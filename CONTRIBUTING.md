@@ -1,4 +1,4 @@
-# Contribuindo para Lia
+# Contribuindo para Maia
 
 Projeto pessoal de Diógenes Mendes — uso interno por enquanto.
 
