@@ -1,0 +1,46 @@
+# Node
+node_modules/
+dist/
+*.log
+.npm
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# WhatsApp / Baileys
+.baileys-auth/
+auth_info_baileys/
+
+# Mídia recebida
+media/
+uploads/
+
+# Build / cache
+.tsbuildinfo
+*.tsbuildinfo
+.cache/
+.turbo/
+
+# Testes
+coverage/
+.nyc_output/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Postgres / Redis volumes locais
+pg_data/
+redis_data/
+
+# Logs
+logs/
+*.log.*
