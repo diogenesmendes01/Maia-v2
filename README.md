@@ -1,4 +1,4 @@
-# Lia
+# Maia
 
 > Assistente financeira inteligente via WhatsApp.
 > Gerencia PF + 8 PJs com separação rígida, memória persistente e ferramentas reais.
