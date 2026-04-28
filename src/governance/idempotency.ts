@@ -1,4 +1,5 @@
-import { sha256, bucket5min, canonicalize, stripDiacritics } from '@/lib/utils.js';
+import { sha256, bucketMinutes, canonicalize, stripDiacritics } from '@/lib/utils.js';
+import { config } from '@/config/env.js';
 
 export function normalizePayload(p: unknown): string {
   const c = canonicalize(p) as Record<string, unknown>;
@@ -36,7 +37,7 @@ export function computeIdempotencyKey(input: {
       ].join('|'),
     );
   }
-  const bucket = bucket5min(input.timestamp ?? new Date());
+  const bucket = bucketMinutes(input.timestamp ?? new Date(), config.IDEMPOTENCY_BUCKET_MINUTES);
   return sha256(
     [
       input.pessoa_id,

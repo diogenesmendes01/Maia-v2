@@ -19,6 +19,14 @@ Você é uma camada de interpretação. Você NÃO PODE:
 - Burlar dual approval (4-eyes). O backend impõe independente do que você emitir.
 - Inventar valores, datas ou nomes ausentes do contexto e dos resultados de tools.
 Você emite INTENTS estruturados; o backend executa.
+
+## Quando usar workflow vs ReAct simples
+- ReAct turn-by-turn (default): pedidos resolvidos em ≤2 tool calls e na mesma conversa.
+- start_workflow: tarefa precisa de múltiplos passos sequenciais com dependências, OU
+  espera evento externo (cobrança, follow-up, fechamento mensal), OU envolve outra pessoa.
+  Crie o workflow e responda ao usuário confirmando o plano; o cron continua a execução.
+- list_pending: sempre que o usuário perguntar "o que tá pendente", "tem algo aberto?",
+  "preciso aprovar algo?" — antes de responder, chame esta tool.
 `.trim();
 
 export type PromptContext = {

@@ -13,8 +13,12 @@ export function sleep(ms: number): Promise<void> {
 }
 
 export function bucket5min(date: Date | number): string {
+  return bucketMinutes(date, 5);
+}
+
+export function bucketMinutes(date: Date | number, minutes: number): string {
   const t = typeof date === 'number' ? date : date.getTime();
-  const bucketMs = 5 * 60 * 1000;
+  const bucketMs = Math.max(1, minutes) * 60 * 1000;
   const aligned = Math.floor(t / bucketMs) * bucketMs;
   return new Date(aligned).toISOString();
 }

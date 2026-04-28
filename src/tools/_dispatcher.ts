@@ -1,6 +1,7 @@
 import type { Pessoa, Conversa } from '@/db/schema.js';
 import type { ResolvedPermission } from '@/governance/permissions.js';
 import { canAct } from '@/governance/permissions.js';
+import { constitutionalCheck } from '@/governance/rules.js';
 import { REGISTRY, type AnyTool } from './_registry.js';
 import { computeIdempotencyKey } from '@/governance/idempotency.js';
 import { idempotencyRepo } from '@/db/repositories.js';
@@ -37,6 +38,35 @@ export async function dispatchTool(input: {
   if (!entity_id) return { error: 'no_entity_in_scope' };
 
   const resolved = input.ctx.scope.byEntity.get(entity_id);
+
+  // Constitutional rules apply BEFORE per-action permission checks: hard
+  // limits, dual-approval gates and cross-entity guards must short-circuit
+  // even if the profile would otherwise authorize the action.
+  const violation = constitutionalCheck({
+    intent: { tool: tool.name, args },
+    pessoa: input.ctx.pessoa,
+    resolved: resolved ?? null,
+    scope: { entidades: input.ctx.scope.entidades },
+    dual_approval_granted:
+      (args as { dual_approval_granted?: boolean }).dual_approval_granted === true,
+  });
+  if (violation) {
+    await audit({
+      acao: 'unauthorized_access_attempt',
+      pessoa_id: input.ctx.pessoa.id,
+      conversa_id: input.ctx.conversa.id,
+      mensagem_id: input.ctx.mensagem_id,
+      metadata: { tool: tool.name, violation },
+    });
+    if (violation.kind === 'forbidden') {
+      return { error: 'forbidden', details: { rule_id: violation.rule_id, reason: violation.reason } };
+    }
+    return {
+      error: 'requires_dual_approval',
+      details: { reason: violation.reason },
+    };
+  }
+
   for (const action of tool.required_actions as ActionKey[]) {
     const allow = canAct({
       pessoa: input.ctx.pessoa,

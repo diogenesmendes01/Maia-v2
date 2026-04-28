@@ -51,14 +51,6 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
     inbound.conversa_id = conversa.id;
   }
 
-  const conversa = await (async () => {
-    const all = await conversasRepo.findActive((await pessoasRepo.findById('00000000-0000-0000-0000-000000000000'))?.id ?? '');
-    return all;
-  })();
-
-  // Re-fetch conversa & pessoa (we have conversa_id now)
-  const fullConversa = await conversasRepo.findActive(inbound.id); // not ideal; we re-resolve
-  // Simpler: fetch by mensagens.conversa_id via a small query
   const conv = await loadConversaWithPessoa(inbound.conversa_id!);
   if (!conv) {
     logger.warn({ mensagem_id }, 'agent.conversa_missing');
@@ -115,14 +107,15 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
           request_id: uuid(),
         },
       });
+      const isError = typeof out === 'object' && out !== null && 'error' in out;
       results.push({
         type: 'tool_result' as const,
         tool_use_id: tu.id,
         content: JSON.stringify(out),
-        is_error: 'error' in out,
+        is_error: isError,
       });
       await audit({
-        acao: ('error' in out ? 'unauthorized_access_attempt' : 'classification_suggested') as never,
+        acao: (isError ? 'unauthorized_access_attempt' : 'classification_suggested') as never,
         pessoa_id: pessoa.id,
         conversa_id: c.id,
         mensagem_id: inbound.id,

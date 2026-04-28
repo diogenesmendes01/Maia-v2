@@ -7,6 +7,7 @@ import { runAuditModeExpirer } from './audit-mode-expirer.js';
 import { runInactivitySweep } from './inactivity-sweep.js';
 import { runConversationSummarizer } from './conversation-summarizer.js';
 import { runReflectionBatch } from './reflection-batch.js';
+import { runMessageRecovery } from './message-recovery.js';
 import { runMorningBriefing, runEveningBriefing, runWeeklyBriefing } from './briefings.js';
 import { tickEngine } from '@/workflows/engine.js';
 
@@ -15,6 +16,7 @@ type Job = { name: string; cron: string; fn: () => Promise<void>; phase: number 
 const JOBS: Job[] = [
   { name: 'health_monitor', cron: '*/1 * * * *', fn: runHealthMonitor, phase: 1 },
   { name: 'pending_expirer', cron: '*/1 * * * *', fn: runPendingExpirer, phase: 1 },
+  { name: 'message_recovery', cron: '*/2 * * * *', fn: runMessageRecovery, phase: 1 },
   { name: 'workflow_engine_tick', cron: '*/30 * * * * *', fn: async () => { await tickEngine(); }, phase: 1 },
   { name: 'audit_mode_expirer', cron: '*/15 * * * *', fn: runAuditModeExpirer, phase: 1 },
   { name: 'idempotency_cleanup', cron: '0 4 * * *', fn: runIdempotencyCleanup, phase: 1 },

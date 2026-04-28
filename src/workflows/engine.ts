@@ -1,9 +1,10 @@
 import { workflowsRepo, workflowStepsRepo } from '@/db/repositories.js';
+import { db } from '@/db/client.js';
+import { workflow_steps } from '@/db/schema.js';
+import { eq } from 'drizzle-orm';
 import { logger } from '@/lib/logger.js';
 import { audit } from '@/governance/audit.js';
 import { expireDueDualApprovals } from './dual-approval.js';
-import { dispatchTool } from '@/tools/_dispatcher.js';
-import type { ToolContext } from '@/tools/_dispatcher.js';
 
 export async function tickEngine(): Promise<{ processed: number; expired: number }> {
   const expired = await expireDueDualApprovals();
@@ -32,4 +33,40 @@ export async function tickEngine(): Promise<{ processed: number; expired: number
     }
   }
   return { processed, expired };
+}
+
+/**
+ * Roll a workflow back: mark any step that did not finish as 'cancelada' and
+ * the workflow itself as 'falhou'. Compensating actions for already-executed
+ * steps are recorded in audit_log so a human can review them — we never
+ * automatically reverse a financial side effect.
+ */
+export async function rollbackWorkflow(workflow_id: string, reason: string): Promise<void> {
+  const wf = await workflowsRepo.byId(workflow_id);
+  if (!wf) return;
+  if (wf.status === 'concluido' || wf.status === 'falhou' || wf.status === 'cancelada') return;
+  const steps = await workflowStepsRepo.byWorkflow(workflow_id);
+  for (const step of steps) {
+    if (step.status === 'concluida') {
+      await audit({
+        acao: 'workflow_compensation_required',
+        alvo_id: workflow_id,
+        metadata: { step_id: step.id, ordem: step.ordem, descricao: step.descricao },
+      });
+      continue;
+    }
+    if (step.status === 'pendente' || step.status === 'em_andamento') {
+      await db
+        .update(workflow_steps)
+        .set({ status: 'cancelada', concluido_em: new Date() })
+        .where(eq(workflow_steps.id, step.id));
+    }
+  }
+  await workflowsRepo.setStatus(workflow_id, 'falhou');
+  await audit({
+    acao: 'workflow_rolled_back',
+    alvo_id: workflow_id,
+    metadata: { reason },
+  });
+  logger.warn({ workflow_id, reason }, 'engine.workflow.rolled_back');
 }

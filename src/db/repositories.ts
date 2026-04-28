@@ -173,6 +173,41 @@ export const mensagensRepo = {
     const rows = await db.insert(mensagens).values(input).returning();
     return rows[0]!;
   },
+  async createInbound(
+    input: Omit<Mensagem, 'id' | 'created_at'>,
+  ): Promise<{ row: Mensagem; duplicate: boolean }> {
+    const wid = (input.metadata as Record<string, unknown> | null)?.['whatsapp_id'];
+    if (typeof wid === 'string' && wid.length > 0) {
+      const existing = await this.findByWhatsappId(wid);
+      if (existing) return { row: existing, duplicate: true };
+    }
+    try {
+      const rows = await db.insert(mensagens).values(input).returning();
+      return { row: rows[0]!, duplicate: false };
+    } catch (err) {
+      // Unique-violation race: re-fetch and treat as duplicate.
+      if (typeof wid === 'string' && (err as { code?: string }).code === '23505') {
+        const existing = await this.findByWhatsappId(wid);
+        if (existing) return { row: existing, duplicate: true };
+      }
+      throw err;
+    }
+  },
+  async listUnprocessedOlderThan(ms: number, limit = 100): Promise<Mensagem[]> {
+    const cutoff = new Date(Date.now() - ms);
+    return db
+      .select()
+      .from(mensagens)
+      .where(
+        and(
+          isNull(mensagens.processada_em),
+          eq(mensagens.direcao, 'in'),
+          sql`created_at < ${cutoff.toISOString()}`,
+        ),
+      )
+      .orderBy(mensagens.created_at)
+      .limit(limit);
+  },
   async findById(id: string): Promise<Mensagem | null> {
     const rows = await db.select().from(mensagens).where(eq(mensagens.id, id)).limit(1);
     return rows[0] ?? null;

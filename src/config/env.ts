@@ -45,6 +45,7 @@ const envSchema = z
     VALOR_LIMITE_DURO: z.coerce.number().positive().default(50000),
     DUAL_APPROVAL_TIMEOUT_HOURS: z.coerce.number().int().positive().default(6),
     AUDIT_MODE_TTL_HOURS: z.coerce.number().int().positive().default(24),
+    IDEMPOTENCY_BUCKET_MINUTES: z.coerce.number().int().positive().default(5),
     PENDING_QUESTION_TTL_MINUTES: z.coerce.number().int().positive().default(120),
     PENDING_ACTION_TTL_HOURS: z.coerce.number().int().positive().default(6),
     RATE_LIMIT_MSGS_PER_HOUR: z.coerce.number().int().positive().default(30),

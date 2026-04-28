@@ -92,7 +92,7 @@ async function handleIncoming(msg: proto.IWebMessageInfo): Promise<void> {
 
   const { type, content, mediaPath, mediaMime, mediaSha256 } = await extractContent(msg);
 
-  const stored = await mensagensRepo.create({
+  const { row: stored, duplicate } = await mensagensRepo.createInbound({
     conversa_id: null,
     direcao: 'in',
     tipo: type,
@@ -113,6 +113,10 @@ async function handleIncoming(msg: proto.IWebMessageInfo): Promise<void> {
   });
 
   await markSeen(whatsapp_id);
+  if (duplicate) {
+    await audit({ acao: 'duplicate_message_dropped', metadata: { whatsapp_id, source: 'db_unique' } });
+    return;
+  }
   await enqueueAgent({ mensagem_id: stored.id });
   logger.info({ mensagem_id: stored.id, tel: '[REDACTED]' }, 'baileys.message.enqueued');
 }
