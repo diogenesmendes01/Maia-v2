@@ -1,5 +1,5 @@
 -- =====================================================================
--- Lia — Schema inicial (PostgreSQL 16 + pgvector)
+-- Maia — Schema inicial (PostgreSQL 16 + pgvector)
 -- Migration 001_initial
 -- =====================================================================
 
@@ -121,13 +121,13 @@ CREATE INDEX idx_recorrencias_proxima ON recorrencias (proxima_em) WHERE ativa =
 CREATE TABLE pessoas (
   id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   nome            TEXT NOT NULL,
-  apelido         TEXT,                                  -- como a Lia se refere
+  apelido         TEXT,                                  -- como a Maia se refere
   telefone_whatsapp TEXT NOT NULL UNIQUE,                -- formato E.164: +5511999999999
   tipo            TEXT NOT NULL CHECK (tipo IN ('dono', 'co_dono', 'socio', 'contador', 'funcionario', 'fornecedor', 'cliente', 'outro')),
   email           TEXT,
   observacoes     TEXT,
   preferencias    JSONB NOT NULL DEFAULT '{}'::jsonb,    -- horario_briefing, tom, idioma, etc.
-  modelo_mental   JSONB NOT NULL DEFAULT '{}'::jsonb,    -- o que a Lia "sabe" sobre essa pessoa
+  modelo_mental   JSONB NOT NULL DEFAULT '{}'::jsonb,    -- o que a Maia "sabe" sobre essa pessoa
   status          TEXT NOT NULL DEFAULT 'ativa' CHECK (status IN ('ativa', 'inativa', 'bloqueada')),
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -154,7 +154,7 @@ CREATE TABLE conversas (
   pessoa_id       UUID NOT NULL REFERENCES pessoas(id) ON DELETE RESTRICT,
   escopo_entidades UUID[] NOT NULL DEFAULT '{}',         -- entidades acessíveis nesta conversa
   status          TEXT NOT NULL DEFAULT 'ativa' CHECK (status IN ('ativa', 'pausada', 'encerrada')),
-  contexto_resumido TEXT,                                -- resumo gerado pela Lia
+  contexto_resumido TEXT,                                -- resumo gerado pela Maia
   ultima_atividade_em TIMESTAMPTZ NOT NULL DEFAULT now(),
   metadata        JSONB NOT NULL DEFAULT '{}'::jsonb,
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -187,7 +187,7 @@ ALTER TABLE transacoes ADD CONSTRAINT fk_transacoes_pessoa FOREIGN KEY (registra
 -- INTELIGÊNCIA — MEMÓRIA E APRENDIZADO
 -- =====================================================================
 
--- Memória semântica: fatos estruturados sobre o mundo da Lia
+-- Memória semântica: fatos estruturados sobre o mundo da Maia
 CREATE TABLE agent_facts (
   id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   escopo          TEXT NOT NULL,                         -- 'global', 'entidade:UUID', 'pessoa:UUID'
@@ -239,7 +239,7 @@ CREATE TABLE agent_memories (
 CREATE INDEX idx_memories_embedding ON agent_memories USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
 CREATE INDEX idx_memories_escopo_tipo ON agent_memories (escopo, tipo);
 
--- Estado da identidade da Lia (versionado)
+-- Estado da identidade da Maia (versionado)
 CREATE TABLE self_state (
   id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   versao          INT NOT NULL,
@@ -289,7 +289,7 @@ CREATE INDEX idx_workflow_steps_wf ON workflow_steps (workflow_id, ordem);
 
 CREATE TABLE audit_log (
   id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  pessoa_id       UUID REFERENCES pessoas(id),           -- quem (NULL = sistema/Lia)
+  pessoa_id       UUID REFERENCES pessoas(id),           -- quem (NULL = sistema/Maia)
   acao            TEXT NOT NULL,                         -- 'transacao.criada', 'permissao.alterada'
   entidade_alvo   TEXT,                                  -- nome da tabela
   alvo_id         UUID,

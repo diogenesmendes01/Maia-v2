@@ -35,7 +35,7 @@
 ## Estrutura do projeto
 
 ```
-lia/
+maia-v2/
 ├── docs/
 │   ├── arquitetura.md          # Desenho completo do sistema
 │   └── inventario.md           # Template de entidades/pessoas/permissões
@@ -50,7 +50,7 @@ lia/
 │   ├── tools/                  # Ferramentas que o agente chama
 │   ├── memory/                 # 5 camadas de memória
 │   ├── identity/
-│   │   └── lia-prompt.md       # System prompt v0 da Lia
+│   │   └── maia-prompt.md      # System prompt v0 da Maia
 │   ├── workflows/              # Tarefas multi-passo
 │   ├── governance/             # Regras e auditoria
 │   ├── workers/                # Cron + event-driven (proatividade)
@@ -66,7 +66,7 @@ lia/
 # - Node 20+
 # - Conta Anthropic com API key
 # - Conta OpenAI com API key
-# - Chip WhatsApp dedicado para a Lia
+# - Chip WhatsApp dedicado para a Maia
 
 # 1. Instale dependências
 npm install
@@ -78,15 +78,18 @@ cp .env.example .env
 # 3. Suba a infra (Postgres + Redis)
 docker compose up -d postgres redis
 
-# 4. Rode migrations
+# 4. Rode migrations (001_initial + 002_specs_v1)
 npm run db:migrate
 
-# 5. Rode seeds (categorias globais)
-npm run db:seed
+# 5. Wizard de bootstrap (cria owner + entidades + permissões + self_state)
+npm run setup
 
 # 6. Inicie em dev
 npm run dev
-# escaneie o QR code do WhatsApp com o número da Lia
+# escaneie o QR code do WhatsApp com o número da Maia
+
+# Adicionar pessoa nova depois (CLI):
+npm run pessoa:add -- --nome="Joana" --telefone="+55..." --profile=contador_leitura --entidades=E1,E3
 ```
 
 ## Setup produção (VPS)
@@ -101,7 +104,7 @@ docker compose logs -f app
 - [`docs/arquitetura.md`](docs/arquitetura.md) — desenho do sistema, os 7 pilares, fases
 - [`docs/inventario.md`](docs/inventario.md) — template a preencher (Mendes + esposa)
 - [`migrations/001_initial.sql`](migrations/001_initial.sql) — schema completo
-- [`src/identity/lia-prompt.md`](src/identity/lia-prompt.md) — identidade da Lia v0
+- [`src/identity/maia-prompt.md`](src/identity/maia-prompt.md) — identidade da Maia v0
 
 ## Roadmap
 

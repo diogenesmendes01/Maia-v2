@@ -1,8 +1,8 @@
-# Inventário — Projeto Lia
+# Inventário — Projeto Maia
 
 > Documento para você (Mendes) e sua esposa preencherem.  
 > Não precisa estar perfeito — preencha o que souber, deixe `?` no que não souber.  
-> Esse arquivo vira a base inicial da memória da Lia.
+> Esse arquivo vira a base inicial da memória da Maia.
 
 ---
 
@@ -34,7 +34,7 @@
 
 ---
 
-## 3. Pessoas que vão interagir com a Lia
+## 3. Pessoas que vão interagir com a Maia
 
 | Nome | Telefone (com DDI) | Papel | Entidades que acessa | Permissões |
 |------|---------------------|-------|----------------------|------------|
@@ -50,7 +50,7 @@
 - `admin` — vê e opera uma entidade específica
 - `operador` — só lança/consulta transações de uma entidade
 - `contador` — leitura + recebe extratos/relatórios + envia balancetes
-- `contato` — só fala com a Lia, não tem acesso a dados (fornecedor, cliente)
+- `contato` — só fala com a Maia, não tem acesso a dados (fornecedor, cliente)
 
 ---
 
@@ -97,7 +97,7 @@
 
 ## 5. Recorrências conhecidas
 
-> Coisas que entram/saem todo mês na mesma data. A Lia vai aprender mais com o tempo, mas se você já souber algumas, agiliza.
+> Coisas que entram/saem todo mês na mesma data. A Maia vai aprender mais com o tempo, mas se você já souber algumas, agiliza.
 
 | Entidade | Descrição | Tipo (Entrada/Saída) | Valor aprox | Dia do mês | Conta |
 |----------|-----------|----------------------|-------------|------------|-------|
@@ -109,7 +109,7 @@
 
 ## 6. Dores específicas (priorize)
 
-> Marque com X o que mais te incomoda hoje. Isso define o que a Lia ataca primeiro.
+> Marque com X o que mais te incomoda hoje. Isso define o que a Maia ataca primeiro.
 
 - [ ] Não sei quanto entra e quanto sai (visão geral)
 - [ ] Esqueço de pagar contas / pago no susto

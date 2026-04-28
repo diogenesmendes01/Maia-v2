@@ -17,7 +17,7 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 - Estrutura inicial do projeto (Node 20 + TypeScript)
 - Documentação de arquitetura completa (`docs/arquitetura.md`)
 - Schema do banco com 16 tabelas (PostgreSQL 16 + pgvector)
-- System prompt da Lia v0 (`src/identity/lia-prompt.md`)
+- System prompt da Maia v0 (`src/identity/maia-prompt.md`)
 - Template de inventário para preencher (`docs/inventario.md`)
 - Docker Compose com Postgres + pgvector + Redis
 - Configuração TypeScript strict mode

@@ -1,36 +1,34 @@
-version: "3.9"
-
 services:
   postgres:
     image: pgvector/pgvector:pg16
-    container_name: lia-postgres
+    container_name: maia-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-lia}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lia}
-      POSTGRES_DB: ${POSTGRES_DB:-lia}
+      POSTGRES_USER: ${POSTGRES_USER:-maia}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-maia}
+      POSTGRES_DB: ${POSTGRES_DB:-maia}
       TZ: America/Sao_Paulo
       PGTZ: America/Sao_Paulo
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
-      - lia_pg_data:/var/lib/postgresql/data
+      - maia_pg_data:/var/lib/postgresql/data
       - ./migrations:/migrations:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-lia}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-maia}"]
       interval: 5s
       timeout: 5s
       retries: 10
 
   redis:
     image: redis:7-alpine
-    container_name: lia-redis
+    container_name: maia-redis
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes"]
     ports:
       - "${REDIS_PORT:-6379}:6379"
     volumes:
-      - lia_redis_data:/data
+      - maia_redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -41,7 +39,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: lia-app
+    container_name: maia-app
     restart: unless-stopped
     depends_on:
       postgres:
@@ -50,7 +48,7 @@ services:
         condition: service_healthy
     environment:
       NODE_ENV: ${NODE_ENV:-production}
-      DATABASE_URL: postgres://${POSTGRES_USER:-lia}:${POSTGRES_PASSWORD:-lia}@postgres:5432/${POSTGRES_DB:-lia}
+      DATABASE_URL: postgres://${POSTGRES_USER:-maia}:${POSTGRES_PASSWORD:-maia}@postgres:5432/${POSTGRES_DB:-maia}
       REDIS_URL: redis://redis:6379
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       OPENAI_API_KEY: ${OPENAI_API_KEY}
@@ -58,11 +56,11 @@ services:
     ports:
       - "${APP_PORT:-3000}:3000"
     volumes:
-      - lia_baileys_auth:/app/.baileys-auth
-      - lia_media:/app/media
+      - maia_baileys_auth:/app/.baileys-auth
+      - maia_media:/app/media
 
 volumes:
-  lia_pg_data:
-  lia_redis_data:
-  lia_baileys_auth:
-  lia_media:
+  maia_pg_data:
+  maia_redis_data:
+  maia_baileys_auth:
+  maia_media:
