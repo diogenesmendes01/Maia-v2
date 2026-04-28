@@ -2,6 +2,7 @@ import {
   default as makeWASocket,
   DisconnectReason,
   useMultiFileAuthState,
+  downloadMediaMessage,
   type WASocket,
   type proto,
 } from '@whiskeysockets/baileys';
@@ -151,14 +152,25 @@ async function extractContent(msg: proto.IWebMessageInfo): Promise<{
     return { type: 'sistema', content: null, mediaPath: null, mediaMime: null, mediaSha256: null };
   }
 
-  // We don't decrypt the media here; that requires downloadMediaMessage from baileys utils.
-  // Implementation detail deferred to Phase 2 (multimedia spec).
-  // For Phase 1 we just record metadata.
-  const mime = (m as any)[mediaKind]?.mimetype ?? null;
-  const caption = (m as any)[mediaKind]?.caption ?? null;
+  const mime = (m as Record<string, { mimetype?: string; caption?: string }>)[mediaKind]?.mimetype ?? null;
+  const caption = (m as Record<string, { mimetype?: string; caption?: string }>)[mediaKind]?.caption ?? null;
   const type: WhatsAppInbound['type'] =
     mediaKind === 'audioMessage' ? 'audio' : mediaKind === 'imageMessage' ? 'imagem' : 'documento';
-  return { type, content: caption, mediaPath: null, mediaMime: mime, mediaSha256: null };
+  let mediaPath: string | null = null;
+  let mediaSha256: string | null = null;
+  try {
+    const buf = await downloadMediaMessage(msg, 'buffer', {});
+    if (Buffer.isBuffer(buf)) {
+      const ext =
+        mime?.split('/')[1]?.split(';')[0] ?? (type === 'audio' ? 'ogg' : type === 'imagem' ? 'jpg' : 'bin');
+      const saved = mediaPathFor(buf, ext);
+      mediaPath = saved.path;
+      mediaSha256 = saved.sha;
+    }
+  } catch (err) {
+    logger.warn({ err: (err as Error).message }, 'baileys.media_download_failed');
+  }
+  return { type, content: caption, mediaPath, mediaMime: mime, mediaSha256 };
 }
 
 export async function sendOutboundText(jid: string, text: string): Promise<string | null> {
