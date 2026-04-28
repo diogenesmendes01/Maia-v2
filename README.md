@@ -78,15 +78,18 @@ cp .env.example .env
 # 3. Suba a infra (Postgres + Redis)
 docker compose up -d postgres redis
 
-# 4. Rode migrations
+# 4. Rode migrations (001_initial + 002_specs_v1)
 npm run db:migrate
 
-# 5. Rode seeds (categorias globais)
-npm run db:seed
+# 5. Wizard de bootstrap (cria owner + entidades + permissões + self_state)
+npm run setup
 
 # 6. Inicie em dev
 npm run dev
 # escaneie o QR code do WhatsApp com o número da Maia
+
+# Adicionar pessoa nova depois (CLI):
+npm run pessoa:add -- --nome="Joana" --telefone="+55..." --profile=contador_leitura --entidades=E1,E3
 ```
 
 ## Setup produção (VPS)
