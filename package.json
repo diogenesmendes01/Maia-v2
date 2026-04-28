@@ -1,7 +1,7 @@
 {
-  "name": "lia",
+  "name": "maia-v2",
   "version": "0.1.0",
-  "description": "Assistente financeira inteligente via WhatsApp - PF + 8 PJs",
+  "description": "Maia — Assistente financeira inteligente via WhatsApp - PF + 8 PJs",
   "private": true,
   "type": "module",
   "engines": {

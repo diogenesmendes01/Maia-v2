@@ -1,4 +1,4 @@
-# Lia — Arquitetura do Sistema
+# Maia — Arquitetura do Sistema
 
 > Assistente financeira inteligente para gerir PF + 8 PJs via WhatsApp.  
 > Versão inicial do documento — vai evoluir junto com o projeto.
@@ -7,7 +7,7 @@
 
 ## 1. Visão geral
 
-A Lia é um **agente de IA** (não um chatbot) com:
+A Maia é um **agente de IA** (não um chatbot) com:
 - Identidade própria (número WhatsApp dedicado)
 - Memória persistente em camadas
 - Ferramentas reais que executam ações
@@ -25,12 +25,12 @@ A inteligência **não está no LLM** (que é stateless). Está no **sistema ao 
 ┌────────────────────────────────────────────────────────────┐
 │  Mendes  │  Esposa  │ Contadores │ Funcionários │ Outros   │
 └──────┬───┴────┬─────┴────┬───────┴──────┬───────┴────┬─────┘
-       │ WhatsApp (cada um na sua conversa, com a Lia)        │
+       │ WhatsApp (cada um na sua conversa, com a Maia)        │
        └────────────────────────┬─────────────────────────────┘
                                 │
                 ┌───────────────▼───────────────┐
                 │  Gateway Baileys              │
-                │  (1 sessão, número da Lia)    │
+                │  (1 sessão, número da Maia)    │
                 └───────────────┬───────────────┘
                                 │  fila (BullMQ)
                 ┌───────────────▼───────────────┐
@@ -75,7 +75,7 @@ A inteligência **não está no LLM** (que é stateless). Está no **sistema ao 
 |--------|--------|-----------|
 | **Trabalho** | Conversa atual, últimas N mensagens | Redis (TTL curto) |
 | **Episódica** | Eventos, transações, decisões com timestamp | Postgres (`mensagens`, `transacoes`, `audit_log`) |
-| **Semântica** | Fatos sobre o mundo da Lia (entidades, pessoas, padrões) | Postgres (`agent_facts`) |
+| **Semântica** | Fatos sobre o mundo da Maia (entidades, pessoas, padrões) | Postgres (`agent_facts`) |
 | **Procedural** | Regras aprendidas (como classificar, como reagir) | Postgres (`learned_rules`) |
 | **Vetorial** | Recall por similaridade ("já vi algo parecido?") | Postgres + pgvector (`agent_memories`) |
 
@@ -108,11 +108,11 @@ Cada `pessoa` tem um perfil:
 - O que pode ver e fazer (permissões)
 - Histórico resumido de interação
 
-Quando a Lia vai responder, o system prompt é **montado** com o perfil do interlocutor injetado.
+Quando a Maia vai responder, o system prompt é **montado** com o perfil do interlocutor injetado.
 
 ### 3.4 Planejamento hierárquico
 
-Tarefas grandes (`workflows`) são árvores de tarefas (`workflow_steps`). Estado persiste em banco. Lia retoma de onde parou mesmo após reinício.
+Tarefas grandes (`workflows`) são árvores de tarefas (`workflow_steps`). Estado persiste em banco. Maia retoma de onde parou mesmo após reinício.
 
 ### 3.5 Auto-supervisão (governance)
 
@@ -131,7 +131,7 @@ Workers rodando em background:
 
 ### 3.7 Continuidade de identidade
 
-`self_state` — arquivo vivo com a identidade da Lia, atualizado conforme aprende. Lido em toda conversa.
+`self_state` — arquivo vivo com a identidade da Maia, atualizado conforme aprende. Lido em toda conversa.
 
 ---
 
@@ -159,7 +159,7 @@ Workers rodando em background:
 ## 5. Estrutura de pastas
 
 ```
-lia/
+maia-v2/
 ├── docker-compose.yml
 ├── package.json
 ├── tsconfig.json
@@ -201,7 +201,7 @@ lia/
 │   │   ├── procedural.ts       # learned_rules
 │   │   └── vector.ts           # pgvector
 │   ├── identity/
-│   │   ├── lia-prompt.md       # system prompt vivo
+│   │   ├── maia-prompt.md      # system prompt vivo
 │   │   ├── load.ts             # carrega + injeta perfil interlocutor
 │   │   └── update.ts           # evolui identidade
 │   ├── workflows/
@@ -264,7 +264,7 @@ Mendes + esposa preenchem `inventario.md`. **Não bloqueia o desenvolvimento.**
 - Gateway Baileys conectado
 - Agente com loop ReAct + 5 ferramentas (registrar/consultar/listar/classificar/identificar entidade)
 - Memória episódica + semântica + procedural funcionando
-- Identidade da Lia v0
+- Identidade da Maia v0
 - Conversa só com Mendes (testar antes de abrir para esposa/terceiros)
 - Governance básica (limites, confirmações)
 
@@ -302,7 +302,7 @@ Mendes + esposa preenchem `inventario.md`. **Não bloqueia o desenvolvimento.**
 | Erro de classificação | Confirmação na fase inicial, aprendizado com correção |
 | Vazamento entre escopos | Filtros obrigatórios por `entidade_id` em toda query, testes específicos |
 | Custo de API explodir | Haiku para tarefas simples, cache de respostas, rate limit |
-| Lia agir errado em algo crítico | Governance hard-coded, audit log, modo "dry run" no início |
+| Maia agir errado em algo crítico | Governance hard-coded, audit log, modo "dry run" no início |
 | VPS cair | Backup diário do Postgres, restart automático via systemd/docker |
 
 ---
@@ -324,7 +324,7 @@ Mendes + esposa preenchem `inventario.md`. **Não bloqueia o desenvolvimento.**
 **Imediato (esta entrega):**
 - [x] Arquitetura documentada
 - [x] Schema do banco
-- [x] System prompt da Lia v0
+- [x] System prompt da Maia v0
 - [x] Template de inventário
 - [x] Estrutura do projeto + dependências
 - [x] Docker compose
