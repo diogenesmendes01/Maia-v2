@@ -6,6 +6,14 @@ import { queryBalanceTool } from './query-balance.js';
 import { listTransactionsTool } from './list-transactions.js';
 import { classifyTransactionTool } from './classify-transaction.js';
 import { identifyEntityTool } from './identify-entity.js';
+import { parseBoletoTool } from './parse-boleto.js';
+import { transcribeAudioTool } from './transcribe-audio.js';
+import { scheduleReminderTool } from './schedule-reminder.js';
+import { sendProactiveMessageTool } from './send-proactive-message.js';
+import { compareEntitiesTool } from './compare-entities.js';
+import { recallMemoryTool } from './recall-memory.js';
+import { saveFactTool } from './save-fact.js';
+import { saveRuleTool } from './save-rule.js';
 
 export type ToolHandlerCtx = {
   pessoa: import('@/db/schema.js').Pessoa;
@@ -37,35 +45,36 @@ export const REGISTRY: Record<string, AnyTool> = {
   list_transactions: listTransactionsTool as unknown as AnyTool,
   classify_transaction: classifyTransactionTool as unknown as AnyTool,
   identify_entity: identifyEntityTool as unknown as AnyTool,
+  parse_boleto: parseBoletoTool as unknown as AnyTool,
+  transcribe_audio: transcribeAudioTool as unknown as AnyTool,
+  schedule_reminder: scheduleReminderTool as unknown as AnyTool,
+  send_proactive_message: sendProactiveMessageTool as unknown as AnyTool,
+  compare_entities: compareEntitiesTool as unknown as AnyTool,
+  recall_memory: recallMemoryTool as unknown as AnyTool,
+  save_fact: saveFactTool as unknown as AnyTool,
+  save_rule: saveRuleTool as unknown as AnyTool,
 };
 
 export function getToolSchemas(byEntity: Map<string, ResolvedPermission>) {
-  // Determine the union of allowed actions across the scope's profiles
   const allowed = new Set<string>();
+  let isOwner = false;
   for (const rp of byEntity.values()) {
     if (rp.profile.acoes.includes('*')) {
-      // owner — all tools available
-      return Object.values(REGISTRY).map(toolToSchema);
+      isOwner = true;
+      break;
     }
     for (const a of rp.profile.acoes) allowed.add(a);
   }
+  if (isOwner) return Object.values(REGISTRY).map(toolToSchema);
   return Object.values(REGISTRY)
     .filter((t) => t.required_actions.every((a) => allowed.has(a)))
     .map(toolToSchema);
 }
 
 function toolToSchema(t: AnyTool) {
-  // Convert Zod schema to a JSON-Schema-like object understood by Anthropic's tool API.
-  // For simplicity we embed the schema description; the SDK accepts a JSON schema.
   return {
     name: t.name,
     description: t.description,
-    input_schema: zodToJsonSchema(t.input_schema),
+    input_schema: { type: 'object' as const, additionalProperties: true },
   };
-}
-
-function zodToJsonSchema(_schema: z.ZodTypeAny): Record<string, unknown> {
-  // Minimal: we let Zod reject inputs in the dispatcher.
-  // For the LLM we provide a permissive schema; richer schemas can be derived later.
-  return { type: 'object', additionalProperties: true };
 }
