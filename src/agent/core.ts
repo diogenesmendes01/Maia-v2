@@ -8,6 +8,11 @@ import { audit } from '@/governance/audit.js';
 import { dispatchTool } from '@/tools/_dispatcher.js';
 import { getToolSchemas } from '@/tools/_registry.js';
 import { uuid } from '@/lib/utils.js';
+import {
+  detectCorrection,
+  reflectOnCorrection,
+  findPreviousAssistantMessage,
+} from './reflection.js';
 
 const MAX_REACT_ITERATIONS = 5;
 
@@ -129,6 +134,19 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
 
   await mensagensRepo.markProcessed(inbound.id, totalTokens);
   await conversasRepo.touch(c.id);
+
+  // Reflection trigger: correction detection (real-time)
+  if (inbound.conteudo && detectCorrection(inbound.conteudo)) {
+    const prev = await findPreviousAssistantMessage(c.id, inbound.id);
+    if (prev) {
+      await reflectOnCorrection({
+        pessoa,
+        conversa: c,
+        inbound,
+        previousAssistant: prev,
+      });
+    }
+  }
 }
 
 async function sendOutbound(
