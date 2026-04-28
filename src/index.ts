@@ -7,6 +7,7 @@ import { runAgentForMensagem } from '@/agent/core.js';
 import { startServer } from '@/server.js';
 import { audit } from '@/governance/audit.js';
 import { shutdownPools } from '@/lib/healthcheck.js';
+import { startWorkers, stopWorkers } from '@/workers/index.js';
 
 async function main() {
   logger.info({ env: config.NODE_ENV, port: config.APP_PORT }, 'maia.starting');
@@ -17,6 +18,7 @@ async function main() {
   startAgentWorker(async (job) => {
     await runAgentForMensagem(job.data.mensagem_id);
   });
+  startWorkers(1);
   await startBaileys();
 
   process.on('SIGTERM', shutdown);
@@ -25,6 +27,7 @@ async function main() {
 
 async function shutdown() {
   logger.info('maia.shutting_down');
+  stopWorkers();
   await audit({ acao: 'system_stopped' }).catch(() => undefined);
   await shutdownPools();
   process.exit(0);
