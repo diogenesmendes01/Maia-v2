@@ -7,7 +7,8 @@ import { sendOutboundText } from '@/gateway/baileys.js';
 import { audit } from '@/governance/audit.js';
 import { dispatchTool } from '@/tools/_dispatcher.js';
 import { getToolSchemas, REGISTRY } from '@/tools/_registry.js';
-import { startTyping, sendReaction } from '@/gateway/presence.js';
+import { startTyping, sendReaction, quotedReplyContext } from '@/gateway/presence.js';
+import { getActivePending } from '@/workflows/pending-questions.js';
 import { uuid } from '@/lib/utils.js';
 import {
   detectCorrection,
@@ -99,7 +100,13 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
       if (res.tool_uses.length === 0) {
         const text = res.content?.trim() ?? '';
         if (text) {
-          await sendOutbound(pessoa.id, c.id, text, inbound.id);
+          const shouldQuote =
+            (inbound.conteudo && detectCorrection(inbound.conteudo)) || getActivePending(c) !== null;
+          await sendOutbound(pessoa.id, c.id, text, inbound.id, {
+            quoted: shouldQuote
+              ? quotedReplyContext(inbound.metadata as Record<string, unknown> | null, inbound.conteudo)
+              : undefined,
+          });
         }
         break;
       }
@@ -187,11 +194,12 @@ async function sendOutbound(
   conversa_id: string,
   text: string,
   in_reply_to: string,
+  opts?: { quoted?: import('@/gateway/presence.js').WAQuotedContext },
 ): Promise<void> {
   const pessoa = await pessoasRepo.findById(pessoa_id);
   if (!pessoa) return;
   const jid = pessoa.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
-  const wid = await sendOutboundText(jid, text);
+  const wid = await sendOutboundText(jid, text, opts);
   await mensagensRepo.create({
     conversa_id,
     direcao: 'out',
