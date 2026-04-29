@@ -19,6 +19,7 @@ import { markRead } from './presence.js';
 import { enqueueAgent } from './queue.js';
 import { checkBotAndMaybeBlock } from './bot-detection.js';
 import { audit } from '@/governance/audit.js';
+import { dispatchReactionAsAnswer, dispatchPollVote } from '@/agent/one-tap.js';
 import type { WhatsAppInbound, WAQuotedContext } from './types.js';
 
 let socket: WASocket | null = null;
@@ -92,7 +93,29 @@ export async function startBaileys(): Promise<void> {
 
 async function handleIncoming(msg: proto.IWebMessageInfo): Promise<void> {
   if (msg.key.fromMe) return;
-  if (isReactionStub(msg)) return; // reactions decorate; we never persist them
+
+  // B1: poll vote arrives as a pollUpdateMessage. When FEATURE_ONE_TAP is on,
+  // route to the one-tap dispatcher and drop. When off, fall through to the
+  // existing pipeline (preserves pre-B1 behaviour).
+  if (msg.message?.pollUpdateMessage) {
+    if (config.FEATURE_ONE_TAP) {
+      await dispatchPollVote(msg).catch((err) =>
+        logger.warn({ err: (err as Error).message }, 'one_tap.poll_dispatch_failed'),
+      );
+      return;
+    }
+    // flag off → fall through; existing extractContent classifies as 'sistema'
+  }
+
+  if (isReactionStub(msg)) {
+    // existing behaviour: never persist reactions; absorb as one-tap when on.
+    if (config.FEATURE_ONE_TAP) {
+      await dispatchReactionAsAnswer(msg).catch((err) =>
+        logger.warn({ err: (err as Error).message }, 'one_tap.reaction_dispatch_failed'),
+      );
+    }
+    return;
+  }
   const remote_jid = msg.key.remoteJid;
   const whatsapp_id = msg.key.id;
   if (!remote_jid || !whatsapp_id) return;
