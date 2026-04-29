@@ -1084,7 +1084,7 @@ let latestPendingId: string | null = null;
 
 This survives across ReAct iterations within the turn.
 
-- [ ] **Step 2: Capture the id INSIDE the inner `for (const tu of res.tool_uses)` loop**
+- [ ] **Step 2: Capture the id INSIDE the inner `for (const tu of res.tool_uses)` loop (with re-validation)**
 
 After the existing `const out = await dispatchTool({ ... })` call (around line ~110 in current main; same line after Task 10), add:
 
@@ -1116,7 +1116,7 @@ if (
 
 Add the `pendingQuestionsRepo` import alongside the other repo imports at the top of `core.ts` if not already present.
 
-- [ ] **Step 2: Extend `sendOutbound` signature**
+- [ ] **Step 3: Extend `sendOutbound` signature**
 
 ```typescript
 async function sendOutbound(
@@ -1146,7 +1146,7 @@ async function sendOutbound(
 }
 ```
 
-- [ ] **Step 3: Pass it at the call site**
+- [ ] **Step 4: Pass it at the call site**
 
 In the ReAct loop where `sendOutbound(pessoa.id, c.id, text, inbound.id)` is invoked, change to:
 
@@ -1156,7 +1156,7 @@ await sendOutbound(pessoa.id, c.id, text, inbound.id, {
 });
 ```
 
-- [ ] **Step 4: Typecheck + commit**
+- [ ] **Step 5: Typecheck + commit**
 
 ```bash
 npx tsc --noEmit
