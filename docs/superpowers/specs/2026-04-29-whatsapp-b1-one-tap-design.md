@@ -45,26 +45,31 @@ The original v1 review found 7 blockers. B0 closed all of them:
 
 ### 5.1 Shared helper (refactor of B0's gate-internal logic)
 
-B0's `applyTx` inside `pending-gate.ts` is private. We extract a public helper that both the gate and the new B1 inbound handlers call:
+B0's `applyTx` inside `pending-gate.ts` is private. It currently **resolves** the pending in a tx and returns a `kind: 'resolved'` shape — the **dispatch** of `acao_proposta` happens in `core.ts:128-145` for the gate path. v2 extracts the resolve+dispatch into one place so reactions/polls reuse both halves without duplicating the orchestration:
 
 ```typescript
 // src/agent/pending-resolver.ts (new)
 export type ResolveSource = 'gate' | 'reaction' | 'poll_vote';
 
 export async function resolveAndDispatch(input: {
-  pessoa_id: string;
-  conversa_id: string;
-  mensagem_id: string;            // the inbound that triggered the resolution
+  pessoa: Pessoa;                  // full row (passed to dispatcher ctx)
+  conversa: Conversa;              // full row
+  mensagem_id: string;             // the inbound that triggered the resolution
   expected_pending_id: string;     // from the inbound's source (gate snapshot, reaction parent, poll parent)
   option_chosen: string;
   confidence: number;              // 1.0 for one-tap; <1 for gate's Haiku
   source: ResolveSource;
-}): Promise<{ resolved: boolean; action?: { tool: string; args: Record<string, unknown> } }>;
+}): Promise<{ resolved: boolean; action_tool?: string; race_lost?: boolean }>;
 ```
 
-The body is essentially what `applyTx` does today in B0's gate, parameterised on `source` and on `expected_pending_id`. The gate is refactored to call `resolveAndDispatch` after its Haiku classification produces `option_chosen`. B1's handlers call the same function with `confidence: 1.0` and the deterministic `option_chosen`.
+Body (one function, three branches):
+1. `withTx` → `findActiveForUpdate` → if not the expected id, audit `pending_race_lost` and return `{ resolved: false, race_lost: true }`.
+2. Inside the same tx: `resolveTx(...)`, audit `pending_resolved_by_<source>`. The action's `acao_proposta` is read from the locked row and **carried out of the tx**.
+3. After commit (no longer holding any lock): `dispatchTool({ tool: action.tool, args: { ...action.args, _pending_choice: option_chosen }, ctx })`. Audit `pending_action_dispatched`.
 
-Audit `acao` carries `source`, so the trail distinguishes `pending_resolved_by_gate` (Haiku) from `pending_resolved_by_reaction` and `pending_resolved_by_poll`.
+`core.ts` is updated: when the gate returns `kind: 'resolved'`, the gate itself has already called `resolveAndDispatch` — `core.ts` no longer dispatches. The gate's `GateResult` for the resolved case becomes `{ kind: 'resolved' }` (no action payload — already dispatched).
+
+This is the only refactor of B0 that B1 forces. Existing B0 unit tests must be updated to mock `resolveAndDispatch` instead of asserting on `dispatchTool` from core.ts (see §10).
 
 ### 5.2 Send-side: poll for 3–12 options
 
@@ -76,26 +81,71 @@ export async function sendPoll(
   question: string,
   options: ReadonlyArray<{ key: string; label: string }>,
   opts?: { quoted?: WAQuotedContext },
-): Promise<{ whatsapp_id: string | null; option_keys: string[] }>;
+): Promise<{
+  whatsapp_id: string | null;
+  message_secret: string | null;     // base64; needed to decrypt votes
+  option_label_to_key: Record<string, string>; // reverse map for receive-side
+}>;
 ```
 
-Uses `socket.sendMessage(jid, { poll: { name: question, values: labels, selectableCount: 1 } })`. Returns the WAID (so the agent loop can stamp `pending_question_id` and the key↔label mapping on the outbound `mensagens` row) plus the `option_keys` in the same order as the labels (so the receive-side can recover the key from the index of the user's pick).
+Uses `socket.sendMessage(jid, { poll: { name: question, values: labels, selectableCount: 1 } })`. Baileys returns the `proto.WebMessageInfo` whose `message.messageContextInfo.messageSecret` is the per-poll secret used to derive the vote-decryption key. **We must persist this secret** on the outbound `mensagens` row, otherwise `decryptPollVote` cannot recover the user's choice on the receive side.
 
-When `FEATURE_ONE_TAP=false` OR Baileys is disconnected, `sendPoll` returns `{ whatsapp_id: null, option_keys: [] }` — caller falls back to the existing text-list path.
-
-### 5.3 Send-side: agent loop decision
-
-Currently the agent loop, after `ask_pending_question` is dispatched, sends the question as plain text via `sendOutbound`. We extend `sendOutbound` (or add a sibling) so when `latestPendingId` is set AND `FEATURE_ONE_TAP=true` AND the pending's `opcoes_validas.length ∈ [3,12]`, a poll is sent instead of plain text. The mensagens row metadata then carries:
+Persisted metadata on the outbound row:
 
 ```typescript
 metadata: {
   whatsapp_id, in_reply_to,
-  pending_question_id,            // already from B0
-  poll_options: [{ key, label }], // NEW (poll branch only)
+  pending_question_id,
+  poll_options: [{ key, label }],            // ordered same as Baileys `values`
+  poll_message_secret: '<base64>',           // NEW — required for decryption
 }
 ```
 
-For binary pendings (length === 2), the existing text path is unchanged — the user can react ✅/❌ on the question message OR reply with text.
+When `FEATURE_ONE_TAP=false` OR Baileys is disconnected, `sendPoll` returns all-null — caller falls back to the existing text-list path.
+
+### 5.3 Send-side: agent loop decision
+
+`sendOutbound` stays text-only. We add **`sendOutboundPoll`** as a sibling helper in `core.ts` for the poll branch — the metadata shape and return contract are different enough (`poll_options`, `poll_message_secret`) that one function doing both gets confused.
+
+The agent loop currently captures `latestPendingId: string | null` from the `ask_pending_question` tool result (`core.ts:226-243`). We **enrich** what's captured: instead of just the id, we pull the `opcoes_count` and `opcoes_validas` directly from the tool's result by extending the tool to return them (the row was already created — adding two fields to the JSON response is free; no extra DB round-trip).
+
+```typescript
+// ask_pending_question output schema becomes:
+z.object({
+  pending_question_id: z.string(),
+  opcoes_count: z.number().int().min(2).max(12),
+  opcoes_validas: z.array(z.object({ key: z.string(), label: z.string() })),
+})
+```
+
+In the agent loop:
+
+```typescript
+let latestPending: { id: string; opcoes_validas: ... } | null = null;
+// ... after ask_pending_question dispatches and re-validates ...
+
+// at the text-send site:
+if (
+  latestPending &&
+  config.FEATURE_ONE_TAP &&
+  latestPending.opcoes_validas.length >= 3 &&
+  latestPending.opcoes_validas.length <= 12
+) {
+  await sendOutboundPoll(pessoa.id, c.id, text, inbound.id, {
+    pending_question_id: latestPending.id,
+    options: latestPending.opcoes_validas,
+  });
+} else {
+  await sendOutbound(pessoa.id, c.id, text, inbound.id, {
+    pending_question_id: latestPending?.id ?? null,
+    quoted: shouldQuote ? quotedReplyContext(...) : undefined,
+  });
+}
+```
+
+Binary pendings (length === 2) take the text path — reactions work on plain text outbound messages.
+
+When `sendOutboundPoll` fails (Baileys disconnect, send error), it falls back internally to `sendOutbound`-with-text rendering of the question + numbered list. The user can still resolve by typing.
 
 ### 5.4 Receive-side: gateway prefix branches
 
@@ -127,12 +177,21 @@ if (isReactionStub(msg)) {
 2. Read `metadata.pending_question_id`. If absent, drop with audit `one_tap_no_pending_anchor`.
 3. Build `option_chosen` (deterministic):
    - **Reaction**: ✅ / 👍 → `opcoes_validas[0].key` (affirmative-first per B0 guard); ❌ / 👎 → `opcoes_validas[1].key`. Other emoji → audit `reaction_ignored_unmapped_emoji` and return.
-   - **Poll vote**: aggregate via `socket.getAggregateVotesInPollMessage(parent, ourPubKey)`, take `chosen_keys[0]`. Match against `metadata.poll_options[i].key`.
+   - **Poll vote**: WhatsApp poll updates carry SHA-256 hashes of the chosen option labels (not labels themselves, not indices). Decryption flow:
+     1. Read `metadata.poll_message_secret` from the outbound row.
+     2. Use Baileys' `decryptPollVote(msg.message.pollUpdateMessage, { messageSecret, ... })` to recover the chosen label hash.
+     3. For each label in `metadata.poll_options`, compute the same hash and compare. The matching label gives the `key`.
+     4. If decryption fails or no label matches → audit `one_tap_dispatch_error` with reason and return.
 4. Call `resolveAndDispatch({ ..., expected_pending_id, option_chosen, confidence: 1.0, source })`.
 
-### 5.5 Pessoa lookup at gateway layer
+### 5.5 Pessoa / conversa lookup at gateway layer
 
-The gateway dispatch handlers need `pessoa_id` and `conversa_id` to call `resolveAndDispatch`. Both are recoverable from the **outbound** `mensagens` row found in step 1 — `mensagens.conversa_id` is set, and the conversa knows its pessoa. No new lookups required, but we add `mensagensRepo.findByWhatsappId` (already exists on B0) and `conversasRepo.byId` (need to verify; if absent, add a one-line method).
+The gateway dispatch handlers need `pessoa` and `conversa` rows to pass into `resolveAndDispatch`. Both are recoverable from the outbound `mensagens` row found in step 1: `mensagens.conversa_id` → `conversa` row → `conversa.pessoa_id` → `pessoa` row.
+
+**Repository additions** (acceptance criterion):
+- `mensagensRepo.findByWhatsappId(whatsapp_id)` — **already exists** at `src/db/repositories.ts:215` (indexed via `uniq_mensagens_whatsapp_id`).
+- `conversasRepo.byId(id)` — **does not exist**. Add a one-liner that returns `Conversa | null`.
+- `pessoasRepo.findById(id)` — already exists.
 
 ### 5.6 Audit additions
 
@@ -208,7 +267,9 @@ This refactor is part of B1 — without it, B1's handlers would duplicate B0's t
 
 ## 12. Acceptance criteria
 
-- [ ] **Refactor**: `resolveAndDispatch` exists in `src/agent/pending-resolver.ts`; B0's gate calls it; existing B0 tests still green.
+- [ ] **Refactor**: `resolveAndDispatch` exists in `src/agent/pending-resolver.ts`; B0's gate calls it; the gate's `GateResult.resolved` no longer carries an action (already dispatched); core.ts no longer dispatches for the gate path.
+- [ ] **B0 tests updated**: `tests/unit/pending-gate.spec.ts` now mocks `resolveAndDispatch` instead of asserting on `dispatchTool` from core.ts.
+- [ ] `conversasRepo.byId` added.
 - [ ] **Send (poll)**: `FEATURE_ONE_TAP=true` + a pending with 3–12 opcoes → outbound is a WhatsApp poll; `mensagens.metadata.poll_options` is populated.
 - [ ] **Send (binary)**: `FEATURE_ONE_TAP=true` + a binary pending → outbound is plain text (poll path skipped); user can resolve by reaction.
 - [ ] **Receive (reaction)**: a ✅ reaction on the outbound parent of a binary pending resolves it; action dispatches; audit `pending_resolved_by_reaction` fires.
@@ -216,7 +277,7 @@ This refactor is part of B1 — without it, B1's handlers would duplicate B0's t
 - [ ] **Unmapped emoji**: 🎉 reaction → no resolution; audit `reaction_ignored_unmapped_emoji`.
 - [ ] **No anchor**: reaction on an outbound without `pending_question_id` → no resolution; audit `one_tap_no_pending_anchor`.
 - [ ] **Race**: reaction + text answer racing → action dispatches exactly once; loser audited as `pending_race_lost`.
-- [ ] **Stale message**: reaction on an old outbound (its pending was resolved long ago) → audit `one_tap_no_pending_anchor` because the active pending no longer matches the parent's `pending_question_id`.
+- [ ] **Stale message**: reaction on an old outbound whose pending was resolved long ago → `resolveAndDispatch` sees `expected_pending_id` not equal to `findActiveForUpdate`'s id and audits `pending_race_lost` (no resolution, no dispatch). The distinct `one_tap_no_pending_anchor` audit fires only when the parent outbound row has no `pending_question_id` at all (a non-pending message somebody reacted to).
 - [ ] `FEATURE_ONE_TAP=false`: zero send-side polls; zero receive-side dispatch; baileys behaves identically to current code.
 - [ ] No new `mensagens` rows for inbound poll updates or reactions.
 - [ ] Unit tests cover: emoji mapping; poll-key resolution; expected-vs-active mismatch; multi-tap idempotency.
