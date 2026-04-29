@@ -38,9 +38,16 @@ export function getSocket(): WASocket | null {
 
 type StubLike = { messageStubType?: number | null | undefined };
 
+/**
+ * Numeric value of `proto.WebMessageInfo.StubType.REACTION` in Baileys.
+ * Hard-coded as a number to keep `proto` as a type-only import (importing
+ * it as a value pulls in the full protobuf runtime). If Baileys ever
+ * renumbers the enum, the unit test for `isReactionStub` will catch it.
+ */
+export const REACTION_STUB_TYPE = 67;
+
 export function isReactionStub(msg: StubLike): boolean {
-  // proto.WebMessageInfo.StubType.REACTION === 67 per Baileys proto.
-  return msg.messageStubType === 67;
+  return msg.messageStubType === REACTION_STUB_TYPE;
 }
 
 export async function startBaileys(): Promise<void> {

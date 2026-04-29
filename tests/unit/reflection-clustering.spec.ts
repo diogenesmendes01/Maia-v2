@@ -15,6 +15,14 @@ describe('reflection-clustering — normalizeDescricao', () => {
       'uber transporte trabalho centro',
     );
   });
+
+  it('returns empty string for empty input', () => {
+    expect(normalizeDescricao('')).toBe('');
+  });
+
+  it('returns empty string when input is only stopwords and digits', () => {
+    expect(normalizeDescricao('de da 2026 1234')).toBe('');
+  });
 });
 
 describe('reflection-clustering — clusterCorrections', () => {

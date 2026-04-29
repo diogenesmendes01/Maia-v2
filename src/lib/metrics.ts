@@ -6,7 +6,10 @@
  */
 const counters = new Map<string, number>();
 const gaugeProviders = new Map<string, () => number | Promise<number>>();
-const histograms = new Map<string, { sum: number; count: number; buckets: number[]; counts: number[] }>();
+const histograms = new Map<
+  string,
+  { sum: number; count: number; buckets: number[]; counts: number[] }
+>();
 
 const DEFAULT_BUCKETS_MS = [50, 100, 250, 500, 1000, 2500, 5000, 10000];
 
@@ -22,6 +25,12 @@ function escape(v: string): string {
   return v.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
 }
 
+function splitNameAndInnerLabels(k: string): { name: string; inner: string } {
+  const i = k.indexOf('{');
+  if (i === -1) return { name: k, inner: '' };
+  return { name: k.slice(0, i), inner: k.slice(i + 1, -1) };
+}
+
 export function incCounter(name: string, labels?: Record<string, string>, by = 1): void {
   const k = key(name, labels);
   counters.set(k, (counters.get(k) ?? 0) + by);
@@ -31,11 +40,20 @@ export function setGaugeProvider(name: string, provider: () => number | Promise<
   gaugeProviders.set(name, provider);
 }
 
-export function observeHistogram(name: string, value: number, labels?: Record<string, string>): void {
+export function observeHistogram(
+  name: string,
+  value: number,
+  labels?: Record<string, string>,
+): void {
   const k = key(name, labels);
   let h = histograms.get(k);
   if (!h) {
-    h = { sum: 0, count: 0, buckets: DEFAULT_BUCKETS_MS, counts: new Array(DEFAULT_BUCKETS_MS.length + 1).fill(0) };
+    h = {
+      sum: 0,
+      count: 0,
+      buckets: DEFAULT_BUCKETS_MS,
+      counts: new Array(DEFAULT_BUCKETS_MS.length + 1).fill(0),
+    };
     histograms.set(k, h);
   }
   h.sum += value;
@@ -63,19 +81,26 @@ export async function renderPrometheus(): Promise<string> {
     }
   }
   for (const [k, h] of histograms) {
-    const base = k.includes('{') ? k.slice(0, -1) : k;
+    const { name, inner } = splitNameAndInnerLabels(k);
+    const sumCountLabels = inner ? `{${inner}}` : '';
+    const bucketLabel = (le: string): string => (inner ? `{${inner},le="${le}"}` : `{le="${le}"}`);
     let cumulative = 0;
     for (let i = 0; i < h.buckets.length; i++) {
       cumulative += h.counts[i]!;
-      const sep = base.endsWith('{') ? '' : ',';
-      lines.push(`${base}_bucket${base.endsWith('{') ? '' : sep}le="${h.buckets[i]}"} ${cumulative}`);
+      lines.push(`${name}_bucket${bucketLabel(String(h.buckets[i]))} ${cumulative}`);
     }
     cumulative += h.counts[h.buckets.length]!;
-    lines.push(`${base}_bucket${base.endsWith('{') ? '' : ','}le="+Inf"} ${cumulative}`);
-    lines.push(`${base.replace('_bucket', '')}_sum ${h.sum}`);
-    lines.push(`${base.replace('_bucket', '')}_count ${h.count}`);
+    lines.push(`${name}_bucket${bucketLabel('+Inf')} ${cumulative}`);
+    lines.push(`${name}_sum${sumCountLabels} ${h.sum}`);
+    lines.push(`${name}_count${sumCountLabels} ${h.count}`);
   }
   return lines.join('\n') + '\n';
+}
+
+export function _resetForTests(): void {
+  counters.clear();
+  gaugeProviders.clear();
+  histograms.clear();
 }
 
 export const _internal = { key };

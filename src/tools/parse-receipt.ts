@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type { Tool } from './_registry.js';
 import { parseImage } from '@/lib/vision.js';
+import { getCachedVision, setCachedVision } from './_vision-cache.js';
 
 const inputSchema = z.object({
   media_local_path: z.string().min(1),
@@ -20,10 +21,14 @@ const outputSchema = z.object({
   confianca: z.number().min(0).max(1),
 });
 
+type Output = z.infer<typeof outputSchema>;
+
 /**
- * Spec 10 §5.3 — extracts structured fields from a PIX/TED/DOC receipt
- * via Claude Vision. Idempotency keyed on file_sha256 → same image yields
- * cached parse with no extra API cost.
+ * Spec 10 §5.3 — extracts structured fields from a PIX/TED/DOC receipt via
+ * Claude Vision. Idempotency: the dispatcher keys on
+ * (pessoa_id, entity_id, file_sha256); on top of that, this handler caches
+ * the Vision parse keyed on file_sha256 alone so the same image uploaded
+ * by different pessoas doesn't pay the Vision API cost twice.
  */
 export const parseReceiptTool: Tool<typeof inputSchema, typeof outputSchema> = {
   name: 'parse_receipt',
@@ -35,11 +40,18 @@ export const parseReceiptTool: Tool<typeof inputSchema, typeof outputSchema> = {
   side_effect: 'read',
   redis_required: false,
   operation_type: 'parse_only',
-  audit_action: 'boleto_parsed',
+  audit_action: 'receipt_parsed',
   handler: async (args) => {
+    const cached = await getCachedVision<Output>('parse_receipt', args.file_sha256);
+    if (cached) return cached;
+
     const result = await parseImage({ path: args.media_local_path, kind: 'receipt' });
-    if (!result) return { confianca: 0 };
-    return {
+    if (!result) {
+      const empty: Output = { confianca: 0 };
+      await setCachedVision('parse_receipt', args.file_sha256, empty);
+      return empty;
+    }
+    const out: Output = {
       tipo: result.tipo,
       valor: result.valor,
       data: result.data,
@@ -49,7 +61,9 @@ export const parseReceiptTool: Tool<typeof inputSchema, typeof outputSchema> = {
       banco_origem: result.banco_origem,
       banco_destino: result.banco_destino,
       endToEndId: result.endToEndId,
-      confianca: result.valor && result.beneficiario_nome ? 0.85 : 0.5,
+      confianca: result.valor && result.beneficiario_nome ? 0.85 : 0.6,
     };
+    await setCachedVision('parse_receipt', args.file_sha256, out);
+    return out;
   },
 };
