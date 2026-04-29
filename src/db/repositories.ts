@@ -718,17 +718,21 @@ export const dlqRepo = {
     payload: unknown;
     error: string;
     attempts: number;
-  }): Promise<void> {
+  }): Promise<{ id: string }> {
     const now = new Date();
-    await db.insert(dead_letter_jobs).values({
-      queue_name: input.queue_name,
-      job_id: input.job_id,
-      payload: input.payload as object,
-      error: input.error,
-      attempts: input.attempts,
-      first_failed_at: now,
-      last_failed_at: now,
-    });
+    const rows = await db
+      .insert(dead_letter_jobs)
+      .values({
+        queue_name: input.queue_name,
+        job_id: input.job_id,
+        payload: input.payload as object,
+        error: input.error,
+        attempts: input.attempts,
+        first_failed_at: now,
+        last_failed_at: now,
+      })
+      .returning({ id: dead_letter_jobs.id });
+    return rows[0]!;
   },
   async listOpen(n = 100) {
     return db
