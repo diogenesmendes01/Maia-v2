@@ -24,6 +24,10 @@ export const IntentResolutionSchema = z.object({
 
 export type IntentResolution = z.infer<typeof IntentResolutionSchema>;
 
+/**
+ * @deprecated Use pendingQuestionsRepo + src/agent/pending-gate.ts instead.
+ * Retained only for src/workflows/dual-approval.ts which has its own pending state.
+ */
 export async function setLightweightPending(
   conversa: Conversa,
   data: Omit<PendingQuestionData, 'id' | 'created_at' | 'expira_em'>,
@@ -46,6 +50,7 @@ export async function setLightweightPending(
   return full;
 }
 
+/** @deprecated See setLightweightPending. */
 export function getActivePending(conversa: Conversa): PendingQuestionData | null {
   const meta = (conversa.metadata ?? {}) as Record<string, unknown>;
   const pq = meta.pending_question as PendingQuestionData | null | undefined;
@@ -54,6 +59,7 @@ export function getActivePending(conversa: Conversa): PendingQuestionData | null
   return pq;
 }
 
+/** @deprecated See setLightweightPending. */
 export async function clearLightweightPending(conversa: Conversa): Promise<void> {
   const meta = (conversa.metadata ?? {}) as Record<string, unknown>;
   delete meta.pending_question;
