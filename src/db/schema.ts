@@ -386,6 +386,18 @@ export const import_entries = pgTable(
 // table in this file does — keeping it consistent with the surrounding code.
 // The migration is the source of truth; this schema is the typing layer.
 
+export const dashboard_sessions = pgTable('dashboard_sessions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  pessoa_id: uuid('pessoa_id').notNull(),
+  token_hash: text('token_hash').notNull(),
+  expira_em: timestamp('expira_em', { withTimezone: true }).notNull(),
+  ip: text('ip'),
+  user_agent: text('user_agent'),
+  created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  used_at: timestamp('used_at', { withTimezone: true }),
+  revoked_at: timestamp('revoked_at', { withTimezone: true }),
+});
+
 export const audit_log = pgTable('audit_log', {
   id: uuid('id').primaryKey().defaultRandom(),
   pessoa_id: uuid('pessoa_id'),
@@ -423,3 +435,4 @@ export type AuditEntry = typeof audit_log.$inferSelect;
 export type PermissionProfile = typeof permission_profiles.$inferSelect;
 export type ImportRun = typeof import_runs.$inferSelect;
 export type ImportEntry = typeof import_entries.$inferSelect;
+export type DashboardSession = typeof dashboard_sessions.$inferSelect;
