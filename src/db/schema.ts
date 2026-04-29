@@ -339,6 +339,43 @@ export const dashboard_sessions = pgTable('dashboard_sessions', {
   revoked_at: timestamp('revoked_at', { withTimezone: true }),
 });
 
+export const import_runs = pgTable('import_runs', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  pessoa_id: uuid('pessoa_id').notNull(),
+  entidade_id: uuid('entidade_id').notNull(),
+  conta_id: uuid('conta_id').notNull(),
+  fonte: text('fonte').notNull(),
+  arquivo_sha256: text('arquivo_sha256').notNull(),
+  arquivo_nome: text('arquivo_nome'),
+  periodo_de: date('periodo_de'),
+  periodo_ate: date('periodo_ate'),
+  total_lancamentos: integer('total_lancamentos').notNull().default(0),
+  matched: integer('matched').notNull().default(0),
+  candidates: integer('candidates').notNull().default(0),
+  novos: integer('novos').notNull().default(0),
+  status: text('status').notNull(),
+  metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+  created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const import_entries = pgTable('import_entries', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  import_run_id: uuid('import_run_id').notNull(),
+  ordem: integer('ordem').notNull(),
+  tipo_oper: text('tipo_oper').notNull(),
+  valor: numeric('valor', { precision: 15, scale: 2 }).notNull(),
+  data_oper: date('data_oper').notNull(),
+  fitid: text('fitid'),
+  memo: text('memo'),
+  contraparte_raw: text('contraparte_raw'),
+  status: text('status').notNull(),
+  matched_transacao_id: uuid('matched_transacao_id'),
+  candidates: jsonb('candidates'),
+  resolved_at: timestamp('resolved_at', { withTimezone: true }),
+  created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
 export const audit_log = pgTable('audit_log', {
   id: uuid('id').primaryKey().defaultRandom(),
   pessoa_id: uuid('pessoa_id'),
@@ -375,3 +412,5 @@ export type DeadLetterJob = typeof dead_letter_jobs.$inferSelect;
 export type AuditEntry = typeof audit_log.$inferSelect;
 export type PermissionProfile = typeof permission_profiles.$inferSelect;
 export type DashboardSession = typeof dashboard_sessions.$inferSelect;
+export type ImportRun = typeof import_runs.$inferSelect;
+export type ImportEntry = typeof import_entries.$inferSelect;
