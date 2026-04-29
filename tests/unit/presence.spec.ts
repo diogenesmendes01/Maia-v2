@@ -65,3 +65,61 @@ describe('presence — markRead', () => {
     expect(readMessages).not.toHaveBeenCalled();
   });
 });
+
+describe('presence — startTyping', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.doMock('../../src/config/env.js', () => ({ config: { FEATURE_PRESENCE: true } }));
+    vi.doMock('../../src/lib/logger.js', () => ({
+      logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    }));
+    vi.doMock('../../src/gateway/baileys.js', () => ({
+      isBaileysConnected: () => true,
+      getSocket: () => ({ readMessages, sendPresenceUpdate, sendMessage }),
+    }));
+  });
+
+  it('emits "composing" once on start and "paused" on stop', async () => {
+    const { startTyping } = await import('../../src/gateway/presence.js');
+    const handle = startTyping('jid-1', 'inbound-1');
+    await new Promise((r) => setImmediate(r));
+    expect(sendPresenceUpdate).toHaveBeenCalledWith('composing', 'jid-1');
+    handle.stop();
+    await new Promise((r) => setImmediate(r));
+    expect(sendPresenceUpdate).toHaveBeenCalledWith('paused', 'jid-1');
+  });
+
+  it('returns the same handle for the same mensagem_id', async () => {
+    const { startTyping } = await import('../../src/gateway/presence.js');
+    const a = startTyping('jid', 'inbound-X');
+    const b = startTyping('jid', 'inbound-X');
+    expect(a).toBe(b);
+    a.stop();
+  });
+
+  it('handle.stop() is idempotent', async () => {
+    const { startTyping } = await import('../../src/gateway/presence.js');
+    const handle = startTyping('jid', 'inbound-Y');
+    handle.stop();
+    handle.stop();
+    await new Promise((r) => setImmediate(r));
+    const pausedCalls = sendPresenceUpdate.mock.calls.filter((c) => c[0] === 'paused');
+    expect(pausedCalls).toHaveLength(1);
+  });
+
+  it('returns no-op handle when FEATURE_PRESENCE is false', async () => {
+    vi.resetModules();
+    vi.doMock('../../src/config/env.js', () => ({ config: { FEATURE_PRESENCE: false } }));
+    vi.doMock('../../src/lib/logger.js', () => ({
+      logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    }));
+    vi.doMock('../../src/gateway/baileys.js', () => ({
+      isBaileysConnected: () => true,
+      getSocket: () => ({ readMessages, sendPresenceUpdate, sendMessage }),
+    }));
+    const { startTyping } = await import('../../src/gateway/presence.js');
+    const handle = startTyping('jid', 'm1');
+    handle.stop();
+    expect(sendPresenceUpdate).not.toHaveBeenCalled();
+  });
+});

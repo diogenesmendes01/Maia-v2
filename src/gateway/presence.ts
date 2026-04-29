@@ -21,9 +21,47 @@ export function markRead(remote_jid: string, whatsapp_id: string): void {
     .catch((err: Error) => logger.warn({ err: err.message }, 'presence.mark_read_failed'));
 }
 
-export function startTyping(_remote_jid: string, _mensagem_id: string): TypingHandle {
+const REFRESH_MS = 8_000;
+
+type Entry = {
+  handle: TypingHandle;
+  jid: string;
+  timer: NodeJS.Timeout;
+  started_at: number;
+};
+
+const handles = new Map<string, Entry>();
+
+export function startTyping(remote_jid: string, mensagem_id: string): TypingHandle {
   if (!config.FEATURE_PRESENCE) return NOOP_HANDLE;
-  return NOOP_HANDLE; // implemented in Task 5
+  if (!isBaileysConnected()) return NOOP_HANDLE;
+  const existing = handles.get(mensagem_id);
+  if (existing) return existing.handle;
+
+  const sock = getSocket();
+  if (!sock) return NOOP_HANDLE;
+
+  const send = () =>
+    sock
+      .sendPresenceUpdate('composing', remote_jid)
+      .catch((err: Error) => logger.warn({ err: err.message }, 'presence.typing_failed'));
+  void send();
+  const timer = setInterval(send, REFRESH_MS);
+
+  let stopped = false;
+  const handle: TypingHandle = {
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      clearInterval(timer);
+      handles.delete(mensagem_id);
+      sock
+        .sendPresenceUpdate('paused', remote_jid)
+        .catch((err: Error) => logger.warn({ err: err.message }, 'presence.typing_paused_failed'));
+    },
+  };
+  handles.set(mensagem_id, { handle, jid: remote_jid, timer, started_at: Date.now() });
+  return handle;
 }
 
 export function sendReaction(
