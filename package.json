@@ -38,6 +38,7 @@
     "fastify": "^5.1.0",
     "ioredis": "^5.4.1",
     "node-cron": "^3.0.3",
+    "nodemailer": "^6.9.16",
     "openai": "^4.70.0",
     "pg": "^8.13.0",
     "pino": "^9.5.0",
@@ -48,6 +49,7 @@
   "devDependencies": {
     "@types/node": "^22.9.0",
     "@types/node-cron": "^3.0.11",
+    "@types/nodemailer": "^6.4.17",
     "@types/pg": "^8.11.10",
     "@types/qrcode-terminal": "^0.12.2",
     "@typescript-eslint/eslint-plugin": "^8.13.0",
