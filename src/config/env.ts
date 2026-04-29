@@ -94,6 +94,10 @@ const envSchema = z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
+    FEATURE_PENDING_GATE: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
   })
   .superRefine((cfg, ctx) => {
     if (cfg.LLM_PROVIDER === 'openai' && !cfg.OPENAI_API_KEY) {

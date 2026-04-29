@@ -541,6 +541,80 @@ export const pendingQuestionsRepo = {
       .returning({ id: pending_questions.id });
     return rows.length;
   },
+
+  // === B0 tx-aware additions ===
+
+  async findActiveSnapshot(conversa_id: string): Promise<PendingQuestion | null> {
+    const rows = await db
+      .select()
+      .from(pending_questions)
+      .where(
+        and(
+          eq(pending_questions.conversa_id, conversa_id),
+          eq(pending_questions.status, 'aberta'),
+          sql`expira_em > now()`,
+        ),
+      )
+      .orderBy(desc(pending_questions.created_at))
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  async findActiveForUpdate(
+    tx: typeof db,
+    conversa_id: string,
+  ): Promise<PendingQuestion | null> {
+    const rows = await tx
+      .select()
+      .from(pending_questions)
+      .where(
+        and(
+          eq(pending_questions.conversa_id, conversa_id),
+          eq(pending_questions.status, 'aberta'),
+          sql`expira_em > now()`,
+        ),
+      )
+      .orderBy(desc(pending_questions.created_at))
+      .limit(1)
+      .for('update');
+    return rows[0] ?? null;
+  },
+
+  async resolveTx(tx: typeof db, id: string, resposta: unknown): Promise<void> {
+    await tx
+      .update(pending_questions)
+      .set({
+        status: 'respondida',
+        resposta: resposta as object,
+        resolvida_em: new Date(),
+      })
+      .where(eq(pending_questions.id, id));
+  },
+
+  async cancelTx(tx: typeof db, id: string, reason: string): Promise<void> {
+    await tx.execute(sql`
+      UPDATE pending_questions
+         SET status = 'cancelada',
+             metadata = metadata || ${JSON.stringify({ cancel_reason: reason })}::jsonb
+       WHERE id = ${id}
+    `);
+  },
+
+  async cancelOpenForConversaTx(
+    tx: typeof db,
+    conversa_id: string,
+    reason: string,
+  ): Promise<{ cancelled_ids: string[] }> {
+    const result = await tx.execute<{ id: string }>(sql`
+      UPDATE pending_questions
+         SET status = 'cancelada',
+             metadata = metadata || ${JSON.stringify({ cancel_reason: reason })}::jsonb
+       WHERE conversa_id = ${conversa_id}
+         AND status = 'aberta'
+       RETURNING id::text
+    `);
+    return { cancelled_ids: result.rows.map((r) => (r as { id: string }).id) };
+  },
 };
 
 export const idempotencyRepo = {
