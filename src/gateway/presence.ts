@@ -11,9 +11,24 @@ export interface TypingHandle {
 
 const NOOP_HANDLE: TypingHandle = { stop: () => undefined };
 
+/**
+ * WhatsApp JID format: digits@s.whatsapp.net (individual) or digits@g.us
+ * (group). Validate before passing to Baileys so a malformed metadata
+ * field doesn't bubble down into the socket call as `undefined@...`.
+ */
+const JID_REGEX = /^\d{5,20}@(s\.whatsapp\.net|g\.us)$/;
+
+function validJid(jid: string): boolean {
+  return JID_REGEX.test(jid);
+}
+
 export function markRead(remote_jid: string, whatsapp_id: string): void {
   if (!config.FEATURE_PRESENCE) return;
   if (!isBaileysConnected()) return;
+  if (!validJid(remote_jid) || !whatsapp_id) {
+    logger.warn({ remote_jid: '[REDACTED]' }, 'presence.invalid_jid_mark_read');
+    return;
+  }
   const sock = getSocket();
   if (!sock) return;
   sock
@@ -35,13 +50,17 @@ const handles = new Map<string, Entry>();
 export function startTyping(remote_jid: string, mensagem_id: string): TypingHandle {
   if (!config.FEATURE_PRESENCE) return NOOP_HANDLE;
   if (!isBaileysConnected()) return NOOP_HANDLE;
+  if (!validJid(remote_jid)) {
+    logger.warn({ remote_jid: '[REDACTED]' }, 'presence.invalid_jid_typing');
+    return NOOP_HANDLE;
+  }
   const existing = handles.get(mensagem_id);
   if (existing) return existing.handle;
 
   const sock = getSocket();
   if (!sock) return NOOP_HANDLE;
 
-  const send = () =>
+  const send = (): Promise<void> =>
     sock
       .sendPresenceUpdate('composing', remote_jid)
       .catch((err: Error) => logger.warn({ err: err.message }, 'presence.typing_failed'));
@@ -71,6 +90,10 @@ export function sendReaction(
 ): void {
   if (!config.FEATURE_PRESENCE) return;
   if (!isBaileysConnected()) return;
+  if (!validJid(remote_jid) || !whatsapp_id) {
+    logger.warn({ remote_jid: '[REDACTED]' }, 'presence.invalid_jid_reaction');
+    return;
+  }
   const sock = getSocket();
   if (!sock) return;
   sock
@@ -90,6 +113,7 @@ export function quotedReplyContext(
   const whatsapp_id = inbound_metadata.whatsapp_id;
   const remote_jid = inbound_metadata.remote_jid;
   if (typeof whatsapp_id !== 'string' || typeof remote_jid !== 'string') return undefined;
+  if (!validJid(remote_jid)) return undefined;
   return {
     key: { remoteJid: remote_jid, id: whatsapp_id, fromMe: false },
     message: { conversation: (inbound_conteudo ?? '').slice(0, QUOTED_TRUNCATE) },
@@ -116,6 +140,26 @@ function drainAll(): void {
   for (const entry of handles.values()) entry.handle.stop();
 }
 
-process.once('beforeExit', drainAll);
+// `beforeExit` only fires when the event loop empties — it does NOT cover
+// SIGTERM (k8s/docker shutdown) or SIGINT (Ctrl+C). Listen for those too so
+// the typing intervals get cleaned up on every shutdown path. We re-emit the
+// signal after draining so Node's default termination behavior takes over
+// (the `.once` listener has auto-removed by then).
+//
+// Guarded by a Symbol on globalThis so test runners that re-import the
+// module (vi.resetModules) don't pile up duplicate listeners.
+const SHUTDOWN_INSTALLED = Symbol.for('maia.presence.shutdown_handlers');
+type GlobalWithFlag = typeof globalThis & { [SHUTDOWN_INSTALLED]?: boolean };
+const g = globalThis as GlobalWithFlag;
+if (!g[SHUTDOWN_INSTALLED]) {
+  g[SHUTDOWN_INSTALLED] = true;
+  process.once('beforeExit', drainAll);
+  const onSignal = (signal: NodeJS.Signals): void => {
+    drainAll();
+    process.kill(process.pid, signal);
+  };
+  process.once('SIGTERM', () => onSignal('SIGTERM'));
+  process.once('SIGINT', () => onSignal('SIGINT'));
+}
 
-export const _internal = { runStaleSweep, drainAll, handles };
+export const _internal = { runStaleSweep, drainAll, handles, validJid };
