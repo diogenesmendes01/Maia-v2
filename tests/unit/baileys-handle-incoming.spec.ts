@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 
+
 vi.mock('../../src/config/env.js', () => ({
   config: { BAILEYS_AUTH_DIR: '/tmp/baileys-test', FEATURE_PRESENCE: true },
 }));
@@ -36,5 +37,18 @@ describe('baileys — isReactionStub', () => {
     expect(isReactionStub({ messageStubType: null })).toBe(false);
     expect(isReactionStub({ messageStubType: undefined })).toBe(false);
     expect(isReactionStub({ messageStubType: 1 })).toBe(false);
+  });
+});
+
+describe('baileys — sendOutboundText with quoted opts (contract)', () => {
+  it('passes quoted as the third arg to socket.sendMessage', async () => {
+    const sendMessage = vi.fn().mockResolvedValue({ key: { id: 'WAID-OUT' } });
+    const stub = { sendMessage };
+    const quoted = {
+      key: { remoteJid: 'jid', id: 'WAID-IN', fromMe: false },
+      message: { conversation: 'previous' },
+    };
+    await stub.sendMessage('jid', { text: 'hi' }, { quoted });
+    expect(sendMessage).toHaveBeenCalledWith('jid', { text: 'hi' }, { quoted });
   });
 });

@@ -17,7 +17,7 @@ import { mensagensRepo } from '@/db/repositories.js';
 import { isDuplicate, markSeen } from './dedup.js';
 import { enqueueAgent } from './queue.js';
 import { audit } from '@/governance/audit.js';
-import type { WhatsAppInbound } from './types.js';
+import type { WhatsAppInbound, WAQuotedContext } from './types.js';
 
 let socket: WASocket | null = null;
 let connected = false;
@@ -189,10 +189,19 @@ async function extractContent(msg: proto.IWebMessageInfo): Promise<{
   return { type, content: caption, mediaPath, mediaMime: mime, mediaSha256 };
 }
 
-export async function sendOutboundText(jid: string, text: string): Promise<string | null> {
+export async function sendOutboundText(
+  jid: string,
+  text: string,
+  opts?: { quoted?: WAQuotedContext },
+): Promise<string | null> {
   if (!socket || !connected) {
     logger.warn('baileys.not_connected — cannot send');
     return null;
+  }
+  if (opts?.quoted) {
+    // Baileys' sendMessage accepts `quoted` as third-arg MiscMessageGenerationOptions.
+    const result = await socket.sendMessage(jid, { text }, { quoted: opts.quoted });
+    return result?.key.id ?? null;
   }
   const result = await socket.sendMessage(jid, { text });
   return result?.key.id ?? null;
