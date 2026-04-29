@@ -32,7 +32,14 @@ export const askPendingQuestionTool: Tool<typeof inputSchema, typeof outputSchem
     'Cria uma pergunta pendente persistida que será resolvida quando o usuário responder. Use quando precisa esperar uma escolha (sim/não, ou 3-12 opções) antes de continuar.',
   input_schema: inputSchema,
   output_schema: outputSchema,
-  required_actions: ['schedule_reminder'],
+  // No required_actions: this is an orchestration primitive (the agent's own
+  // ability to wait on a user choice), not a domain action requested by the
+  // user. Tying it to `schedule_reminder` would block the gate in any flow
+  // where the profile lacks reminder permission — e.g. transaction creation
+  // / correction / cancellation by an `operador` profile. Authorization for
+  // the *proposed action* (acao_proposta.tool) is enforced when that tool is
+  // dispatched, not when the question is asked.
+  required_actions: [],
   side_effect: 'communication',
   redis_required: false,
   operation_type: 'create',
@@ -62,7 +69,11 @@ export const askPendingQuestionTool: Tool<typeof inputSchema, typeof outputSchem
           metadata: { cancelled_ids: cancelled.cancelled_ids },
         });
       }
-      const row = await pendingQuestionsRepo.create({
+      // Insert in the same tx as the cancel above. The partial unique index
+      // `(conversa_id) WHERE status='aberta'` (migration 004) means a
+      // separate connection would still see the prior row as 'aberta' until
+      // the cancel commits, and the insert would 23505.
+      const row = await pendingQuestionsRepo.createTx(tx, {
         conversa_id: ctx.conversa.id,
         pessoa_id: ctx.pessoa.id,
         tipo: 'gate',

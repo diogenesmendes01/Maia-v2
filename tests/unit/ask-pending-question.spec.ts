@@ -3,6 +3,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 const insertedRow = { id: 'pq-uuid-1' };
 const repoMock = {
   create: vi.fn().mockResolvedValue(insertedRow),
+  createTx: vi.fn().mockResolvedValue(insertedRow),
   cancelOpenForConversaTx: vi.fn().mockResolvedValue({ cancelled_ids: [] }),
 };
 const auditMock = vi.fn();
@@ -25,6 +26,7 @@ vi.mock('../../src/lib/logger.js', () => ({
 
 beforeEach(() => {
   repoMock.create.mockClear();
+  repoMock.createTx.mockClear();
   repoMock.cancelOpenForConversaTx.mockClear();
   repoMock.cancelOpenForConversaTx.mockResolvedValue({ cancelled_ids: [] });
   auditMock.mockClear();
@@ -75,7 +77,10 @@ describe('ask_pending_question — schema + affirmative-first', () => {
       'c1',
       'substituted',
     );
-    expect(repoMock.create).toHaveBeenCalled();
+    // Insert must go through createTx so it shares the cancel's transaction;
+    // the legacy `create` (uses global db pool) must NOT be called.
+    expect(repoMock.createTx).toHaveBeenCalled();
+    expect(repoMock.create).not.toHaveBeenCalled();
   });
 
   it('substitutes prior open pending and audits pending_substituted with prior ids', async () => {

@@ -107,7 +107,7 @@ describe('pending-gate — resolve path', () => {
     expect(resolveTx).toHaveBeenCalled();
   });
 
-  it('topic change cancels the row and returns unresolved', async () => {
+  it('topic change cancels the row with reason "topic_change" and audits accordingly', async () => {
     findActiveSnapshot.mockResolvedValueOnce({
       id: 'pq-2',
       pergunta: 'Confirma?',
@@ -127,6 +127,40 @@ describe('pending-gate — resolve path', () => {
     const out = await checkPendingFirst({ pessoa, conversa, inbound });
     expect(out).toEqual({ kind: 'unresolved', reason: 'topic_change' });
     expect(cancelTx).toHaveBeenCalledWith(expect.anything(), 'pq-2', 'topic_change');
+    const audits = audit.mock.calls.filter((c) => c[0].acao === 'pending_unresolved_topic_change');
+    expect(audits.length).toBe(1);
+    // Cancellation must NOT be audited under topic_change.
+    const wrongAudit = audit.mock.calls.filter((c) => c[0].acao === 'pending_unresolved_cancelled');
+    expect(wrongAudit.length).toBe(0);
+  });
+
+  it('explicit cancellation cancels with reason "cancelled" and audits separately', async () => {
+    findActiveSnapshot.mockResolvedValueOnce({
+      id: 'pq-cancel',
+      pergunta: 'Confirma?',
+      opcoes_validas: [{ key: 'sim', label: 'Sim' }, { key: 'nao', label: 'Não' }],
+      acao_proposta: {},
+    });
+    callLLM.mockResolvedValueOnce({
+      content: '{"resolves_pending":false,"is_cancellation":true,"confidence":0.95}',
+      usage: { input_tokens: 0, output_tokens: 0 },
+      tool_uses: [],
+      stop_reason: 'end_turn',
+      model: 'haiku',
+    });
+    findActiveForUpdate.mockResolvedValueOnce({ id: 'pq-cancel', acao_proposta: {} });
+    cancelTx.mockResolvedValueOnce(undefined);
+    const { checkPendingFirst } = await import('../../src/agent/pending-gate.js');
+    const out = await checkPendingFirst({ pessoa, conversa, inbound });
+    expect(out).toEqual({ kind: 'unresolved', reason: 'cancelled' });
+    expect(cancelTx).toHaveBeenCalledWith(expect.anything(), 'pq-cancel', 'cancelled');
+    const audits = audit.mock.calls.filter((c) => c[0].acao === 'pending_unresolved_cancelled');
+    expect(audits.length).toBe(1);
+    // Topic-change audit must NOT fire on explicit cancellation.
+    const topicAudits = audit.mock.calls.filter(
+      (c) => c[0].acao === 'pending_unresolved_topic_change',
+    );
+    expect(topicAudits.length).toBe(0);
   });
 
   it('low confidence: no DB write, audits pending_unresolved_low_confidence', async () => {
