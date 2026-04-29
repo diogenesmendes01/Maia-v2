@@ -83,6 +83,7 @@ export async function handleQuarantineFirstContact(input: {
     },
     expira_em: new Date(ttl),
     status: 'aberta',
+    metadata: {},
   });
 
   // Send the prompt to the owner.

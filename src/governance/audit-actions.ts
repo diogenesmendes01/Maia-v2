@@ -61,6 +61,14 @@ export const AUDIT_ACTIONS = [
   'balance_queried',
   'workflow_rolled_back',
   'workflow_compensation_required',
+  'pending_created',
+  'pending_resolved_by_gate',
+  'pending_unresolved_topic_change',
+  'pending_unresolved_cancelled',
+  'pending_unresolved_low_confidence',
+  'pending_substituted',
+  'pending_action_dispatched',
+  'pending_race_lost',
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];

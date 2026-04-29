@@ -491,10 +491,18 @@ export const rulesRepo = {
   },
 };
 
+// `metadata` is `notNull()` in the schema (with `default '{}'::jsonb`) which
+// makes it required on the inferred select type. Existing callers (e.g.
+// src/identity/quarantine.ts) that predate the column don't pass metadata —
+// the DB default is what they want. We strip metadata from the Omit and
+// add it back as optional so those call sites keep typechecking.
+type PendingQuestionInsert = Omit<
+  PendingQuestion,
+  'id' | 'created_at' | 'resolvida_em' | 'resposta' | 'metadata'
+> & { metadata?: object };
+
 export const pendingQuestionsRepo = {
-  async create(
-    input: Omit<PendingQuestion, 'id' | 'created_at' | 'resolvida_em' | 'resposta'>,
-  ): Promise<PendingQuestion> {
+  async create(input: PendingQuestionInsert): Promise<PendingQuestion> {
     const rows = await db.insert(pending_questions).values(input).returning();
     return rows[0]!;
   },
@@ -540,6 +548,92 @@ export const pendingQuestionsRepo = {
       .where(and(eq(pending_questions.status, 'aberta'), sql`expira_em < now()`))
       .returning({ id: pending_questions.id });
     return rows.length;
+  },
+
+  // === B0 tx-aware additions ===
+
+  async findActiveSnapshot(conversa_id: string): Promise<PendingQuestion | null> {
+    const rows = await db
+      .select()
+      .from(pending_questions)
+      .where(
+        and(
+          eq(pending_questions.conversa_id, conversa_id),
+          eq(pending_questions.status, 'aberta'),
+          sql`expira_em > now()`,
+        ),
+      )
+      .orderBy(desc(pending_questions.created_at))
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  async findActiveForUpdate(
+    tx: typeof db,
+    conversa_id: string,
+  ): Promise<PendingQuestion | null> {
+    const rows = await tx
+      .select()
+      .from(pending_questions)
+      .where(
+        and(
+          eq(pending_questions.conversa_id, conversa_id),
+          eq(pending_questions.status, 'aberta'),
+          sql`expira_em > now()`,
+        ),
+      )
+      .orderBy(desc(pending_questions.created_at))
+      .limit(1)
+      .for('update');
+    return rows[0] ?? null;
+  },
+
+  async resolveTx(tx: typeof db, id: string, resposta: unknown): Promise<void> {
+    await tx
+      .update(pending_questions)
+      .set({
+        status: 'respondida',
+        resposta: resposta as object,
+        resolvida_em: new Date(),
+      })
+      .where(eq(pending_questions.id, id));
+  },
+
+  async cancelTx(tx: typeof db, id: string, reason: string): Promise<void> {
+    await tx.execute(sql`
+      UPDATE pending_questions
+         SET status = 'cancelada',
+             metadata = metadata || ${JSON.stringify({ cancel_reason: reason })}::jsonb
+       WHERE id = ${id}
+    `);
+  },
+
+  async cancelOpenForConversaTx(
+    tx: typeof db,
+    conversa_id: string,
+    reason: string,
+  ): Promise<{ cancelled_ids: string[] }> {
+    const result = await tx.execute<{ id: string }>(sql`
+      UPDATE pending_questions
+         SET status = 'cancelada',
+             metadata = metadata || ${JSON.stringify({ cancel_reason: reason })}::jsonb
+       WHERE conversa_id = ${conversa_id}
+         AND status = 'aberta'
+       RETURNING id::text
+    `);
+    return { cancelled_ids: result.rows.map((r) => (r as { id: string }).id) };
+  },
+
+  async createTx(
+    tx: typeof db,
+    input: PendingQuestionInsert,
+  ): Promise<PendingQuestion> {
+    // Insert inside the same tx as the cancel — required by the partial unique
+    // index `(conversa_id) WHERE status='aberta'` from migration 004. Doing
+    // the insert on the global pool would race with the in-flight cancel and
+    // hit a duplicate-key error.
+    const rows = await tx.insert(pending_questions).values(input).returning();
+    return rows[0]!;
   },
 };
 

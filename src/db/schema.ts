@@ -288,6 +288,7 @@ export const pending_questions = pgTable('pending_questions', {
   status: text('status').notNull().default('aberta'),
   resposta: jsonb('resposta'),
   resolvida_em: timestamp('resolvida_em', { withTimezone: true }),
+  metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
   created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 

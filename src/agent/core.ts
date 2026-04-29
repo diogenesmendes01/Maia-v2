@@ -1,5 +1,6 @@
-import { mensagensRepo, conversasRepo, pessoasRepo } from '@/db/repositories.js';
+import { mensagensRepo, conversasRepo, pessoasRepo, pendingQuestionsRepo } from '@/db/repositories.js';
 import { resolveScope } from '@/governance/permissions.js';
+import { checkPendingFirst } from '@/agent/pending-gate.js';
 import { checkRateLimit, formatPoliteReply } from '@/gateway/rate-limit.js';
 import { resolveIdentity } from '@/identity/resolver.js';
 import { handleQuarantineFirstContact, handleOwnerIdentityReply } from '@/identity/quarantine.js';
@@ -118,6 +119,37 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
     return;
   }
 
+  // B0: pre-LLM gate. If the user's reply resolves a pending question,
+  // dispatch the proposed action and skip the full ReAct turn.
+  const gate = await checkPendingFirst({ pessoa, conversa: c, inbound });
+  if (gate.kind === 'resolved') {
+    if (gate.action) {
+      const args = { ...gate.action.args, _pending_choice: gate.option_chosen };
+      await dispatchTool({
+        tool: gate.action.tool,
+        args,
+        ctx: {
+          pessoa,
+          scope: await resolveScope(pessoa),
+          conversa: c,
+          mensagem_id: inbound.id,
+          request_id: uuid(),
+        },
+      });
+      await audit({
+        acao: 'pending_action_dispatched',
+        pessoa_id: pessoa.id,
+        conversa_id: c.id,
+        mensagem_id: inbound.id,
+        metadata: { tool: gate.action.tool, pending_question_id: gate.pending_question_id },
+      });
+    }
+    await mensagensRepo.markProcessed(inbound.id, 0);
+    await conversasRepo.touch(c.id);
+    return;
+  }
+  // 'unresolved' and 'no_pending' fall through to the existing ReAct flow.
+
   const scope = await resolveScope(pessoa);
 
   const { system, messages } = await buildPrompt({
@@ -130,6 +162,7 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
   const tools = getToolSchemas(scope.byEntity);
   let totalTokens = 0;
   const conversation: LLMMessage[] = messages;
+  let latestPendingId: string | null = null;
 
   const jid = pessoa.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
   const stopTyping = scheduleTypingDebounce(jid, inbound.id);
@@ -142,8 +175,10 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
         const text = res.content?.trim() ?? '';
         if (text) {
           const shouldQuote =
-            (inbound.conteudo && detectCorrection(inbound.conteudo)) || getActivePending(c) !== null;
+            (inbound.conteudo && detectCorrection(inbound.conteudo)) ||
+            getActivePending(c) !== null;
           await sendOutbound(pessoa.id, c.id, text, inbound.id, {
+            pending_question_id: latestPendingId,
             quoted: shouldQuote
               ? quotedReplyContext(inbound.metadata as Record<string, unknown> | null, inbound.conteudo)
               : undefined,
@@ -178,8 +213,34 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
           },
         });
         const isError = typeof out === 'object' && out !== null && 'error' in out;
+
+        // B0: capture the freshly-created pending id, with re-validation against
+        // the dispatcher's 5-min idempotency cache.
+        if (
+          tu.tool === 'ask_pending_question' &&
+          typeof out === 'object' &&
+          out !== null &&
+          'pending_question_id' in out &&
+          typeof (out as { pending_question_id: string }).pending_question_id === 'string'
+        ) {
+          const candidate = (out as { pending_question_id: string }).pending_question_id;
+          const stillActive = await pendingQuestionsRepo
+            .findActiveSnapshot(c.id)
+            .catch(() => null);
+          if (stillActive && stillActive.id === candidate) {
+            latestPendingId = candidate;
+          } else {
+            logger.warn(
+              { tool: tu.tool, candidate, conversa_id: c.id },
+              'agent.stale_pending_id_dropped',
+            );
+          }
+        }
+
+        // Sub-A: silent ack via reaction on side-effect tool outcomes.
         const tool = REGISTRY[tu.tool];
-        const isSideEffect = tool && (tool.side_effect === 'write' || tool.side_effect === 'communication');
+        const isSideEffect =
+          tool && (tool.side_effect === 'write' || tool.side_effect === 'communication');
         if (isSideEffect) {
           const wid = (inbound.metadata as Record<string, unknown> | null)?.['whatsapp_id'];
           if (typeof wid === 'string') {
@@ -193,6 +254,7 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
             }
           }
         }
+
         results.push({
           type: 'tool_result' as const,
           tool_use_id: tu.id,
@@ -235,19 +297,24 @@ async function sendOutbound(
   conversa_id: string,
   text: string,
   in_reply_to: string,
-  opts?: { quoted?: import('@/gateway/presence.js').WAQuotedContext },
+  opts?: {
+    pending_question_id?: string | null;
+    quoted?: import('@/gateway/presence.js').WAQuotedContext;
+  },
 ): Promise<void> {
   const pessoa = await pessoasRepo.findById(pessoa_id);
   if (!pessoa) return;
   const jid = pessoa.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
-  const wid = await sendOutboundText(jid, text, opts);
+  const wid = await sendOutboundText(jid, text, opts?.quoted ? { quoted: opts.quoted } : undefined);
+  const metadata: Record<string, unknown> = { whatsapp_id: wid, in_reply_to };
+  if (opts?.pending_question_id) metadata.pending_question_id = opts.pending_question_id;
   await mensagensRepo.create({
     conversa_id,
     direcao: 'out',
     tipo: 'texto',
     conteudo: text,
     midia_url: null,
-    metadata: { whatsapp_id: wid, in_reply_to },
+    metadata,
     processada_em: new Date(),
     ferramentas_chamadas: [],
     tokens_usados: null,

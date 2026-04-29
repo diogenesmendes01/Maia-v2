@@ -18,6 +18,7 @@ import { saveFactTool } from './save-fact.js';
 import { saveRuleTool } from './save-rule.js';
 import { listPendingTool } from './list-pending.js';
 import { startWorkflowTool } from './start-workflow.js';
+import { askPendingQuestionTool } from './ask-pending-question.js';
 
 export type ToolHandlerCtx = {
   pessoa: import('@/db/schema.js').Pessoa;
@@ -61,6 +62,7 @@ export const REGISTRY: Record<string, AnyTool> = {
   save_rule: saveRuleTool as unknown as AnyTool,
   list_pending: listPendingTool as unknown as AnyTool,
   start_workflow: startWorkflowTool as unknown as AnyTool,
+  ask_pending_question: askPendingQuestionTool as unknown as AnyTool,
 };
 
 export function getToolSchemas(byEntity: Map<string, ResolvedPermission>) {
