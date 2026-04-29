@@ -65,12 +65,19 @@ export function startTyping(remote_jid: string, mensagem_id: string): TypingHand
 }
 
 export function sendReaction(
-  _remote_jid: string,
-  _whatsapp_id: string,
-  _emoji: '✅' | '❌',
+  remote_jid: string,
+  whatsapp_id: string,
+  emoji: '✅' | '❌',
 ): void {
   if (!config.FEATURE_PRESENCE) return;
-  // implemented in Task 7
+  if (!isBaileysConnected()) return;
+  const sock = getSocket();
+  if (!sock) return;
+  sock
+    .sendMessage(remote_jid, {
+      react: { text: emoji, key: { remoteJid: remote_jid, id: whatsapp_id, fromMe: false } },
+    })
+    .catch((err: Error) => logger.warn({ err: err.message }, 'presence.reaction_failed'));
 }
 
 export function quotedReplyContext(

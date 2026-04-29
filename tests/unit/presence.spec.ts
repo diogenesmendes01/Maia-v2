@@ -149,3 +149,42 @@ describe('presence — leak safety', () => {
     expect(pausedCalls.length).toBe(1);
   });
 });
+
+describe('presence — sendReaction', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.doMock('../../src/config/env.js', () => ({ config: { FEATURE_PRESENCE: true } }));
+    vi.doMock('../../src/lib/logger.js', () => ({
+      logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    }));
+    vi.doMock('../../src/gateway/baileys.js', () => ({
+      isBaileysConnected: () => true,
+      getSocket: () => ({ readMessages, sendPresenceUpdate, sendMessage }),
+    }));
+  });
+
+  it('sends a react payload anchored to (remote_jid, whatsapp_id)', async () => {
+    const { sendReaction } = await import('../../src/gateway/presence.js');
+    sendReaction('jid', 'WAID-9', '✅');
+    await new Promise((r) => setImmediate(r));
+    expect(sendMessage).toHaveBeenCalledWith('jid', {
+      react: { text: '✅', key: { remoteJid: 'jid', id: 'WAID-9', fromMe: false } },
+    });
+  });
+
+  it('no-op when disconnected', async () => {
+    vi.resetModules();
+    vi.doMock('../../src/config/env.js', () => ({ config: { FEATURE_PRESENCE: true } }));
+    vi.doMock('../../src/lib/logger.js', () => ({
+      logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    }));
+    vi.doMock('../../src/gateway/baileys.js', () => ({
+      isBaileysConnected: () => false,
+      getSocket: () => null,
+    }));
+    const { sendReaction } = await import('../../src/gateway/presence.js');
+    sendReaction('jid', 'id', '✅');
+    await new Promise((r) => setImmediate(r));
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+});
