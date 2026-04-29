@@ -14,7 +14,7 @@ export type GateResult =
       option_chosen: string;
       pending_question_id: string;
     }
-  | { kind: 'unresolved'; reason: 'low_confidence' | 'topic_change' };
+  | { kind: 'unresolved'; reason: 'low_confidence' | 'topic_change' | 'cancelled' };
 
 const CONFIDENCE_THRESHOLD = 0.7;
 
@@ -119,7 +119,23 @@ async function applyTx(
       return { kind: 'no_pending' as const };
     }
 
-    if (resolution.is_topic_change || resolution.is_cancellation) {
+    // Explicit cancellation and "user moved to a different topic" are both
+    // reasons to drop the pending, but they're product-distinct: cancellation
+    // is intentional ("não, deixa pra lá"), topic change is implicit ("ah,
+    // outra coisa: …"). Use distinct cancel reasons + audit actions so the
+    // log can answer "was this question abandoned or cancelled?" later.
+    if (resolution.is_cancellation) {
+      await pendingQuestionsRepo.cancelTx(tx, snapshot_id, 'cancelled');
+      await audit({
+        acao: 'pending_unresolved_cancelled',
+        pessoa_id: input.pessoa.id,
+        conversa_id: input.conversa.id,
+        mensagem_id: input.inbound.id,
+        alvo_id: snapshot_id,
+      });
+      return { kind: 'unresolved' as const, reason: 'cancelled' as const };
+    }
+    if (resolution.is_topic_change) {
       await pendingQuestionsRepo.cancelTx(tx, snapshot_id, 'topic_change');
       await audit({
         acao: 'pending_unresolved_topic_change',
