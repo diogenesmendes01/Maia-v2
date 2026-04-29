@@ -32,6 +32,41 @@ No DB migrations beyond the index. JSONB additions (`remote_jid`, `last_reminder
 
 ---
 
+## Task 0: Branch from current `main` (must include B1)
+
+**Files:** none — git workspace setup.
+
+The design branch was forked before B1 merged. The implementation branch MUST fork from current `main` so `sendOutboundPoll` (added by B1) is in-tree before Task 6.
+
+- [ ] **Step 1: Sync main + create implementation branch**
+
+```bash
+git checkout main
+git pull origin main
+git checkout -b feat/whatsapp-b2-update-quote
+```
+
+- [ ] **Step 2: Verify B1 is present**
+
+```bash
+grep -n "async function sendOutboundPoll" src/agent/core.ts
+grep -n "poll_creator_jid" src/agent/core.ts
+```
+
+Expected: both return lines. The second is B1's post-merge hotfix that Task 6 must preserve.
+
+- [ ] **Step 3: Verify pre-existing tsc baseline (3 errors)**
+
+```bash
+npx tsc --noEmit 2>&1 | grep -v "Cannot find module\|implicitly has an 'any'" | head -10
+```
+
+Expected: exactly 3 errors — `db/client.ts:24` (PoolClient), `gateway/queue.ts:31` (KeepJobs), `lib/alerts.ts:32` (nodemailer). If a fourth appears, investigate before proceeding.
+
+No commit — workspace setup only.
+
+---
+
 ## Task 1: `FEATURE_MESSAGE_UPDATE` + `FEATURE_PENDING_REMINDER` flags
 
 **Files:** `src/config/env.ts`
@@ -118,6 +153,51 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_audit_mensagem
 git add migrations/005_audit_mensagem_idx.sql
 git commit -m "feat(b2): migration 005 — idx_audit_mensagem partial index"
 ```
+
+---
+
+## Task 3.5: Repository additions (atomic commit)
+
+**Files:** `src/db/repositories.ts`
+
+Three new methods are needed by Tasks 4 (cancel-transaction tool) and 7 (message-update handler). Adding them in one focused commit keeps the tool/handler commits atomic and easier to review.
+
+- [ ] **Step 1: Add `transacoesRepo.byId` and `transacoesRepo.update`**
+
+In `src/db/repositories.ts`, find the `transacoesRepo` block. Append the methods (preserve the existing `byScope`, etc.):
+
+```typescript
+async byId(id: string): Promise<Transacao | null> {
+  const rows = await db.select().from(transacoes).where(eq(transacoes.id, id)).limit(1);
+  return rows[0] ?? null;
+},
+async update(id: string, patch: Partial<Transacao>): Promise<void> {
+  await db.update(transacoes).set(patch).where(eq(transacoes.id, id));
+},
+```
+
+- [ ] **Step 2: Add `auditRepo.findByMensagemId`**
+
+Find the `auditRepo` block. Append:
+
+```typescript
+async findByMensagemId(mensagem_id: string): Promise<AuditEntry[]> {
+  return db
+    .select()
+    .from(audit_log)
+    .where(eq(audit_log.mensagem_id, mensagem_id));
+},
+```
+
+- [ ] **Step 3: Typecheck + commit**
+
+```bash
+npx tsc --noEmit
+git add src/db/repositories.ts
+git commit -m "feat(b2): repo additions — transacoesRepo.byId/update + auditRepo.findByMensagemId"
+```
+
+Expected: 3 pre-existing errors only.
 
 ---
 
@@ -294,24 +374,14 @@ export const cancelTransactionTool: Tool<typeof inputSchema, typeof outputSchema
 };
 ```
 
-**Note**: `transacoesRepo.byId` and `transacoesRepo.update` may not exist on the current repo. Verify before implementing — if missing, add them as one-liners alongside the existing `transacoesRepo.byScope`. Add to Task 4 implementation if needed:
-
-```typescript
-async byId(id: string): Promise<Transacao | null> {
-  const rows = await db.select().from(transacoes).where(eq(transacoes.id, id)).limit(1);
-  return rows[0] ?? null;
-},
-async update(id: string, patch: Partial<Transacao>): Promise<void> {
-  await db.update(transacoes).set(patch).where(eq(transacoes.id, id));
-},
-```
+**Note**: `transacoesRepo.byId` and `transacoesRepo.update` are added in Task 3.5 (already done before this task). The handler imports them; do not re-add.
 
 - [ ] **Step 3: Run + commit**
 
 ```bash
 npx vitest run tests/unit/cancel-transaction.spec.ts
 npx tsc --noEmit
-git add src/tools/cancel-transaction.ts tests/unit/cancel-transaction.spec.ts src/db/repositories.ts
+git add src/tools/cancel-transaction.ts tests/unit/cancel-transaction.spec.ts
 git commit -m "feat(b2): cancel_transaction tool (scope-checked, idempotent)"
 ```
 
@@ -374,7 +444,7 @@ if (opts?.pending_question_id) metadata.pending_question_id = opts.pending_quest
 
 - [ ] **Step 2: Update `sendOutboundPoll`**
 
-Find the `metadata` literal inside `sendOutboundPoll`:
+Post-B1 (with the `poll_creator_jid` hotfix), the `metadata` literal in `sendOutboundPoll` looks like:
 
 ```typescript
 metadata: {
@@ -383,10 +453,11 @@ metadata: {
   pending_question_id: pending.id,
   poll_options: pending.opcoes_validas,
   poll_message_secret: sent.message_secret,
+  poll_creator_jid: sent.creator_jid,
 },
 ```
 
-Add `remote_jid: jid`:
+Add `remote_jid: jid` (preserve every other field exactly — `poll_creator_jid` in particular is required for `decryptPollVote`):
 
 ```typescript
 metadata: {
@@ -396,6 +467,7 @@ metadata: {
   pending_question_id: pending.id,
   poll_options: pending.opcoes_validas,
   poll_message_secret: sent.message_secret,
+  poll_creator_jid: sent.creator_jid,
 },
 ```
 
@@ -517,18 +589,9 @@ Run: must FAIL.
 
 - [ ] **Step 2: Implement (no-side-effect branch only)**
 
-First, add `auditRepo.findByMensagemId` to `src/db/repositories.ts` (find `auditRepo` block; if absent, create one near `audit_log` imports):
+`auditRepo.findByMensagemId` was added in Task 3.5; just import it.
 
-```typescript
-async findByMensagemId(mensagem_id: string): Promise<AuditEntry[]> {
-  return db
-    .select()
-    .from(audit_log)
-    .where(eq(audit_log.mensagem_id, mensagem_id));
-},
-```
-
-Then create `src/agent/message-update.ts`:
+Create `src/agent/message-update.ts`:
 
 ```typescript
 import type { proto } from '@whiskeysockets/baileys';
@@ -639,7 +702,7 @@ async function detectSideEffects(mensagem_id: string): Promise<Array<{ acao: str
 ```bash
 npx vitest run tests/unit/message-update.spec.ts
 npx tsc --noEmit
-git add src/agent/message-update.ts tests/unit/message-update.spec.ts src/db/repositories.ts
+git add src/agent/message-update.ts tests/unit/message-update.spec.ts
 git commit -m "feat(b2): routeMessageUpdate skeleton + no-side-effect audit path"
 ```
 
@@ -651,48 +714,106 @@ git commit -m "feat(b2): routeMessageUpdate skeleton + no-side-effect audit path
 - Modify: `src/agent/message-update.ts`
 - Modify: `tests/unit/message-update.spec.ts`
 
-- [ ] **Step 1: Append tests**
+- [ ] **Step 1: Extend the top-of-file `vi.mock` for owner-lookup + pending-create**
+
+Replace the existing `vi.mock` for `'../../src/db/repositories.js'` with the expanded version that includes `pessoasRepo`, `conversasRepo`, and `pendingQuestionsRepo`:
+
+```typescript
+const findByWhatsappIdMock = vi.fn();
+const auditLogQueryMock = vi.fn();
+const findOwnerByPhoneMock = vi.fn();
+const findActiveConversaMock = vi.fn();
+const pendingCreateTxMock = vi.fn();
+const pendingCancelOpenForConversaTxMock = vi.fn();
+
+vi.mock('../../src/db/repositories.js', () => ({
+  mensagensRepo: { findByWhatsappId: findByWhatsappIdMock },
+  auditRepo: { findByMensagemId: auditLogQueryMock },
+  pessoasRepo: { findByPhone: findOwnerByPhoneMock },
+  conversasRepo: { findActive: findActiveConversaMock },
+  pendingQuestionsRepo: {
+    createTx: pendingCreateTxMock,
+    cancelOpenForConversaTx: pendingCancelOpenForConversaTxMock,
+  },
+}));
+
+const withTxMock = vi.fn(async (fn) => fn({} as never));
+vi.mock('../../src/db/client.js', () => ({ withTx: withTxMock, db: {} as never }));
+
+vi.mock('../../src/config/env.js', () => ({
+  config: { FEATURE_MESSAGE_UPDATE: true, OWNER_TELEFONE_WHATSAPP: '+5511999999999' },
+}));
+```
+
+Add resets for the new mocks to `beforeEach`:
+
+```typescript
+beforeEach(() => {
+  findByWhatsappIdMock.mockReset();
+  auditLogQueryMock.mockReset();
+  findOwnerByPhoneMock.mockReset();
+  findActiveConversaMock.mockReset();
+  pendingCreateTxMock.mockReset();
+  pendingCancelOpenForConversaTxMock.mockReset();
+  pendingCancelOpenForConversaTxMock.mockResolvedValue({ cancelled_ids: [] });
+  auditMock.mockReset();
+  withTxMock.mockClear();
+});
+```
+
+- [ ] **Step 2: Append the side-effect test**
 
 ```typescript
 describe('routeMessageUpdate — side-effect detected', () => {
-  beforeEach(() => {
-    findByWhatsappIdMock.mockReset();
-    auditLogQueryMock.mockReset();
-    auditMock.mockReset();
-  });
-
   it('creates edit_review pending and audits both pending_substituted_by_edit_review and mensagem_edited_after_side_effect', async () => {
     findByWhatsappIdMock.mockResolvedValueOnce({
       id: 'm-orig',
       conteudo: 'lança 50 mercado',
-      conversa_id: 'c-owner', // owner's conversa
+      conversa_id: 'c-user',
     });
     auditLogQueryMock.mockResolvedValueOnce([
       { acao: 'transaction_created', alvo_id: 'tx-1', mensagem_id: 'm-orig' },
     ]);
-    const ownerConversaMock = vi.fn().mockResolvedValueOnce({ id: 'c-owner', pessoa_id: 'owner-id' });
-    pendingQuestionsCreateTxMock.mockResolvedValueOnce({ id: 'pq-edit-review' });
-    pendingQuestionsCancelOpenForConversaTxMock.mockResolvedValueOnce({ cancelled_ids: ['pq-old'] });
-    // Inject mocks via the same vi.mock at top of file (extend setup).
+    findOwnerByPhoneMock.mockResolvedValueOnce({ id: 'owner-id', telefone_whatsapp: '+5511999999999' });
+    findActiveConversaMock.mockResolvedValueOnce({ id: 'c-owner', pessoa_id: 'owner-id' });
+    pendingCancelOpenForConversaTxMock.mockResolvedValueOnce({ cancelled_ids: ['pq-old'] });
+    pendingCreateTxMock.mockResolvedValueOnce({ id: 'pq-edit-review' });
+
     const { routeMessageUpdate } = await import('../../src/agent/message-update.js');
     await routeMessageUpdate({
       key: { id: 'WAID-1', remoteJid: 'jid' },
       message: { editedMessage: { message: { conversation: 'lança 50 restaurante' } } },
     } as never);
-    expect(pendingQuestionsCreateTxMock).toHaveBeenCalledWith(
+
+    // Pending lands in OWNER's conversa (c-owner), not the editing user's (c-user).
+    expect(pendingCreateTxMock).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
+        conversa_id: 'c-owner',
+        pessoa_id: 'owner-id',
         tipo: 'edit_review',
-        acao_proposta: { tool: 'cancel_transaction', args: { transacao_id: 'tx-1' } },
+        acao_proposta: { tool: 'cancel_transaction', args: expect.objectContaining({ transacao_id: 'tx-1' }) },
       }),
     );
     expect(auditMock.mock.calls.some((c) => c[0].acao === 'mensagem_edited_after_side_effect')).toBe(true);
     expect(auditMock.mock.calls.some((c) => c[0].acao === 'pending_substituted_by_edit_review')).toBe(true);
   });
+
+  it('skips pending creation when owner is not configured', async () => {
+    findByWhatsappIdMock.mockResolvedValueOnce({ id: 'm-orig', conteudo: 'x', conversa_id: 'c1' });
+    auditLogQueryMock.mockResolvedValueOnce([{ acao: 'transaction_created', alvo_id: 'tx-1' }]);
+    findOwnerByPhoneMock.mockResolvedValueOnce(null);
+    const { routeMessageUpdate } = await import('../../src/agent/message-update.js');
+    await routeMessageUpdate({
+      key: { id: 'WAID-1', remoteJid: 'jid' },
+      message: { editedMessage: { message: { conversation: 'y' } } },
+    } as never);
+    expect(pendingCreateTxMock).not.toHaveBeenCalled();
+    // mensagem_edited_after_side_effect still fires — the audit is independent of the pending creation.
+    expect(auditMock.mock.calls.some((c) => c[0].acao === 'mensagem_edited_after_side_effect')).toBe(true);
+  });
 });
 ```
-
-(You'll need to add `pendingQuestionsRepo.createTx` and `cancelOpenForConversaTx` to the top-of-file `vi.mock`.)
 
 Run — must FAIL.
 
@@ -842,12 +963,50 @@ socket.ev.on('messages.update', async (updates) => {
 
 **Important**: verify the Baileys 6.7.0 event payload shape before merging — the wrapping `{ key, update }` matters. The `as never` cast is intentional since Baileys' `update` type is a `Partial<WAMessageInfo>`, not the full shape `routeMessageUpdate` accepts. The runtime structure is what matters.
 
-- [ ] **Step 3: Typecheck + commit**
+- [ ] **Step 3: Add a Baileys contract test for the envelope shape**
+
+Append to `tests/unit/baileys-handle-incoming.spec.ts` (the existing baileys unit suite):
+
+```typescript
+describe('baileys — messages.update envelope contract', () => {
+  it('routeMessageUpdate accepts { key, message } where message has editedMessage', async () => {
+    // This pins the Baileys 6.7.0 event shape that Task 9's listener relies on.
+    // If a future Baileys upgrade renames `editedMessage` or restructures
+    // `update.update.message`, this test breaks immediately.
+    const { routeMessageUpdate } = await import('../../src/agent/message-update.js');
+    const fixture = {
+      key: { id: 'WAID-edit', remoteJid: 'jid' },
+      message: {
+        editedMessage: { message: { conversation: 'novo conteudo' } },
+      },
+    };
+    // We just need it not to throw on the unwrap — DB calls are mocked
+    // elsewhere; here we only assert the type contract holds.
+    await expect(routeMessageUpdate(fixture as never)).resolves.toBeUndefined();
+  });
+
+  it('routeMessageUpdate accepts protocolMessage type=0 for revoke', async () => {
+    const { routeMessageUpdate } = await import('../../src/agent/message-update.js');
+    const fixture = {
+      key: { id: 'WAID-revoke', remoteJid: 'jid' },
+      message: {
+        protocolMessage: { type: 0, key: { id: 'WAID-target', remoteJid: 'jid' } },
+      },
+    };
+    await expect(routeMessageUpdate(fixture as never)).resolves.toBeUndefined();
+  });
+});
+```
+
+(These tests need the same `vi.mock` setup as `tests/unit/message-update.spec.ts`. If sharing is awkward, leave the contract tests in `message-update.spec.ts` instead — the goal is just to pin the envelope shape against Baileys upgrades.)
+
+- [ ] **Step 4: Typecheck + run + commit**
 
 ```bash
 npx tsc --noEmit
-git add src/gateway/baileys.ts
-git commit -m "feat(b2): wire messages.update listener (gated by FEATURE_MESSAGE_UPDATE)"
+npx vitest run tests/unit/message-update.spec.ts
+git add src/gateway/baileys.ts tests/unit/baileys-handle-incoming.spec.ts tests/unit/message-update.spec.ts
+git commit -m "feat(b2): wire messages.update listener + Baileys envelope contract test"
 ```
 
 ---
