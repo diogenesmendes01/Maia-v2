@@ -15,6 +15,11 @@ export type AgentJob = {
   mensagem_id: string;
 };
 
+export type WAQuotedContext = {
+  key: { remoteJid: string; id: string; fromMe: boolean };
+  message: { conversation: string };
+};
+
 export type OutboundParams = {
   pessoa_id_destino: string;
   conversa_id: string | null;
