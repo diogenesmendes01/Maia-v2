@@ -30,6 +30,10 @@ export function isBaileysConnected(): boolean {
   return connected;
 }
 
+export function getSocket(): WASocket | null {
+  return socket;
+}
+
 export async function startBaileys(): Promise<void> {
   const { state, saveCreds } = await useMultiFileAuthState(config.BAILEYS_AUTH_DIR);
   socket = makeWASocket({ auth: state, printQRInTerminal: false });
