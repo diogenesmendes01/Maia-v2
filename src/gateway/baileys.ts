@@ -34,6 +34,13 @@ export function getSocket(): WASocket | null {
   return socket;
 }
 
+type StubLike = { messageStubType?: number | null | undefined };
+
+export function isReactionStub(msg: StubLike): boolean {
+  // proto.WebMessageInfo.StubType.REACTION === 67 per Baileys proto.
+  return msg.messageStubType === 67;
+}
+
 export async function startBaileys(): Promise<void> {
   const { state, saveCreds } = await useMultiFileAuthState(config.BAILEYS_AUTH_DIR);
   socket = makeWASocket({ auth: state, printQRInTerminal: false });
@@ -76,6 +83,7 @@ export async function startBaileys(): Promise<void> {
 
 async function handleIncoming(msg: proto.IWebMessageInfo): Promise<void> {
   if (msg.key.fromMe) return;
+  if (isReactionStub(msg)) return; // reactions decorate; we never persist them
   const remote_jid = msg.key.remoteJid;
   const whatsapp_id = msg.key.id;
   if (!remote_jid || !whatsapp_id) return;
