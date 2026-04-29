@@ -99,19 +99,80 @@ export async function checkPendingFirst(input: {
   return await applyTx(snapshot.id, snapshot, resolution, input);
 }
 
-// Stub — Task 9 fills in.
 async function applyTx(
   snapshot_id: string,
   snapshot: { acao_proposta: unknown; opcoes_validas: unknown },
   resolution: ClassifyOut,
   input: { pessoa: Pessoa; conversa: Conversa; inbound: Mensagem },
 ): Promise<GateResult> {
-  void snapshot_id;
-  void snapshot;
-  void resolution;
-  void input;
-  void withTx;
-  void audit;
-  void CONFIDENCE_THRESHOLD;
-  return { kind: 'no_pending' };
+  return await withTx(async (tx) => {
+    const locked = await pendingQuestionsRepo.findActiveForUpdate(tx, input.conversa.id);
+    if (!locked || locked.id !== snapshot_id) {
+      // Race lost — someone else resolved or cancelled while Haiku was running.
+      await audit({
+        acao: 'pending_race_lost',
+        pessoa_id: input.pessoa.id,
+        conversa_id: input.conversa.id,
+        mensagem_id: input.inbound.id,
+        metadata: { pending_question_id: snapshot_id },
+      });
+      return { kind: 'no_pending' as const };
+    }
+
+    if (resolution.is_topic_change || resolution.is_cancellation) {
+      await pendingQuestionsRepo.cancelTx(tx, snapshot_id, 'topic_change');
+      await audit({
+        acao: 'pending_unresolved_topic_change',
+        pessoa_id: input.pessoa.id,
+        conversa_id: input.conversa.id,
+        mensagem_id: input.inbound.id,
+        alvo_id: snapshot_id,
+      });
+      return { kind: 'unresolved' as const, reason: 'topic_change' as const };
+    }
+
+    const opts = snapshot.opcoes_validas as Array<{ key: string; label: string }>;
+    const validKeys = new Set(opts.map((o) => o.key));
+    const isResolved =
+      resolution.resolves_pending &&
+      resolution.confidence >= CONFIDENCE_THRESHOLD &&
+      typeof resolution.option_chosen === 'string' &&
+      validKeys.has(resolution.option_chosen);
+
+    if (!isResolved) {
+      await audit({
+        acao: 'pending_unresolved_low_confidence',
+        pessoa_id: input.pessoa.id,
+        conversa_id: input.conversa.id,
+        mensagem_id: input.inbound.id,
+        alvo_id: snapshot_id,
+        metadata: { confidence: resolution.confidence ?? null },
+      });
+      return { kind: 'unresolved' as const, reason: 'low_confidence' as const };
+    }
+
+    await pendingQuestionsRepo.resolveTx(tx, snapshot_id, {
+      option_chosen: resolution.option_chosen,
+      confidence: resolution.confidence,
+    });
+    await audit({
+      acao: 'pending_resolved_by_gate',
+      pessoa_id: input.pessoa.id,
+      conversa_id: input.conversa.id,
+      mensagem_id: input.inbound.id,
+      alvo_id: snapshot_id,
+      metadata: { option_chosen: resolution.option_chosen },
+    });
+
+    const action = (snapshot.acao_proposta ?? {}) as {
+      tool?: string;
+      args?: Record<string, unknown>;
+    };
+    return {
+      kind: 'resolved' as const,
+      action: action.tool ? { tool: action.tool, args: action.args ?? {} } : undefined,
+      option_chosen: resolution.option_chosen!,
+      pending_question_id: snapshot_id,
+    };
+  });
 }

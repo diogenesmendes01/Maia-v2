@@ -76,3 +76,103 @@ describe('pending-gate — snapshot path', () => {
     expect(out.kind).toBe('no_pending'); // re-check failed → no_pending
   });
 });
+
+describe('pending-gate — resolve path', () => {
+  it('resolves and dispatches when classify succeeds and re-check finds the row', async () => {
+    findActiveSnapshot.mockResolvedValueOnce({
+      id: 'pq-1',
+      pergunta: 'Confirma?',
+      opcoes_validas: [{ key: 'sim', label: 'Sim' }, { key: 'nao', label: 'Não' }],
+      acao_proposta: { tool: 'register_transaction', args: { valor: 50 } },
+    });
+    callLLM.mockResolvedValueOnce({
+      content: '{"resolves_pending":true,"option_chosen":"sim","confidence":0.95}',
+      usage: { input_tokens: 0, output_tokens: 0 },
+      tool_uses: [],
+      stop_reason: 'end_turn',
+      model: 'haiku',
+    });
+    findActiveForUpdate.mockResolvedValueOnce({
+      id: 'pq-1',
+      acao_proposta: { tool: 'register_transaction', args: { valor: 50 } },
+    });
+    resolveTx.mockResolvedValueOnce(undefined);
+    const { checkPendingFirst } = await import('../../src/agent/pending-gate.js');
+    const out = await checkPendingFirst({ pessoa, conversa, inbound });
+    expect(out.kind).toBe('resolved');
+    if (out.kind === 'resolved') {
+      expect(out.option_chosen).toBe('sim');
+      expect(out.action).toEqual({ tool: 'register_transaction', args: { valor: 50 } });
+    }
+    expect(resolveTx).toHaveBeenCalled();
+  });
+
+  it('topic change cancels the row and returns unresolved', async () => {
+    findActiveSnapshot.mockResolvedValueOnce({
+      id: 'pq-2',
+      pergunta: 'Confirma?',
+      opcoes_validas: [{ key: 'sim', label: 'Sim' }, { key: 'nao', label: 'Não' }],
+      acao_proposta: {},
+    });
+    callLLM.mockResolvedValueOnce({
+      content: '{"resolves_pending":false,"is_topic_change":true,"confidence":0.9}',
+      usage: { input_tokens: 0, output_tokens: 0 },
+      tool_uses: [],
+      stop_reason: 'end_turn',
+      model: 'haiku',
+    });
+    findActiveForUpdate.mockResolvedValueOnce({ id: 'pq-2', acao_proposta: {} });
+    cancelTx.mockResolvedValueOnce(undefined);
+    const { checkPendingFirst } = await import('../../src/agent/pending-gate.js');
+    const out = await checkPendingFirst({ pessoa, conversa, inbound });
+    expect(out).toEqual({ kind: 'unresolved', reason: 'topic_change' });
+    expect(cancelTx).toHaveBeenCalledWith(expect.anything(), 'pq-2', 'topic_change');
+  });
+
+  it('low confidence: no DB write, audits pending_unresolved_low_confidence', async () => {
+    findActiveSnapshot.mockResolvedValueOnce({
+      id: 'pq-3',
+      pergunta: 'Confirma?',
+      opcoes_validas: [{ key: 'sim', label: 'Sim' }, { key: 'nao', label: 'Não' }],
+      acao_proposta: {},
+    });
+    callLLM.mockResolvedValueOnce({
+      content: '{"resolves_pending":false,"confidence":0.4}',
+      usage: { input_tokens: 0, output_tokens: 0 },
+      tool_uses: [],
+      stop_reason: 'end_turn',
+      model: 'haiku',
+    });
+    findActiveForUpdate.mockResolvedValueOnce({ id: 'pq-3', acao_proposta: {} });
+    const { checkPendingFirst } = await import('../../src/agent/pending-gate.js');
+    const out = await checkPendingFirst({ pessoa, conversa, inbound });
+    expect(out).toEqual({ kind: 'unresolved', reason: 'low_confidence' });
+    expect(resolveTx).not.toHaveBeenCalled();
+    expect(cancelTx).not.toHaveBeenCalled();
+    const lc = audit.mock.calls.filter((c) => c[0].acao === 'pending_unresolved_low_confidence');
+    expect(lc.length).toBe(1);
+  });
+
+  it('race-loss: re-check returns null → race_lost audit + no_pending', async () => {
+    findActiveSnapshot.mockResolvedValueOnce({
+      id: 'pq-4',
+      pergunta: 'Confirma?',
+      opcoes_validas: [{ key: 'sim', label: 'Sim' }, { key: 'nao', label: 'Não' }],
+      acao_proposta: {},
+    });
+    callLLM.mockResolvedValueOnce({
+      content: '{"resolves_pending":true,"option_chosen":"sim","confidence":0.95}',
+      usage: { input_tokens: 0, output_tokens: 0 },
+      tool_uses: [],
+      stop_reason: 'end_turn',
+      model: 'haiku',
+    });
+    findActiveForUpdate.mockResolvedValueOnce(null);
+    const { checkPendingFirst } = await import('../../src/agent/pending-gate.js');
+    const out = await checkPendingFirst({ pessoa, conversa, inbound });
+    expect(out).toEqual({ kind: 'no_pending' });
+    const lost = audit.mock.calls.filter((c) => c[0].acao === 'pending_race_lost');
+    expect(lost.length).toBe(1);
+    expect(lost[0][0].metadata.pending_question_id).toBe('pq-4');
+  });
+});
