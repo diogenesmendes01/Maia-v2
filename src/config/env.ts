@@ -32,6 +32,7 @@ const envSchema = z
     EMBEDDING_MODEL: z.string().default('voyage-3'),
     EMBEDDING_DIMENSIONS: z.coerce.number().int().positive().default(1024),
     VOYAGE_API_KEY: z.string().optional(),
+    COHERE_API_KEY: z.string().optional(),
 
     BAILEYS_AUTH_DIR: z.string().default('./.baileys-auth'),
     WHATSAPP_NUMBER_MAIA: z.string().regex(/^\+\d{10,15}$/),
@@ -105,6 +106,18 @@ const envSchema = z
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message: 'VOYAGE_API_KEY required when EMBEDDING_PROVIDER=voyage',
+      });
+    }
+    if (cfg.EMBEDDING_PROVIDER === 'openai' && !cfg.OPENAI_API_KEY) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'OPENAI_API_KEY required when EMBEDDING_PROVIDER=openai',
+      });
+    }
+    if (cfg.EMBEDDING_PROVIDER === 'cohere' && !cfg.COHERE_API_KEY) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'COHERE_API_KEY required when EMBEDDING_PROVIDER=cohere',
       });
     }
     if (
