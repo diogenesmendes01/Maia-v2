@@ -6,7 +6,8 @@ import { logger } from '@/lib/logger.js';
 import { sendOutboundText } from '@/gateway/baileys.js';
 import { audit } from '@/governance/audit.js';
 import { dispatchTool } from '@/tools/_dispatcher.js';
-import { getToolSchemas } from '@/tools/_registry.js';
+import { getToolSchemas, REGISTRY } from '@/tools/_registry.js';
+import { startTyping, sendReaction } from '@/gateway/presence.js';
 import { uuid } from '@/lib/utils.js';
 import {
   detectCorrection,
@@ -15,6 +16,24 @@ import {
 } from './reflection.js';
 
 const MAX_REACT_ITERATIONS = 5;
+const TYPING_DEBOUNCE_MS = 1500;
+
+/**
+ * Returns a stopper. The stopper either cancels the pending start (if called
+ * within TYPING_DEBOUNCE_MS) or calls handle.stop() (if typing already started).
+ */
+function scheduleTypingDebounce(jid: string, mensagem_id: string): () => void {
+  let handle: ReturnType<typeof startTyping> | null = null;
+  const timer = setTimeout(() => {
+    handle = startTyping(jid, mensagem_id);
+  }, TYPING_DEBOUNCE_MS);
+  return () => {
+    clearTimeout(timer);
+    handle?.stop();
+  };
+}
+
+export const _internal = { scheduleTypingDebounce };
 
 export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
   const inbound = await mensagensRepo.findById(mensagem_id);
@@ -70,59 +89,80 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
   let totalTokens = 0;
   const conversation: LLMMessage[] = messages;
 
-  for (let i = 0; i < MAX_REACT_ITERATIONS; i++) {
-    const res = await callLLM({ system, messages: conversation, tools, max_tokens: 1024 });
-    totalTokens += res.usage.input_tokens + res.usage.output_tokens;
+  const jid = pessoa.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
+  const stopTyping = scheduleTypingDebounce(jid, inbound.id);
+  try {
+    for (let i = 0; i < MAX_REACT_ITERATIONS; i++) {
+      const res = await callLLM({ system, messages: conversation, tools, max_tokens: 1024 });
+      totalTokens += res.usage.input_tokens + res.usage.output_tokens;
 
-    if (res.tool_uses.length === 0) {
-      const text = res.content?.trim() ?? '';
-      if (text) {
-        await sendOutbound(pessoa.id, c.id, text, inbound.id);
+      if (res.tool_uses.length === 0) {
+        const text = res.content?.trim() ?? '';
+        if (text) {
+          await sendOutbound(pessoa.id, c.id, text, inbound.id);
+        }
+        break;
       }
-      break;
-    }
 
-    // Append assistant turn with tool uses
-    conversation.push({
-      role: 'assistant',
-      content: res.tool_uses.map((tu) => ({
-        type: 'tool_use' as const,
-        id: tu.id,
-        name: tu.tool,
-        input: tu.args,
-      })),
-    });
+      // Append assistant turn with tool uses
+      conversation.push({
+        role: 'assistant',
+        content: res.tool_uses.map((tu) => ({
+          type: 'tool_use' as const,
+          id: tu.id,
+          name: tu.tool,
+          input: tu.args,
+        })),
+      });
 
-    // Execute tools and add results
-    const results = [];
-    for (const tu of res.tool_uses) {
-      const out = await dispatchTool({
-        tool: tu.tool,
-        args: tu.args,
-        ctx: {
-          pessoa,
-          scope,
-          conversa: c,
+      // Execute tools and add results
+      const results = [];
+      for (const tu of res.tool_uses) {
+        const out = await dispatchTool({
+          tool: tu.tool,
+          args: tu.args,
+          ctx: {
+            pessoa,
+            scope,
+            conversa: c,
+            mensagem_id: inbound.id,
+            request_id: uuid(),
+          },
+        });
+        const isError = typeof out === 'object' && out !== null && 'error' in out;
+        const tool = REGISTRY[tu.tool];
+        const isSideEffect = tool && (tool.side_effect === 'write' || tool.side_effect === 'communication');
+        if (isSideEffect) {
+          const wid = (inbound.metadata as Record<string, unknown> | null)?.['whatsapp_id'];
+          if (typeof wid === 'string') {
+            if (!isError) {
+              sendReaction(jid, wid, '✅');
+            } else {
+              const errKind = (out as { error: string }).error;
+              if (errKind === 'forbidden' || errKind === 'requires_dual_approval') {
+                sendReaction(jid, wid, '❌');
+              }
+            }
+          }
+        }
+        results.push({
+          type: 'tool_result' as const,
+          tool_use_id: tu.id,
+          content: JSON.stringify(out),
+          is_error: isError,
+        });
+        await audit({
+          acao: (isError ? 'unauthorized_access_attempt' : 'classification_suggested') as never,
+          pessoa_id: pessoa.id,
+          conversa_id: c.id,
           mensagem_id: inbound.id,
-          request_id: uuid(),
-        },
-      });
-      const isError = typeof out === 'object' && out !== null && 'error' in out;
-      results.push({
-        type: 'tool_result' as const,
-        tool_use_id: tu.id,
-        content: JSON.stringify(out),
-        is_error: isError,
-      });
-      await audit({
-        acao: (isError ? 'unauthorized_access_attempt' : 'classification_suggested') as never,
-        pessoa_id: pessoa.id,
-        conversa_id: c.id,
-        mensagem_id: inbound.id,
-        metadata: { tool: tu.tool },
-      });
+          metadata: { tool: tu.tool },
+        });
+      }
+      conversation.push({ role: 'user', content: results });
     }
-    conversation.push({ role: 'user', content: results });
+  } finally {
+    stopTyping();
   }
 
   await mensagensRepo.markProcessed(inbound.id, totalTokens);
