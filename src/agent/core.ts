@@ -1,5 +1,6 @@
 import { mensagensRepo, conversasRepo, pessoasRepo } from '@/db/repositories.js';
 import { resolveScope } from '@/governance/permissions.js';
+import { checkRateLimit, formatPoliteReply } from '@/gateway/rate-limit.js';
 import { buildPrompt } from './prompt-builder.js';
 import { callLLM, type LLMMessage } from '@/lib/claude.js';
 import { logger } from '@/lib/logger.js';
@@ -57,6 +58,29 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
     return;
   }
   const { conversa: c, pessoa } = conv;
+
+  // Spec 03 §9 — sliding-hour rate limit. Owners exempt; others get one
+  // polite reply per hour, then 60s of silence after each warning.
+  const decision = await checkRateLimit(pessoa);
+  if (decision.kind !== 'allow') {
+    if (decision.kind === 'warn') {
+      await audit({
+        acao: 'rate_limit_exceeded',
+        pessoa_id: pessoa.id,
+        conversa_id: c.id,
+        mensagem_id: inbound.id,
+        metadata: { count: decision.count, threshold: decision.threshold },
+      });
+      const reply = formatPoliteReply(decision.threshold);
+      await sendOutbound(pessoa.id, c.id, reply, inbound.id).catch((err) =>
+        logger.warn({ err: (err as Error).message }, 'agent.rate_limit_reply_failed'),
+      );
+    }
+    await mensagensRepo.markProcessed(inbound.id, 0);
+    await conversasRepo.touch(c.id);
+    return;
+  }
+
   const scope = await resolveScope(pessoa);
 
   const { system, messages } = await buildPrompt({
