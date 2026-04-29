@@ -129,7 +129,7 @@ export async function registerDashboardRoutes(app: FastifyInstance): Promise<voi
 async function requireScope(
   req: FastifyRequest,
   reply: FastifyReply,
-): Promise<{ p: { id: string; nome: string; tipo: string }; scope: { entidades: string[] } } | null> {
+): Promise<{ p: typeof pessoas.$inferSelect; scope: { entidades: string[] } } | null> {
   const session = await getSessionFromCookie(req.headers.cookie);
   if (!session) {
     reply.type('text/html').send(loginHTML());
