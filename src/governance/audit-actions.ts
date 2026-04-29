@@ -14,6 +14,8 @@ export const AUDIT_ACTIONS = [
   'classification_suggested',
   'reminder_scheduled',
   'boleto_parsed',
+  'receipt_parsed',
+  'image_parsed',
   'audio_transcribed',
   'rule_learned',
   'rule_promoted',
