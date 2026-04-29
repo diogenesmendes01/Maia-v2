@@ -1,5 +1,8 @@
 import { mensagensRepo, conversasRepo, pessoasRepo } from '@/db/repositories.js';
 import { resolveScope } from '@/governance/permissions.js';
+import { resolveIdentity } from '@/identity/resolver.js';
+import { handleQuarantineFirstContact, handleOwnerIdentityReply } from '@/identity/quarantine.js';
+import { config } from '@/config/env.js';
 import { buildPrompt } from './prompt-builder.js';
 import { callLLM, type LLMMessage } from '@/lib/claude.js';
 import { logger } from '@/lib/logger.js';
@@ -27,28 +30,42 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
     return;
   }
   if (!inbound.conversa_id) {
-    // Resolve identity inline
     const tel = (inbound.metadata as Record<string, unknown>)?.['telefone'] as string | undefined;
     if (!tel) return;
-    const pessoa = await pessoasRepo.findByPhone(tel);
-    if (!pessoa) {
-      logger.info({ tel: '[REDACTED]' }, 'agent.unknown_pessoa');
+    const resolved = await resolveIdentity({ telefone_whatsapp: tel });
+    if (resolved.kind === 'unknown') {
+      // Mark processed so the recovery worker doesn't requeue forever.
+      await mensagensRepo.markProcessed(inbound.id, 0);
       return;
     }
-    if (pessoa.status !== 'ativa') {
-      logger.info({ pessoa_id: pessoa.id, status: pessoa.status }, 'agent.pessoa_not_active');
+    if (resolved.kind === 'blocked') {
+      logger.info({ pessoa_id: resolved.pessoa.id, reason: resolved.reason }, 'agent.blocked_drop');
+      await mensagensRepo.markProcessed(inbound.id, 0);
       return;
     }
-    let conversa = await conversasRepo.findActive(pessoa.id);
-    if (!conversa) {
-      const scope = await resolveScope(pessoa);
-      conversa = await conversasRepo.create({
-        pessoa_id: pessoa.id,
-        escopo_entidades: scope.entidades,
+    if (resolved.kind === 'quarantined') {
+      await handleQuarantineFirstContact({ pessoa: resolved.pessoa, inbound });
+      await mensagensRepo.markProcessed(inbound.id, 0);
+      return;
+    }
+    // Owner reply on a pending identity_confirmation? handled before the LLM
+    // ever sees the message — deterministic confirmation flow per spec 05 §6.
+    if (
+      resolved.pessoa.telefone_whatsapp === config.OWNER_TELEFONE_WHATSAPP &&
+      typeof inbound.conteudo === 'string'
+    ) {
+      const consumed = await handleOwnerIdentityReply({
+        ownerPessoa: resolved.pessoa,
+        reply: inbound.conteudo,
       });
+      if (consumed) {
+        await mensagensRepo.setConversaId(inbound.id, resolved.conversa.id);
+        await mensagensRepo.markProcessed(inbound.id, 0);
+        return;
+      }
     }
-    await mensagensRepo.setConversaId(inbound.id, conversa.id);
-    inbound.conversa_id = conversa.id;
+    await mensagensRepo.setConversaId(inbound.id, resolved.conversa.id);
+    inbound.conversa_id = resolved.conversa.id;
   }
 
   const conv = await loadConversaWithPessoa(inbound.conversa_id!);

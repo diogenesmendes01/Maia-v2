@@ -16,6 +16,7 @@ import { sha256 } from '@/lib/utils.js';
 import { mensagensRepo } from '@/db/repositories.js';
 import { isDuplicate, markSeen } from './dedup.js';
 import { enqueueAgent } from './queue.js';
+import { checkBotAndMaybeBlock } from './bot-detection.js';
 import { audit } from '@/governance/audit.js';
 import type { WhatsAppInbound } from './types.js';
 
@@ -89,6 +90,11 @@ async function handleIncoming(msg: proto.IWebMessageInfo): Promise<void> {
 
   const phone = remote_jid.split('@')[0]!;
   const tel = '+' + phone;
+
+  if (await checkBotAndMaybeBlock(tel)) {
+    logger.warn({ tel: '[REDACTED]' }, 'baileys.dropped_anomalous_volume');
+    return;
+  }
 
   const { type, content, mediaPath, mediaMime, mediaSha256 } = await extractContent(msg);
 

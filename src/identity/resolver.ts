@@ -32,6 +32,21 @@ export async function resolveIdentity(input: { telefone_whatsapp: string }): Pro
   }
   const scope = await resolveScope(pessoa);
   let conversa = await conversasRepo.findActive(pessoa.id);
+
+  // Spec 05 §11.2: idle conversation rotation. New activity after >7d closes
+  // the prior conversa (background summarizer fills contexto_resumido later)
+  // and starts fresh.
+  const ROTATION_MS = 7 * 24 * 60 * 60 * 1000;
+  if (
+    conversa &&
+    conversa.ultima_atividade_em &&
+    Date.now() - new Date(conversa.ultima_atividade_em).getTime() > ROTATION_MS
+  ) {
+    await conversasRepo.close(conversa.id, '');
+    logger.info({ pessoa_id: pessoa.id, conversa_id: conversa.id }, 'conversa.rotated_idle');
+    conversa = null;
+  }
+
   if (!conversa) {
     conversa = await conversasRepo.create({
       pessoa_id: pessoa.id,

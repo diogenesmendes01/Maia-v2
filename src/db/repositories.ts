@@ -493,6 +493,21 @@ export const pendingQuestionsRepo = {
       .limit(1);
     return rows[0] ?? null;
   },
+  async findOpenByPessoaAndType(pessoa_id: string, tipo: string): Promise<PendingQuestion | null> {
+    const rows = await db
+      .select()
+      .from(pending_questions)
+      .where(
+        and(
+          eq(pending_questions.pessoa_id, pessoa_id),
+          eq(pending_questions.tipo, tipo),
+          eq(pending_questions.status, 'aberta'),
+        ),
+      )
+      .orderBy(desc(pending_questions.created_at))
+      .limit(1);
+    return rows[0] ?? null;
+  },
   async resolve(id: string, resposta: unknown): Promise<void> {
     await db
       .update(pending_questions)
