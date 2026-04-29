@@ -817,7 +817,7 @@ describe('routeMessageUpdate — side-effect detected', () => {
 
 Run — must FAIL.
 
-- [ ] **Step 2: Implement side-effect branch**
+- [ ] **Step 3: Implement side-effect branch**
 
 Replace the no-op side-effect branch in `handleMessageEdit` with a real implementation that creates the pending. Same pattern for `handleMessageRevoke`. Extract the common path into a helper `createEditReviewPending`:
 
@@ -831,16 +831,27 @@ const REVIEW_TTL_HOURS = 24;
 async function createEditReviewPending(input: {
   original: { id: string; conversa_id: string | null };
   side_effects: Array<{ acao: string; alvo_id: string | null }>;
-  pessoa_id: string;
   source: 'edit' | 'revoke';
   diff?: { before: string | null; after: string };
 }): Promise<void> {
-  if (!input.original.conversa_id) return;
   // Take the first transaction-related side-effect; ignore others.
   const tx_audit = input.side_effects.find((e) =>
     ['transaction_created', 'transaction_corrected'].includes(e.acao),
   );
   if (!tx_audit?.alvo_id) return; // unusual: side-effect without alvo_id
+
+  // Resolve the owner. The pending lands in the OWNER's conversa, not the
+  // editing user's — the owner is the one who decides whether to cancel.
+  const owner = await pessoasRepo.findByPhone(config.OWNER_TELEFONE_WHATSAPP);
+  if (!owner) {
+    logger.warn('message_update.no_owner_skipping_review');
+    return;
+  }
+  const ownerConversa = await conversasRepo.findActive(owner.id);
+  if (!ownerConversa) {
+    logger.warn({ owner_id: owner.id }, 'message_update.no_owner_conversa_skipping_review');
+    return;
+  }
 
   const verb = input.source === 'edit' ? 'editou' : 'deletou';
   const expira_em = new Date(Date.now() + REVIEW_TTL_HOURS * 60 * 60 * 1000);
@@ -848,20 +859,20 @@ async function createEditReviewPending(input: {
   await withTx(async (tx) => {
     const cancelled = await pendingQuestionsRepo.cancelOpenForConversaTx(
       tx,
-      input.original.conversa_id!,
+      ownerConversa.id,
       'replaced_by_edit_review',
     );
     if (cancelled.cancelled_ids.length > 0) {
       await audit({
         acao: 'pending_substituted_by_edit_review',
-        conversa_id: input.original.conversa_id!,
+        conversa_id: ownerConversa.id,
         mensagem_id: input.original.id,
         metadata: { cancelled_ids: cancelled.cancelled_ids },
       });
     }
     await pendingQuestionsRepo.createTx(tx, {
-      conversa_id: input.original.conversa_id!,
-      pessoa_id: input.pessoa_id,
+      conversa_id: ownerConversa.id,
+      pessoa_id: owner.id,
       tipo: 'edit_review',
       pergunta: `Você ${verb} uma mensagem que virou transação. Quer cancelar?`,
       opcoes_validas: [
@@ -877,6 +888,7 @@ async function createEditReviewPending(input: {
       metadata: {
         source: 'edit_review',
         original_mensagem_id: input.original.id,
+        original_conversa_id: input.original.conversa_id,
         original_diff: input.diff ?? null,
       },
     });
@@ -884,43 +896,32 @@ async function createEditReviewPending(input: {
 }
 ```
 
-Then in `handleMessageEdit`'s side-effect branch, after the existing `mensagem_edited_after_side_effect` audit:
+Imports needed at the top of `src/agent/message-update.ts`:
+
+```typescript
+import { mensagensRepo, auditRepo, pessoasRepo, conversasRepo, pendingQuestionsRepo } from '@/db/repositories.js';
+import { withTx } from '@/db/client.js';
+import { config } from '@/config/env.js';
+import { audit } from '@/governance/audit.js';
+import { logger } from '@/lib/logger.js';
+```
+
+In `handleMessageEdit`'s side-effect branch, after the existing `mensagem_edited_after_side_effect` audit:
 
 ```typescript
 if (config.FEATURE_MESSAGE_UPDATE) {
   await createEditReviewPending({
     original,
     side_effects: sideEffects,
-    pessoa_id: original.pessoa_id_owner ?? '', // see note below
     source: 'edit',
     diff: { before: original.conteudo ?? null, after: input.new_conteudo },
   });
 }
 ```
 
-**`pessoa_id_owner` note**: The pending must be addressed to the **owner**, not necessarily the message author. Look up via `config.OWNER_TELEFONE_WHATSAPP` → `pessoasRepo.findByPhone` once at the top of `createEditReviewPending`. Cache the result for the duration of the call. (If the owner isn't found, log + return without creating the pending.)
+(Same in `handleMessageRevoke`'s side-effect branch with `source: 'revoke'` and no `diff`.)
 
-Replace the placeholder above with:
-
-```typescript
-import { pessoasRepo } from '@/db/repositories.js';
-// at top
-const owner = await pessoasRepo.findByPhone(config.OWNER_TELEFONE_WHATSAPP);
-if (!owner) {
-  logger.warn('message_update.no_owner_skipping_review');
-  return;
-}
-const ownerConversa = await conversasRepo.findActive(owner.id);
-if (!ownerConversa) {
-  logger.warn('message_update.no_owner_conversa_skipping_review');
-  return;
-}
-// then pass ownerConversa.id to the pending create.
-```
-
-Restructure as you see fit; the key contract is: the pending lands in the owner's conversa, not the editing user's.
-
-- [ ] **Step 3: Run + commit**
+- [ ] **Step 4: Run + commit**
 
 ```bash
 npx vitest run tests/unit/message-update.spec.ts
