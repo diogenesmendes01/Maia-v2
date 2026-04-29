@@ -104,8 +104,8 @@ const outputSchema = z.object({
 Handler steps (transactional):
 
 1. Validate `opcoes_validas.length ∈ [2,12]`.
-2. **Affirmative-first guard for binary**: when `length === 2`, the **first** key MUST match `/^(sim|aprova|libera|ok|pode|confirmo|positivo)$/i` and the **second** `/^(n[ãa]o|cancela|bloqueia|nega|recusa|negativo)$/i`. If not, reject with `error: 'binary_options_must_be_affirmative_first'`. This is the runtime guard the B1 spec review demanded — without it, a future ✅-reaction could silently invert.
-3. Close any other `aberta` pending on the same `conversa_id` (`UPDATE ... SET status='cancelada_substituida' WHERE conversa_id=$1 AND status='aberta'`).
+2. **Affirmative-first guard for binary**: when `length === 2`, the **first** key MUST match `/^(sim|s[ií]m?|aprova|aprovo|confirma|confirmo|libera|ok|pode|positivo)$/i` and the **second** `/^(n[ãa]o|cancela|cancelo|bloqueia|bloqueio|nega|recusa|recuso|negativo)$/i`. If not, reject with `error: 'binary_options_must_be_affirmative_first'`. The contract is documented for B1 generators: imperative ("Confirma"), 1ps ("Confirmo"), and short-form ("OK", "Sim") all match. The same regex is reused as a sanity check at gate-classify time so divergence surfaces.
+3. Close any other `aberta` pending on the same `conversa_id`. Status enum in migration 002 §117 is `('aberta','respondida','expirada','cancelada')` — we reuse `'cancelada'` and stamp `metadata.cancel_reason='substituted'` rather than introducing a new enum value. Concretely: `UPDATE pending_questions SET status='cancelada', metadata = metadata || '{"cancel_reason":"substituted"}'::jsonb WHERE conversa_id=$1 AND status='aberta'`. Audit `pending_substituted` carries the prior id.
 4. Insert new row with `expira_em = now() + (ttl_minutes ?? config.PENDING_QUESTION_TTL_MINUTES) * interval '1 min'`.
 5. Audit `pending_created`.
 6. Return `pending_question_id`.
@@ -126,15 +126,20 @@ export async function checkPendingFirst(input: {
 >;
 ```
 
-Sequence:
+Sequence — **the LLM call runs OUTSIDE the row lock** so we never hold a Postgres lock across a 1-5s network call (anti-pattern):
 
-1. Inside a transaction, `SELECT * FROM pending_questions WHERE conversa_id=$1 AND status='aberta' AND expira_em > now() ORDER BY created_at DESC LIMIT 1 FOR UPDATE`. If none, return `{ kind: 'no_pending' }`.
-2. Call Haiku with a **focused** prompt: the active `pergunta`, the `opcoes_validas`, and the user's inbound text. Force JSON output matching `IntentResolutionSchema` (already in `pending-questions.ts`). Confidence threshold: `0.7`.
-3. If `resolution.is_topic_change` or `resolution.is_cancellation`: clear pending (`UPDATE ... SET status='cancelada' WHERE id=$1` inside the same tx) and return `{ kind: 'unresolved', reason: 'topic_change' }`.
-4. If `resolution.resolves_pending && resolution.confidence >= 0.7 && option_chosen ∈ opcoes_validas.key`: update row to `status='respondida'`, write `resolvida_em` and `resposta`, audit `pending_resolved`. Return `{ kind: 'resolved', action: pq.acao_proposta }`.
-5. Otherwise: return `{ kind: 'unresolved', reason: 'low_confidence' }` without touching the row (the LLM gets a fresh look).
+1. **Read-only snapshot** (no transaction): `SELECT * FROM pending_questions WHERE conversa_id=$1 AND status='aberta' AND expira_em > now() ORDER BY created_at DESC LIMIT 1`. If none, return `{ kind: 'no_pending' }`.
+2. Call Haiku with a **focused** prompt: the snapshot's `pergunta`, `opcoes_validas`, and the user's inbound text. Force JSON output matching `IntentResolutionSchema` (already in `pending-questions.ts`). Confidence threshold: `0.7`.
+3. **Write transaction** with re-check: `BEGIN; SELECT ... FOR UPDATE` the same `pq.id`. If the row's `status` is no longer `'aberta'` OR `expira_em <= now()`, `ROLLBACK` and return `{ kind: 'no_pending' }` (someone else won, or it expired during our LLM call).
+4. Within the same tx, branch on the resolution:
+   - `is_topic_change` / `is_cancellation` → `UPDATE ... SET status='cancelada' WHERE id=$1`. `COMMIT`. Return `{ kind: 'unresolved', reason: 'topic_change' }`. Audit `pending_unresolved_topic_change`.
+   - `resolves_pending && confidence >= 0.7 && option_chosen ∈ opcoes_validas.key` → `UPDATE ... SET status='respondida', resolvida_em=now(), resposta=$2 WHERE id=$1`. `COMMIT`. Audit `pending_resolved_by_gate`. Return `{ kind: 'resolved', action: pq.acao_proposta }`.
+   - Otherwise → `ROLLBACK` (no state change). Return `{ kind: 'unresolved', reason: 'low_confidence' }`. Audit `pending_unresolved_low_confidence`.
 
-The whole function is wrapped in a single Postgres transaction; `FOR UPDATE` blocks any concurrent gate call until this one commits or rolls back. Two concurrent attempts on the same pending serialise: the second sees `status='respondida'` and returns `{ kind: 'no_pending' }` cleanly.
+**Concurrency analysis**:
+- The lock is held only for the duration of one `SELECT ... FOR UPDATE` plus a single `UPDATE` — milliseconds, no LLM in scope.
+- Two concurrent gate calls each pay one Haiku call (intentional cost — sub-second redundancy on a same-pending race). Whichever commits the resolve first wins; the other sees `status != 'aberta'` on re-check and returns `'no_pending'`. The losing call's audit row writes `pending_unresolved_low_confidence` with `metadata.lost_race=true` so the wasted spend is observable in cost monitoring.
+- `expira_em` is re-checked at SELECT-FOR-UPDATE time. If TTL elapsed during the LLM call, treat as `'no_pending'` (no resolution, no cancellation — the existing `pending_expirer` worker will eventually flip the row to `'expirada'`).
 
 ### 4.4 Agent loop change
 
@@ -144,10 +149,21 @@ In `src/agent/core.ts`, between rate-limit and `buildPrompt`:
 const gate = await checkPendingFirst({ pessoa, conversa: c, inbound });
 if (gate.kind === 'resolved') {
   if (gate.action) {
+    // Existing applyResolution contract injects _pending_choice into args
+    // (src/workflows/pending-questions.ts:93). Preserve it here so
+    // downstream tools that key off the chosen option keep working.
+    const args = { ...gate.action.args, _pending_choice: gate.option_chosen };
     await dispatchTool({
       tool: gate.action.tool,
-      args: gate.action.args,
+      args,
       ctx: { pessoa, scope, conversa: c, mensagem_id: inbound.id, request_id: uuid() },
+    });
+    await audit({
+      acao: 'pending_action_dispatched',
+      pessoa_id: pessoa.id,
+      conversa_id: c.id,
+      mensagem_id: inbound.id,
+      metadata: { tool: gate.action.tool, pending_question_id: gate.pending_question_id },
     });
   }
   await mensagensRepo.markProcessed(inbound.id, 0);
@@ -155,6 +171,12 @@ if (gate.kind === 'resolved') {
   return;
 }
 // 'unresolved' and 'no_pending' fall through to the existing ReAct flow.
+```
+
+The `gate` shape for `'resolved'` therefore extends to:
+
+```typescript
+| { kind: 'resolved'; action?: { tool: string; args: Record<string, unknown> }; option_chosen: string; pending_question_id: string }
 ```
 
 Gated by `config.FEATURE_PENDING_GATE` — when `false`, `checkPendingFirst` short-circuits and returns `{ kind: 'no_pending' }` without touching the DB or calling Haiku.
@@ -180,15 +202,44 @@ When the previous tool dispatched in the same turn was `ask_pending_question` an
 
 The agent loop tracks "the most recent pending_question_id created this turn" with a single local variable; if `ask_pending_question` is called multiple times in a turn (rare), the last one wins. The B1 design assumes at most one outbound message per turn (already true today; spec A §5.4 also documents this invariant).
 
-### 4.6 `applyResolution` migration
+### 4.6 Repository extension (transactional helpers)
 
-Current `applyResolution` reads `getActivePending(conversa)` from `conversa.metadata.pending_question`. We do **not** rewrite the existing function. Instead:
+`pendingQuestionsRepo` today (`src/db/repositories.ts:480`) uses the global `db` and exposes only non-transactional methods. The gate needs three new methods that accept a `pg.PoolClient` (or the Drizzle-equivalent transactional client):
 
-- Mark `setLightweightPending`, `getActivePending`, `clearLightweightPending` as `@deprecated` in JSDoc.
-- Add new transactional helper `applyResolutionTx(client, conversa_id, resolution)` used **only** by `pending-gate.ts`. This avoids touching the dual-approval pathway that still uses the lightweight metadata.
-- Lint rule (or grep-based unit test) asserts no new callers of the lightweight helpers in `src/agent/`.
+```typescript
+// Adds to src/db/repositories.ts
+export const pendingQuestionsRepo = {
+  // ...existing methods...
 
-This keeps B0 a strict addition; the legacy lightweight path coexists for now and dies naturally as nothing references it.
+  /** Snapshot read (no lock) — used by checkPendingFirst step 1. */
+  async findActiveSnapshot(conversa_id: string): Promise<PendingQuestion | null>,
+
+  /** Locked read inside a tx — used by checkPendingFirst step 3 re-check. */
+  async findActiveForUpdate(client: PoolClient, conversa_id: string): Promise<PendingQuestion | null>,
+
+  /** Tx-scoped resolve. Updates status='respondida', resolvida_em, resposta. */
+  async resolveTx(client: PoolClient, id: string, resposta: unknown): Promise<void>,
+
+  /** Tx-scoped cancel. Updates status='cancelada', stamps cancel_reason. */
+  async cancelTx(client: PoolClient, id: string, reason: string): Promise<void>,
+
+  /** Used by ask_pending_question's "close prior open" step — non-tx variant for the tool handler's own tx. */
+  async cancelOpenForConversaTx(client: PoolClient, conversa_id: string, reason: string): Promise<{ cancelled_ids: string[] }>,
+};
+```
+
+Existing methods (`create`, `findOpen`, `resolve`, `expireDue`) are left intact — the dual-approval pathway and quarantine flow continue to use them unchanged.
+
+### 4.7 Lightweight-helper deprecation
+
+`setLightweightPending`, `getActivePending`, and `clearLightweightPending` in `src/workflows/pending-questions.ts` are marked `@deprecated` in JSDoc with a one-line "use pendingQuestionsRepo + pending-gate instead" pointer. **No callers remove or rewrite their behaviour** — they coexist. A grep-based unit test (no custom lint rule needed) asserts:
+
+```
+- src/agent/** has zero references to setLightweightPending / getActivePending / clearLightweightPending.
+- src/workflows/dual-approval.ts may continue to reference them (its flow is not migrated in B0).
+```
+
+The legacy path dies naturally as nothing new references it.
 
 ## 5. Audit-action additions
 
@@ -240,7 +291,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS uniq_pending_questions_active_per_conversa
   WHERE status = 'aberta';
 ```
 
-Backwards-compatible: if any conversa happens to have multiple `aberta` rows (unlikely, none in production today), the migration fails with a clear duplicate-key error. Recovery: manually mark older rows as `expirada` and rerun. Seeded environments are clean.
+The status CHECK constraint already permits `'cancelada'`, which is what the substitution path uses (with `metadata.cancel_reason='substituted'` for traceability). No CHECK extension required — keeps the migration footprint to a single index.
+
+**Failure recovery**: if any conversa already has multiple `aberta` rows when the migration applies (unlikely — none in production today, the lifecycle is unwired), the index creation fails with a duplicate-key error. Recovery is operator-facing, not automatic:
+
+```sql
+-- one-shot helper (run before re-applying migration 004)
+UPDATE pending_questions p
+   SET status = 'expirada'
+ WHERE status = 'aberta'
+   AND id NOT IN (
+     SELECT DISTINCT ON (conversa_id) id
+       FROM pending_questions
+      WHERE status = 'aberta'
+      ORDER BY conversa_id, created_at DESC
+   );
+```
+
+This script collapses each conversa's open-pending set to the single most-recent. The script lives in `scripts/recover-pending-dupes.sql` and is referenced from the migration's header comment so an operator who hits the failure has an immediate path forward.
 
 ## 10. Testing
 
@@ -250,9 +318,12 @@ Backwards-compatible: if any conversa happens to have multiple `aberta` rows (un
 - `governance/audit-actions.spec.ts`: closed-taxonomy still includes the new actions.
 
 ### Integration (TEST_DB_URL)
-- **Concurrency proof**: spawn two `checkPendingFirst` against the same conversa; assert exactly one returns `kind: 'resolved'`, the other `'no_pending'`. The action is dispatched at most once.
+- **Concurrency proof**: spawn two `checkPendingFirst` against the same conversa; assert exactly one returns `kind: 'resolved'`, the other `'no_pending'`. The action is dispatched at most once. Both Haiku calls happen (intentional — see §6); the loser's audit row carries `metadata.lost_race=true`.
+- **TTL-mid-call**: stub Haiku to delay 200ms; manually flip `expira_em` to a past timestamp during the delay; assert the gate's re-check observes expiration and returns `'no_pending'` without flipping status.
+- **Substitution**: call `ask_pending_question` twice in a row; assert the first row is `status='cancelada'` with `metadata.cancel_reason='substituted'`, the second is `'aberta'`.
 - Migration: applies cleanly to a seeded DB; rejects a synthetic duplicate `aberta` row.
 - Tool happy path: handler inserts row; gate finds it; resolution updates row.
+- **Colloquial replies**: feed the gate inputs like `'uhum'`, `'blz'`, `'opa'` against a binary pending — assert `low_confidence` path triggers and the row stays `'aberta'`.
 
 ## 11. Out of scope (future sub-projects)
 
