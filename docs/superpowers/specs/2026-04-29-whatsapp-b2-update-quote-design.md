@@ -2,8 +2,9 @@
 
 **Date:** 2026-04-29
 **Status:** Approved (in brainstorm), pending spec review and user review.
-**Scope:** Sub-project B2 of the WhatsApp brainstorm tracks. Sub-A (PR #11), B0 (PR #12) merged. B1 (PR #15) in flight. B3a/B3b/B4 deferred.
-**Depends on:** sub-A (presence — `quotedReplyContext` already accepts any metadata), B0 (`pending_questions` lifecycle + `ask_pending_question` tool), spec 04 (gateway), spec 06 (agent loop), spec 09 (audit taxonomy).
+**Scope:** Sub-project B2 of the WhatsApp brainstorm tracks. Sub-A (PR #11), B0 (PR #12) merged. B3a/B3b/B4 deferred.
+**Hard prerequisite:** **B1 (PR #15) must merge to `main` before this spec's plan starts.** §4.2 modifies `sendOutboundPoll`, which only exists on B1's branch. The plan is unexecutable otherwise.
+**Depends on:** sub-A (presence — `quotedReplyContext` already accepts any metadata), B0 (`pending_questions` lifecycle + `ask_pending_question` tool + `pendingQuestionsRepo.createTx`), B1 (`sendOutboundPoll`), spec 04 (gateway), spec 06 (agent loop), spec 09 (audit taxonomy).
 
 ---
 
@@ -36,15 +37,20 @@ Three complementary capabilities, all about **context preservation** in the What
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
 │  src/agent/message-update.ts (NEW)                                        │
-│    handleMessageEdit({ whatsapp_id, new_conteudo })                       │
-│    handleMessageRevoke({ whatsapp_id, revoked_by_jid })                   │
+│    routeMessageUpdate(update: proto.IWebMessageInfo) — single entry       │
+│    branches internally on update.message:                                  │
+│      .editedMessage           → handleEdit                                 │
+│      .protocolMessage.type=0  → handleRevoke                               │
+│    Other shapes (read receipts etc.) ignored — Baileys reuses              │
+│    messages.update for receipts too.                                       │
 └──────────────────────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────────────────────┐
 │  src/gateway/baileys.ts                                                   │
-│    socket.ev.on('messages.update', ...) → handleMessageEdit (new wire)    │
-│    handleIncoming: pollUpdate / reactionStub branches stay; +REVOKE       │
-│      branch dispatches handleMessageRevoke before falling through         │
+│    socket.ev.on('messages.update', updates) — NEW listener (gated by      │
+│      FEATURE_MESSAGE_UPDATE). For each update, calls routeMessageUpdate.   │
+│    handleIncoming UNCHANGED — revokes do NOT come via messages.upsert      │
+│      in Baileys 6.7.0; both edits and revokes flow through messages.update.│
 └──────────────────────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────────────────────┐
@@ -65,12 +71,53 @@ Three complementary capabilities, all about **context preservation** in the What
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 4.1 `handleMessageEdit` and `handleMessageRevoke`
+### 4.1 `routeMessageUpdate`, `handleMessageEdit`, `handleMessageRevoke`
 
-Both take a single argument and run the same shape:
+`routeMessageUpdate` accepts the raw `proto.IWebMessageInfo` from Baileys' `messages.update` event and is the single entry point. It unwraps the envelope, classifies, and dispatches to one of two private handlers.
+
+```typescript
+// src/agent/message-update.ts
+import type { proto } from '@whiskeysockets/baileys';
+
+export async function routeMessageUpdate(update: proto.IWebMessageInfo): Promise<void> {
+  const wid = update.key?.id;
+  if (!wid) return;
+  const m = update.message;
+  if (!m) return;
+
+  // Edit: Baileys 6.7.0 wraps the new content under editedMessage.message.<typeOfMessage>.
+  // We support text edits initially; media/audio edits noted as out-of-scope (§11).
+  const edited = m.editedMessage?.message;
+  if (edited) {
+    const new_conteudo =
+      edited.conversation ??
+      edited.extendedTextMessage?.text ??
+      null;
+    if (typeof new_conteudo === 'string') {
+      await handleMessageEdit({ whatsapp_id: wid, new_conteudo });
+    }
+    return;
+  }
+
+  // Revoke: protocolMessage.type === REVOKE (numeric 0 in Baileys 6.7.0 enum).
+  // The `key` of the revoked message lives at protocolMessage.key.
+  const proto_msg = m.protocolMessage;
+  if (proto_msg && proto_msg.type === 0 && proto_msg.key?.id) {
+    await handleMessageRevoke({
+      whatsapp_id: proto_msg.key.id,
+      revoked_by_jid: update.key.remoteJid ?? '',
+    });
+    return;
+  }
+
+  // Anything else (read receipts, message-status updates) is not interesting.
+}
+```
+
+`handleMessageEdit({ whatsapp_id, new_conteudo: string })` and `handleMessageRevoke({ whatsapp_id, revoked_by_jid: string })` are private and share the body shape:
 
 1. `mensagensRepo.findByWhatsappId(whatsapp_id)` → `original | null`. If null, log + return (we don't know about that message; can't act).
-2. Detect side-effect: query `audit_log` for rows where `mensagem_id = original.id` AND `acao IN (transaction_created, transaction_corrected, transaction_cancelled, pending_action_dispatched)`. If any → side-effect existed.
+2. Detect side-effect: query `audit_log` for rows where `mensagem_id = original.id` AND `acao IN (transaction_created, transaction_corrected, transaction_cancelled, pending_action_dispatched)`. If any → side-effect existed and the audit row's `alvo_id` carries the `transacao_id`.
 3. **No side-effect path** — emit one of:
    - `mensagem_edited` with `diff: { before: original.conteudo, after: new_conteudo }`
    - `mensagem_revoked`
@@ -93,9 +140,41 @@ Both take a single argument and run the same shape:
 }
 ```
 
-When the owner answers (via text, reaction, or poll — B0+B1 already handle all three), the gate's `resolveAndDispatch` runs the `cancel_transaction` tool. **Zero new dispatch logic.** The B2 work is just: detect → create pending → reuse the existing flow.
+When the owner answers (via text, reaction, or poll — B0+B1 already handle all three), the gate's `resolveAndDispatch` runs the `cancel_transaction` tool.
 
-`cancel_transaction` is an existing tool (verify in `src/tools/_registry.ts`); if absent, declare it as a hard dependency and add a stub that logs + returns (this is uncommon enough that a v1 stub is acceptable — owner can fix manually).
+**`cancel_transaction` does not exist on main today** (verified: `src/tools/_registry.ts` has 18 tools, none named `cancel_transaction`). B2 introduces it as a thin tool:
+
+```typescript
+// src/tools/cancel-transaction.ts
+const inputSchema = z.object({
+  transacao_id: z.string().uuid(),
+  motivo: z.string().max(200).optional(),  // populated from edit_review pending
+});
+
+const outputSchema = z.union([
+  z.object({ ok: z.literal(true), transacao_id: z.string() }),
+  z.object({ error: z.string() }),
+]);
+
+// Handler:
+//   1. Verify the transaction exists and is within ctx.scope.entidades.
+//      Out-of-scope or missing → { error: 'forbidden' }.
+//   2. UPDATE transacoes SET status='cancelada', cancelada_em=now(), updated_at=now()
+//      WHERE id=$1.
+//   3. (Optional) revert account balance if the transaction was 'paga'/'recebida' —
+//      the existing transaction-correction flow already does this; reuse the same
+//      helper if available, else leave a TODO and let owner reconcile manually.
+//   4. Audit transaction_cancelled (existing closed-taxonomy entry).
+//   5. Idempotent on transacao_id (operation_type='cancel') — repeated calls
+//      from the dispatcher cache return the same {ok:true,transacao_id}.
+//
+// side_effect: 'write'
+// required_actions: ['cancel_transaction']  (existing ActionKey)
+// audit_action: 'transaction_cancelled'  (existing AuditAction)
+// operation_type: 'cancel'
+```
+
+Registered in `_registry.ts`. The `transaction_cancelled` audit action and `cancel_transaction` permission ActionKey **already exist** in `src/governance/audit-actions.ts` — only the tool implementation is new. **Zero new audit/permission surface.**
 
 ### 4.2 Outbound `remote_jid` persistence
 
@@ -153,7 +232,9 @@ For each row:
    - `reminder_count = COALESCE(reminder_count, 0) + 1`
 5. Audit `pending_reminder_sent` with `{ pending_question_id, reminder_count }`.
 
-Idempotency: the cron tick is non-transactional but the `last_reminder_at` update happens **before** the reminder send. If the send fails the timestamp is already advanced — the next tick won't double-send. Trade-off: occasional missed reminder on send failure, never duplicate. Acceptable for v1.
+Idempotency: the cron tick is non-transactional but the `last_reminder_at` update happens **before** the reminder send. If the send fails the timestamp is already advanced — the next tick won't double-send. Trade-off: occasional missed reminder on send failure, **never duplicate**. Acceptable for v1.
+
+Observability: when a tick scans a pending whose `last_reminder_at` is within 1h, it emits a debug-level `pending_reminder_skipped_already_marked` audit. This makes the crash-during-send case testable — a deliberate crash between metadata-update and send produces a `pending_reminder_skipped_already_marked` audit on the next tick (instead of a second `pending_reminder_sent`).
 
 **Cron**: registered in `src/workers/index.ts` as `pending_reminder` at `*/30 * * * *`, phase 1, gated by `FEATURE_PENDING_REMINDER`.
 
@@ -163,7 +244,24 @@ The reminder worker SKIPS pendings whose `tipo = 'edit_review'`. Reminding the o
 
 ## 5. Schema / migration
 
-None required. `mensagens.metadata` and `pending_questions.metadata` are JSONB; we add keys without DDL.
+One migration. `audit_log.mensagem_id` is queried by `handleMessageEdit` / `handleMessageRevoke` to detect side-effects (§4.1 step 2). The current schema has no index on that column, so the query degrades to a seq scan as `audit_log` grows.
+
+`migrations/005_audit_mensagem_idx.sql`:
+
+```sql
+-- =====================================================================
+-- Maia — Migration 005 (B2: message-update side-effect detection)
+-- Indexes audit_log.mensagem_id so the per-edit lookup stays O(log n)
+-- as audit_log grows. Partial — only rows that actually carry a
+-- mensagem_id are interesting to this query path.
+-- =====================================================================
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_audit_mensagem
+  ON audit_log (mensagem_id)
+  WHERE mensagem_id IS NOT NULL;
+```
+
+`mensagens.metadata` and `pending_questions.metadata` JSONB additions (`remote_jid`, `last_reminder_at`, `reminder_count`) require **no** DDL.
 
 ## 6. Configuration
 
@@ -184,8 +282,10 @@ In `src/governance/audit-actions.ts`:
 'mensagem_edited_after_side_effect',
 'mensagem_revoked_after_side_effect',
 'edit_review_resolved',                 // when owner decides via the pending
+'pending_substituted_by_edit_review',   // visibility for §8 trade-off
 'pending_reminder_sent',
 'pending_reminder_skipped_no_outbound',
+'pending_reminder_skipped_already_marked', // §4.3 idempotency trace
 ```
 
 `edit_review_resolved` fires from the gate's `resolveAndDispatch` path when the resolved pending's `tipo === 'edit_review'`. (Small addition to `resolveAndDispatch` or a side-listener — the spec leaves the implementation choice to the plan.)
@@ -194,7 +294,7 @@ In `src/governance/audit-actions.ts`:
 
 - The reminder worker runs every 30 min. The 1-hour `last_reminder_at` debounce means a single pending can't be reminded twice within an hour even if the worker runs fast or two cron instances overlap.
 - Edit/revoke handlers are eventually-consistent: the original `mensagens` row may be in flight when the edit arrives (rare; Baileys typically delivers in order). If `findByWhatsappId` returns null, we log and skip — no retry. Trade-off: a race-edited message before its inbound persists is lost. Acceptable.
-- B0's `cancelOpenForConversaTx` invariant (one active pending per conversa) means creating an `edit_review` pending will **substitute** any existing pending. This is desirable: an open question becomes irrelevant if the user just edited the message that triggered it.
+- B0's `cancelOpenForConversaTx` invariant (one active pending per conversa) means creating an `edit_review` pending will **substitute** any existing pending on the owner's conversa — including unrelated ones (e.g., a `query_balance` follow-up). **Trade-off (deliberate)**: edit-review takes priority because it's about reverting financial state; an unrelated balance question is cheap to re-ask. To make the loss observable, the substitution emits an extra audit `pending_substituted_by_edit_review` (in addition to B0's standard `pending_substituted`) carrying the substituted pending's `tipo` so cost monitoring / cost ledger can detect spurious cancellations and the team can revisit if it becomes a real complaint.
 
 ## 9. Error handling
 
@@ -247,6 +347,9 @@ In `src/governance/audit-actions.ts`:
 - [ ] `FEATURE_PENDING_REMINDER=true`: a pending with `reminder_count = 2` → not reminded again.
 - [ ] `FEATURE_PENDING_REMINDER=true`: a pending with `tipo = 'edit_review'` → never reminded.
 - [ ] `FEATURE_PENDING_REMINDER=false` → worker is a no-op.
+- [ ] **Crash-during-send guarantee**: a process crash between `last_reminder_at` write and the WhatsApp send → next tick observes `last_reminder_at` already set, emits `pending_reminder_skipped_already_marked`, and does **not** re-send (verified via fault injection in unit test).
+- [ ] **Substitution visibility**: creating an `edit_review` pending while another open pending exists for the same conversa emits both `pending_substituted` (B0) and `pending_substituted_by_edit_review` (B2) so the loss is observable.
+- [ ] **`cancel_transaction` tool**: registered in `_registry.ts`; refuses out-of-scope `transacao_id` with `error: 'forbidden'`; idempotent on repeat call (dispatcher cache).
 - [ ] Quote in reminder is verified by mock socket receiving `{ quoted: { key: { id: <original_wid>, remoteJid: <jid>, fromMe: true }, message: { conversation: <truncated original pergunta> } } }`.
 
 ## 13. References
