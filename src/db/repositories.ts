@@ -442,6 +442,20 @@ export const rulesRepo = {
     const rows = await db.insert(learned_rules).values(input).returning();
     return rows[0]!;
   },
+  async findByContext(tipo: string, contexto: string): Promise<LearnedRule | null> {
+    const rows = await db
+      .select()
+      .from(learned_rules)
+      .where(
+        and(
+          eq(learned_rules.tipo, tipo),
+          eq(learned_rules.contexto, contexto),
+          eq(learned_rules.ativa, true),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
   async byId(id: string): Promise<LearnedRule | null> {
     const rows = await db.select().from(learned_rules).where(eq(learned_rules.id, id)).limit(1);
     return rows[0] ?? null;
