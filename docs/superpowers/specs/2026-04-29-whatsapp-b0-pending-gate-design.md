@@ -138,7 +138,7 @@ Sequence — **the LLM call runs OUTSIDE the row lock** so we never hold a Postg
 
 **Concurrency analysis**:
 - The lock is held only for the duration of one `SELECT ... FOR UPDATE` plus a single `UPDATE` — milliseconds, no LLM in scope.
-- Two concurrent gate calls each pay one Haiku call (intentional cost — sub-second redundancy on a same-pending race). Whichever commits the resolve first wins; the other sees `status != 'aberta'` on re-check and returns `'no_pending'`. The losing call's audit row writes `pending_unresolved_low_confidence` with `metadata.lost_race=true` so the wasted spend is observable in cost monitoring.
+- Two concurrent gate calls each pay one Haiku call (intentional cost — sub-second redundancy on a same-pending race). Whichever commits the resolve first wins; the other sees `status != 'aberta'` on re-check (step 3 `ROLLBACK` branch) and returns `{ kind: 'no_pending' }`. The losing call audits `pending_race_lost` with `{ pending_question_id, winner_was_us: false }` so the wasted Haiku spend is observable in cost monitoring (see §5 audit additions). The "low_confidence" path remains semantically distinct — it triggers when Haiku itself was inconclusive, not when a race was lost.
 - `expira_em` is re-checked at SELECT-FOR-UPDATE time. If TTL elapsed during the LLM call, treat as `'no_pending'` (no resolution, no cancellation — the existing `pending_expirer` worker will eventually flip the row to `'expirada'`).
 
 ### 4.4 Agent loop change
@@ -252,6 +252,7 @@ Append to `src/governance/audit-actions.ts`:
 'pending_unresolved_low_confidence',
 'pending_substituted',                // when a new ask replaces an open one
 'pending_action_dispatched',
+'pending_race_lost',                  // gate's loser-of-race observability
 ```
 
 ## 6. Concurrency
@@ -313,8 +314,8 @@ This script collapses each conversa's open-pending set to the single most-recent
 ## 10. Testing
 
 ### Unit
-- `tools/ask-pending-question.spec.ts`: schema validation, affirmative-first enforcement on binary, ttl default.
-- `agent/pending-gate.spec.ts`: classify resolve / topic change / low confidence; mock Haiku; mock pg client; verify `applyResolutionTx` calls.
+- `tools/ask-pending-question.spec.ts`: schema validation, affirmative-first enforcement on binary, ttl default, **two-asks-in-a-turn** behaviour (last one wins; the prior is `cancelada` with `metadata.cancel_reason='substituted'`).
+- `agent/pending-gate.spec.ts`: classify resolve / topic change / low confidence; mock Haiku; mock pg client; verify `pendingQuestionsRepo.resolveTx` / `cancelTx` called with the right ids and `_pending_choice` injection.
 - `governance/audit-actions.spec.ts`: closed-taxonomy still includes the new actions.
 
 ### Integration (TEST_DB_URL)
