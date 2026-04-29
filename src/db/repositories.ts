@@ -516,6 +516,7 @@ export const pendingQuestionsRepo = {
           eq(pending_questions.pessoa_id, pessoa_id),
           eq(pending_questions.tipo, tipo),
           eq(pending_questions.status, 'aberta'),
+          sql`(${pending_questions.expira_em} IS NULL OR ${pending_questions.expira_em} > NOW())`,
         ),
       )
       .orderBy(desc(pending_questions.created_at))

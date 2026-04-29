@@ -4,6 +4,7 @@ import type { Pessoa, Mensagem } from '@/db/schema.js';
 import { audit } from '@/governance/audit.js';
 import { sendOutboundText } from '@/gateway/baileys.js';
 import { logger } from '@/lib/logger.js';
+import { parseDecision, maskPhone } from './quarantine-utils.js';
 
 const HOLDING_MESSAGE =
   'Oi! Antes de eu poder te atender, preciso confirmar com {OWNER_NAME} que é você mesmo. Aguenta 1 minutinho?';
@@ -36,8 +37,11 @@ export async function handleQuarantineFirstContact(input: {
   }
 
   const existing = await pendingQuestionsRepo.findOpenByPessoaAndType(owner.id, 'identity_confirmation');
-  if (existing && (existing.acao_proposta as { kind?: string; target_pessoa_id?: string } | null)?.target_pessoa_id === pessoa.id) {
-    // Already waiting on owner — send timeout-aware reply to the contact.
+  if (existing) {
+    // A confirmation is already open (possibly for a different contact). Sending
+    // a second one would make the owner's next reply ambiguous — we can't tell
+    // which person they're confirming. Keep one open at a time and tell the new
+    // contact to wait.
     const tel = (pessoa.telefone_whatsapp ?? '').trim();
     if (tel) await sendOutboundText(jidFromPhone(tel), TIMEOUT_MESSAGE).catch(() => null);
     return;
@@ -143,21 +147,6 @@ export async function handleOwnerIdentityReply(input: {
   return true;
 }
 
-function parseDecision(reply: string): 'aprova' | 'bloqueia' | null {
-  const r = reply.trim().toLowerCase();
-  if (/^(sim|libera|aprova|ok|pode)/.test(r)) return 'aprova';
-  if (/^(n[ãa]o|bloqueia|bloquear|nao libera)/.test(r)) return 'bloqueia';
-  return null;
-}
-
-function maskPhone(tel: string): string {
-  if (tel.length < 6) return '***';
-  return tel.slice(0, 4) + '*****' + tel.slice(-2);
-}
-
 async function findOwner(): Promise<Pessoa | null> {
-  const owner = await pessoasRepo.findByPhone(config.OWNER_TELEFONE_WHATSAPP);
-  return owner;
+  return pessoasRepo.findByPhone(config.OWNER_TELEFONE_WHATSAPP);
 }
-
-export const _internal = { parseDecision, maskPhone };
