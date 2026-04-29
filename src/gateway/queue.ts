@@ -3,6 +3,8 @@ import IORedis from 'ioredis';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 import { dlqRepo } from '@/db/repositories.js';
+import { audit } from '@/governance/audit.js';
+import { sendAlert } from '@/lib/alerts.js';
 import type { AgentJob } from './types.js';
 
 const connection = new IORedis(config.REDIS_URL, {
@@ -32,13 +34,22 @@ export function startAgentWorker(processor: (job: Job<AgentJob>) => Promise<void
   worker.on('failed', async (job, err) => {
     logger.error({ job_id: job?.id, err: err?.message }, 'agent.job.failed');
     if (job && job.attemptsMade >= (job.opts.attempts ?? 3)) {
-      await dlqRepo.add({
+      const entry = await dlqRepo.add({
         queue_name: 'agent',
         job_id: job.id ?? 'unknown',
         payload: job.data,
         error: err?.message ?? 'unknown',
         attempts: job.attemptsMade,
       });
+      await audit({
+        acao: 'dlq_job_added',
+        alvo_id: entry.id,
+        metadata: { queue: 'agent', job_id: job.id, attempts: job.attemptsMade },
+      });
+      await sendAlert({
+        subject: `DLQ entry on agent queue (${job.attemptsMade} attempts)`,
+        body: `Job ${job.id} exhausted retries. Error: ${err?.message ?? 'unknown'}\nDLQ id: ${entry.id}\nRun "npm run dlq" to inspect.`,
+      }).catch(() => null);
     }
   });
   return worker;

@@ -442,6 +442,20 @@ export const rulesRepo = {
     const rows = await db.insert(learned_rules).values(input).returning();
     return rows[0]!;
   },
+  async findByContext(tipo: string, contexto: string): Promise<LearnedRule | null> {
+    const rows = await db
+      .select()
+      .from(learned_rules)
+      .where(
+        and(
+          eq(learned_rules.tipo, tipo),
+          eq(learned_rules.contexto, contexto),
+          eq(learned_rules.ativa, true),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
   async byId(id: string): Promise<LearnedRule | null> {
     const rows = await db.select().from(learned_rules).where(eq(learned_rules.id, id)).limit(1);
     return rows[0] ?? null;
@@ -489,6 +503,21 @@ export const pendingQuestionsRepo = {
       .select()
       .from(pending_questions)
       .where(and(eq(pending_questions.conversa_id, conversa_id), eq(pending_questions.status, 'aberta')))
+      .orderBy(desc(pending_questions.created_at))
+      .limit(1);
+    return rows[0] ?? null;
+  },
+  async findOpenByPessoaAndType(pessoa_id: string, tipo: string): Promise<PendingQuestion | null> {
+    const rows = await db
+      .select()
+      .from(pending_questions)
+      .where(
+        and(
+          eq(pending_questions.pessoa_id, pessoa_id),
+          eq(pending_questions.tipo, tipo),
+          eq(pending_questions.status, 'aberta'),
+        ),
+      )
       .orderBy(desc(pending_questions.created_at))
       .limit(1);
     return rows[0] ?? null;
@@ -689,17 +718,21 @@ export const dlqRepo = {
     payload: unknown;
     error: string;
     attempts: number;
-  }): Promise<void> {
+  }): Promise<{ id: string }> {
     const now = new Date();
-    await db.insert(dead_letter_jobs).values({
-      queue_name: input.queue_name,
-      job_id: input.job_id,
-      payload: input.payload as object,
-      error: input.error,
-      attempts: input.attempts,
-      first_failed_at: now,
-      last_failed_at: now,
-    });
+    const rows = await db
+      .insert(dead_letter_jobs)
+      .values({
+        queue_name: input.queue_name,
+        job_id: input.job_id,
+        payload: input.payload as object,
+        error: input.error,
+        attempts: input.attempts,
+        first_failed_at: now,
+        last_failed_at: now,
+      })
+      .returning({ id: dead_letter_jobs.id });
+    return rows[0]!;
   },
   async listOpen(n = 100) {
     return db

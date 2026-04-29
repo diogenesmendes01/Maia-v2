@@ -54,6 +54,35 @@ class OpenAIEmbeddingProvider implements EmbeddingProvider {
   }
 }
 
+class CohereEmbeddingProvider implements EmbeddingProvider {
+  name = 'cohere' as const;
+  constructor(
+    private apiKey: string,
+    public modelId: string,
+    public dimensions: number,
+  ) {}
+
+  async embed(texts: string[]): Promise<number[][]> {
+    const res = await fetch('https://api.cohere.com/v1/embed', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${this.apiKey}`,
+      },
+      body: JSON.stringify({
+        texts,
+        model: this.modelId,
+        // 'search_document' is the most common case for stored memories;
+        // recall uses 'search_query' on its own dedicated model when needed.
+        input_type: 'search_document',
+      }),
+    });
+    if (!res.ok) throw new Error(`cohere_embed_failed: ${res.status} ${await res.text()}`);
+    const data = (await res.json()) as { embeddings: number[][] };
+    return data.embeddings;
+  }
+}
+
 let _provider: EmbeddingProvider | null = null;
 
 export function getEmbeddingProvider(): EmbeddingProvider {
@@ -64,6 +93,13 @@ export function getEmbeddingProvider(): EmbeddingProvider {
   } else if (config.EMBEDDING_PROVIDER === 'openai') {
     if (!config.OPENAI_API_KEY) throw new Error('OPENAI_API_KEY missing');
     _provider = new OpenAIEmbeddingProvider(config.OPENAI_API_KEY, config.EMBEDDING_MODEL, config.EMBEDDING_DIMENSIONS);
+  } else if (config.EMBEDDING_PROVIDER === 'cohere') {
+    if (!config.COHERE_API_KEY) throw new Error('COHERE_API_KEY missing');
+    _provider = new CohereEmbeddingProvider(
+      config.COHERE_API_KEY,
+      config.EMBEDDING_MODEL,
+      config.EMBEDDING_DIMENSIONS,
+    );
   } else {
     throw new Error(`unsupported embedding provider: ${config.EMBEDDING_PROVIDER}`);
   }
