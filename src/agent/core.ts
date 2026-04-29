@@ -13,7 +13,6 @@ import { audit } from '@/governance/audit.js';
 import { dispatchTool } from '@/tools/_dispatcher.js';
 import { getToolSchemas, REGISTRY } from '@/tools/_registry.js';
 import { startTyping, sendReaction, quotedReplyContext } from '@/gateway/presence.js';
-import { getActivePending } from '@/workflows/pending-questions.js';
 import { uuid } from '@/lib/utils.js';
 import {
   detectCorrection,
@@ -174,8 +173,13 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
       if (res.tool_uses.length === 0) {
         const text = res.content?.trim() ?? '';
         if (text) {
+          // Quote the inbound when the user is correcting us OR when this turn
+          // just opened a new pending question (B1 thread-context). Pre-turn
+          // pendings are already consumed by `checkPendingFirst`, so the only
+          // way one is active here is if `ask_pending_question` was just
+          // called — which is what `latestPendingId !== null` captures.
           const shouldQuote =
-            (inbound.conteudo && detectCorrection(inbound.conteudo)) || getActivePending(c) !== null;
+            (inbound.conteudo && detectCorrection(inbound.conteudo)) || latestPendingId !== null;
           await sendOutbound(pessoa.id, c.id, text, inbound.id, {
             quoted: shouldQuote
               ? quotedReplyContext(inbound.metadata as Record<string, unknown> | null, inbound.conteudo)

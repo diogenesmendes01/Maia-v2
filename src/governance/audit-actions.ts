@@ -64,6 +64,7 @@ export const AUDIT_ACTIONS = [
   'pending_created',
   'pending_resolved_by_gate',
   'pending_unresolved_topic_change',
+  'pending_unresolved_cancelled',
   'pending_unresolved_low_confidence',
   'pending_substituted',
   'pending_action_dispatched',

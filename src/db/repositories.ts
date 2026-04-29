@@ -615,6 +615,18 @@ export const pendingQuestionsRepo = {
     `);
     return { cancelled_ids: result.rows.map((r) => (r as { id: string }).id) };
   },
+
+  async createTx(
+    tx: typeof db,
+    input: Omit<PendingQuestion, 'id' | 'created_at' | 'resolvida_em' | 'resposta'>,
+  ): Promise<PendingQuestion> {
+    // Insert inside the same tx as the cancel — required by the partial unique
+    // index `(conversa_id) WHERE status='aberta'` from migration 004. Doing
+    // the insert on the global pool would race with the in-flight cancel and
+    // hit a duplicate-key error.
+    const rows = await tx.insert(pending_questions).values(input).returning();
+    return rows[0]!;
+  },
 };
 
 export const idempotencyRepo = {
