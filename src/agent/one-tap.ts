@@ -95,7 +95,13 @@ export async function dispatchPollVote(msg: proto.IWebMessageInfo): Promise<void
   }
   const opts = meta.poll_options as Array<{ key: string; label: string }> | undefined;
   const secretB64 = meta.poll_message_secret as string | undefined;
-  if (!opts || !secretB64) {
+  // Baileys derives `pollCreatorJid` via `getKeyAuthor(creationKey, meIdNormalised)`;
+  // for fromMe creation keys (polls Maia sent) that's Maia's normalized JID, NOT
+  // the inbound vote's `remoteJid` (which is the user). It's persisted at send
+  // time in `sendOutboundPoll`. Without it the HMAC fails and decryption falls
+  // through to `decrypt_failed`, so treat it as required.
+  const pollCreatorJid = meta.poll_creator_jid as string | undefined;
+  if (!opts || !secretB64 || !pollCreatorJid) {
     await audit({
       acao: 'one_tap_dispatch_error',
       metadata: { source: 'poll_vote', reason: 'missing_poll_metadata', parent_wid },
@@ -116,7 +122,7 @@ export async function dispatchPollVote(msg: proto.IWebMessageInfo): Promise<void
         encIv: pollUpdate.vote!.encIv!,
       },
       {
-        pollCreatorJid: msg.key.remoteJid ?? '',
+        pollCreatorJid,
         pollMsgId: parent_wid,
         pollEncKey: secret,
         voterJid: msg.key.participant ?? msg.key.remoteJid ?? '',

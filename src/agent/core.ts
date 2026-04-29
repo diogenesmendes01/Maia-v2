@@ -334,8 +334,10 @@ async function sendOutboundPoll(
   const jid = pessoa.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
   const { sendPoll } = await import('@/gateway/presence.js');
   const sent = await sendPoll(jid, text, pending.opcoes_validas);
-  if (!sent.whatsapp_id) {
-    // Fallback to plain text with numbered list.
+  // Without all three (whatsapp_id, message_secret, creator_jid) the inbound
+  // vote can't be decrypted (creator_jid feeds the HMAC in decryptPollVote),
+  // so the user would see a poll they can't actually answer. Fall back.
+  if (!sent.whatsapp_id || !sent.message_secret || !sent.creator_jid) {
     const numbered = pending.opcoes_validas.map((o, i) => `${i + 1}. ${o.label}`).join('\n');
     await sendOutbound(pessoa_id, conversa_id, `${text}\n\n${numbered}`, in_reply_to, {
       pending_question_id: pending.id,
@@ -354,6 +356,7 @@ async function sendOutboundPoll(
       pending_question_id: pending.id,
       poll_options: pending.opcoes_validas,
       poll_message_secret: sent.message_secret,
+      poll_creator_jid: sent.creator_jid,
     },
     processada_em: new Date(),
     ferramentas_chamadas: [],

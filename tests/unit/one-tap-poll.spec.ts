@@ -43,8 +43,10 @@ const pollUpdateMsg = {
   },
 } as never;
 
+const MAIA_JID = '5500000000000@s.whatsapp.net';
+
 describe('dispatchPollVote', () => {
-  it('decrypts vote, hash-matches a label, calls resolveAndDispatch', async () => {
+  it('decrypts vote with persisted pollCreatorJid, hash-matches a label, dispatches', async () => {
     findByWhatsappId.mockResolvedValueOnce({
       id: 'out-1', conversa_id: 'c1',
       metadata: {
@@ -55,6 +57,7 @@ describe('dispatchPollVote', () => {
           { key: 'outro', label: 'Outro' },
         ],
         poll_message_secret: Buffer.from('secret').toString('base64'),
+        poll_creator_jid: MAIA_JID,
       },
     });
     conversaById.mockResolvedValueOnce({ id: 'c1', pessoa_id: 'p1' });
@@ -64,6 +67,19 @@ describe('dispatchPollVote', () => {
     resolveAndDispatch.mockResolvedValueOnce({ resolved: true });
     const { dispatchPollVote } = await import('../../src/agent/one-tap.js');
     await dispatchPollVote(pollUpdateMsg);
+    // The HMAC inside Baileys uses `pollCreatorJid` — for polls Maia sent,
+    // that's Maia's normalized JID (persisted at send time), NOT the inbound
+    // vote's `remoteJid` (which is the user). Asserting the ctx prevents a
+    // regression where votes silently fail to decrypt.
+    expect(decryptPollVote).toHaveBeenCalledWith(
+      expect.objectContaining({ encPayload: expect.anything(), encIv: expect.anything() }),
+      expect.objectContaining({
+        pollCreatorJid: MAIA_JID,
+        pollMsgId: 'WAID-POLL',
+        pollEncKey: expect.any(Buffer),
+        voterJid: 'jid',
+      }),
+    );
     expect(resolveAndDispatch).toHaveBeenCalledWith(expect.objectContaining({
       expected_pending_id: 'pq-1',
       option_chosen: 'restaurante',
@@ -83,6 +99,25 @@ describe('dispatchPollVote', () => {
     expect(audit.mock.calls.some((c) => c[0].acao === 'one_tap_no_pending_anchor')).toBe(true);
   });
 
+  it('metadata missing poll_creator_jid → audit missing_poll_metadata, no decrypt attempt', async () => {
+    findByWhatsappId.mockResolvedValueOnce({
+      id: 'out-1', conversa_id: 'c1',
+      metadata: {
+        pending_question_id: 'pq-1',
+        poll_options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }, { key: 'c', label: 'C' }],
+        poll_message_secret: Buffer.from('secret').toString('base64'),
+        // poll_creator_jid intentionally absent
+      },
+    });
+    const { dispatchPollVote } = await import('../../src/agent/one-tap.js');
+    await dispatchPollVote(pollUpdateMsg);
+    expect(decryptPollVote).not.toHaveBeenCalled();
+    expect(resolveAndDispatch).not.toHaveBeenCalled();
+    expect(audit.mock.calls.some(
+      (c) => c[0].acao === 'one_tap_dispatch_error' && c[0].metadata?.reason === 'missing_poll_metadata',
+    )).toBe(true);
+  });
+
   it('decryption throws → audit one_tap_dispatch_error', async () => {
     findByWhatsappId.mockResolvedValueOnce({
       id: 'out-1', conversa_id: 'c1',
@@ -90,6 +125,7 @@ describe('dispatchPollVote', () => {
         pending_question_id: 'pq-1',
         poll_options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }, { key: 'c', label: 'C' }],
         poll_message_secret: Buffer.from('secret').toString('base64'),
+        poll_creator_jid: MAIA_JID,
       },
     });
     decryptPollVote.mockImplementationOnce(() => { throw new Error('decrypt failed'); });
@@ -106,6 +142,7 @@ describe('dispatchPollVote', () => {
         pending_question_id: 'pq-1',
         poll_options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }, { key: 'c', label: 'C' }],
         poll_message_secret: Buffer.from('secret').toString('base64'),
+        poll_creator_jid: MAIA_JID,
       },
     });
     decryptPollVote.mockReturnValueOnce({ selectedOptions: [Buffer.from('garbage')] });

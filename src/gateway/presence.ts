@@ -1,3 +1,4 @@
+import { jidNormalizedUser } from '@whiskeysockets/baileys';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 import { isBaileysConnected, getSocket } from './baileys.js';
@@ -106,6 +107,12 @@ export function sendReaction(
 export type SendPollResult = {
   whatsapp_id: string | null;
   message_secret: string | null; // base64 — needed to decrypt votes
+  // Normalized JID of the poll creator (Maia). Baileys derives the same value
+  // via `getKeyAuthor(creationKey, meIdNormalised)` for fromMe creation keys
+  // and uses it as `pollCreatorJid` in the decryptPollVote HMAC. Persist it
+  // so the receive-side handler doesn't have to guess (the inbound vote's
+  // remoteJid is the user, not the creator).
+  creator_jid: string | null;
 };
 
 /**
@@ -122,14 +129,15 @@ export async function sendPoll(
   question: string,
   options: ReadonlyArray<{ key: string; label: string }>,
 ): Promise<SendPollResult> {
-  if (!config.FEATURE_ONE_TAP) return { whatsapp_id: null, message_secret: null };
-  if (!isBaileysConnected()) return { whatsapp_id: null, message_secret: null };
+  const empty: SendPollResult = { whatsapp_id: null, message_secret: null, creator_jid: null };
+  if (!config.FEATURE_ONE_TAP) return empty;
+  if (!isBaileysConnected()) return empty;
   if (!validJid(remote_jid)) {
     logger.warn({ remote_jid: '[REDACTED]' }, 'presence.invalid_jid_send_poll');
-    return { whatsapp_id: null, message_secret: null };
+    return empty;
   }
   const sock = getSocket();
-  if (!sock) return { whatsapp_id: null, message_secret: null };
+  if (!sock) return empty;
   try {
     const result = await sock.sendMessage(remote_jid, {
       poll: {
@@ -140,13 +148,15 @@ export async function sendPoll(
     });
     const secretBuf = (result?.message?.messageContextInfo as { messageSecret?: Uint8Array } | undefined)
       ?.messageSecret;
+    const meId = sock.user?.id ? jidNormalizedUser(sock.user.id) : null;
     return {
       whatsapp_id: result?.key?.id ?? null,
       message_secret: secretBuf ? Buffer.from(secretBuf).toString('base64') : null,
+      creator_jid: meId && meId.length > 0 ? meId : null,
     };
   } catch (err) {
     logger.warn({ err: (err as Error).message }, 'presence.send_poll_failed');
-    return { whatsapp_id: null, message_secret: null };
+    return empty;
   }
 }
 
