@@ -81,25 +81,27 @@ describe('presence — startTyping', () => {
 
   it('emits "composing" once on start and "paused" on stop', async () => {
     const { startTyping } = await import('../../src/gateway/presence.js');
-    const handle = startTyping('jid-1', 'inbound-1');
+    const jid = '5511999998881@s.whatsapp.net';
+    const handle = startTyping(jid, 'inbound-1');
     await new Promise((r) => setImmediate(r));
-    expect(sendPresenceUpdate).toHaveBeenCalledWith('composing', 'jid-1');
+    expect(sendPresenceUpdate).toHaveBeenCalledWith('composing', jid);
     handle.stop();
     await new Promise((r) => setImmediate(r));
-    expect(sendPresenceUpdate).toHaveBeenCalledWith('paused', 'jid-1');
+    expect(sendPresenceUpdate).toHaveBeenCalledWith('paused', jid);
   });
 
   it('returns the same handle for the same mensagem_id', async () => {
     const { startTyping } = await import('../../src/gateway/presence.js');
-    const a = startTyping('jid', 'inbound-X');
-    const b = startTyping('jid', 'inbound-X');
+    const jid = '5511999998882@s.whatsapp.net';
+    const a = startTyping(jid, 'inbound-X');
+    const b = startTyping(jid, 'inbound-X');
     expect(a).toBe(b);
     a.stop();
   });
 
   it('handle.stop() is idempotent', async () => {
     const { startTyping } = await import('../../src/gateway/presence.js');
-    const handle = startTyping('jid', 'inbound-Y');
+    const handle = startTyping('5511999998883@s.whatsapp.net', 'inbound-Y');
     handle.stop();
     handle.stop();
     await new Promise((r) => setImmediate(r));
@@ -122,6 +124,79 @@ describe('presence — startTyping', () => {
     handle.stop();
     expect(sendPresenceUpdate).not.toHaveBeenCalled();
   });
+
+  it('returns no-op handle when Baileys is disconnected', async () => {
+    vi.resetModules();
+    vi.doMock('../../src/config/env.js', () => ({ config: { FEATURE_PRESENCE: true } }));
+    vi.doMock('../../src/lib/logger.js', () => ({
+      logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    }));
+    vi.doMock('../../src/gateway/baileys.js', () => ({
+      isBaileysConnected: () => false,
+      getSocket: () => null,
+    }));
+    const { startTyping } = await import('../../src/gateway/presence.js');
+    const handle = startTyping('5511999@s.whatsapp.net', 'inbound-disconnected');
+    handle.stop();
+    await new Promise((r) => setImmediate(r));
+    expect(sendPresenceUpdate).not.toHaveBeenCalled();
+  });
+});
+
+describe('presence — JID validation', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.doMock('../../src/config/env.js', () => ({ config: { FEATURE_PRESENCE: true } }));
+    vi.doMock('../../src/lib/logger.js', () => ({
+      logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    }));
+    vi.doMock('../../src/gateway/baileys.js', () => ({
+      isBaileysConnected: () => true,
+      getSocket: () => ({ readMessages, sendPresenceUpdate, sendMessage }),
+    }));
+  });
+
+  it('validJid accepts canonical individual and group JIDs', async () => {
+    const { _internal } = await import('../../src/gateway/presence.js');
+    expect(_internal.validJid('5511999998888@s.whatsapp.net')).toBe(true);
+    expect(_internal.validJid('120363041234567890@g.us')).toBe(true);
+  });
+
+  it('validJid rejects malformed inputs', async () => {
+    const { _internal } = await import('../../src/gateway/presence.js');
+    expect(_internal.validJid('not-a-jid')).toBe(false);
+    expect(_internal.validJid('@s.whatsapp.net')).toBe(false);
+    expect(_internal.validJid('5511999998888@example.com')).toBe(false);
+    expect(_internal.validJid('5511999998888')).toBe(false);
+    expect(_internal.validJid('')).toBe(false);
+  });
+
+  it('markRead skips socket call on invalid JID', async () => {
+    const { markRead } = await import('../../src/gateway/presence.js');
+    markRead('not-a-jid', 'WAID-1');
+    await new Promise((r) => setImmediate(r));
+    expect(readMessages).not.toHaveBeenCalled();
+  });
+
+  it('startTyping returns NOOP on invalid JID', async () => {
+    const { startTyping } = await import('../../src/gateway/presence.js');
+    const handle = startTyping('garbage', 'inbound-bad');
+    handle.stop();
+    await new Promise((r) => setImmediate(r));
+    expect(sendPresenceUpdate).not.toHaveBeenCalled();
+  });
+
+  it('sendReaction skips socket call on invalid JID', async () => {
+    const { sendReaction } = await import('../../src/gateway/presence.js');
+    sendReaction('garbage', 'WAID-1', '✅');
+    await new Promise((r) => setImmediate(r));
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('quotedReplyContext returns undefined for invalid remote_jid', async () => {
+    const { quotedReplyContext } = await import('../../src/gateway/presence.js');
+    expect(quotedReplyContext({ whatsapp_id: 'W1', remote_jid: 'bogus' }, 'msg')).toBeUndefined();
+  });
 });
 
 describe('presence — leak safety', () => {
@@ -141,7 +216,7 @@ describe('presence — leak safety', () => {
 
   it('sweep stops handles older than 5 min', async () => {
     const { startTyping, _internal } = await import('../../src/gateway/presence.js');
-    const handle = startTyping('jid', 'old-msg');
+    const handle = startTyping('5511999998884@s.whatsapp.net', 'old-msg');
     vi.advanceTimersByTime(6 * 60 * 1000);
     _internal.runStaleSweep();
     handle.stop();
@@ -165,10 +240,11 @@ describe('presence — sendReaction', () => {
 
   it('sends a react payload anchored to (remote_jid, whatsapp_id)', async () => {
     const { sendReaction } = await import('../../src/gateway/presence.js');
-    sendReaction('jid', 'WAID-9', '✅');
+    const jid = '5511999998885@s.whatsapp.net';
+    sendReaction(jid, 'WAID-9', '✅');
     await new Promise((r) => setImmediate(r));
-    expect(sendMessage).toHaveBeenCalledWith('jid', {
-      react: { text: '✅', key: { remoteJid: 'jid', id: 'WAID-9', fromMe: false } },
+    expect(sendMessage).toHaveBeenCalledWith(jid, {
+      react: { text: '✅', key: { remoteJid: jid, id: 'WAID-9', fromMe: false } },
     });
   });
 
@@ -192,18 +268,19 @@ describe('presence — sendReaction', () => {
 describe('presence — quotedReplyContext', () => {
   it('builds a context from inbound metadata + truncates to 200 chars', async () => {
     const { quotedReplyContext } = await import('../../src/gateway/presence.js');
-    const meta = { whatsapp_id: 'W1', remote_jid: 'J1' };
+    const remote_jid = '5511999998886@s.whatsapp.net';
+    const meta = { whatsapp_id: 'W1', remote_jid };
     const long = 'x'.repeat(500);
     const ctx = quotedReplyContext(meta, long);
     expect(ctx).toEqual({
-      key: { remoteJid: 'J1', id: 'W1', fromMe: false },
+      key: { remoteJid: remote_jid, id: 'W1', fromMe: false },
       message: { conversation: 'x'.repeat(200) },
     });
   });
 
   it('returns undefined when metadata lacks whatsapp_id', async () => {
     const { quotedReplyContext } = await import('../../src/gateway/presence.js');
-    expect(quotedReplyContext({ remote_jid: 'J1' }, 'x')).toBeUndefined();
+    expect(quotedReplyContext({ remote_jid: '5511999998887@s.whatsapp.net' }, 'x')).toBeUndefined();
   });
 
   it('returns undefined when metadata lacks remote_jid', async () => {
