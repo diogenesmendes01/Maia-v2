@@ -80,11 +80,20 @@ export function sendReaction(
     .catch((err: Error) => logger.warn({ err: err.message }, 'presence.reaction_failed'));
 }
 
+const QUOTED_TRUNCATE = 200;
+
 export function quotedReplyContext(
-  _inbound_metadata: Record<string, unknown> | null,
-  _inbound_conteudo: string | null,
+  inbound_metadata: Record<string, unknown> | null,
+  inbound_conteudo: string | null,
 ): WAQuotedContext | undefined {
-  return undefined; // implemented in Task 8
+  if (!inbound_metadata) return undefined;
+  const whatsapp_id = inbound_metadata.whatsapp_id;
+  const remote_jid = inbound_metadata.remote_jid;
+  if (typeof whatsapp_id !== 'string' || typeof remote_jid !== 'string') return undefined;
+  return {
+    key: { remoteJid: remote_jid, id: whatsapp_id, fromMe: false },
+    message: { conversation: (inbound_conteudo ?? '').slice(0, QUOTED_TRUNCATE) },
+  };
 }
 
 const STALE_MS = 5 * 60 * 1000;

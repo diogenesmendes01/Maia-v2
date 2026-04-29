@@ -188,3 +188,31 @@ describe('presence — sendReaction', () => {
     expect(sendMessage).not.toHaveBeenCalled();
   });
 });
+
+describe('presence — quotedReplyContext', () => {
+  it('builds a context from inbound metadata + truncates to 200 chars', async () => {
+    const { quotedReplyContext } = await import('../../src/gateway/presence.js');
+    const meta = { whatsapp_id: 'W1', remote_jid: 'J1' };
+    const long = 'x'.repeat(500);
+    const ctx = quotedReplyContext(meta, long);
+    expect(ctx).toEqual({
+      key: { remoteJid: 'J1', id: 'W1', fromMe: false },
+      message: { conversation: 'x'.repeat(200) },
+    });
+  });
+
+  it('returns undefined when metadata lacks whatsapp_id', async () => {
+    const { quotedReplyContext } = await import('../../src/gateway/presence.js');
+    expect(quotedReplyContext({ remote_jid: 'J1' }, 'x')).toBeUndefined();
+  });
+
+  it('returns undefined when metadata lacks remote_jid', async () => {
+    const { quotedReplyContext } = await import('../../src/gateway/presence.js');
+    expect(quotedReplyContext({ whatsapp_id: 'W1' }, 'x')).toBeUndefined();
+  });
+
+  it('returns undefined for null metadata', async () => {
+    const { quotedReplyContext } = await import('../../src/gateway/presence.js');
+    expect(quotedReplyContext(null, 'x')).toBeUndefined();
+  });
+});
