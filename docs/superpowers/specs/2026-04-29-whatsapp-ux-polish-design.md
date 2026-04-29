@@ -191,10 +191,10 @@ If Baileys is mid-reconnect, all four functions return immediately. The user sti
 ### Unit (`tests/unit/presence.spec.ts`)
 
 - `startTyping` returns a handle whose `stop()` is idempotent.
-- Calling `startTyping` twice with the same `request_id` returns the same handle (refcount or Map).
+- Calling `startTyping` twice with the same `inbound.id` returns the same handle (Map-keyed).
 - `markRead`, `sendReaction` are no-ops when `isBaileysConnected()` is false.
 - `quotedReplyContext` truncates conversation to 200 chars and uses the inbound `whatsapp_id` and `remote_jid` from metadata.
-- `quotedReplyContext` returns `undefined` when metadata lacks `whatsapp_id`.
+- `quotedReplyContext` returns `undefined` when metadata lacks `whatsapp_id` OR `remote_jid` (both branches asserted).
 
 Mocks: `isBaileysConnected`, `socket.sendPresenceUpdate`, `socket.sendMessage` injected via the small accessor on `baileys.ts`.
 
@@ -243,7 +243,7 @@ Validation criteria for default-on flip:
 - [ ] `FEATURE_PRESENCE=true` causes the WhatsApp UI to display:
   - Inbound messages flip to read once Maia ACKs them.
   - "Maia is typing…" appears 1.5 s after a slow turn starts and disappears when the reply lands. Only one typing handle exists per turn (keyed by `inbound.id`).
-  - A ✅ reaction lands on the inbound message after a successful `register_transaction` / `correct_transaction` / `start_workflow` / `send_proactive_message`.
+  - A ✅ reaction lands on the inbound message after a successful dispatch of any tool whose `side_effect` is `write` or `communication` (today: `register_transaction`, `correct_transaction`, `start_workflow`, `send_proactive_message`, `save_fact`, `save_rule` — and any future tool with that side-effect classification, no AC update needed).
   - A ❌ reaction lands on the inbound after a `forbidden` or `requires_dual_approval`.
   - Replies to a correction message (or a message resolving an active pending question) are threaded under that message.
 - [ ] `FEATURE_PRESENCE=false` produces zero Baileys-side polish calls (verified by mock spy in tests).
