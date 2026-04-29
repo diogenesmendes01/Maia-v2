@@ -382,7 +382,9 @@ async function applyTx(
   // Topic change / explicit cancellation short-circuit without touching
   // resolveAndDispatch — that helper is for SUCCESSFUL resolutions only.
   // Both reasons cancel the row but keep distinct audit + return values
-  // so the caller can react differently if needed.
+  // so the caller can react differently if needed. Both audit actions
+  // (pending_cancelled, pending_unresolved_topic_change) already exist
+  // in the closed taxonomy from prior PRs; do NOT add to Task 2.
   if (resolution.is_topic_change || resolution.is_cancellation) {
     const reason = resolution.is_cancellation ? 'cancelled' : 'topic_change';
     const cancel_reason = resolution.is_cancellation ? 'user_cancelled' : 'topic_change';
