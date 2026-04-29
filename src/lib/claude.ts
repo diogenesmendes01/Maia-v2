@@ -2,6 +2,8 @@ import Anthropic from '@anthropic-ai/sdk';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 import { sleep } from '@/lib/utils.js';
+import { recordLLMCost } from '@/lib/cost-ledger.js';
+import { incCounter, observeHistogram } from '@/lib/metrics.js';
 
 const anthropic = new Anthropic({ apiKey: config.ANTHROPIC_API_KEY });
 
@@ -81,6 +83,16 @@ class AnthropicProvider implements LLMProvider {
       { model, ms: Date.now() - start, in: res.usage.input_tokens, out: res.usage.output_tokens },
       'llm.call',
     );
+    void recordLLMCost({
+      provider: 'anthropic',
+      model,
+      tokens_input: res.usage.input_tokens,
+      tokens_output: res.usage.output_tokens,
+    });
+    incCounter('maia_llm_calls_total', { provider: 'anthropic', model, status: 'ok' });
+    incCounter('maia_llm_tokens_total', { provider: 'anthropic', model, kind: 'input' }, res.usage.input_tokens);
+    incCounter('maia_llm_tokens_total', { provider: 'anthropic', model, kind: 'output' }, res.usage.output_tokens);
+    observeHistogram('maia_llm_latency_ms', Date.now() - start, { provider: 'anthropic', model });
     return {
       content: textOut,
       tool_uses,

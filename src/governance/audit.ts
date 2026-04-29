@@ -1,6 +1,7 @@
 import { auditRepo } from '@/db/repositories.js';
 import type { AuditAction } from './audit-actions.js';
 import { logger } from '@/lib/logger.js';
+import { incCounter } from '@/lib/metrics.js';
 
 export async function audit(input: {
   acao: AuditAction;
@@ -23,6 +24,7 @@ export async function audit(input: {
       diff: (input.diff ?? null) as object | null,
       metadata: input.metadata ?? {},
     });
+    incCounter('maia_audit_events_total', { action: input.acao });
   } catch (err) {
     logger.error({ err, acao: input.acao }, 'audit.write_failed');
   }
