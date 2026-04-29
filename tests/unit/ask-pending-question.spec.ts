@@ -71,7 +71,14 @@ describe('ask_pending_question — schema + affirmative-first', () => {
       } as never,
       ctx,
     );
-    expect((result as { pending_question_id: string }).pending_question_id).toBe('pq-uuid-1');
+    expect(result).toMatchObject({
+      pending_question_id: 'pq-uuid-1',
+      opcoes_count: 2,
+      opcoes_validas: [
+        { key: 'sim', label: 'Sim' },
+        { key: 'nao', label: 'Não' },
+      ],
+    });
     expect(repoMock.cancelOpenForConversaTx).toHaveBeenCalledWith(
       expect.anything(),
       'c1',
