@@ -79,3 +79,27 @@ export function quotedReplyContext(
 ): WAQuotedContext | undefined {
   return undefined; // implemented in Task 8
 }
+
+const STALE_MS = 5 * 60 * 1000;
+const SWEEP_MS = 60 * 1000;
+
+function runStaleSweep(): void {
+  const cutoff = Date.now() - STALE_MS;
+  for (const [id, entry] of handles) {
+    if (entry.started_at < cutoff) {
+      entry.handle.stop();
+      logger.warn({ mensagem_id: id, age_ms: Date.now() - entry.started_at }, 'presence.typing_stale_swept');
+    }
+  }
+}
+
+const sweepTimer = setInterval(runStaleSweep, SWEEP_MS);
+sweepTimer.unref?.();
+
+function drainAll(): void {
+  for (const entry of handles.values()) entry.handle.stop();
+}
+
+process.once('beforeExit', drainAll);
+
+export const _internal = { runStaleSweep, drainAll, handles };

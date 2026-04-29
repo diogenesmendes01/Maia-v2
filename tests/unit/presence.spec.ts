@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 const readMessages = vi.fn().mockResolvedValue(undefined);
 const sendPresenceUpdate = vi.fn().mockResolvedValue(undefined);
@@ -121,5 +121,31 @@ describe('presence — startTyping', () => {
     const handle = startTyping('jid', 'm1');
     handle.stop();
     expect(sendPresenceUpdate).not.toHaveBeenCalled();
+  });
+});
+
+describe('presence — leak safety', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.resetModules();
+    vi.doMock('../../src/config/env.js', () => ({ config: { FEATURE_PRESENCE: true } }));
+    vi.doMock('../../src/lib/logger.js', () => ({
+      logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    }));
+    vi.doMock('../../src/gateway/baileys.js', () => ({
+      isBaileysConnected: () => true,
+      getSocket: () => ({ readMessages, sendPresenceUpdate, sendMessage }),
+    }));
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it('sweep stops handles older than 5 min', async () => {
+    const { startTyping, _internal } = await import('../../src/gateway/presence.js');
+    const handle = startTyping('jid', 'old-msg');
+    vi.advanceTimersByTime(6 * 60 * 1000);
+    _internal.runStaleSweep();
+    handle.stop();
+    const pausedCalls = sendPresenceUpdate.mock.calls.filter((c) => c[0] === 'paused');
+    expect(pausedCalls.length).toBe(1);
   });
 });
