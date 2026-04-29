@@ -45,15 +45,40 @@ src/agent/core.ts             — wires startTyping at turn start,
 
 ```typescript
 // All functions are fire-and-forget unless noted. Failures log warn and return.
-export function markRead(remote_jid: string, key: WAMessageKey): void;
+export function markRead(remote_jid: string, whatsapp_id: string): void;
 
-export function startTyping(remote_jid: string, request_id: string): TypingHandle;
+// Keyed by mensagem_id (the persisted inbound row id) — exactly one handle
+// per turn, regardless of how many tool dispatches the turn fans into.
+export function startTyping(remote_jid: string, mensagem_id: string): TypingHandle;
 export interface TypingHandle { stop(): void; }
 
-export function sendReaction(remote_jid: string, key: WAMessageKey, emoji: '✅' | '❌'): void;
+// Identifies the inbound by (remote_jid, whatsapp_id) which we DO persist in
+// mensagens.metadata. The full proto.IWebMessageInfo is rebuilt internally
+// as the minimal stub Baileys' react path requires.
+export function sendReaction(
+  remote_jid: string,
+  whatsapp_id: string,
+  emoji: '✅' | '❌',
+): void;
 
 // Pure: builds a quoted-reply context object for sendMessage().
-export function quotedReplyContext(inbound_metadata: Record<string, unknown>): WAQuotedContext | undefined;
+// Returns undefined if the inbound metadata lacks whatsapp_id or remote_jid.
+export function quotedReplyContext(
+  inbound_metadata: Record<string, unknown>,
+  inbound_conteudo: string | null,
+): WAQuotedContext | undefined;
+```
+
+`baileys.ts` gets a new outbound primitive that accepts a quoted context:
+
+```typescript
+// Existing: sendOutboundText(jid, text)
+// NEW: sendOutboundText(jid, text, opts?: { quoted?: WAQuotedContext })
+export async function sendOutboundText(
+  jid: string,
+  text: string,
+  opts?: { quoted?: WAQuotedContext },
+): Promise<string | null>;
 ```
 
 Internally, `presence.ts` checks `isBaileysConnected()` before each call. Disconnected → no-op. The Baileys socket reference is read from `baileys.ts` via a small accessor (no global passing of the socket object).
@@ -63,28 +88,39 @@ Internally, `presence.ts` checks `isBaileysConnected()` before each call. Discon
 ```
 inbound msg arrives
   └─ baileys.handleIncoming
+       ├─ EARLY: drop if proto.messageStubType === REACTION (no mensagens row)
        ├─ dedup / bot-detect / persist (existing)
-       ├─ markRead(remote_jid, msg.key)            [NEW]
+       ├─ markRead(remote_jid, msg.key.id)                            [NEW]
        └─ enqueueAgent
 
 agent worker picks up
   └─ core.runAgentForMensagem
        ├─ resolveIdentity (existing)
        ├─ rate-limit (existing)
-       ├─ const typing = startTyping(jid, request_id) after 1.5s
-       ├─ ReAct loop:
-       │    └─ for each tool_use:
-       │         ├─ dispatchTool
-       │         └─ sendReaction(jid, inbound.key, ok ? '✅' : '❌')   [NEW: side-effect tools only]
-       ├─ sendOutbound — uses quotedReplyContext if correction or pending_question
-       └─ try/finally: typing.stop()
+       ├─ try {
+       │    const typing = startTyping(jid, inbound.id);   // keyed by inbound mensagem_id
+       │    ReAct loop:
+       │      for each tool_use:
+       │        ├─ dispatchTool
+       │        └─ sendReaction(jid, inbound.metadata.whatsapp_id,
+       │                       ok ? '✅' : '❌')           [NEW: side-effect tools only]
+       │    sendOutbound — passes quotedReplyContext when correction or pending_question
+       │  } finally {
+       │    typing.stop();   // idempotent
+       │  }
 ```
+
+Key correction over the v1 sketch: `startTyping` is keyed by `inbound.id`
+(the persisted mensagem_id, one per turn), not by the per-dispatch `request_id`
+that gets minted fresh for every `dispatchTool`.
 
 ## 5. Detailed behaviour
 
 ### 5.1 Read receipt
 
-Fires once per inbound, immediately after `handleIncoming` validates (not group, not duplicate, not bot-blocked). Cost is one Baileys call. Skip when bot-blocked or when the pessoa is in `bloqueada` status (no acknowledgement to abusive numbers).
+Fires once per inbound, immediately after `handleIncoming` validates (not group, not duplicate, not bot-detection-blocked). Cost is one Baileys call.
+
+Note: a `pessoa.status === 'bloqueada'` check would require an identity lookup that `handleIncoming` does not (and should not) perform — identity resolution lives downstream. We accept that a `bloqueada` number will see "read" before being silently dropped. Wiring `bloqueada` into the inbound side is a sub-project C concern (block primitives + pre-handler lookup) and is explicitly NOT part of this design.
 
 ### 5.2 Typing indicator
 
@@ -92,19 +128,25 @@ Fires once per inbound, immediately after `handleIncoming` validates (not group,
 
 Debounce: only fire if the agent loop has been active 1.5 s. This avoids the "type then untype immediately" flicker on quick replies, and reduces the average outbound rate to look more human.
 
-Concurrency: `startTyping` keyed by `request_id`. If called twice for the same id, returns the existing handle. The handle's `stop()` is idempotent.
+**Concurrency & leak safety**:
+- `startTyping` keyed by `inbound.id` (one inbound = one turn = one handle). If called twice for the same id, returns the existing handle. The handle's `stop()` is idempotent.
+- `startTyping` is invoked **inside** the `try` block of `runAgentForMensagem`, so any synchronous error before its first await is impossible.
+- The handle map registers a `process.on('beforeExit')` listener that calls `stop()` on every live entry. This catches the rare case where the worker exits with intervals still ticking.
+- A periodic sweep (every 60 s) drops handles whose `started_at` is older than 5 min — a safety net for any pathological "ReAct iteration loop never returns".
 
 ### 5.3 Reactions on tool dispatch
 
 After each `dispatchTool`, if `tool.side_effect ∈ {'write', 'communication'}`:
 
-- success result (no `error` key) → `sendReaction(jid, inbound.key, '✅')`
-- `error: 'forbidden'` or `error: 'requires_dual_approval'` → `sendReaction(jid, inbound.key, '❌')`
+- success result (no `error` key) → `sendReaction(jid, inbound.metadata.whatsapp_id, '✅')`
+- `error: 'forbidden'` or `error: 'requires_dual_approval'` → `sendReaction(jid, inbound.metadata.whatsapp_id, '❌')`
 - any other error → no reaction (the user gets a textual explanation; double-signalling adds noise)
+
+**Domain invariant**: tool outputs that are **not** errors must never include a top-level `error` key. The dispatcher already computes `is_error` via `'error' in out` (`src/agent/core.ts:110`); we keep that as the canonical signal and treat reactions as a downstream consumer.
 
 Read tools (`side_effect === 'read'`) never react — the data itself is the reply.
 
-Reactions decorate the inbound message (no new mensagens row). They are stored in WhatsApp's reaction stream, not in `mensagens`. We do not persist outbound reactions in the DB — they are pure UX.
+Reactions decorate the inbound message and **must not** create a `mensagens` row. Baileys delivers reactions through the same `messages.upsert` stream as regular messages, distinguished by `proto.IWebMessageInfo.messageStubType === REACTION`. As part of this design's deliverables, `handleIncoming` gets an early return on that stub type (see §4.2) so neither inbound reactions (sent by the user) nor our own reaction echoes pollute `mensagens`. We do not persist outbound reactions in the DB — they are pure UX.
 
 ### 5.4 Quoted reply
 
@@ -115,7 +157,11 @@ Used in two narrow cases:
 
 Default reply path is unchanged (top-level reply).
 
-To produce a quoted-reply context, we need the original `proto.IWebMessageInfo`. It's not persisted in full, but `mensagens.metadata.whatsapp_id` and `metadata.remote_jid` are. `quotedReplyContext` reconstructs the minimal `quoted` shape that Baileys accepts (`{ key: { remoteJid, id, fromMe: false }, message: { conversation: <truncated content> } }`). We truncate `conversation` to 200 chars.
+To produce a quoted-reply context, we need the original `proto.IWebMessageInfo`. It's not persisted in full, but `mensagens.metadata.whatsapp_id` and `metadata.remote_jid` are (inbound only — see assumption below). `quotedReplyContext` reconstructs the minimal `quoted` shape that Baileys accepts (`{ key: { remoteJid, id, fromMe: false }, message: { conversation: <truncated content> } }`). We truncate `conversation` to 200 chars.
+
+**Assumption**: today only inbound messages persist `remote_jid` in metadata; outbound rows persist `whatsapp_id` only (`src/agent/core.ts:161`). If a user later replies-to a Maia message, we cannot quote that outbound back. Acceptable for v1 — corrections target the user's own previous message, not Maia's. If we later need quoting of outbound, we extend `sendOutbound` to persist `remote_jid` in its metadata.
+
+**Multi-message replies**: `sendOutbound` today emits a single message. If a future split-reply lands, only the **first** part carries `quoted`; subsequent parts are top-level. The implementation must guard against double-quoting (each split message gets its own `quoted` defaulted to `undefined`).
 
 ## 6. Error handling
 
@@ -125,16 +171,18 @@ Every public function in `presence.ts` is wrapped:
 .catch((err) => logger.warn({ err: (err as Error).message }, 'presence.<op>_failed'))
 ```
 
-The agent loop wraps `startTyping` in a `try/finally`:
+The agent loop opens the `try` block first, then calls `startTyping` inside it (so the handle cannot leak between minting and the `finally`):
 
 ```typescript
-const typing = startTyping(jid, request_id);
 try {
+  const typing = startTyping(jid, inbound.id);
   // ... ReAct loop ...
 } finally {
-  typing.stop();
+  typing?.stop();
 }
 ```
+
+**DLQ bypass is intentional**: presence calls (read, typing, reaction, quoted reply build) are **fire-and-forget** and do not route through the BullMQ DLQ used for the textual reply (spec 17 §9). A failed reaction is invisible to the user; persisting it as a DLQ entry adds noise without value. The textual reply continues to use the existing DLQ path on `sendOutboundText` exhaustion.
 
 If Baileys is mid-reconnect, all four functions return immediately. The user still gets the textual reply when Baileys recovers (queued via the existing outbound path).
 
@@ -184,18 +232,24 @@ Validation criteria for default-on flip:
 | Block/unblock primitives wired to lockdown | C |
 | `messages.update` (edit/delete) detection | B |
 | View-once for sensitive replies (saldos) | B/C |
+| `markRead` semantics for view-once / disappearing inbound (does it leak that we opened?) | C |
+| `pessoa.status='bloqueada'` check before `markRead` (requires identity at gateway layer) | C |
+| Quoting outbound messages (requires persisting `remote_jid` on outbound) | B |
 
 ## 11. Acceptance criteria
 
+- [ ] `sendOutboundText` accepts an optional `{ quoted?: WAQuotedContext }` argument; calls without it behave exactly as today.
+- [ ] `handleIncoming` early-returns on `messageStubType === REACTION` (no `mensagens` row created for inbound or echoed reactions).
 - [ ] `FEATURE_PRESENCE=true` causes the WhatsApp UI to display:
   - Inbound messages flip to read once Maia ACKs them.
-  - "Maia is typing…" appears 1.5 s after a slow turn starts and disappears when the reply lands.
+  - "Maia is typing…" appears 1.5 s after a slow turn starts and disappears when the reply lands. Only one typing handle exists per turn (keyed by `inbound.id`).
   - A ✅ reaction lands on the inbound message after a successful `register_transaction` / `correct_transaction` / `start_workflow` / `send_proactive_message`.
   - A ❌ reaction lands on the inbound after a `forbidden` or `requires_dual_approval`.
-  - Replies to a correction message are threaded under that message.
+  - Replies to a correction message (or a message resolving an active pending question) are threaded under that message.
 - [ ] `FEATURE_PRESENCE=false` produces zero Baileys-side polish calls (verified by mock spy in tests).
 - [ ] A Baileys-side failure (mocked) in any of the four primitives does not affect the textual reply or audit trail.
-- [ ] Unit suite covers idempotency (handle reuse) and disconnected-no-op for all four primitives.
+- [ ] Typing handle map drains on `beforeExit`; a stale handle older than 5 min is auto-stopped.
+- [ ] Unit suite covers: handle reuse for the same `inbound.id`, disconnected-no-op for all four primitives, `quotedReplyContext` returning `undefined` on missing metadata, truncation to 200 chars.
 
 ## 12. References
 
