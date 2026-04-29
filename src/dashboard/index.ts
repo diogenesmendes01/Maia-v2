@@ -1,14 +1,39 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { db } from '@/db/client.js';
 import { dashboard_sessions, pessoas, entidades, contas_bancarias, transacoes, audit_log } from '@/db/schema.js';
+import type { Pessoa } from '@/db/schema.js';
 import { eq, and, gt, isNull, inArray, desc, sql } from 'drizzle-orm';
 import { sha256, uuid } from '@/lib/utils.js';
-import { resolveScope, isOwnerType } from '@/governance/permissions.js';
+import { resolveScope, isOwnerType, profileAllows, type ResolvedPermission } from '@/governance/permissions.js';
+import type { ActionKey } from '@/governance/audit-actions.js';
 import { audit } from '@/governance/audit.js';
 import { config } from '@/config/env.js';
 import { formatBRL, fmtBR } from '@/lib/brazilian.js';
 
 const SESSION_TTL_HOURS = 8;
+const SESSION_TTL_MS = SESSION_TTL_HOURS * 3600 * 1000;
+const MAGIC_LINK_TTL_MS = 5 * 60 * 1000;
+
+type Scope = { entidades: string[]; byEntity: Map<string, ResolvedPermission> };
+
+function entitiesAllowing(scope: Scope, action: ActionKey): string[] {
+  return scope.entidades.filter((eid) => {
+    const r = scope.byEntity.get(eid);
+    return Boolean(r && profileAllows(r.profile, action));
+  });
+}
+
+function entityAllows(scope: Scope, entId: string, action: ActionKey): boolean {
+  const r = scope.byEntity.get(entId);
+  return Boolean(r && profileAllows(r.profile, action));
+}
+
+function hasAnyAction(scope: Scope, action: ActionKey): boolean {
+  for (const r of scope.byEntity.values()) {
+    if (profileAllows(r.profile, action)) return true;
+  }
+  return false;
+}
 
 async function getSessionFromCookie(cookie: string | undefined): Promise<{ pessoa_id: string } | null> {
   if (!cookie) return null;
@@ -46,8 +71,13 @@ export async function registerDashboardRoutes(app: FastifyInstance): Promise<voi
       return;
     }
     const scope = await resolveScope(p);
-    const ents = await db.select().from(entidades).where(inArray(entidades.id, scope.entidades));
-    const html = await renderDashboard(p.nome, ents, scope.entidades);
+    // Spec 15: only show entities whose profile authorizes `read_balance`.
+    const visibleIds = entitiesAllowing(scope, 'read_balance');
+    const ents = visibleIds.length
+      ? await db.select().from(entidades).where(inArray(entidades.id, visibleIds))
+      : [];
+    const canSeeAudit = isOwnerType(p) && hasAnyAction(scope, 'read_audit');
+    const html = await renderDashboard(p.nome, ents, visibleIds, canSeeAudit);
     reply.type('text/html').send(html);
   });
 
@@ -70,9 +100,12 @@ export async function registerDashboardRoutes(app: FastifyInstance): Promise<voi
       reply.code(401).send({ error: 'invalid_or_expired_token' });
       return;
     }
+    // Magic-link TTL (5min) is for redemption only. After redeem, extend to
+    // SESSION_TTL_HOURS so the cookie's Max-Age and the DB row agree.
+    const sessionExpiresAt = new Date(Date.now() + SESSION_TTL_MS);
     await db
       .update(dashboard_sessions)
-      .set({ used_at: new Date() })
+      .set({ used_at: new Date(), expira_em: sessionExpiresAt })
       .where(eq(dashboard_sessions.id, sess.id));
     reply
       .header(
@@ -95,16 +128,28 @@ export async function registerDashboardRoutes(app: FastifyInstance): Promise<voi
         reply.code(403).type('text/html').send(`<h1>Entidade fora do escopo</h1>`);
         return;
       }
+      // Spec 15: profile must authorize the data being shown. read_balance
+      // covers KPIs/contas. Transactions render only when read_transactions
+      // is also granted — otherwise we hide that section.
+      if (!entityAllows(scope, entId, 'read_balance')) {
+        reply.code(403).type('text/html').send(`<h1>Sem permissão de leitura para essa entidade</h1>`);
+        return;
+      }
+      const includeTxns = entityAllows(scope, entId, 'read_transactions');
       const month = parseMonth((req.query as { mes?: string }).mes);
-      reply.type('text/html').send(await renderEntityView(p.nome, entId, month));
+      reply.type('text/html').send(await renderEntityView(p.nome, entId, month, includeTxns));
     },
   );
 
   app.get('/dashboard/audit', async (req, reply) => {
     const ctx = await requireScope(req, reply);
     if (!ctx) return;
-    if (!isOwnerType(ctx.p)) {
-      reply.code(403).type('text/html').send(`<h1>Apenas donos veem auditoria</h1>`);
+    // Spec 15: audit view requires owner type AND `read_audit` action on at
+    // least one permission. The two checks are belt-and-suspenders since
+    // an owner profile typically grants `*`, but a non-standard profile
+    // could omit `read_audit` and we'd rather 403 than leak.
+    if (!isOwnerType(ctx.p) || !hasAnyAction(ctx.scope, 'read_audit')) {
+      reply.code(403).type('text/html').send(`<h1>Apenas donos com read_audit veem auditoria</h1>`);
       return;
     }
     reply.type('text/html').send(await renderAuditView(ctx.p.nome));
@@ -113,12 +158,25 @@ export async function registerDashboardRoutes(app: FastifyInstance): Promise<voi
   app.post('/dashboard/logout', async (req, reply) => {
     const cookie = req.headers.cookie;
     const token = cookie?.match(/maia_session=([^;]+)/)?.[1];
+    let pessoa_id: string | null = null;
     if (token) {
       const hash = sha256(token);
+      // Read the pessoa_id off the row before revoking, so we can audit it.
+      const sess = (
+        await db
+          .select({ pessoa_id: dashboard_sessions.pessoa_id })
+          .from(dashboard_sessions)
+          .where(eq(dashboard_sessions.token_hash, hash))
+          .limit(1)
+      )[0];
+      pessoa_id = sess?.pessoa_id ?? null;
       await db
         .update(dashboard_sessions)
         .set({ revoked_at: new Date() })
         .where(eq(dashboard_sessions.token_hash, hash));
+    }
+    if (pessoa_id) {
+      await audit({ acao: 'dashboard_session_ended', pessoa_id });
     }
     reply
       .header('set-cookie', 'maia_session=; HttpOnly; Path=/; Max-Age=0; SameSite=Strict')
@@ -129,7 +187,7 @@ export async function registerDashboardRoutes(app: FastifyInstance): Promise<voi
 async function requireScope(
   req: FastifyRequest,
   reply: FastifyReply,
-): Promise<{ p: { id: string; nome: string; tipo: string }; scope: { entidades: string[] } } | null> {
+): Promise<{ p: Pessoa; scope: Scope } | null> {
   const session = await getSessionFromCookie(req.headers.cookie);
   if (!session) {
     reply.type('text/html').send(loginHTML());
@@ -171,7 +229,12 @@ Ela vai te enviar um link único de acesso.</p>
 </body></html>`;
 }
 
-async function renderDashboard(nome: string, ents: Array<{ id: string; nome: string }>, entIds: string[]): Promise<string> {
+async function renderDashboard(
+  nome: string,
+  ents: Array<{ id: string; nome: string }>,
+  entIds: string[],
+  canSeeAudit: boolean,
+): Promise<string> {
   if (entIds.length === 0) return `<html><body><h1>Olá, ${nome}</h1><p>Sem entidades acessíveis.</p></body></html>`;
   const contas = await db.select().from(contas_bancarias).where(inArray(contas_bancarias.entidade_id, entIds));
   const txns = await db
@@ -210,7 +273,7 @@ ${txns
   .join('')}
 </table>
 <p>
-  <a href="/dashboard/audit">Auditoria</a> ·
+  ${canSeeAudit ? `<a href="/dashboard/audit">Auditoria</a> ·` : ''}
   <form method="post" action="/dashboard/logout" style="display:inline"><button type="submit">Sair</button></form>
 </p>
 <p><small>read-only. Tudo que aparece aqui está auditado.</small></p>
@@ -221,6 +284,7 @@ async function renderEntityView(
   pessoaNome: string,
   entId: string,
   month: { from: string; to: string; label: string },
+  includeTxns: boolean,
 ): Promise<string> {
   const ent = (await db.select().from(entidades).where(eq(entidades.id, entId)).limit(1))[0];
   if (!ent) return `<html><body><h1>Entidade não encontrada</h1></body></html>`;
@@ -228,18 +292,22 @@ async function renderEntityView(
     .select()
     .from(contas_bancarias)
     .where(eq(contas_bancarias.entidade_id, entId));
-  const txns = await db
-    .select()
-    .from(transacoes)
-    .where(
-      and(
-        eq(transacoes.entidade_id, entId),
-        sql`data_competencia >= ${month.from}`,
-        sql`data_competencia <= ${month.to}`,
-      ),
-    )
-    .orderBy(desc(transacoes.data_competencia))
-    .limit(500);
+  // Only fetch transactions when the profile authorizes `read_transactions`.
+  // Without it we still show KPIs / contas (which need read_balance only).
+  const txns = includeTxns
+    ? await db
+        .select()
+        .from(transacoes)
+        .where(
+          and(
+            eq(transacoes.entidade_id, entId),
+            sql`data_competencia >= ${month.from}`,
+            sql`data_competencia <= ${month.to}`,
+          ),
+        )
+        .orderBy(desc(transacoes.data_competencia))
+        .limit(500)
+    : [];
   const receita = txns.filter((t) => t.natureza === 'receita').reduce((s, t) => s + Number(t.valor), 0);
   const despesa = txns
     .filter((t) => t.natureza === 'despesa')
@@ -268,7 +336,9 @@ ${baseStyle()}</head><body>
 <table><tr><th>Apelido</th><th>Banco</th><th class="r">Saldo</th></tr>
 ${contas.map((c) => `<tr><td>${escape(c.apelido)}</td><td>${escape(c.banco)}</td><td class="r">${formatBRL(Number(c.saldo_atual))}</td></tr>`).join('')}
 </table>
-<h2>Transações (${txns.length})</h2>
+${
+  includeTxns
+    ? `<h2>Transações (${txns.length})</h2>
 <table><tr><th>Data</th><th>Descrição</th><th>Natureza</th><th class="r">Valor</th></tr>
 ${txns
   .map(
@@ -276,7 +346,9 @@ ${txns
       `<tr><td>${fmtBR(new Date(t.data_competencia))}</td><td>${escape(t.descricao)}</td><td>${t.natureza}</td><td class="r">${formatBRL(Number(t.valor))}</td></tr>`,
   )
   .join('')}
-</table>
+</table>`
+    : `<p><em>Transações não disponíveis (perfil não autoriza read_transactions).</em></p>`
+}
 <p><small>Sessão: ${escape(pessoaNome)}. Read-only.</small></p>
 </body></html>`;
 }
@@ -339,7 +411,10 @@ export async function generateMagicLink(pessoa_id: string): Promise<{ token: str
   if (!p || !isOwnerType(p)) throw new Error('only_owners_allowed');
   const token = uuid();
   const hash = sha256(token);
-  const expira_em = new Date(Date.now() + 5 * 60 * 1000);
+  // Magic-link TTL is the redemption window. After redeem, `expira_em` is
+  // bumped to a full session TTL so the cookie's Max-Age and the DB row stay
+  // consistent.
+  const expira_em = new Date(Date.now() + MAGIC_LINK_TTL_MS);
   await db.insert(dashboard_sessions).values({
     pessoa_id,
     token_hash: hash,
