@@ -24,10 +24,10 @@
 | `src/tools/_registry.ts` | Modify | Register `ask_pending_question` |
 | `src/agent/pending-gate.ts` | Create | Snapshot read → Haiku classify → tx with re-check |
 | `src/agent/core.ts` | Modify | Insert gate before `buildPrompt`; track-and-forward `pending_question_id`; extend `sendOutbound` opts |
-| `tests/unit/ask-pending-question.spec.ts` | Create | Schema, affirmative-first, substitution, multi-ask |
-| `tests/unit/pending-gate.spec.ts` | Create | Snapshot/classify/resolve/topic_change/low_confidence/TTL-mid-call |
+| `tests/unit/ask-pending-question.spec.ts` | Create | Schema, affirmative-first, substitution, no-double-audit |
+| `tests/unit/pending-gate.spec.ts` | Create | Snapshot/classify/resolve/topic_change/low_confidence/race-loss |
 | `tests/unit/pending-deprecation.spec.ts` | Create | Grep-based assertion: no `src/agent/**` callers of lightweight helpers |
-| `tests/integration/pending-gate-concurrency.spec.ts` | Create | Two concurrent gates → action dispatched once; race-loser audit |
+| `tests/integration/pending-gate-concurrency.spec.ts` | Create | Two concurrent gates → action dispatched once; injected classifier |
 
 No DB schema rewrites. No new tables.
 
@@ -152,37 +152,15 @@ git commit -m "feat(b0): migration 004 — partial unique index for one-active-p
 
 ---
 
-## Task 4: TDD — `pendingQuestionsRepo` tx-aware methods
+## Task 4: `pendingQuestionsRepo` tx-aware methods
 
-**Files:** `src/db/repositories.ts`, `tests/unit/pending-questions-repo.spec.ts` (new — but DB-touching, so it's actually a stub-type test)
+**Files:** `src/db/repositories.ts`
 
-The 5 methods all wrap the existing Drizzle query builder, accepting either the global `db` or a `tx` returned by `withTx`. Drizzle's transactional client has the same shape, so we type the parameter as `typeof db`.
+The 5 methods all wrap the Drizzle query builder, accepting either the global `db` or a `tx` returned by `withTx`. Drizzle's tx client has the same shape — typed as `typeof db`. We use Drizzle's native `.for('update')` instead of raw SQL so types and JSONB parsing carry through (no hand casts, no `tx.execute` shape mismatch).
 
-- [ ] **Step 1: Write the failing test** (signatures only — DB-bound full coverage is in the integration test in Task 14)
+- [ ] **Step 1: Add the 5 methods**
 
-Create `tests/unit/pending-questions-repo.spec.ts`:
-
-```typescript
-import { describe, it, expect } from 'vitest';
-import { pendingQuestionsRepo } from '../../src/db/repositories.js';
-
-describe('pendingQuestionsRepo — tx-aware surface', () => {
-  it('exposes findActiveSnapshot, findActiveForUpdate, resolveTx, cancelTx, cancelOpenForConversaTx', () => {
-    expect(typeof pendingQuestionsRepo.findActiveSnapshot).toBe('function');
-    expect(typeof pendingQuestionsRepo.findActiveForUpdate).toBe('function');
-    expect(typeof pendingQuestionsRepo.resolveTx).toBe('function');
-    expect(typeof pendingQuestionsRepo.cancelTx).toBe('function');
-    expect(typeof pendingQuestionsRepo.cancelOpenForConversaTx).toBe('function');
-  });
-});
-```
-
-Run: `npx vitest run tests/unit/pending-questions-repo.spec.ts`
-Expected: 1 fail (methods not defined).
-
-- [ ] **Step 2: Implement the 5 methods**
-
-In `src/db/repositories.ts`, find `export const pendingQuestionsRepo = {` and add the methods (keep the existing `create`, `findOpen`, `resolve`, `expireDue` intact):
+In `src/db/repositories.ts`, find `export const pendingQuestionsRepo = {` and add (keep existing `create`, `findOpen`, `resolve`, `expireDue` intact):
 
 ```typescript
   // === B0 tx-aware additions ===
@@ -207,16 +185,20 @@ In `src/db/repositories.ts`, find `export const pendingQuestionsRepo = {` and ad
     tx: typeof db,
     conversa_id: string,
   ): Promise<PendingQuestion | null> {
-    const result = await tx.execute<PendingQuestion>(sql`
-      SELECT * FROM pending_questions
-       WHERE conversa_id = ${conversa_id}
-         AND status = 'aberta'
-         AND expira_em > now()
-       ORDER BY created_at DESC
-       LIMIT 1
-       FOR UPDATE
-    `);
-    return (result.rows[0] as PendingQuestion | undefined) ?? null;
+    const rows = await tx
+      .select()
+      .from(pending_questions)
+      .where(
+        and(
+          eq(pending_questions.conversa_id, conversa_id),
+          eq(pending_questions.status, 'aberta'),
+          sql`expira_em > now()`,
+        ),
+      )
+      .orderBy(desc(pending_questions.created_at))
+      .limit(1)
+      .for('update');
+    return rows[0] ?? null;
   },
 
   async resolveTx(tx: typeof db, id: string, resposta: unknown): Promise<void> {
@@ -256,13 +238,16 @@ In `src/db/repositories.ts`, find `export const pendingQuestionsRepo = {` and ad
   },
 ```
 
-- [ ] **Step 3: Run + commit**
+(`findActiveSnapshot` and `findActiveForUpdate` use Drizzle's typed query builder so JSONB columns parse correctly. `cancelTx` / `cancelOpenForConversaTx` use raw SQL because they need `metadata || jsonb` concat which Drizzle doesn't expose ergonomically — the cast is bounded.)
+
+The signature-existence ceremony test from the v1 plan was dropped — Task 8/9 unit tests exercise the methods through the gate, which is real coverage.
+
+- [ ] **Step 2: Typecheck + commit**
 
 ```bash
-npx vitest run tests/unit/pending-questions-repo.spec.ts
 npx tsc --noEmit
-git add src/db/repositories.ts tests/unit/pending-questions-repo.spec.ts
-git commit -m "feat(b0): pendingQuestionsRepo tx-aware methods (find/resolve/cancel)"
+git add src/db/repositories.ts
+git commit -m "feat(b0): pendingQuestionsRepo tx-aware methods (find/resolve/cancel) via Drizzle .for('update')"
 ```
 
 ---
@@ -437,7 +422,7 @@ describe('ask_pending_question — schema + affirmative-first', () => {
     expect(subs[0][0].metadata.cancelled_ids).toEqual(['old-pq']);
   });
 
-  it('audits pending_created with the new id', async () => {
+  it('does NOT audit pending_created from the handler (dispatcher does it)', async () => {
     const { askPendingQuestionTool } = await import('../../src/tools/ask-pending-question.js');
     await askPendingQuestionTool.handler(
       {
@@ -450,8 +435,7 @@ describe('ask_pending_question — schema + affirmative-first', () => {
       ctx,
     );
     const creates = auditMock.mock.calls.filter((c) => c[0]?.acao === 'pending_created');
-    expect(creates.length).toBe(1);
-    expect(creates[0][0].alvo_id).toBe('pq-uuid-1');
+    expect(creates.length).toBe(0); // dispatcher fires this audit, not the handler
   });
 });
 ```
@@ -540,14 +524,13 @@ export const askPendingQuestionTool: Tool<typeof inputSchema, typeof outputSchem
       return row;
     });
 
-    await audit({
-      acao: 'pending_created',
-      pessoa_id: ctx.pessoa.id,
-      conversa_id: ctx.conversa.id,
-      mensagem_id: ctx.mensagem_id,
-      alvo_id: created.id,
-      metadata: { tipo: 'gate', expira_em: expira_em.toISOString() },
-    });
+    // Note: do NOT call audit({ acao: 'pending_created' }) here — the dispatcher
+    // emits this audit automatically based on the tool's `audit_action` field.
+    // Doing both would double-write. The dispatcher's audit row carries
+    // pessoa_id, conversa_id, mensagem_id, and `metadata: { tool }` already;
+    // we lose alvo_id (the new pq id) and the expira_em metadata, but the
+    // tool result `{ pending_question_id }` is captured by the dispatcher's
+    // idempotency_keys.resultado JSONB which is queryable for those.
 
     return { pending_question_id: created.id };
   },
@@ -707,6 +690,21 @@ export type GateResult =
 
 const CONFIDENCE_THRESHOLD = 0.7;
 
+/**
+ * Optional classifier dependency-injection. Default is the Haiku-backed
+ * implementation. Tests override this to assert deterministic resolutions
+ * without an LLM round-trip and without needing ANTHROPIC_API_KEY.
+ */
+export type Classifier = (
+  snapshot: { pergunta: string; opcoes_validas: unknown },
+  inbound: Mensagem,
+) => Promise<ClassifyOut | null>;
+
+let _classifier: Classifier = haikuClassifier;
+export function setClassifierForTesting(c: Classifier | null): void {
+  _classifier = c ?? haikuClassifier;
+}
+
 export async function checkPendingFirst(input: {
   pessoa: Pessoa;
   conversa: Conversa;
@@ -724,8 +722,8 @@ export async function checkPendingFirst(input: {
   }
   if (!snapshot) return { kind: 'no_pending' };
 
-  // Step 2: classify with Haiku (OUTSIDE the lock)
-  const resolution = await classify(snapshot, input.inbound);
+  // Step 2: classify (OUTSIDE the lock — Haiku by default, injectable for tests)
+  const resolution = await _classifier(snapshot, input.inbound);
   if (!resolution) return { kind: 'unresolved', reason: 'low_confidence' };
 
   // Step 3 + 4: re-check + commit (Task 9 fills this in)
@@ -740,7 +738,7 @@ type ClassifyOut = {
   is_cancellation?: boolean;
 };
 
-async function classify(
+async function haikuClassifier(
   snapshot: { pergunta: string; opcoes_validas: unknown },
   inbound: Mensagem,
 ): Promise<ClassifyOut | null> {
@@ -1068,14 +1066,29 @@ git commit -m "feat(b0): wire pending-gate into agent loop before LLM"
 
 The `sendOutbound` helper today writes a `mensagens` row with `metadata: { whatsapp_id, in_reply_to }`. We extend it with `pending_question_id` and track the most recently created pending in a turn-local variable.
 
-- [ ] **Step 1: Track latest pending id from `dispatchTool` results**
+**Idempotency-cache hazard**: the dispatcher caches tool results keyed by a 5-min bucket (`src/governance/idempotency.ts`). A retry within the same bucket returns the cached `{ pending_question_id }`. If that pending was meanwhile resolved or cancelled by another path, stamping the stale id onto a fresh outbound is wrong. We mitigate by re-validating the cached id is still active right before stamping — cheap, and safe at the cache miss case too.
 
-Inside the ReAct loop, just after `const out = await dispatchTool(...)`:
+- [ ] **Step 1: Declare `latestPendingId` ABOVE the outer `for (let i ...)` loop**
+
+In `src/agent/core.ts`, find the line that reads:
 
 ```typescript
-let latestPendingId: string | null = null; // declared once before the loop
+const conversation: LLMMessage[] = messages;
+```
 
-// inside the for-tu loop, after `const out = ...`:
+Immediately AFTER it (line ~71 in current main; line will shift slightly after Task 10), add:
+
+```typescript
+let latestPendingId: string | null = null;
+```
+
+This survives across ReAct iterations within the turn.
+
+- [ ] **Step 2: Capture the id INSIDE the inner `for (const tu of res.tool_uses)` loop**
+
+After the existing `const out = await dispatchTool({ ... })` call (around line ~110 in current main; same line after Task 10), add:
+
+```typescript
 if (
   tu.tool === 'ask_pending_question' &&
   typeof out === 'object' &&
@@ -1083,9 +1096,25 @@ if (
   'pending_question_id' in out &&
   typeof (out as { pending_question_id: string }).pending_question_id === 'string'
 ) {
-  latestPendingId = (out as { pending_question_id: string }).pending_question_id;
+  const candidate = (out as { pending_question_id: string }).pending_question_id;
+  // Re-validate that the candidate is still 'aberta'. Defends against
+  // dispatcher-cache returning a stale id from a prior retry within the
+  // 5-min idempotency bucket.
+  const stillActive = await pendingQuestionsRepo
+    .findActiveSnapshot(c.id)
+    .catch(() => null);
+  if (stillActive && stillActive.id === candidate) {
+    latestPendingId = candidate;
+  } else {
+    logger.warn(
+      { tool: tu.tool, candidate, conversa_id: c.id },
+      'agent.stale_pending_id_dropped',
+    );
+  }
 }
 ```
+
+Add the `pendingQuestionsRepo` import alongside the other repo imports at the top of `core.ts` if not already present.
 
 - [ ] **Step 2: Extend `sendOutbound` signature**
 
@@ -1190,11 +1219,17 @@ d('pending-gate concurrency', () => {
       );
       void pq;
 
-      // Two parallel resolves via checkPendingFirst — the test process imports the
-      // module and runs it twice, then asserts the final row state.
-      // We bypass Haiku via a static stub at the LLM layer.
+      // Two parallel resolves via checkPendingFirst. We inject a deterministic
+      // classifier (no Haiku) so the test is self-contained and doesn't require
+      // ANTHROPIC_API_KEY in CI.
       process.env.FEATURE_PENDING_GATE = 'true';
-      const { checkPendingFirst } = await import('../../src/agent/pending-gate.js');
+      const gateModule = await import('../../src/agent/pending-gate.js');
+      const { checkPendingFirst, setClassifierForTesting } = gateModule;
+      setClassifierForTesting(async () => ({
+        resolves_pending: true,
+        option_chosen: 'sim',
+        confidence: 0.95,
+      }));
 
       const inbound = { id: 'm-test', conteudo: 'sim' };
       const conversa = { id: conv.rows[0]!.id };
@@ -1220,6 +1255,7 @@ d('pending-gate concurrency', () => {
       await c.query('DELETE FROM pending_questions WHERE conversa_id = $1', [conv.rows[0]!.id]);
       await c.query('DELETE FROM conversas WHERE id = $1', [conv.rows[0]!.id]);
       await c.query('DELETE FROM pessoas WHERE id = $1', [pessoa.rows[0]!.id]);
+      setClassifierForTesting(null); // restore default Haiku classifier
     } finally {
       c.release();
     }
@@ -1227,7 +1263,7 @@ d('pending-gate concurrency', () => {
 });
 ```
 
-(Note: this requires Haiku to actually return a deterministic resolution. The test doesn't mock `callLLM` — it relies on TEST_DB_URL **and** ANTHROPIC_API_KEY being set. If preferred, refactor `pending-gate.ts` to accept a `classifier` param for testability and inject a stub here. **Pragmatic call**: keep the test gated on both env vars; document that.)
+The test only needs `TEST_DB_URL`; `ANTHROPIC_API_KEY` is not required because we inject the classifier.
 
 - [ ] **Step 2: Run if env is set, otherwise confirm skip**
 
