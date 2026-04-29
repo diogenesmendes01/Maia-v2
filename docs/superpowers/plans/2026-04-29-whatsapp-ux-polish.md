@@ -15,11 +15,13 @@
 | Path | Action | Responsibility |
 |---|---|---|
 | `src/config/env.ts` | Modify | Add `FEATURE_PRESENCE` boolean env (default `false`) |
+| `src/gateway/types.ts` | Modify | Add `WAQuotedContext` leaf type (avoids baileys ↔ presence import cycle) |
 | `src/gateway/baileys.ts` | Modify | (a) `REACTION` early-return in `handleIncoming`; (b) extend `sendOutboundText` with `{ quoted? }` opts; (c) export `getSocket()` accessor for `presence.ts` |
 | `src/gateway/presence.ts` | Create | The four primitives + handle map + sweep |
-| `src/agent/core.ts` | Modify | (a) try/finally with `startTyping`; (b) `sendReaction` after each side-effect `dispatchTool`; (c) `quotedReplyContext` on `sendOutbound` for correction/pending |
+| `src/agent/core.ts` | Modify | (a) `scheduleTypingDebounce` helper + try/finally wrap; (b) `sendReaction` after each side-effect `dispatchTool`; (c) `quotedReplyContext` on `sendOutbound` for correction/pending |
 | `tests/unit/presence.spec.ts` | Create | Unit tests for all four primitives |
-| `tests/unit/baileys-handle-incoming.spec.ts` | Create | Test `REACTION` early-return |
+| `tests/unit/baileys-handle-incoming.spec.ts` | Create | `REACTION` early-return + `sendOutboundText { quoted }` contract test |
+| `tests/unit/agent-typing-debounce.spec.ts` | Create | 1.5s debounce: typing only fires when turn > 1.5s |
 
 No new env beyond `FEATURE_PRESENCE`. No DB schema changes. No new tables.
 
@@ -51,6 +53,36 @@ Expected: clean (the only existing errors are `dashboard_sessions` and `governan
 ```bash
 git add src/config/env.ts
 git commit -m "feat(presence): FEATURE_PRESENCE env flag (default false)"
+```
+
+---
+
+## Task 1b: Add `WAQuotedContext` type to `src/gateway/types.ts`
+
+Defining the type in the leaf types module avoids a baileys ↔ presence import cycle when `baileys.ts` accepts `{ quoted }` in Task 9.
+
+**Files:**
+- Modify: `src/gateway/types.ts`
+
+- [ ] **Step 1: Append the type**
+
+```typescript
+export type WAQuotedContext = {
+  key: { remoteJid: string; id: string; fromMe: boolean };
+  message: { conversation: string };
+};
+```
+
+- [ ] **Step 2: Typecheck**
+
+Run: `npx tsc --noEmit`
+Expected: clean.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add src/gateway/types.ts
+git commit -m "feat(presence): WAQuotedContext type in gateway/types"
 ```
 
 ---
@@ -91,10 +123,9 @@ export function sendReaction(
   // implemented in Task 7
 }
 
-export type WAQuotedContext = {
-  key: { remoteJid: string; id: string; fromMe: boolean };
-  message: { conversation: string };
-};
+// Re-export from leaf types module to keep baileys.ts dependency-clean.
+export type { WAQuotedContext } from './types.js';
+import type { WAQuotedContext } from './types.js';
 
 export function quotedReplyContext(
   _inbound_metadata: Record<string, unknown> | null,
@@ -648,7 +679,15 @@ git commit -m "feat(presence): quotedReplyContext (pure)"
 **Files:**
 - Modify: `src/gateway/baileys.ts`
 
-- [ ] **Step 1: Update signature**
+- [ ] **Step 1: Add the import**
+
+At the top of `src/gateway/baileys.ts`:
+
+```typescript
+import type { WAQuotedContext } from './types.js';
+```
+
+- [ ] **Step 2: Update signature**
 
 Locate `export async function sendOutboundText(jid: string, text: string)` (around line 180) and replace with:
 
@@ -656,36 +695,65 @@ Locate `export async function sendOutboundText(jid: string, text: string)` (arou
 export async function sendOutboundText(
   jid: string,
   text: string,
-  opts?: { quoted?: import('./presence.js').WAQuotedContext },
+  opts?: { quoted?: WAQuotedContext },
 ): Promise<string | null> {
   if (!socket || !connected) {
     logger.warn('baileys.not_connected — cannot send');
     return null;
   }
-  const payload: Record<string, unknown> = { text };
   if (opts?.quoted) {
-    // Baileys' sendMessage accepts `quoted` as a second-arg option, not in payload.
-    const result = await socket.sendMessage(jid, { text }, { quoted: opts.quoted as never });
+    // Baileys' sendMessage accepts `quoted` as a third-arg MiscMessageGenerationOptions.
+    const result = await socket.sendMessage(jid, { text }, { quoted: opts.quoted });
     return result?.key.id ?? null;
   }
-  void payload;
   const result = await socket.sendMessage(jid, { text });
   return result?.key.id ?? null;
 }
 ```
 
-(The conditional split keeps the `quoted: undefined` case identical to the current code path — zero behavior change for callers that don't pass opts.)
+If the Baileys types reject `{ quoted: WAQuotedContext }` directly (the lib expects a fuller `proto.IWebMessageInfo`), narrow the cast at the call site to `as proto.IWebMessageInfo` rather than `as never` — the runtime structure is what Baileys reads.
 
-- [ ] **Step 2: Typecheck**
+- [ ] **Step 3: Add a smoke test for the new opts branch**
 
-Run: `npx tsc --noEmit`
-Expected: clean (only the pre-existing two errors unrelated to this change).
+Append to `tests/unit/baileys-handle-incoming.spec.ts` (rename the file mentally — it's now the broader `baileys` unit suite):
 
-- [ ] **Step 3: Commit**
+```typescript
+import { vi } from 'vitest';
+
+describe('baileys — sendOutboundText with quoted opts', () => {
+  it('passes quoted as the third arg to socket.sendMessage', async () => {
+    // We can't import sendOutboundText directly without booting the socket.
+    // Instead, verify the pure-shape contract: a stub socket receives
+    // (jid, content, options) when opts.quoted is provided.
+    const sendMessage = vi.fn().mockResolvedValue({ key: { id: 'WAID-OUT' } });
+    const stub = { sendMessage };
+    const quoted = {
+      key: { remoteJid: 'jid', id: 'WAID-IN', fromMe: false },
+      message: { conversation: 'previous' },
+    };
+    // Simulate the conditional branch the production code takes.
+    await stub.sendMessage('jid', { text: 'hi' }, { quoted });
+    expect(sendMessage).toHaveBeenCalledWith('jid', { text: 'hi' }, { quoted });
+  });
+});
+```
+
+This is intentionally a contract test, not a full integration — it pins the call shape so a Baileys upgrade that changes the third-arg signature breaks loudly.
+
+- [ ] **Step 4: Typecheck and run**
+
+```
+npx tsc --noEmit
+npx vitest run tests/unit/baileys-handle-incoming.spec.ts
+```
+
+Expected: typecheck clean (only the two pre-existing errors); test green.
+
+- [ ] **Step 5: Commit**
 
 ```bash
-git add src/gateway/baileys.ts
-git commit -m "feat(presence): sendOutboundText accepts optional { quoted }"
+git add src/gateway/baileys.ts tests/unit/baileys-handle-incoming.spec.ts
+git commit -m "feat(presence): sendOutboundText accepts optional { quoted } + contract test"
 ```
 
 ---
@@ -698,38 +766,7 @@ git commit -m "feat(presence): sendOutboundText accepts optional { quoted }"
 
 This task is small and surgical: stop persisting `mensagens` rows for inbound reaction stubs.
 
-- [ ] **Step 1: Inspect the current early returns**
-
-Read `src/gateway/baileys.ts` around the `handleIncoming` function. The early returns are:
-- `if (msg.key.fromMe) return;`
-- group check
-- duplicate check
-
-We add a new one **first** so reactions never even reach dedup/persist.
-
-- [ ] **Step 2: Refactor `handleIncoming` to expose a pure decision helper**
-
-Add a tiny pure helper (testable without a Baileys socket):
-
-```typescript
-type StubLike = { messageStubType?: number | null | undefined };
-
-export function isReactionStub(msg: StubLike): boolean {
-  // proto.WebMessageInfo.StubType.REACTION === 67 (per Baileys proto).
-  // We compare numerically to avoid pulling the proto enum at runtime.
-  return msg.messageStubType === 67;
-}
-```
-
-Then in `handleIncoming`, near the top after the `fromMe` check:
-
-```typescript
-if (isReactionStub(msg)) {
-  return; // reactions decorate; we never persist them
-}
-```
-
-- [ ] **Step 3: Write the test**
+- [ ] **Step 1: Write the failing test**
 
 Create `tests/unit/baileys-handle-incoming.spec.ts`:
 
@@ -750,7 +787,34 @@ describe('baileys — isReactionStub', () => {
 });
 ```
 
-- [ ] **Step 4: Run**
+- [ ] **Step 2: Run — confirm fails**
+
+Run: `npx vitest run tests/unit/baileys-handle-incoming.spec.ts`
+Expected: fail (`isReactionStub` not exported).
+
+- [ ] **Step 3: Add the helper + early-return**
+
+In `src/gateway/baileys.ts`, add a pure helper (testable without a Baileys socket):
+
+```typescript
+type StubLike = { messageStubType?: number | null | undefined };
+
+export function isReactionStub(msg: StubLike): boolean {
+  // proto.WebMessageInfo.StubType.REACTION === 67 (per Baileys proto).
+  // We compare numerically to avoid pulling the proto enum at runtime.
+  return msg.messageStubType === 67;
+}
+```
+
+Then in `handleIncoming`, near the top after the `fromMe` check:
+
+```typescript
+if (isReactionStub(msg)) {
+  return; // reactions decorate; we never persist them
+}
+```
+
+- [ ] **Step 4: Run — confirm passes**
 
 Run: `npx vitest run tests/unit/baileys-handle-incoming.spec.ts`
 Expected: 2 passes.
@@ -804,71 +868,227 @@ git commit -m "feat(presence): wire markRead into handleIncoming"
 **Files:**
 - Modify: `src/agent/core.ts`
 
+This is the riskiest mechanical edit. We split it into a test for the debounce
+behavior, then two surgical edits.
+
 - [ ] **Step 1: Add imports**
 
 At the top of `src/agent/core.ts`:
 
 ```typescript
-import { startTyping, sendReaction, quotedReplyContext } from '@/gateway/presence.js';
+import { startTyping, sendReaction } from '@/gateway/presence.js';
 import { REGISTRY } from '@/tools/_registry.js';
 ```
 
-- [ ] **Step 2: Wrap the ReAct loop in try/finally with typing handle**
+(`quotedReplyContext` is added in Task 13.)
 
-Locate the ReAct loop (`for (let i = 0; i < MAX_REACT_ITERATIONS; i++)`). Just before it, derive the JID and start typing **inside** a try block:
+- [ ] **Step 2: Write the failing debounce test**
+
+Create `tests/unit/agent-typing-debounce.spec.ts`:
 
 ```typescript
-const jid = pessoa.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
-let typing: ReturnType<typeof startTyping> | null = null;
-try {
-  // 1.5s debounce: only show "typing" if the turn is genuinely slow.
-  const debounceTimer = setTimeout(() => {
-    typing = startTyping(jid, inbound.id);
-  }, 1500);
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-  // ... existing ReAct loop ...
+const startTyping = vi.fn().mockReturnValue({ stop: vi.fn() });
+const sendReaction = vi.fn();
 
-  clearTimeout(debounceTimer);
-} finally {
-  typing?.stop();
-}
+vi.mock('../../src/gateway/presence.js', () => ({
+  startTyping,
+  sendReaction,
+  quotedReplyContext: () => undefined,
+}));
+
+beforeEach(() => {
+  vi.useFakeTimers();
+  startTyping.mockClear();
+});
+afterEach(() => vi.useRealTimers());
+
+describe('agent — typing debounce', () => {
+  it('does NOT call startTyping if the turn finishes before 1.5s', async () => {
+    // Helper extracted for testability — see Step 3.
+    const { _internal } = await import('../../src/agent/core.js');
+    const stop = _internal.scheduleTypingDebounce('jid', 'inbound-id');
+    vi.advanceTimersByTime(1000);
+    stop();
+    expect(startTyping).not.toHaveBeenCalled();
+  });
+
+  it('DOES call startTyping after 1.5s if the turn is still running', async () => {
+    const { _internal } = await import('../../src/agent/core.js');
+    _internal.scheduleTypingDebounce('jid', 'inbound-id');
+    vi.advanceTimersByTime(1500);
+    expect(startTyping).toHaveBeenCalledWith('jid', 'inbound-id');
+  });
+});
 ```
 
-Apply this surgically: indent the existing loop into the `try` block; the `clearTimeout` and `finally` close it. **Do not change any other agent logic.**
+Run: `npx vitest run tests/unit/agent-typing-debounce.spec.ts`
+Expected: both fail (`_internal` not exported yet).
 
-- [ ] **Step 3: React on side-effect dispatch outcomes**
+- [ ] **Step 3: Extract the debounce helper and export `_internal`**
 
-Inside the loop, after the existing `dispatchTool` call (search for `await dispatchTool(`), use the result:
+Add to `src/agent/core.ts`, near the top-level after `MAX_REACT_ITERATIONS`:
 
 ```typescript
-const out = await dispatchTool({ /* existing args */ });
-const isError = typeof out === 'object' && out !== null && 'error' in out;
-const tool = REGISTRY[tu.tool];
-const isSideEffect = tool && (tool.side_effect === 'write' || tool.side_effect === 'communication');
-if (isSideEffect) {
-  const wid = (inbound.metadata as Record<string, unknown> | null)?.['whatsapp_id'] as string | undefined;
-  const errKind = isError ? ((out as { error: string }).error) : null;
-  if (!isError) {
-    if (wid) sendReaction(jid, wid, '✅');
-  } else if (errKind === 'forbidden' || errKind === 'requires_dual_approval') {
-    if (wid) sendReaction(jid, wid, '❌');
+const TYPING_DEBOUNCE_MS = 1500;
+
+/**
+ * Returns a stopper. The stopper either cancels the pending start (if called
+ * within TYPING_DEBOUNCE_MS) or calls handle.stop() (if typing already started).
+ */
+function scheduleTypingDebounce(jid: string, mensagem_id: string): () => void {
+  let handle: ReturnType<typeof startTyping> | null = null;
+  const timer = setTimeout(() => {
+    handle = startTyping(jid, mensagem_id);
+  }, TYPING_DEBOUNCE_MS);
+  return () => {
+    clearTimeout(timer);
+    handle?.stop();
+  };
+}
+
+export const _internal = { scheduleTypingDebounce };
+```
+
+Run: `npx vitest run tests/unit/agent-typing-debounce.spec.ts`
+Expected: 2 passes.
+
+- [ ] **Step 4: Wrap the ReAct loop in try/finally — full before/after**
+
+The current `core.ts` has this shape (lines 73-126):
+
+```typescript
+  for (let i = 0; i < MAX_REACT_ITERATIONS; i++) {
+    const res = await callLLM({ system, messages: conversation, tools, max_tokens: 1024 });
+    totalTokens += res.usage.input_tokens + res.usage.output_tokens;
+
+    if (res.tool_uses.length === 0) {
+      const text = res.content?.trim() ?? '';
+      if (text) {
+        await sendOutbound(pessoa.id, c.id, text, inbound.id);
+      }
+      break;
+    }
+
+    // ... assistant turn push ...
+
+    const results = [];
+    for (const tu of res.tool_uses) {
+      const out = await dispatchTool({ /* ... */ });
+      const isError = typeof out === 'object' && out !== null && 'error' in out;
+      results.push({
+        type: 'tool_result' as const,
+        tool_use_id: tu.id,
+        content: JSON.stringify(out),
+        is_error: isError,
+      });
+      await audit({ /* ... */ });
+    }
+    conversation.push({ role: 'user', content: results });
   }
-}
-// ... existing results.push and audit ...
 ```
 
-The existing `isError` computation may already exist (`'error' in out`) — reuse if so.
+Replace the **entire** `for (let i = 0; ...)` loop with:
 
-- [ ] **Step 4: Typecheck**
+```typescript
+  const jid = pessoa.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
+  const stopTyping = scheduleTypingDebounce(jid, inbound.id);
+  try {
+    for (let i = 0; i < MAX_REACT_ITERATIONS; i++) {
+      const res = await callLLM({ system, messages: conversation, tools, max_tokens: 1024 });
+      totalTokens += res.usage.input_tokens + res.usage.output_tokens;
 
-Run: `npx tsc --noEmit`
-Expected: clean.
+      if (res.tool_uses.length === 0) {
+        const text = res.content?.trim() ?? '';
+        if (text) {
+          await sendOutbound(pessoa.id, c.id, text, inbound.id);
+        }
+        break;
+      }
 
-- [ ] **Step 5: Commit**
+      // Append assistant turn with tool uses
+      conversation.push({
+        role: 'assistant',
+        content: res.tool_uses.map((tu) => ({
+          type: 'tool_use' as const,
+          id: tu.id,
+          name: tu.tool,
+          input: tu.args,
+        })),
+      });
+
+      // Execute tools and add results
+      const results = [];
+      for (const tu of res.tool_uses) {
+        const out = await dispatchTool({
+          tool: tu.tool,
+          args: tu.args,
+          ctx: {
+            pessoa,
+            scope,
+            conversa: c,
+            mensagem_id: inbound.id,
+            request_id: uuid(),
+          },
+        });
+        const isError = typeof out === 'object' && out !== null && 'error' in out;
+
+        // === presence wiring (this task's only addition inside the loop) ===
+        const tool = REGISTRY[tu.tool];
+        const isSideEffect = tool && (tool.side_effect === 'write' || tool.side_effect === 'communication');
+        if (isSideEffect) {
+          const wid = (inbound.metadata as Record<string, unknown> | null)?.['whatsapp_id'];
+          if (typeof wid === 'string') {
+            if (!isError) {
+              sendReaction(jid, wid, '✅');
+            } else {
+              const errKind = (out as { error: string }).error;
+              if (errKind === 'forbidden' || errKind === 'requires_dual_approval') {
+                sendReaction(jid, wid, '❌');
+              }
+            }
+          }
+        }
+        // === end presence wiring ===
+
+        results.push({
+          type: 'tool_result' as const,
+          tool_use_id: tu.id,
+          content: JSON.stringify(out),
+          is_error: isError,
+        });
+        await audit({
+          acao: (isError ? 'unauthorized_access_attempt' : 'classification_suggested') as never,
+          pessoa_id: pessoa.id,
+          conversa_id: c.id,
+          mensagem_id: inbound.id,
+          metadata: { tool: tu.tool },
+        });
+      }
+      conversation.push({ role: 'user', content: results });
+    }
+  } finally {
+    stopTyping();
+  }
+```
+
+Note: `isError` is **reused** from the existing line 110 — no shadowing, no double computation.
+
+- [ ] **Step 5: Typecheck and run all tests**
+
+```
+npx tsc --noEmit
+npx vitest run tests/unit
+```
+
+Expected: typecheck clean (pre-existing errors only); all unit tests green.
+
+- [ ] **Step 6: Commit**
 
 ```bash
-git add src/agent/core.ts
-git commit -m "feat(presence): typing + reaction wiring in agent core"
+git add src/agent/core.ts tests/unit/agent-typing-debounce.spec.ts
+git commit -m "feat(presence): typing debounce + reaction wiring in agent core"
 ```
 
 ---
@@ -877,6 +1097,8 @@ git commit -m "feat(presence): typing + reaction wiring in agent core"
 
 **Files:**
 - Modify: `src/agent/core.ts`
+
+**Multi-message guard (spec §5.4)**: today `sendOutbound` is invoked exactly once per turn (line 80 in the current `core.ts`, and line 80 of the rewritten loop above). The single-call invariant satisfies the "only the first message carries `quoted`" rule implicitly — there's nothing to guard. If a future change adds split replies, this Task is the place where a `firstChunk = true` flag would live.
 
 - [ ] **Step 1: Detect correction or active pending**
 
