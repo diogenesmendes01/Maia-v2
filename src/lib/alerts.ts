@@ -26,9 +26,28 @@ async function sendTelegram({ subject, body }: { subject: string; body: string }
   }
 }
 
-async function sendEmail(_input: { subject: string; body: string }): Promise<void> {
-  // SMTP via nodemailer would go here. Phase 1 leaves this as a no-op when SMTP_* not set.
+async function sendEmail({ subject, body }: { subject: string; body: string }): Promise<void> {
   if (!config.SMTP_HOST || !config.ALERT_EMAIL_TO) return;
-  // Minimal placeholder — actual nodemailer call to be wired with the dependency.
-  logger.info({ to: config.ALERT_EMAIL_TO, subject: _input.subject }, 'alert.email.placeholder');
+  try {
+    const nodemailer = await import('nodemailer');
+    const transporter = nodemailer.default.createTransport({
+      host: config.SMTP_HOST,
+      port: config.SMTP_PORT ?? 587,
+      secure: (config.SMTP_PORT ?? 587) === 465,
+      auth:
+        config.SMTP_USER && config.SMTP_PASS
+          ? { user: config.SMTP_USER, pass: config.SMTP_PASS }
+          : undefined,
+    });
+    const from = config.SMTP_USER ?? `maia@${config.SMTP_HOST}`;
+    await transporter.sendMail({
+      from,
+      to: config.ALERT_EMAIL_TO,
+      subject: `[MAIA ALERT] ${subject}`,
+      text: body,
+    });
+    logger.info({ to: config.ALERT_EMAIL_TO, subject }, 'alert.email.sent');
+  } catch (err) {
+    logger.warn({ err: (err as Error).message }, 'alert.email_failed');
+  }
 }

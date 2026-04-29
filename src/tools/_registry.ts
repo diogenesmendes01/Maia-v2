@@ -7,6 +7,8 @@ import { listTransactionsTool } from './list-transactions.js';
 import { classifyTransactionTool } from './classify-transaction.js';
 import { identifyEntityTool } from './identify-entity.js';
 import { parseBoletoTool } from './parse-boleto.js';
+import { parseReceiptTool } from './parse-receipt.js';
+import { parseImageTool } from './parse-image.js';
 import { transcribeAudioTool } from './transcribe-audio.js';
 import { scheduleReminderTool } from './schedule-reminder.js';
 import { sendProactiveMessageTool } from './send-proactive-message.js';
@@ -49,6 +51,8 @@ export const REGISTRY: Record<string, AnyTool> = {
   classify_transaction: classifyTransactionTool as unknown as AnyTool,
   identify_entity: identifyEntityTool as unknown as AnyTool,
   parse_boleto: parseBoletoTool as unknown as AnyTool,
+  parse_receipt: parseReceiptTool as unknown as AnyTool,
+  parse_image: parseImageTool as unknown as AnyTool,
   transcribe_audio: transcribeAudioTool as unknown as AnyTool,
   schedule_reminder: scheduleReminderTool as unknown as AnyTool,
   send_proactive_message: sendProactiveMessageTool as unknown as AnyTool,

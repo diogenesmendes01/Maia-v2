@@ -8,6 +8,8 @@ import { runInactivitySweep } from './inactivity-sweep.js';
 import { runConversationSummarizer } from './conversation-summarizer.js';
 import { runReflectionBatch } from './reflection-batch.js';
 import { runMessageRecovery } from './message-recovery.js';
+import { runNightlyBackup } from './backup.js';
+import { runCostMonitor } from './cost-monitor.js';
 import { runMorningBriefing, runEveningBriefing, runWeeklyBriefing } from './briefings.js';
 import { tickEngine } from '@/workflows/engine.js';
 
@@ -21,6 +23,8 @@ const JOBS: Job[] = [
   { name: 'audit_mode_expirer', cron: '*/15 * * * *', fn: runAuditModeExpirer, phase: 1 },
   { name: 'idempotency_cleanup', cron: '0 4 * * *', fn: runIdempotencyCleanup, phase: 1 },
   { name: 'inactivity_sweep', cron: '0 3 * * *', fn: runInactivitySweep, phase: 1 },
+  { name: 'nightly_backup', cron: '0 3 * * *', fn: runNightlyBackup, phase: 1 },
+  { name: 'cost_monitor', cron: '30 2 * * *', fn: runCostMonitor, phase: 1 },
   { name: 'conversation_summarizer', cron: '0 2 * * *', fn: runConversationSummarizer, phase: 2 },
   { name: 'reflection_batch', cron: '0 2 * * *', fn: runReflectionBatch, phase: 2 },
   { name: 'briefing_morning', cron: '0 8 * * *', fn: runMorningBriefing, phase: 4 },

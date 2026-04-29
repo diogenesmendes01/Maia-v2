@@ -15,9 +15,11 @@ import { logger } from '@/lib/logger.js';
 import { sha256 } from '@/lib/utils.js';
 import { mensagensRepo } from '@/db/repositories.js';
 import { isDuplicate, markSeen } from './dedup.js';
+import { markRead } from './presence.js';
 import { enqueueAgent } from './queue.js';
+import { checkBotAndMaybeBlock } from './bot-detection.js';
 import { audit } from '@/governance/audit.js';
-import type { WhatsAppInbound } from './types.js';
+import type { WhatsAppInbound, WAQuotedContext } from './types.js';
 
 let socket: WASocket | null = null;
 let connected = false;
@@ -28,6 +30,24 @@ mkdirSync(MEDIA_ROOT, { recursive: true });
 
 export function isBaileysConnected(): boolean {
   return connected;
+}
+
+export function getSocket(): WASocket | null {
+  return socket;
+}
+
+type StubLike = { messageStubType?: number | null | undefined };
+
+/**
+ * Numeric value of `proto.WebMessageInfo.StubType.REACTION` in Baileys.
+ * Hard-coded as a number to keep `proto` as a type-only import (importing
+ * it as a value pulls in the full protobuf runtime). If Baileys ever
+ * renumbers the enum, the unit test for `isReactionStub` will catch it.
+ */
+export const REACTION_STUB_TYPE = 67;
+
+export function isReactionStub(msg: StubLike): boolean {
+  return msg.messageStubType === REACTION_STUB_TYPE;
 }
 
 export async function startBaileys(): Promise<void> {
@@ -72,6 +92,7 @@ export async function startBaileys(): Promise<void> {
 
 async function handleIncoming(msg: proto.IWebMessageInfo): Promise<void> {
   if (msg.key.fromMe) return;
+  if (isReactionStub(msg)) return; // reactions decorate; we never persist them
   const remote_jid = msg.key.remoteJid;
   const whatsapp_id = msg.key.id;
   if (!remote_jid || !whatsapp_id) return;
@@ -89,6 +110,11 @@ async function handleIncoming(msg: proto.IWebMessageInfo): Promise<void> {
 
   const phone = remote_jid.split('@')[0]!;
   const tel = '+' + phone;
+
+  if (await checkBotAndMaybeBlock(tel)) {
+    logger.warn({ tel: '[REDACTED]' }, 'baileys.dropped_anomalous_volume');
+    return;
+  }
 
   const { type, content, mediaPath, mediaMime, mediaSha256 } = await extractContent(msg);
 
@@ -113,6 +139,7 @@ async function handleIncoming(msg: proto.IWebMessageInfo): Promise<void> {
   });
 
   await markSeen(whatsapp_id);
+  markRead(remote_jid, whatsapp_id);
   if (duplicate) {
     await audit({ acao: 'duplicate_message_dropped', metadata: { whatsapp_id, source: 'db_unique' } });
     return;
@@ -177,10 +204,19 @@ async function extractContent(msg: proto.IWebMessageInfo): Promise<{
   return { type, content: caption, mediaPath, mediaMime: mime, mediaSha256 };
 }
 
-export async function sendOutboundText(jid: string, text: string): Promise<string | null> {
+export async function sendOutboundText(
+  jid: string,
+  text: string,
+  opts?: { quoted?: WAQuotedContext },
+): Promise<string | null> {
   if (!socket || !connected) {
     logger.warn('baileys.not_connected — cannot send');
     return null;
+  }
+  if (opts?.quoted) {
+    // Baileys' sendMessage accepts `quoted` as third-arg MiscMessageGenerationOptions.
+    const result = await socket.sendMessage(jid, { text }, { quoted: opts.quoted });
+    return result?.key.id ?? null;
   }
   const result = await socket.sendMessage(jid, { text });
   return result?.key.id ?? null;
