@@ -2,6 +2,7 @@ import type { z } from 'zod';
 import type { ActionKey, AuditAction } from '@/governance/audit-actions.js';
 import type { ResolvedPermission } from '@/governance/permissions.js';
 import { registerTransactionTool } from './register-transaction.js';
+import { cancelTransactionTool } from './cancel-transaction.js';
 import { queryBalanceTool } from './query-balance.js';
 import { listTransactionsTool } from './list-transactions.js';
 import { classifyTransactionTool } from './classify-transaction.js';
@@ -46,6 +47,7 @@ export type AnyTool = Tool<z.ZodTypeAny, z.ZodTypeAny>;
 
 export const REGISTRY: Record<string, AnyTool> = {
   register_transaction: registerTransactionTool as unknown as AnyTool,
+  cancel_transaction: cancelTransactionTool as unknown as AnyTool,
   query_balance: queryBalanceTool as unknown as AnyTool,
   list_transactions: listTransactionsTool as unknown as AnyTool,
   classify_transaction: classifyTransactionTool as unknown as AnyTool,
