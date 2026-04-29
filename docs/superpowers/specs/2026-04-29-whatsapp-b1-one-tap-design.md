@@ -80,7 +80,9 @@ export async function sendPoll(
   remote_jid: string,
   question: string,
   options: ReadonlyArray<{ key: string; label: string }>,
-  opts?: { quoted?: WAQuotedContext },
+  // No `quoted` param yet — outbound-quoting of polls is a B2 concern;
+  // including it here would require a Baileys helper that doesn't ergonomically
+  // support both poll messages and quoted contexts in one call.
 ): Promise<{
   whatsapp_id: string | null;
   message_secret: string | null;     // base64; needed to decrypt votes
@@ -215,7 +217,7 @@ Existing `pending_resolved_by_gate` (B0) and `pending_action_dispatched` (B0) co
 
 - All three primitives (poll send, poll dispatch, reaction dispatch) are wrapped `Promise.catch(() => null)` with `logger.warn` at the gateway. Failures never block the inbound stream.
 - `sendPoll` failure: caller falls back to the existing text path. **No user-visible failure.**
-- `getAggregateVotesInPollMessage` failure: drop with audit, retry on next poll-update event (Baileys re-emits state).
+- Decryption / hash-match failure (`decryptPollVote` throws, or no `poll_options[i].label` hash matches the revealed vote): drop with audit `one_tap_dispatch_error`. Baileys typically re-emits the poll-update on reconnect, giving us a second chance.
 
 ## 8. Configuration
 
@@ -239,9 +241,13 @@ None. `metadata.pending_question_id` was added by B0; `metadata.poll_options` is
 B0's `pending-gate.ts` currently inlines the resolve+dispatch in its private `applyTx`. v2 moves that logic into `src/agent/pending-resolver.ts` with the signature in §5.1. The gate becomes:
 
 ```typescript
-// inside checkPendingFirst, after Haiku classify:
+// inside checkPendingFirst, after Haiku classify (full pessoa + conversa
+// rows are already in scope at this point — the gate is called from
+// runAgentForMensagem which loaded both):
 const result = await resolveAndDispatch({
-  pessoa_id, conversa_id, mensagem_id,
+  pessoa,
+  conversa,
+  mensagem_id: input.inbound.id,
   expected_pending_id: snapshot.id,
   option_chosen: resolution.option_chosen!,
   confidence: resolution.confidence,
