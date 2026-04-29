@@ -1,5 +1,7 @@
 import { mensagensRepo, conversasRepo, pessoasRepo } from '@/db/repositories.js';
 import { resolveScope } from '@/governance/permissions.js';
+import { checkPendingFirst } from '@/agent/pending-gate.js';
+import { pendingQuestionsRepo } from '@/db/repositories.js';
 import { buildPrompt } from './prompt-builder.js';
 import { callLLM, type LLMMessage } from '@/lib/claude.js';
 import { logger } from '@/lib/logger.js';
@@ -57,6 +59,38 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
     return;
   }
   const { conversa: c, pessoa } = conv;
+
+  // B0: pre-LLM gate. If the user's reply resolves a pending question,
+  // dispatch the proposed action and skip the full ReAct turn.
+  const gate = await checkPendingFirst({ pessoa, conversa: c, inbound });
+  if (gate.kind === 'resolved') {
+    if (gate.action) {
+      const args = { ...gate.action.args, _pending_choice: gate.option_chosen };
+      await dispatchTool({
+        tool: gate.action.tool,
+        args,
+        ctx: {
+          pessoa,
+          scope: await resolveScope(pessoa),
+          conversa: c,
+          mensagem_id: inbound.id,
+          request_id: uuid(),
+        },
+      });
+      await audit({
+        acao: 'pending_action_dispatched',
+        pessoa_id: pessoa.id,
+        conversa_id: c.id,
+        mensagem_id: inbound.id,
+        metadata: { tool: gate.action.tool, pending_question_id: gate.pending_question_id },
+      });
+    }
+    await mensagensRepo.markProcessed(inbound.id, 0);
+    await conversasRepo.touch(c.id);
+    return;
+  }
+  // 'unresolved' and 'no_pending' fall through to the existing ReAct flow.
+
   const scope = await resolveScope(pessoa);
 
   const { system, messages } = await buildPrompt({
