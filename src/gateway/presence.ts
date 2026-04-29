@@ -103,6 +103,53 @@ export function sendReaction(
     .catch((err: Error) => logger.warn({ err: err.message }, 'presence.reaction_failed'));
 }
 
+export type SendPollResult = {
+  whatsapp_id: string | null;
+  message_secret: string | null; // base64 — needed to decrypt votes
+};
+
+/**
+ * B1: send a native WhatsApp poll. The returned `message_secret` is the
+ * per-poll secret that decryptPollVote() needs to decode incoming votes.
+ * Persist it on the outbound mensagens row so the receive-side handler
+ * can look it up by `metadata.whatsapp_id`.
+ *
+ * No-op when FEATURE_ONE_TAP is off OR Baileys is disconnected — caller
+ * falls back to a plain-text question + numbered list.
+ */
+export async function sendPoll(
+  remote_jid: string,
+  question: string,
+  options: ReadonlyArray<{ key: string; label: string }>,
+): Promise<SendPollResult> {
+  if (!config.FEATURE_ONE_TAP) return { whatsapp_id: null, message_secret: null };
+  if (!isBaileysConnected()) return { whatsapp_id: null, message_secret: null };
+  if (!validJid(remote_jid)) {
+    logger.warn({ remote_jid: '[REDACTED]' }, 'presence.invalid_jid_send_poll');
+    return { whatsapp_id: null, message_secret: null };
+  }
+  const sock = getSocket();
+  if (!sock) return { whatsapp_id: null, message_secret: null };
+  try {
+    const result = await sock.sendMessage(remote_jid, {
+      poll: {
+        name: question,
+        values: options.map((o) => o.label),
+        selectableCount: 1,
+      },
+    });
+    const secretBuf = (result?.message?.messageContextInfo as { messageSecret?: Uint8Array } | undefined)
+      ?.messageSecret;
+    return {
+      whatsapp_id: result?.key?.id ?? null,
+      message_secret: secretBuf ? Buffer.from(secretBuf).toString('base64') : null,
+    };
+  } catch (err) {
+    logger.warn({ err: (err as Error).message }, 'presence.send_poll_failed');
+    return { whatsapp_id: null, message_secret: null };
+  }
+}
+
 const QUOTED_TRUNCATE = 200;
 
 export function quotedReplyContext(
