@@ -120,30 +120,10 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
   }
 
   // B0: pre-LLM gate. If the user's reply resolves a pending question,
-  // dispatch the proposed action and skip the full ReAct turn.
+  // the gate (via resolveAndDispatch) has already executed the proposed
+  // action and audited it; we just close the loop and skip the ReAct turn.
   const gate = await checkPendingFirst({ pessoa, conversa: c, inbound });
   if (gate.kind === 'resolved') {
-    if (gate.action) {
-      const args = { ...gate.action.args, _pending_choice: gate.option_chosen };
-      await dispatchTool({
-        tool: gate.action.tool,
-        args,
-        ctx: {
-          pessoa,
-          scope: await resolveScope(pessoa),
-          conversa: c,
-          mensagem_id: inbound.id,
-          request_id: uuid(),
-        },
-      });
-      await audit({
-        acao: 'pending_action_dispatched',
-        pessoa_id: pessoa.id,
-        conversa_id: c.id,
-        mensagem_id: inbound.id,
-        metadata: { tool: gate.action.tool, pending_question_id: gate.pending_question_id },
-      });
-    }
     await mensagensRepo.markProcessed(inbound.id, 0);
     await conversasRepo.touch(c.id);
     return;
@@ -162,7 +142,10 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
   const tools = getToolSchemas(scope.byEntity);
   let totalTokens = 0;
   const conversation: LLMMessage[] = messages;
-  let latestPendingId: string | null = null;
+  let latestPending: {
+    id: string;
+    opcoes_validas: Array<{ key: string; label: string }>;
+  } | null = null;
 
   const jid = pessoa.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
   const stopTyping = scheduleTypingDebounce(jid, inbound.id);
@@ -174,15 +157,24 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
       if (res.tool_uses.length === 0) {
         const text = res.content?.trim() ?? '';
         if (text) {
-          const shouldQuote =
-            (inbound.conteudo && detectCorrection(inbound.conteudo)) ||
-            getActivePending(c) !== null;
-          await sendOutbound(pessoa.id, c.id, text, inbound.id, {
-            pending_question_id: latestPendingId,
-            quoted: shouldQuote
-              ? quotedReplyContext(inbound.metadata as Record<string, unknown> | null, inbound.conteudo)
-              : undefined,
-          });
+          const usePoll =
+            latestPending &&
+            config.FEATURE_ONE_TAP &&
+            latestPending.opcoes_validas.length >= 3 &&
+            latestPending.opcoes_validas.length <= 12;
+          if (usePoll && latestPending) {
+            await sendOutboundPoll(pessoa.id, c.id, text, inbound.id, latestPending);
+          } else {
+            const shouldQuote =
+              (inbound.conteudo && detectCorrection(inbound.conteudo)) ||
+              getActivePending(c) !== null;
+            await sendOutbound(pessoa.id, c.id, text, inbound.id, {
+              pending_question_id: latestPending?.id ?? null,
+              quoted: shouldQuote
+                ? quotedReplyContext(inbound.metadata as Record<string, unknown> | null, inbound.conteudo)
+                : undefined,
+            });
+          }
         }
         break;
       }
@@ -223,15 +215,24 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
           'pending_question_id' in out &&
           typeof (out as { pending_question_id: string }).pending_question_id === 'string'
         ) {
-          const candidate = (out as { pending_question_id: string }).pending_question_id;
+          const candidate = out as {
+            pending_question_id: string;
+            opcoes_validas: Array<{ key: string; label: string }>;
+          };
+          // Re-validate that the candidate is still 'aberta'. Defends against
+          // dispatcher-cache returning a stale id from a prior retry within the
+          // 5-min idempotency bucket.
           const stillActive = await pendingQuestionsRepo
             .findActiveSnapshot(c.id)
             .catch(() => null);
-          if (stillActive && stillActive.id === candidate) {
-            latestPendingId = candidate;
+          if (stillActive && stillActive.id === candidate.pending_question_id) {
+            latestPending = {
+              id: candidate.pending_question_id,
+              opcoes_validas: candidate.opcoes_validas,
+            };
           } else {
             logger.warn(
-              { tool: tu.tool, candidate, conversa_id: c.id },
+              { tool: tu.tool, candidate: candidate.pending_question_id, conversa_id: c.id },
               'agent.stale_pending_id_dropped',
             );
           }
@@ -319,6 +320,49 @@ async function sendOutbound(
     ferramentas_chamadas: [],
     tokens_usados: null,
   });
+}
+
+async function sendOutboundPoll(
+  pessoa_id: string,
+  conversa_id: string,
+  text: string,
+  in_reply_to: string,
+  pending: { id: string; opcoes_validas: Array<{ key: string; label: string }> },
+): Promise<{ fell_back: boolean }> {
+  const pessoa = await pessoasRepo.findById(pessoa_id);
+  if (!pessoa) return { fell_back: false };
+  const jid = pessoa.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
+  const { sendPoll } = await import('@/gateway/presence.js');
+  const sent = await sendPoll(jid, text, pending.opcoes_validas);
+  // Without all three (whatsapp_id, message_secret, creator_jid) the inbound
+  // vote can't be decrypted (creator_jid feeds the HMAC in decryptPollVote),
+  // so the user would see a poll they can't actually answer. Fall back.
+  if (!sent.whatsapp_id || !sent.message_secret || !sent.creator_jid) {
+    const numbered = pending.opcoes_validas.map((o, i) => `${i + 1}. ${o.label}`).join('\n');
+    await sendOutbound(pessoa_id, conversa_id, `${text}\n\n${numbered}`, in_reply_to, {
+      pending_question_id: pending.id,
+    });
+    return { fell_back: true };
+  }
+  await mensagensRepo.create({
+    conversa_id,
+    direcao: 'out',
+    tipo: 'texto',
+    conteudo: text,
+    midia_url: null,
+    metadata: {
+      whatsapp_id: sent.whatsapp_id,
+      in_reply_to,
+      pending_question_id: pending.id,
+      poll_options: pending.opcoes_validas,
+      poll_message_secret: sent.message_secret,
+      poll_creator_jid: sent.creator_jid,
+    },
+    processada_em: new Date(),
+    ferramentas_chamadas: [],
+    tokens_usados: null,
+  });
+  return { fell_back: false };
 }
 
 async function loadConversaWithPessoa(conversa_id: string) {

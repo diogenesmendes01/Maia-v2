@@ -1,3 +1,4 @@
+import { jidNormalizedUser } from '@whiskeysockets/baileys';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 import { isBaileysConnected, getSocket } from './baileys.js';
@@ -101,6 +102,62 @@ export function sendReaction(
       react: { text: emoji, key: { remoteJid: remote_jid, id: whatsapp_id, fromMe: false } },
     })
     .catch((err: Error) => logger.warn({ err: err.message }, 'presence.reaction_failed'));
+}
+
+export type SendPollResult = {
+  whatsapp_id: string | null;
+  message_secret: string | null; // base64 — needed to decrypt votes
+  // Normalized JID of the poll creator (Maia). Baileys derives the same value
+  // via `getKeyAuthor(creationKey, meIdNormalised)` for fromMe creation keys
+  // and uses it as `pollCreatorJid` in the decryptPollVote HMAC. Persist it
+  // so the receive-side handler doesn't have to guess (the inbound vote's
+  // remoteJid is the user, not the creator).
+  creator_jid: string | null;
+};
+
+/**
+ * B1: send a native WhatsApp poll. The returned `message_secret` is the
+ * per-poll secret that decryptPollVote() needs to decode incoming votes.
+ * Persist it on the outbound mensagens row so the receive-side handler
+ * can look it up by `metadata.whatsapp_id`.
+ *
+ * No-op when FEATURE_ONE_TAP is off OR Baileys is disconnected — caller
+ * falls back to a plain-text question + numbered list.
+ */
+export async function sendPoll(
+  remote_jid: string,
+  question: string,
+  options: ReadonlyArray<{ key: string; label: string }>,
+): Promise<SendPollResult> {
+  const empty: SendPollResult = { whatsapp_id: null, message_secret: null, creator_jid: null };
+  if (!config.FEATURE_ONE_TAP) return empty;
+  if (!isBaileysConnected()) return empty;
+  if (!validJid(remote_jid)) {
+    logger.warn({ remote_jid: '[REDACTED]' }, 'presence.invalid_jid_send_poll');
+    return empty;
+  }
+  const sock = getSocket();
+  if (!sock) return empty;
+  try {
+    const result = await sock.sendMessage(remote_jid, {
+      poll: {
+        name: question,
+        values: options.map((o) => o.label),
+        selectableCount: 1,
+      },
+    });
+    const secretBuf = (result?.message?.messageContextInfo as { messageSecret?: Uint8Array } | undefined)
+      ?.messageSecret;
+    const meId = sock.user?.id ? jidNormalizedUser(sock.user.id) : null;
+    return {
+      whatsapp_id: result?.key?.id ?? null,
+      message_secret: secretBuf ? Buffer.from(secretBuf).toString('base64') : null,
+      creator_jid: meId && meId.length > 0 ? meId : null,
+    };
+  } catch (err) {
+    logger.warn({ err: (err as Error).message }, 'presence.send_poll_failed');
+    return empty;
+  }
 }
 
 const QUOTED_TRUNCATE = 200;

@@ -69,6 +69,11 @@ export const AUDIT_ACTIONS = [
   'pending_substituted',
   'pending_action_dispatched',
   'pending_race_lost',
+  'pending_resolved_by_reaction',
+  'pending_resolved_by_poll',
+  'reaction_ignored_unmapped_emoji',
+  'one_tap_no_pending_anchor',
+  'one_tap_dispatch_error',
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];

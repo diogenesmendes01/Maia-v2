@@ -135,6 +135,10 @@ export const conversasRepo = {
       .limit(1);
     return rows[0] ?? null;
   },
+  async byId(id: string): Promise<Conversa | null> {
+    const rows = await db.select().from(conversas).where(eq(conversas.id, id)).limit(1);
+    return rows[0] ?? null;
+  },
   async create(input: {
     pessoa_id: string;
     escopo_entidades: string[];

@@ -22,7 +22,11 @@ const inputSchema = z.object({
 });
 
 const outputSchema = z.union([
-  z.object({ pending_question_id: z.string() }),
+  z.object({
+    pending_question_id: z.string(),
+    opcoes_count: z.number().int().min(2).max(12),
+    opcoes_validas: z.array(z.object({ key: z.string(), label: z.string() })),
+  }),
   z.object({ error: z.string() }),
 ]);
 
@@ -87,6 +91,10 @@ export const askPendingQuestionTool: Tool<typeof inputSchema, typeof outputSchem
       return row;
     });
 
-    return { pending_question_id: created.id };
+    return {
+      pending_question_id: created.id,
+      opcoes_count: args.opcoes_validas.length,
+      opcoes_validas: args.opcoes_validas,
+    };
   },
 };

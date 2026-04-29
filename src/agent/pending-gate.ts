@@ -4,16 +4,12 @@ import { callLLM } from '@/lib/claude.js';
 import { pendingQuestionsRepo } from '@/db/repositories.js';
 import { withTx } from '@/db/client.js';
 import { audit } from '@/governance/audit.js';
+import { resolveAndDispatch } from './pending-resolver.js';
 import type { Pessoa, Conversa, Mensagem } from '@/db/schema.js';
 
 export type GateResult =
   | { kind: 'no_pending' }
-  | {
-      kind: 'resolved';
-      action?: { tool: string; args: Record<string, unknown> };
-      option_chosen: string;
-      pending_question_id: string;
-    }
+  | { kind: 'resolved' }
   | { kind: 'unresolved'; reason: 'low_confidence' | 'topic_change' | 'cancelled' };
 
 const CONFIDENCE_THRESHOLD = 0.7;
@@ -95,7 +91,6 @@ export async function checkPendingFirst(input: {
   const resolution = await _classifier(snapshot, input.inbound);
   if (!resolution) return { kind: 'unresolved', reason: 'low_confidence' };
 
-  // Step 3 + 4 (Task 9 fills this in)
   return await applyTx(snapshot.id, snapshot, resolution, input);
 }
 
@@ -105,90 +100,60 @@ async function applyTx(
   resolution: ClassifyOut,
   input: { pessoa: Pessoa; conversa: Conversa; inbound: Mensagem },
 ): Promise<GateResult> {
-  return await withTx(async (tx) => {
-    const locked = await pendingQuestionsRepo.findActiveForUpdate(tx, input.conversa.id);
-    if (!locked || locked.id !== snapshot_id) {
-      // Race lost — someone else resolved or cancelled while Haiku was running.
+  // Topic change / explicit cancellation short-circuit without touching
+  // resolveAndDispatch — that helper is for SUCCESSFUL resolutions only.
+  // Both audit actions (pending_cancelled, pending_unresolved_topic_change)
+  // already exist in the closed taxonomy from prior PRs.
+  if (resolution.is_topic_change || resolution.is_cancellation) {
+    const reason = resolution.is_cancellation ? 'cancelled' : 'topic_change';
+    const cancel_reason = resolution.is_cancellation ? 'user_cancelled' : 'topic_change';
+    const audit_acao =
+      resolution.is_cancellation ? 'pending_cancelled' : 'pending_unresolved_topic_change';
+    return await withTx(async (tx) => {
+      const locked = await pendingQuestionsRepo.findActiveForUpdate(tx, input.conversa.id);
+      if (!locked || locked.id !== snapshot_id) return { kind: 'no_pending' };
+      await pendingQuestionsRepo.cancelTx(tx, snapshot_id, cancel_reason);
       await audit({
-        acao: 'pending_race_lost',
-        pessoa_id: input.pessoa.id,
-        conversa_id: input.conversa.id,
-        mensagem_id: input.inbound.id,
-        metadata: { pending_question_id: snapshot_id },
-      });
-      return { kind: 'no_pending' as const };
-    }
-
-    // Explicit cancellation and "user moved to a different topic" are both
-    // reasons to drop the pending, but they're product-distinct: cancellation
-    // is intentional ("não, deixa pra lá"), topic change is implicit ("ah,
-    // outra coisa: …"). Use distinct cancel reasons + audit actions so the
-    // log can answer "was this question abandoned or cancelled?" later.
-    if (resolution.is_cancellation) {
-      await pendingQuestionsRepo.cancelTx(tx, snapshot_id, 'cancelled');
-      await audit({
-        acao: 'pending_unresolved_cancelled',
+        acao: audit_acao as never,
         pessoa_id: input.pessoa.id,
         conversa_id: input.conversa.id,
         mensagem_id: input.inbound.id,
         alvo_id: snapshot_id,
       });
-      return { kind: 'unresolved' as const, reason: 'cancelled' as const };
-    }
-    if (resolution.is_topic_change) {
-      await pendingQuestionsRepo.cancelTx(tx, snapshot_id, 'topic_change');
-      await audit({
-        acao: 'pending_unresolved_topic_change',
-        pessoa_id: input.pessoa.id,
-        conversa_id: input.conversa.id,
-        mensagem_id: input.inbound.id,
-        alvo_id: snapshot_id,
-      });
-      return { kind: 'unresolved' as const, reason: 'topic_change' as const };
-    }
-
-    const opts = snapshot.opcoes_validas as Array<{ key: string; label: string }>;
-    const validKeys = new Set(opts.map((o) => o.key));
-    const isResolved =
-      resolution.resolves_pending &&
-      resolution.confidence >= CONFIDENCE_THRESHOLD &&
-      typeof resolution.option_chosen === 'string' &&
-      validKeys.has(resolution.option_chosen);
-
-    if (!isResolved) {
-      await audit({
-        acao: 'pending_unresolved_low_confidence',
-        pessoa_id: input.pessoa.id,
-        conversa_id: input.conversa.id,
-        mensagem_id: input.inbound.id,
-        alvo_id: snapshot_id,
-        metadata: { confidence: resolution.confidence ?? null },
-      });
-      return { kind: 'unresolved' as const, reason: 'low_confidence' as const };
-    }
-
-    await pendingQuestionsRepo.resolveTx(tx, snapshot_id, {
-      option_chosen: resolution.option_chosen,
-      confidence: resolution.confidence,
+      return { kind: 'unresolved', reason };
     });
+  }
+
+  const opts = snapshot.opcoes_validas as Array<{ key: string; label: string }>;
+  const validKeys = new Set(opts.map((o) => o.key));
+  const isResolved =
+    resolution.resolves_pending &&
+    resolution.confidence >= CONFIDENCE_THRESHOLD &&
+    typeof resolution.option_chosen === 'string' &&
+    validKeys.has(resolution.option_chosen);
+
+  if (!isResolved) {
     await audit({
-      acao: 'pending_resolved_by_gate',
+      acao: 'pending_unresolved_low_confidence',
       pessoa_id: input.pessoa.id,
       conversa_id: input.conversa.id,
       mensagem_id: input.inbound.id,
       alvo_id: snapshot_id,
-      metadata: { option_chosen: resolution.option_chosen },
+      metadata: { confidence: resolution.confidence ?? null },
     });
+    return { kind: 'unresolved', reason: 'low_confidence' };
+  }
 
-    const action = (snapshot.acao_proposta ?? {}) as {
-      tool?: string;
-      args?: Record<string, unknown>;
-    };
-    return {
-      kind: 'resolved' as const,
-      action: action.tool ? { tool: action.tool, args: action.args ?? {} } : undefined,
-      option_chosen: resolution.option_chosen!,
-      pending_question_id: snapshot_id,
-    };
+  const result = await resolveAndDispatch({
+    pessoa: input.pessoa,
+    conversa: input.conversa,
+    mensagem_id: input.inbound.id,
+    expected_pending_id: snapshot_id,
+    option_chosen: resolution.option_chosen!,
+    confidence: resolution.confidence,
+    source: 'gate',
   });
+
+  if (!result.resolved) return { kind: 'no_pending' };
+  return { kind: 'resolved' };
 }

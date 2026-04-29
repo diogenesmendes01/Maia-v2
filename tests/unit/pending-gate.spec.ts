@@ -2,17 +2,18 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const findActiveSnapshot = vi.fn();
 const findActiveForUpdate = vi.fn();
-const resolveTx = vi.fn();
 const cancelTx = vi.fn();
 
 vi.mock('../../src/db/repositories.js', () => ({
   pendingQuestionsRepo: {
     findActiveSnapshot,
     findActiveForUpdate,
-    resolveTx,
     cancelTx,
   },
 }));
+
+const resolveAndDispatch = vi.fn();
+vi.mock('../../src/agent/pending-resolver.js', () => ({ resolveAndDispatch }));
 
 const callLLM = vi.fn();
 vi.mock('../../src/lib/claude.js', () => ({ callLLM }));
@@ -37,8 +38,8 @@ const inbound = { id: 'm1', conteudo: 'sim' } as never;
 beforeEach(() => {
   findActiveSnapshot.mockReset();
   findActiveForUpdate.mockReset();
-  resolveTx.mockReset();
   cancelTx.mockReset();
+  resolveAndDispatch.mockReset();
   callLLM.mockReset();
   audit.mockReset();
 });
@@ -60,20 +61,20 @@ describe('pending-gate — snapshot path', () => {
       acao_proposta: { tool: 'register_transaction', args: { valor: 50 } },
     });
     callLLM.mockResolvedValueOnce({
-      content: '{"resolves_pending":false,"confidence":0.4}',
+      content: '{"resolves_pending":true,"option_chosen":"sim","confidence":0.95}',
       usage: { input_tokens: 0, output_tokens: 0 },
       tool_uses: [],
       stop_reason: 'end_turn',
       model: 'haiku',
     });
-    findActiveForUpdate.mockResolvedValueOnce(null); // simulate someone else won
+    resolveAndDispatch.mockResolvedValueOnce({ resolved: false, race_lost: true });
     const { checkPendingFirst } = await import('../../src/agent/pending-gate.js');
     const out = await checkPendingFirst({ pessoa, conversa, inbound });
     expect(callLLM).toHaveBeenCalledTimes(1);
     const args = callLLM.mock.calls[0]![0];
     expect(args.messages[0].content).toContain('Confirma?');
     expect(args.messages[0].content).toContain('sim');
-    expect(out.kind).toBe('no_pending'); // re-check failed → no_pending
+    expect(out.kind).toBe('no_pending'); // race lost → no_pending
   });
 });
 
@@ -92,19 +93,22 @@ describe('pending-gate — resolve path', () => {
       stop_reason: 'end_turn',
       model: 'haiku',
     });
-    findActiveForUpdate.mockResolvedValueOnce({
-      id: 'pq-1',
-      acao_proposta: { tool: 'register_transaction', args: { valor: 50 } },
+    resolveAndDispatch.mockResolvedValueOnce({
+      resolved: true,
+      action_tool: 'register_transaction',
     });
-    resolveTx.mockResolvedValueOnce(undefined);
     const { checkPendingFirst } = await import('../../src/agent/pending-gate.js');
     const out = await checkPendingFirst({ pessoa, conversa, inbound });
     expect(out.kind).toBe('resolved');
-    if (out.kind === 'resolved') {
-      expect(out.option_chosen).toBe('sim');
-      expect(out.action).toEqual({ tool: 'register_transaction', args: { valor: 50 } });
-    }
-    expect(resolveTx).toHaveBeenCalled();
+    expect(resolveAndDispatch).toHaveBeenCalledTimes(1);
+    expect(resolveAndDispatch.mock.calls[0]![0]).toMatchObject({
+      pessoa,
+      conversa,
+      mensagem_id: 'm1',
+      expected_pending_id: 'pq-1',
+      option_chosen: 'sim',
+      source: 'gate',
+    });
   });
 
   it('topic change cancels the row with reason "topic_change" and audits accordingly', async () => {
@@ -130,11 +134,12 @@ describe('pending-gate — resolve path', () => {
     const audits = audit.mock.calls.filter((c) => c[0].acao === 'pending_unresolved_topic_change');
     expect(audits.length).toBe(1);
     // Cancellation must NOT be audited under topic_change.
-    const wrongAudit = audit.mock.calls.filter((c) => c[0].acao === 'pending_unresolved_cancelled');
+    const wrongAudit = audit.mock.calls.filter((c) => c[0].acao === 'pending_cancelled');
     expect(wrongAudit.length).toBe(0);
+    expect(resolveAndDispatch).not.toHaveBeenCalled();
   });
 
-  it('explicit cancellation cancels with reason "cancelled" and audits separately', async () => {
+  it('explicit cancellation cancels with reason "user_cancelled" and audits separately', async () => {
     findActiveSnapshot.mockResolvedValueOnce({
       id: 'pq-cancel',
       pergunta: 'Confirma?',
@@ -153,14 +158,15 @@ describe('pending-gate — resolve path', () => {
     const { checkPendingFirst } = await import('../../src/agent/pending-gate.js');
     const out = await checkPendingFirst({ pessoa, conversa, inbound });
     expect(out).toEqual({ kind: 'unresolved', reason: 'cancelled' });
-    expect(cancelTx).toHaveBeenCalledWith(expect.anything(), 'pq-cancel', 'cancelled');
-    const audits = audit.mock.calls.filter((c) => c[0].acao === 'pending_unresolved_cancelled');
+    expect(cancelTx).toHaveBeenCalledWith(expect.anything(), 'pq-cancel', 'user_cancelled');
+    const audits = audit.mock.calls.filter((c) => c[0].acao === 'pending_cancelled');
     expect(audits.length).toBe(1);
     // Topic-change audit must NOT fire on explicit cancellation.
     const topicAudits = audit.mock.calls.filter(
       (c) => c[0].acao === 'pending_unresolved_topic_change',
     );
     expect(topicAudits.length).toBe(0);
+    expect(resolveAndDispatch).not.toHaveBeenCalled();
   });
 
   it('low confidence: no DB write, audits pending_unresolved_low_confidence', async () => {
@@ -177,12 +183,11 @@ describe('pending-gate — resolve path', () => {
       stop_reason: 'end_turn',
       model: 'haiku',
     });
-    findActiveForUpdate.mockResolvedValueOnce({ id: 'pq-3', acao_proposta: {} });
     const { checkPendingFirst } = await import('../../src/agent/pending-gate.js');
     const out = await checkPendingFirst({ pessoa, conversa, inbound });
     expect(out).toEqual({ kind: 'unresolved', reason: 'low_confidence' });
-    expect(resolveTx).not.toHaveBeenCalled();
     expect(cancelTx).not.toHaveBeenCalled();
+    expect(resolveAndDispatch).not.toHaveBeenCalled();
     const lc = audit.mock.calls.filter((c) => c[0].acao === 'pending_unresolved_low_confidence');
     expect(lc.length).toBe(1);
   });
@@ -201,12 +206,9 @@ describe('pending-gate — resolve path', () => {
       stop_reason: 'end_turn',
       model: 'haiku',
     });
-    findActiveForUpdate.mockResolvedValueOnce(null);
+    resolveAndDispatch.mockResolvedValueOnce({ resolved: false, race_lost: true });
     const { checkPendingFirst } = await import('../../src/agent/pending-gate.js');
     const out = await checkPendingFirst({ pessoa, conversa, inbound });
     expect(out).toEqual({ kind: 'no_pending' });
-    const lost = audit.mock.calls.filter((c) => c[0].acao === 'pending_race_lost');
-    expect(lost.length).toBe(1);
-    expect(lost[0][0].metadata.pending_question_id).toBe('pq-4');
   });
 });
