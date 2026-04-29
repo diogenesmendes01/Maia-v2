@@ -10,6 +10,7 @@ import {
   date,
   primaryKey,
   unique,
+  index,
 } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 
@@ -327,42 +328,63 @@ export const dead_letter_jobs = pgTable('dead_letter_jobs', {
   created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
-export const import_runs = pgTable('import_runs', {
-  id: uuid('id').primaryKey().defaultRandom(),
-  pessoa_id: uuid('pessoa_id').notNull(),
-  entidade_id: uuid('entidade_id').notNull(),
-  conta_id: uuid('conta_id').notNull(),
-  fonte: text('fonte').notNull(),
-  arquivo_sha256: text('arquivo_sha256').notNull(),
-  arquivo_nome: text('arquivo_nome'),
-  periodo_de: date('periodo_de'),
-  periodo_ate: date('periodo_ate'),
-  total_lancamentos: integer('total_lancamentos').notNull().default(0),
-  matched: integer('matched').notNull().default(0),
-  candidates: integer('candidates').notNull().default(0),
-  novos: integer('novos').notNull().default(0),
-  status: text('status').notNull(),
-  metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
-  created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
-  updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
-});
+export const import_runs = pgTable(
+  'import_runs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    pessoa_id: uuid('pessoa_id').notNull(),
+    entidade_id: uuid('entidade_id').notNull(),
+    conta_id: uuid('conta_id').notNull(),
+    fonte: text('fonte').notNull(),
+    arquivo_sha256: text('arquivo_sha256').notNull(),
+    arquivo_nome: text('arquivo_nome'),
+    periodo_de: date('periodo_de'),
+    periodo_ate: date('periodo_ate'),
+    total_lancamentos: integer('total_lancamentos').notNull().default(0),
+    matched: integer('matched').notNull().default(0),
+    candidates: integer('candidates').notNull().default(0),
+    novos: integer('novos').notNull().default(0),
+    status: text('status').notNull(),
+    metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    // Mirrors `UNIQUE (conta_id, arquivo_sha256)` from migrations/002 §188 —
+    // prevents the same file being imported twice into the same account.
+    arquivo_uniq: unique().on(t.conta_id, t.arquivo_sha256),
+  }),
+);
 
-export const import_entries = pgTable('import_entries', {
-  id: uuid('id').primaryKey().defaultRandom(),
-  import_run_id: uuid('import_run_id').notNull(),
-  ordem: integer('ordem').notNull(),
-  tipo_oper: text('tipo_oper').notNull(),
-  valor: numeric('valor', { precision: 15, scale: 2 }).notNull(),
-  data_oper: date('data_oper').notNull(),
-  fitid: text('fitid'),
-  memo: text('memo'),
-  contraparte_raw: text('contraparte_raw'),
-  status: text('status').notNull(),
-  matched_transacao_id: uuid('matched_transacao_id'),
-  candidates: jsonb('candidates'),
-  resolved_at: timestamp('resolved_at', { withTimezone: true }),
-  created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
-});
+export const import_entries = pgTable(
+  'import_entries',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    import_run_id: uuid('import_run_id').notNull(),
+    ordem: integer('ordem').notNull(),
+    tipo_oper: text('tipo_oper').notNull(),
+    valor: numeric('valor', { precision: 15, scale: 2 }).notNull(),
+    data_oper: date('data_oper').notNull(),
+    fitid: text('fitid'),
+    memo: text('memo'),
+    contraparte_raw: text('contraparte_raw'),
+    status: text('status').notNull(),
+    matched_transacao_id: uuid('matched_transacao_id'),
+    candidates: jsonb('candidates'),
+    resolved_at: timestamp('resolved_at', { withTimezone: true }),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    // Mirrors `idx_import_entries_run` from migrations/002 §208.
+    by_run: index('idx_import_entries_run').on(t.import_run_id, t.ordem),
+  }),
+);
+
+// FKs (pessoas/entidades/contas/transacoes) and CHECK constraints (fonte,
+// status, tipo_oper) live in migrations/002_specs_v1.sql and are enforced by
+// Postgres. We don't redeclare them in the Drizzle schema because no other
+// table in this file does — keeping it consistent with the surrounding code.
+// The migration is the source of truth; this schema is the typing layer.
 
 export const audit_log = pgTable('audit_log', {
   id: uuid('id').primaryKey().defaultRandom(),
