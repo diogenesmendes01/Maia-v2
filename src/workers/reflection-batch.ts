@@ -3,7 +3,6 @@ import { audit_log } from '@/db/schema.js';
 import { sql } from 'drizzle-orm';
 import { logger } from '@/lib/logger.js';
 import { callLLM } from '@/lib/claude.js';
-import { config } from '@/config/env.js';
 import { rulesRepo } from '@/db/repositories.js';
 import { audit } from '@/governance/audit.js';
 import { writeMemory } from '@/memory/vector.js';
@@ -14,6 +13,8 @@ import {
 } from '@/agent/reflection-clustering.js';
 
 const MAX_LLM_CALLS = 200;
+const VALID_TIPOS = ['classificacao', 'identificacao_entidade'] as const;
+type ValidTipo = (typeof VALID_TIPOS)[number];
 
 type AuditRow = {
   acao: string;
@@ -24,7 +25,7 @@ type AuditRow = {
 
 type Proposal = {
   applicable: boolean;
-  tipo?: 'classificacao' | 'identificacao_entidade' | 'tom_resposta' | 'recorrencia';
+  tipo?: ValidTipo;
   contexto?: string;
   acao?: string;
   contexto_jsonb?: Record<string, unknown>;
@@ -73,7 +74,14 @@ export async function runReflectionBatch(): Promise<void> {
 
     const proposal = await proposeRule(cluster);
     llmCalls++;
-    if (!proposal || !proposal.applicable || !proposal.tipo || !proposal.contexto || !proposal.acao) {
+    if (
+      !proposal ||
+      !proposal.applicable ||
+      !proposal.tipo ||
+      !VALID_TIPOS.includes(proposal.tipo as ValidTipo) ||
+      !proposal.contexto ||
+      !proposal.acao
+    ) {
       continue;
     }
 
@@ -144,7 +152,6 @@ async function proposeRule(cluster: Cluster): Promise<Proposal | null> {
       max_tokens: 400,
       temperature: 0.0,
     });
-    void config; // model selection respects env via callLLM (Sonnet→Haiku fallback already wired)
     const text = res.content?.trim() ?? '';
     const m = text.match(/\{[\s\S]*\}/);
     if (!m) return null;
