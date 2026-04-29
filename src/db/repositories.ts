@@ -477,10 +477,18 @@ export const rulesRepo = {
   },
 };
 
+// `metadata` is `notNull()` in the schema (with `default '{}'::jsonb`) which
+// makes it required on the inferred select type. Existing callers (e.g.
+// src/identity/quarantine.ts) that predate the column don't pass metadata —
+// the DB default is what they want. We strip metadata from the Omit and
+// add it back as optional so those call sites keep typechecking.
+type PendingQuestionInsert = Omit<
+  PendingQuestion,
+  'id' | 'created_at' | 'resolvida_em' | 'resposta' | 'metadata'
+> & { metadata?: object };
+
 export const pendingQuestionsRepo = {
-  async create(
-    input: Omit<PendingQuestion, 'id' | 'created_at' | 'resolvida_em' | 'resposta'>,
-  ): Promise<PendingQuestion> {
+  async create(input: PendingQuestionInsert): Promise<PendingQuestion> {
     const rows = await db.insert(pending_questions).values(input).returning();
     return rows[0]!;
   },
@@ -588,7 +596,7 @@ export const pendingQuestionsRepo = {
 
   async createTx(
     tx: typeof db,
-    input: Omit<PendingQuestion, 'id' | 'created_at' | 'resolvida_em' | 'resposta'>,
+    input: PendingQuestionInsert,
   ): Promise<PendingQuestion> {
     // Insert inside the same tx as the cancel — required by the partial unique
     // index `(conversa_id) WHERE status='aberta'` from migration 004. Doing
