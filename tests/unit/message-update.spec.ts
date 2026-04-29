@@ -181,3 +181,31 @@ describe('routeMessageUpdate — side-effect detected', () => {
     expect(auditMock.mock.calls.some((c) => c[0].acao === 'mensagem_revoked_after_side_effect')).toBe(true);
   });
 });
+
+describe('routeMessageUpdate — Baileys envelope contract (v6.7.0)', () => {
+  // These tests pin the exact event-shape Task 9's listener relies on. If a
+  // future Baileys upgrade renames `editedMessage` or restructures
+  // `update.update.message`, these break loudly so the listener gets fixed
+  // before users notice silently-dropped edits.
+  it('routeMessageUpdate accepts { key, message } with editedMessage shape', async () => {
+    findByWhatsappIdMock.mockResolvedValueOnce(null); // unknown original → silent return
+    const { routeMessageUpdate } = await import('../../src/agent/message-update.js');
+    const fixture = {
+      key: { id: 'WAID-edit', remoteJid: 'jid' },
+      message: { editedMessage: { message: { conversation: 'novo conteudo' } } },
+    };
+    await expect(routeMessageUpdate(fixture as never)).resolves.toBeUndefined();
+  });
+
+  it('routeMessageUpdate accepts protocolMessage type=0 for revoke', async () => {
+    findByWhatsappIdMock.mockResolvedValueOnce(null);
+    const { routeMessageUpdate } = await import('../../src/agent/message-update.js');
+    const fixture = {
+      key: { id: 'WAID-revoke', remoteJid: 'jid' },
+      message: {
+        protocolMessage: { type: 0, key: { id: 'WAID-target', remoteJid: 'jid' } },
+      },
+    };
+    await expect(routeMessageUpdate(fixture as never)).resolves.toBeUndefined();
+  });
+});
