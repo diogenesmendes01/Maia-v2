@@ -103,6 +103,7 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
   const tools = getToolSchemas(scope.byEntity);
   let totalTokens = 0;
   const conversation: LLMMessage[] = messages;
+  let latestPendingId: string | null = null;
 
   for (let i = 0; i < MAX_REACT_ITERATIONS; i++) {
     const res = await callLLM({ system, messages: conversation, tools, max_tokens: 1024 });
@@ -111,7 +112,9 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
     if (res.tool_uses.length === 0) {
       const text = res.content?.trim() ?? '';
       if (text) {
-        await sendOutbound(pessoa.id, c.id, text, inbound.id);
+        await sendOutbound(pessoa.id, c.id, text, inbound.id, {
+          pending_question_id: latestPendingId,
+        });
       }
       break;
     }
@@ -142,6 +145,29 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
         },
       });
       const isError = typeof out === 'object' && out !== null && 'error' in out;
+      if (
+        tu.tool === 'ask_pending_question' &&
+        typeof out === 'object' &&
+        out !== null &&
+        'pending_question_id' in out &&
+        typeof (out as { pending_question_id: string }).pending_question_id === 'string'
+      ) {
+        const candidate = (out as { pending_question_id: string }).pending_question_id;
+        // Re-validate that the candidate is still 'aberta'. Defends against
+        // dispatcher-cache returning a stale id from a prior retry within the
+        // 5-min idempotency bucket.
+        const stillActive = await pendingQuestionsRepo
+          .findActiveSnapshot(c.id)
+          .catch(() => null);
+        if (stillActive && stillActive.id === candidate) {
+          latestPendingId = candidate;
+        } else {
+          logger.warn(
+            { tool: tu.tool, candidate, conversa_id: c.id },
+            'agent.stale_pending_id_dropped',
+          );
+        }
+      }
       results.push({
         type: 'tool_result' as const,
         tool_use_id: tu.id,
@@ -181,18 +207,21 @@ async function sendOutbound(
   conversa_id: string,
   text: string,
   in_reply_to: string,
+  opts?: { pending_question_id?: string | null },
 ): Promise<void> {
   const pessoa = await pessoasRepo.findById(pessoa_id);
   if (!pessoa) return;
   const jid = pessoa.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
   const wid = await sendOutboundText(jid, text);
+  const metadata: Record<string, unknown> = { whatsapp_id: wid, in_reply_to };
+  if (opts?.pending_question_id) metadata.pending_question_id = opts.pending_question_id;
   await mensagensRepo.create({
     conversa_id,
     direcao: 'out',
     tipo: 'texto',
     conteudo: text,
     midia_url: null,
-    metadata: { whatsapp_id: wid, in_reply_to },
+    metadata,
     processada_em: new Date(),
     ferramentas_chamadas: [],
     tokens_usados: null,
