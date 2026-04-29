@@ -15,6 +15,7 @@ import { logger } from '@/lib/logger.js';
 import { sha256 } from '@/lib/utils.js';
 import { mensagensRepo } from '@/db/repositories.js';
 import { isDuplicate, markSeen } from './dedup.js';
+import { markRead } from './presence.js';
 import { enqueueAgent } from './queue.js';
 import { audit } from '@/governance/audit.js';
 import type { WhatsAppInbound, WAQuotedContext } from './types.js';
@@ -125,6 +126,7 @@ async function handleIncoming(msg: proto.IWebMessageInfo): Promise<void> {
   });
 
   await markSeen(whatsapp_id);
+  markRead(remote_jid, whatsapp_id);
   if (duplicate) {
     await audit({ acao: 'duplicate_message_dropped', metadata: { whatsapp_id, source: 'db_unique' } });
     return;
