@@ -47,7 +47,7 @@ FEATURE_ONE_TAP: z
   .transform((s) => s === 'true' || s === '1'),
 ```
 
-- [ ] **Step 2:** `npx tsc --noEmit` — only the 2 pre-existing errors remain.
+- [ ] **Step 2:** `npx tsc --noEmit` — only the 3 pre-existing errors remain (`db/client.ts:24`, `gateway/queue.ts:31`, `lib/alerts.ts:32` nodemailer).
 - [ ] **Step 3:** Commit
 ```bash
 git add src/config/env.ts
@@ -379,21 +379,27 @@ async function applyTx(
   resolution: ClassifyOut,
   input: { pessoa: Pessoa; conversa: Conversa; inbound: Mensagem },
 ): Promise<GateResult> {
-  // Topic change short-circuits without touching resolveAndDispatch — that
-  // helper is for SUCCESSFUL resolutions, not cancellations.
+  // Topic change / explicit cancellation short-circuit without touching
+  // resolveAndDispatch — that helper is for SUCCESSFUL resolutions only.
+  // Both reasons cancel the row but keep distinct audit + return values
+  // so the caller can react differently if needed.
   if (resolution.is_topic_change || resolution.is_cancellation) {
+    const reason = resolution.is_cancellation ? 'cancelled' : 'topic_change';
+    const cancel_reason = resolution.is_cancellation ? 'user_cancelled' : 'topic_change';
+    const audit_acao =
+      resolution.is_cancellation ? 'pending_cancelled' : 'pending_unresolved_topic_change';
     return await withTx(async (tx) => {
       const locked = await pendingQuestionsRepo.findActiveForUpdate(tx, input.conversa.id);
       if (!locked || locked.id !== snapshot_id) return { kind: 'no_pending' };
-      await pendingQuestionsRepo.cancelTx(tx, snapshot_id, 'topic_change');
+      await pendingQuestionsRepo.cancelTx(tx, snapshot_id, cancel_reason);
       await audit({
-        acao: 'pending_unresolved_topic_change',
+        acao: audit_acao as never,
         pessoa_id: input.pessoa.id,
         conversa_id: input.conversa.id,
         mensagem_id: input.inbound.id,
         alvo_id: snapshot_id,
       });
-      return { kind: 'unresolved', reason: 'topic_change' };
+      return { kind: 'unresolved', reason };
     });
   }
 
@@ -434,15 +440,43 @@ async function applyTx(
 
 - [ ] **Step 3: Update `tests/unit/pending-gate.spec.ts`**
 
-The existing 6 tests assert on `resolveTx`, `cancelTx`, etc. Three of the four "resolve path" tests now go through `resolveAndDispatch` instead. Replace those mocks: mock `resolveAndDispatch` from `../../src/agent/pending-resolver.js` instead of asserting on `resolveTx`. Keep the topic-change and low-confidence tests as-is (those branches still touch the repo directly).
+The existing file has 6 tests. Map each to its new behaviour:
+
+| # | Existing test title | What changes |
+|---|---|---|
+| 1 | "snapshot path → no_pending when no active row" | unchanged (snapshot mock returns null) |
+| 2 | "snapshot path → calls Haiku and re-check fails → no_pending" | mock `resolveAndDispatch` to return `{ resolved: false, race_lost: true }` instead of `findActiveForUpdate` returning null |
+| 3 | "resolve path → resolves and dispatches" | replace `resolveTx`/`audit` assertions with `resolveAndDispatch.mockResolvedValueOnce({ resolved: true, action_tool: '...' })` and assert `out.kind === 'resolved'` |
+| 4 | "resolve path → topic_change cancels" | unchanged (topic-change still bypasses `resolveAndDispatch` and calls `cancelTx` + `audit` directly) |
+| 5 | "resolve path → low_confidence audits, no DB write" | unchanged (low-confidence still calls `audit` directly without `resolveAndDispatch`) |
+| 6 | "resolve path → race_lost via helper" | drop the `findActiveForUpdate.mockResolvedValueOnce(null)` line; use `resolveAndDispatch.mockResolvedValueOnce({ resolved: false, race_lost: true })` instead |
+
+**Concrete mock setup at the top of the file** (replace `findActiveForUpdate` and `resolveTx` mocks; keep `cancelTx` and `audit` because tests 4 and 5 still use them):
 
 ```typescript
-// At the top, replace the bare resolveTx mock with:
+const findActiveSnapshot = vi.fn();
+const cancelTx = vi.fn();
+vi.mock('../../src/db/repositories.js', () => ({
+  pendingQuestionsRepo: {
+    findActiveSnapshot,
+    cancelTx,
+    // findActiveForUpdate, resolveTx removed — now lives behind resolveAndDispatch
+  },
+}));
+
 const resolveAndDispatch = vi.fn();
 vi.mock('../../src/agent/pending-resolver.js', () => ({ resolveAndDispatch }));
 
-// In the resolve-path test:
-it('resolves and dispatches when classify succeeds and re-check finds the row', async () => {
+const audit = vi.fn();
+vi.mock('../../src/governance/audit.js', () => ({ audit }));
+
+// callLLM, withTx, classifier mocks unchanged from B0.
+```
+
+**Resolve-path test (replaces #3 in the table above):**
+
+```typescript
+it('resolves via helper when classify succeeds', async () => {
   findActiveSnapshot.mockResolvedValueOnce({
     id: 'pq-1', pergunta: 'Confirma?',
     opcoes_validas: [{ key: 'sim', label: 'Sim' }, { key: 'nao', label: 'Não' }],
@@ -455,12 +489,19 @@ it('resolves and dispatches when classify succeeds and re-check finds the row', 
   resolveAndDispatch.mockResolvedValueOnce({ resolved: true, action_tool: 'register_transaction' });
   const { checkPendingFirst } = await import('../../src/agent/pending-gate.js');
   const out = await checkPendingFirst({ pessoa, conversa, inbound });
-  expect(out).toEqual({ kind: 'resolved' }); // no action carried — already dispatched
-  expect(resolveAndDispatch).toHaveBeenCalledTimes(1);
+  expect(out).toEqual({ kind: 'resolved' });
+  expect(resolveAndDispatch).toHaveBeenCalledWith(expect.objectContaining({
+    expected_pending_id: 'pq-1',
+    option_chosen: 'sim',
+    source: 'gate',
+  }));
 });
+```
 
-// Race-loss case: resolveAndDispatch returns { resolved: false, race_lost: true }
-it('race-loss: helper signals race_lost → no_pending', async () => {
+**Race-loss test (replaces #6 — the `findActiveForUpdate(null)` test):**
+
+```typescript
+it('race-loss surfaces from helper as no_pending', async () => {
   findActiveSnapshot.mockResolvedValueOnce({
     id: 'pq-4', pergunta: 'Confirma?',
     opcoes_validas: [{ key: 'sim', label: 'Sim' }, { key: 'nao', label: 'Não' }],
@@ -477,7 +518,13 @@ it('race-loss: helper signals race_lost → no_pending', async () => {
 });
 ```
 
-(The topic-change and low-confidence tests continue to mock `cancelTx`/`audit` directly because those paths don't go through `resolveAndDispatch`.)
+Tests #1, #2, #4, #5 keep the same body. Run after the rewrite:
+
+```
+npx vitest run tests/unit/pending-gate.spec.ts
+```
+
+Expected: 6 green.
 
 - [ ] **Step 4: Verify**
 
@@ -1181,13 +1228,25 @@ export async function dispatchPollVote(msg: proto.IWebMessageInfo): Promise<void
 
   let chosenKey: string | null = null;
   try {
+    // Baileys v6.x decryptPollVote signature (verified against
+    // node_modules/@whiskeysockets/baileys/lib/Utils/messages-media.d.ts):
+    //   decryptPollVote({ encPayload, encIv },
+    //                   { pollCreatorJid, pollMsgId, pollEncKey, voterJid })
+    // pollEncKey is the parent poll's messageSecret. voterJid is the voter
+    // (the participant of the update if it's a group; otherwise remoteJid).
     const secret = Buffer.from(secretB64, 'base64');
-    const decoded = decryptPollVote(pollUpdate, {
-      pollCreatorJid: msg.key.remoteJid ?? '',
-      pollMsgSender: msg.key.participant ?? msg.key.remoteJid ?? '',
-      voteMsgSender: msg.key.participant ?? msg.key.remoteJid ?? '',
-      encKey: secret,
-    } as never);
+    const decoded = decryptPollVote(
+      {
+        encPayload: pollUpdate.vote!.encPayload!,
+        encIv: pollUpdate.vote!.encIv!,
+      },
+      {
+        pollCreatorJid: msg.key.remoteJid ?? '',
+        pollMsgId: parent_wid,
+        pollEncKey: secret,
+        voterJid: msg.key.participant ?? msg.key.remoteJid ?? '',
+      },
+    );
     const selected = (decoded as { selectedOptions?: Uint8Array[] }).selectedOptions ?? [];
     if (selected.length === 0) return; // empty vote (user cleared selection)
     const target = Buffer.from(selected[0]!).toString('hex');
@@ -1237,7 +1296,7 @@ export async function dispatchPollVote(msg: proto.IWebMessageInfo): Promise<void
 }
 ```
 
-(Note: the `decryptPollVote` signature varies across Baileys versions. If the actual API in the repo's `@whiskeysockets/baileys` version differs from what's mocked, adapt the call site to match — the test pins our **expected** shape, so a mismatch will surface immediately.)
+(Verified against Baileys v6.7.0 `lib/Utils/messages-media.d.ts`. If the dependency is bumped, re-verify the signature; the unit test pins our adapter shape so a regression surfaces at test time.)
 
 - [ ] **Step 3: Verify + commit**
 
@@ -1260,7 +1319,14 @@ git commit -m "feat(b1): dispatchPollVote with decryptPollVote + hash-match"
 import { dispatchReactionAsAnswer, dispatchPollVote } from '@/agent/one-tap.js';
 ```
 
-- [ ] **Step 2: Add prefix branches**
+- [ ] **Step 2: Inspect the current `pollUpdateMessage` behaviour**
+
+Before adding the new branch, confirm what current `handleIncoming` does with a `pollUpdateMessage`. Read `src/gateway/baileys.ts`:
+
+- If it falls through `extractContent` and ends as `tipo='sistema'` (a sistema row in `mensagens`), then today's behaviour is "persist as system row, no agent processing". Adding an early-return WITH the flag off changes behaviour.
+- Solution: **gate the early-return on `FEATURE_ONE_TAP`** so flag-off behaviour is identical to today. When the flag is on we re-route + drop; when off we let the existing path persist.
+
+- [ ] **Step 3: Add prefix branches**
 
 In `handleIncoming`, find the existing reaction-stub early return:
 
@@ -1268,21 +1334,24 @@ In `handleIncoming`, find the existing reaction-stub early return:
 if (isReactionStub(msg)) return;
 ```
 
-Replace with:
+Replace with (note both branches gated on `FEATURE_ONE_TAP` for the new dispatch; existing reaction-stub return stays unconditional because it was already in main):
 
 ```typescript
-// B1: poll vote arrives as a pollUpdateMessage; route to one-tap dispatcher
-// before any other processing (we don't persist these).
+// B1: poll vote arrives as a pollUpdateMessage. When FEATURE_ONE_TAP is on,
+// route to the one-tap dispatcher and drop. When off, fall through to the
+// existing pipeline (preserves pre-B1 behaviour).
 if (msg.message?.pollUpdateMessage) {
   if (config.FEATURE_ONE_TAP) {
     await dispatchPollVote(msg).catch((err) =>
       logger.warn({ err: (err as Error).message }, 'one_tap.poll_dispatch_failed'),
     );
+    return;
   }
-  return;
+  // flag off → fall through; existing extractContent classifies as 'sistema'
 }
 
 if (isReactionStub(msg)) {
+  // existing behaviour: never persist reactions; absorb as one-tap when on.
   if (config.FEATURE_ONE_TAP) {
     await dispatchReactionAsAnswer(msg).catch((err) =>
       logger.warn({ err: (err as Error).message }, 'one_tap.reaction_dispatch_failed'),
@@ -1292,7 +1361,7 @@ if (isReactionStub(msg)) {
 }
 ```
 
-- [ ] **Step 3:** Typecheck + commit
+- [ ] **Step 4:** Typecheck + commit
 ```bash
 npx tsc --noEmit
 git add src/gateway/baileys.ts
@@ -1317,7 +1386,7 @@ Expected: all new tests green; pre-existing module-load failures unchanged.
 npx tsc --noEmit
 ```
 
-Expected: only the 2 pre-existing errors (`db/client.ts:24`, `gateway/queue.ts:31`).
+Expected: only the 3 pre-existing errors (`db/client.ts:24`, `gateway/queue.ts:31`, `lib/alerts.ts:32`).
 
 - [ ] **Step 3:** Push & open PR
 
