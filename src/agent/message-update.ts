@@ -75,7 +75,14 @@ async function handleMessageEdit(input: {
     diff: { before: original.conteudo ?? null, after: input.new_conteudo },
     metadata: { side_effect_count: sideEffects.length },
   });
-  // Side-effect pending creation in Task 8.
+  if (config.FEATURE_MESSAGE_UPDATE) {
+    await createEditReviewPending({
+      original,
+      side_effects: sideEffects,
+      source: 'edit',
+      diff: { before: original.conteudo ?? null, after: input.new_conteudo },
+    });
+  }
 }
 
 async function handleMessageRevoke(input: {
@@ -101,7 +108,13 @@ async function handleMessageRevoke(input: {
     mensagem_id: original.id,
     metadata: { side_effect_count: sideEffects.length, revoked_by_jid: input.revoked_by_jid },
   });
-  // Side-effect pending creation in Task 8.
+  if (config.FEATURE_MESSAGE_UPDATE) {
+    await createEditReviewPending({
+      original,
+      side_effects: sideEffects,
+      source: 'revoke',
+    });
+  }
 }
 
 async function detectSideEffects(
@@ -113,10 +126,70 @@ async function detectSideEffects(
     .map((r) => ({ acao: r.acao, alvo_id: r.alvo_id }));
 }
 
-void withTx;
-void pessoasRepo;
-void conversasRepo;
-void pendingQuestionsRepo;
-void config;
-void REVIEW_TTL_HOURS;
+async function createEditReviewPending(input: {
+  original: { id: string; conversa_id: string | null };
+  side_effects: Array<{ acao: string; alvo_id: string | null }>;
+  source: 'edit' | 'revoke';
+  diff?: { before: string | null; after: string };
+}): Promise<void> {
+  const tx_audit = input.side_effects.find((e) =>
+    ['transaction_created', 'transaction_corrected'].includes(e.acao),
+  );
+  if (!tx_audit?.alvo_id) return;
+
+  const owner = await pessoasRepo.findByPhone(config.OWNER_TELEFONE_WHATSAPP);
+  if (!owner) {
+    logger.warn('message_update.no_owner_skipping_review');
+    return;
+  }
+  const ownerConversa = await conversasRepo.findActive(owner.id);
+  if (!ownerConversa) {
+    logger.warn({ owner_id: owner.id }, 'message_update.no_owner_conversa_skipping_review');
+    return;
+  }
+
+  const verb = input.source === 'edit' ? 'editou' : 'deletou';
+  const expira_em = new Date(Date.now() + REVIEW_TTL_HOURS * 60 * 60 * 1000);
+
+  await withTx(async (tx) => {
+    const cancelled = await pendingQuestionsRepo.cancelOpenForConversaTx(
+      tx,
+      ownerConversa.id,
+      'replaced_by_edit_review',
+    );
+    if (cancelled.cancelled_ids.length > 0) {
+      await audit({
+        acao: 'pending_substituted_by_edit_review',
+        conversa_id: ownerConversa.id,
+        mensagem_id: input.original.id,
+        metadata: { cancelled_ids: cancelled.cancelled_ids },
+      });
+    }
+    await pendingQuestionsRepo.createTx(tx, {
+      conversa_id: ownerConversa.id,
+      pessoa_id: owner.id,
+      tipo: 'edit_review',
+      pergunta: `Você ${verb} uma mensagem que virou transação. Quer cancelar?`,
+      opcoes_validas: [
+        { key: 'sim', label: 'Sim, cancela' },
+        { key: 'nao', label: 'Não, mantém' },
+      ],
+      acao_proposta: {
+        tool: 'cancel_transaction',
+        args: {
+          transacao_id: tx_audit.alvo_id,
+          motivo: input.source === 'edit' ? 'edit_review' : 'revoke_review',
+        },
+      },
+      expira_em,
+      status: 'aberta',
+      metadata: {
+        source: 'edit_review',
+        original_mensagem_id: input.original.id,
+        original_conversa_id: input.original.conversa_id,
+        original_diff: input.diff ?? null,
+      },
+    });
+  });
+}
 

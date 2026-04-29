@@ -107,3 +107,77 @@ describe('routeMessageUpdate — irrelevant updates', () => {
     expect(auditMock).not.toHaveBeenCalled();
   });
 });
+
+describe('routeMessageUpdate — side-effect detected', () => {
+  it('creates edit_review pending in OWNER conversa and audits both pending_substituted_by_edit_review and mensagem_edited_after_side_effect', async () => {
+    findByWhatsappIdMock.mockResolvedValueOnce({
+      id: 'm-orig',
+      conteudo: 'lança 50 mercado',
+      conversa_id: 'c-user',
+    });
+    auditLogQueryMock.mockResolvedValueOnce([
+      { acao: 'transaction_created', alvo_id: 'tx-1', mensagem_id: 'm-orig' },
+    ]);
+    findOwnerByPhoneMock.mockResolvedValueOnce({ id: 'owner-id', telefone_whatsapp: '+5511999999999' });
+    findActiveConversaMock.mockResolvedValueOnce({ id: 'c-owner', pessoa_id: 'owner-id' });
+    pendingCancelOpenForConversaTxMock.mockResolvedValueOnce({ cancelled_ids: ['pq-old'] });
+    pendingCreateTxMock.mockResolvedValueOnce({ id: 'pq-edit-review' });
+
+    const { routeMessageUpdate } = await import('../../src/agent/message-update.js');
+    await routeMessageUpdate({
+      key: { id: 'WAID-1', remoteJid: 'jid' },
+      message: { editedMessage: { message: { conversation: 'lança 50 restaurante' } } },
+    } as never);
+
+    expect(pendingCreateTxMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        conversa_id: 'c-owner',
+        pessoa_id: 'owner-id',
+        tipo: 'edit_review',
+        acao_proposta: { tool: 'cancel_transaction', args: expect.objectContaining({ transacao_id: 'tx-1' }) },
+      }),
+    );
+    expect(auditMock.mock.calls.some((c) => c[0].acao === 'mensagem_edited_after_side_effect')).toBe(true);
+    expect(auditMock.mock.calls.some((c) => c[0].acao === 'pending_substituted_by_edit_review')).toBe(true);
+  });
+
+  it('skips pending creation when owner is not configured', async () => {
+    findByWhatsappIdMock.mockResolvedValueOnce({ id: 'm-orig', conteudo: 'x', conversa_id: 'c1' });
+    auditLogQueryMock.mockResolvedValueOnce([{ acao: 'transaction_created', alvo_id: 'tx-1' }]);
+    findOwnerByPhoneMock.mockResolvedValueOnce(null);
+    const { routeMessageUpdate } = await import('../../src/agent/message-update.js');
+    await routeMessageUpdate({
+      key: { id: 'WAID-1', remoteJid: 'jid' },
+      message: { editedMessage: { message: { conversation: 'y' } } },
+    } as never);
+    expect(pendingCreateTxMock).not.toHaveBeenCalled();
+    expect(auditMock.mock.calls.some((c) => c[0].acao === 'mensagem_edited_after_side_effect')).toBe(true);
+  });
+
+  it('revoke side-effect path also creates edit_review pending', async () => {
+    findByWhatsappIdMock.mockResolvedValueOnce({ id: 'm-orig', conteudo: 'x', conversa_id: 'c-user' });
+    auditLogQueryMock.mockResolvedValueOnce([{ acao: 'transaction_created', alvo_id: 'tx-2' }]);
+    findOwnerByPhoneMock.mockResolvedValueOnce({ id: 'owner-id' });
+    findActiveConversaMock.mockResolvedValueOnce({ id: 'c-owner', pessoa_id: 'owner-id' });
+    pendingCreateTxMock.mockResolvedValueOnce({ id: 'pq-edit-review-rev' });
+
+    const { routeMessageUpdate } = await import('../../src/agent/message-update.js');
+    await routeMessageUpdate({
+      key: { id: 'WAID-rev', remoteJid: 'jid' },
+      message: { protocolMessage: { type: 0, key: { id: 'WAID-target', remoteJid: 'jid' } } },
+    } as never);
+
+    expect(pendingCreateTxMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        tipo: 'edit_review',
+        acao_proposta: expect.objectContaining({
+          tool: 'cancel_transaction',
+          args: expect.objectContaining({ transacao_id: 'tx-2', motivo: 'revoke_review' }),
+        }),
+      }),
+    );
+    expect(auditMock.mock.calls.some((c) => c[0].acao === 'mensagem_revoked_after_side_effect')).toBe(true);
+  });
+});
