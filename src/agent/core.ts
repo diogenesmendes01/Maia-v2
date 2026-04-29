@@ -120,30 +120,10 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
   }
 
   // B0: pre-LLM gate. If the user's reply resolves a pending question,
-  // dispatch the proposed action and skip the full ReAct turn.
+  // the gate (via resolveAndDispatch) has already executed the proposed
+  // action and audited it; we just close the loop and skip the ReAct turn.
   const gate = await checkPendingFirst({ pessoa, conversa: c, inbound });
   if (gate.kind === 'resolved') {
-    if (gate.action) {
-      const args = { ...gate.action.args, _pending_choice: gate.option_chosen };
-      await dispatchTool({
-        tool: gate.action.tool,
-        args,
-        ctx: {
-          pessoa,
-          scope: await resolveScope(pessoa),
-          conversa: c,
-          mensagem_id: inbound.id,
-          request_id: uuid(),
-        },
-      });
-      await audit({
-        acao: 'pending_action_dispatched',
-        pessoa_id: pessoa.id,
-        conversa_id: c.id,
-        mensagem_id: inbound.id,
-        metadata: { tool: gate.action.tool, pending_question_id: gate.pending_question_id },
-      });
-    }
     await mensagensRepo.markProcessed(inbound.id, 0);
     await conversasRepo.touch(c.id);
     return;
