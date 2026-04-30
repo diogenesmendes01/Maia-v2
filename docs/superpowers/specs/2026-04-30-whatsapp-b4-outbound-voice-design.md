@@ -41,7 +41,17 @@ This makes voice-note conversations feel conversational ("registra R$ 500 do Ube
 
 ### 4.1 Decision tree (no-tool-uses branch in `core.ts`)
 
-The existing branch order (after B3b) is: `latestReportPdf` → `usePoll` → text. B4 inserts a new branch **between** the PDF branch and the poll/text branches:
+The current B3b structure at `src/agent/core.ts:174` is:
+
+```typescript
+if (latestReportPdf) {
+  // PDF branch
+} else {
+  // a single else block containing the if (usePoll) / else (text) cascade
+}
+```
+
+B4 **flattens** the nested else block into peer `else if` branches and inserts the voice branch in the second slot:
 
 ```typescript
 if (latestReportPdf) {
@@ -53,13 +63,15 @@ if (latestReportPdf) {
 ) {
   // B4 voice branch (NEW)
 } else if (usePoll && latestPending) {
-  // existing B1 poll branch
+  // existing B1 poll branch — moved out of the nested else
 } else {
-  // existing B3a text branch (view-once + sendOutbound)
+  // existing B3a text branch (view-once + sendOutbound) — moved out of the nested else
 }
 ```
 
 The two B4 guards (`inbound.tipo === 'audio'` and `text.length <= 400`) ensure precedence: PDF beats voice; voice beats poll/text **only** when both inbound was audio and reply is short.
+
+**Refactor scope**: the flatten is mechanical — the existing `usePoll` and text branches retain their bodies verbatim, just promoted from nested-else to peer `else if`. No logic change in B3a or B1. The plan should call this out explicitly so the implementer doesn't accidentally rewrite either branch's body.
 
 **Why voice precedes poll**: a voice-in turn that also has a `latestPending` poll request is rare (would require the LLM to dispatch `ask_pending_question` after transcribing a voice question). When it happens, voice is the better UX (keeps the channel symmetry). The poll fallback to numbered text (B1) handles the case where Baileys can't honor the poll.
 
@@ -104,6 +116,11 @@ export async function synthesizeSpeech(text: string): Promise<Buffer> {
   }
   const arrayBuffer = await res.arrayBuffer();
   const buf = Buffer.from(arrayBuffer);
+  // Defensive: OpenAI rarely (but conceivably) returns 200 with an empty body.
+  // Treat as failure so the caller routes through the text-fallback path.
+  if (buf.length === 0) {
+    throw new Error('tts_empty_body');
+  }
   logger.debug({ ms: Date.now() - t0, bytes: buf.length }, 'tts.synthesized');
   return buf;
 }
@@ -245,7 +262,7 @@ PDF beats everything; voice beats poll/text only when channel-symmetric and shor
 
 ## 5. Schema / migrations
 
-None. `mensagens.tipo` already accepts `'audio'` (it's used today by inbound voice notes). New audit action `outbound_sent_document` (sic: `outbound_sent_voice`) is appended to `src/governance/audit-actions.ts`.
+None. `mensagens.tipo` already accepts `'audio'` (it's used today by inbound voice notes; B4 introduces the new combination of `tipo='audio'` with `direcao='out'`, but no schema change is required since the column is free-form `text`). New audit action `outbound_sent_voice` is appended to `src/governance/audit-actions.ts` after `outbound_sent_document` (B3b's last addition).
 
 ## 6. Configuration
 
@@ -287,6 +304,7 @@ Single new action. The fall-back-to-text case reuses existing audit conventions 
 | Failure | Tratamento |
 |---|---|
 | `synthesizeSpeech` throws (network, 5xx, rate limit) | Log warn, fall back to text path inside the same branch (`sendOutbound`). Owner receives the reply as text. No `outbound_sent_voice` audit; existing `classification_suggested` audit (from the LLM turn dispatch) still fires as usual. |
+| `synthesizeSpeech` returns 200 with empty body | Treated as failure (`tts_empty_body` thrown by `synthesizeSpeech` itself). Same fallback path as network errors. |
 | `OPENAI_API_KEY` missing | `synthesizeSpeech` throws `'OPENAI_API_KEY missing for TTS'`. Caught and treated like any TTS failure → text fallback. |
 | `sendOutboundVoice` returns null (Baileys disconnected) | No audit, no `mensagens` row. Owner receives nothing — recovery worker (existing) requeues if appropriate. **No text fallback in this case** (text would also fail since Baileys is down). |
 | `text.length === 0` | Already guarded by outer `if (text)` block. B4 branch is unreachable. |
