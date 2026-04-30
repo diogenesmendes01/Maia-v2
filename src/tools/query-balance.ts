@@ -31,6 +31,7 @@ export const queryBalanceTool: Tool<typeof inputSchema, typeof outputSchema> = {
   redis_required: false,
   operation_type: 'read',
   audit_action: 'balance_queried',
+  sensitive: true,
   handler: async (args, ctx) => {
     let contas;
     if (args.conta_id) {
