@@ -95,11 +95,13 @@ const callLLM = vi.fn();
 vi.mock('../../src/lib/claude.js', () => ({ callLLM }));
 
 const buildPrompt = vi.fn();
-vi.mock('../../src/agent/prompt-builder.js', () => ({
-  buildPrompt,
-  PROMPT_TOKEN_BUDGET_INPUT: 11000,
-  PROMPT_TOKEN_BUDGET_OUTPUT: 1024,
-}));
+vi.mock('../../src/agent/prompt-builder.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/agent/prompt-builder.js')>();
+  return {
+    ...actual,
+    buildPrompt,
+  };
+});
 
 vi.mock('../../src/agent/pending-gate.js', () => ({
   checkPendingFirst: vi.fn().mockResolvedValue({ kind: 'no_pending' }),
@@ -361,5 +363,16 @@ describe('agent loop — preference override', () => {
     const acoes = audit.mock.calls.map((c) => c[0].acao);
     // Skipped audit was emitted before the send attempt
     expect(acoes).toContain('outbound_view_once_skipped_by_preference');
+  });
+});
+
+describe('prompt-builder content rule', () => {
+  it('LLM_BOUNDARIES instructs the LLM to keep monetary figures out of poll question text', async () => {
+    const mod = await import('../../src/agent/prompt-builder.js');
+    const boundaries = mod._internal.LLM_BOUNDARIES;
+    // Loose match — the exact wording can vary, but the rule must be present.
+    expect(boundaries).toMatch(/ask_pending_question/);
+    expect(boundaries).toMatch(/pergunta|poll/i);
+    expect(boundaries).toMatch(/valor|monetár|R\$/i);
   });
 });
