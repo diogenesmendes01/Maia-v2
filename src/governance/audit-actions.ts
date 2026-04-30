@@ -83,6 +83,8 @@ export const AUDIT_ACTIONS = [
   'pending_reminder_sent',
   'pending_reminder_skipped_no_outbound',
   'pending_reminder_skipped_already_marked',
+  'outbound_sent_view_once',
+  'outbound_view_once_skipped_by_preference',
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];
