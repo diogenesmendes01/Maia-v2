@@ -247,4 +247,88 @@ describe('agent loop — B4 voice flow', () => {
     expect(audioRow).toBeUndefined();
     expect(sendOutboundText).not.toHaveBeenCalled();
   });
+
+  it('voice-in + sensitive turn (query_balance) + view-once flag on → text+view_once path; no voice', async () => {
+    flagState.FEATURE_VIEW_ONCE_SENSITIVE = true;
+    findMensagem.mockResolvedValue({ ...VOICE_INBOUND });
+    // First LLM turn: tool use (query_balance — flagged sensitive in real REGISTRY).
+    // Second LLM turn: short final text that would otherwise fit the voice branch.
+    callLLM.mockResolvedValueOnce({
+      content: '',
+      tool_uses: [{ id: 'tu-0', tool: 'query_balance', args: {} }],
+      usage: { input_tokens: 100, output_tokens: 10 },
+    });
+    callLLM.mockResolvedValueOnce({
+      content: 'Saldo R$ 1.234,56', tool_uses: [],
+      usage: { input_tokens: 50, output_tokens: 20 },
+    });
+    dispatchTool.mockResolvedValue({ ok: true });
+    const { runAgentForMensagem } = await import('../../src/agent/core.js');
+    await runAgentForMensagem('in1');
+
+    expect(synthesizeSpeech).not.toHaveBeenCalled();
+    expect(sendOutboundVoice).not.toHaveBeenCalled();
+    expect(sendOutboundText).toHaveBeenCalledTimes(1);
+    const textCall = sendOutboundText.mock.calls[0]!;
+    expect(textCall[2]).toEqual(expect.objectContaining({ view_once: true }));
+    const auditAcoes = audit.mock.calls.map((c) => c[0].acao);
+    expect(auditAcoes).toContain('outbound_sent_view_once');
+    expect(auditAcoes).not.toContain('outbound_sent_voice');
+  });
+
+  it('voice-in + sensitive turn + view-once flag OFF → voice still wins (no view-once enforcement)', async () => {
+    flagState.FEATURE_VIEW_ONCE_SENSITIVE = false;
+    findMensagem.mockResolvedValue({ ...VOICE_INBOUND });
+    callLLM.mockResolvedValueOnce({
+      content: '',
+      tool_uses: [{ id: 'tu-0', tool: 'query_balance', args: {} }],
+      usage: { input_tokens: 100, output_tokens: 10 },
+    });
+    callLLM.mockResolvedValueOnce({
+      content: 'Saldo R$ 1.234,56', tool_uses: [],
+      usage: { input_tokens: 50, output_tokens: 20 },
+    });
+    dispatchTool.mockResolvedValue({ ok: true });
+    synthesizeSpeech.mockResolvedValueOnce(Buffer.from([0x4F, 0x67]));
+    const { runAgentForMensagem } = await import('../../src/agent/core.js');
+    await runAgentForMensagem('in1');
+
+    expect(synthesizeSpeech).toHaveBeenCalledTimes(1);
+    expect(sendOutboundVoice).toHaveBeenCalledTimes(1);
+    expect(sendOutboundText).not.toHaveBeenCalled();
+  });
+
+  it('voice-in + reply exactly 400 chars → voice path (boundary inclusive)', async () => {
+    findMensagem.mockResolvedValue({ ...VOICE_INBOUND });
+    const exact400 = 'a'.repeat(400);
+    callLLM.mockResolvedValueOnce({
+      content: exact400, tool_uses: [],
+      usage: { input_tokens: 50, output_tokens: 80 },
+    });
+    synthesizeSpeech.mockResolvedValueOnce(Buffer.from([0x4F, 0x67]));
+    const { runAgentForMensagem } = await import('../../src/agent/core.js');
+    await runAgentForMensagem('in1');
+    expect(synthesizeSpeech).toHaveBeenCalledTimes(1);
+    expect(sendOutboundVoice).toHaveBeenCalledTimes(1);
+    expect(sendOutboundText).not.toHaveBeenCalled();
+  });
+
+  it('voice-in + correction inbound → sendOutboundVoice called with quoted context', async () => {
+    const { detectCorrection } = await import('../../src/agent/reflection.js');
+    (detectCorrection as ReturnType<typeof vi.fn>).mockReturnValueOnce(true);
+    const { quotedReplyContext } = await import('../../src/gateway/presence.js');
+    const fakeQuoted = { key: { id: 'WAID-IN' } } as never;
+    (quotedReplyContext as ReturnType<typeof vi.fn>).mockReturnValueOnce(fakeQuoted);
+    findMensagem.mockResolvedValue({ ...VOICE_INBOUND });
+    callLLM.mockResolvedValueOnce({
+      content: 'corrigido', tool_uses: [],
+      usage: { input_tokens: 50, output_tokens: 10 },
+    });
+    synthesizeSpeech.mockResolvedValueOnce(Buffer.from([0x4F, 0x67]));
+    const { runAgentForMensagem } = await import('../../src/agent/core.js');
+    await runAgentForMensagem('in1');
+    expect(sendOutboundVoice).toHaveBeenCalledTimes(1);
+    const [, , opts] = sendOutboundVoice.mock.calls[0]!;
+    expect(opts).toEqual({ quoted: fakeQuoted });
+  });
 });

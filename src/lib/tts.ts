@@ -24,6 +24,14 @@ export async function synthesizeSpeech(text: string): Promise<Buffer> {
   if (!config.OPENAI_API_KEY) {
     throw new Error('OPENAI_API_KEY missing for TTS');
   }
+  // Defense-in-depth: the call site (`core.ts` voice branch) already gates on
+  // OUTBOUND_VOICE_MAX_CHARS, but if a future caller forgets that guard we
+  // still cap input length and strip null bytes from LLM-produced text before
+  // it reaches OpenAI.
+  const sanitized = text.replace(/\0/g, '').slice(0, OUTBOUND_VOICE_MAX_CHARS);
+  if (sanitized.length === 0) {
+    throw new Error('tts_empty_input');
+  }
   const t0 = Date.now();
   const res = await fetch('https://api.openai.com/v1/audio/speech', {
     method: 'POST',
@@ -34,7 +42,7 @@ export async function synthesizeSpeech(text: string): Promise<Buffer> {
     body: JSON.stringify({
       model: 'tts-1',
       voice: 'nova',
-      input: text,
+      input: sanitized,
       response_format: 'opus',
     }),
   });

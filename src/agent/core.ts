@@ -167,6 +167,18 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
       if (res.tool_uses.length === 0) {
         const text = res.content?.trim() ?? '';
         if (text) {
+          // Quoting decision is shared across PDF / voice / text branches —
+          // computed once so the rule (correction-detected OR pending active)
+          // can't drift between copies.
+          const shouldQuote =
+            (inbound.conteudo && detectCorrection(inbound.conteudo)) ||
+            getActivePending(c) !== null;
+          const quotedContext = shouldQuote
+            ? quotedReplyContext(
+                inbound.metadata as Record<string, unknown> | null,
+                inbound.conteudo,
+              )
+            : undefined;
           // B3b: PDF report path — takes precedence over poll/text. The LLM's
           // text becomes the document caption (truncated to WhatsApp's 1024-
           // char limit). The unlink-in-finally guarantees the tmp PDF is
@@ -176,19 +188,11 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
             const pdf = latestReportPdf;
             try {
               const captionText = text.slice(0, 1024);
-              const shouldQuote =
-                (inbound.conteudo && detectCorrection(inbound.conteudo)) ||
-                getActivePending(c) !== null;
               const wid = await sendOutboundDocument(jid, pdf.path, {
                 mimetype: pdf.mimetype,
                 fileName: pdf.fileName,
                 caption: captionText,
-                quoted: shouldQuote
-                  ? quotedReplyContext(
-                      inbound.metadata as Record<string, unknown> | null,
-                      inbound.conteudo,
-                    )
-                  : undefined,
+                quoted: quotedContext,
               });
               if (wid) {
                 const file_size_bytes = await stat(pdf.path)
@@ -236,9 +240,15 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
           } else if (
             config.FEATURE_OUTBOUND_VOICE &&
             inbound.tipo === 'audio' &&
-            text.length <= OUTBOUND_VOICE_MAX_CHARS
+            text.length <= OUTBOUND_VOICE_MAX_CHARS &&
+            !(config.FEATURE_VIEW_ONCE_SENSITIVE && turnHasSensitive)
           ) {
             // B4: voice reply for symmetric voice-in/voice-out channel.
+            // Sensitive turns (query_balance / compare_entities) are excluded
+            // from the voice branch so the B3a view-once path (and its
+            // skipped-by-preference audit) keeps protecting saldos. Voice
+            // bubbles can't be view-once, so going text-first is the only way
+            // to honour the sensitive-turn contract from B3a.
             let voiceBuf: Buffer | null = null;
             try {
               voiceBuf = await synthesizeSpeech(text);
@@ -249,16 +259,8 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
               );
             }
             if (voiceBuf) {
-              const shouldQuote =
-                (inbound.conteudo && detectCorrection(inbound.conteudo)) ||
-                getActivePending(c) !== null;
               const wid = await sendOutboundVoice(jid, voiceBuf, {
-                quoted: shouldQuote
-                  ? quotedReplyContext(
-                      inbound.metadata as Record<string, unknown> | null,
-                      inbound.conteudo,
-                    )
-                  : undefined,
+                quoted: quotedContext,
               });
               if (wid) {
                 await audit({
@@ -291,17 +293,9 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
               }
             } else {
               // TTS failed — fall back to text path (re-uses existing sendOutbound).
-              const shouldQuote =
-                (inbound.conteudo && detectCorrection(inbound.conteudo)) ||
-                getActivePending(c) !== null;
               await sendOutbound(pessoa.id, c.id, text, inbound.id, {
                 pending_question_id: latestPending?.id ?? null,
-                quoted: shouldQuote
-                  ? quotedReplyContext(
-                      inbound.metadata as Record<string, unknown> | null,
-                      inbound.conteudo,
-                    )
-                  : undefined,
+                quoted: quotedContext,
               });
             }
           } else {
@@ -313,9 +307,6 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
             if (usePoll && latestPending) {
               await sendOutboundPoll(pessoa.id, c.id, text, inbound.id, latestPending);
             } else {
-              const shouldQuote =
-                (inbound.conteudo && detectCorrection(inbound.conteudo)) ||
-                getActivePending(c) !== null;
               const prefDisabled =
                 (pessoa.preferencias as { balance_view_once?: boolean } | null)
                   ?.balance_view_once === false;
@@ -332,12 +323,7 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
               }
               const wid = await sendOutbound(pessoa.id, c.id, text, inbound.id, {
                 pending_question_id: latestPending?.id ?? null,
-                quoted: shouldQuote
-                  ? quotedReplyContext(
-                      inbound.metadata as Record<string, unknown> | null,
-                      inbound.conteudo,
-                    )
-                  : undefined,
+                quoted: quotedContext,
                 view_once,
               });
               if (wid && view_once) {

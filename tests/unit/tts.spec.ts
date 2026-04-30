@@ -72,4 +72,33 @@ describe('synthesizeSpeech', () => {
     const { synthesizeSpeech } = await import('../../src/lib/tts.js');
     await expect(synthesizeSpeech('x')).rejects.toThrow(/OPENAI_API_KEY missing/);
   });
+
+  it('strips null bytes from input before sending to OpenAI', async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      arrayBuffer: async () => new ArrayBuffer(4),
+    });
+    const { synthesizeSpeech } = await import('../../src/lib/tts.js');
+    await synthesizeSpeech('hello\0world');
+    const body = JSON.parse((fetchMock.mock.calls[0]![1] as { body: string }).body);
+    expect(body.input).toBe('helloworld');
+  });
+
+  it('caps input length at OUTBOUND_VOICE_MAX_CHARS (defense-in-depth)', async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      arrayBuffer: async () => new ArrayBuffer(4),
+    });
+    const { synthesizeSpeech, OUTBOUND_VOICE_MAX_CHARS } = await import('../../src/lib/tts.js');
+    const oversized = 'a'.repeat(OUTBOUND_VOICE_MAX_CHARS + 100);
+    await synthesizeSpeech(oversized);
+    const body = JSON.parse((fetchMock.mock.calls[0]![1] as { body: string }).body);
+    expect(body.input.length).toBe(OUTBOUND_VOICE_MAX_CHARS);
+  });
+
+  it('throws tts_empty_input when sanitization yields empty string', async () => {
+    const { synthesizeSpeech } = await import('../../src/lib/tts.js');
+    await expect(synthesizeSpeech('\0\0\0')).rejects.toThrow(/tts_empty_input/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 });
