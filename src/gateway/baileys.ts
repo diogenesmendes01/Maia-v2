@@ -38,6 +38,14 @@ export function isBaileysConnected(): boolean {
   return connected;
 }
 
+/**
+ * TASK 7: this is a stub. Real implementation calls socket.requestPairingCode(phoneNumber).
+ * The stub throws so tests must mock it; runtime callers see a 503 from /setup/start.
+ */
+export async function triggerPairingCode(_phoneNumber: string): Promise<string> {
+  throw new Error('baileys_socket_not_ready');
+}
+
 export function getSocket(): WASocket | null {
   return socket;
 }
