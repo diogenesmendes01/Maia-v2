@@ -387,6 +387,23 @@ This task introduces the agent-loop mocks. Add the shared mock block at the **to
 // "Tool.sensitive registry surface" describe block.
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
+// vi.hoisted runs before vi.mock and lets the mock factories close over
+// shared mutable state. We use this for two reasons:
+//   1. The Proxy-based config mock needs to read a flag value that the test
+//      can flip per-case (Task 6 flag-off scenario).
+//   2. The db/client mock needs to return a query-chain whose terminal
+//      `.limit(1)` resolves to the conversa+pessoa row that
+//      `loadConversaWithPessoa` (core.ts:368) returns. Production code uses
+//      dynamic imports of `@/db/client.js` and `@/db/schema.js`; vitest
+//      intercepts those, so the mock factories surface as the resolved
+//      modules. Without this mock, the agent-loop tests in Tasks 6/7 would
+//      throw `TypeError: db.select is not a function` at core.ts:373 before
+//      reaching the no-tool-uses branch under test.
+const { flagState, dbState } = vi.hoisted(() => ({
+  flagState: { FEATURE_VIEW_ONCE_SENSITIVE: true },
+  dbState: { conversaResult: [] as unknown[] },
+}));
+
 const sendOutboundText = vi.fn();
 const findById = vi.fn();
 const audit = vi.fn();
@@ -394,9 +411,6 @@ const createMensagem = vi.fn();
 const findMensagem = vi.fn();
 const markProcessed = vi.fn();
 const recentInConversation = vi.fn();
-
-// Mutable feature-flag values for per-test override (Task 6 flag-off scenario).
-const flagState = { FEATURE_VIEW_ONCE_SENSITIVE: true };
 
 vi.mock('../../src/gateway/baileys.js', () => ({
   sendOutboundText,
@@ -419,6 +433,26 @@ vi.mock('../../src/db/repositories.js', () => ({
   rulesRepo: { listActive: vi.fn().mockResolvedValue([]) },
   entityStatesRepo: { byId: vi.fn().mockResolvedValue(null) },
   entidadesRepo: { byIds: vi.fn().mockResolvedValue([]) },
+}));
+// Drizzle query-chain mock — see vi.hoisted block above for rationale.
+vi.mock('../../src/db/client.js', () => {
+  const fakeQuery = {
+    from: () => fakeQuery,
+    innerJoin: () => fakeQuery,
+    where: () => fakeQuery,
+    limit: () => Promise.resolve(dbState.conversaResult),
+  };
+  return {
+    db: { select: () => fakeQuery },
+    withTx: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})),
+  };
+});
+vi.mock('../../src/db/schema.js', () => ({
+  conversas: {} as unknown,
+  pessoas: {} as unknown,
+}));
+vi.mock('drizzle-orm', () => ({
+  eq: () => ({}),
 }));
 vi.mock('../../src/governance/audit.js', () => ({ audit }));
 vi.mock('../../src/lib/logger.js', () => ({
@@ -607,15 +641,12 @@ vi.mock('../../src/agent/reflection.js', () => ({
   findPreviousAssistantMessage: vi.fn(),
 }));
 
-vi.mock('../../src/db/client.js', () => ({
-  db: {} as never,
-  withTx: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})),
-}));
-
-// `loadConversaWithPessoa` in core.ts uses dynamic imports of db/client and
-// db/schema. Since the agent loop test only exercises the no-tool-uses branch
-// after a fake LLM response, we sidestep that helper by feeding the test via
-// findMensagem returning an inbound that already has conversa_id set.
+// Note: `vi.mock('../../src/db/client.js', ...)` and `vi.mock('drizzle-orm', ...)`
+// are already declared in the Task 5 shared block at the top of the file.
+// `loadConversaWithPessoa` (core.ts:368) is invoked at line 93 of
+// runAgentForMensagem; the shared block's query-chain mock returns
+// `dbState.conversaResult`. Set this in beforeEach (see runWithToolUses helper
+// below) so every agent-loop test resolves the conversa lookup correctly.
 
 const PESSOA = {
   id: 'p1',
@@ -635,6 +666,8 @@ const INBOUND = {
   processada_em: null,
 };
 
+const CONVERSA = { id: 'c1', pessoa_id: 'p1', status: 'ativa' } as never;
+
 describe('agent loop — view-once decision + audit', () => {
   beforeEach(() => {
     callLLM.mockReset();
@@ -650,8 +683,12 @@ describe('agent loop — view-once decision + audit', () => {
     findMensagem.mockResolvedValue({ ...INBOUND });
     findById.mockResolvedValue(PESSOA);
     sendOutboundText.mockResolvedValue('WAID-OUT');
-    // tools: query_balance is sensitive, list_transactions is not
-    // We patch the REGISTRY indirectly via the test seam from Task 3.
+    // Drizzle query-chain returns the conversa+pessoa join row that
+    // loadConversaWithPessoa expects. The shape `{ conversas, pessoas }`
+    // matches drizzle's innerJoin result format used in core.ts:368-380.
+    dbState.conversaResult = [{ conversas: CONVERSA, pessoas: PESSOA }];
+    // tools: query_balance is sensitive, list_transactions is not.
+    // The test imports the real REGISTRY (Task 3 flagged the two tools).
   });
 
   async function runWithToolUses(toolNames: string[]) {
@@ -853,13 +890,23 @@ Append to `tests/unit/view-once.spec.ts`:
 ```typescript
 describe('agent loop — preference override', () => {
   beforeEach(() => {
-    // Same beforeEach setup as the prior describe block.
-    // Re-mock pessoa with balance_view_once: false.
-    findById.mockResolvedValue({
-      ...PESSOA,
-      preferencias: { balance_view_once: false },
-    });
+    // Replicate Task 6's beforeEach (mock resets, defaults, dbState), then
+    // override pessoa with balance_view_once: false.
+    callLLM.mockReset();
+    dispatchTool.mockReset();
+    sendOutboundText.mockReset();
+    audit.mockReset();
+    createMensagem.mockReset();
+    findById.mockReset();
+    findMensagem.mockReset();
+    markProcessed.mockReset();
+    recentInConversation.mockReset().mockResolvedValue([]);
+    buildPrompt.mockResolvedValue({ system: 's', messages: [] });
+    findMensagem.mockResolvedValue({ ...INBOUND });
+    const PESSOA_OPTED_OUT = { ...PESSOA, preferencias: { balance_view_once: false } };
+    findById.mockResolvedValue(PESSOA_OPTED_OUT);
     sendOutboundText.mockResolvedValue('WAID-OUT');
+    dbState.conversaResult = [{ conversas: CONVERSA, pessoas: PESSOA_OPTED_OUT }];
   });
 
   it('preference=false on sensitive turn → no view-once; skipped audit fires', async () => {
