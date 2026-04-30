@@ -347,6 +347,13 @@ export const transacoesRepo = {
         ),
       );
   },
+  async byId(id: string): Promise<Transacao | null> {
+    const rows = await db.select().from(transacoes).where(eq(transacoes.id, id)).limit(1);
+    return rows[0] ?? null;
+  },
+  async update(id: string, patch: Partial<Transacao>): Promise<void> {
+    await db.update(transacoes).set(patch).where(eq(transacoes.id, id));
+  },
 };
 
 export const categoriasRepo = {
@@ -694,6 +701,9 @@ export const auditRepo = {
       .where(eq(audit_log.pessoa_id, pessoa_id))
       .orderBy(desc(audit_log.created_at))
       .limit(n);
+  },
+  async findByMensagemId(mensagem_id: string): Promise<AuditEntry[]> {
+    return db.select().from(audit_log).where(eq(audit_log.mensagem_id, mensagem_id));
   },
 };
 

@@ -2,6 +2,7 @@ import type { z } from 'zod';
 import type { ActionKey, AuditAction } from '@/governance/audit-actions.js';
 import type { ResolvedPermission } from '@/governance/permissions.js';
 import { registerTransactionTool } from './register-transaction.js';
+import { cancelTransactionTool } from './cancel-transaction.js';
 import { queryBalanceTool } from './query-balance.js';
 import { listTransactionsTool } from './list-transactions.js';
 import { classifyTransactionTool } from './classify-transaction.js';
@@ -40,12 +41,17 @@ export type Tool<I extends z.ZodTypeAny, O extends z.ZodTypeAny> = {
   operation_type: 'create' | 'correct' | 'cancel' | 'update_meta' | 'parse_only' | 'read' | 'communicate';
   audit_action: AuditAction;
   handler: (input: z.infer<I>, ctx: ToolHandlerCtx) => Promise<z.infer<O>>;
+  // Optional: extract the resource id (e.g. transacao_id) from the tool's
+  // result so the dispatcher can populate audit.alvo_id. Returning null
+  // signals "no new resource was created" (e.g. duplicate-suspected branch).
+  extractAlvoId?: (result: z.infer<O>) => string | null;
 };
 
 export type AnyTool = Tool<z.ZodTypeAny, z.ZodTypeAny>;
 
 export const REGISTRY: Record<string, AnyTool> = {
   register_transaction: registerTransactionTool as unknown as AnyTool,
+  cancel_transaction: cancelTransactionTool as unknown as AnyTool,
   query_balance: queryBalanceTool as unknown as AnyTool,
   list_transactions: listTransactionsTool as unknown as AnyTool,
   classify_transaction: classifyTransactionTool as unknown as AnyTool,

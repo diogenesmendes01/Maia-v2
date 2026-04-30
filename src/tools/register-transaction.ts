@@ -47,6 +47,8 @@ export const registerTransactionTool: Tool<typeof inputSchema, typeof outputSche
   redis_required: false,
   operation_type: 'create',
   audit_action: 'transaction_created',
+  extractAlvoId: (result) =>
+    'transacao_id' in result && typeof result.transacao_id === 'string' ? result.transacao_id : null,
   handler: async (args, ctx) => {
     const conta = await contasRepo.byId(args.conta_id);
     if (!conta) throw new TypedError('conta_not_found', 'conta não existe');

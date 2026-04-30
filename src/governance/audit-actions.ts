@@ -74,6 +74,15 @@ export const AUDIT_ACTIONS = [
   'reaction_ignored_unmapped_emoji',
   'one_tap_no_pending_anchor',
   'one_tap_dispatch_error',
+  'mensagem_edited',
+  'mensagem_revoked',
+  'mensagem_edited_after_side_effect',
+  'mensagem_revoked_after_side_effect',
+  'edit_review_resolved',
+  'pending_substituted_by_edit_review',
+  'pending_reminder_sent',
+  'pending_reminder_skipped_no_outbound',
+  'pending_reminder_skipped_already_marked',
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];

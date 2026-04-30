@@ -20,6 +20,7 @@ import { enqueueAgent } from './queue.js';
 import { checkBotAndMaybeBlock } from './bot-detection.js';
 import { audit } from '@/governance/audit.js';
 import { dispatchReactionAsAnswer, dispatchPollVote } from '@/agent/one-tap.js';
+import { routeMessageUpdate } from '@/agent/message-update.js';
 import type { WhatsAppInbound, WAQuotedContext } from './types.js';
 
 let socket: WASocket | null = null;
@@ -86,6 +87,24 @@ export async function startBaileys(): Promise<void> {
         await handleIncoming(msg);
       } catch (err) {
         logger.error({ err }, 'baileys.handle_failed');
+      }
+    }
+  });
+
+  socket.ev.on('messages.update', async (updates) => {
+    if (!config.FEATURE_MESSAGE_UPDATE) return;
+    for (const update of updates) {
+      try {
+        // Baileys 6.7.0 delivers `update` as `{ key, update: Partial<WAMessageInfo> }`.
+        // We synthesise an IWebMessageInfo whose `message` is the `update.message`
+        // payload so routeMessageUpdate can branch on editedMessage / protocolMessage.
+        // The `as never` cast is intentional — runtime structure is what matters.
+        await routeMessageUpdate({
+          key: update.key,
+          message: update.update.message,
+        } as never);
+      } catch (err) {
+        logger.error({ err: (err as Error).message }, 'message_update.dispatch_failed');
       }
     }
   });

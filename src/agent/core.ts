@@ -307,7 +307,7 @@ async function sendOutbound(
   if (!pessoa) return;
   const jid = pessoa.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
   const wid = await sendOutboundText(jid, text, opts?.quoted ? { quoted: opts.quoted } : undefined);
-  const metadata: Record<string, unknown> = { whatsapp_id: wid, in_reply_to };
+  const metadata: Record<string, unknown> = { whatsapp_id: wid, remote_jid: jid, in_reply_to };
   if (opts?.pending_question_id) metadata.pending_question_id = opts.pending_question_id;
   await mensagensRepo.create({
     conversa_id,
@@ -352,6 +352,7 @@ async function sendOutboundPoll(
     midia_url: null,
     metadata: {
       whatsapp_id: sent.whatsapp_id,
+      remote_jid: jid,
       in_reply_to,
       pending_question_id: pending.id,
       poll_options: pending.opcoes_validas,
