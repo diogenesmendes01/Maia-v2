@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdir, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -57,12 +57,15 @@ describe('setup-state — phase transitions', () => {
 
   it('pairing_code lazily expires to unpaired on current() read after TTL', async () => {
     vi.useFakeTimers();
-    const { setupState, PAIRING_CODE_TTL_MS } = await import('../../src/setup/state.js');
-    setupState.setCode('12345678');
-    expect(setupState.current().phase).toBe('pairing_code');
-    vi.advanceTimersByTime(PAIRING_CODE_TTL_MS + 1000);
-    expect(setupState.current().phase).toBe('unpaired');
-    vi.useRealTimers();
+    try {
+      const { setupState, PAIRING_CODE_TTL_MS } = await import('../../src/setup/state.js');
+      setupState.setCode('12345678');
+      expect(setupState.current().phase).toBe('pairing_code');
+      vi.advanceTimersByTime(PAIRING_CODE_TTL_MS + 1000);
+      expect(setupState.current().phase).toBe('unpaired');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('markPaired transitions from pairing_qr to connected', async () => {
@@ -89,40 +92,44 @@ describe('setup-state — phase transitions', () => {
 });
 
 describe('setup-state — hasValidBaileysSession', () => {
-  const SANDBOX = join(tmpdir(), 'maia-setup-state-test-' + Date.now());
+  let SANDBOX: string;
+
+  beforeEach(async () => {
+    SANDBOX = join(tmpdir(), `maia-setup-state-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(SANDBOX, { recursive: true });
+  });
+
+  afterEach(async () => {
+    await rm(SANDBOX, { recursive: true, force: true }).catch(() => undefined);
+  });
 
   it('returns false when creds.json missing', async () => {
-    await mkdir(SANDBOX, { recursive: true });
     const { hasValidBaileysSession } = await import('../../src/setup/state.js');
     expect(await hasValidBaileysSession(SANDBOX)).toBe(false);
-    await rm(SANDBOX, { recursive: true, force: true });
   });
 
   it('returns false when creds.json present but missing me field', async () => {
-    await mkdir(SANDBOX, { recursive: true });
     await writeFile(join(SANDBOX, 'creds.json'), JSON.stringify({ noteworthy: 'data' }));
     const { hasValidBaileysSession } = await import('../../src/setup/state.js');
     expect(await hasValidBaileysSession(SANDBOX)).toBe(false);
-    await rm(SANDBOX, { recursive: true, force: true });
   });
 
   it('returns true when creds.json has me field', async () => {
-    await mkdir(SANDBOX, { recursive: true });
     await writeFile(join(SANDBOX, 'creds.json'), JSON.stringify({ me: { id: '5511...' } }));
     const { hasValidBaileysSession } = await import('../../src/setup/state.js');
     expect(await hasValidBaileysSession(SANDBOX)).toBe(true);
-    await rm(SANDBOX, { recursive: true, force: true });
   });
 });
 
 describe('setup-recovery — concurrency lock', () => {
-  it('triggerRecovery is idempotent: concurrent calls share the same promise', async () => {
+  it('triggerRecovery is idempotent and runs the full recovery sequence exactly once', async () => {
     vi.resetModules();
-    vi.doMock('../../src/governance/audit.js', () => ({ audit: vi.fn() }));
-    vi.doMock('../../src/lib/alerts.js', () => ({ sendAlert: vi.fn().mockResolvedValue(undefined) }));
-    vi.doMock('../../src/setup/token.js', () => ({
-      rotateToken: vi.fn().mockResolvedValue('new-token'),
-    }));
+    const auditMock = vi.fn().mockResolvedValue(undefined);
+    const sendAlertMock = vi.fn().mockResolvedValue(undefined);
+    const rotateTokenMock = vi.fn().mockResolvedValue('new-token');
+    vi.doMock('../../src/governance/audit.js', () => ({ audit: auditMock }));
+    vi.doMock('../../src/lib/alerts.js', () => ({ sendAlert: sendAlertMock }));
+    vi.doMock('../../src/setup/token.js', () => ({ rotateToken: rotateTokenMock }));
     vi.doMock('../../src/config/env.js', () => ({
       config: { BAILEYS_AUTH_DIR: '/tmp/maia-recovery-test-stub' },
     }));
@@ -135,12 +142,27 @@ describe('setup-recovery — concurrency lock', () => {
     const startBaileys = vi.fn().mockResolvedValue(undefined);
 
     const { triggerRecovery, _internal } = await import('../../src/setup/recovery.js');
+    const { setupState } = await import('../../src/setup/state.js');
+
     const p1 = triggerRecovery({ shutdownBaileys, startBaileys });
     const p2 = triggerRecovery({ shutdownBaileys, startBaileys });
-    expect(p1).toBe(p2); // same promise reference
+    expect(p1).toBe(p2); // singleton lock: same promise reference
     await p1;
+
+    // Each side-effect runs exactly once.
     expect(shutdownBaileys).toHaveBeenCalledTimes(1);
     expect(startBaileys).toHaveBeenCalledTimes(1);
+    expect(rotateTokenMock).toHaveBeenCalledTimes(1);
+    expect(sendAlertMock).toHaveBeenCalledTimes(1);
+
+    // Audit trail is complete (start + completed).
+    expect(auditMock).toHaveBeenCalledWith({ acao: 'pairing_recovery_started' });
+    expect(auditMock).toHaveBeenCalledWith({ acao: 'pairing_recovery_completed' });
+
+    // Final state is unpaired (recovery completed; setUnpaired ran before sendAlert).
+    expect(setupState.current().phase).toBe('unpaired');
+
+    // Lock released.
     expect(_internal.isRecovering()).toBe(false);
   });
 });

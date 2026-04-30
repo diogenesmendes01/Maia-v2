@@ -9,7 +9,8 @@ import { sendAlert } from '@/lib/alerts.js';
 /** Mutable container — avoids Vitest live-binding getter wrapping of bare `let`. */
 const _state = { recoveryPromise: null as Promise<void> | null };
 
-const RECOVERY_ALERT_BODY = `A sessão WhatsApp da Maia foi derrubada (LoggedOut). Limpamos a sessão
+function buildRecoveryAlertBody(): string {
+  return `A sessão WhatsApp da Maia foi derrubada (LoggedOut). Limpamos a sessão
 antiga e geramos um novo bootstrap token automaticamente.
 
 Para re-parear:
@@ -21,6 +22,7 @@ Para re-parear:
 
 Status atual: aguardando re-pareamento.
 Token anterior está revogado.`;
+}
 
 /**
  * Triggered on Baileys `connection: 'close'` with `reason ===
@@ -63,7 +65,7 @@ async function doRecovery(deps: {
     setupState.setUnpaired();
     await sendAlert({
       subject: 'Maia desconectada — re-pareamento necessário',
-      body: RECOVERY_ALERT_BODY,
+      body: buildRecoveryAlertBody(),
     }).catch((err) => logger.warn({ err }, 'setup.recovery_alert_failed'));
     await audit({ acao: 'pairing_recovery_completed' });
     await deps.startBaileys();
@@ -74,7 +76,12 @@ async function doRecovery(deps: {
   }
 }
 
-/** Test-only export so we can verify the singleton lock from unit tests. */
+/**
+ * Test-only export so we can verify and reset the singleton lock from unit
+ * tests. `isRecovering` is used by the concurrency-lock test; `reset` is
+ * provided for future tests that need to trigger recovery twice in a single
+ * test (e.g., to verify a second LoggedOut after the first recovery completes).
+ */
 export const _internal = {
   isRecovering: () => _state.recoveryPromise !== null,
   reset: () => {
