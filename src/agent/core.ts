@@ -176,10 +176,24 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
             // off (the alternative — gating only inside baileys.ts — would
             // cause the agent loop's audit to fire even when no view-once
             // envelope was actually used).
+            const prefDisabled =
+              (pessoa.preferencias as { balance_view_once?: boolean } | null)?.balance_view_once === false;
             const view_once =
-              config.FEATURE_VIEW_ONCE_SENSITIVE &&
-              turnHasSensitive &&
-              (pessoa.preferencias as { balance_view_once?: boolean } | null)?.balance_view_once !== false;
+              config.FEATURE_VIEW_ONCE_SENSITIVE && turnHasSensitive && !prefDisabled;
+            // Decision-time audit: fires on sensitive turn when the preference suppresses view-once.
+            // Independent of whether the resulting plain-text send succeeds (Baileys may be down).
+            // Only emit when the feature is actually enabled — when the flag is off, the
+            // Tool.sensitive flags have no runtime effect (spec §6) so a "skipped" audit
+            // would be misleading.
+            if (config.FEATURE_VIEW_ONCE_SENSITIVE && turnHasSensitive && prefDisabled) {
+              await audit({
+                acao: 'outbound_view_once_skipped_by_preference',
+                pessoa_id: pessoa.id,
+                conversa_id: c.id,
+                mensagem_id: inbound.id,
+                metadata: { sensitive_tools: sensitiveTools },
+              });
+            }
             const wid = await sendOutbound(pessoa.id, c.id, text, inbound.id, {
               pending_question_id: latestPending?.id ?? null,
               quoted: shouldQuote

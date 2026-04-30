@@ -295,3 +295,71 @@ describe('agent loop — view-once decision + audit', () => {
     }
   });
 });
+
+describe('agent loop — preference override', () => {
+  beforeEach(() => {
+    // Replicate Task 6's beforeEach (mock resets, defaults, dbState), then
+    // override pessoa with balance_view_once: false.
+    callLLM.mockReset();
+    dispatchTool.mockReset();
+    sendOutboundText.mockReset();
+    audit.mockReset();
+    createMensagem.mockReset();
+    findById.mockReset();
+    findMensagem.mockReset();
+    markProcessed.mockReset();
+    recentInConversation.mockReset().mockResolvedValue([]);
+    buildPrompt.mockResolvedValue({ system: 's', messages: [] });
+    findMensagem.mockResolvedValue({ ...INBOUND });
+    const PESSOA_OPTED_OUT = { ...PESSOA, preferencias: { balance_view_once: false } };
+    findById.mockResolvedValue(PESSOA_OPTED_OUT);
+    sendOutboundText.mockResolvedValue('WAID-OUT');
+    dbState.conversaResult = [{ conversas: CONVERSA, pessoas: PESSOA_OPTED_OUT }];
+  });
+
+  it('preference=false on sensitive turn → no view-once; skipped audit fires', async () => {
+    callLLM.mockResolvedValueOnce({
+      content: '',
+      tool_uses: [{ id: 't1', tool: 'query_balance', args: {} }],
+      usage: { input_tokens: 100, output_tokens: 10 },
+    });
+    callLLM.mockResolvedValueOnce({
+      content: 'Saldo R$ 1.234',
+      tool_uses: [],
+      usage: { input_tokens: 50, output_tokens: 20 },
+    });
+    dispatchTool.mockResolvedValue({ ok: true });
+    const { runAgentForMensagem } = await import('../../src/agent/core.js');
+    await runAgentForMensagem('in1');
+
+    // Outbound went out as plain text — no view_once
+    const lastCall = sendOutboundText.mock.calls.at(-1)!;
+    expect(lastCall[2]?.view_once).toBeUndefined();
+
+    // Skipped audit fired
+    const acoes = audit.mock.calls.map((c) => c[0].acao);
+    expect(acoes).toContain('outbound_view_once_skipped_by_preference');
+    // Success audit did NOT fire
+    expect(acoes).not.toContain('outbound_sent_view_once');
+  });
+
+  it('preference=false + Baileys disconnected → skipped audit STILL fires (decision-time)', async () => {
+    sendOutboundText.mockResolvedValueOnce(null);
+    callLLM.mockResolvedValueOnce({
+      content: '',
+      tool_uses: [{ id: 't1', tool: 'query_balance', args: {} }],
+      usage: { input_tokens: 100, output_tokens: 10 },
+    });
+    callLLM.mockResolvedValueOnce({
+      content: 'Saldo',
+      tool_uses: [],
+      usage: { input_tokens: 50, output_tokens: 20 },
+    });
+    dispatchTool.mockResolvedValue({ ok: true });
+    const { runAgentForMensagem } = await import('../../src/agent/core.js');
+    await runAgentForMensagem('in1');
+    const acoes = audit.mock.calls.map((c) => c[0].acao);
+    // Skipped audit was emitted before the send attempt
+    expect(acoes).toContain('outbound_view_once_skipped_by_preference');
+  });
+});
