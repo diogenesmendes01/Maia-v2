@@ -1335,13 +1335,13 @@ export async function registerSetupRoutes(app: FastifyInstance): Promise<void> {
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `npx vitest run tests/unit/setup-routes.spec.ts`
-Expected: PASS — 12 tests across 6 describe blocks.
+Expected: PASS — 13 tests across 6 describe blocks (3 auth + 3 POST start + 3 phase rendering + 2 qr.png + 1 status + 1 done = 13).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/setup/index.ts tests/unit/setup-routes.spec.ts
-git commit -m "feat(setup): Fastify routes (chooser/qr/code/status/done) + auth + 12 tests"
+git commit -m "feat(setup): Fastify routes (chooser/qr/code/status/done) + auth + 13 tests"
 ```
 
 ---
