@@ -86,6 +86,7 @@ export const AUDIT_ACTIONS = [
   'outbound_sent_view_once',
   'outbound_view_once_skipped_by_preference',
   'outbound_sent_document',
+  'outbound_sent_voice',
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];
