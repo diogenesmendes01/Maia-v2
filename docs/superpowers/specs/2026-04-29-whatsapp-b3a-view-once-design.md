@@ -151,7 +151,7 @@ Every view-once send emits `outbound_sent_view_once` audit:
 
 Audit fires only on actual view-once sends (not when the flag was on but the preference disabled). When the preference disables view-once on a sensitive turn, emit `outbound_view_once_skipped_by_preference` so the owner-side opt-out is observable.
 
-**Null-WAID handling**: `sendOutboundText` returns `null` when Baileys is disconnected (`baileys.ts:254-257`) — the message was never delivered. In that case the audit MUST NOT fire (no view-once send happened). Concretely:
+**Null-WAID handling**: `sendOutboundText` returns `null` when Baileys is disconnected (`baileys.ts:235-237`) — the message was never delivered. In that case the audit MUST NOT fire (no view-once send happened). Concretely:
 
 ```typescript
 const wid = await sendOutboundText(jid, text, { quoted, view_once });
