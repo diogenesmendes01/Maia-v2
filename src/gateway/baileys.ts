@@ -27,8 +27,11 @@ let socket: WASocket | null = null;
 let connected = false;
 let lastDisconnectAt: Date | null = null;
 
-const MEDIA_ROOT = join(config.BAILEYS_AUTH_DIR, '..', 'media');
+export const MEDIA_ROOT = join(config.BAILEYS_AUTH_DIR, '..', 'media');
 mkdirSync(MEDIA_ROOT, { recursive: true });
+// B3b: tmp subdir for in-flight PDF reports. Created here (idempotent) so any
+// caller importing MEDIA_ROOT can rely on `<MEDIA_ROOT>/tmp` existing.
+mkdirSync(join(MEDIA_ROOT, 'tmp'), { recursive: true });
 
 export function isBaileysConnected(): boolean {
   return connected;
