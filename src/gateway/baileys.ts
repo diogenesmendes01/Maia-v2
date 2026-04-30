@@ -90,8 +90,14 @@ export async function startBaileys(): Promise<void> {
       connected = true;
       logger.info('baileys.connected');
       await audit({ acao: 'whatsapp_connected' });
+      // pairing_completed is one-shot per successful pair (spec §4.7(b)). Skip
+      // when the previous phase was already 'connected' — that path is a
+      // transient reconnect (no QR/code was exchanged), not a new pair event.
+      const phaseBefore = setupState.current().phase;
       setupState.markPaired();
-      await audit({ acao: 'pairing_completed' });
+      if (phaseBefore !== 'connected') {
+        await audit({ acao: 'pairing_completed' });
+      }
     } else if (conn === 'close') {
       connected = false;
       lastDisconnectAt = new Date();

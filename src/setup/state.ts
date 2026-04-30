@@ -53,7 +53,13 @@ class SetupState {
     };
   }
 
-  /** Called on Baileys `connection: 'open'`. */
+  /**
+   * Called on Baileys `connection: 'open'`. Unconditional set — valid from
+   * `pairing_qr`, `pairing_code`, `disconnected_transient` (transient reconnect
+   * with a still-valid session, no new QR/code), and as a defensive fallback
+   * from any other phase. The `pairing_completed` audit is gated by the caller
+   * (`baileys.ts`) so transient reconnects don't pollute the audit log.
+   */
   markPaired(): void {
     state = { phase: 'connected', connectedAt: new Date() };
   }
