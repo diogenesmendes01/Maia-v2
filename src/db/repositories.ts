@@ -370,6 +370,10 @@ export const categoriasRepo = {
     const rows = await db.select().from(categorias).where(eq(categorias.id, id)).limit(1);
     return rows[0] ?? null;
   },
+  async byIds(ids: string[]): Promise<Categoria[]> {
+    if (ids.length === 0) return [];
+    return db.select().from(categorias).where(inArray(categorias.id, ids));
+  },
   async byNomeNatureza(nome: string, natureza: string): Promise<Categoria | null> {
     const rows = await db
       .select()

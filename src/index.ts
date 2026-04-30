@@ -14,6 +14,11 @@ async function main() {
   await audit({ acao: 'system_started' });
 
   await ensureRedisConnect();
+
+  // B3b: clean up any orphan PDF reports from a prior crash. Best-effort.
+  const { sweepPdfTmp } = await import('@/lib/pdf/_sweeper.js');
+  await sweepPdfTmp().catch((err) => logger.warn({ err }, 'pdf.sweeper.boot_failed'));
+
   await startServer();
   startAgentWorker(async (job) => {
     await runAgentForMensagem(job.data.mensagem_id);

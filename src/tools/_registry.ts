@@ -20,6 +20,8 @@ import { saveRuleTool } from './save-rule.js';
 import { listPendingTool } from './list-pending.js';
 import { startWorkflowTool } from './start-workflow.js';
 import { askPendingQuestionTool } from './ask-pending-question.js';
+import { generateReportTool } from './generate-report.js';
+import { config } from '@/config/env.js';
 
 export type ToolHandlerCtx = {
   pessoa: import('@/db/schema.js').Pessoa;
@@ -74,6 +76,10 @@ export const REGISTRY: Record<string, AnyTool> = {
   list_pending: listPendingTool as unknown as AnyTool,
   start_workflow: startWorkflowTool as unknown as AnyTool,
   ask_pending_question: askPendingQuestionTool as unknown as AnyTool,
+  // B3b: gated by feature flag. When false, the LLM never sees this tool.
+  ...(config.FEATURE_PDF_REPORTS
+    ? { generate_report: generateReportTool as unknown as AnyTool }
+    : {}),
 };
 
 export function getToolSchemas(byEntity: Map<string, ResolvedPermission>) {
