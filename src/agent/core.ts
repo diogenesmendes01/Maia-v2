@@ -146,6 +146,8 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
     id: string;
     opcoes_validas: Array<{ key: string; label: string }>;
   } | null = null;
+  let turnHasSensitive = false;
+  const sensitiveTools: string[] = [];
 
   const jid = pessoa.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
   const stopTyping = scheduleTypingDebounce(jid, inbound.id);
@@ -168,12 +170,38 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
             const shouldQuote =
               (inbound.conteudo && detectCorrection(inbound.conteudo)) ||
               getActivePending(c) !== null;
-            await sendOutbound(pessoa.id, c.id, text, inbound.id, {
+            // Per spec §6: when FEATURE_VIEW_ONCE_SENSITIVE is false,
+            // Tool.sensitive flags have NO runtime effect. We gate view_once on
+            // the flag here so the audit also doesn't fire when the feature is
+            // off (the alternative — gating only inside baileys.ts — would
+            // cause the agent loop's audit to fire even when no view-once
+            // envelope was actually used).
+            const view_once =
+              config.FEATURE_VIEW_ONCE_SENSITIVE &&
+              turnHasSensitive &&
+              (pessoa.preferencias as { balance_view_once?: boolean } | null)?.balance_view_once !== false;
+            const wid = await sendOutbound(pessoa.id, c.id, text, inbound.id, {
               pending_question_id: latestPending?.id ?? null,
               quoted: shouldQuote
                 ? quotedReplyContext(inbound.metadata as Record<string, unknown> | null, inbound.conteudo)
                 : undefined,
+              view_once,
             });
+            // Audit fires only when the actual view-once send produced a WAID;
+            // if Baileys returned null (disconnected) we silently skip per
+            // spec §4.6 iter-2 fix.
+            if (wid && view_once) {
+              await audit({
+                acao: 'outbound_sent_view_once',
+                pessoa_id: pessoa.id,
+                conversa_id: c.id,
+                mensagem_id: inbound.id,
+                metadata: {
+                  whatsapp_id: wid,
+                  sensitive_tools: sensitiveTools,
+                },
+              });
+            }
           }
         }
         break;
@@ -240,6 +268,14 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
 
         // Sub-A: silent ack via reaction on side-effect tool outcomes.
         const tool = REGISTRY[tu.tool];
+        // B3a: track sensitive tools dispatched in this turn. The dedup guard
+        // (`!sensitiveTools.includes`) keeps the audit's `sensitive_tools`
+        // list as a unique set even when the LLM dispatches the same tool
+        // multiple times (e.g., balance for two entidade_ids).
+        if (tool?.sensitive && !sensitiveTools.includes(tu.tool)) {
+          turnHasSensitive = true;
+          sensitiveTools.push(tu.tool);
+        }
         const isSideEffect =
           tool && (tool.side_effect === 'write' || tool.side_effect === 'communication');
         if (isSideEffect) {

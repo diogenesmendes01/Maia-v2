@@ -87,6 +87,51 @@ vi.mock('../../src/config/env.js', () => ({
   ),
 }));
 
+// Task 6: additional vi.mock calls for the agent-loop tests below.
+const dispatchTool = vi.fn();
+vi.mock('../../src/tools/_dispatcher.js', () => ({ dispatchTool }));
+
+const callLLM = vi.fn();
+vi.mock('../../src/lib/claude.js', () => ({ callLLM }));
+
+const buildPrompt = vi.fn();
+vi.mock('../../src/agent/prompt-builder.js', () => ({
+  buildPrompt,
+  PROMPT_TOKEN_BUDGET_INPUT: 11000,
+  PROMPT_TOKEN_BUDGET_OUTPUT: 1024,
+}));
+
+vi.mock('../../src/agent/pending-gate.js', () => ({
+  checkPendingFirst: vi.fn().mockResolvedValue({ kind: 'no_pending' }),
+}));
+
+vi.mock('../../src/identity/resolver.js', () => ({ resolveIdentity: vi.fn() }));
+vi.mock('../../src/identity/quarantine.js', () => ({
+  handleQuarantineFirstContact: vi.fn(),
+  handleOwnerIdentityReply: vi.fn(),
+}));
+vi.mock('../../src/governance/permissions.js', () => ({
+  resolveScope: vi.fn().mockResolvedValue({ entidades: [], byEntity: new Map() }),
+}));
+vi.mock('../../src/gateway/rate-limit.js', () => ({
+  checkRateLimit: vi.fn().mockResolvedValue({ kind: 'allow' }),
+  formatPoliteReply: vi.fn(),
+}));
+vi.mock('../../src/gateway/presence.js', () => ({
+  startTyping: vi.fn(() => ({ stop: vi.fn() })),
+  sendReaction: vi.fn(),
+  quotedReplyContext: vi.fn(),
+  sendPoll: vi.fn(),
+}));
+vi.mock('../../src/workflows/pending-questions.js', () => ({
+  getActivePending: vi.fn().mockReturnValue(null),
+}));
+vi.mock('../../src/agent/reflection.js', () => ({
+  detectCorrection: vi.fn().mockReturnValue(false),
+  reflectOnCorrection: vi.fn(),
+  findPreviousAssistantMessage: vi.fn(),
+}));
+
 describe('sendOutbound — view_once threading', () => {
   beforeEach(() => {
     sendOutboundText.mockReset();
@@ -125,5 +170,128 @@ describe('Tool.sensitive registry surface', () => {
     expect(REGISTRY.list_transactions?.sensitive).toBeFalsy();
     expect(REGISTRY.register_transaction?.sensitive).toBeFalsy();
     expect(REGISTRY.ask_pending_question?.sensitive).toBeFalsy();
+  });
+});
+
+const PESSOA = {
+  id: 'p1',
+  telefone_whatsapp: '+5511888888888',
+  nome: 'Test',
+  tipo: 'owner',
+  preferencias: {},
+} as never;
+const INBOUND = {
+  id: 'in1',
+  conversa_id: 'c1',
+  direcao: 'in' as const,
+  tipo: 'texto' as const,
+  conteudo: 'qual o saldo?',
+  metadata: { whatsapp_id: 'WAID-IN' },
+  processada_em: null,
+};
+
+const CONVERSA = { id: 'c1', pessoa_id: 'p1', status: 'ativa' } as never;
+
+describe('agent loop — view-once decision + audit', () => {
+  beforeEach(() => {
+    callLLM.mockReset();
+    dispatchTool.mockReset();
+    sendOutboundText.mockReset();
+    audit.mockReset();
+    createMensagem.mockReset();
+    findById.mockReset();
+    findMensagem.mockReset();
+    markProcessed.mockReset();
+    recentInConversation.mockReset().mockResolvedValue([]);
+    buildPrompt.mockResolvedValue({ system: 's', messages: [] });
+    findMensagem.mockResolvedValue({ ...INBOUND });
+    findById.mockResolvedValue(PESSOA);
+    sendOutboundText.mockResolvedValue('WAID-OUT');
+    // Drizzle query-chain returns the conversa+pessoa join row that
+    // loadConversaWithPessoa expects. The shape `{ conversas, pessoas }`
+    // matches drizzle's innerJoin result format used in core.ts:368-380.
+    dbState.conversaResult = [{ conversas: CONVERSA, pessoas: PESSOA }];
+    // tools: query_balance is sensitive, list_transactions is not.
+    // The test imports the real REGISTRY (Task 3 flagged the two tools).
+  });
+
+  async function runWithToolUses(toolNames: string[]) {
+    // First LLM call: tool uses
+    callLLM.mockResolvedValueOnce({
+      content: '',
+      tool_uses: toolNames.map((t, i) => ({ id: `tu-${i}`, tool: t, args: {} })),
+      usage: { input_tokens: 100, output_tokens: 10 },
+    });
+    // Second LLM call: final text
+    callLLM.mockResolvedValueOnce({
+      content: 'Saldo R$ 1.234,56',
+      tool_uses: [],
+      usage: { input_tokens: 50, output_tokens: 20 },
+    });
+    dispatchTool.mockResolvedValue({ ok: true });
+    const { runAgentForMensagem } = await import('../../src/agent/core.js');
+    await runAgentForMensagem('in1');
+  }
+
+  it('sensitive turn (query_balance) + flag on + preference unset → view-once + audit', async () => {
+    await runWithToolUses(['query_balance']);
+    expect(sendOutboundText).toHaveBeenCalledWith(
+      expect.stringMatching(/@s\.whatsapp\.net$/),
+      'Saldo R$ 1.234,56',
+      expect.objectContaining({ view_once: true }),
+    );
+    const auditCalls = audit.mock.calls.map((c) => c[0]);
+    expect(auditCalls).toContainEqual(
+      expect.objectContaining({
+        acao: 'outbound_sent_view_once',
+        metadata: expect.objectContaining({
+          sensitive_tools: ['query_balance'],
+          whatsapp_id: 'WAID-OUT',
+        }),
+      }),
+    );
+  });
+
+  it('mixed turn (query_balance + list_transactions) → still view-once', async () => {
+    await runWithToolUses(['list_transactions', 'query_balance']);
+    expect(sendOutboundText).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ view_once: true }),
+    );
+  });
+
+  it('non-sensitive turn → no view-once; no view-once audit', async () => {
+    await runWithToolUses(['list_transactions']);
+    const lastCall = sendOutboundText.mock.calls.at(-1)!;
+    expect(lastCall[2]?.view_once).toBeUndefined();
+    const acoes = audit.mock.calls.map((c) => c[0].acao);
+    expect(acoes).not.toContain('outbound_sent_view_once');
+    expect(acoes).not.toContain('outbound_view_once_skipped_by_preference');
+  });
+
+  it('null WAID (Baileys disconnected) → no outbound_sent_view_once audit', async () => {
+    sendOutboundText.mockResolvedValueOnce(null); // disconnect simulated
+    await runWithToolUses(['query_balance']);
+    const acoes = audit.mock.calls.map((c) => c[0].acao);
+    expect(acoes).not.toContain('outbound_sent_view_once');
+  });
+
+  it('FEATURE_VIEW_ONCE_SENSITIVE=false → no view-once, no audit (even on sensitive turn)', async () => {
+    // The shared config mock uses a Proxy whose getter reads
+    // `flagState.FEATURE_VIEW_ONCE_SENSITIVE`. Flip it for this test:
+    flagState.FEATURE_VIEW_ONCE_SENSITIVE = false;
+    try {
+      await runWithToolUses(['query_balance']);
+      const lastCall = sendOutboundText.mock.calls.at(-1)!;
+      // Agent loop gates `view_once` on the flag (Task 6 Step 3), so view_once
+      // is never set on the call when the flag is off — even on a sensitive turn.
+      expect(lastCall[2]?.view_once).toBeUndefined();
+      const acoes = audit.mock.calls.map((c) => c[0].acao);
+      expect(acoes).not.toContain('outbound_sent_view_once');
+      expect(acoes).not.toContain('outbound_view_once_skipped_by_preference');
+    } finally {
+      flagState.FEATURE_VIEW_ONCE_SENSITIVE = true;
+    }
   });
 });
