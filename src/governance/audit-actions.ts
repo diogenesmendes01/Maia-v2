@@ -86,6 +86,14 @@ export const AUDIT_ACTIONS = [
   'outbound_sent_view_once',
   'outbound_view_once_skipped_by_preference',
   'outbound_sent_document',
+  'pairing_qr_displayed',
+  'pairing_code_requested',
+  'pairing_completed',
+  'pairing_logged_out',
+  'pairing_recovery_started',
+  'pairing_recovery_completed',
+  'setup_token_rotated',
+  'setup_unauthorized_access',
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];
