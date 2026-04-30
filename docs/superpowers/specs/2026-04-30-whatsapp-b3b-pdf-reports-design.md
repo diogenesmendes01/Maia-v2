@@ -96,7 +96,7 @@ Two generator modules in `src/lib/pdf/`:
 Both helpers internally:
 1. Build the pdfmake document definition (declarative JSON).
 2. Generate `Buffer` via `pdfMake.createPdfKitDocument(...).end()`.
-3. Write to `<media_root>/tmp/<uuid>.pdf` (where `<media_root>` is the existing `MEDIA_ROOT` constant from `src/gateway/baileys.ts:29`).
+3. Write to `<media_root>/tmp/<uuid>.pdf`. The `<media_root>` is the existing module-private `MEDIA_ROOT` constant in `src/gateway/baileys.ts:30`. Implementation note: that constant is currently NOT exported. The implementer SHOULD export it (`export const MEDIA_ROOT = ...`) so `src/lib/pdf/` can reuse it without re-deriving from `config.BAILEYS_AUTH_DIR`. Re-deriving would duplicate the path-resolution logic and risk drift if the convention changes.
 4. Return `{ path, summary }`.
 
 ### 4.3 PDF templates
@@ -176,6 +176,11 @@ if (latestReportPdf) {
       : undefined,
   });
   if (wid) {
+    // file_size_bytes is read BEFORE unlink (the unlink is in finally below).
+    const file_size_bytes = await fs
+      .stat(latestReportPdf.path)
+      .then((s) => s.size)
+      .catch(() => 0); // defensive: never let stat-failure block the audit
     await audit({
       acao: 'outbound_sent_document',
       pessoa_id: pessoa.id,
@@ -287,7 +292,7 @@ The function reads the file into a buffer rather than streaming — for our 500-
 
 ## 5. Schema / migrations
 
-None. No new DB tables. New audit_action `outbound_sent_document` appended to `src/governance/audit-actions.ts`. Existing `mensagens.tipo` enum already includes `'documento'` (per Spec 02).
+None. No new DB tables. New audit_action `outbound_sent_document` appended to `src/governance/audit-actions.ts`. The `mensagens.tipo` column (free-form `text`, see `src/db/schema.ts:177`) already accepts `'documento'` — that string value is in use today for inbound documents (see `src/gateway/baileys.ts:231` and `src/gateway/types.ts`). No DDL change needed.
 
 ## 6. Configuration
 
@@ -297,7 +302,11 @@ When `false`:
 - `getToolSchemas` filters out `generate_report`. The LLM never sees the tool exists. Behaviourally identical to pre-B3b.
 - The `latestReportPdf` tracking code still exists but `tu.tool === 'generate_report'` never fires (LLM can't invoke).
 - The PDF flow branch in core.ts is unreachable.
-- pdfmake is loaded lazily — `import('pdfmake/...')` only happens when `generate_report` actually runs. Avoids paying the bundle cost on every cold start.
+- pdfmake is loaded lazily — the dynamic import lives inside the `generate_report` handler (and the helpers it calls). Concretely:
+  - `const pdfMakeModule = await import('pdfmake/build/pdfmake.js');`
+  - `const vfsModule = await import('pdfmake/build/vfs_fonts.js');`
+  - Then attach the VFS to the pdfMake instance (idiomatic pdfmake bootstrap).
+  - The `pdfmake/build/pdfmake.js` core is ~2.5MB; `vfs_fonts.js` (default Roboto fonts) is ~1.5MB. Both load only on first PDF generation per process. With the flag off, the `generate_report` handler is unreachable, so neither loads.
 
 When `true`:
 - Tool registered, PDF flow active.
