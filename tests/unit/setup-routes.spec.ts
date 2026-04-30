@@ -193,6 +193,76 @@ describe('setup routes — GET /setup/status', () => {
   });
 });
 
+describe('setup routes — GET /setup/status (per-phase shape)', () => {
+  it('on pairing_code returns phase + expiresAt ISO; raw code is NOT leaked', async () => {
+    const { setupState } = await import('../../src/setup/state.js');
+    setupState.setUnpaired();
+    setupState.setCode('87654321');
+    const r = await app.inject({ method: 'GET', url: '/setup/status?token=TEST-TOKEN' });
+    expect(r.statusCode).toBe(200);
+    const body = JSON.parse(r.body);
+    expect(body.phase).toBe('pairing_code');
+    expect(typeof body.expiresAt).toBe('string');
+    // ISO 8601 with timezone (toISOString always emits Z-suffixed UTC).
+    expect(body.expiresAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    // Raw code MUST NOT appear in the JSON payload (security).
+    expect(JSON.stringify(body)).not.toContain('87654321');
+  });
+
+  it('on connected returns phase + connectedAt ISO', async () => {
+    const { setupState } = await import('../../src/setup/state.js');
+    setupState.setUnpaired();
+    setupState.setQr('q');
+    setupState.markPaired();
+    const r = await app.inject({ method: 'GET', url: '/setup/status?token=TEST-TOKEN' });
+    expect(r.statusCode).toBe(200);
+    const body = JSON.parse(r.body);
+    expect(body.phase).toBe('connected');
+    expect(typeof body.connectedAt).toBe('string');
+    expect(body.connectedAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+  });
+});
+
+describe('setup routes — POST /setup/start (validation + conflict branches)', () => {
+  it('returns 400 when method is missing or unknown', async () => {
+    const r1 = await app.inject({
+      method: 'POST',
+      url: '/setup/start?token=TEST-TOKEN',
+      payload: {},
+    });
+    expect(r1.statusCode).toBe(400);
+    const body1 = JSON.parse(r1.body);
+    expect(body1.ok).toBe(false);
+    expect(body1.error).toBe('invalid_method');
+
+    const r2 = await app.inject({
+      method: 'POST',
+      url: '/setup/start?token=TEST-TOKEN',
+      payload: { method: 'fax' },
+    });
+    expect(r2.statusCode).toBe(400);
+    expect(JSON.parse(r2.body).error).toBe('invalid_method');
+  });
+
+  it('returns 409 when method=code is requested from a non-unpaired phase', async () => {
+    const { setupState } = await import('../../src/setup/state.js');
+    setupState.setUnpaired();
+    setupState.setQr('q');
+    setupState.markPaired(); // phase=connected
+    const r = await app.inject({
+      method: 'POST',
+      url: '/setup/start?token=TEST-TOKEN',
+      payload: { method: 'code' },
+    });
+    expect(r.statusCode).toBe(409);
+    const body = JSON.parse(r.body);
+    expect(body.ok).toBe(false);
+    expect(body.phase).toBe('connected');
+    // triggerPairingCode must NOT be called when phase guard rejects
+    expect(triggerPairingCode).not.toHaveBeenCalled();
+  });
+});
+
 describe('setup routes — GET /setup/done', () => {
   it('returns 200 with confirmation HTML (no token required)', async () => {
     const r = await app.inject({ method: 'GET', url: '/setup/done' });

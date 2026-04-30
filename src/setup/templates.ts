@@ -184,7 +184,7 @@ export function renderRecovering(token: string): string {
 <div class="text-center py-4">
   <div class="inline-block animate-spin text-3xl mb-3">🔄</div>
   <p class="text-slate-700">Limpando sessão antiga e gerando novo token…</p>
-  <p class="text-sm text-slate-500 mt-2">~3s. Verifique seu canal de alertas (email/telegram) para o novo token.</p>
+  <p class="text-sm text-slate-500 mt-2">~3s. Verifique seu canal de alertas (email/telegram) para instruções de re-pareamento.</p>
 </div>
 ${STATUS_AND_FOOT('Limpando sessão antiga e gerando novo token…', token, 5)}`;
 }
