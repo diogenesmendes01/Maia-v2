@@ -73,26 +73,25 @@ export const PAIRING_CODE_TTL_MS = 180 * 1000;
 
 **Singleton** in `setupState.ts` exposes:
 
-- `current(): SetupPhase` — cheap accessor for endpoint reads.
-- `setQr(qr: string)` — called by Baileys QR callback.
-- `setCode(code: string)` — called when `triggerPairingCode` succeeds; sets `expiresAt = Date.now() + PAIRING_CODE_TTL_MS`.
-- `markPaired()` — called on Baileys `connection: 'open'`.
-- `markDisconnected()` — called on `connection: 'close'` with reason ≠ loggedOut.
+- `current(): SetupPhase` — cheap accessor; also performs lazy `pairing_code` TTL expiry check on each read (no separate timer needed).
+- `setQr(qr: string)` — called by Baileys QR callback. **Auto-transitions** `unpaired → pairing_qr` and `disconnected_transient → pairing_qr` (Baileys emits QR on cold start before operator clicks anything; and again on the 5s reconnect path when re-pair is needed). On `pairing_qr` already, just updates `qr`. On `connected`/`recovering`/`pairing_code`, ignored with warn log.
+- `setCode(code: string)` — called when `triggerPairingCode` succeeds; sets `expiresAt = Date.now() + PAIRING_CODE_TTL_MS`. Only valid from `unpaired`.
+- `markPaired()` — called on Baileys `connection: 'open'`. Sets phase to `connected` with `connectedAt`.
+- `markDisconnected()` — called on `connection: 'close'` with reason ≠ loggedOut. Transitions to `disconnected_transient`.
 - `triggerRecovery(): Promise<void>` — called on close + loggedOut. **Idempotent via internal singleton promise** (see §4.3).
-- `chooseQr() / chooseCode()` — operator-driven transitions from `unpaired` to a pairing phase.
 
 **Allowed transitions:**
 
 ```
-unpaired → pairing_qr | pairing_code
-pairing_qr → connected | disconnected_transient | recovering
-pairing_code → connected | disconnected_transient | recovering | unpaired (on TTL expiry)
-connected → disconnected_transient | recovering
-disconnected_transient → connected | recovering | unpaired
-recovering → unpaired
+unpaired                → pairing_qr (auto via setQr) | pairing_code (via setCode)
+pairing_qr              → connected | disconnected_transient | recovering | unpaired (qr cleared on Baileys re-init)
+pairing_code            → connected | disconnected_transient | recovering | unpaired (TTL expiry)
+connected               → disconnected_transient | recovering
+disconnected_transient  → connected | recovering | unpaired | pairing_qr (Baileys re-emits QR after 5s reconnect)
+recovering              → unpaired
 ```
 
-Illegal transitions throw at the boundary (defensive).
+Illegal transitions throw at the boundary (defensive). Note: `setQr` from `unpaired` and `disconnected_transient` is the **auto-transition path** — the operator's "I want QR" choice is implicit (any QR emitted by Baileys means we'll display it). The chooser HTML still posts `/setup/start?method=qr` for clarity, but server-side it's a no-op when phase is already `pairing_qr`.
 
 ### 4.3 Recovery lock (concurrency)
 
@@ -108,15 +107,16 @@ export async function triggerRecovery(): Promise<void> {
 }
 ```
 
-`doRecovery()` performs (in order):
+`doRecovery()` performs (in order — note: phase flipped to `unpaired` BEFORE alert is sent so the alert body's "aguardando re-pareamento" matches what `/setup` actually shows when the operator clicks the URL):
+
 1. Set phase = `recovering`.
 2. Audit `pairing_recovery_started`.
 3. `await shutdownBaileys()` (existing function in `gateway/baileys.ts`).
 4. `await rm(BAILEYS_AUTH_DIR, { recursive: true, force: true })`.
-5. `await rotateToken()` — generates new token, writes file, returns it.
-6. Send alert via `ALERT_CHANNELS` (see §4.6 for body).
-7. Audit `pairing_recovery_completed`.
-8. Set phase = `unpaired`.
+5. `await rotateToken()` — generates new token, writes file, returns it. (The token is NOT included in the alert body — see §4.6.)
+6. Set phase = `unpaired`.
+7. Send alert via `ALERT_CHANNELS` (see §4.6 for body). Best-effort: missing SMTP/Telegram credentials no-op silently per `src/lib/alerts.ts`.
+8. Audit `pairing_recovery_completed`.
 9. `await startBaileys()` (existing) — kicks off new pairing flow.
 
 Two concurrent `LoggedOut` events (rare but possible if Baileys emits twice) join the same promise → only one cleanup.
@@ -134,13 +134,26 @@ export async function ensureToken(): Promise<string> {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
     const token = randomBytes(16).toString('hex');                 // 32 hex chars
     await mkdir(dirname(TOKEN_FILE), { recursive: true });
-    await writeFile(TOKEN_FILE, token + '\n', { mode: 0o600 });
-    await audit({ acao: 'setup_token_rotated', metadata: { reason: 'cold_start' } });
-    return token;
+    // Atomic create: { flag: 'wx' } fails with EEXIST if another writer
+    // raced ahead. On EEXIST we re-read and return their token (last
+    // successful writer wins, no truncation race).
+    try {
+      await writeFile(TOKEN_FILE, token + '\n', { mode: 0o600, flag: 'wx' });
+      await audit({ acao: 'setup_token_rotated', metadata: { reason: 'cold_start' } });
+      return token;
+    } catch (writeErr) {
+      if ((writeErr as NodeJS.ErrnoException).code === 'EEXIST') {
+        return (await readFile(TOKEN_FILE, 'utf-8')).trim();
+      }
+      throw writeErr;
+    }
   }
 }
 
 export async function rotateToken(): Promise<string> {
+  // Single-process guarantee for rotation (the recoveryPromise lock at §4.3
+  // serialises calls). Concurrent ensureToken racing the unlink is harmless
+  // because ensureToken's `flag: 'wx'` makes the create atomic.
   await unlink(TOKEN_FILE).catch((err) => {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
   });
@@ -181,7 +194,7 @@ Branch on `setupState.current()`:
 | `pairing_qr` with `qr=null` | 200 + "Gerando QR..." page, polls `/setup/status` |
 | `pairing_qr` with `qr=string` | 200 + `<img src="/setup/qr.png?token=X">` + status pane + polling JS |
 | `pairing_code` | 200 + `<div class="text-6xl tracking-widest">{code formatted}</div>` + Copy button + countdown timer "Válido por mm:ss" + status pane |
-| `connected` | **410** + friendly HTML: "✅ Maia já está pareada. Status: conectado desde {timestamp}. Para re-parear..." + link `/dashboard` |
+| `connected` | **410** + friendly HTML: "✅ Maia já está pareada. Status: conectado desde {timestamp}. Para re-parear..." + link to `/setup/done` (always present) and to `/dashboard` (only if `FEATURE_DASHBOARD=true`) |
 | `disconnected_transient` | 503 + "Reconectando... costuma levar 5-10s" + auto-refresh meta tag (5s) |
 | `recovering` | 503 + "Limpando sessão antiga (~3s). Verifique seu canal de alertas para o novo token." + auto-refresh (5s) |
 
@@ -193,8 +206,8 @@ Token verify. If `phase === 'pairing_qr'` and `qr` is set, return PNG buffer (Co
 
 Body JSON: `{ method: 'qr' | 'code' }`. Token verify.
 
-- `method === 'qr'`: if phase is `unpaired`, transition to `pairing_qr` (qr=null). The actual QR will be set by Baileys' `connection.update` callback when emitted. If phase is anything else, return 409 with current phase.
-- `method === 'code'`: if phase is `unpaired`, call `triggerPairingCode(config.WHATSAPP_NUMBER_MAIA)`. On success, `setupState.setCode(code)` and audit `pairing_code_requested`. Return 200 JSON `{ ok: true, phase: 'pairing_code' }`. If `triggerPairingCode` throws (Baileys not ready yet), return 503 `{ ok: false, retry_after_s: 2 }`.
+- `method === 'qr'`: server-side no-op when phase is already `pairing_qr` (Baileys auto-transitions on QR emit per §4.2). When phase is `unpaired`, also no-op — the next QR Baileys emits will auto-transition. Returns 200 JSON `{ ok: true, phase: <current> }`. If phase is `pairing_code`/`connected`/`recovering`/`disconnected_transient`, return 409 with current phase.
+- `method === 'code'`: if phase is `unpaired`, call `triggerPairingCode(config.WHATSAPP_NUMBER_MAIA)`. On success, `setupState.setCode(code)` and audit `pairing_code_requested`. Return 200 JSON `{ ok: true, phase: 'pairing_code' }`. If `triggerPairingCode` throws because socket isn't ready yet (boot order: `startServer()` runs before `startBaileys()`, so the socket may be null for ~1-3s on cold boot), return 503 `{ ok: false, retry_after_s: 2 }`. **Client polling JS MUST honour `retry_after_s`** — schedule a setTimeout retry with that delay before re-POSTing.
 
 #### `GET /setup/status?token=X`
 
@@ -231,12 +244,19 @@ Three small surgery points:
 
 ```typescript
 if (qr) {
+  const phaseBefore = setupState.current().phase;
   setupState.setQr(qr);
+  // Audit only on first QR after a phase change. Baileys refreshes the QR
+  // every ~20s during pairing — we don't audit each refresh, only the
+  // initial display.
+  if (phaseBefore !== 'pairing_qr') {
+    await audit({ acao: 'pairing_qr_displayed', metadata: {} });
+  }
   qrcodeTerminal.generate(qr, { small: true });    // keep stdout for dev/log spelunking
 }
 ```
 
-**(b) Connection open.** Add `setupState.markPaired()` after the existing `connected = true; logger.info('baileys.connected'); audit({ acao: 'whatsapp_connected' });`.
+**(b) Connection open.** Add `setupState.markPaired()` AND `await audit({ acao: 'pairing_completed' })` after the existing `connected = true; logger.info('baileys.connected'); audit({ acao: 'whatsapp_connected' });`. Both audits fire — `whatsapp_connected` is the existing connection-life event; `pairing_completed` is the new pair-event audit (one-shot per successful pair).
 
 **(c) Connection close.** Replace the existing logout handling:
 
@@ -265,16 +285,15 @@ if (qr) {
 
 ```typescript
 export async function triggerPairingCode(phone: string): Promise<string> {
-  if (!socket || !connected) {
-    // socket exists but not yet connected to WS for code request? Allow if socket exists.
-    if (!socket) throw new Error('baileys_socket_not_ready');
-  }
-  // requestPairingCode works before pairing — it's literally how to start pairing without QR
-  return socket!.requestPairingCode(phone);
+  // requestPairingCode is meant to work BEFORE pairing — connected=false is
+  // the expected state when a code is requested. We only block if the socket
+  // itself doesn't exist yet (boot race: startServer() runs before
+  // startBaileys()). Caller (POST /setup/start?method=code) translates this
+  // throw into a 503 with retry_after_s so the operator's browser retries.
+  if (!socket) throw new Error('baileys_socket_not_ready');
+  return socket.requestPairingCode(phone);
 }
 ```
-
-Note: `requestPairingCode` works on a socket that has not yet completed pairing — that's the entire point. The check above is conservative.
 
 ### 4.8 Boot integration (`src/index.ts`)
 
@@ -371,14 +390,15 @@ All templates use Tailwind via CDN (`<script src="https://cdn.tailwindcss.com"><
 
 ## 5. Schema / migrations
 
-None.
+**No DB migration needed.** `AUDIT_ACTIONS` (in `src/governance/audit-actions.ts`) is a TypeScript-only `as const` union — `audit_log.acao` in the DB is plain `text`, so adding 8 new strings to the TS union does not require an ALTER TABLE.
 
 ## 6. Configuration
 
 New env vars:
 
 - `SETUP_TOKEN_OVERRIDE` (optional). If set, used as the token instead of generating one. **Discouraged in prod** — env vars leak more easily than file mode 0o600. For dev / scripted deploys.
-- `SETUP_DISABLE_HTTP=true` (optional, default false). Disables HTTP routes entirely; falls back to stdout-only behaviour. Defensive flag for someone who explicitly doesn't want the surface exposed (e.g., if running behind a separate admin proxy).
+
+(The earlier draft mentioned a `SETUP_DISABLE_HTTP` flag — REMOVED to resolve the contradiction with §4.5's "mounted always" stance. If an operator wants the routes off, they should run with a separate admin proxy that routes only `/setup*` away. YAGNI for the kill-switch.)
 
 No new feature flag for the feature itself — pareamento é fundamental, sempre disponível.
 
@@ -492,7 +512,15 @@ Three concurrency hot spots, all addressed:
 - [ ] `npm run build` zero new errors. `npx vitest run` adds passing tests for `setup-state`, `setup-token`, `setup-routes`.
 - [ ] Existing WhatsApp flows (B0/B1/B2/B3a/B3b/B4) untouched. No regressions in their tests.
 
-## 13. References
+## 13. Rollout / migration
+
+**Already-paired operators.** When this code lands and the process restarts, `BAILEYS_AUTH_DIR/creds.json` already exists with a valid `me` field. `hasValidBaileysSession` returns true. `ensureToken` still runs (creates `setup-token.txt` if missing) but the warn log "bootstrap_token_ready" is **not** emitted (the gate at §4.8 only logs when `!hasValidBaileysSession`). `setupState` initialises in `connected` phase once Baileys reconnects. `/setup?token=...` returns 410 immediately. **Net behaviour:** zero operator action required for existing deploys; the new HTTP routes are silent until a `LoggedOut` event eventually triggers them.
+
+**Fresh deploy.** No `BAILEYS_AUTH_DIR/` yet. `ensureToken` creates the dir + token file (mode 0o600). The "bootstrap_token_ready" warn log fires. Operator does the SSH-cat-once flow.
+
+**Recovery from this branch's first LoggedOut.** Same as the steady-state recovery flow (§4.3). The very first time, the operator may notice the new alert format (without token) — clarify in the deploy notes that the token is now in `BAILEYS_AUTH_DIR/setup-token.txt`, not in the alert body.
+
+## 14. References
 
 - Baileys docs: `socket.requestPairingCode(phoneNumber)` — verified at `node_modules/@whiskeysockets/baileys/lib/Socket/socket.d.ts:38`.
 - `qrcode@^1.5` npm — pure-JS QR generator for the PNG endpoint.
