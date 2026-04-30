@@ -317,12 +317,62 @@ export const PDF_STYLES = {
   cellRight: { alignment: 'right' },
   cellNegative: { color: '#bb0000' },
 } as const;
+
+/**
+ * Font config for pdfmake on Node. Uses Helvetica (built into pdfkit, the
+ * underlying engine) so we don't need to bundle external .ttf font files.
+ * Helvetica handles Brazilian Portuguese characters (acentos, R$) fine.
+ *
+ * NOTE: the original spec mentioned `pdfmake/build/vfs_fonts.js` (Roboto via
+ * VFS) — that's the BROWSER API. On Node we use pdfkit's built-in fonts via
+ * the constructor's `fontDescriptors` argument. Verified empirically during
+ * Task 2's install.
+ */
+export const PDF_FONTS = {
+  Helvetica: {
+    normal: 'Helvetica',
+    bold: 'Helvetica-Bold',
+    italics: 'Helvetica-Oblique',
+    bolditalics: 'Helvetica-BoldOblique',
+  },
+} as const;
+
+/**
+ * Render a pdfmake docDefinition to a Buffer using the Node API. Lazy-loads
+ * the pdfmake top-level module (~5MB) the first time it's called per process.
+ *
+ * Caller is responsible for setting `defaultStyle.font: 'Helvetica'` in the
+ * docDefinition (or any custom font config consistent with PDF_FONTS above).
+ */
+export async function renderPdfToBuffer(docDefinition: unknown): Promise<Buffer> {
+  // Top-level `pdfmake` resolves to `src/printer.js` (the Node entry per
+  // pdfmake's package.json `main` field). The default export is the
+  // PdfPrinter constructor.
+  const mod = (await import('pdfmake')) as unknown as {
+    default: new (fonts: unknown) => {
+      createPdfKitDocument: (def: unknown) => {
+        on: (e: string, cb: (...args: unknown[]) => void) => void;
+        end: () => void;
+      };
+    };
+  };
+  const PdfPrinter = mod.default;
+  const printer = new PdfPrinter(PDF_FONTS);
+  const doc = printer.createPdfKitDocument(docDefinition);
+  return await new Promise<Buffer>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    doc.on('data', (chunk: Buffer) => chunks.push(chunk));
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
+    doc.end();
+  });
+}
 ```
 
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `npx vitest run tests/unit/pdf-helpers.spec.ts`
-Expected: PASS — all three describe blocks (3 + 1 + 3 = 7 tests).
+Expected: PASS — all three describe blocks (3 + 1 + 3 = 7 tests). The new `renderPdfToBuffer` function is not exercised here — it's covered by the integration tests in Tasks 5 and 6.
 
 - [ ] **Step 5: Commit**
 
@@ -445,7 +495,14 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { MEDIA_ROOT } from '@/gateway/baileys.js';
 import { fmtBR } from '@/lib/brazilian.js';
-import { buildPdfHeader, PDF_STYLES, slugify, formatPeriodBR, fmtBRLSigned } from './_helpers.js';
+import {
+  buildPdfHeader,
+  PDF_STYLES,
+  slugify,
+  formatPeriodBR,
+  fmtBRLSigned,
+  renderPdfToBuffer,
+} from './_helpers.js';
 
 const HARD_LIMIT_ROWS = 500;
 
@@ -557,7 +614,7 @@ export async function generateExtratoPdf(input: ExtratoInput): Promise<ExtratoRe
       },
     ],
     styles: PDF_STYLES,
-    defaultStyle: { fontSize: 9 },
+    defaultStyle: { fontSize: 9, font: 'Helvetica' },
   };
 
   const buf = await renderPdfToBuffer(docDefinition);
@@ -582,51 +639,20 @@ function truncate(s: string, max: number): string {
   if (s.length <= max) return s;
   return s.slice(0, max - 1) + '…';
 }
-
-/**
- * Lazy-loads pdfmake (~4MB total — main + vfs_fonts) only when called. With
- * `FEATURE_PDF_REPORTS=false` the tool is unregistered and this function is
- * never called, so the bundles never load. See spec §6.
- */
-async function renderPdfToBuffer(docDefinition: unknown): Promise<Buffer> {
-  const pdfMakeModule = (await import('pdfmake/build/pdfmake.js')) as unknown as {
-    default?: { createPdfKitDocument: (def: unknown) => unknown; vfs?: unknown };
-    createPdfKitDocument?: (def: unknown) => unknown;
-    vfs?: unknown;
-  };
-  const vfsModule = (await import('pdfmake/build/vfs_fonts.js')) as unknown as {
-    default?: { pdfMake?: { vfs: unknown } };
-    pdfMake?: { vfs: unknown };
-  };
-  const pdfMake = pdfMakeModule.default ?? pdfMakeModule;
-  const vfs = vfsModule.default?.pdfMake?.vfs ?? vfsModule.pdfMake?.vfs;
-  (pdfMake as { vfs?: unknown }).vfs = vfs;
-  const fonts = {
-    Roboto: {
-      normal: 'Roboto-Regular.ttf',
-      bold: 'Roboto-Medium.ttf',
-      italics: 'Roboto-Italic.ttf',
-      bolditalics: 'Roboto-MediumItalic.ttf',
-    },
-  };
-  const doc = (pdfMake as { createPdfKitDocument: (d: unknown, o?: unknown) => unknown }).createPdfKitDocument(
-    docDefinition,
-    { fonts },
-  ) as { on: (e: string, cb: (...args: unknown[]) => void) => void; end: () => void };
-  return await new Promise<Buffer>((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    doc.on('data', (chunk: Buffer) => chunks.push(chunk));
-    doc.on('end', () => resolve(Buffer.concat(chunks)));
-    doc.on('error', reject);
-    doc.end();
-  });
-}
 ```
+
+The `renderPdfToBuffer` helper lives in `_helpers.ts` (Task 4) — both generators import it. Required imports at the top of `extrato.ts`:
+
+```typescript
+import { buildPdfHeader, PDF_STYLES, slugify, formatPeriodBR, fmtBRLSigned, renderPdfToBuffer } from './_helpers.js';
+```
+
+And the docDefinition's `defaultStyle` MUST set `font: 'Helvetica'` so pdfmake uses the pdfkit built-in (no external fonts needed). Confirmed in the `defaultStyle: { fontSize: 9, font: 'Helvetica' }` field in the snippet above.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `npx vitest run tests/unit/pdf-extrato.spec.ts`
-Expected: PASS — 3/3 tests. (May take 2-4s for first run as pdfmake/vfs are loaded lazily.)
+Expected: PASS — 3/3 tests. (May take 2-4s for first run as pdfmake is loaded lazily.)
 
 - [ ] **Step 5: Commit**
 
@@ -712,7 +738,13 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { MEDIA_ROOT } from '@/gateway/baileys.js';
 import { fmtBR } from '@/lib/brazilian.js';
-import { buildPdfHeader, PDF_STYLES, formatPeriodBR, fmtBRLSigned } from './_helpers.js';
+import {
+  buildPdfHeader,
+  PDF_STYLES,
+  formatPeriodBR,
+  fmtBRLSigned,
+  renderPdfToBuffer,
+} from './_helpers.js';
 
 export type ComparativoRow = {
   entidade_id: string;
@@ -804,7 +836,7 @@ export async function generateComparativoPdf(input: ComparativoInput): Promise<C
       },
     ],
     styles: PDF_STYLES,
-    defaultStyle: { fontSize: 10 },
+    defaultStyle: { fontSize: 10, font: 'Helvetica' },
   };
 
   const buf = await renderPdfToBuffer(docDefinition);
@@ -824,44 +856,9 @@ export async function generateComparativoPdf(input: ComparativoInput): Promise<C
     },
   };
 }
-
-// (Same renderPdfToBuffer as in extrato.ts — duplicated intentionally to keep
-// modules self-contained. If a third PDF generator lands later, factor into
-// `_pdfmake.ts`.)
-async function renderPdfToBuffer(docDefinition: unknown): Promise<Buffer> {
-  const pdfMakeModule = (await import('pdfmake/build/pdfmake.js')) as unknown as {
-    default?: { createPdfKitDocument: (def: unknown) => unknown; vfs?: unknown };
-    createPdfKitDocument?: (def: unknown) => unknown;
-    vfs?: unknown;
-  };
-  const vfsModule = (await import('pdfmake/build/vfs_fonts.js')) as unknown as {
-    default?: { pdfMake?: { vfs: unknown } };
-    pdfMake?: { vfs: unknown };
-  };
-  const pdfMake = pdfMakeModule.default ?? pdfMakeModule;
-  const vfs = vfsModule.default?.pdfMake?.vfs ?? vfsModule.pdfMake?.vfs;
-  (pdfMake as { vfs?: unknown }).vfs = vfs;
-  const fonts = {
-    Roboto: {
-      normal: 'Roboto-Regular.ttf',
-      bold: 'Roboto-Medium.ttf',
-      italics: 'Roboto-Italic.ttf',
-      bolditalics: 'Roboto-MediumItalic.ttf',
-    },
-  };
-  const doc = (pdfMake as { createPdfKitDocument: (d: unknown, o?: unknown) => unknown }).createPdfKitDocument(
-    docDefinition,
-    { fonts },
-  ) as { on: (e: string, cb: (...args: unknown[]) => void) => void; end: () => void };
-  return await new Promise<Buffer>((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    doc.on('data', (chunk: Buffer) => chunks.push(chunk));
-    doc.on('end', () => resolve(Buffer.concat(chunks)));
-    doc.on('error', reject);
-    doc.end();
-  });
-}
 ```
+
+(`renderPdfToBuffer` is the shared helper from `_helpers.ts` — same lazy-load + Helvetica config as extrato.)
 
 - [ ] **Step 4: Run the test to verify it passes**
 
