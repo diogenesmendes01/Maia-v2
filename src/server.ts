@@ -24,6 +24,10 @@ export async function buildServer() {
 
   await registerDashboardRoutes(app);
 
+  // Setup pairing routes — mounted always (no flag gate). See spec §4.5.
+  const { registerSetupRoutes } = await import('@/setup/index.js');
+  await registerSetupRoutes(app);
+
   return app;
 }
 

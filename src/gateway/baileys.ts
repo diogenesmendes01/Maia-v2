@@ -23,6 +23,8 @@ import { audit } from '@/governance/audit.js';
 import { dispatchReactionAsAnswer, dispatchPollVote } from '@/agent/one-tap.js';
 import { routeMessageUpdate } from '@/agent/message-update.js';
 import type { WhatsAppInbound, WAQuotedContext } from './types.js';
+import { setupState } from '@/setup/state.js';
+import { triggerRecovery } from '@/setup/recovery.js';
 
 let socket: WASocket | null = null;
 let connected = false;
@@ -39,11 +41,15 @@ export function isBaileysConnected(): boolean {
 }
 
 /**
- * TASK 7: this is a stub. Real implementation calls socket.requestPairingCode(phoneNumber).
- * The stub throws so tests must mock it; runtime callers see a 503 from /setup/start.
+ * SETUP: request an 8-digit pairing code from WhatsApp. Used when the
+ * operator chooses "Pair with phone number" in the /setup endpoint.
+ * Throws `baileys_socket_not_ready` if the socket hasn't been initialised
+ * yet (boot race: startServer() runs before startBaileys()). Caller (the
+ * /setup/start route) translates the throw into 503 + retry_after_s.
  */
-export async function triggerPairingCode(_phoneNumber: string): Promise<string> {
-  throw new Error('baileys_socket_not_ready');
+export async function triggerPairingCode(phone: string): Promise<string> {
+  if (!socket) throw new Error('baileys_socket_not_ready');
+  return socket.requestPairingCode(phone);
 }
 
 export function getSocket(): WASocket | null {
@@ -72,23 +78,36 @@ export async function startBaileys(): Promise<void> {
 
   socket.ev.on('connection.update', async (update) => {
     const { connection: conn, lastDisconnect, qr } = update;
-    if (qr) qrcodeTerminal.generate(qr, { small: true });
+    if (qr) {
+      const phaseBefore = setupState.current().phase;
+      setupState.setQr(qr);
+      if (phaseBefore !== 'pairing_qr') {
+        await audit({ acao: 'pairing_qr_displayed', metadata: {} });
+      }
+      qrcodeTerminal.generate(qr, { small: true });    // keep stdout for dev/log spelunking
+    }
     if (conn === 'open') {
       connected = true;
       logger.info('baileys.connected');
       await audit({ acao: 'whatsapp_connected' });
+      setupState.markPaired();
+      await audit({ acao: 'pairing_completed' });
     } else if (conn === 'close') {
       connected = false;
       lastDisconnectAt = new Date();
       const reason = (lastDisconnect?.error as Boom)?.output?.statusCode;
       logger.warn({ reason }, 'baileys.connection_closed');
       await audit({ acao: 'whatsapp_disconnected', metadata: { reason } });
-      if (reason !== DisconnectReason.loggedOut) {
+      if (reason === DisconnectReason.loggedOut) {
+        await audit({ acao: 'pairing_logged_out', metadata: { reason } });
+        triggerRecovery({ shutdownBaileys, startBaileys }).catch((err) => {
+          logger.error({ err }, 'setup.recovery_failed');
+        });
+      } else {
+        setupState.markDisconnected();
         setTimeout(() => {
           startBaileys().catch((e) => logger.error({ err: e }, 'baileys.reconnect_failed'));
         }, 5000);
-      } else {
-        logger.error('baileys.logged_out — manual re-pair required');
       }
     }
   });
