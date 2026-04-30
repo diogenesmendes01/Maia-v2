@@ -64,15 +64,6 @@ describe('synthesizeSpeech', () => {
     await expect(synthesizeSpeech('x')).rejects.toThrow(/tts_empty_body/);
   });
 
-  it('throws when OPENAI_API_KEY is missing', async () => {
-    vi.resetModules();
-    vi.doMock('../../src/config/env.js', () => ({
-      config: { OPENAI_API_KEY: '' },
-    }));
-    const { synthesizeSpeech } = await import('../../src/lib/tts.js');
-    await expect(synthesizeSpeech('x')).rejects.toThrow(/OPENAI_API_KEY missing/);
-  });
-
   it('strips null bytes from input before sending to OpenAI', async () => {
     fetchMock.mockResolvedValueOnce({
       ok: true,
@@ -100,5 +91,16 @@ describe('synthesizeSpeech', () => {
     const { synthesizeSpeech } = await import('../../src/lib/tts.js');
     await expect(synthesizeSpeech('\0\0\0')).rejects.toThrow(/tts_empty_input/);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  // KEEP LAST: this test calls vi.resetModules() + vi.doMock, which contaminates
+  // subsequent tests in the file (the empty-key mock persists in the module cache).
+  it('throws when OPENAI_API_KEY is missing', async () => {
+    vi.resetModules();
+    vi.doMock('../../src/config/env.js', () => ({
+      config: { OPENAI_API_KEY: '' },
+    }));
+    const { synthesizeSpeech } = await import('../../src/lib/tts.js');
+    await expect(synthesizeSpeech('x')).rejects.toThrow(/OPENAI_API_KEY missing/);
   });
 });
