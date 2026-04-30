@@ -431,6 +431,8 @@ if (latestReportPdf) {
 
 B4 inserts ONE new `else if` between PDF and the existing else block. The existing else cascade body (usePoll/text) is **NOT** modified — just preceded by the new branch. This is the minimal-diff implementation.
 
+**Note on diff shape vs spec §4.1**: the spec's §4.1 sketches a "flatten" into peer `else if` branches (4-way: PDF / voice / poll / text). The plan deliberately picks a 3-way nested shape (PDF / voice / `{ usePoll-or-text }`) instead — runtime behaviour is identical and the smaller diff means the existing B3a + B1 branch bodies are touched zero times, eliminating regression risk. The 4-way flatten is fine if a future implementer prefers it; this plan just doesn't require it.
+
 - [ ] **Step 1: Write the failing test**
 
 Create `tests/unit/voice-flow.spec.ts`:
@@ -559,9 +561,6 @@ const TEXT_INBOUND = {
 };
 
 describe('agent loop — B4 voice flow', () => {
-  beforeAll(async () => { /* no fs sandbox needed */ });
-  afterAll(async () => { /* idem */ });
-
   beforeEach(() => {
     callLLM.mockReset();
     dispatchTool.mockReset();
