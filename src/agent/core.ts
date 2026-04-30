@@ -39,7 +39,7 @@ function scheduleTypingDebounce(jid: string, mensagem_id: string): () => void {
   };
 }
 
-export const _internal = { scheduleTypingDebounce };
+export const _internal = { scheduleTypingDebounce, sendOutbound };
 
 export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
   const inbound = await mensagensRepo.findById(mensagem_id);
@@ -301,14 +301,23 @@ async function sendOutbound(
   opts?: {
     pending_question_id?: string | null;
     quoted?: import('@/gateway/presence.js').WAQuotedContext;
+    view_once?: boolean;
   },
-): Promise<void> {
+): Promise<string | null> {
   const pessoa = await pessoasRepo.findById(pessoa_id);
-  if (!pessoa) return;
+  if (!pessoa) return null;
   const jid = pessoa.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
-  const wid = await sendOutboundText(jid, text, opts?.quoted ? { quoted: opts.quoted } : undefined);
+  const sendOpts: { quoted?: import('@/gateway/presence.js').WAQuotedContext; view_once?: boolean } = {};
+  if (opts?.quoted) sendOpts.quoted = opts.quoted;
+  if (opts?.view_once) sendOpts.view_once = true;
+  const wid = await sendOutboundText(
+    jid,
+    text,
+    Object.keys(sendOpts).length ? sendOpts : undefined,
+  );
   const metadata: Record<string, unknown> = { whatsapp_id: wid, remote_jid: jid, in_reply_to };
   if (opts?.pending_question_id) metadata.pending_question_id = opts.pending_question_id;
+  if (opts?.view_once) metadata.view_once = true;
   await mensagensRepo.create({
     conversa_id,
     direcao: 'out',
@@ -320,6 +329,7 @@ async function sendOutbound(
     ferramentas_chamadas: [],
     tokens_usados: null,
   });
+  return wid;
 }
 
 async function sendOutboundPoll(
