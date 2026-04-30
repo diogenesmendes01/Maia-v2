@@ -50,6 +50,7 @@
     "pg": "^8.13.0",
     "pino": "^9.5.0",
     "pino-pretty": "^11.3.0",
+    "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0",
     "zod": "^3.23.8"
   },
@@ -59,6 +60,7 @@
     "@types/nodemailer": "^6.4.17",
     "@types/pdfmake": "^0.2.13",
     "@types/pg": "^8.11.10",
+    "@types/qrcode": "^1.5.6",
     "@types/qrcode-terminal": "^0.12.2",
     "@typescript-eslint/eslint-plugin": "^8.13.0",
     "@typescript-eslint/parser": "^8.13.0",
