@@ -10,6 +10,7 @@ import {
 import { withTx } from '@/db/client.js';
 import { audit } from '@/governance/audit.js';
 import { config } from '@/config/env.js';
+import { sendOutboundText } from '@/gateway/baileys.js';
 
 const SIDE_EFFECT_ACTIONS = new Set([
   'transaction_created',
@@ -119,23 +120,26 @@ async function handleMessageRevoke(input: {
 
 async function detectSideEffects(
   mensagem_id: string,
-): Promise<Array<{ acao: string; alvo_id: string | null }>> {
+): Promise<Array<{ acao: string; alvo_id: string | null; entidade_alvo: string | null }>> {
   const rows = await auditRepo.findByMensagemId(mensagem_id);
   return rows
     .filter((r) => SIDE_EFFECT_ACTIONS.has(r.acao))
-    .map((r) => ({ acao: r.acao, alvo_id: r.alvo_id }));
+    .map((r) => ({ acao: r.acao, alvo_id: r.alvo_id, entidade_alvo: r.entidade_alvo }));
 }
 
 async function createEditReviewPending(input: {
   original: { id: string; conversa_id: string | null };
-  side_effects: Array<{ acao: string; alvo_id: string | null }>;
+  side_effects: Array<{ acao: string; alvo_id: string | null; entidade_alvo: string | null }>;
   source: 'edit' | 'revoke';
   diff?: { before: string | null; after: string };
 }): Promise<void> {
   const tx_audit = input.side_effects.find((e) =>
     ['transaction_created', 'transaction_corrected'].includes(e.acao),
   );
-  if (!tx_audit?.alvo_id) return;
+  // Both alvo_id and entidade_alvo are required: alvo_id identifies the
+  // transaction to cancel, entidade_alvo routes the dispatcher's permission
+  // check to the right entity profile when the saved acao_proposta runs.
+  if (!tx_audit?.alvo_id || !tx_audit.entidade_alvo) return;
 
   const owner = await pessoasRepo.findByPhone(config.OWNER_TELEFONE_WHATSAPP);
   if (!owner) {
@@ -149,9 +153,10 @@ async function createEditReviewPending(input: {
   }
 
   const verb = input.source === 'edit' ? 'editou' : 'deletou';
+  const pergunta = `Você ${verb} uma mensagem que virou transação. Quer cancelar?`;
   const expira_em = new Date(Date.now() + REVIEW_TTL_HOURS * 60 * 60 * 1000);
 
-  await withTx(async (tx) => {
+  const created = await withTx(async (tx) => {
     const cancelled = await pendingQuestionsRepo.cancelOpenForConversaTx(
       tx,
       ownerConversa.id,
@@ -165,11 +170,11 @@ async function createEditReviewPending(input: {
         metadata: { cancelled_ids: cancelled.cancelled_ids },
       });
     }
-    await pendingQuestionsRepo.createTx(tx, {
+    return pendingQuestionsRepo.createTx(tx, {
       conversa_id: ownerConversa.id,
       pessoa_id: owner.id,
       tipo: 'edit_review',
-      pergunta: `Você ${verb} uma mensagem que virou transação. Quer cancelar?`,
+      pergunta,
       opcoes_validas: [
         { key: 'sim', label: 'Sim, cancela' },
         { key: 'nao', label: 'Não, mantém' },
@@ -177,6 +182,7 @@ async function createEditReviewPending(input: {
       acao_proposta: {
         tool: 'cancel_transaction',
         args: {
+          entidade_id: tx_audit.entidade_alvo,
           transacao_id: tx_audit.alvo_id,
           motivo: input.source === 'edit' ? 'edit_review' : 'revoke_review',
         },
@@ -191,5 +197,48 @@ async function createEditReviewPending(input: {
       },
     });
   });
+
+  // Outside the tx so a flaky WhatsApp send doesn't roll back the pending.
+  // Without this, the row would sit silently in the DB — the reminder worker
+  // skips `tipo='edit_review'`, and there's no LLM turn to surface it.
+  await notifyOwnerOfEditReview({
+    owner: { telefone_whatsapp: owner.telefone_whatsapp },
+    ownerConversaId: ownerConversa.id,
+    pendingId: created.id,
+    pergunta,
+  });
+}
+
+async function notifyOwnerOfEditReview(input: {
+  owner: { telefone_whatsapp: string };
+  ownerConversaId: string;
+  pendingId: string;
+  pergunta: string;
+}): Promise<void> {
+  const jid = input.owner.telefone_whatsapp.replace(/^\+/, '') + '@s.whatsapp.net';
+  try {
+    const wid = await sendOutboundText(jid, input.pergunta);
+    await mensagensRepo.create({
+      conversa_id: input.ownerConversaId,
+      direcao: 'out',
+      tipo: 'texto',
+      conteudo: input.pergunta,
+      midia_url: null,
+      metadata: {
+        whatsapp_id: wid,
+        remote_jid: jid,
+        pending_question_id: input.pendingId,
+        source: 'edit_review',
+      },
+      processada_em: new Date(),
+      ferramentas_chamadas: [],
+      tokens_usados: null,
+    });
+  } catch (err) {
+    logger.warn(
+      { err: (err as Error).message, pending_id: input.pendingId },
+      'message_update.owner_notify_failed',
+    );
+  }
 }
 

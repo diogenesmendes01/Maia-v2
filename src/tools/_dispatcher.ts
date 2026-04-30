@@ -142,6 +142,8 @@ export async function dispatchTool(input: {
     pessoa_id: input.ctx.pessoa.id,
     conversa_id: input.ctx.conversa.id,
     mensagem_id: input.ctx.mensagem_id,
+    entidade_alvo: entity_id,
+    alvo_id: tool.extractAlvoId?.(out.data) ?? null,
     metadata: { tool: tool.name },
   });
   return out.data;

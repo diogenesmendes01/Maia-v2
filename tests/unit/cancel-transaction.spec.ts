@@ -42,7 +42,7 @@ describe('cancel_transaction tool', () => {
     updateMock.mockResolvedValueOnce(undefined);
     const { cancelTransactionTool } = await import('../../src/tools/cancel-transaction.js');
     const result = await cancelTransactionTool.handler(
-      { transacao_id: 'tx-1', motivo: 'edit_review' } as never,
+      { entidade_id: 'e1', transacao_id: 'tx-1', motivo: 'edit_review' } as never,
       ctx,
     );
     expect(result).toEqual({ ok: true, transacao_id: 'tx-1' });
@@ -54,6 +54,9 @@ describe('cancel_transaction tool', () => {
   });
 
   it('refuses out-of-scope transaction with forbidden', async () => {
+    // Caller passed e_other (matches the tx) but it is NOT in their scope —
+    // the dispatcher would already have blocked this in production; the
+    // handler keeps the scope check as defense in depth.
     transacoesByIdMock.mockResolvedValueOnce({
       id: 'tx-2',
       entidade_id: 'e_other',
@@ -61,7 +64,28 @@ describe('cancel_transaction tool', () => {
     });
     const { cancelTransactionTool } = await import('../../src/tools/cancel-transaction.js');
     const result = await cancelTransactionTool.handler(
-      { transacao_id: 'tx-2' } as never,
+      { entidade_id: 'e_other', transacao_id: 'tx-2' } as never,
+      ctx,
+    );
+    expect(result).toEqual({ error: 'forbidden' });
+    expect(updateMock).not.toHaveBeenCalled();
+    expect(auditMock).not.toHaveBeenCalled();
+  });
+
+  it('refuses when args.entidade_id does not match tx.entidade_id (cross-entity hijack)', async () => {
+    // The dispatcher authorized cancel_transaction against `e1`'s profile
+    // because the caller (or LLM) passed `entidade_id=e1`. But the actual
+    // transaction belongs to `e2`. Without this check, a profile that
+    // permits cancel on e1 would be misused to cancel a transaction owned
+    // by e2 (or vice versa, blocking a legitimate cancel).
+    transacoesByIdMock.mockResolvedValueOnce({
+      id: 'tx-cross',
+      entidade_id: 'e2',
+      status: 'paga',
+    });
+    const { cancelTransactionTool } = await import('../../src/tools/cancel-transaction.js');
+    const result = await cancelTransactionTool.handler(
+      { entidade_id: 'e1', transacao_id: 'tx-cross' } as never,
       ctx,
     );
     expect(result).toEqual({ error: 'forbidden' });
@@ -73,7 +97,7 @@ describe('cancel_transaction tool', () => {
     transacoesByIdMock.mockResolvedValueOnce(null);
     const { cancelTransactionTool } = await import('../../src/tools/cancel-transaction.js');
     const result = await cancelTransactionTool.handler(
-      { transacao_id: 'tx-missing' } as never,
+      { entidade_id: 'e1', transacao_id: 'tx-missing' } as never,
       ctx,
     );
     expect(result).toEqual({ error: 'not_found' });
@@ -88,7 +112,7 @@ describe('cancel_transaction tool', () => {
     });
     const { cancelTransactionTool } = await import('../../src/tools/cancel-transaction.js');
     const result = await cancelTransactionTool.handler(
-      { transacao_id: 'tx-3' } as never,
+      { entidade_id: 'e1', transacao_id: 'tx-3' } as never,
       ctx,
     );
     expect(result).toEqual({ ok: true, transacao_id: 'tx-3' });

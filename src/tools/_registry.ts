@@ -41,6 +41,10 @@ export type Tool<I extends z.ZodTypeAny, O extends z.ZodTypeAny> = {
   operation_type: 'create' | 'correct' | 'cancel' | 'update_meta' | 'parse_only' | 'read' | 'communicate';
   audit_action: AuditAction;
   handler: (input: z.infer<I>, ctx: ToolHandlerCtx) => Promise<z.infer<O>>;
+  // Optional: extract the resource id (e.g. transacao_id) from the tool's
+  // result so the dispatcher can populate audit.alvo_id. Returning null
+  // signals "no new resource was created" (e.g. duplicate-suspected branch).
+  extractAlvoId?: (result: z.infer<O>) => string | null;
 };
 
 export type AnyTool = Tool<z.ZodTypeAny, z.ZodTypeAny>;
