@@ -8,7 +8,7 @@ import { config } from '@/config/env.js';
 import { buildPrompt } from './prompt-builder.js';
 import { callLLM, type LLMMessage } from '@/lib/claude.js';
 import { logger } from '@/lib/logger.js';
-import { sendOutboundText } from '@/gateway/baileys.js';
+import { sendOutboundText, sendOutboundDocument } from '@/gateway/baileys.js';
 import { audit } from '@/governance/audit.js';
 import { dispatchTool } from '@/tools/_dispatcher.js';
 import { getToolSchemas, REGISTRY } from '@/tools/_registry.js';
@@ -20,6 +20,7 @@ import {
   reflectOnCorrection,
   findPreviousAssistantMessage,
 } from './reflection.js';
+import { stat, unlink } from 'node:fs/promises';
 
 const MAX_REACT_ITERATIONS = 5;
 const TYPING_DEBOUNCE_MS = 1500;
@@ -148,6 +149,12 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
   } | null = null;
   let turnHasSensitive = false;
   const sensitiveTools: string[] = [];
+  let latestReportPdf: {
+    path: string;
+    fileName: string;
+    mimetype: string;
+    tipo: 'extrato' | 'comparativo';
+  } | null = null;
 
   const jid = pessoa.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
   const stopTyping = scheduleTypingDebounce(jid, inbound.id);
@@ -158,64 +165,114 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
 
       if (res.tool_uses.length === 0) {
         const text = res.content?.trim() ?? '';
-        if (text) {
-          const usePoll =
-            latestPending &&
-            config.FEATURE_ONE_TAP &&
-            latestPending.opcoes_validas.length >= 3 &&
-            latestPending.opcoes_validas.length <= 12;
-          if (usePoll && latestPending) {
-            await sendOutboundPoll(pessoa.id, c.id, text, inbound.id, latestPending);
-          } else {
-            const shouldQuote =
-              (inbound.conteudo && detectCorrection(inbound.conteudo)) ||
-              getActivePending(c) !== null;
-            // Per spec §6: when FEATURE_VIEW_ONCE_SENSITIVE is false,
-            // Tool.sensitive flags have NO runtime effect. We gate view_once on
-            // the flag here so the audit also doesn't fire when the feature is
-            // off (the alternative — gating only inside baileys.ts — would
-            // cause the agent loop's audit to fire even when no view-once
-            // envelope was actually used).
-            const prefDisabled =
-              (pessoa.preferencias as { balance_view_once?: boolean } | null)?.balance_view_once === false;
-            const view_once =
-              config.FEATURE_VIEW_ONCE_SENSITIVE && turnHasSensitive && !prefDisabled;
-            // Decision-time audit: fires on sensitive turn when the preference suppresses view-once.
-            // Independent of whether the resulting plain-text send succeeds (Baileys may be down).
-            // Only emit when the feature is actually enabled — when the flag is off, the
-            // Tool.sensitive flags have no runtime effect (spec §6) so a "skipped" audit
-            // would be misleading.
-            if (config.FEATURE_VIEW_ONCE_SENSITIVE && turnHasSensitive && prefDisabled) {
-              await audit({
-                acao: 'outbound_view_once_skipped_by_preference',
-                pessoa_id: pessoa.id,
-                conversa_id: c.id,
-                mensagem_id: inbound.id,
-                metadata: { sensitive_tools: sensitiveTools },
+        try {
+          if (text) {
+            // B3b: PDF report path — takes precedence over poll/text. The LLM's
+            // text becomes the document caption (truncated to WhatsApp's 1024-
+            // char limit).
+            if (latestReportPdf) {
+              const captionText = text.slice(0, 1024);
+              const shouldQuote =
+                (inbound.conteudo && detectCorrection(inbound.conteudo)) ||
+                getActivePending(c) !== null;
+              const wid = await sendOutboundDocument(jid, latestReportPdf.path, {
+                mimetype: latestReportPdf.mimetype,
+                fileName: latestReportPdf.fileName,
+                caption: captionText,
+                quoted: shouldQuote
+                  ? quotedReplyContext(
+                      inbound.metadata as Record<string, unknown> | null,
+                      inbound.conteudo,
+                    )
+                  : undefined,
               });
+              if (wid) {
+                const file_size_bytes = await stat(latestReportPdf.path)
+                  .then((s) => s.size)
+                  .catch(() => 0);
+                await audit({
+                  acao: 'outbound_sent_document',
+                  pessoa_id: pessoa.id,
+                  conversa_id: c.id,
+                  mensagem_id: inbound.id,
+                  metadata: {
+                    whatsapp_id: wid,
+                    tipo: latestReportPdf.tipo,
+                    file_size_bytes,
+                  },
+                });
+                await mensagensRepo.create({
+                  conversa_id: c.id,
+                  direcao: 'out',
+                  tipo: 'documento',
+                  conteudo: captionText,
+                  midia_url: null,
+                  metadata: {
+                    whatsapp_id: wid,
+                    in_reply_to: inbound.id,
+                    document_tipo: latestReportPdf.tipo,
+                    document_filename: latestReportPdf.fileName,
+                  },
+                  processada_em: new Date(),
+                  ferramentas_chamadas: [],
+                  tokens_usados: null,
+                });
+              }
+            } else {
+              const usePoll =
+                latestPending &&
+                config.FEATURE_ONE_TAP &&
+                latestPending.opcoes_validas.length >= 3 &&
+                latestPending.opcoes_validas.length <= 12;
+              if (usePoll && latestPending) {
+                await sendOutboundPoll(pessoa.id, c.id, text, inbound.id, latestPending);
+              } else {
+                const shouldQuote =
+                  (inbound.conteudo && detectCorrection(inbound.conteudo)) ||
+                  getActivePending(c) !== null;
+                const prefDisabled =
+                  (pessoa.preferencias as { balance_view_once?: boolean } | null)
+                    ?.balance_view_once === false;
+                const view_once =
+                  config.FEATURE_VIEW_ONCE_SENSITIVE && turnHasSensitive && !prefDisabled;
+                if (config.FEATURE_VIEW_ONCE_SENSITIVE && turnHasSensitive && prefDisabled) {
+                  await audit({
+                    acao: 'outbound_view_once_skipped_by_preference',
+                    pessoa_id: pessoa.id,
+                    conversa_id: c.id,
+                    mensagem_id: inbound.id,
+                    metadata: { sensitive_tools: sensitiveTools },
+                  });
+                }
+                const wid = await sendOutbound(pessoa.id, c.id, text, inbound.id, {
+                  pending_question_id: latestPending?.id ?? null,
+                  quoted: shouldQuote
+                    ? quotedReplyContext(
+                        inbound.metadata as Record<string, unknown> | null,
+                        inbound.conteudo,
+                      )
+                    : undefined,
+                  view_once,
+                });
+                if (wid && view_once) {
+                  await audit({
+                    acao: 'outbound_sent_view_once',
+                    pessoa_id: pessoa.id,
+                    conversa_id: c.id,
+                    mensagem_id: inbound.id,
+                    metadata: { whatsapp_id: wid, sensitive_tools: sensitiveTools },
+                  });
+                }
+              }
             }
-            const wid = await sendOutbound(pessoa.id, c.id, text, inbound.id, {
-              pending_question_id: latestPending?.id ?? null,
-              quoted: shouldQuote
-                ? quotedReplyContext(inbound.metadata as Record<string, unknown> | null, inbound.conteudo)
-                : undefined,
-              view_once,
+          }
+        } finally {
+          // B3b: always unlink the tmp PDF, even if send failed. Boot sweeper
+          // is the safety net for crash-mid-send.
+          if (latestReportPdf) {
+            await unlink(latestReportPdf.path).catch((err) => {
+              logger.warn({ err, path: latestReportPdf?.path }, 'pdf.unlink_failed_will_be_swept');
             });
-            // Audit fires only when the actual view-once send produced a WAID;
-            // if Baileys returned null (disconnected) we silently skip per
-            // spec §4.6 iter-2 fix.
-            if (wid && view_once) {
-              await audit({
-                acao: 'outbound_sent_view_once',
-                pessoa_id: pessoa.id,
-                conversa_id: c.id,
-                mensagem_id: inbound.id,
-                metadata: {
-                  whatsapp_id: wid,
-                  sensitive_tools: sensitiveTools,
-                },
-              });
-            }
           }
         }
         break;
@@ -289,6 +346,31 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
         if (tool?.sensitive && !sensitiveTools.includes(tu.tool)) {
           turnHasSensitive = true;
           sensitiveTools.push(tu.tool);
+        }
+
+        // B3b: capture PDF report result for outbound document send.
+        if (
+          tu.tool === 'generate_report' &&
+          !isError &&
+          typeof out === 'object' &&
+          out !== null &&
+          'path' in out &&
+          'fileName' in out &&
+          'mimetype' in out &&
+          'tipo' in out
+        ) {
+          const r = out as {
+            path: string;
+            fileName: string;
+            mimetype: string;
+            tipo: 'extrato' | 'comparativo';
+          };
+          latestReportPdf = {
+            path: r.path,
+            fileName: r.fileName,
+            mimetype: r.mimetype,
+            tipo: r.tipo,
+          };
         }
         const isSideEffect =
           tool && (tool.side_effect === 'write' || tool.side_effect === 'communication');
