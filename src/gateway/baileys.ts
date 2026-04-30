@@ -249,18 +249,18 @@ async function extractContent(msg: proto.IWebMessageInfo): Promise<{
 export async function sendOutboundText(
   jid: string,
   text: string,
-  opts?: { quoted?: WAQuotedContext },
+  opts?: { quoted?: WAQuotedContext; view_once?: boolean },
 ): Promise<string | null> {
   if (!socket || !connected) {
     logger.warn('baileys.not_connected — cannot send');
     return null;
   }
-  if (opts?.quoted) {
-    // Baileys' sendMessage accepts `quoted` as third-arg MiscMessageGenerationOptions.
-    const result = await socket.sendMessage(jid, { text }, { quoted: opts.quoted });
-    return result?.key.id ?? null;
-  }
-  const result = await socket.sendMessage(jid, { text });
+  const useViewOnce = !!opts?.view_once && config.FEATURE_VIEW_ONCE_SENSITIVE;
+  const content = useViewOnce ? { text, viewOnce: true } : { text };
+  // Baileys' sendMessage accepts `quoted` as third-arg MiscMessageGenerationOptions.
+  // We always pass the third arg (undefined when no quote) so call arity is stable.
+  const miscOpts = opts?.quoted ? { quoted: opts.quoted } : undefined;
+  const result = await socket.sendMessage(jid, content, miscOpts);
   return result?.key.id ?? null;
 }
 
@@ -274,6 +274,15 @@ export async function shutdownBaileys(): Promise<void> {
 export function getLastDisconnectAt(): Date | null {
   return lastDisconnectAt;
 }
+
+// Test-only seam. Production code never calls this. Lets unit tests inject a
+// mock socket without booting the full WA pairing flow.
+export const _internal = {
+  _setSocketForTests(s: WASocket | null, isConnected: boolean): void {
+    socket = s;
+    connected = isConnected;
+  },
+};
 
 // Helper to deterministically create per-message media filenames
 export function mediaPathFor(buf: Buffer, ext: string): { path: string; sha: string } {

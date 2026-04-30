@@ -39,7 +39,7 @@ function scheduleTypingDebounce(jid: string, mensagem_id: string): () => void {
   };
 }
 
-export const _internal = { scheduleTypingDebounce };
+export const _internal = { scheduleTypingDebounce, sendOutbound };
 
 export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
   const inbound = await mensagensRepo.findById(mensagem_id);
@@ -146,6 +146,8 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
     id: string;
     opcoes_validas: Array<{ key: string; label: string }>;
   } | null = null;
+  let turnHasSensitive = false;
+  const sensitiveTools: string[] = [];
 
   const jid = pessoa.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
   const stopTyping = scheduleTypingDebounce(jid, inbound.id);
@@ -168,12 +170,52 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
             const shouldQuote =
               (inbound.conteudo && detectCorrection(inbound.conteudo)) ||
               getActivePending(c) !== null;
-            await sendOutbound(pessoa.id, c.id, text, inbound.id, {
+            // Per spec §6: when FEATURE_VIEW_ONCE_SENSITIVE is false,
+            // Tool.sensitive flags have NO runtime effect. We gate view_once on
+            // the flag here so the audit also doesn't fire when the feature is
+            // off (the alternative — gating only inside baileys.ts — would
+            // cause the agent loop's audit to fire even when no view-once
+            // envelope was actually used).
+            const prefDisabled =
+              (pessoa.preferencias as { balance_view_once?: boolean } | null)?.balance_view_once === false;
+            const view_once =
+              config.FEATURE_VIEW_ONCE_SENSITIVE && turnHasSensitive && !prefDisabled;
+            // Decision-time audit: fires on sensitive turn when the preference suppresses view-once.
+            // Independent of whether the resulting plain-text send succeeds (Baileys may be down).
+            // Only emit when the feature is actually enabled — when the flag is off, the
+            // Tool.sensitive flags have no runtime effect (spec §6) so a "skipped" audit
+            // would be misleading.
+            if (config.FEATURE_VIEW_ONCE_SENSITIVE && turnHasSensitive && prefDisabled) {
+              await audit({
+                acao: 'outbound_view_once_skipped_by_preference',
+                pessoa_id: pessoa.id,
+                conversa_id: c.id,
+                mensagem_id: inbound.id,
+                metadata: { sensitive_tools: sensitiveTools },
+              });
+            }
+            const wid = await sendOutbound(pessoa.id, c.id, text, inbound.id, {
               pending_question_id: latestPending?.id ?? null,
               quoted: shouldQuote
                 ? quotedReplyContext(inbound.metadata as Record<string, unknown> | null, inbound.conteudo)
                 : undefined,
+              view_once,
             });
+            // Audit fires only when the actual view-once send produced a WAID;
+            // if Baileys returned null (disconnected) we silently skip per
+            // spec §4.6 iter-2 fix.
+            if (wid && view_once) {
+              await audit({
+                acao: 'outbound_sent_view_once',
+                pessoa_id: pessoa.id,
+                conversa_id: c.id,
+                mensagem_id: inbound.id,
+                metadata: {
+                  whatsapp_id: wid,
+                  sensitive_tools: sensitiveTools,
+                },
+              });
+            }
           }
         }
         break;
@@ -240,6 +282,14 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
 
         // Sub-A: silent ack via reaction on side-effect tool outcomes.
         const tool = REGISTRY[tu.tool];
+        // B3a: track sensitive tools dispatched in this turn. The dedup guard
+        // (`!sensitiveTools.includes`) keeps the audit's `sensitive_tools`
+        // list as a unique set even when the LLM dispatches the same tool
+        // multiple times (e.g., balance for two entidade_ids).
+        if (tool?.sensitive && !sensitiveTools.includes(tu.tool)) {
+          turnHasSensitive = true;
+          sensitiveTools.push(tu.tool);
+        }
         const isSideEffect =
           tool && (tool.side_effect === 'write' || tool.side_effect === 'communication');
         if (isSideEffect) {
@@ -301,14 +351,23 @@ async function sendOutbound(
   opts?: {
     pending_question_id?: string | null;
     quoted?: import('@/gateway/presence.js').WAQuotedContext;
+    view_once?: boolean;
   },
-): Promise<void> {
+): Promise<string | null> {
   const pessoa = await pessoasRepo.findById(pessoa_id);
-  if (!pessoa) return;
+  if (!pessoa) return null;
   const jid = pessoa.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
-  const wid = await sendOutboundText(jid, text, opts?.quoted ? { quoted: opts.quoted } : undefined);
+  const sendOpts: { quoted?: import('@/gateway/presence.js').WAQuotedContext; view_once?: boolean } = {};
+  if (opts?.quoted) sendOpts.quoted = opts.quoted;
+  if (opts?.view_once) sendOpts.view_once = true;
+  const wid = await sendOutboundText(
+    jid,
+    text,
+    Object.keys(sendOpts).length ? sendOpts : undefined,
+  );
   const metadata: Record<string, unknown> = { whatsapp_id: wid, remote_jid: jid, in_reply_to };
   if (opts?.pending_question_id) metadata.pending_question_id = opts.pending_question_id;
+  if (opts?.view_once) metadata.view_once = true;
   await mensagensRepo.create({
     conversa_id,
     direcao: 'out',
@@ -320,6 +379,7 @@ async function sendOutbound(
     ferramentas_chamadas: [],
     tokens_usados: null,
   });
+  return wid;
 }
 
 async function sendOutboundPoll(

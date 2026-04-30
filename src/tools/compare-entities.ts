@@ -37,6 +37,7 @@ export const compareEntitiesTool: Tool<typeof inputSchema, typeof outputSchema> 
   redis_required: false,
   operation_type: 'read',
   audit_action: 'classification_suggested',
+  sensitive: true,
   handler: async (args, ctx) => {
     const allowed = args.entidade_ids.filter((id) => ctx.scope.entidades.includes(id));
     const ents = await entidadesRepo.byIds(allowed);

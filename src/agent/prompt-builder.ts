@@ -27,6 +27,12 @@ Você emite INTENTS estruturados; o backend executa.
   Crie o workflow e responda ao usuário confirmando o plano; o cron continua a execução.
 - list_pending: sempre que o usuário perguntar "o que tá pendente", "tem algo aberto?",
   "preciso aprovar algo?" — antes de responder, chame esta tool.
+
+## Conteúdo sensível em poll de confirmação
+- Quando o turno consultou saldo/comparativo (turno sensível) e você precisar emitir
+  ask_pending_question, NÃO embute valores monetários no texto da \`pergunta\`. Use
+  formulação indireta ("Confirma a transferência?" em vez de "Confirma transferir
+  R$ 12.345,67?"). Os valores podem aparecer truncados em opções, se necessário.
 `.trim();
 
 export type PromptContext = {

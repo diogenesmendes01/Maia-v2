@@ -45,6 +45,11 @@ export type Tool<I extends z.ZodTypeAny, O extends z.ZodTypeAny> = {
   // result so the dispatcher can populate audit.alvo_id. Returning null
   // signals "no new resource was created" (e.g. duplicate-suspected branch).
   extractAlvoId?: (result: z.infer<O>) => string | null;
+  /**
+   * When true, any turn that dispatches this tool flips the outbound text
+   * reply into view-once (B3a). OR-logic across all tools in the turn.
+   */
+  sensitive?: boolean;
 };
 
 export type AnyTool = Tool<z.ZodTypeAny, z.ZodTypeAny>;
