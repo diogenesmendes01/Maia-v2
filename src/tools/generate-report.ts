@@ -80,15 +80,12 @@ export const generateReportTool: Tool<typeof inputSchema, typeof outputSchema> =
         },
       );
 
-      // Resolve unique categoria names in one batch
+      // Resolve unique categoria names in one batch (single SQL query)
       const catIds = Array.from(
         new Set(rawTxns.map((t) => t.categoria_id).filter((x): x is string => !!x)),
       );
-      const catNameById = new Map<string, string>();
-      for (const cid of catIds) {
-        const cat = await categoriasRepo.byId(cid);
-        if (cat) catNameById.set(cid, cat.nome);
-      }
+      const cats = catIds.length > 0 ? await categoriasRepo.byIds(catIds) : [];
+      const catNameById = new Map<string, string>(cats.map((c) => [c.id, c.nome]));
 
       const transactions: ExtratoTransaction[] = rawTxns.map((t) => ({
         data_competencia: t.data_competencia,
@@ -131,24 +128,41 @@ export const generateReportTool: Tool<typeof inputSchema, typeof outputSchema> =
       };
     }
 
-    const ents = await entidadesRepo.byIds(allowedIds);
+    // Fetch entidades + contas in parallel (contas: single batched SQL via byEntities;
+    // txns: per-entity calls run concurrently, capped at 8 by the schema).
+    const [ents, allContas, perEntityTxns] = await Promise.all([
+      entidadesRepo.byIds(allowedIds),
+      contasRepo.byEntities({ pessoa_id: ctx.pessoa.id, entidades: allowedIds }),
+      Promise.all(
+        allowedIds.map((id) =>
+          transacoesRepo.byScope(
+            { pessoa_id: ctx.pessoa.id, entidades: [id] },
+            { date_from: args.date_from, date_to: args.date_to, limit: 5000 },
+          ),
+        ),
+      ),
+    ]);
     const entById = new Map(ents.map((e) => [e.id, e]));
+    const contasByEntId = new Map<string, typeof allContas>();
+    for (const c of allContas) {
+      const list = contasByEntId.get(c.entidade_id) ?? [];
+      list.push(c);
+      contasByEntId.set(c.entidade_id, list);
+    }
 
     const rows: ComparativoRow[] = [];
-    for (const id of allowedIds) {
+    for (let i = 0; i < allowedIds.length; i++) {
+      const id = allowedIds[i]!;
       const ent = entById.get(id);
       if (!ent) continue;
-      const txns = await transacoesRepo.byScope(
-        { pessoa_id: ctx.pessoa.id, entidades: [id] },
-        { date_from: args.date_from, date_to: args.date_to, limit: 5000 },
-      );
+      const txns = perEntityTxns[i]!;
       const receita = txns
         .filter((t) => t.natureza === 'receita')
         .reduce((s, t) => s + Number(t.valor), 0);
       const despesa = txns
         .filter((t) => t.natureza === 'despesa')
         .reduce((s, t) => s + Number(t.valor), 0);
-      const contas = await contasRepo.byEntity(id);
+      const contas = contasByEntId.get(id) ?? [];
       const caixa_final = contas.reduce((s, c) => s + Number(c.saldo_atual), 0);
       rows.push({
         entidade_id: id,

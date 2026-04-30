@@ -18,13 +18,13 @@ vi.mock('../../src/lib/logger.js', () => ({
 const byScope = vi.fn();
 const entidadeById = vi.fn();
 const entidadesByIds = vi.fn();
-const categoriaById = vi.fn();
-const contasByEntity = vi.fn();
+const categoriasByIds = vi.fn();
+const contasByEntities = vi.fn();
 vi.mock('../../src/db/repositories.js', () => ({
   transacoesRepo: { byScope },
   entidadesRepo: { byId: entidadeById, byIds: entidadesByIds },
-  categoriasRepo: { byId: categoriaById },
-  contasRepo: { byEntity: contasByEntity },
+  categoriasRepo: { byIds: categoriasByIds },
+  contasRepo: { byEntities: contasByEntities },
 }));
 
 beforeAll(async () => {
@@ -80,7 +80,7 @@ describe('generate_report — extrato handler', () => {
   beforeEach(() => {
     byScope.mockReset();
     entidadeById.mockReset();
-    categoriaById.mockReset();
+    categoriasByIds.mockReset();
   });
 
   it('returns forbidden when entidade_id outside scope', async () => {
@@ -101,7 +101,7 @@ describe('generate_report — extrato handler', () => {
       { data_competencia: '2026-04-05', natureza: 'receita', valor: '1500.00', descricao: 'X', categoria_id: 'cat1' },
       { data_competencia: '2026-04-10', natureza: 'despesa', valor: '300.00', descricao: 'Y', categoria_id: null },
     ]);
-    categoriaById.mockResolvedValue({ id: 'cat1', nome: 'Vendas' });
+    categoriasByIds.mockResolvedValue([{ id: 'cat1', nome: 'Vendas' }]);
 
     const { generateReportTool } = await import('../../src/tools/generate-report.js');
     const out = (await generateReportTool.handler(
@@ -121,7 +121,7 @@ describe('generate_report — comparativo handler', () => {
   beforeEach(() => {
     byScope.mockReset();
     entidadesByIds.mockReset();
-    contasByEntity.mockReset();
+    contasByEntities.mockReset();
   });
 
   it('returns forbidden when ALL entidade_ids outside scope', async () => {
@@ -154,9 +154,10 @@ describe('generate_report — comparativo handler', () => {
     byScope
       .mockResolvedValueOnce([{ natureza: 'receita', valor: '1000.00' }])
       .mockResolvedValueOnce([{ natureza: 'despesa', valor: '200.00' }]);
-    contasByEntity
-      .mockResolvedValueOnce([{ saldo_atual: '5000.00' }])
-      .mockResolvedValueOnce([{ saldo_atual: '3000.00' }]);
+    contasByEntities.mockResolvedValue([
+      { entidade_id: 'e1', saldo_atual: '5000.00' },
+      { entidade_id: 'e2', saldo_atual: '3000.00' },
+    ]);
     const { generateReportTool } = await import('../../src/tools/generate-report.js');
     const out = (await generateReportTool.handler(
       { tipo: 'comparativo', entidade_ids: ['e1','e2'], date_from: '2026-04-01', date_to: '2026-04-30' } as never,

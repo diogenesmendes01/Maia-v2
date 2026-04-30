@@ -13,6 +13,7 @@ import {
 } from './_helpers.js';
 
 const HARD_LIMIT_ROWS = 500;
+const MAX_DESCRICAO_LEN = 120;
 
 export type ExtratoTransaction = {
   data_competencia: string; // yyyy-MM-dd
@@ -86,7 +87,7 @@ export async function generateExtratoPdf(input: ExtratoInput): Promise<ExtratoRe
           style: isDespesa ? ['cellRight', 'cellNegative'] : 'cellRight',
         },
         t.categoriaNome ?? '—',
-        { text: truncate(t.descricao, 120), noWrap: false },
+        { text: truncate(t.descricao, MAX_DESCRICAO_LEN), noWrap: false },
       ]);
     }
   }

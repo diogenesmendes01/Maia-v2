@@ -165,19 +165,22 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
 
       if (res.tool_uses.length === 0) {
         const text = res.content?.trim() ?? '';
-        try {
-          if (text) {
-            // B3b: PDF report path — takes precedence over poll/text. The LLM's
-            // text becomes the document caption (truncated to WhatsApp's 1024-
-            // char limit).
-            if (latestReportPdf) {
+        if (text) {
+          // B3b: PDF report path — takes precedence over poll/text. The LLM's
+          // text becomes the document caption (truncated to WhatsApp's 1024-
+          // char limit). The unlink-in-finally guarantees the tmp PDF is
+          // removed even when send fails; boot sweeper is the safety net for
+          // crash-mid-send.
+          if (latestReportPdf) {
+            const pdf = latestReportPdf;
+            try {
               const captionText = text.slice(0, 1024);
               const shouldQuote =
                 (inbound.conteudo && detectCorrection(inbound.conteudo)) ||
                 getActivePending(c) !== null;
-              const wid = await sendOutboundDocument(jid, latestReportPdf.path, {
-                mimetype: latestReportPdf.mimetype,
-                fileName: latestReportPdf.fileName,
+              const wid = await sendOutboundDocument(jid, pdf.path, {
+                mimetype: pdf.mimetype,
+                fileName: pdf.fileName,
                 caption: captionText,
                 quoted: shouldQuote
                   ? quotedReplyContext(
@@ -187,9 +190,15 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
                   : undefined,
               });
               if (wid) {
-                const file_size_bytes = await stat(latestReportPdf.path)
+                const file_size_bytes = await stat(pdf.path)
                   .then((s) => s.size)
-                  .catch(() => 0);
+                  .catch((err) => {
+                    logger.warn(
+                      { err, path: pdf.path },
+                      'pdf.stat_failed_audit_size_zero',
+                    );
+                    return 0;
+                  });
                 await audit({
                   acao: 'outbound_sent_document',
                   pessoa_id: pessoa.id,
@@ -197,7 +206,7 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
                   mensagem_id: inbound.id,
                   metadata: {
                     whatsapp_id: wid,
-                    tipo: latestReportPdf.tipo,
+                    tipo: pdf.tipo,
                     file_size_bytes,
                   },
                 });
@@ -210,69 +219,65 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
                   metadata: {
                     whatsapp_id: wid,
                     in_reply_to: inbound.id,
-                    document_tipo: latestReportPdf.tipo,
-                    document_filename: latestReportPdf.fileName,
+                    document_tipo: pdf.tipo,
+                    document_filename: pdf.fileName,
                   },
                   processada_em: new Date(),
                   ferramentas_chamadas: [],
                   tokens_usados: null,
                 });
               }
+            } finally {
+              await unlink(pdf.path).catch((err) => {
+                logger.warn({ err, path: pdf.path }, 'pdf.unlink_failed_will_be_swept');
+              });
+            }
+          } else {
+            const usePoll =
+              latestPending &&
+              config.FEATURE_ONE_TAP &&
+              latestPending.opcoes_validas.length >= 3 &&
+              latestPending.opcoes_validas.length <= 12;
+            if (usePoll && latestPending) {
+              await sendOutboundPoll(pessoa.id, c.id, text, inbound.id, latestPending);
             } else {
-              const usePoll =
-                latestPending &&
-                config.FEATURE_ONE_TAP &&
-                latestPending.opcoes_validas.length >= 3 &&
-                latestPending.opcoes_validas.length <= 12;
-              if (usePoll && latestPending) {
-                await sendOutboundPoll(pessoa.id, c.id, text, inbound.id, latestPending);
-              } else {
-                const shouldQuote =
-                  (inbound.conteudo && detectCorrection(inbound.conteudo)) ||
-                  getActivePending(c) !== null;
-                const prefDisabled =
-                  (pessoa.preferencias as { balance_view_once?: boolean } | null)
-                    ?.balance_view_once === false;
-                const view_once =
-                  config.FEATURE_VIEW_ONCE_SENSITIVE && turnHasSensitive && !prefDisabled;
-                if (config.FEATURE_VIEW_ONCE_SENSITIVE && turnHasSensitive && prefDisabled) {
-                  await audit({
-                    acao: 'outbound_view_once_skipped_by_preference',
-                    pessoa_id: pessoa.id,
-                    conversa_id: c.id,
-                    mensagem_id: inbound.id,
-                    metadata: { sensitive_tools: sensitiveTools },
-                  });
-                }
-                const wid = await sendOutbound(pessoa.id, c.id, text, inbound.id, {
-                  pending_question_id: latestPending?.id ?? null,
-                  quoted: shouldQuote
-                    ? quotedReplyContext(
-                        inbound.metadata as Record<string, unknown> | null,
-                        inbound.conteudo,
-                      )
-                    : undefined,
-                  view_once,
+              const shouldQuote =
+                (inbound.conteudo && detectCorrection(inbound.conteudo)) ||
+                getActivePending(c) !== null;
+              const prefDisabled =
+                (pessoa.preferencias as { balance_view_once?: boolean } | null)
+                  ?.balance_view_once === false;
+              const view_once =
+                config.FEATURE_VIEW_ONCE_SENSITIVE && turnHasSensitive && !prefDisabled;
+              if (config.FEATURE_VIEW_ONCE_SENSITIVE && turnHasSensitive && prefDisabled) {
+                await audit({
+                  acao: 'outbound_view_once_skipped_by_preference',
+                  pessoa_id: pessoa.id,
+                  conversa_id: c.id,
+                  mensagem_id: inbound.id,
+                  metadata: { sensitive_tools: sensitiveTools },
                 });
-                if (wid && view_once) {
-                  await audit({
-                    acao: 'outbound_sent_view_once',
-                    pessoa_id: pessoa.id,
-                    conversa_id: c.id,
-                    mensagem_id: inbound.id,
-                    metadata: { whatsapp_id: wid, sensitive_tools: sensitiveTools },
-                  });
-                }
+              }
+              const wid = await sendOutbound(pessoa.id, c.id, text, inbound.id, {
+                pending_question_id: latestPending?.id ?? null,
+                quoted: shouldQuote
+                  ? quotedReplyContext(
+                      inbound.metadata as Record<string, unknown> | null,
+                      inbound.conteudo,
+                    )
+                  : undefined,
+                view_once,
+              });
+              if (wid && view_once) {
+                await audit({
+                  acao: 'outbound_sent_view_once',
+                  pessoa_id: pessoa.id,
+                  conversa_id: c.id,
+                  mensagem_id: inbound.id,
+                  metadata: { whatsapp_id: wid, sensitive_tools: sensitiveTools },
+                });
               }
             }
-          }
-        } finally {
-          // B3b: always unlink the tmp PDF, even if send failed. Boot sweeper
-          // is the safety net for crash-mid-send.
-          if (latestReportPdf) {
-            await unlink(latestReportPdf.path).catch((err) => {
-              logger.warn({ err, path: latestReportPdf?.path }, 'pdf.unlink_failed_will_be_swept');
-            });
           }
         }
         break;
