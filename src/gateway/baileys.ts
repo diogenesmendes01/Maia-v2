@@ -9,6 +9,7 @@ import {
 import { Boom } from '@hapi/boom';
 import qrcodeTerminal from 'qrcode-terminal';
 import { mkdirSync, writeFileSync, existsSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
@@ -264,6 +265,46 @@ export async function sendOutboundText(
   // We always pass the third arg (undefined when no quote) so call arity is stable.
   const miscOpts = opts?.quoted ? { quoted: opts.quoted } : undefined;
   const result = await socket.sendMessage(jid, content, miscOpts);
+  return result?.key.id ?? null;
+}
+
+/**
+ * B3b: send a document (PDF) to the recipient. Reads the file into a Buffer
+ * (PDFs are bounded by the 500-row hard limit at <500KB, well within memory),
+ * eliminating the partially-sent-on-error edge case. View-once is intentionally
+ * NOT supported here — see B3b spec §11 for rationale.
+ */
+export async function sendOutboundDocument(
+  jid: string,
+  path: string,
+  opts: {
+    mimetype: string;
+    fileName: string;
+    caption?: string;
+    quoted?: WAQuotedContext;
+  },
+): Promise<string | null> {
+  if (!socket || !connected) {
+    logger.warn('baileys.not_connected — cannot send document');
+    return null;
+  }
+  let buf: Buffer;
+  try {
+    buf = await readFile(path);
+  } catch (err) {
+    logger.error({ err, path }, 'baileys.send_document.read_failed');
+    return null;
+  }
+  const result = await socket.sendMessage(
+    jid,
+    {
+      document: buf,
+      mimetype: opts.mimetype,
+      fileName: opts.fileName,
+      caption: opts.caption,
+    },
+    opts.quoted ? { quoted: opts.quoted } : undefined,
+  );
   return result?.key.id ?? null;
 }
 
