@@ -655,7 +655,6 @@ const PESSOA = {
   tipo: 'owner',
   preferencias: {},
 } as never;
-const CONVERSA = { id: 'c1', pessoa_id: 'p1' } as never;
 const INBOUND = {
   id: 'in1',
   conversa_id: 'c1',
