@@ -123,10 +123,13 @@ describe('setup routes — POST /setup/start', () => {
 });
 
 describe('setup routes — phase-dependent rendering', () => {
-  it('GET /setup with qr=null shows "Gerando QR Code"', async () => {
+  // Note: the public state-machine API only allows entering pairing_qr with a
+  // non-null qr (`setQr(qr: string)`). The qr=null branch in renderQr exists
+  // as a defensive type — unreachable through the route flow today — so we
+  // can't exercise it here without poking internal state directly. See
+  // src/setup/templates.ts renderQr for the spinner branch.
+  it('GET /setup on pairing_qr embeds the QR image tag', async () => {
     const { setupState } = await import('../../src/setup/state.js');
-    setupState.setQr(''); // setQr empty triggers transition with qr=empty; we want null
-    // Workaround: use the auto-transition path properly
     setupState.setUnpaired();
     setupState.setQr('test-qr-string');
     const r = await app.inject({ method: 'GET', url: '/setup?token=TEST-TOKEN' });

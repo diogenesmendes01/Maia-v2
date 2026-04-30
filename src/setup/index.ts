@@ -98,7 +98,7 @@ export async function registerSetupRoutes(app: FastifyInstance): Promise<void> {
 
     const body = (req.body ?? {}) as { method?: 'qr' | 'code' };
     if (body.method !== 'qr' && body.method !== 'code') {
-      return reply.code(400).send({ ok: false, error: 'invalid_method' });
+      return reply.code(400).type('application/json').send({ ok: false, error: 'invalid_method' });
     }
     const phase = setupState.current().phase;
 
@@ -107,27 +107,30 @@ export async function registerSetupRoutes(app: FastifyInstance): Promise<void> {
       // This endpoint exists for HTML form clarity. Conflict only if currently
       // in a non-unpaired/non-pairing_qr phase.
       if (phase !== 'unpaired' && phase !== 'pairing_qr') {
-        return reply.code(409).send({ ok: false, phase });
+        return reply.code(409).type('application/json').send({ ok: false, phase });
       }
-      return reply.send({ ok: true, phase: setupState.current().phase });
+      return reply.type('application/json').send({ ok: true, phase: setupState.current().phase });
     }
 
     // method === 'code'
     if (phase !== 'unpaired') {
-      return reply.code(409).send({ ok: false, phase });
+      return reply.code(409).type('application/json').send({ ok: false, phase });
     }
     try {
       const code = await triggerPairingCode(config.WHATSAPP_NUMBER_MAIA);
       setupState.setCode(code);
       await audit({ acao: 'pairing_code_requested' });
-      return reply.send({ ok: true, phase: 'pairing_code' });
+      return reply.type('application/json').send({ ok: true, phase: 'pairing_code' });
     } catch (err) {
       const msg = (err as Error).message;
-      if (msg.includes('baileys_socket_not_ready')) {
-        return reply.code(503).send({ ok: false, retry_after_s: 2 });
+      // Exact equality (not includes): the only producer of this string is the
+      // socket-null guard in baileys.ts. Substring match would mis-classify any
+      // future error containing this token as "retryable".
+      if (msg === 'baileys_socket_not_ready') {
+        return reply.code(503).type('application/json').send({ ok: false, retry_after_s: 2 });
       }
       logger.error({ err }, 'setup.trigger_pairing_code_failed');
-      return reply.code(500).send({ ok: false, error: 'trigger_failed' });
+      return reply.code(500).type('application/json').send({ ok: false, error: 'trigger_failed' });
     }
   });
 
