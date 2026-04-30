@@ -14,7 +14,7 @@
 
 | Path | Action | Responsibility |
 |---|---|---|
-| `src/config/env.ts` | Modify | Add `FEATURE_VIEW_ONCE_SENSITIVE` (default `false`) |
+| `src/config/env.ts` | Modify | Add `FEATURE_VIEW_ONCE_SENSITIVE` (insert at line 104, before the closing `})` at line 105) |
 | `.env.example` | Modify | Document the new feature flag |
 | `src/governance/audit-actions.ts` | Modify | Append 2 new actions |
 | `src/tools/_registry.ts` | Modify | Add `sensitive?: boolean` to `Tool` type |
@@ -35,15 +35,15 @@ No DB migrations (uses existing `pessoas.preferencias` JSONB). No schema rewrite
 ## Task 1: Add `FEATURE_VIEW_ONCE_SENSITIVE` config flag
 
 **Files:**
-- Modify: `src/config/env.ts:109` (insert before the closing `})` of the schema object)
+- Modify: `src/config/env.ts` (insert at line 104, before the closing `})` of the schema object at line 105)
 - Modify: `.env.example` (append a documented section)
 
 - [ ] **Step 1: Add the env entry to the schema**
 
-In `src/config/env.ts`, locate the `FEATURE_PENDING_REMINDER` block (lines 109-112) and add the new flag right after it, **before** the closing `})` of the `.object({ ... })` call (line 113):
+In `src/config/env.ts`, locate the `FEATURE_ONE_TAP` block (lines 101-104) — currently the last entry in the `.object({ ... })` call. Add the new flag right after it, **before** the closing `})` on line 105:
 
 ```typescript
-    FEATURE_PENDING_REMINDER: z
+    FEATURE_ONE_TAP: z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
@@ -51,13 +51,15 @@ In `src/config/env.ts`, locate the `FEATURE_PENDING_REMINDER` block (lines 109-1
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
+  })
 ```
 
 - [ ] **Step 2: Document in `.env.example`**
 
-Append to `.env.example`:
+Append to `.env.example` (the file currently has no `FEATURE_*` section — add a new one matching the file's existing `# ---- ... ----` header style):
 
 ```bash
+
 # ---- Feature flags ----
 # View-once for sensitive replies (saldos, comparativos). Default false.
 # When true: outbound text replies for turns that ran a tool flagged
@@ -83,14 +85,14 @@ git commit -m "feat(b3a): add FEATURE_VIEW_ONCE_SENSITIVE env flag (default fals
 ## Task 2: Append two audit actions
 
 **Files:**
-- Modify: `src/governance/audit-actions.ts:85` (just before the closing `] as const;`)
+- Modify: `src/governance/audit-actions.ts` (insert after line 76 `'one_tap_dispatch_error'`, before the closing `] as const;` on line 77)
 
 - [ ] **Step 1: Add to `AUDIT_ACTIONS`**
 
-Append two entries to the array (after `'pending_reminder_skipped_already_marked'`, before `] as const;`):
+Append two entries to the array (after `'one_tap_dispatch_error'`, before `] as const;`):
 
 ```typescript
-  'pending_reminder_skipped_already_marked',
+  'one_tap_dispatch_error',
   'outbound_sent_view_once',
   'outbound_view_once_skipped_by_preference',
 ] as const;
@@ -116,6 +118,8 @@ git commit -m "feat(b3a): add outbound_sent_view_once + skipped_by_preference au
 - Modify: `src/tools/_registry.ts:32-43` (extend the `Tool` type)
 - Modify: `src/tools/query-balance.ts:23-30` (add `sensitive: true`)
 - Modify: `src/tools/compare-entities.ts:30-38` (add `sensitive: true`)
+
+> **IMPORTANT — `vi.mock` consolidation rule for `tests/unit/view-once.spec.ts`:** vitest hoists `vi.mock(modulePath, factory)` to the top of the file at runtime. Calling `vi.mock` for the same module path more than once **silently overrides** earlier calls. Therefore the mocks for `'../../src/db/repositories.js'`, `'../../src/governance/audit.js'`, `'../../src/gateway/baileys.js'`, and `'../../src/config/env.js'` must each appear **exactly once** at the top of `view-once.spec.ts`. Tasks 5, 6, 7, and 8 in this plan show their own `vi.mock` blocks for clarity, but the implementer MUST merge them all into one shared block at the top of the file. Each task adds new fields/methods to the existing factory, not a new `vi.mock` call. (Pattern reference: see `tests/unit/pending-gate.spec.ts:7-32` for a similar "all mocks in one block at the top" structure.)
 
 - [ ] **Step 1: Write the failing test**
 
@@ -252,15 +256,11 @@ beforeEach(() => {
   viewOnceFlag = true;
 });
 
-// We need a way to inject the connected socket into the module's private
-// state. The simplest path: we re-import the module and use the Baileys mock
-// to surface the socket. Since `sendOutboundText` checks the module-level
-// `socket` and `connected`, we expose a test hook.
-
-// NOTE TO IMPLEMENTER: if the production code does NOT already expose a way
-// to set the socket from tests, add a `_setSocketForTests` export inside an
-// `_internal` namespace, gated to non-prod. See agent/core.ts for the pattern
-// (`export const _internal = { scheduleTypingDebounce };`).
+// `sendOutboundText` reads the module-level `socket` and `connected`. To
+// drive it from tests without booting the full WA pairing flow, we use a
+// test-only `_internal._setSocketForTests` seam (added to baileys.ts in
+// Step 3 of this task). This Step 1 test will fail because the seam doesn't
+// exist yet — that's the TDD red.
 
 describe('sendOutboundText — view_once envelope contract', () => {
   it('passes { text, viewOnce: true } when opts.view_once && FEATURE_VIEW_ONCE_SENSITIVE', async () => {
@@ -280,14 +280,14 @@ describe('sendOutboundText — view_once envelope contract', () => {
     const mod = await import('../../src/gateway/baileys.js');
     mod._internal._setSocketForTests(fakeSocket as never, true);
     await mod.sendOutboundText('jid', 'Saldo', { view_once: true });
-    expect(sendMessage).toHaveBeenCalledWith('jid', { text: 'Saldo' });
+    expect(sendMessage).toHaveBeenCalledWith('jid', { text: 'Saldo' }, undefined);
   });
 
   it('does NOT pass viewOnce when opts.view_once is false even with flag on', async () => {
     const mod = await import('../../src/gateway/baileys.js');
     mod._internal._setSocketForTests(fakeSocket as never, true);
     await mod.sendOutboundText('jid', 'Saldo', { view_once: false });
-    expect(sendMessage).toHaveBeenCalledWith('jid', { text: 'Saldo' });
+    expect(sendMessage).toHaveBeenCalledWith('jid', { text: 'Saldo' }, undefined);
   });
 
   it('view_once + quoted forwards both', async () => {
@@ -330,7 +330,7 @@ export const _internal = {
 
 - [ ] **Step 4: Extend `sendOutboundText` with `view_once` opt**
 
-Replace the function at `src/gateway/baileys.ts:230-246` with:
+Replace the function at `src/gateway/baileys.ts:230-246` with the version below. Note: we always invoke `socket.sendMessage` with a third `quoted` arg (passing `undefined` when no quote), so the call's arity is stable for `toHaveBeenCalledWith` matchers:
 
 ```typescript
 export async function sendOutboundText(
@@ -344,12 +344,10 @@ export async function sendOutboundText(
   }
   const useViewOnce = !!opts?.view_once && config.FEATURE_VIEW_ONCE_SENSITIVE;
   const content = useViewOnce ? { text, viewOnce: true } : { text };
-  if (opts?.quoted) {
-    // Baileys' sendMessage accepts `quoted` as third-arg MiscMessageGenerationOptions.
-    const result = await socket.sendMessage(jid, content, { quoted: opts.quoted });
-    return result?.key.id ?? null;
-  }
-  const result = await socket.sendMessage(jid, content);
+  // Baileys' sendMessage accepts `quoted` as third-arg MiscMessageGenerationOptions.
+  // We always pass the third arg (undefined when no quote) so call arity is stable.
+  const miscOpts = opts?.quoted ? { quoted: opts.quoted } : undefined;
+  const result = await socket.sendMessage(jid, content, miscOpts);
   return result?.key.id ?? null;
 }
 ```
@@ -382,15 +380,23 @@ This task is a pure refactor — the new opt is plumbed but not yet computed at 
 
 - [ ] **Step 1: Write the failing test**
 
-Append to `tests/unit/view-once.spec.ts` a new describe block. (For the agent loop tests we need to mock most of the world — match the pattern from `tests/unit/pending-gate.spec.ts` and `tests/unit/baileys-handle-incoming.spec.ts`.)
+This task introduces the agent-loop mocks. Add the shared mock block at the **top of the file** (above the registry-surface describe block from Task 3). Subsequent tasks (6, 7, 8) extend fields on these same mocks — they MUST NOT call `vi.mock` again for the same module path.
 
 ```typescript
+// At the TOP of tests/unit/view-once.spec.ts — add this BEFORE the existing
+// "Tool.sensitive registry surface" describe block.
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const sendOutboundText = vi.fn();
 const findById = vi.fn();
 const audit = vi.fn();
 const createMensagem = vi.fn();
+const findMensagem = vi.fn();
+const markProcessed = vi.fn();
+const recentInConversation = vi.fn();
+
+// Mutable feature-flag values for per-test override (Task 6 flag-off scenario).
+const flagState = { FEATURE_VIEW_ONCE_SENSITIVE: true };
 
 vi.mock('../../src/gateway/baileys.js', () => ({
   sendOutboundText,
@@ -400,24 +406,38 @@ vi.mock('../../src/db/repositories.js', () => ({
   pessoasRepo: { findById },
   mensagensRepo: {
     create: createMensagem,
-    findById: vi.fn(),
-    markProcessed: vi.fn(),
-    recentInConversation: vi.fn().mockResolvedValue([]),
+    findById: findMensagem,
+    markProcessed,
+    recentInConversation,
+    setConversaId: vi.fn(),
+    createInbound: vi.fn(),
   },
   pendingQuestionsRepo: { findActiveSnapshot: vi.fn() },
   conversasRepo: { touch: vi.fn() },
+  selfStateRepo: { getActive: vi.fn().mockResolvedValue(null) },
+  factsRepo: { listForScopes: vi.fn().mockResolvedValue([]) },
+  rulesRepo: { listActive: vi.fn().mockResolvedValue([]) },
+  entityStatesRepo: { byId: vi.fn().mockResolvedValue(null) },
+  entidadesRepo: { byIds: vi.fn().mockResolvedValue([]) },
 }));
 vi.mock('../../src/governance/audit.js', () => ({ audit }));
 vi.mock('../../src/lib/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
 }));
 vi.mock('../../src/config/env.js', () => ({
-  config: {
-    FEATURE_VIEW_ONCE_SENSITIVE: true,
-    FEATURE_ONE_TAP: false,
-    FEATURE_PENDING_GATE: false,
-    OWNER_TELEFONE_WHATSAPP: '+5511999999999',
-  },
+  config: new Proxy(
+    {
+      FEATURE_ONE_TAP: false,
+      FEATURE_PENDING_GATE: false,
+      OWNER_TELEFONE_WHATSAPP: '+5511999999999',
+    } as Record<string, unknown>,
+    {
+      get(target, prop) {
+        if (prop === 'FEATURE_VIEW_ONCE_SENSITIVE') return flagState.FEATURE_VIEW_ONCE_SENSITIVE;
+        return target[prop as string];
+      },
+    },
+  ),
 }));
 
 describe('sendOutbound — view_once threading', () => {
@@ -539,12 +559,10 @@ This is the heart of the feature. Test cases cover four §10 scenarios + the ite
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `tests/unit/view-once.spec.ts` (still inside the same file, new describe block):
+Append to `tests/unit/view-once.spec.ts` — same file, new describe block. The agent-loop tests need additional `vi.mock` calls for modules that haven't been mocked yet. Per the consolidation rule, add these new `vi.mock` calls at the TOP of the file alongside the shared block (NOT inside the describe block):
 
 ```typescript
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-// (uses the same vi.mock setup from the previous block — vitest hoists)
-
+// Add at the TOP of the file, after the Task 5 vi.mock block.
 const dispatchTool = vi.fn();
 vi.mock('../../src/tools/_dispatcher.js', () => ({ dispatchTool }));
 
@@ -589,11 +607,15 @@ vi.mock('../../src/agent/reflection.js', () => ({
   findPreviousAssistantMessage: vi.fn(),
 }));
 
-const recentInConversation = vi.fn().mockResolvedValue([]);
-const findMensagem = vi.fn();
-const markProcessed = vi.fn();
+vi.mock('../../src/db/client.js', () => ({
+  db: {} as never,
+  withTx: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})),
+}));
 
-// (extend the existing repositories mock to include findById/markProcessed)
+// `loadConversaWithPessoa` in core.ts uses dynamic imports of db/client and
+// db/schema. Since the agent loop test only exercises the no-tool-uses branch
+// after a fake LLM response, we sidestep that helper by feeding the test via
+// findMensagem returning an inbound that already has conversa_id set.
 
 const PESSOA = {
   id: 'p1',
@@ -694,19 +716,25 @@ describe('agent loop — view-once decision + audit', () => {
     expect(acoes).not.toContain('outbound_sent_view_once');
   });
 
-  it('FEATURE_VIEW_ONCE_SENSITIVE=false → no view-once, no audit', async () => {
-    // Override the config mock for this test only — vitest hoists vi.mock so
-    // we need to use vi.doMock + dynamic import, OR a getter on the config
-    // mock that reads a mutable variable. Use the pattern from the
-    // baileys-view-once.spec.ts file (mutable `viewOnceFlag` + getter).
-    // For brevity here, document the technique inline and let the
-    // implementer pick a concrete approach.
-    // ...
+  it('FEATURE_VIEW_ONCE_SENSITIVE=false → no view-once, no audit (even on sensitive turn)', async () => {
+    // The shared config mock uses a Proxy whose getter reads
+    // `flagState.FEATURE_VIEW_ONCE_SENSITIVE`. Flip it for this test:
+    flagState.FEATURE_VIEW_ONCE_SENSITIVE = false;
+    try {
+      await runWithToolUses(['query_balance']);
+      const lastCall = sendOutboundText.mock.calls.at(-1)!;
+      // Agent loop gates `view_once` on the flag (Task 6 Step 3), so view_once
+      // is never set on the call when the flag is off — even on a sensitive turn.
+      expect(lastCall[2]?.view_once).toBeUndefined();
+      const acoes = audit.mock.calls.map((c) => c[0].acao);
+      expect(acoes).not.toContain('outbound_sent_view_once');
+      expect(acoes).not.toContain('outbound_view_once_skipped_by_preference');
+    } finally {
+      flagState.FEATURE_VIEW_ONCE_SENSITIVE = true;
+    }
   });
 });
 ```
-
-(The flag-off case can be implemented either by switching the test file's config-mock to a getter — same trick as `baileys-view-once.spec.ts` — or by spinning up a separate spec file `view-once-flag-off.spec.ts`. Implementer's choice; either is acceptable. The acceptance criteria require coverage of this branch.)
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -737,6 +765,8 @@ b) Inside the for-loop, after each `dispatchTool`, set the flag. Find the block 
         // ...rest of existing block unchanged
 ```
 
+**Why the `!sensitiveTools.includes(tu.tool)` dedup**: the LLM may dispatch the same tool more than once in a single turn (e.g., querying balance for two different `entidade_id`s as separate tool calls). The `sensitive_tools` list embedded in the audit metadata is meant as a deduplicated set of tool names that flipped the flag, not a count of calls. Don't simplify to `.push()` without the guard — you'll end up with `['query_balance', 'query_balance']` in the audit row and the audit becomes harder to query.
+
 c) At the no-tool-uses branch (lines 157-180, the `if (res.tool_uses.length === 0)` block), compute `view_once` and pass it:
 
 ```typescript
@@ -754,7 +784,13 @@ c) At the no-tool-uses branch (lines 157-180, the `if (res.tool_uses.length === 
             const shouldQuote =
               (inbound.conteudo && detectCorrection(inbound.conteudo)) ||
               getActivePending(c) !== null;
+            // Per spec §6: when FEATURE_VIEW_ONCE_SENSITIVE is false, Tool.sensitive
+            // flags have NO runtime effect. We gate view_once on the flag here so
+            // the audit also doesn't fire when the feature is off (the alternative —
+            // gating only inside baileys.ts — would cause the agent loop's audit to
+            // fire even when no view-once envelope was actually used).
             const view_once =
+              config.FEATURE_VIEW_ONCE_SENSITIVE &&
               turnHasSensitive &&
               (pessoa.preferencias as { balance_view_once?: boolean } | null)?.balance_view_once !== false;
             const wid = await sendOutbound(pessoa.id, c.id, text, inbound.id, {
@@ -782,7 +818,7 @@ c) At the no-tool-uses branch (lines 157-180, the `if (res.tool_uses.length === 
       }
 ```
 
-Note: the audit fires only if `wid && view_once`. When `sendOutboundText` returns null (disconnected), the audit is silently skipped per spec §4.6 iter-2 fix.
+Note: the audit fires only if `wid && view_once`. When `sendOutboundText` returns null (disconnected), the audit is silently skipped per spec §4.6 iter-2 fix. When `FEATURE_VIEW_ONCE_SENSITIVE` is off, `view_once` evaluates to `false` here, so neither the call's `view_once` opt nor the audit fires — matching spec §6's "no runtime effect" guarantee.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -881,10 +917,11 @@ Expected: FAIL — `outbound_view_once_skipped_by_preference` is never emitted.
 
 - [ ] **Step 3: Emit the skipped audit BEFORE the send**
 
-In `src/agent/core.ts` no-tool-uses branch, modify the section right above the `sendOutbound` call. Replace the existing computation:
+In `src/agent/core.ts` no-tool-uses branch, modify the section right above the `sendOutbound` call. Replace the Task 6 Step 3 computation:
 
 ```typescript
             const view_once =
+              config.FEATURE_VIEW_ONCE_SENSITIVE &&
               turnHasSensitive &&
               (pessoa.preferencias as { balance_view_once?: boolean } | null)?.balance_view_once !== false;
 ```
@@ -894,10 +931,14 @@ with:
 ```typescript
             const prefDisabled =
               (pessoa.preferencias as { balance_view_once?: boolean } | null)?.balance_view_once === false;
-            const view_once = turnHasSensitive && !prefDisabled;
+            const view_once =
+              config.FEATURE_VIEW_ONCE_SENSITIVE && turnHasSensitive && !prefDisabled;
             // Decision-time audit: fires on sensitive turn when the preference suppresses view-once.
             // Independent of whether the resulting plain-text send succeeds (Baileys may be down).
-            if (turnHasSensitive && prefDisabled) {
+            // Only emit when the feature is actually enabled — when the flag is off, the
+            // Tool.sensitive flags have no runtime effect (spec §6) so a "skipped" audit
+            // would be misleading.
+            if (config.FEATURE_VIEW_ONCE_SENSITIVE && turnHasSensitive && prefDisabled) {
               await audit({
                 acao: 'outbound_view_once_skipped_by_preference',
                 pessoa_id: pessoa.id,
