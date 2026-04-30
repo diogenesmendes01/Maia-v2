@@ -9,7 +9,7 @@
 
 ## 1. Purpose
 
-When the agent's text response carries financial values (saldos, comparativos), wrap the WhatsApp send in `viewOnceMessageV2` so the reply disappears from the recipient's chat history after a single view. Reduces leak surface when the user passes the phone around or hands it to a third party who scrolls back.
+When the agent's text response carries financial values (saldos, comparativos), wrap the WhatsApp send in `viewOnceMessage` (the V1 envelope produced by Baileys 6.7.0 — verified at `node_modules/@whiskeysockets/baileys/lib/Utils/messages.js:440-442`) so the reply disappears from the recipient's chat history after a single view. Reduces leak surface when the user passes the phone around or hands it to a third party who scrolls back.
 
 This is **best-effort privacy enhancement**, not a security control:
 - Android WhatsApp honours view-once for text (message disappears after viewing).
@@ -126,7 +126,11 @@ await sendOutbound(pessoa.id, c.id, text, inbound.id, {
 });
 ```
 
-For the poll branch (`sendOutboundPoll`), view-once does **not** apply — polls and view-once are incompatible at the WhatsApp protocol level. If a turn has both `turnHasSensitive` AND `latestPending` requiring a poll, the poll wins (sensitive data in poll-question text is acceptable: poll questions are short and the values aren't necessarily inside them).
+For the poll branch (`sendOutboundPoll`), view-once does **not** apply — polls and view-once are incompatible at the WhatsApp protocol level. If a turn has both `turnHasSensitive` AND `latestPending` requiring a poll, the poll wins.
+
+**Content-rule constraint**: poll question text MUST NOT embed sensitive monetary figures. The agent's prompt-builder is updated to instruct the LLM that, when emitting `ask_pending_question` during a sensitive turn, the `pergunta` should reference the value indirectly ("Confirma transferência?" rather than "Confirma transferir R$ 12.345,67?"). The actual figures live in the option labels at most ("Sim, R$ 12k" → still acceptable since it's truncated).
+
+The constraint is documented in the prompt-builder system block (one-liner addition); we do not add a programmatic guard because false positives on monetary regex would be brittle. Failure mode if the LLM ignores the instruction: a sensitive figure leaks into the poll question — same severity as a leak in the regular text reply that view-once was meant to hide. Documented limitation, not a hard correctness break.
 
 ### 4.6 Audit
 
@@ -146,6 +150,17 @@ Every view-once send emits `outbound_sent_view_once` audit:
 ```
 
 Audit fires only on actual view-once sends (not when the flag was on but the preference disabled). When the preference disables view-once on a sensitive turn, emit `outbound_view_once_skipped_by_preference` so the owner-side opt-out is observable.
+
+**Null-WAID handling**: `sendOutboundText` returns `null` when Baileys is disconnected (`baileys.ts:254-257`) — the message was never delivered. In that case the audit MUST NOT fire (no view-once send happened). Concretely:
+
+```typescript
+const wid = await sendOutboundText(jid, text, { quoted, view_once });
+if (wid && view_once) {
+  await audit({ acao: 'outbound_sent_view_once', /* ... */, metadata: { whatsapp_id: wid, sensitive_tools } });
+}
+```
+
+The same wid-guard applies to `outbound_view_once_skipped_by_preference` — that audit fires when view-once was suppressed, which is independent of whether the resulting plain-text send succeeded; emit it BEFORE the send (the suppression decision is made at decision time, not delivery time).
 
 ## 5. Schema / migrations
 
@@ -222,10 +237,12 @@ Manual checklist on the PR (real WhatsApp Android receiver) — verify that `que
 - [ ] Poll outbound (`sendOutboundPoll`) is unaffected — view-once does not apply to polls; the spec documents this trade-off.
 - [ ] `quoted` opt is preserved — view-once + quoted reply works (quote is the third arg to Baileys `sendMessage` regardless of view-once).
 - [ ] Unit tests cover all six branches of §10.
+- [ ] **Null-WAID guard**: `sendOutboundText` returns `null` (Baileys disconnected) on a sensitive turn → no `outbound_sent_view_once` audit fires (verified by mock-spy assertion).
+- [ ] **Prompt-builder content rule**: `src/agent/prompt-builder.ts` system block contains the instruction "during a sensitive turn, do not embed monetary figures in poll question text" (or equivalent).
 
 ## 13. References
 
 - Sub-A design — `docs/superpowers/specs/2026-04-29-whatsapp-ux-polish-design.md` (`sendOutboundText` opts pattern)
 - B0 design — `docs/superpowers/specs/2026-04-29-whatsapp-b0-pending-gate-design.md` (`Tool` type at `_registry.ts`)
 - Spec 09 — audit taxonomy
-- Baileys docs: `viewOnce` flag on `sendMessage`, `viewOnceMessageV2` envelope
+- Baileys docs: `viewOnce` flag on `sendMessage`. **Envelope produced by Baileys 6.7.0 is `viewOnceMessage` (V1)**, NOT `viewOnceMessageV2`. Tests that mock or assert the wrapped shape must match V1.
