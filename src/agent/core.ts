@@ -8,7 +8,8 @@ import { config } from '@/config/env.js';
 import { buildPrompt } from './prompt-builder.js';
 import { callLLM, type LLMMessage } from '@/lib/claude.js';
 import { logger } from '@/lib/logger.js';
-import { sendOutboundText, sendOutboundDocument } from '@/gateway/baileys.js';
+import { sendOutboundText, sendOutboundDocument, sendOutboundVoice } from '@/gateway/baileys.js';
+import { synthesizeSpeech, OUTBOUND_VOICE_MAX_CHARS } from '@/lib/tts.js';
 import { audit } from '@/governance/audit.js';
 import { dispatchTool } from '@/tools/_dispatcher.js';
 import { getToolSchemas, REGISTRY } from '@/tools/_registry.js';
@@ -230,6 +231,77 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
             } finally {
               await unlink(pdf.path).catch((err) => {
                 logger.warn({ err, path: pdf.path }, 'pdf.unlink_failed_will_be_swept');
+              });
+            }
+          } else if (
+            config.FEATURE_OUTBOUND_VOICE &&
+            inbound.tipo === 'audio' &&
+            text.length <= OUTBOUND_VOICE_MAX_CHARS
+          ) {
+            // B4: voice reply for symmetric voice-in/voice-out channel.
+            let voiceBuf: Buffer | null = null;
+            try {
+              voiceBuf = await synthesizeSpeech(text);
+            } catch (err) {
+              logger.warn(
+                { err: (err as Error).message, mensagem_id: inbound.id },
+                'b4.tts_failed_fallback_text',
+              );
+            }
+            if (voiceBuf) {
+              const shouldQuote =
+                (inbound.conteudo && detectCorrection(inbound.conteudo)) ||
+                getActivePending(c) !== null;
+              const wid = await sendOutboundVoice(jid, voiceBuf, {
+                quoted: shouldQuote
+                  ? quotedReplyContext(
+                      inbound.metadata as Record<string, unknown> | null,
+                      inbound.conteudo,
+                    )
+                  : undefined,
+              });
+              if (wid) {
+                await audit({
+                  acao: 'outbound_sent_voice',
+                  pessoa_id: pessoa.id,
+                  conversa_id: c.id,
+                  mensagem_id: inbound.id,
+                  metadata: {
+                    whatsapp_id: wid,
+                    char_count: text.length,
+                    byte_size: voiceBuf.length,
+                  },
+                });
+                await mensagensRepo.create({
+                  conversa_id: c.id,
+                  direcao: 'out',
+                  tipo: 'audio',
+                  conteudo: text,
+                  midia_url: null,
+                  metadata: {
+                    whatsapp_id: wid,
+                    remote_jid: jid,
+                    in_reply_to: inbound.id,
+                    voice: 'nova',
+                  },
+                  processada_em: new Date(),
+                  ferramentas_chamadas: [],
+                  tokens_usados: null,
+                });
+              }
+            } else {
+              // TTS failed — fall back to text path (re-uses existing sendOutbound).
+              const shouldQuote =
+                (inbound.conteudo && detectCorrection(inbound.conteudo)) ||
+                getActivePending(c) !== null;
+              await sendOutbound(pessoa.id, c.id, text, inbound.id, {
+                pending_question_id: latestPending?.id ?? null,
+                quoted: shouldQuote
+                  ? quotedReplyContext(
+                      inbound.metadata as Record<string, unknown> | null,
+                      inbound.conteudo,
+                    )
+                  : undefined,
               });
             }
           } else {
