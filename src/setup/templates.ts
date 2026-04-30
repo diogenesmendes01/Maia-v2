@@ -8,7 +8,8 @@ const BASE_HEAD = `<!DOCTYPE html>
 <style>
   /* Minimal fallback if Tailwind CDN is unreachable */
   body { font: 14px/1.5 system-ui; max-width: 480px; margin: 60px auto; padding: 0 20px; }
-  button { padding: 12px 20px; margin: 8px; border-radius: 8px; cursor: pointer; }
+  button { padding: 12px 20px; margin: 8px; border-radius: 8px; cursor: pointer; border: 1px solid #ccc; }
+  button[value="qr"] { background: #2563eb; color: white; border-color: #2563eb; }
 </style>
 </head>
 <body class="bg-slate-50 min-h-screen flex items-center justify-center p-4">
@@ -31,20 +32,23 @@ const STATUS_AND_FOOT = (statusText: string, token: string, autoRefreshSec?: num
       const res = await fetch('/setup/status?token=' + encodeURIComponent(TOKEN), { cache: 'no-store' });
       if (!res.ok) return;
       const data = await res.json();
+      // Skip change detection on first poll — current phase is already reflected in the HTML.
       if (prevPhase && prevPhase !== data.phase) {
         if (data.phase === 'connected') {
+          clearInterval(intervalId);
           document.getElementById('status-text').textContent = 'Conectado com sucesso. Redirecionando…';
           setTimeout(() => { window.location.href = '/setup/done'; }, 1500);
           return;
         }
-        // Phase changed; reload to render the new state's HTML.
+        // Phase changed; stop polling and reload to render the new state's HTML.
+        clearInterval(intervalId);
         window.location.reload();
         return;
       }
       prevPhase = data.phase;
     } catch (e) { /* network blip; keep polling */ }
   }
-  setInterval(poll, POLL_INTERVAL_MS);
+  const intervalId = setInterval(poll, POLL_INTERVAL_MS);
   poll();
 })();
 </script>${autoRefreshSec ? `<meta http-equiv="refresh" content="${autoRefreshSec}">` : ''}
@@ -123,8 +127,11 @@ export function renderCode(token: string, code: string, expiresAt: Date): string
       const el = document.getElementById('code-display');
       const range = document.createRange();
       range.selectNode(el);
-      window.getSelection().removeAllRanges();
-      window.getSelection().addRange(range);
+      const sel = window.getSelection();
+      if (sel) {
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }
     }
   });
   function tick() {
