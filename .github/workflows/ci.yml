@@ -43,19 +43,23 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Typecheck (tsc --noEmit equivalent via build)
-        run: npm run build
+      - name: Typecheck (tsc --noEmit)
+        # Separated from build so failures point cleanly at type vs build.
+        # `npx` instead of an npm script keeps CI independent of script renames.
+        run: npx tsc --noEmit
+
+      - name: Build + verify artifact
+        # Atomic: dist/ check is chained with `&&` so the step fails if build
+        # fails OR if no dist/index.js was produced.
+        run: npm run build && test -f dist/index.js
 
       - name: Run unit tests
         # Integration tests skip when TEST_DB_URL is unset — the unit lane is
-        # always green on CI. Add a separate job with services if/when we
-        # want integration coverage in CI.
+        # always green on CI. Follow-up: separate job with postgres + redis
+        # service containers for integration coverage.
         run: npx vitest run
 
       - name: Lint
         # `--max-warnings=0` would flip warnings to failures; we keep them as
         # warnings for now so existing code can be cleaned incrementally.
         run: npm run lint
-
-      - name: Verify clean build artifacts produced
-        run: test -d dist && test -f dist/index.js

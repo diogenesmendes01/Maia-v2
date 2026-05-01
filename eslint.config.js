@@ -12,8 +12,74 @@ import js from '@eslint/js';
 import tsParser from '@typescript-eslint/parser';
 import tsPlugin from '@typescript-eslint/eslint-plugin';
 
+// Globals are split into two sets: Node-runtime globals (used everywhere)
+// and Vitest globals (only for tests/). Keeping them separate means a stray
+// `describe(...)` inside src/ raises `no-undef` instead of silently passing.
+const NODE_GLOBALS = {
+  process: 'readonly',
+  Buffer: 'readonly',
+  console: 'readonly',
+  setTimeout: 'readonly',
+  clearTimeout: 'readonly',
+  setInterval: 'readonly',
+  clearInterval: 'readonly',
+  setImmediate: 'readonly',
+  clearImmediate: 'readonly',
+  global: 'readonly',
+  URL: 'readonly',
+  URLSearchParams: 'readonly',
+  AbortSignal: 'readonly',
+  AbortController: 'readonly',
+  fetch: 'readonly',
+  BigInt: 'readonly',
+};
+
+const VITEST_GLOBALS = {
+  describe: 'readonly',
+  it: 'readonly',
+  expect: 'readonly',
+  beforeEach: 'readonly',
+  afterEach: 'readonly',
+  beforeAll: 'readonly',
+  afterAll: 'readonly',
+  vi: 'readonly',
+};
+
+const TS_RULES = {
+  ...tsPlugin.configs.recommended.rules,
+
+  // Disable base no-unused-vars in favour of the TS-aware version
+  'no-unused-vars': 'off',
+  '@typescript-eslint/no-unused-vars': [
+    'warn',
+    {
+      argsIgnorePattern: '^_',
+      varsIgnorePattern: '^_',
+      caughtErrorsIgnorePattern: '^_',
+      ignoreRestSiblings: true,
+    },
+  ],
+
+  // Allow `any` for now — there are deliberate `unknown`-bridge casts and
+  // some external lib boundaries. Tighten later if the team wants.
+  '@typescript-eslint/no-explicit-any': 'warn',
+
+  // Empty catch blocks are common at config/cleanup boundaries.
+  '@typescript-eslint/no-empty-object-type': 'off',
+  'no-empty': ['warn', { allowEmptyCatch: true }],
+
+  // Already enforced by tsc
+  'no-undef': 'off',
+
+  // Allow re-assigning function args (common in patch-style helpers)
+  'no-param-reassign': 'off',
+
+  // Prefer const, but warn instead of error so refactors don't block CI
+  'prefer-const': 'warn',
+};
+
 export default [
-  // Global ignores - mirror tsconfig + add generated/test artifacts
+  // Global ignores
   {
     ignores: [
       'dist/**',
@@ -31,79 +97,39 @@ export default [
   // Base recommended for all JS/TS
   js.configs.recommended,
 
-  // TypeScript-specific config for our source
+  // TypeScript source files (NO test globals — using vi/describe/it here
+  // should fail with no-undef instead of silently passing)
   {
-    files: ['src/**/*.ts', 'scripts/**/*.ts', 'tests/**/*.ts'],
+    files: ['src/**/*.ts', 'scripts/**/*.ts'],
     languageOptions: {
       parser: tsParser,
       parserOptions: {
         ecmaVersion: 2022,
         sourceType: 'module',
       },
-      globals: {
-        // Node built-ins used across the codebase
-        process: 'readonly',
-        Buffer: 'readonly',
-        console: 'readonly',
-        setTimeout: 'readonly',
-        clearTimeout: 'readonly',
-        setInterval: 'readonly',
-        clearInterval: 'readonly',
-        setImmediate: 'readonly',
-        clearImmediate: 'readonly',
-        global: 'readonly',
-        URL: 'readonly',
-        URLSearchParams: 'readonly',
-        AbortSignal: 'readonly',
-        AbortController: 'readonly',
-        fetch: 'readonly',
-        // Vitest globals (only relevant inside tests/, but enabling here is harmless)
-        describe: 'readonly',
-        it: 'readonly',
-        expect: 'readonly',
-        beforeEach: 'readonly',
-        afterEach: 'readonly',
-        beforeAll: 'readonly',
-        afterAll: 'readonly',
-        vi: 'readonly',
-      },
+      globals: NODE_GLOBALS,
     },
     plugins: {
       '@typescript-eslint': tsPlugin,
     },
-    rules: {
-      // Start from the type-eslint flat preset
-      ...tsPlugin.configs.recommended.rules,
+    rules: TS_RULES,
+  },
 
-      // Disable base no-unused-vars in favour of the TS-aware version
-      'no-unused-vars': 'off',
-      '@typescript-eslint/no-unused-vars': [
-        'warn',
-        {
-          argsIgnorePattern: '^_',
-          varsIgnorePattern: '^_',
-          caughtErrorsIgnorePattern: '^_',
-          ignoreRestSiblings: true,
-        },
-      ],
-
-      // Allow `any` for now — there are deliberate `unknown`-bridge casts and
-      // some external lib boundaries. Tighten later if the team wants.
-      '@typescript-eslint/no-explicit-any': 'warn',
-
-      // Empty catch blocks are common at config/cleanup boundaries.
-      '@typescript-eslint/no-empty-object-type': 'off',
-      'no-empty': ['warn', { allowEmptyCatch: true }],
-
-      // Already enforced by tsc
-      'no-undef': 'off',
-
-      // Allow re-assigning function args (common in patch-style helpers)
-      'no-param-reassign': 'off',
-
-      // Prefer const, but warn instead of error so refactors don't block CI
-      'prefer-const': 'warn',
+  // Test files (Node globals + Vitest globals)
+  {
+    files: ['tests/**/*.ts'],
+    languageOptions: {
+      parser: tsParser,
+      parserOptions: {
+        ecmaVersion: 2022,
+        sourceType: 'module',
+      },
+      globals: { ...NODE_GLOBALS, ...VITEST_GLOBALS },
     },
+    plugins: {
+      '@typescript-eslint': tsPlugin,
+    },
+    rules: TS_RULES,
   },
 
   // CommonJS scripts (rare here but defensive)
