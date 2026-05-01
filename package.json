@@ -1,7 +1,7 @@
 {
   "name": "maia-v2",
   "version": "0.1.0",
-  "description": "Maia — Assistente financeira inteligente via WhatsApp - PF + 8 PJs",
+  "description": "Maia \u00e2\u20ac\u201d Assistente financeira inteligente via WhatsApp - PF + 8 PJs",
   "private": true,
   "type": "module",
   "engines": {
@@ -28,7 +28,7 @@
     "test:leak": "vitest run tests/integration/leak.spec.ts tests/integration/repos-leak.spec.ts tests/unit/cross-entity.spec.ts tests/unit/constitutional.spec.ts",
     "test:integration": "vitest run tests/integration",
     "test:e2e": "vitest run tests/e2e",
-    "lint": "eslint src --ext .ts",
+    "lint": "eslint src tests scripts",
     "format": "prettier --write src",
     "typecheck": "tsc --noEmit"
   },

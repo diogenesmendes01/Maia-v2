@@ -6,7 +6,7 @@ export function formatBRL(value: number): string {
 
 export function parseBRL(input: string): number | null {
   if (typeof input !== 'string') return null;
-  const cleaned = input.replace(/[^0-9.,\-]/g, '').trim();
+  const cleaned = input.replace(/[^0-9.,-]/g, '').trim();
   if (!cleaned) return null;
   const sign = cleaned.startsWith('-') ? -1 : 1;
   const digits = cleaned.replace('-', '');

@@ -107,7 +107,7 @@ describe('brazilian — currency', () => {
   });
   it('formata BR', () => {
     const formatted = formatBRL(1234.56);
-    expect(formatted.replace(/ /g, ' ')).toBe('R$ 1.234,56');
+    expect(formatted.replace(/\u00A0/g, ' ')).toBe('R$ 1.234,56');
   });
 });
 
