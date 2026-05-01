@@ -4,8 +4,8 @@ vi.mock('../../src/config/env.js', () => ({
   config: {
     LLM_PROVIDER: 'openrouter',
     OPENROUTER_API_KEY: 'sk-or-test',
-    OPENROUTER_MODEL_MAIN: 'anthropic/claude-sonnet-4-5',
-    OPENROUTER_MODEL_FAST: 'anthropic/claude-haiku-4-5',
+    OPENROUTER_MODEL_MAIN: 'anthropic/claude-sonnet-4.6',
+    OPENROUTER_MODEL_FAST: 'anthropic/claude-haiku-4.5',
     ANTHROPIC_API_KEY: 'sk-ant-test',
     CLAUDE_MODEL_MAIN: 'claude-sonnet-4-6',
     CLAUDE_MODEL_FAST: 'claude-haiku-4-5-20251001',
@@ -96,7 +96,7 @@ describe('openrouter converters', () => {
       id: 'r1',
       object: 'chat.completion',
       created: 0,
-      model: 'anthropic/claude-sonnet-4-5',
+      model: 'anthropic/claude-sonnet-4.6',
       choices: [
         {
           index: 0,
@@ -128,7 +128,7 @@ describe('openrouter converters', () => {
       tool: 'query_balance',
       args: { entidade: 'e1' },
     });
-    expect(out.model).toBe('anthropic/claude-sonnet-4-5');
+    expect(out.model).toBe('anthropic/claude-sonnet-4.6');
   });
 
   it('fromOpenAIResponse maps stop -> end_turn and length -> max_tokens', async () => {

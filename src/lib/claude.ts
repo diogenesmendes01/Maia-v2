@@ -216,8 +216,10 @@ class OpenRouterProvider implements LLMProvider {
       baseURL: 'https://openrouter.ai/api/v1',
       defaultHeaders: {
         // Recommended by OpenRouter for app ranking on their leaderboard.
+        // X-OpenRouter-Title is the canonical name (2026); X-Title is still
+        // accepted for backwards compat per their docs.
         'HTTP-Referer': 'https://github.com/diogenesmendes01/Maia-v2',
-        'X-Title': 'Maia',
+        'X-OpenRouter-Title': 'Maia',
       },
     });
     return this.client;

@@ -478,16 +478,17 @@ function renderLlmSettings(args: {
       </label>
       <button type="submit">Salvar</button>
     </form>
-    <h2>Exemplos OpenRouter</h2>
+    <h2>Exemplos OpenRouter (modelos com tool-calling)</h2>
+    <p class="muted">A Maia REQUER tool-calling pra rodar o agente ReAct. Modelos sem suporte vão falhar com erro de tool. Use a lista filtrada abaixo:</p>
     <ul>
-      <li><code>anthropic/claude-sonnet-4-5</code> - main recomendado</li>
-      <li><code>anthropic/claude-haiku-4-5</code> - fast recomendado</li>
+      <li><code>anthropic/claude-sonnet-4.6</code> - main recomendado</li>
+      <li><code>anthropic/claude-haiku-4.5</code> - fast recomendado</li>
+      <li><code>anthropic/claude-sonnet-latest</code> - alias auto-atualiza pra versão nova</li>
       <li><code>openai/gpt-5</code></li>
       <li><code>google/gemini-2.5-pro</code></li>
-      <li><code>deepseek/deepseek-r1</code></li>
-      <li><code>meta-llama/llama-4-maverick</code></li>
+      <li><code>x-ai/grok-4.1-fast</code> - barato, bom em tool-use</li>
     </ul>
-    <p class="muted">Lista completa: <a href="https://openrouter.ai/models" target="_blank" rel="noopener">openrouter.ai/models</a></p>
+    <p class="muted">Lista filtrada só com tool-calling: <a href="https://openrouter.ai/models?supported_parameters=tools" target="_blank" rel="noopener">openrouter.ai/models?supported_parameters=tools</a></p>
     <p><a href="/dashboard">&larr; Voltar</a></p>
   </div>
 </body>
