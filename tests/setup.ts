@@ -12,6 +12,7 @@ process.env.POSTGRES_PASSWORD = 'test1234';
 process.env.POSTGRES_DB = 'maia_test';
 process.env.REDIS_URL = 'redis://localhost:6379';
 process.env.ANTHROPIC_API_KEY = 'sk-ant-test-placeholder';
+process.env.OPENROUTER_API_KEY = 'sk-or-test-placeholder';
 process.env.WHATSAPP_NUMBER_MAIA = '+5500000000000';
 process.env.OWNER_TELEFONE_WHATSAPP = '+5511111111111';
 process.env.OWNER_NOME = 'Test Owner';

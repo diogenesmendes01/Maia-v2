@@ -250,11 +250,7 @@ Sonnet primary
 
 Circuit breaker per provider (spec 06 §9.3). When circuit is `open`, requests skip directly to next provider.
 
-### 10.2 Phase 2 — Ollama
-
-`FEATURE_OLLAMA_FALLBACK=true` enables a third tier. Ollama is invoked only in **restricted mode**: tool descriptions are simplified; the prompt forbids `create_*` actions; outputs are JSON-validated heavily.
-
-### 10.3 Redis-down policy
+### 10.2 Redis-down policy
 
 When `redis_available === false`, the dispatcher applies:
 

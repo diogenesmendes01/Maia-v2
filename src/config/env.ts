@@ -17,13 +17,14 @@ const envSchema = z
     REDIS_URL: z.string().url(),
     REDIS_PORT: z.coerce.number().int().positive().default(6379),
 
-    LLM_PROVIDER: z.enum(['anthropic', 'openai', 'ollama']).default('anthropic'),
-    ANTHROPIC_API_KEY: z.string().startsWith('sk-ant-'),
+    LLM_PROVIDER: z.enum(['anthropic', 'openrouter']).default('anthropic'),
+    ANTHROPIC_API_KEY: z.string().startsWith('sk-ant-').optional(),
+    OPENROUTER_API_KEY: z.string().startsWith('sk-or-').optional(),
+    OPENROUTER_MODEL_MAIN: z.string().default('anthropic/claude-sonnet-4.6'),
+    OPENROUTER_MODEL_FAST: z.string().default('anthropic/claude-haiku-4.5'),
     CLAUDE_MODEL_MAIN: z.string().default('claude-sonnet-4-6'),
     CLAUDE_MODEL_FAST: z.string().default('claude-haiku-4-5-20251001'),
     OPENAI_API_KEY: z.string().startsWith('sk-').optional(),
-    OLLAMA_BASE_URL: z.string().url().optional(),
-    OLLAMA_MODEL: z.string().optional(),
 
     WHISPER_PROVIDER: z.enum(['openai']).default('openai'),
     WHISPER_MODEL: z.string().default('whisper-1'),
@@ -78,10 +79,6 @@ const envSchema = z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
-    FEATURE_OLLAMA_FALLBACK: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
     FEATURE_OFX_IMPORT: z
       .string()
       .default('false')
@@ -128,16 +125,16 @@ const envSchema = z
     SETUP_TOKEN_OVERRIDE: z.string().optional(),
   })
   .superRefine((cfg, ctx) => {
-    if (cfg.LLM_PROVIDER === 'openai' && !cfg.OPENAI_API_KEY) {
+    if (cfg.LLM_PROVIDER === 'anthropic' && !cfg.ANTHROPIC_API_KEY) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: 'OPENAI_API_KEY required when LLM_PROVIDER=openai',
+        message: 'ANTHROPIC_API_KEY required when LLM_PROVIDER=anthropic',
       });
     }
-    if (cfg.LLM_PROVIDER === 'ollama' && (!cfg.OLLAMA_BASE_URL || !cfg.OLLAMA_MODEL)) {
+    if (cfg.LLM_PROVIDER === 'openrouter' && !cfg.OPENROUTER_API_KEY) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: 'OLLAMA_BASE_URL and OLLAMA_MODEL required when LLM_PROVIDER=ollama',
+        message: 'OPENROUTER_API_KEY required when LLM_PROVIDER=openrouter',
       });
     }
     if (cfg.EMBEDDING_PROVIDER === 'voyage' && !cfg.VOYAGE_API_KEY) {

@@ -8,6 +8,14 @@ import { resolveScope, isOwnerType, profileAllows, type ResolvedPermission } fro
 import type { ActionKey } from '@/governance/audit-actions.js';
 import { audit } from '@/governance/audit.js';
 import { config } from '@/config/env.js';
+import {
+  getCurrentMainModel,
+  getCurrentFastModel,
+  setCurrentMainModel,
+  setCurrentFastModel,
+  envDefaults,
+} from '@/lib/llm-settings.js';
+import { getToolCallingModels, type OpenRouterModel } from '@/lib/openrouter-models.js';
 import { formatBRL, fmtBR } from '@/lib/brazilian.js';
 
 const SESSION_TTL_HOURS = 8;
@@ -154,6 +162,70 @@ export async function registerDashboardRoutes(app: FastifyInstance): Promise<voi
     }
     reply.type('text/html').send(await renderAuditView(ctx.p.nome));
   });
+
+  app.get('/dashboard/llm-settings', async (req, reply) => {
+    const ctx = await requireScope(req, reply);
+    if (!ctx) return;
+    // Mudar o LLM e configuracao global sensivel: so dono pode.
+    if (!isOwnerType(ctx.p)) {
+      reply.code(403).type('text/html').send('<h1>Apenas donos podem mudar configuracao do LLM</h1>');
+      return;
+    }
+    const main = await getCurrentMainModel();
+    const fast = await getCurrentFastModel();
+    const env = envDefaults();
+    const models = await getToolCallingModels();
+    return reply.type('text/html').send(renderLlmSettings({ main, fast, env, models }));
+  });
+
+  app.post<{
+    Body: {
+      main_model?: string;
+      fast_model?: string;
+      main_model_custom?: string;
+      fast_model_custom?: string;
+    };
+  }>(
+    '/dashboard/llm-settings',
+    async (req, reply) => {
+      const ctx = await requireScope(req, reply);
+      if (!ctx) return;
+      if (!isOwnerType(ctx.p)) {
+        reply.code(403).type('text/html').send('<h1>Apenas donos podem mudar configuracao do LLM</h1>');
+        return;
+      }
+      const body = (req.body ?? {}) as {
+        main_model?: string;
+        fast_model?: string;
+        main_model_custom?: string;
+        fast_model_custom?: string;
+      };
+      // Custom (free-text) override beats the dropdown selection when set.
+      const main = (typeof body.main_model_custom === 'string' && body.main_model_custom.trim().length > 0
+        ? body.main_model_custom
+        : (body.main_model ?? '')).trim();
+      const fast = (typeof body.fast_model_custom === 'string' && body.fast_model_custom.trim().length > 0
+        ? body.fast_model_custom
+        : (body.fast_model ?? '')).trim();
+      const changes: Record<string, string> = {};
+      if (main.length > 0 && main.length <= 200) {
+        await setCurrentMainModel(main);
+        changes.main = main;
+      }
+      if (fast.length > 0 && fast.length <= 200) {
+        await setCurrentFastModel(fast);
+        changes.fast = fast;
+      }
+      if (Object.keys(changes).length > 0) {
+        await audit({
+          acao: 'llm_model_changed',
+          pessoa_id: ctx.p.id,
+          metadata: changes,
+        });
+      }
+      return reply.code(303).header('location', '/dashboard/llm-settings').send();
+    },
+  );
 
   app.post('/dashboard/logout', async (req, reply) => {
     const cookie = req.headers.cookie;
@@ -403,6 +475,89 @@ function escape(s: string): string {
   return s.replace(/[&<>"']/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] ?? c,
   );
+}
+
+function fmtPrice(usd_per_million: number): string {
+  if (usd_per_million === 0) return 'free';
+  if (usd_per_million < 1) return `$${usd_per_million.toFixed(2)}/M`;
+  return `$${usd_per_million.toFixed(0)}/M`;
+}
+
+function fmtCtx(tokens: number): string {
+  if (tokens === 0) return '?';
+  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(0)}M`;
+  if (tokens >= 1000) return `${Math.round(tokens / 1000)}k`;
+  return `${tokens}`;
+}
+
+function modelOption(m: OpenRouterModel, selected: string): string {
+  const sel = m.id === selected ? ' selected' : '';
+  const label = `${m.name} - in ${fmtPrice(m.pricing.prompt_per_million)}, out ${fmtPrice(m.pricing.completion_per_million)}, ctx ${fmtCtx(m.context_length)}`;
+  return `<option value="${escape(m.id)}"${sel}>${escape(label)}</option>`;
+}
+
+function modelSelect(name: string, current: string, models: OpenRouterModel[]): string {
+  const inList = models.some((m) => m.id === current);
+  const opts = models.map((m) => modelOption(m, current)).join('\n        ');
+  // If current selection is NOT in the live list (e.g. operator typed a slug
+  // we don't know about), prepend it as a one-off so the dropdown still
+  // shows what's actually saved.
+  const customOpt = inList
+    ? ''
+    : `<option value="${escape(current)}" selected>${escape(current)} (custom)</option>\n        `;
+  return `<select name="${name}">
+        ${customOpt}${opts}
+      </select>`;
+}
+
+function renderLlmSettings(args: {
+  main: string;
+  fast: string;
+  env: { main: string; fast: string; provider: string };
+  models: OpenRouterModel[];
+}): string {
+  const count = args.models.length;
+  return `<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Maia - LLM Settings</title>
+  ${baseStyle()}
+</head>
+<body>
+  <div class="container">
+    <h1>Configuracao do LLM</h1>
+    <p>Provider em uso: <strong>${escape(args.env.provider)}</strong></p>
+    <p class="muted">${count} modelo(s) com tool-calling disponivel(is). Default do .env: main=<code>${escape(args.env.main)}</code>, fast=<code>${escape(args.env.fast)}</code></p>
+    <form method="POST" action="/dashboard/llm-settings">
+      <label>
+        Modelo principal (main)
+        ${modelSelect('main_model', args.main, args.models)}
+      </label>
+      <label>
+        Modelo rapido (fast / fallback)
+        ${modelSelect('fast_model', args.fast, args.models)}
+      </label>
+      <details>
+        <summary>Usar slug customizado (avancado)</summary>
+        <p class="muted">Se quiser usar um slug que nao aparece no dropdown (ex: lancamento muito recente), digite abaixo. Sobrescreve o select acima quando preenchido.</p>
+        <label>
+          main_model custom
+          <input type="text" name="main_model_custom" maxlength="200" placeholder="ex: anthropic/claude-opus-4.7">
+        </label>
+        <label>
+          fast_model custom
+          <input type="text" name="fast_model_custom" maxlength="200" placeholder="ex: anthropic/claude-haiku-latest">
+        </label>
+      </details>
+      <button type="submit">Salvar</button>
+    </form>
+    <p class="muted">Lista atualizada via <code>https://openrouter.ai/api/v1/models</code> (cache 1h). Filtrada para modelos com <code>supported_parameters: tools</code>. <a href="https://openrouter.ai/models?supported_parameters=tools" target="_blank" rel="noopener">Ver na OpenRouter</a>.</p>
+    <p><a href="/dashboard">&larr; Voltar</a></p>
+  </div>
+</body>
+</html>`;
 }
 
 export async function generateMagicLink(pessoa_id: string): Promise<{ token: string; expira_em: Date }> {
