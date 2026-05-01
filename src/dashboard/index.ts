@@ -164,8 +164,13 @@ export async function registerDashboardRoutes(app: FastifyInstance): Promise<voi
   });
 
   app.get('/dashboard/llm-settings', async (req, reply) => {
-    const sess = await getSessionFromCookie(req.headers.cookie);
-    if (!sess) return reply.code(303).header('location', '/dashboard').send();
+    const ctx = await requireScope(req, reply);
+    if (!ctx) return;
+    // Mudar o LLM e configuracao global sensivel: so dono pode.
+    if (!isOwnerType(ctx.p)) {
+      reply.code(403).type('text/html').send('<h1>Apenas donos podem mudar configuracao do LLM</h1>');
+      return;
+    }
     const main = await getCurrentMainModel();
     const fast = await getCurrentFastModel();
     const env = envDefaults();
@@ -183,8 +188,12 @@ export async function registerDashboardRoutes(app: FastifyInstance): Promise<voi
   }>(
     '/dashboard/llm-settings',
     async (req, reply) => {
-      const sess = await getSessionFromCookie(req.headers.cookie);
-      if (!sess) return reply.code(303).header('location', '/dashboard').send();
+      const ctx = await requireScope(req, reply);
+      if (!ctx) return;
+      if (!isOwnerType(ctx.p)) {
+        reply.code(403).type('text/html').send('<h1>Apenas donos podem mudar configuracao do LLM</h1>');
+        return;
+      }
       const body = (req.body ?? {}) as {
         main_model?: string;
         fast_model?: string;
@@ -210,7 +219,7 @@ export async function registerDashboardRoutes(app: FastifyInstance): Promise<voi
       if (Object.keys(changes).length > 0) {
         await audit({
           acao: 'llm_model_changed',
-          pessoa_id: sess.pessoa_id,
+          pessoa_id: ctx.p.id,
           metadata: changes,
         });
       }

@@ -17,7 +17,7 @@ const envSchema = z
     REDIS_URL: z.string().url(),
     REDIS_PORT: z.coerce.number().int().positive().default(6379),
 
-    LLM_PROVIDER: z.enum(['anthropic', 'openai', 'ollama', 'openrouter']).default('anthropic'),
+    LLM_PROVIDER: z.enum(['anthropic', 'openrouter']).default('anthropic'),
     ANTHROPIC_API_KEY: z.string().startsWith('sk-ant-').optional(),
     OPENROUTER_API_KEY: z.string().startsWith('sk-or-').optional(),
     OPENROUTER_MODEL_MAIN: z.string().default('anthropic/claude-sonnet-4.6'),
@@ -141,18 +141,6 @@ const envSchema = z
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message: 'OPENROUTER_API_KEY required when LLM_PROVIDER=openrouter',
-      });
-    }
-    if (cfg.LLM_PROVIDER === 'openai' && !cfg.OPENAI_API_KEY) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: 'OPENAI_API_KEY required when LLM_PROVIDER=openai',
-      });
-    }
-    if (cfg.LLM_PROVIDER === 'ollama' && (!cfg.OLLAMA_BASE_URL || !cfg.OLLAMA_MODEL)) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: 'OLLAMA_BASE_URL and OLLAMA_MODEL required when LLM_PROVIDER=ollama',
       });
     }
     if (cfg.EMBEDDING_PROVIDER === 'voyage' && !cfg.VOYAGE_API_KEY) {

@@ -40,7 +40,7 @@ export type LLMResponse = {
 };
 
 export interface LLMProvider {
-  name: 'anthropic' | 'openai' | 'ollama' | 'openrouter';
+  name: 'anthropic' | 'openrouter';
   call(params: {
     system: string;
     messages: LLMMessage[];
@@ -258,13 +258,12 @@ class OpenRouterProvider implements LLMProvider {
 }
 
 // ============================================================
-// Provider selection at module load
+// Provider selection at module load. The env enum is restricted to the
+// two cases this switch handles ('anthropic' | 'openrouter'); operators
+// wanting GPT, Llama, Gemini, DeepSeek etc. route through OpenRouter.
 // ============================================================
 function selectProvider(): LLMProvider {
   if (config.LLM_PROVIDER === 'openrouter') return new OpenRouterProvider();
-  // 'anthropic' is the legacy default. 'openai' / 'ollama' fall through to
-  // Anthropic for now (no native impls); operators wanting GPT/Llama route
-  // through OpenRouter instead.
   return new AnthropicProvider();
 }
 

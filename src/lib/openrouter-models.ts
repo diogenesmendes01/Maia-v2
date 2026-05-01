@@ -98,9 +98,15 @@ function parseRawModel(raw: RawModel): OpenRouterModel | null {
   };
 }
 
+/** 5 s timeout: long enough for an honest-slow response, short enough
+ * that a hung connection does not block the dashboard cold-render. On
+ * timeout the AbortError reaches the caller and triggers the fallback. */
+const FETCH_TIMEOUT_MS = 5000;
+
 async function fetchFresh(): Promise<OpenRouterModel[]> {
   const res = await fetch('https://openrouter.ai/api/v1/models', {
     headers: { accept: 'application/json' },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     // No body, no auth — this endpoint is public.
   });
   if (!res.ok) {

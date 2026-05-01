@@ -119,6 +119,15 @@ describe('openrouter-models', () => {
     expect(models).toEqual(_internal.FALLBACK_TOOL_MODELS);
   });
 
+  it('falls back when fetch times out / aborts', async () => {
+    const abortErr = Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' });
+    fetchMock.mockRejectedValueOnce(abortErr);
+    const { getToolCallingModels, _internal } = await import('../../src/lib/openrouter-models.js');
+    _internal.resetCache();
+    const models = await getToolCallingModels();
+    expect(models).toEqual(_internal.FALLBACK_TOOL_MODELS);
+  });
+
   it('handles malformed response (missing data array)', async () => {
     fetchMock.mockResolvedValueOnce({
       ok: true,
