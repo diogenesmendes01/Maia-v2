@@ -347,6 +347,31 @@ export async function sendOutboundDocument(
   return result?.key.id ?? null;
 }
 
+/**
+ * B4: send a voice note (PTT — push-to-talk). Renders as a voice-bubble in
+ * the WhatsApp UI (the round one), not a music-player attachment. Buffer-only —
+ * voice notes are small (≤100KB for ≤20s) and ephemeral; no disk persistence.
+ *
+ * The buffer must be OGG-Opus (the format WhatsApp's voice-note protocol
+ * expects). OpenAI TTS with `response_format: 'opus'` emits exactly this.
+ */
+export async function sendOutboundVoice(
+  jid: string,
+  buf: Buffer,
+  opts?: { quoted?: WAQuotedContext },
+): Promise<string | null> {
+  if (!socket || !connected) {
+    logger.warn('baileys.not_connected — cannot send voice');
+    return null;
+  }
+  const result = await socket.sendMessage(
+    jid,
+    { audio: buf, mimetype: 'audio/ogg; codecs=opus', ptt: true },
+    opts?.quoted ? { quoted: opts.quoted } : undefined,
+  );
+  return result?.key.id ?? null;
+}
+
 export async function shutdownBaileys(): Promise<void> {
   if (socket) {
     socket.end(undefined);

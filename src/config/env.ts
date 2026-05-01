@@ -118,6 +118,10 @@ const envSchema = z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
+    FEATURE_OUTBOUND_VOICE: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
     // SETUP: optional override for the bootstrap token. When set, bypasses
     // the file-backed token. Discouraged in prod (env vars leak more than
     // file mode 0o600). Useful for dev / scripted deploys / E2E tests.
