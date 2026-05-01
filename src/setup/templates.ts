@@ -60,10 +60,11 @@ function escapeHtml(s: string): string {
   );
 }
 
-export function renderChooser(token: string): string {
+export function renderChooser(token: string, csrf: string): string {
   return `${BASE_HEAD}
 <p class="text-slate-700 mb-6">Escolha como quer parear o WhatsApp da Maia:</p>
 <form method="POST" action="/setup/start?token=${encodeURIComponent(token)}" class="space-y-3">
+  <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
   <button type="submit" name="method" value="qr"
     class="w-full py-3 px-4 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium">
     📱 Parear com QR Code
