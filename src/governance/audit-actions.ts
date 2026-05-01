@@ -96,6 +96,7 @@ export const AUDIT_ACTIONS = [
   'setup_token_rotated',
   'setup_unauthorized_access',
   'setup_csrf_mismatch',
+  'llm_model_changed',
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];

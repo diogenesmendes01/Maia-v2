@@ -8,6 +8,13 @@ import { resolveScope, isOwnerType, profileAllows, type ResolvedPermission } fro
 import type { ActionKey } from '@/governance/audit-actions.js';
 import { audit } from '@/governance/audit.js';
 import { config } from '@/config/env.js';
+import {
+  getCurrentMainModel,
+  getCurrentFastModel,
+  setCurrentMainModel,
+  setCurrentFastModel,
+  envDefaults,
+} from '@/lib/llm-settings.js';
 import { formatBRL, fmtBR } from '@/lib/brazilian.js';
 
 const SESSION_TTL_HOURS = 8;
@@ -154,6 +161,43 @@ export async function registerDashboardRoutes(app: FastifyInstance): Promise<voi
     }
     reply.type('text/html').send(await renderAuditView(ctx.p.nome));
   });
+
+  app.get('/dashboard/llm-settings', async (req, reply) => {
+    const sess = await getSessionFromCookie(req.headers.cookie);
+    if (!sess) return reply.code(303).header('location', '/dashboard').send();
+    const main = await getCurrentMainModel();
+    const fast = await getCurrentFastModel();
+    const env = envDefaults();
+    return reply.type('text/html').send(renderLlmSettings({ main, fast, env }));
+  });
+
+  app.post<{ Body: { main_model?: string; fast_model?: string } }>(
+    '/dashboard/llm-settings',
+    async (req, reply) => {
+      const sess = await getSessionFromCookie(req.headers.cookie);
+      if (!sess) return reply.code(303).header('location', '/dashboard').send();
+      const body = (req.body ?? {}) as { main_model?: string; fast_model?: string };
+      const main = typeof body.main_model === 'string' ? body.main_model.trim() : '';
+      const fast = typeof body.fast_model === 'string' ? body.fast_model.trim() : '';
+      const changes: Record<string, string> = {};
+      if (main.length > 0 && main.length <= 200) {
+        await setCurrentMainModel(main);
+        changes.main = main;
+      }
+      if (fast.length > 0 && fast.length <= 200) {
+        await setCurrentFastModel(fast);
+        changes.fast = fast;
+      }
+      if (Object.keys(changes).length > 0) {
+        await audit({
+          acao: 'llm_model_changed',
+          pessoa_id: sess.pessoa_id,
+          metadata: changes,
+        });
+      }
+      return reply.code(303).header('location', '/dashboard/llm-settings').send();
+    },
+  );
 
   app.post('/dashboard/logout', async (req, reply) => {
     const cookie = req.headers.cookie;
@@ -403,6 +447,51 @@ function escape(s: string): string {
   return s.replace(/[&<>"']/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] ?? c,
   );
+}
+
+function renderLlmSettings(args: {
+  main: string;
+  fast: string;
+  env: { main: string; fast: string; provider: string };
+}): string {
+  return `<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Maia - LLM Settings</title>
+  ${baseStyle()}
+</head>
+<body>
+  <div class="container">
+    <h1>Configuracao do LLM</h1>
+    <p>Provider em uso: <strong>${escape(args.env.provider)}</strong></p>
+    <p class="muted">Defaults vindos do .env: main=<code>${escape(args.env.main)}</code>, fast=<code>${escape(args.env.fast)}</code></p>
+    <form method="POST" action="/dashboard/llm-settings">
+      <label>
+        Modelo principal (main)
+        <input type="text" name="main_model" value="${escape(args.main)}" maxlength="200" required>
+      </label>
+      <label>
+        Modelo rapido (fast / fallback)
+        <input type="text" name="fast_model" value="${escape(args.fast)}" maxlength="200" required>
+      </label>
+      <button type="submit">Salvar</button>
+    </form>
+    <h2>Exemplos OpenRouter</h2>
+    <ul>
+      <li><code>anthropic/claude-sonnet-4-5</code> - main recomendado</li>
+      <li><code>anthropic/claude-haiku-4-5</code> - fast recomendado</li>
+      <li><code>openai/gpt-5</code></li>
+      <li><code>google/gemini-2.5-pro</code></li>
+      <li><code>deepseek/deepseek-r1</code></li>
+      <li><code>meta-llama/llama-4-maverick</code></li>
+    </ul>
+    <p class="muted">Lista completa: <a href="https://openrouter.ai/models" target="_blank" rel="noopener">openrouter.ai/models</a></p>
+    <p><a href="/dashboard">&larr; Voltar</a></p>
+  </div>
+</body>
+</html>`;
 }
 
 export async function generateMagicLink(pessoa_id: string): Promise<{ token: string; expira_em: Date }> {
