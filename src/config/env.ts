@@ -185,9 +185,10 @@ function loadConfig(): Config {
     const issues = result.error.issues
       .map((i) => `  - ${i.path.join('.') || '<root>'}: ${i.message}`)
       .join('\n');
-    // eslint-disable-next-line no-console
-    console.error(`Invalid configuration:\n${issues}`);
-    process.exit(1);
+    // Throw instead of process.exit(1) - main().catch in index.ts handles
+    // fatal logging and exit. Throwing keeps vitest alive when a spec file
+    // imports a config-dependent module without mocking env.
+    throw new Error(`Invalid configuration:\n${issues}`);
   }
   return result.data;
 }
