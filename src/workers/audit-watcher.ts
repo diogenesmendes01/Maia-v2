@@ -1,11 +1,13 @@
 import { sql } from 'drizzle-orm';
 import { db } from '@/db/client.js';
+import { audit_log } from '@/db/schema.js';
+import type { AuditAction } from '@/governance/audit-actions.js';
 import { sendAlert } from '@/lib/alerts.js';
 import { logger } from '@/lib/logger.js';
 
 /**
  * Audit-driven anomaly watcher. Runs every minute via the worker registry
- * (see src/workers/index.ts). Reads from `auditoria` and emits alerts via
+ * (see src/workers/index.ts). Reads from `audit_log` and emits alerts via
  * `sendAlert` when a rule trips. Throttled to 30 min per rule to avoid spam.
  *
  * Two rule shapes:
@@ -21,7 +23,7 @@ type Severity = 'critical' | 'urgent' | 'info';
 type ThresholdRule = {
   kind: 'threshold';
   id: string;
-  acao: string;
+  acao: AuditAction;
   threshold: number;
   window_min: number;
   severity: Severity;
@@ -30,8 +32,8 @@ type ThresholdRule = {
 type StuckRule = {
   kind: 'stuck';
   id: string;
-  acao: string;
-  mate_acao: string;
+  acao: AuditAction;
+  mate_acao: AuditAction;
   window_min: number;
   severity: Severity;
 };
@@ -49,16 +51,12 @@ const RULES: Rule[] = [
     window_min: 5,
     severity: 'critical',
   },
-  // 5+ CSRF mismatches in 5 min — same operator multiple form errors is rare,
-  // sustained mismatches signal a real attack.
-  {
-    kind: 'threshold',
-    id: 'setup_csrf_attack',
-    acao: 'setup_csrf_mismatch',
-    threshold: 5,
-    window_min: 5,
-    severity: 'critical',
-  },
+  // NOTE: a setup_csrf_attack rule (acao: 'setup_csrf_mismatch') is the
+  // natural twin of the rule above and was prototyped here, but the
+  // `setup_csrf_mismatch` action is introduced on `chore/setup-hardening`,
+  // not on main. To keep this PR mergeable directly against main without a
+  // born-dead rule, the CSRF rule will be added in the same PR that ships
+  // the action emission.
   // Recovery started but not completed within 1 min — recovery normally
   // takes ~3 s, anything over a minute means the rm/rotateToken/sendAlert
   // chain is wedged and operator must SSH.
@@ -97,7 +95,7 @@ const lastAlertedAt = new Map<string, number>();
 async function checkThreshold(rule: ThresholdRule): Promise<void> {
   const cutoff = new Date(Date.now() - rule.window_min * 60_000);
   const r = await db.execute<{ c: number }>(sql`
-    SELECT COUNT(*)::int AS c FROM auditoria
+    SELECT COUNT(*)::int AS c FROM ${audit_log}
     WHERE acao = ${rule.acao} AND created_at > ${cutoff}
   `);
   const count = (r.rows[0]?.c as number | undefined) ?? 0;
@@ -112,12 +110,12 @@ async function checkThreshold(rule: ThresholdRule): Promise<void> {
 async function checkStuck(rule: StuckRule): Promise<void> {
   const olderThan = new Date(Date.now() - rule.window_min * 60_000);
   const r = await db.execute<{ c: number }>(sql`
-    SELECT COUNT(*)::int AS c FROM auditoria a
+    SELECT COUNT(*)::int AS c FROM ${audit_log} a
     WHERE a.acao = ${rule.acao}
       AND a.created_at < ${olderThan}
       AND a.created_at > NOW() - INTERVAL '1 day'
       AND NOT EXISTS (
-        SELECT 1 FROM auditoria b
+        SELECT 1 FROM ${audit_log} b
         WHERE b.acao = ${rule.mate_acao}
           AND b.created_at >= a.created_at
       )

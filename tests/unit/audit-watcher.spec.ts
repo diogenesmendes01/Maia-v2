@@ -1,4 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { PgDialect } from 'drizzle-orm/pg-core';
+import type { SQL } from 'drizzle-orm';
+import { AUDIT_ACTIONS } from '../../src/governance/audit-actions.js';
 
 const sendAlertMock = vi.fn().mockResolvedValue(undefined);
 const dbExecuteMock = vi.fn();
@@ -69,9 +72,44 @@ describe('audit-watcher', () => {
     const { _internal } = await import('../../src/workers/audit-watcher.js');
     const ids = _internal.RULES.map((r) => r.id);
     expect(ids).toContain('setup_unauthorized_farm');
-    expect(ids).toContain('setup_csrf_attack');
     expect(ids).toContain('pairing_recovery_stuck');
     expect(ids).toContain('llm_circuit_long_open');
     expect(ids).toContain('bot_volume_burst');
+  });
+
+  // Regression: a rule referencing a non-existent audit action would never
+  // fire (born-dead). Assert every rule's `acao`/`mate_acao` is a registered
+  // AuditAction so we can't merge a born-dead rule again.
+  it('every rule references actions that exist in AUDIT_ACTIONS', async () => {
+    const { _internal } = await import('../../src/workers/audit-watcher.js');
+    const registry = new Set<string>(AUDIT_ACTIONS);
+    for (const rule of _internal.RULES) {
+      expect(registry.has(rule.acao), `acao "${rule.acao}" of rule "${rule.id}"`).toBe(true);
+      if (rule.kind === 'stuck') {
+        expect(
+          registry.has(rule.mate_acao),
+          `mate_acao "${rule.mate_acao}" of rule "${rule.id}"`,
+        ).toBe(true);
+      }
+    }
+  });
+
+  // Regression: the original PR queried `FROM auditoria`, which doesn't exist
+  // in the schema — the real table is `audit_log`. The watcher now interpolates
+  // the imported `audit_log` schema reference. Render the SQL the watcher
+  // hands to `db.execute` through Drizzle's PgDialect and assert the rendered
+  // text references `audit_log` and never the legacy name.
+  it('queries reference the audit_log table, not auditoria', async () => {
+    dbExecuteMock.mockResolvedValue({ rows: [{ c: 0 }] });
+    const { runAuditWatcher } = await import('../../src/workers/audit-watcher.js');
+    await runAuditWatcher();
+    expect(dbExecuteMock).toHaveBeenCalled();
+
+    const dialect = new PgDialect();
+    for (const call of dbExecuteMock.mock.calls) {
+      const rendered = dialect.sqlToQuery(call[0] as SQL).sql;
+      expect(rendered).not.toMatch(/\bauditoria\b/);
+      expect(rendered).toMatch(/\baudit_log\b/);
+    }
   });
 });
