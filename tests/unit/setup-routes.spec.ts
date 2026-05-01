@@ -250,6 +250,19 @@ describe('setup routes — GET /setup/status', () => {
     // Raw QR string MUST NOT appear in JSON
     expect(JSON.stringify(body)).not.toContain('test-qr-string');
   });
+
+  it('returns phase JSON for pairing_code with expiresAt; raw code is NOT leaked', async () => {
+    const { setupState } = await import('../../src/setup/state.js');
+    setupState.setUnpaired();
+    setupState.setCode('12345678');
+    const r = await app.inject({ method: 'GET', url: '/setup/status?token=TEST-TOKEN' });
+    expect(r.statusCode).toBe(200);
+    const body = JSON.parse(r.body);
+    expect(body.phase).toBe('pairing_code');
+    expect(body.expiresAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    // Raw code MUST NOT appear in JSON
+    expect(JSON.stringify(body)).not.toContain('12345678');
+  });
 });
 
 describe('setup routes — GET /setup/status (per-phase shape)', () => {
