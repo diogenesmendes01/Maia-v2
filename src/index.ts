@@ -19,6 +19,18 @@ async function main() {
   const { sweepPdfTmp } = await import('@/lib/pdf/_sweeper.js');
   await sweepPdfTmp().catch((err) => logger.warn({ err }, 'pdf.sweeper.boot_failed'));
 
+  // SETUP: ensure bootstrap token exists (cold-start / first deploy).
+  // Token NOT logged in plaintext — operator must SSH and read the file.
+  const { ensureToken } = await import('@/setup/token.js');
+  const { hasValidBaileysSession } = await import('@/setup/state.js');
+  await ensureToken();
+  if (!(await hasValidBaileysSession(config.BAILEYS_AUTH_DIR))) {
+    logger.warn(
+      { setup_token_path: '<BAILEYS_AUTH_DIR>/setup-token.txt' },
+      'setup.bootstrap_token_ready — run `cat $BAILEYS_AUTH_DIR/setup-token.txt` and visit /setup',
+    );
+  }
+
   await startServer();
   startAgentWorker(async (job) => {
     await runAgentForMensagem(job.data.mensagem_id);

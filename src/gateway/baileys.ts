@@ -23,6 +23,8 @@ import { audit } from '@/governance/audit.js';
 import { dispatchReactionAsAnswer, dispatchPollVote } from '@/agent/one-tap.js';
 import { routeMessageUpdate } from '@/agent/message-update.js';
 import type { WhatsAppInbound, WAQuotedContext } from './types.js';
+import { setupState } from '@/setup/state.js';
+import { triggerRecovery } from '@/setup/recovery.js';
 
 let socket: WASocket | null = null;
 let connected = false;
@@ -36,6 +38,24 @@ mkdirSync(join(MEDIA_ROOT, 'tmp'), { recursive: true });
 
 export function isBaileysConnected(): boolean {
   return connected;
+}
+
+/**
+ * SETUP: request an 8-digit pairing code from WhatsApp. Used when the
+ * operator chooses "Pair with phone number" in the /setup endpoint.
+ * Throws `baileys_socket_not_ready` if the socket hasn't been initialised
+ * yet (boot race: startServer() runs before startBaileys()). Caller (the
+ * /setup/start route) translates the throw into 503 + retry_after_s.
+ *
+ * Strips a leading "+" before delegating: Baileys' `requestPairingCode`
+ * pipes the phone through `jidEncode(phone, 's.whatsapp.net')`, so a "+"
+ * leaks into the JID (`+55…@s.whatsapp.net`) and WhatsApp rejects the
+ * request. WhatsApp's pairing-code API expects digits-only.
+ */
+export async function triggerPairingCode(phone: string): Promise<string> {
+  if (!socket) throw new Error('baileys_socket_not_ready');
+  const normalized = phone.replace(/^\+/, '');
+  return socket.requestPairingCode(normalized);
 }
 
 export function getSocket(): WASocket | null {
@@ -64,23 +84,42 @@ export async function startBaileys(): Promise<void> {
 
   socket.ev.on('connection.update', async (update) => {
     const { connection: conn, lastDisconnect, qr } = update;
-    if (qr) qrcodeTerminal.generate(qr, { small: true });
+    if (qr) {
+      const phaseBefore = setupState.current().phase;
+      setupState.setQr(qr);
+      if (phaseBefore !== 'pairing_qr') {
+        await audit({ acao: 'pairing_qr_displayed', metadata: {} });
+      }
+      qrcodeTerminal.generate(qr, { small: true });    // keep stdout for dev/log spelunking
+    }
     if (conn === 'open') {
       connected = true;
       logger.info('baileys.connected');
       await audit({ acao: 'whatsapp_connected' });
+      // pairing_completed is one-shot per successful pair (spec §4.7(b)). Skip
+      // when the previous phase was already 'connected' — that path is a
+      // transient reconnect (no QR/code was exchanged), not a new pair event.
+      const phaseBefore = setupState.current().phase;
+      setupState.markPaired();
+      if (phaseBefore !== 'connected') {
+        await audit({ acao: 'pairing_completed' });
+      }
     } else if (conn === 'close') {
       connected = false;
       lastDisconnectAt = new Date();
       const reason = (lastDisconnect?.error as Boom)?.output?.statusCode;
       logger.warn({ reason }, 'baileys.connection_closed');
       await audit({ acao: 'whatsapp_disconnected', metadata: { reason } });
-      if (reason !== DisconnectReason.loggedOut) {
+      if (reason === DisconnectReason.loggedOut) {
+        await audit({ acao: 'pairing_logged_out', metadata: { reason } });
+        triggerRecovery({ shutdownBaileys, startBaileys }).catch((err) => {
+          logger.error({ err }, 'setup.recovery_failed');
+        });
+      } else {
+        setupState.markDisconnected();
         setTimeout(() => {
           startBaileys().catch((e) => logger.error({ err: e }, 'baileys.reconnect_failed'));
         }, 5000);
-      } else {
-        logger.error('baileys.logged_out — manual re-pair required');
       }
     }
   });
