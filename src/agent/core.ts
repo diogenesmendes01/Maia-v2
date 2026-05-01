@@ -14,7 +14,6 @@ import { audit } from '@/governance/audit.js';
 import { dispatchTool } from '@/tools/_dispatcher.js';
 import { getToolSchemas, REGISTRY } from '@/tools/_registry.js';
 import { startTyping, sendReaction, quotedReplyContext } from '@/gateway/presence.js';
-import { getActivePending } from '@/workflows/pending-questions.js';
 import { uuid } from '@/lib/utils.js';
 import {
   detectCorrection,
@@ -170,9 +169,11 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
           // Quoting decision is shared across PDF / voice / text branches —
           // computed once so the rule (correction-detected OR pending active)
           // can't drift between copies.
+          // Pending check via canonical repo (post-B0). `||` short-circuits
+          // on detected correction so the DB hit only happens when needed.
           const shouldQuote =
             (inbound.conteudo && detectCorrection(inbound.conteudo)) ||
-            getActivePending(c) !== null;
+            (await pendingQuestionsRepo.findActiveSnapshot(c.id)) !== null;
           const quotedContext = shouldQuote
             ? quotedReplyContext(
                 inbound.metadata as Record<string, unknown> | null,
