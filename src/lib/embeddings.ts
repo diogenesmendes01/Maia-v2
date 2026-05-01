@@ -60,13 +60,22 @@ class OpenAIEmbeddingProvider implements EmbeddingProvider {
   ) {}
 
   async embed(texts: string[]): Promise<number[][]> {
+    // OpenAI's text-embedding-3-* models support the `dimensions` parameter to
+    // truncate the output (1536 native -> N requested). Without it, the API
+    // returns the full native length, which trips the EmbeddingDimensionGuard
+    // when EMBEDDING_DIMENSIONS != native (e.g. config=1024 on 3-small=1536).
+    // Legacy `text-embedding-ada-002` does NOT support this param and would
+    // error if we pass it, so we gate on the v3 prefix.
+    const supportsDimensionsParam = this.modelId.startsWith('text-embedding-3-');
+    const body: Record<string, unknown> = { input: texts, model: this.modelId };
+    if (supportsDimensionsParam) body.dimensions = this.dimensions;
     const res = await fetch('https://api.openai.com/v1/embeddings', {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
         authorization: `Bearer ${this.apiKey}`,
       },
-      body: JSON.stringify({ input: texts, model: this.modelId }),
+      body: JSON.stringify(body),
     });
     if (!res.ok) throw new Error(`openai_embed_failed: ${res.status} ${await res.text()}`);
     const data = (await res.json()) as { data: Array<{ embedding: number[] }> };
