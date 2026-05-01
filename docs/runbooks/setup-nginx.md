@@ -4,7 +4,8 @@ A endpoint `/setup` ja vem com:
 
 1. **Bootstrap token** (32 hex chars, file mode 0o600) - exigido em query.
 2. **CSRF token** (cookie `maia_setup_csrf` sameSite=strict + hidden input no form).
-3. **Rate limit** (30 req/min/IP em todas as rotas `/setup*`).
+3. **Rate limit** (30 req/min/IP em `/setup*`, com `/setup/status` isento -
+   ele e pollado pela pagina a cada 2s e ocuparia o orcamento sozinho).
 4. **Security headers** (`Cache-Control: no-store`, `Referrer-Policy: no-referrer`, `X-Content-Type-Options: nosniff`).
 
 Pra producao, adicione duas camadas extras no nginx:
@@ -58,17 +59,21 @@ sudo apt-get install certbot python3-certbot-nginx
 sudo certbot --nginx -d maia.seu-dominio.com
 ```
 
-O cookie CSRF e definido com `httpOnly + sameSite=strict` mas `secure: false` por
-default (pra nao quebrar dev local sem TLS). **Mude pra producao** em `src/setup/index.ts`:
+O cookie CSRF e `httpOnly + sameSite=strict` em qualquer ambiente. A flag
+`secure` e decidida no codigo a partir de `NODE_ENV`: vira `true` quando
+`NODE_ENV=production`, `false` em dev/test. Garanta no systemd / .env do
+servidor:
 
-```typescript
-reply.setCookie(CSRF_COOKIE_NAME, csrf, {
-  path: '/',
-  httpOnly: true,
-  sameSite: 'strict',
-  maxAge: CSRF_COOKIE_MAX_AGE_S,
-  secure: process.env.NODE_ENV === 'production',
-});
+```ini
+NODE_ENV=production
+```
+
+Sem isso o navegador aceita o cookie via HTTP (cleartext) e a defesa cai.
+Confira no primeiro GET pos-deploy:
+
+```bash
+curl -is "https://maia.seu-dominio.com/setup?token=$TOKEN" | grep -i set-cookie
+# Esperado: Set-Cookie: maia_setup_csrf=...; HttpOnly; Secure; SameSite=Strict
 ```
 
 ## 4. fail2ban (opcional)

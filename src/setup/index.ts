@@ -115,6 +115,9 @@ export async function registerSetupRoutes(app: FastifyInstance): Promise<void> {
   await app.register(rateLimit, {
     // Operator-only surface - tight global limit (per IP). Tests bypass via
     // NODE_ENV=test so app.inject loops are not tripped by 429s.
+    // /setup/status is opted out per-route below: the chooser polls it every
+    // 2s (30 req/min on its own), and without the exemption a single operator
+    // session would starve the budget for /setup, /setup/start and qr.png.
     global: process.env.NODE_ENV !== 'test',
     max: 30,
     timeWindow: '1 minute',
@@ -148,7 +151,9 @@ export async function registerSetupRoutes(app: FastifyInstance): Promise<void> {
           httpOnly: true,
           sameSite: 'strict',
           maxAge: CSRF_COOKIE_MAX_AGE_S,
-          secure: false, // dev/local; nginx terminates TLS in prod (see runbook)
+          // Code self-decides per env so prod doesn't need a manual edit.
+          // dev/local stays cleartext-friendly; prod requires HTTPS via nginx.
+          secure: config.NODE_ENV === 'production',
         });
         return reply.type('text/html').send(renderChooser(token, csrf));
       }
@@ -241,7 +246,12 @@ export async function registerSetupRoutes(app: FastifyInstance): Promise<void> {
     }
   });
 
-  app.get('/setup/status', async (req, reply) => {
+  // Polled by the chooser page every 2s (POLL_INTERVAL_MS in templates.ts).
+  // 2s polling = 30 req/min, which exactly matches the global rate-limit cap;
+  // without this exemption a single operator session would starve the budget
+  // for /setup, /setup/start and /setup/qr.png. Auth is still enforced via
+  // authGate; payload is metadata only (raw QR/code never appear here).
+  app.get('/setup/status', { config: { rateLimit: false } }, async (req, reply) => {
     if (!(await authGate(req, reply))) return;
 
     const phaseObj = setupState.current();

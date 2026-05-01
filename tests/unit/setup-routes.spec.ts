@@ -19,6 +19,7 @@ vi.mock('../../src/config/env.js', () => ({
     SETUP_TOKEN_OVERRIDE: 'TEST-TOKEN',
     WHATSAPP_NUMBER_MAIA: '+5511999999999',
     FEATURE_DASHBOARD: false,
+    NODE_ENV: 'test',
   },
 }));
 
@@ -325,5 +326,81 @@ describe('setup routes - GET /setup/done', () => {
     const r = await app.inject({ method: 'GET', url: '/setup/done' });
     expect(r.statusCode).toBe(200);
     expect(r.body).toContain('Pareamento completo');
+  });
+});
+
+// Run with NODE_ENV != 'test' so the global rate limit is actually engaged
+// (it's bypassed in tests by design - see registerSetupRoutes). The chooser
+// polls /setup/status every 2s = 30 req/min; if /setup/status counted against
+// the 30/min cap, the operator would hit 429 mid-pairing as soon as they did
+// anything else (POST /setup/start, refresh, /setup/qr.png).
+describe('setup routes - rate limit (production mode)', () => {
+  let prodApp: FastifyInstance;
+  const savedEnv = process.env.NODE_ENV;
+
+  beforeEach(async () => {
+    await app.close(); // discard the test-mode app from the outer beforeEach
+    process.env.NODE_ENV = 'production';
+    vi.resetModules();
+    vi.doMock('../../src/gateway/baileys.js', () => ({
+      triggerPairingCode,
+      isBaileysConnected: () => false,
+    }));
+    vi.doMock('../../src/governance/audit.js', () => ({ audit: vi.fn() }));
+    vi.doMock('../../src/lib/logger.js', () => ({
+      logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
+    }));
+    vi.doMock('../../src/config/env.js', () => ({
+      config: {
+        BAILEYS_AUTH_DIR: '/tmp/maia-setup-routes-test',
+        SETUP_TOKEN_OVERRIDE: 'TEST-TOKEN',
+        WHATSAPP_NUMBER_MAIA: '+5511999999999',
+        FEATURE_DASHBOARD: false,
+        NODE_ENV: 'production',
+      },
+    }));
+    prodApp = Fastify();
+    const { registerSetupRoutes } = await import('../../src/setup/index.js');
+    const { setupState } = await import('../../src/setup/state.js');
+    try { setupState.setUnpaired(); } catch { /* already unpaired */ }
+    await registerSetupRoutes(prodApp);
+    await prodApp.ready();
+  });
+
+  afterEach(async () => {
+    await prodApp.close();
+    if (savedEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = savedEnv;
+  });
+
+  it('GET /setup/status is exempt from the per-IP rate limit', async () => {
+    // 35 polls > 30/min cap. Without `config: { rateLimit: false }` the 31st
+    // request would be 429 and the chooser page would silently stop refreshing.
+    for (let i = 0; i < 35; i++) {
+      const r = await prodApp.inject({ method: 'GET', url: '/setup/status?token=TEST-TOKEN' });
+      expect(r.statusCode, `iteration ${i}`).toBe(200);
+    }
+  });
+
+  it('GET /setup/status polling does not consume the budget for GET /setup', async () => {
+    // Simulate a full minute of polling, then the operator opens the chooser.
+    // If status counted against the cap, this GET /setup would 429.
+    for (let i = 0; i < 30; i++) {
+      const poll = await prodApp.inject({ method: 'GET', url: '/setup/status?token=TEST-TOKEN' });
+      expect(poll.statusCode).toBe(200);
+    }
+    const chooser = await prodApp.inject({ method: 'GET', url: '/setup?token=TEST-TOKEN' });
+    expect(chooser.statusCode).toBe(200);
+  });
+
+  it('CSRF cookie is marked Secure when NODE_ENV=production', async () => {
+    const r = await prodApp.inject({ method: 'GET', url: '/setup?token=TEST-TOKEN' });
+    expect(r.statusCode).toBe(200);
+    const setCookie = r.headers['set-cookie'];
+    const cookieStr = Array.isArray(setCookie) ? setCookie.join('\n') : (setCookie ?? '');
+    expect(cookieStr).toMatch(/maia_setup_csrf=/);
+    expect(cookieStr).toMatch(/Secure/);
+    expect(cookieStr).toMatch(/HttpOnly/);
+    expect(cookieStr).toMatch(/SameSite=Strict/i);
   });
 });
