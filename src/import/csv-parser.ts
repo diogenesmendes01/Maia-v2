@@ -47,7 +47,7 @@ const PROFILES: CSVProfile[] = [
 ];
 
 function brToIso(s: string): string | null {
-  const m = s.match(/(\d{2})[\/-](\d{2})[\/-](\d{4})/);
+  const m = s.match(/(\d{2})[/-](\d{2})[/-](\d{4})/);
   if (m) return `${m[3]}-${m[2]}-${m[1]}`;
   if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
   return null;

@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-progress runs on the same branch when a new push lands.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: typecheck + test + lint + build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # Hermetic placeholders — tests/setup.ts overrides these too, but
+      # config validation runs at module load before vitest's setup file.
+      NODE_ENV: test
+      DATABASE_URL: postgres://maia_test:test1234@localhost:5432/maia_test
+      POSTGRES_USER: maia_test
+      POSTGRES_PASSWORD: test1234
+      POSTGRES_DB: maia_test
+      REDIS_URL: redis://localhost:6379
+      ANTHROPIC_API_KEY: sk-ant-test-placeholder
+      OPENROUTER_API_KEY: sk-or-test-placeholder
+      WHATSAPP_NUMBER_MAIA: '+5500000000000'
+      OWNER_TELEFONE_WHATSAPP: '+5511111111111'
+      OWNER_NOME: Test Owner
+      VOYAGE_API_KEY: test-voyage-key
+      ALERT_CHANNELS: log
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck (tsc --noEmit)
+        # Separated from build so failures point cleanly at type vs build.
+        # `npx` instead of an npm script keeps CI independent of script renames.
+        run: npx tsc --noEmit
+
+      - name: Build + verify artifact
+        # Atomic: dist/ check is chained with `&&` so the step fails if build
+        # fails OR if no dist/index.js was produced.
+        run: npm run build && test -f dist/index.js
+
+      - name: Run unit tests
+        # Integration tests skip when TEST_DB_URL is unset — the unit lane is
+        # always green on CI. Follow-up: separate job with postgres + redis
+        # service containers for integration coverage.
+        run: npx vitest run
+
+      - name: Lint
+        # `--max-warnings=0` would flip warnings to failures; we keep them as
+        # warnings for now so existing code can be cleaned incrementally.
+        run: npm run lint

@@ -42,7 +42,7 @@ function isoToBR(iso: string): string {
  * in tests and renders predictably in pdfmake table cells.
  */
 export function fmtBRLSigned(value: number): string {
-  const positive = formatBRL(Math.abs(value)).replace(/ /g, ' ');
+  const positive = formatBRL(Math.abs(value)).replace(/\u00A0/g, ' ');
   if (value >= 0) return positive;
   return '-' + positive;
 }
