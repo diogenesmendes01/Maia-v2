@@ -20,7 +20,10 @@ export async function withTx<T>(fn: (tx: typeof db) => Promise<T>): Promise<T> {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const tx = drizzle(client);
+    // drizzle(client) returns NodePgDatabase & { $client: PoolClient } —
+    // structurally identical to `db` for query purposes; the unknown-bridge
+    // cast tells TS the $client divergence is intentional.
+    const tx = drizzle(client) as unknown as typeof db;
     const result = await fn(tx);
     await client.query('COMMIT');
     return result;

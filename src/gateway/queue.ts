@@ -28,7 +28,7 @@ export function startAgentWorker(processor: (job: Job<AgentJob>) => Promise<void
       connection,
       concurrency: 1,
       removeOnComplete: { age: 86_400 },
-      removeOnFail: false,
+      // Failed jobs are kept by default — operator inspects via DLQ.
     },
   );
   worker.on('failed', async (job, err) => {
