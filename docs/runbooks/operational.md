@@ -2,13 +2,13 @@
 
 Cenários comuns + ações concretas. Fluxo: detecte (alerta? log? métrica?) → diagnostique → mitigue → registre.
 
-> **Antes de qualquer ação destrutiva**, snapshot do DB: `bash scripts/backup.sh` (ou aguardar o `nightly_backup` 03:00 BRT).
+> **Antes de qualquer ação destrutiva**, snapshot do DB: `npm run backup` (ou aguardar o `nightly_backup` 03:00 BRT — ver `src/workers/backup.ts`).
 
 ---
 
 ## 1. WhatsApp pareou? Como verificar / re-parear
 
-**Sinal**: `/health/whatsapp` retorna `{ ok: false }`, métrica `maia_baileys_connected=0`, ou alerta do `audit_watcher` regra `pairing_recovery_stuck`.
+**Sinal**: `/health/whatsapp` retorna `{ ok: false }`, métrica `maia_baileys_connected=0`, ou audit `whatsapp_disconnected` repetido.
 
 **Diagnóstico rápido**:
 
@@ -27,7 +27,15 @@ ssh maia 'cat .baileys-auth/setup-token.txt'   # NOVO token (já rotacionado pel
 # Clique "QR" ou "Código de 8 dígitos"
 ```
 
-**Caso 3 — recovery travou** (alerta `pairing_recovery_stuck`): SSH manual:
+**Caso 3 — recovery travou**: verifique no `audit_log` se `pairing_recovery_started` apareceu sem `pairing_recovery_completed`:
+
+```sql
+SELECT acao, created_at FROM audit_log
+WHERE acao IN ('pairing_recovery_started', 'pairing_recovery_completed')
+ORDER BY created_at DESC LIMIT 10;
+```
+
+Se travou, SSH manual:
 
 ```bash
 ssh maia
@@ -38,6 +46,8 @@ sudo systemctl start maia
 ```
 
 **Audit log relacionado**: `pairing_recovery_started`, `pairing_recovery_completed`, `pairing_logged_out`, `setup_token_rotated`.
+
+> Quando a PR #24 (audit_watcher) for mergeada, a regra `pairing_recovery_stuck` dispara alerta automático após 1 min sem `_completed`.
 
 ---
 
@@ -58,7 +68,17 @@ sudo systemctl start maia
 
 ## 3. LLM provider down (Anthropic, OpenAI, Voyage)
 
-**Sinal**: alerta `audit_watcher: llm_circuit_long_open` (urgent), métrica `maia_llm_circuit_state=open`, ou `health/llm` em down.
+**Sinal**: audit `llm_circuit_opened` aparecendo, métrica `maia_llm_calls_total{status="error"}` crescendo, mensagens demorando ou falhando.
+
+**Diagnóstico**:
+
+```sql
+-- Ver quantos circuit breakers abriram nas últimas horas:
+SELECT acao, count(*), max(created_at) FROM audit_log
+WHERE acao IN ('llm_circuit_opened', 'llm_circuit_closed')
+  AND created_at > NOW() - INTERVAL '6 hours'
+GROUP BY acao;
+```
 
 **Mitigação**:
 
@@ -69,18 +89,22 @@ sudo systemctl start maia
 
 **Audit log relacionado**: `llm_circuit_opened`, `llm_circuit_closed`.
 
+> Quando a PR #24 (audit_watcher) for mergeada, a regra `llm_circuit_long_open` dispara alerta após 5 min sem `_closed`.
+
 ---
 
 ## 4. DB connection lost / Postgres down
 
-**Sinal**: `/health/db` em down, métrica `maia_db_connected=0`, alerta do `health-monitor` se persistir > 2min.
+**Sinal**: `/health/db` em down, log `pg pool error`, queries falhando em massa.
 
 **Mitigação**:
 
 1. **Identificar a causa**: `ssh maia 'sudo systemctl status postgresql'`. OOM? Disk full?
 2. **Restart simples**: `sudo systemctl restart postgresql`. App reconecta sozinho via pool.
-3. **Disk full**: `df -h /var/lib/postgresql`. Limpe: `vacuum full` em tabelas grandes (`auditoria`, `mensagens`). Cuidado — bloqueia acesso durante o vacuum.
+3. **Disk full**: `df -h /var/lib/postgresql`. Limpe: `vacuum full` em tabelas grandes (`audit_log`, `mensagens`). Cuidado — bloqueia acesso durante o vacuum.
 4. **Restore se corrompido**: ver §6.
+
+> Não há gauge `maia_db_connected` registrado hoje (`src/server.ts` só registra `maia_redis_connected` e `maia_baileys_connected`). Use `/health/db` ou observação dos logs `pg pool error`. Adicionar o gauge é um follow-up trivial se quiser alarme automático.
 
 ---
 
@@ -91,13 +115,20 @@ sudo systemctl start maia
 **Inspeção**:
 
 ```bash
-ssh maia 'cd /opt/maia && npm run dlq'   # lista entradas + payloads
+ssh maia 'cd /opt/maia && npm run dlq -- list'
+# Lista até 50 entradas abertas com id, queue, attempts, error, created_at.
 ```
 
 **Resolução**:
 
-- **Erro determinístico** (parsing inválido, dado corrompido): registre o `id` da DLQ, edite o job se possível, ou simplesmente delete (`npm run dlq -- --delete <id>`).
-- **Erro transient** (timeout LLM, rede): `npm run dlq -- --retry <id>` reenfileira no agent queue.
+- **Erro determinístico** (parsing inválido, dado corrompido): registre o `id` da DLQ, depois marque resolvido (não re-enfileira):
+  ```bash
+  npm run dlq -- resolve <id>
+  ```
+- **Erro transient** (timeout LLM, rede): re-enfileira no agent queue + marca resolvido:
+  ```bash
+  npm run dlq -- retry <id>
+  ```
 - **Padrão recorrente**: investigue o código — provavelmente um bug, não um job ruim.
 
 **Audit log relacionado**: `dlq_job_added`, `dlq_job_resolved`.
@@ -109,7 +140,7 @@ ssh maia 'cd /opt/maia && npm run dlq'   # lista entradas + payloads
 **Drill** (sem afetar produção):
 
 ```bash
-ssh maia 'cd /opt/maia && npx tsx scripts/restore-test.ts'
+ssh maia 'cd /opt/maia && npm run restore:test'
 # Pega o backup mais recente, restaura num DB efêmero, valida count(pessoas), drop.
 # Audit: 'restore_test_passed' ou 'restore_test_failed'.
 ```
@@ -129,7 +160,7 @@ ssh maia 'cd /opt/maia && npx tsx scripts/restore-test.ts'
 
 ## 7. Setup token rotation manual
 
-**Quando**: você suspeita que o token vazou (alerta `audit_watcher: setup_unauthorized_farm` ou `setup_csrf_attack`).
+**Quando**: você suspeita que o token vazou (auditoria mostra `setup_unauthorized_access` repetido — ou, depois da PR #23, `setup_csrf_mismatch`).
 
 ```bash
 ssh maia 'cd /opt/maia && rm -f .baileys-auth/setup-token.txt && sudo systemctl restart maia'
@@ -139,23 +170,28 @@ ssh maia 'cat /opt/maia/.baileys-auth/setup-token.txt'   # NOVO token
 
 **Importante**: o token da sessão (Baileys) é diferente do bootstrap token (`/setup`). Rotacionar o bootstrap NÃO desconecta o WhatsApp.
 
+> Quando a PR #24 (audit_watcher) for mergeada, as regras `setup_unauthorized_farm` (3+ em 5min) e `setup_csrf_attack` (5+ em 5min) disparam alerta automático.
+
 ---
 
 ## 8. Métricas pra ficar de olho
 
 ```bash
-curl -s http://localhost:3000/metrics | grep -E "maia_(baileys|redis|db|llm)_"
+curl -s http://localhost:3000/metrics | grep -E "maia_(baileys|redis|llm|audit)_"
 ```
 
-| Métrica | Alvo | Alerta se |
+| Métrica (registrada hoje) | Tipo | Alerta se |
 |---|---|---|
-| `maia_baileys_connected` | 1 | =0 por > 2min |
-| `maia_db_connected` | 1 | =0 por > 30s |
-| `maia_redis_connected` | 1 | =0 por > 30s |
-| `maia_llm_circuit_state` | 0 (closed) | =1 por > 5min |
-| `maia_audit_events_total{action="setup_unauthorized_access"}` | baixo | crescimento súbito |
+| `maia_baileys_connected` | gauge | =0 por > 2min |
+| `maia_redis_connected` | gauge | =0 por > 30s |
+| `maia_llm_calls_total{status="error"}` | counter | rate alto |
+| `maia_llm_tokens_total{kind=...}` | counter | rate alto = custo |
+| `maia_llm_latency_ms` | histogram | p99 > 30s |
+| `maia_audit_events_total{action=...}` | counter | crescimento súbito em ações sensíveis |
 
-O `audit_watcher` (PR #24) já cobre os principais; `/metrics` é pra deep-dive.
+**Health endpoints** (em `src/server.ts`): `/health`, `/health/db`, `/health/redis`, `/health/whatsapp`. Não há `/health/llm` — use `maia_llm_calls_total{status}` no Prometheus.
+
+> Adicionar `maia_db_connected` e `maia_llm_circuit_state` é um follow-up trivial (uma linha cada em `src/server.ts` via `setGaugeProvider`). Se quiser alertas baseados nessas, abre uma PR.
 
 ---
 
@@ -184,4 +220,17 @@ O shutdown handler em `src/index.ts` chama `stopWorkers()` + `shutdownPools()` +
 - [ ] Audit log mostra `system_started`, `pairing_qr_displayed` (ou `pairing_code_requested`), `pairing_completed`
 - [ ] `/health/whatsapp` ok
 - [ ] Mande mensagem teste pro número Maia → log mostra `baileys.message.enqueued` → resposta do agente em ~3-8s
-- [ ] (Opcional) Configurar nginx (ver `docs/runbooks/setup-nginx.md`): IP whitelist, TLS, fail2ban
+- [ ] (Opcional) Configurar nginx (uma vez que a PR #23 land, ver `docs/runbooks/setup-nginx.md`): IP whitelist, TLS, fail2ban
+
+---
+
+## Apêndice — referências cruzadas
+
+- **`docs/runbooks/setup-nginx.md`** — IP whitelist, TLS, fail2ban (PR #23, ainda não mergeada na escrita deste runbook).
+- **`audit_watcher`** — regras automáticas de detecção de anomalia (PR #24, ainda não mergeada). Mencionado em §1, §3, §7.
+- **`scripts/restore-test.ts`** — drill de restore (já no main).
+- **`src/workers/backup.ts`** — backup nightly (já no main).
+- **`src/workers/cost-monitor.ts`** — alerta de custo LLM diário acima de `DAILY_LLM_USD_THRESHOLD` (já no main).
+- **`src/workers/health-monitor.ts`** — vigilância dos health checks (já no main).
+
+Quando #23 e #24 mergearem, este runbook continua válido — as referências forward (marcadas com `>`) viram links concretos sem alterar nenhum comando.
