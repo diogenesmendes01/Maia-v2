@@ -15,6 +15,7 @@ import {
   setCurrentFastModel,
   envDefaults,
 } from '@/lib/llm-settings.js';
+import { getToolCallingModels, type OpenRouterModel } from '@/lib/openrouter-models.js';
 import { formatBRL, fmtBR } from '@/lib/brazilian.js';
 
 const SESSION_TTL_HOURS = 8;
@@ -168,17 +169,35 @@ export async function registerDashboardRoutes(app: FastifyInstance): Promise<voi
     const main = await getCurrentMainModel();
     const fast = await getCurrentFastModel();
     const env = envDefaults();
-    return reply.type('text/html').send(renderLlmSettings({ main, fast, env }));
+    const models = await getToolCallingModels();
+    return reply.type('text/html').send(renderLlmSettings({ main, fast, env, models }));
   });
 
-  app.post<{ Body: { main_model?: string; fast_model?: string } }>(
+  app.post<{
+    Body: {
+      main_model?: string;
+      fast_model?: string;
+      main_model_custom?: string;
+      fast_model_custom?: string;
+    };
+  }>(
     '/dashboard/llm-settings',
     async (req, reply) => {
       const sess = await getSessionFromCookie(req.headers.cookie);
       if (!sess) return reply.code(303).header('location', '/dashboard').send();
-      const body = (req.body ?? {}) as { main_model?: string; fast_model?: string };
-      const main = typeof body.main_model === 'string' ? body.main_model.trim() : '';
-      const fast = typeof body.fast_model === 'string' ? body.fast_model.trim() : '';
+      const body = (req.body ?? {}) as {
+        main_model?: string;
+        fast_model?: string;
+        main_model_custom?: string;
+        fast_model_custom?: string;
+      };
+      // Custom (free-text) override beats the dropdown selection when set.
+      const main = (typeof body.main_model_custom === 'string' && body.main_model_custom.trim().length > 0
+        ? body.main_model_custom
+        : (body.main_model ?? '')).trim();
+      const fast = (typeof body.fast_model_custom === 'string' && body.fast_model_custom.trim().length > 0
+        ? body.fast_model_custom
+        : (body.fast_model ?? '')).trim();
       const changes: Record<string, string> = {};
       if (main.length > 0 && main.length <= 200) {
         await setCurrentMainModel(main);
@@ -449,11 +468,46 @@ function escape(s: string): string {
   );
 }
 
+function fmtPrice(usd_per_million: number): string {
+  if (usd_per_million === 0) return 'free';
+  if (usd_per_million < 1) return `$${usd_per_million.toFixed(2)}/M`;
+  return `$${usd_per_million.toFixed(0)}/M`;
+}
+
+function fmtCtx(tokens: number): string {
+  if (tokens === 0) return '?';
+  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(0)}M`;
+  if (tokens >= 1000) return `${Math.round(tokens / 1000)}k`;
+  return `${tokens}`;
+}
+
+function modelOption(m: OpenRouterModel, selected: string): string {
+  const sel = m.id === selected ? ' selected' : '';
+  const label = `${m.name} - in ${fmtPrice(m.pricing.prompt_per_million)}, out ${fmtPrice(m.pricing.completion_per_million)}, ctx ${fmtCtx(m.context_length)}`;
+  return `<option value="${escape(m.id)}"${sel}>${escape(label)}</option>`;
+}
+
+function modelSelect(name: string, current: string, models: OpenRouterModel[]): string {
+  const inList = models.some((m) => m.id === current);
+  const opts = models.map((m) => modelOption(m, current)).join('\n        ');
+  // If current selection is NOT in the live list (e.g. operator typed a slug
+  // we don't know about), prepend it as a one-off so the dropdown still
+  // shows what's actually saved.
+  const customOpt = inList
+    ? ''
+    : `<option value="${escape(current)}" selected>${escape(current)} (custom)</option>\n        `;
+  return `<select name="${name}">
+        ${customOpt}${opts}
+      </select>`;
+}
+
 function renderLlmSettings(args: {
   main: string;
   fast: string;
   env: { main: string; fast: string; provider: string };
+  models: OpenRouterModel[];
 }): string {
+  const count = args.models.length;
   return `<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
@@ -466,29 +520,31 @@ function renderLlmSettings(args: {
   <div class="container">
     <h1>Configuracao do LLM</h1>
     <p>Provider em uso: <strong>${escape(args.env.provider)}</strong></p>
-    <p class="muted">Defaults vindos do .env: main=<code>${escape(args.env.main)}</code>, fast=<code>${escape(args.env.fast)}</code></p>
+    <p class="muted">${count} modelo(s) com tool-calling disponivel(is). Default do .env: main=<code>${escape(args.env.main)}</code>, fast=<code>${escape(args.env.fast)}</code></p>
     <form method="POST" action="/dashboard/llm-settings">
       <label>
         Modelo principal (main)
-        <input type="text" name="main_model" value="${escape(args.main)}" maxlength="200" required>
+        ${modelSelect('main_model', args.main, args.models)}
       </label>
       <label>
         Modelo rapido (fast / fallback)
-        <input type="text" name="fast_model" value="${escape(args.fast)}" maxlength="200" required>
+        ${modelSelect('fast_model', args.fast, args.models)}
       </label>
+      <details>
+        <summary>Usar slug customizado (avancado)</summary>
+        <p class="muted">Se quiser usar um slug que nao aparece no dropdown (ex: lancamento muito recente), digite abaixo. Sobrescreve o select acima quando preenchido.</p>
+        <label>
+          main_model custom
+          <input type="text" name="main_model_custom" maxlength="200" placeholder="ex: anthropic/claude-opus-4.7">
+        </label>
+        <label>
+          fast_model custom
+          <input type="text" name="fast_model_custom" maxlength="200" placeholder="ex: anthropic/claude-haiku-latest">
+        </label>
+      </details>
       <button type="submit">Salvar</button>
     </form>
-    <h2>Exemplos OpenRouter (modelos com tool-calling)</h2>
-    <p class="muted">A Maia REQUER tool-calling pra rodar o agente ReAct. Modelos sem suporte vão falhar com erro de tool. Use a lista filtrada abaixo:</p>
-    <ul>
-      <li><code>anthropic/claude-sonnet-4.6</code> - main recomendado</li>
-      <li><code>anthropic/claude-haiku-4.5</code> - fast recomendado</li>
-      <li><code>anthropic/claude-sonnet-latest</code> - alias auto-atualiza pra versão nova</li>
-      <li><code>openai/gpt-5</code></li>
-      <li><code>google/gemini-2.5-pro</code></li>
-      <li><code>x-ai/grok-4.1-fast</code> - barato, bom em tool-use</li>
-    </ul>
-    <p class="muted">Lista filtrada só com tool-calling: <a href="https://openrouter.ai/models?supported_parameters=tools" target="_blank" rel="noopener">openrouter.ai/models?supported_parameters=tools</a></p>
+    <p class="muted">Lista atualizada via <code>https://openrouter.ai/api/v1/models</code> (cache 1h). Filtrada para modelos com <code>supported_parameters: tools</code>. <a href="https://openrouter.ai/models?supported_parameters=tools" target="_blank" rel="noopener">Ver na OpenRouter</a>.</p>
     <p><a href="/dashboard">&larr; Voltar</a></p>
   </div>
 </body>
