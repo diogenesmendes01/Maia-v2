@@ -25,8 +25,6 @@ const envSchema = z
     CLAUDE_MODEL_MAIN: z.string().default('claude-sonnet-4-6'),
     CLAUDE_MODEL_FAST: z.string().default('claude-haiku-4-5-20251001'),
     OPENAI_API_KEY: z.string().startsWith('sk-').optional(),
-    OLLAMA_BASE_URL: z.string().url().optional(),
-    OLLAMA_MODEL: z.string().optional(),
 
     WHISPER_PROVIDER: z.enum(['openai']).default('openai'),
     WHISPER_MODEL: z.string().default('whisper-1'),
@@ -78,10 +76,6 @@ const envSchema = z
     DAILY_LLM_USD_THRESHOLD: z.coerce.number().positive().default(5),
 
     FEATURE_PROACTIVE_MESSAGES: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
-    FEATURE_OLLAMA_FALLBACK: z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),

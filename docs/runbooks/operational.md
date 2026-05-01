@@ -82,9 +82,10 @@ GROUP BY acao;
 
 **Mitigação**:
 
-1. **Confirmar é o provider**: `curl -i https://api.anthropic.com/v1/health` (sem auth).
-2. **Se for Anthropic**: ative `FEATURE_OLLAMA_FALLBACK=true` no `.env` se você tem Ollama configurado, restart.
-3. **Se não tem fallback**: o circuit breaker já está aberto, agente responde "estou processando, volte em alguns minutos" (graceful). Aguarde provider voltar.
+1. **Confirmar é o provider**: `curl -i https://api.anthropic.com/v1/health` (Anthropic) ou `curl -i https://openrouter.ai/api/v1/health` (OpenRouter), sem auth.
+2. **Workaround imediato (LLM_PROVIDER=openrouter)**: troque o modelo em `/dashboard/llm-settings`. Se o main estava num provider down (ex: `anthropic/...`), pula pra outro (ex: `openai/gpt-5`, `google/gemini-2.5-pro`, `x-ai/grok-4.1-fast`). Próxima mensagem usa o modelo novo, sem restart.
+3. **Workaround imediato (LLM_PROVIDER=anthropic)**: edite `LLM_PROVIDER=openrouter` no `.env` + setup `OPENROUTER_API_KEY`, restart. Funcionalmente equivalente ao circuit breaker, mais flexível.
+4. **Sem fallback configurado**: o circuit breaker já está aberto, agente responde "estou processando, volte em alguns minutos" (graceful). Aguarde provider voltar.
 4. **Cost spike** durante outage (retries): o `cost-monitor` cron pega no dia seguinte (alerta `Daily LLM cost USD…above…`).
 
 **Audit log relacionado**: `llm_circuit_opened`, `llm_circuit_closed`.

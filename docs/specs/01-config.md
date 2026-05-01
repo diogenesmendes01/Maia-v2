@@ -42,7 +42,7 @@ Two providers are pluggable: **LLM** and **Embedding**. Both follow the same pat
 
 ```typescript
 // LLM provider
-type LLMProvider = 'anthropic' | 'openai' | 'ollama';
+type LLMProvider = 'anthropic' | 'openrouter';
 
 // Embedding provider
 type EmbeddingProvider = 'voyage' | 'openai' | 'cohere';
@@ -75,14 +75,16 @@ const envSchema = z.object({
   REDIS_URL: z.string().url(),
   REDIS_PORT: z.coerce.number().int().positive().default(6379),
 
-  // LLM (primary)
-  LLM_PROVIDER: z.enum(['anthropic', 'openai', 'ollama']).default('anthropic'),
-  ANTHROPIC_API_KEY: z.string().startsWith('sk-ant-'),
+  // LLM (primary). Operators wanting GPT / Llama / Gemini / DeepSeek route
+  // through OpenRouter — runtime model picked via /dashboard/llm-settings.
+  LLM_PROVIDER: z.enum(['anthropic', 'openrouter']).default('anthropic'),
+  ANTHROPIC_API_KEY: z.string().startsWith('sk-ant-').optional(),
   CLAUDE_MODEL_MAIN: z.string().default('claude-sonnet-4-6'),
   CLAUDE_MODEL_FAST: z.string().default('claude-haiku-4-5-20251001'),
-  OPENAI_API_KEY: z.string().startsWith('sk-').optional(),
-  OLLAMA_BASE_URL: z.string().url().optional(),
-  OLLAMA_MODEL: z.string().optional(),
+  OPENROUTER_API_KEY: z.string().startsWith('sk-or-').optional(),
+  OPENROUTER_MODEL_MAIN: z.string().default('anthropic/claude-sonnet-4.6'),
+  OPENROUTER_MODEL_FAST: z.string().default('anthropic/claude-haiku-4.5'),
+  OPENAI_API_KEY: z.string().startsWith('sk-').optional(), // used by Whisper, not LLM
 
   // Whisper (audio)
   WHISPER_PROVIDER: z.enum(['openai']).default('openai'),
@@ -136,7 +138,6 @@ const envSchema = z.object({
 
   // Feature flags
   FEATURE_PROACTIVE_MESSAGES: z.coerce.boolean().default(false),
-  FEATURE_OLLAMA_FALLBACK: z.coerce.boolean().default(false),
   FEATURE_OFX_IMPORT: z.coerce.boolean().default(false),
   FEATURE_DASHBOARD: z.coerce.boolean().default(false),
 });
@@ -151,11 +152,11 @@ After Zod parsing, additional refinements:
 
 ```typescript
 envSchema.superRefine((cfg, ctx) => {
-  if (cfg.LLM_PROVIDER === 'openai' && !cfg.OPENAI_API_KEY) {
-    ctx.addIssue({ code: 'custom', message: 'OPENAI_API_KEY required when LLM_PROVIDER=openai' });
+  if (cfg.LLM_PROVIDER === 'anthropic' && !cfg.ANTHROPIC_API_KEY) {
+    ctx.addIssue({ code: 'custom', message: 'ANTHROPIC_API_KEY required when LLM_PROVIDER=anthropic' });
   }
-  if (cfg.LLM_PROVIDER === 'ollama' && (!cfg.OLLAMA_BASE_URL || !cfg.OLLAMA_MODEL)) {
-    ctx.addIssue({ code: 'custom', message: 'OLLAMA_BASE_URL and OLLAMA_MODEL required when LLM_PROVIDER=ollama' });
+  if (cfg.LLM_PROVIDER === 'openrouter' && !cfg.OPENROUTER_API_KEY) {
+    ctx.addIssue({ code: 'custom', message: 'OPENROUTER_API_KEY required when LLM_PROVIDER=openrouter' });
   }
   if (cfg.EMBEDDING_PROVIDER === 'voyage' && !cfg.VOYAGE_API_KEY) {
     ctx.addIssue({ code: 'custom', message: 'VOYAGE_API_KEY required when EMBEDDING_PROVIDER=voyage' });
@@ -210,7 +211,7 @@ ESLint rule: `no-process-env` everywhere except `src/config/env.ts`.
 |---------|----------|
 | Missing required env | Process exits with structured error listing every missing field |
 | Invalid format (e.g., URL) | Process exits with the field name and the violated constraint |
-| Cross-field violation (e.g., `OPENAI_API_KEY` missing when `LLM_PROVIDER=openai`) | Process exits with explanatory message |
+| Cross-field violation (e.g., `OPENROUTER_API_KEY` missing when `LLM_PROVIDER=openrouter`) | Process exits with explanatory message |
 | Owner phone equals Maia phone | Process exits with explanatory message |
 
 All exits are **before** any external connection (DB, Redis, Anthropic). No partial startup.
@@ -220,7 +221,7 @@ All exits are **before** any external connection (DB, Redis, Anthropic). No part
 - [ ] `npm run dev` with empty `.env` exits in < 1s with a list of every missing required field.
 - [ ] `process.env` is referenced in exactly one file (`src/config/env.ts`).
 - [ ] Logs contain no API keys after running a sample interaction (verified by grep on log fixtures).
-- [ ] Switching `LLM_PROVIDER` between `anthropic` and `openai` requires only env change + restart, no code edit.
+- [ ] Switching `LLM_PROVIDER` between `anthropic` and `openrouter` requires only env change + restart, no code edit. Once on `openrouter`, switching individual models is operator-driven via `/dashboard/llm-settings` (no restart).
 - [ ] Tests cover: missing field, invalid URL, cross-field violation, owner==Maia phone collision.
 
 ## 10. References

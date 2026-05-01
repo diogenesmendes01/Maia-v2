@@ -230,7 +230,7 @@ The batch is bounded to 200 LLM calls per night. Excess is queued for the next n
 
 ```typescript
 interface LLMProvider {
-  name: 'anthropic' | 'openai' | 'ollama';
+  name: 'anthropic' | 'openrouter';
   modelMain: string;
   modelFast: string;
 
@@ -258,13 +258,11 @@ type LLMResponse = {
 
 Uses `@anthropic-ai/sdk`. Tool use via the native Tools API. Prompt caching is enabled by sending `cache_control: { type: 'ephemeral' }` on the system blocks 1–7.
 
-### 8.3 OpenAI (Phase 2 cross-provider)
+### 8.3 OpenRouter (multi-provider gateway)
 
-Uses `openai` SDK. Tool use via native Function Calling. Different message shape; the provider adapter translates. **Not used by default**; gated by `LLM_PROVIDER=openai`. Out of scope for Phase 1.
+Uses the `openai` SDK pointed at `https://openrouter.ai/api/v1`. Tool use via OpenAI Function Calling (OpenRouter standardises the surface across upstream models). The provider adapter (`toOpenAIMessages` / `toOpenAITools` / `fromOpenAIResponse` in `src/lib/claude.ts`) translates Anthropic-style messages to/from OpenAI Chat Completions. Active when `LLM_PROVIDER=openrouter`. The actual model is read at call time from `agent_facts` (`escopo='global'`, `chave='llm.model.main'|'llm.model.fast'`) with env-var fallback (`OPENROUTER_MODEL_MAIN` / `OPENROUTER_MODEL_FAST`). Operator changes the model from `/dashboard/llm-settings` and the next ReAct turn uses the new value — no restart.
 
-### 8.4 Ollama (Phase 2 local fallback)
-
-Uses HTTP API to a local Ollama server. Llama 3.1 8B or 3.2 3B. Tool use via JSON-mode prompt engineering: tools are described in the system prompt, model output is parsed and Zod-validated. Quality is degraded; **only used in Redis-down-equivalent restricted mode** (read-only intents, no `create_*` actions).
+Models without tool-calling are filtered out of the dashboard dropdown (the agent loop requires tools).
 
 ## 9. Fallback chain
 
@@ -281,11 +279,7 @@ final:    enqueue to retry queue + reply to user
           "Estou com instabilidade técnica. Sua mensagem foi salva. Volto logo."
 ```
 
-### 9.2 Phase 2 chain (`FEATURE_OLLAMA_FALLBACK=true`)
-
-After attempt 4 (Haiku) fails, attempt Ollama in **restricted mode**: the prompt is injected with an additional constraint that limits intents to read-only. If Ollama also fails, fall back to the message above.
-
-### 9.3 Circuit breaker
+### 9.2 Circuit breaker
 
 Per provider, a simple sliding-window failure counter:
 
