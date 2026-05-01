@@ -11,6 +11,7 @@ import { runMessageRecovery } from './message-recovery.js';
 import { runPendingReminder } from './pending-reminder.js';
 import { runNightlyBackup } from './backup.js';
 import { runCostMonitor } from './cost-monitor.js';
+import { runAuditWatcher } from './audit-watcher.js';
 import { runMorningBriefing, runEveningBriefing, runWeeklyBriefing } from './briefings.js';
 import { tickEngine } from '@/workflows/engine.js';
 
@@ -18,6 +19,7 @@ type Job = { name: string; cron: string; fn: () => Promise<void>; phase: number 
 
 const JOBS: Job[] = [
   { name: 'health_monitor', cron: '*/1 * * * *', fn: runHealthMonitor, phase: 1 },
+  { name: 'audit_watcher', cron: '*/1 * * * *', fn: runAuditWatcher, phase: 1 },
   { name: 'pending_expirer', cron: '*/1 * * * *', fn: runPendingExpirer, phase: 1 },
   { name: 'message_recovery', cron: '*/2 * * * *', fn: runMessageRecovery, phase: 1 },
   { name: 'pending_reminder', cron: '*/30 * * * *', fn: runPendingReminder, phase: 1 },
