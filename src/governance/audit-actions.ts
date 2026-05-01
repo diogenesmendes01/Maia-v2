@@ -95,6 +95,7 @@ export const AUDIT_ACTIONS = [
   'pairing_recovery_completed',
   'setup_token_rotated',
   'setup_unauthorized_access',
+  'setup_csrf_mismatch',
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];

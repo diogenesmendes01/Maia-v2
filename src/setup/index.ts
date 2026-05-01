@@ -1,4 +1,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import fastifyCookie from '@fastify/cookie';
+import rateLimit from '@fastify/rate-limit';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { config } from '@/config/env.js';
 import { audit } from '@/governance/audit.js';
 import { logger } from '@/lib/logger.js';
@@ -26,6 +29,46 @@ function applyHeaders(reply: FastifyReply): void {
   for (const [k, v] of Object.entries(SECURITY_HEADERS)) {
     reply.header(k, v);
   }
+}
+
+/**
+ * CSRF defence (spec section 11 cookie-based, deferred originally; landed in
+ * chunk-B setup hardening). The chooser page sets a sameSite=strict httpOnly
+ * cookie `maia_setup_csrf` and embeds the same random hex string in the form's
+ * hidden `csrf` field. POST /setup/start requires both to match (timing-safe)
+ * - sameSite=strict prevents the cookie from riding cross-origin POSTs, so
+ * even an attacker holding the bootstrap token cannot force a re-pair from a
+ * malicious page.
+ */
+const CSRF_COOKIE_NAME = 'maia_setup_csrf';
+const CSRF_COOKIE_MAX_AGE_S = 900; // 15 minutes - long enough for a pair attempt.
+
+function newCsrf(): string {
+  return randomBytes(16).toString('hex');
+}
+
+async function verifyCsrf(req: FastifyRequest, reply: FastifyReply): Promise<boolean> {
+  const cookieToken = (req.cookies as Record<string, string | undefined> | undefined)?.[CSRF_COOKIE_NAME] ?? '';
+  const body = (req.body ?? {}) as { csrf?: string };
+  const presented = typeof body.csrf === 'string' ? body.csrf : '';
+  const ok =
+    cookieToken.length > 0 &&
+    cookieToken.length === presented.length &&
+    timingSafeEqual(Buffer.from(cookieToken), Buffer.from(presented));
+  if (!ok) {
+    await audit({
+      acao: 'setup_csrf_mismatch',
+      metadata: {
+        ip: (req.ip ?? 'unknown').slice(0, 64),
+        ua: (req.headers['user-agent'] ?? 'unknown').slice(0, 200),
+        had_cookie: cookieToken.length > 0,
+        had_body: presented.length > 0,
+      },
+    });
+    reply.code(403).type('text/plain').send('csrf forbidden');
+    return false;
+  }
+  return true;
 }
 
 async function authGate(req: FastifyRequest, reply: FastifyReply): Promise<boolean> {
@@ -68,6 +111,16 @@ function isFormSubmit(req: FastifyRequest): boolean {
 }
 
 export async function registerSetupRoutes(app: FastifyInstance): Promise<void> {
+  await app.register(fastifyCookie);
+  await app.register(rateLimit, {
+    // Operator-only surface - tight global limit (per IP). Tests bypass via
+    // NODE_ENV=test so app.inject loops are not tripped by 429s.
+    global: process.env.NODE_ENV !== 'test',
+    max: 30,
+    timeWindow: '1 minute',
+    skipOnError: true, // never let a Redis/store hiccup take down /setup
+  });
+
   app.addContentTypeParser(
     'application/x-www-form-urlencoded',
     { parseAs: 'string' },
@@ -88,8 +141,17 @@ export async function registerSetupRoutes(app: FastifyInstance): Promise<void> {
     const phaseObj = setupState.current();
 
     switch (phaseObj.phase) {
-      case 'unpaired':
-        return reply.type('text/html').send(renderChooser(token));
+      case 'unpaired': {
+        const csrf = newCsrf();
+        reply.setCookie(CSRF_COOKIE_NAME, csrf, {
+          path: '/',
+          httpOnly: true,
+          sameSite: 'strict',
+          maxAge: CSRF_COOKIE_MAX_AGE_S,
+          secure: false, // dev/local; nginx terminates TLS in prod (see runbook)
+        });
+        return reply.type('text/html').send(renderChooser(token, csrf));
+      }
       case 'pairing_qr':
         return reply.type('text/html').send(renderQr(token, phaseObj.qr));
       case 'pairing_code':
@@ -126,8 +188,9 @@ export async function registerSetupRoutes(app: FastifyInstance): Promise<void> {
 
   app.post('/setup/start', async (req, reply) => {
     if (!(await authGate(req, reply))) return;
+    if (!(await verifyCsrf(req, reply))) return;
 
-    const body = (req.body ?? {}) as { method?: 'qr' | 'code' };
+    const body = (req.body ?? {}) as { method?: 'qr' | 'code'; csrf?: string };
     const fromForm = isFormSubmit(req);
     // Browsers submit the chooser as a plain HTML form, so on success/retry
     // we redirect them back to /setup with the same token. The page then
