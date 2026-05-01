@@ -248,6 +248,18 @@ describe('setup routes - GET /setup/status', () => {
     expect(body.qr).toBe('available');
     expect(JSON.stringify(body)).not.toContain('test-qr-string');
   });
+
+  it('without token returns 403 with security headers (auth gate applies)', async () => {
+    // /setup/status leaks the current pairing phase if unguarded — assert the
+    // authGate is wired and that applyHeaders runs BEFORE verifyToken so the
+    // 403 itself is no-store/no-referrer (defence in depth: the empty body
+    // still benefits from cache controls if a proxy ever sees it).
+    const r = await app.inject({ method: 'GET', url: '/setup/status' });
+    expect(r.statusCode).toBe(403);
+    expect(r.headers['cache-control']).toBe('no-store');
+    expect(r.headers['referrer-policy']).toBe('no-referrer');
+    expect(r.headers['x-content-type-options']).toBe('nosniff');
+  });
 });
 
 describe('setup routes - GET /setup/status (per-phase shape)', () => {
