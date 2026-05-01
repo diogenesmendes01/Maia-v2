@@ -49,6 +49,46 @@ describe('embeddings — provider factory', () => {
     expect(getEmbeddingProvider().name).toBe('openai');
   });
 
+  it('openai text-embedding-3-* requests pass `dimensions` so the API truncates', async () => {
+    // Bug fix: previously the OpenAI body was {input, model} only — without
+    // `dimensions`, text-embedding-3-small returns 1536 (native) and the
+    // downstream guard fires `embedding_dim_mismatch` on the very first embed
+    // when EMBEDDING_DIMENSIONS=1024 (matching pgvector schema).
+    const { getEmbeddingProvider } = await loadWithConfig({
+      EMBEDDING_PROVIDER: 'openai',
+      EMBEDDING_MODEL: 'text-embedding-3-small',
+      EMBEDDING_DIMENSIONS: 1024,
+      OPENAI_API_KEY: 'sk-openai',
+    });
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ data: [{ embedding: new Array(1024).fill(0) }] }),
+    });
+    await getEmbeddingProvider().embed(['olá']);
+    const [, init] = fetchMock.mock.calls[0]!;
+    const body = JSON.parse((init as { body: string }).body);
+    expect(body.dimensions).toBe(1024);
+    expect(body.model).toBe('text-embedding-3-small');
+    expect(body.input).toEqual(['olá']);
+  });
+
+  it('openai legacy text-embedding-ada-002 does NOT pass `dimensions` (api would 400)', async () => {
+    const { getEmbeddingProvider } = await loadWithConfig({
+      EMBEDDING_PROVIDER: 'openai',
+      EMBEDDING_MODEL: 'text-embedding-ada-002',
+      EMBEDDING_DIMENSIONS: 1536,
+      OPENAI_API_KEY: 'sk-openai',
+    });
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ data: [{ embedding: new Array(1536).fill(0) }] }),
+    });
+    await getEmbeddingProvider().embed(['olá']);
+    const [, init] = fetchMock.mock.calls[0]!;
+    const body = JSON.parse((init as { body: string }).body);
+    expect(body.dimensions).toBeUndefined();
+  });
+
   it('selects cohere when configured', async () => {
     const { getEmbeddingProvider } = await loadWithConfig({
       EMBEDDING_PROVIDER: 'cohere',
