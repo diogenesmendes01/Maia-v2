@@ -7,6 +7,16 @@ import { audit } from '@/governance/audit.js';
 const TOKEN_FILE = (): string => join(config.BAILEYS_AUTH_DIR, 'setup-token.txt');
 
 /**
+ * Canonical bootstrap-token format: lowercase 32-char hex string (128 bits
+ * from `randomBytes(16).toString('hex')`). Files whose trimmed content does
+ * NOT match this pattern are treated as missing and rotated, with an audit.
+ * This closes a defence gap: an empty/corrupted file used to be returned
+ * verbatim, and `verifyToken('', '')` short-circuited to true under
+ * `timingSafeEqual`, authenticating an attacker who omits `?token=` entirely.
+ */
+const VALID_TOKEN_PATTERN = /^[0-9a-f]{32}$/;
+
+/**
  * Tracks whether the current process has ever successfully observed a token —
  * either by reading an existing file, by being explicitly rotated, or by
  * creating a fresh one on cold start. Lets `ensureToken` distinguish a true
@@ -38,10 +48,11 @@ async function createTokenFile(tokenPath: string): Promise<string> {
 /**
  * Returns the current bootstrap token. If `SETUP_TOKEN_OVERRIDE` is set, returns
  * it (env-bypass for dev/test). Otherwise reads from
- * `<BAILEYS_AUTH_DIR>/setup-token.txt`. If missing, creates a new 32-hex-char
- * token (mode 0o600) and emits `setup_token_rotated` audit with reason
- * `'cold_start'` (first run) or `'unexpected_missing'` (file vanished after the
- * process already saw a valid token, per spec §9 Error handling).
+ * `<BAILEYS_AUTH_DIR>/setup-token.txt`. If missing OR present-but-corrupted
+ * (empty / not 32-hex), creates a new 32-hex-char token (mode 0o600) and emits
+ * `setup_token_rotated` audit with reason `'cold_start'` (first run) or
+ * `'unexpected_missing'` (file vanished/corrupted after the process already
+ * saw a valid token, per spec §9 Error handling).
  *
  * Atomic create via `flag: 'wx'` — concurrent writers race-safely; the loser
  * re-reads the winner's file (no audit emitted in that branch — the winner
@@ -51,15 +62,28 @@ export async function ensureToken(): Promise<string> {
   if (config.SETUP_TOKEN_OVERRIDE) return config.SETUP_TOKEN_OVERRIDE;
 
   const tokenPath = TOKEN_FILE();
+  let existing: string | null = null;
   try {
-    const token = (await readFile(tokenPath, 'utf-8')).trim();
-    hasInitialised = true;
-    return token;
+    existing = (await readFile(tokenPath, 'utf-8')).trim();
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
   }
 
+  if (existing !== null && VALID_TOKEN_PATTERN.test(existing)) {
+    hasInitialised = true;
+    return existing;
+  }
+
+  // Either ENOENT, empty, or content that doesn't match the canonical
+  // pattern. Rotate. If the file exists with bad content, unlink first so
+  // createTokenFile (flag: 'wx') doesn't trip EEXIST and re-read the bad
+  // value via the race-recovery branch.
   const reason = hasInitialised ? 'unexpected_missing' : 'cold_start';
+  if (existing !== null) {
+    await unlink(tokenPath).catch((err) => {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    });
+  }
   const token = await createTokenFile(tokenPath);
   await audit({ acao: 'setup_token_rotated', metadata: { reason } });
   hasInitialised = true;
@@ -89,8 +113,15 @@ export async function rotateToken(): Promise<string> {
  * leaking the actual length via timing — `timingSafeEqual` would throw on
  * length mismatch, so we check first. The short-circuit is OK because the
  * length of the correct token is itself a public constant (32 chars).
+ *
+ * Defence-in-depth: explicit zero-length reject so that even if `actual`
+ * ever leaks an empty string (corrupted file / tester misuse), an
+ * attacker omitting `?token=` cannot match an empty buffer via
+ * `timingSafeEqual` and authenticate. `ensureToken` is the primary
+ * guardrail (rotates corrupted files); this is the second line.
  */
 export function verifyToken(presented: string, actual: string): boolean {
+  if (presented.length === 0 || actual.length === 0) return false;
   if (presented.length !== actual.length) return false;
   return timingSafeEqual(Buffer.from(presented), Buffer.from(actual));
 }

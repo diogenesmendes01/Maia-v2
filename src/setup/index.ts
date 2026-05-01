@@ -49,7 +49,38 @@ async function authGate(req: FastifyRequest, reply: FastifyReply): Promise<boole
   return true;
 }
 
+/**
+ * The chooser page (`renderChooser`) submits via a plain HTML
+ * `<form method="POST">`, which sends `application/x-www-form-urlencoded`
+ * — Fastify rejects that with 415 unless we register a parser. We register
+ * one inline (no extra dep) and turn the body into a plain object so the
+ * `/setup/start` handler reads `body.method` the same way for both
+ * form-encoded (browser) and JSON (tests / programmatic clients).
+ *
+ * `addContentTypeParser` is idempotent across the same Fastify instance:
+ * a duplicate-registration error throws synchronously and is rethrown as a
+ * setup-time crash, which is fine — `registerSetupRoutes` runs once per
+ * process during boot.
+ */
+function isFormSubmit(req: FastifyRequest): boolean {
+  const ct = req.headers['content-type'] ?? '';
+  return ct.includes('application/x-www-form-urlencoded');
+}
+
 export async function registerSetupRoutes(app: FastifyInstance): Promise<void> {
+  app.addContentTypeParser(
+    'application/x-www-form-urlencoded',
+    { parseAs: 'string' },
+    (_req, body, done) => {
+      try {
+        const parsed = Object.fromEntries(new URLSearchParams(body as string));
+        done(null, parsed);
+      } catch (err) {
+        done(err as Error);
+      }
+    },
+  );
+
   app.get('/setup', async (req, reply) => {
     if (!(await authGate(req, reply))) return;
 
@@ -97,6 +128,16 @@ export async function registerSetupRoutes(app: FastifyInstance): Promise<void> {
     if (!(await authGate(req, reply))) return;
 
     const body = (req.body ?? {}) as { method?: 'qr' | 'code' };
+    const fromForm = isFormSubmit(req);
+    // Browsers submit the chooser as a plain HTML form, so on success/retry
+    // we redirect them back to /setup with the same token. The page then
+    // reflects the new state (chooser still / QR / code) via the existing
+    // polling JS. JSON callers (programmatic / tests) keep getting JSON.
+    const redirectToSetup = (): void => {
+      const token = (req.query as { token?: string }).token ?? '';
+      reply.code(303).header('location', `/setup?token=${encodeURIComponent(token)}`).send();
+    };
+
     if (body.method !== 'qr' && body.method !== 'code') {
       return reply.code(400).type('application/json').send({ ok: false, error: 'invalid_method' });
     }
@@ -109,6 +150,7 @@ export async function registerSetupRoutes(app: FastifyInstance): Promise<void> {
       if (phase !== 'unpaired' && phase !== 'pairing_qr') {
         return reply.code(409).type('application/json').send({ ok: false, phase });
       }
+      if (fromForm) return redirectToSetup();
       return reply.type('application/json').send({ ok: true, phase: setupState.current().phase });
     }
 
@@ -120,6 +162,7 @@ export async function registerSetupRoutes(app: FastifyInstance): Promise<void> {
       const code = await triggerPairingCode(config.WHATSAPP_NUMBER_MAIA);
       setupState.setCode(code);
       await audit({ acao: 'pairing_code_requested' });
+      if (fromForm) return redirectToSetup();
       return reply.type('application/json').send({ ok: true, phase: 'pairing_code' });
     } catch (err) {
       const msg = (err as Error).message;
@@ -127,6 +170,7 @@ export async function registerSetupRoutes(app: FastifyInstance): Promise<void> {
       // socket-null guard in baileys.ts. Substring match would mis-classify any
       // future error containing this token as "retryable".
       if (msg === 'baileys_socket_not_ready') {
+        if (fromForm) return redirectToSetup();
         return reply.code(503).type('application/json').send({ ok: false, retry_after_s: 2 });
       }
       logger.error({ err }, 'setup.trigger_pairing_code_failed');

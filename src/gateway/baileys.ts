@@ -46,10 +46,16 @@ export function isBaileysConnected(): boolean {
  * Throws `baileys_socket_not_ready` if the socket hasn't been initialised
  * yet (boot race: startServer() runs before startBaileys()). Caller (the
  * /setup/start route) translates the throw into 503 + retry_after_s.
+ *
+ * Strips a leading "+" before delegating: Baileys' `requestPairingCode`
+ * pipes the phone through `jidEncode(phone, 's.whatsapp.net')`, so a "+"
+ * leaks into the JID (`+55…@s.whatsapp.net`) and WhatsApp rejects the
+ * request. WhatsApp's pairing-code API expects digits-only.
  */
 export async function triggerPairingCode(phone: string): Promise<string> {
   if (!socket) throw new Error('baileys_socket_not_ready');
-  return socket.requestPairingCode(phone);
+  const normalized = phone.replace(/^\+/, '');
+  return socket.requestPairingCode(normalized);
 }
 
 export function getSocket(): WASocket | null {

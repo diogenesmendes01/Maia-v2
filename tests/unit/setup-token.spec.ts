@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
-import { mkdir, rm, stat, readFile, unlink } from 'node:fs/promises';
+import { mkdir, rm, stat, readFile, writeFile, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -91,6 +91,51 @@ describe('setup-token — ensureToken', () => {
       metadata: { reason: 'unexpected_missing' },
     });
   });
+
+  it('rotates and audits when file exists but is empty (security guard)', async () => {
+    // Without format validation, ensureToken returned '' and verifyToken('', '')
+    // short-circuited via timingSafeEqual to true — authenticating an attacker
+    // who omits the ?token= query param entirely. ensureToken must reject
+    // empty content and rotate the file.
+    const path = join(SANDBOX, 'setup-token.txt');
+    await writeFile(path, '');
+    const { ensureToken } = await import('../../src/setup/token.js');
+    const token = await ensureToken();
+    expect(token).toMatch(/^[0-9a-f]{32}$/);
+    expect(auditMock).toHaveBeenCalledTimes(1);
+    expect(auditMock).toHaveBeenCalledWith({
+      acao: 'setup_token_rotated',
+      metadata: { reason: 'cold_start' },
+    });
+    const fileContent = (await readFile(path, 'utf-8')).trim();
+    expect(fileContent).toBe(token);
+  });
+
+  it('rotates and audits when file content is malformed (not 32 hex chars)', async () => {
+    const path = join(SANDBOX, 'setup-token.txt');
+    await writeFile(path, 'not-a-valid-token-blob\n');
+    const { ensureToken } = await import('../../src/setup/token.js');
+    const token = await ensureToken();
+    expect(token).toMatch(/^[0-9a-f]{32}$/);
+    expect(token).not.toBe('not-a-valid-token-blob');
+    expect(auditMock).toHaveBeenCalledTimes(1);
+    expect(auditMock).toHaveBeenCalledWith({
+      acao: 'setup_token_rotated',
+      metadata: { reason: 'cold_start' },
+    });
+  });
+
+  it('rotates when file has 32 chars but contains non-hex characters', async () => {
+    // Right length, wrong alphabet — caller could not have produced this with
+    // randomBytes(16).toString('hex'). Treat as corruption, rotate.
+    const path = join(SANDBOX, 'setup-token.txt');
+    await writeFile(path, 'ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ\n');
+    const { ensureToken } = await import('../../src/setup/token.js');
+    const token = await ensureToken();
+    expect(token).toMatch(/^[0-9a-f]{32}$/);
+    expect(token).not.toBe('ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ');
+    expect(auditMock).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('setup-token — rotateToken', () => {
@@ -142,5 +187,14 @@ describe('setup-token — verifyToken', () => {
   it('returns false on empty input vs non-empty actual', async () => {
     const { verifyToken } = await import('../../src/setup/token.js');
     expect(verifyToken('', 'abc123')).toBe(false);
+  });
+
+  it('returns false when BOTH presented and actual are empty (regression guard)', async () => {
+    // Without the empty-actual short-circuit, timingSafeEqual on two empty
+    // Buffers returns true, which let an empty/corrupt setup-token.txt
+    // authenticate `/setup` without a ?token= param. Belt-and-suspenders to
+    // the format validation in ensureToken.
+    const { verifyToken } = await import('../../src/setup/token.js');
+    expect(verifyToken('', '')).toBe(false);
   });
 });

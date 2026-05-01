@@ -122,6 +122,65 @@ describe('setup routes — POST /setup/start', () => {
   });
 });
 
+describe('setup routes — POST /setup/start (browser form submit)', () => {
+  // The chooser page (renderChooser) submits via a plain HTML
+  // <form method="POST">, which sends application/x-www-form-urlencoded.
+  // Without these handlers, Fastify rejects the body with 415 and the
+  // operator never sees QR/code — they get a JSON or HTML error instead
+  // of the expected next page. The route must accept the form payload AND
+  // respond with a 303 redirect back to /setup so the page reflects the
+  // resulting state.
+  it('accepts application/x-www-form-urlencoded body (no 415)', async () => {
+    const r = await app.inject({
+      method: 'POST',
+      url: '/setup/start?token=TEST-TOKEN',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      payload: 'method=qr',
+    });
+    expect(r.statusCode).not.toBe(415);
+  });
+
+  it('method=qr (form-encoded) from unpaired returns 303 to /setup with same token', async () => {
+    const r = await app.inject({
+      method: 'POST',
+      url: '/setup/start?token=TEST-TOKEN',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      payload: 'method=qr',
+    });
+    expect(r.statusCode).toBe(303);
+    expect(r.headers.location).toBe('/setup?token=TEST-TOKEN');
+  });
+
+  it('method=code (form-encoded) calls triggerPairingCode and 303-redirects', async () => {
+    triggerPairingCode.mockResolvedValueOnce('12345678');
+    const r = await app.inject({
+      method: 'POST',
+      url: '/setup/start?token=TEST-TOKEN',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      payload: 'method=code',
+    });
+    expect(triggerPairingCode).toHaveBeenCalledWith('+5511999999999');
+    expect(r.statusCode).toBe(303);
+    expect(r.headers.location).toBe('/setup?token=TEST-TOKEN');
+  });
+
+  it('method=code (form-encoded) on baileys_socket_not_ready also 303-redirects', async () => {
+    // For form clients, a 503 JSON response would surface as a raw error
+    // page in the browser. Redirect instead — the chooser will still render,
+    // letting the operator click again once the socket finishes booting.
+    triggerPairingCode.mockRejectedValueOnce(new Error('baileys_socket_not_ready'));
+    const r = await app.inject({
+      method: 'POST',
+      url: '/setup/start?token=TEST-TOKEN',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      payload: 'method=code',
+    });
+    expect(r.statusCode).toBe(303);
+    expect(r.headers.location).toBe('/setup?token=TEST-TOKEN');
+  });
+
+});
+
 describe('setup routes — phase-dependent rendering', () => {
   // Note: the public state-machine API only allows entering pairing_qr with a
   // non-null qr (`setQr(qr: string)`). The qr=null branch in renderQr exists
