@@ -46,12 +46,12 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    env_file:
+      - .env
     environment:
       NODE_ENV: ${NODE_ENV:-production}
       DATABASE_URL: postgres://${POSTGRES_USER:-maia}:${POSTGRES_PASSWORD:-maia}@postgres:5432/${POSTGRES_DB:-maia}
       REDIS_URL: redis://redis:6379
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
-      OPENAI_API_KEY: ${OPENAI_API_KEY}
       TZ: America/Sao_Paulo
     ports:
       - "${APP_PORT:-3000}:3000"

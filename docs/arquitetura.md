@@ -81,6 +81,8 @@ A inteligência **não está no LLM** (que é stateless). Está no **sistema ao 
 
 A função `buildContext(conversa, escopo)` monta o prompt **selecionando dinamicamente** o que importa de cada camada.
 
+> **Nota de implementação.** As 5 "camadas" de memória (`episodic`, `semantic`, `procedural`, `working`, `vector`) são fachadas finas sobre Postgres+pgvector e Redis. Eviction, TTL e ranking ficam delegados ao banco/Redis, não à camada de memória. Expansão (LRU em working, ranking ponderado em semantic) fica como evolução futura.
+
 ### 3.2 Loop de raciocínio (ReAct + Reflexão)
 
 ```

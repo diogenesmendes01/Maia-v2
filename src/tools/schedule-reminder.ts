@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type { Tool } from './_registry.js';
 import { factsRepo } from '@/db/repositories.js';
@@ -25,7 +26,7 @@ export const scheduleReminderTool: Tool<typeof inputSchema, typeof outputSchema>
   operation_type: 'create',
   audit_action: 'reminder_scheduled',
   handler: async (args, ctx) => {
-    const id = 'rem-' + Math.random().toString(36).slice(2, 10);
+    const id = 'rem-' + randomUUID();
     await factsRepo.upsert({
       escopo: `pessoa:${ctx.pessoa.id}`,
       chave: `reminder.${id}`,

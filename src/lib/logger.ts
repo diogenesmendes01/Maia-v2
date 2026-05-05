@@ -22,6 +22,23 @@ const REDACT_PATHS = [
   'config.POSTGRES_PASSWORD',
   'pessoa.telefone_whatsapp',
   'telefone_whatsapp',
+  '*.conteudo',
+  'conteudo',
+  '*.valor',
+  'valor',
+  '*.valor_aprox',
+  'valor_aprox',
+  '*.cpf',
+  'cpf',
+  '*.cnpj',
+  'cnpj',
+  'pessoa.nome',
+  'pessoa.apelido',
+  'mensagem.conteudo',
+  'transacao.valor',
+  'transacao.descricao',
+  'metadata.payload',
+  'metadata.args',
 ];
 
 export const logger = pino({

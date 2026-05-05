@@ -63,3 +63,90 @@ jobs:
         # `--max-warnings=0` would flip warnings to failures; we keep them as
         # warnings for now so existing code can be cleaned incrementally.
         run: npm run lint
+
+  secret-scan:
+    name: gitleaks (secret scan)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  integration:
+    name: integration + e2e (continue-on-error)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # First-iteration safety net: the integration suite has never run on CI
+    # before (TEST_DB_URL was always unset, so the tests skipped). Allow this
+    # job to fail without blocking PRs while we stabilise it.
+    # TODO: remover quando integration estiver verde de forma consistente.
+    continue-on-error: true
+    services:
+      postgres:
+        # pgvector/pgvector:pg16 ships pgvector preinstalled. The image is
+        # based on the official postgres image so pg_isready is available
+        # for the health-check.
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: maia_test
+          POSTGRES_PASSWORD: test1234
+          POSTGRES_DB: maia_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U maia_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Mirror of the `validate` job env (config validation runs at module
+      # load, so every required var must be present), plus TEST_DB_URL so
+      # the integration suite stops short-circuiting via skip().
+      NODE_ENV: test
+      DATABASE_URL: postgres://maia_test:test1234@localhost:5432/maia_test
+      TEST_DB_URL: postgres://maia_test:test1234@localhost:5432/maia_test
+      POSTGRES_USER: maia_test
+      POSTGRES_PASSWORD: test1234
+      POSTGRES_DB: maia_test
+      REDIS_URL: redis://localhost:6379
+      ANTHROPIC_API_KEY: sk-ant-test-placeholder
+      OPENROUTER_API_KEY: sk-or-test-placeholder
+      WHATSAPP_NUMBER_MAIA: '+5500000000000'
+      OWNER_TELEFONE_WHATSAPP: '+5511111111111'
+      OWNER_NOME: Test Owner
+      VOYAGE_API_KEY: test-voyage-key
+      ALERT_CHANNELS: log
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Apply migrations
+        # Service container health-checks gate startup, so by the time this
+        # step runs Postgres is accepting connections.
+        run: npm run db:migrate
+
+      - name: Run integration tests
+        run: npm run test:integration
+
+      - name: Run e2e tests
+        run: npm run test:e2e
