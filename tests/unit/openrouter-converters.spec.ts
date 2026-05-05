@@ -132,7 +132,6 @@ describe('openrouter converters', () => {
   });
 
   it('fromOpenAIResponse maps stop -> end_turn and length -> max_tokens', async () => {
-    const { fromOpenAIResponse } = await import('../../src/lib/claude.js');
     const stopRes = {
       id: 'r2', object: 'chat.completion', created: 0, model: 'm',
       choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: 'ok' } }],

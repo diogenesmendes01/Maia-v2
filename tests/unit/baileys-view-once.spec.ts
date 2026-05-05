@@ -3,6 +3,25 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 const sendMessage = vi.fn();
 const fakeSocket = { sendMessage };
 
+// Mock Redis module before any imports that transitively touch ioredis,
+// so the singleton in src/lib/redis.ts never tries to open a real socket
+// (which on hosts without Redis emits ECONNREFUSED ::1:6379 noise).
+vi.mock('../../src/lib/redis.js', () => ({
+  redis: {
+    get: vi.fn().mockResolvedValue(null),
+    set: vi.fn().mockResolvedValue('OK'),
+    del: vi.fn().mockResolvedValue(0),
+    exists: vi.fn().mockResolvedValue(0),
+    expire: vi.fn().mockResolvedValue(0),
+    incr: vi.fn().mockResolvedValue(1),
+    zadd: vi.fn().mockResolvedValue(0),
+    zcard: vi.fn().mockResolvedValue(0),
+    zremrangebyscore: vi.fn().mockResolvedValue(0),
+  },
+  isRedisConnected: () => false,
+  ensureRedisConnect: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock('@whiskeysockets/baileys', () => ({
   default: () => fakeSocket,
   DisconnectReason: {},
