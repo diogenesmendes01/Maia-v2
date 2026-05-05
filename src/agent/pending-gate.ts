@@ -29,6 +29,7 @@ type ClassifyOut = {
 export type Classifier = (
   snapshot: { pergunta: string; opcoes_validas: unknown },
   inbound: Mensagem,
+  pessoa: Pessoa,
 ) => Promise<ClassifyOut | null>;
 
 let _classifier: Classifier;
@@ -36,6 +37,7 @@ let _classifier: Classifier;
 async function haikuClassifier(
   snapshot: { pergunta: string; opcoes_validas: unknown },
   inbound: Mensagem,
+  pessoa: Pessoa,
 ): Promise<ClassifyOut | null> {
   const opts = snapshot.opcoes_validas as Array<{ key: string; label: string }>;
   const system =
@@ -53,6 +55,7 @@ async function haikuClassifier(
       messages: [{ role: 'user', content: user }],
       max_tokens: 200,
       temperature: 0,
+      pessoa_id: pessoa.id,
     });
     const text = res.content?.trim() ?? '';
     const m = text.match(/\{[\s\S]*\}/);
@@ -88,7 +91,7 @@ export async function checkPendingFirst(input: {
   if (!snapshot) return { kind: 'no_pending' };
 
   // Step 2: classify (OUTSIDE the lock)
-  const resolution = await _classifier(snapshot, input.inbound);
+  const resolution = await _classifier(snapshot, input.inbound, input.pessoa);
   if (!resolution) return { kind: 'unresolved', reason: 'low_confidence' };
 
   return await applyTx(snapshot.id, snapshot, resolution, input);
