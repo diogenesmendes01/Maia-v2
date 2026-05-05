@@ -2,6 +2,7 @@ import { z } from 'zod';
 import type { Tool } from './_registry.js';
 import { parseImage } from '@/lib/vision.js';
 import { getCachedVision, setCachedVision } from './_vision-cache.js';
+import { wrapWithTag } from '@/agent/sanitize.js';
 
 const inputSchema = z.object({
   media_local_path: z.string().min(1),
@@ -55,7 +56,9 @@ export const parseReceiptTool: Tool<typeof inputSchema, typeof outputSchema> = {
       tipo: result.tipo,
       valor: result.valor,
       data: result.data,
-      beneficiario_nome: result.beneficiario_nome,
+      beneficiario_nome: result.beneficiario_nome
+        ? wrapWithTag(result.beneficiario_nome, 'ocr')
+        : undefined,
       beneficiario_documento: result.beneficiario_documento,
       beneficiario_chave_pix: result.beneficiario_chave_pix,
       banco_origem: result.banco_origem,

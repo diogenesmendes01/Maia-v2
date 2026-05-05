@@ -2,6 +2,7 @@ import { z } from 'zod';
 import type { Tool } from './_registry.js';
 import { parseLinhaDigitavel, isValidLinhaDigitavel, BANCOS_CODIGO } from '@/lib/brazilian.js';
 import { parseImage } from '@/lib/vision.js';
+import { wrapWithTag } from '@/agent/sanitize.js';
 
 const inputSchema = z.object({
   media_local_path: z.string().min(1),
@@ -46,7 +47,9 @@ export const parseBoletoTool: Tool<typeof inputSchema, typeof outputSchema> = {
       codigo_barras: parsed?.codigo_barras,
       valor: parsed?.valor ?? result.valor,
       vencimento: parsed?.vencimento_data ?? result.vencimento,
-      beneficiario_nome: result.beneficiario_nome,
+      beneficiario_nome: result.beneficiario_nome
+        ? wrapWithTag(result.beneficiario_nome, 'ocr')
+        : undefined,
       beneficiario_cnpj_cpf: result.beneficiario_cnpj_cpf,
       banco_emissor_codigo: parsed?.banco_codigo,
       banco_emissor_nome: parsed?.banco_codigo ? BANCOS_CODIGO[parsed.banco_codigo] : undefined,

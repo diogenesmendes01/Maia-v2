@@ -11,6 +11,7 @@ import type { Pessoa, Conversa, Mensagem } from '@/db/schema.js';
 import type { ResolvedPermission } from '@/governance/permissions.js';
 import { fmtBR } from '@/lib/brazilian.js';
 import type { LLMMessage } from '@/lib/claude.js';
+import { sanitizeBlock } from './sanitize.js';
 
 const LLM_BOUNDARIES = `
 Você é uma camada de interpretação. Você NÃO PODE:
@@ -70,16 +71,6 @@ export function wrapRule(text: string): string {
   return `<rule>${sanitizeBlock(text)}</rule>`;
 }
 
-const PROTECTED_TAGS = ['user_message', 'ocr', 'audio_transcript', 'fact', 'rule'] as const;
-
-function sanitizeBlock(text: string): string {
-  let out = text ?? '';
-  for (const tag of PROTECTED_TAGS) {
-    // Replace literal closing tags so user content cannot break out of its wrapper.
-    out = out.split(`</${tag}>`).join(`</${tag}_>`);
-  }
-  return out;
-}
 
 export type PromptContext = {
   pessoa: Pessoa;

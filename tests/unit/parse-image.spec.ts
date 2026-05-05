@@ -84,6 +84,7 @@ describe('parse_image — decision tree', () => {
     );
     expect(out.kind).toBe('receipt');
     expect(out.receipt?.tipo).toBe('pix');
+    expect(out.receipt?.beneficiario_nome).toBe('<ocr>João</ocr>');
     expect(out.confianca).toBe(0.85);
     expect(visionMock).toHaveBeenCalledTimes(2);
   });
@@ -101,6 +102,7 @@ describe('parse_image — decision tree', () => {
     );
     expect(out.kind).toBe('receipt');
     expect(out.receipt?.valor).toBe(25);
+    expect(out.receipt?.beneficiario_nome).toBe('<ocr>Maria</ocr>');
     expect(out.confianca).toBe(0.85);
     expect(visionMock).toHaveBeenCalledTimes(2);
   });
@@ -129,7 +131,7 @@ describe('parse_image — decision tree', () => {
       fakeCtx,
     );
     expect(out.kind).toBe('receipt');
-    expect(out.receipt?.beneficiario_nome).toBe('Pedro');
+    expect(out.receipt?.beneficiario_nome).toBe('<ocr>Pedro</ocr>');
     expect(out.confianca).toBe(0.6);
   });
 
@@ -160,6 +162,7 @@ describe('parse_receipt — direct', () => {
       fakeCtx,
     );
     expect(out.confianca).toBe(0.85);
+    expect(out.beneficiario_nome).toBe('<ocr>Ana</ocr>');
     expect(out.banco_origem).toBe('Itau');
     expect(out.banco_destino).toBe('BB');
   });
@@ -182,6 +185,7 @@ describe('parse_receipt — direct', () => {
       fakeCtx,
     );
     expect(out.confianca).toBe(0.6);
+    expect(out.beneficiario_nome).toBe('<ocr>Joana</ocr>');
   });
 
   it('returns confianca 0 when vision yields nothing', async () => {

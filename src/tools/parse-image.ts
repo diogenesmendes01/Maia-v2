@@ -4,6 +4,7 @@ import { parseImage as visionParse } from '@/lib/vision.js';
 import { isValidLinhaDigitavel, parseLinhaDigitavel, BANCOS_CODIGO } from '@/lib/brazilian.js';
 import { logger } from '@/lib/logger.js';
 import { getCachedVision, setCachedVision } from './_vision-cache.js';
+import { wrapWithTag } from '@/agent/sanitize.js';
 
 const inputSchema = z.object({
   media_local_path: z.string().min(1),
@@ -80,7 +81,9 @@ export const parseImageTool: Tool<typeof inputSchema, typeof outputSchema> = {
             codigo_barras: parsed?.codigo_barras,
             valor: parsed?.valor ?? boletoRaw.valor,
             vencimento: parsed?.vencimento_data ?? boletoRaw.vencimento,
-            beneficiario_nome: boletoRaw.beneficiario_nome,
+            beneficiario_nome: boletoRaw.beneficiario_nome
+              ? wrapWithTag(boletoRaw.beneficiario_nome, 'ocr')
+              : undefined,
             beneficiario_cnpj_cpf: boletoRaw.beneficiario_cnpj_cpf,
             banco_emissor_codigo: parsed?.banco_codigo,
             banco_emissor_nome: parsed?.banco_codigo
@@ -108,7 +111,9 @@ export const parseImageTool: Tool<typeof inputSchema, typeof outputSchema> = {
           tipo: receiptRaw.tipo,
           valor: receiptRaw.valor,
           data: receiptRaw.data,
-          beneficiario_nome: receiptRaw.beneficiario_nome,
+          beneficiario_nome: receiptRaw.beneficiario_nome
+            ? wrapWithTag(receiptRaw.beneficiario_nome, 'ocr')
+            : undefined,
           beneficiario_documento: receiptRaw.beneficiario_documento,
           beneficiario_chave_pix: receiptRaw.beneficiario_chave_pix,
           banco_origem: receiptRaw.banco_origem,
