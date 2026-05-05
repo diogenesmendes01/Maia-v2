@@ -10,6 +10,7 @@ import { runReflectionBatch } from './reflection-batch.js';
 import { runMessageRecovery } from './message-recovery.js';
 import { runPendingReminder } from './pending-reminder.js';
 import { runNightlyBackup } from './backup.js';
+import { runBackupRotate } from './backup-rotate.js';
 import { runCostMonitor } from './cost-monitor.js';
 import { runAuditWatcher } from './audit-watcher.js';
 import { runDlqMonitor } from './dlq-monitor.js';
@@ -29,6 +30,7 @@ const JOBS: Job[] = [
   { name: 'idempotency_cleanup', cron: '0 4 * * *', fn: runIdempotencyCleanup, phase: 1 },
   { name: 'inactivity_sweep', cron: '0 3 * * *', fn: runInactivitySweep, phase: 1 },
   { name: 'nightly_backup', cron: '0 3 * * *', fn: runNightlyBackup, phase: 1 },
+  { name: 'backup_rotate', cron: '0 4 * * 0', fn: runBackupRotate, phase: 1 },
   { name: 'cost_monitor', cron: '30 2 * * *', fn: runCostMonitor, phase: 1 },
   { name: 'dlq_monitor', cron: '*/5 * * * *', fn: runDlqMonitor, phase: 1 },
   { name: 'conversation_summarizer', cron: '0 2 * * *', fn: runConversationSummarizer, phase: 2 },

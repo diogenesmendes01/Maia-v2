@@ -72,6 +72,10 @@ const envSchema = z
     BACKUP_RETENTION_LOCAL_DAYS: z.coerce.number().int().positive().default(7),
     BACKUP_RETENTION_CLOUD_DAYS: z.coerce.number().int().positive().default(30),
     BACKUP_S3_BUCKET: z.string().optional(),
+    BACKUP_S3_ENDPOINT: z.string().url().optional(),
+    BACKUP_S3_ACCESS_KEY: z.string().optional(),
+    BACKUP_S3_SECRET_KEY: z.string().optional(),
+    BACKUP_S3_REGION: z.string().default('us-east-1'),
 
     DAILY_LLM_USD_THRESHOLD: z.coerce.number().positive().default(5),
     DLQ_ALERT_THRESHOLD: z.coerce.number().int().positive().default(10),
@@ -176,6 +180,20 @@ const envSchema = z
         code: z.ZodIssueCode.custom,
         message: 'OWNER_TELEFONE_WHATSAPP must differ from WHATSAPP_NUMBER_MAIA',
       });
+    }
+    if (cfg.BACKUP_S3_BUCKET) {
+      if (!cfg.BACKUP_S3_ACCESS_KEY) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'BACKUP_S3_ACCESS_KEY required when BACKUP_S3_BUCKET is set',
+        });
+      }
+      if (!cfg.BACKUP_S3_SECRET_KEY) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'BACKUP_S3_SECRET_KEY required when BACKUP_S3_BUCKET is set',
+        });
+      }
     }
   });
 

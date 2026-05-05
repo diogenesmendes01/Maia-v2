@@ -1,10 +1,11 @@
 import { spawn } from 'node:child_process';
 import { mkdirSync, readdirSync, statSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, basename } from 'node:path';
 import { config } from '@/config/env.js';
 import { audit } from '@/governance/audit.js';
 import { sendAlert } from '@/lib/alerts.js';
 import { logger } from '@/lib/logger.js';
+import { uploadBackup } from '@/lib/s3-backup.js';
 
 function tsName(): string {
   return `maia-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.dump`;
@@ -36,12 +37,35 @@ export async function runNightlyBackup(): Promise<void> {
   }
 
   pruneLocal();
+
+  let s3_url: string | undefined;
   if (!config.BACKUP_S3_BUCKET) {
     logger.warn('backup.no_s3_bucket — local-only backup');
+  } else if (!config.BACKUP_S3_ACCESS_KEY) {
+    // Defensive: env validation already enforces this, but a missing key here
+    // means a misconfigured override at runtime — log and skip rather than
+    // crash the whole nightly job.
+    logger.warn(
+      { bucket: config.BACKUP_S3_BUCKET },
+      'backup.s3_skipped_missing_credentials',
+    );
   } else {
-    // Upload deferred to a follow-up PR; spec 17 §11.2 acceptable as Phase 1.
-    logger.info({ bucket: config.BACKUP_S3_BUCKET }, 'backup.s3_upload_pending');
+    try {
+      const key = `maia/${basename(file)}`;
+      s3_url = await uploadBackup(file, key);
+      logger.info({ s3_url }, 'backup.s3_upload_ok');
+    } catch (err) {
+      const message = (err as Error).message;
+      logger.error({ err: message }, 'backup.s3_upload_failed');
+      await audit({
+        acao: 'backup_s3_upload_failed',
+        metadata: { file, error: message },
+      });
+      // Do not return: local backup succeeded; cloud failure is degraded but
+      // not fatal. backup_completed will still be emitted (without s3_url).
+    }
   }
+
   const size = (() => {
     try {
       return statSync(file).size;
@@ -49,8 +73,11 @@ export async function runNightlyBackup(): Promise<void> {
       return 0;
     }
   })();
-  await audit({ acao: 'backup_completed', metadata: { file, size_bytes: size } });
-  logger.info({ file, size_bytes: size }, 'backup.completed');
+  await audit({
+    acao: 'backup_completed',
+    metadata: { file, size_bytes: size, ...(s3_url ? { s3_url } : {}) },
+  });
+  logger.info({ file, size_bytes: size, s3_url }, 'backup.completed');
 }
 
 function runPgDump(target: string): Promise<void> {
