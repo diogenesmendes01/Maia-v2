@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { canonicalize, canonicalJSON, trigramSim, bucket5min, sha256 } from '../../src/lib/utils.js';
+import { canonicalJSON, trigramSim, bucket5min, sha256 } from '../../src/lib/utils.js';
 
 describe('utils — canonicalize', () => {
   it('ordena chaves', () => {

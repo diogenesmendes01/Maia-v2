@@ -48,6 +48,7 @@ export interface LLMProvider {
     temperature?: number;
     max_tokens?: number;
     model?: string;
+    pessoa_id?: string;
   }): Promise<LLMResponse>;
 }
 
@@ -74,6 +75,7 @@ class AnthropicProvider implements LLMProvider {
     temperature?: number;
     max_tokens?: number;
     model?: string;
+    pessoa_id?: string;
   }): Promise<LLMResponse> {
     const model = params.model ?? config.CLAUDE_MODEL_MAIN;
     const start = Date.now();
@@ -101,6 +103,7 @@ class AnthropicProvider implements LLMProvider {
       model,
       tokens_input: res.usage.input_tokens,
       tokens_output: res.usage.output_tokens,
+      pessoa_id: params.pessoa_id,
     }).catch(() => undefined);
     return {
       content: textOut,
@@ -232,6 +235,7 @@ class OpenRouterProvider implements LLMProvider {
     temperature?: number;
     max_tokens?: number;
     model?: string;
+    pessoa_id?: string;
   }): Promise<LLMResponse> {
     const model = params.model ?? config.OPENROUTER_MODEL_MAIN;
     const start = Date.now();
@@ -252,6 +256,7 @@ class OpenRouterProvider implements LLMProvider {
       model,
       tokens_input: out.usage.input_tokens,
       tokens_output: out.usage.output_tokens,
+      pessoa_id: params.pessoa_id,
     }).catch(() => undefined);
     return out;
   }
@@ -275,6 +280,13 @@ export async function callLLM(params: {
   tools?: ToolSchema[];
   temperature?: number;
   max_tokens?: number;
+  /**
+   * Optional pessoa identifier so `recordLLMCost` can produce a per-pessoa
+   * breakdown. When omitted the cost is only attributed to the global daily
+   * aggregate. Workers without a pessoa context (briefings, reflection-batch,
+   * conversation-summarizer) intentionally don't pass this.
+   */
+  pessoa_id?: string;
 }): Promise<LLMResponse> {
   // Read current model selection from facts (operator-changeable via dashboard).
   // Falls back to env defaults on miss or DB hiccup.

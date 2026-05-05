@@ -71,4 +71,7 @@ async function main() {
   console.log('migrations done');
 }
 
-main();
+main().catch((err) => {
+  console.error('migrate failed:', err);
+  process.exit(1);
+});

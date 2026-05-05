@@ -106,13 +106,30 @@ export default [
       parserOptions: {
         ecmaVersion: 2022,
         sourceType: 'module',
+        // Type-aware parser (typescript-eslint v8 projectService API).
+        // Required by @typescript-eslint/no-floating-promises. Slower than the
+        // pure syntactic parser but typescript-eslint v8 keeps it well under
+        // 60s for this codebase. Falls back gracefully for files outside the
+        // tsconfig (e.g. config files, which are ignored above).
+        // We use an explicit tsconfig.eslint.json (not projectService) because
+        // the build tsconfig excludes tests/ and scripts/, but the lint must
+        // type-check them too. tsconfig.eslint.json extends the build one and
+        // adds those globs.
+        project: ['./tsconfig.eslint.json'],
+        tsconfigRootDir: import.meta.dirname,
       },
       globals: NODE_GLOBALS,
     },
     plugins: {
       '@typescript-eslint': tsPlugin,
     },
-    rules: TS_RULES,
+    rules: {
+      ...TS_RULES,
+      // Floating promises silently swallow errors in queue/cron/event-handler
+      // hot paths. Warn for now; promote to error once warnings hit zero
+      // across all files (see docs/eslint-floating-promises-pending.md).
+      '@typescript-eslint/no-floating-promises': 'warn',
+    },
   },
 
   // Test files (Node globals + Vitest globals)
@@ -123,13 +140,22 @@ export default [
       parserOptions: {
         ecmaVersion: 2022,
         sourceType: 'module',
+        // We use an explicit tsconfig.eslint.json (not projectService) because
+        // the build tsconfig excludes tests/ and scripts/, but the lint must
+        // type-check them too. tsconfig.eslint.json extends the build one and
+        // adds those globs.
+        project: ['./tsconfig.eslint.json'],
+        tsconfigRootDir: import.meta.dirname,
       },
       globals: { ...NODE_GLOBALS, ...VITEST_GLOBALS },
     },
     plugins: {
       '@typescript-eslint': tsPlugin,
     },
-    rules: TS_RULES,
+    rules: {
+      ...TS_RULES,
+      '@typescript-eslint/no-floating-promises': 'warn',
+    },
   },
 
   // CommonJS scripts (rare here but defensive)

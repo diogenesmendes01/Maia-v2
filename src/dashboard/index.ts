@@ -1,8 +1,8 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { db } from '@/db/client.js';
-import { dashboard_sessions, pessoas, entidades, contas_bancarias, transacoes, audit_log } from '@/db/schema.js';
+import { dashboard_sessions, pessoas, entidades, contas_bancarias, transacoes, audit_log, agent_facts } from '@/db/schema.js';
 import type { Pessoa } from '@/db/schema.js';
-import { eq, and, gt, isNull, inArray, desc, sql } from 'drizzle-orm';
+import { eq, and, gt, isNull, inArray, desc, sql, like } from 'drizzle-orm';
 import { sha256, uuid } from '@/lib/utils.js';
 import { resolveScope, isOwnerType, profileAllows, type ResolvedPermission } from '@/governance/permissions.js';
 import type { ActionKey } from '@/governance/audit-actions.js';
@@ -85,7 +85,8 @@ export async function registerDashboardRoutes(app: FastifyInstance): Promise<voi
       ? await db.select().from(entidades).where(inArray(entidades.id, visibleIds))
       : [];
     const canSeeAudit = isOwnerType(p) && hasAnyAction(scope, 'read_audit');
-    const html = await renderDashboard(p.nome, ents, visibleIds, canSeeAudit);
+    const canSeeCost = isOwnerType(p);
+    const html = await renderDashboard(p.nome, ents, visibleIds, canSeeAudit, canSeeCost);
     reply.type('text/html').send(html);
   });
 
@@ -161,6 +162,20 @@ export async function registerDashboardRoutes(app: FastifyInstance): Promise<voi
       return;
     }
     reply.type('text/html').send(await renderAuditView(ctx.p.nome));
+  });
+
+  app.get('/dashboard/cost-by-pessoa', async (req, reply) => {
+    const ctx = await requireScope(req, reply);
+    if (!ctx) return;
+    // Same gate as audit/llm-settings: only owners see cost breakdowns.
+    if (!isOwnerType(ctx.p)) {
+      reply
+        .code(403)
+        .type('text/html')
+        .send('<h1>Apenas donos podem ver o breakdown de custo por pessoa</h1>');
+      return;
+    }
+    reply.type('text/html').send(await renderCostByPessoa(ctx.p.nome));
   });
 
   app.get('/dashboard/llm-settings', async (req, reply) => {
@@ -306,6 +321,7 @@ async function renderDashboard(
   ents: Array<{ id: string; nome: string }>,
   entIds: string[],
   canSeeAudit: boolean,
+  canSeeCost: boolean = false,
 ): Promise<string> {
   if (entIds.length === 0) return `<html><body><h1>Olá, ${nome}</h1><p>Sem entidades acessíveis.</p></body></html>`;
   const contas = await db.select().from(contas_bancarias).where(inArray(contas_bancarias.entidade_id, entIds));
@@ -346,6 +362,7 @@ ${txns
 </table>
 <p>
   ${canSeeAudit ? `<a href="/dashboard/audit">Auditoria</a> ·` : ''}
+  ${canSeeCost ? `<a href="/dashboard/cost-by-pessoa">Custo LLM por pessoa</a> ·` : ''}
   <form method="post" action="/dashboard/logout" style="display:inline"><button type="submit">Sair</button></form>
 </p>
 <p><small>read-only. Tudo que aparece aqui está auditado.</small></p>
@@ -444,6 +461,88 @@ ${events
   )
   .join('')}
 </table>
+<p><small>Sessão: ${escape(pessoaNome)}.</small></p>
+</body></html>`;
+}
+
+async function renderCostByPessoa(pessoaNome: string): Promise<string> {
+  const day = new Date().toISOString().slice(0, 10);
+  // Per-pessoa daily cost facts are written by `cost-ledger.ts` under
+  // (escopo='pessoa', chave='cost.daily.llm.${day}.${pessoa_id}'). The
+  // pessoa_id is also embedded in the JSON `valor`, but we LIKE-match the
+  // chave for filter pushdown to keep the query cheap.
+  const rows = await db
+    .select()
+    .from(agent_facts)
+    .where(
+      and(
+        eq(agent_facts.escopo, 'pessoa'),
+        like(agent_facts.chave, `cost.daily.llm.${day}.%`),
+      ),
+    );
+  type PessoaCost = {
+    pessoa_id: string;
+    nome: string;
+    tokens_input: number;
+    tokens_output: number;
+    usd: number;
+  };
+  const breakdown: PessoaCost[] = [];
+  if (rows.length > 0) {
+    const ids = rows
+      .map((r) => {
+        const v = (r.valor ?? {}) as { pessoa_id?: string };
+        if (typeof v.pessoa_id === 'string') return v.pessoa_id;
+        // Back-compat: derive pessoa_id from the chave suffix.
+        const idx = r.chave.lastIndexOf('.');
+        return idx >= 0 ? r.chave.slice(idx + 1) : '';
+      })
+      .filter((s) => s.length > 0);
+    const pessoaRows = ids.length
+      ? await db.select().from(pessoas).where(inArray(pessoas.id, ids))
+      : [];
+    const nameById = new Map(pessoaRows.map((p) => [p.id, p.nome]));
+    for (const r of rows) {
+      const v = (r.valor ?? {}) as {
+        pessoa_id?: string;
+        tokens_input?: number;
+        tokens_output?: number;
+        usd_cents?: number;
+      };
+      const pid = v.pessoa_id ?? r.chave.slice(r.chave.lastIndexOf('.') + 1);
+      breakdown.push({
+        pessoa_id: pid,
+        nome: nameById.get(pid) ?? '(desconhecido)',
+        tokens_input: v.tokens_input ?? 0,
+        tokens_output: v.tokens_output ?? 0,
+        usd: (v.usd_cents ?? 0) / 100,
+      });
+    }
+    breakdown.sort((a, b) => b.usd - a.usd);
+  }
+  const totalUsd = breakdown.reduce((s, r) => s + r.usd, 0);
+  const totalIn = breakdown.reduce((s, r) => s + r.tokens_input, 0);
+  const totalOut = breakdown.reduce((s, r) => s + r.tokens_output, 0);
+  return `<!DOCTYPE html>
+<html lang="pt-BR"><head><meta charset="utf-8"><title>Custo LLM por pessoa — ${escape(day)}</title>
+${baseStyle()}</head><body>
+<p><a href="/dashboard">← Voltar</a></p>
+<h1>Custo LLM por pessoa <small style="color:#777">${escape(day)} (UTC)</small></h1>
+${
+  breakdown.length === 0
+    ? `<p><em>Sem registros de custo por pessoa para hoje.</em></p>`
+    : `<table>
+<tr><th>Pessoa</th><th class="r">Tokens entrada</th><th class="r">Tokens saída</th><th class="r">USD do dia</th></tr>
+${breakdown
+  .map(
+    (r) =>
+      `<tr><td>${escape(r.nome)}</td><td class="r">${r.tokens_input.toLocaleString('pt-BR')}</td><td class="r">${r.tokens_output.toLocaleString('pt-BR')}</td><td class="r">$${r.usd.toFixed(4)}</td></tr>`,
+  )
+  .join('')}
+<tr><td><strong>Total atribuído</strong></td><td class="r"><strong>${totalIn.toLocaleString('pt-BR')}</strong></td><td class="r"><strong>${totalOut.toLocaleString('pt-BR')}</strong></td><td class="r"><strong>$${totalUsd.toFixed(4)}</strong></td></tr>
+</table>
+<p><small>Workers sem contexto de pessoa (briefings, resumo de conversa, reflexão noturna) caem no agregado global em <code>cost.daily.llm.${escape(day)}</code>.</small></p>`
+}
 <p><small>Sessão: ${escape(pessoaNome)}.</small></p>
 </body></html>`;
 }

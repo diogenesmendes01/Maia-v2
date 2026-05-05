@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { contasRepo, transacoesRepo, contrapartesRepo, categoriasRepo } from '@/db/repositories.js';
+import { contasRepo, transacoesRepo, categoriasRepo } from '@/db/repositories.js';
 import type { Tool } from './_registry.js';
 import { trigramSim } from '@/lib/utils.js';
 import { TypedError } from '@/lib/utils.js';
@@ -89,7 +89,7 @@ export const registerTransactionTool: Tool<typeof inputSchema, typeof outputSche
       categoria_id = generic?.id ?? null;
     }
 
-    let contraparte_id = args.contraparte_id ?? null;
+    const contraparte_id = args.contraparte_id ?? null;
     if (!contraparte_id && args.contraparte_nome) {
       // Optionally lookup or fallback to text-only field; do not auto-create here (4-eyes).
     }

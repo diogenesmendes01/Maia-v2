@@ -5,4 +5,7 @@ async function main() {
   console.log('seed: nothing to do (categorias seeded in 001_initial.sql)');
 }
 
-main();
+main().catch((err) => {
+  console.error('seed failed:', err);
+  process.exit(1);
+});

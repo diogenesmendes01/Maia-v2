@@ -10,7 +10,7 @@ import { Boom } from '@hapi/boom';
 import qrcodeTerminal from 'qrcode-terminal';
 import { mkdirSync, writeFileSync, existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import { join, dirname } from 'node:path';
+import { join } from 'node:path';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 import { sha256 } from '@/lib/utils.js';

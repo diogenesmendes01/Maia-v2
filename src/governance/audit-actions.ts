@@ -45,6 +45,8 @@ export const AUDIT_ACTIONS = [
   'config_loaded',
   'backup_completed',
   'backup_failed',
+  'backup_s3_upload_failed',
+  'backup_cloud_rotated',
   'restore_test_passed',
   'restore_test_failed',
   'whatsapp_connected',

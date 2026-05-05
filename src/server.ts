@@ -6,10 +6,12 @@ import { registerDashboardRoutes } from '@/dashboard/index.js';
 import { renderPrometheus, setGaugeProvider } from '@/lib/metrics.js';
 import { isRedisConnected } from '@/lib/redis.js';
 import { isBaileysConnected } from '@/gateway/baileys.js';
+import { isDbConnected } from '@/db/client.js';
 
 export async function buildServer() {
   const app = Fastify({ logger: false });
 
+  setGaugeProvider('maia_db_connected', () => (isDbConnected() ? 1 : 0));
   setGaugeProvider('maia_redis_connected', () => (isRedisConnected() ? 1 : 0));
   setGaugeProvider('maia_baileys_connected', () => (isBaileysConnected() ? 1 : 0));
 
