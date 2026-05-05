@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { contasRepo } from '@/db/repositories.js';
 import type { Tool } from './_registry.js';
+import { sumDecimal, toDecimal } from '@/lib/decimal.js';
 
 const inputSchema = z.object({
   entidade_id: z.string().uuid().optional(),
@@ -45,13 +46,17 @@ export const queryBalanceTool: Tool<typeof inputSchema, typeof outputSchema> = {
     } else {
       contas = await contasRepo.byEntities({ pessoa_id: ctx.pessoa.id, entidades: ctx.scope.entidades });
     }
+    // saldo_atual vem como string (numeric driver pg). Soma é feita em
+    // Decimal pra preservar precisão; convertemos pra number SOMENTE
+    // no boundary de saída do tool (output_schema é z.number()).
     const out = contas.map((c) => ({
       id: c.id,
       apelido: c.apelido,
-      saldo: Number(c.saldo_atual),
+      saldo: toDecimal(c.saldo_atual).toNumber(),
       banco: c.banco,
       entidade_id: c.entidade_id,
     }));
-    return { contas: out, total: out.reduce((s, c) => s + c.saldo, 0) };
+    const total = sumDecimal(contas.map((c) => c.saldo_atual)).toNumber();
+    return { contas: out, total };
   },
 };
