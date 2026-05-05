@@ -55,6 +55,7 @@ export const AUDIT_ACTIONS = [
   'dashboard_session_ended',
   'dlq_job_added',
   'dlq_job_resolved',
+  'dlq_alert_emitted',
   'pending_resolved',
   'pending_cancelled',
   'pending_expired',

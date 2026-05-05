@@ -30,6 +30,23 @@ let socket: WASocket | null = null;
 let connected = false;
 let lastDisconnectAt: Date | null = null;
 
+/**
+ * Exponential backoff for transient reconnects. Each `connection: 'close'`
+ * with reason ≠ loggedOut increments the attempt counter; the next reconnect
+ * waits `attempt * 1000ms` capped at 30s. After RECONNECT_MAX_ATTEMPTS
+ * consecutive failures we stop the auto-loop and flip setupState to
+ * `recovering`, forcing the operator path. A successful `connection: 'open'`
+ * resets the counter.
+ */
+const RECONNECT_BASE_MS = 1000;
+const RECONNECT_MAX_MS = 30_000;
+const RECONNECT_MAX_ATTEMPTS = 5;
+let reconnectAttempts = 0;
+
+export function reconnectDelayMs(attempt: number): number {
+  return Math.min(attempt * RECONNECT_BASE_MS, RECONNECT_MAX_MS);
+}
+
 export const MEDIA_ROOT = join(config.BAILEYS_AUTH_DIR, '..', 'media');
 mkdirSync(MEDIA_ROOT, { recursive: true });
 // B3b: tmp subdir for in-flight PDF reports. Created here (idempotent) so any
@@ -76,53 +93,79 @@ export function isReactionStub(msg: StubLike): boolean {
   return msg.messageStubType === REACTION_STUB_TYPE;
 }
 
+type ConnectionUpdate = {
+  connection?: 'open' | 'close' | 'connecting';
+  lastDisconnect?: { error?: unknown } | null;
+  qr?: string;
+};
+
+async function handleConnectionUpdate(update: ConnectionUpdate): Promise<void> {
+  const { connection: conn, lastDisconnect, qr } = update;
+  if (qr) {
+    const phaseBefore = setupState.current().phase;
+    setupState.setQr(qr);
+    if (phaseBefore !== 'pairing_qr') {
+      await audit({ acao: 'pairing_qr_displayed', metadata: {} });
+    }
+    qrcodeTerminal.generate(qr, { small: true }); // keep stdout for dev/log spelunking
+  }
+  if (conn === 'open') {
+    connected = true;
+    reconnectAttempts = 0;
+    logger.info('baileys.connected');
+    await audit({ acao: 'whatsapp_connected' });
+    // pairing_completed is one-shot per successful pair (spec §4.7(b)). Skip
+    // when the previous phase was already 'connected' — that path is a
+    // transient reconnect (no QR/code was exchanged), not a new pair event.
+    const phaseBefore = setupState.current().phase;
+    setupState.markPaired();
+    if (phaseBefore !== 'connected') {
+      await audit({ acao: 'pairing_completed' });
+    }
+  } else if (conn === 'close') {
+    connected = false;
+    lastDisconnectAt = new Date();
+    const reason = (lastDisconnect?.error as Boom)?.output?.statusCode;
+    logger.warn({ reason }, 'baileys.connection_closed');
+    await audit({ acao: 'whatsapp_disconnected', metadata: { reason } });
+    if (reason === DisconnectReason.loggedOut) {
+      await audit({ acao: 'pairing_logged_out', metadata: { reason } });
+      reconnectAttempts = 0;
+      triggerRecovery({ shutdownBaileys, startBaileys }).catch((err) => {
+        logger.error({ err }, 'setup.recovery_failed');
+      });
+    } else {
+      setupState.markDisconnected();
+      reconnectAttempts += 1;
+      if (reconnectAttempts > RECONNECT_MAX_ATTEMPTS) {
+        logger.error({ attempts: reconnectAttempts }, 'baileys.reconnect_giving_up');
+        reconnectAttempts = 0;
+        // Flip to recovering — the auto-loop is exhausted, the operator
+        // path takes over via the same recovery hook used for loggedOut.
+        triggerRecovery({ shutdownBaileys, startBaileys }).catch((err) => {
+          logger.error({ err }, 'setup.recovery_failed');
+        });
+        return;
+      }
+      const delay = reconnectDelayMs(reconnectAttempts);
+      logger.info(
+        { attempt: reconnectAttempts, delay_ms: delay },
+        'baileys.reconnect_scheduled',
+      );
+      setTimeout(() => {
+        startBaileys().catch((e) => logger.error({ err: e }, 'baileys.reconnect_failed'));
+      }, delay);
+    }
+  }
+}
+
 export async function startBaileys(): Promise<void> {
   const { state, saveCreds } = await useMultiFileAuthState(config.BAILEYS_AUTH_DIR);
   socket = makeWASocket({ auth: state, printQRInTerminal: false });
 
   socket.ev.on('creds.update', saveCreds);
 
-  socket.ev.on('connection.update', async (update) => {
-    const { connection: conn, lastDisconnect, qr } = update;
-    if (qr) {
-      const phaseBefore = setupState.current().phase;
-      setupState.setQr(qr);
-      if (phaseBefore !== 'pairing_qr') {
-        await audit({ acao: 'pairing_qr_displayed', metadata: {} });
-      }
-      qrcodeTerminal.generate(qr, { small: true });    // keep stdout for dev/log spelunking
-    }
-    if (conn === 'open') {
-      connected = true;
-      logger.info('baileys.connected');
-      await audit({ acao: 'whatsapp_connected' });
-      // pairing_completed is one-shot per successful pair (spec §4.7(b)). Skip
-      // when the previous phase was already 'connected' — that path is a
-      // transient reconnect (no QR/code was exchanged), not a new pair event.
-      const phaseBefore = setupState.current().phase;
-      setupState.markPaired();
-      if (phaseBefore !== 'connected') {
-        await audit({ acao: 'pairing_completed' });
-      }
-    } else if (conn === 'close') {
-      connected = false;
-      lastDisconnectAt = new Date();
-      const reason = (lastDisconnect?.error as Boom)?.output?.statusCode;
-      logger.warn({ reason }, 'baileys.connection_closed');
-      await audit({ acao: 'whatsapp_disconnected', metadata: { reason } });
-      if (reason === DisconnectReason.loggedOut) {
-        await audit({ acao: 'pairing_logged_out', metadata: { reason } });
-        triggerRecovery({ shutdownBaileys, startBaileys }).catch((err) => {
-          logger.error({ err }, 'setup.recovery_failed');
-        });
-      } else {
-        setupState.markDisconnected();
-        setTimeout(() => {
-          startBaileys().catch((e) => logger.error({ err: e }, 'baileys.reconnect_failed'));
-        }, 5000);
-      }
-    }
-  });
+  socket.ev.on('connection.update', handleConnectionUpdate);
 
   socket.ev.on('messages.upsert', async ({ messages }) => {
     for (const msg of messages) {
@@ -390,6 +433,14 @@ export const _internal = {
     socket = s;
     connected = isConnected;
   },
+  _handleConnectionUpdate: handleConnectionUpdate,
+  _resetReconnectAttempts(): void {
+    reconnectAttempts = 0;
+  },
+  _getReconnectAttempts(): number {
+    return reconnectAttempts;
+  },
+  RECONNECT_MAX_ATTEMPTS,
 };
 
 // Helper to deterministically create per-message media filenames
