@@ -37,4 +37,7 @@ async function run() {
   process.exit(0);
 }
 
-run();
+run().catch((err) => {
+  console.error('backup failed:', err);
+  process.exit(1);
+});
