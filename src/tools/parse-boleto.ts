@@ -2,6 +2,7 @@ import { z } from 'zod';
 import type { Tool } from './_registry.js';
 import { parseLinhaDigitavel, isValidLinhaDigitavel, BANCOS_CODIGO } from '@/lib/brazilian.js';
 import { parseImage } from '@/lib/vision.js';
+import { wrapWithTag, validateOrDrop, OCR_REGEXES } from '@/agent/sanitize.js';
 
 const inputSchema = z.object({
   media_local_path: z.string().min(1),
@@ -20,6 +21,16 @@ const outputSchema = z.object({
   confianca: z.number().min(0).max(1),
 });
 
+/**
+ * Sanitization strategy (PR #38 review #3189933385):
+ *   - linha_digitavel: validated by existing logic (isValidLinhaDigitavel)
+ *   - codigo_barras: validated via regex (exactly 44 digits)
+ *   - vencimento: validated against date regex
+ *   - beneficiario_nome: wrap with <ocr> tags + sanitize
+ *   - beneficiario_cnpj_cpf: validate against CPF/CNPJ regex, drop if invalid
+ *   - banco_emissor_codigo: validated by parsing logic
+ *   - banco_emissor_nome: wrap with <ocr> tags (comes from BANCOS_CODIGO lookup, but could be mocked in tests)
+ */
 export const parseBoletoTool: Tool<typeof inputSchema, typeof outputSchema> = {
   name: 'parse_boleto',
   description:
@@ -43,12 +54,17 @@ export const parseBoletoTool: Tool<typeof inputSchema, typeof outputSchema> = {
     const parsed = linhaValid ? parseLinhaDigitavel(linha) : null;
     return {
       linha_digitavel: linhaValid ? linha : undefined,
-      codigo_barras: parsed?.codigo_barras,
+      codigo_barras: validateOrDrop(parsed?.codigo_barras, OCR_REGEXES.codigo_barras),
       valor: parsed?.valor ?? result.valor,
-      vencimento: parsed?.vencimento_data ?? result.vencimento,
-      beneficiario_nome: result.beneficiario_nome,
-      beneficiario_cnpj_cpf: result.beneficiario_cnpj_cpf,
-      banco_emissor_codigo: parsed?.banco_codigo,
+      vencimento: validateOrDrop(
+        parsed?.vencimento_data ?? result.vencimento,
+        OCR_REGEXES.data,
+      ),
+      beneficiario_nome: result.beneficiario_nome
+        ? wrapWithTag(result.beneficiario_nome, 'ocr')
+        : undefined,
+      beneficiario_cnpj_cpf: validateOrDrop(result.beneficiario_cnpj_cpf, OCR_REGEXES.cpf_or_cnpj),
+      banco_emissor_codigo: validateOrDrop(parsed?.banco_codigo, OCR_REGEXES.banco_codigo),
       banco_emissor_nome: parsed?.banco_codigo ? BANCOS_CODIGO[parsed.banco_codigo] : undefined,
       confianca: linhaValid ? 0.9 : 0.5,
     };

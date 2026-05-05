@@ -4,6 +4,7 @@ import { transacoesRepo, entidadesRepo, categoriasRepo, contasRepo } from '@/db/
 import { generateExtratoPdf, type ExtratoTransaction } from '@/lib/pdf/extrato.js';
 import { generateComparativoPdf, type ComparativoRow } from '@/lib/pdf/comparativo.js';
 import { logger } from '@/lib/logger.js';
+import { sumDecimal, toDecimal } from '@/lib/decimal.js';
 
 const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -90,7 +91,8 @@ export const generateReportTool: Tool<typeof inputSchema, typeof outputSchema> =
       const transactions: ExtratoTransaction[] = rawTxns.map((t) => ({
         data_competencia: t.data_competencia,
         natureza: t.natureza as 'receita' | 'despesa' | 'movimentacao',
-        valor: Number(t.valor),
+        // valor vem como string (numeric pg) — toDecimal valida + converte.
+        valor: toDecimal(t.valor).toNumber(),
         descricao: t.descricao ?? '',
         categoriaNome: t.categoria_id ? catNameById.get(t.categoria_id) ?? null : null,
       }));
@@ -156,21 +158,22 @@ export const generateReportTool: Tool<typeof inputSchema, typeof outputSchema> =
       const ent = entById.get(id);
       if (!ent) continue;
       const txns = perEntityTxns[i]!;
-      const receita = txns
-        .filter((t) => t.natureza === 'receita')
-        .reduce((s, t) => s + Number(t.valor), 0);
-      const despesa = txns
-        .filter((t) => t.natureza === 'despesa')
-        .reduce((s, t) => s + Number(t.valor), 0);
+      // Soma exata em Decimal; converte pra number só no boundary do output.
+      const receita = sumDecimal(
+        txns.filter((t) => t.natureza === 'receita').map((t) => t.valor),
+      );
+      const despesa = sumDecimal(
+        txns.filter((t) => t.natureza === 'despesa').map((t) => t.valor),
+      );
       const contas = contasByEntId.get(id) ?? [];
-      const caixa_final = contas.reduce((s, c) => s + Number(c.saldo_atual), 0);
+      const caixa_final = sumDecimal(contas.map((c) => c.saldo_atual));
       rows.push({
         entidade_id: id,
         entidade_nome: ent.nome,
-        receita,
-        despesa,
-        lucro: receita - despesa,
-        caixa_final,
+        receita: receita.toNumber(),
+        despesa: despesa.toNumber(),
+        lucro: receita.minus(despesa).toNumber(),
+        caixa_final: caixa_final.toNumber(),
       });
     }
 

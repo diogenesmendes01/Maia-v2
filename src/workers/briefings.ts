@@ -1,16 +1,18 @@
 import { listOwners } from '@/governance/permissions.js';
 import { entidadesRepo, contasRepo, transacoesRepo } from '@/db/repositories.js';
 import { sendOutboundText } from '@/gateway/baileys.js';
-import { fmtBR, formatBRL } from '@/lib/brazilian.js';
+import { fmtBR } from '@/lib/brazilian.js';
 import { logger } from '@/lib/logger.js';
+import { fmtBRL, sumDecimal } from '@/lib/decimal.js';
 
 async function buildOwnerBriefing(): Promise<string> {
   const ents = await entidadesRepo.list();
   const lines: string[] = [];
   for (const e of ents.slice(0, 5)) {
     const contas = await contasRepo.byEntity(e.id);
-    const total = contas.reduce((s, c) => s + Number(c.saldo_atual), 0);
-    lines.push(`• ${e.nome}: ${formatBRL(total)}`);
+    // saldo_atual vem como string (numeric pg) — sumDecimal preserva precisão.
+    const total = sumDecimal(contas.map((c) => c.saldo_atual));
+    lines.push(`• ${e.nome}: ${fmtBRL(total)}`);
   }
   return [
     `Bom dia. Briefing matinal — ${fmtBR(new Date())}`,
@@ -29,9 +31,9 @@ async function buildEveningBriefing(): Promise<string> {
       { pessoa_id: 'system', entidades: [e.id] },
       { date_from: today, date_to: today, limit: 200 },
     );
-    const r = txns.filter((t) => t.natureza === 'receita').reduce((s, t) => s + Number(t.valor), 0);
-    const d = txns.filter((t) => t.natureza === 'despesa').reduce((s, t) => s + Number(t.valor), 0);
-    lines.push(`• ${e.nome}: +${formatBRL(r)} / -${formatBRL(d)}`);
+    const r = sumDecimal(txns.filter((t) => t.natureza === 'receita').map((t) => t.valor));
+    const d = sumDecimal(txns.filter((t) => t.natureza === 'despesa').map((t) => t.valor));
+    lines.push(`• ${e.nome}: +${fmtBRL(r)} / -${fmtBRL(d)}`);
   }
   return [`Fechamento do dia — ${fmtBR(new Date())}`, '', 'Movimento de hoje:', ...lines].join('\n');
 }
@@ -46,9 +48,10 @@ async function buildWeeklyBriefing(): Promise<string> {
       { pessoa_id: 'system', entidades: [e.id] },
       { date_from: from.toISOString().slice(0, 10), date_to: to.toISOString().slice(0, 10), limit: 1000 },
     );
-    const r = txns.filter((t) => t.natureza === 'receita').reduce((s, t) => s + Number(t.valor), 0);
-    const d = txns.filter((t) => t.natureza === 'despesa').reduce((s, t) => s + Number(t.valor), 0);
-    lines.push(`• ${e.nome}: receita ${formatBRL(r)}, despesa ${formatBRL(d)}, lucro ${formatBRL(r - d)}`);
+    const r = sumDecimal(txns.filter((t) => t.natureza === 'receita').map((t) => t.valor));
+    const d = sumDecimal(txns.filter((t) => t.natureza === 'despesa').map((t) => t.valor));
+    // lucro = r - d em Decimal; só formata pra string no output.
+    lines.push(`• ${e.nome}: receita ${fmtBRL(r)}, despesa ${fmtBRL(d)}, lucro ${fmtBRL(r.minus(d))}`);
   }
   return [`Resumo semanal — ${fmtBR(new Date())}`, '', 'Últimos 7 dias:', ...lines].join('\n');
 }

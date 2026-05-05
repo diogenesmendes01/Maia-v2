@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type { Tool } from './_registry.js';
 import { transcribeWhisper } from '@/lib/whisper.js';
+import { wrapWithTag } from '@/agent/sanitize.js';
 
 const inputSchema = z.object({
   media_local_path: z.string().min(1),
@@ -25,6 +26,10 @@ export const transcribeAudioTool: Tool<typeof inputSchema, typeof outputSchema> 
   operation_type: 'parse_only',
   audit_action: 'audio_transcribed',
   handler: async (args) => {
-    return transcribeWhisper(args.media_local_path);
+    const result = await transcribeWhisper(args.media_local_path);
+    return {
+      ...result,
+      texto: wrapWithTag(result.texto, 'audio_transcript'),
+    };
   },
 };

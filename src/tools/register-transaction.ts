@@ -3,6 +3,7 @@ import { contasRepo, transacoesRepo, contrapartesRepo, categoriasRepo } from '@/
 import type { Tool } from './_registry.js';
 import { trigramSim } from '@/lib/utils.js';
 import { TypedError } from '@/lib/utils.js';
+import { toDecimal } from '@/lib/decimal.js';
 
 const inputSchema = z.object({
   entidade_id: z.string().uuid(),
@@ -71,7 +72,9 @@ export const registerTransactionTool: Tool<typeof inputSchema, typeof outputSche
         existing: {
           transacao_id: sim.id,
           data_competencia: sim.data_competencia,
-          valor: Number(sim.valor),
+          // sim.valor é string (numeric pg). toDecimal valida antes de
+          // converter pra number do output_schema.
+          valor: toDecimal(sim.valor).toNumber(),
           descricao: sim.descricao,
         },
       };
@@ -112,13 +115,21 @@ export const registerTransactionTool: Tool<typeof inputSchema, typeof outputSche
       metadata: args.metadata ?? {},
     });
 
-    let saldo_apos = Number(conta.saldo_atual);
+    // saldo_atual vem como string do pg. Aritmética intermediária (sign * valor,
+    // soma com saldo) seria perigosa em number — fazemos via Decimal.
+    // O update no DB usa SQL `saldo_atual + ${delta}` direto no banco
+    // (numeric exato), mas o saldo_apos retornado pelo tool precisa ser
+    // number (output_schema é z.number()).
+    let saldo_aposDec = toDecimal(conta.saldo_atual);
     if (args.status === 'paga' || args.status === 'recebida') {
       const sign = args.natureza === 'receita' ? 1 : args.natureza === 'despesa' ? -1 : 0;
-      const updated = await contasRepo.addToBalance(conta.id, sign * args.valor);
-      saldo_apos = updated ? Number(updated.saldo_atual) : saldo_apos;
+      const delta = toDecimal(args.valor).times(sign);
+      // addToBalance aceita number; o banco faz a soma em numeric e retorna a
+      // linha atualizada, da qual lemos saldo_atual já calculado.
+      const updated = await contasRepo.addToBalance(conta.id, delta.toNumber());
+      saldo_aposDec = updated ? toDecimal(updated.saldo_atual) : saldo_aposDec;
     }
 
-    return { transacao_id: t.id, saldo_apos };
+    return { transacao_id: t.id, saldo_apos: saldo_aposDec.toNumber() };
   },
 };

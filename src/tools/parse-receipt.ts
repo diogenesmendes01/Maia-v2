@@ -2,6 +2,7 @@ import { z } from 'zod';
 import type { Tool } from './_registry.js';
 import { parseImage } from '@/lib/vision.js';
 import { getCachedVision, setCachedVision } from './_vision-cache.js';
+import { wrapWithTag, validateOrDrop, OCR_REGEXES } from '@/agent/sanitize.js';
 
 const inputSchema = z.object({
   media_local_path: z.string().min(1),
@@ -29,6 +30,15 @@ type Output = z.infer<typeof outputSchema>;
  * (pessoa_id, entity_id, file_sha256); on top of that, this handler caches
  * the Vision parse keyed on file_sha256 alone so the same image uploaded
  * by different pessoas doesn't pay the Vision API cost twice.
+ *
+ * Sanitization strategy (PR #38 review #3189933385):
+ *   - beneficiario_nome: wrap with <ocr> tags + sanitize (strategy B)
+ *   - beneficiario_documento: validate against CPF/CNPJ regex, drop if invalid (strategy A)
+ *   - beneficiario_chave_pix: wrap with <ocr> tags (strategy B, heterogeneous format)
+ *   - banco_origem: wrap with <ocr> tags (strategy B)
+ *   - banco_destino: wrap with <ocr> tags (strategy B)
+ *   - endToEndId: validate against alphanumeric regex, drop if invalid (strategy A)
+ *   - data: validate against date regex, drop if invalid (strategy A)
  */
 export const parseReceiptTool: Tool<typeof inputSchema, typeof outputSchema> = {
   name: 'parse_receipt',
@@ -54,13 +64,21 @@ export const parseReceiptTool: Tool<typeof inputSchema, typeof outputSchema> = {
     const out: Output = {
       tipo: result.tipo,
       valor: result.valor,
-      data: result.data,
-      beneficiario_nome: result.beneficiario_nome,
-      beneficiario_documento: result.beneficiario_documento,
-      beneficiario_chave_pix: result.beneficiario_chave_pix,
-      banco_origem: result.banco_origem,
-      banco_destino: result.banco_destino,
-      endToEndId: result.endToEndId,
+      data: validateOrDrop(result.data, OCR_REGEXES.data),
+      beneficiario_nome: result.beneficiario_nome
+        ? wrapWithTag(result.beneficiario_nome, 'ocr')
+        : undefined,
+      beneficiario_documento: validateOrDrop(result.beneficiario_documento, OCR_REGEXES.cpf_or_cnpj),
+      beneficiario_chave_pix: result.beneficiario_chave_pix
+        ? wrapWithTag(result.beneficiario_chave_pix, 'ocr')
+        : undefined,
+      banco_origem: result.banco_origem
+        ? wrapWithTag(result.banco_origem, 'ocr')
+        : undefined,
+      banco_destino: result.banco_destino
+        ? wrapWithTag(result.banco_destino, 'ocr')
+        : undefined,
+      endToEndId: validateOrDrop(result.endToEndId, OCR_REGEXES.end_to_end_id),
       confianca: result.valor && result.beneficiario_nome ? 0.85 : 0.6,
     };
     await setCachedVision('parse_receipt', args.file_sha256, out);

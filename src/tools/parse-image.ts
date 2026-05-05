@@ -4,6 +4,7 @@ import { parseImage as visionParse } from '@/lib/vision.js';
 import { isValidLinhaDigitavel, parseLinhaDigitavel, BANCOS_CODIGO } from '@/lib/brazilian.js';
 import { logger } from '@/lib/logger.js';
 import { getCachedVision, setCachedVision } from './_vision-cache.js';
+import { wrapWithTag, validateOrDrop, OCR_REGEXES } from '@/agent/sanitize.js';
 
 const inputSchema = z.object({
   media_local_path: z.string().min(1),
@@ -50,6 +51,11 @@ type Output = z.infer<typeof outputSchema>;
  *
  * Idempotency: caches the final routed result keyed on file_sha256. Two
  * pessoas uploading the same image avoid the 1–2 Vision calls per attempt.
+ *
+ * Sanitization strategy (PR #38 review #3189933385):
+ * Both boleto and receipt branches apply the same strategy:
+ *   - Free-text fields (nome, banco_origem, etc.): wrap with <ocr>
+ *   - Structured fields (documento, código_barras, endToEndId, etc.): validate via regex, drop if invalid
  */
 export const parseImageTool: Tool<typeof inputSchema, typeof outputSchema> = {
   name: 'parse_image',
@@ -77,12 +83,20 @@ export const parseImageTool: Tool<typeof inputSchema, typeof outputSchema> = {
           kind: 'boleto',
           boleto: {
             linha_digitavel: linha,
-            codigo_barras: parsed?.codigo_barras,
+            codigo_barras: validateOrDrop(parsed?.codigo_barras, OCR_REGEXES.codigo_barras),
             valor: parsed?.valor ?? boletoRaw.valor,
-            vencimento: parsed?.vencimento_data ?? boletoRaw.vencimento,
-            beneficiario_nome: boletoRaw.beneficiario_nome,
-            beneficiario_cnpj_cpf: boletoRaw.beneficiario_cnpj_cpf,
-            banco_emissor_codigo: parsed?.banco_codigo,
+            vencimento: validateOrDrop(
+              parsed?.vencimento_data ?? boletoRaw.vencimento,
+              OCR_REGEXES.data,
+            ),
+            beneficiario_nome: boletoRaw.beneficiario_nome
+              ? wrapWithTag(boletoRaw.beneficiario_nome, 'ocr')
+              : undefined,
+            beneficiario_cnpj_cpf: validateOrDrop(
+              boletoRaw.beneficiario_cnpj_cpf,
+              OCR_REGEXES.cpf_or_cnpj,
+            ),
+            banco_emissor_codigo: validateOrDrop(parsed?.banco_codigo, OCR_REGEXES.banco_codigo),
             banco_emissor_nome: parsed?.banco_codigo
               ? BANCOS_CODIGO[parsed.banco_codigo]
               : undefined,
@@ -107,13 +121,24 @@ export const parseImageTool: Tool<typeof inputSchema, typeof outputSchema> = {
         receipt: {
           tipo: receiptRaw.tipo,
           valor: receiptRaw.valor,
-          data: receiptRaw.data,
-          beneficiario_nome: receiptRaw.beneficiario_nome,
-          beneficiario_documento: receiptRaw.beneficiario_documento,
-          beneficiario_chave_pix: receiptRaw.beneficiario_chave_pix,
-          banco_origem: receiptRaw.banco_origem,
-          banco_destino: receiptRaw.banco_destino,
-          endToEndId: receiptRaw.endToEndId,
+          data: validateOrDrop(receiptRaw.data, OCR_REGEXES.data),
+          beneficiario_nome: receiptRaw.beneficiario_nome
+            ? wrapWithTag(receiptRaw.beneficiario_nome, 'ocr')
+            : undefined,
+          beneficiario_documento: validateOrDrop(
+            receiptRaw.beneficiario_documento,
+            OCR_REGEXES.cpf_or_cnpj,
+          ),
+          beneficiario_chave_pix: receiptRaw.beneficiario_chave_pix
+            ? wrapWithTag(receiptRaw.beneficiario_chave_pix, 'ocr')
+            : undefined,
+          banco_origem: receiptRaw.banco_origem
+            ? wrapWithTag(receiptRaw.banco_origem, 'ocr')
+            : undefined,
+          banco_destino: receiptRaw.banco_destino
+            ? wrapWithTag(receiptRaw.banco_destino, 'ocr')
+            : undefined,
+          endToEndId: validateOrDrop(receiptRaw.endToEndId, OCR_REGEXES.end_to_end_id),
         },
         confianca: receiptRaw.valor && receiptRaw.beneficiario_nome ? 0.85 : 0.6,
       };

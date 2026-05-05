@@ -20,6 +20,29 @@ export type ToolContext = {
 
 export type DispatchResult = unknown | { error: string; details?: unknown };
 
+type FieldType = 'string' | 'number' | 'boolean';
+type FieldTypeMap = { string: string; number: number; boolean: boolean };
+
+/**
+ * Safely narrow a single field from a Zod-validated args object whose runtime
+ * shape varies per tool. Zod has already validated the value against the
+ * tool's schema; this helper just performs a typeof check before exposing the
+ * field to the dispatcher's cross-tool code paths (entidade_id, valor,
+ * dual_approval_granted, file_sha256).
+ */
+type UnknownBag = { [k: string]: unknown };
+
+function pickToolField<K extends FieldType>(
+  args: unknown,
+  key: string,
+  type: K,
+): FieldTypeMap[K] | undefined {
+  if (typeof args !== 'object' || args === null) return undefined;
+  const bag = args as UnknownBag;
+  const v = bag[key];
+  return typeof v === type ? (v as FieldTypeMap[K]) : undefined;
+}
+
 export async function dispatchTool(input: {
   tool: string;
   args: unknown;
@@ -32,9 +55,10 @@ export async function dispatchTool(input: {
   if (!parsed.success) {
     return { error: 'invalid_args', details: parsed.error.issues };
   }
-  const args = parsed.data as Record<string, unknown>;
+  const args = parsed.data;
 
-  const entity_id = (args.entidade_id as string | undefined) ?? input.ctx.scope.entidades[0];
+  const entity_id =
+    pickToolField<'string'>(args, 'entidade_id', 'string') ?? input.ctx.scope.entidades[0];
   if (!entity_id) return { error: 'no_entity_in_scope' };
 
   const resolved = input.ctx.scope.byEntity.get(entity_id);
@@ -48,7 +72,7 @@ export async function dispatchTool(input: {
     resolved: resolved ?? null,
     scope: { entidades: input.ctx.scope.entidades },
     dual_approval_granted:
-      (args as { dual_approval_granted?: boolean }).dual_approval_granted === true,
+      pickToolField<'boolean'>(args, 'dual_approval_granted', 'boolean') === true,
   });
   if (violation) {
     await audit({
@@ -72,7 +96,7 @@ export async function dispatchTool(input: {
       pessoa: input.ctx.pessoa,
       resolved: resolved ?? null,
       action,
-      valor: typeof args.valor === 'number' ? args.valor : undefined,
+      valor: pickToolField<'number'>(args, 'valor', 'number'),
     });
     if (!allow.allowed) {
       await audit({
@@ -90,7 +114,7 @@ export async function dispatchTool(input: {
     return { error: 'redis_unavailable_blocked' };
   }
 
-  const file_sha256 = typeof args.file_sha256 === 'string' ? args.file_sha256 : undefined;
+  const file_sha256 = pickToolField<'string'>(args, 'file_sha256', 'string');
   const idempotency_key = computeIdempotencyKey({
     pessoa_id: input.ctx.pessoa.id,
     entity_id,

@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { transacoesRepo } from '@/db/repositories.js';
 import type { Tool } from './_registry.js';
+import { toDecimal } from '@/lib/decimal.js';
 
 const inputSchema = z.object({
   entidade_id: z.string().uuid(),
@@ -51,12 +52,15 @@ export const listTransactionsTool: Tool<typeof inputSchema, typeof outputSchema>
         offset: args.offset,
       },
     );
+    // valor é numeric(15,2) e vem como string do driver pg.
+    // Passar por Decimal antes de converter pra number garante o parse
+    // correto e evita NaN silencioso em strings malformadas.
     return {
       items: rows.map((r) => ({
         id: r.id,
         data_competencia: r.data_competencia,
         natureza: r.natureza,
-        valor: Number(r.valor),
+        valor: toDecimal(r.valor).toNumber(),
         descricao: r.descricao,
         categoria_id: r.categoria_id,
         status: r.status,

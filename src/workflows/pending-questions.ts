@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { config } from '@/config/env.js';
 import { conversasRepo, pendingQuestionsRepo } from '@/db/repositories.js';
@@ -32,7 +33,7 @@ export async function setLightweightPending(
   conversa: Conversa,
   data: Omit<PendingQuestionData, 'id' | 'created_at' | 'expira_em'>,
 ): Promise<PendingQuestionData> {
-  const id = 'PQ-' + Math.random().toString(36).slice(2, 8);
+  const id = 'PQ-' + randomUUID();
   const expira_em = new Date(
     Date.now() + config.PENDING_QUESTION_TTL_MINUTES * 60 * 1000,
   ).toISOString();

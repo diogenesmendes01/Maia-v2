@@ -855,6 +855,12 @@ export const dlqRepo = {
       .orderBy(desc(dead_letter_jobs.created_at))
       .limit(n);
   },
+  async countOpen(): Promise<number> {
+    const r = await db.execute<{ c: number }>(sql`
+      SELECT COUNT(*)::int AS c FROM ${dead_letter_jobs} WHERE resolved = false
+    `);
+    return (r.rows[0]?.c as number | undefined) ?? 0;
+  },
   async resolve(id: string): Promise<void> {
     await db
       .update(dead_letter_jobs)

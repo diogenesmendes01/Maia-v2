@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type { Tool } from './_registry.js';
 import { transacoesRepo, contasRepo, entidadesRepo } from '@/db/repositories.js';
+import { Decimal, sumDecimal } from '@/lib/decimal.js';
 
 const inputSchema = z.object({
   entidade_ids: z.array(z.string().uuid()).min(1),
@@ -42,38 +43,44 @@ export const compareEntitiesTool: Tool<typeof inputSchema, typeof outputSchema> 
     const allowed = args.entidade_ids.filter((id) => ctx.scope.entidades.includes(id));
     const ents = await entidadesRepo.byIds(allowed);
     const rows = [];
-    let totReceita = 0,
-      totDespesa = 0,
-      totCaixa = 0;
+    // Acumuladores em Decimal pra evitar erro de ponto flutuante em agregações
+    // de 9 entidades. valor/saldo_atual vêm como string (numeric do Postgres).
+    let totReceita = new Decimal(0);
+    let totDespesa = new Decimal(0);
+    let totCaixa = new Decimal(0);
     for (const e of ents) {
       const txns = await transacoesRepo.byScope(
         { pessoa_id: ctx.pessoa.id, entidades: [e.id] },
         { date_from: args.date_from, date_to: args.date_to, limit: 1000 },
       );
-      const receita = txns.filter((t) => t.natureza === 'receita').reduce((s, t) => s + Number(t.valor), 0);
-      const despesa = txns.filter((t) => t.natureza === 'despesa').reduce((s, t) => s + Number(t.valor), 0);
-      const lucro = receita - despesa;
+      const receita = sumDecimal(
+        txns.filter((t) => t.natureza === 'receita').map((t) => t.valor),
+      );
+      const despesa = sumDecimal(
+        txns.filter((t) => t.natureza === 'despesa').map((t) => t.valor),
+      );
+      const lucro = receita.minus(despesa);
       const contas = await contasRepo.byEntity(e.id);
-      const caixa_final = contas.reduce((s, c) => s + Number(c.saldo_atual), 0);
+      const caixa_final = sumDecimal(contas.map((c) => c.saldo_atual));
       rows.push({
         entidade_id: e.id,
         entidade_nome: e.nome,
-        receita,
-        despesa,
-        lucro,
-        caixa_final,
+        receita: receita.toNumber(),
+        despesa: despesa.toNumber(),
+        lucro: lucro.toNumber(),
+        caixa_final: caixa_final.toNumber(),
       });
-      totReceita += receita;
-      totDespesa += despesa;
-      totCaixa += caixa_final;
+      totReceita = totReceita.plus(receita);
+      totDespesa = totDespesa.plus(despesa);
+      totCaixa = totCaixa.plus(caixa_final);
     }
     return {
       rows,
       consolidado: {
-        receita: totReceita,
-        despesa: totDespesa,
-        lucro: totReceita - totDespesa,
-        caixa_final: totCaixa,
+        receita: totReceita.toNumber(),
+        despesa: totDespesa.toNumber(),
+        lucro: totReceita.minus(totDespesa).toNumber(),
+        caixa_final: totCaixa.toNumber(),
       },
     };
   },

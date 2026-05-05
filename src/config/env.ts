@@ -74,6 +74,7 @@ const envSchema = z
     BACKUP_S3_BUCKET: z.string().optional(),
 
     DAILY_LLM_USD_THRESHOLD: z.coerce.number().positive().default(5),
+    DLQ_ALERT_THRESHOLD: z.coerce.number().int().positive().default(10),
 
     FEATURE_PROACTIVE_MESSAGES: z
       .string()

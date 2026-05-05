@@ -46,17 +46,23 @@ maia-v2/
 │   ├── config/                 # Validação de envs (Zod)
 │   ├── db/                     # Drizzle, repositories
 │   ├── gateway/                # Baileys (WhatsApp in/out)
+│   │   └── queue.ts            # BullMQ wiring (filas de mensagens)
 │   ├── agent/                  # Loop ReAct + tool use
 │   ├── tools/                  # Ferramentas que o agente chama
-│   ├── memory/                 # 5 camadas de memória
+│   ├── memory/                 # 5 camadas de memória (fachadas finas)
 │   ├── identity/
 │   │   └── maia-prompt.md      # System prompt v0 da Maia
 │   ├── workflows/              # Tarefas multi-passo
 │   ├── governance/             # Regras e auditoria
 │   ├── workers/                # Cron + event-driven (proatividade)
+│   ├── setup/                  # Bootstrap inicial (owner, entidades, permissões, self_state)
+│   ├── dashboard/              # Admin web Fastify
 │   └── lib/                    # Wrappers (Claude, Whisper, etc.)
+│       └── redis.ts            # Wrapper ioredis
 └── tests/
 ```
+
+> Nota: as 5 "camadas" de memória (`episodic`, `semantic`, `procedural`, `working`, `vector`) são fachadas finas sobre Postgres+pgvector e Redis. Eviction, TTL e ranking ficam delegados ao banco/Redis, não à camada de memória. Expansão (LRU em working, ranking ponderado em semantic) fica como evolução futura.
 
 ## Setup local (dev)
 
@@ -78,8 +84,9 @@ cp .env.example .env
 # 3. Suba a infra (Postgres + Redis)
 docker compose up -d postgres redis
 
-# 4. Rode migrations (001_initial + 002_specs_v1)
+# 4. Rode todas as migrations em `migrations/`
 npm run db:migrate
+# `npm run db:migrate` aplica em ordem alfabética
 
 # 5. Wizard de bootstrap (cria owner + entidades + permissões + self_state)
 npm run setup
@@ -95,6 +102,7 @@ npm run pessoa:add -- --nome="Joana" --telefone="+55..." --profile=contador_leit
 ## Setup produção (VPS)
 
 ```bash
+# Configure `.env` com chaves antes (compose lê `.env` automaticamente)
 docker compose up -d
 docker compose logs -f app
 ```
