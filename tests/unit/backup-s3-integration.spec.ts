@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 
 const auditMock = vi.fn().mockResolvedValue(undefined);
@@ -74,13 +75,13 @@ beforeEach(() => {
   loggerError.mockClear();
 });
 
-describe('runNightlyBackup S3 integration', () => {
+describe('runBackup S3 integration', () => {
   it('case 1: bucket set + upload OK -> backup_completed includes s3_url', async () => {
     mockConfig();
     uploadBackupMock.mockResolvedValue('s3://test-bucket/maia/dump.dump');
 
-    const { runNightlyBackup } = await import('../../src/workers/backup.js');
-    await runNightlyBackup();
+    const { runBackup } = await import('../../src/workers/backup.js');
+    await runBackup();
 
     expect(uploadBackupMock).toHaveBeenCalledTimes(1);
     const completedCall = auditMock.mock.calls.find(
@@ -102,8 +103,8 @@ describe('runNightlyBackup S3 integration', () => {
     mockConfig();
     uploadBackupMock.mockRejectedValue(new Error('B2 503'));
 
-    const { runNightlyBackup } = await import('../../src/workers/backup.js');
-    await runNightlyBackup();
+    const { runBackup } = await import('../../src/workers/backup.js');
+    await runBackup();
 
     const failed = auditMock.mock.calls.find(
       (c) => (c[0] as { acao: string }).acao === 'backup_s3_upload_failed',
@@ -129,8 +130,8 @@ describe('runNightlyBackup S3 integration', () => {
   it('case 3: bucket unset -> upload skipped silently, backup_completed without s3_url', async () => {
     mockConfig({ BACKUP_S3_BUCKET: undefined, BACKUP_S3_ACCESS_KEY: undefined });
 
-    const { runNightlyBackup } = await import('../../src/workers/backup.js');
-    await runNightlyBackup();
+    const { runBackup } = await import('../../src/workers/backup.js');
+    await runBackup();
 
     expect(uploadBackupMock).not.toHaveBeenCalled();
     const completedCall = auditMock.mock.calls.find(
@@ -143,5 +144,36 @@ describe('runNightlyBackup S3 integration', () => {
       (c) => (c[0] as { acao: string }).acao === 'backup_s3_upload_failed',
     );
     expect(failed).toBeUndefined();
+  });
+
+  it('case 4: pg_dump failure -> audits backup_failed, sends alert, throws', async () => {
+    mockConfig();
+    vi.mocked(spawn).mockImplementationOnce(((..._args: unknown[]) => {
+      const proc = new EventEmitter() as EventEmitter & {
+        stderr: EventEmitter;
+        stdout: EventEmitter;
+      };
+      proc.stderr = new EventEmitter();
+      proc.stdout = new EventEmitter();
+      setImmediate(() => {
+        proc.stderr.emit('data', 'connection refused');
+        proc.emit('close', 1);
+      });
+      return proc;
+    }) as unknown as typeof spawn);
+
+    const { runBackup } = await import('../../src/workers/backup.js');
+    await expect(runBackup()).rejects.toThrow(/pg_dump exit=1/);
+
+    const fatal = auditMock.mock.calls.find(
+      (c) => (c[0] as { acao: string }).acao === 'backup_failed',
+    );
+    expect(fatal).toBeDefined();
+    expect(sendAlertMock).toHaveBeenCalledTimes(1);
+    // No backup_completed when pg_dump never produced a file
+    const completed = auditMock.mock.calls.find(
+      (c) => (c[0] as { acao: string }).acao === 'backup_completed',
+    );
+    expect(completed).toBeUndefined();
   });
 });

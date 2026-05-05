@@ -12,14 +12,15 @@ function tsName(): string {
 }
 
 /**
- * Nightly backup runner — same pg_dump as scripts/backup.ts but invoked from
- * the worker registry so it runs without operator action. On success: audit
- * 'backup_completed'. On failure: audit 'backup_failed' + alert.
+ * Backup runner shared by the nightly worker and the manual `npm run backup`
+ * script: pg_dump → prune local → upload S3 (if configured) → audit
+ * 'backup_completed'. On pg_dump failure: audit 'backup_failed' + alert + throw
+ * so manual callers exit non-zero.
  *
  * S3 upload is skipped when BACKUP_S3_BUCKET is unset; an "all-clear" warning
  * is logged once per run instead of failing.
  */
-export async function runNightlyBackup(): Promise<void> {
+export async function runBackup(): Promise<void> {
   mkdirSync(config.BACKUP_DIR, { recursive: true });
   const file = join(config.BACKUP_DIR, tsName());
 
@@ -30,10 +31,10 @@ export async function runNightlyBackup(): Promise<void> {
     logger.error({ err: message }, 'backup.failed');
     await audit({ acao: 'backup_failed', metadata: { error: message } });
     await sendAlert({
-      subject: 'Nightly backup FAILED',
+      subject: 'Backup FAILED',
       body: `pg_dump failed: ${message}\nCheck disk space and Postgres connectivity.`,
     }).catch(() => null);
-    return;
+    throw err;
   }
 
   pruneLocal();

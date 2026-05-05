@@ -57,16 +57,29 @@ async function resolveBackupSource(): Promise<{ file: string; cleanup: () => voi
   return { file: local, cleanup: () => {} };
 }
 
+async function dropDrillDb(drillDb: string): Promise<void> {
+  const admin = new pg.Client({ connectionString: adminUrl() });
+  await admin.connect();
+  try {
+    await admin.query(`DROP DATABASE IF EXISTS "${drillDb}"`);
+  } finally {
+    await admin.end();
+  }
+}
+
 async function run() {
   const { file, cleanup } = await resolveBackupSource();
   const drillDb = `${config.POSTGRES_DB}_restore_drill_${Date.now()}`;
   console.log(`restoring ${file} into ${drillDb}`);
 
+  let drillCreated = false;
+  let restoreFailed = false;
   try {
     const admin = new pg.Client({ connectionString: adminUrl() });
     await admin.connect();
     await admin.query(`CREATE DATABASE "${drillDb}"`);
     await admin.end();
+    drillCreated = true;
 
     const drillUrl = (() => {
       const u = new URL(config.DATABASE_URL);
@@ -76,9 +89,10 @@ async function run() {
 
     const r = spawnSync('pg_restore', ['--no-owner', '-d', drillUrl, file], { stdio: 'inherit' });
     if (r.status !== 0) {
+      restoreFailed = true;
       console.error('pg_restore failed');
       await audit({ acao: 'restore_test_failed', metadata: { file, drillDb } });
-      process.exit(1);
+      throw new Error('pg_restore failed');
     }
 
     // Sanity probe
@@ -90,21 +104,29 @@ async function run() {
     await probe.end();
     console.log(`sanity probe: transacoes count = ${res.rows[0]?.count}`);
 
-    // Drop drill DB
-    const admin2 = new pg.Client({ connectionString: adminUrl() });
-    await admin2.connect();
-    await admin2.query(`DROP DATABASE "${drillDb}"`);
-    await admin2.end();
-
     await audit({ acao: 'restore_test_passed', metadata: { file } });
     console.log('restore drill ok');
-    process.exit(0);
   } finally {
+    if (drillCreated) {
+      try {
+        await dropDrillDb(drillDb);
+      } catch (err) {
+        // Best-effort: the drill DB will be re-created next run with a new
+        // timestamp, so a stale one is recoverable. Do not mask the original
+        // error (if any) by throwing here.
+        const message = (err as Error).message;
+        if (restoreFailed) {
+          console.error(`drill DB drop failed (post pg_restore failure): ${message}`);
+        } else {
+          console.error(`drill DB drop failed: ${message}`);
+        }
+      }
+    }
     cleanup();
   }
 }
 
 run().catch((e) => {
   console.error(e);
-  process.exit(1);
+  process.exitCode = 1;
 });
