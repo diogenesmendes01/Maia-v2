@@ -10,7 +10,12 @@ const NO_TX_MARKER = /^[ \t]*--[ \t]*maia:no-transaction\b/m;
 
 async function main() {
   const dir = join(process.cwd(), 'migrations');
-  const files = (await readdir(dir)).filter((f) => f.endsWith('.sql')).sort();
+  // `_down.sql` files are rollback scripts run manually via `psql -f` —
+  // see docs/runbooks/migrations.md. Skip them here so the forward chain
+  // doesn't drop and recreate the schema on every run.
+  const files = (await readdir(dir))
+    .filter((f) => f.endsWith('.sql') && !f.endsWith('_down.sql'))
+    .sort();
 
   const pool = new pg.Pool({ connectionString: config.DATABASE_URL });
   await pool.query(`
