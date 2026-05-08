@@ -9,7 +9,7 @@
   },
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "build": "tsc",
+    "build": "tsc && tsc-alias",
     "start": "node dist/index.js",
     "setup": "tsx scripts/setup.ts",
     "pessoa:add": "tsx scripts/pessoa-add.ts",
@@ -75,6 +75,7 @@
     "drizzle-kit": "^0.28.0",
     "eslint": "^10.3.0",
     "prettier": "^3.3.3",
+    "tsc-alias": "^1.8.10",
     "tsx": "^4.19.2",
     "typescript": "^5.6.3",
     "vitest": "^2.1.4"
