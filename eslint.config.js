@@ -4,9 +4,15 @@
 //
 // Keep the rule set lean — the suite already runs typecheck (tsc) and unit
 // tests, so lint is here mainly to catch unused vars, unsafe `any`, and the
-// usual style smells. Heavy rules (no-floating-promises, strict-boolean) are
-// off because they require the type-aware parser, which we can opt into
-// later if the team wants stricter checks.
+// usual style smells.
+//
+// `no-floating-promises` is enabled at warn level for src/ + scripts/ via the
+// type-aware parser (`projectService: true`). Promises that go un-awaited
+// silently fail in Node, so this is a high-value rule. We intentionally do
+// NOT enable it on tests/ — Vitest specs deliberately fire-and-forget in some
+// `beforeEach`/`afterAll` hooks, and the rule's no-op fallback doesn't pay
+// for the lint-time cost there. Other heavy type-aware rules
+// (strict-boolean, no-unsafe-*) stay off pending a follow-up.
 
 import js from '@eslint/js';
 import tsParser from '@typescript-eslint/parser';
@@ -98,9 +104,36 @@ export default [
   js.configs.recommended,
 
   // TypeScript source files (NO test globals — using vi/describe/it here
-  // should fail with no-undef instead of silently passing)
+  // should fail with no-undef instead of silently passing).
+  // Type-aware parser (projectService) enables no-floating-promises for src/.
   {
-    files: ['src/**/*.ts', 'scripts/**/*.ts'],
+    files: ['src/**/*.ts'],
+    languageOptions: {
+      parser: tsParser,
+      parserOptions: {
+        ecmaVersion: 2022,
+        sourceType: 'module',
+        projectService: true,
+        tsconfigRootDir: import.meta.dirname,
+      },
+      globals: NODE_GLOBALS,
+    },
+    plugins: {
+      '@typescript-eslint': tsPlugin,
+    },
+    rules: {
+      ...TS_RULES,
+      '@typescript-eslint/no-floating-promises': 'warn',
+    },
+  },
+
+  // Scripts use the same TS rules but without the type-aware parser.
+  // tsconfig.json includes only src/, and pulling scripts/ into the
+  // type-aware project would force the build to compile them (they run
+  // via tsx, not via dist). Keep them on the lighter parser — they don't
+  // get no-floating-promises, but the trade is acceptable for one-offs.
+  {
+    files: ['scripts/**/*.ts'],
     languageOptions: {
       parser: tsParser,
       parserOptions: {
