@@ -42,7 +42,13 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<{ totalT
   let latestReportPdf: LatestReportPdf | null = null;
 
   for (let i = 0; i < MAX_REACT_ITERATIONS; i++) {
-    const res = await callLLM({ system, messages: conversation, tools, max_tokens: 1024 });
+    const res = await callLLM({
+      system,
+      messages: conversation,
+      tools,
+      max_tokens: 1024,
+      pessoa_id: pessoa.id,
+    });
     totalTokens += res.usage.input_tokens + res.usage.output_tokens;
 
     if (res.tool_uses.length === 0) {

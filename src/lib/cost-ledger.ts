@@ -24,35 +24,76 @@ export async function recordLLMCost(input: {
   model: string;
   tokens_input: number;
   tokens_output: number;
+  /**
+   * Optional. When set, the call's tokens + USD are aggregated to a per-pessoa
+   * key (`cost.daily.llm.${day}.${pessoa_id}`) IN ADDITION to the existing
+   * global aggregate. Workers running outside any pessoa context (briefings,
+   * reflection batches) leave this undefined → only the global counter moves.
+   */
+  pessoa_id?: string;
 }): Promise<void> {
   try {
     const day = todayKey();
     const rate = rateFor(input.model);
     const usd_cents =
       (input.tokens_input / 1000) * rate.input + (input.tokens_output / 1000) * rate.output;
-    const key = `cost.daily.llm.${day}`;
-    const existing = await factsRepo.getByKey('global', key);
-    const prev = (existing?.valor ?? {}) as {
-      tokens_input?: number;
-      tokens_output?: number;
-      usd_cents?: number;
-    };
-    await factsRepo.upsert({
+    await upsertCostFact({
       escopo: 'global',
-      chave: key,
-      valor: {
-        tokens_input: (prev.tokens_input ?? 0) + input.tokens_input,
-        tokens_output: (prev.tokens_output ?? 0) + input.tokens_output,
-        usd_cents: Math.round(((prev.usd_cents ?? 0) + usd_cents) * 100) / 100,
-        provider: input.provider,
-        last_model: input.model,
-      },
-      fonte: 'inferido',
-      confianca: 1,
+      chave: `cost.daily.llm.${day}`,
+      delta: { tokens_input: input.tokens_input, tokens_output: input.tokens_output, usd_cents },
+      provider: input.provider,
+      model: input.model,
     });
+    if (input.pessoa_id) {
+      await upsertCostFact({
+        escopo: 'pessoa',
+        chave: `cost.daily.llm.${day}.${input.pessoa_id}`,
+        delta: { tokens_input: input.tokens_input, tokens_output: input.tokens_output, usd_cents },
+        provider: input.provider,
+        model: input.model,
+      });
+    }
   } catch (err) {
     logger.warn({ err: (err as Error).message }, 'cost_ledger.llm_failed');
   }
+}
+
+async function upsertCostFact(args: {
+  escopo: string;
+  chave: string;
+  delta: { tokens_input: number; tokens_output: number; usd_cents: number };
+  provider: string;
+  model: string;
+}): Promise<void> {
+  const existing = await factsRepo.getByKey(args.escopo, args.chave);
+  const prev = (existing?.valor ?? {}) as {
+    tokens_input?: number;
+    tokens_output?: number;
+    usd_cents?: number;
+  };
+  await factsRepo.upsert({
+    escopo: args.escopo,
+    chave: args.chave,
+    valor: {
+      tokens_input: (prev.tokens_input ?? 0) + args.delta.tokens_input,
+      tokens_output: (prev.tokens_output ?? 0) + args.delta.tokens_output,
+      usd_cents: Math.round(((prev.usd_cents ?? 0) + args.delta.usd_cents) * 100) / 100,
+      provider: args.provider,
+      last_model: args.model,
+    },
+    fonte: 'inferido',
+    confianca: 1,
+  });
+}
+
+export async function readDailyLLMUsdByPessoa(
+  pessoa_id: string,
+  day: string = todayKey(),
+): Promise<number> {
+  const f = await factsRepo.getByKey('pessoa', `cost.daily.llm.${day}.${pessoa_id}`);
+  if (!f) return 0;
+  const v = (f.valor ?? {}) as { usd_cents?: number };
+  return (v.usd_cents ?? 0) / 100;
 }
 
 export async function readDailyLLMUsd(day: string = todayKey()): Promise<number> {
