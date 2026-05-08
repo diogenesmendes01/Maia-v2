@@ -1,8 +1,10 @@
 import { factsRepo } from '@/db/repositories.js';
 import { logger } from '@/lib/logger.js';
+import { getToolCallingModels } from '@/lib/openrouter-models.js';
 
-// Approximate USD prices per 1k tokens (cents). Kept conservative so the
-// daily-threshold alert fires earlier on miscount rather than later.
+// Approximate USD prices per 1k tokens (cents) for direct-vendor models.
+// OpenRouter slugs (containing '/') resolve via getModelPricing(slug) below.
+// Conservative defaults so the daily threshold alert errs on the early side.
 const USD_CENTS_PER_1K_TOKENS: Record<string, { input: number; output: number }> = {
   'claude-sonnet-4-6': { input: 0.3, output: 1.5 },
   'claude-opus-4-7': { input: 1.5, output: 7.5 },
@@ -11,12 +13,38 @@ const USD_CENTS_PER_1K_TOKENS: Record<string, { input: number; output: number }>
   'whisper-1': { input: 0.6, output: 0 },
 };
 
+const FALLBACK_RATE = { input: 0.3, output: 1.5 };
+
 function todayKey(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
-function rateFor(model: string): { input: number; output: number } {
-  return USD_CENTS_PER_1K_TOKENS[model] ?? { input: 0.3, output: 1.5 };
+/**
+ * Look up cents/1k for an OpenRouter slug from the existing 1h-cached
+ * `getToolCallingModels()` (no extra HTTP). Returns the conservative
+ * fallback if the slug isn't in the list (e.g. cold cache + first network
+ * failure). OpenRouter pricing is in USD per million tokens, so we divide
+ * by 10 to get cents per 1k.
+ */
+async function getModelPricing(slug: string): Promise<{ input: number; output: number }> {
+  try {
+    const models = await getToolCallingModels();
+    const m = models.find((x) => x.id === slug);
+    if (!m) return FALLBACK_RATE;
+    return {
+      input: m.pricing.prompt_per_million / 10,
+      output: m.pricing.completion_per_million / 10,
+    };
+  } catch {
+    return FALLBACK_RATE;
+  }
+}
+
+async function rateFor(model: string): Promise<{ input: number; output: number }> {
+  // OpenRouter slugs contain a "/", e.g. "anthropic/claude-sonnet-4.6". The
+  // hardcoded table never has those — they live in OpenRouter's catalog.
+  if (model.includes('/')) return getModelPricing(model);
+  return USD_CENTS_PER_1K_TOKENS[model] ?? FALLBACK_RATE;
 }
 
 export async function recordLLMCost(input: {
@@ -34,7 +62,7 @@ export async function recordLLMCost(input: {
 }): Promise<void> {
   try {
     const day = todayKey();
-    const rate = rateFor(input.model);
+    const rate = await rateFor(input.model);
     const usd_cents =
       (input.tokens_input / 1000) * rate.input + (input.tokens_output / 1000) * rate.output;
     await upsertCostFact({
