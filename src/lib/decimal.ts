@@ -48,6 +48,7 @@ export function toDecimal(v: string | number | null | undefined | Decimal): Deci
   } catch (err) {
     throw new Error(
       `toDecimal: não foi possível parsear "${v}" como Decimal: ${(err as Error).message}`,
+      { cause: err },
     );
   }
 }
