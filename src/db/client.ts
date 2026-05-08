@@ -9,9 +9,48 @@ export const pool = new pg.Pool({
   connectionTimeoutMillis: 5_000,
 });
 
+let dbConnected = false;
+let lastProbe = 0;
+const DB_HEALTH_CACHE_MS = 5000;
+
 pool.on('error', (err) => {
+  dbConnected = false;
   console.error('pg pool error', err);
 });
+
+/**
+ * Synchronous gauge for `/metrics`. Returns the cached connectivity state
+ * — refreshed in the background by `probeDb()`. We can't make Prometheus
+ * scrapes block on a live `SELECT 1`, so the gauge tracks the *last* probe
+ * outcome (≤ 5s old) instead of running a query per scrape.
+ */
+export function isDbConnected(): boolean {
+  return dbConnected;
+}
+
+/**
+ * Best-effort liveness probe. Cheap (`SELECT 1`) and rate-limited to 1
+ * call per 5s so a tight Prometheus scrape loop doesn't hammer the DB.
+ * Errors flip the cached state; success restores it. Safe to call from
+ * anywhere — it never throws.
+ */
+export async function probeDb(): Promise<boolean> {
+  const now = Date.now();
+  if (now - lastProbe < DB_HEALTH_CACHE_MS) return dbConnected;
+  lastProbe = now;
+  try {
+    const client = await pool.connect();
+    try {
+      await client.query('SELECT 1');
+      dbConnected = true;
+    } finally {
+      client.release();
+    }
+  } catch {
+    dbConnected = false;
+  }
+  return dbConnected;
+}
 
 export const db = drizzle(pool);
 
