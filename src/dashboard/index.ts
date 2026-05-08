@@ -301,13 +301,13 @@ Ela vai te enviar um link único de acesso.</p>
 </body></html>`;
 }
 
-async function renderDashboard(
+export async function renderDashboard(
   nome: string,
   ents: Array<{ id: string; nome: string }>,
   entIds: string[],
   canSeeAudit: boolean,
 ): Promise<string> {
-  if (entIds.length === 0) return `<html><body><h1>Olá, ${nome}</h1><p>Sem entidades acessíveis.</p></body></html>`;
+  if (entIds.length === 0) return `<html><body><h1>Olá, ${escape(nome)}</h1><p>Sem entidades acessíveis.</p></body></html>`;
   const contas = await db.select().from(contas_bancarias).where(inArray(contas_bancarias.entidade_id, entIds));
   const txns = await db
     .select()
@@ -322,7 +322,7 @@ async function renderDashboard(
     return { id: e.id, nome: e.nome, total };
   });
   return `<!DOCTYPE html>
-<html lang="pt-BR"><head><meta charset="utf-8"><title>Maia — ${nome}</title>
+<html lang="pt-BR"><head><meta charset="utf-8"><title>Maia — ${escape(nome)}</title>
 <style>
 body{font:14px/1.5 system-ui;max-width:960px;margin:30px auto;padding:0 20px}
 table{width:100%;border-collapse:collapse;margin:1em 0}
@@ -330,7 +330,7 @@ th,td{padding:6px 10px;border-bottom:1px solid #eee;text-align:left}
 th{background:#fafafa}
 .r{text-align:right}
 </style></head><body>
-<h1>Olá, ${nome}</h1>
+<h1>Olá, ${escape(nome)}</h1>
 <h2>Saldos por entidade</h2>
 <table><tr><th>Entidade</th><th class="r">Saldo</th></tr>
 ${sums.map((s) => `<tr><td><a href="/dashboard/entity?entidade=${s.id}">${escape(s.nome)}</a></td><td class="r">${formatBRL(s.total)}</td></tr>`).join('')}
@@ -471,7 +471,7 @@ code{font:12px/1.4 ui-monospace,monospace}
 </style>`;
 }
 
-function escape(s: string): string {
+export function escape(s: string): string {
   return s.replace(/[&<>"']/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] ?? c,
   );
