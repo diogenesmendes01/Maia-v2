@@ -9,16 +9,16 @@ import { runConversationSummarizer } from './conversation-summarizer.js';
 import { runReflectionBatch } from './reflection-batch.js';
 import { runMessageRecovery } from './message-recovery.js';
 import { runPendingReminder } from './pending-reminder.js';
-import { runNightlyBackup } from './backup.js';
+import { runNightlyBackup, runCloudBackupRotation } from './backup.js';
 import { runCostMonitor } from './cost-monitor.js';
 import { runAuditWatcher } from './audit-watcher.js';
 import { runDlqMonitor } from './dlq-monitor.js';
 import { runMorningBriefing, runEveningBriefing, runWeeklyBriefing } from './briefings.js';
 import { tickEngine } from '@/workflows/engine.js';
 
-type Job = { name: string; cron: string; fn: () => Promise<void>; phase: number };
+export type Job = { name: string; cron: string; fn: () => Promise<void>; phase: number };
 
-const JOBS: Job[] = [
+export const JOBS: Job[] = [
   { name: 'health_monitor', cron: '*/1 * * * *', fn: runHealthMonitor, phase: 1 },
   { name: 'audit_watcher', cron: '*/1 * * * *', fn: runAuditWatcher, phase: 1 },
   { name: 'pending_expirer', cron: '*/1 * * * *', fn: runPendingExpirer, phase: 1 },
@@ -29,6 +29,11 @@ const JOBS: Job[] = [
   { name: 'idempotency_cleanup', cron: '0 4 * * *', fn: runIdempotencyCleanup, phase: 1 },
   { name: 'inactivity_sweep', cron: '0 3 * * *', fn: runInactivitySweep, phase: 1 },
   { name: 'nightly_backup', cron: '0 3 * * *', fn: runNightlyBackup, phase: 1 },
+  // Cloud backup rotation runs once a week (Sundays 04:00 BRT) so
+  // BACKUP_RETENTION_CLOUD_DAYS is actually applied. Decoupled from the
+  // nightly run so the upload path stays fast and rotation can be paused
+  // independently if a provider has hiccups.
+  { name: 'cloud_backup_rotation', cron: '0 4 * * 0', fn: runCloudBackupRotation, phase: 1 },
   { name: 'cost_monitor', cron: '30 2 * * *', fn: runCostMonitor, phase: 1 },
   { name: 'dlq_monitor', cron: '*/5 * * * *', fn: runDlqMonitor, phase: 1 },
   { name: 'conversation_summarizer', cron: '0 2 * * *', fn: runConversationSummarizer, phase: 2 },
