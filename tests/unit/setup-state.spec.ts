@@ -131,7 +131,8 @@ describe('setup-recovery — concurrency lock', () => {
     vi.doMock('../../src/lib/alerts.js', () => ({ sendAlert: sendAlertMock }));
     vi.doMock('../../src/setup/token.js', () => ({ rotateToken: rotateTokenMock }));
     vi.doMock('../../src/config/env.js', () => ({
-      config: { BAILEYS_AUTH_DIR: '/tmp/maia-recovery-test-stub' },
+      // Path must contain a "baileys" segment (validated by assertSafeAuthDir).
+      config: { BAILEYS_AUTH_DIR: '/tmp/maia-baileys-recovery-test-stub' },
     }));
     vi.doMock('node:fs/promises', async (orig) => {
       const real = await orig<typeof import('node:fs/promises')>();
