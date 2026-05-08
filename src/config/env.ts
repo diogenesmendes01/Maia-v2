@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import 'dotenv/config';
+import { assertSafeAuthDir } from '@/setup/auth-dir.js';
 
 const envSchema = z
   .object({
@@ -175,6 +176,15 @@ const envSchema = z
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message: 'OWNER_TELEFONE_WHATSAPP must differ from WHATSAPP_NUMBER_MAIA',
+      });
+    }
+    try {
+      assertSafeAuthDir(cfg.BAILEYS_AUTH_DIR);
+    } catch (err) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['BAILEYS_AUTH_DIR'],
+        message: (err as Error).message,
       });
     }
   });
