@@ -1,16 +1,17 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const h = vi.hoisted(() => ({
-  listUnprocessedInConversation: vi.fn(),
+  listUnprocessedByTelefone: vi.fn(),
 }));
 
 vi.mock('../../src/db/repositories.js', () => ({
   mensagensRepo: {
     findById: vi.fn(),
     setConversaId: vi.fn(),
+    setConversaIdMany: vi.fn(),
     markProcessed: vi.fn(),
     create: vi.fn(),
-    listUnprocessedInConversation: h.listUnprocessedInConversation,
+    listUnprocessedByTelefone: h.listUnprocessedByTelefone,
   },
   conversasRepo: { touch: vi.fn() },
   pessoasRepo: { findById: vi.fn() },
@@ -76,6 +77,8 @@ vi.mock('../../src/gateway/debouncer.js', () => ({
 
 import { _internal } from '../../src/agent/core.js';
 
+const TEL = '+5511999999999';
+
 const mkInbound = (over: Partial<Record<string, unknown>>): Record<string, unknown> => ({
   id: 'target-id',
   conversa_id: 'conv-1',
@@ -83,7 +86,7 @@ const mkInbound = (over: Partial<Record<string, unknown>>): Record<string, unkno
   tipo: 'texto',
   conteudo: '',
   midia_url: null,
-  metadata: {},
+  metadata: { telefone: TEL },
   processada_em: null,
   ferramentas_chamadas: [],
   tokens_usados: null,
@@ -93,25 +96,30 @@ const mkInbound = (over: Partial<Record<string, unknown>>): Record<string, unkno
 
 describe('aggregateUnprocessedTexts', () => {
   beforeEach(() => {
-    h.listUnprocessedInConversation.mockReset();
+    h.listUnprocessedByTelefone.mockReset();
   });
 
   it('returns target text alone when there are no unprocessed siblings', async () => {
-    h.listUnprocessedInConversation.mockResolvedValue([]);
+    h.listUnprocessedByTelefone.mockResolvedValue([]);
     const target = mkInbound({ conteudo: 'da empresa X?' });
 
     const result = await _internal.aggregateUnprocessedTexts(target as never);
 
     expect(result.text).toBe('da empresa X?');
     expect(result.merged_ids).toEqual([]);
+    expect(h.listUnprocessedByTelefone).toHaveBeenCalledWith(TEL, { excludeId: 'target-id' });
   });
 
-  it('concatenates older text siblings before the target in chronological order', async () => {
-    h.listUnprocessedInConversation.mockResolvedValue([
-      mkInbound({ id: 's1', conteudo: 'Oi, como esta', tipo: 'texto' }),
-      mkInbound({ id: 's2', conteudo: 'as finanças', tipo: 'texto' }),
+  it('aggregates orphan siblings (conversa_id NULL) — the real-world chunked-typing case', async () => {
+    // Real flow: baileys saves all inbounds with conversa_id NULL. By the
+    // time the debounce job fires, only the target has been resolved by
+    // the agent. Earlier chunks are still NULL — the aggregator MUST find
+    // them. This is the regression test for the original bug.
+    h.listUnprocessedByTelefone.mockResolvedValue([
+      mkInbound({ id: 's1', conversa_id: null, conteudo: 'Oi, como esta', tipo: 'texto' }),
+      mkInbound({ id: 's2', conversa_id: null, conteudo: 'as finanças', tipo: 'texto' }),
     ]);
-    const target = mkInbound({ id: 'target-id', conteudo: 'da empresa X?' });
+    const target = mkInbound({ id: 'target-id', conversa_id: 'conv-1', conteudo: 'da empresa X?' });
 
     const result = await _internal.aggregateUnprocessedTexts(target as never);
 
@@ -119,11 +127,36 @@ describe('aggregateUnprocessedTexts', () => {
     expect(result.merged_ids).toEqual(['s1', 's2']);
   });
 
+  it('aggregates already-attached siblings whose conversa_id matches the target', async () => {
+    h.listUnprocessedByTelefone.mockResolvedValue([
+      mkInbound({ id: 's1', conversa_id: 'conv-1', conteudo: 'attached early', tipo: 'texto' }),
+    ]);
+    const target = mkInbound({ id: 'target-id', conversa_id: 'conv-1', conteudo: 'tail' });
+
+    const result = await _internal.aggregateUnprocessedTexts(target as never);
+
+    expect(result.text).toBe('attached early\ntail');
+    expect(result.merged_ids).toEqual(['s1']);
+  });
+
+  it('rejects siblings already attached to a DIFFERENT conversa (cross-conversation guard)', async () => {
+    h.listUnprocessedByTelefone.mockResolvedValue([
+      mkInbound({ id: 's1', conversa_id: 'conv-2', conteudo: 'foreign', tipo: 'texto' }),
+      mkInbound({ id: 's2', conversa_id: null, conteudo: 'orphan ours', tipo: 'texto' }),
+    ]);
+    const target = mkInbound({ id: 'target-id', conversa_id: 'conv-1', conteudo: 'tail' });
+
+    const result = await _internal.aggregateUnprocessedTexts(target as never);
+
+    expect(result.text).toBe('orphan ours\ntail');
+    expect(result.merged_ids).toEqual(['s2']);
+  });
+
   it('skips siblings with empty/null content', async () => {
-    h.listUnprocessedInConversation.mockResolvedValue([
-      mkInbound({ id: 's1', conteudo: 'real', tipo: 'texto' }),
-      mkInbound({ id: 's2', conteudo: null, tipo: 'texto' }),
-      mkInbound({ id: 's3', conteudo: '', tipo: 'texto' }),
+    h.listUnprocessedByTelefone.mockResolvedValue([
+      mkInbound({ id: 's1', conversa_id: null, conteudo: 'real', tipo: 'texto' }),
+      mkInbound({ id: 's2', conversa_id: null, conteudo: null, tipo: 'texto' }),
+      mkInbound({ id: 's3', conversa_id: null, conteudo: '', tipo: 'texto' }),
     ]);
     const target = mkInbound({ conteudo: 'tail' });
 
@@ -134,11 +167,11 @@ describe('aggregateUnprocessedTexts', () => {
   });
 
   it('does NOT aggregate audio/imagem/documento siblings — only texto', async () => {
-    h.listUnprocessedInConversation.mockResolvedValue([
-      mkInbound({ id: 'a1', conteudo: 'caption', tipo: 'audio' }),
-      mkInbound({ id: 'i1', conteudo: 'caption', tipo: 'imagem' }),
-      mkInbound({ id: 'd1', conteudo: 'caption', tipo: 'documento' }),
-      mkInbound({ id: 't1', conteudo: 'real text', tipo: 'texto' }),
+    h.listUnprocessedByTelefone.mockResolvedValue([
+      mkInbound({ id: 'a1', conversa_id: null, conteudo: 'caption', tipo: 'audio' }),
+      mkInbound({ id: 'i1', conversa_id: null, conteudo: 'caption', tipo: 'imagem' }),
+      mkInbound({ id: 'd1', conversa_id: null, conteudo: 'caption', tipo: 'documento' }),
+      mkInbound({ id: 't1', conversa_id: null, conteudo: 'real text', tipo: 'texto' }),
     ]);
     const target = mkInbound({ conteudo: 'tail' });
 
@@ -148,13 +181,23 @@ describe('aggregateUnprocessedTexts', () => {
     expect(result.merged_ids).toEqual(['t1']);
   });
 
-  it('returns target text with no merge when conversa_id is missing', async () => {
-    const target = mkInbound({ conversa_id: null, conteudo: 'orphan' });
+  it('returns target text with no merge when telefone is missing from metadata', async () => {
+    const target = mkInbound({ metadata: {}, conteudo: 'lonely' });
 
     const result = await _internal.aggregateUnprocessedTexts(target as never);
 
-    expect(result.text).toBe('orphan');
+    expect(result.text).toBe('lonely');
     expect(result.merged_ids).toEqual([]);
-    expect(h.listUnprocessedInConversation).not.toHaveBeenCalled();
+    expect(h.listUnprocessedByTelefone).not.toHaveBeenCalled();
+  });
+
+  it('returns target text with no merge when metadata is null', async () => {
+    const target = mkInbound({ metadata: null, conteudo: 'lonely' });
+
+    const result = await _internal.aggregateUnprocessedTexts(target as never);
+
+    expect(result.text).toBe('lonely');
+    expect(result.merged_ids).toEqual([]);
+    expect(h.listUnprocessedByTelefone).not.toHaveBeenCalled();
   });
 });

@@ -32,32 +32,55 @@ const AGGREGATE_SEPARATOR = '\n';
  * Inbound-text aggregation for the message-debounce path.
  *
  * When FEATURE_MESSAGE_DEBOUNCE is on, baileys schedules a delayed BullMQ
- * job per user instead of enqueueing immediately, so chunked typing arrives
- * at the LLM as a single coherent turn. By the time this worker fires, one
- * or more older inbound text messages may exist in the same conversation
- * with `processada_em IS NULL`. We merge them into the target inbound's
- * `conteudo` and remember the sibling ids so the caller can mark them all
- * processed atomically with the target.
+ * job per user instead of enqueueing immediately, so chunked typing
+ * arrives at the LLM as a single coherent turn. By the time this worker
+ * fires, one or more older inbound text messages may exist for the same
+ * telefone with `processada_em IS NULL`.
  *
- * Only `tipo = 'texto'` siblings are merged. Media (audio/imagem/documento)
- * is left in place — the recovery worker will pick those up on its own
- * 2-minute sweep, or the next inbound-text run will sweep them. Aggregating
- * media into a text turn would change the agent's branching (audio reply,
- * image OCR, etc.), which is out of scope here.
+ * Sibling lookup is keyed by **telefone** (`metadata->>'telefone'`), not
+ * conversa_id: baileys persists every inbound with `conversa_id = NULL`
+ * and resolution happens here in `runAgentForMensagem`. Earlier chunks
+ * from the same burst are still NULL-attached when this runs, so a
+ * conversa_id query would silently miss them — only the target chunk
+ * would reach the LLM and the rest would limp through `message-recovery`
+ * 2 minutes later as separate turns. Keying by telefone catches them.
  *
- * Returns the aggregated text and the ids of merged siblings.
+ * Defense-in-depth: we also accept already-attached siblings whose
+ * conversa_id matches the target's, in case the target was resolved
+ * mid-burst and adopted a sibling synchronously somewhere else.
+ * Cross-conversation leakage isn't a concern in this codebase
+ * (telefone ↔ pessoa ↔ conversa is 1:1) but the explicit filter
+ * documents the intent.
+ *
+ * Only `tipo = 'texto'` siblings are merged. Media bypasses the buffer
+ * upstream (see baileys.handleIncoming).
+ *
+ * Returns the aggregated text and the ids of merged siblings; the
+ * caller is responsible for adopting any orphans (conversa_id NULL) into
+ * the target's conversa and marking them processed.
  */
 async function aggregateUnprocessedTexts(target: Mensagem): Promise<{
   text: string;
   merged_ids: string[];
 }> {
   const targetText = target.conteudo ?? '';
-  if (!target.conversa_id) return { text: targetText, merged_ids: [] };
+  const tel = (target.metadata as Record<string, unknown> | null)?.['telefone'];
+  if (typeof tel !== 'string' || tel.length === 0) {
+    return { text: targetText, merged_ids: [] };
+  }
 
-  const siblings = await mensagensRepo.listUnprocessedInConversation(target.conversa_id, {
+  const siblings = await mensagensRepo.listUnprocessedByTelefone(tel, {
     excludeId: target.id,
   });
-  const textSiblings = siblings.filter((m) => m.tipo === 'texto' && (m.conteudo ?? '').length > 0);
+  const textSiblings = siblings.filter(
+    (m) =>
+      m.tipo === 'texto' &&
+      (m.conteudo ?? '').length > 0 &&
+      // Accept orphans (will be adopted by caller) OR already-attached
+      // siblings whose conversa_id matches. Reject cross-conversation
+      // siblings as a defensive guard.
+      (m.conversa_id === null || m.conversa_id === target.conversa_id),
+  );
   if (textSiblings.length === 0) return { text: targetText, merged_ids: [] };
 
   // Chronological order: oldest sibling first, target last (it IS the
@@ -142,12 +165,14 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
   const { conversa: c, pessoa } = conv;
 
   // Debounce aggregation: concatenate any older unprocessed inbound texts
-  // in this conversation into the target's content so the LLM sees one
-  // turn instead of N partial chunks. No-op when there are no siblings,
-  // so this is safe to run unconditionally — the recovery path also
-  // benefits (a crash mid-debounce leaves siblings, this sweeps them).
-  // We mutate `inbound.conteudo` in memory only — DB rows for siblings
-  // are left intact and marked processed at the end.
+  // for this telefone into the target's content so the LLM sees one turn
+  // instead of N partial chunks. No-op when there are no siblings, so
+  // this is safe to run unconditionally — the recovery path also benefits
+  // (a crash mid-debounce leaves siblings, this sweeps them).
+  //
+  // We mutate `inbound.conteudo` in memory only. Sibling DB rows are
+  // adopted into the target's conversa (so history queries + recovery
+  // sweeps see the right linkage) and marked processed at the end.
   const aggregated = inbound.conteudo
     ? await aggregateUnprocessedTexts(inbound).catch((err) => {
         logger.warn(
@@ -159,6 +184,19 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
     : { text: '', merged_ids: [] as string[] };
   if (aggregated.merged_ids.length > 0) {
     inbound.conteudo = aggregated.text;
+    // Adopt orphans (conversa_id NULL) into the target's conversation.
+    // setConversaIdMany is a no-op for ids already attached, so we can
+    // pass the full merged set without filtering. Best-effort: a failure
+    // here doesn't block the LLM turn — the rows still get processada_em
+    // stamped below, so recovery won't double-process.
+    try {
+      await mensagensRepo.setConversaIdMany(aggregated.merged_ids, c.id);
+    } catch (err) {
+      logger.warn(
+        { err: (err as Error).message, count: aggregated.merged_ids.length },
+        'agent.adopt_siblings_failed',
+      );
+    }
     logger.info(
       {
         mensagem_id: inbound.id,
