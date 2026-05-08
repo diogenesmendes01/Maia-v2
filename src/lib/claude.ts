@@ -178,7 +178,7 @@ export function fromOpenAIResponse(res: OpenAI.Chat.Completions.ChatCompletion):
   const msg = choice?.message;
   const tool_uses: LLMResponse['tool_uses'] = (msg?.tool_calls ?? []).map((tc) => {
     const fn = (tc as { function?: { name?: string; arguments?: string } }).function;
-    let args: unknown = {};
+    let args: unknown;
     try {
       args = JSON.parse(fn?.arguments ?? '{}');
     } catch {

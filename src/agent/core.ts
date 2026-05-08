@@ -271,7 +271,7 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
   const tools = getToolSchemas(scope.byEntity);
   const jid = pessoa.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
   const stopTyping = scheduleTypingDebounce(jid, inbound.id);
-  let totalTokens = 0;
+  let totalTokens: number;
   try {
     const result = await runReActLoop({
       pessoa,
