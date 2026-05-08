@@ -74,6 +74,9 @@ describe('pending-gate — snapshot path', () => {
     const args = callLLM.mock.calls[0]![0];
     expect(args.messages[0].content).toContain('Confirma?');
     expect(args.messages[0].content).toContain('sim');
+    // Per-pessoa cost breakdown: classifier must forward the id so the
+    // call shows up under the right pessoa, not just the global aggregate.
+    expect(args.pessoa_id).toBe('p1');
     expect(out.kind).toBe('no_pending'); // race lost → no_pending
   });
 });
