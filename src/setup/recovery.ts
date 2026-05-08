@@ -5,6 +5,7 @@ import { logger } from '@/lib/logger.js';
 import { setupState } from './state.js';
 import { rotateToken } from './token.js';
 import { sendAlert } from '@/lib/alerts.js';
+import { assertSafeAuthDir } from './auth-dir.js';
 
 /** Mutable container — avoids Vitest live-binding getter wrapping of bare `let`. */
 const _state = { recoveryPromise: null as Promise<void> | null };
@@ -60,7 +61,12 @@ async function doRecovery(deps: {
   await audit({ acao: 'pairing_recovery_started' });
   try {
     await deps.shutdownBaileys();
-    await rm(config.BAILEYS_AUTH_DIR, { recursive: true, force: true });
+    // Defense-in-depth: re-validate the path even if env validation already ran.
+    // A bad value here would wipe the wrong directory automatically on every
+    // LoggedOut event with no human in the loop.
+    const safeDir = assertSafeAuthDir(config.BAILEYS_AUTH_DIR);
+    logger.info({ dir: safeDir }, 'setup.recovery_rm_auth_dir');
+    await rm(safeDir, { recursive: true, force: true });
     await rotateToken();
     setupState.setUnpaired();
     await sendAlert({
