@@ -21,6 +21,16 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vites
 import pg from 'pg';
 import { randomInt } from 'node:crypto';
 
+// `aggregateUnprocessedTexts` short-circuits when FEATURE_MESSAGE_DEBOUNCE
+// is off, and config/env.ts parses the env at module load via zod — so a
+// `process.env.FEATURE_MESSAGE_DEBOUNCE = 'true'` inside `it()` lands too
+// late. `vi.hoisted` runs before ANY import in the file, even hoisted ESM
+// imports, so the config module reads the truthy value the first time it
+// loads.
+vi.hoisted(() => {
+  process.env.FEATURE_MESSAGE_DEBOUNCE = 'true';
+});
+
 // Stub the queue/baileys/redis chain so importing src/agent/core.js
 // (for `_internal.aggregateUnprocessedTexts`) doesn't try to open a
 // BullMQ Queue or a Baileys socket. The DB layer is real.
@@ -215,7 +225,9 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
   });
 
   it('aggregateUnprocessedTexts (production fn) merges chronologically and respects an already-processed sibling', async () => {
-    process.env.FEATURE_MESSAGE_DEBOUNCE = 'true';
+    // FEATURE_MESSAGE_DEBOUNCE is set via vi.hoisted at the top of the
+    // file so config.FEATURE_MESSAGE_DEBOUNCE reads true. Setting it
+    // here too is redundant but documents the dependency.
     const c = await pool.connect();
     try {
       const t0 = new Date(Date.now() - 3000);
