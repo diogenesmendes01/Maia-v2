@@ -6,12 +6,14 @@
 // tests, so lint is here mainly to catch unused vars, unsafe `any`, and the
 // usual style smells.
 //
-// `no-floating-promises` is enabled at warn level for src/ + scripts/ via the
+// `no-floating-promises` is enabled at warn level for src/ only, via the
 // type-aware parser (`projectService: true`). Promises that go un-awaited
-// silently fail in Node, so this is a high-value rule. We intentionally do
-// NOT enable it on tests/ — Vitest specs deliberately fire-and-forget in some
-// `beforeEach`/`afterAll` hooks, and the rule's no-op fallback doesn't pay
-// for the lint-time cost there. Other heavy type-aware rules
+// silently fail in Node, so this is a high-value rule. Scripts/ are kept on
+// the lighter parser because tsconfig.json includes only src/, and pulling
+// scripts/ into the type-aware project would force tsc to compile them
+// (they run via tsx, not via dist) — see the scripts block below. tests/
+// also stays off the rule: Vitest specs deliberately fire-and-forget in
+// some `beforeEach`/`afterAll` hooks. Other heavy type-aware rules
 // (strict-boolean, no-unsafe-*) stay off pending a follow-up.
 
 import js from '@eslint/js';
