@@ -10,14 +10,42 @@
  *
  * This spec runs the JSONB lookup, the bulk conversa-id update, and the
  * mark-processed sequence against a real database so a regression in any
- * of those three paths fails CI. Mocks the LLM + outbound dispatch so we
- * don't need network or WhatsApp; everything else is real Postgres.
+ * of those three paths fails CI. Stubs the queue/baileys chain at module
+ * load (those don't need a live Redis for the aggregator path) so we can
+ * import the production `_internal.aggregateUnprocessedTexts` directly
+ * instead of reimplementing its logic in the test.
  *
  * Skipped without TEST_DB_URL so unit-only CI lanes keep passing.
  */
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
 import pg from 'pg';
 import { randomInt } from 'node:crypto';
+
+// Stub the queue/baileys/redis chain so importing src/agent/core.js
+// (for `_internal.aggregateUnprocessedTexts`) doesn't try to open a
+// BullMQ Queue or a Baileys socket. The DB layer is real.
+vi.mock('../../src/lib/redis.js', () => ({
+  redis: {},
+  isRedisConnected: () => false,
+  ensureRedisConnect: vi.fn(),
+}));
+vi.mock('../../src/gateway/queue.js', () => ({
+  agentQueue: { add: vi.fn(), getJob: vi.fn() },
+  startAgentWorker: vi.fn(),
+  enqueueAgent: vi.fn(),
+  shutdownQueue: vi.fn(),
+}));
+vi.mock('../../src/gateway/baileys.js', () => ({
+  isBaileysConnected: () => false,
+  getSocket: () => null,
+  startBaileys: vi.fn(),
+  shutdownBaileys: vi.fn(),
+  triggerPairingCode: vi.fn(),
+  isReactionStub: () => false,
+  REACTION_STUB_TYPE: 67,
+  MEDIA_ROOT: '/tmp/media',
+  getLastDisconnectAt: () => null,
+}));
 
 const SHOULD_RUN =
   !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
@@ -186,7 +214,7 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
     }
   });
 
-  it('aggregateUnprocessedTexts merges chronologically and respects an already-processed sibling', async () => {
+  it('aggregateUnprocessedTexts (production fn) merges chronologically and respects an already-processed sibling', async () => {
     process.env.FEATURE_MESSAGE_DEBOUNCE = 'true';
     const c = await pool.connect();
     try {
@@ -201,43 +229,30 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
       const target = await mensagensRepo.findById(id3);
       expect(target).not.toBeNull();
 
-      // We can't import agent/core directly without dragging the queue/baileys
-      // load chain into the spec — but the aggregator's logic is exercised
-      // via the same mensagensRepo.listUnprocessedByTelefone path it uses
-      // internally. Rebuild the merge here so the test asserts the *shape*
-      // of what the production code consumes.
-      const siblings = await mensagensRepo.listUnprocessedByTelefone(telefone, {
-        excludeId: target!.id,
-      });
-      const targetMs = target!.created_at?.getTime() ?? Date.now();
-      const text = siblings
-        .filter(
-          (m) =>
-            m.tipo === 'texto' &&
-            (m.conteudo ?? '').length > 0 &&
-            (m.created_at?.getTime() ?? 0) <= targetMs,
-        )
-        .map((m) => m.conteudo)
-        .concat(target!.conteudo)
-        .filter((s): s is string => !!s)
-        .join('\n');
-      expect(text).toBe('Oi,\ncomo vai\na finança?');
+      // Import the real aggregator (queue/baileys are stubbed at module
+      // top so this load chain doesn't open a Redis socket). This is the
+      // exact function the agent worker calls in production — the spec
+      // catches regressions in feature flag, conversa guard, separator,
+      // and merged_ids that a re-implementation would not.
+      const { _internal } = await import('../../src/agent/core.js');
+      const out = await _internal.aggregateUnprocessedTexts(target!);
+      expect(out.text).toBe('Oi,\ncomo vai\na finança?');
+      expect(out.merged_ids).toEqual(expect.arrayContaining([id1, id2]));
+      expect(out.merged_ids).not.toContain(id3); // target is excluded
 
-      // Process id2 to simulate a partial run; the next listUnprocessed
-      // should drop it from the result.
+      // Process id2 to simulate a partial run; the next aggregator call
+      // should drop it from the merge.
       await mensagensRepo.markProcessed(id2, 0);
-      const after = await mensagensRepo.listUnprocessedByTelefone(telefone, {
-        excludeId: target!.id,
-      });
-      expect(after.find((m) => m.id === id2)).toBeUndefined();
-      expect(after.find((m) => m.id === id1)).toBeDefined();
+      const after = await _internal.aggregateUnprocessedTexts(target!);
+      expect(after.text).toBe('Oi,\na finança?');
+      expect(after.merged_ids).toEqual([id1]);
     } finally {
       await cleanup();
       c.release();
     }
   });
 
-  it('end-to-end: setConversaIdMany + markProcessed sequence is idempotent', async () => {
+  it('re-running markProcessed does NOT cause the recovery worker to reprocess (queries skip the row)', async () => {
     const c = await pool.connect();
     try {
       const id1 = await insertInbound(c, { conversa_id: null, telefone, conteudo: 'a' });
@@ -250,22 +265,37 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
       await mensagensRepo.markProcessed(id2, 0);
       await mensagensRepo.markProcessed(id3, 20);
 
-      // Re-running the recovery worker on already-processed rows must be a
-      // no-op: processada_em stays set, tokens unchanged, conversa_id sticks.
+      // The "idempotency" we care about is: even if a recovery worker
+      // hits an already-processed row again, the row stays excluded from
+      // the unprocessed-query so the agent never runs twice. The
+      // implementation overwrites processada_em + tokens_usados on every
+      // call (not strictly idempotent at the row level), but that's
+      // acceptable because the safety property is on the QUERY, not the
+      // row. Assert both: the row is still excluded, and tokens_usados
+      // does get overwritten (so the test reflects real behaviour).
       await mensagensRepo.markProcessed(id1, 999);
 
-      const r = await c.query<{ id: string; processada_em: Date | null; conversa_id: string | null }>(
-        `SELECT id, processada_em, conversa_id FROM mensagens WHERE id = ANY($1)`,
+      const r = await c.query<{ id: string; processada_em: Date | null; tokens_usados: number | null; conversa_id: string | null }>(
+        `SELECT id, processada_em, tokens_usados, conversa_id FROM mensagens WHERE id = ANY($1)`,
         [[id1, id2, id3]],
       );
       for (const row of r.rows) {
         expect(row.processada_em).not.toBeNull();
       }
-      // The two we batched share the conversa; id3 was inserted standalone
-      // and only sees its own chain.
       const byId = new Map(r.rows.map((row) => [row.id, row]));
       expect(byId.get(id1)!.conversa_id).toBe(conversa_id);
       expect(byId.get(id2)!.conversa_id).toBe(conversa_id);
+      // Documented behaviour: the second call overwrites tokens_usados.
+      // If we ever want strict idempotency, the markProcessed signature
+      // needs a guard. For now the safety property is purely query-side.
+      expect(byId.get(id1)!.tokens_usados).toBe(999);
+
+      // The query-side safety: an unprocessed-only fetch must NOT return
+      // any of the three rows.
+      const stillUnprocessed = await mensagensRepo.listUnprocessedByTelefone(telefone);
+      expect(stillUnprocessed.find((m) => m.id === id1)).toBeUndefined();
+      expect(stillUnprocessed.find((m) => m.id === id2)).toBeUndefined();
+      expect(stillUnprocessed.find((m) => m.id === id3)).toBeUndefined();
     } finally {
       await cleanup();
       c.release();
