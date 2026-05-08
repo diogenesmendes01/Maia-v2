@@ -22,6 +22,17 @@ const SESSION_TTL_HOURS = 8;
 const SESSION_TTL_MS = SESSION_TTL_HOURS * 3600 * 1000;
 const MAGIC_LINK_TTL_MS = 5 * 60 * 1000;
 
+/**
+ * Build a `Set-Cookie` value for `maia_session`. Login + logout share this
+ * helper so the cookie attributes can't drift. Adds `Secure` only in
+ * production — keeping it off for development means localhost (which is HTTP)
+ * still works.
+ */
+export function sessionCookie(value: string, maxAgeS: number): string {
+  const secure = config.NODE_ENV === 'production' ? '; Secure' : '';
+  return `maia_session=${value}; HttpOnly; Path=/; Max-Age=${maxAgeS}; SameSite=Strict${secure}`;
+}
+
 type Scope = { entidades: string[]; byEntity: Map<string, ResolvedPermission> };
 
 function entitiesAllowing(scope: Scope, action: ActionKey): string[] {
@@ -116,10 +127,7 @@ export async function registerDashboardRoutes(app: FastifyInstance): Promise<voi
       .set({ used_at: new Date(), expira_em: sessionExpiresAt })
       .where(eq(dashboard_sessions.id, sess.id));
     reply
-      .header(
-        'set-cookie',
-        `maia_session=${token}; HttpOnly; Path=/; Max-Age=${SESSION_TTL_HOURS * 3600}; SameSite=Strict`,
-      )
+      .header('set-cookie', sessionCookie(token, SESSION_TTL_HOURS * 3600))
       .send({ ok: true });
   });
 
@@ -251,7 +259,7 @@ export async function registerDashboardRoutes(app: FastifyInstance): Promise<voi
       await audit({ acao: 'dashboard_session_ended', pessoa_id });
     }
     reply
-      .header('set-cookie', 'maia_session=; HttpOnly; Path=/; Max-Age=0; SameSite=Strict')
+      .header('set-cookie', sessionCookie('', 0))
       .send({ ok: true });
   });
 }
