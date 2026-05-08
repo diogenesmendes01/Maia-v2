@@ -62,6 +62,7 @@ Proponha uma regra ou diga não aplicável.`;
       messages: [{ role: 'user', content: user }],
       max_tokens: 400,
       temperature: 0.0,
+      pessoa_id: input.pessoa.id,
     });
     const text = res.content?.trim() ?? '';
     const match = text.match(/\{[\s\S]*\}/);
