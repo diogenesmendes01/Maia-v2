@@ -10,7 +10,6 @@ export const pool = new pg.Pool({
 });
 
 pool.on('error', (err) => {
-  // eslint-disable-next-line no-console
   console.error('pg pool error', err);
 });
 

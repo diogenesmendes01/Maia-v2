@@ -144,8 +144,8 @@ describe('openrouter converters', () => {
       usage: { prompt_tokens: 1, completion_tokens: 1024, total_tokens: 1025 },
     };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    expect((await import('../../src/lib/claude.js')).fromOpenAIResponse(stopRes as any).stop_reason).toBe('end_turn');
+    expect(fromOpenAIResponse(stopRes as any).stop_reason).toBe('end_turn');
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    expect((await import('../../src/lib/claude.js')).fromOpenAIResponse(lenRes as any).stop_reason).toBe('max_tokens');
+    expect(fromOpenAIResponse(lenRes as any).stop_reason).toBe('max_tokens');
   });
 });
