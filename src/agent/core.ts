@@ -32,38 +32,52 @@ const AGGREGATE_SEPARATOR = '\n';
  * Inbound-text aggregation for the message-debounce path.
  *
  * When FEATURE_MESSAGE_DEBOUNCE is on, baileys schedules a delayed BullMQ
- * job per user instead of enqueueing immediately, so chunked typing
- * arrives at the LLM as a single coherent turn. By the time this worker
- * fires, one or more older inbound text messages may exist for the same
- * telefone with `processada_em IS NULL`.
+ * job per user (instead of enqueueing each message immediately), so
+ * chunked typing arrives at the LLM as a single coherent turn. The job's
+ * `mensagem_id` always points to the LATEST message at scheduling time;
+ * when the worker fires, this function pulls older unprocessed siblings
+ * for the same telefone and concatenates them in chronological order.
+ *
+ * **Two correctness gates — both required**:
+ *
+ * 1. **Feature flag**: when `FEATURE_MESSAGE_DEBOUNCE` is off, baileys
+ *    enqueues one job per inbound. The first job's target is the FIRST
+ *    chunk, not the last; aggregating here would (a) put the prompt in
+ *    reverse order ("M2\nM1") and (b) mark M2 processed before its own
+ *    job runs, causing the M2 job to early-return and never produce a
+ *    turn. Off-flag must mean "one inbound, one turn" — period.
+ *
+ * 2. **`created_at <= target.created_at`**: even on-flag, never aggregate
+ *    siblings that are NEWER than the target. This protects against:
+ *      - `message-recovery` requeueing an old-stuck message: target is
+ *        ancient, but younger siblings shouldn't get folded in.
+ *      - DLQ replay of an old job: same shape.
+ *      - Race with a brand-new inbound that arrived in the window
+ *        between job dispatch and worker pickup.
  *
  * Sibling lookup is keyed by **telefone** (`metadata->>'telefone'`), not
  * conversa_id: baileys persists every inbound with `conversa_id = NULL`
  * and resolution happens here in `runAgentForMensagem`. Earlier chunks
  * from the same burst are still NULL-attached when this runs, so a
- * conversa_id query would silently miss them — only the target chunk
- * would reach the LLM and the rest would limp through `message-recovery`
- * 2 minutes later as separate turns. Keying by telefone catches them.
+ * conversa_id query would silently miss them.
  *
- * Defense-in-depth: we also accept already-attached siblings whose
- * conversa_id matches the target's, in case the target was resolved
- * mid-burst and adopted a sibling synchronously somewhere else.
- * Cross-conversation leakage isn't a concern in this codebase
- * (telefone ↔ pessoa ↔ conversa is 1:1) but the explicit filter
- * documents the intent.
+ * We accept orphans (conversa_id NULL — caller adopts them) OR already-
+ * attached siblings whose conversa_id matches. Cross-conversation
+ * leakage isn't a real concern (telefone ↔ pessoa ↔ conversa is 1:1)
+ * but the filter documents the intent.
  *
- * Only `tipo = 'texto'` siblings are merged. Media bypasses the buffer
- * upstream (see baileys.handleIncoming).
- *
- * Returns the aggregated text and the ids of merged siblings; the
- * caller is responsible for adopting any orphans (conversa_id NULL) into
- * the target's conversa and marking them processed.
+ * Only `tipo = 'texto'` is merged. Media bypasses the debouncer
+ * upstream (see `baileys.handleIncoming`).
  */
 async function aggregateUnprocessedTexts(target: Mensagem): Promise<{
   text: string;
   merged_ids: string[];
 }> {
   const targetText = target.conteudo ?? '';
+
+  // Gate 1: off-flag → no aggregation. Each inbound is its own turn.
+  if (!config.FEATURE_MESSAGE_DEBOUNCE) return { text: targetText, merged_ids: [] };
+
   const tel = (target.metadata as Record<string, unknown> | null)?.['telefone'];
   if (typeof tel !== 'string' || tel.length === 0) {
     return { text: targetText, merged_ids: [] };
@@ -72,20 +86,23 @@ async function aggregateUnprocessedTexts(target: Mensagem): Promise<{
   const siblings = await mensagensRepo.listUnprocessedByTelefone(tel, {
     excludeId: target.id,
   });
+
+  // Gate 2: only siblings strictly older than (or equal to) the target.
+  // `created_at` is timestamptz; getTime() gives ms epoch. Falsy guard
+  // covers the rare null path (db rows always have created_at, but TS
+  // sees it as Date | null on some inferred shapes).
+  const targetMs = target.created_at?.getTime() ?? Date.now();
+
   const textSiblings = siblings.filter(
     (m) =>
       m.tipo === 'texto' &&
       (m.conteudo ?? '').length > 0 &&
-      // Accept orphans (will be adopted by caller) OR already-attached
-      // siblings whose conversa_id matches. Reject cross-conversation
-      // siblings as a defensive guard.
+      (m.created_at?.getTime() ?? 0) <= targetMs &&
       (m.conversa_id === null || m.conversa_id === target.conversa_id),
   );
   if (textSiblings.length === 0) return { text: targetText, merged_ids: [] };
 
-  // Chronological order: oldest sibling first, target last (it IS the
-  // newest, since baileys schedules the debounced job pointing at the
-  // most-recent inbound).
+  // Chronological order: oldest sibling first, target last.
   const parts = textSiblings.map((m) => m.conteudo ?? '');
   const merged = [...parts, targetText].filter((s) => s.length > 0).join(AGGREGATE_SEPARATOR);
   return { text: merged, merged_ids: textSiblings.map((m) => m.id) };
