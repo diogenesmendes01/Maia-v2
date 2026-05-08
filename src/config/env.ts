@@ -72,6 +72,14 @@ const envSchema = z
     BACKUP_RETENTION_LOCAL_DAYS: z.coerce.number().int().positive().default(7),
     BACKUP_RETENTION_CLOUD_DAYS: z.coerce.number().int().positive().default(30),
     BACKUP_S3_BUCKET: z.string().optional(),
+    // Optional custom endpoint for S3-compatible providers (Backblaze B2,
+    // Cloudflare R2, Wasabi, etc.). Leave unset for AWS S3 native.
+    BACKUP_S3_ENDPOINT: z.string().url().optional(),
+    BACKUP_S3_REGION: z.string().default('us-east-1'),
+    BACKUP_S3_ACCESS_KEY: z.string().optional(),
+    BACKUP_S3_SECRET_KEY: z.string().optional(),
+    // S3 path prefix inside the bucket (no leading or trailing slash).
+    BACKUP_S3_PREFIX: z.string().default('maia'),
 
     DAILY_LLM_USD_THRESHOLD: z.coerce.number().positive().default(5),
     DLQ_ALERT_THRESHOLD: z.coerce.number().int().positive().default(10),
