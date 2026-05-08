@@ -120,6 +120,18 @@ const envSchema = z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
+    // Message debounce: hold incoming text messages from the same user for a
+    // short window so chunked typing ("Oi, " / "como está " / "a finança?")
+    // arrives at the LLM as a single coherent turn. Off by default — when on,
+    // each new text resets the timer up to MESSAGE_DEBOUNCE_MAX_MS, then the
+    // worker aggregates all unprocessed inbound texts in the conversation.
+    // Media (audio/imagem/documento) bypasses the buffer and runs immediately.
+    FEATURE_MESSAGE_DEBOUNCE: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
+    MESSAGE_DEBOUNCE_MS: z.coerce.number().int().positive().default(5000),
+    MESSAGE_DEBOUNCE_MAX_MS: z.coerce.number().int().positive().default(30000),
     // SETUP: optional override for the bootstrap token. When set, bypasses
     // the file-backed token. Discouraged in prod (env vars leak more than
     // file mode 0o600). Useful for dev / scripted deploys / E2E tests.

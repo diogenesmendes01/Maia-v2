@@ -232,6 +232,36 @@ export const mensagensRepo = {
       .orderBy(desc(mensagens.created_at))
       .limit(n);
   },
+  /**
+   * Inbound messages in a conversation that haven't been processed yet,
+   * in chronological order (oldest first). Used by the debounce
+   * aggregation path: when the worker fires the debounced job, it
+   * concatenates the content of all unprocessed inbound texts so the
+   * LLM sees one coherent turn instead of N partial chunks.
+   *
+   * `excludeId` lets the caller skip the "target" message that triggered
+   * the run, so callers can append it explicitly with its own metadata.
+   */
+  async listUnprocessedInConversation(
+    conversa_id: string,
+    opts?: { excludeId?: string; limit?: number },
+  ): Promise<Mensagem[]> {
+    const limit = opts?.limit ?? 50;
+    const rows = await db
+      .select()
+      .from(mensagens)
+      .where(
+        and(
+          eq(mensagens.conversa_id, conversa_id),
+          eq(mensagens.direcao, 'in'),
+          isNull(mensagens.processada_em),
+        ),
+      )
+      .orderBy(mensagens.created_at)
+      .limit(limit);
+    if (opts?.excludeId) return rows.filter((r) => r.id !== opts.excludeId);
+    return rows;
+  },
   async setConversaId(id: string, conversa_id: string): Promise<void> {
     await db.update(mensagens).set({ conversa_id }).where(eq(mensagens.id, id));
   },

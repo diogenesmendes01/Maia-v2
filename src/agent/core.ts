@@ -5,8 +5,10 @@ import { checkRateLimit, formatPoliteReply } from '@/gateway/rate-limit.js';
 import { resolveIdentity } from '@/identity/resolver.js';
 import { handleQuarantineFirstContact, handleOwnerIdentityReply } from '@/identity/quarantine.js';
 import { config } from '@/config/env.js';
+import { clearDebounceState } from '@/gateway/debouncer.js';
 import { buildPrompt } from './prompt-builder.js';
 import { logger } from '@/lib/logger.js';
+import type { Mensagem } from '@/db/schema.js';
 import { audit } from '@/governance/audit.js';
 import { getToolSchemas } from '@/tools/_registry.js';
 import { startTyping } from '@/gateway/presence.js';
@@ -19,6 +21,52 @@ import { sendOutbound } from './output-dispatch.js';
 import { runReActLoop } from './react-loop.js';
 
 const TYPING_DEBOUNCE_MS = 1500;
+
+/** Separator between aggregated chunks. Plain newline keeps the LLM's
+ * tokenizer happy while letting it see the chunk boundaries the user
+ * originally created — sometimes meaningful (e.g., "ok" / "espera" /
+ * "deixa eu pensar"). */
+const AGGREGATE_SEPARATOR = '\n';
+
+/**
+ * Inbound-text aggregation for the message-debounce path.
+ *
+ * When FEATURE_MESSAGE_DEBOUNCE is on, baileys schedules a delayed BullMQ
+ * job per user instead of enqueueing immediately, so chunked typing arrives
+ * at the LLM as a single coherent turn. By the time this worker fires, one
+ * or more older inbound text messages may exist in the same conversation
+ * with `processada_em IS NULL`. We merge them into the target inbound's
+ * `conteudo` and remember the sibling ids so the caller can mark them all
+ * processed atomically with the target.
+ *
+ * Only `tipo = 'texto'` siblings are merged. Media (audio/imagem/documento)
+ * is left in place — the recovery worker will pick those up on its own
+ * 2-minute sweep, or the next inbound-text run will sweep them. Aggregating
+ * media into a text turn would change the agent's branching (audio reply,
+ * image OCR, etc.), which is out of scope here.
+ *
+ * Returns the aggregated text and the ids of merged siblings.
+ */
+async function aggregateUnprocessedTexts(target: Mensagem): Promise<{
+  text: string;
+  merged_ids: string[];
+}> {
+  const targetText = target.conteudo ?? '';
+  if (!target.conversa_id) return { text: targetText, merged_ids: [] };
+
+  const siblings = await mensagensRepo.listUnprocessedInConversation(target.conversa_id, {
+    excludeId: target.id,
+  });
+  const textSiblings = siblings.filter((m) => m.tipo === 'texto' && (m.conteudo ?? '').length > 0);
+  if (textSiblings.length === 0) return { text: targetText, merged_ids: [] };
+
+  // Chronological order: oldest sibling first, target last (it IS the
+  // newest, since baileys schedules the debounced job pointing at the
+  // most-recent inbound).
+  const parts = textSiblings.map((m) => m.conteudo ?? '');
+  const merged = [...parts, targetText].filter((s) => s.length > 0).join(AGGREGATE_SEPARATOR);
+  return { text: merged, merged_ids: textSiblings.map((m) => m.id) };
+}
 
 /**
  * Returns a stopper. The stopper either cancels the pending start (if called
@@ -35,7 +83,7 @@ function scheduleTypingDebounce(jid: string, mensagem_id: string): () => void {
   };
 }
 
-export const _internal = { scheduleTypingDebounce, sendOutbound };
+export const _internal = { scheduleTypingDebounce, sendOutbound, aggregateUnprocessedTexts };
 
 export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
   const inbound = await mensagensRepo.findById(mensagem_id);
@@ -93,6 +141,51 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
   }
   const { conversa: c, pessoa } = conv;
 
+  // Debounce aggregation: concatenate any older unprocessed inbound texts
+  // in this conversation into the target's content so the LLM sees one
+  // turn instead of N partial chunks. No-op when there are no siblings,
+  // so this is safe to run unconditionally — the recovery path also
+  // benefits (a crash mid-debounce leaves siblings, this sweeps them).
+  // We mutate `inbound.conteudo` in memory only — DB rows for siblings
+  // are left intact and marked processed at the end.
+  const aggregated = inbound.conteudo
+    ? await aggregateUnprocessedTexts(inbound).catch((err) => {
+        logger.warn(
+          { err: (err as Error).message, mensagem_id: inbound.id },
+          'agent.aggregate_failed_continuing_solo',
+        );
+        return { text: inbound.conteudo ?? '', merged_ids: [] as string[] };
+      })
+    : { text: '', merged_ids: [] as string[] };
+  if (aggregated.merged_ids.length > 0) {
+    inbound.conteudo = aggregated.text;
+    logger.info(
+      {
+        mensagem_id: inbound.id,
+        merged_count: aggregated.merged_ids.length,
+        conversa_id: c.id,
+      },
+      'agent.debounce_aggregated',
+    );
+  }
+  const allInboundIds = [...aggregated.merged_ids, inbound.id];
+  const markAllProcessed = async (tokens: number | null): Promise<void> => {
+    // Per-row update keeps the existing repo contract (single-id) and
+    // mirrors the audit semantics: each row gets its own processada_em.
+    // Errors on individual rows are swallowed so one failure can't block
+    // the others — recovery worker will catch any stragglers.
+    for (const id of allInboundIds) {
+      try {
+        await mensagensRepo.markProcessed(id, id === inbound.id ? tokens : 0);
+      } catch (err) {
+        logger.warn(
+          { err: (err as Error).message, mensagem_id: id },
+          'agent.mark_processed_failed',
+        );
+      }
+    }
+  };
+
   // Spec 03 §9 — sliding-hour rate limit. Owners exempt; others get one
   // polite reply per hour, then 60s of silence after each warning.
   const decision = await checkRateLimit(pessoa);
@@ -110,8 +203,9 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
         logger.warn({ err: (err as Error).message }, 'agent.rate_limit_reply_failed'),
       );
     }
-    await mensagensRepo.markProcessed(inbound.id, 0);
+    await markAllProcessed(0);
     await conversasRepo.touch(c.id);
+    await clearDebounceState(pessoa.telefone_whatsapp);
     return;
   }
 
@@ -120,8 +214,9 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
   // action and audited it; we just close the loop and skip the ReAct turn.
   const gate = await checkPendingFirst({ pessoa, conversa: c, inbound });
   if (gate.kind === 'resolved') {
-    await mensagensRepo.markProcessed(inbound.id, 0);
+    await markAllProcessed(0);
     await conversasRepo.touch(c.id);
+    await clearDebounceState(pessoa.telefone_whatsapp);
     return;
   }
   // 'unresolved' and 'no_pending' fall through to the existing ReAct flow.
@@ -155,8 +250,9 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
     stopTyping();
   }
 
-  await mensagensRepo.markProcessed(inbound.id, totalTokens);
+  await markAllProcessed(totalTokens);
   await conversasRepo.touch(c.id);
+  await clearDebounceState(pessoa.telefone_whatsapp);
 
   // Reflection trigger: correction detection (real-time)
   if (inbound.conteudo && detectCorrection(inbound.conteudo)) {
