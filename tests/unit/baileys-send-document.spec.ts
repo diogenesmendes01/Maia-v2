@@ -25,6 +25,30 @@ vi.mock('../../src/db/repositories.js', () => ({
 
 vi.mock('../../src/governance/audit.js', () => ({ audit: vi.fn() }));
 
+// Mock the redis-touching transitive modules so importing baileys.ts
+// doesn't try to open a TCP connection to localhost:6379. The unit suite
+// runs without a live Redis; without these stubs the module-load chain
+// (baileys → queue → ioredis, baileys → bot-detection → redis) emits
+// ECONNREFUSED stderr noise even when tests pass.
+vi.mock('../../src/lib/redis.js', () => ({
+  redis: {},
+  isRedisConnected: () => false,
+  ensureRedisConnect: vi.fn(),
+}));
+vi.mock('../../src/gateway/queue.js', () => ({
+  agentQueue: { add: vi.fn() },
+  startAgentWorker: vi.fn(),
+  enqueueAgent: vi.fn(),
+  shutdownQueue: vi.fn(),
+}));
+vi.mock('../../src/gateway/bot-detection.js', () => ({
+  checkBotAndMaybeBlock: vi.fn().mockResolvedValue(false),
+}));
+vi.mock('../../src/gateway/dedup.js', () => ({
+  isDuplicate: vi.fn().mockResolvedValue(false),
+  markSeen: vi.fn(),
+}));
+
 vi.mock('../../src/config/env.js', () => ({
   config: {
     BAILEYS_AUTH_DIR: join(SANDBOX, '.baileys'),

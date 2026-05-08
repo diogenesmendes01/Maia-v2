@@ -19,11 +19,27 @@ vi.mock('../../src/gateway/dedup.js', () => ({
 }));
 
 vi.mock('../../src/gateway/queue.js', () => ({
+  agentQueue: { add: vi.fn() },
+  startAgentWorker: vi.fn(),
   enqueueAgent: vi.fn(),
+  shutdownQueue: vi.fn(),
 }));
 
 vi.mock('../../src/governance/audit.js', () => ({
   audit: vi.fn(),
+}));
+
+// Stub the redis client so the module-load chain (baileys → bot-detection
+// → redis) doesn't try to open a TCP connection to localhost:6379. Without
+// this, ioredis emits ECONNREFUSED on stderr — the tests still pass but
+// the noise can mask real issues in CI logs.
+vi.mock('../../src/lib/redis.js', () => ({
+  redis: {},
+  isRedisConnected: () => false,
+  ensureRedisConnect: vi.fn(),
+}));
+vi.mock('../../src/gateway/bot-detection.js', () => ({
+  checkBotAndMaybeBlock: vi.fn().mockResolvedValue(false),
 }));
 
 import { isReactionStub } from '../../src/gateway/baileys.js';
