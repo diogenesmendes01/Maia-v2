@@ -18,7 +18,7 @@ const THRESHOLD = 50; // > 50 msgs/min → auto-block per spec 05 §11.4
  */
 export async function checkBotAndMaybeBlock(tel: string): Promise<boolean> {
   if (!isRedisConnected()) return false; // degraded: skip rather than fail-open
-  let count = 0;
+  let count: number;
   try {
     count = await redis.incr(KEY(tel));
     if (count === 1) await redis.expire(KEY(tel), WINDOW_SECONDS);

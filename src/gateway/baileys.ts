@@ -18,6 +18,7 @@ import { mensagensRepo } from '@/db/repositories.js';
 import { isDuplicate, markSeen } from './dedup.js';
 import { markRead } from './presence.js';
 import { enqueueAgent } from './queue.js';
+import { scheduleDebouncedAgent } from './debouncer.js';
 import { checkBotAndMaybeBlock } from './bot-detection.js';
 import { audit } from '@/governance/audit.js';
 import { dispatchReactionAsAnswer, dispatchPollVote } from '@/agent/one-tap.js';
@@ -272,6 +273,36 @@ async function handleIncoming(msg: proto.IWebMessageInfo): Promise<void> {
     await audit({ acao: 'duplicate_message_dropped', metadata: { whatsapp_id, source: 'db_unique' } });
     return;
   }
+
+  // Debounce path: only chunked-typing of TEXT messages benefits from
+  // buffering. Media (audio/imagem/documento) carries enough self-contained
+  // signal to process immediately, and aggregating media + text in one turn
+  // would require reshaping extractContent and several agent-core branches
+  // — out of scope for this change.
+  if (config.FEATURE_MESSAGE_DEBOUNCE && type === 'texto') {
+    try {
+      const result = await scheduleDebouncedAgent({ key: tel, mensagem_id: stored.id });
+      logger.info(
+        {
+          mensagem_id: stored.id,
+          tel: '[REDACTED]',
+          debounce: result.kind,
+          ...(result.kind === 'scheduled' ? { reset: result.reset } : {}),
+        },
+        'baileys.message.debounced',
+      );
+      return;
+    } catch (err) {
+      // Redis/BullMQ hiccup → fall through to immediate enqueue so the
+      // message isn't lost. The aggregation step in the agent worker is
+      // forgiving: it picks up unprocessed siblings either way.
+      logger.warn(
+        { err: (err as Error).message, mensagem_id: stored.id },
+        'baileys.debounce_failed_fallback_immediate',
+      );
+    }
+  }
+
   await enqueueAgent({ mensagem_id: stored.id });
   logger.info({ mensagem_id: stored.id, tel: '[REDACTED]' }, 'baileys.message.enqueued');
 }

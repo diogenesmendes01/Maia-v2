@@ -232,8 +232,57 @@ export const mensagensRepo = {
       .orderBy(desc(mensagens.created_at))
       .limit(n);
   },
+  /**
+   * Inbound messages from a given telefone (`metadata->>'telefone'`) that
+   * haven't been processed yet, in chronological order (oldest first).
+   *
+   * Keyed off telefone — NOT conversa_id — because at the moment the
+   * debounce worker fires, only the target message has had its
+   * conversa_id resolved by the agent. Earlier chunks from the same
+   * burst still carry `conversa_id IS NULL` (baileys saves all inbounds
+   * with null conversa_id; resolution happens in `runAgentForMensagem`).
+   * Querying by conversa_id would silently miss them.
+   *
+   * `excludeId` lets the caller skip the "target" message that triggered
+   * the run. The result includes orphans (`conversa_id IS NULL`) and
+   * messages already attached to a conversa — caller filters by
+   * conversa_id == target's OR null to avoid cross-conversation leakage
+   * (defensive: telefone is 1:1 with pessoa, so leakage is theoretical).
+   */
+  async listUnprocessedByTelefone(
+    telefone: string,
+    opts?: { excludeId?: string; limit?: number },
+  ): Promise<Mensagem[]> {
+    const limit = opts?.limit ?? 50;
+    const rows = await db
+      .select()
+      .from(mensagens)
+      .where(
+        and(
+          eq(mensagens.direcao, 'in'),
+          isNull(mensagens.processada_em),
+          sql`metadata->>'telefone' = ${telefone}`,
+        ),
+      )
+      .orderBy(mensagens.created_at)
+      .limit(limit);
+    if (opts?.excludeId) return rows.filter((r) => r.id !== opts.excludeId);
+    return rows;
+  },
   async setConversaId(id: string, conversa_id: string): Promise<void> {
     await db.update(mensagens).set({ conversa_id }).where(eq(mensagens.id, id));
+  },
+  /**
+   * Bulk variant for the debounce aggregation path: adopts orphan
+   * inbound rows (conversa_id null) into the conversation that the
+   * target message resolved to. One UPDATE round-trip instead of N.
+   */
+  async setConversaIdMany(ids: string[], conversa_id: string): Promise<void> {
+    if (ids.length === 0) return;
+    await db
+      .update(mensagens)
+      .set({ conversa_id })
+      .where(inArray(mensagens.id, ids));
   },
   async markProcessed(id: string, tokens: number | null): Promise<void> {
     await db

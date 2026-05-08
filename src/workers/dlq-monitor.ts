@@ -36,7 +36,7 @@ export async function runDlqMonitor(): Promise<void> {
   // Redis-backed throttle so a sustained backlog doesn't spam every 5min.
   // SET … NX EX returns 'OK' when the key was set (i.e. no recent alert);
   // null when the key already exists.
-  let acquired = false;
+  let acquired: boolean;
   try {
     const result = await redis.set(ALERT_KEY, String(Date.now()), 'EX', ALERT_TTL_S, 'NX');
     acquired = result === 'OK';

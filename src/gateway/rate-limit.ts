@@ -41,7 +41,7 @@ export async function checkRateLimit(pessoa: Pessoa): Promise<RateLimitDecision>
   const cutoff = now - HOUR_MS;
   const countKey = COUNT_KEY(pessoa.id);
 
-  let count = 0;
+  let count: number;
   try {
     await redis.zremrangebyscore(countKey, 0, cutoff);
     // Score is `now`; member is `now-<rand>` to avoid collapsing concurrent
