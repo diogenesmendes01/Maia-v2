@@ -3,6 +3,7 @@ import {
   DisconnectReason,
   useMultiFileAuthState,
   downloadMediaMessage,
+  fetchLatestBaileysVersion,
   type WASocket,
   type proto,
 } from '@whiskeysockets/baileys';
@@ -162,7 +163,23 @@ async function handleConnectionUpdate(update: ConnectionUpdate): Promise<void> {
 
 export async function startBaileys(): Promise<void> {
   const { state, saveCreds } = await useMultiFileAuthState(config.BAILEYS_AUTH_DIR);
-  socket = makeWASocket({ auth: state, printQRInTerminal: false });
+  // Pin the WA Web protocol version to whatever WhatsApp is currently
+  // serving. Without this, Baileys uses the version hardcoded at the time
+  // the library was published — when WhatsApp ships a server-side bump,
+  // the handshake fails with "Connection Failure / reason: 405" before
+  // any QR or pairing code is emitted. fetchLatestBaileysVersion hits
+  // the upstream Baileys version manifest (cached by the library) and
+  // returns the current { version, isLatest } pair. Best-effort: if the
+  // fetch fails (offline boot, DNS), fall back to the library default.
+  let version: [number, number, number] | undefined;
+  try {
+    const latest = await fetchLatestBaileysVersion();
+    version = latest.version;
+    logger.info({ version, isLatest: latest.isLatest }, 'baileys.version_resolved');
+  } catch (err) {
+    logger.warn({ err: (err as Error).message }, 'baileys.version_fetch_failed');
+  }
+  socket = makeWASocket({ auth: state, version, printQRInTerminal: false });
 
   socket.ev.on('creds.update', saveCreds);
 
