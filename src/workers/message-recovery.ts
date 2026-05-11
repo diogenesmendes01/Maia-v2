@@ -1,6 +1,7 @@
 import { mensagensRepo } from '@/db/repositories.js';
 import { enqueueAgent } from '@/gateway/queue.js';
 import { logger } from '@/lib/logger.js';
+import { runWithTenantContext } from '@/db/tenant-context.js';
 
 const STUCK_AFTER_MS = 2 * 60 * 1000; // older than 2min and still unprocessed
 const MAX_PER_RUN = 200;
@@ -11,6 +12,14 @@ const MAX_PER_RUN = 200;
  * Idempotent: agent-core early-returns when processada_em is set.
  */
 export async function runMessageRecovery(): Promise<void> {
+  // P0: single-tenant default. P6 will fan-out per tenant.
+  await runWithTenantContext(
+    { tenant_id: 'default', agent_id: 'default' },
+    runMessageRecoveryInner,
+  );
+}
+
+async function runMessageRecoveryInner(): Promise<void> {
   const stuck = await mensagensRepo.listUnprocessedOlderThan(STUCK_AFTER_MS, MAX_PER_RUN);
   if (stuck.length === 0) return;
   let requeued = 0;

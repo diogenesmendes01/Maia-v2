@@ -7,6 +7,7 @@ import { logger } from '@/lib/logger.js';
 import { sendOutboundText, isBaileysConnected } from '@/gateway/baileys.js';
 import { audit } from '@/governance/audit.js';
 import { quotedReplyContext } from '@/gateway/presence.js';
+import { runWithTenantContext } from '@/db/tenant-context.js';
 
 const SCAN_LIMIT = 50;
 const MAX_REMINDERS = 2;
@@ -21,6 +22,14 @@ type Row = {
 };
 
 export async function runPendingReminder(): Promise<void> {
+  // P0: single-tenant default. P6 will fan-out per tenant.
+  await runWithTenantContext(
+    { tenant_id: 'default', agent_id: 'default' },
+    runPendingReminderInner,
+  );
+}
+
+async function runPendingReminderInner(): Promise<void> {
   if (!config.FEATURE_PENDING_REMINDER) return;
   if (!isBaileysConnected()) {
     logger.debug('pending_reminder.baileys_disconnected_skip');

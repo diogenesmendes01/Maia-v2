@@ -6,6 +6,7 @@ import { audit } from '@/governance/audit.js';
 import { sendAlert } from '@/lib/alerts.js';
 import { logger } from '@/lib/logger.js';
 import { isS3Configured, uploadBackup, pruneCloud } from './backup-s3.js';
+import { runWithTenantContext } from '@/db/tenant-context.js';
 
 function tsName(): string {
   return `maia-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.dump`;
@@ -20,6 +21,14 @@ function tsName(): string {
  * is logged once per run instead of failing.
  */
 export async function runNightlyBackup(): Promise<void> {
+  // P0: single-tenant default. P6 will fan-out per tenant.
+  await runWithTenantContext(
+    { tenant_id: 'default', agent_id: 'default' },
+    runNightlyBackupInner,
+  );
+}
+
+async function runNightlyBackupInner(): Promise<void> {
   mkdirSync(config.BACKUP_DIR, { recursive: true });
   const file = join(config.BACKUP_DIR, tsName());
 
@@ -83,25 +92,28 @@ export async function runNightlyBackup(): Promise<void> {
  * run fast and lets ops schedule it independently if needed.
  */
 export async function runCloudBackupRotation(): Promise<void> {
-  if (!isS3Configured()) {
-    logger.debug('backup.rotation_skipped_no_s3');
-    return;
-  }
-  try {
-    const { scanned, deleted } = await pruneCloud();
-    logger.info({ scanned, deleted }, 'backup.cloud_rotation_done');
-    await audit({
-      acao: 'backup_cloud_rotation_completed',
-      metadata: { scanned, deleted, retention_days: config.BACKUP_RETENTION_CLOUD_DAYS },
-    });
-  } catch (err) {
-    const message = (err as Error).message;
-    logger.error({ err: message }, 'backup.cloud_rotation_failed');
-    await audit({
-      acao: 'backup_cloud_rotation_failed',
-      metadata: { error: message },
-    });
-  }
+  // P0: single-tenant default. P6 will fan-out per tenant.
+  await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+    if (!isS3Configured()) {
+      logger.debug('backup.rotation_skipped_no_s3');
+      return;
+    }
+    try {
+      const { scanned, deleted } = await pruneCloud();
+      logger.info({ scanned, deleted }, 'backup.cloud_rotation_done');
+      await audit({
+        acao: 'backup_cloud_rotation_completed',
+        metadata: { scanned, deleted, retention_days: config.BACKUP_RETENTION_CLOUD_DAYS },
+      });
+    } catch (err) {
+      const message = (err as Error).message;
+      logger.error({ err: message }, 'backup.cloud_rotation_failed');
+      await audit({
+        acao: 'backup_cloud_rotation_failed',
+        metadata: { error: message },
+      });
+    }
+  });
 }
 
 function runPgDump(target: string): Promise<void> {

@@ -15,6 +15,7 @@ import { runAuditWatcher } from './audit-watcher.js';
 import { runDlqMonitor } from './dlq-monitor.js';
 import { runMorningBriefing, runEveningBriefing, runWeeklyBriefing } from './briefings.js';
 import { tickEngine } from '@/workflows/engine.js';
+import { runWithTenantContext } from '@/db/tenant-context.js';
 
 export type Job = { name: string; cron: string; fn: () => Promise<void>; phase: number };
 
@@ -24,7 +25,17 @@ export const JOBS: Job[] = [
   { name: 'pending_expirer', cron: '*/1 * * * *', fn: runPendingExpirer, phase: 1 },
   { name: 'message_recovery', cron: '*/2 * * * *', fn: runMessageRecovery, phase: 1 },
   { name: 'pending_reminder', cron: '*/30 * * * *', fn: runPendingReminder, phase: 1 },
-  { name: 'workflow_engine_tick', cron: '*/30 * * * * *', fn: async () => { await tickEngine(); }, phase: 1 },
+  {
+    name: 'workflow_engine_tick',
+    cron: '*/30 * * * * *',
+    fn: async () => {
+      // P0: single-tenant default. P6 will fan-out per tenant.
+      await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+        await tickEngine();
+      });
+    },
+    phase: 1,
+  },
   { name: 'audit_mode_expirer', cron: '*/15 * * * *', fn: runAuditModeExpirer, phase: 1 },
   { name: 'idempotency_cleanup', cron: '0 4 * * *', fn: runIdempotencyCleanup, phase: 1 },
   { name: 'inactivity_sweep', cron: '0 3 * * *', fn: runInactivitySweep, phase: 1 },

@@ -2,8 +2,17 @@ import { db } from '@/db/client.js';
 import { sql } from 'drizzle-orm';
 import { logger } from '@/lib/logger.js';
 import { audit } from '@/governance/audit.js';
+import { runWithTenantContext } from '@/db/tenant-context.js';
 
 export async function runInactivitySweep(): Promise<void> {
+  // P0: single-tenant default. P6 will fan-out per tenant.
+  await runWithTenantContext(
+    { tenant_id: 'default', agent_id: 'default' },
+    runInactivitySweepInner,
+  );
+}
+
+async function runInactivitySweepInner(): Promise<void> {
   const result = await db.execute<{ id: string; pessoa_id: string }>(sql`
     UPDATE permissoes p
     SET status = 'suspensa'

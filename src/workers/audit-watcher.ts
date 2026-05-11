@@ -4,6 +4,7 @@ import { audit_log } from '@/db/schema.js';
 import type { AuditAction } from '@/governance/audit-actions.js';
 import { sendAlert } from '@/lib/alerts.js';
 import { logger } from '@/lib/logger.js';
+import { runWithTenantContext } from '@/db/tenant-context.js';
 
 /**
  * Audit-driven anomaly watcher. Runs every minute via the worker registry
@@ -151,17 +152,20 @@ async function maybeAlert(rule: Rule, detail: string): Promise<void> {
 }
 
 export async function runAuditWatcher(): Promise<void> {
-  for (const rule of RULES) {
-    try {
-      if (rule.kind === 'threshold') await checkThreshold(rule);
-      else await checkStuck(rule);
-    } catch (err) {
-      logger.error(
-        { err: (err as Error).message, rule: rule.id },
-        'audit_watcher.check_failed',
-      );
+  // P0: single-tenant default. P6 will fan-out per tenant.
+  await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+    for (const rule of RULES) {
+      try {
+        if (rule.kind === 'threshold') await checkThreshold(rule);
+        else await checkStuck(rule);
+      } catch (err) {
+        logger.error(
+          { err: (err as Error).message, rule: rule.id },
+          'audit_watcher.check_failed',
+        );
+      }
     }
-  }
+  });
 }
 
 /** Test-only export so unit tests can read/clear the throttle map. */
