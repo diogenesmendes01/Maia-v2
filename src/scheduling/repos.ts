@@ -458,14 +458,29 @@ export const occurrencesRepo = {
    * to advance the occurrence through its remaining steps (forward + next
    * cycle). The original `claimDue` only picks up `pending`, so we have a
    * second claim path for `in_progress` occurrences that need engine love.
+   *
+   * Review 3 BLOCKER fix: the query MUST be restricted to series of type
+   * `recurring_outreach`. Otherwise a `one_shot_reminder` whose engine
+   * transition flipped the occurrence to `in_progress` (then enqueued the
+   * outbox) is picked up here while the outbox is still pending — the
+   * engine then runs `advanceInProgressOccurrence`, sees no recurring
+   * advance to do, and historically marked the occurrence completed,
+   * producing a phantom success while the underlying message never sent.
+   *
+   * Completion for `one_shot_reminder` (and any other non-outreach tipo)
+   * MUST flow through outbox-drain after a confirmed `markSent`, or
+   * through `onMessageDead` after exhausting retries.
    */
   async claimInProgressForAdvance(worker_id: string, limit: number): Promise<Occurrence[]> {
     const rows = await db.execute<{ id: string }>(sql`
       WITH eligible AS (
-        SELECT id FROM occurrences
-         WHERE status = 'in_progress'
-           AND (claimed_at IS NULL OR claimed_at < now() - interval '30 seconds')
-         ORDER BY created_at ASC
+        SELECT o.id
+          FROM occurrences o
+          JOIN series s ON s.id = o.series_id
+         WHERE o.status = 'in_progress'
+           AND s.tipo = 'recurring_outreach'
+           AND (o.claimed_at IS NULL OR o.claimed_at < now() - interval '30 seconds')
+         ORDER BY o.created_at ASC
          FOR UPDATE SKIP LOCKED
          LIMIT ${limit}
       )

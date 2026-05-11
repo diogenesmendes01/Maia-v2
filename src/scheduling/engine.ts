@@ -459,9 +459,19 @@ async function advanceInProgressOccurrence(occ: Occurrence): Promise<'advanced' 
     return 'skipped';
   }
   if (series.tipo !== 'recurring_outreach') {
-    // No in_progress advance defined for other tipos; release.
-    await occurrencesRepo.setStatus(occ.id, 'completed', { outcome: 'fired' });
-    return 'advanced';
+    // Review 3 BLOCKER fix: previously this branch marked the occurrence
+    // `completed/fired`, producing a phantom success for `one_shot_reminder`
+    // rows whose outbox row was still pending. The repo-level claim is now
+    // restricted to `recurring_outreach`, so reaching this branch means we
+    // saw a row through a race with cancellation or a manual data fix.
+    // Either way the safe action is to release the claim (no status mutation)
+    // and let the outbox-drain own completion semantics.
+    await occurrencesRepo.releaseClaim(occ.id, 30);
+    logger.warn(
+      { occurrence_id: occ.id, series_id: series.id, tipo: series.tipo },
+      'scheduling.in_progress_advance_skipped_unexpected_tipo',
+    );
+    return 'skipped';
   }
   const ctx = occ.contexto_snapshot as RecurringOutreachContexto;
   const tasksList = await tasksRepo.byOccurrence(occ.id);

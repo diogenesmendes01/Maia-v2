@@ -5,6 +5,25 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Spec 18 v2.3 — addresses 1 follow-up BLOCKER** raised in PR #72
+  review 3:
+  - **B1/r3 — `claimInProgressForAdvance()` restricted to
+    `recurring_outreach`**: the SQL claim now `JOIN`s on `series` and
+    filters `tipo = 'recurring_outreach'`, so `one_shot_reminder`
+    occurrences whose outbox row is still pending (rate-limited,
+    Baileys disconnected, retry pending) are never picked up by the
+    engine's in-progress pass. Previously they could be falsely
+    finalized as `completed/fired` while the underlying WhatsApp
+    message had never been sent. Completion for `one_shot_reminder`
+    now flows exclusively through `outbox-drain`: `markSent` →
+    `task.completed` → `occurrence.completed(fired)`, or `markDead`
+    → `task.failed` → `occurrence.failed(reason=outbox_dead)`.
+
+    Defence-in-depth: `advanceInProgressOccurrence` now `releaseClaim`s
+    when the series tipo is not `recurring_outreach` (instead of marking
+    the occurrence `completed`). Even if a future change widens the
+    claim filter or a race exposes the wrong tipo, the engine never
+    audits a phantom success.
 - **Spec 18 v2.2 — addresses 4 follow-up BLOCKERs** raised in PR #72 review 2:
   - **B1/r2 — `payment_due` never audits confirmed on dispatch failure**:
     `resolvePaymentOccurrence` now inspects the `dispatchTool` return
