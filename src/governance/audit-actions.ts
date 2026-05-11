@@ -101,6 +101,21 @@ export const AUDIT_ACTIONS = [
   'setup_unauthorized_access',
   'setup_csrf_mismatch',
   'llm_model_changed',
+  'reminder_fired',
+  'reminder_send_failed',
+  'reminder_skipped',
+  'reminder_cancelled',
+  'outreach_sent',
+  'outreach_response_captured',
+  'outreach_no_response',
+  'outreach_completed_and_rescheduled',
+  'outreach_response_was_media',
+  'payment_due_proposed',
+  'payment_due_confirmed',
+  'payment_due_skipped',
+  'payment_due_postponed',
+  'payment_due_unanswered',
+  'workflow_cancelled',
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];

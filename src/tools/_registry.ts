@@ -12,6 +12,7 @@ import { parseReceiptTool } from './parse-receipt.js';
 import { parseImageTool } from './parse-image.js';
 import { transcribeAudioTool } from './transcribe-audio.js';
 import { scheduleReminderTool } from './schedule-reminder.js';
+import { cancelReminderTool } from './cancel-reminder.js';
 import { sendProactiveMessageTool } from './send-proactive-message.js';
 import { compareEntitiesTool } from './compare-entities.js';
 import { recallMemoryTool } from './recall-memory.js';
@@ -68,6 +69,7 @@ export const REGISTRY: Record<string, AnyTool> = {
   parse_image: parseImageTool as unknown as AnyTool,
   transcribe_audio: transcribeAudioTool as unknown as AnyTool,
   schedule_reminder: scheduleReminderTool as unknown as AnyTool,
+  cancel_reminder: cancelReminderTool as unknown as AnyTool,
   send_proactive_message: sendProactiveMessageTool as unknown as AnyTool,
   compare_entities: compareEntitiesTool as unknown as AnyTool,
   recall_memory: recallMemoryTool as unknown as AnyTool,

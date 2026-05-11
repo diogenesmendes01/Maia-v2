@@ -9,6 +9,7 @@ import { runConversationSummarizer } from './conversation-summarizer.js';
 import { runReflectionBatch } from './reflection-batch.js';
 import { runMessageRecovery } from './message-recovery.js';
 import { runPendingReminder } from './pending-reminder.js';
+import { runReminderFirer } from './reminder-firer.js';
 import { runNightlyBackup, runCloudBackupRotation } from './backup.js';
 import { runCostMonitor } from './cost-monitor.js';
 import { runAuditWatcher } from './audit-watcher.js';
@@ -24,6 +25,7 @@ export const JOBS: Job[] = [
   { name: 'pending_expirer', cron: '*/1 * * * *', fn: runPendingExpirer, phase: 1 },
   { name: 'message_recovery', cron: '*/2 * * * *', fn: runMessageRecovery, phase: 1 },
   { name: 'pending_reminder', cron: '*/30 * * * *', fn: runPendingReminder, phase: 1 },
+  { name: 'reminder_firer', cron: '* * * * *', fn: runReminderFirer, phase: 1 },
   { name: 'workflow_engine_tick', cron: '*/30 * * * * *', fn: async () => { await tickEngine(); }, phase: 1 },
   { name: 'audit_mode_expirer', cron: '*/15 * * * *', fn: runAuditModeExpirer, phase: 1 },
   { name: 'idempotency_cleanup', cron: '0 4 * * *', fn: runIdempotencyCleanup, phase: 1 },
