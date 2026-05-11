@@ -22,6 +22,9 @@ import {
   self_state,
   system_health_events,
   dead_letter_jobs,
+  tenants,
+  agents,
+  cognitive_module_log,
 } from './schema.js';
 import { TypedError } from '@/lib/utils.js';
 import type {
@@ -43,6 +46,9 @@ import type {
   WorkflowStep,
   EntityState,
   SelfState,
+  Tenant,
+  Agent,
+  CognitiveModuleLog,
 } from './schema.js';
 
 export type EntityScope = {
@@ -915,5 +921,43 @@ export const dlqRepo = {
       .update(dead_letter_jobs)
       .set({ resolved: true, resolved_at: new Date() })
       .where(eq(dead_letter_jobs.id, id));
+  },
+};
+
+export const tenantsRepo = {
+  async findById(id: string): Promise<Tenant | null> {
+    const rows = await db.select().from(tenants).where(eq(tenants.id, id)).limit(1);
+    return rows[0] ?? null;
+  },
+
+  async create(t: { id: string; nome: string; status?: string }): Promise<Tenant> {
+    const [created] = await db.insert(tenants).values(t).returning();
+    return created!;
+  },
+};
+
+export const agentsRepo = {
+  async findById(id: string): Promise<Agent | null> {
+    const rows = await db.select().from(agents).where(eq(agents.id, id)).limit(1);
+    return rows[0] ?? null;
+  },
+
+  async listByTenant(tenant_id: string): Promise<Agent[]> {
+    return db.select().from(agents).where(eq(agents.tenant_id, tenant_id));
+  },
+};
+
+export const cognitiveModuleLogRepo = {
+  async record(entry: Omit<CognitiveModuleLog, 'id' | 'created_at'>): Promise<void> {
+    await db.insert(cognitive_module_log).values(entry);
+  },
+
+  async recentByModule(module_name: string, limit = 100): Promise<CognitiveModuleLog[]> {
+    return db
+      .select()
+      .from(cognitive_module_log)
+      .where(eq(cognitive_module_log.module_name, module_name))
+      .orderBy(desc(cognitive_module_log.created_at))
+      .limit(limit);
   },
 };
