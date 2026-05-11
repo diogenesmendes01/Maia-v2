@@ -4,6 +4,10 @@ export function sha256(input: string | Buffer): string {
   return createHash('sha256').update(input).digest('hex');
 }
 
+export function hashContent(content: string): string {
+  return createHash('sha256').update(content).digest('hex').slice(0, 16);
+}
+
 export function uuid(): string {
   return randomUUID();
 }

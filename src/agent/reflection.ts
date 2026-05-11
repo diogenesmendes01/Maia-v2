@@ -1,9 +1,15 @@
 import { z } from 'zod';
 import { callLLM } from '@/lib/claude.js';
-import { rulesRepo, mensagensRepo, selfStateRepo } from '@/db/repositories.js';
+import {
+  rulesRepo,
+  mensagensRepo,
+  selfStateRepo,
+  cognitiveModuleLogRepo,
+} from '@/db/repositories.js';
 import { writeMemory } from '@/memory/vector.js';
 import { audit } from '@/governance/audit.js';
 import { logger } from '@/lib/logger.js';
+import { hashContent } from '@/lib/utils.js';
 import type { Pessoa, Conversa, Mensagem } from '@/db/schema.js';
 
 const ReflectionRule = z.object({
@@ -57,6 +63,7 @@ ${input.inbound.conteudo}
 
 Proponha uma regra ou diga não aplicável.`;
   try {
+    const startTime = Date.now();
     const res = await callLLM({
       system,
       messages: [{ role: 'user', content: user }],
@@ -66,8 +73,38 @@ Proponha uma regra ou diga não aplicável.`;
     });
     const text = res.content?.trim() ?? '';
     const match = text.match(/\{[\s\S]*\}/);
-    if (!match) return;
-    const parsed = ReflectionRule.safeParse(JSON.parse(match[0]));
+    const parsed = match ? ReflectionRule.safeParse(JSON.parse(match[0])) : null;
+
+    const latencyMs = Date.now() - startTime;
+    await cognitiveModuleLogRepo
+      .record({
+        tenant_id: 'default',
+        agent_id: 'default',
+        conversa_id: input.conversa.id,
+        turno_id: input.inbound.id,
+        module_name: 'reflection.correction',
+        module_version: 'v1',
+        prompt_version: null,
+        triggered_by: 'async_event',
+        started_at: new Date(startTime),
+        ended_at: new Date(),
+        latency_ms: latencyMs,
+        model_used: 'claude-haiku-4-5',
+        tokens_in: res.usage?.input_tokens ?? null,
+        tokens_out: res.usage?.output_tokens ?? null,
+        cost_estimate: null,
+        output_summary_hash: parsed?.success ? hashContent(text) : null,
+        confidence: parsed?.success && parsed.data.applicable ? '0.500' : '0.000',
+        fallback_triggered: false,
+        fallback_reason: null,
+        status: parsed?.success ? 'success' : 'error',
+        metadata: { rule_created: !!(parsed?.success && parsed.data.applicable) },
+      })
+      .catch((err) =>
+        logger.warn({ err: (err as Error).message }, 'reflection.cognitive_log_failed'),
+      );
+
+    if (!match || !parsed) return;
     if (!parsed.success || !parsed.data.applicable) return;
     if (!parsed.data.tipo || !parsed.data.contexto || !parsed.data.acao) return;
 
