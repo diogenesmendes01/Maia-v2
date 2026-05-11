@@ -129,14 +129,21 @@ const envSchema = z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
-    // Recurring workflows (outreach_recorrente, payment_due) — spec 18 §6.
-    // Off by default. When off, tickEngine no-ops on those workflow types
-    // and start_workflow still creates rows but the engine never advances
-    // them. Enables gradual production rollout per §8.
-    FEATURE_RECURRING_WORKFLOWS: z
+    // Spec 18 — Scheduling V2 (series/occurrences/tasks/outbox). When off,
+    // the scheduling workers and start_recurring_* tools are inert; the
+    // schedule_reminder tool still works because it just writes a series
+    // row, but no firing happens. Default off — production rollout per §12.
+    FEATURE_SCHEDULING_V2: z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
+    // Outbox drain backpressure — spec 18 §7.2. Defaults are conservative;
+    // tune per WhatsApp account standing.
+    OUTBOX_MAX_PER_SECOND: z.coerce.number().positive().default(1),
+    OUTBOX_MAX_PER_HOUR: z.coerce.number().int().positive().default(600),
+    OUTBOX_WORKER_CONCURRENCY: z.coerce.number().int().positive().default(4),
+    OUTBOX_LEASE_TTL_SECONDS: z.coerce.number().int().positive().default(300),
+    OCCURRENCE_LEASE_TTL_SECONDS: z.coerce.number().int().positive().default(300),
     // Message debounce: hold incoming text messages from the same user for a
     // short window so chunked typing ("Oi, " / "como está " / "a finança?")
     // arrives at the LLM as a single coherent turn. Off by default — when on,

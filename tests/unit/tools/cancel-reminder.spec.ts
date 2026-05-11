@@ -1,27 +1,24 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-const getByKeyMock = vi.fn();
-const upsertMock = vi.fn();
-
-vi.mock('../../../src/db/repositories.js', () => ({
-  factsRepo: {
-    getByKey: getByKeyMock,
-    upsert: upsertMock,
-  },
+const cancelAtomicMock = vi.fn();
+vi.mock('../../../src/scheduling/repos.js', () => ({
+  seriesRepo: { cancelAtomic: cancelAtomicMock },
 }));
+
+const auditMock = vi.fn();
+vi.mock('../../../src/governance/audit.js', () => ({ audit: auditMock }));
 
 vi.mock('../../../src/lib/logger.js', () => ({
   logger: { warn: vi.fn(), info: vi.fn(), debug: vi.fn(), error: vi.fn() },
 }));
 
 beforeEach(() => {
-  getByKeyMock.mockReset();
-  upsertMock.mockReset();
-  upsertMock.mockResolvedValue({ id: 'fact-row' });
+  cancelAtomicMock.mockReset();
+  auditMock.mockReset();
 });
 
 const ctx = {
-  pessoa: { id: 'p1' },
+  pessoa: { id: 'owner-id' },
   conversa: { id: 'c1' },
   scope: { entidades: [], byEntity: new Map() },
   mensagem_id: 'm1',
@@ -29,72 +26,54 @@ const ctx = {
   idempotency_key: 'ik1',
 } as never;
 
-describe('cancel_reminder tool', () => {
-  it('returns not_found when the fact does not exist', async () => {
-    getByKeyMock.mockResolvedValue(null);
+describe('cancel_reminder tool (spec 18)', () => {
+  it('returns not_found when no series matches the id', async () => {
+    cancelAtomicMock.mockResolvedValue({ series: null, cancelled_occurrence_ids: [] });
     const { cancelReminderTool } = await import('../../../src/tools/cancel-reminder.js');
-    const result = await cancelReminderTool.handler({ reminder_id: 'rem-x' }, ctx);
-    expect(result).toEqual({ cancelled: false, reason: 'not_found' });
-    expect(upsertMock).not.toHaveBeenCalled();
+    const result = await cancelReminderTool.handler(
+      { series_id: '00000000-0000-0000-0000-000000000001' },
+      ctx,
+    );
+    expect(result).toEqual({
+      cancelled: false,
+      cancelled_occurrence_count: 0,
+      reason: 'not_found',
+    });
+    expect(auditMock).not.toHaveBeenCalled();
   });
 
-  it('returns already_fired when the reminder already fired', async () => {
-    getByKeyMock.mockResolvedValue({
-      escopo: 'pessoa:p1',
-      chave: 'reminder.rem-x',
-      valor: {
-        id: 'rem-x',
-        pessoa_id: 'p1',
-        quando: '2026-01-01T00:00:00Z',
-        texto: 'X',
-        fired_at: '2026-01-02T00:00:00Z',
-      },
-      fonte: 'configurado',
+  it('returns already_cancelled when atomic cancel found no active series', async () => {
+    cancelAtomicMock.mockResolvedValue({
+      series: { id: 's1', status: 'cancelled', version: 5 },
+      cancelled_occurrence_ids: [],
     });
     const { cancelReminderTool } = await import('../../../src/tools/cancel-reminder.js');
-    const result = await cancelReminderTool.handler({ reminder_id: 'rem-x' }, ctx);
-    expect(result).toEqual({ cancelled: false, reason: 'already_fired' });
-    expect(upsertMock).not.toHaveBeenCalled();
+    const result = await cancelReminderTool.handler(
+      { series_id: '00000000-0000-0000-0000-000000000001' },
+      ctx,
+    );
+    expect(result).toEqual({
+      cancelled: false,
+      cancelled_occurrence_count: 0,
+      reason: 'already_cancelled',
+    });
   });
 
-  it('returns already_cancelled when the reminder was cancelled previously', async () => {
-    getByKeyMock.mockResolvedValue({
-      escopo: 'pessoa:p1',
-      chave: 'reminder.rem-y',
-      valor: {
-        id: 'rem-y',
-        pessoa_id: 'p1',
-        quando: '2026-01-01T00:00:00Z',
-        texto: 'Y',
-        fired_at: '2026-01-01T12:00:00Z',
-        cancel_reason: 'owner_request',
-      },
-      fonte: 'configurado',
+  it('happy path: returns count of cancelled occurrences and audits', async () => {
+    cancelAtomicMock.mockResolvedValue({
+      series: { id: 's2', status: 'cancelled', version: 2 },
+      cancelled_occurrence_ids: ['o1', 'o2', 'o3'],
     });
     const { cancelReminderTool } = await import('../../../src/tools/cancel-reminder.js');
-    const result = await cancelReminderTool.handler({ reminder_id: 'rem-y' }, ctx);
-    expect(result).toEqual({ cancelled: false, reason: 'already_cancelled' });
-    expect(upsertMock).not.toHaveBeenCalled();
-  });
-
-  it('cancels happy path: writes fired_at + cancel_reason and reports success', async () => {
-    getByKeyMock.mockResolvedValue({
-      escopo: 'pessoa:p1',
-      chave: 'reminder.rem-z',
-      valor: {
-        id: 'rem-z',
-        pessoa_id: 'p1',
-        quando: '2027-01-01T00:00:00Z',
-        texto: 'Z',
-      },
-      fonte: 'configurado',
-    });
-    const { cancelReminderTool } = await import('../../../src/tools/cancel-reminder.js');
-    const result = await cancelReminderTool.handler({ reminder_id: 'rem-z' }, ctx);
-    expect(result).toEqual({ cancelled: true });
-    expect(upsertMock).toHaveBeenCalledTimes(1);
-    const arg = upsertMock.mock.calls[0]![0] as { valor: Record<string, unknown> };
-    expect(arg.valor.fired_at).toBeTypeOf('string');
-    expect(arg.valor.cancel_reason).toBe('owner_request');
+    const result = await cancelReminderTool.handler(
+      { series_id: '00000000-0000-0000-0000-000000000002', reason: 'mudei de ideia' },
+      ctx,
+    );
+    expect(result).toEqual({ cancelled: true, cancelled_occurrence_count: 3 });
+    expect(auditMock).toHaveBeenCalledTimes(1);
+    const call = auditMock.mock.calls[0]![0] as { acao: string; metadata: { reason: string; cancelled_occurrences: string[] } };
+    expect(call.acao).toBe('series_cancelled');
+    expect(call.metadata.reason).toBe('mudei de ideia');
+    expect(call.metadata.cancelled_occurrences).toEqual(['o1', 'o2', 'o3']);
   });
 });

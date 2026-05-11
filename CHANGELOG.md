@@ -5,41 +5,69 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 ## [Unreleased]
 
 ### Added
-- **Spec 18** (`docs/specs/18-scheduling-and-recurring-workflows.md`)
-  — design doc for proactive scheduling: reminders, recurring
-  outreach, recurring payment confirmations.
-- **Phase 1 — Reminder firer worker** (`src/workers/reminder-firer.ts`,
-  cron `* * * * *`): scans `agent_facts.chave LIKE 'reminder.%'` for
-  due rows, fires via WhatsApp, marks `fired_at` BEFORE the send so
-  retries can't double-fire. Skips when Baileys is disconnected; the
-  next tick drains the backlog. New `cancel_reminder` tool. New
-  audit actions: `reminder_fired`, `reminder_send_failed`,
-  `reminder_skipped`, `reminder_cancelled`.
-- **Phase 2 — Recurring workflows** (`src/workflows/recurring.ts`,
-  `src/workflows/rrule.ts`): two new `tickEngine` handlers gated by
-  `FEATURE_RECURRING_WORKFLOWS`.
-  - `outreach_recorrente` — sends a templated WhatsApp message to a
-    third party on a recurrence (`FREQ=DAILY|WEEKLY|MONTHLY`,
-    `BYDAY`, `BYMONTHDAY`, `BYHOUR`, `BYMINUTE`); waits up to N
-    hours for response; optionally forwards to a second person;
-    auto-schedules the next cycle as a NEW workflow row (auditable
-    per cycle); escalates to the owner on no-response.
-  - `payment_due` — fires a `pending_question` to the owner with
-    `sim` / `nao` / `adiar` options; on `sim`, the existing
-    pending-resolver dispatches `register_transaction` through the
-    normal constitutional pipeline (limits, dual-approval). Money
-    NEVER moves without owner confirmation. On `nao` skip + next
-    cycle. On `adiar` postpone 2 days. On no-response within
-    `escalate_after_hours`, alert via spec 17 channels and halt
-    the chain — operator decides to resume.
-  - `cancel_workflow` tool — stops a single workflow or the whole
-    `chain_id` series in one call.
-  - Constitutional rules **C-006** (`payment_due` above
-    `VALOR_LIMITE_DURO` rejected at creation) and **C-007**
-    (`outreach_recorrente` requires `dual_approval_granted` at
-    creation).
-  - Migration `007_scheduling.sql` adds `workflows.chain_id` +
-    indexes for engine scan + reminder firer scan.
+- **Spec 18 v2 — Scheduling: series → occurrences → tasks → outbox**
+  (`docs/specs/18-scheduling-and-recurring-workflows.md`). Operational
+  engineering spec for proactive scheduling. Supersedes the v1
+  discovery draft. Satisfies seven production requirements:
+  1. Outbox never loses a message — transactional outbox table.
+  2. 10k-deep backlog drains under per-second + per-hour + per-
+     recipient backpressure (`OUTBOX_MAX_*` env).
+  3. Monthly series on day 31 follows a documented
+     `month_end_policy` (`skip_invalid_month` | `last_day_of_month`
+     | `nearest_previous` | `nearest_next`).
+  4. Multi-day downtime follows a documented `missed_run_policy`
+     (`fire_all` | `fire_latest_only` | `skip_all` |
+     `escalate_to_owner`).
+  5. Cancelling a series prevents new occurrences even with a
+     concurrent engine tick — version-gated INSERT + atomic
+     status+occurrence transaction.
+  6. Multiple open outreaches with the same destinatario never
+     capture each other's response — correlation tokens
+     (`_ref: A4F2_`) + disambiguation prompt to the owner.
+  7. Every occurrence has an auditable trail from scheduling to
+     final outcome in **one SQL query** — `audit_log.occurrence_id`
+     populated on every state transition.
+- **Migration `007_scheduling.sql`**: four new tables
+  (`series`, `occurrences`, `tasks`, `outbox_messages`) +
+  `audit_log.occurrence_id`. All indexes for hot paths.
+- **`src/scheduling/`** module: `rrule.ts` (RFC 5545 subset +
+  month-end policies), `repos.ts` (transactional repos with
+  `FOR UPDATE SKIP LOCKED` and optimistic locking),
+  `backpressure.ts` (Redis token-bucket per-second/per-hour +
+  per-recipient pacing, fail-CLOSED on Redis outage),
+  `correlation.ts` (4-hex tokens for outreach disambiguation),
+  `policies.ts` (missed-run decision table),
+  `disambiguation.ts` (multi-pending owner prompt),
+  `engine.ts` (claim + advance per-tipo, never sends directly),
+  `outbox-drain.ts` (lease-based claim, polynomial backoff, DLQ).
+- **New tools**:
+  - `schedule_reminder` (rewritten) — creates a `one_shot_reminder`
+    series + initial occurrence + reminder task atomically.
+  - `cancel_reminder` (rewritten) — invokes
+    `seriesRepo.cancelAtomic` so cancellation pre-empts in-flight
+    engine ticks.
+  - `start_recurring_outreach` (new) — `recurring_outreach` series
+    with C-007 dual-approval gate at creation.
+  - `start_recurring_payment` (new) — `recurring_payment` series
+    with C-006 hard-limit gate at creation.
+- **New workers**: `scheduling_tick` (cron `* * * * *`) and
+  `outbox_drain` (cron `* * * * *`). Both register only when
+  `FEATURE_SCHEDULING_V2=true`.
+- **Constitutional rules**: **C-006** (`start_recurring_payment`
+  above `VALOR_LIMITE_DURO` rejected), **C-007**
+  (`start_recurring_outreach` requires `dual_approval_granted`),
+  **C-008** (defence-in-depth — occurrence rejected at claim if
+  `contexto_snapshot.valor` exceeds current `VALOR_LIMITE_DURO`).
+- **Env vars**: `FEATURE_SCHEDULING_V2`, `OUTBOX_MAX_PER_SECOND`
+  (default 1), `OUTBOX_MAX_PER_HOUR` (default 600),
+  `OUTBOX_WORKER_CONCURRENCY` (default 4),
+  `OUTBOX_LEASE_TTL_SECONDS` (default 300),
+  `OCCURRENCE_LEASE_TTL_SECONDS` (default 300).
+- **23 new audit actions** covering series, occurrence, outbox,
+  outreach, payment_due lifecycles.
+- **47 new unit specs** across 8 files, one per requirement
+  (rrule, policies, correlation, backpressure, disambiguation,
+  cancel-race, outbox-drain, engine).
 
 ### Fixed
 - **WhatsApp privacy IDs (`@lid`)**: mensagens chegando de contas com

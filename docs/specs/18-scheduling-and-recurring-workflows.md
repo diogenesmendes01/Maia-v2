@@ -1,426 +1,513 @@
-# Spec 18 — Scheduling: Reminders, Recurring Outreach, Payment Due
+# Spec 18 — Scheduling: Series, Occurrences, Outbox, Operational Engine
 
-**Status:** Phase 1 (reminder firer) + Phase 2 (recurring workflows) • **Depends on:** 00, 02, 06, 07, 09, 11, 12, 17
+**Status:** Production engineering spec • **Depends on:** 00, 02, 06, 07, 09, 11, 12, 17
+
+> Supersedes the discovery draft of spec 18. Recurring scheduling and payment confirmations are high-stakes workflows that must survive crash, partial network failure, multi-day downtime, concurrent workers, and operator cancellation. This spec defines **how** that happens, not just **what** the feature looks like.
 
 ---
 
 ## 1. Purpose
 
-Define the **proactive scheduling layer** of Maia — the system that lets her *act on time without being asked*. Three use cases:
+A durable, observable, reversible scheduler for Maia that satisfies seven operational requirements:
 
-1. **One-shot reminders to the owner** — "me lembra amanhã às 9 de pagar a Vivo".
-2. **Recurring outreach involving third parties** — "todo dia 5, peça o relatório à Mariana e encaminhe pra Maria da contabilidade".
-3. **Recurring payment confirmations** — "todo dia 10, me pergunte se devo pagar o aluguel R$ 4.500 da empresa 3".
+| # | Requirement |
+|---|---|
+| 1 | Outbox never loses a message — atomicity between DB commit and WhatsApp send |
+| 2 | A 10k-deep backlog drains under controlled backpressure without WhatsApp ban |
+| 3 | Monthly series on day 31 follows a **documented**, configurable policy |
+| 4 | After multi-day downtime, behaviour follows a **documented** `missed_run_policy` |
+| 5 | Cancelling a series prevents new occurrences even with a concurrent engine tick |
+| 6 | Multiple open pendings with the same third party never capture each other's reply |
+| 7 | Every occurrence has an auditable trail from scheduling to final outcome in **one query** |
 
-The defining principle: **never auto-execute high-stakes actions**. Money never moves without owner confirmation in the same conversation turn — the scheduler triggers a confirmation, not the transaction itself.
+Anything that violates any of these is a bug, not a design tradeoff.
 
 ## 2. Goals
 
-- **Durability:** every scheduled action lives in Postgres (WAL-backed), not Redis. Survives crash, redeploy, multi-day downtime.
-- **Backfill:** when Maia comes back from downtime, picks up all overdue items and asks the owner if they should still fire.
-- **Idempotency:** the same fire never produces two messages or two transactions.
-- **Auditability:** every fire, miss, and reschedule appears in `audit_log` with structured metadata.
-- **Recurrence:** supports daily/weekly/monthly patterns with anchor day (e.g., "every 5th") via a minimal subset of iCal RRULE.
-- **Cancellation:** owner can stop any scheduled item via a tool/CLI/dashboard.
-- **No double-fire under concurrency:** workers use `FOR UPDATE SKIP LOCKED` semantics.
+- Single conceptual model — **Series → Occurrences → Tasks → Outbox** — covering one-shot reminders, recurring outreach, recurring payments, and any future scheduled action.
+- Postgres is the source of truth; Redis is a cache for rate-limit counters.
+- Workers are stateless and horizontally idempotent (`FOR UPDATE SKIP LOCKED` + claim/lease).
+- Every state transition writes audit; one occurrence = one canonical query.
 
 ## 3. Non-goals
 
-- General-purpose cron-as-a-service (no arbitrary user-supplied cron expressions).
-- Sub-minute precision (60s scan resolution is the contract).
-- Time zones beyond `America/Sao_Paulo` (single-tenant assumption from spec 00).
-- A UI for editing recurrence rules (Phase 5 dashboard work, out of scope here).
+- Sub-minute precision (60s tick remains the contract).
+- Multi-tenant isolation (single-tenant per spec 00).
+- Arbitrary user-supplied cron syntax (we expose a minimal RRULE subset).
+- Cross-region replication.
 
-## 4. Architecture overview
+## 4. Domain model
 
-Two complementary mechanisms, one per phase:
+Four new tables. The existing `workflows` table stays untouched for `dual_approval` and free-form workflows; recurring scheduling lives entirely in the new tables to avoid the dual-purpose ambiguity that broke the v1 design.
 
-| Use case | Mechanism | Phase |
-|---|---|---|
-| One-shot owner reminder | `agent_facts.chave LIKE 'reminder.%'` + cron worker `reminder_firer` | 1 |
-| Recurring outreach to third party | `workflows` row with `tipo='outreach_recorrente'` + extended `tickEngine` | 2 |
-| Recurring payment confirmation | `workflows` row with `tipo='payment_due'` + extended `tickEngine` | 2 |
+### 4.1 `series`
 
-Both mechanisms write to the same `audit_log`, use the same identity/permission resolution, and reuse the existing `sendOutboundText` / `pending_questions` rails.
-
-### 4.1 Why two mechanisms, not one
-
-A one-shot text reminder to yourself is a *post-it* — schema-less, cheap to create, no state machine, no DAG, no recurrence. Forcing it into the `workflows` table over-engineers the 80% case ("me lembra de X").
-
-A recurring multi-step task involving third parties is fundamentally different: it has steps with dependencies, can wait for an external reply indefinitely, can fail mid-way and need rollback, and lives across many months. That's what the `workflows` table was designed for (spec 11).
-
-The split costs one extra worker but keeps both paths simple and matches the existing data model conventions.
-
-## 5. Phase 1 — Reminder firer
-
-### 5.1 Data model
-
-Reminders continue to live in `agent_facts`:
-
-```
-escopo = 'pessoa:<owner_uuid>'
-chave  = 'reminder.rem-<uuid>'
-valor  = {
-  id: string,
-  pessoa_id: string,           -- creator AND recipient (Phase 1 is self-reminders only)
-  entidade_id: string | null,
-  quando: string (ISO 8601),   -- when to fire
-  texto: string,                -- message body, max 500 chars
-  canal: 'whatsapp',
-  fired_at?: string (ISO),     -- set when fired; presence makes the fact inert
-  cancel_reason?: string,       -- set when cancelled
-}
-fonte = 'configurado'
-```
-
-No new table. The `agent_facts` index on `(escopo, chave)` is sufficient for lookups by owner; firing scans use a JSONB predicate.
-
-**Why no new table?** The data is trivially shaped and already has an index on `(escopo, chave)`. Adding a table for a 4-field JSON record means one more migration to maintain, one more repo, one more place to update on schema drift. Re-evaluate at Phase 5 if reminders grow attributes (snoozing, multi-recipient, tags).
-
-### 5.2 Tool changes (`schedule_reminder`)
-
-The existing tool keeps its schema. One adjustment: `quando` is parsed and validated as ISO 8601, rejected if in the past by more than 60 seconds (a small grace window covers clock skew between Maia and the owner's mental model).
-
-Adds soft validation: if `quando > now() + 1 year`, returns warning in `valor.metadata.warn_far_future` for the LLM to surface ("você marcou pra daqui a 18 meses, era isso mesmo?").
-
-### 5.3 Tool changes (`cancel_reminder` — new)
-
-```ts
-input  = { reminder_id: string }
-output = { cancelled: boolean, reason?: 'not_found' | 'already_fired' | 'already_cancelled' }
-```
-
-Side-effect: write. Audit action: `reminder_cancelled`. Sets `valor.cancel_reason = 'owner_request'` and `valor.fired_at = now()` so the firer skips it.
-
-Scope: only the creator (`pessoa_id` in `valor`) can cancel. Constitutional check: requires `schedule_reminder` action permission.
-
-### 5.4 Worker `reminder_firer`
-
-**Location:** `src/workers/reminder-firer.ts`. **Cron:** `* * * * *` (every minute). **Phase:** 1.
-
-```typescript
-async function runReminderFirer(): Promise<void> {
-  if (!isBaileysConnected()) return;          // graceful skip — see §5.5
-
-  const due = await db.execute(sql`
-    SELECT id, escopo, valor
-    FROM agent_facts
-    WHERE chave LIKE 'reminder.%'
-      AND (valor->>'fired_at') IS NULL
-      AND (valor->>'quando')::timestamptz <= now()
-    ORDER BY (valor->>'quando')::timestamptz ASC
-    LIMIT 50
-    FOR UPDATE SKIP LOCKED
-  `);
-
-  for (const row of due) {
-    await fireOne(row).catch(err =>
-      logger.warn({ err, fact_id: row.id }, 'reminder_firer.row_failed')
-    );
-  }
-}
-```
-
-`fireOne` flow:
-
-1. Resolve `pessoa` by `escopo` (`pessoa:<uuid>` → `pessoas.id`). If missing or `status != 'ativa'`, mark `fired_at = now()` with `metadata.skip_reason = 'pessoa_invalid'` and audit `reminder_skipped`.
-2. Build JID via the same logic as outbound dispatch (prefer the most recent `mensagens.metadata.remote_jid` of that pessoa to handle `@lid`).
-3. Format text: `🔔 Lembrete: {texto}\n_agendado em {quando_relativo}_`.
-4. `UPDATE agent_facts SET valor = jsonb_set(valor, '{fired_at}', to_jsonb(now()::text))` **before** the send (idempotency: if send fails, the row is already marked — operator inspects via audit).
-5. Call `sendOutboundText(jid, text)`. Persist as `mensagens` row with `direcao='out'`, `metadata.reminder_id = id`.
-6. Audit `reminder_fired` with `metadata = { reminder_id, delay_seconds, late_minutes }`.
-7. On send failure: audit `reminder_send_failed` and re-insert into a DLQ entry so the operator sees it.
-
-### 5.5 Graceful skip when Baileys disconnected
-
-If `isBaileysConnected() === false`, skip the whole tick. The reminder stays `fired_at IS NULL` and gets picked up on the next tick where Baileys is up. The 60s scan interval bounds the worst-case delay to 60 seconds after reconnection.
-
-### 5.6 Backfill behavior
-
-If Maia was down for 3 hours and 12 reminders accumulated past their `quando`, the next tick fires all of them in ISO-time order, one minute apart? **No** — they fire in the same tick, in chronological order, with no artificial spacing. The 50-row LIMIT per tick prevents a backlog of 500 reminders from saturating the WhatsApp send queue; subsequent ticks drain the remainder.
-
-Each fired reminder records `late_minutes = floor((now - quando)/60)` in metadata so the operator can see how stale the firing was. The text itself is **not** modified — the user gets the original message; staleness is an internal observability concern, not a UX one.
-
-### 5.7 Audit actions added
-
-- `reminder_fired` — successful WhatsApp send. Metadata: `{ reminder_id, late_minutes }`.
-- `reminder_send_failed` — Baileys send threw. Metadata: `{ reminder_id, error }`.
-- `reminder_skipped` — pessoa inactive / blocked / quarantined. Metadata: `{ reminder_id, skip_reason }`.
-- `reminder_cancelled` — owner cancelled via `cancel_reminder` tool.
-
-### 5.8 Tests
-
-- Unit: `reminder-firer.spec.ts` — fires due, skips not-due, sets `fired_at`, handles Baileys disconnect, handles inactive pessoa, audits each branch.
-- Unit: `cancel-reminder.spec.ts` — happy path, idempotent re-cancel, not-found, already-fired blocks.
-- Integration: `reminder-flow.spec.ts` — full tool → DB → worker → WhatsApp mock cycle.
-
----
-
-## 6. Phase 2 — Recurring workflows (`outreach_recorrente`, `payment_due`)
-
-Both new workflow types share infrastructure: a minimal RRULE-like recurrence spec, an extended `tickEngine` that knows how to advance them, and the existing `pending_questions` rails for human confirmation.
-
-### 6.1 Recurrence specification
-
-A workflow's `contexto.rrule` is a string in the shape:
-
-```
-FREQ=<DAILY|WEEKLY|MONTHLY>;BYDAY=<MON|TUE|...>;BYMONTHDAY=<1-31>;BYHOUR=<0-23>;BYMINUTE=<0-59>
-```
-
-Only the listed components are supported (subset of iCal RFC 5545). Parsing/validation lives in `src/workflows/rrule.ts`. Examples:
-
-- `FREQ=MONTHLY;BYMONTHDAY=5;BYHOUR=9` — every 5th of the month at 9am
-- `FREQ=DAILY;BYHOUR=8` — every day at 8am
-- `FREQ=WEEKLY;BYDAY=MON;BYHOUR=10` — every Monday at 10am
-
-`computeNext(rrule, after_ts)` returns the next ISO timestamp on or after `after_ts` matching the rule, in `America/Sao_Paulo`. If no match within 366 days, throws — guards against malformed input.
-
-### 6.2 Workflow type: `outreach_recorrente`
-
-**Purpose:** ask a third party for something on a schedule, optionally forwarding their response elsewhere.
-
-**Contexto shape:**
-```ts
-{
-  rrule: string,
-  destinatario_pessoa_id: string,   // who Maia asks
-  forward_to_pessoa_id?: string,    // optional: where to forward the reply
-  message_template: string,          // sent to destinatario; supports {{mes_anterior}} {{nome}}
-  forward_template?: string,         // sent to forward_to; supports {{resposta}}
-  wait_response_hours: number,       // default 48; after this, escalate to owner
-  owner_pessoa_id: string,           // for escalations
-}
-```
-
-**Steps generated at workflow creation:**
-
-```
-1. send_outreach              — sends the prompt to destinatario
-2. await_response             — sets workflow.status='aguardando_terceiro', listens for inbound
-3. forward_or_close           — if forward_to set and response captured, send; else close
-4. reschedule                 — compute next proxima_acao_em via rrule, reset steps for the next cycle
-```
-
-**Engine flow** (`tickEngine` extended):
-
-```
-when wf.tipo === 'outreach_recorrente' AND wf.status === 'pendente':
-  if wf.proxima_acao_em <= now():
-    execute step 1 (send_outreach):
-      sendOutboundText(destinatario_jid, render(message_template, {mes_anterior: ...}))
-      step.status = concluido, step.resultado.whatsapp_id = ...
-      wf.status = 'aguardando_terceiro'
-      step 2 (await_response).status = em_andamento
-      step 2.iniciado_em = now()
-      audit('outreach_sent', { wf, destinatario, message })
-
-when wf.tipo === 'outreach_recorrente' AND wf.status === 'aguardando_terceiro':
-  if (now() - step2.iniciado_em) > wait_response_hours:
-    audit('outreach_no_response', ...)
-    notify owner: "Mariana não respondeu o pedido de relatório de %s desde %s"
-    wf.status = 'aguardando_humano'
-    (owner replies 'pular' or 'esperar mais' via pending_question — handled in §6.4)
-
-when an inbound mensagem arrives from destinatario_pessoa_id while wf.status === 'aguardando_terceiro':
-  the agent loop detects it via a hook (see §6.5), captures the response,
-  marks step 2 concluido, advances to step 3.
-
-when wf.tipo === 'outreach_recorrente' AND wf.status === 'em_andamento' AND step 3 pending:
-  if forward_to set:
-    send forward_template (with {{resposta}} substituted) to forward_to_jid
-  step 3.status = concluido
-  step 4 (reschedule):
-    next_at = computeNext(rrule, now())
-    new workflow row created with same contexto and proxima_acao_em = next_at
-    wf.status = 'concluido'
-    audit('outreach_completed_and_rescheduled', { next: next_at })
-```
-
-**Why a NEW workflow row per cycle, not resetting steps in-place?** Auditability. Each cycle becomes a distinct row with its own start/end timestamps. Querying "did Maia run the dia-5 routine in March?" becomes a single SELECT.
-
-### 6.3 Workflow type: `payment_due`
-
-**Purpose:** prompt the owner to confirm a payment that should happen today. Maia **never** registers the transaction without explicit owner answer in the same turn.
-
-**Contexto shape:**
-```ts
-{
-  rrule: string,
-  entidade_id: string,
-  conta_id: string,
-  natureza: 'despesa',                          // payments are always 'despesa'
-  valor: number,
-  descricao: string,                             // human-readable: "Aluguel Empresa 3"
-  categoria_id?: string,
-  contraparte_id?: string,
-  escalate_after_hours: number,                  // default 4 — see §6.6
-}
-```
-
-**Steps generated at creation:**
-
-```
-1. propose_payment            — creates a pending_question with payment details and options
-2. await_owner_decision       — workflow waits in 'aguardando_humano' until question resolves
-3. execute_or_skip            — if 'sim' → register_transaction; if 'não' → audit + skip; if 'adiar' → reschedule
-4. reschedule                 — compute next, create next-cycle workflow row
-```
-
-**Engine flow:**
-
-```
-when wf.tipo === 'payment_due' AND wf.status === 'pendente':
-  if wf.proxima_acao_em <= now():
-    p = pendingQuestionsRepo.create({
-      conversa_id: owner's active conversa,
-      pessoa_id: owner.id,
-      tipo: 'payment_confirmation',
-      pergunta: 'Pagamento {descricao} de {valor} hoje? (sim / não / adiar)',
-      opcoes_validas: [
-        { key: 'sim', label: 'Pagar agora' },
-        { key: 'nao', label: 'Pular este mês' },
-        { key: 'adiar', label: 'Adiar 2 dias' },
-      ],
-      acao_proposta: { tool: 'register_transaction', args: {...} },
-      expira_em: now() + escalate_after_hours hours,
-      metadata: { workflow_id: wf.id }
-    })
-    send to owner via sendOutboundPoll OR text fallback (see spec 09)
-    wf.status = 'aguardando_humano'
-    step 1.status = concluido
-    audit('payment_due_proposed', { wf, valor })
-
-when pending_question resolves (handled by existing pending-resolver):
-  it looks for metadata.workflow_id; if present, advance(wf, decision)
-
-advance(wf, 'sim'):
-  dispatch register_transaction via the normal tool path (constitutional checks fire normally — limit, dual_approval, etc.)
-  step 3.status = concluido
-  step 3.resultado = { transacao_id: ... }
-  audit('payment_due_confirmed', { wf, transacao_id })
-  step 4 reschedule
-
-advance(wf, 'nao'):
-  audit('payment_due_skipped', { wf })
-  step 4 reschedule
-
-advance(wf, 'adiar'):
-  wf.proxima_acao_em = now() + 2 days
-  wf.status = 'pendente'
-  step 1-3 reset
-  audit('payment_due_postponed', { wf, new_proxima_acao_em })
-
-when pending_question expires unanswered:
-  audit('payment_due_unanswered', { wf })
-  trigger alert via sendAlert (email/telegram) — high-stakes silence is operator-visible
-  wf.status = 'falhou'
-  do NOT reschedule automatically — operator decides whether to resume
-```
-
-**Why expire-without-action is `falhou` not auto-skip?** A missed payment confirmation is a different signal from a "no" — it might mean the owner was unreachable, sick, or the system was offline. Defaulting to "skipped" risks rent going unpaid; defaulting to "alert + halt" risks duplicate work. We choose alert + halt because the failure mode is recoverable (operator restarts the workflow) but the silent-skip failure mode is not (rent past due).
-
-### 6.4 Workflow type pause/resume tool: `cancel_workflow`
-
-```ts
-input  = { workflow_id: string, reason?: string }
-output = { cancelled: boolean }
-```
-
-Constitutional gate: only `pessoa_envolvida` (creator) or owner can cancel. Sets `workflows.status = 'cancelada'`, any in-flight step → `'cancelada'`, audit `workflow_cancelled`. **Does not auto-cancel future cycles** — recurring workflows create their next-cycle row at `step 4 reschedule`, so cancelling the current row stops further iterations only if cancelled BEFORE step 4 runs. To stop ALL future cycles, the tool also looks up rows of the same logical chain via `contexto.chain_id` and cancels each.
-
-`contexto.chain_id` (new field) is a UUID generated at first workflow creation and copied to each rescheduled cycle. Lets the operator stop the whole series with one call.
-
-### 6.5 Capturing third-party responses (the `aguardando_terceiro` hook)
-
-When an inbound text arrives, `agent/core.ts` already runs identity resolution. We add a pre-LLM hook: if the sender has any workflow in `aguardando_terceiro` status with `contexto.destinatario_pessoa_id === sender.id`, capture the inbound `conteudo` into `workflow_steps.resultado.response_text` of the `await_response` step, mark step `concluido`, set workflow back to `'em_andamento'`, and let the engine pick it up on the next tick (≤30s). The original inbound still flows to the LLM so Mariana can also have a conversational thread.
-
-**Edge:** if the inbound is media (image, audio, document) and the workflow expected text — we save the inbound `mensagem_id` and `midia_url` into the step resultado, and forward as media if `forward_template` is empty, or skip forwarding with audit `outreach_response_was_media` if templated text is required. Phase 2.5 may relax this.
-
-### 6.6 Time-zone handling
-
-All `proxima_acao_em` computations use `America/Sao_Paulo` via `date-fns-tz` (already a dep). RRULE BYHOUR=9 means 9am in São Paulo, regardless of UTC offset (handles DST automatically).
-
-### 6.7 Tool changes (`start_workflow` extended)
-
-The `tipo` enum gains `'outreach_recorrente'` and `'payment_due'`. The Zod input schema branches per type to validate the matching `contexto` shape — no free-form JSONB blob accepted.
-
-The tool's `audit_action` already exists (`reminder_scheduled`); we keep it but consider future split to `workflow_started` for clarity.
-
-### 6.8 Constitutional rules added
-
-**C-006 (new):** `payment_due` workflows with `valor > VALOR_LIMITE_DURO` are rejected at creation. The hard limit must hold at scheduling, not only at execution, to prevent attempts that would always fail.
-
-**C-007 (new):** `outreach_recorrente` workflows require `dual_approval_granted = true` at creation (same rule as one-shot `send_proactive_message`, but applied to the *recurring contract*). Once approved, each cycle inherits the approval — the owner approves the *schedule*, not each fire.
-
-### 6.9 Audit actions added
-
-- `outreach_sent` — message sent to destinatario.
-- `outreach_response_captured` — inbound matched a workflow.
-- `outreach_no_response` — wait window expired.
-- `outreach_completed_and_rescheduled` — cycle done, next row created.
-- `outreach_response_was_media` — media path edge.
-- `payment_due_proposed` — pending_question created.
-- `payment_due_confirmed` — owner said yes, transaction created.
-- `payment_due_skipped` — owner said no.
-- `payment_due_postponed` — owner said adiar.
-- `payment_due_unanswered` — pending_question expired, workflow halted.
-- `workflow_cancelled` — series stopped.
-
-### 6.10 Tests
-
-- Unit: `rrule.spec.ts` — `computeNext` for DAILY/WEEKLY/MONTHLY across DST boundaries, leap years, BYMONTHDAY=31 in February (skip to next valid month).
-- Unit: `engine-outreach.spec.ts` — happy path, no-response escalation, media response, cancellation mid-cycle.
-- Unit: `engine-payment.spec.ts` — sim/nao/adiar branches, expire, hard-limit rejection at creation.
-- Integration: `recurring-payment-flow.spec.ts` — start workflow → cron fires → owner answers → transaction created → next cycle scheduled.
-
-## 7. Migration plan
-
-Both phases share migration `007_scheduling.sql`:
+The recurring (or one-shot) template.
 
 ```sql
--- Phase 2: chain_id on workflows for cancellation across cycles
-ALTER TABLE workflows ADD COLUMN chain_id UUID;
-CREATE INDEX idx_workflows_chain ON workflows (chain_id) WHERE chain_id IS NOT NULL;
+CREATE TABLE series (
+  id                          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tipo                        TEXT NOT NULL,                 -- 'one_shot_reminder' | 'recurring_outreach' | 'recurring_payment'
+  status                      TEXT NOT NULL DEFAULT 'active', -- 'active' | 'paused' | 'cancelled'
+  version                     INTEGER NOT NULL DEFAULT 1,    -- optimistic lock against concurrent inserts
+  rrule                       TEXT,                          -- NULL for one_shot_reminder
+  one_shot_at                 TIMESTAMPTZ,                   -- non-null only for one_shot_reminder
+  month_end_policy            TEXT NOT NULL DEFAULT 'skip_invalid_month',
+                              -- 'skip_invalid_month' | 'last_day_of_month' | 'nearest_previous' | 'nearest_next'
+  missed_run_policy           TEXT NOT NULL DEFAULT 'fire_latest_only',
+                              -- 'fire_all' | 'fire_latest_only' | 'skip_all' | 'escalate_to_owner'
+  staleness_threshold_hours   INTEGER NOT NULL DEFAULT 24,   -- past this, an unfired occurrence ages out
+  exclusive_per_destinatario  BOOLEAN NOT NULL DEFAULT FALSE,
+  contexto_template           JSONB NOT NULL DEFAULT '{}',   -- payment details, message template, etc.
+  entidade_id                 UUID,
+  owner_pessoa_id             UUID NOT NULL,
+  created_at                  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at                  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  cancelled_at                TIMESTAMPTZ,
+  CHECK (
+    (tipo = 'one_shot_reminder' AND one_shot_at IS NOT NULL AND rrule IS NULL) OR
+    (tipo <> 'one_shot_reminder' AND rrule IS NOT NULL AND one_shot_at IS NULL)
+  )
+);
 
--- Phase 2: index for engine scan
-CREATE INDEX idx_workflows_due ON workflows (proxima_acao_em)
-  WHERE status IN ('pendente', 'em_andamento', 'aguardando_terceiro');
-
--- Phase 1: index for reminder firer scan
--- agent_facts already has (escopo, chave) unique; add GIN on valor for the firer's predicate
-CREATE INDEX idx_agent_facts_reminder_due ON agent_facts
-  USING gin ((valor) jsonb_path_ops)
-  WHERE chave LIKE 'reminder.%';
+CREATE INDEX idx_series_active ON series (owner_pessoa_id) WHERE status = 'active';
 ```
 
-Down migration drops all new indexes and the column. No data loss.
+### 4.2 `occurrences`
 
-## 8. Rollout
+Each scheduled fire. **Idempotent**: a series can never have two occurrences at the same `scheduled_for` (UNIQUE constraint), so duplicate inserts during a race are rejected at the DB layer.
 
-1. Phase 1 ships behind no feature flag (low risk: pure additive worker + tool, can't fire if no reminders are scheduled).
-2. Phase 2 ships behind `FEATURE_RECURRING_WORKFLOWS=false` default. Each new workflow type added to `tickEngine` checks the flag and no-ops when off. Enables gradual production validation.
-3. Run for one month with internal use (owner only) before opening to spouse/team.
+```sql
+CREATE TABLE occurrences (
+  id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  series_id           UUID NOT NULL REFERENCES series(id) ON DELETE CASCADE,
+  scheduled_for       TIMESTAMPTZ NOT NULL,
+  status              TEXT NOT NULL DEFAULT 'pending',
+                      -- 'pending'|'claimed'|'in_progress'|'awaiting_third_party'|'awaiting_owner'
+                      -- |'completed'|'skipped'|'failed'|'aged_out'|'cancelled'
+  outcome             TEXT,        -- 'sim'|'nao'|'adiar'|'no_response'|'fired'|'forwarded'|null
+  claimed_by          TEXT,        -- worker id (host + pid + uuid)
+  claimed_at          TIMESTAMPTZ,
+  started_at          TIMESTAMPTZ,
+  completed_at        TIMESTAMPTZ,
+  correlation_token   TEXT,        -- 4-hex string embedded in outbound message (recurring_outreach)
+  contexto_snapshot   JSONB NOT NULL DEFAULT '{}',
+                      -- frozen copy of series.contexto_template at creation time
+                      -- ensures running occurrences survive series edits
+  metadata            JSONB NOT NULL DEFAULT '{}',
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (series_id, scheduled_for)
+);
 
-## 9. Operational concerns
+CREATE INDEX idx_occurrences_due
+  ON occurrences (scheduled_for)
+  WHERE status IN ('pending', 'claimed');
 
-- **DLQ:** A reminder or workflow fire that exhausts retries lands in `dead_letter_jobs` with `queue_name='scheduling'`. Inspect via `npm run dlq`.
-- **Alerts:** `payment_due_unanswered` always alerts via spec 17 channels (email/Telegram). `outreach_no_response` alerts only on the second consecutive miss.
-- **Backups:** `agent_facts` and `workflows` are already in nightly Postgres dump (spec 17 §4).
-- **Observability:** add `reminder_lateness_seconds` and `workflow_advance_duration_ms` to the metrics surface (spec 17).
+CREATE INDEX idx_occurrences_series
+  ON occurrences (series_id, status);
 
-## 10. Acceptance criteria (per phase)
+CREATE INDEX idx_occurrences_corr
+  ON occurrences (correlation_token)
+  WHERE correlation_token IS NOT NULL AND status IN ('awaiting_third_party', 'in_progress');
+```
 
-**Phase 1 ready when:**
-- Reminder created via tool fires at `quando ± 60s` in clean test.
-- After Maia downtime > 1 hour, accumulated reminders fire on next tick in chronological order.
-- Cancelled reminder never fires, even if `quando` already passed.
-- All audit actions land with correct metadata shape.
-- `npm test` green; integration test passes against real Postgres.
+### 4.3 `tasks`
 
-**Phase 2 ready when:**
-- `outreach_recorrente` workflow created → first fire happens at the RRULE-computed time, Mariana receives the templated message, her text reply is captured into the step, forwarded to Maria, and next cycle is scheduled.
-- `payment_due` workflow created → first fire posts a confirmation pending_question with three options, sim → transaction created in DB (with audit), não → no transaction, adiar → workflow re-fires in 2 days, unanswered → alert sent and workflow halted.
-- `cancel_workflow` stops both current and all future cycles when given a `chain_id`.
-- Constitutional checks reject `valor > LIMITE_DURO` at creation and require dual approval for outreach.
-- All audit actions land with correct metadata shape.
+Steps within one occurrence. Replaces `workflow_steps` for the scheduling domain (the old table remains for legacy workflow types).
+
+```sql
+CREATE TABLE tasks (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  occurrence_id   UUID NOT NULL REFERENCES occurrences(id) ON DELETE CASCADE,
+  ordem           INTEGER NOT NULL,
+  kind            TEXT NOT NULL,
+                  -- 'fire_reminder'|'send_outreach'|'await_response'|'forward'
+                  -- |'propose_payment'|'await_decision'|'execute_or_skip'
+  status          TEXT NOT NULL DEFAULT 'pending',
+                  -- 'pending'|'in_progress'|'completed'|'skipped'|'failed'
+  result          JSONB NOT NULL DEFAULT '{}',
+  started_at      TIMESTAMPTZ,
+  completed_at    TIMESTAMPTZ,
+  UNIQUE (occurrence_id, ordem)
+);
+```
+
+### 4.4 `outbox_messages`
+
+The transactional outbox. Anything that must reach the outside world (WhatsApp text, poll, document, alert email) is enqueued **in the same transaction** that advances the task state. A separate worker drains it.
+
+```sql
+CREATE TABLE outbox_messages (
+  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  occurrence_id     UUID REFERENCES occurrences(id) ON DELETE SET NULL,
+  task_id           UUID REFERENCES tasks(id) ON DELETE SET NULL,
+  kind              TEXT NOT NULL,
+                    -- 'whatsapp_text'|'whatsapp_pending_question'|'whatsapp_alert'|'email_alert'
+  payload           JSONB NOT NULL,        -- { jid, text } or { pessoa_id, conversa_id, question_payload } etc.
+  status            TEXT NOT NULL DEFAULT 'pending',
+                    -- 'pending'|'claimed'|'sent'|'failed'|'dead'
+  claimed_by        TEXT,
+  claimed_at        TIMESTAMPTZ,
+  attempts          INTEGER NOT NULL DEFAULT 0,
+  max_attempts      INTEGER NOT NULL DEFAULT 5,
+  next_attempt_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_error        TEXT,
+  sent_at           TIMESTAMPTZ,
+  dedup_key         TEXT,                  -- optional caller-supplied unique key
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_outbox_due
+  ON outbox_messages (next_attempt_at)
+  WHERE status IN ('pending', 'claimed');
+
+CREATE UNIQUE INDEX idx_outbox_dedup
+  ON outbox_messages (dedup_key)
+  WHERE dedup_key IS NOT NULL;
+```
+
+### 4.5 `audit_log` extension
+
+Existing `audit_log` gets one new column. No data migration needed; back-fill is unnecessary because the column is nullable and only used by new flows.
+
+```sql
+ALTER TABLE audit_log ADD COLUMN occurrence_id UUID REFERENCES occurrences(id) ON DELETE SET NULL;
+CREATE INDEX idx_audit_log_occurrence ON audit_log (occurrence_id) WHERE occurrence_id IS NOT NULL;
+```
+
+## 5. State machines
+
+### 5.1 Occurrence lifecycle
+
+```
+            ┌──────────────────────────────────────────┐
+            ▼                                          │
+pending ─► claimed ─► in_progress ──► completed        │
+   │           │            │                          │
+   │           │            ├──► awaiting_third_party ─┤ (response arrives or ages out)
+   │           │            │
+   │           │            ├──► awaiting_owner ────────► completed | skipped | failed
+   │           │            │
+   │           │            └──► failed
+   │           │
+   │           └──► (re-claim on lease expiry → claimed)
+   │
+   ├──► cancelled    (via cancel_series)
+   └──► aged_out     (past staleness_threshold_hours)
+```
+
+A claim is a **lease**: `claimed` rows with `claimed_at < now() - LEASE_TTL` are reclaimable by another worker. Default lease = 5 minutes.
+
+### 5.2 Outbox lifecycle
+
+```
+pending ─► claimed ─► sent
+   │           │
+   │           └──► failed (attempts < max) ─► back to pending with backoff
+   │
+   └─► dead  (attempts >= max)   alerts operator, never auto-retries
+```
+
+## 6. Policies
+
+All policies are **persisted on the series row** and applied in deterministic code paths. None is implicit.
+
+### 6.1 `month_end_policy`
+
+Applied by `computeNextOccurrence(series, after)` whenever `rrule` has `BYMONTHDAY` and the target month does not contain that day.
+
+| Value | Behaviour for `BYMONTHDAY=31` in February |
+|---|---|
+| `skip_invalid_month` | Skips February entirely; next fire is March 31. (default) |
+| `last_day_of_month` | Fires on Feb 28 / 29. |
+| `nearest_previous` | Fires on Feb 28. Same as `last_day_of_month` for end-of-month; different for `BYMONTHDAY=30` in Feb (29 vs 28). |
+| `nearest_next` | Fires on Mar 1. |
+
+### 6.2 `missed_run_policy`
+
+Applied by the engine tick when it discovers an occurrence with `scheduled_for < now() - staleness_threshold_hours`.
+
+| Value | Behaviour |
+|---|---|
+| `fire_all` | Fire every overdue occurrence in chronological order. Default for `one_shot_reminder` (a missed lembrete is still a useful lembrete late). |
+| `fire_latest_only` | Audit older overdues as `occurrence_aged_skipped`; fire only the most recent. Default for `recurring_payment` and `recurring_outreach`. |
+| `skip_all` | Audit each overdue as `occurrence_aged_skipped`; engine schedules only the next future occurrence. |
+| `escalate_to_owner` | Audit overdues; do not fire; send an alert message to the owner asking how to proceed. |
+
+`staleness_threshold_hours` controls when an occurrence becomes "overdue" for this policy. Default 24h. A 25-minute hiccup never triggers policy logic — only multi-hour windows.
+
+### 6.3 `staleness_threshold_hours`
+
+Past this window an unfired occurrence is `aged_out` regardless of policy when the missed-run policy is `skip_all` or `escalate_to_owner`. For `fire_all` and `fire_latest_only`, the policy itself decides — staleness controls *whether the policy even applies*. Threshold is independently overridable per series.
+
+### 6.4 `exclusive_per_destinatario`
+
+When true, the engine refuses to create a new occurrence for the series while a prior occurrence with the same `contexto_snapshot.destinatario_pessoa_id` is in `awaiting_third_party` or `in_progress`. The previous one must complete or age out first. Prevents pile-up of un-answered outreach to the same person.
+
+## 7. Operational mechanics
+
+### 7.1 Outbox-first writes (Requirement 1)
+
+Every code path that needs to reach WhatsApp follows the **same** contract:
+
+```typescript
+await db.transaction(async (tx) => {
+  await tx.update(tasks).set({ status: 'completed', result }).where(...);
+  await tx.insert(outbox_messages).values({
+    occurrence_id, task_id,
+    kind: 'whatsapp_text',
+    payload: { jid, text, ... },
+    dedup_key: `${occurrence_id}:${task.ordem}:send`,
+  });
+});
+```
+
+If the process crashes after the commit, the next `outbox-drain` tick picks up the pending row. If the process crashes before the commit, neither the state advance nor the outbox row exists. **No half-states.**
+
+The `dedup_key` is required for every outbox write that could be retried. Format: `<occurrence_id>:<task_ordem>:<purpose>`. The unique partial index rejects duplicates at the DB layer, so retrying the whole transaction is safe.
+
+### 7.2 Backpressure (Requirement 2)
+
+Three independent limits applied by `outbox-drain`:
+
+1. **Global rate** — Redis token bucket at key `outbox:rate:whatsapp`, refilled by config:
+   - `OUTBOX_MAX_PER_SECOND` (default 1)
+   - `OUTBOX_MAX_PER_HOUR` (default 600)
+2. **Per-recipient pacing** — `SET NX EX 2` on `outbox:pace:{jid}` before send; if the key exists, defer (occurrence remains `pending` for next tick).
+3. **Concurrency** — at most `OUTBOX_WORKER_CONCURRENCY` (default 4) in-flight sends per drain pass.
+
+A 10k backlog with default config drains at 1 msg/s = ~2.8 hours, but more importantly it never bursts to WhatsApp. If `OUTBOX_MAX_PER_HOUR` is exceeded, drain waits.
+
+`aged_out` enforcement runs in the same loop: any `pending` occurrence with `scheduled_for < now() - staleness_threshold_hours` is processed by the missed-run policy (audit + skip / escalate) and does **not** consume rate-limit tokens.
+
+### 7.3 Locking and concurrent workers (Requirement 5)
+
+**Engine pick** uses Postgres advisory:
+
+```sql
+BEGIN;
+SELECT * FROM occurrences
+ WHERE status = 'pending' AND scheduled_for <= now()
+ ORDER BY scheduled_for
+ FOR UPDATE SKIP LOCKED
+ LIMIT 20;
+-- in the same tx, claim each:
+UPDATE occurrences
+   SET status = 'claimed', claimed_by = $worker_id, claimed_at = now()
+ WHERE id = ANY($ids);
+COMMIT;
+```
+
+`FOR UPDATE SKIP LOCKED` means two engine instances never see the same row. The claim is a lease — another worker may steal it if `claimed_at < now() - LEASE_TTL`, by repeating the same flow against `status='claimed' AND claimed_at < ...`.
+
+**Series cancellation** runs in one transaction and bumps the version:
+
+```sql
+BEGIN;
+UPDATE series
+   SET status = 'cancelled', cancelled_at = now(), version = version + 1
+ WHERE id = $series_id AND status = 'active';
+UPDATE occurrences
+   SET status = 'cancelled', completed_at = now()
+ WHERE series_id = $series_id AND status IN ('pending', 'claimed');
+COMMIT;
+```
+
+**Next-occurrence creation** by the engine uses the version:
+
+```sql
+INSERT INTO occurrences (...)
+SELECT ...
+  FROM series
+ WHERE id = $series_id
+   AND status = 'active'
+   AND version = $observed_version;
+-- 0 rows affected → series was cancelled / edited mid-tick; engine drops the
+-- next-occurrence attempt and audits 'series_cancelled_during_advance'.
+```
+
+Combined: a cancellation racing with an in-flight `advance()` either pre-empts it (status check returns 0 rows on the insert) or the cancel itself drops the about-to-be-created row anyway. **No "ghost" occurrences post-cancellation.**
+
+### 7.4 Correlation tokens (Requirement 6)
+
+Each `recurring_outreach` occurrence stores a `correlation_token`: a 4-hex string like `A4F2`. The outbound message template appends `\n\n_ref: A4F2_` (formatted as italic via WhatsApp's markdown to look incidental, not technical).
+
+When the engine's inbound hook sees a text from a known destinatario:
+
+1. **Regex first** — search for `_ref:\s*([A-F0-9]{4})_` (case-insensitive). If a match exists and an active occurrence with that token belongs to the sender, route the response there. **Match.**
+2. **Single-candidate fallback** — if no token but exactly one active occurrence with this destinatario, route there (preserves usability if the third party stripped the ref).
+3. **Disambiguation** — multiple candidates and no token → engine creates a `pending_question` to the **owner** (not the destinatario): "Mariana respondeu mas tenho 2 pedidos abertos com ela. Foi sobre [A: relatório Empresa A] ou [B: relatório Empresa B]?". The owner's reply resolves which occurrence gets the response. The destinatario's text is **held**, not lost.
+
+For `exclusive_per_destinatario=true` series, case 3 never happens because the engine refuses to start a second concurrent occurrence.
+
+### 7.5 Audit trail per occurrence (Requirement 7)
+
+Every state transition writes `audit_log` with `occurrence_id` populated. The canonical "tell me everything about this occurrence" query is one statement:
+
+```sql
+SELECT
+  o.id, o.series_id, o.scheduled_for, o.status, o.outcome,
+  o.contexto_snapshot,
+  json_agg(
+    json_build_object(
+      'at', a.created_at,
+      'acao', a.acao,
+      'metadata', a.metadata,
+      'pessoa_id', a.pessoa_id
+    ) ORDER BY a.created_at
+  ) FILTER (WHERE a.id IS NOT NULL) AS events
+FROM occurrences o
+LEFT JOIN audit_log a ON a.occurrence_id = o.id
+WHERE o.id = $1
+GROUP BY o.id;
+```
+
+For an entire series:
+
+```sql
+SELECT o.id, o.scheduled_for, o.status, o.outcome
+  FROM occurrences o
+ WHERE o.series_id = $1
+ ORDER BY o.scheduled_for DESC;
+```
+
+## 8. Tools (LLM-facing surface)
+
+### 8.1 `schedule_reminder` (rewritten)
+
+Input unchanged from owner perspective. Implementation creates a series with `tipo='one_shot_reminder'`:
+
+```ts
+input  = { quando: ISO, texto: string<=500, entidade_id?: UUID, canal?: 'whatsapp' }
+output = { series_id, occurrence_id, scheduled_for }
+```
+
+The first (and only) occurrence is created in the same transaction. Tool action key: `schedule_reminder`. Audit: `series_created` + `occurrence_scheduled`.
+
+### 8.2 `cancel_reminder` / `cancel_series` (unified)
+
+```ts
+input  = { series_id: UUID, reason?: string }
+output = { cancelled: boolean, occurrences_cancelled: number }
+```
+
+Atomic transaction per §7.3. Replaces the older `cancel_workflow`. The standalone `cancel_reminder` is preserved as a thin wrapper for LLM ergonomics (the model can stay on the verb it knows for one-shots).
+
+### 8.3 `start_recurring_outreach`
+
+```ts
+input = {
+  rrule: string,
+  destinatario_pessoa_id: UUID,
+  forward_to_pessoa_id?: UUID,
+  message_template: string<=2000,         // supports {{nome}}, {{mes_anterior}}; ref token appended automatically
+  forward_template?: string<=2000,        // supports {{resposta}}, {{nome}}
+  wait_response_hours?: int (1..720, default 48),
+  month_end_policy?: MonthEndPolicy,
+  missed_run_policy?: MissedRunPolicy,    // default 'escalate_to_owner' for outreach
+  exclusive_per_destinatario?: bool,      // default false
+  entidade_id: UUID,
+  dual_approval_granted: bool,            // C-007 requires true
+}
+```
+
+### 8.4 `start_recurring_payment`
+
+```ts
+input = {
+  rrule: string,
+  conta_id: UUID,
+  valor: number > 0,
+  descricao: string<=280,
+  categoria_id?: UUID,
+  contraparte_id?: UUID,
+  escalate_after_hours?: int (1..168, default 4),
+  month_end_policy?: MonthEndPolicy,
+  missed_run_policy?: MissedRunPolicy,    // default 'fire_latest_only' for payments
+  entidade_id: UUID,
+}
+```
+
+C-006 enforces `valor <= VALOR_LIMITE_DURO` at creation.
+
+## 9. Constitutional rules (added/refined)
+
+- **C-006**: `start_recurring_payment` with `valor > VALOR_LIMITE_DURO` is forbidden at creation. Applies to **scheduled** intent, not just dispatch.
+- **C-007**: `start_recurring_outreach` requires `dual_approval_granted=true` at creation. One approval covers the recurring contract; each cycle inherits it via the series, but the *cycle itself* still passes through the engine which respects the series row state.
+- **C-008 (new)**: An occurrence whose `contexto_snapshot.valor > VALOR_LIMITE_DURO` is rejected when claimed by the engine. Defence in depth: prevents a previously-valid series from firing if `VALOR_LIMITE_DURO` was lowered after creation.
+
+## 10. Workers
+
+| Worker | Cron | Purpose |
+|---|---|---|
+| `scheduling_tick` | `* * * * *` (1 min) | Claim due occurrences, advance state machine, enqueue outbox writes. |
+| `outbox_drain` | continuous loop (BullMQ worker, not cron) | Consume `outbox_messages` rows, send via Baileys / alerts, apply backpressure. |
+| `occurrence_lease_reaper` | `*/5 * * * *` | Reclaim stuck `claimed` occurrences (lease expired). |
+| `outbox_lease_reaper` | `*/5 * * * *` | Reclaim stuck `claimed` outbox rows. |
+| `series_next_scheduler` | `*/10 * * * *` | For every active series with no pending future occurrence, compute and insert the next one. |
+
+`outbox_drain` is intentionally NOT a cron — it's a long-running BullMQ worker so backpressure decisions don't lose state between cron firings.
+
+## 11. Migration plan
+
+Migration `007_scheduling.sql` (the v1 draft is dropped from this branch) becomes the operational schema:
+
+1. Create `series`, `occurrences`, `tasks`, `outbox_messages`.
+2. Add `occurrence_id` to `audit_log`.
+3. Drop the unused `chain_id` column / index from the v1 attempt (only if applied; safe to skip if not).
+
+No data migration needed — there are no v1 rows in production.
+
+## 12. Rollout
+
+1. Apply migration on staging.
+2. Deploy code; `FEATURE_SCHEDULING_V2=true` enables the new tools and workers. Default off in case of unforeseen prod issues.
+3. Run shadow mode for 24h: workers run, but `outbox_drain` sends only to a single owner-test JID. Confirm metrics (queue depth, send rate, error rate).
+4. Enable for production owner. Monitor `payment_due` runs for one full cycle (one month).
+5. Open to spouse + team after first full successful cycle.
+
+## 13. Acceptance criteria — the seven tests
+
+Each criterion is a single integration test in `tests/integration/scheduling/`:
+
+| # | Test file | What it proves |
+|---|---|---|
+| 1 | `outbox-crash-no-loss.spec.ts` | Crash between task commit and outbox send: next tick still delivers. |
+| 2 | `backpressure-10k-drain.spec.ts` | 10k due occurrences drain under configured limits, never exceeding `OUTBOX_MAX_PER_SECOND`. |
+| 3 | `month-end-policy.spec.ts` | All four `month_end_policy` values produce documented dates for BYMONTHDAY=31 across feb/apr/jun/sep/nov. |
+| 4 | `missed-run-policy.spec.ts` | Simulated 5-day downtime: each `missed_run_policy` value produces the documented audit + fire pattern. |
+| 5 | `cancel-race.spec.ts` | Concurrent `cancel_series` + engine tick: no new occurrence is created post-cancellation, no occurrence is dispatched post-cancellation. |
+| 6 | `multi-pending-disambiguation.spec.ts` | Two open outreach occurrences with same destinatario: response without token triggers disambiguation pending_question to the owner; response with matching token routes directly. |
+| 7 | `audit-trail-per-occurrence.spec.ts` | Single SQL query returns the full ordered event chain for any occurrence from creation through final outcome. |
+
+All seven must pass in CI before merge.
+
+## 14. Observability
+
+Metrics (Prometheus-shape, exposed via spec 17):
+
+- `scheduling_engine_tick_duration_ms` (histogram)
+- `scheduling_occurrences_claimed_total` (counter, by tipo)
+- `scheduling_occurrences_status` (gauge, by status)
+- `scheduling_outbox_queue_depth` (gauge)
+- `scheduling_outbox_send_total` (counter, by kind, outcome)
+- `scheduling_outbox_attempts` (histogram)
+- `scheduling_aged_out_total` (counter, by tipo)
+- `scheduling_cancel_race_drops_total` (counter — series_cancelled_during_advance)
+
+Audit actions:
+
+`series_created`, `series_cancelled`, `series_cancelled_during_advance`,
+`occurrence_scheduled`, `occurrence_claimed`, `occurrence_aged_skipped`,
+`occurrence_completed`, `occurrence_failed`, `occurrence_cancelled`,
+`outbox_enqueued`, `outbox_sent`, `outbox_failed`, `outbox_dead`,
+`reminder_fired`, `outreach_sent`, `outreach_response_captured`,
+`outreach_response_disambiguation_required`, `outreach_response_dropped_no_match`,
+`payment_due_proposed`, `payment_due_confirmed`, `payment_due_skipped`,
+`payment_due_postponed`, `payment_due_unanswered`.
+
+## 15. Operational concerns
+
+- **Backup**: all new tables included in nightly Postgres dump (spec 17 §4); restore-test exercises one full series → occurrence → outbox round-trip.
+- **DLQ**: any outbox row that reaches `dead` triggers an alert via spec 17 (email/Telegram). `npm run dlq` shows scheduling DLQ alongside agent queue.
+- **Cleanup**: `occurrences` in terminal states (`completed`, `skipped`, `failed`, `aged_out`, `cancelled`) older than 365 days can be archived to cold storage. Not implemented Phase 1; flag in metrics if `occurrences` table exceeds 100k rows.

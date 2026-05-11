@@ -262,9 +262,101 @@ export const workflows = pgTable('workflows', {
   iniciado_em: timestamp('iniciado_em', { withTimezone: true }).notNull().defaultNow(),
   concluido_em: timestamp('concluido_em', { withTimezone: true }),
   metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
-  // Spec 18 §6.4 — links recurring cycles so cancel_workflow can stop the whole series.
-  chain_id: uuid('chain_id'),
 });
+
+// Spec 18 — Scheduling: Series, Occurrences, Tasks, Outbox.
+// Lives in its own domain alongside `workflows` (which keeps dual_approval
+// and any other ad-hoc workflow types). Recurring scheduling never touches
+// `workflows` anymore — the v1 chain_id design was scrapped per spec 18 v2.
+export const series = pgTable(
+  'series',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tipo: text('tipo').notNull(),
+    status: text('status').notNull().default('active'),
+    version: integer('version').notNull().default(1),
+    rrule: text('rrule'),
+    one_shot_at: timestamp('one_shot_at', { withTimezone: true }),
+    month_end_policy: text('month_end_policy').notNull().default('skip_invalid_month'),
+    missed_run_policy: text('missed_run_policy').notNull().default('fire_latest_only'),
+    staleness_threshold_hours: integer('staleness_threshold_hours').notNull().default(24),
+    exclusive_per_destinatario: boolean('exclusive_per_destinatario').notNull().default(false),
+    contexto_template: jsonb('contexto_template').notNull().default(sql`'{}'::jsonb`),
+    entidade_id: uuid('entidade_id'),
+    owner_pessoa_id: uuid('owner_pessoa_id').notNull(),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    cancelled_at: timestamp('cancelled_at', { withTimezone: true }),
+  },
+  (t) => ({
+    by_owner_active: index('idx_series_active').on(t.owner_pessoa_id),
+  }),
+);
+
+export const occurrences = pgTable(
+  'occurrences',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    series_id: uuid('series_id').notNull(),
+    scheduled_for: timestamp('scheduled_for', { withTimezone: true }).notNull(),
+    status: text('status').notNull().default('pending'),
+    outcome: text('outcome'),
+    claimed_by: text('claimed_by'),
+    claimed_at: timestamp('claimed_at', { withTimezone: true }),
+    started_at: timestamp('started_at', { withTimezone: true }),
+    completed_at: timestamp('completed_at', { withTimezone: true }),
+    correlation_token: text('correlation_token'),
+    contexto_snapshot: jsonb('contexto_snapshot').notNull().default(sql`'{}'::jsonb`),
+    metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    by_series_sched: unique('occurrences_series_scheduled_uniq').on(t.series_id, t.scheduled_for),
+    by_due: index('idx_occurrences_due').on(t.scheduled_for),
+    by_series_status: index('idx_occurrences_series_status').on(t.series_id, t.status),
+  }),
+);
+
+export const tasks = pgTable(
+  'tasks',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    occurrence_id: uuid('occurrence_id').notNull(),
+    ordem: integer('ordem').notNull(),
+    kind: text('kind').notNull(),
+    status: text('status').notNull().default('pending'),
+    result: jsonb('result').notNull().default(sql`'{}'::jsonb`),
+    started_at: timestamp('started_at', { withTimezone: true }),
+    completed_at: timestamp('completed_at', { withTimezone: true }),
+  },
+  (t) => ({
+    by_occurrence_ordem: unique('tasks_occurrence_ordem_uniq').on(t.occurrence_id, t.ordem),
+  }),
+);
+
+export const outbox_messages = pgTable(
+  'outbox_messages',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    occurrence_id: uuid('occurrence_id'),
+    task_id: uuid('task_id'),
+    kind: text('kind').notNull(),
+    payload: jsonb('payload').notNull(),
+    status: text('status').notNull().default('pending'),
+    claimed_by: text('claimed_by'),
+    claimed_at: timestamp('claimed_at', { withTimezone: true }),
+    attempts: integer('attempts').notNull().default(0),
+    max_attempts: integer('max_attempts').notNull().default(5),
+    next_attempt_at: timestamp('next_attempt_at', { withTimezone: true }).notNull().defaultNow(),
+    last_error: text('last_error'),
+    sent_at: timestamp('sent_at', { withTimezone: true }),
+    dedup_key: text('dedup_key'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    by_due: index('idx_outbox_due').on(t.next_attempt_at),
+  }),
+);
 
 export const workflow_steps = pgTable('workflow_steps', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -408,6 +500,8 @@ export const audit_log = pgTable('audit_log', {
   alvo_id: uuid('alvo_id'),
   conversa_id: uuid('conversa_id'),
   mensagem_id: uuid('mensagem_id'),
+  // Spec 18 §7.5 — per-occurrence audit trail. Nullable; only set by scheduling flows.
+  occurrence_id: uuid('occurrence_id'),
   diff: jsonb('diff'),
   metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
   created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
@@ -438,3 +532,11 @@ export type PermissionProfile = typeof permission_profiles.$inferSelect;
 export type DashboardSession = typeof dashboard_sessions.$inferSelect;
 export type ImportRun = typeof import_runs.$inferSelect;
 export type ImportEntry = typeof import_entries.$inferSelect;
+export type Series = typeof series.$inferSelect;
+export type SeriesInsert = typeof series.$inferInsert;
+export type Occurrence = typeof occurrences.$inferSelect;
+export type OccurrenceInsert = typeof occurrences.$inferInsert;
+export type Task = typeof tasks.$inferSelect;
+export type TaskInsert = typeof tasks.$inferInsert;
+export type OutboxMessage = typeof outbox_messages.$inferSelect;
+export type OutboxMessageInsert = typeof outbox_messages.$inferInsert;

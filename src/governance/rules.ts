@@ -52,26 +52,35 @@ export function constitutionalCheck(input: {
     return { kind: 'forbidden', rule_id: 'C-005', reason: 'decisão estratégica exige humano' };
   }
 
-  // C-006 (spec 18 §6.8): payment_due workflow above LIMITE_DURO rejected at
-  // creation. The hard limit must hold at scheduling, not only execution,
-  // so we never persist a workflow that would always fail when it fires.
-  if (intent.tool === 'start_workflow' && intent.args.tipo === 'payment_due') {
-    const ctx = intent.args.contexto as Record<string, unknown> | undefined;
-    const valor = ctx?.['valor'];
+  // C-006 (spec 18 §9): start_recurring_payment with valor > LIMITE_DURO
+  // rejected at creation. Hard limit must hold at scheduling, not only at
+  // dispatch — we never persist a series that would always fail.
+  if (intent.tool === 'start_recurring_payment') {
+    const valor = intent.args.valor;
     if (typeof valor === 'number' && valor > config.VALOR_LIMITE_DURO) {
       return { kind: 'forbidden', rule_id: 'C-006', reason: 'pagamento agendado acima do limite duro' };
     }
   }
 
-  // C-007 (spec 18 §6.8): outreach_recorrente requires dual_approval at
-  // creation. Same threshold as one-shot send_proactive_message — owner
-  // approves the recurring contract once, each cycle inherits the approval.
-  if (intent.tool === 'start_workflow' && intent.args.tipo === 'outreach_recorrente' && !input.dual_approval_granted) {
+  // C-007 (spec 18 §9): start_recurring_outreach requires dual_approval at
+  // creation. Owner approves the recurring contract once; each occurrence
+  // inherits via the series row.
+  if (intent.tool === 'start_recurring_outreach' && !input.dual_approval_granted) {
     return {
       kind: 'limit_exceeded',
       required_action: 'dual_approval',
       reason: 'agendamento recorrente envolvendo terceiros requer aprovação',
     };
+  }
+
+  // C-008 (spec 18 §9): defence-in-depth — an occurrence whose snapshot
+  // exceeds VALOR_LIMITE_DURO is rejected when claimed by the engine.
+  // Guards against limit changes after the series was created.
+  if (intent.tool === '__occurrence_claim__' && intent.args.tipo === 'recurring_payment') {
+    const valor = (intent.args.contexto_snapshot as Record<string, unknown> | undefined)?.['valor'];
+    if (typeof valor === 'number' && valor > config.VALOR_LIMITE_DURO) {
+      return { kind: 'forbidden', rule_id: 'C-008', reason: 'ocorrência acima do limite duro atual' };
+    }
   }
 
   return null;
