@@ -10,6 +10,7 @@ export async function audit(input: {
   alvo_id?: string | null;
   conversa_id?: string | null;
   mensagem_id?: string | null;
+  occurrence_id?: string | null;
   diff?: { before?: unknown; after?: unknown } | null;
   metadata?: Record<string, unknown>;
 }): Promise<void> {
@@ -21,6 +22,7 @@ export async function audit(input: {
       alvo_id: input.alvo_id ?? null,
       conversa_id: input.conversa_id ?? null,
       mensagem_id: input.mensagem_id ?? null,
+      occurrence_id: input.occurrence_id ?? null,
       diff: (input.diff ?? null) as object | null,
       metadata: input.metadata ?? {},
     });

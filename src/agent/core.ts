@@ -274,7 +274,36 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
     await clearDebounceState(pessoa.telefone_whatsapp);
     return;
   }
-  // 'unresolved' and 'no_pending' fall through to the existing ReAct flow.
+  // 'unresolved' and 'no_pending' fall through.
+
+  // Blocker 9 — Scheduling inbound hook (spec 18 §7.4). When the inbound
+  // is a text from someone who has at least one `recurring_outreach`
+  // occurrence in `awaiting_third_party`, try to attach the response.
+  // Three outcomes:
+  //  - routed: response captured, occurrence advances; we DON'T short-
+  //    circuit the LLM turn (the LLM can still acknowledge to the sender).
+  //  - disambiguation_requested: owner was prompted; we still let the LLM
+  //    answer the sender so they don't get silence.
+  //  - no_match: no scheduling state cares about this inbound; continue.
+  if (config.FEATURE_SCHEDULING_V2 && inbound.tipo === 'texto' && inbound.conteudo) {
+    try {
+      const { captureInboundForOutreach } = await import('@/scheduling/disambiguation.js');
+      const ownerId = config.OWNER_TELEFONE_WHATSAPP;
+      const owner = await (await import('@/db/repositories.js')).pessoasRepo.findByPhone(ownerId);
+      if (owner) {
+        await captureInboundForOutreach({
+          sender: pessoa,
+          inbound,
+          owner_pessoa_id: owner.id,
+        });
+      }
+    } catch (err) {
+      logger.warn(
+        { err: (err as Error).message, mensagem_id: inbound.id },
+        'agent.scheduling_inbound_hook_failed',
+      );
+    }
+  }
 
   const scope = await resolveScope(pessoa);
 
