@@ -286,7 +286,14 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
   });
 
   const tools = getToolSchemas(scope.byEntity);
-  const jid = pessoa.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
+  // Use the JID the inbound message arrived on so replies stay on the same
+  // thread — critical when WhatsApp routes via `@lid` (privacy IDs) instead
+  // of the raw `phone@s.whatsapp.net` form. Falls back to phone-derived JID.
+  const inboundRemoteJid = (inbound.metadata as Record<string, unknown> | null)?.['remote_jid'];
+  const jid =
+    typeof inboundRemoteJid === 'string' && inboundRemoteJid.length > 0
+      ? inboundRemoteJid
+      : pessoa.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
   const stopTyping = scheduleTypingDebounce(jid, inbound.id);
   let totalTokens: number;
   try {

@@ -254,8 +254,28 @@ async function handleIncoming(msg: proto.IWebMessageInfo): Promise<void> {
     return;
   }
 
-  const phone = remote_jid.split('@')[0]!;
-  const tel = '+' + phone;
+  // WhatsApp privacy: alguns contatos chegam como `XXX@lid` (Linked ID)
+  // em vez de `5511...@s.whatsapp.net`. O LID é sintético — usá-lo como
+  // telefone faz a resolução de identidade falhar pra sempre. Quando vier
+  // `@lid`, tenta extrair o telefone real do `senderPn` / `participantPn`
+  // que o Baileys popula nessas mensagens. Fallback: split do JID (padrão).
+  const isLid = remote_jid.endsWith('@lid');
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const k = msg.key as any;
+  const realPn: string | undefined =
+    typeof k?.senderPn === 'string'
+      ? k.senderPn
+      : typeof k?.participantPn === 'string'
+        ? k.participantPn
+        : undefined;
+  const rawPhone = isLid && realPn ? realPn.split('@')[0]! : remote_jid.split('@')[0]!;
+  const tel = '+' + rawPhone;
+  if (isLid && !realPn) {
+    logger.warn(
+      { remote_jid, whatsapp_id },
+      'baileys.lid_without_real_phone',
+    );
+  }
 
   if (await checkBotAndMaybeBlock(tel)) {
     logger.warn({ tel: '[REDACTED]' }, 'baileys.dropped_anomalous_volume');

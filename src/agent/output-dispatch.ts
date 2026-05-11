@@ -11,6 +11,29 @@ import type { WAQuotedContext } from '@/gateway/presence.js';
 import { detectCorrection } from './reflection.js';
 import { cleanupPDF } from './pdf-cleanup.js';
 
+/**
+ * Returns the JID the outbound reply should target. Looks up the inbound
+ * message's original `metadata.remote_jid` so that replies stay on whatever
+ * thread (incl. `@lid` privacy IDs) the user contacted us through. Falls
+ * back to building the JID from the pessoa's phone — the legacy behaviour
+ * for cases where the inbound row is missing or doesn't have `remote_jid`.
+ */
+async function resolveOutboundJid(pessoa: Pessoa, in_reply_to: string): Promise<string> {
+  try {
+    const inbound = await mensagensRepo.findById(in_reply_to);
+    const inboundRemoteJid = (inbound?.metadata as Record<string, unknown> | null)?.['remote_jid'];
+    if (typeof inboundRemoteJid === 'string' && inboundRemoteJid.length > 0) {
+      return inboundRemoteJid;
+    }
+  } catch (err) {
+    logger.warn(
+      { err: (err as Error).message, in_reply_to },
+      'outbound.jid_lookup_failed_falling_back',
+    );
+  }
+  return pessoa.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
+}
+
 export type LatestPending = {
   id: string;
   opcoes_validas: Array<{ key: string; label: string }>;
@@ -244,7 +267,10 @@ export async function sendOutbound(
 ): Promise<string | null> {
   const pessoa = await pessoasRepo.findById(pessoa_id);
   if (!pessoa) return null;
-  const jid = pessoa.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
+  // Reply to whatever JID the inbound used (handles `@lid` privacy IDs that
+  // wouldn't survive the round-trip through `phone + @s.whatsapp.net`).
+  // Falls back to the phone-derived JID for non-reply outbounds.
+  const jid = await resolveOutboundJid(pessoa, in_reply_to);
   const sendOpts: { quoted?: WAQuotedContext; view_once?: boolean } = {};
   if (opts?.quoted) sendOpts.quoted = opts.quoted;
   if (opts?.view_once) sendOpts.view_once = true;
@@ -279,7 +305,7 @@ export async function sendOutboundPoll(
 ): Promise<{ fell_back: boolean }> {
   const pessoa = await pessoasRepo.findById(pessoa_id);
   if (!pessoa) return { fell_back: false };
-  const jid = pessoa.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
+  const jid = await resolveOutboundJid(pessoa, in_reply_to);
   const { sendPoll } = await import('@/gateway/presence.js');
   const sent = await sendPoll(jid, text, pending.opcoes_validas);
   // Without all three (whatsapp_id, message_secret, creator_jid) the inbound
