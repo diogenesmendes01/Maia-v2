@@ -2,7 +2,11 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const claimDueMock = vi.fn();
 const reclaimMock = vi.fn().mockResolvedValue([]);
+const claimInProgressMock = vi.fn().mockResolvedValue([]);
+const listAwaitingTimedOutMock = vi.fn().mockResolvedValue([]);
 const setStatusMock = vi.fn().mockResolvedValue(undefined);
+const releaseClaimMock = vi.fn().mockResolvedValue(undefined);
+const hasOpenExclMock = vi.fn().mockResolvedValue(false);
 const findByIdMock = vi.fn();
 const tasksByOccMock = vi.fn();
 const tasksSetStatusMock = vi.fn().mockResolvedValue(undefined);
@@ -10,17 +14,34 @@ const enqueueMock = vi.fn().mockResolvedValue({ id: 'ob-1' });
 const listOverdueMock = vi.fn().mockResolvedValue([]);
 const insertNextMock = vi.fn().mockResolvedValue({ occurrence: null, tasks: [] });
 
+// advanceWithTx mock: runs the callback with stub tx-scoped repos that
+// delegate to the same outer mocks we've set up. This lets the engine's
+// transactional blocks execute their writes during tests.
+const advanceWithTxMock = vi.fn(async (fn: (tx: unknown, repos: unknown) => unknown) => {
+  const repos = {
+    occurrences: { setStatus: setStatusMock },
+    tasks: { setStatus: tasksSetStatusMock },
+    outbox: { enqueue: enqueueMock },
+  };
+  return fn({}, repos);
+});
+
 vi.mock('../../src/scheduling/repos.js', () => ({
   seriesRepo: { findById: findByIdMock, insertNextOccurrenceIfActive: insertNextMock },
   occurrencesRepo: {
     claimDue: claimDueMock,
     reclaimExpiredLeases: reclaimMock,
+    claimInProgressForAdvance: claimInProgressMock,
+    listAwaitingTimedOut: listAwaitingTimedOutMock,
     setStatus: setStatusMock,
+    releaseClaim: releaseClaimMock,
+    hasOpenForDestinatarioExcluding: hasOpenExclMock,
     listOverdueForSeries: listOverdueMock,
     byId: vi.fn(),
   },
   tasksRepo: { byOccurrence: tasksByOccMock, setStatus: tasksSetStatusMock },
   outboxRepo: { enqueue: enqueueMock },
+  advanceWithTx: advanceWithTxMock,
 }));
 
 const pessoasFindByIdMock = vi.fn();
@@ -50,7 +71,11 @@ vi.mock('../../src/config/env.js', () => ({
 beforeEach(() => {
   claimDueMock.mockReset();
   reclaimMock.mockReset().mockResolvedValue([]);
+  claimInProgressMock.mockReset().mockResolvedValue([]);
+  listAwaitingTimedOutMock.mockReset().mockResolvedValue([]);
   setStatusMock.mockReset().mockResolvedValue(undefined);
+  releaseClaimMock.mockReset().mockResolvedValue(undefined);
+  hasOpenExclMock.mockReset().mockResolvedValue(false);
   findByIdMock.mockReset();
   tasksByOccMock.mockReset();
   tasksSetStatusMock.mockReset().mockResolvedValue(undefined);

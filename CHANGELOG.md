@@ -5,6 +5,55 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Spec 18 v2.1 — addresses 10 review BLOCKERs** raised on PR #72:
+  - **B1 — payment_due never silently dispatches**: pending-resolver
+    detects `acao_proposta.scheduling_kind === 'payment_due'` and
+    routes to `resolvePaymentOccurrence`. `register_transaction`
+    fires ONLY in the `sim` branch — `nao` skips and `adiar`
+    postpones. Previously, the generic dispatcher would have
+    executed the transaction for any chosen option.
+  - **B2 — lease reclaim re-enters the pending queue**: both
+    `runSchedulingTick` and `runOutboxDrain` reclaim expired leases
+    by resetting rows to `pending` (clearing `claimed_by` /
+    `claimed_at`). The subsequent `claimDue` in the same tick picks
+    them up naturally. Previously, reclaimed rows stayed `claimed`
+    indefinitely.
+  - **B3 — recurring_outreach completes the cycle**: engine claims
+    `in_progress` occurrences in a dedicated pass to run the
+    `forward` step, scans `awaiting_third_party` for
+    `wait_response_hours` timeouts and escalates, and inserts the
+    next cycle via `insertNextOccurrenceIfActive`. The previous
+    cycle could stall after the response was captured.
+  - **B4 — engine advances are transactional**: new
+    `advanceWithTx(fn)` wraps `tasks.setStatus` +
+    `occurrences.setStatus` + `outbox.enqueue` inside one DB
+    transaction. Either all three commit or none. Previously the
+    three writes were separate calls; a crash between them left
+    half-states.
+  - **B5 / B6 — feature flag gates the tools**: `schedule_reminder`,
+    `cancel_reminder`, `start_recurring_outreach`,
+    `start_recurring_payment` only register in the LLM tool
+    registry when `FEATURE_SCHEDULING_V2=true`. Prevents the LLM
+    from creating series that no worker would execute.
+  - **B7 — workers match the spec**: added
+    `series_next_scheduler` cron (`*/10 * * * *`) that backfills
+    missing next-cycle occurrences for active series whose chain
+    broke (crash between complete + reschedule). Spec updated to
+    document the in-tick lease reaper.
+  - **B8 — exclusive_per_destinatario enforced**: when a series
+    has the flag set and the engine claims an outreach occurrence,
+    it checks for sibling occurrences already
+    `in_progress`/`awaiting_third_party` with the same destinatario
+    and defers (releases the claim with a 10-min backoff) if so.
+  - **B9 — inbound hook wired**: `agent/core.ts` calls
+    `captureInboundForOutreach` on every text inbound when
+    scheduling is enabled. Third-party replies now actually advance
+    their occurrence.
+  - **B10 — integration tests for the 7 critérios**: seven specs
+    under `tests/integration/scheduling/` exercise crash recovery,
+    backlog drain under backpressure, month-end policy outcomes,
+    missed-run policy decisions, cancel-race, multi-pending
+    disambiguation, and per-occurrence audit reconstruction.
 - **Spec 18 v2 — Scheduling: series → occurrences → tasks → outbox**
   (`docs/specs/18-scheduling-and-recurring-workflows.md`). Operational
   engineering spec for proactive scheduling. Supersedes the v1

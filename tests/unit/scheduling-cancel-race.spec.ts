@@ -30,10 +30,11 @@ const txMock = {
   insert: vi.fn().mockReturnValue(txInsertChain),
   update: vi.fn().mockReturnValue(txUpdateChain),
 };
-const transactionMock = vi.fn(async (fn: (tx: typeof txMock) => unknown) => fn(txMock));
+const withTxMock = vi.fn(async (fn: (tx: typeof txMock) => unknown) => fn(txMock));
 
 vi.mock('../../src/db/client.js', () => ({
-  db: { transaction: transactionMock, select: txMock.select, insert: txMock.insert, update: txMock.update },
+  db: { select: txMock.select, insert: txMock.insert, update: txMock.update },
+  withTx: withTxMock,
 }));
 
 vi.mock('../../src/lib/logger.js', () => ({
@@ -50,7 +51,7 @@ beforeEach(() => {
   txMock.select.mockClear();
   txMock.insert.mockClear();
   txMock.update.mockClear();
-  transactionMock.mockClear();
+  withTxMock.mockClear();
 });
 
 describe('seriesRepo.insertNextOccurrenceIfActive — Requirement 5', () => {
@@ -127,7 +128,7 @@ describe('seriesRepo.cancelAtomic — Requirement 5', () => {
     const result = await seriesRepo.cancelAtomic('series-1', 'owner-id');
     expect(result.series?.status).toBe('cancelled');
     expect(result.cancelled_occurrence_ids.sort()).toEqual(['occ-1', 'occ-2']);
-    expect(transactionMock).toHaveBeenCalledTimes(1);
+    expect(withTxMock).toHaveBeenCalledTimes(1);
   });
 
   it('no-op when series is already cancelled (returns existing)', async () => {

@@ -1,20 +1,23 @@
 /**
  * Spec 18 — Scheduling engine.
  *
- * On every tick:
- *   1. Reclaim leases on `claimed` occurrences whose lease expired (the
- *      worker that claimed them crashed).
- *   2. Claim up to N due `pending` occurrences using FOR UPDATE SKIP LOCKED.
- *   3. For each claimed occurrence, advance it: apply missed-run policy
- *      if applicable, otherwise enqueue an outbox row appropriate for the
- *      task kind and move the occurrence into the matching waiting state.
+ * Each tick, in order:
+ *   1. Reclaim expired leases on `claimed` rows — they return to `pending`
+ *      so the regular `claimDue` pass below picks them up. (Blocker 2: the
+ *      previous version returned the reclaimed rows but never processed
+ *      them; rows could sit `claimed` indefinitely after a crash.)
+ *   2. Claim due `pending` occurrences via `FOR UPDATE SKIP LOCKED`. Each
+ *      occurrence is advanced inside its own transaction so the outbox
+ *      enqueue + task/occurrence state update commit atomically (spec 18
+ *      §7.1, Blocker 4).
+ *   3. Claim `in_progress` occurrences whose advance was paused waiting
+ *      for an external response — `recurring_outreach` `forward` step
+ *      runs here after `captureInboundForOutreach` flipped the status.
+ *   4. Process `awaiting_third_party` rows whose `wait_response_hours`
+ *      window expired and escalate to the owner.
  *
  * Side-effect contract: the engine NEVER calls Baileys directly. It only
- * writes DB rows (occurrences, tasks, outbox_messages) inside transactions.
- * The outbox-drain worker is responsible for actually sending.
- *
- * Determinism: the engine writes audit entries with `occurrence_id` so
- * the per-occurrence query (spec 18 §7.5) reconstructs the full timeline.
+ * writes DB rows. The outbox-drain worker is responsible for sending.
  */
 
 import { hostname } from 'node:os';
@@ -24,7 +27,13 @@ import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 import { audit } from '@/governance/audit.js';
 import { pessoasRepo, conversasRepo, pendingQuestionsRepo } from '@/db/repositories.js';
-import { seriesRepo, occurrencesRepo, tasksRepo, outboxRepo } from './repos.js';
+import {
+  seriesRepo,
+  occurrencesRepo,
+  tasksRepo,
+  outboxRepo,
+  advanceWithTx,
+} from './repos.js';
 import { computeNext } from './rrule.js';
 import { decideMissedRun, isOverdue } from './policies.js';
 import { newCorrelationToken, appendCorrelationFooter } from './correlation.js';
@@ -42,6 +51,7 @@ import type {
 const WORKER_ID = `${hostname()}:scheduling:${process.pid}:${randomUUID().slice(0, 8)}`;
 
 const CLAIM_LIMIT_PER_TICK = 20;
+const TIMEOUT_SCAN_LIMIT = 20;
 
 function jidFromPhone(tel: string): string {
   return tel.replace('+', '') + '@s.whatsapp.net';
@@ -57,24 +67,34 @@ function previousMonthLabel(now: Date): string {
   return `${String(prev.getMonth() + 1).padStart(2, '0')}/${prev.getFullYear()}`;
 }
 
-export async function runSchedulingTick(): Promise<{ claimed: number; advanced: number; skipped: number }> {
-  if (!config.FEATURE_SCHEDULING_V2) return { claimed: 0, advanced: 0, skipped: 0 };
+export async function runSchedulingTick(): Promise<{
+  reclaimed: number;
+  claimed: number;
+  advanced: number;
+  skipped: number;
+  timed_out: number;
+  in_progress_advanced: number;
+}> {
+  if (!config.FEATURE_SCHEDULING_V2)
+    return { reclaimed: 0, claimed: 0, advanced: 0, skipped: 0, timed_out: 0, in_progress_advanced: 0 };
 
-  // Step 1: reclaim expired leases.
-  await occurrencesRepo
+  // Step 1: reclaim expired leases — these go back to `pending`.
+  const reclaimedIds = await occurrencesRepo
     .reclaimExpiredLeases(WORKER_ID, config.OCCURRENCE_LEASE_TTL_SECONDS, CLAIM_LIMIT_PER_TICK)
-    .catch((err) =>
-      logger.warn({ err: (err as Error).message }, 'scheduling.reclaim_failed'),
-    );
+    .catch((err) => {
+      logger.warn({ err: (err as Error).message }, 'scheduling.reclaim_failed');
+      return [] as string[];
+    });
+  if (reclaimedIds.length > 0) {
+    await audit({
+      acao: 'occurrence_claimed',
+      metadata: { count: reclaimedIds.length, kind: 'lease_reaped' },
+    });
+  }
 
-  // Step 2: claim due.
+  // Step 2: claim due pending. Reclaimed rows from step 1 are now `pending`
+  // and become eligible here.
   const claimed = await occurrencesRepo.claimDue(WORKER_ID, CLAIM_LIMIT_PER_TICK);
-  if (claimed.length === 0) return { claimed: 0, advanced: 0, skipped: 0 };
-
-  await audit({
-    acao: 'occurrence_claimed',
-    metadata: { count: claimed.length, worker: WORKER_ID },
-  });
 
   let advanced = 0;
   let skipped = 0;
@@ -83,6 +103,7 @@ export async function runSchedulingTick(): Promise<{ claimed: number; advanced: 
       const result = await advanceOccurrence(occ);
       if (result === 'advanced') advanced++;
       else if (result === 'skipped') skipped++;
+      else if (result === 'deferred') skipped++;
     } catch (err) {
       logger.warn(
         { err: (err as Error).message, occurrence_id: occ.id },
@@ -99,18 +120,60 @@ export async function runSchedulingTick(): Promise<{ claimed: number; advanced: 
       });
     }
   }
-  return { claimed: claimed.length, advanced, skipped };
+
+  // Step 3: claim in_progress occurrences whose advance was paused waiting
+  // for an external response that has now arrived. Outreach forward step.
+  const inProgress = await occurrencesRepo
+    .claimInProgressForAdvance(WORKER_ID, CLAIM_LIMIT_PER_TICK)
+    .catch(() => [] as Occurrence[]);
+  let in_progress_advanced = 0;
+  for (const occ of inProgress) {
+    try {
+      const r = await advanceInProgressOccurrence(occ);
+      if (r === 'advanced') in_progress_advanced++;
+    } catch (err) {
+      logger.warn(
+        { err: (err as Error).message, occurrence_id: occ.id },
+        'scheduling.in_progress_advance_failed',
+      );
+    }
+  }
+
+  // Step 4: scan awaiting_third_party for timeouts.
+  const timedOut = await occurrencesRepo
+    .listAwaitingTimedOut(TIMEOUT_SCAN_LIMIT)
+    .catch(() => [] as Occurrence[]);
+  let timed_out = 0;
+  for (const occ of timedOut) {
+    try {
+      await escalateOutreachTimeout(occ);
+      timed_out++;
+    } catch (err) {
+      logger.warn(
+        { err: (err as Error).message, occurrence_id: occ.id },
+        'scheduling.outreach_timeout_failed',
+      );
+    }
+  }
+
+  return {
+    reclaimed: reclaimedIds.length,
+    claimed: claimed.length,
+    advanced,
+    skipped,
+    timed_out,
+    in_progress_advanced,
+  };
 }
 
-async function advanceOccurrence(occ: Occurrence): Promise<'advanced' | 'skipped'> {
+async function advanceOccurrence(occ: Occurrence): Promise<'advanced' | 'skipped' | 'deferred'> {
   const series = await seriesRepo.findById(occ.series_id);
   if (!series) {
-    // Series deleted? Mark occurrence cancelled.
     await occurrencesRepo.setStatus(occ.id, 'cancelled');
     return 'skipped';
   }
 
-  // If the series was cancelled while we held the lease, abort.
+  // Cancellation race: series was cancelled while we held the lease.
   if (series.status !== 'active') {
     await occurrencesRepo.setStatus(occ.id, 'cancelled');
     await audit({
@@ -128,8 +191,6 @@ async function advanceOccurrence(occ: Occurrence): Promise<'advanced' | 'skipped
       series.id,
       new Date(Date.now() - series.staleness_threshold_hours * 3600_000),
     );
-    // The current occurrence is `claimed`, not `pending`, so it won't be
-    // in the sibling list. Include it explicitly for the latest-only check.
     const all = [
       ...overdueSiblings.map((s) => ({ id: s.id, scheduled_for: s.scheduled_for })),
       { id: occ.id, scheduled_for: occ.scheduled_for },
@@ -169,7 +230,6 @@ async function advanceOccurrence(occ: Occurrence): Promise<'advanced' | 'skipped
       }
       return 'skipped';
     }
-    // decision.kind === 'fire' → continue advancing below.
   }
 
   // Per-tipo advance.
@@ -185,7 +245,7 @@ async function advanceOccurrence(occ: Occurrence): Promise<'advanced' | 'skipped
 async function advanceOneShotReminder(
   series: Awaited<ReturnType<typeof seriesRepo.findById>>,
   occ: Occurrence,
-): Promise<'advanced'> {
+): Promise<'advanced' | 'deferred'> {
   if (!series) throw new Error('series missing');
   const owner = await pessoasRepo.findById(series.owner_pessoa_id);
   if (!owner || owner.status !== 'ativa') {
@@ -195,19 +255,23 @@ async function advanceOneShotReminder(
     return 'advanced';
   }
   const ctx = occ.contexto_snapshot as OneShotReminderContexto;
-  const tasks = await tasksRepo.byOccurrence(occ.id);
-  const fireTask = tasks.find((t) => t.kind === 'fire_reminder');
+  const tasksList = await tasksRepo.byOccurrence(occ.id);
+  const fireTask = tasksList.find((t) => t.kind === 'fire_reminder');
   if (!fireTask) throw new Error('one_shot_reminder: missing fire_reminder task');
 
-  await outboxRepo.enqueue({
-    occurrence_id: occ.id,
-    task_id: fireTask.id,
-    kind: 'whatsapp_text',
-    payload: { jid: jidFromPhone(owner.telefone_whatsapp), text: `🔔 Lembrete: ${ctx.texto}` },
-    dedup_key: `${occ.id}:fire_reminder`,
+  // Transactional advance: task in_progress + occurrence in_progress +
+  // outbox enqueue commit together. Spec 18 §7.1, Blocker 4.
+  await advanceWithTx(async (_tx, repos) => {
+    await repos.tasks.setStatus(fireTask.id, 'in_progress');
+    await repos.occurrences.setStatus(occ.id, 'in_progress');
+    await repos.outbox.enqueue({
+      occurrence_id: occ.id,
+      task_id: fireTask.id,
+      kind: 'whatsapp_text',
+      payload: { jid: jidFromPhone(owner.telefone_whatsapp), text: `🔔 Lembrete: ${ctx.texto}` },
+      dedup_key: `${occ.id}:fire_reminder`,
+    });
   });
-  await tasksRepo.setStatus(fireTask.id, 'in_progress');
-  await occurrencesRepo.setStatus(occ.id, 'in_progress');
   await audit({
     acao: 'outbox_enqueued',
     alvo_id: occ.id,
@@ -220,9 +284,25 @@ async function advanceOneShotReminder(
 async function advanceRecurringOutreach(
   series: Awaited<ReturnType<typeof seriesRepo.findById>>,
   occ: Occurrence,
-): Promise<'advanced'> {
+): Promise<'advanced' | 'deferred'> {
   if (!series) throw new Error('series missing');
   const ctx = occ.contexto_snapshot as RecurringOutreachContexto;
+
+  // Blocker 8 — exclusive_per_destinatario: defer if another occurrence of
+  // this series already has the same destinatario open. Release the claim
+  // so the next tick retries; do NOT mark the occurrence failed.
+  if (series.exclusive_per_destinatario) {
+    const collision = await occurrencesRepo.hasOpenForDestinatarioExcluding(
+      series.id,
+      ctx.destinatario_pessoa_id,
+      occ.id,
+    );
+    if (collision) {
+      await occurrencesRepo.releaseClaim(occ.id, 600); // try again in 10 min
+      return 'deferred';
+    }
+  }
+
   const destinatario = await pessoasRepo.findById(ctx.destinatario_pessoa_id);
   if (!destinatario || destinatario.status !== 'ativa') {
     await occurrencesRepo.setStatus(occ.id, 'failed', {
@@ -230,8 +310,8 @@ async function advanceRecurringOutreach(
     });
     return 'advanced';
   }
-  const tasks = await tasksRepo.byOccurrence(occ.id);
-  const sendTask = tasks.find((t) => t.kind === 'send_outreach');
+  const tasksList = await tasksRepo.byOccurrence(occ.id);
+  const sendTask = tasksList.find((t) => t.kind === 'send_outreach');
   if (!sendTask) throw new Error('recurring_outreach: missing send_outreach task');
 
   const body = renderTemplate(ctx.message_template, {
@@ -242,15 +322,19 @@ async function advanceRecurringOutreach(
     ? appendCorrelationFooter(body, occ.correlation_token)
     : body;
 
-  await outboxRepo.enqueue({
-    occurrence_id: occ.id,
-    task_id: sendTask.id,
-    kind: 'whatsapp_text',
-    payload: { jid: jidFromPhone(destinatario.telefone_whatsapp), text },
-    dedup_key: `${occ.id}:send_outreach`,
+  // Transactional: task in_progress + occurrence awaiting_third_party +
+  // outbox enqueue commit together.
+  await advanceWithTx(async (_tx, repos) => {
+    await repos.tasks.setStatus(sendTask.id, 'in_progress');
+    await repos.occurrences.setStatus(occ.id, 'awaiting_third_party');
+    await repos.outbox.enqueue({
+      occurrence_id: occ.id,
+      task_id: sendTask.id,
+      kind: 'whatsapp_text',
+      payload: { jid: jidFromPhone(destinatario.telefone_whatsapp), text },
+      dedup_key: `${occ.id}:send_outreach`,
+    });
   });
-  await tasksRepo.setStatus(sendTask.id, 'in_progress');
-  await occurrencesRepo.setStatus(occ.id, 'awaiting_third_party');
   await audit({
     acao: 'outreach_sent',
     pessoa_id: series.owner_pessoa_id,
@@ -264,10 +348,9 @@ async function advanceRecurringOutreach(
 async function advanceRecurringPayment(
   series: Awaited<ReturnType<typeof seriesRepo.findById>>,
   occ: Occurrence,
-): Promise<'advanced'> {
+): Promise<'advanced' | 'deferred'> {
   if (!series) throw new Error('series missing');
   const ctx = occ.contexto_snapshot as RecurringPaymentContexto;
-  // C-008 defence: re-check valor against the current hard limit.
   if (ctx.valor > config.VALOR_LIMITE_DURO) {
     await occurrencesRepo.setStatus(occ.id, 'failed', {
       metadata_patch: { fail_reason: 'valor_above_limit_at_claim' },
@@ -289,61 +372,71 @@ async function advanceRecurringPayment(
   }
   const ownerConv = await conversasRepo.findActive(owner.id);
   if (!ownerConv) {
-    // Cannot anchor a pending_question without an active conversa. Re-pend
-    // (return occurrence to pending so the next tick retries).
-    await occurrencesRepo.setStatus(occ.id, 'pending');
-    return 'advanced';
+    // Defer: no active conversa to anchor a pending_question. Release
+    // the claim so the next tick retries after the owner messages Maia.
+    await occurrencesRepo.releaseClaim(occ.id, 600);
+    return 'deferred';
   }
-  const tasks = await tasksRepo.byOccurrence(occ.id);
-  const proposeTask = tasks.find((t) => t.kind === 'propose_payment');
+  const tasksList = await tasksRepo.byOccurrence(occ.id);
+  const proposeTask = tasksList.find((t) => t.kind === 'propose_payment');
   if (!proposeTask) throw new Error('recurring_payment: missing propose_payment task');
 
   const valorFmt = ctx.valor.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
   const pergunta = `Pagamento ${ctx.descricao} de ${valorFmt} hoje? Responda *sim*, *não* ou *adiar*.`;
 
-  // Create the pending_question + enqueue the outbox in the SAME tx so
-  // the message either both exists and will be sent, or neither.
-  await pendingQuestionsRepo.create({
-    conversa_id: ownerConv.id,
-    pessoa_id: owner.id,
-    tipo: 'payment_confirmation',
-    pergunta,
-    opcoes_validas: [
-      { key: 'sim', label: 'Pagar agora' },
-      { key: 'nao', label: 'Pular este mês' },
-      { key: 'adiar', label: 'Adiar 2 dias' },
-    ],
-    acao_proposta: {
-      tool: 'register_transaction',
-      args: {
-        entidade_id: series.entidade_id,
-        conta_id: ctx.conta_id,
-        natureza: 'despesa',
-        valor: ctx.valor,
-        data_competencia: new Date().toISOString().slice(0, 10),
-        data_pagamento: new Date().toISOString().slice(0, 10),
-        status: 'paga',
-        descricao: ctx.descricao,
-        categoria_id: ctx.categoria_id,
-        contraparte_id: ctx.contraparte_id,
-        origem: 'whatsapp',
+  // Transactional: pending_question + task completed + occurrence
+  // awaiting_owner + outbox enqueue all commit together.
+  await advanceWithTx(async (tx, repos) => {
+    await pendingQuestionsRepo.createTx(tx, {
+      conversa_id: ownerConv.id,
+      pessoa_id: owner.id,
+      tipo: 'payment_confirmation',
+      pergunta,
+      opcoes_validas: [
+        { key: 'sim', label: 'Pagar agora' },
+        { key: 'nao', label: 'Pular este mês' },
+        { key: 'adiar', label: 'Adiar 2 dias' },
+      ],
+      acao_proposta: {
+        // Blocker 1: scheduling-aware kind. Pending-resolver detects this
+        // and routes to resolvePaymentOccurrence — does NOT dispatch
+        // register_transaction generically.
+        scheduling_kind: 'payment_due',
+        occurrence_id: occ.id,
+        series_id: series.id,
+        // The transaction args are kept as `payload` so the sim branch can
+        // dispatch them; nao/adiar branches never touch this.
+        payload: {
+          tool: 'register_transaction',
+          args: {
+            entidade_id: series.entidade_id,
+            conta_id: ctx.conta_id,
+            natureza: 'despesa',
+            valor: ctx.valor,
+            data_competencia: new Date().toISOString().slice(0, 10),
+            data_pagamento: new Date().toISOString().slice(0, 10),
+            status: 'paga',
+            descricao: ctx.descricao,
+            categoria_id: ctx.categoria_id,
+            contraparte_id: ctx.contraparte_id,
+            origem: 'whatsapp',
+          },
+        },
       },
-    },
-    expira_em: new Date(Date.now() + ctx.escalate_after_hours * 3600_000),
-    status: 'aberta',
-    metadata: { occurrence_id: occ.id, series_id: series.id },
+      expira_em: new Date(Date.now() + ctx.escalate_after_hours * 3600_000),
+      status: 'aberta',
+      metadata: { occurrence_id: occ.id, series_id: series.id },
+    });
+    await repos.tasks.setStatus(proposeTask.id, 'completed', { pergunta });
+    await repos.occurrences.setStatus(occ.id, 'awaiting_owner');
+    await repos.outbox.enqueue({
+      occurrence_id: occ.id,
+      task_id: proposeTask.id,
+      kind: 'whatsapp_text',
+      payload: { jid: jidFromPhone(owner.telefone_whatsapp), text: pergunta },
+      dedup_key: `${occ.id}:propose_payment`,
+    });
   });
-
-  await outboxRepo.enqueue({
-    occurrence_id: occ.id,
-    task_id: proposeTask.id,
-    kind: 'whatsapp_text',
-    payload: { jid: jidFromPhone(owner.telefone_whatsapp), text: pergunta },
-    dedup_key: `${occ.id}:propose_payment`,
-  });
-
-  await tasksRepo.setStatus(proposeTask.id, 'completed', { pergunta });
-  await occurrencesRepo.setStatus(occ.id, 'awaiting_owner');
   await audit({
     acao: 'payment_due_proposed',
     pessoa_id: owner.id,
@@ -355,22 +448,203 @@ async function advanceRecurringPayment(
 }
 
 /**
- * Called from spec 12 / pending-resolver when the owner answers a
- * payment_confirmation pending question whose metadata carried our
- * occurrence_id. Drives the rest of the payment_due state machine.
+ * Advances an `in_progress` recurring_outreach: runs the forward step
+ * (if forward_template + response captured), then schedules the next
+ * cycle. Blocker 3.
+ */
+async function advanceInProgressOccurrence(occ: Occurrence): Promise<'advanced' | 'skipped'> {
+  const series = await seriesRepo.findById(occ.series_id);
+  if (!series || series.status !== 'active') {
+    await occurrencesRepo.setStatus(occ.id, 'cancelled');
+    return 'skipped';
+  }
+  if (series.tipo !== 'recurring_outreach') {
+    // No in_progress advance defined for other tipos; release.
+    await occurrencesRepo.setStatus(occ.id, 'completed', { outcome: 'fired' });
+    return 'advanced';
+  }
+  const ctx = occ.contexto_snapshot as RecurringOutreachContexto;
+  const tasksList = await tasksRepo.byOccurrence(occ.id);
+  const awaitTask = tasksList.find((t) => t.kind === 'await_response');
+  const forwardTask = tasksList.find((t) => t.kind === 'forward');
+  const response = (awaitTask?.result as Record<string, unknown> | null)?.['response_text'] as
+    | string
+    | undefined;
+
+  // Forward step.
+  if (forwardTask && forwardTask.status === 'pending') {
+    if (ctx.forward_to_pessoa_id && ctx.forward_template && response) {
+      const forwardTo = await pessoasRepo.findById(ctx.forward_to_pessoa_id);
+      if (forwardTo && forwardTo.status === 'ativa') {
+        const fwdMsg = renderTemplate(ctx.forward_template, {
+          resposta: response,
+          nome: forwardTo.nome,
+          mes_anterior: previousMonthLabel(new Date()),
+        });
+        await advanceWithTx(async (_tx, repos) => {
+          await repos.tasks.setStatus(forwardTask.id, 'in_progress');
+          await repos.outbox.enqueue({
+            occurrence_id: occ.id,
+            task_id: forwardTask.id,
+            kind: 'whatsapp_text',
+            payload: { jid: jidFromPhone(forwardTo.telefone_whatsapp), text: fwdMsg },
+            dedup_key: `${occ.id}:forward`,
+          });
+        });
+        await audit({
+          acao: 'outbox_enqueued',
+          alvo_id: occ.id,
+          occurrence_id: occ.id,
+          metadata: { kind: 'whatsapp_text', purpose: 'forward', forward_to: forwardTo.id },
+        });
+        // Mark forward complete + occurrence completed in a second pass —
+        // the outbox-drain confirms send; for now we optimistically advance.
+        await tasksRepo.setStatus(forwardTask.id, 'completed', { forwarded_to: forwardTo.id });
+      } else {
+        await tasksRepo.setStatus(forwardTask.id, 'skipped', { reason: 'forward_to_inactive' });
+      }
+    } else {
+      await tasksRepo.setStatus(forwardTask.id, 'skipped', { reason: 'nothing_to_forward' });
+    }
+  }
+
+  // Schedule next cycle.
+  if (series.rrule) {
+    const next_at = computeNext(
+      series.rrule,
+      new Date(),
+      series.month_end_policy as MonthEndPolicy,
+    );
+    await seriesRepo.insertNextOccurrenceIfActive({
+      series_id: series.id,
+      expected_version: series.version,
+      scheduled_for: next_at,
+      contexto_snapshot: occ.contexto_snapshot as SeriesContexto,
+      correlation_token: newCorrelationToken(),
+      tasks: outreachTaskBlueprint(),
+    });
+  }
+  await occurrencesRepo.setStatus(occ.id, 'completed', { outcome: 'forwarded' });
+  await audit({
+    acao: 'occurrence_completed',
+    alvo_id: occ.id,
+    occurrence_id: occ.id,
+    metadata: { tipo: series.tipo },
+  });
+  return 'advanced';
+}
+
+/**
+ * Handles a `recurring_outreach` occurrence whose `wait_response_hours`
+ * window expired without a response. Marks it `failed` with outcome
+ * `no_response`, sends a heads-up to the owner via outbox, and schedules
+ * the next cycle so the series doesn't stall on the bad ciclo.
+ */
+async function escalateOutreachTimeout(occ: Occurrence): Promise<void> {
+  const series = await seriesRepo.findById(occ.series_id);
+  if (!series || series.status !== 'active') {
+    await occurrencesRepo.setStatus(occ.id, 'cancelled');
+    return;
+  }
+  const ctx = occ.contexto_snapshot as RecurringOutreachContexto;
+  const destinatario = await pessoasRepo.findById(ctx.destinatario_pessoa_id);
+  const owner = await pessoasRepo.findById(series.owner_pessoa_id);
+  await advanceWithTx(async (_tx, repos) => {
+    await repos.occurrences.setStatus(occ.id, 'failed', { outcome: 'no_response' });
+    if (owner) {
+      await repos.outbox.enqueue({
+        occurrence_id: occ.id,
+        task_id: null,
+        kind: 'whatsapp_alert',
+        payload: {
+          jid: jidFromPhone(owner.telefone_whatsapp),
+          text: `Heads-up: ${destinatario?.nome ?? 'o contato'} não respondeu o pedido recorrente agendado em ${occ.scheduled_for.toISOString().slice(0, 10)}. Próxima ocorrência segue normal.`,
+        },
+        dedup_key: `${occ.id}:no_response_alert`,
+      });
+    }
+  });
+  await audit({
+    acao: 'outreach_no_response',
+    pessoa_id: series.owner_pessoa_id,
+    alvo_id: occ.id,
+    occurrence_id: occ.id,
+    metadata: { destinatario_id: ctx.destinatario_pessoa_id },
+  });
+  // Auto-schedule next cycle so the series keeps going.
+  if (series.rrule) {
+    const next_at = computeNext(
+      series.rrule,
+      new Date(),
+      series.month_end_policy as MonthEndPolicy,
+    );
+    await seriesRepo.insertNextOccurrenceIfActive({
+      series_id: series.id,
+      expected_version: series.version,
+      scheduled_for: next_at,
+      contexto_snapshot: occ.contexto_snapshot as SeriesContexto,
+      correlation_token: newCorrelationToken(),
+      tasks: outreachTaskBlueprint(),
+    });
+  }
+}
+
+/**
+ * Called from the pending-resolver when the owner answers a
+ * `payment_confirmation` pending question whose `acao_proposta.scheduling_kind
+ * === 'payment_due'`. Drives the rest of the payment_due state machine.
+ * Blocker 1: this is the ONLY path that dispatches register_transaction
+ * for payment_due — and only on `sim`.
  */
 export async function resolvePaymentOccurrence(
   occurrence_id: string,
   decision: 'sim' | 'nao' | 'adiar',
-): Promise<void> {
+  payload: { tool: string; args: Record<string, unknown> } | null,
+  ctx: {
+    pessoa: { id: string };
+    conversa: { id: string };
+    mensagem_id: string;
+  },
+): Promise<{ dispatched_tool: string | null }> {
   const occ = await occurrencesRepo.byId(occurrence_id);
-  if (!occ || occ.status !== 'awaiting_owner') return;
+  if (!occ || occ.status !== 'awaiting_owner') return { dispatched_tool: null };
   const series = await seriesRepo.findById(occ.series_id);
-  if (!series) return;
-  const tasks = await tasksRepo.byOccurrence(occ.id);
-  const execTask = tasks.find((t) => t.kind === 'execute_or_skip');
+  if (!series) return { dispatched_tool: null };
+  const tasksList = await tasksRepo.byOccurrence(occ.id);
+  const execTask = tasksList.find((t) => t.kind === 'execute_or_skip');
 
   if (decision === 'sim') {
+    // Dispatch register_transaction through the normal tool pipeline so
+    // C-001, dual_approval and permissions apply.
+    let dispatched_tool: string | null = null;
+    if (payload?.tool) {
+      try {
+        const { dispatchTool } = await import('@/tools/_dispatcher.js');
+        const { resolveScope } = await import('@/governance/permissions.js');
+        const { uuid } = await import('@/lib/utils.js');
+        const fullPessoa = await pessoasRepo.findById(ctx.pessoa.id);
+        if (fullPessoa) {
+          const scope = await resolveScope(fullPessoa);
+          await dispatchTool({
+            tool: payload.tool,
+            args: { ...(payload.args ?? {}), _pending_choice: 'sim' },
+            ctx: {
+              pessoa: fullPessoa,
+              scope,
+              conversa: { id: ctx.conversa.id } as never,
+              mensagem_id: ctx.mensagem_id,
+              request_id: uuid(),
+            },
+          });
+          dispatched_tool = payload.tool;
+        }
+      } catch (err) {
+        logger.warn(
+          { err: (err as Error).message, occurrence_id },
+          'payment_due.dispatch_failed',
+        );
+      }
+    }
     if (execTask) await tasksRepo.setStatus(execTask.id, 'completed', { decision: 'sim' });
     await occurrencesRepo.setStatus(occ.id, 'completed', { outcome: 'sim' });
     await audit({
@@ -380,8 +654,9 @@ export async function resolvePaymentOccurrence(
       occurrence_id: occ.id,
     });
     await scheduleNextRecurring(series, occ);
-    return;
+    return { dispatched_tool };
   }
+
   if (decision === 'nao') {
     if (execTask) await tasksRepo.setStatus(execTask.id, 'skipped', { decision: 'nao' });
     await occurrencesRepo.setStatus(occ.id, 'skipped', { outcome: 'nao' });
@@ -392,29 +667,27 @@ export async function resolvePaymentOccurrence(
       occurrence_id: occ.id,
     });
     await scheduleNextRecurring(series, occ);
-    return;
+    return { dispatched_tool: null };
   }
-  if (decision === 'adiar') {
-    if (execTask) await tasksRepo.setStatus(execTask.id, 'skipped', { decision: 'adiar' });
-    await occurrencesRepo.setStatus(occ.id, 'skipped', { outcome: 'adiar' });
-    await audit({
-      acao: 'payment_due_postponed',
-      pessoa_id: series.owner_pessoa_id,
-      alvo_id: occ.id,
-      occurrence_id: occ.id,
-    });
-    // Spawn a one-off "+2 days" occurrence — same series, but explicit
-    // scheduled_for, idempotent on (series_id, scheduled_for).
-    const next_at = new Date(Date.now() + 2 * 86400_000);
-    await seriesRepo.insertNextOccurrenceIfActive({
-      series_id: series.id,
-      expected_version: series.version,
-      scheduled_for: next_at,
-      contexto_snapshot: occ.contexto_snapshot as SeriesContexto,
-      tasks: paymentTaskBlueprint(),
-    });
-    return;
-  }
+
+  // decision === 'adiar'
+  if (execTask) await tasksRepo.setStatus(execTask.id, 'skipped', { decision: 'adiar' });
+  await occurrencesRepo.setStatus(occ.id, 'skipped', { outcome: 'adiar' });
+  await audit({
+    acao: 'payment_due_postponed',
+    pessoa_id: series.owner_pessoa_id,
+    alvo_id: occ.id,
+    occurrence_id: occ.id,
+  });
+  const next_at = new Date(Date.now() + 2 * 86400_000);
+  await seriesRepo.insertNextOccurrenceIfActive({
+    series_id: series.id,
+    expected_version: series.version,
+    scheduled_for: next_at,
+    contexto_snapshot: occ.contexto_snapshot as SeriesContexto,
+    tasks: paymentTaskBlueprint(),
+  });
+  return { dispatched_tool: null };
 }
 
 async function scheduleNextRecurring(
@@ -439,6 +712,56 @@ async function scheduleNextRecurring(
     correlation_token,
     tasks,
   });
+}
+
+/**
+ * Backfill scheduler — runs less often than the main tick. Ensures every
+ * active series has at least one pending future occurrence. Belt-and-
+ * suspenders for the case where a decision flow failed to spawn the next
+ * cycle (e.g., crash between `setStatus('completed')` and
+ * `scheduleNextRecurring`).
+ */
+export async function runSeriesNextScheduler(): Promise<{ scheduled: number }> {
+  if (!config.FEATURE_SCHEDULING_V2) return { scheduled: 0 };
+  const orphaned = await seriesRepo.listActiveWithoutPendingOccurrence(50);
+  let scheduled = 0;
+  for (const s of orphaned) {
+    if (!s.rrule) continue;
+    try {
+      const next_at = computeNext(
+        s.rrule,
+        new Date(),
+        s.month_end_policy as MonthEndPolicy,
+      );
+      const tasks: Array<{ ordem: number; kind: TaskKind }> =
+        s.tipo === 'recurring_payment' ? paymentTaskBlueprint() : outreachTaskBlueprint();
+      const correlation_token =
+        s.tipo === 'recurring_outreach' ? newCorrelationToken() : undefined;
+      const result = await seriesRepo.insertNextOccurrenceIfActive({
+        series_id: s.id,
+        expected_version: s.version,
+        scheduled_for: next_at,
+        contexto_snapshot: s.contexto_template as SeriesContexto,
+        correlation_token,
+        tasks,
+      });
+      if (result.occurrence) {
+        scheduled++;
+        await audit({
+          acao: 'occurrence_scheduled',
+          alvo_id: result.occurrence.id,
+          occurrence_id: result.occurrence.id,
+          metadata: { series_id: s.id, source: 'backfill_scheduler' },
+        });
+      }
+    } catch (err) {
+      logger.warn(
+        { err: (err as Error).message, series_id: s.id },
+        'scheduling.backfill_failed',
+      );
+    }
+  }
+  return { scheduled };
 }
 
 export function paymentTaskBlueprint(): Array<{ ordem: number; kind: TaskKind }> {

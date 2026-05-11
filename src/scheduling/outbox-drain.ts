@@ -46,20 +46,29 @@ function backoffSeconds(attempts: number): number {
 }
 
 export async function runOutboxDrain(): Promise<{
+  reclaimed: number;
   drained: number;
   sent: number;
   failed: number;
   rate_limited: number;
 }> {
   if (!config.FEATURE_SCHEDULING_V2) {
-    return { drained: 0, sent: 0, failed: 0, rate_limited: 0 };
+    return { reclaimed: 0, drained: 0, sent: 0, failed: 0, rate_limited: 0 };
   }
 
-  // Reclaim leases from crashed workers.
-  await outboxRepo.reclaimExpiredLeases(WORKER_ID, config.OUTBOX_LEASE_TTL_SECONDS, CLAIM_LIMIT);
+  // Reclaim leases from crashed workers — these go back to `pending` so
+  // the regular `claimDue` below picks them up in this same tick.
+  // Blocker 2: the previous version returned reclaimed rows but never
+  // processed them; outbox rows could sit `claimed` indefinitely.
+  const reclaimedIds = await outboxRepo.reclaimExpiredLeases(
+    WORKER_ID,
+    config.OUTBOX_LEASE_TTL_SECONDS,
+    CLAIM_LIMIT,
+  );
 
   const due = await outboxRepo.claimDue(WORKER_ID, CLAIM_LIMIT);
-  if (due.length === 0) return { drained: 0, sent: 0, failed: 0, rate_limited: 0 };
+  if (due.length === 0)
+    return { reclaimed: reclaimedIds.length, drained: 0, sent: 0, failed: 0, rate_limited: 0 };
 
   // Process under bounded concurrency.
   const concurrency = Math.max(1, config.OUTBOX_WORKER_CONCURRENCY);
@@ -86,7 +95,7 @@ export async function runOutboxDrain(): Promise<{
   }
 
   await Promise.all(Array.from({ length: concurrency }, () => worker()));
-  return { drained: due.length, sent, failed, rate_limited };
+  return { reclaimed: reclaimedIds.length, drained: due.length, sent, failed, rate_limited };
 }
 
 async function processOne(msg: OutboxMessage): Promise<'sent' | 'failed' | 'rate_limited'> {

@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const outboxClaimDueMock = vi.fn();
-const outboxReclaimExpiredMock = vi.fn().mockResolvedValue([]);
+// Returns IDs (the reclaim resets rows to 'pending'; claimDue picks them up).
+const outboxReclaimExpiredMock = vi.fn().mockResolvedValue([] as string[]);
 const outboxMarkSentMock = vi.fn().mockResolvedValue(undefined);
 const outboxMarkFailedRetryableMock = vi.fn().mockResolvedValue(undefined);
 const outboxMarkDeadMock = vi.fn().mockResolvedValue(undefined);

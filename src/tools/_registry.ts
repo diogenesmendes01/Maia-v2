@@ -70,10 +70,19 @@ export const REGISTRY: Record<string, AnyTool> = {
   parse_receipt: parseReceiptTool as unknown as AnyTool,
   parse_image: parseImageTool as unknown as AnyTool,
   transcribe_audio: transcribeAudioTool as unknown as AnyTool,
-  schedule_reminder: scheduleReminderTool as unknown as AnyTool,
-  cancel_reminder: cancelReminderTool as unknown as AnyTool,
-  start_recurring_outreach: startRecurringOutreachTool as unknown as AnyTool,
-  start_recurring_payment: startRecurringPaymentTool as unknown as AnyTool,
+  // Spec 18 — Scheduling V2 tools. Gated by FEATURE_SCHEDULING_V2 so the
+  // LLM doesn't expose tools whose backing workers aren't running.
+  // Blockers 5 + 6: without this gate, schedule_reminder would create
+  // series rows that never fire (no worker), and start_recurring_* would
+  // accept commitments the engine can't honour.
+  ...(config.FEATURE_SCHEDULING_V2
+    ? {
+        schedule_reminder: scheduleReminderTool as unknown as AnyTool,
+        cancel_reminder: cancelReminderTool as unknown as AnyTool,
+        start_recurring_outreach: startRecurringOutreachTool as unknown as AnyTool,
+        start_recurring_payment: startRecurringPaymentTool as unknown as AnyTool,
+      }
+    : {}),
   send_proactive_message: sendProactiveMessageTool as unknown as AnyTool,
   compare_entities: compareEntitiesTool as unknown as AnyTool,
   recall_memory: recallMemoryTool as unknown as AnyTool,

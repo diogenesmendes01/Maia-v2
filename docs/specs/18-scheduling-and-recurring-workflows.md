@@ -440,13 +440,11 @@ C-006 enforces `valor <= VALOR_LIMITE_DURO` at creation.
 
 | Worker | Cron | Purpose |
 |---|---|---|
-| `scheduling_tick` | `* * * * *` (1 min) | Claim due occurrences, advance state machine, enqueue outbox writes. |
-| `outbox_drain` | continuous loop (BullMQ worker, not cron) | Consume `outbox_messages` rows, send via Baileys / alerts, apply backpressure. |
-| `occurrence_lease_reaper` | `*/5 * * * *` | Reclaim stuck `claimed` occurrences (lease expired). |
-| `outbox_lease_reaper` | `*/5 * * * *` | Reclaim stuck `claimed` outbox rows. |
-| `series_next_scheduler` | `*/10 * * * *` | For every active series with no pending future occurrence, compute and insert the next one. |
+| `scheduling_tick` | `* * * * *` (1 min) | (a) Reclaim expired occurrence leases (rows return to `pending`); (b) claim due `pending` occurrences and advance state machine (each advance is one DB transaction — task update + occurrence update + outbox enqueue commit atomically); (c) claim `in_progress` occurrences whose advance was paused waiting for an external response (outreach `forward` step); (d) scan `awaiting_third_party` for `wait_response_hours` timeouts and escalate. |
+| `outbox_drain` | `* * * * *` (1 min, runs the drain pass) | (a) Reclaim expired outbox leases (rows return to `pending`); (b) claim due `outbox_messages`; (c) for each, apply per-second / per-hour / per-recipient backpressure gates and send via Baileys (or alerts for `email_alert` kind); (d) mark sent / failed-retryable / dead. |
+| `series_next_scheduler` | `*/10 * * * *` | For every active series whose chain has no pending future occurrence (failure or crash between completed-cycle and re-schedule), compute and insert the next one. Belt-and-suspenders for the rescheduling path inside `scheduling_tick`. |
 
-`outbox_drain` is intentionally NOT a cron — it's a long-running BullMQ worker so backpressure decisions don't lose state between cron firings.
+The lease-reaper passes are folded into `scheduling_tick` / `outbox_drain` because they share locking semantics (`FOR UPDATE SKIP LOCKED`) and need to run in the same process to avoid losing reclaimed rows between cron firings. A reclaimed row goes back to `status='pending'` (its `claimed_by` / `claimed_at` cleared), so the subsequent `claimDue` in the same tick picks it up naturally.
 
 ## 11. Migration plan
 
