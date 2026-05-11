@@ -441,6 +441,47 @@ export const agents = pgTable(
   }),
 );
 
+// P0 cognitive module audit log (migration 008). Records every invocation of a
+// cognitive module (e.g. reflection.ts) for observability, cost tracking, and
+// debugging. FKs to tenants/agents enforced in SQL only; see plan §8 and §10.5.
+export const cognitive_module_log = pgTable(
+  'cognitive_module_log',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull().default('default'),
+    agent_id: text('agent_id').notNull().default('default'),
+    conversa_id: uuid('conversa_id'),
+    turno_id: uuid('turno_id'),
+    module_name: text('module_name').notNull(),
+    module_version: text('module_version').notNull().default('v1'),
+    prompt_version: text('prompt_version'),
+    triggered_by: text('triggered_by').notNull(),
+    started_at: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
+    ended_at: timestamp('ended_at', { withTimezone: true }),
+    latency_ms: integer('latency_ms'),
+    model_used: text('model_used'),
+    tokens_in: integer('tokens_in'),
+    tokens_out: integer('tokens_out'),
+    cost_estimate: numeric('cost_estimate', { precision: 10, scale: 6 }),
+    output_summary_hash: text('output_summary_hash'),
+    confidence: numeric('confidence', { precision: 4, scale: 3 }),
+    fallback_triggered: boolean('fallback_triggered').notNull().default(false),
+    fallback_reason: text('fallback_reason'),
+    status: text('status').notNull(),
+    metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    tenantAgentIdx: index('cognitive_module_log_tenant_agent_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.created_at,
+    ),
+    moduleIdx: index('cognitive_module_log_module_idx').on(t.module_name, t.created_at),
+    conversaIdx: index('cognitive_module_log_conversa_idx').on(t.conversa_id),
+  }),
+);
+
 export type Entidade = typeof entidades.$inferSelect;
 export type Pessoa = typeof pessoas.$inferSelect;
 export type Permissao = typeof permissoes.$inferSelect;
@@ -468,3 +509,4 @@ export type ImportRun = typeof import_runs.$inferSelect;
 export type ImportEntry = typeof import_entries.$inferSelect;
 export type Tenant = typeof tenants.$inferSelect;
 export type Agent = typeof agents.$inferSelect;
+export type CognitiveModuleLog = typeof cognitive_module_log.$inferSelect;
