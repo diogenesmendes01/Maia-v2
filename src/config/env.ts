@@ -129,6 +129,11 @@ const envSchema = z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
+    // Feature flags do roadmap Maia v2
+    FEATURE_P0_TENANT_GUARD_ENFORCED: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
     // Message debounce: hold incoming text messages from the same user for a
     // short window so chunked typing ("Oi, " / "como está " / "a finança?")
     // arrives at the LLM as a single coherent turn. Off by default — when on,
