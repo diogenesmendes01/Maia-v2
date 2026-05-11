@@ -106,3 +106,22 @@ FROM cognitive_module_log
 ORDER BY created_at DESC LIMIT 20;
 "
 ```
+
+## Validação completa de P0 (acceptance gates)
+
+Quando DB estiver up e migrations aplicadas:
+
+```bash
+bash scripts/p0-acceptance-gates.sh
+```
+
+Se todos os gates passarem, tag o release:
+
+```bash
+git tag p0-foundation-done
+git push origin p0-foundation-done
+```
+
+> Nota: os gates de code-level (1, 5, 7, 8, 9) já foram validados na Task 17. O script roda
+> tudo de novo de cabo a rabo, incluindo os gates 2, 3, 4 e 6 que precisam de DB up
+> (NOT NULL enforcement, isolation, backfill, cognitive_module_log smoke).
