@@ -451,6 +451,16 @@ export const transacoesRepo = {
     const rows = await db.insert(transacoes).values(guarded).returning();
     return rows[0]!;
   },
+  async listRecent(limit = 50): Promise<Transacao[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(transacoes)
+      .where(and(eq(transacoes.tenant_id, tenant_id), eq(transacoes.agent_id, agent_id)))
+      .orderBy(desc(transacoes.created_at))
+      .limit(limit);
+  },
   async findRecentSimilar(params: {
     entidade_id: string;
     valor: string;
