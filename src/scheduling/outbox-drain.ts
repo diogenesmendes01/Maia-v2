@@ -144,6 +144,15 @@ async function processOne(msg: OutboxMessage): Promise<'sent' | 'failed' | 'rate
         occurrence_id: msg.occurrence_id,
         metadata: { kind: msg.kind, attempts: newAttempts, error: (err as Error).message },
       });
+      // Blocker 3 (review 2): if the dead message was an outreach
+      // FORWARD or a one_shot_reminder FIRE, the underlying task must
+      // be marked failed and the occurrence must NOT remain a phantom
+      // success. `onMessageDead` looks up the task kind and updates
+      // accordingly.
+      await onMessageDead({
+        ...msg,
+        last_error: (err as Error).message,
+      } as OutboxMessage).catch(() => null);
       await sendAlert({
         subject: `Outbox DLQ: ${msg.kind}`,
         body: `Outbox row ${msg.id} reached max_attempts (${newAttempts}). Error: ${(err as Error).message}`,
@@ -169,27 +178,78 @@ async function processOne(msg: OutboxMessage): Promise<'sent' | 'failed' | 'rate
     metadata: { kind: msg.kind },
   });
 
-  // Mark the originating task / occurrence completed when this was the
-  // last user-facing step (one_shot_reminder fires).
+  // Confirm task completion after a successful send. This is the
+  // contract change for Blocker 3 (review 2): the forward task is NO
+  // LONGER marked completed in the engine right after enqueue. The
+  // outbox-drain only marks it completed here, after the send actually
+  // succeeded. For other task kinds (fire_reminder, send_outreach,
+  // propose_payment) the same logic applies — task completes on send.
   if (msg.task_id && msg.kind === 'whatsapp_text') {
     await tasksRepo.setStatus(msg.task_id, 'completed', { sent_outbox_id: msg.id });
     if (msg.occurrence_id) {
       const occ = await occurrencesRepo.byId(msg.occurrence_id);
       if (occ && occ.status === 'in_progress') {
-        // For one_shot_reminder, in_progress + outbox sent = complete.
-        // For recurring_outreach, the occurrence is in awaiting_third_party
-        // by now (engine flipped it before enqueuing), so we don't touch it.
-        await occurrencesRepo.setStatus(occ.id, 'completed', { outcome: 'fired' });
-        await audit({
-          acao: 'occurrence_completed',
-          alvo_id: occ.id,
-          occurrence_id: occ.id,
-          metadata: { kind: msg.kind },
-        });
+        // one_shot_reminder fires and is done. For recurring_outreach
+        // the occurrence is already `awaiting_third_party` (engine
+        // flipped before enqueue) — we don't touch it. For the
+        // recurring_outreach FORWARD step the occurrence is `in_progress`
+        // and the engine's next tick lands on branch (c) which finalizes.
+        // We mark `completed` here only when the task that just sent
+        // is the `fire_reminder` kind (one_shot_reminder).
+        const tasks = await tasksRepo.byOccurrence(occ.id);
+        const self = tasks.find((t) => t.id === msg.task_id);
+        if (self?.kind === 'fire_reminder') {
+          await occurrencesRepo.setStatus(occ.id, 'completed', { outcome: 'fired' });
+          await audit({
+            acao: 'occurrence_completed',
+            alvo_id: occ.id,
+            occurrence_id: occ.id,
+            metadata: { kind: msg.kind },
+          });
+        }
       }
     }
   }
   return 'sent';
+}
+
+/**
+ * Called from `markDead` path to handle scheduling-specific consequences
+ * of a dead outbox message (forward never sent → mark forward task
+ * failed and the occurrence failed; the series stays alive but this
+ * cycle is recorded as a failure).
+ */
+async function onMessageDead(msg: OutboxMessage): Promise<void> {
+  if (!msg.task_id) return;
+  try {
+    const tasks = await tasksRepo.byOccurrence(msg.occurrence_id ?? '');
+    const self = tasks.find((t) => t.id === msg.task_id);
+    if (!self) return;
+    await tasksRepo.setStatus(self.id, 'failed', {
+      dead_outbox_id: msg.id,
+      last_error: msg.last_error ?? 'unknown',
+    });
+    if (msg.occurrence_id) {
+      // For forward step we fail the occurrence so the operator sees a
+      // distinct failure rather than a silent ghost-success.
+      if (self.kind === 'forward' || self.kind === 'fire_reminder') {
+        await occurrencesRepo.setStatus(msg.occurrence_id, 'failed', {
+          metadata_patch: { reason: 'outbox_dead', task_kind: self.kind },
+        });
+        await audit({
+          acao: 'occurrence_failed',
+          alvo_id: msg.occurrence_id,
+          occurrence_id: msg.occurrence_id,
+          metadata: { reason: 'outbox_dead', task_kind: self.kind },
+        });
+      }
+    }
+  } catch (err) {
+    logger.warn(
+      { err: (err as Error).message, outbox_id: msg.id },
+      'outbox_drain.on_dead_failed',
+    );
+  }
 }
 
 type Channel =

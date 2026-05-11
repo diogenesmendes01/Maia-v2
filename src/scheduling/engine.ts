@@ -471,7 +471,20 @@ async function advanceInProgressOccurrence(occ: Occurrence): Promise<'advanced' 
     | string
     | undefined;
 
-  // Forward step.
+  // Blocker 3 (review 2): forward task must only complete AFTER the
+  // outbox confirms send. We split this into three sub-states:
+  //   (a) forwardTask.status === 'pending' AND there IS something to
+  //       forward → enqueue the outbox row, mark task `in_progress`.
+  //       DO NOT mark task or occurrence completed here. Outbox-drain
+  //       will mark the task `completed` on successful send (see
+  //       outbox-drain.ts processOne).
+  //   (b) forwardTask.status === 'pending' AND nothing to forward
+  //       (no forward_template / no forward_to / no response) → mark
+  //       task `skipped` immediately. Then finalize the occurrence.
+  //   (c) forwardTask.status === 'completed' (set by outbox-drain) or
+  //       'skipped' (set in (b)) → finalize the occurrence + schedule
+  //       next cycle. This is the path that runs ONCE per cycle, after
+  //       the forward send is confirmed.
   if (forwardTask && forwardTask.status === 'pending') {
     if (ctx.forward_to_pessoa_id && ctx.forward_template && response) {
       const forwardTo = await pessoasRepo.findById(ctx.forward_to_pessoa_id);
@@ -497,16 +510,33 @@ async function advanceInProgressOccurrence(occ: Occurrence): Promise<'advanced' 
           occurrence_id: occ.id,
           metadata: { kind: 'whatsapp_text', purpose: 'forward', forward_to: forwardTo.id },
         });
-        // Mark forward complete + occurrence completed in a second pass —
-        // the outbox-drain confirms send; for now we optimistically advance.
-        await tasksRepo.setStatus(forwardTask.id, 'completed', { forwarded_to: forwardTo.id });
+        // STOP here. Occurrence stays in_progress. Outbox-drain will mark
+        // the task completed on success, or dead on failure. Next engine
+        // tick re-claims this occurrence and lands in branch (c).
+        return 'advanced';
       } else {
         await tasksRepo.setStatus(forwardTask.id, 'skipped', { reason: 'forward_to_inactive' });
+        // fall through to finalization below
       }
     } else {
       await tasksRepo.setStatus(forwardTask.id, 'skipped', { reason: 'nothing_to_forward' });
+      // fall through to finalization below
     }
   }
+
+  // Branch (c): forward is done (sent → completed by outbox-drain, or
+  // skipped above). The forward task is either completed or skipped.
+  // If it's still in_progress (outbox hasn't sent yet) we wait.
+  if (forwardTask && forwardTask.status === 'in_progress') {
+    // Still waiting on the outbox to send the forward. Don't finalize
+    // — release claim so we re-claim on the next tick.
+    await occurrencesRepo.releaseClaim(occ.id, 30);
+    return 'skipped';
+  }
+
+  // Determine final occurrence outcome based on what the forward did.
+  const forwardOutcome: string =
+    forwardTask && forwardTask.status === 'completed' ? 'forwarded' : 'fired';
 
   // Schedule next cycle.
   if (series.rrule) {
@@ -524,12 +554,12 @@ async function advanceInProgressOccurrence(occ: Occurrence): Promise<'advanced' 
       tasks: outreachTaskBlueprint(),
     });
   }
-  await occurrencesRepo.setStatus(occ.id, 'completed', { outcome: 'forwarded' });
+  await occurrencesRepo.setStatus(occ.id, 'completed', { outcome: forwardOutcome });
   await audit({
     acao: 'occurrence_completed',
     alvo_id: occ.id,
     occurrence_id: occ.id,
-    metadata: { tipo: series.tipo },
+    metadata: { tipo: series.tipo, forward_outcome: forwardOutcome },
   });
   return 'advanced';
 }
@@ -616,7 +646,16 @@ export async function resolvePaymentOccurrence(
   if (decision === 'sim') {
     // Dispatch register_transaction through the normal tool pipeline so
     // C-001, dual_approval and permissions apply.
-    let dispatched_tool: string | null = null;
+    //
+    // Blocker 1 (review 2): `dispatchTool` returns `{ error }` for
+    // forbidden / requires_dual_approval / invalid_args /
+    // redis_unavailable_blocked / execution_failed — it does NOT throw.
+    // The previous code ignored the return value and audited
+    // `payment_due_confirmed` even when the dispatch was rejected. Now
+    // we inspect the result: only on a real success do we complete the
+    // occurrence and audit confirmed.
+    let dispatch_result: unknown = null;
+    let dispatch_threw: string | null = null;
     if (payload?.tool) {
       try {
         const { dispatchTool } = await import('@/tools/_dispatcher.js');
@@ -625,7 +664,7 @@ export async function resolvePaymentOccurrence(
         const fullPessoa = await pessoasRepo.findById(ctx.pessoa.id);
         if (fullPessoa) {
           const scope = await resolveScope(fullPessoa);
-          await dispatchTool({
+          dispatch_result = await dispatchTool({
             tool: payload.tool,
             args: { ...(payload.args ?? {}), _pending_choice: 'sim' },
             ctx: {
@@ -636,15 +675,65 @@ export async function resolvePaymentOccurrence(
               request_id: uuid(),
             },
           });
-          dispatched_tool = payload.tool;
+        } else {
+          dispatch_threw = 'pessoa_not_found';
         }
       } catch (err) {
+        dispatch_threw = (err as Error).message;
         logger.warn(
-          { err: (err as Error).message, occurrence_id },
-          'payment_due.dispatch_failed',
+          { err: dispatch_threw, occurrence_id },
+          'payment_due.dispatch_threw',
         );
       }
     }
+    const dispatchHasError =
+      typeof dispatch_result === 'object' &&
+      dispatch_result !== null &&
+      'error' in (dispatch_result as Record<string, unknown>);
+
+    if (dispatch_threw || dispatchHasError) {
+      // Dispatch failed or was gated. Do NOT audit `payment_due_confirmed`
+      // — that would lie about money having moved. Park the occurrence
+      // as `failed` with the reason and let the operator decide. Do NOT
+      // schedule the next cycle (the series stays alive; the operator
+      // can resume or cancel via cancel_reminder).
+      const reason = dispatch_threw ?? ((dispatch_result as { error: string }).error);
+      if (execTask) {
+        await tasksRepo.setStatus(execTask.id, 'failed', {
+          decision: 'sim',
+          dispatch_error: reason,
+        });
+      }
+      await occurrencesRepo.setStatus(occ.id, 'failed', {
+        metadata_patch: { dispatch_error: reason },
+      });
+      await audit({
+        acao: 'occurrence_failed',
+        pessoa_id: series.owner_pessoa_id,
+        alvo_id: occ.id,
+        occurrence_id: occ.id,
+        metadata: { reason: 'payment_dispatch_rejected', detail: reason },
+      });
+      // Alert the owner so the failure is operator-visible (not just
+      // buried in audit).
+      const owner = await pessoasRepo.findById(series.owner_pessoa_id);
+      if (owner) {
+        await outboxRepo.enqueue({
+          occurrence_id: occ.id,
+          task_id: null,
+          kind: 'whatsapp_alert',
+          payload: {
+            jid: jidFromPhone(owner.telefone_whatsapp),
+            text: `⚠️ Não consegui registrar o pagamento "${(occ.contexto_snapshot as RecurringPaymentContexto).descricao ?? '?'}" (motivo: ${reason}). Vou pausar essa cobrança até você resolver.`,
+          },
+          dedup_key: `${occ.id}:dispatch_failure_alert`,
+        });
+      }
+      return { dispatched_tool: null };
+    }
+
+    // Success path.
+    const dispatched_tool = payload?.tool ?? null;
     if (execTask) await tasksRepo.setStatus(execTask.id, 'completed', { decision: 'sim' });
     await occurrencesRepo.setStatus(occ.id, 'completed', { outcome: 'sim' });
     await audit({

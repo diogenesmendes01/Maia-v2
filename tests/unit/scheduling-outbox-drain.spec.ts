@@ -11,6 +11,7 @@ const tasksSetStatusMock = vi.fn().mockResolvedValue(undefined);
 const occByIdMock = vi.fn();
 const occSetStatusMock = vi.fn().mockResolvedValue(undefined);
 
+const tasksByOccMock = vi.fn().mockResolvedValue([]);
 vi.mock('../../src/scheduling/repos.js', () => ({
   outboxRepo: {
     claimDue: outboxClaimDueMock,
@@ -20,7 +21,7 @@ vi.mock('../../src/scheduling/repos.js', () => ({
     markDead: outboxMarkDeadMock,
     returnToPending: outboxReturnToPendingMock,
   },
-  tasksRepo: { setStatus: tasksSetStatusMock },
+  tasksRepo: { setStatus: tasksSetStatusMock, byOccurrence: tasksByOccMock },
   occurrencesRepo: { byId: occByIdMock, setStatus: occSetStatusMock },
 }));
 
@@ -81,6 +82,9 @@ beforeEach(() => {
   outboxMarkDeadMock.mockReset().mockResolvedValue(undefined);
   outboxReturnToPendingMock.mockReset().mockResolvedValue(undefined);
   tasksSetStatusMock.mockReset().mockResolvedValue(undefined);
+  tasksByOccMock.mockReset().mockResolvedValue([
+    { id: 't1', kind: 'fire_reminder', status: 'in_progress' },
+  ]);
   occByIdMock.mockReset();
   occSetStatusMock.mockReset().mockResolvedValue(undefined);
   sendOutboundTextMock.mockReset();

@@ -278,6 +278,14 @@ Three independent limits applied by `outbox-drain`:
 
 A 10k backlog with default config drains at 1 msg/s = ~2.8 hours, but more importantly it never bursts to WhatsApp. If `OUTBOX_MAX_PER_HOUR` is exceeded, drain waits.
 
+To honour the per-second cadence with a per-minute cron, the worker
+loops within a single firing: each pass calls `runOutboxDrain`, then
+sleeps `OUTBOX_DRAIN_LOOP_SLEEP_MS` (default 1000ms) when the rate
+gate denied any send, up to `OUTBOX_DRAIN_LOOP_PASSES` (default 55).
+Loop exits early when the queue is empty. Without this loop, a
+cron-only worker would drain ~1 msg/minute regardless of
+`OUTBOX_MAX_PER_SECOND` — turning a 10k backlog into days.
+
 `aged_out` enforcement runs in the same loop: any `pending` occurrence with `scheduled_for < now() - staleness_threshold_hours` is processed by the missed-run policy (audit + skip / escalate) and does **not** consume rate-limit tokens.
 
 ### 7.3 Locking and concurrent workers (Requirement 5)

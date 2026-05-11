@@ -5,6 +5,35 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Spec 18 v2.2 — addresses 4 follow-up BLOCKERs** raised in PR #72 review 2:
+  - **B1/r2 — `payment_due` never audits confirmed on dispatch failure**:
+    `resolvePaymentOccurrence` now inspects the `dispatchTool` return
+    value. When the dispatcher returns `{ error: ... }` (forbidden /
+    requires_dual_approval / invalid_args / etc.) OR throws, the
+    occurrence is parked as `failed`, the task is marked `failed`
+    with the dispatch error, the operator is alerted via the outbox,
+    and the next cycle is NOT scheduled. `payment_due_confirmed`
+    only audits on a real success.
+  - **B2/r2 — outreach timeout anchor**: `occurrencesRepo.setStatus`
+    now sets `started_at` on transitions to `awaiting_third_party`
+    and `awaiting_owner` (not just `in_progress`). The
+    `listAwaitingTimedOut` query relies on `started_at IS NOT NULL`
+    and previously never matched any outreach occurrence.
+  - **B3/r2 — forward task gated on `outbox_sent` confirmation**:
+    `advanceInProgressOccurrence` enqueues the forward outbox row
+    and leaves the task `in_progress`. The outbox-drain marks the
+    task `completed` ONLY after a successful send. The occurrence
+    finalizes (and the next cycle schedules) on the next engine tick
+    that sees `forward.status='completed'`. Dead outbox rows for
+    forward / fire_reminder tasks now mark the occurrence `failed`
+    instead of leaving a phantom success.
+  - **B4/r2 — outbox-drain loops within one cron firing**: the
+    worker calls `runOutboxDrain` up to `OUTBOX_DRAIN_LOOP_PASSES`
+    times (default 55), sleeping `OUTBOX_DRAIN_LOOP_SLEEP_MS` ms
+    (default 1000) between passes when the rate gate denied any
+    send. Honours the per-second cadence with a per-minute cron.
+    Without this loop, a 10k backlog drained at ~1 msg/minute
+    (rate gate denied 49 of 50 attempts per tick).
 - **Spec 18 v2.1 — addresses 10 review BLOCKERs** raised on PR #72:
   - **B1 — payment_due never silently dispatches**: pending-resolver
     detects `acao_proposta.scheduling_kind === 'payment_due'` and

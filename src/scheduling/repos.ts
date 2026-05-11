@@ -281,7 +281,13 @@ function txRepos(tx: Tx): TxScopedRepos {
     occurrences: {
       async setStatus(id, status, extra): Promise<void> {
         const update: Record<string, unknown> = { status };
-        if (status === 'in_progress') update.started_at = new Date();
+        if (
+          status === 'in_progress' ||
+          status === 'awaiting_third_party' ||
+          status === 'awaiting_owner'
+        ) {
+          update.started_at = new Date();
+        }
         if (
           status === 'completed' ||
           status === 'skipped' ||
@@ -402,7 +408,18 @@ export const occurrencesRepo = {
     extra?: { outcome?: string; metadata_patch?: Record<string, unknown> },
   ): Promise<void> {
     const update: Record<string, unknown> = { status };
-    if (status === 'in_progress') update.started_at = new Date();
+    // Anchor `started_at` whenever we transition into any "started"
+    // state. `awaiting_third_party` and `awaiting_owner` mean the work
+    // has begun and we're now waiting for an external party — for the
+    // timeout query to fire, those rows MUST have `started_at` set.
+    // Previously only `in_progress` set this and timeouts never matched.
+    if (
+      status === 'in_progress' ||
+      status === 'awaiting_third_party' ||
+      status === 'awaiting_owner'
+    ) {
+      update.started_at = new Date();
+    }
     if (
       status === 'completed' ||
       status === 'skipped' ||
