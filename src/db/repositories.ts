@@ -158,6 +158,18 @@ export const conversasRepo = {
   async updateMetadata(id: string, metadata: Record<string, unknown>): Promise<void> {
     await db.update(conversas).set({ metadata }).where(eq(conversas.id, id));
   },
+  /**
+   * Atomic partial merge into conversas.metadata via the jsonb `||`
+   * operator. Issue #73: avoids losing concurrent keys (e.g. pending_question)
+   * when two workers race to write metadata. Existing keys in `patch`
+   * overwrite existing keys in metadata; everything else is preserved.
+   */
+  async mergeMetadata(id: string, patch: Record<string, unknown>): Promise<void> {
+    await db
+      .update(conversas)
+      .set({ metadata: sql`${conversas.metadata} || ${JSON.stringify(patch)}::jsonb` })
+      .where(eq(conversas.id, id));
+  },
   async close(id: string, contexto_resumido: string): Promise<void> {
     await db
       .update(conversas)

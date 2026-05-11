@@ -9,6 +9,10 @@ import { REGISTRY } from '@/tools/_registry.js';
 import { sendReaction } from '@/gateway/presence.js';
 import { uuid } from '@/lib/utils.js';
 import { dispatchOutput, type LatestPending, type LatestReportPdf } from './output-dispatch.js';
+import {
+  buildToolSummary,
+  type ToolExecutionSummary,
+} from './tool-execution-summary.js';
 
 export const MAX_REACT_ITERATIONS = 5;
 
@@ -40,6 +44,11 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<{ totalT
   let turnHasSensitive = false;
   const sensitiveTools: string[] = [];
   let latestReportPdf: LatestReportPdf | null = null;
+  // Issue #73 — structured per-tool outcomes accumulated across all loop
+  // iterations. Persisted on the outbound assistant message as
+  // `ferramentas_chamadas` so the NEXT turn can reidrate them in the
+  // system prompt's "## Eventos confirmados pelo backend" block.
+  const toolSummaries: ToolExecutionSummary[] = [];
 
   for (let i = 0; i < MAX_REACT_ITERATIONS; i++) {
     const res = await callLLM({
@@ -64,6 +73,7 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<{ totalT
           latestReportPdf,
           turnHasSensitive,
           sensitiveTools,
+          toolSummaries,
         });
       }
       break;
@@ -185,6 +195,22 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<{ totalT
         content: JSON.stringify(out),
         is_error: isError,
       });
+
+      // Issue #73 — accumulate a structured summary for next-turn persistence.
+      // Side-effect 'none' tools (parse_only) still get summarized to keep
+      // the audit trail intact; the prompt-builder events-block filters by
+      // priority later.
+      toolSummaries.push(
+        buildToolSummary({
+          tool_call_id: tu.id,
+          tool_name: tu.tool,
+          side_effect: tool?.side_effect ?? 'none',
+          args: tu.args,
+          result: out,
+          status: isError ? 'error' : 'success',
+        }),
+      );
+
       await audit({
         acao: (isError ? 'unauthorized_access_attempt' : 'classification_suggested') as never,
         pessoa_id: pessoa.id,
