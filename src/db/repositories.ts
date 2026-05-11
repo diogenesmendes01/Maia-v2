@@ -75,7 +75,7 @@ export const pessoasRepo = {
       .limit(1);
     return rows[0] ?? null;
   },
-  async create(input: Omit<Pessoa, 'id' | 'created_at' | 'updated_at'>): Promise<Pessoa> {
+  async create(input: Omit<Pessoa, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>): Promise<Pessoa> {
     const rows = await db.insert(pessoas).values(input).returning();
     return rows[0]!;
   },
@@ -108,7 +108,7 @@ export const permissoesRepo = {
       .limit(1);
     return rows[0] ?? null;
   },
-  async create(input: Omit<Permissao, 'id' | 'created_at'>): Promise<Permissao> {
+  async create(input: Omit<Permissao, 'id' | 'tenant_id' | 'agent_id' | 'created_at'>): Promise<Permissao> {
     const rows = await db.insert(permissoes).values(input).returning();
     return rows[0]!;
   },
@@ -179,12 +179,12 @@ export const conversasRepo = {
 };
 
 export const mensagensRepo = {
-  async create(input: Omit<Mensagem, 'id' | 'created_at'>): Promise<Mensagem> {
+  async create(input: Omit<Mensagem, 'id' | 'tenant_id' | 'agent_id' | 'created_at'>): Promise<Mensagem> {
     const rows = await db.insert(mensagens).values(input).returning();
     return rows[0]!;
   },
   async createInbound(
-    input: Omit<Mensagem, 'id' | 'created_at'>,
+    input: Omit<Mensagem, 'id' | 'tenant_id' | 'agent_id' | 'created_at'>,
   ): Promise<{ row: Mensagem; duplicate: boolean }> {
     const wid = (input.metadata as Record<string, unknown> | null)?.['whatsapp_id'];
     if (typeof wid === 'string' && wid.length > 0) {
@@ -310,7 +310,7 @@ export const entidadesRepo = {
     if (ids.length === 0) return [];
     return db.select().from(entidades).where(inArray(entidades.id, ids));
   },
-  async create(input: Omit<Entidade, 'id' | 'created_at' | 'updated_at'>): Promise<Entidade> {
+  async create(input: Omit<Entidade, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>): Promise<Entidade> {
     const rows = await db.insert(entidades).values(input).returning();
     return rows[0]!;
   },
@@ -335,7 +335,7 @@ export const contasRepo = {
       .from(contas_bancarias)
       .where(inArray(contas_bancarias.entidade_id, scope.entidades));
   },
-  async create(input: Omit<Conta, 'id' | 'created_at' | 'updated_at'>): Promise<Conta> {
+  async create(input: Omit<Conta, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>): Promise<Conta> {
     const rows = await db.insert(contas_bancarias).values(input).returning();
     return rows[0]!;
   },
@@ -378,7 +378,7 @@ export const transacoesRepo = {
       .limit(filter?.limit ?? 50)
       .offset(filter?.offset ?? 0);
   },
-  async create(input: Omit<Transacao, 'id' | 'created_at' | 'updated_at'>): Promise<Transacao> {
+  async create(input: Omit<Transacao, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>): Promise<Transacao> {
     const rows = await db.insert(transacoes).values(input).returning();
     return rows[0]!;
   },
@@ -451,7 +451,7 @@ export const contrapartesRepo = {
     const rows = await db.select().from(contrapartes).where(eq(contrapartes.id, id)).limit(1);
     return rows[0] ?? null;
   },
-  async create(input: Omit<Contraparte, 'id' | 'created_at' | 'updated_at'>): Promise<Contraparte> {
+  async create(input: Omit<Contraparte, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>): Promise<Contraparte> {
     const rows = await db.insert(contrapartes).values(input).returning();
     return rows[0]!;
   },
@@ -508,7 +508,7 @@ export const rulesRepo = {
       .orderBy(desc(learned_rules.confianca), desc(learned_rules.updated_at))
       .limit(50);
   },
-  async create(input: Omit<LearnedRule, 'id' | 'created_at' | 'updated_at'>): Promise<LearnedRule> {
+  async create(input: Omit<LearnedRule, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>): Promise<LearnedRule> {
     const rows = await db.insert(learned_rules).values(input).returning();
     return rows[0]!;
   },
@@ -568,7 +568,7 @@ export const rulesRepo = {
 // add it back as optional so those call sites keep typechecking.
 type PendingQuestionInsert = Omit<
   PendingQuestion,
-  'id' | 'created_at' | 'resolvida_em' | 'resposta' | 'metadata'
+  'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'resolvida_em' | 'resposta' | 'metadata'
 > & { metadata?: object };
 
 export const pendingQuestionsRepo = {
@@ -750,7 +750,7 @@ export const idempotencyRepo = {
 };
 
 export const auditRepo = {
-  async write(input: Omit<AuditEntry, 'id' | 'created_at'>): Promise<void> {
+  async write(input: Omit<AuditEntry, 'id' | 'tenant_id' | 'agent_id' | 'created_at'>): Promise<void> {
     await db.insert(audit_log).values(input);
   },
   async listByPessoa(pessoa_id: string, n = 100): Promise<AuditEntry[]> {
@@ -767,7 +767,7 @@ export const auditRepo = {
 };
 
 export const workflowsRepo = {
-  async create(input: Omit<Workflow, 'id' | 'iniciado_em' | 'concluido_em'>): Promise<Workflow> {
+  async create(input: Omit<Workflow, 'id' | 'tenant_id' | 'agent_id' | 'iniciado_em' | 'concluido_em'>): Promise<Workflow> {
     const rows = await db.insert(workflows).values(input).returning();
     return rows[0]!;
   },
@@ -792,7 +792,7 @@ export const workflowsRepo = {
 
 export const workflowStepsRepo = {
   async createMany(
-    inputs: Omit<WorkflowStep, 'id' | 'iniciado_em' | 'concluido_em'>[],
+    inputs: Omit<WorkflowStep, 'id' | 'tenant_id' | 'agent_id' | 'iniciado_em' | 'concluido_em'>[],
   ): Promise<WorkflowStep[]> {
     if (inputs.length === 0) return [];
     return db.insert(workflow_steps).values(inputs).returning();
