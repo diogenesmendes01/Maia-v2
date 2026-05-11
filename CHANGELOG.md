@@ -4,6 +4,43 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **Spec 18** (`docs/specs/18-scheduling-and-recurring-workflows.md`)
+  — design doc for proactive scheduling: reminders, recurring
+  outreach, recurring payment confirmations.
+- **Phase 1 — Reminder firer worker** (`src/workers/reminder-firer.ts`,
+  cron `* * * * *`): scans `agent_facts.chave LIKE 'reminder.%'` for
+  due rows, fires via WhatsApp, marks `fired_at` BEFORE the send so
+  retries can't double-fire. Skips when Baileys is disconnected; the
+  next tick drains the backlog. New `cancel_reminder` tool. New
+  audit actions: `reminder_fired`, `reminder_send_failed`,
+  `reminder_skipped`, `reminder_cancelled`.
+- **Phase 2 — Recurring workflows** (`src/workflows/recurring.ts`,
+  `src/workflows/rrule.ts`): two new `tickEngine` handlers gated by
+  `FEATURE_RECURRING_WORKFLOWS`.
+  - `outreach_recorrente` — sends a templated WhatsApp message to a
+    third party on a recurrence (`FREQ=DAILY|WEEKLY|MONTHLY`,
+    `BYDAY`, `BYMONTHDAY`, `BYHOUR`, `BYMINUTE`); waits up to N
+    hours for response; optionally forwards to a second person;
+    auto-schedules the next cycle as a NEW workflow row (auditable
+    per cycle); escalates to the owner on no-response.
+  - `payment_due` — fires a `pending_question` to the owner with
+    `sim` / `nao` / `adiar` options; on `sim`, the existing
+    pending-resolver dispatches `register_transaction` through the
+    normal constitutional pipeline (limits, dual-approval). Money
+    NEVER moves without owner confirmation. On `nao` skip + next
+    cycle. On `adiar` postpone 2 days. On no-response within
+    `escalate_after_hours`, alert via spec 17 channels and halt
+    the chain — operator decides to resume.
+  - `cancel_workflow` tool — stops a single workflow or the whole
+    `chain_id` series in one call.
+  - Constitutional rules **C-006** (`payment_due` above
+    `VALOR_LIMITE_DURO` rejected at creation) and **C-007**
+    (`outreach_recorrente` requires `dual_approval_granted` at
+    creation).
+  - Migration `007_scheduling.sql` adds `workflows.chain_id` +
+    indexes for engine scan + reminder firer scan.
+
 ### Fixed
 - **WhatsApp privacy IDs (`@lid`)**: mensagens chegando de contas com
   privacy enabled vinham como `XXXXXXXXXXXXXX@lid` em vez de

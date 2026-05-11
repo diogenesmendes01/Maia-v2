@@ -41,6 +41,7 @@ export async function requestDualApproval(input: {
     pessoa_envolvida: input.requester.id,
     proxima_acao_em: expira,
     metadata: {},
+    chain_id: null,
   });
   await workflowStepsRepo.createMany([
     {

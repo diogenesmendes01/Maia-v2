@@ -262,6 +262,8 @@ export const workflows = pgTable('workflows', {
   iniciado_em: timestamp('iniciado_em', { withTimezone: true }).notNull().defaultNow(),
   concluido_em: timestamp('concluido_em', { withTimezone: true }),
   metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+  // Spec 18 §6.4 — links recurring cycles so cancel_workflow can stop the whole series.
+  chain_id: uuid('chain_id'),
 });
 
 export const workflow_steps = pgTable('workflow_steps', {

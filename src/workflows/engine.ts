@@ -5,12 +5,36 @@ import { eq } from 'drizzle-orm';
 import { logger } from '@/lib/logger.js';
 import { audit } from '@/governance/audit.js';
 import { expireDueDualApprovals } from './dual-approval.js';
+import { config } from '@/config/env.js';
+import { advanceOutreach, advancePaymentDue } from './recurring.js';
 
 export async function tickEngine(): Promise<{ processed: number; expired: number }> {
   const expired = await expireDueDualApprovals();
   const pending = await workflowsRepo.listPending();
   let processed = 0;
   for (const wf of pending) {
+    if (config.FEATURE_RECURRING_WORKFLOWS && wf.tipo === 'outreach_recorrente') {
+      const advanced = await advanceOutreach(wf).catch((err) => {
+        logger.warn(
+          { err: (err as Error).message, workflow_id: wf.id },
+          'engine.outreach.failed',
+        );
+        return false;
+      });
+      if (advanced) processed++;
+      continue;
+    }
+    if (config.FEATURE_RECURRING_WORKFLOWS && wf.tipo === 'payment_due') {
+      const advanced = await advancePaymentDue(wf).catch((err) => {
+        logger.warn(
+          { err: (err as Error).message, workflow_id: wf.id },
+          'engine.payment_due.failed',
+        );
+        return false;
+      });
+      if (advanced) processed++;
+      continue;
+    }
     if (wf.tipo === 'dual_approval' && wf.status === 'em_andamento') {
       // Two signatures collected → execute the original intent
       const ctx = wf.contexto as { intent?: { tool: string; args: Record<string, unknown> }; requester_pessoa_id: string };

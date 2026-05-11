@@ -20,6 +20,7 @@ import { saveFactTool } from './save-fact.js';
 import { saveRuleTool } from './save-rule.js';
 import { listPendingTool } from './list-pending.js';
 import { startWorkflowTool } from './start-workflow.js';
+import { cancelWorkflowTool } from './cancel-workflow.js';
 import { askPendingQuestionTool } from './ask-pending-question.js';
 import { generateReportTool } from './generate-report.js';
 import { config } from '@/config/env.js';
@@ -77,6 +78,7 @@ export const REGISTRY: Record<string, AnyTool> = {
   save_rule: saveRuleTool as unknown as AnyTool,
   list_pending: listPendingTool as unknown as AnyTool,
   start_workflow: startWorkflowTool as unknown as AnyTool,
+  cancel_workflow: cancelWorkflowTool as unknown as AnyTool,
   ask_pending_question: askPendingQuestionTool as unknown as AnyTool,
   // B3b: gated by feature flag. When false, the LLM never sees this tool.
   ...(config.FEATURE_PDF_REPORTS

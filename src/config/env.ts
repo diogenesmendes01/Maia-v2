@@ -129,6 +129,14 @@ const envSchema = z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
+    // Recurring workflows (outreach_recorrente, payment_due) — spec 18 §6.
+    // Off by default. When off, tickEngine no-ops on those workflow types
+    // and start_workflow still creates rows but the engine never advances
+    // them. Enables gradual production rollout per §8.
+    FEATURE_RECURRING_WORKFLOWS: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
     // Message debounce: hold incoming text messages from the same user for a
     // short window so chunked typing ("Oi, " / "como está " / "a finança?")
     // arrives at the LLM as a single coherent turn. Off by default — when on,

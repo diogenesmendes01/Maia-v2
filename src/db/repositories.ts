@@ -774,6 +774,9 @@ export const workflowsRepo = {
     if (status === 'concluido') update.concluido_em = new Date();
     await db.update(workflows).set(update).where(eq(workflows.id, id));
   },
+  async setProximaAcaoEm(id: string, proxima_acao_em: Date): Promise<void> {
+    await db.update(workflows).set({ proxima_acao_em }).where(eq(workflows.id, id));
+  },
   async listPending(): Promise<Workflow[]> {
     return db
       .select()
@@ -781,6 +784,12 @@ export const workflowsRepo = {
       .where(
         sql`status IN ('pendente','em_andamento','aguardando_humano','aguardando_terceiro')`,
       );
+  },
+  async listByChain(chain_id: string): Promise<Workflow[]> {
+    return db
+      .select()
+      .from(workflows)
+      .where(eq(workflows.chain_id, chain_id));
   },
 };
 
