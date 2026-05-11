@@ -27,6 +27,8 @@ import {
   cognitive_module_log,
 } from './schema.js';
 import { TypedError } from '@/lib/utils.js';
+import { applyTenantGuard } from './tenant-guard.js';
+import { getCurrentTenant, getCurrentAgent } from './tenant-context.js';
 import type {
   Pessoa,
   Permissao,
@@ -133,26 +135,48 @@ export const profilesRepo = {
 
 export const conversasRepo = {
   async findActive(pessoa_id: string): Promise<Conversa | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const rows = await db
       .select()
       .from(conversas)
-      .where(and(eq(conversas.pessoa_id, pessoa_id), eq(conversas.status, 'ativa')))
+      .where(
+        and(
+          eq(conversas.tenant_id, tenant_id),
+          eq(conversas.agent_id, agent_id),
+          eq(conversas.pessoa_id, pessoa_id),
+          eq(conversas.status, 'ativa'),
+        ),
+      )
       .orderBy(desc(conversas.ultima_atividade_em))
       .limit(1);
     return rows[0] ?? null;
   },
   async byId(id: string): Promise<Conversa | null> {
-    const rows = await db.select().from(conversas).where(eq(conversas.id, id)).limit(1);
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(conversas)
+      .where(
+        and(
+          eq(conversas.tenant_id, tenant_id),
+          eq(conversas.agent_id, agent_id),
+          eq(conversas.id, id),
+        ),
+      )
+      .limit(1);
     return rows[0] ?? null;
   },
   async create(input: {
     pessoa_id: string;
     escopo_entidades: string[];
   }): Promise<Conversa> {
-    const rows = await db
-      .insert(conversas)
-      .values({ pessoa_id: input.pessoa_id, escopo_entidades: input.escopo_entidades })
-      .returning();
+    const guarded = applyTenantGuard({
+      pessoa_id: input.pessoa_id,
+      escopo_entidades: input.escopo_entidades,
+    });
+    const rows = await db.insert(conversas).values(guarded).returning();
     return rows[0]!;
   },
   async touch(id: string): Promise<void> {
@@ -180,7 +204,8 @@ export const conversasRepo = {
 
 export const mensagensRepo = {
   async create(input: Omit<Mensagem, 'id' | 'tenant_id' | 'agent_id' | 'created_at'>): Promise<Mensagem> {
-    const rows = await db.insert(mensagens).values(input).returning();
+    const guarded = applyTenantGuard(input);
+    const rows = await db.insert(mensagens).values(guarded).returning();
     return rows[0]!;
   },
   async createInbound(
@@ -192,7 +217,8 @@ export const mensagensRepo = {
       if (existing) return { row: existing, duplicate: true };
     }
     try {
-      const rows = await db.insert(mensagens).values(input).returning();
+      const guarded = applyTenantGuard(input);
+      const rows = await db.insert(mensagens).values(guarded).returning();
       return { row: rows[0]!, duplicate: false };
     } catch (err) {
       // Unique-violation race: re-fetch and treat as duplicate.
@@ -204,12 +230,16 @@ export const mensagensRepo = {
     }
   },
   async listUnprocessedOlderThan(ms: number, limit = 100): Promise<Mensagem[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const cutoff = new Date(Date.now() - ms);
     return db
       .select()
       .from(mensagens)
       .where(
         and(
+          eq(mensagens.tenant_id, tenant_id),
+          eq(mensagens.agent_id, agent_id),
           isNull(mensagens.processada_em),
           eq(mensagens.direcao, 'in'),
           sql`created_at < ${cutoff.toISOString()}`,
@@ -219,22 +249,50 @@ export const mensagensRepo = {
       .limit(limit);
   },
   async findById(id: string): Promise<Mensagem | null> {
-    const rows = await db.select().from(mensagens).where(eq(mensagens.id, id)).limit(1);
-    return rows[0] ?? null;
-  },
-  async findByWhatsappId(whatsapp_id: string): Promise<Mensagem | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const rows = await db
       .select()
       .from(mensagens)
-      .where(sql`metadata->>'whatsapp_id' = ${whatsapp_id}`)
+      .where(
+        and(
+          eq(mensagens.tenant_id, tenant_id),
+          eq(mensagens.agent_id, agent_id),
+          eq(mensagens.id, id),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+  async findByWhatsappId(whatsapp_id: string): Promise<Mensagem | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(mensagens)
+      .where(
+        and(
+          eq(mensagens.tenant_id, tenant_id),
+          eq(mensagens.agent_id, agent_id),
+          sql`metadata->>'whatsapp_id' = ${whatsapp_id}`,
+        ),
+      )
       .limit(1);
     return rows[0] ?? null;
   },
   async recentInConversation(conversa_id: string, n = 20): Promise<Mensagem[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     return db
       .select()
       .from(mensagens)
-      .where(eq(mensagens.conversa_id, conversa_id))
+      .where(
+        and(
+          eq(mensagens.tenant_id, tenant_id),
+          eq(mensagens.agent_id, agent_id),
+          eq(mensagens.conversa_id, conversa_id),
+        ),
+      )
       .orderBy(desc(mensagens.created_at))
       .limit(n);
   },
@@ -259,12 +317,16 @@ export const mensagensRepo = {
     telefone: string,
     opts?: { excludeId?: string; limit?: number },
   ): Promise<Mensagem[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const limit = opts?.limit ?? 50;
     const rows = await db
       .select()
       .from(mensagens)
       .where(
         and(
+          eq(mensagens.tenant_id, tenant_id),
+          eq(mensagens.agent_id, agent_id),
           eq(mensagens.direcao, 'in'),
           isNull(mensagens.processada_em),
           sql`metadata->>'telefone' = ${telefone}`,
@@ -365,7 +427,13 @@ export const transacoesRepo = {
     },
   ): Promise<Transacao[]> {
     if (scope.entidades.length === 0) throw new EmptyScopeError();
-    const conds = [inArray(transacoes.entidade_id, scope.entidades)];
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const conds = [
+      eq(transacoes.tenant_id, tenant_id),
+      eq(transacoes.agent_id, agent_id),
+      inArray(transacoes.entidade_id, scope.entidades),
+    ];
     if (filter?.date_from) conds.push(sql`data_competencia >= ${filter.date_from}`);
     if (filter?.date_to) conds.push(sql`data_competencia <= ${filter.date_to}`);
     if (filter?.categoria_id) conds.push(eq(transacoes.categoria_id, filter.categoria_id));
@@ -379,7 +447,8 @@ export const transacoesRepo = {
       .offset(filter?.offset ?? 0);
   },
   async create(input: Omit<Transacao, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>): Promise<Transacao> {
-    const rows = await db.insert(transacoes).values(input).returning();
+    const guarded = applyTenantGuard(input);
+    const rows = await db.insert(transacoes).values(guarded).returning();
     return rows[0]!;
   },
   async findRecentSimilar(params: {
@@ -389,12 +458,16 @@ export const transacoesRepo = {
     registrado_por: string;
     sinceMs: number;
   }): Promise<Transacao[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const since = new Date(Date.now() - params.sinceMs);
     return db
       .select()
       .from(transacoes)
       .where(
         and(
+          eq(transacoes.tenant_id, tenant_id),
+          eq(transacoes.agent_id, agent_id),
           eq(transacoes.entidade_id, params.entidade_id),
           eq(transacoes.valor, params.valor),
           eq(transacoes.registrado_por, params.registrado_por),
@@ -403,7 +476,19 @@ export const transacoesRepo = {
       );
   },
   async byId(id: string): Promise<Transacao | null> {
-    const rows = await db.select().from(transacoes).where(eq(transacoes.id, id)).limit(1);
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(transacoes)
+      .where(
+        and(
+          eq(transacoes.tenant_id, tenant_id),
+          eq(transacoes.agent_id, agent_id),
+          eq(transacoes.id, id),
+        ),
+      )
+      .limit(1);
     return rows[0] ?? null;
   },
   async update(id: string, patch: Partial<Transacao>): Promise<void> {
@@ -459,10 +544,19 @@ export const contrapartesRepo = {
 
 export const factsRepo = {
   async getByKey(escopo: string, chave: string): Promise<AgentFact | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const rows = await db
       .select()
       .from(agent_facts)
-      .where(and(eq(agent_facts.escopo, escopo), eq(agent_facts.chave, chave)))
+      .where(
+        and(
+          eq(agent_facts.tenant_id, tenant_id),
+          eq(agent_facts.agent_id, agent_id),
+          eq(agent_facts.escopo, escopo),
+          eq(agent_facts.chave, chave),
+        ),
+      )
       .limit(1);
     return rows[0] ?? null;
   },
@@ -473,15 +567,16 @@ export const factsRepo = {
     fonte: 'configurado' | 'aprendido' | 'inferido';
     confianca?: number;
   }): Promise<AgentFact> {
+    const guarded = applyTenantGuard({
+      escopo: input.escopo,
+      chave: input.chave,
+      valor: input.valor as object,
+      fonte: input.fonte,
+      confianca: String(input.confianca ?? 1),
+    });
     const rows = await db
       .insert(agent_facts)
-      .values({
-        escopo: input.escopo,
-        chave: input.chave,
-        valor: input.valor as object,
-        fonte: input.fonte,
-        confianca: String(input.confianca ?? 1),
-      })
+      .values(guarded)
       .onConflictDoUpdate({
         target: [agent_facts.escopo, agent_facts.chave],
         set: {
@@ -495,29 +590,54 @@ export const factsRepo = {
   },
   async listForScopes(escopos: string[]): Promise<AgentFact[]> {
     if (escopos.length === 0) return [];
-    return db.select().from(agent_facts).where(inArray(agent_facts.escopo, escopos));
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(agent_facts)
+      .where(
+        and(
+          eq(agent_facts.tenant_id, tenant_id),
+          eq(agent_facts.agent_id, agent_id),
+          inArray(agent_facts.escopo, escopos),
+        ),
+      );
   },
 };
 
 export const rulesRepo = {
   async listActive(tipo: string): Promise<LearnedRule[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     return db
       .select()
       .from(learned_rules)
-      .where(and(eq(learned_rules.ativa, true), eq(learned_rules.tipo, tipo)))
+      .where(
+        and(
+          eq(learned_rules.tenant_id, tenant_id),
+          eq(learned_rules.agent_id, agent_id),
+          eq(learned_rules.ativa, true),
+          eq(learned_rules.tipo, tipo),
+        ),
+      )
       .orderBy(desc(learned_rules.confianca), desc(learned_rules.updated_at))
       .limit(50);
   },
   async create(input: Omit<LearnedRule, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>): Promise<LearnedRule> {
-    const rows = await db.insert(learned_rules).values(input).returning();
+    const guarded = applyTenantGuard(input);
+    const rows = await db.insert(learned_rules).values(guarded).returning();
     return rows[0]!;
   },
   async findByContext(tipo: string, contexto: string): Promise<LearnedRule | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const rows = await db
       .select()
       .from(learned_rules)
       .where(
         and(
+          eq(learned_rules.tenant_id, tenant_id),
+          eq(learned_rules.agent_id, agent_id),
           eq(learned_rules.tipo, tipo),
           eq(learned_rules.contexto, contexto),
           eq(learned_rules.ativa, true),
@@ -527,7 +647,19 @@ export const rulesRepo = {
     return rows[0] ?? null;
   },
   async byId(id: string): Promise<LearnedRule | null> {
-    const rows = await db.select().from(learned_rules).where(eq(learned_rules.id, id)).limit(1);
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(learned_rules)
+      .where(
+        and(
+          eq(learned_rules.tenant_id, tenant_id),
+          eq(learned_rules.agent_id, agent_id),
+          eq(learned_rules.id, id),
+        ),
+      )
+      .limit(1);
     return rows[0] ?? null;
   },
   async incrementAcerto(id: string): Promise<void> {
@@ -751,18 +883,38 @@ export const idempotencyRepo = {
 
 export const auditRepo = {
   async write(input: Omit<AuditEntry, 'id' | 'tenant_id' | 'agent_id' | 'created_at'>): Promise<void> {
-    await db.insert(audit_log).values(input);
+    const guarded = applyTenantGuard(input);
+    await db.insert(audit_log).values(guarded);
   },
   async listByPessoa(pessoa_id: string, n = 100): Promise<AuditEntry[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     return db
       .select()
       .from(audit_log)
-      .where(eq(audit_log.pessoa_id, pessoa_id))
+      .where(
+        and(
+          eq(audit_log.tenant_id, tenant_id),
+          eq(audit_log.agent_id, agent_id),
+          eq(audit_log.pessoa_id, pessoa_id),
+        ),
+      )
       .orderBy(desc(audit_log.created_at))
       .limit(n);
   },
   async findByMensagemId(mensagem_id: string): Promise<AuditEntry[]> {
-    return db.select().from(audit_log).where(eq(audit_log.mensagem_id, mensagem_id));
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(audit_log)
+      .where(
+        and(
+          eq(audit_log.tenant_id, tenant_id),
+          eq(audit_log.agent_id, agent_id),
+          eq(audit_log.mensagem_id, mensagem_id),
+        ),
+      );
   },
 };
 

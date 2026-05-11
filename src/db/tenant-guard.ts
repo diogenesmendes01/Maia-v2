@@ -13,20 +13,23 @@ export { MissingTenantContextError } from './tenant-context.js';
  *     return db.insert(table).values(guarded).returning();
  *   }
  */
-export function applyTenantGuard<T extends { tenant_id?: string; agent_id?: string }>(
+export function applyTenantGuard<T extends Record<string, unknown>>(
   input: T,
 ): T & { tenant_id: string; agent_id: string } {
   const ctxTenant = getCurrentTenant(); // pode lançar MissingTenantContextError
   const ctxAgent = getCurrentAgent();
 
-  if (input.tenant_id && input.tenant_id !== ctxTenant) {
+  const inputTenant = input.tenant_id as string | undefined;
+  const inputAgent = input.agent_id as string | undefined;
+
+  if (inputTenant && inputTenant !== ctxTenant) {
     throw new Error(
-      `tenant mismatch: input ${input.tenant_id} vs context ${ctxTenant}`,
+      `tenant mismatch: input ${inputTenant} vs context ${ctxTenant}`,
     );
   }
-  if (input.agent_id && input.agent_id !== ctxAgent) {
+  if (inputAgent && inputAgent !== ctxAgent) {
     throw new Error(
-      `agent mismatch: input ${input.agent_id} vs context ${ctxAgent}`,
+      `agent mismatch: input ${inputAgent} vs context ${ctxAgent}`,
     );
   }
 
