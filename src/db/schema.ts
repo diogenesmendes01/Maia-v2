@@ -411,6 +411,36 @@ export const audit_log = pgTable('audit_log', {
   created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
+// P0 multi-tenant scaffolding (migration 007). `tenants.id` and `agents.id` are
+// TEXT (human-readable slugs like 'default', 'cliente-x'), not UUIDs — the
+// 'default' row is seeded by the migration to preserve the legacy single-tenant
+// Maia behavior. FK from agents.tenant_id → tenants.id is enforced in SQL only;
+// see plan §6.1.
+export const tenants = pgTable('tenants', {
+  id: text('id').primaryKey(),
+  nome: text('nome').notNull(),
+  status: text('status').notNull().default('active'),
+  metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+  created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const agents = pgTable(
+  'agents',
+  {
+    id: text('id').primaryKey(),
+    tenant_id: text('tenant_id').notNull(),
+    nome: text('nome').notNull(),
+    status: text('status').notNull().default('active'),
+    metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    tenantIdIdx: index('agents_tenant_id_idx').on(t.tenant_id),
+  }),
+);
+
 export type Entidade = typeof entidades.$inferSelect;
 export type Pessoa = typeof pessoas.$inferSelect;
 export type Permissao = typeof permissoes.$inferSelect;
@@ -436,3 +466,5 @@ export type PermissionProfile = typeof permission_profiles.$inferSelect;
 export type DashboardSession = typeof dashboard_sessions.$inferSelect;
 export type ImportRun = typeof import_runs.$inferSelect;
 export type ImportEntry = typeof import_entries.$inferSelect;
+export type Tenant = typeof tenants.$inferSelect;
+export type Agent = typeof agents.$inferSelect;
