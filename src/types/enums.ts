@@ -24,9 +24,27 @@ export type AgentStatus = typeof AgentStatus[keyof typeof AgentStatus];
  * já registrar eventos do Reflector existente.
  */
 export const CognitiveEventType = {
-  USER_CORRECTION: 'user_correction', // existente (reflection.ts)
+  USER_CORRECTION: 'user_correction',         // existente (P0)
+  SUCCESS_EXPLICIT: 'success_explicit',       // P1 NEW
+  CONVERSATION_CLOSED: 'conversation_closed', // P1 NEW
+  PATTERN_DETECTED: 'pattern_detected',       // P1 NEW
+  INTERNAL_GAP: 'internal_gap',               // P1 NEW
 } as const;
 export type CognitiveEventType = typeof CognitiveEventType[keyof typeof CognitiveEventType];
+
+/**
+ * Tipos de candidatos a conhecimento que peuvent ser capturados e armazenados.
+ * Define 6 destinos de aprendizado do sistema.
+ */
+export const CandidateType = {
+  FATO: 'fato',
+  REGRA: 'regra',
+  PROCEDIMENTO: 'procedimento',
+  LACUNA: 'lacuna',
+  TOOL_REQUEST: 'tool_request',
+  DESCARTE: 'descarte',
+} as const;
+export type CandidateType = typeof CandidateType[keyof typeof CandidateType];
 
 /**
  * Nomes de feature flags conhecidas. Cresce conforme fases ativam.
