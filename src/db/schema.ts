@@ -621,6 +621,75 @@ export const behavioral_hint = pgTable(
   }),
 );
 
+export const agent_capabilities_domain = pgTable(
+  'agent_capabilities_domain',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    domain: text('domain').notNull(),
+    confidence: numeric('confidence', { precision: 4, scale: 3 }).notNull().default('0'),
+    evidence_count: integer('evidence_count').notNull().default(0),
+    success_count: integer('success_count').notNull().default(0),
+    failure_count: integer('failure_count').notNull().default(0),
+    last_success: timestamp('last_success', { withTimezone: true }),
+    last_failure: timestamp('last_failure', { withTimezone: true }),
+    failure_modes: jsonb('failure_modes').notNull().default(sql`'[]'::jsonb`),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    uniq: unique().on(t.tenant_id, t.agent_id, t.domain),
+    domainIdx: index('caps_domain_idx').on(t.tenant_id, t.agent_id, t.domain),
+  }),
+);
+
+export const agent_capabilities_skill = pgTable(
+  'agent_capabilities_skill',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    domain: text('domain').notNull(),
+    skill_name: text('skill_name').notNull(),
+    confidence: numeric('confidence', { precision: 4, scale: 3 }).notNull().default('0'),
+    evidence_count: integer('evidence_count').notNull().default(0),
+    success_count: integer('success_count').notNull().default(0),
+    failure_count: integer('failure_count').notNull().default(0),
+    last_success: timestamp('last_success', { withTimezone: true }),
+    last_failure: timestamp('last_failure', { withTimezone: true }),
+    failure_modes: jsonb('failure_modes').notNull().default(sql`'[]'::jsonb`),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    uniq: unique().on(t.tenant_id, t.agent_id, t.domain, t.skill_name),
+    skillIdx: index('caps_skill_idx').on(t.tenant_id, t.agent_id, t.domain, t.skill_name),
+  }),
+);
+
+export const agent_capability_gaps = pgTable(
+  'agent_capability_gaps',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    capability_description: text('capability_description').notNull(),
+    tipo: text('tipo').notNull(),
+    contexto: text('contexto'),
+    frequency_score: integer('frequency_score').notNull().default(1),
+    severity_score: integer('severity_score').notNull().default(1),
+    current_level: text('current_level').notNull().default('silent'),
+    source_candidate_id: uuid('source_candidate_id'),
+    last_observed: timestamp('last_observed', { withTimezone: true }).notNull().defaultNow(),
+    last_level_change_at: timestamp('last_level_change_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    levelIdx: index('caps_gaps_level_idx').on(t.tenant_id, t.agent_id, t.current_level),
+  }),
+);
+
 export type Entidade = typeof entidades.$inferSelect;
 export type Pessoa = typeof pessoas.$inferSelect;
 export type Permissao = typeof permissoes.$inferSelect;
@@ -652,3 +721,6 @@ export type CognitiveModuleLog = typeof cognitive_module_log.$inferSelect;
 export type CognitiveCandidate = typeof cognitive_candidates.$inferSelect;
 export type MemoryEntry = typeof memory_entry.$inferSelect;
 export type BehavioralHint = typeof behavioral_hint.$inferSelect;
+export type AgentCapabilityDomain = typeof agent_capabilities_domain.$inferSelect;
+export type AgentCapabilitySkill = typeof agent_capabilities_skill.$inferSelect;
+export type AgentCapabilityGap = typeof agent_capability_gaps.$inferSelect;
