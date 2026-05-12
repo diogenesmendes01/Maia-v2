@@ -591,6 +591,36 @@ export const memory_entry = pgTable(
   }),
 );
 
+export const behavioral_hint = pgTable(
+  'behavioral_hint',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    scope_type: text('scope_type').notNull(),
+    subject_id: text('subject_id'),
+    hint_text: text('hint_text').notNull(),
+    derived_from_memory_id: uuid('derived_from_memory_id'),
+    derived_sensitivity: text('derived_sensitivity').notNull(),
+    ttl_days: integer('ttl_days'),
+    extension_reason: text('extension_reason'),
+    extension_approved_by: text('extension_approved_by'),
+    extension_approved_at: timestamp('extension_approved_at', { withTimezone: true }),
+    expires_at: timestamp('expires_at', { withTimezone: true }),
+    revoked_at: timestamp('revoked_at', { withTimezone: true }),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    tenantScopeIdx: index('behavioral_hint_tenant_scope_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.scope_type,
+      t.subject_id,
+    ),
+    activeIdx: index('behavioral_hint_active_idx').on(t.revoked_at, t.expires_at),
+  }),
+);
+
 export type Entidade = typeof entidades.$inferSelect;
 export type Pessoa = typeof pessoas.$inferSelect;
 export type Permissao = typeof permissoes.$inferSelect;
@@ -621,3 +651,4 @@ export type Agent = typeof agents.$inferSelect;
 export type CognitiveModuleLog = typeof cognitive_module_log.$inferSelect;
 export type CognitiveCandidate = typeof cognitive_candidates.$inferSelect;
 export type MemoryEntry = typeof memory_entry.$inferSelect;
+export type BehavioralHint = typeof behavioral_hint.$inferSelect;
