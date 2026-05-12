@@ -590,7 +590,12 @@ export const factsRepo = {
       .insert(agent_facts)
       .values(guarded)
       .onConflictDoUpdate({
-        target: [agent_facts.escopo, agent_facts.chave],
+        target: [
+          agent_facts.tenant_id,
+          agent_facts.agent_id,
+          agent_facts.escopo,
+          agent_facts.chave,
+        ],
         set: {
           valor: input.valor as object,
           fonte: input.fonte,
