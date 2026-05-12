@@ -117,3 +117,28 @@ export type RunModuleResult<TOut> = {
   fallback_triggered: boolean;
   latency_ms: number;
 };
+
+// P3a: Procedure types
+
+export type ProcedureStep = {
+  id: string;
+  intencao: string;
+  como: string;
+  sucesso_criteria_ref?: string;
+  armadilhas?: string[];
+  tools_used?: string[];
+  depends_on?: string[];
+};
+
+export type ProcedureSuccessCriterion =
+  | { id: string; type: 'machine_check'; expression: string }
+  | { id: string; type: 'tool_result'; tool: string; expected: string }
+  | { id: string; type: 'user_signal'; signals: string[] }
+  | { id: string; type: 'llm_judge'; prompt: string; threshold: number }
+  | { id: string; type: 'human_confirmed'; requires_role: string };
+
+export type ProcedureWhenApply = {
+  conditions?: string[];
+  tags?: string[];
+  context_match?: Record<string, unknown>;
+};
