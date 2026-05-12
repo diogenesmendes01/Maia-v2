@@ -725,6 +725,26 @@ export const procedure_definitions = pgTable(
   }),
 );
 
+export const procedure_assignments = pgTable(
+  'procedure_assignments',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    definition_id: uuid('definition_id').notNull(),
+    definition_version: integer('definition_version').notNull(),
+    target_type: text('target_type').notNull(),
+    target_id: text('target_id').notNull(),
+    customizations: jsonb('customizations').notNull().default(sql`'{}'::jsonb`),
+    enabled: boolean('enabled').notNull().default(true),
+    activated_at: timestamp('activated_at', { withTimezone: true }).notNull().defaultNow(),
+    deactivated_at: timestamp('deactivated_at', { withTimezone: true }),
+  },
+  (t) => ({
+    targetIdx: index('procedure_assignments_target_idx').on(t.tenant_id, t.target_type, t.target_id, t.enabled),
+    defIdx: index('procedure_assignments_def_idx').on(t.definition_id),
+  }),
+);
+
 export type Entidade = typeof entidades.$inferSelect;
 export type Pessoa = typeof pessoas.$inferSelect;
 export type Permissao = typeof permissoes.$inferSelect;
@@ -760,3 +780,4 @@ export type AgentCapabilityDomain = typeof agent_capabilities_domain.$inferSelec
 export type AgentCapabilitySkill = typeof agent_capabilities_skill.$inferSelect;
 export type AgentCapabilityGap = typeof agent_capability_gaps.$inferSelect;
 export type ProcedureDefinition = typeof procedure_definitions.$inferSelect;
+export type ProcedureAssignment = typeof procedure_assignments.$inferSelect;
