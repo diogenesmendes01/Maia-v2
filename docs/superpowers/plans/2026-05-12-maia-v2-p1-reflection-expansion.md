@@ -29,7 +29,7 @@
 | `src/agent/reflection.ts` | Modify | Refactor `reflectOnCorrection` → roteia pelo Runner; preserva behavior |
 | `src/agent/success-detector.ts` | Create | Detector de sucesso explícito em mensagens (regex + LLM-as-judge no ambíguo) |
 | `src/agent/gap-detector.ts` | Create | Detector de auto-reconhecimento de lacuna no ReAct loop |
-| `src/workers/reflection-batch.ts` | Modify | Suportar múltiplos triggers (não só `transaction_corrected`) |
+| `src/workers/reflection-batch.ts` | (no-op em P1) | Continua processando correções como hoje; novos triggers vão pelos seus próprios paths. Listed pra clareza. |
 | `src/workers/conversation-summarizer.ts` | Modify | Disparar evento `conversation_closed` ao fechar conversa |
 | `src/workers/pattern-detector.ts` | Create | Worker batch — detecta padrões repetidos em audit_log |
 | `tests/unit/cognition-runner.spec.ts` | Create | Testa runner: success/timeout/fallback/audit |
@@ -1034,37 +1034,46 @@ const MIN_OCCURRENCES = 3;
  * Atualmente: ações com mesma `acao` que repetiram ≥ MIN_OCCURRENCES vezes
  * pra mesma `alvo_id` ou conta.
  */
-export async function runPatternDetector(): Promise<void> {
-  const rows = await db.execute<{ pattern: string; count: number; alvo_ids: string[] }>(sql`
-    SELECT 
-      acao || '|' || COALESCE((metadata->>'descricao'), '') AS pattern,
-      count(*) AS count,
-      array_agg(DISTINCT alvo_id::text) FILTER (WHERE alvo_id IS NOT NULL) AS alvo_ids
-    FROM ${audit_log}
-    WHERE created_at >= now() - interval '24 hours'
-    GROUP BY pattern
-    HAVING count(*) >= ${MIN_OCCURRENCES}
-    ORDER BY count DESC
-    LIMIT 20
-  `);
+import { runWithTenantContext } from '@/db/tenant-context.js';
 
-  for (const r of rows.rows as Array<{ pattern: string; count: number; alvo_ids: string[] }>) {
-    const event = {
-      type: CognitiveEventType.PATTERN_DETECTED,
-      pattern_descriptor: r.pattern,
-      evidence_count: r.count,
-      evidence_ids: r.alvo_ids ?? [],
-    } as const;
-    try {
-      const reflected = await reflect(event);
-      if (!reflected) continue;
-      const classified = await classify(reflected.insight);
-      if (!classified) continue;
-      await persistCandidate(classified, event);
-    } catch (err) {
-      logger.warn({ err: (err as Error).message, pattern: r.pattern }, 'pattern_detector.failed');
+export async function runPatternDetector(): Promise<void> {
+  // P0-era single-tenant shim: pattern detection roda em escopo do tenant 'default'.
+  // P6 introduz iteração por tenant (encapsular esse corpo num for-each tenant).
+  // IMPORTANTE: pattern queries são tenant-scoped (audit_log é multi-tenant pós-P0).
+  await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+    const rows = await db.execute<{ pattern: string; count: number; alvo_ids: string[] }>(sql`
+      SELECT 
+        acao || '|' || COALESCE((metadata->>'descricao'), '') AS pattern,
+        count(*) AS count,
+        array_agg(DISTINCT alvo_id::text) FILTER (WHERE alvo_id IS NOT NULL) AS alvo_ids
+      FROM ${audit_log}
+      WHERE tenant_id = 'default'
+        AND agent_id = 'default'
+        AND created_at >= now() - interval '24 hours'
+      GROUP BY pattern
+      HAVING count(*) >= ${MIN_OCCURRENCES}
+      ORDER BY count DESC
+      LIMIT 20
+    `);
+
+    for (const r of rows.rows as Array<{ pattern: string; count: number; alvo_ids: string[] }>) {
+      const event = {
+        type: CognitiveEventType.PATTERN_DETECTED,
+        pattern_descriptor: r.pattern,
+        evidence_count: r.count,
+        evidence_ids: r.alvo_ids ?? [],
+      } as const;
+      try {
+        const reflected = await reflect(event);
+        if (!reflected) continue;
+        const classified = await classify(reflected.insight);
+        if (!classified) continue;
+        await persistCandidate(classified, event);
+      } catch (err) {
+        logger.warn({ err: (err as Error).message, pattern: r.pattern }, 'pattern_detector.failed');
+      }
     }
-  }
+  });
 }
 ```
 
