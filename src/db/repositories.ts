@@ -1,4 +1,4 @@
-import { eq, and, inArray, desc, isNull, sql } from 'drizzle-orm';
+import { eq, and, inArray, desc, isNull, sql, or, gt } from 'drizzle-orm';
 import { db } from './client.js';
 import {
   pessoas,
@@ -26,6 +26,11 @@ import {
   agents,
   cognitive_module_log,
   cognitive_candidates,
+  memory_entry,
+  behavioral_hint,
+  agent_capabilities_domain,
+  agent_capabilities_skill,
+  agent_capability_gaps,
 } from './schema.js';
 import { TypedError } from '@/lib/utils.js';
 import { applyTenantGuard } from './tenant-guard.js';
@@ -53,6 +58,11 @@ import type {
   Agent,
   CognitiveModuleLog,
   CognitiveCandidate,
+  MemoryEntry,
+  BehavioralHint,
+  AgentCapabilityDomain,
+  AgentCapabilitySkill,
+  AgentCapabilityGap,
 } from './schema.js';
 
 export type EntityScope = {
@@ -1157,5 +1167,336 @@ export const cognitiveCandidatesRepo = {
       .update(cognitive_candidates)
       .set({ status: 'consumed', consumed_by_phase: phase, consumed_at: new Date() })
       .where(eq(cognitive_candidates.id, id));
+  },
+};
+
+export const memoryEntryRepo = {
+  async create(
+    input: Omit<MemoryEntry, 'id' | 'created_at' | 'updated_at' | 'tenant_id' | 'agent_id'>,
+  ): Promise<MemoryEntry> {
+    const guarded = applyTenantGuard(input);
+    const [row] = await db.insert(memory_entry).values(guarded).returning();
+    return row!;
+  },
+
+  async findRelevant(opts: {
+    interlocutor_id?: string;
+    role_id?: string;
+    conversa_id?: string;
+    limit?: number;
+  }): Promise<MemoryEntry[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const conds = [
+      eq(memory_entry.tenant_id, tenant_id),
+      eq(memory_entry.agent_id, agent_id),
+      eq(memory_entry.needs_review, false),
+    ];
+    // Filtrar por scope_type + subject_id apropriado
+    const orConds = [];
+    if (opts.interlocutor_id) {
+      orConds.push(
+        and(
+          eq(memory_entry.scope_type, 'interlocutor'),
+          eq(memory_entry.subject_id, opts.interlocutor_id),
+        ),
+      );
+    }
+    if (opts.role_id) {
+      orConds.push(
+        and(eq(memory_entry.scope_type, 'role'), eq(memory_entry.subject_id, opts.role_id)),
+      );
+    }
+    if (opts.conversa_id) {
+      orConds.push(
+        and(
+          eq(memory_entry.scope_type, 'conversation'),
+          eq(memory_entry.subject_id, opts.conversa_id),
+        ),
+      );
+    }
+    orConds.push(eq(memory_entry.scope_type, 'agent'));
+
+    return db
+      .select()
+      .from(memory_entry)
+      .where(and(...conds, or(...orConds)))
+      .orderBy(desc(memory_entry.created_at))
+      .limit(opts.limit ?? 50);
+  },
+
+  async markReviewed(
+    id: string,
+    updates: {
+      memory_type: string;
+      sensitivity: string;
+      proactive_use: boolean;
+      mention_allowed: boolean;
+      ttl_days?: number | null;
+      scope_type?: string;
+      subject_id?: string;
+    },
+  ): Promise<void> {
+    await db
+      .update(memory_entry)
+      .set({ ...updates, needs_review: false, updated_at: new Date() })
+      .where(eq(memory_entry.id, id));
+  },
+
+  async listNeedsReview(limit = 100): Promise<MemoryEntry[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(memory_entry)
+      .where(
+        and(
+          eq(memory_entry.tenant_id, tenant_id),
+          eq(memory_entry.agent_id, agent_id),
+          eq(memory_entry.needs_review, true),
+        ),
+      )
+      .limit(limit);
+  },
+};
+
+export const behavioralHintRepo = {
+  async create(
+    input: Omit<BehavioralHint, 'id' | 'created_at' | 'tenant_id' | 'agent_id'>,
+  ): Promise<BehavioralHint> {
+    const guarded = applyTenantGuard(input);
+    const [row] = await db.insert(behavioral_hint).values(guarded).returning();
+    return row!;
+  },
+
+  async findActiveForScope(opts: {
+    scope_type: string;
+    subject_id?: string | null;
+  }): Promise<BehavioralHint[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const now = new Date();
+    const conds = [
+      eq(behavioral_hint.tenant_id, tenant_id),
+      eq(behavioral_hint.agent_id, agent_id),
+      eq(behavioral_hint.scope_type, opts.scope_type),
+      isNull(behavioral_hint.revoked_at),
+    ];
+    if (opts.subject_id) conds.push(eq(behavioral_hint.subject_id, opts.subject_id));
+    return db
+      .select()
+      .from(behavioral_hint)
+      .where(
+        and(
+          ...conds,
+          or(isNull(behavioral_hint.expires_at), gt(behavioral_hint.expires_at, now)),
+        ),
+      );
+  },
+
+  async revoke(id: string): Promise<void> {
+    await db
+      .update(behavioral_hint)
+      .set({ revoked_at: new Date() })
+      .where(eq(behavioral_hint.id, id));
+  },
+};
+
+export const capabilitiesDomainRepo = {
+  async findByDomain(domain: string): Promise<AgentCapabilityDomain | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(agent_capabilities_domain)
+      .where(
+        and(
+          eq(agent_capabilities_domain.tenant_id, tenant_id),
+          eq(agent_capabilities_domain.agent_id, agent_id),
+          eq(agent_capabilities_domain.domain, domain),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  async upsertConfidence(
+    domain: string,
+    updates: Partial<AgentCapabilityDomain>,
+  ): Promise<void> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    // Try update first
+    const existing = await capabilitiesDomainRepo.findByDomain(domain);
+    if (existing) {
+      await db
+        .update(agent_capabilities_domain)
+        .set({ ...updates, updated_at: new Date() })
+        .where(eq(agent_capabilities_domain.id, existing.id));
+    } else {
+      await db.insert(agent_capabilities_domain).values({
+        tenant_id,
+        agent_id,
+        domain,
+        ...updates,
+      } as typeof agent_capabilities_domain.$inferInsert);
+    }
+  },
+
+  async listAll(): Promise<AgentCapabilityDomain[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(agent_capabilities_domain)
+      .where(
+        and(
+          eq(agent_capabilities_domain.tenant_id, tenant_id),
+          eq(agent_capabilities_domain.agent_id, agent_id),
+        ),
+      );
+  },
+};
+
+export const capabilitiesSkillRepo = {
+  async findBySkill(domain: string, skill_name: string): Promise<AgentCapabilitySkill | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(agent_capabilities_skill)
+      .where(
+        and(
+          eq(agent_capabilities_skill.tenant_id, tenant_id),
+          eq(agent_capabilities_skill.agent_id, agent_id),
+          eq(agent_capabilities_skill.domain, domain),
+          eq(agent_capabilities_skill.skill_name, skill_name),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  async upsertConfidence(
+    domain: string,
+    skill_name: string,
+    updates: Partial<AgentCapabilitySkill>,
+  ): Promise<void> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const existing = await capabilitiesSkillRepo.findBySkill(domain, skill_name);
+    if (existing) {
+      await db
+        .update(agent_capabilities_skill)
+        .set({ ...updates, updated_at: new Date() })
+        .where(eq(agent_capabilities_skill.id, existing.id));
+    } else {
+      await db.insert(agent_capabilities_skill).values({
+        tenant_id,
+        agent_id,
+        domain,
+        skill_name,
+        ...updates,
+      } as typeof agent_capabilities_skill.$inferInsert);
+    }
+  },
+
+  async listByDomain(domain: string): Promise<AgentCapabilitySkill[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(agent_capabilities_skill)
+      .where(
+        and(
+          eq(agent_capabilities_skill.tenant_id, tenant_id),
+          eq(agent_capabilities_skill.agent_id, agent_id),
+          eq(agent_capabilities_skill.domain, domain),
+        ),
+      );
+  },
+
+  async listAll(): Promise<AgentCapabilitySkill[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(agent_capabilities_skill)
+      .where(
+        and(
+          eq(agent_capabilities_skill.tenant_id, tenant_id),
+          eq(agent_capabilities_skill.agent_id, agent_id),
+        ),
+      );
+  },
+};
+
+export const capabilityGapsRepo = {
+  async upsert(input: {
+    capability_description: string;
+    tipo: 'tool' | 'knowledge' | 'procedure';
+    contexto?: string;
+    source_candidate_id?: string;
+  }): Promise<AgentCapabilityGap> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    // Simple match by description (LIKE or exact); P3+ pode usar embedding similarity
+    const existing = await db
+      .select()
+      .from(agent_capability_gaps)
+      .where(
+        and(
+          eq(agent_capability_gaps.tenant_id, tenant_id),
+          eq(agent_capability_gaps.agent_id, agent_id),
+          eq(agent_capability_gaps.capability_description, input.capability_description),
+        ),
+      )
+      .limit(1);
+
+    if (existing[0]) {
+      await db
+        .update(agent_capability_gaps)
+        .set({
+          frequency_score: existing[0].frequency_score + 1,
+          last_observed: new Date(),
+        })
+        .where(eq(agent_capability_gaps.id, existing[0].id));
+      return existing[0];
+    }
+
+    const [created] = await db
+      .insert(agent_capability_gaps)
+      .values({
+        tenant_id,
+        agent_id,
+        capability_description: input.capability_description,
+        tipo: input.tipo,
+        contexto: input.contexto ?? null,
+        source_candidate_id: input.source_candidate_id ?? null,
+      } as typeof agent_capability_gaps.$inferInsert)
+      .returning();
+    return created!;
+  },
+
+  async listByLevel(level: string): Promise<AgentCapabilityGap[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(agent_capability_gaps)
+      .where(
+        and(
+          eq(agent_capability_gaps.tenant_id, tenant_id),
+          eq(agent_capability_gaps.agent_id, agent_id),
+          eq(agent_capability_gaps.current_level, level),
+        ),
+      );
+  },
+
+  async escalateLevel(id: string, new_level: string): Promise<void> {
+    await db
+      .update(agent_capability_gaps)
+      .set({ current_level: new_level, last_level_change_at: new Date() })
+      .where(eq(agent_capability_gaps.id, id));
   },
 };
