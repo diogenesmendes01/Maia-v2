@@ -6,8 +6,12 @@ import {
   mensagensRepo,
   entityStatesRepo,
   entidadesRepo,
+  memoryEntryRepo,
+  behavioralHintRepo,
+  capabilitiesSkillRepo,
+  capabilityGapsRepo,
 } from '@/db/repositories.js';
-import type { Pessoa, Conversa, Mensagem } from '@/db/schema.js';
+import type { Pessoa, Conversa, Mensagem, BehavioralHint } from '@/db/schema.js';
 import type { ResolvedPermission } from '@/governance/permissions.js';
 import { fmtBR } from '@/lib/brazilian.js';
 import type { LLMMessage } from '@/lib/claude.js';
@@ -120,6 +124,103 @@ export async function buildPrompt(ctx: PromptContext): Promise<{ system: string;
     );
   }
 
+  // P2: Load memory_entry respecting visibility flags, behavioral hints, and
+  // self-awareness (capabilities + gaps). Wrapped in try/catch so any DB
+  // failure or missing repo (e.g. older test mocks) degrades gracefully —
+  // the existing prompt is still produced.
+  let memorySection = '';
+  let hintsSection = '';
+  let selfAwarenessSection = '';
+
+  try {
+    const memoryEntries = (await memoryEntryRepo?.findRelevant?.({
+      interlocutor_id: ctx.pessoa?.id,
+      conversa_id: ctx.conversa?.id,
+      limit: 30,
+    })) ?? [];
+
+    // Respect proactive_use: if false, only include when current message
+    // touches the topic (simple keyword overlap heuristic).
+    const currentText = (ctx.inbound?.conteudo ?? '').toLowerCase();
+    const usableMemories = memoryEntries.filter((m) => {
+      if (m.proactive_use) return true;
+      const memWords = m.content
+        .toLowerCase()
+        .split(/\s+/)
+        .filter((w) => w.length > 4);
+      return memWords.some((w) => currentText.includes(w));
+    });
+
+    // Split: only mention_allowed enters the prompt literally. The hidden-
+    // influence subset is represented via behavioral hints derived from it.
+    const mentionableMemories = usableMemories.filter((m) => m.mention_allowed);
+
+    if (mentionableMemories.length > 0) {
+      memorySection =
+        '\n## Memória relevante\n' +
+        mentionableMemories.map((m) => `- ${m.content}`).join('\n');
+    }
+  } catch {
+    // Degrade gracefully — DB unavailable or repo unmocked in tests.
+  }
+
+  try {
+    const scopeQueries: Array<{ scope_type: string; subject_id?: string | null }> = [
+      { scope_type: 'interlocutor', subject_id: ctx.pessoa?.id },
+      { scope_type: 'conversation', subject_id: ctx.conversa?.id },
+      { scope_type: 'agent', subject_id: null },
+    ];
+    const allHints: BehavioralHint[] = [];
+    for (const sq of scopeQueries) {
+      // Skip interlocutor/conversation queries when subject id is missing.
+      if (sq.scope_type !== 'agent' && !sq.subject_id) continue;
+      const hints =
+        (await behavioralHintRepo?.findActiveForScope?.({
+          scope_type: sq.scope_type,
+          subject_id: sq.subject_id ?? null,
+        })) ?? [];
+      allHints.push(...hints);
+    }
+    if (allHints.length > 0) {
+      hintsSection =
+        '\n## Instruções comportamentais ativas\n' +
+        allHints.map((h) => `- ${h.hint_text}`).join('\n');
+    }
+  } catch {
+    // Degrade gracefully.
+  }
+
+  try {
+    const allSkills = (await capabilitiesSkillRepo?.listAll?.()) ?? [];
+    const topSkills = [...allSkills]
+      .sort((a, b) => Number(b.confidence) - Number(a.confidence))
+      .slice(0, 5);
+    const masteredSkills = topSkills.filter((s) => Number(s.confidence) >= 0.7);
+    const learningSkills = topSkills.filter((s) => Number(s.confidence) < 0.5);
+    const mentionableGaps = (await capabilityGapsRepo?.listByLevel?.('mentionable')) ?? [];
+
+    const lines = [
+      masteredSkills.length
+        ? `Você domina: ${masteredSkills.map((s) => s.skill_name).join(', ')}.`
+        : '',
+      learningSkills.length
+        ? `Está aprendendo: ${learningSkills.map((s) => s.skill_name).join(', ')}.`
+        : '',
+      mentionableGaps.length
+        ? `Ainda não tem: ${mentionableGaps
+            .map((g) => g.capability_description)
+            .slice(0, 3)
+            .join(', ')}.`
+        : '',
+    ].filter(Boolean);
+
+    if (lines.length > 0) {
+      selfAwarenessSection = '\n## Autoconhecimento\n' + lines.join('\n');
+    }
+  } catch {
+    // Degrade gracefully.
+  }
+
   const system = [
     self?.system_prompt ?? 'Você é a Maia.',
     '',
@@ -150,7 +251,10 @@ export async function buildPrompt(ctx: PromptContext): Promise<{ system: string;
     '',
     '## Regras aprendidas relevantes',
     rulesBlock || '  (vazio)',
-  ].join('\n');
+  ].join('\n')
+    + memorySection
+    + hintsSection
+    + selfAwarenessSection;
 
   // Build conversation messages: oldest first
   const ordered = [...recent].reverse();
