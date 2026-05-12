@@ -9,6 +9,11 @@ import { REGISTRY } from '@/tools/_registry.js';
 import { sendReaction } from '@/gateway/presence.js';
 import { uuid } from '@/lib/utils.js';
 import { dispatchOutput, type LatestPending, type LatestReportPdf } from './output-dispatch.js';
+import { detectGap } from './gap-detector.js';
+import { reflect } from '@/cognition/reflector.js';
+import { classify } from '@/cognition/classifier.js';
+import { persistCandidate } from '@/cognition/persister.js';
+import { CognitiveEventType } from '@/types/enums.js';
 
 export const MAX_REACT_ITERATIONS = 5;
 
@@ -65,6 +70,37 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<{ totalT
           turnHasSensitive,
           sensitiveTools,
         });
+
+        // P1 reflection trigger: INTERNAL_GAP. Inspects the final outbound
+        // text for self-recognized gaps ("não sei", "preciso verificar",
+        // "sem acesso a..."). Fire-and-forget — reflection MUST never
+        // block the user-facing reply or the ReAct return.
+        const gap = detectGap(text);
+        if (gap.detected) {
+          const responseText = text;
+          const signal = gap.signal ?? '';
+          void (async () => {
+            try {
+              const event = {
+                type: CognitiveEventType.INTERNAL_GAP,
+                conversa_id: c.id,
+                inbound_mensagem_id: inbound.id,
+                gap_description: signal,
+                attempted_response: responseText,
+              } as const;
+              const reflected = await reflect(event, { pessoa_id: pessoa.id });
+              if (!reflected || !reflected.insight) return;
+              const classified = await classify(reflected.insight);
+              if (!classified) return;
+              await persistCandidate(classified, event);
+            } catch (err) {
+              logger.warn(
+                { err: (err as Error).message, mensagem_id: inbound.id },
+                'gap.reflection.failed',
+              );
+            }
+          })();
+        }
       }
       break;
     }
