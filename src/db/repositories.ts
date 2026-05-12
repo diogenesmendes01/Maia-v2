@@ -31,6 +31,8 @@ import {
   agent_capabilities_domain,
   agent_capabilities_skill,
   agent_capability_gaps,
+  procedure_definitions,
+  procedure_assignments,
 } from './schema.js';
 import { TypedError } from '@/lib/utils.js';
 import { applyTenantGuard } from './tenant-guard.js';
@@ -63,6 +65,8 @@ import type {
   AgentCapabilityDomain,
   AgentCapabilitySkill,
   AgentCapabilityGap,
+  ProcedureDefinition,
+  ProcedureAssignment,
 } from './schema.js';
 
 export type EntityScope = {
@@ -1498,5 +1502,109 @@ export const capabilityGapsRepo = {
       .update(agent_capability_gaps)
       .set({ current_level: new_level, last_level_change_at: new Date() })
       .where(eq(agent_capability_gaps.id, id));
+  },
+};
+
+export const procedureDefinitionsRepo = {
+  async create(
+    input: Omit<ProcedureDefinition, 'id' | 'created_at' | 'updated_at' | 'tenant_id' | 'agent_id'>,
+  ): Promise<ProcedureDefinition> {
+    const guarded = applyTenantGuard(input);
+    const [row] = await db.insert(procedure_definitions).values(guarded as any).returning();
+    return row!;
+  },
+
+  async findActiveByName(nome: string): Promise<ProcedureDefinition | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(procedure_definitions)
+      .where(and(
+        eq(procedure_definitions.tenant_id, tenant_id),
+        eq(procedure_definitions.agent_id, agent_id),
+        eq(procedure_definitions.nome, nome),
+        eq(procedure_definitions.status, 'active'),
+      ))
+      .orderBy(desc(procedure_definitions.version_number))
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  async findById(id: string): Promise<ProcedureDefinition | null> {
+    const rows = await db.select().from(procedure_definitions).where(eq(procedure_definitions.id, id)).limit(1);
+    return rows[0] ?? null;
+  },
+
+  async listByStatus(status: string, limit = 100): Promise<ProcedureDefinition[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(procedure_definitions)
+      .where(and(
+        eq(procedure_definitions.tenant_id, tenant_id),
+        eq(procedure_definitions.agent_id, agent_id),
+        eq(procedure_definitions.status, status),
+      ))
+      .orderBy(desc(procedure_definitions.created_at))
+      .limit(limit);
+  },
+
+  async updateStatus(
+    id: string,
+    updates: { status: string; approved_by?: string; approved_at?: Date | null; activated_at?: Date | null; deactivated_at?: Date | null; proposed_by?: string },
+  ): Promise<void> {
+    await db
+      .update(procedure_definitions)
+      .set({ ...updates, updated_at: new Date() })
+      .where(eq(procedure_definitions.id, id));
+  },
+
+  async listAllVersionsByName(nome: string): Promise<ProcedureDefinition[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(procedure_definitions)
+      .where(and(
+        eq(procedure_definitions.tenant_id, tenant_id),
+        eq(procedure_definitions.agent_id, agent_id),
+        eq(procedure_definitions.nome, nome),
+      ))
+      .orderBy(desc(procedure_definitions.version_number));
+  },
+};
+
+export const procedureAssignmentsRepo = {
+  async create(
+    input: Omit<ProcedureAssignment, 'id' | 'activated_at' | 'tenant_id'>,
+  ): Promise<ProcedureAssignment> {
+    const tenant_id = getCurrentTenant();
+    const [row] = await db
+      .insert(procedure_assignments)
+      .values({ ...input, tenant_id } as any)
+      .returning();
+    return row!;
+  },
+
+  async listForTarget(target_type: string, target_id: string): Promise<ProcedureAssignment[]> {
+    const tenant_id = getCurrentTenant();
+    return db
+      .select()
+      .from(procedure_assignments)
+      .where(and(
+        eq(procedure_assignments.tenant_id, tenant_id),
+        eq(procedure_assignments.target_type, target_type),
+        eq(procedure_assignments.target_id, target_id),
+        eq(procedure_assignments.enabled, true),
+      ));
+  },
+
+  async disable(id: string): Promise<void> {
+    await db
+      .update(procedure_assignments)
+      .set({ enabled: false, deactivated_at: new Date() })
+      .where(eq(procedure_assignments.id, id));
   },
 };
