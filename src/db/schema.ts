@@ -536,6 +536,30 @@ export const cognitive_module_log = pgTable(
   }),
 );
 
+export const cognitive_candidates = pgTable(
+  'cognitive_candidates',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    conversa_id: uuid('conversa_id'),
+    source_event_type: text('source_event_type').notNull(),
+    source_event_id: uuid('source_event_id'),
+    candidate_type: text('candidate_type').notNull(),
+    payload: jsonb('payload').notNull(),
+    status: text('status').notNull().default('pending'),
+    consumed_by_phase: text('consumed_by_phase'),
+    consumed_at: timestamp('consumed_at', { withTimezone: true }),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    tenantAgentStatusIdx: index('cognitive_candidates_tenant_agent_status_idx').on(
+      t.tenant_id, t.agent_id, t.status, t.created_at,
+    ),
+    typeStatusIdx: index('cognitive_candidates_type_status_idx').on(t.candidate_type, t.status),
+  }),
+);
+
 export type Entidade = typeof entidades.$inferSelect;
 export type Pessoa = typeof pessoas.$inferSelect;
 export type Permissao = typeof permissoes.$inferSelect;
@@ -564,3 +588,4 @@ export type ImportEntry = typeof import_entries.$inferSelect;
 export type Tenant = typeof tenants.$inferSelect;
 export type Agent = typeof agents.$inferSelect;
 export type CognitiveModuleLog = typeof cognitive_module_log.$inferSelect;
+export type CognitiveCandidate = typeof cognitive_candidates.$inferSelect;
