@@ -15,7 +15,13 @@ import {
 } from '@/db/tenant-context.js';
 import { like, inArray } from 'drizzle-orm';
 
-describe('Tenant isolation (P0)', () => {
+// Padrão do projeto (tests/integration/leak.spec.ts): integration tests
+// só rodam quando TEST_DB_URL está setada. No CI a validate job não tem
+// Postgres — o integration job (com service container) cuida desse caso.
+const SHOULD_RUN = !!process.env.TEST_DB_URL;
+const d = SHOULD_RUN ? describe : describe.skip;
+
+d('Tenant isolation (P0)', () => {
   beforeAll(async () => {
     // Cria 2 tenants + 1 agente cada
     await tenantsRepo.create({ id: 't-a', nome: 'Tenant A' });
