@@ -5,9 +5,14 @@ import { runCognitiveModule } from './runner.js';
 /**
  * Reflector — gera candidato bruto (texto livre) a partir de evento cognitivo.
  * Saída é um insight não-tipado que será classificado pelo Classifier.
+ *
+ * `pessoa_id` (opcional) propaga a atribuição de custo do LLM pra pessoa certa
+ * (ex.: reflexão disparada por correção de uma pessoa específica). Workers sem
+ * contexto de pessoa (briefings, batches) deixam undefined.
  */
 export async function reflect(
   event: CognitiveEvent,
+  opts?: { pessoa_id?: string },
 ): Promise<{ insight: string; tokens_in?: number; tokens_out?: number } | null> {
   const systemPrompt = buildSystemForEvent(event);
   const userPrompt = buildUserForEvent(event);
@@ -28,6 +33,7 @@ export async function reflect(
         messages: [{ role: 'user', content: userPrompt }],
         max_tokens: 500,
         temperature: 0.2,
+        pessoa_id: opts?.pessoa_id,
       });
       return {
         insight: (res.content ?? '').trim(),

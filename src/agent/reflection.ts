@@ -1,26 +1,12 @@
-import { z } from 'zod';
-import { callLLM } from '@/lib/claude.js';
-import {
-  rulesRepo,
-  mensagensRepo,
-  selfStateRepo,
-  cognitiveModuleLogRepo,
-} from '@/db/repositories.js';
+import { mensagensRepo, selfStateRepo } from '@/db/repositories.js';
 import { writeMemory } from '@/memory/vector.js';
 import { audit } from '@/governance/audit.js';
 import { logger } from '@/lib/logger.js';
-import { hashContent } from '@/lib/utils.js';
+import { reflect } from '@/cognition/reflector.js';
+import { classify } from '@/cognition/classifier.js';
+import { persistCandidate } from '@/cognition/persister.js';
+import { CognitiveEventType } from '@/types/enums.js';
 import type { Pessoa, Conversa, Mensagem } from '@/db/schema.js';
-
-const ReflectionRule = z.object({
-  applicable: z.boolean(),
-  tipo: z.enum(['classificacao', 'identificacao_entidade', 'tom_resposta', 'recorrencia']).optional(),
-  contexto: z.string().optional(),
-  acao: z.string().optional(),
-  contexto_jsonb: z.record(z.unknown()).optional(),
-  acoes_jsonb: z.record(z.unknown()).optional(),
-  justificativa: z.string().optional(),
-});
 
 const CORRECTION_HINTS = [
   /\bn[ãa]o\b/i,
@@ -35,6 +21,22 @@ export function detectCorrection(message: string): boolean {
   return CORRECTION_HINTS.some((re) => re.test(message));
 }
 
+/**
+ * Reflete sobre uma correção do usuário.
+ *
+ * Em P1, esta função roteia pelo pipeline cognitivo novo:
+ *   Reflector (gera insight bruto) → Classifier (tipa em 6 destinos) → Persister
+ *   (grava no destino certo: facts/rules/candidates queue).
+ *
+ * O cognitive_module_log é emitido automaticamente pelo `runCognitiveModule`
+ * dentro de Reflector e Classifier — não duplicamos aqui.
+ *
+ * Audit `rule_learned` é preservado quando o Classifier tipa como 'regra' e o
+ * Persister grava em `learned_rules` (backward-compat com auditoria existente).
+ *
+ * `writeMemory` (vetorização) NÃO é chamado aqui — apenas em
+ * `reflectOnWorkflowCompletion`, que continua intacto.
+ */
 export async function reflectOnCorrection(input: {
   pessoa: Pessoa;
   conversa: Conversa;
@@ -42,93 +44,44 @@ export async function reflectOnCorrection(input: {
   previousAssistant: Mensagem | null;
 }): Promise<void> {
   if (!input.previousAssistant) return;
-  const system = `Você é a Maia analisando uma correção do usuário. Responda APENAS em JSON conforme o schema.
-Se a correção é genuína (categoria errada, entidade errada, valor errado, etc.), proponha uma regra que evite repetição.
-Schema:
-{
-  "applicable": boolean,
-  "tipo": "classificacao" | "identificacao_entidade" | "tom_resposta" | "recorrencia",
-  "contexto": string,
-  "acao": string,
-  "contexto_jsonb": object,
-  "acoes_jsonb": object,
-  "justificativa": string
-}
-Se não for aplicável, retorne {"applicable": false}.`;
-  const user = `Resposta anterior da Maia:
-${input.previousAssistant.conteudo}
 
-Correção do usuário:
-${input.inbound.conteudo}
+  const event = {
+    type: CognitiveEventType.USER_CORRECTION,
+    conversa_id: input.conversa.id,
+    inbound_mensagem_id: input.inbound.id,
+    previous_assistant_mensagem_id: input.previousAssistant.id,
+    correction_text: input.inbound.conteudo ?? '',
+    previous_response_text: input.previousAssistant.conteudo ?? '',
+  } as const;
 
-Proponha uma regra ou diga não aplicável.`;
   try {
-    const startTime = Date.now();
-    const res = await callLLM({
-      system,
-      messages: [{ role: 'user', content: user }],
-      max_tokens: 400,
-      temperature: 0.0,
-      pessoa_id: input.pessoa.id,
-    });
-    const text = res.content?.trim() ?? '';
-    const match = text.match(/\{[\s\S]*\}/);
-    const parsed = match ? ReflectionRule.safeParse(JSON.parse(match[0])) : null;
+    const reflected = await reflect(event, { pessoa_id: input.pessoa.id });
+    if (!reflected || !reflected.insight) return;
 
-    const latencyMs = Date.now() - startTime;
-    await cognitiveModuleLogRepo
-      .record({
-        tenant_id: 'default',
-        agent_id: 'default',
+    const classified = await classify(reflected.insight);
+    if (!classified) return;
+
+    const persistResult = await persistCandidate(classified, event);
+
+    // Preserva audit existente quando uma regra é criada (compat retroativa).
+    if (
+      classified.type === 'regra' &&
+      persistResult.persisted_to === 'learned_rules' &&
+      persistResult.id
+    ) {
+      await audit({
+        acao: 'rule_learned',
+        pessoa_id: input.pessoa.id,
         conversa_id: input.conversa.id,
-        turno_id: input.inbound.id,
-        module_name: 'reflection.correction',
-        module_version: 'v1',
-        prompt_version: null,
-        triggered_by: 'async_event',
-        started_at: new Date(startTime),
-        ended_at: new Date(),
-        latency_ms: latencyMs,
-        model_used: 'claude-haiku-4-5',
-        tokens_in: res.usage?.input_tokens ?? null,
-        tokens_out: res.usage?.output_tokens ?? null,
-        cost_estimate: null,
-        output_summary_hash: parsed?.success ? hashContent(text) : null,
-        confidence: parsed?.success && parsed.data.applicable ? '0.500' : '0.000',
-        fallback_triggered: false,
-        fallback_reason: null,
-        status: parsed?.success ? 'success' : 'error',
-        metadata: { rule_created: !!(parsed?.success && parsed.data.applicable) },
-      })
-      .catch((err) =>
-        logger.warn({ err: (err as Error).message }, 'reflection.cognitive_log_failed'),
+        mensagem_id: input.inbound.id,
+        alvo_id: persistResult.id,
+        metadata: { tipo: classified.tipo },
+      });
+      logger.info(
+        { rule_id: persistResult.id, tipo: classified.tipo },
+        'reflection.rule_created',
       );
-
-    if (!match || !parsed) return;
-    if (!parsed.success || !parsed.data.applicable) return;
-    if (!parsed.data.tipo || !parsed.data.contexto || !parsed.data.acao) return;
-
-    const r = await rulesRepo.create({
-      tipo: parsed.data.tipo,
-      contexto: parsed.data.contexto,
-      acao: parsed.data.acao,
-      contexto_jsonb: parsed.data.contexto_jsonb ?? {},
-      acoes_jsonb: parsed.data.acoes_jsonb ?? {},
-      confianca: '0.50',
-      acertos: 0,
-      erros: 0,
-      ativa: true,
-      exemplo_origem_id: input.inbound.id,
-    });
-    await audit({
-      acao: 'rule_learned',
-      pessoa_id: input.pessoa.id,
-      conversa_id: input.conversa.id,
-      mensagem_id: input.inbound.id,
-      alvo_id: r.id,
-      metadata: { tipo: parsed.data.tipo, justificativa: parsed.data.justificativa },
-    });
-    logger.info({ rule_id: r.id, tipo: parsed.data.tipo }, 'reflection.rule_created');
+    }
   } catch (err) {
     logger.warn({ err: (err as Error).message }, 'reflection.failed');
   }
