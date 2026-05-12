@@ -11,7 +11,7 @@ export async function runCognitiveModule<TOut>(
   const timeoutMs = opts.timeoutMs ?? 30000;
   const audit = opts.audit ?? true;
   let status: RunModuleResult<TOut>['status'] = 'success';
-  let output: TOut | null = null;
+  let output: TOut | null;
   let fallback_triggered = false;
   let error_message: string | undefined;
 

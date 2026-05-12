@@ -48,9 +48,13 @@ export const JOBS: Job[] = [
   { name: 'cloud_backup_rotation', cron: '0 4 * * 0', fn: runCloudBackupRotation, phase: 1 },
   { name: 'cost_monitor', cron: '30 2 * * *', fn: runCostMonitor, phase: 1 },
   { name: 'dlq_monitor', cron: '*/5 * * * *', fn: runDlqMonitor, phase: 1 },
-  { name: 'conversation_summarizer', cron: '0 2 * * *', fn: runConversationSummarizer, phase: 2 },
-  { name: 'reflection_batch', cron: '0 2 * * *', fn: runReflectionBatch, phase: 2 },
-  { name: 'pattern_detector', cron: '0 4 * * *', fn: runPatternDetector, phase: 2 },
+  // P1: estes três workers alimentam o pipeline de reflexão expandida —
+  // conversation_summarizer dispara CONVERSATION_CLOSED, pattern_detector
+  // dispara PATTERN_DETECTED, e reflection_batch agrega correções. São
+  // pré-requisito dos triggers prometidos no P1, portanto rodam em phase 1.
+  { name: 'conversation_summarizer', cron: '0 2 * * *', fn: runConversationSummarizer, phase: 1 },
+  { name: 'reflection_batch', cron: '0 2 * * *', fn: runReflectionBatch, phase: 1 },
+  { name: 'pattern_detector', cron: '0 4 * * *', fn: runPatternDetector, phase: 1 },
   { name: 'briefing_morning', cron: '0 8 * * *', fn: runMorningBriefing, phase: 4 },
   { name: 'briefing_evening', cron: '0 21 * * *', fn: runEveningBriefing, phase: 4 },
   { name: 'briefing_weekly', cron: '0 8 * * 1', fn: runWeeklyBriefing, phase: 4 },
