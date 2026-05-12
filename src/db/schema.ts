@@ -560,6 +560,37 @@ export const cognitive_candidates = pgTable(
   }),
 );
 
+export const memory_entry = pgTable(
+  'memory_entry',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    interlocutor_id: uuid('interlocutor_id'),
+    conversa_id: uuid('conversa_id'),
+    content: text('content').notNull(),
+    memory_type: text('memory_type').notNull(),
+    scope_type: text('scope_type').notNull(),
+    subject_id: text('subject_id'),
+    sensitivity: text('sensitivity').notNull().default('low'),
+    proactive_use: boolean('proactive_use').notNull().default(false),
+    mention_allowed: boolean('mention_allowed').notNull().default(false),
+    ttl_days: integer('ttl_days'),
+    needs_review: boolean('needs_review').notNull().default(false),
+    source_event_id: uuid('source_event_id'),
+    expires_at: timestamp('expires_at', { withTimezone: true }),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    tenantAgentIdx: index('memory_entry_tenant_agent_idx').on(t.tenant_id, t.agent_id, t.created_at),
+    interlocutorIdx: index('memory_entry_interlocutor_idx').on(t.interlocutor_id),
+    scopeIdx: index('memory_entry_scope_idx').on(t.scope_type, t.subject_id),
+    needsReviewIdx: index('memory_entry_needs_review_idx').on(t.needs_review),
+    expiresIdx: index('memory_entry_expires_idx').on(t.expires_at),
+  }),
+);
+
 export type Entidade = typeof entidades.$inferSelect;
 export type Pessoa = typeof pessoas.$inferSelect;
 export type Permissao = typeof permissoes.$inferSelect;
@@ -589,3 +620,4 @@ export type Tenant = typeof tenants.$inferSelect;
 export type Agent = typeof agents.$inferSelect;
 export type CognitiveModuleLog = typeof cognitive_module_log.$inferSelect;
 export type CognitiveCandidate = typeof cognitive_candidates.$inferSelect;
+export type MemoryEntry = typeof memory_entry.$inferSelect;
