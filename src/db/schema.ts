@@ -223,7 +223,12 @@ export const agent_facts = pgTable(
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
-    uniq: unique().on(t.escopo, t.chave),
+    uniq: unique('agent_facts_tenant_agent_escopo_chave_key').on(
+      t.tenant_id,
+      t.agent_id,
+      t.escopo,
+      t.chave,
+    ),
   }),
 );
 

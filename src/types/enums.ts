@@ -2,7 +2,12 @@
  * Single source of truth para enums do Maia v2.
  * Valores literais em snake_case (convention §10.10 do spec).
  * Importar daqui, nunca duplicar strings espalhadas.
+ *
+ * O padrão `const X = {} as const` + `type X = typeof X[keyof typeof X]`
+ * faz o nome viver em dois namespaces (valor + tipo). É legítimo em TS,
+ * mas `no-redeclare` (mesmo a variante TS-aware) sinaliza como conflito.
  */
+/* eslint-disable @typescript-eslint/no-redeclare */
 
 export const TenantStatus = {
   ACTIVE: 'active',

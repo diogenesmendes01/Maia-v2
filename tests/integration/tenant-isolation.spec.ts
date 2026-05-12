@@ -7,9 +7,13 @@ import {
   entidades,
   contas_bancarias,
 } from '@/db/schema.js';
-import { tenantsRepo, agentsRepo, transacoesRepo } from '@/db/repositories.js';
-import { runWithTenantContext } from '@/db/tenant-context.js';
-import { eq, like } from 'drizzle-orm';
+import { tenantsRepo, transacoesRepo } from '@/db/repositories.js';
+import {
+  runWithTenantContext,
+  getCurrentTenant,
+  getCurrentAgent,
+} from '@/db/tenant-context.js';
+import { like, inArray } from 'drizzle-orm';
 
 describe('Tenant isolation (P0)', () => {
   beforeAll(async () => {
@@ -23,26 +27,34 @@ describe('Tenant isolation (P0)', () => {
   });
 
   afterAll(async () => {
-    // Cleanup em ordem reversa de FK (transacoes → contas → entidades)
-    await db.delete(transacoes).where(eq(transacoes.tenant_id, 't-a'));
-    await db.delete(transacoes).where(eq(transacoes.tenant_id, 't-b'));
-    // Helper-created rows ficam em tenant 'default' (raw insert bypassa context).
-    await db.delete(contas_bancarias).where(like(contas_bancarias.apelido, 'Conta-test-%'));
+    // Cleanup em ordem reversa de FK (transacoes → contas → entidades).
+    // Filtrar por tenant dos próprios fixtures — agora entidades/contas
+    // herdam o tenant_id do contexto onde foram criadas (não 'default').
+    const tenantIds = ['t-a', 't-b'];
+    await db.delete(transacoes).where(inArray(transacoes.tenant_id, tenantIds));
+    await db
+      .delete(contas_bancarias)
+      .where(like(contas_bancarias.apelido, 'Conta-test-%'));
     await db.delete(entidades).where(like(entidades.nome, 'TestEnt-%'));
-    await db.delete(agents).where(eq(agents.tenant_id, 't-a'));
-    await db.delete(agents).where(eq(agents.tenant_id, 't-b'));
-    await db.delete(tenants).where(eq(tenants.id, 't-a'));
-    await db.delete(tenants).where(eq(tenants.id, 't-b'));
+    await db.delete(agents).where(inArray(agents.tenant_id, tenantIds));
+    await db.delete(tenants).where(inArray(tenants.id, tenantIds));
   });
 
-  // Helper pra criar transacao válida (todos os NOT NULL preenchidos).
-  // Cria entidade/conta com nomes únicos prefixados pra limpeza confiável.
+  // Helper pra criar transacao válida (todos os NOT NULL preenchidos +
+  // valores aceitos pelos CHECKs de natureza/status/tipo).
+  //
+  // Importante: precisa rodar DENTRO de `runWithTenantContext`. Lê o tenant
+  // atual e injeta nas inserções raw, garantindo que entidade/conta/transação
+  // ficam todos no mesmo tenant (sem isso, o raw insert cairia no default
+  // 'default' do schema e a tx referenciaria entidade de outro tenant).
   let fixtureCounter = 0;
   async function makeTxFixture(descricao: string) {
     fixtureCounter++;
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const [ent] = await db
       .insert(entidades)
-      .values({ nome: `TestEnt-${fixtureCounter}`, tipo: 'pj' })
+      .values({ nome: `TestEnt-${fixtureCounter}`, tipo: 'pj', tenant_id, agent_id })
       .returning();
     const [conta] = await db
       .insert(contas_bancarias)
@@ -50,16 +62,18 @@ describe('Tenant isolation (P0)', () => {
         entidade_id: ent.id,
         banco: 'X',
         apelido: `Conta-test-${fixtureCounter}`,
-        tipo: 'corrente',
+        tipo: 'cc',
+        tenant_id,
+        agent_id,
       })
       .returning();
     return {
       entidade_id: ent.id,
       conta_id: conta.id,
-      natureza: 'saida' as const,
+      natureza: 'despesa' as const,
       valor: '100.00',
       data_competencia: '2026-05-11',
-      status: 'confirmada',
+      status: 'paga',
       descricao,
       origem: 'manual' as const,
     };
@@ -82,9 +96,11 @@ describe('Tenant isolation (P0)', () => {
   it('tentativa de injetar tenant_id no input lança erro', async () => {
     await runWithTenantContext({ tenant_id: 't-a', agent_id: 'agent-a' }, async () => {
       const fixture = await makeTxFixture('INJECTION');
-      await expect(
-        transacoesRepo.create({ ...fixture, tenant_id: 't-b' } as any),
-      ).rejects.toThrow(/tenant mismatch/);
+      // tenant_id é Omitted do tipo de input do create — passar mesmo assim
+      // exige bypass do excess-property check. `unknown` é o cast mínimo.
+      type CreateInput = Parameters<typeof transacoesRepo.create>[0];
+      const malicious = { ...fixture, tenant_id: 't-b' } as unknown as CreateInput;
+      await expect(transacoesRepo.create(malicious)).rejects.toThrow(/tenant mismatch/);
     });
   });
 
