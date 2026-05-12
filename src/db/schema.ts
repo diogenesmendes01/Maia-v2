@@ -690,6 +690,41 @@ export const agent_capability_gaps = pgTable(
   }),
 );
 
+export const procedure_definitions = pgTable(
+  'procedure_definitions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    scope: text('scope').notNull(),
+    owner_agent_id: text('owner_agent_id'),
+    nome: text('nome').notNull(),
+    version_number: integer('version_number').notNull().default(1),
+    status: text('status').notNull().default('draft'),
+    intencao: text('intencao').notNull(),
+    when_apply: jsonb('when_apply').notNull().default(sql`'{}'::jsonb`),
+    when_not_apply: jsonb('when_not_apply').notNull().default(sql`'{}'::jsonb`),
+    steps: jsonb('steps').notNull().default(sql`'[]'::jsonb`),
+    success_criteria: jsonb('success_criteria').notNull().default(sql`'[]'::jsonb`),
+    failure_modes: jsonb('failure_modes').notNull().default(sql`'[]'::jsonb`),
+    tools_referenced: jsonb('tools_referenced').notNull().default(sql`'[]'::jsonb`),
+    source: text('source').notNull(),
+    proposed_by: text('proposed_by'),
+    approved_by: text('approved_by'),
+    approved_at: timestamp('approved_at', { withTimezone: true }),
+    activated_at: timestamp('activated_at', { withTimezone: true }),
+    deactivated_at: timestamp('deactivated_at', { withTimezone: true }),
+    source_candidate_id: uuid('source_candidate_id'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    tenantAgentStatusIdx: index('procedure_def_tenant_agent_status_idx').on(t.tenant_id, t.agent_id, t.status, t.nome),
+    activeIdx: index('procedure_def_active_idx').on(t.tenant_id, t.agent_id, t.nome),
+    sourceCandidateIdx: index('procedure_def_source_candidate_idx').on(t.source_candidate_id),
+  }),
+);
+
 export type Entidade = typeof entidades.$inferSelect;
 export type Pessoa = typeof pessoas.$inferSelect;
 export type Permissao = typeof permissoes.$inferSelect;
@@ -724,3 +759,4 @@ export type BehavioralHint = typeof behavioral_hint.$inferSelect;
 export type AgentCapabilityDomain = typeof agent_capabilities_domain.$inferSelect;
 export type AgentCapabilitySkill = typeof agent_capabilities_skill.$inferSelect;
 export type AgentCapabilityGap = typeof agent_capability_gaps.$inferSelect;
+export type ProcedureDefinition = typeof procedure_definitions.$inferSelect;
