@@ -17,6 +17,7 @@ import { runDlqMonitor } from './dlq-monitor.js';
 import { runMorningBriefing, runEveningBriefing, runWeeklyBriefing } from './briefings.js';
 import { runLegacyMemoryReclassifier } from './legacy-memory-reclassifier.js';
 import { runConfidenceRecompute } from './confidence-recompute.js';
+import { runProcedureCandidateConsumer } from './procedure-candidate-consumer.js';
 import { tickEngine } from '@/workflows/engine.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 
@@ -55,6 +56,7 @@ export const JOBS: Job[] = [
   { name: 'pattern_detector', cron: '0 4 * * *', fn: runPatternDetector, phase: 2 },
   { name: 'legacy_memory_reclassifier', cron: '0 3 * * *', fn: runLegacyMemoryReclassifier, phase: 2 },
   { name: 'confidence_recompute', cron: '30 3 * * *', fn: runConfidenceRecompute, phase: 2 },
+  { name: 'procedure_candidate_consumer', cron: '0 2 * * *', fn: runProcedureCandidateConsumer, phase: 2 },
   { name: 'briefing_morning', cron: '0 8 * * *', fn: runMorningBriefing, phase: 4 },
   { name: 'briefing_evening', cron: '0 21 * * *', fn: runEveningBriefing, phase: 4 },
   { name: 'briefing_weekly', cron: '0 8 * * 1', fn: runWeeklyBriefing, phase: 4 },
