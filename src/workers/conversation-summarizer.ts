@@ -6,6 +6,10 @@ import { callLLM } from '@/lib/claude.js';
 import { logger } from '@/lib/logger.js';
 import { config } from '@/config/env.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
+import { reflect } from '@/cognition/reflector.js';
+import { classify } from '@/cognition/classifier.js';
+import { persistCandidate } from '@/cognition/persister.js';
+import { CognitiveEventType } from '@/types/enums.js';
 
 export async function runConversationSummarizer(): Promise<void> {
   // P0: single-tenant default. P6 will fan-out per tenant.
@@ -30,6 +34,27 @@ async function runConversationSummarizerInner(): Promise<void> {
     const msgs = await mensagensRepo.recentInConversation(c.id, 50);
     if (msgs.length === 0) {
       await conversasRepo.close(c.id, '');
+      try {
+        const event = {
+          type: CognitiveEventType.CONVERSATION_CLOSED,
+          conversa_id: c.id,
+          transcript: '',
+          summary: '',
+          duration_minutes: 0,
+        } as const;
+        const reflected = await reflect(event);
+        if (reflected) {
+          const classified = await classify(reflected.insight);
+          if (classified) {
+            await persistCandidate(classified, event);
+          }
+        }
+      } catch (err) {
+        logger.warn(
+          { err: (err as Error).message, conversa_id: c.id },
+          'conversation_closed.reflection.failed'
+        );
+      }
       continue;
     }
     const transcript = [...msgs]
@@ -47,6 +72,27 @@ async function runConversationSummarizerInner(): Promise<void> {
       const summary = (res.content ?? '').slice(0, 500);
       await conversasRepo.close(c.id, summary);
       logger.info({ conversa_id: c.id, len: summary.length }, 'conversation_summarized');
+      try {
+        const event = {
+          type: CognitiveEventType.CONVERSATION_CLOSED,
+          conversa_id: c.id,
+          transcript,
+          summary,
+          duration_minutes: 0,
+        } as const;
+        const reflected = await reflect(event);
+        if (reflected) {
+          const classified = await classify(reflected.insight);
+          if (classified) {
+            await persistCandidate(classified, event);
+          }
+        }
+      } catch (err) {
+        logger.warn(
+          { err: (err as Error).message, conversa_id: c.id },
+          'conversation_closed.reflection.failed'
+        );
+      }
     } catch (err) {
       logger.warn({ err: (err as Error).message, conversa_id: c.id }, 'summarizer.failed');
     }
