@@ -18,10 +18,24 @@ vi.mock('../../src/db/repositories.js', () => ({
   factsRepo: { listForScopes: factsListForScopes },
   rulesRepo: { listActive: rulesListActive },
   entityStatesRepo: { byId: entityStatesById },
+  operationalProfileVersionsRepo: { getActive: vi.fn().mockResolvedValue(null) },
 }));
 
 vi.mock('../../src/config/env.js', () => ({
   config: {},
+}));
+
+// P4 Task 7: prompt-builder now imports the logger (for the dual-read
+// fallback warning). The existing `config: {}` mock above doesn't include
+// LOG_LEVEL / NODE_ENV, which would make pino throw at construction time.
+// Stubbing the logger keeps these tests hermetic.
+vi.mock('../../src/lib/logger.js', () => ({
+  logger: {
+    warn: vi.fn(),
+    info: vi.fn(),
+    error: vi.fn(),
+    debug: vi.fn(),
+  },
 }));
 
 beforeEach(() => {
