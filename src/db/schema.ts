@@ -771,6 +771,25 @@ export const procedure_executions = pgTable(
   }),
 );
 
+export const procedure_execution_events = pgTable(
+  'procedure_execution_events',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    execution_id: uuid('execution_id').notNull(),
+    step_id: text('step_id'),
+    event_type: text('event_type').notNull(),
+    payload: jsonb('payload').notNull().default(sql`'{}'::jsonb`),
+    confidence: numeric('confidence', { precision: 4, scale: 3 }),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    executionIdx: index('procedure_events_execution_idx').on(t.execution_id, t.created_at),
+    typeIdx: index('procedure_events_type_idx').on(t.event_type, t.created_at),
+  }),
+);
+
 export type Entidade = typeof entidades.$inferSelect;
 export type Pessoa = typeof pessoas.$inferSelect;
 export type Permissao = typeof permissoes.$inferSelect;
@@ -808,3 +827,4 @@ export type AgentCapabilityGap = typeof agent_capability_gaps.$inferSelect;
 export type ProcedureDefinition = typeof procedure_definitions.$inferSelect;
 export type ProcedureAssignment = typeof procedure_assignments.$inferSelect;
 export type ProcedureExecution = typeof procedure_executions.$inferSelect;
+export type ProcedureExecutionEvent = typeof procedure_execution_events.$inferSelect;
