@@ -965,6 +965,39 @@ export const gap_escalation_rules = pgTable(
   }),
 );
 
+// P5: capability_proposals — propostas formais (spec gerada por LLM no nível 'proposed').
+// Fluxo de status: draft -> submitted -> approved/rejected -> delivered. Sem aprovação
+// explícita, o agente não ganha a capability; loop fechado via capability_test_results.
+export const capability_proposals = pgTable(
+  'capability_proposals',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    gap_id: uuid('gap_id'),
+    capability_type: text('capability_type').notNull(),
+    title: text('title').notNull(),
+    description: text('description').notNull(),
+    proposed_spec: jsonb('proposed_spec').notNull().default(sql`'{}'::jsonb`),
+    motivation: text('motivation').notNull(),
+    expected_impact: text('expected_impact'),
+    test_scenarios: jsonb('test_scenarios').notNull().default(sql`'[]'::jsonb`),
+    status: text('status').notNull().default('draft'),
+    submitted_at: timestamp('submitted_at', { withTimezone: true }),
+    decided_at: timestamp('decided_at', { withTimezone: true }),
+    decided_by: text('decided_by'),
+    decision_reason: text('decision_reason'),
+    delivered_at: timestamp('delivered_at', { withTimezone: true }),
+    delivery_artifact_ref: text('delivery_artifact_ref'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    statusIdx: index('cap_proposals_tenant_agent_status_idx').on(t.tenant_id, t.agent_id, t.status, t.created_at),
+    gapIdx: index('cap_proposals_gap_idx').on(t.gap_id),
+  }),
+);
+
 export type Entidade = typeof entidades.$inferSelect;
 export type Pessoa = typeof pessoas.$inferSelect;
 export type Permissao = typeof permissoes.$inferSelect;
@@ -1013,3 +1046,5 @@ export type AgentDriftAlert = typeof agent_drift_alerts.$inferSelect;
 export type NewAgentDriftAlert = typeof agent_drift_alerts.$inferInsert;
 export type GapEscalationRule = typeof gap_escalation_rules.$inferSelect;
 export type NewGapEscalationRule = typeof gap_escalation_rules.$inferInsert;
+export type CapabilityProposal = typeof capability_proposals.$inferSelect;
+export type NewCapabilityProposal = typeof capability_proposals.$inferInsert;
