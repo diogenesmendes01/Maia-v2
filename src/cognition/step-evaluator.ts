@@ -1,4 +1,5 @@
 import type { ProcedureExecution, ProcedureDefinition } from '@/db/schema.js';
+import { getLatestHumanConfirmation } from '@/procedures/engine.js';
 import { judgeStepCriterion } from './step-evaluator-llm-judge.js';
 import { detectUserSignal } from './step-evaluator-user-signal.js';
 
@@ -112,10 +113,30 @@ export async function evaluateCurrentStep(args: {
       passed = r.passed;
       evidence = `user_signal ${r.matched}: ${r.evidence}`;
     } else if (c.type === 'human_confirmed') {
-      // P3c Task 6 (próximo commit): exige confirmação de um humano com
-      // role específica (ex.: owner) via flag explícita. Idem ao acima.
-      passed = false;
-      evidence = `criterion type ${c.type} not evaluated yet (Task 6)`;
+      // P3c Task 6: event-sourced. Consulta o ÚLTIMO evento
+      // `human_confirmation` para (execution_id, step_id). Sem evento ainda →
+      // awaiting. TTL opcional invalida approvals antigos — útil para
+      // confirmações sensíveis (ex.: pagamento) que perdem validade rápido.
+      const conf = await getLatestHumanConfirmation({
+        execution_id: args.execution.id,
+        step_id: currentStep.id,
+      });
+      if (!conf) {
+        passed = false;
+        evidence = 'awaiting human confirmation';
+      } else if (conf.decision === 'rejected') {
+        passed = false;
+        evidence = `human rejected by ${conf.operator_id}`;
+      } else {
+        const ttlMin = typeof c.ttl_minutes === 'number' ? (c.ttl_minutes as number) : undefined;
+        if (ttlMin && Date.now() - conf.ts.getTime() > ttlMin * 60_000) {
+          passed = false;
+          evidence = `confirmation expired (ttl ${ttlMin}min)`;
+        } else {
+          passed = true;
+          evidence = `human approved by ${conf.operator_id}`;
+        }
+      }
     }
 
     if (!passed) all_passed = false;

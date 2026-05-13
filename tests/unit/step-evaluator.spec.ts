@@ -1,4 +1,20 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+
+// P3c Task 6: o ramo `human_confirmed` agora consulta
+// procedureExecutionEventsRepo.listByExecution. Como estes testes não exercitam
+// confirmação humana de fato (cobertos em step-evaluator-human-confirmed.spec),
+// retornamos lista vazia → comportamento "awaiting".
+vi.mock('@/db/repositories.js', async () => {
+  const actual = await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
+  return {
+    ...actual,
+    procedureExecutionEventsRepo: {
+      record: vi.fn(async () => {}),
+      listByExecution: vi.fn(async () => []),
+    },
+  };
+});
+
 import { evaluateCurrentStep } from '@/cognition/step-evaluator.js';
 
 describe('evaluateCurrentStep', () => {
@@ -79,9 +95,9 @@ describe('evaluateCurrentStep', () => {
     expect(result.criterion_results[0]?.evidence).toContain('user_signal negative');
   });
 
-  it('human_confirmed: ainda não avaliado (Task 6)', async () => {
+  it('human_confirmed sem evento → step_completed=false, evidence "awaiting"', async () => {
     const result = await evaluateCurrentStep({
-      execution: { current_step_id: 'step-1', completed_steps: [] } as any,
+      execution: { id: 'exec-x', current_step_id: 'step-1', completed_steps: [] } as any,
       definition: {
         steps: [{ id: 'step-1', sucesso_criteria_ref: 'crit-1' }],
         success_criteria: [{ id: 'crit-1', type: 'human_confirmed' }],
@@ -89,6 +105,6 @@ describe('evaluateCurrentStep', () => {
       response_context: { response_text: 'algo' },
     });
     expect(result.step_completed).toBe(false);
-    expect(result.criterion_results[0]?.evidence).toContain('Task 6');
+    expect(result.criterion_results[0]?.evidence).toMatch(/awaiting/i);
   });
 });
