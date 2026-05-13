@@ -1024,6 +1024,30 @@ export const capability_test_results = pgTable(
   }),
 );
 
+// P6: channels — instâncias de entrada de mensagem (1+ por agent). channel_type
+// + external_id é a chave estável (UNIQUE por tenant); um mesmo agent pode ter
+// múltiplos canais (várias instâncias WhatsApp, telegram, etc).
+export const channels = pgTable(
+  'channels',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    external_id: text('external_id').notNull(),
+    channel_type: text('channel_type').notNull(),
+    display_name: text('display_name'),
+    active: boolean('active').notNull().default(true),
+    metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    tenantAgentIdx: index('channels_tenant_agent_idx').on(t.tenant_id, t.agent_id),
+    externalIdx: index('channels_external_idx').on(t.channel_type, t.external_id),
+    externalUq: uniqueIndex('channels_tenant_type_external_uq').on(t.tenant_id, t.channel_type, t.external_id),
+  }),
+);
+
 export type Entidade = typeof entidades.$inferSelect;
 export type Pessoa = typeof pessoas.$inferSelect;
 export type Permissao = typeof permissoes.$inferSelect;
@@ -1076,3 +1100,5 @@ export type CapabilityProposal = typeof capability_proposals.$inferSelect;
 export type NewCapabilityProposal = typeof capability_proposals.$inferInsert;
 export type CapabilityTestResult = typeof capability_test_results.$inferSelect;
 export type NewCapabilityTestResult = typeof capability_test_results.$inferInsert;
+export type Channel = typeof channels.$inferSelect;
+export type NewChannel = typeof channels.$inferInsert;
