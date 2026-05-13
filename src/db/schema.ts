@@ -10,6 +10,7 @@ import {
   boolean,
   date,
   unique,
+  uniqueIndex,
   index,
 } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
@@ -863,6 +864,46 @@ export const procedure_metrics = pgMaterializedView('procedure_metrics', {
   refreshed_at: timestamp('refreshed_at', { withTimezone: true }).notNull(),
 }).existing();
 
+// P4: agent_operational_profile_versions — append-only, 4 camadas
+// (núcleo imutável / perfil operacional aprendido / memória episódica temporária
+// / backlog de crescimento aprovado) + status (proposed | active | frozen |
+// rolled_back). Apenas a row `active` por (tenant_id, agent_id) entra em
+// runtime — esse invariante é garantido pelo unique index parcial
+// `agent_op_profile_unique_active_idx` declarado em migrations/025
+// (Drizzle não expressa WHERE em uniqueIndex; a DB enforce).
+export const agent_operational_profile_versions = pgTable(
+  'agent_operational_profile_versions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    version: integer('version').notNull(),
+    status: text('status').notNull(),
+    core_immutable: jsonb('core_immutable').notNull().default(sql`'{}'::jsonb`),
+    operational_profile: jsonb('operational_profile').notNull().default(sql`'{}'::jsonb`),
+    episodic_temp: jsonb('episodic_temp').notNull().default(sql`'{}'::jsonb`),
+    growth_backlog: jsonb('growth_backlog').notNull().default(sql`'{}'::jsonb`),
+    proposed_by: text('proposed_by').notNull(),
+    proposed_reason: text('proposed_reason'),
+    approved_by: text('approved_by'),
+    approved_at: timestamp('approved_at', { withTimezone: true }),
+    activated_at: timestamp('activated_at', { withTimezone: true }),
+    frozen_at: timestamp('frozen_at', { withTimezone: true }),
+    rolled_back_at: timestamp('rolled_back_at', { withTimezone: true }),
+    rollback_reason: text('rollback_reason'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    tenantAgentStatusIdx: index('agent_op_profile_tenant_agent_status_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.status,
+      t.version,
+    ),
+    versionUq: uniqueIndex('agent_op_profile_version_uq').on(t.tenant_id, t.agent_id, t.version),
+  }),
+);
+
 export type Entidade = typeof entidades.$inferSelect;
 export type Pessoa = typeof pessoas.$inferSelect;
 export type Permissao = typeof permissoes.$inferSelect;
@@ -905,3 +946,5 @@ export type ProcedureSelectorDecision = typeof procedure_selector_decisions.$inf
 export type ProcedureTest = typeof procedure_tests.$inferSelect;
 export type NewProcedureTest = typeof procedure_tests.$inferInsert;
 export type ProcedureMetric = typeof procedure_metrics.$inferSelect;
+export type AgentOperationalProfileVersion = typeof agent_operational_profile_versions.$inferSelect;
+export type NewAgentOperationalProfileVersion = typeof agent_operational_profile_versions.$inferInsert;
