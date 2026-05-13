@@ -25,6 +25,7 @@ import { capabilityProposalsRepo } from '@/db/repositories.js';
 import { featureFlags } from '@/config/feature-flags.js';
 import { FeatureFlagName } from '@/types/enums.js';
 import type { AgentCapabilityGap } from '@/db/schema.js';
+import { sanitizeBlock } from '@/agent/sanitize.js';
 
 export type ProposalDraft = {
   capability_type: 'tool' | 'knowledge' | 'procedure' | 'integration' | 'other';
@@ -70,14 +71,20 @@ export async function proposeCapabilityForGap(args: {
         'IMPORTANTE: NÃO inclua julgamento de prioridade. Apenas a spec técnica.',
       ].join('\n');
 
+      // P87-C1: gap fields e evidence.context flowing from user-influenced
+      // sources são sanitizados antes de irem para o prompt do Sonnet (defense
+      // in depth — mesmo o LLM secundário não deve receber tag-breakout).
       const evidenceBlock = args.recent_evidence && args.recent_evidence.length > 0
-        ? `EVIDÊNCIAS RECENTES:\n${args.recent_evidence.slice(0, 5).map((e) => `- ${e.context}`).join('\n')}`
+        ? `EVIDÊNCIAS RECENTES:\n${args.recent_evidence
+            .slice(0, 5)
+            .map((e) => `- ${sanitizeBlock(e.context)}`)
+            .join('\n')}`
         : '';
 
       const userParts = [
-        `LACUNA: ${args.gap.capability_description}`,
+        `LACUNA: ${sanitizeBlock(args.gap.capability_description)}`,
         `TIPO PROVÁVEL: ${args.gap.tipo}`,
-        `CONTEXTO RECORRENTE: ${args.gap.contexto ?? '(sem detalhe)'}`,
+        `CONTEXTO RECORRENTE: ${sanitizeBlock(args.gap.contexto ?? '(sem detalhe)')}`,
         `FREQUÊNCIA: ${args.gap.frequency_score} ocorrências`,
         `SEVERIDADE: ${args.gap.severity_score}/10`,
         evidenceBlock,

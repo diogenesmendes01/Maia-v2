@@ -111,14 +111,22 @@ export type GapLevel = typeof GapLevel[keyof typeof GapLevel];
 /**
  * P5 — Ciclo de vida de uma proposta de capacidade (spec técnica gerada
  * pela Maia para fechar uma lacuna). Owner decide aprovação/rejeição;
- * delivered indica que a capacidade foi entregue.
+ * delivered indica que a capacidade foi entregue após testes pós-ativação.
+ *
+ * P87-C3 (PR #87 review) — adicionados `testing` (intermediate state quando
+ * runCapabilityTests está executando) e `reverted` (terminal alternativo a
+ * delivered, quando teste pós-ativação falha e revertCapability cria gap
+ * técnico). Garantia do design contract: capability_acquired NÃO ocorre
+ * sem o test gate (criterion #3 do P5 §9).
  */
 export const ProposalStatus = {
   DRAFT: 'draft',
   SUBMITTED: 'submitted',
   APPROVED: 'approved',
   REJECTED: 'rejected',
+  TESTING: 'testing',
   DELIVERED: 'delivered',
+  REVERTED: 'reverted',
 } as const;
 export type ProposalStatus = typeof ProposalStatus[keyof typeof ProposalStatus];
 

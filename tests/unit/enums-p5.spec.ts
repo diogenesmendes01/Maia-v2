@@ -16,8 +16,18 @@ describe('P5 enums', () => {
       'silent',
     ]);
   });
-  it('ProposalStatus has 5 values', () => {
-    expect(Object.values(ProposalStatus)).toHaveLength(5);
+  // PR #87 review (P87-C3) — added 'testing' (intermediate state durante
+  // runCapabilityTests) e 'reverted' (terminal alt para failed tests).
+  it('ProposalStatus has 7 values including testing + reverted', () => {
+    expect(Object.values(ProposalStatus).sort()).toEqual([
+      'approved',
+      'delivered',
+      'draft',
+      'rejected',
+      'reverted',
+      'submitted',
+      'testing',
+    ]);
   });
   it('CapabilityTestOutcome has 3 values', () => {
     expect(Object.values(CapabilityTestOutcome).sort()).toEqual(['error', 'fail', 'pass']);

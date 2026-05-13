@@ -6,20 +6,30 @@
  * busca todos os gaps em níveis abertos (silent/dashboard/mentionable) e, para
  * cada um, consulta o engine determinístico (`decideEscalation` — Task 6).
  * Sempre que o engine devolve `changed:true`, persiste o novo nível via
- * `capabilityGapsRepo.updateLevel` e — só na transição para `proposed` —
- * dispara o `proposeCapabilityForGap` (Task 7) em fire-and-forget para não
- * bloquear o worker no LLM (Sonnet pode levar até 15s).
+ * `capabilityGapsRepo.updateLevel`. Para silent/dashboard/mentionable a
+ * promoção é imediata; para a transição para `proposed`, o worker invoca o
+ * `proposeCapabilityForGap` PRIMEIRO e só promove o gap se o proposer
+ * retornar ok:true (atomicidade artifact-first, P87-C2 do review do PR #87).
  *
  * Invariantes:
  *   - O engine continua sendo a ÚNICA fonte de decisão de escalada (sem LLM
- *     aqui — o LLM só roda DEPOIS, no proposer, em background).
+ *     aqui — o LLM só roda DEPOIS, no proposer).
  *   - Cooldown e contagem de distinct_contexts entram como input ao engine
  *     (worker NÃO toma decisão; só fornece os dados).
  *   - `distinct_contexts_count` neste P5 simplifica para 2 se `gap.contexto`
  *     existe, 1 caso contrário. (TODO P5.x: agregar de fato distinct contexts
  *     observados nas reflexões de origem; por ora gap.contexto é proxy.)
- *   - Erros do proposer NÃO derrubam o worker — capturados no .catch da
- *     promise fire-and-forget.
+ *   - Erros do proposer NÃO derrubam o worker — runCognitiveModule absorve
+ *     timeout/throw retornando { ok:false, reason }; o catch externo é
+ *     defesa adicional.
+ *   - Cooldown tenant-wide: a query DB é feita uma vez por tenant; após cada
+ *     promoção bem-sucedida a `proposed` na mesma rodada, o sentinel local
+ *     é forçado a 0 para impedir burst (P87-C4 do review).
+ *   - Atomicidade artifact-first: gap só vira `proposed` quando já existe
+ *     uma row em `capability_proposals`. Failures transient (repo_failed,
+ *     parse_failed, llm_unavailable, throw) mantêm o gap em `mentionable`
+ *     para retry no próximo tick — sem gaps órfãos em proposed sem artifact
+ *     (P87-C2).
  */
 import { logger } from '@/lib/logger.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
@@ -58,7 +68,7 @@ export async function runGapEscalationMonitor(): Promise<void> {
         GapLevel.DASHBOARD,
         GapLevel.MENTIONABLE,
       ]);
-      const daysSinceLastProposed = await capabilityGapsRepo.daysSinceLastProposed();
+      let daysSinceLastProposed = await capabilityGapsRepo.daysSinceLastProposed();
 
       for (const gap of gaps) {
         // P5 simplification: distinct_contexts_count proxy = 2 if contexto present, else 1.
@@ -76,11 +86,74 @@ export async function runGapEscalationMonitor(): Promise<void> {
 
         if (!decision.changed) continue;
 
+        // P87-C2 + P87-C4 — split path por destino:
+        //  * Para silent→dashboard e dashboard→mentionable: flip imediato
+        //    (sem side-effect downstream).
+        //  * Para mentionable→proposed: invoca o proposer ANTES do flip.
+        //    Só se o proposer retornar ok:true (artifact persistido) é que o
+        //    gap vira `proposed`. Em transient failure (repo_failed,
+        //    parse_failed, llm_unavailable, throw), o gap permanece em
+        //    `mentionable` e o próximo tick do worker re-tenta — sem órfão
+        //    em proposed sem artifact.
+        //  * Cooldown: ao confirmar uma promoção a `proposed`, força o
+        //    daysSinceLastProposed local para 0 — defeito o burst em
+        //    múltiplos gaps elegíveis na mesma rodada (P87-C4). Cooldown
+        //    real é tenant-wide e a consulta DB foi feita uma vez no início
+        //    da rodada; atualizar o sentinel local é a forma idiomática
+        //    sem precisar de UPDATE atômico.
+        if (decision.new_level !== GapLevel.PROPOSED) {
+          await capabilityGapsRepo.updateLevel({
+            id: gap.id,
+            new_level: decision.new_level,
+          });
+          total_changed++;
+          logger.info(
+            {
+              tenant_id: t.id,
+              gap_id: gap.id,
+              from: decision.current_level,
+              to: decision.new_level,
+              reason: decision.reason,
+            },
+            'gap_escalation.changed',
+          );
+          continue;
+        }
+
+        // mentionable → proposed: tenta o proposer primeiro, espera o resultado.
+        // Sonnet timeout/throw são absorvidos pelo runCognitiveModule (fallback=null)
+        // dentro do proposer; aqui só observamos { ok, reason } estruturado.
+        let proposeResult;
+        try {
+          proposeResult = await proposeCapabilityForGap({
+            gap: { ...gap, current_level: decision.new_level },
+          });
+        } catch (err) {
+          // Defesa adicional: mesmo que algo escape do runCognitiveModule,
+          // não queremos derrubar a iteração do worker (continua com próximo gap).
+          logger.error({ gap_id: gap.id, err }, 'gap_escalation.proposer_threw');
+          proposeResult = { ok: false as const, reason: 'parse_failed' as const };
+        }
+
+        if (!proposeResult.ok) {
+          // Sem artifact → não promove (gap permanece em mentionable e será
+          // re-tentado no próximo tick). Cooldown NÃO é debitado porque
+          // nenhuma proposal foi criada.
+          logger.warn(
+            { gap_id: gap.id, reason: proposeResult.reason },
+            'gap_escalation.proposal_failed',
+          );
+          continue;
+        }
+
+        // Sucesso — agora sim promove o gap (atomic w.r.t. o artifact: já existe
+        // a row em capability_proposals quando o nível vira proposed).
         await capabilityGapsRepo.updateLevel({
           id: gap.id,
           new_level: decision.new_level,
         });
         total_changed++;
+        total_proposed_triggered++;
 
         logger.info(
           {
@@ -92,31 +165,14 @@ export async function runGapEscalationMonitor(): Promise<void> {
           },
           'gap_escalation.changed',
         );
+        logger.info(
+          { proposal_id: proposeResult.proposal_id, gap_id: gap.id },
+          'gap_escalation.proposal_created',
+        );
 
-        if (decision.new_level === GapLevel.PROPOSED) {
-          // Fire-and-forget proposer — Sonnet pode demorar; o worker não bloqueia.
-          // Eventuais erros são logados mas não propagam para a iteração.
-          void proposeCapabilityForGap({
-            gap: { ...gap, current_level: decision.new_level },
-          })
-            .then((r) => {
-              if (r.ok) {
-                logger.info(
-                  { proposal_id: r.proposal_id, gap_id: gap.id },
-                  'gap_escalation.proposal_created',
-                );
-              } else {
-                logger.warn(
-                  { gap_id: gap.id, reason: r.reason },
-                  'gap_escalation.proposal_failed',
-                );
-              }
-            })
-            .catch((err) => {
-              logger.error({ gap_id: gap.id, err }, 'gap_escalation.proposer_threw');
-            });
-          total_proposed_triggered++;
-        }
+        // P87-C4 — debit local cooldown so demais mentionable gaps deste tick
+        // não atravessam a barreira proposed→proposed na mesma rodada.
+        daysSinceLastProposed = 0;
       }
     });
   }

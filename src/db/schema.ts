@@ -997,6 +997,13 @@ export const capability_proposals = pgTable(
     decision_reason: text('decision_reason'),
     delivered_at: timestamp('delivered_at', { withTimezone: true }),
     delivery_artifact_ref: text('delivery_artifact_ref'),
+    // P87-C3 — closed-loop test gate. Estes são populados pelo orchestrator
+    // `activateApprovedCapability` (capability-test-runner.ts), nunca pelo
+    // state-machine puro.
+    last_test_outcome: text('last_test_outcome'), // 'pass' | 'fail' | 'error' | null
+    last_test_at: timestamp('last_test_at', { withTimezone: true }),
+    reverted_at: timestamp('reverted_at', { withTimezone: true }),
+    revert_reason: text('revert_reason'),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },

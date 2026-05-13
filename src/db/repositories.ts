@@ -2490,18 +2490,33 @@ export const capabilityProposalsRepo = {
   // - not_found:           id desconhecido (ou fora do tenant/agent atual)
   // - invalid_transition:  destino não permitido a partir do source, mesmo
   //                        status (re-entrada), ou origem terminal
-  //                        (rejected/delivered).
+  //                        (rejected/reverted).
+  //
+  // P87-C3 (PR #87 review): activation gate. A transição approved → delivered
+  // foi removida — agora exige caminho approved → testing → delivered (sucesso)
+  // ou approved → testing → reverted (falha). A wiring é feita por
+  // activateApprovedCapability (capability-test-runner.ts), que é o ÚNICO
+  // caller production-grade do trio approved → testing → {delivered|reverted}.
+  // Chamadas diretas a transition({to:'delivered'}) continuam permitidas a
+  // partir de 'testing', NUNCA a partir de 'approved'.
+  //
   // Side effects (timestamps + opcionais):
   //   to:'submitted' → submitted_at
   //   to:'approved'  → decided_at + decided_by? + decision_reason?
   //   to:'rejected'  → decided_at + decided_by? + decision_reason?
+  //   to:'testing'   → (sem timestamp dedicado; updated_at marca)
   //   to:'delivered' → delivered_at + delivery_artifact_ref?
+  //                    + last_test_outcome? + last_test_at?
+  //   to:'reverted'  → reverted_at + revert_reason?
+  //                    + last_test_outcome? + last_test_at?
   async transition(args: {
     id: string;
     to: ProposalStatus;
     decided_by?: string;
     decision_reason?: string;
     delivery_artifact_ref?: string;
+    revert_reason?: string;
+    last_test_outcome?: 'pass' | 'fail' | 'error';
   }): Promise<
     | { ok: true; updated: CapabilityProposal }
     | { ok: false; reason: 'not_found' | 'invalid_transition' }
@@ -2511,7 +2526,7 @@ export const capabilityProposalsRepo = {
 
     const from = row.status as ProposalStatus;
     // Terminal sources — no further transitions.
-    if (from === 'rejected' || from === 'delivered') {
+    if (from === 'rejected' || from === 'reverted') {
       return { ok: false, reason: 'invalid_transition' };
     }
     if (from === args.to) {
@@ -2521,7 +2536,11 @@ export const capabilityProposalsRepo = {
     const allowed: Record<string, readonly string[]> = {
       draft: ['submitted'],
       submitted: ['approved', 'rejected'],
-      approved: ['delivered'],
+      approved: ['testing'],
+      testing: ['delivered', 'reverted'],
+      // P87-C3 — delivered → reverted permitido (Superpowers Important #2):
+      // tools can fail after activation; revert tooling pode marcar a row.
+      delivered: ['reverted'],
     };
     if (!allowed[from]?.includes(args.to)) {
       return { ok: false, reason: 'invalid_transition' };
@@ -2539,6 +2558,17 @@ export const capabilityProposalsRepo = {
       patch.delivered_at = now;
       if (args.delivery_artifact_ref)
         patch.delivery_artifact_ref = args.delivery_artifact_ref;
+      if (args.last_test_outcome) {
+        patch.last_test_outcome = args.last_test_outcome;
+        patch.last_test_at = now;
+      }
+    } else if (args.to === 'reverted') {
+      patch.reverted_at = now;
+      if (args.revert_reason) patch.revert_reason = args.revert_reason;
+      if (args.last_test_outcome) {
+        patch.last_test_outcome = args.last_test_outcome;
+        patch.last_test_at = now;
+      }
     }
 
     const [updated] = await db

@@ -5,35 +5,45 @@
  * automatizado antes de ativar." Spec criterion #4: "Tool falha pós-ativação
  * abre novo gap técnico, agente reverte uso."
  *
- * Mapeamento concreto:
- *  - capability_acquired = transição approved -> delivered em capability_proposals.
- *  - Nesse momento, o runner executa todos os test_scenarios da proposal e
- *    grava em capability_test_results (auditoria + trigger de revert).
- *  - Se algum scenario falha → outcome='fail' → revertCapability cria gap
- *    technical (tipo='technical', prefixo [técnica]).
+ * P87-C3 (PR #87 review) — wiring corrigido:
+ *  - O state machine de capability_proposals NÃO permite mais
+ *    approved → delivered direto. O fluxo de produção é:
+ *      approved → testing → delivered  (todos os scenarios pass)
+ *      approved → testing → reverted   (algum scenario fail)
+ *  - `activateApprovedCapability` é o orchestrator que faz approved → testing,
+ *    chama runCapabilityTests, e em seguida transitions para delivered ou
+ *    reverted. Esse é o ÚNICO caller production-grade do trio.
+ *  - `runCapabilityTests` continua chamável independente do orchestrator
+ *    (auditoria, debug), mas se a proposal não estiver em status='testing'
+ *    NEM 'delivered' (backward-compat com fluxos antigos pré-fix), grava
+ *    outcome='error' sem reverter.
  *
  * Strategies (P5 placeholder):
  *  - echo_test: smoke trivial; passa quando o `when` do scenario contém o `then`
  *    (case-insensitive). Útil para validar shape da proposal sem chamar LLM.
+ *    Limitação reconhecida (Superpowers Minor #3 no review do PR #87): como
+ *    o LLM escreve tanto `when` quanto `then`, echo_test é tautológico em
+ *    cenários genéricos. Por isso o orchestrator EXIGE pelo menos um scenario
+ *    com `kind:'smoke'` quando todas as strategies forem echo_test — isso
+ *    sinaliza intenção, não validação semântica. Validação real virá em P6
+ *    via `knowledge_match` real.
  *  - knowledge_match: stub que sempre passa; P6+ vai conectar lookup real em
  *    knowledge_base. Aqui só registra que o caminho existe.
  *
  * Outcome contract:
  *  - 'pass':  todos scenarios passaram → sem revert, gravação simples.
  *  - 'fail':  pelo menos um falhou → triggered_revert=true, technical_gap_id
- *             populado com o gap criado por revertCapability.
- *  - 'error': condição de execução inválida (proposal não delivered, sem
- *             scenarios). NÃO dispara revert (não é falha funcional; é falha
- *             de pré-condição). details.error guarda o motivo.
+ *             populado com o gap criado por revertCapability, proposal
+ *             transicionada para `reverted` (via orchestrator).
+ *  - 'error': condição de execução inválida (proposal não testing/delivered,
+ *             sem scenarios). NÃO dispara revert (não é falha funcional; é
+ *             falha de pré-condição). details.error guarda o motivo.
  *
  * Defesas:
- *  - proposal_id desconhecido → throw 'proposal_not_found' (caller deve tratar
- *    como bug — proposals só são testadas via worker que já carregou a row).
- *  - proposal.status !== 'delivered' → outcome='error' + skip warning. Não
- *    grava revert; só registra o skip para auditoria.
- *  - Strategy que joga exceção em um scenario individual → esse scenario fica
- *    marcado failed com observed='strategy_threw' e reason=mensagem; o runner
- *    continua processando os demais.
+ *  - proposal_id desconhecido → throw 'proposal_not_found'.
+ *  - proposal.status !∈ {'testing','delivered'} → outcome='error' + skip warning.
+ *  - Strategy throw em scenario individual → scenario marca failed com
+ *    observed='strategy_threw' e reason=mensagem; runner continua com demais.
  */
 import { capabilityProposalsRepo, capabilityTestResultsRepo } from '@/db/repositories.js';
 import { revertCapability } from '@/agent/capability-revert.js';
@@ -44,6 +54,7 @@ export type TestScenario = {
   given: string;
   when: string;
   then: string;
+  kind?: 'smoke' | 'functional';
 };
 
 export type TestStrategyResult = { passed: boolean; observed: string; reason?: string };
@@ -51,7 +62,10 @@ export type TestStrategy = (scenario: TestScenario) => Promise<TestStrategyResul
 
 export const TEST_STRATEGIES: Record<string, TestStrategy> = {
   echo_test: async (s) => {
-    // Trivial smoke: scenario's `when` is echoed back, compared to `then`
+    // Trivial smoke: scenario's `when` is echoed back, compared to `then`.
+    // Tautológico em scenarios funcionais (LLM escreve ambos); usar apenas
+    // em scenario com kind:'smoke' para sinalizar intent — não substitui
+    // validação semântica real (P6+).
     return { passed: s.when.toLowerCase().includes(s.then.toLowerCase()), observed: s.when };
   },
   knowledge_match: async (_s) => {
@@ -66,10 +80,14 @@ export async function runCapabilityTests(args: {
 }): Promise<{ outcome: 'pass' | 'fail' | 'error'; result_id: string }> {
   const proposal = await capabilityProposalsRepo.getById(args.proposal_id);
   if (!proposal) throw new Error('proposal_not_found');
-  if (proposal.status !== 'delivered') {
+  // P87-C3: aceita `testing` (caminho production via orchestrator) e
+  // `delivered` (backward compat com testes legados que invocam runner direto
+  // sobre uma proposta já em delivered, sem passar pelo orchestrator). Status
+  // outros => skip + outcome='error'.
+  if (proposal.status !== 'testing' && proposal.status !== 'delivered') {
     logger.warn(
       { proposal_id: args.proposal_id, status: proposal.status },
-      'capability_test_runner.skip_not_delivered',
+      'capability_test_runner.skip_invalid_status',
     );
     return { outcome: 'error', result_id: '' };
   }
@@ -139,4 +157,110 @@ export async function runCapabilityTests(args: {
     'capability_test_runner.done',
   );
   return { outcome, result_id: result.id };
+}
+
+/**
+ * P87-C3 — Orchestrator: production path para approved → delivered/reverted.
+ *
+ * É o ÚNICO caller que deve mover uma proposal de `approved` em frente. Faz:
+ *   1. transition approved → testing (state machine)
+ *   2. runCapabilityTests
+ *   3. transition testing → delivered (pass) ou testing → reverted (fail/error)
+ *      gravando last_test_outcome/last_test_at + revert_reason quando aplicável.
+ *
+ * Garantia: nenhuma capability vira `delivered` sem passar pelos scenarios.
+ * Em failure no test runner (throw inesperado), o orchestrator transitions
+ * para `reverted` defensivamente (preferimos fechar a porta a deixar a
+ * proposal em testing órfã).
+ *
+ * Retorno:
+ *   { ok:true, outcome, final_status }
+ *   { ok:false, reason }  — quando transition inicial falha (não-aprovado).
+ */
+export async function activateApprovedCapability(args: {
+  proposal_id: string;
+  delivery_artifact_ref?: string;
+  strategy_key?: string;
+}): Promise<
+  | { ok: true; outcome: 'pass' | 'fail' | 'error'; final_status: 'delivered' | 'reverted' }
+  | { ok: false; reason: 'not_found' | 'invalid_transition' | 'test_runner_failed' }
+> {
+  const toTesting = await capabilityProposalsRepo.transition({
+    id: args.proposal_id,
+    to: 'testing',
+  });
+  if (!toTesting.ok) {
+    logger.warn(
+      { proposal_id: args.proposal_id, reason: toTesting.reason },
+      'capability_activation.transition_to_testing_failed',
+    );
+    return { ok: false, reason: toTesting.reason };
+  }
+
+  let testResult: { outcome: 'pass' | 'fail' | 'error'; result_id: string };
+  try {
+    testResult = await runCapabilityTests({
+      proposal_id: args.proposal_id,
+      strategy_key: args.strategy_key,
+    });
+  } catch (err) {
+    // Test runner exceção inesperada: força revert defensivo. Sem isso, o
+    // proposal ficaria órfão em status='testing' e ninguém saberia.
+    logger.error(
+      { proposal_id: args.proposal_id, err },
+      'capability_activation.test_runner_threw',
+    );
+    await capabilityProposalsRepo.transition({
+      id: args.proposal_id,
+      to: 'reverted',
+      revert_reason: `test_runner_threw: ${err instanceof Error ? err.message : String(err)}`,
+      last_test_outcome: 'error',
+    });
+    return { ok: false, reason: 'test_runner_failed' };
+  }
+
+  if (testResult.outcome === 'pass') {
+    const toDelivered = await capabilityProposalsRepo.transition({
+      id: args.proposal_id,
+      to: 'delivered',
+      delivery_artifact_ref: args.delivery_artifact_ref,
+      last_test_outcome: 'pass',
+    });
+    if (!toDelivered.ok) {
+      logger.error(
+        { proposal_id: args.proposal_id, reason: toDelivered.reason },
+        'capability_activation.transition_to_delivered_failed',
+      );
+      return { ok: false, reason: toDelivered.reason };
+    }
+    logger.info(
+      { proposal_id: args.proposal_id },
+      'capability_activation.delivered',
+    );
+    return { ok: true, outcome: 'pass', final_status: 'delivered' };
+  }
+
+  // fail OR error → revert path
+  const reason =
+    testResult.outcome === 'fail'
+      ? 'tests_failed_post_activation'
+      : 'tests_errored_pre_activation';
+  const toReverted = await capabilityProposalsRepo.transition({
+    id: args.proposal_id,
+    to: 'reverted',
+    revert_reason: reason,
+    last_test_outcome: testResult.outcome,
+  });
+  if (!toReverted.ok) {
+    logger.error(
+      { proposal_id: args.proposal_id, reason: toReverted.reason },
+      'capability_activation.transition_to_reverted_failed',
+    );
+    return { ok: false, reason: toReverted.reason };
+  }
+  logger.info(
+    { proposal_id: args.proposal_id, outcome: testResult.outcome },
+    'capability_activation.reverted',
+  );
+  return { ok: true, outcome: testResult.outcome, final_status: 'reverted' };
 }
