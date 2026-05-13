@@ -1,4 +1,9 @@
-import type { CognitiveEventType, CandidateType } from '@/types/enums.js';
+// P83-C5: Use value imports (not `import type`). The constants below
+// are referenced in `typeof CognitiveEventType.X` / `typeof CandidateType.Y`
+// type expressions; while TypeScript currently resolves those through the
+// type binding, a future flip of `verbatimModuleSyntax` would erase the
+// import and break compilation. Value imports work in both cases.
+import { CognitiveEventType, CandidateType } from '@/types/enums.js';
 
 /** Evento que dispara reflexão. Discriminated union por type. */
 export type CognitiveEvent =

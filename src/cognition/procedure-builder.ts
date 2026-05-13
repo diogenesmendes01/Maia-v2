@@ -1,6 +1,10 @@
 import { z } from 'zod';
 import { callLLM } from '@/lib/claude.js';
+import { logger } from '@/lib/logger.js';
 import { runCognitiveModule } from './runner.js';
+
+/** Maximum length for descricao_livre input. Caps cost/abuse. (M4) */
+const MAX_DESCRICAO_LIVRE_LENGTH = 8000;
 
 const ProcedureDraftSchema = z.object({
   intencao: z.string(),
@@ -23,6 +27,12 @@ const ProcedureDraftSchema = z.object({
   tools_referenced: z.array(z.string()).optional(),
 });
 
+/**
+ * Schema for the LLM "soft-error" envelope. When the model decides input
+ * is incomprehensible, the prompt instructs it to emit {"error":"..."}.
+ */
+const ProcedureErrorEnvelopeSchema = z.object({ error: z.string() });
+
 export type ProcedureDraft = {
   nome: string;
   scope: 'global' | 'tenant' | 'agent' | 'role';
@@ -36,46 +46,171 @@ export type ProcedureDraft = {
   source: 'ensino' | 'observacao' | 'pratica' | 'platform_wisdom';
 };
 
+/**
+ * Typed result of a successful schema parse — the LLM emitted a valid
+ * procedure draft envelope.
+ */
+type BuilderOk = { ok: true; data: z.infer<typeof ProcedureDraftSchema> };
+
+/**
+ * Typed failure reasons surfaced by the builder. Per project north-star
+ * (governança/escopo/evidência), every ENSINO failure must produce a
+ * typed, auditable reason instead of a silent null. (C1)
+ */
+export type ProcedureBuilderFailureReason =
+  | 'input_too_long'
+  | 'llm_empty'
+  | 'no_json_envelope'
+  | 'llm_rejected'   // model returned {"error":"..."}
+  | 'invalid_json'   // could not JSON.parse
+  | 'invalid_schema' // JSON parsed but failed schema validation
+  | 'llm_call_failed';
+
+type BuilderFail = {
+  ok: false;
+  reason: ProcedureBuilderFailureReason;
+  detail?: string;
+};
+
+type BuilderResult = BuilderOk | BuilderFail;
+
+/**
+ * Discriminated union returned by teachProcedure. Callers MUST inspect
+ * `ok` before consuming the draft.
+ */
+export type TeachProcedureResult =
+  | { ok: true; draft: ProcedureDraft }
+  | BuilderFail;
+
+/**
+ * Modo ENSINO entry-point.
+ *
+ * @deprecated Prefer the discriminated-result form `teachProcedureSafe`,
+ *   which surfaces typed failure reasons for governance/audit. This
+ *   wrapper returns `null` on any failure (kept for callers that have
+ *   not migrated yet); the failure reason is still logged.
+ */
 export async function teachProcedure(input: {
   nome: string;
   descricao_livre: string;
   scope: 'global' | 'tenant' | 'agent' | 'role';
   source?: 'ensino' | 'observacao' | 'pratica' | 'platform_wisdom';
 }): Promise<ProcedureDraft | null> {
-  const result = await runCognitiveModule(
+  const result = await teachProcedureSafe(input);
+  return result.ok ? result.draft : null;
+}
+
+/**
+ * Discriminated-result form of `teachProcedure`. Returns a typed
+ * failure reason instead of a silent null. (C1)
+ */
+export async function teachProcedureSafe(input: {
+  nome: string;
+  descricao_livre: string;
+  scope: 'global' | 'tenant' | 'agent' | 'role';
+  source?: 'ensino' | 'observacao' | 'pratica' | 'platform_wisdom';
+}): Promise<TeachProcedureResult> {
+  // M4: bounded input.
+  if (input.descricao_livre.length > MAX_DESCRICAO_LIVRE_LENGTH) {
+    return {
+      ok: false,
+      reason: 'input_too_long',
+      detail: `descricao_livre length ${input.descricao_livre.length} exceeds cap ${MAX_DESCRICAO_LIVRE_LENGTH}`,
+    };
+  }
+
+  const result = await runCognitiveModule<BuilderResult>(
     { name: 'procedure-builder.ensino', triggered_by: 'sync_required', timeoutMs: 15000 },
     async () => {
-      const res = await callLLM({
-        system: builderPrompt(),
-        messages: [{ role: 'user', content: input.descricao_livre }],
-        max_tokens: 1500,
-        temperature: 0.0,
-      });
-      const text = (res.content ?? '').trim();
-      const match = text.match(/\{[\s\S]*\}/);
-      if (!match) return null;
+      let res;
       try {
-        const parsed = ProcedureDraftSchema.safeParse(JSON.parse(match[0]));
-        return parsed.success ? parsed.data : null;
-      } catch {
-        return null;
+        res = await callLLM({
+          system: builderPrompt(),
+          messages: [{ role: 'user', content: input.descricao_livre }],
+          max_tokens: 1500,
+          temperature: 0.0,
+        });
+      } catch (err) {
+        return {
+          ok: false,
+          reason: 'llm_call_failed',
+          detail: (err as Error).message,
+        } as BuilderFail;
       }
+
+      const text = (res.content ?? '').trim();
+      if (!text) return { ok: false, reason: 'llm_empty' };
+
+      const match = text.match(/\{[\s\S]*\}/);
+      if (!match) return { ok: false, reason: 'no_json_envelope' };
+
+      let parsedJson: unknown;
+      try {
+        parsedJson = JSON.parse(match[0]);
+      } catch (err) {
+        return {
+          ok: false,
+          reason: 'invalid_json',
+          detail: (err as Error).message,
+        };
+      }
+
+      // Detect the LLM "soft-error" envelope explicitly so callers can
+      // distinguish `{"error":"..."}` from a schema-shaped hallucination.
+      const errEnvelope = ProcedureErrorEnvelopeSchema.safeParse(parsedJson);
+      if (errEnvelope.success) {
+        return { ok: false, reason: 'llm_rejected', detail: errEnvelope.data.error };
+      }
+
+      const parsed = ProcedureDraftSchema.safeParse(parsedJson);
+      if (!parsed.success) {
+        return {
+          ok: false,
+          reason: 'invalid_schema',
+          detail: parsed.error.issues
+            .slice(0, 5)
+            .map((i) => `${i.path.join('.')}: ${i.message}`)
+            .join('; '),
+        };
+      }
+      return { ok: true, data: parsed.data };
     },
   );
 
-  if (!result.output) return null;
+  // runCognitiveModule swallows thrown errors and returns null. Treat a
+  // null output as a runtime-level failure so we still surface a typed
+  // reason instead of returning silently.
+  if (!result.output) {
+    return {
+      ok: false,
+      reason: 'llm_call_failed',
+      detail: result.status === 'timeout' ? 'timeout' : 'unknown',
+    };
+  }
 
+  if (result.output.ok === false) {
+    logger.warn(
+      { reason: result.output.reason, detail: result.output.detail, nome: input.nome },
+      'procedure_builder.failed',
+    );
+    return result.output;
+  }
+
+  const data = result.output.data;
   return {
-    nome: input.nome,
-    scope: input.scope,
-    intencao: result.output.intencao,
-    when_apply: result.output.when_apply,
-    when_not_apply: result.output.when_not_apply ?? {},
-    steps: result.output.steps as ProcedureDraft['steps'],
-    success_criteria: result.output.success_criteria as ProcedureDraft['success_criteria'],
-    failure_modes: result.output.failure_modes ?? [],
-    tools_referenced: result.output.tools_referenced ?? [],
-    source: input.source ?? 'ensino',
+    ok: true,
+    draft: {
+      nome: input.nome,
+      scope: input.scope,
+      intencao: data.intencao,
+      when_apply: data.when_apply,
+      when_not_apply: data.when_not_apply ?? {},
+      steps: data.steps as ProcedureDraft['steps'],
+      success_criteria: data.success_criteria as ProcedureDraft['success_criteria'],
+      failure_modes: data.failure_modes ?? [],
+      tools_referenced: data.tools_referenced ?? [],
+      source: input.source ?? 'ensino',
+    },
   };
 }
 

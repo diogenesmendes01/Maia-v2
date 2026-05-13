@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { teachProcedure } from '@/cognition/procedure-builder.js';
+import { teachProcedure, teachProcedureSafe } from '@/cognition/procedure-builder.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 
 vi.mock('@/lib/claude.js', () => ({
@@ -61,6 +61,88 @@ describe('teachProcedure', () => {
         scope: 'tenant',
       });
       expect(draft).toBeNull();
+    });
+  });
+
+  // PR #83 C1: teachProcedureSafe surfaces typed failure reasons instead
+  // of silent null. Each failure mode below must produce a distinct
+  // discriminated outcome that the caller can audit.
+  describe('teachProcedureSafe — typed failure reasons (C1)', () => {
+    it('llm_rejected: envelope {"error":"..."} is detected explicitly', async () => {
+      (callLLM as any).mockResolvedValueOnce({
+        content: JSON.stringify({ error: 'input vago — não entendi' }),
+      });
+      await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+        const res = await teachProcedureSafe({
+          nome: 'foo',
+          descricao_livre: 'ok',
+          scope: 'agent',
+        });
+        expect(res.ok).toBe(false);
+        if (!res.ok) {
+          expect(res.reason).toBe('llm_rejected');
+          expect(res.detail).toContain('vago');
+        }
+      });
+    });
+
+    it('invalid_json: malformed JSON envelope surfaces invalid_json reason', async () => {
+      // Has matching {...} braces so the regex extracts the block, but
+      // the inner content fails JSON.parse.
+      (callLLM as any).mockResolvedValueOnce({ content: '{ not json: yes }' });
+      await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+        const res = await teachProcedureSafe({
+          nome: 'foo',
+          descricao_livre: 'ok',
+          scope: 'agent',
+        });
+        expect(res.ok).toBe(false);
+        if (!res.ok) expect(res.reason).toBe('invalid_json');
+      });
+    });
+
+    it('no_json_envelope: text without a JSON block surfaces no_json_envelope', async () => {
+      (callLLM as any).mockResolvedValueOnce({ content: 'no json here at all' });
+      await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+        const res = await teachProcedureSafe({
+          nome: 'foo',
+          descricao_livre: 'ok',
+          scope: 'agent',
+        });
+        expect(res.ok).toBe(false);
+        if (!res.ok) expect(res.reason).toBe('no_json_envelope');
+      });
+    });
+
+    it('invalid_schema: parsable JSON missing required fields', async () => {
+      (callLLM as any).mockResolvedValueOnce({
+        content: JSON.stringify({ intencao: 'X' /* missing steps + success_criteria */ }),
+      });
+      await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+        const res = await teachProcedureSafe({
+          nome: 'foo',
+          descricao_livre: 'ok',
+          scope: 'agent',
+        });
+        expect(res.ok).toBe(false);
+        if (!res.ok) {
+          expect(res.reason).toBe('invalid_schema');
+          expect(res.detail).toBeDefined();
+        }
+      });
+    });
+
+    it('input_too_long: bounded by MAX_DESCRICAO_LIVRE_LENGTH (M4)', async () => {
+      const big = 'x'.repeat(8001);
+      await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+        const res = await teachProcedureSafe({
+          nome: 'foo',
+          descricao_livre: big,
+          scope: 'agent',
+        });
+        expect(res.ok).toBe(false);
+        if (!res.ok) expect(res.reason).toBe('input_too_long');
+      });
     });
   });
 
