@@ -1063,6 +1063,31 @@ export const channels = pgTable(
   }),
 );
 
+// P6: roles — modos operacionais por agent (comercial, suporte, default, etc).
+// Exatamente 1 default por (tenant, agent), garantido por partial unique index.
+// prompt_addendum entra no prompt quando o role estiver ativo.
+export const roles = pgTable(
+  'roles',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    role_key: text('role_key').notNull(),
+    display_name: text('display_name').notNull(),
+    description: text('description'),
+    prompt_addendum: text('prompt_addendum'),
+    active: boolean('active').notNull().default(true),
+    is_default: boolean('is_default').notNull().default(false),
+    metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    tenantAgentActiveIdx: index('roles_tenant_agent_active_idx').on(t.tenant_id, t.agent_id, t.active),
+    keyUq: uniqueIndex('roles_tenant_agent_key_uq').on(t.tenant_id, t.agent_id, t.role_key),
+  }),
+);
+
 export type Entidade = typeof entidades.$inferSelect;
 export type Pessoa = typeof pessoas.$inferSelect;
 export type Permissao = typeof permissoes.$inferSelect;
@@ -1117,3 +1142,5 @@ export type CapabilityTestResult = typeof capability_test_results.$inferSelect;
 export type NewCapabilityTestResult = typeof capability_test_results.$inferInsert;
 export type Channel = typeof channels.$inferSelect;
 export type NewChannel = typeof channels.$inferInsert;
+export type Role = typeof roles.$inferSelect;
+export type NewRole = typeof roles.$inferInsert;

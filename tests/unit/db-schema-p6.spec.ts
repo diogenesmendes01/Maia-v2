@@ -11,4 +11,13 @@ describe('P6 schema', () => {
     expect(cols).toContain('external_id');
     expect(cols).toContain('active');
   });
+  it('exports roles table', () => {
+    expect(schema.roles).toBeDefined();
+  });
+  it('roles has role_key + is_default + prompt_addendum', () => {
+    const cols = Object.keys(schema.roles);
+    expect(cols).toContain('role_key');
+    expect(cols).toContain('is_default');
+    expect(cols).toContain('prompt_addendum');
+  });
 });
