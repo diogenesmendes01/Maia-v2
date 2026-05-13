@@ -34,7 +34,7 @@ import { reflect } from '@/cognition/reflector.js';
 import { classify } from '@/cognition/classifier.js';
 import { persistCandidate } from '@/cognition/persister.js';
 import { recordSuccess } from '@/cognition/capability-tracker.js';
-import { selectProcedure } from '@/cognition/procedure-selector.js';
+import { selectProcedure, type SelectorDecision } from '@/cognition/procedure-selector.js';
 import { evaluateCurrentStep } from '@/cognition/step-evaluator.js';
 import * as procedureEngine from '@/procedures/engine.js';
 import { CognitiveEventType } from '@/types/enums.js';
@@ -44,6 +44,9 @@ import { runWithTenantContext } from '@/db/tenant-context.js';
 import { db } from '@/db/client.js';
 import { mensagens } from '@/db/schema.js';
 import { eq } from 'drizzle-orm';
+import { runNodes } from '@/cognitive-graph/orchestrator.js';
+import { buildPreturnNodes, type PreturnContext } from '@/cognitive-graph/preturn-graph.js';
+import { buildPostturnNodes } from '@/cognitive-graph/postturn-graph.js';
 
 const TYPING_DEBOUNCE_MS = 1500;
 
@@ -336,7 +339,17 @@ async function runAgentForMensagemInner(
   // parallel with response generation). Sees the post-aggregation
   // `inbound.conteudo` so signals across chunked turns are captured.
   // Errors are swallowed — reflection MUST never block the user-facing reply.
-  if (inbound.conteudo && detectSuccess(inbound.conteudo)) {
+  //
+  // P7 Task 8 — quando FEATURE_COGNITIVE_GRAPH ON, este trigger é executado
+  // pelo postturn-graph (mais abaixo) com semântica fire-and-forget equivalente.
+  // Shift de timing: legacy roda ANTES do ReAct, graph roda APÓS o ReAct. Ambos
+  // são fire-and-forget e não afetam o output user-facing — apenas a ordering
+  // de gravação em DB muda, aceitável por não-regressão de comportamento.
+  if (
+    !featureFlags.isEnabled(FeatureFlagName.COGNITIVE_GRAPH) &&
+    inbound.conteudo &&
+    detectSuccess(inbound.conteudo)
+  ) {
     const signal = inbound.conteudo;
     void (async () => {
       try {
@@ -402,130 +415,232 @@ async function runAgentForMensagemInner(
 
   const scope = await resolveScope(pessoa);
 
-  // P3b Task 9 — PRE-TURN selector:
-  // Resolve whether a procedure should be active for this turn. The
-  // selector consults the current active execution (if any) and the
-  // assigned procedures for this agent. Its decision (start/continue/
-  // switch/escalate/none) is recorded for auditability. If a new
-  // procedure should start, we kick off the execution BEFORE buildPrompt
-  // so the system prompt picks up the new procedure's first step.
+  // P3b Task 9 / P6 Task 9 / P7 Task 8 — PRE-TURN cognitive modules:
+  // resolve procedure-selector + role-selector (when MULTI_CHANNEL on).
   //
-  // Fully wrapped in try/catch — procedure runtime must never break the
-  // baseline ReAct turn. Failures here just leave `activeExecution=null`.
+  // Dual-path: quando FEATURE_COGNITIVE_GRAPH ON, orquestração é declarativa
+  // via `runNodes(buildPreturnNodes(...))`; OFF mantém path legacy intacto
+  // (try/catch ad-hoc por módulo). Side effects de DB (record decision,
+  // start/abort execution, etc.) acontecem APÓS o grafo retornar, lendo
+  // `result.nodes[name].output` — mantém paridade byte-por-byte com legacy.
+  //
+  // Procedure runtime nunca pode derrubar o baseline ReAct turn. Failures
+  // só deixam `activeExecution=null` / `activeRole=null`.
   let activeExecution: ProcedureExecution | null = null;
-  try {
-    activeExecution = await procedureExecutionsRepo.findActiveForConversa(c.id);
-    const selectorResult = await selectProcedure({
-      conversa_id: c.id,
-      current_message: inbound.conteudo ?? '',
-      current_execution: activeExecution
-        ? {
-            id: activeExecution.id,
-            definition_id: activeExecution.definition_id,
-            status: activeExecution.status,
-          }
-        : null,
-    });
+  let activeRole: Role | null = null;
 
-    await procedureSelectorDecisionsRepo
-      .record({
+  if (featureFlags.isEnabled(FeatureFlagName.COGNITIVE_GRAPH)) {
+    // P7 path — orquestração via grafo declarativo.
+    try {
+      activeExecution = await procedureExecutionsRepo.findActiveForConversa(c.id);
+      const role_inputs = await buildRoleInputs(channel_id);
+      const nodes = buildPreturnNodes({
+        multi_channel_on: featureFlags.isEnabled(FeatureFlagName.MULTI_CHANNEL),
+      });
+      const ctx: PreturnContext = {
         conversa_id: c.id,
         turno_id: inbound.id,
-        current_execution_id: activeExecution?.id ?? null,
-        candidates: selectorResult.candidates as unknown,
-        conflicts: selectorResult.conflicts as unknown,
-        decision: selectorResult.decision,
-        selected_procedure_id: selectorResult.selected_procedure_id ?? null,
-        decided_by: 'selector_llm',
-        reason: selectorResult.reason,
-      } as never)
-      .catch((err) =>
-        logger.warn(
-          { err: (err as Error).message },
-          'procedure.selector_decision.persist_failed',
-        ),
-      );
+        inbound_text: inbound.conteudo ?? '',
+        current_execution: activeExecution
+          ? {
+              id: activeExecution.id,
+              definition_id: activeExecution.definition_id,
+              status: activeExecution.status,
+            }
+          : null,
+        ...(role_inputs ? { role_inputs } : {}),
+      };
+      const result = await runNodes(nodes, ctx);
 
-    if (
-      selectorResult.decision === 'start' &&
-      selectorResult.selected_procedure_id
-    ) {
-      const def = await procedureDefinitionsRepo.findById(
-        selectorResult.selected_procedure_id,
-      );
-      if (def) {
-        const steps = def.steps as unknown as Array<{ id: string }>;
-        const firstStep = steps[0]?.id ?? null;
-        activeExecution = await procedureEngine.startExecution({
-          definition_id: def.id,
-          definition_version: def.version_number,
-          conversa_id: c.id,
-          first_step_id: firstStep,
-        });
-      }
-    } else if (
-      selectorResult.decision === 'switch' &&
-      selectorResult.selected_procedure_id &&
-      activeExecution
-    ) {
-      await procedureEngine.abortExecution({
-        execution_id: activeExecution.id,
-        reason: 'switched_by_selector',
-      });
-      const def = await procedureDefinitionsRepo.findById(
-        selectorResult.selected_procedure_id,
-      );
-      if (def) {
-        const steps = def.steps as unknown as Array<{ id: string }>;
-        const firstStep = steps[0]?.id ?? null;
-        activeExecution = await procedureEngine.startExecution({
-          definition_id: def.id,
-          definition_version: def.version_number,
-          conversa_id: c.id,
-          first_step_id: firstStep,
-        });
-      }
-    }
-    // 'continue', 'escalate', 'none' → no engine action here. continue
-    // keeps the existing activeExecution; escalate/none leave it null
-    // (or unchanged) and the turn proceeds without a procedure.
-  } catch (err) {
-    logger.warn(
-      { err: (err as Error).message, conversa_id: c.id },
-      'procedure.preturn.failed',
-    );
-  }
-
-  // P6 Task 9: Resolve active role for this turn — only when flag ON AND
-  // channel resolver returned a real channel_id. Failures degrade silently
-  // to "no role section in prompt" — role injection is non-essential.
-  let activeRole: Role | null = null;
-  if (featureFlags.isEnabled(FeatureFlagName.MULTI_CHANNEL) && channel_id) {
-    try {
-      const policy = await channelPoliciesRepo.getByChannelId(channel_id);
-      if (policy) {
-        const [availableRoles, currentRole] = await Promise.all([
-          rolesRepo.listActive(),
-          rolesRepo.getById(policy.default_role_id),
-        ]);
-        if (currentRole && availableRoles.length > 0) {
-          const result = await selectRole({
-            inbound_text: inbound.conteudo ?? '',
-            current_role: currentRole,
-            available_roles: availableRoles,
-            policy,
+      // Side effects POST-graph — mesma semântica do path legacy.
+      const selectorOutput = result.nodes['procedure-selector']?.output as
+        | SelectorDecision
+        | null;
+      if (selectorOutput) {
+        await procedureSelectorDecisionsRepo
+          .record({
             conversa_id: c.id,
-            channel_id,
             turno_id: inbound.id,
+            current_execution_id: activeExecution?.id ?? null,
+            candidates: selectorOutput.candidates as unknown,
+            conflicts: selectorOutput.conflicts as unknown,
+            decision: selectorOutput.decision,
+            selected_procedure_id: selectorOutput.selected_procedure_id ?? null,
+            decided_by: 'selector_llm',
+            reason: selectorOutput.reason,
+          } as never)
+          .catch((err) =>
+            logger.warn(
+              { err: (err as Error).message },
+              'procedure.selector_decision.persist_failed',
+            ),
+          );
+
+        if (
+          selectorOutput.decision === 'start' &&
+          selectorOutput.selected_procedure_id
+        ) {
+          const def = await procedureDefinitionsRepo.findById(
+            selectorOutput.selected_procedure_id,
+          );
+          if (def) {
+            const steps = def.steps as unknown as Array<{ id: string }>;
+            activeExecution = await procedureEngine.startExecution({
+              definition_id: def.id,
+              definition_version: def.version_number,
+              conversa_id: c.id,
+              first_step_id: steps[0]?.id ?? null,
+            });
+          }
+        } else if (
+          selectorOutput.decision === 'switch' &&
+          selectorOutput.selected_procedure_id &&
+          activeExecution
+        ) {
+          await procedureEngine.abortExecution({
+            execution_id: activeExecution.id,
+            reason: 'switched_by_selector',
           });
-          activeRole = result.decided_role;
+          const def = await procedureDefinitionsRepo.findById(
+            selectorOutput.selected_procedure_id,
+          );
+          if (def) {
+            const steps = def.steps as unknown as Array<{ id: string }>;
+            activeExecution = await procedureEngine.startExecution({
+              definition_id: def.id,
+              definition_version: def.version_number,
+              conversa_id: c.id,
+              first_step_id: steps[0]?.id ?? null,
+            });
+          }
         }
       }
+
+      const roleResult = result.nodes['role-selector']?.output as
+        | { decided_role: Role }
+        | null;
+      if (roleResult) activeRole = roleResult.decided_role;
     } catch (err) {
       logger.warn(
-        { channel_id, err: (err as Error).message },
-        'agent.role_selection_failed_continuing_without_role',
+        { err: (err as Error).message, conversa_id: c.id },
+        'preturn.graph_failed',
       );
+    }
+  } else {
+    // LEGACY path (P0..P6) — intacto. NÃO REMOVER.
+    try {
+      activeExecution = await procedureExecutionsRepo.findActiveForConversa(c.id);
+      const selectorResult = await selectProcedure({
+        conversa_id: c.id,
+        current_message: inbound.conteudo ?? '',
+        current_execution: activeExecution
+          ? {
+              id: activeExecution.id,
+              definition_id: activeExecution.definition_id,
+              status: activeExecution.status,
+            }
+          : null,
+      });
+
+      await procedureSelectorDecisionsRepo
+        .record({
+          conversa_id: c.id,
+          turno_id: inbound.id,
+          current_execution_id: activeExecution?.id ?? null,
+          candidates: selectorResult.candidates as unknown,
+          conflicts: selectorResult.conflicts as unknown,
+          decision: selectorResult.decision,
+          selected_procedure_id: selectorResult.selected_procedure_id ?? null,
+          decided_by: 'selector_llm',
+          reason: selectorResult.reason,
+        } as never)
+        .catch((err) =>
+          logger.warn(
+            { err: (err as Error).message },
+            'procedure.selector_decision.persist_failed',
+          ),
+        );
+
+      if (
+        selectorResult.decision === 'start' &&
+        selectorResult.selected_procedure_id
+      ) {
+        const def = await procedureDefinitionsRepo.findById(
+          selectorResult.selected_procedure_id,
+        );
+        if (def) {
+          const steps = def.steps as unknown as Array<{ id: string }>;
+          const firstStep = steps[0]?.id ?? null;
+          activeExecution = await procedureEngine.startExecution({
+            definition_id: def.id,
+            definition_version: def.version_number,
+            conversa_id: c.id,
+            first_step_id: firstStep,
+          });
+        }
+      } else if (
+        selectorResult.decision === 'switch' &&
+        selectorResult.selected_procedure_id &&
+        activeExecution
+      ) {
+        await procedureEngine.abortExecution({
+          execution_id: activeExecution.id,
+          reason: 'switched_by_selector',
+        });
+        const def = await procedureDefinitionsRepo.findById(
+          selectorResult.selected_procedure_id,
+        );
+        if (def) {
+          const steps = def.steps as unknown as Array<{ id: string }>;
+          const firstStep = steps[0]?.id ?? null;
+          activeExecution = await procedureEngine.startExecution({
+            definition_id: def.id,
+            definition_version: def.version_number,
+            conversa_id: c.id,
+            first_step_id: firstStep,
+          });
+        }
+      }
+      // 'continue', 'escalate', 'none' → no engine action here. continue
+      // keeps the existing activeExecution; escalate/none leave it null
+      // (or unchanged) and the turn proceeds without a procedure.
+    } catch (err) {
+      logger.warn(
+        { err: (err as Error).message, conversa_id: c.id },
+        'procedure.preturn.failed',
+      );
+    }
+
+    // P6 Task 9: Resolve active role for this turn — only when flag ON AND
+    // channel resolver returned a real channel_id. Failures degrade silently
+    // to "no role section in prompt" — role injection is non-essential.
+    if (featureFlags.isEnabled(FeatureFlagName.MULTI_CHANNEL) && channel_id) {
+      try {
+        const policy = await channelPoliciesRepo.getByChannelId(channel_id);
+        if (policy) {
+          const [availableRoles, currentRole] = await Promise.all([
+            rolesRepo.listActive(),
+            rolesRepo.getById(policy.default_role_id),
+          ]);
+          if (currentRole && availableRoles.length > 0) {
+            const result = await selectRole({
+              inbound_text: inbound.conteudo ?? '',
+              current_role: currentRole,
+              available_roles: availableRoles,
+              policy,
+              conversa_id: c.id,
+              channel_id,
+              turno_id: inbound.id,
+            });
+            activeRole = result.decided_role;
+          }
+        }
+      } catch (err) {
+        logger.warn(
+          { channel_id, err: (err as Error).message },
+          'agent.role_selection_failed_continuing_without_role',
+        );
+      }
     }
   }
 
@@ -572,68 +687,124 @@ async function runAgentForMensagemInner(
   await conversasRepo.touch(c.id);
   await clearDebounceState(pessoa.telefone_whatsapp);
 
-  // P3b Task 9 — POST-TURN evaluator (fire-and-forget):
-  // If a procedure execution is active, re-load it (state may have
-  // mutated mid-turn) and evaluate the current step's success criteria
-  // against this turn's outbound text + tool results. If the step is
-  // complete, advance to the next step or complete the execution.
-  // Errors are swallowed — procedure runtime must NEVER block the
-  // user-facing reply or post-turn cleanup.
-  if (activeExecution) {
-    const execId = activeExecution.id;
-    const responseContext = {
+  // P3b/P7 — POST-TURN cognitive modules (fire-and-forget):
+  // step-evaluator + correction-reflection + success-reflection.
+  //
+  // Dual-path: quando FEATURE_COGNITIVE_GRAPH ON, todos os 3 triggers
+  // rodam dentro do postturn-graph (camada ASYNC). OFF mantém legacy
+  // intacto. Critério: errors NUNCA bloqueiam ack do turn.
+  if (featureFlags.isEnabled(FeatureFlagName.COGNITIVE_GRAPH)) {
+    // P7 path — fire-and-forget via runNodes (postturn nodes são ASYNC).
+    // Inclui step-evaluator + correction-reflection + success-reflection.
+    void runNodes(buildPostturnNodes(), {
+      conversa_id: c.id,
+      turno_id: inbound.id,
+      pessoa,
+      conversa: c,
+      inbound,
       response_text: reactOutboundText,
       tools_called: reactToolsCalled,
-      // P3c Task 5: user_signal critério lê o inbound textual do turn.
-      // Pós-aggregation (debounce merge) — inbound.conteudo já está mesclado.
-      user_message: inbound.conteudo ?? '',
-    };
-    void (async () => {
-      try {
-        const exec = await procedureExecutionsRepo.findById(execId);
-        if (!exec || exec.status !== 'in_progress') return;
-        const def = await procedureDefinitionsRepo.findById(exec.definition_id);
-        if (!def) return;
+      active_execution_id: activeExecution?.id ?? null,
+    }).catch((err) =>
+      logger.warn({ err: (err as Error).message }, 'agent.postturn_graph_failed'),
+    );
+  } else {
+    // LEGACY post-turn — intacto.
+    // P3b Task 9 — POST-TURN evaluator (fire-and-forget):
+    // If a procedure execution is active, re-load it (state may have
+    // mutated mid-turn) and evaluate the current step's success criteria
+    // against this turn's outbound text + tool results. If the step is
+    // complete, advance to the next step or complete the execution.
+    // Errors are swallowed — procedure runtime must NEVER block the
+    // user-facing reply or post-turn cleanup.
+    if (activeExecution) {
+      const execId = activeExecution.id;
+      const responseContext = {
+        response_text: reactOutboundText,
+        tools_called: reactToolsCalled,
+        // P3c Task 5: user_signal critério lê o inbound textual do turn.
+        // Pós-aggregation (debounce merge) — inbound.conteudo já está mesclado.
+        user_message: inbound.conteudo ?? '',
+      };
+      void (async () => {
+        try {
+          const exec = await procedureExecutionsRepo.findById(execId);
+          if (!exec || exec.status !== 'in_progress') return;
+          const def = await procedureDefinitionsRepo.findById(exec.definition_id);
+          if (!def) return;
 
-        const evalResult = await evaluateCurrentStep({
-          execution: exec,
-          definition: def,
-          response_context: responseContext,
-        });
+          const evalResult = await evaluateCurrentStep({
+            execution: exec,
+            definition: def,
+            response_context: responseContext,
+          });
 
-        if (!evalResult.step_completed) return;
-        if (evalResult.next_step_id) {
-          await procedureEngine.advanceStep({
-            execution_id: exec.id,
-            next_step_id: evalResult.next_step_id,
-            completed_step_id: exec.current_step_id!,
-          });
-        } else {
-          await procedureEngine.completeExecution({
-            execution_id: exec.id,
-            outcome: 'success',
-          });
+          if (!evalResult.step_completed) return;
+          if (evalResult.next_step_id) {
+            await procedureEngine.advanceStep({
+              execution_id: exec.id,
+              next_step_id: evalResult.next_step_id,
+              completed_step_id: exec.current_step_id!,
+            });
+          } else {
+            await procedureEngine.completeExecution({
+              execution_id: exec.id,
+              outcome: 'success',
+            });
+          }
+        } catch (err) {
+          logger.warn(
+            { err: (err as Error).message, execId },
+            'procedure.postturn.failed',
+          );
         }
-      } catch (err) {
-        logger.warn(
-          { err: (err as Error).message, execId },
-          'procedure.postturn.failed',
-        );
-      }
-    })();
-  }
-
-  // Reflection trigger: correction detection (real-time)
-  if (inbound.conteudo && detectCorrection(inbound.conteudo)) {
-    const prev = await findPreviousAssistantMessage(c.id, inbound.id);
-    if (prev) {
-      await reflectOnCorrection({
-        pessoa,
-        conversa: c,
-        inbound,
-        previousAssistant: prev,
-      });
+      })();
     }
+
+    // Reflection trigger: correction detection (real-time)
+    if (inbound.conteudo && detectCorrection(inbound.conteudo)) {
+      const prev = await findPreviousAssistantMessage(c.id, inbound.id);
+      if (prev) {
+        await reflectOnCorrection({
+          pessoa,
+          conversa: c,
+          inbound,
+          previousAssistant: prev,
+        });
+      }
+    }
+  }
+}
+
+/**
+ * P7 Task 8 — helper file-local para montar `role_inputs` do PreturnContext.
+ *
+ * Mirror do bloco legacy de role-selection: só retorna inputs quando
+ * MULTI_CHANNEL on E channel_id presente E policy + roles disponíveis.
+ * Caso contrário retorna undefined, e o node role-selector é omitido do
+ * grafo (`buildPreturnNodes(multi_channel_on: false)`) ou skipado via
+ * `runWhen=ctx.role_inputs !== undefined`.
+ */
+async function buildRoleInputs(
+  channel_id: string | null,
+): Promise<PreturnContext['role_inputs']> {
+  if (!channel_id) return undefined;
+  if (!featureFlags.isEnabled(FeatureFlagName.MULTI_CHANNEL)) return undefined;
+  try {
+    const policy = await channelPoliciesRepo.getByChannelId(channel_id);
+    if (!policy) return undefined;
+    const [availableRoles, currentRole] = await Promise.all([
+      rolesRepo.listActive(),
+      rolesRepo.getById(policy.default_role_id),
+    ]);
+    if (!currentRole || availableRoles.length === 0) return undefined;
+    return { current_role: currentRole, available_roles: availableRoles, policy, channel_id };
+  } catch (err) {
+    logger.warn(
+      { channel_id, err: (err as Error).message },
+      'preturn.role_inputs_build_failed',
+    );
+    return undefined;
   }
 }
 
