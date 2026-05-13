@@ -1,6 +1,6 @@
 # Runbook — P7 Grafo Cognitivo Formal
 
-> Como operar, debugar e dar rollback rapido na camada de orquestracao via grafo cognitivo declarativo. P7 formaliza modulos cognitivos como descriptors (runWhen, timeoutMs, fallback, model, version), fecha a lacuna de cobertura de auditoria (100% das chamadas LLM emitem row em `cognitive_module_log`) e instrumenta p95 do sync path.
+> Como operar, debugar e dar rollback rapido na camada de orquestracao via grafo cognitivo declarativo. P7 formaliza modulos cognitivos como descriptors (runWhen, timeoutMs, fallback, model, version), fecha a lacuna de cobertura de auditoria (todo modulo cognitivo emite row em `cognitive_module_log` — ver "Escopo de 100% audit coverage" em Limitacoes) e instrumenta p95 do sync path.
 
 ## O que e P7
 
@@ -211,6 +211,8 @@ Gate fala qual arquivo falhou (lista offenders).
 - **Golden test simplificado** — Option B (smoke + audit invariant), nao snapshot 1:1 do outbound text. Defesa principal de nao-regressao e o dual-path manter codigo legacy intacto + monitoring p95.
 - **Gate 6 skip-friendly** — sem baseline pre-P7 medido, gate passa. Recomendacao: medir baseline antes do flip global (`SYNC_LATENCY_P95_BASELINE_MS` no `.env` da CI).
 - **Sem migration nova** — P7 reusa `cognitive_module_log` (migration 008 do P0). Nao ha rollback de schema; rollback eh apenas flag OFF + revert do branch.
+- **Escopo de "100% audit coverage"** — significa "todo modulo cognitivo (catalogo §8.1) emite >= 1 row por execucao". Modulos compostos (drift detectors) auditam no nivel do **orchestrator** (`drift_detector_<type>`), nao na chamada LLM interna — auditoria nested. Infra nao-cognitiva (image OCR em `src/lib/vision.ts`, embeddings, tokenizers) NAO emite row em `cognitive_module_log` por design. Grep gate cobre apenas o helper `callLLM`; chamadas SDK diretas em modulos ja envelopados em nivel superior nao sao bypass.
+- **Shift de cobertura de success-reflection com flag ON** — no path legacy, success-reflection roda **antes** do rate-limit/pending-gate, entao mesmo turns que terminam em warn/resolved geram reflexao. No path do grafo (postturn), o trigger so dispara apos a resposta — turns bloqueados por rate-limit ou resolvidos no pending-gate **nao geram success-reflection**. Trade-off aceitavel (reflexao nao e user-facing), mas operadores que monitoram volume de reflection devem esperar uma queda observavel apos o flip. Para restaurar paridade exata, mover o trigger legacy para dentro dos branches de early-return em PR de follow-up.
 
 ## Rollback
 
