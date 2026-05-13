@@ -15,4 +15,15 @@ describe('P4 schema', () => {
     expect(cols).toContain('proposed_by');
     expect(cols).toContain('rollback_reason');
   });
+  it('exports agent_drift_alerts table', () => {
+    expect(schema.agent_drift_alerts).toBeDefined();
+  });
+  it('drift alerts has drift_type, severity, decision, evidence', () => {
+    const cols = Object.keys(schema.agent_drift_alerts);
+    expect(cols).toContain('drift_type');
+    expect(cols).toContain('severity');
+    expect(cols).toContain('decision');
+    expect(cols).toContain('evidence');
+    expect(cols).toContain('profile_version_id');
+  });
 });
