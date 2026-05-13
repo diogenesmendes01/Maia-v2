@@ -39,7 +39,12 @@ export type NodeRunResult<TOut> = {
 
 /** Resultado do grafo inteiro (uma layer ou o pipeline todo). */
 export type GraphRunResult = {
-  /** Soma dos latencies dos nodes (não wall-clock para layer paralela). */
+  /**
+   * Wall-clock total da execução de `runNodes` (do entry até o return),
+   * em ms. Para a camada SYNC_CONDITIONAL paralela isto é dominado pelo
+   * node mais lento, não pela soma — é o tempo *percebido* pelo caller,
+   * que é o que importa pra budget de latência p95.
+   */
   total_latency_ms: number;
   /** Outputs indexados por `descriptor.name`. */
   nodes: Record<string, NodeRunResult<unknown>>;
