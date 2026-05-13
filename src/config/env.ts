@@ -149,6 +149,15 @@ const envSchema = z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
+    // P7 — grafo cognitivo formal (orquestração declarativa de módulos)
+    FEATURE_COGNITIVE_GRAPH: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
+    /** Baseline pré-P7 em ms para p95 do sync path. Se ausente, gate skipa. */
+    SYNC_LATENCY_P95_BASELINE_MS: z.coerce.number().int().positive().optional(),
+    /** Percentual extra permitido sobre baseline (default 20). */
+    SYNC_LATENCY_P95_BUDGET_PERCENT: z.coerce.number().int().nonnegative().default(20),
     // Message debounce: hold incoming text messages from the same user for a
     // short window so chunked typing ("Oi, " / "como está " / "a finança?")
     // arrives at the LLM as a single coherent turn. Off by default — when on,
