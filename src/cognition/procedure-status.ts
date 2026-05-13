@@ -1,5 +1,5 @@
-import { procedureDefinitionsRepo } from '@/db/repositories.js';
-import type { ProcedureDefinition } from '@/db/schema.js';
+import { procedureDefinitionsRepo, procedureTestsRepo } from '@/db/repositories.js';
+import type { ProcedureDefinition, ProcedureTest } from '@/db/schema.js';
 
 export type ProcedureStatus = 'draft' | 'proposed' | 'active' | 'frozen' | 'rolled_back';
 
@@ -24,16 +24,56 @@ export function validateTransition(from: string, to: string): void {
 }
 
 /**
+ * Result of an attempted transition.
+ *
+ * `ok: true` ⇒ the transition was performed.
+ * `ok: false` ⇒ the transition was rejected by a gate (e.g. P3c test gate)
+ * with a structured `reason`. Hard schema-level invariants (invalid
+ * source→target combinations) still throw via `validateTransition` — those
+ * are programming errors, not governance decisions.
+ */
+export type TransitionResult =
+  | { ok: true; definition: ProcedureDefinition }
+  | {
+      ok: false;
+      reason: 'tests_required';
+      missing_tests: true;
+    }
+  | {
+      ok: false;
+      reason: 'tests_not_passing';
+      failing_tests: ProcedureTest[];
+    };
+
+/**
  * Async helper that applies a transition AND, if going to 'active',
  * deactivates the previous active version of the same nome.
- * Returns the updated definition.
+ *
+ * P3c gate: `proposed → active` requires at least 1 procedure_test row
+ * for the definition AND every row must have last_run_status='pass'.
+ * The gate fires ONLY on `proposed → active`; other transitions
+ * (draft→proposed, active→frozen, frozen→active, …) bypass it. Existing
+ * `active` definitions are unaffected — they never re-enter `proposed`,
+ * so the gate cannot retroactively block them.
  */
 export async function transitionProcedureStatus(args: {
   definition: ProcedureDefinition;
   to: ProcedureStatus;
   actor: string;
-}): Promise<void> {
+}): Promise<TransitionResult> {
   validateTransition(args.definition.status, args.to);
+
+  // P3c gate: proposed → active requires green tests.
+  if (args.definition.status === 'proposed' && args.to === 'active') {
+    const tests = await procedureTestsRepo.listByDefinition(args.definition.id);
+    if (tests.length === 0) {
+      return { ok: false, reason: 'tests_required', missing_tests: true };
+    }
+    const failing = tests.filter((t) => t.last_run_status !== 'pass');
+    if (failing.length > 0) {
+      return { ok: false, reason: 'tests_not_passing', failing_tests: failing };
+    }
+  }
 
   const now = new Date();
   const updates: Record<string, unknown> = { status: args.to };
@@ -58,5 +98,13 @@ export async function transitionProcedureStatus(args: {
     updates.deactivated_at = now;
   }
 
-  await procedureDefinitionsRepo.updateStatus(args.definition.id, updates as Parameters<typeof procedureDefinitionsRepo.updateStatus>[1]);
+  await procedureDefinitionsRepo.updateStatus(
+    args.definition.id,
+    updates as Parameters<typeof procedureDefinitionsRepo.updateStatus>[1],
+  );
+
+  return {
+    ok: true,
+    definition: { ...args.definition, ...(updates as Partial<ProcedureDefinition>) },
+  };
 }

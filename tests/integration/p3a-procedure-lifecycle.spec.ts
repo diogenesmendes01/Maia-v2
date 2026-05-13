@@ -4,6 +4,9 @@ import { transitionProcedureStatus, canTransition } from '@/cognition/procedure-
 
 // In-memory state for mocked repo. Acts as the procedure_definitions table.
 const state: Record<string, any> = {};
+// P3c: in-memory backing store for procedure_tests so the test gate
+// (proposed → active) sees seeded fixtures.
+const testsState: Record<string, any> = {};
 
 vi.mock('@/db/repositories.js', async () => {
   const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
@@ -37,6 +40,50 @@ vi.mock('@/db/repositories.js', async () => {
           .sort((a: any, b: any) => b.version_number - a.version_number),
       ),
     },
+    procedureTestsRepo: {
+      create: vi.fn(async (input: any) => {
+        const id = `test-${Math.random().toString(36).slice(2)}`;
+        const row = {
+          id,
+          tenant_id: 'default',
+          agent_id: 'default',
+          last_run_at: null,
+          last_run_status: null,
+          last_run_details: null,
+          created_at: new Date(),
+          updated_at: new Date(),
+          description: null,
+          expected_step_path: null,
+          ...input,
+        };
+        testsState[id] = row;
+        return row;
+      }),
+      listByDefinition: vi.fn(async (definition_id: string) =>
+        Object.values(testsState).filter((t: any) => t.definition_id === definition_id),
+      ),
+      recordRun: vi.fn(async (args: { id: string; status: string; details: unknown }) => {
+        if (testsState[args.id]) {
+          testsState[args.id] = {
+            ...testsState[args.id],
+            last_run_at: new Date(),
+            last_run_status: args.status,
+            last_run_details: args.details,
+            updated_at: new Date(),
+          };
+        }
+      }),
+      allPassFor: vi.fn(async (definition_id: string) => {
+        const tests = Object.values(testsState).filter(
+          (t: any) => t.definition_id === definition_id,
+        );
+        if (tests.length === 0) return false;
+        return tests.every((t: any) => t.last_run_status === 'pass');
+      }),
+      delete: vi.fn(async (id: string) => {
+        delete testsState[id];
+      }),
+    },
     cognitiveModuleLogRepo: {
       record: vi.fn(async () => {}),
       recentByModule: vi.fn(async () => []),
@@ -44,9 +91,24 @@ vi.mock('@/db/repositories.js', async () => {
   };
 });
 
+// P3c helper: seed a passing procedure_test for a definition so the
+// `proposed → active` gate is satisfied. Returns the test id.
+async function seedPassingTest(definition_id: string) {
+  const { procedureTestsRepo } = await import('@/db/repositories.js');
+  const row = await procedureTestsRepo.create({
+    definition_id,
+    name: 'happy-path',
+    scenario: {},
+    expected_outcome: 'success',
+  });
+  await procedureTestsRepo.recordRun({ id: row.id, status: 'pass', details: {} });
+  return row.id;
+}
+
 describe('P3a procedure lifecycle integration', () => {
   beforeEach(() => {
     for (const k of Object.keys(state)) delete state[k];
+    for (const k of Object.keys(testsState)) delete testsState[k];
     vi.clearAllMocks();
   });
 
@@ -99,12 +161,16 @@ describe('P3a procedure lifecycle integration', () => {
         expect(state[def.id].status).toBe('proposed');
         expect(state[def.id].proposed_by).toBe('owner-1');
 
+        // P3c: gate requires >=1 passing procedure_test before proposed → active
+        await seedPassingTest(def.id);
+
         const proposed = state[def.id];
-        await transitionProcedureStatus({
+        const result = await transitionProcedureStatus({
           definition: proposed,
           to: 'active',
           actor: 'owner-1',
         });
+        expect(result.ok).toBe(true);
         expect(state[def.id].status).toBe('active');
         expect(state[def.id].approved_by).toBe('owner-1');
         expect(state[def.id].activated_at).toBeDefined();
@@ -148,7 +214,15 @@ describe('P3a procedure lifecycle integration', () => {
           source: 'ensino',
         } as any);
 
-        await transitionProcedureStatus({ definition: v2, to: 'active', actor: 'owner-2' });
+        // P3c: gate requires >=1 passing procedure_test on v2 before promotion
+        await seedPassingTest(v2.id);
+
+        const result = await transitionProcedureStatus({
+          definition: v2,
+          to: 'active',
+          actor: 'owner-2',
+        });
+        expect(result.ok).toBe(true);
         expect(state[v2.id].status).toBe('active');
         // v1 should be deactivated (frozen)
         expect(state[v1.id].status).toBe('frozen');
