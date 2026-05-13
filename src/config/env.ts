@@ -134,6 +134,11 @@ const envSchema = z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
+    // P4 — identidade operacional v2 (perfil versionado + drift detector)
+    FEATURE_OPERATIONAL_PROFILE_V2: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
     // Message debounce: hold incoming text messages from the same user for a
     // short window so chunked typing ("Oi, " / "como está " / "a finança?")
     // arrives at the LLM as a single coherent turn. Off by default — when on,
