@@ -10,6 +10,8 @@ import {
   behavioralHintRepo,
   capabilitiesSkillRepo,
   capabilityGapsRepo,
+  procedureExecutionsRepo,
+  procedureDefinitionsRepo,
 } from '@/db/repositories.js';
 import type { Pessoa, Conversa, Mensagem, BehavioralHint } from '@/db/schema.js';
 import type { ResolvedPermission } from '@/governance/permissions.js';
@@ -131,6 +133,7 @@ export async function buildPrompt(ctx: PromptContext): Promise<{ system: string;
   let memorySection = '';
   let hintsSection = '';
   let selfAwarenessSection = '';
+  let procedureSection = '';
 
   try {
     const memoryEntries = (await memoryEntryRepo?.findRelevant?.({
@@ -221,6 +224,51 @@ export async function buildPrompt(ctx: PromptContext): Promise<{ system: string;
     // Degrade gracefully.
   }
 
+  // P3b Task 8: if there's an active procedure_execution for this conversa,
+  // surface it in the system prompt so the model can follow the step's
+  // intencao/como/sucesso/armadilhas instead of improvising. Wrapped in
+  // try/catch so missing repos in tests or any DB failure leave the prompt
+  // intact — procedure runtime is non-essential to the baseline turn.
+  try {
+    if (ctx.conversa?.id) {
+      const activeExec = await procedureExecutionsRepo?.findActiveForConversa?.(
+        ctx.conversa.id,
+      );
+      if (activeExec) {
+        const def = await procedureDefinitionsRepo?.findById?.(activeExec.definition_id);
+        if (def && activeExec.current_step_id) {
+          const steps = def.steps as unknown as Array<{
+            id: string;
+            intencao?: string;
+            como?: string;
+            sucesso_criteria_ref?: string;
+            armadilhas?: string[];
+          }>;
+          const criteria = def.success_criteria as unknown as Array<{
+            id: string;
+            type?: string;
+          }>;
+          const currentStep = steps.find((s) => s.id === activeExec.current_step_id);
+          if (currentStep) {
+            const matchingCriterion = currentStep.sucesso_criteria_ref
+              ? criteria.find((c) => c.id === currentStep.sucesso_criteria_ref)
+              : null;
+            const stateJson = JSON.stringify(activeExec.execution_state, null, 2);
+            procedureSection = `\n## Procedimento em execução
+Você está executando "${def.nome}" v${def.version_number}, passo atual: "${currentStep.id}".
+Intenção do passo: ${currentStep.intencao ?? 'não especificada'}.
+Como executar: ${currentStep.como ?? 'não especificado'}.${matchingCriterion ? `\nCritério de sucesso (${matchingCriterion.type}).` : ''}${currentStep.armadilhas?.length ? `\nArmadilhas comuns: ${currentStep.armadilhas.join('; ')}.` : ''}
+
+Estado coletado:
+${stateJson}`;
+          }
+        }
+      }
+    }
+  } catch {
+    // Degrade gracefully — procedure runtime must not break baseline prompt.
+  }
+
   const system = [
     self?.system_prompt ?? 'Você é a Maia.',
     '',
@@ -254,7 +302,8 @@ export async function buildPrompt(ctx: PromptContext): Promise<{ system: string;
   ].join('\n')
     + memorySection
     + hintsSection
-    + selfAwarenessSection;
+    + selfAwarenessSection
+    + procedureSection;
 
   // Build conversation messages: oldest first
   const ordered = [...recent].reverse();
