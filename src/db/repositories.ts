@@ -1758,12 +1758,48 @@ export const procedureExecutionsRepo = {
       .where(eq(procedure_executions.id, id));
   },
 
+  // P3c — PR #85 fix P85-I1. Tx-variant used by the reaper so that the
+  // status update is atomic with the auto_abandoned event INSERT. Without
+  // this, a process crash between the event-write and the status-write
+  // produces a duplicate auto_abandoned event on the next reaper tick
+  // (audit-trail corruption).
+  async updateStateTx(
+    tx: typeof db,
+    id: string,
+    updates: Partial<{
+      current_step_id: string;
+      execution_state: any;
+      completed_steps: any;
+      last_activity_at: Date;
+      status: string;
+      outcome: string;
+      ended_at: Date;
+      notes: string;
+    }>,
+  ): Promise<void> {
+    await tx
+      .update(procedure_executions)
+      .set({ ...updates, last_activity_at: new Date() } as any)
+      .where(eq(procedure_executions.id, id));
+  },
+
   // P3c Task 9 — reaper helper. Retorna execuções do tenant atual ainda em
   // status='in_progress' cuja last_activity_at < now() - ttl_days. Workers
   // chamam dentro de runWithTenantContext para isolar por tenant.
-  async listStaleInProgress(opts: { ttl_days: number }): Promise<ProcedureExecution[]> {
+  //
+  // PR #85 fix P85-I6: cap result size with `limit` (default 1000) to keep
+  // the per-tick cost bounded. After a long outage this prevents one cron
+  // tick from grinding through tens of thousands of stale rows in a single
+  // sequential pass and overlapping with the next tick. Reaper is
+  // idempotent across runs (combined with P85-I1's transactional write),
+  // so the leftover backlog drains on subsequent ticks.
+  async listStaleInProgress(opts: {
+    ttl_days: number;
+    limit?: number;
+  }): Promise<ProcedureExecution[]> {
     const tenant_id = getCurrentTenant();
     const cutoff = new Date(Date.now() - opts.ttl_days * 86_400_000);
+    const cap = opts.limit ?? 1000;
     return db
       .select()
       .from(procedure_executions)
@@ -1773,7 +1809,8 @@ export const procedureExecutionsRepo = {
           eq(procedure_executions.status, 'in_progress'),
           lt(procedure_executions.last_activity_at, cutoff),
         ),
-      );
+      )
+      .limit(cap);
   },
 };
 
@@ -1785,8 +1822,12 @@ export const procedureExecutionEventsRepo = {
     await db.insert(procedure_execution_events).values(guarded as any);
   },
 
-  // P84-C5: transaction-aware variant. Lets the engine commit
-  // recordEvent+updateState atomically inside withTx().
+  // P84-C5 / P3c fix P85-I1: transaction-aware variant. Lets the engine
+  // commit recordEvent+updateState atomically inside withTx(), and lets the
+  // reaper atomically pair the audit-event INSERT with the
+  // procedure-execution UPDATE. The applyTenantGuard call still binds
+  // tenant/agent from AsyncLocalStorage so tenant isolation is preserved
+  // across the transaction boundary.
   async recordTx(
     tx: typeof db,
     input: Omit<ProcedureExecutionEvent, 'id' | 'created_at' | 'tenant_id' | 'agent_id'>,

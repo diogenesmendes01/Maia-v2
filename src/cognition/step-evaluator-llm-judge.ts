@@ -35,7 +35,27 @@ const FALLBACK_RESULT: LLMJudgeResult = {
   reasoning: 'judge_timeout_or_error',
 };
 
+// PR #85 fix P85-I5 — distinct reasoning when the deploy is misconfigured
+// (no ANTHROPIC_API_KEY). Without this branch, every `llm_judge` criterion
+// silently fails with `judge_timeout_or_error`, indistinguishable from the
+// judge legitimately scoring the response low. Ops needs a signal that
+// the failure is configuration-class, not content-class — distinct
+// reasoning shows up in `cognitive_module_log` so the audit trail
+// differentiates the two.
+const MISSING_API_KEY_RESULT: LLMJudgeResult = {
+  passed: false,
+  score: 0,
+  reasoning: 'judge_missing_api_key',
+};
+
 export async function judgeStepCriterion(input: LLMJudgeInput): Promise<LLMJudgeResult> {
+  // Short-circuit BEFORE calling runCognitiveModule so the missing-key
+  // result is exposed as the module output (and therefore audited as such)
+  // rather than degrading into the generic timeout/error fallback path.
+  if (!config.ANTHROPIC_API_KEY || config.ANTHROPIC_API_KEY.length === 0) {
+    return { ...MISSING_API_KEY_RESULT };
+  }
+
   const result = await runCognitiveModule<LLMJudgeResult>(
     {
       name: 'step_evaluator_llm_judge',
