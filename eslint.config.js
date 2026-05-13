@@ -58,6 +58,12 @@ const TS_RULES = {
 
   // Disable base no-unused-vars in favour of the TS-aware version
   'no-unused-vars': 'off',
+  // Same story for no-redeclare: the base rule trips on the
+  // `export const Foo = {...}` + `export type Foo = ...` enum-shaped
+  // objects we use in src/types/enums.ts. The TS-aware variant
+  // understands the namespace merge and skips the false positive.
+  'no-redeclare': 'off',
+  '@typescript-eslint/no-redeclare': 'warn',
   '@typescript-eslint/no-unused-vars': [
     'warn',
     {

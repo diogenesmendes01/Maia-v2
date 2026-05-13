@@ -600,7 +600,16 @@ export const factsRepo = {
       .insert(agent_facts)
       .values(guarded)
       .onConflictDoUpdate({
-        target: [agent_facts.escopo, agent_facts.chave],
+        // PR #82 review (Codex): conflict target must match the
+        // (tenant_id, agent_id, escopo, chave) unique introduced in
+        // migration 018 — otherwise tenant B can overwrite tenant A's
+        // fact by colliding on (escopo, chave).
+        target: [
+          agent_facts.tenant_id,
+          agent_facts.agent_id,
+          agent_facts.escopo,
+          agent_facts.chave,
+        ],
         set: {
           valor: input.valor as object,
           fonte: input.fonte,
@@ -624,6 +633,46 @@ export const factsRepo = {
           inArray(agent_facts.escopo, escopos),
         ),
       );
+  },
+  /**
+   * PR #82 review (Superpowers Critical #1): the legacy factsBlock in the
+   * system prompt was rendering every agent_fact unfiltered, bypassing the
+   * memory_entry sensitivity/mention_allowed model. This method returns
+   * only facts whose content has either (a) no corresponding memory_entry
+   * row yet (e.g. classifier hasn't run, or the fact predates P2) or
+   * (b) has a memory_entry that is needs_review=false AND mention_allowed=
+   * true. Sensitive/personal facts whose memory_entry says do-not-mention
+   * are dropped from the prompt.
+   *
+   * The match is by literal `content` against `valor->>'content'`. Persister
+   * writes valor as `{ content, subject_id }`, so the join is stable for
+   * P2-era facts. Facts predating P2 (no memory_entry row) are shown — a
+   * conservative default for migration-window legacy data, since migration
+   * 017 explicitly seeds these as needs_review=true memory entries that
+   * the reclassifier will eventually re-evaluate.
+   */
+  async listMentionableForScopes(escopos: string[]): Promise<AgentFact[]> {
+    if (escopos.length === 0) return [];
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const result = await db.execute<AgentFact>(sql`
+      SELECT af.*
+      FROM agent_facts af
+      WHERE af.tenant_id = ${tenant_id}
+        AND af.agent_id = ${agent_id}
+        AND af.escopo = ANY(${escopos})
+        AND NOT EXISTS (
+          SELECT 1 FROM memory_entry me
+          WHERE me.tenant_id = af.tenant_id
+            AND me.agent_id = af.agent_id
+            AND me.content = (af.valor->>'content')
+            AND (
+              me.needs_review = true
+              OR me.mention_allowed = false
+            )
+        )
+    `);
+    return Array.from(result.rows as unknown as AgentFact[]);
   },
 };
 
@@ -1182,17 +1231,26 @@ export const memoryEntryRepo = {
   async findRelevant(opts: {
     interlocutor_id?: string;
     role_id?: string;
+    channel_id?: string;
     conversa_id?: string;
     limit?: number;
   }): Promise<MemoryEntry[]> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
+    const now = new Date();
     const conds = [
       eq(memory_entry.tenant_id, tenant_id),
       eq(memory_entry.agent_id, agent_id),
       eq(memory_entry.needs_review, false),
+      // PR #82 review (Codex medium + Superpowers Critical #2): TTL must
+      // be enforced at query time. Entries past expires_at MUST NOT be
+      // returned to the prompt builder. NULL expires_at = no TTL.
+      or(isNull(memory_entry.expires_at), gt(memory_entry.expires_at, now)),
     ];
-    // Filtrar por scope_type + subject_id apropriado
+    // Filtrar por scope_type + subject_id apropriado. PR #82 review
+    // (Superpowers Critical #4): role/channel devem só ser incluídos
+    // quando o caller passar o subject id correspondente — senão a
+    // memória escopada por role/channel atravessa todas as fronteiras.
     const orConds = [];
     if (opts.interlocutor_id) {
       orConds.push(
@@ -1205,6 +1263,14 @@ export const memoryEntryRepo = {
     if (opts.role_id) {
       orConds.push(
         and(eq(memory_entry.scope_type, 'role'), eq(memory_entry.subject_id, opts.role_id)),
+      );
+    }
+    if (opts.channel_id) {
+      orConds.push(
+        and(
+          eq(memory_entry.scope_type, 'channel'),
+          eq(memory_entry.subject_id, opts.channel_id),
+        ),
       );
     }
     if (opts.conversa_id) {
@@ -1237,9 +1303,17 @@ export const memoryEntryRepo = {
       subject_id?: string;
     },
   ): Promise<void> {
+    // PR #82 review (Superpowers Critical #3): when promoting a candidate
+    // out of needs_review, compute expires_at from ttl_days so that the
+    // TTL filter in findRelevant can actually evict the row. Without this
+    // a sensitive memory with ttl_days=7 was kept indefinitely.
+    const expires_at =
+      updates.ttl_days != null
+        ? new Date(Date.now() + updates.ttl_days * 24 * 60 * 60 * 1000)
+        : null;
     await db
       .update(memory_entry)
-      .set({ ...updates, needs_review: false, updated_at: new Date() })
+      .set({ ...updates, expires_at, needs_review: false, updated_at: new Date() })
       .where(eq(memory_entry.id, id));
   },
 

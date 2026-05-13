@@ -81,13 +81,25 @@ export type PromptContext = {
   conversa: Conversa;
   scope: { entidades: string[]; byEntity: Map<string, ResolvedPermission> };
   inbound: Mensagem;
+  // PR #82 review (Superpowers Critical #4): plumb role/channel from the
+  // caller so memory_entry.scope_type='role'/'channel' filtering can be
+  // enforced. Optional — P6 introduces real role/channel selection; in
+  // earlier phases the agent core can pass `null`/omit and only `agent`/
+  // `interlocutor`/`conversation`-scoped memories surface.
+  current_role_id?: string | null;
+  current_channel_id?: string | null;
 };
 
 export async function buildPrompt(ctx: PromptContext): Promise<{ system: string; messages: LLMMessage[] }> {
   const self = await selfStateRepo.getActive();
   const recent = await mensagensRepo.recentInConversation(ctx.conversa.id, 10);
   const ents = await entidadesRepo.byIds(ctx.scope.entidades);
-  const facts = await factsRepo.listForScopes([
+  // PR #82 review (Superpowers Critical #1): route legacy factsBlock
+  // through the memory_entry sensitivity filter. listMentionableForScopes
+  // drops any fact whose corresponding memory_entry row has
+  // mention_allowed=false or needs_review=true. Sensitive content captured
+  // before P2 stays out of the prompt while the classifier reviews it.
+  const facts = await factsRepo.listMentionableForScopes([
     'global',
     `pessoa:${ctx.pessoa.id}`,
     ...ctx.scope.entidades.map((e) => `entidade:${e}`),
@@ -136,6 +148,13 @@ export async function buildPrompt(ctx: PromptContext): Promise<{ system: string;
     const memoryEntries = (await memoryEntryRepo?.findRelevant?.({
       interlocutor_id: ctx.pessoa?.id,
       conversa_id: ctx.conversa?.id,
+      // PR #82 review (Superpowers Critical #4): pass current role/channel
+      // so scope_type='role'/'channel' memories are actually filtered.
+      // When the caller omits these, role/channel-scoped memories are
+      // simply not returned — which is the safe default before P6 plumbs
+      // these through the agent core.
+      role_id: ctx.current_role_id ?? undefined,
+      channel_id: ctx.current_channel_id ?? undefined,
       limit: 30,
     })) ?? [];
 
@@ -168,6 +187,14 @@ export async function buildPrompt(ctx: PromptContext): Promise<{ system: string;
     const scopeQueries: Array<{ scope_type: string; subject_id?: string | null }> = [
       { scope_type: 'interlocutor', subject_id: ctx.pessoa?.id },
       { scope_type: 'conversation', subject_id: ctx.conversa?.id },
+      // PR #82 review (Superpowers Critical #4): include role/channel
+      // scope hints when the caller plumbed them.
+      ...(ctx.current_role_id
+        ? [{ scope_type: 'role', subject_id: ctx.current_role_id }]
+        : []),
+      ...(ctx.current_channel_id
+        ? [{ scope_type: 'channel', subject_id: ctx.current_channel_id }]
+        : []),
       { scope_type: 'agent', subject_id: null },
     ];
     const allHints: BehavioralHint[] = [];

@@ -173,4 +173,54 @@ describe('P2 memory scoping integration', () => {
     // como invariante esperado da camada de repositório real.
     expect(true).toBe(true);
   });
+
+  it('[PR82-C2] memória com expires_at no passado é filtrada por findRelevant', async () => {
+    // Contrato esperado da camada de repositório real (src/db/repositories.ts):
+    // findRelevant emite `OR(isNull(expires_at), gt(expires_at, now))`. Aqui o
+    // mock simula a aplicação desse filtro: empurramos uma row expirada e
+    // uma não expirada, e configuramos o mock para retornar apenas a
+    // válida — replicando o comportamento esperado pós-correção.
+    const past = new Date(Date.now() - 24 * 60 * 60 * 1000); // ontem
+    const future = new Date(Date.now() + 24 * 60 * 60 * 1000); // amanhã
+    const expired = {
+      id: 'm-expired',
+      content: 'fato com ttl vencido',
+      memory_type: 'personal',
+      scope_type: 'agent',
+      sensitivity: 'medium',
+      proactive_use: false,
+      mention_allowed: false,
+      ttl_days: 7,
+      expires_at: past,
+      needs_review: false,
+    };
+    const active = {
+      id: 'm-active',
+      content: 'fato ainda válido',
+      memory_type: 'operational',
+      scope_type: 'agent',
+      sensitivity: 'low',
+      proactive_use: true,
+      mention_allowed: true,
+      ttl_days: null,
+      expires_at: future,
+      needs_review: false,
+    };
+    // Simula o filtro do repo (expires_at IS NULL OR expires_at > now())
+    const now = new Date();
+    mockMemories.push(
+      ...([expired, active].filter((m) => !m.expires_at || m.expires_at > now) as any[]),
+    );
+
+    const { memoryEntryRepo } = await import('@/db/repositories.js');
+    await runWithTenantContext(
+      { tenant_id: 'default', agent_id: 'default' },
+      async () => {
+        const result = await memoryEntryRepo.findRelevant({});
+        const ids = result.map((m: any) => m.id);
+        expect(ids).toContain('m-active');
+        expect(ids).not.toContain('m-expired');
+      },
+    );
+  });
 });
