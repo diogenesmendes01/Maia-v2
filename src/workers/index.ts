@@ -20,6 +20,7 @@ import { runConfidenceRecompute } from './confidence-recompute.js';
 import { runProcedureCandidateConsumer } from './procedure-candidate-consumer.js';
 import { runProcedureExecutionReaper } from './procedure-execution-reaper.js';
 import { runProcedureMetricsRefresh } from './procedure-metrics-refresh.js';
+import { runDriftMonitor } from './drift-monitor.js';
 import { tickEngine } from '@/workflows/engine.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 
@@ -64,6 +65,8 @@ export const JOBS: Job[] = [
   { name: 'briefing_morning', cron: '0 8 * * *', fn: runMorningBriefing, phase: 4 },
   { name: 'briefing_evening', cron: '0 21 * * *', fn: runEveningBriefing, phase: 4 },
   { name: 'briefing_weekly', cron: '0 8 * * 1', fn: runWeeklyBriefing, phase: 4 },
+  // P4 Task 10 — drift monitor semanal (domingo 03:00 BRT).
+  { name: 'drift_monitor', cron: '0 3 * * 0', fn: runDriftMonitor, phase: 4 },
 ];
 
 const tasks: cron.ScheduledTask[] = [];
