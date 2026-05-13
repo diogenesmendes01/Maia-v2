@@ -11,4 +11,7 @@ describe('P3c schema', () => {
     expect(cols).toContain('expected_outcome');
     expect(cols).toContain('definition_id');
   });
+  it('exports procedure_metrics view', () => {
+    expect(schema.procedure_metrics).toBeDefined();
+  });
 });
