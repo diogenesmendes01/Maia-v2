@@ -21,7 +21,7 @@ import { renderOperationalProfile, type RenderedProfile } from '@/identity/profi
 import { fmtBR } from '@/lib/brazilian.js';
 import type { LLMMessage } from '@/lib/claude.js';
 import { logger } from '@/lib/logger.js';
-import { FeatureFlagName } from '@/types/enums.js';
+import { FeatureFlagName, GapLevel } from '@/types/enums.js';
 import { sanitizeBlock } from './sanitize.js';
 
 const LLM_BOUNDARIES = `
@@ -89,6 +89,32 @@ export type PromptContext = {
   scope: { entidades: string[]; byEntity: Map<string, ResolvedPermission> };
   inbound: Mensagem;
 };
+
+/**
+ * P5 Task 10 — injeta no system prompt as lacunas em nível `mentionable` ou
+ * `proposed` para que o agente possa, com transparência, explicar limitações
+ * quando o usuário tocar nos temas.
+ *
+ * Regras:
+ * - Flag `DIALOGICAL_ACQUISITION` desliga totalmente a seção.
+ * - Gaps em nível `silent`/`dashboard` NUNCA entram aqui — silent é invisível
+ *   por design (gate #7) e dashboard fica restrito ao painel do owner.
+ * - Limita a 5 gaps para evitar token bloat; gaps `proposed` recebem sufixo
+ *   indicando que já há proposta de melhoria registrada.
+ * - Retorna null quando não há nada a injetar (chamador omite a seção).
+ */
+async function buildGapMentionSection(): Promise<string | null> {
+  if (!featureFlags.isEnabled(FeatureFlagName.DIALOGICAL_ACQUISITION)) return null;
+  const gaps =
+    (await capabilityGapsRepo?.listByLevels?.([GapLevel.MENTIONABLE, GapLevel.PROPOSED])) ?? [];
+  if (gaps.length === 0) return null;
+  const lines = gaps.slice(0, 5).map((g) => {
+    const proposedSuffix =
+      g.current_level === GapLevel.PROPOSED ? ' (proposta de melhoria já enviada)' : '';
+    return `- Se o usuário perguntar sobre ${g.capability_description}, você pode explicar honestamente que isso é uma limitação atual${proposedSuffix}.`;
+  });
+  return `## Limitações conhecidas (mencionar com transparência se vier à tona)\n${lines.join('\n')}`;
+}
 
 export async function buildPrompt(ctx: PromptContext): Promise<{ system: string; messages: LLMMessage[] }> {
   // P4 Task 7: dual-read.
@@ -178,6 +204,7 @@ export async function buildPrompt(ctx: PromptContext): Promise<{ system: string;
   let hintsSection = '';
   let selfAwarenessSection = '';
   let procedureSection = '';
+  let gapMentionSection = '';
 
   try {
     const memoryEntries = (await memoryEntryRepo?.findRelevant?.({
@@ -313,6 +340,17 @@ ${stateJson}`;
     // Degrade gracefully — procedure runtime must not break baseline prompt.
   }
 
+  // P5 Task 10: surface gaps em nível mentionable/proposed para que o agente
+  // possa ser transparente sobre limitações conhecidas se vierem à tona.
+  // Flag-gated (DIALOGICAL_ACQUISITION). Tolerante a falhas: qualquer erro
+  // de repo degrada para "sem seção" sem quebrar o prompt.
+  try {
+    const section = await buildGapMentionSection();
+    if (section) gapMentionSection = '\n' + section;
+  } catch {
+    // Degrade gracefully — gap mention é não-essencial ao turno.
+  }
+
   const system = [
     systemPromptBody || 'Você é a Maia.',
     '',
@@ -348,6 +386,7 @@ ${stateJson}`;
     + hintsSection
     + selfAwarenessSection
     + procedureSection
+    + gapMentionSection
     + (renderedV2?.growth_hints_block ? '\n' + renderedV2.growth_hints_block : '')
     + (renderedV2?.episodic_summary_block ? '\n' + renderedV2.episodic_summary_block : '');
 
