@@ -21,6 +21,15 @@ const tenantsState: Array<{ id: string; nome: string; status: string }> = [];
 const executionsState: Record<string, any> = {};
 const eventsLog: any[] = [];
 
+// PR #85 fix P85-I1 — reaper now wraps event+status in withTx. Mock it as
+// a passthrough so the existing repo mocks (which mutate in-memory state)
+// continue to drive assertions. Real DB tx behaviour is covered by
+// integration tests; here we just verify the worker still emits the
+// expected logical writes.
+vi.mock('@/db/client.js', () => ({
+  withTx: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})),
+}));
+
 vi.mock('@/db/repositories.js', async () => {
   const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
     '@/db/repositories.js',
@@ -33,13 +42,13 @@ vi.mock('@/db/repositories.js', async () => {
       create: vi.fn(),
     },
     procedureExecutionsRepo: {
-      listStaleInProgress: vi.fn(async (opts: { ttl_days: number }) => {
+      listStaleInProgress: vi.fn(async (opts: { ttl_days: number; limit?: number }) => {
         // Read current tenant from context — the worker MUST set tenant context
         // via runWithTenantContext before calling this.
         const { getCurrentTenant } = await import('@/db/tenant-context.js');
         const tenant_id = getCurrentTenant();
         const cutoff = Date.now() - opts.ttl_days * 86_400_000;
-        return Object.values(executionsState).filter((ex: any) => {
+        const all = Object.values(executionsState).filter((ex: any) => {
           if (ex.tenant_id !== tenant_id) return false;
           if (ex.status !== 'in_progress') return false;
           const lastTs =
@@ -48,8 +57,21 @@ vi.mock('@/db/repositories.js', async () => {
               : new Date(ex.last_activity_at).getTime();
           return lastTs < cutoff;
         });
+        // Honour the worker's batch limit (P85-I6).
+        return typeof opts.limit === 'number' ? all.slice(0, opts.limit) : all;
       }),
       updateState: vi.fn(async (id: string, updates: any) => {
+        if (executionsState[id]) {
+          executionsState[id] = {
+            ...executionsState[id],
+            ...updates,
+            last_activity_at: new Date(),
+          };
+        }
+      }),
+      // Tx-variant used by the post-fix reaper. Same semantics as updateState
+      // in this in-memory mock — the real implementation forwards through tx.
+      updateStateTx: vi.fn(async (_tx: unknown, id: string, updates: any) => {
         if (executionsState[id]) {
           executionsState[id] = {
             ...executionsState[id],
@@ -61,6 +83,10 @@ vi.mock('@/db/repositories.js', async () => {
     },
     procedureExecutionEventsRepo: {
       record: vi.fn(async (input: any) => {
+        eventsLog.push({ ...input, created_at: new Date() });
+      }),
+      // Tx-variant used by the post-fix reaper.
+      recordTx: vi.fn(async (_tx: unknown, input: any) => {
         eventsLog.push({ ...input, created_at: new Date() });
       }),
     },

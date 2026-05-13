@@ -37,6 +37,16 @@ vi.mock('@anthropic-ai/sdk', () => {
   return { default: Anthropic };
 });
 
+// ---------- db/client mock (PR #85 fix P85-I1: reaper uses withTx) ----------
+// Passthrough — repo mocks below provide the tx-variants, so the closure
+// runs the same in-memory mutations without actually opening a pg
+// connection. Real transactional semantics are implicitly covered by the
+// repo-pair behaviour in the integration scenario.
+vi.mock('@/db/client.js', () => ({
+  withTx: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})),
+  db: {},
+}));
+
 // ---------- repositories mock ----------
 vi.mock('@/db/repositories.js', async () => {
   const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
@@ -137,12 +147,22 @@ vi.mock('@/db/repositories.js', async () => {
           };
         }
       }),
-      listStaleInProgress: vi.fn(async (opts: { ttl_days: number }) => {
+      // Tx-variant: PR #85 fix P85-I1 routes reaper writes through withTx.
+      updateStateTx: vi.fn(async (_tx: unknown, id: string, updates: any) => {
+        if (execState[id]) {
+          execState[id] = {
+            ...execState[id],
+            ...updates,
+            last_activity_at: new Date(),
+          };
+        }
+      }),
+      listStaleInProgress: vi.fn(async (opts: { ttl_days: number; limit?: number }) => {
         // Reaper sets tenant context per iteration; honour it.
         const { getCurrentTenant } = await import('@/db/tenant-context.js');
         const tenant_id = getCurrentTenant();
         const cutoff = Date.now() - opts.ttl_days * 86_400_000;
-        return Object.values(execState).filter((ex: any) => {
+        const all = Object.values(execState).filter((ex: any) => {
           if (ex.tenant_id !== tenant_id) return false;
           if (ex.status !== 'in_progress') return false;
           const lastTs =
@@ -151,10 +171,16 @@ vi.mock('@/db/repositories.js', async () => {
               : new Date(ex.last_activity_at).getTime();
           return lastTs < cutoff;
         });
+        // Honour the worker's batch limit (PR #85 fix P85-I6).
+        return typeof opts.limit === 'number' ? all.slice(0, opts.limit) : all;
       }),
     },
     procedureExecutionEventsRepo: {
       record: vi.fn(async (input: any) => {
+        events.push({ ...input, created_at: input.created_at ?? new Date() });
+      }),
+      // Tx-variant: PR #85 fix P85-I1 routes reaper writes through withTx.
+      recordTx: vi.fn(async (_tx: unknown, input: any) => {
         events.push({ ...input, created_at: input.created_at ?? new Date() });
       }),
       listByExecution: vi.fn(async (execution_id: string) =>

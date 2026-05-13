@@ -31,12 +31,30 @@ vi.mock('../../src/lib/logger.js', () => ({
   logger: loggerMock,
 }));
 
+// PR #85 fix P85-I4 — worker now emits a `system_health_events` row per
+// run. Mock the repo to capture calls without touching the DB.
+const healthRecordMock = vi.fn(async () => {});
+vi.mock('../../src/db/repositories.js', async () => {
+  const actual = await vi.importActual<typeof import('../../src/db/repositories.js')>(
+    '../../src/db/repositories.js',
+  );
+  return {
+    ...actual,
+    healthRepo: {
+      record: healthRecordMock,
+      lastForComponent: vi.fn(async () => null),
+    },
+  };
+});
+
 beforeEach(() => {
   dbExecuteMock.mockReset();
   loggerMock.info.mockReset();
   loggerMock.warn.mockReset();
   loggerMock.error.mockReset();
   loggerMock.debug.mockReset();
+  healthRecordMock.mockReset();
+  healthRecordMock.mockResolvedValue(undefined);
 });
 
 describe('runProcedureMetricsRefresh', () => {
@@ -78,5 +96,64 @@ describe('runProcedureMetricsRefresh', () => {
     expect(msg).toBe('procedure_metrics_refresh.failed');
     expect(ctx.err).toBe(boom);
     expect(loggerMock.info).not.toHaveBeenCalled();
+  });
+
+  // PR #85 fix P85-I4 — observability: each refresh emits a health row so
+  // DLQ-monitor / dashboards can alert when refresh is stale.
+  it('happy path: emite system_health_events row com status=ok e duration_ms', async () => {
+    dbExecuteMock.mockResolvedValueOnce(undefined);
+
+    const { runProcedureMetricsRefresh } = await import(
+      '../../src/workers/procedure-metrics-refresh.js'
+    );
+    await runProcedureMetricsRefresh();
+
+    expect(healthRecordMock).toHaveBeenCalledTimes(1);
+    const arg = healthRecordMock.mock.calls[0]![0] as {
+      component: string;
+      status: string;
+      duration_ms: number;
+    };
+    expect(arg.component).toBe('procedure_metrics_refresh');
+    expect(arg.status).toBe('ok');
+    expect(typeof arg.duration_ms).toBe('number');
+  });
+
+  it('failure path: emite system_health_events row com status=down e error', async () => {
+    const boom = new Error('matview deadlocked');
+    dbExecuteMock.mockRejectedValueOnce(boom);
+
+    const { runProcedureMetricsRefresh } = await import(
+      '../../src/workers/procedure-metrics-refresh.js'
+    );
+    await expect(runProcedureMetricsRefresh()).rejects.toThrow('matview deadlocked');
+
+    expect(healthRecordMock).toHaveBeenCalledTimes(1);
+    const arg = healthRecordMock.mock.calls[0]![0] as {
+      component: string;
+      status: string;
+      duration_ms: number;
+      error?: string;
+    };
+    expect(arg.component).toBe('procedure_metrics_refresh');
+    expect(arg.status).toBe('down');
+    expect(arg.error).toBe('matview deadlocked');
+  });
+
+  it('health write failure não mascara o sucesso/fracasso do refresh', async () => {
+    dbExecuteMock.mockResolvedValueOnce(undefined);
+    healthRecordMock.mockRejectedValueOnce(new Error('health insert failed'));
+
+    const { runProcedureMetricsRefresh } = await import(
+      '../../src/workers/procedure-metrics-refresh.js'
+    );
+    // Should NOT throw — health emission is best-effort.
+    await runProcedureMetricsRefresh();
+
+    expect(loggerMock.info).toHaveBeenCalledTimes(1); // refresh.done still logged
+    expect(loggerMock.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ err: expect.any(Error) }),
+      'procedure_metrics_refresh.health_write_failed',
+    );
   });
 });
