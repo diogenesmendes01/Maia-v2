@@ -998,6 +998,32 @@ export const capability_proposals = pgTable(
   }),
 );
 
+// P5: capability_test_results — auditoria do loop fechado pós-ativação. Cada execução
+// dos test_scenarios da proposal gera uma linha; outcome=fail/error pode disparar
+// triggered_revert=true e criar um technical_gap_id (gap derivado para investigação).
+export const capability_test_results = pgTable(
+  'capability_test_results',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    proposal_id: uuid('proposal_id').notNull(),
+    gap_id: uuid('gap_id'),
+    outcome: text('outcome').notNull(),
+    scenarios_run: jsonb('scenarios_run').notNull().default(sql`'[]'::jsonb`),
+    scenarios_passed: integer('scenarios_passed').notNull().default(0),
+    scenarios_failed: integer('scenarios_failed').notNull().default(0),
+    details: jsonb('details').notNull().default(sql`'{}'::jsonb`),
+    triggered_revert: boolean('triggered_revert').notNull().default(false),
+    technical_gap_id: uuid('technical_gap_id'),
+    ran_at: timestamp('ran_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    proposalIdx: index('cap_test_results_proposal_idx').on(t.proposal_id, t.ran_at),
+    outcomeIdx: index('cap_test_results_outcome_idx').on(t.tenant_id, t.agent_id, t.outcome, t.ran_at),
+  }),
+);
+
 export type Entidade = typeof entidades.$inferSelect;
 export type Pessoa = typeof pessoas.$inferSelect;
 export type Permissao = typeof permissoes.$inferSelect;
@@ -1048,3 +1074,5 @@ export type GapEscalationRule = typeof gap_escalation_rules.$inferSelect;
 export type NewGapEscalationRule = typeof gap_escalation_rules.$inferInsert;
 export type CapabilityProposal = typeof capability_proposals.$inferSelect;
 export type NewCapabilityProposal = typeof capability_proposals.$inferInsert;
+export type CapabilityTestResult = typeof capability_test_results.$inferSelect;
+export type NewCapabilityTestResult = typeof capability_test_results.$inferInsert;
