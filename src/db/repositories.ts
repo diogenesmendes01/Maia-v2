@@ -33,6 +33,9 @@ import {
   agent_capability_gaps,
   procedure_definitions,
   procedure_assignments,
+  procedure_executions,
+  procedure_execution_events,
+  procedure_selector_decisions,
 } from './schema.js';
 import { TypedError } from '@/lib/utils.js';
 import { applyTenantGuard } from './tenant-guard.js';
@@ -67,6 +70,9 @@ import type {
   AgentCapabilityGap,
   ProcedureDefinition,
   ProcedureAssignment,
+  ProcedureExecution,
+  ProcedureExecutionEvent,
+  ProcedureSelectorDecision,
 } from './schema.js';
 
 export type EntityScope = {
@@ -1606,5 +1612,95 @@ export const procedureAssignmentsRepo = {
       .update(procedure_assignments)
       .set({ enabled: false, deactivated_at: new Date() })
       .where(eq(procedure_assignments.id, id));
+  },
+};
+
+export const procedureExecutionsRepo = {
+  async create(
+    input: Omit<ProcedureExecution, 'id' | 'started_at' | 'last_activity_at' | 'tenant_id' | 'agent_id'>,
+  ): Promise<ProcedureExecution> {
+    const guarded = applyTenantGuard(input);
+    const [row] = await db.insert(procedure_executions).values(guarded as any).returning();
+    return row!;
+  },
+
+  async findActiveForConversa(conversa_id: string): Promise<ProcedureExecution | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(procedure_executions)
+      .where(and(
+        eq(procedure_executions.tenant_id, tenant_id),
+        eq(procedure_executions.agent_id, agent_id),
+        eq(procedure_executions.conversa_id, conversa_id),
+        eq(procedure_executions.status, 'in_progress'),
+      ))
+      .orderBy(desc(procedure_executions.last_activity_at))
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  async findById(id: string): Promise<ProcedureExecution | null> {
+    const rows = await db.select().from(procedure_executions).where(eq(procedure_executions.id, id)).limit(1);
+    return rows[0] ?? null;
+  },
+
+  async updateState(
+    id: string,
+    updates: Partial<{
+      current_step_id: string;
+      execution_state: any;
+      completed_steps: any;
+      last_activity_at: Date;
+      status: string;
+      outcome: string;
+      ended_at: Date;
+      notes: string;
+    }>,
+  ): Promise<void> {
+    await db
+      .update(procedure_executions)
+      .set({ ...updates, last_activity_at: new Date() } as any)
+      .where(eq(procedure_executions.id, id));
+  },
+};
+
+export const procedureExecutionEventsRepo = {
+  async record(
+    input: Omit<ProcedureExecutionEvent, 'id' | 'created_at' | 'tenant_id' | 'agent_id'>,
+  ): Promise<void> {
+    const guarded = applyTenantGuard(input);
+    await db.insert(procedure_execution_events).values(guarded as any);
+  },
+
+  async listByExecution(execution_id: string): Promise<ProcedureExecutionEvent[]> {
+    return db
+      .select()
+      .from(procedure_execution_events)
+      .where(eq(procedure_execution_events.execution_id, execution_id))
+      .orderBy(procedure_execution_events.created_at);
+  },
+};
+
+export const procedureSelectorDecisionsRepo = {
+  async record(
+    input: Omit<ProcedureSelectorDecision, 'id' | 'decided_at' | 'tenant_id' | 'agent_id'>,
+  ): Promise<void> {
+    const guarded = applyTenantGuard(input);
+    await db.insert(procedure_selector_decisions).values(guarded as any);
+  },
+
+  async recentByConversa(conversa_id: string, limit = 20): Promise<ProcedureSelectorDecision[]> {
+    const tenant_id = getCurrentTenant();
+    return db
+      .select()
+      .from(procedure_selector_decisions)
+      .where(and(
+        eq(procedure_selector_decisions.tenant_id, tenant_id),
+        eq(procedure_selector_decisions.conversa_id, conversa_id),
+      ))
+      .orderBy(desc(procedure_selector_decisions.decided_at))
+      .limit(limit);
   },
 };
