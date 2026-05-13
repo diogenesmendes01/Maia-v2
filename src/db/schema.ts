@@ -950,6 +950,29 @@ export const agent_drift_alerts = pgTable(
   }),
 );
 
+// P5: gap_escalation_rules — thresholds determinísticos por (tenant_id, agent_id)
+// para a escalation chain (silent -> dashboard -> mentionable -> proposed). Defaults
+// embutidos no schema; UNIQUE (tenant_id, agent_id) garante uma única regra ativa
+// por agente. Quando ausente, o engine usa os defaults da coluna.
+export const gap_escalation_rules = pgTable(
+  'gap_escalation_rules',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    dashboard_freq_threshold: integer('dashboard_freq_threshold').notNull().default(3),
+    mentionable_severity_threshold: integer('mentionable_severity_threshold').notNull().default(5),
+    proposed_combined_threshold: integer('proposed_combined_threshold').notNull().default(8),
+    proposed_min_distinct_contexts: integer('proposed_min_distinct_contexts').notNull().default(2),
+    cooldown_days_proposed_to_proposed: integer('cooldown_days_proposed_to_proposed').notNull().default(14),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    tenantAgentUq: uniqueIndex('gap_escalation_rules_tenant_agent_uq').on(t.tenant_id, t.agent_id),
+  }),
+);
+
 export type Entidade = typeof entidades.$inferSelect;
 export type Pessoa = typeof pessoas.$inferSelect;
 export type Permissao = typeof permissoes.$inferSelect;
@@ -996,3 +1019,5 @@ export type AgentOperationalProfileVersion = typeof agent_operational_profile_ve
 export type NewAgentOperationalProfileVersion = typeof agent_operational_profile_versions.$inferInsert;
 export type AgentDriftAlert = typeof agent_drift_alerts.$inferSelect;
 export type NewAgentDriftAlert = typeof agent_drift_alerts.$inferInsert;
+export type GapEscalationRule = typeof gap_escalation_rules.$inferSelect;
+export type NewGapEscalationRule = typeof gap_escalation_rules.$inferInsert;
