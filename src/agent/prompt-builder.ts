@@ -15,7 +15,7 @@ import {
   procedureDefinitionsRepo,
   operationalProfileVersionsRepo,
 } from '@/db/repositories.js';
-import type { Pessoa, Conversa, Mensagem, BehavioralHint } from '@/db/schema.js';
+import type { Pessoa, Conversa, Mensagem, BehavioralHint, Role } from '@/db/schema.js';
 import type { ResolvedPermission } from '@/governance/permissions.js';
 import { renderOperationalProfile, type RenderedProfile } from '@/identity/profile-renderer.js';
 import { fmtBR } from '@/lib/brazilian.js';
@@ -88,7 +88,38 @@ export type PromptContext = {
   conversa: Conversa;
   scope: { entidades: string[]; byEntity: Map<string, ResolvedPermission> };
   inbound: Mensagem;
+  // P6 Task 9 — Active role for this turn (CHANNEL POLICY level in spec §10.7
+  // precedence). Optional/nullable preserva legacy behavior: quando ausente
+  // (flag MULTI_CHANNEL OFF ou resolver não resolveu canal), prompt-builder
+  // omite a seção "Modo operacional" e tudo se comporta como P0..P5.
+  activeRole?: Role | null;
 };
+
+/**
+ * P6 Task 9 — Renderiza a seção "## Modo operacional" no system prompt.
+ *
+ * Posicionada ENTRE selfAwarenessSection e procedureSection para respeitar
+ * a precedência da spec §10.7: CHANNEL POLICY (role) precede PROCEDURE.
+ *
+ * Gates:
+ *   - Flag MULTI_CHANNEL OFF                        → null (seção ausente).
+ *   - `role` null/undefined                         → null (sem role ativa).
+ *   - role sem description E sem prompt_addendum    → null (nada a injetar).
+ *
+ * Quando renderiza:
+ *   - Sempre inclui `display_name` (mínimo identificador do modo).
+ *   - description e prompt_addendum entram apenas se presentes (não vazios).
+ */
+async function buildRoleSection(role: Role | null | undefined): Promise<string | null> {
+  if (!featureFlags.isEnabled(FeatureFlagName.MULTI_CHANNEL)) return null;
+  if (!role) return null;
+  if (!role.prompt_addendum && !role.description) return null;
+  const parts: string[] = ['## Modo operacional'];
+  parts.push(`Você está operando como **${role.display_name}**.`);
+  if (role.description) parts.push(role.description);
+  if (role.prompt_addendum) parts.push(role.prompt_addendum);
+  return parts.join('\n\n');
+}
 
 /**
  * P5 Task 10 — injeta no system prompt as lacunas em nível `mentionable` ou
@@ -203,6 +234,7 @@ export async function buildPrompt(ctx: PromptContext): Promise<{ system: string;
   let memorySection = '';
   let hintsSection = '';
   let selfAwarenessSection = '';
+  let roleSection = '';
   let procedureSection = '';
   let gapMentionSection = '';
 
@@ -295,6 +327,16 @@ export async function buildPrompt(ctx: PromptContext): Promise<{ system: string;
     // Degrade gracefully.
   }
 
+  // P6 Task 9: injeta "## Modo operacional" entre selfAwareness e procedure
+  // para respeitar a precedência da spec §10.7 (CHANNEL POLICY > PROCEDURE).
+  // Flag-gated (MULTI_CHANNEL) e tolerante a ausência de role.
+  try {
+    const section = await buildRoleSection(ctx.activeRole);
+    if (section) roleSection = '\n' + section;
+  } catch {
+    // Degrade gracefully — role section é não-essencial ao turno base.
+  }
+
   // P3b Task 8: if there's an active procedure_execution for this conversa,
   // surface it in the system prompt so the model can follow the step's
   // intencao/como/sucesso/armadilhas instead of improvising. Wrapped in
@@ -385,6 +427,7 @@ ${stateJson}`;
     + memorySection
     + hintsSection
     + selfAwarenessSection
+    + roleSection
     + procedureSection
     + gapMentionSection
     + (renderedV2?.growth_hints_block ? '\n' + renderedV2.growth_hints_block : '')

@@ -4,6 +4,8 @@ import {
   procedureExecutionsRepo,
   procedureDefinitionsRepo,
   procedureSelectorDecisionsRepo,
+  channelPoliciesRepo,
+  rolesRepo,
 } from '@/db/repositories.js';
 import { resolveScope } from '@/governance/permissions.js';
 import { checkPendingFirst } from '@/agent/pending-gate.js';
@@ -11,10 +13,14 @@ import { checkRateLimit, formatPoliteReply } from '@/gateway/rate-limit.js';
 import { resolveIdentity } from '@/identity/resolver.js';
 import { handleQuarantineFirstContact, handleOwnerIdentityReply } from '@/identity/quarantine.js';
 import { config } from '@/config/env.js';
+import { featureFlags } from '@/config/feature-flags.js';
+import { FeatureFlagName } from '@/types/enums.js';
 import { clearDebounceState } from '@/gateway/debouncer.js';
 import { buildPrompt } from './prompt-builder.js';
 import { logger } from '@/lib/logger.js';
-import type { Mensagem, ProcedureExecution } from '@/db/schema.js';
+import type { Mensagem, ProcedureExecution, Role } from '@/db/schema.js';
+import { resolveChannel } from '@/gateway/channel-resolver.js';
+import { selectRole } from '@/cognition/role-selector/engine.js';
 import { audit } from '@/governance/audit.js';
 import { getToolSchemas } from '@/tools/_registry.js';
 import { startTyping } from '@/gateway/presence.js';
@@ -35,6 +41,9 @@ import { CognitiveEventType } from '@/types/enums.js';
 import { sendOutbound } from './output-dispatch.js';
 import { runReActLoop } from './react-loop.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
+import { db } from '@/db/client.js';
+import { mensagens } from '@/db/schema.js';
+import { eq } from 'drizzle-orm';
 
 const TYPING_DEBOUNCE_MS = 1500;
 
@@ -141,17 +150,73 @@ function scheduleTypingDebounce(jid: string, mensagem_id: string): () => void {
 
 export const _internal = { scheduleTypingDebounce, sendOutbound, aggregateUnprocessedTexts };
 
+/**
+ * Probe-only cross-tenant read of `mensagens.metadata` for the channel resolver.
+ *
+ * P6 Task 9: roda ANTES de `runWithTenantContext`, portanto bypassa
+ * `applyTenantGuard` deliberadamente (mesma justificativa do
+ * `channelsRepo.findByExternalCrossTenant` — entry point precisa descobrir
+ * qual tenant antes de poder operar dentro dele).
+ *
+ * Retorna apenas o suficiente para chamar `resolveChannel`. Qualquer falha
+ * (mensagem ausente, sem `metadata.telefone`, erro de DB) devolve null —
+ * o caller cai em legacy default/default.
+ */
+async function probeMessageForChannel(
+  mensagem_id: string,
+): Promise<{ channel_type: 'whatsapp'; external_id: string } | null> {
+  try {
+    const rows = await db
+      .select({ metadata: mensagens.metadata })
+      .from(mensagens)
+      .where(eq(mensagens.id, mensagem_id))
+      .limit(1);
+    if (rows.length === 0) return null;
+    const md = (rows[0]!.metadata ?? {}) as Record<string, unknown>;
+    const tel = typeof md['telefone'] === 'string' ? (md['telefone'] as string) : null;
+    if (!tel) return null;
+    return { channel_type: 'whatsapp', external_id: tel };
+  } catch {
+    return null;
+  }
+}
+
 export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
-  // P0: 'default' is the only tenant/agent — single-tenant deployment.
-  // P6 introduces multi-channel/multi-agent and will route via channel→tenant
-  // resolution before this function is invoked.
+  // P6 Task 9: roteamento via channel resolver quando flag MULTI_CHANNEL ON.
+  // O resolver é o entry point — roda ANTES de existir tenant context (faz
+  // cross-tenant lookup propositalmente). Falhas caem em default/default
+  // (legacy) para preservar compat com P0..P5 quando o canal não está
+  // registrado em `channels`.
+  let resolved: { tenant_id: string; agent_id: string; channel_id: string | null } = {
+    tenant_id: 'default',
+    agent_id: 'default',
+    channel_id: null,
+  };
+
+  if (featureFlags.isEnabled(FeatureFlagName.MULTI_CHANNEL)) {
+    try {
+      const probe = await probeMessageForChannel(mensagem_id);
+      if (probe) {
+        resolved = await resolveChannel(probe);
+      }
+    } catch (err) {
+      logger.warn(
+        { mensagem_id, err: (err as Error).message },
+        'agent.channel_resolution_failed_fallback_default',
+      );
+    }
+  }
+
   await runWithTenantContext(
-    { tenant_id: 'default', agent_id: 'default' },
-    () => runAgentForMensagemInner(mensagem_id),
+    { tenant_id: resolved.tenant_id, agent_id: resolved.agent_id },
+    () => runAgentForMensagemInner(mensagem_id, resolved.channel_id),
   );
 }
 
-async function runAgentForMensagemInner(mensagem_id: string): Promise<void> {
+async function runAgentForMensagemInner(
+  mensagem_id: string,
+  channel_id: string | null = null,
+): Promise<void> {
   const inbound = await mensagensRepo.findById(mensagem_id);
   if (!inbound) {
     logger.warn({ mensagem_id }, 'agent.message_not_found');
@@ -431,11 +496,45 @@ async function runAgentForMensagemInner(mensagem_id: string): Promise<void> {
     );
   }
 
+  // P6 Task 9: Resolve active role for this turn — only when flag ON AND
+  // channel resolver returned a real channel_id. Failures degrade silently
+  // to "no role section in prompt" — role injection is non-essential.
+  let activeRole: Role | null = null;
+  if (featureFlags.isEnabled(FeatureFlagName.MULTI_CHANNEL) && channel_id) {
+    try {
+      const policy = await channelPoliciesRepo.getByChannelId(channel_id);
+      if (policy) {
+        const [availableRoles, currentRole] = await Promise.all([
+          rolesRepo.listActive(),
+          rolesRepo.getById(policy.default_role_id),
+        ]);
+        if (currentRole && availableRoles.length > 0) {
+          const result = await selectRole({
+            inbound_text: inbound.conteudo ?? '',
+            current_role: currentRole,
+            available_roles: availableRoles,
+            policy,
+            conversa_id: c.id,
+            channel_id,
+            turno_id: inbound.id,
+          });
+          activeRole = result.decided_role;
+        }
+      }
+    } catch (err) {
+      logger.warn(
+        { channel_id, err: (err as Error).message },
+        'agent.role_selection_failed_continuing_without_role',
+      );
+    }
+  }
+
   const { system, messages } = await buildPrompt({
     pessoa,
     conversa: c,
     scope,
     inbound,
+    activeRole,
   });
 
   const tools = getToolSchemas(scope.byEntity);
