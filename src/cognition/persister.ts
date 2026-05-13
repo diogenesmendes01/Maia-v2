@@ -1,5 +1,6 @@
 import type { ClassifiedCandidate, CognitiveEvent } from './types.js';
 import { factsRepo, rulesRepo, cognitiveCandidatesRepo } from '@/db/repositories.js';
+import { initialFactConfidence, initialRuleConfidence } from './confidence.js';
 import { logger } from '@/lib/logger.js';
 
 /**
@@ -11,7 +12,12 @@ import { logger } from '@/lib/logger.js';
  *  - `descarte`    → log apenas
  *
  * Tenant/agent são preenchidos automaticamente pelo tenant-guard nos
- * repositories. Confianca de fato/regra usa default sensato quando ausente.
+ * repositories.
+ *
+ * Invariante north-star: `confianca` para fato e regra é SEMPRE derivada
+ * deterministicamente de evidência observável (ver `confidence.ts`).
+ * NUNCA é lida do LLM. O classifier pode emitir `confianca_sugerida_llm`
+ * mas é tratada como metadata e descartada aqui.
  */
 export async function persistCandidate(
   candidate: ClassifiedCandidate,
@@ -28,19 +34,22 @@ export async function persistCandidate(
         chave,
         valor: { content: candidate.content, subject_id: candidate.subject_id ?? null },
         fonte: 'aprendido',
-        confianca: 0.7,
+        // Deterministic — never from the LLM. P2+ will recompute from evidence.
+        confianca: initialFactConfidence(),
       });
       return { persisted_to: 'agent_facts', id: fact?.id };
     }
     case 'regra': {
       // numeric() em Drizzle exige string; demais campos jsonb ganham default {}.
+      // `candidate.confianca_sugerida_llm` is intentionally IGNORED here —
+      // confidence comes from `confidence.ts` (deterministic, evidence-driven).
       const rule = await rulesRepo.create({
         tipo: candidate.tipo,
         contexto: candidate.contexto,
         acao: candidate.acao,
         contexto_jsonb: {},
         acoes_jsonb: {},
-        confianca: String(candidate.confianca),
+        confianca: String(initialRuleConfidence()),
         acertos: 0,
         erros: 0,
         ativa: true,

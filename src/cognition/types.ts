@@ -69,7 +69,14 @@ export type RegraCandidate = {
   contexto: string;
   acao: string;
   tipo: 'classificacao' | 'identificacao_entidade' | 'tom_resposta' | 'recorrencia';
-  confianca: number;
+  /**
+   * METADATA-ONLY. The persister IGNORES this and computes confidence
+   * deterministically (see `confidence.ts`). North-star invariant:
+   * confidence is NEVER sourced from the LLM. Kept on the type to preserve
+   * round-trip with the classifier schema; should never be read as
+   * canonical confidence.
+   */
+  confianca_sugerida_llm?: number;
 };
 
 export type ProcedimentoCandidate = {
