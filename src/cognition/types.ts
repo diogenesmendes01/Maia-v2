@@ -142,3 +142,14 @@ export type ProcedureWhenApply = {
   tags?: string[];
   context_match?: Record<string, unknown>;
 };
+
+// P3c Task 4: forma tipada do critério llm_judge (já presente em
+// ProcedureSuccessCriterion como union variant; aqui é o alias usado
+// pelo step-evaluator-llm-judge para clareza nos call sites).
+export type LLMJudgeCriterion = {
+  id: string;
+  type: 'llm_judge';
+  prompt: string;
+  threshold?: number;
+  rubric?: string;
+};

@@ -2,8 +2,8 @@ import { describe, it, expect } from 'vitest';
 import { evaluateCurrentStep } from '@/cognition/step-evaluator.js';
 
 describe('evaluateCurrentStep', () => {
-  it('machine_check passa → step_completed=true', () => {
-    const result = evaluateCurrentStep({
+  it('machine_check passa → step_completed=true', async () => {
+    const result = await evaluateCurrentStep({
       execution: { id: 'e1', definition_id: 'd1', current_step_id: 'step-1', completed_steps: [] } as any,
       definition: {
         steps: [{ id: 'step-1', sucesso_criteria_ref: 'crit-1' }, { id: 'step-2', depends_on: ['step-1'] }],
@@ -17,8 +17,8 @@ describe('evaluateCurrentStep', () => {
     expect(result.branch_alternates).toEqual([]);
   });
 
-  it('machine_check falha → step_completed=false', () => {
-    const result = evaluateCurrentStep({
+  it('machine_check falha → step_completed=false', async () => {
+    const result = await evaluateCurrentStep({
       execution: { id: 'e1', definition_id: 'd1', current_step_id: 'step-1', completed_steps: [] } as any,
       definition: {
         steps: [{ id: 'step-1', sucesso_criteria_ref: 'crit-1' }],
@@ -30,8 +30,8 @@ describe('evaluateCurrentStep', () => {
     expect(result.next_step_id).toBeNull();
   });
 
-  it('tool_result passa quando tool foi chamada com expected', () => {
-    const result = evaluateCurrentStep({
+  it('tool_result passa quando tool foi chamada com expected', async () => {
+    const result = await evaluateCurrentStep({
       execution: { id: 'e1', definition_id: 'd1', current_step_id: 'step-1', completed_steps: [] } as any,
       definition: {
         steps: [{ id: 'step-1', sucesso_criteria_ref: 'crit-1' }],
@@ -42,8 +42,8 @@ describe('evaluateCurrentStep', () => {
     expect(result.step_completed).toBe(true);
   });
 
-  it('último step completed → next_step_id=null (procedure done)', () => {
-    const result = evaluateCurrentStep({
+  it('último step completed → next_step_id=null (procedure done)', async () => {
+    const result = await evaluateCurrentStep({
       execution: { id: 'e1', definition_id: 'd1', current_step_id: 'final-step', completed_steps: [] } as any,
       definition: {
         steps: [{ id: 'final-step', sucesso_criteria_ref: 'crit-final' }],
@@ -55,24 +55,25 @@ describe('evaluateCurrentStep', () => {
     expect(result.next_step_id).toBeNull();
   });
 
-  it('llm_judge/user_signal/human_confirmed: skip em P3b (tratados como failed para forçar próximo turno)', () => {
-    const result = evaluateCurrentStep({
+  it('user_signal/human_confirmed: ainda não avaliados (Task 5/6)', async () => {
+    const result = await evaluateCurrentStep({
       execution: { id: 'e1', definition_id: 'd1', current_step_id: 'step-1', completed_steps: [] } as any,
       definition: {
         steps: [{ id: 'step-1', sucesso_criteria_ref: 'crit-1' }],
-        success_criteria: [{ id: 'crit-1', type: 'llm_judge', prompt: 'X?', threshold: 0.7 }],
+        success_criteria: [{ id: 'crit-1', type: 'user_signal', signals: ['ok'] }],
       } as any,
       response_context: { response_text: 'algo' },
     });
-    // P3b doesn't evaluate llm_judge — returns step_completed=false (waits for P3c)
+    // P3c Tasks 5/6 ainda não implementados — segue retornando false
     expect(result.step_completed).toBe(false);
+    expect(result.criterion_results[0]?.evidence).toContain('Task 5');
     // P84-C3: surfaces as unsupported_criterion_only so the audit trail
     // can see the stall instead of silently looping.
     expect(result.stall_reason).toBe('unsupported_criterion_only');
   });
 
-  it('P84-C3: zero-criteria step → stall_reason=no_criteria_defined, não avança', () => {
-    const result = evaluateCurrentStep({
+  it('P84-C3: zero-criteria step → stall_reason=no_criteria_defined, não avança', async () => {
+    const result = await evaluateCurrentStep({
       execution: { id: 'e1', definition_id: 'd1', current_step_id: 'step-1', completed_steps: [] } as any,
       definition: {
         steps: [{ id: 'step-1' /* no sucesso_criteria_ref */ }, { id: 'step-2', depends_on: ['step-1'] }],
@@ -85,8 +86,8 @@ describe('evaluateCurrentStep', () => {
     expect(result.next_step_id).toBeNull();
   });
 
-  it('P84-C3: DAG com 2 branches paralelos → next_step deterministico + alternates reportados', () => {
-    const result = evaluateCurrentStep({
+  it('P84-C3: DAG com 2 branches paralelos → next_step deterministico + alternates reportados', async () => {
+    const result = await evaluateCurrentStep({
       execution: { id: 'e1', definition_id: 'd1', current_step_id: 'step-1', completed_steps: [] } as any,
       definition: {
         steps: [
@@ -106,8 +107,8 @@ describe('evaluateCurrentStep', () => {
     expect(result.branch_alternates).toEqual(['step-2b']);
   });
 
-  it('P84-C3: criterion deletado/missing ref → stepCriteria=[] → stall, não passa', () => {
-    const result = evaluateCurrentStep({
+  it('P84-C3: criterion deletado/missing ref → stepCriteria=[] → stall, não passa', async () => {
+    const result = await evaluateCurrentStep({
       execution: { id: 'e1', definition_id: 'd1', current_step_id: 'step-1', completed_steps: [] } as any,
       definition: {
         // sucesso_criteria_ref aponta para criterion que não existe.
