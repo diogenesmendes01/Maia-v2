@@ -790,6 +790,28 @@ export const procedure_execution_events = pgTable(
   }),
 );
 
+export const procedure_selector_decisions = pgTable(
+  'procedure_selector_decisions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    conversa_id: uuid('conversa_id'),
+    turno_id: uuid('turno_id'),
+    current_execution_id: uuid('current_execution_id'),
+    candidates: jsonb('candidates').notNull().default(sql`'[]'::jsonb`),
+    conflicts: jsonb('conflicts').notNull().default(sql`'[]'::jsonb`),
+    decision: text('decision').notNull(),
+    selected_procedure_id: uuid('selected_procedure_id'),
+    decided_by: text('decided_by').notNull(),
+    reason: text('reason'),
+    decided_at: timestamp('decided_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    conversaIdx: index('procedure_selector_conversa_idx').on(t.conversa_id, t.decided_at),
+  }),
+);
+
 export type Entidade = typeof entidades.$inferSelect;
 export type Pessoa = typeof pessoas.$inferSelect;
 export type Permissao = typeof permissoes.$inferSelect;
@@ -828,3 +850,4 @@ export type ProcedureDefinition = typeof procedure_definitions.$inferSelect;
 export type ProcedureAssignment = typeof procedure_assignments.$inferSelect;
 export type ProcedureExecution = typeof procedure_executions.$inferSelect;
 export type ProcedureExecutionEvent = typeof procedure_execution_events.$inferSelect;
+export type ProcedureSelectorDecision = typeof procedure_selector_decisions.$inferSelect;
