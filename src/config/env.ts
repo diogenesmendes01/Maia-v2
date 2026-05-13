@@ -144,6 +144,11 @@ const envSchema = z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
+    // P6 — separação Agent/Channel/Role + Role Policy (multi-canal)
+    FEATURE_MULTI_CHANNEL: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
     // Message debounce: hold incoming text messages from the same user for a
     // short window so chunked typing ("Oi, " / "como está " / "a finança?")
     // arrives at the LLM as a single coherent turn. Off by default — when on,
