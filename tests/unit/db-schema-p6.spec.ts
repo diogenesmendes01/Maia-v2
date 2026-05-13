@@ -20,4 +20,14 @@ describe('P6 schema', () => {
     expect(cols).toContain('is_default');
     expect(cols).toContain('prompt_addendum');
   });
+  it('exports channel_policies table', () => {
+    expect(schema.channel_policies).toBeDefined();
+  });
+  it('channel_policies has switch_behavior + by_context_guards', () => {
+    const cols = Object.keys(schema.channel_policies);
+    expect(cols).toContain('switch_behavior');
+    expect(cols).toContain('announce_mode');
+    expect(cols).toContain('by_context_guards');
+    expect(cols).toContain('default_role_id');
+  });
 });
