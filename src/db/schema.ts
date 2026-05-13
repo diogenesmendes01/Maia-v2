@@ -745,6 +745,32 @@ export const procedure_assignments = pgTable(
   }),
 );
 
+export const procedure_executions = pgTable(
+  'procedure_executions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    conversa_id: uuid('conversa_id'),
+    definition_id: uuid('definition_id').notNull(),
+    definition_version: integer('definition_version').notNull(),
+    status: text('status').notNull().default('in_progress'),
+    current_step_id: text('current_step_id'),
+    execution_state: jsonb('execution_state').notNull().default(sql`'{}'::jsonb`),
+    completed_steps: jsonb('completed_steps').notNull().default(sql`'[]'::jsonb`),
+    started_at: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
+    last_activity_at: timestamp('last_activity_at', { withTimezone: true }).notNull().defaultNow(),
+    ended_at: timestamp('ended_at', { withTimezone: true }),
+    outcome: text('outcome'),
+    notes: text('notes'),
+  },
+  (t) => ({
+    tenantAgentStatusIdx: index('procedure_exec_tenant_agent_status_idx').on(t.tenant_id, t.agent_id, t.status, t.last_activity_at),
+    conversaIdx: index('procedure_exec_conversa_idx').on(t.conversa_id),
+    inProgressIdx: index('procedure_exec_in_progress_idx').on(t.tenant_id, t.agent_id, t.conversa_id, t.last_activity_at),
+  }),
+);
+
 export type Entidade = typeof entidades.$inferSelect;
 export type Pessoa = typeof pessoas.$inferSelect;
 export type Permissao = typeof permissoes.$inferSelect;
@@ -781,3 +807,4 @@ export type AgentCapabilitySkill = typeof agent_capabilities_skill.$inferSelect;
 export type AgentCapabilityGap = typeof agent_capability_gaps.$inferSelect;
 export type ProcedureDefinition = typeof procedure_definitions.$inferSelect;
 export type ProcedureAssignment = typeof procedure_assignments.$inferSelect;
+export type ProcedureExecution = typeof procedure_executions.$inferSelect;
