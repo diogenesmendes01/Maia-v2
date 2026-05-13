@@ -25,4 +25,15 @@ describe('P5 schema', () => {
     expect(cols).toContain('delivered_at');
     expect(cols).toContain('gap_id');
   });
+  it('exports capability_test_results table', () => {
+    expect(schema.capability_test_results).toBeDefined();
+  });
+  it('test results has outcome + revert tracking + technical gap link', () => {
+    const cols = Object.keys(schema.capability_test_results);
+    expect(cols).toContain('outcome');
+    expect(cols).toContain('scenarios_run');
+    expect(cols).toContain('triggered_revert');
+    expect(cols).toContain('technical_gap_id');
+    expect(cols).toContain('proposal_id');
+  });
 });
