@@ -1,5 +1,6 @@
 import {
   pgTable,
+  pgMaterializedView,
   uuid,
   text,
   numeric,
@@ -840,6 +841,32 @@ export const procedure_tests = pgTable(
   }),
 );
 
+// P3c: procedure_metrics — materialized view aggregating execution metrics per
+// definition (recalculable 100% from procedure_executions, itself a projection
+// of procedure_execution_events). Defined via SQL in migrations/024; declared
+// here with `.existing()` so Drizzle types reads without trying to manage DDL.
+// `success_rate` and `avg_completion_seconds` are typed as text because
+// PostgreSQL `numeric` / `double precision` arrive as strings via node-postgres.
+export const procedure_metrics = pgMaterializedView('procedure_metrics', {
+  definition_id: uuid('definition_id').primaryKey(),
+  tenant_id: text('tenant_id').notNull(),
+  agent_id: text('agent_id').notNull(),
+  nome: text('nome').notNull(),
+  version: integer('version').notNull(),
+  definition_status: text('definition_status').notNull(),
+  total_executions: integer('total_executions').notNull(),
+  successful_executions: integer('successful_executions').notNull(),
+  failed_executions: integer('failed_executions').notNull(),
+  aborted_executions: integer('aborted_executions').notNull(),
+  escalated_executions: integer('escalated_executions').notNull(),
+  abandoned_executions: integer('abandoned_executions').notNull(),
+  in_progress_executions: integer('in_progress_executions').notNull(),
+  success_rate: text('success_rate'),
+  avg_completion_seconds: text('avg_completion_seconds'),
+  last_execution_at: timestamp('last_execution_at', { withTimezone: true }),
+  refreshed_at: timestamp('refreshed_at', { withTimezone: true }).notNull(),
+}).existing();
+
 export type Entidade = typeof entidades.$inferSelect;
 export type Pessoa = typeof pessoas.$inferSelect;
 export type Permissao = typeof permissoes.$inferSelect;
@@ -881,3 +908,4 @@ export type ProcedureExecutionEvent = typeof procedure_execution_events.$inferSe
 export type ProcedureSelectorDecision = typeof procedure_selector_decisions.$inferSelect;
 export type ProcedureTest = typeof procedure_tests.$inferSelect;
 export type NewProcedureTest = typeof procedure_tests.$inferInsert;
+export type ProcedureMetric = typeof procedure_metrics.$inferSelect;
