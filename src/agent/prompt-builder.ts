@@ -1,4 +1,5 @@
 import { config } from '@/config/env.js';
+import { featureFlags } from '@/config/feature-flags.js';
 import {
   selfStateRepo,
   factsRepo,
@@ -12,6 +13,7 @@ import {
   capabilityGapsRepo,
   procedureExecutionsRepo,
   procedureDefinitionsRepo,
+  operationalProfileVersionsRepo,
 } from '@/db/repositories.js';
 import type {
   Pessoa,
@@ -21,8 +23,11 @@ import type {
   ProcedureExecution,
 } from '@/db/schema.js';
 import type { ResolvedPermission } from '@/governance/permissions.js';
+import { renderOperationalProfile, type RenderedProfile } from '@/identity/profile-renderer.js';
 import { fmtBR } from '@/lib/brazilian.js';
 import type { LLMMessage } from '@/lib/claude.js';
+import { logger } from '@/lib/logger.js';
+import { FeatureFlagName } from '@/types/enums.js';
 import { sanitizeBlock } from './sanitize.js';
 
 const LLM_BOUNDARIES = `
@@ -98,7 +103,46 @@ export type PromptContext = {
 };
 
 export async function buildPrompt(ctx: PromptContext): Promise<{ system: string; messages: LLMMessage[] }> {
-  const self = await selfStateRepo.getActive();
+  // P4 Task 7: dual-read.
+  // - Flag OFF                              → comportamento legado (self_state).
+  // - Flag ON + profile com status==='active' → usa renderOperationalProfile.
+  // - Flag ON + profile inválido (proposed/frozen/rolled_back) → fallback
+  //   para self_state + log de warning (defesa em runtime: nunca expor
+  //   `proposed` mesmo se a invariant da DB falhar).
+  // - Flag ON + sem profile (null)          → fallback silencioso a self_state.
+  let renderedV2: RenderedProfile | null = null;
+  let selfVersionLabel: string;
+  let systemPromptBody: string;
+  let resumoAprendizadosBody: string;
+
+  if (featureFlags.isEnabled(FeatureFlagName.OPERATIONAL_PROFILE_V2)) {
+    const profile = await operationalProfileVersionsRepo.getActive();
+    if (profile && profile.status === 'active') {
+      renderedV2 = renderOperationalProfile({ version: profile });
+      systemPromptBody = renderedV2.system_prompt_block;
+      selfVersionLabel = `op_profile_v${profile.version}`;
+      resumoAprendizadosBody = '(perfil v2 ativo)';
+    } else {
+      if (profile) {
+        // Profile carregado mas status !== 'active' — defesa em runtime, NUNCA
+        // deve acontecer se a invariant da DB segurar. Log + fallback.
+        logger.warn(
+          { has_profile: true, status: profile.status },
+          'identity.profile_v2_invalid_fallback_to_legacy',
+        );
+      }
+      const self = await selfStateRepo.getActive();
+      systemPromptBody = self?.system_prompt ?? 'Você é a Maia.';
+      selfVersionLabel = `self_state_v${self?.versao ?? 0}`;
+      resumoAprendizadosBody = self?.resumo_aprendizados ?? '(vazio)';
+    }
+  } else {
+    const self = await selfStateRepo.getActive();
+    systemPromptBody = self?.system_prompt ?? 'Você é a Maia.';
+    selfVersionLabel = `self_state_v${self?.versao ?? 0}`;
+    resumoAprendizadosBody = self?.resumo_aprendizados ?? '(vazio)';
+  }
+
   const recent = await mensagensRepo.recentInConversation(ctx.conversa.id, 10);
   const ents = await entidadesRepo.byIds(ctx.scope.entidades);
   const facts = await factsRepo.listForScopes([
@@ -288,7 +332,7 @@ ${stateJson}`;
   }
 
   const system = [
-    self?.system_prompt ?? 'Você é a Maia.',
+    systemPromptBody || 'Você é a Maia.',
     '',
     '## LLM Boundaries',
     LLM_BOUNDARIES,
@@ -297,8 +341,8 @@ ${stateJson}`;
     INPUT_HANDLING,
     '',
     '## Sobre você',
-    `- Versão self_state: ${self?.versao ?? 0}`,
-    `- Resumo de aprendizados:\n${self?.resumo_aprendizados ?? '(vazio)'}`,
+    `- Versão: ${selfVersionLabel}`,
+    `- Resumo de aprendizados:\n${resumoAprendizadosBody}`,
     '',
     '## Sobre o interlocutor',
     `- Nome: ${ctx.pessoa.nome}`,
@@ -321,7 +365,9 @@ ${stateJson}`;
     + memorySection
     + hintsSection
     + selfAwarenessSection
-    + procedureSection;
+    + procedureSection
+    + (renderedV2?.growth_hints_block ? '\n' + renderedV2.growth_hints_block : '')
+    + (renderedV2?.episodic_summary_block ? '\n' + renderedV2.episodic_summary_block : '');
 
   // Build conversation messages: oldest first
   const ordered = [...recent].reverse();
