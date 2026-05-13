@@ -43,11 +43,28 @@ import {
   gap_escalation_rules,
   capability_proposals,
   capability_test_results,
+  channels,
+  roles,
+  channel_policies,
+  role_selector_decisions,
 } from './schema.js';
 import { TypedError } from '@/lib/utils.js';
 import { applyTenantGuard } from './tenant-guard.js';
 import { getCurrentTenant, getCurrentAgent } from './tenant-context.js';
-import type { ProfileStatus, DriftType, DriftSeverity, DriftDecision, GapLevel, ProposalStatus } from '@/types/enums.js';
+import type {
+  ProfileStatus,
+  DriftType,
+  DriftSeverity,
+  DriftDecision,
+  GapLevel,
+  ProposalStatus,
+  SwitchBehavior,
+  AnnounceMode,
+  SuggestedBy,
+  DecidedBy,
+  RoleSelectorStrength,
+  RoleDecisionAction,
+} from '@/types/enums.js';
 import type {
   Pessoa,
   Permissao,
@@ -89,6 +106,11 @@ import type {
   NewGapEscalationRule,
   CapabilityProposal,
   CapabilityTestResult,
+  Channel,
+  Role,
+  ChannelPolicy,
+  NewChannelPolicy,
+  RoleSelectorDecisionRow,
 } from './schema.js';
 
 export type EntityScope = {
@@ -2742,5 +2764,379 @@ export const capabilityTestResultsRepo = {
       .orderBy(desc(capability_test_results.ran_at))
       .limit(1);
     return rows[0] ?? null;
+  },
+};
+
+// P6: channels — instâncias de entrada de mensagem (1+ por agent). Tenant-
+// scoped via applyTenantGuard; findByExternalCrossTenant é o único método que
+// bypassa o guard (usado pelo resolver de entrada, antes do contexto existir).
+export const channelsRepo = {
+  async create(input: {
+    external_id: string;
+    channel_type: 'whatsapp' | 'telegram' | 'email' | 'sms' | 'web' | 'api' | 'other';
+    display_name?: string;
+    metadata?: unknown;
+  }): Promise<Channel> {
+    const guarded = applyTenantGuard({
+      external_id: input.external_id,
+      channel_type: input.channel_type,
+      display_name: input.display_name ?? null,
+      metadata: (input.metadata as object) ?? {},
+    });
+    const [row] = await db
+      .insert(channels)
+      .values(guarded as typeof channels.$inferInsert)
+      .returning();
+    return row!;
+  },
+
+  async getById(id: string): Promise<Channel | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(channels)
+      .where(
+        and(
+          eq(channels.tenant_id, tenant_id),
+          eq(channels.agent_id, agent_id),
+          eq(channels.id, id),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  async findByExternal(
+    channel_type: string,
+    external_id: string,
+  ): Promise<Channel | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(channels)
+      .where(
+        and(
+          eq(channels.tenant_id, tenant_id),
+          eq(channels.agent_id, agent_id),
+          eq(channels.channel_type, channel_type),
+          eq(channels.external_id, external_id),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  // EXPLICITLY bypasses applyTenantGuard — used by resolver (entry point,
+  // before context exists). The (channel_type, external_id) lookup discovers
+  // which tenant/agent owns the inbound message.
+  async findByExternalCrossTenant(args: {
+    channel_type: string;
+    external_id: string;
+  }): Promise<Channel | null> {
+    const rows = await db
+      .select()
+      .from(channels)
+      .where(
+        and(
+          eq(channels.channel_type, args.channel_type),
+          eq(channels.external_id, args.external_id),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  async listActive(): Promise<Channel[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(channels)
+      .where(
+        and(
+          eq(channels.tenant_id, tenant_id),
+          eq(channels.agent_id, agent_id),
+          eq(channels.active, true),
+        ),
+      );
+  },
+
+  async deactivate(id: string): Promise<void> {
+    await db
+      .update(channels)
+      .set({ active: false, updated_at: new Date() })
+      .where(eq(channels.id, id));
+  },
+};
+
+// P6: roles — modos operacionais por agent (comercial, suporte, default, etc).
+// Exatamente 1 default por (tenant, agent), garantido por partial unique index.
+export const rolesRepo = {
+  async create(input: {
+    role_key: string;
+    display_name: string;
+    description?: string;
+    prompt_addendum?: string;
+    is_default?: boolean;
+  }): Promise<Role> {
+    const guarded = applyTenantGuard({
+      role_key: input.role_key,
+      display_name: input.display_name,
+      description: input.description ?? null,
+      prompt_addendum: input.prompt_addendum ?? null,
+      is_default: input.is_default ?? false,
+    });
+    const [row] = await db
+      .insert(roles)
+      .values(guarded as typeof roles.$inferInsert)
+      .returning();
+    return row!;
+  },
+
+  async getById(id: string): Promise<Role | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(roles)
+      .where(
+        and(
+          eq(roles.tenant_id, tenant_id),
+          eq(roles.agent_id, agent_id),
+          eq(roles.id, id),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  async getByKey(role_key: string): Promise<Role | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(roles)
+      .where(
+        and(
+          eq(roles.tenant_id, tenant_id),
+          eq(roles.agent_id, agent_id),
+          eq(roles.role_key, role_key),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  async getDefault(): Promise<Role | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(roles)
+      .where(
+        and(
+          eq(roles.tenant_id, tenant_id),
+          eq(roles.agent_id, agent_id),
+          eq(roles.is_default, true),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  async listActive(): Promise<Role[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(roles)
+      .where(
+        and(
+          eq(roles.tenant_id, tenant_id),
+          eq(roles.agent_id, agent_id),
+          eq(roles.active, true),
+        ),
+      );
+  },
+
+  async deactivate(id: string): Promise<void> {
+    await db
+      .update(roles)
+      .set({ active: false, updated_at: new Date() })
+      .where(eq(roles.id, id));
+  },
+};
+
+// P6: channel_policies — governance que define default role + switch_behavior
+// + travas anti-oscilação para by_context. UNIQUE (channel_id) garante 1
+// policy por canal.
+export const channelPoliciesRepo = {
+  async create(input: {
+    channel_id: string;
+    default_role_id: string;
+    switch_behavior: SwitchBehavior;
+    announce_mode?: AnnounceMode;
+    by_context_guards?: unknown;
+    allowed_role_ids?: string[];
+  }): Promise<ChannelPolicy> {
+    const guarded = applyTenantGuard({
+      channel_id: input.channel_id,
+      default_role_id: input.default_role_id,
+      switch_behavior: input.switch_behavior,
+      ...(input.announce_mode !== undefined
+        ? { announce_mode: input.announce_mode }
+        : {}),
+      ...(input.by_context_guards !== undefined
+        ? { by_context_guards: input.by_context_guards as object }
+        : {}),
+      ...(input.allowed_role_ids !== undefined
+        ? { allowed_role_ids: input.allowed_role_ids as unknown as object }
+        : {}),
+    });
+    const [row] = await db
+      .insert(channel_policies)
+      .values(guarded as typeof channel_policies.$inferInsert)
+      .returning();
+    return row!;
+  },
+
+  async getByChannelId(channel_id: string): Promise<ChannelPolicy | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(channel_policies)
+      .where(
+        and(
+          eq(channel_policies.tenant_id, tenant_id),
+          eq(channel_policies.agent_id, agent_id),
+          eq(channel_policies.channel_id, channel_id),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  async update(
+    id: string,
+    patch: Partial<NewChannelPolicy>,
+  ): Promise<ChannelPolicy> {
+    // Strip any tenant/agent the caller might have supplied — context wins.
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const { tenant_id: inTenant, agent_id: inAgent, ...rest } = patch;
+    if (inTenant && inTenant !== tenant_id) {
+      throw new Error(`tenant mismatch: input ${inTenant} vs context ${tenant_id}`);
+    }
+    if (inAgent && inAgent !== agent_id) {
+      throw new Error(`agent mismatch: input ${inAgent} vs context ${agent_id}`);
+    }
+    const [row] = await db
+      .update(channel_policies)
+      .set({
+        ...rest,
+        updated_at: new Date(),
+      } as Partial<typeof channel_policies.$inferInsert>)
+      .where(
+        and(
+          eq(channel_policies.tenant_id, tenant_id),
+          eq(channel_policies.agent_id, agent_id),
+          eq(channel_policies.id, id),
+        ),
+      )
+      .returning();
+    return row!;
+  },
+};
+
+// P6: role_selector_decisions — log append-only de TODA decisão do role
+// selector (mesmo "keep_current"). decided_by NUNCA pode ser llm_classifier:
+// CHECK constraint no DB + runtime guard aqui (defense in depth). LLM
+// sugere (suggested_by), policy decide (decided_by).
+export const roleSelectorDecisionsRepo = {
+  async record(input: {
+    conversa_id?: string;
+    turno_id?: string;
+    channel_id?: string;
+    policy_id?: string;
+    current_role_id?: string;
+    suggested_role_id?: string;
+    decided_role_id: string;
+    action: RoleDecisionAction;
+    candidates: unknown[];
+    conflicts: unknown[];
+    suggested_by: SuggestedBy;
+    decided_by: DecidedBy;
+    suggested_strength?: RoleSelectorStrength;
+    suggested_confidence?: number;
+    reason?: string;
+    switch_count_in_conversation?: number;
+  }): Promise<RoleSelectorDecisionRow> {
+    // CRITICAL runtime guard — defense in depth. DB has CHECK constraint,
+    // but app validates too. LLM sugere; policy/owner/fallback decide.
+    if ((input.decided_by as string) === 'llm_classifier') {
+      throw new Error('decided_by_cannot_be_llm_classifier');
+    }
+    const guarded = applyTenantGuard({
+      conversa_id: input.conversa_id ?? null,
+      turno_id: input.turno_id ?? null,
+      channel_id: input.channel_id ?? null,
+      policy_id: input.policy_id ?? null,
+      current_role_id: input.current_role_id ?? null,
+      suggested_role_id: input.suggested_role_id ?? null,
+      decided_role_id: input.decided_role_id,
+      action: input.action,
+      candidates: input.candidates as unknown as object,
+      conflicts: input.conflicts as unknown as object,
+      suggested_by: input.suggested_by,
+      decided_by: input.decided_by,
+      suggested_strength: input.suggested_strength ?? null,
+      suggested_confidence:
+        input.suggested_confidence !== undefined
+          ? String(input.suggested_confidence)
+          : null,
+      reason: input.reason ?? null,
+      switch_count_in_conversation: input.switch_count_in_conversation ?? 0,
+    });
+    const [row] = await db
+      .insert(role_selector_decisions)
+      .values(guarded as typeof role_selector_decisions.$inferInsert)
+      .returning();
+    return row!;
+  },
+
+  async listByConversation(
+    conversa_id: string,
+  ): Promise<RoleSelectorDecisionRow[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(role_selector_decisions)
+      .where(
+        and(
+          eq(role_selector_decisions.tenant_id, tenant_id),
+          eq(role_selector_decisions.agent_id, agent_id),
+          eq(role_selector_decisions.conversa_id, conversa_id),
+        ),
+      )
+      .orderBy(desc(role_selector_decisions.decided_at));
+  },
+
+  async countSwitchesInConversation(conversa_id: string): Promise<number> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const result = await db.execute<{ count: number | string }>(sql`
+      SELECT COUNT(*)::int AS count
+        FROM role_selector_decisions
+       WHERE tenant_id = ${tenant_id}
+         AND agent_id = ${agent_id}
+         AND conversa_id = ${conversa_id}
+         AND action = 'switch'
+    `);
+    const raw = result.rows[0]?.count ?? 0;
+    return typeof raw === 'string' ? Number(raw) : raw;
   },
 };
