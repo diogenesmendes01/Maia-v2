@@ -1,4 +1,4 @@
-import { eq, and, inArray, desc, isNull, sql, or, gt } from 'drizzle-orm';
+import { eq, and, inArray, desc, isNull, sql, or, gt, lt } from 'drizzle-orm';
 import { db } from './client.js';
 import {
   pessoas,
@@ -1122,6 +1122,13 @@ export const tenantsRepo = {
     const [created] = await db.insert(tenants).values(t).returning();
     return created!;
   },
+
+  // P3c Task 9: workers que precisam iterar todos os tenants (ex.: reaper)
+  // chamam list() para fan-out. Cross-tenant por design — single point of
+  // truth para enumeração, sem RLS implícito.
+  async list(): Promise<Tenant[]> {
+    return db.select().from(tenants).orderBy(tenants.id);
+  },
 };
 
 export const agentsRepo = {
@@ -1667,6 +1674,24 @@ export const procedureExecutionsRepo = {
       .update(procedure_executions)
       .set({ ...updates, last_activity_at: new Date() } as any)
       .where(eq(procedure_executions.id, id));
+  },
+
+  // P3c Task 9 — reaper helper. Retorna execuções do tenant atual ainda em
+  // status='in_progress' cuja last_activity_at < now() - ttl_days. Workers
+  // chamam dentro de runWithTenantContext para isolar por tenant.
+  async listStaleInProgress(opts: { ttl_days: number }): Promise<ProcedureExecution[]> {
+    const tenant_id = getCurrentTenant();
+    const cutoff = new Date(Date.now() - opts.ttl_days * 86_400_000);
+    return db
+      .select()
+      .from(procedure_executions)
+      .where(
+        and(
+          eq(procedure_executions.tenant_id, tenant_id),
+          eq(procedure_executions.status, 'in_progress'),
+          lt(procedure_executions.last_activity_at, cutoff),
+        ),
+      );
   },
 };
 
