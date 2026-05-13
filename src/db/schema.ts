@@ -1088,6 +1088,30 @@ export const roles = pgTable(
   }),
 );
 
+// P6: channel_policies — define o default role do channel + governance (switch_behavior)
+// + travas anti-oscilação para by_context (min_confidence, cooldown_turns, strength_delta,
+// max_switches). UNIQUE (channel_id) garante 1 policy por canal.
+export const channel_policies = pgTable(
+  'channel_policies',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    channel_id: uuid('channel_id').notNull(),
+    default_role_id: uuid('default_role_id').notNull(),
+    switch_behavior: text('switch_behavior').notNull(),
+    announce_mode: text('announce_mode').notNull().default('affects_user'),
+    by_context_guards: jsonb('by_context_guards').notNull().default(sql`'{"min_confidence_to_switch":0.7,"cooldown_turns":3,"required_strength_delta":0.2,"max_switches_per_conversation":3}'::jsonb`),
+    allowed_role_ids: jsonb('allowed_role_ids').notNull().default(sql`'[]'::jsonb`),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    tenantAgentIdx: index('channel_policies_tenant_agent_idx').on(t.tenant_id, t.agent_id),
+    channelUq: uniqueIndex('channel_policies_channel_uq').on(t.channel_id),
+  }),
+);
+
 export type Entidade = typeof entidades.$inferSelect;
 export type Pessoa = typeof pessoas.$inferSelect;
 export type Permissao = typeof permissoes.$inferSelect;
@@ -1144,3 +1168,5 @@ export type Channel = typeof channels.$inferSelect;
 export type NewChannel = typeof channels.$inferInsert;
 export type Role = typeof roles.$inferSelect;
 export type NewRole = typeof roles.$inferInsert;
+export type ChannelPolicy = typeof channel_policies.$inferSelect;
+export type NewChannelPolicy = typeof channel_policies.$inferInsert;
