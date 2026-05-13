@@ -21,6 +21,7 @@ import { runProcedureCandidateConsumer } from './procedure-candidate-consumer.js
 import { runProcedureExecutionReaper } from './procedure-execution-reaper.js';
 import { runProcedureMetricsRefresh } from './procedure-metrics-refresh.js';
 import { runDriftMonitor } from './drift-monitor.js';
+import { runGapEscalationMonitor } from './gap-escalation-monitor.js';
 import { tickEngine } from '@/workflows/engine.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 
@@ -67,6 +68,8 @@ export const JOBS: Job[] = [
   { name: 'briefing_weekly', cron: '0 8 * * 1', fn: runWeeklyBriefing, phase: 4 },
   // P4 Task 10 — drift monitor semanal (domingo 03:00 BRT).
   { name: 'drift_monitor', cron: '0 3 * * 0', fn: runDriftMonitor, phase: 4 },
+  // P5 Task 9 — gap escalation monitor (a cada 30min).
+  { name: 'gap_escalation_monitor', cron: '*/30 * * * *', fn: runGapEscalationMonitor, phase: 5 },
 ];
 
 const tasks: cron.ScheduledTask[] = [];
