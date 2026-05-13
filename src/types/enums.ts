@@ -142,6 +142,80 @@ export const CapabilityTestOutcome = {
 export type CapabilityTestOutcome = typeof CapabilityTestOutcome[keyof typeof CapabilityTestOutcome];
 
 /**
+ * P6 — Comportamento de switching entre roles dentro de um canal/agente.
+ * locked: role fixa (sem troca). prefer_handoff: prefere transferir
+ * para outro agente em vez de trocar role. free_with_trigger: troca
+ * livre mediante trigger explícito. by_context: troca automática por
+ * contexto (com travas anti-oscilação).
+ */
+export const SwitchBehavior = {
+  LOCKED: 'locked',
+  PREFER_HANDOFF: 'prefer_handoff',
+  FREE_WITH_TRIGGER: 'free_with_trigger',
+  BY_CONTEXT: 'by_context',
+} as const;
+export type SwitchBehavior = typeof SwitchBehavior[keyof typeof SwitchBehavior];
+
+/**
+ * P6 — Origem da sugestão de role pelo seletor. LLM apenas sugere
+ * (suggested_by); decisão final fica com a policy (decided_by).
+ */
+export const SuggestedBy = {
+  LLM_CLASSIFIER: 'llm_classifier',
+  DETERMINISTIC_CLASSIFIER: 'deterministic_classifier',
+  NONE: 'none',
+} as const;
+export type SuggestedBy = typeof SuggestedBy[keyof typeof SuggestedBy];
+
+/**
+ * P6 — Origem da decisão final de role. Note que llm_classifier NÃO
+ * aparece aqui: LLM nunca decide, apenas sugere. Policy/owner/fallback
+ * são as únicas autoridades de decisão.
+ */
+export const DecidedBy = {
+  POLICY_DEFAULT: 'policy_default',
+  POLICY_RULE: 'policy_rule',
+  OWNER_OVERRIDE: 'owner_override',
+  FALLBACK_RULE: 'fallback_rule',
+} as const;
+export type DecidedBy = typeof DecidedBy[keyof typeof DecidedBy];
+
+/**
+ * P6 — Política de anúncio de troca de role ao usuário. affects_user
+ * é o default: anuncia somente quando a troca muda a experiência
+ * percebida pelo usuário.
+ */
+export const AnnounceMode = {
+  ALWAYS: 'always',
+  NEVER: 'never',
+  AFFECTS_USER: 'affects_user',
+} as const;
+export type AnnounceMode = typeof AnnounceMode[keyof typeof AnnounceMode];
+
+/**
+ * P6 — Força do sinal do seletor de role (intensidade da evidência).
+ * Combina com policy para decidir se troca ou mantém.
+ */
+export const RoleSelectorStrength = {
+  WEAK: 'weak',
+  MEDIUM: 'medium',
+  STRONG: 'strong',
+} as const;
+export type RoleSelectorStrength = typeof RoleSelectorStrength[keyof typeof RoleSelectorStrength];
+
+/**
+ * P6 — Ação tomada pela decisão de role: manter atual, trocar,
+ * transferir para outro agente, ou cair em regra de fallback.
+ */
+export const RoleDecisionAction = {
+  KEEP_CURRENT: 'keep_current',
+  SWITCH: 'switch',
+  HANDOFF: 'handoff',
+  FALLBACK: 'fallback',
+} as const;
+export type RoleDecisionAction = typeof RoleDecisionAction[keyof typeof RoleDecisionAction];
+
+/**
  * Nomes de feature flags conhecidas. Cresce conforme fases ativam.
  */
 export const FeatureFlagName = {
@@ -151,5 +225,7 @@ export const FeatureFlagName = {
   OPERATIONAL_PROFILE_V2: 'OPERATIONAL_PROFILE_V2',
   // P5 — aquisição dialógica de capacidades (lacunas -> propostas)
   DIALOGICAL_ACQUISITION: 'DIALOGICAL_ACQUISITION',
+  // P6 — separação Agent/Channel/Role + Role Policy (multi-canal)
+  MULTI_CHANNEL: 'MULTI_CHANNEL',
 } as const;
 export type FeatureFlagName = typeof FeatureFlagName[keyof typeof FeatureFlagName];
