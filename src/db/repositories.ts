@@ -65,33 +65,83 @@ export class EmptyScopeError extends TypedError {
 }
 
 export const pessoasRepo = {
+  // PR #75 review (P75-C2): pessoas is a tenant-aware table since migration
+  // 009. Identity resolution by phone is the FIRST step on inbound — if it
+  // leaks across tenants, every downstream check (permissões, escopo) is
+  // already compromised. All reads filter by (tenant_id, agent_id); all
+  // writes go through `applyTenantGuard`.
   async findById(id: string): Promise<Pessoa | null> {
-    const rows = await db.select().from(pessoas).where(eq(pessoas.id, id)).limit(1);
-    return rows[0] ?? null;
-  },
-  async findByPhone(telefone: string): Promise<Pessoa | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const rows = await db
       .select()
       .from(pessoas)
-      .where(eq(pessoas.telefone_whatsapp, telefone))
+      .where(
+        and(
+          eq(pessoas.tenant_id, tenant_id),
+          eq(pessoas.agent_id, agent_id),
+          eq(pessoas.id, id),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+  async findByPhone(telefone: string): Promise<Pessoa | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(pessoas)
+      .where(
+        and(
+          eq(pessoas.tenant_id, tenant_id),
+          eq(pessoas.agent_id, agent_id),
+          eq(pessoas.telefone_whatsapp, telefone),
+        ),
+      )
       .limit(1);
     return rows[0] ?? null;
   },
   async create(input: Omit<Pessoa, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>): Promise<Pessoa> {
-    const rows = await db.insert(pessoas).values(input).returning();
+    const guarded = applyTenantGuard(input);
+    const rows = await db.insert(pessoas).values(guarded).returning();
     return rows[0]!;
   },
   async updateStatus(id: string, status: Pessoa['status']): Promise<void> {
-    await db.update(pessoas).set({ status, updated_at: new Date() }).where(eq(pessoas.id, id));
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    await db
+      .update(pessoas)
+      .set({ status, updated_at: new Date() })
+      .where(
+        and(
+          eq(pessoas.tenant_id, tenant_id),
+          eq(pessoas.agent_id, agent_id),
+          eq(pessoas.id, id),
+        ),
+      );
   },
   async updatePreferencias(id: string, preferencias: Record<string, unknown>): Promise<void> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     await db
       .update(pessoas)
       .set({ preferencias, updated_at: new Date() })
-      .where(eq(pessoas.id, id));
+      .where(
+        and(
+          eq(pessoas.tenant_id, tenant_id),
+          eq(pessoas.agent_id, agent_id),
+          eq(pessoas.id, id),
+        ),
+      );
   },
   async list(): Promise<Pessoa[]> {
-    return db.select().from(pessoas);
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(pessoas)
+      .where(and(eq(pessoas.tenant_id, tenant_id), eq(pessoas.agent_id, agent_id)));
   },
 };
 
@@ -111,7 +161,8 @@ export const permissoesRepo = {
     return rows[0] ?? null;
   },
   async create(input: Omit<Permissao, 'id' | 'tenant_id' | 'agent_id' | 'created_at'>): Promise<Permissao> {
-    const rows = await db.insert(permissoes).values(input).returning();
+    const guarded = applyTenantGuard(input);
+    const rows = await db.insert(permissoes).values(guarded).returning();
     return rows[0]!;
   },
   async updateStatus(id: string, status: Permissao['status']): Promise<void> {
@@ -373,7 +424,8 @@ export const entidadesRepo = {
     return db.select().from(entidades).where(inArray(entidades.id, ids));
   },
   async create(input: Omit<Entidade, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>): Promise<Entidade> {
-    const rows = await db.insert(entidades).values(input).returning();
+    const guarded = applyTenantGuard(input);
+    const rows = await db.insert(entidades).values(guarded).returning();
     return rows[0]!;
   },
 };
@@ -398,7 +450,8 @@ export const contasRepo = {
       .where(inArray(contas_bancarias.entidade_id, scope.entidades));
   },
   async create(input: Omit<Conta, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>): Promise<Conta> {
-    const rows = await db.insert(contas_bancarias).values(input).returning();
+    const guarded = applyTenantGuard(input);
+    const rows = await db.insert(contas_bancarias).values(guarded).returning();
     return rows[0]!;
   },
   async addToBalance(id: string, delta: number): Promise<Conta | null> {
@@ -547,7 +600,8 @@ export const contrapartesRepo = {
     return rows[0] ?? null;
   },
   async create(input: Omit<Contraparte, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>): Promise<Contraparte> {
-    const rows = await db.insert(contrapartes).values(input).returning();
+    const guarded = applyTenantGuard(input);
+    const rows = await db.insert(contrapartes).values(guarded).returning();
     return rows[0]!;
   },
 };
@@ -720,7 +774,8 @@ type PendingQuestionInsert = Omit<
 
 export const pendingQuestionsRepo = {
   async create(input: PendingQuestionInsert): Promise<PendingQuestion> {
-    const rows = await db.insert(pending_questions).values(input).returning();
+    const guarded = applyTenantGuard(input);
+    const rows = await db.insert(pending_questions).values(guarded).returning();
     return rows[0]!;
   },
   async findOpen(conversa_id: string): Promise<PendingQuestion | null> {
@@ -849,7 +904,8 @@ export const pendingQuestionsRepo = {
     // index `(conversa_id) WHERE status='aberta'` from migration 004. Doing
     // the insert on the global pool would race with the in-flight cancel and
     // hit a duplicate-key error.
-    const rows = await tx.insert(pending_questions).values(input).returning();
+    const guarded = applyTenantGuard(input);
+    const rows = await tx.insert(pending_questions).values(guarded).returning();
     return rows[0]!;
   },
 };
@@ -935,7 +991,8 @@ export const auditRepo = {
 
 export const workflowsRepo = {
   async create(input: Omit<Workflow, 'id' | 'tenant_id' | 'agent_id' | 'iniciado_em' | 'concluido_em'>): Promise<Workflow> {
-    const rows = await db.insert(workflows).values(input).returning();
+    const guarded = applyTenantGuard(input);
+    const rows = await db.insert(workflows).values(guarded).returning();
     return rows[0]!;
   },
   async byId(id: string): Promise<Workflow | null> {
@@ -962,7 +1019,8 @@ export const workflowStepsRepo = {
     inputs: Omit<WorkflowStep, 'id' | 'tenant_id' | 'agent_id' | 'iniciado_em' | 'concluido_em'>[],
   ): Promise<WorkflowStep[]> {
     if (inputs.length === 0) return [];
-    return db.insert(workflow_steps).values(inputs).returning();
+    const guarded = inputs.map((i) => applyTenantGuard(i));
+    return db.insert(workflow_steps).values(guarded).returning();
   },
   async byWorkflow(workflow_id: string): Promise<WorkflowStep[]> {
     return db
