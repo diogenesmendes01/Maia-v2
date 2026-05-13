@@ -1,4 +1,5 @@
 import type { ProcedureExecution, ProcedureDefinition } from '@/db/schema.js';
+import { judgeStepCriterion } from './step-evaluator-llm-judge.js';
 
 type Criterion = {
   id: string;
@@ -25,11 +26,11 @@ export type StepEvalResult = {
   failure_detected: boolean;
 };
 
-export function evaluateCurrentStep(args: {
+export async function evaluateCurrentStep(args: {
   execution: ProcedureExecution;
   definition: ProcedureDefinition;
   response_context: ResponseContext;
-}): StepEvalResult {
+}): Promise<StepEvalResult> {
   const steps = args.definition.steps as unknown as Step[];
   const criteria = args.definition.success_criteria as unknown as Criterion[];
   const currentStepId = args.execution.current_step_id;
@@ -81,11 +82,30 @@ export function evaluateCurrentStep(args: {
         passed = false;
         evidence = `tool ${tool} not called`;
       }
-    } else {
-      // P3b: llm_judge / user_signal / human_confirmed — not evaluated yet
+    } else if (c.type === 'llm_judge') {
+      // P3c Task 4: chamada ao Haiku via runCognitiveModule wrapper.
+      // judgeStepCriterion JÁ embute timeout + fallback determinístico —
+      // não propaga exceção, no pior caso retorna passed=false com reasoning
+      // 'judge_timeout_or_error'. Threshold default 0.7 quando ausente.
+      const threshold = typeof c.threshold === 'number' ? (c.threshold as number) : 0.7;
+      const judge = await judgeStepCriterion({
+        prompt: c.prompt as string,
+        threshold,
+        response_text: args.response_context.response_text ?? '',
+        rubric: c.rubric as string | undefined,
+      });
+      passed = judge.passed;
+      evidence = `judge score=${judge.score.toFixed(2)} threshold=${threshold}: ${judge.reasoning}`;
+    } else if (c.type === 'user_signal') {
+      // P3c Task 5 (próximo commit): detecção de sinal explícito do usuário
+      // a partir do inbound textual. Por ora segue como "not evaluated".
       passed = false;
-      evidence = `criterion type ${c.type} not evaluated in P3b`;
-      // Don't mark as failure — just incomplete (P3c handles)
+      evidence = `criterion type ${c.type} not evaluated yet (Task 5)`;
+    } else if (c.type === 'human_confirmed') {
+      // P3c Task 6 (próximo commit): exige confirmação de um humano com
+      // role específica (ex.: owner) via flag explícita. Idem ao acima.
+      passed = false;
+      evidence = `criterion type ${c.type} not evaluated yet (Task 6)`;
     }
 
     if (!passed) all_passed = false;

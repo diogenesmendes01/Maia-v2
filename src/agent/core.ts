@@ -493,7 +493,7 @@ async function runAgentForMensagemInner(mensagem_id: string): Promise<void> {
         const def = await procedureDefinitionsRepo.findById(exec.definition_id);
         if (!def) return;
 
-        const evalResult = evaluateCurrentStep({
+        const evalResult = await evaluateCurrentStep({
           execution: exec,
           definition: def,
           response_context: responseContext,
