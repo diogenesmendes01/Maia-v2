@@ -511,6 +511,9 @@ async function runAgentForMensagemInner(mensagem_id: string): Promise<void> {
     const responseContext = {
       response_text: reactOutboundText,
       tools_called: reactToolsCalled,
+      // P3c Task 5: user_signal critério lê o inbound textual do turn.
+      // Pós-aggregation (debounce merge) — inbound.conteudo já está mesclado.
+      user_message: inbound.conteudo ?? '',
     };
     void (async () => {
       try {

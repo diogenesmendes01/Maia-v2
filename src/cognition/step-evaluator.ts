@@ -1,6 +1,7 @@
 import type { ProcedureExecution, ProcedureDefinition } from '@/db/schema.js';
 import { logger } from '@/lib/logger.js';
 import { judgeStepCriterion } from './step-evaluator-llm-judge.js';
+import { detectUserSignal } from './step-evaluator-user-signal.js';
 
 type Criterion = {
   id: string;
@@ -18,6 +19,8 @@ type Step = {
 export type ResponseContext = {
   response_text?: string;
   tools_called?: Array<{ name: string; result: unknown }>;
+  /** Texto inbound do usuário neste turn — usado por critérios `user_signal`. */
+  user_message?: string;
 };
 
 export type StepEvalResult = {
@@ -133,12 +136,17 @@ export async function evaluateCurrentStep(args: {
       passed = judge.passed;
       evidence = `judge score=${judge.score.toFixed(2)} threshold=${threshold}: ${judge.reasoning}`;
     } else if (c.type === 'user_signal') {
-      // P3c Task 5 (próximo commit): detecção de sinal explícito do usuário
-      // a partir do inbound textual. Por ora segue como "not evaluated".
-      passed = false;
-      evidence = `criterion type ${c.type} not evaluated yet (Task 5)`;
-      unsupported_count += 1;
-      // Don't mark as failure — just incomplete (P3c handles)
+      // P3c Task 5: detecção determinística (regex) sobre a MENSAGEM DO USUÁRIO
+      // — não a resposta do agente. Negative checked first, então
+      // "não, mas pode ser" não vira positivo por engano.
+      const r = detectUserSignal({
+        signal: (c.signal as 'agreement' | 'denial' | 'custom') ?? 'agreement',
+        positive_patterns: c.positive_patterns as string[] | undefined,
+        negative_patterns: c.negative_patterns as string[] | undefined,
+        user_message: args.response_context.user_message ?? '',
+      });
+      passed = r.passed;
+      evidence = `user_signal ${r.matched}: ${r.evidence}`;
     } else if (c.type === 'human_confirmed') {
       // P3c Task 6 (próximo commit): exige confirmação de um humano com
       // role específica (ex.: owner) via flag explícita. Idem ao acima.
