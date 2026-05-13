@@ -144,6 +144,17 @@ const envSchema = z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
+    // P84-Op (PR #84 review): kill switch for the P3b procedure runtime
+    // (selector + engine + post-turn evaluator). When OFF, the runtime
+    // no-ops: no selector decisions are recorded, no executions are
+    // created, no events are emitted. Defaults to ON. Set to 'false'
+    // when zombie executions accumulate or any procedure-runtime bug
+    // surfaces in prod before P3c lands. The baseline ReAct turn is
+    // unaffected either way — procedure runtime never blocks reply.
+    FEATURE_PROCEDURE_RUNTIME: z
+      .string()
+      .default('true')
+      .transform((s) => s === 'true' || s === '1'),
     MESSAGE_DEBOUNCE_MS: z.coerce.number().int().positive().default(5000),
     MESSAGE_DEBOUNCE_MAX_MS: z.coerce.number().int().positive().default(30000),
     // SETUP: optional override for the bootstrap token. When set, bypasses

@@ -348,7 +348,12 @@ async function runAgentForMensagemInner(mensagem_id: string): Promise<void> {
   // Fully wrapped in try/catch — procedure runtime must never break the
   // baseline ReAct turn. Failures here just leave `activeExecution=null`.
   let activeExecution: ProcedureExecution | null = null;
-  try {
+  // P84-Op: kill switch. When FEATURE_PROCEDURE_RUNTIME=false, the entire
+  // selector/engine/evaluator wire-up no-ops so the system can be turned
+  // off in prod (zombie executions piling up, runtime bug, etc.) without
+  // a code revert. The baseline ReAct turn proceeds unchanged.
+  if (config.FEATURE_PROCEDURE_RUNTIME) {
+   try {
     activeExecution = await procedureExecutionsRepo.findActiveForConversa(c.id);
     const selectorResult = await selectProcedure({
       conversa_id: c.id,
@@ -391,12 +396,17 @@ async function runAgentForMensagemInner(mensagem_id: string): Promise<void> {
       if (def) {
         const steps = def.steps as unknown as Array<{ id: string }>;
         const firstStep = steps[0]?.id ?? null;
-        activeExecution = await procedureEngine.startExecution({
+        // P84-C2: startExecution returns { execution, created }. On a
+        // concurrent-start race, `created=false` and we adopt the
+        // execution that the winning worker just inserted instead of
+        // creating a duplicate.
+        const started = await procedureEngine.startExecution({
           definition_id: def.id,
           definition_version: def.version_number,
           conversa_id: c.id,
           first_step_id: firstStep,
         });
+        activeExecution = started.execution;
       }
     } else if (
       selectorResult.decision === 'switch' &&
@@ -413,22 +423,24 @@ async function runAgentForMensagemInner(mensagem_id: string): Promise<void> {
       if (def) {
         const steps = def.steps as unknown as Array<{ id: string }>;
         const firstStep = steps[0]?.id ?? null;
-        activeExecution = await procedureEngine.startExecution({
+        const started = await procedureEngine.startExecution({
           definition_id: def.id,
           definition_version: def.version_number,
           conversa_id: c.id,
           first_step_id: firstStep,
         });
+        activeExecution = started.execution;
       }
     }
     // 'continue', 'escalate', 'none' → no engine action here. continue
     // keeps the existing activeExecution; escalate/none leave it null
     // (or unchanged) and the turn proceeds without a procedure.
-  } catch (err) {
+   } catch (err) {
     logger.warn(
       { err: (err as Error).message, conversa_id: c.id },
       'procedure.preturn.failed',
     );
+   }
   }
 
   const { system, messages } = await buildPrompt({
@@ -480,7 +492,16 @@ async function runAgentForMensagemInner(mensagem_id: string): Promise<void> {
   // complete, advance to the next step or complete the execution.
   // Errors are swallowed — procedure runtime must NEVER block the
   // user-facing reply or post-turn cleanup.
-  if (activeExecution) {
+  //
+  // P84-Op: gated on FEATURE_PROCEDURE_RUNTIME — the kill switch covers
+  // post-turn too, otherwise turning it off mid-execution would leave
+  // executions un-advanced. We still load+evaluate when ON, no-op when OFF.
+  // P84-C4: emit `criterion_checked` for every gate evaluation,
+  // `tool_called` for procedure-relevant tool calls, and `step_failed`
+  // when the step is stalled (zero criteria or unsupported-only) — the
+  // audit trail must reconstruct "why did step X not advance?" from the
+  // event log alone.
+  if (activeExecution && config.FEATURE_PROCEDURE_RUNTIME) {
     const execId = activeExecution.id;
     const responseContext = {
       response_text: reactOutboundText,
@@ -499,7 +520,76 @@ async function runAgentForMensagemInner(mensagem_id: string): Promise<void> {
           response_context: responseContext,
         });
 
+        // P84-C4: emit a `tool_called` event for every tool the ReAct
+        // loop invoked this turn. We emit unconditionally (rather than
+        // only when the tool intersects a criterion) so the audit trail
+        // can answer "what tools did this procedure trigger?" without
+        // joining against criterion shapes. Truncation is handled inside
+        // the engine helper.
+        for (const tc of responseContext.tools_called ?? []) {
+          await procedureEngine.recordToolCalled({
+            execution_id: exec.id,
+            step_id: exec.current_step_id,
+            tool_name: tc.name,
+            result: tc.result,
+          }).catch(() => undefined);
+        }
+
+        // P84-C4: emit `criterion_checked` for each criterion the
+        // step-evaluator scored. Best-effort: if persistence fails, we
+        // still proceed with the advance/complete decision below.
+        for (const cr of evalResult.criterion_results) {
+          await procedureEngine.recordCriterionChecked({
+            execution_id: exec.id,
+            step_id: exec.current_step_id ?? '',
+            criterion_id: cr.id,
+            criterion_type: cr.type,
+            passed: cr.passed,
+            evidence: cr.evidence,
+          }).catch(() => undefined);
+        }
+
+        // P84-C3: stall handling. When the evaluator reports a stall
+        // reason (`no_criteria_defined` — step has no criteria,
+        // `unsupported_criterion_only` — all criteria are P3c types
+        // not yet evaluated), we record a `step_failed` event so the
+        // future P3c reaper can sweep the execution. We do NOT abort
+        // here — operators may still want to manually advance via SQL,
+        // and the kill switch handles the worst case.
+        if (evalResult.stall_reason) {
+          await procedureEngine.recordEvent({
+            execution_id: exec.id,
+            step_id: exec.current_step_id,
+            event_type: 'step_failed',
+            payload: {
+              reason: evalResult.stall_reason,
+              step_id: exec.current_step_id,
+            },
+            confidence: null,
+          }).catch(() => undefined);
+        }
+
         if (!evalResult.step_completed) return;
+
+        // P84-C3: when the DAG-aware picker linearized parallel
+        // branches, record a `branch_taken` event with the chosen
+        // step + the alternates so P3c can use it to drive proper
+        // branch resolution. Today the picker is deterministic (first
+        // in array order); the event makes the choice auditable.
+        if (evalResult.branch_alternates.length > 0 && evalResult.next_step_id) {
+          await procedureEngine.recordEvent({
+            execution_id: exec.id,
+            step_id: evalResult.next_step_id,
+            event_type: 'branch_taken',
+            payload: {
+              chosen_step_id: evalResult.next_step_id,
+              alternates: evalResult.branch_alternates,
+              picker: 'deterministic_array_order',
+            },
+            confidence: null,
+          }).catch(() => undefined);
+        }
+
         if (evalResult.next_step_id) {
           await procedureEngine.advanceStep({
             execution_id: exec.id,

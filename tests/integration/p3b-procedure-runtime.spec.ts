@@ -13,6 +13,17 @@ const assignments: any[] = [];
 
 vi.mock('@/lib/claude.js', () => ({ callLLM: vi.fn() }));
 
+vi.mock('@/db/client.js', async () => {
+  return {
+    withTx: async (fn: (tx: unknown) => Promise<unknown>) => fn({}),
+    db: {},
+    pool: {},
+    isDbConnected: () => true,
+    probeDb: async () => true,
+    shutdownDb: async () => {},
+  };
+});
+
 vi.mock('@/db/repositories.js', async () => {
   const actual = await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
@@ -23,6 +34,22 @@ vi.mock('@/db/repositories.js', async () => {
         execState[id] = { id, ...input, status: 'in_progress', completed_steps: input.completed_steps ?? [] };
         return execState[id];
       }),
+      createOrFindActive: vi.fn(async (input: any) => {
+        // P84-C2: integration test for the partial-unique behaviour —
+        // when there's already an in_progress execution for the same
+        // conversa, the second insert no-ops and we return the existing.
+        const existing = Object.values(execState).find(
+          (e: any) =>
+            e.conversa_id === input.conversa_id &&
+            e.status === 'in_progress',
+        );
+        if (existing) {
+          return { execution: existing, created: false };
+        }
+        const id = `exec-${Math.random().toString(36).slice(2)}`;
+        execState[id] = { id, ...input, status: 'in_progress', completed_steps: input.completed_steps ?? [] };
+        return { execution: execState[id], created: true };
+      }),
       findById: vi.fn(async (id: string) => execState[id] ?? null),
       findActiveForConversa: vi.fn(async (conversa_id: string) => {
         return Object.values(execState).find((e: any) => e.conversa_id === conversa_id && e.status === 'in_progress') ?? null;
@@ -30,9 +57,13 @@ vi.mock('@/db/repositories.js', async () => {
       updateState: vi.fn(async (id: string, updates: any) => {
         if (execState[id]) execState[id] = { ...execState[id], ...updates };
       }),
+      updateStateTx: vi.fn(async (_tx: unknown, id: string, updates: any) => {
+        if (execState[id]) execState[id] = { ...execState[id], ...updates };
+      }),
     },
     procedureExecutionEventsRepo: {
       record: vi.fn(async (input: any) => { events.push(input); }),
+      recordTx: vi.fn(async (_tx: unknown, input: any) => { events.push(input); }),
       listByExecution: vi.fn(async (id: string) => events.filter((e) => e.execution_id === id)),
     },
     procedureSelectorDecisionsRepo: {
@@ -107,7 +138,7 @@ describe('P3b procedure runtime integration', () => {
       expect(result.selected_procedure_id).toBe(defId);
 
       // Now start execution
-      const exec = await engine.startExecution({
+      const { execution: exec, created } = await engine.startExecution({
         definition_id: defId,
         definition_version: 1,
         conversa_id: 'c1',
@@ -115,6 +146,7 @@ describe('P3b procedure runtime integration', () => {
       });
       expect(exec.status).toBe('in_progress');
       expect(exec.current_step_id).toBe('step-1');
+      expect(created).toBe(true);
       expect(events.some((e) => e.event_type === 'execution_started')).toBe(true);
     });
   });
@@ -136,7 +168,7 @@ describe('P3b procedure runtime integration', () => {
     };
 
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
-      const exec = await engine.startExecution({
+      const { execution: exec } = await engine.startExecution({
         definition_id: defId,
         definition_version: 1,
         conversa_id: 'c2',
@@ -163,7 +195,7 @@ describe('P3b procedure runtime integration', () => {
 
   it('cenário 4: replay reconstrói state a partir de events', async () => {
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
-      const exec = await engine.startExecution({
+      const { execution: exec } = await engine.startExecution({
         definition_id: 'def-x',
         definition_version: 1,
         conversa_id: 'c3',
@@ -177,12 +209,14 @@ describe('P3b procedure runtime integration', () => {
       expect(state.status).toBe('completed');
       expect(state.completed_steps).toContain('step-1');
       expect(state.completed_steps).toContain('step-2');
+      // P84-C4: outcome now reconstructed from state_updated event.
+      expect(state.outcome).toBe('success');
     });
   });
 
   it('cenário 5: abortExecution finaliza com status=aborted + event', async () => {
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
-      const exec = await engine.startExecution({
+      const { execution: exec } = await engine.startExecution({
         definition_id: 'def-y',
         definition_version: 1,
         conversa_id: 'c4',
@@ -193,6 +227,38 @@ describe('P3b procedure runtime integration', () => {
       expect(execState[exec.id].status).toBe('aborted');
       expect(execState[exec.id].notes).toBe('user_change_of_mind');
       expect(events.some((e) => e.event_type === 'execution_aborted')).toBe(true);
+    });
+  });
+
+  it('cenário 6 (P84-C2): startExecution concorrente para mesma conversa retorna {created:false}', async () => {
+    // Simulate the race: two parallel callers start an execution on the
+    // same conversa. The first wins (created=true). The second sees the
+    // ON CONFLICT and re-loads the existing execution (created=false).
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const [a, b] = await Promise.all([
+        engine.startExecution({
+          definition_id: 'def-race',
+          definition_version: 1,
+          conversa_id: 'c-race',
+          first_step_id: 'step-1',
+        }),
+        engine.startExecution({
+          definition_id: 'def-race',
+          definition_version: 1,
+          conversa_id: 'c-race',
+          first_step_id: 'step-1',
+        }),
+      ]);
+
+      // One of them must be a created=true winner, the other a created=false loser.
+      const created = [a.created, b.created];
+      expect(created).toContain(true);
+      expect(created).toContain(false);
+      // Same execution row for both.
+      expect(a.execution.id).toBe(b.execution.id);
+      // Exactly ONE execution_started event was emitted across both calls.
+      const startedEvents = events.filter((e) => e.event_type === 'execution_started');
+      expect(startedEvents.length).toBe(1);
     });
   });
 });

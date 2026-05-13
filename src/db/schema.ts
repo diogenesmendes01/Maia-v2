@@ -768,6 +768,10 @@ export const procedure_executions = pgTable(
     tenantAgentStatusIdx: index('procedure_exec_tenant_agent_status_idx').on(t.tenant_id, t.agent_id, t.status, t.last_activity_at),
     conversaIdx: index('procedure_exec_conversa_idx').on(t.conversa_id),
     inProgressIdx: index('procedure_exec_in_progress_idx').on(t.tenant_id, t.agent_id, t.conversa_id, t.last_activity_at),
+    // P84-C2: partial UNIQUE constraint enforcing at most one in_progress
+    // execution per (tenant, agent, conversa). Declared via raw SQL migration
+    // 023 because Drizzle 0.45 doesn't expose partial-unique-index in DSL;
+    // recorded here for documentation. See migration 023.
   }),
 );
 
