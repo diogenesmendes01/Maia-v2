@@ -904,6 +904,44 @@ export const agent_operational_profile_versions = pgTable(
   }),
 );
 
+// P4: agent_drift_alerts — audit das execuções do drift detector.
+// Cada alert = 1 tipo de drift detectado (7 tipos: tom, valores, confianca,
+// vies, escopo, linguagem, procedimento) × 4 severidades (baixo, medio, alto,
+// critico) × decisão (auto_approved, queued_human, frozen, rollback). A FK
+// para agent_operational_profile_versions é opcional porque um drift pode ser
+// detectado antes de uma nova versão de perfil ser proposta. Constraints CHECK
+// e o partial index `agent_drift_unresolved_idx` ficam só na DB (migrações/026);
+// Drizzle não expressa WHERE em index().
+export const agent_drift_alerts = pgTable(
+  'agent_drift_alerts',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    profile_version_id: uuid('profile_version_id'),
+    drift_type: text('drift_type').notNull(),
+    severity: text('severity').notNull(),
+    evidence: jsonb('evidence').notNull().default(sql`'{}'::jsonb`),
+    detected_by: text('detected_by').notNull(),
+    decision: text('decision').notNull(),
+    decided_at: timestamp('decided_at', { withTimezone: true }).notNull().defaultNow(),
+    decided_by: text('decided_by').notNull(),
+    resolution_note: text('resolution_note'),
+    resolved_at: timestamp('resolved_at', { withTimezone: true }),
+    resolved_by: text('resolved_by'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    tenantAgentSeverityIdx: index('agent_drift_tenant_agent_severity_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.severity,
+      t.created_at,
+    ),
+    profileVersionIdx: index('agent_drift_profile_version_idx').on(t.profile_version_id),
+  }),
+);
+
 export type Entidade = typeof entidades.$inferSelect;
 export type Pessoa = typeof pessoas.$inferSelect;
 export type Permissao = typeof permissoes.$inferSelect;
@@ -948,3 +986,5 @@ export type NewProcedureTest = typeof procedure_tests.$inferInsert;
 export type ProcedureMetric = typeof procedure_metrics.$inferSelect;
 export type AgentOperationalProfileVersion = typeof agent_operational_profile_versions.$inferSelect;
 export type NewAgentOperationalProfileVersion = typeof agent_operational_profile_versions.$inferInsert;
+export type AgentDriftAlert = typeof agent_drift_alerts.$inferSelect;
+export type NewAgentDriftAlert = typeof agent_drift_alerts.$inferInsert;
