@@ -1112,6 +1112,40 @@ export const channel_policies = pgTable(
   }),
 );
 
+// P6: role_selector_decisions — log append-only de TODA decisão do role selector
+// (mesmo "keep_current"). suggested_by registra a sugestão (LLM ou determinístico);
+// decided_by registra QUEM decidiu — NUNCA llm_classifier (CHECK constraint no DB).
+// LLM sugere, policy decide. Defesa do criterio #2 da spec.
+export const role_selector_decisions = pgTable(
+  'role_selector_decisions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    conversa_id: uuid('conversa_id'),
+    turno_id: uuid('turno_id'),
+    channel_id: uuid('channel_id'),
+    policy_id: uuid('policy_id'),
+    current_role_id: uuid('current_role_id'),
+    suggested_role_id: uuid('suggested_role_id'),
+    decided_role_id: uuid('decided_role_id').notNull(),
+    action: text('action').notNull(),
+    candidates: jsonb('candidates').notNull().default(sql`'[]'::jsonb`),
+    conflicts: jsonb('conflicts').notNull().default(sql`'[]'::jsonb`),
+    suggested_by: text('suggested_by').notNull(),
+    decided_by: text('decided_by').notNull(),
+    suggested_strength: text('suggested_strength'),
+    suggested_confidence: numeric('suggested_confidence', { precision: 4, scale: 3 }),
+    reason: text('reason'),
+    switch_count_in_conversation: integer('switch_count_in_conversation').notNull().default(0),
+    decided_at: timestamp('decided_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    conversaIdx: index('role_selector_conversa_idx').on(t.conversa_id, t.decided_at),
+    tenantAgentIdx: index('role_selector_tenant_agent_idx').on(t.tenant_id, t.agent_id, t.decided_at),
+  }),
+);
+
 export type Entidade = typeof entidades.$inferSelect;
 export type Pessoa = typeof pessoas.$inferSelect;
 export type Permissao = typeof permissoes.$inferSelect;
@@ -1170,3 +1204,5 @@ export type Role = typeof roles.$inferSelect;
 export type NewRole = typeof roles.$inferInsert;
 export type ChannelPolicy = typeof channel_policies.$inferSelect;
 export type NewChannelPolicy = typeof channel_policies.$inferInsert;
+export type RoleSelectorDecisionRow = typeof role_selector_decisions.$inferSelect;
+export type NewRoleSelectorDecisionRow = typeof role_selector_decisions.$inferInsert;

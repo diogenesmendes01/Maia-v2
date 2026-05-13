@@ -30,4 +30,17 @@ describe('P6 schema', () => {
     expect(cols).toContain('by_context_guards');
     expect(cols).toContain('default_role_id');
   });
+  it('exports role_selector_decisions table', () => {
+    expect(schema.role_selector_decisions).toBeDefined();
+  });
+  it('role_selector_decisions has audit shape', () => {
+    const cols = Object.keys(schema.role_selector_decisions);
+    expect(cols).toContain('current_role_id');
+    expect(cols).toContain('suggested_role_id');
+    expect(cols).toContain('decided_role_id');
+    expect(cols).toContain('action');
+    expect(cols).toContain('suggested_by');
+    expect(cols).toContain('decided_by');
+    expect(cols).toContain('switch_count_in_conversation');
+  });
 });
