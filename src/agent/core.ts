@@ -1,4 +1,10 @@
-import { mensagensRepo, conversasRepo } from '@/db/repositories.js';
+import {
+  mensagensRepo,
+  conversasRepo,
+  procedureExecutionsRepo,
+  procedureDefinitionsRepo,
+  procedureSelectorDecisionsRepo,
+} from '@/db/repositories.js';
 import { resolveScope } from '@/governance/permissions.js';
 import { checkPendingFirst } from '@/agent/pending-gate.js';
 import { checkRateLimit, formatPoliteReply } from '@/gateway/rate-limit.js';
@@ -8,7 +14,7 @@ import { config } from '@/config/env.js';
 import { clearDebounceState } from '@/gateway/debouncer.js';
 import { buildPrompt } from './prompt-builder.js';
 import { logger } from '@/lib/logger.js';
-import type { Mensagem } from '@/db/schema.js';
+import type { Mensagem, ProcedureExecution } from '@/db/schema.js';
 import { audit } from '@/governance/audit.js';
 import { getToolSchemas } from '@/tools/_registry.js';
 import { startTyping } from '@/gateway/presence.js';
@@ -22,6 +28,9 @@ import { reflect } from '@/cognition/reflector.js';
 import { classify } from '@/cognition/classifier.js';
 import { persistCandidate } from '@/cognition/persister.js';
 import { recordSuccess } from '@/cognition/capability-tracker.js';
+import { selectProcedure } from '@/cognition/procedure-selector.js';
+import { evaluateCurrentStep } from '@/cognition/step-evaluator.js';
+import * as procedureEngine from '@/procedures/engine.js';
 import { CognitiveEventType } from '@/types/enums.js';
 import { sendOutbound } from './output-dispatch.js';
 import { runReActLoop } from './react-loop.js';
@@ -328,6 +337,100 @@ async function runAgentForMensagemInner(mensagem_id: string): Promise<void> {
 
   const scope = await resolveScope(pessoa);
 
+  // P3b Task 9 — PRE-TURN selector:
+  // Resolve whether a procedure should be active for this turn. The
+  // selector consults the current active execution (if any) and the
+  // assigned procedures for this agent. Its decision (start/continue/
+  // switch/escalate/none) is recorded for auditability. If a new
+  // procedure should start, we kick off the execution BEFORE buildPrompt
+  // so the system prompt picks up the new procedure's first step.
+  //
+  // Fully wrapped in try/catch — procedure runtime must never break the
+  // baseline ReAct turn. Failures here just leave `activeExecution=null`.
+  let activeExecution: ProcedureExecution | null = null;
+  try {
+    activeExecution = await procedureExecutionsRepo.findActiveForConversa(c.id);
+    const selectorResult = await selectProcedure({
+      conversa_id: c.id,
+      current_message: inbound.conteudo ?? '',
+      current_execution: activeExecution
+        ? {
+            id: activeExecution.id,
+            definition_id: activeExecution.definition_id,
+            status: activeExecution.status,
+          }
+        : null,
+    });
+
+    await procedureSelectorDecisionsRepo
+      .record({
+        conversa_id: c.id,
+        turno_id: inbound.id,
+        current_execution_id: activeExecution?.id ?? null,
+        candidates: selectorResult.candidates as unknown,
+        conflicts: selectorResult.conflicts as unknown,
+        decision: selectorResult.decision,
+        selected_procedure_id: selectorResult.selected_procedure_id ?? null,
+        decided_by: 'selector_llm',
+        reason: selectorResult.reason,
+      } as never)
+      .catch((err) =>
+        logger.warn(
+          { err: (err as Error).message },
+          'procedure.selector_decision.persist_failed',
+        ),
+      );
+
+    if (
+      selectorResult.decision === 'start' &&
+      selectorResult.selected_procedure_id
+    ) {
+      const def = await procedureDefinitionsRepo.findById(
+        selectorResult.selected_procedure_id,
+      );
+      if (def) {
+        const steps = def.steps as unknown as Array<{ id: string }>;
+        const firstStep = steps[0]?.id ?? null;
+        activeExecution = await procedureEngine.startExecution({
+          definition_id: def.id,
+          definition_version: def.version_number,
+          conversa_id: c.id,
+          first_step_id: firstStep,
+        });
+      }
+    } else if (
+      selectorResult.decision === 'switch' &&
+      selectorResult.selected_procedure_id &&
+      activeExecution
+    ) {
+      await procedureEngine.abortExecution({
+        execution_id: activeExecution.id,
+        reason: 'switched_by_selector',
+      });
+      const def = await procedureDefinitionsRepo.findById(
+        selectorResult.selected_procedure_id,
+      );
+      if (def) {
+        const steps = def.steps as unknown as Array<{ id: string }>;
+        const firstStep = steps[0]?.id ?? null;
+        activeExecution = await procedureEngine.startExecution({
+          definition_id: def.id,
+          definition_version: def.version_number,
+          conversa_id: c.id,
+          first_step_id: firstStep,
+        });
+      }
+    }
+    // 'continue', 'escalate', 'none' → no engine action here. continue
+    // keeps the existing activeExecution; escalate/none leave it null
+    // (or unchanged) and the turn proceeds without a procedure.
+  } catch (err) {
+    logger.warn(
+      { err: (err as Error).message, conversa_id: c.id },
+      'procedure.preturn.failed',
+    );
+  }
+
   const { system, messages } = await buildPrompt({
     pessoa,
     conversa: c,
@@ -346,6 +449,8 @@ async function runAgentForMensagemInner(mensagem_id: string): Promise<void> {
       : pessoa.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
   const stopTyping = scheduleTypingDebounce(jid, inbound.id);
   let totalTokens: number;
+  let reactOutboundText = '';
+  let reactToolsCalled: Array<{ name: string; result: unknown }> = [];
   try {
     const result = await runReActLoop({
       pessoa,
@@ -358,6 +463,8 @@ async function runAgentForMensagemInner(mensagem_id: string): Promise<void> {
       tools,
     });
     totalTokens = result.totalTokens;
+    reactOutboundText = result.outboundText;
+    reactToolsCalled = result.toolsCalled;
   } finally {
     stopTyping();
   }
@@ -365,6 +472,54 @@ async function runAgentForMensagemInner(mensagem_id: string): Promise<void> {
   await markAllProcessed(totalTokens);
   await conversasRepo.touch(c.id);
   await clearDebounceState(pessoa.telefone_whatsapp);
+
+  // P3b Task 9 — POST-TURN evaluator (fire-and-forget):
+  // If a procedure execution is active, re-load it (state may have
+  // mutated mid-turn) and evaluate the current step's success criteria
+  // against this turn's outbound text + tool results. If the step is
+  // complete, advance to the next step or complete the execution.
+  // Errors are swallowed — procedure runtime must NEVER block the
+  // user-facing reply or post-turn cleanup.
+  if (activeExecution) {
+    const execId = activeExecution.id;
+    const responseContext = {
+      response_text: reactOutboundText,
+      tools_called: reactToolsCalled,
+    };
+    void (async () => {
+      try {
+        const exec = await procedureExecutionsRepo.findById(execId);
+        if (!exec || exec.status !== 'in_progress') return;
+        const def = await procedureDefinitionsRepo.findById(exec.definition_id);
+        if (!def) return;
+
+        const evalResult = evaluateCurrentStep({
+          execution: exec,
+          definition: def,
+          response_context: responseContext,
+        });
+
+        if (!evalResult.step_completed) return;
+        if (evalResult.next_step_id) {
+          await procedureEngine.advanceStep({
+            execution_id: exec.id,
+            next_step_id: evalResult.next_step_id,
+            completed_step_id: exec.current_step_id!,
+          });
+        } else {
+          await procedureEngine.completeExecution({
+            execution_id: exec.id,
+            outcome: 'success',
+          });
+        }
+      } catch (err) {
+        logger.warn(
+          { err: (err as Error).message, execId },
+          'procedure.postturn.failed',
+        );
+      }
+    })();
+  }
 
   // Reflection trigger: correction detection (real-time)
   if (inbound.conteudo && detectCorrection(inbound.conteudo)) {

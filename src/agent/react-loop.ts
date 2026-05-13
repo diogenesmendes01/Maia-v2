@@ -28,6 +28,18 @@ export type RunReActLoopParams = {
   tools: ToolSchema[];
 };
 
+export type ReActLoopResult = {
+  totalTokens: number;
+  /** Final assistant text sent to the user (empty string when no end_turn produced text). */
+  outboundText: string;
+  /**
+   * P3b Task 9: captured tool invocations across all iterations so the
+   * post-turn step-evaluator can match tool_result success criteria.
+   * Each entry has the tool name and the raw dispatcher output.
+   */
+  toolsCalled: Array<{ name: string; result: unknown }>;
+};
+
 /**
  * Runs the ReAct iteration loop. Keeps the LLM call → tool execution cycle
  * going until the model stops requesting tools (or the iteration cap is
@@ -35,9 +47,11 @@ export type RunReActLoopParams = {
  * `dispatchOutput` so the right output channel (PDF/voice/text/poll) is used.
  *
  * Returns the total tokens consumed across iterations so the caller can
- * persist it via `mensagensRepo.markProcessed`.
+ * persist it via `mensagensRepo.markProcessed`, plus the final outbound
+ * text and the list of tools invoked — both used by the post-turn
+ * procedure step-evaluator wired in `core.ts`.
  */
-export async function runReActLoop(params: RunReActLoopParams): Promise<{ totalTokens: number }> {
+export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoopResult> {
   const { pessoa, conversa: c, inbound, jid, system, messages, tools } = params;
   let totalTokens = 0;
   const conversation: LLMMessage[] = messages;
@@ -45,6 +59,8 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<{ totalT
   let turnHasSensitive = false;
   const sensitiveTools: string[] = [];
   let latestReportPdf: LatestReportPdf | null = null;
+  let outboundText = '';
+  const toolsCalled: Array<{ name: string; result: unknown }> = [];
 
   for (let i = 0; i < MAX_REACT_ITERATIONS; i++) {
     const res = await callLLM({
@@ -58,6 +74,7 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<{ totalT
 
     if (res.tool_uses.length === 0) {
       const text = res.content?.trim() ?? '';
+      outboundText = text;
       if (text) {
         await dispatchOutput({
           pessoa,
@@ -131,6 +148,10 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<{ totalT
         },
       });
       const isError = typeof out === 'object' && out !== null && 'error' in out;
+
+      // P3b Task 9: capture every tool invocation for the post-turn
+      // step-evaluator (tool_result success criteria).
+      toolsCalled.push({ name: tu.tool, result: out });
 
       // B0: capture the freshly-created pending id, with re-validation against
       // the dispatcher's 5-min idempotency cache.
@@ -232,5 +253,5 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<{ totalT
     conversation.push({ role: 'user', content: results });
   }
 
-  return { totalTokens };
+  return { totalTokens, outboundText, toolsCalled };
 }
