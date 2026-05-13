@@ -13,6 +13,7 @@ import { detectGap } from './gap-detector.js';
 import { reflect } from '@/cognition/reflector.js';
 import { classify } from '@/cognition/classifier.js';
 import { persistCandidate } from '@/cognition/persister.js';
+import { runCognitiveModule } from '@/cognition/runner.js';
 import { CognitiveEventType } from '@/types/enums.js';
 
 export const MAX_REACT_ITERATIONS = 5;
@@ -63,13 +64,34 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
   const toolsCalled: Array<{ name: string; result: unknown }> = [];
 
   for (let i = 0; i < MAX_REACT_ITERATIONS; i++) {
-    const res = await callLLM({
-      system,
-      messages: conversation,
-      tools,
-      max_tokens: 1024,
-      pessoa_id: pessoa.id,
-    });
+    const reasonerResult = await runCognitiveModule(
+      {
+        name: 'reasoner',
+        version: 'v1',
+        triggered_by: 'sync_required',
+        timeoutMs: 30000,
+        conversa_id: c.id,
+        turno_id: inbound.id,
+      },
+      () =>
+        callLLM({
+          system,
+          messages: conversation,
+          tools,
+          max_tokens: 1024,
+          pessoa_id: pessoa.id,
+        }),
+    );
+    const res = reasonerResult.output;
+    if (!res) {
+      // Reasoner falhou (timeout/erro) — encerra loop com resposta vazia.
+      // Não joga exception nem trava o worker; turn termina sem reply útil.
+      logger.warn(
+        { conversa_id: c.id, mensagem_id: inbound.id, status: reasonerResult.status },
+        'react_loop.reasoner_failed',
+      );
+      break;
+    }
     totalTokens += res.usage.input_tokens + res.usage.output_tokens;
 
     if (res.tool_uses.length === 0) {
