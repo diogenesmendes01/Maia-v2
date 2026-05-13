@@ -11,22 +11,28 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { AgentOperationalProfileVersion } from '@/db/schema.js';
 import type { DriftRecentMessage } from '@/cognition/drift/types.js';
 
-const messagesCreateMock = vi.fn();
+// [P86-C4] detector via callLLM (provider-agnostic).
+const { callLLMMock } = vi.hoisted(() => ({ callLLMMock: vi.fn() }));
 
-vi.mock('@anthropic-ai/sdk', () => {
-  const Anthropic = vi.fn().mockImplementation(() => ({
-    messages: { create: messagesCreateMock },
-  }));
-  return { default: Anthropic };
-});
+vi.mock('@/lib/claude.js', () => ({
+  callLLM: callLLMMock,
+}));
 
 import { linguagemDetector } from '@/cognition/drift/linguagem.js';
 
-function makeAnthropicReply(jsonObj: Record<string, unknown>): {
-  content: Array<{ type: 'text'; text: string }>;
+function makeLLMReply(jsonObj: Record<string, unknown>): {
+  content: string;
+  tool_uses: unknown[];
+  stop_reason: 'end_turn';
+  usage: { input_tokens: number; output_tokens: number };
+  model: string;
 } {
   return {
-    content: [{ type: 'text', text: JSON.stringify(jsonObj) }],
+    content: JSON.stringify(jsonObj),
+    tool_uses: [],
+    stop_reason: 'end_turn',
+    usage: { input_tokens: 0, output_tokens: 0 },
+    model: 'mock-model',
   };
 }
 
@@ -63,12 +69,12 @@ function makeAgentMsg(text: string, id = 'm-' + Math.random().toString(36).slice
 
 describe('linguagemDetector', () => {
   beforeEach(() => {
-    messagesCreateMock.mockReset();
+    callLLMMock.mockReset();
   });
 
   it('drift_detected=true + severity_hint=medio → evidence com severity_hint=medio', async () => {
-    messagesCreateMock.mockResolvedValueOnce(
-      makeAnthropicReply({
+    callLLMMock.mockResolvedValueOnce(
+      makeLLMReply({
         drift_detected: true,
         severity_hint: 'medio',
         offensive: false,
@@ -95,8 +101,8 @@ describe('linguagemDetector', () => {
   });
 
   it('drift_detected=true + offensive:true → severity_hint=critico (offensive override mesmo se hint=baixo)', async () => {
-    messagesCreateMock.mockResolvedValueOnce(
-      makeAnthropicReply({
+    callLLMMock.mockResolvedValueOnce(
+      makeLLMReply({
         drift_detected: true,
         severity_hint: 'baixo',
         offensive: true,
@@ -117,8 +123,8 @@ describe('linguagemDetector', () => {
   });
 
   it('drift_detected=false → null', async () => {
-    messagesCreateMock.mockResolvedValueOnce(
-      makeAnthropicReply({
+    callLLMMock.mockResolvedValueOnce(
+      makeLLMReply({
         drift_detected: false,
         severity_hint: 'baixo',
         offensive: false,
@@ -144,23 +150,28 @@ describe('linguagemDetector', () => {
     });
 
     expect(out).toBeNull();
-    expect(messagesCreateMock).not.toHaveBeenCalled();
+    expect(callLLMMock).not.toHaveBeenCalled();
   });
 
-  it('Anthropic throws → null (defensivo)', async () => {
-    messagesCreateMock.mockRejectedValueOnce(new Error('network exploded'));
+  // [P86-C4] callLLM error propagates instead of swallow.
+  it('callLLM throws → erro PROPAGA (não mais swallow)', async () => {
+    callLLMMock.mockRejectedValueOnce(new Error('network exploded'));
 
-    const out = await linguagemDetector.detect({
-      profile_active: makeProfile(),
-      recent_messages: [makeAgentMsg('Beleza.')],
-    });
-
-    expect(out).toBeNull();
+    await expect(
+      linguagemDetector.detect({
+        profile_active: makeProfile(),
+        recent_messages: [makeAgentMsg('Beleza.')],
+      }),
+    ).rejects.toThrow('network exploded');
   });
 
   it('resposta sem JSON parseável → null', async () => {
-    messagesCreateMock.mockResolvedValueOnce({
-      content: [{ type: 'text', text: 'sem json aqui' }],
+    callLLMMock.mockResolvedValueOnce({
+      content: 'sem json aqui',
+      tool_uses: [],
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 0, output_tokens: 0 },
+      model: 'mock-model',
     });
 
     const out = await linguagemDetector.detect({
@@ -172,8 +183,8 @@ describe('linguagemDetector', () => {
   });
 
   it('drift_detected=true sem severity_hint nem offensive → defaults aplicados (severity=baixo)', async () => {
-    messagesCreateMock.mockResolvedValueOnce(
-      makeAnthropicReply({ drift_detected: true }),
+    callLLMMock.mockResolvedValueOnce(
+      makeLLMReply({ drift_detected: true }),
     );
 
     const out = await linguagemDetector.detect({

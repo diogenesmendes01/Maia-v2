@@ -12,17 +12,24 @@
  *        medio   → queued_human
  *        alto    → frozen
  *        critico → rollback
- *  3) Para `frozen`/`rollback`, transiciona o perfil ativo via
- *     `operationalProfileVersionsRepo.transition`. Falhas no transition NÃO
- *     bloqueiam o pipeline: marcam `applied=false` + `applied_error`.
- *  4) Persiste SEMPRE 1 row em `agent_drift_alerts` (incluindo decisões
- *     baixo/medio que não tocam no perfil). Falhas no `create` do alert são
- *     concatenadas em `applied_error` mas não interrompem as evidências
- *     restantes do loop.
+ *  3) Persiste SEMPRE 1 row em `agent_drift_alerts` ANTES de qualquer
+ *     transição (governança: behavior changes são eventos auditáveis;
+ *     o audit trail precede a mutação do perfil). Falhas no `create` do
+ *     alert IMPEDEM a transição (não mudamos identidade sem evidência
+ *     registrada — invariante "agente gera evidência, não muda quem é").
+ *  4) Para `frozen`/`rollback`, somente APÓS o alert existir, transiciona
+ *     o perfil ativo via `operationalProfileVersionsRepo.transition`.
+ *     Falhas no transition NÃO bloqueiam o pipeline: marcam `applied=false`
+ *     + `applied_error`.
  *
  * Sem dependência de LLM, sem `runCognitiveModule` — o orchestrator (Task 8)
  * já governou os detectores. Este engine é a borda determinística que
  * traduz evidência em ação operacional + audit.
+ *
+ * Review-2 (PR #86 P86-C1): a ordem foi invertida — alert antes da
+ * transição. Sem alert, não há identity change. Isso preserva o invariante
+ * inviolável de governança: o agente gera evidência; só o sistema (com
+ * audit row em mãos) aplica mudanças.
  */
 import {
   DriftSeverity,
@@ -158,6 +165,40 @@ export async function decideAndApply(args: {
 
     let applied = false;
     let applied_error: string | undefined;
+    let alert_id: string | undefined;
+
+    // [P86-C1] Audit-first: persist the alert BEFORE touching the operational
+    // profile. Behavior changes are governance events; without a recorded
+    // audit row we MUST NOT mutate identity (the inviolable invariant says
+    // the agent generates evidence, it does not change who it is).
+    try {
+      const alert = await driftAlertsRepo.create({
+        profile_version_id: args.active_profile_id,
+        drift_type: ev.drift_type,
+        severity,
+        evidence: { ...ev.payload, summary: ev.evidence_summary },
+        detected_by: ev.detected_by,
+        decision,
+        decided_by: 'decision_engine',
+      });
+      alert_id = alert.id;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      applied_error = 'alert_persist_failed:' + msg;
+      // Alert failed → record result with applied=false and SKIP the
+      // transition entirely. Identity must never change without an audit
+      // row. This is intentionally strict (was a Critical review finding).
+      results.push({
+        drift_type: ev.drift_type,
+        severity,
+        decision,
+        evidence: ev,
+        applied: false,
+        applied_error,
+        alert_id: undefined,
+      });
+      continue;
+    }
 
     if (decision === DriftDecision.FROZEN || decision === DriftDecision.ROLLBACK) {
       try {
@@ -173,24 +214,6 @@ export async function decideAndApply(args: {
       } catch (e) {
         applied_error = e instanceof Error ? e.message : String(e);
       }
-    }
-
-    let alert_id: string | undefined;
-    try {
-      const alert = await driftAlertsRepo.create({
-        profile_version_id: args.active_profile_id,
-        drift_type: ev.drift_type,
-        severity,
-        evidence: { ...ev.payload, summary: ev.evidence_summary },
-        detected_by: ev.detected_by,
-        decision,
-        decided_by: 'decision_engine',
-      });
-      alert_id = alert.id;
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      applied_error =
-        (applied_error ? applied_error + '; ' : '') + 'alert_persist_failed:' + msg;
     }
 
     results.push({

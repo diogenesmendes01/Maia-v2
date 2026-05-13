@@ -11,22 +11,28 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { AgentOperationalProfileVersion } from '@/db/schema.js';
 import type { DriftRecentMessage } from '@/cognition/drift/types.js';
 
-const messagesCreateMock = vi.fn();
+// [P86-C4] detector via callLLM (provider-agnostic).
+const { callLLMMock } = vi.hoisted(() => ({ callLLMMock: vi.fn() }));
 
-vi.mock('@anthropic-ai/sdk', () => {
-  const Anthropic = vi.fn().mockImplementation(() => ({
-    messages: { create: messagesCreateMock },
-  }));
-  return { default: Anthropic };
-});
+vi.mock('@/lib/claude.js', () => ({
+  callLLM: callLLMMock,
+}));
 
 import { escopoDetector } from '@/cognition/drift/escopo.js';
 
-function makeAnthropicReply(jsonObj: Record<string, unknown>): {
-  content: Array<{ type: 'text'; text: string }>;
+function makeLLMReply(jsonObj: Record<string, unknown>): {
+  content: string;
+  tool_uses: unknown[];
+  stop_reason: 'end_turn';
+  usage: { input_tokens: number; output_tokens: number };
+  model: string;
 } {
   return {
-    content: [{ type: 'text', text: JSON.stringify(jsonObj) }],
+    content: JSON.stringify(jsonObj),
+    tool_uses: [],
+    stop_reason: 'end_turn',
+    usage: { input_tokens: 0, output_tokens: 0 },
+    model: 'mock-model',
   };
 }
 
@@ -60,12 +66,12 @@ function makeAgentMsg(text: string, id = 'm-' + Math.random().toString(36).slice
 
 describe('escopoDetector', () => {
   beforeEach(() => {
-    messagesCreateMock.mockReset();
+    callLLMMock.mockReset();
   });
 
   it('LLM extrai promessa "envio_pix" e capability "envio_pix" está active → null (promessa cumprível)', async () => {
-    messagesCreateMock.mockResolvedValueOnce(
-      makeAnthropicReply({
+    callLLMMock.mockResolvedValueOnce(
+      makeLLMReply({
         promises: [
           { message_id: 'm1', promise: 'vou te enviar pix', capability_required: 'envio_pix' },
         ],
@@ -83,12 +89,12 @@ describe('escopoDetector', () => {
     });
 
     expect(out).toBeNull();
-    expect(messagesCreateMock).toHaveBeenCalledTimes(1);
+    expect(callLLMMock).toHaveBeenCalledTimes(1);
   });
 
   it('LLM extrai promessa "envio_invoice" mas nenhuma capability com esse nome existe → evidence com unfulfillable_promises', async () => {
-    messagesCreateMock.mockResolvedValueOnce(
-      makeAnthropicReply({
+    callLLMMock.mockResolvedValueOnce(
+      makeLLMReply({
         promises: [
           {
             message_id: 'm1',
@@ -128,24 +134,25 @@ describe('escopoDetector', () => {
     });
 
     expect(out).toBeNull();
-    expect(messagesCreateMock).not.toHaveBeenCalled();
+    expect(callLLMMock).not.toHaveBeenCalled();
   });
 
-  it('Anthropic throws → null (defensivo)', async () => {
-    messagesCreateMock.mockRejectedValueOnce(new Error('network exploded'));
+  // [P86-C4] callLLM error propagates instead of swallow.
+  it('callLLM throws → erro PROPAGA (não mais swallow)', async () => {
+    callLLMMock.mockRejectedValueOnce(new Error('network exploded'));
 
-    const out = await escopoDetector.detect({
-      profile_active: makeProfile(),
-      recent_messages: [makeAgentMsg('Vou te enviar agora.')],
-      capabilities: [{ name: 'envio_pix', status: 'active' }],
-    });
-
-    expect(out).toBeNull();
+    await expect(
+      escopoDetector.detect({
+        profile_active: makeProfile(),
+        recent_messages: [makeAgentMsg('Vou te enviar agora.')],
+        capabilities: [{ name: 'envio_pix', status: 'active' }],
+      }),
+    ).rejects.toThrow('network exploded');
   });
 
   it('capability com mesmo nome mas status="inactive" → tratada como ausente (drift)', async () => {
-    messagesCreateMock.mockResolvedValueOnce(
-      makeAnthropicReply({
+    callLLMMock.mockResolvedValueOnce(
+      makeLLMReply({
         promises: [
           { message_id: 'm1', promise: 'agendamento', capability_required: 'agendamento_reuniao' },
         ],
@@ -166,8 +173,8 @@ describe('escopoDetector', () => {
   });
 
   it('3 promessas sem capability → severity_hint=critico', async () => {
-    messagesCreateMock.mockResolvedValueOnce(
-      makeAnthropicReply({
+    callLLMMock.mockResolvedValueOnce(
+      makeLLMReply({
         promises: [
           { message_id: 'm1', promise: 'p1', capability_required: 'cap_x' },
           { message_id: 'm1', promise: 'p2', capability_required: 'cap_y' },

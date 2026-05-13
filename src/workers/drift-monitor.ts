@@ -33,6 +33,7 @@ import { db } from '@/db/client.js';
 import {
   mensagens,
   procedure_definitions,
+  procedure_metrics,
   type AgentOperationalProfileVersion,
 } from '@/db/schema.js';
 import { runWithTenantContext, getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
@@ -160,14 +161,21 @@ async function assembleDriftInput(
     logger.warn({ err: (err as Error).message }, 'drift_monitor.self_model_failed');
   }
 
-  // recent_procedures — sem método dedicado em procedureDefinitionsRepo; SELECT
-  // direto últimos 30d. O detector procedimento espera `{ id, created_at,
-  // evidence_count, status }`. procedure_definitions não tem `evidence_count`
-  // próprio — usamos um proxy via número de tests passing/exec count NÃO está
-  // exposto aqui. Para esse worker, deixamos `evidence_count` como 0 (gatilha
-  // detector por design — procedure novo sem evidência é justamente o alvo)
-  // ou usamos um sentinel `Infinity` para suprimir até existir tracking real.
-  // Conservador: 0 (deixa o detector decidir com base no threshold dele).
+  // recent_procedures — SELECT direto últimos 30d, LEFT JOIN com
+  // procedure_metrics (materialized view P3c) para obter o evidence_count
+  // REAL via `total_executions`. Sem join, todo procedure recente vinha com
+  // `evidence_count: 0`, o que (segundo o threshold do detector) marca como
+  // "low evidence" e — se algum estava active — disparava ALTO + freeze do
+  // perfil. Issue P86-C2 ("evidence_count=0 sentinel freezes profiles").
+  //
+  // Correção: quando não há row em procedure_metrics (procedure nunca
+  // executou) usamos Number.POSITIVE_INFINITY → procedure não conta como
+  // baixa evidência ("ainda não temos evidência para julgar"). Quando há
+  // metrics, usamos `total_executions` como contagem real.
+  //
+  // Isso preserva o invariante "agente gera evidência, não muda quem é":
+  // sem evidência REAL coletada, o detector não classifica o procedure
+  // como drift e o decision engine não freeza o perfil.
   let recent_procedures: Array<{
     id: string;
     created_at: Date;
@@ -183,22 +191,30 @@ async function assembleDriftInput(
         id: procedure_definitions.id,
         status: procedure_definitions.status,
         created_at: procedure_definitions.created_at,
+        total_executions: procedure_metrics.total_executions,
       })
       .from(procedure_definitions)
-      .where(
-        sql`tenant_id = ${tenant_id}
-            AND agent_id = ${agent_id}
-            AND created_at >= ${cutoff.toISOString()}`,
+      .leftJoin(
+        procedure_metrics,
+        sql`${procedure_metrics.definition_id} = ${procedure_definitions.id}`,
       )
-      .orderBy(sql`created_at DESC`);
+      .where(
+        sql`${procedure_definitions.tenant_id} = ${tenant_id}
+            AND ${procedure_definitions.agent_id} = ${agent_id}
+            AND ${procedure_definitions.created_at} >= ${cutoff.toISOString()}`,
+      )
+      .orderBy(sql`${procedure_definitions.created_at} DESC`);
     recent_procedures = rows.map((r) => ({
       id: String(r.id),
       created_at: r.created_at instanceof Date ? r.created_at : new Date(r.created_at ?? Date.now()),
-      // procedure_definitions ainda não rastreia evidence_count direto — 0
-      // mantém o detector conservador (gatilha quando o agente cria muitos
-      // procedures sem evidência consolidada). Quando o tracking existir,
-      // basta join contra procedure_metrics aqui.
-      evidence_count: 0,
+      // Real evidence count via procedure_metrics; no metrics row =>
+      // POSITIVE_INFINITY (detector treats missing data as "not yet
+      // judged" and does NOT classify as low evidence). Prevents
+      // synthetic-zero freezes (P86-C2).
+      evidence_count:
+        typeof r.total_executions === 'number'
+          ? r.total_executions
+          : Number.POSITIVE_INFINITY,
       status: r.status,
     }));
   } catch (err) {

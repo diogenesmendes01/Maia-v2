@@ -2123,12 +2123,30 @@ export const operationalProfileVersionsRepo = {
       patch.rollback_reason = args.rollback_reason ?? null;
     }
 
+    // [P86-C3] tenant-scoped write predicate: even though `getById` above
+    // already filtered by tenant_id/agent_id, the actual UPDATE must
+    // include them in WHERE as defense-in-depth (an alert UUID alone is
+    // not enough authorization to mutate identity in a different tenant
+    // context). This is the inviolable tenant isolation invariant.
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const [updated] = await db
       .update(agent_operational_profile_versions)
       .set(patch as Partial<typeof agent_operational_profile_versions.$inferInsert>)
-      .where(eq(agent_operational_profile_versions.id, args.id))
+      .where(
+        and(
+          eq(agent_operational_profile_versions.id, args.id),
+          eq(agent_operational_profile_versions.tenant_id, tenant_id),
+          eq(agent_operational_profile_versions.agent_id, agent_id),
+        ),
+      )
       .returning();
-    return { ok: true, updated: updated! };
+    if (!updated) {
+      // Could only happen if tenant context changed between the read above
+      // and the update — treat as not_found to keep the contract.
+      return { ok: false, reason: 'not_found' };
+    }
+    return { ok: true, updated };
   },
 
   // Próxima version sequencial para (tenant_id, agent_id) corrente.
@@ -2210,18 +2228,32 @@ export const driftAlertsRepo = {
       .orderBy(desc(agent_drift_alerts.created_at));
   },
 
+  // [P86-C3] tenant-scoped: includes tenant_id AND agent_id predicates in
+  // the UPDATE so an alert UUID from another tenant cannot be resolved from
+  // the wrong context. Returns { ok, found } so callers can detect a
+  // forbidden/missing target without silently no-op'ing.
   async resolve(args: {
     id: string;
     resolution_note: string;
     resolved_by: string;
-  }): Promise<void> {
-    await db
+  }): Promise<{ ok: boolean; found: boolean }> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const updated = await db
       .update(agent_drift_alerts)
       .set({
         resolution_note: args.resolution_note,
         resolved_at: new Date(),
         resolved_by: args.resolved_by,
       })
-      .where(eq(agent_drift_alerts.id, args.id));
+      .where(
+        and(
+          eq(agent_drift_alerts.id, args.id),
+          eq(agent_drift_alerts.tenant_id, tenant_id),
+          eq(agent_drift_alerts.agent_id, agent_id),
+        ),
+      )
+      .returning({ id: agent_drift_alerts.id });
+    return { ok: updated.length > 0, found: updated.length > 0 };
   },
 };

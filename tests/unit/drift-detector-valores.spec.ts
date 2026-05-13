@@ -9,22 +9,28 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { AgentOperationalProfileVersion } from '@/db/schema.js';
 import type { DriftRecentMessage } from '@/cognition/drift/types.js';
 
-const messagesCreateMock = vi.fn();
+// [P86-C4] detector via callLLM (provider-agnostic).
+const { callLLMMock } = vi.hoisted(() => ({ callLLMMock: vi.fn() }));
 
-vi.mock('@anthropic-ai/sdk', () => {
-  const Anthropic = vi.fn().mockImplementation(() => ({
-    messages: { create: messagesCreateMock },
-  }));
-  return { default: Anthropic };
-});
+vi.mock('@/lib/claude.js', () => ({
+  callLLM: callLLMMock,
+}));
 
 import { valoresDetector } from '@/cognition/drift/valores.js';
 
-function makeAnthropicReply(jsonObj: Record<string, unknown>): {
-  content: Array<{ type: 'text'; text: string }>;
+function makeLLMReply(jsonObj: Record<string, unknown>): {
+  content: string;
+  tool_uses: unknown[];
+  stop_reason: 'end_turn';
+  usage: { input_tokens: number; output_tokens: number };
+  model: string;
 } {
   return {
-    content: [{ type: 'text', text: JSON.stringify(jsonObj) }],
+    content: JSON.stringify(jsonObj),
+    tool_uses: [],
+    stop_reason: 'end_turn',
+    usage: { input_tokens: 0, output_tokens: 0 },
+    model: 'mock-model',
   };
 }
 
@@ -70,12 +76,12 @@ function makeAgentMsg(text: string, id = 'm-' + Math.random().toString(36).slice
 
 describe('valoresDetector', () => {
   beforeEach(() => {
-    messagesCreateMock.mockReset();
+    callLLMMock.mockReset();
   });
 
   it('drift_detected=true → retorna DriftEvidence com type valores, payload com violated_principles', async () => {
-    messagesCreateMock.mockResolvedValueOnce(
-      makeAnthropicReply({
+    callLLMMock.mockResolvedValueOnce(
+      makeLLMReply({
         drift_detected: true,
         severity_hint: 'alto',
         violated_principles: [0],
@@ -102,8 +108,8 @@ describe('valoresDetector', () => {
   });
 
   it('drift_detected=false → retorna null', async () => {
-    messagesCreateMock.mockResolvedValueOnce(
-      makeAnthropicReply({
+    callLLMMock.mockResolvedValueOnce(
+      makeLLMReply({
         drift_detected: false,
         severity_hint: 'baixo',
         violated_principles: [],
@@ -120,15 +126,16 @@ describe('valoresDetector', () => {
     expect(out).toBeNull();
   });
 
-  it('Anthropic throws → retorna null (defensivo)', async () => {
-    messagesCreateMock.mockRejectedValueOnce(new Error('network exploded'));
+  // [P86-C4] callLLM error propagates instead of swallow.
+  it('callLLM throws → erro PROPAGA (não mais swallow)', async () => {
+    callLLMMock.mockRejectedValueOnce(new Error('network exploded'));
 
-    const out = await valoresDetector.detect({
-      profile_active: makeProfile(),
-      recent_messages: [makeAgentMsg('algo')],
-    });
-
-    expect(out).toBeNull();
+    await expect(
+      valoresDetector.detect({
+        profile_active: makeProfile(),
+        recent_messages: [makeAgentMsg('algo')],
+      }),
+    ).rejects.toThrow('network exploded');
   });
 
   it('sem princípios definidos → retorna null sem chamar Anthropic', async () => {
@@ -138,7 +145,7 @@ describe('valoresDetector', () => {
     });
 
     expect(out).toBeNull();
-    expect(messagesCreateMock).not.toHaveBeenCalled();
+    expect(callLLMMock).not.toHaveBeenCalled();
   });
 
   it('sem mensagens do agente → retorna null sem chamar Anthropic', async () => {
@@ -150,12 +157,16 @@ describe('valoresDetector', () => {
     });
 
     expect(out).toBeNull();
-    expect(messagesCreateMock).not.toHaveBeenCalled();
+    expect(callLLMMock).not.toHaveBeenCalled();
   });
 
   it('resposta sem JSON parseável → retorna null', async () => {
-    messagesCreateMock.mockResolvedValueOnce({
-      content: [{ type: 'text', text: 'sem json' }],
+    callLLMMock.mockResolvedValueOnce({
+      content: 'sem json',
+      tool_uses: [],
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 0, output_tokens: 0 },
+      model: 'mock-model',
     });
 
     const out = await valoresDetector.detect({
@@ -167,8 +178,8 @@ describe('valoresDetector', () => {
   });
 
   it('drift_detected=true sem campos opcionais → defaults aplicados (severity medio)', async () => {
-    messagesCreateMock.mockResolvedValueOnce(
-      makeAnthropicReply({ drift_detected: true }),
+    callLLMMock.mockResolvedValueOnce(
+      makeLLMReply({ drift_detected: true }),
     );
 
     const out = await valoresDetector.detect({
