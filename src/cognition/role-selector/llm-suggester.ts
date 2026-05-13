@@ -19,6 +19,7 @@
  */
 import Anthropic from '@anthropic-ai/sdk';
 import { runCognitiveModule } from '@/cognition/runner.js';
+import { config } from '@/config/env.js';
 import { SuggestedBy, RoleSelectorStrength } from '@/types/enums.js';
 import type { RoleSuggester, RoleCandidate, RoleSelectorInput } from './types.js';
 
@@ -38,7 +39,14 @@ export const llmSuggester: RoleSuggester = {
         fallback: null,
       },
       async () => {
-        const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY ?? '' });
+        // [P88-H5] Use validated env singleton instead of raw process.env.
+        // Direct process.env read would defeat the startup validator and
+        // silently send apiKey='' to Anthropic on missing config (opaque 401).
+        // If the key isn't set, fail fast and let runCognitiveModule fall back.
+        if (!config.ANTHROPIC_API_KEY) {
+          throw new Error('ANTHROPIC_API_KEY_not_configured');
+        }
+        const anthropic = new Anthropic({ apiKey: config.ANTHROPIC_API_KEY });
         const rolesBlock = input.available_roles
           .map(
             (r) =>

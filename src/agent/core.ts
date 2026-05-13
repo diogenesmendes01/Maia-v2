@@ -6,6 +6,7 @@ import {
   procedureSelectorDecisionsRepo,
   channelPoliciesRepo,
   rolesRepo,
+  roleSelectorDecisionsRepo,
 } from '@/db/repositories.js';
 import { resolveScope } from '@/governance/permissions.js';
 import { checkPendingFirst } from '@/agent/pending-gate.js';
@@ -187,7 +188,11 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
   // cross-tenant lookup propositalmente). Falhas caem em default/default
   // (legacy) para preservar compat com P0..P5 quando o canal não está
   // registrado em `channels`.
-  let resolved: { tenant_id: string; agent_id: string; channel_id: string | null } = {
+  let resolvedChannel: {
+    tenant_id: string;
+    agent_id: string;
+    channel_id: string | null;
+  } = {
     tenant_id: 'default',
     agent_id: 'default',
     channel_id: null,
@@ -197,7 +202,7 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
     try {
       const probe = await probeMessageForChannel(mensagem_id);
       if (probe) {
-        resolved = await resolveChannel(probe);
+        resolvedChannel = await resolveChannel(probe);
       }
     } catch (err) {
       logger.warn(
@@ -207,9 +212,32 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
     }
   }
 
+  // [P88-C1] Atomically adopt the mensagens row to the resolved (tenant,
+  // agent) BEFORE entering tenant context. Without this, the inner
+  // tenant-scoped `mensagensRepo.findById` returns null whenever the
+  // gateway persisted the row under a different tenant (e.g., `default`
+  // before the channel was registered), silently black-holing every
+  // non-default channel message on first FEATURE_MULTI_CHANNEL enable.
+  // Adopt is a no-op when the row is already on the resolved triplet, so
+  // safe to call unconditionally on the resolver-success path.
+  if (resolvedChannel.channel_id) {
+    try {
+      await mensagensRepo.adoptToResolvedTenantCrossTenant({
+        id: mensagem_id,
+        tenant_id: resolvedChannel.tenant_id,
+        agent_id: resolvedChannel.agent_id,
+      });
+    } catch (err) {
+      logger.warn(
+        { mensagem_id, err: (err as Error).message },
+        'agent.adopt_to_resolved_tenant_failed',
+      );
+    }
+  }
+
   await runWithTenantContext(
-    { tenant_id: resolved.tenant_id, agent_id: resolved.agent_id },
-    () => runAgentForMensagemInner(mensagem_id, resolved.channel_id),
+    { tenant_id: resolvedChannel.tenant_id, agent_id: resolvedChannel.agent_id },
+    () => runAgentForMensagemInner(mensagem_id, resolvedChannel.channel_id),
   );
 }
 
@@ -512,14 +540,42 @@ async function runAgentForMensagemInner(
   // channel resolver returned a real channel_id. Failures degrade silently
   // to "no role section in prompt" — role injection is non-essential.
   let activeRole: Role | null = null;
+  // [P88-C4] Announcement text (prepended to outbound) when policy.announce_mode
+  // permits emitting a "switching role" notice on action='switch'. Null = silent.
+  let roleAnnouncement: string | null = null;
   if (featureFlags.isEnabled(FeatureFlagName.MULTI_CHANNEL) && channel_id) {
     try {
       const policy = await channelPoliciesRepo.getByChannelId(channel_id);
       if (policy) {
-        const [availableRoles, currentRole] = await Promise.all([
+        // [P88-C2] Rehydrate `current_role` from the LAST decided role for
+        // this conversation, not from policy.default_role_id. Without this,
+        // switches don't persist across turns — turn N+1 always starts from
+        // default, so three consistent same-context turns each count as a
+        // fresh switch and the by_context cap fires backwards, punishing
+        // consistency. Falls back to policy.default_role_id only when no
+        // prior decision exists for this conversation (i.e., bootstrap).
+        const lastDecidedRoleId = await roleSelectorDecisionsRepo
+          .getLastDecidedRoleId(c.id)
+          .catch(() => null);
+        const currentRoleId = lastDecidedRoleId ?? policy.default_role_id;
+        const [activeRoles, currentRole] = await Promise.all([
           rolesRepo.listActive(),
-          rolesRepo.getById(policy.default_role_id),
+          rolesRepo.getById(currentRoleId),
         ]);
+        // [P88-H1] Enforce policy.allowed_role_ids — the available set
+        // passed to the selector is the policy's allowlist (plus the
+        // default role, which is always allowed). Without this filter
+        // every active tenant role was selectable regardless of policy.
+        const allowedIds = Array.isArray(policy.allowed_role_ids)
+          ? (policy.allowed_role_ids as string[])
+          : [];
+        const availableRoles =
+          allowedIds.length > 0
+            ? activeRoles.filter(
+                (r) =>
+                  allowedIds.includes(r.id) || r.id === policy.default_role_id,
+              )
+            : activeRoles;
         if (currentRole && availableRoles.length > 0) {
           const result = await selectRole({
             inbound_text: inbound.conteudo ?? '',
@@ -531,6 +587,31 @@ async function runAgentForMensagemInner(
             turno_id: inbound.id,
           });
           activeRole = result.decided_role;
+          // [P88-C4] Announce gating. The policy's `announce_mode` plus the
+          // boolean "did this switch actually change the user-perceived
+          // behaviour" decide whether to prepend a notice to the outbound:
+          //   - 'always':       announce on every action='switch'.
+          //   - 'never':        never announce.
+          //   - 'affects_user': announce iff the new role has a different
+          //                     display_name AND a non-empty prompt_addendum
+          //                     (heuristic for "the user will see a shift").
+          // We only consider action='switch' — keep_current/handoff/fallback
+          // do not warrant an announcement.
+          if (
+            result.action === 'switch' &&
+            result.decided_role.id !== currentRole.id
+          ) {
+            const announceMode = policy.announce_mode;
+            const affectsUser =
+              result.decided_role.display_name !== currentRole.display_name &&
+              !!(result.decided_role.prompt_addendum ?? '').trim();
+            const shouldAnnounce =
+              announceMode === 'always' ||
+              (announceMode === 'affects_user' && affectsUser);
+            if (shouldAnnounce) {
+              roleAnnouncement = `_(Mudando para o modo ${result.decided_role.display_name}.)_`;
+            }
+          }
         }
       }
     } catch (err) {
@@ -577,6 +658,9 @@ async function runAgentForMensagemInner(
       system,
       messages,
       tools,
+      // [P88-C4] Pass the precomputed role-switch announcement (if any) so
+      // react-loop can prepend it to the final assistant text before dispatch.
+      outboundPrefix: roleAnnouncement,
     });
     totalTokens = result.totalTokens;
     reactOutboundText = result.outboundText;

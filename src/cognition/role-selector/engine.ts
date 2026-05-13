@@ -21,7 +21,12 @@ import { roleSelectorDecisionsRepo } from '@/db/repositories.js';
 import { llmSuggester } from './llm-suggester.js';
 import { deterministicSuggester } from './deterministic-classifier.js';
 import { decidePolicy } from './policy-decider.js';
-import { SuggestedBy, RoleDecisionAction } from '@/types/enums.js';
+import {
+  SuggestedBy,
+  RoleDecisionAction,
+  DecidedBy,
+  SwitchBehavior,
+} from '@/types/enums.js';
 import type { RoleSelectorInput, RoleCandidate } from './types.js';
 import type { Role } from '@/db/schema.js';
 
@@ -31,7 +36,49 @@ export type RoleSelectorResult = {
   decision_id: string;
 };
 
+/**
+ * Strength scoring helper. Mirrors the WEAK<MEDIUM<STRONG ordering used by
+ * llm-suggester.ts (confidence-derived) and deterministic-classifier.ts
+ * (regex-derived). Used by the tiebreaker when suggesters disagree.
+ */
+function strengthScore(s: RoleCandidate['strength']): number {
+  if (s === 'strong') return 3;
+  if (s === 'medium') return 2;
+  return 1;
+}
+
 export async function selectRole(input: RoleSelectorInput): Promise<RoleSelectorResult> {
+  // [P88-H4] Short-circuit on locked policies — the policy decider would
+  // return keep_current regardless, and burning Haiku tokens + 3s latency
+  // for a no-op is hot-path waste. Locked is the most common config for
+  // the default Maia. Suggesters skipped; audit still records keep_current.
+  const policySwitchBehavior = input.policy.switch_behavior as SwitchBehavior;
+  if (policySwitchBehavior === SwitchBehavior.LOCKED) {
+    const baseCount = input.conversa_id
+      ? await roleSelectorDecisionsRepo.countSwitchesInConversation(input.conversa_id)
+      : 0;
+    const recorded = await roleSelectorDecisionsRepo.record({
+      conversa_id: input.conversa_id,
+      turno_id: input.turno_id,
+      channel_id: input.channel_id,
+      policy_id: input.policy.id,
+      current_role_id: input.current_role.id,
+      decided_role_id: input.current_role.id,
+      action: RoleDecisionAction.KEEP_CURRENT,
+      candidates: [],
+      conflicts: [],
+      suggested_by: SuggestedBy.NONE,
+      decided_by: DecidedBy.POLICY_RULE,
+      reason: 'policy locked',
+      switch_count_in_conversation: baseCount,
+    });
+    return {
+      decided_role: input.current_role,
+      action: RoleDecisionAction.KEEP_CURRENT,
+      decision_id: recorded.id,
+    };
+  }
+
   // Run both suggesters in parallel
   const [detResult, llmResult] = await Promise.all([
     deterministicSuggester.suggest(input),
@@ -43,19 +90,35 @@ export async function selectRole(input: RoleSelectorInput): Promise<RoleSelector
   );
   const conflicts: Array<{ a: string; b: string; reason: string }> = [];
 
-  // Prefer deterministic if both present and they agree
-  // If they disagree, deterministic wins (cheaper, more predictable, audited via conflicts)
+  // Conflict resolution. Default: deterministic wins (cheaper, regex source-
+  // of-truth, audited via conflicts[]). Exception per [P88-H3] — respect a
+  // meaningful strength delta: when the LLM candidate is STRICTLY STRONGER
+  // (one full strength tier higher) than the deterministic one, the LLM wins
+  // and the override is recorded in conflicts[]. A "medium vs medium" or
+  // "strong vs medium" with the same confidence still picks deterministic.
   let chosenCandidate: RoleCandidate | null = null;
   if (detResult && llmResult) {
     if (detResult.role_id === llmResult.role_id) {
       chosenCandidate = detResult;
     } else {
-      conflicts.push({
-        a: detResult.role_key,
-        b: llmResult.role_key,
-        reason: 'suggesters_disagree',
-      });
-      chosenCandidate = detResult;
+      const detScore = strengthScore(detResult.strength);
+      const llmScore = strengthScore(llmResult.strength);
+      const llmWinsOnStrength = llmScore > detScore;
+      if (llmWinsOnStrength) {
+        conflicts.push({
+          a: detResult.role_key,
+          b: llmResult.role_key,
+          reason: 'llm_stronger_signal',
+        });
+        chosenCandidate = llmResult;
+      } else {
+        conflicts.push({
+          a: detResult.role_key,
+          b: llmResult.role_key,
+          reason: 'suggesters_disagree',
+        });
+        chosenCandidate = detResult;
+      }
     }
   } else {
     chosenCandidate = detResult ?? llmResult;

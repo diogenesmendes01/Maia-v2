@@ -297,4 +297,74 @@ describe('selectRole — orquestrador', () => {
     expect(payload.switch_count_in_conversation).toBe(3); // 2 + 1
     expect(countSwitchesMock).toHaveBeenCalledWith('conv-1');
   });
+
+  // [P88-H4] Locked policies skip suggesters entirely (hot-path waste).
+  it('LOCKED short-circuit → suggesters NOT called, audit records keep_current', async () => {
+    const lockedInput = {
+      ...makeInput({ conversa_id: 'conv-locked' }),
+      policy: { ...makePolicy(), switch_behavior: SwitchBehavior.LOCKED },
+    };
+
+    const out = await selectRole(lockedInput);
+
+    expect(detSuggestMock).not.toHaveBeenCalled();
+    expect(llmSuggestMock).not.toHaveBeenCalled();
+    expect(decidePolicyMock).not.toHaveBeenCalled();
+    expect(out.action).toBe(RoleDecisionAction.KEEP_CURRENT);
+    expect(out.decided_role.id).toBe('role-default');
+    expect(recordMock).toHaveBeenCalledTimes(1);
+    const payload = recordMock.mock.calls[0]![0] as {
+      action: RoleDecisionAction;
+      decided_by: DecidedBy;
+      candidates: unknown[];
+      suggested_by: SuggestedBy;
+      reason: string;
+    };
+    expect(payload.action).toBe(RoleDecisionAction.KEEP_CURRENT);
+    expect(payload.decided_by).toBe(DecidedBy.POLICY_RULE);
+    expect(payload.candidates).toEqual([]);
+    expect(payload.suggested_by).toBe(SuggestedBy.NONE);
+    expect(payload.reason).toBe('policy locked');
+  });
+
+  // [P88-H3] When suggesters disagree, a strictly stronger LLM signal wins.
+  it('suggesters discordam + LLM strength STRONG > det MEDIUM → LLM wins, conflict registra llm_stronger_signal', async () => {
+    const detCandidate = makeCandidate({
+      role_id: 'role-suporte',
+      role_key: 'suporte',
+      strength: RoleSelectorStrength.MEDIUM,
+      confidence: 0.65,
+      suggested_by: SuggestedBy.DETERMINISTIC_CLASSIFIER,
+    });
+    const llmCandidate = makeCandidate({
+      role_id: 'role-comercial',
+      role_key: 'comercial',
+      strength: RoleSelectorStrength.STRONG,
+      confidence: 0.95,
+      suggested_by: SuggestedBy.LLM_CLASSIFIER,
+    });
+    detSuggestMock.mockResolvedValue(detCandidate);
+    llmSuggestMock.mockResolvedValue(llmCandidate);
+    decidePolicyMock.mockResolvedValue({
+      decided_role: comercialRole,
+      action: RoleDecisionAction.SWITCH,
+      decided_by: DecidedBy.POLICY_RULE,
+      reason: 'llm stronger',
+    });
+
+    await selectRole(makeInput());
+
+    const payload = recordMock.mock.calls[0]![0] as {
+      conflicts: Array<{ a: string; b: string; reason: string }>;
+      suggested_by: SuggestedBy;
+      suggested_role_id?: string;
+    };
+    expect(payload.conflicts).toHaveLength(1);
+    expect(payload.conflicts[0]!.reason).toBe('llm_stronger_signal');
+    expect(payload.suggested_by).toBe(SuggestedBy.LLM_CLASSIFIER);
+    expect(payload.suggested_role_id).toBe('role-comercial');
+    // The policy decider received the LLM candidate (the stronger one).
+    const decideArg = decidePolicyMock.mock.calls[0]![0] as { candidate: RoleCandidate };
+    expect(decideArg.candidate.role_id).toBe('role-comercial');
+  });
 });

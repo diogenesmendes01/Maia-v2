@@ -27,7 +27,10 @@
  * SEM IMPORTS DE LLM SDK. Acceptance gate #4 da spec roda grep nesta linha.
  */
 import { DecidedBy, RoleDecisionAction, SwitchBehavior } from '@/types/enums.js';
-import { shouldBlockSwitchByOscillation } from './oscillation-tracker.js';
+import {
+  shouldBlockSwitchByOscillation,
+  isWithinCooldownWindow,
+} from './oscillation-tracker.js';
 import type { RoleSelectorInput, RoleCandidate } from './types.js';
 import type { Role } from '@/db/schema.js';
 
@@ -101,6 +104,20 @@ export async function decidePolicy(args: {
     };
   }
 
+  // [P88-H1] Candidate must be in the policy's allowed set (the caller
+  // already filtered available_roles by allowed_role_ids; this is the
+  // second-layer enforcement so a stale candidate from an out-of-band
+  // suggester still gets rejected). If not, fall back rather than switch.
+  const targetInAvailable = findRoleById(input.available_roles, candidate.role_id);
+  if (!targetInAvailable) {
+    return {
+      decided_role: input.current_role,
+      action: RoleDecisionAction.FALLBACK,
+      decided_by: DecidedBy.FALLBACK_RULE,
+      reason: 'candidate role not in available_roles (allowed_role_ids violation)',
+    };
+  }
+
   // 4. BY_CONTEXT — apply guards
   if (switch_behavior === SwitchBehavior.BY_CONTEXT) {
     const guards = policy.by_context_guards as {
@@ -111,14 +128,44 @@ export async function decidePolicy(args: {
     };
     const minConf = guards.min_confidence_to_switch ?? 0.7;
     const maxSwitches = guards.max_switches_per_conversation ?? 3;
+    // [P88-H4] Read cooldown_turns + required_strength_delta from the JSONB
+    // guard payload. Previously declared in the migration default JSON but
+    // never consumed — operators configuring them expected enforcement.
+    const cooldownTurns = guards.cooldown_turns ?? 0;
+    const requiredStrengthDelta = guards.required_strength_delta ?? 0;
 
-    if (candidate.confidence < minConf) {
+    // Base threshold: min_confidence_to_switch + required_strength_delta.
+    // The delta forces the candidate to clear the minimum by an extra
+    // margin, dampening switches on borderline signals.
+    const effectiveMinConf = minConf + Math.max(0, requiredStrengthDelta);
+    if (candidate.confidence < effectiveMinConf) {
       return {
         decided_role: input.current_role,
         action: RoleDecisionAction.KEEP_CURRENT,
         decided_by: DecidedBy.POLICY_RULE,
-        reason: `confidence ${candidate.confidence.toFixed(2)} < min ${minConf}`,
+        reason:
+          requiredStrengthDelta > 0
+            ? `confidence ${candidate.confidence.toFixed(2)} < min ${minConf} + delta ${requiredStrengthDelta}`
+            : `confidence ${candidate.confidence.toFixed(2)} < min ${minConf}`,
       };
+    }
+
+    // [P88-H4] Cooldown guard: at least `cooldown_turns` turns must pass
+    // between switches in this conversation. Blocks if there was already
+    // a switch in the last N turns. cooldown=0 disables (default).
+    if (input.conversa_id && cooldownTurns > 0) {
+      const inCooldown = await isWithinCooldownWindow({
+        conversa_id: input.conversa_id,
+        cooldown_turns: cooldownTurns,
+      });
+      if (inCooldown.blocked) {
+        return {
+          decided_role: input.current_role,
+          action: RoleDecisionAction.KEEP_CURRENT,
+          decided_by: DecidedBy.POLICY_RULE,
+          reason: `cooldown active (switch in last ${cooldownTurns} turns)`,
+        };
+      }
     }
 
     // Oscillation guard
@@ -137,14 +184,11 @@ export async function decidePolicy(args: {
       }
     }
 
-    const target = findRoleById(input.available_roles, candidate.role_id);
     return {
-      decided_role: target ?? input.current_role,
-      action: target ? RoleDecisionAction.SWITCH : RoleDecisionAction.FALLBACK,
-      decided_by: target ? DecidedBy.POLICY_RULE : DecidedBy.FALLBACK_RULE,
-      reason: target
-        ? `by_context approved (conf=${candidate.confidence.toFixed(2)} >= ${minConf})`
-        : 'candidate role not in available_roles',
+      decided_role: targetInAvailable,
+      action: RoleDecisionAction.SWITCH,
+      decided_by: DecidedBy.POLICY_RULE,
+      reason: `by_context approved (conf=${candidate.confidence.toFixed(2)} >= ${effectiveMinConf.toFixed(2)})`,
     };
   }
 

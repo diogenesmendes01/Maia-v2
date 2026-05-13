@@ -418,6 +418,25 @@ export const mensagensRepo = {
       .set({ processada_em: new Date(), tokens_usados: tokens ?? null })
       .where(eq(mensagens.id, id));
   },
+
+  // [P88-C1] EXPLICITLY bypasses applyTenantGuard — the channel resolver
+  // runs BEFORE tenant context exists (it's the entry point that DISCOVERS
+  // which tenant owns the inbound). If a non-default channel resolves to
+  // (tenantX, agentX) but the gateway persisted the row under (default,
+  // default), the post-resolution tenant-scoped findById would return null
+  // and the turn would be silently dropped. This method atomically adopts
+  // the row to the resolved triplet so the inner tenant-scoped read finds
+  // it. Same sanctioned-bypass pattern as channelsRepo.findByExternalCrossTenant.
+  async adoptToResolvedTenantCrossTenant(args: {
+    id: string;
+    tenant_id: string;
+    agent_id: string;
+  }): Promise<void> {
+    await db
+      .update(mensagens)
+      .set({ tenant_id: args.tenant_id, agent_id: args.agent_id })
+      .where(eq(mensagens.id, args.id));
+  },
 };
 
 export const entidadesRepo = {
@@ -2863,11 +2882,25 @@ export const channelsRepo = {
       );
   },
 
-  async deactivate(id: string): Promise<void> {
-    await db
+  // [P88-C3] Tenant-scoped: write paths MUST enforce isolation. Without
+  // tenant/agent predicates, any caller with another tenant's channel UUID
+  // could disable that channel (cross-tenant DoS). Read-side filters here
+  // were already tenant-scoped — this aligns the destructive path.
+  async deactivate(id: string): Promise<{ rowCount: number }> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const result = await db
       .update(channels)
       .set({ active: false, updated_at: new Date() })
-      .where(eq(channels.id, id));
+      .where(
+        and(
+          eq(channels.tenant_id, tenant_id),
+          eq(channels.agent_id, agent_id),
+          eq(channels.id, id),
+        ),
+      )
+      .returning({ id: channels.id });
+    return { rowCount: result.length };
   },
 };
 
@@ -2961,11 +2994,23 @@ export const rolesRepo = {
       );
   },
 
-  async deactivate(id: string): Promise<void> {
-    await db
+  // [P88-C3] Tenant-scoped: same justification as channelsRepo.deactivate.
+  // Cross-tenant deactivation would break the inviolable isolation invariant.
+  async deactivate(id: string): Promise<{ rowCount: number }> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const result = await db
       .update(roles)
       .set({ active: false, updated_at: new Date() })
-      .where(eq(roles.id, id));
+      .where(
+        and(
+          eq(roles.tenant_id, tenant_id),
+          eq(roles.agent_id, agent_id),
+          eq(roles.id, id),
+        ),
+      )
+      .returning({ id: roles.id });
+    return { rowCount: result.length };
   },
 };
 
@@ -3123,6 +3168,54 @@ export const roleSelectorDecisionsRepo = {
         ),
       )
       .orderBy(desc(role_selector_decisions.decided_at));
+  },
+
+  // [P88-C2] Returns the most recently DECIDED role for this conversation
+  // (across all turns). Used by the role selector to rehydrate the current
+  // role each turn — without this, `current_role` resets to policy.default
+  // every turn, breaking the `by_context` anti-osc lock (it would punish
+  // consistency by counting three same-context turns as three switches).
+  async getLastDecidedRoleId(conversa_id: string): Promise<string | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select({ decided_role_id: role_selector_decisions.decided_role_id })
+      .from(role_selector_decisions)
+      .where(
+        and(
+          eq(role_selector_decisions.tenant_id, tenant_id),
+          eq(role_selector_decisions.agent_id, agent_id),
+          eq(role_selector_decisions.conversa_id, conversa_id),
+        ),
+      )
+      .orderBy(desc(role_selector_decisions.decided_at))
+      .limit(1);
+    return rows[0]?.decided_role_id ?? null;
+  },
+
+  // [P88-H4 cooldown_turns] Counts decisions in this conversation in the
+  // last N turns (i.e., the N most recent decisions). Used by the policy
+  // decider to enforce `cooldown_turns` — require N turns between switches.
+  async countSwitchesInLastNTurns(args: {
+    conversa_id: string;
+    n: number;
+  }): Promise<number> {
+    if (args.n <= 0) return 0;
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select({ action: role_selector_decisions.action })
+      .from(role_selector_decisions)
+      .where(
+        and(
+          eq(role_selector_decisions.tenant_id, tenant_id),
+          eq(role_selector_decisions.agent_id, agent_id),
+          eq(role_selector_decisions.conversa_id, args.conversa_id),
+        ),
+      )
+      .orderBy(desc(role_selector_decisions.decided_at))
+      .limit(args.n);
+    return rows.filter((r) => r.action === 'switch').length;
   },
 
   async countSwitchesInConversation(conversa_id: string): Promise<number> {
