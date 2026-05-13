@@ -56,6 +56,28 @@ describe('buildToolSummary', () => {
     expect(s.result_keys?.transacao_id).toBe('33333333-3333-3333-3333-333333333333');
   });
 
+  it('does NOT persist saldo_apos in register_transaction result_keys (Codex C2: sensitive-balance leak)', () => {
+    // register_transaction is not flagged sensitive in the tool registry, so
+    // persisting saldo_apos would let the next turn answer balance follow-ups
+    // from the persisted event without re-calling query_balance — bypassing
+    // the view-once / sensitive-output controls. The summary must omit it.
+    const s = buildToolSummary({
+      tool_call_id: 'tu_leak',
+      tool_name: 'register_transaction',
+      side_effect: 'write',
+      args: { natureza: 'despesa', valor: 240, descricao: 'mercado' },
+      result: {
+        transacao_id: '33333333-3333-3333-3333-333333333333',
+        saldo_apos: 1500.55,
+      },
+      status: 'success',
+    });
+
+    expect(s.result_keys?.saldo_apos).toBeUndefined();
+    expect(JSON.stringify(s)).not.toContain('saldo_apos');
+    expect(JSON.stringify(s)).not.toContain('1500.55');
+  });
+
   it('summarizes register_transaction duplicate_suspected branch distinctly', () => {
     const s = buildToolSummary({
       tool_call_id: 'tu_dup',

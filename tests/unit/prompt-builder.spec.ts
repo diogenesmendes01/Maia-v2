@@ -490,6 +490,192 @@ describe('prompt-builder — contradiction overlay', () => {
   });
 });
 
+describe('prompt-builder — contradiction overlay (PR #74 review fixes)', () => {
+  it('Superpowers I1: does NOT emit overlay when the successful tool occurred_at is older than 24h (TTL)', async () => {
+    const summary = {
+      tool_call_id: 'tu_stale',
+      tool_name: 'schedule_reminder',
+      status: 'success',
+      side_effect: 'write',
+      result_summary: 'lembrete agendado',
+      occurred_at: '2026-05-09T14:00:00Z', // > 24h before inbound
+    };
+    h.recentInConversation.mockResolvedValue([
+      mkAssistantMsg({
+        conteudo: 'Não consegui agendar os lembretes — backend retornou erro.',
+        ferramentas_chamadas: [summary],
+        created_at: new Date('2026-05-09T14:00:00Z'),
+      }),
+      mkInbound({ created_at: new Date('2026-05-11T15:00:00Z') }),
+    ]);
+    const { system } = await build({
+      inbound: mkInbound({ created_at: new Date('2026-05-11T15:00:00Z') }),
+    });
+    expect(system).not.toMatch(/Conflito detectado/i);
+  });
+
+  it('Superpowers I2: does NOT emit overlay when the same message also contains a positive-confirmation phrase ("agora foi")', async () => {
+    const summary = {
+      tool_call_id: 'tu_self_corrected',
+      tool_name: 'schedule_reminder',
+      status: 'success',
+      side_effect: 'write',
+      result_summary: 'lembrete agendado',
+      occurred_at: '2026-05-11T14:59:00Z',
+    };
+    h.recentInConversation.mockResolvedValue([
+      mkAssistantMsg({
+        conteudo: 'Deu erro na primeira tentativa, mas agora foi: lembretes agendados.',
+        ferramentas_chamadas: [summary],
+      }),
+      mkInbound(),
+    ]);
+    const { system } = await build();
+    expect(system).not.toMatch(/Conflito detectado/i);
+  });
+
+  it('Superpowers I2: does NOT emit overlay when the message contains "refiz e funcionou"', async () => {
+    const summary = {
+      tool_call_id: 'tu_redo',
+      tool_name: 'schedule_reminder',
+      status: 'success',
+      side_effect: 'write',
+      result_summary: 'lembrete agendado',
+      occurred_at: '2026-05-11T14:59:00Z',
+    };
+    h.recentInConversation.mockResolvedValue([
+      mkAssistantMsg({
+        conteudo: 'Falhou na primeira, mas refiz e funcionou — agendamento criado.',
+        ferramentas_chamadas: [summary],
+      }),
+      mkInbound(),
+    ]);
+    const { system } = await build();
+    expect(system).not.toMatch(/Conflito detectado/i);
+  });
+});
+
+describe('prompt-builder — events block (PR #74 Codex C3: batch cardinality)', () => {
+  it('preserves ALL write/communication successes from the most recent assistant turn even past K=5', async () => {
+    // Codex C3 repro: 6 schedule_reminder writes from the same turn must
+    // all surface, not be truncated to 5.
+    const writes = Array.from({ length: 6 }, (_, i) => ({
+      tool_call_id: 'tu_w' + i,
+      tool_name: 'schedule_reminder',
+      status: 'success' as const,
+      side_effect: 'write' as const,
+      result_summary: `lembrete batch ${i}`,
+      occurred_at: '2026-05-11T14:58:00Z',
+    }));
+    h.recentInConversation.mockResolvedValue([
+      mkAssistantMsg({ ferramentas_chamadas: writes }),
+      mkInbound(),
+    ]);
+    const { system } = await build();
+    for (let i = 0; i < 6; i++) {
+      expect(system).toContain(`lembrete batch ${i}`);
+    }
+  });
+
+  it('still truncates older or lower-priority events when budget is exceeded', async () => {
+    // Most-recent turn has 3 writes (pinned). Older turn has 6 reads.
+    // Pinned writes (3) take precedence; remaining budget of K-3 = 2 fills
+    // with the most-recent reads. Older 4 reads are dropped.
+    const writes = Array.from({ length: 3 }, (_, i) => ({
+      tool_call_id: 'tu_w' + i,
+      tool_name: 'schedule_reminder',
+      status: 'success' as const,
+      side_effect: 'write' as const,
+      result_summary: `write recent ${i}`,
+      occurred_at: '2026-05-11T14:58:00Z',
+    }));
+    const reads = Array.from({ length: 6 }, (_, i) => ({
+      tool_call_id: 'tu_r' + i,
+      tool_name: 'query_balance',
+      status: 'success' as const,
+      side_effect: 'read' as const,
+      result_summary: `read older ${i}`,
+      // Stagger occurred_at so the sort is deterministic.
+      occurred_at: new Date(Date.parse('2026-05-11T14:00:00Z') + i * 1000).toISOString(),
+    }));
+    h.recentInConversation.mockResolvedValue([
+      mkAssistantMsg({
+        id: 'recent-asst',
+        ferramentas_chamadas: writes,
+        created_at: new Date('2026-05-11T14:58:00Z'),
+        processada_em: new Date('2026-05-11T14:58:00Z'),
+      }),
+      mkAssistantMsg({
+        id: 'older-asst',
+        ferramentas_chamadas: reads,
+        created_at: new Date('2026-05-11T14:00:00Z'),
+        processada_em: new Date('2026-05-11T14:00:00Z'),
+      }),
+      mkInbound(),
+    ]);
+    const { system } = await build();
+    // All 3 recent writes survive.
+    for (let i = 0; i < 3; i++) {
+      expect(system).toContain(`write recent ${i}`);
+    }
+    // At most 2 reads survive (budget = 5 - 3 = 2).
+    let readsIncluded = 0;
+    for (let i = 0; i < 6; i++) {
+      if (system.includes(`read older ${i}`)) readsIncluded++;
+    }
+    expect(readsIncluded).toBeLessThanOrEqual(2);
+  });
+});
+
+describe('prompt-builder — role coalescing and event-only rows (PR #74)', () => {
+  it('Superpowers I5: coalesces adjacent same-role persisted messages into a single LLMMessage', async () => {
+    // Two unprocessed user messages in a row (rare but possible during
+    // debouncing edge cases). Without coalescing, the messages array
+    // ends with two user turns then the inbound user turn = three
+    // adjacent user roles.
+    const a = mkUserMsg({ id: 'u-a', conteudo: 'parte 1', created_at: new Date('2026-05-11T14:57:00Z') });
+    const b = mkUserMsg({ id: 'u-b', conteudo: 'parte 2', created_at: new Date('2026-05-11T14:58:00Z') });
+    h.recentInConversation.mockResolvedValue([b, a, mkInbound({ conteudo: 'parte 3' })]);
+    const { messages } = await build({ inbound: mkInbound({ conteudo: 'parte 3' }) });
+    // No two adjacent same-role messages.
+    for (let i = 1; i < messages.length; i++) {
+      expect(messages[i].role).not.toBe(messages[i - 1].role);
+    }
+    // Final user message contains all three parts in order.
+    const lastUser = messages[messages.length - 1];
+    expect(lastUser.role).toBe('user');
+    expect(String(lastUser.content)).toContain('parte 1');
+    expect(String(lastUser.content)).toContain('parte 2');
+    expect(String(lastUser.content)).toContain('parte 3');
+  });
+
+  it('Codex C1: skips event-only placeholder rows in the messages array but reidrates their tool summaries in the events block', async () => {
+    const summary = {
+      tool_call_id: 'tu_flushed',
+      tool_name: 'schedule_reminder',
+      status: 'success',
+      side_effect: 'write',
+      result_summary: 'lembrete agendado (flush)',
+      occurred_at: '2026-05-11T14:59:00Z',
+    };
+    const eventOnlyRow = mkAssistantMsg({
+      id: 'msg-event-only',
+      tipo: 'evento',
+      conteudo: '',
+      ferramentas_chamadas: [summary],
+      metadata: { event_only: true, flush_reason: 'iteration_cap' },
+    });
+    h.recentInConversation.mockResolvedValue([eventOnlyRow, mkInbound()]);
+    const { system, messages } = await build();
+    // Events block surfaces the summary.
+    expect(system).toContain('Eventos confirmados pelo backend');
+    expect(system).toContain('lembrete agendado (flush)');
+    // The messages array DOES NOT include the empty assistant row.
+    const assistantMessages = messages.filter((m) => m.role === 'assistant');
+    expect(assistantMessages).toHaveLength(0);
+  });
+});
+
 describe('prompt-builder — raw conversation history preserved', () => {
   it('leaves assistant message conteudo unchanged in the messages array (no rewrite/collapse)', async () => {
     const summary = {

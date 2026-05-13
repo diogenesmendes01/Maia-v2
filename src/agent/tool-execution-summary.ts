@@ -85,11 +85,14 @@ const REGISTER_TRANSACTION: Summarizer = (_args, result) => {
       result_summary: 'transação suspeita de duplicata — não criou nova; existente já encontrada',
     };
   }
+  // Codex C2 (PR #74): do NOT persist `saldo_apos` in result_keys.
+  // `register_transaction` is not flagged sensitive in the tool registry, so
+  // any follow-up answered from a persisted balance would bypass the
+  // view-once / sensitive-output controls reserved for `query_balance`.
+  // The next turn must re-query through `query_balance` to surface a balance.
   const transacao_id = asString(result.transacao_id);
-  const saldo_apos = asNumber(result.saldo_apos);
   const result_keys: ResultKeys = {};
   if (transacao_id) result_keys.transacao_id = transacao_id;
-  if (typeof saldo_apos === 'number') result_keys.saldo_apos = saldo_apos;
   return {
     result_summary: `transação registrada (id ${transacao_id ?? '?'})`,
     result_keys,
@@ -248,8 +251,21 @@ export function buildToolSummary(input: {
   args: unknown;
   result: unknown;
   status: 'success' | 'error';
+  /**
+   * Superpowers I4 (PR #74): `occurred_at` semantics.
+   *
+   * Pass the dispatch START timestamp (captured BEFORE `dispatchTool` returns)
+   * so the events-block 24h window-filter uses the user's reference frame
+   * (when the side effect was REQUESTED), not the post-completion wall clock.
+   * Matters for long-running tools (PDF gen, external APIs) where dispatch
+   * and completion straddle the window boundary.
+   *
+   * When omitted, falls back to `Date.now()` (completion time) for backwards
+   * compatibility with any caller that doesn't have a dispatch timestamp.
+   */
+  dispatched_at?: number;
 }): ToolExecutionSummary {
-  const occurred_at = new Date().toISOString();
+  const occurred_at = new Date(input.dispatched_at ?? Date.now()).toISOString();
   const side_effect = normalizeSideEffect(input.side_effect);
 
   if (input.status === 'error') {

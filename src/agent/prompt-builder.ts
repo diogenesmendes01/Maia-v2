@@ -81,6 +81,28 @@ verdade atual. Descarte conclusões anteriores baseadas no escopo antigo
 const FAILURE_PHRASE_RE =
   /(n[ãa]o consegui|n[ãa]o foi poss[íi]vel|falhou|deu erro|deu errado|n[ãa]o funcionou|erro do backend|backend retornou erro|n[ãa]o est[áa] (?:sendo )?(?:carregado|carregada)|backend.*erro)/i;
 
+/**
+ * Superpowers I2 (PR #74): self-correction guard for the contradiction overlay.
+ *
+ * If the same assistant message ALSO contains a positive-confirmation /
+ * self-correction phrase ("agora foi", "funcionou", "refiz e deu certo",
+ * "tudo certo", etc.), the message is NOT a contradiction of a successful
+ * tool — Maia already corrected herself in the same breath. Suppress the
+ * overlay to avoid telling the LLM its own already-correct narrative is
+ * invalid.
+ *
+ * Each alternative starts with a token that "Não/Nao" cannot precede
+ * naturally (or carries its own qualifier like "refiz e"), so we don't have
+ * to chase JS-portable lookbehind escapes. The earlier draft included
+ * `consegui\s+(?:agendar|...)`, which incorrectly matched inside
+ * "Não consegui agendar" and suppressed legitimate contradictions; the
+ * "consegui …" stem has been removed as a result — `agora foi`, `funcionou`,
+ * `deu certo`, etc. carry the same self-correction semantics without the
+ * negation false-positive.
+ */
+const POSITIVE_CONFIRMATION_RE =
+  /(agora\s+(?:foi|funcionou|deu\s+certo|consegui)|(?:^|[\s.,;:!?])funcionou(?:\s|$|[.,;:!?])|deu\s+certo|refiz\s+e\s+(?:foi|funcionou|deu\s+certo)|tudo\s+certo|conclu[íi]do\s+com\s+sucesso|sucesso\s+(?:agora|na\s+(?:segunda|2[aª])\s+tentativa))/i;
+
 const EVENTS_BLOCK_MAX_ITEMS = 5;
 const EVENTS_BLOCK_WINDOW_MS = 24 * 60 * 60 * 1000;
 
@@ -149,30 +171,71 @@ function selectEventsForBlock(
   turns: AssistantTurn[],
   now: number,
 ): ToolExecutionSummary[] {
-  const successOnly: ToolExecutionSummary[] = [];
-  for (const t of turns) {
+  // Codex C3 (PR #74): we used to truncate uniformly at K=5, which silently
+  // dropped write/communication successes from a single turn that legitimately
+  // executed 6+ tools (e.g. the six-reminder integration scenario). The fix:
+  // preserve ALL write/communication successes from the MOST RECENT assistant
+  // turn before applying the cap to older or read-tier events. Older write/
+  // comm successes and any read successes share the remaining budget under
+  // the existing priority-then-recency sort.
+  const isWriteOrComm = (s: ToolExecutionSummary): boolean =>
+    s.side_effect === 'write' || s.side_effect === 'communication';
+
+  const passes = (s: ToolExecutionSummary): boolean => {
+    if (s.status !== 'success') return false;
+    const occurredMs = Date.parse(s.occurred_at);
+    if (!Number.isFinite(occurredMs)) return false;
+    if (now - occurredMs > EVENTS_BLOCK_WINDOW_MS) return false;
+    return true;
+  };
+
+  // Identify the most recent assistant turn that has at least one
+  // qualifying summary (recent + success). `turns` is already in
+  // most-recent-first order from `recentInConversation`.
+  let mostRecentTurnIndex = -1;
+  for (let i = 0; i < turns.length; i++) {
+    const t = turns[i];
+    if (t && t.summaries.some(passes)) {
+      mostRecentTurnIndex = i;
+      break;
+    }
+  }
+
+  // Pinned set: all write/communication successes from the most recent
+  // assistant turn — cardinality-preserving, never truncated.
+  const pinned: ToolExecutionSummary[] = [];
+  const rest: ToolExecutionSummary[] = [];
+  for (let i = 0; i < turns.length; i++) {
+    const t = turns[i];
+    if (!t) continue;
     for (const s of t.summaries) {
-      if (s.status !== 'success') continue;
-      const occurredMs = Date.parse(s.occurred_at);
-      if (!Number.isFinite(occurredMs)) continue;
-      if (now - occurredMs > EVENTS_BLOCK_WINDOW_MS) continue;
-      successOnly.push(s);
+      if (!passes(s)) continue;
+      if (i === mostRecentTurnIndex && isWriteOrComm(s)) {
+        pinned.push(s);
+      } else {
+        rest.push(s);
+      }
     }
   }
 
   // Most recent first, side-effect priority (write/communication > read).
+  // Within a priority tier, recency wins.
   const priorityRank = (s: ToolExecutionSummary): number => {
-    if (s.side_effect === 'write' || s.side_effect === 'communication') return 0;
+    if (isWriteOrComm(s)) return 0;
     if (s.side_effect === 'read') return 1;
     return 2;
   };
-  successOnly.sort((a, b) => {
+  const byPriorityThenRecency = (a: ToolExecutionSummary, b: ToolExecutionSummary): number => {
     const r = priorityRank(a) - priorityRank(b);
     if (r !== 0) return r;
     return Date.parse(b.occurred_at) - Date.parse(a.occurred_at);
-  });
+  };
+  pinned.sort(byPriorityThenRecency);
+  rest.sort(byPriorityThenRecency);
 
-  return successOnly.slice(0, EVENTS_BLOCK_MAX_ITEMS);
+  // Pinned writes go first. Fill remaining budget (if any) from `rest`.
+  const remaining = Math.max(0, EVENTS_BLOCK_MAX_ITEMS - pinned.length);
+  return [...pinned, ...rest.slice(0, remaining)];
 }
 
 function renderEventsBlock(events: ToolExecutionSummary[]): string {
@@ -189,15 +252,27 @@ function renderEventsBlock(events: ToolExecutionSummary[]): string {
   return ['## Eventos confirmados pelo backend', ...lines].join('\n');
 }
 
-function detectContradictions(turns: AssistantTurn[]): ToolExecutionSummary[] {
+function detectContradictions(turns: AssistantTurn[], now: number): ToolExecutionSummary[] {
+  // Superpowers I1 (PR #74): apply the same 24h window the events block uses.
+  // Without TTL the overlay re-fires on every subsequent turn for stale
+  // failure-phrase messages from 5 turns ago, becoming a new anchoring noise
+  // source instead of fixing the original one.
+  //
+  // Superpowers I2 (PR #74): skip messages where Maia already self-corrected
+  // (positive-confirmation phrase in the same message). "Refiz e funcionou"
+  // is NOT a contradiction of a successful tool — it's an accurate narrative.
   const overlays: ToolExecutionSummary[] = [];
   for (const t of turns) {
     const text = t.message.conteudo ?? '';
     if (!text) continue;
     if (!FAILURE_PHRASE_RE.test(text)) continue;
+    if (POSITIVE_CONFIRMATION_RE.test(text)) continue;
     for (const s of t.summaries) {
       if (s.status !== 'success') continue;
       if (s.side_effect !== 'write' && s.side_effect !== 'communication') continue;
+      const occurredMs = Date.parse(s.occurred_at);
+      if (!Number.isFinite(occurredMs)) continue;
+      if (now - occurredMs > EVENTS_BLOCK_WINDOW_MS) continue;
       const kws = DOMAIN_KEYWORDS[s.tool_name];
       if (!kws || kws.length === 0) continue;
       const lower = text.toLowerCase();
@@ -276,7 +351,7 @@ export async function buildPrompt(ctx: PromptContext): Promise<{ system: string;
   const events = selectEventsForBlock(priorAssistantTurns, nowMs);
   const eventsBlock = renderEventsBlock(events);
 
-  const overlays = detectContradictions(priorAssistantTurns);
+  const overlays = detectContradictions(priorAssistantTurns, nowMs);
   const overlayBlock = renderContradictionOverlay(overlays);
 
   const systemSections: string[] = [
@@ -335,14 +410,41 @@ export async function buildPrompt(ctx: PromptContext): Promise<{ system: string;
   // Build conversation messages: oldest first.
   // History stays RAW — no inline tool-summary injection (auditability + the
   // tool-summary block above already carries that signal at higher authority).
+  //
+  // Superpowers I5 (PR #74): invariant — the Anthropic API accepts but
+  // suboptimally caches `messages` arrays with consecutive same-role entries.
+  // The current ReAct loop only persists final assistant TEXT in
+  // `mensagens.conteudo` (tool_use blocks live only in the in-memory loop),
+  // so adjacent assistant rows can't appear in the persisted history. The
+  // only way two consecutive same-role messages could surface is if an
+  // unprocessed inbound is followed by `ctx.inbound`. Coalesce defensively:
+  // adjacent same-role pushes are folded into one entry so cache prefixes
+  // stay stable across turns.
   const ordered = [...recent].reverse();
   const messages: LLMMessage[] = [];
+  const pushCoalesced = (next: LLMMessage): void => {
+    const last = messages[messages.length - 1];
+    if (last && last.role === next.role && typeof last.content === 'string' && typeof next.content === 'string') {
+      last.content = `${last.content}\n${next.content}`;
+      return;
+    }
+    messages.push(next);
+  };
   for (const m of ordered) {
     if (m.id === ctx.inbound.id) continue;
-    if (m.direcao === 'in') messages.push({ role: 'user', content: wrapUserContent(m.conteudo ?? '') });
-    else messages.push({ role: 'assistant', content: m.conteudo ?? '' });
+    // Codex C1 (PR #74): skip placeholder "event-only" rows that were
+    // flushed by the react-loop when no outbound was dispatched (iteration
+    // cap / empty-final / outbound-failure). They carry tool summaries in
+    // `ferramentas_chamadas` (reidrated by `collectPriorAssistantTurns`
+    // above) but have no textual content for the LLM to read.
+    const isEventOnly =
+      m.direcao === 'out' &&
+      (m.tipo === 'evento' || (m.conteudo ?? '').length === 0);
+    if (isEventOnly) continue;
+    if (m.direcao === 'in') pushCoalesced({ role: 'user', content: wrapUserContent(m.conteudo ?? '') });
+    else pushCoalesced({ role: 'assistant', content: m.conteudo ?? '' });
   }
-  messages.push({ role: 'user', content: wrapUserContent(ctx.inbound.conteudo ?? '') });
+  pushCoalesced({ role: 'user', content: wrapUserContent(ctx.inbound.conteudo ?? '') });
 
   return { system, messages };
 }
@@ -353,6 +455,7 @@ export const _internal = {
   EVIDENCE_HIERARCHY,
   SCOPE_SENTINEL,
   FAILURE_PHRASE_RE,
+  POSITIVE_CONFIRMATION_RE,
   EVENTS_BLOCK_MAX_ITEMS,
   EVENTS_BLOCK_WINDOW_MS,
   selectEventsForBlock,

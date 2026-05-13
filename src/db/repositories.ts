@@ -170,6 +170,20 @@ export const conversasRepo = {
       .set({ metadata: sql`${conversas.metadata} || ${JSON.stringify(patch)}::jsonb` })
       .where(eq(conversas.id, id));
   },
+  /**
+   * Atomic key removal from conversas.metadata via the jsonb `-` operator.
+   * Superpowers I3 (PR #74): paired with `mergeMetadata` for the deprecated
+   * lightweight-pending-question flow so a clear-pending operation no
+   * longer races with concurrent `mergeMetadata` writes (e.g.
+   * `last_scope_hash`) — the previous `updateMetadata` full-object set
+   * would silently drop concurrent keys.
+   */
+  async unsetMetadataKey(id: string, key: string): Promise<void> {
+    await db
+      .update(conversas)
+      .set({ metadata: sql`${conversas.metadata} - ${key}` })
+      .where(eq(conversas.id, id));
+  },
   async close(id: string, contexto_resumido: string): Promise<void> {
     await db
       .update(conversas)
