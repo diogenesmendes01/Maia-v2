@@ -448,6 +448,11 @@ async function runAgentForMensagemInner(mensagem_id: string): Promise<void> {
     conversa: c,
     scope,
     inbound,
+    // PR #84 Minor #7: pass the execution already loaded above so
+    // buildPrompt skips its own DB roundtrip. Pass `null` (not omit) when
+    // the runtime flag is off so the section is suppressed without a
+    // fallback lookup.
+    activeExecution: config.FEATURE_PROCEDURE_RUNTIME ? activeExecution : null,
   });
 
   const tools = getToolSchemas(scope.byEntity);

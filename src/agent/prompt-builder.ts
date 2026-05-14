@@ -13,7 +13,13 @@ import {
   procedureExecutionsRepo,
   procedureDefinitionsRepo,
 } from '@/db/repositories.js';
-import type { Pessoa, Conversa, Mensagem, BehavioralHint } from '@/db/schema.js';
+import type {
+  Pessoa,
+  Conversa,
+  Mensagem,
+  BehavioralHint,
+  ProcedureExecution,
+} from '@/db/schema.js';
 import type { ResolvedPermission } from '@/governance/permissions.js';
 import { fmtBR } from '@/lib/brazilian.js';
 import type { LLMMessage } from '@/lib/claude.js';
@@ -83,6 +89,12 @@ export type PromptContext = {
   conversa: Conversa;
   scope: { entidades: string[]; byEntity: Map<string, ResolvedPermission> };
   inbound: Mensagem;
+  // PR #84 Minor #7: when the caller has already loaded the active procedure
+  // execution (e.g. `core.ts` runs `findActiveForConversa` in the pre-turn
+  // selector block), pass it down so we don't re-query the DB inside buildPrompt.
+  // When undefined, buildPrompt falls back to its own lookup so existing
+  // callers (and tests that don't set up procedure runtime) keep working.
+  activeExecution?: ProcedureExecution | null;
 };
 
 export async function buildPrompt(ctx: PromptContext): Promise<{ system: string; messages: LLMMessage[] }> {
@@ -229,11 +241,17 @@ export async function buildPrompt(ctx: PromptContext): Promise<{ system: string;
   // intencao/como/sucesso/armadilhas instead of improvising. Wrapped in
   // try/catch so missing repos in tests or any DB failure leave the prompt
   // intact — procedure runtime is non-essential to the baseline turn.
+  //
+  // PR #84 Minor #7: prefer the execution that core.ts already loaded
+  // (`ctx.activeExecution`) over a fresh DB roundtrip. `undefined` means the
+  // caller didn't provide one (legacy / test) → fall back to lookup. `null`
+  // means the caller looked and found nothing → skip the section entirely.
   try {
     if (ctx.conversa?.id) {
-      const activeExec = await procedureExecutionsRepo?.findActiveForConversa?.(
-        ctx.conversa.id,
-      );
+      const activeExec =
+        ctx.activeExecution !== undefined
+          ? ctx.activeExecution
+          : await procedureExecutionsRepo?.findActiveForConversa?.(ctx.conversa.id);
       if (activeExec) {
         const def = await procedureDefinitionsRepo?.findById?.(activeExec.definition_id);
         if (def && activeExec.current_step_id) {

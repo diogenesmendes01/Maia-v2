@@ -756,6 +756,10 @@ export const procedure_executions = pgTable(
     definition_version: integer('definition_version').notNull(),
     status: text('status').notNull().default('in_progress'),
     current_step_id: text('current_step_id'),
+    // PR #84 Minor #2: declared and read by prompt-builder (stateJson block),
+    // but no engine path mutates it in P3b. Reserved for P3c which will emit
+    // `state_updated` events with `execution_state` deltas (e.g. coleted slot
+    // values across steps) and replay them in `replayState`.
     execution_state: jsonb('execution_state').notNull().default(sql`'{}'::jsonb`),
     completed_steps: jsonb('completed_steps').notNull().default(sql`'[]'::jsonb`),
     started_at: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),

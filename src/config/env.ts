@@ -155,6 +155,15 @@ const envSchema = z
       .string()
       .default('true')
       .transform((s) => s === 'true' || s === '1'),
+    // PR #84 Minor #5: selector confidence threshold was hardcoded at 0.6.
+    // Different tenants/agents have different acceptable false-positive
+    // rates; expose as env override so ops can tune without a redeploy.
+    // Constrained to (0, 1] — 0 would auto-start on any candidate.
+    PROCEDURE_SELECTOR_CONFIDENCE_THRESHOLD: z.coerce
+      .number()
+      .gt(0)
+      .lte(1)
+      .default(0.6),
     MESSAGE_DEBOUNCE_MS: z.coerce.number().int().positive().default(5000),
     MESSAGE_DEBOUNCE_MAX_MS: z.coerce.number().int().positive().default(30000),
     // SETUP: optional override for the bootstrap token. When set, bypasses
