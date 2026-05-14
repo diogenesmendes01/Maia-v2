@@ -1,6 +1,7 @@
 import type { ProcedureExecution, ProcedureDefinition } from '@/db/schema.js';
 import { logger } from '@/lib/logger.js';
 import { getLatestHumanConfirmation } from '@/procedures/engine.js';
+import { healthRepo } from '@/db/repositories.js';
 import { judgeStepCriterion } from './step-evaluator-llm-judge.js';
 import { detectUserSignal } from './step-evaluator-user-signal.js';
 
@@ -36,7 +37,7 @@ export type StepEvalResult = {
    * so the executor can record an event and (in P3c) the reaper can sweep.
    * Today: surfaced as a warning + audit event so the stall is observable.
    */
-  stall_reason: null | 'no_criteria_defined' | 'unsupported_criterion_only';
+  stall_reason: null | 'no_criteria_defined' | 'unsupported_criterion_only' | 'unknown_criterion_type';
   /**
    * P84-C3: when more than one downstream step is eligible to fire from
    * the current completion (DAG parallel branches), the evaluator picks
@@ -111,6 +112,14 @@ export async function evaluateCurrentStep(args: {
   // so, the step is stuck waiting on P3c and we should flag it rather
   // than silently looping forever.
   let unsupported_count = 0;
+
+  // P85-NB1: any criterion whose `type` is not handled by any branch
+  // below. Without this defensive tracker, a future criterion type
+  // added without an evaluator branch would produce passed=false +
+  // evidence='' and the procedure would stall invisibly until the
+  // reaper sweep. We surface it as a distinct stall_reason so audit
+  // and ops can see it.
+  const unknown_types: string[] = [];
 
   for (const c of stepCriteria) {
     let passed = false;
@@ -192,6 +201,45 @@ export async function evaluateCurrentStep(args: {
           evidence = `human approved by ${conf.operator_id}`;
         }
       }
+    } else {
+      // P85-NB1: defensive terminal else. If a new criterion type is added
+      // to the schema but no evaluator branch is added here, fall through
+      // to a visible, auditable stall instead of silently producing
+      // passed=false + evidence=''. The stall_reason='unknown_criterion_type'
+      // (set below) shows up in audit/reaper data; the health row emits a
+      // 'degraded' signal so the DLQ-monitor / dashboards page ops.
+      const unknownType = String((c as { type?: unknown }).type ?? 'undefined');
+      unknown_types.push(unknownType);
+      passed = false;
+      evidence = `unknown_criterion_type: ${unknownType}`;
+      logger.warn(
+        {
+          execution_id: args.execution.id,
+          definition_id: args.execution.definition_id,
+          step_id: currentStep.id,
+          criterion_id: c.id,
+          criterion_type: unknownType,
+        },
+        'step_evaluator.unknown_criterion_type',
+      );
+      // Best-effort health emission — never mask the procedure logic if
+      // the health write itself fails (matches the procedure-metrics-refresh
+      // pattern introduced by P85-I4).
+      try {
+        await healthRepo.record({
+          component: 'step_evaluator',
+          status: 'degraded',
+          error: `unknown_criterion_type:${unknownType}`,
+          metadata: {
+            execution_id: args.execution.id,
+            step_id: currentStep.id,
+            criterion_id: c.id,
+            criterion_type: unknownType,
+          },
+        });
+      } catch (healthErr) {
+        logger.warn({ err: healthErr }, 'step_evaluator.health_write_failed');
+      }
     }
 
     if (!passed) all_passed = false;
@@ -218,6 +266,12 @@ export async function evaluateCurrentStep(args: {
       },
       'step_evaluator.stall.no_criteria_defined',
     );
+  } else if (unknown_types.length > 0) {
+    // P85-NB1: an unknown criterion type takes precedence over
+    // 'unsupported_criterion_only' — the former signals a definition or
+    // schema bug that ops must investigate; the latter is normal awaiting
+    // behavior. Surface the more actionable signal.
+    stall_reason = 'unknown_criterion_type';
   } else if (unsupported_count === stepCriteria.length) {
     stall_reason = 'unsupported_criterion_only';
   }

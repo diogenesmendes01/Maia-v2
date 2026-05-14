@@ -4,6 +4,15 @@ import { describe, it, expect, vi } from 'vitest';
 // procedureExecutionEventsRepo.listByExecution. Como estes testes não exercitam
 // confirmação humana de fato (cobertos em step-evaluator-human-confirmed.spec),
 // retornamos lista vazia → comportamento "awaiting".
+//
+// P85-NB1: o terminal else do dispatch de criterion types chama
+// healthRepo.record (best-effort health metric). Mockado aqui para não
+// tentar tocar o DB durante os testes unitários. Usa vi.hoisted para
+// expor o mock do healthRepo.record para o teste (vi.mock factory roda
+// antes das declarações top-level por ser hoisted).
+const mocks = vi.hoisted(() => ({
+  healthRecord: vi.fn(async () => {}),
+}));
 vi.mock('@/db/repositories.js', async () => {
   const actual = await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
@@ -12,9 +21,16 @@ vi.mock('@/db/repositories.js', async () => {
       record: vi.fn(async () => {}),
       listByExecution: vi.fn(async () => []),
     },
+    healthRepo: {
+      record: mocks.healthRecord,
+      lastForComponent: vi.fn(async () => null),
+    },
   };
 });
 
+// P85-NB1: spy on logger.warn so the terminal-else test can assert the
+// warning is emitted with the unknown criterion type in the payload.
+import { logger } from '@/lib/logger.js';
 import { evaluateCurrentStep } from '@/cognition/step-evaluator.js';
 
 describe('evaluateCurrentStep', () => {
@@ -157,5 +173,50 @@ describe('evaluateCurrentStep', () => {
     });
     expect(result.step_completed).toBe(false);
     expect(result.stall_reason).toBe('no_criteria_defined');
+  });
+
+  it('P85-NB1: criterion com type desconhecido → logger.warn + stall_reason=unknown_criterion_type', async () => {
+    // Mock a hypothetical future criterion type that has no evaluator branch
+    // yet. Without the terminal else, the procedure would silently stall
+    // (passed=false + evidence='') until the reaper sweeps it ~7d later.
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    mocks.healthRecord.mockClear();
+
+    const result = await evaluateCurrentStep({
+      execution: { id: 'exec-nb1', definition_id: 'def-nb1', current_step_id: 'step-1', completed_steps: [] } as any,
+      definition: {
+        steps: [{ id: 'step-1', sucesso_criteria_ref: 'crit-future' }],
+        // `type: 'future_oracle_check'` is intentionally not any of the
+        // five handled types. The `as any` is the whole point of this test:
+        // simulating a schema drift / future criterion type.
+        success_criteria: [{ id: 'crit-future', type: 'future_oracle_check' } as any],
+      } as any,
+      response_context: { response_text: 'whatever' },
+    });
+
+    expect(result.step_completed).toBe(false);
+    expect(result.stall_reason).toBe('unknown_criterion_type');
+    expect(result.criterion_results).toHaveLength(1);
+    expect(result.criterion_results[0]?.passed).toBe(false);
+    expect(result.criterion_results[0]?.evidence).toBe('unknown_criterion_type: future_oracle_check');
+
+    // Assert the warning was emitted with the unknown criterion type
+    // in the payload — that's the ops-visible signal.
+    const matching = warnSpy.mock.calls.find(
+      (call) => call[1] === 'step_evaluator.unknown_criterion_type',
+    );
+    expect(matching, 'expected step_evaluator.unknown_criterion_type warn').toBeDefined();
+    expect((matching?.[0] as Record<string, unknown>)?.criterion_type).toBe('future_oracle_check');
+
+    // Health metric was emitted (degraded).
+    expect(mocks.healthRecord).toHaveBeenCalledWith(
+      expect.objectContaining({
+        component: 'step_evaluator',
+        status: 'degraded',
+        error: 'unknown_criterion_type:future_oracle_check',
+      }),
+    );
+
+    warnSpy.mockRestore();
   });
 });
