@@ -162,6 +162,10 @@ export const _internal = { scheduleTypingDebounce, sendOutbound, aggregateUnproc
  * Retorna apenas o suficiente para chamar `resolveChannel`. Qualquer falha
  * (mensagem ausente, sem `metadata.telefone`, erro de DB) devolve null —
  * o caller cai em legacy default/default.
+ *
+ * TODO(p7+): channel_type está hardcoded 'whatsapp' porque WA é o único ingress
+ * path ativo no P6. Quando entrar Telegram/Email/SMS, ler `metadata.channel_type`
+ * (gravado pelo gateway) e derivar external_id por tipo (telefone/chat_id/etc).
  */
 async function probeMessageForChannel(
   mensagem_id: string,
@@ -176,6 +180,8 @@ async function probeMessageForChannel(
     const md = (rows[0]!.metadata ?? {}) as Record<string, unknown>;
     const tel = typeof md['telefone'] === 'string' ? (md['telefone'] as string) : null;
     if (!tel) return null;
+    // TODO(p7+): suportar telegram/email/sms — derivar channel_type+external_id
+    // do metadata em vez de assumir whatsapp/telefone.
     return { channel_type: 'whatsapp', external_id: tel };
   } catch {
     return null;

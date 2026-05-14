@@ -61,13 +61,32 @@ else
   FAILED=$((FAILED + 1))
 fi
 
-echo "=== Gate 4/8: policy-decider is deterministic (zero LLM) ==="
+echo "=== Gate 4/8: policy-decider is deterministic (zero LLM, including transitive deps) ==="
+# Direct check: policy-decider.ts itself must not import any LLM SDK.
+# Transitive check: scan every file in policy-decider's local-import closure
+# (./types.js, ./oscillation-tracker.js) for the same pattern. A util that
+# wraps Anthropic would slip past the direct grep — this catches it.
+GATE4_FAIL=0
 if grep -E "anthropic|Anthropic|openai|OpenAI" src/cognition/role-selector/policy-decider.ts; then
+  GATE4_FAIL=1
+fi
+# Walk transitive local imports (limited to ./*.ts in the same dir — sufficient
+# given the deterministic module is intentionally self-contained).
+TRANSITIVE_FILES=$(grep -E "from '\\./.+\\.js'" src/cognition/role-selector/policy-decider.ts \
+  | sed -E "s|.*from '\\./(.+)\\.js'.*|src/cognition/role-selector/\\1.ts|" \
+  | sort -u)
+for f in $TRANSITIVE_FILES; do
+  if [ -f "$f" ] && grep -E "anthropic|Anthropic|openai|OpenAI" "$f"; then
+    echo "  transitive LLM import detected in: $f"
+    GATE4_FAIL=1
+  fi
+done
+if [ "$GATE4_FAIL" = "0" ]; then
+  echo "[GATE 4/8] policy-decider deterministic (direct + transitive) ... PASS"
+  PASSED=$((PASSED + 1))
+else
   echo "[GATE 4/8] policy-decider deterministic ... FAIL"
   FAILED=$((FAILED + 1))
-else
-  echo "[GATE 4/8] policy-decider deterministic ... PASS"
-  PASSED=$((PASSED + 1))
 fi
 
 echo "=== Gate 5/8: MULTI_CHANNEL flag registered in singleton ==="

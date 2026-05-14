@@ -27,6 +27,53 @@ export type ChannelResolution = {
   channel_id: string | null;
 };
 
+/**
+ * [P88-M5] Sampled warning state for resolver misses.
+ *
+ * A scanner/spammer probing random external_ids would fill the log at
+ * one-line-per-message. We log the FIRST miss per `(channel_type, external_id)`
+ * pair, then suppress until a 5-minute window elapses or a count threshold
+ * is hit — whichever comes first. This preserves the alerting signal for
+ * legitimately-misconfigured channels without drowning the log on abuse.
+ *
+ * Map is in-memory per process. With high-volume distinct-id attacks the map
+ * itself could grow — bounded by a soft cap (1024 entries) with LRU eviction
+ * of the oldest entry on overflow. Acceptable for warn-level signal.
+ */
+const MISS_WINDOW_MS = 5 * 60 * 1000;
+const MISS_COUNT_FLUSH = 50;
+const MISS_MAP_CAP = 1024;
+type MissState = { count: number; first_logged_at: number };
+const missState = new Map<string, MissState>();
+
+function shouldLogMiss(channel_type: string, external_id: string): {
+  log: boolean;
+  suppressed_count: number;
+} {
+  const key = `${channel_type}::${external_id}`;
+  const now = Date.now();
+  const entry = missState.get(key);
+  if (!entry) {
+    if (missState.size >= MISS_MAP_CAP) {
+      // LRU-ish: drop the oldest insertion (Map preserves insertion order).
+      const oldest = missState.keys().next().value;
+      if (oldest !== undefined) missState.delete(oldest);
+    }
+    missState.set(key, { count: 1, first_logged_at: now });
+    return { log: true, suppressed_count: 0 };
+  }
+  entry.count += 1;
+  const windowElapsed = now - entry.first_logged_at >= MISS_WINDOW_MS;
+  const countFlush = entry.count >= MISS_COUNT_FLUSH;
+  if (windowElapsed || countFlush) {
+    const suppressed = entry.count - 1;
+    entry.first_logged_at = now;
+    entry.count = 1;
+    return { log: true, suppressed_count: suppressed };
+  }
+  return { log: false, suppressed_count: 0 };
+}
+
 export async function resolveChannel(args: {
   channel_type: 'whatsapp' | 'telegram' | 'email' | 'sms' | 'web' | 'api' | 'other';
   external_id: string;
@@ -44,18 +91,25 @@ export async function resolveChannel(args: {
     external_id: args.external_id,
   });
 
-  // 3. Miss ou canal desativado: warning + fallback default (não-fatal — gateway
-  //    continua processando como legacy, e o owner vê o warning no dashboard).
+  // 3. Miss ou canal desativado: warning sampled + fallback default (não-fatal —
+  //    gateway continua processando como legacy, e o owner vê o warning no
+  //    dashboard). [P88-M5] sampling evita flood quando scanner/spammer bate
+  //    em external_ids aleatórios — primeira ocorrência loga, repetições
+  //    são contadas e flushed a cada 5min ou 50 hits.
   if (!channel || !channel.active) {
-    logger.warn(
-      {
-        channel_type: args.channel_type,
-        external_id: args.external_id,
-        found: !!channel,
-        active: channel?.active ?? false,
-      },
-      'channel_resolver.unknown_or_inactive_channel_fallback',
-    );
+    const sample = shouldLogMiss(args.channel_type, args.external_id);
+    if (sample.log) {
+      logger.warn(
+        {
+          channel_type: args.channel_type,
+          external_id: args.external_id,
+          found: !!channel,
+          active: channel?.active ?? false,
+          suppressed_since_last: sample.suppressed_count,
+        },
+        'channel_resolver.unknown_or_inactive_channel_fallback',
+      );
+    }
     return { tenant_id: 'default', agent_id: 'default', channel_id: null };
   }
 

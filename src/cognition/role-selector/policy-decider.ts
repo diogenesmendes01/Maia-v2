@@ -27,12 +27,61 @@
  * SEM IMPORTS DE LLM SDK. Acceptance gate #4 da spec roda grep nesta linha.
  */
 import { DecidedBy, RoleDecisionAction, SwitchBehavior } from '@/types/enums.js';
+import { logger } from '@/lib/logger.js';
 import {
   shouldBlockSwitchByOscillation,
   isWithinCooldownWindow,
 } from './oscillation-tracker.js';
 import type { RoleSelectorInput, RoleCandidate } from './types.js';
 import type { Role } from '@/db/schema.js';
+
+type ByContextGuards = {
+  min_confidence_to_switch?: number;
+  cooldown_turns?: number;
+  required_strength_delta?: number;
+  max_switches_per_conversation?: number;
+};
+
+/**
+ * [P88-M2] Validate `by_context_guards` JSONB shape on read.
+ *
+ * The migration default (`033`) supplies a well-formed object, but the column
+ * is JSONB — any operator can write garbage via SQL/admin tooling. A raw
+ * `as` cast would silently substitute defaults for malformed payloads. Instead,
+ * we shape-check each key and warn loudly when a value is the wrong type or
+ * the whole payload is unusable. Unknown extra keys are ignored (forward-compat
+ * with future guard fields).
+ */
+function parseByContextGuards(raw: unknown, policy_id: string): ByContextGuards {
+  if (raw === null || typeof raw !== 'object') {
+    logger.warn(
+      { policy_id, raw_type: raw === null ? 'null' : typeof raw },
+      'policy_decider.by_context_guards_malformed_using_defaults',
+    );
+    return {};
+  }
+  const obj = raw as Record<string, unknown>;
+  const out: ByContextGuards = {};
+  const numKeys = [
+    'min_confidence_to_switch',
+    'cooldown_turns',
+    'required_strength_delta',
+    'max_switches_per_conversation',
+  ] as const;
+  for (const k of numKeys) {
+    const v = obj[k];
+    if (v === undefined) continue;
+    if (typeof v !== 'number' || !Number.isFinite(v)) {
+      logger.warn(
+        { policy_id, key: k, value: v },
+        'policy_decider.by_context_guards_field_invalid_using_default',
+      );
+      continue;
+    }
+    out[k] = v;
+  }
+  return out;
+}
 
 export type PolicyDecisionResult = {
   decided_role: Role;
@@ -120,12 +169,9 @@ export async function decidePolicy(args: {
 
   // 4. BY_CONTEXT — apply guards
   if (switch_behavior === SwitchBehavior.BY_CONTEXT) {
-    const guards = policy.by_context_guards as {
-      min_confidence_to_switch?: number;
-      cooldown_turns?: number;
-      required_strength_delta?: number;
-      max_switches_per_conversation?: number;
-    };
+    // [P88-M2] Validate shape rather than blind `as` cast — warns loudly when
+    // the JSONB is malformed instead of silently using defaults.
+    const guards = parseByContextGuards(policy.by_context_guards, policy.id);
     const minConf = guards.min_confidence_to_switch ?? 0.7;
     const maxSwitches = guards.max_switches_per_conversation ?? 3;
     // [P88-H4] Read cooldown_turns + required_strength_delta from the JSONB
