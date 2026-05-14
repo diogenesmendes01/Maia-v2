@@ -1577,6 +1577,14 @@ export const capabilityGapsRepo = {
   // cooldown_days_proposed_to_proposed: do not raise another gap to 'proposed'
   // if the last one happened recently. Returns null if no gap was ever
   // promoted to 'proposed' for this (tenant, agent).
+  //
+  // Invariant (PR #87 Minor #2): este cálculo é correto SOMENTE enquanto
+  // `proposed` for terminal no engine de escalação (Task 6 engine.ts não
+  // gera transição saindo de proposed). Se um futuro fluxo demover gaps de
+  // `proposed`, last_level_change_at vira ambíguo (poderia ser uma demoção,
+  // não uma promoção real) e o cooldown poderia ser zerado indevidamente.
+  // Nesse caso, migrar a fonte para `MAX(c.submitted_at FROM capability_proposals c)`
+  // ou adicionar coluna dedicada `last_proposed_at` no gap.
   async daysSinceLastProposed(): Promise<number | null> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
@@ -2596,6 +2604,31 @@ export const capabilityTestResultsRepo = {
     triggered_revert?: boolean;
     technical_gap_id?: string;
   }): Promise<CapabilityTestResult> {
+    // PR #87 Minor #3: defensive parity. applyTenantGuard injeta tenant/agent
+    // do contexto atual, mas NÃO valida que technical_gap_id (passado pelo
+    // caller) pertence ao mesmo tenant. Hoje a chain (capability-test-runner
+    // → revertCapability → capabilityGapsRepo.create) sempre cria o gap
+    // dentro do mesmo tenant context, então o id retornado é seguro — mas
+    // callers futuros poderiam quebrar essa premissa. Faz cross-check
+    // explícito para fechar a porta agora.
+    if (input.technical_gap_id) {
+      const tenant_id = getCurrentTenant();
+      const agent_id = getCurrentAgent();
+      const rows = await db
+        .select({ id: agent_capability_gaps.id })
+        .from(agent_capability_gaps)
+        .where(
+          and(
+            eq(agent_capability_gaps.id, input.technical_gap_id),
+            eq(agent_capability_gaps.tenant_id, tenant_id),
+            eq(agent_capability_gaps.agent_id, agent_id),
+          ),
+        )
+        .limit(1);
+      if (rows.length === 0) {
+        throw new Error('capability_test_results.technical_gap_id_cross_tenant');
+      }
+    }
     const guarded = applyTenantGuard({
       proposal_id: input.proposal_id,
       gap_id: input.gap_id ?? null,

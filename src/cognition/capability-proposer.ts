@@ -107,15 +107,39 @@ export async function proposeCapabilityForGap(args: {
         .map((c) => c.text)
         .join('');
 
-      const match = text.match(/\{[\s\S]*\}/);
-      if (!match) return null;
-
-      let parsed: ProposalDraft;
-      try {
-        parsed = JSON.parse(match[0]) as ProposalDraft;
-      } catch {
-        return null;
+      // PR #87 Minor #5: robust JSON extraction. Sonnet ocasionalmente devolve
+      // prose antes/depois do JSON, ou múltiplos blocos `{...}` (ex.: exemplo
+      // em prosa + bloco final). Estratégia: enumerar todos os candidatos
+      // balanceados e tentar parsear do maior para o menor — o primeiro
+      // que parsear vira o draft. Regex non-greedy isolada não basta porque
+      // o JSON real contém objetos aninhados.
+      let parsed: ProposalDraft | null = null;
+      const candidates: string[] = [];
+      for (let i = 0; i < text.length; i++) {
+        if (text[i] !== '{') continue;
+        let depth = 0;
+        for (let j = i; j < text.length; j++) {
+          if (text[j] === '{') depth++;
+          else if (text[j] === '}') {
+            depth--;
+            if (depth === 0) {
+              candidates.push(text.slice(i, j + 1));
+              break;
+            }
+          }
+        }
       }
+      // Prefer larger candidates (mais provável de ser o objeto principal).
+      candidates.sort((a, b) => b.length - a.length);
+      for (const c of candidates) {
+        try {
+          parsed = JSON.parse(c) as ProposalDraft;
+          break;
+        } catch {
+          // tenta próximo candidato
+        }
+      }
+      if (!parsed) return null;
 
       // Light validation: required keys present.
       if (
