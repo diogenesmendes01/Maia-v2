@@ -2,6 +2,7 @@ import {
   procedureDefinitionsRepo,
   procedureStatusEventsRepo,
 } from '@/db/repositories.js';
+import type { ProcedureStatusUpdate } from '@/db/repositories.js';
 import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import type { ProcedureDefinition } from '@/db/schema.js';
 
@@ -64,7 +65,10 @@ export async function transitionProcedureStatus(args: {
   }
 
   const now = new Date();
-  const updates: Parameters<typeof procedureDefinitionsRepo.updateStatus>[1] = {
+  // P83-L1: use the exported ProcedureStatusUpdate type directly instead of
+  // a `Parameters<typeof ...>[1]` lookup. Both refer to the same shape; the
+  // direct alias is clearer at the call site and easier to evolve.
+  const updates: ProcedureStatusUpdate = {
     status: args.to,
   };
 

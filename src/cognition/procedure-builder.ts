@@ -226,5 +226,20 @@ function builderPrompt(): string {
 
 Use snake_case pra ids. Cada step deve ser concreto e verificável.
 
+Exemplo de formato esperado (P83-L5, apenas pra ancorar o shape — não copie o conteúdo):
+{
+  "intencao": "Qualificar lead novo de inglês adulto via primeiras mensagens",
+  "when_apply": { "tags": ["lead_novo", "ingles_adulto"] },
+  "when_not_apply": { "tags": ["lead_kids"] },
+  "steps": [
+    { "id": "descobrir_motivo", "intencao": "Entender por que quer aprender", "como": "Pergunta aberta: 'O que te levou a procurar inglês agora?'" }
+  ],
+  "success_criteria": [
+    { "id": "motivo_capturado", "type": "user_signal" }
+  ],
+  "failure_modes": ["Pular descoberta e oferecer plano direto"],
+  "tools_referenced": []
+}
+
 Retorne APENAS JSON. Se input incompreensível, retorne {"error":"..."}.`;
 }

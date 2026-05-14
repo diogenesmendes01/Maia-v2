@@ -130,7 +130,9 @@ describe('P3a procedure lifecycle integration', () => {
         const { procedureDefinitionsRepo } = await import('@/db/repositories.js');
         const created = await procedureDefinitionsRepo.create({
           scope: 'agent',
-          nome: 'test-proc',
+          // P83-L3: namespace spec ids to avoid collisions if test isolation
+          // regresses (each id prefixed with 'p83-' for this spec).
+          nome: 'p83-test-proc',
           version_number: 1,
           status: 'draft',
           intencao: 'X',
@@ -155,7 +157,7 @@ describe('P3a procedure lifecycle integration', () => {
         const { procedureDefinitionsRepo } = await import('@/db/repositories.js');
         const def = await procedureDefinitionsRepo.create({
           scope: 'agent',
-          nome: 'flow-test',
+          nome: 'p83-flow-test',
           version_number: 1,
           status: 'draft',
           intencao: 'X',
@@ -200,7 +202,7 @@ describe('P3a procedure lifecycle integration', () => {
         const firstActivatedAt = new Date('2025-01-01T00:00:00.000Z');
         const v1 = await procedureDefinitionsRepo.create({
           scope: 'agent',
-          nome: 'same-name',
+          nome: 'p83-same-name',
           version_number: 1,
           status: 'active',
           intencao: 'v1',
@@ -216,7 +218,7 @@ describe('P3a procedure lifecycle integration', () => {
 
         const v2 = await procedureDefinitionsRepo.create({
           scope: 'agent',
-          nome: 'same-name',
+          nome: 'p83-same-name',
           version_number: 2,
           status: 'proposed',
           intencao: 'v2',
@@ -257,7 +259,7 @@ describe('P3a procedure lifecycle integration', () => {
         const { procedureDefinitionsRepo } = await import('@/db/repositories.js');
         const def = await procedureDefinitionsRepo.create({
           scope: 'agent',
-          nome: 'terminal-test',
+          nome: 'p83-terminal-test',
           version_number: 1,
           status: 'rolled_back',
           intencao: 'X',
@@ -281,7 +283,7 @@ describe('P3a procedure lifecycle integration', () => {
     const def = {
       id: 'def-x',
       status: 'draft',
-      nome: 'no-ctx',
+      nome: 'p83-no-ctx',
     } as any;
     // No runWithTenantContext wrapper — should fail because the function
     // calls getCurrentTenant() / getCurrentAgent() as a guard.
