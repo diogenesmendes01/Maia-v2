@@ -13,9 +13,10 @@ import { resolve } from 'node:path';
  * time. This test reads the migration SQL files and grep-style scans the
  * known production emitters; both must agree.
  *
- * If you add a new `event_type:` literal in `src/procedures/engine.ts` or
- * `src/workers/procedure-execution-reaper.ts`, you MUST also add it to the
- * CHECK list in the latest migration that constrains the column.
+ * If you add a new `event_type:` literal in `src/procedures/engine.ts`,
+ * `src/workers/procedure-execution-reaper.ts`, or `src/agent/core.ts`, you
+ * MUST also add it to the CHECK list in the latest migration that constrains
+ * the column.
  */
 
 const REPO_ROOT = resolve(__dirname, '..', '..');
@@ -52,6 +53,7 @@ const ALLOWED_EVENT_TYPES = [
 const EMITTING_SOURCES = [
   'src/procedures/engine.ts',
   'src/workers/procedure-execution-reaper.ts',
+  'src/agent/core.ts',
 ];
 
 function extractEmittedTypes(source: string): string[] {
@@ -65,14 +67,40 @@ function extractEmittedTypes(source: string): string[] {
   return out;
 }
 
+/**
+ * Extract the CHECK (event_type IN (...)) clause body from a migration file.
+ *
+ * Why: a substring match on the whole file is satisfied by SQL comments that
+ * mention the value, which is exactly the failure mode this test is trying
+ * to prevent (per Codex/Superpowers review on PR #92). We slice off the
+ * `ADD CONSTRAINT ... CHECK (event_type IN ( ... ))` block specifically.
+ *
+ * The down migration test already used `split('ADD CONSTRAINT')[1]`; we
+ * generalize that here and apply it to the up migration as well.
+ */
+function extractCheckInClause(sql: string): string {
+  const afterAdd = sql.split('ADD CONSTRAINT')[1] ?? '';
+  // The body of the IN list is between `event_type IN (` and the matching
+  // `)`. We slice between the first `IN (` after the ADD CONSTRAINT and the
+  // next `));` (close of IN + close of CHECK + statement terminator).
+  const inIdx = afterAdd.indexOf('IN (');
+  if (inIdx < 0) return '';
+  const tail = afterAdd.slice(inIdx + 'IN ('.length);
+  const closeIdx = tail.indexOf('))');
+  if (closeIdx < 0) return '';
+  return tail.slice(0, closeIdx);
+}
+
 describe('Issue #91 — procedure_execution_events.event_type CHECK ↔ code sync', () => {
   it('migration 026 CHECK contains every value in ALLOWED_EVENT_TYPES', () => {
     const sql = readFileSync(
       resolve(REPO_ROOT, 'migrations/026_p3c_fix_event_type_check.sql'),
       'utf-8',
     );
+    const checkClause = extractCheckInClause(sql);
+    expect(checkClause, `migration 026 ADD CONSTRAINT ... CHECK (event_type IN (...)) clause missing`).toBeTruthy();
     for (const t of ALLOWED_EVENT_TYPES) {
-      expect(sql, `migration 026 missing event_type '${t}' in CHECK`).toContain(`'${t}'`);
+      expect(checkClause, `migration 026 CHECK missing event_type '${t}'`).toContain(`'${t}'`);
     }
   });
 
@@ -81,8 +109,13 @@ describe('Issue #91 — procedure_execution_events.event_type CHECK ↔ code syn
       resolve(REPO_ROOT, 'migrations/026_p3c_fix_event_type_check.sql'),
       'utf-8',
     );
-    expect(sql).toContain(`'auto_abandoned'`);
-    expect(sql).toContain(`'human_confirmation'`);
+    // Scope assertions to the CHECK clause body specifically — comments that
+    // describe the fix would otherwise satisfy `toContain` and pass even if a
+    // future edit removed the literal from the actual constraint list.
+    const checkClause = extractCheckInClause(sql);
+    expect(checkClause, `migration 026 ADD CONSTRAINT CHECK clause missing`).toBeTruthy();
+    expect(checkClause).toContain(`'auto_abandoned'`);
+    expect(checkClause).toContain(`'human_confirmation'`);
   });
 
   it('every event_type literal emitted in production code is in the CHECK list', () => {
@@ -107,10 +140,8 @@ describe('Issue #91 — procedure_execution_events.event_type CHECK ↔ code syn
     // Down must NOT include the P3c additions in the restored CHECK.
     // It SHOULD delete pre-existing rows with those values first (irreversible
     // but documented in the SQL comment).
-    const checkClause = downSql
-      .split('ADD CONSTRAINT')[1]   // grab the restoration ADD
-      ?? '';
-    expect(checkClause, `down ADD CONSTRAINT clause missing`).toBeTruthy();
+    const checkClause = extractCheckInClause(downSql);
+    expect(checkClause, `down ADD CONSTRAINT CHECK clause missing`).toBeTruthy();
     expect(checkClause).not.toContain(`'auto_abandoned'`);
     expect(checkClause).not.toContain(`'human_confirmation'`);
     // Sanity: down should still contain the original 15 values
@@ -123,5 +154,24 @@ describe('Issue #91 — procedure_execution_events.event_type CHECK ↔ code syn
     for (const t of original15) {
       expect(checkClause).toContain(`'${t}'`);
     }
+  });
+
+  it('down migration is wrapped in an explicit transaction (atomic rollback)', () => {
+    // `_down.sql` is run manually via `psql -f`, which does NOT auto-wrap a
+    // multi-statement file. Without explicit BEGIN/COMMIT a crash between
+    // DELETE and ADD CONSTRAINT leaves the table with audit rows deleted AND
+    // no CHECK at all (per PR #92 Codex/Superpowers review).
+    const downSql = readFileSync(
+      resolve(REPO_ROOT, 'migrations/026_p3c_fix_event_type_check_down.sql'),
+      'utf-8',
+    );
+    // Strip line comments so a comment mentioning "BEGIN" can't satisfy the
+    // check — we want the actual statement.
+    const stripped = downSql
+      .split('\n')
+      .map((l) => l.replace(/--.*$/, ''))
+      .join('\n');
+    expect(stripped).toMatch(/\bBEGIN\s*;/);
+    expect(stripped).toMatch(/\bCOMMIT\s*;/);
   });
 });

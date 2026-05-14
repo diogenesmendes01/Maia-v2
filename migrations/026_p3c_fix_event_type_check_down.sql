@@ -6,7 +6,23 @@
 -- This loses some audit trail; only run the down if you also rolled back the
 -- reaper / human_confirmed evaluator code that emitted those rows.
 --
--- NOTE: no BEGIN/COMMIT — migrate.ts wraps in transaction.
+-- Runtime contract: `_down.sql` files are NOT run by `scripts/migrate.ts`
+-- (it filters them out — see migrate.ts:16-17). They are executed manually
+-- via `psql -f`, and `psql` does NOT auto-wrap a multi-statement file in a
+-- transaction — each statement autocommits on its own. So we wrap the whole
+-- file in an explicit BEGIN/COMMIT and take an EXCLUSIVE lock on the table
+-- to fence concurrent inserts: if the script is interrupted between the
+-- DELETE/DROP/ADD, the transaction aborts and the table is left with the
+-- original CHECK and rows intact, instead of audit data lost AND no CHECK
+-- at all.
+--
+-- Operator note: you can also invoke via `psql -1 -f <file>` (single
+-- transaction mode) for belt-and-suspenders; the explicit BEGIN/COMMIT
+-- below makes that flag redundant but harmless.
+
+BEGIN;
+
+LOCK TABLE procedure_execution_events IN EXCLUSIVE MODE;
 
 DELETE FROM procedure_execution_events
 WHERE event_type IN ('auto_abandoned', 'human_confirmation');
@@ -33,3 +49,5 @@ ALTER TABLE procedure_execution_events
     'execution_escalated',
     'execution_abandoned'
   ));
+
+COMMIT;
