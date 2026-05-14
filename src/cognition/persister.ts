@@ -28,7 +28,7 @@ export async function persistCandidate(
       // FatoCandidate scope: 'agent' | 'role' | 'conversation'.
       // agent_facts.escopo é text; mantemos o literal do candidato como escopo.
       const escopo = candidate.scope;
-      const chave = hashKey(candidate.content);
+      const chave = slugKey(candidate.content);
       const fact = await factsRepo.upsert({
         escopo,
         chave,
@@ -81,9 +81,13 @@ export async function persistCandidate(
 
 /**
  * Gera uma chave determinística e curta a partir do conteúdo do fato.
+ * NOTA: é um slug (lowercase + ASCII) truncado em 80 chars, NÃO um hash
+ * criptográfico. Duas frases longas com prefixo idêntico podem colidir e
+ * cair no mesmo upsert — comportamento esperado para fatos "morais"
+ * equivalentes em P1. Se P2+ precisar de unicidade exata, trocar por sha256.
  * Prefixa com `p1.` pra distinguir da knowledge curada manualmente.
  */
-function hashKey(content: string): string {
+function slugKey(content: string): string {
   const slug = content
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '_')
