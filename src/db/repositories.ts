@@ -1173,8 +1173,17 @@ export const agentsRepo = {
 };
 
 export const cognitiveModuleLogRepo = {
+  // PR #75 review (Superpowers finding #6): cognitive_module_log é tenant-aware
+  // (tenant_id + agent_id NOT NULL desde migration 008). O caller atual
+  // (reflection.ts) já passa tenant_id/agent_id explicitamente e roda dentro
+  // de runWithTenantContext, mas aplicamos `applyTenantGuard` aqui pra:
+  //   1. Falhar fechado se algum caller futuro esquecer o contexto.
+  //   2. Detectar mismatch entre input e contexto (caller passou tenant errado).
+  // O DEFAULT 'default' do schema fica como rede de segurança em P0 — sweep
+  // de DROP DEFAULT está agendado pro pós-P0 (finding #7).
   async record(entry: Omit<CognitiveModuleLog, 'id' | 'created_at'>): Promise<void> {
-    await db.insert(cognitive_module_log).values(entry);
+    const guarded = applyTenantGuard(entry as Record<string, unknown>);
+    await db.insert(cognitive_module_log).values(guarded as typeof entry);
   },
 
   async recentByModule(module_name: string, limit = 100): Promise<CognitiveModuleLog[]> {

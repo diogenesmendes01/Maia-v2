@@ -593,6 +593,7 @@ export const agents = pgTable(
   },
   (t) => ({
     tenantIdIdx: index('agents_tenant_id_idx').on(t.tenant_id),
+    tenantStatusIdx: index('agents_tenant_status_idx').on(t.tenant_id, t.status),
   }),
 );
 
