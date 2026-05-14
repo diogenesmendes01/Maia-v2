@@ -1680,8 +1680,11 @@ export const procedureExecutionsRepo = {
           procedure_executions.conversa_id,
         ],
         // index_predicate for the partial unique index defined in
-        // migration 023_p3b_unique_in_progress_per_conversa.sql.
-        where: sql`status = 'in_progress'`,
+        // migration 023_p3b_unique_in_progress_per_conversa.sql. The
+        // predicate MUST match the migration's `WHERE` exactly so Postgres'
+        // partial-index inference engine can match this ON CONFLICT to the
+        // index — relying on column-presence inference alone is brittle.
+        where: sql`status = 'in_progress' AND conversa_id IS NOT NULL`,
       })
       .returning();
 
