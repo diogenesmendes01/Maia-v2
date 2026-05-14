@@ -576,6 +576,11 @@ export const memory_entry = pgTable(
     content: text('content').notNull(),
     memory_type: text('memory_type').notNull(),
     scope_type: text('scope_type').notNull(),
+    // subject_id é nullable: é obrigatório para scope_type
+    // ∈ {conversation, interlocutor, channel, role}, e pode ser NULL para
+    // scope_type ∈ {agent, tenant} (onde tenant_id/agent_id já carregam o
+    // escopo). findRelevant em repositories.ts emite o disjunto
+    // `eq(scope_type, 'agent')` sem checar subject_id, refletindo isso.
     subject_id: text('subject_id'),
     sensitivity: text('sensitivity').notNull().default('low'),
     proactive_use: boolean('proactive_use').notNull().default(false),
