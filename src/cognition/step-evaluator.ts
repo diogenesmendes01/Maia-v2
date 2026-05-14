@@ -56,6 +56,14 @@ export async function evaluateCurrentStep(args: {
   const currentStepId = args.execution.current_step_id;
 
   if (!currentStepId) {
+    // P85-M3: surface the silent stall — without this log, an execution stuck
+    // with `current_step_id IS NULL` and `status='in_progress'` is invisible
+    // until the reaper sweeps it ~7d later. The post-turn evaluator wraps this
+    // in try/catch so the log doesn't break the agent turn.
+    logger.warn(
+      { execution_id: args.execution.id, definition_id: args.definition.id },
+      'step_evaluator.no_current_step',
+    );
     return {
       step_completed: false,
       criterion_results: [],
@@ -68,6 +76,17 @@ export async function evaluateCurrentStep(args: {
 
   const currentStep = steps.find((s) => s.id === currentStepId);
   if (!currentStep) {
+    // P85-M3: same class of silent-stall — `current_step_id` references a
+    // step that no longer exists in the definition (e.g., definition was
+    // edited mid-execution). Logged with both ids so ops can correlate.
+    logger.warn(
+      {
+        execution_id: args.execution.id,
+        definition_id: args.definition.id,
+        current_step_id: currentStepId,
+      },
+      'step_evaluator.current_step_not_found_in_definition',
+    );
     return {
       step_completed: false,
       criterion_results: [],

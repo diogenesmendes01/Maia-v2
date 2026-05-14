@@ -37,6 +37,18 @@ import {
  * backlog residual drena em ticks subsequentes — apenas com um teto de
  * trabalho por iteração.
  *
+ * P85-M5 (caveat de acoplamento): `runWithTenantContext` recebe
+ * `agent_id: 'default'` por construção. Hoje isso é seguro PORQUE
+ * `listStaleInProgress` filtra apenas por `tenant_id` (não chama
+ * `getCurrentAgent()`). Se alguém alterar `listStaleInProgress` no futuro
+ * para passar a filtrar também por `agent_id` via `getCurrentAgent()`,
+ * o reaper passará a varrer SOMENTE execuções do agent `default` em
+ * tenants multi-agent — silenciosamente deixando o resto stale.
+ * Mitigação futura: iterar `agentsRepo.listByTenant(t.id)` e abrir um
+ * tenant context por (tenant, agent), OU fazer o repo aceitar
+ * explicitamente um modo `crossAgent=true`. Sinalizado aqui para que
+ * a próxima refatoração do repo seja consciente do contrato.
+ *
  * Spec line 594: "Worker reaper força status=abandoned após 7d de inatividade".
  */
 const TTL_DAYS = Number(process.env.PROCEDURE_TTL_DAYS ?? 7);
