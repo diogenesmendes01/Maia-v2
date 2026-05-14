@@ -644,12 +644,20 @@ export const factsRepo = {
    * true. Sensitive/personal facts whose memory_entry says do-not-mention
    * are dropped from the prompt.
    *
-   * The match is by literal `content` against `valor->>'content'`. Persister
-   * writes valor as `{ content, subject_id }`, so the join is stable for
-   * P2-era facts. Facts predating P2 (no memory_entry row) are shown — a
-   * conservative default for migration-window legacy data, since migration
-   * 017 explicitly seeds these as needs_review=true memory entries that
-   * the reclassifier will eventually re-evaluate.
+   * The match is by literal `content` against two known shapes:
+   *   1. P2-era persister: valor = { content, subject_id }, so the join
+   *      is `me.content = af.valor->>'content'`.
+   *   2. Legacy (pre-P2) facts: migration 017 seeded memory_entry with
+   *      `content = CONCAT(af.chave, ': ', af.valor::text)`. If the fact's
+   *      `valor` happened to already include a `content` key, shape (1)
+   *      alone wouldn't catch it until the reclassifier worker rewrote
+   *      that entry. We also match shape (2) so the sensitivity filter
+   *      is correct during the reclassifier-backlog window.
+   *
+   * Facts predating P2 with NO memory_entry row at all are still shown —
+   * a conservative default for migration-window legacy data, since the
+   * 017 seed guarantees they get a needs_review=true entry the reclassifier
+   * will eventually re-evaluate.
    */
   async listMentionableForScopes(escopos: string[]): Promise<AgentFact[]> {
     if (escopos.length === 0) return [];
@@ -665,7 +673,10 @@ export const factsRepo = {
           SELECT 1 FROM memory_entry me
           WHERE me.tenant_id = af.tenant_id
             AND me.agent_id = af.agent_id
-            AND me.content = (af.valor->>'content')
+            AND (
+              me.content = (af.valor->>'content')
+              OR me.content = (af.chave || ': ' || af.valor::text)
+            )
             AND (
               me.needs_review = true
               OR me.mention_allowed = false

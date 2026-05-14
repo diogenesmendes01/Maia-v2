@@ -190,3 +190,90 @@ describe('[P82-C3] markReviewed computes expires_at from ttl_days', () => {
     expect(expires_at).toBeNull();
   });
 });
+
+/**
+ * PR #82 non-blocker followup — Finding 2:
+ *
+ * Migration 017 seeded legacy agent_facts into memory_entry with
+ * `content = CONCAT(chave, ': ', valor::text)`. P2 persister writes
+ * memory_entry rows with `content` matching `valor->>'content'`. The C1
+ * filter MUST join on BOTH shapes, otherwise legacy facts whose `valor`
+ * happens to already contain a `content` key escape the sensitivity
+ * gate until the reclassifier worker rewrites the entry.
+ *
+ * We can't run the real query without Postgres, so we mock db.execute,
+ * invoke the repo, and assert the emitted SQL contains both clauses —
+ * that's the contract change we need to lock in.
+ */
+describe('[P82-NB Finding 2] listMentionableForScopes matches both content shapes', () => {
+  const dbExecuteMock = vi.fn();
+
+  beforeEach(() => {
+    vi.resetModules();
+    // The top-level vi.mock at the head of this file replaces
+    // ../../src/db/repositories.js with a stub bag of vi.fn()s. To exercise
+    // the REAL factsRepo.listMentionableForScopes implementation (and
+    // assert the SQL it builds), we override that mock for this describe
+    // using vi.doMock + importActual, and we replace the db.execute that
+    // the real implementation will call.
+    vi.doMock('../../src/db/repositories.js', async () => {
+      const actual = await vi.importActual<typeof import('../../src/db/repositories.js')>(
+        '../../src/db/repositories.js'
+      );
+      return actual;
+    });
+    vi.doMock('../../src/db/client.js', () => ({ db: { execute: dbExecuteMock } }));
+    vi.doMock('../../src/db/tenant-context.js', () => ({
+      getCurrentTenant: () => 'tenant-x',
+      getCurrentAgent: () => 'agent-y',
+    }));
+    dbExecuteMock.mockReset();
+    dbExecuteMock.mockResolvedValue({ rows: [] });
+  });
+
+  async function captureSqlText() {
+    const { factsRepo } = await import('../../src/db/repositories.js');
+    await factsRepo.listMentionableForScopes(['global', 'pessoa:p1']);
+    expect(dbExecuteMock).toHaveBeenCalledTimes(1);
+    const sqlObj = dbExecuteMock.mock.calls[0]![0];
+    // drizzle's sql template exposes the literal chunks via .queryChunks
+    // (array of StringChunk { value: [string] } | param-placeholders).
+    // Concatenating the StringChunk values gives the static SQL skeleton.
+    const chunks = (sqlObj.queryChunks ?? []) as Array<{ value?: string[] }>;
+    return chunks
+      .map((c) => (Array.isArray(c.value) ? c.value.join('') : ''))
+      .join('')
+      .toLowerCase();
+  }
+
+  it('emits a JOIN clause for the P2-era persister shape (valor->>"content")', async () => {
+    const text = await captureSqlText();
+    // P2-era shape — exact form persister writes.
+    expect(text).toContain("af.valor->>'content'");
+  });
+
+  it('emits a JOIN clause for the legacy 017 shape (chave || ": " || valor::text)', async () => {
+    const text = await captureSqlText();
+    // Legacy 017 shape — what migration 017 seeded into memory_entry.content.
+    // Tolerant to whitespace variation: assert each segment is present.
+    expect(text).toContain('af.chave');
+    expect(text).toContain("': '");
+    expect(text).toContain('af.valor::text');
+  });
+
+  it('combines the two shapes with OR (single NOT EXISTS, no missed branch)', async () => {
+    const text = await captureSqlText();
+    // The whole disjunction lives inside a single NOT EXISTS over memory_entry.
+    expect(text).toContain('not exists');
+    expect(text).toContain('memory_entry');
+    // OR between the two me.content equalities — guard against a future
+    // regression that drops the second branch back to AND or removes it.
+    expect(text).toMatch(/me\.content\s*=\s*\(af\.valor->>'content'\)\s*\n?\s*or\s+me\.content\s*=/);
+  });
+
+  it('still gates by needs_review OR mention_allowed=false (the sensitivity verdict is unchanged)', async () => {
+    const text = await captureSqlText();
+    expect(text).toContain('me.needs_review = true');
+    expect(text).toContain('me.mention_allowed = false');
+  });
+});
