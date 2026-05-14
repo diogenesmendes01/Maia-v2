@@ -136,6 +136,18 @@ vi.mock('@/db/repositories.js', async () => {
         };
         return execState[id];
       }),
+      // PR #84 introduced createOrFindActive returning { execution, created }.
+      createOrFindActive: vi.fn(async (input: any) => {
+        const id = `exec-${Math.random().toString(36).slice(2)}`;
+        execState[id] = {
+          id,
+          ...input,
+          status: input.status ?? 'in_progress',
+          completed_steps: input.completed_steps ?? [],
+          execution_state: input.execution_state ?? {},
+        };
+        return { execution: execState[id], created: true };
+      }),
       findById: vi.fn(async (id: string) => execState[id] ?? null),
       findActiveForConversa: vi.fn(async () => null),
       updateState: vi.fn(async (id: string, updates: any) => {

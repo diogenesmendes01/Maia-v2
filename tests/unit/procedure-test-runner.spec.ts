@@ -1,6 +1,15 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 
+// PR #84 wraps engine.startExecution/advance/complete/abort in withTx and
+// routes their event+state writes through recordTx/updateStateTx. Mock the
+// transaction wrapper as identity — repo mocks already use shared in-memory
+// state regardless of `tx` argument.
+vi.mock('@/db/client.js', () => ({
+  withTx: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})),
+  db: {},
+}));
+
 // In-memory state, mirroring the pattern used by p3b-procedure-runtime.spec.ts
 // so the runner can drive engine/repo calls without a real DB.
 const execState: Record<string, any> = {};
@@ -22,14 +31,34 @@ vi.mock('@/db/repositories.js', async () => {
         };
         return execState[id];
       }),
+      // PR #84 introduced createOrFindActive returning { execution, created }.
+      createOrFindActive: vi.fn(async (input: any) => {
+        const id = `exec-${Math.random().toString(36).slice(2)}`;
+        execState[id] = {
+          id,
+          ...input,
+          status: input.status ?? 'in_progress',
+          completed_steps: input.completed_steps ?? [],
+          execution_state: input.execution_state ?? {},
+        };
+        return { execution: execState[id], created: true };
+      }),
       findById: vi.fn(async (id: string) => execState[id] ?? null),
       findActiveForConversa: vi.fn(async () => null),
       updateState: vi.fn(async (id: string, updates: any) => {
         if (execState[id]) execState[id] = { ...execState[id], ...updates };
       }),
+      // PR #84 added updateStateTx — engine writes go through this inside withTx.
+      updateStateTx: vi.fn(async (_tx: unknown, id: string, updates: any) => {
+        if (execState[id]) execState[id] = { ...execState[id], ...updates };
+      }),
     },
     procedureExecutionEventsRepo: {
       record: vi.fn(async (input: any) => {
+        events.push({ ...input, created_at: input.created_at ?? new Date() });
+      }),
+      // PR #84 added recordTx — engine writes go through this inside withTx.
+      recordTx: vi.fn(async (_tx: unknown, input: any) => {
         events.push({ ...input, created_at: input.created_at ?? new Date() });
       }),
       listByExecution: vi.fn(async (execution_id: string) =>
@@ -174,10 +203,15 @@ describe('runProcedureTest', () => {
   it('error path: engine throws → status=error, details.error populated', async () => {
     const definition = makeDefinition();
 
-    // Force startExecution to throw by sabotaging the events repo
+    // Force startExecution to throw by sabotaging the events repo.
+    // PR #84: engine.startExecution writes events via recordTx now.
     const repos = await import('@/db/repositories.js');
-    const original = repos.procedureExecutionEventsRepo.record;
+    const originalRecord = repos.procedureExecutionEventsRepo.record;
+    const originalRecordTx = (repos.procedureExecutionEventsRepo as any).recordTx;
     (repos.procedureExecutionEventsRepo.record as any) = vi.fn(async () => {
+      throw new Error('boom-from-events-repo');
+    });
+    (repos.procedureExecutionEventsRepo as any).recordTx = vi.fn(async () => {
       throw new Error('boom-from-events-repo');
     });
 
@@ -200,7 +234,8 @@ describe('runProcedureTest', () => {
         expect(result.details.error).toContain('boom-from-events-repo');
       });
     } finally {
-      (repos.procedureExecutionEventsRepo.record as any) = original;
+      (repos.procedureExecutionEventsRepo.record as any) = originalRecord;
+      (repos.procedureExecutionEventsRepo as any).recordTx = originalRecordTx;
     }
   });
 });

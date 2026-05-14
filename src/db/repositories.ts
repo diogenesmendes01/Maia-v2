@@ -1717,8 +1717,12 @@ export const procedureExecutionsRepo = {
     return { execution: existing, created: false };
   },
 
-  // P84-C5: transaction-aware variant. When called from inside a
-  // withTx() block, all writes commit together with the caller's events.
+  // P84-C5 / P3c fix P85-I1: transaction-aware variant. When called from
+  // inside a withTx() block, all writes commit together with the caller's
+  // events. Used by the engine (advance/complete/abort) and by the reaper
+  // (auto_abandoned event + status update must be atomic — without this, a
+  // process crash between event-write and status-write produces a duplicate
+  // auto_abandoned event on the next reaper tick).
   async updateStateTx(
     tx: typeof db,
     id: string,
@@ -1753,31 +1757,6 @@ export const procedureExecutionsRepo = {
     }>,
   ): Promise<void> {
     await db
-      .update(procedure_executions)
-      .set({ ...updates, last_activity_at: new Date() } as any)
-      .where(eq(procedure_executions.id, id));
-  },
-
-  // P3c — PR #85 fix P85-I1. Tx-variant used by the reaper so that the
-  // status update is atomic with the auto_abandoned event INSERT. Without
-  // this, a process crash between the event-write and the status-write
-  // produces a duplicate auto_abandoned event on the next reaper tick
-  // (audit-trail corruption).
-  async updateStateTx(
-    tx: typeof db,
-    id: string,
-    updates: Partial<{
-      current_step_id: string;
-      execution_state: any;
-      completed_steps: any;
-      last_activity_at: Date;
-      status: string;
-      outcome: string;
-      ended_at: Date;
-      notes: string;
-    }>,
-  ): Promise<void> {
-    await tx
       .update(procedure_executions)
       .set({ ...updates, last_activity_at: new Date() } as any)
       .where(eq(procedure_executions.id, id));
