@@ -52,7 +52,7 @@ psql "$DATABASE_URL" -f migrations/025_p4_agent_operational_profile_versions.sql
 psql "$DATABASE_URL" -f migrations/026_p4_agent_drift_alerts.sql
 ```
 
-Migration 026 referencia 025 via FK (`agent_drift_alerts.version_id → agent_operational_profile_versions.id`) — ordem de aplicação é obrigatória.
+Migration 026 referencia 025 via FK (`agent_drift_alerts.profile_version_id → agent_operational_profile_versions.id`) — ordem de aplicação é obrigatória.
 
 ### Seed inicial
 
@@ -80,7 +80,7 @@ WHERE tenant_id = $1
 ORDER BY version DESC;
 
 -- Apenas versão ativa
-SELECT version, core_immutable, operational_layer, activated_at
+SELECT version, core_immutable, operational_profile, activated_at
 FROM agent_operational_profile_versions
 WHERE tenant_id = $1 AND status = 'active';
 ```
@@ -122,6 +122,8 @@ await runDriftMonitor();
 ```
 
 Itera por tenant, busca versão ativa, monta janela de evidência, dispara os 7 detectores em paralelo via `runCognitiveModule`, agrega via decision engine, persiste alerts.
+
+Por run, processa até `DRIFT_MONITOR_TENANT_BATCH` tenants (default 500). Se a fleet exceder o cap, o worker loga `drift_monitor.tenant_batch_capped` com `skipped`; tenants restantes entram na próxima execução semanal (drift é sinal de cadência semanal, sem urgência).
 
 ### Inspecionar alertas
 
@@ -194,7 +196,7 @@ Kill-switch runtime é volátil — só vale para o processo atual. Sem flip de 
 | Sem versões para o tenant (`buildPrompt` em fallback constante) | Seed nunca rodou | Rodar `seedInitialOperationalProfile()` para o tenant em questão |
 | Drift CRÍTICO disparou `rollback_version` errado | Consultar `agent_drift_alerts.evidence` da decision para entender o gatilho | Reverter manualmente: `operationalProfileVersionsRepo.create` com `core_immutable` da versão anterior, depois `transition({ to: 'active' })`. Documentar incident review |
 | Drift detector falhando consistentemente | Conferir `cognitive_module_log` para timeouts/erros | `SELECT module, model, latency_ms, success, error_message FROM cognitive_module_log WHERE module LIKE 'drift.%' ORDER BY created_at DESC LIMIT 50` — investigar Anthropic API health, possivelmente reduzir tamanho da janela de evidência |
-| Decision engine sempre `monitor` apesar de drift óbvio | Thresholds podem estar mal calibrados para o tenant | Inspecionar `agent_drift_alerts.evidence.detector_scores`. Se sinal forte mas score baixo, revisar prompts dos detectores em `src/cognition/drift/*.ts` |
+| Decision engine sempre `monitor` apesar de drift óbvio | Thresholds podem estar mal calibrados para o tenant | Inspecionar `agent_drift_alerts.evidence` (campos `severity_hint`, `reasoning`, `examples`, `summary`). Se sinal forte mas severidade baixa, revisar prompts dos detectores em `src/cognition/drift/*.ts` |
 | Múltiplas versões `active` simultâneas | Constraint violado — não deve acontecer | Bug grave. Conferir DB: `SELECT count(*) FROM agent_operational_profile_versions WHERE tenant_id = $1 AND agent_id = $2 AND status = 'active'`. Esperado: 1. Se > 1, escolher a mais recente e forçar as outras para `frozen` manualmente |
 
 ## Rollback de migration
@@ -226,7 +228,7 @@ Exit 0 esperado. Smoke test adicional:
 2. Conferir versão `active` via SQL.
 3. Habilitar flag (`FEATURE_OPERATIONAL_PROFILE_V2=true`).
 4. Chamar `buildPrompt({...})` via REPL.
-5. Conferir que o prompt renderizado contém o conteúdo de `operational_layer` (tom, valores) e não cai em fallback.
+5. Conferir que o prompt renderizado contém o conteúdo de `operational_profile` (tom, valores) e não cai em fallback.
 
 ## Próximas fases
 

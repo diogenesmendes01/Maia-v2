@@ -52,11 +52,25 @@ import { decideAndApply } from '@/cognition/drift/decision-engine.js';
 const RECENT_DAYS = 7;
 const RECENT_MSG_LIMIT = 200;
 const RECENT_PROCEDURES_DAYS = 30;
+// Cap tenants processed in a single weekly run to bound runtime/cost.
+// Sequential per-tenant (1 LLM call × 4 detectores × N tenants → easy to
+// blow past sane limits at scale). Default 500 — operator-overridable via
+// env when fleet grows. When capped, remaining tenants get processed in the
+// next scheduled run (drift is a weekly-cadence signal, no urgency).
+const TENANT_BATCH_LIMIT = Number(process.env.DRIFT_MONITOR_TENANT_BATCH ?? 500);
 
 type SeverityBreakdown = { baixo: number; medio: number; alto: number; critico: number };
 
 export async function runDriftMonitor(): Promise<void> {
-  const tenants = await tenantsRepo.list();
+  const all_tenants = await tenantsRepo.list();
+  const batch_capped = all_tenants.length > TENANT_BATCH_LIMIT;
+  const tenants = batch_capped ? all_tenants.slice(0, TENANT_BATCH_LIMIT) : all_tenants;
+  if (batch_capped) {
+    logger.warn(
+      { total: all_tenants.length, limit: TENANT_BATCH_LIMIT, skipped: all_tenants.length - TENANT_BATCH_LIMIT },
+      'drift_monitor.tenant_batch_capped',
+    );
+  }
   let total_alerts = 0;
   const by_severity: SeverityBreakdown = { baixo: 0, medio: 0, alto: 0, critico: 0 };
 
@@ -94,7 +108,10 @@ export async function runDriftMonitor(): Promise<void> {
     });
   }
 
-  logger.info({ total_alerts, by_severity }, 'drift_monitor.done');
+  logger.info(
+    { total_alerts, by_severity, tenants_processed: tenants.length, batch_capped },
+    'drift_monitor.done',
+  );
 }
 
 async function assembleDriftInput(
