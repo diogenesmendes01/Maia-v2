@@ -106,6 +106,12 @@ vi.mock('@/db/repositories.js', () => ({
     listByLevels: capabilityGapsListByLevels,
     daysSinceLastProposed: capabilityGapsDaysSinceLastProposed,
     updateLevel: capabilityGapsUpdateLevel,
+    // PR #87 follow-up — updateLevelTx delega para o mesmo mock,
+    // ignorando o tx handle (testes não validam tx em si; o teste
+    // dedicado de rollback vive em tests/unit/gap-escalation-monitor.spec.ts).
+    updateLevelTx: vi.fn(async (_tx: unknown, args: { id: string; new_level: GapLevel }) =>
+      capabilityGapsUpdateLevel(args),
+    ),
     create: capabilityGapsCreate,
     listByLevel: capabilityGapsListByLevel,
     upsert: vi.fn(),
@@ -113,6 +119,10 @@ vi.mock('@/db/repositories.js', () => ({
   },
   capabilityProposalsRepo: {
     create: capabilityProposalsCreate,
+    // PR #87 follow-up — createTx delega para o mesmo mock, ignorando tx.
+    createTx: vi.fn(async (_tx: unknown, input: unknown) =>
+      capabilityProposalsCreate(input as never),
+    ),
     getById: capabilityProposalsGetById,
     transition: capabilityProposalsTransition,
     listByStatus: vi.fn(),
@@ -140,6 +150,19 @@ vi.mock('@/lib/logger.js', () => ({
     error: loggerError,
     debug: loggerDebug,
   },
+}));
+
+// PR #87 follow-up — withTx é usado pelo gap-escalation-monitor para tornar
+// INSERT capability_proposals + UPDATE agent_capability_gaps atômicos. No
+// teste de integração não há pool pg, então mockamos para executar o closure
+// imediatamente com um stub-tx (os repos *Tx já delegam para os mocks
+// não-tx). Testes que precisam validar rollback de fato vivem no unit test
+// dedicado em tests/unit/gap-escalation-monitor.spec.ts.
+vi.mock('@/db/client.js', () => ({
+  withTx: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({} as unknown)),
+  db: {},
+  shutdownDb: vi.fn(),
+  isConnected: vi.fn(() => true),
 }));
 
 // ---------- Helpers / factories ----------

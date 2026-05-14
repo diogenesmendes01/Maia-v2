@@ -1572,6 +1572,32 @@ export const capabilityGapsRepo = {
       );
   },
 
+  // PR #87 follow-up — transactional variant of updateLevel. Same semantics
+  // but executed against the caller-supplied `tx` handle so it can participate
+  // in a withTx block. Used by gap-escalation-monitor to commit the
+  // `mentionable → proposed` flip atomically with the capability_proposals
+  // INSERT (createTx). If either write fails the transaction rolls back,
+  // eliminating the partial-success window (proposal persisted but gap
+  // still mentionable) that previously caused the worker to enqueue a
+  // duplicate Sonnet call on the next tick.
+  async updateLevelTx(
+    tx: typeof db,
+    args: { id: string; new_level: GapLevel },
+  ): Promise<void> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    await tx
+      .update(agent_capability_gaps)
+      .set({ current_level: args.new_level, last_level_change_at: new Date() })
+      .where(
+        and(
+          eq(agent_capability_gaps.id, args.id),
+          eq(agent_capability_gaps.tenant_id, tenant_id),
+          eq(agent_capability_gaps.agent_id, agent_id),
+        ),
+      );
+  },
+
   // P5: daysSinceLastProposed — tenant/agent-wide MAX(last_level_change_at)
   // where current_level='proposed'. Used by the escalation engine to enforce
   // cooldown_days_proposed_to_proposed: do not raise another gap to 'proposed'
@@ -2439,6 +2465,43 @@ export const capabilityProposalsRepo = {
       test_scenarios: input.test_scenarios as unknown as object,
     });
     const [row] = await db
+      .insert(capability_proposals)
+      .values(guarded as typeof capability_proposals.$inferInsert)
+      .returning();
+    return row!;
+  },
+
+  // PR #87 follow-up — transactional variant of create. Writes via the
+  // caller-supplied `tx` handle so the INSERT participates in an outer
+  // withTx block. Pairs with capabilityGapsRepo.updateLevelTx so the
+  // gap-escalation worker can commit the proposal artifact and the gap
+  // level flip in a single transaction; transient failure during the
+  // gap UPDATE rolls back the proposal INSERT so the next worker tick
+  // does NOT produce a duplicate proposal row.
+  async createTx(
+    tx: typeof db,
+    input: {
+      gap_id?: string;
+      capability_type: 'tool' | 'knowledge' | 'procedure' | 'integration' | 'other';
+      title: string;
+      description: string;
+      proposed_spec: unknown;
+      motivation: string;
+      expected_impact?: string;
+      test_scenarios: unknown[];
+    },
+  ): Promise<CapabilityProposal> {
+    const guarded = applyTenantGuard({
+      gap_id: input.gap_id ?? null,
+      capability_type: input.capability_type,
+      title: input.title,
+      description: input.description,
+      proposed_spec: input.proposed_spec as object,
+      motivation: input.motivation,
+      expected_impact: input.expected_impact ?? null,
+      test_scenarios: input.test_scenarios as unknown as object,
+    });
+    const [row] = await tx
       .insert(capability_proposals)
       .values(guarded as typeof capability_proposals.$inferInsert)
       .returning();

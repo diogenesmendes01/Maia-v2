@@ -30,13 +30,19 @@ const tenantsState: Array<{ id: string; nome: string; status: string }> = [];
 
 const {
   updateLevelMock,
-  proposeCapabilityForGapMock,
+  updateLevelTxMock,
+  createProposalTxMock,
+  generateDraftMock,
+  withTxMock,
   loggerInfoMock,
   loggerWarnMock,
   loggerErrorMock,
 } = vi.hoisted(() => ({
   updateLevelMock: vi.fn(),
-  proposeCapabilityForGapMock: vi.fn(),
+  updateLevelTxMock: vi.fn(),
+  createProposalTxMock: vi.fn(),
+  generateDraftMock: vi.fn(),
+  withTxMock: vi.fn(),
   loggerInfoMock: vi.fn(),
   loggerWarnMock: vi.fn(),
   loggerErrorMock: vi.fn(),
@@ -75,6 +81,11 @@ vi.mock('@/db/repositories.js', async () => {
         return daysSinceProposedByTenant.get(tid) ?? null;
       }),
       updateLevel: updateLevelMock,
+      updateLevelTx: updateLevelTxMock,
+    },
+    capabilityProposalsRepo: {
+      ...actual.capabilityProposalsRepo,
+      createTx: createProposalTxMock,
     },
     gapEscalationRulesRepo: {
       ...actual.gapEscalationRulesRepo,
@@ -87,8 +98,18 @@ vi.mock('@/db/repositories.js', async () => {
   };
 });
 
+// PR #87 follow-up — worker agora abre uma transação para fazer
+// INSERT capability_proposals + UPDATE agent_capability_gaps atomicamente.
+// Por padrão o mock executa o closure passando um stub-tx (qualquer valor;
+// os repos *Tx são mockados acima); testes que querem simular falha
+// transient na transação substituem este mock.
+vi.mock('@/db/client.js', async () => {
+  const actual = await vi.importActual<typeof import('@/db/client.js')>('@/db/client.js');
+  return { ...actual, withTx: withTxMock };
+});
+
 vi.mock('@/cognition/capability-proposer.js', () => ({
-  proposeCapabilityForGap: proposeCapabilityForGapMock,
+  generateCapabilityProposalDraft: generateDraftMock,
 }));
 
 import { runGapEscalationMonitor } from '@/workers/gap-escalation-monitor.js';
@@ -143,10 +164,23 @@ describe('runGapEscalationMonitor', () => {
     rulesByTenant.clear();
     daysSinceProposedByTenant.clear();
     updateLevelMock.mockReset();
-    proposeCapabilityForGapMock.mockReset();
+    updateLevelTxMock.mockReset();
+    createProposalTxMock.mockReset();
+    generateDraftMock.mockReset();
+    withTxMock.mockReset();
     loggerInfoMock.mockReset();
     loggerWarnMock.mockReset();
     loggerErrorMock.mockReset();
+
+    // Default: withTx executa o closure com um stub-tx (os repos *Tx já
+    // estão mockados, então o valor passado não importa). Testes que
+    // querem simular falha transient (rollback) sobrescrevem este mock
+    // com mockImplementationOnce(() => { throw ... }).
+    withTxMock.mockImplementation(async (fn: (tx: unknown) => Promise<unknown>) => {
+      return fn({} as unknown);
+    });
+    // createProposalTx por padrão devolve uma row mínima válida.
+    createProposalTxMock.mockResolvedValue({ id: 'prop-default' });
   });
 
   it('cenário 1: silent + freq=3 (threshold default) → escala para dashboard, log emitido, proposer NÃO chamado', async () => {
@@ -162,7 +196,8 @@ describe('runGapEscalationMonitor', () => {
 
     expect(updateLevelMock).toHaveBeenCalledTimes(1);
     expect(updateLevelMock).toHaveBeenCalledWith({ id: 'gap-1', new_level: GapLevel.DASHBOARD });
-    expect(proposeCapabilityForGapMock).not.toHaveBeenCalled();
+    expect(generateDraftMock).not.toHaveBeenCalled();
+    expect(withTxMock).not.toHaveBeenCalled();
 
     const changed = loggerInfoMock.mock.calls.find((c) => c[1] === 'gap_escalation.changed');
     expect(changed).toBeDefined();
@@ -193,18 +228,33 @@ describe('runGapEscalationMonitor', () => {
     rulesByTenant.set('tenant-a', null);
     daysSinceProposedByTenant.set('tenant-a', null); // sem proposed prévio → cooldown ok
 
-    proposeCapabilityForGapMock.mockResolvedValueOnce({
+    generateDraftMock.mockResolvedValueOnce({
       ok: true,
-      proposal_id: 'prop-1',
       draft: { capability_type: 'tool', title: 't', description: 'd', proposed_spec: {}, motivation: 'm', expected_impact: '', test_scenarios: [] },
     });
+    createProposalTxMock.mockResolvedValueOnce({ id: 'prop-1' });
 
     await runGapEscalationMonitor();
     await flushMicrotasks();
 
-    expect(updateLevelMock).toHaveBeenCalledWith({ id: 'gap-mention', new_level: GapLevel.PROPOSED });
-    expect(proposeCapabilityForGapMock).toHaveBeenCalledTimes(1);
-    const arg = proposeCapabilityForGapMock.mock.calls[0]![0] as { gap: AgentCapabilityGap };
+    // PR #87 follow-up — promoção a proposed acontece dentro de withTx;
+    // updateLevelTx é chamado em vez do updateLevel não-transacional.
+    expect(withTxMock).toHaveBeenCalledTimes(1);
+    expect(createProposalTxMock).toHaveBeenCalledTimes(1);
+    const createArgs = createProposalTxMock.mock.calls[0]![1] as { gap_id: string };
+    expect(createArgs.gap_id).toBe('gap-mention');
+    expect(updateLevelTxMock).toHaveBeenCalledWith(expect.anything(), {
+      id: 'gap-mention',
+      new_level: GapLevel.PROPOSED,
+    });
+    // updateLevel (non-tx) NÃO foi chamado para o path proposed.
+    expect(updateLevelMock).not.toHaveBeenCalledWith({
+      id: 'gap-mention',
+      new_level: GapLevel.PROPOSED,
+    });
+
+    expect(generateDraftMock).toHaveBeenCalledTimes(1);
+    const arg = generateDraftMock.mock.calls[0]![0] as { gap: AgentCapabilityGap };
     expect(arg.gap.id).toBe('gap-mention');
     // worker passa o gap com new_level aplicado
     expect(arg.gap.current_level).toBe(GapLevel.PROPOSED);
@@ -238,7 +288,9 @@ describe('runGapEscalationMonitor', () => {
     await flushMicrotasks();
 
     expect(updateLevelMock).not.toHaveBeenCalled();
-    expect(proposeCapabilityForGapMock).not.toHaveBeenCalled();
+    expect(updateLevelTxMock).not.toHaveBeenCalled();
+    expect(generateDraftMock).not.toHaveBeenCalled();
+    expect(withTxMock).not.toHaveBeenCalled();
 
     const done = loggerInfoMock.mock.calls.find((c) => c[1] === 'gap_escalation_monitor.done');
     expect(done).toBeDefined();
@@ -256,7 +308,9 @@ describe('runGapEscalationMonitor', () => {
     await flushMicrotasks();
 
     expect(updateLevelMock).not.toHaveBeenCalled();
-    expect(proposeCapabilityForGapMock).not.toHaveBeenCalled();
+    expect(updateLevelTxMock).not.toHaveBeenCalled();
+    expect(generateDraftMock).not.toHaveBeenCalled();
+    expect(withTxMock).not.toHaveBeenCalled();
 
     const done = loggerInfoMock.mock.calls.find((c) => c[1] === 'gap_escalation_monitor.done');
     expect(done).toBeDefined();
@@ -276,7 +330,9 @@ describe('runGapEscalationMonitor', () => {
 
     // freq 4 < 5 → sem mudança
     expect(updateLevelMock).not.toHaveBeenCalled();
-    expect(proposeCapabilityForGapMock).not.toHaveBeenCalled();
+    expect(updateLevelTxMock).not.toHaveBeenCalled();
+    expect(generateDraftMock).not.toHaveBeenCalled();
+    expect(withTxMock).not.toHaveBeenCalled();
   });
 
   it('cenário 6: multi-tenant — itera tenants em contextos isolados; proposer disparado pela tenant elegível', async () => {
@@ -310,22 +366,28 @@ describe('runGapEscalationMonitor', () => {
     rulesByTenant.set('tenant-b', null);
     daysSinceProposedByTenant.set('tenant-b', null);
 
-    proposeCapabilityForGapMock.mockResolvedValueOnce({
+    generateDraftMock.mockResolvedValueOnce({
       ok: true,
-      proposal_id: 'prop-a',
       draft: { capability_type: 'tool', title: 't', description: 'd', proposed_spec: {}, motivation: 'm', expected_impact: '', test_scenarios: [] },
     });
+    createProposalTxMock.mockResolvedValueOnce({ id: 'prop-a' });
 
     await runGapEscalationMonitor();
     await flushMicrotasks();
 
-    // só tenant-a sofreu updateLevel
-    expect(updateLevelMock).toHaveBeenCalledTimes(1);
-    expect(updateLevelMock).toHaveBeenCalledWith({ id: 'gap-a', new_level: GapLevel.PROPOSED });
+    // só tenant-a sofreu promoção; agora via withTx + updateLevelTx.
+    expect(withTxMock).toHaveBeenCalledTimes(1);
+    expect(updateLevelTxMock).toHaveBeenCalledTimes(1);
+    expect(updateLevelTxMock).toHaveBeenCalledWith(expect.anything(), {
+      id: 'gap-a',
+      new_level: GapLevel.PROPOSED,
+    });
+    // updateLevel (não-tx) não foi chamado em nenhum dos tenants.
+    expect(updateLevelMock).not.toHaveBeenCalled();
 
     // proposer só foi chamado para tenant-a
-    expect(proposeCapabilityForGapMock).toHaveBeenCalledTimes(1);
-    const arg = proposeCapabilityForGapMock.mock.calls[0]![0] as { gap: AgentCapabilityGap };
+    expect(generateDraftMock).toHaveBeenCalledTimes(1);
+    const arg = generateDraftMock.mock.calls[0]![0] as { gap: AgentCapabilityGap };
     expect(arg.gap.id).toBe('gap-a');
 
     // log changed para tenant-a presente
@@ -342,5 +404,103 @@ describe('runGapEscalationMonitor', () => {
     const payload = done![0] as Record<string, unknown>;
     expect(payload.total_changed).toBe(1);
     expect(payload.total_proposed_triggered).toBe(1);
+  });
+
+  it('PR #87 follow-up — withTx throw inside closure: rollback atômico (sem proposal persistida, sem level flip, gap permanece mentionable)', async () => {
+    // Cenário: a chamada LLM retorna draft válido, mas o updateLevel
+    // dentro da transação falha (DB blip / lock timeout / qualquer throw).
+    // Comportamento esperado:
+    //   - withTx propaga o throw após ROLLBACK; o catch externo do worker
+    //     loga 'gap_escalation.atomic_promotion_failed' e segue.
+    //   - Como o mock de withTx joga ANTES do createProposalTx executar
+    //     (closure inteiro abortado), nenhuma row em capability_proposals
+    //     foi simulada como persistida.
+    //   - updateLevel (caminho não-tx) nunca é chamado para PROPOSED.
+    //   - total_proposed_triggered = 0 (promoção não aconteceu).
+    //   - gap_escalation.proposal_created NÃO é emitido.
+    //   - Próximo tick re-tentaria do zero — sem duplicate row.
+    tenantsState.push({ id: 'tenant-a', nome: 'A', status: 'active' });
+    gapsByTenant.set('tenant-a', [
+      makeGap({
+        id: 'gap-atomic',
+        current_level: GapLevel.MENTIONABLE,
+        frequency_score: 4,
+        severity_score: 5,
+        contexto: 'ctx-atomic',
+      }),
+    ]);
+    rulesByTenant.set('tenant-a', null);
+    daysSinceProposedByTenant.set('tenant-a', null);
+
+    generateDraftMock.mockResolvedValueOnce({
+      ok: true,
+      draft: {
+        capability_type: 'tool',
+        title: 't',
+        description: 'd',
+        proposed_spec: {},
+        motivation: 'm',
+        expected_impact: '',
+        test_scenarios: [],
+      },
+    });
+
+    // Sobrescreve o default: withTx executa o closure mas o updateLevelTx
+    // (segundo write dentro da transação) joga. O closure inteiro é
+    // abortado e withTx propaga o erro — exatamente como o pg client real
+    // faria após ROLLBACK.
+    let createTxCalled = false;
+    createProposalTxMock.mockImplementationOnce(async () => {
+      createTxCalled = true;
+      return { id: 'prop-would-have-been-rolled-back' };
+    });
+    updateLevelTxMock.mockImplementationOnce(async () => {
+      throw new Error('simulated db blip during updateLevel');
+    });
+
+    await runGapEscalationMonitor();
+    await flushMicrotasks();
+
+    // Worker recuperou-se: error logado, continuou para próxima iteração.
+    const atomicFailLog = loggerErrorMock.mock.calls.find(
+      (c) => c[1] === 'gap_escalation.atomic_promotion_failed',
+    );
+    expect(atomicFailLog).toBeDefined();
+    expect((atomicFailLog![0] as Record<string, unknown>).gap_id).toBe('gap-atomic');
+
+    // Asserções centrais:
+    // 1) withTx foi chamado (worker tentou a promoção atômica).
+    expect(withTxMock).toHaveBeenCalledTimes(1);
+    // 2) Em produção, INSERT + UPDATE seriam rolled back. Aqui, dado que
+    //    withTx propagou o throw, nenhuma row é considerada persistida.
+    //    O log de proposal_created NÃO foi emitido — proxy para "nada
+    //    persistido com sucesso da perspectiva do worker".
+    const proposalCreatedLog = loggerInfoMock.mock.calls.find(
+      (c) => c[1] === 'gap_escalation.proposal_created',
+    );
+    expect(proposalCreatedLog).toBeUndefined();
+    // 3) gap_escalation.changed NÃO foi emitido — gap permanece mentionable
+    //    do ponto de vista observável do worker.
+    const changedLog = loggerInfoMock.mock.calls.find(
+      (c) =>
+        c[1] === 'gap_escalation.changed' &&
+        (c[0] as Record<string, unknown>).gap_id === 'gap-atomic',
+    );
+    expect(changedLog).toBeUndefined();
+    // 4) updateLevel não-tx jamais foi chamado para esse gap (caminho
+    //    proposed sempre passa por updateLevelTx dentro do withTx).
+    expect(updateLevelMock).not.toHaveBeenCalled();
+
+    // 5) Contador agregado reflete a falha: nenhuma promoção contabilizada.
+    const done = loggerInfoMock.mock.calls.find((c) => c[1] === 'gap_escalation_monitor.done');
+    expect(done).toBeDefined();
+    const payload = done![0] as Record<string, unknown>;
+    expect(payload.total_changed).toBe(0);
+    expect(payload.total_proposed_triggered).toBe(0);
+
+    // sanity: o closure entrou (createTx foi chamado) — confirma que o
+    // throw aconteceu DENTRO da transação, não antes; em produção essa
+    // INSERT teria sido revertida pelo ROLLBACK do withTx real.
+    expect(createTxCalled).toBe(true);
   });
 });

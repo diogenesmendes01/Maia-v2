@@ -18,6 +18,18 @@
  *
  * IMPORTANTE: o proposer NÃO julga prioridade; só gera spec. Aprovação e
  * delivery vivem no fluxo de capability_proposals (state machine no repo).
+ *
+ * PR #87 follow-up — duas entradas públicas:
+ *  - `proposeCapabilityForGap`: full path (flag + LLM + persistência via repo
+ *    direto). Mantida para compatibilidade com chamadas que não precisam de
+ *    atomicidade com outras operações.
+ *  - `generateCapabilityProposalDraft`: APENAS flag + LLM, sem DB write.
+ *    Usado pelo gap-escalation-monitor para fazer a chamada LLM ANTES de
+ *    abrir a transação, então a transação atomiza apenas as duas escritas
+ *    rápidas (INSERT capability_proposals + UPDATE agent_capability_gaps),
+ *    eliminando o estado de sucesso parcial (proposal persistida mas nível
+ *    do gap ainda mentionable) que causava propostas duplicadas no próximo
+ *    tick do worker em caso de falha transitória do updateLevel.
  */
 import Anthropic from '@anthropic-ai/sdk';
 import { runCognitiveModule } from './runner.js';
@@ -41,8 +53,42 @@ export type ProposeResult =
   | { ok: true; proposal_id: string; draft: ProposalDraft }
   | { ok: false; reason: 'llm_unavailable' | 'parse_failed' | 'repo_failed'; message?: string };
 
+// PR #87 follow-up — discriminated union para o caminho draft-only (sem DB).
+// `repo_failed` não aparece porque nenhum repo é tocado nesta fase.
+export type DraftResult =
+  | { ok: true; draft: ProposalDraft }
+  | { ok: false; reason: 'llm_unavailable' | 'parse_failed'; message?: string };
+
 const PROPOSER_MODEL = 'claude-sonnet-4-6';
 const PROPOSER_TIMEOUT_MS = 15000;
+
+/**
+ * PR #87 follow-up — chamada LLM + parse, sem DB write. Permite ao caller
+ * (gap-escalation-monitor) fazer a chamada Sonnet (lenta, não-transacionável)
+ * ANTES de abrir um withTx que atomiza createProposal + updateLevel.
+ *
+ * Retorna o draft cru; é responsabilidade do caller persistir via createTx
+ * dentro da transação. Mesmas garantias do path completo:
+ *  - Flag gate antes da chamada (sem spend Sonnet com flag off).
+ *  - runCognitiveModule wrapper (timeout 15s + audit log + fallback null).
+ */
+export async function generateCapabilityProposalDraft(args: {
+  gap: AgentCapabilityGap;
+  recent_evidence?: Array<{ context: string; created_at: Date }>;
+}): Promise<DraftResult> {
+  if (!featureFlags.isEnabled(FeatureFlagName.DIALOGICAL_ACQUISITION)) {
+    return { ok: false, reason: 'llm_unavailable', message: 'flag_off' };
+  }
+
+  const draft = await runProposerLLM(args);
+
+  if (!draft.output) {
+    const reason = draft.status === 'timeout' ? 'llm_unavailable' : 'parse_failed';
+    return { ok: false, reason };
+  }
+
+  return { ok: true, draft: draft.output };
+}
 
 export async function proposeCapabilityForGap(args: {
   gap: AgentCapabilityGap;
@@ -53,7 +99,45 @@ export async function proposeCapabilityForGap(args: {
     return { ok: false, reason: 'llm_unavailable', message: 'flag_off' };
   }
 
-  const draft = await runCognitiveModule<ProposalDraft | null>(
+  const draft = await runProposerLLM(args);
+
+  if (!draft.output) {
+    const reason = draft.status === 'timeout' ? 'llm_unavailable' : 'parse_failed';
+    return { ok: false, reason };
+  }
+
+  try {
+    const proposal = await capabilityProposalsRepo.create({
+      gap_id: args.gap.id,
+      capability_type: draft.output.capability_type,
+      title: draft.output.title,
+      description: draft.output.description,
+      proposed_spec: draft.output.proposed_spec,
+      motivation: draft.output.motivation,
+      expected_impact: draft.output.expected_impact,
+      test_scenarios: draft.output.test_scenarios,
+    });
+    return { ok: true, proposal_id: proposal.id, draft: draft.output };
+  } catch (e) {
+    return {
+      ok: false,
+      reason: 'repo_failed',
+      message: e instanceof Error ? e.message : String(e),
+    };
+  }
+}
+
+/**
+ * Internal — runs runCognitiveModule + the Anthropic LLM call + parse.
+ * Returns the runCognitiveModule result (output may be null on
+ * timeout/throw/parse-failure). Extracted so both public entry points share
+ * the same prompt/parse logic.
+ */
+async function runProposerLLM(args: {
+  gap: AgentCapabilityGap;
+  recent_evidence?: Array<{ context: string; created_at: Date }>;
+}) {
+  return runCognitiveModule<ProposalDraft | null>(
     {
       name: 'capability_proposer',
       timeoutMs: PROPOSER_TIMEOUT_MS,
@@ -153,32 +237,4 @@ export async function proposeCapabilityForGap(args: {
       return parsed;
     },
   );
-
-  if (!draft.output) {
-    // runCognitiveModule maps thrown error → status='error', timeout → 'timeout'.
-    // Em ambos os casos output=null por causa do fallback. Tratamos genericamente
-    // como 'parse_failed' (LLM não produziu spec utilizável) exceto timeout puro.
-    const reason = draft.status === 'timeout' ? 'llm_unavailable' : 'parse_failed';
-    return { ok: false, reason };
-  }
-
-  try {
-    const proposal = await capabilityProposalsRepo.create({
-      gap_id: args.gap.id,
-      capability_type: draft.output.capability_type,
-      title: draft.output.title,
-      description: draft.output.description,
-      proposed_spec: draft.output.proposed_spec,
-      motivation: draft.output.motivation,
-      expected_impact: draft.output.expected_impact,
-      test_scenarios: draft.output.test_scenarios,
-    });
-    return { ok: true, proposal_id: proposal.id, draft: draft.output };
-  } catch (e) {
-    return {
-      ok: false,
-      reason: 'repo_failed',
-      message: e instanceof Error ? e.message : String(e),
-    };
-  }
 }
