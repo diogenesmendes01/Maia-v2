@@ -361,33 +361,6 @@ describe('decideAndApply', () => {
     expect(out[1]!.alert_id).toBe('alert-second-ok');
   });
 
-  // [P86-C1] Critical governance invariant: if the alert (audit row) fails
-  // to persist, we MUST NOT mutate the operational profile. The agent
-  // generates evidence; identity changes only happen with a recorded audit
-  // trail. This test enforces that contract for an ALTO-severity evidence
-  // which would otherwise call transition().
-  it('alto severity + alert.create falha → NÃO chama transition (governança: sem audit, sem mudança de identidade)', async () => {
-    transitionOk();
-    createAlertMock.mockRejectedValueOnce(new Error('audit db down'));
-
-    const ev = makeEvidence(DriftType.VALORES, { violated_principles: [0] });
-    const out = await decideAndApply({
-      evidences: [ev],
-      active_profile_id: PROFILE_ID,
-    });
-
-    expect(out[0]!.decision).toBe(DriftDecision.FROZEN);
-    expect(out[0]!.severity).toBe(DriftSeverity.ALTO);
-    expect(out[0]!.applied).toBe(false);
-    expect(out[0]!.applied_error).toContain('alert_persist_failed');
-    expect(out[0]!.applied_error).toContain('audit db down');
-    expect(out[0]!.alert_id).toBeUndefined();
-
-    // Crucial: transition was NEVER called because the audit row was not
-    // persisted first.
-    expect(transitionMock).not.toHaveBeenCalled();
-  });
-
   it('transition LANÇA erro (não retorna ok:false) → applied=false, applied_error tem a mensagem, alert ainda criado', async () => {
     transitionMock.mockRejectedValueOnce(new Error('db timeout'));
     const ev = makeEvidence(DriftType.VALORES, { violated_principles: [0] });

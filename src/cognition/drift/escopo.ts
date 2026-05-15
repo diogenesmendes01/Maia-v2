@@ -11,13 +11,11 @@
  * comparação é case-insensitive em `name` para tolerar diferenças de
  * convenção entre o LLM (que extrai capability_required do texto) e o P2.
  *
- * Provider-agnostic (P86-C4): usa `callLLM`. Erros propagam para o runner.
- *
- * Returns `null` quando não há mensagens do agente, ou quando todas as
- * promessas têm capability ativa. Throws em falha de provider/parse —
- * runCognitiveModule audita como `status:'error'`.
+ * Returns `null` quando não há mensagens do agente, quando o Anthropic falha
+ * (defensivo — o orchestrator cuida do fallback via runCognitiveModule), ou
+ * quando todas as promessas têm capability ativa.
  */
-import { callLLM } from '@/lib/claude.js';
+import Anthropic from '@anthropic-ai/sdk';
 import { DriftType } from '@/types/enums.js';
 import type { DriftDetector, DriftDetectionInput, DriftEvidence } from './types.js';
 
@@ -43,6 +41,7 @@ export const escopoDetector: DriftDetector = {
       .map((m) => `- (id=${m.id}) ${m.text}`)
       .join('\n');
 
+    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY ?? '' });
     const system = [
       'Você audita o agente em busca de promessas que ele não pode cumprir.',
       'Extraia das mensagens dele promessas/compromissos para o usuário.',
@@ -54,39 +53,46 @@ export const escopoDetector: DriftDetector = {
       'Devolva {"promises": [{"message_id": "...", "promise": "...", "capability_required": "..."}], "reasoning": "..."}',
     ].join('\n');
 
-    const res = await callLLM({
-      system,
-      messages: [{ role: 'user', content: user }],
-      max_tokens: 800,
-      temperature: 0.2,
-    });
-    const text = res.content ?? '';
-    const match = text.match(/\{[\s\S]*\}/);
-    if (!match) return null;
-    const parsed = JSON.parse(match[0]) as {
-      promises?: Array<{ message_id?: string; promise?: string; capability_required?: string }>;
-      reasoning?: string;
-    };
-    const promises = Array.isArray(parsed.promises) ? parsed.promises : [];
-    const unfulfillable = promises.filter(
-      (p) =>
-        typeof p.capability_required === 'string' &&
-        !activeNames.has(p.capability_required.toLowerCase()),
-    );
-    if (unfulfillable.length === 0) return null;
+    try {
+      const completion = await anthropic.messages.create({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 800,
+        system,
+        messages: [{ role: 'user', content: user }],
+      });
+      const text = completion.content
+        .filter((c): c is { type: 'text'; text: string } => c.type === 'text')
+        .map((c) => c.text)
+        .join('');
+      const match = text.match(/\{[\s\S]*\}/);
+      if (!match) return null;
+      const parsed = JSON.parse(match[0]) as {
+        promises?: Array<{ message_id?: string; promise?: string; capability_required?: string }>;
+        reasoning?: string;
+      };
+      const promises = Array.isArray(parsed.promises) ? parsed.promises : [];
+      const unfulfillable = promises.filter(
+        (p) =>
+          typeof p.capability_required === 'string' &&
+          !activeNames.has(p.capability_required.toLowerCase()),
+      );
+      if (unfulfillable.length === 0) return null;
 
-    const severity_hint =
-      unfulfillable.length >= 3 ? 'critico' : 'alto';
+      const severity_hint =
+        unfulfillable.length >= 3 ? 'critico' : unfulfillable.length >= 2 ? 'alto' : 'alto';
 
-    return {
-      drift_type: DriftType.ESCOPO,
-      detected_by: 'drift_detector_escopo',
-      payload: {
-        unfulfillable_promises: unfulfillable,
-        available_capabilities: Array.from(activeNames),
-        severity_hint,
-      },
-      evidence_summary: `${unfulfillable.length} promessas sem capability ativa`,
-    };
+      return {
+        drift_type: DriftType.ESCOPO,
+        detected_by: 'drift_detector_escopo',
+        payload: {
+          unfulfillable_promises: unfulfillable,
+          available_capabilities: Array.from(activeNames),
+          severity_hint,
+        },
+        evidence_summary: `${unfulfillable.length} promessas sem capability ativa`,
+      };
+    } catch {
+      return null;
+    }
   },
 };

@@ -11,28 +11,22 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { AgentOperationalProfileVersion } from '@/db/schema.js';
 import type { DriftRecentMessage } from '@/cognition/drift/types.js';
 
-// [P86-C4] detector via callLLM (provider-agnostic).
-const { callLLMMock } = vi.hoisted(() => ({ callLLMMock: vi.fn() }));
+const messagesCreateMock = vi.fn();
 
-vi.mock('@/lib/claude.js', () => ({
-  callLLM: callLLMMock,
-}));
+vi.mock('@anthropic-ai/sdk', () => {
+  const Anthropic = vi.fn().mockImplementation(() => ({
+    messages: { create: messagesCreateMock },
+  }));
+  return { default: Anthropic };
+});
 
 import { linguagemDetector } from '@/cognition/drift/linguagem.js';
 
-function makeLLMReply(jsonObj: Record<string, unknown>): {
-  content: string;
-  tool_uses: unknown[];
-  stop_reason: 'end_turn';
-  usage: { input_tokens: number; output_tokens: number };
-  model: string;
+function makeAnthropicReply(jsonObj: Record<string, unknown>): {
+  content: Array<{ type: 'text'; text: string }>;
 } {
   return {
-    content: JSON.stringify(jsonObj),
-    tool_uses: [],
-    stop_reason: 'end_turn',
-    usage: { input_tokens: 0, output_tokens: 0 },
-    model: 'mock-model',
+    content: [{ type: 'text', text: JSON.stringify(jsonObj) }],
   };
 }
 
@@ -44,33 +38,13 @@ function makeProfile(): AgentOperationalProfileVersion {
     agent_id: 'default',
     version: 1,
     status: 'active',
-    profile_body: {
-      schema_version: 'v3.1.1-2026-05-15',
-      identity: {
-        role_descriptor: 'Maia',
-        voice: {
-          tone: 'coloquial-profissional. Sem emojis.',
-          formality: 'medium',
-          verbosity: 'medium',
-        },
-        cognitive_limits: {
-          max_inference_depth: 3,
-          max_speculation_in_response: 0.2,
-          confidence_floor_for_action: 0.7,
-        },
-        priorities: [],
-        learned_voice_modifiers: [],
-      },
-      style: {
-        language: 'Português brasileiro, coloquial-profissional. Sem emojis.',
-        rhythm: {},
-      },
-      metadata: {
-        effective_from: now.toISOString(),
-        created_by: 'system_seed',
-        previous_version_id: null,
-      },
+    core_immutable: { identity_block: 'Maia', principles: [] } as unknown,
+    operational_profile: {
+      voice_descriptor: 'Português brasileiro, coloquial-profissional. Sem emojis.',
+      thresholds: {},
     } as unknown,
+    episodic_temp: {} as unknown,
+    growth_backlog: [] as unknown,
     proposed_by: 'system_seed',
     proposed_reason: null,
     approved_by: 'system_seed',
@@ -89,12 +63,12 @@ function makeAgentMsg(text: string, id = 'm-' + Math.random().toString(36).slice
 
 describe('linguagemDetector', () => {
   beforeEach(() => {
-    callLLMMock.mockReset();
+    messagesCreateMock.mockReset();
   });
 
   it('drift_detected=true + severity_hint=medio → evidence com severity_hint=medio', async () => {
-    callLLMMock.mockResolvedValueOnce(
-      makeLLMReply({
+    messagesCreateMock.mockResolvedValueOnce(
+      makeAnthropicReply({
         drift_detected: true,
         severity_hint: 'medio',
         offensive: false,
@@ -121,8 +95,8 @@ describe('linguagemDetector', () => {
   });
 
   it('drift_detected=true + offensive:true → severity_hint=critico (offensive override mesmo se hint=baixo)', async () => {
-    callLLMMock.mockResolvedValueOnce(
-      makeLLMReply({
+    messagesCreateMock.mockResolvedValueOnce(
+      makeAnthropicReply({
         drift_detected: true,
         severity_hint: 'baixo',
         offensive: true,
@@ -143,8 +117,8 @@ describe('linguagemDetector', () => {
   });
 
   it('drift_detected=false → null', async () => {
-    callLLMMock.mockResolvedValueOnce(
-      makeLLMReply({
+    messagesCreateMock.mockResolvedValueOnce(
+      makeAnthropicReply({
         drift_detected: false,
         severity_hint: 'baixo',
         offensive: false,
@@ -170,28 +144,23 @@ describe('linguagemDetector', () => {
     });
 
     expect(out).toBeNull();
-    expect(callLLMMock).not.toHaveBeenCalled();
+    expect(messagesCreateMock).not.toHaveBeenCalled();
   });
 
-  // [P86-C4] callLLM error propagates instead of swallow.
-  it('callLLM throws → erro PROPAGA (não mais swallow)', async () => {
-    callLLMMock.mockRejectedValueOnce(new Error('network exploded'));
+  it('Anthropic throws → null (defensivo)', async () => {
+    messagesCreateMock.mockRejectedValueOnce(new Error('network exploded'));
 
-    await expect(
-      linguagemDetector.detect({
-        profile_active: makeProfile(),
-        recent_messages: [makeAgentMsg('Beleza.')],
-      }),
-    ).rejects.toThrow('network exploded');
+    const out = await linguagemDetector.detect({
+      profile_active: makeProfile(),
+      recent_messages: [makeAgentMsg('Beleza.')],
+    });
+
+    expect(out).toBeNull();
   });
 
   it('resposta sem JSON parseável → null', async () => {
-    callLLMMock.mockResolvedValueOnce({
-      content: 'sem json aqui',
-      tool_uses: [],
-      stop_reason: 'end_turn',
-      usage: { input_tokens: 0, output_tokens: 0 },
-      model: 'mock-model',
+    messagesCreateMock.mockResolvedValueOnce({
+      content: [{ type: 'text', text: 'sem json aqui' }],
     });
 
     const out = await linguagemDetector.detect({
@@ -203,8 +172,8 @@ describe('linguagemDetector', () => {
   });
 
   it('drift_detected=true sem severity_hint nem offensive → defaults aplicados (severity=baixo)', async () => {
-    callLLMMock.mockResolvedValueOnce(
-      makeLLMReply({ drift_detected: true }),
+    messagesCreateMock.mockResolvedValueOnce(
+      makeAnthropicReply({ drift_detected: true }),
     );
 
     const out = await linguagemDetector.detect({

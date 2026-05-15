@@ -2,24 +2,20 @@
  * P4 Task 8 — Drift detector: VIES (regex + LLM).
  *
  * Híbrido: primeiro filtra mensagens do agente por padrões de generalização
- * (regex). Se houver match, pergunta ao LLM se essas mensagens contêm
+ * (regex). Se houver match, pergunta ao Sonnet se essas mensagens contêm
  * vieses reais (classificação semântica). Combina determinismo (regex) com
  * julgamento (LLM).
  *
- * Floor determinístico: o regex é a base; o LLM eleva a severidade quando
- * confirma. Sem LLM, a regex sozinha não é alarme crítico — mas erros do
- * provider PROPAGAM (throw) para `runCognitiveModule` auditar como
- * `status:'error'` em vez de "success com regex baseline" (que mascarava
- * falhas de provider — issue P86-C4). O JSON inválido / unparseable é
- * tratado como caso normal "LLM não classificou" → emite evidência com
- * regex matches em `baixo`, sem throw.
+ * Floor determinístico: se o LLM falhar (rede, parse), o detector AINDA
+ * devolve evidência com `severity_hint='baixo'` para que a regex não seja
+ * silenciosamente engolida. Esse é o ponto: a regex é a base; o LLM eleva
+ * a severidade quando confirma. Sem LLM, a regex sozinha não é alarme
+ * crítico, mas merece registro.
  *
- * Provider-agnostic: usa `callLLM` (respeita LLM_PROVIDER).
- *
- * Returns `null` quando não há matches regex (sem chamar provider), ou
+ * Returns `null` quando não há matches regex (sem chamar Anthropic), ou
  * quando o LLM classifica como falso positivo (`drift_detected: false`).
  */
-import { callLLM } from '@/lib/claude.js';
+import Anthropic from '@anthropic-ai/sdk';
 import { DriftType } from '@/types/enums.js';
 import type { DriftDetector, DriftDetectionInput, DriftEvidence } from './types.js';
 
@@ -54,6 +50,7 @@ export const viesDetector: DriftDetector = {
     if (matches.length === 0) return null;
 
     const sample = matches.map((m) => `- (pattern: ${m.matched_pattern}) "${m.text}"`).join('\n');
+    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY ?? '' });
     const system = [
       'Você audita mensagens de um agente em busca de generalizações enviesadas.',
       'Para cada mensagem suspeita, classifique como: bias_real | falso_positivo | inconclusivo.',
@@ -64,46 +61,54 @@ export const viesDetector: DriftDetector = {
       'Devolva {"drift_detected": bool, "severity_hint": "baixo"|"medio"|"alto"|"critico", "confirmed": [...], "reasoning": "..."}',
     ].join('\n');
 
-    // Provider errors propagate to runCognitiveModule (audited as 'error'),
-    // unlike before where catch returned baseline-regex evidence and silently
-    // masked the failure (P86-C4).
-    const res = await callLLM({
-      system,
-      messages: [{ role: 'user', content: user }],
-      max_tokens: 600,
-      temperature: 0.2,
-    });
-    const text = res.content ?? '';
-    const match = text.match(/\{[\s\S]*\}/);
-    if (!match) {
-      // LLM responded but JSON unparseable — keep deterministic floor:
-      // surface regex matches as soft signal (severity baixo). This is a
-      // normal classifier outcome, not a provider failure, so we do NOT
-      // throw.
+    try {
+      const completion = await anthropic.messages.create({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 600,
+        system,
+        messages: [{ role: 'user', content: user }],
+      });
+      const text = completion.content
+        .filter((c): c is { type: 'text'; text: string } => c.type === 'text')
+        .map((c) => c.text)
+        .join('');
+      const match = text.match(/\{[\s\S]*\}/);
+      if (!match) {
+        // LLM unable to judge — surface regex matches anyway as soft signal (severity baixo)
+        return {
+          drift_type: DriftType.VIES,
+          detected_by: 'drift_detector_vies',
+          payload: { regex_matches: matches, llm_unparseable: true, severity_hint: 'baixo' },
+          evidence_summary: `${matches.length} matches regex de generalização (LLM não classificou)`,
+        };
+      }
+      const parsed = JSON.parse(match[0]) as {
+        drift_detected?: boolean;
+        severity_hint?: string;
+        confirmed?: unknown[];
+        reasoning?: string;
+      };
+      if (!parsed.drift_detected) return null;
       return {
         drift_type: DriftType.VIES,
         detected_by: 'drift_detector_vies',
-        payload: { regex_matches: matches, llm_unparseable: true, severity_hint: 'baixo' },
-        evidence_summary: `${matches.length} matches regex de generalização (LLM não classificou)`,
+        payload: {
+          regex_matches: matches,
+          confirmed: Array.isArray(parsed.confirmed) ? parsed.confirmed : [],
+          severity_hint: parsed.severity_hint ?? 'medio',
+          reasoning: parsed.reasoning ?? '',
+        },
+        evidence_summary: (parsed.reasoning ?? `${matches.length} possíveis vieses detectados`).slice(0, 200),
+      };
+    } catch {
+      // Defensive — but DO surface regex matches at baixo severity, even when LLM is down.
+      // This is the "regex + LLM" detector; the regex side is the deterministic floor.
+      return {
+        drift_type: DriftType.VIES,
+        detected_by: 'drift_detector_vies',
+        payload: { regex_matches: matches, llm_error: true, severity_hint: 'baixo' },
+        evidence_summary: `${matches.length} matches regex de generalização (LLM falhou)`,
       };
     }
-    const parsed = JSON.parse(match[0]) as {
-      drift_detected?: boolean;
-      severity_hint?: string;
-      confirmed?: unknown[];
-      reasoning?: string;
-    };
-    if (!parsed.drift_detected) return null;
-    return {
-      drift_type: DriftType.VIES,
-      detected_by: 'drift_detector_vies',
-      payload: {
-        regex_matches: matches,
-        confirmed: Array.isArray(parsed.confirmed) ? parsed.confirmed : [],
-        severity_hint: parsed.severity_hint ?? 'medio',
-        reasoning: parsed.reasoning ?? '',
-      },
-      evidence_summary: (parsed.reasoning ?? `${matches.length} possíveis vieses detectados`).slice(0, 200),
-    };
   },
 };

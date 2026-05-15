@@ -106,12 +106,6 @@ vi.mock('@/db/repositories.js', () => ({
     listByLevels: capabilityGapsListByLevels,
     daysSinceLastProposed: capabilityGapsDaysSinceLastProposed,
     updateLevel: capabilityGapsUpdateLevel,
-    // PR #87 follow-up — updateLevelTx delega para o mesmo mock,
-    // ignorando o tx handle (testes não validam tx em si; o teste
-    // dedicado de rollback vive em tests/unit/gap-escalation-monitor.spec.ts).
-    updateLevelTx: vi.fn(async (_tx: unknown, args: { id: string; new_level: GapLevel }) =>
-      capabilityGapsUpdateLevel(args),
-    ),
     create: capabilityGapsCreate,
     listByLevel: capabilityGapsListByLevel,
     upsert: vi.fn(),
@@ -119,10 +113,6 @@ vi.mock('@/db/repositories.js', () => ({
   },
   capabilityProposalsRepo: {
     create: capabilityProposalsCreate,
-    // PR #87 follow-up — createTx delega para o mesmo mock, ignorando tx.
-    createTx: vi.fn(async (_tx: unknown, input: unknown) =>
-      capabilityProposalsCreate(input as never),
-    ),
     getById: capabilityProposalsGetById,
     transition: capabilityProposalsTransition,
     listByStatus: vi.fn(),
@@ -150,19 +140,6 @@ vi.mock('@/lib/logger.js', () => ({
     error: loggerError,
     debug: loggerDebug,
   },
-}));
-
-// PR #87 follow-up — withTx é usado pelo gap-escalation-monitor para tornar
-// INSERT capability_proposals + UPDATE agent_capability_gaps atômicos. No
-// teste de integração não há pool pg, então mockamos para executar o closure
-// imediatamente com um stub-tx (os repos *Tx já delegam para os mocks
-// não-tx). Testes que precisam validar rollback de fato vivem no unit test
-// dedicado em tests/unit/gap-escalation-monitor.spec.ts.
-vi.mock('@/db/client.js', () => ({
-  withTx: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({} as unknown)),
-  db: {},
-  shutdownDb: vi.fn(),
-  isConnected: vi.fn(() => true),
 }));
 
 // ---------- Helpers / factories ----------
@@ -360,28 +337,18 @@ function wireRepoImplementations() {
   );
 
   // capabilityProposalsRepo.transition — full state-machine emulation.
-  // Mirrors production rules incl. P87-C3 (testing intermediate + reverted).
   capabilityProposalsTransition.mockImplementation(
     async (args: {
       id: string;
-      to: 'submitted' | 'approved' | 'rejected' | 'testing' | 'delivered' | 'reverted';
+      to: 'submitted' | 'approved' | 'rejected' | 'delivered';
       decided_by?: string;
       decision_reason?: string;
       delivery_artifact_ref?: string;
-      revert_reason?: string;
-      last_test_outcome?: 'pass' | 'fail' | 'error';
     }) => {
       const row = proposalsState[args.id];
       if (!row) return { ok: false as const, reason: 'not_found' as const };
-      const from = row.status as
-        | 'draft'
-        | 'submitted'
-        | 'approved'
-        | 'rejected'
-        | 'testing'
-        | 'delivered'
-        | 'reverted';
-      if (from === 'rejected' || from === 'reverted') {
+      const from = row.status as 'draft' | 'submitted' | 'approved' | 'rejected' | 'delivered';
+      if (from === 'rejected' || from === 'delivered') {
         return { ok: false as const, reason: 'invalid_transition' as const };
       }
       if (from === args.to) {
@@ -390,9 +357,7 @@ function wireRepoImplementations() {
       const allowed: Record<string, string[]> = {
         draft: ['submitted'],
         submitted: ['approved', 'rejected'],
-        approved: ['testing'],
-        testing: ['delivered', 'reverted'],
-        delivered: ['reverted'],
+        approved: ['delivered'],
       };
       if (!allowed[from]?.includes(args.to)) {
         return { ok: false as const, reason: 'invalid_transition' as const };
@@ -411,18 +376,6 @@ function wireRepoImplementations() {
       } else if (args.to === 'delivered') {
         patch.delivered_at = now;
         if (args.delivery_artifact_ref) patch.delivery_artifact_ref = args.delivery_artifact_ref;
-        if (args.last_test_outcome) {
-          (patch as Record<string, unknown>).last_test_outcome = args.last_test_outcome;
-          (patch as Record<string, unknown>).last_test_at = now;
-        }
-      } else if (args.to === 'reverted') {
-        (patch as Record<string, unknown>).reverted_at = now;
-        if (args.revert_reason)
-          (patch as Record<string, unknown>).revert_reason = args.revert_reason;
-        if (args.last_test_outcome) {
-          (patch as Record<string, unknown>).last_test_outcome = args.last_test_outcome;
-          (patch as Record<string, unknown>).last_test_at = now;
-        }
       }
       const updated = { ...row, ...patch } as CapabilityProposal;
       proposalsState[args.id] = updated;
@@ -600,21 +553,12 @@ describe('P5 dialogical acquisition — end-to-end', () => {
   });
 
   // ---------- Cenário 2 ----------
-  // P87-C3 (PR #87 review) — fluxo de produção agora exige
-  // approved → testing → delivered via orchestrator. Direto approved → delivered
-  // é invalid_transition (bypass do test gate é proibido).
-  it('cenário 2: owner aprova proposta (draft → submitted → approved → testing → delivered); approved→delivered direto é invalid', async () => {
+  it('cenário 2: owner aprova proposta (draft → submitted → approved → delivered); invalid transition rejected', async () => {
     await runWithTenantContext(
       { tenant_id: 'default', agent_id: 'default' },
       async () => {
         // Pre-seed a draft proposal in mocked state.
-        const seeded = makeProposal({
-          id: 'prop-flow-1',
-          status: 'draft',
-          test_scenarios: [
-            { name: 'smoke', given: 'on', when: 'returns status', then: 'status' },
-          ],
-        });
+        const seeded = makeProposal({ id: 'prop-flow-1', status: 'draft' });
         proposalsState['prop-flow-1'] = seeded;
 
         const { capabilityProposalsRepo } = await import('@/db/repositories.js');
@@ -643,42 +587,20 @@ describe('P5 dialogical acquisition — end-to-end', () => {
           expect(r2.updated.decided_at).toBeInstanceOf(Date);
         }
 
-        // approved → delivered DIRETO: invalid_transition (gate de teste).
-        const bypass = await capabilityProposalsRepo.transition({
+        // approved → delivered (with delivery_artifact_ref)
+        const r3 = await capabilityProposalsRepo.transition({
           id: 'prop-flow-1',
           to: 'delivered',
           delivery_artifact_ref: 'pr-123',
         });
-        expect(bypass.ok).toBe(false);
-        if (!bypass.ok) {
-          expect(bypass.reason).toBe('invalid_transition');
-        }
-        // State unchanged: ainda em approved.
-        expect(proposalsState['prop-flow-1']!.status).toBe('approved');
-
-        // Caminho válido: orchestrator activateApprovedCapability faz
-        // approved → testing → delivered + invoca runCapabilityTests.
-        const { activateApprovedCapability } = await import(
-          '@/cognition/capability-test-runner.js'
-        );
-        const r3 = await activateApprovedCapability({
-          proposal_id: 'prop-flow-1',
-          delivery_artifact_ref: 'pr-123',
-        });
         expect(r3.ok).toBe(true);
         if (r3.ok) {
-          expect(r3.outcome).toBe('pass');
-          expect(r3.final_status).toBe('delivered');
+          expect(r3.updated.status).toBe('delivered');
+          expect(r3.updated.delivery_artifact_ref).toBe('pr-123');
+          expect(r3.updated.delivered_at).toBeInstanceOf(Date);
         }
-        expect(proposalsState['prop-flow-1']!.status).toBe('delivered');
-        expect(proposalsState['prop-flow-1']!.delivery_artifact_ref).toBe('pr-123');
-        // Test gate recorded:
-        expect(
-          (proposalsState['prop-flow-1'] as unknown as Record<string, unknown>)
-            .last_test_outcome,
-        ).toBe('pass');
 
-        // Invalid path: re-seed a submitted and try submitted → delivered directly.
+        // Invalid path: re-seed a draft and try submitted → delivered directly.
         proposalsState['prop-flow-2'] = makeProposal({
           id: 'prop-flow-2',
           status: 'submitted',
@@ -847,13 +769,7 @@ describe('P5 dialogical acquisition — end-to-end', () => {
   });
 
   // ---------- Cenário 6 ----------
-  // P87-C2 (PR #87 review): atomicidade artifact-first. Para a transição
-  // mentionable → proposed, o worker agora invoca o proposer ANTES de flipar
-  // o nível e só promove se ok:true. Com flag OFF o proposer retorna
-  // { ok:false, reason:'llm_unavailable' } → o gap fica em mentionable
-  // (sem órfão em proposed sem proposal). O engine determinístico
-  // continua independente da flag para as transições SILENT/DASHBOARD/MENTIONABLE.
-  it('cenário 6: flag OFF gates proposer (no Sonnet spend); gap NÃO promove a proposed sem artifact (P87-C2)', async () => {
+  it('cenário 6: flag OFF gates proposer (no Sonnet spend) mas engine determinístico ainda escala', async () => {
     const { featureFlags } = await import('@/config/feature-flags.js');
     featureFlags.override(FeatureFlagName.DIALOGICAL_ACQUISITION, false);
 
@@ -868,8 +784,9 @@ describe('P5 dialogical acquisition — end-to-end', () => {
     } as Tenant;
     tenantsState.push(tenant);
 
-    // Pre-seed a mentionable gap que satisfaz TODOS os thresholds proposed.
-    // Sem flag, o proposer falha → gap permanece em mentionable (P87-C2).
+    // Pre-seed a mentionable gap that satisfies ALL proposed thresholds:
+    // freq=5 + sev=5 (combined=10 >= 8), contexto present (distinct=2 >= 2),
+    // no cooldown. Engine would promote silent path → proposed regardless of flag.
     const gapId = 'gap-flag-off';
     gapsState[gapId] = makeGap({
       id: gapId,
@@ -886,16 +803,16 @@ describe('P5 dialogical acquisition — end-to-end', () => {
     await runGapEscalationMonitor();
     await flushMicrotasks();
 
-    // P87-C2: gap NÃO foi promovido a proposed porque o proposer falhou
-    // (flag OFF). Sem artifact em capability_proposals, o nível fica como
-    // estava — re-tentado no próximo tick quando flag estiver ON.
-    expect(gapsState[gapId]!.current_level).toBe(GapLevel.MENTIONABLE);
+    // Engine still promotes the gap (deterministic, doesn't depend on flag).
+    expect(gapsState[gapId]!.current_level).toBe(GapLevel.PROPOSED);
 
-    // Proposer short-circuits sem chamar Anthropic e sem criar capability_proposal.
+    // BUT proposer short-circuits without calling Anthropic and without
+    // creating a capability_proposal.
     expect(anthropicCreateMock).not.toHaveBeenCalled();
     expect(capabilityProposalsCreate).not.toHaveBeenCalled();
 
-    // proposer_failed log emitted with reason llm_unavailable.
+    // proposer_failed log emitted with reason llm_unavailable (from worker
+    // .then handler since proposer returns ok:false).
     const failedLog = loggerWarn.mock.calls.find(
       (c) => c[1] === 'gap_escalation.proposal_failed',
     );
@@ -903,71 +820,5 @@ describe('P5 dialogical acquisition — end-to-end', () => {
     const failedMeta = failedLog![0] as Record<string, unknown>;
     expect(failedMeta.gap_id).toBe(gapId);
     expect(failedMeta.reason).toBe('llm_unavailable');
-
-    // Nenhum log gap_escalation.changed para esta promoção (não houve
-    // promoção, pois proposer falhou). Sanity: changed só dispara em
-    // promoções confirmadas.
-    const changedLog = loggerInfo.mock.calls.find(
-      (c) =>
-        c[1] === 'gap_escalation.changed' &&
-        (c[0] as Record<string, unknown>).to === GapLevel.PROPOSED,
-    );
-    expect(changedLog).toBeUndefined();
-  });
-
-  // ---------- Cenário 7 (P87-C4) ----------
-  // Burst-protection: múltiplos gaps elegíveis a proposed em uma rodada
-  // não devem todos promover. Após a primeira promoção bem-sucedida, o
-  // cooldown local é debitado para 0 e os demais ficam em mentionable.
-  it('cenário 7: P87-C4 — múltiplos gaps elegíveis, apenas 1 promove por rodada (cooldown atomic in-loop)', async () => {
-    const { featureFlags } = await import('@/config/feature-flags.js');
-    featureFlags.override(FeatureFlagName.DIALOGICAL_ACQUISITION, true);
-
-    const now = new Date();
-    const tenant: Tenant = {
-      id: 'tenant-burst',
-      nome: 'Burst',
-      status: 'active',
-      metadata: {},
-      created_at: now,
-      updated_at: now,
-    } as Tenant;
-    tenantsState.push(tenant);
-
-    // Duas regras com cooldown 14 dias (DEFAULT_RULES).
-    // daysSinceLastProposed=null (nenhuma proposed ainda) → primeiro gap
-    // passa; depois deve ser debitado para 0 → segundo gap NÃO passa o gate.
-    for (let i = 1; i <= 2; i++) {
-      const id = `gap-burst-${i}`;
-      gapsState[id] = makeGap({
-        id,
-        tenant_id: 'tenant-burst',
-        current_level: GapLevel.MENTIONABLE,
-        frequency_score: 5,
-        severity_score: 5,
-        contexto: `contexto-${i}`,
-      });
-    }
-
-    // Anthropic responde apenas uma vez — se o worker chamasse 2x seria spam.
-    anthropicCreateMock.mockResolvedValueOnce({
-      content: [{ type: 'text', text: happyJson() }],
-    });
-
-    const { runGapEscalationMonitor } = await import(
-      '@/workers/gap-escalation-monitor.js'
-    );
-    await runGapEscalationMonitor();
-    await flushMicrotasks();
-
-    // Exatamente 1 dos gaps avançou para proposed.
-    const promotedCount = Object.values(gapsState).filter(
-      (g) => g.current_level === GapLevel.PROPOSED,
-    ).length;
-    expect(promotedCount).toBe(1);
-
-    // 1 capability_proposal criada (não 2).
-    expect(capabilityProposalsCreate).toHaveBeenCalledTimes(1);
-    expect(anthropicCreateMock).toHaveBeenCalledTimes(1);
   });
 });

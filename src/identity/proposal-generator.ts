@@ -8,10 +8,11 @@
  * index (1 active por (tenant, agent)).
  *
  * Determinístico — sem chamada a LLM. Decompõe `src/identity/maia-prompt.md`
- * em um único `profile_body: ProfileBody` (v3.1.1) com 3 namespaces:
- *   - identity      ← role_descriptor, voice, cognitive_limits, priorities, learned_voice_modifiers
- *   - style         ← language, rhythm
- *   - metadata      ← effective_from, created_by, previous_version_id
+ * em 4 camadas:
+ *   - core_immutable      ← seção "## Identidade" + "## Princípios" (intocável)
+ *   - operational_profile ← seção "## Como você fala" + thresholds derivados de self_state
+ *   - episodic_temp       ← {} (preenchido em runtime conforme conversa rola)
+ *   - growth_backlog      ← [] (preenchido conforme propostas aprovadas)
  *
  * Idempotente: se já existe versão `active` para o (tenant, agent), retorna a
  * existente sem criar nada. Também trata a corrida em que outra propose ganhou
@@ -20,8 +21,7 @@
  */
 import { readFile } from 'node:fs/promises';
 import { operationalProfileVersionsRepo } from '@/db/repositories.js';
-import { PROFILE_BODY_SCHEMA_VERSION } from '@/db/schema.js';
-import type { AgentOperationalProfileVersion, ProfileBody, SelfState } from '@/db/schema.js';
+import type { AgentOperationalProfileVersion, SelfState } from '@/db/schema.js';
 
 export type ProposalGeneratorResult =
   | { created: true; version: AgentOperationalProfileVersion }
@@ -51,47 +51,30 @@ export async function seedInitialOperationalProfile(args?: {
     );
   }
 
-  // 3. Quebrar em seções e montar profile_body v3.1.1.
+  // 3. Quebrar em seções e montar as 4 camadas.
   const sections = parseMarkdownSections(content);
   const principles = parseNumberedList(
     sections.get('princípios') ?? sections.get('principios') ?? '',
   );
-  const identity_block = sections.get('identidade') ?? '';
-  const voice_descriptor =
-    sections.get('como você fala') ?? sections.get('como voce fala') ?? '';
-  const thresholds = extractThresholdsFromSelf(args?.source_self_state) ?? {};
-
-  const profile_body: ProfileBody = {
-    schema_version: PROFILE_BODY_SCHEMA_VERSION,
-    identity: {
-      role_descriptor: identity_block,
-      voice: {
-        tone: voice_descriptor,
-        formality: 'medium',
-        verbosity: 'medium',
-      },
-      cognitive_limits: {
-        max_inference_depth: 3,
-        max_speculation_in_response: 0.2,
-        confidence_floor_for_action: 0.7,
-      },
-      priorities: principles,
-      learned_voice_modifiers: [],
-    },
-    style: {
-      language: 'pt-BR',
-      rhythm: thresholds,
-    },
-    metadata: {
-      effective_from: new Date().toISOString(),
-      created_by: 'system_seed',
-      previous_version_id: null,
-    },
+  const core_immutable = {
+    identity_block: sections.get('identidade') ?? '',
+    principles,
   };
+  const thresholds = extractThresholdsFromSelf(args?.source_self_state) ?? {};
+  const operational_profile = {
+    voice_descriptor:
+      sections.get('como você fala') ?? sections.get('como voce fala') ?? '',
+    thresholds,
+  };
+  const episodic_temp: Record<string, unknown> = {};
+  const growth_backlog: unknown[] = [];
 
   // 4. Two-step seed: create defaults a proposed, depois transitiona pra active.
   const created = await operationalProfileVersionsRepo.create({
-    profile_body,
+    core_immutable,
+    operational_profile,
+    episodic_temp,
+    growth_backlog,
     proposed_by: 'system_seed',
     proposed_reason: 'initial seed from self_state + maia-prompt.md',
   });

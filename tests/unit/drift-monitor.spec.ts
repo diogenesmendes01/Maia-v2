@@ -71,29 +71,19 @@ vi.mock('@/db/repositories.js', async () => {
 
 // Mock direct db.select chain (mensagens + procedure_definitions). Cada teste
 // não vai depender dos dados; só precisamos que os fetches não joguem.
-//
-// O fetch de procedures usa LEFT JOIN com procedure_metrics (fix P86-C2:
-// evidence_count vem real de procedure_metrics.total_executions, NÃO mais
-// hardcoded como 0). O mock precisa suportar o método `.leftJoin()` na cadeia.
 vi.mock('@/db/client.js', async () => {
-  const emptyResult: unknown[] = [];
-  const finalChain = {
-    orderBy: () => ({
-      limit: async () => emptyResult,
-      then: (resolve: (v: unknown[]) => unknown) => resolve(emptyResult),
-    }),
-  };
-  const whereChain = {
-    where: () => finalChain,
-  };
-  const fromChain = {
-    from: () => ({
-      ...whereChain,
-      leftJoin: () => whereChain,
-    }),
-  };
   const noop = {
-    select: () => fromChain,
+    select: () => ({
+      from: () => ({
+        where: () => ({
+          orderBy: () => ({
+            limit: async () => [],
+            // some chains call .orderBy then await directly (no limit) — return a thenable
+            then: (resolve: (v: unknown[]) => unknown) => resolve([]),
+          }),
+        }),
+      }),
+    }),
   };
   return {
     db: noop,

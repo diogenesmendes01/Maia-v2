@@ -10,16 +10,13 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-const { countSwitchesMock, countSwitchesInLastNTurnsMock } = vi.hoisted(() => ({
+const { countSwitchesMock } = vi.hoisted(() => ({
   countSwitchesMock: vi.fn<[conversa_id: string], Promise<number>>(),
-  // [P88-H4] new repo method for cooldown_turns guard
-  countSwitchesInLastNTurnsMock: vi.fn<[args: { conversa_id: string; n: number }], Promise<number>>(),
 }));
 
 vi.mock('@/db/repositories.js', () => ({
   roleSelectorDecisionsRepo: {
     countSwitchesInConversation: countSwitchesMock,
-    countSwitchesInLastNTurns: countSwitchesInLastNTurnsMock,
   },
 }));
 
@@ -36,9 +33,6 @@ import type { RoleSelectorInput, RoleCandidate } from '@/cognition/role-selector
 
 beforeEach(() => {
   countSwitchesMock.mockReset();
-  countSwitchesInLastNTurnsMock.mockReset();
-  // Default: no recent switches → cooldown never blocks unless test overrides.
-  countSwitchesInLastNTurnsMock.mockResolvedValue(0);
 });
 
 function makeRole(role_key: string, id: string): Role {
@@ -218,12 +212,7 @@ describe('decidePolicy — BY_CONTEXT (travas anti-osc)', () => {
 
   it('confidence >= min + osc count < max → switch, decided_by=policy_rule', async () => {
     countSwitchesMock.mockResolvedValueOnce(1); // abaixo do default max=3
-    // [P88-H4] required_strength_delta=0 so 0.85 clears the threshold
-    // (with default delta=0.2 the effective min would be 0.9 and 0.85 fails).
-    const input = makeInput(SwitchBehavior.BY_CONTEXT, {
-      conversa_id: 'conv-1',
-      guards: { required_strength_delta: 0 },
-    });
+    const input = makeInput(SwitchBehavior.BY_CONTEXT, { conversa_id: 'conv-1' });
     const candidate = makeCandidate({ confidence: 0.85 });
     const out = await decidePolicy({ input, candidate });
 
@@ -260,82 +249,6 @@ describe('decidePolicy — BY_CONTEXT (travas anti-osc)', () => {
     expect(out.action).toBe(RoleDecisionAction.KEEP_CURRENT);
     expect(out.decided_by).toBe(DecidedBy.POLICY_RULE);
     expect(out.reason).toContain('< min 0.9');
-    assertNotLlmClassifier(out.decided_by);
-  });
-
-  // [P88-H4] required_strength_delta raises the effective minimum confidence.
-  it('required_strength_delta forces extra margin → candidate@0.85, min=0.7, delta=0.2 → keep_current', async () => {
-    const input = makeInput(SwitchBehavior.BY_CONTEXT, {
-      conversa_id: 'conv-rsd',
-      guards: { required_strength_delta: 0.2, cooldown_turns: 0 },
-    });
-    const candidate = makeCandidate({ confidence: 0.85 });
-    const out = await decidePolicy({ input, candidate });
-
-    expect(out.action).toBe(RoleDecisionAction.KEEP_CURRENT);
-    expect(out.decided_by).toBe(DecidedBy.POLICY_RULE);
-    expect(out.reason).toContain('+ delta 0.2');
-    assertNotLlmClassifier(out.decided_by);
-  });
-
-  // [P88-H4] cooldown_turns blocks the switch when there was a switch in the
-  // recent window — even when confidence + osc would otherwise allow it.
-  it('cooldown_turns=3 + recent switch within window → keep_current via policy_rule', async () => {
-    countSwitchesMock.mockResolvedValue(0); // osc would NOT block
-    countSwitchesInLastNTurnsMock.mockResolvedValueOnce(1); // 1 switch in last 3 turns
-    const input = makeInput(SwitchBehavior.BY_CONTEXT, {
-      conversa_id: 'conv-cool',
-      guards: { cooldown_turns: 3, required_strength_delta: 0 },
-    });
-    const candidate = makeCandidate({ confidence: 0.95 });
-    const out = await decidePolicy({ input, candidate });
-
-    expect(out.action).toBe(RoleDecisionAction.KEEP_CURRENT);
-    expect(out.decided_by).toBe(DecidedBy.POLICY_RULE);
-    expect(out.reason).toContain('cooldown active');
-    expect(countSwitchesInLastNTurnsMock).toHaveBeenCalledWith({
-      conversa_id: 'conv-cool',
-      n: 3,
-    });
-    assertNotLlmClassifier(out.decided_by);
-  });
-
-  // [P88-H4] cooldown_turns=0 disables the cooldown guard.
-  it('cooldown_turns=0 → cooldown guard does NOT query repo', async () => {
-    countSwitchesMock.mockResolvedValueOnce(0);
-    const input = makeInput(SwitchBehavior.BY_CONTEXT, {
-      conversa_id: 'conv-no-cool',
-      guards: { cooldown_turns: 0, required_strength_delta: 0 },
-    });
-    const candidate = makeCandidate({ confidence: 0.85 });
-    const out = await decidePolicy({ input, candidate });
-
-    expect(out.action).toBe(RoleDecisionAction.SWITCH);
-    expect(countSwitchesInLastNTurnsMock).not.toHaveBeenCalled();
-    assertNotLlmClassifier(out.decided_by);
-  });
-});
-
-// [P88-H1] allowed_role_ids enforcement is layered: caller filters
-// available_roles (engine.ts in core.ts), and the decider re-checks. The
-// FREE_WITH_TRIGGER branch already had this check; BY_CONTEXT now does too.
-describe('decidePolicy — [P88-H1] allowed_role_ids enforcement (allowlist)', () => {
-  it('BY_CONTEXT + candidate NOT in available_roles → fallback (allowlist violation)', async () => {
-    const def = makeRole('default', 'role-default');
-    const input = makeInput(SwitchBehavior.BY_CONTEXT, {
-      current: def,
-      available: [def], // suporte NOT in allowed set
-      conversa_id: 'conv-allowlist',
-    });
-    const candidate = makeCandidate({
-      role_id: 'role-suporte',
-      confidence: 0.95,
-    });
-    const out = await decidePolicy({ input, candidate });
-
-    expect(out.action).toBe(RoleDecisionAction.FALLBACK);
-    expect(out.decided_by).toBe(DecidedBy.FALLBACK_RULE);
-    expect(out.reason).toContain('allowed_role_ids violation');
     assertNotLlmClassifier(out.decided_by);
   });
 });

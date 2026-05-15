@@ -88,6 +88,18 @@ export async function transitionProcedureStatus(args: {
     }
   }
 
+  // P3c gate: proposed → active requires green tests.
+  if (args.definition.status === 'proposed' && args.to === 'active') {
+    const tests = await procedureTestsRepo.listByDefinition(args.definition.id);
+    if (tests.length === 0) {
+      return { ok: false, reason: 'tests_required', missing_tests: true };
+    }
+    const failing = tests.filter((t) => t.last_run_status !== 'pass');
+    if (failing.length > 0) {
+      return { ok: false, reason: 'tests_not_passing', failing_tests: failing };
+    }
+  }
+
   const now = new Date();
   // P83-L1: use the exported ProcedureStatusUpdate type directly instead of
   // a `Parameters<typeof ...>[1]` lookup. Both refer to the same shape; the

@@ -1,44 +1,35 @@
 /**
  * P4 Task 8 (Cluster 1) — drift detector: tom (LLM-as-judge).
  *
- * [P86-C4] Detector agora roteia via `callLLM` (provider-agnostic) em vez
- * de instanciar Anthropic direto. Mock atualizado para interceptar `callLLM`
- * — cobertura de provider/Anthropic/OpenRouter via uma única superfície.
- * Erros de provider PROPAGAM (throw) ao orchestrator; o teste antigo
- * "Anthropic throws → retorna null" foi atualizado para "callLLM throws →
- * propaga ao runner" (responsabilidade do orchestrator, não do detector).
+ * Padrão de mock copiado de tests/unit/step-evaluator-llm-judge.spec.ts:
+ * vi.mock do @anthropic-ai/sdk com um messagesCreateMock controlável.
  *
  * Cenários cobertos:
  *  - drift_detected=true → retorna DriftEvidence com type='tom', payload contém severity_hint
  *  - drift_detected=false → retorna null
- *  - callLLM throws → erro propaga (não mais swallow silencioso)
- *  - sem mensagens do agente → retorna null sem chamar callLLM
+ *  - Anthropic throws → retorna null (defensivo)
+ *  - sem mensagens do agente → retorna null sem chamar Anthropic
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { AgentOperationalProfileVersion } from '@/db/schema.js';
 import type { DriftRecentMessage } from '@/cognition/drift/types.js';
 
-const { callLLMMock } = vi.hoisted(() => ({ callLLMMock: vi.fn() }));
+const messagesCreateMock = vi.fn();
 
-vi.mock('@/lib/claude.js', () => ({
-  callLLM: callLLMMock,
-}));
+vi.mock('@anthropic-ai/sdk', () => {
+  const Anthropic = vi.fn().mockImplementation(() => ({
+    messages: { create: messagesCreateMock },
+  }));
+  return { default: Anthropic };
+});
 
 import { tomDetector } from '@/cognition/drift/tom.js';
 
-function makeLLMReply(jsonObj: Record<string, unknown>): {
-  content: string;
-  tool_uses: unknown[];
-  stop_reason: 'end_turn';
-  usage: { input_tokens: number; output_tokens: number };
-  model: string;
+function makeAnthropicReply(jsonObj: Record<string, unknown>): {
+  content: Array<{ type: 'text'; text: string }>;
 } {
   return {
-    content: JSON.stringify(jsonObj),
-    tool_uses: [],
-    stop_reason: 'end_turn',
-    usage: { input_tokens: 0, output_tokens: 0 },
-    model: 'mock-model',
+    content: [{ type: 'text', text: JSON.stringify(jsonObj) }],
   };
 }
 
@@ -50,33 +41,16 @@ function makeProfile(): AgentOperationalProfileVersion {
     agent_id: 'default',
     version: 1,
     status: 'active',
-    profile_body: {
-      schema_version: 'v3.1.1-2026-05-15',
-      identity: {
-        role_descriptor: 'Você é a Maia, assistente financeira.',
-        voice: {
-          tone: 'coloquial-profissional. Sem emojis.',
-          formality: 'medium',
-          verbosity: 'medium',
-        },
-        cognitive_limits: {
-          max_inference_depth: 3,
-          max_speculation_in_response: 0.2,
-          confidence_floor_for_action: 0.7,
-        },
-        priorities: ['Direta, não burocrática.'],
-        learned_voice_modifiers: [],
-      },
-      style: {
-        language: 'pt-BR',
-        rhythm: {},
-      },
-      metadata: {
-        effective_from: now.toISOString(),
-        created_by: 'system_seed',
-        previous_version_id: null,
-      },
+    core_immutable: {
+      identity_block: 'Você é a Maia, assistente financeira.',
+      principles: ['Direta, não burocrática.'],
     } as unknown,
+    operational_profile: {
+      voice_descriptor: 'Português brasileiro, coloquial-profissional. Sem emojis.',
+      thresholds: {},
+    } as unknown,
+    episodic_temp: {} as unknown,
+    growth_backlog: [] as unknown,
     proposed_by: 'system_seed',
     proposed_reason: null,
     approved_by: 'system_seed',
@@ -100,12 +74,12 @@ function makeAgentMsg(text: string, id = 'm-' + Math.random().toString(36).slice
 
 describe('tomDetector', () => {
   beforeEach(() => {
-    callLLMMock.mockReset();
+    messagesCreateMock.mockReset();
   });
 
   it('drift_detected=true → retorna DriftEvidence com type tom, detected_by drift_detector_tom, payload com severity_hint', async () => {
-    callLLMMock.mockResolvedValueOnce(
-      makeLLMReply({
+    messagesCreateMock.mockResolvedValueOnce(
+      makeAnthropicReply({
         drift_detected: true,
         severity_hint: 'medio',
         examples: ['msg X'],
@@ -130,8 +104,8 @@ describe('tomDetector', () => {
   });
 
   it('drift_detected=false → retorna null', async () => {
-    callLLMMock.mockResolvedValueOnce(
-      makeLLMReply({
+    messagesCreateMock.mockResolvedValueOnce(
+      makeAnthropicReply({
         drift_detected: false,
         severity_hint: 'baixo',
         examples: [],
@@ -147,22 +121,18 @@ describe('tomDetector', () => {
     expect(out).toBeNull();
   });
 
-  // [P86-C4] callLLM failure now propagates instead of being swallowed as
-  // "no drift". The orchestrator's runCognitiveModule catches and audits
-  // the error as `status:'error'`. Visibility of provider failures is the
-  // explicit fix.
-  it('callLLM throws → erro PROPAGA (não mais swallow silencioso)', async () => {
-    callLLMMock.mockRejectedValueOnce(new Error('network exploded'));
+  it('Anthropic throws → retorna null (defensivo)', async () => {
+    messagesCreateMock.mockRejectedValueOnce(new Error('network exploded'));
 
-    await expect(
-      tomDetector.detect({
-        profile_active: makeProfile(),
-        recent_messages: [makeAgentMsg('Beleza, registrei.')],
-      }),
-    ).rejects.toThrow('network exploded');
+    const out = await tomDetector.detect({
+      profile_active: makeProfile(),
+      recent_messages: [makeAgentMsg('Beleza, registrei.')],
+    });
+
+    expect(out).toBeNull();
   });
 
-  it('sem mensagens do agente → retorna null sem chamar callLLM', async () => {
+  it('sem mensagens do agente → retorna null sem chamar Anthropic', async () => {
     const out = await tomDetector.detect({
       profile_active: makeProfile(),
       recent_messages: [
@@ -171,16 +141,12 @@ describe('tomDetector', () => {
     });
 
     expect(out).toBeNull();
-    expect(callLLMMock).not.toHaveBeenCalled();
+    expect(messagesCreateMock).not.toHaveBeenCalled();
   });
 
   it('resposta sem JSON parseável → retorna null', async () => {
-    callLLMMock.mockResolvedValueOnce({
-      content: 'desculpe, sem json aqui',
-      tool_uses: [],
-      stop_reason: 'end_turn',
-      usage: { input_tokens: 0, output_tokens: 0 },
-      model: 'mock-model',
+    messagesCreateMock.mockResolvedValueOnce({
+      content: [{ type: 'text', text: 'desculpe, sem json aqui' }],
     });
 
     const out = await tomDetector.detect({
@@ -192,8 +158,8 @@ describe('tomDetector', () => {
   });
 
   it('drift_detected=true sem severity_hint/examples/reasoning → defaults aplicados', async () => {
-    callLLMMock.mockResolvedValueOnce(
-      makeLLMReply({ drift_detected: true }),
+    messagesCreateMock.mockResolvedValueOnce(
+      makeAnthropicReply({ drift_detected: true }),
     );
 
     const out = await tomDetector.detect({

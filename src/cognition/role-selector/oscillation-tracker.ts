@@ -21,24 +21,3 @@ export async function shouldBlockSwitchByOscillation(args: {
   const count = await roleSelectorDecisionsRepo.countSwitchesInConversation(args.conversa_id);
   return { blocked: count >= args.max_switches, current_switches: count };
 }
-
-/**
- * [P88-H4] Cooldown window check. Blocks a switch when there was already
- * a switch in the last `cooldown_turns` decisions for this conversation.
- * Examines the N most recent rows and returns blocked=true if any of them
- * has action='switch'. Without conversa_id (legacy/anonymous flow) we
- * cannot enforce, so we never block.
- */
-export async function isWithinCooldownWindow(args: {
-  conversa_id: string;
-  cooldown_turns: number;
-}): Promise<{ blocked: boolean; recent_switches: number }> {
-  if (!args.conversa_id || args.cooldown_turns <= 0) {
-    return { blocked: false, recent_switches: 0 };
-  }
-  const recentSwitches = await roleSelectorDecisionsRepo.countSwitchesInLastNTurns({
-    conversa_id: args.conversa_id,
-    n: args.cooldown_turns,
-  });
-  return { blocked: recentSwitches > 0, recent_switches: recentSwitches };
-}

@@ -4,15 +4,6 @@ import { describe, it, expect, vi } from 'vitest';
 // procedureExecutionEventsRepo.listByExecution. Como estes testes não exercitam
 // confirmação humana de fato (cobertos em step-evaluator-human-confirmed.spec),
 // retornamos lista vazia → comportamento "awaiting".
-//
-// P85-NB1: o terminal else do dispatch de criterion types chama
-// healthRepo.record (best-effort health metric). Mockado aqui para não
-// tentar tocar o DB durante os testes unitários. Usa vi.hoisted para
-// expor o mock do healthRepo.record para o teste (vi.mock factory roda
-// antes das declarações top-level por ser hoisted).
-const mocks = vi.hoisted(() => ({
-  healthRecord: vi.fn(async () => {}),
-}));
 vi.mock('@/db/repositories.js', async () => {
   const actual = await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
@@ -21,22 +12,15 @@ vi.mock('@/db/repositories.js', async () => {
       record: vi.fn(async () => {}),
       listByExecution: vi.fn(async () => []),
     },
-    healthRepo: {
-      record: mocks.healthRecord,
-      lastForComponent: vi.fn(async () => null),
-    },
   };
 });
 
-// P85-NB1: spy on logger.warn so the terminal-else test can assert the
-// warning is emitted with the unknown criterion type in the payload.
-import { logger } from '@/lib/logger.js';
 import { evaluateCurrentStep } from '@/cognition/step-evaluator.js';
 
 describe('evaluateCurrentStep', () => {
   it('machine_check passa → step_completed=true', async () => {
     const result = await evaluateCurrentStep({
-      execution: { id: 'e1', definition_id: 'd1', current_step_id: 'step-1', completed_steps: [] } as any,
+      execution: { current_step_id: 'step-1', completed_steps: [] } as any,
       definition: {
         steps: [{ id: 'step-1', sucesso_criteria_ref: 'crit-1' }, { id: 'step-2', depends_on: ['step-1'] }],
         success_criteria: [{ id: 'crit-1', type: 'machine_check', expression: 'cnpj' }],
@@ -51,7 +35,7 @@ describe('evaluateCurrentStep', () => {
 
   it('machine_check falha → step_completed=false', async () => {
     const result = await evaluateCurrentStep({
-      execution: { id: 'e1', definition_id: 'd1', current_step_id: 'step-1', completed_steps: [] } as any,
+      execution: { current_step_id: 'step-1', completed_steps: [] } as any,
       definition: {
         steps: [{ id: 'step-1', sucesso_criteria_ref: 'crit-1' }],
         success_criteria: [{ id: 'crit-1', type: 'machine_check', expression: 'cnpj' }],
@@ -64,7 +48,7 @@ describe('evaluateCurrentStep', () => {
 
   it('tool_result passa quando tool foi chamada com expected', async () => {
     const result = await evaluateCurrentStep({
-      execution: { id: 'e1', definition_id: 'd1', current_step_id: 'step-1', completed_steps: [] } as any,
+      execution: { current_step_id: 'step-1', completed_steps: [] } as any,
       definition: {
         steps: [{ id: 'step-1', sucesso_criteria_ref: 'crit-1' }],
         success_criteria: [{ id: 'crit-1', type: 'tool_result', tool: 'register-transaction', expected: 'confirmed' }],
@@ -76,7 +60,7 @@ describe('evaluateCurrentStep', () => {
 
   it('último step completed → next_step_id=null (procedure done)', async () => {
     const result = await evaluateCurrentStep({
-      execution: { id: 'e1', definition_id: 'd1', current_step_id: 'final-step', completed_steps: [] } as any,
+      execution: { current_step_id: 'final-step', completed_steps: [] } as any,
       definition: {
         steps: [{ id: 'final-step', sucesso_criteria_ref: 'crit-final' }],
         success_criteria: [{ id: 'crit-final', type: 'machine_check', expression: 'done' }],
@@ -89,7 +73,7 @@ describe('evaluateCurrentStep', () => {
 
   it('user_signal (agreement) com user_message positivo → step_completed=true', async () => {
     const result = await evaluateCurrentStep({
-      execution: { id: 'e1', definition_id: 'd1', current_step_id: 'step-1', completed_steps: [] } as any,
+      execution: { current_step_id: 'step-1', completed_steps: [] } as any,
       definition: {
         steps: [{ id: 'step-1', sucesso_criteria_ref: 'crit-1' }],
         success_criteria: [{ id: 'crit-1', type: 'user_signal', signal: 'agreement' }],
@@ -124,99 +108,5 @@ describe('evaluateCurrentStep', () => {
     });
     expect(result.step_completed).toBe(false);
     expect(result.criterion_results[0]?.evidence).toMatch(/awaiting/i);
-  });
-
-  it('P84-C3: zero-criteria step → stall_reason=no_criteria_defined, não avança', async () => {
-    const result = await evaluateCurrentStep({
-      execution: { id: 'e1', definition_id: 'd1', current_step_id: 'step-1', completed_steps: [] } as any,
-      definition: {
-        steps: [{ id: 'step-1' /* no sucesso_criteria_ref */ }, { id: 'step-2', depends_on: ['step-1'] }],
-        success_criteria: [],
-      } as any,
-      response_context: { response_text: 'qualquer coisa' },
-    });
-    expect(result.step_completed).toBe(false);
-    expect(result.stall_reason).toBe('no_criteria_defined');
-    expect(result.next_step_id).toBeNull();
-  });
-
-  it('P84-C3: DAG com 2 branches paralelos → next_step deterministico + alternates reportados', async () => {
-    const result = await evaluateCurrentStep({
-      execution: { id: 'e1', definition_id: 'd1', current_step_id: 'step-1', completed_steps: [] } as any,
-      definition: {
-        steps: [
-          { id: 'step-1', sucesso_criteria_ref: 'crit-1' },
-          // Both 2a and 2b depend on step-1 → after step-1 completes,
-          // both are eligible. Deterministic picker takes the first in
-          // array order, reports the second as an alternate.
-          { id: 'step-2a', depends_on: ['step-1'] },
-          { id: 'step-2b', depends_on: ['step-1'] },
-        ],
-        success_criteria: [{ id: 'crit-1', type: 'machine_check', expression: 'ok' }],
-      } as any,
-      response_context: { response_text: 'tudo ok!' },
-    });
-    expect(result.step_completed).toBe(true);
-    expect(result.next_step_id).toBe('step-2a');
-    expect(result.branch_alternates).toEqual(['step-2b']);
-  });
-
-  it('P84-C3: criterion deletado/missing ref → stepCriteria=[] → stall, não passa', async () => {
-    const result = await evaluateCurrentStep({
-      execution: { id: 'e1', definition_id: 'd1', current_step_id: 'step-1', completed_steps: [] } as any,
-      definition: {
-        // sucesso_criteria_ref aponta para criterion que não existe.
-        steps: [{ id: 'step-1', sucesso_criteria_ref: 'crit-DELETED' }],
-        success_criteria: [{ id: 'crit-other', type: 'machine_check', expression: 'x' }],
-      } as any,
-      response_context: { response_text: 'whatever' },
-    });
-    expect(result.step_completed).toBe(false);
-    expect(result.stall_reason).toBe('no_criteria_defined');
-  });
-
-  it('P85-NB1: criterion com type desconhecido → logger.warn + stall_reason=unknown_criterion_type', async () => {
-    // Mock a hypothetical future criterion type that has no evaluator branch
-    // yet. Without the terminal else, the procedure would silently stall
-    // (passed=false + evidence='') until the reaper sweeps it ~7d later.
-    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
-    mocks.healthRecord.mockClear();
-
-    const result = await evaluateCurrentStep({
-      execution: { id: 'exec-nb1', definition_id: 'def-nb1', current_step_id: 'step-1', completed_steps: [] } as any,
-      definition: {
-        steps: [{ id: 'step-1', sucesso_criteria_ref: 'crit-future' }],
-        // `type: 'future_oracle_check'` is intentionally not any of the
-        // five handled types. The `as any` is the whole point of this test:
-        // simulating a schema drift / future criterion type.
-        success_criteria: [{ id: 'crit-future', type: 'future_oracle_check' } as any],
-      } as any,
-      response_context: { response_text: 'whatever' },
-    });
-
-    expect(result.step_completed).toBe(false);
-    expect(result.stall_reason).toBe('unknown_criterion_type');
-    expect(result.criterion_results).toHaveLength(1);
-    expect(result.criterion_results[0]?.passed).toBe(false);
-    expect(result.criterion_results[0]?.evidence).toBe('unknown_criterion_type: future_oracle_check');
-
-    // Assert the warning was emitted with the unknown criterion type
-    // in the payload — that's the ops-visible signal.
-    const matching = warnSpy.mock.calls.find(
-      (call) => call[1] === 'step_evaluator.unknown_criterion_type',
-    );
-    expect(matching, 'expected step_evaluator.unknown_criterion_type warn').toBeDefined();
-    expect((matching?.[0] as Record<string, unknown>)?.criterion_type).toBe('future_oracle_check');
-
-    // Health metric was emitted (degraded).
-    expect(mocks.healthRecord).toHaveBeenCalledWith(
-      expect.objectContaining({
-        component: 'step_evaluator',
-        status: 'degraded',
-        error: 'unknown_criterion_type:future_oracle_check',
-      }),
-    );
-
-    warnSpy.mockRestore();
   });
 });

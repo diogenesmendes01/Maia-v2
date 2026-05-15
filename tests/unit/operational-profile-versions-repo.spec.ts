@@ -15,48 +15,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import { ProfileStatus } from '@/types/enums.js';
-import {
-  agent_operational_profile_versions,
-  PROFILE_BODY_SCHEMA_VERSION,
-  type ProfileBody,
-} from '@/db/schema.js';
-
-describe('schema profile_body (v3.1.1)', () => {
-  it('has profile_body column', () => {
-    expect('profile_body' in agent_operational_profile_versions).toBe(true);
-  });
-
-  it('does NOT have legacy 4-column JSONB', () => {
-    expect('core_immutable' in agent_operational_profile_versions).toBe(false);
-    expect('operational_profile' in agent_operational_profile_versions).toBe(false);
-    expect('episodic_temp' in agent_operational_profile_versions).toBe(false);
-    expect('growth_backlog' in agent_operational_profile_versions).toBe(false);
-  });
-
-  it('exports ProfileBody type with schema_version v3.1.1', () => {
-    const sample: ProfileBody = {
-      schema_version: 'v3.1.1-2026-05-15',
-      identity: {
-        role_descriptor: 'x',
-        voice: { tone: 't', formality: 'medium', verbosity: 'concise' },
-        cognitive_limits: {
-          max_inference_depth: 3,
-          max_speculation_in_response: 0.2,
-          confidence_floor_for_action: 0.7,
-        },
-        priorities: [],
-        learned_voice_modifiers: [],
-      },
-      style: { language: 'pt-BR', rhythm: {} },
-      metadata: {
-        effective_from: '2026-05-15T00:00:00Z',
-        created_by: 'test',
-        previous_version_id: null,
-      },
-    };
-    expect(sample.schema_version).toBe('v3.1.1-2026-05-15');
-  });
-});
 
 type ProfileRow = {
   id: string;
@@ -64,7 +22,10 @@ type ProfileRow = {
   agent_id: string;
   version: number;
   status: 'proposed' | 'active' | 'frozen' | 'rolled_back';
-  profile_body: ProfileBody;
+  core_immutable: unknown;
+  operational_profile: unknown;
+  episodic_temp: unknown;
+  growth_backlog: unknown;
   proposed_by: string;
   proposed_reason: string | null;
   approved_by: string | null;
@@ -77,29 +38,6 @@ type ProfileRow = {
 };
 
 const profilesState: Record<string, ProfileRow> = {};
-
-// Helper para tests não precisarem repetir a estrutura inteira do ProfileBody.
-const makeProfileBody = (overrides: Partial<ProfileBody> = {}): ProfileBody => ({
-  schema_version: PROFILE_BODY_SCHEMA_VERSION,
-  identity: {
-    role_descriptor: 'test_role',
-    voice: { tone: 'neutral', formality: 'medium', verbosity: 'concise' },
-    cognitive_limits: {
-      max_inference_depth: 3,
-      max_speculation_in_response: 0.2,
-      confidence_floor_for_action: 0.7,
-    },
-    priorities: [],
-    learned_voice_modifiers: [],
-  },
-  style: { language: 'pt-BR', rhythm: {} },
-  metadata: {
-    effective_from: '2026-05-15T00:00:00Z',
-    created_by: 'test',
-    previous_version_id: null,
-  },
-  ...overrides,
-});
 
 vi.mock('@/db/repositories.js', async () => {
   const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
@@ -126,7 +64,10 @@ vi.mock('@/db/repositories.js', async () => {
     ...actual,
     operationalProfileVersionsRepo: {
       create: vi.fn(async (input: {
-        profile_body: ProfileBody;
+        core_immutable: unknown;
+        operational_profile: unknown;
+        episodic_temp?: unknown;
+        growth_backlog?: unknown;
         proposed_by: string;
         proposed_reason?: string;
       }) => {
@@ -140,7 +81,10 @@ vi.mock('@/db/repositories.js', async () => {
           agent_id,
           version,
           status: 'proposed',
-          profile_body: input.profile_body,
+          core_immutable: input.core_immutable,
+          operational_profile: input.operational_profile,
+          episodic_temp: input.episodic_temp ?? {},
+          growth_backlog: input.growth_backlog ?? {},
           proposed_by: input.proposed_by,
           proposed_reason: input.proposed_reason ?? null,
           approved_by: null,
@@ -226,19 +170,8 @@ describe('operationalProfileVersionsRepo', () => {
       async () => {
         const { operationalProfileVersionsRepo } = await import('@/db/repositories.js');
         const row = await operationalProfileVersionsRepo.create({
-          profile_body: makeProfileBody({
-            identity: {
-              role_descriptor: 'financial_assistant',
-              voice: { tone: 'formal', formality: 'medium', verbosity: 'concise' },
-              cognitive_limits: {
-                max_inference_depth: 3,
-                max_speculation_in_response: 0.2,
-                confidence_floor_for_action: 0.7,
-              },
-              priorities: [],
-              learned_voice_modifiers: [],
-            },
-          }),
+          core_immutable: { mission: 'Serve as financial assistant' },
+          operational_profile: { tone: 'formal' },
           proposed_by: 'reflector',
           proposed_reason: 'initial bootstrap',
         });
@@ -260,15 +193,18 @@ describe('operationalProfileVersionsRepo', () => {
       async () => {
         const { operationalProfileVersionsRepo } = await import('@/db/repositories.js');
         const r1 = await operationalProfileVersionsRepo.create({
-          profile_body: makeProfileBody(),
+          core_immutable: {},
+          operational_profile: {},
           proposed_by: 'reflector',
         });
         const r2 = await operationalProfileVersionsRepo.create({
-          profile_body: makeProfileBody(),
+          core_immutable: {},
+          operational_profile: {},
           proposed_by: 'reflector',
         });
         const r3 = await operationalProfileVersionsRepo.create({
-          profile_body: makeProfileBody(),
+          core_immutable: {},
+          operational_profile: {},
           proposed_by: 'reflector',
         });
         expect(r1.version).toBe(1);
@@ -285,12 +221,14 @@ describe('operationalProfileVersionsRepo', () => {
         const { operationalProfileVersionsRepo } = await import('@/db/repositories.js');
         expect(await operationalProfileVersionsRepo.nextVersion()).toBe(1);
         await operationalProfileVersionsRepo.create({
-          profile_body: makeProfileBody(),
+          core_immutable: {},
+          operational_profile: {},
           proposed_by: 'r',
         });
         expect(await operationalProfileVersionsRepo.nextVersion()).toBe(2);
         await operationalProfileVersionsRepo.create({
-          profile_body: makeProfileBody(),
+          core_immutable: {},
+          operational_profile: {},
           proposed_by: 'r',
         });
         expect(await operationalProfileVersionsRepo.nextVersion()).toBe(3);
@@ -304,7 +242,8 @@ describe('operationalProfileVersionsRepo', () => {
       async () => {
         const { operationalProfileVersionsRepo } = await import('@/db/repositories.js');
         const row = await operationalProfileVersionsRepo.create({
-          profile_body: makeProfileBody(),
+          core_immutable: {},
+          operational_profile: {},
           proposed_by: 'r',
         });
         const result = await operationalProfileVersionsRepo.transition({
@@ -329,11 +268,13 @@ describe('operationalProfileVersionsRepo', () => {
       async () => {
         const { operationalProfileVersionsRepo } = await import('@/db/repositories.js');
         const r1 = await operationalProfileVersionsRepo.create({
-          profile_body: makeProfileBody(),
+          core_immutable: {},
+          operational_profile: {},
           proposed_by: 'r',
         });
         const r2 = await operationalProfileVersionsRepo.create({
-          profile_body: makeProfileBody(),
+          core_immutable: {},
+          operational_profile: {},
           proposed_by: 'r',
         });
         const t1 = await operationalProfileVersionsRepo.transition({
@@ -359,7 +300,8 @@ describe('operationalProfileVersionsRepo', () => {
       async () => {
         const { operationalProfileVersionsRepo } = await import('@/db/repositories.js');
         const row = await operationalProfileVersionsRepo.create({
-          profile_body: makeProfileBody(),
+          core_immutable: {},
+          operational_profile: {},
           proposed_by: 'r',
         });
         await operationalProfileVersionsRepo.transition({
@@ -386,7 +328,8 @@ describe('operationalProfileVersionsRepo', () => {
       async () => {
         const { operationalProfileVersionsRepo } = await import('@/db/repositories.js');
         const row = await operationalProfileVersionsRepo.create({
-          profile_body: makeProfileBody(),
+          core_immutable: {},
+          operational_profile: {},
           proposed_by: 'r',
         });
         await operationalProfileVersionsRepo.transition({
@@ -415,7 +358,8 @@ describe('operationalProfileVersionsRepo', () => {
       async () => {
         const { operationalProfileVersionsRepo } = await import('@/db/repositories.js');
         const row = await operationalProfileVersionsRepo.create({
-          profile_body: makeProfileBody(),
+          core_immutable: {},
+          operational_profile: {},
           proposed_by: 'r',
         });
         await operationalProfileVersionsRepo.transition({
@@ -454,7 +398,8 @@ describe('operationalProfileVersionsRepo', () => {
       async () => {
         const { operationalProfileVersionsRepo } = await import('@/db/repositories.js');
         const row = await operationalProfileVersionsRepo.create({
-          profile_body: makeProfileBody(),
+          core_immutable: {},
+          operational_profile: {},
           proposed_by: 'r',
         });
         // proposed -> proposed
@@ -475,7 +420,8 @@ describe('operationalProfileVersionsRepo', () => {
         const { operationalProfileVersionsRepo } = await import('@/db/repositories.js');
         // Create v1, activate, freeze
         const r1 = await operationalProfileVersionsRepo.create({
-          profile_body: makeProfileBody(),
+          core_immutable: {},
+          operational_profile: {},
           proposed_by: 'r',
         });
         await operationalProfileVersionsRepo.transition({
@@ -489,7 +435,8 @@ describe('operationalProfileVersionsRepo', () => {
         });
         // Create v2, activate
         const r2 = await operationalProfileVersionsRepo.create({
-          profile_body: makeProfileBody(),
+          core_immutable: {},
+          operational_profile: {},
           proposed_by: 'r',
         });
         await operationalProfileVersionsRepo.transition({
@@ -515,7 +462,8 @@ describe('operationalProfileVersionsRepo', () => {
         const { operationalProfileVersionsRepo } = await import('@/db/repositories.js');
         expect(await operationalProfileVersionsRepo.getActive()).toBeNull();
         const row = await operationalProfileVersionsRepo.create({
-          profile_body: makeProfileBody(),
+          core_immutable: {},
+          operational_profile: {},
           proposed_by: 'r',
         });
         // still null while proposed
@@ -539,15 +487,18 @@ describe('operationalProfileVersionsRepo', () => {
       async () => {
         const { operationalProfileVersionsRepo } = await import('@/db/repositories.js');
         const r1 = await operationalProfileVersionsRepo.create({
-          profile_body: makeProfileBody(),
+          core_immutable: {},
+          operational_profile: {},
           proposed_by: 'r',
         });
         const r2 = await operationalProfileVersionsRepo.create({
-          profile_body: makeProfileBody(),
+          core_immutable: {},
+          operational_profile: {},
           proposed_by: 'r',
         });
         await operationalProfileVersionsRepo.create({
-          profile_body: makeProfileBody(),
+          core_immutable: {},
+          operational_profile: {},
           proposed_by: 'r',
         });
         await operationalProfileVersionsRepo.transition({
@@ -578,57 +529,14 @@ describe('operationalProfileVersionsRepo', () => {
       async () => {
         const { operationalProfileVersionsRepo } = await import('@/db/repositories.js');
         const row = await operationalProfileVersionsRepo.create({
-          profile_body: makeProfileBody(),
+          core_immutable: { key: 'v' },
+          operational_profile: {},
           proposed_by: 'r',
         });
         const found = await operationalProfileVersionsRepo.getById(row.id);
         expect(found).not.toBeNull();
         expect(found!.id).toBe(row.id);
         expect(await operationalProfileVersionsRepo.getById('nope')).toBeNull();
-      },
-    );
-  });
-
-  it('create accepts ProfileBody and getById returns profile_body intact', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { operationalProfileVersionsRepo } = await import('@/db/repositories.js');
-        const sampleBody: ProfileBody = {
-          schema_version: 'v3.1.1-2026-05-15',
-          identity: {
-            role_descriptor: 'test_role',
-            voice: { tone: 'neutral', formality: 'medium', verbosity: 'concise' },
-            cognitive_limits: {
-              max_inference_depth: 3,
-              max_speculation_in_response: 0.2,
-              confidence_floor_for_action: 0.7,
-            },
-            priorities: [],
-            learned_voice_modifiers: [],
-          },
-          style: { language: 'pt-BR', rhythm: {} },
-          metadata: {
-            effective_from: new Date().toISOString(),
-            created_by: 'test',
-            previous_version_id: null,
-          },
-        };
-
-        const inserted = await operationalProfileVersionsRepo.create({
-          profile_body: sampleBody,
-          proposed_by: 'test',
-        });
-
-        expect(inserted.profile_body.identity.role_descriptor).toBe('test_role');
-        expect(inserted.profile_body.style.language).toBe('pt-BR');
-        expect(inserted.profile_body.schema_version).toBe('v3.1.1-2026-05-15');
-
-        // Round-trip through getById preserves the body intact.
-        const fetched = await operationalProfileVersionsRepo.getById(inserted.id);
-        expect(fetched).not.toBeNull();
-        expect(fetched!.profile_body.identity.role_descriptor).toBe('test_role');
-        expect(fetched!.profile_body.metadata.created_by).toBe('test');
       },
     );
   });

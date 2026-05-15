@@ -335,15 +335,6 @@ export async function getLatestHumanConfirmation(args: {
   return null;
 }
 
-/**
- * P84-C4: replayState now consumes `state_updated` events too, so the
- * full set of derived fields can be reconstructed from the event log
- * alone (`outcome`, `notes`, plus `current_step_id`/`completed_steps`/
- * `status` as before). Older executions that pre-date the
- * `state_updated` emission still replay correctly because the legacy
- * `step_started`/`step_completed`/`execution_*` events carry the same
- * information.
- */
 export async function replayState(execution_id: string): Promise<{
   current_step_id: string | null;
   completed_steps: string[];

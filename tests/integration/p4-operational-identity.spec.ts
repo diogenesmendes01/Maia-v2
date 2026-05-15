@@ -30,7 +30,6 @@ import { runWithTenantContext } from '@/db/tenant-context.js';
 import { FeatureFlagName, DriftType, DriftSeverity, DriftDecision } from '@/types/enums.js';
 import type {
   AgentOperationalProfileVersion,
-  ProfileBody,
   SelfState,
 } from '@/db/schema.js';
 import type { DriftEvidence } from '@/cognition/drift/types.js';
@@ -42,7 +41,10 @@ type ProfileRow = {
   agent_id: string;
   version: number;
   status: 'proposed' | 'active' | 'frozen' | 'rolled_back';
-  profile_body: ProfileBody;
+  core_immutable: unknown;
+  operational_profile: unknown;
+  episodic_temp: unknown;
+  growth_backlog: unknown;
   proposed_by: string;
   proposed_reason: string | null;
   approved_by: string | null;
@@ -53,27 +55,6 @@ type ProfileRow = {
   rollback_reason: string | null;
   created_at: Date;
 };
-
-const makeEmptyProfileBody = (): ProfileBody => ({
-  schema_version: 'v3.1.1-2026-05-15',
-  identity: {
-    role_descriptor: '',
-    voice: { tone: '', formality: 'medium', verbosity: 'medium' },
-    cognitive_limits: {
-      max_inference_depth: 3,
-      max_speculation_in_response: 0.2,
-      confidence_floor_for_action: 0.7,
-    },
-    priorities: [],
-    learned_voice_modifiers: [],
-  },
-  style: { language: 'pt-BR', rhythm: {} },
-  metadata: {
-    effective_from: new Date().toISOString(),
-    created_by: 'test',
-    previous_version_id: null,
-  },
-});
 
 const profilesState: Record<string, ProfileRow> = {};
 
@@ -223,7 +204,16 @@ function buildVersion(
     agent_id: 'default',
     version: 3,
     status: 'active',
-    profile_body: makeEmptyProfileBody(),
+    core_immutable: {
+      identity_block: 'V2_IDENTITY_BLOCK_CONTENT',
+      principles: ['princípio A', 'princípio B'],
+    },
+    operational_profile: {
+      voice_descriptor: 'voz operacional V2',
+      thresholds: {},
+    },
+    episodic_temp: {},
+    growth_backlog: {},
     proposed_by: 'system_seed',
     proposed_reason: null,
     approved_by: null,
@@ -285,7 +275,10 @@ describe('P4 operational identity — end-to-end', () => {
 
     // Default seed-mode for create/transition: use in-memory state.
     operationalProfileVersionsCreate.mockImplementation(async (input: {
-      profile_body: ProfileBody;
+      core_immutable: unknown;
+      operational_profile: unknown;
+      episodic_temp?: unknown;
+      growth_backlog?: unknown;
       proposed_by: string;
       proposed_reason?: string;
     }) => {
@@ -300,7 +293,10 @@ describe('P4 operational identity — end-to-end', () => {
         agent_id: 'default',
         version,
         status: 'proposed',
-        profile_body: input.profile_body,
+        core_immutable: input.core_immutable,
+        operational_profile: input.operational_profile,
+        episodic_temp: input.episodic_temp ?? {},
+        growth_backlog: input.growth_backlog ?? {},
         proposed_by: input.proposed_by,
         proposed_reason: input.proposed_reason ?? null,
         approved_by: null,
@@ -411,12 +407,12 @@ describe('P4 operational identity — end-to-end', () => {
         expect(v.status).toBe('active');
         expect(v.version).toBe(1);
         expect(v.proposed_by).toBe('system_seed');
-        // profile_body v3.1.1 substituiu as 4 camadas legacy.
-        const body = v.profile_body;
-        expect(body.schema_version).toBe('v3.1.1-2026-05-15');
-        expect(body.identity.role_descriptor).toBeTruthy();
-        expect(body.identity.priorities.length).toBeGreaterThanOrEqual(3);
-        expect(body.metadata.created_by).toBe('system_seed');
+        const core = v.core_immutable as {
+          identity_block: string;
+          principles: string[];
+        };
+        expect(core.identity_block).toBeTruthy();
+        expect(core.principles.length).toBeGreaterThanOrEqual(3);
 
         // Spies confirm: create + transition foram invocados.
         expect(operationalProfileVersionsCreate).toHaveBeenCalledTimes(1);
@@ -446,13 +442,9 @@ describe('P4 operational identity — end-to-end', () => {
     operationalProfileVersionsGetActive.mockResolvedValue(
       buildVersion({
         status: 'active',
-        profile_body: {
-          ...makeEmptyProfileBody(),
-          identity: {
-            ...makeEmptyProfileBody().identity,
-            role_descriptor: 'V2_PROFILE_BODY_SHOULD_NOT_APPEAR',
-            priorities: ['princípio ignorado'],
-          },
+        core_immutable: {
+          identity_block: 'V2_PROFILE_BODY_SHOULD_NOT_APPEAR',
+          principles: ['princípio ignorado'],
         },
       }),
     );
@@ -479,18 +471,12 @@ describe('P4 operational identity — end-to-end', () => {
     operationalProfileVersionsGetActive.mockResolvedValue(
       buildVersion({
         status: 'active',
-        profile_body: {
-          ...makeEmptyProfileBody(),
-          identity: {
-            ...makeEmptyProfileBody().identity,
-            role_descriptor: 'V2_IDENTITY_DISTINCT_BLOCK',
-            priorities: ['princípio v2 alpha', 'princípio v2 beta'],
-            voice: {
-              tone: 'voz v2 distinta',
-              formality: 'medium',
-              verbosity: 'concise',
-            },
-          },
+        core_immutable: {
+          identity_block: 'V2_IDENTITY_DISTINCT_BLOCK',
+          principles: ['princípio v2 alpha', 'princípio v2 beta'],
+        },
+        operational_profile: {
+          voice_descriptor: 'voz v2 distinta',
         },
       }),
     );
@@ -498,13 +484,12 @@ describe('P4 operational identity — end-to-end', () => {
     const { buildPrompt } = await import('@/agent/prompt-builder.js');
     const { system } = await buildPrompt(ctx);
 
-    // Profile v2 content is rendered (v3.1.1 renderer: ## Identidade operacional + ## Estilo).
+    // Profile v2 content is rendered.
     expect(system).toContain('V2_IDENTITY_DISTINCT_BLOCK');
-    expect(system).toContain('## Identidade operacional');
-    expect(system).toContain('- Papel: V2_IDENTITY_DISTINCT_BLOCK');
-    expect(system).toContain('1. princípio v2 alpha');
-    expect(system).toContain('- Tom: voz v2 distinta');
-    expect(system).toContain('## Estilo');
+    expect(system).toContain('## Princípios');
+    expect(system).toContain('- princípio v2 alpha');
+    expect(system).toContain('## Voz operacional');
+    expect(system).toContain('voz v2 distinta');
     expect(system).toContain('op_profile_v3');
     // Self_state legacy content is NOT in the prompt.
     expect(system).not.toContain('LEGACY_SYSTEM_PROMPT_BODY');
@@ -524,12 +509,8 @@ describe('P4 operational identity — end-to-end', () => {
     operationalProfileVersionsGetActive.mockResolvedValue(
       buildVersion({
         status: 'proposed',
-        profile_body: {
-          ...makeEmptyProfileBody(),
-          identity: {
-            ...makeEmptyProfileBody().identity,
-            role_descriptor: 'V2_PROPOSED_BODY_MUST_NEVER_APPEAR',
-          },
+        core_immutable: {
+          identity_block: 'V2_PROPOSED_BODY_MUST_NEVER_APPEAR',
         },
       }),
     );
@@ -625,18 +606,12 @@ describe('P4 operational identity — end-to-end', () => {
     operationalProfileVersionsGetActive.mockResolvedValue(
       buildVersion({
         status: 'active',
-        profile_body: {
-          ...makeEmptyProfileBody(),
-          identity: {
-            ...makeEmptyProfileBody().identity,
-            role_descriptor: 'V2_KILLSWITCH_TEST_BLOCK',
-            priorities: ['princípio rollback'],
-            voice: {
-              tone: 'voz rollback test',
-              formality: 'medium',
-              verbosity: 'concise',
-            },
-          },
+        core_immutable: {
+          identity_block: 'V2_KILLSWITCH_TEST_BLOCK',
+          principles: ['princípio rollback'],
+        },
+        operational_profile: {
+          voice_descriptor: 'voz rollback test',
         },
       }),
     );

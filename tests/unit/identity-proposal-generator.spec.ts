@@ -3,8 +3,8 @@
  *
  * Esta é a ÚNICA situação onde criamos a primeira versão `active` do perfil
  * operacional via `create+transition`. Deterministico: lê `maia-prompt.md`,
- * decompõe num único `profile_body: ProfileBody` (v3.1.1) com 3 namespaces
- * (identity / style / metadata) e seeda v1 active.
+ * decompõe em 4 camadas (core_immutable / operational_profile / episodic_temp
+ * / growth_backlog) e seeda v1 active.
  *
  * Padrão de mock: similar a operational-profile-versions-repo.spec.ts —
  * mockamos `@/db/repositories.js` com estado in-memory. Também mockamos
@@ -12,7 +12,7 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { runWithTenantContext } from '@/db/tenant-context.js';
-import type { ProfileBody, SelfState } from '@/db/schema.js';
+import type { SelfState } from '@/db/schema.js';
 
 type ProfileRow = {
   id: string;
@@ -20,7 +20,10 @@ type ProfileRow = {
   agent_id: string;
   version: number;
   status: 'proposed' | 'active' | 'frozen' | 'rolled_back';
-  profile_body: ProfileBody;
+  core_immutable: unknown;
+  operational_profile: unknown;
+  episodic_temp: unknown;
+  growth_backlog: unknown;
   proposed_by: string;
   proposed_reason: string | null;
   approved_by: string | null;
@@ -31,27 +34,6 @@ type ProfileRow = {
   rollback_reason: string | null;
   created_at: Date;
 };
-
-const makeEmptyProfileBody = (): ProfileBody => ({
-  schema_version: 'v3.1.1-2026-05-15',
-  identity: {
-    role_descriptor: '',
-    voice: { tone: '', formality: 'medium', verbosity: 'medium' },
-    cognitive_limits: {
-      max_inference_depth: 3,
-      max_speculation_in_response: 0.2,
-      confidence_floor_for_action: 0.7,
-    },
-    priorities: [],
-    learned_voice_modifiers: [],
-  },
-  style: { language: 'pt-BR', rhythm: {} },
-  metadata: {
-    effective_from: new Date().toISOString(),
-    created_by: 'test',
-    previous_version_id: null,
-  },
-});
 
 const profilesState: Record<string, ProfileRow> = {};
 
@@ -100,7 +82,10 @@ vi.mock('@/db/repositories.js', async () => {
     ...actual,
     operationalProfileVersionsRepo: {
       create: vi.fn(async (input: {
-        profile_body: ProfileBody;
+        core_immutable: unknown;
+        operational_profile: unknown;
+        episodic_temp?: unknown;
+        growth_backlog?: unknown;
         proposed_by: string;
         proposed_reason?: string;
       }) => {
@@ -114,7 +99,10 @@ vi.mock('@/db/repositories.js', async () => {
           agent_id,
           version,
           status: 'proposed',
-          profile_body: input.profile_body,
+          core_immutable: input.core_immutable,
+          operational_profile: input.operational_profile,
+          episodic_temp: input.episodic_temp ?? {},
+          growth_backlog: input.growth_backlog ?? {},
           proposed_by: input.proposed_by,
           proposed_reason: input.proposed_reason ?? null,
           approved_by: null,
@@ -239,7 +227,7 @@ describe('seedInitialOperationalProfile', () => {
     );
   });
 
-  it('first seed creates active v1 with profile_body (v3.1.1) populated', async () => {
+  it('first seed creates active v1 with 4 camadas populated', async () => {
     await runWithTenantContext(
       { tenant_id: 'default', agent_id: 'default' },
       async () => {
@@ -257,22 +245,27 @@ describe('seedInitialOperationalProfile', () => {
         expect(v.approved_by).toBe('system_seed');
         expect(v.activated_at).toBeInstanceOf(Date);
 
-        // profile_body v3.1.1: identity namespace
-        const body = v.profile_body;
-        expect(body.schema_version).toBe('v3.1.1-2026-05-15');
-        expect(body.identity.role_descriptor).toContain('Você é a **Maia**');
-        expect(Array.isArray(body.identity.priorities)).toBe(true);
-        expect(body.identity.priorities.length).toBeGreaterThanOrEqual(3);
-        expect(body.identity.priorities[0]).toContain('Separação');
-        expect(body.identity.voice.tone).toContain('Português brasileiro');
+        // 4 camadas: core_immutable
+        const core = v.core_immutable as {
+          identity_block: string;
+          principles: string[];
+        };
+        expect(core.identity_block).toContain('Você é a **Maia**');
+        expect(Array.isArray(core.principles)).toBe(true);
+        expect(core.principles.length).toBeGreaterThanOrEqual(3);
+        expect(core.principles[0]).toContain('Separação');
 
-        // style namespace
-        expect(body.style.language).toBe('pt-BR');
-        expect(body.style.rhythm).toEqual({});
+        // operational_profile
+        const op = v.operational_profile as {
+          voice_descriptor: string;
+          thresholds: Record<string, unknown>;
+        };
+        expect(op.voice_descriptor).toContain('Português brasileiro');
+        expect(op.thresholds).toEqual({});
 
-        // metadata namespace
-        expect(body.metadata.created_by).toBe('system_seed');
-        expect(body.metadata.previous_version_id).toBeNull();
+        // episodic_temp + growth_backlog
+        expect(v.episodic_temp).toEqual({});
+        expect(v.growth_backlog).toEqual([]);
       },
     );
   });
@@ -306,7 +299,7 @@ describe('seedInitialOperationalProfile', () => {
     );
   });
 
-  it('self_state null → style.rhythm = {}', async () => {
+  it('self_state null → episodic_temp = {}, growth_backlog = [], thresholds = {}', async () => {
     await runWithTenantContext(
       { tenant_id: 'default', agent_id: 'default' },
       async () => {
@@ -316,14 +309,16 @@ describe('seedInitialOperationalProfile', () => {
         expect(result.created).toBe(true);
         if (!result.created) throw new Error('expected created=true');
 
-        const body = result.version.profile_body;
-        expect(body.style.rhythm).toEqual({});
-        expect(body.identity.learned_voice_modifiers).toEqual([]);
+        const v = result.version;
+        expect(v.episodic_temp).toEqual({});
+        expect(v.growth_backlog).toEqual([]);
+        const op = v.operational_profile as { thresholds: Record<string, unknown> };
+        expect(op.thresholds).toEqual({});
       },
     );
   });
 
-  it('self_state with resumo_aprendizados → style.rhythm includes resumo + versao_legacy', async () => {
+  it('self_state with resumo_aprendizados → thresholds includes resumo + versao_legacy', async () => {
     await runWithTenantContext(
       { tenant_id: 'default', agent_id: 'default' },
       async () => {
@@ -343,12 +338,11 @@ describe('seedInitialOperationalProfile', () => {
         expect(result.created).toBe(true);
         if (!result.created) throw new Error('expected created=true');
 
-        const rhythm = result.version.profile_body.style.rhythm as {
-          resumo: string;
-          versao_legacy: number;
+        const op = result.version.operational_profile as {
+          thresholds: { resumo: string; versao_legacy: number };
         };
-        expect(rhythm.resumo).toBe('Mendes prefere objetividade.');
-        expect(rhythm.versao_legacy).toBe(42);
+        expect(op.thresholds.resumo).toBe('Mendes prefere objetividade.');
+        expect(op.thresholds.versao_legacy).toBe(42);
       },
     );
   });
@@ -383,7 +377,10 @@ describe('seedInitialOperationalProfile', () => {
           agent_id: 'default',
           version: 99,
           status: 'active',
-          profile_body: makeEmptyProfileBody(),
+          core_immutable: {},
+          operational_profile: {},
+          episodic_temp: {},
+          growth_backlog: [],
           proposed_by: 'race-condition',
           proposed_reason: null,
           approved_by: 'race',

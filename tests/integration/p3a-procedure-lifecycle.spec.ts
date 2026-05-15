@@ -148,6 +148,50 @@ vi.mock('@/db/repositories.js', async () => {
         delete testsState[id];
       }),
     },
+    procedureTestsRepo: {
+      create: vi.fn(async (input: any) => {
+        const id = `test-${Math.random().toString(36).slice(2)}`;
+        const row = {
+          id,
+          tenant_id: 'default',
+          agent_id: 'default',
+          last_run_at: null,
+          last_run_status: null,
+          last_run_details: null,
+          created_at: new Date(),
+          updated_at: new Date(),
+          description: null,
+          expected_step_path: null,
+          ...input,
+        };
+        testsState[id] = row;
+        return row;
+      }),
+      listByDefinition: vi.fn(async (definition_id: string) =>
+        Object.values(testsState).filter((t: any) => t.definition_id === definition_id),
+      ),
+      recordRun: vi.fn(async (args: { id: string; status: string; details: unknown }) => {
+        if (testsState[args.id]) {
+          testsState[args.id] = {
+            ...testsState[args.id],
+            last_run_at: new Date(),
+            last_run_status: args.status,
+            last_run_details: args.details,
+            updated_at: new Date(),
+          };
+        }
+      }),
+      allPassFor: vi.fn(async (definition_id: string) => {
+        const tests = Object.values(testsState).filter(
+          (t: any) => t.definition_id === definition_id,
+        );
+        if (tests.length === 0) return false;
+        return tests.every((t: any) => t.last_run_status === 'pass');
+      }),
+      delete: vi.fn(async (id: string) => {
+        delete testsState[id];
+      }),
+    },
     cognitiveModuleLogRepo: {
       record: vi.fn(async () => {}),
       recentByModule: vi.fn(async () => []),
@@ -230,6 +274,9 @@ describe('P3a procedure lifecycle integration', () => {
         expect(
           events.find((e) => e.definition_id === def.id && e.to_status === 'proposed'),
         ).toBeDefined();
+
+        // P3c: gate requires >=1 passing procedure_test before proposed → active
+        await seedPassingTest(def.id);
 
         // P3c: gate requires >=1 passing procedure_test before proposed → active
         await seedPassingTest(def.id);

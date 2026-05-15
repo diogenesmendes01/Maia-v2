@@ -116,22 +116,14 @@ export type GapLevel = typeof GapLevel[keyof typeof GapLevel];
 /**
  * P5 — Ciclo de vida de uma proposta de capacidade (spec técnica gerada
  * pela Maia para fechar uma lacuna). Owner decide aprovação/rejeição;
- * delivered indica que a capacidade foi entregue após testes pós-ativação.
- *
- * P87-C3 (PR #87 review) — adicionados `testing` (intermediate state quando
- * runCapabilityTests está executando) e `reverted` (terminal alternativo a
- * delivered, quando teste pós-ativação falha e revertCapability cria gap
- * técnico). Garantia do design contract: capability_acquired NÃO ocorre
- * sem o test gate (criterion #3 do P5 §9).
+ * delivered indica que a capacidade foi entregue.
  */
 export const ProposalStatus = {
   DRAFT: 'draft',
   SUBMITTED: 'submitted',
   APPROVED: 'approved',
   REJECTED: 'rejected',
-  TESTING: 'testing',
   DELIVERED: 'delivered',
-  REVERTED: 'reverted',
 } as const;
 export type ProposalStatus = typeof ProposalStatus[keyof typeof ProposalStatus];
 
@@ -221,6 +213,22 @@ export const RoleDecisionAction = {
 export type RoleDecisionAction = typeof RoleDecisionAction[keyof typeof RoleDecisionAction];
 
 /**
+ * P7 — Grafo cognitivo formal. Camada de execução de um módulo cognitivo
+ * dentro do orquestrador declarativo. Os valores literais batem com o tipo
+ * `triggered_by` de `RunModuleOptions` (src/cognition/types.ts), permitindo
+ * passar `CognitiveLayer.X` direto sem cast.
+ */
+export const CognitiveLayer = {
+  /** Caminho crítico — não pode falhar nem ser pulado. */
+  SYNC_REQUIRED: 'sync_required',
+  /** Rodado por turn se `runWhen` satisfeito; falha não derruba turn. */
+  SYNC_CONDITIONAL: 'sync_conditional',
+  /** Fire-and-forget pós-turn ou worker; nunca bloqueia user-facing reply. */
+  ASYNC: 'async_event',
+} as const;
+export type CognitiveLayer = (typeof CognitiveLayer)[keyof typeof CognitiveLayer];
+
+/**
  * Nomes de feature flags conhecidas. Cresce conforme fases ativam.
  */
 export const FeatureFlagName = {
@@ -239,5 +247,7 @@ export const FeatureFlagName = {
   DIALOGICAL_ACQUISITION: 'DIALOGICAL_ACQUISITION',
   // P6 — separação Agent/Channel/Role + Role Policy (multi-canal)
   MULTI_CHANNEL: 'MULTI_CHANNEL',
+  // P7 — grafo cognitivo formal (orquestração declarativa de módulos)
+  COGNITIVE_GRAPH: 'cognitive_graph',
 } as const;
 export type FeatureFlagName = typeof FeatureFlagName[keyof typeof FeatureFlagName];

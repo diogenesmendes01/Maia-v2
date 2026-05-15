@@ -44,4 +44,5 @@ export const featureFlags = new FeatureFlags({
   [FeatureFlagName.OPERATIONAL_PROFILE_V2]: config.FEATURE_OPERATIONAL_PROFILE_V2,
   [FeatureFlagName.DIALOGICAL_ACQUISITION]: config.FEATURE_DIALOGICAL_ACQUISITION,
   [FeatureFlagName.MULTI_CHANNEL]: config.FEATURE_MULTI_CHANNEL,
+  [FeatureFlagName.COGNITIVE_GRAPH]: config.FEATURE_COGNITIVE_GRAPH,
 });

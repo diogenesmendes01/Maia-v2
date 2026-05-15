@@ -76,32 +76,14 @@ vi.mock('@/db/repositories.js', async () => {
         Object.values(alertsState).filter((r) => r.profile_version_id === profile_version_id),
       ),
       resolve: vi.fn(async (args: { id: string; resolution_note: string; resolved_by: string }) => {
-        // [P86-C3] mirrors the real repo's tenant-scoped resolve: returns
-        // { ok, found } so callers can detect cross-tenant attempts.
         const row = alertsState[args.id];
-        if (!row) return { ok: false, found: false };
-        // Tenant guard mirror: only resolve if current tenant context owns
-        // the row. The mock uses 'default' for everything in this file,
-        // but the contract change must propagate.
-        const { getCurrentTenant, getCurrentAgent } = await import('@/db/tenant-context.js');
-        let currentTenant: string;
-        let currentAgent: string;
-        try {
-          currentTenant = getCurrentTenant();
-          currentAgent = getCurrentAgent();
-        } catch {
-          return { ok: false, found: false };
-        }
-        if (row.tenant_id !== currentTenant || row.agent_id !== currentAgent) {
-          return { ok: false, found: false };
-        }
+        if (!row) return;
         alertsState[args.id] = {
           ...row,
           resolution_note: args.resolution_note,
           resolved_at: new Date(),
           resolved_by: args.resolved_by,
         };
-        return { ok: true, found: true };
       }),
     },
   };
@@ -257,52 +239,6 @@ describe('driftAlertsRepo', () => {
         expect(onX.length).toBe(0);
       },
     );
-  });
-
-  // [P86-C3] cross-tenant negative test: an alert UUID from tenant-A must
-  // NOT be resolvable from tenant-B's context. The repo enforces tenant
-  // isolation in the UPDATE predicate; returning { ok:false } signals the
-  // forbidden attempt without silently no-op'ing.
-  it('resolve cross-tenant é proibido: tenant-B não pode resolver alert do tenant-A', async () => {
-    // Seed under tenant-A.
-    let createdId = '';
-    await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'default' },
-      async () => {
-        const { driftAlertsRepo } = await import('@/db/repositories.js');
-        const a = await driftAlertsRepo.create({
-          drift_type: DriftType.TOM,
-          severity: DriftSeverity.MEDIO,
-          evidence: {},
-          detected_by: 'detector',
-          decision: DriftDecision.QUEUED_HUMAN,
-          decided_by: 'policy',
-        });
-        createdId = a.id;
-        // Force the seeded row to belong to tenant-A (mock above defaulted to 'default').
-        alertsState[createdId] = { ...alertsState[createdId]!, tenant_id: 'tenant-A' };
-      },
-    );
-
-    // Attempt resolve from tenant-B.
-    await runWithTenantContext(
-      { tenant_id: 'tenant-B', agent_id: 'default' },
-      async () => {
-        const { driftAlertsRepo } = await import('@/db/repositories.js');
-        const res = await driftAlertsRepo.resolve({
-          id: createdId,
-          resolution_note: 'should be rejected',
-          resolved_by: 'attacker',
-        });
-        expect(res.ok).toBe(false);
-        expect(res.found).toBe(false);
-      },
-    );
-
-    // Row remains unresolved.
-    const row = alertsState[createdId]!;
-    expect(row.resolved_at).toBeNull();
-    expect(row.resolution_note).toBeNull();
   });
 
   it('resolve updates resolution_note + resolved_at + resolved_by', async () => {

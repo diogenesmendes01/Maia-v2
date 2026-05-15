@@ -59,8 +59,6 @@ const {
   channelsFindByExternalCrossTenantMock,
   recordDecisionMock,
   countSwitchesMock,
-  countSwitchesInLastNTurnsMock,
-  getLastDecidedRoleIdMock,
   listByConversationMock,
   // Suggesters mocked at module level so we can drive each cenário deterministically.
   detSuggestMock,
@@ -91,8 +89,6 @@ const {
   channelsFindByExternalCrossTenantMock: vi.fn(),
   recordDecisionMock: vi.fn(),
   countSwitchesMock: vi.fn(),
-  countSwitchesInLastNTurnsMock: vi.fn(),
-  getLastDecidedRoleIdMock: vi.fn(),
   listByConversationMock: vi.fn(),
   detSuggestMock: vi.fn(),
   llmSuggestMock: vi.fn(),
@@ -151,8 +147,6 @@ vi.mock('@/db/repositories.js', () => ({
     // CRITICAL guard: mimic real repo — throw before anything else.
     record: recordDecisionMock,
     countSwitchesInConversation: countSwitchesMock,
-    countSwitchesInLastNTurns: countSwitchesInLastNTurnsMock,
-    getLastDecidedRoleId: getLastDecidedRoleIdMock,
     listByConversation: listByConversationMock,
   },
   // Prompt-builder dependencies (cenário 7).
@@ -288,11 +282,7 @@ describe('P6 channel/role/policy — end-to-end', () => {
     decisionsState.length = 0;
     recordedPayloads.length = 0;
 
-    // [P88-H4] resetAllMocks (not clearAllMocks) flushes queued
-    // `mockResolvedValueOnce` entries. After P88 wires LOCKED to short-
-    // circuit suggesters, queued values from a LOCKED cenário would leak
-    // into later cenários and produce stale confidence reads.
-    vi.resetAllMocks();
+    vi.clearAllMocks();
 
     // Default suggester behavior: both return null. Per-cenário overrides win.
     detSuggestMock.mockResolvedValue(null);
@@ -338,10 +328,6 @@ describe('P6 channel/role/policy — end-to-end', () => {
 
     // Default counts to 0 — cenário 5 overrides to simulate cap reached.
     countSwitchesMock.mockResolvedValue(0);
-    // [P88-H4] cooldown window — default 0 recent switches (no cooldown).
-    countSwitchesInLastNTurnsMock.mockResolvedValue(0);
-    // [P88-C2] no prior decision → rehydrate falls back to policy default.
-    getLastDecidedRoleIdMock.mockResolvedValue(null);
     listByConversationMock.mockResolvedValue([]);
 
     // Prompt-builder dependencies — safe defaults.

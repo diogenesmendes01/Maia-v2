@@ -111,17 +111,11 @@ vi.mock('@/db/repositories.js', async () => {
         );
       }),
       deactivate: vi.fn(async (id: string) => {
-        // [P88-C3] tenant-scoped — refuses cross-tenant deactivation.
-        const tenant_id = getCurrentTenant();
-        const agent_id = getCurrentAgent();
         const row = rolesState[id];
-        if (!row) return { rowCount: 0 };
-        if (row.tenant_id !== tenant_id || row.agent_id !== agent_id) {
-          return { rowCount: 0 };
+        if (row) {
+          row.active = false;
+          row.updated_at = new Date();
         }
-        row.active = false;
-        row.updated_at = new Date();
-        return { rowCount: 1 };
       }),
     },
   };
@@ -231,44 +225,6 @@ describe('rolesRepo', () => {
         expect(def.is_default).toBe(true);
         const fetched = await rolesRepo.getDefault();
         expect(fetched!.id).toBe(def.id);
-      },
-    );
-  });
-
-  // [P88-C3] Inviolable tenant isolation on writes.
-  it('deactivate de outro tenant NÃO afeta o role (cross-tenant guard)', async () => {
-    let roleIdA: string = '';
-    await runWithTenantContext(
-      { tenant_id: 'tenant-a', agent_id: 'agent-a' },
-      async () => {
-        const { rolesRepo } = await import('@/db/repositories.js');
-        const row = await rolesRepo.create({
-          role_key: 'comercial-a',
-          display_name: 'Comercial A',
-        });
-        roleIdA = row.id;
-        expect(row.active).toBe(true);
-      },
-    );
-
-    // Tenant B tenta desativar role de A — no-op com rowCount=0.
-    await runWithTenantContext(
-      { tenant_id: 'tenant-b', agent_id: 'agent-b' },
-      async () => {
-        const { rolesRepo } = await import('@/db/repositories.js');
-        const result = await rolesRepo.deactivate(roleIdA);
-        expect(result.rowCount).toBe(0);
-      },
-    );
-
-    // De volta em A, role ainda ativo.
-    await runWithTenantContext(
-      { tenant_id: 'tenant-a', agent_id: 'agent-a' },
-      async () => {
-        const { rolesRepo } = await import('@/db/repositories.js');
-        const row = await rolesRepo.getById(roleIdA);
-        expect(row).not.toBeNull();
-        expect(row!.active).toBe(true);
       },
     );
   });

@@ -6,7 +6,7 @@
 
 Fase de governança sobre a identidade comportamental do agent. Adiciona:
 
-- `agent_operational_profile_versions`: versionamento imutável do perfil operacional (papel, voz, limites cognitivos, prioridades, idioma). Cada mudança gera nova versão (`proposed → active → frozen | rolled_back`). Apenas 1 versão `active` por (tenant, agent) por vez. Consolidada em coluna `profile_body` JSONB desde v3.1.1 (2026-05-15).
+- `agent_operational_profile_versions`: versionamento imutável do perfil operacional (tom, valores, fronteiras, vocabulario). Cada mudança gera nova versão (`proposed → active → frozen | rolled_back`). Apenas 1 versão `active` por (tenant, agent) por vez.
 - `agent_drift_alerts`: alertas tipados quando o comportamento observado divergir do perfil ativo. 7 tipos × 4 severidades.
 - 7 detectores cognitivos: `tom`, `valores`, `confianca`, `vies`, `escopo`, `linguagem`, `procedimento`.
 - Decision engine: agrega evidências dos detectores em uma decisão única (`monitor` | `alert_only` | `freeze_version` | `rollback_version`).
@@ -31,18 +31,6 @@ P4 depende de P0/P1/P2/P3a/P3b/P3c já aplicados:
 - P2: reflexão + agent identity
 - P3a/P3b/P3c: procedures (referenciadas pelo detector `procedimento`)
 
-## v3.1.1 schema migration (2026-05-15)
-
-A tabela `agent_operational_profile_versions` foi reorganizada: as 4 colunas JSONB legacy (`core_immutable`, `operational_profile`, `episodic_temp`, `growth_backlog`) foram consolidadas em uma única coluna `profile_body` JSONB com 3 namespaces tipados:
-
-- `profile_body.identity` — papel, voz (tom/formalidade/verbosidade), limites cognitivos, prioridades
-- `profile_body.style` — idioma, ritmo
-- `profile_body.metadata` — `schema_version`, autoria, lineage
-
-O JSONB carrega `schema_version: 'v3.1.1-2026-05-15'` no topo. Demais Sources of Truth (Soul/Skill/Policy/Memory) NÃO moram aqui — são resolvidas pelo Context Assembly via slice builders (P8+).
-
-O trigger de immutability (migration 027) foi atualizado para checar `profile_body` como uma única unidade — qualquer mutação após insert é bloqueada pelo DB.
-
 ## Feature flag
 
 `FEATURE_OPERATIONAL_PROFILE_V2` (default OFF). Ativar:
@@ -64,7 +52,7 @@ psql "$DATABASE_URL" -f migrations/025_p4_agent_operational_profile_versions.sql
 psql "$DATABASE_URL" -f migrations/026_p4_agent_drift_alerts.sql
 ```
 
-Migration 026 referencia 025 via FK (`agent_drift_alerts.profile_version_id → agent_operational_profile_versions.id`) — ordem de aplicação é obrigatória.
+Migration 026 referencia 025 via FK (`agent_drift_alerts.version_id → agent_operational_profile_versions.id`) — ordem de aplicação é obrigatória.
 
 ### Seed inicial
 
@@ -80,7 +68,7 @@ await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async 
 });
 ```
 
-Idempotente — segunda chamada retorna `{ created: false, reason: 'already_active' }`. Sem seed, prompt-builder cai em fallback (mesmo com flag ON) e loga warning `profile_v2_invalid_fallback_to_legacy`.
+Idempotente — segunda chamada retorna `{ created: false, reason: 'already_seeded' }`. Sem seed, prompt-builder cai em fallback (mesmo com flag ON) e loga warning `profile_v2_invalid_fallback_to_legacy`.
 
 ### Inspecionar versões
 
@@ -91,11 +79,8 @@ FROM agent_operational_profile_versions
 WHERE tenant_id = $1
 ORDER BY version DESC;
 
--- Apenas versão ativa (extraindo namespaces de profile_body)
-SELECT version, 
-       profile_body->'identity' AS identity, 
-       profile_body->'style' AS style, 
-       activated_at
+-- Apenas versão ativa
+SELECT version, core_immutable, operational_layer, activated_at
 FROM agent_operational_profile_versions
 WHERE tenant_id = $1 AND status = 'active';
 ```
@@ -137,8 +122,6 @@ await runDriftMonitor();
 ```
 
 Itera por tenant, busca versão ativa, monta janela de evidência, dispara os 7 detectores em paralelo via `runCognitiveModule`, agrega via decision engine, persiste alerts.
-
-Por run, processa até `DRIFT_MONITOR_TENANT_BATCH` tenants (default 500). Se a fleet exceder o cap, o worker loga `drift_monitor.tenant_batch_capped` com `skipped`; tenants restantes entram na próxima execução semanal (drift é sinal de cadência semanal, sem urgência).
 
 ### Inspecionar alertas
 
@@ -209,9 +192,9 @@ Kill-switch runtime é volátil — só vale para o processo atual. Sem flip de 
 | Profile V2 ativado mas prompt usa `self_state` | Conferir `featureFlags.isEnabled(FeatureFlagName.OPERATIONAL_PROFILE_V2)` | Conferir env var + restart, ou conferir kill-switch ativo |
 | Warning `profile_v2_invalid_fallback_to_legacy` no log | Profile retornado tem `status !== 'active'` (provavelmente foi para `frozen` ou `rolled_back`) | `SELECT status FROM agent_operational_profile_versions WHERE tenant_id = $1 AND agent_id = $2 ORDER BY version DESC` — promover uma versão para `active` ou criar nova proposed |
 | Sem versões para o tenant (`buildPrompt` em fallback constante) | Seed nunca rodou | Rodar `seedInitialOperationalProfile()` para o tenant em questão |
-| Drift CRÍTICO disparou `rollback_version` errado | Consultar `agent_drift_alerts.evidence` da decision para entender o gatilho | Reverter manualmente: `operationalProfileVersionsRepo.create` com `profile_body` da versão anterior, depois `transition({ to: 'active' })`. Documentar incident review |
+| Drift CRÍTICO disparou `rollback_version` errado | Consultar `agent_drift_alerts.evidence` da decision para entender o gatilho | Reverter manualmente: `operationalProfileVersionsRepo.create` com `core_immutable` da versão anterior, depois `transition({ to: 'active' })`. Documentar incident review |
 | Drift detector falhando consistentemente | Conferir `cognitive_module_log` para timeouts/erros | `SELECT module, model, latency_ms, success, error_message FROM cognitive_module_log WHERE module LIKE 'drift.%' ORDER BY created_at DESC LIMIT 50` — investigar Anthropic API health, possivelmente reduzir tamanho da janela de evidência |
-| Decision engine sempre `monitor` apesar de drift óbvio | Thresholds podem estar mal calibrados para o tenant | Inspecionar `agent_drift_alerts.evidence` (campos `severity_hint`, `reasoning`, `examples`, `summary`). Se sinal forte mas severidade baixa, revisar prompts dos detectores em `src/cognition/drift/*.ts` |
+| Decision engine sempre `monitor` apesar de drift óbvio | Thresholds podem estar mal calibrados para o tenant | Inspecionar `agent_drift_alerts.evidence.detector_scores`. Se sinal forte mas score baixo, revisar prompts dos detectores em `src/cognition/drift/*.ts` |
 | Múltiplas versões `active` simultâneas | Constraint violado — não deve acontecer | Bug grave. Conferir DB: `SELECT count(*) FROM agent_operational_profile_versions WHERE tenant_id = $1 AND agent_id = $2 AND status = 'active'`. Esperado: 1. Se > 1, escolher a mais recente e forçar as outras para `frozen` manualmente |
 
 ## Rollback de migration
@@ -243,7 +226,7 @@ Exit 0 esperado. Smoke test adicional:
 2. Conferir versão `active` via SQL.
 3. Habilitar flag (`FEATURE_OPERATIONAL_PROFILE_V2=true`).
 4. Chamar `buildPrompt({...})` via REPL.
-5. Conferir que o prompt renderizado contém o conteúdo de `profile_body.identity` (papel, tom, prioridades) e `profile_body.style` (idioma) e não cai em fallback.
+5. Conferir que o prompt renderizado contém o conteúdo de `operational_layer` (tom, valores) e não cai em fallback.
 
 ## Próximas fases
 

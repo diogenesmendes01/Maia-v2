@@ -12,28 +12,22 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { AgentOperationalProfileVersion } from '@/db/schema.js';
 import type { DriftRecentMessage } from '@/cognition/drift/types.js';
 
-// [P86-C4] detector via callLLM (provider-agnostic).
-const { callLLMMock } = vi.hoisted(() => ({ callLLMMock: vi.fn() }));
+const messagesCreateMock = vi.fn();
 
-vi.mock('@/lib/claude.js', () => ({
-  callLLM: callLLMMock,
-}));
+vi.mock('@anthropic-ai/sdk', () => {
+  const Anthropic = vi.fn().mockImplementation(() => ({
+    messages: { create: messagesCreateMock },
+  }));
+  return { default: Anthropic };
+});
 
 import { viesDetector } from '@/cognition/drift/vies.js';
 
-function makeLLMReply(jsonObj: Record<string, unknown>): {
-  content: string;
-  tool_uses: unknown[];
-  stop_reason: 'end_turn';
-  usage: { input_tokens: number; output_tokens: number };
-  model: string;
+function makeAnthropicReply(jsonObj: Record<string, unknown>): {
+  content: Array<{ type: 'text'; text: string }>;
 } {
   return {
-    content: JSON.stringify(jsonObj),
-    tool_uses: [],
-    stop_reason: 'end_turn',
-    usage: { input_tokens: 0, output_tokens: 0 },
-    model: 'mock-model',
+    content: [{ type: 'text', text: JSON.stringify(jsonObj) }],
   };
 }
 
@@ -67,12 +61,12 @@ function makeAgentMsg(text: string, id = 'm-' + Math.random().toString(36).slice
 
 describe('viesDetector', () => {
   beforeEach(() => {
-    callLLMMock.mockReset();
+    messagesCreateMock.mockReset();
   });
 
   it('msg "todos os clientes preferem PIX" + Anthropic confirma → evidence com severity_hint=medio', async () => {
-    callLLMMock.mockResolvedValueOnce(
-      makeLLMReply({
+    messagesCreateMock.mockResolvedValueOnce(
+      makeAnthropicReply({
         drift_detected: true,
         severity_hint: 'medio',
         confirmed: [{ pattern: 'todos os clientes', verdict: 'bias_real' }],
@@ -96,7 +90,7 @@ describe('viesDetector', () => {
     expect(regexMatches[0]['message_id']).toBe('m1');
     expect(out.evidence_summary).toContain('generalização');
     expect(out.evidence_summary.length).toBeLessThanOrEqual(200);
-    expect(callLLMMock).toHaveBeenCalledTimes(1);
+    expect(messagesCreateMock).toHaveBeenCalledTimes(1);
   });
 
   it('msg sem generalização regex → null SEM chamar Anthropic', async () => {
@@ -106,12 +100,12 @@ describe('viesDetector', () => {
     });
 
     expect(out).toBeNull();
-    expect(callLLMMock).not.toHaveBeenCalled();
+    expect(messagesCreateMock).not.toHaveBeenCalled();
   });
 
   it('msg com regex match MAS Anthropic devolve drift_detected:false → null', async () => {
-    callLLMMock.mockResolvedValueOnce(
-      makeLLMReply({
+    messagesCreateMock.mockResolvedValueOnce(
+      makeAnthropicReply({
         drift_detected: false,
         severity_hint: 'baixo',
         confirmed: [],
@@ -125,29 +119,30 @@ describe('viesDetector', () => {
     });
 
     expect(out).toBeNull();
-    expect(callLLMMock).toHaveBeenCalledTimes(1);
+    expect(messagesCreateMock).toHaveBeenCalledTimes(1);
   });
 
-  // [P86-C4] Anteriormente "regex floor" silenciava falhas do provider —
-  // o erro agora PROPAGA ao runner para auditoria observável.
-  it('regex match + callLLM throws → erro PROPAGA (não mais regex floor silencioso)', async () => {
-    callLLMMock.mockRejectedValueOnce(new Error('network exploded'));
+  it('regex match + Anthropic throws → evidence com llm_error:true e severity baixo (regex floor)', async () => {
+    messagesCreateMock.mockRejectedValueOnce(new Error('network exploded'));
 
-    await expect(
-      viesDetector.detect({
-        profile_active: makeProfile(),
-        recent_messages: [makeAgentMsg('Todos os clientes preferem PIX.', 'm1')],
-      }),
-    ).rejects.toThrow('network exploded');
+    const out = await viesDetector.detect({
+      profile_active: makeProfile(),
+      recent_messages: [makeAgentMsg('Todos os clientes preferem PIX.', 'm1')],
+    });
+
+    expect(out).not.toBeNull();
+    if (!out) throw new Error('expected DriftEvidence');
+    expect(out.drift_type).toBe('vies');
+    expect(out.payload['llm_error']).toBe(true);
+    expect(out.payload['severity_hint']).toBe('baixo');
+    const regexMatches = out.payload['regex_matches'] as Array<Record<string, unknown>>;
+    expect(regexMatches.length).toBeGreaterThanOrEqual(1);
+    expect(out.evidence_summary).toContain('LLM falhou');
   });
 
-  it('regex match + LLM responde sem JSON parseável → evidence com llm_unparseable:true, severity baixo (regex floor para parse failure normal)', async () => {
-    callLLMMock.mockResolvedValueOnce({
-      content: 'desculpe, sem json estruturado aqui',
-      tool_uses: [],
-      stop_reason: 'end_turn',
-      usage: { input_tokens: 0, output_tokens: 0 },
-      model: 'mock-model',
+  it('regex match + Anthropic responde sem JSON parseável → evidence com llm_unparseable:true, severity baixo', async () => {
+    messagesCreateMock.mockResolvedValueOnce({
+      content: [{ type: 'text', text: 'desculpe, sem json estruturado aqui' }],
     });
 
     const out = await viesDetector.detect({
@@ -171,6 +166,6 @@ describe('viesDetector', () => {
     });
 
     expect(out).toBeNull();
-    expect(callLLMMock).not.toHaveBeenCalled();
+    expect(messagesCreateMock).not.toHaveBeenCalled();
   });
 });
