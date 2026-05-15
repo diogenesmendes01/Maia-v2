@@ -58,6 +58,29 @@ function decisionForSeverity(s: DriftSeverity): DriftDecision {
   }
 }
 
+/**
+ * P8b — soul_drift NUNCA promove rollback de profile (spec §5.4):
+ *  - BAIXO   → auto_approved (log only)
+ *  - MEDIO   → queued_human
+ *  - ALTO    → queued_human (cap; sem frozen)
+ *  - CRITICO → queued_human (cap; com Admin UI banner downstream)
+ *
+ * Diferença em relação aos 7 detectores anteriores: soul detection é sinal
+ * de *aderência*, não de violação de identity/policy. A bias modula; ela
+ * NUNCA gera gate de execução. O remediation correto é proposal review
+ * pelo owner, não rollback automático.
+ */
+function decisionForSoulDriftSeverity(s: DriftSeverity): DriftDecision {
+  switch (s) {
+    case DriftSeverity.BAIXO:
+      return DriftDecision.AUTO_APPROVED;
+    case DriftSeverity.MEDIO:
+    case DriftSeverity.ALTO:
+    case DriftSeverity.CRITICO:
+      return DriftDecision.QUEUED_HUMAN;
+  }
+}
+
 const VALID_SEVERITIES: readonly string[] = [
   DriftSeverity.BAIXO,
   DriftSeverity.MEDIO,
@@ -135,6 +158,17 @@ export function classifySeverity(ev: DriftEvidence): DriftSeverity {
       if (hint !== null) return hint;
       return DriftSeverity.BAIXO;
     }
+    case DriftType.SOUL_DRIFT: {
+      // soul_drift severity = quantidade de violações de soul biases (spec §5.4).
+      // Hint do detector wins quando >= 2 (CRITICO requer hint).
+      const violationsRaw = (p as { violations?: unknown }).violations;
+      const violations = Array.isArray(violationsRaw) ? violationsRaw : [];
+      if (hint === DriftSeverity.CRITICO) return DriftSeverity.CRITICO;
+      if (violations.length >= 5) return DriftSeverity.ALTO;
+      if (violations.length >= 2) return DriftSeverity.MEDIO;
+      if (hint !== null) return hint;
+      return DriftSeverity.BAIXO;
+    }
     default:
       // unknown drift_type — defensivo
       return hint !== null ? hint : DriftSeverity.BAIXO;
@@ -154,12 +188,21 @@ export async function decideAndApply(args: {
 
   for (const ev of args.evidences) {
     const severity = classifySeverity(ev);
-    const decision = decisionForSeverity(severity);
+    // P8b: soul_drift maps to a DIFFERENT decision table — it NEVER promotes
+    // frozen/rollback because soul biases modulate (not gate) behavior.
+    const decision =
+      ev.drift_type === DriftType.SOUL_DRIFT
+        ? decisionForSoulDriftSeverity(severity)
+        : decisionForSeverity(severity);
 
     let applied = false;
     let applied_error: string | undefined;
 
-    if (decision === DriftDecision.FROZEN || decision === DriftDecision.ROLLBACK) {
+    // soul_drift NEVER touches the profile, regardless of severity.
+    if (
+      ev.drift_type !== DriftType.SOUL_DRIFT &&
+      (decision === DriftDecision.FROZEN || decision === DriftDecision.ROLLBACK)
+    ) {
       try {
         const r = await operationalProfileVersionsRepo.transition({
           id: args.active_profile_id,

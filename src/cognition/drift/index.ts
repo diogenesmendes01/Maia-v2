@@ -20,6 +20,7 @@ import { viesDetector } from './vies.js';
 import { escopoDetector } from './escopo.js';
 import { linguagemDetector } from './linguagem.js';
 import { procedimentoDetector } from './procedimento.js';
+import { soulDriftDetector } from './soul.js';
 import type { DriftDetector, DriftDetectionInput, DriftEvidence } from './types.js';
 
 const DETECTORS: DriftDetector[] = [
@@ -30,6 +31,9 @@ const DETECTORS: DriftDetector[] = [
   escopoDetector,
   linguagemDetector,
   procedimentoDetector,
+  // P8b: 8º detector. Severidade NUNCA promove rollback de profile
+  // (decision-engine mapeia soul_drift → queued_human no máximo).
+  soulDriftDetector,
 ];
 
 export async function runAllDriftDetectors(
