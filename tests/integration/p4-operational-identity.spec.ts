@@ -30,6 +30,7 @@ import { runWithTenantContext } from '@/db/tenant-context.js';
 import { FeatureFlagName, DriftType, DriftSeverity, DriftDecision } from '@/types/enums.js';
 import type {
   AgentOperationalProfileVersion,
+  ProfileBody,
   SelfState,
 } from '@/db/schema.js';
 import type { DriftEvidence } from '@/cognition/drift/types.js';
@@ -41,10 +42,7 @@ type ProfileRow = {
   agent_id: string;
   version: number;
   status: 'proposed' | 'active' | 'frozen' | 'rolled_back';
-  core_immutable: unknown;
-  operational_profile: unknown;
-  episodic_temp: unknown;
-  growth_backlog: unknown;
+  profile_body: ProfileBody;
   proposed_by: string;
   proposed_reason: string | null;
   approved_by: string | null;
@@ -55,6 +53,27 @@ type ProfileRow = {
   rollback_reason: string | null;
   created_at: Date;
 };
+
+const makeEmptyProfileBody = (): ProfileBody => ({
+  schema_version: 'v3.1.1-2026-05-15',
+  identity: {
+    role_descriptor: '',
+    voice: { tone: '', formality: 'medium', verbosity: 'medium' },
+    cognitive_limits: {
+      max_inference_depth: 3,
+      max_speculation_in_response: 0.2,
+      confidence_floor_for_action: 0.7,
+    },
+    priorities: [],
+    learned_voice_modifiers: [],
+  },
+  style: { language: 'pt-BR', rhythm: {} },
+  metadata: {
+    effective_from: new Date().toISOString(),
+    created_by: 'test',
+    previous_version_id: null,
+  },
+});
 
 const profilesState: Record<string, ProfileRow> = {};
 
@@ -204,16 +223,7 @@ function buildVersion(
     agent_id: 'default',
     version: 3,
     status: 'active',
-    core_immutable: {
-      identity_block: 'V2_IDENTITY_BLOCK_CONTENT',
-      principles: ['princípio A', 'princípio B'],
-    },
-    operational_profile: {
-      voice_descriptor: 'voz operacional V2',
-      thresholds: {},
-    },
-    episodic_temp: {},
-    growth_backlog: {},
+    profile_body: makeEmptyProfileBody(),
     proposed_by: 'system_seed',
     proposed_reason: null,
     approved_by: null,
@@ -275,10 +285,7 @@ describe('P4 operational identity — end-to-end', () => {
 
     // Default seed-mode for create/transition: use in-memory state.
     operationalProfileVersionsCreate.mockImplementation(async (input: {
-      core_immutable: unknown;
-      operational_profile: unknown;
-      episodic_temp?: unknown;
-      growth_backlog?: unknown;
+      profile_body: ProfileBody;
       proposed_by: string;
       proposed_reason?: string;
     }) => {
@@ -293,10 +300,7 @@ describe('P4 operational identity — end-to-end', () => {
         agent_id: 'default',
         version,
         status: 'proposed',
-        core_immutable: input.core_immutable,
-        operational_profile: input.operational_profile,
-        episodic_temp: input.episodic_temp ?? {},
-        growth_backlog: input.growth_backlog ?? {},
+        profile_body: input.profile_body,
         proposed_by: input.proposed_by,
         proposed_reason: input.proposed_reason ?? null,
         approved_by: null,
@@ -407,12 +411,12 @@ describe('P4 operational identity — end-to-end', () => {
         expect(v.status).toBe('active');
         expect(v.version).toBe(1);
         expect(v.proposed_by).toBe('system_seed');
-        const core = v.core_immutable as {
-          identity_block: string;
-          principles: string[];
-        };
-        expect(core.identity_block).toBeTruthy();
-        expect(core.principles.length).toBeGreaterThanOrEqual(3);
+        // profile_body v3.1.1 substituiu as 4 camadas legacy.
+        const body = v.profile_body;
+        expect(body.schema_version).toBe('v3.1.1-2026-05-15');
+        expect(body.identity.role_descriptor).toBeTruthy();
+        expect(body.identity.priorities.length).toBeGreaterThanOrEqual(3);
+        expect(body.metadata.created_by).toBe('system_seed');
 
         // Spies confirm: create + transition foram invocados.
         expect(operationalProfileVersionsCreate).toHaveBeenCalledTimes(1);

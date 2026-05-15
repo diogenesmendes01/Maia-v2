@@ -81,6 +81,7 @@ import type {
   ProcedureTest,
   ProcedureMetric,
   AgentOperationalProfileVersion,
+  ProfileBody,
   AgentDriftAlert,
 } from './schema.js';
 
@@ -1986,10 +1987,7 @@ export const procedureMetricsRepo = {
 //                  (tenant, agent) e retorna { ok:false, reason:'already_has_active' }.
 export const operationalProfileVersionsRepo = {
   async create(input: {
-    core_immutable: unknown;
-    operational_profile: unknown;
-    episodic_temp?: unknown;
-    growth_backlog?: unknown;
+    profile_body: ProfileBody;
     proposed_by: string;
     proposed_reason?: string;
   }): Promise<AgentOperationalProfileVersion> {
@@ -1999,22 +1997,18 @@ export const operationalProfileVersionsRepo = {
     const guarded = applyTenantGuard({
       version,
       status: 'proposed',
-      core_immutable: input.core_immutable as object,
-      operational_profile: input.operational_profile as object,
-      episodic_temp: (input.episodic_temp ?? {}) as object,
-      growth_backlog: (input.growth_backlog ?? {}) as object,
+      profile_body: input.profile_body,
       proposed_by: input.proposed_by,
       proposed_reason: input.proposed_reason ?? null,
     });
-    // tenant_id/agent_id são injetados pelo applyTenantGuard; o type-cast
-    // alinha com o $inferInsert da tabela. Note: tenant_id e agent_id já
-    // estão setados via guard; o getCurrent acima é só pra computar version
-    // dentro do mesmo contexto.
+    // tenant_id/agent_id são injetados pelo applyTenantGuard. Os types do
+    // Drizzle agora alinham naturalmente com o $inferInsert da tabela (1
+    // coluna JSONB `profile_body` em vez das 4 legacy) — sem cast necessário.
     void tenant_id;
     void agent_id;
     const [row] = await db
       .insert(agent_operational_profile_versions)
-      .values(guarded as typeof agent_operational_profile_versions.$inferInsert)
+      .values(guarded)
       .returning();
     return row!;
   },
