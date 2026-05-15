@@ -62,6 +62,64 @@ function buildSystemForEvent(event: CognitiveEvent): string {
   }
 }
 
+/**
+ * Serializa apenas os campos semânticos do evento para o prompt do LLM.
+ * Omite identificadores internos (UUIDs de conversa/mensagem) — eles não
+ * ajudam o modelo a refletir e poluem o contexto, aumentando custo de tokens
+ * e expondo shape interno desnecessariamente.
+ */
 function buildUserForEvent(event: CognitiveEvent): string {
-  return JSON.stringify(event, null, 2);
+  switch (event.type) {
+    case 'user_correction':
+      return JSON.stringify(
+        {
+          type: event.type,
+          correction_text: event.correction_text,
+          previous_response_text: event.previous_response_text,
+        },
+        null,
+        2,
+      );
+    case 'success_explicit':
+      return JSON.stringify(
+        {
+          type: event.type,
+          signal: event.signal,
+          context_summary: event.context_summary,
+        },
+        null,
+        2,
+      );
+    case 'conversation_closed':
+      return JSON.stringify(
+        {
+          type: event.type,
+          summary: event.summary,
+          duration_minutes: event.duration_minutes,
+          transcript: event.transcript,
+        },
+        null,
+        2,
+      );
+    case 'pattern_detected':
+      return JSON.stringify(
+        {
+          type: event.type,
+          pattern_descriptor: event.pattern_descriptor,
+          evidence_count: event.evidence_count,
+        },
+        null,
+        2,
+      );
+    case 'internal_gap':
+      return JSON.stringify(
+        {
+          type: event.type,
+          gap_description: event.gap_description,
+          attempted_response: event.attempted_response,
+        },
+        null,
+        2,
+      );
+  }
 }

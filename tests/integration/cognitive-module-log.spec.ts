@@ -4,7 +4,13 @@ import { cognitive_module_log } from '@/db/schema.js';
 import { cognitiveModuleLogRepo } from '@/db/repositories.js';
 import { eq } from 'drizzle-orm';
 
-describe('cognitive_module_log smoke', () => {
+// Padrão do projeto (tests/integration/leak.spec.ts): integration tests
+// só rodam quando TEST_DB_URL está setada. No CI a validate job não tem
+// Postgres — o integration job (com service container) cuida desse caso.
+const SHOULD_RUN = !!process.env.TEST_DB_URL;
+const d = SHOULD_RUN ? describe : describe.skip;
+
+d('cognitive_module_log smoke', () => {
   it('aceita insert de evento de reflection', async () => {
     await cognitiveModuleLogRepo.record({
       tenant_id: 'default',

@@ -1,5 +1,10 @@
--- P4: agent_operational_profile_versions — append-only, 4 camadas + status
--- proposed NUNCA entra em runtime. active vai pro prompt quando flag on.
+-- P4: agent_operational_profile_versions — append-only versionada
+-- v3.1.1 (2026-05-15): consolidação em profile_body com 3 namespaces tipados
+-- (identity, style, metadata). Demais Sources of Truth (Soul, Skills, Policy,
+-- Memory) NÃO moram aqui — são consultadas independentemente pelo Context
+-- Assembly via slice builders.
+--
+-- Status: proposed NUNCA entra em runtime. active vai pro prompt quando flag on.
 -- NOTE: no BEGIN/COMMIT — migrate.ts wraps in transaction.
 
 CREATE TABLE agent_operational_profile_versions (
@@ -10,10 +15,20 @@ CREATE TABLE agent_operational_profile_versions (
   status TEXT NOT NULL CHECK (
     status IN ('proposed', 'active', 'frozen', 'rolled_back')
   ),
-  core_immutable JSONB NOT NULL DEFAULT '{}'::jsonb,
-  operational_profile JSONB NOT NULL DEFAULT '{}'::jsonb,
-  episodic_temp JSONB NOT NULL DEFAULT '{}'::jsonb,
-  growth_backlog JSONB NOT NULL DEFAULT '{}'::jsonb,
+  profile_body JSONB NOT NULL DEFAULT '{}'::jsonb,
+  -- Shape (schema_version='v3.1.1-2026-05-15'):
+  -- {
+  --   "schema_version": "v3.1.1-2026-05-15",
+  --   "identity": {
+  --     "role_descriptor": "...",
+  --     "voice": { "tone", "formality", "verbosity" },
+  --     "cognitive_limits": { "max_inference_depth", "max_speculation_in_response", "confidence_floor_for_action" },
+  --     "priorities": [...],
+  --     "learned_voice_modifiers": []
+  --   },
+  --   "style": { "language": "pt-BR", "rhythm": {} },
+  --   "metadata": { "effective_from", "created_by", "previous_version_id" }
+  -- }
   proposed_by TEXT NOT NULL,
   proposed_reason TEXT,
   approved_by TEXT,

@@ -20,6 +20,9 @@ import type { AgentCapabilityDomain } from '@/db/schema.js';
 const DEFAULT_DOMAIN = 'general';
 
 // Cap on the failure_modes array — keeps the row small and gives us recency.
+// Applied on write only via `.slice(-FAILURE_MODES_CAP)`; rows persisted under
+// um cap maior continuam intactas até a próxima escrita, quando o trim os
+// reduz. Lowering this constant não faz backfill — é eventual por design.
 const FAILURE_MODES_CAP = 50;
 
 export async function recordSuccess(args: { domain?: string }): Promise<void> {

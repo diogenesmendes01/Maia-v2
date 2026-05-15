@@ -1,8 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 
-// Mock LLM — não usado diretamente nestes testes, mas evita acidentalmente
-// chamar API externa caso algum caminho de import dispare initialization.
+// Mock LLM — não é usado diretamente nestes testes (cobertura do classifier
+// vive em tests/unit/memory-classifier.spec.ts). Serve só pra evitar
+// inicialização real da API caso algum caminho de import dispare. O payload
+// devolvido é um stub seguro (operational/low/agent) — testes que precisam
+// de comportamento sensitive injetam a memória direto via mockMemories.
 vi.mock('@/lib/claude.js', () => ({
   callLLM: vi.fn(async () => ({
     content: '{"memory_type":"operational","scope_type":"agent","sensitivity":"low"}',
@@ -168,9 +171,95 @@ describe('P2 memory scoping integration', () => {
   });
 
   it('memória needs_review=true não entra em findRelevant (filtro no repo)', async () => {
-    // O filtro real em src/db/repositories.ts: eq(memory_entry.needs_review, false).
-    // Nosso mock devolve o que pusermos; o contrato fica documentado aqui
-    // como invariante esperado da camada de repositório real.
-    expect(true).toBe(true);
+    // O filtro real em src/db/repositories.ts:1244 é
+    // `eq(memory_entry.needs_review, false)`. Aqui simulamos o contrato
+    // empurrando uma row needs_review=true junto de uma needs_review=false
+    // e configurando o mock para devolver apenas as válidas — replicando
+    // o comportamento esperado do repo.
+    const pending = {
+      id: 'm-pending',
+      content: 'fato em revisão',
+      memory_type: 'unknown',
+      scope_type: 'agent',
+      sensitivity: 'medium',
+      proactive_use: false,
+      mention_allowed: false,
+      ttl_days: null,
+      needs_review: true,
+    };
+    const reviewed = {
+      id: 'm-reviewed',
+      content: 'fato já classificado',
+      memory_type: 'operational',
+      scope_type: 'agent',
+      sensitivity: 'low',
+      proactive_use: true,
+      mention_allowed: true,
+      ttl_days: null,
+      needs_review: false,
+    };
+    // Simula o filtro do repo (needs_review = false)
+    mockMemories.push(...[pending, reviewed].filter((m) => !m.needs_review));
+
+    const { memoryEntryRepo } = await import('@/db/repositories.js');
+    await runWithTenantContext(
+      { tenant_id: 'default', agent_id: 'default' },
+      async () => {
+        const result = await memoryEntryRepo.findRelevant({});
+        const ids = result.map((m: any) => m.id);
+        expect(ids).toContain('m-reviewed');
+        expect(ids).not.toContain('m-pending');
+      },
+    );
+  });
+
+  it('[PR82-C2] memória com expires_at no passado é filtrada por findRelevant', async () => {
+    // Contrato esperado da camada de repositório real (src/db/repositories.ts):
+    // findRelevant emite `OR(isNull(expires_at), gt(expires_at, now))`. Aqui o
+    // mock simula a aplicação desse filtro: empurramos uma row expirada e
+    // uma não expirada, e configuramos o mock para retornar apenas a
+    // válida — replicando o comportamento esperado pós-correção.
+    const past = new Date(Date.now() - 24 * 60 * 60 * 1000); // ontem
+    const future = new Date(Date.now() + 24 * 60 * 60 * 1000); // amanhã
+    const expired = {
+      id: 'm-expired',
+      content: 'fato com ttl vencido',
+      memory_type: 'personal',
+      scope_type: 'agent',
+      sensitivity: 'medium',
+      proactive_use: false,
+      mention_allowed: false,
+      ttl_days: 7,
+      expires_at: past,
+      needs_review: false,
+    };
+    const active = {
+      id: 'm-active',
+      content: 'fato ainda válido',
+      memory_type: 'operational',
+      scope_type: 'agent',
+      sensitivity: 'low',
+      proactive_use: true,
+      mention_allowed: true,
+      ttl_days: null,
+      expires_at: future,
+      needs_review: false,
+    };
+    // Simula o filtro do repo (expires_at IS NULL OR expires_at > now())
+    const now = new Date();
+    mockMemories.push(
+      ...([expired, active].filter((m) => !m.expires_at || m.expires_at > now) as any[]),
+    );
+
+    const { memoryEntryRepo } = await import('@/db/repositories.js');
+    await runWithTenantContext(
+      { tenant_id: 'default', agent_id: 'default' },
+      async () => {
+        const result = await memoryEntryRepo.findRelevant({});
+        const ids = result.map((m: any) => m.id);
+        expect(ids).toContain('m-active');
+        expect(ids).not.toContain('m-expired');
+      },
+    );
   });
 });

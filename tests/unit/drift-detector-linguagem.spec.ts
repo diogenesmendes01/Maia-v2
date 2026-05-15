@@ -44,13 +44,33 @@ function makeProfile(): AgentOperationalProfileVersion {
     agent_id: 'default',
     version: 1,
     status: 'active',
-    core_immutable: { identity_block: 'Maia', principles: [] } as unknown,
-    operational_profile: {
-      voice_descriptor: 'Português brasileiro, coloquial-profissional. Sem emojis.',
-      thresholds: {},
+    profile_body: {
+      schema_version: 'v3.1.1-2026-05-15',
+      identity: {
+        role_descriptor: 'Maia',
+        voice: {
+          tone: 'coloquial-profissional. Sem emojis.',
+          formality: 'medium',
+          verbosity: 'medium',
+        },
+        cognitive_limits: {
+          max_inference_depth: 3,
+          max_speculation_in_response: 0.2,
+          confidence_floor_for_action: 0.7,
+        },
+        priorities: [],
+        learned_voice_modifiers: [],
+      },
+      style: {
+        language: 'Português brasileiro, coloquial-profissional. Sem emojis.',
+        rhythm: {},
+      },
+      metadata: {
+        effective_from: now.toISOString(),
+        created_by: 'system_seed',
+        previous_version_id: null,
+      },
     } as unknown,
-    episodic_temp: {} as unknown,
-    growth_backlog: [] as unknown,
     proposed_by: 'system_seed',
     proposed_reason: null,
     approved_by: 'system_seed',
