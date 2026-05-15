@@ -919,6 +919,81 @@ export const procedure_status_events = pgTable(
   }),
 );
 
+export const procedure_executions = pgTable(
+  'procedure_executions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    conversa_id: uuid('conversa_id'),
+    definition_id: uuid('definition_id').notNull(),
+    definition_version: integer('definition_version').notNull(),
+    status: text('status').notNull().default('in_progress'),
+    current_step_id: text('current_step_id'),
+    // PR #84 Minor #2: declared and read by prompt-builder (stateJson block),
+    // but no engine path mutates it in P3b. Reserved for P3c which will emit
+    // `state_updated` events with `execution_state` deltas (e.g. coleted slot
+    // values across steps) and replay them in `replayState`.
+    execution_state: jsonb('execution_state').notNull().default(sql`'{}'::jsonb`),
+    completed_steps: jsonb('completed_steps').notNull().default(sql`'[]'::jsonb`),
+    started_at: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
+    last_activity_at: timestamp('last_activity_at', { withTimezone: true }).notNull().defaultNow(),
+    ended_at: timestamp('ended_at', { withTimezone: true }),
+    outcome: text('outcome'),
+    notes: text('notes'),
+  },
+  (t) => ({
+    tenantAgentStatusIdx: index('procedure_exec_tenant_agent_status_idx').on(t.tenant_id, t.agent_id, t.status, t.last_activity_at),
+    conversaIdx: index('procedure_exec_conversa_idx').on(t.conversa_id),
+    inProgressIdx: index('procedure_exec_in_progress_idx').on(t.tenant_id, t.agent_id, t.conversa_id, t.last_activity_at),
+    // P84-C2: partial UNIQUE constraint enforcing at most one in_progress
+    // execution per (tenant, agent, conversa). Declared via raw SQL migration
+    // 023 because Drizzle 0.45 doesn't expose partial-unique-index in DSL;
+    // recorded here for documentation. See migration 023.
+  }),
+);
+
+export const procedure_execution_events = pgTable(
+  'procedure_execution_events',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    execution_id: uuid('execution_id').notNull(),
+    step_id: text('step_id'),
+    event_type: text('event_type').notNull(),
+    payload: jsonb('payload').notNull().default(sql`'{}'::jsonb`),
+    confidence: numeric('confidence', { precision: 4, scale: 3 }),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    executionIdx: index('procedure_events_execution_idx').on(t.execution_id, t.created_at),
+    typeIdx: index('procedure_events_type_idx').on(t.event_type, t.created_at),
+  }),
+);
+
+export const procedure_selector_decisions = pgTable(
+  'procedure_selector_decisions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    conversa_id: uuid('conversa_id'),
+    turno_id: uuid('turno_id'),
+    current_execution_id: uuid('current_execution_id'),
+    candidates: jsonb('candidates').notNull().default(sql`'[]'::jsonb`),
+    conflicts: jsonb('conflicts').notNull().default(sql`'[]'::jsonb`),
+    decision: text('decision').notNull(),
+    selected_procedure_id: uuid('selected_procedure_id'),
+    decided_by: text('decided_by').notNull(),
+    reason: text('reason'),
+    decided_at: timestamp('decided_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    conversaIdx: index('procedure_selector_conversa_idx').on(t.conversa_id, t.decided_at),
+  }),
+);
+
 export type Entidade = typeof entidades.$inferSelect;
 export type Pessoa = typeof pessoas.$inferSelect;
 export type Permissao = typeof permissoes.$inferSelect;
@@ -955,4 +1030,6 @@ export type AgentCapabilitySkill = typeof agent_capabilities_skill.$inferSelect;
 export type AgentCapabilityGap = typeof agent_capability_gaps.$inferSelect;
 export type ProcedureDefinition = typeof procedure_definitions.$inferSelect;
 export type ProcedureAssignment = typeof procedure_assignments.$inferSelect;
-export type ProcedureStatusEvent = typeof procedure_status_events.$inferSelect;
+export type ProcedureExecution = typeof procedure_executions.$inferSelect;
+export type ProcedureExecutionEvent = typeof procedure_execution_events.$inferSelect;
+export type ProcedureSelectorDecision = typeof procedure_selector_decisions.$inferSelect;

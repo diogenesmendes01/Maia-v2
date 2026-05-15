@@ -10,8 +10,16 @@ import {
   behavioralHintRepo,
   capabilitiesSkillRepo,
   capabilityGapsRepo,
+  procedureExecutionsRepo,
+  procedureDefinitionsRepo,
 } from '@/db/repositories.js';
-import type { Pessoa, Conversa, Mensagem, BehavioralHint } from '@/db/schema.js';
+import type {
+  Pessoa,
+  Conversa,
+  Mensagem,
+  BehavioralHint,
+  ProcedureExecution,
+} from '@/db/schema.js';
 import type { ResolvedPermission } from '@/governance/permissions.js';
 import { fmtBR } from '@/lib/brazilian.js';
 import type { LLMMessage } from '@/lib/claude.js';
@@ -160,13 +168,12 @@ export type PromptContext = {
   conversa: Conversa;
   scope: { entidades: string[]; byEntity: Map<string, ResolvedPermission> };
   inbound: Mensagem;
-  // PR #82 review (Superpowers Critical #4): plumb role/channel from the
-  // caller so memory_entry.scope_type='role'/'channel' filtering can be
-  // enforced. Optional — P6 introduces real role/channel selection; in
-  // earlier phases the agent core can pass `null`/omit and only `agent`/
-  // `interlocutor`/`conversation`-scoped memories surface.
-  current_role_id?: string | null;
-  current_channel_id?: string | null;
+  // PR #84 Minor #7: when the caller has already loaded the active procedure
+  // execution (e.g. `core.ts` runs `findActiveForConversa` in the pre-turn
+  // selector block), pass it down so we don't re-query the DB inside buildPrompt.
+  // When undefined, buildPrompt falls back to its own lookup so existing
+  // callers (and tests that don't set up procedure runtime) keep working.
+  activeExecution?: ProcedureExecution | null;
 };
 
 function isToolExecutionSummary(x: unknown): x is ToolExecutionSummary {
@@ -380,6 +387,7 @@ export async function buildPrompt(ctx: PromptContext): Promise<{ system: string;
   let memorySection = '';
   let hintsSection = '';
   let selfAwarenessSection = '';
+  let procedureSection = '';
 
   try {
     const memoryEntries = (await memoryEntryRepo?.findRelevant?.({
@@ -491,6 +499,57 @@ export async function buildPrompt(ctx: PromptContext): Promise<{ system: string;
     // Degrade gracefully.
   }
 
+  // P3b Task 8: if there's an active procedure_execution for this conversa,
+  // surface it in the system prompt so the model can follow the step's
+  // intencao/como/sucesso/armadilhas instead of improvising. Wrapped in
+  // try/catch so missing repos in tests or any DB failure leave the prompt
+  // intact — procedure runtime is non-essential to the baseline turn.
+  //
+  // PR #84 Minor #7: prefer the execution that core.ts already loaded
+  // (`ctx.activeExecution`) over a fresh DB roundtrip. `undefined` means the
+  // caller didn't provide one (legacy / test) → fall back to lookup. `null`
+  // means the caller looked and found nothing → skip the section entirely.
+  try {
+    if (ctx.conversa?.id) {
+      const activeExec =
+        ctx.activeExecution !== undefined
+          ? ctx.activeExecution
+          : await procedureExecutionsRepo?.findActiveForConversa?.(ctx.conversa.id);
+      if (activeExec) {
+        const def = await procedureDefinitionsRepo?.findById?.(activeExec.definition_id);
+        if (def && activeExec.current_step_id) {
+          const steps = def.steps as unknown as Array<{
+            id: string;
+            intencao?: string;
+            como?: string;
+            sucesso_criteria_ref?: string;
+            armadilhas?: string[];
+          }>;
+          const criteria = def.success_criteria as unknown as Array<{
+            id: string;
+            type?: string;
+          }>;
+          const currentStep = steps.find((s) => s.id === activeExec.current_step_id);
+          if (currentStep) {
+            const matchingCriterion = currentStep.sucesso_criteria_ref
+              ? criteria.find((c) => c.id === currentStep.sucesso_criteria_ref)
+              : null;
+            const stateJson = JSON.stringify(activeExec.execution_state, null, 2);
+            procedureSection = `\n## Procedimento em execução
+Você está executando "${def.nome}" v${def.version_number}, passo atual: "${currentStep.id}".
+Intenção do passo: ${currentStep.intencao ?? 'não especificada'}.
+Como executar: ${currentStep.como ?? 'não especificado'}.${matchingCriterion ? `\nCritério de sucesso (${matchingCriterion.type}).` : ''}${currentStep.armadilhas?.length ? `\nArmadilhas comuns: ${currentStep.armadilhas.join('; ')}.` : ''}
+
+Estado coletado:
+${stateJson}`;
+          }
+        }
+      }
+    }
+  } catch {
+    // Degrade gracefully — procedure runtime must not break baseline prompt.
+  }
+
   const system = [
     self?.system_prompt ?? 'Você é a Maia.',
     '',
@@ -543,7 +602,8 @@ export async function buildPrompt(ctx: PromptContext): Promise<{ system: string;
   ].join('\n')
     + memorySection
     + hintsSection
-    + selfAwarenessSection;
+    + selfAwarenessSection
+    + procedureSection;
 
   const system = systemSections.join('\n');
 

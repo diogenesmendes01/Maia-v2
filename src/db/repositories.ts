@@ -33,7 +33,9 @@ import {
   agent_capability_gaps,
   procedure_definitions,
   procedure_assignments,
-  procedure_status_events,
+  procedure_executions,
+  procedure_execution_events,
+  procedure_selector_decisions,
 } from './schema.js';
 import { TypedError } from '@/lib/utils.js';
 import { applyTenantGuard } from './tenant-guard.js';
@@ -68,7 +70,9 @@ import type {
   AgentCapabilityGap,
   ProcedureDefinition,
   ProcedureAssignment,
-  ProcedureStatusEvent,
+  ProcedureExecution,
+  ProcedureExecutionEvent,
+  ProcedureSelectorDecision,
 } from './schema.js';
 
 export type EntityScope = {
@@ -2070,5 +2074,196 @@ export const procedureAssignmentsRepo = {
       .update(procedure_assignments)
       .set({ enabled: false, deactivated_at: new Date() })
       .where(eq(procedure_assignments.id, id));
+  },
+};
+
+export const procedureExecutionsRepo = {
+  async create(
+    input: Omit<ProcedureExecution, 'id' | 'started_at' | 'last_activity_at' | 'tenant_id' | 'agent_id'>,
+  ): Promise<ProcedureExecution> {
+    const guarded = applyTenantGuard(input);
+    const [row] = await db.insert(procedure_executions).values(guarded as any).returning();
+    return row!;
+  },
+
+  async findActiveForConversa(conversa_id: string): Promise<ProcedureExecution | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(procedure_executions)
+      .where(and(
+        eq(procedure_executions.tenant_id, tenant_id),
+        eq(procedure_executions.agent_id, agent_id),
+        eq(procedure_executions.conversa_id, conversa_id),
+        eq(procedure_executions.status, 'in_progress'),
+      ))
+      .orderBy(desc(procedure_executions.last_activity_at))
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  // P84-C1: tenant-scoped read. The previous implementation queried by id
+  // alone — UUID collisions are astronomically unlikely but the project's
+  // tenant-isolation invariant is structural, not probabilistic. Every
+  // cross-tenant query path must be closed by code.
+  async findById(id: string): Promise<ProcedureExecution | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(procedure_executions)
+      .where(and(
+        eq(procedure_executions.id, id),
+        eq(procedure_executions.tenant_id, tenant_id),
+        eq(procedure_executions.agent_id, agent_id),
+      ))
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  // P84-C2: tenant-scoped create with ON CONFLICT no-op on the
+  // (tenant,agent,conversa) WHERE status='in_progress' partial unique index
+  // shipped in migration 023. When two workers race and both see
+  // activeExecution=null → both call startExecution, the second insert is
+  // rejected by the constraint; we swallow it and return null so the caller
+  // re-loads the active row.
+  async createOrFindActive(
+    input: Omit<ProcedureExecution, 'id' | 'started_at' | 'last_activity_at' | 'tenant_id' | 'agent_id'>,
+  ): Promise<{ execution: ProcedureExecution; created: boolean }> {
+    const guarded = applyTenantGuard(input);
+    const rows = await db
+      .insert(procedure_executions)
+      .values(guarded as any)
+      .onConflictDoNothing({
+        target: [
+          procedure_executions.tenant_id,
+          procedure_executions.agent_id,
+          procedure_executions.conversa_id,
+        ],
+        // index_predicate for the partial unique index defined in
+        // migration 023_p3b_unique_in_progress_per_conversa.sql. The
+        // predicate MUST match the migration's `WHERE` exactly so Postgres'
+        // partial-index inference engine can match this ON CONFLICT to the
+        // index — relying on column-presence inference alone is brittle.
+        where: sql`status = 'in_progress' AND conversa_id IS NOT NULL`,
+      })
+      .returning();
+
+    if (rows[0]) {
+      return { execution: rows[0], created: true };
+    }
+
+    // Conflict path: another worker created an in_progress execution for
+    // the same conversa concurrently. Re-load and return it. conversa_id
+    // is guaranteed non-null here because the partial index only applies
+    // when conversa_id IS NOT NULL (and a null conversa_id can't conflict).
+    if (guarded.conversa_id == null) {
+      throw new Error('procedureExecutionsRepo.createOrFindActive: insert returned no row and conversa_id is null');
+    }
+    const existing = await procedureExecutionsRepo.findActiveForConversa(guarded.conversa_id as string);
+    if (!existing) {
+      throw new Error('procedureExecutionsRepo.createOrFindActive: conflict but no active row found');
+    }
+    return { execution: existing, created: false };
+  },
+
+  // P84-C5: transaction-aware variant. When called from inside a
+  // withTx() block, all writes commit together with the caller's events.
+  async updateStateTx(
+    tx: typeof db,
+    id: string,
+    updates: Partial<{
+      current_step_id: string | null;
+      execution_state: any;
+      completed_steps: any;
+      last_activity_at: Date;
+      status: string;
+      outcome: string;
+      ended_at: Date;
+      notes: string;
+    }>,
+  ): Promise<void> {
+    await tx
+      .update(procedure_executions)
+      .set({ ...updates, last_activity_at: new Date() } as any)
+      .where(eq(procedure_executions.id, id));
+  },
+
+  async updateState(
+    id: string,
+    updates: Partial<{
+      current_step_id: string | null;
+      execution_state: any;
+      completed_steps: any;
+      last_activity_at: Date;
+      status: string;
+      outcome: string;
+      ended_at: Date;
+      notes: string;
+    }>,
+  ): Promise<void> {
+    await db
+      .update(procedure_executions)
+      .set({ ...updates, last_activity_at: new Date() } as any)
+      .where(eq(procedure_executions.id, id));
+  },
+};
+
+export const procedureExecutionEventsRepo = {
+  async record(
+    input: Omit<ProcedureExecutionEvent, 'id' | 'created_at' | 'tenant_id' | 'agent_id'>,
+  ): Promise<void> {
+    const guarded = applyTenantGuard(input);
+    await db.insert(procedure_execution_events).values(guarded as any);
+  },
+
+  // P84-C5: transaction-aware variant. Lets the engine commit
+  // recordEvent+updateState atomically inside withTx().
+  async recordTx(
+    tx: typeof db,
+    input: Omit<ProcedureExecutionEvent, 'id' | 'created_at' | 'tenant_id' | 'agent_id'>,
+  ): Promise<void> {
+    const guarded = applyTenantGuard(input);
+    await tx.insert(procedure_execution_events).values(guarded as any);
+  },
+
+  // P84-C1: tenant-scoped read. Mirror the pattern in findById — never
+  // trust the execution_id alone, even though FKs make a cross-tenant
+  // collision unlikely. Audit trail reads must respect tenant boundaries.
+  async listByExecution(execution_id: string): Promise<ProcedureExecutionEvent[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(procedure_execution_events)
+      .where(and(
+        eq(procedure_execution_events.execution_id, execution_id),
+        eq(procedure_execution_events.tenant_id, tenant_id),
+        eq(procedure_execution_events.agent_id, agent_id),
+      ))
+      .orderBy(procedure_execution_events.created_at);
+  },
+};
+
+export const procedureSelectorDecisionsRepo = {
+  async record(
+    input: Omit<ProcedureSelectorDecision, 'id' | 'decided_at' | 'tenant_id' | 'agent_id'>,
+  ): Promise<void> {
+    const guarded = applyTenantGuard(input);
+    await db.insert(procedure_selector_decisions).values(guarded as any);
+  },
+
+  async recentByConversa(conversa_id: string, limit = 20): Promise<ProcedureSelectorDecision[]> {
+    const tenant_id = getCurrentTenant();
+    return db
+      .select()
+      .from(procedure_selector_decisions)
+      .where(and(
+        eq(procedure_selector_decisions.tenant_id, tenant_id),
+        eq(procedure_selector_decisions.conversa_id, conversa_id),
+      ))
+      .orderBy(desc(procedure_selector_decisions.decided_at))
+      .limit(limit);
   },
 };
