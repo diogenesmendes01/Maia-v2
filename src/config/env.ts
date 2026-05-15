@@ -190,6 +190,28 @@ const envSchema = z
       .default(0.6),
     MESSAGE_DEBOUNCE_MS: z.coerce.number().int().positive().default(5000),
     MESSAGE_DEBOUNCE_MAX_MS: z.coerce.number().int().positive().default(30000),
+    // Scheduling v2: feature flag for the new occurrence/outbox engine.
+    // Off by default; flip on per-tenant via env once the worker fleet is
+    // ready. Any code path that depends on the new tables is no-op when
+    // this flag is false.
+    FEATURE_SCHEDULING_V2: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
+    // Outbox backpressure caps (per agent instance). Defaults are
+    // conservative; tune per provider rate-limits.
+    OUTBOX_MAX_PER_SECOND: z.coerce.number().int().positive().default(2),
+    OUTBOX_MAX_PER_HOUR: z.coerce.number().int().positive().default(120),
+    // How long a leased occurrence stays leased before another worker can
+    // reclaim it (e.g. crashed worker). Stale leases are reclaimed on the
+    // next tick.
+    OCCURRENCE_LEASE_TTL_SECONDS: z.coerce.number().int().positive().default(300),
+    OUTBOX_LEASE_TTL_SECONDS: z.coerce.number().int().positive().default(60),
+    OUTBOX_WORKER_CONCURRENCY: z.coerce.number().int().positive().default(4),
+    // Drain worker tick parameters: how many drain passes per tick and how
+    // long to sleep between ticks. Defaults give ~1 pass/200ms.
+    OUTBOX_DRAIN_LOOP_PASSES: z.coerce.number().int().positive().default(5),
+    OUTBOX_DRAIN_LOOP_SLEEP_MS: z.coerce.number().int().nonnegative().default(200),
     // SETUP: optional override for the bootstrap token. When set, bypasses
     // the file-backed token. Discouraged in prod (env vars leak more than
     // file mode 0o600). Useful for dev / scripted deploys / E2E tests.
