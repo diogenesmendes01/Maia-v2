@@ -1,20 +1,20 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-const factsUpsertMock = vi.fn();
-
-vi.mock('../../../src/db/repositories.js', () => ({
-  factsRepo: {
-    upsert: factsUpsertMock,
-  },
+const createWithFirstOccurrenceMock = vi.fn();
+vi.mock('../../../src/scheduling/repos.js', () => ({
+  seriesRepo: { createWithFirstOccurrence: createWithFirstOccurrenceMock },
 }));
+
+const auditMock = vi.fn();
+vi.mock('../../../src/governance/audit.js', () => ({ audit: auditMock }));
 
 vi.mock('../../../src/lib/logger.js', () => ({
   logger: { warn: vi.fn(), info: vi.fn(), debug: vi.fn(), error: vi.fn() },
 }));
 
 beforeEach(() => {
-  factsUpsertMock.mockReset();
-  factsUpsertMock.mockResolvedValue({ id: 'fact-row' });
+  createWithFirstOccurrenceMock.mockReset();
+  auditMock.mockReset();
 });
 
 const E1 = '00000000-0000-0000-0000-0000000000e1';
@@ -28,60 +28,70 @@ const ctx = {
   idempotency_key: 'ik1',
 } as never;
 
-describe('schedule_reminder tool', () => {
-  it('happy path: upserts a reminder fact under pessoa scope and returns reminder_id + quando', async () => {
+describe('schedule_reminder tool (spec 18)', () => {
+  it('happy path: creates a one_shot_reminder series with an occurrence + reminder task', async () => {
+    const scheduled = '2027-01-15T09:00:00Z';
+    createWithFirstOccurrenceMock.mockResolvedValue({
+      series: { id: 'series-1', tipo: 'one_shot_reminder' },
+      occurrence: { id: 'occ-1', scheduled_for: new Date(scheduled) },
+      tasks: [{ id: 'task-1', ordem: 1, kind: 'fire_reminder' }],
+    });
     const { scheduleReminderTool } = await import('../../../src/tools/schedule-reminder.js');
     const result = await scheduleReminderTool.handler(
       {
         entidade_id: E1,
-        quando: '2027-01-15T09:00:00Z',
-        texto: 'Lembrar de pagar boleto',
+        quando: scheduled,
+        texto: 'Pagar Vivo',
         canal: 'whatsapp',
       } as never,
       ctx,
     );
-    expect(result.quando).toBe('2027-01-15T09:00:00Z');
-    expect(result.reminder_id).toMatch(/^rem-/);
+    expect(result.series_id).toBe('series-1');
+    expect(result.occurrence_id).toBe('occ-1');
+    expect(result.scheduled_for).toBe(new Date(scheduled).toISOString());
 
-    expect(factsUpsertMock).toHaveBeenCalledTimes(1);
-    const arg = factsUpsertMock.mock.calls[0]![0] as Record<string, unknown>;
-    expect(arg.escopo).toBe('pessoa:p1');
-    expect(arg.chave).toBe(`reminder.${result.reminder_id}`);
-    expect(arg.fonte).toBe('configurado');
-    const valor = arg.valor as Record<string, unknown>;
-    expect(valor.id).toBe(result.reminder_id);
-    expect(valor.pessoa_id).toBe('p1');
-    expect(valor.entidade_id).toBe(E1);
-    expect(valor.quando).toBe('2027-01-15T09:00:00Z');
-    expect(valor.texto).toBe('Lembrar de pagar boleto');
-    expect(valor.canal).toBe('whatsapp');
+    expect(createWithFirstOccurrenceMock).toHaveBeenCalledTimes(1);
+    const arg = createWithFirstOccurrenceMock.mock.calls[0]![0] as {
+      tipo: string;
+      one_shot_at: Date;
+      contexto_template: { texto: string };
+      initial_occurrence: {
+        scheduled_for: Date;
+        contexto_snapshot: { texto: string };
+        tasks: Array<{ kind: string }>;
+      };
+    };
+    expect(arg.tipo).toBe('one_shot_reminder');
+    expect(arg.contexto_template.texto).toBe('Pagar Vivo');
+    expect(arg.initial_occurrence.tasks.map((t) => t.kind)).toEqual(['fire_reminder']);
+
+    // Audit fired for series_created + occurrence_scheduled.
+    const actions = auditMock.mock.calls.map((c) => (c[0] as { acao: string }).acao);
+    expect(actions).toContain('series_created');
+    expect(actions).toContain('occurrence_scheduled');
   });
 
-  it('schema invalid: rejects empty texto', async () => {
+  it('schema invalid: empty texto rejected by zod', async () => {
     const { scheduleReminderTool } = await import('../../../src/tools/schedule-reminder.js');
     const parsed = scheduleReminderTool.input_schema.safeParse({
       quando: '2027-01-15T09:00:00Z',
       texto: '',
     });
     expect(parsed.success).toBe(false);
-    expect(factsUpsertMock).not.toHaveBeenCalled();
+    expect(createWithFirstOccurrenceMock).not.toHaveBeenCalled();
   });
 
-  it('reminder id is a v4 UUID (not Math.random) prefixed with "rem-" and unique per call', async () => {
+  it('flags warn_far_future when quando > 1 year ahead', async () => {
+    createWithFirstOccurrenceMock.mockResolvedValue({
+      series: { id: 's' },
+      occurrence: { id: 'o', scheduled_for: new Date('2030-01-01T00:00:00Z') },
+      tasks: [],
+    });
     const { scheduleReminderTool } = await import('../../../src/tools/schedule-reminder.js');
-    const r1 = await scheduleReminderTool.handler(
-      { quando: '2027-02-01T10:00:00Z', texto: 'A', canal: 'whatsapp' } as never,
+    const result = await scheduleReminderTool.handler(
+      { quando: '2030-01-01T00:00:00Z', texto: 'X', canal: 'whatsapp' } as never,
       ctx,
     );
-    const r2 = await scheduleReminderTool.handler(
-      { quando: '2027-02-01T11:00:00Z', texto: 'B', canal: 'whatsapp' } as never,
-      ctx,
-    );
-    // Each call gets a fresh randomUUID — values must differ.
-    expect(r1.reminder_id).not.toBe(r2.reminder_id);
-    // Strip the "rem-" prefix and assert v4 UUID shape.
-    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-    expect(r1.reminder_id.replace(/^rem-/, '')).toMatch(uuidRegex);
-    expect(r2.reminder_id.replace(/^rem-/, '')).toMatch(uuidRegex);
+    expect(result.warn_far_future).toBe(true);
   });
 });

@@ -16,15 +16,26 @@ npx vitest run tests/unit/tenant-context.spec.ts
 
 echo ""
 echo "=== Gate 2: NOT NULL forçado em 27 tabelas ==="
-psql "$DATABASE_URL" -c "
-SELECT count(*) AS not_null_count
+# Expected = 57:
+#   27 P0 tables × 2 cols (tenant_id + agent_id)       = 54  (migration 012)
+#   agents.tenant_id                                    =  1  (migration 007)
+#   cognitive_module_log.tenant_id + agent_id           =  2  (migration 008)
+# Se este número mudar (nova tabela tenant-aware), atualizar EXPECTED.
+EXPECTED_NOT_NULL=57
+NOT_NULL_COUNT=$(psql "$DATABASE_URL" -At -c "
+SELECT count(*)
 FROM information_schema.columns
 WHERE column_name IN ('tenant_id', 'agent_id')
   AND is_nullable = 'NO'
   AND table_schema = 'public';
-"
-echo "Expected: count >= 56 (27 P0 tables × 2 cols + 2 from agents + 2 from cognitive_module_log = 58, minus tables sem agent_id)"
-echo "Adjust expected number after empiric check on first run."
+")
+echo "NOT NULL tenant_id/agent_id columns: $NOT_NULL_COUNT (expected $EXPECTED_NOT_NULL)"
+if [ "$NOT_NULL_COUNT" -ne "$EXPECTED_NOT_NULL" ]; then
+  echo "Gate 2 FAIL: esperado $EXPECTED_NOT_NULL colunas NOT NULL, encontrado $NOT_NULL_COUNT."
+  echo "  Verifique se todas as migrations P0 (007-012) rodaram e se o EXPECTED está atualizado."
+  exit 1
+fi
+echo "Gate 2 OK"
 
 echo ""
 echo "=== Gate 3: Isolation integration test ==="

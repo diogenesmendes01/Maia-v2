@@ -1,7 +1,14 @@
 import { AsyncLocalStorage } from 'async_hooks';
 
 export class MissingTenantContextError extends Error {
+  // Error code estável (não-traduzível) pra UI/dashboards que precisem
+  // distinguir esse erro programaticamente sem fazer string match.
+  readonly code = 'MISSING_TENANT_CONTEXT';
+
   constructor() {
+    // Mensagem técnica em PT (target: devs/operadores). Não exposta a end-user.
+    // UI deve usar `.code === 'MISSING_TENANT_CONTEXT'` pra traduzir/i18n
+    // (PR #75 review, Superpowers finding #11).
     super('Tenant context não está disponível — toda query precisa rodar dentro de runWithTenantContext');
     this.name = 'MissingTenantContextError';
   }

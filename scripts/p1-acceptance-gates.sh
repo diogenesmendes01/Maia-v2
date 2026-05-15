@@ -16,7 +16,7 @@ npx vitest run tests/integration/p1-reflection-expansion.spec.ts
 
 echo ""
 echo "=== DB-dependent gates ==="
-echo "→ migration 013 applied (cognitive_candidates exists)"
+echo "→ migration 014 applied (cognitive_candidates exists)"
 psql "$DATABASE_URL" -c "SELECT to_regclass('public.cognitive_candidates') AS exists;" \
   | grep -q 'cognitive_candidates' || { echo "FAIL: cognitive_candidates table missing — run npm run db:migrate"; exit 1; }
 echo "OK"
