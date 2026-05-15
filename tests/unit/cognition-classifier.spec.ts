@@ -6,7 +6,9 @@ vi.mock('@/lib/claude.js', () => ({
   callLLM: vi.fn(async ({ messages }) => {
     const user = messages[0].content as string;
     if (user.includes('FATO_X')) return { content: JSON.stringify({ type: 'fato', content: 'X', scope: 'agent' }) };
-    if (user.includes('REGRA_X')) return { content: JSON.stringify({ type: 'regra', contexto: 'X', acao: 'Y', tipo: 'classificacao', confianca: 0.7 }) };
+    // Note: `confianca_sugerida_llm` is METADATA-ONLY. Persister derives the
+    // canonical confianca deterministically (north-star invariant).
+    if (user.includes('REGRA_X')) return { content: JSON.stringify({ type: 'regra', contexto: 'X', acao: 'Y', tipo: 'classificacao', confianca_sugerida_llm: 0.7 }) };
     if (user.includes('LACUNA_X')) return { content: JSON.stringify({ type: 'lacuna', capability_description: 'X', tipo: 'tool', contexto: 'Y' }) };
     if (user.includes('DESCARTE_X')) return { content: JSON.stringify({ type: 'descarte', reason: 'irrelevant' }) };
     return { content: JSON.stringify({ type: 'descarte', reason: 'fallback' }) };
