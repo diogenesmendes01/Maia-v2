@@ -9,7 +9,9 @@ import {
   boolean,
   date,
   unique,
+  uniqueIndex,
   index,
+  check,
 } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 
@@ -797,6 +799,126 @@ export const agent_capability_gaps = pgTable(
   }),
 );
 
+export const procedure_definitions = pgTable(
+  'procedure_definitions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    scope: text('scope').notNull(),
+    owner_agent_id: text('owner_agent_id'),
+    nome: text('nome').notNull(),
+    version_number: integer('version_number').notNull().default(1),
+    status: text('status').notNull().default('draft'),
+    intencao: text('intencao').notNull(),
+    when_apply: jsonb('when_apply').notNull().default(sql`'{}'::jsonb`),
+    when_not_apply: jsonb('when_not_apply').notNull().default(sql`'{}'::jsonb`),
+    steps: jsonb('steps').notNull().default(sql`'[]'::jsonb`),
+    success_criteria: jsonb('success_criteria').notNull().default(sql`'[]'::jsonb`),
+    failure_modes: jsonb('failure_modes').notNull().default(sql`'[]'::jsonb`),
+    tools_referenced: jsonb('tools_referenced').notNull().default(sql`'[]'::jsonb`),
+    source: text('source').notNull(),
+    proposed_by: text('proposed_by'),
+    approved_by: text('approved_by'),
+    approved_at: timestamp('approved_at', { withTimezone: true }),
+    activated_at: timestamp('activated_at', { withTimezone: true }),
+    deactivated_at: timestamp('deactivated_at', { withTimezone: true }),
+    source_candidate_id: uuid('source_candidate_id'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  // P83-C3: Drizzle definitions must mirror the SQL migration's CHECK +
+  // UNIQUE so drizzle-kit drift detection does not propose dropping them
+  // and so the types match what the database actually enforces.
+  (t) => ({
+    tenantAgentStatusIdx: index('procedure_def_tenant_agent_status_idx').on(t.tenant_id, t.agent_id, t.status, t.nome),
+    sourceCandidateIdx: index('procedure_def_source_candidate_idx').on(t.source_candidate_id),
+    nameVersionUniq: unique('procedure_def_name_version_uniq').on(
+      t.tenant_id,
+      t.agent_id,
+      t.nome,
+      t.version_number,
+    ),
+    // P83-C4: partial UNIQUE so the DB rejects two simultaneously active
+    // versions of the same nome. Promoted from a plain partial index to
+    // a UNIQUE partial index. Migration 020 enforces this at the DB layer
+    // (CREATE UNIQUE INDEX ... WHERE status='active').
+    activeUniqIdx: uniqueIndex('procedure_def_active_uniq_idx')
+      .on(t.tenant_id, t.agent_id, t.nome)
+      .where(sql`status = 'active'`),
+    scopeCheck: check(
+      'procedure_def_scope_check',
+      sql`scope IN ('global', 'tenant', 'agent', 'role')`,
+    ),
+    statusCheck: check(
+      'procedure_def_status_check',
+      sql`status IN ('draft', 'proposed', 'active', 'frozen', 'rolled_back')`,
+    ),
+    sourceCheck: check(
+      'procedure_def_source_check',
+      sql`source IN ('ensino', 'observacao', 'pratica', 'platform_wisdom')`,
+    ),
+  }),
+);
+
+export const procedure_assignments = pgTable(
+  'procedure_assignments',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    definition_id: uuid('definition_id').notNull(),
+    definition_version: integer('definition_version').notNull(),
+    target_type: text('target_type').notNull(),
+    target_id: text('target_id').notNull(),
+    customizations: jsonb('customizations').notNull().default(sql`'{}'::jsonb`),
+    enabled: boolean('enabled').notNull().default(true),
+    activated_at: timestamp('activated_at', { withTimezone: true }).notNull().defaultNow(),
+    deactivated_at: timestamp('deactivated_at', { withTimezone: true }),
+  },
+  (t) => ({
+    targetIdx: index('procedure_assignments_target_idx').on(t.tenant_id, t.target_type, t.target_id, t.enabled),
+    defIdx: index('procedure_assignments_def_idx').on(t.definition_id),
+    targetUniq: unique('procedure_assignments_target_uniq').on(
+      t.tenant_id,
+      t.definition_id,
+      t.target_type,
+      t.target_id,
+    ),
+    targetTypeCheck: check(
+      'procedure_assignments_target_type_check',
+      sql`target_type IN ('agent', 'role')`,
+    ),
+  }),
+);
+
+/**
+ * Event-sourced status transition log for procedure_definitions. Each row
+ * captures who moved the definition between which states and when.
+ * (PR #83 H1, H2)
+ */
+export const procedure_status_events = pgTable(
+  'procedure_status_events',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    definition_id: uuid('definition_id').notNull(),
+    from_status: text('from_status').notNull(),
+    to_status: text('to_status').notNull(),
+    actor: text('actor').notNull(),
+    reason: text('reason'),
+    occurred_at: timestamp('occurred_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    defIdx: index('procedure_status_events_def_idx').on(t.definition_id, t.occurred_at),
+    tenantAgentIdx: index('procedure_status_events_tenant_agent_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.occurred_at,
+    ),
+  }),
+);
+
 export type Entidade = typeof entidades.$inferSelect;
 export type Pessoa = typeof pessoas.$inferSelect;
 export type Permissao = typeof permissoes.$inferSelect;
@@ -831,3 +953,6 @@ export type BehavioralHint = typeof behavioral_hint.$inferSelect;
 export type AgentCapabilityDomain = typeof agent_capabilities_domain.$inferSelect;
 export type AgentCapabilitySkill = typeof agent_capabilities_skill.$inferSelect;
 export type AgentCapabilityGap = typeof agent_capability_gaps.$inferSelect;
+export type ProcedureDefinition = typeof procedure_definitions.$inferSelect;
+export type ProcedureAssignment = typeof procedure_assignments.$inferSelect;
+export type ProcedureStatusEvent = typeof procedure_status_events.$inferSelect;

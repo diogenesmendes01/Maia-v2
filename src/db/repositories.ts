@@ -1,5 +1,5 @@
-import { eq, and, inArray, desc, isNull, sql, or, gt } from 'drizzle-orm';
-import { db } from './client.js';
+import { eq, and, inArray, desc, isNull, sql, or, gt, ne } from 'drizzle-orm';
+import { db, withTx } from './client.js';
 import {
   pessoas,
   permissoes,
@@ -31,6 +31,9 @@ import {
   agent_capabilities_domain,
   agent_capabilities_skill,
   agent_capability_gaps,
+  procedure_definitions,
+  procedure_assignments,
+  procedure_status_events,
 } from './schema.js';
 import { TypedError } from '@/lib/utils.js';
 import { applyTenantGuard } from './tenant-guard.js';
@@ -63,6 +66,9 @@ import type {
   AgentCapabilityDomain,
   AgentCapabilitySkill,
   AgentCapabilityGap,
+  ProcedureDefinition,
+  ProcedureAssignment,
+  ProcedureStatusEvent,
 } from './schema.js';
 
 export type EntityScope = {
@@ -77,40 +83,39 @@ export class EmptyScopeError extends TypedError {
 }
 
 export const pessoasRepo = {
-  // PR #75 review (P75-C2): pessoas is a tenant-aware table since migration
-  // 009. Identity resolution by phone is the FIRST step on inbound — if it
-  // leaks across tenants, every downstream check (permissões, escopo) is
-  // already compromised. All reads filter by (tenant_id, agent_id); all
-  // writes go through `applyTenantGuard`.
+  /**
+   * P83-C7: tenant-scoped findById. A row from another tenant is invisible.
+   */
   async findById(id: string): Promise<Pessoa | null> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
     const rows = await db
       .select()
       .from(pessoas)
-      .where(
-        and(
-          eq(pessoas.tenant_id, tenant_id),
-          eq(pessoas.agent_id, agent_id),
-          eq(pessoas.id, id),
-        ),
-      )
+      .where(and(
+        eq(pessoas.id, id),
+        eq(pessoas.tenant_id, tenant_id),
+        eq(pessoas.agent_id, agent_id),
+      ))
       .limit(1);
     return rows[0] ?? null;
   },
+  /**
+   * P83-C7: tenant-scoped findByPhone. WhatsApp phone numbers are
+   * globally unique but the pessoa record still belongs to a single
+   * tenant — we MUST scope the read.
+   */
   async findByPhone(telefone: string): Promise<Pessoa | null> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
     const rows = await db
       .select()
       .from(pessoas)
-      .where(
-        and(
-          eq(pessoas.tenant_id, tenant_id),
-          eq(pessoas.agent_id, agent_id),
-          eq(pessoas.telefone_whatsapp, telefone),
-        ),
-      )
+      .where(and(
+        eq(pessoas.telefone_whatsapp, telefone),
+        eq(pessoas.tenant_id, tenant_id),
+        eq(pessoas.agent_id, agent_id),
+      ))
       .limit(1);
     return rows[0] ?? null;
   },
@@ -125,13 +130,11 @@ export const pessoasRepo = {
     await db
       .update(pessoas)
       .set({ status, updated_at: new Date() })
-      .where(
-        and(
-          eq(pessoas.tenant_id, tenant_id),
-          eq(pessoas.agent_id, agent_id),
-          eq(pessoas.id, id),
-        ),
-      );
+      .where(and(
+        eq(pessoas.id, id),
+        eq(pessoas.tenant_id, tenant_id),
+        eq(pessoas.agent_id, agent_id),
+      ));
   },
   async updatePreferencias(id: string, preferencias: Record<string, unknown>): Promise<void> {
     const tenant_id = getCurrentTenant();
@@ -139,13 +142,11 @@ export const pessoasRepo = {
     await db
       .update(pessoas)
       .set({ preferencias, updated_at: new Date() })
-      .where(
-        and(
-          eq(pessoas.tenant_id, tenant_id),
-          eq(pessoas.agent_id, agent_id),
-          eq(pessoas.id, id),
-        ),
-      );
+      .where(and(
+        eq(pessoas.id, id),
+        eq(pessoas.tenant_id, tenant_id),
+        eq(pessoas.agent_id, agent_id),
+      ));
   },
   async list(): Promise<Pessoa[]> {
     const tenant_id = getCurrentTenant();
@@ -158,17 +159,32 @@ export const pessoasRepo = {
 };
 
 export const permissoesRepo = {
+  // P83-C7: all permissoes reads + writes scoped to current tenant.
   async forPessoa(pessoa_id: string): Promise<Permissao[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     return db
       .select()
       .from(permissoes)
-      .where(and(eq(permissoes.pessoa_id, pessoa_id), eq(permissoes.status, 'ativa')));
+      .where(and(
+        eq(permissoes.tenant_id, tenant_id),
+        eq(permissoes.agent_id, agent_id),
+        eq(permissoes.pessoa_id, pessoa_id),
+        eq(permissoes.status, 'ativa'),
+      ));
   },
   async byKey(pessoa_id: string, entidade_id: string): Promise<Permissao | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const rows = await db
       .select()
       .from(permissoes)
-      .where(and(eq(permissoes.pessoa_id, pessoa_id), eq(permissoes.entidade_id, entidade_id)))
+      .where(and(
+        eq(permissoes.tenant_id, tenant_id),
+        eq(permissoes.agent_id, agent_id),
+        eq(permissoes.pessoa_id, pessoa_id),
+        eq(permissoes.entidade_id, entidade_id),
+      ))
       .limit(1);
     return rows[0] ?? null;
   },
@@ -178,7 +194,16 @@ export const permissoesRepo = {
     return rows[0]!;
   },
   async updateStatus(id: string, status: Permissao['status']): Promise<void> {
-    await db.update(permissoes).set({ status }).where(eq(permissoes.id, id));
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    await db
+      .update(permissoes)
+      .set({ status })
+      .where(and(
+        eq(permissoes.id, id),
+        eq(permissoes.tenant_id, tenant_id),
+        eq(permissoes.agent_id, agent_id),
+      ));
   },
 };
 
@@ -1083,27 +1108,51 @@ export const auditRepo = {
 };
 
 export const workflowsRepo = {
+  // P83-C7: tenant-scoped workflow reads/writes.
   async create(input: Omit<Workflow, 'id' | 'tenant_id' | 'agent_id' | 'iniciado_em' | 'concluido_em'>): Promise<Workflow> {
     const guarded = applyTenantGuard(input);
     const rows = await db.insert(workflows).values(guarded).returning();
     return rows[0]!;
   },
   async byId(id: string): Promise<Workflow | null> {
-    const rows = await db.select().from(workflows).where(eq(workflows.id, id)).limit(1);
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(workflows)
+      .where(and(
+        eq(workflows.id, id),
+        eq(workflows.tenant_id, tenant_id),
+        eq(workflows.agent_id, agent_id),
+      ))
+      .limit(1);
     return rows[0] ?? null;
   },
   async setStatus(id: string, status: Workflow['status']): Promise<void> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const update: Record<string, unknown> = { status };
     if (status === 'concluido') update.concluido_em = new Date();
-    await db.update(workflows).set(update).where(eq(workflows.id, id));
+    await db
+      .update(workflows)
+      .set(update)
+      .where(and(
+        eq(workflows.id, id),
+        eq(workflows.tenant_id, tenant_id),
+        eq(workflows.agent_id, agent_id),
+      ));
   },
   async listPending(): Promise<Workflow[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     return db
       .select()
       .from(workflows)
-      .where(
+      .where(and(
+        eq(workflows.tenant_id, tenant_id),
+        eq(workflows.agent_id, agent_id),
         sql`status IN ('pendente','em_andamento','aguardando_humano','aguardando_terceiro')`,
-      );
+      ));
   },
 };
 
@@ -1320,6 +1369,34 @@ export const cognitiveCandidatesRepo = {
       .update(cognitive_candidates)
       .set({ status: 'consumed', consumed_by_phase: phase, consumed_at: new Date() })
       .where(eq(cognitive_candidates.id, id));
+  },
+
+  /**
+   * Returns the distinct (tenant_id, agent_id) pairs that own at least
+   * one pending candidate of the requested type. Used by workers that
+   * must fan out across tenants (e.g., procedure_candidate_consumer).
+   *
+   * NOTE: This method intentionally does NOT use the tenant guard —
+   * iteration is part of the worker's contract. Callers MUST invoke it
+   * once at worker startup and then wrap per-pair processing in
+   * `runWithTenantContext`. (P83-C2)
+   */
+  async listPendingTenantPairsForType(
+    candidate_type: string,
+  ): Promise<Array<{ tenant_id: string; agent_id: string }>> {
+    const rows = await db
+      .selectDistinct({
+        tenant_id: cognitive_candidates.tenant_id,
+        agent_id: cognitive_candidates.agent_id,
+      })
+      .from(cognitive_candidates)
+      .where(
+        and(
+          eq(cognitive_candidates.status, 'pending'),
+          eq(cognitive_candidates.candidate_type, candidate_type),
+        ),
+      );
+    return rows;
   },
 };
 
@@ -1676,5 +1753,322 @@ export const capabilityGapsRepo = {
       .update(agent_capability_gaps)
       .set({ current_level: new_level, last_level_change_at: new Date() })
       .where(eq(agent_capability_gaps.id, id));
+  },
+};
+
+/**
+ * Type of the status-update payload accepted by procedureDefinitionsRepo.
+ * Kept narrow so the cast at call sites (procedure-status.ts) can be removed.
+ */
+export type ProcedureStatusUpdate = {
+  status: string;
+  approved_by?: string | null;
+  approved_at?: Date | null;
+  activated_at?: Date | null;
+  deactivated_at?: Date | null;
+  proposed_by?: string | null;
+};
+
+export const procedureDefinitionsRepo = {
+  async create(
+    input: Omit<ProcedureDefinition, 'id' | 'created_at' | 'updated_at' | 'tenant_id' | 'agent_id'>,
+  ): Promise<ProcedureDefinition> {
+    const guarded = applyTenantGuard(input);
+    const [row] = await db
+      .insert(procedure_definitions)
+      .values(guarded as typeof procedure_definitions.$inferInsert)
+      .returning();
+    return row!;
+  },
+
+  async findActiveByName(nome: string): Promise<ProcedureDefinition | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(procedure_definitions)
+      .where(and(
+        eq(procedure_definitions.tenant_id, tenant_id),
+        eq(procedure_definitions.agent_id, agent_id),
+        eq(procedure_definitions.nome, nome),
+        eq(procedure_definitions.status, 'active'),
+      ))
+      .orderBy(desc(procedure_definitions.version_number))
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  /**
+   * Tenant-scoped findById. Returns null if the row exists but belongs
+   * to a different tenant/agent (P83-H5: prevent cross-tenant access by id).
+   */
+  async findById(id: string): Promise<ProcedureDefinition | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(procedure_definitions)
+      .where(and(
+        eq(procedure_definitions.id, id),
+        eq(procedure_definitions.tenant_id, tenant_id),
+        eq(procedure_definitions.agent_id, agent_id),
+      ))
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  async listByStatus(status: string, limit = 100): Promise<ProcedureDefinition[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(procedure_definitions)
+      .where(and(
+        eq(procedure_definitions.tenant_id, tenant_id),
+        eq(procedure_definitions.agent_id, agent_id),
+        eq(procedure_definitions.status, status),
+      ))
+      .orderBy(desc(procedure_definitions.created_at))
+      .limit(limit);
+  },
+
+  /**
+   * Tenant-scoped status update. (P83-H5)
+   * Returns number of affected rows so callers can detect cross-tenant
+   * attempts (0 rows updated = id belongs to another tenant or doesn't exist).
+   */
+  async updateStatus(id: string, updates: ProcedureStatusUpdate): Promise<number> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .update(procedure_definitions)
+      .set({ ...updates, updated_at: new Date() })
+      .where(and(
+        eq(procedure_definitions.id, id),
+        eq(procedure_definitions.tenant_id, tenant_id),
+        eq(procedure_definitions.agent_id, agent_id),
+      ))
+      .returning({ id: procedure_definitions.id });
+    return rows.length;
+  },
+
+  async listAllVersionsByName(nome: string): Promise<ProcedureDefinition[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(procedure_definitions)
+      .where(and(
+        eq(procedure_definitions.tenant_id, tenant_id),
+        eq(procedure_definitions.agent_id, agent_id),
+        eq(procedure_definitions.nome, nome),
+      ))
+      .orderBy(desc(procedure_definitions.version_number));
+  },
+
+  /**
+   * Atomically activate `target_id` and freeze any other active version
+   * of the same `nome` within the same tenant/agent. The whole operation
+   * runs in a single transaction with row-level locking so concurrent
+   * approvers cannot leave two rows in `status='active'`. Combined with
+   * the UNIQUE partial index `procedure_def_active_uniq_idx`, this makes
+   * dual-active a hard impossibility at both the application and DB
+   * layers. (P83-C4)
+   */
+  async atomicActivate(args: {
+    target_id: string;
+    actor: string;
+    preserve_activated_at?: boolean;
+  }): Promise<{
+    activated: ProcedureDefinition;
+    deactivated: ProcedureDefinition | null;
+  }> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const now = new Date();
+
+    return withTx(async (tx) => {
+      // 1) Lock the row we want to activate FOR UPDATE. Also confirms
+      // tenant-scope.
+      const targetRows = await tx
+        .select()
+        .from(procedure_definitions)
+        .where(and(
+          eq(procedure_definitions.id, args.target_id),
+          eq(procedure_definitions.tenant_id, tenant_id),
+          eq(procedure_definitions.agent_id, agent_id),
+        ))
+        .for('update');
+      const target = targetRows[0];
+      if (!target) {
+        throw new Error(`procedure_definition ${args.target_id} not found in current tenant`);
+      }
+
+      // 2) Lock any currently active sibling rows (same nome) so two
+      // concurrent activations serialize on this set.
+      const activeSiblings = await tx
+        .select()
+        .from(procedure_definitions)
+        .where(and(
+          eq(procedure_definitions.tenant_id, tenant_id),
+          eq(procedure_definitions.agent_id, agent_id),
+          eq(procedure_definitions.nome, target.nome),
+          eq(procedure_definitions.status, 'active'),
+          ne(procedure_definitions.id, target.id),
+        ))
+        .for('update');
+
+      let deactivated: ProcedureDefinition | null = null;
+      if (activeSiblings.length > 0) {
+        // Migrate constraint guarantees at most one, but we defensively
+        // handle a list. Freeze each, then return the first as the
+        // deactivated row.
+        for (const sib of activeSiblings) {
+          const [updated] = await tx
+            .update(procedure_definitions)
+            .set({ status: 'frozen', deactivated_at: now, updated_at: now })
+            .where(eq(procedure_definitions.id, sib.id))
+            .returning();
+          if (updated && !deactivated) deactivated = updated;
+        }
+      }
+
+      // 3) Promote the target to active. Preserve original activated_at
+      // if it was already set (H1 — keep first-activation timestamp).
+      const setPayload: ProcedureStatusUpdate & { updated_at: Date } = {
+        status: 'active',
+        approved_by: args.actor,
+        approved_at: now,
+        deactivated_at: null,
+        updated_at: now,
+      };
+      if (!args.preserve_activated_at || target.activated_at == null) {
+        setPayload.activated_at = now;
+      }
+      const [activated] = await tx
+        .update(procedure_definitions)
+        .set(setPayload)
+        .where(eq(procedure_definitions.id, target.id))
+        .returning();
+      if (!activated) {
+        throw new Error(`procedure_definition ${target.id} disappeared mid-transaction`);
+      }
+
+      // 4) Append event-sourcing rows for the audit trail (H2).
+      await tx.insert(procedure_status_events).values({
+        tenant_id,
+        agent_id,
+        definition_id: target.id,
+        from_status: target.status,
+        to_status: 'active',
+        actor: args.actor,
+      });
+      if (deactivated) {
+        await tx.insert(procedure_status_events).values({
+          tenant_id,
+          agent_id,
+          definition_id: deactivated.id,
+          from_status: 'active',
+          to_status: 'frozen',
+          actor: args.actor,
+          reason: `superseded by ${target.id}`,
+        });
+      }
+
+      return { activated, deactivated };
+    });
+  },
+};
+
+export const procedureStatusEventsRepo = {
+  async record(input: {
+    definition_id: string;
+    from_status: string;
+    to_status: string;
+    actor: string;
+    reason?: string;
+  }): Promise<void> {
+    const guarded = applyTenantGuard({
+      definition_id: input.definition_id,
+      from_status: input.from_status,
+      to_status: input.to_status,
+      actor: input.actor,
+      reason: input.reason ?? null,
+    });
+    await db.insert(procedure_status_events).values(guarded);
+  },
+
+  async listByDefinition(definition_id: string): Promise<ProcedureStatusEvent[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(procedure_status_events)
+      .where(and(
+        eq(procedure_status_events.tenant_id, tenant_id),
+        eq(procedure_status_events.agent_id, agent_id),
+        eq(procedure_status_events.definition_id, definition_id),
+      ))
+      .orderBy(desc(procedure_status_events.occurred_at));
+  },
+};
+
+export const procedureAssignmentsRepo = {
+  /**
+   * Create an assignment. P83-H6: refuses to assign a procedure whose
+   * `definition_id` belongs to a different tenant. The FK only enforces
+   * referential integrity, not tenant-isolation, so we cross-check here.
+   */
+  async create(
+    input: Omit<ProcedureAssignment, 'id' | 'activated_at' | 'tenant_id'>,
+  ): Promise<ProcedureAssignment> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+
+    // Verify the referenced definition is in the caller's tenant.
+    const defRows = await db
+      .select({
+        id: procedure_definitions.id,
+        tenant_id: procedure_definitions.tenant_id,
+        agent_id: procedure_definitions.agent_id,
+      })
+      .from(procedure_definitions)
+      .where(eq(procedure_definitions.id, input.definition_id))
+      .limit(1);
+    const def = defRows[0];
+    if (!def) {
+      throw new Error(`procedure_definition ${input.definition_id} does not exist`);
+    }
+    if (def.tenant_id !== tenant_id || def.agent_id !== agent_id) {
+      throw new Error(
+        `cross-tenant assignment refused: definition ${input.definition_id} belongs to a different tenant/agent`,
+      );
+    }
+
+    const [row] = await db
+      .insert(procedure_assignments)
+      .values({ ...input, tenant_id } as typeof procedure_assignments.$inferInsert)
+      .returning();
+    return row!;
+  },
+
+  async listForTarget(target_type: string, target_id: string): Promise<ProcedureAssignment[]> {
+    const tenant_id = getCurrentTenant();
+    return db
+      .select()
+      .from(procedure_assignments)
+      .where(and(
+        eq(procedure_assignments.tenant_id, tenant_id),
+        eq(procedure_assignments.target_type, target_type),
+        eq(procedure_assignments.target_id, target_id),
+        eq(procedure_assignments.enabled, true),
+      ));
+  },
+
+  async disable(id: string): Promise<void> {
+    await db
+      .update(procedure_assignments)
+      .set({ enabled: false, deactivated_at: new Date() })
+      .where(eq(procedure_assignments.id, id));
   },
 };

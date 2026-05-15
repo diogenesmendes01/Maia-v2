@@ -1,4 +1,9 @@
-import type { CognitiveEventType, CandidateType } from '@/types/enums.js';
+// P83-C5: Use value imports (not `import type`). The constants below
+// are referenced in `typeof CognitiveEventType.X` / `typeof CandidateType.Y`
+// type expressions; while TypeScript currently resolves those through the
+// type binding, a future flip of `verbatimModuleSyntax` would erase the
+// import and break compilation. Value imports work in both cases.
+import { CognitiveEventType, CandidateType } from '@/types/enums.js';
 
 /** Evento que dispara reflexão. Discriminated union por type. */
 export type CognitiveEvent =
@@ -123,4 +128,29 @@ export type RunModuleResult<TOut> = {
   status: 'success' | 'timeout' | 'error' | 'skipped';
   fallback_triggered: boolean;
   latency_ms: number;
+};
+
+// P3a: Procedure types
+
+export type ProcedureStep = {
+  id: string;
+  intencao: string;
+  como: string;
+  sucesso_criteria_ref?: string;
+  armadilhas?: string[];
+  tools_used?: string[];
+  depends_on?: string[];
+};
+
+export type ProcedureSuccessCriterion =
+  | { id: string; type: 'machine_check'; expression: string }
+  | { id: string; type: 'tool_result'; tool: string; expected: string }
+  | { id: string; type: 'user_signal'; signals: string[] }
+  | { id: string; type: 'llm_judge'; prompt: string; threshold: number }
+  | { id: string; type: 'human_confirmed'; requires_role: string };
+
+export type ProcedureWhenApply = {
+  conditions?: string[];
+  tags?: string[];
+  context_match?: Record<string, unknown>;
 };
