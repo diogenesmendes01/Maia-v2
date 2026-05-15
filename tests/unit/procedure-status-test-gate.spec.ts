@@ -39,6 +39,30 @@ vi.mock('@/db/repositories.js', async () => {
           definitionsState[id] = { ...definitionsState[id], ...updates };
         }
       }),
+      // P83-C4: atomicActivate is the single entry point for `→ active`
+      // transitions (locks + freezes siblings + emits event in one tx).
+      // The transitionProcedureStatus router calls it after the P3c gate
+      // passes — so this test mock has to provide it too.
+      atomicActivate: vi.fn(async (args: any) => {
+        const target = definitionsState[args.target_id];
+        if (!target) throw new Error('not found');
+        let deactivated: any = null;
+        for (const id in definitionsState) {
+          const sib = definitionsState[id];
+          if (sib.id !== target.id && sib.nome === target.nome && sib.status === 'active') {
+            sib.status = 'frozen';
+            sib.deactivated_at = new Date();
+            if (!deactivated) deactivated = sib;
+          }
+        }
+        target.status = 'active';
+        target.approved_by = args.actor;
+        target.approved_at = new Date();
+        if (!args.preserve_activated_at || !target.activated_at) {
+          target.activated_at = new Date();
+        }
+        return { activated: target, deactivated };
+      }),
       create: vi.fn(async (input: any) => {
         const id = `def-${Math.random().toString(36).slice(2)}`;
         definitionsState[id] = { id, ...input };
