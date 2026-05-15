@@ -16,6 +16,7 @@ import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 import { sha256 } from '@/lib/utils.js';
 import { mensagensRepo } from '@/db/repositories.js';
+import { runWithTenantContext } from '@/db/tenant-context.js';
 import { isDuplicate, markSeen } from './dedup.js';
 import { markRead } from './presence.js';
 import { enqueueAgent } from './queue.js';
@@ -27,6 +28,19 @@ import { routeMessageUpdate } from '@/agent/message-update.js';
 import type { WhatsAppInbound, WAQuotedContext } from './types.js';
 import { setupState } from '@/setup/state.js';
 import { triggerRecovery } from '@/setup/recovery.js';
+import { runWithTenantContext } from '@/db/tenant-context.js';
+
+/**
+ * P0 default tenant context for the WhatsApp gateway. The current Baileys
+ * deployment is single-tenant (the legacy Maia), so every inbound is mapped
+ * to the seeded `'default'` tenant/agent. P6 introduces multi-channel/
+ * multi-agent routing and will resolve the tenant from the channel config
+ * BEFORE invoking `handleIncoming` / `routeMessageUpdate`.
+ *
+ * Lives at module scope so the fix is one-line at each call site and easy
+ * to swap in P6 (a single replacement point).
+ */
+const BAILEYS_DEFAULT_CTX = { tenant_id: 'default', agent_id: 'default' } as const;
 
 let socket: WASocket | null = null;
 let connected = false;
@@ -185,10 +199,21 @@ export async function startBaileys(): Promise<void> {
 
   socket.ev.on('connection.update', handleConnectionUpdate);
 
+  // P1: Baileys ingress entry-points wrap every callback in a tenant
+  // context. The repos called by `handleIncoming`/`routeMessageUpdate`
+  // (mensagensRepo.findByWhatsappId, createInbound, …) call
+  // `getCurrentTenant()` and throw MissingTenantContextError when run
+  // outside a context — without this wrap the try/catch below would log
+  // baileys.handle_failed and silently drop every inbound message in
+  // production. P0 single-tenant: 'default'/'default' literal; P6 will
+  // resolve the tuple from the channel/JID before invoking the handler.
   socket.ev.on('messages.upsert', async ({ messages }) => {
     for (const msg of messages) {
       try {
-        await handleIncoming(msg);
+        await runWithTenantContext(
+          { tenant_id: 'default', agent_id: 'default' },
+          () => handleIncoming(msg),
+        );
       } catch (err) {
         logger.error({ err }, 'baileys.handle_failed');
       }
@@ -203,10 +228,13 @@ export async function startBaileys(): Promise<void> {
         // We synthesise an IWebMessageInfo whose `message` is the `update.message`
         // payload so routeMessageUpdate can branch on editedMessage / protocolMessage.
         // The `as never` cast is intentional — runtime structure is what matters.
-        await routeMessageUpdate({
-          key: update.key,
-          message: update.update.message,
-        } as never);
+        await runWithTenantContext(
+          { tenant_id: 'default', agent_id: 'default' },
+          () => routeMessageUpdate({
+            key: update.key,
+            message: update.update.message,
+          } as never),
+        );
       } catch (err) {
         logger.error({ err: (err as Error).message }, 'message_update.dispatch_failed');
       }

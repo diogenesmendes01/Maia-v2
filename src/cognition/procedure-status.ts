@@ -62,6 +62,19 @@ export async function transitionProcedureStatus(args: {
   actor: string;
 }): Promise<TransitionResult> {
   validateTransition(args.definition.status, args.to);
+  // P83-M6 guard: throw if invoked outside a tenant context.
+  getCurrentTenant();
+  getCurrentAgent();
+
+  if (args.to === 'active') {
+    // Atomic path: locking + freeze-previous + event log in one tx.
+    await procedureDefinitionsRepo.atomicActivate({
+      target_id: args.definition.id,
+      actor: args.actor,
+      preserve_activated_at: true,
+    });
+    return;
+  }
 
   // P3c gate: proposed → active requires green tests.
   if (args.definition.status === 'proposed' && args.to === 'active') {
@@ -76,24 +89,15 @@ export async function transitionProcedureStatus(args: {
   }
 
   const now = new Date();
-  const updates: Record<string, unknown> = { status: args.to };
+  // P83-L1: use the exported ProcedureStatusUpdate type directly instead of
+  // a `Parameters<typeof ...>[1]` lookup. Both refer to the same shape; the
+  // direct alias is clearer at the call site and easier to evolve.
+  const updates: ProcedureStatusUpdate = {
+    status: args.to,
+  };
 
   if (args.to === 'proposed') {
     updates.proposed_by = args.actor;
-  } else if (args.to === 'active') {
-    updates.approved_by = args.actor;
-    updates.approved_at = now;
-    updates.activated_at = now;
-    updates.deactivated_at = null;
-
-    // Deactivate previous active version (only one active per nome)
-    const previousActive = await procedureDefinitionsRepo.findActiveByName(args.definition.nome);
-    if (previousActive && previousActive.id !== args.definition.id) {
-      await procedureDefinitionsRepo.updateStatus(previousActive.id, {
-        status: 'frozen',
-        deactivated_at: now,
-      });
-    }
   } else if (args.to === 'frozen' || args.to === 'rolled_back') {
     updates.deactivated_at = now;
   }

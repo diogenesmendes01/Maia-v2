@@ -28,11 +28,16 @@ const outputSchema = z.object({
  * ReAct→Workflow hybrid bridge: when the model detects that a request needs
  * multiple steps over time (or across humans/days), it calls this tool to
  * persist a workflow + steps. The cron `tickEngine` then drives execution.
+ *
+ * Note: recurring scheduling (reminders, outreach, payment_due) does NOT
+ * use this tool. Those flows live in spec 18 — the `series → occurrence →
+ * task → outbox` model — invoked via `schedule_reminder`,
+ * `start_recurring_outreach`, `start_recurring_payment`.
  */
 export const startWorkflowTool: Tool<typeof inputSchema, typeof outputSchema> = {
   name: 'start_workflow',
   description:
-    'Cria um workflow multi-passo persistido para tarefas que excedem o turn-by-turn (fechamento de mês, cobrança de balancete, consolidação, follow-up). Use quando a tarefa requer >2 passos sequenciais ou aguarda evento externo. NÃO use para ações simples (registrar transação, consultar saldo).',
+    'Cria um workflow multi-passo persistido para tarefas que excedem o turn-by-turn (fechamento de mês, cobrança de balancete, consolidação, follow-up). Use quando a tarefa requer >2 passos sequenciais ou aguarda evento externo. NÃO use para ações simples (registrar transação, consultar saldo) nem para agendamentos recorrentes (use schedule_reminder / start_recurring_outreach / start_recurring_payment).',
   input_schema: inputSchema,
   output_schema: outputSchema,
   required_actions: ['schedule_reminder'],
