@@ -2,7 +2,12 @@
  * Single source of truth para enums do Maia v2.
  * Valores literais em snake_case (convention §10.10 do spec).
  * Importar daqui, nunca duplicar strings espalhadas.
+ *
+ * O padrão `const X = {} as const` + `type X = typeof X[keyof typeof X]`
+ * faz o nome viver em dois namespaces (valor + tipo). É legítimo em TS,
+ * mas `no-redeclare` (mesmo a variante TS-aware) sinaliza como conflito.
  */
+/* eslint-disable @typescript-eslint/no-redeclare */
 
 export const TenantStatus = {
   ACTIVE: 'active',
@@ -50,7 +55,14 @@ export type CandidateType = typeof CandidateType[keyof typeof CandidateType];
  * Nomes de feature flags conhecidas. Cresce conforme fases ativam.
  */
 export const FeatureFlagName = {
-  // P0 — flag de smoke test (validador do framework)
+  // P0 — flag de smoke test (validador do framework de feature flags).
+  // TODO(P1+): `P0_TENANT_GUARD_ENFORCED` é só um smoke flag — ela existe
+  // pra validar que o framework funciona ponta-a-ponta (env → singleton →
+  // isEnabled). NÃO é consultada em runtime; o `applyTenantGuard` é sempre
+  // aplicado. Quando a primeira flag real entrar (ex.: P1 reflection toggle),
+  // remover este comentário. Se este flag continuar sem caller até P2,
+  // considerar removê-lo e reescrever os testes de feature-flags.spec.ts
+  // contra a nova flag real.
   P0_TENANT_GUARD_ENFORCED: 'P0_TENANT_GUARD_ENFORCED',
 } as const;
 export type FeatureFlagName = typeof FeatureFlagName[keyof typeof FeatureFlagName];

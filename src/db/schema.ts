@@ -9,7 +9,9 @@ import {
   boolean,
   date,
   unique,
+  uniqueIndex,
   index,
+  check,
 } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 
@@ -223,7 +225,12 @@ export const agent_facts = pgTable(
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
-    uniq: unique().on(t.escopo, t.chave),
+    uniq: unique('agent_facts_tenant_agent_escopo_chave_key').on(
+      t.tenant_id,
+      t.agent_id,
+      t.escopo,
+      t.chave,
+    ),
   }),
 );
 
@@ -299,6 +306,100 @@ export const workflows = pgTable('workflows', {
   concluido_em: timestamp('concluido_em', { withTimezone: true }),
   metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
 });
+
+// Spec 18 — Scheduling: Series, Occurrences, Tasks, Outbox.
+// Lives in its own domain alongside `workflows` (which keeps dual_approval
+// and any other ad-hoc workflow types). Recurring scheduling never touches
+// `workflows` anymore — the v1 chain_id design was scrapped per spec 18 v2.
+export const series = pgTable(
+  'series',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tipo: text('tipo').notNull(),
+    status: text('status').notNull().default('active'),
+    version: integer('version').notNull().default(1),
+    rrule: text('rrule'),
+    one_shot_at: timestamp('one_shot_at', { withTimezone: true }),
+    month_end_policy: text('month_end_policy').notNull().default('skip_invalid_month'),
+    missed_run_policy: text('missed_run_policy').notNull().default('fire_latest_only'),
+    staleness_threshold_hours: integer('staleness_threshold_hours').notNull().default(24),
+    exclusive_per_destinatario: boolean('exclusive_per_destinatario').notNull().default(false),
+    contexto_template: jsonb('contexto_template').notNull().default(sql`'{}'::jsonb`),
+    entidade_id: uuid('entidade_id'),
+    owner_pessoa_id: uuid('owner_pessoa_id').notNull(),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    cancelled_at: timestamp('cancelled_at', { withTimezone: true }),
+  },
+  (t) => ({
+    by_owner_active: index('idx_series_active').on(t.owner_pessoa_id),
+  }),
+);
+
+export const occurrences = pgTable(
+  'occurrences',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    series_id: uuid('series_id').notNull(),
+    scheduled_for: timestamp('scheduled_for', { withTimezone: true }).notNull(),
+    status: text('status').notNull().default('pending'),
+    outcome: text('outcome'),
+    claimed_by: text('claimed_by'),
+    claimed_at: timestamp('claimed_at', { withTimezone: true }),
+    started_at: timestamp('started_at', { withTimezone: true }),
+    completed_at: timestamp('completed_at', { withTimezone: true }),
+    correlation_token: text('correlation_token'),
+    contexto_snapshot: jsonb('contexto_snapshot').notNull().default(sql`'{}'::jsonb`),
+    metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    by_series_sched: unique('occurrences_series_scheduled_uniq').on(t.series_id, t.scheduled_for),
+    by_due: index('idx_occurrences_due').on(t.scheduled_for),
+    by_series_status: index('idx_occurrences_series_status').on(t.series_id, t.status),
+  }),
+);
+
+export const tasks = pgTable(
+  'tasks',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    occurrence_id: uuid('occurrence_id').notNull(),
+    ordem: integer('ordem').notNull(),
+    kind: text('kind').notNull(),
+    status: text('status').notNull().default('pending'),
+    result: jsonb('result').notNull().default(sql`'{}'::jsonb`),
+    started_at: timestamp('started_at', { withTimezone: true }),
+    completed_at: timestamp('completed_at', { withTimezone: true }),
+  },
+  (t) => ({
+    by_occurrence_ordem: unique('tasks_occurrence_ordem_uniq').on(t.occurrence_id, t.ordem),
+  }),
+);
+
+export const outbox_messages = pgTable(
+  'outbox_messages',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    occurrence_id: uuid('occurrence_id'),
+    task_id: uuid('task_id'),
+    kind: text('kind').notNull(),
+    payload: jsonb('payload').notNull(),
+    status: text('status').notNull().default('pending'),
+    claimed_by: text('claimed_by'),
+    claimed_at: timestamp('claimed_at', { withTimezone: true }),
+    attempts: integer('attempts').notNull().default(0),
+    max_attempts: integer('max_attempts').notNull().default(5),
+    next_attempt_at: timestamp('next_attempt_at', { withTimezone: true }).notNull().defaultNow(),
+    last_error: text('last_error'),
+    sent_at: timestamp('sent_at', { withTimezone: true }),
+    dedup_key: text('dedup_key'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    by_due: index('idx_outbox_due').on(t.next_attempt_at),
+  }),
+);
 
 export const workflow_steps = pgTable('workflow_steps', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -460,6 +561,8 @@ export const audit_log = pgTable('audit_log', {
   alvo_id: uuid('alvo_id'),
   conversa_id: uuid('conversa_id'),
   mensagem_id: uuid('mensagem_id'),
+  // Spec 18 §7.5 — per-occurrence audit trail. Nullable; only set by scheduling flows.
+  occurrence_id: uuid('occurrence_id'),
   diff: jsonb('diff'),
   metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
   created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
@@ -492,6 +595,7 @@ export const agents = pgTable(
   },
   (t) => ({
     tenantIdIdx: index('agents_tenant_id_idx').on(t.tenant_id),
+    tenantStatusIdx: index('agents_tenant_status_idx').on(t.tenant_id, t.status),
   }),
 );
 
@@ -571,6 +675,11 @@ export const memory_entry = pgTable(
     content: text('content').notNull(),
     memory_type: text('memory_type').notNull(),
     scope_type: text('scope_type').notNull(),
+    // subject_id é nullable: é obrigatório para scope_type
+    // ∈ {conversation, interlocutor, channel, role}, e pode ser NULL para
+    // scope_type ∈ {agent, tenant} (onde tenant_id/agent_id já carregam o
+    // escopo). findRelevant em repositories.ts emite o disjunto
+    // `eq(scope_type, 'agent')` sem checar subject_id, refletindo isso.
     subject_id: text('subject_id'),
     sensitivity: text('sensitivity').notNull().default('low'),
     proactive_use: boolean('proactive_use').notNull().default(false),
@@ -718,10 +827,37 @@ export const procedure_definitions = pgTable(
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
+  // P83-C3: Drizzle definitions must mirror the SQL migration's CHECK +
+  // UNIQUE so drizzle-kit drift detection does not propose dropping them
+  // and so the types match what the database actually enforces.
   (t) => ({
     tenantAgentStatusIdx: index('procedure_def_tenant_agent_status_idx').on(t.tenant_id, t.agent_id, t.status, t.nome),
-    activeIdx: index('procedure_def_active_idx').on(t.tenant_id, t.agent_id, t.nome),
     sourceCandidateIdx: index('procedure_def_source_candidate_idx').on(t.source_candidate_id),
+    nameVersionUniq: unique('procedure_def_name_version_uniq').on(
+      t.tenant_id,
+      t.agent_id,
+      t.nome,
+      t.version_number,
+    ),
+    // P83-C4: partial UNIQUE so the DB rejects two simultaneously active
+    // versions of the same nome. Promoted from a plain partial index to
+    // a UNIQUE partial index. Migration 020 enforces this at the DB layer
+    // (CREATE UNIQUE INDEX ... WHERE status='active').
+    activeUniqIdx: uniqueIndex('procedure_def_active_uniq_idx')
+      .on(t.tenant_id, t.agent_id, t.nome)
+      .where(sql`status = 'active'`),
+    scopeCheck: check(
+      'procedure_def_scope_check',
+      sql`scope IN ('global', 'tenant', 'agent', 'role')`,
+    ),
+    statusCheck: check(
+      'procedure_def_status_check',
+      sql`status IN ('draft', 'proposed', 'active', 'frozen', 'rolled_back')`,
+    ),
+    sourceCheck: check(
+      'procedure_def_source_check',
+      sql`source IN ('ensino', 'observacao', 'pratica', 'platform_wisdom')`,
+    ),
   }),
 );
 
@@ -742,6 +878,44 @@ export const procedure_assignments = pgTable(
   (t) => ({
     targetIdx: index('procedure_assignments_target_idx').on(t.tenant_id, t.target_type, t.target_id, t.enabled),
     defIdx: index('procedure_assignments_def_idx').on(t.definition_id),
+    targetUniq: unique('procedure_assignments_target_uniq').on(
+      t.tenant_id,
+      t.definition_id,
+      t.target_type,
+      t.target_id,
+    ),
+    targetTypeCheck: check(
+      'procedure_assignments_target_type_check',
+      sql`target_type IN ('agent', 'role')`,
+    ),
+  }),
+);
+
+/**
+ * Event-sourced status transition log for procedure_definitions. Each row
+ * captures who moved the definition between which states and when.
+ * (PR #83 H1, H2)
+ */
+export const procedure_status_events = pgTable(
+  'procedure_status_events',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    definition_id: uuid('definition_id').notNull(),
+    from_status: text('from_status').notNull(),
+    to_status: text('to_status').notNull(),
+    actor: text('actor').notNull(),
+    reason: text('reason'),
+    occurred_at: timestamp('occurred_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    defIdx: index('procedure_status_events_def_idx').on(t.definition_id, t.occurred_at),
+    tenantAgentIdx: index('procedure_status_events_tenant_agent_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.occurred_at,
+    ),
   }),
 );
 

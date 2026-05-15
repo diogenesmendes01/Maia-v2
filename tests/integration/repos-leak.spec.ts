@@ -19,6 +19,13 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import pg from 'pg';
 import { mkEntidade, mkConta, mkTransacao, mkContraparte } from '../factories/db.js';
+import { runWithTenantContext } from '@/db/tenant-context.js';
+
+// P0 espalhou `getCurrentTenant()` em vários repos. Estes testes pré-P0
+// não dependem de isolamento tenant — só de entity scope. Wrapamos as
+// chamadas de repo no tenant 'default' (que carrega as rows legacy).
+const withDefaultTenant = <T>(fn: () => Promise<T>): Promise<T> =>
+  runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, fn);
 
 const SHOULD_RUN = !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
 const d = SHOULD_RUN ? describe : describe.skip;
@@ -103,7 +110,9 @@ d('repos leak suite', () => {
       const t2 = await mkTransacao(c, b.id, cb.id, { descricao: 'B1' });
       tk.transacoes.push(t2.id);
       const { transacoesRepo } = await loadRepos();
-      const out = await transacoesRepo.byScope({ pessoa_id: 'x', entidades: [a.id] });
+      const out = await withDefaultTenant(() =>
+        transacoesRepo.byScope({ pessoa_id: 'x', entidades: [a.id] }),
+      );
       expect(out.every((row) => row.entidade_id === a.id)).toBe(true);
     } finally {
       await cleanupTracked(c, tk);

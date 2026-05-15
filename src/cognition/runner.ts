@@ -11,7 +11,11 @@ export async function runCognitiveModule<TOut>(
   const timeoutMs = opts.timeoutMs ?? 30000;
   const audit = opts.audit ?? true;
   let status: RunModuleResult<TOut>['status'] = 'success';
-  let output: TOut | null = null;
+  // PR #82 review: declare output without an initial null assignment —
+  // `let foo = null` followed by an unconditional re-assignment in both
+  // try and catch arms trips `no-useless-assignment`. TS already forces
+  // a definite assignment along every reachable path.
+  let output: TOut | null;
   let fallback_triggered = false;
   let error_message: string | undefined;
 
@@ -40,6 +44,17 @@ export async function runCognitiveModule<TOut>(
 
   if (audit) {
     const ctx = tryGetCurrentContext();
+    if (!ctx) {
+      // Tenant context missing → cognitive_module_log row would land on
+      // ('default','default') silently, diverging from cognitive_candidates
+      // (whose repo throws via applyTenantGuard when context is absent).
+      // Surface the gap loudly so callers can be fixed; do NOT throw — the
+      // primary module already ran and the user-facing path must not break.
+      logger.warn(
+        { module: opts.name },
+        'runner.audit_missing_tenant_context_fallback_default',
+      );
+    }
     try {
       await cognitiveModuleLogRepo.record({
         tenant_id: ctx?.tenant_id ?? 'default',
