@@ -7,6 +7,7 @@ import { handleQuarantineFirstContact, handleOwnerIdentityReply } from '@/identi
 import { config } from '@/config/env.js';
 import { clearDebounceState } from '@/gateway/debouncer.js';
 import { buildPrompt } from './prompt-builder.js';
+import { hashScope } from './scope-hash.js';
 import { logger } from '@/lib/logger.js';
 import type { Mensagem } from '@/db/schema.js';
 import { audit } from '@/governance/audit.js';
@@ -343,6 +344,22 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
 
   await markAllProcessed(totalTokens);
   await conversasRepo.touch(c.id);
+  // Issue #73 — persist the scope hash for the *next* turn's sentinel check.
+  // Merge (jsonb ||) instead of overwrite so concurrent writers don't clobber
+  // unrelated metadata keys (e.g. pending_question). The hash itself is
+  // last-writer-wins, which is fine: we want the freshest finished turn's
+  // scope to be the baseline for comparison.
+  try {
+    await conversasRepo.mergeMetadata(c.id, {
+      last_scope_hash: hashScope(scope),
+      last_scope_hash_set_at: new Date().toISOString(),
+    });
+  } catch (err) {
+    logger.warn(
+      { err: (err as Error).message, conversa_id: c.id },
+      'agent.scope_hash_persist_failed',
+    );
+  }
   await clearDebounceState(pessoa.telefone_whatsapp);
 
   // Reflection trigger: correction detection (real-time)

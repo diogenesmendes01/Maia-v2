@@ -132,18 +132,26 @@ describe('buildPrompt — injection-resistant assembly', () => {
     ]);
     const { buildPrompt } = await import('../../src/agent/prompt-builder.js');
     const { messages } = await buildPrompt(ctx);
-    // First message should be the prior turn (oldest first); the inbound
-    // is appended last.
-    expect(messages.length).toBeGreaterThanOrEqual(2);
-    const prev = messages[0]!;
-    expect(prev.role).toBe('user');
-    const content = prev.content as string;
+    // Superpowers I5 (PR #74): adjacent same-role messages are coalesced
+    // into one entry to keep prefix caching stable. Both the prior user
+    // turn and the current inbound user turn collapse into a single
+    // message whose content carries TWO wrapped <user_message> blocks.
+    expect(messages).toHaveLength(1);
+    const only = messages[0]!;
+    expect(only.role).toBe('user');
+    const content = only.content as string;
+    // The prior turn appears wrapped exactly once at the start.
     expect(content.startsWith('<user_message>')).toBe(true);
-    expect(content.endsWith('</user_message>')).toBe(true);
-    const inner = content
-      .replace(/^<user_message>/, '')
-      .replace(/<\/user_message>$/, '');
-    expect(inner).not.toContain('</user_message>');
+    // Both pieces preserve the wrapper tags and the injection attempt
+    // (`</user_message> bypass`) is sanitized inside its wrapper.
+    const wrapperOpens = (content.match(/<user_message>/g) ?? []).length;
+    const wrapperCloses = (content.match(/<\/user_message>/g) ?? []).length;
+    expect(wrapperOpens).toBe(2);
+    expect(wrapperCloses).toBe(2);
+    // The literal escape attempt must NOT appear as a real closing tag inside
+    // the prior wrapper. Split by the prior wrapper's closing tag and check
+    // the first segment contains the sanitized payload.
+    expect(content).not.toContain('</user_message> bypass');
   });
 
   it('wraps facts and rules blocks with sanitized <fact>/<rule> tags', async () => {

@@ -1,4 +1,4 @@
-import { pendingQuestionsRepo } from '@/db/repositories.js';
+import { mensagensRepo, pendingQuestionsRepo } from '@/db/repositories.js';
 import type { Pessoa, Conversa, Mensagem } from '@/db/schema.js';
 import { audit } from '@/governance/audit.js';
 import type { ResolvedPermission } from '@/governance/permissions.js';
@@ -9,6 +9,10 @@ import { REGISTRY } from '@/tools/_registry.js';
 import { sendReaction } from '@/gateway/presence.js';
 import { uuid } from '@/lib/utils.js';
 import { dispatchOutput, type LatestPending, type LatestReportPdf } from './output-dispatch.js';
+import {
+  buildToolSummary,
+  type ToolExecutionSummary,
+} from './tool-execution-summary.js';
 
 export const MAX_REACT_ITERATIONS = 5;
 
@@ -32,6 +36,60 @@ export type RunReActLoopParams = {
  * Returns the total tokens consumed across iterations so the caller can
  * persist it via `mensagensRepo.markProcessed`.
  */
+/**
+ * Codex C1 (PR #74): persist accumulated tool summaries to `mensagens.ferramentas_chamadas`
+ * when no outbound assistant message gets dispatched (iteration-cap reached,
+ * LLM returned empty final text, or a downstream outbound failure occurs).
+ * Without this flush, side-effecting tools (writes, communications) that
+ * already committed would have no persisted event, letting the NEXT turn
+ * re-attempt or deny an already-completed backend action — the exact
+ * failure mode this PR was meant to fix.
+ *
+ * The placeholder row has `direcao='out'` and `tipo='evento'` with empty
+ * `conteudo`, so it never surfaces to the LLM as an assistant text turn
+ * (prompt-builder ignores empty `conteudo` for the messages array) — but
+ * it IS surfaced via `recentInConversation` so the events block reidrates
+ * the summaries on the next turn.
+ *
+ * Best-effort: a persistence failure here is logged but not re-thrown.
+ * The audit trail (already written by the loop) is the durable evidence;
+ * losing the next-turn anchor is the soft failure mode.
+ */
+async function flushUnconfirmedToolSummaries(
+  conversa_id: string,
+  inbound_id: string,
+  toolSummaries: ToolExecutionSummary[],
+  reason: 'iteration_cap' | 'empty_final_text' | 'outbound_failure',
+): Promise<void> {
+  if (toolSummaries.length === 0) return;
+  try {
+    await mensagensRepo.create({
+      conversa_id,
+      direcao: 'out',
+      tipo: 'evento',
+      conteudo: '',
+      midia_url: null,
+      metadata: {
+        in_reply_to: inbound_id,
+        event_only: true,
+        flush_reason: reason,
+      },
+      processada_em: new Date(),
+      ferramentas_chamadas: toolSummaries,
+      tokens_usados: null,
+    });
+    logger.info(
+      { conversa_id, inbound_id, count: toolSummaries.length, reason },
+      'agent.tool_summaries_flushed_no_outbound',
+    );
+  } catch (err) {
+    logger.warn(
+      { err: (err as Error).message, conversa_id, reason },
+      'agent.tool_summaries_flush_failed',
+    );
+  }
+}
+
 export async function runReActLoop(params: RunReActLoopParams): Promise<{ totalTokens: number }> {
   const { pessoa, conversa: c, inbound, jid, system, messages, tools } = params;
   let totalTokens = 0;
@@ -40,6 +98,13 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<{ totalT
   let turnHasSensitive = false;
   const sensitiveTools: string[] = [];
   let latestReportPdf: LatestReportPdf | null = null;
+  // Issue #73 — structured per-tool outcomes accumulated across all loop
+  // iterations. Persisted on the outbound assistant message as
+  // `ferramentas_chamadas` so the NEXT turn can reidrate them in the
+  // system prompt's "## Eventos confirmados pelo backend" block.
+  const toolSummaries: ToolExecutionSummary[] = [];
+  let outboundDispatched = false;
+  let exitReason: 'normal' | 'iteration_cap' | 'empty_final_text' = 'normal';
 
   for (let i = 0; i < MAX_REACT_ITERATIONS; i++) {
     const res = await callLLM({
@@ -54,17 +119,33 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<{ totalT
     if (res.tool_uses.length === 0) {
       const text = res.content?.trim() ?? '';
       if (text) {
-        await dispatchOutput({
-          pessoa,
-          conversa: c,
-          inbound,
-          jid,
-          text,
-          latestPending,
-          latestReportPdf,
-          turnHasSensitive,
-          sensitiveTools,
-        });
+        try {
+          await dispatchOutput({
+            pessoa,
+            conversa: c,
+            inbound,
+            jid,
+            text,
+            latestPending,
+            latestReportPdf,
+            turnHasSensitive,
+            sensitiveTools,
+            toolSummaries,
+          });
+          outboundDispatched = true;
+        } catch (err) {
+          // Codex C1: outbound failure must NOT drop the persisted
+          // ferramentas_chamadas — flush them via the placeholder row so
+          // the next turn still sees the events block.
+          logger.warn(
+            { err: (err as Error).message, conversa_id: c.id, inbound_id: inbound.id },
+            'agent.dispatch_output_failed_flushing_summaries',
+          );
+          await flushUnconfirmedToolSummaries(c.id, inbound.id, toolSummaries, 'outbound_failure');
+          throw err;
+        }
+      } else {
+        exitReason = 'empty_final_text';
       }
       break;
     }
@@ -83,6 +164,11 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<{ totalT
     // Execute tools and add results
     const results = [];
     for (const tu of res.tool_uses) {
+      // Superpowers I4 (PR #74): capture the dispatch START timestamp so the
+      // summary's `occurred_at` reflects when the side effect was requested,
+      // not when it completed. Matters for long-running tools whose
+      // completion straddles the events-block 24h window boundary.
+      const dispatched_at = Date.now();
       const out = await dispatchTool({
         tool: tu.tool,
         args: tu.args,
@@ -185,6 +271,23 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<{ totalT
         content: JSON.stringify(out),
         is_error: isError,
       });
+
+      // Issue #73 — accumulate a structured summary for next-turn persistence.
+      // Side-effect 'none' tools (parse_only) still get summarized to keep
+      // the audit trail intact; the prompt-builder events-block filters by
+      // priority later.
+      toolSummaries.push(
+        buildToolSummary({
+          tool_call_id: tu.id,
+          tool_name: tu.tool,
+          side_effect: tool?.side_effect ?? 'none',
+          args: tu.args,
+          result: out,
+          status: isError ? 'error' : 'success',
+          dispatched_at,
+        }),
+      );
+
       await audit({
         acao: (isError ? 'unauthorized_access_attempt' : 'classification_suggested') as never,
         pessoa_id: pessoa.id,
@@ -194,6 +297,24 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<{ totalT
       });
     }
     conversation.push({ role: 'user', content: results });
+    // If we completed the final iteration with tool_uses, we'll exit the
+    // for-loop without dispatching outbound. Mark for the flush path.
+    if (i === MAX_REACT_ITERATIONS - 1) {
+      exitReason = 'iteration_cap';
+    }
+  }
+
+  // Codex C1 (PR #74): when no outbound was dispatched but tools ran, persist
+  // their summaries via a placeholder event row so the next turn's
+  // prompt-builder still surfaces them in the "## Eventos confirmados pelo
+  // backend" block. Covers iteration-cap and empty-final-text paths.
+  if (!outboundDispatched && toolSummaries.length > 0) {
+    await flushUnconfirmedToolSummaries(
+      c.id,
+      inbound.id,
+      toolSummaries,
+      exitReason === 'iteration_cap' ? 'iteration_cap' : 'empty_final_text',
+    );
   }
 
   return { totalTokens };
