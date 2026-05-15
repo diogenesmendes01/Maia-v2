@@ -58,7 +58,13 @@ export async function classifyMemory(content: string): Promise<ClassifierOutput 
     },
   );
 
-  // Conservative fallback: classifier failed → treat as personal+restricted
+  // Conservative fallback: classifier failed → treat as personal+restricted.
+  // Nota: a tabela aceita memory_type='unknown' (usado pela migração 017 para
+  // legacy facts pendentes de revisão), mas aqui escolhemos 'personal' em vez
+  // de 'unknown' porque o classificador rodando em runtime já passa pelo
+  // persister normal — quem grava precisa de mention_allowed=false explícito,
+  // não do gate needs_review. 'unknown' fica reservado pra rows que ainda
+  // precisam passar pelo legacy-memory-reclassifier.
   if (result.output === null) {
     return {
       memory_type: 'personal',

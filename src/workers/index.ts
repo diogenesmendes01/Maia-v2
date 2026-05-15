@@ -10,6 +10,9 @@ import { runReflectionBatch } from './reflection-batch.js';
 import { runPatternDetector } from './pattern-detector.js';
 import { runMessageRecovery } from './message-recovery.js';
 import { runPendingReminder } from './pending-reminder.js';
+import { runScheduling } from './scheduling-tick.js';
+import { runOutboxDrainWorker } from './outbox-drain-worker.js';
+import { runSeriesNextSchedulerWorker } from './series-next-scheduler.js';
 import { runNightlyBackup, runCloudBackupRotation } from './backup.js';
 import { runCostMonitor } from './cost-monitor.js';
 import { runAuditWatcher } from './audit-watcher.js';
@@ -31,11 +34,25 @@ export const JOBS: Job[] = [
   { name: 'pending_expirer', cron: '*/1 * * * *', fn: runPendingExpirer, phase: 1 },
   { name: 'message_recovery', cron: '*/2 * * * *', fn: runMessageRecovery, phase: 1 },
   { name: 'pending_reminder', cron: '*/30 * * * *', fn: runPendingReminder, phase: 1 },
+  // Spec 18 §10 — three scheduling workers:
+  //  - scheduling_tick: every minute, claims due occurrences and advances
+  //    state (also reclaims expired occurrence leases in the same pass).
+  //  - outbox_drain: every minute, drains pending outbox messages under
+  //    backpressure (also reclaims expired outbox leases in the same pass).
+  //  - series_next_scheduler: every 10 min, backfills missing next-cycle
+  //    occurrences for any active series whose chain was broken by a
+  //    failure between completion and re-schedule.
+  // Scheduling tables (series/occurrences/tasks/outbox_messages) ainda não
+  // têm tenant_id em P0 — workers rodam fora de tenant context.
+  { name: 'scheduling_tick', cron: '* * * * *', fn: runScheduling, phase: 1 },
+  { name: 'outbox_drain', cron: '* * * * *', fn: runOutboxDrainWorker, phase: 1 },
+  { name: 'series_next_scheduler', cron: '*/10 * * * *', fn: runSeriesNextSchedulerWorker, phase: 1 },
   {
     name: 'workflow_engine_tick',
     cron: '*/30 * * * * *',
     fn: async () => {
       // P0: single-tenant default. P6 will fan-out per tenant.
+      // tickEngine() acessa workflows/workflow_steps (tabelas tenant-aware).
       await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
         await tickEngine();
       });
@@ -64,6 +81,10 @@ export const JOBS: Job[] = [
   { name: 'briefing_morning', cron: '0 8 * * *', fn: runMorningBriefing, phase: 4 },
   { name: 'briefing_evening', cron: '0 21 * * *', fn: runEveningBriefing, phase: 4 },
   { name: 'briefing_weekly', cron: '0 8 * * 1', fn: runWeeklyBriefing, phase: 4 },
+  // P4 Task 10 — drift monitor semanal (domingo 03:00 BRT).
+  { name: 'drift_monitor', cron: '0 3 * * 0', fn: runDriftMonitor, phase: 4 },
+  // P5 Task 9 — gap escalation monitor (a cada 30min).
+  { name: 'gap_escalation_monitor', cron: '*/30 * * * *', fn: runGapEscalationMonitor, phase: 5 },
 ];
 
 const tasks: cron.ScheduledTask[] = [];

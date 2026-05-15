@@ -4,6 +4,8 @@ import {
   procedureExecutionsRepo,
   procedureDefinitionsRepo,
   procedureSelectorDecisionsRepo,
+  channelPoliciesRepo,
+  rolesRepo,
 } from '@/db/repositories.js';
 import { resolveScope } from '@/governance/permissions.js';
 import { checkPendingFirst } from '@/agent/pending-gate.js';
@@ -11,10 +13,15 @@ import { checkRateLimit, formatPoliteReply } from '@/gateway/rate-limit.js';
 import { resolveIdentity } from '@/identity/resolver.js';
 import { handleQuarantineFirstContact, handleOwnerIdentityReply } from '@/identity/quarantine.js';
 import { config } from '@/config/env.js';
+import { featureFlags } from '@/config/feature-flags.js';
+import { FeatureFlagName } from '@/types/enums.js';
 import { clearDebounceState } from '@/gateway/debouncer.js';
 import { buildPrompt } from './prompt-builder.js';
+import { hashScope } from './scope-hash.js';
 import { logger } from '@/lib/logger.js';
-import type { Mensagem, ProcedureExecution } from '@/db/schema.js';
+import type { Mensagem, ProcedureExecution, Role } from '@/db/schema.js';
+import { resolveChannel } from '@/gateway/channel-resolver.js';
+import { selectRole } from '@/cognition/role-selector/engine.js';
 import { audit } from '@/governance/audit.js';
 import { getToolSchemas } from '@/tools/_registry.js';
 import { startTyping } from '@/gateway/presence.js';
@@ -28,13 +35,19 @@ import { reflect } from '@/cognition/reflector.js';
 import { classify } from '@/cognition/classifier.js';
 import { persistCandidate } from '@/cognition/persister.js';
 import { recordSuccess } from '@/cognition/capability-tracker.js';
-import { selectProcedure } from '@/cognition/procedure-selector.js';
+import { selectProcedure, type SelectorDecision } from '@/cognition/procedure-selector.js';
 import { evaluateCurrentStep } from '@/cognition/step-evaluator.js';
 import * as procedureEngine from '@/procedures/engine.js';
 import { CognitiveEventType } from '@/types/enums.js';
 import { sendOutbound } from './output-dispatch.js';
 import { runReActLoop } from './react-loop.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
+import { db } from '@/db/client.js';
+import { mensagens } from '@/db/schema.js';
+import { eq } from 'drizzle-orm';
+import { runNodes } from '@/cognitive-graph/orchestrator.js';
+import { buildPreturnNodes, type PreturnContext } from '@/cognitive-graph/preturn-graph.js';
+import { buildPostturnNodes } from '@/cognitive-graph/postturn-graph.js';
 
 const TYPING_DEBOUNCE_MS = 1500;
 
@@ -141,17 +154,73 @@ function scheduleTypingDebounce(jid: string, mensagem_id: string): () => void {
 
 export const _internal = { scheduleTypingDebounce, sendOutbound, aggregateUnprocessedTexts };
 
+/**
+ * Probe-only cross-tenant read of `mensagens.metadata` for the channel resolver.
+ *
+ * P6 Task 9: roda ANTES de `runWithTenantContext`, portanto bypassa
+ * `applyTenantGuard` deliberadamente (mesma justificativa do
+ * `channelsRepo.findByExternalCrossTenant` — entry point precisa descobrir
+ * qual tenant antes de poder operar dentro dele).
+ *
+ * Retorna apenas o suficiente para chamar `resolveChannel`. Qualquer falha
+ * (mensagem ausente, sem `metadata.telefone`, erro de DB) devolve null —
+ * o caller cai em legacy default/default.
+ */
+async function probeMessageForChannel(
+  mensagem_id: string,
+): Promise<{ channel_type: 'whatsapp'; external_id: string } | null> {
+  try {
+    const rows = await db
+      .select({ metadata: mensagens.metadata })
+      .from(mensagens)
+      .where(eq(mensagens.id, mensagem_id))
+      .limit(1);
+    if (rows.length === 0) return null;
+    const md = (rows[0]!.metadata ?? {}) as Record<string, unknown>;
+    const tel = typeof md['telefone'] === 'string' ? (md['telefone'] as string) : null;
+    if (!tel) return null;
+    return { channel_type: 'whatsapp', external_id: tel };
+  } catch {
+    return null;
+  }
+}
+
 export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
-  // P0: 'default' is the only tenant/agent — single-tenant deployment.
-  // P6 introduces multi-channel/multi-agent and will route via channel→tenant
-  // resolution before this function is invoked.
+  // P6 Task 9: roteamento via channel resolver quando flag MULTI_CHANNEL ON.
+  // O resolver é o entry point — roda ANTES de existir tenant context (faz
+  // cross-tenant lookup propositalmente). Falhas caem em default/default
+  // (legacy) para preservar compat com P0..P5 quando o canal não está
+  // registrado em `channels`.
+  let resolved: { tenant_id: string; agent_id: string; channel_id: string | null } = {
+    tenant_id: 'default',
+    agent_id: 'default',
+    channel_id: null,
+  };
+
+  if (featureFlags.isEnabled(FeatureFlagName.MULTI_CHANNEL)) {
+    try {
+      const probe = await probeMessageForChannel(mensagem_id);
+      if (probe) {
+        resolved = await resolveChannel(probe);
+      }
+    } catch (err) {
+      logger.warn(
+        { mensagem_id, err: (err as Error).message },
+        'agent.channel_resolution_failed_fallback_default',
+      );
+    }
+  }
+
   await runWithTenantContext(
-    { tenant_id: 'default', agent_id: 'default' },
-    () => runAgentForMensagemInner(mensagem_id),
+    { tenant_id: resolved.tenant_id, agent_id: resolved.agent_id },
+    () => runAgentForMensagemInner(mensagem_id, resolved.channel_id),
   );
 }
 
-async function runAgentForMensagemInner(mensagem_id: string): Promise<void> {
+async function runAgentForMensagemInner(
+  mensagem_id: string,
+  channel_id: string | null = null,
+): Promise<void> {
   const inbound = await mensagensRepo.findById(mensagem_id);
   if (!inbound) {
     logger.warn({ mensagem_id }, 'agent.message_not_found');
@@ -271,7 +340,17 @@ async function runAgentForMensagemInner(mensagem_id: string): Promise<void> {
   // parallel with response generation). Sees the post-aggregation
   // `inbound.conteudo` so signals across chunked turns are captured.
   // Errors are swallowed — reflection MUST never block the user-facing reply.
-  if (inbound.conteudo && detectSuccess(inbound.conteudo)) {
+  //
+  // P7 Task 8 — quando FEATURE_COGNITIVE_GRAPH ON, este trigger é executado
+  // pelo postturn-graph (mais abaixo) com semântica fire-and-forget equivalente.
+  // Shift de timing: legacy roda ANTES do ReAct, graph roda APÓS o ReAct. Ambos
+  // são fire-and-forget e não afetam o output user-facing — apenas a ordering
+  // de gravação em DB muda, aceitável por não-regressão de comportamento.
+  if (
+    !featureFlags.isEnabled(FeatureFlagName.COGNITIVE_GRAPH) &&
+    inbound.conteudo &&
+    detectSuccess(inbound.conteudo)
+  ) {
     const signal = inbound.conteudo;
     void (async () => {
       try {
@@ -333,114 +412,266 @@ async function runAgentForMensagemInner(mensagem_id: string): Promise<void> {
     await clearDebounceState(pessoa.telefone_whatsapp);
     return;
   }
-  // 'unresolved' and 'no_pending' fall through to the existing ReAct flow.
+  // 'unresolved' and 'no_pending' fall through.
+
+  // Blocker 9 — Scheduling inbound hook (spec 18 §7.4). When the inbound
+  // is a text from someone who has at least one `recurring_outreach`
+  // occurrence in `awaiting_third_party`, try to attach the response.
+  // Three outcomes:
+  //  - routed: response captured, occurrence advances; we DON'T short-
+  //    circuit the LLM turn (the LLM can still acknowledge to the sender).
+  //  - disambiguation_requested: owner was prompted; we still let the LLM
+  //    answer the sender so they don't get silence.
+  //  - no_match: no scheduling state cares about this inbound; continue.
+  if (config.FEATURE_SCHEDULING_V2 && inbound.tipo === 'texto' && inbound.conteudo) {
+    try {
+      const { captureInboundForOutreach } = await import('@/scheduling/disambiguation.js');
+      const ownerId = config.OWNER_TELEFONE_WHATSAPP;
+      const owner = await (await import('@/db/repositories.js')).pessoasRepo.findByPhone(ownerId);
+      if (owner) {
+        await captureInboundForOutreach({
+          sender: pessoa,
+          inbound,
+          owner_pessoa_id: owner.id,
+        });
+      }
+    } catch (err) {
+      logger.warn(
+        { err: (err as Error).message, mensagem_id: inbound.id },
+        'agent.scheduling_inbound_hook_failed',
+      );
+    }
+  }
 
   const scope = await resolveScope(pessoa);
 
-  // P3b Task 9 — PRE-TURN selector:
-  // Resolve whether a procedure should be active for this turn. The
-  // selector consults the current active execution (if any) and the
-  // assigned procedures for this agent. Its decision (start/continue/
-  // switch/escalate/none) is recorded for auditability. If a new
-  // procedure should start, we kick off the execution BEFORE buildPrompt
-  // so the system prompt picks up the new procedure's first step.
+  // P3b Task 9 / P6 Task 9 / P7 Task 8 — PRE-TURN cognitive modules:
+  // resolve procedure-selector + role-selector (when MULTI_CHANNEL on).
   //
-  // Fully wrapped in try/catch — procedure runtime must never break the
-  // baseline ReAct turn. Failures here just leave `activeExecution=null`.
+  // Dual-path: quando FEATURE_COGNITIVE_GRAPH ON, orquestração é declarativa
+  // via `runNodes(buildPreturnNodes(...))`; OFF mantém path legacy intacto
+  // (try/catch ad-hoc por módulo). Side effects de DB (record decision,
+  // start/abort execution, etc.) acontecem APÓS o grafo retornar, lendo
+  // `result.nodes[name].output` — mantém paridade byte-por-byte com legacy.
+  //
+  // Procedure runtime nunca pode derrubar o baseline ReAct turn. Failures
+  // só deixam `activeExecution=null` / `activeRole=null`.
   let activeExecution: ProcedureExecution | null = null;
-  // P84-Op: kill switch. When FEATURE_PROCEDURE_RUNTIME=false, the entire
-  // selector/engine/evaluator wire-up no-ops so the system can be turned
-  // off in prod (zombie executions piling up, runtime bug, etc.) without
-  // a code revert. The baseline ReAct turn proceeds unchanged.
-  if (config.FEATURE_PROCEDURE_RUNTIME) {
-   try {
-    activeExecution = await procedureExecutionsRepo.findActiveForConversa(c.id);
-    const selectorResult = await selectProcedure({
-      conversa_id: c.id,
-      current_message: inbound.conteudo ?? '',
-      current_execution: activeExecution
-        ? {
-            id: activeExecution.id,
-            definition_id: activeExecution.definition_id,
-            status: activeExecution.status,
-          }
-        : null,
-    });
+  let activeRole: Role | null = null;
 
-    await procedureSelectorDecisionsRepo
-      .record({
+  if (featureFlags.isEnabled(FeatureFlagName.COGNITIVE_GRAPH)) {
+    // P7 path — orquestração via grafo declarativo.
+    try {
+      activeExecution = await procedureExecutionsRepo.findActiveForConversa(c.id);
+      const role_inputs = await buildRoleInputs(channel_id);
+      const nodes = buildPreturnNodes({
+        multi_channel_on: featureFlags.isEnabled(FeatureFlagName.MULTI_CHANNEL),
+      });
+      const ctx: PreturnContext = {
         conversa_id: c.id,
         turno_id: inbound.id,
-        current_execution_id: activeExecution?.id ?? null,
-        candidates: selectorResult.candidates as unknown,
-        conflicts: selectorResult.conflicts as unknown,
-        decision: selectorResult.decision,
-        selected_procedure_id: selectorResult.selected_procedure_id ?? null,
-        decided_by: 'selector_llm',
-        reason: selectorResult.reason,
-      } as never)
-      .catch((err) =>
-        logger.warn(
-          { err: (err as Error).message },
-          'procedure.selector_decision.persist_failed',
-        ),
-      );
+        inbound_text: inbound.conteudo ?? '',
+        current_execution: activeExecution
+          ? {
+              id: activeExecution.id,
+              definition_id: activeExecution.definition_id,
+              status: activeExecution.status,
+            }
+          : null,
+        ...(role_inputs ? { role_inputs } : {}),
+      };
+      const result = await runNodes(nodes, ctx);
 
-    if (
-      selectorResult.decision === 'start' &&
-      selectorResult.selected_procedure_id
-    ) {
-      const def = await procedureDefinitionsRepo.findById(
-        selectorResult.selected_procedure_id,
-      );
-      if (def) {
-        const steps = def.steps as unknown as Array<{ id: string }>;
-        const firstStep = steps[0]?.id ?? null;
-        // P84-C2: startExecution returns { execution, created }. On a
-        // concurrent-start race, `created=false` and we adopt the
-        // execution that the winning worker just inserted instead of
-        // creating a duplicate.
-        const started = await procedureEngine.startExecution({
-          definition_id: def.id,
-          definition_version: def.version_number,
-          conversa_id: c.id,
-          first_step_id: firstStep,
-        });
-        activeExecution = started.execution;
+      // Side effects POST-graph — mesma semântica do path legacy.
+      const selectorOutput = result.nodes['procedure-selector']?.output as
+        | SelectorDecision
+        | null;
+      if (selectorOutput) {
+        await procedureSelectorDecisionsRepo
+          .record({
+            conversa_id: c.id,
+            turno_id: inbound.id,
+            current_execution_id: activeExecution?.id ?? null,
+            candidates: selectorOutput.candidates as unknown,
+            conflicts: selectorOutput.conflicts as unknown,
+            decision: selectorOutput.decision,
+            selected_procedure_id: selectorOutput.selected_procedure_id ?? null,
+            decided_by: 'selector_llm',
+            reason: selectorOutput.reason,
+          } as never)
+          .catch((err) =>
+            logger.warn(
+              { err: (err as Error).message },
+              'procedure.selector_decision.persist_failed',
+            ),
+          );
+
+        if (
+          selectorOutput.decision === 'start' &&
+          selectorOutput.selected_procedure_id
+        ) {
+          const def = await procedureDefinitionsRepo.findById(
+            selectorOutput.selected_procedure_id,
+          );
+          if (def) {
+            const steps = def.steps as unknown as Array<{ id: string }>;
+            activeExecution = await procedureEngine.startExecution({
+              definition_id: def.id,
+              definition_version: def.version_number,
+              conversa_id: c.id,
+              first_step_id: steps[0]?.id ?? null,
+            });
+          }
+        } else if (
+          selectorOutput.decision === 'switch' &&
+          selectorOutput.selected_procedure_id &&
+          activeExecution
+        ) {
+          await procedureEngine.abortExecution({
+            execution_id: activeExecution.id,
+            reason: 'switched_by_selector',
+          });
+          const def = await procedureDefinitionsRepo.findById(
+            selectorOutput.selected_procedure_id,
+          );
+          if (def) {
+            const steps = def.steps as unknown as Array<{ id: string }>;
+            activeExecution = await procedureEngine.startExecution({
+              definition_id: def.id,
+              definition_version: def.version_number,
+              conversa_id: c.id,
+              first_step_id: steps[0]?.id ?? null,
+            });
+          }
+        }
       }
-    } else if (
-      selectorResult.decision === 'switch' &&
-      selectorResult.selected_procedure_id &&
-      activeExecution
-    ) {
-      await procedureEngine.abortExecution({
-        execution_id: activeExecution.id,
-        reason: 'switched_by_selector',
-      });
-      const def = await procedureDefinitionsRepo.findById(
-        selectorResult.selected_procedure_id,
+
+      const roleResult = result.nodes['role-selector']?.output as
+        | { decided_role: Role }
+        | null;
+      if (roleResult) activeRole = roleResult.decided_role;
+    } catch (err) {
+      logger.warn(
+        { err: (err as Error).message, conversa_id: c.id },
+        'preturn.graph_failed',
       );
-      if (def) {
-        const steps = def.steps as unknown as Array<{ id: string }>;
-        const firstStep = steps[0]?.id ?? null;
-        const started = await procedureEngine.startExecution({
-          definition_id: def.id,
-          definition_version: def.version_number,
+    }
+  } else {
+    // LEGACY path (P0..P6) — intacto. NÃO REMOVER.
+    try {
+      activeExecution = await procedureExecutionsRepo.findActiveForConversa(c.id);
+      const selectorResult = await selectProcedure({
+        conversa_id: c.id,
+        current_message: inbound.conteudo ?? '',
+        current_execution: activeExecution
+          ? {
+              id: activeExecution.id,
+              definition_id: activeExecution.definition_id,
+              status: activeExecution.status,
+            }
+          : null,
+      });
+
+      await procedureSelectorDecisionsRepo
+        .record({
           conversa_id: c.id,
-          first_step_id: firstStep,
+          turno_id: inbound.id,
+          current_execution_id: activeExecution?.id ?? null,
+          candidates: selectorResult.candidates as unknown,
+          conflicts: selectorResult.conflicts as unknown,
+          decision: selectorResult.decision,
+          selected_procedure_id: selectorResult.selected_procedure_id ?? null,
+          decided_by: 'selector_llm',
+          reason: selectorResult.reason,
+        } as never)
+        .catch((err) =>
+          logger.warn(
+            { err: (err as Error).message },
+            'procedure.selector_decision.persist_failed',
+          ),
+        );
+
+      if (
+        selectorResult.decision === 'start' &&
+        selectorResult.selected_procedure_id
+      ) {
+        const def = await procedureDefinitionsRepo.findById(
+          selectorResult.selected_procedure_id,
+        );
+        if (def) {
+          const steps = def.steps as unknown as Array<{ id: string }>;
+          const firstStep = steps[0]?.id ?? null;
+          activeExecution = await procedureEngine.startExecution({
+            definition_id: def.id,
+            definition_version: def.version_number,
+            conversa_id: c.id,
+            first_step_id: firstStep,
+          });
+        }
+      } else if (
+        selectorResult.decision === 'switch' &&
+        selectorResult.selected_procedure_id &&
+        activeExecution
+      ) {
+        await procedureEngine.abortExecution({
+          execution_id: activeExecution.id,
+          reason: 'switched_by_selector',
         });
-        activeExecution = started.execution;
+        const def = await procedureDefinitionsRepo.findById(
+          selectorResult.selected_procedure_id,
+        );
+        if (def) {
+          const steps = def.steps as unknown as Array<{ id: string }>;
+          const firstStep = steps[0]?.id ?? null;
+          activeExecution = await procedureEngine.startExecution({
+            definition_id: def.id,
+            definition_version: def.version_number,
+            conversa_id: c.id,
+            first_step_id: firstStep,
+          });
+        }
+      }
+      // 'continue', 'escalate', 'none' → no engine action here. continue
+      // keeps the existing activeExecution; escalate/none leave it null
+      // (or unchanged) and the turn proceeds without a procedure.
+    } catch (err) {
+      logger.warn(
+        { err: (err as Error).message, conversa_id: c.id },
+        'procedure.preturn.failed',
+      );
+    }
+
+    // P6 Task 9: Resolve active role for this turn — only when flag ON AND
+    // channel resolver returned a real channel_id. Failures degrade silently
+    // to "no role section in prompt" — role injection is non-essential.
+    if (featureFlags.isEnabled(FeatureFlagName.MULTI_CHANNEL) && channel_id) {
+      try {
+        const policy = await channelPoliciesRepo.getByChannelId(channel_id);
+        if (policy) {
+          const [availableRoles, currentRole] = await Promise.all([
+            rolesRepo.listActive(),
+            rolesRepo.getById(policy.default_role_id),
+          ]);
+          if (currentRole && availableRoles.length > 0) {
+            const result = await selectRole({
+              inbound_text: inbound.conteudo ?? '',
+              current_role: currentRole,
+              available_roles: availableRoles,
+              policy,
+              conversa_id: c.id,
+              channel_id,
+              turno_id: inbound.id,
+            });
+            activeRole = result.decided_role;
+          }
+        }
+      } catch (err) {
+        logger.warn(
+          { channel_id, err: (err as Error).message },
+          'agent.role_selection_failed_continuing_without_role',
+        );
       }
     }
-    // 'continue', 'escalate', 'none' → no engine action here. continue
-    // keeps the existing activeExecution; escalate/none leave it null
-    // (or unchanged) and the turn proceeds without a procedure.
-   } catch (err) {
-    logger.warn(
-      { err: (err as Error).message, conversa_id: c.id },
-      'procedure.preturn.failed',
-    );
-   }
   }
 
   const { system, messages } = await buildPrompt({
@@ -448,6 +679,7 @@ async function runAgentForMensagemInner(mensagem_id: string): Promise<void> {
     conversa: c,
     scope,
     inbound,
+    activeRole,
   });
 
   const tools = getToolSchemas(scope.byEntity);
@@ -473,6 +705,9 @@ async function runAgentForMensagemInner(mensagem_id: string): Promise<void> {
       system,
       messages,
       tools,
+      // [P88-C4] Pass the precomputed role-switch announcement (if any) so
+      // react-loop can prepend it to the final assistant text before dispatch.
+      outboundPrefix: roleAnnouncement,
     });
     totalTokens = result.totalTokens;
     reactOutboundText = result.outboundText;
@@ -483,27 +718,39 @@ async function runAgentForMensagemInner(mensagem_id: string): Promise<void> {
 
   await markAllProcessed(totalTokens);
   await conversasRepo.touch(c.id);
+  // Issue #73 — persist the scope hash for the *next* turn's sentinel check.
+  // Merge (jsonb ||) instead of overwrite so concurrent writers don't clobber
+  // unrelated metadata keys (e.g. pending_question). The hash itself is
+  // last-writer-wins, which is fine: we want the freshest finished turn's
+  // scope to be the baseline for comparison.
+  try {
+    await conversasRepo.mergeMetadata(c.id, {
+      last_scope_hash: hashScope(scope),
+      last_scope_hash_set_at: new Date().toISOString(),
+    });
+  } catch (err) {
+    logger.warn(
+      { err: (err as Error).message, conversa_id: c.id },
+      'agent.scope_hash_persist_failed',
+    );
+  }
   await clearDebounceState(pessoa.telefone_whatsapp);
 
-  // P3b Task 9 — POST-TURN evaluator (fire-and-forget):
-  // If a procedure execution is active, re-load it (state may have
-  // mutated mid-turn) and evaluate the current step's success criteria
-  // against this turn's outbound text + tool results. If the step is
-  // complete, advance to the next step or complete the execution.
-  // Errors are swallowed — procedure runtime must NEVER block the
-  // user-facing reply or post-turn cleanup.
+  // P3b/P7 — POST-TURN cognitive modules (fire-and-forget):
+  // step-evaluator + correction-reflection + success-reflection.
   //
-  // P84-Op: gated on FEATURE_PROCEDURE_RUNTIME — the kill switch covers
-  // post-turn too, otherwise turning it off mid-execution would leave
-  // executions un-advanced. We still load+evaluate when ON, no-op when OFF.
-  // P84-C4: emit `criterion_checked` for every gate evaluation,
-  // `tool_called` for procedure-relevant tool calls, and `step_failed`
-  // when the step is stalled (zero criteria or unsupported-only) — the
-  // audit trail must reconstruct "why did step X not advance?" from the
-  // event log alone.
-  if (activeExecution && config.FEATURE_PROCEDURE_RUNTIME) {
-    const execId = activeExecution.id;
-    const responseContext = {
+  // Dual-path: quando FEATURE_COGNITIVE_GRAPH ON, todos os 3 triggers
+  // rodam dentro do postturn-graph (camada ASYNC). OFF mantém legacy
+  // intacto. Critério: errors NUNCA bloqueiam ack do turn.
+  if (featureFlags.isEnabled(FeatureFlagName.COGNITIVE_GRAPH)) {
+    // P7 path — fire-and-forget via runNodes (postturn nodes são ASYNC).
+    // Inclui step-evaluator + correction-reflection + success-reflection.
+    void runNodes(buildPostturnNodes(), {
+      conversa_id: c.id,
+      turno_id: inbound.id,
+      pessoa,
+      conversa: c,
+      inbound,
       response_text: reactOutboundText,
       tools_called: reactToolsCalled,
       // P3c Task 5: user_signal critério lê o inbound textual do turn.
@@ -599,32 +846,73 @@ async function runAgentForMensagemInner(mensagem_id: string): Promise<void> {
             next_step_id: evalResult.next_step_id,
             completed_step_id: exec.current_step_id!,
           });
-        } else {
-          await procedureEngine.completeExecution({
-            execution_id: exec.id,
-            outcome: 'success',
-          });
-        }
-      } catch (err) {
-        logger.warn(
-          { err: (err as Error).message, execId },
-          'procedure.postturn.failed',
-        );
-      }
-    })();
-  }
 
-  // Reflection trigger: correction detection (real-time)
-  if (inbound.conteudo && detectCorrection(inbound.conteudo)) {
-    const prev = await findPreviousAssistantMessage(c.id, inbound.id);
-    if (prev) {
-      await reflectOnCorrection({
-        pessoa,
-        conversa: c,
-        inbound,
-        previousAssistant: prev,
-      });
+          if (!evalResult.step_completed) return;
+          if (evalResult.next_step_id) {
+            await procedureEngine.advanceStep({
+              execution_id: exec.id,
+              next_step_id: evalResult.next_step_id,
+              completed_step_id: exec.current_step_id!,
+            });
+          } else {
+            await procedureEngine.completeExecution({
+              execution_id: exec.id,
+              outcome: 'success',
+            });
+          }
+        } catch (err) {
+          logger.warn(
+            { err: (err as Error).message, execId },
+            'procedure.postturn.failed',
+          );
+        }
+      })();
     }
+
+    // Reflection trigger: correction detection (real-time)
+    if (inbound.conteudo && detectCorrection(inbound.conteudo)) {
+      const prev = await findPreviousAssistantMessage(c.id, inbound.id);
+      if (prev) {
+        await reflectOnCorrection({
+          pessoa,
+          conversa: c,
+          inbound,
+          previousAssistant: prev,
+        });
+      }
+    }
+  }
+}
+
+/**
+ * P7 Task 8 — helper file-local para montar `role_inputs` do PreturnContext.
+ *
+ * Mirror do bloco legacy de role-selection: só retorna inputs quando
+ * MULTI_CHANNEL on E channel_id presente E policy + roles disponíveis.
+ * Caso contrário retorna undefined, e o node role-selector é omitido do
+ * grafo (`buildPreturnNodes(multi_channel_on: false)`) ou skipado via
+ * `runWhen=ctx.role_inputs !== undefined`.
+ */
+async function buildRoleInputs(
+  channel_id: string | null,
+): Promise<PreturnContext['role_inputs']> {
+  if (!channel_id) return undefined;
+  if (!featureFlags.isEnabled(FeatureFlagName.MULTI_CHANNEL)) return undefined;
+  try {
+    const policy = await channelPoliciesRepo.getByChannelId(channel_id);
+    if (!policy) return undefined;
+    const [availableRoles, currentRole] = await Promise.all([
+      rolesRepo.listActive(),
+      rolesRepo.getById(policy.default_role_id),
+    ]);
+    if (!currentRole || availableRoles.length === 0) return undefined;
+    return { current_role: currentRole, available_roles: availableRoles, policy, channel_id };
+  } catch (err) {
+    logger.warn(
+      { channel_id, err: (err as Error).message },
+      'preturn.role_inputs_build_failed',
+    );
+    return undefined;
   }
 }
 

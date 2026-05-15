@@ -33,7 +33,7 @@ export async function startExecution(args: {
       ended_at: null,
       outcome: null,
       notes: null,
-    } as any);
+    });
 
     if (created) {
       await procedureExecutionEventsRepo.recordTx(tx, {
@@ -46,7 +46,7 @@ export async function startExecution(args: {
           first_step_id: args.first_step_id,
         },
         confidence: null,
-      } as any);
+      });
     } else {
       // Concurrent-start race: another worker just inserted the in_progress
       // row. Skip the `execution_started` event (the winner already emitted
@@ -77,8 +77,8 @@ export async function recordEvent(args: {
     step_id: args.step_id ?? null,
     event_type: args.event_type,
     payload: args.payload,
-    confidence: args.confidence ?? null,
-  } as any);
+    confidence: confidenceToColumn(args.confidence),
+  });
 }
 
 /**
@@ -107,8 +107,8 @@ export async function recordCriterionChecked(args: {
       passed: args.passed,
       evidence: args.evidence,
     },
-    confidence: args.confidence ?? null,
-  } as any);
+    confidence: confidenceToColumn(args.confidence),
+  });
 }
 
 /**
@@ -135,7 +135,7 @@ export async function recordToolCalled(args: {
       result: truncateForAudit(args.result),
     },
     confidence: null,
-  } as any);
+  });
 }
 
 function truncateForAudit(v: unknown): unknown {
@@ -146,6 +146,14 @@ function truncateForAudit(v: unknown): unknown {
   } catch {
     return { _unserializable: true };
   }
+}
+
+// PR #84 Minor #1: Drizzle infers `numeric(p,s)` columns as `string | null`
+// even though callers pass a JS number. Centralize the coercion so call sites
+// can use the natural number type and the type cast lives in one place
+// (instead of `as any` on every event insert).
+function confidenceToColumn(c: number | null | undefined): string | null {
+  return c == null ? null : c.toString();
 }
 
 export async function advanceStep(args: {
@@ -174,7 +182,7 @@ export async function advanceStep(args: {
       event_type: 'step_completed',
       payload: { completed_step_id: args.completed_step_id, next_step_id: args.next_step_id },
       confidence: null,
-    } as any);
+    });
 
     if (args.next_step_id) {
       await procedureExecutionEventsRepo.recordTx(tx, {
@@ -183,7 +191,7 @@ export async function advanceStep(args: {
         event_type: 'step_started',
         payload: {},
         confidence: null,
-      } as any);
+      });
     }
 
     // P84-C4: emit `state_updated` for replay reconstructibility. Without
@@ -199,11 +207,11 @@ export async function advanceStep(args: {
         completed_steps: newCompleted,
       },
       confidence: null,
-    } as any);
+    });
 
     await procedureExecutionsRepo.updateStateTx(tx, args.execution_id, {
       current_step_id: args.next_step_id,
-      completed_steps: newCompleted as any,
+      completed_steps: newCompleted,
     });
   });
 }
@@ -223,7 +231,7 @@ export async function completeExecution(args: {
       event_type: 'execution_completed',
       payload: { outcome: args.outcome },
       confidence: null,
-    } as any);
+    });
 
     await procedureExecutionEventsRepo.recordTx(tx, {
       execution_id: args.execution_id,
@@ -231,7 +239,7 @@ export async function completeExecution(args: {
       event_type: 'state_updated',
       payload: { status: 'completed', outcome: args.outcome },
       confidence: null,
-    } as any);
+    });
 
     await procedureExecutionsRepo.updateStateTx(tx, args.execution_id, {
       status: 'completed',
@@ -250,7 +258,7 @@ export async function abortExecution(args: { execution_id: string; reason: strin
       event_type: 'execution_aborted',
       payload: { reason: args.reason },
       confidence: null,
-    } as any);
+    });
 
     await procedureExecutionEventsRepo.recordTx(tx, {
       execution_id: args.execution_id,
@@ -258,7 +266,7 @@ export async function abortExecution(args: { execution_id: string; reason: strin
       event_type: 'state_updated',
       payload: { status: 'aborted', notes: args.reason },
       confidence: null,
-    } as any);
+    });
 
     await procedureExecutionsRepo.updateStateTx(tx, args.execution_id, {
       status: 'aborted',
@@ -336,6 +344,56 @@ export async function getLatestHumanConfirmation(args: {
  * `step_started`/`step_completed`/`execution_*` events carry the same
  * information.
  */
+export async function recordHumanConfirmation(args: {
+  execution_id: string;
+  step_id: string;
+  operator_id: string;
+  decision: 'approved' | 'rejected';
+  notes?: string;
+}): Promise<void> {
+  await procedureExecutionEventsRepo.record({
+    execution_id: args.execution_id,
+    step_id: args.step_id,
+    event_type: 'human_confirmation',
+    payload: {
+      step_id: args.step_id,
+      operator_id: args.operator_id,
+      decision: args.decision,
+      notes: args.notes ?? null,
+    },
+    confidence: null,
+  } as any);
+}
+
+/**
+ * P3c Task 6: busca a confirmação humana mais recente para um (execution_id,
+ * step_id). Retorna null se não houver. LIFO sobre a lista ordenada por
+ * created_at (asc, vinda do repo) — itera de trás pra frente.
+ *
+ * Eventos com payload inválido (sem step_id correto, ou decision != approved
+ * | rejected) são ignorados em vez de lançar — defensivo contra evolução de
+ * schema.
+ */
+export async function getLatestHumanConfirmation(args: {
+  execution_id: string;
+  step_id: string;
+}): Promise<{ decision: 'approved' | 'rejected'; operator_id: string; ts: Date } | null> {
+  const events = await procedureExecutionEventsRepo.listByExecution(args.execution_id);
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i];
+    if (!e || e.event_type !== 'human_confirmation') continue;
+    const p = e.payload as { step_id?: string; decision?: string; operator_id?: string } | null;
+    if (!p || p.step_id !== args.step_id) continue;
+    if (p.decision !== 'approved' && p.decision !== 'rejected') continue;
+    return {
+      decision: p.decision,
+      operator_id: p.operator_id ?? 'unknown',
+      ts: e.created_at,
+    };
+  }
+  return null;
+}
+
 export async function replayState(execution_id: string): Promise<{
   current_step_id: string | null;
   completed_steps: string[];

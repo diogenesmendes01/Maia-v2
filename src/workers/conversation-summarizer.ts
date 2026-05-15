@@ -9,6 +9,7 @@ import { runWithTenantContext } from '@/db/tenant-context.js';
 import { reflect } from '@/cognition/reflector.js';
 import { classify } from '@/cognition/classifier.js';
 import { persistCandidate } from '@/cognition/persister.js';
+import { runCognitiveModule } from '@/cognition/runner.js';
 import { CognitiveEventType } from '@/types/enums.js';
 
 export async function runConversationSummarizer(): Promise<void> {
@@ -62,13 +63,30 @@ async function runConversationSummarizerInner(): Promise<void> {
       .map((m) => `${m.direcao === 'in' ? 'Usuário' : 'Maia'}: ${m.conteudo ?? '[mídia]'}`)
       .join('\n');
     try {
-      const res = await callLLM({
-        system:
-          'Você é a Maia. Resuma a conversa abaixo em até 500 caracteres em português, focando em decisões, fatos e pendências. Não invente.',
-        messages: [{ role: 'user', content: transcript }],
-        max_tokens: 500,
-        temperature: 0.0,
-      });
+      const summarizerResult = await runCognitiveModule(
+        {
+          name: 'conversation-summarizer',
+          triggered_by: 'async_event',
+          timeoutMs: 30000,
+          conversa_id: c.id,
+        },
+        () =>
+          callLLM({
+            system:
+              'Você é a Maia. Resuma a conversa abaixo em até 500 caracteres em português, focando em decisões, fatos e pendências. Não invente.',
+            messages: [{ role: 'user', content: transcript }],
+            max_tokens: 500,
+            temperature: 0.0,
+          }),
+      );
+      const res = summarizerResult.output;
+      if (!res) {
+        logger.warn(
+          { conversa_id: c.id, status: summarizerResult.status },
+          'summarizer.llm_failed_skipping',
+        );
+        continue;
+      }
       const summary = (res.content ?? '').slice(0, 500);
       await conversasRepo.close(c.id, summary);
       logger.info({ conversa_id: c.id, len: summary.length }, 'conversation_summarized');

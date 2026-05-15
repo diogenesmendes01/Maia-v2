@@ -7,6 +7,7 @@ import { rulesRepo } from '@/db/repositories.js';
 import { audit } from '@/governance/audit.js';
 import { writeMemory } from '@/memory/vector.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
+import { runCognitiveModule } from '@/cognition/runner.js';
 import {
   clusterCorrections,
   type CorrectionSignal,
@@ -151,19 +152,31 @@ async function proposeRule(cluster: Cluster): Promise<Proposal | null> {
     'Schema: {"applicable":bool,"tipo":"classificacao"|"identificacao_entidade","contexto":string,"acao":string,"contexto_jsonb":obj,"acoes_jsonb":obj,"justificativa":string}. ' +
     'Se não houver padrão claro, retorne {"applicable":false}.';
   const user = `Cluster (descricao normalizada: "${cluster.descricao_normalized}", ${cluster.signals.length} ocorrências):\n${examples}`;
+  const proposalResult = await runCognitiveModule(
+    { name: 'reflection-batch', triggered_by: 'async_event', timeoutMs: 30000 },
+    () =>
+      callLLM({
+        system,
+        messages: [{ role: 'user', content: user }],
+        max_tokens: 400,
+        temperature: 0.0,
+      }),
+  );
+  const res = proposalResult.output;
+  if (!res) {
+    logger.warn(
+      { status: proposalResult.status },
+      'reflection_batch.llm_failed_skipping',
+    );
+    return null;
+  }
   try {
-    const res = await callLLM({
-      system,
-      messages: [{ role: 'user', content: user }],
-      max_tokens: 400,
-      temperature: 0.0,
-    });
     const text = res.content?.trim() ?? '';
     const m = text.match(/\{[\s\S]*\}/);
     if (!m) return null;
     return JSON.parse(m[0]) as Proposal;
   } catch (err) {
-    logger.warn({ err: (err as Error).message }, 'reflection_batch.llm_failed');
+    logger.warn({ err: (err as Error).message }, 'reflection_batch.parse_failed');
     return null;
   }
 }

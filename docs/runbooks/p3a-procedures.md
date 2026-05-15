@@ -25,6 +25,12 @@ procedure_assignments
 
 ## Modo ENSINO — criar procedure manualmente
 
+> **Nota (P83-L4):** o uso de `tenant_id: 'default'` / `agent_id: 'default'` nos
+> exemplos abaixo é um **shim do P0** — útil em scripts manuais e em ambientes
+> single-tenant. A partir do P6 (fan-out multi-tenant) toda chamada deve passar
+> os identificadores reais do tenant/agent do owner. Não copie este padrão para
+> código de produção que rode com múltiplos tenants.
+
 ```typescript
 import { teachProcedure } from '@/cognition/procedure-builder.js';
 import { procedureDefinitionsRepo } from '@/db/repositories.js';

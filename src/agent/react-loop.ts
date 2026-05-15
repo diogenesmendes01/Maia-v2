@@ -1,4 +1,4 @@
-import { pendingQuestionsRepo } from '@/db/repositories.js';
+import { mensagensRepo, pendingQuestionsRepo } from '@/db/repositories.js';
 import type { Pessoa, Conversa, Mensagem } from '@/db/schema.js';
 import { audit } from '@/governance/audit.js';
 import type { ResolvedPermission } from '@/governance/permissions.js';
@@ -13,6 +13,7 @@ import { detectGap } from './gap-detector.js';
 import { reflect } from '@/cognition/reflector.js';
 import { classify } from '@/cognition/classifier.js';
 import { persistCandidate } from '@/cognition/persister.js';
+import { runCognitiveModule } from '@/cognition/runner.js';
 import { CognitiveEventType } from '@/types/enums.js';
 
 export const MAX_REACT_ITERATIONS = 5;
@@ -26,6 +27,13 @@ export type RunReActLoopParams = {
   system: string;
   messages: LLMMessage[];
   tools: ToolSchema[];
+  /**
+   * [P88-C4] Optional announcement (e.g., "switching to suporte mode")
+   * prepended to the final outbound text. null when policy.announce_mode
+   * says no announcement should be emitted this turn. The model never sees
+   * this text — it's a system-emitted prefix attached at dispatch time.
+   */
+  outboundPrefix?: string | null;
 };
 
 export type ReActLoopResult = {
@@ -63,17 +71,46 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
   const toolsCalled: Array<{ name: string; result: unknown }> = [];
 
   for (let i = 0; i < MAX_REACT_ITERATIONS; i++) {
-    const res = await callLLM({
-      system,
-      messages: conversation,
-      tools,
-      max_tokens: 1024,
-      pessoa_id: pessoa.id,
-    });
+    const reasonerResult = await runCognitiveModule(
+      {
+        name: 'reasoner',
+        version: 'v1',
+        triggered_by: 'sync_required',
+        timeoutMs: 30000,
+        conversa_id: c.id,
+        turno_id: inbound.id,
+      },
+      () =>
+        callLLM({
+          system,
+          messages: conversation,
+          tools,
+          max_tokens: 1024,
+          pessoa_id: pessoa.id,
+        }),
+    );
+    const res = reasonerResult.output;
+    if (!res) {
+      // Reasoner falhou (timeout/erro) — encerra loop com resposta vazia.
+      // Não joga exception nem trava o worker; turn termina sem reply útil.
+      logger.warn(
+        { conversa_id: c.id, mensagem_id: inbound.id, status: reasonerResult.status },
+        'react_loop.reasoner_failed',
+      );
+      break;
+    }
     totalTokens += res.usage.input_tokens + res.usage.output_tokens;
 
     if (res.tool_uses.length === 0) {
-      const text = res.content?.trim() ?? '';
+      const rawText = res.content?.trim() ?? '';
+      // [P88-C4] Prepend the role-switch announcement (if any) to the
+      // final outbound. Only attaches when the model actually produced
+      // text — an empty turn stays empty (no orphan announcement bubble).
+      const prefix = params.outboundPrefix;
+      const text =
+        rawText && typeof prefix === 'string' && prefix.length > 0
+          ? `${prefix}\n\n${rawText}`
+          : rawText;
       outboundText = text;
       if (text) {
         await dispatchOutput({
@@ -92,9 +129,11 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
         // text for self-recognized gaps ("não sei", "preciso verificar",
         // "sem acesso a..."). Fire-and-forget — reflection MUST never
         // block the user-facing reply or the ReAct return.
-        const gap = detectGap(text);
+        // [P88-C4] Use rawText (without role announcement prefix) so the
+        // announcement string can't trigger spurious gap detection.
+        const gap = detectGap(rawText);
         if (gap.detected) {
-          const responseText = text;
+          const responseText = rawText;
           const signal = gap.signal ?? '';
           void (async () => {
             try {
@@ -136,6 +175,11 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
     // Execute tools and add results
     const results = [];
     for (const tu of res.tool_uses) {
+      // Superpowers I4 (PR #74): capture the dispatch START timestamp so the
+      // summary's `occurred_at` reflects when the side effect was requested,
+      // not when it completed. Matters for long-running tools whose
+      // completion straddles the events-block 24h window boundary.
+      const dispatched_at = Date.now();
       const out = await dispatchTool({
         tool: tu.tool,
         args: tu.args,
@@ -242,6 +286,23 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
         content: JSON.stringify(out),
         is_error: isError,
       });
+
+      // Issue #73 — accumulate a structured summary for next-turn persistence.
+      // Side-effect 'none' tools (parse_only) still get summarized to keep
+      // the audit trail intact; the prompt-builder events-block filters by
+      // priority later.
+      toolSummaries.push(
+        buildToolSummary({
+          tool_call_id: tu.id,
+          tool_name: tu.tool,
+          side_effect: tool?.side_effect ?? 'none',
+          args: tu.args,
+          result: out,
+          status: isError ? 'error' : 'success',
+          dispatched_at,
+        }),
+      );
+
       await audit({
         acao: (isError ? 'unauthorized_access_attempt' : 'classification_suggested') as never,
         pessoa_id: pessoa.id,
@@ -251,6 +312,24 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
       });
     }
     conversation.push({ role: 'user', content: results });
+    // If we completed the final iteration with tool_uses, we'll exit the
+    // for-loop without dispatching outbound. Mark for the flush path.
+    if (i === MAX_REACT_ITERATIONS - 1) {
+      exitReason = 'iteration_cap';
+    }
+  }
+
+  // Codex C1 (PR #74): when no outbound was dispatched but tools ran, persist
+  // their summaries via a placeholder event row so the next turn's
+  // prompt-builder still surfaces them in the "## Eventos confirmados pelo
+  // backend" block. Covers iteration-cap and empty-final-text paths.
+  if (!outboundDispatched && toolSummaries.length > 0) {
+    await flushUnconfirmedToolSummaries(
+      c.id,
+      inbound.id,
+      toolSummaries,
+      exitReason === 'iteration_cap' ? 'iteration_cap' : 'empty_final_text',
+    );
   }
 
   return { totalTokens, outboundText, toolsCalled };

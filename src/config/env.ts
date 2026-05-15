@@ -134,6 +134,30 @@ const envSchema = z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
+    // P4 — identidade operacional v2 (perfil versionado + drift detector)
+    FEATURE_OPERATIONAL_PROFILE_V2: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
+    // P5 — aquisição dialógica de capacidades (lacunas -> propostas -> testes)
+    FEATURE_DIALOGICAL_ACQUISITION: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
+    // P6 — separação Agent/Channel/Role + Role Policy (multi-canal)
+    FEATURE_MULTI_CHANNEL: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
+    // P7 — grafo cognitivo formal (orquestração declarativa de módulos)
+    FEATURE_COGNITIVE_GRAPH: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
+    /** Baseline pré-P7 em ms para p95 do sync path. Se ausente, gate skipa. */
+    SYNC_LATENCY_P95_BASELINE_MS: z.coerce.number().int().positive().optional(),
+    /** Percentual extra permitido sobre baseline (default 20). */
+    SYNC_LATENCY_P95_BUDGET_PERCENT: z.coerce.number().int().nonnegative().default(20),
     // Message debounce: hold incoming text messages from the same user for a
     // short window so chunked typing ("Oi, " / "como está " / "a finança?")
     // arrives at the LLM as a single coherent turn. Off by default — when on,
@@ -155,6 +179,15 @@ const envSchema = z
       .string()
       .default('true')
       .transform((s) => s === 'true' || s === '1'),
+    // PR #84 Minor #5: selector confidence threshold was hardcoded at 0.6.
+    // Different tenants/agents have different acceptable false-positive
+    // rates; expose as env override so ops can tune without a redeploy.
+    // Constrained to (0, 1] — 0 would auto-start on any candidate.
+    PROCEDURE_SELECTOR_CONFIDENCE_THRESHOLD: z.coerce
+      .number()
+      .gt(0)
+      .lte(1)
+      .default(0.6),
     MESSAGE_DEBOUNCE_MS: z.coerce.number().int().positive().default(5000),
     MESSAGE_DEBOUNCE_MAX_MS: z.coerce.number().int().positive().default(30000),
     // SETUP: optional override for the bootstrap token. When set, bypasses

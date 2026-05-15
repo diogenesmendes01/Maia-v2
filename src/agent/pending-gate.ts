@@ -1,6 +1,7 @@
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 import { callLLM } from '@/lib/claude.js';
+import { runCognitiveModule } from '@/cognition/runner.js';
 import { pendingQuestionsRepo } from '@/db/repositories.js';
 import { withTx } from '@/db/client.js';
 import { audit } from '@/governance/audit.js';
@@ -49,20 +50,35 @@ async function haikuClassifier(
     `Pergunta: ${snapshot.pergunta}\n` +
     `Opções: ${opts.map((o) => `${o.key} (${o.label})`).join(', ')}\n` +
     `Resposta do usuário: ${inbound.conteudo ?? ''}`;
+  const gateResult = await runCognitiveModule(
+    { name: 'pending-gate', triggered_by: 'sync_conditional', timeoutMs: 5000 },
+    () =>
+      callLLM({
+        system,
+        messages: [{ role: 'user', content: user }],
+        max_tokens: 200,
+        temperature: 0,
+        pessoa_id: ctx?.pessoa_id,
+      }),
+  );
+  const res = gateResult.output;
+  if (!res) {
+    // Timeout/erro do classificador — fallback de segurança: trata como
+    // não-resolvido. Caller (checkPendingFirst) converte null em
+    // { kind: 'unresolved', reason: 'low_confidence' }.
+    logger.warn(
+      { status: gateResult.status },
+      'pending_gate.classify_failed',
+    );
+    return null;
+  }
   try {
-    const res = await callLLM({
-      system,
-      messages: [{ role: 'user', content: user }],
-      max_tokens: 200,
-      temperature: 0,
-      pessoa_id: ctx?.pessoa_id,
-    });
     const text = res.content?.trim() ?? '';
     const m = text.match(/\{[\s\S]*\}/);
     if (!m) return null;
     return JSON.parse(m[0]) as ClassifyOut;
   } catch (err) {
-    logger.warn({ err: (err as Error).message }, 'pending_gate.classify_failed');
+    logger.warn({ err: (err as Error).message }, 'pending_gate.parse_failed');
     return null;
   }
 }

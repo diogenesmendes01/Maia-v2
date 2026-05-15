@@ -36,7 +36,7 @@ export type StepEvalResult = {
    * so the executor can record an event and (in P3c) the reaper can sweep.
    * Today: surfaced as a warning + audit event so the stall is observable.
    */
-  stall_reason: null | 'no_criteria_defined' | 'unsupported_criterion_only';
+  stall_reason: null | 'no_criteria_defined' | 'unsupported_criterion_only' | 'unknown_criterion_type';
   /**
    * P84-C3: when more than one downstream step is eligible to fire from
    * the current completion (DAG parallel branches), the evaluator picks
@@ -56,6 +56,14 @@ export async function evaluateCurrentStep(args: {
   const currentStepId = args.execution.current_step_id;
 
   if (!currentStepId) {
+    // P85-M3: surface the silent stall — without this log, an execution stuck
+    // with `current_step_id IS NULL` and `status='in_progress'` is invisible
+    // until the reaper sweeps it ~7d later. The post-turn evaluator wraps this
+    // in try/catch so the log doesn't break the agent turn.
+    logger.warn(
+      { execution_id: args.execution.id, definition_id: args.definition.id },
+      'step_evaluator.no_current_step',
+    );
     return {
       step_completed: false,
       criterion_results: [],
@@ -68,6 +76,17 @@ export async function evaluateCurrentStep(args: {
 
   const currentStep = steps.find((s) => s.id === currentStepId);
   if (!currentStep) {
+    // P85-M3: same class of silent-stall — `current_step_id` references a
+    // step that no longer exists in the definition (e.g., definition was
+    // edited mid-execution). Logged with both ids so ops can correlate.
+    logger.warn(
+      {
+        execution_id: args.execution.id,
+        definition_id: args.definition.id,
+        current_step_id: currentStepId,
+      },
+      'step_evaluator.current_step_not_found_in_definition',
+    );
     return {
       step_completed: false,
       criterion_results: [],
@@ -92,6 +111,14 @@ export async function evaluateCurrentStep(args: {
   // so, the step is stuck waiting on P3c and we should flag it rather
   // than silently looping forever.
   let unsupported_count = 0;
+
+  // P85-NB1: any criterion whose `type` is not handled by any branch
+  // below. Without this defensive tracker, a future criterion type
+  // added without an evaluator branch would produce passed=false +
+  // evidence='' and the procedure would stall invisibly until the
+  // reaper sweep. We surface it as a distinct stall_reason so audit
+  // and ops can see it.
+  const unknown_types: string[] = [];
 
   for (const c of stepCriteria) {
     let passed = false;
@@ -199,6 +226,12 @@ export async function evaluateCurrentStep(args: {
       },
       'step_evaluator.stall.no_criteria_defined',
     );
+  } else if (unknown_types.length > 0) {
+    // P85-NB1: an unknown criterion type takes precedence over
+    // 'unsupported_criterion_only' — the former signals a definition or
+    // schema bug that ops must investigate; the latter is normal awaiting
+    // behavior. Surface the more actionable signal.
+    stall_reason = 'unknown_criterion_type';
   } else if (unsupported_count === stepCriteria.length) {
     stall_reason = 'unsupported_criterion_only';
   }
