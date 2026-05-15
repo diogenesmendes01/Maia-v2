@@ -61,6 +61,14 @@ const SHOULD_RUN =
   !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
 const d = SHOULD_RUN ? describe : describe.skip;
 
+// P0 adicionou `getCurrentTenant()` em listUnprocessedByTelefone e
+// derivados. Os fixtures abaixo criam rows via raw SQL (default tenant
+// pelo schema), então wrappar as chamadas de repo no contexto 'default'
+// é suficiente.
+import { runWithTenantContext } from '@/db/tenant-context.js';
+const withDefaultTenant = <T>(fn: () => Promise<T>): Promise<T> =>
+  runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, fn);
+
 let pool: pg.Pool;
 let pessoa_id: string;
 let conversa_id: string;
@@ -153,7 +161,9 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
       const id3 = await insertInbound(c, { conversa_id: null, telefone, conteudo: 'a finança?', created_at: t2 });
 
       const { mensagensRepo } = await import('../../src/db/repositories.js');
-      const rows = await mensagensRepo.listUnprocessedByTelefone(telefone, { excludeId: id3 });
+      const rows = await withDefaultTenant(() =>
+        mensagensRepo.listUnprocessedByTelefone(telefone, { excludeId: id3 }),
+      );
       const ids = rows.map((r) => r.id);
       expect(ids).toContain(id1);
       expect(ids).toContain(id2);
@@ -238,7 +248,7 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
       const id3 = await insertInbound(c, { conversa_id: null, telefone, conteudo: 'a finança?', created_at: t2 });
 
       const { mensagensRepo } = await import('../../src/db/repositories.js');
-      const target = await mensagensRepo.findById(id3);
+      const target = await withDefaultTenant(() => mensagensRepo.findById(id3));
       expect(target).not.toBeNull();
 
       // Import the real aggregator (queue/baileys are stubbed at module
@@ -247,7 +257,7 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
       // catches regressions in feature flag, conversa guard, separator,
       // and merged_ids that a re-implementation would not.
       const { _internal } = await import('../../src/agent/core.js');
-      const out = await _internal.aggregateUnprocessedTexts(target!);
+      const out = await withDefaultTenant(() => _internal.aggregateUnprocessedTexts(target!));
       expect(out.text).toBe('Oi,\ncomo vai\na finança?');
       expect(out.merged_ids).toEqual(expect.arrayContaining([id1, id2]));
       expect(out.merged_ids).not.toContain(id3); // target is excluded
@@ -255,7 +265,7 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
       // Process id2 to simulate a partial run; the next aggregator call
       // should drop it from the merge.
       await mensagensRepo.markProcessed(id2, 0);
-      const after = await _internal.aggregateUnprocessedTexts(target!);
+      const after = await withDefaultTenant(() => _internal.aggregateUnprocessedTexts(target!));
       expect(after.text).toBe('Oi,\na finança?');
       expect(after.merged_ids).toEqual([id1]);
     } finally {
@@ -304,7 +314,9 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
 
       // The query-side safety: an unprocessed-only fetch must NOT return
       // any of the three rows.
-      const stillUnprocessed = await mensagensRepo.listUnprocessedByTelefone(telefone);
+      const stillUnprocessed = await withDefaultTenant(() =>
+        mensagensRepo.listUnprocessedByTelefone(telefone),
+      );
       expect(stillUnprocessed.find((m) => m.id === id1)).toBeUndefined();
       expect(stillUnprocessed.find((m) => m.id === id2)).toBeUndefined();
       expect(stillUnprocessed.find((m) => m.id === id3)).toBeUndefined();

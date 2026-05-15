@@ -28,6 +28,21 @@ export type StepEvalResult = {
   criterion_results: Array<{ id: string; type: string; passed: boolean; evidence: string }>;
   next_step_id: string | null;
   failure_detected: boolean;
+  /**
+   * P84-C3: signal back to the caller when the current step cannot make
+   * progress on its own — typically because it has no criteria defined.
+   * The runtime treats this as `step_failed` with reason `no_criteria_defined`
+   * so the executor can record an event and (in P3c) the reaper can sweep.
+   * Today: surfaced as a warning + audit event so the stall is observable.
+   */
+  stall_reason: null | 'no_criteria_defined' | 'unsupported_criterion_only' | 'unknown_criterion_type';
+  /**
+   * P84-C3: when more than one downstream step is eligible to fire from
+   * the current completion (DAG parallel branches), the evaluator picks
+   * deterministically by array order and reports the alternates here so
+   * the audit log can show that a DAG was linearized.
+   */
+  branch_alternates: string[];
 };
 
 export async function evaluateCurrentStep(args: {
@@ -40,12 +55,45 @@ export async function evaluateCurrentStep(args: {
   const currentStepId = args.execution.current_step_id;
 
   if (!currentStepId) {
-    return { step_completed: false, criterion_results: [], next_step_id: null, failure_detected: false };
+    // P85-M3: surface the silent stall — without this log, an execution stuck
+    // with `current_step_id IS NULL` and `status='in_progress'` is invisible
+    // until the reaper sweeps it ~7d later. The post-turn evaluator wraps this
+    // in try/catch so the log doesn't break the agent turn.
+    logger.warn(
+      { execution_id: args.execution.id, definition_id: args.definition.id },
+      'step_evaluator.no_current_step',
+    );
+    return {
+      step_completed: false,
+      criterion_results: [],
+      next_step_id: null,
+      failure_detected: false,
+      stall_reason: null,
+      branch_alternates: [],
+    };
   }
 
   const currentStep = steps.find((s) => s.id === currentStepId);
   if (!currentStep) {
-    return { step_completed: false, criterion_results: [], next_step_id: null, failure_detected: false };
+    // P85-M3: same class of silent-stall — `current_step_id` references a
+    // step that no longer exists in the definition (e.g., definition was
+    // edited mid-execution). Logged with both ids so ops can correlate.
+    logger.warn(
+      {
+        execution_id: args.execution.id,
+        definition_id: args.definition.id,
+        current_step_id: currentStepId,
+      },
+      'step_evaluator.current_step_not_found_in_definition',
+    );
+    return {
+      step_completed: false,
+      criterion_results: [],
+      next_step_id: null,
+      failure_detected: false,
+      stall_reason: null,
+      branch_alternates: [],
+    };
   }
 
   // Find criteria for this step (via sucesso_criteria_ref)
@@ -56,6 +104,20 @@ export async function evaluateCurrentStep(args: {
   const criterion_results: StepEvalResult['criterion_results'] = [];
   let all_passed = stepCriteria.length > 0;
   const any_failure = false;
+
+  // P84-C3: track whether every criterion on this step is one the P3b
+  // engine can't evaluate (llm_judge, user_signal, human_confirmed). If
+  // so, the step is stuck waiting on P3c and we should flag it rather
+  // than silently looping forever.
+  let unsupported_count = 0;
+
+  // P85-NB1: any criterion whose `type` is not handled by any branch
+  // below. Without this defensive tracker, a future criterion type
+  // added without an evaluator branch would produce passed=false +
+  // evidence='' and the procedure would stall invisibly until the
+  // reaper sweep. We surface it as a distinct stall_reason so audit
+  // and ops can see it.
+  const unknown_types: string[] = [];
 
   for (const c of stepCriteria) {
     let passed = false;
@@ -143,17 +205,80 @@ export async function evaluateCurrentStep(args: {
     criterion_results.push({ id: c.id, type: c.type, passed, evidence });
   }
 
+  // P84-C3: detect stalls.
+  // (a) Step has no criteria → it can never auto-advance from machine
+  // evaluation. We surface this so the runtime can emit a step_failed
+  // event with reason 'no_criteria_defined' and the reaper can sweep.
+  // We deliberately do NOT auto-advance — that would silently mask
+  // procedure-definition bugs in production.
+  // (b) Step has only P3c-only criteria → the engine can't evaluate any
+  // of them; flag as 'unsupported_criterion_only' so observability picks
+  // it up. The selector/reaper handles the rest.
+  let stall_reason: StepEvalResult['stall_reason'] = null;
+  if (stepCriteria.length === 0) {
+    stall_reason = 'no_criteria_defined';
+    logger.warn(
+      {
+        execution_id: args.execution.id,
+        step_id: currentStepId,
+        definition_id: args.execution.definition_id,
+      },
+      'step_evaluator.stall.no_criteria_defined',
+    );
+  } else if (unknown_types.length > 0) {
+    // P85-NB1: an unknown criterion type takes precedence over
+    // 'unsupported_criterion_only' — the former signals a definition or
+    // schema bug that ops must investigate; the latter is normal awaiting
+    // behavior. Surface the more actionable signal.
+    stall_reason = 'unknown_criterion_type';
+  } else if (unsupported_count === stepCriteria.length) {
+    stall_reason = 'unsupported_criterion_only';
+  }
+
   let next_step_id: string | null = null;
+  const branch_alternates: string[] = [];
   if (all_passed) {
-    // Find next step (one whose depends_on includes currentStepId AND not already completed)
+    // P84-C3: deterministic DAG-aware next-step picker.
+    //
+    // Before: `Array.prototype.find` returned the FIRST step whose
+    // dependencies were satisfied — for DAGs with parallel branches
+    // (e.g. `step-2a` + `step-2b` both depending on `step-1`), only the
+    // one declared first ever fired. Worse: if step ordering wasn't
+    // topological, a step whose deps happened to be partially satisfied
+    // through another path could be picked out of order.
+    //
+    // After: gather ALL eligible candidates (deps satisfied, not yet
+    // completed, not the current step). Pick the first deterministically
+    // by array order (= definition-time order). Report the alternates
+    // so the audit log can show a DAG was linearized. P3c will replace
+    // this with explicit branch resolution via `branch_taken` events;
+    // until then, the deterministic pick + warning is the safe MVP.
     const completed = (args.execution.completed_steps as unknown as string[]) ?? [];
     const newCompleted = [...completed, currentStepId];
-    const nextStep = steps.find((s) => {
+
+    const eligible = steps.filter((s) => {
+      if (s.id === currentStepId) return false;
       if (newCompleted.includes(s.id)) return false;
       const deps = s.depends_on ?? [];
       return deps.length === 0 || deps.every((d) => newCompleted.includes(d));
     });
-    next_step_id = nextStep?.id ?? null;
+
+    if (eligible.length > 1) {
+      logger.warn(
+        {
+          execution_id: args.execution.id,
+          completed_step_id: currentStepId,
+          candidates: eligible.map((e) => e.id),
+        },
+        'step_evaluator.dag.parallel_branches_linearized',
+      );
+    }
+
+    next_step_id = eligible[0]?.id ?? null;
+    for (let i = 1; i < eligible.length; i++) {
+      const alt = eligible[i];
+      if (alt) branch_alternates.push(alt.id);
+    }
   }
 
   return {
@@ -161,5 +286,7 @@ export async function evaluateCurrentStep(args: {
     criterion_results,
     next_step_id,
     failure_detected: any_failure,
+    stall_reason,
+    branch_alternates,
   };
 }

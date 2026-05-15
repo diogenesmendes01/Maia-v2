@@ -3,6 +3,7 @@ import { callLLM } from '@/lib/claude.js';
 import { runCognitiveModule } from './runner.js';
 import { procedureAssignmentsRepo, procedureDefinitionsRepo } from '@/db/repositories.js';
 import { getCurrentAgent } from '@/db/tenant-context.js';
+import { config } from '@/config/env.js';
 
 const MatchResponseSchema = z.object({
   matches: z.boolean(),
@@ -10,7 +11,11 @@ const MatchResponseSchema = z.object({
   reason: z.string().optional(),
 });
 
-const CONFIDENCE_THRESHOLD = 0.6;
+// PR #84 Minor #5: threshold is now env-driven so ops can tune without a
+// redeploy. Default 0.6 preserves the previous hardcoded behavior.
+function confidenceThreshold(): number {
+  return config.PROCEDURE_SELECTOR_CONFIDENCE_THRESHOLD;
+}
 
 export type SelectorDecision = {
   decision: 'start' | 'continue' | 'switch' | 'escalate' | 'none';
@@ -81,8 +86,9 @@ export async function selectProcedure(input: {
 
   candidates.sort((a, b) => b.confidence - a.confidence);
   const top = candidates[0];
+  const threshold = confidenceThreshold();
 
-  if (!top || top.confidence < CONFIDENCE_THRESHOLD) {
+  if (!top || top.confidence < threshold) {
     return { decision: 'none', candidates, conflicts: [], reason: 'no candidate above threshold' };
   }
 
@@ -97,7 +103,7 @@ export async function selectProcedure(input: {
     selected_procedure_id: top.procedure_id,
     candidates,
     conflicts,
-    reason: `top candidate ${top.confidence.toFixed(2)} > threshold ${CONFIDENCE_THRESHOLD}`,
+    reason: `top candidate ${top.confidence.toFixed(2)} > threshold ${threshold}`,
   };
 }
 

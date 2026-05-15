@@ -29,6 +29,8 @@ describe('evaluateCurrentStep', () => {
     });
     expect(result.step_completed).toBe(true);
     expect(result.next_step_id).toBe('step-2');
+    expect(result.stall_reason).toBeNull();
+    expect(result.branch_alternates).toEqual([]);
   });
 
   it('machine_check falha → step_completed=false', async () => {

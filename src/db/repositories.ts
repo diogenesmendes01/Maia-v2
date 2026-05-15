@@ -125,57 +125,127 @@ export class EmptyScopeError extends TypedError {
 }
 
 export const pessoasRepo = {
+  /**
+   * P83-C7: tenant-scoped findById. A row from another tenant is invisible.
+   */
   async findById(id: string): Promise<Pessoa | null> {
-    const rows = await db.select().from(pessoas).where(eq(pessoas.id, id)).limit(1);
-    return rows[0] ?? null;
-  },
-  async findByPhone(telefone: string): Promise<Pessoa | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const rows = await db
       .select()
       .from(pessoas)
-      .where(eq(pessoas.telefone_whatsapp, telefone))
+      .where(and(
+        eq(pessoas.id, id),
+        eq(pessoas.tenant_id, tenant_id),
+        eq(pessoas.agent_id, agent_id),
+      ))
+      .limit(1);
+    return rows[0] ?? null;
+  },
+  /**
+   * P83-C7: tenant-scoped findByPhone. WhatsApp phone numbers are
+   * globally unique but the pessoa record still belongs to a single
+   * tenant — we MUST scope the read.
+   */
+  async findByPhone(telefone: string): Promise<Pessoa | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(pessoas)
+      .where(and(
+        eq(pessoas.telefone_whatsapp, telefone),
+        eq(pessoas.tenant_id, tenant_id),
+        eq(pessoas.agent_id, agent_id),
+      ))
       .limit(1);
     return rows[0] ?? null;
   },
   async create(input: Omit<Pessoa, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>): Promise<Pessoa> {
-    const rows = await db.insert(pessoas).values(input).returning();
+    const guarded = applyTenantGuard(input);
+    const rows = await db.insert(pessoas).values(guarded).returning();
     return rows[0]!;
   },
   async updateStatus(id: string, status: Pessoa['status']): Promise<void> {
-    await db.update(pessoas).set({ status, updated_at: new Date() }).where(eq(pessoas.id, id));
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    await db
+      .update(pessoas)
+      .set({ status, updated_at: new Date() })
+      .where(and(
+        eq(pessoas.id, id),
+        eq(pessoas.tenant_id, tenant_id),
+        eq(pessoas.agent_id, agent_id),
+      ));
   },
   async updatePreferencias(id: string, preferencias: Record<string, unknown>): Promise<void> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     await db
       .update(pessoas)
       .set({ preferencias, updated_at: new Date() })
-      .where(eq(pessoas.id, id));
+      .where(and(
+        eq(pessoas.id, id),
+        eq(pessoas.tenant_id, tenant_id),
+        eq(pessoas.agent_id, agent_id),
+      ));
   },
   async list(): Promise<Pessoa[]> {
-    return db.select().from(pessoas);
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(pessoas)
+      .where(and(eq(pessoas.tenant_id, tenant_id), eq(pessoas.agent_id, agent_id)));
   },
 };
 
 export const permissoesRepo = {
+  // P83-C7: all permissoes reads + writes scoped to current tenant.
   async forPessoa(pessoa_id: string): Promise<Permissao[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     return db
       .select()
       .from(permissoes)
-      .where(and(eq(permissoes.pessoa_id, pessoa_id), eq(permissoes.status, 'ativa')));
+      .where(and(
+        eq(permissoes.tenant_id, tenant_id),
+        eq(permissoes.agent_id, agent_id),
+        eq(permissoes.pessoa_id, pessoa_id),
+        eq(permissoes.status, 'ativa'),
+      ));
   },
   async byKey(pessoa_id: string, entidade_id: string): Promise<Permissao | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const rows = await db
       .select()
       .from(permissoes)
-      .where(and(eq(permissoes.pessoa_id, pessoa_id), eq(permissoes.entidade_id, entidade_id)))
+      .where(and(
+        eq(permissoes.tenant_id, tenant_id),
+        eq(permissoes.agent_id, agent_id),
+        eq(permissoes.pessoa_id, pessoa_id),
+        eq(permissoes.entidade_id, entidade_id),
+      ))
       .limit(1);
     return rows[0] ?? null;
   },
   async create(input: Omit<Permissao, 'id' | 'tenant_id' | 'agent_id' | 'created_at'>): Promise<Permissao> {
-    const rows = await db.insert(permissoes).values(input).returning();
+    const guarded = applyTenantGuard(input);
+    const rows = await db.insert(permissoes).values(guarded).returning();
     return rows[0]!;
   },
   async updateStatus(id: string, status: Permissao['status']): Promise<void> {
-    await db.update(permissoes).set({ status }).where(eq(permissoes.id, id));
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    await db
+      .update(permissoes)
+      .set({ status })
+      .where(and(
+        eq(permissoes.id, id),
+        eq(permissoes.tenant_id, tenant_id),
+        eq(permissoes.agent_id, agent_id),
+      ));
   },
 };
 
@@ -247,6 +317,32 @@ export const conversasRepo = {
   },
   async updateMetadata(id: string, metadata: Record<string, unknown>): Promise<void> {
     await db.update(conversas).set({ metadata }).where(eq(conversas.id, id));
+  },
+  /**
+   * Atomic partial merge into conversas.metadata via the jsonb `||`
+   * operator. Issue #73: avoids losing concurrent keys (e.g. pending_question)
+   * when two workers race to write metadata. Existing keys in `patch`
+   * overwrite existing keys in metadata; everything else is preserved.
+   */
+  async mergeMetadata(id: string, patch: Record<string, unknown>): Promise<void> {
+    await db
+      .update(conversas)
+      .set({ metadata: sql`${conversas.metadata} || ${JSON.stringify(patch)}::jsonb` })
+      .where(eq(conversas.id, id));
+  },
+  /**
+   * Atomic key removal from conversas.metadata via the jsonb `-` operator.
+   * Superpowers I3 (PR #74): paired with `mergeMetadata` for the deprecated
+   * lightweight-pending-question flow so a clear-pending operation no
+   * longer races with concurrent `mergeMetadata` writes (e.g.
+   * `last_scope_hash`) — the previous `updateMetadata` full-object set
+   * would silently drop concurrent keys.
+   */
+  async unsetMetadataKey(id: string, key: string): Promise<void> {
+    await db
+      .update(conversas)
+      .set({ metadata: sql`${conversas.metadata} - ${key}` })
+      .where(eq(conversas.id, id));
   },
   async close(id: string, contexto_resumido: string): Promise<void> {
     await db
@@ -418,6 +514,25 @@ export const mensagensRepo = {
       .set({ processada_em: new Date(), tokens_usados: tokens ?? null })
       .where(eq(mensagens.id, id));
   },
+
+  // [P88-C1] EXPLICITLY bypasses applyTenantGuard — the channel resolver
+  // runs BEFORE tenant context exists (it's the entry point that DISCOVERS
+  // which tenant owns the inbound). If a non-default channel resolves to
+  // (tenantX, agentX) but the gateway persisted the row under (default,
+  // default), the post-resolution tenant-scoped findById would return null
+  // and the turn would be silently dropped. This method atomically adopts
+  // the row to the resolved triplet so the inner tenant-scoped read finds
+  // it. Same sanctioned-bypass pattern as channelsRepo.findByExternalCrossTenant.
+  async adoptToResolvedTenantCrossTenant(args: {
+    id: string;
+    tenant_id: string;
+    agent_id: string;
+  }): Promise<void> {
+    await db
+      .update(mensagens)
+      .set({ tenant_id: args.tenant_id, agent_id: args.agent_id })
+      .where(eq(mensagens.id, args.id));
+  },
 };
 
 export const entidadesRepo = {
@@ -433,7 +548,8 @@ export const entidadesRepo = {
     return db.select().from(entidades).where(inArray(entidades.id, ids));
   },
   async create(input: Omit<Entidade, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>): Promise<Entidade> {
-    const rows = await db.insert(entidades).values(input).returning();
+    const guarded = applyTenantGuard(input);
+    const rows = await db.insert(entidades).values(guarded).returning();
     return rows[0]!;
   },
 };
@@ -458,7 +574,8 @@ export const contasRepo = {
       .where(inArray(contas_bancarias.entidade_id, scope.entidades));
   },
   async create(input: Omit<Conta, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>): Promise<Conta> {
-    const rows = await db.insert(contas_bancarias).values(input).returning();
+    const guarded = applyTenantGuard(input);
+    const rows = await db.insert(contas_bancarias).values(guarded).returning();
     return rows[0]!;
   },
   async addToBalance(id: string, delta: number): Promise<Conta | null> {
@@ -607,7 +724,8 @@ export const contrapartesRepo = {
     return rows[0] ?? null;
   },
   async create(input: Omit<Contraparte, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>): Promise<Contraparte> {
-    const rows = await db.insert(contrapartes).values(input).returning();
+    const guarded = applyTenantGuard(input);
+    const rows = await db.insert(contrapartes).values(guarded).returning();
     return rows[0]!;
   },
 };
@@ -648,7 +766,16 @@ export const factsRepo = {
       .insert(agent_facts)
       .values(guarded)
       .onConflictDoUpdate({
-        target: [agent_facts.escopo, agent_facts.chave],
+        // PR #82 review (Codex): conflict target must match the
+        // (tenant_id, agent_id, escopo, chave) unique introduced in
+        // migration 018 — otherwise tenant B can overwrite tenant A's
+        // fact by colliding on (escopo, chave).
+        target: [
+          agent_facts.tenant_id,
+          agent_facts.agent_id,
+          agent_facts.escopo,
+          agent_facts.chave,
+        ],
         set: {
           valor: input.valor as object,
           fonte: input.fonte,
@@ -672,6 +799,57 @@ export const factsRepo = {
           inArray(agent_facts.escopo, escopos),
         ),
       );
+  },
+  /**
+   * PR #82 review (Superpowers Critical #1): the legacy factsBlock in the
+   * system prompt was rendering every agent_fact unfiltered, bypassing the
+   * memory_entry sensitivity/mention_allowed model. This method returns
+   * only facts whose content has either (a) no corresponding memory_entry
+   * row yet (e.g. classifier hasn't run, or the fact predates P2) or
+   * (b) has a memory_entry that is needs_review=false AND mention_allowed=
+   * true. Sensitive/personal facts whose memory_entry says do-not-mention
+   * are dropped from the prompt.
+   *
+   * The match is by literal `content` against two known shapes:
+   *   1. P2-era persister: valor = { content, subject_id }, so the join
+   *      is `me.content = af.valor->>'content'`.
+   *   2. Legacy (pre-P2) facts: migration 017 seeded memory_entry with
+   *      `content = CONCAT(af.chave, ': ', af.valor::text)`. If the fact's
+   *      `valor` happened to already include a `content` key, shape (1)
+   *      alone wouldn't catch it until the reclassifier worker rewrote
+   *      that entry. We also match shape (2) so the sensitivity filter
+   *      is correct during the reclassifier-backlog window.
+   *
+   * Facts predating P2 with NO memory_entry row at all are still shown —
+   * a conservative default for migration-window legacy data, since the
+   * 017 seed guarantees they get a needs_review=true entry the reclassifier
+   * will eventually re-evaluate.
+   */
+  async listMentionableForScopes(escopos: string[]): Promise<AgentFact[]> {
+    if (escopos.length === 0) return [];
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const result = await db.execute<AgentFact>(sql`
+      SELECT af.*
+      FROM agent_facts af
+      WHERE af.tenant_id = ${tenant_id}
+        AND af.agent_id = ${agent_id}
+        AND af.escopo = ANY(${escopos})
+        AND NOT EXISTS (
+          SELECT 1 FROM memory_entry me
+          WHERE me.tenant_id = af.tenant_id
+            AND me.agent_id = af.agent_id
+            AND (
+              me.content = (af.valor->>'content')
+              OR me.content = (af.chave || ': ' || af.valor::text)
+            )
+            AND (
+              me.needs_review = true
+              OR me.mention_allowed = false
+            )
+        )
+    `);
+    return Array.from(result.rows as unknown as AgentFact[]);
   },
 };
 
@@ -775,7 +953,8 @@ type PendingQuestionInsert = Omit<
 
 export const pendingQuestionsRepo = {
   async create(input: PendingQuestionInsert): Promise<PendingQuestion> {
-    const rows = await db.insert(pending_questions).values(input).returning();
+    const guarded = applyTenantGuard(input);
+    const rows = await db.insert(pending_questions).values(guarded).returning();
     return rows[0]!;
   },
   async findOpen(conversa_id: string): Promise<PendingQuestion | null> {
@@ -904,7 +1083,8 @@ export const pendingQuestionsRepo = {
     // index `(conversa_id) WHERE status='aberta'` from migration 004. Doing
     // the insert on the global pool would race with the in-flight cancel and
     // hit a duplicate-key error.
-    const rows = await tx.insert(pending_questions).values(input).returning();
+    const guarded = applyTenantGuard(input);
+    const rows = await tx.insert(pending_questions).values(guarded).returning();
     return rows[0]!;
   },
 };
@@ -989,26 +1169,51 @@ export const auditRepo = {
 };
 
 export const workflowsRepo = {
+  // P83-C7: tenant-scoped workflow reads/writes.
   async create(input: Omit<Workflow, 'id' | 'tenant_id' | 'agent_id' | 'iniciado_em' | 'concluido_em'>): Promise<Workflow> {
-    const rows = await db.insert(workflows).values(input).returning();
+    const guarded = applyTenantGuard(input);
+    const rows = await db.insert(workflows).values(guarded).returning();
     return rows[0]!;
   },
   async byId(id: string): Promise<Workflow | null> {
-    const rows = await db.select().from(workflows).where(eq(workflows.id, id)).limit(1);
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(workflows)
+      .where(and(
+        eq(workflows.id, id),
+        eq(workflows.tenant_id, tenant_id),
+        eq(workflows.agent_id, agent_id),
+      ))
+      .limit(1);
     return rows[0] ?? null;
   },
   async setStatus(id: string, status: Workflow['status']): Promise<void> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const update: Record<string, unknown> = { status };
     if (status === 'concluido') update.concluido_em = new Date();
-    await db.update(workflows).set(update).where(eq(workflows.id, id));
+    await db
+      .update(workflows)
+      .set(update)
+      .where(and(
+        eq(workflows.id, id),
+        eq(workflows.tenant_id, tenant_id),
+        eq(workflows.agent_id, agent_id),
+      ));
   },
   async listPending(): Promise<Workflow[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     return db
       .select()
       .from(workflows)
-      .where(
+      .where(and(
+        eq(workflows.tenant_id, tenant_id),
+        eq(workflows.agent_id, agent_id),
         sql`status IN ('pendente','em_andamento','aguardando_humano','aguardando_terceiro')`,
-      );
+      ));
   },
 };
 
@@ -1017,7 +1222,8 @@ export const workflowStepsRepo = {
     inputs: Omit<WorkflowStep, 'id' | 'tenant_id' | 'agent_id' | 'iniciado_em' | 'concluido_em'>[],
   ): Promise<WorkflowStep[]> {
     if (inputs.length === 0) return [];
-    return db.insert(workflow_steps).values(inputs).returning();
+    const guarded = inputs.map((i) => applyTenantGuard(i));
+    return db.insert(workflow_steps).values(guarded).returning();
   },
   async byWorkflow(workflow_id: string): Promise<WorkflowStep[]> {
     return db
@@ -1177,8 +1383,17 @@ export const agentsRepo = {
 };
 
 export const cognitiveModuleLogRepo = {
+  // PR #75 review (Superpowers finding #6): cognitive_module_log é tenant-aware
+  // (tenant_id + agent_id NOT NULL desde migration 008). O caller atual
+  // (reflection.ts) já passa tenant_id/agent_id explicitamente e roda dentro
+  // de runWithTenantContext, mas aplicamos `applyTenantGuard` aqui pra:
+  //   1. Falhar fechado se algum caller futuro esquecer o contexto.
+  //   2. Detectar mismatch entre input e contexto (caller passou tenant errado).
+  // O DEFAULT 'default' do schema fica como rede de segurança em P0 — sweep
+  // de DROP DEFAULT está agendado pro pós-P0 (finding #7).
   async record(entry: Omit<CognitiveModuleLog, 'id' | 'created_at'>): Promise<void> {
-    await db.insert(cognitive_module_log).values(entry);
+    const guarded = applyTenantGuard(entry as Record<string, unknown>);
+    await db.insert(cognitive_module_log).values(guarded as typeof entry);
   },
 
   async recentByModule(module_name: string, limit = 100): Promise<CognitiveModuleLog[]> {
@@ -1223,6 +1438,34 @@ export const cognitiveCandidatesRepo = {
       .set({ status: 'consumed', consumed_by_phase: phase, consumed_at: new Date() })
       .where(eq(cognitive_candidates.id, id));
   },
+
+  /**
+   * Returns the distinct (tenant_id, agent_id) pairs that own at least
+   * one pending candidate of the requested type. Used by workers that
+   * must fan out across tenants (e.g., procedure_candidate_consumer).
+   *
+   * NOTE: This method intentionally does NOT use the tenant guard —
+   * iteration is part of the worker's contract. Callers MUST invoke it
+   * once at worker startup and then wrap per-pair processing in
+   * `runWithTenantContext`. (P83-C2)
+   */
+  async listPendingTenantPairsForType(
+    candidate_type: string,
+  ): Promise<Array<{ tenant_id: string; agent_id: string }>> {
+    const rows = await db
+      .selectDistinct({
+        tenant_id: cognitive_candidates.tenant_id,
+        agent_id: cognitive_candidates.agent_id,
+      })
+      .from(cognitive_candidates)
+      .where(
+        and(
+          eq(cognitive_candidates.status, 'pending'),
+          eq(cognitive_candidates.candidate_type, candidate_type),
+        ),
+      );
+    return rows;
+  },
 };
 
 export const memoryEntryRepo = {
@@ -1237,17 +1480,26 @@ export const memoryEntryRepo = {
   async findRelevant(opts: {
     interlocutor_id?: string;
     role_id?: string;
+    channel_id?: string;
     conversa_id?: string;
     limit?: number;
   }): Promise<MemoryEntry[]> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
+    const now = new Date();
     const conds = [
       eq(memory_entry.tenant_id, tenant_id),
       eq(memory_entry.agent_id, agent_id),
       eq(memory_entry.needs_review, false),
+      // PR #82 review (Codex medium + Superpowers Critical #2): TTL must
+      // be enforced at query time. Entries past expires_at MUST NOT be
+      // returned to the prompt builder. NULL expires_at = no TTL.
+      or(isNull(memory_entry.expires_at), gt(memory_entry.expires_at, now)),
     ];
-    // Filtrar por scope_type + subject_id apropriado
+    // Filtrar por scope_type + subject_id apropriado. PR #82 review
+    // (Superpowers Critical #4): role/channel devem só ser incluídos
+    // quando o caller passar o subject id correspondente — senão a
+    // memória escopada por role/channel atravessa todas as fronteiras.
     const orConds = [];
     if (opts.interlocutor_id) {
       orConds.push(
@@ -1260,6 +1512,14 @@ export const memoryEntryRepo = {
     if (opts.role_id) {
       orConds.push(
         and(eq(memory_entry.scope_type, 'role'), eq(memory_entry.subject_id, opts.role_id)),
+      );
+    }
+    if (opts.channel_id) {
+      orConds.push(
+        and(
+          eq(memory_entry.scope_type, 'channel'),
+          eq(memory_entry.subject_id, opts.channel_id),
+        ),
       );
     }
     if (opts.conversa_id) {
@@ -1292,9 +1552,17 @@ export const memoryEntryRepo = {
       subject_id?: string;
     },
   ): Promise<void> {
+    // PR #82 review (Superpowers Critical #3): when promoting a candidate
+    // out of needs_review, compute expires_at from ttl_days so that the
+    // TTL filter in findRelevant can actually evict the row. Without this
+    // a sensitive memory with ttl_days=7 was kept indefinitely.
+    const expires_at =
+      updates.ttl_days != null
+        ? new Date(Date.now() + updates.ttl_days * 24 * 60 * 60 * 1000)
+        : null;
     await db
       .update(memory_entry)
-      .set({ ...updates, needs_review: false, updated_at: new Date() })
+      .set({ ...updates, expires_at, needs_review: false, updated_at: new Date() })
       .where(eq(memory_entry.id, id));
   },
 
@@ -1642,7 +1910,10 @@ export const procedureDefinitionsRepo = {
     input: Omit<ProcedureDefinition, 'id' | 'created_at' | 'updated_at' | 'tenant_id' | 'agent_id'>,
   ): Promise<ProcedureDefinition> {
     const guarded = applyTenantGuard(input);
-    const [row] = await db.insert(procedure_definitions).values(guarded as any).returning();
+    const [row] = await db
+      .insert(procedure_definitions)
+      .values(guarded as typeof procedure_definitions.$inferInsert)
+      .returning();
     return row!;
   },
 
@@ -1663,8 +1934,22 @@ export const procedureDefinitionsRepo = {
     return rows[0] ?? null;
   },
 
+  /**
+   * Tenant-scoped findById. Returns null if the row exists but belongs
+   * to a different tenant/agent (P83-H5: prevent cross-tenant access by id).
+   */
   async findById(id: string): Promise<ProcedureDefinition | null> {
-    const rows = await db.select().from(procedure_definitions).where(eq(procedure_definitions.id, id)).limit(1);
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(procedure_definitions)
+      .where(and(
+        eq(procedure_definitions.id, id),
+        eq(procedure_definitions.tenant_id, tenant_id),
+        eq(procedure_definitions.agent_id, agent_id),
+      ))
+      .limit(1);
     return rows[0] ?? null;
   },
 
@@ -1683,14 +1968,24 @@ export const procedureDefinitionsRepo = {
       .limit(limit);
   },
 
-  async updateStatus(
-    id: string,
-    updates: { status: string; approved_by?: string; approved_at?: Date | null; activated_at?: Date | null; deactivated_at?: Date | null; proposed_by?: string },
-  ): Promise<void> {
-    await db
+  /**
+   * Tenant-scoped status update. (P83-H5)
+   * Returns number of affected rows so callers can detect cross-tenant
+   * attempts (0 rows updated = id belongs to another tenant or doesn't exist).
+   */
+  async updateStatus(id: string, updates: ProcedureStatusUpdate): Promise<number> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
       .update(procedure_definitions)
       .set({ ...updates, updated_at: new Date() })
-      .where(eq(procedure_definitions.id, id));
+      .where(and(
+        eq(procedure_definitions.id, id),
+        eq(procedure_definitions.tenant_id, tenant_id),
+        eq(procedure_definitions.agent_id, agent_id),
+      ))
+      .returning({ id: procedure_definitions.id });
+    return rows.length;
   },
 
   async listAllVersionsByName(nome: string): Promise<ProcedureDefinition[]> {
@@ -1706,16 +2001,189 @@ export const procedureDefinitionsRepo = {
       ))
       .orderBy(desc(procedure_definitions.version_number));
   },
+
+  /**
+   * Atomically activate `target_id` and freeze any other active version
+   * of the same `nome` within the same tenant/agent. The whole operation
+   * runs in a single transaction with row-level locking so concurrent
+   * approvers cannot leave two rows in `status='active'`. Combined with
+   * the UNIQUE partial index `procedure_def_active_uniq_idx`, this makes
+   * dual-active a hard impossibility at both the application and DB
+   * layers. (P83-C4)
+   */
+  async atomicActivate(args: {
+    target_id: string;
+    actor: string;
+    preserve_activated_at?: boolean;
+  }): Promise<{
+    activated: ProcedureDefinition;
+    deactivated: ProcedureDefinition | null;
+  }> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const now = new Date();
+
+    return withTx(async (tx) => {
+      // 1) Lock the row we want to activate FOR UPDATE. Also confirms
+      // tenant-scope.
+      const targetRows = await tx
+        .select()
+        .from(procedure_definitions)
+        .where(and(
+          eq(procedure_definitions.id, args.target_id),
+          eq(procedure_definitions.tenant_id, tenant_id),
+          eq(procedure_definitions.agent_id, agent_id),
+        ))
+        .for('update');
+      const target = targetRows[0];
+      if (!target) {
+        throw new Error(`procedure_definition ${args.target_id} not found in current tenant`);
+      }
+
+      // 2) Lock any currently active sibling rows (same nome) so two
+      // concurrent activations serialize on this set.
+      const activeSiblings = await tx
+        .select()
+        .from(procedure_definitions)
+        .where(and(
+          eq(procedure_definitions.tenant_id, tenant_id),
+          eq(procedure_definitions.agent_id, agent_id),
+          eq(procedure_definitions.nome, target.nome),
+          eq(procedure_definitions.status, 'active'),
+          ne(procedure_definitions.id, target.id),
+        ))
+        .for('update');
+
+      let deactivated: ProcedureDefinition | null = null;
+      if (activeSiblings.length > 0) {
+        // Migrate constraint guarantees at most one, but we defensively
+        // handle a list. Freeze each, then return the first as the
+        // deactivated row.
+        for (const sib of activeSiblings) {
+          const [updated] = await tx
+            .update(procedure_definitions)
+            .set({ status: 'frozen', deactivated_at: now, updated_at: now })
+            .where(eq(procedure_definitions.id, sib.id))
+            .returning();
+          if (updated && !deactivated) deactivated = updated;
+        }
+      }
+
+      // 3) Promote the target to active. Preserve original activated_at
+      // if it was already set (H1 — keep first-activation timestamp).
+      const setPayload: ProcedureStatusUpdate & { updated_at: Date } = {
+        status: 'active',
+        approved_by: args.actor,
+        approved_at: now,
+        deactivated_at: null,
+        updated_at: now,
+      };
+      if (!args.preserve_activated_at || target.activated_at == null) {
+        setPayload.activated_at = now;
+      }
+      const [activated] = await tx
+        .update(procedure_definitions)
+        .set(setPayload)
+        .where(eq(procedure_definitions.id, target.id))
+        .returning();
+      if (!activated) {
+        throw new Error(`procedure_definition ${target.id} disappeared mid-transaction`);
+      }
+
+      // 4) Append event-sourcing rows for the audit trail (H2).
+      await tx.insert(procedure_status_events).values({
+        tenant_id,
+        agent_id,
+        definition_id: target.id,
+        from_status: target.status,
+        to_status: 'active',
+        actor: args.actor,
+      });
+      if (deactivated) {
+        await tx.insert(procedure_status_events).values({
+          tenant_id,
+          agent_id,
+          definition_id: deactivated.id,
+          from_status: 'active',
+          to_status: 'frozen',
+          actor: args.actor,
+          reason: `superseded by ${target.id}`,
+        });
+      }
+
+      return { activated, deactivated };
+    });
+  },
+};
+
+export const procedureStatusEventsRepo = {
+  async record(input: {
+    definition_id: string;
+    from_status: string;
+    to_status: string;
+    actor: string;
+    reason?: string;
+  }): Promise<void> {
+    const guarded = applyTenantGuard({
+      definition_id: input.definition_id,
+      from_status: input.from_status,
+      to_status: input.to_status,
+      actor: input.actor,
+      reason: input.reason ?? null,
+    });
+    await db.insert(procedure_status_events).values(guarded);
+  },
+
+  async listByDefinition(definition_id: string): Promise<ProcedureStatusEvent[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(procedure_status_events)
+      .where(and(
+        eq(procedure_status_events.tenant_id, tenant_id),
+        eq(procedure_status_events.agent_id, agent_id),
+        eq(procedure_status_events.definition_id, definition_id),
+      ))
+      .orderBy(desc(procedure_status_events.occurred_at));
+  },
 };
 
 export const procedureAssignmentsRepo = {
+  /**
+   * Create an assignment. P83-H6: refuses to assign a procedure whose
+   * `definition_id` belongs to a different tenant. The FK only enforces
+   * referential integrity, not tenant-isolation, so we cross-check here.
+   */
   async create(
     input: Omit<ProcedureAssignment, 'id' | 'activated_at' | 'tenant_id'>,
   ): Promise<ProcedureAssignment> {
     const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+
+    // Verify the referenced definition is in the caller's tenant.
+    const defRows = await db
+      .select({
+        id: procedure_definitions.id,
+        tenant_id: procedure_definitions.tenant_id,
+        agent_id: procedure_definitions.agent_id,
+      })
+      .from(procedure_definitions)
+      .where(eq(procedure_definitions.id, input.definition_id))
+      .limit(1);
+    const def = defRows[0];
+    if (!def) {
+      throw new Error(`procedure_definition ${input.definition_id} does not exist`);
+    }
+    if (def.tenant_id !== tenant_id || def.agent_id !== agent_id) {
+      throw new Error(
+        `cross-tenant assignment refused: definition ${input.definition_id} belongs to a different tenant/agent`,
+      );
+    }
+
     const [row] = await db
       .insert(procedure_assignments)
-      .values({ ...input, tenant_id } as any)
+      .values({ ...input, tenant_id } as typeof procedure_assignments.$inferInsert)
       .returning();
     return row!;
   },
@@ -1767,15 +2235,101 @@ export const procedureExecutionsRepo = {
     return rows[0] ?? null;
   },
 
+  // P84-C1: tenant-scoped read. The previous implementation queried by id
+  // alone — UUID collisions are astronomically unlikely but the project's
+  // tenant-isolation invariant is structural, not probabilistic. Every
+  // cross-tenant query path must be closed by code.
   async findById(id: string): Promise<ProcedureExecution | null> {
-    const rows = await db.select().from(procedure_executions).where(eq(procedure_executions.id, id)).limit(1);
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(procedure_executions)
+      .where(and(
+        eq(procedure_executions.id, id),
+        eq(procedure_executions.tenant_id, tenant_id),
+        eq(procedure_executions.agent_id, agent_id),
+      ))
+      .limit(1);
     return rows[0] ?? null;
+  },
+
+  // P84-C2: tenant-scoped create with ON CONFLICT no-op on the
+  // (tenant,agent,conversa) WHERE status='in_progress' partial unique index
+  // shipped in migration 023. When two workers race and both see
+  // activeExecution=null → both call startExecution, the second insert is
+  // rejected by the constraint; we swallow it and return null so the caller
+  // re-loads the active row.
+  async createOrFindActive(
+    input: Omit<ProcedureExecution, 'id' | 'started_at' | 'last_activity_at' | 'tenant_id' | 'agent_id'>,
+  ): Promise<{ execution: ProcedureExecution; created: boolean }> {
+    const guarded = applyTenantGuard(input);
+    const rows = await db
+      .insert(procedure_executions)
+      .values(guarded as any)
+      .onConflictDoNothing({
+        target: [
+          procedure_executions.tenant_id,
+          procedure_executions.agent_id,
+          procedure_executions.conversa_id,
+        ],
+        // index_predicate for the partial unique index defined in
+        // migration 023_p3b_unique_in_progress_per_conversa.sql. The
+        // predicate MUST match the migration's `WHERE` exactly so Postgres'
+        // partial-index inference engine can match this ON CONFLICT to the
+        // index — relying on column-presence inference alone is brittle.
+        where: sql`status = 'in_progress' AND conversa_id IS NOT NULL`,
+      })
+      .returning();
+
+    if (rows[0]) {
+      return { execution: rows[0], created: true };
+    }
+
+    // Conflict path: another worker created an in_progress execution for
+    // the same conversa concurrently. Re-load and return it. conversa_id
+    // is guaranteed non-null here because the partial index only applies
+    // when conversa_id IS NOT NULL (and a null conversa_id can't conflict).
+    if (guarded.conversa_id == null) {
+      throw new Error('procedureExecutionsRepo.createOrFindActive: insert returned no row and conversa_id is null');
+    }
+    const existing = await procedureExecutionsRepo.findActiveForConversa(guarded.conversa_id as string);
+    if (!existing) {
+      throw new Error('procedureExecutionsRepo.createOrFindActive: conflict but no active row found');
+    }
+    return { execution: existing, created: false };
+  },
+
+  // P84-C5 / P3c fix P85-I1: transaction-aware variant. When called from
+  // inside a withTx() block, all writes commit together with the caller's
+  // events. Used by the engine (advance/complete/abort) and by the reaper
+  // (auto_abandoned event + status update must be atomic — without this, a
+  // process crash between event-write and status-write produces a duplicate
+  // auto_abandoned event on the next reaper tick).
+  async updateStateTx(
+    tx: typeof db,
+    id: string,
+    updates: Partial<{
+      current_step_id: string | null;
+      execution_state: any;
+      completed_steps: any;
+      last_activity_at: Date;
+      status: string;
+      outcome: string;
+      ended_at: Date;
+      notes: string;
+    }>,
+  ): Promise<void> {
+    await tx
+      .update(procedure_executions)
+      .set({ ...updates, last_activity_at: new Date() } as any)
+      .where(eq(procedure_executions.id, id));
   },
 
   async updateState(
     id: string,
     updates: Partial<{
-      current_step_id: string;
+      current_step_id: string | null;
       execution_state: any;
       completed_steps: any;
       last_activity_at: Date;
@@ -1818,11 +2372,34 @@ export const procedureExecutionEventsRepo = {
     await db.insert(procedure_execution_events).values(guarded as any);
   },
 
+  // P84-C5 / P3c fix P85-I1: transaction-aware variant. Lets the engine
+  // commit recordEvent+updateState atomically inside withTx(), and lets the
+  // reaper atomically pair the audit-event INSERT with the
+  // procedure-execution UPDATE. The applyTenantGuard call still binds
+  // tenant/agent from AsyncLocalStorage so tenant isolation is preserved
+  // across the transaction boundary.
+  async recordTx(
+    tx: typeof db,
+    input: Omit<ProcedureExecutionEvent, 'id' | 'created_at' | 'tenant_id' | 'agent_id'>,
+  ): Promise<void> {
+    const guarded = applyTenantGuard(input);
+    await tx.insert(procedure_execution_events).values(guarded as any);
+  },
+
+  // P84-C1: tenant-scoped read. Mirror the pattern in findById — never
+  // trust the execution_id alone, even though FKs make a cross-tenant
+  // collision unlikely. Audit trail reads must respect tenant boundaries.
   async listByExecution(execution_id: string): Promise<ProcedureExecutionEvent[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     return db
       .select()
       .from(procedure_execution_events)
-      .where(eq(procedure_execution_events.execution_id, execution_id))
+      .where(and(
+        eq(procedure_execution_events.execution_id, execution_id),
+        eq(procedure_execution_events.tenant_id, tenant_id),
+        eq(procedure_execution_events.agent_id, agent_id),
+      ))
       .orderBy(procedure_execution_events.created_at);
   },
 };
