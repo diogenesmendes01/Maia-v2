@@ -15,6 +15,50 @@ import { classify } from '@/cognition/classifier.js';
 import { persistCandidate } from '@/cognition/persister.js';
 import { runCognitiveModule } from '@/cognition/runner.js';
 import { CognitiveEventType } from '@/types/enums.js';
+import { buildToolSummary, type ToolExecutionSummary } from './tool-execution-summary.js';
+
+/**
+ * Codex C1 (PR #74): when the ReAct loop exits without dispatching outbound
+ * (iteration cap, empty final text, or outbound failure) but tools ran,
+ * persist the tool summaries via a placeholder "event-only" mensagem so
+ * the next turn's prompt-builder can still surface them in the
+ * "## Eventos confirmados pelo backend" block. Best-effort: if persistence
+ * fails, the next turn loses its anchor — that's the soft failure mode.
+ */
+async function flushUnconfirmedToolSummaries(
+  conversa_id: string,
+  inbound_id: string,
+  toolSummaries: ToolExecutionSummary[],
+  reason: 'iteration_cap' | 'empty_final_text' | 'outbound_failure',
+): Promise<void> {
+  if (toolSummaries.length === 0) return;
+  try {
+    await mensagensRepo.create({
+      conversa_id,
+      direcao: 'out',
+      tipo: 'evento',
+      conteudo: '',
+      midia_url: null,
+      metadata: {
+        in_reply_to: inbound_id,
+        event_only: true,
+        flush_reason: reason,
+      },
+      processada_em: new Date(),
+      ferramentas_chamadas: toolSummaries,
+      tokens_usados: null,
+    });
+    logger.info(
+      { conversa_id, inbound_id, count: toolSummaries.length, reason },
+      'agent.tool_summaries_flushed_no_outbound',
+    );
+  } catch (err) {
+    logger.warn(
+      { err: (err as Error).message, conversa_id, reason },
+      'agent.tool_summaries_flush_failed',
+    );
+  }
+}
 
 export const MAX_REACT_ITERATIONS = 5;
 
@@ -69,6 +113,20 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
   let latestReportPdf: LatestReportPdf | null = null;
   let outboundText = '';
   const toolsCalled: Array<{ name: string; result: unknown }> = [];
+  // Issue #73 — accumulator of structured per-tool summaries used both for
+  // anti-anchoring (next-turn events block) and as the audit trail. Persisted
+  // in `mensagens.ferramentas_chamadas` of the dispatched outbound, or via
+  // `flushUnconfirmedToolSummaries` when no outbound was dispatched.
+  const toolSummaries: ToolExecutionSummary[] = [];
+  // Codex C1 (PR #74): tracks whether any iteration successfully ran the
+  // outbound dispatch path. `false` at exit + non-empty toolSummaries triggers
+  // the placeholder flush so the next turn's anchor isn't lost.
+  let outboundDispatched = false;
+  // Reason recorded when we exit the loop without dispatching outbound.
+  // Defaults to empty_final_text (the model returned no end_turn text);
+  // overridden to 'iteration_cap' when we hit MAX_REACT_ITERATIONS.
+  let exitReason: 'iteration_cap' | 'empty_final_text' | 'outbound_failure' =
+    'empty_final_text';
 
   for (let i = 0; i < MAX_REACT_ITERATIONS; i++) {
     const reasonerResult = await runCognitiveModule(
@@ -124,6 +182,7 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
           turnHasSensitive,
           sensitiveTools,
         });
+        outboundDispatched = true;
 
         // P1 reflection trigger: INTERNAL_GAP. Inspects the final outbound
         // text for self-recognized gaps ("não sei", "preciso verificar",
