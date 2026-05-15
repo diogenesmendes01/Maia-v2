@@ -11,9 +11,14 @@
  * Defesa em runtime: o caso (3)/(4) garante que `proposed`/`frozen` NUNCA
  * entram no system prompt mesmo se a invariant da DB (unique index parcial
  * `agent_op_profile_unique_active_idx`) for violada.
+ *
+ * v3.1.1: o RenderedProfile só carrega `system_prompt_block` (identidade +
+ * estilo) e `version_label`. Os blocos `growth_hints_block` e
+ * `episodic_summary_block` foram removidos (migraram para Evolution Pipeline e
+ * User Layer respectivamente).
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import type { AgentOperationalProfileVersion } from '../../src/db/schema.js';
+import type { AgentOperationalProfileVersion, ProfileBody } from '../../src/db/schema.js';
 
 const selfStateGetActive = vi.fn();
 const operationalProfileVersionsGetActive = vi.fn();
@@ -62,8 +67,29 @@ vi.mock('../../src/lib/logger.js', () => ({
   },
 }));
 
+const defaultProfileBody: ProfileBody = {
+  schema_version: 'v3.1.1-2026-05-15',
+  identity: {
+    role_descriptor: 'V2_ROLE_DESCRIPTOR',
+    voice: { tone: 'V2_TONE', formality: 'medium', verbosity: 'concise' },
+    cognitive_limits: {
+      max_inference_depth: 3,
+      max_speculation_in_response: 0.2,
+      confidence_floor_for_action: 0.7,
+    },
+    priorities: ['V2_PRIORITY_A'],
+    learned_voice_modifiers: [],
+  },
+  style: { language: 'pt-BR', rhythm: {} },
+  metadata: {
+    effective_from: '2026-05-15T00:00:00Z',
+    created_by: 'test',
+    previous_version_id: null,
+  },
+};
+
 function buildVersion(
-  overrides: Partial<AgentOperationalProfileVersion>,
+  overrides: Partial<AgentOperationalProfileVersion> = {},
 ): AgentOperationalProfileVersion {
   return {
     id: 'prof-1',
@@ -71,16 +97,7 @@ function buildVersion(
     agent_id: 'default',
     version: 3,
     status: 'active',
-    core_immutable: {
-      identity_block: 'V2_IDENTITY_BLOCK',
-      principles: ['princípio A', 'princípio B'],
-    },
-    operational_profile: {
-      voice_descriptor: 'voz V2',
-      thresholds: { confirm_limit_brl: 500 },
-    },
-    episodic_temp: {},
-    growth_backlog: {},
+    profile_body: defaultProfileBody,
     proposed_by: 'system_seed',
     proposed_reason: null,
     approved_by: null,
@@ -184,48 +201,30 @@ describe('buildPrompt — dual-read sob FEATURE_OPERATIONAL_PROFILE_V2', () => {
     const { FeatureFlagName } = await import('../../src/types/enums.js');
     featureFlags.override(FeatureFlagName.OPERATIONAL_PROFILE_V2, true);
 
-    operationalProfileVersionsGetActive.mockResolvedValue(
-      buildVersion({
-        status: 'active',
-        core_immutable: {
-          identity_block: 'V2_IDENTITY_BLOCK',
-          principles: ['princípio A'],
-        },
-        operational_profile: {
-          voice_descriptor: 'voz V2',
-        },
-        growth_backlog: ['feature G1'],
-        episodic_temp: {
-          entries: [
-            {
-              summary: 'episódio recente OK',
-              mention_allowed: true,
-              proactive_use: true,
-            },
-          ],
-        },
-      }),
-    );
+    operationalProfileVersionsGetActive.mockResolvedValue(buildVersion({ status: 'active' }));
 
     const { buildPrompt } = await import('../../src/agent/prompt-builder.js');
     const { system } = await buildPrompt(ctx);
 
-    expect(system).toContain('V2_IDENTITY_BLOCK');
-    expect(system).toContain('## Princípios');
-    expect(system).toContain('- princípio A');
-    expect(system).toContain('## Voz operacional');
-    expect(system).toContain('voz V2');
+    // v3.1.1: system_prompt_block traz identidade (papel, tom, prioridades,
+    // limites cognitivos) + estilo (idioma). É a única fonte de verdade da
+    // Identity Layer.
+    expect(system).toContain('## Identidade operacional');
+    expect(system).toContain('V2_ROLE_DESCRIPTOR');
+    expect(system).toContain('V2_TONE');
+    expect(system).toContain('V2_PRIORITY_A');
+    expect(system).toContain('## Estilo');
+    expect(system).toContain('pt-BR');
     // Versão indicada vem do op_profile, não do self_state.
     expect(system).toContain('op_profile_v3');
     expect(system).not.toContain('self_state_v7');
     // Bloco legado NÃO deve aparecer.
     expect(system).not.toContain('LEGACY_SYSTEM_PROMPT_BODY');
     expect(system).not.toContain('LEGACY_RESUMO');
-    // Blocos extras de V2 (growth + episodic).
-    expect(system).toContain('## Capacidades em desenvolvimento');
-    expect(system).toContain('- feature G1');
-    expect(system).toContain('## Contexto recente');
-    expect(system).toContain('- episódio recente OK');
+    // Conteúdo dos blocos removidos em v3.1.1 NÃO deve aparecer no prompt
+    // (growth_backlog → Evolution Pipeline P5/P9; episodic_temp → User Layer P8c).
+    expect(system).not.toContain('## Capacidades em desenvolvimento');
+    expect(system).not.toContain('## Contexto recente');
     // self_state NUNCA é consultado quando há profile ativo.
     expect(selfStateGetActive).not.toHaveBeenCalled();
     expect(operationalProfileVersionsGetActive).toHaveBeenCalledTimes(1);
@@ -240,8 +239,9 @@ describe('buildPrompt — dual-read sob FEATURE_OPERATIONAL_PROFILE_V2', () => {
     operationalProfileVersionsGetActive.mockResolvedValue(
       buildVersion({
         status: 'proposed',
-        core_immutable: {
-          identity_block: 'V2_IDENTITY_BLOCK_PROPOSED',
+        profile_body: {
+          ...defaultProfileBody,
+          identity: { ...defaultProfileBody.identity, role_descriptor: 'V2_ROLE_PROPOSED' },
         },
       }),
     );
@@ -252,7 +252,7 @@ describe('buildPrompt — dual-read sob FEATURE_OPERATIONAL_PROFILE_V2', () => {
     // Fallback para self_state — o conteúdo `proposed` JAMAIS entra no prompt.
     expect(system).toContain('LEGACY_SYSTEM_PROMPT_BODY');
     expect(system).toContain('self_state_v7');
-    expect(system).not.toContain('V2_IDENTITY_BLOCK_PROPOSED');
+    expect(system).not.toContain('V2_ROLE_PROPOSED');
     // Warning emitido com status visível.
     expect(loggerWarn).toHaveBeenCalledTimes(1);
     const [meta, msg] = loggerWarn.mock.calls[0]!;
@@ -270,8 +270,9 @@ describe('buildPrompt — dual-read sob FEATURE_OPERATIONAL_PROFILE_V2', () => {
     operationalProfileVersionsGetActive.mockResolvedValue(
       buildVersion({
         status: 'frozen',
-        core_immutable: {
-          identity_block: 'V2_IDENTITY_BLOCK_FROZEN',
+        profile_body: {
+          ...defaultProfileBody,
+          identity: { ...defaultProfileBody.identity, role_descriptor: 'V2_ROLE_FROZEN' },
         },
       }),
     );
@@ -281,7 +282,7 @@ describe('buildPrompt — dual-read sob FEATURE_OPERATIONAL_PROFILE_V2', () => {
 
     expect(system).toContain('LEGACY_SYSTEM_PROMPT_BODY');
     expect(system).toContain('self_state_v7');
-    expect(system).not.toContain('V2_IDENTITY_BLOCK_FROZEN');
+    expect(system).not.toContain('V2_ROLE_FROZEN');
     expect(loggerWarn).toHaveBeenCalledTimes(1);
     const [meta, msg] = loggerWarn.mock.calls[0]!;
     expect(meta).toEqual({ has_profile: true, status: 'frozen' });

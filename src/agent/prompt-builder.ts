@@ -365,9 +365,10 @@ ${stateJson}`;
     + memorySection
     + hintsSection
     + selfAwarenessSection
-    + procedureSection
-    + (renderedV2?.growth_hints_block ? '\n' + renderedV2.growth_hints_block : '')
-    + (renderedV2?.episodic_summary_block ? '\n' + renderedV2.episodic_summary_block : '');
+    + procedureSection;
+  // v3.1.1: growth_hints_block e episodic_summary_block foram removidos do
+  // RenderedProfile. growth_backlog → Evolution Pipeline (P5/P9 capability_proposals);
+  // episodic_temp → User Layer (P8c). Identity Layer não carrega esse conteúdo.
 
   // Build conversation messages: oldest first
   const ordered = [...recent].reverse();
