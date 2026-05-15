@@ -20,7 +20,6 @@ import { InMemorySliceCache } from '@/runtime/context-packet/cache/slice-cache.j
 import type { SliceBuilderSet } from '@/runtime/context-packet/build-context-packet.js';
 import type {
   SliceBuilder,
-  SliceBuilderInput,
   SliceBuilderResult,
 } from '@/runtime/context-assembly/slice-builders/_types.js';
 import type {
@@ -167,7 +166,8 @@ describe('buildContextPacket orchestrator', () => {
 
   it('user builder failure → degrades to empty, packet still completes', async () => {
     const { builders } = makeStandardBuilders();
-    const failingUser: SliceBuilder<unknown, ReturnType<typeof unwrap>> = {
+    type UserSliceType = import('@/runtime/context-packet/types.js').UserSlice;
+    const failingUser: SliceBuilder<unknown, UserSliceType> = {
       name: 'user',
       build: async () => {
         throw new Error('user repo timeout');
@@ -257,13 +257,3 @@ describe('buildContextPacket orchestrator', () => {
   });
 });
 
-function unwrap(): import('@/runtime/context-packet/types.js').UserSlice {
-  // type helper for the failing user test above
-  return {
-    pessoa: null,
-    preferences: {},
-    memories: [],
-    behavioral_hints: [],
-    truncated: false,
-  };
-}

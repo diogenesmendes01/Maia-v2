@@ -9,7 +9,6 @@ import {
   InvalidationBus,
   wireDefaultInvalidationHandlers,
   EVENT_TO_SLICE,
-  type InvalidationEvent,
   type InvalidationEventType,
 } from '@/runtime/context-packet/cache/invalidation-bus.js';
 import { InMemorySliceCache } from '@/runtime/context-packet/cache/slice-cache.js';

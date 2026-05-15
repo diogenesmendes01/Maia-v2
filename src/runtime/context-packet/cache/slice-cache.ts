@@ -138,7 +138,7 @@ export class RedisSliceCache implements SliceCache {
 function patternToRegex(pattern: string): RegExp {
   // Convert redis-style glob (`*`, `?`) to JS regex. Escape every other
   // metacharacter conservatively.
-  const escaped = pattern.replace(/[\\^$.+(){}\[\]|]/g, '\\$&');
+  const escaped = pattern.replace(/[\\^$.+(){}[\]|]/g, '\\$&');
   const regexBody = escaped.replace(/\*/g, '.*').replace(/\?/g, '.');
   return new RegExp(`^${regexBody}$`);
 }

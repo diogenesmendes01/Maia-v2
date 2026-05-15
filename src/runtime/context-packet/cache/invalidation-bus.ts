@@ -58,9 +58,8 @@ export class InvalidationBus {
     await Promise.all(
       handlers.map((h) =>
         h(event).catch((err: unknown) => {
-          // Log via console (real impl would use the logger); never bubble.
           // Failure of a single handler should not block dispatch.
-          // eslint-disable-next-line no-console
+          // Log via console (real impl would use the logger).
           console.error(
             `[InvalidationBus] handler error for ${event.type}:`,
             err,

@@ -127,7 +127,7 @@ export class BaseContextBuilder {
  * `build()`, so this default is rarely hit.
  */
 const defaultResolver: IdentityResolverPort = {
-  async resolve(channel_id: string) {
+  async resolve(_channel_id: string) {
     // Last-resort fallback so the builder doesn't crash when DI is missing.
     // The real resolver lives in src/identity/resolver.ts.
     return { tenant_id: 'default', agent_id: 'default' };
