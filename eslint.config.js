@@ -85,6 +85,13 @@ const TS_RULES = {
   // Already enforced by tsc
   'no-undef': 'off',
 
+  // Use the TS-aware variant: `const X = {} as const; type X = ...` is the
+  // canonical TS pattern for "enum-shaped" objects, and lives in separate
+  // namespaces (value vs. type). Base `no-redeclare` flags it as conflict,
+  // `@typescript-eslint/no-redeclare` understands the namespaces.
+  'no-redeclare': 'off',
+  '@typescript-eslint/no-redeclare': 'error',
+
   // Allow re-assigning function args (common in patch-style helpers)
   'no-param-reassign': 'off',
 

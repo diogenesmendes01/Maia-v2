@@ -128,7 +128,11 @@ export async function findPreviousAssistantMessage(
   conversa_id: string,
   before_id: string,
 ): Promise<Mensagem | null> {
-  const recent = await mensagensRepo.recentInConversation(conversa_id, 5);
+  // Window of 15 (was 5): a chunked-typing correction may follow ≥4 inbound
+  // pieces, so the real previous-assistant message can sit further back.
+  // Without enough lookback `reflectOnCorrection` exits early
+  // (`if (!input.previousAssistant) return`) and the learning is lost.
+  const recent = await mensagensRepo.recentInConversation(conversa_id, 15);
   for (const m of recent) {
     if (m.id === before_id) continue;
     if (m.direcao === 'out') return m;

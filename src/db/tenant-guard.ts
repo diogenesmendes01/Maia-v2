@@ -1,4 +1,4 @@
-import { getCurrentTenant, getCurrentAgent, MissingTenantContextError } from './tenant-context.js';
+import { getCurrentTenant, getCurrentAgent } from './tenant-context.js';
 
 export { MissingTenantContextError } from './tenant-context.js';
 

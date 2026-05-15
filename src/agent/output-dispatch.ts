@@ -10,6 +10,7 @@ import { quotedReplyContext } from '@/gateway/presence.js';
 import type { WAQuotedContext } from '@/gateway/presence.js';
 import { detectCorrection } from './reflection.js';
 import { cleanupPDF } from './pdf-cleanup.js';
+import type { ToolExecutionSummary } from './tool-execution-summary.js';
 
 /**
  * Returns the JID the outbound reply should target. Looks up the inbound
@@ -56,6 +57,13 @@ export type DispatchOutputCtx = {
   latestReportPdf: LatestReportPdf | null;
   turnHasSensitive: boolean;
   sensitiveTools: string[];
+  /**
+   * Issue #73: structured per-tool outcomes from this turn's react loop.
+   * Persisted on the outbound assistant message in `ferramentas_chamadas`
+   * so the NEXT turn's prompt-builder can reidrate the "## Eventos
+   * confirmados pelo backend" block from authoritative backend state.
+   */
+  toolSummaries?: ToolExecutionSummary[];
 };
 
 /**
@@ -75,6 +83,7 @@ export type DispatchOutputCtx = {
  */
 export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
   const { pessoa, conversa: c, inbound, jid, text, latestPending, latestReportPdf, turnHasSensitive, sensitiveTools } = ctx;
+  const toolSummaries = ctx.toolSummaries ?? [];
 
   // Quoting decision is shared across PDF / voice / text branches —
   // computed once so the rule (correction-detected OR pending active)
@@ -140,7 +149,7 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
             document_filename: pdf.fileName,
           },
           processada_em: new Date(),
-          ferramentas_chamadas: [],
+          ferramentas_chamadas: toolSummaries,
           tokens_usados: null,
         });
       }
@@ -200,7 +209,7 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
             voice: 'nova',
           },
           processada_em: new Date(),
-          ferramentas_chamadas: [],
+          ferramentas_chamadas: toolSummaries,
           tokens_usados: null,
         });
       }
@@ -209,6 +218,7 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
       await sendOutbound(pessoa.id, c.id, text, inbound.id, {
         pending_question_id: latestPending?.id ?? null,
         quoted: quotedContext,
+        tool_summaries: toolSummaries,
       });
     }
     return;
@@ -220,7 +230,9 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
     latestPending.opcoes_validas.length >= 3 &&
     latestPending.opcoes_validas.length <= 12;
   if (usePoll && latestPending) {
-    await sendOutboundPoll(pessoa.id, c.id, text, inbound.id, latestPending);
+    await sendOutboundPoll(pessoa.id, c.id, text, inbound.id, latestPending, {
+      tool_summaries: toolSummaries,
+    });
     return;
   }
 
@@ -242,6 +254,7 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
     pending_question_id: latestPending?.id ?? null,
     quoted: quotedContext,
     view_once,
+    tool_summaries: toolSummaries,
   });
   if (wid && view_once) {
     await audit({
@@ -263,6 +276,12 @@ export async function sendOutbound(
     pending_question_id?: string | null;
     quoted?: WAQuotedContext;
     view_once?: boolean;
+    /**
+     * Issue #73: structured tool outcomes for this turn — persisted on the
+     * outbound message so next-turn prompt-builder can reidrate them in the
+     * "## Eventos confirmados pelo backend" block.
+     */
+    tool_summaries?: ToolExecutionSummary[];
   },
 ): Promise<string | null> {
   const pessoa = await pessoasRepo.findById(pessoa_id);
@@ -290,7 +309,7 @@ export async function sendOutbound(
     midia_url: null,
     metadata,
     processada_em: new Date(),
-    ferramentas_chamadas: [],
+    ferramentas_chamadas: opts?.tool_summaries ?? [],
     tokens_usados: null,
   });
   return wid;
@@ -302,6 +321,7 @@ export async function sendOutboundPoll(
   text: string,
   in_reply_to: string,
   pending: { id: string; opcoes_validas: Array<{ key: string; label: string }> },
+  opts?: { tool_summaries?: ToolExecutionSummary[] },
 ): Promise<{ fell_back: boolean }> {
   const pessoa = await pessoasRepo.findById(pessoa_id);
   if (!pessoa) return { fell_back: false };
@@ -315,6 +335,7 @@ export async function sendOutboundPoll(
     const numbered = pending.opcoes_validas.map((o, i) => `${i + 1}. ${o.label}`).join('\n');
     await sendOutbound(pessoa_id, conversa_id, `${text}\n\n${numbered}`, in_reply_to, {
       pending_question_id: pending.id,
+      tool_summaries: opts?.tool_summaries,
     });
     return { fell_back: true };
   }
@@ -334,7 +355,7 @@ export async function sendOutboundPoll(
       poll_creator_jid: sent.creator_jid,
     },
     processada_em: new Date(),
-    ferramentas_chamadas: [],
+    ferramentas_chamadas: opts?.tool_summaries ?? [],
     tokens_usados: null,
   });
   return { fell_back: false };
