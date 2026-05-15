@@ -23,6 +23,8 @@ import { runConfidenceRecompute } from './confidence-recompute.js';
 import { runProcedureCandidateConsumer } from './procedure-candidate-consumer.js';
 import { runProcedureExecutionReaper } from './procedure-execution-reaper.js';
 import { runProcedureMetricsRefresh } from './procedure-metrics-refresh.js';
+import { runDriftMonitor } from './drift-monitor.js';
+import { runGapEscalationMonitor } from './gap-escalation-monitor.js';
 import { tickEngine } from '@/workflows/engine.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 

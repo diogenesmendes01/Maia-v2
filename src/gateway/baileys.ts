@@ -28,7 +28,6 @@ import { routeMessageUpdate } from '@/agent/message-update.js';
 import type { WhatsAppInbound, WAQuotedContext } from './types.js';
 import { setupState } from '@/setup/state.js';
 import { triggerRecovery } from '@/setup/recovery.js';
-import { runWithTenantContext } from '@/db/tenant-context.js';
 
 /**
  * P0 default tenant context for the WhatsApp gateway. The current Baileys

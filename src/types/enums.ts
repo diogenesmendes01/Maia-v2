@@ -122,8 +122,14 @@ export const ProposalStatus = {
   DRAFT: 'draft',
   SUBMITTED: 'submitted',
   APPROVED: 'approved',
+  // P87-C3 — closed-loop test gate: post-approval, runs the proposal's
+  // declared test_scenarios. Outcome decides delivered vs reverted.
+  TESTING: 'testing',
   REJECTED: 'rejected',
   DELIVERED: 'delivered',
+  // P87-C3 — terminal: a delivered capability later flagged failing in
+  // the loop is reverted (and a technical_gap_id may be raised).
+  REVERTED: 'reverted',
 } as const;
 export type ProposalStatus = typeof ProposalStatus[keyof typeof ProposalStatus];
 

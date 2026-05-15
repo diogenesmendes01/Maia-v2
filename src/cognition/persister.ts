@@ -11,6 +11,7 @@ import { logger } from '@/lib/logger.js';
 import { classifyMemory } from './memory-classifier.js';
 import { deriveBehavioralHint } from './behavioral-hint-deriver.js';
 import { validateBehavioralHint } from '@/workers/behavioral-hint-validator.js';
+import { initialFactConfidence, initialRuleConfidence } from './confidence.js';
 
 /**
  * Persister — roteia ClassifiedCandidate para o destino correto:
