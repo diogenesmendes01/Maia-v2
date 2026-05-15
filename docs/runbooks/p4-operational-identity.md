@@ -80,7 +80,7 @@ await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async 
 });
 ```
 
-Idempotente — segunda chamada retorna `{ created: false, reason: 'already_seeded' }`. Sem seed, prompt-builder cai em fallback (mesmo com flag ON) e loga warning `profile_v2_invalid_fallback_to_legacy`.
+Idempotente — segunda chamada retorna `{ created: false, reason: 'already_active' }`. Sem seed, prompt-builder cai em fallback (mesmo com flag ON) e loga warning `profile_v2_invalid_fallback_to_legacy`.
 
 ### Inspecionar versões
 
