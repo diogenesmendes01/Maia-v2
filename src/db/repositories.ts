@@ -1,5 +1,6 @@
-import { eq, and, inArray, desc, isNull, sql, or, gt, lt } from 'drizzle-orm';
-import { db } from './client.js';
+import { eq, and, inArray, desc, isNull, sql, or, gt, lt, ne } from 'drizzle-orm';
+import { db, withTx } from './client.js';
+import { procedure_status_events } from './schema.js';
 import {
   pessoas,
   permissoes,
@@ -38,6 +39,15 @@ import {
   procedure_selector_decisions,
   procedure_tests,
   procedure_metrics,
+  agent_operational_profile_versions,
+  agent_drift_alerts,
+  gap_escalation_rules,
+  capability_proposals,
+  capability_test_results,
+  channels,
+  roles,
+  channel_policies,
+  role_selector_decisions,
 } from './schema.js';
 import { TypedError } from '@/lib/utils.js';
 import { applyTenantGuard } from './tenant-guard.js';
@@ -91,6 +101,20 @@ import type {
   ProcedureSelectorDecision,
   ProcedureTest,
   ProcedureMetric,
+  ProcedureStatusEvent,
+  ProcedureStatusUpdate,
+  AgentOperationalProfileVersion,
+  ProfileBody,
+  AgentDriftAlert,
+  GapEscalationRule,
+  NewGapEscalationRule,
+  CapabilityProposal,
+  CapabilityTestResult,
+  Channel,
+  Role,
+  ChannelPolicy,
+  NewChannelPolicy,
+  RoleSelectorDecisionRow,
 } from './schema.js';
 
 export type EntityScope = {
@@ -2524,5 +2548,1084 @@ export const procedureMetricsRepo = {
         eq(procedure_metrics.tenant_id, tenant_id),
         eq(procedure_metrics.agent_id, agent_id),
       ));
+  },
+};
+export const operationalProfileVersionsRepo = {
+  async create(input: {
+    profile_body: ProfileBody;
+    proposed_by: string;
+    proposed_reason?: string;
+  }): Promise<AgentOperationalProfileVersion> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const version = await operationalProfileVersionsRepo.nextVersion();
+    const guarded = applyTenantGuard({
+      version,
+      status: 'proposed',
+      profile_body: input.profile_body,
+      proposed_by: input.proposed_by,
+      proposed_reason: input.proposed_reason ?? null,
+    });
+    // tenant_id/agent_id são injetados pelo applyTenantGuard. Os types do
+    // Drizzle agora alinham naturalmente com o $inferInsert da tabela (1
+    // coluna JSONB `profile_body` em vez das 4 legacy) — sem cast necessário.
+    void tenant_id;
+    void agent_id;
+    const [row] = await db
+      .insert(agent_operational_profile_versions)
+      .values(guarded)
+      .returning();
+    return row!;
+  },
+
+  async getActive(): Promise<AgentOperationalProfileVersion | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(agent_operational_profile_versions)
+      .where(
+        and(
+          eq(agent_operational_profile_versions.tenant_id, tenant_id),
+          eq(agent_operational_profile_versions.agent_id, agent_id),
+          eq(agent_operational_profile_versions.status, 'active'),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  async getById(id: string): Promise<AgentOperationalProfileVersion | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(agent_operational_profile_versions)
+      .where(
+        and(
+          eq(agent_operational_profile_versions.tenant_id, tenant_id),
+          eq(agent_operational_profile_versions.agent_id, agent_id),
+          eq(agent_operational_profile_versions.id, id),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  async listByStatus(status: ProfileStatus): Promise<AgentOperationalProfileVersion[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(agent_operational_profile_versions)
+      .where(
+        and(
+          eq(agent_operational_profile_versions.tenant_id, tenant_id),
+          eq(agent_operational_profile_versions.agent_id, agent_id),
+          eq(agent_operational_profile_versions.status, status),
+        ),
+      )
+      .orderBy(desc(agent_operational_profile_versions.version));
+  },
+
+  // Validated state-machine transition. Retorna typed result, sem throw.
+  // - not_found:           id desconhecido
+  // - terminal:            row já está rolled_back (terminal)
+  // - invalid_transition:  destino não permitido a partir do source ou same-state
+  // - already_has_active:  to:'active' mas outra row ativa existe para (tenant,agent)
+  async transition(args: {
+    id: string;
+    to: ProfileStatus;
+    approved_by?: string;
+    rollback_reason?: string;
+  }): Promise<
+    | { ok: true; updated: AgentOperationalProfileVersion }
+    | { ok: false; reason: 'not_found' | 'invalid_transition' | 'already_has_active' | 'terminal' }
+  > {
+    const row = await operationalProfileVersionsRepo.getById(args.id);
+    if (!row) return { ok: false, reason: 'not_found' };
+
+    const from = row.status as ProfileStatus;
+    if (from === 'rolled_back') return { ok: false, reason: 'terminal' };
+    if (from === args.to) return { ok: false, reason: 'invalid_transition' };
+
+    const allowed: Record<string, readonly string[]> = {
+      proposed: ['active', 'frozen', 'rolled_back'],
+      active: ['frozen', 'rolled_back'],
+      frozen: ['active', 'rolled_back'],
+    };
+    if (!allowed[from]?.includes(args.to)) {
+      return { ok: false, reason: 'invalid_transition' };
+    }
+
+    if (args.to === 'active') {
+      const active = await operationalProfileVersionsRepo.getActive();
+      if (active && active.id !== row.id) {
+        return { ok: false, reason: 'already_has_active' };
+      }
+    }
+
+    const now = new Date();
+    const patch: Record<string, unknown> = { status: args.to };
+    if (args.to === 'active') {
+      // approved_at é definido na primeira vez que se aprova; re-ativações
+      // a partir de frozen preservam o approved_at original.
+      if (!row.approved_at) {
+        patch.approved_at = now;
+        if (args.approved_by) patch.approved_by = args.approved_by;
+      }
+      patch.activated_at = now;
+    } else if (args.to === 'frozen') {
+      patch.frozen_at = now;
+    } else if (args.to === 'rolled_back') {
+      patch.rolled_back_at = now;
+      patch.rollback_reason = args.rollback_reason ?? null;
+    }
+
+    // [P86-C3] tenant-scoped write predicate: even though `getById` above
+    // already filtered by tenant_id/agent_id, the actual UPDATE must
+    // include them in WHERE as defense-in-depth (an alert UUID alone is
+    // not enough authorization to mutate identity in a different tenant
+    // context). This is the inviolable tenant isolation invariant.
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const [updated] = await db
+      .update(agent_operational_profile_versions)
+      .set(patch as Partial<typeof agent_operational_profile_versions.$inferInsert>)
+      .where(
+        and(
+          eq(agent_operational_profile_versions.id, args.id),
+          eq(agent_operational_profile_versions.tenant_id, tenant_id),
+          eq(agent_operational_profile_versions.agent_id, agent_id),
+        ),
+      )
+      .returning();
+    if (!updated) {
+      // Could only happen if tenant context changed between the read above
+      // and the update — treat as not_found to keep the contract.
+      return { ok: false, reason: 'not_found' };
+    }
+    return { ok: true, updated };
+  },
+
+  // Próxima version sequencial para (tenant_id, agent_id) corrente.
+  // MAX(version) + 1, ou 1 quando não existe versão ainda.
+  async nextVersion(): Promise<number> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const result = await db.execute<{ max: number | null }>(sql`
+      SELECT MAX(version) AS max
+        FROM agent_operational_profile_versions
+       WHERE tenant_id = ${tenant_id}
+         AND agent_id = ${agent_id}
+    `);
+    const max = result.rows[0]?.max ?? null;
+    return max == null ? 1 : Number(max) + 1;
+  },
+};
+
+// P4: agent_drift_alerts — audit das execuções do drift detector.
+// Cada alert = 1 evento (drift_type, severity, decision) + evidência + audit
+// trail (decided_by, resolved_by, resolution_note). FK opcional para
+// agent_operational_profile_versions porque drifts podem ser detectados antes
+// de uma nova versão de perfil ser proposta.
+export const driftAlertsRepo = {
+  async create(input: {
+    profile_version_id?: string;
+    drift_type: DriftType;
+    severity: DriftSeverity;
+    evidence: unknown;
+    detected_by: string;
+    decision: DriftDecision;
+    decided_by: string;
+  }): Promise<AgentDriftAlert> {
+    const guarded = applyTenantGuard({
+      profile_version_id: input.profile_version_id ?? null,
+      drift_type: input.drift_type,
+      severity: input.severity,
+      evidence: input.evidence as object,
+      detected_by: input.detected_by,
+      decision: input.decision,
+      decided_by: input.decided_by,
+    });
+    const [row] = await db
+      .insert(agent_drift_alerts)
+      .values(guarded as typeof agent_drift_alerts.$inferInsert)
+      .returning();
+    return row!;
+  },
+
+  async listUnresolved(): Promise<AgentDriftAlert[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(agent_drift_alerts)
+      .where(
+        and(
+          eq(agent_drift_alerts.tenant_id, tenant_id),
+          eq(agent_drift_alerts.agent_id, agent_id),
+          isNull(agent_drift_alerts.resolved_at),
+        ),
+      )
+      .orderBy(desc(agent_drift_alerts.created_at));
+  },
+
+  async listByProfileVersion(profile_version_id: string): Promise<AgentDriftAlert[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(agent_drift_alerts)
+      .where(
+        and(
+          eq(agent_drift_alerts.tenant_id, tenant_id),
+          eq(agent_drift_alerts.agent_id, agent_id),
+          eq(agent_drift_alerts.profile_version_id, profile_version_id),
+        ),
+      )
+      .orderBy(desc(agent_drift_alerts.created_at));
+  },
+
+  // [P86-C3] tenant-scoped: includes tenant_id AND agent_id predicates in
+  // the UPDATE so an alert UUID from another tenant cannot be resolved from
+  // the wrong context. Returns { ok, found } so callers can detect a
+  // forbidden/missing target without silently no-op'ing.
+  async resolve(args: {
+    id: string;
+    resolution_note: string;
+    resolved_by: string;
+  }): Promise<{ ok: boolean; found: boolean }> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const updated = await db
+      .update(agent_drift_alerts)
+      .set({
+        resolution_note: args.resolution_note,
+        resolved_at: new Date(),
+        resolved_by: args.resolved_by,
+      })
+      .where(
+        and(
+          eq(agent_drift_alerts.id, args.id),
+          eq(agent_drift_alerts.tenant_id, tenant_id),
+          eq(agent_drift_alerts.agent_id, agent_id),
+        ),
+      )
+      .returning({ id: agent_drift_alerts.id });
+    return { ok: updated.length > 0, found: updated.length > 0 };
+  },
+};
+
+// P5: gap_escalation_rules — thresholds determinísticos por (tenant_id, agent_id)
+// para a escalation chain (silent → dashboard → mentionable → proposed).
+// Defaults vivem no schema; este repo expõe getForCurrentAgent (null se nenhuma
+// regra customizada) e upsert (ON CONFLICT via UNIQUE(tenant_id, agent_id)).
+export const gapEscalationRulesRepo = {
+  async getForCurrentAgent(): Promise<GapEscalationRule | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(gap_escalation_rules)
+      .where(
+        and(
+          eq(gap_escalation_rules.tenant_id, tenant_id),
+          eq(gap_escalation_rules.agent_id, agent_id),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  async upsert(input: Partial<NewGapEscalationRule>): Promise<GapEscalationRule> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    // Strip any tenant/agent the caller might have supplied — applyTenantGuard
+    // semantics: context wins, mismatch throws.
+    const { tenant_id: inTenant, agent_id: inAgent, ...rest } = input;
+    if (inTenant && inTenant !== tenant_id) {
+      throw new Error(`tenant mismatch: input ${inTenant} vs context ${tenant_id}`);
+    }
+    if (inAgent && inAgent !== agent_id) {
+      throw new Error(`agent mismatch: input ${inAgent} vs context ${agent_id}`);
+    }
+    const now = new Date();
+    const [row] = await db
+      .insert(gap_escalation_rules)
+      .values({
+        ...rest,
+        tenant_id,
+        agent_id,
+        updated_at: now,
+      } as typeof gap_escalation_rules.$inferInsert)
+      .onConflictDoUpdate({
+        target: [gap_escalation_rules.tenant_id, gap_escalation_rules.agent_id],
+        set: {
+          ...rest,
+          updated_at: now,
+        },
+      })
+      .returning();
+    return row!;
+  },
+};
+
+// P5: capability_proposals — propostas formais de capability (spec gerada por
+// LLM no nível 'proposed'). Fluxo de status:
+//   draft → submitted → approved | rejected
+//   approved → delivered
+//   rejected | delivered = terminal
+// transition() é typed-result (sem throw): { ok:true, updated } | { ok:false,
+// reason: 'not_found' | 'invalid_transition' }. Cada transição seta um
+// timestamp (submitted_at | decided_at | delivered_at) + campos opcionais
+// (decided_by, decision_reason, delivery_artifact_ref).
+export const capabilityProposalsRepo = {
+  async create(input: {
+    gap_id?: string;
+    capability_type: 'tool' | 'knowledge' | 'procedure' | 'integration' | 'other';
+    title: string;
+    description: string;
+    proposed_spec: unknown;
+    motivation: string;
+    expected_impact?: string;
+    test_scenarios: unknown[];
+  }): Promise<CapabilityProposal> {
+    const guarded = applyTenantGuard({
+      gap_id: input.gap_id ?? null,
+      capability_type: input.capability_type,
+      title: input.title,
+      description: input.description,
+      proposed_spec: input.proposed_spec as object,
+      motivation: input.motivation,
+      expected_impact: input.expected_impact ?? null,
+      test_scenarios: input.test_scenarios as unknown as object,
+    });
+    const [row] = await db
+      .insert(capability_proposals)
+      .values(guarded as typeof capability_proposals.$inferInsert)
+      .returning();
+    return row!;
+  },
+
+  // PR #87 follow-up — transactional variant of create. Writes via the
+  // caller-supplied `tx` handle so the INSERT participates in an outer
+  // withTx block. Pairs with capabilityGapsRepo.updateLevelTx so the
+  // gap-escalation worker can commit the proposal artifact and the gap
+  // level flip in a single transaction; transient failure during the
+  // gap UPDATE rolls back the proposal INSERT so the next worker tick
+  // does NOT produce a duplicate proposal row.
+  async createTx(
+    tx: typeof db,
+    input: {
+      gap_id?: string;
+      capability_type: 'tool' | 'knowledge' | 'procedure' | 'integration' | 'other';
+      title: string;
+      description: string;
+      proposed_spec: unknown;
+      motivation: string;
+      expected_impact?: string;
+      test_scenarios: unknown[];
+    },
+  ): Promise<CapabilityProposal> {
+    const guarded = applyTenantGuard({
+      gap_id: input.gap_id ?? null,
+      capability_type: input.capability_type,
+      title: input.title,
+      description: input.description,
+      proposed_spec: input.proposed_spec as object,
+      motivation: input.motivation,
+      expected_impact: input.expected_impact ?? null,
+      test_scenarios: input.test_scenarios as unknown as object,
+    });
+    const [row] = await tx
+      .insert(capability_proposals)
+      .values(guarded as typeof capability_proposals.$inferInsert)
+      .returning();
+    return row!;
+  },
+
+  async getById(id: string): Promise<CapabilityProposal | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(capability_proposals)
+      .where(
+        and(
+          eq(capability_proposals.tenant_id, tenant_id),
+          eq(capability_proposals.agent_id, agent_id),
+          eq(capability_proposals.id, id),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  async listByStatus(status: ProposalStatus): Promise<CapabilityProposal[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(capability_proposals)
+      .where(
+        and(
+          eq(capability_proposals.tenant_id, tenant_id),
+          eq(capability_proposals.agent_id, agent_id),
+          eq(capability_proposals.status, status),
+        ),
+      )
+      .orderBy(desc(capability_proposals.created_at));
+  },
+
+  async listByGap(gap_id: string): Promise<CapabilityProposal[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(capability_proposals)
+      .where(
+        and(
+          eq(capability_proposals.tenant_id, tenant_id),
+          eq(capability_proposals.agent_id, agent_id),
+          eq(capability_proposals.gap_id, gap_id),
+        ),
+      )
+      .orderBy(desc(capability_proposals.created_at));
+  },
+
+  // Validated state-machine transition. Retorna typed result, sem throw.
+  // - not_found:           id desconhecido (ou fora do tenant/agent atual)
+  // - invalid_transition:  destino não permitido a partir do source, mesmo
+  //                        status (re-entrada), ou origem terminal
+  //                        (rejected/reverted).
+  //
+  // P87-C3 (PR #87 review): activation gate. A transição approved → delivered
+  // foi removida — agora exige caminho approved → testing → delivered (sucesso)
+  // ou approved → testing → reverted (falha). A wiring é feita por
+  // activateApprovedCapability (capability-test-runner.ts), que é o ÚNICO
+  // caller production-grade do trio approved → testing → {delivered|reverted}.
+  // Chamadas diretas a transition({to:'delivered'}) continuam permitidas a
+  // partir de 'testing', NUNCA a partir de 'approved'.
+  //
+  // Side effects (timestamps + opcionais):
+  //   to:'submitted' → submitted_at
+  //   to:'approved'  → decided_at + decided_by? + decision_reason?
+  //   to:'rejected'  → decided_at + decided_by? + decision_reason?
+  //   to:'testing'   → (sem timestamp dedicado; updated_at marca)
+  //   to:'delivered' → delivered_at + delivery_artifact_ref?
+  //                    + last_test_outcome? + last_test_at?
+  //   to:'reverted'  → reverted_at + revert_reason?
+  //                    + last_test_outcome? + last_test_at?
+  async transition(args: {
+    id: string;
+    to: ProposalStatus;
+    decided_by?: string;
+    decision_reason?: string;
+    delivery_artifact_ref?: string;
+    revert_reason?: string;
+    last_test_outcome?: 'pass' | 'fail' | 'error';
+  }): Promise<
+    | { ok: true; updated: CapabilityProposal }
+    | { ok: false; reason: 'not_found' | 'invalid_transition' }
+  > {
+    const row = await capabilityProposalsRepo.getById(args.id);
+    if (!row) return { ok: false, reason: 'not_found' };
+
+    const from = row.status as ProposalStatus;
+    // Terminal sources — no further transitions.
+    if (from === 'rejected' || from === 'reverted') {
+      return { ok: false, reason: 'invalid_transition' };
+    }
+    if (from === args.to) {
+      return { ok: false, reason: 'invalid_transition' };
+    }
+
+    const allowed: Record<string, readonly string[]> = {
+      draft: ['submitted'],
+      submitted: ['approved', 'rejected'],
+      approved: ['testing'],
+      testing: ['delivered', 'reverted'],
+      // P87-C3 — delivered → reverted permitido (Superpowers Important #2):
+      // tools can fail after activation; revert tooling pode marcar a row.
+      delivered: ['reverted'],
+    };
+    if (!allowed[from]?.includes(args.to)) {
+      return { ok: false, reason: 'invalid_transition' };
+    }
+
+    const now = new Date();
+    const patch: Record<string, unknown> = { status: args.to, updated_at: now };
+    if (args.to === 'submitted') {
+      patch.submitted_at = now;
+    } else if (args.to === 'approved' || args.to === 'rejected') {
+      patch.decided_at = now;
+      if (args.decided_by) patch.decided_by = args.decided_by;
+      if (args.decision_reason) patch.decision_reason = args.decision_reason;
+    } else if (args.to === 'delivered') {
+      patch.delivered_at = now;
+      if (args.delivery_artifact_ref)
+        patch.delivery_artifact_ref = args.delivery_artifact_ref;
+      if (args.last_test_outcome) {
+        patch.last_test_outcome = args.last_test_outcome;
+        patch.last_test_at = now;
+      }
+    } else if (args.to === 'reverted') {
+      patch.reverted_at = now;
+      if (args.revert_reason) patch.revert_reason = args.revert_reason;
+      if (args.last_test_outcome) {
+        patch.last_test_outcome = args.last_test_outcome;
+        patch.last_test_at = now;
+      }
+    }
+
+    const [updated] = await db
+      .update(capability_proposals)
+      .set(patch as Partial<typeof capability_proposals.$inferInsert>)
+      .where(eq(capability_proposals.id, args.id))
+      .returning();
+    return { ok: true, updated: updated! };
+  },
+};
+
+// P5: capability_test_results — auditoria do loop fechado pós-ativação. Cada
+// run dos test_scenarios da proposal gera uma linha; outcome=fail/error pode
+// disparar triggered_revert=true e criar um technical_gap_id (gap derivado
+// para investigação). Reads ordenam por ran_at DESC (mais recente primeiro).
+export const capabilityTestResultsRepo = {
+  async record(input: {
+    proposal_id: string;
+    gap_id?: string;
+    outcome: 'pass' | 'fail' | 'error';
+    scenarios_run: unknown[];
+    scenarios_passed: number;
+    scenarios_failed: number;
+    details?: unknown;
+    triggered_revert?: boolean;
+    technical_gap_id?: string;
+  }): Promise<CapabilityTestResult> {
+    // PR #87 Minor #3: defensive parity. applyTenantGuard injeta tenant/agent
+    // do contexto atual, mas NÃO valida que technical_gap_id (passado pelo
+    // caller) pertence ao mesmo tenant. Hoje a chain (capability-test-runner
+    // → revertCapability → capabilityGapsRepo.create) sempre cria o gap
+    // dentro do mesmo tenant context, então o id retornado é seguro — mas
+    // callers futuros poderiam quebrar essa premissa. Faz cross-check
+    // explícito para fechar a porta agora.
+    if (input.technical_gap_id) {
+      const tenant_id = getCurrentTenant();
+      const agent_id = getCurrentAgent();
+      const rows = await db
+        .select({ id: agent_capability_gaps.id })
+        .from(agent_capability_gaps)
+        .where(
+          and(
+            eq(agent_capability_gaps.id, input.technical_gap_id),
+            eq(agent_capability_gaps.tenant_id, tenant_id),
+            eq(agent_capability_gaps.agent_id, agent_id),
+          ),
+        )
+        .limit(1);
+      if (rows.length === 0) {
+        throw new Error('capability_test_results.technical_gap_id_cross_tenant');
+      }
+    }
+    const guarded = applyTenantGuard({
+      proposal_id: input.proposal_id,
+      gap_id: input.gap_id ?? null,
+      outcome: input.outcome,
+      scenarios_run: input.scenarios_run as unknown as object,
+      scenarios_passed: input.scenarios_passed,
+      scenarios_failed: input.scenarios_failed,
+      details: (input.details ?? {}) as object,
+      triggered_revert: input.triggered_revert ?? false,
+      technical_gap_id: input.technical_gap_id ?? null,
+    });
+    const [row] = await db
+      .insert(capability_test_results)
+      .values(guarded as typeof capability_test_results.$inferInsert)
+      .returning();
+    return row!;
+  },
+
+  async listByProposal(proposal_id: string): Promise<CapabilityTestResult[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(capability_test_results)
+      .where(
+        and(
+          eq(capability_test_results.tenant_id, tenant_id),
+          eq(capability_test_results.agent_id, agent_id),
+          eq(capability_test_results.proposal_id, proposal_id),
+        ),
+      )
+      .orderBy(desc(capability_test_results.ran_at));
+  },
+
+  async latestByProposal(proposal_id: string): Promise<CapabilityTestResult | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(capability_test_results)
+      .where(
+        and(
+          eq(capability_test_results.tenant_id, tenant_id),
+          eq(capability_test_results.agent_id, agent_id),
+          eq(capability_test_results.proposal_id, proposal_id),
+        ),
+      )
+      .orderBy(desc(capability_test_results.ran_at))
+      .limit(1);
+    return rows[0] ?? null;
+  },
+};
+
+// P6: channels — instâncias de entrada de mensagem (1+ por agent). Tenant-
+// scoped via applyTenantGuard; findByExternalCrossTenant é o único método que
+// bypassa o guard (usado pelo resolver de entrada, antes do contexto existir).
+export const channelsRepo = {
+  async create(input: {
+    external_id: string;
+    channel_type: 'whatsapp' | 'telegram' | 'email' | 'sms' | 'web' | 'api' | 'other';
+    display_name?: string;
+    metadata?: unknown;
+  }): Promise<Channel> {
+    const guarded = applyTenantGuard({
+      external_id: input.external_id,
+      channel_type: input.channel_type,
+      display_name: input.display_name ?? null,
+      metadata: (input.metadata as object) ?? {},
+    });
+    const [row] = await db
+      .insert(channels)
+      .values(guarded as typeof channels.$inferInsert)
+      .returning();
+    return row!;
+  },
+
+  async getById(id: string): Promise<Channel | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(channels)
+      .where(
+        and(
+          eq(channels.tenant_id, tenant_id),
+          eq(channels.agent_id, agent_id),
+          eq(channels.id, id),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  async findByExternal(
+    channel_type: string,
+    external_id: string,
+  ): Promise<Channel | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(channels)
+      .where(
+        and(
+          eq(channels.tenant_id, tenant_id),
+          eq(channels.agent_id, agent_id),
+          eq(channels.channel_type, channel_type),
+          eq(channels.external_id, external_id),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  // EXPLICITLY bypasses applyTenantGuard — used by resolver (entry point,
+  // before context exists). The (channel_type, external_id) lookup discovers
+  // which tenant/agent owns the inbound message.
+  async findByExternalCrossTenant(args: {
+    channel_type: string;
+    external_id: string;
+  }): Promise<Channel | null> {
+    const rows = await db
+      .select()
+      .from(channels)
+      .where(
+        and(
+          eq(channels.channel_type, args.channel_type),
+          eq(channels.external_id, args.external_id),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  async listActive(): Promise<Channel[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(channels)
+      .where(
+        and(
+          eq(channels.tenant_id, tenant_id),
+          eq(channels.agent_id, agent_id),
+          eq(channels.active, true),
+        ),
+      );
+  },
+
+  // [P88-C3] Tenant-scoped: write paths MUST enforce isolation. Without
+  // tenant/agent predicates, any caller with another tenant's channel UUID
+  // could disable that channel (cross-tenant DoS). Read-side filters here
+  // were already tenant-scoped — this aligns the destructive path.
+  async deactivate(id: string): Promise<{ rowCount: number }> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const result = await db
+      .update(channels)
+      .set({ active: false, updated_at: new Date() })
+      .where(
+        and(
+          eq(channels.tenant_id, tenant_id),
+          eq(channels.agent_id, agent_id),
+          eq(channels.id, id),
+        ),
+      )
+      .returning({ id: channels.id });
+    return { rowCount: result.length };
+  },
+};
+
+// P6: roles — modos operacionais por agent (comercial, suporte, default, etc).
+// Exatamente 1 default por (tenant, agent), garantido por partial unique index.
+export const rolesRepo = {
+  async create(input: {
+    role_key: string;
+    display_name: string;
+    description?: string;
+    prompt_addendum?: string;
+    is_default?: boolean;
+  }): Promise<Role> {
+    const guarded = applyTenantGuard({
+      role_key: input.role_key,
+      display_name: input.display_name,
+      description: input.description ?? null,
+      prompt_addendum: input.prompt_addendum ?? null,
+      is_default: input.is_default ?? false,
+    });
+    const [row] = await db
+      .insert(roles)
+      .values(guarded as typeof roles.$inferInsert)
+      .returning();
+    return row!;
+  },
+
+  async getById(id: string): Promise<Role | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(roles)
+      .where(
+        and(
+          eq(roles.tenant_id, tenant_id),
+          eq(roles.agent_id, agent_id),
+          eq(roles.id, id),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  async getByKey(role_key: string): Promise<Role | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(roles)
+      .where(
+        and(
+          eq(roles.tenant_id, tenant_id),
+          eq(roles.agent_id, agent_id),
+          eq(roles.role_key, role_key),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  async getDefault(): Promise<Role | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(roles)
+      .where(
+        and(
+          eq(roles.tenant_id, tenant_id),
+          eq(roles.agent_id, agent_id),
+          eq(roles.is_default, true),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  async listActive(): Promise<Role[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(roles)
+      .where(
+        and(
+          eq(roles.tenant_id, tenant_id),
+          eq(roles.agent_id, agent_id),
+          eq(roles.active, true),
+        ),
+      );
+  },
+
+  // [P88-C3] Tenant-scoped: same justification as channelsRepo.deactivate.
+  // Cross-tenant deactivation would break the inviolable isolation invariant.
+  async deactivate(id: string): Promise<{ rowCount: number }> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const result = await db
+      .update(roles)
+      .set({ active: false, updated_at: new Date() })
+      .where(
+        and(
+          eq(roles.tenant_id, tenant_id),
+          eq(roles.agent_id, agent_id),
+          eq(roles.id, id),
+        ),
+      )
+      .returning({ id: roles.id });
+    return { rowCount: result.length };
+  },
+};
+
+// P6: channel_policies — governance que define default role + switch_behavior
+// + travas anti-oscilação para by_context. UNIQUE (channel_id) garante 1
+// policy por canal.
+export const channelPoliciesRepo = {
+  async create(input: {
+    channel_id: string;
+    default_role_id: string;
+    switch_behavior: SwitchBehavior;
+    announce_mode?: AnnounceMode;
+    by_context_guards?: unknown;
+    allowed_role_ids?: string[];
+  }): Promise<ChannelPolicy> {
+    const guarded = applyTenantGuard({
+      channel_id: input.channel_id,
+      default_role_id: input.default_role_id,
+      switch_behavior: input.switch_behavior,
+      ...(input.announce_mode !== undefined
+        ? { announce_mode: input.announce_mode }
+        : {}),
+      ...(input.by_context_guards !== undefined
+        ? { by_context_guards: input.by_context_guards as object }
+        : {}),
+      ...(input.allowed_role_ids !== undefined
+        ? { allowed_role_ids: input.allowed_role_ids as unknown as object }
+        : {}),
+    });
+    const [row] = await db
+      .insert(channel_policies)
+      .values(guarded as typeof channel_policies.$inferInsert)
+      .returning();
+    return row!;
+  },
+
+  async getByChannelId(channel_id: string): Promise<ChannelPolicy | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(channel_policies)
+      .where(
+        and(
+          eq(channel_policies.tenant_id, tenant_id),
+          eq(channel_policies.agent_id, agent_id),
+          eq(channel_policies.channel_id, channel_id),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  async update(
+    id: string,
+    patch: Partial<NewChannelPolicy>,
+  ): Promise<ChannelPolicy> {
+    // Strip any tenant/agent the caller might have supplied — context wins.
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const { tenant_id: inTenant, agent_id: inAgent, ...rest } = patch;
+    if (inTenant && inTenant !== tenant_id) {
+      throw new Error(`tenant mismatch: input ${inTenant} vs context ${tenant_id}`);
+    }
+    if (inAgent && inAgent !== agent_id) {
+      throw new Error(`agent mismatch: input ${inAgent} vs context ${agent_id}`);
+    }
+    const [row] = await db
+      .update(channel_policies)
+      .set({
+        ...rest,
+        updated_at: new Date(),
+      } as Partial<typeof channel_policies.$inferInsert>)
+      .where(
+        and(
+          eq(channel_policies.tenant_id, tenant_id),
+          eq(channel_policies.agent_id, agent_id),
+          eq(channel_policies.id, id),
+        ),
+      )
+      .returning();
+    return row!;
+  },
+};
+
+// P6: role_selector_decisions — log append-only de TODA decisão do role
+// selector (mesmo "keep_current"). decided_by NUNCA pode ser llm_classifier:
+// CHECK constraint no DB + runtime guard aqui (defense in depth). LLM
+// sugere (suggested_by), policy decide (decided_by).
+export const roleSelectorDecisionsRepo = {
+  async record(input: {
+    conversa_id?: string;
+    turno_id?: string;
+    channel_id?: string;
+    policy_id?: string;
+    current_role_id?: string;
+    suggested_role_id?: string;
+    decided_role_id: string;
+    action: RoleDecisionAction;
+    candidates: unknown[];
+    conflicts: unknown[];
+    suggested_by: SuggestedBy;
+    decided_by: DecidedBy;
+    suggested_strength?: RoleSelectorStrength;
+    suggested_confidence?: number;
+    reason?: string;
+    switch_count_in_conversation?: number;
+  }): Promise<RoleSelectorDecisionRow> {
+    // CRITICAL runtime guard — defense in depth. DB has CHECK constraint,
+    // but app validates too. LLM sugere; policy/owner/fallback decide.
+    if ((input.decided_by as string) === 'llm_classifier') {
+      throw new Error('decided_by_cannot_be_llm_classifier');
+    }
+    const guarded = applyTenantGuard({
+      conversa_id: input.conversa_id ?? null,
+      turno_id: input.turno_id ?? null,
+      channel_id: input.channel_id ?? null,
+      policy_id: input.policy_id ?? null,
+      current_role_id: input.current_role_id ?? null,
+      suggested_role_id: input.suggested_role_id ?? null,
+      decided_role_id: input.decided_role_id,
+      action: input.action,
+      candidates: input.candidates as unknown as object,
+      conflicts: input.conflicts as unknown as object,
+      suggested_by: input.suggested_by,
+      decided_by: input.decided_by,
+      suggested_strength: input.suggested_strength ?? null,
+      suggested_confidence:
+        input.suggested_confidence !== undefined
+          ? String(input.suggested_confidence)
+          : null,
+      reason: input.reason ?? null,
+      switch_count_in_conversation: input.switch_count_in_conversation ?? 0,
+    });
+    const [row] = await db
+      .insert(role_selector_decisions)
+      .values(guarded as typeof role_selector_decisions.$inferInsert)
+      .returning();
+    return row!;
+  },
+
+  async listByConversation(
+    conversa_id: string,
+  ): Promise<RoleSelectorDecisionRow[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(role_selector_decisions)
+      .where(
+        and(
+          eq(role_selector_decisions.tenant_id, tenant_id),
+          eq(role_selector_decisions.agent_id, agent_id),
+          eq(role_selector_decisions.conversa_id, conversa_id),
+        ),
+      )
+      .orderBy(desc(role_selector_decisions.decided_at));
+  },
+
+  // [P88-C2] Returns the most recently DECIDED role for this conversation
+  // (across all turns). Used by the role selector to rehydrate the current
+  // role each turn — without this, `current_role` resets to policy.default
+  // every turn, breaking the `by_context` anti-osc lock (it would punish
+  // consistency by counting three same-context turns as three switches).
+  async getLastDecidedRoleId(conversa_id: string): Promise<string | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select({ decided_role_id: role_selector_decisions.decided_role_id })
+      .from(role_selector_decisions)
+      .where(
+        and(
+          eq(role_selector_decisions.tenant_id, tenant_id),
+          eq(role_selector_decisions.agent_id, agent_id),
+          eq(role_selector_decisions.conversa_id, conversa_id),
+        ),
+      )
+      .orderBy(desc(role_selector_decisions.decided_at))
+      .limit(1);
+    return rows[0]?.decided_role_id ?? null;
+  },
+
+  // [P88-H4 cooldown_turns] Counts decisions in this conversation in the
+  // last N turns (i.e., the N most recent decisions). Used by the policy
+  // decider to enforce `cooldown_turns` — require N turns between switches.
+  async countSwitchesInLastNTurns(args: {
+    conversa_id: string;
+    n: number;
+  }): Promise<number> {
+    if (args.n <= 0) return 0;
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select({ action: role_selector_decisions.action })
+      .from(role_selector_decisions)
+      .where(
+        and(
+          eq(role_selector_decisions.tenant_id, tenant_id),
+          eq(role_selector_decisions.agent_id, agent_id),
+          eq(role_selector_decisions.conversa_id, args.conversa_id),
+        ),
+      )
+      .orderBy(desc(role_selector_decisions.decided_at))
+      .limit(args.n);
+    return rows.filter((r) => r.action === 'switch').length;
+  },
+
+  async countSwitchesInConversation(conversa_id: string): Promise<number> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const result = await db.execute<{ count: number | string }>(sql`
+      SELECT COUNT(*)::int AS count
+        FROM role_selector_decisions
+       WHERE tenant_id = ${tenant_id}
+         AND agent_id = ${agent_id}
+         AND conversa_id = ${conversa_id}
+         AND action = 'switch'
+    `);
+    const raw = result.rows[0]?.count ?? 0;
+    return typeof raw === 'string' ? Number(raw) : raw;
   },
 };
