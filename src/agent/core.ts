@@ -756,7 +756,9 @@ async function runAgentForMensagemInner(
       // P3c Task 5: user_signal critério lê o inbound textual do turn.
       // Pós-aggregation (debounce merge) — inbound.conteudo já está mesclado.
       user_message: inbound.conteudo ?? '',
-    };
+    });
+  } else {
+    // Legacy path — direct fire-and-forget IIFE.
     void (async () => {
       try {
         const exec = await procedureExecutionsRepo.findById(execId);
@@ -846,44 +848,34 @@ async function runAgentForMensagemInner(
             next_step_id: evalResult.next_step_id,
             completed_step_id: exec.current_step_id!,
           });
-
-          if (!evalResult.step_completed) return;
-          if (evalResult.next_step_id) {
-            await procedureEngine.advanceStep({
-              execution_id: exec.id,
-              next_step_id: evalResult.next_step_id,
-              completed_step_id: exec.current_step_id!,
-            });
-          } else {
-            await procedureEngine.completeExecution({
-              execution_id: exec.id,
-              outcome: 'success',
-            });
-          }
-        } catch (err) {
-          logger.warn(
-            { err: (err as Error).message, execId },
-            'procedure.postturn.failed',
-          );
+        } else {
+          await procedureEngine.completeExecution({
+            execution_id: exec.id,
+            outcome: 'success',
+          });
         }
-      })();
-    }
-
-    // Reflection trigger: correction detection (real-time)
-    if (inbound.conteudo && detectCorrection(inbound.conteudo)) {
-      const prev = await findPreviousAssistantMessage(c.id, inbound.id);
-      if (prev) {
-        await reflectOnCorrection({
-          pessoa,
-          conversa: c,
-          inbound,
-          previousAssistant: prev,
-        });
+      } catch (err) {
+        logger.warn(
+          { err: (err as Error).message, execId },
+          'procedure.postturn.failed',
+        );
       }
+    })();
+  }
+
+  // Reflection trigger: correction detection (real-time)
+  if (inbound.conteudo && detectCorrection(inbound.conteudo)) {
+    const prev = await findPreviousAssistantMessage(c.id, inbound.id);
+    if (prev) {
+      await reflectOnCorrection({
+        pessoa,
+        conversa: c,
+        inbound,
+        previousAssistant: prev,
+      });
     }
   }
 }
-
 /**
  * P7 Task 8 — helper file-local para montar `role_inputs` do PreturnContext.
  *

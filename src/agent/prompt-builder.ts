@@ -549,17 +549,18 @@ ${stateJson}`;
     '',
     '## Regras aprendidas relevantes',
     rulesBlock || '  (vazio)',
-  ].join('\n')
+  );
+
+  // v3.1.1: growth_hints_block e episodic_summary_block foram removidos do
+  // RenderedProfile. growth_backlog -> Evolution Pipeline (P5/P9 capability_proposals);
+  // episodic_temp -> User Layer (P8c). Identity Layer nao carrega esse conteudo.
+  const system = systemSections.join('\n')
     + memorySection
     + hintsSection
     + selfAwarenessSection
     + roleSection
     + procedureSection
-    + gapMentionSection
-    + (renderedV2?.growth_hints_block ? '\n' + renderedV2.growth_hints_block : '')
-    + (renderedV2?.episodic_summary_block ? '\n' + renderedV2.episodic_summary_block : '');
-
-  const system = systemSections.join('\n');
+    + gapMentionSection;
 
   // Build conversation messages: oldest first.
   // History stays RAW — no inline tool-summary injection (auditability + the
