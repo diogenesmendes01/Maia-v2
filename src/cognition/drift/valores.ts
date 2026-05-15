@@ -2,32 +2,35 @@
  * P4 Task 8 — Drift detector: VALORES.
  *
  * LLM-as-judge: verifica se as mensagens recentes do agente CONTRADIZEM
- * explicitamente algum dos `core_immutable.principles`.
+ * explicitamente alguma das `profile_body.identity.priorities` (lista ordenada
+ * de prioridades — substitui o conceito anterior de `principles`).
+ *
+ * TODO(P8): re-mapear quando Soul Layer chegar — valores soft devem migrar
+ * para soul_biases. Por enquanto, comparamos contra identity.priorities.
  *
  * Provider-agnostic (P86-C4): usa `callLLM`. Erros propagam para o runner.
  *
- * Returns `null` quando não há princípios definidos, sem mensagens do agente,
+ * Returns `null` quando não há prioridades definidas, sem mensagens do agente,
  * sem drift detectado, ou quando o JSON do LLM não pode ser parseado. Throws
  * em falha de API/timeout — runCognitiveModule converte em audit observável.
  */
 import { callLLM } from '@/lib/claude.js';
 import { DriftType } from '@/types/enums.js';
+import type { ProfileBody } from '@/db/schema.js';
 import type { DriftDetector, DriftDetectionInput, DriftEvidence } from './types.js';
-
-type CoreImmutable = { principles?: string[] };
 
 export const valoresDetector: DriftDetector = {
   type: DriftType.VALORES,
   async detect(input: DriftDetectionInput): Promise<DriftEvidence | null> {
-    const core = (input.profile_active.core_immutable ?? {}) as CoreImmutable;
-    const principles = Array.isArray(core.principles) ? core.principles : [];
-    if (principles.length === 0) return null;
+    const body = (input.profile_active.profile_body ?? {}) as Partial<ProfileBody>;
+    const priorities = Array.isArray(body.identity?.priorities) ? body.identity!.priorities : [];
+    if (priorities.length === 0) return null;
 
     const agentMessages = input.recent_messages.filter((m) => m.from === 'agent');
     if (agentMessages.length === 0) return null;
 
     const sample = agentMessages.slice(-20).map((m) => `- ${m.text}`).join('\n');
-    const principlesTxt = principles.map((p, i) => `${i + 1}. ${p}`).join('\n');
+    const principlesTxt = priorities.map((p, i) => `${i + 1}. ${p}`).join('\n');
 
     const system = [
       'Você é um auditor de princípios do agente.',

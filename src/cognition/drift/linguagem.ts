@@ -2,7 +2,7 @@
  * P4 Task 8 — Drift detector: LINGUAGEM (LLM-as-judge).
  *
  * LLM verifica vocabulário/registro recente do agente contra
- * `operational_profile.voice_descriptor`. Diferente do `tom`, foca em
+ * `profile_body.style` (idioma + ritmo). Diferente do `tom`, foca em
  * vocabulário específico, gírias inadequadas, formalidade fora do registro,
  * ou linguagem ofensiva — não no "tom geral" da conversa.
  *
@@ -19,14 +19,23 @@
  */
 import { callLLM } from '@/lib/claude.js';
 import { DriftType } from '@/types/enums.js';
+import type { ProfileBody } from '@/db/schema.js';
 import type { DriftDetector, DriftDetectionInput, DriftEvidence } from './types.js';
 
-type OpProfile = { voice_descriptor?: string };
+function formatStyle(style: ProfileBody['style'] | undefined): string {
+  if (!style) return '(vazio)';
+  const rhythmKeys = Object.keys(style.rhythm ?? {});
+  const rhythmTxt = rhythmKeys.length > 0
+    ? rhythmKeys.map((k) => `${k}=${JSON.stringify(style.rhythm[k])}`).join('; ')
+    : '(sem ritmo definido)';
+  return `idioma=${style.language ?? '(vazio)'}; ritmo=${rhythmTxt}`;
+}
 
 export const linguagemDetector: DriftDetector = {
   type: DriftType.LINGUAGEM,
   async detect(input: DriftDetectionInput): Promise<DriftEvidence | null> {
-    const op = (input.profile_active.operational_profile ?? {}) as OpProfile;
+    const body = (input.profile_active.profile_body ?? {}) as Partial<ProfileBody>;
+    const style_block = formatStyle(body.style);
     const agentMessages = input.recent_messages.filter((m) => m.from === 'agent');
     if (agentMessages.length === 0) return null;
 
@@ -39,7 +48,7 @@ export const linguagemDetector: DriftDetector = {
       'Devolva JSON estrito.',
     ].join('\n');
     const user = [
-      `DESCRITOR DE VOZ:\n${op.voice_descriptor ?? '(vazio)'}\n`,
+      `DESCRITOR DE VOZ:\n${style_block}\n`,
       `MENSAGENS RECENTES:\n${sample}\n`,
       'Devolva {"drift_detected": bool, "severity_hint": "baixo"|"medio"|"alto"|"critico", "offensive": bool, "examples": [...], "reasoning": "..."}',
     ].join('\n');
