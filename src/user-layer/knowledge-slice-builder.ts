@@ -71,6 +71,6 @@ export async function buildKnowledgeSlice(input: {
       cache_key,
     };
   } catch (error) {
-    throw new Error(`Failed to build KnowledgeSlice: ${error}`);
+    throw new Error(`Failed to build KnowledgeSlice: ${error}`, { cause: error });
   }
 }

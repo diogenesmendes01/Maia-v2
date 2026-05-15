@@ -72,34 +72,29 @@ echo ""
 echo "────────────────────────────────────────────────────────────"
 echo ""
 
-# Gate 2: Verify NO resolver uses agent_id as isolation predicate
-echo "[Gate 2] No resolver uses agent_id as isolation predicate"
+# Gate 2: Verify NO resolver uses <table>.agent_id as a query predicate
+# (writes to agent_id in insert/upsert are legitimate metadata)
+echo "[Gate 2] No resolver uses <table>.agent_id as query predicate"
 echo ""
 
 GATE2_PASSED=true
 
-# Search for agent_id used as a filter predicate (common anti-patterns):
-# - eq(agent_id, ...)
-# - where("agent_id", ...)
-# - agent_id: { ... }
-
+# Match drizzle predicates that compare a column reference to agent_id:
+#   eq(<table>.agent_id, ...) | inArray(<table>.agent_id, ...) | and(... .agent_id ...)
 for resolver in src/user-layer/resolvers/*.ts; do
-  if grep -E "(eq|where).*agent_id|agent_id\s*:" "$resolver" > /dev/null 2>&1; then
-    # Make sure it's not just in a comment or type definition
-    if grep -E "^\s*(eq|where).*agent_id|^\s*agent_id\s*:" "$resolver" > /dev/null 2>&1; then
-      echo "✗ $(basename $resolver) uses agent_id as predicate"
-      GATE2_PASSED=false
-    fi
+  if grep -E "(eq|inArray|ne|gt|lt|gte|lte)\(\s*\w+\.agent_id" "$resolver" > /dev/null 2>&1; then
+    echo "✗ $(basename $resolver) filters by <table>.agent_id"
+    GATE2_PASSED=false
   fi
 done
 
 if [ "$GATE2_PASSED" = true ]; then
-  echo "✓ No resolvers use agent_id as isolation predicate"
+  echo "✓ No resolvers filter by <table>.agent_id"
   echo ""
   echo "✓ Gate 2 PASSED: Cross-tenant isolation is correct"
 else
   echo ""
-  echo "✗ Gate 2 FAILED: Found agent_id used as predicate"
+  echo "✗ Gate 2 FAILED: Found agent_id used as query predicate"
   exit 1
 fi
 
@@ -197,16 +192,46 @@ echo ""
 echo "────────────────────────────────────────────────────────────"
 echo ""
 
-# Gate 6: Run acceptance tests
-echo "[Gate 6] Run acceptance gate tests"
+# Gate 6: Run user-layer unit tests
+echo "[Gate 6] Run user-layer unit tests"
 echo ""
 
-if npm run test -- src/user-layer/__tests__/acceptance-gates.spec.ts --run 2>/dev/null; then
+if npm run test -- tests/unit/user-layer/ --run 2>/dev/null; then
   echo ""
-  echo "✓ Gate 6 PASSED: Acceptance tests passed"
+  echo "✓ Gate 6 PASSED: user-layer tests passed"
 else
   echo ""
-  echo "✗ Gate 6 FAILED: Acceptance tests failed"
+  echo "✗ Gate 6 FAILED: user-layer tests failed"
+  exit 1
+fi
+
+echo ""
+echo "────────────────────────────────────────────────────────────"
+echo ""
+
+# Gate 7: Verify migration file present in canonical location
+echo "[Gate 7] Migration 036_p8c_lifecycle_status.sql present"
+echo ""
+
+if [ -f "migrations/036_p8c_lifecycle_status.sql" ]; then
+  for t in memory_entry agent_facts learned_rules behavioral_hint; do
+    if grep -qE "ALTER TABLE $t" "migrations/036_p8c_lifecycle_status.sql"; then
+      echo "✓ migration touches $t"
+    else
+      echo "✗ migration does not touch $t"
+      exit 1
+    fi
+  done
+  if grep -q "DEFAULT 'active'" "migrations/036_p8c_lifecycle_status.sql"; then
+    echo "✓ migration uses DEFAULT 'active'"
+  else
+    echo "✗ migration missing DEFAULT 'active'"
+    exit 1
+  fi
+  echo ""
+  echo "✓ Gate 7 PASSED: Migration file valid"
+else
+  echo "✗ migration file not found at migrations/036_p8c_lifecycle_status.sql"
   exit 1
 fi
 

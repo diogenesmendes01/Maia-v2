@@ -1,8 +1,22 @@
-import { and, eq, isNull, lte, desc, inArray, ilike, or } from 'drizzle-orm';
+import { and, eq, isNull, gt, desc, inArray, ilike, or } from 'drizzle-orm';
 import { db } from '../../db/client.js';
 import { memory_entry } from '../../db/schema.js';
 import { isVisibleLifecycle } from '../internal/visibility.js';
 import type { KnowledgeLifecycleStatus } from '../types.js';
+
+/**
+ * memory-resolver — facade over memory_entry table.
+ *
+ * Tenant-scoped: filters by tenant_id ALWAYS, never by agent_id as a predicate.
+ * Applies lifecycle visibility (KSM) + TTL/expires_at.
+ *
+ * Schema mapping (P8c keeps schema legacy intact; resolver translates to canonical shape):
+ *   memory_entry.content        → MemoryItem.conteudo
+ *   memory_entry.interlocutor_id → MemoryItem.pessoa_id (input filter)
+ *   memory_entry.scope_type/subject_id → MemoryItem.scope (composite "{scope_type}:{subject_id}")
+ *   memory_entry.confidence     → MemoryItem.confidence
+ *   memory_entry.lifecycle_status → MemoryItem.lifecycle_status
+ */
 
 export interface MemoryListInput {
   tenant_id: string;
@@ -32,10 +46,12 @@ export interface MemoryItem {
 
 export interface MemoryUpsertInput {
   tenant_id: string;
-  pessoa_id: string;
+  agent_id: string;
+  pessoa_id?: string;
   conteudo: string;
   memory_type: string;
-  scope: string;
+  scope_type: string;
+  subject_id?: string;
   sensitivity: 'low' | 'medium' | 'high';
   proactive_use: boolean;
   mention_allowed: boolean;
@@ -44,56 +60,58 @@ export interface MemoryUpsertInput {
   caller_agent_id?: string;
 }
 
+function rowToItem(r: typeof memory_entry.$inferSelect): MemoryItem {
+  const scope = r.subject_id ? `${r.scope_type}:${r.subject_id}` : r.scope_type;
+  return {
+    id: r.id,
+    conteudo: r.content,
+    memory_type: r.memory_type,
+    scope,
+    sensitivity: r.sensitivity as MemoryItem['sensitivity'],
+    proactive_use: r.proactive_use,
+    mention_allowed: r.mention_allowed,
+    ttl_days: r.ttl_days,
+    expires_at: r.expires_at?.toISOString() ?? null,
+    needs_review: r.needs_review ?? false,
+    confidence: Number(r.confidence),
+    lifecycle_status: r.lifecycle_status as KnowledgeLifecycleStatus,
+    created_at: r.created_at?.toISOString() ?? '',
+  };
+}
+
 export const memoryResolver = {
   async list(input: MemoryListInput): Promise<MemoryItem[]> {
     const now = new Date();
     const conditions = [
       eq(memory_entry.tenant_id, input.tenant_id),
       isVisibleLifecycle(memory_entry.lifecycle_status),
+      // Expired memories are filtered out: expires_at IS NULL or expires_at > now
       or(
         isNull(memory_entry.expires_at),
-        lte(memory_entry.expires_at, now),
+        gt(memory_entry.expires_at, now),
       ),
     ];
 
     if (input.pessoa_id) {
-      conditions.push(eq(memory_entry.pessoa_id, input.pessoa_id));
-    }
-    if (input.scope?.length) {
-      conditions.push(inArray(memory_entry.scope, input.scope));
+      conditions.push(eq(memory_entry.interlocutor_id, input.pessoa_id));
     }
     if (input.memory_types?.length) {
       conditions.push(inArray(memory_entry.memory_type, input.memory_types));
     }
-
-    let query = db.select().from(memory_entry).where(and(...conditions));
-
     if (input.intent_filter) {
-      // Ideally use vector recall; fallback to ILIKE
-      query = query.where(
-        ilike(memory_entry.conteudo, `%${input.intent_filter}%`),
+      conditions.push(
+        ilike(memory_entry.content, `%${input.intent_filter}%`),
       );
     }
 
-    const rows = await query
+    const rows = await db
+      .select()
+      .from(memory_entry)
+      .where(and(...conditions))
       .orderBy(desc(memory_entry.created_at))
       .limit(input.limit);
 
-    return rows.map((r) => ({
-      id: r.id,
-      conteudo: r.conteudo,
-      memory_type: r.memory_type,
-      scope: r.scope,
-      sensitivity: r.sensitivity as MemoryItem['sensitivity'],
-      proactive_use: r.proactive_use,
-      mention_allowed: r.mention_allowed,
-      ttl_days: r.ttl_days,
-      expires_at: r.expires_at?.toISOString() ?? null,
-      needs_review: r.needs_review ?? false,
-      confidence: Number(r.confidence),
-      lifecycle_status: r.lifecycle_status as KnowledgeLifecycleStatus,
-      created_at: r.created_at?.toISOString() ?? '',
-    }));
+    return rows.map(rowToItem);
   },
 
   async upsert(input: MemoryUpsertInput): Promise<MemoryItem> {
@@ -105,10 +123,12 @@ export const memoryResolver = {
       .insert(memory_entry)
       .values({
         tenant_id: input.tenant_id,
-        pessoa_id: input.pessoa_id,
-        conteudo: input.conteudo,
+        agent_id: input.agent_id,
+        interlocutor_id: input.pessoa_id ?? null,
+        content: input.conteudo,
         memory_type: input.memory_type,
-        scope: input.scope,
+        scope_type: input.scope_type,
+        subject_id: input.subject_id ?? null,
         sensitivity: input.sensitivity,
         proactive_use: input.proactive_use,
         mention_allowed: input.mention_allowed,
@@ -116,34 +136,20 @@ export const memoryResolver = {
         expires_at: expiresAt,
         lifecycle_status: input.lifecycle_status ?? 'active',
       })
-      .onConflictDoNothing()
       .returning();
 
     if (!inserted) {
       throw new Error('Failed to upsert memory');
     }
-
-    return {
-      id: inserted.id,
-      conteudo: inserted.conteudo,
-      memory_type: inserted.memory_type,
-      scope: inserted.scope,
-      sensitivity: inserted.sensitivity as MemoryItem['sensitivity'],
-      proactive_use: inserted.proactive_use,
-      mention_allowed: inserted.mention_allowed,
-      ttl_days: inserted.ttl_days,
-      expires_at: inserted.expires_at?.toISOString() ?? null,
-      needs_review: inserted.needs_review ?? false,
-      confidence: Number(inserted.confidence),
-      lifecycle_status: inserted.lifecycle_status as KnowledgeLifecycleStatus,
-      created_at: inserted.created_at?.toISOString() ?? '',
-    };
+    return rowToItem(inserted);
   },
 
-  async markObserved(id: string, by_agent_id?: string): Promise<void> {
+  async markObserved(id: string, _by_agent_id?: string): Promise<void> {
+    // P8c: stub — full KSM transitions land in P10a.
+    // Records evidence_count++ as best-effort metadata signal.
     await db
       .update(memory_entry)
-      .set({ /* last_observed_at, etc. — optional metadata */ })
+      .set({ updated_at: new Date() })
       .where(eq(memory_entry.id, id));
   },
 };

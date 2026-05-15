@@ -1,4 +1,4 @@
--- 030_p8c_lifecycle_status.sql
+-- 036_p8c_lifecycle_status.sql
 -- P8c — adiciona campos do Knowledge State Machine sem remover legacy.
 -- DEFAULT 'active' preserva backward compat: tudo que já existia continua visível.
 

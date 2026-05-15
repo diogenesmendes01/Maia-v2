@@ -88,6 +88,6 @@ export async function buildUserSlice(input: {
       cache_key,
     };
   } catch (error) {
-    throw new Error(`Failed to build UserSlice: ${error}`);
+    throw new Error(`Failed to build UserSlice: ${error}`, { cause: error });
   }
 }
