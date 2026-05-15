@@ -21,6 +21,8 @@ import { runMorningBriefing, runEveningBriefing, runWeeklyBriefing } from './bri
 import { runLegacyMemoryReclassifier } from './legacy-memory-reclassifier.js';
 import { runConfidenceRecompute } from './confidence-recompute.js';
 import { runProcedureCandidateConsumer } from './procedure-candidate-consumer.js';
+import { runProcedureExecutionReaper } from './procedure-execution-reaper.js';
+import { runProcedureMetricsRefresh } from './procedure-metrics-refresh.js';
 import { tickEngine } from '@/workflows/engine.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 
@@ -74,6 +76,8 @@ export const JOBS: Job[] = [
   { name: 'legacy_memory_reclassifier', cron: '0 3 * * *', fn: runLegacyMemoryReclassifier, phase: 2 },
   { name: 'confidence_recompute', cron: '30 3 * * *', fn: runConfidenceRecompute, phase: 2 },
   { name: 'procedure_candidate_consumer', cron: '0 2 * * *', fn: runProcedureCandidateConsumer, phase: 2 },
+  { name: 'procedure_execution_reaper', cron: '0 * * * *', fn: runProcedureExecutionReaper, phase: 3 },
+  { name: 'procedure_metrics_refresh', cron: '*/15 * * * *', fn: runProcedureMetricsRefresh, phase: 3 },
   { name: 'briefing_morning', cron: '0 8 * * *', fn: runMorningBriefing, phase: 4 },
   { name: 'briefing_evening', cron: '0 21 * * *', fn: runEveningBriefing, phase: 4 },
   { name: 'briefing_weekly', cron: '0 8 * * 1', fn: runWeeklyBriefing, phase: 4 },

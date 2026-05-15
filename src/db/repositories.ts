@@ -1,5 +1,5 @@
-import { eq, and, inArray, desc, isNull, sql, or, gt, ne } from 'drizzle-orm';
-import { db, withTx } from './client.js';
+import { eq, and, inArray, desc, isNull, sql, or, gt, lt } from 'drizzle-orm';
+import { db } from './client.js';
 import {
   pessoas,
   permissoes,
@@ -36,6 +36,8 @@ import {
   procedure_executions,
   procedure_execution_events,
   procedure_selector_decisions,
+  procedure_tests,
+  procedure_metrics,
 } from './schema.js';
 import { TypedError } from '@/lib/utils.js';
 import { applyTenantGuard } from './tenant-guard.js';
@@ -73,6 +75,8 @@ import type {
   ProcedureExecution,
   ProcedureExecutionEvent,
   ProcedureSelectorDecision,
+  ProcedureTest,
+  ProcedureMetric,
 } from './schema.js';
 
 export type EntityScope = {
@@ -1305,6 +1309,13 @@ export const tenantsRepo = {
     const [created] = await db.insert(tenants).values(t).returning();
     return created!;
   },
+
+  // P3c Task 9: workers que precisam iterar todos os tenants (ex.: reaper)
+  // chamam list() para fan-out. Cross-tenant por design — single point of
+  // truth para enumeração, sem RLS implícito.
+  async list(): Promise<Tenant[]> {
+    return db.select().from(tenants).orderBy(tenants.id);
+  },
 };
 
 export const agentsRepo = {
@@ -2168,8 +2179,12 @@ export const procedureExecutionsRepo = {
     return { execution: existing, created: false };
   },
 
-  // P84-C5: transaction-aware variant. When called from inside a
-  // withTx() block, all writes commit together with the caller's events.
+  // P84-C5 / P3c fix P85-I1: transaction-aware variant. When called from
+  // inside a withTx() block, all writes commit together with the caller's
+  // events. Used by the engine (advance/complete/abort) and by the reaper
+  // (auto_abandoned event + status update must be atomic — without this, a
+  // process crash between event-write and status-write produces a duplicate
+  // auto_abandoned event on the next reaper tick).
   async updateStateTx(
     tx: typeof db,
     id: string,
@@ -2208,6 +2223,36 @@ export const procedureExecutionsRepo = {
       .set({ ...updates, last_activity_at: new Date() } as any)
       .where(eq(procedure_executions.id, id));
   },
+
+  // P3c Task 9 — reaper helper. Retorna execuções do tenant atual ainda em
+  // status='in_progress' cuja last_activity_at < now() - ttl_days. Workers
+  // chamam dentro de runWithTenantContext para isolar por tenant.
+  //
+  // PR #85 fix P85-I6: cap result size with `limit` (default 1000) to keep
+  // the per-tick cost bounded. After a long outage this prevents one cron
+  // tick from grinding through tens of thousands of stale rows in a single
+  // sequential pass and overlapping with the next tick. Reaper is
+  // idempotent across runs (combined with P85-I1's transactional write),
+  // so the leftover backlog drains on subsequent ticks.
+  async listStaleInProgress(opts: {
+    ttl_days: number;
+    limit?: number;
+  }): Promise<ProcedureExecution[]> {
+    const tenant_id = getCurrentTenant();
+    const cutoff = new Date(Date.now() - opts.ttl_days * 86_400_000);
+    const cap = opts.limit ?? 1000;
+    return db
+      .select()
+      .from(procedure_executions)
+      .where(
+        and(
+          eq(procedure_executions.tenant_id, tenant_id),
+          eq(procedure_executions.status, 'in_progress'),
+          lt(procedure_executions.last_activity_at, cutoff),
+        ),
+      )
+      .limit(cap);
+  },
 };
 
 export const procedureExecutionEventsRepo = {
@@ -2218,8 +2263,12 @@ export const procedureExecutionEventsRepo = {
     await db.insert(procedure_execution_events).values(guarded as any);
   },
 
-  // P84-C5: transaction-aware variant. Lets the engine commit
-  // recordEvent+updateState atomically inside withTx().
+  // P84-C5 / P3c fix P85-I1: transaction-aware variant. Lets the engine
+  // commit recordEvent+updateState atomically inside withTx(), and lets the
+  // reaper atomically pair the audit-event INSERT with the
+  // procedure-execution UPDATE. The applyTenantGuard call still binds
+  // tenant/agent from AsyncLocalStorage so tenant isolation is preserved
+  // across the transaction boundary.
   async recordTx(
     tx: typeof db,
     input: Omit<ProcedureExecutionEvent, 'id' | 'created_at' | 'tenant_id' | 'agent_id'>,
@@ -2265,5 +2314,114 @@ export const procedureSelectorDecisionsRepo = {
       ))
       .orderBy(desc(procedure_selector_decisions.decided_at))
       .limit(limit);
+  },
+};
+
+// P3c: procedure_tests — cenários executáveis usados como gate de promoção
+// proposed → active. `recordRun` é chamado pelo test-runner; `allPassFor` é
+// o predicado consultado por `transitionProcedureStatus` antes de ativar.
+export const procedureTestsRepo = {
+  async create(input: {
+    definition_id: string;
+    name: string;
+    description?: string;
+    scenario: unknown;
+    expected_outcome: 'success' | 'failure' | 'partial' | 'escalated';
+    expected_step_path?: unknown;
+  }): Promise<ProcedureTest> {
+    const guarded = applyTenantGuard({
+      definition_id: input.definition_id,
+      name: input.name,
+      description: input.description ?? null,
+      scenario: input.scenario as object,
+      expected_outcome: input.expected_outcome,
+      expected_step_path: (input.expected_step_path ?? null) as object | null,
+    });
+    const [row] = await db.insert(procedure_tests).values(guarded as any).returning();
+    return row!;
+  },
+
+  async listByDefinition(definition_id: string): Promise<ProcedureTest[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(procedure_tests)
+      .where(and(
+        eq(procedure_tests.tenant_id, tenant_id),
+        eq(procedure_tests.agent_id, agent_id),
+        eq(procedure_tests.definition_id, definition_id),
+      ))
+      .orderBy(procedure_tests.created_at);
+  },
+
+  async recordRun(args: {
+    id: string;
+    status: 'pass' | 'fail' | 'error' | 'skipped';
+    details: unknown;
+  }): Promise<void> {
+    await db
+      .update(procedure_tests)
+      .set({
+        last_run_at: new Date(),
+        last_run_status: args.status,
+        last_run_details: args.details as object,
+        updated_at: new Date(),
+      })
+      .where(eq(procedure_tests.id, args.id));
+  },
+
+  // True iff there's >=1 test AND ALL have last_run_status='pass'.
+  // Used as gate before promoting proposed → active.
+  async allPassFor(definition_id: string): Promise<boolean> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select({ last_run_status: procedure_tests.last_run_status })
+      .from(procedure_tests)
+      .where(and(
+        eq(procedure_tests.tenant_id, tenant_id),
+        eq(procedure_tests.agent_id, agent_id),
+        eq(procedure_tests.definition_id, definition_id),
+      ));
+    if (rows.length === 0) return false;
+    return rows.every((r) => r.last_run_status === 'pass');
+  },
+
+  async delete(id: string): Promise<void> {
+    await db.delete(procedure_tests).where(eq(procedure_tests.id, id));
+  },
+};
+
+// P3c: procedure_metrics — read-only access to the materialized view.
+// Refresh is owned by a worker; this repo only exposes reads, filtered by
+// tenant/agent context (still applyTenantGuard-equivalent: every select
+// includes tenant + agent from the AsyncLocalStorage).
+export const procedureMetricsRepo = {
+  async getByDefinition(definition_id: string): Promise<ProcedureMetric | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(procedure_metrics)
+      .where(and(
+        eq(procedure_metrics.tenant_id, tenant_id),
+        eq(procedure_metrics.agent_id, agent_id),
+        eq(procedure_metrics.definition_id, definition_id),
+      ))
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  async listByTenantAgent(): Promise<ProcedureMetric[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(procedure_metrics)
+      .where(and(
+        eq(procedure_metrics.tenant_id, tenant_id),
+        eq(procedure_metrics.agent_id, agent_id),
+      ));
   },
 };

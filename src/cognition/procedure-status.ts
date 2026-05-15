@@ -1,10 +1,5 @@
-import {
-  procedureDefinitionsRepo,
-  procedureStatusEventsRepo,
-} from '@/db/repositories.js';
-import type { ProcedureStatusUpdate } from '@/db/repositories.js';
-import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
-import type { ProcedureDefinition } from '@/db/schema.js';
+import { procedureDefinitionsRepo, procedureTestsRepo } from '@/db/repositories.js';
+import type { ProcedureDefinition, ProcedureTest } from '@/db/schema.js';
 
 export type ProcedureStatus = 'draft' | 'proposed' | 'active' | 'frozen' | 'rolled_back';
 
@@ -29,26 +24,43 @@ export function validateTransition(from: string, to: string): void {
 }
 
 /**
- * Apply a status transition.
+ * Result of an attempted transition.
  *
- * - Refuses to run without a tenant context (P83-M6: no fallback to
- *   `default`; every transition must be auditable to a real tenant).
- * - Routes `→ active` through `procedureDefinitionsRepo.atomicActivate`,
- *   which (a) takes row-level locks, (b) freezes any sibling active
- *   version, (c) appends event rows — all in a single transaction.
- *   Combined with the UNIQUE partial index on (tenant,agent,nome) WHERE
- *   status='active', dual-active is impossible. (P83-C4, H1, H2)
- * - For other transitions, performs a tenant-scoped update and appends
- *   an event row. updateStatus returns the affected-row count so a
- *   cross-tenant id surfaces as "no row affected" instead of silent
- *   success. (P83-H5)
+ * `ok: true` ⇒ the transition was performed.
+ * `ok: false` ⇒ the transition was rejected by a gate (e.g. P3c test gate)
+ * with a structured `reason`. Hard schema-level invariants (invalid
+ * source→target combinations) still throw via `validateTransition` — those
+ * are programming errors, not governance decisions.
+ */
+export type TransitionResult =
+  | { ok: true; definition: ProcedureDefinition }
+  | {
+      ok: false;
+      reason: 'tests_required';
+      missing_tests: true;
+    }
+  | {
+      ok: false;
+      reason: 'tests_not_passing';
+      failing_tests: ProcedureTest[];
+    };
+
+/**
+ * Async helper that applies a transition AND, if going to 'active',
+ * deactivates the previous active version of the same nome.
+ *
+ * P3c gate: `proposed → active` requires at least 1 procedure_test row
+ * for the definition AND every row must have last_run_status='pass'.
+ * The gate fires ONLY on `proposed → active`; other transitions
+ * (draft→proposed, active→frozen, frozen→active, …) bypass it. Existing
+ * `active` definitions are unaffected — they never re-enter `proposed`,
+ * so the gate cannot retroactively block them.
  */
 export async function transitionProcedureStatus(args: {
   definition: ProcedureDefinition;
   to: ProcedureStatus;
   actor: string;
-  reason?: string;
-}): Promise<void> {
+}): Promise<TransitionResult> {
   validateTransition(args.definition.status, args.to);
   // P83-M6 guard: throw if invoked outside a tenant context.
   getCurrentTenant();
@@ -62,6 +74,18 @@ export async function transitionProcedureStatus(args: {
       preserve_activated_at: true,
     });
     return;
+  }
+
+  // P3c gate: proposed → active requires green tests.
+  if (args.definition.status === 'proposed' && args.to === 'active') {
+    const tests = await procedureTestsRepo.listByDefinition(args.definition.id);
+    if (tests.length === 0) {
+      return { ok: false, reason: 'tests_required', missing_tests: true };
+    }
+    const failing = tests.filter((t) => t.last_run_status !== 'pass');
+    if (failing.length > 0) {
+      return { ok: false, reason: 'tests_not_passing', failing_tests: failing };
+    }
   }
 
   const now = new Date();
@@ -78,18 +102,13 @@ export async function transitionProcedureStatus(args: {
     updates.deactivated_at = now;
   }
 
-  const affected = await procedureDefinitionsRepo.updateStatus(args.definition.id, updates);
-  if (affected === 0) {
-    throw new Error(
-      `procedure_definition ${args.definition.id} not updated — wrong tenant context or row missing`,
-    );
-  }
+  await procedureDefinitionsRepo.updateStatus(
+    args.definition.id,
+    updates as Parameters<typeof procedureDefinitionsRepo.updateStatus>[1],
+  );
 
-  await procedureStatusEventsRepo.record({
-    definition_id: args.definition.id,
-    from_status: args.definition.status,
-    to_status: args.to,
-    actor: args.actor,
-    reason: args.reason,
-  });
+  return {
+    ok: true,
+    definition: { ...args.definition, ...(updates as Partial<ProcedureDefinition>) },
+  };
 }

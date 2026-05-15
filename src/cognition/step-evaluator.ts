@@ -1,5 +1,9 @@
 import type { ProcedureExecution, ProcedureDefinition } from '@/db/schema.js';
 import { logger } from '@/lib/logger.js';
+import { getLatestHumanConfirmation } from '@/procedures/engine.js';
+import { healthRepo } from '@/db/repositories.js';
+import { judgeStepCriterion } from './step-evaluator-llm-judge.js';
+import { detectUserSignal } from './step-evaluator-user-signal.js';
 
 type Criterion = {
   id: string;
@@ -17,6 +21,8 @@ type Step = {
 export type ResponseContext = {
   response_text?: string;
   tools_called?: Array<{ name: string; result: unknown }>;
+  /** Texto inbound do usuário neste turn — usado por critérios `user_signal`. */
+  user_message?: string;
 };
 
 export type StepEvalResult = {
@@ -31,7 +37,7 @@ export type StepEvalResult = {
    * so the executor can record an event and (in P3c) the reaper can sweep.
    * Today: surfaced as a warning + audit event so the stall is observable.
    */
-  stall_reason: null | 'no_criteria_defined' | 'unsupported_criterion_only';
+  stall_reason: null | 'no_criteria_defined' | 'unsupported_criterion_only' | 'unknown_criterion_type';
   /**
    * P84-C3: when more than one downstream step is eligible to fire from
    * the current completion (DAG parallel branches), the evaluator picks
@@ -41,16 +47,24 @@ export type StepEvalResult = {
   branch_alternates: string[];
 };
 
-export function evaluateCurrentStep(args: {
+export async function evaluateCurrentStep(args: {
   execution: ProcedureExecution;
   definition: ProcedureDefinition;
   response_context: ResponseContext;
-}): StepEvalResult {
+}): Promise<StepEvalResult> {
   const steps = args.definition.steps as unknown as Step[];
   const criteria = args.definition.success_criteria as unknown as Criterion[];
   const currentStepId = args.execution.current_step_id;
 
   if (!currentStepId) {
+    // P85-M3: surface the silent stall — without this log, an execution stuck
+    // with `current_step_id IS NULL` and `status='in_progress'` is invisible
+    // until the reaper sweeps it ~7d later. The post-turn evaluator wraps this
+    // in try/catch so the log doesn't break the agent turn.
+    logger.warn(
+      { execution_id: args.execution.id, definition_id: args.definition.id },
+      'step_evaluator.no_current_step',
+    );
     return {
       step_completed: false,
       criterion_results: [],
@@ -63,6 +77,17 @@ export function evaluateCurrentStep(args: {
 
   const currentStep = steps.find((s) => s.id === currentStepId);
   if (!currentStep) {
+    // P85-M3: same class of silent-stall — `current_step_id` references a
+    // step that no longer exists in the definition (e.g., definition was
+    // edited mid-execution). Logged with both ids so ops can correlate.
+    logger.warn(
+      {
+        execution_id: args.execution.id,
+        definition_id: args.definition.id,
+        current_step_id: currentStepId,
+      },
+      'step_evaluator.current_step_not_found_in_definition',
+    );
     return {
       step_completed: false,
       criterion_results: [],
@@ -87,6 +112,14 @@ export function evaluateCurrentStep(args: {
   // so, the step is stuck waiting on P3c and we should flag it rather
   // than silently looping forever.
   let unsupported_count = 0;
+
+  // P85-NB1: any criterion whose `type` is not handled by any branch
+  // below. Without this defensive tracker, a future criterion type
+  // added without an evaluator branch would produce passed=false +
+  // evidence='' and the procedure would stall invisibly until the
+  // reaper sweep. We surface it as a distinct stall_reason so audit
+  // and ops can see it.
+  const unknown_types: string[] = [];
 
   for (const c of stepCriteria) {
     let passed = false;
@@ -117,12 +150,96 @@ export function evaluateCurrentStep(args: {
         passed = false;
         evidence = `tool ${tool} not called`;
       }
+    } else if (c.type === 'llm_judge') {
+      // P3c Task 4: chamada ao Haiku via runCognitiveModule wrapper.
+      // judgeStepCriterion JÁ embute timeout + fallback determinístico —
+      // não propaga exceção, no pior caso retorna passed=false com reasoning
+      // 'judge_timeout_or_error'. Threshold default 0.7 quando ausente.
+      const threshold = typeof c.threshold === 'number' ? (c.threshold as number) : 0.7;
+      const judge = await judgeStepCriterion({
+        prompt: c.prompt as string,
+        threshold,
+        response_text: args.response_context.response_text ?? '',
+        rubric: c.rubric as string | undefined,
+      });
+      passed = judge.passed;
+      evidence = `judge score=${judge.score.toFixed(2)} threshold=${threshold}: ${judge.reasoning}`;
+    } else if (c.type === 'user_signal') {
+      // P3c Task 5: detecção determinística (regex) sobre a MENSAGEM DO USUÁRIO
+      // — não a resposta do agente. Negative checked first, então
+      // "não, mas pode ser" não vira positivo por engano.
+      const r = detectUserSignal({
+        signal: (c.signal as 'agreement' | 'denial' | 'custom') ?? 'agreement',
+        positive_patterns: c.positive_patterns as string[] | undefined,
+        negative_patterns: c.negative_patterns as string[] | undefined,
+        user_message: args.response_context.user_message ?? '',
+      });
+      passed = r.passed;
+      evidence = `user_signal ${r.matched}: ${r.evidence}`;
+    } else if (c.type === 'human_confirmed') {
+      // P3c Task 6: event-sourced. Consulta o ÚLTIMO evento
+      // `human_confirmation` para (execution_id, step_id). Sem evento ainda →
+      // awaiting. TTL opcional invalida approvals antigos — útil para
+      // confirmações sensíveis (ex.: pagamento) que perdem validade rápido.
+      const conf = await getLatestHumanConfirmation({
+        execution_id: args.execution.id,
+        step_id: currentStep.id,
+      });
+      if (!conf) {
+        passed = false;
+        evidence = 'awaiting human confirmation';
+      } else if (conf.decision === 'rejected') {
+        passed = false;
+        evidence = `human rejected by ${conf.operator_id}`;
+      } else {
+        const ttlMin = typeof c.ttl_minutes === 'number' ? (c.ttl_minutes as number) : undefined;
+        if (ttlMin && Date.now() - conf.ts.getTime() > ttlMin * 60_000) {
+          passed = false;
+          evidence = `confirmation expired (ttl ${ttlMin}min)`;
+        } else {
+          passed = true;
+          evidence = `human approved by ${conf.operator_id}`;
+        }
+      }
     } else {
-      // P3b: llm_judge / user_signal / human_confirmed — not evaluated yet
+      // P85-NB1: defensive terminal else. If a new criterion type is added
+      // to the schema but no evaluator branch is added here, fall through
+      // to a visible, auditable stall instead of silently producing
+      // passed=false + evidence=''. The stall_reason='unknown_criterion_type'
+      // (set below) shows up in audit/reaper data; the health row emits a
+      // 'degraded' signal so the DLQ-monitor / dashboards page ops.
+      const unknownType = String((c as { type?: unknown }).type ?? 'undefined');
+      unknown_types.push(unknownType);
       passed = false;
-      evidence = `criterion type ${c.type} not evaluated in P3b`;
-      unsupported_count += 1;
-      // Don't mark as failure — just incomplete (P3c handles)
+      evidence = `unknown_criterion_type: ${unknownType}`;
+      logger.warn(
+        {
+          execution_id: args.execution.id,
+          definition_id: args.execution.definition_id,
+          step_id: currentStep.id,
+          criterion_id: c.id,
+          criterion_type: unknownType,
+        },
+        'step_evaluator.unknown_criterion_type',
+      );
+      // Best-effort health emission — never mask the procedure logic if
+      // the health write itself fails (matches the procedure-metrics-refresh
+      // pattern introduced by P85-I4).
+      try {
+        await healthRepo.record({
+          component: 'step_evaluator',
+          status: 'degraded',
+          error: `unknown_criterion_type:${unknownType}`,
+          metadata: {
+            execution_id: args.execution.id,
+            step_id: currentStep.id,
+            criterion_id: c.id,
+            criterion_type: unknownType,
+          },
+        });
+      } catch (healthErr) {
+        logger.warn({ err: healthErr }, 'step_evaluator.health_write_failed');
+      }
     }
 
     if (!passed) all_passed = false;
@@ -149,6 +266,12 @@ export function evaluateCurrentStep(args: {
       },
       'step_evaluator.stall.no_criteria_defined',
     );
+  } else if (unknown_types.length > 0) {
+    // P85-NB1: an unknown criterion type takes precedence over
+    // 'unsupported_criterion_only' — the former signals a definition or
+    // schema bug that ops must investigate; the latter is normal awaiting
+    // behavior. Surface the more actionable signal.
+    stall_reason = 'unknown_criterion_type';
   } else if (unsupported_count === stepCriteria.length) {
     stall_reason = 'unsupported_criterion_only';
   }

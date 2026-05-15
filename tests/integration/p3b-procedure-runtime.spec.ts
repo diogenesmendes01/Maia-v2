@@ -175,7 +175,7 @@ describe('P3b procedure runtime integration', () => {
         first_step_id: 'step-1',
       });
 
-      const evalResult = evaluateCurrentStep({
+      const evalResult = await evaluateCurrentStep({
         execution: exec,
         definition: definitions[defId],
         response_context: { response_text: 'Dado foi confirmado pelo cliente' },

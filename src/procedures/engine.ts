@@ -277,6 +277,65 @@ export async function abortExecution(args: { execution_id: string; reason: strin
 }
 
 /**
+ * P3c Task 6: registra uma confirmação humana (approved | rejected) como evento
+ * event-sourced. O step-evaluator consulta o evento mais recente via
+ * {@link getLatestHumanConfirmation} para decidir o critério `human_confirmed`.
+ *
+ * Não muta o estado da execution diretamente — apenas append. A decisão de
+ * avançar/abortar é responsabilidade do evaluator + advanceStep no turno
+ * seguinte.
+ */
+export async function recordHumanConfirmation(args: {
+  execution_id: string;
+  step_id: string;
+  operator_id: string;
+  decision: 'approved' | 'rejected';
+  notes?: string;
+}): Promise<void> {
+  await procedureExecutionEventsRepo.record({
+    execution_id: args.execution_id,
+    step_id: args.step_id,
+    event_type: 'human_confirmation',
+    payload: {
+      step_id: args.step_id,
+      operator_id: args.operator_id,
+      decision: args.decision,
+      notes: args.notes ?? null,
+    },
+    confidence: null,
+  } as any);
+}
+
+/**
+ * P3c Task 6: busca a confirmação humana mais recente para um (execution_id,
+ * step_id). Retorna null se não houver. LIFO sobre a lista ordenada por
+ * created_at (asc, vinda do repo) — itera de trás pra frente.
+ *
+ * Eventos com payload inválido (sem step_id correto, ou decision != approved
+ * | rejected) são ignorados em vez de lançar — defensivo contra evolução de
+ * schema.
+ */
+export async function getLatestHumanConfirmation(args: {
+  execution_id: string;
+  step_id: string;
+}): Promise<{ decision: 'approved' | 'rejected'; operator_id: string; ts: Date } | null> {
+  const events = await procedureExecutionEventsRepo.listByExecution(args.execution_id);
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i];
+    if (!e || e.event_type !== 'human_confirmation') continue;
+    const p = e.payload as { step_id?: string; decision?: string; operator_id?: string } | null;
+    if (!p || p.step_id !== args.step_id) continue;
+    if (p.decision !== 'approved' && p.decision !== 'rejected') continue;
+    return {
+      decision: p.decision,
+      operator_id: p.operator_id ?? 'unknown',
+      ts: e.created_at,
+    };
+  }
+  return null;
+}
+
+/**
  * P84-C4: replayState now consumes `state_updated` events too, so the
  * full set of derived fields can be reconstructed from the event log
  * alone (`outcome`, `notes`, plus `current_step_id`/`completed_steps`/
