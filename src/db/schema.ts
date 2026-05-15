@@ -872,13 +872,12 @@ export const procedure_metrics = pgMaterializedView('procedure_metrics', {
   refreshed_at: timestamp('refreshed_at', { withTimezone: true }).notNull(),
 }).existing();
 
-// P4: agent_operational_profile_versions — append-only, 4 camadas
-// (núcleo imutável / perfil operacional aprendido / memória episódica temporária
-// / backlog de crescimento aprovado) + status (proposed | active | frozen |
-// rolled_back). Apenas a row `active` por (tenant_id, agent_id) entra em
-// runtime — esse invariante é garantido pelo unique index parcial
-// `agent_op_profile_unique_active_idx` declarado em migrations/025
-// (Drizzle não expressa WHERE em uniqueIndex; a DB enforce).
+// P4: agent_operational_profile_versions — append-only, 1 JSONB `profile_body`
+// (v3.1.1: { schema_version, identity{...}, style{...}, metadata{...} }) +
+// status (proposed | active | frozen | rolled_back). Apenas a row `active` por
+// (tenant_id, agent_id) entra em runtime — esse invariante é garantido pelo
+// unique index parcial `agent_op_profile_unique_active_idx` declarado em
+// migrations/025 (Drizzle não expressa WHERE em uniqueIndex; a DB enforce).
 export const agent_operational_profile_versions = pgTable(
   'agent_operational_profile_versions',
   {
@@ -887,10 +886,8 @@ export const agent_operational_profile_versions = pgTable(
     agent_id: text('agent_id').notNull(),
     version: integer('version').notNull(),
     status: text('status').notNull(),
-    core_immutable: jsonb('core_immutable').notNull().default(sql`'{}'::jsonb`),
-    operational_profile: jsonb('operational_profile').notNull().default(sql`'{}'::jsonb`),
-    episodic_temp: jsonb('episodic_temp').notNull().default(sql`'{}'::jsonb`),
-    growth_backlog: jsonb('growth_backlog').notNull().default(sql`'{}'::jsonb`),
+    profile_body: jsonb('profile_body').notNull().default(sql`'{}'::jsonb`),
+    // shape: { schema_version, identity{...}, style{...}, metadata{...} } — ver migration 025
     proposed_by: text('proposed_by').notNull(),
     proposed_reason: text('proposed_reason'),
     approved_by: text('approved_by'),
@@ -994,5 +991,34 @@ export type NewProcedureTest = typeof procedure_tests.$inferInsert;
 export type ProcedureMetric = typeof procedure_metrics.$inferSelect;
 export type AgentOperationalProfileVersion = typeof agent_operational_profile_versions.$inferSelect;
 export type NewAgentOperationalProfileVersion = typeof agent_operational_profile_versions.$inferInsert;
+
+// Tipo estrutural do JSONB `profile_body` (v3.1.1)
+export interface ProfileBody {
+  schema_version: 'v3.1.1-2026-05-15';
+  identity: {
+    role_descriptor: string;
+    voice: {
+      tone: string;
+      formality: 'low' | 'medium' | 'high';
+      verbosity: 'short' | 'medium' | 'detailed';
+    };
+    cognitive_limits: {
+      max_inference_depth: number;
+      max_speculation_in_response: number;
+      confidence_floor_for_action: number;
+    };
+    priorities: string[];
+    learned_voice_modifiers: unknown[];
+  };
+  style: {
+    language: string;
+    rhythm: Record<string, unknown>;
+  };
+  metadata: {
+    effective_from: string;
+    created_by: string;
+    previous_version_id: string | null;
+  };
+}
 export type AgentDriftAlert = typeof agent_drift_alerts.$inferSelect;
 export type NewAgentDriftAlert = typeof agent_drift_alerts.$inferInsert;

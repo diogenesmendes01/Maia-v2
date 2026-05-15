@@ -15,6 +15,44 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import { ProfileStatus } from '@/types/enums.js';
+import { agent_operational_profile_versions, type ProfileBody } from '@/db/schema.js';
+
+describe('schema profile_body (v3.1.1)', () => {
+  it('has profile_body column', () => {
+    expect('profile_body' in agent_operational_profile_versions).toBe(true);
+  });
+
+  it('does NOT have legacy 4-column JSONB', () => {
+    expect('core_immutable' in agent_operational_profile_versions).toBe(false);
+    expect('operational_profile' in agent_operational_profile_versions).toBe(false);
+    expect('episodic_temp' in agent_operational_profile_versions).toBe(false);
+    expect('growth_backlog' in agent_operational_profile_versions).toBe(false);
+  });
+
+  it('exports ProfileBody type with schema_version v3.1.1', () => {
+    const sample: ProfileBody = {
+      schema_version: 'v3.1.1-2026-05-15',
+      identity: {
+        role_descriptor: 'x',
+        voice: { tone: 't', formality: 'medium', verbosity: 'short' },
+        cognitive_limits: {
+          max_inference_depth: 3,
+          max_speculation_in_response: 0.2,
+          confidence_floor_for_action: 0.7,
+        },
+        priorities: [],
+        learned_voice_modifiers: [],
+      },
+      style: { language: 'pt-BR', rhythm: {} },
+      metadata: {
+        effective_from: '2026-05-15T00:00:00Z',
+        created_by: 'test',
+        previous_version_id: null,
+      },
+    };
+    expect(sample.schema_version).toBe('v3.1.1-2026-05-15');
+  });
+});
 
 type ProfileRow = {
   id: string;
