@@ -4,6 +4,9 @@ import {
   procedureExecutionsRepo,
   procedureDefinitionsRepo,
   procedureSelectorDecisionsRepo,
+  channelPoliciesRepo,
+  rolesRepo,
+  roleSelectorDecisionsRepo,
 } from '@/db/repositories.js';
 import { resolveScope } from '@/governance/permissions.js';
 import { checkPendingFirst } from '@/agent/pending-gate.js';
@@ -11,11 +14,15 @@ import { checkRateLimit, formatPoliteReply } from '@/gateway/rate-limit.js';
 import { resolveIdentity } from '@/identity/resolver.js';
 import { handleQuarantineFirstContact, handleOwnerIdentityReply } from '@/identity/quarantine.js';
 import { config } from '@/config/env.js';
+import { featureFlags } from '@/config/feature-flags.js';
+import { FeatureFlagName } from '@/types/enums.js';
 import { clearDebounceState } from '@/gateway/debouncer.js';
 import { buildPrompt } from './prompt-builder.js';
 import { hashScope } from './scope-hash.js';
 import { logger } from '@/lib/logger.js';
-import type { Mensagem, ProcedureExecution } from '@/db/schema.js';
+import type { Mensagem, ProcedureExecution, Role } from '@/db/schema.js';
+import { resolveChannel } from '@/gateway/channel-resolver.js';
+import { selectRole } from '@/cognition/role-selector/engine.js';
 import { audit } from '@/governance/audit.js';
 import { getToolSchemas } from '@/tools/_registry.js';
 import { startTyping } from '@/gateway/presence.js';
@@ -36,6 +43,9 @@ import { CognitiveEventType } from '@/types/enums.js';
 import { sendOutbound } from './output-dispatch.js';
 import { runReActLoop } from './react-loop.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
+import { db } from '@/db/client.js';
+import { mensagens } from '@/db/schema.js';
+import { eq } from 'drizzle-orm';
 
 const TYPING_DEBOUNCE_MS = 1500;
 
@@ -142,17 +152,106 @@ function scheduleTypingDebounce(jid: string, mensagem_id: string): () => void {
 
 export const _internal = { scheduleTypingDebounce, sendOutbound, aggregateUnprocessedTexts };
 
+/**
+ * Probe-only cross-tenant read of `mensagens.metadata` for the channel resolver.
+ *
+ * P6 Task 9: roda ANTES de `runWithTenantContext`, portanto bypassa
+ * `applyTenantGuard` deliberadamente (mesma justificativa do
+ * `channelsRepo.findByExternalCrossTenant` — entry point precisa descobrir
+ * qual tenant antes de poder operar dentro dele).
+ *
+ * Retorna apenas o suficiente para chamar `resolveChannel`. Qualquer falha
+ * (mensagem ausente, sem `metadata.telefone`, erro de DB) devolve null —
+ * o caller cai em legacy default/default.
+ *
+ * TODO(p7+): channel_type está hardcoded 'whatsapp' porque WA é o único ingress
+ * path ativo no P6. Quando entrar Telegram/Email/SMS, ler `metadata.channel_type`
+ * (gravado pelo gateway) e derivar external_id por tipo (telefone/chat_id/etc).
+ */
+async function probeMessageForChannel(
+  mensagem_id: string,
+): Promise<{ channel_type: 'whatsapp'; external_id: string } | null> {
+  try {
+    const rows = await db
+      .select({ metadata: mensagens.metadata })
+      .from(mensagens)
+      .where(eq(mensagens.id, mensagem_id))
+      .limit(1);
+    if (rows.length === 0) return null;
+    const md = (rows[0]!.metadata ?? {}) as Record<string, unknown>;
+    const tel = typeof md['telefone'] === 'string' ? (md['telefone'] as string) : null;
+    if (!tel) return null;
+    // TODO(p7+): suportar telegram/email/sms — derivar channel_type+external_id
+    // do metadata em vez de assumir whatsapp/telefone.
+    return { channel_type: 'whatsapp', external_id: tel };
+  } catch {
+    return null;
+  }
+}
+
 export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
-  // P0: 'default' is the only tenant/agent — single-tenant deployment.
-  // P6 introduces multi-channel/multi-agent and will route via channel→tenant
-  // resolution before this function is invoked.
+  // P6 Task 9: roteamento via channel resolver quando flag MULTI_CHANNEL ON.
+  // O resolver é o entry point — roda ANTES de existir tenant context (faz
+  // cross-tenant lookup propositalmente). Falhas caem em default/default
+  // (legacy) para preservar compat com P0..P5 quando o canal não está
+  // registrado em `channels`.
+  let resolvedChannel: {
+    tenant_id: string;
+    agent_id: string;
+    channel_id: string | null;
+  } = {
+    tenant_id: 'default',
+    agent_id: 'default',
+    channel_id: null,
+  };
+
+  if (featureFlags.isEnabled(FeatureFlagName.MULTI_CHANNEL)) {
+    try {
+      const probe = await probeMessageForChannel(mensagem_id);
+      if (probe) {
+        resolvedChannel = await resolveChannel(probe);
+      }
+    } catch (err) {
+      logger.warn(
+        { mensagem_id, err: (err as Error).message },
+        'agent.channel_resolution_failed_fallback_default',
+      );
+    }
+  }
+
+  // [P88-C1] Atomically adopt the mensagens row to the resolved (tenant,
+  // agent) BEFORE entering tenant context. Without this, the inner
+  // tenant-scoped `mensagensRepo.findById` returns null whenever the
+  // gateway persisted the row under a different tenant (e.g., `default`
+  // before the channel was registered), silently black-holing every
+  // non-default channel message on first FEATURE_MULTI_CHANNEL enable.
+  // Adopt is a no-op when the row is already on the resolved triplet, so
+  // safe to call unconditionally on the resolver-success path.
+  if (resolvedChannel.channel_id) {
+    try {
+      await mensagensRepo.adoptToResolvedTenantCrossTenant({
+        id: mensagem_id,
+        tenant_id: resolvedChannel.tenant_id,
+        agent_id: resolvedChannel.agent_id,
+      });
+    } catch (err) {
+      logger.warn(
+        { mensagem_id, err: (err as Error).message },
+        'agent.adopt_to_resolved_tenant_failed',
+      );
+    }
+  }
+
   await runWithTenantContext(
-    { tenant_id: 'default', agent_id: 'default' },
-    () => runAgentForMensagemInner(mensagem_id),
+    { tenant_id: resolvedChannel.tenant_id, agent_id: resolvedChannel.agent_id },
+    () => runAgentForMensagemInner(mensagem_id, resolvedChannel.channel_id),
   );
 }
 
-async function runAgentForMensagemInner(mensagem_id: string): Promise<void> {
+async function runAgentForMensagemInner(
+  mensagem_id: string,
+  channel_id: string | null = null,
+): Promise<void> {
   const inbound = await mensagensRepo.findById(mensagem_id);
   if (!inbound) {
     logger.warn({ mensagem_id }, 'agent.message_not_found');
@@ -473,6 +572,92 @@ async function runAgentForMensagemInner(mensagem_id: string): Promise<void> {
    }
   }
 
+  // P6 Task 9: Resolve active role for this turn — only when flag ON AND
+  // channel resolver returned a real channel_id. Failures degrade silently
+  // to "no role section in prompt" — role injection is non-essential.
+  let activeRole: Role | null = null;
+  // [P88-C4] Announcement text (prepended to outbound) when policy.announce_mode
+  // permits emitting a "switching role" notice on action='switch'. Null = silent.
+  let roleAnnouncement: string | null = null;
+  if (featureFlags.isEnabled(FeatureFlagName.MULTI_CHANNEL) && channel_id) {
+    try {
+      const policy = await channelPoliciesRepo.getByChannelId(channel_id);
+      if (policy) {
+        // [P88-C2] Rehydrate `current_role` from the LAST decided role for
+        // this conversation, not from policy.default_role_id. Without this,
+        // switches don't persist across turns — turn N+1 always starts from
+        // default, so three consistent same-context turns each count as a
+        // fresh switch and the by_context cap fires backwards, punishing
+        // consistency. Falls back to policy.default_role_id only when no
+        // prior decision exists for this conversation (i.e., bootstrap).
+        const lastDecidedRoleId = await roleSelectorDecisionsRepo
+          .getLastDecidedRoleId(c.id)
+          .catch(() => null);
+        const currentRoleId = lastDecidedRoleId ?? policy.default_role_id;
+        const [activeRoles, currentRole] = await Promise.all([
+          rolesRepo.listActive(),
+          rolesRepo.getById(currentRoleId),
+        ]);
+        // [P88-H1] Enforce policy.allowed_role_ids — the available set
+        // passed to the selector is the policy's allowlist (plus the
+        // default role, which is always allowed). Without this filter
+        // every active tenant role was selectable regardless of policy.
+        const allowedIds = Array.isArray(policy.allowed_role_ids)
+          ? (policy.allowed_role_ids as string[])
+          : [];
+        const availableRoles =
+          allowedIds.length > 0
+            ? activeRoles.filter(
+                (r) =>
+                  allowedIds.includes(r.id) || r.id === policy.default_role_id,
+              )
+            : activeRoles;
+        if (currentRole && availableRoles.length > 0) {
+          const result = await selectRole({
+            inbound_text: inbound.conteudo ?? '',
+            current_role: currentRole,
+            available_roles: availableRoles,
+            policy,
+            conversa_id: c.id,
+            channel_id,
+            turno_id: inbound.id,
+          });
+          activeRole = result.decided_role;
+          // [P88-C4] Announce gating. The policy's `announce_mode` plus the
+          // boolean "did this switch actually change the user-perceived
+          // behaviour" decide whether to prepend a notice to the outbound:
+          //   - 'always':       announce on every action='switch'.
+          //   - 'never':        never announce.
+          //   - 'affects_user': announce iff the new role has a different
+          //                     display_name AND a non-empty prompt_addendum
+          //                     (heuristic for "the user will see a shift").
+          // We only consider action='switch' — keep_current/handoff/fallback
+          // do not warrant an announcement.
+          if (
+            result.action === 'switch' &&
+            result.decided_role.id !== currentRole.id
+          ) {
+            const announceMode = policy.announce_mode;
+            const affectsUser =
+              result.decided_role.display_name !== currentRole.display_name &&
+              !!(result.decided_role.prompt_addendum ?? '').trim();
+            const shouldAnnounce =
+              announceMode === 'always' ||
+              (announceMode === 'affects_user' && affectsUser);
+            if (shouldAnnounce) {
+              roleAnnouncement = `_(Mudando para o modo ${result.decided_role.display_name}.)_`;
+            }
+          }
+        }
+      }
+    } catch (err) {
+      logger.warn(
+        { channel_id, err: (err as Error).message },
+        'agent.role_selection_failed_continuing_without_role',
+      );
+    }
+  }
+
   const { system, messages } = await buildPrompt({
     pessoa,
     conversa: c,
@@ -483,6 +668,7 @@ async function runAgentForMensagemInner(mensagem_id: string): Promise<void> {
     // the runtime flag is off so the section is suppressed without a
     // fallback lookup.
     activeExecution: config.FEATURE_PROCEDURE_RUNTIME ? activeExecution : null,
+    activeRole,
   });
 
   const tools = getToolSchemas(scope.byEntity);
@@ -508,6 +694,9 @@ async function runAgentForMensagemInner(mensagem_id: string): Promise<void> {
       system,
       messages,
       tools,
+      // [P88-C4] Pass the precomputed role-switch announcement (if any) so
+      // react-loop can prepend it to the final assistant text before dispatch.
+      outboundPrefix: roleAnnouncement,
     });
     totalTokens = result.totalTokens;
     reactOutboundText = result.outboundText;

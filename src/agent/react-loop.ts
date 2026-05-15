@@ -26,6 +26,13 @@ export type RunReActLoopParams = {
   system: string;
   messages: LLMMessage[];
   tools: ToolSchema[];
+  /**
+   * [P88-C4] Optional announcement (e.g., "switching to suporte mode")
+   * prepended to the final outbound text. null when policy.announce_mode
+   * says no announcement should be emitted this turn. The model never sees
+   * this text — it's a system-emitted prefix attached at dispatch time.
+   */
+  outboundPrefix?: string | null;
 };
 
 export type ReActLoopResult = {
@@ -73,7 +80,15 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
     totalTokens += res.usage.input_tokens + res.usage.output_tokens;
 
     if (res.tool_uses.length === 0) {
-      const text = res.content?.trim() ?? '';
+      const rawText = res.content?.trim() ?? '';
+      // [P88-C4] Prepend the role-switch announcement (if any) to the
+      // final outbound. Only attaches when the model actually produced
+      // text — an empty turn stays empty (no orphan announcement bubble).
+      const prefix = params.outboundPrefix;
+      const text =
+        rawText && typeof prefix === 'string' && prefix.length > 0
+          ? `${prefix}\n\n${rawText}`
+          : rawText;
       outboundText = text;
       if (text) {
         await dispatchOutput({
@@ -92,9 +107,11 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
         // text for self-recognized gaps ("não sei", "preciso verificar",
         // "sem acesso a..."). Fire-and-forget — reflection MUST never
         // block the user-facing reply or the ReAct return.
-        const gap = detectGap(text);
+        // [P88-C4] Use rawText (without role announcement prefix) so the
+        // announcement string can't trigger spurious gap detection.
+        const gap = detectGap(rawText);
         if (gap.detected) {
-          const responseText = text;
+          const responseText = rawText;
           const signal = gap.signal ?? '';
           void (async () => {
             try {

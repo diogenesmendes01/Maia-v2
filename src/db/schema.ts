@@ -1209,6 +1209,113 @@ export const capability_test_results = pgTable(
   }),
 );
 
+// P6: channels — instâncias de entrada de mensagem (1+ por agent). channel_type
+// + external_id é a chave estável (UNIQUE por tenant); um mesmo agent pode ter
+// múltiplos canais (várias instâncias WhatsApp, telegram, etc).
+export const channels = pgTable(
+  'channels',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    external_id: text('external_id').notNull(),
+    channel_type: text('channel_type').notNull(),
+    display_name: text('display_name'),
+    active: boolean('active').notNull().default(true),
+    metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    tenantAgentIdx: index('channels_tenant_agent_idx').on(t.tenant_id, t.agent_id),
+    externalIdx: index('channels_external_idx').on(t.channel_type, t.external_id),
+    externalUq: uniqueIndex('channels_tenant_type_external_uq').on(t.tenant_id, t.channel_type, t.external_id),
+  }),
+);
+
+// P6: roles — modos operacionais por agent (comercial, suporte, default, etc).
+// Exatamente 1 default por (tenant, agent), garantido por partial unique index.
+// prompt_addendum entra no prompt quando o role estiver ativo.
+export const roles = pgTable(
+  'roles',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    role_key: text('role_key').notNull(),
+    display_name: text('display_name').notNull(),
+    description: text('description'),
+    prompt_addendum: text('prompt_addendum'),
+    active: boolean('active').notNull().default(true),
+    is_default: boolean('is_default').notNull().default(false),
+    metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    tenantAgentActiveIdx: index('roles_tenant_agent_active_idx').on(t.tenant_id, t.agent_id, t.active),
+    keyUq: uniqueIndex('roles_tenant_agent_key_uq').on(t.tenant_id, t.agent_id, t.role_key),
+  }),
+);
+
+// P6: channel_policies — define o default role do channel + governance (switch_behavior)
+// + travas anti-oscilação para by_context (min_confidence, cooldown_turns, strength_delta,
+// max_switches). UNIQUE (channel_id) garante 1 policy por canal.
+export const channel_policies = pgTable(
+  'channel_policies',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    channel_id: uuid('channel_id').notNull(),
+    default_role_id: uuid('default_role_id').notNull(),
+    switch_behavior: text('switch_behavior').notNull(),
+    announce_mode: text('announce_mode').notNull().default('affects_user'),
+    by_context_guards: jsonb('by_context_guards').notNull().default(sql`'{"min_confidence_to_switch":0.7,"cooldown_turns":3,"required_strength_delta":0.2,"max_switches_per_conversation":3}'::jsonb`),
+    allowed_role_ids: jsonb('allowed_role_ids').notNull().default(sql`'[]'::jsonb`),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    tenantAgentIdx: index('channel_policies_tenant_agent_idx').on(t.tenant_id, t.agent_id),
+    channelUq: uniqueIndex('channel_policies_channel_uq').on(t.channel_id),
+  }),
+);
+
+// P6: role_selector_decisions — log append-only de TODA decisão do role selector
+// (mesmo "keep_current"). suggested_by registra a sugestão (LLM ou determinístico);
+// decided_by registra QUEM decidiu — NUNCA llm_classifier (CHECK constraint no DB).
+// LLM sugere, policy decide. Defesa do criterio #2 da spec.
+export const role_selector_decisions = pgTable(
+  'role_selector_decisions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    conversa_id: uuid('conversa_id'),
+    turno_id: uuid('turno_id'),
+    channel_id: uuid('channel_id'),
+    policy_id: uuid('policy_id'),
+    current_role_id: uuid('current_role_id'),
+    suggested_role_id: uuid('suggested_role_id'),
+    decided_role_id: uuid('decided_role_id').notNull(),
+    action: text('action').notNull(),
+    candidates: jsonb('candidates').notNull().default(sql`'[]'::jsonb`),
+    conflicts: jsonb('conflicts').notNull().default(sql`'[]'::jsonb`),
+    suggested_by: text('suggested_by').notNull(),
+    decided_by: text('decided_by').notNull(),
+    suggested_strength: text('suggested_strength'),
+    suggested_confidence: numeric('suggested_confidence', { precision: 4, scale: 3 }),
+    reason: text('reason'),
+    switch_count_in_conversation: integer('switch_count_in_conversation').notNull().default(0),
+    decided_at: timestamp('decided_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    conversaIdx: index('role_selector_conversa_idx').on(t.conversa_id, t.decided_at),
+    tenantAgentIdx: index('role_selector_tenant_agent_idx').on(t.tenant_id, t.agent_id, t.decided_at),
+  }),
+);
+
 export type Entidade = typeof entidades.$inferSelect;
 export type Pessoa = typeof pessoas.$inferSelect;
 export type Permissao = typeof permissoes.$inferSelect;
@@ -1295,3 +1402,11 @@ export type CapabilityProposal = typeof capability_proposals.$inferSelect;
 export type NewCapabilityProposal = typeof capability_proposals.$inferInsert;
 export type CapabilityTestResult = typeof capability_test_results.$inferSelect;
 export type NewCapabilityTestResult = typeof capability_test_results.$inferInsert;
+export type Channel = typeof channels.$inferSelect;
+export type NewChannel = typeof channels.$inferInsert;
+export type Role = typeof roles.$inferSelect;
+export type NewRole = typeof roles.$inferInsert;
+export type ChannelPolicy = typeof channel_policies.$inferSelect;
+export type NewChannelPolicy = typeof channel_policies.$inferInsert;
+export type RoleSelectorDecisionRow = typeof role_selector_decisions.$inferSelect;
+export type NewRoleSelectorDecisionRow = typeof role_selector_decisions.$inferInsert;
