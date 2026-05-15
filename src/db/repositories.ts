@@ -40,11 +40,14 @@ import {
   procedure_metrics,
   agent_operational_profile_versions,
   agent_drift_alerts,
+  gap_escalation_rules,
+  capability_proposals,
+  capability_test_results,
 } from './schema.js';
 import { TypedError } from '@/lib/utils.js';
 import { applyTenantGuard } from './tenant-guard.js';
 import { getCurrentTenant, getCurrentAgent } from './tenant-context.js';
-import type { ProfileStatus, DriftType, DriftSeverity, DriftDecision } from '@/types/enums.js';
+import type { ProfileStatus, DriftType, DriftSeverity, DriftDecision, GapLevel, ProposalStatus } from '@/types/enums.js';
 import type {
   Pessoa,
   Permissao,
@@ -83,6 +86,10 @@ import type {
   AgentOperationalProfileVersion,
   ProfileBody,
   AgentDriftAlert,
+  GapEscalationRule,
+  NewGapEscalationRule,
+  CapabilityProposal,
+  CapabilityTestResult,
 } from './schema.js';
 
 export type EntityScope = {
@@ -1775,6 +1782,121 @@ export const capabilityGapsRepo = {
       .set({ current_level: new_level, last_level_change_at: new Date() })
       .where(eq(agent_capability_gaps.id, id));
   },
+
+  // P5: extensions ------------------------------------------------------------
+  // listByLevels: plural variant for the escalation engine that needs to load
+  // every gap in a set of current levels (e.g. ['silent', 'dashboard']) in one
+  // query before running level-transition rules.
+  async listByLevels(levels: GapLevel[]): Promise<AgentCapabilityGap[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    if (levels.length === 0) return [];
+    return db
+      .select()
+      .from(agent_capability_gaps)
+      .where(
+        and(
+          eq(agent_capability_gaps.tenant_id, tenant_id),
+          eq(agent_capability_gaps.agent_id, agent_id),
+          inArray(agent_capability_gaps.current_level, levels),
+        ),
+      );
+  },
+
+  // P5: updateLevel — typed args variant of escalateLevel, scoped by the
+  // current tenant/agent context (defense in depth: even with a leaked id
+  // from another tenant, the WHERE clause filters it out). Sets
+  // last_level_change_at = now() which the cooldown logic depends on.
+  async updateLevel(args: { id: string; new_level: GapLevel }): Promise<void> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    await db
+      .update(agent_capability_gaps)
+      .set({ current_level: args.new_level, last_level_change_at: new Date() })
+      .where(
+        and(
+          eq(agent_capability_gaps.id, args.id),
+          eq(agent_capability_gaps.tenant_id, tenant_id),
+          eq(agent_capability_gaps.agent_id, agent_id),
+        ),
+      );
+  },
+
+  // PR #87 follow-up — transactional variant of updateLevel. Same semantics
+  // but executed against the caller-supplied `tx` handle so it can participate
+  // in a withTx block. Used by gap-escalation-monitor to commit the
+  // `mentionable → proposed` flip atomically with the capability_proposals
+  // INSERT (createTx). If either write fails the transaction rolls back,
+  // eliminating the partial-success window (proposal persisted but gap
+  // still mentionable) that previously caused the worker to enqueue a
+  // duplicate Sonnet call on the next tick.
+  async updateLevelTx(
+    tx: typeof db,
+    args: { id: string; new_level: GapLevel },
+  ): Promise<void> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    await tx
+      .update(agent_capability_gaps)
+      .set({ current_level: args.new_level, last_level_change_at: new Date() })
+      .where(
+        and(
+          eq(agent_capability_gaps.id, args.id),
+          eq(agent_capability_gaps.tenant_id, tenant_id),
+          eq(agent_capability_gaps.agent_id, agent_id),
+        ),
+      );
+  },
+
+  // P5: daysSinceLastProposed — tenant/agent-wide MAX(last_level_change_at)
+  // where current_level='proposed'. Used by the escalation engine to enforce
+  // cooldown_days_proposed_to_proposed: do not raise another gap to 'proposed'
+  // if the last one happened recently. Returns null if no gap was ever
+  // promoted to 'proposed' for this (tenant, agent).
+  //
+  // Invariant (PR #87 Minor #2): este cálculo é correto SOMENTE enquanto
+  // `proposed` for terminal no engine de escalação (Task 6 engine.ts não
+  // gera transição saindo de proposed). Se um futuro fluxo demover gaps de
+  // `proposed`, last_level_change_at vira ambíguo (poderia ser uma demoção,
+  // não uma promoção real) e o cooldown poderia ser zerado indevidamente.
+  // Nesse caso, migrar a fonte para `MAX(c.submitted_at FROM capability_proposals c)`
+  // ou adicionar coluna dedicada `last_proposed_at` no gap.
+  async daysSinceLastProposed(): Promise<number | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const result = await db.execute<{ days: number | null }>(sql`
+      SELECT EXTRACT(DAY FROM (now() - MAX(last_level_change_at)))::int AS days
+        FROM agent_capability_gaps
+       WHERE tenant_id = ${tenant_id}
+         AND agent_id = ${agent_id}
+         AND current_level = 'proposed'
+    `);
+    const first = result.rows[0];
+    if (!first) return null;
+    return first.days ?? null;
+  },
+
+  // P5: create — straight insert via applyTenantGuard (no de-dup by
+  // description like upsert does). Used by call-sites that already know
+  // the gap is new — typically the dialogical-acquisition engine creating
+  // technical_gap rows derived from a failed capability_test_result, where
+  // grouping by description would be incorrect.
+  async create(input: {
+    capability_description: string;
+    tipo: string;
+    contexto?: string;
+  }): Promise<AgentCapabilityGap> {
+    const guarded = applyTenantGuard({
+      capability_description: input.capability_description,
+      tipo: input.tipo,
+      contexto: input.contexto ?? null,
+    });
+    const [row] = await db
+      .insert(agent_capability_gaps)
+      .values(guarded as typeof agent_capability_gaps.$inferInsert)
+      .returning();
+    return row!;
+  },
 };
 
 /**
@@ -2712,5 +2834,370 @@ export const driftAlertsRepo = {
       )
       .returning({ id: agent_drift_alerts.id });
     return { ok: updated.length > 0, found: updated.length > 0 };
+  },
+};
+
+// P5: gap_escalation_rules — thresholds determinísticos por (tenant_id, agent_id)
+// para a escalation chain (silent → dashboard → mentionable → proposed).
+// Defaults vivem no schema; este repo expõe getForCurrentAgent (null se nenhuma
+// regra customizada) e upsert (ON CONFLICT via UNIQUE(tenant_id, agent_id)).
+export const gapEscalationRulesRepo = {
+  async getForCurrentAgent(): Promise<GapEscalationRule | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(gap_escalation_rules)
+      .where(
+        and(
+          eq(gap_escalation_rules.tenant_id, tenant_id),
+          eq(gap_escalation_rules.agent_id, agent_id),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  async upsert(input: Partial<NewGapEscalationRule>): Promise<GapEscalationRule> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    // Strip any tenant/agent the caller might have supplied — applyTenantGuard
+    // semantics: context wins, mismatch throws.
+    const { tenant_id: inTenant, agent_id: inAgent, ...rest } = input;
+    if (inTenant && inTenant !== tenant_id) {
+      throw new Error(`tenant mismatch: input ${inTenant} vs context ${tenant_id}`);
+    }
+    if (inAgent && inAgent !== agent_id) {
+      throw new Error(`agent mismatch: input ${inAgent} vs context ${agent_id}`);
+    }
+    const now = new Date();
+    const [row] = await db
+      .insert(gap_escalation_rules)
+      .values({
+        ...rest,
+        tenant_id,
+        agent_id,
+        updated_at: now,
+      } as typeof gap_escalation_rules.$inferInsert)
+      .onConflictDoUpdate({
+        target: [gap_escalation_rules.tenant_id, gap_escalation_rules.agent_id],
+        set: {
+          ...rest,
+          updated_at: now,
+        },
+      })
+      .returning();
+    return row!;
+  },
+};
+
+// P5: capability_proposals — propostas formais de capability (spec gerada por
+// LLM no nível 'proposed'). Fluxo de status:
+//   draft → submitted → approved | rejected
+//   approved → delivered
+//   rejected | delivered = terminal
+// transition() é typed-result (sem throw): { ok:true, updated } | { ok:false,
+// reason: 'not_found' | 'invalid_transition' }. Cada transição seta um
+// timestamp (submitted_at | decided_at | delivered_at) + campos opcionais
+// (decided_by, decision_reason, delivery_artifact_ref).
+export const capabilityProposalsRepo = {
+  async create(input: {
+    gap_id?: string;
+    capability_type: 'tool' | 'knowledge' | 'procedure' | 'integration' | 'other';
+    title: string;
+    description: string;
+    proposed_spec: unknown;
+    motivation: string;
+    expected_impact?: string;
+    test_scenarios: unknown[];
+  }): Promise<CapabilityProposal> {
+    const guarded = applyTenantGuard({
+      gap_id: input.gap_id ?? null,
+      capability_type: input.capability_type,
+      title: input.title,
+      description: input.description,
+      proposed_spec: input.proposed_spec as object,
+      motivation: input.motivation,
+      expected_impact: input.expected_impact ?? null,
+      test_scenarios: input.test_scenarios as unknown as object,
+    });
+    const [row] = await db
+      .insert(capability_proposals)
+      .values(guarded as typeof capability_proposals.$inferInsert)
+      .returning();
+    return row!;
+  },
+
+  // PR #87 follow-up — transactional variant of create. Writes via the
+  // caller-supplied `tx` handle so the INSERT participates in an outer
+  // withTx block. Pairs with capabilityGapsRepo.updateLevelTx so the
+  // gap-escalation worker can commit the proposal artifact and the gap
+  // level flip in a single transaction; transient failure during the
+  // gap UPDATE rolls back the proposal INSERT so the next worker tick
+  // does NOT produce a duplicate proposal row.
+  async createTx(
+    tx: typeof db,
+    input: {
+      gap_id?: string;
+      capability_type: 'tool' | 'knowledge' | 'procedure' | 'integration' | 'other';
+      title: string;
+      description: string;
+      proposed_spec: unknown;
+      motivation: string;
+      expected_impact?: string;
+      test_scenarios: unknown[];
+    },
+  ): Promise<CapabilityProposal> {
+    const guarded = applyTenantGuard({
+      gap_id: input.gap_id ?? null,
+      capability_type: input.capability_type,
+      title: input.title,
+      description: input.description,
+      proposed_spec: input.proposed_spec as object,
+      motivation: input.motivation,
+      expected_impact: input.expected_impact ?? null,
+      test_scenarios: input.test_scenarios as unknown as object,
+    });
+    const [row] = await tx
+      .insert(capability_proposals)
+      .values(guarded as typeof capability_proposals.$inferInsert)
+      .returning();
+    return row!;
+  },
+
+  async getById(id: string): Promise<CapabilityProposal | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(capability_proposals)
+      .where(
+        and(
+          eq(capability_proposals.tenant_id, tenant_id),
+          eq(capability_proposals.agent_id, agent_id),
+          eq(capability_proposals.id, id),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  async listByStatus(status: ProposalStatus): Promise<CapabilityProposal[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(capability_proposals)
+      .where(
+        and(
+          eq(capability_proposals.tenant_id, tenant_id),
+          eq(capability_proposals.agent_id, agent_id),
+          eq(capability_proposals.status, status),
+        ),
+      )
+      .orderBy(desc(capability_proposals.created_at));
+  },
+
+  async listByGap(gap_id: string): Promise<CapabilityProposal[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(capability_proposals)
+      .where(
+        and(
+          eq(capability_proposals.tenant_id, tenant_id),
+          eq(capability_proposals.agent_id, agent_id),
+          eq(capability_proposals.gap_id, gap_id),
+        ),
+      )
+      .orderBy(desc(capability_proposals.created_at));
+  },
+
+  // Validated state-machine transition. Retorna typed result, sem throw.
+  // - not_found:           id desconhecido (ou fora do tenant/agent atual)
+  // - invalid_transition:  destino não permitido a partir do source, mesmo
+  //                        status (re-entrada), ou origem terminal
+  //                        (rejected/reverted).
+  //
+  // P87-C3 (PR #87 review): activation gate. A transição approved → delivered
+  // foi removida — agora exige caminho approved → testing → delivered (sucesso)
+  // ou approved → testing → reverted (falha). A wiring é feita por
+  // activateApprovedCapability (capability-test-runner.ts), que é o ÚNICO
+  // caller production-grade do trio approved → testing → {delivered|reverted}.
+  // Chamadas diretas a transition({to:'delivered'}) continuam permitidas a
+  // partir de 'testing', NUNCA a partir de 'approved'.
+  //
+  // Side effects (timestamps + opcionais):
+  //   to:'submitted' → submitted_at
+  //   to:'approved'  → decided_at + decided_by? + decision_reason?
+  //   to:'rejected'  → decided_at + decided_by? + decision_reason?
+  //   to:'testing'   → (sem timestamp dedicado; updated_at marca)
+  //   to:'delivered' → delivered_at + delivery_artifact_ref?
+  //                    + last_test_outcome? + last_test_at?
+  //   to:'reverted'  → reverted_at + revert_reason?
+  //                    + last_test_outcome? + last_test_at?
+  async transition(args: {
+    id: string;
+    to: ProposalStatus;
+    decided_by?: string;
+    decision_reason?: string;
+    delivery_artifact_ref?: string;
+    revert_reason?: string;
+    last_test_outcome?: 'pass' | 'fail' | 'error';
+  }): Promise<
+    | { ok: true; updated: CapabilityProposal }
+    | { ok: false; reason: 'not_found' | 'invalid_transition' }
+  > {
+    const row = await capabilityProposalsRepo.getById(args.id);
+    if (!row) return { ok: false, reason: 'not_found' };
+
+    const from = row.status as ProposalStatus;
+    // Terminal sources — no further transitions.
+    if (from === 'rejected' || from === 'reverted') {
+      return { ok: false, reason: 'invalid_transition' };
+    }
+    if (from === args.to) {
+      return { ok: false, reason: 'invalid_transition' };
+    }
+
+    const allowed: Record<string, readonly string[]> = {
+      draft: ['submitted'],
+      submitted: ['approved', 'rejected'],
+      approved: ['testing'],
+      testing: ['delivered', 'reverted'],
+      // P87-C3 — delivered → reverted permitido (Superpowers Important #2):
+      // tools can fail after activation; revert tooling pode marcar a row.
+      delivered: ['reverted'],
+    };
+    if (!allowed[from]?.includes(args.to)) {
+      return { ok: false, reason: 'invalid_transition' };
+    }
+
+    const now = new Date();
+    const patch: Record<string, unknown> = { status: args.to, updated_at: now };
+    if (args.to === 'submitted') {
+      patch.submitted_at = now;
+    } else if (args.to === 'approved' || args.to === 'rejected') {
+      patch.decided_at = now;
+      if (args.decided_by) patch.decided_by = args.decided_by;
+      if (args.decision_reason) patch.decision_reason = args.decision_reason;
+    } else if (args.to === 'delivered') {
+      patch.delivered_at = now;
+      if (args.delivery_artifact_ref)
+        patch.delivery_artifact_ref = args.delivery_artifact_ref;
+      if (args.last_test_outcome) {
+        patch.last_test_outcome = args.last_test_outcome;
+        patch.last_test_at = now;
+      }
+    } else if (args.to === 'reverted') {
+      patch.reverted_at = now;
+      if (args.revert_reason) patch.revert_reason = args.revert_reason;
+      if (args.last_test_outcome) {
+        patch.last_test_outcome = args.last_test_outcome;
+        patch.last_test_at = now;
+      }
+    }
+
+    const [updated] = await db
+      .update(capability_proposals)
+      .set(patch as Partial<typeof capability_proposals.$inferInsert>)
+      .where(eq(capability_proposals.id, args.id))
+      .returning();
+    return { ok: true, updated: updated! };
+  },
+};
+
+// P5: capability_test_results — auditoria do loop fechado pós-ativação. Cada
+// run dos test_scenarios da proposal gera uma linha; outcome=fail/error pode
+// disparar triggered_revert=true e criar um technical_gap_id (gap derivado
+// para investigação). Reads ordenam por ran_at DESC (mais recente primeiro).
+export const capabilityTestResultsRepo = {
+  async record(input: {
+    proposal_id: string;
+    gap_id?: string;
+    outcome: 'pass' | 'fail' | 'error';
+    scenarios_run: unknown[];
+    scenarios_passed: number;
+    scenarios_failed: number;
+    details?: unknown;
+    triggered_revert?: boolean;
+    technical_gap_id?: string;
+  }): Promise<CapabilityTestResult> {
+    // PR #87 Minor #3: defensive parity. applyTenantGuard injeta tenant/agent
+    // do contexto atual, mas NÃO valida que technical_gap_id (passado pelo
+    // caller) pertence ao mesmo tenant. Hoje a chain (capability-test-runner
+    // → revertCapability → capabilityGapsRepo.create) sempre cria o gap
+    // dentro do mesmo tenant context, então o id retornado é seguro — mas
+    // callers futuros poderiam quebrar essa premissa. Faz cross-check
+    // explícito para fechar a porta agora.
+    if (input.technical_gap_id) {
+      const tenant_id = getCurrentTenant();
+      const agent_id = getCurrentAgent();
+      const rows = await db
+        .select({ id: agent_capability_gaps.id })
+        .from(agent_capability_gaps)
+        .where(
+          and(
+            eq(agent_capability_gaps.id, input.technical_gap_id),
+            eq(agent_capability_gaps.tenant_id, tenant_id),
+            eq(agent_capability_gaps.agent_id, agent_id),
+          ),
+        )
+        .limit(1);
+      if (rows.length === 0) {
+        throw new Error('capability_test_results.technical_gap_id_cross_tenant');
+      }
+    }
+    const guarded = applyTenantGuard({
+      proposal_id: input.proposal_id,
+      gap_id: input.gap_id ?? null,
+      outcome: input.outcome,
+      scenarios_run: input.scenarios_run as unknown as object,
+      scenarios_passed: input.scenarios_passed,
+      scenarios_failed: input.scenarios_failed,
+      details: (input.details ?? {}) as object,
+      triggered_revert: input.triggered_revert ?? false,
+      technical_gap_id: input.technical_gap_id ?? null,
+    });
+    const [row] = await db
+      .insert(capability_test_results)
+      .values(guarded as typeof capability_test_results.$inferInsert)
+      .returning();
+    return row!;
+  },
+
+  async listByProposal(proposal_id: string): Promise<CapabilityTestResult[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(capability_test_results)
+      .where(
+        and(
+          eq(capability_test_results.tenant_id, tenant_id),
+          eq(capability_test_results.agent_id, agent_id),
+          eq(capability_test_results.proposal_id, proposal_id),
+        ),
+      )
+      .orderBy(desc(capability_test_results.ran_at));
+  },
+
+  async latestByProposal(proposal_id: string): Promise<CapabilityTestResult | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(capability_test_results)
+      .where(
+        and(
+          eq(capability_test_results.tenant_id, tenant_id),
+          eq(capability_test_results.agent_id, agent_id),
+          eq(capability_test_results.proposal_id, proposal_id),
+        ),
+      )
+      .orderBy(desc(capability_test_results.ran_at))
+      .limit(1);
+    return rows[0] ?? null;
   },
 };

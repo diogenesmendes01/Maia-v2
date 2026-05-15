@@ -1120,6 +1120,95 @@ export const agent_drift_alerts = pgTable(
   }),
 );
 
+// P5: gap_escalation_rules — thresholds determinísticos por (tenant_id, agent_id)
+// para a escalation chain (silent -> dashboard -> mentionable -> proposed). Defaults
+// embutidos no schema; UNIQUE (tenant_id, agent_id) garante uma única regra ativa
+// por agente. Quando ausente, o engine usa os defaults da coluna.
+export const gap_escalation_rules = pgTable(
+  'gap_escalation_rules',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    dashboard_freq_threshold: integer('dashboard_freq_threshold').notNull().default(3),
+    mentionable_severity_threshold: integer('mentionable_severity_threshold').notNull().default(5),
+    proposed_combined_threshold: integer('proposed_combined_threshold').notNull().default(8),
+    proposed_min_distinct_contexts: integer('proposed_min_distinct_contexts').notNull().default(2),
+    cooldown_days_proposed_to_proposed: integer('cooldown_days_proposed_to_proposed').notNull().default(14),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    tenantAgentUq: uniqueIndex('gap_escalation_rules_tenant_agent_uq').on(t.tenant_id, t.agent_id),
+  }),
+);
+
+// P5: capability_proposals — propostas formais (spec gerada por LLM no nível 'proposed').
+// Fluxo de status: draft -> submitted -> approved/rejected -> delivered. Sem aprovação
+// explícita, o agente não ganha a capability; loop fechado via capability_test_results.
+export const capability_proposals = pgTable(
+  'capability_proposals',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    gap_id: uuid('gap_id'),
+    capability_type: text('capability_type').notNull(),
+    title: text('title').notNull(),
+    description: text('description').notNull(),
+    proposed_spec: jsonb('proposed_spec').notNull().default(sql`'{}'::jsonb`),
+    motivation: text('motivation').notNull(),
+    expected_impact: text('expected_impact'),
+    test_scenarios: jsonb('test_scenarios').notNull().default(sql`'[]'::jsonb`),
+    status: text('status').notNull().default('draft'),
+    submitted_at: timestamp('submitted_at', { withTimezone: true }),
+    decided_at: timestamp('decided_at', { withTimezone: true }),
+    decided_by: text('decided_by'),
+    decision_reason: text('decision_reason'),
+    delivered_at: timestamp('delivered_at', { withTimezone: true }),
+    delivery_artifact_ref: text('delivery_artifact_ref'),
+    // P87-C3 — closed-loop test gate. Estes são populados pelo orchestrator
+    // `activateApprovedCapability` (capability-test-runner.ts), nunca pelo
+    // state-machine puro.
+    last_test_outcome: text('last_test_outcome'), // 'pass' | 'fail' | 'error' | null
+    last_test_at: timestamp('last_test_at', { withTimezone: true }),
+    reverted_at: timestamp('reverted_at', { withTimezone: true }),
+    revert_reason: text('revert_reason'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    statusIdx: index('cap_proposals_tenant_agent_status_idx').on(t.tenant_id, t.agent_id, t.status, t.created_at),
+    gapIdx: index('cap_proposals_gap_idx').on(t.gap_id),
+  }),
+);
+
+// P5: capability_test_results — auditoria do loop fechado pós-ativação. Cada execução
+// dos test_scenarios da proposal gera uma linha; outcome=fail/error pode disparar
+// triggered_revert=true e criar um technical_gap_id (gap derivado para investigação).
+export const capability_test_results = pgTable(
+  'capability_test_results',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    proposal_id: uuid('proposal_id').notNull(),
+    gap_id: uuid('gap_id'),
+    outcome: text('outcome').notNull(),
+    scenarios_run: jsonb('scenarios_run').notNull().default(sql`'[]'::jsonb`),
+    scenarios_passed: integer('scenarios_passed').notNull().default(0),
+    scenarios_failed: integer('scenarios_failed').notNull().default(0),
+    details: jsonb('details').notNull().default(sql`'{}'::jsonb`),
+    triggered_revert: boolean('triggered_revert').notNull().default(false),
+    technical_gap_id: uuid('technical_gap_id'),
+    ran_at: timestamp('ran_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    proposalIdx: index('cap_test_results_proposal_idx').on(t.proposal_id, t.ran_at),
+    outcomeIdx: index('cap_test_results_outcome_idx').on(t.tenant_id, t.agent_id, t.outcome, t.ran_at),
+  }),
+);
+
 export type Entidade = typeof entidades.$inferSelect;
 export type Pessoa = typeof pessoas.$inferSelect;
 export type Permissao = typeof permissoes.$inferSelect;
@@ -1200,3 +1289,9 @@ export interface ProfileBody {
 }
 export type AgentDriftAlert = typeof agent_drift_alerts.$inferSelect;
 export type NewAgentDriftAlert = typeof agent_drift_alerts.$inferInsert;
+export type GapEscalationRule = typeof gap_escalation_rules.$inferSelect;
+export type NewGapEscalationRule = typeof gap_escalation_rules.$inferInsert;
+export type CapabilityProposal = typeof capability_proposals.$inferSelect;
+export type NewCapabilityProposal = typeof capability_proposals.$inferInsert;
+export type CapabilityTestResult = typeof capability_test_results.$inferSelect;
+export type NewCapabilityTestResult = typeof capability_test_results.$inferInsert;

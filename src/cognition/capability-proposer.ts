@@ -1,0 +1,240 @@
+/**
+ * P5 Task 7 — capability-proposer (Sonnet-based, ÚNICO módulo LLM do P5).
+ *
+ * Disparado pelo worker (Task 9) APENAS depois que o engine determinístico
+ * (Task 6) eleva um gap ao nível PROPOSED. Gera spec técnica formal e persiste
+ * em `capability_proposals` (status='draft'). A Maia propõe; o owner decide.
+ *
+ * Gates obrigatórios:
+ *  1. featureFlags.isEnabled(DIALOGICAL_ACQUISITION) — sem flag, sem spend.
+ *     Retorno: { ok:false, reason:'llm_unavailable', message:'flag_off' }.
+ *  2. runCognitiveModule wrapper — timeout 15s, fallback=null, audit log
+ *     em cognitive_module_log via triggered_by='async_event'.
+ *
+ * Mapping de erros para reason:
+ *   - Anthropic throw / timeout → output=null  → 'parse_failed'
+ *   - LLM responde sem JSON ou sem campos obrigatórios → null → 'parse_failed'
+ *   - Repo throw                                       → 'repo_failed' + message
+ *
+ * IMPORTANTE: o proposer NÃO julga prioridade; só gera spec. Aprovação e
+ * delivery vivem no fluxo de capability_proposals (state machine no repo).
+ *
+ * PR #87 follow-up — duas entradas públicas:
+ *  - `proposeCapabilityForGap`: full path (flag + LLM + persistência via repo
+ *    direto). Mantida para compatibilidade com chamadas que não precisam de
+ *    atomicidade com outras operações.
+ *  - `generateCapabilityProposalDraft`: APENAS flag + LLM, sem DB write.
+ *    Usado pelo gap-escalation-monitor para fazer a chamada LLM ANTES de
+ *    abrir a transação, então a transação atomiza apenas as duas escritas
+ *    rápidas (INSERT capability_proposals + UPDATE agent_capability_gaps),
+ *    eliminando o estado de sucesso parcial (proposal persistida mas nível
+ *    do gap ainda mentionable) que causava propostas duplicadas no próximo
+ *    tick do worker em caso de falha transitória do updateLevel.
+ */
+import Anthropic from '@anthropic-ai/sdk';
+import { runCognitiveModule } from './runner.js';
+import { capabilityProposalsRepo } from '@/db/repositories.js';
+import { featureFlags } from '@/config/feature-flags.js';
+import { FeatureFlagName } from '@/types/enums.js';
+import type { AgentCapabilityGap } from '@/db/schema.js';
+import { sanitizeBlock } from '@/agent/sanitize.js';
+
+export type ProposalDraft = {
+  capability_type: 'tool' | 'knowledge' | 'procedure' | 'integration' | 'other';
+  title: string;
+  description: string;
+  proposed_spec: Record<string, unknown>;
+  motivation: string;
+  expected_impact: string;
+  test_scenarios: Array<{ name: string; given: string; when: string; then: string }>;
+};
+
+export type ProposeResult =
+  | { ok: true; proposal_id: string; draft: ProposalDraft }
+  | { ok: false; reason: 'llm_unavailable' | 'parse_failed' | 'repo_failed'; message?: string };
+
+// PR #87 follow-up — discriminated union para o caminho draft-only (sem DB).
+// `repo_failed` não aparece porque nenhum repo é tocado nesta fase.
+export type DraftResult =
+  | { ok: true; draft: ProposalDraft }
+  | { ok: false; reason: 'llm_unavailable' | 'parse_failed'; message?: string };
+
+const PROPOSER_MODEL = 'claude-sonnet-4-6';
+const PROPOSER_TIMEOUT_MS = 15000;
+
+/**
+ * PR #87 follow-up — chamada LLM + parse, sem DB write. Permite ao caller
+ * (gap-escalation-monitor) fazer a chamada Sonnet (lenta, não-transacionável)
+ * ANTES de abrir um withTx que atomiza createProposal + updateLevel.
+ *
+ * Retorna o draft cru; é responsabilidade do caller persistir via createTx
+ * dentro da transação. Mesmas garantias do path completo:
+ *  - Flag gate antes da chamada (sem spend Sonnet com flag off).
+ *  - runCognitiveModule wrapper (timeout 15s + audit log + fallback null).
+ */
+export async function generateCapabilityProposalDraft(args: {
+  gap: AgentCapabilityGap;
+  recent_evidence?: Array<{ context: string; created_at: Date }>;
+}): Promise<DraftResult> {
+  if (!featureFlags.isEnabled(FeatureFlagName.DIALOGICAL_ACQUISITION)) {
+    return { ok: false, reason: 'llm_unavailable', message: 'flag_off' };
+  }
+
+  const draft = await runProposerLLM(args);
+
+  if (!draft.output) {
+    const reason = draft.status === 'timeout' ? 'llm_unavailable' : 'parse_failed';
+    return { ok: false, reason };
+  }
+
+  return { ok: true, draft: draft.output };
+}
+
+export async function proposeCapabilityForGap(args: {
+  gap: AgentCapabilityGap;
+  recent_evidence?: Array<{ context: string; created_at: Date }>;
+}): Promise<ProposeResult> {
+  // Flag gate — no Sonnet spend without governance active
+  if (!featureFlags.isEnabled(FeatureFlagName.DIALOGICAL_ACQUISITION)) {
+    return { ok: false, reason: 'llm_unavailable', message: 'flag_off' };
+  }
+
+  const draft = await runProposerLLM(args);
+
+  if (!draft.output) {
+    const reason = draft.status === 'timeout' ? 'llm_unavailable' : 'parse_failed';
+    return { ok: false, reason };
+  }
+
+  try {
+    const proposal = await capabilityProposalsRepo.create({
+      gap_id: args.gap.id,
+      capability_type: draft.output.capability_type,
+      title: draft.output.title,
+      description: draft.output.description,
+      proposed_spec: draft.output.proposed_spec,
+      motivation: draft.output.motivation,
+      expected_impact: draft.output.expected_impact,
+      test_scenarios: draft.output.test_scenarios,
+    });
+    return { ok: true, proposal_id: proposal.id, draft: draft.output };
+  } catch (e) {
+    return {
+      ok: false,
+      reason: 'repo_failed',
+      message: e instanceof Error ? e.message : String(e),
+    };
+  }
+}
+
+/**
+ * Internal — runs runCognitiveModule + the Anthropic LLM call + parse.
+ * Returns the runCognitiveModule result (output may be null on
+ * timeout/throw/parse-failure). Extracted so both public entry points share
+ * the same prompt/parse logic.
+ */
+async function runProposerLLM(args: {
+  gap: AgentCapabilityGap;
+  recent_evidence?: Array<{ context: string; created_at: Date }>;
+}) {
+  return runCognitiveModule<ProposalDraft | null>(
+    {
+      name: 'capability_proposer',
+      timeoutMs: PROPOSER_TIMEOUT_MS,
+      triggered_by: 'async_event',
+      fallback: null,
+    },
+    async () => {
+      const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY ?? '' });
+      const system = [
+        'Você é o agente analisando uma lacuna recorrente na sua capacidade.',
+        'Proponha uma especificação técnica para resolver. Você propõe; o owner decide.',
+        'Devolva JSON estrito com {capability_type, title, description, proposed_spec, motivation, expected_impact, test_scenarios}.',
+        'capability_type é um de: tool, knowledge, procedure, integration, other.',
+        'test_scenarios é array de objetos {name, given, when, then} (BDD).',
+        'IMPORTANTE: NÃO inclua julgamento de prioridade. Apenas a spec técnica.',
+      ].join('\n');
+
+      // P87-C1: gap fields e evidence.context flowing from user-influenced
+      // sources são sanitizados antes de irem para o prompt do Sonnet (defense
+      // in depth — mesmo o LLM secundário não deve receber tag-breakout).
+      const evidenceBlock = args.recent_evidence && args.recent_evidence.length > 0
+        ? `EVIDÊNCIAS RECENTES:\n${args.recent_evidence
+            .slice(0, 5)
+            .map((e) => `- ${sanitizeBlock(e.context)}`)
+            .join('\n')}`
+        : '';
+
+      const userParts = [
+        `LACUNA: ${sanitizeBlock(args.gap.capability_description)}`,
+        `TIPO PROVÁVEL: ${args.gap.tipo}`,
+        `CONTEXTO RECORRENTE: ${sanitizeBlock(args.gap.contexto ?? '(sem detalhe)')}`,
+        `FREQUÊNCIA: ${args.gap.frequency_score} ocorrências`,
+        `SEVERIDADE: ${args.gap.severity_score}/10`,
+        evidenceBlock,
+        'Devolva JSON estrito conforme estrutura definida.',
+      ].filter((s) => s.length > 0);
+      const user = userParts.join('\n\n');
+
+      const completion = await anthropic.messages.create({
+        model: PROPOSER_MODEL,
+        max_tokens: 1500,
+        system,
+        messages: [{ role: 'user', content: user }],
+      });
+
+      const text = (completion.content as Array<{ type: string; text?: string }>)
+        .filter(
+          (c): c is { type: 'text'; text: string } =>
+            c.type === 'text' && typeof c.text === 'string',
+        )
+        .map((c) => c.text)
+        .join('');
+
+      // PR #87 Minor #5: robust JSON extraction. Sonnet ocasionalmente devolve
+      // prose antes/depois do JSON, ou múltiplos blocos `{...}` (ex.: exemplo
+      // em prosa + bloco final). Estratégia: enumerar todos os candidatos
+      // balanceados e tentar parsear do maior para o menor — o primeiro
+      // que parsear vira o draft. Regex non-greedy isolada não basta porque
+      // o JSON real contém objetos aninhados.
+      let parsed: ProposalDraft | null = null;
+      const candidates: string[] = [];
+      for (let i = 0; i < text.length; i++) {
+        if (text[i] !== '{') continue;
+        let depth = 0;
+        for (let j = i; j < text.length; j++) {
+          if (text[j] === '{') depth++;
+          else if (text[j] === '}') {
+            depth--;
+            if (depth === 0) {
+              candidates.push(text.slice(i, j + 1));
+              break;
+            }
+          }
+        }
+      }
+      // Prefer larger candidates (mais provável de ser o objeto principal).
+      candidates.sort((a, b) => b.length - a.length);
+      for (const c of candidates) {
+        try {
+          parsed = JSON.parse(c) as ProposalDraft;
+          break;
+        } catch {
+          // tenta próximo candidato
+        }
+      }
+      if (!parsed) return null;
+
+      // Light validation: required keys present.
+      if (
+        !parsed.title ||
+        !parsed.description ||
+        !parsed.motivation ||
+        !parsed.capability_type
+      ) {
+        return null;
+      }
+      return parsed;
+    },
+  );
+}

@@ -100,6 +100,53 @@ export const DriftDecision = {
 export type DriftDecision = typeof DriftDecision[keyof typeof DriftDecision];
 
 /**
+ * P5 — Nível de escalada para lacunas detectadas (aquisição dialógica de
+ * capacidades). 4 níveis determinísticos: silencioso (apenas log) ->
+ * dashboard (visível para owner) -> mencionável (Maia pode pedir contexto)
+ * -> proposto (spec formal aguardando decisão do owner).
+ */
+export const GapLevel = {
+  SILENT: 'silent',
+  DASHBOARD: 'dashboard',
+  MENTIONABLE: 'mentionable',
+  PROPOSED: 'proposed',
+} as const;
+export type GapLevel = typeof GapLevel[keyof typeof GapLevel];
+
+/**
+ * P5 — Ciclo de vida de uma proposta de capacidade (spec técnica gerada
+ * pela Maia para fechar uma lacuna). Owner decide aprovação/rejeição;
+ * delivered indica que a capacidade foi entregue após testes pós-ativação.
+ *
+ * P87-C3 (PR #87 review) — adicionados `testing` (intermediate state quando
+ * runCapabilityTests está executando) e `reverted` (terminal alternativo a
+ * delivered, quando teste pós-ativação falha e revertCapability cria gap
+ * técnico). Garantia do design contract: capability_acquired NÃO ocorre
+ * sem o test gate (criterion #3 do P5 §9).
+ */
+export const ProposalStatus = {
+  DRAFT: 'draft',
+  SUBMITTED: 'submitted',
+  APPROVED: 'approved',
+  REJECTED: 'rejected',
+  TESTING: 'testing',
+  DELIVERED: 'delivered',
+  REVERTED: 'reverted',
+} as const;
+export type ProposalStatus = typeof ProposalStatus[keyof typeof ProposalStatus];
+
+/**
+ * P5 — Resultado de teste pós-aquisição (loop fechado: a capacidade
+ * adquirida realmente fecha a lacuna?).
+ */
+export const CapabilityTestOutcome = {
+  PASS: 'pass',
+  FAIL: 'fail',
+  ERROR: 'error',
+} as const;
+export type CapabilityTestOutcome = typeof CapabilityTestOutcome[keyof typeof CapabilityTestOutcome];
+
+/**
  * Nomes de feature flags conhecidas. Cresce conforme fases ativam.
  */
 export const FeatureFlagName = {
@@ -114,5 +161,7 @@ export const FeatureFlagName = {
   P0_TENANT_GUARD_ENFORCED: 'P0_TENANT_GUARD_ENFORCED',
   // P4 — identidade operacional v2 (perfil versionado + drift)
   OPERATIONAL_PROFILE_V2: 'OPERATIONAL_PROFILE_V2',
+  // P5 — aquisição dialógica de capacidades (lacunas -> propostas)
+  DIALOGICAL_ACQUISITION: 'DIALOGICAL_ACQUISITION',
 } as const;
 export type FeatureFlagName = typeof FeatureFlagName[keyof typeof FeatureFlagName];
