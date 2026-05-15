@@ -992,9 +992,14 @@ export type ProcedureMetric = typeof procedure_metrics.$inferSelect;
 export type AgentOperationalProfileVersion = typeof agent_operational_profile_versions.$inferSelect;
 export type NewAgentOperationalProfileVersion = typeof agent_operational_profile_versions.$inferInsert;
 
+// Single source of truth for the ProfileBody schema version literal.
+// Bump this constant when introducing a new ProfileBody shape (e.g., v3.1.2).
+export const PROFILE_BODY_SCHEMA_VERSION = 'v3.1.1-2026-05-15' as const;
+export type ProfileBodySchemaVersion = typeof PROFILE_BODY_SCHEMA_VERSION;
+
 // Tipo estrutural do JSONB `profile_body` (v3.1.1)
 export interface ProfileBody {
-  schema_version: 'v3.1.1-2026-05-15';
+  schema_version: ProfileBodySchemaVersion;
   identity: {
     role_descriptor: string;
     voice: {

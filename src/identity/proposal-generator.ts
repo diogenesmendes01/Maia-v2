@@ -20,6 +20,7 @@
  */
 import { readFile } from 'node:fs/promises';
 import { operationalProfileVersionsRepo } from '@/db/repositories.js';
+import { PROFILE_BODY_SCHEMA_VERSION } from '@/db/schema.js';
 import type { AgentOperationalProfileVersion, ProfileBody, SelfState } from '@/db/schema.js';
 
 export type ProposalGeneratorResult =
@@ -61,7 +62,7 @@ export async function seedInitialOperationalProfile(args?: {
   const thresholds = extractThresholdsFromSelf(args?.source_self_state) ?? {};
 
   const profile_body: ProfileBody = {
-    schema_version: 'v3.1.1-2026-05-15',
+    schema_version: PROFILE_BODY_SCHEMA_VERSION,
     identity: {
       role_descriptor: identity_block,
       voice: {

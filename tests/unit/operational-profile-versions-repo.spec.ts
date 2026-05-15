@@ -15,7 +15,11 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import { ProfileStatus } from '@/types/enums.js';
-import { agent_operational_profile_versions, type ProfileBody } from '@/db/schema.js';
+import {
+  agent_operational_profile_versions,
+  PROFILE_BODY_SCHEMA_VERSION,
+  type ProfileBody,
+} from '@/db/schema.js';
 
 describe('schema profile_body (v3.1.1)', () => {
   it('has profile_body column', () => {
@@ -76,7 +80,7 @@ const profilesState: Record<string, ProfileRow> = {};
 
 // Helper para tests não precisarem repetir a estrutura inteira do ProfileBody.
 const makeProfileBody = (overrides: Partial<ProfileBody> = {}): ProfileBody => ({
-  schema_version: 'v3.1.1-2026-05-15',
+  schema_version: PROFILE_BODY_SCHEMA_VERSION,
   identity: {
     role_descriptor: 'test_role',
     voice: { tone: 'neutral', formality: 'medium', verbosity: 'concise' },
