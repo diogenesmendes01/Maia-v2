@@ -34,7 +34,7 @@ describe('schema profile_body (v3.1.1)', () => {
       schema_version: 'v3.1.1-2026-05-15',
       identity: {
         role_descriptor: 'x',
-        voice: { tone: 't', formality: 'medium', verbosity: 'short' },
+        voice: { tone: 't', formality: 'medium', verbosity: 'concise' },
         cognitive_limits: {
           max_inference_depth: 3,
           max_speculation_in_response: 0.2,

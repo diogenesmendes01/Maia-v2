@@ -1000,7 +1000,7 @@ export interface ProfileBody {
     voice: {
       tone: string;
       formality: 'low' | 'medium' | 'high';
-      verbosity: 'short' | 'medium' | 'detailed';
+      verbosity: 'concise' | 'medium' | 'detailed';
     };
     cognitive_limits: {
       max_inference_depth: number;
