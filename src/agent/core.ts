@@ -753,39 +753,98 @@ async function runAgentForMensagemInner(
       inbound,
       response_text: reactOutboundText,
       tools_called: reactToolsCalled,
-      active_execution_id: activeExecution?.id ?? null,
-    }).catch((err) =>
-      logger.warn({ err: (err as Error).message }, 'agent.postturn_graph_failed'),
-    );
-  } else {
-    // LEGACY post-turn — intacto.
-    // P3b Task 9 — POST-TURN evaluator (fire-and-forget):
-    // If a procedure execution is active, re-load it (state may have
-    // mutated mid-turn) and evaluate the current step's success criteria
-    // against this turn's outbound text + tool results. If the step is
-    // complete, advance to the next step or complete the execution.
-    // Errors are swallowed — procedure runtime must NEVER block the
-    // user-facing reply or post-turn cleanup.
-    if (activeExecution) {
-      const execId = activeExecution.id;
-      const responseContext = {
-        response_text: reactOutboundText,
-        tools_called: reactToolsCalled,
-        // P3c Task 5: user_signal critério lê o inbound textual do turn.
-        // Pós-aggregation (debounce merge) — inbound.conteudo já está mesclado.
-        user_message: inbound.conteudo ?? '',
-      };
-      void (async () => {
-        try {
-          const exec = await procedureExecutionsRepo.findById(execId);
-          if (!exec || exec.status !== 'in_progress') return;
-          const def = await procedureDefinitionsRepo.findById(exec.definition_id);
-          if (!def) return;
+      // P3c Task 5: user_signal critério lê o inbound textual do turn.
+      // Pós-aggregation (debounce merge) — inbound.conteudo já está mesclado.
+      user_message: inbound.conteudo ?? '',
+    };
+    void (async () => {
+      try {
+        const exec = await procedureExecutionsRepo.findById(execId);
+        if (!exec || exec.status !== 'in_progress') return;
+        const def = await procedureDefinitionsRepo.findById(exec.definition_id);
+        if (!def) return;
 
-          const evalResult = await evaluateCurrentStep({
-            execution: exec,
-            definition: def,
-            response_context: responseContext,
+        const evalResult = await evaluateCurrentStep({
+          execution: exec,
+          definition: def,
+          response_context: responseContext,
+        });
+
+        // P84-C4: emit a `tool_called` event for every tool the ReAct
+        // loop invoked this turn. We emit unconditionally (rather than
+        // only when the tool intersects a criterion) so the audit trail
+        // can answer "what tools did this procedure trigger?" without
+        // joining against criterion shapes. Truncation is handled inside
+        // the engine helper.
+        for (const tc of responseContext.tools_called ?? []) {
+          await procedureEngine.recordToolCalled({
+            execution_id: exec.id,
+            step_id: exec.current_step_id,
+            tool_name: tc.name,
+            result: tc.result,
+          }).catch(() => undefined);
+        }
+
+        // P84-C4: emit `criterion_checked` for each criterion the
+        // step-evaluator scored. Best-effort: if persistence fails, we
+        // still proceed with the advance/complete decision below.
+        for (const cr of evalResult.criterion_results) {
+          await procedureEngine.recordCriterionChecked({
+            execution_id: exec.id,
+            step_id: exec.current_step_id ?? '',
+            criterion_id: cr.id,
+            criterion_type: cr.type,
+            passed: cr.passed,
+            evidence: cr.evidence,
+          }).catch(() => undefined);
+        }
+
+        // P84-C3: stall handling. When the evaluator reports a stall
+        // reason (`no_criteria_defined` — step has no criteria,
+        // `unsupported_criterion_only` — all criteria are P3c types
+        // not yet evaluated), we record a `step_failed` event so the
+        // future P3c reaper can sweep the execution. We do NOT abort
+        // here — operators may still want to manually advance via SQL,
+        // and the kill switch handles the worst case.
+        if (evalResult.stall_reason) {
+          await procedureEngine.recordEvent({
+            execution_id: exec.id,
+            step_id: exec.current_step_id,
+            event_type: 'step_failed',
+            payload: {
+              reason: evalResult.stall_reason,
+              step_id: exec.current_step_id,
+            },
+            confidence: null,
+          }).catch(() => undefined);
+        }
+
+        if (!evalResult.step_completed) return;
+
+        // P84-C3: when the DAG-aware picker linearized parallel
+        // branches, record a `branch_taken` event with the chosen
+        // step + the alternates so P3c can use it to drive proper
+        // branch resolution. Today the picker is deterministic (first
+        // in array order); the event makes the choice auditable.
+        if (evalResult.branch_alternates.length > 0 && evalResult.next_step_id) {
+          await procedureEngine.recordEvent({
+            execution_id: exec.id,
+            step_id: evalResult.next_step_id,
+            event_type: 'branch_taken',
+            payload: {
+              chosen_step_id: evalResult.next_step_id,
+              alternates: evalResult.branch_alternates,
+              picker: 'deterministic_array_order',
+            },
+            confidence: null,
+          }).catch(() => undefined);
+        }
+
+        if (evalResult.next_step_id) {
+          await procedureEngine.advanceStep({
+            execution_id: exec.id,
+            next_step_id: evalResult.next_step_id,
+            completed_step_id: exec.current_step_id!,
           });
 
           if (!evalResult.step_completed) return;

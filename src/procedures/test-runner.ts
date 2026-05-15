@@ -65,12 +65,13 @@ export async function runProcedureTest(args: {
       const firstStep = steps.find((s) => !s.depends_on || s.depends_on.length === 0) ?? steps[0] ?? null;
       const firstStepId = firstStep?.id ?? null;
 
-      const exec = await engine.startExecution({
+      const startResult = await engine.startExecution({
         definition_id: args.definition.id,
         definition_version: args.definition.version_number,
         conversa_id: null,
         first_step_id: firstStepId,
       });
+      const exec = startResult.execution;
       executionId = exec.id;
       if (firstStepId) actual_step_path.push(firstStepId);
 

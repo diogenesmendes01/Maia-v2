@@ -1,4 +1,5 @@
 import type { ProcedureExecution, ProcedureDefinition } from '@/db/schema.js';
+import { logger } from '@/lib/logger.js';
 import { getLatestHumanConfirmation } from '@/procedures/engine.js';
 import { judgeStepCriterion } from './step-evaluator-llm-judge.js';
 import { detectUserSignal } from './step-evaluator-user-signal.js';
