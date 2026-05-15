@@ -11,7 +11,7 @@
  * Resolver is exercised via createPolicyDescriptorResolver(mockRepo, cache).
  * The cache is the real PolicyResolverCacheImpl with TTL = 60s.
  */
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import {
   createPolicyDescriptorResolver,
   PolicyResolverCacheImpl,

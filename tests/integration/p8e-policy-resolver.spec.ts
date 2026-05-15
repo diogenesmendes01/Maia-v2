@@ -12,7 +12,7 @@
  * mock the repo with an in-memory state, build a fresh resolver+cache for
  * each scenario.
  */
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import {
   PolicyResolverCacheImpl,

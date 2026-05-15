@@ -257,7 +257,7 @@ export function startPolicyCacheInvalidationSubscriber(): void {
   sub.connect().catch((err) => {
     logger.warn({ err: (err as Error).message }, 'policy_cache.subscribe_connect_failed');
   });
-  sub.subscribe(POLICY_LIFECYCLE_CHANNEL, (err) => {
+  void sub.subscribe(POLICY_LIFECYCLE_CHANNEL, (err) => {
     if (err) {
       logger.warn(
         { err: err.message },

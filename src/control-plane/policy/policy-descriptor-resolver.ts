@@ -95,7 +95,7 @@ export class PolicyDescriptorResolverImpl implements PolicyDescriptorResolver {
       }
 
       // 2) repo lookup (agent_id-specific then tenant-wide via repo)
-      let row: PolicyRule | null = null;
+      let row: PolicyRule | null;
       try {
         row = await this.repo.findActiveByDescriptor({
           descriptor,

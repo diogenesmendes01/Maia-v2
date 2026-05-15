@@ -3,7 +3,12 @@
  *
  * Master spec v3.1.1 §2.1, §2.2. `rule_body` is OPAQUE in P8e (DSL/AST
  * evaluator lives in P9d). Here we only expose the JSON object shape.
+ *
+ * The `const X = {} as const` + `type X = typeof X[keyof typeof X]` pattern
+ * is legitimate in TS (same name in value + type space). `no-redeclare`
+ * sees that as a conflict; disable here as enums.ts does.
  */
+/* eslint-disable @typescript-eslint/no-redeclare */
 
 /**
  * 4 kinds of governance rule. hard_limit gets the strictest activation
