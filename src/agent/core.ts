@@ -458,6 +458,11 @@ async function runAgentForMensagemInner(
   // só deixam `activeExecution=null` / `activeRole=null`.
   let activeExecution: ProcedureExecution | null = null;
   let activeRole: Role | null = null;
+  // [P88-C4] Mensagem opcional anunciando troca de role (lida pela react-loop
+  // como outboundPrefix). Permanece null quando não há troca ou quando a
+  // policy do canal pede silêncio (announce_mode=never). Ver path legacy
+  // abaixo onde é populada.
+  let roleAnnouncement: string | null = null;
 
   if (featureFlags.isEnabled(FeatureFlagName.COGNITIVE_GRAPH)) {
     // P7 path — orquestração via grafo declarativo.
@@ -515,12 +520,13 @@ async function runAgentForMensagemInner(
           );
           if (def) {
             const steps = def.steps as unknown as Array<{ id: string }>;
-            activeExecution = await procedureEngine.startExecution({
+            const { execution: started } = await procedureEngine.startExecution({
               definition_id: def.id,
               definition_version: def.version_number,
               conversa_id: c.id,
               first_step_id: steps[0]?.id ?? null,
             });
+            activeExecution = started;
           }
         } else if (
           selectorOutput.decision === 'switch' &&
@@ -536,12 +542,13 @@ async function runAgentForMensagemInner(
           );
           if (def) {
             const steps = def.steps as unknown as Array<{ id: string }>;
-            activeExecution = await procedureEngine.startExecution({
+            const { execution: started } = await procedureEngine.startExecution({
               definition_id: def.id,
               definition_version: def.version_number,
               conversa_id: c.id,
               first_step_id: steps[0]?.id ?? null,
             });
+            activeExecution = started;
           }
         }
       }
@@ -601,12 +608,13 @@ async function runAgentForMensagemInner(
         if (def) {
           const steps = def.steps as unknown as Array<{ id: string }>;
           const firstStep = steps[0]?.id ?? null;
-          activeExecution = await procedureEngine.startExecution({
+          const { execution: started } = await procedureEngine.startExecution({
             definition_id: def.id,
             definition_version: def.version_number,
             conversa_id: c.id,
             first_step_id: firstStep,
           });
+          activeExecution = started;
         }
       } else if (
         selectorResult.decision === 'switch' &&
@@ -623,12 +631,13 @@ async function runAgentForMensagemInner(
         if (def) {
           const steps = def.steps as unknown as Array<{ id: string }>;
           const firstStep = steps[0]?.id ?? null;
-          activeExecution = await procedureEngine.startExecution({
+          const { execution: started } = await procedureEngine.startExecution({
             definition_id: def.id,
             definition_version: def.version_number,
             conversa_id: c.id,
             first_step_id: firstStep,
           });
+          activeExecution = started;
         }
       }
       // 'continue', 'escalate', 'none' → no engine action here. continue
@@ -663,6 +672,24 @@ async function runAgentForMensagemInner(
               turno_id: inbound.id,
             });
             activeRole = result.decided_role;
+            // [P88-C4] Compute the optional switch announcement. Only
+            // emit when the policy says so AND the role actually changed
+            // AND the new role brings a user-facing addendum.
+            if (
+              result.action === 'switch' &&
+              result.decided_role.id !== currentRole.id
+            ) {
+              const announceMode = policy.announce_mode;
+              const affectsUser =
+                result.decided_role.display_name !== currentRole.display_name &&
+                !!(result.decided_role.prompt_addendum ?? '').trim();
+              const shouldAnnounce =
+                announceMode === 'always' ||
+                (announceMode === 'affects_user' && affectsUser);
+              if (shouldAnnounce) {
+                roleAnnouncement = `_(Mudando para o modo ${result.decided_role.display_name}.)_`;
+              }
+            }
           }
         }
       } catch (err) {
@@ -753,12 +780,19 @@ async function runAgentForMensagemInner(
       inbound,
       response_text: reactOutboundText,
       tools_called: reactToolsCalled,
-      // P3c Task 5: user_signal critério lê o inbound textual do turn.
-      // Pós-aggregation (debounce merge) — inbound.conteudo já está mesclado.
-      user_message: inbound.conteudo ?? '',
+      // P3c Task 5: nodes derive `user_message` from `inbound.conteudo`
+      // themselves; we just pass the active_execution_id so the
+      // step-evaluator runs only when there's something to advance.
+      active_execution_id: activeExecution?.id ?? null,
     });
-  } else {
-    // Legacy path — direct fire-and-forget IIFE.
+  } else if (activeExecution) {
+    // Legacy path — direct fire-and-forget IIFE. Only enter when there's an
+    // active procedure_execution to evaluate; otherwise nothing to advance.
+    const execId = activeExecution.id;
+    const responseContext = {
+      response_text: reactOutboundText,
+      tools_called: reactToolsCalled,
+    };
     void (async () => {
       try {
         const exec = await procedureExecutionsRepo.findById(execId);
