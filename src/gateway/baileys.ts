@@ -16,6 +16,7 @@ import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 import { sha256 } from '@/lib/utils.js';
 import { mensagensRepo } from '@/db/repositories.js';
+import { runWithTenantContext } from '@/db/tenant-context.js';
 import { isDuplicate, markSeen } from './dedup.js';
 import { markRead } from './presence.js';
 import { enqueueAgent } from './queue.js';
@@ -198,14 +199,21 @@ export async function startBaileys(): Promise<void> {
 
   socket.ev.on('connection.update', handleConnectionUpdate);
 
+  // P1: Baileys ingress entry-points wrap every callback in a tenant
+  // context. The repos called by `handleIncoming`/`routeMessageUpdate`
+  // (mensagensRepo.findByWhatsappId, createInbound, …) call
+  // `getCurrentTenant()` and throw MissingTenantContextError when run
+  // outside a context — without this wrap the try/catch below would log
+  // baileys.handle_failed and silently drop every inbound message in
+  // production. P0 single-tenant: 'default'/'default' literal; P6 will
+  // resolve the tuple from the channel/JID before invoking the handler.
   socket.ev.on('messages.upsert', async ({ messages }) => {
     for (const msg of messages) {
       try {
-        // PR #75 review (P75-C1): handleIncoming hits mensagensRepo /
-        // pessoasRepo, both of which now require tenant context. Wrap each
-        // message dispatch in the default tenant context so the new guard
-        // doesn't drop real WhatsApp inbounds.
-        await runWithTenantContext(BAILEYS_DEFAULT_CTX, () => handleIncoming(msg));
+        await runWithTenantContext(
+          { tenant_id: 'default', agent_id: 'default' },
+          () => handleIncoming(msg),
+        );
       } catch (err) {
         logger.error({ err }, 'baileys.handle_failed');
       }
@@ -220,11 +228,9 @@ export async function startBaileys(): Promise<void> {
         // We synthesise an IWebMessageInfo whose `message` is the `update.message`
         // payload so routeMessageUpdate can branch on editedMessage / protocolMessage.
         // The `as never` cast is intentional — runtime structure is what matters.
-        //
-        // Same tenant-context wrap as messages.upsert: routeMessageUpdate
-        // reads mensagensRepo/pessoasRepo/auditRepo (all tenant-scoped now).
-        await runWithTenantContext(BAILEYS_DEFAULT_CTX, () =>
-          routeMessageUpdate({
+        await runWithTenantContext(
+          { tenant_id: 'default', agent_id: 'default' },
+          () => routeMessageUpdate({
             key: update.key,
             message: update.update.message,
           } as never),

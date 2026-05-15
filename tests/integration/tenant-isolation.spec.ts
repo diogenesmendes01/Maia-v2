@@ -8,16 +8,11 @@ import {
   contas_bancarias,
   pessoas,
 } from '@/db/schema.js';
-import {
-  tenantsRepo,
-  transacoesRepo,
-  pessoasRepo,
-} from '@/db/repositories.js';
+import { tenantsRepo, transacoesRepo } from '@/db/repositories.js';
 import {
   runWithTenantContext,
   getCurrentTenant,
   getCurrentAgent,
-  MissingTenantContextError,
 } from '@/db/tenant-context.js';
 import { like, inArray } from 'drizzle-orm';
 
@@ -48,7 +43,6 @@ d('Tenant isolation (P0)', () => {
       .delete(contas_bancarias)
       .where(like(contas_bancarias.apelido, 'Conta-test-%'));
     await db.delete(entidades).where(like(entidades.nome, 'TestEnt-%'));
-    await db.delete(pessoas).where(inArray(pessoas.tenant_id, tenantIds));
     await db.delete(agents).where(inArray(agents.tenant_id, tenantIds));
     await db.delete(tenants).where(inArray(tenants.id, tenantIds));
   });

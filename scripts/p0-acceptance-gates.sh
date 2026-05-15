@@ -16,26 +16,12 @@ npx vitest run tests/unit/tenant-context.spec.ts
 
 echo ""
 echo "=== Gate 2: NOT NULL forçado em 27 tabelas ==="
-# Expected é derivado da lista de tabelas tenant-aware (menos frágil que hard-code).
-# Estrutura: 27 P0 tables × 2 cols + agents.tenant_id (1) + cognitive_module_log × 2.
-#
-# Ao adicionar uma nova tabela tenant-aware:
-#   - Adicione à lista TENANT_AWARE_TABLES abaixo.
-#   - Crie a migration que adiciona tenant_id+agent_id NOT NULL.
-#   - O EXPECTED se recalcula automaticamente.
-TENANT_AWARE_TABLES=(
-  entidades contas_bancarias categorias transacoes
-  transferencias_internas recorrencias contrapartes
-  pessoas permission_profiles permissoes
-  conversas mensagens
-  agent_facts learned_rules agent_memories self_state
-  entity_states workflows workflow_steps
-  pending_questions idempotency_keys
-  system_health_events dead_letter_jobs dashboard_sessions
-  import_runs import_entries audit_log
-)
-# 27 × 2 (tenant_id + agent_id) + agents.tenant_id (1) + cognitive_module_log × 2
-EXPECTED_NOT_NULL=$(( ${#TENANT_AWARE_TABLES[@]} * 2 + 1 + 2 ))
+# Expected = 57:
+#   27 P0 tables × 2 cols (tenant_id + agent_id)       = 54  (migration 012)
+#   agents.tenant_id                                    =  1  (migration 007)
+#   cognitive_module_log.tenant_id + agent_id           =  2  (migration 008)
+# Se este número mudar (nova tabela tenant-aware), atualizar EXPECTED.
+EXPECTED_NOT_NULL=57
 NOT_NULL_COUNT=$(psql "$DATABASE_URL" -At -c "
 SELECT count(*)
 FROM information_schema.columns
@@ -46,7 +32,7 @@ WHERE column_name IN ('tenant_id', 'agent_id')
 echo "NOT NULL tenant_id/agent_id columns: $NOT_NULL_COUNT (expected $EXPECTED_NOT_NULL)"
 if [ "$NOT_NULL_COUNT" -ne "$EXPECTED_NOT_NULL" ]; then
   echo "Gate 2 FAIL: esperado $EXPECTED_NOT_NULL colunas NOT NULL, encontrado $NOT_NULL_COUNT."
-  echo "  Verifique se todas as migrations P0 (007-012) rodaram e se TENANT_AWARE_TABLES está atualizada."
+  echo "  Verifique se todas as migrations P0 (007-012) rodaram e se o EXPECTED está atualizado."
   exit 1
 fi
 echo "Gate 2 OK"

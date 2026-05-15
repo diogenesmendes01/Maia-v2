@@ -18,6 +18,11 @@ import {
   reflectOnCorrection,
   findPreviousAssistantMessage,
 } from './reflection.js';
+import { detectSuccess } from './success-detector.js';
+import { reflect } from '@/cognition/reflector.js';
+import { classify } from '@/cognition/classifier.js';
+import { persistCandidate } from '@/cognition/persister.js';
+import { CognitiveEventType } from '@/types/enums.js';
 import { sendOutbound } from './output-dispatch.js';
 import { runReActLoop } from './react-loop.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
@@ -252,6 +257,35 @@ async function runAgentForMensagemInner(mensagem_id: string): Promise<void> {
       }
     }
   };
+
+  // P1 reflection trigger: success detection (fire-and-forget, runs in
+  // parallel with response generation). Sees the post-aggregation
+  // `inbound.conteudo` so signals across chunked turns are captured.
+  // Errors are swallowed — reflection MUST never block the user-facing reply.
+  if (inbound.conteudo && detectSuccess(inbound.conteudo)) {
+    const signal = inbound.conteudo;
+    void (async () => {
+      try {
+        const event = {
+          type: CognitiveEventType.SUCCESS_EXPLICIT,
+          conversa_id: c.id,
+          inbound_mensagem_id: inbound.id,
+          signal,
+          context_summary: '',
+        } as const;
+        const reflected = await reflect(event, { pessoa_id: pessoa.id });
+        if (!reflected || !reflected.insight) return;
+        const classified = await classify(reflected.insight);
+        if (!classified) return;
+        await persistCandidate(classified, event);
+      } catch (err) {
+        logger.warn(
+          { err: (err as Error).message, mensagem_id: inbound.id },
+          'success.reflection.failed',
+        );
+      }
+    })();
+  }
 
   // Spec 03 §9 — sliding-hour rate limit. Owners exempt; others get one
   // polite reply per hour, then 60s of silence after each warning.

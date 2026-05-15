@@ -25,6 +25,7 @@ import {
   tenants,
   agents,
   cognitive_module_log,
+  cognitive_candidates,
 } from './schema.js';
 import { TypedError } from '@/lib/utils.js';
 import { applyTenantGuard } from './tenant-guard.js';
@@ -51,6 +52,7 @@ import type {
   Tenant,
   Agent,
   CognitiveModuleLog,
+  CognitiveCandidate,
 } from './schema.js';
 
 export type EntityScope = {
@@ -1219,5 +1221,39 @@ export const cognitiveModuleLogRepo = {
       .where(eq(cognitive_module_log.module_name, module_name))
       .orderBy(desc(cognitive_module_log.created_at))
       .limit(limit);
+  },
+};
+
+export const cognitiveCandidatesRepo = {
+  async create(
+    input: Omit<CognitiveCandidate, 'id' | 'created_at' | 'tenant_id' | 'agent_id' | 'status' | 'consumed_by_phase' | 'consumed_at'>,
+  ): Promise<CognitiveCandidate> {
+    const guarded = applyTenantGuard(input);
+    const [row] = await db.insert(cognitive_candidates).values(guarded).returning();
+    return row!;
+  },
+
+  async listPending(candidate_type?: string, limit = 100): Promise<CognitiveCandidate[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const conditions = [
+      eq(cognitive_candidates.tenant_id, tenant_id),
+      eq(cognitive_candidates.agent_id, agent_id),
+      eq(cognitive_candidates.status, 'pending'),
+    ];
+    if (candidate_type) conditions.push(eq(cognitive_candidates.candidate_type, candidate_type));
+    return db
+      .select()
+      .from(cognitive_candidates)
+      .where(and(...conditions))
+      .orderBy(desc(cognitive_candidates.created_at))
+      .limit(limit);
+  },
+
+  async markConsumed(id: string, phase: string): Promise<void> {
+    await db
+      .update(cognitive_candidates)
+      .set({ status: 'consumed', consumed_by_phase: phase, consumed_at: new Date() })
+      .where(eq(cognitive_candidates.id, id));
   },
 };
