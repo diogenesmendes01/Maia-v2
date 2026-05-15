@@ -7,6 +7,7 @@ import {
   jsonb,
   timestamp,
   integer,
+  bigserial,
   boolean,
   date,
   unique,
@@ -1316,6 +1317,119 @@ export const role_selector_decisions = pgTable(
   }),
 );
 
+// =====================================================================
+// P8.5 Admin UI v1 — auth, approvals, audit, debug snapshot grants
+// =====================================================================
+
+// 038: app_users — admin-ui authentication (NextAuth)
+export const app_users = pgTable(
+  'app_users',
+  {
+    id: text('id').primaryKey(),
+    tenant_id: text('tenant_id').notNull(),
+    email: text('email').notNull(),
+    name: text('name'),
+    role: text('role').notNull(), // founder | compliance_officer | owner | analyst | viewer
+    email_verified: timestamp('email_verified', { withTimezone: true }),
+    image: text('image'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    tenantEmailUq: unique('app_users_tenant_email_uq').on(t.tenant_id, t.email),
+    tenantIdx: index('app_users_tenant_idx').on(t.tenant_id),
+  }),
+);
+
+// 038: app_sessions — JWT/session tracking
+export const app_sessions = pgTable(
+  'app_sessions',
+  {
+    id: text('id').primaryKey(),
+    user_id: text('user_id').notNull(),
+    session_token: text('session_token').notNull().unique(),
+    expires: timestamp('expires', { withTimezone: true }).notNull(),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    userIdx: index('app_sessions_user_id_idx').on(t.user_id),
+    expiresIdx: index('app_sessions_expires_idx').on(t.expires),
+  }),
+);
+
+// 039: proposal_approvals — tracks dual-approval state
+export const proposal_approvals = pgTable(
+  'proposal_approvals',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    proposal_id: uuid('proposal_id').notNull(),
+    approval_class: text('approval_class').notNull(),
+    approver_user_id: text('approver_user_id').notNull(),
+    approver_role: text('approver_role').notNull(),
+    decision: text('decision').notNull(), // 'approved' | 'rejected'
+    comment: text('comment'),
+    decided_at: timestamp('decided_at', { withTimezone: true }).notNull().defaultNow(),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    proposalRoleDecisionUq: unique('proposal_approvals_proposal_role_decision_uq').on(
+      t.proposal_id,
+      t.approver_role,
+      t.decision,
+    ),
+    proposalIdx: index('proposal_approvals_proposal_id_idx').on(t.proposal_id),
+    classIdx: index('proposal_approvals_approval_class_idx').on(t.approval_class),
+    tenantIdx: index('proposal_approvals_tenant_idx').on(t.tenant_id),
+  }),
+);
+
+// 040: admin_audit_log — APPEND-ONLY audit trail for admin-ui mutations
+// NEVER UPDATE/DELETE these rows. Constraint enforced at app + lint layer.
+export const admin_audit_log = pgTable(
+  'admin_audit_log',
+  {
+    id: bigserial('id', { mode: 'number' }).primaryKey(),
+    tenant_id: text('tenant_id').notNull(),
+    actor_id: text('actor_id').notNull(),
+    actor_role: text('actor_role').notNull(),
+    action: text('action').notNull(),
+    resource_type: text('resource_type').notNull(),
+    resource_id: text('resource_id'),
+    change_summary: jsonb('change_summary'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    tenantCreatedIdx: index('admin_audit_log_tenant_id_created_idx').on(t.tenant_id, t.created_at),
+    actorIdx: index('admin_audit_log_actor_id_idx').on(t.actor_id),
+    resourceIdx: index('admin_audit_log_resource_idx').on(t.resource_type, t.resource_id),
+  }),
+);
+
+// 041: debug_snapshot_grants — TTL-bounded access to runtime_trace_bodies
+export const debug_snapshot_grants = pgTable(
+  'debug_snapshot_grants',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    granted_to_user_id: text('granted_to_user_id').notNull(),
+    granted_by_user_id: text('granted_by_user_id').notNull(),
+    trace_id: uuid('trace_id').notNull(),
+    reason: text('reason').notNull(),
+    category: text('category'),
+    read_count: integer('read_count').notNull().default(0),
+    expires_at: timestamp('expires_at', { withTimezone: true }).notNull(),
+    revoked_at: timestamp('revoked_at', { withTimezone: true }),
+    revoked_by_user_id: text('revoked_by_user_id'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    expiresIdx: index('debug_snapshot_grants_expires_idx').on(t.expires_at),
+    tenantIdx: index('debug_snapshot_grants_tenant_id_idx').on(t.tenant_id),
+    grantedToIdx: index('debug_snapshot_grants_granted_to_idx').on(t.granted_to_user_id),
+    traceIdx: index('debug_snapshot_grants_trace_idx').on(t.trace_id),
+  }),
+);
+
 export type Entidade = typeof entidades.$inferSelect;
 export type Pessoa = typeof pessoas.$inferSelect;
 export type Permissao = typeof permissoes.$inferSelect;
@@ -1433,3 +1547,50 @@ export type ChannelPolicy = typeof channel_policies.$inferSelect;
 export type NewChannelPolicy = typeof channel_policies.$inferInsert;
 export type RoleSelectorDecisionRow = typeof role_selector_decisions.$inferSelect;
 export type NewRoleSelectorDecisionRow = typeof role_selector_decisions.$inferInsert;
+
+// =====================================================================
+// P8.5 Admin UI v1 — type exports + Zod schemas + governance enums
+// =====================================================================
+
+export type AppUser = typeof app_users.$inferSelect;
+export type NewAppUser = typeof app_users.$inferInsert;
+export type AppSession = typeof app_sessions.$inferSelect;
+export type NewAppSession = typeof app_sessions.$inferInsert;
+export type ProposalApproval = typeof proposal_approvals.$inferSelect;
+export type NewProposalApproval = typeof proposal_approvals.$inferInsert;
+export type AdminAuditLogEntry = typeof admin_audit_log.$inferSelect;
+export type NewAdminAuditLogEntry = typeof admin_audit_log.$inferInsert;
+export type DebugSnapshotGrant = typeof debug_snapshot_grants.$inferSelect;
+export type NewDebugSnapshotGrant = typeof debug_snapshot_grants.$inferInsert;
+
+// String literal unions for governance enums consumed by tRPC + admin-ui.
+// (Zod schemas live in src/admin-ui/lib/governance-schemas.ts to avoid
+// adding a Zod dependency at the db layer; values mirror those constants.)
+export type AdminUserRole = 'founder' | 'compliance_officer' | 'owner' | 'analyst' | 'viewer';
+
+export type ProposalTypeId =
+  | 'policy_rule'
+  | 'soul_bias'
+  | 'skill'
+  | 'capability_proposal'
+  | 'knowledge_proposal';
+
+export type RiskLevelId = 'low' | 'medium' | 'high' | 'critical';
+
+export type ApprovalClassId =
+  | 'policy_rule_soft_guidance'
+  | 'policy_rule_hard_limit'
+  | 'soul_bias_core_value'
+  | 'soul_bias_peripheral'
+  | 'skill_new_domain'
+  | 'skill_refinement'
+  | 'capability_safe_tool'
+  | 'capability_dangerous_tool'
+  | 'capability_side_effect'
+  | 'knowledge_rule'
+  | 'knowledge_guidance'
+  | 'knowledge_deprecated'
+  | 'identity_drift_correction'
+  | 'procedure_update';
+
+export type ProposalUnifiedStatus = 'proposed' | 'pending_review' | 'rejected' | 'activated';
