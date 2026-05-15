@@ -15,7 +15,7 @@ import {
   procedureDefinitionsRepo,
   operationalProfileVersionsRepo,
 } from '@/db/repositories.js';
-import type { Pessoa, Conversa, Mensagem, BehavioralHint, Role } from '@/db/schema.js';
+import type { Pessoa, Conversa, Mensagem, BehavioralHint, Role, ProcedureExecution } from '@/db/schema.js';
 import type { ResolvedPermission } from '@/governance/permissions.js';
 import { renderOperationalProfile, type RenderedProfile } from '@/identity/profile-renderer.js';
 import { fmtBR } from '@/lib/brazilian.js';
@@ -157,6 +157,25 @@ export function wrapGap(text: string): string {
   return `<gap>${sanitizeBlock(text)}</gap>`;
 }
 
+/**
+ * P83-C6 — wrap memory_entry content in <memory> tags so the LLM treats
+ * stored memory as data, not as instruction. Mirrors fact/rule/user_message
+ * wrappers; sanitization prevents tag-breakout injections.
+ */
+export function wrapMemory(text: string): string {
+  return `<memory>${sanitizeBlock(text)}</memory>`;
+}
+
+/**
+ * P83-C6 — wrap behavioral_hint text in <hint> tags. Hints are derived from
+ * observed conversations and so may carry user-supplied phrasing; treating
+ * them as data prevents a malicious user from poisoning hints to issue
+ * commands to the agent.
+ */
+export function wrapHint(text: string): string {
+  return `<hint>${sanitizeBlock(text)}</hint>`;
+}
+
 
 export type PromptContext = {
   pessoa: Pessoa;
@@ -168,7 +187,128 @@ export type PromptContext = {
   // (flag MULTI_CHANNEL OFF ou resolver não resolveu canal), prompt-builder
   // omite a seção "Modo operacional" e tudo se comporta como P0..P5.
   activeRole?: Role | null;
+  // PR #82 review (Superpowers Critical #4): role/channel ids plumbed
+  // through from core.ts so memory_entry filters can honor scope_type
+  // 'role' and 'channel'. Optional — when absent, role/channel-scoped
+  // memories simply don't surface.
+  current_role_id?: string | null;
+  current_channel_id?: string | null;
+  // PR #84 Minor #7: when core.ts already loaded the active procedure
+  // execution, pass it here to avoid a duplicate DB roundtrip in the
+  // prompt builder. `undefined` = caller didn't look (fall back to
+  // findActiveForConversa); `null` = caller looked and found nothing
+  // (skip the section).
+  activeExecution?: ProcedureExecution | null;
 };
+
+function isToolExecutionSummary(x: unknown): x is ToolExecutionSummary {
+  if (typeof x !== 'object' || x === null) return false;
+  const r = x as Record<string, unknown>;
+  return (
+    typeof r.tool_name === 'string' &&
+    typeof r.status === 'string' &&
+    (r.status === 'success' || r.status === 'error') &&
+    typeof r.result_summary === 'string' &&
+    typeof r.occurred_at === 'string'
+  );
+}
+
+function parseSummaries(ferramentas_chamadas: unknown): ToolExecutionSummary[] {
+  if (!Array.isArray(ferramentas_chamadas)) return [];
+  return ferramentas_chamadas.filter(isToolExecutionSummary);
+}
+
+type AssistantTurn = {
+  message: Mensagem;
+  summaries: ToolExecutionSummary[];
+};
+
+function collectPriorAssistantTurns(messages: Mensagem[], inboundId: string): AssistantTurn[] {
+  return messages
+    .filter((m) => m.direcao === 'out' && m.id !== inboundId)
+    .map((m) => ({ message: m, summaries: parseSummaries(m.ferramentas_chamadas) }));
+}
+
+function selectEventsForBlock(
+  turns: AssistantTurn[],
+  now: number,
+): ToolExecutionSummary[] {
+  const successOnly: ToolExecutionSummary[] = [];
+  for (const t of turns) {
+    for (const s of t.summaries) {
+      if (s.status !== 'success') continue;
+      const occurredMs = Date.parse(s.occurred_at);
+      if (!Number.isFinite(occurredMs)) continue;
+      if (now - occurredMs > EVENTS_BLOCK_WINDOW_MS) continue;
+      successOnly.push(s);
+    }
+  }
+
+  // Most recent first, side-effect priority (write/communication > read).
+  const priorityRank = (s: ToolExecutionSummary): number => {
+    if (s.side_effect === 'write' || s.side_effect === 'communication') return 0;
+    if (s.side_effect === 'read') return 1;
+    return 2;
+  };
+  successOnly.sort((a, b) => {
+    const r = priorityRank(a) - priorityRank(b);
+    if (r !== 0) return r;
+    return Date.parse(b.occurred_at) - Date.parse(a.occurred_at);
+  });
+
+  return successOnly.slice(0, EVENTS_BLOCK_MAX_ITEMS);
+}
+
+function renderEventsBlock(events: ToolExecutionSummary[]): string {
+  if (events.length === 0) return '';
+  const lines = events.map((e) => {
+    const keys = e.result_keys
+      ? Object.entries(e.result_keys)
+          .map(([k, v]) => `${k}=${Array.isArray(v) ? v.join(',') : String(v)}`)
+          .join(' ')
+      : '';
+    const suffix = keys ? ` [${keys}]` : '';
+    return `- ${e.tool_name} (${e.side_effect ?? 'none'}, success): ${e.result_summary}${suffix}`;
+  });
+  return ['## Eventos confirmados pelo backend', ...lines].join('\n');
+}
+
+function detectContradictions(turns: AssistantTurn[]): ToolExecutionSummary[] {
+  const overlays: ToolExecutionSummary[] = [];
+  for (const t of turns) {
+    const text = t.message.conteudo ?? '';
+    if (!text) continue;
+    if (!FAILURE_PHRASE_RE.test(text)) continue;
+    // Self-correction guard (Superpowers I2): if the same message also
+    // contains a positive-confirmation phrase, treat the failure phrase as
+    // a self-correction the agent already issued, NOT a contradiction.
+    if (POSITIVE_CONFIRMATION_RE.test(text)) continue;
+    for (const s of t.summaries) {
+      if (s.status !== 'success') continue;
+      if (s.side_effect !== 'write' && s.side_effect !== 'communication') continue;
+      const kws = DOMAIN_KEYWORDS[s.tool_name];
+      if (!kws || kws.length === 0) continue;
+      const lower = text.toLowerCase();
+      const matched = kws.some((kw) => lower.includes(kw.toLowerCase()));
+      if (matched) overlays.push(s);
+    }
+  }
+  return overlays;
+}
+
+function renderContradictionOverlay(overlays: ToolExecutionSummary[]): string {
+  if (overlays.length === 0) return '';
+  const items = overlays.map(
+    (s) =>
+      `- ${s.tool_name} (${s.side_effect}): ${s.result_summary}. Sua afirmação contraditória anterior está obsoleta.`,
+  );
+  return [
+    '## ⚠ Conflito detectado em turno anterior',
+    'Você escreveu uma mensagem de falha, mas o backend confirmou sucesso para a(s) tool(s) abaixo.',
+    'Trate a afirmação contraditória anterior como inválida. A verdade é o evento do backend:',
+    ...items,
+  ].join('\n');
+}
 
 /**
  * P6 Task 9 — Renderiza a seção "## Modo operacional" no system prompt.
@@ -500,7 +640,25 @@ ${stateJson}`;
     // Degrade gracefully — gap mention é não-essencial ao turno.
   }
 
-  const system = [
+  // Issue #73 — scope-change sentinel + backend events + contradiction overlay.
+  // These three blocks are computed once and injected at fixed positions in
+  // the system prompt below.
+  const priorAssistantTurns = collectPriorAssistantTurns(recent, ctx.inbound.id);
+  const currScopeHash = hashScope(ctx.scope);
+  const meta = (ctx.conversa.metadata ?? {}) as Record<string, unknown>;
+  const lastScopeHash = typeof meta.last_scope_hash === 'string' ? meta.last_scope_hash : null;
+  const scopeChanged =
+    lastScopeHash !== null && lastScopeHash !== currScopeHash && priorAssistantTurns.length > 0;
+  const scopeSentinelBlock = scopeChanged ? SCOPE_SENTINEL : '';
+
+  const nowMs = ctx.inbound.created_at?.getTime() ?? Date.now();
+  const events = selectEventsForBlock(priorAssistantTurns, nowMs);
+  const eventsBlock = renderEventsBlock(events);
+
+  const overlays = detectContradictions(priorAssistantTurns);
+  const overlayBlock = renderContradictionOverlay(overlays);
+
+  const systemSections: string[] = [
     systemPromptBody || 'Você é a Maia.',
     '',
     '## LLM Boundaries',

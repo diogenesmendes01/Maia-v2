@@ -1359,6 +1359,15 @@ export type ProcedureTest = typeof procedure_tests.$inferSelect;
 export type NewProcedureTest = typeof procedure_tests.$inferInsert;
 export type ProcedureMetric = typeof procedure_metrics.$inferSelect;
 export type ProcedureStatusEvent = typeof procedure_status_events.$inferSelect;
+// Scheduling v2 aliases — table names are plural, type aliases are singular.
+export type Series = typeof series.$inferSelect;
+export type SeriesInsert = typeof series.$inferInsert;
+export type Occurrence = typeof occurrences.$inferSelect;
+export type OccurrenceInsert = typeof occurrences.$inferInsert;
+export type Task = typeof tasks.$inferSelect;
+export type TaskInsert = typeof tasks.$inferInsert;
+export type OutboxMessage = typeof outbox_messages.$inferSelect;
+export type OutboxMessageInsert = typeof outbox_messages.$inferInsert;
 
 // Subset of procedure_definitions columns mutable by the status transition
 // engine. Kept narrow on purpose so callers cannot accidentally update
