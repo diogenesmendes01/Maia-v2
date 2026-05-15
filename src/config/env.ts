@@ -134,30 +134,11 @@ const envSchema = z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
-    // Spec 18 — Scheduling V2 (series/occurrences/tasks/outbox). When off,
-    // the scheduling workers and start_recurring_* tools are inert; the
-    // schedule_reminder tool still works because it just writes a series
-    // row, but no firing happens. Default off — production rollout per §12.
-    FEATURE_SCHEDULING_V2: z
+    // P4 — identidade operacional v2 (perfil versionado + drift detector)
+    FEATURE_OPERATIONAL_PROFILE_V2: z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
-    // Outbox drain backpressure — spec 18 §7.2. Defaults are conservative;
-    // tune per WhatsApp account standing.
-    OUTBOX_MAX_PER_SECOND: z.coerce.number().positive().default(1),
-    OUTBOX_MAX_PER_HOUR: z.coerce.number().int().positive().default(600),
-    OUTBOX_WORKER_CONCURRENCY: z.coerce.number().int().positive().default(4),
-    OUTBOX_LEASE_TTL_SECONDS: z.coerce.number().int().positive().default(300),
-    OCCURRENCE_LEASE_TTL_SECONDS: z.coerce.number().int().positive().default(300),
-    // Spec 18 §7.2 backpressure cadence (Blocker 4, review 2):
-    // outbox-drain is a cron job firing once per minute, but the rate
-    // gate is per-second. Without a loop inside one firing, only ~1 msg
-    // per minute drains regardless of OUTBOX_MAX_PER_SECOND. We loop
-    // up to this many passes within one tick, sleeping ~1s between
-    // when rate-limited, so 10k backlog drains at the configured rate.
-    // Set to 1 in tests for predictable behaviour.
-    OUTBOX_DRAIN_LOOP_PASSES: z.coerce.number().int().positive().default(55),
-    OUTBOX_DRAIN_LOOP_SLEEP_MS: z.coerce.number().int().nonnegative().default(1000),
     // Message debounce: hold incoming text messages from the same user for a
     // short window so chunked typing ("Oi, " / "como está " / "a finança?")
     // arrives at the LLM as a single coherent turn. Off by default — when on,

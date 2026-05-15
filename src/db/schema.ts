@@ -1045,6 +1045,81 @@ export const procedure_metrics = pgMaterializedView('procedure_metrics', {
   refreshed_at: timestamp('refreshed_at', { withTimezone: true }).notNull(),
 }).existing();
 
+// P4: agent_operational_profile_versions — append-only, 1 JSONB `profile_body`
+// (v3.1.1: { schema_version, identity{...}, style{...}, metadata{...} }) +
+// status (proposed | active | frozen | rolled_back). Apenas a row `active` por
+// (tenant_id, agent_id) entra em runtime — esse invariante é garantido pelo
+// unique index parcial `agent_op_profile_unique_active_idx` declarado em
+// migrations/025 (Drizzle não expressa WHERE em uniqueIndex; a DB enforce).
+export const agent_operational_profile_versions = pgTable(
+  'agent_operational_profile_versions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    version: integer('version').notNull(),
+    status: text('status').notNull(),
+    profile_body: jsonb('profile_body').notNull().default(sql`'{}'::jsonb`),
+    // shape: { schema_version, identity{...}, style{...}, metadata{...} } — ver migration 025
+    proposed_by: text('proposed_by').notNull(),
+    proposed_reason: text('proposed_reason'),
+    approved_by: text('approved_by'),
+    approved_at: timestamp('approved_at', { withTimezone: true }),
+    activated_at: timestamp('activated_at', { withTimezone: true }),
+    frozen_at: timestamp('frozen_at', { withTimezone: true }),
+    rolled_back_at: timestamp('rolled_back_at', { withTimezone: true }),
+    rollback_reason: text('rollback_reason'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    tenantAgentStatusIdx: index('agent_op_profile_tenant_agent_status_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.status,
+      t.version,
+    ),
+    versionUq: uniqueIndex('agent_op_profile_version_uq').on(t.tenant_id, t.agent_id, t.version),
+  }),
+);
+
+// P4: agent_drift_alerts — audit das execuções do drift detector.
+// Cada alert = 1 tipo de drift detectado (7 tipos: tom, valores, confianca,
+// vies, escopo, linguagem, procedimento) × 4 severidades (baixo, medio, alto,
+// critico) × decisão (auto_approved, queued_human, frozen, rollback). A FK
+// para agent_operational_profile_versions é opcional porque um drift pode ser
+// detectado antes de uma nova versão de perfil ser proposta. Constraints CHECK
+// e o partial index `agent_drift_unresolved_idx` ficam só na DB (migrações/026);
+// Drizzle não expressa WHERE em index().
+export const agent_drift_alerts = pgTable(
+  'agent_drift_alerts',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    profile_version_id: uuid('profile_version_id'),
+    drift_type: text('drift_type').notNull(),
+    severity: text('severity').notNull(),
+    evidence: jsonb('evidence').notNull().default(sql`'{}'::jsonb`),
+    detected_by: text('detected_by').notNull(),
+    decision: text('decision').notNull(),
+    decided_at: timestamp('decided_at', { withTimezone: true }).notNull().defaultNow(),
+    decided_by: text('decided_by').notNull(),
+    resolution_note: text('resolution_note'),
+    resolved_at: timestamp('resolved_at', { withTimezone: true }),
+    resolved_by: text('resolved_by'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    tenantAgentSeverityIdx: index('agent_drift_tenant_agent_severity_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.severity,
+      t.created_at,
+    ),
+    profileVersionIdx: index('agent_drift_profile_version_idx').on(t.profile_version_id),
+  }),
+);
+
 export type Entidade = typeof entidades.$inferSelect;
 export type Pessoa = typeof pessoas.$inferSelect;
 export type Permissao = typeof permissoes.$inferSelect;
@@ -1087,3 +1162,41 @@ export type ProcedureSelectorDecision = typeof procedure_selector_decisions.$inf
 export type ProcedureTest = typeof procedure_tests.$inferSelect;
 export type NewProcedureTest = typeof procedure_tests.$inferInsert;
 export type ProcedureMetric = typeof procedure_metrics.$inferSelect;
+export type AgentOperationalProfileVersion = typeof agent_operational_profile_versions.$inferSelect;
+export type NewAgentOperationalProfileVersion = typeof agent_operational_profile_versions.$inferInsert;
+
+// Single source of truth for the ProfileBody schema version literal.
+// Bump this constant when introducing a new ProfileBody shape (e.g., v3.1.2).
+export const PROFILE_BODY_SCHEMA_VERSION = 'v3.1.1-2026-05-15' as const;
+export type ProfileBodySchemaVersion = typeof PROFILE_BODY_SCHEMA_VERSION;
+
+// Tipo estrutural do JSONB `profile_body` (v3.1.1)
+export interface ProfileBody {
+  schema_version: ProfileBodySchemaVersion;
+  identity: {
+    role_descriptor: string;
+    voice: {
+      tone: string;
+      formality: 'low' | 'medium' | 'high';
+      verbosity: 'concise' | 'medium' | 'detailed';
+    };
+    cognitive_limits: {
+      max_inference_depth: number;
+      max_speculation_in_response: number;
+      confidence_floor_for_action: number;
+    };
+    priorities: string[];
+    learned_voice_modifiers: unknown[];
+  };
+  style: {
+    language: string;
+    rhythm: Record<string, unknown>;
+  };
+  metadata: {
+    effective_from: string;
+    created_by: string;
+    previous_version_id: string | null;
+  };
+}
+export type AgentDriftAlert = typeof agent_drift_alerts.$inferSelect;
+export type NewAgentDriftAlert = typeof agent_drift_alerts.$inferInsert;

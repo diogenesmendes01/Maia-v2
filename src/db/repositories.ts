@@ -38,10 +38,13 @@ import {
   procedure_selector_decisions,
   procedure_tests,
   procedure_metrics,
+  agent_operational_profile_versions,
+  agent_drift_alerts,
 } from './schema.js';
 import { TypedError } from '@/lib/utils.js';
 import { applyTenantGuard } from './tenant-guard.js';
 import { getCurrentTenant, getCurrentAgent } from './tenant-context.js';
+import type { ProfileStatus, DriftType, DriftSeverity, DriftDecision } from '@/types/enums.js';
 import type {
   Pessoa,
   Permissao,
@@ -77,6 +80,9 @@ import type {
   ProcedureSelectorDecision,
   ProcedureTest,
   ProcedureMetric,
+  AgentOperationalProfileVersion,
+  ProfileBody,
+  AgentDriftAlert,
 } from './schema.js';
 
 export type EntityScope = {
@@ -2423,5 +2429,288 @@ export const procedureMetricsRepo = {
         eq(procedure_metrics.tenant_id, tenant_id),
         eq(procedure_metrics.agent_id, agent_id),
       ));
+  },
+};
+
+// P4: agent_operational_profile_versions — append-only, profile_body JSONB
+// (v3.1.1, 3 namespaces: identity/style/metadata), status
+// (proposed | active | frozen | rolled_back). Apenas a row `active` por
+// (tenant_id, agent_id) entra em runtime (enforced pelo partial unique index
+// agent_op_profile_unique_active_idx em migrations/025). Esse repo expõe um
+// state machine de transição com guard `already_has_active` em código (defesa
+// em profundidade), além da UQ no SQL.
+//
+// Regras:
+//   create() — sempre status='proposed'. Nunca aceita 'active' direto.
+//   transition() — proposed → active|frozen|rolled_back
+//                  active   → frozen|rolled_back
+//                  frozen   → active|rolled_back
+//                  rolled_back — terminal
+//                  to:'active' verifica que não há outro active para
+//                  (tenant, agent) e retorna { ok:false, reason:'already_has_active' }.
+export const operationalProfileVersionsRepo = {
+  async create(input: {
+    profile_body: ProfileBody;
+    proposed_by: string;
+    proposed_reason?: string;
+  }): Promise<AgentOperationalProfileVersion> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const version = await operationalProfileVersionsRepo.nextVersion();
+    const guarded = applyTenantGuard({
+      version,
+      status: 'proposed',
+      profile_body: input.profile_body,
+      proposed_by: input.proposed_by,
+      proposed_reason: input.proposed_reason ?? null,
+    });
+    // tenant_id/agent_id são injetados pelo applyTenantGuard. Os types do
+    // Drizzle agora alinham naturalmente com o $inferInsert da tabela (1
+    // coluna JSONB `profile_body` em vez das 4 legacy) — sem cast necessário.
+    void tenant_id;
+    void agent_id;
+    const [row] = await db
+      .insert(agent_operational_profile_versions)
+      .values(guarded)
+      .returning();
+    return row!;
+  },
+
+  async getActive(): Promise<AgentOperationalProfileVersion | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(agent_operational_profile_versions)
+      .where(
+        and(
+          eq(agent_operational_profile_versions.tenant_id, tenant_id),
+          eq(agent_operational_profile_versions.agent_id, agent_id),
+          eq(agent_operational_profile_versions.status, 'active'),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  async getById(id: string): Promise<AgentOperationalProfileVersion | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(agent_operational_profile_versions)
+      .where(
+        and(
+          eq(agent_operational_profile_versions.tenant_id, tenant_id),
+          eq(agent_operational_profile_versions.agent_id, agent_id),
+          eq(agent_operational_profile_versions.id, id),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  async listByStatus(status: ProfileStatus): Promise<AgentOperationalProfileVersion[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(agent_operational_profile_versions)
+      .where(
+        and(
+          eq(agent_operational_profile_versions.tenant_id, tenant_id),
+          eq(agent_operational_profile_versions.agent_id, agent_id),
+          eq(agent_operational_profile_versions.status, status),
+        ),
+      )
+      .orderBy(desc(agent_operational_profile_versions.version));
+  },
+
+  // Validated state-machine transition. Retorna typed result, sem throw.
+  // - not_found:           id desconhecido
+  // - terminal:            row já está rolled_back (terminal)
+  // - invalid_transition:  destino não permitido a partir do source ou same-state
+  // - already_has_active:  to:'active' mas outra row ativa existe para (tenant,agent)
+  async transition(args: {
+    id: string;
+    to: ProfileStatus;
+    approved_by?: string;
+    rollback_reason?: string;
+  }): Promise<
+    | { ok: true; updated: AgentOperationalProfileVersion }
+    | { ok: false; reason: 'not_found' | 'invalid_transition' | 'already_has_active' | 'terminal' }
+  > {
+    const row = await operationalProfileVersionsRepo.getById(args.id);
+    if (!row) return { ok: false, reason: 'not_found' };
+
+    const from = row.status as ProfileStatus;
+    if (from === 'rolled_back') return { ok: false, reason: 'terminal' };
+    if (from === args.to) return { ok: false, reason: 'invalid_transition' };
+
+    const allowed: Record<string, readonly string[]> = {
+      proposed: ['active', 'frozen', 'rolled_back'],
+      active: ['frozen', 'rolled_back'],
+      frozen: ['active', 'rolled_back'],
+    };
+    if (!allowed[from]?.includes(args.to)) {
+      return { ok: false, reason: 'invalid_transition' };
+    }
+
+    if (args.to === 'active') {
+      const active = await operationalProfileVersionsRepo.getActive();
+      if (active && active.id !== row.id) {
+        return { ok: false, reason: 'already_has_active' };
+      }
+    }
+
+    const now = new Date();
+    const patch: Record<string, unknown> = { status: args.to };
+    if (args.to === 'active') {
+      // approved_at é definido na primeira vez que se aprova; re-ativações
+      // a partir de frozen preservam o approved_at original.
+      if (!row.approved_at) {
+        patch.approved_at = now;
+        if (args.approved_by) patch.approved_by = args.approved_by;
+      }
+      patch.activated_at = now;
+    } else if (args.to === 'frozen') {
+      patch.frozen_at = now;
+    } else if (args.to === 'rolled_back') {
+      patch.rolled_back_at = now;
+      patch.rollback_reason = args.rollback_reason ?? null;
+    }
+
+    // [P86-C3] tenant-scoped write predicate: even though `getById` above
+    // already filtered by tenant_id/agent_id, the actual UPDATE must
+    // include them in WHERE as defense-in-depth (an alert UUID alone is
+    // not enough authorization to mutate identity in a different tenant
+    // context). This is the inviolable tenant isolation invariant.
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const [updated] = await db
+      .update(agent_operational_profile_versions)
+      .set(patch as Partial<typeof agent_operational_profile_versions.$inferInsert>)
+      .where(
+        and(
+          eq(agent_operational_profile_versions.id, args.id),
+          eq(agent_operational_profile_versions.tenant_id, tenant_id),
+          eq(agent_operational_profile_versions.agent_id, agent_id),
+        ),
+      )
+      .returning();
+    if (!updated) {
+      // Could only happen if tenant context changed between the read above
+      // and the update — treat as not_found to keep the contract.
+      return { ok: false, reason: 'not_found' };
+    }
+    return { ok: true, updated };
+  },
+
+  // Próxima version sequencial para (tenant_id, agent_id) corrente.
+  // MAX(version) + 1, ou 1 quando não existe versão ainda.
+  async nextVersion(): Promise<number> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const result = await db.execute<{ max: number | null }>(sql`
+      SELECT MAX(version) AS max
+        FROM agent_operational_profile_versions
+       WHERE tenant_id = ${tenant_id}
+         AND agent_id = ${agent_id}
+    `);
+    const max = result.rows[0]?.max ?? null;
+    return max == null ? 1 : Number(max) + 1;
+  },
+};
+
+// P4: agent_drift_alerts — audit das execuções do drift detector.
+// Cada alert = 1 evento (drift_type, severity, decision) + evidência + audit
+// trail (decided_by, resolved_by, resolution_note). FK opcional para
+// agent_operational_profile_versions porque drifts podem ser detectados antes
+// de uma nova versão de perfil ser proposta.
+export const driftAlertsRepo = {
+  async create(input: {
+    profile_version_id?: string;
+    drift_type: DriftType;
+    severity: DriftSeverity;
+    evidence: unknown;
+    detected_by: string;
+    decision: DriftDecision;
+    decided_by: string;
+  }): Promise<AgentDriftAlert> {
+    const guarded = applyTenantGuard({
+      profile_version_id: input.profile_version_id ?? null,
+      drift_type: input.drift_type,
+      severity: input.severity,
+      evidence: input.evidence as object,
+      detected_by: input.detected_by,
+      decision: input.decision,
+      decided_by: input.decided_by,
+    });
+    const [row] = await db
+      .insert(agent_drift_alerts)
+      .values(guarded as typeof agent_drift_alerts.$inferInsert)
+      .returning();
+    return row!;
+  },
+
+  async listUnresolved(): Promise<AgentDriftAlert[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(agent_drift_alerts)
+      .where(
+        and(
+          eq(agent_drift_alerts.tenant_id, tenant_id),
+          eq(agent_drift_alerts.agent_id, agent_id),
+          isNull(agent_drift_alerts.resolved_at),
+        ),
+      )
+      .orderBy(desc(agent_drift_alerts.created_at));
+  },
+
+  async listByProfileVersion(profile_version_id: string): Promise<AgentDriftAlert[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(agent_drift_alerts)
+      .where(
+        and(
+          eq(agent_drift_alerts.tenant_id, tenant_id),
+          eq(agent_drift_alerts.agent_id, agent_id),
+          eq(agent_drift_alerts.profile_version_id, profile_version_id),
+        ),
+      )
+      .orderBy(desc(agent_drift_alerts.created_at));
+  },
+
+  // [P86-C3] tenant-scoped: includes tenant_id AND agent_id predicates in
+  // the UPDATE so an alert UUID from another tenant cannot be resolved from
+  // the wrong context. Returns { ok, found } so callers can detect a
+  // forbidden/missing target without silently no-op'ing.
+  async resolve(args: {
+    id: string;
+    resolution_note: string;
+    resolved_by: string;
+  }): Promise<{ ok: boolean; found: boolean }> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const updated = await db
+      .update(agent_drift_alerts)
+      .set({
+        resolution_note: args.resolution_note,
+        resolved_at: new Date(),
+        resolved_by: args.resolved_by,
+      })
+      .where(
+        and(
+          eq(agent_drift_alerts.id, args.id),
+          eq(agent_drift_alerts.tenant_id, tenant_id),
+          eq(agent_drift_alerts.agent_id, agent_id),
+        ),
+      )
+      .returning({ id: agent_drift_alerts.id });
+    return { ok: updated.length > 0, found: updated.length > 0 };
   },
 };
