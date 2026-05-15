@@ -1,5 +1,6 @@
 import { procedureDefinitionsRepo, procedureTestsRepo } from '@/db/repositories.js';
-import type { ProcedureDefinition, ProcedureTest } from '@/db/schema.js';
+import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
+import type { ProcedureDefinition, ProcedureStatusUpdate, ProcedureTest } from '@/db/schema.js';
 
 export type ProcedureStatus = 'draft' | 'proposed' | 'active' | 'frozen' | 'rolled_back';
 
@@ -67,49 +68,26 @@ export async function transitionProcedureStatus(args: {
   getCurrentAgent();
 
   if (args.to === 'active') {
+    // P3c gate: proposed → active requires green tests. Fires ONLY on
+    // proposed → active; other transitions to active (e.g., frozen → active
+    // re-activation by an operator) bypass the gate.
+    if (args.definition.status === 'proposed') {
+      const tests = await procedureTestsRepo.listByDefinition(args.definition.id);
+      if (tests.length === 0) {
+        return { ok: false, reason: 'tests_required', missing_tests: true };
+      }
+      const failing = tests.filter((t) => t.last_run_status !== 'pass');
+      if (failing.length > 0) {
+        return { ok: false, reason: 'tests_not_passing', failing_tests: failing };
+      }
+    }
     // Atomic path: locking + freeze-previous + event log in one tx.
-    await procedureDefinitionsRepo.atomicActivate({
+    const { activated } = await procedureDefinitionsRepo.atomicActivate({
       target_id: args.definition.id,
       actor: args.actor,
       preserve_activated_at: true,
     });
-    return;
-  }
-
-  // P3c gate: proposed → active requires green tests.
-  if (args.definition.status === 'proposed' && args.to === 'active') {
-    const tests = await procedureTestsRepo.listByDefinition(args.definition.id);
-    if (tests.length === 0) {
-      return { ok: false, reason: 'tests_required', missing_tests: true };
-    }
-    const failing = tests.filter((t) => t.last_run_status !== 'pass');
-    if (failing.length > 0) {
-      return { ok: false, reason: 'tests_not_passing', failing_tests: failing };
-    }
-  }
-
-  // P3c gate: proposed → active requires green tests.
-  if (args.definition.status === 'proposed' && args.to === 'active') {
-    const tests = await procedureTestsRepo.listByDefinition(args.definition.id);
-    if (tests.length === 0) {
-      return { ok: false, reason: 'tests_required', missing_tests: true };
-    }
-    const failing = tests.filter((t) => t.last_run_status !== 'pass');
-    if (failing.length > 0) {
-      return { ok: false, reason: 'tests_not_passing', failing_tests: failing };
-    }
-  }
-
-  // P3c gate: proposed → active requires green tests.
-  if (args.definition.status === 'proposed' && args.to === 'active') {
-    const tests = await procedureTestsRepo.listByDefinition(args.definition.id);
-    if (tests.length === 0) {
-      return { ok: false, reason: 'tests_required', missing_tests: true };
-    }
-    const failing = tests.filter((t) => t.last_run_status !== 'pass');
-    if (failing.length > 0) {
-      return { ok: false, reason: 'tests_not_passing', failing_tests: failing };
-    }
+    return { ok: true, definition: activated };
   }
 
   const now = new Date();

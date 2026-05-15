@@ -19,8 +19,16 @@ type OpProfile = { voice_descriptor?: string };
 export const tomDetector: DriftDetector = {
   type: DriftType.TOM,
   async detect(input: DriftDetectionInput): Promise<DriftEvidence | null> {
-    const core = (input.profile_active.core_immutable ?? {}) as CoreImmutable;
-    const op = (input.profile_active.operational_profile ?? {}) as OpProfile;
+    // TODO(v3.1.1 migration): the schema collapsed core_immutable + operational_profile
+    // into a single `profile_body` JSONB. The detectors still read the legacy
+    // shape — read from `profile_body` (cast as legacy-compatible) until they
+    // are migrated to consume the new identity/style/metadata structure.
+    const legacy = (input.profile_active as unknown) as {
+      core_immutable?: CoreImmutable;
+      operational_profile?: OpProfile;
+    };
+    const core = (legacy.core_immutable ?? {}) as CoreImmutable;
+    const op = (legacy.operational_profile ?? {}) as OpProfile;
     const agentMessages = input.recent_messages.filter((m) => m.from === 'agent');
     if (agentMessages.length === 0) return null;
 

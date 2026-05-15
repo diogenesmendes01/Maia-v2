@@ -21,7 +21,8 @@
  */
 import { readFile } from 'node:fs/promises';
 import { operationalProfileVersionsRepo } from '@/db/repositories.js';
-import type { AgentOperationalProfileVersion, SelfState } from '@/db/schema.js';
+import type { AgentOperationalProfileVersion, ProfileBody, SelfState } from '@/db/schema.js';
+import { PROFILE_BODY_SCHEMA_VERSION } from '@/db/schema.js';
 
 export type ProposalGeneratorResult =
   | { created: true; version: AgentOperationalProfileVersion }
@@ -70,11 +71,36 @@ export async function seedInitialOperationalProfile(args?: {
   const growth_backlog: unknown[] = [];
 
   // 4. Two-step seed: create defaults a proposed, depois transitiona pra active.
-  const created = await operationalProfileVersionsRepo.create({
+  // TODO(v3.1.1 migration): the legacy 4-layer shape (core_immutable +
+  // operational_profile + episodic_temp + growth_backlog) was collapsed into
+  // `profile_body`. We pack the legacy fields into profile_body via a non-
+  // standard extension so existing renderer/detector code (which still reads
+  // the legacy keys) keeps working at runtime. When all consumers move to the
+  // new identity/style/metadata structure, this generator becomes the source
+  // of truth for the migration.
+  const profile_body = {
+    schema_version: PROFILE_BODY_SCHEMA_VERSION,
+    identity: {
+      role_descriptor: core_immutable.identity_block,
+      voice: { tone: '', formality: 'medium' as const, verbosity: 'medium' as const },
+      cognitive_limits: {
+        max_inference_depth: 0,
+        max_speculation_in_response: 0,
+        confidence_floor_for_action: 0,
+      },
+      priorities: principles,
+      learned_voice_modifiers: [],
+    },
+    style: { language: 'pt-BR', rhythm: {} },
+    metadata: { effective_from: new Date().toISOString(), created_by: 'system_seed', previous_version_id: null },
+    // legacy mirror for renderer/detector consumers (TODO migrate)
     core_immutable,
     operational_profile,
     episodic_temp,
     growth_backlog,
+  } as unknown as ProfileBody;
+  const created = await operationalProfileVersionsRepo.create({
+    profile_body,
     proposed_by: 'system_seed',
     proposed_reason: 'initial seed from self_state + maia-prompt.md',
   });

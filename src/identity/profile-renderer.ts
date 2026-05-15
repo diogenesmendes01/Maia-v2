@@ -58,10 +58,20 @@ export function renderOperationalProfile({
 }: {
   version: AgentOperationalProfileVersion;
 }): RenderedProfile {
-  const core = (version.core_immutable ?? {}) as CoreImmutable;
-  const op = (version.operational_profile ?? {}) as OperationalProfileLayer;
-  const ep = (version.episodic_temp ?? {}) as EpisodicTemp;
-  const bk = (version.growth_backlog ?? {}) as GrowthBacklog;
+  // TODO(v3.1.1 migration): the schema collapsed core_immutable +
+  // operational_profile + episodic_temp + growth_backlog into a single
+  // `profile_body` JSONB. The renderer still consumes the legacy shape;
+  // when migrated, read from `version.profile_body` (typed as ProfileBody).
+  const legacy = (version as unknown) as {
+    core_immutable?: CoreImmutable;
+    operational_profile?: OperationalProfileLayer;
+    episodic_temp?: EpisodicTemp;
+    growth_backlog?: GrowthBacklog;
+  };
+  const core = (legacy.core_immutable ?? {}) as CoreImmutable;
+  const op = (legacy.operational_profile ?? {}) as OperationalProfileLayer;
+  const ep = (legacy.episodic_temp ?? {}) as EpisodicTemp;
+  const bk = (legacy.growth_backlog ?? {}) as GrowthBacklog;
 
   // ---- system_prompt_block (sempre presente, nunca null) -------------------
   const lines: string[] = [];

@@ -18,7 +18,9 @@ type CoreImmutable = { principles?: string[] };
 export const valoresDetector: DriftDetector = {
   type: DriftType.VALORES,
   async detect(input: DriftDetectionInput): Promise<DriftEvidence | null> {
-    const core = (input.profile_active.core_immutable ?? {}) as CoreImmutable;
+    // TODO(v3.1.1 migration): legacy `core_immutable` shape — see tom.ts comment.
+    const legacy = (input.profile_active as unknown) as { core_immutable?: CoreImmutable };
+    const core = (legacy.core_immutable ?? {}) as CoreImmutable;
     const principles = Array.isArray(core.principles) ? core.principles : [];
     if (principles.length === 0) return null;
 

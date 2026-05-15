@@ -23,7 +23,11 @@ type OpProfile = { voice_descriptor?: string };
 export const linguagemDetector: DriftDetector = {
   type: DriftType.LINGUAGEM,
   async detect(input: DriftDetectionInput): Promise<DriftEvidence | null> {
-    const op = (input.profile_active.operational_profile ?? {}) as OpProfile;
+    // TODO(v3.1.1 migration): the schema collapsed core_immutable + operational_profile
+    // into a single `profile_body` JSONB. Read via legacy-shaped cast until the
+    // detector consumes the new identity/style/metadata structure.
+    const legacy = (input.profile_active as unknown) as { operational_profile?: OpProfile };
+    const op = (legacy.operational_profile ?? {}) as OpProfile;
     const agentMessages = input.recent_messages.filter((m) => m.from === 'agent');
     if (agentMessages.length === 0) return null;
 
