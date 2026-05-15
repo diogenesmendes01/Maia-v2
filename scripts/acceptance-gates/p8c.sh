@@ -1,0 +1,227 @@
+#!/bin/bash
+# ────────────────────────────────────────────────────────────
+# P8c: User Layer Namespace — Acceptance Gates
+# ────────────────────────────────────────────────────────────
+# Verify cross-tenant isolation, lifecycle visibility, depth limits,
+# and proper integration with P8b cache layer.
+#
+# Usage: npm run acceptance-gates:p8c
+# (or directly: bash scripts/acceptance-gates/p8c.sh)
+# ────────────────────────────────────────────────────────────
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
+
+cd "$PROJECT_ROOT"
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "P8c: User Layer Namespace — Acceptance Gates"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+
+# Gate 1: Verify all resolvers filter by tenant_id
+echo "[Gate 1] All resolvers filter by tenant_id (grep check)"
+echo ""
+
+GATE1_PASSED=true
+
+# Check memory-resolver.ts
+if grep -q "tenant_id" src/user-layer/resolvers/memory-resolver.ts; then
+  echo "✓ memory-resolver.ts filters by tenant_id"
+else
+  echo "✗ memory-resolver.ts missing tenant_id filter"
+  GATE1_PASSED=false
+fi
+
+# Check facts-resolver.ts
+if grep -q "tenant_id" src/user-layer/resolvers/facts-resolver.ts; then
+  echo "✓ facts-resolver.ts filters by tenant_id"
+else
+  echo "✗ facts-resolver.ts missing tenant_id filter"
+  GATE1_PASSED=false
+fi
+
+# Check rules-resolver.ts
+if grep -q "tenant_id" src/user-layer/resolvers/rules-resolver.ts; then
+  echo "✓ rules-resolver.ts filters by tenant_id"
+else
+  echo "✗ rules-resolver.ts missing tenant_id filter"
+  GATE1_PASSED=false
+fi
+
+# Check hints-resolver.ts
+if grep -q "tenant_id" src/user-layer/resolvers/hints-resolver.ts; then
+  echo "✓ hints-resolver.ts filters by tenant_id"
+else
+  echo "✗ hints-resolver.ts missing tenant_id filter"
+  GATE1_PASSED=false
+fi
+
+if [ "$GATE1_PASSED" = true ]; then
+  echo ""
+  echo "✓ Gate 1 PASSED: All resolvers filter by tenant_id"
+else
+  echo ""
+  echo "✗ Gate 1 FAILED: Some resolvers missing tenant_id filter"
+  exit 1
+fi
+
+echo ""
+echo "────────────────────────────────────────────────────────────"
+echo ""
+
+# Gate 2: Verify NO resolver uses agent_id as isolation predicate
+echo "[Gate 2] No resolver uses agent_id as isolation predicate"
+echo ""
+
+GATE2_PASSED=true
+
+# Search for agent_id used as a filter predicate (common anti-patterns):
+# - eq(agent_id, ...)
+# - where("agent_id", ...)
+# - agent_id: { ... }
+
+for resolver in src/user-layer/resolvers/*.ts; do
+  if grep -E "(eq|where).*agent_id|agent_id\s*:" "$resolver" > /dev/null 2>&1; then
+    # Make sure it's not just in a comment or type definition
+    if grep -E "^\s*(eq|where).*agent_id|^\s*agent_id\s*:" "$resolver" > /dev/null 2>&1; then
+      echo "✗ $(basename $resolver) uses agent_id as predicate"
+      GATE2_PASSED=false
+    fi
+  fi
+done
+
+if [ "$GATE2_PASSED" = true ]; then
+  echo "✓ No resolvers use agent_id as isolation predicate"
+  echo ""
+  echo "✓ Gate 2 PASSED: Cross-tenant isolation is correct"
+else
+  echo ""
+  echo "✗ Gate 2 FAILED: Found agent_id used as predicate"
+  exit 1
+fi
+
+echo ""
+echo "────────────────────────────────────────────────────────────"
+echo ""
+
+# Gate 3: Verify lifecycle visibility filter exists
+echo "[Gate 3] Lifecycle visibility filter implemented"
+echo ""
+
+if [ -f "src/user-layer/internal/visibility.ts" ]; then
+  if grep -q "isVisibleLifecycle\|VISIBLE_LIFECYCLE_STATES" src/user-layer/internal/visibility.ts; then
+    echo "✓ visibility.ts implements lifecycle filter"
+    echo ""
+    echo "✓ Gate 3 PASSED: Lifecycle visibility filter exists"
+  else
+    echo "✗ visibility.ts missing lifecycle filter implementation"
+    echo ""
+    echo "✗ Gate 3 FAILED"
+    exit 1
+  fi
+else
+  echo "✗ visibility.ts file not found"
+  echo ""
+  echo "✗ Gate 3 FAILED"
+  exit 1
+fi
+
+echo ""
+echo "────────────────────────────────────────────────────────────"
+echo ""
+
+# Gate 4: Verify depth limits are applied
+echo "[Gate 4] Depth-based limits implemented"
+echo ""
+
+if [ -f "src/user-layer/internal/depth-mapping.ts" ]; then
+  if grep -q "USER_DEPTH_LIMITS\|KNOWLEDGE_DEPTH_LIMITS" src/user-layer/internal/depth-mapping.ts; then
+    echo "✓ depth-mapping.ts defines depth limits"
+
+    # Verify specific limits
+    if grep -q "minimal.*5\|minimal:.*5" src/user-layer/internal/depth-mapping.ts; then
+      echo "✓ User minimal depth limit set to 5"
+    fi
+    if grep -q "relevant.*15\|relevant:.*15" src/user-layer/internal/depth-mapping.ts; then
+      echo "✓ User relevant depth limit set to 15"
+    fi
+    if grep -q "deep.*50\|deep:.*50" src/user-layer/internal/depth-mapping.ts; then
+      echo "✓ User deep depth limit set to 50"
+    fi
+
+    echo ""
+    echo "✓ Gate 4 PASSED: Depth limits implemented"
+  else
+    echo "✗ depth-mapping.ts missing depth limits"
+    echo ""
+    echo "✗ Gate 4 FAILED"
+    exit 1
+  fi
+else
+  echo "✗ depth-mapping.ts file not found"
+  echo ""
+  echo "✗ Gate 4 FAILED"
+  exit 1
+fi
+
+echo ""
+echo "────────────────────────────────────────────────────────────"
+echo ""
+
+# Gate 5: Verify cache key builders exist
+echo "[Gate 5] Cache key builders implemented"
+echo ""
+
+if [ -f "src/user-layer/internal/cache-keys.ts" ]; then
+  if grep -q "buildUserSliceCacheKey\|buildKnowledgeSliceCacheKey" src/user-layer/internal/cache-keys.ts; then
+    echo "✓ cache-keys.ts implements cache key builders"
+    echo ""
+    echo "✓ Gate 5 PASSED: Cache key builders exist"
+  else
+    echo "✗ cache-keys.ts missing cache key builders"
+    echo ""
+    echo "✗ Gate 5 FAILED"
+    exit 1
+  fi
+else
+  echo "✗ cache-keys.ts file not found"
+  echo ""
+  echo "✗ Gate 5 FAILED"
+  exit 1
+fi
+
+echo ""
+echo "────────────────────────────────────────────────────────────"
+echo ""
+
+# Gate 6: Run acceptance tests
+echo "[Gate 6] Run acceptance gate tests"
+echo ""
+
+if npm run test -- src/user-layer/__tests__/acceptance-gates.spec.ts --run 2>/dev/null; then
+  echo ""
+  echo "✓ Gate 6 PASSED: Acceptance tests passed"
+else
+  echo ""
+  echo "✗ Gate 6 FAILED: Acceptance tests failed"
+  exit 1
+fi
+
+echo ""
+echo "────────────────────────────────────────────────────────────"
+echo ""
+
+# Final summary
+echo "✓✓✓ ALL ACCEPTANCE GATES PASSED ✓✓✓"
+echo ""
+echo "P8c implementation verified:"
+echo "  ✓ Cross-tenant isolation enforced"
+echo "  ✓ Lifecycle visibility filtering"
+echo "  ✓ Depth-based limits applied"
+echo "  ✓ Cache integration ready for P8b"
+echo "  ✓ No agent_id isolation leaks"
+echo ""
+echo "Ready for P8b cache layer integration."

@@ -255,5 +255,7 @@ export const FeatureFlagName = {
   MULTI_CHANNEL: 'MULTI_CHANNEL',
   // P7 — grafo cognitivo formal (orquestração declarativa de módulos)
   COGNITIVE_GRAPH: 'cognitive_graph',
+  // P8c — User Layer namespace (depth-scoped slice builders + facade resolvers)
+  P8C_USER_LAYER_NAMESPACE_V1: 'P8C_USER_LAYER_NAMESPACE_V1',
 } as const;
 export type FeatureFlagName = typeof FeatureFlagName[keyof typeof FeatureFlagName];
