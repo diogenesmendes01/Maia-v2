@@ -104,7 +104,10 @@ async function runReflectionBatchInner(): Promise<void> {
         erros: 0,
         ativa: true,
         exemplo_origem_id: cluster.signals[0]?.alvo_id ?? null,
-      });
+        lifecycle_status: 'active',
+        evidence_count: 1,
+        lifecycle_transitions: JSON.stringify([]),
+      } as any);
       await audit({
         acao: 'rule_learned',
         alvo_id: r.id,

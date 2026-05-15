@@ -39,8 +39,8 @@ export async function buildUserSlice(input: {
     });
 
     // Load memories & hints based on depth
-    let memories = [];
-    let behavioral_hints = [];
+    let memories: any[] = [];
+    let behavioral_hints: any[] = [];
 
     if (input.depth !== 'none') {
       memories = await memoryResolver.list({

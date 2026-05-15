@@ -22,6 +22,11 @@ export const rulesResolver = {
     only_active?: boolean;
     limit: number;
   }): Promise<RuleItem[]> {
+    // ATENÇÃO: NÃO chamar `.where()` em sequência. No Drizzle <0.29 o segundo
+    // `.where(...)` SUBSTITUI o primeiro silenciosamente, dropando o filtro
+    // tenant_id — vazamento cross-tenant verificável quando `intent_filter`
+    // está setado. A>=0.29 isso é type error. Empilhar TODAS as condições
+    // no array antes do `and(...)` é a forma correta.
     const conditions = [
       eq(learned_rules.tenant_id, input.tenant_id),
       isVisibleLifecycle(learned_rules.lifecycle_status),
@@ -31,15 +36,14 @@ export const rulesResolver = {
       conditions.push(eq(learned_rules.ativa, true));
     }
 
-    let query = db.select().from(learned_rules).where(and(...conditions));
-
     if (input.intent_filter) {
-      query = query.where(
-        ilike(learned_rules.contexto, `%${input.intent_filter}%`),
-      );
+      conditions.push(ilike(learned_rules.contexto, `%${input.intent_filter}%`));
     }
 
-    const rows = await query
+    const rows = await db
+      .select()
+      .from(learned_rules)
+      .where(and(...conditions))
       .orderBy(desc(learned_rules.confianca), desc(learned_rules.updated_at))
       .limit(input.limit);
 

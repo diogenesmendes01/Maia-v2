@@ -70,10 +70,14 @@ export async function persistCandidate(
             ttl_days: classified.ttl_days,
             needs_review: false,
             source_event_id: null,
+            lifecycle_status: 'active',
+            evidence_count: 1,
+            lifecycle_transitions: JSON.stringify([]),
+            confidence: '0.5',
             expires_at: classified.ttl_days
               ? new Date(Date.now() + classified.ttl_days * 24 * 60 * 60 * 1000)
               : null,
-          });
+          } as any);
           memoryEntryId = memEntry.id;
 
           // Se sensível: deriva hint comportamental, valida anti-vazamento e
@@ -97,6 +101,10 @@ export async function persistCandidate(
                     extension_reason: null,
                     extension_approved_by: null,
                     extension_approved_at: null,
+                    lifecycle_status: 'active',
+                    evidence_count: 1,
+                    lifecycle_transitions: JSON.stringify([]),
+                    confidence: '0.5',
                     expires_at: classified.ttl_days
                       ? new Date(Date.now() + classified.ttl_days * 24 * 60 * 60 * 1000)
                       : null,
@@ -144,7 +152,10 @@ export async function persistCandidate(
         erros: 0,
         ativa: true,
         exemplo_origem_id: null,
-      });
+        lifecycle_status: 'active',
+        evidence_count: 1,
+        lifecycle_transitions: JSON.stringify([]),
+      } as any);
       return { persisted_to: 'learned_rules', id: rule?.id };
     }
     case 'lacuna': {

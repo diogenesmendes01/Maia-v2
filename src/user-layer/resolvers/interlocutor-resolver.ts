@@ -33,6 +33,9 @@ export const interlocutorResolver = {
     }
 
     const p = row[0];
+    if (!p) {
+      throw new Error(`Interlocutor not found: ${input.pessoa_id} in tenant ${input.tenant_id}`);
+    }
     return {
       pessoa_id: p.id,
       nome: p.nome,

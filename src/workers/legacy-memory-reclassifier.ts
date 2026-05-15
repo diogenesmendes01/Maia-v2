@@ -75,6 +75,10 @@ async function reclassifyForTenant(): Promise<{ reclassified: number; failed: nu
                 extension_reason: null,
                 extension_approved_by: null,
                 extension_approved_at: null,
+                lifecycle_status: 'active',
+                evidence_count: 1,
+                lifecycle_transitions: JSON.stringify([]),
+                confidence: '0.5',
                 expires_at,
                 revoked_at: null,
               });

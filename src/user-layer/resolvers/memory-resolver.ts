@@ -25,7 +25,6 @@ export interface MemoryListInput {
   memory_types?: string[];
   intent_filter?: string;
   limit: number;
-  caller_agent_id?: string; // SOMENTE para policy/audit, NÃO para filter
 }
 
 export interface MemoryItem {
@@ -57,7 +56,6 @@ export interface MemoryUpsertInput {
   mention_allowed: boolean;
   ttl_days?: number;
   lifecycle_status?: KnowledgeLifecycleStatus;
-  caller_agent_id?: string;
 }
 
 function rowToItem(r: typeof memory_entry.$inferSelect): MemoryItem {
@@ -144,12 +142,27 @@ export const memoryResolver = {
     return rowToItem(inserted);
   },
 
-  async markObserved(id: string, _by_agent_id?: string): Promise<void> {
-    // P8c: stub — full KSM transitions land in P10a.
-    // Records evidence_count++ as best-effort metadata signal.
+  /**
+   * P8c: stub — full KSM lifecycle transitions land in P10a.
+   *
+   * Requires tenant_id explicitly to keep the cross-tenant invariant intact
+   * (the rest of the resolver enforces it on every read/upsert; markObserved
+   * MUST follow the same contract even while it's a no-op shell).
+   */
+  async markObserved(input: {
+    tenant_id: string;
+    id: string;
+    by_agent_id?: string;
+  }): Promise<void> {
+    void input.by_agent_id; // reserved for KSM auto-evolution (P10a)
     await db
       .update(memory_entry)
       .set({ updated_at: new Date() })
-      .where(eq(memory_entry.id, id));
+      .where(
+        and(
+          eq(memory_entry.tenant_id, input.tenant_id),
+          eq(memory_entry.id, input.id),
+        ),
+      );
   },
 };

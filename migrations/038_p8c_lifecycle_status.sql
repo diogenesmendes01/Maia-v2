@@ -1,6 +1,9 @@
--- 036_p8c_lifecycle_status.sql
+-- 038_p8c_lifecycle_status.sql
 -- P8c — adiciona campos do Knowledge State Machine sem remover legacy.
 -- DEFAULT 'active' preserva backward compat: tudo que já existia continua visível.
+--
+-- Numbering: 036/037 reservados a P8e (#93). P8b (#95) usa 039-042.
+-- Coordenação acordada na review de 2026-05-15.
 
 BEGIN;
 
@@ -15,7 +18,8 @@ ALTER TABLE memory_entry
     )),
   ADD COLUMN IF NOT EXISTS evidence_count INTEGER NOT NULL DEFAULT 1,
   ADD COLUMN IF NOT EXISTS confidence NUMERIC(3, 2) NOT NULL DEFAULT 1.00,
-  ADD COLUMN IF NOT EXISTS lifecycle_transitions JSONB NOT NULL DEFAULT '[]'::jsonb;
+  ADD COLUMN IF NOT EXISTS lifecycle_transitions JSONB NOT NULL DEFAULT '[]'::jsonb
+    CHECK (jsonb_typeof(lifecycle_transitions) = 'array' AND jsonb_array_length(lifecycle_transitions) <= 1000);
 
 CREATE INDEX IF NOT EXISTS idx_memory_entry_tenant_lifecycle
   ON memory_entry (tenant_id, lifecycle_status)
@@ -31,7 +35,8 @@ ALTER TABLE agent_facts
       'reinforced', 'verified', 'active', 'deprecated', 'revoked'
     )),
   ADD COLUMN IF NOT EXISTS evidence_count INTEGER NOT NULL DEFAULT 1,
-  ADD COLUMN IF NOT EXISTS lifecycle_transitions JSONB NOT NULL DEFAULT '[]'::jsonb;
+  ADD COLUMN IF NOT EXISTS lifecycle_transitions JSONB NOT NULL DEFAULT '[]'::jsonb
+    CHECK (jsonb_typeof(lifecycle_transitions) = 'array' AND jsonb_array_length(lifecycle_transitions) <= 1000);
 -- agent_facts já possui `confianca` (NUMERIC). Mantemos. Resolver alias para `confidence`.
 
 CREATE INDEX IF NOT EXISTS idx_agent_facts_tenant_lifecycle
@@ -48,7 +53,8 @@ ALTER TABLE learned_rules
       'reinforced', 'verified', 'active', 'deprecated', 'revoked'
     )),
   ADD COLUMN IF NOT EXISTS evidence_count INTEGER NOT NULL DEFAULT 1,
-  ADD COLUMN IF NOT EXISTS lifecycle_transitions JSONB NOT NULL DEFAULT '[]'::jsonb;
+  ADD COLUMN IF NOT EXISTS lifecycle_transitions JSONB NOT NULL DEFAULT '[]'::jsonb
+    CHECK (jsonb_typeof(lifecycle_transitions) = 'array' AND jsonb_array_length(lifecycle_transitions) <= 1000);
 -- learned_rules já possui `confianca`, `acertos`, `erros`. Mantemos. Resolver mapeia.
 
 CREATE INDEX IF NOT EXISTS idx_learned_rules_tenant_lifecycle
@@ -66,7 +72,8 @@ ALTER TABLE behavioral_hint
     )),
   ADD COLUMN IF NOT EXISTS evidence_count INTEGER NOT NULL DEFAULT 1,
   ADD COLUMN IF NOT EXISTS confidence NUMERIC(3, 2) NOT NULL DEFAULT 1.00,
-  ADD COLUMN IF NOT EXISTS lifecycle_transitions JSONB NOT NULL DEFAULT '[]'::jsonb;
+  ADD COLUMN IF NOT EXISTS lifecycle_transitions JSONB NOT NULL DEFAULT '[]'::jsonb
+    CHECK (jsonb_typeof(lifecycle_transitions) = 'array' AND jsonb_array_length(lifecycle_transitions) <= 1000);
 
 CREATE INDEX IF NOT EXISTS idx_behavioral_hint_tenant_lifecycle
   ON behavioral_hint (tenant_id, lifecycle_status)

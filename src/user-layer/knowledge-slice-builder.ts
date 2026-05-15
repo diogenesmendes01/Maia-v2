@@ -36,8 +36,8 @@ export async function buildKnowledgeSlice(input: {
   });
 
   try {
-    let facts = [];
-    let rules = [];
+    let facts: any[] = [];
+    let rules: any[] = [];
 
     if (input.depth !== 'none') {
       facts = await factsResolver.list({

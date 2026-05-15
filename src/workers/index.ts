@@ -89,7 +89,7 @@ export const JOBS: Job[] = [
   { name: 'gap_escalation_monitor', cron: '*/30 * * * *', fn: runGapEscalationMonitor, phase: 5 },
 ];
 
-const tasks: cron.ScheduledTask[] = [];
+const tasks: any[] = [];
 
 export function startWorkers(currentPhase: number = 1): void {
   for (const job of JOBS) {
@@ -99,7 +99,7 @@ export function startWorkers(currentPhase: number = 1): void {
       () => {
         job.fn().catch((err) => logger.error({ err, job: job.name }, 'worker.failed'));
       },
-      { scheduled: true, timezone: 'America/Sao_Paulo' },
+      { timezone: 'America/Sao_Paulo' } as any,
     );
     tasks.push(t);
     logger.info({ job: job.name, cron: job.cron, phase: job.phase }, 'worker.scheduled');

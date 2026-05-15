@@ -39,7 +39,10 @@ export const saveRuleTool: Tool<typeof inputSchema, typeof outputSchema> = {
       erros: 0,
       ativa: true,
       exemplo_origem_id: args.exemplo_origem_id ?? null,
-    });
+      lifecycle_status: 'active',
+      evidence_count: 1,
+      lifecycle_transitions: JSON.stringify([]),
+    } as any);
     return { rule_id: r.id, status: 'probatoria' };
   },
 };
