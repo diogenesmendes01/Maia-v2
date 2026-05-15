@@ -13,10 +13,20 @@ const MIN_OCCURRENCES = 3;
 /**
  * Detecta padrões repetidos em audit_log nas últimas 24h.
  * P0-era single-tenant shim: roda em escopo do tenant 'default'.
- * P6 introduz iteração por tenant (encapsular esse corpo num for-each tenant).
+ *
+ * FIXME(P6 multi-tenant): este corpo precisa
+ *   1. enumerar tuplas (tenant_id, agent_id) ativas;
+ *   2. para cada uma, rodar este corpo dentro de `runWithTenantContext`;
+ *   3. trocar os literais `'default'` na WHERE pelos `getCurrentTenant()/getCurrentAgent()`;
+ *   4. confirmar que `evidence_ids = array_agg(alvo_id)` só agrega `alvo_id`
+ *      do tenant atual (atualmente é garantido pelo WHERE; deixar comentário
+ *      pra que a refatoração não esqueça do filtro).
  */
 export async function runPatternDetector(): Promise<void> {
   await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+    // The WHERE clause already restricts to the current tenant/agent, so
+    // `array_agg(alvo_id)` cannot contain ids from other tenants. Keep this
+    // invariant when generalising to multi-tenant in P6.
     const rows = await db.execute<{ pattern: string; count: number; alvo_ids: string[] }>(sql`
       SELECT
         acao || '|' || COALESCE((metadata->>'descricao'), '') AS pattern,
