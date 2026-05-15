@@ -25,7 +25,7 @@ import { capabilityProposalsRepo } from '@/db/repositories.js';
 import { featureFlags } from '@/config/feature-flags.js';
 import { FeatureFlagName } from '@/types/enums.js';
 import type { AgentCapabilityGap, ActivationContext } from '@/db/schema.js';
-import type { SoulOrigin, SoulScope } from '@/types/enums.js';
+import type { SoulScope } from '@/types/enums.js';
 
 /**
  * P8b: spec interna de uma proposta de soul_bias. Vive em
