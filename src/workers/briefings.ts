@@ -4,6 +4,7 @@ import { sendOutboundText } from '@/gateway/baileys.js';
 import { fmtBR } from '@/lib/brazilian.js';
 import { logger } from '@/lib/logger.js';
 import { fmtBRL, sumDecimal } from '@/lib/decimal.js';
+import { runWithTenantContext } from '@/db/tenant-context.js';
 
 async function buildOwnerBriefing(): Promise<string> {
   const ents = await entidadesRepo.list();
@@ -67,19 +68,26 @@ async function sendToOwners(text: string): Promise<void> {
 }
 
 export async function runMorningBriefing(): Promise<void> {
-  const text = await buildOwnerBriefing();
-  await sendToOwners(text);
-  logger.info('briefing.morning.sent');
+  // P0: single-tenant default. P6 will fan-out per tenant.
+  await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+    const text = await buildOwnerBriefing();
+    await sendToOwners(text);
+    logger.info('briefing.morning.sent');
+  });
 }
 
 export async function runEveningBriefing(): Promise<void> {
-  const text = await buildEveningBriefing();
-  await sendToOwners(text);
-  logger.info('briefing.evening.sent');
+  await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+    const text = await buildEveningBriefing();
+    await sendToOwners(text);
+    logger.info('briefing.evening.sent');
+  });
 }
 
 export async function runWeeklyBriefing(): Promise<void> {
-  const text = await buildWeeklyBriefing();
-  await sendToOwners(text);
-  logger.info('briefing.weekly.sent');
+  await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+    const text = await buildWeeklyBriefing();
+    await sendToOwners(text);
+    logger.info('briefing.weekly.sent');
+  });
 }

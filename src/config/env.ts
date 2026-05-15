@@ -129,6 +129,11 @@ const envSchema = z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
+    // Feature flags do roadmap Maia v2
+    FEATURE_P0_TENANT_GUARD_ENFORCED: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
     // Spec 18 — Scheduling V2 (series/occurrences/tasks/outbox). When off,
     // the scheduling workers and start_recurring_* tools are inert; the
     // schedule_reminder tool still works because it just writes a series

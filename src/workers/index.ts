@@ -18,6 +18,7 @@ import { runAuditWatcher } from './audit-watcher.js';
 import { runDlqMonitor } from './dlq-monitor.js';
 import { runMorningBriefing, runEveningBriefing, runWeeklyBriefing } from './briefings.js';
 import { tickEngine } from '@/workflows/engine.js';
+import { runWithTenantContext } from '@/db/tenant-context.js';
 
 export type Job = { name: string; cron: string; fn: () => Promise<void>; phase: number };
 
@@ -35,10 +36,23 @@ export const JOBS: Job[] = [
   //  - series_next_scheduler: every 10 min, backfills missing next-cycle
   //    occurrences for any active series whose chain was broken by a
   //    failure between completion and re-schedule.
+  // Scheduling tables (series/occurrences/tasks/outbox_messages) ainda não
+  // têm tenant_id em P0 — workers rodam fora de tenant context.
   { name: 'scheduling_tick', cron: '* * * * *', fn: runScheduling, phase: 1 },
   { name: 'outbox_drain', cron: '* * * * *', fn: runOutboxDrainWorker, phase: 1 },
   { name: 'series_next_scheduler', cron: '*/10 * * * *', fn: runSeriesNextSchedulerWorker, phase: 1 },
-  { name: 'workflow_engine_tick', cron: '*/30 * * * * *', fn: async () => { await tickEngine(); }, phase: 1 },
+  {
+    name: 'workflow_engine_tick',
+    cron: '*/30 * * * * *',
+    fn: async () => {
+      // P0: single-tenant default. P6 will fan-out per tenant.
+      // tickEngine() acessa workflows/workflow_steps (tabelas tenant-aware).
+      await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+        await tickEngine();
+      });
+    },
+    phase: 1,
+  },
   { name: 'audit_mode_expirer', cron: '*/15 * * * *', fn: runAuditModeExpirer, phase: 1 },
   { name: 'idempotency_cleanup', cron: '0 4 * * *', fn: runIdempotencyCleanup, phase: 1 },
   { name: 'inactivity_sweep', cron: '0 3 * * *', fn: runInactivitySweep, phase: 1 },

@@ -27,6 +27,19 @@ import { routeMessageUpdate } from '@/agent/message-update.js';
 import type { WhatsAppInbound, WAQuotedContext } from './types.js';
 import { setupState } from '@/setup/state.js';
 import { triggerRecovery } from '@/setup/recovery.js';
+import { runWithTenantContext } from '@/db/tenant-context.js';
+
+/**
+ * P0 default tenant context for the WhatsApp gateway. The current Baileys
+ * deployment is single-tenant (the legacy Maia), so every inbound is mapped
+ * to the seeded `'default'` tenant/agent. P6 introduces multi-channel/
+ * multi-agent routing and will resolve the tenant from the channel config
+ * BEFORE invoking `handleIncoming` / `routeMessageUpdate`.
+ *
+ * Lives at module scope so the fix is one-line at each call site and easy
+ * to swap in P6 (a single replacement point).
+ */
+const BAILEYS_DEFAULT_CTX = { tenant_id: 'default', agent_id: 'default' } as const;
 
 let socket: WASocket | null = null;
 let connected = false;
@@ -188,7 +201,11 @@ export async function startBaileys(): Promise<void> {
   socket.ev.on('messages.upsert', async ({ messages }) => {
     for (const msg of messages) {
       try {
-        await handleIncoming(msg);
+        // PR #75 review (P75-C1): handleIncoming hits mensagensRepo /
+        // pessoasRepo, both of which now require tenant context. Wrap each
+        // message dispatch in the default tenant context so the new guard
+        // doesn't drop real WhatsApp inbounds.
+        await runWithTenantContext(BAILEYS_DEFAULT_CTX, () => handleIncoming(msg));
       } catch (err) {
         logger.error({ err }, 'baileys.handle_failed');
       }
@@ -203,10 +220,15 @@ export async function startBaileys(): Promise<void> {
         // We synthesise an IWebMessageInfo whose `message` is the `update.message`
         // payload so routeMessageUpdate can branch on editedMessage / protocolMessage.
         // The `as never` cast is intentional — runtime structure is what matters.
-        await routeMessageUpdate({
-          key: update.key,
-          message: update.update.message,
-        } as never);
+        //
+        // Same tenant-context wrap as messages.upsert: routeMessageUpdate
+        // reads mensagensRepo/pessoasRepo/auditRepo (all tenant-scoped now).
+        await runWithTenantContext(BAILEYS_DEFAULT_CTX, () =>
+          routeMessageUpdate({
+            key: update.key,
+            message: update.update.message,
+          } as never),
+        );
       } catch (err) {
         logger.error({ err: (err as Error).message }, 'message_update.dispatch_failed');
       }

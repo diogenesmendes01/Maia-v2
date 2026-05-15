@@ -6,6 +6,7 @@ import { callLLM } from '@/lib/claude.js';
 import { rulesRepo } from '@/db/repositories.js';
 import { audit } from '@/governance/audit.js';
 import { writeMemory } from '@/memory/vector.js';
+import { runWithTenantContext } from '@/db/tenant-context.js';
 import {
   clusterCorrections,
   type CorrectionSignal,
@@ -34,6 +35,11 @@ type Proposal = {
 };
 
 export async function runReflectionBatch(): Promise<void> {
+  // P0: single-tenant default. P6 will fan-out per tenant.
+  await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, runReflectionBatchInner);
+}
+
+async function runReflectionBatchInner(): Promise<void> {
   const since = sql`now() - interval '24 hours'`;
   const rows = await db.execute<AuditRow>(
     sql`SELECT acao, alvo_id, metadata, pessoa_id FROM ${audit_log}

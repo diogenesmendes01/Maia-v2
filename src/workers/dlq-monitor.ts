@@ -4,6 +4,7 @@ import { sendAlert } from '@/lib/alerts.js';
 import { redis } from '@/lib/redis.js';
 import { logger } from '@/lib/logger.js';
 import { audit } from '@/governance/audit.js';
+import { runWithTenantContext } from '@/db/tenant-context.js';
 
 /**
  * DLQ size guard. Reads the count of unresolved entries in `dead_letter_jobs`
@@ -22,6 +23,11 @@ const ALERT_KEY = 'maia:dlq_monitor:alerted';
 const ALERT_TTL_S = 60 * 60; // 1h
 
 export async function runDlqMonitor(): Promise<void> {
+  // P0: single-tenant default. P6 will fan-out per tenant.
+  await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, runDlqMonitorInner);
+}
+
+async function runDlqMonitorInner(): Promise<void> {
   let count: number;
   try {
     count = await dlqRepo.countOpen();

@@ -20,6 +20,7 @@ import {
 } from './reflection.js';
 import { sendOutbound } from './output-dispatch.js';
 import { runReActLoop } from './react-loop.js';
+import { runWithTenantContext } from '@/db/tenant-context.js';
 
 const TYPING_DEBOUNCE_MS = 1500;
 
@@ -127,6 +128,16 @@ function scheduleTypingDebounce(jid: string, mensagem_id: string): () => void {
 export const _internal = { scheduleTypingDebounce, sendOutbound, aggregateUnprocessedTexts };
 
 export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
+  // P0: 'default' is the only tenant/agent — single-tenant deployment.
+  // P6 introduces multi-channel/multi-agent and will route via channel→tenant
+  // resolution before this function is invoked.
+  await runWithTenantContext(
+    { tenant_id: 'default', agent_id: 'default' },
+    () => runAgentForMensagemInner(mensagem_id),
+  );
+}
+
+async function runAgentForMensagemInner(mensagem_id: string): Promise<void> {
   const inbound = await mensagensRepo.findById(mensagem_id);
   if (!inbound) {
     logger.warn({ mensagem_id }, 'agent.message_not_found');

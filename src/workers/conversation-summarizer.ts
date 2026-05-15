@@ -5,8 +5,17 @@ import { mensagensRepo, conversasRepo } from '@/db/repositories.js';
 import { callLLM } from '@/lib/claude.js';
 import { logger } from '@/lib/logger.js';
 import { config } from '@/config/env.js';
+import { runWithTenantContext } from '@/db/tenant-context.js';
 
 export async function runConversationSummarizer(): Promise<void> {
+  // P0: single-tenant default. P6 will fan-out per tenant.
+  await runWithTenantContext(
+    { tenant_id: 'default', agent_id: 'default' },
+    runConversationSummarizerInner,
+  );
+}
+
+async function runConversationSummarizerInner(): Promise<void> {
   const stale = await db
     .select()
     .from(conversas)
