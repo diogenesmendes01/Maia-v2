@@ -28,6 +28,19 @@ import { routeMessageUpdate } from '@/agent/message-update.js';
 import type { WhatsAppInbound, WAQuotedContext } from './types.js';
 import { setupState } from '@/setup/state.js';
 import { triggerRecovery } from '@/setup/recovery.js';
+import { runWithTenantContext } from '@/db/tenant-context.js';
+
+/**
+ * P0 default tenant context for the WhatsApp gateway. The current Baileys
+ * deployment is single-tenant (the legacy Maia), so every inbound is mapped
+ * to the seeded `'default'` tenant/agent. P6 introduces multi-channel/
+ * multi-agent routing and will resolve the tenant from the channel config
+ * BEFORE invoking `handleIncoming` / `routeMessageUpdate`.
+ *
+ * Lives at module scope so the fix is one-line at each call site and easy
+ * to swap in P6 (a single replacement point).
+ */
+const BAILEYS_DEFAULT_CTX = { tenant_id: 'default', agent_id: 'default' } as const;
 
 let socket: WASocket | null = null;
 let connected = false;

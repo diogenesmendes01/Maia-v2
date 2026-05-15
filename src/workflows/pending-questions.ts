@@ -28,6 +28,11 @@ export type IntentResolution = z.infer<typeof IntentResolutionSchema>;
 /**
  * @deprecated Use pendingQuestionsRepo + src/agent/pending-gate.ts instead.
  * Retained only for src/workflows/dual-approval.ts which has its own pending state.
+ *
+ * Superpowers I3 (PR #74): uses `mergeMetadata` (atomic jsonb `||`) instead
+ * of the previous read-modify-write `updateMetadata`. The old flow would
+ * silently drop concurrent metadata keys (e.g. `last_scope_hash` written by
+ * the agent core in the same window). The merge variant preserves siblings.
  */
 export async function setLightweightPending(
   conversa: Conversa,
@@ -45,9 +50,7 @@ export async function setLightweightPending(
     expira_em,
     created_at: new Date().toISOString(),
   };
-  const meta = (conversa.metadata ?? {}) as Record<string, unknown>;
-  meta.pending_question = full;
-  await conversasRepo.updateMetadata(conversa.id, meta);
+  await conversasRepo.mergeMetadata(conversa.id, { pending_question: full });
   return full;
 }
 
@@ -60,11 +63,15 @@ export function getActivePending(conversa: Conversa): PendingQuestionData | null
   return pq;
 }
 
-/** @deprecated See setLightweightPending. */
+/**
+ * @deprecated See setLightweightPending.
+ *
+ * Superpowers I3 (PR #74): uses `unsetMetadataKey` (atomic jsonb `-`) so a
+ * clear-pending operation can't silently drop concurrent siblings written
+ * via `mergeMetadata`.
+ */
 export async function clearLightweightPending(conversa: Conversa): Promise<void> {
-  const meta = (conversa.metadata ?? {}) as Record<string, unknown>;
-  delete meta.pending_question;
-  await conversasRepo.updateMetadata(conversa.id, meta);
+  await conversasRepo.unsetMetadataKey(conversa.id, 'pending_question');
 }
 
 export async function applyResolution(

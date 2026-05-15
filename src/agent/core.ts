@@ -7,6 +7,7 @@ import { handleQuarantineFirstContact, handleOwnerIdentityReply } from '@/identi
 import { config } from '@/config/env.js';
 import { clearDebounceState } from '@/gateway/debouncer.js';
 import { buildPrompt } from './prompt-builder.js';
+import { hashScope } from './scope-hash.js';
 import { logger } from '@/lib/logger.js';
 import type { Mensagem } from '@/db/schema.js';
 import { audit } from '@/governance/audit.js';
@@ -319,7 +320,36 @@ async function runAgentForMensagemInner(mensagem_id: string): Promise<void> {
     await clearDebounceState(pessoa.telefone_whatsapp);
     return;
   }
-  // 'unresolved' and 'no_pending' fall through to the existing ReAct flow.
+  // 'unresolved' and 'no_pending' fall through.
+
+  // Blocker 9 — Scheduling inbound hook (spec 18 §7.4). When the inbound
+  // is a text from someone who has at least one `recurring_outreach`
+  // occurrence in `awaiting_third_party`, try to attach the response.
+  // Three outcomes:
+  //  - routed: response captured, occurrence advances; we DON'T short-
+  //    circuit the LLM turn (the LLM can still acknowledge to the sender).
+  //  - disambiguation_requested: owner was prompted; we still let the LLM
+  //    answer the sender so they don't get silence.
+  //  - no_match: no scheduling state cares about this inbound; continue.
+  if (config.FEATURE_SCHEDULING_V2 && inbound.tipo === 'texto' && inbound.conteudo) {
+    try {
+      const { captureInboundForOutreach } = await import('@/scheduling/disambiguation.js');
+      const ownerId = config.OWNER_TELEFONE_WHATSAPP;
+      const owner = await (await import('@/db/repositories.js')).pessoasRepo.findByPhone(ownerId);
+      if (owner) {
+        await captureInboundForOutreach({
+          sender: pessoa,
+          inbound,
+          owner_pessoa_id: owner.id,
+        });
+      }
+    } catch (err) {
+      logger.warn(
+        { err: (err as Error).message, mensagem_id: inbound.id },
+        'agent.scheduling_inbound_hook_failed',
+      );
+    }
+  }
 
   const scope = await resolveScope(pessoa);
 
@@ -359,6 +389,22 @@ async function runAgentForMensagemInner(mensagem_id: string): Promise<void> {
 
   await markAllProcessed(totalTokens);
   await conversasRepo.touch(c.id);
+  // Issue #73 — persist the scope hash for the *next* turn's sentinel check.
+  // Merge (jsonb ||) instead of overwrite so concurrent writers don't clobber
+  // unrelated metadata keys (e.g. pending_question). The hash itself is
+  // last-writer-wins, which is fine: we want the freshest finished turn's
+  // scope to be the baseline for comparison.
+  try {
+    await conversasRepo.mergeMetadata(c.id, {
+      last_scope_hash: hashScope(scope),
+      last_scope_hash_set_at: new Date().toISOString(),
+    });
+  } catch (err) {
+    logger.warn(
+      { err: (err as Error).message, conversa_id: c.id },
+      'agent.scope_hash_persist_failed',
+    );
+  }
   await clearDebounceState(pessoa.telefone_whatsapp);
 
   // Reflection trigger: correction detection (real-time)

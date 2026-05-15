@@ -6,6 +6,7 @@ import {
   transacoes,
   entidades,
   contas_bancarias,
+  pessoas,
 } from '@/db/schema.js';
 import { tenantsRepo, transacoesRepo } from '@/db/repositories.js';
 import {
@@ -15,7 +16,13 @@ import {
 } from '@/db/tenant-context.js';
 import { like, inArray } from 'drizzle-orm';
 
-describe('Tenant isolation (P0)', () => {
+// Padrão do projeto (tests/integration/leak.spec.ts): integration tests
+// só rodam quando TEST_DB_URL está setada. No CI a validate job não tem
+// Postgres — o integration job (com service container) cuida desse caso.
+const SHOULD_RUN = !!process.env.TEST_DB_URL;
+const d = SHOULD_RUN ? describe : describe.skip;
+
+d('Tenant isolation (P0)', () => {
   beforeAll(async () => {
     // Cria 2 tenants + 1 agente cada
     await tenantsRepo.create({ id: 't-a', nome: 'Tenant A' });
@@ -106,5 +113,48 @@ describe('Tenant isolation (P0)', () => {
 
   it('query fora de tenant context lança MissingTenantContextError', async () => {
     await expect(transacoesRepo.listRecent()).rejects.toThrow(/Tenant context/);
+  });
+
+  // PR #75 review finding #C2 / Superpowers #1: pessoa lookup by phone is the
+  // first step on every WhatsApp inbound. If it leaks across tenants, every
+  // downstream permission/escopo check is already compromised.
+  it('pessoasRepo.findByPhone is isolated by tenant (PR #75 #C2)', async () => {
+    const sharedPhone = '+5511999990123';
+
+    await runWithTenantContext(
+      { tenant_id: 't-a', agent_id: 'agent-a' },
+      async () => {
+        await pessoasRepo.create({
+          nome: 'Pessoa A',
+          telefone_whatsapp: sharedPhone,
+          email: null,
+          cpf: null,
+          status: 'ativa',
+          preferencias: {},
+          metadata: {},
+        } as Parameters<typeof pessoasRepo.create>[0]);
+      },
+    );
+
+    // Tenant B searches for the SAME phone — must NOT see Tenant A's pessoa.
+    const seenByB = await runWithTenantContext(
+      { tenant_id: 't-b', agent_id: 'agent-b' },
+      () => pessoasRepo.findByPhone(sharedPhone),
+    );
+    expect(seenByB).toBeNull();
+
+    // Tenant A still sees their own row.
+    const seenByA = await runWithTenantContext(
+      { tenant_id: 't-a', agent_id: 'agent-a' },
+      () => pessoasRepo.findByPhone(sharedPhone),
+    );
+    expect(seenByA).not.toBeNull();
+    expect(seenByA?.tenant_id).toBe('t-a');
+  });
+
+  it('pessoasRepo.findByPhone outside any tenant context throws', async () => {
+    await expect(pessoasRepo.findByPhone('+5511999990123')).rejects.toBeInstanceOf(
+      MissingTenantContextError,
+    );
   });
 });

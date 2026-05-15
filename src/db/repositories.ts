@@ -67,33 +67,83 @@ export class EmptyScopeError extends TypedError {
 }
 
 export const pessoasRepo = {
+  // PR #75 review (P75-C2): pessoas is a tenant-aware table since migration
+  // 009. Identity resolution by phone is the FIRST step on inbound — if it
+  // leaks across tenants, every downstream check (permissões, escopo) is
+  // already compromised. All reads filter by (tenant_id, agent_id); all
+  // writes go through `applyTenantGuard`.
   async findById(id: string): Promise<Pessoa | null> {
-    const rows = await db.select().from(pessoas).where(eq(pessoas.id, id)).limit(1);
-    return rows[0] ?? null;
-  },
-  async findByPhone(telefone: string): Promise<Pessoa | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const rows = await db
       .select()
       .from(pessoas)
-      .where(eq(pessoas.telefone_whatsapp, telefone))
+      .where(
+        and(
+          eq(pessoas.tenant_id, tenant_id),
+          eq(pessoas.agent_id, agent_id),
+          eq(pessoas.id, id),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+  async findByPhone(telefone: string): Promise<Pessoa | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(pessoas)
+      .where(
+        and(
+          eq(pessoas.tenant_id, tenant_id),
+          eq(pessoas.agent_id, agent_id),
+          eq(pessoas.telefone_whatsapp, telefone),
+        ),
+      )
       .limit(1);
     return rows[0] ?? null;
   },
   async create(input: Omit<Pessoa, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>): Promise<Pessoa> {
-    const rows = await db.insert(pessoas).values(input).returning();
+    const guarded = applyTenantGuard(input);
+    const rows = await db.insert(pessoas).values(guarded).returning();
     return rows[0]!;
   },
   async updateStatus(id: string, status: Pessoa['status']): Promise<void> {
-    await db.update(pessoas).set({ status, updated_at: new Date() }).where(eq(pessoas.id, id));
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    await db
+      .update(pessoas)
+      .set({ status, updated_at: new Date() })
+      .where(
+        and(
+          eq(pessoas.tenant_id, tenant_id),
+          eq(pessoas.agent_id, agent_id),
+          eq(pessoas.id, id),
+        ),
+      );
   },
   async updatePreferencias(id: string, preferencias: Record<string, unknown>): Promise<void> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     await db
       .update(pessoas)
       .set({ preferencias, updated_at: new Date() })
-      .where(eq(pessoas.id, id));
+      .where(
+        and(
+          eq(pessoas.tenant_id, tenant_id),
+          eq(pessoas.agent_id, agent_id),
+          eq(pessoas.id, id),
+        ),
+      );
   },
   async list(): Promise<Pessoa[]> {
-    return db.select().from(pessoas);
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(pessoas)
+      .where(and(eq(pessoas.tenant_id, tenant_id), eq(pessoas.agent_id, agent_id)));
   },
 };
 
@@ -113,7 +163,8 @@ export const permissoesRepo = {
     return rows[0] ?? null;
   },
   async create(input: Omit<Permissao, 'id' | 'tenant_id' | 'agent_id' | 'created_at'>): Promise<Permissao> {
-    const rows = await db.insert(permissoes).values(input).returning();
+    const guarded = applyTenantGuard(input);
+    const rows = await db.insert(permissoes).values(guarded).returning();
     return rows[0]!;
   },
   async updateStatus(id: string, status: Permissao['status']): Promise<void> {
@@ -189,6 +240,32 @@ export const conversasRepo = {
   },
   async updateMetadata(id: string, metadata: Record<string, unknown>): Promise<void> {
     await db.update(conversas).set({ metadata }).where(eq(conversas.id, id));
+  },
+  /**
+   * Atomic partial merge into conversas.metadata via the jsonb `||`
+   * operator. Issue #73: avoids losing concurrent keys (e.g. pending_question)
+   * when two workers race to write metadata. Existing keys in `patch`
+   * overwrite existing keys in metadata; everything else is preserved.
+   */
+  async mergeMetadata(id: string, patch: Record<string, unknown>): Promise<void> {
+    await db
+      .update(conversas)
+      .set({ metadata: sql`${conversas.metadata} || ${JSON.stringify(patch)}::jsonb` })
+      .where(eq(conversas.id, id));
+  },
+  /**
+   * Atomic key removal from conversas.metadata via the jsonb `-` operator.
+   * Superpowers I3 (PR #74): paired with `mergeMetadata` for the deprecated
+   * lightweight-pending-question flow so a clear-pending operation no
+   * longer races with concurrent `mergeMetadata` writes (e.g.
+   * `last_scope_hash`) — the previous `updateMetadata` full-object set
+   * would silently drop concurrent keys.
+   */
+  async unsetMetadataKey(id: string, key: string): Promise<void> {
+    await db
+      .update(conversas)
+      .set({ metadata: sql`${conversas.metadata} - ${key}` })
+      .where(eq(conversas.id, id));
   },
   async close(id: string, contexto_resumido: string): Promise<void> {
     await db
@@ -375,7 +452,8 @@ export const entidadesRepo = {
     return db.select().from(entidades).where(inArray(entidades.id, ids));
   },
   async create(input: Omit<Entidade, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>): Promise<Entidade> {
-    const rows = await db.insert(entidades).values(input).returning();
+    const guarded = applyTenantGuard(input);
+    const rows = await db.insert(entidades).values(guarded).returning();
     return rows[0]!;
   },
 };
@@ -400,7 +478,8 @@ export const contasRepo = {
       .where(inArray(contas_bancarias.entidade_id, scope.entidades));
   },
   async create(input: Omit<Conta, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>): Promise<Conta> {
-    const rows = await db.insert(contas_bancarias).values(input).returning();
+    const guarded = applyTenantGuard(input);
+    const rows = await db.insert(contas_bancarias).values(guarded).returning();
     return rows[0]!;
   },
   async addToBalance(id: string, delta: number): Promise<Conta | null> {
@@ -549,7 +628,8 @@ export const contrapartesRepo = {
     return rows[0] ?? null;
   },
   async create(input: Omit<Contraparte, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>): Promise<Contraparte> {
-    const rows = await db.insert(contrapartes).values(input).returning();
+    const guarded = applyTenantGuard(input);
+    const rows = await db.insert(contrapartes).values(guarded).returning();
     return rows[0]!;
   },
 };
@@ -722,7 +802,8 @@ type PendingQuestionInsert = Omit<
 
 export const pendingQuestionsRepo = {
   async create(input: PendingQuestionInsert): Promise<PendingQuestion> {
-    const rows = await db.insert(pending_questions).values(input).returning();
+    const guarded = applyTenantGuard(input);
+    const rows = await db.insert(pending_questions).values(guarded).returning();
     return rows[0]!;
   },
   async findOpen(conversa_id: string): Promise<PendingQuestion | null> {
@@ -851,7 +932,8 @@ export const pendingQuestionsRepo = {
     // index `(conversa_id) WHERE status='aberta'` from migration 004. Doing
     // the insert on the global pool would race with the in-flight cancel and
     // hit a duplicate-key error.
-    const rows = await tx.insert(pending_questions).values(input).returning();
+    const guarded = applyTenantGuard(input);
+    const rows = await tx.insert(pending_questions).values(guarded).returning();
     return rows[0]!;
   },
 };
@@ -937,7 +1019,8 @@ export const auditRepo = {
 
 export const workflowsRepo = {
   async create(input: Omit<Workflow, 'id' | 'tenant_id' | 'agent_id' | 'iniciado_em' | 'concluido_em'>): Promise<Workflow> {
-    const rows = await db.insert(workflows).values(input).returning();
+    const guarded = applyTenantGuard(input);
+    const rows = await db.insert(workflows).values(guarded).returning();
     return rows[0]!;
   },
   async byId(id: string): Promise<Workflow | null> {
@@ -964,7 +1047,8 @@ export const workflowStepsRepo = {
     inputs: Omit<WorkflowStep, 'id' | 'tenant_id' | 'agent_id' | 'iniciado_em' | 'concluido_em'>[],
   ): Promise<WorkflowStep[]> {
     if (inputs.length === 0) return [];
-    return db.insert(workflow_steps).values(inputs).returning();
+    const guarded = inputs.map((i) => applyTenantGuard(i));
+    return db.insert(workflow_steps).values(guarded).returning();
   },
   async byWorkflow(workflow_id: string): Promise<WorkflowStep[]> {
     return db
@@ -1117,8 +1201,17 @@ export const agentsRepo = {
 };
 
 export const cognitiveModuleLogRepo = {
+  // PR #75 review (Superpowers finding #6): cognitive_module_log é tenant-aware
+  // (tenant_id + agent_id NOT NULL desde migration 008). O caller atual
+  // (reflection.ts) já passa tenant_id/agent_id explicitamente e roda dentro
+  // de runWithTenantContext, mas aplicamos `applyTenantGuard` aqui pra:
+  //   1. Falhar fechado se algum caller futuro esquecer o contexto.
+  //   2. Detectar mismatch entre input e contexto (caller passou tenant errado).
+  // O DEFAULT 'default' do schema fica como rede de segurança em P0 — sweep
+  // de DROP DEFAULT está agendado pro pós-P0 (finding #7).
   async record(entry: Omit<CognitiveModuleLog, 'id' | 'created_at'>): Promise<void> {
-    await db.insert(cognitive_module_log).values(entry);
+    const guarded = applyTenantGuard(entry as Record<string, unknown>);
+    await db.insert(cognitive_module_log).values(guarded as typeof entry);
   },
 
   async recentByModule(module_name: string, limit = 100): Promise<CognitiveModuleLog[]> {
