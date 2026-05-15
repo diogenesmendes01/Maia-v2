@@ -1970,7 +1970,8 @@ export const procedureMetricsRepo = {
   },
 };
 
-// P4: agent_operational_profile_versions — append-only, 4 camadas, status
+// P4: agent_operational_profile_versions — append-only, profile_body JSONB
+// (v3.1.1, 3 namespaces: identity/style/metadata), status
 // (proposed | active | frozen | rolled_back). Apenas a row `active` por
 // (tenant_id, agent_id) entra em runtime (enforced pelo partial unique index
 // agent_op_profile_unique_active_idx em migrations/025). Esse repo expõe um

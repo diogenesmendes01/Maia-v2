@@ -437,6 +437,13 @@ describe('P4 operational identity — end-to-end', () => {
     );
   });
 
+  // TODO(P4 refactor Tasks 5/6.5/8b): cenários 2-6 still pass legacy column fixtures
+  // (`core_immutable`, `operational_profile`, etc.) to buildVersion() overrides.
+  // They currently "pass" because mocked objects retain excess properties at runtime.
+  // When the renderer (Task 5) and drift detectors (Task 6.5) are refactored to
+  // read from profile_body.identity/style, these fixtures must be migrated to the
+  // ProfileBody shape. Task 8b will sweep cenários 4-6; cenário 1 already migrated.
+
   // ---------- Cenário 2 ----------
   it('cenário 2: prompt-builder com flag OFF lê self_state legado e ignora profile v2', async () => {
     const { featureFlags } = await import('@/config/feature-flags.js');
