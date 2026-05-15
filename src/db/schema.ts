@@ -1316,6 +1316,41 @@ export const role_selector_decisions = pgTable(
   }),
 );
 
+// P8e — policy_rules: Source of Truth versionada para regras de governança.
+// Master spec v3.1.1 §2.1. DEFAULT 'proposed' garante invariante #5; partial
+// unique 'one active' garante invariante #6 (no DB). rule_body é JSONB opaco
+// em P8e — P9d entrega o avaliador de DSL/AST.
+//
+// Migration: migrations/036_p8e_policy_rules.sql. Indexes idx_policy_rules_*
+// declared via raw SQL there (Drizzle 0.45 doesn't expose `COALESCE` in
+// uniqueIndex expressions cleanly). We declare the table here so types and
+// `.$inferSelect/$inferInsert` work; the migration is source of truth for
+// constraints.
+export const policy_rules = pgTable('policy_rules', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenant_id: text('tenant_id').notNull(),
+  agent_id: text('agent_id'),
+  rule_kind: text('rule_kind').notNull(),
+  rule_descriptor: text('rule_descriptor').notNull(),
+  rule_body: jsonb('rule_body').notNull(),
+  scope: jsonb('scope').notNull().default(sql`'{}'::jsonb`),
+  source_of_truth: text('source_of_truth').notNull(),
+  status: text('status').notNull().default('proposed'),
+  version: integer('version').notNull(),
+  proposed_by: text('proposed_by').notNull(),
+  proposed_reason: text('proposed_reason'),
+  approved_by: text('approved_by'),
+  approved_at: timestamp('approved_at', { withTimezone: true }),
+  activated_at: timestamp('activated_at', { withTimezone: true }),
+  deprecated_at: timestamp('deprecated_at', { withTimezone: true }),
+  rolled_back_at: timestamp('rolled_back_at', { withTimezone: true }),
+  rollback_reason: text('rollback_reason'),
+  created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export type PolicyRuleRow = typeof policy_rules.$inferSelect;
+export type NewPolicyRuleRow = typeof policy_rules.$inferInsert;
+
 export type Entidade = typeof entidades.$inferSelect;
 export type Pessoa = typeof pessoas.$inferSelect;
 export type Permissao = typeof permissoes.$inferSelect;
