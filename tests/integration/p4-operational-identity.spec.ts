@@ -437,13 +437,6 @@ describe('P4 operational identity — end-to-end', () => {
     );
   });
 
-  // TODO(P4 refactor Tasks 5/6.5/8b): cenários 2-6 still pass legacy column fixtures
-  // (`core_immutable`, `operational_profile`, etc.) to buildVersion() overrides.
-  // They currently "pass" because mocked objects retain excess properties at runtime.
-  // When the renderer (Task 5) and drift detectors (Task 6.5) are refactored to
-  // read from profile_body.identity/style, these fixtures must be migrated to the
-  // ProfileBody shape. Task 8b will sweep cenários 4-6; cenário 1 already migrated.
-
   // ---------- Cenário 2 ----------
   it('cenário 2: prompt-builder com flag OFF lê self_state legado e ignora profile v2', async () => {
     const { featureFlags } = await import('@/config/feature-flags.js');
@@ -453,9 +446,13 @@ describe('P4 operational identity — end-to-end', () => {
     operationalProfileVersionsGetActive.mockResolvedValue(
       buildVersion({
         status: 'active',
-        core_immutable: {
-          identity_block: 'V2_PROFILE_BODY_SHOULD_NOT_APPEAR',
-          principles: ['princípio ignorado'],
+        profile_body: {
+          ...makeEmptyProfileBody(),
+          identity: {
+            ...makeEmptyProfileBody().identity,
+            role_descriptor: 'V2_PROFILE_BODY_SHOULD_NOT_APPEAR',
+            priorities: ['princípio ignorado'],
+          },
         },
       }),
     );
@@ -482,12 +479,18 @@ describe('P4 operational identity — end-to-end', () => {
     operationalProfileVersionsGetActive.mockResolvedValue(
       buildVersion({
         status: 'active',
-        core_immutable: {
-          identity_block: 'V2_IDENTITY_DISTINCT_BLOCK',
-          principles: ['princípio v2 alpha', 'princípio v2 beta'],
-        },
-        operational_profile: {
-          voice_descriptor: 'voz v2 distinta',
+        profile_body: {
+          ...makeEmptyProfileBody(),
+          identity: {
+            ...makeEmptyProfileBody().identity,
+            role_descriptor: 'V2_IDENTITY_DISTINCT_BLOCK',
+            priorities: ['princípio v2 alpha', 'princípio v2 beta'],
+            voice: {
+              tone: 'voz v2 distinta',
+              formality: 'medium',
+              verbosity: 'concise',
+            },
+          },
         },
       }),
     );
@@ -495,12 +498,13 @@ describe('P4 operational identity — end-to-end', () => {
     const { buildPrompt } = await import('@/agent/prompt-builder.js');
     const { system } = await buildPrompt(ctx);
 
-    // Profile v2 content is rendered.
+    // Profile v2 content is rendered (v3.1.1 renderer: ## Identidade operacional + ## Estilo).
     expect(system).toContain('V2_IDENTITY_DISTINCT_BLOCK');
-    expect(system).toContain('## Princípios');
-    expect(system).toContain('- princípio v2 alpha');
-    expect(system).toContain('## Voz operacional');
-    expect(system).toContain('voz v2 distinta');
+    expect(system).toContain('## Identidade operacional');
+    expect(system).toContain('- Papel: V2_IDENTITY_DISTINCT_BLOCK');
+    expect(system).toContain('1. princípio v2 alpha');
+    expect(system).toContain('- Tom: voz v2 distinta');
+    expect(system).toContain('## Estilo');
     expect(system).toContain('op_profile_v3');
     // Self_state legacy content is NOT in the prompt.
     expect(system).not.toContain('LEGACY_SYSTEM_PROMPT_BODY');
@@ -520,8 +524,12 @@ describe('P4 operational identity — end-to-end', () => {
     operationalProfileVersionsGetActive.mockResolvedValue(
       buildVersion({
         status: 'proposed',
-        core_immutable: {
-          identity_block: 'V2_PROPOSED_BODY_MUST_NEVER_APPEAR',
+        profile_body: {
+          ...makeEmptyProfileBody(),
+          identity: {
+            ...makeEmptyProfileBody().identity,
+            role_descriptor: 'V2_PROPOSED_BODY_MUST_NEVER_APPEAR',
+          },
         },
       }),
     );
@@ -617,12 +625,18 @@ describe('P4 operational identity — end-to-end', () => {
     operationalProfileVersionsGetActive.mockResolvedValue(
       buildVersion({
         status: 'active',
-        core_immutable: {
-          identity_block: 'V2_KILLSWITCH_TEST_BLOCK',
-          principles: ['princípio rollback'],
-        },
-        operational_profile: {
-          voice_descriptor: 'voz rollback test',
+        profile_body: {
+          ...makeEmptyProfileBody(),
+          identity: {
+            ...makeEmptyProfileBody().identity,
+            role_descriptor: 'V2_KILLSWITCH_TEST_BLOCK',
+            priorities: ['princípio rollback'],
+            voice: {
+              tone: 'voz rollback test',
+              formality: 'medium',
+              verbosity: 'concise',
+            },
+          },
         },
       }),
     );
