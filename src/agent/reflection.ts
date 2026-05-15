@@ -5,6 +5,7 @@ import { logger } from '@/lib/logger.js';
 import { reflect } from '@/cognition/reflector.js';
 import { classify } from '@/cognition/classifier.js';
 import { persistCandidate } from '@/cognition/persister.js';
+import { recordFailure } from '@/cognition/capability-tracker.js';
 import { CognitiveEventType } from '@/types/enums.js';
 import type { Pessoa, Conversa, Mensagem } from '@/db/schema.js';
 
@@ -80,6 +81,19 @@ export async function reflectOnCorrection(input: {
       logger.info(
         { rule_id: persistResult.id, tipo: classified.tipo },
         'reflection.rule_created',
+      );
+    }
+
+    // P2 Task 14: update self-model on user correction. Domain extraction is
+    // naive in P2 (default 'general'); P3+ refines via procedure context.
+    // recordFailure swallows its own errors, but we still try/catch here so
+    // even a thrown-from-import path can't break the reflection pipeline.
+    try {
+      await recordFailure({ domain: 'general', failure_mode: 'user_correction' });
+    } catch (err) {
+      logger.warn(
+        { err: (err as Error).message },
+        'reflection.capability_tracker_failed',
       );
     }
   } catch (err) {

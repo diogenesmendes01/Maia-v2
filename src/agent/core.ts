@@ -22,6 +22,7 @@ import { detectSuccess } from './success-detector.js';
 import { reflect } from '@/cognition/reflector.js';
 import { classify } from '@/cognition/classifier.js';
 import { persistCandidate } from '@/cognition/persister.js';
+import { recordSuccess } from '@/cognition/capability-tracker.js';
 import { CognitiveEventType } from '@/types/enums.js';
 import { sendOutbound } from './output-dispatch.js';
 import { runReActLoop } from './react-loop.js';
@@ -278,6 +279,10 @@ async function runAgentForMensagemInner(mensagem_id: string): Promise<void> {
         const classified = await classify(reflected.insight);
         if (!classified) return;
         await persistCandidate(classified, event);
+        // P2 Task 14: update self-model on explicit success. Domain extraction
+        // is naive in P2 (default 'general'); P3+ refines via procedure context
+        // or topic detection. recordSuccess swallows its own errors.
+        await recordSuccess({ domain: 'general' });
       } catch (err) {
         logger.warn(
           { err: (err as Error).message, mensagem_id: inbound.id },

@@ -11,6 +11,10 @@ export async function runCognitiveModule<TOut>(
   const timeoutMs = opts.timeoutMs ?? 30000;
   const audit = opts.audit ?? true;
   let status: RunModuleResult<TOut>['status'] = 'success';
+  // PR #82 review: declare output without an initial null assignment —
+  // `let foo = null` followed by an unconditional re-assignment in both
+  // try and catch arms trips `no-useless-assignment`. TS already forces
+  // a definite assignment along every reachable path.
   let output: TOut | null;
   let fallback_triggered = false;
   let error_message: string | undefined;
