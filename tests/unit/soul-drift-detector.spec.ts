@@ -88,8 +88,9 @@ function makeMessages(n: number, text: string) {
 beforeEach(() => {
   mockActiveBiases = [];
   vi.clearAllMocks();
-  // Limpa API key pra evitar chamada de LLM nos testes
-  delete process.env.ANTHROPIC_API_KEY;
+  // ANTHROPIC_API_KEY é seeded em tests/setup.ts; o detector tem try/catch
+  // que retorna null silenciosamente em qualquer erro do SDK — heurística
+  // permanece o caminho principal nos testes.
 });
 
 describe('soulDriftDetector (P8b)', () => {
