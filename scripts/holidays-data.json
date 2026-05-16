@@ -1,0 +1,12 @@
+{
+  "state": [
+    { "name": "Revolução Constitucionalista", "uf": "SP", "month": 7, "day": 9 }
+  ],
+  "municipal": [
+    { "name": "Aniversário de São Paulo", "uf": "SP", "cidade": "São Paulo", "month": 1, "day": 25 },
+    { "name": "Fundação de Campinas", "uf": "SP", "cidade": "Campinas", "month": 7, "day": 14 },
+    { "name": "Aniversário do Rio de Janeiro", "uf": "RJ", "cidade": "Rio de Janeiro", "month": 3, "day": 1 },
+    { "name": "São Sebastião", "uf": "RJ", "cidade": "Rio de Janeiro", "month": 1, "day": 20 },
+    { "name": "Aniversário de Belo Horizonte", "uf": "MG", "cidade": "Belo Horizonte", "month": 12, "day": 12 }
+  ]
+}

@@ -127,6 +127,11 @@ export const AUDIT_ACTIONS = [
   'payment_due_skipped',
   'payment_due_postponed',
   'payment_due_unanswered',
+  // Calendar v2
+  'calendar_query',
+  'manage_calendar',
+  'capability_proposal_approved',
+  'capability_proposal_rejected',
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];
@@ -156,6 +161,8 @@ export const ACTION_KEYS = [
   'emergency_unlock',
   'mark_rule_firm',
   'ban_rule',
+  // Calendar v2
+  'manage_calendar',
 ] as const;
 
 export type ActionKey = (typeof ACTION_KEYS)[number];

@@ -25,6 +25,19 @@ import { startWorkflowTool } from './start-workflow.js';
 import { askPendingQuestionTool } from './ask-pending-question.js';
 import { generateReportTool } from './generate-report.js';
 import { config } from '@/config/env.js';
+import { featureFlags } from '@/config/feature-flags.js';
+import { FeatureFlagName } from '@/types/enums.js';
+// Calendar v2 — read-only tools
+import { calendarIsBusinessDayTool } from './calendar/calendar-is-business-day.js';
+import { calendarNextHolidayTool } from './calendar/calendar-next-holiday.js';
+import { calendarListHolidaysTool } from './calendar/calendar-list-holidays.js';
+import { calendarBusinessDaysBetweenTool } from './calendar/calendar-business-days-between.js';
+import { calendarAddBusinessDaysTool } from './calendar/calendar-add-business-days.js';
+// Calendar v2 — write tools + P5 closure
+import { registerCustomHolidayTool } from './register-custom-holiday.js';
+import { approveCapabilityProposalTool } from './approve-capability-proposal.js';
+import { rejectCapabilityProposalTool } from './reject-capability-proposal.js';
+import { listPendingProposalsTool } from './list-pending-proposals.js';
 
 export type ToolHandlerCtx = {
   pessoa: import('@/db/schema.js').Pessoa;
@@ -94,6 +107,22 @@ export const REGISTRY: Record<string, AnyTool> = {
   // B3b: gated by feature flag. When false, the LLM never sees this tool.
   ...(config.FEATURE_PDF_REPORTS
     ? { generate_report: generateReportTool as unknown as AnyTool }
+    : {}),
+  // Calendar v2 — read-only tools (sempre expostas; flag OFF retorna fallback
+  // legacy só-nacionais sem quebrar).
+  calendar_is_business_day: calendarIsBusinessDayTool as unknown as AnyTool,
+  calendar_next_holiday: calendarNextHolidayTool as unknown as AnyTool,
+  calendar_list_holidays: calendarListHolidaysTool as unknown as AnyTool,
+  calendar_business_days_between: calendarBusinessDaysBetweenTool as unknown as AnyTool,
+  calendar_add_business_days: calendarAddBusinessDaysTool as unknown as AnyTool,
+  // Calendar v2 — write tools (atrás da flag para evitar exposição prematura).
+  ...(featureFlags.isEnabled(FeatureFlagName.CALENDAR_V2)
+    ? {
+        register_custom_holiday: registerCustomHolidayTool as unknown as AnyTool,
+        approve_capability_proposal: approveCapabilityProposalTool as unknown as AnyTool,
+        reject_capability_proposal: rejectCapabilityProposalTool as unknown as AnyTool,
+        list_pending_proposals: listPendingProposalsTool as unknown as AnyTool,
+      }
     : {}),
 };
 

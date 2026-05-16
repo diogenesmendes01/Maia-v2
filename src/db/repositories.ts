@@ -3629,3 +3629,7 @@ export const roleSelectorDecisionsRepo = {
     return typeof raw === 'string' ? Number(raw) : raw;
   },
 };
+
+// Calendar v2 — re-export of holidaysRepo + holidayEntidadesRepo from dedicated modules.
+export { holidaysRepo } from './repositories/holidays-repo.js';
+export { holidayEntidadesRepo, CrossTenantIntegrityError } from './repositories/holiday-entidades-repo.js';

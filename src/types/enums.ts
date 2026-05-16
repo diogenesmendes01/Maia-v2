@@ -255,5 +255,7 @@ export const FeatureFlagName = {
   MULTI_CHANNEL: 'MULTI_CHANNEL',
   // P7 — grafo cognitivo formal (orquestração declarativa de módulos)
   COGNITIVE_GRAPH: 'cognitive_graph',
+  // Calendar v2 — feriados nacionais/regionais + business-day calendar + rrule extension
+  CALENDAR_V2: 'calendar_v2',
 } as const;
 export type FeatureFlagName = typeof FeatureFlagName[keyof typeof FeatureFlagName];

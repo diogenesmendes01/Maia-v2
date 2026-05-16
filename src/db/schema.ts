@@ -13,6 +13,11 @@ import {
   uniqueIndex,
   index,
   check,
+  varchar,
+  bigserial,
+  bigint,
+  smallint,
+  primaryKey,
 } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 
@@ -26,10 +31,65 @@ export const entidades = pgTable('entidades', {
   status: text('status').notNull().default('ativa'),
   cor: text('cor'),
   observacoes: text('observacoes'),
+  // Calendar v2: localização para resolução de feriados regionais (M036).
+  // NULL = retrocompat; sem cidade/uf, só feriados nacionais aplicam-se.
+  cidade: text('cidade'),
+  uf: varchar('uf', { length: 2 }),
   metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
   created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 });
+
+// Calendar v2: holidays — feriados nacionais, estaduais, municipais, custom
+// por entidade e recessos de holding. tenant_id NOT NULL (P0 invariant).
+// Veja migrations/037_calendar_b_holidays.sql para CHECK constraints.
+export const holidays = pgTable(
+  'holidays',
+  {
+    id: bigserial('id', { mode: 'number' }).primaryKey(),
+    tenant_id: text('tenant_id').notNull(),
+    name: text('name').notNull(),
+    month: smallint('month').notNull(),
+    day: smallint('day').notNull(),
+    year: integer('year'),
+    type: text('type').notNull(),
+    uf: varchar('uf', { length: 2 }),
+    cidade: text('cidade'),
+    proposal_id: uuid('proposal_id'),
+    approved_by: text('approved_by'),
+    approved_at: timestamp('approved_at', { withTimezone: true }),
+    status: text('status').notNull().default('ativo'),
+    source: text('source'),
+    metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    tenantDateIdx: index('idx_holidays_tenant_date').on(t.tenant_id, t.month, t.day),
+    tenantRegionalIdx: index('idx_holidays_tenant_regional').on(t.tenant_id, t.type, t.uf, t.cidade),
+  }),
+);
+
+// Calendar v2: junction holiday_entidades (custom holidays linked to specific
+// entidades, e.g. holding recess for entidade X). tenant_id explícito.
+export const holiday_entidades = pgTable(
+  'holiday_entidades',
+  {
+    tenant_id: text('tenant_id').notNull(),
+    holiday_id: bigint('holiday_id', { mode: 'number' }).notNull(),
+    entidade_id: uuid('entidade_id').notNull(),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.holiday_id, t.entidade_id] }),
+    tenantEntidadeIdx: index('idx_holiday_entidades_tenant_entidade').on(t.tenant_id, t.entidade_id),
+  }),
+);
+
+export type Holiday = typeof holidays.$inferSelect;
+export type NewHoliday = typeof holidays.$inferInsert;
+export type HolidayEntidade = typeof holiday_entidades.$inferSelect;
+export type NewHolidayEntidade = typeof holiday_entidades.$inferInsert;
 
 export const contas_bancarias = pgTable('contas_bancarias', {
   id: uuid('id').primaryKey().defaultRandom(),

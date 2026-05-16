@@ -154,6 +154,11 @@ const envSchema = z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
+    // Calendar v2 — feriados nacionais/regionais + business-day calendar + rrule extension
+    FEATURE_CALENDAR_V2: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
     /** Baseline pré-P7 em ms para p95 do sync path. Se ausente, gate skipa. */
     SYNC_LATENCY_P95_BASELINE_MS: z.coerce.number().int().positive().optional(),
     /** Percentual extra permitido sobre baseline (default 20). */
