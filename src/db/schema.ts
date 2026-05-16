@@ -224,6 +224,13 @@ export const agent_facts = pgTable(
     ultima_validacao: timestamp('ultima_validacao', { withTimezone: true }),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    // P10a — Knowledge State Machine lifecycle columns (added in
+    // migration 036; backfill with DEFAULT 'active' preserves legacy
+    // visibility for rows created before P10a was canary'd).
+    lifecycle_status: text('lifecycle_status').notNull().default('active'),
+    evidence_count: integer('evidence_count').notNull().default(0),
+    lifecycle_transitions: jsonb('lifecycle_transitions').notNull().default(sql`'[]'::jsonb`),
+    last_recall_at: timestamp('last_recall_at', { withTimezone: true }),
   },
   (t) => ({
     uniq: unique('agent_facts_tenant_agent_escopo_chave_key').on(
@@ -251,6 +258,11 @@ export const learned_rules = pgTable('learned_rules', {
   exemplo_origem_id: uuid('exemplo_origem_id'),
   created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  // P10a — Knowledge State Machine lifecycle columns (migration 036)
+  lifecycle_status: text('lifecycle_status').notNull().default('active'),
+  evidence_count: integer('evidence_count').notNull().default(0),
+  lifecycle_transitions: jsonb('lifecycle_transitions').notNull().default(sql`'[]'::jsonb`),
+  last_recall_at: timestamp('last_recall_at', { withTimezone: true }),
 });
 
 export const agent_memories = pgTable('agent_memories', {
@@ -691,6 +703,12 @@ export const memory_entry = pgTable(
     expires_at: timestamp('expires_at', { withTimezone: true }),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    // P10a — Knowledge State Machine lifecycle columns (migration 036)
+    lifecycle_status: text('lifecycle_status').notNull().default('active'),
+    evidence_count: integer('evidence_count').notNull().default(0),
+    confidence: numeric('confidence', { precision: 4, scale: 3 }).notNull().default('0.500'),
+    lifecycle_transitions: jsonb('lifecycle_transitions').notNull().default(sql`'[]'::jsonb`),
+    last_recall_at: timestamp('last_recall_at', { withTimezone: true }),
   },
   (t) => ({
     tenantAgentIdx: index('memory_entry_tenant_agent_idx').on(t.tenant_id, t.agent_id, t.created_at),
@@ -719,6 +737,13 @@ export const behavioral_hint = pgTable(
     expires_at: timestamp('expires_at', { withTimezone: true }),
     revoked_at: timestamp('revoked_at', { withTimezone: true }),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    // P10a — Knowledge State Machine lifecycle columns (migration 036)
+    lifecycle_status: text('lifecycle_status').notNull().default('active'),
+    evidence_count: integer('evidence_count').notNull().default(0),
+    confidence: numeric('confidence', { precision: 4, scale: 3 }).notNull().default('0.500'),
+    lifecycle_transitions: jsonb('lifecycle_transitions').notNull().default(sql`'[]'::jsonb`),
+    last_recall_at: timestamp('last_recall_at', { withTimezone: true }),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
     tenantScopeIdx: index('behavioral_hint_tenant_scope_idx').on(

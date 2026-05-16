@@ -154,6 +154,11 @@ const envSchema = z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
+    // P10a — Knowledge State Machine (9 estados + auto-promoter + propose_* tools)
+    FEATURE_KNOWLEDGE_STATE_MACHINE_V1: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
     /** Baseline pré-P7 em ms para p95 do sync path. Se ausente, gate skipa. */
     SYNC_LATENCY_P95_BASELINE_MS: z.coerce.number().int().positive().optional(),
     /** Percentual extra permitido sobre baseline (default 20). */

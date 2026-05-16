@@ -45,4 +45,12 @@ export const featureFlags = new FeatureFlags({
   [FeatureFlagName.DIALOGICAL_ACQUISITION]: config.FEATURE_DIALOGICAL_ACQUISITION,
   [FeatureFlagName.MULTI_CHANNEL]: config.FEATURE_MULTI_CHANNEL,
   [FeatureFlagName.COGNITIVE_GRAPH]: config.FEATURE_COGNITIVE_GRAPH,
+  [FeatureFlagName.KNOWLEDGE_STATE_MACHINE_V1]: config.FEATURE_KNOWLEDGE_STATE_MACHINE_V1,
 });
+
+/**
+ * P10a — Knowledge State Machine feature flag, exposed as named constant
+ * for module-level early-returns (workers, tool registration).
+ */
+export const FEATURE_KNOWLEDGE_STATE_MACHINE_V1 =
+  config.FEATURE_KNOWLEDGE_STATE_MACHINE_V1;

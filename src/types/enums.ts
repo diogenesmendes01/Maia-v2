@@ -255,5 +255,7 @@ export const FeatureFlagName = {
   MULTI_CHANNEL: 'MULTI_CHANNEL',
   // P7 — grafo cognitivo formal (orquestração declarativa de módulos)
   COGNITIVE_GRAPH: 'cognitive_graph',
+  // P10a — Knowledge State Machine (9 estados + auto-promoter + propose_* tools)
+  KNOWLEDGE_STATE_MACHINE_V1: 'KNOWLEDGE_STATE_MACHINE_V1',
 } as const;
 export type FeatureFlagName = typeof FeatureFlagName[keyof typeof FeatureFlagName];

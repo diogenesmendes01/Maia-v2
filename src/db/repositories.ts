@@ -875,7 +875,21 @@ export const rulesRepo = {
       .orderBy(desc(learned_rules.confianca), desc(learned_rules.updated_at))
       .limit(50);
   },
-  async create(input: Omit<LearnedRule, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>): Promise<LearnedRule> {
+  async create(
+    input: Omit<
+      LearnedRule,
+      | 'id'
+      | 'tenant_id'
+      | 'agent_id'
+      | 'created_at'
+      | 'updated_at'
+      // P10a: lifecycle columns have DB defaults — callers don't supply them.
+      | 'lifecycle_status'
+      | 'evidence_count'
+      | 'lifecycle_transitions'
+      | 'last_recall_at'
+    >,
+  ): Promise<LearnedRule> {
     const guarded = applyTenantGuard(input);
     const rows = await db.insert(learned_rules).values(guarded).returning();
     return rows[0]!;
@@ -1474,7 +1488,20 @@ export const cognitiveCandidatesRepo = {
 
 export const memoryEntryRepo = {
   async create(
-    input: Omit<MemoryEntry, 'id' | 'created_at' | 'updated_at' | 'tenant_id' | 'agent_id'>,
+    input: Omit<
+      MemoryEntry,
+      | 'id'
+      | 'created_at'
+      | 'updated_at'
+      | 'tenant_id'
+      | 'agent_id'
+      // P10a: lifecycle columns have DB defaults — callers don't supply them.
+      | 'lifecycle_status'
+      | 'evidence_count'
+      | 'confidence'
+      | 'lifecycle_transitions'
+      | 'last_recall_at'
+    >,
   ): Promise<MemoryEntry> {
     const guarded = applyTenantGuard(input);
     const [row] = await db.insert(memory_entry).values(guarded).returning();
@@ -1589,7 +1616,21 @@ export const memoryEntryRepo = {
 
 export const behavioralHintRepo = {
   async create(
-    input: Omit<BehavioralHint, 'id' | 'created_at' | 'tenant_id' | 'agent_id'>,
+    input: Omit<
+      BehavioralHint,
+      | 'id'
+      | 'created_at'
+      | 'tenant_id'
+      | 'agent_id'
+      // P10a: lifecycle columns + updated_at have DB defaults — callers
+      // don't supply them.
+      | 'updated_at'
+      | 'lifecycle_status'
+      | 'evidence_count'
+      | 'confidence'
+      | 'lifecycle_transitions'
+      | 'last_recall_at'
+    >,
   ): Promise<BehavioralHint> {
     const guarded = applyTenantGuard(input);
     const [row] = await db.insert(behavioral_hint).values(guarded).returning();
