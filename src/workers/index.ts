@@ -25,6 +25,9 @@ import { runProcedureExecutionReaper } from './procedure-execution-reaper.js';
 import { runProcedureMetricsRefresh } from './procedure-metrics-refresh.js';
 import { runDriftMonitor } from './drift-monitor.js';
 import { runGapEscalationMonitor } from './gap-escalation-monitor.js';
+import { runTraceBodyWriter } from './trace-body-writer.js';
+import { runTraceBodyRecoverer } from './trace-body-recoverer.js';
+import { runTraceMatviewRefresh } from './trace-matview-refresh.js';
 import { tickEngine } from '@/workflows/engine.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 
@@ -87,6 +90,13 @@ export const JOBS: Job[] = [
   { name: 'drift_monitor', cron: '0 3 * * 0', fn: runDriftMonitor, phase: 4 },
   // P5 Task 9 — gap escalation monitor (a cada 30min).
   { name: 'gap_escalation_monitor', cron: '*/30 * * * *', fn: runGapEscalationMonitor, phase: 5 },
+  // P10b — runtime trace: 3 workers (body writer, body recoverer, matview refresh).
+  // body_writer drains the in-process enqueue (every minute).
+  { name: 'trace_body_writer', cron: '* * * * *', fn: runTraceBodyWriter, phase: 6 },
+  // body_recoverer flips persisted/orphans pending envelopes (every 5 min).
+  { name: 'trace_body_recoverer', cron: '*/5 * * * *', fn: runTraceBodyRecoverer, phase: 6 },
+  // matview refresh — unified_trace_events (every 5 min, CONCURRENTLY).
+  { name: 'trace_matview_refresh', cron: '*/5 * * * *', fn: runTraceMatviewRefresh, phase: 6 },
 ];
 
 const tasks: cron.ScheduledTask[] = [];
