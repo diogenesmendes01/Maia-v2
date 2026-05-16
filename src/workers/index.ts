@@ -25,6 +25,7 @@ import { runProcedureExecutionReaper } from './procedure-execution-reaper.js';
 import { runProcedureMetricsRefresh } from './procedure-metrics-refresh.js';
 import { runDriftMonitor } from './drift-monitor.js';
 import { runGapEscalationMonitor } from './gap-escalation-monitor.js';
+import { runKnowledgeStatePromoter } from './knowledge-state-promoter.js';
 import { tickEngine } from '@/workflows/engine.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 
@@ -87,6 +88,12 @@ export const JOBS: Job[] = [
   { name: 'drift_monitor', cron: '0 3 * * 0', fn: runDriftMonitor, phase: 4 },
   // P5 Task 9 — gap escalation monitor (a cada 30min).
   { name: 'gap_escalation_monitor', cron: '*/30 * * * *', fn: runGapEscalationMonitor, phase: 5 },
+  // P10a — knowledge state auto-promoter (hourly; matures ephemeral→observed→
+  // reinforced→verified→active by evidence_count + age, and expires stale
+  // rows to deprecated). Worker is gated by FEATURE_KNOWLEDGE_STATE_MACHINE_V1
+  // — when off it early-returns immediately, so leaving the cron entry on is
+  // safe.
+  { name: 'knowledge_state_promoter', cron: '0 * * * *', fn: runKnowledgeStatePromoter, phase: 2 },
 ];
 
 const tasks: cron.ScheduledTask[] = [];

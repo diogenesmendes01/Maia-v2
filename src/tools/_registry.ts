@@ -20,6 +20,10 @@ import { compareEntitiesTool } from './compare-entities.js';
 import { recallMemoryTool } from './recall-memory.js';
 import { saveFactTool } from './save-fact.js';
 import { saveRuleTool } from './save-rule.js';
+import { proposeFactTool } from './propose-fact.js';
+import { proposeRuleTool } from './propose-rule.js';
+import { proposeMemoryTool } from './propose-memory.js';
+import { proposeHintTool } from './propose-hint.js';
 import { listPendingTool } from './list-pending.js';
 import { startWorkflowTool } from './start-workflow.js';
 import { askPendingQuestionTool } from './ask-pending-question.js';
@@ -88,6 +92,13 @@ export const REGISTRY: Record<string, AnyTool> = {
   recall_memory: recallMemoryTool as unknown as AnyTool,
   save_fact: saveFactTool as unknown as AnyTool,
   save_rule: saveRuleTool as unknown as AnyTool,
+  // P10a — Knowledge State Machine `propose_*` tools. The harness
+  // decides the initial lifecycle state (ephemeral / pending_review);
+  // the LLM never writes directly to `active`.
+  propose_fact: proposeFactTool as unknown as AnyTool,
+  propose_rule: proposeRuleTool as unknown as AnyTool,
+  propose_memory: proposeMemoryTool as unknown as AnyTool,
+  propose_hint: proposeHintTool as unknown as AnyTool,
   list_pending: listPendingTool as unknown as AnyTool,
   start_workflow: startWorkflowTool as unknown as AnyTool,
   ask_pending_question: askPendingQuestionTool as unknown as AnyTool,
