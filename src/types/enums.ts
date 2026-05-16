@@ -54,6 +54,9 @@ export type CandidateType = typeof CandidateType[keyof typeof CandidateType];
 /**
  * P4 — Tipos de drift de identidade operacional detectados pelo sistema.
  * Mapeiam dimensões do comportamento que podem desviar do perfil ativo.
+ *
+ * P8d adiciona PAPEL_DRIFT (9º). P8b adiciona SOUL_DRIFT (8º) — registrado
+ * em outra branch; quando aquela merge, este enum cresce naturalmente.
  */
 export const DriftType = {
   TOM: 'tom',
@@ -63,6 +66,7 @@ export const DriftType = {
   ESCOPO: 'escopo',
   LINGUAGEM: 'linguagem',
   PROCEDIMENTO: 'procedimento',
+  PAPEL_DRIFT: 'papel_drift',
 } as const;
 export type DriftType = typeof DriftType[keyof typeof DriftType];
 
