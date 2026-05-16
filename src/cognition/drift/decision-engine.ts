@@ -135,6 +135,30 @@ export function classifySeverity(ev: DriftEvidence): DriftSeverity {
       if (hint !== null) return hint;
       return DriftSeverity.BAIXO;
     }
+    case DriftType.PAPEL_DRIFT: {
+      // P8d §7 — floor rules determinísticas. Conservadoras: 3+ exemplos
+      // são piso `alto`; rolesDiverge + 3+ é `critico`. Hint só age se
+      // nenhuma regra-piso disparou.
+      const offRoleRaw = (p as { off_role_examples?: unknown }).off_role_examples;
+      const offRole = Array.isArray(offRoleRaw) ? offRoleRaw : [];
+      const observed = (p as { observed_role_inferred?: unknown }).observed_role_inferred;
+      const declared = (p as { declared_role?: unknown }).declared_role;
+      const rolesDiverge =
+        typeof observed === 'string' &&
+        typeof declared === 'string' &&
+        observed.length > 0 &&
+        !observed.toLowerCase().includes(
+          (declared.toLowerCase().split('_')[0] ?? ''),
+        );
+
+      if (offRole.length >= 5 || (rolesDiverge && offRole.length >= 3))
+        return DriftSeverity.CRITICO;
+      if (offRole.length >= 3) return DriftSeverity.ALTO;
+      if (offRole.length === 2) return DriftSeverity.MEDIO;
+      if (offRole.length === 1) return DriftSeverity.BAIXO;
+      if (hint !== null) return hint;
+      return DriftSeverity.BAIXO;
+    }
     default:
       // unknown drift_type — defensivo
       return hint !== null ? hint : DriftSeverity.BAIXO;

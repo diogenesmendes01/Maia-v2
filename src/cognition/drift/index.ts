@@ -20,9 +20,12 @@ import { viesDetector } from './vies.js';
 import { escopoDetector } from './escopo.js';
 import { linguagemDetector } from './linguagem.js';
 import { procedimentoDetector } from './procedimento.js';
+import { papelDriftDetector } from './papel.js';
 import type { DriftDetector, DriftDetectionInput, DriftEvidence } from './types.js';
 
-const DETECTORS: DriftDetector[] = [
+// P8d §6 — papelDriftDetector é o 9º detector (P8b adiciona soul_drift como 8º
+// em outra branch; quando aquele merge, basta inserir ali).
+export const DETECTORS: DriftDetector[] = [
   tomDetector,
   valoresDetector,
   confiancaDetector,
@@ -30,6 +33,7 @@ const DETECTORS: DriftDetector[] = [
   escopoDetector,
   linguagemDetector,
   procedimentoDetector,
+  papelDriftDetector,
 ];
 
 export async function runAllDriftDetectors(
