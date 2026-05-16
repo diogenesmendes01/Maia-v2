@@ -1433,3 +1433,122 @@ export type ChannelPolicy = typeof channel_policies.$inferSelect;
 export type NewChannelPolicy = typeof channel_policies.$inferInsert;
 export type RoleSelectorDecisionRow = typeof role_selector_decisions.$inferSelect;
 export type NewRoleSelectorDecisionRow = typeof role_selector_decisions.$inferInsert;
+
+// P9a: skills — Skill Contracts versionados (Source of Truth)
+// Master spec v3.1.1 §2.4 + §2.5 (runtime_hints).
+// Convenções:
+//  - DEFAULT status='proposed' (uma skill nunca nasce active).
+//  - Partial unique "one active" garante invariante no DB; o repo respeita.
+//  - tenant_id é TEXT (slug), seguindo padrão de migrations 007/018+ —
+//    spec menciona UUID mas o resto da Maia ainda usa slug; alinhamento
+//    pode ocorrer em P11. agent_id NULL = skill tenant-wide.
+export const skills = pgTable(
+  'skills',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id'),
+
+    skill_descriptor: text('skill_descriptor').notNull(),
+    category: text('category').notNull(),
+    execution_mode: text('execution_mode').notNull(),
+
+    goal: text('goal').notNull(),
+    when_to_use: text('when_to_use').notNull(),
+    procedure: jsonb('procedure').notNull().default(sql`'{}'::jsonb`),
+    constraints: jsonb('constraints').notNull().default(sql`'[]'::jsonb`),
+
+    input_schema: jsonb('input_schema').notNull(),
+    output_schema: jsonb('output_schema').notNull(),
+
+    allowed_tools: text('allowed_tools').array().notNull().default(sql`'{}'::text[]`),
+    policy_descriptors: text('policy_descriptors').array().notNull().default(sql`'{}'::text[]`),
+
+    success_criteria: jsonb('success_criteria').notNull().default(sql`'[]'::jsonb`),
+    failure_modes: jsonb('failure_modes').notNull().default(sql`'[]'::jsonb`),
+
+    runtime_hints: jsonb('runtime_hints').notNull().default(sql`'{}'::jsonb`),
+
+    status: text('status').notNull().default('proposed'),
+    version: integer('version').notNull(),
+    proposed_by: text('proposed_by').notNull(),
+    proposed_reason: text('proposed_reason'),
+    approved_by: text('approved_by'),
+    approved_at: timestamp('approved_at', { withTimezone: true }),
+    activated_at: timestamp('activated_at', { withTimezone: true }),
+    deprecated_at: timestamp('deprecated_at', { withTimezone: true }),
+    rolled_back_at: timestamp('rolled_back_at', { withTimezone: true }),
+    rollback_reason: text('rollback_reason'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    tenantActiveIdx: index('idx_skills_tenant_active')
+      .on(t.tenant_id, t.status, t.skill_descriptor)
+      .where(sql`status = 'active'`),
+    tenantCategoryActiveIdx: index('idx_skills_tenant_category_active')
+      .on(t.tenant_id, t.category, t.status)
+      .where(sql`status = 'active'`),
+    versionUq: uniqueIndex('idx_skills_version_uq').on(
+      t.tenant_id,
+      sql`COALESCE(agent_id, 'tenant_wide')`,
+      t.skill_descriptor,
+      t.version,
+    ),
+    oneActiveUq: uniqueIndex('idx_skills_one_active_uq')
+      .on(t.tenant_id, sql`COALESCE(agent_id, 'tenant_wide')`, t.skill_descriptor)
+      .where(sql`status = 'active'`),
+    proposedIdx: index('idx_skills_proposed')
+      .on(t.tenant_id, t.status, t.created_at)
+      .where(sql`status = 'proposed'`),
+    categoryCheck: check(
+      'skills_category_check',
+      sql`category IN ('classify', 'extract', 'compose', 'decide', 'tool_mediated', 'diagnose', 'plan', 'evaluator')`,
+    ),
+    executionModeCheck: check(
+      'skills_execution_mode_check',
+      sql`execution_mode IN ('prompt_only', 'procedure_adapter', 'tool_mediated', 'evaluator')`,
+    ),
+    statusCheck: check(
+      'skills_status_check',
+      sql`status IN ('proposed', 'active', 'deprecated', 'rolled_back')`,
+    ),
+  }),
+);
+
+export type SkillRow = typeof skills.$inferSelect;
+export type NewSkillRow = typeof skills.$inferInsert;
+
+/**
+ * Runtime hints declarados no Skill Contract (master §2.5 CORREÇÃO #14).
+ * O harness aplica caps por execução; ausência de campo cai em defaults
+ * do SkillRunner.
+ */
+export interface SkillRuntimeHints {
+  max_prompt_tokens?: number;
+  max_output_tokens?: number;
+  max_tool_calls?: number;
+  preferred_model?: string;
+  timeout_ms?: number;
+}
+
+/**
+ * Forma estrutural do contrato declarativo (linha em `skills`). Usado
+ * como input para `skillsRepo.propose` e como o `proposed_spec` em
+ * `capability_proposals` quando capability_type='skill'.
+ */
+export interface SkillContract {
+  skill_descriptor: string;
+  category: string;
+  execution_mode: string;
+  goal: string;
+  when_to_use: string;
+  procedure: Record<string, unknown>;
+  constraints?: Array<Record<string, unknown>>;
+  input_schema: Record<string, unknown>;
+  output_schema: Record<string, unknown>;
+  allowed_tools?: string[];
+  policy_descriptors?: string[];
+  success_criteria?: Array<Record<string, unknown>>;
+  failure_modes?: Array<Record<string, unknown>>;
+  runtime_hints?: SkillRuntimeHints;
+}

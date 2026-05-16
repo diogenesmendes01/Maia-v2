@@ -154,6 +154,11 @@ const envSchema = z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
+    // P9a — Skill Registry v1 (skills table + SkillRunner + 4 modes)
+    FEATURE_SKILL_REGISTRY_V1: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
     /** Baseline pré-P7 em ms para p95 do sync path. Se ausente, gate skipa. */
     SYNC_LATENCY_P95_BASELINE_MS: z.coerce.number().int().positive().optional(),
     /** Percentual extra permitido sobre baseline (default 20). */

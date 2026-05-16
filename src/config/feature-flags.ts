@@ -45,4 +45,5 @@ export const featureFlags = new FeatureFlags({
   [FeatureFlagName.DIALOGICAL_ACQUISITION]: config.FEATURE_DIALOGICAL_ACQUISITION,
   [FeatureFlagName.MULTI_CHANNEL]: config.FEATURE_MULTI_CHANNEL,
   [FeatureFlagName.COGNITIVE_GRAPH]: config.FEATURE_COGNITIVE_GRAPH,
+  [FeatureFlagName.SKILL_REGISTRY_V1]: config.FEATURE_SKILL_REGISTRY_V1,
 });

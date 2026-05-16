@@ -235,6 +235,48 @@ export const CognitiveLayer = {
 export type CognitiveLayer = (typeof CognitiveLayer)[keyof typeof CognitiveLayer];
 
 /**
+ * P9a — Ciclo de vida de uma skill (Skill Contract). Toda skill nasce em
+ * 'proposed'; só vira 'active' por aprovação explícita. 'rolled_back' é
+ * estado terminal pós-revert, mas reativa a versão anterior automaticamente.
+ */
+export const SkillStatus = {
+  PROPOSED: 'proposed',
+  ACTIVE: 'active',
+  DEPRECATED: 'deprecated',
+  ROLLED_BACK: 'rolled_back',
+} as const;
+export type SkillStatus = typeof SkillStatus[keyof typeof SkillStatus];
+
+/**
+ * P9a — Modo de execução de uma skill. Cada modo tem um handler estável
+ * em `src/skills/modes/<mode>.ts` (executor não muda por edição de Admin
+ * UI; só por PR de código).
+ */
+export const SkillExecutionMode = {
+  PROMPT_ONLY: 'prompt_only',
+  PROCEDURE_ADAPTER: 'procedure_adapter',
+  TOOL_MEDIATED: 'tool_mediated',
+  EVALUATOR: 'evaluator',
+} as const;
+export type SkillExecutionMode = typeof SkillExecutionMode[keyof typeof SkillExecutionMode];
+
+/**
+ * P9a — Categoria semântica de uma skill (orienta listagem em Admin UI
+ * e seleção do proposer). Ortogonal a execution_mode.
+ */
+export const SkillCategory = {
+  CLASSIFY: 'classify',
+  EXTRACT: 'extract',
+  COMPOSE: 'compose',
+  DECIDE: 'decide',
+  TOOL_MEDIATED: 'tool_mediated',
+  DIAGNOSE: 'diagnose',
+  PLAN: 'plan',
+  EVALUATOR: 'evaluator',
+} as const;
+export type SkillCategory = typeof SkillCategory[keyof typeof SkillCategory];
+
+/**
  * Nomes de feature flags conhecidas. Cresce conforme fases ativam.
  */
 export const FeatureFlagName = {
@@ -255,5 +297,7 @@ export const FeatureFlagName = {
   MULTI_CHANNEL: 'MULTI_CHANNEL',
   // P7 — grafo cognitivo formal (orquestração declarativa de módulos)
   COGNITIVE_GRAPH: 'cognitive_graph',
+  // P9a — Skill Registry v1 (skills table + SkillRunner + 4 execution modes).
+  SKILL_REGISTRY_V1: 'SKILL_REGISTRY_V1',
 } as const;
 export type FeatureFlagName = typeof FeatureFlagName[keyof typeof FeatureFlagName];
