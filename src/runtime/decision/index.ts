@@ -40,6 +40,11 @@ export type {
   DecisionEngineResult,
 } from './decision-engine.js';
 
+export {
+  runDecisionEngineIfEnabled,
+  type RunDecisionEngineResult,
+} from './integration.js';
+
 export * from './types.js';
 
 import type {

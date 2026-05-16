@@ -54,10 +54,13 @@ export class RiskScorerStubImpl implements RiskScorer {
       reasons.push(`medium_intent_noted:${input.intent.label}`);
     }
 
+    // Defensive check: P9b stub never returns 'high' but the contract allows
+    // future P9c implementations to elevate. Cast keeps the contract clear.
+    const requires_human_review: boolean = (level as RiskLevel) === 'high';
     return {
       level,
       reasons,
-      requires_human_review: level === 'high',
+      requires_human_review,
     };
   }
 }
