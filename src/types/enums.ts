@@ -235,6 +235,24 @@ export const CognitiveLayer = {
 export type CognitiveLayer = (typeof CognitiveLayer)[keyof typeof CognitiveLayer];
 
 /**
+ * P9c — Nível de risco operacional (spec §10.11). Calculado pelo
+ * `risk-assessor` em dois estágios (heurística determinística + LLM
+ * Haiku condicional).
+ *
+ * Ordenação total: low < medium < high < critical. Comparações de
+ * "max" e "no-downgrade" devem usar `compareRiskLevel` em
+ * `src/shared/risk/level.ts`, não strings — evita erros de ordering
+ * em editores que reordenem o objeto.
+ */
+export const RiskLevel = {
+  LOW: 'low',
+  MEDIUM: 'medium',
+  HIGH: 'high',
+  CRITICAL: 'critical',
+} as const;
+export type RiskLevel = typeof RiskLevel[keyof typeof RiskLevel];
+
+/**
  * Nomes de feature flags conhecidas. Cresce conforme fases ativam.
  */
 export const FeatureFlagName = {
