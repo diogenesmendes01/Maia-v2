@@ -154,6 +154,23 @@ const envSchema = z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
+    // P10b — runtime trace (sync envelope + async body, HMAC + redaction)
+    FEATURE_RUNTIME_TRACE_V1: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
+    /** HMAC key version currently in use (rotates every 90d). */
+    RUNTIME_TRACE_HMAC_KEY_VERSION: z.coerce.number().int().positive().default(1),
+    /** Master secret material (test only — prod fetches from KMS). */
+    RUNTIME_TRACE_HMAC_MASTER_SECRET: z.string().optional(),
+    /** S3 bucket for debug-mode encrypted snapshots (24h TTL). */
+    RUNTIME_TRACE_DEBUG_S3_BUCKET: z.string().optional(),
+    /** AES-GCM key (base64) for debug-mode snapshot encryption. */
+    RUNTIME_TRACE_DEBUG_AES_KEY: z.string().optional(),
+    /** Max age in seconds of a pending envelope body before recoverer alerts (default 300). */
+    RUNTIME_TRACE_BODY_ORPHAN_SEC: z.coerce.number().int().positive().default(300),
+    /** Refresh interval for unified_trace_events matview (worker schedules; this is metadata only). */
+    RUNTIME_TRACE_MATVIEW_REFRESH_SEC: z.coerce.number().int().positive().default(300),
     /** Baseline pré-P7 em ms para p95 do sync path. Se ausente, gate skipa. */
     SYNC_LATENCY_P95_BASELINE_MS: z.coerce.number().int().positive().optional(),
     /** Percentual extra permitido sobre baseline (default 20). */

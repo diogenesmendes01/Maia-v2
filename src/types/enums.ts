@@ -255,5 +255,7 @@ export const FeatureFlagName = {
   MULTI_CHANNEL: 'MULTI_CHANNEL',
   // P7 — grafo cognitivo formal (orquestração declarativa de módulos)
   COGNITIVE_GRAPH: 'cognitive_graph',
+  // P10b — runtime trace (envelope sync + body async, HMAC + redaction)
+  RUNTIME_TRACE_V1: 'runtime_trace_v1',
 } as const;
 export type FeatureFlagName = typeof FeatureFlagName[keyof typeof FeatureFlagName];
