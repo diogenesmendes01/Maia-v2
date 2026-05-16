@@ -22,12 +22,15 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { runCognitiveModule } from './runner.js';
 import { capabilityProposalsRepo } from '@/db/repositories.js';
+import type { CapabilityProposalType } from '@/db/repositories.js';
 import { featureFlags } from '@/config/feature-flags.js';
 import { FeatureFlagName } from '@/types/enums.js';
 import type { AgentCapabilityGap } from '@/db/schema.js';
 
 export type ProposalDraft = {
-  capability_type: 'tool' | 'knowledge' | 'procedure' | 'integration' | 'other';
+  // P9a: união estendida — 'skill' habilitado para o capability-proposer
+  // gerar drafts de Skill Contract via mesma rota. Owner aprova no Admin UI.
+  capability_type: CapabilityProposalType;
   title: string;
   description: string;
   proposed_spec: Record<string, unknown>;
