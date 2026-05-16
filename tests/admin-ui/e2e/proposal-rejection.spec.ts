@@ -1,7 +1,7 @@
 /**
  * P8.5 — Single-proposal rejection E2E.
  */
-import { test, expect } from '@playwright/test';
+import { test } from '@playwright/test';
 
 test.describe('Proposal Rejection', () => {
   test('rejection records comment + status=rejected', async ({ page }) => {

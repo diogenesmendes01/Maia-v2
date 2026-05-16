@@ -6,7 +6,7 @@
  *     exactly one admin_audit_log row.
  *   - No mutation can edit/delete past audit rows.
  */
-import { test, expect } from '@playwright/test';
+import { test } from '@playwright/test';
 
 test.describe('Audit Log', () => {
   test('approval writes single audit entry', async ({ page }) => {

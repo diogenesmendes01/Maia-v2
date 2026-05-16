@@ -12,7 +12,6 @@ const handler = (req: Request) =>
     router: appRouter,
     createContext: () => createTRPCContext({ headers: req.headers }),
     onError: ({ path, error }) => {
-      // eslint-disable-next-line no-console
       console.error(`[tRPC] ${path ?? '<unknown>'} → ${error.code}: ${error.message}`);
     },
   });
