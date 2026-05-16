@@ -52,6 +52,7 @@ import {
 import { TypedError } from '@/lib/utils.js';
 import { applyTenantGuard } from './tenant-guard.js';
 import { getCurrentTenant, getCurrentAgent } from './tenant-context.js';
+import { LearnedVoiceModifierSchema } from '@/identity/learned-voice-modifier.js';
 import type {
   ProfileStatus,
   DriftType,
@@ -2550,12 +2551,60 @@ export const procedureMetricsRepo = {
       ));
   },
 };
+/**
+ * P8d §10 — Write-path validation para `profile_body`.
+ *
+ * Aplicada antes de qualquer INSERT em `agent_operational_profile_versions`.
+ * Garante que cognitive_limits estão dentro do range esperado e que cada
+ * `LearnedVoiceModifier` casa o schema Zod.
+ *
+ * P9b enforça `cognitive_limits` em runtime do SkillRunner; P8d só fecha a
+ * porta na DB (defesa em depth).
+ */
+function validateProfileBodyP8d(body: ProfileBody): void {
+  const identity = (body as { identity?: Record<string, unknown> }).identity;
+  if (!identity) return;
+
+  const cl = identity.cognitive_limits as
+    | { max_inference_depth?: unknown; max_speculation_in_response?: unknown; confidence_floor_for_action?: unknown }
+    | undefined;
+  if (cl) {
+    // Aceita 0 (semente inicial pode não ter calibrado ainda) mas rejeita
+    // valores negativos/fora-range tipados.
+    if (typeof cl.max_inference_depth !== 'number' ||
+        cl.max_inference_depth < 0 || cl.max_inference_depth > 10) {
+      throw new Error('cognitive_limits.max_inference_depth out of range [0,10]');
+    }
+    if (typeof cl.max_speculation_in_response !== 'number' ||
+        cl.max_speculation_in_response < 0 || cl.max_speculation_in_response > 1) {
+      throw new Error('cognitive_limits.max_speculation_in_response out of range [0,1]');
+    }
+    if (typeof cl.confidence_floor_for_action !== 'number' ||
+        cl.confidence_floor_for_action < 0 || cl.confidence_floor_for_action > 1) {
+      throw new Error('cognitive_limits.confidence_floor_for_action out of range [0,1]');
+    }
+  }
+
+  const mods = identity.learned_voice_modifiers;
+  if (Array.isArray(mods)) {
+    for (const m of mods) {
+      // Throws ZodError com path detalhado se inválido.
+      LearnedVoiceModifierSchema.parse(m);
+    }
+  }
+}
+
 export const operationalProfileVersionsRepo = {
   async create(input: {
     profile_body: ProfileBody;
     proposed_by: string;
     proposed_reason?: string;
   }): Promise<AgentOperationalProfileVersion> {
+    // P8d §10 — write-path validation: rejeita cognitive_limits fora de range
+    // e modifiers malformados. Defesa em depth contra inserts "tortos" via
+    // qualquer caller (proposal-generator, migration script, Admin UI).
+    validateProfileBodyP8d(input.profile_body);
+
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
     const version = await operationalProfileVersionsRepo.nextVersion();
