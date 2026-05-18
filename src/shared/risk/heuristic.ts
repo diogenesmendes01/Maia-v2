@@ -18,6 +18,7 @@
  */
 import { RiskLevel } from '@/types/enums.js';
 import { maxRiskLevel } from './level.js';
+import { logger } from '@/lib/logger.js';
 import type {
   HeuristicResult,
   KnowledgeRiskSignals,
@@ -52,6 +53,65 @@ const TOOL_RISK: Record<ToolKind, RiskLevel | null> = {
   transfer: RiskLevel.HIGH,
   irreversible: RiskLevel.HIGH,
 };
+
+// ---------------------------------------------------------------------------
+// Runtime validators (fail-closed on invalid strings from schema drift /
+// deserialized rows). TypeScript does not protect runtime boundaries where
+// unknown strings arrive from classifiers or DB. These guards ensure invalid
+// values are treated conservatively instead of silently returning undefined
+// from index lookups (which would suppress triggers → emit LOW with no audit).
+// ---------------------------------------------------------------------------
+
+const VALID_TOPICS = new Set<string>(Object.keys(TOPIC_RISK));
+const VALID_TOOL_KINDS = new Set<string>(Object.keys(TOOL_RISK));
+const VALID_KNOWLEDGE_TYPES = new Set<string>([
+  'fato', 'regra', 'procedimento', 'lacuna', 'tool_request',
+]);
+
+/**
+ * Coerce an unknown runtime topic string to a valid TopicSignal.
+ * Invalid strings map to 'unknown' so that the caller treats the signal
+ * as ambiguous (LLM gate will be consulted) rather than a silent no-op.
+ */
+function coerceTopic(raw: string | undefined): TopicSignal | undefined {
+  if (raw === undefined) return undefined;
+  if (VALID_TOPICS.has(raw)) return raw as TopicSignal;
+  logger.warn(
+    { module: 'risk_heuristic', invalid_topic: raw },
+    'heuristic.invalid_topic_coerced_to_unknown',
+  );
+  return 'unknown';
+}
+
+/**
+ * Coerce an unknown runtime tool kind string to a valid ToolKind.
+ * Invalid tool kinds are mapped to 'irreversible' (the most restrictive
+ * bucket) so that a schema drift does not suppress risk — it is more
+ * conservative to assume the worst than to silently drop the signal.
+ */
+function coerceToolKind(raw: string): ToolKind {
+  if (VALID_TOOL_KINDS.has(raw)) return raw as ToolKind;
+  logger.warn(
+    { module: 'risk_heuristic', invalid_tool_kind: raw },
+    'heuristic.invalid_tool_kind_coerced_to_irreversible',
+  );
+  return 'irreversible';
+}
+
+/**
+ * Validate knowledge_type. Invalid values are treated as 'lacuna' (always
+ * ambiguous) so that an unrecognized type does not silently skip checks.
+ */
+function coerceKnowledgeType(raw: string): KnowledgeRiskSignals['knowledge_type'] {
+  if (VALID_KNOWLEDGE_TYPES.has(raw)) {
+    return raw as KnowledgeRiskSignals['knowledge_type'];
+  }
+  logger.warn(
+    { module: 'risk_heuristic', invalid_knowledge_type: raw },
+    'heuristic.invalid_knowledge_type_coerced_to_lacuna',
+  );
+  return 'lacuna';
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -105,14 +165,20 @@ function applyOwnerOverride(
 export function scoreTurnHeuristic(sig: TurnRiskSignals): HeuristicResult {
   const triggers: RiskTrigger[] = [];
 
+  // Validate and coerce topic at the runtime boundary (fail-closed).
+  const topic = coerceTopic(sig.topic);
+
   // Topic
-  if (sig.topic && sig.topic !== 'casual' && sig.topic !== 'operational_simple') {
-    const lvl = TOPIC_RISK[sig.topic];
-    if (lvl) pushTrigger(triggers, `topic:${sig.topic}`, lvl, 1);
+  if (topic && topic !== 'casual' && topic !== 'operational_simple') {
+    const lvl = TOPIC_RISK[topic];
+    if (lvl) pushTrigger(triggers, `topic:${topic}`, lvl, 1);
   }
 
+  // Validate and coerce tool_kinds at the runtime boundary (fail-closed).
+  const toolKinds = (sig.tool_kinds ?? []).map(coerceToolKind);
+
   // Tools
-  for (const k of sig.tool_kinds ?? []) {
+  for (const k of toolKinds) {
     const lvl = TOOL_RISK[k];
     if (lvl) pushTrigger(triggers, `tool:${k}`, lvl, 1);
   }
@@ -148,8 +214,8 @@ export function scoreTurnHeuristic(sig: TurnRiskSignals): HeuristicResult {
   // `"low"` da inicialização e rejeita o reassign para `"critical"`.
   let baseline: RiskLevel = RiskLevel.LOW;
   if (
-    sig.topic === 'critical_decision' &&
-    (sig.tool_kinds ?? []).some(
+    topic === 'critical_decision' &&
+    toolKinds.some(
       (k) => k === 'irreversible' || k === 'transfer' || k === 'write_external',
     )
   ) {
@@ -164,7 +230,7 @@ export function scoreTurnHeuristic(sig: TurnRiskSignals): HeuristicResult {
 
   // Ambiguous: LOW com topic=unknown ou sem topic, OU MEDIUM sem trigger forte
   // (heurística de "vale a pena consultar Haiku para refinar?").
-  const topicMissing = !sig.topic || sig.topic === 'unknown';
+  const topicMissing = !topic || topic === 'unknown';
   const hasStrongTrigger = triggers.some(
     (t) => t.contributes_to === RiskLevel.HIGH || t.contributes_to === RiskLevel.CRITICAL,
   );
@@ -196,14 +262,19 @@ function isSensitiveTool(k: ToolKind): boolean {
 export function scoreKnowledgeHeuristic(sig: KnowledgeRiskSignals): HeuristicResult {
   const triggers: RiskTrigger[] = [];
 
+  // Validate and coerce at runtime boundaries (fail-closed on invalid strings).
+  const topic = coerceTopic(sig.topic);
+  const knowledgeType = coerceKnowledgeType(sig.knowledge_type);
+  const toolKinds = (sig.tool_kinds ?? []).map(coerceToolKind);
+
   // Topic
-  if (sig.topic && sig.topic !== 'casual' && sig.topic !== 'operational_simple') {
-    const lvl = TOPIC_RISK[sig.topic];
-    if (lvl) pushTrigger(triggers, `topic:${sig.topic}`, lvl, 1);
+  if (topic && topic !== 'casual' && topic !== 'operational_simple') {
+    const lvl = TOPIC_RISK[topic];
+    if (lvl) pushTrigger(triggers, `topic:${topic}`, lvl, 1);
   }
 
   // Tools envolvidas
-  for (const k of sig.tool_kinds ?? []) {
+  for (const k of toolKinds) {
     const lvl = TOOL_RISK[k];
     if (lvl) pushTrigger(triggers, `tool:${k}`, lvl, 1);
   }
@@ -221,8 +292,8 @@ export function scoreKnowledgeHeuristic(sig: KnowledgeRiskSignals): HeuristicRes
 
   // Lacuna em domínio crítico = pelo menos medium e ambíguo
   if (
-    sig.knowledge_type === 'lacuna' &&
-    (sig.topic === 'critical_decision' || sig.topic === 'legal' || sig.topic === 'health')
+    knowledgeType === 'lacuna' &&
+    (topic === 'critical_decision' || topic === 'legal' || topic === 'health')
   ) {
     pushTrigger(triggers, 'knowledge:lacuna_in_sensitive_domain', RiskLevel.MEDIUM, 1);
   }
@@ -247,14 +318,14 @@ export function scoreKnowledgeHeuristic(sig: KnowledgeRiskSignals): HeuristicRes
   // --------------------------------------------------------------------
   let baseline: RiskLevel = RiskLevel.LOW;
   const isActionable =
-    sig.knowledge_type === 'regra' ||
-    sig.knowledge_type === 'procedimento' ||
-    sig.knowledge_type === 'tool_request';
-  const hasSensitiveTool = (sig.tool_kinds ?? []).some(isSensitiveTool);
+    knowledgeType === 'regra' ||
+    knowledgeType === 'procedimento' ||
+    knowledgeType === 'tool_request';
+  const hasSensitiveTool = toolKinds.some(isSensitiveTool);
   const hasIrreversibleAction = hasSensitiveTool || sig.touches_irreversible === true;
   if (
     isActionable &&
-    sig.topic === 'critical_decision' &&
+    topic === 'critical_decision' &&
     hasIrreversibleAction
   ) {
     baseline = RiskLevel.CRITICAL;
@@ -277,12 +348,12 @@ export function scoreKnowledgeHeuristic(sig: KnowledgeRiskSignals): HeuristicRes
   //  - knowledge_type sem topic explícito → ambíguo
   let ambiguous = false;
   if (
-    (sig.knowledge_type === 'regra' || sig.knowledge_type === 'procedimento') &&
+    (knowledgeType === 'regra' || knowledgeType === 'procedimento') &&
     (sig.evidence_count ?? 0) < 2
   ) {
     ambiguous = true;
   }
-  if (sig.knowledge_type === 'lacuna') ambiguous = true;
+  if (knowledgeType === 'lacuna') ambiguous = true;
   if (level === RiskLevel.MEDIUM) {
     const hasStrong = triggers.some(
       (t) => t.contributes_to === RiskLevel.HIGH || t.contributes_to === RiskLevel.CRITICAL,

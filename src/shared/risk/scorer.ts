@@ -124,6 +124,7 @@ async function applyGate(
   }
 
   let suggested: { suggested_level: RiskLevel; reason: string } | null;
+  let gateThrew = false;
   try {
     suggested = await opts.gate({
       current_level: heuristic.level,
@@ -133,16 +134,37 @@ async function applyGate(
     // Defensive — gate impl deveria capturar e retornar null. Aqui
     // garantimos que erro não vaza para o caller do scorer.
     suggested = null;
+    gateThrew = true;
   }
 
   if (!suggested) {
-    const level = assertNoCriticalSignalLoss(heuristic.triggers, heuristic.level, context);
+    // Fail-closed (Codex review #97, round-2 finding 2):
+    // The gate ran but returned null (timeout / parse failure / key missing).
+    // Combined with heuristic.ambiguous=true this means the deterministic
+    // stage explicitly could not decide. If the heuristic level is LOW we
+    // MUST escalate to at least MEDIUM — LOW is the only tier with fast-path
+    // and budget perks, so returning LOW when we couldn't actually confirm it
+    // is fail-open. We record a trigger for audit visibility.
+    let level = assertNoCriticalSignalLoss(heuristic.triggers, heuristic.level, context);
+    const escalatedTriggers = [...heuristic.triggers];
+    if (level === RiskLevel.LOW && heuristic.ambiguous) {
+      level = RiskLevel.MEDIUM;
+      escalatedTriggers.push({
+        signal: 'gate:fallback_ambiguous',
+        contributes_to: RiskLevel.MEDIUM,
+        weight: 1,
+      });
+      logger.warn(
+        { module: 'risk_scorer', context, gate_threw: gateThrew },
+        'scorer.ambiguous_low_gate_degraded_escalated_to_medium',
+      );
+    }
     return {
       level,
       confidence: heuristic.confidence,
       llm_consulted: true,
       llm_attempted_downgrade: false,
-      triggers: heuristic.triggers,
+      triggers: escalatedTriggers,
       decided_by: 'heuristic',
     };
   }

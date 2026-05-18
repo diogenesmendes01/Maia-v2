@@ -157,6 +157,30 @@ describe('scoreTurnHeuristic', () => {
     expect(r.level).toBe(RiskLevel.LOW);
     expect(r.ambiguous).toBe(true);
   });
+
+  // -----------------------------------------------------------------------
+  // Codex review #97 round-2 finding 1 — runtime validator regression tests
+  // -----------------------------------------------------------------------
+
+  it('topic totalmente inválido (schema drift) → coerced to unknown, result is low+ambiguous (não LOW silencioso)', () => {
+    // Simula schema drift: classifier devolve string fora do union.
+    const sig = { topic: 'totally-fake' as unknown as import('@/shared/risk/types.ts').TopicSignal };
+    const r = scoreTurnHeuristic(sig);
+    // O sinal inválido é coerced para 'unknown', que → LOW+ambiguous.
+    // O importante é ambiguous=true: o LLM gate SERÁ consultado.
+    expect(r.level).toBe(RiskLevel.LOW);
+    expect(r.ambiguous).toBe(true);
+  });
+
+  it('tool_kind totalmente inválido → coerced to irreversible → HIGH ou CRITICAL', () => {
+    const sig = {
+      topic: 'operational_simple' as const,
+      tool_kinds: ['super-unknown-tool' as unknown as import('@/shared/risk/types.ts').ToolKind],
+    };
+    const r = scoreTurnHeuristic(sig);
+    // Invalid tool → 'irreversible' → HIGH
+    expect(r.level === RiskLevel.HIGH || r.level === RiskLevel.CRITICAL).toBe(true);
+  });
 });
 
 describe('scoreKnowledgeHeuristic', () => {
@@ -362,6 +386,35 @@ describe('scoreKnowledgeHeuristic', () => {
       expect(
         r.triggers.some((t) => t.signal === 'composite:knowledge_critical_decision+sensitive_action'),
       ).toBe(false);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Codex review #97 round-2 finding 1 — knowledge runtime validator regressions
+  // -----------------------------------------------------------------------
+
+  describe('runtime validator — invalid knowledge_type coerced to lacuna', () => {
+    it('knowledge_type inválido → coerced to lacuna → ambiguous=true', () => {
+      const sig = {
+        knowledge_type: 'super_unknown_type' as unknown as KnowledgeRiskSignals['knowledge_type'],
+        topic: 'casual' as const,
+        evidence_count: 5,
+      };
+      const r = scoreKnowledgeHeuristic(sig);
+      // Coerced to 'lacuna' → always ambiguous
+      expect(r.ambiguous).toBe(true);
+    });
+
+    it('knowledge_type inválido + critical_decision topic → pelo menos ambiguous (não LOW silencioso)', () => {
+      const sig = {
+        knowledge_type: 'xpto_drift' as unknown as KnowledgeRiskSignals['knowledge_type'],
+        topic: 'critical_decision' as const,
+        tool_kinds: [] as KnowledgeRiskSignals['tool_kinds'],
+      };
+      const r = scoreKnowledgeHeuristic(sig);
+      // lacuna + critical_decision → MEDIUM + ambiguous=true
+      expect(r.ambiguous).toBe(true);
+      expect(r.level === RiskLevel.MEDIUM || r.level === RiskLevel.HIGH).toBe(true);
     });
   });
 });

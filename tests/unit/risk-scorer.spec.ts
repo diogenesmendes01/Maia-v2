@@ -77,16 +77,21 @@ describe('scoreTurnRisk — gate orchestration', () => {
     expect(r.decided_by).toBe('llm_upgrade');
   });
 
-  it('LLM retorna null (timeout/erro) → mantém heurístico', async () => {
+  it('LLM retorna null (timeout/erro) + ambíguo → fail-closed: MEDIUM com gate:fallback_ambiguous', async () => {
+    // Codex review #97 round-2 finding 2: ambiguous LOW + gate null must NOT
+    // stay LOW. LOW has fast-path/budget perks; when we cannot confirm it,
+    // we must escalate to at least MEDIUM.
     const gate = vi.fn<Parameters<LLMGate>, ReturnType<LLMGate>>(gateReturning(null));
     const r = await scoreTurnRisk(
-      { topic: 'unknown' },
+      { topic: 'unknown' }, // heuristic: LOW + ambiguous=true
       { gate, contextText: 'x' },
     );
     expect(r.llm_consulted).toBe(true);
-    expect(r.level).toBe(RiskLevel.LOW);
+    expect(r.level).toBe(RiskLevel.MEDIUM); // fail-closed escalation
     expect(r.decided_by).toBe('heuristic');
     expect(r.llm_attempted_downgrade).toBe(false);
+    // The escalation trigger must be in the triggers list.
+    expect(r.triggers.some((t) => t.signal === 'gate:fallback_ambiguous')).toBe(true);
   });
 
   it('LLM concorda → mantém heurístico, decided_by=heuristic', async () => {
@@ -401,6 +406,9 @@ describe('scoreTurnRisk — invalid LLM output handling', () => {
       { topic: 'unknown' }, // ambíguo → gate consultado
       { gate, contextText: 'x' },
     );
+    // Gate output inválido → goes through isRiskLevel guard, not the !suggested
+    // branch. The invalid-level guard returns heuristic as-is (no ambiguous
+    // LOW escalation applies here because !suggested is false).
     // Heurística é LOW; gate output inválido é ignorado.
     expect(r.level).toBe(RiskLevel.LOW);
     expect(r.llm_consulted).toBe(true);
@@ -419,5 +427,76 @@ describe('scoreTurnRisk — invalid LLM output handling', () => {
     );
     expect(r.level).toBe(RiskLevel.MEDIUM);
     expect(r.decided_by).toBe('heuristic');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Codex review #97 round-2 finding 2 — fail-closed ambiguous gate degradation
+// ---------------------------------------------------------------------------
+
+describe('scoreTurnRisk — fail-closed: ambiguous LOW + gate degraded → MEDIUM', () => {
+  it('topic=unknown + gate throws → result is MEDIUM with gate:fallback_ambiguous', async () => {
+    const gate: LLMGate = async () => {
+      throw new Error('simulated Anthropic timeout');
+    };
+    const r = await scoreTurnRisk(
+      { topic: 'unknown' }, // heuristic: LOW + ambiguous=true
+      { gate, contextText: 'x' },
+    );
+    expect(r.llm_consulted).toBe(true);
+    expect(r.level).toBe(RiskLevel.MEDIUM);
+    expect(r.triggers.some((t) => t.signal === 'gate:fallback_ambiguous')).toBe(true);
+    expect(r.decided_by).toBe('heuristic');
+  });
+
+  it('topic=unknown + gate returns null → result is MEDIUM with gate:fallback_ambiguous', async () => {
+    const gate = gateReturning(null);
+    const r = await scoreTurnRisk(
+      { topic: 'unknown' },
+      { gate, contextText: 'x' },
+    );
+    expect(r.level).toBe(RiskLevel.MEDIUM);
+    expect(r.triggers.some((t) => t.signal === 'gate:fallback_ambiguous')).toBe(true);
+  });
+
+  it('heuristic MEDIUM ambiguous + gate null → stays MEDIUM (no escalation needed beyond MEDIUM)', async () => {
+    // financial topic → MEDIUM + ambiguous (no strong trigger). Gate null should
+    // NOT escalate to HIGH — escalation only applies when level is LOW.
+    const gate = gateReturning(null);
+    const r = await scoreTurnRisk(
+      { topic: 'financial' },
+      { gate, contextText: 'x' },
+    );
+    expect(r.level).toBe(RiskLevel.MEDIUM); // stays MEDIUM, not escalated to HIGH
+    expect(r.triggers.some((t) => t.signal === 'gate:fallback_ambiguous')).toBe(false);
+  });
+
+  it('heuristic HIGH non-ambiguous + no gate call → stays HIGH (gate skipped)', async () => {
+    // HIGH non-ambiguous → gate is skipped entirely, no escalation applies.
+    const gate = vi.fn<Parameters<LLMGate>, ReturnType<LLMGate>>(gateReturning(null));
+    const r = await scoreTurnRisk(
+      { topic: 'legal', tool_kinds: ['irreversible'] },
+      { gate, contextText: 'x' },
+    );
+    expect(r.llm_consulted).toBe(false);
+    expect(r.level === RiskLevel.HIGH || r.level === RiskLevel.CRITICAL).toBe(true);
+    expect(gate).not.toHaveBeenCalled();
+  });
+
+  it('scoreKnowledgeRisk: regra + 1 evidência (ambiguous LOW) + gate null → MEDIUM', async () => {
+    // Knowledge path: regra with 1 evidence is always ambiguous.
+    // If heuristic produces LOW (no other signals) + gate is null → fail-closed.
+    const gate = gateReturning(null);
+    const r = await scoreKnowledgeRisk(
+      {
+        knowledge_type: 'regra',
+        topic: 'casual',    // no risk from topic
+        derived_confidence: 0.8, // no risk from confidence
+        evidence_count: 1,       // ambiguous=true
+      },
+      { gate, contextText: 'x' },
+    );
+    expect(r.level).toBe(RiskLevel.MEDIUM);
+    expect(r.triggers.some((t) => t.signal === 'gate:fallback_ambiguous')).toBe(true);
   });
 });
