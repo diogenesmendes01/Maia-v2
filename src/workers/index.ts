@@ -1,4 +1,4 @@
-import cron from 'node-cron';
+import cron, { type ScheduledTask } from 'node-cron';
 import { logger } from '@/lib/logger.js';
 import { runHealthMonitor } from './health-monitor.js';
 import { runPendingExpirer } from './pending-expirer.js';
@@ -96,7 +96,7 @@ export const JOBS: Job[] = [
   { name: 'knowledge_state_promoter', cron: '0 * * * *', fn: runKnowledgeStatePromoter, phase: 2 },
 ];
 
-const tasks: cron.ScheduledTask[] = [];
+const tasks: ScheduledTask[] = [];
 
 export function startWorkers(currentPhase: number = 1): void {
   for (const job of JOBS) {
@@ -106,7 +106,7 @@ export function startWorkers(currentPhase: number = 1): void {
       () => {
         job.fn().catch((err) => logger.error({ err, job: job.name }, 'worker.failed'));
       },
-      { scheduled: true, timezone: 'America/Sao_Paulo' },
+      { timezone: 'America/Sao_Paulo' },
     );
     tasks.push(t);
     logger.info({ job: job.name, cron: job.cron, phase: job.phase }, 'worker.scheduled');
