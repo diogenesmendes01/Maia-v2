@@ -7,6 +7,16 @@
  * loop encerra quando o LLM responde com `stop_reason='end_turn'` ou o
  * cap `max_tool_calls` é atingido (default 5).
  *
+ * Caps enforced (review #99 finding 3 + mission item 3):
+ *  - `runtime_hints.max_tool_calls`: counter; ao exceder → BLOQUEIA novas
+ *    tool calls e devolve resultado parcial. Audit log emitido.
+ *  - `runtime_hints.max_tokens`: contador acumula
+ *    `input_tokens + output_tokens` em cada iteração; ao exceder →
+ *    TRUNCA o loop, emite warning `token_budget_exceeded`, e retorna o
+ *    último conteúdo capturado.
+ *  - AbortSignal: respeitado entre iterações; toolDispatcher recebe o
+ *    signal para que tools side-effecting possam cancelar.
+ *
  * Master spec §2.4 + §3.4 (skill agent harness). Cada tool resolvida é
  * registrada em `tools_called` (passado para o trace pelo SkillRunner).
  *
@@ -26,7 +36,11 @@ interface ProcedureSpec {
 }
 
 export interface ToolDispatcher {
-  (name: string, args: unknown): Promise<unknown>;
+  (
+    name: string,
+    args: unknown,
+    opts?: { signal?: AbortSignal; idempotency_key?: string },
+  ): Promise<unknown>;
 }
 
 let toolDispatcher: ToolDispatcher | null = null;
@@ -50,6 +64,14 @@ export async function toolMediatedMode(
   const system = procedure.system_prompt ?? procedure.template ?? '';
   const max_tokens = typeof hints.max_output_tokens === 'number' ? hints.max_output_tokens : 2048;
   const maxToolCalls = typeof hints.max_tool_calls === 'number' ? hints.max_tool_calls : 5;
+  // Total prompt+output token budget enforced across the loop (review #99
+  // mission item 3). When exceeded, we truncate the loop and emit warning.
+  const maxTokensBudget =
+    typeof hints.max_tokens === 'number'
+      ? hints.max_tokens
+      : typeof hints.max_prompt_tokens === 'number'
+      ? hints.max_prompt_tokens + max_tokens * (maxToolCalls + 1)
+      : Number.POSITIVE_INFINITY;
 
   // Filter tool schemas to only those declared in allowed_tools (defense in depth).
   const tools: ToolSchema[] = (procedure.tool_schemas ?? []).filter((t) =>
@@ -60,8 +82,29 @@ export async function toolMediatedMode(
   const toolsCalled: string[] = [];
   let totalIn = 0;
   let totalOut = 0;
+  let toolCallCount = 0;
+  let lastContent: string | null = null;
+  let tokenBudgetExceeded = false;
+  let toolCapHit = false;
 
-  for (let i = 0; i <= maxToolCalls; i++) {
+  // Generate an idempotency-key prefix that is stable per skill execution
+  // attempt. Combined with the tool_use.id this gives each dispatch a
+  // unique idempotency key the underlying tool can use to dedupe retries
+  // (review #99 finding 3 recommendation).
+  const idempotencyPrefix = `${ctx.skill.id}:${ctx.turno_id ?? ctx.conversa_id ?? Date.now()}`;
+
+  // Safety upper bound for the loop: allow a few extra iterations beyond
+  // max_tool_calls so the LLM can wrap up its answer after we soft-block
+  // further tool dispatch (review #99 mission item 3). Throws
+  // `max_tool_calls_exceeded` only if even this larger bound is exceeded
+  // (defense against runaway LLM that keeps re-requesting tools).
+  const loopUpperBound = maxToolCalls + 5;
+  for (let i = 0; i <= loopUpperBound; i++) {
+    // Pre-iteration abort check — caller / runner timeout cuts the loop
+    // before issuing a new LLM call.
+    if (ctx.signal?.aborted) {
+      throw new Error('aborted');
+    }
     const res = await callLLM({
       system,
       messages,
@@ -70,15 +113,38 @@ export async function toolMediatedMode(
     });
     totalIn += res.usage.input_tokens;
     totalOut += res.usage.output_tokens;
+    if (res.content !== null) lastContent = res.content;
+
+    // Token-budget enforcement (review #99 mission item 3): truncate
+    // before issuing further tool calls or new iterations.
+    if (totalIn + totalOut > maxTokensBudget) {
+      tokenBudgetExceeded = true;
+      logger.warn(
+        {
+          skill_id: ctx.skill.id,
+          tokens_in: totalIn,
+          tokens_out: totalOut,
+          budget: maxTokensBudget,
+        },
+        'p9a.tool_mediated.token_budget_exceeded',
+      );
+      break;
+    }
 
     if (res.tool_uses.length === 0 || res.stop_reason === 'end_turn') {
       // No more tool calls — final answer is text content.
-      const text = res.content ?? '';
-      const parsed = safeParseJson(text);
-      return { ...parsed, _tools_called: toolsCalled, _tokens_in: totalIn, _tokens_out: totalOut };
+      const parsed = safeParseJson(lastContent ?? '');
+      return {
+        ...parsed,
+        _tools_called: toolsCalled,
+        _tokens_in: totalIn,
+        _tokens_out: totalOut,
+        _token_budget_exceeded: tokenBudgetExceeded,
+        _tool_cap_hit: toolCapHit,
+      };
     }
 
-    if (i === maxToolCalls) {
+    if (i === loopUpperBound) {
       throw new Error('max_tool_calls_exceeded');
     }
 
@@ -104,6 +170,30 @@ export async function toolMediatedMode(
       is_error?: boolean;
     }> = [];
     for (const tu of res.tool_uses) {
+      // Cap enforcement (review #99 mission item 3): when we have already
+      // reached the cap, refuse further dispatch and emit a tool_result
+      // marking it so the LLM stops. We do NOT raise — partial-result
+      // path is preferable for the agent to wrap up its answer.
+      if (toolCallCount >= maxToolCalls) {
+        toolCapHit = true;
+        logger.warn(
+          { skill_id: ctx.skill.id, max_tool_calls: maxToolCalls, tool: tu.tool },
+          'p9a.tool_mediated.tool_call_cap_hit',
+        );
+        toolResults.push({
+          type: 'tool_result',
+          tool_use_id: tu.id,
+          content: 'tool_call_cap_reached',
+          is_error: true,
+        });
+        continue;
+      }
+      // Abort check before dispatch (review #99 finding 3): if the runner
+      // signaled cancellation while we were filling toolResults, refuse to
+      // start a new side-effecting tool call.
+      if (ctx.signal?.aborted) {
+        throw new Error('aborted');
+      }
       if (!allowedTools.includes(tu.tool)) {
         toolResults.push({
           type: 'tool_result',
@@ -117,7 +207,11 @@ export async function toolMediatedMode(
         throw new Error('tool_dispatcher_not_configured');
       }
       try {
-        const result = await toolDispatcher(tu.tool, tu.args);
+        const result = await toolDispatcher(tu.tool, tu.args, {
+          signal: ctx.signal,
+          idempotency_key: `${idempotencyPrefix}:${tu.id}`,
+        });
+        toolCallCount++;
         toolsCalled.push(tu.tool);
         toolResults.push({
           type: 'tool_result',
@@ -126,6 +220,11 @@ export async function toolMediatedMode(
         });
       } catch (err) {
         const e = err as Error;
+        // Propagate cancellation upward — never swallow an abort into the
+        // tool-result stream as a normal error (review #99 finding 3).
+        if (e.message === 'aborted' || ctx.signal?.aborted) {
+          throw new Error('aborted', { cause: err });
+        }
         logger.warn({ skill_id: ctx.skill.id, tool: tu.tool, err: e.message }, 'p9a.tool_dispatch_error');
         toolResults.push({
           type: 'tool_result',
@@ -136,6 +235,19 @@ export async function toolMediatedMode(
       }
     }
     messages.push({ role: 'user', content: toolResults });
+  }
+
+  // Loop exited via break (token budget) or natural end — return what we have.
+  if (tokenBudgetExceeded) {
+    const parsed = safeParseJson(lastContent ?? '');
+    return {
+      ...parsed,
+      _tools_called: toolsCalled,
+      _tokens_in: totalIn,
+      _tokens_out: totalOut,
+      _token_budget_exceeded: true,
+      _tool_cap_hit: toolCapHit,
+    };
   }
 
   throw new Error('tool_loop_exhausted_without_resolution');

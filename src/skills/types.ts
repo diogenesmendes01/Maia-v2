@@ -30,16 +30,31 @@ export interface SkillExecutionInput {
   turno_id?: string;
   triggered_by: SkillTriggeredBy;
   /**
-   * Optional: scope a lookup to a specific agent. `null` = tenant-wide skill;
-   * `undefined` = qualquer (default — pega tenant-wide ou agent-scoped match).
+   * Optional: scope a lookup to a specific agent. `null` = tenant-wide skill
+   * (must also be allowed by policy when reading another agent's data);
+   * `undefined` = default — uses the agent_id from the current tenant context.
+   *
+   * Cross-agent execution: only allowed when `skill.agent_id === null`
+   * (tenant-wide) AND policy permits. Mismatched explicit agent_id is rejected.
    */
   agent_id?: string | null;
+  /**
+   * Optional AbortSignal that aborts in-flight LLM/tool calls if the caller
+   * cancels (e.g. on runner timeout). Modes propagate this signal to
+   * `callLLM` and `toolDispatcher` so side-effecting work can be cut off
+   * cleanly instead of running to completion behind a non-cancelling
+   * Promise.race (review #99 finding 3).
+   */
+  signal?: AbortSignal;
 }
 
 export type SkillFailureReason =
   | 'flag_off'
   | 'skill_not_found'
   | 'policy_blocked'
+  | 'unresolved_policy'
+  | 'hard_limit_block'
+  | 'agent_scope_violation'
   | 'budget_exceeded'
   | 'invalid_input'
   | 'invalid_output'
@@ -71,6 +86,12 @@ export interface ModeContext {
   resolvedPolicies: ResolvedPolicyDescriptor[];
   conversa_id?: string;
   turno_id?: string;
+  /**
+   * AbortSignal propagated from the runner. Modes are expected to forward
+   * this to LLM / tool dispatcher calls so timeout cancellation actually
+   * cuts off in-flight side-effecting work.
+   */
+  signal?: AbortSignal;
 }
 
 export type ExecutionModeHandler = (ctx: ModeContext) => Promise<Record<string, unknown>>;
@@ -112,6 +133,22 @@ export interface ResolvedPolicyDescriptor {
   descriptor: string;
   effect: 'allow' | 'block' | 'audit' | 'noop';
   reason?: string;
+  /**
+   * Rule classification (P8e). 'hard_limit' rules combine with an
+   * `evaluator` callable to determine match-time block; SkillRunner gate 4.5
+   * BLOCKS execution with reason `hard_limit_block` when matched. Soft rules
+   * fall back to the `effect` field semantics.
+   */
+  rule_kind?: 'soft' | 'hard_limit';
+  /**
+   * Optional matcher invoked by the SkillRunner when `rule_kind='hard_limit'`.
+   * `matched: true` → BLOCK execution. Stays optional so P9a/P8e can keep
+   * shape-only stubs while the real PolicyDescriptorResolver lands.
+   */
+  evaluator?: (args: {
+    skill: SkillRow;
+    input: Record<string, unknown>;
+  }) => { matched: boolean; reason?: string };
 }
 
 export interface UnresolvedPolicyDescriptor {

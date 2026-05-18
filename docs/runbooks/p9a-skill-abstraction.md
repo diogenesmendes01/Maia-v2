@@ -92,8 +92,35 @@ const result = await runSkill({
 // result.ok=true → result.output = { risk_level: 'medium', confidence: 0.78 }
 // result.ok=false → result.reason in
 //   'flag_off' | 'skill_not_found' | 'invalid_input' | 'policy_blocked' |
+//   'unresolved_policy' | 'hard_limit_block' | 'agent_scope_violation' |
 //   'invalid_output' | 'executor_error' | 'timeout'
 ```
+
+### Governança e isolamento (review #99 / no-ship hardening)
+
+- **Tenant + agent guard:** `runSkill` exige `runWithTenantContext`. Sem
+  contexto → `reason='agent_scope_violation'` com `message='missing_tenant_context'`.
+- **Cross-agent:** uma skill de agente A NUNCA é visível para agente B do mesmo
+  tenant. `skillsRepo.findActive` retorna `null` (não vaza ID) e `getById`
+  retorna `null` para skills de outro agente. Tenant-wide skills (`agent_id=null`)
+  são visíveis para todos agentes do tenant — útil para skills de plataforma.
+- **Fail-closed em policy descriptors:** uma skill que declara
+  `policy_descriptors=['lgpd_strict']` e o resolver retorna `unresolved` →
+  `reason='unresolved_policy'`. Isso impede que o stub do P8e (que devolve
+  unresolved como default) silencie políticas críticas.
+- **Hard limits:** policies com `rule_kind='hard_limit'` e `evaluator()` matched
+  → `reason='hard_limit_block'` (separado de `policy_blocked` para dashboards
+  distinguirem "blocked by policy effect=block" vs "blocked because hard limit hit").
+- **Evaluator mode constraint:** skills com `execution_mode='evaluator'` NÃO
+  podem declarar `allowed_tools` não-vazio. `skillsRepo.propose` rejeita com
+  `evaluator_mode_disallows_tools` em propose time.
+- **runtime_hints caps:** `max_tool_calls` (default 5) e `max_tokens` (default
+  ∞) são enforced pelo `tool_mediated` mode. Quando atingidos, o output
+  inclui `_tool_cap_hit=true` ou `_token_budget_exceeded=true`.
+- **AbortSignal:** ao expirar `timeout_ms`, o runner aciona um
+  `AbortController` que sinaliza `tool_mediated` para parar entre iterações.
+  O `toolDispatcher` recebe `{ signal, idempotency_key }`, permitindo
+  cancelar tools side-effecting e deduplicar retries.
 
 ---
 

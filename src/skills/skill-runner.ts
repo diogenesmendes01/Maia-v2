@@ -3,12 +3,19 @@
  *
  * Fluxo 7-gate (master spec v3.1.1 §2.4 + §3.4):
  *  Gate 1. Feature flag (FEATURE_SKILL_REGISTRY_V1)
- *  Gate 2. Lookup skill ativo (skillsRepo.findActive)
+ *  Gate 1.5. Tenant + agent guard (review #99 finding 1) — assertAgentScope.
+ *  Gate 2. Lookup skill ativo (skillsRepo.findActive). Tenant + agent-scoped.
  *  Gate 3. Validação do input contra `skill.input_schema`
- *  Gate 4. Resolução de policy_descriptors via PolicyDescriptorResolver (P8e/stub)
- *  Gate 4.5. Aplicação de policies pre-execução (allow/block)
+ *  Gate 4. Resolução de policy_descriptors via PolicyDescriptorResolver (P8e).
+ *          FAIL CLOSED: descriptors declarados mas unresolved → BLOCK com
+ *          reason `unresolved_policy` (review #99 finding 2).
+ *  Gate 4.5. Aplicação de policies pre-execução:
+ *            - effect='block' → reason 'policy_blocked'
+ *            - rule_kind='hard_limit' AND evaluator matches → reason
+ *              'hard_limit_block'
  *  Gate 5/6. Wrapper `runCognitiveModule` (P1 invariant: toda execução audita)
- *           dispatcher por execution_mode
+ *           dispatcher por execution_mode. AbortSignal propagado a modes
+ *           para cortar tool calls em timeout (review #99 finding 3).
  *  Gate 7. Validação do output contra `skill.output_schema`
  *
  * Master spec §0.4 princípio 3: skill orquestra, não age. O executor é
@@ -24,7 +31,11 @@ import { promptOnlyMode } from './modes/prompt-only.js';
 import { procedureAdapterMode } from './modes/procedure-adapter.js';
 import { toolMediatedMode } from './modes/tool-mediated.js';
 import { evaluatorMode } from './modes/evaluator.js';
-import { tryGetCurrentContext } from '@/db/tenant-context.js';
+import {
+  tryGetCurrentContext,
+  getCurrentTenant,
+  getCurrentAgent,
+} from '@/db/tenant-context.js';
 import { logger } from '@/lib/logger.js';
 import type {
   SkillExecutionInput,
@@ -64,6 +75,49 @@ function mapTriggeredBy(t: SkillTriggeredBy): 'sync_required' | 'sync_conditiona
   return 'sync_required';
 }
 
+/**
+ * Assert that the requested execution stays within the current tenant +
+ * agent scope (review #99 finding 1). Throws on violation.
+ *
+ *  - Tenant must exist in context (no anonymous execution).
+ *  - input.agent_id, when provided, must match context agent OR be null
+ *    (tenant-wide intent).
+ *  - skill.agent_id, when not null, must match context agent.
+ *  - tenant-wide skills (skill.agent_id === null) require policy approval
+ *    to read data of another agent; the caller path enforces that via the
+ *    PolicyDescriptorResolver. We do NOT auto-permit cross-agent reads.
+ */
+function assertAgentScope(args: {
+  input: SkillExecutionInput;
+  skill: SkillRow;
+}): { ok: true } | { ok: false; reason: string } {
+  const ctx = tryGetCurrentContext();
+  if (!ctx) {
+    return { ok: false, reason: 'missing_tenant_context' };
+  }
+  if (args.input.agent_id !== undefined && args.input.agent_id !== null) {
+    if (args.input.agent_id !== ctx.agent_id) {
+      return {
+        ok: false,
+        reason: `input agent_id ${args.input.agent_id} differs from context ${ctx.agent_id}`,
+      };
+    }
+  }
+  if (args.skill.tenant_id !== ctx.tenant_id) {
+    return {
+      ok: false,
+      reason: `skill tenant ${args.skill.tenant_id} differs from context ${ctx.tenant_id}`,
+    };
+  }
+  if (args.skill.agent_id !== null && args.skill.agent_id !== ctx.agent_id) {
+    return {
+      ok: false,
+      reason: `skill agent ${args.skill.agent_id} differs from context ${ctx.agent_id}`,
+    };
+  }
+  return { ok: true };
+}
+
 export async function runSkill(input: SkillExecutionInput): Promise<SkillExecutionOutput> {
   const startTime = Date.now();
 
@@ -78,12 +132,54 @@ export async function runSkill(input: SkillExecutionInput): Promise<SkillExecuti
     };
   }
 
-  // Gate 2: lookup skill ativo (tenant-scoped pelo skillsRepo)
+  // Gate 1.5: tenant + agent context required (review #99 finding 1).
+  // runSkill cannot execute outside runWithTenantContext. We probe early
+  // so we return a structured failure instead of letting findActive throw.
+  const ctx = tryGetCurrentContext();
+  if (!ctx) {
+    return {
+      ok: false,
+      reason: 'agent_scope_violation',
+      message: 'missing_tenant_context — runSkill must execute inside runWithTenantContext',
+      latency_ms: Date.now() - startTime,
+      resolved_policies: [],
+      trace: EMPTY_TRACE,
+    };
+  }
+  // Explicit input.agent_id mismatch is rejected even before lookup.
+  if (
+    input.agent_id !== undefined &&
+    input.agent_id !== null &&
+    input.agent_id !== ctx.agent_id
+  ) {
+    return {
+      ok: false,
+      reason: 'agent_scope_violation',
+      message: `input agent_id ${input.agent_id} differs from context ${ctx.agent_id}`,
+      latency_ms: Date.now() - startTime,
+      resolved_policies: [],
+      trace: EMPTY_TRACE,
+    };
+  }
+
+  // Gate 2: lookup skill ativo (tenant- AND agent-scoped pelo skillsRepo)
   let skill: SkillRow | null;
   try {
     skill = await skillsRepo.findActive(input.skill_descriptor, input.agent_id);
   } catch (err) {
     const e = err as Error;
+    // agent_scope_violation surfaces here when input.agent_id targets a
+    // different agent than context.
+    if (e.message.startsWith('agent_scope_violation')) {
+      return {
+        ok: false,
+        reason: 'agent_scope_violation',
+        message: e.message,
+        latency_ms: Date.now() - startTime,
+        resolved_policies: [],
+        trace: EMPTY_TRACE,
+      };
+    }
     logger.warn({ err: e.message, descriptor: input.skill_descriptor }, 'p9a.runner.lookup_failed');
     return {
       ok: false,
@@ -110,6 +206,21 @@ export async function runSkill(input: SkillExecutionInput): Promise<SkillExecuti
     skill_id: skill.id,
   };
 
+  // Gate 1.5b: re-assert agent scope on the resolved skill (defense in
+  // depth — findActive should have prevented cross-agent skills surfacing,
+  // but tests / future repo refactors could leak).
+  const scopeCheck = assertAgentScope({ input, skill });
+  if (!scopeCheck.ok) {
+    return {
+      ok: false,
+      reason: 'agent_scope_violation',
+      message: scopeCheck.reason,
+      latency_ms: Date.now() - startTime,
+      resolved_policies: [],
+      trace: skillTrace,
+    };
+  }
+
   // Gate 3: input validation
   const inputValidation = validateAgainstSchema(input.input, skill.input_schema as Record<string, unknown>);
   if (!inputValidation.valid) {
@@ -124,22 +235,39 @@ export async function runSkill(input: SkillExecutionInput): Promise<SkillExecuti
   }
 
   // Gate 4: resolve policy descriptors
-  const ctx = tryGetCurrentContext();
-  const tenantId = ctx?.tenant_id ?? 'default';
+  const tenantId = getCurrentTenant();
   const descriptors = (skill.policy_descriptors ?? []) as string[];
-  const policiesResolved = await policyDescriptorResolver.resolveDescriptors({
+  const policiesResolution = await policyDescriptorResolver.resolveDescriptors({
     tenant_id: tenantId,
     descriptors,
-    scope: { skill_category: skill.category },
+    scope: { skill_category: skill.category, agent_id: getCurrentAgent() },
   });
-  const resolvedPolicyIds = policiesResolved.resolved.map((p) => p.policy_id);
+  const resolvedPolicyIds = policiesResolution.resolved.map((p) => p.policy_id);
 
-  // Gate 4.5: apply policies pre-skill (early block)
-  const policyDecision = applyPoliciesPreSkill(policiesResolved.resolved);
+  // Fail-closed: if the skill declares policy_descriptors and any descriptor
+  // is unresolved, BLOCK execution (review #99 finding 2). This prevents
+  // the resolver stub / future bugs from silently degrading enforcement.
+  if (descriptors.length > 0 && policiesResolution.unresolved.length > 0) {
+    const unresolvedNames = policiesResolution.unresolved.map((u) => u.descriptor).join(', ');
+    return {
+      ok: false,
+      reason: 'unresolved_policy',
+      message: `unresolved descriptors: ${unresolvedNames}`,
+      latency_ms: Date.now() - startTime,
+      resolved_policies: resolvedPolicyIds,
+      trace: skillTrace,
+    };
+  }
+
+  // Gate 4.5: apply policies pre-skill (early block).
+  const policyDecision = applyPoliciesPreSkill(policiesResolution.resolved, {
+    skill,
+    input: input.input,
+  });
   if (policyDecision.decision === 'block') {
     return {
       ok: false,
-      reason: 'policy_blocked',
+      reason: policyDecision.kind === 'hard_limit' ? 'hard_limit_block' : 'policy_blocked',
       message: policyDecision.reason,
       latency_ms: Date.now() - startTime,
       resolved_policies: resolvedPolicyIds,
@@ -147,9 +275,19 @@ export async function runSkill(input: SkillExecutionInput): Promise<SkillExecuti
     };
   }
 
-  // Gate 6: wrap em runCognitiveModule (P1 invariant — audit obrigatório)
+  // Gate 6: wrap em runCognitiveModule (P1 invariant — audit obrigatório).
+  // AbortSignal: propagated from caller OR created locally so we can
+  // signal cancellation when the runner timeout fires. Modes are required
+  // to forward this to callLLM / toolDispatcher.
   const hints = (skill.runtime_hints ?? {}) as Record<string, unknown>;
   const timeoutMs = typeof hints.timeout_ms === 'number' ? hints.timeout_ms : DEFAULT_TIMEOUT_MS;
+
+  const abortController = new AbortController();
+  if (input.signal) {
+    // Forward caller cancellation to our internal controller.
+    if (input.signal.aborted) abortController.abort();
+    else input.signal.addEventListener('abort', () => abortController.abort(), { once: true });
+  }
 
   const fallbackOutput: SkillExecutionOutput = {
     ok: false,
@@ -167,10 +305,16 @@ export async function runSkill(input: SkillExecutionInput): Promise<SkillExecuti
       timeoutMs,
       conversa_id: input.conversa_id,
       turno_id: input.turno_id,
-      fallback: () => ({
-        ...fallbackOutput,
-        latency_ms: Date.now() - startTime,
-      }),
+      fallback: () => {
+        // Timeout firing here means runCognitiveModule rejected the racing
+        // promise — signal the in-flight mode so it stops dispatching tools
+        // (review #99 finding 3).
+        abortController.abort();
+        return {
+          ...fallbackOutput,
+          latency_ms: Date.now() - startTime,
+        };
+      },
     },
     async () => {
       const modeHandler = MODE_DISPATCH[skill!.execution_mode];
@@ -180,9 +324,10 @@ export async function runSkill(input: SkillExecutionInput): Promise<SkillExecuti
       const modeOutput = await modeHandler({
         skill: skill!,
         input: input.input,
-        resolvedPolicies: policiesResolved.resolved,
+        resolvedPolicies: policiesResolution.resolved,
         conversa_id: input.conversa_id,
         turno_id: input.turno_id,
+        signal: abortController.signal,
       });
 
       // Gate 7: output validation
@@ -212,6 +357,7 @@ export async function runSkill(input: SkillExecutionInput): Promise<SkillExecuti
   );
 
   if (moduleResult.status === 'timeout') {
+    abortController.abort();
     return {
       ok: false,
       reason: 'timeout',
@@ -234,16 +380,51 @@ export async function runSkill(input: SkillExecutionInput): Promise<SkillExecuti
 }
 
 /**
- * Aplica decisões de policy pré-execução. Em P9a (sem P8e mergeado),
- * apenas verifica se algum policy resolvido tem effect='block'. Quando
- * P8e merge, este método consultará o evaluador real de policy.
+ * Aplica decisões de policy pré-execução. Em P9a:
+ *  - `effect='block'` → decisão 'block' com kind='policy' (mapeia para
+ *    reason `policy_blocked` no SkillRunner).
+ *  - `rule_kind='hard_limit'` AND evaluator(matched=true) → decisão 'block'
+ *    com kind='hard_limit' (mapeia para reason `hard_limit_block`).
+ *
+ * P9a inicial não tinha o conceito hard_limit; foi adicionado no Codex
+ * review #99 finding 2 para evitar que regras críticas (e.g. PII out-of-
+ * region, budget overrun) só sejam aplicadas via warning.
  */
 export function applyPoliciesPreSkill(
   policies: ResolvedPolicyDescriptor[],
-): { decision: 'allow' | 'block'; reason?: string } {
+  ctx?: { skill: SkillRow; input: Record<string, unknown> },
+): { decision: 'allow' } | { decision: 'block'; reason?: string; kind: 'policy' | 'hard_limit' } {
   for (const p of policies) {
+    // hard_limit rules: evaluator decides; matched=true → BLOCK.
+    if (p.rule_kind === 'hard_limit' && typeof p.evaluator === 'function' && ctx) {
+      let evalRes: { matched: boolean; reason?: string };
+      try {
+        evalRes = p.evaluator({ skill: ctx.skill, input: ctx.input });
+      } catch (err) {
+        // Evaluator throw is treated as match (fail-closed for hard limits).
+        return {
+          decision: 'block',
+          reason: `hard_limit_evaluator_error: ${(err as Error).message}`,
+          kind: 'hard_limit',
+        };
+      }
+      if (evalRes.matched) {
+        return {
+          decision: 'block',
+          reason: evalRes.reason ?? `hard_limit_matched_${p.descriptor}`,
+          kind: 'hard_limit',
+        };
+      }
+      // No match: continue to next policy.
+      continue;
+    }
+    // Soft block via effect.
     if (p.effect === 'block') {
-      return { decision: 'block', reason: p.reason ?? `blocked_by_${p.descriptor}` };
+      return {
+        decision: 'block',
+        reason: p.reason ?? `blocked_by_${p.descriptor}`,
+        kind: 'policy',
+      };
     }
   }
   return { decision: 'allow' };

@@ -189,7 +189,7 @@ describe('SkillRunner — 7-gate flow', () => {
     expect(vi.mocked(policyDescriptorResolver.resolveDescriptors)).toHaveBeenCalledWith(
       expect.objectContaining({
         descriptors: ['lgpd_strict', 'pii_redaction'],
-        scope: { skill_category: 'classify' },
+        scope: expect.objectContaining({ skill_category: 'classify' }),
       }),
     );
   });
@@ -320,12 +320,12 @@ describe('applyPoliciesPreSkill', () => {
     ).toEqual({ decision: 'allow' });
   });
 
-  it('block when any effect is block', () => {
+  it('block (kind=policy) when any effect is block', () => {
     expect(
       applyPoliciesPreSkill([
         { policy_id: 'p1', descriptor: 'a', effect: 'allow' },
         { policy_id: 'p2', descriptor: 'b', effect: 'block', reason: 'lgpd' },
       ]),
-    ).toEqual({ decision: 'block', reason: 'lgpd' });
+    ).toEqual({ decision: 'block', reason: 'lgpd', kind: 'policy' });
   });
 });

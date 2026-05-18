@@ -7,16 +7,19 @@
  *  - activate() é transacional: deprecate previous active + activate this one.
  *  - rollback() é transacional: marca como rolled_back + reativa version-1
  *    (que estava deprecated).
- *  - Lookups respeitam tenant_id do contexto (applyTenantGuard quando insert;
- *    SELECT inclui tenant_id no WHERE).
+ *  - Lookups respeitam tenant_id do contexto E agent scope:
+ *      * findActive sem agent_id explícito → restringe a (agent atual OR
+ *        tenant-wide). NUNCA retorna skill de outro agente do mesmo tenant.
+ *      * propose / activate / deprecate / rollback rejeitam mismatched
+ *        agent_id (review #99 finding 1).
  *
  * Master spec v3.1.1 §2.4. Plan P9a Tasks 4.
  */
-import { eq, and, desc, sql } from 'drizzle-orm';
+import { eq, and, desc, or, sql } from 'drizzle-orm';
 import { db, withTx } from '@/db/client.js';
 import { skills } from '@/db/schema.js';
 import type { SkillRow, SkillContract } from '@/db/schema.js';
-import { getCurrentTenant } from '@/db/tenant-context.js';
+import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 
 export type ProposeInput = SkillContract & {
   proposed_by: string;
@@ -64,6 +67,28 @@ export interface SkillsRepo {
 export const skillsRepo: SkillsRepo = {
   async findActive(descriptor, agent_id): Promise<SkillRow | null> {
     const tenant_id = getCurrentTenant();
+    // Derive default scope from tenant context. Agent-isolation rule
+    // (review #99 finding 1): when caller omits agent_id we scope to
+    // (current agent OR tenant-wide). We NEVER fall through to "any agent
+    // in tenant".
+    const ctxAgent = getCurrentAgent();
+    let scopeClause;
+    if (agent_id === undefined) {
+      // Default: current agent OR tenant-wide. Prefer agent-scoped match
+      // (ORDER BY agent_id NULLS LAST) so an agent-specific skill beats
+      // a tenant-wide one with the same descriptor.
+      scopeClause = or(eq(skills.agent_id, ctxAgent), sql`agent_id IS NULL`);
+    } else if (agent_id === null) {
+      // Explicit tenant-wide request: only NULL agent_id matches.
+      scopeClause = sql`agent_id IS NULL`;
+    } else {
+      // Explicit agent_id: must match the context agent (cross-agent reads
+      // are rejected; admin paths use a dedicated method, not findActive).
+      if (agent_id !== ctxAgent) {
+        throw new Error(`agent_scope_violation: input agent ${agent_id} vs context ${ctxAgent}`);
+      }
+      scopeClause = eq(skills.agent_id, agent_id);
+    }
     const rows = await db
       .select()
       .from(skills)
@@ -72,20 +97,19 @@ export const skillsRepo: SkillsRepo = {
           eq(skills.tenant_id, tenant_id),
           eq(skills.skill_descriptor, descriptor),
           eq(skills.status, 'active'),
-          // null agent_id means tenant-wide; explicit agent_id only matches that one.
-          agent_id === undefined
-            ? sql`true`
-            : agent_id === null
-            ? sql`agent_id IS NULL`
-            : eq(skills.agent_id, agent_id),
+          scopeClause,
         ),
       )
+      // Prefer agent-scoped match over tenant-wide when both exist for the
+      // same descriptor. NULLS LAST mimics "real agent_id first" ordering.
+      .orderBy(sql`agent_id IS NULL`)
       .limit(1);
     return rows[0] ?? null;
   },
 
   async listByCategory(category): Promise<SkillRow[]> {
     const tenant_id = getCurrentTenant();
+    const ctxAgent = getCurrentAgent();
     return db
       .select()
       .from(skills)
@@ -94,17 +118,48 @@ export const skillsRepo: SkillsRepo = {
           eq(skills.tenant_id, tenant_id),
           eq(skills.category, category),
           eq(skills.status, 'active'),
+          // Agent scope (review #99 finding 1).
+          or(eq(skills.agent_id, ctxAgent), sql`agent_id IS NULL`),
         ),
       );
   },
 
   async propose(input): Promise<SkillRow> {
     const ctxTenant = getCurrentTenant();
+    const ctxAgent = getCurrentAgent();
     const tenant_id = input.tenant_id ?? ctxTenant;
     if (input.tenant_id && input.tenant_id !== ctxTenant) {
       throw new Error(`tenant mismatch: input ${input.tenant_id} vs context ${ctxTenant}`);
     }
-    const agent_id = input.agent_id ?? null;
+    // Validate agent scope (review #99 finding 1): explicit input.agent_id
+    // must match context agent OR be null (tenant-wide). undefined → defaults
+    // to current agent (NOT to tenant-wide, to avoid accidental privilege
+    // escalation when caller forgot to scope).
+    let agent_id: string | null;
+    if (input.agent_id === undefined) {
+      agent_id = ctxAgent;
+    } else if (input.agent_id === null) {
+      agent_id = null; // explicit tenant-wide; require owner-approved later
+    } else if (input.agent_id !== ctxAgent) {
+      throw new Error(
+        `agent_scope_violation: input agent ${input.agent_id} vs context ${ctxAgent}`,
+      );
+    } else {
+      agent_id = input.agent_id;
+    }
+    // Validate evaluator-mode skills cannot declare allowed_tools (review
+    // #99 mission item 4). Evaluators only inspect candidate outputs; tool
+    // access on evaluation pipelines is a category error and a potential
+    // privilege-escalation surface.
+    if (
+      input.execution_mode === 'evaluator' &&
+      input.allowed_tools &&
+      input.allowed_tools.length > 0
+    ) {
+      throw new Error(
+        'evaluator_mode_disallows_tools: skills with execution_mode=evaluator must have empty allowed_tools',
+      );
+    }
 
     // Determinar próxima version monotônica para (tenant, agent_or_tenant_wide, descriptor)
     const latestRows = await db
@@ -151,6 +206,7 @@ export const skillsRepo: SkillsRepo = {
 
   async activate(id, approver, reason): Promise<SkillRow> {
     const tenant_id = getCurrentTenant();
+    const ctxAgent = getCurrentAgent();
     return withTx(async (tx) => {
       const targetRows = await tx
         .select()
@@ -159,6 +215,15 @@ export const skillsRepo: SkillsRepo = {
         .limit(1);
       const target = targetRows[0];
       if (!target) throw new Error('skill_not_found');
+      // Agent-scope check (review #99 finding 1): caller cannot activate a
+      // skill owned by a different agent. Tenant-wide skills (agent_id=null)
+      // require the same caller to also activate via tenant-admin context,
+      // but here we accept either match-current-agent OR tenant-wide.
+      if (target.agent_id !== null && target.agent_id !== ctxAgent) {
+        throw new Error(
+          `agent_scope_violation: target agent ${target.agent_id} vs context ${ctxAgent}`,
+        );
+      }
       if (target.status !== 'proposed') {
         throw new Error(`cannot_activate_from_${target.status}`);
       }
@@ -200,6 +265,20 @@ export const skillsRepo: SkillsRepo = {
 
   async deprecate(id, _deprecator, _reason): Promise<SkillRow> {
     const tenant_id = getCurrentTenant();
+    const ctxAgent = getCurrentAgent();
+    // Read first to enforce agent scope (review #99 finding 1).
+    const existingRows = await db
+      .select()
+      .from(skills)
+      .where(and(eq(skills.tenant_id, tenant_id), eq(skills.id, id)))
+      .limit(1);
+    const existing = existingRows[0];
+    if (!existing) throw new Error('skill_not_found');
+    if (existing.agent_id !== null && existing.agent_id !== ctxAgent) {
+      throw new Error(
+        `agent_scope_violation: target agent ${existing.agent_id} vs context ${ctxAgent}`,
+      );
+    }
     const [updated] = await db
       .update(skills)
       .set({ status: 'deprecated', deprecated_at: new Date() })
@@ -211,6 +290,7 @@ export const skillsRepo: SkillsRepo = {
 
   async rollback(id, reason, _rolledBackBy): Promise<SkillRow> {
     const tenant_id = getCurrentTenant();
+    const ctxAgent = getCurrentAgent();
     return withTx(async (tx) => {
       const targetRows = await tx
         .select()
@@ -219,6 +299,12 @@ export const skillsRepo: SkillsRepo = {
         .limit(1);
       const target = targetRows[0];
       if (!target) throw new Error('skill_not_found');
+      // Agent-scope check (review #99 finding 1).
+      if (target.agent_id !== null && target.agent_id !== ctxAgent) {
+        throw new Error(
+          `agent_scope_violation: target agent ${target.agent_id} vs context ${ctxAgent}`,
+        );
+      }
 
       const now = new Date();
       const [updated] = await tx
@@ -261,19 +347,31 @@ export const skillsRepo: SkillsRepo = {
 
   async getById(id): Promise<SkillRow | null> {
     const tenant_id = getCurrentTenant();
+    const ctxAgent = getCurrentAgent();
     const rows = await db
       .select()
       .from(skills)
       .where(and(eq(skills.tenant_id, tenant_id), eq(skills.id, id)))
       .limit(1);
-    return rows[0] ?? null;
+    const row = rows[0];
+    if (!row) return null;
+    // Agent-scope check (review #99 finding 1): hide skills owned by other
+    // agents in the same tenant. Tenant-wide (agent_id=null) skills are
+    // visible to all agents.
+    if (row.agent_id !== null && row.agent_id !== ctxAgent) {
+      return null;
+    }
+    return row;
   },
 
   async getByDescriptor(descriptor, version): Promise<SkillRow | null> {
     const tenant_id = getCurrentTenant();
+    const ctxAgent = getCurrentAgent();
     const filters = [
       eq(skills.tenant_id, tenant_id),
       eq(skills.skill_descriptor, descriptor),
+      // Same scope rule as findActive: current agent OR tenant-wide.
+      or(eq(skills.agent_id, ctxAgent), sql`agent_id IS NULL`),
     ];
     if (typeof version === 'number') {
       filters.push(eq(skills.version, version));
@@ -289,10 +387,17 @@ export const skillsRepo: SkillsRepo = {
 
   async listVersions(descriptor): Promise<SkillRow[]> {
     const tenant_id = getCurrentTenant();
+    const ctxAgent = getCurrentAgent();
     return db
       .select()
       .from(skills)
-      .where(and(eq(skills.tenant_id, tenant_id), eq(skills.skill_descriptor, descriptor)))
+      .where(
+        and(
+          eq(skills.tenant_id, tenant_id),
+          eq(skills.skill_descriptor, descriptor),
+          or(eq(skills.agent_id, ctxAgent), sql`agent_id IS NULL`),
+        ),
+      )
       .orderBy(desc(skills.version));
   },
 };
