@@ -6,7 +6,7 @@
 
 Soul Layer é a "gravidade comportamental" do agente. Soul **modula** — ela nunca cria gate de execução. As 6 entregas:
 
-1. **Tabela `soul_biases`** (migration 036) — append-only versionada por (tenant, agent, scope, scope_value, principle); DEFAULT 'proposed' garante que nenhuma bias nasce active por acidente; partial unique `soul_biases_one_active_idx` garante 1 active por chave.
+1. **Tabela `soul_biases`** (migration 038) — append-only versionada por (tenant, agent, scope, scope_value, principle); DEFAULT 'proposed' garante que nenhuma bias nasce active por acidente; partial unique `soul_biases_one_active_idx` garante 1 active por chave.
 2. **`soulBiasesRepo`** (7 métodos) — state machine `proposed → active → deprecated/rolled_back`; tenant guard em todas leituras/escritas; `withTx` para deprecate-incumbent + activate-new atômico.
 3. **`SoulSlice` + `buildSoulSlice`** — fatia do Context Packet; filtra por `activation_context` (intent_in, role_in, domain_in, channel_in, risk_level_min); ranqueia por strength DESC + scope specificity DESC; renderiza bloco markdown "Orientação persistente" com disclaimer "inclinam, não bloqueiam".
 4. **Detector `soul_drift`** (8º tipo) — heurística-first (palavras absolutistas) + LLM judge opcional; emite `DriftEvidence` com severity_hint. `decision-engine` mapeia soul_drift → QUEUED_HUMAN máximo (NUNCA frozen/rollback).
@@ -138,7 +138,7 @@ if (decision.allowed) {
 | Bias não aparece no slice | `depth='relevant'`? `activation_context` filtra? `status='active'`? `findActiveForScope` retorna a bias? |
 | Drift alert stuck em `queued_human` | É esperado — soul_drift NUNCA é auto-aplicado. Owner precisa decidir na Inbox. |
 | `learned_strong_evidence` sobrescreveu Identity | Bug crítico. Inspecione `agent_drift_alerts` por `soul_identity_conflict` — origin-gate deveria ter bloqueado. |
-| Duas biases active na mesma chave | Impossível em DB normal (partial unique). Se aparecer, verificar que migration 036 rodou + índice existe. |
+| Duas biases active na mesma chave | Impossível em DB normal (partial unique). Se aparecer, verificar que migration 038 rodou + índice existe. |
 | Activate falha com `no_lineage_to_replace_active` | Bias proposed precisa de `previous_version_id` apontando para a active vigente. |
 | Worker materializa duplicado | Verificar que `findExistingBiasForProposal` está retornando — repo precisa de índice em `proposal_id`. |
 
@@ -158,10 +158,10 @@ SELECT * FROM soul_biases WHERE principle = 'X' AND status = 'active';
 
 **Cenário 3: rollback de migration**
 ```bash
-psql ... -f migrations/037_p8b_seed_founder_biases_down.sql
-psql ... -f migrations/036c_p8b_extend_capability_proposal_type_down.sql
-psql ... -f migrations/036b_p8b_extend_drift_alerts_type_down.sql
-psql ... -f migrations/036_p8b_soul_biases_down.sql
+psql ... -f migrations/039_p8b_seed_founder_biases_down.sql
+psql ... -f migrations/038c_p8b_extend_capability_proposal_type_down.sql
+psql ... -f migrations/038b_p8b_extend_drift_alerts_type_down.sql
+psql ... -f migrations/038_p8b_soul_biases_down.sql
 ```
 
 ## Admin UI (P8.5 — fora de escopo P8b)

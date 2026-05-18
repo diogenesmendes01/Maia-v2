@@ -213,7 +213,7 @@ export async function proposeSoulBiasFromDriftAlert(args: {
 > {
   try {
     // CAST: existing `capabilityProposalsRepo.create` is typed against the
-    // pre-P8b union. After migration 036c the DB CHECK includes 'soul_bias';
+    // pre-P8b union. After migration 038c the DB CHECK includes 'soul_bias';
     // we cast at the boundary until the repo signature is widened in a
     // follow-up.
     const repoCreate = capabilityProposalsRepo.create as unknown as (

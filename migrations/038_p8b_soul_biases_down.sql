@@ -1,4 +1,4 @@
--- Down de 036: drop integral.
+-- Down de 038: drop integral.
 DROP INDEX IF EXISTS soul_biases_drift_source_idx;
 DROP INDEX IF EXISTS soul_biases_proposal_idx;
 DROP INDEX IF EXISTS soul_biases_proposed_inbox_idx;

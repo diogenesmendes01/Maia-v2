@@ -1,4 +1,4 @@
--- Reverte 036b: restore CHECK original (7 tipos sem papel_drift/soul_drift).
+-- Reverte 038b: restore CHECK original (7 tipos sem papel_drift/soul_drift).
 ALTER TABLE agent_drift_alerts
   DROP CONSTRAINT IF EXISTS agent_drift_alerts_drift_type_check;
 

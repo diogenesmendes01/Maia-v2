@@ -1,4 +1,4 @@
--- Reverte 036c: volta para 5 tipos originais de 028_p5_capability_proposals.sql.
+-- Reverte 038c: volta para 5 tipos originais de 028_p5_capability_proposals.sql.
 ALTER TABLE capability_proposals
   DROP CONSTRAINT IF EXISTS capability_proposals_capability_type_check;
 

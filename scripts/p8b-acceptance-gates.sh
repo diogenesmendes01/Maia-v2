@@ -9,11 +9,11 @@ FAILED=0
 echo "=== Gate 1/10: P8b module structure (7 files) ==="
 STRUCT_OK=1
 for f in \
-  migrations/036_p8b_soul_biases.sql \
-  migrations/036_p8b_soul_biases_down.sql \
-  migrations/036b_p8b_extend_drift_alerts_type.sql \
-  migrations/036c_p8b_extend_capability_proposal_type.sql \
-  migrations/037_p8b_seed_founder_biases.sql \
+  migrations/038_p8b_soul_biases.sql \
+  migrations/038_p8b_soul_biases_down.sql \
+  migrations/038b_p8b_extend_drift_alerts_type.sql \
+  migrations/038c_p8b_extend_capability_proposal_type.sql \
+  migrations/039_p8b_seed_founder_biases.sql \
   src/control-plane/soul/soul-biases-repo.ts \
   src/control-plane/soul/origin-gate.ts \
   src/runtime/context-assembly/types/soul-slice.ts \
@@ -33,8 +33,8 @@ else
   FAILED=$((FAILED + 1))
 fi
 
-echo "=== Gate 2/10: migration 036 — soul_biases DEFAULT 'proposed' (invariante 5) ==="
-if grep -q "DEFAULT 'proposed'" migrations/036_p8b_soul_biases.sql; then
+echo "=== Gate 2/10: migration 038 — soul_biases DEFAULT 'proposed' (invariante 5) ==="
+if grep -q "DEFAULT 'proposed'" migrations/038_p8b_soul_biases.sql; then
   echo "[GATE 2/10] DEFAULT 'proposed' ... PASS"
   PASSED=$((PASSED + 1))
 else
@@ -42,9 +42,9 @@ else
   FAILED=$((FAILED + 1))
 fi
 
-echo "=== Gate 3/10: migration 036 — partial unique 'one active' (invariante 6) ==="
-if grep -q "soul_biases_one_active_idx" migrations/036_p8b_soul_biases.sql && \
-   grep -q "WHERE status = 'active'" migrations/036_p8b_soul_biases.sql; then
+echo "=== Gate 3/10: migration 038 — partial unique 'one active' (invariante 6) ==="
+if grep -q "soul_biases_one_active_idx" migrations/038_p8b_soul_biases.sql && \
+   grep -q "WHERE status = 'active'" migrations/038_p8b_soul_biases.sql; then
   echo "[GATE 3/10] partial unique 'one active' ... PASS"
   PASSED=$((PASSED + 1))
 else

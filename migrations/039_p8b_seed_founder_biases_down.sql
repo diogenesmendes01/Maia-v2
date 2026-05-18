@@ -1,4 +1,4 @@
--- Reverte seed 037: remove os 3 founder biases.
+-- Reverte seed 039: remove os 3 founder biases.
 DELETE FROM soul_biases
   WHERE proposed_by = 'founder'
     AND tenant_id = 'default'
