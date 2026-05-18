@@ -35,6 +35,11 @@ import {
   advanceWithTx,
 } from './repos.js';
 import { computeNext } from './rrule.js';
+import {
+  parseRRule as parseRRuleExtended,
+  usesBusinessDayExtension,
+  computeNextWithBusinessDays,
+} from './business-day-rrule.js';
 import { decideMissedRun, isOverdue } from './policies.js';
 import { newCorrelationToken, appendCorrelationFooter } from './correlation.js';
 import type {
@@ -55,6 +60,28 @@ const TIMEOUT_SCAN_LIMIT = 20;
 
 function jidFromPhone(tel: string): string {
   return tel.replace('+', '') + '@s.whatsapp.net';
+}
+
+/**
+ * Codex review #105 (medium): roteia entre o computeNext legacy e a versão
+ * business-day-aware. Subsequent cycles (advance + backfill) DEVEM honrar
+ * BYNTHWORKDAY/BYWORKDAY=true se o RRULE original os usou — caso contrário a
+ * extensão funciona só no primeiro ciclo e silenciosamente quebra depois.
+ */
+async function computeNextAdvance(args: {
+  rrule: string;
+  after: Date;
+  monthEndPolicy: MonthEndPolicy;
+  entidadeId?: string | null;
+}): Promise<Date> {
+  const extParsed = parseRRuleExtended(args.rrule);
+  if (usesBusinessDayExtension(extParsed)) {
+    return computeNextWithBusinessDays(extParsed, args.after, {
+      monthEndPolicy: args.monthEndPolicy,
+      entidadeId: args.entidadeId ?? undefined,
+    });
+  }
+  return computeNext(args.rrule, args.after, args.monthEndPolicy);
 }
 
 function renderTemplate(template: string, vars: Record<string, string>): string {
@@ -550,11 +577,12 @@ async function advanceInProgressOccurrence(occ: Occurrence): Promise<'advanced' 
 
   // Schedule next cycle.
   if (series.rrule) {
-    const next_at = computeNext(
-      series.rrule,
-      new Date(),
-      series.month_end_policy as MonthEndPolicy,
-    );
+    const next_at = await computeNextAdvance({
+      rrule: series.rrule,
+      after: new Date(),
+      monthEndPolicy: series.month_end_policy as MonthEndPolicy,
+      entidadeId: series.entidade_id,
+    });
     await seriesRepo.insertNextOccurrenceIfActive({
       series_id: series.id,
       expected_version: series.version,
@@ -613,11 +641,12 @@ async function escalateOutreachTimeout(occ: Occurrence): Promise<void> {
   });
   // Auto-schedule next cycle so the series keeps going.
   if (series.rrule) {
-    const next_at = computeNext(
-      series.rrule,
-      new Date(),
-      series.month_end_policy as MonthEndPolicy,
-    );
+    const next_at = await computeNextAdvance({
+      rrule: series.rrule,
+      after: new Date(),
+      monthEndPolicy: series.month_end_policy as MonthEndPolicy,
+      entidadeId: series.entidade_id,
+    });
     await seriesRepo.insertNextOccurrenceIfActive({
       series_id: series.id,
       expected_version: series.version,
@@ -794,11 +823,12 @@ async function scheduleNextRecurring(
   current: Occurrence,
 ): Promise<void> {
   if (!series.rrule) return;
-  const next_at = computeNext(
-    series.rrule,
-    new Date(),
-    series.month_end_policy as MonthEndPolicy,
-  );
+  const next_at = await computeNextAdvance({
+    rrule: series.rrule,
+    after: new Date(),
+    monthEndPolicy: series.month_end_policy as MonthEndPolicy,
+    entidadeId: series.entidade_id,
+  });
   const tasks: Array<{ ordem: number; kind: TaskKind }> =
     series.tipo === 'recurring_payment' ? paymentTaskBlueprint() : outreachTaskBlueprint();
   let correlation_token: string | undefined;
@@ -827,11 +857,12 @@ export async function runSeriesNextScheduler(): Promise<{ scheduled: number }> {
   for (const s of orphaned) {
     if (!s.rrule) continue;
     try {
-      const next_at = computeNext(
-        s.rrule,
-        new Date(),
-        s.month_end_policy as MonthEndPolicy,
-      );
+      const next_at = await computeNextAdvance({
+        rrule: s.rrule,
+        after: new Date(),
+        monthEndPolicy: s.month_end_policy as MonthEndPolicy,
+        entidadeId: s.entidade_id,
+      });
       const tasks: Array<{ ordem: number; kind: TaskKind }> =
         s.tipo === 'recurring_payment' ? paymentTaskBlueprint() : outreachTaskBlueprint();
       const correlation_token =

@@ -3,6 +3,11 @@ import type { Tool } from './_registry.js';
 import { audit } from '@/governance/audit.js';
 import { seriesRepo } from '@/scheduling/repos.js';
 import { computeNext, parseRRule } from '@/scheduling/rrule.js';
+import {
+  parseRRule as parseRRuleExtended,
+  usesBusinessDayExtension,
+  computeNextWithBusinessDays,
+} from '@/scheduling/business-day-rrule.js';
 import { outreachTaskBlueprint } from '@/scheduling/engine.js';
 import { newCorrelationToken } from '@/scheduling/correlation.js';
 
@@ -53,11 +58,16 @@ export const startRecurringOutreachTool: Tool<typeof inputSchema, typeof outputS
     if (!ctx.scope.entidades.includes(args.entidade_id)) {
       throw new Error('entidade fora do escopo');
     }
-    const first_scheduled_for = computeNext(
-      parseRRule(args.rrule),
-      new Date(),
-      args.month_end_policy,
-    );
+    // Codex review #105 (medium): roteia para business-day RRULE quando
+    // a regra usa BYNTHWORKDAY ou BYWORKDAY=true. Sem isso, a extensão
+    // existe na lib mas é inalcançável pelo product path.
+    const extParsed = parseRRuleExtended(args.rrule);
+    const first_scheduled_for = usesBusinessDayExtension(extParsed)
+      ? await computeNextWithBusinessDays(extParsed, new Date(), {
+          monthEndPolicy: args.month_end_policy,
+          entidadeId: args.entidade_id,
+        })
+      : computeNext(parseRRule(args.rrule), new Date(), args.month_end_policy);
     const correlation_token = newCorrelationToken();
     const contexto = {
       destinatario_pessoa_id: args.destinatario_pessoa_id,

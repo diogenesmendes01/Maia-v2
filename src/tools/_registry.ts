@@ -68,6 +68,16 @@ export type Tool<I extends z.ZodTypeAny, O extends z.ZodTypeAny> = {
    * reply into view-once (B3a). OR-logic across all tools in the turn.
    */
   sensitive?: boolean;
+  /**
+   * Codex review #105 (medium): kill-switch em runtime. Quando setado, o
+   * dispatcher checa o flag IMEDIATAMENTE antes de autorizar/executar — se
+   * o flag estiver off (kill switch ativo), o tool é tratado como
+   * inexistente para a chamada. O filtro em `REGISTRY` no module-load
+   * continua valendo para o schema exposto ao LLM, mas processos já
+   * carregados que recebam o tool name via chamada direta também respeitam
+   * o flag pós-load.
+   */
+  feature_flag?: FeatureFlagName;
 };
 
 export type AnyTool = Tool<z.ZodTypeAny, z.ZodTypeAny>;
@@ -115,15 +125,14 @@ export const REGISTRY: Record<string, AnyTool> = {
   calendar_list_holidays: calendarListHolidaysTool as unknown as AnyTool,
   calendar_business_days_between: calendarBusinessDaysBetweenTool as unknown as AnyTool,
   calendar_add_business_days: calendarAddBusinessDaysTool as unknown as AnyTool,
-  // Calendar v2 — write tools (atrás da flag para evitar exposição prematura).
-  ...(featureFlags.isEnabled(FeatureFlagName.CALENDAR_V2)
-    ? {
-        register_custom_holiday: registerCustomHolidayTool as unknown as AnyTool,
-        approve_capability_proposal: approveCapabilityProposalTool as unknown as AnyTool,
-        reject_capability_proposal: rejectCapabilityProposalTool as unknown as AnyTool,
-        list_pending_proposals: listPendingProposalsTool as unknown as AnyTool,
-      }
-    : {}),
+  // Calendar v2 — write tools. Cada uma declara `feature_flag` para que o
+  // gate seja avaliado em runtime (kill-switch funciona em processos já
+  // carregados, schema exposto ao LLM sincroniza com o flag). Codex review
+  // #105 medium.
+  register_custom_holiday: registerCustomHolidayTool as unknown as AnyTool,
+  approve_capability_proposal: approveCapabilityProposalTool as unknown as AnyTool,
+  reject_capability_proposal: rejectCapabilityProposalTool as unknown as AnyTool,
+  list_pending_proposals: listPendingProposalsTool as unknown as AnyTool,
 };
 
 export function getToolSchemas(byEntity: Map<string, ResolvedPermission>) {
@@ -136,8 +145,14 @@ export function getToolSchemas(byEntity: Map<string, ResolvedPermission>) {
     }
     for (const a of rp.profile.acoes) allowed.add(a);
   }
-  if (isOwner) return Object.values(REGISTRY).map(toolToSchema);
+  // Codex review #105 (medium): além do filtro de permissão, oculta tools
+  // cujo feature_flag esteja desligado em runtime. Mantém schema exposto
+  // ao LLM sincronizado com o gate do dispatcher.
+  const flagOk = (t: AnyTool): boolean =>
+    t.feature_flag === undefined || featureFlags.isEnabled(t.feature_flag);
+  if (isOwner) return Object.values(REGISTRY).filter(flagOk).map(toolToSchema);
   return Object.values(REGISTRY)
+    .filter(flagOk)
     .filter((t) => t.required_actions.every((a) => allowed.has(a)))
     .map(toolToSchema);
 }

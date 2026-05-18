@@ -5,6 +5,7 @@
 import { z } from 'zod';
 import type { Tool } from './_registry.js';
 import { capabilityProposalsRepo } from '@/db/repositories.js';
+import { FeatureFlagName } from '@/types/enums.js';
 
 const inputSchema = z.object({
   capability_type: z
@@ -38,6 +39,7 @@ export const listPendingProposalsTool: Tool<typeof inputSchema, typeof outputSch
   redis_required: false,
   operation_type: 'read',
   audit_action: 'calendar_query',
+  feature_flag: FeatureFlagName.CALENDAR_V2,
   handler: async (args) => {
     const all = await capabilityProposalsRepo.listByStatus('submitted');
     const filtered = args.capability_type

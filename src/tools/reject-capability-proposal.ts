@@ -5,6 +5,7 @@
 import { z } from 'zod';
 import type { Tool } from './_registry.js';
 import { capabilityProposalsRepo } from '@/db/repositories.js';
+import { FeatureFlagName } from '@/types/enums.js';
 
 const inputSchema = z.object({
   proposal_id: z.string().uuid(),
@@ -26,6 +27,7 @@ export const rejectCapabilityProposalTool: Tool<typeof inputSchema, typeof outpu
   redis_required: false,
   operation_type: 'update_meta',
   audit_action: 'capability_proposal_rejected',
+  feature_flag: FeatureFlagName.CALENDAR_V2,
   handler: async (args, ctx) => {
     const approverId = ctx.pessoa?.id ?? 'owner';
     const t = await capabilityProposalsRepo.transition({

@@ -9,6 +9,7 @@ import { audit } from '@/governance/audit.js';
 import { isRedisConnected } from '@/lib/redis.js';
 import { logger } from '@/lib/logger.js';
 import type { ActionKey } from '@/governance/audit-actions.js';
+import { featureFlags } from '@/config/feature-flags.js';
 
 export type ToolContext = {
   pessoa: Pessoa;
@@ -50,6 +51,18 @@ export async function dispatchTool(input: {
 }): Promise<DispatchResult> {
   const tool = REGISTRY[input.tool] as AnyTool | undefined;
   if (!tool) return { error: 'unknown_tool', details: { tool: input.tool } };
+
+  // Codex review #105 (medium): kill-switch em runtime. `REGISTRY` é
+  // construído no module-load; quando um flag é killado depois, processos
+  // já em execução ainda exporiam (e executariam) o tool sem essa checagem.
+  // Verifica AQUI, antes de auth e idempotência, para que o flag desligado
+  // bloqueie execução imediatamente — incluindo retries de tools cacheadas.
+  if (tool.feature_flag !== undefined && !featureFlags.isEnabled(tool.feature_flag)) {
+    return {
+      error: 'feature_disabled',
+      details: { tool: tool.name, feature_flag: tool.feature_flag },
+    };
+  }
 
   const parsed = tool.input_schema.safeParse(input.args);
   if (!parsed.success) {
