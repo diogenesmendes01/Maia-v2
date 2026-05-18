@@ -720,8 +720,8 @@ async function runAgentForMensagemInner(
       : pessoa.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
   const stopTyping = scheduleTypingDebounce(jid, inbound.id);
   let totalTokens: number;
-  let reactOutboundText = '';
-  let reactToolsCalled: Array<{ name: string; result: unknown }> = [];
+  let reactOutboundText: string;
+  let reactToolsCalled: Array<{ name: string; result: unknown }>;
   try {
     const result = await runReActLoop({
       pessoa,

@@ -255,5 +255,187 @@ describe('buildContextPacket orchestrator', () => {
     expect(packet.history.turns).toEqual([]);
     expect(packet.assembly_meta.fallback_depths_applied.history).toBe('degraded');
   });
+
+  // ============================================================================
+  // Per-slice timeout + total budget enforcement (PR #96 review remediation)
+  // ============================================================================
+
+  describe('budget + per-slice timeout enforcement', () => {
+    /**
+     * Build a slice builder whose promise never resolves and ignores
+     * AbortSignal. This is the hostile case from Codex review — a hanging
+     * downstream dep that doesn't observe abort.
+     */
+    function makeHangingBuilder<TSlice>(
+      name: import('@/runtime/context-packet/types.js').SliceName,
+      _fallback: TSlice,
+    ): SliceBuilder<unknown, TSlice> {
+      return {
+        name,
+        build: () => new Promise<SliceBuilderResult<TSlice>>(() => undefined),
+        cacheKey: () => `maia:context:hang:${name}:x`,
+      };
+    }
+
+    it('orchestrator does not exceed total budget even if slice hangs', async () => {
+      const { builders } = makeStandardBuilders();
+      type UserSliceType = import('@/runtime/context-packet/types.js').UserSlice;
+      const hangingUser = makeHangingBuilder<UserSliceType>('user', {
+        pessoa: null,
+        preferences: {},
+        memories: [],
+        behavioral_hints: [],
+        truncated: false,
+      });
+      const totalBudgetMs = 200;
+      const timeoutPerSliceMs = 50;
+
+      const start = performance.now();
+      const packet = await buildContextPacket(
+        { base: mockBase(), decision: mockDecision() },
+        {
+          builders: {
+            ...builders,
+            user: hangingUser as unknown as SliceBuilderSet['user'],
+          },
+          historyLoader: emptyHistory,
+          budgetMs: totalBudgetMs,
+          timeoutPerSliceMs,
+        },
+      );
+      const elapsed = performance.now() - start;
+
+      // Budget allowance: total + small jitter for timer firing + GC.
+      expect(elapsed).toBeLessThan(totalBudgetMs + 100);
+      expect(packet.user.memories).toEqual([]);
+      // Either 'timeout' or 'timeout_cache' depending on whether cache was hit.
+      expect(['timeout', 'timeout_cache']).toContain(
+        packet.assembly_meta.fallback_depths_applied.user,
+      );
+    });
+
+    it('history loader hang also bounded by per-slice timeout', async () => {
+      const { builders } = makeStandardBuilders();
+      const hangingHistory = () =>
+        new Promise<import('@/runtime/context-packet/types.js').HistorySlice>(
+          () => undefined,
+        );
+      const start = performance.now();
+      const packet = await buildContextPacket(
+        { base: mockBase(), decision: mockDecision() },
+        {
+          builders,
+          historyLoader: hangingHistory,
+          budgetMs: 200,
+          timeoutPerSliceMs: 50,
+        },
+      );
+      const elapsed = performance.now() - start;
+      expect(elapsed).toBeLessThan(300);
+      expect(packet.history.turns).toEqual([]);
+      expect(packet.assembly_meta.fallback_depths_applied.history).toBe(
+        'timeout',
+      );
+    });
+
+    it('policy hang → throws (fail closed, budget cannot rescue)', async () => {
+      const { builders } = makeStandardBuilders();
+      const hangingPolicy = makeHangingBuilder<PolicySlice>('policy', {
+        applicable_rules: [],
+        truncated: false,
+      });
+      await expect(
+        buildContextPacket(
+          { base: mockBase(), decision: mockDecision() },
+          {
+            builders: { ...builders, policy: hangingPolicy },
+            historyLoader: emptyHistory,
+            budgetMs: 200,
+            timeoutPerSliceMs: 50,
+          },
+        ),
+      ).rejects.toThrow(/policy.*exceeded timeout/i);
+    });
+
+    it('cached value used on timeout when cache passed', async () => {
+      const cache = new InMemorySliceCache();
+      type UserSliceType = import('@/runtime/context-packet/types.js').UserSlice;
+      const knownUserSlice: UserSliceType = {
+        pessoa: null,
+        preferences: { foo: 'bar' },
+        memories: [],
+        behavioral_hints: [],
+        truncated: false,
+      };
+      const cacheKey = 'maia:context:hang:user:x';
+      await cache.set(cacheKey, knownUserSlice, 60);
+
+      const { builders } = makeStandardBuilders();
+      const hangingUser = makeHangingBuilder<UserSliceType>('user', {
+        pessoa: null,
+        preferences: {},
+        memories: [],
+        behavioral_hints: [],
+        truncated: false,
+      });
+      const packet = await buildContextPacket(
+        { base: mockBase(), decision: mockDecision() },
+        {
+          builders: {
+            ...builders,
+            user: hangingUser as unknown as SliceBuilderSet['user'],
+          },
+          historyLoader: emptyHistory,
+          budgetMs: 200,
+          timeoutPerSliceMs: 50,
+          cache,
+        },
+      );
+      // The cached value's `preferences` survived; fallback would have been
+      // an empty object.
+      expect(packet.user.preferences).toEqual({ foo: 'bar' });
+      expect(packet.assembly_meta.fallback_depths_applied.user).toBe(
+        'timeout_cache',
+      );
+    });
+
+    it('emits metric counter on timeout', async () => {
+      const { builders } = makeStandardBuilders();
+      type SoulSliceType = import('@/runtime/context-packet/types.js').SoulSlice;
+      const hangingSoul = makeHangingBuilder<SoulSliceType>('soul', {
+        biases: [],
+        truncated: false,
+      });
+      const counters: Array<{ name: string; labels?: Record<string, string> }> = [];
+      await buildContextPacket(
+        { base: mockBase(), decision: mockDecision() },
+        {
+          builders: { ...builders, soul: hangingSoul },
+          historyLoader: emptyHistory,
+          budgetMs: 200,
+          timeoutPerSliceMs: 50,
+          metrics: {
+            recordCounter(name, labels) {
+              counters.push({ name, labels });
+            },
+          },
+        },
+      );
+      const fallbackCounters = counters.filter(
+        (c) =>
+          c.name === 'context_packet.fallback_applied' && c.labels?.slice === 'soul',
+      );
+      expect(fallbackCounters.length).toBeGreaterThanOrEqual(1);
+      expect(fallbackCounters[0]?.labels?.reason).toMatch(/timeout/);
+    });
+
+    it('exposes DEFAULT_TOTAL_BUDGET_MS and DEFAULT_TIMEOUT_PER_SLICE_MS', async () => {
+      const mod = await import(
+        '@/runtime/context-packet/build-context-packet.js'
+      );
+      expect(mod.DEFAULT_TOTAL_BUDGET_MS).toBe(600);
+      expect(mod.DEFAULT_TIMEOUT_PER_SLICE_MS).toBe(100);
+    });
+  });
 });
 
