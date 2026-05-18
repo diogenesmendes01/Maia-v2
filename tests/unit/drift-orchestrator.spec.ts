@@ -1,19 +1,21 @@
 /**
  * P4 Task 8 (Cluster 3) — drift orchestrator: runAllDriftDetectors.
  *
- * P8d: amplia para 8 detectores (adiciona papel_drift). Quando P8b mergear
- * soul_drift, o número aqui sobe para 9.
+ * P8d: amplia para 8 detectores (adiciona papel_drift gated on
+ * FEATURE_OPERATIONAL_PROFILE_V2). Quando P8b mergear soul_drift, o número
+ * sobe para 9 (também gated).
  *
  * Mocka os detectores e o runCognitiveModule do runner para garantir que:
- *  - O orchestrator chama runCognitiveModule UMA vez por detector.
+ *  - O orchestrator chama runCognitiveModule UMA vez por detector ATIVO.
  *  - As opções passadas a runCognitiveModule incluem name=`drift_detector_<type>`,
  *    triggered_by='async_event', timeoutMs=8000, fallback=null.
  *  - O resultado final filtra `r.output === null`, ou seja, só retorna
  *    DriftEvidence onde algum detector identificou drift de fato.
- *  - A ordem das chamadas reflete a ordem de DETECTORS.
+ *  - A ordem das chamadas reflete a ordem de buildDetectors().
+ *  - Com flag OFF: papelDriftDetector NÃO é invocado, nenhuma decisão aplicada.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { DriftType } from '@/types/enums.js';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { DriftType, FeatureFlagName } from '@/types/enums.js';
 import type { DriftDetectionInput, DriftEvidence } from '@/cognition/drift/types.js';
 import type { AgentOperationalProfileVersion } from '@/db/schema.js';
 
@@ -27,6 +29,7 @@ const {
   procedimentoDetectMock,
   papelDetectMock,
   runCognitiveModuleMock,
+  featureFlagsIsEnabledMock,
 } = vi.hoisted(() => ({
   tomDetectMock: vi.fn(),
   valoresDetectMock: vi.fn(),
@@ -37,6 +40,7 @@ const {
   procedimentoDetectMock: vi.fn(),
   papelDetectMock: vi.fn(),
   runCognitiveModuleMock: vi.fn(),
+  featureFlagsIsEnabledMock: vi.fn(),
 }));
 
 vi.mock('@/cognition/drift/tom.js', () => ({
@@ -67,6 +71,13 @@ vi.mock('@/cognition/drift/papel.js', () => ({
 vi.mock('@/cognition/runner.js', () => ({
   runCognitiveModule: (opts: unknown, fn: () => Promise<unknown>) =>
     runCognitiveModuleMock(opts, fn),
+}));
+
+// Mock featureFlags singleton so tests control flag state without env vars.
+vi.mock('@/config/feature-flags.js', () => ({
+  featureFlags: {
+    isEnabled: featureFlagsIsEnabledMock,
+  },
 }));
 
 import { runAllDriftDetectors } from '@/cognition/drift/index.js';
@@ -125,9 +136,18 @@ describe('runAllDriftDetectors', () => {
     procedimentoDetectMock.mockReset();
     papelDetectMock.mockReset();
     runCognitiveModuleMock.mockReset();
+    featureFlagsIsEnabledMock.mockReset();
+    // Default: OPERATIONAL_PROFILE_V2 flag ON (papel_drift included).
+    featureFlagsIsEnabledMock.mockImplementation(
+      (name: string) => name === FeatureFlagName.OPERATIONAL_PROFILE_V2,
+    );
   });
 
-  it('chama runCognitiveModule 8x (um por detector) com opções corretas e retorna apenas outputs não-null', async () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('flag ON: chama runCognitiveModule 8x (um por detector) com opções corretas e retorna apenas outputs não-null', async () => {
     // Make runCognitiveModule simply invoke the detector and wrap result
     runCognitiveModuleMock.mockImplementation(async (_opts: unknown, fn: () => Promise<unknown>) => {
       const output = await fn();
@@ -155,7 +175,7 @@ describe('runAllDriftDetectors', () => {
     expect(firstCallOpts['timeoutMs']).toBe(8000);
     expect(firstCallOpts['fallback']).toBeNull();
 
-    // Order of calls matches DETECTORS order
+    // Order of calls matches buildDetectors() order (flag ON → papel_drift last)
     const calledNames = runCognitiveModuleMock.mock.calls.map(
       (c) => (c[0] as Record<string, unknown>)['name'],
     );
@@ -175,6 +195,41 @@ describe('runAllDriftDetectors', () => {
     expect(out.map((e) => e.drift_type)).toEqual(['tom', 'vies', 'papel_drift']);
   });
 
+  it('flag OFF (OPERATIONAL_PROFILE_V2=false): papelDriftDetector NÃO é invocado, apenas 7 módulos chamados', async () => {
+    // Override: flag disabled — papel_drift stays dormant.
+    featureFlagsIsEnabledMock.mockReturnValue(false);
+
+    runCognitiveModuleMock.mockImplementation(async (_opts: unknown, fn: () => Promise<unknown>) => {
+      const output = await fn();
+      return { output, status: 'success', fallback_triggered: false, latency_ms: 5 };
+    });
+
+    tomDetectMock.mockResolvedValue(null);
+    valoresDetectMock.mockResolvedValue(null);
+    confiancaDetectMock.mockResolvedValue(null);
+    viesDetectMock.mockResolvedValue(null);
+    escopoDetectMock.mockResolvedValue(null);
+    linguagemDetectMock.mockResolvedValue(null);
+    procedimentoDetectMock.mockResolvedValue(null);
+
+    const out = await runAllDriftDetectors(makeInput());
+
+    // Only 7 calls (no papel_drift)
+    expect(runCognitiveModuleMock).toHaveBeenCalledTimes(7);
+
+    const calledNames = runCognitiveModuleMock.mock.calls.map(
+      (c) => (c[0] as Record<string, unknown>)['name'],
+    );
+    expect(calledNames).not.toContain('drift_detector_papel_drift');
+    expect(calledNames).toContain('drift_detector_tom');
+
+    // papelDetectMock was never called
+    expect(papelDetectMock).not.toHaveBeenCalled();
+
+    // No evidence returned (all null)
+    expect(out).toEqual([]);
+  });
+
   it('quando runCognitiveModule retorna output:null (fallback) → excluído do resultado', async () => {
     runCognitiveModuleMock.mockResolvedValue({
       output: null,
@@ -190,12 +245,13 @@ describe('runAllDriftDetectors', () => {
     escopoDetectMock.mockResolvedValue(null);
     linguagemDetectMock.mockResolvedValue(null);
     procedimentoDetectMock.mockResolvedValue(null);
+    papelDetectMock.mockResolvedValue(null);
 
     const out = await runAllDriftDetectors(makeInput());
     expect(out).toEqual([]);
   });
 
-  it('todos detectores retornam evidence → 8 evidences no resultado', async () => {
+  it('flag ON + todos detectores retornam evidence → 8 evidences no resultado', async () => {
     runCognitiveModuleMock.mockImplementation(async (_opts: unknown, fn: () => Promise<unknown>) => {
       const output = await fn();
       return { output, status: 'success', fallback_triggered: false, latency_ms: 5 };
@@ -222,5 +278,27 @@ describe('runAllDriftDetectors', () => {
       'valores',
       'vies',
     ]);
+  });
+
+  it('flag OFF + todos base detectores retornam evidence → 7 evidences (sem papel_drift)', async () => {
+    featureFlagsIsEnabledMock.mockReturnValue(false);
+
+    runCognitiveModuleMock.mockImplementation(async (_opts: unknown, fn: () => Promise<unknown>) => {
+      const output = await fn();
+      return { output, status: 'success', fallback_triggered: false, latency_ms: 5 };
+    });
+
+    tomDetectMock.mockResolvedValueOnce(makeEvidence(DriftType.TOM));
+    valoresDetectMock.mockResolvedValueOnce(makeEvidence(DriftType.VALORES));
+    confiancaDetectMock.mockResolvedValueOnce(makeEvidence(DriftType.CONFIANCA));
+    viesDetectMock.mockResolvedValueOnce(makeEvidence(DriftType.VIES));
+    escopoDetectMock.mockResolvedValueOnce(makeEvidence(DriftType.ESCOPO));
+    linguagemDetectMock.mockResolvedValueOnce(makeEvidence(DriftType.LINGUAGEM));
+    procedimentoDetectMock.mockResolvedValueOnce(makeEvidence(DriftType.PROCEDIMENTO));
+
+    const out = await runAllDriftDetectors(makeInput());
+    expect(out).toHaveLength(7);
+    expect(out.map((e) => e.drift_type)).not.toContain('papel_drift');
+    expect(papelDetectMock).not.toHaveBeenCalled();
   });
 });

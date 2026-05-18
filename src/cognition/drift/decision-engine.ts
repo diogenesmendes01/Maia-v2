@@ -143,10 +143,19 @@ export function classifySeverity(ev: DriftEvidence): DriftSeverity {
       const offRole = Array.isArray(offRoleRaw) ? offRoleRaw : [];
       const observed = (p as { observed_role_inferred?: unknown }).observed_role_inferred;
       const declared = (p as { declared_role?: unknown }).declared_role;
+
+      // rolesDiverge requires BOTH sides to be validated role slugs (snake_case,
+      // no spaces). Free-text prose descriptors (role_descriptor from seed) are
+      // NOT slugs — comparing prose prefixes against role ids produces false
+      // positives that promote normal alto drift to critico/rollback.
+      // A valid slug: word chars + underscores only, at least one underscore
+      // (e.g. "atendimento_financeiro_pf"), no spaces.
+      const SLUG_RE = /^\w+(_\w+)+$/;
       const rolesDiverge =
         typeof observed === 'string' &&
         typeof declared === 'string' &&
-        observed.length > 0 &&
+        SLUG_RE.test(observed.trim()) &&
+        SLUG_RE.test(declared.trim()) &&
         !observed.toLowerCase().includes(
           (declared.toLowerCase().split('_')[0] ?? ''),
         );

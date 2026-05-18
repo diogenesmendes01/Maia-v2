@@ -1,11 +1,16 @@
--- P8d §6 / review #100 — Extend agent_drift_alerts.drift_type CHECK to include papel_drift.
+-- P8d §6 / review #100 round-2 — Extend agent_drift_alerts.drift_type CHECK to
+-- include papel_drift while preserving the full expected enum superset.
 --
 -- Migration 026 originally defined the CHECK with 7 values (tom, valores, confianca,
--- vies, escopo, linguagem, procedimento). P8d adds papel_drift as the 9th detector
--- (8th in this branch — soul_drift from P8b joins via 038/039 when those merge).
--- Without this migration the CHECK rejects papel_drift inserts and decideAndApply
--- in src/cognition/drift/decision-engine.ts has already mutated profile state
--- (freeze/rollback) before the alert insert blows up — violating audit trail.
+-- vies, escopo, linguagem, procedimento). P8d adds papel_drift as the 9th detector.
+-- P8b adds soul_drift (8th, via migrations 038/039 on a parallel branch).
+--
+-- Merge-safety rationale: this migration drops and recreates the CHECK with the
+-- FULL union of all known drift_type values (P4 original 7 + soul_drift from P8b
+-- + papel_drift from P8d). Regardless of which branch merges first, the final
+-- merged state will contain every value. If soul_drift rows already exist (P8b
+-- merged first) this CHECK keeps them valid; if they don't exist yet (P8d merges
+-- first) the value is pre-registered harmlessly — future P8b rows will pass.
 --
 -- Migration numbers 036–039 are coordinated for P8e/P8c/P8b reviews on PRs
 -- #93/#94/#95; this branch owns 040.
@@ -25,5 +30,6 @@ ALTER TABLE agent_drift_alerts ADD CONSTRAINT agent_drift_alerts_drift_type_chec
     'escopo',
     'linguagem',
     'procedimento',
+    'soul_drift',
     'papel_drift'
   ));

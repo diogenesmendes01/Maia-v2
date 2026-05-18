@@ -22,10 +22,11 @@ import { linguagemDetector } from './linguagem.js';
 import { procedimentoDetector } from './procedimento.js';
 import { papelDriftDetector } from './papel.js';
 import type { DriftDetector, DriftDetectionInput, DriftEvidence } from './types.js';
+import { featureFlags } from '@/config/feature-flags.js';
+import { FeatureFlagName } from '@/types/enums.js';
 
-// P8d §6 — papelDriftDetector é o 9º detector (P8b adiciona soul_drift como 8º
-// em outra branch; quando aquele merge, basta inserir ali).
-export const DETECTORS: DriftDetector[] = [
+// P4 — base detectors, always active.
+export const BASE_DETECTORS: DriftDetector[] = [
   tomDetector,
   valoresDetector,
   confiancaDetector,
@@ -33,14 +34,33 @@ export const DETECTORS: DriftDetector[] = [
   escopoDetector,
   linguagemDetector,
   procedimentoDetector,
-  papelDriftDetector,
 ];
+
+// P8d §6 — papelDriftDetector gated on FEATURE_OPERATIONAL_PROFILE_V2.
+// When the flag is off, papel_drift remains dormant: no Anthropic call,
+// no freeze/rollback, no alert row. P8b adds soul_drift on a separate branch;
+// when that merges it adds its own gated detector alongside this one.
+//
+// `DETECTORS` is kept for backwards-compatibility with existing tests that
+// inspect the list. It reflects the currently active set — re-computed each
+// call so runtime flag changes (e.g. kill switch) are respected immediately.
+export function buildDetectors(): DriftDetector[] {
+  const detectors = [...BASE_DETECTORS];
+  if (featureFlags.isEnabled(FeatureFlagName.OPERATIONAL_PROFILE_V2)) {
+    detectors.push(papelDriftDetector);
+  }
+  return detectors;
+}
+
+/** @deprecated Use buildDetectors() to get the flag-aware list. */
+export const DETECTORS: DriftDetector[] = BASE_DETECTORS;
 
 export async function runAllDriftDetectors(
   input: DriftDetectionInput,
 ): Promise<DriftEvidence[]> {
+  const activeDetectors = buildDetectors();
   const results = await Promise.all(
-    DETECTORS.map((d) =>
+    activeDetectors.map((d) =>
       runCognitiveModule<DriftEvidence | null>(
         {
           name: `drift_detector_${d.type}`,
