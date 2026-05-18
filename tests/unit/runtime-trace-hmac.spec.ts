@@ -1,10 +1,24 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterAll, vi } from 'vitest';
+
+// Codex review #102 issue 2: HMAC fails closed when no master secret is
+// configured. Tests install a deterministic secret via the injection slot
+// instead of relying on the (now-removed) silent fallback.
+vi.mock('../../src/config/env.js', () => ({
+  config: {
+    NODE_ENV: 'test',
+    RUNTIME_TRACE_HMAC_KEY_VERSION: 1,
+    RUNTIME_TRACE_HMAC_MASTER_SECRET: undefined,
+  },
+}));
+
 import {
   signHmac,
   verifyHmac,
   canonicalJson,
   deriveTenantKey,
   _resetHmacCacheForTests,
+  _setTestMasterSecretForTests,
+  _clearTestMasterSecretForTests,
 } from '../../src/control-plane/runtime-trace/lib/hmac.js';
 
 /**
@@ -16,6 +30,11 @@ import {
 describe('runtime-trace HMAC', () => {
   beforeEach(() => {
     _resetHmacCacheForTests();
+    _setTestMasterSecretForTests('p10b-unit-test-master-secret-deterministic');
+  });
+
+  afterAll(() => {
+    _clearTestMasterSecretForTests();
   });
 
   describe('canonicalJson', () => {
@@ -88,6 +107,63 @@ describe('runtime-trace HMAC', () => {
     it('key-order-different but equivalent payload still verifies (canonical encoding)', () => {
       const sig = signHmac('tenant-a', 1, { a: 1, b: 2 });
       expect(verifyHmac('tenant-a', 1, { b: 2, a: 1 }, sig)).toBe(true);
+    });
+  });
+
+  describe('determinism property tests', () => {
+    // Codex review #102: HMAC must be deterministic within a tenant so a
+    // re-signed payload always matches verify(). We assert this across 50
+    // random payloads × 3 tenants.
+    function randomPayload(seed: number): Record<string, unknown> {
+      const rng = (i: number) => ((seed * 9301 + 49297 * (i + 1)) % 233280) / 233280;
+      const depth = 1 + Math.floor(rng(0) * 3);
+      const keys = ['a', 'b', 'c', 'd', 'e', 'f', 'g'];
+      const out: Record<string, unknown> = {};
+      for (let i = 0; i < depth + 2; i++) {
+        const k = keys[Math.floor(rng(i + 1) * keys.length)]!;
+        const which = Math.floor(rng(i + 7) * 4);
+        if (which === 0) out[k] = Math.floor(rng(i + 11) * 1000);
+        else if (which === 1) out[k] = rng(i + 13) > 0.5;
+        else if (which === 2) out[k] = `s${i}-${Math.floor(rng(i + 17) * 100)}`;
+        else out[k] = [rng(i) > 0.5, rng(i + 1) > 0.5];
+      }
+      return out;
+    }
+
+    it('signHmac is deterministic within a tenant (50 random payloads × 3 tenants)', () => {
+      const tenants = ['tenant-alpha', 'tenant-beta', 'tenant-gamma'];
+      for (let i = 0; i < 50; i++) {
+        const payload = randomPayload(i);
+        for (const t of tenants) {
+          const sig1 = signHmac(t, 1, payload);
+          const sig2 = signHmac(t, 1, payload);
+          expect(sig1).toBe(sig2);
+        }
+      }
+    });
+
+    it('signHmac differs across tenants for every random payload (50 × 3 pairs)', () => {
+      for (let i = 0; i < 50; i++) {
+        const payload = randomPayload(i);
+        const sigA = signHmac('tenant-alpha', 1, payload);
+        const sigB = signHmac('tenant-beta', 1, payload);
+        const sigC = signHmac('tenant-gamma', 1, payload);
+        expect(sigA).not.toBe(sigB);
+        expect(sigB).not.toBe(sigC);
+        expect(sigA).not.toBe(sigC);
+      }
+    });
+  });
+
+  describe('fail-closed behaviour (Codex review #102)', () => {
+    it('throws when no master secret configured (fail-closed in prod)', () => {
+      _clearTestMasterSecretForTests();
+      // No test secret AND no env var → must throw, not fall back.
+      expect(() => signHmac('tenant-x', 1, { a: 1 })).toThrow(
+        /RUNTIME_TRACE_HMAC_MASTER_SECRET is required/,
+      );
+      // Restore for any subsequent test.
+      _setTestMasterSecretForTests('p10b-unit-test-master-secret-deterministic');
     });
   });
 

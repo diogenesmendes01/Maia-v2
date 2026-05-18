@@ -286,6 +286,21 @@ const envSchema = z
         message: 'OWNER_TELEFONE_WHATSAPP must differ from WHATSAPP_NUMBER_MAIA',
       });
     }
+    // P10b (Codex review #102 — issue 2): fail-closed on missing HMAC secret.
+    // When runtime trace is on in production, the master secret MUST be set
+    // (KMS-backed). Test/dev can override via _setTestMasterSecretForTests().
+    if (
+      cfg.NODE_ENV === 'production' &&
+      cfg.FEATURE_RUNTIME_TRACE_V1 &&
+      !cfg.RUNTIME_TRACE_HMAC_MASTER_SECRET
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['RUNTIME_TRACE_HMAC_MASTER_SECRET'],
+        message:
+          'RUNTIME_TRACE_HMAC_MASTER_SECRET is required in production when FEATURE_RUNTIME_TRACE_V1 is enabled — audit HMACs would be forgeable without it',
+      });
+    }
     try {
       assertSafeAuthDir(cfg.BAILEYS_AUTH_DIR);
     } catch (err) {

@@ -1,13 +1,18 @@
 #!/bin/bash
 # P10b Acceptance Gates — Runtime Trace
-# Run after DB up + migrations 036/037/038 applied.
+# Run after DB up + migrations 041/042/043 applied.
+# (Migration numbers updated per Codex review #102 to coordinate with
+#  parallel PRs P8b/P8c/P8d/P8e — see runbook for the global numbering table.)
 set -e
 
-echo "=== Gate A: 2 novas tabelas + 1 matview no schema ==="
-COUNT_TBL=$(grep -cE "^export const (runtime_trace_envelopes|runtime_trace_bodies)" src/db/schema.ts)
-[ "$COUNT_TBL" = "2" ] || { echo "FAIL: expected 2 trace tables in schema.ts, got $COUNT_TBL"; exit 1; }
-grep -q "unified_trace_events" migrations/038_p10b_unified_trace_events_matview.sql || {
+echo "=== Gate A: 3 novas tabelas + 1 matview no schema ==="
+COUNT_TBL=$(grep -cE "^export const (runtime_trace_envelopes|runtime_trace_bodies|runtime_trace_body_outbox)" src/db/schema.ts)
+[ "$COUNT_TBL" = "3" ] || { echo "FAIL: expected 3 trace tables in schema.ts, got $COUNT_TBL"; exit 1; }
+grep -q "unified_trace_events" migrations/043_p10b_unified_trace_events_matview.sql || {
   echo "FAIL: unified_trace_events matview migration missing"; exit 1;
+}
+grep -q "runtime_trace_body_outbox" migrations/042_p10b_runtime_trace_bodies.sql || {
+  echo "FAIL: durable outbox migration missing"; exit 1;
 }
 echo "OK"
 
@@ -24,7 +29,7 @@ grep -q "trace_body_recoverer" src/workers/index.ts || { echo "FAIL: trace_body_
 grep -q "trace_matview_refresh" src/workers/index.ts || { echo "FAIL: trace_matview_refresh job missing"; exit 1; }
 echo "OK"
 
-echo "=== Gate D: unit tests (HMAC + redaction + envelope + body + facade + p99) ==="
+echo "=== Gate D: unit tests (HMAC + redaction + envelope + body + facade + p99 + migration smoke) ==="
 npx vitest run \
   tests/unit/runtime-trace-hmac.spec.ts \
   tests/unit/runtime-trace-redaction.spec.ts \
@@ -33,7 +38,8 @@ npx vitest run \
   tests/unit/runtime-trace-envelope-p99.spec.ts \
   tests/unit/runtime-trace-body-writer.spec.ts \
   tests/unit/runtime-trace-facade.spec.ts \
-  tests/unit/trace-body-writer-worker.spec.ts
+  tests/unit/trace-body-writer-worker.spec.ts \
+  tests/unit/p10b-migrations-smoke.spec.ts
 
 echo "=== Gate E: integration test (6 cenários) ==="
 npx vitest run tests/integration/p10b-runtime-trace.spec.ts
@@ -44,6 +50,7 @@ if [ -n "$DATABASE_URL" ]; then
     SELECT
       to_regclass('public.runtime_trace_envelopes')        AS envelopes,
       to_regclass('public.runtime_trace_bodies')           AS bodies,
+      to_regclass('public.runtime_trace_body_outbox')      AS outbox,
       to_regclass('public.unified_trace_events')           AS matview;
   "
 else
@@ -61,6 +68,7 @@ npx eslint \
   src/workers/trace-matview-refresh.ts \
   tests/unit/runtime-trace-*.spec.ts \
   tests/unit/trace-body-writer-worker.spec.ts \
+  tests/unit/p10b-migrations-smoke.spec.ts \
   tests/integration/p10b-runtime-trace.spec.ts
 
 echo ""

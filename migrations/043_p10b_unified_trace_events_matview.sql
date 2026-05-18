@@ -62,6 +62,12 @@ CREATE MATERIALIZED VIEW IF NOT EXISTS unified_trace_events AS
   FROM agent_drift_alerts
   UNION ALL
   -- 4. role_selector_decisions
+  --
+  -- IMPORTANT: schema (migration 034) uses `decided_role_id` and `decided_at`
+  -- — NOT `chosen_role_id`/`created_at` (Codex review #102 caught the typo
+  -- that would block a fresh deploy). Keep column names in lock-step with
+  -- migrations/034_p6_role_selector_decisions.sql or this matview will
+  -- silently fail the next CONCURRENTLY refresh.
   SELECT
     id::text          AS trace_id,
     tenant_id,
@@ -69,9 +75,9 @@ CREATE MATERIALIZED VIEW IF NOT EXISTS unified_trace_events AS
     conversa_id,
     'role_selector_decision'::text AS source,
     'role_selection'  AS event_kind,
-    jsonb_build_object('chosen_role_id', chosen_role_id, 'decided_by', decided_by)
+    jsonb_build_object('decided_role_id', decided_role_id, 'decided_by', decided_by)
                       AS summary,
-    created_at        AS occurred_at
+    decided_at        AS occurred_at
   FROM role_selector_decisions
   UNION ALL
   -- 5. capability_test_results

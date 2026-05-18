@@ -12,7 +12,8 @@
  *     conversa_id, turno_id,
  *     redaction_class: 'standard', // | 'debug' | 'minimal'
  *   });
- *   // ↑ envelope written sync (<20ms); body enqueued for async write.
+ *   // ↑ envelope + body-outbox row written sync (<20ms) in one
+ *   //   transaction; body persisted async by trace-body-writer worker.
  *
  * Direct callers:
  *   - PEP wrappers (Late hook, after policy evaluation).
@@ -21,6 +22,13 @@
  * Feature gate: callers should check featureFlags.isEnabled(RUNTIME_TRACE_V1).
  * When OFF, `trace()` is a no-op that returns a synthetic envelope-written
  * shape so the caller path doesn't branch on the flag everywhere.
+ *
+ * Durability (Codex review #102 — issue 4):
+ *   envelope + body outbox row are written in one DB transaction so a
+ *   process crash between envelope-write and enqueueBody() can no longer
+ *   strand the packet in volatile memory. The in-process Map is a perf
+ *   accelerator only; the worker drains the durable outbox as the source
+ *   of truth.
  */
 export { writeEnvelope } from './envelope-writer.js';
 export { writeBody } from './body-writer.js';
@@ -32,6 +40,8 @@ export {
   currentKeyVersion,
   deriveTenantKey,
   _resetHmacCacheForTests,
+  _setTestMasterSecretForTests,
+  _clearTestMasterSecretForTests,
 } from './lib/hmac.js';
 export { encryptForDebug, uploadDebugSnapshot } from './lib/debug-encrypt.js';
 export type {
@@ -78,9 +88,9 @@ export interface TraceInput {
 }
 
 /**
- * One-shot trace: write envelope sync, enqueue body for async write.
- * Returns the envelope record. If the flag is OFF, returns a no-op
- * envelope (does NOT touch the DB).
+ * One-shot trace: write envelope + body outbox row sync (one transaction),
+ * also enqueue in-memory as an accelerator. Returns the envelope record.
+ * If the flag is OFF, returns a no-op envelope (does NOT touch the DB).
  *
  * Throws if envelope write fails — caller MUST abort the side effect.
  */
@@ -107,7 +117,6 @@ export async function trace(input: TraceInput): Promise<TraceEnvelopeWritten> {
     decision: input.decision,
     redaction_class: input.redaction_class,
   };
-  const env = await writeEnvelope(envelopeInput);
 
   const bodyInput: TraceBodyInput = {
     trace_id: input.trace_id,
@@ -115,8 +124,15 @@ export async function trace(input: TraceInput): Promise<TraceEnvelopeWritten> {
     agent_id: input.agent_id,
     packet: input.packet,
     decision: input.decision,
-    redaction_class: env.redaction_class,
+    redaction_class: input.redaction_class ?? 'standard',
   };
+
+  // envelope + outbox row in one transaction. Worker drains outbox.
+  const env = await writeEnvelope(envelopeInput, { outbox_body: bodyInput });
+
+  // Also enqueue in-memory: the worker drains both, and the outbox row
+  // is the source of truth. This is a no-op for durability but lets the
+  // worker pick up bodies a tick faster than the DB poll path.
   enqueueBody(bodyInput);
 
   return env;

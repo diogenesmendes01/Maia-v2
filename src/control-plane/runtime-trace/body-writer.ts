@@ -5,10 +5,13 @@
  * a fire-and-forget) to persist the redacted body. Uses ON CONFLICT
  * (trace_id) DO NOTHING so re-deliveries are idempotent.
  *
- * Two paths:
+ * Three paths:
  *   - standard / minimal → redactPacket() then INSERT body.
  *   - debug              → encryptForDebug() + uploadDebugSnapshot() then
- *                          INSERT body with encrypted=true, s3_uri set.
+ *                          INSERT body with encrypted=true and EITHER
+ *                          s3_uri (bucket configured) OR ciphertext_inline
+ *                          (no bucket — test/dev). The DB CHECK constraint
+ *                          requires at least one to be present (issue 3).
  *
  * After successful body INSERT, flips the envelope's body_status to
  * 'persisted' and stamps body_persisted_at. The flip is best-effort —
@@ -36,6 +39,7 @@ export async function writeBody(input: TraceBodyInput): Promise<TraceBodyWritten
   let packetForRow: Record<string, unknown>;
   let encrypted = false;
   let s3_uri: string | null = null;
+  let ciphertext_inline: string | null = null;
 
   if (input.redaction_class === 'debug') {
     const cipher = encryptForDebug(input.packet);
@@ -51,13 +55,20 @@ export async function writeBody(input: TraceBodyInput): Promise<TraceBodyWritten
       redacted.bytes_redacted = fallback.bytes_redacted;
       redacted.redaction_applied = 'standard_v1';
     } else {
+      // Codex review #102 — issue 3: upload BEFORE marking persisted.
+      // uploadDebugSnapshot now either does a real S3 PutObject (bucket
+      // configured) or returns inline ciphertext for DB storage. Throws
+      // on S3 upload failure so we never mark a body persisted while the
+      // ciphertext is unrecoverable.
       const upload = await uploadDebugSnapshot(input.trace_id, cipher);
       s3_uri = upload.s3_uri;
+      ciphertext_inline = upload.inline;
       encrypted = true;
-      // The DB body row stores only the cipher envelope — never the plaintext.
+      // The DB body row stores only the cipher envelope metadata + pointer.
       packetForRow = {
         __encrypted: true,
         cipher: { iv: cipher.iv, tag: cipher.tag, key_version: cipher.key_version },
+        storage: upload.storage,
         s3_uri,
       };
     }
@@ -69,16 +80,17 @@ export async function writeBody(input: TraceBodyInput): Promise<TraceBodyWritten
 
   const packet_hmac = signHmac(input.tenant_id, hmac_key_version, packetForRow);
 
-  // INSERT ... ON CONFLICT DO NOTHING (idempotent).
+  // INSERT ... ON CONFLICT DO NOTHING (idempotent under at-least-once
+  // delivery from the durable outbox / in-process queue / recoverer).
   await db.execute(
     sql`INSERT INTO runtime_trace_bodies (
       trace_id, tenant_id, agent_id, packet, packet_hmac,
-      hmac_key_version, redaction_applied, bytes_redacted, encrypted, s3_uri
+      hmac_key_version, redaction_applied, bytes_redacted, encrypted, s3_uri, ciphertext_inline
     ) VALUES (
       ${input.trace_id}, ${input.tenant_id}, ${input.agent_id},
       ${JSON.stringify(packetForRow)}::jsonb, ${packet_hmac},
       ${hmac_key_version}, ${redacted.redaction_applied},
-      ${redacted.bytes_redacted}, ${encrypted}, ${s3_uri}
+      ${redacted.bytes_redacted}, ${encrypted}, ${s3_uri}, ${ciphertext_inline}
     ) ON CONFLICT (trace_id) DO NOTHING`,
   );
 

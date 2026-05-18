@@ -4,11 +4,13 @@
 
 ## What P10b ships
 
-A two-table audit pipeline + 3 workers + 1 materialized view:
+A two-table audit pipeline + durable outbox + 3 workers + 1 materialized view:
 
-- `runtime_trace_envelopes` (migration 036): the narrow synchronous record proving a decision was made. PK = `trace_id`. Written in <20ms p99 (audit gate). Carries `decision`, `side_effect_level`, `policy_id`, `redaction_class`, `envelope_hmac`, `hmac_key_version`, `body_status`.
-- `runtime_trace_bodies` (migration 037): the heavy body — redacted `ExecutionContextPacket` + `DecisionPacket`. PK = `trace_id` with `ON CONFLICT DO NOTHING` so the writer is idempotent under at-least-once delivery.
-- `unified_trace_events` matview (migration 038): UNION ALL across 7 source tables (audit_log, cognitive_module_log, agent_drift_alerts, role_selector_decisions, capability_test_results, procedure_execution_events, runtime_trace_envelopes), refreshed CONCURRENTLY every 5 minutes.
+- `runtime_trace_envelopes` (migration 041): the narrow synchronous record proving a decision was made. PK = `trace_id`. Written in <20ms p99 (audit gate). Carries `decision`, `side_effect_level`, `policy_id`, `redaction_class`, `envelope_hmac`, `hmac_key_version`, `body_status`.
+- `runtime_trace_bodies` + `runtime_trace_body_outbox` (migration 042): the heavy body — redacted `ExecutionContextPacket` + `DecisionPacket` (PK = `trace_id`, `ON CONFLICT DO NOTHING` for idempotent at-least-once delivery), plus a **durable outbox** table written transactionally with the envelope so a process crash never strands the packet (Codex review #102 issue 4).
+- `unified_trace_events` matview (migration 043): UNION ALL across 7 source tables (audit_log, cognitive_module_log, agent_drift_alerts, role_selector_decisions, capability_test_results, procedure_execution_events, runtime_trace_envelopes), refreshed CONCURRENTLY every 5 minutes.
+
+> Migration numbering coordinated with parallel PRs: P8e=036/037, P8b=036/036b/036c/037, P8c=038, P8d=040, P10b=041/042/043. The matview references `role_selector_decisions.decided_role_id` + `decided_at` — confirmed against migration 034 by `tests/unit/p10b-migrations-smoke.spec.ts`.
 
 Workers (in `src/workers/`):
 
@@ -20,10 +22,11 @@ Workers (in `src/workers/`):
 
 | # | Invariant | Where enforced |
 |---|---|---|
-| 8 | HMAC-SHA256 is tenant-scoped (no cross-tenant dictionary attack) | `src/control-plane/runtime-trace/lib/hmac.ts` — HKDF derives a per-tenant key from the master KMS material |
+| 8 | HMAC-SHA256 is tenant-scoped (no cross-tenant dictionary attack) | `src/control-plane/runtime-trace/lib/hmac.ts` — HKDF derives a per-tenant key from the master KMS material. **Fail-closed**: throws if `RUNTIME_TRACE_HMAC_MASTER_SECRET` is absent in prod (Codex #102 issue 2). |
 | 12 | Envelope MUST be written BEFORE any side effect with `side_effect_level >= medium` | `src/control-plane/runtime-trace/envelope-writer.ts` throws on failure; caller MUST abort the side effect |
-| — | Redaction policy hardcoded (8-field PII set) | `src/control-plane/runtime-trace/lib/redaction.ts` — `STRUCTURAL_TOP_LEVEL` + `REQUEST_PII_FIELDS` |
-| — | Debug mode is AES-256-GCM + S3 with 24h TTL + MFA-gated read | `lib/debug-encrypt.ts` + Admin UI permission check (out of P10b scope) |
+| — | Redaction policy is a **strict allowlist** — `STRUCTURAL_TOP_LEVEL` + `DECISION_TOP_LEVEL` + special-cased `request`/`soul`/`user_layer`; unknown top-level fields are DROPPED (Codex #102 issue 5) | `src/control-plane/runtime-trace/lib/redaction.ts` |
+| — | Debug mode is AES-256-GCM + S3 with 24h TTL + MFA-gated read. **Durability**: real `PutObject` when bucket configured, or inline ciphertext in DB row when not — never silent-drop (Codex #102 issue 3). | `lib/debug-encrypt.ts` + `body-writer.ts` + DB CHECK constraint `runtime_trace_bodies_encrypted_has_storage` |
+| — | Body packet is preserved via durable outbox row written in the same transaction as the envelope (Codex #102 issue 4) | `runtime_trace_body_outbox` table + `envelope-writer.ts` + `trace-body-writer.ts` worker drains via `FOR UPDATE SKIP LOCKED` |
 
 ## Feature flag
 
@@ -89,9 +92,9 @@ P10b is purely additive — flip `FEATURE_RUNTIME_TRACE_V1=false` to stop new wr
 To fully remove:
 
 1. Disable the workers in `src/workers/index.ts` (`phase > 6`).
-2. Run `migrations/038_p10b_unified_trace_events_matview_down.sql`.
-3. Run `migrations/037_p10b_runtime_trace_bodies_down.sql`.
-4. Run `migrations/036_p10b_runtime_trace_envelopes_down.sql`.
+2. Run `migrations/043_p10b_unified_trace_events_matview_down.sql`.
+3. Run `migrations/042_p10b_runtime_trace_bodies_down.sql` (drops both `runtime_trace_bodies` and `runtime_trace_body_outbox`).
+4. Run `migrations/041_p10b_runtime_trace_envelopes_down.sql`.
 
 DO NOT drop the tables while the flag is still ON in another replica — concurrent writers will hit a hard error.
 

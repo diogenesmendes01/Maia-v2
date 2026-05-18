@@ -1,13 +1,26 @@
 /**
- * P10b — Debug-mode encrypted snapshot to S3.
+ * P10b — Debug-mode encrypted snapshot to S3 (or inline fallback).
  *
  * When redaction_class='debug', the body bypasses the standard PII
  * stripper and is instead AES-256-GCM encrypted and uploaded to S3
  * with a 24h TTL. Reads require MFA-gated admin role (enforced by the
  * Admin UI, not here).
  *
- * The ciphertext envelope is stored in the body row as:
- *   { iv: base64, tag: base64, ciphertext: base64, key_version: int }
+ * The ciphertext envelope (iv/tag/key_version) is always stored in the
+ * body row metadata. The CIPHERTEXT BYTES are stored in one of two ways
+ * (Codex review #102 — issue 3):
+ *
+ *   1. `s3_uri` mode  — bucket configured (prod path). We perform a real
+ *                       PutObject and only return success after the upload
+ *                       lands. The body row records `s3_uri` + `encrypted=true`.
+ *   2. `inline` mode  — no bucket (dev/test/CI). We return the raw
+ *                       base64 ciphertext so the caller can persist it
+ *                       inline in `runtime_trace_bodies.ciphertext_inline`.
+ *                       Body row records `ciphertext_inline` + `encrypted=true`.
+ *
+ * In neither path do we mark the body persisted while the bytes are
+ * unrecoverable — the previous behaviour returned a synthetic s3:// URI
+ * without actually uploading, which silently destroyed evidence.
  *
  * Key management:
  *   - RUNTIME_TRACE_DEBUG_AES_KEY: base64-encoded 32-byte master key.
@@ -17,6 +30,7 @@
  */
 import { randomBytes, createCipheriv } from 'node:crypto';
 import { config } from '@/config/env.js';
+import { logger } from '@/lib/logger.js';
 
 export interface DebugCiphertext {
   iv: string;
@@ -25,8 +39,17 @@ export interface DebugCiphertext {
   key_version: number;
 }
 
+/**
+ * Storage outcome for the encrypted snapshot.
+ *
+ *   - `s3`     : ciphertext landed in S3 at `s3_uri`. `inline` is null.
+ *   - `inline` : ciphertext returned in `inline` for the caller to store
+ *                in `runtime_trace_bodies.ciphertext_inline`. `s3_uri` is null.
+ */
 export interface DebugUploadResult {
-  s3_uri: string;
+  storage: 's3' | 'inline';
+  s3_uri: string | null;
+  inline: string | null;
   cipher: DebugCiphertext;
 }
 
@@ -63,8 +86,38 @@ export function encryptForDebug(packet: unknown): DebugCiphertext | null {
 }
 
 /**
- * Upload the ciphertext to S3. Stubbed when bucket/SDK isn't configured —
- * returns a synthetic URI for tests/local. Real impl uses @aws-sdk/client-s3.
+ * Lazy import of the S3 client so test environments that mock `@/db/client`
+ * don't need to mock the SDK too. Returns null when import fails (rare —
+ * the package is in deps; the lazy hop is for cold-start latency only).
+ */
+async function loadS3Client(): Promise<{
+  S3Client: new (opts: Record<string, unknown>) => unknown;
+  PutObjectCommand: new (opts: Record<string, unknown>) => unknown;
+} | null> {
+  try {
+    const mod = (await import('@aws-sdk/client-s3')) as unknown as {
+      S3Client: new (opts: Record<string, unknown>) => unknown;
+      PutObjectCommand: new (opts: Record<string, unknown>) => unknown;
+    };
+    return { S3Client: mod.S3Client, PutObjectCommand: mod.PutObjectCommand };
+  } catch (err) {
+    logger.warn(
+      { err: (err as Error).message },
+      'runtime_trace.debug_s3_client_load_failed',
+    );
+    return null;
+  }
+}
+
+/**
+ * Persist the ciphertext durably. Two paths:
+ *
+ *   - Bucket configured → real S3 PutObject. Throws on upload failure
+ *     (caller must abort the body write; debug body must never be silently
+ *     dropped). Returns `{ storage: 's3', s3_uri, inline: null }`.
+ *   - No bucket          → returns `{ storage: 'inline', inline, s3_uri: null }`
+ *     and the caller stores the bytes in `runtime_trace_bodies.ciphertext_inline`.
+ *     Body remains recoverable via DB; no silent data loss (Codex #102 issue 3).
  */
 export async function uploadDebugSnapshot(
   trace_id: string,
@@ -72,15 +125,59 @@ export async function uploadDebugSnapshot(
 ): Promise<DebugUploadResult> {
   const bucket = config.RUNTIME_TRACE_DEBUG_S3_BUCKET;
   if (!bucket) {
-    // No bucket configured: store inline (test path). Production MUST
-    // configure a bucket — otherwise the upload step silently degrades.
-    const s3_uri = `inline:debug/${trace_id}`;
-    return { s3_uri, cipher };
+    // Inline path: return the ciphertext for DB storage. The body row's
+    // CHECK constraint requires either s3_uri or ciphertext_inline to be
+    // present when encrypted=true, so the contract is enforced at the DB.
+    return {
+      storage: 'inline',
+      s3_uri: null,
+      inline: cipher.ciphertext,
+      cipher,
+    };
   }
-  // Real S3 upload is deferred — when the @aws-sdk/client-s3 lazy-loader
-  // pattern is in place we add it here. Today we return a deterministic
-  // URI assuming a putObject would succeed (used by integration tests
-  // with a mocked SDK).
-  const s3_uri = `s3://${bucket}/runtime-trace/debug/${trace_id}.json.enc`;
-  return { s3_uri, cipher };
+
+  // S3 path: real PutObject. We assemble the encrypted envelope as JSON
+  // for grep-ability in S3 ops tooling. ServerSideEncryption defaults to
+  // S3-managed AES-256 (additional defense-in-depth over our own AES-GCM).
+  const s3Client = await loadS3Client();
+  if (!s3Client) {
+    throw new Error(
+      'p10b: @aws-sdk/client-s3 unavailable but RUNTIME_TRACE_DEBUG_S3_BUCKET is set — cannot upload debug snapshot',
+    );
+  }
+  const { S3Client, PutObjectCommand } = s3Client;
+  const region = config.BACKUP_S3_REGION;
+  const endpoint = config.BACKUP_S3_ENDPOINT;
+  const accessKey = config.BACKUP_S3_ACCESS_KEY;
+  const secretKey = config.BACKUP_S3_SECRET_KEY;
+  const clientOpts: Record<string, unknown> = { region };
+  if (endpoint) clientOpts.endpoint = endpoint;
+  if (accessKey && secretKey) {
+    clientOpts.credentials = { accessKeyId: accessKey, secretAccessKey: secretKey };
+  }
+  const client = new S3Client(clientOpts) as {
+    send: (cmd: unknown) => Promise<unknown>;
+    destroy?: () => void;
+  };
+  const key = `runtime-trace/debug/${trace_id}.json.enc`;
+  const body = JSON.stringify({
+    iv: cipher.iv,
+    tag: cipher.tag,
+    ciphertext: cipher.ciphertext,
+    key_version: cipher.key_version,
+  });
+  const cmd = new PutObjectCommand({
+    Bucket: bucket,
+    Key: key,
+    Body: body,
+    ContentType: 'application/json',
+    ServerSideEncryption: 'AES256',
+  });
+  try {
+    await client.send(cmd);
+  } finally {
+    client.destroy?.();
+  }
+  const s3_uri = `s3://${bucket}/${key}`;
+  return { storage: 's3', s3_uri, inline: null, cipher };
 }

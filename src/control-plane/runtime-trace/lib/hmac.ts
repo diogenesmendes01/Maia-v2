@@ -28,13 +28,58 @@ function cacheKey(tenant_id: string, version: number): string {
   return `${tenant_id}::v${version}`;
 }
 
+/**
+ * Test-only injection slot. NEVER read in prod paths — gated below by
+ * NODE_ENV check. Tests call `_setTestMasterSecret(...)` from spec setup
+ * to provide deterministic material WITHOUT silently weakening
+ * production behaviour (Codex review #102 — issue 2).
+ */
+let __TEST_MASTER_SECRET: string | null = null;
+
+/**
+ * Test helper: install a deterministic master secret. Must NOT be called
+ * outside `vitest`/`jest`. Asserts NODE_ENV at call time so accidental
+ * production use throws immediately.
+ */
+export function _setTestMasterSecretForTests(secret: string): void {
+  if (config.NODE_ENV === 'production') {
+    throw new Error(
+      'p10b: _setTestMasterSecretForTests is forbidden when NODE_ENV=production',
+    );
+  }
+  __TEST_MASTER_SECRET = secret;
+  // Bust cache so the new secret takes effect immediately.
+  KEY_CACHE.clear();
+}
+
+export function _clearTestMasterSecretForTests(): void {
+  __TEST_MASTER_SECRET = null;
+  KEY_CACHE.clear();
+}
+
+/**
+ * Resolve the HMAC master secret.
+ *
+ * Codex review #102 — issue 2 (no-ship):
+ *   Previously this returned a hardcoded literal when the env var was
+ *   absent, which silently produced forgeable HMACs in a misconfigured
+ *   production deploy. We now FAIL CLOSED: if FEATURE_RUNTIME_TRACE_V1
+ *   is on and no master secret is present (env or test injection), throw
+ *   on first call. The trace path is fail-closed (invariant 12), so
+ *   throwing here aborts the side effect — better than silently writing
+ *   audit rows an attacker could forge.
+ */
 function masterSecret(): Buffer {
+  if (__TEST_MASTER_SECRET !== null) {
+    return Buffer.from(__TEST_MASTER_SECRET, 'utf8');
+  }
   const s = config.RUNTIME_TRACE_HMAC_MASTER_SECRET;
   if (!s) {
-    // In test/dev, fall back to a deterministic value so spec tests don't
-    // need an extra env var per file. NEVER hits prod — the env validator
-    // makes this optional precisely because tests don't all care.
-    return Buffer.from('p10b-test-master-secret-do-not-use-in-prod', 'utf8');
+    throw new Error(
+      'p10b: RUNTIME_TRACE_HMAC_MASTER_SECRET is required when FEATURE_RUNTIME_TRACE_V1 is enabled — ' +
+        'audit HMACs would be forgeable without it. Configure via KMS-backed env or call ' +
+        '_setTestMasterSecretForTests() in test setup.',
+    );
   }
   return Buffer.from(s, 'utf8');
 }

@@ -1370,6 +1370,10 @@ export const runtime_trace_bodies = pgTable(
     bytes_redacted: integer('bytes_redacted').notNull().default(0),
     encrypted: boolean('encrypted').notNull().default(false),
     s3_uri: text('s3_uri'),
+    // Codex #102 issue 3: when encrypted=true and no S3 bucket configured
+    // (dev/test/CI), the ciphertext is stored inline here. The DB CHECK
+    // requires either s3_uri OR ciphertext_inline when encrypted=true.
+    ciphertext_inline: text('ciphertext_inline'),
     persisted_at: timestamp('persisted_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
@@ -1378,6 +1382,31 @@ export const runtime_trace_bodies = pgTable(
       t.agent_id,
       t.persisted_at,
     ),
+  }),
+);
+
+// P10b (Codex #102 issue 4): runtime_trace_body_outbox — durable queue
+// for the async body writer. Written transactionally with the envelope
+// so a process crash never strands the packet in volatile memory.
+// Workers claim rows via FOR UPDATE SKIP LOCKED, write the body, and
+// delete the outbox row in the same transaction.
+export const runtime_trace_body_outbox = pgTable(
+  'runtime_trace_body_outbox',
+  {
+    trace_id: uuid('trace_id').primaryKey(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    // The full TraceBodyInput shape, ready to feed writeBody() without
+    // any rebuild. Includes packet + decision + redaction_class.
+    payload: jsonb('payload').notNull(),
+    redaction_class: text('redaction_class').notNull(),
+    enqueued_at: timestamp('enqueued_at', { withTimezone: true }).notNull().defaultNow(),
+    attempts: integer('attempts').notNull().default(0),
+    last_attempt_at: timestamp('last_attempt_at', { withTimezone: true }),
+    last_error: text('last_error'),
+  },
+  (t) => ({
+    drainIdx: index('runtime_trace_body_outbox_drain_idx').on(t.enqueued_at),
   }),
 );
 
@@ -1502,3 +1531,5 @@ export type RuntimeTraceEnvelope = typeof runtime_trace_envelopes.$inferSelect;
 export type NewRuntimeTraceEnvelope = typeof runtime_trace_envelopes.$inferInsert;
 export type RuntimeTraceBody = typeof runtime_trace_bodies.$inferSelect;
 export type NewRuntimeTraceBody = typeof runtime_trace_bodies.$inferInsert;
+export type RuntimeTraceBodyOutbox = typeof runtime_trace_body_outbox.$inferSelect;
+export type NewRuntimeTraceBodyOutbox = typeof runtime_trace_body_outbox.$inferInsert;
