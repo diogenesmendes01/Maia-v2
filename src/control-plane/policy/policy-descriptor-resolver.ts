@@ -130,10 +130,13 @@ export class PolicyDescriptorResolverImpl implements PolicyDescriptorResolver {
         continue;
       }
 
-      // 2) repo lookup (agent_id-specific then tenant-wide via repo)
-      let row: PolicyRule | null;
+      // 2) repo lookup — fetch agent-specific AND tenant-wide candidates so
+      //    scope is applied to each independently (round-2 Codex #93 finding:
+      //    a scoped agent-specific row must not suppress a universal tenant-wide
+      //    row when the agent row fails scope for the current request).
+      let candidates: PolicyRule[];
       try {
-        row = await this.repo.findActiveByDescriptor({
+        candidates = await this.repo.findActiveCandidates({
           descriptor,
           agent_id: input.agent_id ?? null,
         });
@@ -157,15 +160,20 @@ export class PolicyDescriptorResolverImpl implements PolicyDescriptorResolver {
         continue;
       }
 
-      if (!row) {
+      // 3) scope filter: prefer first candidate that passes scope.
+      //    Candidates are ordered: agent-specific first, then tenant-wide.
+      //    Cache unresolved only after ALL candidates fail.
+      const matched = candidates.find((c) => matchesScope(c.scope, input.scope));
+
+      if (!matched && candidates.length === 0) {
         this.cache.setUnresolved(key);
         unresolved.push(descriptor);
         failures.push({ descriptor, reason: 'not_found' });
         continue;
       }
 
-      // 3) scope filter
-      if (!matchesScope(row.scope, input.scope)) {
+      if (!matched) {
+        // At least one candidate existed but none passed scope.
         this.cache.setUnresolved(key);
         unresolved.push(descriptor);
         failures.push({ descriptor, reason: 'scope_mismatch' });
@@ -174,9 +182,9 @@ export class PolicyDescriptorResolverImpl implements PolicyDescriptorResolver {
 
       const r: ResolvedPolicy = {
         descriptor,
-        policy_id: row.id,
-        version: row.version,
-        rule_kind: row.rule_kind,
+        policy_id: matched.id,
+        version: matched.version,
+        rule_kind: matched.rule_kind,
       };
       this.cache.set(key, r);
       resolved.push(r);

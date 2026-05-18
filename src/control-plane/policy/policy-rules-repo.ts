@@ -149,6 +149,20 @@ export interface PolicyRulesRepo {
     agent_id?: string | null;
   }): Promise<PolicyRule | null>;
 
+  /**
+   * Returns active candidates in precedence order: agent-specific row first
+   * (if agent_id provided), then tenant-wide row (agent_id IS NULL). Both
+   * are returned so the resolver can apply scope to each independently —
+   * a scoped agent-specific mismatch must not suppress a universal
+   * tenant-wide row.
+   *
+   * Result length: 0, 1, or 2. Never includes nulls.
+   */
+  findActiveCandidates(args: {
+    descriptor: string;
+    agent_id?: string | null;
+  }): Promise<PolicyRule[]>;
+
   listActiveForTenant(): Promise<PolicyRule[]>;
 
   listVersions(args: {
@@ -247,6 +261,45 @@ export const policyRulesRepo: PolicyRulesRepo = {
       )
       .limit(1);
     return tenantRow ? rowToDomain(tenantRow) : null;
+  },
+
+  async findActiveCandidates(args) {
+    const tenant_id = getCurrentTenant();
+    const candidates: PolicyRule[] = [];
+
+    // 1) agent-specific candidate
+    if (args.agent_id) {
+      const [agentRow] = await db
+        .select()
+        .from(policy_rules)
+        .where(
+          and(
+            eq(policy_rules.tenant_id, tenant_id),
+            eq(policy_rules.agent_id, args.agent_id),
+            eq(policy_rules.rule_descriptor, args.descriptor),
+            eq(policy_rules.status, 'active'),
+          ),
+        )
+        .limit(1);
+      if (agentRow) candidates.push(rowToDomain(agentRow));
+    }
+
+    // 2) tenant-wide candidate (agent_id IS NULL) — always queried
+    const [tenantRow] = await db
+      .select()
+      .from(policy_rules)
+      .where(
+        and(
+          eq(policy_rules.tenant_id, tenant_id),
+          sql`${policy_rules.agent_id} IS NULL`,
+          eq(policy_rules.rule_descriptor, args.descriptor),
+          eq(policy_rules.status, 'active'),
+        ),
+      )
+      .limit(1);
+    if (tenantRow) candidates.push(rowToDomain(tenantRow));
+
+    return candidates;
   },
 
   async listActiveForTenant() {

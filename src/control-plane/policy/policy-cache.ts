@@ -73,8 +73,16 @@ function canonScope(scope: PolicyRuleScope | undefined): string {
   return JSON.stringify(entries);
 }
 
+/**
+ * Unambiguous structured key. agent_id stays null (not a sentinel string)
+ * so a real agent with id 'wide' cannot collide with tenant-wide entries.
+ *
+ * Format: JSON.stringify([tenant_id, agent_id, descriptor, canonScope])
+ * — JSON preserves null vs string distinction; canonScope is already a
+ * deterministic string so the outer JSON never embeds nested JSON.
+ */
 export function cacheKeyHash(k: CacheKey): string {
-  return `${k.tenant_id}|${k.agent_id ?? 'wide'}|${k.descriptor}|${canonScope(k.scope)}`;
+  return JSON.stringify([k.tenant_id, k.agent_id, k.descriptor, canonScope(k.scope)]);
 }
 
 /** Key prefix used by invalidate() to match entries to drop. */
@@ -83,7 +91,16 @@ function invalidationPrefix(
   agent_id: string | null,
   descriptor: string,
 ): string {
-  return `${tenant_id}|${agent_id ?? 'wide'}|${descriptor}|`;
+  // The full key is JSON.stringify([tenant_id, agent_id, descriptor, scope]).
+  // We cannot use a simple string prefix here because JSON encodes strings
+  // with quotes and null as null. Instead callers compare full-parsed segments.
+  // This helper is kept for the agent-specific invalidate branch which
+  // still needs a way to efficiently scan. We return the partial prefix that
+  // matches the first three components; callers must verify the parse.
+  //
+  // Note: the tenant-wide (agent_id=null) invalidation branch in invalidate()
+  // does NOT use this helper — it iterates and parses each key.
+  return JSON.stringify([tenant_id, agent_id, descriptor]).slice(0, -1); // strips trailing ']'
 }
 
 export interface PolicyCacheConfig {
@@ -142,35 +159,36 @@ export class PolicyResolverCacheImpl implements PolicyResolverCache {
     // all cached agent_ids. Otherwise an agent that previously hit
     // `agent_id=A | descriptor=D | scope=...` would keep serving the
     // stale resolved policy (or stale `unresolved` miss) for up to ttl_ms.
+    //
+    // Key format (post round-2 fix): JSON.stringify([tenant_id, agent_id, descriptor, scope_str])
+    // We parse each key and compare slots exactly — no sentinel strings, no substring tricks.
     if (args.agent_id === null) {
-      // Match the more permissive prefix: tenant|*|descriptor|... — i.e.
-      // any agent including 'wide'. We can't precompute a startsWith here
-      // (agent slot is in the middle), so iterate and parse.
-      const tenantPart = `${args.tenant_id}|`;
-      const descPart = `|${args.descriptor}|`;
+      // Fan-out: evict all entries for this (tenant, descriptor) regardless of agent_id.
       for (const [k, e] of this.store) {
-        if (k.startsWith(tenantPart) && k.includes(descPart)) {
-          // Sanity: the descriptor slot is the 3rd `|`-segment. Build
-          // canonical prefix to avoid false positives where the
-          // descriptor string also appears in the scope tail.
-          const segs = k.split('|');
-          // segs: [tenant, agent_or_wide, descriptor, ...scopeTail]
-          if (segs[0] === args.tenant_id && segs[2] === args.descriptor) {
-            this.removeFromList(k, e);
-            this.store.delete(k);
-          }
+        let parsed: unknown;
+        try { parsed = JSON.parse(k); } catch { continue; }
+        if (!Array.isArray(parsed) || parsed.length < 3) continue;
+        // slots: [tenant_id, agent_id, descriptor, scope_str]
+        if (parsed[0] === args.tenant_id && parsed[2] === args.descriptor) {
+          this.removeFromList(k, e);
+          this.store.delete(k);
         }
       }
       return;
     }
     // Agent-specific event: invalidate only entries for that exact agent.
-    // (A tenant-wide row is never published under a non-null agent_id, so
-    // this branch does NOT need to fan-out to 'wide'.)
+    // Use the structured prefix (first 3 slots) to match without parsing scope.
     const prefix = invalidationPrefix(args.tenant_id, args.agent_id, args.descriptor);
     for (const [k, e] of this.store) {
       if (k.startsWith(prefix)) {
-        this.removeFromList(k, e);
-        this.store.delete(k);
+        // Verify the prefix is not a false positive by parsing.
+        let parsed: unknown;
+        try { parsed = JSON.parse(k); } catch { continue; }
+        if (!Array.isArray(parsed) || parsed.length < 3) continue;
+        if (parsed[0] === args.tenant_id && parsed[1] === args.agent_id && parsed[2] === args.descriptor) {
+          this.removeFromList(k, e);
+          this.store.delete(k);
+        }
       }
     }
   }

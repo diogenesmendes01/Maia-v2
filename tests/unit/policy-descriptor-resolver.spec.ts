@@ -15,6 +15,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import {
   createPolicyDescriptorResolver,
   PolicyResolverCacheImpl,
+  cacheKeyHash,
   matchesScope,
   hasBlockingFailure,
   RESOLVER_FAILURE_DEFAULT,
@@ -23,6 +24,7 @@ import {
 import type {
   PolicyRule,
   PolicyRulesRepo,
+  ResolvedPolicy,
 } from '@/control-plane/policy/index.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 
@@ -32,9 +34,9 @@ import { runWithTenantContext } from '@/db/tenant-context.js';
  */
 function makeFakeRepo(rows: PolicyRule[]): {
   repo: PolicyRulesRepo;
-  calls: { findActiveByDescriptor: number };
+  calls: { findActiveByDescriptor: number; findActiveCandidates: number };
 } {
-  const calls = { findActiveByDescriptor: 0 };
+  const calls = { findActiveByDescriptor: 0, findActiveCandidates: 0 };
   const repo: PolicyRulesRepo = {
     async findActiveByDescriptor(args) {
       calls.findActiveByDescriptor++;
@@ -56,6 +58,30 @@ function makeFakeRepo(rows: PolicyRule[]): {
           r.status === 'active',
       );
       return t ?? null;
+    },
+
+    async findActiveCandidates(args) {
+      calls.findActiveCandidates++;
+      const candidates: PolicyRule[] = [];
+      // Agent-specific first
+      if (args.agent_id) {
+        const a = rows.find(
+          (r) =>
+            r.rule_descriptor === args.descriptor &&
+            r.agent_id === args.agent_id &&
+            r.status === 'active',
+        );
+        if (a) candidates.push(a);
+      }
+      // Tenant-wide fallback
+      const t = rows.find(
+        (r) =>
+          r.rule_descriptor === args.descriptor &&
+          r.agent_id === null &&
+          r.status === 'active',
+      );
+      if (t) candidates.push(t);
+      return candidates;
     },
     async listActiveForTenant() {
       return rows.filter((r) => r.status === 'active');
@@ -278,13 +304,13 @@ describe('PolicyDescriptorResolver.resolveDescriptors', () => {
       tenant_id: 'default',
       descriptors: ['cached'],
     });
-    expect(calls.findActiveByDescriptor).toBe(1);
+    expect(calls.findActiveCandidates).toBe(1);
 
     await resolver.resolveDescriptors({
       tenant_id: 'default',
       descriptors: ['cached'],
     });
-    expect(calls.findActiveByDescriptor).toBe(1); // still 1
+    expect(calls.findActiveCandidates).toBe(1); // still 1 — cache hit
     expect(cache.stats().hits).toBeGreaterThanOrEqual(1);
   });
 
@@ -296,13 +322,13 @@ describe('PolicyDescriptorResolver.resolveDescriptors', () => {
       tenant_id: 'default',
       descriptors: ['missing'],
     });
-    expect(calls.findActiveByDescriptor).toBe(1);
+    expect(calls.findActiveCandidates).toBe(1);
 
     await resolver.resolveDescriptors({
       tenant_id: 'default',
       descriptors: ['missing'],
     });
-    expect(calls.findActiveByDescriptor).toBe(1);
+    expect(calls.findActiveCandidates).toBe(1);
   });
 
   it('repo error for a single descriptor becomes unresolved with reason=db_error (fail-closed, does not crash batch)', async () => {
@@ -314,11 +340,11 @@ describe('PolicyDescriptorResolver.resolveDescriptors', () => {
     const { repo: baseRepo } = makeFakeRepo([rule]);
     const repo: PolicyRulesRepo = {
       ...baseRepo,
-      async findActiveByDescriptor(args) {
+      async findActiveCandidates(args) {
         if (args.descriptor === 'crash') {
           throw new Error('connection_reset');
         }
-        return baseRepo.findActiveByDescriptor(args);
+        return baseRepo.findActiveCandidates(args);
       },
     };
     const resolver = createPolicyDescriptorResolver(repo, cache);
@@ -341,10 +367,10 @@ describe('PolicyDescriptorResolver.resolveDescriptors', () => {
     const { repo: baseRepo } = makeFakeRepo([]);
     const repo: PolicyRulesRepo = {
       ...baseRepo,
-      async findActiveByDescriptor() {
+      async findActiveCandidates() {
         attempts++;
         if (attempts === 1) throw new Error('transient_db_blip');
-        return makeRule({ rule_descriptor: 'flaky' });
+        return [makeRule({ rule_descriptor: 'flaky' })];
       },
     };
     const resolver = createPolicyDescriptorResolver(repo, cache);
@@ -460,6 +486,138 @@ describe('PolicyDescriptorResolver.resolveDescriptors', () => {
         failures: [{ descriptor: 'a', reason: 'tenant_mismatch' }],
       }),
     ).toBe(true);
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Round-2 Codex review #93 regression tests
+// ──────────────────────────────────────────────────────────────────────────────
+
+describe('Round-2 finding 1: scoped agent override must not suppress tenant-wide fallback', () => {
+  it('scoped agent-specific row (whatsapp) + universal tenant-wide → telegram request resolves via tenant-wide', async () => {
+    // Bug scenario: agent-specific row has scope={channel:'whatsapp'}.
+    // Tenant-wide row is universal (scope={}). Request comes in for channel=telegram.
+    // Old behavior: resolver returns the agent-specific row, fails scope, caches "unresolved",
+    //               NEVER checks the universal tenant-wide row → policy bypass.
+    // New behavior: resolver tries both candidates; agent-specific fails scope; tenant-wide
+    //               matches → resolved correctly.
+    const tenantWide = makeRule({
+      id: 'pol-tenant-wide',
+      rule_descriptor: 'no_pii_in_logs',
+      agent_id: null,
+      scope: {}, // universal
+      version: 1,
+    });
+    const agentSpecific = makeRule({
+      id: 'pol-agent-specific',
+      rule_descriptor: 'no_pii_in_logs',
+      agent_id: 'bot-x',
+      scope: { channel: 'whatsapp' }, // only whatsapp
+      version: 2,
+    });
+    const { repo } = makeFakeRepo([agentSpecific, tenantWide]);
+    const resolver = createPolicyDescriptorResolver(repo, cache);
+
+    const out = await resolver.resolveDescriptors({
+      tenant_id: 'default',
+      agent_id: 'bot-x',
+      descriptors: ['no_pii_in_logs'],
+      scope: { channel: 'telegram' }, // does NOT match agent-specific
+    });
+
+    // Must resolve via the tenant-wide row, NOT be unresolved.
+    expect(out.resolved).toHaveLength(1);
+    expect(out.unresolved).toHaveLength(0);
+    expect(out.resolved[0]?.policy_id).toBe('pol-tenant-wide');
+    expect(out.failures).toHaveLength(0);
+  });
+
+  it('scoped agent-specific row (whatsapp) + no tenant-wide → telegram request is unresolved (scope_mismatch)', async () => {
+    // When there is NO tenant-wide fallback, scope mismatch on the agent-specific
+    // row should still produce scope_mismatch (not not_found).
+    const agentSpecific = makeRule({
+      id: 'pol-agent-only',
+      rule_descriptor: 'agent_only_policy',
+      agent_id: 'bot-x',
+      scope: { channel: 'whatsapp' },
+      version: 1,
+    });
+    const { repo } = makeFakeRepo([agentSpecific]);
+    const resolver = createPolicyDescriptorResolver(repo, cache);
+
+    const out = await resolver.resolveDescriptors({
+      tenant_id: 'default',
+      agent_id: 'bot-x',
+      descriptors: ['agent_only_policy'],
+      scope: { channel: 'telegram' },
+    });
+
+    expect(out.resolved).toHaveLength(0);
+    expect(out.unresolved).toEqual(['agent_only_policy']);
+    expect(out.failures[0]?.reason).toBe('scope_mismatch');
+  });
+});
+
+describe('Round-2 finding 2 (cache): agent_id "wide" does not collide with null', () => {
+  it('cacheKeyHash: agent_id=null and agent_id="wide" produce different hashes', () => {
+    const nullKey = cacheKeyHash({
+      tenant_id: 't',
+      agent_id: null,
+      descriptor: 'd',
+      scope: {},
+    });
+    const wideKey = cacheKeyHash({
+      tenant_id: 't',
+      agent_id: 'wide',
+      descriptor: 'd',
+      scope: {},
+    });
+    expect(nullKey).not.toBe(wideKey);
+  });
+
+  it('cache: storing a value for agent_id="wide" does not pollute tenant-wide (null) lookup', () => {
+    const c = new PolicyResolverCacheImpl({ ttl_ms: 60_000, max_entries: 100 });
+    const resolvedForWide: ResolvedPolicy = {
+      descriptor: 'd',
+      policy_id: 'pol-wide-agent',
+      version: 3,
+      rule_kind: 'soft_guidance',
+    };
+    const resolvedForNull: ResolvedPolicy = {
+      descriptor: 'd',
+      policy_id: 'pol-tenant-wide',
+      version: 1,
+      rule_kind: 'hard_limit',
+    };
+    c.set({ tenant_id: 't', agent_id: 'wide', descriptor: 'd', scope: {} }, resolvedForWide);
+    c.set({ tenant_id: 't', agent_id: null, descriptor: 'd', scope: {} }, resolvedForNull);
+
+    const gotWide = c.get({ tenant_id: 't', agent_id: 'wide', descriptor: 'd', scope: {} });
+    const gotNull = c.get({ tenant_id: 't', agent_id: null, descriptor: 'd', scope: {} });
+
+    expect(gotWide).toEqual(resolvedForWide);
+    expect(gotNull).toEqual(resolvedForNull);
+    // The two must be distinct entries — no collision.
+    expect((gotWide as ResolvedPolicy)?.policy_id).not.toBe((gotNull as ResolvedPolicy)?.policy_id);
+  });
+
+  it('invalidate(agent_id=null) clears null-entry but NOT the "wide"-agent entry', () => {
+    const c = new PolicyResolverCacheImpl({ ttl_ms: 60_000, max_entries: 100 });
+    const resolved: ResolvedPolicy = {
+      descriptor: 'd',
+      policy_id: 'p1',
+      version: 1,
+      rule_kind: 'soft_guidance',
+    };
+    c.set({ tenant_id: 't', agent_id: null, descriptor: 'd', scope: {} }, resolved);
+    c.set({ tenant_id: 't', agent_id: 'wide', descriptor: 'd', scope: {} }, resolved);
+
+    // Tenant-wide invalidation (agent_id=null) should evict null-keyed entries.
+    // The 'wide'-agent entry should ALSO be evicted (same tenant+descriptor fan-out).
+    c.invalidate({ tenant_id: 't', agent_id: null, descriptor: 'd' });
+
+    expect(c.get({ tenant_id: 't', agent_id: null, descriptor: 'd', scope: {} })).toBeUndefined();
+    expect(c.get({ tenant_id: 't', agent_id: 'wide', descriptor: 'd', scope: {} })).toBeUndefined();
   });
 });
 
