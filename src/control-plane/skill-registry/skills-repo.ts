@@ -139,7 +139,11 @@ export const skillsRepo: SkillsRepo = {
     if (input.agent_id === undefined) {
       agent_id = ctxAgent;
     } else if (input.agent_id === null) {
-      agent_id = null; // explicit tenant-wide; require owner-approved later
+      // Round-2 review #99 finding 1: proposing a tenant-wide skill from agent
+      // context is a privilege escalation. Tenant-admin authorization required.
+      throw new Error(
+        'tenant_admin_required: tenant-wide skills (agent_id=null) cannot be proposed from agent context; use admin authorization',
+      );
     } else if (input.agent_id !== ctxAgent) {
       throw new Error(
         `agent_scope_violation: input agent ${input.agent_id} vs context ${ctxAgent}`,
@@ -215,11 +219,17 @@ export const skillsRepo: SkillsRepo = {
         .limit(1);
       const target = targetRows[0];
       if (!target) throw new Error('skill_not_found');
-      // Agent-scope check (review #99 finding 1): caller cannot activate a
-      // skill owned by a different agent. Tenant-wide skills (agent_id=null)
-      // require the same caller to also activate via tenant-admin context,
-      // but here we accept either match-current-agent OR tenant-wide.
-      if (target.agent_id !== null && target.agent_id !== ctxAgent) {
+      // Agent-scope check (round-2 review #99 finding 1): caller cannot
+      // activate a skill owned by a different agent, AND cannot activate
+      // tenant-wide skills (agent_id=null) from a regular agent context —
+      // those require explicit tenant-admin authorization (a separate path
+      // not available in the per-agent repo methods).
+      if (target.agent_id === null) {
+        throw new Error(
+          'tenant_admin_required: tenant-wide skills (agent_id=null) cannot be activated from agent context; use admin authorization',
+        );
+      }
+      if (target.agent_id !== ctxAgent) {
         throw new Error(
           `agent_scope_violation: target agent ${target.agent_id} vs context ${ctxAgent}`,
         );
@@ -274,7 +284,15 @@ export const skillsRepo: SkillsRepo = {
       .limit(1);
     const existing = existingRows[0];
     if (!existing) throw new Error('skill_not_found');
-    if (existing.agent_id !== null && existing.agent_id !== ctxAgent) {
+    // Round-2 review #99 finding 1: tenant-wide skills (agent_id=null)
+    // require tenant-admin authorization — not available in agent-context
+    // repo methods. Reject to prevent any agent from deprecating shared skills.
+    if (existing.agent_id === null) {
+      throw new Error(
+        'tenant_admin_required: tenant-wide skills (agent_id=null) cannot be deprecated from agent context; use admin authorization',
+      );
+    }
+    if (existing.agent_id !== ctxAgent) {
       throw new Error(
         `agent_scope_violation: target agent ${existing.agent_id} vs context ${ctxAgent}`,
       );
@@ -299,8 +317,14 @@ export const skillsRepo: SkillsRepo = {
         .limit(1);
       const target = targetRows[0];
       if (!target) throw new Error('skill_not_found');
-      // Agent-scope check (review #99 finding 1).
-      if (target.agent_id !== null && target.agent_id !== ctxAgent) {
+      // Agent-scope check (round-2 review #99 finding 1): tenant-wide skills
+      // require tenant-admin context, not agent context.
+      if (target.agent_id === null) {
+        throw new Error(
+          'tenant_admin_required: tenant-wide skills (agent_id=null) cannot be rolled back from agent context; use admin authorization',
+        );
+      }
+      if (target.agent_id !== ctxAgent) {
         throw new Error(
           `agent_scope_violation: target agent ${target.agent_id} vs context ${ctxAgent}`,
         );

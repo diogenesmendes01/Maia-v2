@@ -27,7 +27,23 @@
  */
 import { callLLM, type LLMMessage, type ToolSchema } from '@/lib/claude.js';
 import { logger } from '@/lib/logger.js';
+import { tryGetCurrentContext } from '@/db/tenant-context.js';
 import type { ModeContext } from '../types.js';
+
+/**
+ * Deterministic hash of arbitrary args for idempotency key derivation.
+ * Not cryptographic — used only to distinguish distinct tool invocations
+ * within the same turn (round-2 review #99 finding 3).
+ */
+function simpleArgsHash(args: unknown): string {
+  const json = JSON.stringify(args, Object.keys(args && typeof args === 'object' ? args as object : {}).sort());
+  let h = 5381;
+  for (let i = 0; i < json.length; i++) {
+    h = ((h << 5) + h) ^ json.charCodeAt(i);
+    h >>>= 0; // keep 32-bit unsigned
+  }
+  return h.toString(16);
+}
 
 interface ProcedureSpec {
   system_prompt?: string;
@@ -87,11 +103,27 @@ export async function toolMediatedMode(
   let tokenBudgetExceeded = false;
   let toolCapHit = false;
 
-  // Generate an idempotency-key prefix that is stable per skill execution
-  // attempt. Combined with the tool_use.id this gives each dispatch a
-  // unique idempotency key the underlying tool can use to dedupe retries
-  // (review #99 finding 3 recommendation).
-  const idempotencyPrefix = `${ctx.skill.id}:${ctx.turno_id ?? ctx.conversa_id ?? Date.now()}`;
+  // Stable idempotency key base (round-2 review #99 finding 3).
+  //
+  // Requirements:
+  //  - Must survive retries of the same execution attempt (same key → dedupe).
+  //  - Must NOT collide across distinct turns even if a provider repeats a
+  //    tool_use id.
+  //  - Must fail-closed when no stable execution/turn ID is available.
+  //
+  // Key shape: tenant:agent:skill_id:skill_version:turno_id_or_conversa_id
+  // Per-dispatch suffix: tool_name:args_hash (appended in the loop below,
+  // replacing the unreliable LLM-generated tool_use.id as sole discriminant).
+  const stableExecId = ctx.turno_id ?? ctx.conversa_id ?? null;
+  if (!stableExecId) {
+    throw new Error(
+      'idempotency_key_unstable: tool_mediated skills require a stable turno_id or conversa_id in ModeContext to derive idempotency keys; aborting to prevent duplicate side effects',
+    );
+  }
+  const tenantCtx = tryGetCurrentContext();
+  const tenant = tenantCtx?.tenant_id ?? 'unknown';
+  const agent = tenantCtx?.agent_id ?? 'unknown';
+  const idempotencyBase = `${tenant}:${agent}:${ctx.skill.id}:${ctx.skill.version}:${stableExecId}`;
 
   // Safety upper bound for the loop: allow a few extra iterations beyond
   // max_tool_calls so the LLM can wrap up its answer after we soft-block
@@ -207,9 +239,12 @@ export async function toolMediatedMode(
         throw new Error('tool_dispatcher_not_configured');
       }
       try {
+        // Per-dispatch key: base + tool_name + args_hash (not tu.id, which
+        // is LLM-generated and may repeat across turns per provider).
+        const dispatchKey = `${idempotencyBase}:${tu.tool}:${simpleArgsHash(tu.args)}`;
         const result = await toolDispatcher(tu.tool, tu.args, {
           signal: ctx.signal,
-          idempotency_key: `${idempotencyPrefix}:${tu.id}`,
+          idempotency_key: dispatchKey,
         });
         toolCallCount++;
         toolsCalled.push(tu.tool);

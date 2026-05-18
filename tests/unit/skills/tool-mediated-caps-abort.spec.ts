@@ -9,8 +9,12 @@
  *  - AbortSignal: abortado entre iterações → throws 'aborted';
  *    toolDispatcher recebe { signal, idempotency_key }.
  *  - Cancelamento durante dispatch propaga para chamador.
+ *
+ * Round-2 review #99 finding 3: turno_id obrigatório para chave de
+ * idempotência estável. Todos os calls agora passam turno_id.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { runWithTenantContext } from '@/db/tenant-context.js';
 
 vi.mock('@/lib/claude.js', () => ({ callLLM: vi.fn() }));
 
@@ -19,6 +23,9 @@ import { callLLM } from '@/lib/claude.js';
 
 const baseSkill = {
   id: 'tm-1',
+  tenant_id: 'default',
+  agent_id: 'default',
+  version: 1,
   procedure: {
     system_prompt: 'system',
     tool_schemas: [
@@ -28,6 +35,9 @@ const baseSkill = {
   allowed_tools: ['write_db'],
   runtime_hints: {},
 } as any;
+
+/** Stable turno_id required by round-2 finding 3 fix. */
+const TURNO = 'turn-caps-test-1';
 
 describe('tool_mediated: max_tool_calls cap', () => {
   beforeEach(() => {
@@ -82,10 +92,12 @@ describe('tool_mediated: max_tool_calls cap', () => {
         usage: { input_tokens: 1, output_tokens: 1 },
         model: 'x',
       });
-    const out = await toolMediatedMode({ skill, input: {}, resolvedPolicies: [] });
-    expect(toolCalls).toBe(2);
-    expect(out._tool_cap_hit).toBe(true);
-    expect(out.answer).toBe('done');
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const out = await toolMediatedMode({ skill, input: {}, resolvedPolicies: [], turno_id: TURNO });
+      expect(toolCalls).toBe(2);
+      expect(out._tool_cap_hit).toBe(true);
+      expect(out.answer).toBe('done');
+    });
   });
 });
 
@@ -109,12 +121,14 @@ describe('tool_mediated: max_tokens budget', () => {
       usage: { input_tokens: 5, output_tokens: 5 },
       model: 'x',
     });
-    const out = await toolMediatedMode({ skill, input: {}, resolvedPolicies: [] });
-    expect(out._token_budget_exceeded).toBe(true);
-    expect(out._tokens_in).toBe(5);
-    expect(out._tokens_out).toBe(5);
-    // partial body comes from last LLM content.
-    expect(out.partial).toBe(true);
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const out = await toolMediatedMode({ skill, input: {}, resolvedPolicies: [], turno_id: TURNO });
+      expect(out._token_budget_exceeded).toBe(true);
+      expect(out._tokens_in).toBe(5);
+      expect(out._tokens_out).toBe(5);
+      // partial body comes from last LLM content.
+      expect(out.partial).toBe(true);
+    });
   });
 });
 
@@ -151,14 +165,17 @@ describe('tool_mediated: AbortSignal propagation', () => {
           model: 'x',
         };
       });
-    await expect(
-      toolMediatedMode({
-        skill,
-        input: {},
-        resolvedPolicies: [],
-        signal: controller.signal,
-      }),
-    ).rejects.toThrow('aborted');
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      await expect(
+        toolMediatedMode({
+          skill,
+          input: {},
+          resolvedPolicies: [],
+          signal: controller.signal,
+          turno_id: TURNO,
+        }),
+      ).rejects.toThrow('aborted');
+    });
   });
 
   it('toolDispatcher recebe signal + idempotency_key', async () => {
@@ -189,15 +206,17 @@ describe('tool_mediated: AbortSignal propagation', () => {
         usage: { input_tokens: 1, output_tokens: 1 },
         model: 'x',
       });
-    const out = await toolMediatedMode({
-      skill,
-      input: {},
-      resolvedPolicies: [],
-      signal: controller.signal,
-      turno_id: 'turn-42',
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const out = await toolMediatedMode({
+        skill,
+        input: {},
+        resolvedPolicies: [],
+        signal: controller.signal,
+        turno_id: 'turn-42',
+      });
+      expect(out.done).toBe(true);
+      expect(dispatcherSpy).toHaveBeenCalledTimes(1);
     });
-    expect(out.done).toBe(true);
-    expect(dispatcherSpy).toHaveBeenCalledTimes(1);
   });
 
   it('dispatcher aborta → propaga como erro "aborted" (não swallow)', async () => {
@@ -217,13 +236,16 @@ describe('tool_mediated: AbortSignal propagation', () => {
       usage: { input_tokens: 1, output_tokens: 1 },
       model: 'x',
     });
-    await expect(
-      toolMediatedMode({
-        skill,
-        input: {},
-        resolvedPolicies: [],
-        signal: controller.signal,
-      }),
-    ).rejects.toThrow('aborted');
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      await expect(
+        toolMediatedMode({
+          skill,
+          input: {},
+          resolvedPolicies: [],
+          signal: controller.signal,
+          turno_id: TURNO,
+        }),
+      ).rejects.toThrow('aborted');
+    });
   });
 });

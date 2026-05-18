@@ -18,15 +18,30 @@ import { capabilityGapsRepo, skillsRepo } from '@/db/repositories.js';
 import type { CapabilityProposal } from '@/db/schema.js';
 import { logger } from '@/lib/logger.js';
 
+export type RevertCapabilityResult =
+  | { ok: true; technical_gap_id: string }
+  | { ok: false; revert_failed: true; reason: string };
+
 export async function revertCapability(args: {
   proposal: CapabilityProposal;
   reason: string;
-}): Promise<{ technical_gap_id: string }> {
-  // P9a: skill branch — se o artefato delivered for uma skill, marcar
-  // como rolled_back (que reativa a versão anterior dentro da mesma
-  // transação no skillsRepo). O technical gap é criado em qualquer caso
-  // — preserva auditoria e backlog para investigação humana.
-  if (args.proposal.capability_type === 'skill' && args.proposal.delivery_artifact_ref) {
+}): Promise<RevertCapabilityResult> {
+  // P9a: skill branch — se o artefato delivered for uma skill, rollback
+  // deve ser atômico. Round-2 review #99 finding 2:
+  //  - delivery_artifact_ref é obrigatório para capability_type='skill'.
+  //  - Falhas de rollback propagam (não são silenciadas): a skill ruim
+  //    permanece ativa e o audit NÃO pode mentir dizendo que reverteu.
+  //  - O gap técnico só é criado após o rollback ter sucedido.
+  if (args.proposal.capability_type === 'skill') {
+    if (!args.proposal.delivery_artifact_ref) {
+      const msg =
+        'p9a.capability_revert.missing_artifact: capability_type=skill requires delivery_artifact_ref to rollback';
+      logger.error(
+        { proposal_id: args.proposal.id },
+        msg,
+      );
+      return { ok: false, revert_failed: true, reason: msg };
+    }
     try {
       await skillsRepo.rollback(
         args.proposal.delivery_artifact_ref,
@@ -34,17 +49,23 @@ export async function revertCapability(args: {
         'capability-revert',
       );
     } catch (err) {
-      logger.warn(
-        { err: (err as Error).message, skill_id: args.proposal.delivery_artifact_ref },
+      const msg = (err as Error).message;
+      logger.error(
+        { err: msg, skill_id: args.proposal.delivery_artifact_ref, proposal_id: args.proposal.id },
         'p9a.capability_revert.skill_rollback_failed',
       );
+      // Rollback failed: do NOT create a gap that implies revert succeeded.
+      // Caller must treat this as a hard failure and keep the skill active
+      // in the state machine without marking triggered_revert=true.
+      return { ok: false, revert_failed: true, reason: msg };
     }
   }
 
+  // Only reached for non-skill proposals OR after successful skill rollback.
   const newGap = await capabilityGapsRepo.create({
     capability_description: `[técnica] ${args.proposal.title} falhou pós-ativação`,
     tipo: 'technical',
     contexto: args.reason,
   });
-  return { technical_gap_id: newGap.id };
+  return { ok: true, technical_gap_id: newGap.id };
 }

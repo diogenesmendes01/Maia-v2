@@ -6,8 +6,12 @@
  *  - max_tool_calls cap (loops infinitos quebram)
  *  - dispatcher chamado com (name, args)
  *  - acumulação de tools_called no output
+ *
+ * Round-2 review #99 finding 3: turno_id obrigatório para chave de
+ * idempotência estável. Todos os calls agora passam turno_id.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { runWithTenantContext } from '@/db/tenant-context.js';
 
 vi.mock('@/lib/claude.js', () => ({ callLLM: vi.fn() }));
 
@@ -16,6 +20,9 @@ import { callLLM } from '@/lib/claude.js';
 
 const mockSkill = {
   id: 'tool-skill-1',
+  tenant_id: 'default',
+  agent_id: 'default',
+  version: 1,
   procedure: {
     system_prompt: 'You can call tools.',
     tool_schemas: [
@@ -26,6 +33,9 @@ const mockSkill = {
   allowed_tools: ['query_balance'],
   runtime_hints: { max_output_tokens: 1000, max_tool_calls: 3 },
 } as any;
+
+/** Default stable context shared by all tests in this file. */
+const stableCtx = { turno_id: 'turn-test-1' };
 
 describe('toolMediatedMode', () => {
   beforeEach(() => {
@@ -41,9 +51,11 @@ describe('toolMediatedMode', () => {
       usage: { input_tokens: 5, output_tokens: 5 },
       model: 'x',
     });
-    const out = await toolMediatedMode({ skill: mockSkill, input: {}, resolvedPolicies: [] });
-    expect(out.answer).toBe('R$1000');
-    expect(out._tools_called).toEqual([]);
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const out = await toolMediatedMode({ skill: mockSkill, input: {}, resolvedPolicies: [], ...stableCtx });
+      expect(out.answer).toBe('R$1000');
+      expect(out._tools_called).toEqual([]);
+    });
   });
 
   it('throws if dispatcher not configured but tool requested', async () => {
@@ -55,9 +67,11 @@ describe('toolMediatedMode', () => {
         usage: { input_tokens: 5, output_tokens: 5 },
         model: 'x',
       });
-    await expect(
-      toolMediatedMode({ skill: mockSkill, input: {}, resolvedPolicies: [] }),
-    ).rejects.toThrow('tool_dispatcher_not_configured');
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      await expect(
+        toolMediatedMode({ skill: mockSkill, input: {}, resolvedPolicies: [], ...stableCtx }),
+      ).rejects.toThrow('tool_dispatcher_not_configured');
+    });
   });
 
   it('dispatches allowed tool and continues to final answer', async () => {
@@ -77,9 +91,11 @@ describe('toolMediatedMode', () => {
         usage: { input_tokens: 5, output_tokens: 5 },
         model: 'x',
       });
-    const out = await toolMediatedMode({ skill: mockSkill, input: {}, resolvedPolicies: [] });
-    expect(out.answer).toBe('saldo é 1234');
-    expect(out._tools_called).toEqual(['query_balance']);
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const out = await toolMediatedMode({ skill: mockSkill, input: {}, resolvedPolicies: [], ...stableCtx });
+      expect(out.answer).toBe('saldo é 1234');
+      expect(out._tools_called).toEqual(['query_balance']);
+    });
   });
 
   it('blocks tools not in allowed_tools (returns error tool_result)', async () => {
@@ -99,9 +115,11 @@ describe('toolMediatedMode', () => {
         usage: { input_tokens: 5, output_tokens: 5 },
         model: 'x',
       });
-    const out = await toolMediatedMode({ skill: mockSkill, input: {}, resolvedPolicies: [] });
-    // unauthorized_tool was rejected, never made it into _tools_called.
-    expect(out._tools_called).toEqual([]);
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const out = await toolMediatedMode({ skill: mockSkill, input: {}, resolvedPolicies: [], ...stableCtx });
+      // unauthorized_tool was rejected, never made it into _tools_called.
+      expect(out._tools_called).toEqual([]);
+    });
   });
 
   it('throws max_tool_calls_exceeded after cap reached', async () => {
@@ -114,8 +132,10 @@ describe('toolMediatedMode', () => {
       usage: { input_tokens: 1, output_tokens: 1 },
       model: 'x',
     });
-    await expect(
-      toolMediatedMode({ skill: mockSkill, input: {}, resolvedPolicies: [] }),
-    ).rejects.toThrow('max_tool_calls_exceeded');
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      await expect(
+        toolMediatedMode({ skill: mockSkill, input: {}, resolvedPolicies: [], ...stableCtx }),
+      ).rejects.toThrow('max_tool_calls_exceeded');
+    });
   });
 });
