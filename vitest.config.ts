@@ -26,6 +26,7 @@ export default defineConfig({
   },
   test: {
     include: ['tests/**/*.spec.ts'],
+    exclude: ['tests/admin-ui/e2e/**'],
     environment: 'node',
     setupFiles: ['./tests/setup.ts'],
     coverage: {
