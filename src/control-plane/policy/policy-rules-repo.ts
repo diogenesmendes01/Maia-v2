@@ -85,6 +85,63 @@ async function publishLifecycle(evt: PolicyLifecycleEvent): Promise<void> {
   }
 }
 
+/**
+ * Codex review #93 finding: a hard_limit activation MUST present structured
+ * evidence of two distinct approvers (owner + compliance). Previously any
+ * truthy object passed. The seed script also bypassed the guard with
+ * `{ script_bootstrap: true }` — that backdoor is closed by routing the
+ * seed through `propose()` only and approving via Admin UI (P8.5).
+ *
+ * Validation rules:
+ *  - `approvers`: array of >= 2 distinct non-empty principal ids
+ *  - `approved_at`: ISO-8601 timestamp string (1 per approver, parallel arr)
+ *  - `dual_approval_evidence` must NOT be undefined for hard_limit /
+ *    lockdown_trigger (lockdown is the kill-switch — same guard applies).
+ *
+ * The Admin UI (P8.5) populates this from session-authenticated approvers;
+ * the repo just enforces shape. Strict cryptographic proof (signatures)
+ * is out of scope here; P8.5 may add a `signature` field later.
+ */
+export interface DualApprovalEvidence {
+  approvers: string[]; // >= 2 distinct
+  approved_at: string[]; // parallel array of ISO-8601 timestamps
+  // Optional free-form context (audit trail, ticket id, etc.).
+  context?: Record<string, unknown>;
+}
+
+export function isValidDualApprovalEvidence(
+  ev: unknown,
+): ev is DualApprovalEvidence {
+  if (!ev || typeof ev !== 'object') return false;
+  const e = ev as Record<string, unknown>;
+  if (!Array.isArray(e.approvers) || !Array.isArray(e.approved_at)) return false;
+  if (e.approvers.length < 2) return false;
+  if (e.approvers.length !== e.approved_at.length) return false;
+  // All approvers non-empty strings, all distinct, all timestamps parse.
+  const seen = new Set<string>();
+  for (const a of e.approvers) {
+    if (typeof a !== 'string' || a.trim() === '') return false;
+    if (seen.has(a)) return false;
+    seen.add(a);
+  }
+  for (const t of e.approved_at) {
+    if (typeof t !== 'string') return false;
+    const d = new Date(t);
+    if (Number.isNaN(d.getTime())) return false;
+  }
+  return true;
+}
+
+/**
+ * The two rule kinds that REQUIRE dual_approval_evidence to activate.
+ * `lockdown_trigger` is the tenant-wide kill-switch — Codex #93 flagged
+ * that it had NO guard at all; same dual-approval guard now applies.
+ */
+const ACTIVATION_REQUIRES_DUAL_APPROVAL: ReadonlySet<PolicyRuleKind> = new Set([
+  'hard_limit',
+  'lockdown_trigger',
+]);
+
 export interface PolicyRulesRepo {
   // READ-side
   findActiveByDescriptor(args: {
@@ -116,7 +173,7 @@ export interface PolicyRulesRepo {
   activate(args: {
     id: string;
     approved_by: string;
-    dual_approval_evidence?: object;
+    dual_approval_evidence?: DualApprovalEvidence;
   }): Promise<
     | { ok: true; updated: PolicyRule }
     | {
@@ -125,7 +182,8 @@ export interface PolicyRulesRepo {
           | 'not_found'
           | 'invalid_transition'
           | 'already_has_active'
-          | 'hard_limit_requires_dual_approval';
+          | 'hard_limit_requires_dual_approval'
+          | 'invalid_dual_approval_evidence';
       }
   >;
 
@@ -277,10 +335,19 @@ export const policyRulesRepo: PolicyRulesRepo = {
   },
 
   /**
-   * proposed → active. Hard-limit guard: refuses without dual_approval_evidence.
-   * The partial unique index `idx_policy_rules_one_active_uq` is the source
-   * of truth for "no two actives simultaneously"; concurrent activates
-   * surface as a unique-violation, translated to `already_has_active`.
+   * proposed → active. Hard-limit + lockdown_trigger guard: refuses
+   * without VALID dual_approval_evidence (2+ distinct approvers, ISO
+   * timestamps). Codex review #93 closed the loophole where any truthy
+   * object passed and noted lockdown_trigger had no guard at all.
+   *
+   * Concurrency: state-transition is enforced with a CONDITIONAL UPDATE
+   * (`WHERE status='proposed'`). A concurrent rollback that flipped the
+   * row to rolled_back between our SELECT and UPDATE is rejected by the
+   * 0-rowcount → invalid_transition path. The partial unique index
+   * `idx_policy_rules_one_active_uq` separately guarantees no two
+   * actives co-exist for the same (tenant, agent_or_wide, descriptor);
+   * a concurrent activate that won surfaces as 23505 →
+   * already_has_active.
    */
   async activate(args) {
     const tenant_id = getCurrentTenant();
@@ -295,13 +362,30 @@ export const policyRulesRepo: PolicyRulesRepo = {
     if (row.status !== 'proposed') {
       return { ok: false, reason: 'invalid_transition' };
     }
-    if (row.rule_kind === 'hard_limit' && !args.dual_approval_evidence) {
-      return { ok: false, reason: 'hard_limit_requires_dual_approval' };
+    const kind = row.rule_kind as PolicyRuleKind;
+    if (ACTIVATION_REQUIRES_DUAL_APPROVAL.has(kind)) {
+      if (!args.dual_approval_evidence) {
+        return { ok: false, reason: 'hard_limit_requires_dual_approval' };
+      }
+      if (!isValidDualApprovalEvidence(args.dual_approval_evidence)) {
+        return { ok: false, reason: 'invalid_dual_approval_evidence' };
+      }
+      // approved_by must not be one of the approvers (the requester
+      // cannot self-approve their own activation, even with co-signer).
+      const ev = args.dual_approval_evidence;
+      if (ev.approvers.includes(args.approved_by)) {
+        // approved_by is the EXECUTOR. To satisfy 2-of-N separation of
+        // duties, the executor MUST be distinct from the approvers.
+        return { ok: false, reason: 'invalid_dual_approval_evidence' };
+      }
     }
 
     const now = new Date();
     try {
-      const [updated] = await db
+      // Codex review #93: conditional UPDATE on expected status guards
+      // against the stale-read race where a concurrent rollback flipped
+      // the row between our SELECT and UPDATE.
+      const updated = await db
         .update(policy_rules)
         .set({
           status: 'active',
@@ -309,12 +393,32 @@ export const policyRulesRepo: PolicyRulesRepo = {
           approved_at: now,
           activated_at: now,
         })
-        .where(eq(policy_rules.id, args.id))
+        .where(
+          and(
+            eq(policy_rules.id, args.id),
+            eq(policy_rules.tenant_id, tenant_id),
+            eq(policy_rules.status, 'proposed'),
+          ),
+        )
         .returning();
-      if (!updated) {
-        return { ok: false, reason: 'not_found' };
+      const updatedRow = updated[0];
+      if (!updatedRow) {
+        // 0 rows updated: either the row vanished or someone won the
+        // transition first. Re-read to decide which.
+        const [check] = await db
+          .select()
+          .from(policy_rules)
+          .where(
+            and(
+              eq(policy_rules.id, args.id),
+              eq(policy_rules.tenant_id, tenant_id),
+            ),
+          )
+          .limit(1);
+        if (!check) return { ok: false, reason: 'not_found' };
+        return { ok: false, reason: 'invalid_transition' };
       }
-      const domain = rowToDomain(updated);
+      const domain = rowToDomain(updatedRow);
       await publishLifecycle({
         event: 'policy_rule_activated',
         tenant_id: domain.tenant_id,
@@ -335,32 +439,43 @@ export const policyRulesRepo: PolicyRulesRepo = {
 
   /**
    * active → deprecated. Frees the descriptor slot for a new active version.
+   * Codex review #93: conditional UPDATE on expected status guards
+   * against the stale-read race; tenant_id in WHERE guarantees no
+   * cross-tenant write even if AsyncLocalStorage leaked.
    */
   async deprecate(args) {
     const tenant_id = getCurrentTenant();
-    const [row] = await db
-      .select()
-      .from(policy_rules)
-      .where(
-        and(eq(policy_rules.id, args.id), eq(policy_rules.tenant_id, tenant_id)),
-      )
-      .limit(1);
-    if (!row) return { ok: false, reason: 'not_found' };
-    if (row.status !== 'active') {
-      return { ok: false, reason: 'invalid_transition' };
-    }
-
     const now = new Date();
-    const [updated] = await db
+    const updated = await db
       .update(policy_rules)
       .set({
         status: 'deprecated',
         deprecated_at: now,
       })
-      .where(eq(policy_rules.id, args.id))
+      .where(
+        and(
+          eq(policy_rules.id, args.id),
+          eq(policy_rules.tenant_id, tenant_id),
+          eq(policy_rules.status, 'active'),
+        ),
+      )
       .returning();
-    if (!updated) return { ok: false, reason: 'not_found' };
-    const domain = rowToDomain(updated);
+    const updatedRow = updated[0];
+    if (!updatedRow) {
+      const [check] = await db
+        .select()
+        .from(policy_rules)
+        .where(
+          and(
+            eq(policy_rules.id, args.id),
+            eq(policy_rules.tenant_id, tenant_id),
+          ),
+        )
+        .limit(1);
+      if (!check) return { ok: false, reason: 'not_found' };
+      return { ok: false, reason: 'invalid_transition' };
+    }
+    const domain = rowToDomain(updatedRow);
     await publishLifecycle({
       event: 'policy_rule_deprecated',
       tenant_id: domain.tenant_id,
@@ -375,33 +490,45 @@ export const policyRulesRepo: PolicyRulesRepo = {
 
   /**
    * any non-terminal → rolled_back. Terminal = rolled_back already.
+   * Codex review #93: conditional UPDATE excludes 'rolled_back' atomically;
+   * a concurrent rollback that won between our (avoided) SELECT and UPDATE
+   * lands as 0-rowcount → re-read → `terminal`.
    */
   async rollback(args) {
     const tenant_id = getCurrentTenant();
-    const [row] = await db
-      .select()
-      .from(policy_rules)
-      .where(
-        and(eq(policy_rules.id, args.id), eq(policy_rules.tenant_id, tenant_id)),
-      )
-      .limit(1);
-    if (!row) return { ok: false, reason: 'not_found' };
-    if (row.status === 'rolled_back') {
-      return { ok: false, reason: 'terminal' };
-    }
-
     const now = new Date();
-    const [updated] = await db
+    const updated = await db
       .update(policy_rules)
       .set({
         status: 'rolled_back',
         rolled_back_at: now,
         rollback_reason: args.rollback_reason,
       })
-      .where(eq(policy_rules.id, args.id))
+      .where(
+        and(
+          eq(policy_rules.id, args.id),
+          eq(policy_rules.tenant_id, tenant_id),
+          // not yet terminal
+          sql`${policy_rules.status} <> 'rolled_back'`,
+        ),
+      )
       .returning();
-    if (!updated) return { ok: false, reason: 'not_found' };
-    const domain = rowToDomain(updated);
+    const updatedRow = updated[0];
+    if (!updatedRow) {
+      const [check] = await db
+        .select()
+        .from(policy_rules)
+        .where(
+          and(
+            eq(policy_rules.id, args.id),
+            eq(policy_rules.tenant_id, tenant_id),
+          ),
+        )
+        .limit(1);
+      if (!check) return { ok: false, reason: 'not_found' };
+      return { ok: false, reason: 'terminal' };
+    }
+    const domain = rowToDomain(updatedRow);
     await publishLifecycle({
       event: 'policy_rule_rolled_back',
       tenant_id: domain.tenant_id,

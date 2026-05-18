@@ -134,6 +134,38 @@ export class PolicyResolverCacheImpl implements PolicyResolverCache {
     agent_id: string | null;
     descriptor: string;
   }): void {
+    // Codex review #93 finding: when agent_id is null (tenant-wide
+    // lifecycle event), we MUST also evict any agent-specific cache entries
+    // for the same (tenant, descriptor). The resolver caches under the
+    // requested agent_id even when the underlying row is the tenant-wide
+    // fallback, so a tenant-wide deprecate/activate must fan-out across
+    // all cached agent_ids. Otherwise an agent that previously hit
+    // `agent_id=A | descriptor=D | scope=...` would keep serving the
+    // stale resolved policy (or stale `unresolved` miss) for up to ttl_ms.
+    if (args.agent_id === null) {
+      // Match the more permissive prefix: tenant|*|descriptor|... — i.e.
+      // any agent including 'wide'. We can't precompute a startsWith here
+      // (agent slot is in the middle), so iterate and parse.
+      const tenantPart = `${args.tenant_id}|`;
+      const descPart = `|${args.descriptor}|`;
+      for (const [k, e] of this.store) {
+        if (k.startsWith(tenantPart) && k.includes(descPart)) {
+          // Sanity: the descriptor slot is the 3rd `|`-segment. Build
+          // canonical prefix to avoid false positives where the
+          // descriptor string also appears in the scope tail.
+          const segs = k.split('|');
+          // segs: [tenant, agent_or_wide, descriptor, ...scopeTail]
+          if (segs[0] === args.tenant_id && segs[2] === args.descriptor) {
+            this.removeFromList(k, e);
+            this.store.delete(k);
+          }
+        }
+      }
+      return;
+    }
+    // Agent-specific event: invalidate only entries for that exact agent.
+    // (A tenant-wide row is never published under a non-null agent_id, so
+    // this branch does NOT need to fan-out to 'wide'.)
     const prefix = invalidationPrefix(args.tenant_id, args.agent_id, args.descriptor);
     for (const [k, e] of this.store) {
       if (k.startsWith(prefix)) {
@@ -239,9 +271,43 @@ export const policyResolverCache: PolicyResolverCache = new PolicyResolverCacheI
 let subscriberStarted = false;
 
 /**
+ * Pure handler: parses a Redis pub/sub message and invalidates the given
+ * cache. Extracted from startPolicyCacheInvalidationSubscriber() so tests
+ * can verify the wiring without standing up a Redis client.
+ *
+ * Codex review #93: previously the handler logic was inline in the
+ * subscriber start function and untestable in isolation; the only proof
+ * that "Redis publish invalidates cache" was the publish branch, never
+ * the subscribe branch. This indirection lets a unit test exercise the
+ * full publish-payload → cache-invalidate path.
+ */
+export function handlePolicyLifecycleMessage(
+  channel: string,
+  msg: string,
+  cache: PolicyResolverCache = policyResolverCache,
+): void {
+  if (channel !== POLICY_LIFECYCLE_CHANNEL) return;
+  try {
+    const evt = JSON.parse(msg) as PolicyLifecycleEvent;
+    cache.invalidate({
+      tenant_id: evt.tenant_id,
+      agent_id: evt.agent_id,
+      descriptor: evt.descriptor,
+    });
+  } catch (err) {
+    logger.warn(
+      { err: (err as Error).message, msg },
+      'policy_cache.invalid_event_payload',
+    );
+  }
+}
+
+/**
  * Idempotent: starts the Redis subscriber the first time it's called,
  * then no-ops. Failure to subscribe is logged but doesn't throw —
  * caches still expire naturally via TTL.
+ *
+ * Wired from src/index.ts startup when FEATURE_POLICY_RESOLVER_V1 is on.
  */
 export function startPolicyCacheInvalidationSubscriber(): void {
   if (subscriberStarted) return;
@@ -266,19 +332,15 @@ export function startPolicyCacheInvalidationSubscriber(): void {
     }
   });
   sub.on('message', (channel, msg) => {
-    if (channel !== POLICY_LIFECYCLE_CHANNEL) return;
-    try {
-      const evt = JSON.parse(msg) as PolicyLifecycleEvent;
-      policyResolverCache.invalidate({
-        tenant_id: evt.tenant_id,
-        agent_id: evt.agent_id,
-        descriptor: evt.descriptor,
-      });
-    } catch (err) {
-      logger.warn(
-        { err: (err as Error).message, msg },
-        'policy_cache.invalid_event_payload',
-      );
-    }
+    handlePolicyLifecycleMessage(channel, msg);
   });
+}
+
+/**
+ * Test-only: reset the once-flag so the integration test can re-invoke
+ * `startPolicyCacheInvalidationSubscriber` after the spec replaces the
+ * Redis client. Production code must NOT call this.
+ */
+export function _resetPolicyCacheSubscriberStartedFlag(): void {
+  subscriberStarted = false;
 }

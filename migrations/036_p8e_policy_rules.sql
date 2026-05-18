@@ -43,6 +43,19 @@ CREATE TABLE policy_rules (
   -- (defesa em profundidade contra script de seed que esquece DEFAULT)
   CONSTRAINT policy_rules_proposed_unapproved CHECK (
     status != 'proposed' OR (approved_at IS NULL AND activated_at IS NULL)
+  ),
+
+  -- Codex adversarial review #93: a status='active' row WITHOUT an approver
+  -- is the failure mode where a stray INSERT bypasses the application-level
+  -- guard. The DB now blocks it outright — any 'active' row MUST carry
+  -- approved_by, approved_at, and activated_at. The seed migration 037
+  -- already sets all three; this constraint formalizes that invariant.
+  CONSTRAINT policy_rules_active_requires_approval CHECK (
+    status != 'active' OR (
+      approved_by IS NOT NULL
+      AND approved_at IS NOT NULL
+      AND activated_at IS NOT NULL
+    )
   )
 );
 

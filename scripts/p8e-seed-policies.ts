@@ -2,9 +2,15 @@
  * P8e — programmatic seed script (dev/test alternative to SQL migration 037).
  *
  * Idempotent: each policy is created only when no active row with the same
- * descriptor exists. Calls repo.propose() + repo.activate() with
- * `dual_approval_evidence: { script_bootstrap: true }` — the bootstrap
- * exception to the normal dual-approval workflow.
+ * descriptor exists. Calls repo.propose() + repo.activate() with a
+ * STRUCTURED dual_approval_evidence (2 distinct synthetic approvers).
+ *
+ * Codex review #93 closed the previous loophole — the old shape
+ * `{ script_bootstrap: true }` is REJECTED by repo.activate now
+ * (invalid_dual_approval_evidence). Dev seeding uses synthetic principals
+ * `seed_owner_bootstrap` + `seed_compliance_bootstrap`, with the executor
+ * (`approved_by`) distinct (`p8e_seed_executor`). In prod the Admin UI
+ * (P8.5) populates real principals from authenticated sessions.
  *
  * Usage:
  *   tsx scripts/p8e-seed-policies.ts
@@ -180,10 +186,19 @@ async function seedDefaultPolicies(): Promise<{
       proposed_by: 'p8e_seed_script',
       proposed_reason: policy.proposed_reason,
     });
+    const now = new Date().toISOString();
     const result = await policyRulesRepo.activate({
       id: proposed.id,
-      approved_by: 'p8e_seed_script',
-      dual_approval_evidence: { script_bootstrap: true },
+      approved_by: 'p8e_seed_executor',
+      dual_approval_evidence: {
+        approvers: ['seed_owner_bootstrap', 'seed_compliance_bootstrap'],
+        approved_at: [now, now],
+        context: {
+          source: 'p8e_seed_script',
+          rationale:
+            'Dev seed: 2 synthetic principals satisfy structured guard. Prod policies originate from Admin UI (P8.5).',
+        },
+      },
     });
     if (!result.ok) {
       logger.warn(

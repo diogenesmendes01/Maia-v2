@@ -16,9 +16,15 @@ import {
   createPolicyDescriptorResolver,
   PolicyResolverCacheImpl,
   matchesScope,
+  hasBlockingFailure,
+  RESOLVER_FAILURE_DEFAULT,
   type PolicyResolverCache,
 } from '@/control-plane/policy/index.js';
-import type { PolicyRule, PolicyRulesRepo } from '@/control-plane/policy/index.js';
+import type {
+  PolicyRule,
+  PolicyRulesRepo,
+} from '@/control-plane/policy/index.js';
+import { runWithTenantContext } from '@/db/tenant-context.js';
 
 /**
  * In-memory repo fake. Tests configure rows in `state`; the resolver calls
@@ -299,7 +305,11 @@ describe('PolicyDescriptorResolver.resolveDescriptors', () => {
     expect(calls.findActiveByDescriptor).toBe(1);
   });
 
-  it('repo error for a single descriptor becomes unresolved (does not crash batch)', async () => {
+  it('repo error for a single descriptor becomes unresolved with reason=db_error (fail-closed, does not crash batch)', async () => {
+    // Codex review #93 contract: a repo throw MUST produce a typed
+    // `db_error` failure entry, NOT collapse into a generic miss. This
+    // distinction is what lets PEPs fail closed during a DB outage —
+    // see RESOLVER_FAILURE_DEFAULT='block' and hasBlockingFailure().
     const rule = makeRule({ rule_descriptor: 'ok' });
     const { repo: baseRepo } = makeFakeRepo([rule]);
     const repo: PolicyRulesRepo = {
@@ -320,6 +330,136 @@ describe('PolicyDescriptorResolver.resolveDescriptors', () => {
 
     expect(out.resolved.map((r) => r.descriptor)).toEqual(['ok']);
     expect(out.unresolved).toEqual(['crash']);
+    // Typed failure entry: 'crash' is db_error, 'ok' has no failure entry.
+    expect(out.failures).toEqual([{ descriptor: 'crash', reason: 'db_error' }]);
+    // Caller's blocking decision: TRUE because db_error is blocking.
+    expect(hasBlockingFailure(out)).toBe(true);
+  });
+
+  it('does NOT cache db_error misses (transient outage must not pin "no policy")', async () => {
+    let attempts = 0;
+    const { repo: baseRepo } = makeFakeRepo([]);
+    const repo: PolicyRulesRepo = {
+      ...baseRepo,
+      async findActiveByDescriptor() {
+        attempts++;
+        if (attempts === 1) throw new Error('transient_db_blip');
+        return makeRule({ rule_descriptor: 'flaky' });
+      },
+    };
+    const resolver = createPolicyDescriptorResolver(repo, cache);
+
+    // First call: db_error, NOT cached.
+    const out1 = await resolver.resolveDescriptors({
+      tenant_id: 'default',
+      descriptors: ['flaky'],
+    });
+    expect(out1.failures[0]?.reason).toBe('db_error');
+
+    // Second call: repo recovers — resolver MUST re-query (not serve a
+    // cached miss from the first call).
+    const out2 = await resolver.resolveDescriptors({
+      tenant_id: 'default',
+      descriptors: ['flaky'],
+    });
+    expect(out2.resolved).toHaveLength(1);
+    expect(out2.failures).toEqual([]);
+    expect(attempts).toBe(2);
+  });
+
+  it('not_found is tagged separately and is NOT a blocking failure', async () => {
+    const { repo } = makeFakeRepo([]);
+    const resolver = createPolicyDescriptorResolver(repo, cache);
+
+    const out = await resolver.resolveDescriptors({
+      tenant_id: 'default',
+      descriptors: ['absent'],
+    });
+
+    expect(out.failures).toEqual([{ descriptor: 'absent', reason: 'not_found' }]);
+    expect(hasBlockingFailure(out)).toBe(false);
+  });
+
+  it('scope_mismatch is its own typed reason (not collapsed into not_found)', async () => {
+    const rule = makeRule({
+      rule_descriptor: 'scoped',
+      scope: { channel: 'whatsapp' },
+    });
+    const { repo } = makeFakeRepo([rule]);
+    const resolver = createPolicyDescriptorResolver(repo, cache);
+
+    const out = await resolver.resolveDescriptors({
+      tenant_id: 'default',
+      descriptors: ['scoped'],
+      scope: { channel: 'telegram' },
+    });
+
+    expect(out.failures).toEqual([
+      { descriptor: 'scoped', reason: 'scope_mismatch' },
+    ]);
+    expect(hasBlockingFailure(out)).toBe(false);
+  });
+
+  it('tenant_mismatch: declared tenant_id differs from active context → batch fails closed', async () => {
+    // Codex review #93: the resolver MUST refuse cross-tenant calls.
+    // The repo would otherwise silently use the active context and
+    // resolve under the WRONG tenant.
+    const rule = makeRule({ rule_descriptor: 'sensitive' });
+    const { repo } = makeFakeRepo([rule]);
+    const resolver = createPolicyDescriptorResolver(repo, cache);
+
+    await runWithTenantContext(
+      { tenant_id: 'tenant-a', agent_id: 'default' },
+      async () => {
+        const out = await resolver.resolveDescriptors({
+          tenant_id: 'tenant-b', // <-- mismatch
+          descriptors: ['sensitive', 'other'],
+        });
+        expect(out.resolved).toHaveLength(0);
+        expect(out.failures).toEqual([
+          { descriptor: 'sensitive', reason: 'tenant_mismatch' },
+          { descriptor: 'other', reason: 'tenant_mismatch' },
+        ]);
+        expect(hasBlockingFailure(out)).toBe(true);
+      },
+    );
+  });
+
+  it('RESOLVER_FAILURE_DEFAULT invariant is pinned to "block"', () => {
+    // If anyone flips this constant, the caller contract changes
+    // silently. Pin the value with an explicit test so the change shows
+    // up as a test failure in code review.
+    expect(RESOLVER_FAILURE_DEFAULT).toBe('block');
+  });
+
+  it('hasBlockingFailure returns false when all failures are non-blocking', () => {
+    expect(
+      hasBlockingFailure({
+        resolved: [],
+        unresolved: ['a', 'b'],
+        failures: [
+          { descriptor: 'a', reason: 'not_found' },
+          { descriptor: 'b', reason: 'scope_mismatch' },
+        ],
+      }),
+    ).toBe(false);
+  });
+
+  it('hasBlockingFailure returns true when any failure is db_error or tenant_mismatch', () => {
+    expect(
+      hasBlockingFailure({
+        resolved: [],
+        unresolved: ['a'],
+        failures: [{ descriptor: 'a', reason: 'db_error' }],
+      }),
+    ).toBe(true);
+    expect(
+      hasBlockingFailure({
+        resolved: [],
+        unresolved: ['a'],
+        failures: [{ descriptor: 'a', reason: 'tenant_mismatch' }],
+      }),
+    ).toBe(true);
   });
 });
 

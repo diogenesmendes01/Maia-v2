@@ -125,8 +125,61 @@ export interface ResolvedPolicy {
   rule_kind: PolicyRuleKind;
 }
 
-/** Master §2.2 — Resolver output. Invariant: resolved.length + unresolved.length === input.descriptors.length. */
+/**
+ * Why a descriptor ended up in `unresolved`. The resolver MUST distinguish
+ * "no policy exists" (`not_found`) from "the policy store is unavailable"
+ * (`db_error`) so PEP callers can fail closed on the latter. Treating
+ * `db_error` as `not_found` would let traffic continue without the hard
+ * limit during a DB outage — the exact failure-open mode the master spec
+ * §0.2 invariant #5 forbids.
+ *
+ * - `not_found`: no active policy matches the descriptor (and scope filter
+ *   if any). The resolver cached the miss; safe to proceed.
+ * - `scope_mismatch`: a row exists, but its scope doesn't intersect the
+ *   input.scope. Same handling as `not_found` from the caller's POV.
+ * - `db_error`: the repo threw. The resolver could not determine whether a
+ *   policy exists. Callers MUST treat the descriptor as "policy active,
+ *   block by default" (RESOLVER_FAILURE_DEFAULT='block'). Tested in
+ *   resolver fail-closed unit spec.
+ * - `tenant_mismatch`: input.tenant_id differs from the active tenant
+ *   context. Programmer error; resolver refuses to resolve cross-tenant.
+ */
+export type ResolverFailureReason =
+  | 'not_found'
+  | 'scope_mismatch'
+  | 'db_error'
+  | 'tenant_mismatch';
+
+export interface UnresolvedDescriptor {
+  descriptor: string;
+  reason: ResolverFailureReason;
+}
+
+/** Master §2.2 — Resolver output. Invariant: resolved.length + unresolved.length === input.descriptors.length.
+ *
+ * `unresolved` (string[]) preserved for back-compat with the original spec
+ * shape. `failures` (typed) is the source of truth for fail-closed
+ * decision-making — callers MUST consult `failures.find(f => f.reason ===
+ * 'db_error')` and BLOCK if any exists. See RESOLVER_FAILURE_DEFAULT below.
+ */
 export interface PolicyDescriptorResolverOutput {
   resolved: ResolvedPolicy[];
   unresolved: string[];
+  failures: UnresolvedDescriptor[];
 }
+
+/**
+ * Fail-closed default for resolver consumers. When the resolver returns a
+ * descriptor with `reason: 'db_error'`, the PEP / slice builder MUST default
+ * to BLOCK (NEVER auto-allow). Exported as a constant so consumers can
+ * reference it in their own invariant checks (and so tests can pin the
+ * value to 'block' and fail if someone flips it).
+ *
+ * Codex review #93 finding: previously the resolver collapsed repo errors
+ * into "unresolved" (string), which is indistinguishable from "no policy
+ * exists" — letting traffic continue without the hard limit during a DB
+ * outage. The new contract: `failures: UnresolvedDescriptor[]` with typed
+ * reasons, and this constant pins the caller default.
+ */
+export const RESOLVER_FAILURE_DEFAULT = 'block' as const;
+export type ResolverFailureDefault = typeof RESOLVER_FAILURE_DEFAULT;

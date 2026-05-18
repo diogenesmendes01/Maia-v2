@@ -18,7 +18,9 @@ import type {
   PolicyRuleScope,
   PolicySourceOfTruth,
   PolicyRulesRepo,
+  DualApprovalEvidence,
 } from '@/control-plane/policy/index.js';
+import { isValidDualApprovalEvidence } from '@/control-plane/policy/index.js';
 
 type ProposeInput = {
   agent_id?: string | null;
@@ -138,8 +140,18 @@ vi.mock('@/control-plane/policy/policy-rules-repo.js', async () => {
       if (row.status !== 'proposed') {
         return { ok: false, reason: 'invalid_transition' };
       }
-      if (row.rule_kind === 'hard_limit' && !args.dual_approval_evidence) {
-        return { ok: false, reason: 'hard_limit_requires_dual_approval' };
+      const requiresDual =
+        row.rule_kind === 'hard_limit' || row.rule_kind === 'lockdown_trigger';
+      if (requiresDual) {
+        if (!args.dual_approval_evidence) {
+          return { ok: false, reason: 'hard_limit_requires_dual_approval' };
+        }
+        if (!isValidDualApprovalEvidence(args.dual_approval_evidence)) {
+          return { ok: false, reason: 'invalid_dual_approval_evidence' };
+        }
+        if (args.dual_approval_evidence.approvers.includes(args.approved_by)) {
+          return { ok: false, reason: 'invalid_dual_approval_evidence' };
+        }
       }
       // Simulate one-active partial unique index.
       const existingActive = findActive(
@@ -298,17 +310,136 @@ describe('policyRulesRepo.activate', () => {
     });
   });
 
-  it('hard_limit with dual_approval_evidence activates', async () => {
+  it('hard_limit with VALID structured dual_approval_evidence activates', async () => {
     await runWithTenantContext(ctx(), async () => {
       const p = await policyRulesRepo.propose(
         baseProposeInput({ rule_kind: 'hard_limit' }),
       );
       const res = await policyRulesRepo.activate({
         id: p.id,
-        approved_by: 'admin',
-        dual_approval_evidence: { compliance_signer: 'CRO' },
+        approved_by: 'executor',
+        dual_approval_evidence: {
+          approvers: ['owner-alice', 'compliance-bob'],
+          approved_at: [
+            '2026-05-01T10:00:00.000Z',
+            '2026-05-01T10:05:00.000Z',
+          ],
+        },
       });
       expect(res.ok).toBe(true);
+    });
+  });
+
+  it('hard_limit REJECTS old-style truthy-object evidence (Codex #93 closed loophole)', async () => {
+    await runWithTenantContext(ctx(), async () => {
+      const p = await policyRulesRepo.propose(
+        baseProposeInput({ rule_kind: 'hard_limit' }),
+      );
+      // Pre-fix: this used to pass. Post-fix: rejected with the new reason.
+      const res = await policyRulesRepo.activate({
+        id: p.id,
+        approved_by: 'admin',
+        dual_approval_evidence: { compliance_signer: 'CRO' } as DualApprovalEvidence,
+      });
+      expect(res.ok).toBe(false);
+      if (res.ok) return;
+      expect(res.reason).toBe('invalid_dual_approval_evidence');
+    });
+  });
+
+  it('hard_limit REJECTS evidence with only ONE approver', async () => {
+    await runWithTenantContext(ctx(), async () => {
+      const p = await policyRulesRepo.propose(
+        baseProposeInput({ rule_kind: 'hard_limit' }),
+      );
+      const res = await policyRulesRepo.activate({
+        id: p.id,
+        approved_by: 'executor',
+        dual_approval_evidence: {
+          approvers: ['solo'],
+          approved_at: ['2026-05-01T10:00:00.000Z'],
+        },
+      });
+      expect(res.ok).toBe(false);
+      if (res.ok) return;
+      expect(res.reason).toBe('invalid_dual_approval_evidence');
+    });
+  });
+
+  it('hard_limit REJECTS evidence with two NON-DISTINCT approvers', async () => {
+    await runWithTenantContext(ctx(), async () => {
+      const p = await policyRulesRepo.propose(
+        baseProposeInput({ rule_kind: 'hard_limit' }),
+      );
+      const res = await policyRulesRepo.activate({
+        id: p.id,
+        approved_by: 'executor',
+        dual_approval_evidence: {
+          approvers: ['same-user', 'same-user'],
+          approved_at: [
+            '2026-05-01T10:00:00.000Z',
+            '2026-05-01T10:05:00.000Z',
+          ],
+        },
+      });
+      expect(res.ok).toBe(false);
+      if (res.ok) return;
+      expect(res.reason).toBe('invalid_dual_approval_evidence');
+    });
+  });
+
+  it('hard_limit REJECTS when executor is also one of the approvers (separation of duties)', async () => {
+    await runWithTenantContext(ctx(), async () => {
+      const p = await policyRulesRepo.propose(
+        baseProposeInput({ rule_kind: 'hard_limit' }),
+      );
+      const res = await policyRulesRepo.activate({
+        id: p.id,
+        approved_by: 'alice',
+        dual_approval_evidence: {
+          approvers: ['alice', 'bob'],
+          approved_at: [
+            '2026-05-01T10:00:00.000Z',
+            '2026-05-01T10:05:00.000Z',
+          ],
+        },
+      });
+      expect(res.ok).toBe(false);
+      if (res.ok) return;
+      expect(res.reason).toBe('invalid_dual_approval_evidence');
+    });
+  });
+
+  it('lockdown_trigger ALSO requires structured dual_approval_evidence (Codex #93: kill-switch was unguarded)', async () => {
+    await runWithTenantContext(ctx(), async () => {
+      const p = await policyRulesRepo.propose(
+        baseProposeInput({
+          rule_kind: 'lockdown_trigger',
+          rule_descriptor: 'tenant_lockdown',
+        }),
+      );
+      // Missing evidence: rejected.
+      const r1 = await policyRulesRepo.activate({
+        id: p.id,
+        approved_by: 'executor',
+      });
+      expect(r1.ok).toBe(false);
+      if (r1.ok) return;
+      expect(r1.reason).toBe('hard_limit_requires_dual_approval');
+
+      // Valid evidence: activates.
+      const r2 = await policyRulesRepo.activate({
+        id: p.id,
+        approved_by: 'executor',
+        dual_approval_evidence: {
+          approvers: ['owner', 'compliance'],
+          approved_at: [
+            '2026-05-01T10:00:00.000Z',
+            '2026-05-01T10:05:00.000Z',
+          ],
+        },
+      });
+      expect(r2.ok).toBe(true);
     });
   });
 
@@ -521,5 +652,88 @@ describe('policyRulesRepo tenant isolation', () => {
       const all = await policyRulesRepo.listActiveForTenant();
       expect(all.find((row) => row.rule_descriptor === 'a_only')).toBeUndefined();
     });
+  });
+});
+
+describe('isValidDualApprovalEvidence (Codex #93)', () => {
+  const valid = {
+    approvers: ['owner', 'compliance'],
+    approved_at: ['2026-05-01T10:00:00.000Z', '2026-05-01T10:05:00.000Z'],
+  };
+
+  it('accepts the canonical shape (2 distinct approvers, parallel timestamps)', () => {
+    expect(isValidDualApprovalEvidence(valid)).toBe(true);
+  });
+
+  it('accepts MORE than 2 distinct approvers', () => {
+    expect(
+      isValidDualApprovalEvidence({
+        approvers: ['a', 'b', 'c'],
+        approved_at: [
+          '2026-05-01T10:00:00.000Z',
+          '2026-05-01T10:05:00.000Z',
+          '2026-05-01T10:10:00.000Z',
+        ],
+      }),
+    ).toBe(true);
+  });
+
+  it('rejects undefined / null / non-object', () => {
+    expect(isValidDualApprovalEvidence(undefined)).toBe(false);
+    expect(isValidDualApprovalEvidence(null)).toBe(false);
+    expect(isValidDualApprovalEvidence('hello')).toBe(false);
+    expect(isValidDualApprovalEvidence(42)).toBe(false);
+  });
+
+  it('rejects empty object (the original loophole)', () => {
+    expect(isValidDualApprovalEvidence({})).toBe(false);
+  });
+
+  it('rejects fewer than 2 approvers', () => {
+    expect(
+      isValidDualApprovalEvidence({ approvers: [], approved_at: [] }),
+    ).toBe(false);
+    expect(
+      isValidDualApprovalEvidence({
+        approvers: ['solo'],
+        approved_at: ['2026-05-01T10:00:00.000Z'],
+      }),
+    ).toBe(false);
+  });
+
+  it('rejects non-distinct approvers', () => {
+    expect(
+      isValidDualApprovalEvidence({
+        approvers: ['same', 'same'],
+        approved_at: ['2026-05-01T10:00:00.000Z', '2026-05-01T10:00:00.000Z'],
+      }),
+    ).toBe(false);
+  });
+
+  it('rejects empty-string approver', () => {
+    expect(
+      isValidDualApprovalEvidence({
+        approvers: ['', 'bob'],
+        approved_at: ['2026-05-01T10:00:00.000Z', '2026-05-01T10:05:00.000Z'],
+      }),
+    ).toBe(false);
+  });
+
+  it('rejects approvers/approved_at length mismatch', () => {
+    expect(
+      isValidDualApprovalEvidence({
+        approvers: ['alice', 'bob'],
+        approved_at: ['2026-05-01T10:00:00.000Z'],
+      }),
+    ).toBe(false);
+  });
+
+  it('rejects unparseable timestamps', () => {
+    expect(
+      isValidDualApprovalEvidence({
+        approvers: ['alice', 'bob'],
+        approved_at: ['not-a-date', '2026-05-01T10:05:00.000Z'],
+      }),
+    ).toBe(false);
   });
 });

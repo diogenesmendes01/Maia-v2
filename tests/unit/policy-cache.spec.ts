@@ -176,4 +176,123 @@ describe('PolicyResolverCacheImpl', () => {
     expect(cache.get(makeKey({ descriptor: 'b' }))).toBeUndefined();
     expect(cache.get(makeKey({ descriptor: 'a' }))?.version).toBe(2);
   });
+
+  // ----- Codex review #93: tenant-wide invalidation fan-out -----
+  describe('invalidate() tenant-wide fan-out (agent_id=null)', () => {
+    it('agent_id=null event clears agent-specific cache entries for the same (tenant, descriptor)', () => {
+      // Scenario: resolver previously cached a hit for agent-x under
+      // descriptor=d (the underlying row was the tenant-wide fallback).
+      // Admin then deprecates the tenant-wide row. The lifecycle event
+      // arrives with agent_id=null; we MUST clear agent-x's entry too,
+      // otherwise that agent serves the deprecated policy until ttl_ms.
+      const cache = new PolicyResolverCacheImpl({ ttl_ms: 60_000, max_entries: 100 });
+      // Same descriptor cached under 3 agent_ids + the tenant-wide key
+      cache.set(makeKey({ descriptor: 'd', agent_id: null }), makeResolved());
+      cache.set(makeKey({ descriptor: 'd', agent_id: 'agent-x' }), makeResolved());
+      cache.set(makeKey({ descriptor: 'd', agent_id: 'agent-y' }), makeResolved());
+      // A different descriptor for the same agent must survive
+      cache.set(
+        makeKey({ descriptor: 'other', agent_id: 'agent-x' }),
+        makeResolved({ descriptor: 'other' }),
+      );
+      // A different tenant must survive (tenant isolation)
+      cache.set(
+        makeKey({ descriptor: 'd', tenant_id: 'tenant-b', agent_id: 'agent-x' }),
+        makeResolved(),
+      );
+
+      cache.invalidate({ tenant_id: 'default', agent_id: null, descriptor: 'd' });
+
+      // All same-(tenant,descriptor) entries gone regardless of agent_id
+      expect(
+        cache.get(makeKey({ descriptor: 'd', agent_id: null })),
+      ).toBeUndefined();
+      expect(
+        cache.get(makeKey({ descriptor: 'd', agent_id: 'agent-x' })),
+      ).toBeUndefined();
+      expect(
+        cache.get(makeKey({ descriptor: 'd', agent_id: 'agent-y' })),
+      ).toBeUndefined();
+      // Other descriptor survives
+      expect(
+        cache.get(makeKey({ descriptor: 'other', agent_id: 'agent-x' })),
+      ).toBeDefined();
+      // Other tenant survives
+      expect(
+        cache.get(
+          makeKey({
+            descriptor: 'd',
+            tenant_id: 'tenant-b',
+            agent_id: 'agent-x',
+          }),
+        ),
+      ).toBeDefined();
+    });
+
+    it('agent_id=null event also clears agent-specific NEGATIVE cache (unresolved entries)', () => {
+      // Scenario: agent-x previously hit "unresolved" for descriptor=d
+      // (no tenant-wide row existed yet). Admin then activates a new
+      // tenant-wide row. The event has agent_id=null; we MUST clear
+      // agent-x's negative entry too so it re-fetches and sees the new
+      // active row.
+      const cache = new PolicyResolverCacheImpl({ ttl_ms: 60_000, max_entries: 100 });
+      cache.setUnresolved(makeKey({ descriptor: 'd', agent_id: 'agent-x' }));
+      cache.setUnresolved(makeKey({ descriptor: 'd', agent_id: null }));
+
+      cache.invalidate({ tenant_id: 'default', agent_id: null, descriptor: 'd' });
+
+      expect(cache.get(makeKey({ descriptor: 'd', agent_id: 'agent-x' }))).toBeUndefined();
+      expect(cache.get(makeKey({ descriptor: 'd', agent_id: null }))).toBeUndefined();
+    });
+
+    it('agent-specific event does NOT fan out to tenant-wide entries (asymmetric)', () => {
+      const cache = new PolicyResolverCacheImpl({ ttl_ms: 60_000, max_entries: 100 });
+      cache.set(makeKey({ descriptor: 'd', agent_id: null }), makeResolved());
+      cache.set(makeKey({ descriptor: 'd', agent_id: 'agent-x' }), makeResolved());
+
+      cache.invalidate({
+        tenant_id: 'default',
+        agent_id: 'agent-x',
+        descriptor: 'd',
+      });
+
+      // agent-x entry gone
+      expect(
+        cache.get(makeKey({ descriptor: 'd', agent_id: 'agent-x' })),
+      ).toBeUndefined();
+      // tenant-wide survives — only an agent-x specific row changed,
+      // not the underlying tenant-wide fallback.
+      expect(
+        cache.get(makeKey({ descriptor: 'd', agent_id: null })),
+      ).toBeDefined();
+    });
+
+    it('invalidation does not falsely match when descriptor substring appears in scope', () => {
+      // Guard against the naive substring approach. Hash format:
+      // "tenant|agent_or_wide|descriptor|<canonScope>". We must NOT
+      // evict an entry whose scope contains the descriptor string.
+      const cache = new PolicyResolverCacheImpl({ ttl_ms: 60_000, max_entries: 100 });
+      cache.set(
+        makeKey({
+          descriptor: 'other',
+          agent_id: 'agent-x',
+          scope: { domain: 'd' }, // value "d" embeds the target descriptor
+        }),
+        makeResolved({ descriptor: 'other' }),
+      );
+
+      cache.invalidate({ tenant_id: 'default', agent_id: null, descriptor: 'd' });
+
+      // The 'other' entry must survive — descriptor slot is 'other'.
+      expect(
+        cache.get(
+          makeKey({
+            descriptor: 'other',
+            agent_id: 'agent-x',
+            scope: { domain: 'd' },
+          }),
+        ),
+      ).toBeDefined();
+    });
+  });
 });

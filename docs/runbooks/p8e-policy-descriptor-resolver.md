@@ -116,23 +116,38 @@ await runWithTenantContext(
 ### Ativar uma policy proposed
 
 ```typescript
+const now = new Date().toISOString();
 const result = await policyRulesRepo.activate({
   id: proposed.id,
-  approved_by: 'compliance@example.com',
-  // Hard_limit OBRIGA dual_approval_evidence; outros tipos podem omitir.
+  approved_by: 'executor@example.com',
+  // hard_limit + lockdown_trigger OBRIGAM dual_approval_evidence STRUCTURED;
+  // outros kinds podem omitir. Post review #93: o shape antigo
+  // `{ second_approver: ... }` NAO funciona mais — rejeitado com
+  // reason='invalid_dual_approval_evidence'.
   dual_approval_evidence: {
-    second_approver: 'risk_officer@example.com',
-    ticket_id: 'INC-1234',
+    approvers: ['owner@example.com', 'compliance@example.com'],
+    approved_at: [now, now],
+    context: { ticket_id: 'INC-1234' }, // opcional
   },
 });
 
 if (!result.ok) {
-  // reason: 'not_found' | 'invalid_transition' | 'already_has_active' | 'hard_limit_requires_dual_approval'
+  // reason: 'not_found' | 'invalid_transition' | 'already_has_active'
+  //       | 'hard_limit_requires_dual_approval'
+  //       | 'invalid_dual_approval_evidence'  // NEW post review #93
   console.error(`activate failed: ${result.reason}`);
 } else {
   console.log(`active v${result.updated.version}`);
 }
 ```
+
+**Regras de dual_approval_evidence (post review #93):**
+
+- `approvers`: array com >= 2 IDs distintos, todos non-empty.
+- `approved_at`: array paralelo de ISO-8601 timestamps (1 por approver).
+- `approved_by` (executor) NAO pode ser um dos `approvers` (separation of duties).
+- Aplica-se a `rule_kind = 'hard_limit'` E `'lockdown_trigger'`. O kill-switch global agora tem a mesma defesa.
+- Helper exportado: `isValidDualApprovalEvidence(ev): ev is DualApprovalEvidence`.
 
 **Importante:** apenas 1 active simultaneo por `(tenant, agent_or_wide, descriptor)`. Se ja existe um active, `activate()` retorna `reason='already_has_active'`. Para substituir, deprecate o ativo antes.
 
@@ -191,22 +206,52 @@ npm run db:migrate
 ```bash
 tsx scripts/p8e-seed-policies.ts
 # Usa repo.propose() + repo.activate(). Idempotente via findActiveByDescriptor.
-# dual_approval_evidence={script_bootstrap:true} marca a excecao de seed.
+# Post review #93: o script usa 2 principals sinteticos
+# (seed_owner_bootstrap, seed_compliance_bootstrap), com executor
+# distinto (p8e_seed_executor). O shape antigo
+# `{ script_bootstrap: true }` foi rejeitado pelo novo guard.
 ```
 
 ## Como o resolver funciona
 
-`PolicyDescriptorResolver.resolveDescriptors({tenant_id, agent_id?, descriptors, scope?})` retorna `{resolved: ResolvedPolicy[], unresolved: string[]}`:
+`PolicyDescriptorResolver.resolveDescriptors({tenant_id, agent_id?, descriptors, scope?})` retorna `{resolved: ResolvedPolicy[], unresolved: string[], failures: UnresolvedDescriptor[]}`:
 
 1. Para cada descriptor, tenta cache (`tenant|agent|descriptor|scope` key).
-2. Hit positive → empurra para `resolved`. Hit negative (`'unresolved'`) → empurra para `unresolved`.
+2. Hit positive → empurra para `resolved`. Hit negative (`'unresolved'`) → empurra para `unresolved` + `failures` com `reason='not_found'`.
 3. Miss → bate em `repo.findActiveByDescriptor()`. Precedencia: agent_id-specific antes de tenant-wide.
 4. Aplica `matchesScope(rule.scope, input.scope)`:
    - Rule scope `{}` (vazio) → universal (match any input).
    - Rule scope set → todas as keys de rule.scope precisam casar com input.scope.
-5. Escreve no cache (positive ou `'unresolved'`).
+   - Mismatch → `failures` com `reason='scope_mismatch'`.
+5. Escreve no cache (positive ou `'unresolved'`). **Excecao:** `db_error` NAO e cacheado (transient outage nao deve fixar "no policy" por ttl_ms).
 
-**Invariante:** `resolved.length + unresolved.length === input.descriptors.length`.
+**Invariante:** `resolved.length + unresolved.length === input.descriptors.length === resolved.length + failures.length`.
+
+### Contrato fail-closed (post review #93)
+
+O resolver distingue 4 motivos de falha (`ResolverFailureReason`):
+
+| reason | Quando | Caller MUST block? |
+|---|---|---|
+| `not_found` | Nenhuma row active para o descriptor | NAO (caller decide pelo descriptor) |
+| `scope_mismatch` | Row existe, mas scope nao bate | NAO |
+| `db_error` | Repo lancou exception (DB outage, etc) | **SIM** (RESOLVER_FAILURE_DEFAULT='block') |
+| `tenant_mismatch` | input.tenant_id != active tenant context | **SIM** (programmer error) |
+
+Helper exportado:
+
+```typescript
+import { hasBlockingFailure, RESOLVER_FAILURE_DEFAULT } from '@/control-plane/policy';
+
+const out = await resolver.resolveDescriptors({...});
+if (hasBlockingFailure(out)) {
+  // RESOLVER_FAILURE_DEFAULT === 'block' — caller MUST default to BLOCK.
+  // Nunca auto-allow nesse caminho.
+  return { decision: 'block', reason: 'policy_store_unavailable' };
+}
+```
+
+A constante `RESOLVER_FAILURE_DEFAULT` esta pinada como `'block'` por teste de unidade — qualquer flip dispara falha em CI.
 
 ## Acceptance gates
 
@@ -216,15 +261,18 @@ Antes de mergear qualquer PR que mude `policy_rules` ou o resolver, rode:
 bash scripts/p8e-acceptance-gates.sh
 ```
 
-7 gates obrigatorios:
+10 gates obrigatorios:
 
 1. Migrations 036+037 (UP + DOWN) + DEFAULT 'proposed' + one-active partial unique.
 2. Seed inclui as 5 descriptors esperados + NOT EXISTS idempotency.
 3. vitest passa para todas as 4 policy specs.
-4. Architecture Lock: zero imports de `@/control-plane/policy/` em `src/agent/` ou `src/cognition/`.
+4. Architecture Lock: zero imports de `@/control-plane/policy/` em `src/agent/` ou `src/cognition/`. Tambem enforced como regra ESLint `no-restricted-imports` (`eslint.config.js`).
 5. `FEATURE_POLICY_RESOLVER_V1` registrada + default off.
 6. `rule_body` opacity: sem `PolicyPredicate.evaluate` em P8e.
 7. Os 9 metodos do repo presentes.
+8. (Post review #93) Resolver fail-closed: `RESOLVER_FAILURE_DEFAULT='block'` + `reason='db_error'` + log estruturado.
+9. (Post review #93) Cache invalidation subscriber wired em `src/index.ts` (gated na flag).
+10. (Post review #93) Structured `DualApprovalEvidence` + DB CHECK `policy_rules_active_requires_approval`.
 
 ## Troubleshooting
 
@@ -238,9 +286,14 @@ bash scripts/p8e-acceptance-gates.sh
 
 - Significa que o partial unique index `idx_policy_rules_one_active_uq` blocked o segundo active simultaneo. Deprecate o ativo corrente antes ou rollback o novo.
 
-### `activate` para hard_limit retorna `hard_limit_requires_dual_approval`
+### `activate` para hard_limit retorna `hard_limit_requires_dual_approval` ou `invalid_dual_approval_evidence`
 
-- Passe `dual_approval_evidence: {...}` no `activate()`. Em P8.5 (Admin UI) o evidence vai conter ids dos 2 aprovadores e o request id da approval queue. Em P8e, qualquer object nao-vazio passa (a validacao real chega em P8.5).
+- `hard_limit_requires_dual_approval`: nenhum `dual_approval_evidence` passou. Passe um objeto valido.
+- `invalid_dual_approval_evidence` (post review #93): o shape e invalido. Confira:
+  - `approvers: string[]` com >= 2 ids distintos non-empty
+  - `approved_at: string[]` paralelo, todos ISO-8601 parseaveis
+  - `approved_by` (executor) NAO esta em `approvers` (separation of duties)
+- Mesmo guard aplica a `rule_kind='lockdown_trigger'` (kill-switch global).
 
 ### Cache stale apos `activate` em multi-instancia
 

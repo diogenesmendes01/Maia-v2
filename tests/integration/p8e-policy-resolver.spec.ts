@@ -17,12 +17,16 @@ import { runWithTenantContext } from '@/db/tenant-context.js';
 import {
   PolicyResolverCacheImpl,
   createPolicyDescriptorResolver,
+  handlePolicyLifecycleMessage,
+  isValidDualApprovalEvidence,
+  POLICY_LIFECYCLE_CHANNEL,
   type PolicyRule,
   type PolicyRuleBody,
   type PolicyRuleKind,
   type PolicyRuleScope,
   type PolicyRulesRepo,
   type PolicySourceOfTruth,
+  type PolicyLifecycleEvent,
 } from '@/control-plane/policy/index.js';
 
 type ProposeInput = {
@@ -195,8 +199,18 @@ function makeFakeRepo(
       if (row.status !== 'proposed') {
         return { ok: false, reason: 'invalid_transition' };
       }
-      if (row.rule_kind === 'hard_limit' && !args.dual_approval_evidence) {
-        return { ok: false, reason: 'hard_limit_requires_dual_approval' };
+      const requiresDual =
+        row.rule_kind === 'hard_limit' || row.rule_kind === 'lockdown_trigger';
+      if (requiresDual) {
+        if (!args.dual_approval_evidence) {
+          return { ok: false, reason: 'hard_limit_requires_dual_approval' };
+        }
+        if (!isValidDualApprovalEvidence(args.dual_approval_evidence)) {
+          return { ok: false, reason: 'invalid_dual_approval_evidence' };
+        }
+        if (args.dual_approval_evidence.approvers.includes(args.approved_by)) {
+          return { ok: false, reason: 'invalid_dual_approval_evidence' };
+        }
       }
       const existing = findActive(row.tenant_id, row.agent_id, row.rule_descriptor);
       if (existing) {
@@ -270,8 +284,10 @@ function makeFakeRepo(
 /**
  * Seeds 5 policies as active for the current tenant. Mirrors the SQL
  * migration 037 logic: NOT EXISTS guard via findActiveByDescriptor.
+ * Uses the new structured DualApprovalEvidence (Codex #93).
  */
 async function seedFiveDefaults(repo: PolicyRulesRepo): Promise<number> {
+  const now = new Date().toISOString();
   let created = 0;
   for (const def of SEED_DEFS) {
     const existing = await repo.findActiveByDescriptor({
@@ -282,8 +298,11 @@ async function seedFiveDefaults(repo: PolicyRulesRepo): Promise<number> {
     const proposed = await repo.propose(def);
     const res = await repo.activate({
       id: proposed.id,
-      approved_by: 'p8e_seed',
-      dual_approval_evidence: { script_bootstrap: true },
+      approved_by: 'p8e_seed_executor',
+      dual_approval_evidence: {
+        approvers: ['seed_owner', 'seed_compliance'],
+        approved_at: [now, now],
+      },
     });
     if (res.ok) created++;
   }
@@ -490,5 +509,198 @@ describe('p8e policy resolver — integration', () => {
         expect(stats.hits / total).toBeGreaterThanOrEqual(0.8);
       },
     );
+  });
+
+  // ----- Codex review #93: lifecycle pub/sub → cache invalidation wiring -----
+  describe('cache invalidation pub/sub wiring (Codex #93)', () => {
+    it('handlePolicyLifecycleMessage invalidates the cache for every lifecycle event kind', () => {
+      // This is the "pure handler" used by the Redis subscriber. We
+      // simulate Redis delivering each lifecycle event kind and verify
+      // every one drops the matching cache entry. Catches regressions
+      // where one new event kind ships without being wired up.
+      const cache = new PolicyResolverCacheImpl({ ttl_ms: 60_000, max_entries: 100 });
+      const make = (descriptor: string) => ({
+        descriptor,
+        policy_id: `pol-${descriptor}`,
+        version: 1,
+        rule_kind: 'soft_guidance' as const,
+      });
+
+      const eventKinds: PolicyLifecycleEvent['event'][] = [
+        'policy_rule_activated',
+        'policy_rule_deprecated',
+        'policy_rule_rolled_back',
+      ];
+      for (const eventKind of eventKinds) {
+        const desc = `lifecycle_${eventKind}`;
+        cache.set(
+          {
+            tenant_id: 'default',
+            agent_id: 'agent-x',
+            descriptor: desc,
+            scope: {},
+          },
+          make(desc),
+        );
+        expect(
+          cache.get({
+            tenant_id: 'default',
+            agent_id: 'agent-x',
+            descriptor: desc,
+            scope: {},
+          }),
+        ).toBeDefined();
+
+        const evt: PolicyLifecycleEvent = {
+          event: eventKind,
+          tenant_id: 'default',
+          agent_id: 'agent-x',
+          descriptor: desc,
+        };
+        handlePolicyLifecycleMessage(
+          POLICY_LIFECYCLE_CHANNEL,
+          JSON.stringify(evt),
+          cache,
+        );
+        expect(
+          cache.get({
+            tenant_id: 'default',
+            agent_id: 'agent-x',
+            descriptor: desc,
+            scope: {},
+          }),
+        ).toBeUndefined();
+      }
+    });
+
+    it('handlePolicyLifecycleMessage with agent_id=null invalidates ALL agent-cached entries for the (tenant, descriptor)', () => {
+      const cache = new PolicyResolverCacheImpl({ ttl_ms: 60_000, max_entries: 100 });
+      const make = (d: string) => ({
+        descriptor: d,
+        policy_id: `pol-${d}`,
+        version: 1,
+        rule_kind: 'soft_guidance' as const,
+      });
+      for (const a of [null, 'agent-x', 'agent-y']) {
+        cache.set(
+          {
+            tenant_id: 'default',
+            agent_id: a,
+            descriptor: 'wide_event',
+            scope: {},
+          },
+          make('wide_event'),
+        );
+      }
+      const evt: PolicyLifecycleEvent = {
+        event: 'policy_rule_deprecated',
+        tenant_id: 'default',
+        agent_id: null,
+        descriptor: 'wide_event',
+      };
+      handlePolicyLifecycleMessage(
+        POLICY_LIFECYCLE_CHANNEL,
+        JSON.stringify(evt),
+        cache,
+      );
+      // All 3 must be gone.
+      for (const a of [null, 'agent-x', 'agent-y']) {
+        expect(
+          cache.get({
+            tenant_id: 'default',
+            agent_id: a,
+            descriptor: 'wide_event',
+            scope: {},
+          }),
+        ).toBeUndefined();
+      }
+    });
+
+    it('handlePolicyLifecycleMessage ignores messages on other channels', () => {
+      const cache = new PolicyResolverCacheImpl({ ttl_ms: 60_000, max_entries: 100 });
+      cache.set(
+        { tenant_id: 't', agent_id: null, descriptor: 'd', scope: {} },
+        {
+          descriptor: 'd',
+          policy_id: 'p',
+          version: 1,
+          rule_kind: 'soft_guidance',
+        },
+      );
+      handlePolicyLifecycleMessage(
+        'unrelated_channel',
+        JSON.stringify({
+          event: 'policy_rule_activated',
+          tenant_id: 't',
+          agent_id: null,
+          descriptor: 'd',
+        }),
+        cache,
+      );
+      // Untouched.
+      expect(
+        cache.get({ tenant_id: 't', agent_id: null, descriptor: 'd', scope: {} }),
+      ).toBeDefined();
+    });
+
+    it('handlePolicyLifecycleMessage swallows malformed JSON without throwing', () => {
+      const cache = new PolicyResolverCacheImpl({ ttl_ms: 60_000, max_entries: 100 });
+      expect(() => {
+        handlePolicyLifecycleMessage(
+          POLICY_LIFECYCLE_CHANNEL,
+          'not-json',
+          cache,
+        );
+      }).not.toThrow();
+    });
+
+    it('end-to-end: repo.deprecate publishes → handler invalidates → resolver returns unresolved (with fail-closed contract)', async () => {
+      // Wires the repo's invalidate callback to handlePolicyLifecycleMessage
+      // via the synthesized JSON event payload — proving the Redis-side
+      // path is equivalent to the in-process callback.
+      const cache = new PolicyResolverCacheImpl({ ttl_ms: 60_000, max_entries: 100 });
+      const repo = makeFakeRepo((k) => {
+        const evt: PolicyLifecycleEvent = {
+          event: 'policy_rule_deprecated',
+          ...k,
+        };
+        handlePolicyLifecycleMessage(
+          POLICY_LIFECYCLE_CHANNEL,
+          JSON.stringify(evt),
+          cache,
+        );
+      });
+      const resolver = createPolicyDescriptorResolver(repo, cache);
+      await runWithTenantContext(
+        { tenant_id: 'default', agent_id: 'default' },
+        async () => {
+          const p = await repo.propose({
+            rule_kind: 'soft_guidance',
+            rule_descriptor: 'pubsub_e2e',
+            rule_body: {},
+            source_of_truth: 'tenant_culture',
+            proposed_by: 'op',
+          });
+          await repo.activate({ id: p.id, approved_by: 'op' });
+
+          const before = await resolver.resolveDescriptors({
+            tenant_id: 'default',
+            descriptors: ['pubsub_e2e'],
+          });
+          expect(before.resolved).toHaveLength(1);
+
+          await repo.deprecate({ id: p.id, deprecated_by: 'op' });
+
+          const after = await resolver.resolveDescriptors({
+            tenant_id: 'default',
+            descriptors: ['pubsub_e2e'],
+          });
+          expect(after.resolved).toHaveLength(0);
+          expect(after.failures).toEqual([
+            { descriptor: 'pubsub_e2e', reason: 'not_found' },
+          ]);
+        },
+      );
+    });
   });
 });

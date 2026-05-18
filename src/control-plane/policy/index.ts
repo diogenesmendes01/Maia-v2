@@ -17,22 +17,29 @@ export type {
   ResolvedPolicy,
   PolicyLifecycleEvent,
   PolicyLifecycleEventName,
+  UnresolvedDescriptor,
+  ResolverFailureReason,
+  ResolverFailureDefault,
 } from './types.js';
 export {
   PolicyRuleKind as PolicyRuleKindValues,
   PolicyRuleStatus as PolicyRuleStatusValues,
   PolicySourceOfTruth as PolicySourceOfTruthValues,
+  RESOLVER_FAILURE_DEFAULT,
 } from './types.js';
 export {
   policyRulesRepo,
   POLICY_LIFECYCLE_CHANNEL,
+  isValidDualApprovalEvidence,
   type PolicyRulesRepo,
+  type DualApprovalEvidence,
 } from './policy-rules-repo.js';
 export {
   policyResolverCache,
   PolicyResolverCacheImpl,
   cacheKeyHash,
   startPolicyCacheInvalidationSubscriber,
+  handlePolicyLifecycleMessage,
   type PolicyResolverCache,
   type CacheKey,
   type CacheValue,
@@ -43,5 +50,6 @@ export {
   PolicyDescriptorResolverImpl,
   createPolicyDescriptorResolver,
   matchesScope,
+  hasBlockingFailure,
   type PolicyDescriptorResolver,
 } from './policy-descriptor-resolver.js';
