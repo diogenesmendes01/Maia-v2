@@ -112,17 +112,15 @@ export async function processSoulBiasProposalApproval(args: {
 
 /**
  * Procura bias existente para este proposal_id (idempotência).
- * Usa listProposed + listVersions — não há método by-proposal-id no repo
- * ainda; em prod adicionar `findByProposalId` é trivial.
+ *
+ * Usa `soulBiasesRepo.findByProposalId` que busca em TODOS os statuses via
+ * índice em `soul_biases.proposal_id`. Tratar qualquer materialização
+ * existente (inclusive rolled_back / deprecated) como terminal — um replay
+ * de proposal aprovada NUNCA recria uma bias que já existiu com este
+ * proposal_id para evitar ressurreição de biaS rolled_back.
  */
 async function findExistingBiasForProposal(
   proposal_id: string,
 ): Promise<{ id: string } | null> {
-  // Busca em proposed + active (já materializadas).
-  // Em P8b a busca varre as duas listas; performance OK para inboxes
-  // pequenas, otimizar via index em soul_biases.proposal_id se necessário.
-  const proposed = await soulBiasesRepo.listProposed({ limit: 100 });
-  const active = await soulBiasesRepo.findActiveForScope({ limit: 100 });
-  const all = [...proposed, ...active];
-  return all.find((b) => b.proposal_id === proposal_id) ?? null;
+  return soulBiasesRepo.findByProposalId(proposal_id);
 }

@@ -206,8 +206,31 @@ vi.mock('@/control-plane/soul/soul-biases-repo.js', async () => {
         return { ok: true as const, bias: updated };
       }),
 
+      findByProposalId: vi.fn(async (proposal_id: string) => {
+        const { tenant_id, agent_id } = await ctxRequire();
+        return (
+          Object.values(biasState).find(
+            (r) =>
+              r.tenant_id === tenant_id &&
+              r.agent_id === agent_id &&
+              r.proposal_id === proposal_id,
+          ) ?? null
+        );
+      }),
+
       deprecate: vi.fn(async () => ({ ok: true as const })),
-      rollback: vi.fn(async () => ({ ok: true as const })),
+      rollback: vi.fn(async (args: { id: string; rollback_reason: string; rolled_back_by: string }) => {
+        const { tenant_id, agent_id } = await ctxRequire();
+        const row = biasState[args.id];
+        if (!row || row.tenant_id !== tenant_id || row.agent_id !== agent_id) {
+          return { ok: false as const, reason: 'bias_not_found' as const };
+        }
+        if (row.status === 'rolled_back') {
+          return { ok: false as const, reason: 'already_rolled_back' as const };
+        }
+        biasState[args.id] = { ...row, status: 'rolled_back', rolled_back_at: new Date() };
+        return { ok: true as const, bias: biasState[args.id]! };
+      }),
     },
   };
 });
@@ -390,6 +413,125 @@ describe('P8b Soul Layer Integration — 6 scenarios', () => {
         // ensures the chain compiles together.
         expect(ev!.payload).toHaveProperty('violations');
         expect(ev!.payload).toHaveProperty('severity_hint');
+      },
+    );
+  });
+
+  // ============================================================
+  // Round-2 review scenarios
+  // ============================================================
+
+  it('round-2 scope leak: role-scoped bias NÃO aparece no slice para role diferente', async () => {
+    await runWithTenantContext(
+      { tenant_id: 'default', agent_id: 'default' },
+      async () => {
+        // Insert role-scoped bias for role='finance_advisor'
+        const { soulBiasesRepo } = await import('@/control-plane/soul/soul-biases-repo.js');
+        const b = await soulBiasesRepo.propose({
+          scope: 'role',
+          scope_value: 'finance_advisor',
+          principle: 'role_scoped_only',
+          guidance: 'Esta bias vale apenas para finance_advisor.',
+          origin: 'founder_explicit',
+          strength: 0.9,
+          activation_context: {},  // empty activation_context: must still be scope-gated
+          proposed_by: 'founder',
+        });
+        await soulBiasesRepo.activate({ id: b.id, approved_by: 'founder' });
+
+        const { buildSoulSlice } = await import(
+          '@/runtime/context-assembly/slice-builders/soul-slice-builder.js'
+        );
+
+        // current_role='support' — bias must NOT appear
+        const sliceOtherRole = await buildSoulSlice({
+          tenant_id: 'default',
+          agent_id: 'default',
+          depth: 'relevant',
+          max_biases: 10,
+          current_role: 'support',
+        });
+        expect(sliceOtherRole.active_biases.map((x) => x.principle)).not.toContain('role_scoped_only');
+
+        // no current_role at all — bias must NOT appear
+        const sliceNoRole = await buildSoulSlice({
+          tenant_id: 'default',
+          agent_id: 'default',
+          depth: 'relevant',
+          max_biases: 10,
+        });
+        expect(sliceNoRole.active_biases.map((x) => x.principle)).not.toContain('role_scoped_only');
+
+        // correct role — bias MUST appear
+        const sliceCorrectRole = await buildSoulSlice({
+          tenant_id: 'default',
+          agent_id: 'default',
+          depth: 'relevant',
+          max_biases: 10,
+          current_role: 'finance_advisor',
+        });
+        expect(sliceCorrectRole.active_biases.map((x) => x.principle)).toContain('role_scoped_only');
+      },
+    );
+  });
+
+  it('round-2 replay: propose → approve → materialize → rollback; replay NÃO recria bias', async () => {
+    await runWithTenantContext(
+      { tenant_id: 'default', agent_id: 'default' },
+      async () => {
+        const { processSoulBiasProposalApproval } = await import(
+          '@/workers/soul-bias-activator.js'
+        );
+
+        // First materialization
+        const r1 = await processSoulBiasProposalApproval({
+          proposal_id: 'prop-replay-test',
+          spec: {
+            scope: 'tenant',
+            scope_value: '*',
+            principle: 'replay_test_bias',
+            guidance: 'Guidance for replay test bias.',
+            suggested_strength: 0.75,
+            suggested_activation_context: {},
+            suggested_origin: 'human_approved',
+          },
+          decided_by: 'admin@maia',
+        });
+        expect(r1.ok).toBe(true);
+        if (r1.ok) expect(r1.action).toBe('created_and_activated');
+
+        // Rollback the bias
+        const { soulBiasesRepo } = await import('@/control-plane/soul/soul-biases-repo.js');
+        const bias_id = r1.ok ? r1.bias_id : '';
+        const rollbackResult = await soulBiasesRepo.rollback({
+          id: bias_id,
+          rollback_reason: 'test rollback',
+          rolled_back_by: 'admin@maia',
+        });
+        expect(rollbackResult.ok).toBe(true);
+
+        // Replay same proposal — must NOT create a new active row
+        const r2 = await processSoulBiasProposalApproval({
+          proposal_id: 'prop-replay-test',
+          spec: {
+            scope: 'tenant',
+            scope_value: '*',
+            principle: 'replay_test_bias',
+            guidance: 'Guidance for replay test bias.',
+            suggested_strength: 0.75,
+            suggested_activation_context: {},
+            suggested_origin: 'human_approved',
+          },
+          decided_by: 'admin@maia',
+        });
+        // Must be treated as already_materialized (rolled_back found by findByProposalId)
+        expect(r2.ok).toBe(true);
+        if (r2.ok) expect(r2.action).toBe('already_materialized');
+
+        // Verify no second active row was created
+        const active = await soulBiasesRepo.findActiveForScope({ limit: 20 });
+        const forProposal = active.filter((b) => b.proposal_id === 'prop-replay-test');
+        expect(forProposal).toHaveLength(0);
       },
     );
   });

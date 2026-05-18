@@ -312,6 +312,94 @@ describe('buildSoulSlice (P8b)', () => {
     expect(slice.rendered_block).toBeNull();
   });
 
+  it('scope=role com activation_context={} NÃO vaza para role diferente', async () => {
+    // role-scoped bias with EMPTY activation_context (no role_in filter)
+    // Must still be rejected when current_role doesn't match scope_value
+    mockBiases = [
+      makeBias({
+        scope: 'role',
+        scope_value: 'finance_advisor',
+        principle: 'role_scoped_no_ctx',
+        activation_context: {},  // empty — scope enforcement must still block
+      }),
+    ];
+    const { buildSoulSlice } = await import(
+      '@/runtime/context-assembly/slice-builders/soul-slice-builder.js'
+    );
+
+    // wrong role — must NOT include bias
+    const sliceWrong = await buildSoulSlice({
+      tenant_id: 'default',
+      agent_id: 'default',
+      depth: 'relevant',
+      max_biases: 5,
+      current_role: 'support',
+    });
+    expect(sliceWrong.active_biases.map((b) => b.principle)).not.toContain('role_scoped_no_ctx');
+
+    // no role — must NOT include bias
+    const sliceNoRole = await buildSoulSlice({
+      tenant_id: 'default',
+      agent_id: 'default',
+      depth: 'relevant',
+      max_biases: 5,
+    });
+    expect(sliceNoRole.active_biases.map((b) => b.principle)).not.toContain('role_scoped_no_ctx');
+
+    // correct role — MUST include bias
+    const sliceMatch = await buildSoulSlice({
+      tenant_id: 'default',
+      agent_id: 'default',
+      depth: 'relevant',
+      max_biases: 5,
+      current_role: 'finance_advisor',
+    });
+    expect(sliceMatch.active_biases.map((b) => b.principle)).toContain('role_scoped_no_ctx');
+  });
+
+  it('scope=domain com activation_context={} NÃO vaza para domínio diferente', async () => {
+    mockBiases = [
+      makeBias({
+        scope: 'domain',
+        scope_value: 'condolencia',
+        principle: 'domain_scoped_no_ctx',
+        activation_context: {},  // empty — scope enforcement must still block
+      }),
+    ];
+    const { buildSoulSlice } = await import(
+      '@/runtime/context-assembly/slice-builders/soul-slice-builder.js'
+    );
+
+    // wrong domain — must NOT include bias
+    const sliceWrong = await buildSoulSlice({
+      tenant_id: 'default',
+      agent_id: 'default',
+      depth: 'relevant',
+      max_biases: 5,
+      current_domain: 'finance',
+    });
+    expect(sliceWrong.active_biases.map((b) => b.principle)).not.toContain('domain_scoped_no_ctx');
+
+    // no domain — must NOT include bias
+    const sliceNoDomain = await buildSoulSlice({
+      tenant_id: 'default',
+      agent_id: 'default',
+      depth: 'relevant',
+      max_biases: 5,
+    });
+    expect(sliceNoDomain.active_biases.map((b) => b.principle)).not.toContain('domain_scoped_no_ctx');
+
+    // correct domain — MUST include bias
+    const sliceMatch = await buildSoulSlice({
+      tenant_id: 'default',
+      agent_id: 'default',
+      depth: 'relevant',
+      max_biases: 5,
+      current_domain: 'condolencia',
+    });
+    expect(sliceMatch.active_biases.map((b) => b.principle)).toContain('domain_scoped_no_ctx');
+  });
+
   it('cache_key é estável para os mesmos args', async () => {
     mockBiases = [makeBias({ principle: 'p1' })];
     const { buildSoulSlice } = await import(

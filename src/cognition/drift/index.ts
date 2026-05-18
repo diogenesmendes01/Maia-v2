@@ -22,8 +22,10 @@ import { linguagemDetector } from './linguagem.js';
 import { procedimentoDetector } from './procedimento.js';
 import { soulDriftDetector } from './soul.js';
 import type { DriftDetector, DriftDetectionInput, DriftEvidence } from './types.js';
+import { featureFlags } from '@/config/feature-flags.js';
+import { FeatureFlagName } from '@/types/enums.js';
 
-const DETECTORS: DriftDetector[] = [
+const BASE_DETECTORS: DriftDetector[] = [
   tomDetector,
   valoresDetector,
   confiancaDetector,
@@ -31,16 +33,30 @@ const DETECTORS: DriftDetector[] = [
   escopoDetector,
   linguagemDetector,
   procedimentoDetector,
-  // P8b: 8º detector. Severidade NUNCA promove rollback de profile
-  // (decision-engine mapeia soul_drift → queued_human no máximo).
-  soulDriftDetector,
 ];
+
+/**
+ * Builds the active detector list. The soul drift detector is conditionally
+ * appended only when FEATURE_SOUL_LAYER_V1 is enabled — this is the runtime
+ * kill switch that prevents ANY soul-layer DB/LLM work when the flag is off.
+ *
+ * NOTE: evaluated at call time (not module load time) so runtime override()
+ * and killSwitch() calls in tests take effect without re-importing the module.
+ */
+function buildDetectors(): DriftDetector[] {
+  if (featureFlags.isEnabled(FeatureFlagName.FEATURE_SOUL_LAYER_V1)) {
+    // P8b: 8º detector. Severidade NUNCA promove rollback de profile
+    // (decision-engine mapeia soul_drift → queued_human no máximo).
+    return [...BASE_DETECTORS, soulDriftDetector];
+  }
+  return BASE_DETECTORS;
+}
 
 export async function runAllDriftDetectors(
   input: DriftDetectionInput,
 ): Promise<DriftEvidence[]> {
   const results = await Promise.all(
-    DETECTORS.map((d) =>
+    buildDetectors().map((d) =>
       runCognitiveModule<DriftEvidence | null>(
         {
           name: `drift_detector_${d.type}`,

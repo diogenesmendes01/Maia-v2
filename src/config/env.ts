@@ -154,6 +154,13 @@ const envSchema = z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
+    // P8b — Soul Layer (biases comportamentais persistentes que modulam, nunca bloqueiam).
+    // Kill switch: set FEATURE_SOUL_LAYER_V1=false para desativar todo o soul pipeline
+    // (detector de drift, slice injection, activator worker) sem alterar DB.
+    FEATURE_SOUL_LAYER_V1: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
     /** Baseline pré-P7 em ms para p95 do sync path. Se ausente, gate skipa. */
     SYNC_LATENCY_P95_BASELINE_MS: z.coerce.number().int().positive().optional(),
     /** Percentual extra permitido sobre baseline (default 20). */

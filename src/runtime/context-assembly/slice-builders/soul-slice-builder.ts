@@ -81,7 +81,15 @@ function emptySlice(args: BuildSoulSliceArgs): SoulSlice {
 /**
  * Avalia se a bias deve ativar dado o contexto do turno.
  *
- * Regras (todas devem passar quando o filtro está presente):
+ * STEP 1 — Scope check (aplicado ANTES de activation_context):
+ *  - 'tenant'  → sempre passa (filtro só por tenant_id, já feito no repo)
+ *  - 'agent'   → args.agent_id deve estar presente (repo já filtrou por agent_id)
+ *  - 'role'    → args.current_role deve existir e bater com bias.scope_value
+ *  - 'domain'  → args.current_domain deve existir e bater com bias.scope_value
+ *
+ * Se o contexto necessário para o scope estiver ausente → bias NÃO ativa.
+ *
+ * STEP 2 — Activation context rules (quando escopo passa):
  *  - intent_in    : current_intent ∈ intent_in
  *  - role_in      : current_role ∈ role_in
  *  - domain_in    : current_domain ∈ domain_in
@@ -93,6 +101,28 @@ function emptySlice(args: BuildSoulSliceArgs): SoulSlice {
  * Quando o filtro está ausente, qualquer contexto passa.
  */
 function matchesActivationContext(bias: SoulBias, args: BuildSoulSliceArgs): boolean {
+  // STEP 1 — Scope enforcement (before activation_context)
+  const scope = bias.scope as SoulScope;
+  if (scope === 'role') {
+    // role-scoped bias: current_role must match scope_value exactly
+    if (!args.current_role || args.current_role !== bias.scope_value) {
+      return false;
+    }
+  } else if (scope === 'domain') {
+    // domain-scoped bias: current_domain must match scope_value exactly
+    if (!args.current_domain || args.current_domain !== bias.scope_value) {
+      return false;
+    }
+  } else if (scope === 'agent') {
+    // agent-scoped bias: agent_id must be present (already filtered by repo,
+    // but guard against missing context)
+    if (!args.agent_id) {
+      return false;
+    }
+  }
+  // 'tenant' scope: no additional context requirement — passes scope check
+
+  // STEP 2 — Activation context checks
   const ctx = (bias.activation_context ?? {}) as ActivationContext;
 
   if (ctx.intent_in && ctx.intent_in.length > 0) {

@@ -56,6 +56,7 @@ CREATE TABLE soul_biases (
   approved_by  TEXT,
   approved_at  TIMESTAMPTZ,
   activated_at TIMESTAMPTZ,
+  frozen_at    TIMESTAMPTZ,
   deprecated_at TIMESTAMPTZ,
   deprecated_reason TEXT,
   rolled_back_at TIMESTAMPTZ,

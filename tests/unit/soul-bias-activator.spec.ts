@@ -24,6 +24,7 @@ let proposeMock: ReturnType<typeof vi.fn> = vi.fn();
 let activateMock: ReturnType<typeof vi.fn> = vi.fn();
 let listProposedMock: ReturnType<typeof vi.fn> = vi.fn();
 let findActiveForScopeMock: ReturnType<typeof vi.fn> = vi.fn();
+let findByProposalIdMock: ReturnType<typeof vi.fn> = vi.fn();
 
 vi.mock('@/control-plane/soul/soul-biases-repo.js', () => ({
   soulBiasesRepo: {
@@ -38,6 +39,9 @@ vi.mock('@/control-plane/soul/soul-biases-repo.js', () => ({
     },
     get findActiveForScope() {
       return findActiveForScopeMock;
+    },
+    get findByProposalId() {
+      return findByProposalIdMock;
     },
   },
 }));
@@ -67,6 +71,10 @@ beforeEach(() => {
 
   listProposedMock = vi.fn(async () => Object.values(biasState).filter((b) => b.status === 'proposed'));
   findActiveForScopeMock = vi.fn(async () => Object.values(biasState).filter((b) => b.status === 'active'));
+  // findByProposalId searches ALL statuses — this is what makes replay-safety work.
+  findByProposalIdMock = vi.fn(async (proposal_id: string) =>
+    Object.values(biasState).find((b) => b.proposal_id === proposal_id) ?? null
+  );
 
   proposeMock = vi.fn(async (input: { proposal_id?: string; principle: string }) => {
     const id = `bias-${Math.random().toString(36).slice(2, 8)}`;
@@ -147,6 +155,35 @@ describe('processSoulBiasProposalApproval (P8b worker)', () => {
     });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toMatch(/propose_failed/);
+  });
+
+  it('replay após rollback: findByProposalId encontra rolled_back → retorna already_materialized sem criar nova bias', async () => {
+    // Seed uma bias rolled_back com proposal_id='prop-rb'
+    biasState['rb-bias'] = {
+      id: 'rb-bias',
+      status: 'rolled_back',
+      proposal_id: 'prop-rb',
+      scope: 'tenant',
+      scope_value: '*',
+      principle: 'p_rb',
+      guidance: 'g',
+      origin: 'human_approved',
+      strength: '0.800',
+    };
+
+    const { processSoulBiasProposalApproval } = await import('@/workers/soul-bias-activator.js');
+    const r = await processSoulBiasProposalApproval({
+      proposal_id: 'prop-rb',
+      spec: defaultSpec(),
+      decided_by: 'admin@maia',
+    });
+    // Must short-circuit at already_materialized (rolled_back counts as terminal)
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.action).toBe('already_materialized');
+    expect(proposeMock).not.toHaveBeenCalled();
+    expect(activateMock).not.toHaveBeenCalled();
+    // Only one bias should exist (no new one created)
+    expect(Object.keys(biasState)).toHaveLength(1);
   });
 
   it('falha de activate surfaceia o reason do repo', async () => {

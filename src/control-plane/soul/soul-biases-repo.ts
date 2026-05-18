@@ -304,6 +304,32 @@ export const soulBiasesRepo = {
     }
   },
 
+  /**
+   * Busca bias por proposal_id em TODOS os statuses (proposed, active,
+   * deprecated, rolled_back). Usado pela idempotência do activator para
+   * tratar qualquer materialização existente como terminal — evita que um
+   * replay recrie bias rolled_back.
+   *
+   * Tenant-isolated: filtra por tenant_id + agent_id do contexto atual.
+   * Retorna null se não encontrado.
+   */
+  async findByProposalId(proposal_id: string): Promise<SoulBias | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(soul_biases)
+      .where(
+        and(
+          eq(soul_biases.proposal_id, proposal_id),
+          eq(soul_biases.tenant_id, tenant_id),
+          eq(soul_biases.agent_id, agent_id),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
   /** Active → deprecated. Não toca lineage. */
   async deprecate(args: {
     id: string;
