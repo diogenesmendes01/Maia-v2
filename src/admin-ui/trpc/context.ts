@@ -1,5 +1,11 @@
 /**
  * P8.5 — tRPC context. Builds per-request session + tenant assertion + repos.
+ *
+ * Post-Codex-review #101: every tRPC procedure consumes `ctx.tenantId` derived
+ * exclusively from the authenticated NextAuth session. There is no path by
+ * which a request body can override the session tenant — see also
+ * src/admin-ui/trpc/tenant-resolver.ts (which permits founder-cross-tenant
+ * only).
  */
 import { getServerSession } from 'next-auth';
 import { TRPCError } from '@trpc/server';

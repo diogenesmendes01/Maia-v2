@@ -70,6 +70,7 @@ import type {
 import { TypedError } from '@/lib/utils.js';
 import { applyTenantGuard } from './tenant-guard.js';
 import { getCurrentTenant, getCurrentAgent } from './tenant-context.js';
+import { deriveCapabilityRisk, deriveCapabilityLocks } from './capability-risk.js';
 import type {
   ProfileStatus,
   DriftType,
@@ -3780,11 +3781,14 @@ export const proposalsUnifiedRepo = {
         .orderBy(desc(capability_proposals.created_at))
         .limit(input.limit + 1);
       for (const r of rows) {
+        // Post-Codex-review #101: risk is DERIVED from capability_type +
+        // proposed_spec markers; never hardcoded. Fail-closed default is
+        // 'critical' (forces dual approval). See ./capability-risk.ts.
         items.push({
           id: r.id,
           type: 'capability_proposal',
           descriptor: r.title,
-          risk: 'medium',
+          risk: deriveCapabilityRisk(r.capability_type, r.proposed_spec),
           source: r.capability_type,
           status,
           proposed_at: r.created_at,
@@ -3867,21 +3871,201 @@ export const proposalsUnifiedRepo = {
           rejected: 'rejected',
           delivered: 'activated',
         };
+        // Post-Codex-review #101: risk + locks DERIVED from spec, not hardcoded.
         return {
           id: r.id,
           type: 'capability_proposal',
           descriptor: r.title,
-          risk: 'medium',
+          risk: deriveCapabilityRisk(r.capability_type, r.proposed_spec),
           source: r.capability_type,
           status: reverseStatusMap[r.status] ?? 'proposed',
           proposed_at: r.created_at,
           proposed_by: r.decided_by ?? 'system',
           body: r.proposed_spec,
-          locks: [],
+          locks: deriveCapabilityLocks(r.capability_type, r.proposed_spec),
         };
       }
     }
     return null;
+  },
+
+  /**
+   * decideAtomically — single-transaction approve/reject for a unified proposal.
+   *
+   * Post-Codex-review #101: the old approve/reject path inserted into
+   * proposal_approvals + admin_audit_log but never touched the source-of-truth
+   * row. A capability_proposal could stay in status='submitted' forever while
+   * the admin UI reported "activated". This method closes that gap.
+   *
+   * Behavior per source:
+   *   capability_proposals:
+   *     - On approve gate satisfied (dual or single): submitted → approved
+   *       (capabilityProposalsRepo.transition). Subsequent activation
+   *       (approved → testing → delivered) is owned by the capability-test-runner.
+   *     - On reject: submitted → rejected.
+   *
+   *   policy_rules / soul_biases / skills / knowledge_pending_review:
+   *     - Transitions deferred to the source repo once each schema lands.
+   *       Returns { ok: false, reason: 'source_not_supported' } until then —
+   *       NEVER silently succeeds.
+   *
+   * Pre-conditions enforced inside the transaction:
+   *   - Source row exists for (tenantId, id)
+   *   - Source status is currently in a valid pre-decision state for the
+   *     attempted transition (rejects double-approval, double-reject, race
+   *     between two operators).
+   *
+   * The approver_user_id + role check + dual-approval invariant lives at the
+   * tRPC procedure layer (proposalsRouter.approve); this method assumes the
+   * caller has already enforced the approval gate.
+   */
+  async decideAtomically(input: {
+    tenantId: string;
+    proposalId: string;
+    type: ProposalTypeId;
+    approvalClass: string;
+    actorId: string;
+    actorRole: string;
+    decision: 'approved' | 'rejected';
+    comment: string;
+    /** True ⇒ the gate is satisfied; perform the source transition. */
+    dualComplete: boolean;
+  }): Promise<{
+    ok: true;
+    sourceTransitioned: boolean;
+    approval: ProposalApproval;
+    finalStatus: ProposalUnifiedStatus;
+  } | {
+    ok: false;
+    reason:
+      | 'not_found'
+      | 'invalid_source_status'
+      | 'source_not_supported'
+      | 'transition_failed';
+  }> {
+    const available = await this._availableTables();
+
+    return await withTx(async (tx) => {
+      // (1) Re-read source under the txn lock to prevent races.
+      if (input.type === 'capability_proposal') {
+        if (!available.includes('capability_proposals')) {
+          return { ok: false, reason: 'source_not_supported' as const };
+        }
+        const rows = await tx
+          .select()
+          .from(capability_proposals)
+          .where(
+            and(
+              eq(capability_proposals.tenant_id, input.tenantId),
+              eq(capability_proposals.id, input.proposalId),
+            ),
+          )
+          .for('update')
+          .limit(1);
+        const sourceRow = rows[0];
+        if (!sourceRow) return { ok: false, reason: 'not_found' as const };
+
+        // Only 'submitted' rows are eligible for approve/reject. 'draft' would
+        // need explicit submit first; terminal states block.
+        if (sourceRow.status !== 'submitted') {
+          return { ok: false, reason: 'invalid_source_status' as const };
+        }
+
+        // (2) Insert approval row.
+        const insertedApprovals = await tx
+          .insert(proposal_approvals)
+          .values({
+            tenant_id: input.tenantId,
+            proposal_id: input.proposalId,
+            approval_class: input.approvalClass,
+            approver_user_id: input.actorId,
+            approver_role: input.actorRole,
+            decision: input.decision,
+            comment: input.comment,
+          })
+          .returning();
+        const approval = insertedApprovals[0];
+        if (!approval) {
+          throw new TypedError('approval_insert_failed', 'Could not record approval');
+        }
+
+        // (3) Audit BEFORE source mutation, so the audit row is visible
+        // even if the source UPDATE rolls back.
+        await tx.insert(admin_audit_log).values({
+          tenant_id: input.tenantId,
+          actor_id: input.actorId,
+          actor_role: input.actorRole,
+          action: input.decision === 'approved' ? 'proposal_approve' : 'proposal_reject',
+          resource_type: 'capability_proposal',
+          resource_id: input.proposalId,
+          change_summary: {
+            approval_class: input.approvalClass,
+            comment: input.comment,
+            dual_complete: input.dualComplete,
+            source_transition_attempted:
+              input.decision === 'rejected' || input.dualComplete,
+          },
+        });
+
+        // (4) Mutate source-of-truth.
+        let finalStatus: ProposalUnifiedStatus = 'pending_review';
+        let sourceTransitioned = false;
+        if (input.decision === 'rejected') {
+          // Direct UPDATE inside the same txn so we don't depend on
+          // capabilityProposalsRepo.transition (which uses module-level `db`).
+          const patched = await tx
+            .update(capability_proposals)
+            .set({
+              status: 'rejected',
+              decided_at: new Date(),
+              decided_by: input.actorId,
+              decision_reason: input.comment,
+              updated_at: new Date(),
+            })
+            .where(eq(capability_proposals.id, input.proposalId))
+            .returning();
+          if (patched.length === 0) {
+            return { ok: false, reason: 'transition_failed' as const };
+          }
+          finalStatus = 'rejected';
+          sourceTransitioned = true;
+        } else if (input.dualComplete) {
+          // submitted → approved. (approved → testing → delivered is owned by
+          // capability-test-runner and runs out-of-band.)
+          const patched = await tx
+            .update(capability_proposals)
+            .set({
+              status: 'approved',
+              decided_at: new Date(),
+              decided_by: input.actorId,
+              decision_reason: input.comment,
+              updated_at: new Date(),
+            })
+            .where(eq(capability_proposals.id, input.proposalId))
+            .returning();
+          if (patched.length === 0) {
+            return { ok: false, reason: 'transition_failed' as const };
+          }
+          // Admin-ui surface name: 'pending_review' once approved but not yet
+          // delivered. The reverseStatusMap in getOne also maps 'approved' →
+          // 'pending_review' for consistency.
+          finalStatus = 'pending_review';
+          sourceTransitioned = true;
+        }
+
+        return {
+          ok: true as const,
+          sourceTransitioned,
+          approval,
+          finalStatus,
+        };
+      }
+
+      // Future sources land here. Returning source_not_supported is the
+      // fail-safe — surface NOT_IMPLEMENTED to the operator instead of
+      // pretending success.
+      return { ok: false, reason: 'source_not_supported' as const };
+    });
   },
 
   /**
@@ -3933,6 +4117,26 @@ export const proposalsUnifiedRepo = {
           resource_id: id,
           change_summary: { comment, source: 'admin-ui' },
         });
+        // Post-Codex-review #101: mutate source-of-truth too. Without this
+        // step the inbox would keep showing rejected proposals as 'proposed'.
+        if (proposal.type === 'capability_proposal') {
+          await tx
+            .update(capability_proposals)
+            .set({
+              status: 'rejected',
+              decided_at: new Date(),
+              decided_by: actorId,
+              decision_reason: comment,
+              updated_at: new Date(),
+            })
+            .where(
+              and(
+                eq(capability_proposals.tenant_id, tenantId),
+                eq(capability_proposals.id, id),
+                eq(capability_proposals.status, 'submitted'),
+              ),
+            );
+        }
         rejected += 1;
       }
       return { rejected_count: rejected, skipped_ids: skipped };

@@ -1372,9 +1372,13 @@ export const proposal_approvals = pgTable(
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
-    proposalRoleDecisionUq: unique('proposal_approvals_proposal_role_decision_uq').on(
+    // Post-Codex-review #101: dropped (proposal_id, approver_role, decision)
+    // — see migration 042 — because it blocked dual-founder approval flows.
+    // Distinct-user invariant is still enforced; distinct-role invariant
+    // (for owner+compliance dual classes) is enforced at the app layer.
+    proposalUserDecisionUq: unique('proposal_approvals_proposal_user_decision_uq').on(
       t.proposal_id,
-      t.approver_role,
+      t.approver_user_id,
       t.decision,
     ),
     proposalIdx: index('proposal_approvals_proposal_id_idx').on(t.proposal_id),

@@ -5,10 +5,15 @@
  *   - listProposals       — paginated UNION across proposal sources
  *   - counters            — count by type for top-of-page badges
  *   - bulkReject          — reject N risk=low proposals in one tx (writes audit)
+ *
+ * Post-Codex-review #101: tenantId is derived from the authenticated session
+ * (ctx.tenantId). The optional `input.tenantId` is a sanity-check value only —
+ * any mismatch with the session value is FORBIDDEN. See resolveTenantId.
  */
 import { z } from 'zod';
 import { TRPCError } from '@trpc/server';
 import { router, protectedProcedure } from '../server.js';
+import { resolveTenantId } from '../tenant-resolver.js';
 import {
   ProposalTypeSchema,
   RiskLevelSchema,
@@ -16,7 +21,7 @@ import {
 } from '../types.js';
 
 const ListInputSchema = z.object({
-  tenantId: z.string(),
+  tenantId: z.string().optional(),
   types: z.array(ProposalTypeSchema).optional(),
   risks: z.array(RiskLevelSchema).optional(),
   sources: z.array(z.string()).optional(),
@@ -26,10 +31,10 @@ const ListInputSchema = z.object({
   cursor: z.string().nullish(),
 });
 
-const CountersInputSchema = z.object({ tenantId: z.string() });
+const CountersInputSchema = z.object({ tenantId: z.string().optional() });
 
 const BulkRejectInputSchema = z.object({
-  tenantId: z.string(),
+  tenantId: z.string().optional(),
   ids: z.array(z.string().uuid()).min(1).max(50),
   comment: z.string().min(10).max(1000),
 });
@@ -38,9 +43,9 @@ export const inboxRouter = router({
   listProposals: protectedProcedure
     .input(ListInputSchema)
     .query(async ({ input, ctx }) => {
-      ctx.assertTenant(input.tenantId);
+      const tenantId = resolveTenantId(ctx, input.tenantId);
       return await ctx.repos.proposalsUnifiedRepo.list({
-        tenantId: input.tenantId,
+        tenantId,
         types: input.types,
         risks: input.risks,
         sources: input.sources,
@@ -54,18 +59,18 @@ export const inboxRouter = router({
   counters: protectedProcedure
     .input(CountersInputSchema)
     .query(async ({ input, ctx }) => {
-      ctx.assertTenant(input.tenantId);
-      return await ctx.repos.proposalsUnifiedRepo.countersByType(input.tenantId);
+      const tenantId = resolveTenantId(ctx, input.tenantId);
+      return await ctx.repos.proposalsUnifiedRepo.countersByType(tenantId);
     }),
 
   bulkReject: protectedProcedure
     .input(BulkRejectInputSchema)
     .mutation(async ({ input, ctx }) => {
-      ctx.assertTenant(input.tenantId);
+      const tenantId = resolveTenantId(ctx, input.tenantId);
       ctx.assertRole('owner', 'compliance_officer', 'founder');
 
       const result = await ctx.repos.proposalsUnifiedRepo.bulkReject(
-        input.tenantId,
+        tenantId,
         input.ids,
         ctx.userId,
         ctx.userRole,

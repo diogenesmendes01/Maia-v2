@@ -31,7 +31,10 @@ export default function ProposalDetailPage({ params }: { params: { id: string } 
 
   const proposal = proposalQuery.data;
   const lockBlocked = proposal.locks.length > 0 && userRole !== 'founder';
-  const canApprove = proposal.required_roles.includes(userRole) && !lockBlocked;
+  // Post-Codex-review #101: founder is always allowed at the role-gate layer;
+  // architecture locks then restrict to founder via lockBlocked above.
+  const canApprove =
+    !lockBlocked && (userRole === 'founder' || proposal.required_roles.includes(userRole));
 
   return (
     <div className="space-y-6">
