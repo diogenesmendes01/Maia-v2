@@ -16,7 +16,7 @@ export {
   getVisibilityTable,
   VISIBLE_STATES,
 } from './visibility.js';
-export { knowledgeRepos } from './repos.js';
+export { knowledgeRepos, KnowledgeConflictError } from './repos.js';
 export { KnowledgeRiskScorer } from './risk-scorer.js';
 
 export type {

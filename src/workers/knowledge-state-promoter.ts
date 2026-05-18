@@ -26,7 +26,8 @@
 import { sql } from 'drizzle-orm';
 import { runCognitiveModule } from '@/cognition/runner.js';
 import { logger } from '@/lib/logger.js';
-import { FEATURE_KNOWLEDGE_STATE_MACHINE_V1 } from '@/config/feature-flags.js';
+import { featureFlags } from '@/config/feature-flags.js';
+import { FeatureFlagName } from '@/types/enums.js';
 import { KnowledgeStateMachine } from '@/control-plane/knowledge-state-machine/state-machine.js';
 import { knowledgeRepos } from '@/control-plane/knowledge-state-machine/repos.js';
 import { IllegalTransitionError } from '@/control-plane/knowledge-state-machine/transitions.js';
@@ -38,6 +39,24 @@ import type {
 
 const KINDS: KnowledgeKind[] = ['memory', 'fact', 'rule', 'behavioral_hint'];
 const PER_TICK_LIMIT = 100;
+
+/**
+ * P10a (review #104 high): the four knowledge tables don't share a
+ * confidence column. Facts/rules use the legacy Portuguese `confianca`
+ * (numeric(3,2)); memories/hints use the English `confidence`
+ * (numeric(4,3)). Building a single `COALESCE(confidence, confianca, 0)`
+ * predicate raises `column does not exist` on PostgreSQL the moment the
+ * query touches a table that lacks one of them — so the verified→active
+ * promotion silently fails for every table and only the list error is
+ * logged.
+ *
+ * Build the maturity predicate per-table using the actual column name.
+ */
+function maturityFilter(kind: KnowledgeKind, minConfidence: number, minEvidence: number) {
+  const confCol =
+    kind === 'fact' || kind === 'rule' ? sql.raw('confianca') : sql.raw('confidence');
+  return sql`evidence_count >= ${minEvidence} AND ${confCol} >= ${minConfidence}`;
+}
 
 interface PromoteStats {
   ephemeral_to_observed: number;
@@ -51,22 +70,36 @@ interface PromoteStats {
 
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * Per-tick promotion across all 4 user-layer knowledge tables.
+ *
+ * `filter` is either a single SQL fragment that works for every table
+ * (e.g. "evidence_count >= N AND updated_at >= cutoff") or a factory
+ * returning per-table fragments — needed for the verified→active
+ * maturity check because facts/rules and memories/hints store
+ * confidence in different columns.
+ */
 async function promote(args: {
   from: KnowledgeLifecycleStatus;
   to: KnowledgeLifecycleStatus;
-  filter: ReturnType<typeof sql>;
+  filter:
+    | ReturnType<typeof sql>
+    | ((kind: KnowledgeKind) => ReturnType<typeof sql>);
   reason: string;
   decided_by: KnowledgeDecidedBy;
   stats: PromoteStats;
   counterKey: keyof PromoteStats;
 }): Promise<void> {
+  const filterFor = (kind: KnowledgeKind) =>
+    typeof args.filter === 'function' ? args.filter(kind) : args.filter;
+
   for (const kind of KINDS) {
     let rows: Array<{ id: string }>;
     try {
       rows = await knowledgeRepos.listEligible({
         kind,
         from: args.from,
-        extraFilter: args.filter,
+        extraFilter: filterFor(kind),
         limit: PER_TICK_LIMIT,
       });
     } catch (err) {
@@ -109,7 +142,12 @@ async function promote(args: {
 }
 
 export async function runKnowledgeStatePromoter(): Promise<void> {
-  if (!FEATURE_KNOWLEDGE_STATE_MACHINE_V1) {
+  // P10a (review #104 high): use the runtime feature-flag singleton
+  // so a kill switch takes effect on the next tick without a redeploy.
+  // The previous code path read the module-level constant
+  // FEATURE_KNOWLEDGE_STATE_MACHINE_V1 at import time, which froze the
+  // value at startup.
+  if (!featureFlags.isEnabled(FeatureFlagName.KNOWLEDGE_STATE_MACHINE_V1)) {
     logger.debug({}, 'knowledge_state_promoter.skipped_disabled');
     return;
   }
@@ -170,13 +208,14 @@ export async function runKnowledgeStatePromoter(): Promise<void> {
       });
 
       // 4. verified → active (conf>=0.9, evidence>=10 — conservative maturity)
-      //    Some knowledge tables don't have a 'confidence' column; use the
-      //    legacy 'confianca' fallback when present. Casting both to numeric
-      //    in SQL avoids dialect-specific COALESCE quirks.
+      //    Per-table predicate: facts/rules store confidence as
+      //    `confianca` (numeric(3,2)), memories/hints as `confidence`
+      //    (numeric(4,3)). Referencing both in a single COALESCE
+      //    raises "column does not exist" on PostgreSQL (review #104).
       await promote({
         from: 'verified',
         to: 'active',
-        filter: sql`evidence_count >= 10 AND COALESCE(confidence, confianca, 0) >= 0.9`,
+        filter: (kind) => maturityFilter(kind, 0.9, 10),
         reason: 'maturity_threshold:conf_0.9_evidence_10',
         decided_by: 'auto_promoter:maturity_threshold',
         stats,

@@ -9,7 +9,8 @@
 import { z } from 'zod';
 import type { Tool } from './_registry.js';
 import { logger } from '@/lib/logger.js';
-import { FEATURE_KNOWLEDGE_STATE_MACHINE_V1 } from '@/config/feature-flags.js';
+import { featureFlags } from '@/config/feature-flags.js';
+import { FeatureFlagName } from '@/types/enums.js';
 import { saveFact as saveFactInMemory } from '@/memory/semantic.js';
 import { proposeFactTool } from './propose-fact.js';
 
@@ -65,8 +66,9 @@ export const saveFactTool: Tool<typeof inputSchema, typeof outputSchema> = {
       }
     }
 
-    // Flag off → preserve legacy behaviour bit-for-bit.
-    if (!FEATURE_KNOWLEDGE_STATE_MACHINE_V1) {
+    // Flag off → preserve legacy behaviour bit-for-bit. Runtime
+    // singleton picks up kill switches without a redeploy (review #104).
+    if (!featureFlags.isEnabled(FeatureFlagName.KNOWLEDGE_STATE_MACHINE_V1)) {
       const f = await saveFactInMemory({
         escopo: args.escopo,
         chave: args.chave,

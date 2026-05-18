@@ -174,8 +174,79 @@ requires:
 
 | Flag | Tools | Workers | `save_fact` / `save_rule` |
 |------|-------|---------|---------------------------|
-| `false` | `propose_*` still registered but never recommended in prompts | early-return | legacy `factsRepo.upsert` / `rulesRepo.create` directly |
+| `false` | `propose_*` hidden from `getToolSchemas` AND `dispatchTool` returns `tool_disabled` (review #104) | early-return | legacy `factsRepo.upsert` / `rulesRepo.create` directly |
 | `true`  | `propose_*` is the recommended path; LLM picks via prompt | runs every 1h | wrapper → `propose_*`, emits `deprecation_warning_save_*` |
+
+All gates now consult `featureFlags.isEnabled(KNOWLEDGE_STATE_MACHINE_V1)`
+(the runtime singleton) so a kill switch takes effect within one
+worker tick / one tool call — no redeploy required. Prior code froze
+the value at import time.
+
+---
+
+## 6. Safety properties enforced (post-review #104)
+
+### 6.1 Visibility filter is mandatory on LLM-facing reads
+
+Every read path that surfaces knowledge to the model must filter
+`lifecycle_status IN (ephemeral, observed, reinforced, verified, active)`:
+
+| Repo method | File |
+|---|---|
+| `factsRepo.listForScopes` | `src/db/repositories.ts` |
+| `factsRepo.listMentionableForScopes` | `src/db/repositories.ts` |
+| `rulesRepo.listActive` | `src/db/repositories.ts` |
+| `rulesRepo.findByContext` | `src/db/repositories.ts` |
+| `memoryEntryRepo.findRelevant` | `src/db/repositories.ts` |
+| `behavioralHintRepo.findActiveForScope` | `src/db/repositories.ts` |
+
+`pending_review`, `deprecated`, `revoked` rows never reach the prompt.
+Test fence: `tests/unit/ksm-visibility-filter-on-reads.spec.ts`.
+
+### 6.2 Atomic transitions (optimistic concurrency)
+
+`knowledgeRepos.update()` accepts `expected_previous_status` and uses
+`WHERE id = ? AND lifecycle_status = <expected>`. If a concurrent
+writer (e.g. auto-promoter racing with human revoke) changed the row
+between our read and write, affected rows = 0 and the repo throws
+`KnowledgeConflictError`. The state-machine catches it, re-reads, and
+either:
+
+- (transition) Re-throws as `IllegalTransitionError` carrying the
+  now-observed status. Auto-promoter treats this as a benign skip;
+  human paths surface to the operator.
+- (revoke) If the row is now `revoked`, returns idempotent no-op.
+  Otherwise retries against the new state — revoke is allowed from
+  every non-terminal state in `ALLOWED_TRANSITIONS`.
+
+Test fence: `tests/unit/ksm-conflict-detection.spec.ts`.
+
+### 6.3 DB-level enforcement (migration 044)
+
+`enforce_lifecycle_transition()` PL/pgSQL trigger fires `BEFORE UPDATE
+OF lifecycle_status` on all 4 user-layer tables and mirrors
+`ALLOWED_TRANSITIONS`. This blocks **direct SQL UPDATEs** that bypass
+the state machine — even `psql` sessions, ad-hoc scripts, or buggy
+migrations. Error code: `check_violation` with message
+`illegal knowledge lifecycle transition: <from> -> <to>`.
+
+The trigger function must be kept in sync with `transitions.ts`.
+
+### 6.4 Per-table maturity predicate (verified → active)
+
+`evidence_count >= 10 AND <conf-col> >= 0.9` where `<conf-col>` is
+`confianca` for facts/rules and `confidence` for memories/hints. Built
+by `maturityFilter(kind, ...)` in
+`src/workers/knowledge-state-promoter.ts`. The old `COALESCE` raised
+`column does not exist` on every table.
+
+### 6.5 BFS reachability invariant
+
+`tests/property/knowledge-state-machine.spec.ts` walks the transition
+graph and asserts no path exists from `revoked` to any non-revoked
+state — preventing accidental edges that would resurrect terminal
+rows. The same suite runs the auto-promoter 100 times and asserts a
+stable end-state snapshot.
 
 **Rollout:**
 1. Week 1 — staging only.

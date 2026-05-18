@@ -62,9 +62,27 @@ type EligibleFilter = {
 
 let currentFilter: EligibleFilter = {};
 
+// KnowledgeConflictError lives inside the mock factory because vi.mock
+// is hoisted above any top-level binding; an outer-scope class would
+// race the hoist with ReferenceError. state-machine.ts imports from
+// `./repos.js`, so it picks up THIS class identity — `instanceof`
+// inside the catch block matches the throw here.
 vi.mock('@/control-plane/knowledge-state-machine/repos.js', async () => {
   const drizzle = await vi.importActual<typeof import('drizzle-orm')>('drizzle-orm');
+  class KnowledgeConflictError extends Error {
+    constructor(
+      public readonly kind: KnowledgeKind,
+      public readonly id: string,
+      public readonly expected_previous_status: KnowledgeLifecycleStatus,
+    ) {
+      super(
+        `knowledge_conflict:${kind}:${id}:expected_${expected_previous_status}`,
+      );
+      this.name = 'KnowledgeConflictError';
+    }
+  }
   return {
+    KnowledgeConflictError,
     knowledgeRepos: {
       async create(input: {
         kind: KnowledgeKind;
@@ -101,10 +119,21 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', async () => {
           lifecycle_status?: KnowledgeLifecycleStatus;
           lifecycle_transitions?: KnowledgeTransitionRecord[];
           evidence_count?: number;
+          expected_previous_status?: KnowledgeLifecycleStatus;
         },
       ): Promise<void> {
         const row = storeByKind.get(kind)?.get(id);
         if (!row) return;
+        if (
+          updates.expected_previous_status !== undefined &&
+          row.lifecycle_status !== updates.expected_previous_status
+        ) {
+          throw new KnowledgeConflictError(
+            kind,
+            id,
+            updates.expected_previous_status,
+          );
+        }
         if (updates.lifecycle_status !== undefined)
           row.lifecycle_status = updates.lifecycle_status;
         if (updates.lifecycle_transitions !== undefined)
@@ -192,7 +221,12 @@ vi.mock('@/lib/logger.js', () => {
   };
 });
 
-// Force the feature flag on for the promoter tests.
+// Force the feature flag on for the promoter tests. Override both the
+// module-level constant (kept for back-compat) AND the singleton
+// instance the worker now consults via featureFlags.isEnabled() after
+// review #104 — without the singleton override, the worker would
+// short-circuit on `disabled` because the test env doesn't set
+// FEATURE_KNOWLEDGE_STATE_MACHINE_V1=true.
 vi.mock('@/config/feature-flags.js', async () => {
   const actual = await vi.importActual<
     typeof import('@/config/feature-flags.js')
@@ -200,6 +234,14 @@ vi.mock('@/config/feature-flags.js', async () => {
   return {
     ...actual,
     FEATURE_KNOWLEDGE_STATE_MACHINE_V1: true,
+    featureFlags: {
+      ...actual.featureFlags,
+      isEnabled: () => true,
+      override: () => undefined,
+      killSwitch: () => undefined,
+      unkillSwitch: () => undefined,
+      reset: () => undefined,
+    },
   };
 });
 

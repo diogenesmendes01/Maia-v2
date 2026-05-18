@@ -108,5 +108,80 @@ grep -q "memory_entry_lifecycle_transitions_shape" \
   || fail "CHECK constraint missing in migration"
 pass "migration 036 has indexes + CHECK constraints"
 
+# ============================================================
+# Post-review #104 gates — DB enforcement, visibility, concurrency,
+# runtime feature gate, per-table maturity filter.
+# ============================================================
+
+gate "Gate 13: migration 044 — enforce_lifecycle_transition trigger on all 4 tables"
+test -f migrations/044_p10a_enforce_lifecycle_transition.sql \
+  || fail "migration 044 file missing"
+for tbl in memory_entry agent_facts learned_rules behavioral_hint; do
+  grep -q "trg_enforce_lifecycle_transition_${tbl}" \
+    migrations/044_p10a_enforce_lifecycle_transition.sql \
+    || fail "trigger for ${tbl} missing in migration 044"
+done
+grep -q "illegal knowledge lifecycle transition" \
+  migrations/044_p10a_enforce_lifecycle_transition.sql \
+  || fail "trigger function must raise EXCEPTION on illegal transition"
+pass "DB-level lifecycle enforcement trigger present on all 4 tables"
+
+gate "Gate 14: visibility filter mandatory on every LLM-facing read path"
+# Scan from each function signature for the next 80 lines and confirm
+# lifecycle_status is referenced inside. Brace-balanced scanning is
+# brittle here because the function signatures span multiple lines with
+# objects on them.
+for fn in "listForScopes" "listMentionableForScopes" "listActive" "findRelevant" "findActiveForScope"; do
+  awk -v f="$fn" '
+    BEGIN { found = 0; in_fn = 0; window = 0 }
+    $0 ~ "async " f "\\(" { in_fn = 1; window = 0 }
+    in_fn { window++ }
+    in_fn && /lifecycle_status/ { found = 1; exit }
+    in_fn && window > 80 { in_fn = 0 }
+    END { exit (found ? 0 : 1) }
+  ' src/db/repositories.ts || fail "$fn does not reference lifecycle_status in its WHERE"
+done
+pass "all 5 LLM-facing read paths filter by lifecycle_status"
+
+gate "Gate 15: state-machine.transition uses optimistic-concurrency expected_previous_status"
+grep -q "expected_previous_status: current.lifecycle_status" \
+  src/control-plane/knowledge-state-machine/state-machine.ts \
+  || fail "transition() must pass expected_previous_status for optimistic locking"
+grep -q "KnowledgeConflictError" \
+  src/control-plane/knowledge-state-machine/state-machine.ts \
+  || fail "transition() must catch KnowledgeConflictError"
+pass "state-machine.transition is atomic via expected_previous_status"
+
+gate "Gate 16: propose_* tools gated by runtime feature flag (featureFlags.isEnabled)"
+grep -q "featureFlags.isEnabled(FeatureFlagName.KNOWLEDGE_STATE_MACHINE_V1)" \
+  src/tools/_registry.ts \
+  || fail "_registry.ts must use featureFlags.isEnabled (runtime singleton)"
+grep -q "isToolEnabled" src/tools/_dispatcher.ts \
+  || fail "_dispatcher.ts must reject disabled tools via isToolEnabled"
+grep -q "featureFlags.isEnabled(FeatureFlagName.KNOWLEDGE_STATE_MACHINE_V1)" \
+  src/workers/knowledge-state-promoter.ts \
+  || fail "knowledge-state-promoter must use featureFlags.isEnabled (runtime singleton)"
+pass "propose_* tools + worker gated by featureFlags.isEnabled() runtime"
+
+gate "Gate 17: per-table maturity filter (no COALESCE confidence,confianca)"
+# Only flag the bad pattern when it appears in executable code — comments
+# documenting why we replaced it are fine. We grep for the SQL fragment
+# inside backtick-quoted sql\`...\` template literals.
+if grep -E "sql\`.*COALESCE\(confidence, confianca" src/workers/knowledge-state-promoter.ts; then
+  fail "knowledge-state-promoter still uses the invalid COALESCE pattern in executable SQL"
+fi
+grep -q "maturityFilter" src/workers/knowledge-state-promoter.ts \
+  || fail "maturityFilter per-table predicate factory not used"
+pass "verified→active uses per-table maturity predicate"
+
+gate "Gate 18: BFS reachability + idempotency property tests present"
+test -f tests/property/knowledge-state-machine.spec.ts \
+  || fail "property tests file missing"
+grep -q "no path exists from revoked to active" tests/property/knowledge-state-machine.spec.ts \
+  || fail "BFS reachability test missing"
+grep -q "100 sequential ticks" tests/property/knowledge-state-machine.spec.ts \
+  || fail "idempotency 100-iteration test missing"
+pass "BFS reachability + 100-iter idempotency property tests present"
+
 echo
-printf "\033[32m\033[1mAll 12 P10a acceptance gates passed.\033[0m\n"
+printf "\033[32m\033[1mAll 18 P10a acceptance gates passed.\033[0m\n"

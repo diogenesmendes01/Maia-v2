@@ -17,7 +17,7 @@
 
 import { runCognitiveModule } from '@/cognition/runner.js';
 import { logger } from '@/lib/logger.js';
-import { knowledgeRepos } from './repos.js';
+import { knowledgeRepos, KnowledgeConflictError } from './repos.js';
 import { KnowledgeRiskScorer } from './risk-scorer.js';
 import {
   assertAllowedTransition,
@@ -168,6 +168,16 @@ export class KnowledgeStateMachine {
    * Apply an explicit lifecycle transition (auto-promoter, human
    * approval, etc.). Append-only on lifecycle_transitions; validated
    * via ALLOWED_TRANSITIONS (throws IllegalTransitionError if invalid).
+   *
+   * Concurrency: uses optimistic locking via
+   * `expected_previous_status`. If another writer transitioned the row
+   * in between the read and the write (e.g. a parallel revoke), the
+   * conditional UPDATE affects 0 rows and we throw
+   * IllegalTransitionError describing the now-current status. The
+   * caller is expected to drop the proposed transition — re-reading
+   * could lead to indefinite retries against a moving target. Workers
+   * (auto-promoter) treat IllegalTransitionError on parallel-promote
+   * races as benign; human-driven paths surface it to the operator.
    */
   static async transition(
     args: KnowledgeTransitionInput,
@@ -194,10 +204,40 @@ export class KnowledgeStateMachine {
         : {}),
     };
 
-    await knowledgeRepos.update(args.kind, args.proposal_id, {
-      lifecycle_status: args.to,
-      lifecycle_transitions: [...current.lifecycle_transitions, transition],
-    });
+    try {
+      await knowledgeRepos.update(args.kind, args.proposal_id, {
+        lifecycle_status: args.to,
+        lifecycle_transitions: [...current.lifecycle_transitions, transition],
+        expected_previous_status: current.lifecycle_status,
+      });
+    } catch (err) {
+      if (err instanceof KnowledgeConflictError) {
+        // Re-read to surface what the row actually became — this lets
+        // workers tell apart "already promoted by sibling" from "human
+        // revoked under us" and skip vs. raise accordingly.
+        const fresh = await knowledgeRepos.findById(
+          args.kind,
+          args.proposal_id,
+        );
+        const now = fresh?.lifecycle_status ?? current.lifecycle_status;
+        logger.warn(
+          {
+            proposal_id: args.proposal_id,
+            kind: args.kind,
+            expected_from: current.lifecycle_status,
+            observed_now: now,
+            attempted_to: args.to,
+            decided_by: args.decided_by,
+          },
+          'knowledge_state_machine.transition.conflict',
+        );
+        // Translate to IllegalTransitionError so existing callers
+        // (auto-promoter catches IllegalTransitionError as benign) stay
+        // unchanged.
+        throw new IllegalTransitionError(now, args.to);
+      }
+      throw err;
+    }
 
     logger.info(
       {
@@ -248,10 +288,73 @@ export class KnowledgeStateMachine {
       decided_by: args.decided_by,
     };
 
-    await knowledgeRepos.update(args.kind, args.proposal_id, {
-      lifecycle_status: 'revoked',
-      lifecycle_transitions: [...current.lifecycle_transitions, transition],
-    });
+    // Revoke wins on conflict: if another writer transitioned the row
+    // first, we re-read once. If the row is now revoked, treat as
+    // idempotent. Otherwise, re-attempt the revoke against the newly
+    // observed status — revoke is allowed from any non-terminal state,
+    // so the second try succeeds (or the row was already revoked).
+    try {
+      await knowledgeRepos.update(args.kind, args.proposal_id, {
+        lifecycle_status: 'revoked',
+        lifecycle_transitions: [...current.lifecycle_transitions, transition],
+        expected_previous_status: current.lifecycle_status,
+      });
+    } catch (err) {
+      if (err instanceof KnowledgeConflictError) {
+        const fresh = await knowledgeRepos.findById(
+          args.kind,
+          args.proposal_id,
+        );
+        if (!fresh) {
+          throw new Error(
+            `knowledge_not_found:${args.kind}:${args.proposal_id}`,
+            { cause: err },
+          );
+        }
+        if (fresh.lifecycle_status === 'revoked') {
+          // Concurrent revoke landed first — idempotent no-op.
+          return {
+            from: 'revoked',
+            to: 'revoked',
+            at: fresh.updated_at.toISOString(),
+            reason: 'already_revoked_concurrent',
+            decided_by: 'idempotent',
+          };
+        }
+        // Retry against the new observed status. Revoke is allowed from
+        // every non-terminal state in ALLOWED_TRANSITIONS, so the
+        // second try will succeed unless another concurrent revoke
+        // beat us again — in which case the re-read above catches it.
+        const retryTransition: KnowledgeTransitionRecord = {
+          from: fresh.lifecycle_status,
+          to: 'revoked',
+          at: new Date().toISOString(),
+          reason: args.reason,
+          decided_by: args.decided_by,
+        };
+        await knowledgeRepos.update(args.kind, args.proposal_id, {
+          lifecycle_status: 'revoked',
+          lifecycle_transitions: [
+            ...fresh.lifecycle_transitions,
+            retryTransition,
+          ],
+          expected_previous_status: fresh.lifecycle_status,
+        });
+        logger.warn(
+          {
+            proposal_id: args.proposal_id,
+            kind: args.kind,
+            from: fresh.lifecycle_status,
+            reason: args.reason,
+            decided_by: args.decided_by,
+            retried: true,
+          },
+          'knowledge_state_machine.revoked',
+        );
+        return retryTransition;
+      }
+      throw err;
+    }
 
     logger.warn(
       {

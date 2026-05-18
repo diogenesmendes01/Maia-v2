@@ -2,7 +2,7 @@ import type { Pessoa, Conversa } from '@/db/schema.js';
 import type { ResolvedPermission } from '@/governance/permissions.js';
 import { canAct } from '@/governance/permissions.js';
 import { constitutionalCheck } from '@/governance/rules.js';
-import { REGISTRY, type AnyTool } from './_registry.js';
+import { REGISTRY, isToolEnabled, type AnyTool } from './_registry.js';
 import { computeIdempotencyKey } from '@/governance/idempotency.js';
 import { idempotencyRepo } from '@/db/repositories.js';
 import { audit } from '@/governance/audit.js';
@@ -50,6 +50,17 @@ export async function dispatchTool(input: {
 }): Promise<DispatchResult> {
   const tool = REGISTRY[input.tool] as AnyTool | undefined;
   if (!tool) return { error: 'unknown_tool', details: { tool: input.tool } };
+  // P10a (review #104 high): runtime feature-flag gate. A killed
+  // feature flag must block the handler in-flight, not just hide the
+  // schema. Without this, the LLM could still call propose_* during a
+  // canary rollback and produce rows whose lifecycle columns may not
+  // exist in the database yet.
+  if (!isToolEnabled(input.tool)) {
+    return {
+      error: 'tool_disabled',
+      details: { tool: input.tool, reason: 'feature_flag_off' },
+    };
+  }
 
   const parsed = tool.input_schema.safeParse(input.args);
   if (!parsed.success) {

@@ -793,6 +793,12 @@ export const factsRepo = {
     if (escopos.length === 0) return [];
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
+    // P10a (review #104 critical): every read path that surfaces knowledge
+    // to the LLM MUST filter by lifecycle_status. Without this, a
+    // propose_fact row with lifecycle_status='pending_review' (or even
+    // 'revoked') reaches the prompt because the legacy path filtered only
+    // by tenant/agent/escopo. The 5 visible states mirror
+    // visibility.VISIBLE_STATES.
     return db
       .select()
       .from(agent_facts)
@@ -801,6 +807,13 @@ export const factsRepo = {
           eq(agent_facts.tenant_id, tenant_id),
           eq(agent_facts.agent_id, agent_id),
           inArray(agent_facts.escopo, escopos),
+          inArray(agent_facts.lifecycle_status, [
+            'ephemeral',
+            'observed',
+            'reinforced',
+            'verified',
+            'active',
+          ]),
         ),
       );
   },
@@ -833,12 +846,17 @@ export const factsRepo = {
     if (escopos.length === 0) return [];
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
+    // P10a (review #104 critical): lifecycle_status filter is mandatory
+    // on every read that the LLM can see. pending_review / deprecated /
+    // revoked rows MUST NOT reach the prompt — they live behind the
+    // Admin UI Proposal Inbox until a human acts on them.
     const result = await db.execute<AgentFact>(sql`
       SELECT af.*
       FROM agent_facts af
       WHERE af.tenant_id = ${tenant_id}
         AND af.agent_id = ${agent_id}
         AND af.escopo = ANY(${escopos})
+        AND af.lifecycle_status IN ('ephemeral', 'observed', 'reinforced', 'verified', 'active')
         AND NOT EXISTS (
           SELECT 1 FROM memory_entry me
           WHERE me.tenant_id = af.tenant_id
@@ -861,6 +879,11 @@ export const rulesRepo = {
   async listActive(tipo: string): Promise<LearnedRule[]> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
+    // P10a (review #104 critical): rules surfaced to the LLM must pass
+    // both the legacy `ativa` flag AND the lifecycle_status visibility
+    // filter. propose_rule lands rows in pending_review (master §2.6) —
+    // those rows must NEVER appear in the rulesBlock until a human
+    // approves them in the Admin UI Proposal Inbox.
     return db
       .select()
       .from(learned_rules)
@@ -870,6 +893,13 @@ export const rulesRepo = {
           eq(learned_rules.agent_id, agent_id),
           eq(learned_rules.ativa, true),
           eq(learned_rules.tipo, tipo),
+          inArray(learned_rules.lifecycle_status, [
+            'ephemeral',
+            'observed',
+            'reinforced',
+            'verified',
+            'active',
+          ]),
         ),
       )
       .orderBy(desc(learned_rules.confianca), desc(learned_rules.updated_at))
@@ -897,6 +927,9 @@ export const rulesRepo = {
   async findByContext(tipo: string, contexto: string): Promise<LearnedRule | null> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
+    // P10a (review #104): exclude non-visible lifecycle states so a
+    // pending_review duplicate doesn't satisfy the dedup check and
+    // accidentally short-circuit a fresh proposal.
     const rows = await db
       .select()
       .from(learned_rules)
@@ -907,6 +940,13 @@ export const rulesRepo = {
           eq(learned_rules.tipo, tipo),
           eq(learned_rules.contexto, contexto),
           eq(learned_rules.ativa, true),
+          inArray(learned_rules.lifecycle_status, [
+            'ephemeral',
+            'observed',
+            'reinforced',
+            'verified',
+            'active',
+          ]),
         ),
       )
       .limit(1);
@@ -1526,6 +1566,16 @@ export const memoryEntryRepo = {
       // be enforced at query time. Entries past expires_at MUST NOT be
       // returned to the prompt builder. NULL expires_at = no TTL.
       or(isNull(memory_entry.expires_at), gt(memory_entry.expires_at, now)),
+      // P10a (review #104 critical): lifecycle_status filter enforced on
+      // every prompt-exposing read. pending_review / deprecated / revoked
+      // entries stay hidden from the LLM.
+      inArray(memory_entry.lifecycle_status, [
+        'ephemeral',
+        'observed',
+        'reinforced',
+        'verified',
+        'active',
+      ]),
     ];
     // Filtrar por scope_type + subject_id apropriado. PR #82 review
     // (Superpowers Critical #4): role/channel devem só ser incluídos
@@ -1649,6 +1699,17 @@ export const behavioralHintRepo = {
       eq(behavioral_hint.agent_id, agent_id),
       eq(behavioral_hint.scope_type, opts.scope_type),
       isNull(behavioral_hint.revoked_at),
+      // P10a (review #104 critical): hints proposed via propose_hint
+      // start in pending_review / ephemeral. The LLM-facing path must
+      // include only visible states so a pending hint never steers
+      // behavior before a human approves it.
+      inArray(behavioral_hint.lifecycle_status, [
+        'ephemeral',
+        'observed',
+        'reinforced',
+        'verified',
+        'active',
+      ]),
     ];
     if (opts.subject_id) conds.push(eq(behavioral_hint.subject_id, opts.subject_id));
     return db

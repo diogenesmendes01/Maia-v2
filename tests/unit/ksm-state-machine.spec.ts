@@ -26,7 +26,25 @@ function seedStore(kind: KnowledgeKind, row: KnowledgeRow): void {
   storeByKind.get(kind)!.set(row.id, row);
 }
 
-vi.mock('@/control-plane/knowledge-state-machine/repos.js', () => ({
+// KnowledgeConflictError needs the SAME constructor identity that
+// state-machine.ts imports via `./repos.js`. We define it INSIDE the
+// factory because vi.mock is hoisted above any top-level declaration —
+// referencing an outer class would race the hoist and ReferenceError.
+vi.mock('@/control-plane/knowledge-state-machine/repos.js', () => {
+  class KnowledgeConflictError extends Error {
+    constructor(
+      public readonly kind: KnowledgeKind,
+      public readonly id: string,
+      public readonly expected_previous_status: KnowledgeLifecycleStatus,
+    ) {
+      super(
+        `knowledge_conflict:${kind}:${id}:expected_${expected_previous_status}`,
+      );
+      this.name = 'KnowledgeConflictError';
+    }
+  }
+  return {
+  KnowledgeConflictError,
   knowledgeRepos: {
     async create(input: {
       kind: KnowledgeKind;
@@ -61,10 +79,23 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', () => ({
         lifecycle_status?: KnowledgeLifecycleStatus;
         lifecycle_transitions?: KnowledgeTransitionRecord[];
         evidence_count?: number;
+        expected_previous_status?: KnowledgeLifecycleStatus;
       },
     ): Promise<void> {
       const row = storeByKind.get(kind)?.get(id);
       if (!row) return;
+      // Optimistic concurrency: simulate the conditional UPDATE so the
+      // state-machine's KnowledgeConflictError path is exercised.
+      if (
+        updates.expected_previous_status !== undefined &&
+        row.lifecycle_status !== updates.expected_previous_status
+      ) {
+        throw new KnowledgeConflictError(
+          kind,
+          id,
+          updates.expected_previous_status,
+        );
+      }
       if (updates.lifecycle_status !== undefined)
         row.lifecycle_status = updates.lifecycle_status;
       if (updates.lifecycle_transitions !== undefined)
@@ -74,7 +105,8 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', () => ({
       row.updated_at = new Date();
     },
   },
-}));
+  };
+});
 
 // Bypass the cognitive_module_log DB write — tenant context missing is
 // expected in unit tests, the runner still returns the inner function's

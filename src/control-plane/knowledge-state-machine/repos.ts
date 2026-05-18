@@ -55,6 +55,34 @@ interface UpdateInput {
   lifecycle_status?: KnowledgeLifecycleStatus;
   lifecycle_transitions?: KnowledgeTransitionRecord[];
   evidence_count?: number;
+  /**
+   * Optimistic concurrency guard — when set, the UPDATE includes a
+   * `WHERE lifecycle_status = expected_previous_status` predicate so a
+   * stale read (e.g. an auto-promoter tick racing with a human revoke)
+   * cannot overwrite the latest persisted status. The repo returns
+   * false when affected rows = 0 so the caller can retry/refresh.
+   * See Codex review #104 — without this, a parallel revoke can be lost.
+   */
+  expected_previous_status?: KnowledgeLifecycleStatus;
+}
+
+/**
+ * Thrown by `knowledgeRepos.update` when an optimistic-concurrency
+ * conditional update finds 0 affected rows. The state-machine catches
+ * this, re-reads the row, and translates it into IllegalTransitionError
+ * (lost-revoke scenario) or a benign skip (already-promoted scenario).
+ */
+export class KnowledgeConflictError extends Error {
+  constructor(
+    public readonly kind: KnowledgeKind,
+    public readonly id: string,
+    public readonly expected_previous_status: KnowledgeLifecycleStatus,
+  ) {
+    super(
+      `knowledge_conflict:${kind}:${id}:expected_${expected_previous_status}`,
+    );
+    this.name = 'KnowledgeConflictError';
+  }
 }
 
 type AnyRow = Record<string, unknown>;
@@ -244,6 +272,21 @@ export const knowledgeRepos = {
     }
   },
 
+  /**
+   * Update a knowledge row.
+   *
+   * When `updates.expected_previous_status` is set, the UPDATE includes
+   * a `WHERE lifecycle_status = <expected>` predicate so it only fires
+   * when the persisted state still matches what the caller read. If
+   * another writer changed the row in between, affected rows = 0 and
+   * we throw KnowledgeConflictError. The state-machine catches and
+   * surfaces this as an IllegalTransitionError after re-reading.
+   *
+   * Without the expected-previous guard, a worker promotion and a
+   * concurrent human revoke can both read the same old status, and the
+   * second write wins blindly — so a revoke can be lost and a terminal
+   * row "resurrected". See Codex review #104 (critical).
+   */
   async update(
     kind: KnowledgeKind,
     id: string,
@@ -260,23 +303,75 @@ export const knowledgeRepos = {
       set['evidence_count'] = updates.evidence_count;
     }
 
+    const expected = updates.expected_previous_status;
+
     switch (kind) {
-      case 'fact':
-        await db.update(agent_facts).set(set).where(eq(agent_facts.id, id));
+      case 'fact': {
+        const where = expected
+          ? and(eq(agent_facts.id, id), eq(agent_facts.lifecycle_status, expected))
+          : eq(agent_facts.id, id);
+        const rows = await db
+          .update(agent_facts)
+          .set(set)
+          .where(where)
+          .returning({ id: agent_facts.id });
+        if (expected && rows.length === 0) {
+          throw new KnowledgeConflictError(kind, id, expected);
+        }
         return;
-      case 'rule':
-        await db.update(learned_rules).set(set).where(eq(learned_rules.id, id));
+      }
+      case 'rule': {
+        const where = expected
+          ? and(
+              eq(learned_rules.id, id),
+              eq(learned_rules.lifecycle_status, expected),
+            )
+          : eq(learned_rules.id, id);
+        const rows = await db
+          .update(learned_rules)
+          .set(set)
+          .where(where)
+          .returning({ id: learned_rules.id });
+        if (expected && rows.length === 0) {
+          throw new KnowledgeConflictError(kind, id, expected);
+        }
         return;
-      case 'memory':
-        await db.update(memory_entry).set(set).where(eq(memory_entry.id, id));
+      }
+      case 'memory': {
+        const where = expected
+          ? and(
+              eq(memory_entry.id, id),
+              eq(memory_entry.lifecycle_status, expected),
+            )
+          : eq(memory_entry.id, id);
+        const rows = await db
+          .update(memory_entry)
+          .set(set)
+          .where(where)
+          .returning({ id: memory_entry.id });
+        if (expected && rows.length === 0) {
+          throw new KnowledgeConflictError(kind, id, expected);
+        }
         return;
+      }
       case 'behavioral_hint':
-      case 'procedure_hint':
-        await db
+      case 'procedure_hint': {
+        const where = expected
+          ? and(
+              eq(behavioral_hint.id, id),
+              eq(behavioral_hint.lifecycle_status, expected),
+            )
+          : eq(behavioral_hint.id, id);
+        const rows = await db
           .update(behavioral_hint)
           .set(set)
-          .where(eq(behavioral_hint.id, id));
+          .where(where)
+          .returning({ id: behavioral_hint.id });
+        if (expected && rows.length === 0) {
+          throw new KnowledgeConflictError(kind, id, expected);
+        }
         return;
+      }
       default: {
         const _exhaustive: never = kind;
         throw new Error(`unknown knowledge kind: ${String(_exhaustive)}`);

@@ -11,7 +11,8 @@ import { z } from 'zod';
 import type { Tool } from './_registry.js';
 import { logger } from '@/lib/logger.js';
 import { rulesRepo } from '@/db/repositories.js';
-import { FEATURE_KNOWLEDGE_STATE_MACHINE_V1 } from '@/config/feature-flags.js';
+import { featureFlags } from '@/config/feature-flags.js';
+import { FeatureFlagName } from '@/types/enums.js';
 import { proposeRuleTool } from './propose-rule.js';
 
 const inputSchema = z.object({
@@ -54,7 +55,9 @@ export const saveRuleTool: Tool<typeof inputSchema, typeof outputSchema> = {
       'deprecation_warning_save_rule',
     );
 
-    if (!FEATURE_KNOWLEDGE_STATE_MACHINE_V1) {
+    // P10a (review #104): runtime singleton so kill switch flips
+    // immediately. The module-level constant froze at import time.
+    if (!featureFlags.isEnabled(FeatureFlagName.KNOWLEDGE_STATE_MACHINE_V1)) {
       const r = await rulesRepo.create({
         tipo: args.tipo,
         contexto: args.contexto,
