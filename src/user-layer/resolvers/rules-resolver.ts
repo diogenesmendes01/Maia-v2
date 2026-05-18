@@ -12,13 +12,28 @@ export interface RuleItem {
   acertos: number;
   erros: number;
   ativa: boolean;
+  tipo: string;
   lifecycle_status: KnowledgeLifecycleStatus;
 }
 
 export const rulesResolver = {
+  /**
+   * Default behavior (Codex review PR #94 high #4):
+   *   `only_active = true` (matches `rulesRepo.listActive`'s contract — the
+   *   prompt path only ever surfaces ativa=true rules; disabled rules are
+   *   often superseded / bad behavior and MUST NOT influence decisions).
+   *   Caller can opt out by passing `only_active: false` explicitly for the
+   *   one or two admin paths that need the full set.
+   *
+   *   `tipo` filter exposed: when builder doesn't pass it we still emit
+   *   everything (no change), but the knowledge-slice-builder now pins
+   *   `tipo='classificacao'` to match `rulesRepo.listActive('classificacao')`
+   *   used by prompt-builder. Passing `tipo: undefined` keeps the old shape.
+   */
   async list(input: {
     tenant_id: string;
     intent_filter?: string;
+    tipo?: string;
     only_active?: boolean;
     limit: number;
   }): Promise<RuleItem[]> {
@@ -32,8 +47,13 @@ export const rulesResolver = {
       isVisibleLifecycle(learned_rules.lifecycle_status),
     ];
 
-    if (input.only_active) {
+    // Default ON — opt-out via explicit `only_active: false`.
+    if (input.only_active !== false) {
       conditions.push(eq(learned_rules.ativa, true));
+    }
+
+    if (input.tipo) {
+      conditions.push(eq(learned_rules.tipo, input.tipo));
     }
 
     if (input.intent_filter) {
@@ -55,6 +75,7 @@ export const rulesResolver = {
       acertos: r.acertos,
       erros: r.erros,
       ativa: r.ativa,
+      tipo: r.tipo,
       lifecycle_status: r.lifecycle_status as KnowledgeLifecycleStatus,
     }));
   },

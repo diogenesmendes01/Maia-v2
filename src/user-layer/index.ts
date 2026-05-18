@@ -26,3 +26,10 @@ export {
 export { isVisibleLifecycle, isVisible } from './internal/visibility.js';
 export { getUserMaxItems, getKnowledgeMaxes } from './internal/depth-mapping.js';
 export { buildUserSliceCacheKey, buildKnowledgeSliceCacheKey } from './internal/cache-keys.js';
+export {
+  enforceTenantBoundary,
+  TenantBoundaryViolation,
+  type TenantBoundaryDecision,
+  type TenantBoundaryInput,
+} from './internal/tenant-boundary.js';
+export { NON_MENTIONABLE_CONTENT_MARKER } from './resolvers/memory-resolver.js';

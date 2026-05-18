@@ -10,6 +10,21 @@ import type { KnowledgeLifecycleStatus } from '../types.js';
  * Tenant-scoped: filters by tenant_id ALWAYS, never by agent_id as a predicate.
  * Applies lifecycle visibility (KSM) + TTL/expires_at.
  *
+ * Privacy gates (Codex review PR #94 critical #2):
+ *   The prompt-builder path (memoryEntryRepo.findRelevant in repositories.ts)
+ *   gates rows by `needs_review=false` BEFORE handing content to the LLM.
+ *   Migration 038 defaults every legacy row to lifecycle_status='active', so
+ *   without these gates a sensitive `needs_review=true` row would re-enter
+ *   the slice. We enforce three privacy rails here:
+ *     - `needs_review = false`                  (drop never-reviewed candidates)
+ *     - raw `content` returned ONLY when `mention_allowed = true`; otherwise
+ *       the field is replaced with a placeholder marker so downstream
+ *       prompt rendering can still iterate the row (for counters / behavioral
+ *       hint backreferences) without ever surfacing the raw text.
+ *     - when `scope_hint` is passed, the SQL disjunct mirrors `findRelevant`:
+ *       only rows whose scope_type matches an allowlisted (scope, subject)
+ *       pair OR scope_type='agent' (broadcast) are eligible.
+ *
  * Schema mapping (P8c keeps schema legacy intact; resolver translates to canonical shape):
  *   memory_entry.content        → MemoryItem.conteudo
  *   memory_entry.interlocutor_id → MemoryItem.pessoa_id (input filter)
@@ -24,6 +39,15 @@ export interface MemoryListInput {
   scope?: string[];
   memory_types?: string[];
   intent_filter?: string;
+  /**
+   * When provided, the disjunct mirrors `memoryEntryRepo.findRelevant`:
+   * only memories whose scope_type matches one of `interlocutor / role /
+   * channel / conversation` with the corresponding subject_id pass, plus
+   * the broadcast `scope_type='agent'`. Other scopes are excluded.
+   */
+  role_id?: string;
+  channel_id?: string;
+  conversa_id?: string;
   limit: number;
 }
 
@@ -58,11 +82,20 @@ export interface MemoryUpsertInput {
   lifecycle_status?: KnowledgeLifecycleStatus;
 }
 
+/**
+ * Placeholder used when `mention_allowed = false`. Downstream code can iterate
+ * the slice for behavioral-hint lookup / counts without ever rendering the raw
+ * text. Renderers that detect this marker MUST fall back to validated
+ * behavioral hints derived from the memory id.
+ */
+export const NON_MENTIONABLE_CONTENT_MARKER = '[non-mentionable memory]';
+
 function rowToItem(r: typeof memory_entry.$inferSelect): MemoryItem {
   const scope = r.subject_id ? `${r.scope_type}:${r.subject_id}` : r.scope_type;
   return {
     id: r.id,
-    conteudo: r.content,
+    // Privacy gate: surface raw content only when explicitly mention-allowed.
+    conteudo: r.mention_allowed ? r.content : NON_MENTIONABLE_CONTENT_MARKER,
     memory_type: r.memory_type,
     scope,
     sensitivity: r.sensitivity as MemoryItem['sensitivity'],
@@ -83,6 +116,8 @@ export const memoryResolver = {
     const conditions = [
       eq(memory_entry.tenant_id, input.tenant_id),
       isVisibleLifecycle(memory_entry.lifecycle_status),
+      // PR #82 / PR #94 review: never surface unreviewed candidates.
+      eq(memory_entry.needs_review, false),
       // Expired memories are filtered out: expires_at IS NULL or expires_at > now
       or(
         isNull(memory_entry.expires_at),
@@ -90,9 +125,51 @@ export const memoryResolver = {
       ),
     ];
 
+    // Scope disjunct (matches memoryEntryRepo.findRelevant in repositories.ts).
+    // Only emit the OR clause when AT LEAST ONE subject is passed. Otherwise
+    // we fall through to the general pessoa_id / memory_types filters below.
+    const scopeOrs = [];
     if (input.pessoa_id) {
-      conditions.push(eq(memory_entry.interlocutor_id, input.pessoa_id));
+      scopeOrs.push(
+        and(
+          eq(memory_entry.scope_type, 'interlocutor'),
+          eq(memory_entry.subject_id, input.pessoa_id),
+        ),
+      );
     }
+    if (input.role_id) {
+      scopeOrs.push(
+        and(eq(memory_entry.scope_type, 'role'), eq(memory_entry.subject_id, input.role_id)),
+      );
+    }
+    if (input.channel_id) {
+      scopeOrs.push(
+        and(
+          eq(memory_entry.scope_type, 'channel'),
+          eq(memory_entry.subject_id, input.channel_id),
+        ),
+      );
+    }
+    if (input.conversa_id) {
+      scopeOrs.push(
+        and(
+          eq(memory_entry.scope_type, 'conversation'),
+          eq(memory_entry.subject_id, input.conversa_id),
+        ),
+      );
+    }
+    if (scopeOrs.length > 0) {
+      // Always include the broadcast scope ('agent') so global memories
+      // reach every subject — same shape findRelevant uses.
+      scopeOrs.push(eq(memory_entry.scope_type, 'agent'));
+      conditions.push(or(...scopeOrs)!);
+    } else if (input.pessoa_id) {
+      // Backwards compat: when only pessoa_id is set (legacy callers), still
+      // narrow to that interlocutor. The block above already covers this
+      // case via scopeOrs, so this branch is unreachable — kept commented as
+      // a contract note for future maintainers.
+    }
+
     if (input.memory_types?.length) {
       conditions.push(inArray(memory_entry.memory_type, input.memory_types));
     }

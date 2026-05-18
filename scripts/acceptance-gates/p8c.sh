@@ -209,20 +209,23 @@ echo ""
 echo "────────────────────────────────────────────────────────────"
 echo ""
 
-# Gate 7: Verify migration file present in canonical location
-echo "[Gate 7] Migration 036_p8c_lifecycle_status.sql present"
+# Gate 7: Verify migration file present in canonical location.
+# PR #94 review: renumbered 036 → 038 so P8e #93 keeps 036/037 (smaller PR,
+# higher merge priority). The acceptance gate tracks the renumbered file.
+echo "[Gate 7] Migration 038_p8c_lifecycle_status.sql present"
 echo ""
 
-if [ -f "migrations/036_p8c_lifecycle_status.sql" ]; then
+MIGRATION_FILE="migrations/038_p8c_lifecycle_status.sql"
+if [ -f "$MIGRATION_FILE" ]; then
   for t in memory_entry agent_facts learned_rules behavioral_hint; do
-    if grep -qE "ALTER TABLE $t" "migrations/036_p8c_lifecycle_status.sql"; then
+    if grep -qE "ALTER TABLE $t" "$MIGRATION_FILE"; then
       echo "✓ migration touches $t"
     else
       echo "✗ migration does not touch $t"
       exit 1
     fi
   done
-  if grep -q "DEFAULT 'active'" "migrations/036_p8c_lifecycle_status.sql"; then
+  if grep -q "DEFAULT 'active'" "$MIGRATION_FILE"; then
     echo "✓ migration uses DEFAULT 'active'"
   else
     echo "✗ migration missing DEFAULT 'active'"
@@ -231,7 +234,68 @@ if [ -f "migrations/036_p8c_lifecycle_status.sql" ]; then
   echo ""
   echo "✓ Gate 7 PASSED: Migration file valid"
 else
-  echo "✗ migration file not found at migrations/036_p8c_lifecycle_status.sql"
+  echo "✗ migration file not found at $MIGRATION_FILE"
+  exit 1
+fi
+
+echo ""
+echo "────────────────────────────────────────────────────────────"
+echo ""
+
+# Gate 8 (PR #94 review): facade trust boundary + privacy gates present.
+echo "[Gate 8] Facade tenant boundary + resolver privacy gates"
+echo ""
+
+GATE8_PASSED=true
+
+# enforceTenantBoundary must exist and be wired into BOTH slice builders.
+if [ -f "src/user-layer/internal/tenant-boundary.ts" ]; then
+  echo "✓ tenant-boundary.ts present"
+else
+  echo "✗ tenant-boundary.ts missing"
+  GATE8_PASSED=false
+fi
+
+for builder in src/user-layer/user-slice-builder.ts src/user-layer/knowledge-slice-builder.ts; do
+  if grep -q "enforceTenantBoundary" "$builder"; then
+    echo "✓ $(basename $builder) calls enforceTenantBoundary"
+  else
+    echo "✗ $(basename $builder) missing enforceTenantBoundary call"
+    GATE8_PASSED=false
+  fi
+done
+
+# memory-resolver must enforce needs_review=false at list time.
+if grep -q "memory_entry.needs_review" src/user-layer/resolvers/memory-resolver.ts; then
+  echo "✓ memory-resolver gates by needs_review"
+else
+  echo "✗ memory-resolver missing needs_review gate"
+  GATE8_PASSED=false
+fi
+
+# facts-resolver must use the NOT EXISTS mentionable gate.
+if grep -q "NOT EXISTS" src/user-layer/resolvers/facts-resolver.ts; then
+  echo "✓ facts-resolver enforces NOT EXISTS mentionable gate"
+else
+  echo "✗ facts-resolver missing NOT EXISTS mentionable gate"
+  GATE8_PASSED=false
+fi
+
+# knowledge-slice-builder MUST default only_active + pin tipo for rules.
+if grep -q "only_active: true" src/user-layer/knowledge-slice-builder.ts \
+   && grep -q "tipo: 'classificacao'" src/user-layer/knowledge-slice-builder.ts; then
+  echo "✓ knowledge-slice-builder pins only_active=true + tipo='classificacao'"
+else
+  echo "✗ knowledge-slice-builder missing only_active/tipo defaults"
+  GATE8_PASSED=false
+fi
+
+if [ "$GATE8_PASSED" = true ]; then
+  echo ""
+  echo "✓ Gate 8 PASSED: Facade boundary + privacy gates wired"
+else
+  echo ""
+  echo "✗ Gate 8 FAILED: Privacy/boundary gates missing — see Codex review #94"
   exit 1
 fi
 

@@ -4,6 +4,7 @@ import { hintsResolver } from './resolvers/hints-resolver.js';
 import { interlocutorResolver } from './resolvers/interlocutor-resolver.js';
 import { getUserMaxItems } from './internal/depth-mapping.js';
 import { buildUserSliceCacheKey } from './internal/cache-keys.js';
+import { enforceTenantBoundary } from './internal/tenant-boundary.js';
 import type { UserSlice, UserDepth } from './types.js';
 
 export interface BuildUserSliceOutput {
@@ -19,8 +20,15 @@ export async function buildUserSlice(input: {
   max_items?: number;
   intent_label?: string;
   scope_hint?: string[];
+  /** Optional cross-check against AsyncLocalStorage agent_id; see tenant-boundary.ts */
+  agent_id?: string;
   trace_id: string;
 }): Promise<BuildUserSliceOutput> {
+  // PR #94 Codex review high #3: enforce tenant trust boundary AT THE FACADE
+  // before any resolver is touched. Throws TenantBoundaryViolation if the
+  // caller passes a tenant_id that doesn't match the AsyncLocalStorage ctx.
+  enforceTenantBoundary({ tenant_id: input.tenant_id, agent_id: input.agent_id });
+
   const start = performance.now();
   const max_items = input.max_items ?? getUserMaxItems(input.depth);
   const cache_key = buildUserSliceCacheKey({

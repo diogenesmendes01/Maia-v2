@@ -9,9 +9,19 @@
  * The contract we lock in: `.where()` is called EXACTLY ONCE, and ALL
  * filters (including the optional `ilike` from `intent_filter`) are
  * inside that single `and(...)`.
+ *
+ * Drizzle SQL expressions are circular (table ↔ column back-refs) so we
+ * can't JSON.stringify the root. Instead we walk the tree extracting
+ * string params from `.value` and `.queryChunks` recursively.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { rulesResolver } from '@/user-layer/resolvers/rules-resolver.js';
+
+vi.mock('@/db/tenant-context.js', async () => {
+  const actual = await vi.importActual<typeof import('../../../src/db/tenant-context.js')>(
+    '@/db/tenant-context.js',
+  );
+  return { ...actual, tryGetCurrentContext: () => null };
+});
 
 // Capture the chain so we can assert on it.
 const whereSpy = vi.fn();
@@ -27,6 +37,33 @@ vi.mock('@/db/client.js', () => ({
     select: (...args: unknown[]) => selectSpy(...args),
   },
 }));
+
+import { rulesResolver } from '@/user-layer/resolvers/rules-resolver.js';
+
+// Safe walker — Drizzle SQL roots are circular; we extract string params only.
+function collectStringParams(node: unknown, depth = 0, out: string[] = []): string[] {
+  if (depth > 8 || node == null) return out;
+  if (typeof node === 'string') {
+    out.push(node);
+    return out;
+  }
+  if (typeof node !== 'object') return out;
+  if (Array.isArray(node)) {
+    for (const item of node) collectStringParams(item, depth + 1, out);
+    return out;
+  }
+  const n = node as Record<string, unknown>;
+  if (Object.prototype.hasOwnProperty.call(n, 'value')) {
+    collectStringParams(n.value, depth + 1, out);
+  }
+  if (Array.isArray(n.queryChunks)) {
+    collectStringParams(n.queryChunks, depth + 1, out);
+  }
+  if (Array.isArray(n.params)) {
+    collectStringParams(n.params, depth + 1, out);
+  }
+  return out;
+}
 
 describe('rulesResolver.list — tenant isolation regression', () => {
   beforeEach(() => {
@@ -67,11 +104,9 @@ describe('rulesResolver.list — tenant isolation regression', () => {
       limit: 10,
     });
 
-    // Drizzle's `and(...)` returns an opaque SQL object — serialise to JSON
-    // so we can grep for the tenant_id literal injected via `eq(..., 't-a')`.
     const expr = whereSpy.mock.calls[0]?.[0];
     expect(expr).toBeDefined();
-    const serialised = JSON.stringify(expr);
-    expect(serialised).toContain('t-a');
+    const params = collectStringParams(expr);
+    expect(params).toContain('t-a');
   });
 });
