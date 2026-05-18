@@ -11,6 +11,9 @@
 
 export { evaluate } from './evaluator.js';
 export { validatePolicyRuleBody } from './validator.js';
+export type { ValidatePolicyOptions } from './validator.js';
+export { enforce } from './enforcement.js';
+export type { EnforcementAction } from './enforcement.js';
 export {
   compileSafeRegex,
   getRegexCacheStats,
@@ -25,9 +28,11 @@ export {
   ALLOWED_EFFECT_ACTIONS,
   ALLOWED_OPERATORS,
   ALLOWED_PREDICATE_KINDS,
+  MAX_BRANCH_FANOUT,
   MAX_FIELD_PATH_DEPTH,
   MAX_PREDICATE_DEPTH,
   MAX_REGEX_INPUT_LENGTH,
+  MAX_TOTAL_PREDICATE_NODES,
   REGEX_CACHE_MAX,
   TARGET_P99_MICROS,
 } from './constants.js';
@@ -44,6 +49,7 @@ export type {
   PolicyNotPredicate,
   PolicyOperator,
   PolicyOrPredicate,
+  PolicyOutcome,
   PolicyPathSegment,
   PolicyPredicate,
   PolicyRuleBody,

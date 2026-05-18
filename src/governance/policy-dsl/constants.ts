@@ -51,6 +51,26 @@ export const MAX_REGEX_INPUT_LENGTH = 4096;
 export const REGEX_CACHE_MAX = 256;
 
 /**
+ * Maximum number of predicate nodes (leaf + branch) in a single rule body.
+ * Caps total runtime even when individual depth is small. A `policy_rules`
+ * row with > `MAX_TOTAL_PREDICATE_NODES` predicates is rejected at proposal
+ * time (`predicate_too_deep`) AND treated as inert at evaluation
+ * (`predicate_depth_exceeded`).
+ *
+ * Picked as `MAX_PREDICATE_DEPTH * MAX_BRANCH_FANOUT` headroom (16 * 16 = 256)
+ * with a safety multiplier — every realistic rule fits, oversized DoS-style
+ * payloads do not.
+ */
+export const MAX_TOTAL_PREDICATE_NODES = 1024;
+
+/**
+ * Maximum number of direct children allowed on a single `and`/`or` branch.
+ * Combined with `MAX_PREDICATE_DEPTH` and `MAX_TOTAL_PREDICATE_NODES`, this
+ * bounds runtime even for syntactically valid but adversarial bodies.
+ */
+export const MAX_BRANCH_FANOUT = 64;
+
+/**
  * Performance target documented for the tinybench benchmark. The benchmark
  * is informational (not a CI gate) so flaky CI runners don't fail the build,
  * but local runs must clear this. See `tests/benchmark/policy-dsl.bench.ts`.

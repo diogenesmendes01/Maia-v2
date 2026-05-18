@@ -133,6 +133,13 @@ describe('property: totality', () => {
         expect(typeof decision.matched).toBe('boolean');
         expect(Array.isArray(decision.errors)).toBe(true);
         expect(decision.diagnostics).toBeDefined();
+        // Outcome must be one of the four enum values (Architecture Lock).
+        expect([
+          'matched',
+          'not_matched',
+          'not_applicable',
+          'evaluation_error',
+        ]).toContain(decision.outcome);
       }),
       { numRuns: 200 },
     );
@@ -146,6 +153,129 @@ describe('property: totality', () => {
         expect(typeof decision.matched).toBe('boolean');
       }),
       { numRuns: 200 },
+    );
+  });
+
+  /**
+   * Adversarial 10k-iteration totality stress (Codex review #98 ask 4).
+   *
+   * Generates aggressive inputs:
+   *  - deeply nested predicates (random branch shapes up to size ≈ 8 deep)
+   *  - missing context fields (small context dict + large field-path pool)
+   *  - malformed regex patterns (random non-string + ReDoS shapes)
+   *  - empty contexts, null contexts, primitive contexts
+   *
+   * Invariants:
+   *  - never throws
+   *  - returns a `PolicyDecision`-shaped object
+   *  - outcome is a member of the closed enum
+   *  - matched implies outcome === 'matched' and effect present
+   *  - evaluation_error MUST have at least one error
+   */
+  it('totality holds for 10k adversarial inputs', () => {
+    const adversarialContext = fc.oneof(
+      fc.constant(null),
+      fc.constant(undefined),
+      fc.integer(),
+      fc.string(),
+      fc.boolean(),
+      contextArb,
+      // Deeply nested adversarial context
+      fc.dictionary(fc.string({ maxLength: 4 }), valueArb, { maxKeys: 16 }),
+    );
+
+    // Adversarial regex pool — mix of safe, ReDoS, and invalid patterns.
+    const adversarialRegex = fc.oneof(
+      fc.constant('^a'),
+      fc.constant('(a+)+$'), // ReDoS-prone
+      fc.constant('[unclosed'), // invalid syntax
+      fc.constant('(a|aa)+'), // ambiguous
+      fc.string({ maxLength: 32 }),
+    );
+
+    // Adversarial leaf — sometimes asks for a path that doesn't exist.
+    const adversarialLeaf: fc.Arbitrary<PolicyPredicate> = fc.record({
+      kind: fc.constant('leaf' as const),
+      field: fc.oneof(
+        fc.constant('missing.nested.path'),
+        fc.constant('a'),
+        fc.constant(''),
+        fc.string({ maxLength: 16 }),
+        fieldArb,
+      ),
+      op: operatorArb,
+      value: fc.oneof(valueArb, adversarialRegex),
+    }) as fc.Arbitrary<PolicyPredicate>;
+
+    const adversarialBody: fc.Arbitrary<PolicyRuleBody> = fc.record({
+      rule_id: fc.option(fc.string({ maxLength: 16 }), { nil: undefined }),
+      predicate: fc.oneof(
+        adversarialLeaf,
+        // Compose AND/OR/NOT with the adversarial leaf for shallow but
+        // wide adversarial trees.
+        fc.record({
+          kind: fc.constant('and' as const),
+          predicates: fc.array(adversarialLeaf, { minLength: 0, maxLength: 6 }),
+        }),
+        fc.record({
+          kind: fc.constant('or' as const),
+          predicates: fc.array(adversarialLeaf, { minLength: 0, maxLength: 6 }),
+        }),
+        fc.record({
+          kind: fc.constant('not' as const),
+          predicate: adversarialLeaf,
+        }),
+        predicateArb,
+      ),
+      effect: fc.record({
+        action: effectActionArb,
+        message: fc.option(fc.string({ maxLength: 16 }), { nil: undefined }),
+      }) as fc.Arbitrary<PolicyRuleBody['effect']>,
+    }) as fc.Arbitrary<PolicyRuleBody>;
+
+    fc.assert(
+      fc.property(adversarialBody, adversarialContext, (body, ctx) => {
+        let decision;
+        try {
+          decision = evaluate(body, ctx);
+        } catch (e) {
+          // Totality violation — the evaluator MUST NOT throw.
+          throw new Error(`evaluator threw: ${String(e)}`, { cause: e });
+        }
+        expect(decision).toBeDefined();
+        expect([
+          'matched',
+          'not_matched',
+          'not_applicable',
+          'evaluation_error',
+        ]).toContain(decision.outcome);
+        expect(Array.isArray(decision.errors)).toBe(true);
+        expect(typeof decision.matched).toBe('boolean');
+
+        // Invariant: matched implies outcome === 'matched' AND effect present.
+        if (decision.matched) {
+          expect(decision.outcome).toBe('matched');
+          expect(decision.effect).toBeDefined();
+        }
+        // Invariant: outcome=evaluation_error MUST have at least one error.
+        if (decision.outcome === 'evaluation_error') {
+          expect(decision.errors.length).toBeGreaterThan(0);
+        }
+        // Invariant: outcome=matched/not_matched/not_applicable MUST have
+        // no errors (errors force evaluation_error).
+        if (
+          decision.outcome === 'matched' ||
+          decision.outcome === 'not_matched' ||
+          decision.outcome === 'not_applicable'
+        ) {
+          expect(decision.errors).toEqual([]);
+        }
+        // Invariant: effect is only present when matched.
+        if (decision.outcome !== 'matched') {
+          expect(decision.effect).toBeUndefined();
+        }
+      }),
+      { numRuns: 10_000 },
     );
   });
 });

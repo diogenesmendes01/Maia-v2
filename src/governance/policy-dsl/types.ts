@@ -140,16 +140,60 @@ export type PolicyRuleBody = {
 };
 
 /**
+ * Tri-state outcome of a policy evaluation. This is the **load-bearing**
+ * discriminator that PEPs (Policy Enforcement Points) must switch on. It is
+ * intentionally distinct from `matched: boolean` because the difference
+ * between "rule didn't apply" and "rule could not be evaluated safely" is a
+ * security boundary — collapsing them silently turns missing context into an
+ * implicit allow.
+ *
+ *  - `matched` — predicate evaluated to `true`. PEP MUST apply `effect`.
+ *  - `not_matched` — predicate evaluated to `false` cleanly. PEP MAY ignore
+ *    the rule (it didn't fire) but the rule WAS evaluable.
+ *  - `not_applicable` — a required field was missing for an equality-style
+ *    operator (`eq`/`neq`/`in`/`not_in`/`contains`/`matches`). The policy
+ *    author's intent — "rule applies when field has this value" — cannot be
+ *    answered when the field is absent. PEP MAY ignore (treat as not-fired)
+ *    but MUST surface in audit (fields drift can hide bugs).
+ *  - `evaluation_error` — the evaluator could not produce a sound decision
+ *    (ordinal op against a missing field, depth-exceeded, malformed runtime
+ *    body, regex compile failure). **PEPs MUST treat this as BLOCK** —
+ *    default-safe. Letting `evaluation_error` reach the LLM as "policy
+ *    didn't apply" is an Architecture Lock violation; `enforce()` in
+ *    `enforcement.ts` is the canonical helper that does this correctly.
+ *
+ * Architecture Lock: this enum and its semantics are immutable. Adding a
+ * new variant requires founder approval because every PEP must explicitly
+ * handle each case.
+ */
+export type PolicyOutcome =
+  | 'matched'
+  | 'not_matched'
+  | 'not_applicable'
+  | 'evaluation_error';
+
+/**
  * Result of `evaluate()`. The evaluator never throws — every error is
- * captured as a `PolicyDecision.errors` entry and `matched` is set to
- * `false` so the consumer treats the policy as inert.
+ * captured as a `PolicyDecision.errors` entry and `outcome` is set to
+ * `evaluation_error` or `not_applicable` so the consumer treats the policy
+ * as inert (or in the case of `evaluation_error`, as BLOCK — see
+ * `PolicyOutcome` docs and the `enforce()` Architecture Lock).
  */
 export type PolicyDecision = {
-  /** `true` iff `predicate` evaluated to `true` (with no errors). */
+  /**
+   * Tri-state outcome. **PEPs MUST switch on this**, not on `matched`,
+   * because the boolean view collapses `not_applicable` and `evaluation_error`
+   * into `false` — turning a missing field into implicit allow.
+   */
+  outcome: PolicyOutcome;
+  /**
+   * Convenience alias for `outcome === 'matched'`. Retained for readability
+   * in tests + simple consumers; production PEPs MUST switch on `outcome`.
+   */
   matched: boolean;
   /** Mirrors `rule_body.rule_id` when present. */
   rule_id?: string;
-  /** Applied effect (only when `matched === true`). */
+  /** Applied effect (only when `outcome === 'matched'`). */
   effect?: PolicyEffect;
   /** Captured non-fatal evaluator errors (depth, ReDoS, bad shape, etc.). */
   errors: PolicyEvaluationError[];
@@ -184,6 +228,27 @@ export type PolicyEvaluationErrorCode =
   | 'field_path_depth_exceeded'
   /** Leaf `field` cannot be resolved (returns `undefined`). */
   | 'field_path_unresolvable'
+  /**
+   * Ordinal operator (`gt`/`gte`/`lt`/`lte`) targeted a missing field.
+   * Unlike equality ops, ordinal comparisons against missing context are
+   * **not** safe to silently coerce — `amount > 100` against a context with
+   * no `amount` cannot be answered. This is an evaluation error, NOT a
+   * `not_applicable` and NOT a `not_matched`. PEPs MUST block on this.
+   */
+  | 'missing_field'
+  /**
+   * Branch child (in `and.predicates`/`or.predicates`) was `null`, `undefined`,
+   * or otherwise not an object. The evaluator does NOT silently skip such
+   * children (previous behaviour was an Architecture Lock violation — a
+   * `{kind:'and', predicates:[null]}` body could match vacuously).
+   */
+  | 'malformed_branch_child'
+  /**
+   * `rule_body.effect` was missing or had an unknown action at evaluation
+   * time. Matched decisions with invalid effects are forced inert and the
+   * outcome becomes `evaluation_error` so the PEP blocks.
+   */
+  | 'invalid_effect'
   /** `matches` input string exceeds `MAX_REGEX_INPUT_LENGTH`. */
   | 'regex_input_too_long'
   /** `matches` pattern failed `safe-regex2` (proposal-time validator). */
@@ -212,7 +277,15 @@ export type PolicyValidationErrorCode =
   | 'in_value_not_array'
   | 'predicate_too_deep'
   | 'regex_pattern_invalid'
-  | 'regex_pattern_unsafe';
+  | 'regex_pattern_unsafe'
+  /**
+   * Leaf `field` path is not present in any allowed `EvaluationContext`
+   * schema (Early/Mid/Late). Only emitted when the caller passes an
+   * `allowedFieldPaths` option to `validatePolicyRuleBody`. Default behaviour
+   * is permissive (the path is accepted) for backwards-compat; P9b passes
+   * the strict set when validating policies at proposal time.
+   */
+  | 'unknown_field_path';
 
 export type PolicyValidationError = {
   code: PolicyValidationErrorCode;

@@ -15,7 +15,11 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { validatePolicyRuleBody } from '@/governance/policy-dsl/validator.js';
 import { resetRegexCache } from '@/governance/policy-dsl/regex-cache.js';
-import { MAX_PREDICATE_DEPTH } from '@/governance/policy-dsl/constants.js';
+import {
+  MAX_BRANCH_FANOUT,
+  MAX_PREDICATE_DEPTH,
+  MAX_TOTAL_PREDICATE_NODES,
+} from '@/governance/policy-dsl/constants.js';
 
 afterEach(() => {
   resetRegexCache();
@@ -270,6 +274,162 @@ describe('validatePolicyRuleBody — accumulation', () => {
     if (!result.ok) {
       // At least 4 errors: 3 leaf + 1 unknown_effect_action.
       expect(result.errors.length).toBeGreaterThanOrEqual(4);
+    }
+  });
+});
+
+describe('validatePolicyRuleBody — bounded fan-out (Codex review #98)', () => {
+  it('rejects and.predicates with > MAX_BRANCH_FANOUT children', () => {
+    const huge = Array.from({ length: MAX_BRANCH_FANOUT + 1 }, () => ({
+      kind: 'leaf' as const,
+      field: 'a',
+      op: 'eq' as const,
+      value: 1,
+    }));
+    const result = validatePolicyRuleBody({
+      predicate: { kind: 'and', predicates: huge },
+      effect: { action: 'block' },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.errors.some((e) => e.code === 'predicate_too_deep')).toBe(true);
+    }
+  });
+
+  it('rejects or.predicates with > MAX_BRANCH_FANOUT children', () => {
+    const huge = Array.from({ length: MAX_BRANCH_FANOUT + 1 }, () => ({
+      kind: 'leaf' as const,
+      field: 'a',
+      op: 'eq' as const,
+      value: 1,
+    }));
+    const result = validatePolicyRuleBody({
+      predicate: { kind: 'or', predicates: huge },
+      effect: { action: 'block' },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.errors.some((e) => e.code === 'predicate_too_deep')).toBe(true);
+    }
+  });
+
+  it('rejects total nodes exceeding MAX_TOTAL_PREDICATE_NODES', () => {
+    // Build a degenerate tree where each level has fan-out 4 — the total
+    // node count blows past the cap before depth blows up.
+    let total = 0;
+    function build(remaining: number): unknown {
+      total += 1;
+      if (remaining <= 0 || total >= MAX_TOTAL_PREDICATE_NODES * 2) {
+        return { kind: 'leaf', field: 'a', op: 'eq', value: 1 };
+      }
+      return {
+        kind: 'and',
+        predicates: Array.from({ length: 4 }, () => build(remaining - 1)),
+      };
+    }
+    // Reset total then build with enough depth to overshoot the cap but
+    // within MAX_PREDICATE_DEPTH.
+    total = 0;
+    const pred = build(MAX_PREDICATE_DEPTH - 1);
+    const result = validatePolicyRuleBody({
+      predicate: pred,
+      effect: { action: 'block' },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.errors.some((e) => e.code === 'predicate_too_deep')).toBe(true);
+    }
+  });
+});
+
+describe('validatePolicyRuleBody — branch children must be objects (Codex review #98)', () => {
+  it('rejects and.predicates containing null', () => {
+    const result = validatePolicyRuleBody({
+      predicate: { kind: 'and', predicates: [null] },
+      effect: { action: 'block' },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.errors.some((e) => e.code === 'missing_predicate_kind')).toBe(true);
+    }
+  });
+
+  it('rejects or.predicates containing a non-object', () => {
+    const result = validatePolicyRuleBody({
+      predicate: { kind: 'or', predicates: ['not-an-object'] },
+      effect: { action: 'block' },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.errors.some((e) => e.code === 'missing_predicate_kind')).toBe(true);
+    }
+  });
+});
+
+describe('validatePolicyRuleBody — allowedFieldPaths (Codex review #98)', () => {
+  const allowlist = new Set(['user.role', 'channel', 'risk_score', 'message']);
+
+  it('accepts paths in allowlist', () => {
+    const result = validatePolicyRuleBody(
+      {
+        predicate: { kind: 'leaf', field: 'channel', op: 'eq', value: 'whatsapp' },
+        effect: { action: 'block' },
+      },
+      { allowedFieldPaths: allowlist },
+    );
+    expect(result.ok).toBe(true);
+  });
+
+  it('rejects paths NOT in allowlist with unknown_field_path', () => {
+    const result = validatePolicyRuleBody(
+      {
+        predicate: { kind: 'leaf', field: 'mystery.field', op: 'eq', value: 1 },
+        effect: { action: 'block' },
+      },
+      { allowedFieldPaths: allowlist },
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.errors.some((e) => e.code === 'unknown_field_path')).toBe(true);
+    }
+  });
+
+  it('checks every leaf in a compound predicate', () => {
+    const result = validatePolicyRuleBody(
+      {
+        predicate: {
+          kind: 'and',
+          predicates: [
+            { kind: 'leaf', field: 'channel', op: 'eq', value: 'x' },
+            { kind: 'leaf', field: 'unknown_field', op: 'eq', value: 1 },
+          ],
+        },
+        effect: { action: 'block' },
+      },
+      { allowedFieldPaths: allowlist },
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.errors.some((e) => e.code === 'unknown_field_path')).toBe(true);
+    }
+  });
+
+  it('default (no allowlist) is permissive — any path accepted', () => {
+    const result = validatePolicyRuleBody({
+      predicate: { kind: 'leaf', field: 'anything.goes', op: 'eq', value: 1 },
+      effect: { action: 'block' },
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  it('rejects empty path segments (a..b) even without allowlist', () => {
+    const result = validatePolicyRuleBody({
+      predicate: { kind: 'leaf', field: 'a..b', op: 'eq', value: 1 },
+      effect: { action: 'block' },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.errors.some((e) => e.code === 'missing_leaf_field')).toBe(true);
     }
   });
 });

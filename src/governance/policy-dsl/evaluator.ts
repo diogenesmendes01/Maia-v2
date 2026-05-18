@@ -7,23 +7,46 @@
  * **Hard guarantees**:
  *  - **Pure**: no I/O, no side-effects, no `Date.now()`/`Math.random()`.
  *  - **Total**: never throws; every error path returns a `PolicyDecision`
- *    with `matched=false` and a structured `errors` entry.
+ *    with `outcome=evaluation_error` (or `not_applicable`) and a structured
+ *    `errors` entry.
  *  - **Deterministic**: identical inputs → byte-identical decisions.
  *  - **Bounded**: predicate depth ≤ `MAX_PREDICATE_DEPTH`, field paths ≤
  *    `MAX_FIELD_PATH_DEPTH`, regex inputs ≤ `MAX_REGEX_INPUT_LENGTH`.
  *  - **ReDoS-safe**: every `matches` pattern routes through the
  *    `safe-regex2`-gated cache; inputs are length-capped.
+ *  - **Fail-closed on missing context**: equality ops short-circuit to
+ *    `not_applicable`; ordinal ops short-circuit to `evaluation_error`.
+ *    Branch children that aren't objects produce `malformed_branch_child`
+ *    and force the whole decision inert — they are never silently skipped.
+ *  - **Matched decisions have valid effects**: runtime re-checks the effect
+ *    shape before returning `matched=true`; missing/unknown actions emit
+ *    `invalid_effect` and force `evaluation_error`.
+ *
+ * Tri-state outcome (`PolicyOutcome`):
+ *  - `matched`: predicate true + effect valid + no errors.
+ *  - `not_matched`: predicate false (all fields present, all ops clean).
+ *  - `not_applicable`: equality/membership/string op hit a missing field.
+ *  - `evaluation_error`: structural fault, ordinal op against missing field,
+ *    malformed branch child, depth-exceeded, regex compile failure, or
+ *    invalid effect.
+ *
+ * **Caller contract (PEPs)**: callers MUST switch on `decision.outcome`.
+ * Treating `decision.matched === false` as "rule didn't apply" collapses
+ * `not_applicable` and `evaluation_error` into a silent allow. Use the
+ * `enforce()` helper in `enforcement.ts` for the canonical fail-closed
+ * mapping (Architecture Lock).
  *
  * Effects are **advisory data**: `evaluate()` returns `decision.effect` when
- * `predicate` evaluates to `true`. Enforcement (block/warn/escalate) lives
- * in the consumer (P9b Decision Engine). This separation keeps the evaluator
+ * the outcome is `matched`. Enforcement (block/warn/escalate) lives in the
+ * consumer (P9b Decision Engine). This separation keeps the evaluator
  * trivially auditable and lets multiple PEPs share one evaluator.
  *
- * Architecture Lock: changes to AST shape, operator semantics, or bounds
- * require founder approval. See `types.ts` and `constants.ts`.
+ * Architecture Lock: changes to AST shape, operator semantics, outcome
+ * enum, or bounds require founder approval. See `types.ts` and `constants.ts`.
  */
 
 import {
+  ALLOWED_EFFECT_ACTIONS,
   MAX_PREDICATE_DEPTH,
   MAX_REGEX_INPUT_LENGTH,
 } from './constants.js';
@@ -46,6 +69,20 @@ import type {
   PolicyRuleBody,
 } from './types.js';
 
+const ALLOWED_EFFECTS_SET = new Set<string>(ALLOWED_EFFECT_ACTIONS);
+
+/**
+ * Leaf result tri-state. The evaluator propagates this through the boolean
+ * tree so we can surface `not_applicable` vs `not_matched` at the top.
+ *
+ *  - `true`   — leaf matched cleanly.
+ *  - `false`  — leaf evaluated cleanly and did not match.
+ *  - `na`     — required field was absent for an equality-style operator;
+ *    the leaf has no defined truth value.
+ *  - `err`    — an evaluation error was recorded; the whole decision is inert.
+ */
+type LeafTriState = true | false | 'na' | 'err';
+
 /** Mutable evaluation state threaded through recursion. */
 type EvalState = {
   errors: PolicyEvaluationError[];
@@ -55,10 +92,21 @@ type EvalState = {
 /**
  * Evaluate `rule_body` against `context`. Returns a `PolicyDecision`.
  *
- * Errors during evaluation are captured (never thrown). When `errors.length
- * > 0` the consumer should treat the policy as inert (`matched === false`)
- * and surface the codes for ops review. The evaluator's totality guarantee
- * means a malformed policy can never crash a PEP.
+ * Errors during evaluation are captured (never thrown). The decision's
+ * `outcome` field is the load-bearing discriminator:
+ *
+ *  - `matched`: predicate true + effect valid + zero errors.
+ *  - `not_matched`: predicate false, all fields present, no errors.
+ *  - `not_applicable`: an equality/membership/string op needed a field that
+ *    was absent — author intent ("rule applies when field has this value")
+ *    has no defined answer.
+ *  - `evaluation_error`: ordinal op against missing field, malformed runtime
+ *    body, depth/length-exceeded, regex compile failure, invalid effect.
+ *    **PEPs MUST treat this as BLOCK**.
+ *
+ * The evaluator's totality guarantee means a malformed policy can never
+ * crash a PEP — but it CAN force `evaluation_error`, which PEPs MUST
+ * fail-closed on. See `enforcement.ts` for the canonical helper.
  */
 export function evaluate(
   rule_body: PolicyRuleBody | null | undefined,
@@ -90,15 +138,78 @@ export function evaluate(
     });
   }
 
-  const matched = evalPredicate(rule_body.predicate, context, state, 0, '$.predicate');
+  const leafResult = evalPredicate(
+    rule_body.predicate,
+    context,
+    state,
+    0,
+    '$.predicate',
+  );
 
-  // Effect is only attached when matched and there were no evaluation errors.
-  // This makes "soft fail" (errors → matched=false) trivially observable.
-  const effect =
-    matched && state.errors.length === 0 ? rule_body.effect : undefined;
+  // Any recorded error forces evaluation_error regardless of the boolean.
+  if (state.errors.length > 0 || leafResult === 'err') {
+    return {
+      outcome: 'evaluation_error',
+      matched: false,
+      rule_id: rule_body.rule_id,
+      errors: state.errors,
+      diagnostics: state.diagnostics,
+    };
+  }
+
+  if (leafResult === 'na') {
+    return {
+      outcome: 'not_applicable',
+      matched: false,
+      rule_id: rule_body.rule_id,
+      errors: state.errors,
+      diagnostics: state.diagnostics,
+    };
+  }
+
+  if (leafResult === false) {
+    return {
+      outcome: 'not_matched',
+      matched: false,
+      rule_id: rule_body.rule_id,
+      errors: state.errors,
+      diagnostics: state.diagnostics,
+    };
+  }
+
+  // leafResult === true → matched. Re-validate effect before returning it.
+  // Architecture Lock: a matched decision MUST carry an enforceable effect.
+  // Validator catches this at proposal time, but DB corruption or schema
+  // drift could let an invalid effect through; we re-check defensively.
+  const effect = rule_body.effect;
+  const effectValid =
+    effect &&
+    typeof effect === 'object' &&
+    typeof (effect as { action?: unknown }).action === 'string' &&
+    ALLOWED_EFFECTS_SET.has((effect as { action: string }).action);
+
+  if (!effectValid) {
+    const action = (effect as { action?: unknown } | undefined)?.action;
+    state.errors.push({
+      code: 'invalid_effect',
+      message:
+        effect === undefined || effect === null
+          ? 'matched decision has missing effect'
+          : `matched decision has invalid effect.action: ${String(action)}`,
+      path: '$.effect',
+    });
+    return {
+      outcome: 'evaluation_error',
+      matched: false,
+      rule_id: rule_body.rule_id,
+      errors: state.errors,
+      diagnostics: state.diagnostics,
+    };
+  }
 
   return {
-    matched: matched && state.errors.length === 0,
+    outcome: 'matched',
+    matched: true,
     rule_id: rule_body.rule_id,
     effect,
     errors: state.errors,
@@ -109,6 +220,7 @@ export function evaluate(
 function inert(state: EvalState, error: PolicyEvaluationError): PolicyDecision {
   state.errors.push(error);
   return {
+    outcome: 'evaluation_error',
     matched: false,
     errors: state.errors,
     diagnostics: state.diagnostics,
@@ -121,7 +233,7 @@ function evalPredicate(
   state: EvalState,
   depth: number,
   path: string,
-): boolean {
+): LeafTriState {
   state.diagnostics.predicate_depth_visited = Math.max(
     state.diagnostics.predicate_depth_visited,
     depth,
@@ -133,7 +245,7 @@ function evalPredicate(
       message: `predicate depth ${depth} exceeds limit ${MAX_PREDICATE_DEPTH}`,
       path,
     });
-    return false;
+    return 'err';
   }
 
   if (!pred || typeof pred !== 'object') {
@@ -142,7 +254,7 @@ function evalPredicate(
       message: 'predicate node is missing or not an object',
       path,
     });
-    return false;
+    return 'err';
   }
 
   switch (pred.kind) {
@@ -153,69 +265,141 @@ function evalPredicate(
     case 'or':
       return evalOr(pred.predicates, context, state, depth, path);
     case 'not':
-      return !evalPredicate(pred.predicate, context, state, depth + 1, `${path}.not`);
+      return evalNot(pred.predicate, context, state, depth, path);
     default:
       state.errors.push({
         code: 'malformed_predicate',
         message: `unknown predicate kind: ${String((pred as { kind: unknown }).kind)}`,
         path,
       });
-      return false;
+      return 'err';
   }
 }
 
+/**
+ * AND fold over tri-state children.
+ *
+ * Truth table (left × right):
+ *   true  &&  true   = true
+ *   true  &&  false  = false   (short-circuit on first false)
+ *   any   &&  err    = err
+ *   any   &&  na     = na      (cannot answer AND if one side is N/A,
+ *                                unless we already saw a false → short-circuit)
+ *   false &&  any    = false
+ *
+ * Note: `not_applicable` is "absorbed" by `false` (a definite false stays
+ * false even alongside an N/A) but otherwise propagates upward — an AND
+ * with a clean true and an N/A is N/A, mirroring three-valued (Kleene) logic.
+ */
 function evalAnd(
   preds: PolicyPredicate[] | undefined,
   context: unknown,
   state: EvalState,
   depth: number,
   path: string,
-): boolean {
+): LeafTriState {
   if (!Array.isArray(preds)) {
     state.errors.push({
       code: 'malformed_predicate',
       message: 'and.predicates is not an array',
       path,
     });
-    return false;
+    return 'err';
   }
   // Empty AND is vacuously true (matches boolean-algebra identity).
-  // Short-circuit on first false to keep cost minimal.
+  let sawNotApplicable = false;
   for (let i = 0; i < preds.length; i += 1) {
     const child = preds[i];
-    if (!child) continue;
-    if (!evalPredicate(child, context, state, depth + 1, `${path}.and[${i}]`)) {
-      return false;
+    // Per Codex review: do NOT silently skip null/undefined children. A
+    // corrupted `{kind:'and', predicates:[null]}` body would otherwise
+    // evaluate to vacuously true and bypass governance.
+    if (child === null || child === undefined || typeof child !== 'object') {
+      state.errors.push({
+        code: 'malformed_branch_child',
+        message: `and.predicates[${i}] is not a predicate object`,
+        path: `${path}.and[${i}]`,
+      });
+      return 'err';
     }
+    const r = evalPredicate(child, context, state, depth + 1, `${path}.and[${i}]`);
+    if (r === 'err') return 'err';
+    if (r === false) return false;
+    if (r === 'na') sawNotApplicable = true;
+    // r === true → continue scanning.
   }
-  return true;
+  return sawNotApplicable ? 'na' : true;
 }
 
+/**
+ * OR fold over tri-state children. Dual of `evalAnd`.
+ *
+ * Truth table:
+ *   true  ||  any    = true    (short-circuit on first true)
+ *   false ||  false  = false
+ *   any   ||  err    = err
+ *   false ||  na     = na      (cannot answer OR if all defined sides are
+ *                                false and at least one is N/A)
+ */
 function evalOr(
   preds: PolicyPredicate[] | undefined,
   context: unknown,
   state: EvalState,
   depth: number,
   path: string,
-): boolean {
+): LeafTriState {
   if (!Array.isArray(preds)) {
     state.errors.push({
       code: 'malformed_predicate',
       message: 'or.predicates is not an array',
       path,
     });
-    return false;
+    return 'err';
   }
   // Empty OR is vacuously false (boolean-algebra identity).
-  // Short-circuit on first true.
+  let sawNotApplicable = false;
   for (let i = 0; i < preds.length; i += 1) {
     const child = preds[i];
-    if (!child) continue;
-    if (evalPredicate(child, context, state, depth + 1, `${path}.or[${i}]`)) {
-      return true;
+    if (child === null || child === undefined || typeof child !== 'object') {
+      state.errors.push({
+        code: 'malformed_branch_child',
+        message: `or.predicates[${i}] is not a predicate object`,
+        path: `${path}.or[${i}]`,
+      });
+      return 'err';
     }
+    const r = evalPredicate(child, context, state, depth + 1, `${path}.or[${i}]`);
+    if (r === 'err') return 'err';
+    if (r === true) return true;
+    if (r === 'na') sawNotApplicable = true;
+    // r === false → continue scanning.
   }
-  return false;
+  return sawNotApplicable ? 'na' : false;
+}
+
+/**
+ * NOT inversion preserves `not_applicable`/`err`. Inverting `not_applicable`
+ * to `matched=true` would be unsound — "the field is missing so the policy
+ * applies" is the exact failure mode that lets exclusion-style rules
+ * (`not_in ['banned']`) silently match.
+ */
+function evalNot(
+  inner: PolicyPredicate,
+  context: unknown,
+  state: EvalState,
+  depth: number,
+  path: string,
+): LeafTriState {
+  if (!inner || typeof inner !== 'object') {
+    state.errors.push({
+      code: 'malformed_branch_child',
+      message: 'not.predicate is missing or not an object',
+      path: `${path}.not`,
+    });
+    return 'err';
+  }
+  const r = evalPredicate(inner, context, state, depth + 1, `${path}.not`);
+  if (r === 'err' || r === 'na') return r;
+  return !r as LeafTriState;
 }
 
 function evalLeaf(
@@ -223,14 +407,14 @@ function evalLeaf(
   context: unknown,
   state: EvalState,
   path: string,
-): boolean {
+): LeafTriState {
   if (typeof leaf.field !== 'string') {
     state.errors.push({
       code: 'malformed_predicate',
       message: 'leaf.field is missing or not a string',
       path,
     });
-    return false;
+    return 'err';
   }
   if (typeof leaf.op !== 'string') {
     state.errors.push({
@@ -238,7 +422,7 @@ function evalLeaf(
       message: 'leaf.op is missing or not a string',
       path,
     });
-    return false;
+    return 'err';
   }
 
   if (isFieldPathTooDeep(leaf.field)) {
@@ -247,16 +431,50 @@ function evalLeaf(
       message: `field path "${leaf.field}" exceeds depth limit`,
       path: `${path}.field`,
     });
-    return false;
+    return 'err';
   }
 
   state.diagnostics.field_lookups += 1;
   const fieldValue = resolveFieldPath(context, leaf.field);
-  // Note: unresolved fields are NOT errors — they simply make the leaf
-  // false (consistent with the policy author's intent: "if the field is
-  // missing, the predicate doesn't apply"). Only unresolvable + an op that
-  // strictly requires a value would otherwise need to throw, but our op
-  // semantics already return false for type-mismatched operands.
+  const fieldMissing = fieldValue === undefined;
+
+  // Per-operator missing-field policy (Architecture Lock — see types.ts).
+  //
+  //  - Equality / membership / string ops → `not_applicable`. Author intent
+  //    ("rule applies when field has this value") cannot be answered when
+  //    the field is absent. Negative predicates like `neq` or `not_in` MUST
+  //    NOT silently coerce `undefined` into a match — that flipped
+  //    exclusion lists into implicit allow rules (Codex review #98 critical).
+  //  - Ordinal ops (`gt`/`gte`/`lt`/`lte`) → `evaluation_error: missing_field`.
+  //    Numeric comparison against missing context cannot be coerced to 0
+  //    without changing the rule's meaning. PEP MUST block.
+  //  - `not` / `and` / `or` propagation: see `evalNot`/`evalAnd`/`evalOr`.
+  if (fieldMissing) {
+    switch (leaf.op as PolicyOperator) {
+      case 'eq':
+      case 'neq':
+      case 'in':
+      case 'not_in':
+      case 'contains':
+      case 'matches':
+        return 'na';
+      case 'gt':
+      case 'gte':
+      case 'lt':
+      case 'lte':
+        state.errors.push({
+          code: 'missing_field',
+          message: `ordinal op "${leaf.op}" requires a numeric value at "${leaf.field}" (got undefined)`,
+          path: `${path}.field`,
+        });
+        return 'err';
+      default:
+        // Unknown op falls through to `applyOperator` which will record
+        // `malformed_predicate`.
+        break;
+    }
+  }
+
   return applyOperator(leaf.op as PolicyOperator, fieldValue, leaf.value, state, path);
 }
 
@@ -266,7 +484,7 @@ function applyOperator(
   right: unknown,
   state: EvalState,
   path: string,
-): boolean {
+): LeafTriState {
   switch (op) {
     case 'eq':
       return deepEqual(left, right);
@@ -296,7 +514,7 @@ function applyOperator(
         message: `unknown operator: ${String(op)}`,
         path,
       });
-      return false;
+      return 'err';
   }
 }
 
@@ -358,7 +576,7 @@ function matchesOp(
   right: unknown,
   state: EvalState,
   path: string,
-): boolean {
+): LeafTriState {
   if (typeof right !== 'string') return false;
   // Only string inputs can be regex-matched. Numbers, booleans, etc. → false.
   if (typeof left !== 'string') return false;
@@ -368,7 +586,7 @@ function matchesOp(
       message: `input length ${left.length} exceeds ${MAX_REGEX_INPUT_LENGTH}`,
       path,
     });
-    return false;
+    return 'err';
   }
 
   // Short-circuit if the cache already knows this pattern is unsafe (so we
@@ -380,7 +598,7 @@ function matchesOp(
       message: `pattern "${right}" failed safe-regex2`,
       path,
     });
-    return false;
+    return 'err';
   }
 
   const regex = compileSafeRegex(right);
@@ -407,7 +625,7 @@ function matchesOp(
         path,
       });
     }
-    return false;
+    return 'err';
   }
   // Diagnostics (best-effort): we can't tell from here whether this was a
   // hit or a fresh compile without inspecting the cache stats; the
@@ -420,6 +638,6 @@ function matchesOp(
       message: `regex.test threw on input of length ${left.length}`,
       path,
     });
-    return false;
+    return 'err';
   }
 }

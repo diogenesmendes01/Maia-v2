@@ -278,10 +278,189 @@ describe('evaluate — totality and error capture', () => {
     expect(d.errors[0]?.code).toBe('regex_evaluation_failed');
   });
 
-  it('missing field is NOT an error (false but no error code)', () => {
+  it('missing field for equality op yields not_applicable (no error)', () => {
+    // Tightened by Codex review #98: previously this was just `matched=false`
+    // with no signal to the PEP that the rule never had a chance to apply.
     const d = evaluate(blockBody(leaf('a', 'eq', 1)), { b: 2 });
     expect(d.matched).toBe(false);
+    expect(d.outcome).toBe('not_applicable');
     expect(d.errors).toEqual([]);
+  });
+});
+
+describe('evaluate — missing-field semantics (per-operator, Codex review #98)', () => {
+  // For equality / membership / string operators a missing field cannot
+  // answer "does this rule apply?" — outcome MUST be `not_applicable` so
+  // PEPs can distinguish "rule said no" from "rule had no data".
+  it.each([
+    ['eq', 1],
+    ['neq', 1],
+    ['in', [1, 2]],
+    ['not_in', [1, 2]],
+    ['contains', 'foo'],
+    ['matches', '^foo'],
+  ])('%s on missing field → not_applicable, no errors', (op, value) => {
+    const d = evaluate(blockBody(leaf('missing.path', op, value)), {});
+    expect(d.outcome).toBe('not_applicable');
+    expect(d.matched).toBe(false);
+    expect(d.errors).toEqual([]);
+  });
+
+  // Critical Codex finding: `neq` against a missing field previously returned
+  // `!deepEqual(undefined, value)` → true → matched! That was a silent allow.
+  it('neq on missing field does NOT silently match (was Codex critical)', () => {
+    const d = evaluate(blockBody(leaf('role', 'neq', 'admin')), {});
+    expect(d.matched).toBe(false);
+    expect(d.outcome).toBe('not_applicable');
+  });
+
+  // Critical Codex finding: `not_in` against missing field returned true
+  // → "role not in [banned]" matched on absent role → silent allow.
+  it('not_in on missing field does NOT silently match (was Codex critical)', () => {
+    const d = evaluate(blockBody(leaf('role', 'not_in', ['banned'])), {});
+    expect(d.matched).toBe(false);
+    expect(d.outcome).toBe('not_applicable');
+  });
+
+  // For ordinal ops, missing context is an evaluation_error (cannot coerce
+  // undefined to a number without changing meaning). PEPs MUST block.
+  it.each(['gt', 'gte', 'lt', 'lte'])('%s on missing field → evaluation_error: missing_field', (op) => {
+    const d = evaluate(blockBody(leaf('amount', op, 100)), {});
+    expect(d.outcome).toBe('evaluation_error');
+    expect(d.matched).toBe(false);
+    expect(d.errors.some((e) => e.code === 'missing_field')).toBe(true);
+  });
+
+  // NOT propagation: `not(not_applicable)` MUST stay `not_applicable`,
+  // NOT become `matched=true`. Inverting "we don't know" doesn't give us
+  // a definite answer.
+  it('not(not_applicable) propagates not_applicable (not inverted to matched)', () => {
+    const d = evaluate(
+      blockBody({ kind: 'not', predicate: leaf('a', 'eq', 1) }),
+      { b: 2 },
+    );
+    expect(d.outcome).toBe('not_applicable');
+    expect(d.matched).toBe(false);
+  });
+
+  // AND with one not_applicable side and one true side → not_applicable
+  // (Kleene three-valued semantics). A definite false still wins.
+  it('AND: true && not_applicable → not_applicable', () => {
+    const d = evaluate(
+      blockBody({
+        kind: 'and',
+        predicates: [leaf('present', 'eq', 1), leaf('missing', 'eq', 2)],
+      }),
+      { present: 1 },
+    );
+    expect(d.outcome).toBe('not_applicable');
+  });
+
+  it('AND: false && not_applicable → false (definite false wins)', () => {
+    const d = evaluate(
+      blockBody({
+        kind: 'and',
+        predicates: [leaf('present', 'eq', 999), leaf('missing', 'eq', 2)],
+      }),
+      { present: 1 },
+    );
+    expect(d.outcome).toBe('not_matched');
+  });
+
+  it('OR: false || not_applicable → not_applicable', () => {
+    const d = evaluate(
+      blockBody({
+        kind: 'or',
+        predicates: [leaf('present', 'eq', 999), leaf('missing', 'eq', 2)],
+      }),
+      { present: 1 },
+    );
+    expect(d.outcome).toBe('not_applicable');
+  });
+
+  it('OR: true || not_applicable → matched (definite true wins)', () => {
+    const d = evaluate(
+      blockBody({
+        kind: 'or',
+        predicates: [leaf('present', 'eq', 1), leaf('missing', 'eq', 2)],
+      }),
+      { present: 1 },
+    );
+    expect(d.outcome).toBe('matched');
+  });
+});
+
+describe('evaluate — branch fail-closed (Codex review #98 high)', () => {
+  it('AND with null child fails closed (was silently skipped)', () => {
+    // Previously: `{kind:'and', predicates:[null]}` evaluated to vacuously
+    // true and bypassed governance. Now it surfaces as evaluation_error.
+    const body = {
+      rule_id: 'r',
+      predicate: { kind: 'and', predicates: [null] } as never,
+      effect: { action: 'block' } as never,
+    };
+    const d = evaluate(body, {});
+    expect(d.outcome).toBe('evaluation_error');
+    expect(d.matched).toBe(false);
+    expect(d.errors.some((e) => e.code === 'malformed_branch_child')).toBe(true);
+  });
+
+  it('OR with undefined child fails closed', () => {
+    const body = {
+      rule_id: 'r',
+      predicate: { kind: 'or', predicates: [undefined] } as never,
+      effect: { action: 'block' } as never,
+    };
+    const d = evaluate(body, {});
+    expect(d.outcome).toBe('evaluation_error');
+    expect(d.errors.some((e) => e.code === 'malformed_branch_child')).toBe(true);
+  });
+
+  it('AND with non-object child fails closed', () => {
+    const body = {
+      rule_id: 'r',
+      predicate: { kind: 'and', predicates: ['not-a-predicate'] } as never,
+      effect: { action: 'block' } as never,
+    };
+    const d = evaluate(body, {});
+    expect(d.outcome).toBe('evaluation_error');
+    expect(d.errors.some((e) => e.code === 'malformed_branch_child')).toBe(true);
+  });
+});
+
+describe('evaluate — matched-effect validity (Codex review #98 high)', () => {
+  it('matched decision with missing effect.action → evaluation_error', () => {
+    const body = {
+      rule_id: 'r',
+      predicate: leaf('a', 'eq', 1),
+      effect: {} as never,
+    };
+    const d = evaluate(body, { a: 1 });
+    expect(d.outcome).toBe('evaluation_error');
+    expect(d.matched).toBe(false);
+    expect(d.errors.some((e) => e.code === 'invalid_effect')).toBe(true);
+  });
+
+  it('matched decision with unknown effect.action → evaluation_error', () => {
+    const body = {
+      rule_id: 'r',
+      predicate: leaf('a', 'eq', 1),
+      effect: { action: 'self-destruct' as never },
+    };
+    const d = evaluate(body, { a: 1 });
+    expect(d.outcome).toBe('evaluation_error');
+    expect(d.errors.some((e) => e.code === 'invalid_effect')).toBe(true);
+  });
+
+  it('matched decision with null effect → evaluation_error', () => {
+    const body = {
+      rule_id: 'r',
+      predicate: leaf('a', 'eq', 1),
+      effect: null as never,
+    };
+    const d = evaluate(body, { a: 1 });
+    expect(d.outcome).toBe('evaluation_error');
+    expect(d.errors.some((e) => e.code === 'invalid_effect')).toBe(true);
   });
 });
 
