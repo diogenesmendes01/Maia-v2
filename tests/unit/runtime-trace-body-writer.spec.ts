@@ -67,15 +67,16 @@ describe('writeBody', () => {
     expect(out.encrypted).toBe(false);
     expect(out.s3_uri).toBeNull();
     expect(out.bytes_redacted).toBeGreaterThan(0);
-    // Two execute calls: INSERT body, UPDATE envelope.
-    expect(dbExecuteMock).toHaveBeenCalledTimes(2);
+    // Three execute calls: SELECT (idempotency check), INSERT body, UPDATE envelope.
+    // Round-2 finding #2 fix: SELECT before any external write prevents re-upload on retry.
+    expect(dbExecuteMock).toHaveBeenCalledTimes(3);
   });
 
   it('minimal: body row marked __minimal, no PII present', async () => {
     const out = await writeBody({ ...baseInput, redaction_class: 'minimal' });
     expect(out.redaction_applied).toBe('minimal_v1');
-    // Inspect the SQL payload to confirm __minimal flag.
-    const insertCall = dbExecuteMock.mock.calls[0]![0];
+    // call[0] = SELECT (idempotency), call[1] = INSERT, call[2] = UPDATE envelope.
+    const insertCall = dbExecuteMock.mock.calls[1]![0];
     // Drizzle sql template returns an object with queryChunks; convert to string for inspection.
     const sqlText = JSON.stringify(insertCall);
     expect(sqlText).toContain('__minimal');
@@ -93,7 +94,10 @@ describe('writeBody', () => {
     let call = 0;
     dbExecuteMock.mockImplementation(() => {
       call += 1;
-      if (call === 2) throw new Error('envelope update failed');
+      // call 1 = SELECT (idempotency check → no existing body → proceed)
+      // call 2 = INSERT body (succeeds)
+      // call 3 = UPDATE envelope (fails — best-effort)
+      if (call === 3) throw new Error('envelope update failed');
       return Promise.resolve(undefined);
     });
     // Should still resolve — body INSERT succeeded.
@@ -101,8 +105,37 @@ describe('writeBody', () => {
   });
 
   it('throws if body INSERT itself fails (caller may retry)', async () => {
-    dbExecuteMock.mockRejectedValueOnce(new Error('unique constraint'));
+    // First call is SELECT (returns undefined → no existing body) → second call is INSERT (fails).
+    dbExecuteMock
+      .mockResolvedValueOnce(undefined) // SELECT idempotency check
+      .mockRejectedValueOnce(new Error('unique constraint')); // INSERT
     await expect(writeBody(baseInput)).rejects.toThrow('unique constraint');
+  });
+
+  // Round-2 finding #2 — idempotency: second call skips S3 upload entirely.
+  it('idempotency: second call returns existing row without re-uploading', async () => {
+    // Simulate an existing body row being found by the SELECT.
+    const existingRow = {
+      rows: [
+        {
+          packet_hmac: 'existinghmac==',
+          hmac_key_version: 1,
+          redaction_applied: 'standard_v1',
+          bytes_redacted: 100,
+          encrypted: false,
+          s3_uri: null,
+        },
+      ],
+    };
+    dbExecuteMock
+      .mockResolvedValueOnce(existingRow) // SELECT finds existing body
+      .mockResolvedValueOnce(undefined); // UPDATE envelope (best-effort flip)
+    const out = await writeBody(baseInput);
+    // Must return existing row metadata without any INSERT.
+    expect(out.packet_hmac).toBe('existinghmac==');
+    expect(out.redaction_applied).toBe('standard_v1');
+    // Only 2 execute calls: SELECT + envelope UPDATE. NO new INSERT, NO S3 upload.
+    expect(dbExecuteMock).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -132,7 +165,8 @@ describe('writeBody — debug-mode durability paths', () => {
     // and the packet metadata must indicate storage='inline'. The double
     // serialization (drizzle template wraps an already-JSON.stringify'd
     // payload) means the inner quotes get escaped — match on escaped form.
-    const insertCall = dbExecuteMock.mock.calls[0]![0];
+    // call[0] = SELECT (idempotency check), call[1] = INSERT body.
+    const insertCall = dbExecuteMock.mock.calls[1]![0];
     const sqlText = JSON.stringify(insertCall);
     expect(sqlText).toContain('ciphertext_inline');
     expect(sqlText).toContain('\\"storage\\":\\"inline\\"');

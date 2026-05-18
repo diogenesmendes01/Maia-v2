@@ -18,6 +18,7 @@ import {
   deriveTenantKey,
   _resetHmacCacheForTests,
   _setTestMasterSecretForTests,
+  _setTestKeyringEntryForTests,
   _clearTestMasterSecretForTests,
 } from '../../src/control-plane/runtime-trace/lib/hmac.js';
 
@@ -89,6 +90,9 @@ describe('runtime-trace HMAC', () => {
     });
 
     it('different key versions produce DIFFERENT HMACs (90d rotation)', () => {
+      // version 1 = current (registered via _setTestMasterSecretForTests in beforeEach).
+      // version 2 = previous/future key — must be registered explicitly.
+      _setTestKeyringEntryForTests(2, 'p10b-unit-test-master-secret-v2-different');
       const payload = { trace_id: 't1' };
       const sigV1 = signHmac('tenant-a', 1, payload);
       const sigV2 = signHmac('tenant-a', 2, payload);
@@ -163,6 +167,51 @@ describe('runtime-trace HMAC', () => {
         /RUNTIME_TRACE_HMAC_MASTER_SECRET is required/,
       );
       // Restore for any subsequent test.
+      _setTestMasterSecretForTests('p10b-unit-test-master-secret-deterministic');
+    });
+  });
+
+  // Round-2 finding #3 — versioned HMAC keyring.
+  // After rotation: old rows signed with v1/old-master must still verify;
+  // new rows signed with v2/new-master must verify with the new master.
+  describe('key rotation (round-2 finding #3)', () => {
+    it('old row (v1/old-master) verifies after rotating to new master (v2)', () => {
+      // Phase 1: Sign a row with v1 / old master (version 1 is "current" in this phase).
+      // Mock config has RUNTIME_TRACE_HMAC_KEY_VERSION=1 throughout this test.
+      // We simulate version 1 = old master using the main test secret slot.
+      _resetHmacCacheForTests();
+      _setTestMasterSecretForTests('old-master-secret-v1');
+      const payload = { trace_id: 'historic-row', decision: 'allow' };
+      const sigV1 = signHmac('tenant-rotation', 1, payload);
+
+      // Phase 2: Simulate rotation. The "new" master is registered as version 2
+      // in the keyring (since mock config still reports current=1, we use keyring
+      // to provide both old v1 and new v2 material explicitly).
+      _resetHmacCacheForTests();
+      // After rotation, v1 = old master (retained in keyring for audit verification).
+      // v2 = new master (registered as a keyring entry since mock config = 1).
+      _setTestKeyringEntryForTests(1, 'old-master-secret-v1'); // old, kept for verify
+      _setTestKeyringEntryForTests(2, 'new-master-secret-v2'); // new, current in prod
+
+      // Phase 3: Old row (v1) must still verify with old master.
+      expect(verifyHmac('tenant-rotation', 1, payload, sigV1)).toBe(true);
+
+      // Phase 4: Sign and verify a new row with v2 (new master).
+      const newPayload = { trace_id: 'new-row', decision: 'deny' };
+      const sigV2 = signHmac('tenant-rotation', 2, newPayload);
+      expect(verifyHmac('tenant-rotation', 2, newPayload, sigV2)).toBe(true);
+
+      // Phase 5: Cross-version check — v1 sig MUST NOT verify as v2 (different key).
+      expect(verifyHmac('tenant-rotation', 2, payload, sigV1)).toBe(false);
+    });
+
+    it('throws when verifying a row whose version is not in the keyring', () => {
+      _resetHmacCacheForTests();
+      _clearTestMasterSecretForTests();
+      _setTestMasterSecretForTests('current-master-v1');
+      // version 7 is neither current (1) nor registered in keyring → fail closed.
+      expect(() => signHmac('tenant-x', 7, { a: 1 })).toThrow(/not found in keyring/);
+      // Restore for subsequent tests.
       _setTestMasterSecretForTests('p10b-unit-test-master-secret-deterministic');
     });
   });

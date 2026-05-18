@@ -163,6 +163,16 @@ const envSchema = z
     RUNTIME_TRACE_HMAC_KEY_VERSION: z.coerce.number().int().positive().default(1),
     /** Master secret material (test only — prod fetches from KMS). */
     RUNTIME_TRACE_HMAC_MASTER_SECRET: z.string().optional(),
+    /**
+     * Previous HMAC master secrets for audit-row verification after rotation.
+     * Format: semicolon-separated `version=secret` pairs, e.g.:
+     *   "1=<old-secret>;2=<older-secret>"
+     * The current master secret is keyed separately in RUNTIME_TRACE_HMAC_MASTER_SECRET
+     * (at RUNTIME_TRACE_HMAC_KEY_VERSION). Previous secrets are retained here
+     * through the audit-retention window so old rows remain verifiable.
+     * Round-2 finding #3 fix.
+     */
+    RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS: z.string().optional(),
     /** S3 bucket for debug-mode encrypted snapshots (24h TTL). */
     RUNTIME_TRACE_DEBUG_S3_BUCKET: z.string().optional(),
     /** AES-GCM key (base64) for debug-mode snapshot encryption. */

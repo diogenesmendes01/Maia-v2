@@ -215,24 +215,94 @@ describe('redactPacket', () => {
       }
     });
 
-    it('decision_packet (with redacted_ prefix) MUST already be redacted by upstream — passes through verbatim', () => {
-      // decision_packet is in the DECISION_TOP_LEVEL allowlist, which means
-      // the caller (P9b PEP) is responsible for redacting before handing
-      // to runtime-trace. We test the audit: if a caller drops PII into
-      // decision_packet, runtime-trace DOES NOT silently strip it — the
-      // caller's redaction is the contract. This documents the boundary.
+    it('decision_packet applies nested allowlist — unknown fields dropped (round-2 #4 fix)', () => {
+      // Round-2 finding #4: decision_packet was copied verbatim, allowing PII
+      // inside an allowlisted container. Now only DECISION_PACKET_ALLOWED keys
+      // survive. Unknown fields (including free-text reasoning) are dropped.
       const out = redactPacket(
         {
           trace_id: 't',
           tenant_id: 'a',
           agent_id: 'b',
-          decision_packet: { redacted_reason: 'boundary_violation' }, // safe — already redacted
+          decision_packet: {
+            decision: 'allow',        // allowed: kept
+            policy_id: 'p-123',       // allowed: kept
+            risk_score: 0.3,          // allowed: kept
+            reasoning: 'user CPF 123.456.789-01 verified', // NOT allowed: dropped
+            tool_args: { cpf: '123.456.789-01' },           // NOT allowed: dropped
+          },
         },
         'standard',
       );
-      expect((out.packet!.decision_packet as Record<string, unknown>).redacted_reason).toBe(
-        'boundary_violation',
+      const dp = out.packet!.decision_packet as Record<string, unknown>;
+      expect(dp.decision).toBe('allow');
+      expect(dp.policy_id).toBe('p-123');
+      expect(dp.risk_score).toBe(0.3);
+      // Free-text and tool args MUST be dropped.
+      expect(dp.reasoning).toBeUndefined();
+      expect(dp.tool_args).toBeUndefined();
+      // Drop counter present.
+      expect(dp._nested_dropped).toBe(2);
+      // Bytes redacted must account for the dropped nested fields.
+      expect(out.bytes_redacted).toBeGreaterThan(0);
+    });
+
+    // --- Hostile nested PII tests (round-2 finding #4) ---
+    it('hostile: CPF inside decision_packet.reasoning is dropped', () => {
+      const out = redactPacket(
+        {
+          trace_id: 't',
+          tenant_id: 'a',
+          agent_id: 'b',
+          decision_packet: { reasoning: 'user CPF 123.456.789-01', decision: 'deny' },
+        },
+        'standard',
       );
+      const serialised = JSON.stringify(out.packet);
+      expect(serialised).not.toMatch(/123\.456\.789-01/);
+    });
+
+    it('hostile: email inside decision_meta is dropped', () => {
+      const out = redactPacket(
+        {
+          trace_id: 't',
+          tenant_id: 'a',
+          agent_id: 'b',
+          decision_meta: { risk_score: 0.5, reason_text: 'email: user@example.com' },
+        },
+        'standard',
+      );
+      const serialised = JSON.stringify(out.packet);
+      expect(serialised).not.toContain('user@example.com');
+      // reason_text not in allowlist → dropped.
+      const dm = out.packet!.decision_meta as Record<string, unknown>;
+      expect(dm.risk_score).toBe(0.5);
+      expect(dm.reason_text).toBeUndefined();
+    });
+
+    it('hostile: phone inside policy_hooks hook output is dropped', () => {
+      const out = redactPacket(
+        {
+          trace_id: 't',
+          tenant_id: 'a',
+          agent_id: 'b',
+          policy_hooks: [
+            {
+              hook_id: 'h-1',
+              outcome: 'pass',
+              output_message: 'called +5511999998888', // NOT in allowlist
+            },
+          ],
+        },
+        'standard',
+      );
+      const serialised = JSON.stringify(out.packet);
+      expect(serialised).not.toContain('+5511999998888');
+      const hooks = out.packet!.policy_hooks as Record<string, unknown>[];
+      expect(hooks[0]!.hook_id).toBe('h-1');
+      expect(hooks[0]!.outcome).toBe('pass');
+      expect(hooks[0]!.output_message).toBeUndefined();
+      expect(hooks[0]!._nested_dropped).toBe(1);
     });
   });
 });

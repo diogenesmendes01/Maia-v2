@@ -2,7 +2,7 @@
  * P10b — Tenant-scoped HMAC-SHA256 signer (CRITICAL invariant 8).
  *
  * Each tenant gets a derived secret. We use HKDF-SHA256 with:
- *   - IKM    = RUNTIME_TRACE_HMAC_MASTER_SECRET (KMS material; env in tests)
+ *   - IKM    = master secret for `hmac_key_version` (from versioned keyring)
  *   - salt   = `runtime-trace/v${HMAC_KEY_VERSION}`
  *   - info   = `tenant:${tenant_id}/v${HMAC_KEY_VERSION}`
  *
@@ -10,9 +10,13 @@
  * into another tenant's HMACs, an attacker can't recover the secret or
  * forge a signature for their target tenant.
  *
- * Key rotation (90 days):
+ * Key rotation (90 days) — round-2 finding #3 fix:
  *   - Operators bump RUNTIME_TRACE_HMAC_KEY_VERSION and supply a new master.
- *   - Old envelopes/bodies keep their `hmac_key_version` column for verify.
+ *   - The OLD master is retained in RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS
+ *     (format: "1=<secret>;2=<secret>") through the audit-retention window.
+ *   - `deriveTenantKey(tenant_id, version)` resolves the correct master for
+ *     the requested version — current OR previous — so old audit rows remain
+ *     verifiable after rotation.
  *   - The cache is keyed by `(tenant_id, version)` so multiple versions coexist.
  *
  * Canonical JSON: we sort object keys recursively and JSON.stringify with
@@ -37,6 +41,13 @@ function cacheKey(tenant_id: string, version: number): string {
 let __TEST_MASTER_SECRET: string | null = null;
 
 /**
+ * Test-only versioned keyring. Keys are `version` → `secret_string`.
+ * This mirrors the prod RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS env var
+ * without coupling tests to env parsing.
+ */
+const __TEST_KEYRING = new Map<number, string>();
+
+/**
  * Test helper: install a deterministic master secret. Must NOT be called
  * outside `vitest`/`jest`. Asserts NODE_ENV at call time so accidental
  * production use throws immediately.
@@ -52,41 +63,121 @@ export function _setTestMasterSecretForTests(secret: string): void {
   KEY_CACHE.clear();
 }
 
+/**
+ * Test helper: register a previous-version master secret.
+ * Simulates rotating from version `version` to a new current master.
+ *
+ * Usage in tests:
+ *   _setTestMasterSecretForTests('new-master');          // current (new)
+ *   _setTestKeyringEntryForTests(1, 'old-master');       // previous v1
+ */
+export function _setTestKeyringEntryForTests(version: number, secret: string): void {
+  if (config.NODE_ENV === 'production') {
+    throw new Error(
+      'p10b: _setTestKeyringEntryForTests is forbidden when NODE_ENV=production',
+    );
+  }
+  __TEST_KEYRING.set(version, secret);
+  KEY_CACHE.clear();
+}
+
 export function _clearTestMasterSecretForTests(): void {
   __TEST_MASTER_SECRET = null;
+  __TEST_KEYRING.clear();
   KEY_CACHE.clear();
 }
 
 /**
- * Resolve the HMAC master secret.
+ * Parse the RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS env var into a Map.
+ * Format: "1=<secret>;2=<secret>" — semicolon-separated version=secret pairs.
+ * Invalid entries are skipped with a warning (fail-safe: current master still works).
+ */
+function parsePrevSecrets(raw: string | undefined): Map<number, Buffer> {
+  const out = new Map<number, Buffer>();
+  if (!raw) return out;
+  for (const pair of raw.split(';')) {
+    const idx = pair.indexOf('=');
+    if (idx < 1) continue;
+    const vStr = pair.slice(0, idx).trim();
+    const sStr = pair.slice(idx + 1).trim();
+    const v = parseInt(vStr, 10);
+    if (isNaN(v) || v < 1 || !sStr) continue;
+    out.set(v, Buffer.from(sStr, 'utf8'));
+  }
+  return out;
+}
+
+/** Lazily-parsed previous keyring from env (not reparsed on every call). */
+let _prevSecretsCache: Map<number, Buffer> | null = null;
+function prevSecrets(): Map<number, Buffer> {
+  if (_prevSecretsCache === null) {
+    _prevSecretsCache = parsePrevSecrets(config.RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS);
+  }
+  return _prevSecretsCache;
+}
+
+/**
+ * Resolve the HMAC master secret for a given key version.
+ *
+ * Version lookup order:
+ *   1. Test-injected keyring (test env only).
+ *   2. If `version` == current configured version: current master secret.
+ *   3. Previous secrets registry (RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS).
+ *   4. Throw — version unknown and unverifiable.
  *
  * Codex review #102 — issue 2 (no-ship):
- *   Previously this returned a hardcoded literal when the env var was
- *   absent, which silently produced forgeable HMACs in a misconfigured
- *   production deploy. We now FAIL CLOSED: if FEATURE_RUNTIME_TRACE_V1
- *   is on and no master secret is present (env or test injection), throw
- *   on first call. The trace path is fail-closed (invariant 12), so
- *   throwing here aborts the side effect — better than silently writing
- *   audit rows an attacker could forge.
+ *   FAIL CLOSED: no fallback to a hardcoded literal. Missing config throws.
+ *
+ * Codex review round-2 — finding #3 (no-ship):
+ *   `deriveTenantKey()` previously always used the CURRENT master secret
+ *   regardless of the requested version. After rotation, verifying an old
+ *   row with version=1 would derive v1 from the NEW master — producing a
+ *   different key than the original signer used → verification fails.
+ *   Fix: version-keyed lookup resolves the ORIGINAL master for each version.
  */
-function masterSecret(): Buffer {
-  if (__TEST_MASTER_SECRET !== null) {
-    return Buffer.from(__TEST_MASTER_SECRET, 'utf8');
+function masterSecretForVersion(version: number): Buffer {
+  const currentVersion = config.RUNTIME_TRACE_HMAC_KEY_VERSION;
+
+  // 1. Test keyring (version-specific overrides).
+  if (config.NODE_ENV !== 'production' && __TEST_KEYRING.has(version)) {
+    return Buffer.from(__TEST_KEYRING.get(version)!, 'utf8');
   }
-  const s = config.RUNTIME_TRACE_HMAC_MASTER_SECRET;
-  if (!s) {
-    throw new Error(
-      'p10b: RUNTIME_TRACE_HMAC_MASTER_SECRET is required when FEATURE_RUNTIME_TRACE_V1 is enabled — ' +
-        'audit HMACs would be forgeable without it. Configure via KMS-backed env or call ' +
-        '_setTestMasterSecretForTests() in test setup.',
-    );
+
+  // 2. Current version → current master.
+  if (version === currentVersion) {
+    if (__TEST_MASTER_SECRET !== null) {
+      return Buffer.from(__TEST_MASTER_SECRET, 'utf8');
+    }
+    const s = config.RUNTIME_TRACE_HMAC_MASTER_SECRET;
+    if (!s) {
+      throw new Error(
+        'p10b: RUNTIME_TRACE_HMAC_MASTER_SECRET is required when FEATURE_RUNTIME_TRACE_V1 is enabled — ' +
+          'audit HMACs would be forgeable without it. Configure via KMS-backed env or call ' +
+          '_setTestMasterSecretForTests() in test setup.',
+      );
+    }
+    return Buffer.from(s, 'utf8');
   }
-  return Buffer.from(s, 'utf8');
+
+  // 3. Previous keyring from env.
+  const prev = prevSecrets().get(version);
+  if (prev) return prev;
+
+  // 4. Fail closed — we cannot verify rows signed with an unknown version.
+  throw new Error(
+    `p10b: HMAC master secret for version ${version} not found in keyring. ` +
+      `Current version is ${currentVersion}. ` +
+      `Add previous master secrets to RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS ` +
+      `as "${version}=<secret>" to keep old audit rows verifiable through the retention window.`,
+  );
 }
 
 /**
  * Derive a tenant-scoped HMAC key. Cached. Synchronous because hkdfSync is
  * pure CPU; the trace envelope hot path can't afford an async hop.
+ *
+ * Round-2 fix: resolves master secret by `version`, not always by current
+ * version, so old rows remain verifiable after key rotation.
  */
 export function deriveTenantKey(tenant_id: string, version: number): Buffer {
   const k = cacheKey(tenant_id, version);
@@ -95,7 +186,7 @@ export function deriveTenantKey(tenant_id: string, version: number): Buffer {
   const salt = Buffer.from(`runtime-trace/v${version}`, 'utf8');
   const info = Buffer.from(`tenant:${tenant_id}/v${version}`, 'utf8');
   // 32 bytes = SHA256 output length.
-  const derived = Buffer.from(hkdfSync('sha256', masterSecret(), salt, info, 32));
+  const derived = Buffer.from(hkdfSync('sha256', masterSecretForVersion(version), salt, info, 32));
   KEY_CACHE.set(k, derived);
   return derived;
 }
@@ -103,6 +194,8 @@ export function deriveTenantKey(tenant_id: string, version: number): Buffer {
 /** Test-only: clear cache so spec can rotate keys without process restart. */
 export function _resetHmacCacheForTests(): void {
   KEY_CACHE.clear();
+  // Also clear the prev-secrets parse cache so tests that mutate env see updates.
+  _prevSecretsCache = null;
 }
 
 /**

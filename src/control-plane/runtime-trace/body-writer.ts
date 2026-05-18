@@ -2,16 +2,19 @@
  * P10b — Async body writer.
  *
  * Called by the TraceBody worker (or directly from the request path as
- * a fire-and-forget) to persist the redacted body. Uses ON CONFLICT
- * (trace_id) DO NOTHING so re-deliveries are idempotent.
+ * a fire-and-forget) to persist the redacted body. Idempotent: checks
+ * for an existing body row BEFORE any external write (S3/DB). This
+ * prevents duplicate S3 uploads that could overwrite the ciphertext that
+ * won the original INSERT (round-2 finding #2 fix).
  *
  * Three paths:
  *   - standard / minimal → redactPacket() then INSERT body.
- *   - debug              → encryptForDebug() + uploadDebugSnapshot() then
- *                          INSERT body with encrypted=true and EITHER
- *                          s3_uri (bucket configured) OR ciphertext_inline
- *                          (no bucket — test/dev). The DB CHECK constraint
- *                          requires at least one to be present (issue 3).
+ *   - debug              → check existing → encryptForDebug() +
+ *                          uploadDebugSnapshot() → INSERT body with
+ *                          encrypted=true and EITHER s3_uri (bucket
+ *                          configured) OR ciphertext_inline (no bucket —
+ *                          test/dev). The DB CHECK constraint requires at
+ *                          least one to be present.
  *
  * After successful body INSERT, flips the envelope's body_status to
  * 'persisted' and stamps body_persisted_at. The flip is best-effort —
@@ -27,12 +30,97 @@ import { logger } from '@/lib/logger.js';
 import { incCounter, observeHistogram } from '@/lib/metrics.js';
 
 /**
+ * Idempotency check: returns the existing body row metadata if a body has
+ * already been persisted for this trace_id. Callers MUST call this before
+ * any external write (S3 upload, DB insert) to avoid generating new
+ * IV/ciphertext that would overwrite the bytes the first INSERT won.
+ *
+ * Round-2 finding #2 — body writes were not idempotent: retries after a
+ * partial success (S3 upload succeeded, outbox-delete failed) generated a
+ * new cipher and re-uploaded, while the DB row remained pointing at the
+ * FIRST cipher (ON CONFLICT DO NOTHING). The S3 object was then a
+ * ciphertext mismatch, making the audit row unrecoverable.
+ */
+async function findExistingBody(trace_id: string): Promise<{
+  packet_hmac: string;
+  hmac_key_version: number;
+  redaction_applied: string;
+  bytes_redacted: number;
+  encrypted: boolean;
+  s3_uri: string | null;
+} | null> {
+  const rows = await db.execute(
+    sql`SELECT packet_hmac, hmac_key_version, redaction_applied,
+               bytes_redacted, encrypted, s3_uri
+        FROM runtime_trace_bodies
+        WHERE trace_id = ${trace_id}
+        LIMIT 1`,
+  );
+  const rowsAny = rows as { rows?: unknown[] } | null | undefined;
+  const row = rowsAny?.rows?.[0] as
+    | {
+        packet_hmac: string;
+        hmac_key_version: number;
+        redaction_applied: string;
+        bytes_redacted: number;
+        encrypted: boolean;
+        s3_uri: string | null;
+      }
+    | undefined;
+  return row ?? null;
+}
+
+/**
  * Persist the body. Safe to call multiple times for the same trace_id.
  * Returns the written record. Does NOT throw on the envelope flip step
  * (recoverer handles).
+ *
+ * Idempotency contract (round-2 finding #2):
+ *   1. Check DB for existing body FIRST.
+ *   2. If already present, return existing row metadata — NO new S3 upload.
+ *   3. Only if absent: encrypt + upload to S3 + INSERT.
+ *   4. Envelope flip happens only after both DB row + S3 object are known good.
  */
 export async function writeBody(input: TraceBodyInput): Promise<TraceBodyWritten> {
   const t0 = performance.now();
+
+  // --- Idempotency guard: skip all external writes if body already exists ---
+  const existing = await findExistingBody(input.trace_id);
+  if (existing) {
+    logger.debug(
+      { trace_id: input.trace_id },
+      'runtime_trace.body_already_exists_skip_write',
+    );
+    // Still attempt the envelope flip — it may have failed on the prior pass.
+    try {
+      await db.execute(
+        sql`UPDATE runtime_trace_envelopes
+            SET body_status = 'persisted', body_persisted_at = now()
+            WHERE trace_id = ${input.trace_id} AND body_status != 'persisted'`,
+      );
+    } catch (err) {
+      logger.warn(
+        { err: (err as Error).message, trace_id: input.trace_id },
+        'runtime_trace.envelope_flip_failed',
+      );
+    }
+    incCounter('maia_runtime_trace_body_written_total', {
+      redaction: existing.redaction_applied,
+      encrypted: String(existing.encrypted),
+      idempotent_skip: 'true',
+    });
+    return {
+      trace_id: input.trace_id,
+      packet_hmac: existing.packet_hmac,
+      hmac_key_version: existing.hmac_key_version,
+      redaction_applied: existing.redaction_applied as import('./types.js').TraceBodyWritten['redaction_applied'],
+      bytes_redacted: existing.bytes_redacted,
+      encrypted: existing.encrypted,
+      s3_uri: existing.s3_uri,
+    };
+  }
+
+  // --- No existing body: proceed with full write path ---
   const redacted = redactPacket(input.packet, input.redaction_class);
   const hmac_key_version = currentKeyVersion();
 
@@ -55,11 +143,9 @@ export async function writeBody(input: TraceBodyInput): Promise<TraceBodyWritten
       redacted.bytes_redacted = fallback.bytes_redacted;
       redacted.redaction_applied = 'standard_v1';
     } else {
-      // Codex review #102 — issue 3: upload BEFORE marking persisted.
-      // uploadDebugSnapshot now either does a real S3 PutObject (bucket
-      // configured) or returns inline ciphertext for DB storage. Throws
-      // on S3 upload failure so we never mark a body persisted while the
-      // ciphertext is unrecoverable.
+      // Round-2 fix: upload ONLY after idempotency check above confirms no
+      // body exists. This prevents a new IV/ciphertext overwriting the bytes
+      // the first INSERT won (deterministic S3 key = same object per trace_id).
       const upload = await uploadDebugSnapshot(input.trace_id, cipher);
       s3_uri = upload.s3_uri;
       ciphertext_inline = upload.inline;
@@ -80,8 +166,8 @@ export async function writeBody(input: TraceBodyInput): Promise<TraceBodyWritten
 
   const packet_hmac = signHmac(input.tenant_id, hmac_key_version, packetForRow);
 
-  // INSERT ... ON CONFLICT DO NOTHING (idempotent under at-least-once
-  // delivery from the durable outbox / in-process queue / recoverer).
+  // INSERT ... ON CONFLICT DO NOTHING (race-safe second barrier after the
+  // in-process check above: two workers racing can still both reach here).
   await db.execute(
     sql`INSERT INTO runtime_trace_bodies (
       trace_id, tenant_id, agent_id, packet, packet_hmac,
