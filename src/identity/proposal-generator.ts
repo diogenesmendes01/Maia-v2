@@ -81,10 +81,16 @@ export async function seedInitialOperationalProfile(args?: {
   // the legacy keys) keeps working at runtime. When all consumers move to the
   // new identity/style/metadata structure, this generator becomes the source
   // of truth for the migration.
+  // Review #100 fix: populate identity.identity_block and identity.principles so
+  // identity-slice-builder reads the canonical content from the canonical place.
+  // role_descriptor still mirrors identity_block (back-compat for callers that
+  // already rely on it as a denormalized label).
   const profile_body = {
     schema_version: PROFILE_BODY_SCHEMA_VERSION,
     identity: {
       role_descriptor: core_immutable.identity_block,
+      identity_block: core_immutable.identity_block,
+      principles: core_immutable.principles,
       voice: { tone: '', formality: 'medium' as const, verbosity: 'medium' as const },
       cognitive_limits: {
         max_inference_depth: 0,

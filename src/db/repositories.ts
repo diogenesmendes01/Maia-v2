@@ -2771,6 +2771,122 @@ export const operationalProfileVersionsRepo = {
     const max = result.rows[0]?.max ?? null;
     return max == null ? 1 : Number(max) + 1;
   },
+
+  // Review #100 fix: atomic create-frozen-active in one transaction with
+  // FOR UPDATE locking on the current active row. Used by data migration
+  // scripts (P8d priorities) to avoid the create→freeze→activate window
+  // where a crash leaves the agent with no active profile.
+  //
+  // Semantics:
+  //   - Locks the current active row (if any) FOR UPDATE so concurrent
+  //     callers serialize on that tuple.
+  //   - Verifies tenant scope on both the lock and the inserts.
+  //   - On any error inside the closure, the transaction rolls back —
+  //     the old active row stays active.
+  //   - Throws (instead of returning result) so callers can wrap in
+  //     try/catch and count failures distinctly.
+  async seedNewActiveAtomic(input: {
+    profile_body: ProfileBody;
+    proposed_by: string;
+    proposed_reason?: string;
+    /** Expected current active id; if mismatch, throws — protects against
+     *  the caller having read stale data outside the tx. */
+    expected_current_active_id?: string;
+  }): Promise<{
+    new_active: AgentOperationalProfileVersion;
+    frozen_previous: AgentOperationalProfileVersion | null;
+  }> {
+    // Validate before opening the transaction so we fail fast without
+    // touching the DB on a malformed body.
+    validateProfileBodyP8d(input.profile_body);
+
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+
+    return withTx(async (tx) => {
+      // 1) Lock the current active row FOR UPDATE (if any). Two concurrent
+      //    seeds against the same agent now serialize on this tuple.
+      const activeRows = await tx
+        .select()
+        .from(agent_operational_profile_versions)
+        .where(
+          and(
+            eq(agent_operational_profile_versions.tenant_id, tenant_id),
+            eq(agent_operational_profile_versions.agent_id, agent_id),
+            eq(agent_operational_profile_versions.status, 'active'),
+          ),
+        )
+        .for('update');
+      const currentActive = activeRows[0] ?? null;
+
+      if (
+        input.expected_current_active_id &&
+        currentActive?.id !== input.expected_current_active_id
+      ) {
+        throw new Error(
+          `seed_atomic_stale_active: expected ${input.expected_current_active_id}, found ${currentActive?.id ?? 'none'}`,
+        );
+      }
+
+      // 2) Compute next version inside the tx so concurrent inserts can't
+      //    collide on (tenant, agent, version) unique index.
+      const maxRes = await tx.execute<{ max: number | null }>(sql`
+        SELECT MAX(version) AS max
+          FROM agent_operational_profile_versions
+         WHERE tenant_id = ${tenant_id}
+           AND agent_id = ${agent_id}
+      `);
+      const max = maxRes.rows[0]?.max ?? null;
+      const nextV = max == null ? 1 : Number(max) + 1;
+
+      const now = new Date();
+
+      // 3) Freeze the previous active row FIRST so the partial unique index
+      //    on (tenant, agent) WHERE status='active' is satisfied before the
+      //    new insert lands. Otherwise both rows would compete for activeness.
+      let frozenPrevious: AgentOperationalProfileVersion | null = null;
+      if (currentActive) {
+        const [updated] = await tx
+          .update(agent_operational_profile_versions)
+          .set({ status: 'frozen', frozen_at: now })
+          .where(
+            and(
+              eq(agent_operational_profile_versions.id, currentActive.id),
+              eq(agent_operational_profile_versions.tenant_id, tenant_id),
+              eq(agent_operational_profile_versions.agent_id, agent_id),
+            ),
+          )
+          .returning();
+        if (!updated) {
+          throw new Error('seed_atomic_freeze_failed: previous active row vanished mid-tx');
+        }
+        frozenPrevious = updated;
+      }
+
+      // 4) Insert the new row directly as `active`. The partial unique index
+      //    rejects if another active row sneaks in between the freeze above
+      //    and this insert — that forces tx rollback and the caller retries.
+      const guarded = applyTenantGuard({
+        version: nextV,
+        status: 'active',
+        profile_body: input.profile_body,
+        proposed_by: input.proposed_by,
+        proposed_reason: input.proposed_reason ?? null,
+        approved_by: input.proposed_by,
+        approved_at: now,
+        activated_at: now,
+      });
+      const [inserted] = await tx
+        .insert(agent_operational_profile_versions)
+        .values(guarded)
+        .returning();
+      if (!inserted) {
+        throw new Error('seed_atomic_insert_failed: returning() empty');
+      }
+
+      return { new_active: inserted, frozen_previous: frozenPrevious };
+    });
+  },
 };
 
 // P4: agent_drift_alerts — audit das execuções do drift detector.

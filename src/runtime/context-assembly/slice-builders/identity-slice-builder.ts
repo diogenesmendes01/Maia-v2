@@ -27,11 +27,23 @@ export async function buildIdentitySlice(args: {
   const body = (profile.profile_body ?? {}) as Record<string, unknown>;
   const identity = (body.identity ?? {}) as Record<string, unknown>;
 
+  // Review #100 fix: fall back to profile_body.core_immutable for identity_block
+  // and principles. seedInitialOperationalProfile (P4) wrote those under the
+  // legacy `core_immutable` shape; the seed now also writes them under
+  // `identity` (canonical), but the fallback keeps slices populated for rows
+  // that were seeded before the proposal-generator fix landed.
+  const coreImmutable = (body.core_immutable ?? {}) as Record<string, unknown>;
+  const identityBlock =
+    typeof identity.identity_block === 'string' && identity.identity_block.length > 0
+      ? identity.identity_block
+      : typeof coreImmutable.identity_block === 'string'
+        ? coreImmutable.identity_block
+        : '';
+
   const slice: IdentitySlice = {
     role_descriptor:
       typeof identity.role_descriptor === 'string' ? identity.role_descriptor : 'unset',
-    identity_block:
-      typeof identity.identity_block === 'string' ? identity.identity_block : '',
+    identity_block: identityBlock,
     priorities: Array.isArray(identity.priorities)
       ? (identity.priorities as unknown[]).filter((p): p is string => typeof p === 'string')
       : [],
@@ -44,8 +56,13 @@ export async function buildIdentitySlice(args: {
   };
 
   if (args.depth === 'full') {
-    if (Array.isArray(identity.principles)) {
-      slice.principles = (identity.principles as unknown[]).filter(
+    const principlesRaw = Array.isArray(identity.principles)
+      ? identity.principles
+      : Array.isArray(coreImmutable.principles)
+        ? coreImmutable.principles
+        : null;
+    if (principlesRaw) {
+      slice.principles = (principlesRaw as unknown[]).filter(
         (p): p is string => typeof p === 'string',
       );
     }

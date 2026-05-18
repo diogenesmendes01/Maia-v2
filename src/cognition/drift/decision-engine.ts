@@ -182,24 +182,19 @@ export async function decideAndApply(args: {
 
     let applied = false;
     let applied_error: string | undefined;
-
-    if (decision === DriftDecision.FROZEN || decision === DriftDecision.ROLLBACK) {
-      try {
-        const r = await operationalProfileVersionsRepo.transition({
-          id: args.active_profile_id,
-          to: decision === DriftDecision.FROZEN ? 'frozen' : 'rolled_back',
-          approved_by: `auto:drift_${severity}`,
-          rollback_reason:
-            decision === DriftDecision.ROLLBACK ? ev.evidence_summary : undefined,
-        });
-        applied = r.ok;
-        if (!r.ok) applied_error = r.reason;
-      } catch (e) {
-        applied_error = e instanceof Error ? e.message : String(e);
-      }
-    }
-
     let alert_id: string | undefined;
+
+    // Review #100: persist alert BEFORE attempting transition. The prior
+    // ordering (transition → alert) could freeze/rollback the profile and
+    // then crash on alert insert (e.g. CHECK constraint rejecting a new
+    // drift_type without the matching migration). That left profile state
+    // mutated without any audit row explaining why. By going alert-first:
+    //   - if alert insert fails, no profile mutation happens (decision
+    //     surfaces as alert_persist_failed via applied_error and the
+    //     transition is skipped — Postgres CHECK violation is the canonical
+    //     case migration 040 prevents);
+    //   - if transition fails after the alert is in, the alert still
+    //     captures decision/severity so the operator sees what was tried.
     try {
       const alert = await driftAlertsRepo.create({
         profile_version_id: args.active_profile_id,
@@ -213,8 +208,29 @@ export async function decideAndApply(args: {
       alert_id = alert.id;
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      applied_error =
-        (applied_error ? applied_error + '; ' : '') + 'alert_persist_failed:' + msg;
+      applied_error = 'alert_persist_failed:' + msg;
+    }
+
+    // Only mutate profile state if we have a persisted audit row. This is
+    // the invariant: every freeze/rollback applied by the engine MUST have
+    // a matching agent_drift_alerts row visible after the fact.
+    if (
+      alert_id &&
+      (decision === DriftDecision.FROZEN || decision === DriftDecision.ROLLBACK)
+    ) {
+      try {
+        const r = await operationalProfileVersionsRepo.transition({
+          id: args.active_profile_id,
+          to: decision === DriftDecision.FROZEN ? 'frozen' : 'rolled_back',
+          approved_by: `auto:drift_${severity}`,
+          rollback_reason:
+            decision === DriftDecision.ROLLBACK ? ev.evidence_summary : undefined,
+        });
+        applied = r.ok;
+        if (!r.ok) applied_error = r.reason;
+      } catch (e) {
+        applied_error = e instanceof Error ? e.message : String(e);
+      }
     }
 
     results.push({

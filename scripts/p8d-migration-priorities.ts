@@ -4,15 +4,23 @@
  * Estratégia (preserva invariante append-only — master §15.4):
  *  1. Para cada (tenant, agent) com versão `active`, parsear `maia-prompt.md`
  *  2. Se `priorities` já populated → skip (idempotência)
- *  3. Senão, criar nova versão `proposed` com priorities populated
- *     (demais campos copiados, schema_version atualizado, previous_version_id
- *     aponta para a versão antiga)
- *  4. Transition antiga `active → frozen`
- *  5. Transition nova `proposed → active`
- *  6. Em caso de falha no activate, rollback: `frozen → active` da antiga
+ *  3. Senão, chamar `seedNewActiveAtomic` que numa única transação:
+ *     - lock FOR UPDATE na active atual
+ *     - freeze antiga
+ *     - insert nova como `active` direto
+ *     Qualquer falha rola tudo back — old active row stays active.
+ *
+ * Review #100: o caminho antigo (create proposed → transition freeze →
+ * transition active) podia deixar agente sem active row se o processo morresse
+ * entre passos. `seedNewActiveAtomic` torna a sequência atômica por design.
  *
  * Idempotente: re-rodar é seguro. Rodar manualmente após deploy
  * (dev → staging → prod, espaçar 24h).
+ *
+ * Exit code:
+ *  - 0 quando todos os agentes pular ou migrar com sucesso
+ *  - 1 quando há ao menos uma falha por-agente (failed > 0). Crash global
+ *    também resulta em exit 1 via process.exitCode.
  */
 import { readFile } from 'node:fs/promises';
 import { sql } from 'drizzle-orm';
@@ -88,36 +96,21 @@ async function main(): Promise<void> {
             },
           } as unknown as ProfileBody;
 
-          // Step 1: criar nova versão proposed
-          const newVersion = await operationalProfileVersionsRepo.create({
-            profile_body: newBody,
-            proposed_by: 'p8d_migration_priorities',
-            proposed_reason: `populate priorities[]: ${parsed.join(', ')}`,
-          });
-
-          // Step 2: freeze antiga
-          const freezeR = await operationalProfileVersionsRepo.transition({
-            id: active.id,
-            to: 'frozen',
-            approved_by: 'p8d_migration_priorities',
-          });
-          if (!freezeR.ok) throw new Error(`freeze_failed: ${freezeR.reason}`);
-
-          // Step 3: ativar nova
-          const activateR = await operationalProfileVersionsRepo.transition({
-            id: newVersion.id,
-            to: 'active',
-            approved_by: 'p8d_migration_priorities',
-          });
-          if (!activateR.ok) {
-            // Rollback: re-ativar a antiga (frozen → active permitido)
-            await operationalProfileVersionsRepo.transition({
-              id: active.id,
-              to: 'active',
-              approved_by: 'p8d_migration_priorities_rollback',
+          // Review #100: atomic create-frozen-active in one tx with FOR UPDATE
+          // lock. Replaces the legacy create→freeze→activate sequence which
+          // had a 3-step window where a crash could leave the agent without
+          // any active profile (old frozen, new still proposed).
+          //
+          // expected_current_active_id catches the rare race where another
+          // writer (Admin UI, drift engine) promoted a different row to active
+          // between getActive() above and the lock inside the tx.
+          const { new_active: newVersion } =
+            await operationalProfileVersionsRepo.seedNewActiveAtomic({
+              profile_body: newBody,
+              proposed_by: 'p8d_migration_priorities',
+              proposed_reason: `populate priorities[]: ${parsed.join(', ')}`,
+              expected_current_active_id: active.id,
             });
-            throw new Error(`activate_failed: ${activateR.reason}`);
-          }
 
           logger.info(
             {
@@ -142,6 +135,12 @@ async function main(): Promise<void> {
   }
 
   logger.info({ seeded, skipped, failed }, 'p8d_migrate.done');
+
+  // Review #100: partial failure must surface as nonzero exit so CI/runbook
+  // detect "migration finished with errors" instead of silently succeeding.
+  if (failed > 0) {
+    process.exitCode = 1;
+  }
 }
 
 void main().catch((err) => {

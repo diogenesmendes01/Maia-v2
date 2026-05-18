@@ -11,17 +11,18 @@ Quatro completions sobre o `profile_body` (schema v3.1.1, já em produção via 
 3. **`papel_drift`** — 9º detector de drift (alongside `soul_drift` de P8b).
 4. **`identity-slice-builder`** — produz `IdentitySlice` (consumido por `ContextPacket` de P8a).
 
-Sem nova migration DDL. Tudo é código + dados.
+Uma migration DDL pequena (040 — extende CHECK do `drift_type`); tudo o mais é código + dados.
 
 ## Escopo
 
-- Nenhuma DDL nova (reutiliza `agent_operational_profile_versions.profile_body` JSONB v3.1.1).
+- 1 migration DDL (`040_p8d_extend_drift_type_papel.sql`) — adiciona `'papel_drift'` ao CHECK constraint de `agent_drift_alerts.drift_type` (idempotente, com `IF EXISTS`). Necessária porque migration 026 fixou os 7 tipos iniciais; sem 040 a `INSERT` de alert papel_drift falha **depois** de freeze/rollback ter mutado o profile (review #100).
 - 1 detector novo (`papel_drift`).
 - 1 enum novo (`DriftType.PAPEL_DRIFT='papel_drift'`).
 - 1 case novo no `decision-engine.ts` (`PAPEL_DRIFT` com floor rules).
-- 1 script de migração de dados (idempotente, transactional por tenant/agent).
-- 1 builder de slice (`identity-slice-builder.ts`).
+- 1 script de migração de dados (idempotente, transactional por tenant/agent via `seedNewActiveAtomic`).
+- 1 builder de slice (`identity-slice-builder.ts`) com fallback para legacy `core_immutable`.
 - 1 tipo Zod (`LearnedVoiceModifier`).
+- 1 método novo no repo (`operationalProfileVersionsRepo.seedNewActiveAtomic`) — wrappa create+freeze+insert em `withTx` + `FOR UPDATE` (review #100).
 - Validação de `cognitive_limits` + `learned_voice_modifiers` em `operationalProfileVersionsRepo.create`.
 
 ## Feature flag
@@ -55,11 +56,17 @@ Para cada (tenant, agent) com versão `active`:
 
 1. Lê `src/identity/maia-prompt.md`, infere `priorities[]` via `parsePrioritiesFromMarkdown`.
 2. Se a versão `active` já tem `priorities` populated → `skipped` (idempotência).
-3. Senão:
-   - Cria nova versão `proposed` com mesmo body + priorities + `previous_version_id` apontando para a antiga
-   - `transition` antiga `active → frozen`
-   - `transition` nova `proposed → active`
-   - Em caso de falha no activate, rollback: re-ativa a antiga (`frozen → active`)
+3. Senão, chama `operationalProfileVersionsRepo.seedNewActiveAtomic` que, numa única transação Postgres:
+   - lock `FOR UPDATE` na row `active` atual
+   - freeze antiga (`active → frozen`)
+   - insert nova row direto como `active`
+   - qualquer falha rola tudo back e a versão antiga permanece `active`
+4. `expected_current_active_id` protege contra race com Admin UI / drift engine que tenham promovido outra versão entre o `getActive()` e o lock.
+
+### Exit code
+
+- `0` quando todos os agentes pular ou migrar com sucesso
+- `1` quando houve ao menos uma falha por-agente (review #100). CI/runbook devem checar exit code.
 
 ### Logs estruturados
 
@@ -135,13 +142,17 @@ Verifica:
 
 `maia-prompt.md` não tem `## Prioridades` nem `## Princípios` parseáveis. Edit o markdown e re-rode.
 
-### `freeze_failed: not_found` ou `invalid_transition`
+### `seed_atomic_stale_active`
 
-Versão `active` mudou entre o `getActive()` e o `transition` (race com outro processo). O script trata como `failed` e continua para o próximo (tenant, agent). Re-rodar é seguro.
+A versão `active` mudou entre o `getActive()` do script (fora da tx) e o lock `FOR UPDATE` dentro do `seedNewActiveAtomic` (race com Admin UI / drift engine que promoveu outra versão). O script trata como `failed`, conta no exit code, e o estado anterior fica intacto. Re-rodar é seguro.
 
-### `activate_failed: already_has_active`
+### `seed_atomic_freeze_failed`
 
-Outro processo ativou uma terceira versão entre nosso freeze e activate. O rollback automático (re-ativa a antiga) **não vai funcionar** porque já existe outra active. Decisão manual: investigar via `listByStatus('active')` e decidir qual versão deve ficar.
+A row `active` desapareceu mid-tx (deletada). Cenário muito raro — investigar audit log.
+
+### Race com partial unique index
+
+O insert da nova `active` falha se outra thread driblar o lock e inserir antes (`agent_op_profile_unique_active_idx` violation). Postgres aborta a tx; nada é mutado; o script reporta `failed` e segue para o próximo agente.
 
 ### Validação de write-path
 
