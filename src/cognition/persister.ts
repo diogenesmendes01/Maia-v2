@@ -72,12 +72,16 @@ export async function persistCandidate(
             source_event_id: null,
             lifecycle_status: 'active',
             evidence_count: 1,
-            lifecycle_transitions: JSON.stringify([]),
+            // PR #94 round-2: pass [] directly — Drizzle's jsonb mapper
+            // serializes the value; JSON.stringify([]) would double-encode,
+            // storing a JSON string instead of an array and failing the
+            // CHECK jsonb_typeof(lifecycle_transitions) = 'array'.
+            lifecycle_transitions: [],
             confidence: '0.5',
             expires_at: classified.ttl_days
               ? new Date(Date.now() + classified.ttl_days * 24 * 60 * 60 * 1000)
               : null,
-          } as any);
+          });
           memoryEntryId = memEntry.id;
 
           // Se sensível: deriva hint comportamental, valida anti-vazamento e
@@ -103,7 +107,7 @@ export async function persistCandidate(
                     extension_approved_at: null,
                     lifecycle_status: 'active',
                     evidence_count: 1,
-                    lifecycle_transitions: JSON.stringify([]),
+                    lifecycle_transitions: [],
                     confidence: '0.5',
                     expires_at: classified.ttl_days
                       ? new Date(Date.now() + classified.ttl_days * 24 * 60 * 60 * 1000)
@@ -154,8 +158,10 @@ export async function persistCandidate(
         exemplo_origem_id: null,
         lifecycle_status: 'active',
         evidence_count: 1,
-        lifecycle_transitions: JSON.stringify([]),
-      } as any);
+        // PR #94 round-2: pass [] not JSON.stringify([]) — Drizzle jsonb mapper
+        // serializes for us; double-encoding would fail the CHECK constraint.
+        lifecycle_transitions: [],
+      });
       return { persisted_to: 'learned_rules', id: rule?.id };
     }
     case 'lacuna': {

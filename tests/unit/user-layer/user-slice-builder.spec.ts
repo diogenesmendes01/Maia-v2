@@ -6,6 +6,18 @@ import * as interlocutorResolverModule from '@/user-layer/resolvers/interlocutor
 import type { MemoryItem } from '@/user-layer/resolvers/memory-resolver.js';
 import type { HintItem } from '@/user-layer/resolvers/hints-resolver.js';
 
+// PR #94 round-2: enforceTenantBoundary now fails closed (throws when no ALS
+// context). These unit tests focus on slice composition logic, not boundary
+// enforcement. The boundary is mocked to return a stable decision so tests
+// can run without runWithTenantContext.
+vi.mock('@/user-layer/internal/tenant-boundary.js', () => ({
+  enforceTenantBoundary: vi.fn(({ tenant_id }: { tenant_id: string; agent_id?: string }) => ({
+    tenant_id,
+    agent_id: 'agent-test',
+  })),
+  TenantBoundaryViolation: class TenantBoundaryViolation extends Error {},
+}));
+
 const mockInterlocutor = {
   pessoa_id: 'pessoa-1',
   nome: 'João Silva',

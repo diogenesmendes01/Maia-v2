@@ -1,4 +1,5 @@
 import cron from 'node-cron';
+import type { ScheduledTask } from 'node-cron';
 import { logger } from '@/lib/logger.js';
 import { runHealthMonitor } from './health-monitor.js';
 import { runPendingExpirer } from './pending-expirer.js';
@@ -89,7 +90,7 @@ export const JOBS: Job[] = [
   { name: 'gap_escalation_monitor', cron: '*/30 * * * *', fn: runGapEscalationMonitor, phase: 5 },
 ];
 
-const tasks: any[] = [];
+const tasks: ScheduledTask[] = [];
 
 export function startWorkers(currentPhase: number = 1): void {
   for (const job of JOBS) {
@@ -99,7 +100,7 @@ export function startWorkers(currentPhase: number = 1): void {
       () => {
         job.fn().catch((err) => logger.error({ err, job: job.name }, 'worker.failed'));
       },
-      { timezone: 'America/Sao_Paulo' } as any,
+      { timezone: 'America/Sao_Paulo' },
     );
     tasks.push(t);
     logger.info({ job: job.name, cron: job.cron, phase: job.phase }, 'worker.scheduled');

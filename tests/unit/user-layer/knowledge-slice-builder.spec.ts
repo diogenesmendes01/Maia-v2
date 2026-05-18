@@ -5,6 +5,16 @@ import * as rulesResolverModule from '@/user-layer/resolvers/rules-resolver.js';
 import type { FactItem } from '@/user-layer/resolvers/facts-resolver.js';
 import type { RuleItem } from '@/user-layer/resolvers/rules-resolver.js';
 
+// PR #94 round-2: enforceTenantBoundary now fails closed. These unit tests
+// focus on knowledge-slice composition, not boundary enforcement.
+vi.mock('@/user-layer/internal/tenant-boundary.js', () => ({
+  enforceTenantBoundary: vi.fn(({ tenant_id }: { tenant_id: string; agent_id?: string }) => ({
+    tenant_id,
+    agent_id: 'agent-test',
+  })),
+  TenantBoundaryViolation: class TenantBoundaryViolation extends Error {},
+}));
+
 function makeFact(i: number, overrides: Partial<FactItem> = {}): FactItem {
   return {
     id: `fact-${i}`,

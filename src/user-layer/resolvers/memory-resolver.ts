@@ -35,6 +35,14 @@ import type { KnowledgeLifecycleStatus } from '../types.js';
 
 export interface MemoryListInput {
   tenant_id: string;
+  /**
+   * Agent isolation: when provided, SQL predicate adds `agent_id = ?`.
+   * Slice builders MUST pass the effective agent_id returned by
+   * `enforceTenantBoundary` so sibling agents in the same tenant stay
+   * isolated. Omitting this field disables agent-level filtering (use only
+   * for explicit privileged fan-out paths, never as the default).
+   */
+  agent_id?: string;
   pessoa_id?: string;
   scope?: string[];
   memory_types?: string[];
@@ -124,6 +132,13 @@ export const memoryResolver = {
         gt(memory_entry.expires_at, now),
       ),
     ];
+
+    // PR #94 round-2 high: enforce agent isolation. The effective agent_id
+    // from enforceTenantBoundary must be propagated here so sibling agents
+    // within the same tenant cannot read each other's memories.
+    if (input.agent_id) {
+      conditions.push(eq(memory_entry.agent_id, input.agent_id));
+    }
 
     // Scope disjunct (matches memoryEntryRepo.findRelevant in repositories.ts).
     // Only emit the OR clause when AT LEAST ONE subject is passed. Otherwise
@@ -229,17 +244,22 @@ export const memoryResolver = {
   async markObserved(input: {
     tenant_id: string;
     id: string;
+    /** PR #94 round-2: agent_id from enforceTenantBoundary ensures we only
+     * touch rows owned by the calling agent, not sibling agents' rows. */
+    agent_id?: string;
     by_agent_id?: string;
   }): Promise<void> {
     void input.by_agent_id; // reserved for KSM auto-evolution (P10a)
+    const whereClauses = [
+      eq(memory_entry.tenant_id, input.tenant_id),
+      eq(memory_entry.id, input.id),
+    ];
+    if (input.agent_id) {
+      whereClauses.push(eq(memory_entry.agent_id, input.agent_id));
+    }
     await db
       .update(memory_entry)
       .set({ updated_at: new Date() })
-      .where(
-        and(
-          eq(memory_entry.tenant_id, input.tenant_id),
-          eq(memory_entry.id, input.id),
-        ),
-      );
+      .where(and(...whereClauses));
   },
 };

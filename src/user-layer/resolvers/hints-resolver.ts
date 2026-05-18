@@ -29,6 +29,11 @@ export interface HintItem {
 export const hintsResolver = {
   async list(input: {
     tenant_id: string;
+    /**
+     * PR #94 round-2: agent_id from enforceTenantBoundary ensures sibling
+     * agents within the same tenant cannot read each other's hints.
+     */
+    agent_id?: string;
     pessoa_id?: string;
     scope?: string[];
     limit: number;
@@ -44,6 +49,11 @@ export const hintsResolver = {
         gt(behavioral_hint.expires_at, now),
       ),
     ];
+
+    // PR #94 round-2 high: enforce agent isolation.
+    if (input.agent_id) {
+      conditions.push(eq(behavioral_hint.agent_id, input.agent_id));
+    }
 
     if (input.pessoa_id) {
       conditions.push(eq(behavioral_hint.subject_id, input.pessoa_id));

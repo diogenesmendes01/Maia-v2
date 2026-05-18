@@ -32,6 +32,11 @@ export const rulesResolver = {
    */
   async list(input: {
     tenant_id: string;
+    /**
+     * PR #94 round-2: agent_id from enforceTenantBoundary ensures sibling
+     * agents within the same tenant cannot read each other's rules.
+     */
+    agent_id?: string;
     intent_filter?: string;
     tipo?: string;
     only_active?: boolean;
@@ -46,6 +51,11 @@ export const rulesResolver = {
       eq(learned_rules.tenant_id, input.tenant_id),
       isVisibleLifecycle(learned_rules.lifecycle_status),
     ];
+
+    // PR #94 round-2 high: enforce agent isolation.
+    if (input.agent_id) {
+      conditions.push(eq(learned_rules.agent_id, input.agent_id));
+    }
 
     // Default ON — opt-out via explicit `only_active: false`.
     if (input.only_active !== false) {

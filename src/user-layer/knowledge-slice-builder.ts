@@ -25,10 +25,9 @@ export async function buildKnowledgeSlice(input: {
   agent_id?: string;
   trace_id: string;
 }): Promise<BuildKnowledgeSliceOutput> {
-  // PR #94 Codex review high #3: enforce tenant trust boundary AT THE FACADE
-  // before any resolver is touched. Throws TenantBoundaryViolation if the
-  // caller passes a tenant_id that doesn't match the AsyncLocalStorage ctx.
-  enforceTenantBoundary({ tenant_id: input.tenant_id, agent_id: input.agent_id });
+  // PR #94 round-2: enforce boundary fail-closed. Throws if no ALS context or
+  // mismatch. Effective agent_id from context is threaded into resolver calls.
+  const boundary = enforceTenantBoundary({ tenant_id: input.tenant_id, agent_id: input.agent_id });
 
   const start = performance.now();
   const maxes = getKnowledgeMaxes(input.depth, {
@@ -50,12 +49,14 @@ export async function buildKnowledgeSlice(input: {
     if (input.depth !== 'none') {
       facts = await factsResolver.list({
         tenant_id: input.tenant_id,
+        agent_id: boundary.agent_id,
         scope: input.scope_hint,
         limit: maxes.facts,
       });
 
       rules = await rulesResolver.list({
         tenant_id: input.tenant_id,
+        agent_id: boundary.agent_id,
         intent_filter: input.intent_label,
         // PR #94 Codex review high #4: mirror rulesRepo.listActive('classificacao')
         // used by the prompt path. Inactive rules MUST NOT enter KnowledgeSlice;

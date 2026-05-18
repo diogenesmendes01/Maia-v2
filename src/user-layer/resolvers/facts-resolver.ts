@@ -40,6 +40,11 @@ export interface FactItem {
 export const factsResolver = {
   async list(input: {
     tenant_id: string;
+    /**
+     * PR #94 round-2: agent_id from enforceTenantBoundary ensures sibling
+     * agents within the same tenant cannot read each other's facts.
+     */
+    agent_id?: string;
     scope?: Array<'global' | 'tenant' | 'domain' | 'entity'>;
     keys?: string[];
     limit: number;
@@ -58,6 +63,10 @@ export const factsResolver = {
       input.keys && input.keys.length > 0
         ? sql`AND af.chave = ANY(${input.keys})`
         : sql``;
+    // PR #94 round-2 high: enforce agent isolation when agent_id supplied.
+    const agentFilter = input.agent_id
+      ? sql`AND af.agent_id = ${input.agent_id}`
+      : sql``;
 
     const rows = await db.execute<{
       id: string;
@@ -75,6 +84,7 @@ export const factsResolver = {
       FROM agent_facts af
       WHERE af.tenant_id = ${input.tenant_id}
         AND af.lifecycle_status = ANY(${visibleStates})
+        ${agentFilter}
         ${scopeFilter}
         ${keysFilter}
         AND NOT EXISTS (

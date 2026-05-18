@@ -24,10 +24,11 @@ export async function buildUserSlice(input: {
   agent_id?: string;
   trace_id: string;
 }): Promise<BuildUserSliceOutput> {
-  // PR #94 Codex review high #3: enforce tenant trust boundary AT THE FACADE
-  // before any resolver is touched. Throws TenantBoundaryViolation if the
-  // caller passes a tenant_id that doesn't match the AsyncLocalStorage ctx.
-  enforceTenantBoundary({ tenant_id: input.tenant_id, agent_id: input.agent_id });
+  // PR #94 Codex review (round-2): enforce boundary fail-closed. Throws if no
+  // ALS context or if input.tenant_id/agent_id mismatch the established ctx.
+  // The returned decision carries the effective agent_id from context, which
+  // MUST be threaded into every resolver call for agent-level isolation.
+  const boundary = enforceTenantBoundary({ tenant_id: input.tenant_id, agent_id: input.agent_id });
 
   const start = performance.now();
   const max_items = input.max_items ?? getUserMaxItems(input.depth);
@@ -53,6 +54,7 @@ export async function buildUserSlice(input: {
     if (input.depth !== 'none') {
       memories = await memoryResolver.list({
         tenant_id: input.tenant_id,
+        agent_id: boundary.agent_id,
         pessoa_id: input.pessoa_id,
         limit: max_items,
         intent_filter: input.intent_label,
@@ -62,6 +64,7 @@ export async function buildUserSlice(input: {
     if (input.depth === 'relevant' || input.depth === 'deep') {
       behavioral_hints = await hintsResolver.list({
         tenant_id: input.tenant_id,
+        agent_id: boundary.agent_id,
         pessoa_id: input.pessoa_id,
         limit: input.depth === 'deep' ? 999 : 5,
       });
