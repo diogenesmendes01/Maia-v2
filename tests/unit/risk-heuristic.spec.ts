@@ -236,4 +236,132 @@ describe('scoreKnowledgeHeuristic', () => {
     const r = scoreKnowledgeHeuristic(sigDown);
     expect(r.level === RiskLevel.HIGH || r.level === RiskLevel.CRITICAL).toBe(true);
   });
+
+  // ----------------------------------------------------------------------
+  // Codex review #97 finding 1 — CRITICAL composite para knowledge actionable
+  // ----------------------------------------------------------------------
+
+  describe('CRITICAL composite (Codex review)', () => {
+    it('procedimento + critical_decision + tool irreversible → CRITICAL', () => {
+      const sig: KnowledgeRiskSignals = {
+        knowledge_type: 'procedimento',
+        topic: 'critical_decision',
+        tool_kinds: ['irreversible'],
+        evidence_count: 5,
+      };
+      const r = scoreKnowledgeHeuristic(sig);
+      expect(r.level).toBe(RiskLevel.CRITICAL);
+      expect(
+        r.triggers.some((t) => t.signal === 'composite:knowledge_critical_decision+sensitive_action'),
+      ).toBe(true);
+    });
+
+    it('procedimento + critical_decision + transfer → CRITICAL', () => {
+      const sig: KnowledgeRiskSignals = {
+        knowledge_type: 'procedimento',
+        topic: 'critical_decision',
+        tool_kinds: ['transfer'],
+        evidence_count: 5,
+      };
+      expect(scoreKnowledgeHeuristic(sig).level).toBe(RiskLevel.CRITICAL);
+    });
+
+    it('procedimento + critical_decision + write_external → CRITICAL', () => {
+      const sig: KnowledgeRiskSignals = {
+        knowledge_type: 'procedimento',
+        topic: 'critical_decision',
+        tool_kinds: ['write_external'],
+        evidence_count: 5,
+      };
+      expect(scoreKnowledgeHeuristic(sig).level).toBe(RiskLevel.CRITICAL);
+    });
+
+    it('procedimento + critical_decision + touches_irreversible (sem tool_kinds) → CRITICAL', () => {
+      const sig: KnowledgeRiskSignals = {
+        knowledge_type: 'procedimento',
+        topic: 'critical_decision',
+        touches_irreversible: true,
+        evidence_count: 5,
+      };
+      expect(scoreKnowledgeHeuristic(sig).level).toBe(RiskLevel.CRITICAL);
+    });
+
+    it('regra + critical_decision + irreversible → CRITICAL', () => {
+      const sig: KnowledgeRiskSignals = {
+        knowledge_type: 'regra',
+        topic: 'critical_decision',
+        tool_kinds: ['irreversible'],
+        evidence_count: 3,
+      };
+      expect(scoreKnowledgeHeuristic(sig).level).toBe(RiskLevel.CRITICAL);
+    });
+
+    it('tool_request + critical_decision + transfer → CRITICAL', () => {
+      const sig: KnowledgeRiskSignals = {
+        knowledge_type: 'tool_request',
+        topic: 'critical_decision',
+        tool_kinds: ['transfer'],
+      };
+      expect(scoreKnowledgeHeuristic(sig).level).toBe(RiskLevel.CRITICAL);
+    });
+
+    it('fato (não-actionable) + critical_decision + irreversible → NÃO eleva a CRITICAL', () => {
+      // Fato é descrição, não ação. Não dispara composite — fica em HIGH
+      // pelo trigger do tool irreversible + topic critical_decision.
+      const sig: KnowledgeRiskSignals = {
+        knowledge_type: 'fato',
+        topic: 'critical_decision',
+        tool_kinds: ['irreversible'],
+      };
+      const r = scoreKnowledgeHeuristic(sig);
+      expect(r.level).toBe(RiskLevel.HIGH);
+      expect(
+        r.triggers.some((t) => t.signal === 'composite:knowledge_critical_decision+sensitive_action'),
+      ).toBe(false);
+    });
+
+    it('lacuna (não-actionable) + critical_decision + irreversible → NÃO eleva via composite', () => {
+      const sig: KnowledgeRiskSignals = {
+        knowledge_type: 'lacuna',
+        topic: 'critical_decision',
+        tool_kinds: ['irreversible'],
+      };
+      const r = scoreKnowledgeHeuristic(sig);
+      // HIGH é o teto sem o composite (tool irreversible + topic).
+      expect(r.level === RiskLevel.HIGH || r.level === RiskLevel.MEDIUM).toBe(true);
+      expect(
+        r.triggers.some((t) => t.signal === 'composite:knowledge_critical_decision+sensitive_action'),
+      ).toBe(false);
+    });
+
+    it('procedimento + critical_decision + write_local (NÃO sensível) → fica HIGH', () => {
+      // write_local não é sensitive (não toca external); composite não dispara.
+      const sig: KnowledgeRiskSignals = {
+        knowledge_type: 'procedimento',
+        topic: 'critical_decision',
+        tool_kinds: ['write_local'],
+        evidence_count: 5,
+      };
+      const r = scoreKnowledgeHeuristic(sig);
+      expect(r.level).toBe(RiskLevel.HIGH); // critical_decision = HIGH no TOPIC_RISK
+      expect(
+        r.triggers.some((t) => t.signal === 'composite:knowledge_critical_decision+sensitive_action'),
+      ).toBe(false);
+    });
+
+    it('procedimento + tool irreversible mas topic financial (não critical_decision) → HIGH', () => {
+      // Composite exige TOPIC=critical_decision. financial → fica HIGH via tool.
+      const sig: KnowledgeRiskSignals = {
+        knowledge_type: 'procedimento',
+        topic: 'financial',
+        tool_kinds: ['irreversible'],
+        evidence_count: 5,
+      };
+      const r = scoreKnowledgeHeuristic(sig);
+      expect(r.level).toBe(RiskLevel.HIGH);
+      expect(
+        r.triggers.some((t) => t.signal === 'composite:knowledge_critical_decision+sensitive_action'),
+      ).toBe(false);
+    });
+  });
 });

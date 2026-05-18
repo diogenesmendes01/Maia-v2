@@ -184,6 +184,15 @@ export function scoreTurnHeuristic(sig: TurnRiskSignals): HeuristicResult {
 // API: Knowledge scoring
 // ---------------------------------------------------------------------------
 
+/**
+ * Helper: um tool_kind é "sensitive" no sentido de poder consumar uma
+ * ação irreversível/destrutiva (transferir dinheiro, escrever em sistema
+ * externo, executar ação não-revertível). Usado nos composites CRITICAL.
+ */
+function isSensitiveTool(k: ToolKind): boolean {
+  return k === 'irreversible' || k === 'transfer' || k === 'write_external';
+}
+
 export function scoreKnowledgeHeuristic(sig: KnowledgeRiskSignals): HeuristicResult {
   const triggers: RiskTrigger[] = [];
 
@@ -218,7 +227,46 @@ export function scoreKnowledgeHeuristic(sig: KnowledgeRiskSignals): HeuristicRes
     pushTrigger(triggers, 'knowledge:lacuna_in_sensitive_domain', RiskLevel.MEDIUM, 1);
   }
 
-  let level = levelFromTriggers(RiskLevel.LOW, triggers);
+  // --------------------------------------------------------------------
+  // Codex review #97 — finding 1: KNOWLEDGE CRITICAL composite.
+  //
+  // Antes desta regra, `scoreKnowledgeHeuristic` saturava em HIGH para
+  // um procedimento de critical_decision + tool irreversível. Como
+  // `applyGate` SKIPa o LLM para >=HIGH, esse caso ficava preso em HIGH
+  // e nunca virava CRITICAL — o que para procedimentos PERSISTIDOS de
+  // ação irreversível é under-classificação.
+  //
+  // O turn-path tem composite simétrico em scoreTurnHeuristic; aqui
+  // ele estava faltando. Replicamos o mesmo formato + também tratamos
+  // `touches_irreversible` (sinal específico do knowledge path).
+  //
+  // Tipos elegíveis: REGRA e PROCEDIMENTO (não fato/lacuna/tool_request)
+  // — o conhecimento precisa ser ACIONÁVEL para virar critical via composite.
+  // tool_request também elegível porque é literalmente um pedido para
+  // criar uma capability que aciona ação sensível.
+  // --------------------------------------------------------------------
+  let baseline: RiskLevel = RiskLevel.LOW;
+  const isActionable =
+    sig.knowledge_type === 'regra' ||
+    sig.knowledge_type === 'procedimento' ||
+    sig.knowledge_type === 'tool_request';
+  const hasSensitiveTool = (sig.tool_kinds ?? []).some(isSensitiveTool);
+  const hasIrreversibleAction = hasSensitiveTool || sig.touches_irreversible === true;
+  if (
+    isActionable &&
+    sig.topic === 'critical_decision' &&
+    hasIrreversibleAction
+  ) {
+    baseline = RiskLevel.CRITICAL;
+    pushTrigger(
+      triggers,
+      'composite:knowledge_critical_decision+sensitive_action',
+      RiskLevel.CRITICAL,
+      1,
+    );
+  }
+
+  let level = levelFromTriggers(baseline, triggers);
 
   // Owner override
   level = applyOwnerOverride(level, sig.risk_override, triggers);

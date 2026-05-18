@@ -2,16 +2,27 @@
  * P9c — Scorer composto: heurística (Stage 1, sempre) + gate Haiku
  * (Stage 2, condicional) + invariante "LLM nunca rebaixa".
  *
- * Defesa em profundidade — 3 camadas:
+ * Defesa em profundidade — 4 camadas (Codex review #97):
  *  1) TIPO: o `LLMGate` em `types.ts` aceita qualquer `RiskLevel`,
  *     mas a aplicação do resultado é feita por este módulo via
  *     `maxRiskLevel(heuristic, llm)` — nunca por atribuição direta.
- *  2) RUNTIME: este arquivo APLICA a regra. Se o LLM tentou rebaixar,
- *     `llm_attempted_downgrade=true` é registrado no resultado e em
- *     audit (via cognitive_module_log do gate + flag no scorer).
- *  3) PROPERTY TEST: `tests/unit/risk-scorer.spec.ts` gera 500 inputs
+ *  2) RUNTIME (1): este arquivo APLICA a regra do max. Se o LLM tentou
+ *     rebaixar, `llm_attempted_downgrade=true` é registrado no resultado
+ *     e em audit (via cognitive_module_log do gate + flag no scorer).
+ *  3) RUNTIME (2): `assertNoCriticalSignalLoss` post-LLM verifica que
+ *     se a heurística produziu um trigger CRITICAL determinístico,
+ *     o resultado final é CRITICAL. Se algum caminho futuro tentar
+ *     comprimir esse sinal, esta asserção quebra o caminho em vez de
+ *     deixar passar uma under-classification silenciosa.
+ *  4) PROPERTY TEST: `tests/unit/risk-scorer.spec.ts` gera 10k inputs
  *     aleatórios + LLM mock que pode tentar rebaixar; o resultado final
- *     nunca pode ficar abaixo do heurístico.
+ *     nunca pode ficar abaixo do heurístico, e nenhum trigger CRITICAL
+ *     desaparece silenciosamente.
+ *
+ * Validação de runtime fail-closed (level.ts): se o gate devolver um
+ * suggested_level fora do enum RiskLevel, `compareRiskLevel` lança
+ * `InvalidRiskLevelError`. Aqui capturamos esse erro e tratamos como
+ * "gate inválido" (mantém heurístico) sem propagar.
  *
  * Composição com `runCognitiveModule`:
  *  - O gate (`haikuRiskGate`) é wrapped no próprio módulo. O scorer
@@ -20,11 +31,19 @@
  *    componham livremente sem audit duplicado.
  */
 import { RiskLevel } from '@/types/enums.js';
-import { maxRiskLevel, compareRiskLevel } from './level.js';
+import { logger } from '@/lib/logger.js';
+import {
+  maxRiskLevel,
+  compareRiskLevel,
+  isRiskLevel,
+  isAtLeast,
+  InvalidRiskLevelError,
+} from './level.js';
 import { scoreTurnHeuristic, scoreKnowledgeHeuristic } from './heuristic.js';
 import type {
   KnowledgeRiskSignals,
   LLMGate,
+  RiskTrigger,
   ScoredRisk,
   TurnRiskSignals,
 } from './types.js';
@@ -37,12 +56,55 @@ export type ScorerOptions = {
 };
 
 /**
- * Aplica heurística → gate condicional → no-downgrade enforcement.
- * Retorna `ScoredRisk` carregando o nível final + diagnóstico.
+ * Codex review #97 — invariante crítico:
+ *
+ * Se a heurística determinística marcou um trigger CRITICAL (ex.: o
+ * composite `critical_decision + tool sensível`), o nível final NÃO
+ * pode cair abaixo de CRITICAL — mesmo que outras lógicas (gate, owner
+ * override, futuros decoradores) tentem suprimir.
+ *
+ * Esta função é defensiva: ela NÃO deveria nunca corrigir nada na
+ * implementação atual (porque `maxRiskLevel` já garante isso), mas
+ * registramos um warn loud + retornamos o nível corrigido se algum
+ * caminho futuro regredir.
+ *
+ * Em outras palavras: é uma assertion-with-rescue. Em dev, deveria
+ * sempre ser no-op. Em prod, se quebrar, corrige + log para alerta.
+ */
+function assertNoCriticalSignalLoss(
+  triggers: ReadonlyArray<RiskTrigger>,
+  resolvedLevel: RiskLevel,
+  context: 'turn' | 'knowledge',
+): RiskLevel {
+  const hasCriticalTrigger = triggers.some(
+    (t) => t.contributes_to === RiskLevel.CRITICAL,
+  );
+  if (!hasCriticalTrigger) return resolvedLevel;
+  if (isAtLeast(resolvedLevel, RiskLevel.CRITICAL)) return resolvedLevel;
+  // Defesa-em-profundidade: re-escala para CRITICAL e loga audit-visible.
+  logger.warn(
+    {
+      module: 'risk_scorer',
+      context,
+      resolved_level_before: resolvedLevel,
+      critical_triggers: triggers
+        .filter((t) => t.contributes_to === RiskLevel.CRITICAL)
+        .map((t) => t.signal),
+    },
+    'scorer.critical_signal_loss_corrected',
+  );
+  return RiskLevel.CRITICAL;
+}
+
+/**
+ * Aplica heurística → gate condicional → no-downgrade enforcement →
+ * assertCriticalSignals. Retorna `ScoredRisk` carregando o nível final
+ * + diagnóstico.
  */
 async function applyGate(
   heuristic: { level: RiskLevel; confidence: number; ambiguous: boolean; triggers: ScoredRisk['triggers'] },
   opts: ScorerOptions,
+  context: 'turn' | 'knowledge',
 ): Promise<ScoredRisk> {
   // Pula gate se não-ambíguo OU se nível >= high (gastar Haiku para
   // tentar elevar HIGH→CRITICAL não vale; CRITICAL via LLM precisa de
@@ -50,8 +112,9 @@ async function applyGate(
   const skipGate = !heuristic.ambiguous ||
     compareRiskLevel(heuristic.level, RiskLevel.HIGH) >= 0;
   if (skipGate) {
+    const level = assertNoCriticalSignalLoss(heuristic.triggers, heuristic.level, context);
     return {
-      level: heuristic.level,
+      level,
       confidence: heuristic.confidence,
       llm_consulted: false,
       llm_attempted_downgrade: false,
@@ -73,8 +136,9 @@ async function applyGate(
   }
 
   if (!suggested) {
+    const level = assertNoCriticalSignalLoss(heuristic.triggers, heuristic.level, context);
     return {
-      level: heuristic.level,
+      level,
       confidence: heuristic.confidence,
       llm_consulted: true,
       llm_attempted_downgrade: false,
@@ -83,17 +147,84 @@ async function applyGate(
     };
   }
 
+  // Codex review #97 finding 3 — defesa fail-closed contra outputs
+  // corrompidos. Se o LLM (ou um stub mal-comportado) devolveu uma
+  // string fora do enum, `compareRiskLevel` lança InvalidRiskLevelError.
+  // Em vez de propagar, IGNORAMOS o output e mantemos a heurística — o
+  // resultado fica como se o gate tivesse retornado null, mas logamos.
+  if (!isRiskLevel(suggested.suggested_level)) {
+    logger.warn(
+      {
+        module: 'risk_scorer',
+        context,
+        invalid_suggested_level: suggested.suggested_level,
+      },
+      'scorer.gate_returned_invalid_level_ignored',
+    );
+    const level = assertNoCriticalSignalLoss(heuristic.triggers, heuristic.level, context);
+    return {
+      level,
+      confidence: heuristic.confidence,
+      llm_consulted: true,
+      llm_attempted_downgrade: false,
+      triggers: heuristic.triggers,
+      llm_reason: suggested.reason,
+      decided_by: 'heuristic',
+    };
+  }
+
   // 3-layer enforcement, layer 2 (RUNTIME):
   //   resolved = max(heuristic, llm) — se LLM < heuristic, max devolve
   //   heuristic e marcamos llm_attempted_downgrade=true.
-  const attemptedDowngrade =
-    compareRiskLevel(suggested.suggested_level, heuristic.level) < 0;
-  const resolved = maxRiskLevel(heuristic.level, suggested.suggested_level);
+  let attemptedDowngrade: boolean;
+  let resolved: RiskLevel;
+  try {
+    attemptedDowngrade = compareRiskLevel(suggested.suggested_level, heuristic.level) < 0;
+    resolved = maxRiskLevel(heuristic.level, suggested.suggested_level);
+  } catch (err) {
+    // Belt-and-suspenders: se algum operando virar inválido ENTRE o
+    // isRiskLevel guard acima e este bloco (concorrência ou bug futuro),
+    // tratamos como gate-null em vez de quebrar o turn.
+    if (err instanceof InvalidRiskLevelError) {
+      logger.warn(
+        { module: 'risk_scorer', context, err: err.message },
+        'scorer.invalid_risk_level_in_compare_ignored',
+      );
+      const level = assertNoCriticalSignalLoss(heuristic.triggers, heuristic.level, context);
+      return {
+        level,
+        confidence: heuristic.confidence,
+        llm_consulted: true,
+        llm_attempted_downgrade: false,
+        triggers: heuristic.triggers,
+        llm_reason: suggested.reason,
+        decided_by: 'heuristic',
+      };
+    }
+    throw err;
+  }
 
-  const llmActuallyMoved = compareRiskLevel(resolved, heuristic.level) > 0;
+  // Audit-visible log: LLM tried to lower a non-CRITICAL heuristic.
+  // (CRITICAL case is protected by skipGate above + assertNoCriticalSignalLoss.)
+  if (attemptedDowngrade) {
+    logger.warn(
+      {
+        module: 'risk_scorer',
+        context,
+        heuristic_level: heuristic.level,
+        llm_suggested_level: suggested.suggested_level,
+        llm_reason: suggested.reason,
+      },
+      'scorer.llm_disagreed_down_ignored',
+    );
+  }
+
+  // Final assertion: critical signals survived end-to-end.
+  const finalLevel = assertNoCriticalSignalLoss(heuristic.triggers, resolved, context);
+  const llmActuallyMoved = compareRiskLevel(finalLevel, heuristic.level) > 0;
 
   return {
-    level: resolved,
+    level: finalLevel,
     confidence: heuristic.confidence,
     llm_consulted: true,
     llm_attempted_downgrade: attemptedDowngrade,
@@ -108,7 +239,7 @@ export async function scoreTurnRisk(
   opts: ScorerOptions,
 ): Promise<ScoredRisk> {
   const heuristic = scoreTurnHeuristic(sig);
-  return applyGate(heuristic, opts);
+  return applyGate(heuristic, opts, 'turn');
 }
 
 export async function scoreKnowledgeRisk(
@@ -116,5 +247,5 @@ export async function scoreKnowledgeRisk(
   opts: ScorerOptions,
 ): Promise<ScoredRisk> {
   const heuristic = scoreKnowledgeHeuristic(sig);
-  return applyGate(heuristic, opts);
+  return applyGate(heuristic, opts, 'knowledge');
 }

@@ -222,29 +222,72 @@ function randomTurnSignals(rnd: () => number): TurnRiskSignals {
   };
 }
 
-describe('PROPERTY: scoreTurnRisk (500 iter) — final NUNCA abaixo do heurístico', () => {
-  it('LLM aleatório (incluindo abaixo) nunca rebaixa o resultado final', async () => {
+function randomKnowledgeSignals(rnd: () => number): KnowledgeRiskSignals {
+  const ktypes = ['fato', 'regra', 'procedimento', 'lacuna', 'tool_request'] as const;
+  const topics = ['casual', 'operational_simple', 'financial', 'legal', 'health',
+    'critical_decision', 'unknown'] as const;
+  const tools = ['read_local', 'read_external', 'write_local', 'write_external',
+    'transfer', 'irreversible', 'communication'] as const;
+  const overrides = [undefined, RiskLevel.LOW, RiskLevel.MEDIUM, RiskLevel.HIGH,
+    RiskLevel.CRITICAL] as const;
+
+  const tool_kinds: KnowledgeRiskSignals['tool_kinds'] = [];
+  const nTools = Math.floor(rnd() * 3);
+  for (let i = 0; i < nTools; i++) tool_kinds.push(pickFrom(rnd, tools));
+
+  return {
+    knowledge_type: pickFrom(rnd, ktypes),
+    topic: pickFrom(rnd, topics),
+    derived_confidence: rnd() < 0.5 ? rnd() : undefined,
+    evidence_count: rnd() < 0.7 ? Math.floor(rnd() * 6) : undefined,
+    touches_irreversible: rnd() < 0.25,
+    tool_kinds,
+    risk_override: pickFrom(rnd, overrides),
+  };
+}
+
+describe('PROPERTY: scoreTurnRisk (10k iter) — final NUNCA abaixo do heurístico + critical preserved', () => {
+  it('LLM aleatório (incluindo abaixo + inválido) nunca rebaixa o resultado final', async () => {
     const rnd = pseudoRandomGenerator(0xC0FFEE);
-    const ITER = 500;
+    const ITER = 10_000;
     let downgradeAttempts = 0;
     let llmCalls = 0;
+    let invalidLevelInjections = 0;
+    let criticalHeuristicCount = 0;
+
+    const { scoreTurnHeuristic } = await import('@/shared/risk/heuristic.ts');
 
     for (let i = 0; i < ITER; i++) {
       const sig = randomTurnSignals(rnd);
-      const llmLevel = pickFrom(rnd, RISK_LEVELS_ASCENDING);
+      // 5% das vezes o LLM "responde" um nível inválido (fora do enum) —
+      // o scorer deve ignorar e manter heurístico (Codex review #97 finding 3).
+      const injectInvalid = rnd() < 0.05;
+      const llmLevel = injectInvalid
+        ? ('bogus_level' as unknown as RiskLevel)
+        : pickFrom(rnd, RISK_LEVELS_ASCENDING);
+      if (injectInvalid) invalidLevelInjections++;
       let calledThisIter = false;
       const gate: LLMGate = async () => {
         calledThisIter = true;
         return { suggested_level: llmLevel, reason: 'rng' };
       };
       const r = await scoreTurnRisk(sig, { gate, contextText: 'rng' });
-      // Re-rodar heurística para isolar o piso esperado.
-      const { scoreTurnHeuristic } = await import('@/shared/risk/heuristic.ts');
       const h = scoreTurnHeuristic(sig);
       // Final NUNCA abaixo do heurístico.
       expect(isAtLeast(r.level, h.level)).toBe(true);
-      // Se LLM foi chamado e tentou abaixar, flag deve ser true.
-      if (calledThisIter) {
+
+      // CRITICAL SIGNAL PRESERVATION (Codex finding — defesa em profundidade):
+      // se a heurística produziu um trigger CRITICAL, o resultado final é CRITICAL.
+      const heuristicHasCriticalTrigger = h.triggers.some(
+        (t) => t.contributes_to === RiskLevel.CRITICAL,
+      );
+      if (heuristicHasCriticalTrigger) {
+        criticalHeuristicCount++;
+        expect(r.level).toBe(RiskLevel.CRITICAL);
+      }
+
+      // Se LLM foi chamado com nível válido e tentou abaixar → flag.
+      if (calledThisIter && !injectInvalid) {
         llmCalls++;
         if (compareRiskLevel(llmLevel, h.level) < 0) {
           downgradeAttempts++;
@@ -254,8 +297,127 @@ describe('PROPERTY: scoreTurnRisk (500 iter) — final NUNCA abaixo do heurísti
       }
     }
     // Sanity: o gerador realmente tentou rebaixar pelo menos algumas vezes
-    // — caso contrário o teste estaria provando nada.
+    // E injetou alguns inválidos — caso contrário o teste estaria provando nada.
     expect(llmCalls).toBeGreaterThan(0);
     expect(downgradeAttempts).toBeGreaterThan(0);
+    expect(invalidLevelInjections).toBeGreaterThan(0);
+    // Sanity: existiu pelo menos um caso CRITICAL determinístico no
+    // randomização (composite critical_decision + irreversible).
+    expect(criticalHeuristicCount).toBeGreaterThan(0);
+  }, 30_000); // timeout de 30s para 10k iter
+});
+
+describe('PROPERTY: scoreKnowledgeRisk (10k iter) — final NUNCA abaixo do heurístico + critical preserved', () => {
+  it('LLM aleatório nunca rebaixa knowledge; CRITICAL triggers nunca perdem', async () => {
+    const rnd = pseudoRandomGenerator(0xCAFE_F00D);
+    const ITER = 10_000;
+    let downgradeAttempts = 0;
+    let invalidInjections = 0;
+    let criticalHeuristicCount = 0;
+
+    const { scoreKnowledgeHeuristic } = await import('@/shared/risk/heuristic.ts');
+
+    for (let i = 0; i < ITER; i++) {
+      const sig = randomKnowledgeSignals(rnd);
+      const injectInvalid = rnd() < 0.05;
+      const llmLevel = injectInvalid
+        ? ('SUPER_CRITICAL_PLUS' as unknown as RiskLevel)
+        : pickFrom(rnd, RISK_LEVELS_ASCENDING);
+      if (injectInvalid) invalidInjections++;
+      const gate: LLMGate = async () => ({ suggested_level: llmLevel, reason: 'rng' });
+      const r = await scoreKnowledgeRisk(sig, { gate, contextText: 'rng' });
+      const h = scoreKnowledgeHeuristic(sig);
+      expect(isAtLeast(r.level, h.level)).toBe(true);
+
+      const hasCriticalTrigger = h.triggers.some(
+        (t) => t.contributes_to === RiskLevel.CRITICAL,
+      );
+      if (hasCriticalTrigger) {
+        criticalHeuristicCount++;
+        expect(r.level).toBe(RiskLevel.CRITICAL);
+      }
+
+      if (!injectInvalid && compareRiskLevel(llmLevel, h.level) < 0) {
+        downgradeAttempts++;
+        // Só checamos a flag se o gate foi chamado (heurística ambígua).
+        if (r.llm_consulted) {
+          expect(r.llm_attempted_downgrade).toBe(true);
+          expect(r.level).toBe(h.level);
+        }
+      }
+    }
+    expect(downgradeAttempts).toBeGreaterThan(0);
+    expect(invalidInjections).toBeGreaterThan(0);
+    expect(criticalHeuristicCount).toBeGreaterThan(0);
+  }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// Codex review #97 finding 1 — knowledge CRITICAL never silently downgrades
+// ---------------------------------------------------------------------------
+describe('scoreKnowledgeRisk — CRITICAL composite no-downgrade', () => {
+  it('procedimento critical_decision + irreversible: LLM adversarial NÃO rebaixa', async () => {
+    const sig: KnowledgeRiskSignals = {
+      knowledge_type: 'procedimento',
+      topic: 'critical_decision',
+      tool_kinds: ['irreversible'],
+      evidence_count: 5,
+    };
+    // Heurística é CRITICAL — gate é SKIPADO (level >= HIGH).
+    const adversarial: LLMGate = vi.fn(async () => ({
+      suggested_level: RiskLevel.LOW,
+      reason: 'parece ok',
+    }));
+    const r = await scoreKnowledgeRisk(sig, { gate: adversarial, contextText: 'x' });
+    expect(r.level).toBe(RiskLevel.CRITICAL);
+    expect(adversarial).not.toHaveBeenCalled();
+    expect(r.decided_by).toBe('heuristic');
+  });
+
+  it('tool_request critical_decision + transfer: CRITICAL preservado mesmo se gate tentasse', async () => {
+    const sig: KnowledgeRiskSignals = {
+      knowledge_type: 'tool_request',
+      topic: 'critical_decision',
+      tool_kinds: ['transfer'],
+    };
+    const r = await scoreKnowledgeRisk(sig, {
+      gate: async () => ({ suggested_level: RiskLevel.LOW, reason: 'mock' }),
+      contextText: '',
+    });
+    expect(r.level).toBe(RiskLevel.CRITICAL);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Codex review #97 finding 3 — invalid gate output is ignored, not propagated
+// ---------------------------------------------------------------------------
+describe('scoreTurnRisk — invalid LLM output handling', () => {
+  it('gate retorna nível string fora do enum → ignora, mantém heurístico', async () => {
+    const gate: LLMGate = async () => ({
+      suggested_level: 'super_critical' as unknown as RiskLevel,
+      reason: 'fora do enum',
+    });
+    const r = await scoreTurnRisk(
+      { topic: 'unknown' }, // ambíguo → gate consultado
+      { gate, contextText: 'x' },
+    );
+    // Heurística é LOW; gate output inválido é ignorado.
+    expect(r.level).toBe(RiskLevel.LOW);
+    expect(r.llm_consulted).toBe(true);
+    expect(r.llm_attempted_downgrade).toBe(false);
+    expect(r.decided_by).toBe('heuristic');
+  });
+
+  it('gate retorna nível undefined → ignora, mantém heurístico', async () => {
+    const gate: LLMGate = async () => ({
+      suggested_level: undefined as unknown as RiskLevel,
+      reason: 'sem level',
+    });
+    const r = await scoreTurnRisk(
+      { topic: 'financial' }, // medium ambíguo → gate consultado
+      { gate, contextText: 'x' },
+    );
+    expect(r.level).toBe(RiskLevel.MEDIUM);
+    expect(r.decided_by).toBe('heuristic');
   });
 });

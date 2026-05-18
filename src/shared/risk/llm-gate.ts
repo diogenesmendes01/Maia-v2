@@ -9,22 +9,56 @@
  *  - Wrapped in `runCognitiveModule` (`name='risk_assessor_llm'`,
  *    `triggered_by='sync_conditional'`, `timeoutMs=2500`, fallback=null,
  *    audit=true). cognitive_module_log registra latência + status.
- *  - Anthropic throw / timeout / JSON malformado → null silencioso
- *    (gate retorna null; scorer trata como "manter heurístico").
+ *  - Anthropic throw / timeout → status='error'/'timeout' (runner cobre).
+ *  - JSON ausente / malformado / inválido pelo Zod schema → THROW
+ *    `LLMGateParseError` (Codex review #97 finding 2). Antes, o gate
+ *    devolvia `null` silenciosamente e o runner registrava status='success'
+ *    com output=null — uma regressão de prompt podia ficar invisível.
+ *    Agora o throw força runner status='error', fallback_triggered=true e
+ *    fallback_reason com a mensagem do erro de parse.
  *  - O contrato NÃO força no-downgrade no LLM — defesa em profundidade
  *    deixa essa validação para o scorer (cf. `scorer.ts`).
  */
 import Anthropic from '@anthropic-ai/sdk';
+import { z } from 'zod';
 import { runCognitiveModule } from '@/cognition/runner.js';
+import { logger } from '@/lib/logger.js';
 import { RiskLevel } from '@/types/enums.js';
 import type { LLMGate } from './types.js';
 
-const VALID_LEVELS: ReadonlySet<string> = new Set([
-  RiskLevel.LOW,
-  RiskLevel.MEDIUM,
-  RiskLevel.HIGH,
-  RiskLevel.CRITICAL,
-]);
+/**
+ * Zod schema do JSON estrito esperado do Haiku. Falha de validação =
+ * throw `LLMGateParseError` para o runCognitiveModule registrar como erro.
+ */
+const HaikuResponseSchema = z.object({
+  suggested_level: z.enum([
+    RiskLevel.LOW,
+    RiskLevel.MEDIUM,
+    RiskLevel.HIGH,
+    RiskLevel.CRITICAL,
+  ]),
+  reason: z.string().optional().default(''),
+});
+
+/**
+ * Erro tipado emitido quando a resposta do Haiku é unparseable / inválida.
+ * Causa: runner classifica como `status='error'` e `fallback_triggered=true`,
+ * o que aparece no cognitive_module_log e permite alarme operacional.
+ *
+ * Defesa em profundidade: o scorer trata `gate→null` (que é o fallback do
+ * runner) como "manter heurístico" — o piso de risco nunca cai.
+ */
+export class LLMGateParseError extends Error {
+  readonly kind: 'no_json' | 'malformed_json' | 'schema_invalid';
+  readonly raw_text_sample: string;
+  constructor(kind: LLMGateParseError['kind'], raw_text_sample: string, detail?: string) {
+    super(`risk_assessor_llm parse failure (${kind})${detail ? ': ' + detail : ''}`);
+    this.name = 'LLMGateParseError';
+    this.kind = kind;
+    // Cap to avoid logging huge bodies; first 200 chars is enough for postmortem.
+    this.raw_text_sample = raw_text_sample.slice(0, 200);
+  }
+}
 
 /**
  * Implementação default backed by Anthropic Haiku 4.5. Para tests que
@@ -71,19 +105,47 @@ export const haikuRiskGate: LLMGate = async ({ current_level, context_text }) =>
         )
         .map((c) => c.text)
         .join('');
+
+      // Stage 1: JSON detection. Sem chaves no texto → throw para audit.
       const match = text.match(/\{[\s\S]*\}/);
-      if (!match) return null;
-      let parsed: { suggested_level?: string; reason?: string };
-      try {
-        parsed = JSON.parse(match[0]) as { suggested_level?: string; reason?: string };
-      } catch {
-        return null;
+      if (!match) {
+        logger.warn(
+          { module: 'risk_assessor_llm', kind: 'no_json', sample: text.slice(0, 80) },
+          'haikuRiskGate.parse_failure_no_json',
+        );
+        throw new LLMGateParseError('no_json', text);
       }
-      if (typeof parsed.suggested_level !== 'string') return null;
-      if (!VALID_LEVELS.has(parsed.suggested_level)) return null;
+
+      // Stage 2: JSON.parse. Sintaxe inválida → throw.
+      let raw: unknown;
+      try {
+        raw = JSON.parse(match[0]);
+      } catch (err) {
+        const msg = (err as Error).message;
+        logger.warn(
+          { module: 'risk_assessor_llm', kind: 'malformed_json', err: msg },
+          'haikuRiskGate.parse_failure_malformed',
+        );
+        throw new LLMGateParseError('malformed_json', match[0], msg);
+      }
+
+      // Stage 3: Zod schema. Shape inválido (level fora do enum, suggested_level
+      // ausente, etc.) → throw para audit.
+      const validation = HaikuResponseSchema.safeParse(raw);
+      if (!validation.success) {
+        const issues = validation.error.issues
+          .map((i) => `${i.path.join('.')}:${i.code}`)
+          .join('|');
+        logger.warn(
+          { module: 'risk_assessor_llm', kind: 'schema_invalid', issues },
+          'haikuRiskGate.parse_failure_schema',
+        );
+        throw new LLMGateParseError('schema_invalid', match[0], issues);
+      }
+
       return {
-        suggested_level: parsed.suggested_level as RiskLevel,
-        reason: typeof parsed.reason === 'string' ? parsed.reason : '',
+        suggested_level: validation.data.suggested_level,
+        reason: validation.data.reason,
       };
     },
   );
