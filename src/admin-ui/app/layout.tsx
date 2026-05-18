@@ -1,9 +1,8 @@
 import './../styles/globals.css';
 import * as React from 'react';
 import Link from 'next/link';
-import { getServerSession } from 'next-auth';
-import { authOptions } from '../lib/auth.js';
-import { TRPCProvider } from '../trpc/client-provider.js';
+import { auth } from '../lib/auth.js';
+import { Providers } from './providers.js';
 
 export const metadata = {
   title: 'Maia Admin',
@@ -11,12 +10,12 @@ export const metadata = {
 };
 
 export default async function RootLayout({ children }: { children: React.ReactNode }) {
-  const session = await getServerSession(authOptions);
+  const session = await auth();
 
   return (
     <html lang="pt-BR">
       <body>
-        <TRPCProvider>
+        <Providers>
           {session ? (
             <>
               <nav className="bg-gray-900 text-white p-4 flex justify-between items-center">
@@ -51,7 +50,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
           ) : (
             <main className="p-6">{children}</main>
           )}
-        </TRPCProvider>
+        </Providers>
       </body>
     </html>
   );

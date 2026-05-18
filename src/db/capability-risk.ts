@@ -57,28 +57,63 @@ function asObject(spec: unknown): Record<string, unknown> | null {
   return spec as Record<string, unknown>;
 }
 
+const RISK_ORDER: Record<RiskLevelId, number> = {
+  low: 0,
+  medium: 1,
+  high: 2,
+  critical: 3,
+};
+
+function maxRisk(a: RiskLevelId, b: RiskLevelId): RiskLevelId {
+  return RISK_ORDER[a] >= RISK_ORDER[b] ? a : b;
+}
+
 export function deriveCapabilityRisk(
   capabilityType: string | null | undefined,
   proposedSpec: unknown,
 ): RiskLevelId {
   const spec = asObject(proposedSpec);
-
-  if (spec && typeof spec.risk === 'string') {
-    const r = spec.risk as RiskLevelId;
-    if (r === 'low' || r === 'medium' || r === 'high' || r === 'critical') return r;
-  }
-
-  if (hasAny(spec, DESTRUCTIVE_SPEC_MARKERS)) return 'critical';
-  if (hasAny(spec, SIDE_EFFECT_SPEC_MARKERS)) return 'high';
-  if (hasAny(spec, READ_ONLY_SPEC_MARKERS)) {
-    const t = capabilityType ?? '';
-    const floor = TYPE_RISK_FLOOR[t];
-    return floor === 'low' ? 'low' : 'medium';
-  }
-  if (hasAny(spec, COSTLY_READ_MARKERS)) return 'medium';
-
   const t = capabilityType ?? '';
-  return TYPE_RISK_FLOOR[t] ?? 'critical';
+  const typeFloor: RiskLevelId = TYPE_RISK_FLOOR[t] ?? 'critical';
+
+  // --- Step 1: Compute marker-derived risk (security-authoritative). ---
+  // Destructive markers dominate everything.
+  let markerRisk: RiskLevelId;
+  if (hasAny(spec, DESTRUCTIVE_SPEC_MARKERS)) {
+    markerRisk = 'critical';
+  } else if (hasAny(spec, SIDE_EFFECT_SPEC_MARKERS)) {
+    markerRisk = 'high';
+  } else if (hasAny(spec, READ_ONLY_SPEC_MARKERS)) {
+    // read_only is a downward hint. Clamp to 'medium' at most
+    // (never below 'low'); but the type floor will still dominate in step 2.
+    markerRisk = 'low';
+  } else if (hasAny(spec, COSTLY_READ_MARKERS)) {
+    markerRisk = 'medium';
+  } else {
+    // No markers — marker contribution is neutral (floor wins).
+    markerRisk = 'low';
+  }
+
+  // --- Step 2: Apply type floor (floor is a MINIMUM, cannot be bypassed). ---
+  const derivedRisk: RiskLevelId = maxRisk(markerRisk, typeFloor);
+
+  // --- Step 3: Self-declared risk is an ESCALATION HINT ONLY. ---
+  // proposal_spec.risk can raise the computed severity (escalate) but NEVER
+  // lower it. This prevents a malicious or buggy proposal body from
+  // self-downgrading its approval class past what markers + type floor require.
+  if (spec && typeof spec.risk === 'string') {
+    const selfDeclared = spec.risk as string;
+    if (
+      selfDeclared === 'low' ||
+      selfDeclared === 'medium' ||
+      selfDeclared === 'high' ||
+      selfDeclared === 'critical'
+    ) {
+      return maxRisk(derivedRisk, selfDeclared as RiskLevelId);
+    }
+  }
+
+  return derivedRisk;
 }
 
 export function deriveCapabilityLocks(

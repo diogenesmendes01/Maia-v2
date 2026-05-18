@@ -7,9 +7,8 @@
  * src/admin-ui/trpc/tenant-resolver.ts (which permits founder-cross-tenant
  * only).
  */
-import { getServerSession } from 'next-auth';
 import { TRPCError } from '@trpc/server';
-import { authOptions } from '../lib/auth.js';
+import { auth } from '../lib/auth.js';
 import * as repos from '../../db/repositories.js';
 
 export interface CreateContextOptions {
@@ -17,7 +16,7 @@ export interface CreateContextOptions {
 }
 
 export async function createTRPCContext(_opts?: CreateContextOptions) {
-  const session = await getServerSession(authOptions);
+  const session = await auth();
 
   return {
     session,

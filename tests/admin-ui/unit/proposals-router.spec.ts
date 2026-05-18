@@ -113,11 +113,14 @@ function makeRepoMock(proposals: Proposal[]) {
         });
         let sourceTransitioned = false;
         let finalStatus = src.status;
+        // round-2: mock mirrors the real decideAtomically which returns
+        // dualComplete (recomputed inside the transaction).
+        const resolvedDual = input.dualComplete;
         if (input.decision === 'rejected') {
           src.status = 'rejected';
           finalStatus = 'rejected';
           sourceTransitioned = true;
-        } else if (input.dualComplete) {
+        } else if (resolvedDual) {
           src.status = 'pending_review';
           finalStatus = 'pending_review';
           sourceTransitioned = true;
@@ -127,6 +130,7 @@ function makeRepoMock(proposals: Proposal[]) {
           approval,
           sourceTransitioned,
           finalStatus,
+          dualComplete: resolvedDual,
         };
       },
     },

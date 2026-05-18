@@ -3915,9 +3915,14 @@ export const proposalsUnifiedRepo = {
    *     attempted transition (rejects double-approval, double-reject, race
    *     between two operators).
    *
-   * The approver_user_id + role check + dual-approval invariant lives at the
-   * tRPC procedure layer (proposalsRouter.approve); this method assumes the
-   * caller has already enforced the approval gate.
+   * round-2 fix: dup-check (same user cannot approve twice) and gate
+   * recomputation now happen INSIDE the transaction after locking the source
+   * row. This prevents the race where two concurrent approvers both compute
+   * willSatisfyGate=false outside the tx, then both serialize through the
+   * lock and insert approvals without triggering the transition.
+   *
+   * Gate inputs from the tRPC layer (requiredRoles, allLocks) are passed in
+   * so this method can recompute dualComplete from the fresh approval list.
    */
   async decideAtomically(input: {
     tenantId: string;
@@ -3928,25 +3933,40 @@ export const proposalsUnifiedRepo = {
     actorRole: string;
     decision: 'approved' | 'rejected';
     comment: string;
-    /** True ⇒ the gate is satisfied; perform the source transition. */
+    /**
+     * Provided by the tRPC layer for gate recomputation inside the tx.
+     * If absent, falls back to the pre-computed dualComplete (old behaviour,
+     * kept for backwards-compat with the mock in tests).
+     */
+    gateParams?: {
+      dualRequired: boolean;
+      requiredRoles: string[];
+      allLocks: string[];
+    };
+    /** True ⇒ the gate is satisfied; perform the source transition.
+     * Ignored when gateParams is present (recomputed inside tx). */
     dualComplete: boolean;
   }): Promise<{
     ok: true;
     sourceTransitioned: boolean;
     approval: ProposalApproval;
     finalStatus: ProposalUnifiedStatus;
+    /** Recomputed inside transaction. */
+    dualComplete: boolean;
   } | {
     ok: false;
     reason:
       | 'not_found'
       | 'invalid_source_status'
       | 'source_not_supported'
-      | 'transition_failed';
+      | 'transition_failed'
+      | 'already_approved_by_user'
+      | 'already_approved_by_role';
   }> {
     const available = await this._availableTables();
 
     return await withTx(async (tx) => {
-      // (1) Re-read source under the txn lock to prevent races.
+      // (1) Re-read + LOCK source row to prevent races.
       if (input.type === 'capability_proposal') {
         if (!available.includes('capability_proposals')) {
           return { ok: false, reason: 'source_not_supported' as const };
@@ -3969,6 +3989,53 @@ export const proposalsUnifiedRepo = {
         // need explicit submit first; terminal states block.
         if (sourceRow.status !== 'submitted') {
           return { ok: false, reason: 'invalid_source_status' as const };
+        }
+
+        // (1b) Re-read existing approvals INSIDE the transaction + re-run dup
+        // checks so concurrent approvers cannot race past the idempotency guard.
+        let resolvedDualComplete = input.dualComplete;
+        if (input.decision === 'approved' && input.gateParams) {
+          const existingInTx = await tx
+            .select()
+            .from(proposal_approvals)
+            .where(eq(proposal_approvals.proposal_id, input.proposalId));
+
+          // Idempotency by user: same user cannot record two approvals.
+          if (existingInTx.some(
+            (a) => a.approver_user_id === input.actorId && a.decision === 'approved',
+          )) {
+            return { ok: false, reason: 'already_approved_by_user' as const };
+          }
+
+          const { dualRequired, requiredRoles, allLocks } = input.gateParams;
+
+          // For non-lockdown dual classes: same role cannot double-sign.
+          if (dualRequired && allLocks.length === 0) {
+            if (existingInTx.some(
+              (a) => a.approver_role === input.actorRole && a.decision === 'approved',
+            )) {
+              return { ok: false, reason: 'already_approved_by_role' as const };
+            }
+          }
+
+          // Recompute gate from the fresh (locked) approval list + this approval.
+          if (allLocks.length > 0) {
+            const priorFounderIds = new Set(
+              existingInTx
+                .filter((a) => a.decision === 'approved' && a.approver_role === 'founder')
+                .map((a) => a.approver_user_id),
+            );
+            priorFounderIds.add(input.actorId);
+            resolvedDualComplete = priorFounderIds.size >= 2;
+          } else if (dualRequired) {
+            const approvedRoles = new Set(
+              existingInTx.filter((a) => a.decision === 'approved').map((a) => a.approver_role),
+            );
+            approvedRoles.add(input.actorRole);
+            resolvedDualComplete = requiredRoles.every((r) => approvedRoles.has(r));
+          } else {
+            resolvedDualComplete = true;
+          }
         }
 
         // (2) Insert approval row.
@@ -4001,9 +4068,9 @@ export const proposalsUnifiedRepo = {
           change_summary: {
             approval_class: input.approvalClass,
             comment: input.comment,
-            dual_complete: input.dualComplete,
+            dual_complete: resolvedDualComplete,
             source_transition_attempted:
-              input.decision === 'rejected' || input.dualComplete,
+              input.decision === 'rejected' || resolvedDualComplete,
           },
         });
 
@@ -4029,7 +4096,7 @@ export const proposalsUnifiedRepo = {
           }
           finalStatus = 'rejected';
           sourceTransitioned = true;
-        } else if (input.dualComplete) {
+        } else if (resolvedDualComplete) {
           // submitted → approved. (approved → testing → delivered is owned by
           // capability-test-runner and runs out-of-band.)
           const patched = await tx
@@ -4058,6 +4125,7 @@ export const proposalsUnifiedRepo = {
           sourceTransitioned,
           approval,
           finalStatus,
+          dualComplete: resolvedDualComplete,
         };
       }
 
@@ -4080,67 +4148,54 @@ export const proposalsUnifiedRepo = {
     comment: string,
   ): Promise<{ rejected_count: number; skipped_ids: string[] }> {
     if (ids.length === 0) return { rejected_count: 0, skipped_ids: [] };
-    return await withTx(async (tx) => {
-      let rejected = 0;
-      const skipped: string[] = [];
-      for (const id of ids) {
-        const proposal = await this.getOne(tenantId, id);
-        if (!proposal) {
-          skipped.push(id);
-          continue;
-        }
-        if (proposal.risk !== 'low') {
-          skipped.push(id);
-          continue;
-        }
-        if (proposal.locks.length > 0) {
-          skipped.push(id);
-          continue;
-        }
-        // Write rejection row
-        await tx.insert(proposal_approvals).values({
-          tenant_id: tenantId,
-          proposal_id: id,
-          approval_class: `${proposal.type}_${proposal.risk}`,
-          approver_user_id: actorId,
-          approver_role: actorRole,
-          decision: 'rejected',
-          comment,
-        });
-        // Audit log row
-        await tx.insert(admin_audit_log).values({
-          tenant_id: tenantId,
-          actor_id: actorId,
-          actor_role: actorRole,
-          action: 'bulk_reject',
-          resource_type: proposal.type,
-          resource_id: id,
-          change_summary: { comment, source: 'admin-ui' },
-        });
-        // Post-Codex-review #101: mutate source-of-truth too. Without this
-        // step the inbox would keep showing rejected proposals as 'proposed'.
-        if (proposal.type === 'capability_proposal') {
-          await tx
-            .update(capability_proposals)
-            .set({
-              status: 'rejected',
-              decided_at: new Date(),
-              decided_by: actorId,
-              decision_reason: comment,
-              updated_at: new Date(),
-            })
-            .where(
-              and(
-                eq(capability_proposals.tenant_id, tenantId),
-                eq(capability_proposals.id, id),
-                eq(capability_proposals.status, 'submitted'),
-              ),
-            );
-        }
-        rejected += 1;
+    // round-2 fix: each proposal is processed in its own nested transaction
+    // using decideAtomically so that:
+    //   (a) The source row is locked (SELECT FOR UPDATE) before reading status.
+    //   (b) audit/approval rows are ONLY inserted when the source transition
+    //       succeeds (UPDATE returns a row), not on stale/already-handled rows.
+    //   (c) rejected_count is only incremented for actual state changes.
+    let rejected = 0;
+    const skipped: string[] = [];
+
+    for (const id of ids) {
+      // Pre-flight: read outside tx for fast-skip (risk, locks). If the row
+      // disappears between here and decideAtomically, decideAtomically returns
+      // not_found and we skip.
+      const proposal = await this.getOne(tenantId, id);
+      if (!proposal) {
+        skipped.push(id);
+        continue;
       }
-      return { rejected_count: rejected, skipped_ids: skipped };
-    });
+      if (proposal.risk !== 'low') {
+        skipped.push(id);
+        continue;
+      }
+      if (proposal.locks.length > 0) {
+        skipped.push(id);
+        continue;
+      }
+      // Authoritative transactional path: lock + validate + write atomically.
+      const result = await this.decideAtomically({
+        tenantId,
+        proposalId: id,
+        type: proposal.type,
+        approvalClass: `${proposal.type}_${proposal.risk}`,
+        actorId,
+        actorRole,
+        decision: 'rejected',
+        comment,
+        dualComplete: true, // single rejection is always gate-complete.
+      });
+      if (!result.ok) {
+        // invalid_source_status → row already delivered/approved/rejected.
+        // not_found → race: row deleted between pre-flight and lock.
+        // Either way: no state change → skip without counting.
+        skipped.push(id);
+        continue;
+      }
+      rejected += 1;
+    }
+    return { rejected_count: rejected, skipped_ids: skipped };
   },
 };
 

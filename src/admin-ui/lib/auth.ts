@@ -1,10 +1,11 @@
 /**
  * P8.5 — NextAuth v5 (auth.js) configuration.
  *
- * SECURITY POSTURE (post Codex review #101):
+ * SECURITY POSTURE (post Codex review #101 round-2):
  *
  *   Production:
- *     - NEXTAUTH_SECRET must be set (>= 32 chars). Boot fails otherwise.
+ *     - NEXTAUTH_SECRET / AUTH_SECRET must be set (>= 32 chars). Boot fails
+ *       otherwise.
  *     - The magic-link CredentialsProvider is NOT registered. There is no
  *       email-only sign-in path. OIDC/SAML must be wired (deferred to P10);
  *       until then, production sign-in returns "no providers configured".
@@ -25,10 +26,23 @@
  *   tenant match + feature flag + dev-auth flag), all of which require shell
  *   access to the deployment to configure.
  *
- * REVIEW REFERENCE: PR #101 Codex finding "[critical] Email-only credentials
- * provider lets anyone impersonate admins".
+ * REVIEW REFERENCE:
+ *   - round-1 finding: "[critical] Email-only credentials provider lets anyone
+ *     impersonate admins" — fixed in round-1.
+ *   - round-2 finding: "[critical] Auth route exports wrong NextAuth v5 object"
+ *     — fixed here: v4 NextAuthOptions → v5 NextAuthConfig; exports { handlers,
+ *     auth }; consumers call auth() instead of getServerSession(authOptions).
+ *
+ * v5 MIGRATION NOTES:
+ *   - `NextAuthOptions` (v4) → `NextAuthConfig` (v5).
+ *   - `authOptions` removed; `auth` is the universal session accessor.
+ *   - Route handler exports `handlers.GET` / `handlers.POST`.
+ *   - Server components / tRPC context use `auth()` (no args) instead of
+ *     `getServerSession(authOptions)`.
+ *   - JWT callback signature: `user` is always present on initial sign-in.
  */
-import type { NextAuthOptions, Session, User } from 'next-auth';
+import NextAuth from 'next-auth';
+import type { NextAuthConfig, Session } from 'next-auth';
 import type { JWT } from 'next-auth/jwt';
 import CredentialsProvider from 'next-auth/providers/credentials';
 import { appUsersRepo } from '../../db/repositories.js';
@@ -39,7 +53,7 @@ import {
   resolveSecret,
 } from './auth-gating.js';
 
-function buildProviders(): NextAuthOptions['providers'] {
+function buildProviders(): NextAuthConfig['providers'] {
   if (!devCredentialsProviderEnabled()) {
     // Fail-closed: no providers. NextAuth will refuse sign-in until OIDC/SAML
     // is wired (P10). This is intentional — see module-level comment.
@@ -55,7 +69,7 @@ function buildProviders(): NextAuthOptions['providers'] {
         token: { label: 'Token', type: 'text' },
         tenantId: { label: 'Tenant', type: 'text' },
       },
-      async authorize(credentials): Promise<User | null> {
+      async authorize(credentials) {
         // Defense in depth: re-check at request time, in case env changed since boot.
         if (!devCredentialsProviderEnabled()) return null;
 
@@ -95,10 +109,11 @@ function buildProviders(): NextAuthOptions['providers'] {
   ];
 }
 
-export const authOptions: NextAuthOptions = {
+// v5 NextAuthConfig (replaces v4 NextAuthOptions).
+const authConfig: NextAuthConfig = {
   providers: buildProviders(),
   callbacks: {
-    async jwt({ token, user }: { token: JWT; user?: User }): Promise<JWT> {
+    async jwt({ token, user }: { token: JWT; user?: { id?: string } }) {
       if (user?.id) {
         // Always re-derive role + tenant_id from the DB row, never trust the
         // session bootstrap claims. Prevents a malicious client from supplying
@@ -112,11 +127,11 @@ export const authOptions: NextAuthOptions = {
       }
       return token;
     },
-    async session({ session, token }: { session: Session; token: JWT }): Promise<Session> {
+    async session({ session, token }: { session: Session; token: JWT }) {
       if (session.user) {
-        session.user.id = token.id as string;
-        session.user.role = token.role as string;
-        session.user.tenant_id = token.tenant_id as string;
+        session.user.id = (token.id as string) ?? '';
+        session.user.role = (token.role as string) ?? '';
+        session.user.tenant_id = (token.tenant_id as string) ?? '';
       }
       return session;
     },
@@ -128,6 +143,14 @@ export const authOptions: NextAuthOptions = {
   },
   secret: resolveSecret(),
 };
+
+/**
+ * `handlers` — Next.js App Router route handlers (GET/POST).
+ * `auth`     — universal session accessor. Call as `auth()` (no args) in server
+ *              components, tRPC context, and middleware to get the active Session
+ *              (replaces v4's `getServerSession(authOptions)`).
+ */
+export const { handlers, auth } = NextAuth(authConfig);
 
 /**
  * Test-only re-exports. These are NOT part of the public API surface; they

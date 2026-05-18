@@ -105,23 +105,24 @@ export const proposalsRouter = router({
         });
       }
 
-      const existing = await ctx.repos.proposalApprovalsRepo.listByProposal(input.id);
+      // Round-2 fix: pass gateParams into decideAtomically so the dup-check
+      // and willSatisfyGate recomputation happen INSIDE the transaction, after
+      // locking the source row. The pre-flight dup checks below are kept as a
+      // fast-fail UX shortcut (avoids acquiring the DB lock for obvious
+      // duplicates) but the authoritative check is transactional.
+      const existingFastCheck = await ctx.repos.proposalApprovalsRepo.listByProposal(input.id);
 
-      // Idempotency by USER (not by role): the same user cannot record two
-      // approval rows for the same proposal. For dual-founder lockdown flows,
-      // this still allows founder-A and founder-B to both sign.
-      if (existing.some((a) => a.approver_user_id === ctx.userId && a.decision === 'approved')) {
+      // Fast-fail: same user cannot record two approval rows.
+      if (existingFastCheck.some((a) => a.approver_user_id === ctx.userId && a.decision === 'approved')) {
         throw new TRPCError({
           code: 'CONFLICT',
           message: 'You have already approved this proposal',
         });
       }
 
-      // For non-lockdown dual classes (e.g. policy_rule_hard_limit requires
-      // owner + compliance_officer, two DIFFERENT roles), block a duplicate
-      // signature from the same role.
+      // Fast-fail: same role cannot double-sign non-lockdown dual classes.
       if (dualRequired && allLocks.length === 0) {
-        if (existing.some((a) => a.approver_role === ctx.userRole && a.decision === 'approved')) {
+        if (existingFastCheck.some((a) => a.approver_role === ctx.userRole && a.decision === 'approved')) {
           throw new TRPCError({
             code: 'CONFLICT',
             message: `Role ${ctx.userRole} already approved this proposal`,
@@ -129,23 +130,19 @@ export const proposalsRouter = router({
         }
       }
 
-      // Lockdown-critical descriptors require TWO distinct founder signatures.
-      // The matrix only requires one founder for identity_drift_correction et al.
-      // For broader architecture-lock proposals (any locks), enforce
-      // 2 × distinct founders before sourceTransition fires.
+      // Optimistic pre-check (non-authoritative — real check is inside the tx).
       let willSatisfyGate: boolean;
       if (allLocks.length > 0) {
-        // Need 2 distinct founder approvers (including this one).
-        const priorFounderApprovals = existing.filter(
-          (a) => a.decision === 'approved' && a.approver_role === 'founder',
+        const priorFounderIds = new Set(
+          existingFastCheck
+            .filter((a) => a.decision === 'approved' && a.approver_role === 'founder')
+            .map((a) => a.approver_user_id),
         );
-        const distinctFounders = new Set(priorFounderApprovals.map((a) => a.approver_user_id));
-        distinctFounders.add(ctx.userId);
-        willSatisfyGate = distinctFounders.size >= 2;
+        priorFounderIds.add(ctx.userId);
+        willSatisfyGate = priorFounderIds.size >= 2;
       } else if (dualRequired) {
-        // Need each requiredRole represented at least once.
         const approvedRoles = new Set(
-          existing.filter((a) => a.decision === 'approved').map((a) => a.approver_role),
+          existingFastCheck.filter((a) => a.decision === 'approved').map((a) => a.approver_role),
         );
         approvedRoles.add(ctx.userRole);
         willSatisfyGate = requiredRoles.every((r) => approvedRoles.has(r));
@@ -154,6 +151,8 @@ export const proposalsRouter = router({
       }
 
       // Atomic decision: insert approval + audit + source transition.
+      // gateParams causes decideAtomically to re-check dup + recompute gate
+      // from the locked approval list, preventing concurrent-approval races.
       const result = await ctx.repos.proposalsUnifiedRepo.decideAtomically({
         tenantId,
         proposalId: input.id,
@@ -164,6 +163,11 @@ export const proposalsRouter = router({
         decision: 'approved',
         comment: input.comment,
         dualComplete: willSatisfyGate,
+        gateParams: {
+          dualRequired,
+          requiredRoles,
+          allLocks,
+        },
       });
 
       if (!result.ok) {
@@ -182,24 +186,40 @@ export const proposalsRouter = router({
             message: 'Approval for this proposal source is not implemented yet',
           });
         }
+        // round-2: transactional dup-check inside decideAtomically.
+        if (result.reason === 'already_approved_by_user') {
+          throw new TRPCError({
+            code: 'CONFLICT',
+            message: 'You have already approved this proposal (concurrent request detected)',
+          });
+        }
+        if (result.reason === 'already_approved_by_role') {
+          throw new TRPCError({
+            code: 'CONFLICT',
+            message: `Role ${ctx.userRole} already approved this proposal (concurrent request detected)`,
+          });
+        }
         throw new TRPCError({
           code: 'INTERNAL_SERVER_ERROR',
           message: `Source transition failed: ${result.reason}`,
         });
       }
 
+      // Use the authoritative dualComplete from inside the transaction.
+      const txDualComplete = result.dualComplete;
+
       const approvedRoles = new Set(
-        [...existing, result.approval]
+        [...existingFastCheck, result.approval]
           .filter((a) => a.decision === 'approved')
           .map((a) => a.approver_role),
       );
       const remainingRoles = requiredRoles.filter((r) => !approvedRoles.has(r));
 
       return {
-        status: result.sourceTransitioned && willSatisfyGate ? 'activated' : 'pending_dual_approval',
+        status: result.sourceTransitioned && txDualComplete ? 'activated' : 'pending_dual_approval',
         approval_id: result.approval.id,
         dual_required: dualRequired,
-        dual_complete: willSatisfyGate,
+        dual_complete: txDualComplete,
         source_transitioned: result.sourceTransitioned,
         final_status: result.finalStatus,
         remaining_roles: remainingRoles,

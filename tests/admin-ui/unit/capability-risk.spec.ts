@@ -10,9 +10,25 @@ import { deriveCapabilityRisk, deriveCapabilityLocks } from '@/db/capability-ris
 import { getApprovalClassFor, requiresDualApproval } from '@/admin-ui/lib/approval-matrix.js';
 
 describe('deriveCapabilityRisk', () => {
-  it('explicit risk in spec wins', () => {
-    expect(deriveCapabilityRisk('tool', { risk: 'low' })).toBe('low');
+  // round-2 fix: self-declared risk is an ESCALATION HINT only.
+  // proposed_spec.risk cannot lower the computed severity (max-only).
+  it('self-declared risk cannot lower type-floor (tool floor=critical)', () => {
+    // A tool self-declaring risk:'low' must still resolve to 'critical' (type floor).
+    expect(deriveCapabilityRisk('tool', { risk: 'low' })).toBe('critical');
+    // A tool self-declaring risk:'medium' must still resolve to 'critical'.
+    expect(deriveCapabilityRisk('tool', { risk: 'medium' })).toBe('critical');
+    // Self-declaring 'critical' is fine (same as floor).
     expect(deriveCapabilityRisk('tool', { risk: 'critical' })).toBe('critical');
+  });
+
+  it('self-declared risk can escalate above marker-derived risk', () => {
+    // A knowledge type with read_only would normally be 'low', but self-declaring
+    // 'high' escalates it (max-only: higher wins).
+    expect(deriveCapabilityRisk('knowledge', { read_only: true, risk: 'high' })).toBe('high');
+    // A procedure (floor=medium) self-declaring 'critical' escalates.
+    expect(deriveCapabilityRisk('procedure', { risk: 'critical' })).toBe('critical');
+    // Self-declaring 'low' for procedure (floor=medium) → still 'medium'.
+    expect(deriveCapabilityRisk('procedure', { risk: 'low' })).toBe('medium');
   });
 
   it('destructive markers force critical', () => {
@@ -24,23 +40,36 @@ describe('deriveCapabilityRisk', () => {
     expect(deriveCapabilityRisk('tool', { mass_writes: true })).toBe('critical');
   });
 
-  it('side-effect markers escalate to high', () => {
-    expect(deriveCapabilityRisk('tool', { has_side_effects: true })).toBe('high');
-    expect(deriveCapabilityRisk('tool', { mutates_state: true })).toBe('high');
-    expect(deriveCapabilityRisk('tool', { writes_data: true })).toBe('high');
-    expect(deriveCapabilityRisk('integration', { external_post: true })).toBe('high');
+  it('side-effect markers escalate to high, capped at type-floor (round-2)', () => {
+    // tool/integration floor=critical dominates: maxRisk(high,critical)=critical.
+    expect(deriveCapabilityRisk('tool', { has_side_effects: true })).toBe('critical');
+    expect(deriveCapabilityRisk('tool', { mutates_state: true })).toBe('critical');
+    expect(deriveCapabilityRisk('tool', { writes_data: true })).toBe('critical');
+    expect(deriveCapabilityRisk('integration', { external_post: true })).toBe('critical');
+    // procedure floor=medium: maxRisk(high,medium)=high.
+    expect(deriveCapabilityRisk('procedure', { has_side_effects: true })).toBe('high');
+    // knowledge floor=low: maxRisk(high,low)=high.
+    expect(deriveCapabilityRisk('knowledge', { mutates_state: true })).toBe('high');
   });
 
-  it('read-only knowledge is low; read-only tool is medium', () => {
+  it('read-only knowledge is low; read-only tool/integration are critical (type-floor wins)', () => {
     expect(deriveCapabilityRisk('knowledge', { read_only: true })).toBe('low');
-    expect(deriveCapabilityRisk('tool', { idempotent: true })).toBe('medium');
-    expect(deriveCapabilityRisk('integration', { safe_read: true })).toBe('medium');
+    // procedure floor=medium: maxRisk(medium,medium)=medium.
+    expect(deriveCapabilityRisk('procedure', { idempotent: true })).toBe('medium');
+    // tool/integration floor=critical: maxRisk(medium,critical)=critical.
+    expect(deriveCapabilityRisk('tool', { idempotent: true })).toBe('critical');
+    expect(deriveCapabilityRisk('integration', { safe_read: true })).toBe('critical');
   });
 
-  it('costly-read markers are medium', () => {
-    expect(deriveCapabilityRisk('tool', { paid_api: true })).toBe('medium');
-    expect(deriveCapabilityRisk('tool', { high_cost: true })).toBe('medium');
-    expect(deriveCapabilityRisk('tool', { large_scan: true })).toBe('medium');
+  it('costly-read markers capped at type-floor (round-2)', () => {
+    // tool floor=critical: maxRisk(medium,critical)=critical.
+    expect(deriveCapabilityRisk('tool', { paid_api: true })).toBe('critical');
+    expect(deriveCapabilityRisk('tool', { high_cost: true })).toBe('critical');
+    expect(deriveCapabilityRisk('tool', { large_scan: true })).toBe('critical');
+    // procedure floor=medium: maxRisk(medium,medium)=medium.
+    expect(deriveCapabilityRisk('procedure', { paid_api: true })).toBe('medium');
+    // knowledge floor=low: maxRisk(medium,low)=medium.
+    expect(deriveCapabilityRisk('knowledge', { paid_api: true })).toBe('medium');
   });
 
   it('FAIL CLOSED: unknown capability_type + no markers → critical', () => {
@@ -59,10 +88,17 @@ describe('deriveCapabilityRisk', () => {
     expect(deriveCapabilityRisk('other', {})).toBe('critical');
   });
 
-  it('explicit safe spec downgrades a tool to medium, not below', () => {
-    // Even if marked read_only, tool stays medium (not low) because tool's
-    // type-floor is critical and read_only opens the floor only to medium.
-    expect(deriveCapabilityRisk('tool', { read_only: true })).toBe('medium');
+  it('type-floor dominates: read_only tool stays critical (round-2 fix)', () => {
+    // round-2: self-declared or marker-inferred 'medium' cannot lower the
+    // type-floor for tool (critical). read_only narrows the read-marker hint
+    // to medium, but maxRisk(medium, critical) = critical.
+    expect(deriveCapabilityRisk('tool', { read_only: true })).toBe('critical');
+    // integration shares the same floor.
+    expect(deriveCapabilityRisk('integration', { safe_read: true })).toBe('critical');
+    // knowledge read_only → 'low' (floor is low, read_only hint = low → max = low).
+    expect(deriveCapabilityRisk('knowledge', { read_only: true })).toBe('low');
+    // procedure read_only → medium (floor is medium, hint = medium → max = medium).
+    expect(deriveCapabilityRisk('procedure', { read_only: true })).toBe('medium');
   });
 
   it('destructive overrides everything else', () => {
@@ -125,8 +161,19 @@ describe('risk → approval matrix integration (Codex #101 — no destructive si
     expect(requiresDualApproval(cls)).toBe(true);
   });
 
-  it('side-effect capability lands on capability_side_effect (dual approval)', () => {
+  it('side-effect tool lands on capability_dangerous_tool (type-floor critical, round-2)', () => {
+    // tool + side-effect → maxRisk(high, critical) = critical → dangerous_tool.
     const risk = deriveCapabilityRisk('tool', { has_side_effects: true });
+    expect(risk).toBe('critical');
+    const cls = getApprovalClassFor('capability_proposal', risk);
+    expect(cls).toBe('capability_dangerous_tool');
+    expect(requiresDualApproval(cls)).toBe(true);
+  });
+
+  it('side-effect procedure lands on capability_side_effect (procedure floor=medium)', () => {
+    // procedure + side-effect → maxRisk(high, medium) = high → capability_side_effect.
+    const risk = deriveCapabilityRisk('procedure', { has_side_effects: true });
+    expect(risk).toBe('high');
     const cls = getApprovalClassFor('capability_proposal', risk);
     expect(cls).toBe('capability_side_effect');
     expect(requiresDualApproval(cls)).toBe(true);
