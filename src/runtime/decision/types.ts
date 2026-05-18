@@ -254,6 +254,22 @@ export interface ContinueDecision {
     rule_descriptor: string;
     reason: string;
   }>;
+  /**
+   * Structured tool-set reductions issued by `reduce_tool_set` policies.
+   *
+   * Spec §4.2 + Codex review #103: a Mid PEP `reduce_tool_set` MUST become
+   * an enforceable rule (not only a warning). Each entry instructs the
+   * action-decider to subtract the listed tools from the final
+   * `allowed_tools` and move them into `blocked_tools` with audit trail.
+   *
+   * Empty (or undefined) on Early PEP since it has no skill/tool context.
+   */
+  tool_reductions?: Array<{
+    policy_id: string;
+    rule_descriptor: string;
+    removed_tools: string[];
+    reason: string;
+  }>;
 }
 
 export type EarlyPepOutput = BlockDecision | ContinueDecision;
@@ -328,11 +344,22 @@ export interface SkillSelectorResult {
   candidate_skill_ids: string[];
 }
 
+export interface SkillSelectorOptions {
+  /**
+   * Optional override for the agent under which skills are looked up. When
+   * the channel policy resolves a different default agent than the base
+   * packet, the engine MUST pass this so that skill candidates and tool
+   * permissions belong to the routed agent (Codex review #103).
+   */
+  agent_id_override?: string;
+  workflow_id?: string;
+}
+
 export interface SkillSelector {
   select(
     base: BaseContextPacket,
     intent: DecisionPacket['intent'],
-    workflow_id?: string,
+    options?: SkillSelectorOptions,
   ): Promise<SkillSelectorResult>;
 }
 
@@ -363,6 +390,7 @@ export interface ActionDecider {
 // ============================================================================
 
 export type SubBudgetName =
+  | 'resolver'
   | 'early_pep'
   | 'intent'
   | 'risk'

@@ -10,6 +10,7 @@
 import type {
   Skill,
   SkillSelector,
+  SkillSelectorOptions,
   SkillSelectorResult,
   SkillsRepo,
 } from './types.js';
@@ -30,14 +31,22 @@ export class SkillSelectorImpl implements SkillSelector {
   async select(
     base: BaseContextPacket,
     intent: DecisionPacket['intent'],
-    workflow_id?: string,
+    options?: SkillSelectorOptions,
   ): Promise<SkillSelectorResult> {
+    // Codex review #103: always honour the routed agent over base.agent_id.
+    // The channel policy may resolve a different default agent than the one
+    // that built the BaseContextPacket; skill lookup MUST use the routed
+    // agent or we leak skills/tool permissions across agents inside the same
+    // tenant.
+    const routedAgentId = options?.agent_id_override ?? base.agent_id;
     const query: Parameters<SkillsRepo['findActive']>[0] = {
       tenant_id: base.tenant_id,
-      agent_id: base.agent_id,
+      agent_id: routedAgentId,
       applicable_to_intent: intent.label,
     };
-    if (workflow_id !== undefined) query.applicable_to_workflow = workflow_id;
+    if (options?.workflow_id !== undefined) {
+      query.applicable_to_workflow = options.workflow_id;
+    }
 
     const candidates = await this.deps.skillsRepo.findActive(query);
 

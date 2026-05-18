@@ -88,7 +88,7 @@ describe('P9b — SkillSelector', () => {
     await selector.select(
       mkBase(),
       { label: 'transfer_intent', confidence: 0.8 },
-      'wf_123',
+      { workflow_id: 'wf_123' },
     );
     expect(deps.skillsRepo.findActive).toHaveBeenCalledWith({
       tenant_id: 'tn1',
@@ -96,6 +96,32 @@ describe('P9b — SkillSelector', () => {
       applicable_to_intent: 'transfer_intent',
       applicable_to_workflow: 'wf_123',
     });
+  });
+
+  it('Codex #103 — uses agent_id_override when provided (routed agent ≠ base agent)', async () => {
+    const deps = mkDeps([mkSkill({ id: 's_x' })]);
+    const selector = new SkillSelectorImpl(deps);
+    await selector.select(
+      mkBase({ agent_id: 'base_agent_X' }),
+      { label: 'transfer_intent', confidence: 0.8 },
+      { agent_id_override: 'routed_agent_Y' },
+    );
+    const call = (deps.skillsRepo.findActive as ReturnType<typeof vi.fn>).mock
+      .calls[0]?.[0];
+    expect(call?.agent_id).toBe('routed_agent_Y');
+    expect(call?.agent_id).not.toBe('base_agent_X');
+  });
+
+  it('Codex #103 — falls back to base.agent_id when no override given', async () => {
+    const deps = mkDeps([mkSkill({ id: 's_x' })]);
+    const selector = new SkillSelectorImpl(deps);
+    await selector.select(
+      mkBase({ agent_id: 'base_only' }),
+      { label: 'greet', confidence: 0.95 },
+    );
+    const call = (deps.skillsRepo.findActive as ReturnType<typeof vi.fn>).mock
+      .calls[0]?.[0];
+    expect(call?.agent_id).toBe('base_only');
   });
 
   it('omits workflow_id from query when undefined', async () => {

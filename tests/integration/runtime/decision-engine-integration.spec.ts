@@ -409,6 +409,88 @@ describe('P9b — Decision Engine integration (7 cenários, spec §10.2)', () =>
     );
   });
 
+  it('Codex #103 — Cenário 8: Mid PEP reduce_tool_set REMOVES tool from packet (no policy bypass)', async () => {
+    fixture.setContent('quero transferir R$ 100');
+    fixture.policies.set('p_mid_reduce', {
+      policy_id: 'p_mid_reduce',
+      descriptor: 'transfer.reduce_unsafe',
+      applies_to_peps: ['mid'],
+    });
+    fixture.setVerdict('p_mid_reduce', {
+      action: 'reduce_tool_set',
+      reason: 'transfer_money requires extra verification',
+      parameters: { removed_tools: ['transfer_money'] },
+    });
+
+    const engine = createDecisionEngine(fixture);
+    const r = await engine.run({ base: mkBase(fixture) });
+
+    // Engine should still produce a packet — but transfer_money MUST NOT
+    // appear in allowed_tools. Before the fix it leaked through because the
+    // verdict was logged as a warning only.
+    expect(r.packet.tool_permissions.allowed_tools).not.toContain(
+      'transfer_money',
+    );
+    expect(r.packet.tool_permissions.blocked_tools).toContain(
+      'transfer_money',
+    );
+    // Skill_transfer has ONLY transfer_money in allowed_tools — reducing it
+    // empties the list, which must force ask_clarification (never a
+    // call_tool packet with empty allowed_tools).
+    expect(r.packet.action_mode).toBe('ask_clarification');
+    expect(r.packet.rationale).toContain('tool_set_reduced_to_empty');
+
+    // Audit row recorded with policy_id and warn decision
+    const reduceRows = r.packet.policy_decisions.filter(
+      (d) => d.policy_id === 'p_mid_reduce',
+    );
+    expect(reduceRows.length).toBeGreaterThan(0);
+  });
+
+  it('Codex #103 — Cenário 9: skill selection uses routed agent (not base.agent_id)', async () => {
+    // Set channel policy to resolve a DIFFERENT default agent than base.
+    fixture.channelPolicies.getForChannel = vi.fn().mockResolvedValue({
+      tenant_id: fixture.tenant_id,
+      channel_id: 'ch_wpp_1',
+      default_agent_id: 'agent_b', // routing wins
+    });
+    const findActiveSpy = vi.spyOn(fixture.skillsRepo, 'findActive');
+    fixture.setContent('olá!');
+
+    const engine = createDecisionEngine(fixture);
+    const r = await engine.run({
+      base: mkBase(fixture, { agent_id: 'agent_a' }), // base says agent_a
+    });
+
+    // Packet routing reflects channel-resolved agent
+    expect(r.packet.routing.agent_id).toBe('agent_b');
+    // SkillsRepo MUST have been queried with agent_b — not agent_a.
+    const lastCall = findActiveSpy.mock.calls.at(-1)?.[0];
+    expect(lastCall?.agent_id).toBe('agent_b');
+    expect(lastCall?.agent_id).not.toBe('agent_a');
+  });
+
+  it('Codex #103 — Cenário 10: hung resolver triggers deadline fallback (hot path bounded)', async () => {
+    const hangResolver: PolicyDescriptorResolver = {
+      resolveDescriptors: vi
+        .fn()
+        .mockImplementation(() => new Promise<ResolvedPolicy[]>(() => {})),
+    };
+    const engine = createDecisionEngine({ ...fixture, resolver: hangResolver });
+
+    const t0 = Date.now();
+    const r = await engine.run({ base: mkBase(fixture) });
+    const elapsed = Date.now() - t0;
+
+    expect(r.fallback_applied).toBe('ask_clarification');
+    expect(r.packet.action_mode).toBe('ask_clarification');
+    expect(elapsed).toBeLessThan(800); // bounded by 400ms budget + small slack
+    expect(fixture.metrics.increment).toHaveBeenCalledWith(
+      'decision_engine.budget_fallback',
+      expect.objectContaining({ failed_step: 'resolver' }),
+    );
+  }, 5000);
+
   it('Cenário 7: policy_decisions array populated from 3 PEPs (early warn + mid warn + late warn)', async () => {
     // Early adds a warning policy
     fixture.policies.set('p_early_warn', {

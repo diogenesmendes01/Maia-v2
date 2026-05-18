@@ -17,6 +17,7 @@ import type {
   ActionDecider,
   ActionDeciderInput,
   ActionDeciderResult,
+  ContinueDecision,
   RequireDualApprovalDecision,
   Skill,
   SkillsRepo,
@@ -120,9 +121,28 @@ export class ActionDeciderImpl implements ActionDecider {
     }
 
     if (skill.category === 'tool_mediated' || skill.category === 'decide') {
+      // Codex review #103: enforce Mid PEP `reduce_tool_set` reductions
+      // BEFORE emitting the packet. If reducing removes every available tool
+      // from a tool-mediated skill, fall back to ask_clarification — never
+      // emit a call_tool packet with an empty allowed_tools list.
+      const reductions = collectReductions(input.midPepOutcome);
+      const toolPerms = applyToolReductions(buildToolPerms(skill), reductions);
+      if (
+        reductions.length > 0 &&
+        toolPerms.allowed_tools.length === 0 &&
+        (skill.allowed_tools ?? []).length > 0
+      ) {
+        return {
+          action_mode: 'ask_clarification',
+          tool_permissions: toolPerms,
+          context_requirements: DEFAULT_CONTEXT_REQUIREMENTS,
+          evaluation_plan: DEFAULT_EVAL_PLAN,
+          rationale: `tool_set_reduced_to_empty:${skill.id}`,
+        };
+      }
       return {
         action_mode: 'call_tool',
-        tool_permissions: buildToolPerms(skill),
+        tool_permissions: toolPerms,
         context_requirements: buildContextRequirements({
           skill,
           intent: input.intent,
@@ -158,6 +178,41 @@ function buildToolPerms(skill: Skill): DecisionPacket['tool_permissions'] {
     allowed_tools: skill.allowed_tools ?? [],
     blocked_tools: skill.blocked_tools ?? [],
     requires_confirmation: skill.requires_confirmation_tools ?? [],
+  };
+}
+
+function collectReductions(
+  outcome: ActionDeciderInput['midPepOutcome'],
+): NonNullable<ContinueDecision['tool_reductions']> {
+  // Block / escalate / dual_approval already short-circuit the engine before
+  // action-decider runs, but we narrow defensively.
+  if ('decision' in outcome) return [];
+  return outcome.tool_reductions ?? [];
+}
+
+function applyToolReductions(
+  perms: DecisionPacket['tool_permissions'],
+  reductions: NonNullable<ContinueDecision['tool_reductions']>,
+): DecisionPacket['tool_permissions'] {
+  if (reductions.length === 0) return perms;
+  const removed = new Set<string>();
+  for (const r of reductions) {
+    for (const t of r.removed_tools) removed.add(t);
+  }
+  if (removed.size === 0) return perms;
+  const remainingAllowed = perms.allowed_tools.filter((t) => !removed.has(t));
+  const removedActuallyAllowed = perms.allowed_tools.filter((t) =>
+    removed.has(t),
+  );
+  // Merge into blocked_tools (dedup, preserve original order then appended).
+  const blockedSet = new Set<string>(perms.blocked_tools);
+  for (const t of removedActuallyAllowed) blockedSet.add(t);
+  return {
+    allowed_tools: remainingAllowed,
+    blocked_tools: Array.from(blockedSet),
+    requires_confirmation: perms.requires_confirmation.filter(
+      (t) => !removed.has(t),
+    ),
   };
 }
 

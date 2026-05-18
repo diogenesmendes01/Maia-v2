@@ -214,4 +214,177 @@ describe('P9b — ActionDecider', () => {
     const r = await decider.decide(mkInput());
     expect(r.context_requirements.user.depth).toBe('minimal');
   });
+
+  it('Codex #103 — enforces reduce_tool_set: removes tools from allowed and moves to blocked', async () => {
+    const skill = mkSkill({
+      id: 'skill_transfer',
+      category: 'tool_mediated',
+      allowed_tools: ['transfer_money', 'send_receipt', 'view_balance'],
+      blocked_tools: ['delete_account'],
+      requires_confirmation_tools: ['transfer_money'],
+    });
+    const deps = mkDeps({
+      skillsRepo: {
+        find: vi.fn().mockResolvedValue(skill),
+        findActive: vi.fn().mockResolvedValue([skill]),
+      },
+    });
+    const decider = new ActionDeciderImpl(deps);
+    const r = await decider.decide(
+      mkInput({
+        intent: { label: 'transfer_intent', confidence: 0.85 },
+        skill: {
+          selected_skill_id: 'skill_transfer',
+          candidate_skill_ids: ['skill_transfer'],
+        },
+        midPepOutcome: {
+          pep: 'mid',
+          warnings: [],
+          tool_reductions: [
+            {
+              policy_id: 'p_reduce',
+              rule_descriptor: 'transfer.reduce_for_unauth',
+              removed_tools: ['transfer_money'],
+              reason: 'unauthenticated must not transfer',
+            },
+          ],
+        },
+      }),
+    );
+    expect(r.action_mode).toBe('call_tool');
+    // transfer_money was removed from allowed AND moved to blocked
+    expect(r.tool_permissions.allowed_tools).not.toContain('transfer_money');
+    expect(r.tool_permissions.allowed_tools).toContain('send_receipt');
+    expect(r.tool_permissions.allowed_tools).toContain('view_balance');
+    expect(r.tool_permissions.blocked_tools).toContain('transfer_money');
+    expect(r.tool_permissions.blocked_tools).toContain('delete_account');
+    expect(r.tool_permissions.requires_confirmation).not.toContain(
+      'transfer_money',
+    );
+  });
+
+  it('Codex #103 — multiple reductions are accumulated and deduped', async () => {
+    const skill = mkSkill({
+      id: 'skill_x',
+      category: 'tool_mediated',
+      allowed_tools: ['t1', 't2', 't3', 't4'],
+      blocked_tools: [],
+      requires_confirmation_tools: [],
+    });
+    const deps = mkDeps({
+      skillsRepo: {
+        find: vi.fn().mockResolvedValue(skill),
+        findActive: vi.fn().mockResolvedValue([skill]),
+      },
+    });
+    const decider = new ActionDeciderImpl(deps);
+    const r = await decider.decide(
+      mkInput({
+        skill: {
+          selected_skill_id: 'skill_x',
+          candidate_skill_ids: ['skill_x'],
+        },
+        midPepOutcome: {
+          pep: 'mid',
+          warnings: [],
+          tool_reductions: [
+            {
+              policy_id: 'p1',
+              rule_descriptor: 'd1',
+              removed_tools: ['t1', 't2'],
+              reason: 'rule 1',
+            },
+            {
+              policy_id: 'p2',
+              rule_descriptor: 'd2',
+              removed_tools: ['t2', 't3'], // t2 dup
+              reason: 'rule 2',
+            },
+          ],
+        },
+      }),
+    );
+    expect(r.tool_permissions.allowed_tools).toEqual(['t4']);
+    expect(r.tool_permissions.blocked_tools.sort()).toEqual(['t1', 't2', 't3']);
+  });
+
+  it('Codex #103 — falls back to ask_clarification if reduction empties allowed_tools (NEVER auto-allow)', async () => {
+    const skill = mkSkill({
+      id: 'skill_transfer',
+      category: 'tool_mediated',
+      allowed_tools: ['transfer_money'],
+      blocked_tools: [],
+      requires_confirmation_tools: [],
+    });
+    const deps = mkDeps({
+      skillsRepo: {
+        find: vi.fn().mockResolvedValue(skill),
+        findActive: vi.fn().mockResolvedValue([skill]),
+      },
+    });
+    const decider = new ActionDeciderImpl(deps);
+    const r = await decider.decide(
+      mkInput({
+        skill: {
+          selected_skill_id: 'skill_transfer',
+          candidate_skill_ids: ['skill_transfer'],
+        },
+        midPepOutcome: {
+          pep: 'mid',
+          warnings: [],
+          tool_reductions: [
+            {
+              policy_id: 'p_reduce',
+              rule_descriptor: 'd',
+              removed_tools: ['transfer_money'],
+              reason: 'all unsafe',
+            },
+          ],
+        },
+      }),
+    );
+    expect(r.action_mode).toBe('ask_clarification');
+    expect(r.rationale).toContain('tool_set_reduced_to_empty');
+    expect(r.tool_permissions.allowed_tools).toEqual([]);
+    expect(r.tool_permissions.blocked_tools).toContain('transfer_money');
+  });
+
+  it('Codex #103 — reduce_tool_set is a no-op when removed_tools is empty', async () => {
+    const skill = mkSkill({
+      id: 'skill_x',
+      category: 'tool_mediated',
+      allowed_tools: ['t1'],
+      blocked_tools: [],
+      requires_confirmation_tools: [],
+    });
+    const deps = mkDeps({
+      skillsRepo: {
+        find: vi.fn().mockResolvedValue(skill),
+        findActive: vi.fn().mockResolvedValue([skill]),
+      },
+    });
+    const decider = new ActionDeciderImpl(deps);
+    const r = await decider.decide(
+      mkInput({
+        skill: {
+          selected_skill_id: 'skill_x',
+          candidate_skill_ids: ['skill_x'],
+        },
+        midPepOutcome: {
+          pep: 'mid',
+          warnings: [],
+          tool_reductions: [
+            {
+              policy_id: 'p_noop',
+              rule_descriptor: 'd',
+              removed_tools: [],
+              reason: 'evaluator returned empty list',
+            },
+          ],
+        },
+      }),
+    );
+    expect(r.action_mode).toBe('call_tool');
+    expect(r.tool_permissions.allowed_tools).toEqual(['t1']);
+  });
 });

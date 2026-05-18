@@ -233,6 +233,115 @@ describe('P9b — Mid PEP', () => {
     expect(cont.warnings[1]?.reason).toContain('delete_account');
   });
 
+  it('Codex #103 — reduce_tool_set populates structured tool_reductions output', async () => {
+    const deps = mkDeps({
+      policyRepo: {
+        getBody: vi.fn().mockResolvedValue({
+          policy_id: 'p_reduce',
+          descriptor: 'transfer.reduce_unsafe',
+          applies_to_peps: ['mid'],
+        }),
+        getBodySync: vi.fn().mockReturnValue(null),
+      },
+      evaluator: {
+        evaluate: vi.fn().mockResolvedValue({
+          action: 'reduce_tool_set',
+          reason: 'remove dangerous tools',
+          parameters: { removed_tools: ['transfer_money', 'delete_account'] },
+        }),
+      },
+    });
+    const pep = new MidPepImpl(deps);
+    const r = await pep.evaluate(
+      mkInput({
+        resolved_policies: [
+          {
+            policy_id: 'p_reduce',
+            descriptor: 'transfer.reduce_unsafe',
+            applies_to_peps: ['mid'],
+          },
+        ],
+      }),
+    );
+    const cont = r as ContinueDecision;
+    // Structured reduction available to action-decider
+    expect(cont.tool_reductions).toBeDefined();
+    expect(cont.tool_reductions).toHaveLength(1);
+    expect(cont.tool_reductions?.[0]?.policy_id).toBe('p_reduce');
+    expect(cont.tool_reductions?.[0]?.removed_tools).toEqual([
+      'transfer_money',
+      'delete_account',
+    ]);
+    // Audit warning still recorded for trace visibility
+    expect(cont.warnings).toHaveLength(1);
+    expect(cont.warnings[0]?.reason).toContain('transfer_money');
+  });
+
+  it('Codex #103 — reduce_tool_set filters non-string entries', async () => {
+    const deps = mkDeps({
+      policyRepo: {
+        getBody: vi.fn().mockResolvedValue({
+          policy_id: 'p',
+          descriptor: 'd',
+          applies_to_peps: ['mid'],
+        }),
+        getBodySync: vi.fn().mockReturnValue(null),
+      },
+      evaluator: {
+        evaluate: vi.fn().mockResolvedValue({
+          action: 'reduce_tool_set',
+          reason: 'mix of valid and invalid',
+          parameters: {
+            removed_tools: ['valid', '', null, 123, 'also_valid'],
+          },
+        }),
+      },
+    });
+    const pep = new MidPepImpl(deps);
+    const r = await pep.evaluate(
+      mkInput({
+        resolved_policies: [
+          { policy_id: 'p', descriptor: 'd', applies_to_peps: ['mid'] },
+        ],
+      }),
+    );
+    const cont = r as ContinueDecision;
+    expect(cont.tool_reductions?.[0]?.removed_tools).toEqual([
+      'valid',
+      'also_valid',
+    ]);
+  });
+
+  it('Codex #103 — no tool_reductions key when no reduce_tool_set verdicts fired', async () => {
+    const deps = mkDeps({
+      policyRepo: {
+        getBody: vi.fn().mockResolvedValue({
+          policy_id: 'p',
+          descriptor: 'd',
+          applies_to_peps: ['mid'],
+        }),
+        getBodySync: vi.fn().mockReturnValue(null),
+      },
+      evaluator: {
+        evaluate: vi.fn().mockResolvedValue({
+          action: 'warn_in_trace',
+          reason: 'minor',
+        }),
+      },
+    });
+    const pep = new MidPepImpl(deps);
+    const r = await pep.evaluate(
+      mkInput({
+        resolved_policies: [
+          { policy_id: 'p', descriptor: 'd', applies_to_peps: ['mid'] },
+        ],
+      }),
+    );
+    const cont = r as ContinueDecision;
+    expect(cont.tool_reductions).toBeUndefined();
+    expect(cont.warnings).toHaveLength(1);
+  });
+
   it('skips policies that do not include mid in applies_to_peps', async () => {
     const deps = mkDeps({
       policyRepo: {

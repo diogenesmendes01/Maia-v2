@@ -39,6 +39,7 @@ export class MidPepImpl implements MidPep {
     });
 
     const warnings: ContinueDecision['warnings'] = [];
+    const tool_reductions: NonNullable<ContinueDecision['tool_reductions']> = [];
 
     for (const policy of midPolicies) {
       const body = await this.deps.policyRepo.getBody(policy.policy_id);
@@ -106,8 +107,19 @@ export class MidPepImpl implements MidPep {
 
       if (verdict.action === 'reduce_tool_set') {
         const removed = Array.isArray(verdict.parameters?.['removed_tools'])
-          ? (verdict.parameters['removed_tools'] as string[])
+          ? (verdict.parameters['removed_tools'] as string[]).filter(
+              (t): t is string => typeof t === 'string' && t.length > 0,
+            )
           : [];
+        // Codex review #103: a reduce_tool_set policy MUST be enforceable.
+        // We emit BOTH a structured reduction (consumed by ActionDecider) and
+        // a warning row (preserved for audit visibility in PepAudit).
+        tool_reductions.push({
+          policy_id: policy.policy_id,
+          rule_descriptor: policy.descriptor,
+          removed_tools: removed,
+          reason: verdict.reason,
+        });
         warnings.push({
           policy_id: policy.policy_id,
           rule_descriptor: policy.descriptor,
@@ -124,6 +136,8 @@ export class MidPepImpl implements MidPep {
       }
     }
 
-    return { pep: 'mid', warnings };
+    const out: ContinueDecision = { pep: 'mid', warnings };
+    if (tool_reductions.length > 0) out.tool_reductions = tool_reductions;
+    return out;
   }
 }

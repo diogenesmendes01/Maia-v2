@@ -318,4 +318,92 @@ describe('P9b — DecisionEngine orchestrator', () => {
     const engine = new DecisionEngine(deps);
     await expect(engine.run({ base: mkBase() })).rejects.toThrow('unexpected');
   });
+
+  it('Codex #103 — skill selector receives resolved agent.agent_id (not base.agent_id)', async () => {
+    const skillSelector: SkillSelector = {
+      select: vi.fn().mockResolvedValue({
+        selected_skill_id: 'skill_greet',
+        candidate_skill_ids: ['skill_greet'],
+      }),
+    };
+    const agentSelector: AgentSelector = {
+      select: vi.fn().mockResolvedValue({ agent_id: 'routed_agent_Y' }),
+    };
+    const deps = mkDeps({ skillSelector, agentSelector });
+    const engine = new DecisionEngine(deps);
+    const r = await engine.run({
+      base: mkBase({ agent_id: 'base_agent_X' }),
+    });
+    expect(r.packet.routing.agent_id).toBe('routed_agent_Y');
+    // The third arg to skillSelector.select is the options object carrying
+    // agent_id_override.
+    const call = (skillSelector.select as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(call?.[2]).toMatchObject({ agent_id_override: 'routed_agent_Y' });
+  });
+
+  it('Codex #103 — slow resolver triggers deadline (hot path cannot hang on resolver)', async () => {
+    // Resolver hangs forever; the deadline must fire and return fallback packet.
+    const resolver: PolicyDescriptorResolver = {
+      resolveDescriptors: vi.fn().mockImplementation(
+        () => new Promise(() => {}),
+      ),
+    };
+    const deps = mkDeps({ resolver });
+    const engine = new DecisionEngine(deps);
+    const t0 = Date.now();
+    const r = await engine.run({ base: mkBase() });
+    const elapsed = Date.now() - t0;
+    expect(r.fallback_applied).toBe('ask_clarification');
+    expect(r.packet.action_mode).toBe('ask_clarification');
+    // Hot path total must stay near the 400ms budget even under hung resolver.
+    expect(elapsed).toBeLessThan(800);
+    expect(deps.metrics?.increment).toHaveBeenCalledWith(
+      'decision_engine.budget_fallback',
+      expect.objectContaining({ failed_step: 'resolver' }),
+    );
+  }, 5000);
+
+  it('Codex #103 — hung intent classifier triggers deadline (PEPs still recorded)', async () => {
+    const intentClassifier: IntentClassifier = {
+      classify: vi.fn().mockImplementation(() => new Promise(() => {})),
+    };
+    const deps = mkDeps({ intentClassifier });
+    const engine = new DecisionEngine(deps);
+    const t0 = Date.now();
+    const r = await engine.run({ base: mkBase() });
+    const elapsed = Date.now() - t0;
+    expect(r.fallback_applied).toBe('ask_clarification');
+    expect(elapsed).toBeLessThan(800);
+    expect(deps.metrics?.increment).toHaveBeenCalledWith(
+      'decision_engine.budget_fallback',
+      expect.objectContaining({ failed_step: 'intent' }),
+    );
+  }, 5000);
+
+  it('Codex #103 — caller-supplied AbortSignal short-circuits engine into fallback', async () => {
+    const controller = new AbortController();
+    const intentClassifier: IntentClassifier = {
+      classify: vi.fn().mockImplementation(async () => {
+        // Trigger abort during step
+        controller.abort();
+        // Hang so the deadline fires
+        return new Promise(() => {});
+      }),
+    };
+    const deps = mkDeps({ intentClassifier });
+    const engine = new DecisionEngine(deps);
+    const r = await engine.run({ base: mkBase(), signal: controller.signal });
+    expect(r.fallback_applied).toBe('ask_clarification');
+  }, 5000);
+
+  it('Codex #103 — pre-aborted signal returns fallback immediately', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const deps = mkDeps();
+    const engine = new DecisionEngine(deps);
+    const r = await engine.run({ base: mkBase(), signal: controller.signal });
+    // Pre-aborted: the first step's checkBudget→abort short-circuits.
+    expect(r.fallback_applied).toBe('ask_clarification');
+    expect(r.packet.action_mode).toBe('ask_clarification');
+  });
 });
