@@ -256,7 +256,21 @@ export type PolicyEvaluationErrorCode =
   /** Compiled `RegExp` threw at evaluation (defensive — should never happen). */
   | 'regex_evaluation_failed'
   /** Generic guard for malformed inputs reaching the evaluator at runtime. */
-  | 'malformed_predicate';
+  | 'malformed_predicate'
+  /**
+   * A literal value on a leaf predicate exceeds the size bounds enforced at
+   * evaluation time (`MAX_LITERAL_ARRAY`, `MAX_LITERAL_STRING`,
+   * `MAX_REGEX_PATTERN`). The validator catches these at proposal time, but
+   * corrupted JSONB or rows that pre-date the limits can reach the evaluator.
+   */
+  | 'literal_too_large'
+  /**
+   * A single `and`/`or` branch exceeded `MAX_BRANCH_FANOUT` children at
+   * evaluation time, or the policy body exceeded `MAX_TOTAL_PREDICATE_NODES`.
+   * Enforced at both proposal (validator) and runtime (evaluator) to guard
+   * against corrupted or pre-validation rows.
+   */
+  | 'branch_fanout_exceeded';
 
 /**
  * Validator error code (proposal-time `validatePolicyRuleBody`). Distinct
@@ -278,6 +292,12 @@ export type PolicyValidationErrorCode =
   | 'predicate_too_deep'
   | 'regex_pattern_invalid'
   | 'regex_pattern_unsafe'
+  /**
+   * A literal value on a leaf predicate exceeds the size bounds:
+   * `in`/`not_in` arrays > `MAX_LITERAL_ARRAY`, string literals >
+   * `MAX_LITERAL_STRING`, or `matches` pattern strings > `MAX_REGEX_PATTERN`.
+   */
+  | 'literal_too_large'
   /**
    * Leaf `field` path is not present in any allowed `EvaluationContext`
    * schema (Early/Mid/Late). Only emitted when the caller passes an

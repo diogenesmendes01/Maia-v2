@@ -71,6 +71,35 @@ export const MAX_TOTAL_PREDICATE_NODES = 1024;
 export const MAX_BRANCH_FANOUT = 64;
 
 /**
+ * Maximum number of elements in a single `in` / `not_in` value array. This
+ * caps the per-leaf worst-case work of `right.some(deepEqual)` regardless of
+ * context value. Arrays larger than this limit are rejected at proposal time
+ * (`literal_too_large`) and treated as inert at evaluation time.
+ *
+ * 64 is deliberately the same as `MAX_BRANCH_FANOUT` — a membership list
+ * larger than 64 entries suggests a data-lookup that belongs in the DB, not
+ * in a policy literal.
+ */
+export const MAX_LITERAL_ARRAY = 64;
+
+/**
+ * Maximum byte-length of a primitive string literal in a leaf `value`. This
+ * covers `eq` / `neq` / `contains` and is the upper bound on what the
+ * evaluator will deepEqual against a string field value. Values longer than
+ * this are rejected at proposal time and at runtime.
+ */
+export const MAX_LITERAL_STRING = 512;
+
+/**
+ * Maximum byte-length of a `matches` regex pattern string. `safe-regex2`
+ * itself imposes no length limit; a very long pattern string consumes parse
+ * time and cache space disproportionately. Values exceeding this limit are
+ * rejected at proposal time with `literal_too_large` and at runtime with
+ * `regex_pattern_invalid`.
+ */
+export const MAX_REGEX_PATTERN = 256;
+
+/**
  * Performance target documented for the tinybench benchmark. The benchmark
  * is informational (not a CI gate) so flaky CI runners don't fail the build,
  * but local runs must clear this. See `tests/benchmark/policy-dsl.bench.ts`.

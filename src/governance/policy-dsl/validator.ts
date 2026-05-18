@@ -33,7 +33,10 @@ import {
   ALLOWED_OPERATORS,
   ALLOWED_PREDICATE_KINDS,
   MAX_BRANCH_FANOUT,
+  MAX_LITERAL_ARRAY,
+  MAX_LITERAL_STRING,
   MAX_PREDICATE_DEPTH,
+  MAX_REGEX_PATTERN,
   MAX_TOTAL_PREDICATE_NODES,
 } from './constants.js';
 import {
@@ -360,11 +363,43 @@ function validateLeaf(
     });
   }
 
+  // --- Literal-size limits (round-2 review) ---
+  // These caps bound worst-case evaluation CPU regardless of context.
+  if ((op === 'in' || op === 'not_in') && Array.isArray(leaf.value)) {
+    if (leaf.value.length > MAX_LITERAL_ARRAY) {
+      state.errors.push({
+        code: 'literal_too_large',
+        message: `${op}.value array length ${leaf.value.length} exceeds limit ${MAX_LITERAL_ARRAY}`,
+        path: `${path}.value`,
+      });
+    }
+  }
+
+  if (typeof leaf.value === 'string' && op !== 'matches') {
+    if (leaf.value.length > MAX_LITERAL_STRING) {
+      state.errors.push({
+        code: 'literal_too_large',
+        message: `leaf.value string length ${leaf.value.length} exceeds limit ${MAX_LITERAL_STRING}`,
+        path: `${path}.value`,
+      });
+    }
+  }
+
   if (op === 'matches') {
     if (typeof leaf.value !== 'string') {
       state.errors.push({
         code: 'regex_pattern_invalid',
         message: 'matches.value must be a string regex pattern',
+        path: `${path}.value`,
+      });
+      return;
+    }
+    // Pattern length cap — very long patterns consume parse time and cache
+    // memory disproportionately even when otherwise valid.
+    if (leaf.value.length > MAX_REGEX_PATTERN) {
+      state.errors.push({
+        code: 'literal_too_large',
+        message: `matches.value pattern length ${leaf.value.length} exceeds limit ${MAX_REGEX_PATTERN}`,
         path: `${path}.value`,
       });
       return;

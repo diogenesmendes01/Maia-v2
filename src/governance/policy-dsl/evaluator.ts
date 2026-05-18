@@ -47,8 +47,13 @@
 
 import {
   ALLOWED_EFFECT_ACTIONS,
+  MAX_BRANCH_FANOUT,
+  MAX_LITERAL_ARRAY,
+  MAX_LITERAL_STRING,
   MAX_PREDICATE_DEPTH,
   MAX_REGEX_INPUT_LENGTH,
+  MAX_REGEX_PATTERN,
+  MAX_TOTAL_PREDICATE_NODES,
 } from './constants.js';
 import {
   isFieldPathTooDeep,
@@ -87,6 +92,9 @@ type LeafTriState = true | false | 'na' | 'err';
 type EvalState = {
   errors: PolicyEvaluationError[];
   diagnostics: PolicyEvaluationDiagnostics;
+  /** Running total of predicate nodes visited (leaves + branches). Used to
+   *  enforce MAX_TOTAL_PREDICATE_NODES at runtime, mirroring validator. */
+  nodeCount: number;
 };
 
 /**
@@ -114,6 +122,7 @@ export function evaluate(
 ): PolicyDecision {
   const state: EvalState = {
     errors: [],
+    nodeCount: 0,
     diagnostics: {
       predicate_depth_visited: 0,
       field_lookups: 0,
@@ -239,6 +248,18 @@ function evalPredicate(
     depth,
   );
 
+  // Runtime total-node cap (mirrors validator MAX_TOTAL_PREDICATE_NODES).
+  // Protects against corrupted rows or rows that pre-date proposal-time caps.
+  state.nodeCount += 1;
+  if (state.nodeCount > MAX_TOTAL_PREDICATE_NODES) {
+    state.errors.push({
+      code: 'branch_fanout_exceeded',
+      message: `total predicate node count exceeded limit ${MAX_TOTAL_PREDICATE_NODES}`,
+      path,
+    });
+    return 'err';
+  }
+
   if (depth > MAX_PREDICATE_DEPTH) {
     state.errors.push({
       code: 'predicate_depth_exceeded',
@@ -306,8 +327,26 @@ function evalAnd(
     });
     return 'err';
   }
-  // Empty AND is vacuously true (matches boolean-algebra identity).
-  let sawNotApplicable = false;
+
+  // Runtime fan-out cap (mirrors validator MAX_BRANCH_FANOUT).
+  if (preds.length > MAX_BRANCH_FANOUT) {
+    state.errors.push({
+      code: 'branch_fanout_exceeded',
+      message: `and branch has ${preds.length} children, exceeds limit ${MAX_BRANCH_FANOUT}`,
+      path,
+    });
+    return 'err';
+  }
+
+  // Error-dominant evaluation (round-2 review):
+  // Pre-scan ALL children for structural faults before applying boolean
+  // short-circuit. This ensures AND([false, malformed]) and
+  // AND([malformed, false]) both surface evaluation_error — order-invariant.
+  //
+  // Phase 1: evaluate every child, collecting results. Short-circuit on
+  // structural faults (null/undefined/non-object) but continue through
+  // boolean false/na to find any evaluation errors hiding behind them.
+  const results: LeafTriState[] = [];
   for (let i = 0; i < preds.length; i += 1) {
     const child = preds[i];
     // Per Codex review: do NOT silently skip null/undefined children. A
@@ -322,12 +361,18 @@ function evalAnd(
       return 'err';
     }
     const r = evalPredicate(child, context, state, depth + 1, `${path}.and[${i}]`);
-    if (r === 'err') return 'err';
-    if (r === false) return false;
-    if (r === 'na') sawNotApplicable = true;
-    // r === true → continue scanning.
+    results.push(r);
+    // If the child recorded errors, keep scanning remaining children so we
+    // don't hide other errors — but we will ultimately return 'err'.
+    // Do NOT short-circuit on 'err' here; that's the fix.
   }
-  return sawNotApplicable ? 'na' : true;
+
+  // Phase 2: apply boolean logic. If ANY child produced 'err', dominate.
+  if (results.some((r) => r === 'err')) return 'err';
+  // Definite false dominates not-applicable (Kleene semantics).
+  if (results.some((r) => r === false)) return false;
+  if (results.some((r) => r === 'na')) return 'na';
+  return true;
 }
 
 /**
@@ -355,8 +400,21 @@ function evalOr(
     });
     return 'err';
   }
-  // Empty OR is vacuously false (boolean-algebra identity).
-  let sawNotApplicable = false;
+
+  // Runtime fan-out cap (mirrors validator MAX_BRANCH_FANOUT).
+  if (preds.length > MAX_BRANCH_FANOUT) {
+    state.errors.push({
+      code: 'branch_fanout_exceeded',
+      message: `or branch has ${preds.length} children, exceeds limit ${MAX_BRANCH_FANOUT}`,
+      path,
+    });
+    return 'err';
+  }
+
+  // Error-dominant evaluation (round-2 review):
+  // Pre-scan ALL children so OR([true, malformed]) surfaces evaluation_error
+  // instead of silently returning matched=true. Order-invariant.
+  const results: LeafTriState[] = [];
   for (let i = 0; i < preds.length; i += 1) {
     const child = preds[i];
     if (child === null || child === undefined || typeof child !== 'object') {
@@ -368,12 +426,17 @@ function evalOr(
       return 'err';
     }
     const r = evalPredicate(child, context, state, depth + 1, `${path}.or[${i}]`);
-    if (r === 'err') return 'err';
-    if (r === true) return true;
-    if (r === 'na') sawNotApplicable = true;
-    // r === false → continue scanning.
+    results.push(r);
+    // Continue through true/false/na to find any evaluation errors.
+    // Do NOT short-circuit on 'err' or 'true' here; that's the fix.
   }
-  return sawNotApplicable ? 'na' : false;
+
+  // Phase 2: apply boolean logic. If ANY child produced 'err', dominate.
+  if (results.some((r) => r === 'err')) return 'err';
+  // Definite true dominates not-applicable (Kleene semantics).
+  if (results.some((r) => r === true)) return true;
+  if (results.some((r) => r === 'na')) return 'na';
+  return false;
 }
 
 /**
@@ -492,9 +555,27 @@ function applyOperator(
       return !deepEqual(left, right);
     case 'in':
       if (!Array.isArray(right)) return false;
+      // Runtime guard: cap array length even if validator was bypassed.
+      if (right.length > MAX_LITERAL_ARRAY) {
+        state.errors.push({
+          code: 'literal_too_large',
+          message: `in.value array length ${right.length} exceeds runtime limit ${MAX_LITERAL_ARRAY}`,
+          path: `${path}.value`,
+        });
+        return 'err';
+      }
       return right.some((candidate) => deepEqual(left, candidate));
     case 'not_in':
       if (!Array.isArray(right)) return false;
+      // Runtime guard: cap array length even if validator was bypassed.
+      if (right.length > MAX_LITERAL_ARRAY) {
+        state.errors.push({
+          code: 'literal_too_large',
+          message: `not_in.value array length ${right.length} exceeds runtime limit ${MAX_LITERAL_ARRAY}`,
+          path: `${path}.value`,
+        });
+        return 'err';
+      }
       return !right.some((candidate) => deepEqual(left, candidate));
     case 'gt':
       return numericCompare(left, right, (a, b) => a > b);
@@ -578,6 +659,15 @@ function matchesOp(
   path: string,
 ): LeafTriState {
   if (typeof right !== 'string') return false;
+  // Runtime guard: cap pattern string length even if validator was bypassed.
+  if (right.length > MAX_REGEX_PATTERN) {
+    state.errors.push({
+      code: 'literal_too_large',
+      message: `matches.value pattern length ${right.length} exceeds runtime limit ${MAX_REGEX_PATTERN}`,
+      path: `${path}.value`,
+    });
+    return 'err';
+  }
   // Only string inputs can be regex-matched. Numbers, booleans, etc. → false.
   if (typeof left !== 'string') return false;
   if (left.length > MAX_REGEX_INPUT_LENGTH) {

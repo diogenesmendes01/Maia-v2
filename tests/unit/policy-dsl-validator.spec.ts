@@ -17,7 +17,10 @@ import { validatePolicyRuleBody } from '@/governance/policy-dsl/validator.js';
 import { resetRegexCache } from '@/governance/policy-dsl/regex-cache.js';
 import {
   MAX_BRANCH_FANOUT,
+  MAX_LITERAL_ARRAY,
+  MAX_LITERAL_STRING,
   MAX_PREDICATE_DEPTH,
+  MAX_REGEX_PATTERN,
   MAX_TOTAL_PREDICATE_NODES,
 } from '@/governance/policy-dsl/constants.js';
 
@@ -338,6 +341,75 @@ describe('validatePolicyRuleBody — bounded fan-out (Codex review #98)', () => 
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.errors.some((e) => e.code === 'predicate_too_deep')).toBe(true);
+    }
+  });
+});
+
+describe('validatePolicyRuleBody — literal-size limits (round-2 review)', () => {
+  it('rejects in.value array with > MAX_LITERAL_ARRAY elements', () => {
+    const bigArray = Array.from({ length: MAX_LITERAL_ARRAY + 1 }, (_, i) => String(i));
+    const result = validatePolicyRuleBody({
+      predicate: { kind: 'leaf', field: 'x', op: 'in', value: bigArray },
+      effect: { action: 'block' },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.errors.some((e) => e.code === 'literal_too_large')).toBe(true);
+    }
+  });
+
+  it('accepts in.value array at exactly MAX_LITERAL_ARRAY elements', () => {
+    const okArray = Array.from({ length: MAX_LITERAL_ARRAY }, (_, i) => String(i));
+    const result = validatePolicyRuleBody({
+      predicate: { kind: 'leaf', field: 'x', op: 'in', value: okArray },
+      effect: { action: 'block' },
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  it('rejects not_in.value array with > MAX_LITERAL_ARRAY elements', () => {
+    const bigArray = Array.from({ length: MAX_LITERAL_ARRAY + 1 }, (_, i) => i);
+    const result = validatePolicyRuleBody({
+      predicate: { kind: 'leaf', field: 'x', op: 'not_in', value: bigArray },
+      effect: { action: 'block' },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.errors.some((e) => e.code === 'literal_too_large')).toBe(true);
+    }
+  });
+
+  it('rejects eq.value string longer than MAX_LITERAL_STRING', () => {
+    const longStr = 'a'.repeat(MAX_LITERAL_STRING + 1);
+    const result = validatePolicyRuleBody({
+      predicate: { kind: 'leaf', field: 'x', op: 'eq', value: longStr },
+      effect: { action: 'block' },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.errors.some((e) => e.code === 'literal_too_large')).toBe(true);
+    }
+  });
+
+  it('accepts eq.value string at exactly MAX_LITERAL_STRING characters', () => {
+    const okStr = 'a'.repeat(MAX_LITERAL_STRING);
+    const result = validatePolicyRuleBody({
+      predicate: { kind: 'leaf', field: 'x', op: 'eq', value: okStr },
+      effect: { action: 'block' },
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  it('rejects matches.value pattern longer than MAX_REGEX_PATTERN', () => {
+    // Build a pattern that is syntactically valid but too long.
+    const longPattern = '^' + 'a'.repeat(MAX_REGEX_PATTERN);
+    const result = validatePolicyRuleBody({
+      predicate: { kind: 'leaf', field: 'x', op: 'matches', value: longPattern },
+      effect: { action: 'block' },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.errors.some((e) => e.code === 'literal_too_large')).toBe(true);
     }
   });
 });

@@ -17,8 +17,11 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { evaluate } from '@/governance/policy-dsl/evaluator.js';
 import { resetRegexCache } from '@/governance/policy-dsl/regex-cache.js';
 import {
+  MAX_BRANCH_FANOUT,
+  MAX_LITERAL_ARRAY,
   MAX_PREDICATE_DEPTH,
   MAX_REGEX_INPUT_LENGTH,
+  MAX_REGEX_PATTERN,
 } from '@/governance/policy-dsl/constants.js';
 import type {
   PolicyPredicate,
@@ -461,6 +464,138 @@ describe('evaluate — matched-effect validity (Codex review #98 high)', () => {
     const d = evaluate(body, { a: 1 });
     expect(d.outcome).toBe('evaluation_error');
     expect(d.errors.some((e) => e.code === 'invalid_effect')).toBe(true);
+  });
+});
+
+describe('evaluate — error-dominant branch short-circuit (round-2 review)', () => {
+  // Finding: AND([false, malformed]) and AND([malformed, false]) must both
+  // surface evaluation_error — not order-dependent fail-open.
+  it('AND([false, malformed]) → evaluation_error (error dominates over false)', () => {
+    const body: PolicyRuleBody = {
+      rule_id: 'r',
+      predicate: {
+        kind: 'and',
+        predicates: [
+          // false child first: eq against a value that won't match.
+          leaf('a', 'eq', 999),
+          // malformed child second: ordinal op against missing field → error.
+          leaf('missing_field', 'gt', 0),
+        ],
+      },
+      effect: { action: 'block' },
+    };
+    const d = evaluate(body, { a: 1 });
+    expect(d.outcome).toBe('evaluation_error');
+    expect(d.matched).toBe(false);
+  });
+
+  it('AND([malformed, false]) → evaluation_error (same outcome, reversed order)', () => {
+    const body: PolicyRuleBody = {
+      rule_id: 'r',
+      predicate: {
+        kind: 'and',
+        predicates: [
+          // malformed child first: ordinal op against missing field → error.
+          leaf('missing_field', 'gt', 0),
+          // false child second.
+          leaf('a', 'eq', 999),
+        ],
+      },
+      effect: { action: 'block' },
+    };
+    const d = evaluate(body, { a: 1 });
+    expect(d.outcome).toBe('evaluation_error');
+    expect(d.matched).toBe(false);
+  });
+
+  it('OR([true, malformed]) → evaluation_error (malformed not silently swallowed)', () => {
+    const body: PolicyRuleBody = {
+      rule_id: 'r',
+      predicate: {
+        kind: 'or',
+        predicates: [
+          // true child first.
+          leaf('a', 'eq', 1),
+          // malformed child second: ordinal op against missing field → error.
+          leaf('missing_field', 'gt', 0),
+        ],
+      },
+      effect: { action: 'block' },
+    };
+    const d = evaluate(body, { a: 1 });
+    expect(d.outcome).toBe('evaluation_error');
+    expect(d.matched).toBe(false);
+  });
+
+  it('OR([malformed, true]) → evaluation_error (same outcome, reversed order)', () => {
+    const body: PolicyRuleBody = {
+      rule_id: 'r',
+      predicate: {
+        kind: 'or',
+        predicates: [
+          // malformed child first.
+          leaf('missing_field', 'gt', 0),
+          // true child second.
+          leaf('a', 'eq', 1),
+        ],
+      },
+      effect: { action: 'block' },
+    };
+    const d = evaluate(body, { a: 1 });
+    expect(d.outcome).toBe('evaluation_error');
+    expect(d.matched).toBe(false);
+  });
+});
+
+describe('evaluate — runtime fan-out and total-node caps (round-2 review)', () => {
+  it('rejects and branch with > MAX_BRANCH_FANOUT children at runtime', () => {
+    // Bypass the validator by constructing a body directly. Simulates a
+    // corrupted policy_rules row or one that pre-dates proposal-time caps.
+    const children = Array.from({ length: MAX_BRANCH_FANOUT + 1 }, () =>
+      leaf('a', 'eq', 1),
+    );
+    const body = {
+      rule_id: 'r',
+      predicate: { kind: 'and' as const, predicates: children },
+      effect: { action: 'block' as const },
+    };
+    const d = evaluate(body, { a: 1 });
+    expect(d.outcome).toBe('evaluation_error');
+    expect(d.matched).toBe(false);
+    expect(d.errors.some((e) => e.code === 'branch_fanout_exceeded')).toBe(true);
+  });
+
+  it('rejects or branch with > MAX_BRANCH_FANOUT children at runtime', () => {
+    const children = Array.from({ length: MAX_BRANCH_FANOUT + 1 }, () =>
+      leaf('a', 'eq', 1),
+    );
+    const body = {
+      rule_id: 'r',
+      predicate: { kind: 'or' as const, predicates: children },
+      effect: { action: 'block' as const },
+    };
+    const d = evaluate(body, { a: 1 });
+    expect(d.outcome).toBe('evaluation_error');
+    expect(d.matched).toBe(false);
+    expect(d.errors.some((e) => e.code === 'branch_fanout_exceeded')).toBe(true);
+  });
+
+  it('rejects over-large in.value array at runtime', () => {
+    const bigArray = Array.from({ length: MAX_LITERAL_ARRAY + 1 }, (_, i) => i);
+    const body = blockBody(leaf('a', 'in', bigArray as never));
+    const d = evaluate(body, { a: 0 });
+    expect(d.outcome).toBe('evaluation_error');
+    expect(d.matched).toBe(false);
+    expect(d.errors.some((e) => e.code === 'literal_too_large')).toBe(true);
+  });
+
+  it('rejects over-long matches pattern at runtime', () => {
+    const longPattern = '^' + 'a'.repeat(MAX_REGEX_PATTERN);
+    const body = blockBody(leaf('a', 'matches', longPattern));
+    const d = evaluate(body, { a: 'aaa' });
+    expect(d.outcome).toBe('evaluation_error');
+    expect(d.matched).toBe(false);
+    expect(d.errors.some((e) => e.code === 'literal_too_large')).toBe(true);
   });
 });
 
