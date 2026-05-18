@@ -1,7 +1,9 @@
 /**
  * P8a Task 7 — KnowledgeSliceBuilder tests.
  *
- * Critical invariant (master §15 #9): proposed / pending_review NEVER exposed.
+ * Critical invariants:
+ *   - proposed / pending_review NEVER exposed (master §15 #9).
+ *   - entity A facts MUST NOT enter entity B's slice (round-2 finding #1).
  */
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
@@ -168,5 +170,117 @@ describe('KnowledgeSliceBuilder', () => {
       signal: AbortSignal.timeout(600),
     });
     expect(b.cache_hit).toBe(true);
+  });
+
+  // ===========================================================================
+  // Round-2 finding #1 — entity scope leak prevention
+  // ===========================================================================
+
+  describe('authorized_entity_ids scope isolation', () => {
+    /**
+     * Entity-scoped fact factory: sets scope='entity' and attaches entity_id.
+     */
+    const entityFact = (key: string, entityId: string, lifecycle_status = 'active'): FactRecord => ({
+      key,
+      value: `entity-val-${key}`,
+      scope: 'entity',
+      entity_id: entityId,
+      confidence: 0.9,
+      source: 'observation',
+      lifecycle_status,
+    });
+
+    const tenantFact = (key: string): FactRecord => ({
+      key,
+      value: `tenant-val-${key}`,
+      scope: 'tenant',
+      entity_id: null,
+      confidence: 0.8,
+      source: 'observation',
+      lifecycle_status: 'active',
+    });
+
+    it('MUST NOT include entity A fact in entity B slice (two-entity isolation)', async () => {
+      // Both entity_A and entity_B facts are in the repo response (simulating a
+      // query that returned tenant-wide rows before DB-side filtering).
+      const entityAFact = entityFact('secret-A', 'entity-A');
+      const sharedTenantFact = tenantFact('shared');
+
+      const repo: KnowledgeRepoPort = {
+        async listFacts() {
+          // Simulates repo returning both facts even though caller only
+          // authorized entity-B. The builder's entity filter must remove entity-A.
+          return [entityAFact, sharedTenantFact];
+        },
+        async listRules() {
+          return [];
+        },
+      };
+
+      const builder = new KnowledgeSliceBuilder(repo, cache);
+
+      // Build with entity-B authorized (NOT entity-A).
+      const result = await builder.build({
+        base: mockBase(),
+        requirements: {
+          depth: 'relevant',
+          authorized_entity_ids: ['entity-B'],
+        },
+        decision: mockDecision(),
+        signal: AbortSignal.timeout(600),
+      });
+
+      const keys = result.slice.facts.map((f) => f.key);
+      // Entity-A fact must be absent; shared tenant fact must be present.
+      expect(keys).not.toContain('secret-A');
+      expect(keys).toContain('shared');
+    });
+
+    it('entity A fact IS included when entity A is authorized', async () => {
+      const entityAFact = entityFact('secret-A', 'entity-A');
+      const repo: KnowledgeRepoPort = {
+        async listFacts() { return [entityAFact]; },
+        async listRules() { return []; },
+      };
+      const builder = new KnowledgeSliceBuilder(repo, cache);
+      const result = await builder.build({
+        base: mockBase(),
+        requirements: {
+          depth: 'relevant',
+          authorized_entity_ids: ['entity-A'],
+        },
+        decision: mockDecision(),
+        signal: AbortSignal.timeout(600),
+      });
+      expect(result.slice.facts.map((f) => f.key)).toContain('secret-A');
+    });
+
+    it('empty authorized_entity_ids means no restriction — all facts pass', async () => {
+      const eA = entityFact('fa', 'entity-A');
+      const eB = entityFact('fb', 'entity-B');
+      const repo: KnowledgeRepoPort = {
+        async listFacts() { return [eA, eB]; },
+        async listRules() { return []; },
+      };
+      const builder = new KnowledgeSliceBuilder(repo, cache);
+      const result = await builder.build({
+        base: mockBase(),
+        requirements: { depth: 'relevant', authorized_entity_ids: [] },
+        decision: mockDecision(),
+        signal: AbortSignal.timeout(600),
+      });
+      const keys = result.slice.facts.map((f) => f.key);
+      expect(keys).toContain('fa');
+      expect(keys).toContain('fb');
+    });
+
+    it('different authorized_entity_ids produce different cache keys', () => {
+      const builder = new KnowledgeSliceBuilder(mkRepo([], []), cache);
+      const base = mockBase();
+      const req = { depth: 'relevant' as const };
+      const keyA = builder.cacheKey(base, { ...req, authorized_entity_ids: ['entity-A'] });
+      const keyB = builder.cacheKey(base, { ...req, authorized_entity_ids: ['entity-B'] });
+      expect(keyA).not.toBe(keyB);
+    });
   });
 });

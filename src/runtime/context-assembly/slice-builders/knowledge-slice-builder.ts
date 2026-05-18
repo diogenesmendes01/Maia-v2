@@ -29,15 +29,30 @@ export interface KnowledgeRequirements {
   max_facts?: number;
   max_rules?: number;
   max_tokens_hint?: number;
+  /**
+   * Authorized entity IDs for this conversation.  When non-empty, only facts
+   * whose `entity_id` is null (tenant/global scope) or matches one of the
+   * listed IDs will enter the slice.  An empty array means "no entity scope
+   * restriction" (tenant-wide access), which applies when the actor has
+   * full tenant-admin rights.  Included in the cache key so two different
+   * entity sets never share a cached slice (security invariant).
+   */
+  authorized_entity_ids?: string[];
 }
 
 export interface FactRecord {
   key: string;
   value: unknown;
   scope: 'global' | 'tenant' | 'domain' | 'entity';
+  /**
+   * entity_id is set only when scope === 'entity'.  Null for global/tenant/domain facts.
+   */
+  entity_id?: string | null;
   confidence: number;
   source: string;
   lifecycle_status: string;
+  /** sensitivity indicates whether the fact is mentionable in the prompt */
+  sensitivity?: 'public' | 'internal' | 'sensitive' | 'restricted';
 }
 
 export interface RuleRecord {
@@ -46,16 +61,25 @@ export interface RuleRecord {
   action: string;
   confidence: number;
   lifecycle_status: string;
+  entity_id?: string | null;
 }
 
 export interface KnowledgeRepoPort {
   listFacts(
     tenant_id: string,
-    opts: { depth: KnowledgeRequirements['depth']; limit: number },
+    opts: {
+      depth: KnowledgeRequirements['depth'];
+      limit: number;
+      authorized_entity_ids?: string[];
+    },
   ): Promise<FactRecord[]>;
   listRules(
     tenant_id: string,
-    opts: { depth: KnowledgeRequirements['depth']; limit: number },
+    opts: {
+      depth: KnowledgeRequirements['depth'];
+      limit: number;
+      authorized_entity_ids?: string[];
+    },
   ): Promise<RuleRecord[]>;
 }
 
@@ -83,10 +107,14 @@ export class KnowledgeSliceBuilder
   ) {}
 
   cacheKey(base: BaseContextPacket, req: KnowledgeRequirements): string {
+    // Sort authorized_entity_ids so different orderings produce the same key.
+    const sortedEntityIds = [...(req.authorized_entity_ids ?? [])].sort();
     const scope = hashShort({
       depth: req.depth,
       max_facts: req.max_facts ?? 10,
       max_rules: req.max_rules ?? 5,
+      // Include scope set so a cache miss for entity A never serves entity B.
+      authorized_entity_ids: sortedEntityIds,
     });
     return sliceCacheKey(base.tenant_id, 'knowledge', scope);
   }
@@ -117,6 +145,7 @@ export class KnowledgeSliceBuilder
 
     const maxFacts = input.requirements.max_facts ?? 10;
     const maxRules = input.requirements.max_rules ?? 5;
+    const authorizedEntityIds = input.requirements.authorized_entity_ids ?? [];
     throwIfAborted(input.signal);
 
     const [rawFacts, rawRules] = await Promise.all([
@@ -124,16 +153,33 @@ export class KnowledgeSliceBuilder
       this.repo.listFacts(input.base.tenant_id, {
         depth: input.requirements.depth,
         limit: maxFacts * 2 + 1,
+        authorized_entity_ids: authorizedEntityIds,
       }),
       this.repo.listRules(input.base.tenant_id, {
         depth: input.requirements.depth,
         limit: maxRules * 2 + 1,
+        authorized_entity_ids: authorizedEntityIds,
       }),
     ]);
 
     // Lifecycle allowlist — drop proposed/pending_review/anything else.
-    const safeFacts = rawFacts.filter((f) => isAllowed(f.lifecycle_status));
-    const safeRules = rawRules.filter((r) => isAllowed(r.lifecycle_status));
+    const lifecycleAllowedFacts = rawFacts.filter((f) => isAllowed(f.lifecycle_status));
+    const lifecycleAllowedRules = rawRules.filter((r) => isAllowed(r.lifecycle_status));
+
+    // Entity-scope filter: when authorized_entity_ids is non-empty, entity-
+    // scoped facts/rules are only allowed when their entity_id is in the set.
+    // Non-entity facts (global/tenant/domain, entity_id null/undefined) always
+    // pass through — they are tenant-wide and scope-safe.
+    const isEntityAuthorized = (entityId: string | null | undefined): boolean => {
+      if (authorizedEntityIds.length === 0) return true; // no restriction
+      if (entityId == null) return true; // global/tenant/domain scope
+      return authorizedEntityIds.includes(entityId);
+    };
+
+    const safeFacts = lifecycleAllowedFacts.filter((f) =>
+      f.scope !== 'entity' || isEntityAuthorized(f.entity_id),
+    );
+    const safeRules = lifecycleAllowedRules.filter((r) => isEntityAuthorized(r.entity_id));
 
     const factsTruncated = safeFacts.length > maxFacts;
     const rulesTruncated = safeRules.length > maxRules;

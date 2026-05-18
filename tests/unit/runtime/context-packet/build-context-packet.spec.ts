@@ -436,6 +436,72 @@ describe('buildContextPacket orchestrator', () => {
       expect(mod.DEFAULT_TOTAL_BUDGET_MS).toBe(600);
       expect(mod.DEFAULT_TIMEOUT_PER_SLICE_MS).toBe(100);
     });
+
+    // =========================================================================
+    // Round-2 finding #3 — budget-bounded fallback cache read
+    // =========================================================================
+
+    it('hanging cache.get on fallback path still returns within total budget', async () => {
+      /**
+       * Reproduce the exact scenario from the review: a slice times out, then
+       * the fallback cache.get hangs indefinitely. The orchestrator MUST return
+       * before the total budget expires — it cannot be held hostage by the cache.
+       *
+       * Setup:
+       *  - user builder hangs → triggers per-slice timeout (timeoutPerSliceMs=50ms).
+       *  - cache.get also hangs indefinitely (5 s).
+       *  - total budget = 200ms.
+       * Expected: orchestrator returns < 200ms + small jitter (not 5+ seconds).
+       */
+      const { builders } = makeStandardBuilders();
+      type UserSliceType = import('@/runtime/context-packet/types.js').UserSlice;
+      const hangingUser = makeHangingBuilder<UserSliceType>('user', {
+        pessoa: null,
+        preferences: {},
+        memories: [],
+        behavioral_hints: [],
+        truncated: false,
+      });
+
+      // A cache whose get() never resolves (simulates degraded Redis).
+      const hangingCache = {
+        async get<T>(_key: string): Promise<T | null> {
+          return new Promise<T | null>(() => undefined); // hangs forever
+        },
+        async set(): Promise<void> {},
+        async invalidate(): Promise<void> {},
+      };
+
+      const totalBudgetMs = 200;
+      const timeoutPerSliceMs = 50;
+
+      const start = performance.now();
+      const packet = await buildContextPacket(
+        { base: mockBase(), decision: mockDecision() },
+        {
+          builders: {
+            ...builders,
+            user: hangingUser as unknown as SliceBuilderSet['user'],
+          },
+          historyLoader: emptyHistory,
+          budgetMs: totalBudgetMs,
+          timeoutPerSliceMs,
+          cache: hangingCache,
+        },
+      );
+      const elapsed = performance.now() - start;
+
+      // Must return well within the total budget + jitter.
+      expect(elapsed).toBeLessThan(totalBudgetMs + 150);
+      // User slice should fall back gracefully (not crash).
+      expect(packet.user.memories).toEqual([]);
+      // Either 'timeout' (cache was skipped because budget exhausted before
+      // the race timer fired) or 'timeout_cache' (shouldn't happen with
+      // hanging cache, but accept either for robustness).
+      expect(['timeout', 'timeout_cache']).toContain(
+        packet.assembly_meta.fallback_depths_applied.user,
+      );
+    });
   });
 });
 

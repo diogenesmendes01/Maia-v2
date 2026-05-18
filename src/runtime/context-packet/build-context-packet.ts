@@ -371,12 +371,25 @@ export async function buildContextPacket(
     ): Promise<T> => {
       if (result.status === 'fulfilled') {
         if (isTimeoutOutcome(result.value)) {
-          // Per-slice or global deadline trip. Try cache first.
+          // Per-slice or global deadline trip. Try cache first, but ONLY if
+          // the total budget still has time left — a hanging Redis get must
+          // not defeat the 600ms guarantee (Codex round-2 finding #3).
           assemblyMeta.cache_hits[name] = false;
           let cached: T | null = null;
-          if (deps.cache && cacheKey) {
+          const remainingForCache = remainingBudgetMs();
+          if (deps.cache && cacheKey && remainingForCache > 0) {
             try {
-              cached = await deps.cache.get<T>(cacheKey);
+              // Race the cache read against the remaining budget so a
+              // degraded Redis instance cannot hang the entire orchestrator.
+              cached = await Promise.race([
+                deps.cache.get<T>(cacheKey),
+                new Promise<null>((resolve) => {
+                  const t = setTimeout(() => resolve(null), remainingForCache);
+                  if (typeof t === 'object' && t !== null && 'unref' in t) {
+                    (t as { unref: () => void }).unref();
+                  }
+                }),
+              ]);
             } catch {
               cached = null;
             }
