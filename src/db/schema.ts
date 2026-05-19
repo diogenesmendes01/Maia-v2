@@ -1591,6 +1591,104 @@ export const debug_snapshot_grants = pgTable(
   }),
 );
 
+// =====================================================================
+// P10b — Runtime Trace (envelope sync + body async, HMAC + redaction)
+// =====================================================================
+
+// P10b: runtime_trace_envelopes — sync envelope written BEFORE any side
+// effect with side_effect_level >= medium. Narrow shape, written in the
+// hot path; the heavy packet body lives in runtime_trace_bodies and is
+// persisted async via the TraceBody writer worker.
+// Invariant 12: envelope MUST precede the side effect.
+// Invariant 8: envelope_hmac is HMAC-SHA256(secret = per-tenant key from
+// KMS, payload = canonical-JSON of envelope minus envelope_hmac field).
+export const runtime_trace_envelopes = pgTable(
+  'runtime_trace_envelopes',
+  {
+    trace_id: uuid('trace_id').primaryKey(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    conversa_id: uuid('conversa_id'),
+    turno_id: uuid('turno_id'),
+    policy_id: uuid('policy_id'),
+    decision: text('decision').notNull(),
+    side_effect_level: text('side_effect_level').notNull(),
+    redaction_class: text('redaction_class').notNull().default('standard'),
+    envelope_hmac: text('envelope_hmac').notNull(),
+    hmac_key_version: integer('hmac_key_version').notNull(),
+    body_status: text('body_status').notNull().default('pending'),
+    body_persisted_at: timestamp('body_persisted_at', { withTimezone: true }),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    tenantCreatedIdx: index('runtime_trace_env_tenant_created_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.created_at,
+    ),
+    bodyPendingIdx: index('runtime_trace_env_body_pending_idx').on(t.created_at),
+    conversaIdx: index('runtime_trace_env_conversa_idx').on(t.conversa_id, t.created_at),
+  }),
+);
+
+// P10b: runtime_trace_bodies — async body persistence. PK = trace_id so the
+// writer worker can use ON CONFLICT DO NOTHING to make at-least-once delivery
+// idempotent. The body is the redacted ExecutionContextPacket + DecisionPacket
+// payload; when redaction_class='debug' on the envelope, the body is replaced
+// by an encrypted AES-GCM snapshot uploaded to S3 (24h TTL, MFA-gated read).
+export const runtime_trace_bodies = pgTable(
+  'runtime_trace_bodies',
+  {
+    trace_id: uuid('trace_id').primaryKey(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    packet: jsonb('packet').notNull(),
+    packet_hmac: text('packet_hmac').notNull(),
+    hmac_key_version: integer('hmac_key_version').notNull(),
+    redaction_applied: text('redaction_applied').notNull(),
+    bytes_redacted: integer('bytes_redacted').notNull().default(0),
+    encrypted: boolean('encrypted').notNull().default(false),
+    s3_uri: text('s3_uri'),
+    // Codex #102 issue 3: when encrypted=true and no S3 bucket configured
+    // (dev/test/CI), the ciphertext is stored inline here. The DB CHECK
+    // requires either s3_uri OR ciphertext_inline when encrypted=true.
+    ciphertext_inline: text('ciphertext_inline'),
+    persisted_at: timestamp('persisted_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    tenantIdx: index('runtime_trace_bodies_tenant_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.persisted_at,
+    ),
+  }),
+);
+
+// P10b (Codex #102 issue 4): runtime_trace_body_outbox — durable queue
+// for the async body writer. Written transactionally with the envelope
+// so a process crash never strands the packet in volatile memory.
+// Workers claim rows via FOR UPDATE SKIP LOCKED, write the body, and
+// delete the outbox row in the same transaction.
+export const runtime_trace_body_outbox = pgTable(
+  'runtime_trace_body_outbox',
+  {
+    trace_id: uuid('trace_id').primaryKey(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    // The full TraceBodyInput shape, ready to feed writeBody() without
+    // any rebuild. Includes packet + decision + redaction_class.
+    payload: jsonb('payload').notNull(),
+    redaction_class: text('redaction_class').notNull(),
+    enqueued_at: timestamp('enqueued_at', { withTimezone: true }).notNull().defaultNow(),
+    attempts: integer('attempts').notNull().default(0),
+    last_attempt_at: timestamp('last_attempt_at', { withTimezone: true }),
+    last_error: text('last_error'),
+  },
+  (t) => ({
+    drainIdx: index('runtime_trace_body_outbox_drain_idx').on(t.enqueued_at),
+  }),
+);
+
 export type Entidade = typeof entidades.$inferSelect;
 export type Pessoa = typeof pessoas.$inferSelect;
 export type Permissao = typeof permissoes.$inferSelect;
@@ -1708,6 +1806,12 @@ export type ChannelPolicy = typeof channel_policies.$inferSelect;
 export type NewChannelPolicy = typeof channel_policies.$inferInsert;
 export type RoleSelectorDecisionRow = typeof role_selector_decisions.$inferSelect;
 export type NewRoleSelectorDecisionRow = typeof role_selector_decisions.$inferInsert;
+export type RuntimeTraceEnvelope = typeof runtime_trace_envelopes.$inferSelect;
+export type NewRuntimeTraceEnvelope = typeof runtime_trace_envelopes.$inferInsert;
+export type RuntimeTraceBody = typeof runtime_trace_bodies.$inferSelect;
+export type NewRuntimeTraceBody = typeof runtime_trace_bodies.$inferInsert;
+export type RuntimeTraceBodyOutbox = typeof runtime_trace_body_outbox.$inferSelect;
+export type NewRuntimeTraceBodyOutbox = typeof runtime_trace_body_outbox.$inferInsert;
 
 // P9a: skills — Skill Contracts versionados (Source of Truth)
 // Master spec v3.1.1 §2.4 + §2.5 (runtime_hints).

@@ -368,5 +368,7 @@ export const FeatureFlagName = {
   SKILL_REGISTRY_V1: 'SKILL_REGISTRY_V1',
   // P10a — Knowledge State Machine (9 estados + auto-promoter + propose_* tools)
   KNOWLEDGE_STATE_MACHINE_V1: 'KNOWLEDGE_STATE_MACHINE_V1',
+  // P10b — runtime trace (envelope sync + body async, HMAC + redaction)
+  RUNTIME_TRACE_V1: 'runtime_trace_v1',
 } as const;
 export type FeatureFlagName = typeof FeatureFlagName[keyof typeof FeatureFlagName];

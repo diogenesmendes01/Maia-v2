@@ -50,6 +50,7 @@ export const featureFlags = new FeatureFlags({
   [FeatureFlagName.POLICY_RESOLVER_V1]: config.FEATURE_POLICY_RESOLVER_V1,
   [FeatureFlagName.SKILL_REGISTRY_V1]: config.FEATURE_SKILL_REGISTRY_V1,
   [FeatureFlagName.KNOWLEDGE_STATE_MACHINE_V1]: config.FEATURE_KNOWLEDGE_STATE_MACHINE_V1,
+  [FeatureFlagName.RUNTIME_TRACE_V1]: config.FEATURE_RUNTIME_TRACE_V1,
 });
 
 /**
