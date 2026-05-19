@@ -75,6 +75,7 @@ async function reclassifyForTenant(): Promise<{ reclassified: number; failed: nu
                 extension_reason: null,
                 extension_approved_by: null,
                 extension_approved_at: null,
+                // P10a: lifecycle columns populated by DB defaults.
                 expires_at,
                 revoked_at: null,
               });

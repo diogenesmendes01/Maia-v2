@@ -41,7 +41,15 @@ vi.mock('../../src/db/repositories.js', () => ({
   capabilityGapsRepo: { listByLevel: capabilityGapsListByLevel },
 }));
 
-vi.mock('../../src/config/env.js', () => ({ config: {} }));
+vi.mock('../../src/config/env.js', () => ({
+  config: { LOG_LEVEL: 'silent', NODE_ENV: 'test', TZ: 'America/Sao_Paulo' },
+}));
+
+// Stub the logger so prompt-builder can be imported without exercising pino's
+// config-driven level resolution (which throws on undefined LOG_LEVEL).
+vi.mock('../../src/lib/logger.js', () => ({
+  logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
+}));
 
 beforeEach(() => {
   selfStateGetActive.mockReset();

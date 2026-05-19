@@ -142,6 +142,37 @@ export default [
     },
   },
 
+  // P8e Architecture Lock (enforced as ESLint rule, not just CI grep):
+  // src/agent/ and src/cognition/ must NEVER import @/control-plane/policy
+  // directly. They consume via slice builders (P8d) or PEPs (P9b/d).
+  // Adversarial review #93 flagged that the grep gate is bypassable; this
+  // rule makes the lock part of `npm run lint`.
+  {
+    files: ['src/agent/**/*.ts', 'src/cognition/**/*.ts'],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              group: ['@/control-plane/policy', '@/control-plane/policy/*'],
+              message:
+                'Architecture Lock (P8e): agent/cognition MUST NOT import the policy module directly. Use a slice builder (P8d) or PEP (P9b/d) instead. See docs/runbooks/p8e-policy-descriptor-resolver.md#architecture-lock',
+            },
+            {
+              group: [
+                '**/control-plane/policy',
+                '**/control-plane/policy/*',
+              ],
+              message:
+                'Architecture Lock (P8e): agent/cognition MUST NOT import the policy module directly. Use a slice builder (P8d) or PEP (P9b/d) instead.',
+            },
+          ],
+        },
+      ],
+    },
+  },
+
   // Scripts use the same TS rules but without the type-aware parser.
   // tsconfig.json includes only src/, and pulling scripts/ into the
   // type-aware project would force the build to compile them (they run

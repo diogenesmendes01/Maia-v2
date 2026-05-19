@@ -221,11 +221,12 @@ describe('buildPrompt — dual-read sob FEATURE_OPERATIONAL_PROFILE_V2', () => {
     // Bloco legado NÃO deve aparecer.
     expect(system).not.toContain('LEGACY_SYSTEM_PROMPT_BODY');
     expect(system).not.toContain('LEGACY_RESUMO');
-    // Blocos extras de V2 (growth + episodic).
-    expect(system).toContain('## Capacidades em desenvolvimento');
-    expect(system).toContain('- feature G1');
-    expect(system).toContain('## Contexto recente');
-    expect(system).toContain('- episódio recente OK');
+    // v3.1.1: growth_hints_block e episodic_summary_block foram removidos do
+    // RenderedProfile. growth_backlog → Evolution Pipeline (P5/P9
+    // capability_proposals); episodic_temp → User Layer (P8c). Identity Layer
+    // nao carrega esse conteudo.
+    expect(system).not.toContain('## Capacidades em desenvolvimento');
+    expect(system).not.toContain('## Contexto recente');
     // self_state NUNCA é consultado quando há profile ativo.
     expect(selfStateGetActive).not.toHaveBeenCalled();
     expect(operationalProfileVersionsGetActive).toHaveBeenCalledTimes(1);

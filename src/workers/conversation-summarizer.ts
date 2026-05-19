@@ -47,7 +47,7 @@ async function runConversationSummarizerInner(): Promise<void> {
         if (reflected) {
           const classified = await classify(reflected.insight);
           if (classified) {
-            await persistCandidate(classified, event);
+            await persistCandidate(classified, event, 'worker');
           }
         }
       } catch (err) {
@@ -102,7 +102,7 @@ async function runConversationSummarizerInner(): Promise<void> {
         if (reflected) {
           const classified = await classify(reflected.insight);
           if (classified) {
-            await persistCandidate(classified, event);
+            await persistCandidate(classified, event, 'worker');
           }
         }
       } catch (err) {

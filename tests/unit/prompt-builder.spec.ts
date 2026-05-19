@@ -20,6 +20,9 @@ const h = vi.hoisted(() => ({
   selfStateGetActive: vi.fn(),
   recentInConversation: vi.fn(),
   entidadesByIds: vi.fn(),
+  // P82-C1 / Issue #106: prompt-builder routes through the sensitivity-filtered
+  // facts accessor (`listMentionableForScopes`). Mock matches the production
+  // signature: same input shape, same return type (AgentFact[]).
   factsListMentionableForScopes: vi.fn(),
   rulesListActive: vi.fn(),
   entityStatesById: vi.fn(),
