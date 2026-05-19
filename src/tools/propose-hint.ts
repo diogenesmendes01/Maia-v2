@@ -38,8 +38,11 @@ const inputSchema = z.object({
   confianca: z.number().min(0).max(1).default(0.6),
 });
 
+// Codex round-2 finding 3: proposal_id must be a non-empty UUID string.
+const PROPOSAL_ID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 const outputSchema = z.object({
-  proposal_id: z.string(),
+  proposal_id: z.string().regex(PROPOSAL_ID_REGEX, 'proposal_id must be a UUID'),
   initial_status: z.enum(['ephemeral', 'pending_review']),
   visible_to_llm: z.boolean(),
   reason: z.string(),
@@ -99,6 +102,16 @@ export const proposeHintTool: Tool<typeof inputSchema, typeof outputSchema> = {
       source: 'tool:propose_hint',
       sensitivity_hint: args.derived_sensitivity,
       ...(args.ttl_days !== undefined ? { ttl_days: args.ttl_days } : {}),
+      // Codex round-2 finding 2: persist native behavioral_hint columns
+      // so scope_type matches what the prompt-builder lookup expects
+      // (`interlocutor`/`role`/`channel`/`conversation`/`agent`/`tenant`)
+      // rather than the generic KnowledgeScope literal.
+      native: {
+        hint_scope_type: args.scope_type,
+        hint_subject_id: args.subject_id ?? null,
+        hint_derived_sensitivity: args.derived_sensitivity,
+        hint_derived_from_memory_id: args.derived_from_memory_id ?? null,
+      },
     });
 
     const initial_status =

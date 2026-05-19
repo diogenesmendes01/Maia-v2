@@ -74,29 +74,37 @@ export class KnowledgeStateMachine {
    * appended at creation records the risk score so Admin UI can show it
    * and the audit trail explains the decision.
    *
-   * On scorer timeout or error, fallback is pending_review (master §14
-   * — fail-safe is conservative).
+   * Timeout policy (Codex review round-2, finding 3):
+   *   - The 300ms timeout wraps ONLY the risk scorer, not the DB insert.
+   *   - On scorer timeout, fall back to a conservative HIGH-RISK score
+   *     (forces pending_review) and continue with the insert
+   *     synchronously — so the row really exists when we return.
+   *   - The DB insert is NOT wrapped in `Promise.race`; if it throws,
+   *     we propagate the error and DO NOT return a synthetic empty-id
+   *     success. Returning `proposal_id: ''` would let callers
+   *     audit/cache a nonexistent row.
    */
   static async propose(
     input: KnowledgeProposalInput,
   ): Promise<KnowledgeProposeResult> {
-    const fallback: KnowledgeProposeResult = {
-      proposal_id: '',
-      initial_status: 'pending_review',
-      visible_to_llm: false,
-      reason: 'fallback:scorer_timeout',
-    };
-
-    const result = await runCognitiveModule<KnowledgeProposeResult>(
+    // Step 1 — score risk under a 300ms budget. On timeout/error we
+    // synthesise a conservative score so decideInitialStatus routes to
+    // pending_review (master §14 — fail-safe is conservative).
+    const scoreResult = await runCognitiveModule(
       {
-        name: 'knowledge-state-machine.propose',
+        name: 'knowledge-state-machine.propose.score',
         version: 'v1',
         triggered_by: 'sync_required',
         timeoutMs: 300,
-        fallback,
+        fallback: () => ({
+          level: 'high' as const,
+          sensitivity: input.sensitivity_hint ?? ('high' as const),
+          reasons: ['scorer_fallback:timeout_or_error'],
+          source: 'cache' as const,
+        }),
       },
-      async () => {
-        const risk = await KnowledgeRiskScorer.score({
+      async () =>
+        KnowledgeRiskScorer.score({
           trace_id: input.trace_id,
           tenant_id: input.tenant_id,
           agent_id: input.agent_id,
@@ -106,62 +114,77 @@ export class KnowledgeStateMachine {
           confidence: input.confidence,
           origin: input.origin,
           proposer_sensitivity_hint: input.sensitivity_hint,
-        });
-
-        const initial_status = decideInitialStatus({
-          kind: input.kind,
-          risk_level: risk.level,
-          sensitivity: risk.sensitivity,
-          confidence: input.confidence,
-        });
-
-        const transition: KnowledgeTransitionRecord = {
-          from: 'proposed',
-          to: initial_status,
-          at: new Date().toISOString(),
-          reason: `risk=${risk.level};kind=${input.kind};confidence=${input.confidence.toFixed(2)}`,
-          decided_by: 'state_machine_propose',
-          risk_score: {
-            level: risk.level,
-            sensitivity: risk.sensitivity,
-            reasons: risk.reasons,
-            source: risk.source,
-          },
-        };
-
-        const evidence_count =
-          input.origin === 'user_explicit' || input.origin === 'human_approved'
-            ? 1
-            : 0;
-
-        const proposal_id = await knowledgeRepos.create({
-          tenant_id: input.tenant_id,
-          agent_id: input.agent_id,
-          kind: input.kind,
-          key: input.key,
-          scope: input.scope,
-          scope_value: input.scope_value,
-          content: input.content,
-          content_text: input.content_text,
-          confidence: input.confidence,
-          lifecycle_status: initial_status,
-          lifecycle_transitions: [transition],
-          evidence_count,
-          ttl_days: input.ttl_days,
-        });
-
-        return {
-          proposal_id,
-          initial_status,
-          visible_to_llm: VISIBLE_STATES.includes(initial_status),
-          reason: `risk=${risk.level} | kind=${input.kind} | conf=${input.confidence.toFixed(2)}`,
-        };
-      },
+        }),
     );
 
-    // runCognitiveModule guarantees a non-null output when fallback is
-    // provided; the type system can't see that, so assert here.
-    return result.output ?? fallback;
+    // runCognitiveModule guarantees non-null when fallback is provided.
+    const risk = scoreResult.output!;
+    const fellBack = scoreResult.fallback_triggered;
+
+    // Step 2 — decide initial status from (possibly fallback) risk.
+    const initial_status = decideInitialStatus({
+      kind: input.kind,
+      risk_level: risk.level,
+      sensitivity: risk.sensitivity,
+      confidence: input.confidence,
+    });
+
+    const transition: KnowledgeTransitionRecord = {
+      from: 'proposed',
+      to: initial_status,
+      at: new Date().toISOString(),
+      reason: fellBack
+        ? `scorer_fallback;kind=${input.kind};confidence=${input.confidence.toFixed(2)}`
+        : `risk=${risk.level};kind=${input.kind};confidence=${input.confidence.toFixed(2)}`,
+      decided_by: 'state_machine_propose',
+      risk_score: {
+        level: risk.level,
+        sensitivity: risk.sensitivity,
+        reasons: risk.reasons,
+        source: risk.source,
+      },
+    };
+
+    const evidence_count =
+      input.origin === 'user_explicit' || input.origin === 'human_approved'
+        ? 1
+        : 0;
+
+    // Step 3 — persist the row synchronously, outside the timeout race.
+    // If the DB insert fails we throw — never return success with an
+    // empty proposal_id (Codex finding 3).
+    const proposal_id = await knowledgeRepos.create({
+      tenant_id: input.tenant_id,
+      agent_id: input.agent_id,
+      kind: input.kind,
+      key: input.key,
+      scope: input.scope,
+      scope_value: input.scope_value,
+      content: input.content,
+      content_text: input.content_text,
+      confidence: input.confidence,
+      lifecycle_status: initial_status,
+      lifecycle_transitions: [transition],
+      evidence_count,
+      ttl_days: input.ttl_days,
+      native: input.native,
+    });
+
+    if (!proposal_id) {
+      // Defensive — knowledgeRepos.create returns `String(rows[0]?.id ?? '')`,
+      // so an empty string indicates the INSERT … RETURNING returned no
+      // rows. Treat as hard failure to honour finding 3.
+      throw new Error('knowledge_state_machine.propose:insert_returned_empty_id');
+    }
+
+    return {
+      proposal_id,
+      initial_status,
+      visible_to_llm: VISIBLE_STATES.includes(initial_status),
+      reason: fellBack
+        ? `fallback:scorer_${scoreResult.status} | kind=${input.kind} | conf=${input.confidence.toFixed(2)}`
+        : `risk=${risk.level} | kind=${input.kind} | conf=${input.confidence.toFixed(2)}`,
+    };
   }
 
   /**

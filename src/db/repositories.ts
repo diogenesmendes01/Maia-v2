@@ -879,11 +879,15 @@ export const rulesRepo = {
   async listActive(tipo: string): Promise<LearnedRule[]> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
-    // P10a (review #104 critical): rules surfaced to the LLM must pass
-    // both the legacy `ativa` flag AND the lifecycle_status visibility
-    // filter. propose_rule lands rows in pending_review (master §2.6) —
-    // those rows must NEVER appear in the rulesBlock until a human
-    // approves them in the Admin UI Proposal Inbox.
+    // Codex round-2 finding 2: lifecycle_status is the source of truth
+    // for "is this rule visible to the LLM". The legacy `ativa=true`
+    // requirement was double-bookkeeping: KSM-proposed rules transitioned
+    // through pending_review → … → active never flipped `ativa`, so
+    // approved proposals stayed invisible forever. We drop the
+    // `ativa=true` predicate here and rely on lifecycle_status alone.
+    // (The `ativa` column is preserved for ops/admin "soft disable"
+    // outside the lifecycle pipeline; if it gets set to false in the
+    // DB, a follow-up migration can join it back.)
     return db
       .select()
       .from(learned_rules)
@@ -891,7 +895,6 @@ export const rulesRepo = {
         and(
           eq(learned_rules.tenant_id, tenant_id),
           eq(learned_rules.agent_id, agent_id),
-          eq(learned_rules.ativa, true),
           eq(learned_rules.tipo, tipo),
           inArray(learned_rules.lifecycle_status, [
             'ephemeral',
@@ -927,9 +930,9 @@ export const rulesRepo = {
   async findByContext(tipo: string, contexto: string): Promise<LearnedRule | null> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
-    // P10a (review #104): exclude non-visible lifecycle states so a
-    // pending_review duplicate doesn't satisfy the dedup check and
-    // accidentally short-circuit a fresh proposal.
+    // Codex round-2 finding 2: same drop of legacy `ativa=true` here —
+    // lifecycle_status is the source of truth for visibility (see
+    // listActive comment above).
     const rows = await db
       .select()
       .from(learned_rules)
@@ -939,7 +942,6 @@ export const rulesRepo = {
           eq(learned_rules.agent_id, agent_id),
           eq(learned_rules.tipo, tipo),
           eq(learned_rules.contexto, contexto),
-          eq(learned_rules.ativa, true),
           inArray(learned_rules.lifecycle_status, [
             'ephemeral',
             'observed',

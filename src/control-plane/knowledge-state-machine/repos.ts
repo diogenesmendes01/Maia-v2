@@ -31,6 +31,7 @@ import {
 import type {
   KnowledgeKind,
   KnowledgeLifecycleStatus,
+  KnowledgeProposalNativeFields,
   KnowledgeRow,
   KnowledgeTransitionRecord,
 } from './types.js';
@@ -49,6 +50,12 @@ interface CreateInput {
   lifecycle_transitions: KnowledgeTransitionRecord[];
   evidence_count: number;
   ttl_days?: number;
+  /**
+   * Codex round-2 finding 2 — preserves table-native columns
+   * (escopo/chave/tipo/contexto/acao/scope_type/subject_id/etc.) so
+   * proposed rows match what the legacy read paths look for.
+   */
+  native?: KnowledgeProposalNativeFields;
 }
 
 interface UpdateInput {
@@ -126,17 +133,36 @@ function normaliseRow(raw: AnyRow): KnowledgeRow {
 
 export const knowledgeRepos = {
   async create(input: CreateInput): Promise<string> {
+    const native = input.native ?? {};
     switch (input.kind) {
       case 'fact': {
+        // Codex round-2 finding 2: legacy read paths look for
+        // `pessoa:<id>` / `entidade:<id>` / `global` / `tenant` in
+        // agent_facts.escopo. The previous facade wrote
+        // `user:<id>` / `agent:<id>`, breaking factsRepo.listForScopes.
+        // Prefer `native.fact_escopo` when callers supply it; otherwise
+        // map known generic scopes back to the legacy convention.
+        const escopo =
+          native.fact_escopo ??
+          (input.scope === 'user' && input.scope_value
+            ? `pessoa:${input.scope_value}`
+            : input.scope === 'agent' && input.scope_value
+              ? `entidade:${input.scope_value}`
+              : input.scope === 'tenant'
+                ? 'tenant'
+                : input.scope === 'global'
+                  ? 'global'
+                  : input.scope_value
+                    ? `${input.scope}:${input.scope_value}`
+                    : input.scope);
+        const chave = native.fact_chave ?? input.key;
         const rows = await db
           .insert(agent_facts)
           .values({
             tenant_id: input.tenant_id,
             agent_id: input.agent_id,
-            escopo: input.scope_value
-              ? `${input.scope}:${input.scope_value}`
-              : input.scope,
-            chave: input.key,
+            escopo,
+            chave,
             valor: input.content as object,
             confianca: String(input.confidence),
             fonte: 'aprendido',
@@ -148,16 +174,30 @@ export const knowledgeRepos = {
         return String(rows[0]?.id ?? '');
       }
       case 'rule': {
+        // Codex round-2 finding 2: preserve tipo/contexto/acao verbatim
+        // from the proposer. Previously the facade hard-coded
+        // tipo='classificacao' and lost the LLM's structured contexto/acao
+        // payload. We also keep `ativa=true` on insert so the column
+        // semantics are "this rule is not disabled" — lifecycle_status
+        // is the source of truth for visibility, and rulesRepo.listActive
+        // now relies on lifecycle_status instead of ativa.
+        const tipo = native.rule_tipo ?? 'classificacao';
+        const contexto = native.rule_contexto ?? input.content_text.slice(0, 4000);
+        const acao =
+          native.rule_acao ??
+          (typeof input.content === 'string' ? input.content : input.key);
         const rows = await db
           .insert(learned_rules)
           .values({
             tenant_id: input.tenant_id,
             agent_id: input.agent_id,
-            tipo: 'classificacao',
-            contexto: input.content_text.slice(0, 4000),
-            acao: typeof input.content === 'string' ? input.content : input.key,
+            tipo,
+            contexto,
+            acao,
+            contexto_jsonb: (native.rule_contexto_jsonb ?? {}) as object,
+            acoes_jsonb: (native.rule_acoes_jsonb ?? {}) as object,
             confianca: String(input.confidence),
-            ativa: input.lifecycle_status === 'active',
+            ativa: true,
             lifecycle_status: input.lifecycle_status,
             evidence_count: input.evidence_count,
             lifecycle_transitions: input.lifecycle_transitions as unknown as object,
@@ -166,21 +206,42 @@ export const knowledgeRepos = {
         return String(rows[0]?.id ?? '');
       }
       case 'memory': {
+        // Codex round-2 finding 2: memory_entry needs scope_type +
+        // subject_id + interlocutor_id + conversa_id round-tripped from
+        // the proposer so `findRelevant` can match by
+        // interlocutor/role/channel/conversation. The previous facade
+        // wrote scope_type=<generic kind scope> (e.g. 'user', 'session')
+        // which findRelevant never looks for.
         const ttlDays =
           input.ttl_days ?? (input.lifecycle_status === 'ephemeral' ? 30 : 90);
         const expiresAt = new Date(Date.now() + ttlDays * 86_400_000);
+        const scopeType =
+          native.memory_scope_type ??
+          (input.scope === 'user'
+            ? 'interlocutor'
+            : input.scope === 'session'
+              ? 'conversation'
+              : input.scope === 'agent'
+                ? 'agent'
+                : input.scope === 'tenant'
+                  ? 'tenant'
+                  : 'agent');
+        const subjectId = native.memory_subject_id ?? input.scope_value ?? null;
+        const sensitivity = native.memory_sensitivity ?? 'low';
         const rows = await db
           .insert(memory_entry)
           .values({
             tenant_id: input.tenant_id,
             agent_id: input.agent_id,
             content: input.content_text,
-            memory_type: input.key,
-            scope_type: input.scope,
-            subject_id: input.scope_value ?? null,
-            sensitivity: 'low',
-            proactive_use: false,
-            mention_allowed: false,
+            memory_type: native.memory_type ?? input.key,
+            scope_type: scopeType,
+            subject_id: subjectId,
+            interlocutor_id: native.memory_interlocutor_id ?? null,
+            conversa_id: native.memory_conversa_id ?? null,
+            sensitivity,
+            proactive_use: native.memory_proactive_use ?? false,
+            mention_allowed: native.memory_mention_allowed ?? false,
             ttl_days: ttlDays,
             needs_review: false,
             expires_at: expiresAt,
@@ -194,18 +255,36 @@ export const knowledgeRepos = {
       }
       case 'behavioral_hint':
       case 'procedure_hint': {
+        // Codex round-2 finding 2: behavioral_hint.scope_type accepts
+        // `interlocutor`/`role`/`channel`/`conversation`/`agent`/`tenant`.
+        // The previous facade wrote the generic KnowledgeScope literal
+        // (`user`, `session`, etc.), which the prompt-builder lookup
+        // can't match. Prefer `native.hint_scope_type` and fall back to
+        // a sensible mapping from the generic scope.
         const ttlDays =
           input.ttl_days ?? (input.lifecycle_status === 'ephemeral' ? 14 : 60);
         const expiresAt = new Date(Date.now() + ttlDays * 86_400_000);
+        const scopeType =
+          native.hint_scope_type ??
+          (input.scope === 'user'
+            ? 'interlocutor'
+            : input.scope === 'session'
+              ? 'conversation'
+              : input.scope === 'agent'
+                ? 'agent'
+                : input.scope === 'tenant'
+                  ? 'tenant'
+                  : 'agent');
         const rows = await db
           .insert(behavioral_hint)
           .values({
             tenant_id: input.tenant_id,
             agent_id: input.agent_id,
-            scope_type: input.scope,
-            subject_id: input.scope_value ?? null,
+            scope_type: scopeType,
+            subject_id: native.hint_subject_id ?? input.scope_value ?? null,
             hint_text: input.content_text,
-            derived_sensitivity: 'low',
+            derived_sensitivity: native.hint_derived_sensitivity ?? 'low',
+            derived_from_memory_id: native.hint_derived_from_memory_id ?? null,
             ttl_days: ttlDays,
             expires_at: expiresAt,
             confidence: String(input.confidence),

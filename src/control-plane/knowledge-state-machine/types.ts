@@ -67,6 +67,58 @@ export type KnowledgeDecidedBy =
   | 'contraevidence'
   | 'idempotent';
 
+/**
+ * Per-kind table-native fields the KSM facade must write verbatim into
+ * the legacy columns. Without this carrier the facade silently coerced
+ * everything to generic scope strings and lost subject_id / role /
+ * channel / interlocutor — making proposed rows un-findable by the
+ * legacy read paths (Codex round-2 finding 2).
+ *
+ * Every field is optional; callers fill the ones their kind expects:
+ *   - fact  → `fact_escopo`, `fact_chave` (e.g. `pessoa:<uuid>` / `entidade:<uuid>`).
+ *   - rule  → `rule_tipo`, `rule_contexto`, `rule_acao`, `rule_contexto_jsonb`,
+ *             `rule_acoes_jsonb`.
+ *   - memory → `memory_scope_type`, `memory_subject_id`, `memory_type`,
+ *              `memory_interlocutor_id`, `memory_conversa_id`,
+ *              `memory_sensitivity`, `memory_proactive_use`,
+ *              `memory_mention_allowed`.
+ *   - behavioral_hint / procedure_hint → `hint_scope_type`,
+ *              `hint_subject_id`, `hint_derived_sensitivity`,
+ *              `hint_derived_from_memory_id`.
+ */
+export interface KnowledgeProposalNativeFields {
+  // fact
+  fact_escopo?: string;
+  fact_chave?: string;
+
+  // rule
+  rule_tipo?:
+    | 'classificacao'
+    | 'identificacao_entidade'
+    | 'tom_resposta'
+    | 'recorrencia';
+  rule_contexto?: string;
+  rule_acao?: string;
+  rule_contexto_jsonb?: Record<string, unknown>;
+  rule_acoes_jsonb?: Record<string, unknown>;
+
+  // memory
+  memory_type?: string;
+  memory_scope_type?: 'interlocutor' | 'role' | 'channel' | 'conversation' | 'agent' | 'tenant';
+  memory_subject_id?: string | null;
+  memory_interlocutor_id?: string | null;
+  memory_conversa_id?: string | null;
+  memory_sensitivity?: 'low' | 'medium' | 'high' | 'sensitive';
+  memory_proactive_use?: boolean;
+  memory_mention_allowed?: boolean;
+
+  // hint
+  hint_scope_type?: 'interlocutor' | 'role' | 'channel' | 'conversation' | 'agent' | 'tenant';
+  hint_subject_id?: string | null;
+  hint_derived_sensitivity?: 'low' | 'medium' | 'high';
+  hint_derived_from_memory_id?: string | null;
+}
+
 export interface KnowledgeProposalInput {
   trace_id: string;
   tenant_id: string;
@@ -82,6 +134,14 @@ export interface KnowledgeProposalInput {
   source: string;
   sensitivity_hint?: KnowledgeSensitivity;
   ttl_days?: number;
+  /**
+   * Codex round-2 finding 2: table-native column values the legacy
+   * read paths (factsRepo.listForScopes, memoryEntryRepo.findRelevant,
+   * rulesRepo.listActive) match against. If omitted, the facade falls
+   * back to derived values, which can be lossy for memory/hint scope
+   * variants (interlocutor / conversation / role / channel).
+   */
+  native?: KnowledgeProposalNativeFields;
 }
 
 export interface KnowledgeProposeResult {

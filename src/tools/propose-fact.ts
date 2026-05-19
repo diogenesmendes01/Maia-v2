@@ -32,8 +32,13 @@ const inputSchema = z.object({
   sensibilidade: z.enum(['low', 'medium', 'high']).optional(),
 });
 
+// Codex round-2 finding 3: proposal_id must be a non-empty
+// UUID-shaped string. Callers (audit, idempotency cache, Admin UI)
+// rely on this being a real DB id; an empty string is never valid.
+const PROPOSAL_ID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 const outputSchema = z.object({
-  proposal_id: z.string(),
+  proposal_id: z.string().regex(PROPOSAL_ID_REGEX, 'proposal_id must be a UUID'),
   initial_status: z.enum(['ephemeral', 'pending_review']),
   visible_to_llm: z.boolean(),
   reason: z.string(),
@@ -103,6 +108,14 @@ export const proposeFactTool: Tool<typeof inputSchema, typeof outputSchema> = {
       ...(args.sensibilidade !== undefined
         ? { sensitivity_hint: args.sensibilidade }
         : {}),
+      // Codex round-2 finding 2: persist the legacy escopo/chave verbatim
+      // so factsRepo.listForScopes / listMentionableForScopes (which look
+      // for `pessoa:<id>` / `entidade:<id>`) can find the row after a
+      // human approves it.
+      native: {
+        fact_escopo: args.escopo,
+        fact_chave: args.chave,
+      },
     });
 
     // Output shape narrows to {ephemeral, pending_review} — the only two

@@ -12,6 +12,33 @@ import { classifyMemory } from './memory-classifier.js';
 import { deriveBehavioralHint } from './behavioral-hint-deriver.js';
 import { validateBehavioralHint } from '@/workers/behavioral-hint-validator.js';
 import { initialFactConfidence, initialRuleConfidence } from './confidence.js';
+import { featureFlags } from '@/config/feature-flags.js';
+import { FeatureFlagName } from '@/types/enums.js';
+import { KnowledgeStateMachine } from '@/control-plane/knowledge-state-machine/index.js';
+import {
+  getCurrentTenant,
+  getCurrentAgent,
+} from '@/db/tenant-context.js';
+
+/**
+ * Origin of a `persistCandidate` call. Codex round-2 finding 1:
+ * legacy reflection paths could create active knowledge by hitting
+ * the table-default `lifecycle_status='active'`, bypassing the new
+ * risk scorer + pending_review gate.
+ *
+ *   - `llm`    → reflector/classifier/react-loop (LLM-derived).
+ *                MUST route through KSM when the flag is on, MUST refuse
+ *                an `active` initial status.
+ *   - `worker` → batch/pattern-detector/conversation-summarizer.
+ *                Same constraints as `llm`.
+ *   - `user`   → explicit human-driven write from a tool handler.
+ *                Routes through KSM with `origin='user_explicit'` —
+ *                eligible for ephemeral when conf>=0.6 but never `active`.
+ *   - `admin`  → human-approved promotion. Only origin allowed to write
+ *                `active` rows directly through legacy repos (e.g. the
+ *                Admin UI approve action).
+ */
+export type PersistOrigin = 'llm' | 'worker' | 'user' | 'admin';
 
 /**
  * Persister — roteia ClassifiedCandidate para o destino correto:
@@ -30,11 +57,36 @@ import { initialFactConfidence, initialRuleConfidence } from './confidence.js';
  *
  * Novos paths P2 (memory_entry / behavioral_hint / capability_gaps) são
  * aditivos e try/catch wrapped — falha neles NUNCA derruba o path legado.
+ *
+ * Codex round-2 finding 1: when the KSM feature flag is enabled and
+ * `origin` is `'llm'` or `'worker'`, fato/regra writes are routed
+ * through `KnowledgeStateMachine.propose()` so they're risk-scored and
+ * land in `pending_review`/`ephemeral` instead of bypassing review with
+ * the DB's `lifecycle_status='active'` default. `origin` defaults to
+ * `'llm'` because every existing caller is a reflection path.
  */
 export async function persistCandidate(
   candidate: ClassifiedCandidate,
   event: CognitiveEvent,
+  origin: PersistOrigin = 'llm',
 ): Promise<{ persisted_to: string; id?: string }> {
+  const ksmEnabled = featureFlags.isEnabled(
+    FeatureFlagName.KNOWLEDGE_STATE_MACHINE_V1,
+  );
+
+  // Codex round-2 finding 1: LLM/worker writes that reach legacy repos
+  // (which insert with `lifecycle_status='active'` by DB default) are
+  // exactly the silent-corruption path the review flagged. When the
+  // flag is enabled, route fact/rule proposals through the state
+  // machine so risk scoring + pending_review apply.
+  if (
+    ksmEnabled &&
+    (origin === 'llm' || origin === 'worker') &&
+    (candidate.type === 'fato' || candidate.type === 'regra')
+  ) {
+    return persistViaKSM(candidate, event, origin);
+  }
+
   switch (candidate.type) {
     case 'fato': {
       // Legacy: agent_facts (upsert por escopo+chave)
@@ -218,4 +270,157 @@ function slugKey(content: string): string {
     .replace(/^_+|_+$/g, '')
     .slice(0, 80);
   return `p1.${slug || 'fact'}`;
+}
+
+/**
+ * Codex round-2 finding 1 — KSM-routed persistence for `fato`/`regra`
+ * candidates originating from the LLM or background workers. The
+ * proposal lands in pending_review/ephemeral via the state machine, so
+ * it CANNOT silently bypass review by hitting the DB-default
+ * `lifecycle_status='active'`. We also assert here that the returned
+ * initial status is never 'active' — fail loudly is safer than silent
+ * corruption.
+ */
+async function persistViaKSM(
+  candidate: ClassifiedCandidate,
+  event: CognitiveEvent,
+  origin: 'llm' | 'worker',
+): Promise<{ persisted_to: string; id?: string }> {
+  const tenant_id = getCurrentTenant();
+  const agent_id = getCurrentAgent();
+  const conversa_id = 'conversa_id' in event ? event.conversa_id : undefined;
+  // KSM expects an explicit KnowledgeOrigin — 'llm'/'worker' both map
+  // to llm_inference (worker writes are still LLM-derived insights
+  // produced offline).
+  const ksm_origin = 'llm_inference' as const;
+  const trace_id = `persister:${event.type}:${conversa_id ?? 'n/a'}`;
+
+  if (candidate.type === 'fato') {
+    // FatoCandidate.scope is 'agent'|'role'|'conversation'. Map to KSM
+    // scope + preserve the legacy escopo string for the table-native
+    // column so factsRepo reads can find the row after approval.
+    const subject = candidate.subject_id ?? null;
+    const ksmScope =
+      candidate.scope === 'agent'
+        ? 'agent'
+        : candidate.scope === 'role'
+          ? 'agent'
+          : 'session';
+    const legacyEscopo =
+      candidate.scope === 'agent'
+        ? subject
+          ? `entidade:${subject}`
+          : 'global'
+        : candidate.scope;
+    const chave = slugKey(candidate.content);
+
+    const result = await KnowledgeStateMachine.propose({
+      trace_id,
+      tenant_id,
+      agent_id,
+      kind: 'fact',
+      scope: ksmScope,
+      ...(subject ? { scope_value: subject } : {}),
+      key: chave,
+      content: { content: candidate.content, subject_id: subject },
+      content_text: candidate.content,
+      confidence: initialFactConfidence(),
+      origin: ksm_origin,
+      source: `persister:${origin}`,
+      native: {
+        fact_escopo: legacyEscopo,
+        fact_chave: chave,
+      },
+    });
+
+    if (result.initial_status === 'active') {
+      // Defensive — decideInitialStatus never returns 'active', but if
+      // a future change accidentally let one through we refuse to honor
+      // it. Bypass detection is the whole point of finding 1.
+      throw new Error(
+        `persister.ksm_returned_active_status_for_${origin}_origin`,
+      );
+    }
+
+    logger.info(
+      {
+        kind: 'fact',
+        proposal_id: result.proposal_id,
+        initial_status: result.initial_status,
+        origin,
+      },
+      'persister.ksm_routed',
+    );
+
+    return {
+      persisted_to: `ksm:${result.initial_status}`,
+      id: result.proposal_id,
+    };
+  }
+
+  // The persistViaKSM gate filters to 'fato'|'regra'; the if-block
+  // above handles 'fato', so this branch is exclusively RegraCandidate.
+  if (candidate.type !== 'regra') {
+    // Exhaustive — should be unreachable.
+    throw new Error(
+      `persister.persistViaKSM_unexpected_candidate_type:${String(candidate.type)}`,
+    );
+  }
+  const regra = candidate;
+  const result = await KnowledgeStateMachine.propose({
+    trace_id,
+    tenant_id,
+    agent_id,
+    kind: 'rule',
+    scope: 'agent',
+    key: regra.tipo,
+    content: {
+      tipo: regra.tipo,
+      contexto: regra.contexto,
+      acao: regra.acao,
+    },
+    content_text: `[${regra.tipo}] ${regra.contexto} -> ${regra.acao}`,
+    confidence: initialRuleConfidence(),
+    origin: ksm_origin,
+    source: `persister:${origin}`,
+    native: {
+      rule_tipo: regra.tipo,
+      rule_contexto: regra.contexto,
+      rule_acao: regra.acao,
+    },
+  });
+
+  if (result.initial_status === 'active') {
+    throw new Error(
+      `persister.ksm_returned_active_status_for_${origin}_origin`,
+    );
+  }
+
+  // Rules always land in pending_review per master §2.6 — assert it so
+  // any rule-policy regression surfaces immediately.
+  if (result.initial_status !== 'pending_review') {
+    logger.warn(
+      {
+        proposal_id: result.proposal_id,
+        initial_status: result.initial_status,
+      },
+      'persister.rule_not_pending_review',
+    );
+  }
+
+  logger.info(
+    {
+      kind: 'rule',
+      proposal_id: result.proposal_id,
+      initial_status: result.initial_status,
+      tipo: regra.tipo,
+      origin,
+    },
+    'persister.ksm_routed',
+  );
+
+  return {
+    persisted_to: `ksm:${result.initial_status}`,
+    id: result.proposal_id,
+  };
 }

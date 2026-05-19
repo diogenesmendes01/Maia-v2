@@ -29,8 +29,11 @@ const inputSchema = z.object({
   exemplo_origem_id: z.string().uuid().optional(),
 });
 
+// Codex round-2 finding 3: proposal_id must be a non-empty UUID string.
+const PROPOSAL_ID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 const outputSchema = z.object({
-  proposal_id: z.string(),
+  proposal_id: z.string().regex(PROPOSAL_ID_REGEX, 'proposal_id must be a UUID'),
   initial_status: z.literal('pending_review'),
   visible_to_llm: z.literal(false),
   reason: z.string(),
@@ -69,6 +72,17 @@ export const proposeRuleTool: Tool<typeof inputSchema, typeof outputSchema> = {
       confidence: args.confianca,
       origin: 'llm_inference',
       source: 'tool:propose_rule',
+      // Codex round-2 finding 2: preserve native rule fields so the
+      // proposal lands in learned_rules with the proposer's tipo/contexto/
+      // acao verbatim (not hard-coded `tipo='classificacao'` and acao
+      // falling back to the key).
+      native: {
+        rule_tipo: args.tipo,
+        rule_contexto: args.contexto,
+        rule_acao: args.acao,
+        rule_contexto_jsonb: args.contexto_jsonb,
+        rule_acoes_jsonb: args.acoes_jsonb,
+      },
     });
 
     return {
