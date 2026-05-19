@@ -20,11 +20,28 @@ import { compareEntitiesTool } from './compare-entities.js';
 import { recallMemoryTool } from './recall-memory.js';
 import { saveFactTool } from './save-fact.js';
 import { saveRuleTool } from './save-rule.js';
+import { proposeFactTool } from './propose-fact.js';
+import { proposeRuleTool } from './propose-rule.js';
+import { proposeMemoryTool } from './propose-memory.js';
+import { proposeHintTool } from './propose-hint.js';
 import { listPendingTool } from './list-pending.js';
 import { startWorkflowTool } from './start-workflow.js';
 import { askPendingQuestionTool } from './ask-pending-question.js';
 import { generateReportTool } from './generate-report.js';
 import { config } from '@/config/env.js';
+import { featureFlags } from '@/config/feature-flags.js';
+import { FeatureFlagName } from '@/types/enums.js';
+// Calendar v2 — read-only tools
+import { calendarIsBusinessDayTool } from './calendar/calendar-is-business-day.js';
+import { calendarNextHolidayTool } from './calendar/calendar-next-holiday.js';
+import { calendarListHolidaysTool } from './calendar/calendar-list-holidays.js';
+import { calendarBusinessDaysBetweenTool } from './calendar/calendar-business-days-between.js';
+import { calendarAddBusinessDaysTool } from './calendar/calendar-add-business-days.js';
+// Calendar v2 — write tools + P5 closure
+import { registerCustomHolidayTool } from './register-custom-holiday.js';
+import { approveCapabilityProposalTool } from './approve-capability-proposal.js';
+import { rejectCapabilityProposalTool } from './reject-capability-proposal.js';
+import { listPendingProposalsTool } from './list-pending-proposals.js';
 
 export type ToolHandlerCtx = {
   pessoa: import('@/db/schema.js').Pessoa;
@@ -55,9 +72,34 @@ export type Tool<I extends z.ZodTypeAny, O extends z.ZodTypeAny> = {
    * reply into view-once (B3a). OR-logic across all tools in the turn.
    */
   sensitive?: boolean;
+  /**
+   * Codex review #105 (medium): kill-switch em runtime. Quando setado, o
+   * dispatcher checa o flag IMEDIATAMENTE antes de autorizar/executar — se
+   * o flag estiver off (kill switch ativo), o tool é tratado como
+   * inexistente para a chamada. O filtro em `REGISTRY` no module-load
+   * continua valendo para o schema exposto ao LLM, mas processos já
+   * carregados que recebam o tool name via chamada direta também respeitam
+   * o flag pós-load.
+   */
+  feature_flag?: FeatureFlagName;
 };
 
 export type AnyTool = Tool<z.ZodTypeAny, z.ZodTypeAny>;
+
+/**
+ * P10a (review #104): `propose_*` tool names are kept here so we can
+ * filter the registry view (`getToolSchemas`) and the dispatcher path
+ * (`isToolEnabled`) by the runtime feature flag. The registry itself
+ * holds all entries so the kill switch can be flipped on/off without a
+ * redeploy; the runtime check decides whether the tool is exposed and
+ * dispatched.
+ */
+const KSM_PROPOSE_TOOLS: ReadonlySet<string> = new Set([
+  'propose_fact',
+  'propose_rule',
+  'propose_memory',
+  'propose_hint',
+]);
 
 export const REGISTRY: Record<string, AnyTool> = {
   register_transaction: registerTransactionTool as unknown as AnyTool,
@@ -88,6 +130,16 @@ export const REGISTRY: Record<string, AnyTool> = {
   recall_memory: recallMemoryTool as unknown as AnyTool,
   save_fact: saveFactTool as unknown as AnyTool,
   save_rule: saveRuleTool as unknown as AnyTool,
+  // P10a — Knowledge State Machine `propose_*` tools. The harness
+  // decides the initial lifecycle state (ephemeral / pending_review);
+  // the LLM never writes directly to `active`.
+  // Runtime feature-flag check in getToolSchemas + isToolEnabled keeps
+  // them invisible/blocked when KNOWLEDGE_STATE_MACHINE_V1 is off (review
+  // #104), so kill switches take effect without a redeploy.
+  propose_fact: proposeFactTool as unknown as AnyTool,
+  propose_rule: proposeRuleTool as unknown as AnyTool,
+  propose_memory: proposeMemoryTool as unknown as AnyTool,
+  propose_hint: proposeHintTool as unknown as AnyTool,
   list_pending: listPendingTool as unknown as AnyTool,
   start_workflow: startWorkflowTool as unknown as AnyTool,
   ask_pending_question: askPendingQuestionTool as unknown as AnyTool,
@@ -95,7 +147,43 @@ export const REGISTRY: Record<string, AnyTool> = {
   ...(config.FEATURE_PDF_REPORTS
     ? { generate_report: generateReportTool as unknown as AnyTool }
     : {}),
+  // Calendar v2 — read-only tools (sempre expostas; flag OFF retorna fallback
+  // legacy só-nacionais sem quebrar).
+  calendar_is_business_day: calendarIsBusinessDayTool as unknown as AnyTool,
+  calendar_next_holiday: calendarNextHolidayTool as unknown as AnyTool,
+  calendar_list_holidays: calendarListHolidaysTool as unknown as AnyTool,
+  calendar_business_days_between: calendarBusinessDaysBetweenTool as unknown as AnyTool,
+  calendar_add_business_days: calendarAddBusinessDaysTool as unknown as AnyTool,
+  // Calendar v2 — write tools. Cada uma declara `feature_flag` para que o
+  // gate seja avaliado em runtime (kill-switch funciona em processos já
+  // carregados, schema exposto ao LLM sincroniza com o flag). Codex review
+  // #105 medium.
+  register_custom_holiday: registerCustomHolidayTool as unknown as AnyTool,
+  approve_capability_proposal: approveCapabilityProposalTool as unknown as AnyTool,
+  reject_capability_proposal: rejectCapabilityProposalTool as unknown as AnyTool,
+  list_pending_proposals: listPendingProposalsTool as unknown as AnyTool,
 };
+
+/**
+ * Runtime-flag check used by both the schema exposure path
+ * (getToolSchemas) and the dispatcher (`dispatchTool`). When the flag is
+ * off (or killed via kill switch), `propose_*` tools are reported as
+ * disabled and the dispatcher will reject the call before the handler
+ * runs. The check honours the live FeatureFlags singleton so kill
+ * switches don't need a redeploy to take effect.
+ */
+export function isToolEnabled(name: string): boolean {
+  if (KSM_PROPOSE_TOOLS.has(name)) {
+    return featureFlags.isEnabled(FeatureFlagName.KNOWLEDGE_STATE_MACHINE_V1);
+  }
+  // Calendar v2 + outras tools opcionais — honra `feature_flag` declarado
+  // na definição do tool (kill switch em runtime sem redeploy).
+  const tool = REGISTRY[name];
+  if (tool?.feature_flag !== undefined) {
+    return featureFlags.isEnabled(tool.feature_flag);
+  }
+  return true;
+}
 
 export function getToolSchemas(byEntity: Map<string, ResolvedPermission>) {
   const allowed = new Set<string>();
@@ -107,8 +195,13 @@ export function getToolSchemas(byEntity: Map<string, ResolvedPermission>) {
     }
     for (const a of rp.profile.acoes) allowed.add(a);
   }
-  if (isOwner) return Object.values(REGISTRY).map(toolToSchema);
-  return Object.values(REGISTRY)
+  // Codex review #105 (medium) + KSM: além do filtro de permissão, oculta tools
+  // cujo feature_flag esteja desligado em runtime. Mantém schema exposto
+  // ao LLM sincronizado com o gate do dispatcher. `isToolEnabled` honra
+  // tanto KSM propose_* tools quanto o `feature_flag` declarado por tool.
+  const tools = Object.values(REGISTRY).filter((t) => isToolEnabled(t.name));
+  if (isOwner) return tools.map(toolToSchema);
+  return tools
     .filter((t) => t.required_actions.every((a) => allowed.has(a)))
     .map(toolToSchema);
 }

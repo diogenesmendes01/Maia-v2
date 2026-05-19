@@ -1,5 +1,6 @@
-import cron from 'node-cron';
+import cron, { type ScheduledTask } from 'node-cron';
 import { logger } from '@/lib/logger.js';
+import { config } from '@/config/env.js';
 import { runHealthMonitor } from './health-monitor.js';
 import { runPendingExpirer } from './pending-expirer.js';
 import { runIdempotencyCleanup } from './idempotency-cleanup.js';
@@ -25,10 +26,21 @@ import { runProcedureExecutionReaper } from './procedure-execution-reaper.js';
 import { runProcedureMetricsRefresh } from './procedure-metrics-refresh.js';
 import { runDriftMonitor } from './drift-monitor.js';
 import { runGapEscalationMonitor } from './gap-escalation-monitor.js';
+import { runTraceBodyWriter } from './trace-body-writer.js';
+import { runTraceBodyRecoverer } from './trace-body-recoverer.js';
+import { runTraceMatviewRefresh } from './trace-matview-refresh.js';
+import { runKnowledgeStatePromoter } from './knowledge-state-promoter.js';
 import { tickEngine } from '@/workflows/engine.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 
-export type Job = { name: string; cron: string; fn: () => Promise<void>; phase: number };
+export type Job = {
+  name: string;
+  cron: string;
+  fn: () => Promise<void>;
+  phase: number;
+  /** When set, job is only scheduled if the feature flag is true at startup. */
+  featureFlag?: boolean;
+};
 
 export const JOBS: Job[] = [
   { name: 'health_monitor', cron: '*/1 * * * *', fn: runHealthMonitor, phase: 1 },
@@ -87,22 +99,61 @@ export const JOBS: Job[] = [
   { name: 'drift_monitor', cron: '0 3 * * 0', fn: runDriftMonitor, phase: 4 },
   // P5 Task 9 — gap escalation monitor (a cada 30min).
   { name: 'gap_escalation_monitor', cron: '*/30 * * * *', fn: runGapEscalationMonitor, phase: 5 },
+  // P10a — knowledge state auto-promoter (hourly; matures ephemeral→observed→
+  // reinforced→verified→active by evidence_count + age, and expires stale
+  // rows to deprecated). Worker is gated by FEATURE_KNOWLEDGE_STATE_MACHINE_V1
+  // — when off it early-returns immediately, so leaving the cron entry on is
+  // safe.
+  { name: 'knowledge_state_promoter', cron: '0 * * * *', fn: runKnowledgeStatePromoter, phase: 2 },
+  // P10b — runtime trace: 3 workers (body writer, body recoverer, matview refresh).
+  // Registered at phase 1 so they are included in the production startup call
+  // `startWorkers(1)`. Gated on FEATURE_RUNTIME_TRACE_V1 so they are a no-op
+  // when the flag is off. Prior phase: 6 (round-2 finding #1 fix).
+  // body_writer drains the in-process enqueue (every minute).
+  {
+    name: 'trace_body_writer',
+    cron: '* * * * *',
+    fn: runTraceBodyWriter,
+    phase: 1,
+    featureFlag: config.FEATURE_RUNTIME_TRACE_V1,
+  },
+  // body_recoverer flips persisted/orphans pending envelopes (every 5 min).
+  {
+    name: 'trace_body_recoverer',
+    cron: '*/5 * * * *',
+    fn: runTraceBodyRecoverer,
+    phase: 1,
+    featureFlag: config.FEATURE_RUNTIME_TRACE_V1,
+  },
+  // matview refresh — unified_trace_events (every 5 min, CONCURRENTLY).
+  {
+    name: 'trace_matview_refresh',
+    cron: '*/5 * * * *',
+    fn: runTraceMatviewRefresh,
+    phase: 1,
+    featureFlag: config.FEATURE_RUNTIME_TRACE_V1,
+  },
 ];
 
-const tasks: cron.ScheduledTask[] = [];
+const tasks: ScheduledTask[] = [];
 
 export function startWorkers(currentPhase: number = 1): void {
   for (const job of JOBS) {
     if (job.phase > currentPhase) continue;
+    // Skip feature-flagged jobs whose flag is off.
+    if (job.featureFlag === false) continue;
     const t = cron.schedule(
       job.cron,
       () => {
         job.fn().catch((err) => logger.error({ err, job: job.name }, 'worker.failed'));
       },
-      { scheduled: true, timezone: 'America/Sao_Paulo' },
+      { timezone: 'America/Sao_Paulo' },
     );
     tasks.push(t);
-    logger.info({ job: job.name, cron: job.cron, phase: job.phase }, 'worker.scheduled');
+    logger.info(
+      { job: job.name, cron: job.cron, phase: job.phase, featureFlag: job.featureFlag },
+      'worker.scheduled',
+    );
   }
 }
 

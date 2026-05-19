@@ -154,6 +154,66 @@ const envSchema = z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
+    // Calendar v2 — feriados nacionais/regionais + business-day calendar + rrule extension
+    FEATURE_CALENDAR_V2: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
+    // P8b — Soul Layer (biases comportamentais persistentes que modulam, nunca bloqueiam).
+    // Kill switch: set FEATURE_SOUL_LAYER_V1=false para desativar todo o soul pipeline
+    // (detector de drift, slice injection, activator worker) sem alterar DB.
+    FEATURE_SOUL_LAYER_V1: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
+    // P8e — PolicyDescriptorResolver + policy_rules (Source of Truth versionada).
+    // Off by default; only flips on when slice builder (P8d), PEPs (P9b/d),
+    // and Admin UI (P8.5) are in place to consume the resolver.
+    FEATURE_POLICY_RESOLVER_V1: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
+    /** Cache TTL (ms) for PolicyResolverCache. Default 5min = 300_000ms. */
+    POLICY_RESOLVER_CACHE_TTL_MS: z.coerce.number().int().positive().default(300_000),
+    /** LRU cap for PolicyResolverCache. Default 10_000 entries. */
+    POLICY_RESOLVER_CACHE_MAX_ENTRIES: z.coerce.number().int().positive().default(10_000),
+    // P9a — Skill Registry v1 (skills table + SkillRunner + 4 modes)
+    FEATURE_SKILL_REGISTRY_V1: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
+    // P10a — Knowledge State Machine (9 estados + auto-promoter + propose_* tools)
+    FEATURE_KNOWLEDGE_STATE_MACHINE_V1: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
+    // P10b — runtime trace (sync envelope + async body, HMAC + redaction)
+    FEATURE_RUNTIME_TRACE_V1: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
+    /** HMAC key version currently in use (rotates every 90d). */
+    RUNTIME_TRACE_HMAC_KEY_VERSION: z.coerce.number().int().positive().default(1),
+    /** Master secret material (test only — prod fetches from KMS). */
+    RUNTIME_TRACE_HMAC_MASTER_SECRET: z.string().optional(),
+    /**
+     * Previous HMAC master secrets for audit-row verification after rotation.
+     * Format: semicolon-separated `version=secret` pairs, e.g.:
+     *   "1=<old-secret>;2=<older-secret>"
+     * The current master secret is keyed separately in RUNTIME_TRACE_HMAC_MASTER_SECRET
+     * (at RUNTIME_TRACE_HMAC_KEY_VERSION). Previous secrets are retained here
+     * through the audit-retention window so old rows remain verifiable.
+     * Round-2 finding #3 fix.
+     */
+    RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS: z.string().optional(),
+    /** S3 bucket for debug-mode encrypted snapshots (24h TTL). */
+    RUNTIME_TRACE_DEBUG_S3_BUCKET: z.string().optional(),
+    /** AES-GCM key (base64) for debug-mode snapshot encryption. */
+    RUNTIME_TRACE_DEBUG_AES_KEY: z.string().optional(),
+    /** Max age in seconds of a pending envelope body before recoverer alerts (default 300). */
+    RUNTIME_TRACE_BODY_ORPHAN_SEC: z.coerce.number().int().positive().default(300),
+    /** Refresh interval for unified_trace_events matview (worker schedules; this is metadata only). */
+    RUNTIME_TRACE_MATVIEW_REFRESH_SEC: z.coerce.number().int().positive().default(300),
     /** Baseline pré-P7 em ms para p95 do sync path. Se ausente, gate skipa. */
     SYNC_LATENCY_P95_BASELINE_MS: z.coerce.number().int().positive().optional(),
     /** Percentual extra permitido sobre baseline (default 20). */
@@ -216,6 +276,12 @@ const envSchema = z
     // the file-backed token. Discouraged in prod (env vars leak more than
     // file mode 0o600). Useful for dev / scripted deploys / E2E tests.
     SETUP_TOKEN_OVERRIDE: z.string().optional(),
+
+    // P8c — User Layer namespace (depth-scoped slice builders + facade resolvers)
+    FEATURE_P8C_USER_LAYER_NAMESPACE_V1: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
   })
   .superRefine((cfg, ctx) => {
     if (cfg.LLM_PROVIDER === 'anthropic' && !cfg.ANTHROPIC_API_KEY) {
@@ -267,6 +333,21 @@ const envSchema = z
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message: 'OWNER_TELEFONE_WHATSAPP must differ from WHATSAPP_NUMBER_MAIA',
+      });
+    }
+    // P10b (Codex review #102 — issue 2): fail-closed on missing HMAC secret.
+    // When runtime trace is on in production, the master secret MUST be set
+    // (KMS-backed). Test/dev can override via _setTestMasterSecretForTests().
+    if (
+      cfg.NODE_ENV === 'production' &&
+      cfg.FEATURE_RUNTIME_TRACE_V1 &&
+      !cfg.RUNTIME_TRACE_HMAC_MASTER_SECRET
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['RUNTIME_TRACE_HMAC_MASTER_SECRET'],
+        message:
+          'RUNTIME_TRACE_HMAC_MASTER_SECRET is required in production when FEATURE_RUNTIME_TRACE_V1 is enabled — audit HMACs would be forgeable without it',
       });
     }
     try {
