@@ -55,8 +55,9 @@ jobs:
 
       - name: Run unit tests
         # Integration tests skip when TEST_DB_URL is unset — the unit lane is
-        # always green on CI. Follow-up: separate job with postgres + redis
-        # service containers for integration coverage.
+        # always green without infrastructure. Full integration coverage runs in
+        # the dedicated `integration` job below with postgres + redis service
+        # containers.
         run: npx vitest run
 
       - name: Lint
