@@ -122,6 +122,9 @@ export async function persistCandidate(
             ttl_days: classified.ttl_days,
             needs_review: false,
             source_event_id: null,
+            // P10a: lifecycle columns (lifecycle_status/evidence_count/
+            // confidence/lifecycle_transitions/last_recall_at) are populated
+            // by DB defaults — the repo signature Omits them.
             expires_at: classified.ttl_days
               ? new Date(Date.now() + classified.ttl_days * 24 * 60 * 60 * 1000)
               : null,
@@ -149,6 +152,7 @@ export async function persistCandidate(
                     extension_reason: null,
                     extension_approved_by: null,
                     extension_approved_at: null,
+                    // P10a: lifecycle columns populated by DB defaults.
                     expires_at: classified.ttl_days
                       ? new Date(Date.now() + classified.ttl_days * 24 * 60 * 60 * 1000)
                       : null,
@@ -196,6 +200,7 @@ export async function persistCandidate(
         erros: 0,
         ativa: true,
         exemplo_origem_id: null,
+        // P10a: lifecycle columns populated by DB defaults.
       });
       return { persisted_to: 'learned_rules', id: rule?.id };
     }

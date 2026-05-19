@@ -94,35 +94,35 @@ grep -q "risk_score:" src/control-plane/knowledge-state-machine/state-machine.ts
   || fail "propose() does not persist risk_score in lifecycle_transitions[0]"
 pass "risk_score persisted in lifecycle_transitions[0]"
 
-gate "Gate 12: migration 036 applied (file exists + indexes/CHECK declared)"
-test -f migrations/036_p10a_ksm_lifecycle_and_indexes.sql \
-  || fail "migration 036 file missing"
+gate "Gate 12: migration 050 applied (file exists + indexes/CHECK declared)"
+test -f migrations/050_p10a_ksm_lifecycle_and_indexes.sql \
+  || fail "migration 050 file missing"
 grep -q "knowledge_pending_review_idx_memory" \
-  migrations/036_p10a_ksm_lifecycle_and_indexes.sql \
+  migrations/050_p10a_ksm_lifecycle_and_indexes.sql \
   || fail "pending_review index missing in migration"
 grep -q "knowledge_auto_promoter_eligible_idx_memory" \
-  migrations/036_p10a_ksm_lifecycle_and_indexes.sql \
+  migrations/050_p10a_ksm_lifecycle_and_indexes.sql \
   || fail "auto_promoter index missing in migration"
 grep -q "memory_entry_lifecycle_transitions_shape" \
-  migrations/036_p10a_ksm_lifecycle_and_indexes.sql \
+  migrations/050_p10a_ksm_lifecycle_and_indexes.sql \
   || fail "CHECK constraint missing in migration"
-pass "migration 036 has indexes + CHECK constraints"
+pass "migration 050 has indexes + CHECK constraints"
 
 # ============================================================
 # Post-review #104 gates — DB enforcement, visibility, concurrency,
 # runtime feature gate, per-table maturity filter.
 # ============================================================
 
-gate "Gate 13: migration 044 — enforce_lifecycle_transition trigger on all 4 tables"
-test -f migrations/044_p10a_enforce_lifecycle_transition.sql \
-  || fail "migration 044 file missing"
+gate "Gate 13: migration 051 — enforce_lifecycle_transition trigger on all 4 tables"
+test -f migrations/051_p10a_enforce_lifecycle_transition.sql \
+  || fail "migration 051 file missing"
 for tbl in memory_entry agent_facts learned_rules behavioral_hint; do
   grep -q "trg_enforce_lifecycle_transition_${tbl}" \
-    migrations/044_p10a_enforce_lifecycle_transition.sql \
-    || fail "trigger for ${tbl} missing in migration 044"
+    migrations/051_p10a_enforce_lifecycle_transition.sql \
+    || fail "trigger for ${tbl} missing in migration 051"
 done
 grep -q "illegal knowledge lifecycle transition" \
-  migrations/044_p10a_enforce_lifecycle_transition.sql \
+  migrations/051_p10a_enforce_lifecycle_transition.sql \
   || fail "trigger function must raise EXCEPTION on illegal transition"
 pass "DB-level lifecycle enforcement trigger present on all 4 tables"
 
