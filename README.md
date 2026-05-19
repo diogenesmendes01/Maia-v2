@@ -107,6 +107,36 @@ docker compose up -d
 docker compose logs -f app
 ```
 
+## Running integration tests
+
+Integration tests hit a live Postgres and (for some specs) a live Redis. They
+skip automatically when `TEST_DB_URL` is unset, so the plain `npm test` lane
+always passes without infrastructure.
+
+To run integration specs locally:
+
+```bash
+# 1. Start Postgres + Redis via Docker Compose
+npm run test:integration:setup
+
+# 2. Apply DB migrations so the schema is up to date
+TEST_DB_URL=postgres://maia_test:test1234@localhost:5432/maia_test npm run db:migrate
+
+# 3. Run the suite (TEST_DB_URL enables the live-DB specs)
+TEST_DB_URL=postgres://maia_test:test1234@localhost:5432/maia_test npm run test:integration
+
+# 4. Stop services when done (removes volumes)
+npm run test:integration:teardown
+```
+
+If a spec fails immediately with a connectivity error, the helper in
+`tests/helpers/integrationSetup.ts` prints an actionable message telling you
+which service is unreachable and which command to run.
+
+CI runs these automatically in the dedicated `integration` job (see
+`.github/workflows/ci.yml`), which spins up `postgres` and `redis` service
+containers before executing the suite.
+
 ## Documentação
 
 - [`docs/arquitetura.md`](docs/arquitetura.md) — desenho do sistema, os 7 pilares, fases
