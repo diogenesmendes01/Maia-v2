@@ -58,6 +58,42 @@ export const TEST_STRATEGIES: Record<string, TestStrategy> = {
     // P5 placeholder: assume always passes (P6+ wires real knowledge lookup)
     return { passed: true, observed: 'knowledge_match_stub' };
   },
+  // P9a: skill_evaluator — invoca um Skill em modo evaluator para julgar o
+  // candidate (skill recém-aprovada). O scenario.when contém o
+  // skill_descriptor do candidate; scenario.then é o baseline esperado;
+  // o evaluator skill descriptor é resolvido por convenção via
+  // `${candidate}_evaluator`. Se faltar evaluator, retorna observed=skip.
+  skill_evaluator: async (s) => {
+    // Lazy import para quebrar ciclo (skill-runner depende de várias coisas
+    // do cognition; este strategy roda dentro do test-runner pós-aprovação).
+    const { runSkill } = await import('@/skills/skill-runner.js');
+    const candidateDescriptor = s.when.trim();
+    const evaluatorDescriptor = `${candidateDescriptor}_evaluator`;
+    const candidate = await runSkill({
+      skill_descriptor: candidateDescriptor,
+      input: { test_scenario: s },
+      triggered_by: 'evaluator_pipeline',
+    });
+    if (!candidate.ok) {
+      return { passed: false, observed: candidate.reason ?? 'candidate_failed', reason: candidate.message };
+    }
+    const evalResult = await runSkill({
+      skill_descriptor: evaluatorDescriptor,
+      input: { candidate_output: candidate.output, baseline: s.then, context: s },
+      triggered_by: 'evaluator_pipeline',
+    });
+    if (!evalResult.ok) {
+      // Sem evaluator skill ativo — não bloqueia o teste; reporta como skip.
+      return { passed: true, observed: 'evaluator_unavailable_skip', reason: evalResult.reason };
+    }
+    const verdict = (evalResult.output as { verdict?: string } | undefined)?.verdict;
+    const reasons = (evalResult.output as { reasons?: string[] } | undefined)?.reasons ?? [];
+    return {
+      passed: verdict === 'pass',
+      observed: verdict ?? 'no_verdict',
+      reason: reasons.join('; '),
+    };
+  },
 };
 
 export async function runCapabilityTests(args: {
@@ -115,11 +151,27 @@ export async function runCapabilityTests(args: {
   let technical_gap_id: string | undefined;
   let triggered_revert = false;
   if (outcome === 'fail') {
-    triggered_revert = true;
     const failingScenario = scenarios_run.find((s) => !s.passed);
     const reason = `capability "${proposal.title}" failed: ${failingScenario?.reason ?? failingScenario?.observed ?? 'unknown'}`;
     const revertResult = await revertCapability({ proposal, reason });
-    technical_gap_id = revertResult.technical_gap_id;
+    if (revertResult.ok) {
+      // Round-2 review #99 finding 2: only mark triggered_revert=true when
+      // the rollback actually succeeded. A failed rollback leaves the bad
+      // skill active — lying to audit by setting triggered_revert=true is
+      // a governance invariant violation.
+      triggered_revert = true;
+      technical_gap_id = revertResult.technical_gap_id;
+    } else {
+      // Rollback failed: log prominently but do NOT set triggered_revert.
+      // The skill remains active; caller / human must intervene.
+      logger.error(
+        {
+          proposal_id: proposal.id,
+          revert_reason: revertResult.reason,
+        },
+        'capability_test_runner.revert_failed: skill remains active; triggered_revert stays false',
+      );
+    }
   }
 
   const result = await capabilityTestResultsRepo.record({

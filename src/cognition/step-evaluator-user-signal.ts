@@ -42,8 +42,8 @@ export function detectUserSignal(input: UserSignalInput): UserSignalResult {
   if (msg.length === 0) {
     return { passed: false, matched: 'none', evidence: 'no user message' };
   }
-  let pos: RegExp[] = [];
-  let neg: RegExp[] = [];
+  let pos: RegExp[];
+  let neg: RegExp[];
   if (input.signal === 'agreement') {
     pos = AGREEMENT_POSITIVE;
     neg = AGREEMENT_NEGATIVE;

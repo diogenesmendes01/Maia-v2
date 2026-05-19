@@ -52,6 +52,7 @@ import {
 import { TypedError } from '@/lib/utils.js';
 import { applyTenantGuard } from './tenant-guard.js';
 import { getCurrentTenant, getCurrentAgent } from './tenant-context.js';
+import { LearnedVoiceModifierSchema } from '@/identity/learned-voice-modifier.js';
 import type {
   ProfileStatus,
   DriftType,
@@ -2550,12 +2551,60 @@ export const procedureMetricsRepo = {
       ));
   },
 };
+/**
+ * P8d §10 — Write-path validation para `profile_body`.
+ *
+ * Aplicada antes de qualquer INSERT em `agent_operational_profile_versions`.
+ * Garante que cognitive_limits estão dentro do range esperado e que cada
+ * `LearnedVoiceModifier` casa o schema Zod.
+ *
+ * P9b enforça `cognitive_limits` em runtime do SkillRunner; P8d só fecha a
+ * porta na DB (defesa em depth).
+ */
+function validateProfileBodyP8d(body: ProfileBody): void {
+  const identity = (body as { identity?: Record<string, unknown> }).identity;
+  if (!identity) return;
+
+  const cl = identity.cognitive_limits as
+    | { max_inference_depth?: unknown; max_speculation_in_response?: unknown; confidence_floor_for_action?: unknown }
+    | undefined;
+  if (cl) {
+    // Aceita 0 (semente inicial pode não ter calibrado ainda) mas rejeita
+    // valores negativos/fora-range tipados.
+    if (typeof cl.max_inference_depth !== 'number' ||
+        cl.max_inference_depth < 0 || cl.max_inference_depth > 10) {
+      throw new Error('cognitive_limits.max_inference_depth out of range [0,10]');
+    }
+    if (typeof cl.max_speculation_in_response !== 'number' ||
+        cl.max_speculation_in_response < 0 || cl.max_speculation_in_response > 1) {
+      throw new Error('cognitive_limits.max_speculation_in_response out of range [0,1]');
+    }
+    if (typeof cl.confidence_floor_for_action !== 'number' ||
+        cl.confidence_floor_for_action < 0 || cl.confidence_floor_for_action > 1) {
+      throw new Error('cognitive_limits.confidence_floor_for_action out of range [0,1]');
+    }
+  }
+
+  const mods = identity.learned_voice_modifiers;
+  if (Array.isArray(mods)) {
+    for (const m of mods) {
+      // Throws ZodError com path detalhado se inválido.
+      LearnedVoiceModifierSchema.parse(m);
+    }
+  }
+}
+
 export const operationalProfileVersionsRepo = {
   async create(input: {
     profile_body: ProfileBody;
     proposed_by: string;
     proposed_reason?: string;
   }): Promise<AgentOperationalProfileVersion> {
+    // P8d §10 — write-path validation: rejeita cognitive_limits fora de range
+    // e modifiers malformados. Defesa em depth contra inserts "tortos" via
+    // qualquer caller (proposal-generator, migration script, Admin UI).
+    validateProfileBodyP8d(input.profile_body);
+
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
     const version = await operationalProfileVersionsRepo.nextVersion();
@@ -2722,6 +2771,122 @@ export const operationalProfileVersionsRepo = {
     const max = result.rows[0]?.max ?? null;
     return max == null ? 1 : Number(max) + 1;
   },
+
+  // Review #100 fix: atomic create-frozen-active in one transaction with
+  // FOR UPDATE locking on the current active row. Used by data migration
+  // scripts (P8d priorities) to avoid the create→freeze→activate window
+  // where a crash leaves the agent with no active profile.
+  //
+  // Semantics:
+  //   - Locks the current active row (if any) FOR UPDATE so concurrent
+  //     callers serialize on that tuple.
+  //   - Verifies tenant scope on both the lock and the inserts.
+  //   - On any error inside the closure, the transaction rolls back —
+  //     the old active row stays active.
+  //   - Throws (instead of returning result) so callers can wrap in
+  //     try/catch and count failures distinctly.
+  async seedNewActiveAtomic(input: {
+    profile_body: ProfileBody;
+    proposed_by: string;
+    proposed_reason?: string;
+    /** Expected current active id; if mismatch, throws — protects against
+     *  the caller having read stale data outside the tx. */
+    expected_current_active_id?: string;
+  }): Promise<{
+    new_active: AgentOperationalProfileVersion;
+    frozen_previous: AgentOperationalProfileVersion | null;
+  }> {
+    // Validate before opening the transaction so we fail fast without
+    // touching the DB on a malformed body.
+    validateProfileBodyP8d(input.profile_body);
+
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+
+    return withTx(async (tx) => {
+      // 1) Lock the current active row FOR UPDATE (if any). Two concurrent
+      //    seeds against the same agent now serialize on this tuple.
+      const activeRows = await tx
+        .select()
+        .from(agent_operational_profile_versions)
+        .where(
+          and(
+            eq(agent_operational_profile_versions.tenant_id, tenant_id),
+            eq(agent_operational_profile_versions.agent_id, agent_id),
+            eq(agent_operational_profile_versions.status, 'active'),
+          ),
+        )
+        .for('update');
+      const currentActive = activeRows[0] ?? null;
+
+      if (
+        input.expected_current_active_id &&
+        currentActive?.id !== input.expected_current_active_id
+      ) {
+        throw new Error(
+          `seed_atomic_stale_active: expected ${input.expected_current_active_id}, found ${currentActive?.id ?? 'none'}`,
+        );
+      }
+
+      // 2) Compute next version inside the tx so concurrent inserts can't
+      //    collide on (tenant, agent, version) unique index.
+      const maxRes = await tx.execute<{ max: number | null }>(sql`
+        SELECT MAX(version) AS max
+          FROM agent_operational_profile_versions
+         WHERE tenant_id = ${tenant_id}
+           AND agent_id = ${agent_id}
+      `);
+      const max = maxRes.rows[0]?.max ?? null;
+      const nextV = max == null ? 1 : Number(max) + 1;
+
+      const now = new Date();
+
+      // 3) Freeze the previous active row FIRST so the partial unique index
+      //    on (tenant, agent) WHERE status='active' is satisfied before the
+      //    new insert lands. Otherwise both rows would compete for activeness.
+      let frozenPrevious: AgentOperationalProfileVersion | null = null;
+      if (currentActive) {
+        const [updated] = await tx
+          .update(agent_operational_profile_versions)
+          .set({ status: 'frozen', frozen_at: now })
+          .where(
+            and(
+              eq(agent_operational_profile_versions.id, currentActive.id),
+              eq(agent_operational_profile_versions.tenant_id, tenant_id),
+              eq(agent_operational_profile_versions.agent_id, agent_id),
+            ),
+          )
+          .returning();
+        if (!updated) {
+          throw new Error('seed_atomic_freeze_failed: previous active row vanished mid-tx');
+        }
+        frozenPrevious = updated;
+      }
+
+      // 4) Insert the new row directly as `active`. The partial unique index
+      //    rejects if another active row sneaks in between the freeze above
+      //    and this insert — that forces tx rollback and the caller retries.
+      const guarded = applyTenantGuard({
+        version: nextV,
+        status: 'active',
+        profile_body: input.profile_body,
+        proposed_by: input.proposed_by,
+        proposed_reason: input.proposed_reason ?? null,
+        approved_by: input.proposed_by,
+        approved_at: now,
+        activated_at: now,
+      });
+      const [inserted] = await tx
+        .insert(agent_operational_profile_versions)
+        .values(guarded)
+        .returning();
+      if (!inserted) {
+        throw new Error('seed_atomic_insert_failed: returning() empty');
+      }
+
+      return { new_active: inserted, frozen_previous: frozenPrevious };
+    });
+  },
 };
 
 // P4: agent_drift_alerts — audit das execuções do drift detector.
@@ -2880,10 +3045,25 @@ export const gapEscalationRulesRepo = {
 // reason: 'not_found' | 'invalid_transition' }. Cada transição seta um
 // timestamp (submitted_at | decided_at | delivered_at) + campos opcionais
 // (decided_by, decision_reason, delivery_artifact_ref).
+// P9a — extended capability_type set (migration 044). 'skill' enables
+// the P9a Skill Registry to flow proposals through the same approval inbox;
+// 'soul_bias' / 'policy_rule' / 'holiday' antecipam P8e/P9b/scheduling sem
+// ativar uso até o respectivo phase.
+export type CapabilityProposalType =
+  | 'tool'
+  | 'knowledge'
+  | 'procedure'
+  | 'integration'
+  | 'other'
+  | 'skill'
+  | 'soul_bias'
+  | 'policy_rule'
+  | 'holiday';
+
 export const capabilityProposalsRepo = {
   async create(input: {
     gap_id?: string;
-    capability_type: 'tool' | 'knowledge' | 'procedure' | 'integration' | 'other';
+    capability_type: CapabilityProposalType;
     title: string;
     description: string;
     proposed_spec: unknown;
@@ -2919,7 +3099,7 @@ export const capabilityProposalsRepo = {
     tx: typeof db,
     input: {
       gap_id?: string;
-      capability_type: 'tool' | 'knowledge' | 'procedure' | 'integration' | 'other';
+      capability_type: CapabilityProposalType;
       title: string;
       description: string;
       proposed_spec: unknown;
@@ -3629,3 +3809,10 @@ export const roleSelectorDecisionsRepo = {
     return typeof raw === 'string' ? Number(raw) : raw;
   },
 };
+
+// P9a — re-export skillsRepo from control-plane/skill-registry. Convention:
+// `repositories.ts` é o ponto único de import para callers; `control-plane/`
+// hospeda a implementação propriamente dita (Source of Truth + Admin UI).
+// Ver `src/control-plane/skill-registry/skills-repo.ts`.
+export { skillsRepo } from '@/control-plane/skill-registry/index.js';
+export type { SkillsRepo, ProposeInput as SkillProposeInput } from '@/control-plane/skill-registry/index.js';
