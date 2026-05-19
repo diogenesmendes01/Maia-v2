@@ -296,5 +296,7 @@ export const FeatureFlagName = {
   COGNITIVE_GRAPH: 'cognitive_graph',
   // P8b — Soul Layer (persistent behavioral biases que modulam, nunca bloqueiam)
   FEATURE_SOUL_LAYER_V1: 'FEATURE_SOUL_LAYER_V1',
+  // P8e — PolicyDescriptorResolver + policy_rules (Source of Truth versionada)
+  POLICY_RESOLVER_V1: 'POLICY_RESOLVER_V1',
 } as const;
 export type FeatureFlagName = typeof FeatureFlagName[keyof typeof FeatureFlagName];
