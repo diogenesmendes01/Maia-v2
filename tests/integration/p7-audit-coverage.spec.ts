@@ -35,7 +35,8 @@ describe('P7 — audit coverage (grep gate)', () => {
         if (f.endsWith('claude.ts')) continue;
         const src = readFileSync(f, 'utf8');
         const hasCall = /\bcallLLM\s*\(/.test(src);
-        const hasWrapper = /\brunCognitiveModule\s*\(/.test(src);
+        // Match generic-typed calls: runCognitiveModule<T>(...) or runCognitiveModule(...)
+        const hasWrapper = /\brunCognitiveModule\s*[<(]/.test(src);
         if (hasCall && !hasWrapper) offenders.push(f);
       }
     }

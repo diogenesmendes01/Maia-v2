@@ -79,6 +79,40 @@ vi.mock('@/db/repositories.js', async () => {
       listAllVersionsByName: vi.fn(async (nome: string) =>
         Object.values(definitionsState).filter((d: any) => d.nome === nome),
       ),
+      // P83-C4: atomic activation in a single transaction.
+      // Required by procedure-status.ts when transitioning proposed → active.
+      atomicActivate: vi.fn(
+        async (args: {
+          target_id: string;
+          actor: string;
+          preserve_activated_at?: boolean;
+        }) => {
+          const target = definitionsState[args.target_id];
+          if (!target) throw new Error('not found');
+          const now = new Date();
+          // Freeze any sibling that is currently active (same nome).
+          let deactivated: any = null;
+          for (const k of Object.keys(definitionsState)) {
+            const row = definitionsState[k];
+            if (row.nome === target.nome && row.status === 'active' && row.id !== target.id) {
+              definitionsState[k] = { ...row, status: 'frozen', deactivated_at: now };
+              if (!deactivated) deactivated = definitionsState[k];
+            }
+          }
+          const fromStatus = target.status;
+          const patch: any = {
+            status: 'active',
+            approved_by: args.actor,
+            approved_at: now,
+            deactivated_at: null,
+          };
+          if (!args.preserve_activated_at || target.activated_at == null) {
+            patch.activated_at = now;
+          }
+          definitionsState[args.target_id] = { ...target, ...patch };
+          return { activated: definitionsState[args.target_id], deactivated };
+        },
+      ),
     },
     procedureTestsRepo: {
       create: vi.fn(async (input: any) => {
