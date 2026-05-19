@@ -54,6 +54,8 @@ export type CandidateType = typeof CandidateType[keyof typeof CandidateType];
 /**
  * P4 — Tipos de drift de identidade operacional detectados pelo sistema.
  * Mapeiam dimensões do comportamento que podem desviar do perfil ativo.
+ *
+ * P8b adiciona SOUL_DRIFT (8º). P8d adiciona PAPEL_DRIFT (9º).
  */
 export const DriftType = {
   TOM: 'tom',
@@ -66,6 +68,8 @@ export const DriftType = {
   // P8b: 8º tipo de drift — aderência a Soul Biases ativas no contexto.
   // Severidade NUNCA força rollback de profile (apenas queued_human).
   SOUL_DRIFT: 'soul_drift',
+  // P8d: 9º tipo de drift — divergência de papel (cognitive_limits/priorities).
+  PAPEL_DRIFT: 'papel_drift',
 } as const;
 export type DriftType = typeof DriftType[keyof typeof DriftType];
 

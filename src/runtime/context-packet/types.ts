@@ -154,6 +154,12 @@ export interface IdentitySlice {
     confidence_floor_for_action: number;
   };
   priorities: string[];
+  /**
+   * P8a structural modifiers (legacy/loose shape) used by main's class-based
+   * IdentitySliceBuilder. P8d also surfaces `active_voice_modifiers` below
+   * with the strongly-typed `LearnedVoiceModifier` shape from
+   * `@/identity/learned-voice-modifier`.
+   */
   learned_voice_modifiers: Array<{
     aspect: string;
     modifier: string;
@@ -161,6 +167,13 @@ export interface IdentitySlice {
   }>;
   schema_version: string;
   version_id: string;
+
+  // P8d §5 — extra optional fields populated by `buildIdentitySlice()`.
+  // Optional so existing callers (P8a class) keep compiling.
+  identity_block?: string;
+  principles?: string[]; // only when depth='full' and data has them
+  active_voice_modifiers?: unknown[]; // only when depth='full' and ≥1 active
+  version_number?: number;
 }
 
 export interface UserSlice {
