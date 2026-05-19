@@ -154,6 +154,13 @@ const envSchema = z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
+    // P8b — Soul Layer (biases comportamentais persistentes que modulam, nunca bloqueiam).
+    // Kill switch: set FEATURE_SOUL_LAYER_V1=false para desativar todo o soul pipeline
+    // (detector de drift, slice injection, activator worker) sem alterar DB.
+    FEATURE_SOUL_LAYER_V1: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
     // P8e — PolicyDescriptorResolver + policy_rules (Source of Truth versionada).
     // Off by default; only flips on when slice builder (P8d), PEPs (P9b/d),
     // and Admin UI (P8.5) are in place to consume the resolver.

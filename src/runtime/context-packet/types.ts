@@ -202,18 +202,19 @@ export interface KnowledgeSlice {
   truncated: { facts: boolean; rules: boolean };
 }
 
-export interface SoulSlice {
-  biases: Array<{
-    id: string;
-    principle: string;
-    strength: number;
-    origin: string;
-    scope: string;
-    scope_value: string | null;
-    version_id: string;
-  }>;
-  truncated: boolean;
-}
+/**
+ * SoulSlice — re-exported from p8b's canonical location.
+ *
+ * P8a originally shipped a stub `{ biases, truncated }` shape. P8b replaces it
+ * with the richer real shape `{ active_biases, rendered_block, total_active,
+ * truncated_to, cache_key, resolved_at }` defined in
+ * `src/runtime/context-assembly/types/soul-slice.ts`.
+ */
+import type {
+  SoulSlice,
+  SoulSliceBias,
+} from '../context-assembly/types/soul-slice.js';
+export type { SoulSlice, SoulSliceBias };
 
 export type PolicyRuleKind =
   | 'hard_limit'

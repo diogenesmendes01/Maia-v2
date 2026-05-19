@@ -8,7 +8,7 @@
  * Exported as a lazy singleton (created once on first call) so the builders
  * share the same InMemorySliceCache instance across turns in the process.
  *
- * TODO(P8b): replace stubSoulPort with real soul-layer port.
+ * P8b: soulBiasesRepoPort wired (real port backed by soulBiasesRepo).
  * TODO(P8c): replace stub user repo with real user-layer facade.
  * TODO(P8e): replace stubPolicyDescriptorResolver with real resolver.
  */
@@ -21,7 +21,7 @@ import {
 } from '../context-assembly/slice-builders/knowledge-slice-builder.js';
 import {
   SoulSliceBuilder,
-  stubSoulPort,
+  soulBiasesRepoPort,
 } from '../context-assembly/slice-builders/soul-slice-builder.js';
 import {
   PolicySliceBuilder,
@@ -106,7 +106,7 @@ export function getProductionBuilderSet(): {
       cache,
     ) as unknown as SliceBuilderSet['knowledge'],
     soul: new SoulSliceBuilder(
-      stubSoulPort,
+      soulBiasesRepoPort,
       cache,
     ) as unknown as SliceBuilderSet['soul'],
     policy: new PolicySliceBuilder(

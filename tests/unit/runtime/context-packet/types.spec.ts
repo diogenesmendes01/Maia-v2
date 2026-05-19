@@ -124,7 +124,14 @@ describe('Context Packet types (v3.1.1)', () => {
       rules: [],
       truncated: { facts: false, rules: false },
     };
-    const soul: SoulSlice = { biases: [], truncated: false };
+    const soul: SoulSlice = {
+      active_biases: [],
+      rendered_block: null,
+      total_active: 0,
+      truncated_to: 0,
+      cache_key: 'k',
+      resolved_at: new Date(),
+    };
     const policy: PolicySlice = {
       applicable_rules: [],
       resolver_cache_key: 'key1',

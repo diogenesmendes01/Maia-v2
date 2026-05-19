@@ -131,7 +131,14 @@ const EMPTY_FALLBACKS = {
     rules: [],
     truncated: { facts: false, rules: false },
   }),
-  soul: (): SoulSlice => ({ biases: [], truncated: false }),
+  soul: (): SoulSlice => ({
+    active_biases: [],
+    rendered_block: null,
+    total_active: 0,
+    truncated_to: 0,
+    cache_key: '',
+    resolved_at: new Date(0),
+  }),
   skill: (): SkillSlice => ({
     mode: 'candidates',
     selected_skill: null,

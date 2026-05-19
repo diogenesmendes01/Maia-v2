@@ -38,7 +38,14 @@ const minimalPacket = (
     truncated: false,
   },
   knowledge: { facts: [], rules: [], truncated: { facts: false, rules: false } },
-  soul: { biases: [], truncated: false },
+  soul: {
+    active_biases: [],
+    rendered_block: null,
+    total_active: 0,
+    truncated_to: 0,
+    cache_key: '',
+    resolved_at: new Date(0),
+  },
   policy: {
     applicable_rules: [],
     resolver_cache_key: 'k',

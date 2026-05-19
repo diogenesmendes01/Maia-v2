@@ -403,8 +403,12 @@ describe('buildContextPacket orchestrator', () => {
       const { builders } = makeStandardBuilders();
       type SoulSliceType = import('@/runtime/context-packet/types.js').SoulSlice;
       const hangingSoul = makeHangingBuilder<SoulSliceType>('soul', {
-        biases: [],
-        truncated: false,
+        active_biases: [],
+        rendered_block: null,
+        total_active: 0,
+        truncated_to: 0,
+        cache_key: '',
+        resolved_at: new Date(0),
       });
       const counters: Array<{ name: string; labels?: Record<string, string> }> = [];
       await buildContextPacket(

@@ -1082,6 +1082,79 @@ export const agent_operational_profile_versions = pgTable(
   }),
 );
 
+// P8b — soul_biases: append-only behavioral biases versionadas por chave
+// (tenant, agent, scope, scope_value, principle). DEFAULT 'proposed' garante que
+// nenhuma bias nasça active por acidente (invariante 5). Partial unique
+// "one active" garante 1 row active por chave (migration 038).
+export const soul_biases = pgTable(
+  'soul_biases',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    scope: text('scope').notNull(),
+    scope_value: text('scope_value').notNull(),
+    principle: text('principle').notNull(),
+    guidance: text('guidance').notNull(),
+    origin: text('origin').notNull(),
+    strength: numeric('strength', { precision: 4, scale: 3 }).notNull(),
+    activation_context: jsonb('activation_context').notNull().default(sql`'{}'::jsonb`),
+    status: text('status').notNull().default('proposed'),
+    version: integer('version').notNull(),
+    previous_version_id: uuid('previous_version_id'),
+    proposed_by: text('proposed_by').notNull(),
+    proposed_reason: text('proposed_reason'),
+    approved_by: text('approved_by'),
+    approved_at: timestamp('approved_at', { withTimezone: true }),
+    activated_at: timestamp('activated_at', { withTimezone: true }),
+    frozen_at: timestamp('frozen_at', { withTimezone: true }),
+    rolled_back_at: timestamp('rolled_back_at', { withTimezone: true }),
+    rollback_reason: text('rollback_reason'),
+    deprecated_at: timestamp('deprecated_at', { withTimezone: true }),
+    deprecated_reason: text('deprecated_reason'),
+    proposal_id: uuid('proposal_id'),
+    source_drift_alert_id: uuid('source_drift_alert_id'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    versionUniq: unique('soul_biases_version_uniq').on(
+      t.tenant_id,
+      t.agent_id,
+      t.scope,
+      t.scope_value,
+      t.principle,
+      t.version,
+    ),
+    oneActiveIdx: uniqueIndex('soul_biases_one_active_idx')
+      .on(t.tenant_id, t.agent_id, t.scope, t.scope_value, t.principle)
+      .where(sql`status = 'active'`),
+    activeLookupIdx: index('soul_biases_active_lookup_idx')
+      .on(t.tenant_id, t.agent_id, t.status, t.scope, t.scope_value)
+      .where(sql`status = 'active'`),
+    proposedInboxIdx: index('soul_biases_proposed_inbox_idx')
+      .on(t.tenant_id, t.agent_id, t.status, t.created_at)
+      .where(sql`status = 'proposed'`),
+    proposalIdx: index('soul_biases_proposal_idx')
+      .on(t.proposal_id)
+      .where(sql`proposal_id IS NOT NULL`),
+    driftSourceIdx: index('soul_biases_drift_source_idx')
+      .on(t.source_drift_alert_id)
+      .where(sql`source_drift_alert_id IS NOT NULL`),
+    scopeCheck: check(
+      'soul_biases_scope_check',
+      sql`scope IN ('tenant', 'agent', 'role', 'domain')`,
+    ),
+    statusCheck: check(
+      'soul_biases_status_check',
+      sql`status IN ('proposed', 'active', 'deprecated', 'rolled_back')`,
+    ),
+    originCheck: check(
+      'soul_biases_origin_check',
+      sql`origin IN ('founder_explicit', 'human_approved', 'tenant_culture_explicit', 'learned_strong_evidence')`,
+    ),
+  }),
+);
+
 // P4: agent_drift_alerts — audit das execuções do drift detector.
 // Cada alert = 1 tipo de drift detectado (7 tipos: tom, valores, confianca,
 // vies, escopo, linguagem, procedimento) × 4 severidades (baixo, medio, alto,
@@ -1315,6 +1388,22 @@ export const role_selector_decisions = pgTable(
     tenantAgentIdx: index('role_selector_tenant_agent_idx').on(t.tenant_id, t.agent_id, t.decided_at),
   }),
 );
+
+export type SoulBias = typeof soul_biases.$inferSelect;
+export type NewSoulBias = typeof soul_biases.$inferInsert;
+
+/**
+ * P8b — Estrutura JSONB de `soul_biases.activation_context`.
+ * Avaliada por soul-slice-builder. Vazio = sempre ativo dentro do scope.
+ */
+export interface ActivationContext {
+  intent_in?: string[];
+  risk_level_min?: 'low' | 'medium' | 'high';
+  channel_in?: string[];
+  role_in?: string[];
+  domain_in?: string[];
+  time_window?: string;
+}
 
 // P8e — policy_rules: Source of Truth versionada para regras de governança.
 // Master spec v3.1.1 §2.1. DEFAULT 'proposed' garante invariante #5; partial

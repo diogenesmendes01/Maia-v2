@@ -36,7 +36,7 @@ export function buildPromptFromPacket(
   if (packet.policy.applicable_rules.length > 0) {
     blocks.push(renderPolicy(packet.policy));
   }
-  if (packet.soul.biases.length > 0) {
+  if (packet.soul.active_biases.length > 0) {
     blocks.push(renderSoul(packet.soul));
   }
   if (packet.user.pessoa) {
@@ -105,13 +105,18 @@ function renderPolicy(slice: PolicySlice): string {
 }
 
 function renderSoul(slice: SoulSlice): string {
+  // P8b ships a pre-rendered markdown block; prefer it when available so the
+  // ranking + disclaimer logic stays in the slice builder.
+  if (slice.rendered_block) {
+    return slice.rendered_block;
+  }
   const lines = ['## Vieses ativos (orientam, não bloqueiam)'];
-  for (const b of slice.biases) {
+  for (const b of slice.active_biases) {
     lines.push(
       `- ${b.principle} (força ${b.strength.toFixed(2)}, origem ${b.origin})`,
     );
   }
-  if (slice.truncated) {
+  if (slice.total_active > slice.truncated_to) {
     lines.push('- (lista truncada)');
   }
   return lines.join('\n');
