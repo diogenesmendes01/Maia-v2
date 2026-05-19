@@ -6,8 +6,8 @@
  * retorna null sem chamar Anthropic".
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import type { AgentOperationalProfileVersion } from '@/db/schema.js';
 import type { DriftRecentMessage } from '@/cognition/drift/types.js';
+import { buildProfileVersion } from '../fixtures/agentProfile.js';
 
 const messagesCreateMock = vi.fn();
 
@@ -28,14 +28,29 @@ function makeAnthropicReply(jsonObj: Record<string, unknown>): {
   };
 }
 
-function makeProfile(opts: { principles?: string[] } = {}): AgentOperationalProfileVersion {
-  const now = new Date();
-  return {
-    id: 'prof-1',
-    tenant_id: 'default',
-    agent_id: 'default',
-    version: 1,
-    status: 'active',
+/**
+ * valoresDetector reads `core_immutable.principles` directly from the profile
+ * object via a legacy cast (TODO v3.1.1 migration in valores.ts). Until the
+ * detector is migrated to read from profile_body.identity.priorities, the
+ * fixture must expose core_immutable as a top-level field alongside the
+ * canonical profile_body shape.
+ */
+function makeProfile(opts: { principles?: string[] } = {}) {
+  const base = buildProfileVersion({
+    _legacy: {
+      core_immutable: {
+        identity_block: 'Você é a Maia.',
+        principles: opts.principles ?? [
+          'Separação acima de tudo. PF é PF.',
+          'Confirme antes de agir em coisas relevantes.',
+          'Direta, não burocrática.',
+        ],
+      },
+      operational_profile: { voice_descriptor: 'pt-br', thresholds: {} },
+    },
+  });
+  // Mirror legacy top-level access that valores.ts relies on during migration.
+  return Object.assign(base, {
     core_immutable: {
       identity_block: 'Você é a Maia.',
       principles: opts.principles ?? [
@@ -43,20 +58,8 @@ function makeProfile(opts: { principles?: string[] } = {}): AgentOperationalProf
         'Confirme antes de agir em coisas relevantes.',
         'Direta, não burocrática.',
       ],
-    } as unknown,
-    operational_profile: { voice_descriptor: 'pt-br', thresholds: {} } as unknown,
-    episodic_temp: {} as unknown,
-    growth_backlog: [] as unknown,
-    proposed_by: 'system_seed',
-    proposed_reason: null,
-    approved_by: 'system_seed',
-    approved_at: now,
-    activated_at: now,
-    frozen_at: null,
-    rolled_back_at: null,
-    rollback_reason: null,
-    created_at: now,
-  } as unknown as AgentOperationalProfileVersion;
+    },
+  });
 }
 
 function makeAgentMsg(text: string, id = 'm-' + Math.random().toString(36).slice(2)): DriftRecentMessage {
