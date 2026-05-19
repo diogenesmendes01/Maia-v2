@@ -13,7 +13,7 @@ import type { KnowledgeLifecycleStatus } from '../types.js';
  * Privacy gates (Codex review PR #94 critical #2):
  *   The prompt-builder path (memoryEntryRepo.findRelevant in repositories.ts)
  *   gates rows by `needs_review=false` BEFORE handing content to the LLM.
- *   Migration 038 defaults every legacy row to lifecycle_status='active', so
+ *   Migration 041 defaults every legacy row to lifecycle_status='active', so
  *   without these gates a sensitive `needs_review=true` row would re-enter
  *   the slice. We enforce three privacy rails here:
  *     - `needs_review = false`                  (drop never-reviewed candidates)

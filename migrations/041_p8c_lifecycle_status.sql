@@ -1,8 +1,8 @@
--- 038_p8c_lifecycle_status.sql
+-- 041_p8c_lifecycle_status.sql
 -- P8c — adiciona campos do Knowledge State Machine sem remover legacy.
 -- DEFAULT 'active' preserva backward compat: tudo que já existia continua visível.
 --
--- Numbering: 036/037 reservados a P8e (#93). P8b (#95) usa 039-042.
+-- Numbering: 035 (P6) + 036/037 (P8e) + 038-040 (P8b) já tomados em main; P8c usa 041.
 -- Coordenação acordada na review de 2026-05-15.
 
 BEGIN;

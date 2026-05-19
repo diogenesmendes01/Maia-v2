@@ -11,7 +11,7 @@ import type { KnowledgeLifecycleStatus } from '../types.js';
  * Privacy gate (Codex review PR #94 critical #1):
  *   `agent_facts.valor` may carry raw candidate text whose underlying
  *   `memory_entry` is still `needs_review=true` or `mention_allowed=false`.
- *   When migration 038 backfills every legacy row to lifecycle_status='active',
+ *   When migration 041 backfills every legacy row to lifecycle_status='active',
  *   those previously hidden facts would otherwise become eligible for
  *   KnowledgeSlice. We replicate `factsRepo.listMentionableForScopes` (see
  *   `src/db/repositories.ts:832`): a `NOT EXISTS` correlated subquery on

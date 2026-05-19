@@ -1,5 +1,5 @@
--- 038_p8c_lifecycle_status_down.sql
--- Reverte 038_p8c_lifecycle_status.sql (forward-only durante janela pré-merge).
+-- 041_p8c_lifecycle_status_down.sql
+-- Reverte 041_p8c_lifecycle_status.sql (forward-only durante janela pré-merge).
 
 BEGIN;
 

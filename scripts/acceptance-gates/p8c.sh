@@ -210,12 +210,11 @@ echo "────────────────────────�
 echo ""
 
 # Gate 7: Verify migration file present in canonical location.
-# PR #94 review: renumbered 036 → 038 so P8e #93 keeps 036/037 (smaller PR,
-# higher merge priority). The acceptance gate tracks the renumbered file.
-echo "[Gate 7] Migration 038_p8c_lifecycle_status.sql present"
+# After main absorbed P8e (036/037) and P8b (038-040), P8c is renumbered to 041.
+echo "[Gate 7] Migration 041_p8c_lifecycle_status.sql present"
 echo ""
 
-MIGRATION_FILE="migrations/038_p8c_lifecycle_status.sql"
+MIGRATION_FILE="migrations/041_p8c_lifecycle_status.sql"
 if [ -f "$MIGRATION_FILE" ]; then
   for t in memory_entry agent_facts learned_rules behavioral_hint; do
     if grep -qE "ALTER TABLE $t" "$MIGRATION_FILE"; then
