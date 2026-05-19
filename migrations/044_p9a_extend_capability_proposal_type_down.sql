@@ -1,4 +1,4 @@
--- Revert 037: restore CHECK para valores antigos.
+-- Revert 044: restore CHECK para valores antigos.
 
 ALTER TABLE capability_proposals
   DROP CONSTRAINT IF EXISTS capability_proposals_capability_type_check;

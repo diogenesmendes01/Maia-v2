@@ -39,6 +39,11 @@ export const saveRuleTool: Tool<typeof inputSchema, typeof outputSchema> = {
       erros: 0,
       ativa: true,
       exemplo_origem_id: args.exemplo_origem_id ?? null,
+      lifecycle_status: 'active',
+      evidence_count: 1,
+      // PR #94 round-2: pass [] not JSON.stringify([]) — Drizzle jsonb mapper
+      // serializes; double-encoding fails the CHECK constraint.
+      lifecycle_transitions: [],
     });
     return { rule_id: r.id, status: 'probatoria' };
   },

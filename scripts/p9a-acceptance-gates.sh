@@ -1,41 +1,41 @@
 #!/bin/bash
 # P9a Acceptance Gates — Skill Abstraction
-# Run after: DB up + migrations 036/037 applied (or in CI: only static checks).
+# Run after: DB up + migrations 043/044 applied (or in CI: only static checks).
 # Note: gates that require a live DB (DB constraint checks) are guarded by
 # DATABASE_URL detection; CI without DB skips those silently.
 set -e
 
 echo "=== P9a Acceptance Gates ==="
 
-# G1: Migration 036 creates skills table
-echo "G1: Migration 036 skills table..."
-test -f migrations/036_p9a_skills.sql || { echo "FAIL: migration 036 missing"; exit 1; }
-grep -q "CREATE TABLE skills" migrations/036_p9a_skills.sql || { echo "FAIL: skills CREATE missing"; exit 1; }
-grep -q "runtime_hints" migrations/036_p9a_skills.sql || { echo "FAIL: runtime_hints column missing"; exit 1; }
+# G1: Migration 043 creates skills table
+echo "G1: Migration 043 skills table..."
+test -f migrations/043_p9a_skills.sql || { echo "FAIL: migration 043 missing"; exit 1; }
+grep -q "CREATE TABLE skills" migrations/043_p9a_skills.sql || { echo "FAIL: skills CREATE missing"; exit 1; }
+grep -q "runtime_hints" migrations/043_p9a_skills.sql || { echo "FAIL: runtime_hints column missing"; exit 1; }
 echo "OK"
 
 # G2: DEFAULT status='proposed'
 echo "G2: DEFAULT status='proposed'..."
-grep -q "DEFAULT 'proposed'" migrations/036_p9a_skills.sql || { echo "FAIL: DEFAULT 'proposed' missing"; exit 1; }
+grep -q "DEFAULT 'proposed'" migrations/043_p9a_skills.sql || { echo "FAIL: DEFAULT 'proposed' missing"; exit 1; }
 echo "OK"
 
 # G3: Partial unique "one active"
 echo "G3: Partial unique 'one active'..."
-grep -q "idx_skills_one_active_uq" migrations/036_p9a_skills.sql || { echo "FAIL: one_active partial unique missing"; exit 1; }
-grep -q "WHERE status = 'active'" migrations/036_p9a_skills.sql || { echo "FAIL: WHERE clause for partial unique missing"; exit 1; }
+grep -q "idx_skills_one_active_uq" migrations/043_p9a_skills.sql || { echo "FAIL: one_active partial unique missing"; exit 1; }
+grep -q "WHERE status = 'active'" migrations/043_p9a_skills.sql || { echo "FAIL: WHERE clause for partial unique missing"; exit 1; }
 echo "OK"
 
 # G4: Version monotônica unique
 echo "G4: Version monotônica..."
-grep -q "idx_skills_version_uq" migrations/036_p9a_skills.sql || { echo "FAIL: version unique missing"; exit 1; }
+grep -q "idx_skills_version_uq" migrations/043_p9a_skills.sql || { echo "FAIL: version unique missing"; exit 1; }
 echo "OK"
 
 # G5: 4 execution_modes CHECK
 echo "G5: execution_mode CHECK..."
-grep -q "prompt_only" migrations/036_p9a_skills.sql || { echo "FAIL"; exit 1; }
-grep -q "procedure_adapter" migrations/036_p9a_skills.sql || { echo "FAIL"; exit 1; }
-grep -q "tool_mediated" migrations/036_p9a_skills.sql || { echo "FAIL"; exit 1; }
-grep -q "evaluator" migrations/036_p9a_skills.sql || { echo "FAIL"; exit 1; }
+grep -q "prompt_only" migrations/043_p9a_skills.sql || { echo "FAIL"; exit 1; }
+grep -q "procedure_adapter" migrations/043_p9a_skills.sql || { echo "FAIL"; exit 1; }
+grep -q "tool_mediated" migrations/043_p9a_skills.sql || { echo "FAIL"; exit 1; }
+grep -q "evaluator" migrations/043_p9a_skills.sql || { echo "FAIL"; exit 1; }
 echo "OK"
 
 # G6: Drizzle schema exports skills table
@@ -91,10 +91,10 @@ test -f src/cognition/skill-proposer.ts || { echo "FAIL: skill-proposer.ts missi
 grep -q "detectAndProposeSkill" src/cognition/skill-proposer.ts || { echo "FAIL: detectAndProposeSkill missing"; exit 1; }
 echo "OK"
 
-# G13: capability_type CHECK estendido (migration 037)
+# G13: capability_type CHECK estendido (migration 044)
 echo "G13: capability_type CHECK estendido..."
-test -f migrations/037_p9a_extend_capability_proposal_type.sql || { echo "FAIL: migration 037 missing"; exit 1; }
-grep -q "'skill'" migrations/037_p9a_extend_capability_proposal_type.sql || { echo "FAIL: 'skill' not in CHECK"; exit 1; }
+test -f migrations/044_p9a_extend_capability_proposal_type.sql || { echo "FAIL: migration 044 missing"; exit 1; }
+grep -q "'skill'" migrations/044_p9a_extend_capability_proposal_type.sql || { echo "FAIL: 'skill' not in CHECK"; exit 1; }
 echo "OK"
 
 # G14: Integration with capability-revert (P5)

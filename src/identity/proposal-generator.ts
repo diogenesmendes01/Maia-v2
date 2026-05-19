@@ -49,6 +49,7 @@ export async function seedInitialOperationalProfile(args?: {
   } catch (err) {
     throw new Error(
       `seed_prompt_unavailable: ${path} (${err instanceof Error ? err.message : String(err)})`,
+      { cause: err },
     );
   }
 
@@ -70,6 +71,9 @@ export async function seedInitialOperationalProfile(args?: {
   const episodic_temp: Record<string, unknown> = {};
   const growth_backlog: unknown[] = [];
 
+  // P8d §3 — extrai priorities do mesmo markdown (Prioridades / Princípios)
+  const priorities = parsePrioritiesFromSections(sections);
+
   // 4. Two-step seed: create defaults a proposed, depois transitiona pra active.
   // TODO(v3.1.1 migration): the legacy 4-layer shape (core_immutable +
   // operational_profile + episodic_temp + growth_backlog) was collapsed into
@@ -78,17 +82,23 @@ export async function seedInitialOperationalProfile(args?: {
   // the legacy keys) keeps working at runtime. When all consumers move to the
   // new identity/style/metadata structure, this generator becomes the source
   // of truth for the migration.
+  // Review #100 fix: populate identity.identity_block and identity.principles so
+  // identity-slice-builder reads the canonical content from the canonical place.
+  // role_descriptor still mirrors identity_block (back-compat for callers that
+  // already rely on it as a denormalized label).
   const profile_body = {
     schema_version: PROFILE_BODY_SCHEMA_VERSION,
     identity: {
       role_descriptor: core_immutable.identity_block,
+      identity_block: core_immutable.identity_block,
+      principles: core_immutable.principles,
       voice: { tone: '', formality: 'medium' as const, verbosity: 'medium' as const },
       cognitive_limits: {
         max_inference_depth: 0,
         max_speculation_in_response: 0,
         confidence_floor_for_action: 0,
       },
-      priorities: principles,
+      priorities,
       learned_voice_modifiers: [],
     },
     style: { language: 'pt-BR', rhythm: {} },
@@ -125,7 +135,9 @@ export async function seedInitialOperationalProfile(args?: {
 function parseMarkdownSections(content: string): Map<string, string> {
   const sections = new Map<string, string>();
   // Match "## Title" headers e captura tudo até o próximo "## " ou EOF.
-  const regex = /^## ([^\n]+)\n([\s\S]*?)(?=^## |\Z)/gm;
+  // `(?=^## |$(?![\s\S]))` — lookahead for either the next ## header or true
+  // end-of-string (JS regex has no \Z; the `$(?![\s\S])` idiom emulates it).
+  const regex = /^## ([^\n]+)\n([\s\S]*?)(?=^## |$(?![\s\S]))/gm;
   let m: RegExpExecArray | null;
   while ((m = regex.exec(content)) !== null) {
     const title = (m[1] ?? '').trim().toLowerCase();
@@ -162,4 +174,93 @@ function extractThresholdsFromSelf(
   // Best-effort: leva o resumo + a versão legacy adiante. As fases seguintes
   // (P4 Task 7+) vão derivar thresholds estruturados via reflector.
   return { resumo: self.resumo_aprendizados, versao_legacy: self.versao };
+}
+
+// ============================================================================
+// P8d §3 — priorities extraction (determinístico, sem LLM)
+// ============================================================================
+
+/**
+ * Slug snake_case válido: começa com letra, [a-z0-9_], 3-80 chars.
+ * Justifica `papel_drift` matching contra slugs.
+ */
+const PRIORITY_SLUG_RE = /^[a-z][a-z0-9_]{2,79}$/;
+
+/**
+ * Versão exportada — recebe o markdown bruto e devolve as prioridades
+ * inferidas. Wrapper sobre `parsePrioritiesFromSections` para reuse pelo
+ * script de migração de dados (§8) que precisa lidar com o markdown direto
+ * de `maia-prompt.md`.
+ *
+ * Usa um parser local `parseAllSections` (lida corretamente com seção final
+ * sem `## ` posterior, ao contrário de `parseMarkdownSections` que depende
+ * de `\Z` PCRE-only).
+ */
+export function parsePrioritiesFromMarkdown(markdown: string): string[] {
+  return parsePrioritiesFromSections(parseAllSections(markdown));
+}
+
+/**
+ * Parser de seções `## Title` robusto a EOF — itera sobre headers achados,
+ * captura o body de cada um até o próximo header ou fim do arquivo. Necessário
+ * porque `parseMarkdownSections` (legado P4) usa `\Z` que não existe em JS regex
+ * e por isso não captura a última seção.
+ */
+function parseAllSections(content: string): Map<string, string> {
+  const sections = new Map<string, string>();
+  const headerRe = /^## ([^\n]+)$/gm;
+  const headers: { title: string; bodyStart: number; headerStart: number }[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = headerRe.exec(content)) !== null) {
+    headers.push({
+      title: (m[1] ?? '').trim().toLowerCase(),
+      bodyStart: headerRe.lastIndex + 1, // skip newline after header
+      headerStart: m.index,
+    });
+  }
+  for (let i = 0; i < headers.length; i++) {
+    const h = headers[i]!;
+    const next = headers[i + 1];
+    const body = content.slice(h.bodyStart, next ? next.headerStart : content.length).trim();
+    sections.set(h.title, body);
+  }
+  return sections;
+}
+
+/**
+ * Extrai prioridades dado o mapa de seções já parseado.
+ * Ordem de precedência:
+ *   1. ## Prioridades (lista numerada → slug)
+ *   2. ## Princípios (primeiras 3 entradas → slugifyFirstSentence)
+ * Filtra slugs malformados; respeita máx 5; devolve [] em qualquer falha.
+ */
+function parsePrioritiesFromSections(sections: Map<string, string>): string[] {
+  const explicit = parseNumberedList(sections.get('prioridades') ?? '')
+    .map((s) => slugify(s))
+    .filter((s) => PRIORITY_SLUG_RE.test(s));
+  if (explicit.length > 0) return explicit.slice(0, 5);
+
+  const principles = parseNumberedList(
+    sections.get('princípios') ?? sections.get('principios') ?? '',
+  );
+  return principles
+    .slice(0, 3)
+    .map((line) => slugifyFirstSentence(line))
+    .filter((s) => PRIORITY_SLUG_RE.test(s));
+}
+
+function slugify(text: string): string {
+  return text
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 80);
+}
+
+function slugifyFirstSentence(line: string): string {
+  // Pega só a primeira sentença/oração (até `.` ou `,`).
+  const head = line.split(/[.,]/)[0] ?? line;
+  return slugify(head);
 }

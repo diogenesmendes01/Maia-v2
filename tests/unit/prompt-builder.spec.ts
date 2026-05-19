@@ -21,6 +21,10 @@ const h = vi.hoisted(() => ({
   recentInConversation: vi.fn(),
   entidadesByIds: vi.fn(),
   factsListForScopes: vi.fn(),
+  // P82-C1: prompt-builder now routes through the sensitivity-filtered facts
+  // accessor. Mock matches the production signature: same input shape, same
+  // return type (AgentFact[]).
+  factsListMentionableForScopes: vi.fn(),
   rulesListActive: vi.fn(),
   entityStatesById: vi.fn(),
 }));
@@ -29,7 +33,10 @@ vi.mock('../../src/db/repositories.js', () => ({
   selfStateRepo: { getActive: h.selfStateGetActive },
   mensagensRepo: { recentInConversation: h.recentInConversation },
   entidadesRepo: { byIds: h.entidadesByIds },
-  factsRepo: { listForScopes: h.factsListForScopes },
+  factsRepo: {
+    listForScopes: h.factsListForScopes,
+    listMentionableForScopes: h.factsListMentionableForScopes,
+  },
   rulesRepo: { listActive: h.rulesListActive },
   entityStatesRepo: { byId: h.entityStatesById },
 }));
@@ -167,6 +174,7 @@ beforeEach(() => {
   h.recentInConversation.mockResolvedValue([]);
   h.entidadesByIds.mockResolvedValue([]);
   h.factsListForScopes.mockResolvedValue([]);
+  h.factsListMentionableForScopes.mockResolvedValue([]);
   h.rulesListActive.mockResolvedValue([]);
   h.entityStatesById.mockResolvedValue(null);
 });

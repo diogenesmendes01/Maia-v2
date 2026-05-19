@@ -1,4 +1,4 @@
--- Down de 036: drop integral.
+-- Down de 043: drop integral.
 
 DROP INDEX IF EXISTS idx_skills_proposed;
 DROP INDEX IF EXISTS idx_skills_one_active_uq;

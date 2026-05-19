@@ -1,45 +1,228 @@
 /**
- * P9a stub — PolicyDescriptorResolver (PEP/PDP em P8e PR #93).
+ * P8e — PolicyDescriptorResolver: single canonical path
+ * `string descriptor → active (policy_id, version)` for the 6 hot-path
+ * call sites (master §0.3, §2.2):
+ *   1. policy-slice-builder.ts (P8d)
+ *   2. SkillRunner (resolve skill.policy_descriptors at runtime)
+ *   3. Early PEP
+ *   4. Mid PEP
+ *   5. Late PEP
+ *   6. Trace writer
  *
- * Esta é uma implementação minimalista enquanto P8e não está mergeado.
- * Quando P8e for integrado, substituir o conteúdo deste arquivo pela
- * implementação real (mesma forma de `resolveDescriptors`).
+ * Architecture Lock: resolver lives in src/control-plane/policy/. NOT
+ * importable from src/agent/ or src/cognition/ (callers go through
+ * slice builders or PEPs). Enforced by lint rule + code review.
  *
- * Comportamento atual:
- *  - Sempre retorna `{ resolved: [], unresolved: [] }` se não há descriptors
- *  - Para cada descriptor passado, retorna unresolved (sem decidir effect),
- *    com motivo `p8e_resolver_not_yet_merged` — assim o SkillRunner sabe
- *    que descriptors existem mas não pode aplicá-los; default é allow.
+ * Behavior:
+ *   - Cache hit: returns immediately (positive or 'unresolved').
+ *   - Cache miss: repo.findActiveByDescriptor (agent-specific override),
+ *     scope filter, cache write, return.
+ *   - Invariant: resolved.length + unresolved.length === input.descriptors.length
  *
- * TODO(P8e merge): substituir por `import { policyDescriptorResolver } from
- * './policy-descriptor-resolver-impl.js'`.
+ * NO DSL evaluation here. rule_body stays opaque; P9d will read it.
  */
-import type { PolicyResolutionResult } from '@/skills/types.js';
-
-export interface ResolveDescriptorsArgs {
-  tenant_id: string;
-  descriptors: string[];
-  scope?: {
-    skill_category?: string;
-    [key: string]: unknown;
-  };
-}
+import type { PolicyRulesRepo } from './policy-rules-repo.js';
+import { policyRulesRepo } from './policy-rules-repo.js';
+import { policyResolverCache } from './policy-cache.js';
+import type { PolicyResolverCache, CacheKey } from './policy-cache.js';
+import { logger } from '@/lib/logger.js';
+import { getCurrentTenant } from '@/db/tenant-context.js';
+import type {
+  PolicyDescriptorResolverInput,
+  PolicyDescriptorResolverOutput,
+  PolicyRule,
+  PolicyRuleScope,
+  ResolvedPolicy,
+  UnresolvedDescriptor,
+} from './types.js';
+import { RESOLVER_FAILURE_DEFAULT } from './types.js';
 
 export interface PolicyDescriptorResolver {
-  resolveDescriptors(args: ResolveDescriptorsArgs): Promise<PolicyResolutionResult>;
+  resolveDescriptors(
+    input: PolicyDescriptorResolverInput,
+  ): Promise<PolicyDescriptorResolverOutput>;
 }
 
-export const policyDescriptorResolver: PolicyDescriptorResolver = {
-  async resolveDescriptors(args): Promise<PolicyResolutionResult> {
-    if (!args.descriptors || args.descriptors.length === 0) {
-      return { resolved: [], unresolved: [] };
+/**
+ * Match-by-omission semantics:
+ *   - rule.scope empty {}: matches any input.scope (universal).
+ *   - rule.scope set: every set key in rule.scope must equal the same key
+ *     in input.scope. Missing keys in input.scope -> no match.
+ */
+export function matchesScope(
+  ruleScope: PolicyRuleScope,
+  inputScope?: PolicyRuleScope,
+): boolean {
+  const ruleKeys = Object.entries(ruleScope).filter(
+    ([, v]) => v !== undefined && v !== null && v !== '',
+  );
+  if (ruleKeys.length === 0) return true;
+  if (!inputScope) return false;
+  for (const [k, v] of ruleKeys) {
+    if (inputScope[k] !== v) return false;
+  }
+  return true;
+}
+
+export class PolicyDescriptorResolverImpl implements PolicyDescriptorResolver {
+  constructor(
+    private readonly repo: PolicyRulesRepo,
+    private readonly cache: PolicyResolverCache,
+  ) {}
+
+  async resolveDescriptors(
+    input: PolicyDescriptorResolverInput,
+  ): Promise<PolicyDescriptorResolverOutput> {
+    const resolved: ResolvedPolicy[] = [];
+    const unresolved: string[] = [];
+    const failures: UnresolvedDescriptor[] = [];
+
+    const agent_id = input.agent_id ?? null;
+    const scope = input.scope ?? {};
+
+    // Tenant context cross-check (Codex #93 finding): if the caller's
+    // declared tenant_id disagrees with the active AsyncLocalStorage tenant
+    // context, refuse the whole batch as a programming error. The repo
+    // would otherwise silently use the active context and a leaked
+    // resolver call could query the wrong tenant. We surface it as
+    // typed failures so callers fail closed (block) per
+    // RESOLVER_FAILURE_DEFAULT.
+    let activeTenant: string | undefined;
+    try {
+      activeTenant = getCurrentTenant();
+    } catch {
+      activeTenant = undefined;
     }
-    return {
-      resolved: [],
-      unresolved: args.descriptors.map((d) => ({
-        descriptor: d,
-        reason: 'p8e_resolver_not_yet_merged',
-      })),
-    };
-  },
-};
+    if (activeTenant && activeTenant !== input.tenant_id) {
+      logger.warn(
+        {
+          declared_tenant: input.tenant_id,
+          active_tenant: activeTenant,
+          descriptors: input.descriptors,
+          failure_default: RESOLVER_FAILURE_DEFAULT,
+        },
+        'policy_resolver.tenant_mismatch',
+      );
+      for (const descriptor of input.descriptors) {
+        unresolved.push(descriptor);
+        failures.push({ descriptor, reason: 'tenant_mismatch' });
+      }
+      return { resolved, unresolved, failures };
+    }
+
+    for (const descriptor of input.descriptors) {
+      const key: CacheKey = {
+        tenant_id: input.tenant_id,
+        agent_id,
+        descriptor,
+        scope,
+      };
+
+      // 1) cache lookup
+      const cached = this.cache.get(key);
+      if (cached === 'unresolved') {
+        unresolved.push(descriptor);
+        failures.push({ descriptor, reason: 'not_found' });
+        continue;
+      }
+      if (cached) {
+        resolved.push(cached);
+        continue;
+      }
+
+      // 2) repo lookup — fetch agent-specific AND tenant-wide candidates so
+      //    scope is applied to each independently (round-2 Codex #93 finding:
+      //    a scoped agent-specific row must not suppress a universal tenant-wide
+      //    row when the agent row fails scope for the current request).
+      let candidates: PolicyRule[];
+      try {
+        candidates = await this.repo.findActiveCandidates({
+          descriptor,
+          agent_id: input.agent_id ?? null,
+        });
+      } catch (err) {
+        // Fail-closed contract (Codex review #93): a repo error is NOT a
+        // miss. Surface a typed `db_error` reason so callers can BLOCK
+        // (RESOLVER_FAILURE_DEFAULT='block'). We do NOT cache this — a
+        // transient outage shouldn't pin "no policy" for ttl_ms.
+        logger.error(
+          {
+            err: (err as Error).message,
+            tenant_id: input.tenant_id,
+            agent_id: input.agent_id ?? null,
+            descriptor,
+            failure_default: RESOLVER_FAILURE_DEFAULT,
+          },
+          'policy_resolver.db_error_fail_closed',
+        );
+        unresolved.push(descriptor);
+        failures.push({ descriptor, reason: 'db_error' });
+        continue;
+      }
+
+      // 3) scope filter: prefer first candidate that passes scope.
+      //    Candidates are ordered: agent-specific first, then tenant-wide.
+      //    Cache unresolved only after ALL candidates fail.
+      const matched = candidates.find((c) => matchesScope(c.scope, input.scope));
+
+      if (!matched && candidates.length === 0) {
+        this.cache.setUnresolved(key);
+        unresolved.push(descriptor);
+        failures.push({ descriptor, reason: 'not_found' });
+        continue;
+      }
+
+      if (!matched) {
+        // At least one candidate existed but none passed scope.
+        this.cache.setUnresolved(key);
+        unresolved.push(descriptor);
+        failures.push({ descriptor, reason: 'scope_mismatch' });
+        continue;
+      }
+
+      const r: ResolvedPolicy = {
+        descriptor,
+        policy_id: matched.id,
+        version: matched.version,
+        rule_kind: matched.rule_kind,
+      };
+      this.cache.set(key, r);
+      resolved.push(r);
+    }
+
+    return { resolved, unresolved, failures };
+  }
+}
+
+/**
+ * Helper for PEP / slice-builder callers (Codex review #93): returns true
+ * iff the resolver output contains at least one descriptor that the caller
+ * MUST block on. `db_error` and `tenant_mismatch` are always blocking;
+ * `not_found` and `scope_mismatch` are NOT (caller decides based on the
+ * descriptor's role).
+ *
+ * Pin the failure default at the call site: never inline `'block'` — read
+ * RESOLVER_FAILURE_DEFAULT. That way changing the invariant requires
+ * touching one constant + sweeping tests, never grepping for strings.
+ */
+export function hasBlockingFailure(output: PolicyDescriptorResolverOutput): boolean {
+  return output.failures.some(
+    (f) => f.reason === 'db_error' || f.reason === 'tenant_mismatch',
+  );
+}
+
+/**
+ * Singleton: hot-path resolver wired to the singleton repo + cache.
+ */
+export const policyDescriptorResolver: PolicyDescriptorResolver =
+  new PolicyDescriptorResolverImpl(policyRulesRepo, policyResolverCache);
+
+/**
+ * Factory for tests: pass mocks of the repo / cache.
+ */
+export function createPolicyDescriptorResolver(
+  repo: PolicyRulesRepo,
+  cache: PolicyResolverCache,
+): PolicyDescriptorResolver {
+  return new PolicyDescriptorResolverImpl(repo, cache);
+}

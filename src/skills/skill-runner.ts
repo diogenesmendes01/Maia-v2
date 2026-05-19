@@ -234,21 +234,53 @@ export async function runSkill(input: SkillExecutionInput): Promise<SkillExecuti
     };
   }
 
-  // Gate 4: resolve policy descriptors
+  // Gate 4: resolve policy descriptors via P8e PolicyDescriptorResolver.
+  // The P8e resolver returns a typed shape (`PolicyDescriptorResolverOutput`)
+  // with `resolved: ResolvedPolicy[]` (no effect/evaluator — those are part
+  // of P9d's DSL evaluator) and `unresolved: string[]` + `failures` (typed
+  // reasons). We bridge to the local `ResolvedPolicyDescriptor` shape used
+  // by applyPoliciesPreSkill. Until P9d, descriptors that resolve get
+  // `effect: 'noop'` by default — applyPoliciesPreSkill won't BLOCK on
+  // bare hard_limit without an evaluator.
   const tenantId = getCurrentTenant();
+  const currentAgentId = getCurrentAgent();
   const descriptors = (skill.policy_descriptors ?? []) as string[];
-  const policiesResolution = await policyDescriptorResolver.resolveDescriptors({
+  const p8eOutputRaw = await policyDescriptorResolver.resolveDescriptors({
     tenant_id: tenantId,
+    agent_id: currentAgentId,
     descriptors,
-    scope: { skill_category: skill.category, agent_id: getCurrentAgent() },
+    scope: { skill_category: skill.category },
   });
-  const resolvedPolicyIds = policiesResolution.resolved.map((p) => p.policy_id);
+  // Defensive cast: tests mock the resolver and may include legacy fields
+  // (effect, evaluator, reason) on resolved entries. We accept those as
+  // pass-through so existing P9a unit tests keep covering the post-Gate-4
+  // flow until P9d delivers the real effect-resolution.
+  const p8eOutput = p8eOutputRaw as unknown as {
+    resolved: Array<Partial<ResolvedPolicyDescriptor> & {
+      policy_id: string;
+      descriptor: string;
+      rule_kind?: string;
+    }>;
+    unresolved: Array<string | { descriptor: string; reason?: string }>;
+    failures?: Array<{ descriptor: string; reason: string }>;
+  };
+  const resolvedPolicies: ResolvedPolicyDescriptor[] = p8eOutput.resolved.map((p) => ({
+    policy_id: p.policy_id,
+    descriptor: p.descriptor,
+    effect: p.effect ?? 'noop',
+    reason: p.reason,
+    rule_kind: p.rule_kind === 'hard_limit' ? 'hard_limit' : p.rule_kind === 'soft' ? 'soft' : undefined,
+    evaluator: p.evaluator,
+  }));
+  const resolvedPolicyIds = resolvedPolicies.map((p) => p.policy_id);
 
   // Fail-closed: if the skill declares policy_descriptors and any descriptor
   // is unresolved, BLOCK execution (review #99 finding 2). This prevents
   // the resolver stub / future bugs from silently degrading enforcement.
-  if (descriptors.length > 0 && policiesResolution.unresolved.length > 0) {
-    const unresolvedNames = policiesResolution.unresolved.map((u) => u.descriptor).join(', ');
+  if (descriptors.length > 0 && p8eOutput.unresolved.length > 0) {
+    const unresolvedNames = p8eOutput.unresolved
+      .map((u) => (typeof u === 'string' ? u : u.descriptor))
+      .join(', ');
     return {
       ok: false,
       reason: 'unresolved_policy',
@@ -260,7 +292,7 @@ export async function runSkill(input: SkillExecutionInput): Promise<SkillExecuti
   }
 
   // Gate 4.5: apply policies pre-skill (early block).
-  const policyDecision = applyPoliciesPreSkill(policiesResolution.resolved, {
+  const policyDecision = applyPoliciesPreSkill(resolvedPolicies, {
     skill,
     input: input.input,
   });
@@ -324,7 +356,7 @@ export async function runSkill(input: SkillExecutionInput): Promise<SkillExecuti
       const modeOutput = await modeHandler({
         skill: skill!,
         input: input.input,
-        resolvedPolicies: policiesResolution.resolved,
+        resolvedPolicies,
         conversa_id: input.conversa_id,
         turno_id: input.turno_id,
         signal: abortController.signal,

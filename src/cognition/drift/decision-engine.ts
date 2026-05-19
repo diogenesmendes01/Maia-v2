@@ -58,6 +58,29 @@ function decisionForSeverity(s: DriftSeverity): DriftDecision {
   }
 }
 
+/**
+ * P8b — soul_drift NUNCA promove rollback de profile (spec §5.4):
+ *  - BAIXO   → auto_approved (log only)
+ *  - MEDIO   → queued_human
+ *  - ALTO    → queued_human (cap; sem frozen)
+ *  - CRITICO → queued_human (cap; com Admin UI banner downstream)
+ *
+ * Diferença em relação aos 7 detectores anteriores: soul detection é sinal
+ * de *aderência*, não de violação de identity/policy. A bias modula; ela
+ * NUNCA gera gate de execução. O remediation correto é proposal review
+ * pelo owner, não rollback automático.
+ */
+function decisionForSoulDriftSeverity(s: DriftSeverity): DriftDecision {
+  switch (s) {
+    case DriftSeverity.BAIXO:
+      return DriftDecision.AUTO_APPROVED;
+    case DriftSeverity.MEDIO:
+    case DriftSeverity.ALTO:
+    case DriftSeverity.CRITICO:
+      return DriftDecision.QUEUED_HUMAN;
+  }
+}
+
 const VALID_SEVERITIES: readonly string[] = [
   DriftSeverity.BAIXO,
   DriftSeverity.MEDIO,
@@ -135,6 +158,50 @@ export function classifySeverity(ev: DriftEvidence): DriftSeverity {
       if (hint !== null) return hint;
       return DriftSeverity.BAIXO;
     }
+    case DriftType.SOUL_DRIFT: {
+      // P8b — soul_drift severity = quantidade de violações de soul biases (spec §5.4).
+      // Hint do detector wins quando >= 2 (CRITICO requer hint).
+      const violationsRaw = (p as { violations?: unknown }).violations;
+      const violations = Array.isArray(violationsRaw) ? violationsRaw : [];
+      if (hint === DriftSeverity.CRITICO) return DriftSeverity.CRITICO;
+      if (violations.length >= 5) return DriftSeverity.ALTO;
+      if (violations.length >= 2) return DriftSeverity.MEDIO;
+      if (hint !== null) return hint;
+      return DriftSeverity.BAIXO;
+    }
+    case DriftType.PAPEL_DRIFT: {
+      // P8d §7 — floor rules determinísticas. Conservadoras: 3+ exemplos
+      // são piso `alto`; rolesDiverge + 3+ é `critico`. Hint só age se
+      // nenhuma regra-piso disparou.
+      const offRoleRaw = (p as { off_role_examples?: unknown }).off_role_examples;
+      const offRole = Array.isArray(offRoleRaw) ? offRoleRaw : [];
+      const observed = (p as { observed_role_inferred?: unknown }).observed_role_inferred;
+      const declared = (p as { declared_role?: unknown }).declared_role;
+
+      // rolesDiverge requires BOTH sides to be validated role slugs (snake_case,
+      // no spaces). Free-text prose descriptors (role_descriptor from seed) are
+      // NOT slugs — comparing prose prefixes against role ids produces false
+      // positives that promote normal alto drift to critico/rollback.
+      // A valid slug: word chars + underscores only, at least one underscore
+      // (e.g. "atendimento_financeiro_pf"), no spaces.
+      const SLUG_RE = /^\w+(_\w+)+$/;
+      const rolesDiverge =
+        typeof observed === 'string' &&
+        typeof declared === 'string' &&
+        SLUG_RE.test(observed.trim()) &&
+        SLUG_RE.test(declared.trim()) &&
+        !observed.toLowerCase().includes(
+          (declared.toLowerCase().split('_')[0] ?? ''),
+        );
+
+      if (offRole.length >= 5 || (rolesDiverge && offRole.length >= 3))
+        return DriftSeverity.CRITICO;
+      if (offRole.length >= 3) return DriftSeverity.ALTO;
+      if (offRole.length === 2) return DriftSeverity.MEDIO;
+      if (offRole.length === 1) return DriftSeverity.BAIXO;
+      if (hint !== null) return hint;
+      return DriftSeverity.BAIXO;
+    }
     default:
       // unknown drift_type — defensivo
       return hint !== null ? hint : DriftSeverity.BAIXO;
@@ -154,28 +221,28 @@ export async function decideAndApply(args: {
 
   for (const ev of args.evidences) {
     const severity = classifySeverity(ev);
-    const decision = decisionForSeverity(severity);
+    // P8b: soul_drift maps to a DIFFERENT decision table — it NEVER promotes
+    // frozen/rollback because soul biases modulate (not gate) behavior.
+    const decision =
+      ev.drift_type === DriftType.SOUL_DRIFT
+        ? decisionForSoulDriftSeverity(severity)
+        : decisionForSeverity(severity);
 
     let applied = false;
     let applied_error: string | undefined;
-
-    if (decision === DriftDecision.FROZEN || decision === DriftDecision.ROLLBACK) {
-      try {
-        const r = await operationalProfileVersionsRepo.transition({
-          id: args.active_profile_id,
-          to: decision === DriftDecision.FROZEN ? 'frozen' : 'rolled_back',
-          approved_by: `auto:drift_${severity}`,
-          rollback_reason:
-            decision === DriftDecision.ROLLBACK ? ev.evidence_summary : undefined,
-        });
-        applied = r.ok;
-        if (!r.ok) applied_error = r.reason;
-      } catch (e) {
-        applied_error = e instanceof Error ? e.message : String(e);
-      }
-    }
-
     let alert_id: string | undefined;
+
+    // Review #100: persist alert BEFORE attempting transition. The prior
+    // ordering (transition → alert) could freeze/rollback the profile and
+    // then crash on alert insert (e.g. CHECK constraint rejecting a new
+    // drift_type without the matching migration). That left profile state
+    // mutated without any audit row explaining why. By going alert-first:
+    //   - if alert insert fails, no profile mutation happens (decision
+    //     surfaces as alert_persist_failed via applied_error and the
+    //     transition is skipped — Postgres CHECK violation is the canonical
+    //     case migration 042 prevents);
+    //   - if transition fails after the alert is in, the alert still
+    //     captures decision/severity so the operator sees what was tried.
     try {
       const alert = await driftAlertsRepo.create({
         profile_version_id: args.active_profile_id,
@@ -189,8 +256,31 @@ export async function decideAndApply(args: {
       alert_id = alert.id;
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      applied_error =
-        (applied_error ? applied_error + '; ' : '') + 'alert_persist_failed:' + msg;
+      applied_error = 'alert_persist_failed:' + msg;
+    }
+
+    // Only mutate profile state if we have a persisted audit row. This is
+    // the invariant: every freeze/rollback applied by the engine MUST have
+    // a matching agent_drift_alerts row visible after the fact.
+    // P8b: soul_drift NEVER touches the profile, regardless of severity.
+    if (
+      alert_id &&
+      ev.drift_type !== DriftType.SOUL_DRIFT &&
+      (decision === DriftDecision.FROZEN || decision === DriftDecision.ROLLBACK)
+    ) {
+      try {
+        const r = await operationalProfileVersionsRepo.transition({
+          id: args.active_profile_id,
+          to: decision === DriftDecision.FROZEN ? 'frozen' : 'rolled_back',
+          approved_by: `auto:drift_${severity}`,
+          rollback_reason:
+            decision === DriftDecision.ROLLBACK ? ev.evidence_summary : undefined,
+        });
+        applied = r.ok;
+        if (!r.ok) applied_error = r.reason;
+      } catch (e) {
+        applied_error = e instanceof Error ? e.message : String(e);
+      }
     }
 
     results.push({

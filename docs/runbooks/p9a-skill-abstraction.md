@@ -18,7 +18,7 @@ Sempre `proposed → approved → active`.
 
 - **Feature flag:** `FEATURE_SKILL_REGISTRY_V1` (default OFF). Set
   `FEATURE_SKILL_REGISTRY_V1=true` no `.env` para habilitar `runSkill`.
-- **Migrações:** `036_p9a_skills.sql`, `037_p9a_extend_capability_proposal_type.sql`.
+- **Migrações:** `043_p9a_skills.sql`, `044_p9a_extend_capability_proposal_type.sql`.
 - **Source of Truth:** tabela `skills` (15 cols + lifecycle metadata).
 - **Executor:** `src/skills/skill-runner.ts` + 4 modes em `src/skills/modes/`.
 - **Proposer:** `src/cognition/skill-proposer.ts` (batch async).
@@ -221,11 +221,11 @@ unset FEATURE_SKILL_REGISTRY_V1   # ou setar 'false'
 ### Rollback de migrations
 
 ```bash
-psql "$DATABASE_URL" -f migrations/037_p9a_extend_capability_proposal_type_down.sql
-psql "$DATABASE_URL" -f migrations/036_p9a_skills_down.sql
+psql "$DATABASE_URL" -f migrations/044_p9a_extend_capability_proposal_type_down.sql
+psql "$DATABASE_URL" -f migrations/043_p9a_skills_down.sql
 ```
 
-A `down` de 037 restaura o CHECK antigo de `capability_type` — atenção: se
+A `down` de 044 restaura o CHECK antigo de `capability_type` — atenção: se
 houver `capability_proposals.capability_type='skill'` no banco, o `down` falhará
 até esses registros serem removidos.
 
