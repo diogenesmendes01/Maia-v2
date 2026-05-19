@@ -29,11 +29,13 @@ const events: any[] = [];
 const tenantsState: Array<{ id: string; nome: string; status: string }> = [];
 
 // ---------- Anthropic SDK mock (cenário 4: llm_judge) ----------
-const messagesCreateMock = vi.fn();
+const { messagesCreateMock } = vi.hoisted(() => ({
+  messagesCreateMock: vi.fn(),
+}));
 vi.mock('@anthropic-ai/sdk', () => {
-  const Anthropic = vi.fn().mockImplementation(() => ({
-    messages: { create: messagesCreateMock },
-  }));
+  const Anthropic = vi.fn(function (this: unknown) {
+    return { messages: { create: messagesCreateMock } };
+  });
   return { default: Anthropic };
 });
 

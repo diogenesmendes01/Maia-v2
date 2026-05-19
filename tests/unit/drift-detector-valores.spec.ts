@@ -9,12 +9,14 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { AgentOperationalProfileVersion } from '@/db/schema.js';
 import type { DriftRecentMessage } from '@/cognition/drift/types.js';
 
-const messagesCreateMock = vi.fn();
+const { messagesCreateMock } = vi.hoisted(() => ({
+  messagesCreateMock: vi.fn(),
+}));
 
 vi.mock('@anthropic-ai/sdk', () => {
-  const Anthropic = vi.fn().mockImplementation(() => ({
-    messages: { create: messagesCreateMock },
-  }));
+  const Anthropic = vi.fn(function (this: unknown) {
+    return { messages: { create: messagesCreateMock } };
+  });
   return { default: Anthropic };
 });
 
