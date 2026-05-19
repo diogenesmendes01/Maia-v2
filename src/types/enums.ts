@@ -63,8 +63,47 @@ export const DriftType = {
   ESCOPO: 'escopo',
   LINGUAGEM: 'linguagem',
   PROCEDIMENTO: 'procedimento',
+  // P8b: 8º tipo de drift — aderência a Soul Biases ativas no contexto.
+  // Severidade NUNCA força rollback de profile (apenas queued_human).
+  SOUL_DRIFT: 'soul_drift',
 } as const;
 export type DriftType = typeof DriftType[keyof typeof DriftType];
+
+/**
+ * P8b — Origem de uma Soul Bias (governance class).
+ * `learned_strong_evidence` NUNCA pode sobrescrever Identity (origin gate, §7).
+ */
+export const SoulOrigin = {
+  FOUNDER_EXPLICIT: 'founder_explicit',
+  HUMAN_APPROVED: 'human_approved',
+  TENANT_CULTURE_EXPLICIT: 'tenant_culture_explicit',
+  LEARNED_STRONG_EVIDENCE: 'learned_strong_evidence',
+} as const;
+export type SoulOrigin = typeof SoulOrigin[keyof typeof SoulOrigin];
+
+/**
+ * P8b — Escopo de aplicabilidade da Soul Bias.
+ * Define onde a bias entra em consideração no slice builder.
+ */
+export const SoulScope = {
+  TENANT: 'tenant',
+  AGENT: 'agent',
+  ROLE: 'role',
+  DOMAIN: 'domain',
+} as const;
+export type SoulScope = typeof SoulScope[keyof typeof SoulScope];
+
+/**
+ * P8b — Ciclo de vida da Soul Bias (state machine).
+ * DEFAULT 'proposed' no DB para impedir nascimento active por acidente.
+ */
+export const SoulBiasStatus = {
+  PROPOSED: 'proposed',
+  ACTIVE: 'active',
+  DEPRECATED: 'deprecated',
+  ROLLED_BACK: 'rolled_back',
+} as const;
+export type SoulBiasStatus = typeof SoulBiasStatus[keyof typeof SoulBiasStatus];
 
 /**
  * P4 — Severidade de drift detectado, define limiar de ação.
@@ -257,5 +296,9 @@ export const FeatureFlagName = {
   COGNITIVE_GRAPH: 'cognitive_graph',
   // P8c — User Layer namespace (depth-scoped slice builders + facade resolvers)
   P8C_USER_LAYER_NAMESPACE_V1: 'P8C_USER_LAYER_NAMESPACE_V1',
+  // P8b — Soul Layer (persistent behavioral biases que modulam, nunca bloqueiam)
+  FEATURE_SOUL_LAYER_V1: 'FEATURE_SOUL_LAYER_V1',
+  // P8e — PolicyDescriptorResolver + policy_rules (Source of Truth versionada)
+  POLICY_RESOLVER_V1: 'POLICY_RESOLVER_V1',
 } as const;
 export type FeatureFlagName = typeof FeatureFlagName[keyof typeof FeatureFlagName];
