@@ -9,8 +9,10 @@ import {
 import { featureFlags } from '@/config/feature-flags.js';
 
 describe('P4 enums', () => {
-  it('DriftType has 7 values', () => {
-    expect(Object.values(DriftType)).toHaveLength(7);
+  // P4 baseline: 7 detectores (tom, valores, confianca, vies, escopo, linguagem, procedimento).
+  // P8b adicionou SOUL_DRIFT (8º). P8d adicionou PAPEL_DRIFT (9º).
+  it('DriftType has 9 values (P4 baseline + P8b soul_drift + P8d papel_drift)', () => {
+    expect(Object.values(DriftType)).toHaveLength(9);
   });
   it('DriftSeverity has 4 values', () => {
     expect(Object.values(DriftSeverity)).toHaveLength(4);

@@ -33,10 +33,10 @@ echo ""
 echo "Preconditions"
 test -f src/db/schema.ts && pass "schema.ts present" || fail "schema.ts missing"
 test -f src/db/repositories.ts && pass "repositories.ts present" || fail "repositories.ts missing"
-test -f migrations/038_admin_users_sessions.sql && pass "038 migration present" || fail "038 migration missing"
-test -f migrations/039_admin_proposal_approvals.sql && pass "039 migration present" || fail "039 migration missing"
-test -f migrations/040_admin_audit_log.sql && pass "040 migration present" || fail "040 migration missing"
-test -f migrations/041_admin_debug_snapshot_grants.sql && pass "041 migration present" || fail "041 migration missing"
+test -f migrations/045_admin_users_sessions.sql && pass "045 migration present" || fail "045 migration missing"
+test -f migrations/046_admin_proposal_approvals.sql && pass "046 migration present" || fail "046 migration missing"
+test -f migrations/047_admin_audit_log.sql && pass "047 migration present" || fail "047 migration missing"
+test -f migrations/048_admin_debug_snapshot_grants.sql && pass "048 migration present" || fail "048 migration missing"
 test -f src/admin-ui/next.config.mjs && pass "next.config.mjs present" || fail "next.config.mjs missing"
 test -f src/admin-ui/trpc/routers/_app.ts && pass "appRouter present" || fail "appRouter missing"
 test -f src/admin-ui/lib/approval-matrix.ts && pass "approval-matrix present" || fail "approval-matrix missing"
@@ -87,7 +87,7 @@ npx vitest run tests/admin-ui/unit/audit-append-only.spec.ts > /tmp/p8.5-audit.l
 
 echo ""
 echo "Gate 6: Migrations syntax check (down/up files exist)"
-for m in 038_admin_users_sessions 039_admin_proposal_approvals 040_admin_audit_log 041_admin_debug_snapshot_grants; do
+for m in 045_admin_users_sessions 046_admin_proposal_approvals 047_admin_audit_log 048_admin_debug_snapshot_grants; do
   test -f "migrations/${m}.sql" && test -f "migrations/${m}_down.sql" \
     || fail "Gate 6: ${m} missing up or down"
 done

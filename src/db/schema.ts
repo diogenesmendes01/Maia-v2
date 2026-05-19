@@ -223,6 +223,10 @@ export const agent_facts = pgTable(
     confianca: numeric('confianca', { precision: 3, scale: 2 }).notNull().default('1.00'),
     fonte: text('fonte').notNull().default('aprendido'),
     ultima_validacao: timestamp('ultima_validacao', { withTimezone: true }),
+    // P8c — Knowledge State Machine columns (migration 036)
+    lifecycle_status: text('lifecycle_status').notNull().default('active'),
+    evidence_count: integer('evidence_count').notNull().default(1),
+    lifecycle_transitions: jsonb('lifecycle_transitions').notNull().default(sql`'[]'::jsonb`),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -250,6 +254,10 @@ export const learned_rules = pgTable('learned_rules', {
   erros: integer('erros').notNull().default(0),
   ativa: boolean('ativa').notNull().default(true),
   exemplo_origem_id: uuid('exemplo_origem_id'),
+  // P8c — Knowledge State Machine columns (migration 036)
+  lifecycle_status: text('lifecycle_status').notNull().default('active'),
+  evidence_count: integer('evidence_count').notNull().default(1),
+  lifecycle_transitions: jsonb('lifecycle_transitions').notNull().default(sql`'[]'::jsonb`),
   created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 });
@@ -690,6 +698,11 @@ export const memory_entry = pgTable(
     needs_review: boolean('needs_review').notNull().default(false),
     source_event_id: uuid('source_event_id'),
     expires_at: timestamp('expires_at', { withTimezone: true }),
+    // P8c — Knowledge State Machine columns (migration 036)
+    lifecycle_status: text('lifecycle_status').notNull().default('active'),
+    evidence_count: integer('evidence_count').notNull().default(1),
+    confidence: numeric('confidence', { precision: 3, scale: 2 }).notNull().default('1.00'),
+    lifecycle_transitions: jsonb('lifecycle_transitions').notNull().default(sql`'[]'::jsonb`),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -719,6 +732,11 @@ export const behavioral_hint = pgTable(
     extension_approved_at: timestamp('extension_approved_at', { withTimezone: true }),
     expires_at: timestamp('expires_at', { withTimezone: true }),
     revoked_at: timestamp('revoked_at', { withTimezone: true }),
+    // P8c — Knowledge State Machine columns (migration 036)
+    lifecycle_status: text('lifecycle_status').notNull().default('active'),
+    evidence_count: integer('evidence_count').notNull().default(1),
+    confidence: numeric('confidence', { precision: 3, scale: 2 }).notNull().default('1.00'),
+    lifecycle_transitions: jsonb('lifecycle_transitions').notNull().default(sql`'[]'::jsonb`),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
@@ -1083,6 +1101,79 @@ export const agent_operational_profile_versions = pgTable(
   }),
 );
 
+// P8b — soul_biases: append-only behavioral biases versionadas por chave
+// (tenant, agent, scope, scope_value, principle). DEFAULT 'proposed' garante que
+// nenhuma bias nasça active por acidente (invariante 5). Partial unique
+// "one active" garante 1 row active por chave (migration 038).
+export const soul_biases = pgTable(
+  'soul_biases',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    scope: text('scope').notNull(),
+    scope_value: text('scope_value').notNull(),
+    principle: text('principle').notNull(),
+    guidance: text('guidance').notNull(),
+    origin: text('origin').notNull(),
+    strength: numeric('strength', { precision: 4, scale: 3 }).notNull(),
+    activation_context: jsonb('activation_context').notNull().default(sql`'{}'::jsonb`),
+    status: text('status').notNull().default('proposed'),
+    version: integer('version').notNull(),
+    previous_version_id: uuid('previous_version_id'),
+    proposed_by: text('proposed_by').notNull(),
+    proposed_reason: text('proposed_reason'),
+    approved_by: text('approved_by'),
+    approved_at: timestamp('approved_at', { withTimezone: true }),
+    activated_at: timestamp('activated_at', { withTimezone: true }),
+    frozen_at: timestamp('frozen_at', { withTimezone: true }),
+    rolled_back_at: timestamp('rolled_back_at', { withTimezone: true }),
+    rollback_reason: text('rollback_reason'),
+    deprecated_at: timestamp('deprecated_at', { withTimezone: true }),
+    deprecated_reason: text('deprecated_reason'),
+    proposal_id: uuid('proposal_id'),
+    source_drift_alert_id: uuid('source_drift_alert_id'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    versionUniq: unique('soul_biases_version_uniq').on(
+      t.tenant_id,
+      t.agent_id,
+      t.scope,
+      t.scope_value,
+      t.principle,
+      t.version,
+    ),
+    oneActiveIdx: uniqueIndex('soul_biases_one_active_idx')
+      .on(t.tenant_id, t.agent_id, t.scope, t.scope_value, t.principle)
+      .where(sql`status = 'active'`),
+    activeLookupIdx: index('soul_biases_active_lookup_idx')
+      .on(t.tenant_id, t.agent_id, t.status, t.scope, t.scope_value)
+      .where(sql`status = 'active'`),
+    proposedInboxIdx: index('soul_biases_proposed_inbox_idx')
+      .on(t.tenant_id, t.agent_id, t.status, t.created_at)
+      .where(sql`status = 'proposed'`),
+    proposalIdx: index('soul_biases_proposal_idx')
+      .on(t.proposal_id)
+      .where(sql`proposal_id IS NOT NULL`),
+    driftSourceIdx: index('soul_biases_drift_source_idx')
+      .on(t.source_drift_alert_id)
+      .where(sql`source_drift_alert_id IS NOT NULL`),
+    scopeCheck: check(
+      'soul_biases_scope_check',
+      sql`scope IN ('tenant', 'agent', 'role', 'domain')`,
+    ),
+    statusCheck: check(
+      'soul_biases_status_check',
+      sql`status IN ('proposed', 'active', 'deprecated', 'rolled_back')`,
+    ),
+    originCheck: check(
+      'soul_biases_origin_check',
+      sql`origin IN ('founder_explicit', 'human_approved', 'tenant_culture_explicit', 'learned_strong_evidence')`,
+    ),
+  }),
+);
+
 // P4: agent_drift_alerts — audit das execuções do drift detector.
 // Cada alert = 1 tipo de drift detectado (7 tipos: tom, valores, confianca,
 // vies, escopo, linguagem, procedimento) × 4 severidades (baixo, medio, alto,
@@ -1317,11 +1408,62 @@ export const role_selector_decisions = pgTable(
   }),
 );
 
+export type SoulBias = typeof soul_biases.$inferSelect;
+export type NewSoulBias = typeof soul_biases.$inferInsert;
+
+/**
+ * P8b — Estrutura JSONB de `soul_biases.activation_context`.
+ * Avaliada por soul-slice-builder. Vazio = sempre ativo dentro do scope.
+ */
+export interface ActivationContext {
+  intent_in?: string[];
+  risk_level_min?: 'low' | 'medium' | 'high';
+  channel_in?: string[];
+  role_in?: string[];
+  domain_in?: string[];
+  time_window?: string;
+}
+
+// P8e — policy_rules: Source of Truth versionada para regras de governança.
+// Master spec v3.1.1 §2.1. DEFAULT 'proposed' garante invariante #5; partial
+// unique 'one active' garante invariante #6 (no DB). rule_body é JSONB opaco
+// em P8e — P9d entrega o avaliador de DSL/AST.
+//
+// Migration: migrations/036_p8e_policy_rules.sql. Indexes idx_policy_rules_*
+// declared via raw SQL there (Drizzle 0.45 doesn't expose `COALESCE` in
+// uniqueIndex expressions cleanly). We declare the table here so types and
+// `.$inferSelect/$inferInsert` work; the migration is source of truth for
+// constraints.
+export const policy_rules = pgTable('policy_rules', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenant_id: text('tenant_id').notNull(),
+  agent_id: text('agent_id'),
+  rule_kind: text('rule_kind').notNull(),
+  rule_descriptor: text('rule_descriptor').notNull(),
+  rule_body: jsonb('rule_body').notNull(),
+  scope: jsonb('scope').notNull().default(sql`'{}'::jsonb`),
+  source_of_truth: text('source_of_truth').notNull(),
+  status: text('status').notNull().default('proposed'),
+  version: integer('version').notNull(),
+  proposed_by: text('proposed_by').notNull(),
+  proposed_reason: text('proposed_reason'),
+  approved_by: text('approved_by'),
+  approved_at: timestamp('approved_at', { withTimezone: true }),
+  activated_at: timestamp('activated_at', { withTimezone: true }),
+  deprecated_at: timestamp('deprecated_at', { withTimezone: true }),
+  rolled_back_at: timestamp('rolled_back_at', { withTimezone: true }),
+  rollback_reason: text('rollback_reason'),
+  created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export type PolicyRuleRow = typeof policy_rules.$inferSelect;
+export type NewPolicyRuleRow = typeof policy_rules.$inferInsert;
+
 // =====================================================================
 // P8.5 Admin UI v1 — auth, approvals, audit, debug snapshot grants
 // =====================================================================
 
-// 038: app_users — admin-ui authentication (NextAuth)
+// 045: app_users — admin-ui authentication (NextAuth)
 export const app_users = pgTable(
   'app_users',
   {
@@ -1340,7 +1482,7 @@ export const app_users = pgTable(
   }),
 );
 
-// 038: app_sessions — JWT/session tracking
+// 045: app_sessions — JWT/session tracking
 export const app_sessions = pgTable(
   'app_sessions',
   {
@@ -1356,7 +1498,7 @@ export const app_sessions = pgTable(
   }),
 );
 
-// 039: proposal_approvals — tracks dual-approval state
+// 046: proposal_approvals — tracks dual-approval state
 export const proposal_approvals = pgTable(
   'proposal_approvals',
   {
@@ -1373,7 +1515,7 @@ export const proposal_approvals = pgTable(
   },
   (t) => ({
     // Post-Codex-review #101: dropped (proposal_id, approver_role, decision)
-    // — see migration 042 — because it blocked dual-founder approval flows.
+    // — see migration 049 — because it blocked dual-founder approval flows.
     // Distinct-user invariant is still enforced; distinct-role invariant
     // (for owner+compliance dual classes) is enforced at the app layer.
     proposalUserDecisionUq: unique('proposal_approvals_proposal_user_decision_uq').on(
@@ -1387,7 +1529,7 @@ export const proposal_approvals = pgTable(
   }),
 );
 
-// 040: admin_audit_log — APPEND-ONLY audit trail for admin-ui mutations
+// 047: admin_audit_log — APPEND-ONLY audit trail for admin-ui mutations
 // NEVER UPDATE/DELETE these rows. Constraint enforced at app + lint layer.
 export const admin_audit_log = pgTable(
   'admin_audit_log',
@@ -1409,7 +1551,7 @@ export const admin_audit_log = pgTable(
   }),
 );
 
-// 041: debug_snapshot_grants — TTL-bounded access to runtime_trace_bodies
+// 048: debug_snapshot_grants — TTL-bounded access to runtime_trace_bodies
 export const debug_snapshot_grants = pgTable(
   'debug_snapshot_grants',
   {
@@ -1551,6 +1693,125 @@ export type ChannelPolicy = typeof channel_policies.$inferSelect;
 export type NewChannelPolicy = typeof channel_policies.$inferInsert;
 export type RoleSelectorDecisionRow = typeof role_selector_decisions.$inferSelect;
 export type NewRoleSelectorDecisionRow = typeof role_selector_decisions.$inferInsert;
+
+// P9a: skills — Skill Contracts versionados (Source of Truth)
+// Master spec v3.1.1 §2.4 + §2.5 (runtime_hints).
+// Convenções:
+//  - DEFAULT status='proposed' (uma skill nunca nasce active).
+//  - Partial unique "one active" garante invariante no DB; o repo respeita.
+//  - tenant_id é TEXT (slug), seguindo padrão de migrations 007/018+ —
+//    spec menciona UUID mas o resto da Maia ainda usa slug; alinhamento
+//    pode ocorrer em P11. agent_id NULL = skill tenant-wide.
+export const skills = pgTable(
+  'skills',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id'),
+
+    skill_descriptor: text('skill_descriptor').notNull(),
+    category: text('category').notNull(),
+    execution_mode: text('execution_mode').notNull(),
+
+    goal: text('goal').notNull(),
+    when_to_use: text('when_to_use').notNull(),
+    procedure: jsonb('procedure').notNull().default(sql`'{}'::jsonb`),
+    constraints: jsonb('constraints').notNull().default(sql`'[]'::jsonb`),
+
+    input_schema: jsonb('input_schema').notNull(),
+    output_schema: jsonb('output_schema').notNull(),
+
+    allowed_tools: text('allowed_tools').array().notNull().default(sql`'{}'::text[]`),
+    policy_descriptors: text('policy_descriptors').array().notNull().default(sql`'{}'::text[]`),
+
+    success_criteria: jsonb('success_criteria').notNull().default(sql`'[]'::jsonb`),
+    failure_modes: jsonb('failure_modes').notNull().default(sql`'[]'::jsonb`),
+
+    runtime_hints: jsonb('runtime_hints').notNull().default(sql`'{}'::jsonb`),
+
+    status: text('status').notNull().default('proposed'),
+    version: integer('version').notNull(),
+    proposed_by: text('proposed_by').notNull(),
+    proposed_reason: text('proposed_reason'),
+    approved_by: text('approved_by'),
+    approved_at: timestamp('approved_at', { withTimezone: true }),
+    activated_at: timestamp('activated_at', { withTimezone: true }),
+    deprecated_at: timestamp('deprecated_at', { withTimezone: true }),
+    rolled_back_at: timestamp('rolled_back_at', { withTimezone: true }),
+    rollback_reason: text('rollback_reason'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    tenantActiveIdx: index('idx_skills_tenant_active')
+      .on(t.tenant_id, t.status, t.skill_descriptor)
+      .where(sql`status = 'active'`),
+    tenantCategoryActiveIdx: index('idx_skills_tenant_category_active')
+      .on(t.tenant_id, t.category, t.status)
+      .where(sql`status = 'active'`),
+    versionUq: uniqueIndex('idx_skills_version_uq').on(
+      t.tenant_id,
+      sql`COALESCE(agent_id, 'tenant_wide')`,
+      t.skill_descriptor,
+      t.version,
+    ),
+    oneActiveUq: uniqueIndex('idx_skills_one_active_uq')
+      .on(t.tenant_id, sql`COALESCE(agent_id, 'tenant_wide')`, t.skill_descriptor)
+      .where(sql`status = 'active'`),
+    proposedIdx: index('idx_skills_proposed')
+      .on(t.tenant_id, t.status, t.created_at)
+      .where(sql`status = 'proposed'`),
+    categoryCheck: check(
+      'skills_category_check',
+      sql`category IN ('classify', 'extract', 'compose', 'decide', 'tool_mediated', 'diagnose', 'plan', 'evaluator')`,
+    ),
+    executionModeCheck: check(
+      'skills_execution_mode_check',
+      sql`execution_mode IN ('prompt_only', 'procedure_adapter', 'tool_mediated', 'evaluator')`,
+    ),
+    statusCheck: check(
+      'skills_status_check',
+      sql`status IN ('proposed', 'active', 'deprecated', 'rolled_back')`,
+    ),
+  }),
+);
+
+export type SkillRow = typeof skills.$inferSelect;
+export type NewSkillRow = typeof skills.$inferInsert;
+
+/**
+ * Runtime hints declarados no Skill Contract (master §2.5 CORREÇÃO #14).
+ * O harness aplica caps por execução; ausência de campo cai em defaults
+ * do SkillRunner.
+ */
+export interface SkillRuntimeHints {
+  max_prompt_tokens?: number;
+  max_output_tokens?: number;
+  max_tool_calls?: number;
+  preferred_model?: string;
+  timeout_ms?: number;
+}
+
+/**
+ * Forma estrutural do contrato declarativo (linha em `skills`). Usado
+ * como input para `skillsRepo.propose` e como o `proposed_spec` em
+ * `capability_proposals` quando capability_type='skill'.
+ */
+export interface SkillContract {
+  skill_descriptor: string;
+  category: string;
+  execution_mode: string;
+  goal: string;
+  when_to_use: string;
+  procedure: Record<string, unknown>;
+  constraints?: Array<Record<string, unknown>>;
+  input_schema: Record<string, unknown>;
+  output_schema: Record<string, unknown>;
+  allowed_tools?: string[];
+  policy_descriptors?: string[];
+  success_criteria?: Array<Record<string, unknown>>;
+  failure_modes?: Array<Record<string, unknown>>;
+  runtime_hints?: SkillRuntimeHints;
+}
 
 // =====================================================================
 // P8.5 Admin UI v1 — type exports + Zod schemas + governance enums

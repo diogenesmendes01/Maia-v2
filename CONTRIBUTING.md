@@ -87,10 +87,10 @@ FEATURE_ADMIN_UI_REDECIDE=false      # libera re-decide (v1.1)
 - **14 classes de aprovação:** dual approval para hard_limit, soul_core,
   dangerous_tool, identity_drift_correction (ver `lib/approval-matrix.ts`)
 - **Architecture Lock:** banner + role=founder gate em proposals locked
-- **Audit append-only:** `admin_audit_log` (migration 040); repo expõe
+- **Audit append-only:** `admin_audit_log` (migration 047); repo expõe
   apenas `append` + `list`
-- **Migrations P8.5:** 038 (app_users/sessions), 039 (proposal_approvals),
-  040 (admin_audit_log), 041 (debug_snapshot_grants)
+- **Migrations P8.5:** 045 (app_users/sessions), 046 (proposal_approvals),
+  047 (admin_audit_log), 048 (debug_snapshot_grants), 049 (proposal_approvals user UQ)
 - **Dependências futuras:** P8a-e (policy_rules, soul_biases, skills,
   knowledge_pending_review) — repo `proposalsUnified` faz lookup em
   `information_schema` e degrada graciosamente se tabelas ainda não existem

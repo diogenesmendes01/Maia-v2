@@ -134,6 +134,114 @@ describe('classifySeverity (deterministic, per type)', () => {
     };
     expect(classifySeverity(ev2)).toBe(DriftSeverity.BAIXO);
   });
+
+  // P8d §7 — papel_drift floor rules (determinísticas)
+  it('PAPEL_DRIFT: 1 off_role → BAIXO, 2 → MEDIO, 3 → ALTO, 5+ → CRITICO', () => {
+    expect(
+      classifySeverity(
+        makeEvidence(DriftType.PAPEL_DRIFT, { off_role_examples: ['a'] }),
+      ),
+    ).toBe(DriftSeverity.BAIXO);
+    expect(
+      classifySeverity(
+        makeEvidence(DriftType.PAPEL_DRIFT, { off_role_examples: ['a', 'b'] }),
+      ),
+    ).toBe(DriftSeverity.MEDIO);
+    expect(
+      classifySeverity(
+        makeEvidence(DriftType.PAPEL_DRIFT, { off_role_examples: ['a', 'b', 'c'] }),
+      ),
+    ).toBe(DriftSeverity.ALTO);
+    expect(
+      classifySeverity(
+        makeEvidence(DriftType.PAPEL_DRIFT, {
+          off_role_examples: ['a', 'b', 'c', 'd', 'e'],
+        }),
+      ),
+    ).toBe(DriftSeverity.CRITICO);
+  });
+
+  it('PAPEL_DRIFT: rolesDiverge + 3+ off_role → CRITICO (mesmo abaixo de 5, ambos slugs válidos)', () => {
+    expect(
+      classifySeverity(
+        makeEvidence(DriftType.PAPEL_DRIFT, {
+          off_role_examples: ['a', 'b', 'c'],
+          declared_role: 'atendimento_financeiro_pf',
+          observed_role_inferred: 'consultoria_juridica_e_investimentos',
+        }),
+      ),
+    ).toBe(DriftSeverity.CRITICO);
+  });
+
+  it('PAPEL_DRIFT: declared_role é prosa (sem slug) + 3 off_role → ALTO (não promove a critico)', () => {
+    // Caso real do seed: role_descriptor = core_immutable.identity_block (prosa longa).
+    // A divergência de papéis NÃO pode ser detectada se um dos lados não é um slug
+    // de papel validado — portanto a promoção a critico não deve acontecer.
+    const prosaDeclarada = 'Sou a Maia, assistente financeira inteligente para pessoas físicas e pequenas empresas, especializada em controle de gastos, planejamento orçamentário e análise de fluxo de caixa.';
+    expect(
+      classifySeverity(
+        makeEvidence(DriftType.PAPEL_DRIFT, {
+          off_role_examples: ['a', 'b', 'c'],
+          declared_role: prosaDeclarada,
+          observed_role_inferred: 'vendas',
+        }),
+      ),
+    ).toBe(DriftSeverity.ALTO); // 3 off_role → ALTO; rolesDiverge false (prosa não é slug)
+  });
+
+  it('PAPEL_DRIFT: observed_role_inferred é prosa + 3 off_role → ALTO (não promove a critico)', () => {
+    // observed_role_inferred pode conter texto livre do LLM — também deve bloquear promoção.
+    expect(
+      classifySeverity(
+        makeEvidence(DriftType.PAPEL_DRIFT, {
+          off_role_examples: ['a', 'b', 'c'],
+          declared_role: 'atendimento_financeiro_pf',
+          observed_role_inferred: 'Parece que o agente está atuando como consultor jurídico especializado',
+        }),
+      ),
+    ).toBe(DriftSeverity.ALTO); // observed não é slug → rolesDiverge=false → piso ALTO
+  });
+
+  it('PAPEL_DRIFT: rolesDiverge mas só 2 off_role → MEDIO (rule não dispara)', () => {
+    expect(
+      classifySeverity(
+        makeEvidence(DriftType.PAPEL_DRIFT, {
+          off_role_examples: ['a', 'b'],
+          declared_role: 'atendimento_financeiro_pf',
+          observed_role_inferred: 'consultoria_juridica',
+        }),
+      ),
+    ).toBe(DriftSeverity.MEDIO);
+  });
+
+  it('PAPEL_DRIFT: roles compartilham prefixo (não diverge) + 3 off_role → ALTO (não promove)', () => {
+    expect(
+      classifySeverity(
+        makeEvidence(DriftType.PAPEL_DRIFT, {
+          off_role_examples: ['a', 'b', 'c'],
+          declared_role: 'atendimento_financeiro_pf',
+          observed_role_inferred: 'atendimento_corporativo',
+        }),
+      ),
+    ).toBe(DriftSeverity.ALTO);
+  });
+
+  it('PAPEL_DRIFT: sem off_role + hint → respeita hint', () => {
+    expect(
+      classifySeverity(
+        makeEvidence(DriftType.PAPEL_DRIFT, {
+          off_role_examples: [],
+          severity_hint: 'medio',
+        }),
+      ),
+    ).toBe(DriftSeverity.MEDIO);
+  });
+
+  it('PAPEL_DRIFT: sem off_role nem hint → BAIXO (default)', () => {
+    expect(
+      classifySeverity(makeEvidence(DriftType.PAPEL_DRIFT, {})),
+    ).toBe(DriftSeverity.BAIXO);
+  });
 });
 
 describe('decideAndApply', () => {
