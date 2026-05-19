@@ -4,9 +4,6 @@ import { describe, it, expect, vi } from 'vitest';
 // each of those in turn imports config/redis/db. Stub everything to a
 // no-op resolved promise — the registry test only cares about the JOBS
 // array shape, not the underlying behaviour.
-vi.mock('../../src/lib/logger.js', () => ({
-  logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
-}));
 
 // Note: config is NOT mocked here — the vitest setup.ts populates process.env
 // with all required fields. The workers/index.ts reads config.FEATURE_RUNTIME_TRACE_V1
@@ -14,29 +11,40 @@ vi.mock('../../src/lib/logger.js', () => ({
 // overridden. The registry tests check JOBS array shape, not runtime feature gate.
 // The featureFlag property just needs to be a boolean (true/false/undefined).
 
-const noopAsync = vi.fn(async () => undefined);
-const noopWorkers = {
-  runHealthMonitor: noopAsync,
-  runPendingExpirer: noopAsync,
-  runIdempotencyCleanup: noopAsync,
-  runAuditModeExpirer: noopAsync,
-  runInactivitySweep: noopAsync,
-  runConversationSummarizer: noopAsync,
-  runReflectionBatch: noopAsync,
-  runMessageRecovery: noopAsync,
-  runPendingReminder: noopAsync,
-  runNightlyBackup: noopAsync,
-  runCloudBackupRotation: noopAsync,
-  runCostMonitor: noopAsync,
-  runAuditWatcher: noopAsync,
-  runDlqMonitor: noopAsync,
-  runMorningBriefing: noopAsync,
-  runEveningBriefing: noopAsync,
-  runWeeklyBriefing: noopAsync,
-  runTraceBodyWriter: noopAsync,
-  runTraceBodyRecoverer: noopAsync,
-  runTraceMatviewRefresh: noopAsync,
-};
+// vi.hoisted: noopAsync, noopWorkers, and mockSchedule must be declared here
+// so they are available inside vi.mock() factories (vitest 4 hoists vi.mock()
+// before top-level statements).
+const { noopAsync, noopWorkers, mockSchedule } = vi.hoisted(() => {
+  const noopAsync = vi.fn(async () => undefined);
+  const noopWorkers = {
+    runHealthMonitor: noopAsync,
+    runPendingExpirer: noopAsync,
+    runIdempotencyCleanup: noopAsync,
+    runAuditModeExpirer: noopAsync,
+    runInactivitySweep: noopAsync,
+    runConversationSummarizer: noopAsync,
+    runReflectionBatch: noopAsync,
+    runMessageRecovery: noopAsync,
+    runPendingReminder: noopAsync,
+    runNightlyBackup: noopAsync,
+    runCloudBackupRotation: noopAsync,
+    runCostMonitor: noopAsync,
+    runAuditWatcher: noopAsync,
+    runDlqMonitor: noopAsync,
+    runMorningBriefing: noopAsync,
+    runEveningBriefing: noopAsync,
+    runWeeklyBriefing: noopAsync,
+    runTraceBodyWriter: noopAsync,
+    runTraceBodyRecoverer: noopAsync,
+    runTraceMatviewRefresh: noopAsync,
+  };
+  const mockSchedule = vi.fn(() => ({ stop: vi.fn(), start: vi.fn() }));
+  return { noopAsync, noopWorkers, mockSchedule };
+});
+
+vi.mock('../../src/lib/logger.js', () => ({
+  logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
+}));
 
 vi.mock('../../src/workers/health-monitor.js', () => noopWorkers);
 vi.mock('../../src/workers/pending-expirer.js', () => noopWorkers);
@@ -61,7 +69,6 @@ vi.mock('../../src/workers/trace-matview-refresh.js', () => noopWorkers);
 vi.mock('../../src/workflows/engine.js', () => ({ tickEngine: noopAsync }));
 
 // node-cron v4: ScheduledTask is an interface with stop() / start() / etc.
-const mockSchedule = vi.fn(() => ({ stop: vi.fn(), start: vi.fn() }));
 vi.mock('node-cron', () => ({
   default: { schedule: mockSchedule },
 }));

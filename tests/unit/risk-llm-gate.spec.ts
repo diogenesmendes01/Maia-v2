@@ -28,9 +28,9 @@ const { anthropicCreateMock, recordMock } = vi.hoisted(() => ({
 }));
 
 vi.mock('@anthropic-ai/sdk', () => {
-  const Anthropic = vi.fn().mockImplementation(() => ({
-    messages: { create: anthropicCreateMock },
-  }));
+  const Anthropic = vi.fn(function (this: unknown) {
+    return { messages: { create: anthropicCreateMock } };
+  });
   return { default: Anthropic };
 });
 
