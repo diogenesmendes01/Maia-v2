@@ -22,6 +22,7 @@ const {
   holidaysCreate,
   holidaysFindByProposalId,
   holidayEntidadesLink,
+  holidayEntidadesListByEntidade,
   proposalsGetById,
   proposalsTransition,
   createWithFirstOccurrence,
@@ -30,6 +31,7 @@ const {
   holidaysCreate: vi.fn(),
   holidaysFindByProposalId: vi.fn(),
   holidayEntidadesLink: vi.fn(),
+  holidayEntidadesListByEntidade: vi.fn(),
   proposalsGetById: vi.fn(),
   proposalsTransition: vi.fn(),
   createWithFirstOccurrence: vi.fn(),
@@ -54,7 +56,7 @@ vi.mock('@/db/repositories/holiday-entidades-repo.js', () => ({
   holidayEntidadesRepo: {
     link: holidayEntidadesLink,
     unlink: vi.fn(),
-    listByEntidade: vi.fn(),
+    listByEntidade: holidayEntidadesListByEntidade,
   },
   CrossTenantIntegrityError: class extends Error {
     code = 'CROSS_TENANT_INTEGRITY_VIOLATION';
@@ -113,6 +115,7 @@ beforeEach(() => {
   holidaysCreate.mockReset();
   holidaysFindByProposalId.mockReset();
   holidayEntidadesLink.mockReset();
+  holidayEntidadesListByEntidade.mockReset();
   proposalsGetById.mockReset();
   proposalsTransition.mockReset();
   createWithFirstOccurrence.mockReset();
@@ -123,6 +126,10 @@ beforeEach(() => {
   holidaysCreate.mockResolvedValue({ id: 42 });
   holidaysFindByProposalId.mockResolvedValue(null);
   holidayEntidadesLink.mockResolvedValue(undefined);
+  // Default reconciliation lookup returns an empty list — if the test sets up
+  // an idempotent retry where the link already exists, override to include
+  // the holiday id.
+  holidayEntidadesListByEntidade.mockResolvedValue([]);
   createWithFirstOccurrence.mockImplementation(
     async (args: { initial_occurrence: { scheduled_for: Date } }) => ({
       series: { id: 'series-1', tipo: 'recurring_payment' },
@@ -311,7 +318,7 @@ describe('approve_capability_proposal — atomic materialization (Codex #105 hig
     expect(tcall.to).toBe('approved');
   });
 
-  it('idempotent retry: holiday already exists for proposal → no new INSERT, transition still fires', async () => {
+  it('idempotent retry: holiday already exists for proposal AND link present → no new INSERT/link, transition still fires', async () => {
     proposalsGetById.mockResolvedValue(makeProposal());
     proposalsTransition.mockResolvedValue({ ok: true, updated: {} });
     // Simulate prior materialization that left a holiday row but failed
@@ -320,6 +327,8 @@ describe('approve_capability_proposal — atomic materialization (Codex #105 hig
       id: 99,
       proposal_id: '11111111-1111-1111-1111-111111111111',
     });
+    // Link already present — reconciliation no-ops.
+    holidayEntidadesListByEntidade.mockResolvedValueOnce([99]);
 
     const { approveCapabilityProposalTool } = await import(
       '@/tools/approve-capability-proposal.js'
@@ -329,12 +338,144 @@ describe('approve_capability_proposal — atomic materialization (Codex #105 hig
         {
           proposal_id: '11111111-1111-1111-1111-111111111111',
         } as never,
-        makeCtx([E_IN]),
+        makeCtx([E_IN], ['manage_calendar', 'manage_capabilities']),
       );
       expect(out.status).toBe('approved');
       expect(out.holiday_id).toBe(99);
     });
     expect(holidaysCreate).not.toHaveBeenCalled();
+    expect(holidayEntidadesLink).not.toHaveBeenCalled();
+    expect(proposalsTransition).toHaveBeenCalledTimes(1);
+  });
+
+  // Codex review #105 round-2 (high): idempotent retry now reconciles a
+  // missing link instead of blessing an orphaned holiday.
+  it('round-2: idempotent retry reconciles missing holiday_entidades link before returning success', async () => {
+    proposalsGetById.mockResolvedValue(makeProposal());
+    proposalsTransition.mockResolvedValue({ ok: true, updated: {} });
+    // Prior partial run: holiday exists, but link in junction never made it
+    // (e.g., link INSERT failed, transient db blip). Retry must fill the gap.
+    holidaysFindByProposalId.mockResolvedValueOnce({
+      id: 99,
+      proposal_id: '11111111-1111-1111-1111-111111111111',
+    });
+    // Link missing: entidade has no junction rows yet for this holiday id.
+    holidayEntidadesListByEntidade.mockResolvedValueOnce([]);
+
+    const { approveCapabilityProposalTool } = await import(
+      '@/tools/approve-capability-proposal.js'
+    );
+    await runWithTenantContext(TENANT_CTX, async () => {
+      const out = await approveCapabilityProposalTool.handler(
+        { proposal_id: '11111111-1111-1111-1111-111111111111' } as never,
+        makeCtx([E_IN], ['manage_calendar', 'manage_capabilities']),
+      );
+      expect(out.status).toBe('approved');
+      expect(out.holiday_id).toBe(99);
+    });
+    // Reconciliation must have called link with the existing holiday id.
+    expect(holidayEntidadesLink).toHaveBeenCalledTimes(1);
+    expect(holidayEntidadesLink).toHaveBeenCalledWith({
+      holiday_id: 99,
+      entidade_id: E_IN,
+    });
+    expect(holidaysCreate).not.toHaveBeenCalled();
+    expect(proposalsTransition).toHaveBeenCalledTimes(1);
+  });
+
+  // Codex review #105 round-2 (high): partial failure (link throws after
+  // INSERT commits) must keep proposal `submitted` so a retry can finish.
+  it('round-2: partial failure (link throws after holiday create) → throws, proposal NOT transitioned', async () => {
+    proposalsGetById.mockResolvedValue(makeProposal());
+    // First-time path: holiday create succeeds, link throws.
+    holidaysFindByProposalId.mockResolvedValueOnce(null);
+    holidayEntidadesLink.mockRejectedValueOnce(new Error('link_db_failure'));
+
+    const { approveCapabilityProposalTool } = await import(
+      '@/tools/approve-capability-proposal.js'
+    );
+    await runWithTenantContext(TENANT_CTX, async () => {
+      await expect(
+        approveCapabilityProposalTool.handler(
+          { proposal_id: '11111111-1111-1111-1111-111111111111' } as never,
+          makeCtx([E_IN], ['manage_calendar', 'manage_capabilities']),
+        ),
+      ).rejects.toThrow(/link_db_failure/);
+    });
+    // Transition NEVER called — proposal stays `submitted` for retry.
+    expect(proposalsTransition).not.toHaveBeenCalled();
+  });
+
+  // Codex review #105 round-2 (high): caller without manage_capabilities is
+  // rejected at the entry-time second-check (caller exercises dispatcher
+  // round-2 — see "scope leakage" describe block below for full coverage).
+  it('round-2: rejects holiday proposal when caller scope does not include proposed_spec.entidade_id', async () => {
+    proposalsGetById.mockResolvedValue(makeProposal());
+    holidaysFindByProposalId.mockResolvedValue(null);
+
+    const { approveCapabilityProposalTool } = await import(
+      '@/tools/approve-capability-proposal.js'
+    );
+    await runWithTenantContext(TENANT_CTX, async () => {
+      // Caller scope contains E_OTHER but proposal targets E_IN. Should reject.
+      await expect(
+        approveCapabilityProposalTool.handler(
+          { proposal_id: '11111111-1111-1111-1111-111111111111' } as never,
+          makeCtx([E_OTHER], ['manage_calendar', 'manage_capabilities']),
+        ),
+      ).rejects.toThrow(/fora do escopo/);
+    });
+    expect(holidaysCreate).not.toHaveBeenCalled();
+    expect(proposalsTransition).not.toHaveBeenCalled();
+  });
+
+  it('round-2: rejects holiday proposal when caller has manage_capabilities but lacks manage_calendar on entidade alvo', async () => {
+    proposalsGetById.mockResolvedValue(makeProposal());
+    holidaysFindByProposalId.mockResolvedValue(null);
+
+    const { approveCapabilityProposalTool } = await import(
+      '@/tools/approve-capability-proposal.js'
+    );
+    await runWithTenantContext(TENANT_CTX, async () => {
+      // Caller has manage_capabilities + ver_saldo but NOT manage_calendar.
+      await expect(
+        approveCapabilityProposalTool.handler(
+          { proposal_id: '11111111-1111-1111-1111-111111111111' } as never,
+          makeCtx([E_IN], ['manage_capabilities', 'ver_saldo']),
+        ),
+      ).rejects.toThrow(/manage_calendar/);
+    });
+    expect(holidaysCreate).not.toHaveBeenCalled();
+    expect(proposalsTransition).not.toHaveBeenCalled();
+  });
+
+  it('round-2: tenant-level proposal (capability_type=tool) only needs manage_capabilities (handler-side passes; dispatcher enforces actual check)', async () => {
+    // Tenant-level proposals (tool/knowledge/procedure/integration/other) DO
+    // NOT have an entidade alvo to refine the check against. The handler
+    // does NOT enforce manage_calendar; the dispatcher's manage_capabilities
+    // check is the authority.
+    proposalsGetById.mockResolvedValue(
+      makeProposal({
+        capability_type: 'tool',
+        proposed_spec: { name: 'wire_payment' },
+      }),
+    );
+    proposalsTransition.mockResolvedValue({ ok: true, updated: {} });
+
+    const { approveCapabilityProposalTool } = await import(
+      '@/tools/approve-capability-proposal.js'
+    );
+    await runWithTenantContext(TENANT_CTX, async () => {
+      const out = await approveCapabilityProposalTool.handler(
+        { proposal_id: '11111111-1111-1111-1111-111111111111' } as never,
+        // Caller has manage_capabilities but only manage_calendar on a
+        // different entity — for tenant-level proposals this is fine
+        // because there is no entidade alvo to enforce against.
+        makeCtx([E_IN], ['manage_capabilities']),
+      );
+      expect(out.status).toBe('approved');
+      expect(out.holiday_id).toBeNull();
+    });
     expect(proposalsTransition).toHaveBeenCalledTimes(1);
   });
 });

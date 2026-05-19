@@ -565,9 +565,19 @@ async function advanceInProgressOccurrence(occ: Occurrence): Promise<'advanced' 
   // skipped above). The forward task is either completed or skipped.
   // If it's still in_progress (outbox hasn't sent yet) we wait.
   if (forwardTask && forwardTask.status === 'in_progress') {
-    // Still waiting on the outbox to send the forward. Don't finalize
-    // — release claim so we re-claim on the next tick.
-    await occurrencesRepo.releaseClaim(occ.id, 30);
+    // Still waiting on the outbox to send the forward. Don't finalize.
+    // Codex review #105 round-2 (high): use a LEASE-ONLY release here,
+    // not `releaseClaim`. The latter sets status back to `pending`, which
+    // makes the next pending-path claim re-run the initial outreach step
+    // (advanceRecurringOutreach) and silently regress an already-sent
+    // outreach into a duplicate send + reset to awaiting_third_party,
+    // while the forward outbox row is still pending — eventually causing
+    // a phantom `no_response` timeout despite the response having been
+    // captured and forwarded.
+    //
+    // Keep status='in_progress'; clear only the lease so the next
+    // `claimInProgressForAdvance` tick (>30s out) re-picks the row.
+    await occurrencesRepo.releaseLeaseOnly(occ.id);
     return 'skipped';
   }
 

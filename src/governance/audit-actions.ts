@@ -163,6 +163,12 @@ export const ACTION_KEYS = [
   'ban_rule',
   // Calendar v2
   'manage_calendar',
+  // Codex review #105 round-2 (high): capability proposal management
+  // (approve/reject) é genérico — vale para holiday, tool, knowledge,
+  // procedure, integration, other. Separado de `manage_calendar` para
+  // que `manage_calendar` em uma entidade NÃO autorize aprovação de
+  // proposals tenant-level ou de entidades fora do escopo.
+  'manage_capabilities',
 ] as const;
 
 export type ActionKey = (typeof ACTION_KEYS)[number];

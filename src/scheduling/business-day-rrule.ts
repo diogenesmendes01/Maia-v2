@@ -170,9 +170,36 @@ export async function computeNextWithBusinessDays(
     throw new Error('rrule: no BYNTHWORKDAY match within 24 months');
   }
 
-  // Caso BYWORKDAY (DAILY): próximo dia útil estritamente depois de `after`.
+  // Caso BYWORKDAY (DAILY): primeiro tenta o candidato do MESMO calendar-day
+  // local (BR), retornando-o se o dia for útil e o horário ainda for futuro
+  // em relação a `after`. Codex review #105 round-2 (medium): a versão
+  // anterior delegava direto para `nextBusinessDayBR(after)` que avança no
+  // mínimo +1 calendar-day, então `FREQ=DAILY;BYWORKDAY=true;BYHOUR=9`
+  // criado às 08:00 de um dia útil agendava amanhã 09:00 em vez de hoje
+  // 09:00 — pulando silenciosamente uma execução válida (mesmo-dia).
+  // Comportamento legacy (RRULE puro sem BYWORKDAY) inclui o mesmo-dia, e
+  // a extensão DEVE preservá-lo.
   if (r.byWorkday === true) {
-    const next = await nextBusinessDayBR(after, bdOpts);
+    // Hoje em TZ local (BR) — y/m/d do calendar-day de `after`.
+    const afterZ = toZonedTime(after, TZ);
+    const todayY = afterZ.getFullYear();
+    const todayMo = afterZ.getMonth();
+    const todayD = afterZ.getDate();
+    const todayLocal = new Date(todayY, todayMo, todayD, r.byhour, r.byminute, 0, 0);
+    const todayCandidate = fromZonedTime(todayLocal, TZ);
+    // Para checar se hoje é dia útil pelo calendar-day BR, montamos um Date
+    // UTC ancorado nesse y/m/d (à meia-noite UTC) — é o contrato esperado
+    // pelos helpers `isBusinessDayBR` / `nextBusinessDayBR` que usam
+    // getUTCFullYear/Month/Date sobre o argumento.
+    const todayUtcAnchor = new Date(Date.UTC(todayY, todayMo, todayD));
+    if (
+      todayCandidate.getTime() > after.getTime() &&
+      (await isBusinessDayBR(todayUtcAnchor, bdOpts))
+    ) {
+      return todayCandidate;
+    }
+    // Senão (hoje não é dia útil, ou horário do dia já passou): avança.
+    const next = await nextBusinessDayBR(todayUtcAnchor, bdOpts);
     const y = next.getUTCFullYear();
     const mo = next.getUTCMonth();
     const d = next.getUTCDate();

@@ -42,6 +42,7 @@ const {
   holidaysCreate,
   holidaysFindByProposalId,
   holidayEntidadesLink,
+  holidayEntidadesListByEntidade,
   proposalsGetById,
   proposalsTransition,
   proposalsListByStatus,
@@ -49,6 +50,7 @@ const {
   holidaysCreate: vi.fn(),
   holidaysFindByProposalId: vi.fn(),
   holidayEntidadesLink: vi.fn(),
+  holidayEntidadesListByEntidade: vi.fn(),
   proposalsGetById: vi.fn(),
   proposalsTransition: vi.fn(),
   proposalsListByStatus: vi.fn(),
@@ -68,7 +70,7 @@ vi.mock('@/db/repositories/holiday-entidades-repo.js', () => ({
   holidayEntidadesRepo: {
     link: holidayEntidadesLink,
     unlink: vi.fn(),
-    listByEntidade: vi.fn(),
+    listByEntidade: holidayEntidadesListByEntidade,
   },
   CrossTenantIntegrityError: class extends Error {
     code = 'CROSS_TENANT_INTEGRITY_VIOLATION';
@@ -173,6 +175,12 @@ describe('Calendar v2 — approval pipeline (holiday)', () => {
         });
       },
     );
+    // Reconciliation lookup reflects in-memory junction state.
+    holidayEntidadesListByEntidade.mockImplementation(async (entidade_id: string) => {
+      return holidayEntidadesState
+        .filter((r) => r.entidade_id === entidade_id)
+        .map((r) => r.holiday_id);
+    });
   });
 
   afterEach(() => {

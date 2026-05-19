@@ -1,8 +1,12 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { fromZonedTime } from 'date-fns-tz';
 import {
   parseRRule,
   usesBusinessDayExtension,
+  computeNextWithBusinessDays,
 } from '../../src/scheduling/business-day-rrule.js';
+import { featureFlags } from '../../src/config/feature-flags.js';
+import { FeatureFlagName } from '../../src/types/enums.js';
 
 describe('parseRRule extension', () => {
   it('parses FREQ=MONTHLY;BYNTHWORKDAY=5;WORKDAY_KIND=standard', () => {
@@ -50,5 +54,80 @@ describe('parseRRule extension', () => {
   it('parses BYNTHWORKDAY=-1 (último DU)', () => {
     const rule = parseRRule('FREQ=MONTHLY;BYNTHWORKDAY=-1');
     expect(rule.byNthWorkday).toBe(-1);
+  });
+});
+
+/**
+ * Codex review #105 round-2 (medium): BYWORKDAY must not skip a valid
+ * same-day run. Tests run with FEATURE_CALENDAR_V2 OFF so the legacy
+ * national-only fast-path in `isBusinessDayBR` resolves synchronously and
+ * deterministically without DB.
+ */
+describe('computeNextWithBusinessDays — BYWORKDAY same-day (Codex #105 round-2 medium)', () => {
+  const TZ = 'America/Sao_Paulo';
+
+  beforeEach(() => {
+    // Force legacy fast-path: only national fixed/moving holidays apply.
+    featureFlags.override(FeatureFlagName.CALENDAR_V2, false);
+  });
+  afterEach(() => {
+    featureFlags.reset();
+  });
+
+  // 2026-05-19 is a Tuesday (not a national holiday) → business day.
+  // 2026-05-23 is a Saturday → not a business day.
+  // 2026-05-25 is the following Monday → business day.
+
+  it('BYHOUR=9 on Tuesday 08:00 BR returns SAME DAY at 09:00 BR (not next business day)', async () => {
+    // 08:00 BR (UTC-3) = 11:00 UTC on a Tuesday.
+    const after = fromZonedTime(new Date(2026, 4, 19, 8, 0, 0, 0), TZ);
+    const next = await computeNextWithBusinessDays('FREQ=DAILY;BYWORKDAY=true;BYHOUR=9', after);
+    // Expected: same calendar day, 09:00 BR.
+    const expected = fromZonedTime(new Date(2026, 4, 19, 9, 0, 0, 0), TZ);
+    expect(next.getTime()).toBe(expected.getTime());
+  });
+
+  it('BYHOUR=9 on Tuesday 10:00 BR (already past 09:00) advances to NEXT business day at 09:00 BR', async () => {
+    const after = fromZonedTime(new Date(2026, 4, 19, 10, 0, 0, 0), TZ);
+    const next = await computeNextWithBusinessDays('FREQ=DAILY;BYWORKDAY=true;BYHOUR=9', after);
+    // Wednesday 2026-05-20 09:00 BR.
+    const expected = fromZonedTime(new Date(2026, 4, 20, 9, 0, 0, 0), TZ);
+    expect(next.getTime()).toBe(expected.getTime());
+  });
+
+  it('BYHOUR=9 on Saturday 08:00 BR skips to following Monday 09:00 BR', async () => {
+    const after = fromZonedTime(new Date(2026, 4, 23, 8, 0, 0, 0), TZ);
+    const next = await computeNextWithBusinessDays('FREQ=DAILY;BYWORKDAY=true;BYHOUR=9', after);
+    // Monday 2026-05-25 09:00 BR.
+    const expected = fromZonedTime(new Date(2026, 4, 25, 9, 0, 0, 0), TZ);
+    expect(next.getTime()).toBe(expected.getTime());
+  });
+
+  it('BYHOUR=9 BYMINUTE=30 on Tuesday 09:00 BR returns SAME DAY at 09:30 BR', async () => {
+    // Exact same-day-future minute boundary.
+    const after = fromZonedTime(new Date(2026, 4, 19, 9, 0, 0, 0), TZ);
+    const next = await computeNextWithBusinessDays(
+      'FREQ=DAILY;BYWORKDAY=true;BYHOUR=9;BYMINUTE=30',
+      after,
+    );
+    const expected = fromZonedTime(new Date(2026, 4, 19, 9, 30, 0, 0), TZ);
+    expect(next.getTime()).toBe(expected.getTime());
+  });
+
+  it('BYHOUR=9 on Sunday 08:00 BR skips to Monday 09:00 BR (not Sunday 09:00)', async () => {
+    // 2026-05-24 is a Sunday.
+    const after = fromZonedTime(new Date(2026, 4, 24, 8, 0, 0, 0), TZ);
+    const next = await computeNextWithBusinessDays('FREQ=DAILY;BYWORKDAY=true;BYHOUR=9', after);
+    const expected = fromZonedTime(new Date(2026, 4, 25, 9, 0, 0, 0), TZ);
+    expect(next.getTime()).toBe(expected.getTime());
+  });
+
+  it('BYHOUR=9 on the morning of a national holiday (1° de Maio, Friday) skips to next business day', async () => {
+    // 2026-05-01 is a Friday AND Labor Day (national holiday).
+    // Next business day = Monday 2026-05-04.
+    const after = fromZonedTime(new Date(2026, 4, 1, 8, 0, 0, 0), TZ);
+    const next = await computeNextWithBusinessDays('FREQ=DAILY;BYWORKDAY=true;BYHOUR=9', after);
+    const expected = fromZonedTime(new Date(2026, 4, 4, 9, 0, 0, 0), TZ);
+    expect(next.getTime()).toBe(expected.getTime());
   });
 });
