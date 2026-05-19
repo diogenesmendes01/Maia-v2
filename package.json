@@ -30,7 +30,15 @@
     "test:e2e": "vitest run tests/e2e",
     "lint": "eslint src tests scripts",
     "format": "prettier --write src",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "admin:install": "cd src/admin-ui && npm install",
+    "admin:dev": "bash scripts/admin-ui-dev.sh",
+    "admin:build": "cd src/admin-ui && next build",
+    "admin:start": "cd src/admin-ui && next start --port 4000",
+    "admin:typecheck": "cd src/admin-ui && tsc --noEmit",
+    "test:admin-ui:unit": "vitest run tests/admin-ui/unit/",
+    "test:admin-ui:e2e": "playwright test tests/admin-ui/e2e/",
+    "admin:acceptance": "bash scripts/admin-ui-acceptance-gates.sh"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.30.0",

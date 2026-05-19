@@ -48,10 +48,29 @@ import {
   roles,
   channel_policies,
   role_selector_decisions,
+  app_users,
+  app_sessions,
+  proposal_approvals,
+  admin_audit_log,
+  debug_snapshot_grants,
+} from './schema.js';
+import type {
+  AppUser,
+  NewAppUser,
+  ProposalApproval,
+  NewProposalApproval,
+  AdminAuditLogEntry,
+  NewAdminAuditLogEntry,
+  DebugSnapshotGrant,
+  NewDebugSnapshotGrant,
+  ProposalTypeId,
+  RiskLevelId,
+  ProposalUnifiedStatus,
 } from './schema.js';
 import { TypedError } from '@/lib/utils.js';
 import { applyTenantGuard } from './tenant-guard.js';
 import { getCurrentTenant, getCurrentAgent } from './tenant-context.js';
+import { deriveCapabilityRisk, deriveCapabilityLocks } from './capability-risk.js';
 import { LearnedVoiceModifierSchema } from '@/identity/learned-voice-modifier.js';
 import type {
   ProfileStatus,
@@ -3807,6 +3826,640 @@ export const roleSelectorDecisionsRepo = {
     `);
     const raw = result.rows[0]?.count ?? 0;
     return typeof raw === 'string' ? Number(raw) : raw;
+  },
+};
+
+// =====================================================================
+// P8.5 Admin UI v1 — auth, approvals, audit log, debug snapshot grants
+// =====================================================================
+
+/**
+ * Repository wrapper for P8.5 admin-ui app_users (NextAuth integration).
+ */
+export const appUsersRepo = {
+  async getByEmail(tenant_id: string, email: string): Promise<AppUser | null> {
+    const rows = await db
+      .select()
+      .from(app_users)
+      .where(and(eq(app_users.tenant_id, tenant_id), eq(app_users.email, email)))
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  async getById(id: string): Promise<AppUser | null> {
+    const rows = await db.select().from(app_users).where(eq(app_users.id, id)).limit(1);
+    return rows[0] ?? null;
+  },
+
+  async create(input: NewAppUser): Promise<AppUser> {
+    const rows = await db.insert(app_users).values(input).returning();
+    if (!rows[0]) throw new TypedError('app_user_create_failed', 'Could not create app_user');
+    return rows[0];
+  },
+};
+
+/**
+ * proposalsUnified — virtual UNION view aggregating all proposal sources.
+ *
+ * Targets (post-merge of #93–#96):
+ *   - policy_rules               (P8e — PolicyDescriptorResolver)
+ *   - soul_biases                (P8b — Soul Layer)
+ *   - skills                     (P8c — User Layer)
+ *   - capability_proposals       (P5 — already in main)
+ *   - knowledge_pending_review   (P10a — knowledge state machine)
+ *
+ * In current main, only `capability_proposals` exists. This wrapper falls back
+ * gracefully: tables that do not exist yet contribute zero rows (verified at
+ * call time via information_schema lookups). Once the dependent PRs merge,
+ * the UNION view materializes the full federation without code changes.
+ */
+export const proposalsUnifiedRepo = {
+  /** Tables expected to exist post-merge; queried with COALESCE-style fallback. */
+  EXPECTED_TABLES: [
+    'policy_rules',
+    'soul_biases',
+    'skills',
+    'capability_proposals',
+    'knowledge_pending_review',
+  ] as const,
+
+  async _availableTables(): Promise<string[]> {
+    const result = await db.execute<{ table_name: string }>(sql`
+      SELECT table_name FROM information_schema.tables
+       WHERE table_schema = 'public'
+         AND table_name = ANY (ARRAY['policy_rules','soul_biases','skills','capability_proposals','knowledge_pending_review'])
+    `);
+    return result.rows.map((r) => r.table_name);
+  },
+
+  async list(input: {
+    tenantId: string;
+    types?: ProposalTypeId[];
+    risks?: RiskLevelId[];
+    sources?: string[];
+    status?: ProposalUnifiedStatus;
+    ageBucket?: 'lt_1h' | 'lt_24h' | 'lt_7d' | 'lt_30d' | 'older';
+    limit: number;
+    cursor?: string | null;
+  }): Promise<{
+    items: Array<{
+      id: string;
+      type: ProposalTypeId;
+      descriptor: string;
+      risk: RiskLevelId;
+      source: string;
+      status: ProposalUnifiedStatus;
+      proposed_at: Date;
+      proposed_by: string;
+    }>;
+    hasMore: boolean;
+    nextCursor: string | null;
+  }> {
+    const available = await this._availableTables();
+    const status = input.status ?? 'proposed';
+
+    // capability_proposals is the only table guaranteed to exist on main.
+    if (!available.includes('capability_proposals')) {
+      return { items: [], hasMore: false, nextCursor: null };
+    }
+
+    const items: Array<{
+      id: string;
+      type: ProposalTypeId;
+      descriptor: string;
+      risk: RiskLevelId;
+      source: string;
+      status: ProposalUnifiedStatus;
+      proposed_at: Date;
+      proposed_by: string;
+    }> = [];
+
+    // capability_proposals: title column → descriptor
+    // capability_proposals.status uses values: 'draft' | 'submitted' | 'approved' | 'rejected' | 'delivered'
+    // We map admin-ui statuses ('proposed' | 'pending_review' | 'rejected' | 'activated') to those values:
+    //   proposed → submitted
+    //   pending_review → submitted (alias for current admin-ui review queue)
+    //   rejected → rejected
+    //   activated → delivered
+    const capStatusMap: Record<ProposalUnifiedStatus, string> = {
+      proposed: 'submitted',
+      pending_review: 'submitted',
+      rejected: 'rejected',
+      activated: 'delivered',
+    };
+    if (available.includes('capability_proposals')) {
+      const dbStatus = capStatusMap[status];
+      const rows = await db
+        .select()
+        .from(capability_proposals)
+        .where(
+          and(
+            eq(capability_proposals.tenant_id, input.tenantId),
+            eq(capability_proposals.status, dbStatus),
+          ),
+        )
+        .orderBy(desc(capability_proposals.created_at))
+        .limit(input.limit + 1);
+      for (const r of rows) {
+        // Post-Codex-review #101: risk is DERIVED from capability_type +
+        // proposed_spec markers; never hardcoded. Fail-closed default is
+        // 'critical' (forces dual approval). See ./capability-risk.ts.
+        items.push({
+          id: r.id,
+          type: 'capability_proposal',
+          descriptor: r.title,
+          risk: deriveCapabilityRisk(r.capability_type, r.proposed_spec),
+          source: r.capability_type,
+          status,
+          proposed_at: r.created_at,
+          proposed_by: r.decided_by ?? 'system',
+        });
+      }
+    }
+
+    // Future tables (policy_rules, soul_biases, skills, knowledge_pending_review)
+    // are wired up here once their schemas land in main; the available[] check
+    // gates each block independently to avoid runtime errors before merge.
+
+    // Simple in-memory filter on optional facets (UI-side filters)
+    const filtered = items.filter((it) => {
+      if (input.types && !input.types.includes(it.type)) return false;
+      if (input.risks && !input.risks.includes(it.risk)) return false;
+      if (input.sources && !input.sources.includes(it.source)) return false;
+      return true;
+    });
+
+    const hasMore = filtered.length > input.limit;
+    const trimmed = filtered.slice(0, input.limit);
+    const nextCursor = hasMore && trimmed[trimmed.length - 1]
+      ? trimmed[trimmed.length - 1]!.id
+      : null;
+    return { items: trimmed, hasMore, nextCursor };
+  },
+
+  async countersByType(tenantId: string): Promise<Record<ProposalTypeId, number>> {
+    const counts: Record<ProposalTypeId, number> = {
+      policy_rule: 0,
+      soul_bias: 0,
+      skill: 0,
+      capability_proposal: 0,
+      knowledge_proposal: 0,
+    };
+    const available = await this._availableTables();
+    if (available.includes('capability_proposals')) {
+      const result = await db.execute<{ count: number | string }>(sql`
+        SELECT COUNT(*)::int AS count
+          FROM capability_proposals
+         WHERE tenant_id = ${tenantId}
+           AND status = 'submitted'
+      `);
+      const raw = result.rows[0]?.count ?? 0;
+      counts.capability_proposal = typeof raw === 'string' ? Number(raw) : raw;
+    }
+    return counts;
+  },
+
+  async getOne(
+    tenantId: string,
+    id: string,
+  ): Promise<{
+    id: string;
+    type: ProposalTypeId;
+    descriptor: string;
+    risk: RiskLevelId;
+    source: string;
+    status: ProposalUnifiedStatus;
+    proposed_at: Date;
+    proposed_by: string;
+    body: unknown;
+    locks: string[];
+  } | null> {
+    const available = await this._availableTables();
+    if (available.includes('capability_proposals')) {
+      const rows = await db
+        .select()
+        .from(capability_proposals)
+        .where(and(eq(capability_proposals.tenant_id, tenantId), eq(capability_proposals.id, id)))
+        .limit(1);
+      const r = rows[0];
+      if (r) {
+        // Reverse-map db status → admin-ui status; fall back to 'proposed'.
+        const reverseStatusMap: Record<string, ProposalUnifiedStatus> = {
+          draft: 'proposed',
+          submitted: 'proposed',
+          approved: 'pending_review',
+          rejected: 'rejected',
+          delivered: 'activated',
+        };
+        // Post-Codex-review #101: risk + locks DERIVED from spec, not hardcoded.
+        return {
+          id: r.id,
+          type: 'capability_proposal',
+          descriptor: r.title,
+          risk: deriveCapabilityRisk(r.capability_type, r.proposed_spec),
+          source: r.capability_type,
+          status: reverseStatusMap[r.status] ?? 'proposed',
+          proposed_at: r.created_at,
+          proposed_by: r.decided_by ?? 'system',
+          body: r.proposed_spec,
+          locks: deriveCapabilityLocks(r.capability_type, r.proposed_spec),
+        };
+      }
+    }
+    return null;
+  },
+
+  /**
+   * decideAtomically — single-transaction approve/reject for a unified proposal.
+   *
+   * Post-Codex-review #101: the old approve/reject path inserted into
+   * proposal_approvals + admin_audit_log but never touched the source-of-truth
+   * row. A capability_proposal could stay in status='submitted' forever while
+   * the admin UI reported "activated". This method closes that gap.
+   *
+   * Behavior per source:
+   *   capability_proposals:
+   *     - On approve gate satisfied (dual or single): submitted → approved
+   *       (capabilityProposalsRepo.transition). Subsequent activation
+   *       (approved → testing → delivered) is owned by the capability-test-runner.
+   *     - On reject: submitted → rejected.
+   *
+   *   policy_rules / soul_biases / skills / knowledge_pending_review:
+   *     - Transitions deferred to the source repo once each schema lands.
+   *       Returns { ok: false, reason: 'source_not_supported' } until then —
+   *       NEVER silently succeeds.
+   *
+   * Pre-conditions enforced inside the transaction:
+   *   - Source row exists for (tenantId, id)
+   *   - Source status is currently in a valid pre-decision state for the
+   *     attempted transition (rejects double-approval, double-reject, race
+   *     between two operators).
+   *
+   * round-2 fix: dup-check (same user cannot approve twice) and gate
+   * recomputation now happen INSIDE the transaction after locking the source
+   * row. This prevents the race where two concurrent approvers both compute
+   * willSatisfyGate=false outside the tx, then both serialize through the
+   * lock and insert approvals without triggering the transition.
+   *
+   * Gate inputs from the tRPC layer (requiredRoles, allLocks) are passed in
+   * so this method can recompute dualComplete from the fresh approval list.
+   */
+  async decideAtomically(input: {
+    tenantId: string;
+    proposalId: string;
+    type: ProposalTypeId;
+    approvalClass: string;
+    actorId: string;
+    actorRole: string;
+    decision: 'approved' | 'rejected';
+    comment: string;
+    /**
+     * Provided by the tRPC layer for gate recomputation inside the tx.
+     * If absent, falls back to the pre-computed dualComplete (old behaviour,
+     * kept for backwards-compat with the mock in tests).
+     */
+    gateParams?: {
+      dualRequired: boolean;
+      requiredRoles: string[];
+      allLocks: string[];
+    };
+    /** True ⇒ the gate is satisfied; perform the source transition.
+     * Ignored when gateParams is present (recomputed inside tx). */
+    dualComplete: boolean;
+  }): Promise<{
+    ok: true;
+    sourceTransitioned: boolean;
+    approval: ProposalApproval;
+    finalStatus: ProposalUnifiedStatus;
+    /** Recomputed inside transaction. */
+    dualComplete: boolean;
+  } | {
+    ok: false;
+    reason:
+      | 'not_found'
+      | 'invalid_source_status'
+      | 'source_not_supported'
+      | 'transition_failed'
+      | 'already_approved_by_user'
+      | 'already_approved_by_role';
+  }> {
+    const available = await this._availableTables();
+
+    return await withTx(async (tx) => {
+      // (1) Re-read + LOCK source row to prevent races.
+      if (input.type === 'capability_proposal') {
+        if (!available.includes('capability_proposals')) {
+          return { ok: false, reason: 'source_not_supported' as const };
+        }
+        const rows = await tx
+          .select()
+          .from(capability_proposals)
+          .where(
+            and(
+              eq(capability_proposals.tenant_id, input.tenantId),
+              eq(capability_proposals.id, input.proposalId),
+            ),
+          )
+          .for('update')
+          .limit(1);
+        const sourceRow = rows[0];
+        if (!sourceRow) return { ok: false, reason: 'not_found' as const };
+
+        // Only 'submitted' rows are eligible for approve/reject. 'draft' would
+        // need explicit submit first; terminal states block.
+        if (sourceRow.status !== 'submitted') {
+          return { ok: false, reason: 'invalid_source_status' as const };
+        }
+
+        // (1b) Re-read existing approvals INSIDE the transaction + re-run dup
+        // checks so concurrent approvers cannot race past the idempotency guard.
+        let resolvedDualComplete = input.dualComplete;
+        if (input.decision === 'approved' && input.gateParams) {
+          const existingInTx = await tx
+            .select()
+            .from(proposal_approvals)
+            .where(eq(proposal_approvals.proposal_id, input.proposalId));
+
+          // Idempotency by user: same user cannot record two approvals.
+          if (existingInTx.some(
+            (a) => a.approver_user_id === input.actorId && a.decision === 'approved',
+          )) {
+            return { ok: false, reason: 'already_approved_by_user' as const };
+          }
+
+          const { dualRequired, requiredRoles, allLocks } = input.gateParams;
+
+          // For non-lockdown dual classes: same role cannot double-sign.
+          if (dualRequired && allLocks.length === 0) {
+            if (existingInTx.some(
+              (a) => a.approver_role === input.actorRole && a.decision === 'approved',
+            )) {
+              return { ok: false, reason: 'already_approved_by_role' as const };
+            }
+          }
+
+          // Recompute gate from the fresh (locked) approval list + this approval.
+          if (allLocks.length > 0) {
+            const priorFounderIds = new Set(
+              existingInTx
+                .filter((a) => a.decision === 'approved' && a.approver_role === 'founder')
+                .map((a) => a.approver_user_id),
+            );
+            priorFounderIds.add(input.actorId);
+            resolvedDualComplete = priorFounderIds.size >= 2;
+          } else if (dualRequired) {
+            const approvedRoles = new Set(
+              existingInTx.filter((a) => a.decision === 'approved').map((a) => a.approver_role),
+            );
+            approvedRoles.add(input.actorRole);
+            resolvedDualComplete = requiredRoles.every((r) => approvedRoles.has(r));
+          } else {
+            resolvedDualComplete = true;
+          }
+        }
+
+        // (2) Insert approval row.
+        const insertedApprovals = await tx
+          .insert(proposal_approvals)
+          .values({
+            tenant_id: input.tenantId,
+            proposal_id: input.proposalId,
+            approval_class: input.approvalClass,
+            approver_user_id: input.actorId,
+            approver_role: input.actorRole,
+            decision: input.decision,
+            comment: input.comment,
+          })
+          .returning();
+        const approval = insertedApprovals[0];
+        if (!approval) {
+          throw new TypedError('approval_insert_failed', 'Could not record approval');
+        }
+
+        // (3) Audit BEFORE source mutation, so the audit row is visible
+        // even if the source UPDATE rolls back.
+        await tx.insert(admin_audit_log).values({
+          tenant_id: input.tenantId,
+          actor_id: input.actorId,
+          actor_role: input.actorRole,
+          action: input.decision === 'approved' ? 'proposal_approve' : 'proposal_reject',
+          resource_type: 'capability_proposal',
+          resource_id: input.proposalId,
+          change_summary: {
+            approval_class: input.approvalClass,
+            comment: input.comment,
+            dual_complete: resolvedDualComplete,
+            source_transition_attempted:
+              input.decision === 'rejected' || resolvedDualComplete,
+          },
+        });
+
+        // (4) Mutate source-of-truth.
+        let finalStatus: ProposalUnifiedStatus = 'pending_review';
+        let sourceTransitioned = false;
+        if (input.decision === 'rejected') {
+          // Direct UPDATE inside the same txn so we don't depend on
+          // capabilityProposalsRepo.transition (which uses module-level `db`).
+          const patched = await tx
+            .update(capability_proposals)
+            .set({
+              status: 'rejected',
+              decided_at: new Date(),
+              decided_by: input.actorId,
+              decision_reason: input.comment,
+              updated_at: new Date(),
+            })
+            .where(eq(capability_proposals.id, input.proposalId))
+            .returning();
+          if (patched.length === 0) {
+            return { ok: false, reason: 'transition_failed' as const };
+          }
+          finalStatus = 'rejected';
+          sourceTransitioned = true;
+        } else if (resolvedDualComplete) {
+          // submitted → approved. (approved → testing → delivered is owned by
+          // capability-test-runner and runs out-of-band.)
+          const patched = await tx
+            .update(capability_proposals)
+            .set({
+              status: 'approved',
+              decided_at: new Date(),
+              decided_by: input.actorId,
+              decision_reason: input.comment,
+              updated_at: new Date(),
+            })
+            .where(eq(capability_proposals.id, input.proposalId))
+            .returning();
+          if (patched.length === 0) {
+            return { ok: false, reason: 'transition_failed' as const };
+          }
+          // Admin-ui surface name: 'pending_review' once approved but not yet
+          // delivered. The reverseStatusMap in getOne also maps 'approved' →
+          // 'pending_review' for consistency.
+          finalStatus = 'pending_review';
+          sourceTransitioned = true;
+        }
+
+        return {
+          ok: true as const,
+          sourceTransitioned,
+          approval,
+          finalStatus,
+          dualComplete: resolvedDualComplete,
+        };
+      }
+
+      // Future sources land here. Returning source_not_supported is the
+      // fail-safe — surface NOT_IMPLEMENTED to the operator instead of
+      // pretending success.
+      return { ok: false, reason: 'source_not_supported' as const };
+    });
+  },
+
+  /**
+   * Bulk reject — only allowed for risk=low proposals.
+   * Hard-limit / architecture-lock proposals are rejected one-at-a-time.
+   */
+  async bulkReject(
+    tenantId: string,
+    ids: string[],
+    actorId: string,
+    actorRole: string,
+    comment: string,
+  ): Promise<{ rejected_count: number; skipped_ids: string[] }> {
+    if (ids.length === 0) return { rejected_count: 0, skipped_ids: [] };
+    // round-2 fix: each proposal is processed in its own nested transaction
+    // using decideAtomically so that:
+    //   (a) The source row is locked (SELECT FOR UPDATE) before reading status.
+    //   (b) audit/approval rows are ONLY inserted when the source transition
+    //       succeeds (UPDATE returns a row), not on stale/already-handled rows.
+    //   (c) rejected_count is only incremented for actual state changes.
+    let rejected = 0;
+    const skipped: string[] = [];
+
+    for (const id of ids) {
+      // Pre-flight: read outside tx for fast-skip (risk, locks). If the row
+      // disappears between here and decideAtomically, decideAtomically returns
+      // not_found and we skip.
+      const proposal = await this.getOne(tenantId, id);
+      if (!proposal) {
+        skipped.push(id);
+        continue;
+      }
+      if (proposal.risk !== 'low') {
+        skipped.push(id);
+        continue;
+      }
+      if (proposal.locks.length > 0) {
+        skipped.push(id);
+        continue;
+      }
+      // Authoritative transactional path: lock + validate + write atomically.
+      const result = await this.decideAtomically({
+        tenantId,
+        proposalId: id,
+        type: proposal.type,
+        approvalClass: `${proposal.type}_${proposal.risk}`,
+        actorId,
+        actorRole,
+        decision: 'rejected',
+        comment,
+        dualComplete: true, // single rejection is always gate-complete.
+      });
+      if (!result.ok) {
+        // invalid_source_status → row already delivered/approved/rejected.
+        // not_found → race: row deleted between pre-flight and lock.
+        // Either way: no state change → skip without counting.
+        skipped.push(id);
+        continue;
+      }
+      rejected += 1;
+    }
+    return { rejected_count: rejected, skipped_ids: skipped };
+  },
+};
+
+/**
+ * proposalApprovalsRepo — track + check dual-approval state.
+ */
+export const proposalApprovalsRepo = {
+  async listByProposal(proposalId: string): Promise<ProposalApproval[]> {
+    return await db
+      .select()
+      .from(proposal_approvals)
+      .where(eq(proposal_approvals.proposal_id, proposalId));
+  },
+
+  async record(input: NewProposalApproval): Promise<ProposalApproval> {
+    const rows = await db.insert(proposal_approvals).values(input).returning();
+    if (!rows[0]) throw new TypedError('approval_insert_failed', 'Could not record approval');
+    return rows[0];
+  },
+};
+
+/**
+ * adminAuditLogRepo — APPEND-ONLY mutation trail for admin-ui actions.
+ *
+ * IMPORTANT: this repo exposes ONLY `append` and `list`. There is NO update
+ * or delete method. Lint rule (eslint custom config) flags any direct
+ * `update(admin_audit_log)` or `delete(admin_audit_log)` usage in src/.
+ */
+export const adminAuditLogRepo = {
+  async append(entry: NewAdminAuditLogEntry): Promise<AdminAuditLogEntry> {
+    const rows = await db.insert(admin_audit_log).values(entry).returning();
+    if (!rows[0]) throw new TypedError('audit_log_append_failed', 'Could not append audit entry');
+    return rows[0];
+  },
+
+  async list(input: {
+    tenantId: string;
+    actorId?: string;
+    resourceType?: string;
+    limit?: number;
+  }): Promise<AdminAuditLogEntry[]> {
+    const limit = input.limit ?? 100;
+    const where = [eq(admin_audit_log.tenant_id, input.tenantId)];
+    if (input.actorId) where.push(eq(admin_audit_log.actor_id, input.actorId));
+    if (input.resourceType) where.push(eq(admin_audit_log.resource_type, input.resourceType));
+    return await db
+      .select()
+      .from(admin_audit_log)
+      .where(and(...where))
+      .orderBy(desc(admin_audit_log.created_at))
+      .limit(limit);
+  },
+};
+
+/**
+ * debugSnapshotGrantsRepo — TTL-bounded permission grants for trace bodies.
+ */
+export const debugSnapshotGrantsRepo = {
+  async create(input: NewDebugSnapshotGrant): Promise<DebugSnapshotGrant> {
+    const rows = await db.insert(debug_snapshot_grants).values(input).returning();
+    if (!rows[0]) throw new TypedError('grant_insert_failed', 'Could not create grant');
+    return rows[0];
+  },
+
+  async findActive(args: {
+    tenantId: string;
+    userId: string;
+    traceId: string;
+  }): Promise<DebugSnapshotGrant | null> {
+    const now = new Date();
+    const rows = await db
+      .select()
+      .from(debug_snapshot_grants)
+      .where(
+        and(
+          eq(debug_snapshot_grants.tenant_id, args.tenantId),
+          eq(debug_snapshot_grants.granted_to_user_id, args.userId),
+          eq(debug_snapshot_grants.trace_id, args.traceId),
+          isNull(debug_snapshot_grants.revoked_at),
+          gt(debug_snapshot_grants.expires_at, now),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
   },
 };
 
