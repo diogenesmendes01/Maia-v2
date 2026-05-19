@@ -71,14 +71,21 @@ export interface LatePep {
     candidate: AgentOutputCandidate,
     execContext: ExecutionContextPacket,
     decision: DecisionPacket,
+    options?: { signal?: AbortSignal },
   ): Promise<PolicyValidationResult>;
 }
 
-/** Schema validator stub (Late PEP step 1). */
+/**
+ * Schema validator stub (Late PEP step 1).
+ *
+ * Round-2 finding 4: `signal` lets callers cancel slow schema validation
+ * (e.g. remote registry fetch) when an upstream deadline fires.
+ */
 export interface SkillSchemaValidator {
   validate(
     output: unknown,
     schemaRef: string | undefined,
+    options?: { signal?: AbortSignal },
   ): Promise<{ valid: boolean; errors: string[] }>;
 }
 

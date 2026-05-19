@@ -107,8 +107,38 @@ export class ActionDeciderImpl implements ActionDecider {
       };
     }
 
-    // 4. Look up skill to decide tool path vs respond.
-    const skill = await this.deps.skillsRepo.find(input.skill.selected_skill_id);
+    // 4. Resolve the skill.
+    //
+    // Codex round-2 finding 3: prefer the scoped `selected_skill` instance
+    // resolved upstream by SkillSelector (which queried under the routed
+    // agent). The previous unscoped `find(skill_id)` would happily return a
+    // skill from another agent — or even another tenant — sharing the same
+    // ID, leaking its `allowed_tools` into the packet.
+    //
+    // We still fall back to `find(skill_id, scope)` for callers that didn't
+    // populate `selected_skill` (e.g. tests / legacy wiring), but the call
+    // is now SCOPED to `(tenant_id, routed agent_id)` so the leak is
+    // closed in either path. If neither yields a skill, we treat it as a
+    // lookup failure rather than silently emitting empty permissions.
+    let skill: Skill | null = input.skill.selected_skill ?? null;
+    if (!skill) {
+      const lookupScope = {
+        tenant_id: input.base.tenant_id,
+        // ActionDecider sees only base.agent_id at this layer; the routed
+        // agent is what was used by SkillSelector and is already encoded
+        // into `selected_skill` when present. When falling back we use
+        // base.agent_id which matches the original (pre-routing) caller
+        // and is the only piece of identity available here.
+        agent_id: input.base.agent_id,
+      };
+      const findOpts: { signal?: AbortSignal } = {};
+      if (input.signal) findOpts.signal = input.signal;
+      skill = await this.deps.skillsRepo.find(
+        input.skill.selected_skill_id,
+        lookupScope,
+        findOpts,
+      );
+    }
 
     if (!skill) {
       return {

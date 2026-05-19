@@ -28,7 +28,10 @@ export class LatePepImpl implements LatePep {
     candidate: AgentOutputCandidate,
     execContext: ExecutionContextPacket,
     decision: DecisionPacket,
+    options?: { signal?: AbortSignal },
   ): Promise<PolicyValidationResult> {
+    const opts: { signal?: AbortSignal } = {};
+    if (options?.signal) opts.signal = options.signal;
     const results: PolicyValidationResult['policy_decisions'] = [];
 
     // 1. Schema validation (only if a schema is declared).
@@ -36,6 +39,7 @@ export class LatePepImpl implements LatePep {
     const schemaCheck = await this.deps.skillSchemaValidator.validate(
       candidate.structured_output ?? candidate.raw_text,
       schemaRef,
+      opts,
     );
     if (!schemaCheck.valid) {
       return {
@@ -59,14 +63,18 @@ export class LatePepImpl implements LatePep {
     );
 
     for (const rule of latePolicies) {
-      const body = await this.deps.policyRepo.getBody(rule.policy_id);
+      const body = await this.deps.policyRepo.getBody(rule.policy_id, opts);
       if (!body) continue;
 
-      const verdict = await this.deps.evaluator.evaluate(body, {
-        output: candidate,
-        decision,
-        execContext,
-      });
+      const verdict = await this.deps.evaluator.evaluate(
+        body,
+        {
+          output: candidate,
+          decision,
+          execContext,
+        },
+        opts,
+      );
 
       const policyDecision = mapVerdictToDecision(verdict);
       results.push({
@@ -81,6 +89,20 @@ export class LatePepImpl implements LatePep {
         return { passed: false, policy_decisions: results, final_action: 'block' };
       }
       if (verdict.action === 'escalate') {
+        return {
+          passed: false,
+          policy_decisions: results,
+          final_action: 'escalate',
+        };
+      }
+      // Codex round-2 finding 1: a Late `require_dual_approval` verdict MUST
+      // halt the send path. Without this branch the verdict was recorded into
+      // policy_decisions, then the loop fell through to `passed:true /
+      // final_action:'send'` — i.e. policy says "needs dual approval" but the
+      // message would still be delivered. Treat as failed validation that
+      // requires escalation, matching how Mid PEP surfaces the same verdict
+      // via DecisionEngine (action_mode='escalate').
+      if (verdict.action === 'require_dual_approval') {
         return {
           passed: false,
           policy_decisions: results,

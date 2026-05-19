@@ -36,6 +36,7 @@ import {
   type PolicyDescriptorResolver,
   type RequireDualApprovalDecision,
   type RiskScorer,
+  type Skill,
   type SkillSelector,
   type SubBudgetName,
   type WorkflowSelector,
@@ -188,12 +189,15 @@ export class DecisionEngine {
     try {
       // --- Step 0: resolve all applicable policies (Codex #103: must obey budget too). ---
       const resolved_policies = await runStep('resolver', () =>
-        this.deps.resolver.resolveDescriptors({
-          tenant_id: input.base.tenant_id,
-          agent_id: input.base.agent_id,
-          descriptors: ['*'],
-          scope: { channel: input.base.channel.kind },
-        }),
+        this.deps.resolver.resolveDescriptors(
+          {
+            tenant_id: input.base.tenant_id,
+            agent_id: input.base.agent_id,
+            descriptors: ['*'],
+            scope: { channel: input.base.channel.kind },
+          },
+          { signal },
+        ),
       );
 
       // --- Step 1: Early PEP. ---
@@ -201,6 +205,7 @@ export class DecisionEngine {
         this.deps.earlyPep.evaluate({
           base: input.base,
           resolved_policies,
+          signal,
         }),
       );
 
@@ -221,22 +226,22 @@ export class DecisionEngine {
 
       // --- Step 2: intent classifier. ---
       const intent = await runStep('intent', () =>
-        this.deps.intentClassifier.classify(input.base),
+        this.deps.intentClassifier.classify(input.base, { signal }),
       );
 
       // --- Step 3: risk scorer (stub in P9b; TODO P9c). ---
       const risk = await runStep('risk', () =>
-        this.deps.riskScorer.score({ intent, base: input.base }),
+        this.deps.riskScorer.score({ intent, base: input.base }, { signal }),
       );
 
       // --- Step 4: workflow selector. ---
       const workflow = await runStep('workflow', () =>
-        this.deps.workflowSelector.select(input.base, intent),
+        this.deps.workflowSelector.select(input.base, intent, { signal }),
       );
 
       // --- Step 5: agent selector (no-op in P9b). ---
       const agent = await runStep('agent', () =>
-        this.deps.agentSelector.select(input.base),
+        this.deps.agentSelector.select(input.base, { signal }),
       );
 
       // --- Step 6: skill selector. ---
@@ -247,7 +252,7 @@ export class DecisionEngine {
       // skills/tool permissions into the packet.
       const skillOptions: NonNullable<
         Parameters<SkillSelector['select']>[2]
-      > = { agent_id_override: agent.agent_id };
+      > = { agent_id_override: agent.agent_id, signal };
       if (workflow.workflow_id !== undefined) {
         skillOptions.workflow_id = workflow.workflow_id;
       }
@@ -256,6 +261,20 @@ export class DecisionEngine {
       );
 
       // --- Step 7: Mid PEP. ---
+      // Codex round-2 finding 2: Mid PEP must see the selected skill's
+      // actual tool permissions, NOT an empty placeholder. Otherwise tool
+      // policies evaluate against `[]` and approve tools that later appear
+      // in the packet. We derive the preview from `skill.selected_skill`
+      // (the SAME scoped instance the SkillSelector returned), which also
+      // closes finding 3 by removing the unscoped re-fetch downstream.
+      const selectedSkill: Skill | undefined = skill.selected_skill;
+      const toolPermsPreview: DecisionPacket['tool_permissions'] = selectedSkill
+        ? {
+            allowed_tools: selectedSkill.allowed_tools ?? [],
+            blocked_tools: selectedSkill.blocked_tools ?? [],
+            requires_confirmation: selectedSkill.requires_confirmation_tools ?? [],
+          }
+        : EMPTY_TOOL_PERMS;
       const midResult: MidPepOutput = await runStep('mid_pep', () =>
         this.deps.midPep.evaluate({
           base: input.base,
@@ -268,8 +287,10 @@ export class DecisionEngine {
           ...(workflow.workflow_id !== undefined
             ? { workflow_id: workflow.workflow_id }
             : {}),
-          tool_permissions_preview: EMPTY_TOOL_PERMS,
+          ...(selectedSkill ? { selected_skill: selectedSkill } : {}),
+          tool_permissions_preview: toolPermsPreview,
           resolved_policies,
+          signal,
         }),
       );
 
@@ -317,6 +338,7 @@ export class DecisionEngine {
           skill,
           midPepOutcome: midResult,
           earlyWarnings: (earlyResult as ContinueDecision).warnings ?? [],
+          signal,
         }),
       );
 

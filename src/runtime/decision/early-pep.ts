@@ -27,7 +27,13 @@ export interface EarlyPepDeps {
 export class EarlyPepImpl implements EarlyPep {
   constructor(private deps: EarlyPepDeps) {}
 
-  async evaluate({ base, resolved_policies }: EarlyPepInput): Promise<EarlyPepOutput> {
+  async evaluate({
+    base,
+    resolved_policies,
+    signal,
+  }: EarlyPepInput): Promise<EarlyPepOutput> {
+    const opts: { signal?: AbortSignal } = {};
+    if (signal) opts.signal = signal;
     // 1. Hardcoded short-circuits (rules first, master §0.4 principle 1).
     if (base.channel.is_locked_down) {
       return {
@@ -43,6 +49,7 @@ export class EarlyPepImpl implements EarlyPep {
     // 2. Tenant lockdown check (governance/lockdown.ts).
     const tenantLocked = await this.deps.lockdownReader.isTenantInGlobalLockdown(
       base.tenant_id,
+      opts,
     );
     if (tenantLocked) {
       return {
@@ -67,16 +74,20 @@ export class EarlyPepImpl implements EarlyPep {
     const warnings: ContinueDecision['warnings'] = [];
 
     for (const policy of earlyPolicies) {
-      const body = await this.deps.policyRepo.getBody(policy.policy_id);
+      const body = await this.deps.policyRepo.getBody(policy.policy_id, opts);
       if (!body) continue;
 
-      const verdict = await this.deps.evaluator.evaluate(body, {
-        actor: base.actor,
-        channel: base.channel,
-        input: base.input,
-        received_at: base.input.received_at,
-        tenant_id: base.tenant_id,
-      });
+      const verdict = await this.deps.evaluator.evaluate(
+        body,
+        {
+          actor: base.actor,
+          channel: base.channel,
+          input: base.input,
+          received_at: base.input.received_at,
+          tenant_id: base.tenant_id,
+        },
+        opts,
+      );
 
       if (verdict.action === 'block' || verdict.action === 'escalate') {
         const block: BlockDecision = {

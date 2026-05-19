@@ -109,7 +109,12 @@ describe('P9b — Early PEP', () => {
 
     // Only the early policy should reach evaluator
     expect(evaluator.evaluate).toHaveBeenCalledTimes(1);
-    expect(policyRepo.getBody).toHaveBeenCalledWith('p_early');
+    // Round-2 finding 4: policyRepo.getBody now accepts an options object
+    // for AbortSignal propagation, so we use an additional matcher.
+    expect(policyRepo.getBody).toHaveBeenCalledWith(
+      'p_early',
+      expect.any(Object),
+    );
   });
 
   it('returns block if a policy evaluator returns block', async () => {

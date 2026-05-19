@@ -253,6 +253,87 @@ describe('P9b — Late PEP', () => {
     expect(deps.evaluator.evaluate).not.toHaveBeenCalled();
   });
 
+  it('Codex round-2 finding 1 — require_dual_approval verdict halts send and escalates', async () => {
+    const deps = mkDeps({
+      policyRepo: {
+        getBody: vi.fn().mockResolvedValue({
+          policy_id: 'p_dual_late',
+          descriptor: 'output.requires_dual_approval',
+          applies_to_peps: ['late'],
+        }),
+        getBodySync: vi.fn().mockReturnValue(null),
+      },
+      evaluator: {
+        evaluate: vi.fn().mockResolvedValue({
+          action: 'require_dual_approval',
+          reason: 'output crosses dual-approval threshold',
+          parameters: { approval_class: 'owner_plus_compliance' },
+        }),
+      },
+    });
+    const exec = mkExecContext({
+      policy: {
+        applicable_rules: [
+          {
+            policy_id: 'p_dual_late',
+            rule_descriptor: 'output.requires_dual_approval',
+            applies_to_peps: ['late'],
+          },
+        ],
+      },
+    });
+    const pep = new LatePepImpl(deps);
+    const r = await pep.validate(mkCandidate(), exec, mkDecision());
+
+    // The critical bug: before the fix the verdict was recorded but the loop
+    // fell through to passed:true / final_action:'send'. After the fix,
+    // dual_approval verdicts MUST block the send path with escalate.
+    expect(r.passed).toBe(false);
+    expect(r.final_action).toBe('escalate');
+    expect(r.policy_decisions).toHaveLength(1);
+    expect(r.policy_decisions[0]?.decision).toBe('require_dual_approval');
+    expect(r.policy_decisions[0]?.policy_id).toBe('p_dual_late');
+  });
+
+  it('Codex round-2 finding 1 — first dual_approval halts further policy evaluation', async () => {
+    // Two late policies in sequence — first returns dual_approval, second
+    // would return allow. After the fix the second one must NOT be reached.
+    const evaluate = vi
+      .fn()
+      .mockResolvedValueOnce({
+        action: 'require_dual_approval',
+        reason: 'amount over threshold',
+      })
+      .mockResolvedValueOnce({ action: 'allow', reason: 'ok' });
+    const deps = mkDeps({
+      policyRepo: {
+        getBody: vi.fn().mockImplementation(async (id: string) => ({
+          policy_id: id,
+          descriptor: `d.${id}`,
+          applies_to_peps: ['late'],
+        })),
+        getBodySync: vi.fn().mockReturnValue(null),
+      },
+      evaluator: { evaluate },
+    });
+    const exec = mkExecContext({
+      policy: {
+        applicable_rules: [
+          { policy_id: 'p_dual', rule_descriptor: 'd_dual', applies_to_peps: ['late'] },
+          { policy_id: 'p_allow', rule_descriptor: 'd_allow', applies_to_peps: ['late'] },
+        ],
+      },
+    });
+    const pep = new LatePepImpl(deps);
+    const r = await pep.validate(mkCandidate(), exec, mkDecision());
+
+    expect(r.passed).toBe(false);
+    expect(r.final_action).toBe('escalate');
+    // Only the first policy was evaluated (loop short-circuited).
+    expect(evaluate).toHaveBeenCalledTimes(1);
+    expect(r.policy_decisions).toHaveLength(1);
+  });
+
   it('all policy_decisions have pep=late', async () => {
     const deps = mkDeps({
       policyRepo: {

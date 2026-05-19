@@ -90,12 +90,17 @@ describe('P9b — SkillSelector', () => {
       { label: 'transfer_intent', confidence: 0.8 },
       { workflow_id: 'wf_123' },
     );
-    expect(deps.skillsRepo.findActive).toHaveBeenCalledWith({
-      tenant_id: 'tn1',
-      agent_id: 'ag1',
-      applicable_to_intent: 'transfer_intent',
-      applicable_to_workflow: 'wf_123',
-    });
+    // Round-2 finding 4: findActive now accepts a second arg for AbortSignal
+    // propagation, so match the first arg precisely and tolerate the rest.
+    expect(deps.skillsRepo.findActive).toHaveBeenCalledWith(
+      {
+        tenant_id: 'tn1',
+        agent_id: 'ag1',
+        applicable_to_intent: 'transfer_intent',
+        applicable_to_workflow: 'wf_123',
+      },
+      expect.any(Object),
+    );
   });
 
   it('Codex #103 — uses agent_id_override when provided (routed agent ≠ base agent)', async () => {

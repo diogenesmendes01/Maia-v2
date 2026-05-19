@@ -72,11 +72,15 @@ export interface PolicyEvaluatorVerdict {
  * TODO(P9d #98): Replace with concrete PolicyEvaluator class from P9d.
  * P9b ships a default `AllowAllPolicyEvaluator` that always returns
  * `allow`, plus a `FixturePolicyEvaluator` for testing.
+ *
+ * Round-2 finding 4: `signal` lets the Decision Engine cancel a slow
+ * evaluator when the hot-path budget fires.
  */
 export interface PolicyEvaluator {
   evaluate(
     body: PolicyRuleBody,
     context: Record<string, unknown>,
+    options?: { signal?: AbortSignal },
   ): Promise<PolicyEvaluatorVerdict>;
 }
 
@@ -84,9 +88,15 @@ export interface PolicyEvaluator {
  * Repository for fetching policy rule bodies by ID.
  *
  * TODO(P8e #93): Replace with PolicyRulesRepo from P8e.
+ *
+ * Round-2 finding 4: `signal` lets the Decision Engine cancel a slow repo
+ * lookup when the hot-path budget fires.
  */
 export interface PolicyRulesRepo {
-  getBody(policy_id: string): Promise<PolicyRuleBody | null>;
+  getBody(
+    policy_id: string,
+    options?: { signal?: AbortSignal },
+  ): Promise<PolicyRuleBody | null>;
   /** Sync access (cached). Returns null if not in cache. */
   getBodySync(policy_id: string): PolicyRuleBody | null;
 }
@@ -116,15 +126,36 @@ export interface Skill {
  * Skills repository (P9a stub).
  *
  * TODO(P9a #99): Replace with SkillsRepo from P9a.
+ *
+ * Codex round-2 finding 3: `find` MUST be scoped by tenant_id + agent_id.
+ * The legacy unscoped `find(skill_id)` would silently return a skill from a
+ * different agent (or even a different tenant in pathological data shapes),
+ * which then leaks its `allowed_tools` into the DecisionPacket. The scoped
+ * overload is now the only signature on the port; callers either pass scope
+ * or use the cached `Skill` object resolved upstream by `SkillSelector`.
+ *
+ * Round-2 finding 4: optional `signal` lets callers cancel slow I/O when
+ * the Decision Engine deadline fires.
  */
 export interface SkillsRepo {
-  findActive(query: {
-    tenant_id: string;
-    agent_id: string;
-    applicable_to_intent?: string;
-    applicable_to_workflow?: string;
-  }): Promise<Skill[]>;
-  find(skill_id: string): Promise<Skill | null>;
+  findActive(
+    query: {
+      tenant_id: string;
+      agent_id: string;
+      applicable_to_intent?: string;
+      applicable_to_workflow?: string;
+    },
+    options?: { signal?: AbortSignal },
+  ): Promise<Skill[]>;
+  /**
+   * Scoped lookup. Implementations MUST verify that the returned skill
+   * belongs to the supplied tenant_id+agent_id and return `null` otherwise.
+   */
+  find(
+    skill_id: string,
+    scope: { tenant_id: string; agent_id: string },
+    options?: { signal?: AbortSignal },
+  ): Promise<Skill | null>;
 }
 
 /**
@@ -147,15 +178,28 @@ export interface ChannelPoliciesReader {
  * Lockdown reader interface used by Early PEP.
  *
  * Bridges to existing `src/governance/lockdown.ts` (P4) via adapter.
+ *
+ * Round-2 finding 4: `signal` lets the Decision Engine cancel a slow
+ * lockdown lookup when the hot-path budget fires.
  */
 export interface LockdownReader {
-  isChannelLockedDown(channel_id: string, tenant_id: string): Promise<boolean>;
-  isTenantInGlobalLockdown(tenant_id: string): Promise<boolean>;
+  isChannelLockedDown(
+    channel_id: string,
+    tenant_id: string,
+    options?: { signal?: AbortSignal },
+  ): Promise<boolean>;
+  isTenantInGlobalLockdown(
+    tenant_id: string,
+    options?: { signal?: AbortSignal },
+  ): Promise<boolean>;
   /**
    * Returns true if tenant has data that makes a budget-fallback
    * `ask_clarification` unsafe (must escalate instead). Spec §6.2.
    */
-  tenantHasSensitiveContext(tenant_id: string): Promise<boolean>;
+  tenantHasSensitiveContext(
+    tenant_id: string,
+    options?: { signal?: AbortSignal },
+  ): Promise<boolean>;
 }
 
 /**
@@ -178,9 +222,12 @@ export interface ProceduresRepo {
 
 /**
  * Content resolver — resolves `content_ref` -> message text.
+ *
+ * Round-2 finding 4: `signal` lets the Decision Engine cancel slow content
+ * resolution (e.g. blob store) when the hot-path budget fires.
  */
 export interface ContentResolver {
-  text(content_ref: string): Promise<string>;
+  text(content_ref: string, options?: { signal?: AbortSignal }): Promise<string>;
 }
 
 /**
@@ -188,13 +235,20 @@ export interface ContentResolver {
  *
  * TODO: Replace with concrete HaikuClient from lib/claude.ts once a stable
  * narrow interface is exposed. Spec §7.1 calls `haiku.classify(...)`.
+ *
+ * Round-2 finding 4: `signal` lets the Decision Engine cancel a slow Haiku
+ * call when the hot-path budget fires. The Anthropic SDK accepts an
+ * AbortSignal natively.
  */
 export interface HaikuClient {
-  classify(params: {
-    text: string;
-    allowed_labels: string[];
-    max_tokens: number;
-  }): Promise<{ label: string; confidence: number; top3?: string[] }>;
+  classify(
+    params: {
+      text: string;
+      allowed_labels: string[];
+      max_tokens: number;
+    },
+    options?: { signal?: AbortSignal },
+  ): Promise<{ label: string; confidence: number; top3?: string[] }>;
 }
 
 /**
@@ -223,9 +277,15 @@ export interface ResolveDescriptorsQuery {
  * `src/control-plane/policy/policy-descriptor-resolver.ts`. Per spec
  * Architecture Lock, Decision Engine must NEVER import the resolver
  * directly.
+ *
+ * Round-2 finding 4: `signal` lets the Decision Engine cancel a slow
+ * resolver call when the hot-path budget fires.
  */
 export interface PolicyDescriptorResolver {
-  resolveDescriptors(query: ResolveDescriptorsQuery): Promise<ResolvedPolicy[]>;
+  resolveDescriptors(
+    query: ResolveDescriptorsQuery,
+    options?: { signal?: AbortSignal },
+  ): Promise<ResolvedPolicy[]>;
 }
 
 // ============================================================================
@@ -235,6 +295,8 @@ export interface PolicyDescriptorResolver {
 export interface EarlyPepInput {
   base: BaseContextPacket;
   resolved_policies: ResolvedPolicy[];
+  /** Round-2 finding 4: abort signal from Decision Engine deadline. */
+  signal?: AbortSignal;
 }
 
 export interface BlockDecision {
@@ -289,8 +351,24 @@ export interface MidPepInput {
   selected_skill_id?: string;
   candidate_skill_ids: string[];
   workflow_id?: string;
+  /**
+   * Preview of the tool permissions that will reach the final packet IF no
+   * Mid-PEP verdict mutates them. Codex round-2 finding 2: the Decision
+   * Engine MUST populate this from the resolved Skill object, NOT pass an
+   * empty placeholder. Otherwise tool-based block/reduce predicates evaluate
+   * against `[]` and approve tools that later appear in the packet.
+   */
   tool_permissions_preview: DecisionPacket['tool_permissions'];
+  /**
+   * The scoped Skill object selected by SkillSelector, when one was found.
+   * Allows policy evaluators to inspect schema refs / runtime hints without
+   * an extra repo lookup, and guarantees Mid PEP sees the same skill
+   * instance that ActionDecider will use downstream.
+   */
+  selected_skill?: Skill;
   resolved_policies: ResolvedPolicy[];
+  /** Round-2 finding 4: abort signal from Decision Engine deadline. */
+  signal?: AbortSignal;
 }
 
 export interface RequireDualApprovalDecision {
@@ -313,14 +391,20 @@ export interface MidPep {
 // ============================================================================
 
 export interface IntentClassifier {
-  classify(base: BaseContextPacket): Promise<DecisionPacket['intent']>;
+  classify(
+    base: BaseContextPacket,
+    options?: { signal?: AbortSignal },
+  ): Promise<DecisionPacket['intent']>;
 }
 
 export interface RiskScorer {
-  score(input: {
-    intent: DecisionPacket['intent'];
-    base: BaseContextPacket;
-  }): Promise<DecisionPacket['risk_profile']>;
+  score(
+    input: {
+      intent: DecisionPacket['intent'];
+      base: BaseContextPacket;
+    },
+    options?: { signal?: AbortSignal },
+  ): Promise<DecisionPacket['risk_profile']>;
 }
 
 export interface WorkflowSelectorResult {
@@ -332,16 +416,30 @@ export interface WorkflowSelector {
   select(
     base: BaseContextPacket,
     intent: DecisionPacket['intent'],
+    options?: { signal?: AbortSignal },
   ): Promise<WorkflowSelectorResult>;
 }
 
 export interface AgentSelector {
-  select(base: BaseContextPacket): Promise<{ agent_id: string }>;
+  select(
+    base: BaseContextPacket,
+    options?: { signal?: AbortSignal },
+  ): Promise<{ agent_id: string }>;
 }
 
 export interface SkillSelectorResult {
   selected_skill_id?: string;
   candidate_skill_ids: string[];
+  /**
+   * Codex round-2 findings 2+3: when a skill is selected we carry the
+   * resolved Skill object forward so Mid PEP and ActionDecider can see the
+   * same scoped instance (with its `allowed_tools` / `blocked_tools` /
+   * `requires_confirmation_tools`). Without this, Mid PEP would evaluate
+   * tool-based predicates against an empty preview and ActionDecider would
+   * re-fetch by ID under no scope, both of which produce divergent or
+   * cross-agent results.
+   */
+  selected_skill?: Skill;
 }
 
 export interface SkillSelectorOptions {
@@ -353,6 +451,8 @@ export interface SkillSelectorOptions {
    */
   agent_id_override?: string;
   workflow_id?: string;
+  /** Round-2 finding 4: abort signal from Decision Engine deadline. */
+  signal?: AbortSignal;
 }
 
 export interface SkillSelector {
@@ -368,9 +468,18 @@ export interface ActionDeciderInput {
   intent: DecisionPacket['intent'];
   risk: DecisionPacket['risk_profile'];
   workflow: WorkflowSelectorResult;
+  /**
+   * Round-2 finding 3: `skill.selected_skill` (when present) carries the
+   * SAME resolved Skill object that SkillSelector queried under the routed
+   * agent. ActionDecider MUST prefer this over an unscoped `find()` lookup,
+   * otherwise it can emit `tool_permissions` from a homonym skill belonging
+   * to a different agent or tenant.
+   */
   skill: SkillSelectorResult;
   midPepOutcome: MidPepOutput;
   earlyWarnings: ContinueDecision['warnings'];
+  /** Round-2 finding 4: abort signal from Decision Engine deadline. */
+  signal?: AbortSignal;
 }
 
 export interface ActionDeciderResult {

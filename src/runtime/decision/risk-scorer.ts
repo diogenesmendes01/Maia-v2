@@ -29,10 +29,15 @@ const HIGH_RISK_INTENTS = new Set([
 const MEDIUM_RISK_INTENTS = new Set(['balance_query', 'profile_update']);
 
 export class RiskScorerStubImpl implements RiskScorer {
-  async score(input: {
-    intent: DecisionPacket['intent'];
-    base: BaseContextPacket;
-  }): Promise<DecisionPacket['risk_profile']> {
+  async score(
+    input: {
+      intent: DecisionPacket['intent'];
+      base: BaseContextPacket;
+    },
+    _options?: { signal?: AbortSignal },
+  ): Promise<DecisionPacket['risk_profile']> {
+    // P9b stub is synchronous; AbortSignal forwarding becomes relevant when
+    // P9c TurnRiskScorer adds a Haiku-based enrichment that performs I/O.
     const reasons: string[] = [];
     let level: RiskLevel = 'low';
 

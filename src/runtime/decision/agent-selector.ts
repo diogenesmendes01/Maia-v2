@@ -20,9 +20,15 @@ export interface AgentSelectorDeps {
 export class AgentSelectorImpl implements AgentSelector {
   constructor(private deps: AgentSelectorDeps) {}
 
-  async select(base: BaseContextPacket): Promise<{ agent_id: string }> {
+  async select(
+    base: BaseContextPacket,
+    _options?: { signal?: AbortSignal },
+  ): Promise<{ agent_id: string }> {
     // NO-OP in P9b: single agent per channel via channel_policies.
     // Future: MULTI_AGENT_SELECTOR_V2 flag will enable per-turn selection.
+    // ChannelPoliciesReader.getForChannel does not yet accept a signal; the
+    // engine-level deadline still guards against hangs. Once P0 surfaces a
+    // signal-aware port we forward `_options.signal` here.
     const policy = await this.deps.channelPolicies.getForChannel(
       base.tenant_id,
       base.channel.id,

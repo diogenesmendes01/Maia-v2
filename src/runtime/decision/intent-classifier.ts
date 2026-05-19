@@ -80,8 +80,16 @@ const TENANT_INTENT_TAXONOMY: Record<string, readonly string[]> = {};
 export class IntentClassifierImpl implements IntentClassifier {
   constructor(private deps: IntentClassifierDeps) {}
 
-  async classify(base: BaseContextPacket): Promise<DecisionPacket['intent']> {
-    const text = await this.deps.contentResolver.text(base.input.content_ref);
+  async classify(
+    base: BaseContextPacket,
+    options?: { signal?: AbortSignal },
+  ): Promise<DecisionPacket['intent']> {
+    const opts: { signal?: AbortSignal } = {};
+    if (options?.signal) opts.signal = options.signal;
+    const text = await this.deps.contentResolver.text(
+      base.input.content_ref,
+      opts,
+    );
 
     // 1. Rules first.
     for (const h of HEURISTIC_INTENTS) {
@@ -105,11 +113,14 @@ export class IntentClassifierImpl implements IntentClassifier {
 
     this.deps.metrics?.increment('intent_classifier.llm_calls');
     try {
-      const haiku = await this.deps.haiku.classify({
-        text,
-        allowed_labels: Array.from(taxonomy),
-        max_tokens: 50,
-      });
+      const haiku = await this.deps.haiku.classify(
+        {
+          text,
+          allowed_labels: Array.from(taxonomy),
+          max_tokens: 50,
+        },
+        opts,
+      );
       const intent: DecisionPacket['intent'] = {
         label: haiku.label,
         confidence: haiku.confidence,

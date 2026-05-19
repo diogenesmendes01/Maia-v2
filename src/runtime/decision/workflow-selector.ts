@@ -20,6 +20,10 @@ export interface WorkflowSelectorDeps {
   proceduresRepo: ProceduresRepo;
 }
 
+// Reserved for future use: signal is currently observed at the engine layer
+// (deadlines short-circuit awaiters). The proceduresRepo port does not yet
+// accept an AbortSignal; once P3b exposes one this selector forwards it.
+
 /**
  * Simple intent → domain mapping. Override-friendly: a future iteration may
  * read this from a tenant_settings table.
@@ -39,6 +43,7 @@ export class WorkflowSelectorImpl implements WorkflowSelector {
   async select(
     base: BaseContextPacket,
     intent: DecisionPacket['intent'],
+    _options?: { signal?: AbortSignal },
   ): Promise<WorkflowSelectorResult> {
     if (!base.active_procedure_execution_id) {
       return { mode: 'none' };

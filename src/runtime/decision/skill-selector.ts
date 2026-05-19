@@ -48,7 +48,9 @@ export class SkillSelectorImpl implements SkillSelector {
       query.applicable_to_workflow = options.workflow_id;
     }
 
-    const candidates = await this.deps.skillsRepo.findActive(query);
+    const findOpts: { signal?: AbortSignal } = {};
+    if (options?.signal) findOpts.signal = options.signal;
+    const candidates = await this.deps.skillsRepo.findActive(query, findOpts);
 
     if (candidates.length === 0) {
       return { candidate_skill_ids: [] };
@@ -61,7 +63,14 @@ export class SkillSelectorImpl implements SkillSelector {
         .map((s) => s.id),
     };
     const top = ranked[0];
-    if (top) result.selected_skill_id = top.id;
+    if (top) {
+      result.selected_skill_id = top.id;
+      // Codex round-2 findings 2+3: carry the scoped Skill object forward so
+      // Mid PEP and ActionDecider use the SAME instance the routed-agent
+      // query produced. This eliminates the unscoped find() lookup that
+      // could otherwise return a homonym from another agent.
+      result.selected_skill = top;
+    }
     return result;
   }
 }

@@ -28,6 +28,8 @@ export class MidPepImpl implements MidPep {
   constructor(private deps: MidPepDeps) {}
 
   async evaluate(input: MidPepInput): Promise<MidPepOutput> {
+    const opts: { signal?: AbortSignal } = {};
+    if (input.signal) opts.signal = input.signal;
     // Filter: default to ['mid', 'late'] (spec §5) so any policy not explicit
     // about applies_to_peps still runs through Mid.
     const midPolicies = input.resolved_policies.filter((p) => {
@@ -42,23 +44,32 @@ export class MidPepImpl implements MidPep {
     const tool_reductions: NonNullable<ContinueDecision['tool_reductions']> = [];
 
     for (const policy of midPolicies) {
-      const body = await this.deps.policyRepo.getBody(policy.policy_id);
+      const body = await this.deps.policyRepo.getBody(policy.policy_id, opts);
       if (!body) continue;
 
-      const verdict = await this.deps.evaluator.evaluate(body, {
-        actor: input.base.actor,
-        channel: input.base.channel,
-        input: input.base.input,
-        intent: input.intent,
-        risk: input.risk_profile,
-        skill: {
-          id: input.selected_skill_id,
-          candidates: input.candidate_skill_ids,
+      const verdict = await this.deps.evaluator.evaluate(
+        body,
+        {
+          actor: input.base.actor,
+          channel: input.base.channel,
+          input: input.base.input,
+          intent: input.intent,
+          risk: input.risk_profile,
+          skill: {
+            id: input.selected_skill_id,
+            candidates: input.candidate_skill_ids,
+            // Codex round-2 finding 2: expose the actual scoped Skill (with
+            // its allowed_tools/blocked_tools/runtime_hints) so tool-based
+            // predicates evaluate against the real surface instead of the
+            // previously empty preview.
+            selected: input.selected_skill,
+          },
+          workflow: { id: input.workflow_id },
+          tools: input.tool_permissions_preview,
+          tenant_id: input.base.tenant_id,
         },
-        workflow: { id: input.workflow_id },
-        tools: input.tool_permissions_preview,
-        tenant_id: input.base.tenant_id,
-      });
+        opts,
+      );
 
       if (verdict.action === 'block') {
         const block: BlockDecision = {

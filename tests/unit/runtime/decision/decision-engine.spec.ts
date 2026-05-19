@@ -406,4 +406,181 @@ describe('P9b — DecisionEngine orchestrator', () => {
     expect(r.fallback_applied).toBe('ask_clarification');
     expect(r.packet.action_mode).toBe('ask_clarification');
   });
+
+  it('Codex round-2 finding 2 — Mid PEP receives the selected skill\'s actual allowed_tools (not empty)', async () => {
+    // Engine wires SkillSelector → Mid PEP. Before the fix Mid PEP was always
+    // handed `EMPTY_TOOL_PERMS`, so any policy evaluator inspecting the
+    // tool surface saw `[]` and could not block/reduce tools that ended up
+    // in the final packet. After the fix the engine derives the preview
+    // from the resolved Skill returned by SkillSelector.
+    const skillSelector: SkillSelector = {
+      select: vi.fn().mockResolvedValue({
+        selected_skill_id: 'skill_transfer',
+        candidate_skill_ids: ['skill_transfer'],
+        selected_skill: {
+          id: 'skill_transfer',
+          category: 'tool_mediated',
+          priority: 1,
+          status: 'active',
+          allowed_tools: ['transfer_money', 'view_balance'],
+          blocked_tools: ['delete_account'],
+          requires_confirmation_tools: ['transfer_money'],
+        },
+      }),
+    };
+    const midPep: MidPep = {
+      evaluate: vi.fn().mockResolvedValue({ pep: 'mid', warnings: [] }),
+    };
+    const deps = mkDeps({ skillSelector, midPep });
+    const engine = new DecisionEngine(deps);
+    await engine.run({ base: mkBase() });
+
+    const midInput = (midPep.evaluate as ReturnType<typeof vi.fn>).mock
+      .calls[0]?.[0];
+    expect(midInput).toBeDefined();
+    expect(midInput.tool_permissions_preview.allowed_tools).toEqual([
+      'transfer_money',
+      'view_balance',
+    ]);
+    expect(midInput.tool_permissions_preview.blocked_tools).toEqual([
+      'delete_account',
+    ]);
+    expect(midInput.tool_permissions_preview.requires_confirmation).toEqual([
+      'transfer_money',
+    ]);
+    // The same Skill object is also forwarded explicitly so the evaluator
+    // can read schema refs / runtime hints / etc.
+    expect(midInput.selected_skill?.id).toBe('skill_transfer');
+  });
+
+  it('Codex round-2 finding 2 — Mid PEP receives empty preview when no skill selected', async () => {
+    // No selected_skill_id → preview must remain empty (no leak from a stale
+    // candidate). This is the only path that legitimately produces an empty
+    // tool_permissions_preview.
+    const skillSelector: SkillSelector = {
+      select: vi.fn().mockResolvedValue({ candidate_skill_ids: [] }),
+    };
+    const midPep: MidPep = {
+      evaluate: vi.fn().mockResolvedValue({ pep: 'mid', warnings: [] }),
+    };
+    const deps = mkDeps({ skillSelector, midPep });
+    const engine = new DecisionEngine(deps);
+    await engine.run({ base: mkBase() });
+
+    const midInput = (midPep.evaluate as ReturnType<typeof vi.fn>).mock
+      .calls[0]?.[0];
+    expect(midInput.tool_permissions_preview.allowed_tools).toEqual([]);
+    expect(midInput.tool_permissions_preview.blocked_tools).toEqual([]);
+    expect(midInput.selected_skill).toBeUndefined();
+  });
+
+  it('Codex round-2 finding 4 — slow resolver receives AbortSignal when deadline fires', async () => {
+    // Capture the signal handed to the resolver so we can assert it was
+    // aborted after fallback. The resolver hangs forever to force the
+    // engine's deadline to fire.
+    let capturedSignal: AbortSignal | undefined;
+    const resolver: PolicyDescriptorResolver = {
+      resolveDescriptors: vi.fn().mockImplementation(
+        (_q: unknown, opts?: { signal?: AbortSignal }) => {
+          capturedSignal = opts?.signal;
+          return new Promise(() => {}); // hang
+        },
+      ),
+    };
+    const deps = mkDeps({ resolver });
+    const engine = new DecisionEngine(deps);
+    const r = await engine.run({ base: mkBase() });
+
+    expect(r.fallback_applied).toBe('ask_clarification');
+    expect(capturedSignal).toBeDefined();
+    expect(capturedSignal?.aborted).toBe(true);
+  }, 5000);
+
+  it('Codex round-2 finding 4 — signal also reaches intent classifier when it runs', async () => {
+    let capturedSignal: AbortSignal | undefined;
+    const intentClassifier: IntentClassifier = {
+      classify: vi.fn().mockImplementation(
+        async (_b: unknown, opts?: { signal?: AbortSignal }) => {
+          capturedSignal = opts?.signal;
+          // Hang so the engine deadline fires while this step runs.
+          await new Promise(() => {});
+          return { label: 'greet', confidence: 0.95 };
+        },
+      ),
+    };
+    const deps = mkDeps({ intentClassifier });
+    const engine = new DecisionEngine(deps);
+    await engine.run({ base: mkBase() });
+
+    expect(capturedSignal).toBeDefined();
+    expect(capturedSignal?.aborted).toBe(true);
+  }, 5000);
+
+  it('Codex round-2 finding 4 — caller-supplied signal is observable by dependencies', async () => {
+    // External cancellation forwards through the engine to dependencies.
+    const controller = new AbortController();
+    let capturedSignal: AbortSignal | undefined;
+    const resolver: PolicyDescriptorResolver = {
+      resolveDescriptors: vi.fn().mockImplementation(
+        (_q: unknown, opts?: { signal?: AbortSignal }) => {
+          capturedSignal = opts?.signal;
+          controller.abort();
+          return new Promise(() => {});
+        },
+      ),
+    };
+    const deps = mkDeps({ resolver });
+    const engine = new DecisionEngine(deps);
+    await engine.run({ base: mkBase(), signal: controller.signal });
+
+    expect(capturedSignal?.aborted).toBe(true);
+  }, 5000);
+
+  it('Codex round-2 finding 3 — ActionDecider receives the same scoped Skill the SkillSelector resolved', async () => {
+    // The selected_skill object flows SkillSelector → Mid PEP → ActionDecider
+    // unmodified. Verifies the threaded-skill pattern that closes the
+    // unscoped-find leak.
+    const resolvedSkill = {
+      id: 'skill_transfer',
+      category: 'tool_mediated' as const,
+      priority: 1,
+      status: 'active' as const,
+      allowed_tools: ['transfer_money'],
+      blocked_tools: [],
+      requires_confirmation_tools: [],
+    };
+    const skillSelector: SkillSelector = {
+      select: vi.fn().mockResolvedValue({
+        selected_skill_id: 'skill_transfer',
+        candidate_skill_ids: ['skill_transfer'],
+        selected_skill: resolvedSkill,
+      }),
+    };
+    const actionDecider: ActionDecider = {
+      decide: vi.fn().mockResolvedValue({
+        action_mode: 'call_tool',
+        tool_permissions: {
+          allowed_tools: ['transfer_money'],
+          blocked_tools: [],
+          requires_confirmation: [],
+        },
+        context_requirements: DEFAULT_CONTEXT_REQUIREMENTS,
+        evaluation_plan: {
+          validators: [],
+          llm_judge_required: false,
+          human_review_required: false,
+        },
+        rationale: 'call_tool:skill_transfer',
+      }),
+    };
+    const deps = mkDeps({ skillSelector, actionDecider });
+    const engine = new DecisionEngine(deps);
+    await engine.run({ base: mkBase() });
+
+    const actionInput = (actionDecider.decide as ReturnType<typeof vi.fn>).mock
+      .calls[0]?.[0];
+    // ActionDecider sees the EXACT object the SkillSelector returned —
+    // identity check, not deep equality.
+    expect(actionInput.skill.selected_skill).toBe(resolvedSkill);
+  });
 });

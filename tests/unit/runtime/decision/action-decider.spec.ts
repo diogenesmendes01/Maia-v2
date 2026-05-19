@@ -349,6 +349,98 @@ describe('P9b — ActionDecider', () => {
     expect(r.tool_permissions.blocked_tools).toContain('transfer_money');
   });
 
+  it('Codex round-2 finding 3 — prefers scoped selected_skill over unscoped find()', async () => {
+    // SkillSelector already resolved the skill under the routed agent.
+    // ActionDecider MUST use that instance instead of re-fetching by ID.
+    const scopedSkill: Skill = mkSkill({
+      id: 'skill_transfer',
+      category: 'tool_mediated',
+      allowed_tools: ['transfer_money'],
+      blocked_tools: [],
+      requires_confirmation_tools: ['transfer_money'],
+    });
+    // Repo would return a DIFFERENT skill with the same ID (simulating the
+    // unscoped-lookup leak). After the fix, this find() must NOT be called.
+    const leakingSkill: Skill = mkSkill({
+      id: 'skill_transfer',
+      category: 'tool_mediated',
+      allowed_tools: ['LEAKED_TOOL_FROM_OTHER_AGENT'],
+      blocked_tools: [],
+      requires_confirmation_tools: [],
+    });
+    const findSpy = vi.fn().mockResolvedValue(leakingSkill);
+    const deps = mkDeps({
+      skillsRepo: { find: findSpy, findActive: vi.fn().mockResolvedValue([]) },
+    });
+    const decider = new ActionDeciderImpl(deps);
+    const r = await decider.decide(
+      mkInput({
+        intent: { label: 'transfer_intent', confidence: 0.85 },
+        skill: {
+          selected_skill_id: 'skill_transfer',
+          candidate_skill_ids: ['skill_transfer'],
+          selected_skill: scopedSkill,
+        },
+      }),
+    );
+
+    expect(r.action_mode).toBe('call_tool');
+    // The packet reflects the SCOPED skill's tools — no leak from the repo.
+    expect(r.tool_permissions.allowed_tools).toEqual(['transfer_money']);
+    expect(r.tool_permissions.allowed_tools).not.toContain(
+      'LEAKED_TOOL_FROM_OTHER_AGENT',
+    );
+    // The unscoped find() was bypassed entirely.
+    expect(findSpy).not.toHaveBeenCalled();
+  });
+
+  it('Codex round-2 finding 3 — when falling back to find(), passes tenant_id+agent_id scope', async () => {
+    // Legacy/test callers may not populate selected_skill. The fallback MUST
+    // call find() with the scope tuple so the repo can verify ownership.
+    const skill = mkSkill({ id: 'skill_x', category: 'respond' });
+    const findSpy = vi.fn().mockResolvedValue(skill);
+    const deps = mkDeps({
+      skillsRepo: { find: findSpy, findActive: vi.fn().mockResolvedValue([]) },
+    });
+    const decider = new ActionDeciderImpl(deps);
+    await decider.decide(
+      mkInput({
+        skill: {
+          selected_skill_id: 'skill_x',
+          candidate_skill_ids: ['skill_x'],
+          // selected_skill intentionally omitted — forces fallback
+        },
+      }),
+    );
+
+    expect(findSpy).toHaveBeenCalledTimes(1);
+    const args = findSpy.mock.calls[0];
+    expect(args?.[0]).toBe('skill_x');
+    expect(args?.[1]).toEqual({ tenant_id: 'tn1', agent_id: 'ag1' });
+  });
+
+  it('Codex round-2 finding 3 — find() returning null still surfaces as ask_clarification', async () => {
+    // Repo enforces ownership check and returns null for cross-agent IDs.
+    // ActionDecider must NOT emit empty tool permissions silently.
+    const findSpy = vi.fn().mockResolvedValue(null);
+    const deps = mkDeps({
+      skillsRepo: { find: findSpy, findActive: vi.fn().mockResolvedValue([]) },
+    });
+    const decider = new ActionDeciderImpl(deps);
+    const r = await decider.decide(
+      mkInput({
+        skill: {
+          selected_skill_id: 'skill_other_agent',
+          candidate_skill_ids: ['skill_other_agent'],
+        },
+      }),
+    );
+
+    expect(r.action_mode).toBe('ask_clarification');
+    expect(r.rationale).toContain('skill_lookup_failed:skill_other_agent');
+    expect(r.tool_permissions.allowed_tools).toEqual([]);
+  });
+
   it('Codex #103 — reduce_tool_set is a no-op when removed_tools is empty', async () => {
     const skill = mkSkill({
       id: 'skill_x',
