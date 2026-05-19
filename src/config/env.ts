@@ -154,6 +154,34 @@ const envSchema = z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
+    // P8b — Soul Layer (biases comportamentais persistentes que modulam, nunca bloqueiam).
+    // Kill switch: set FEATURE_SOUL_LAYER_V1=false para desativar todo o soul pipeline
+    // (detector de drift, slice injection, activator worker) sem alterar DB.
+    FEATURE_SOUL_LAYER_V1: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
+    // P8e — PolicyDescriptorResolver + policy_rules (Source of Truth versionada).
+    // Off by default; only flips on when slice builder (P8d), PEPs (P9b/d),
+    // and Admin UI (P8.5) are in place to consume the resolver.
+    FEATURE_POLICY_RESOLVER_V1: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
+    /** Cache TTL (ms) for PolicyResolverCache. Default 5min = 300_000ms. */
+    POLICY_RESOLVER_CACHE_TTL_MS: z.coerce.number().int().positive().default(300_000),
+    /** LRU cap for PolicyResolverCache. Default 10_000 entries. */
+    POLICY_RESOLVER_CACHE_MAX_ENTRIES: z.coerce.number().int().positive().default(10_000),
+    // P9a — Skill Registry v1 (skills table + SkillRunner + 4 modes)
+    FEATURE_SKILL_REGISTRY_V1: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
+    // P10a — Knowledge State Machine (9 estados + auto-promoter + propose_* tools)
+    FEATURE_KNOWLEDGE_STATE_MACHINE_V1: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
     // P10b — runtime trace (sync envelope + async body, HMAC + redaction)
     FEATURE_RUNTIME_TRACE_V1: z
       .string()
@@ -243,6 +271,12 @@ const envSchema = z
     // the file-backed token. Discouraged in prod (env vars leak more than
     // file mode 0o600). Useful for dev / scripted deploys / E2E tests.
     SETUP_TOKEN_OVERRIDE: z.string().optional(),
+
+    // P8c — User Layer namespace (depth-scoped slice builders + facade resolvers)
+    FEATURE_P8C_USER_LAYER_NAMESPACE_V1: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
   })
   .superRefine((cfg, ctx) => {
     if (cfg.LLM_PROVIDER === 'anthropic' && !cfg.ANTHROPIC_API_KEY) {

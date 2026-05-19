@@ -1,0 +1,92 @@
+import { and, eq, desc, ilike } from 'drizzle-orm';
+import { db } from '../../db/client.js';
+import { learned_rules } from '../../db/schema.js';
+import { isVisibleLifecycle } from '../internal/visibility.js';
+import type { KnowledgeLifecycleStatus } from '../types.js';
+
+export interface RuleItem {
+  id: string;
+  context: string;
+  action: string;
+  confidence: number;
+  acertos: number;
+  erros: number;
+  ativa: boolean;
+  tipo: string;
+  lifecycle_status: KnowledgeLifecycleStatus;
+}
+
+export const rulesResolver = {
+  /**
+   * Default behavior (Codex review PR #94 high #4):
+   *   `only_active = true` (matches `rulesRepo.listActive`'s contract — the
+   *   prompt path only ever surfaces ativa=true rules; disabled rules are
+   *   often superseded / bad behavior and MUST NOT influence decisions).
+   *   Caller can opt out by passing `only_active: false` explicitly for the
+   *   one or two admin paths that need the full set.
+   *
+   *   `tipo` filter exposed: when builder doesn't pass it we still emit
+   *   everything (no change), but the knowledge-slice-builder now pins
+   *   `tipo='classificacao'` to match `rulesRepo.listActive('classificacao')`
+   *   used by prompt-builder. Passing `tipo: undefined` keeps the old shape.
+   */
+  async list(input: {
+    tenant_id: string;
+    /**
+     * PR #94 round-2: agent_id from enforceTenantBoundary ensures sibling
+     * agents within the same tenant cannot read each other's rules.
+     */
+    agent_id?: string;
+    intent_filter?: string;
+    tipo?: string;
+    only_active?: boolean;
+    limit: number;
+  }): Promise<RuleItem[]> {
+    // ATENÇÃO: NÃO chamar `.where()` em sequência. No Drizzle <0.29 o segundo
+    // `.where(...)` SUBSTITUI o primeiro silenciosamente, dropando o filtro
+    // tenant_id — vazamento cross-tenant verificável quando `intent_filter`
+    // está setado. A>=0.29 isso é type error. Empilhar TODAS as condições
+    // no array antes do `and(...)` é a forma correta.
+    const conditions = [
+      eq(learned_rules.tenant_id, input.tenant_id),
+      isVisibleLifecycle(learned_rules.lifecycle_status),
+    ];
+
+    // PR #94 round-2 high: enforce agent isolation.
+    if (input.agent_id) {
+      conditions.push(eq(learned_rules.agent_id, input.agent_id));
+    }
+
+    // Default ON — opt-out via explicit `only_active: false`.
+    if (input.only_active !== false) {
+      conditions.push(eq(learned_rules.ativa, true));
+    }
+
+    if (input.tipo) {
+      conditions.push(eq(learned_rules.tipo, input.tipo));
+    }
+
+    if (input.intent_filter) {
+      conditions.push(ilike(learned_rules.contexto, `%${input.intent_filter}%`));
+    }
+
+    const rows = await db
+      .select()
+      .from(learned_rules)
+      .where(and(...conditions))
+      .orderBy(desc(learned_rules.confianca), desc(learned_rules.updated_at))
+      .limit(input.limit);
+
+    return rows.map((r) => ({
+      id: r.id,
+      context: r.contexto,
+      action: r.acao,
+      confidence: Number(r.confianca),
+      acertos: r.acertos,
+      erros: r.erros,
+      ativa: r.ativa,
+      tipo: r.tipo,
+      lifecycle_status: r.lifecycle_status as KnowledgeLifecycleStatus,
+    }));
+  },
+};

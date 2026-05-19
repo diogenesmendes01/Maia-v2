@@ -5,7 +5,7 @@ import { join } from 'node:path';
 /**
  * P10b — Migration smoke test (Codex review #102 issue 1).
  *
- * The critical bug in the first round: migration 038 (now 043) joined the
+ * The critical bug in the first round: migration 038 (now 054) joined the
  * matview to `role_selector_decisions.chosen_role_id`, but the schema
  * (migration 034) actually uses `decided_role_id` / `decided_at`. A fresh
  * deploy would have crashed at matview creation, blocking P10b rollout.
@@ -121,27 +121,27 @@ function getAllColumnsForTable(tableName: string): Set<string> {
 }
 
 describe('P10b — migration smoke (Codex review #102 issue 1)', () => {
-  it('runtime_trace_envelopes migration is present at 041', () => {
-    const f = '041_p10b_runtime_trace_envelopes.sql';
+  it('runtime_trace_envelopes migration is present at 052', () => {
+    const f = '052_p10b_runtime_trace_envelopes.sql';
     const sql = readMig(f);
     expect(sql).toContain('CREATE TABLE IF NOT EXISTS runtime_trace_envelopes');
   });
 
-  it('runtime_trace_bodies + outbox migration is present at 042', () => {
-    const f = '042_p10b_runtime_trace_bodies.sql';
+  it('runtime_trace_bodies + outbox migration is present at 053', () => {
+    const f = '053_p10b_runtime_trace_bodies.sql';
     const sql = readMig(f);
     expect(sql).toContain('CREATE TABLE IF NOT EXISTS runtime_trace_bodies');
     expect(sql).toContain('CREATE TABLE IF NOT EXISTS runtime_trace_body_outbox');
   });
 
-  it('unified_trace_events matview migration is present at 043', () => {
-    const f = '043_p10b_unified_trace_events_matview.sql';
+  it('unified_trace_events matview migration is present at 054', () => {
+    const f = '054_p10b_unified_trace_events_matview.sql';
     const sql = readMig(f);
     expect(sql).toContain('CREATE MATERIALIZED VIEW IF NOT EXISTS unified_trace_events');
   });
 
   it('matview column references match the role_selector_decisions schema (the bug Codex caught)', () => {
-    const matview = readMig('043_p10b_unified_trace_events_matview.sql');
+    const matview = readMig('054_p10b_unified_trace_events_matview.sql');
     // Strip comments so we only check actual SQL (the comment block
     // intentionally references the broken column name to document the fix).
     const codeOnly = matview
@@ -161,7 +161,7 @@ describe('P10b — migration smoke (Codex review #102 issue 1)', () => {
   });
 
   it('matview column references match all 7 source tables', () => {
-    const matview = readMig('043_p10b_unified_trace_events_matview.sql');
+    const matview = readMig('054_p10b_unified_trace_events_matview.sql');
     // Spot-check the columns referenced in matview against each source table.
     // (We don't parse the matview SQL fully — we just verify the columns
     // we KNOW are referenced exist in the source.)
@@ -187,20 +187,20 @@ describe('P10b — migration smoke (Codex review #102 issue 1)', () => {
   });
 
   it('all three migrations have down counterparts', () => {
-    expect(() => readMig('041_p10b_runtime_trace_envelopes_down.sql')).not.toThrow();
-    expect(() => readMig('042_p10b_runtime_trace_bodies_down.sql')).not.toThrow();
-    expect(() => readMig('043_p10b_unified_trace_events_matview_down.sql')).not.toThrow();
+    expect(() => readMig('052_p10b_runtime_trace_envelopes_down.sql')).not.toThrow();
+    expect(() => readMig('053_p10b_runtime_trace_bodies_down.sql')).not.toThrow();
+    expect(() => readMig('054_p10b_unified_trace_events_matview_down.sql')).not.toThrow();
   });
 
   it('down migrations DROP the objects they should', () => {
-    const env = readMig('041_p10b_runtime_trace_envelopes_down.sql');
+    const env = readMig('052_p10b_runtime_trace_envelopes_down.sql');
     expect(env).toMatch(/DROP TABLE IF EXISTS runtime_trace_envelopes/);
 
-    const body = readMig('042_p10b_runtime_trace_bodies_down.sql');
+    const body = readMig('053_p10b_runtime_trace_bodies_down.sql');
     expect(body).toMatch(/DROP TABLE IF EXISTS runtime_trace_bodies/);
     expect(body).toMatch(/DROP TABLE IF EXISTS runtime_trace_body_outbox/);
 
-    const matview = readMig('043_p10b_unified_trace_events_matview_down.sql');
+    const matview = readMig('054_p10b_unified_trace_events_matview_down.sql');
     expect(matview).toMatch(/DROP MATERIALIZED VIEW IF EXISTS unified_trace_events/);
   });
 
@@ -208,9 +208,9 @@ describe('P10b — migration smoke (Codex review #102 issue 1)', () => {
     // Cheap heuristics: balanced parens, no trailing BEGIN without END, no
     // stray % outside of format() calls.
     for (const f of [
-      '041_p10b_runtime_trace_envelopes.sql',
-      '042_p10b_runtime_trace_bodies.sql',
-      '043_p10b_unified_trace_events_matview.sql',
+      '052_p10b_runtime_trace_envelopes.sql',
+      '053_p10b_runtime_trace_bodies.sql',
+      '054_p10b_unified_trace_events_matview.sql',
     ]) {
       const sql = readMig(f);
       // Balanced parens (counting only outside of -- comments).

@@ -45,7 +45,7 @@ export async function selectRole(input: RoleSelectorInput): Promise<RoleSelector
 
   // Prefer deterministic if both present and they agree
   // If they disagree, deterministic wins (cheaper, more predictable, audited via conflicts)
-  let chosenCandidate: RoleCandidate | null = null;
+  let chosenCandidate: RoleCandidate | null;
   if (detResult && llmResult) {
     if (detResult.role_id === llmResult.role_id) {
       chosenCandidate = detResult;

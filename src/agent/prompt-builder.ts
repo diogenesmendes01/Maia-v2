@@ -370,7 +370,7 @@ export async function buildPrompt(ctx: PromptContext): Promise<{ system: string;
   //   para self_state + log de warning (defesa em runtime: nunca expor
   //   `proposed` mesmo se a invariant da DB falhar).
   // - Flag ON + sem profile (null)          → fallback silencioso a self_state.
-  let renderedV2: RenderedProfile | null = null;
+  let renderedV2: RenderedProfile | null;
   let selfVersionLabel: string;
   let systemPromptBody: string;
   let resumoAprendizadosBody: string;

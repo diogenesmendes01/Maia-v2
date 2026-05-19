@@ -6,11 +6,11 @@
 
 A two-table audit pipeline + durable outbox + 3 workers + 1 materialized view:
 
-- `runtime_trace_envelopes` (migration 041): the narrow synchronous record proving a decision was made. PK = `trace_id`. Written in <20ms p99 (audit gate). Carries `decision`, `side_effect_level`, `policy_id`, `redaction_class`, `envelope_hmac`, `hmac_key_version`, `body_status`.
-- `runtime_trace_bodies` + `runtime_trace_body_outbox` (migration 042): the heavy body — redacted `ExecutionContextPacket` + `DecisionPacket` (PK = `trace_id`, `ON CONFLICT DO NOTHING` for idempotent at-least-once delivery), plus a **durable outbox** table written transactionally with the envelope so a process crash never strands the packet (Codex review #102 issue 4).
-- `unified_trace_events` matview (migration 043): UNION ALL across 7 source tables (audit_log, cognitive_module_log, agent_drift_alerts, role_selector_decisions, capability_test_results, procedure_execution_events, runtime_trace_envelopes), refreshed CONCURRENTLY every 5 minutes.
+- `runtime_trace_envelopes` (migration 052): the narrow synchronous record proving a decision was made. PK = `trace_id`. Written in <20ms p99 (audit gate). Carries `decision`, `side_effect_level`, `policy_id`, `redaction_class`, `envelope_hmac`, `hmac_key_version`, `body_status`.
+- `runtime_trace_bodies` + `runtime_trace_body_outbox` (migration 053): the heavy body — redacted `ExecutionContextPacket` + `DecisionPacket` (PK = `trace_id`, `ON CONFLICT DO NOTHING` for idempotent at-least-once delivery), plus a **durable outbox** table written transactionally with the envelope so a process crash never strands the packet (Codex review #102 issue 4).
+- `unified_trace_events` matview (migration 054): UNION ALL across 7 source tables (audit_log, cognitive_module_log, agent_drift_alerts, role_selector_decisions, capability_test_results, procedure_execution_events, runtime_trace_envelopes), refreshed CONCURRENTLY every 5 minutes.
 
-> Migration numbering coordinated with parallel PRs: P8e=036/037, P8b=036/036b/036c/037, P8c=038, P8d=040, P10b=041/042/043. The matview references `role_selector_decisions.decided_role_id` + `decided_at` — confirmed against migration 034 by `tests/unit/p10b-migrations-smoke.spec.ts`.
+> Migration numbering coordinated with parallel PRs after merge: P8b/P8c/P8d/P8e/P9a/P10a took 036–051; P10b lands at 052/053/054. The matview references `role_selector_decisions.decided_role_id` + `decided_at` — confirmed against migration 034 by `tests/unit/p10b-migrations-smoke.spec.ts`.
 
 Workers (in `src/workers/`):
 
@@ -92,9 +92,9 @@ P10b is purely additive — flip `FEATURE_RUNTIME_TRACE_V1=false` to stop new wr
 To fully remove:
 
 1. Disable the workers in `src/workers/index.ts` (`phase > 6`).
-2. Run `migrations/043_p10b_unified_trace_events_matview_down.sql`.
-3. Run `migrations/042_p10b_runtime_trace_bodies_down.sql` (drops both `runtime_trace_bodies` and `runtime_trace_body_outbox`).
-4. Run `migrations/041_p10b_runtime_trace_envelopes_down.sql`.
+2. Run `migrations/054_p10b_unified_trace_events_matview_down.sql`.
+3. Run `migrations/053_p10b_runtime_trace_bodies_down.sql` (drops both `runtime_trace_bodies` and `runtime_trace_body_outbox`).
+4. Run `migrations/052_p10b_runtime_trace_envelopes_down.sql`.
 
 DO NOT drop the tables while the flag is still ON in another replica — concurrent writers will hit a hard error.
 

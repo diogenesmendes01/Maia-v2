@@ -54,6 +54,8 @@ export type CandidateType = typeof CandidateType[keyof typeof CandidateType];
 /**
  * P4 — Tipos de drift de identidade operacional detectados pelo sistema.
  * Mapeiam dimensões do comportamento que podem desviar do perfil ativo.
+ *
+ * P8b adiciona SOUL_DRIFT (8º). P8d adiciona PAPEL_DRIFT (9º).
  */
 export const DriftType = {
   TOM: 'tom',
@@ -63,8 +65,49 @@ export const DriftType = {
   ESCOPO: 'escopo',
   LINGUAGEM: 'linguagem',
   PROCEDIMENTO: 'procedimento',
+  // P8b: 8º tipo de drift — aderência a Soul Biases ativas no contexto.
+  // Severidade NUNCA força rollback de profile (apenas queued_human).
+  SOUL_DRIFT: 'soul_drift',
+  // P8d: 9º tipo de drift — divergência de papel (cognitive_limits/priorities).
+  PAPEL_DRIFT: 'papel_drift',
 } as const;
 export type DriftType = typeof DriftType[keyof typeof DriftType];
+
+/**
+ * P8b — Origem de uma Soul Bias (governance class).
+ * `learned_strong_evidence` NUNCA pode sobrescrever Identity (origin gate, §7).
+ */
+export const SoulOrigin = {
+  FOUNDER_EXPLICIT: 'founder_explicit',
+  HUMAN_APPROVED: 'human_approved',
+  TENANT_CULTURE_EXPLICIT: 'tenant_culture_explicit',
+  LEARNED_STRONG_EVIDENCE: 'learned_strong_evidence',
+} as const;
+export type SoulOrigin = typeof SoulOrigin[keyof typeof SoulOrigin];
+
+/**
+ * P8b — Escopo de aplicabilidade da Soul Bias.
+ * Define onde a bias entra em consideração no slice builder.
+ */
+export const SoulScope = {
+  TENANT: 'tenant',
+  AGENT: 'agent',
+  ROLE: 'role',
+  DOMAIN: 'domain',
+} as const;
+export type SoulScope = typeof SoulScope[keyof typeof SoulScope];
+
+/**
+ * P8b — Ciclo de vida da Soul Bias (state machine).
+ * DEFAULT 'proposed' no DB para impedir nascimento active por acidente.
+ */
+export const SoulBiasStatus = {
+  PROPOSED: 'proposed',
+  ACTIVE: 'active',
+  DEPRECATED: 'deprecated',
+  ROLLED_BACK: 'rolled_back',
+} as const;
+export type SoulBiasStatus = typeof SoulBiasStatus[keyof typeof SoulBiasStatus];
 
 /**
  * P4 — Severidade de drift detectado, define limiar de ação.
@@ -235,6 +278,66 @@ export const CognitiveLayer = {
 export type CognitiveLayer = (typeof CognitiveLayer)[keyof typeof CognitiveLayer];
 
 /**
+ * P9a — Ciclo de vida de uma skill (Skill Contract). Toda skill nasce em
+ * 'proposed'; só vira 'active' por aprovação explícita. 'rolled_back' é
+ * estado terminal pós-revert, mas reativa a versão anterior automaticamente.
+ */
+export const SkillStatus = {
+  PROPOSED: 'proposed',
+  ACTIVE: 'active',
+  DEPRECATED: 'deprecated',
+  ROLLED_BACK: 'rolled_back',
+} as const;
+export type SkillStatus = typeof SkillStatus[keyof typeof SkillStatus];
+
+/**
+ * P9a — Modo de execução de uma skill. Cada modo tem um handler estável
+ * em `src/skills/modes/<mode>.ts` (executor não muda por edição de Admin
+ * UI; só por PR de código).
+ */
+export const SkillExecutionMode = {
+  PROMPT_ONLY: 'prompt_only',
+  PROCEDURE_ADAPTER: 'procedure_adapter',
+  TOOL_MEDIATED: 'tool_mediated',
+  EVALUATOR: 'evaluator',
+} as const;
+export type SkillExecutionMode = typeof SkillExecutionMode[keyof typeof SkillExecutionMode];
+
+/**
+ * P9a — Categoria semântica de uma skill (orienta listagem em Admin UI
+ * e seleção do proposer). Ortogonal a execution_mode.
+ */
+export const SkillCategory = {
+  CLASSIFY: 'classify',
+  EXTRACT: 'extract',
+  COMPOSE: 'compose',
+  DECIDE: 'decide',
+  TOOL_MEDIATED: 'tool_mediated',
+  DIAGNOSE: 'diagnose',
+  PLAN: 'plan',
+  EVALUATOR: 'evaluator',
+} as const;
+export type SkillCategory = typeof SkillCategory[keyof typeof SkillCategory];
+
+/**
+ * P9c — Nível de risco operacional (spec §10.11). Calculado pelo
+ * `risk-assessor` em dois estágios (heurística determinística + LLM
+ * Haiku condicional).
+ *
+ * Ordenação total: low < medium < high < critical. Comparações de
+ * "max" e "no-downgrade" devem usar `compareRiskLevel` em
+ * `src/shared/risk/level.ts`, não strings — evita erros de ordering
+ * em editores que reordenem o objeto.
+ */
+export const RiskLevel = {
+  LOW: 'low',
+  MEDIUM: 'medium',
+  HIGH: 'high',
+  CRITICAL: 'critical',
+} as const;
+export type RiskLevel = typeof RiskLevel[keyof typeof RiskLevel];
+
+/**
  * Nomes de feature flags conhecidas. Cresce conforme fases ativam.
  */
 export const FeatureFlagName = {
@@ -255,6 +358,16 @@ export const FeatureFlagName = {
   MULTI_CHANNEL: 'MULTI_CHANNEL',
   // P7 — grafo cognitivo formal (orquestração declarativa de módulos)
   COGNITIVE_GRAPH: 'cognitive_graph',
+  // P8c — User Layer namespace (depth-scoped slice builders + facade resolvers)
+  P8C_USER_LAYER_NAMESPACE_V1: 'P8C_USER_LAYER_NAMESPACE_V1',
+  // P8b — Soul Layer (persistent behavioral biases que modulam, nunca bloqueiam)
+  FEATURE_SOUL_LAYER_V1: 'FEATURE_SOUL_LAYER_V1',
+  // P8e — PolicyDescriptorResolver + policy_rules (Source of Truth versionada)
+  POLICY_RESOLVER_V1: 'POLICY_RESOLVER_V1',
+  // P9a — Skill Registry v1 (skills table + SkillRunner + 4 execution modes).
+  SKILL_REGISTRY_V1: 'SKILL_REGISTRY_V1',
+  // P10a — Knowledge State Machine (9 estados + auto-promoter + propose_* tools)
+  KNOWLEDGE_STATE_MACHINE_V1: 'KNOWLEDGE_STATE_MACHINE_V1',
   // P10b — runtime trace (envelope sync + body async, HMAC + redaction)
   RUNTIME_TRACE_V1: 'runtime_trace_v1',
 } as const;
