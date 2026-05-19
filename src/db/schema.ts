@@ -222,6 +222,10 @@ export const agent_facts = pgTable(
     confianca: numeric('confianca', { precision: 3, scale: 2 }).notNull().default('1.00'),
     fonte: text('fonte').notNull().default('aprendido'),
     ultima_validacao: timestamp('ultima_validacao', { withTimezone: true }),
+    // P8c — Knowledge State Machine columns (migration 036)
+    lifecycle_status: text('lifecycle_status').notNull().default('active'),
+    evidence_count: integer('evidence_count').notNull().default(1),
+    lifecycle_transitions: jsonb('lifecycle_transitions').notNull().default(sql`'[]'::jsonb`),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -249,6 +253,10 @@ export const learned_rules = pgTable('learned_rules', {
   erros: integer('erros').notNull().default(0),
   ativa: boolean('ativa').notNull().default(true),
   exemplo_origem_id: uuid('exemplo_origem_id'),
+  // P8c — Knowledge State Machine columns (migration 036)
+  lifecycle_status: text('lifecycle_status').notNull().default('active'),
+  evidence_count: integer('evidence_count').notNull().default(1),
+  lifecycle_transitions: jsonb('lifecycle_transitions').notNull().default(sql`'[]'::jsonb`),
   created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 });
@@ -689,6 +697,11 @@ export const memory_entry = pgTable(
     needs_review: boolean('needs_review').notNull().default(false),
     source_event_id: uuid('source_event_id'),
     expires_at: timestamp('expires_at', { withTimezone: true }),
+    // P8c — Knowledge State Machine columns (migration 036)
+    lifecycle_status: text('lifecycle_status').notNull().default('active'),
+    evidence_count: integer('evidence_count').notNull().default(1),
+    confidence: numeric('confidence', { precision: 3, scale: 2 }).notNull().default('1.00'),
+    lifecycle_transitions: jsonb('lifecycle_transitions').notNull().default(sql`'[]'::jsonb`),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -718,6 +731,11 @@ export const behavioral_hint = pgTable(
     extension_approved_at: timestamp('extension_approved_at', { withTimezone: true }),
     expires_at: timestamp('expires_at', { withTimezone: true }),
     revoked_at: timestamp('revoked_at', { withTimezone: true }),
+    // P8c — Knowledge State Machine columns (migration 036)
+    lifecycle_status: text('lifecycle_status').notNull().default('active'),
+    evidence_count: integer('evidence_count').notNull().default(1),
+    confidence: numeric('confidence', { precision: 3, scale: 2 }).notNull().default('1.00'),
+    lifecycle_transitions: jsonb('lifecycle_transitions').notNull().default(sql`'[]'::jsonb`),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({

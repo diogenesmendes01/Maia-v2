@@ -294,6 +294,8 @@ export const FeatureFlagName = {
   MULTI_CHANNEL: 'MULTI_CHANNEL',
   // P7 — grafo cognitivo formal (orquestração declarativa de módulos)
   COGNITIVE_GRAPH: 'cognitive_graph',
+  // P8c — User Layer namespace (depth-scoped slice builders + facade resolvers)
+  P8C_USER_LAYER_NAMESPACE_V1: 'P8C_USER_LAYER_NAMESPACE_V1',
   // P8b — Soul Layer (persistent behavioral biases que modulam, nunca bloqueiam)
   FEATURE_SOUL_LAYER_V1: 'FEATURE_SOUL_LAYER_V1',
   // P8e — PolicyDescriptorResolver + policy_rules (Source of Truth versionada)

@@ -234,6 +234,12 @@ const envSchema = z
     // the file-backed token. Discouraged in prod (env vars leak more than
     // file mode 0o600). Useful for dev / scripted deploys / E2E tests.
     SETUP_TOKEN_OVERRIDE: z.string().optional(),
+
+    // P8c — User Layer namespace (depth-scoped slice builders + facade resolvers)
+    FEATURE_P8C_USER_LAYER_NAMESPACE_V1: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
   })
   .superRefine((cfg, ctx) => {
     if (cfg.LLM_PROVIDER === 'anthropic' && !cfg.ANTHROPIC_API_KEY) {

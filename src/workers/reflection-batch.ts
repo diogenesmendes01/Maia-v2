@@ -104,6 +104,11 @@ async function runReflectionBatchInner(): Promise<void> {
         erros: 0,
         ativa: true,
         exemplo_origem_id: cluster.signals[0]?.alvo_id ?? null,
+        lifecycle_status: 'active',
+        evidence_count: 1,
+        // PR #94 round-2: pass [] not JSON.stringify([]) — Drizzle jsonb
+        // mapper serializes; double-encoding fails the CHECK constraint.
+        lifecycle_transitions: [],
       });
       await audit({
         acao: 'rule_learned',
