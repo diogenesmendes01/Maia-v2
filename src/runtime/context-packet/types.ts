@@ -5,7 +5,9 @@
  * Plan: docs/superpowers/plans/2026-05-15-p8a-context-packet.md Task 1.
  *
  * Camada 1 (Entry & Context) → BaseContextPacket
- * Camada 2 (Decision Engine) → DecisionPacket (P8a entrega tipo + stub; real em P9b)
+ * Camada 2 (Decision Engine) → DecisionPacket (P8a entregou tipo + stub; P9b
+ *   substitui pela versão real, incluindo `PepKind` (early|mid|late),
+ *   `KnowledgeProposalRequest` e `requested_knowledge_proposals`).
  * Camada 3 (Context Assembly) → ExecutionContextPacket (7 slices + history + assembly_meta)
  */
 
@@ -59,6 +61,12 @@ export type PolicyDecision =
   | 'require_dual_approval'
   | 'escalate';
 
+/**
+ * P9b: PEP discriminator. P8a originally stubbed only `early|mid`; the Late
+ * PEP completes the trio per spec §2.
+ */
+export type PepKind = 'early' | 'mid' | 'late';
+
 export interface ContextRequirements {
   identity: { depth: 'minimal' | 'full' };
   user: {
@@ -98,6 +106,17 @@ export const DEFAULT_CONTEXT_REQUIREMENTS: ContextRequirements = {
   skill: 'selected_only',
 };
 
+/**
+ * P9b: knowledge proposals requested by classifier/mid_pep/action_decider,
+ * persisted by the Decision Engine for later async classification.
+ */
+export interface KnowledgeProposalRequest {
+  kind: 'fact' | 'rule' | 'memory' | 'hint';
+  payload: Record<string, unknown>;
+  confidence: number;
+  source: 'classifier' | 'mid_pep' | 'action_decider';
+}
+
 export interface DecisionPacket {
   trace_id: string;
   intent: { label: string; confidence: number; alternatives?: string[] };
@@ -125,12 +144,13 @@ export interface DecisionPacket {
     human_review_required: boolean;
   };
   policy_decisions: Array<{
-    pep: 'early' | 'mid';
+    pep: PepKind;
     policy_id: string;
     rule_descriptor: string;
     decision: PolicyDecision;
     reason: string;
   }>;
+  requested_knowledge_proposals?: Array<KnowledgeProposalRequest>;
   rationale: string;
 }
 
