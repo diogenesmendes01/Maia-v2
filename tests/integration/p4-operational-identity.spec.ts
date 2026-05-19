@@ -35,16 +35,14 @@ import type {
 import type { DriftEvidence } from '@/cognition/drift/types.js';
 
 // ---------- in-memory state for seed scenarios ----------
+// ProfileRow mirrors AgentOperationalProfileVersion (v3.1.1 single profile_body column).
 type ProfileRow = {
   id: string;
   tenant_id: string;
   agent_id: string;
   version: number;
   status: 'proposed' | 'active' | 'frozen' | 'rolled_back';
-  core_immutable: unknown;
-  operational_profile: unknown;
-  episodic_temp: unknown;
-  growth_backlog: unknown;
+  profile_body: unknown;
   proposed_by: string;
   proposed_reason: string | null;
   approved_by: string | null;
@@ -200,8 +198,16 @@ Você existe para que ele e a esposa não precisem mais acordar pensando "quanto
 Você é a Maia.
 `;
 
+/**
+ * Build a fake AgentOperationalProfileVersion for integration tests.
+ *
+ * The renderer reads the legacy 4-layer keys (core_immutable / operational_profile
+ * / episodic_temp / growth_backlog) via an `as unknown` cast. We keep them at the
+ * top level of the fake row (spread via overrides) so the renderer can find them,
+ * while also satisfying TypeScript via `as unknown as AgentOperationalProfileVersion`.
+ */
 function buildVersion(
-  overrides: Partial<AgentOperationalProfileVersion>,
+  overrides: Record<string, unknown>,
 ): AgentOperationalProfileVersion {
   return {
     id: 'prof-1',
@@ -209,16 +215,9 @@ function buildVersion(
     agent_id: 'default',
     version: 3,
     status: 'active',
-    core_immutable: {
-      identity_block: 'V2_IDENTITY_BLOCK_CONTENT',
-      principles: ['princípio A', 'princípio B'],
-    },
-    operational_profile: {
-      voice_descriptor: 'voz operacional V2',
-      thresholds: {},
-    },
-    episodic_temp: {},
-    growth_backlog: {},
+    // profile_body satisfies the Drizzle type; legacy keys from overrides are
+    // also spread at the top level for the renderer's `as unknown` cast to find.
+    profile_body: {} as unknown as AgentOperationalProfileVersion['profile_body'],
     proposed_by: 'system_seed',
     proposed_reason: null,
     approved_by: null,
@@ -229,7 +228,7 @@ function buildVersion(
     rollback_reason: null,
     created_at: new Date(),
     ...overrides,
-  };
+  } as unknown as AgentOperationalProfileVersion;
 }
 
 const pessoa = {
@@ -280,11 +279,10 @@ describe('P4 operational identity — end-to-end', () => {
     operationalProfileVersionsGetActive.mockResolvedValue(null);
 
     // Default seed-mode for create/transition: use in-memory state.
+    // Accepts profile_body (v3.1.1 single JSONB column) — the generator packs
+    // legacy 4-layer keys inside profile_body during the migration window.
     operationalProfileVersionsCreate.mockImplementation(async (input: {
-      core_immutable: unknown;
-      operational_profile: unknown;
-      episodic_temp?: unknown;
-      growth_backlog?: unknown;
+      profile_body: unknown;
       proposed_by: string;
       proposed_reason?: string;
     }) => {
@@ -299,10 +297,7 @@ describe('P4 operational identity — end-to-end', () => {
         agent_id: 'default',
         version,
         status: 'proposed',
-        core_immutable: input.core_immutable,
-        operational_profile: input.operational_profile,
-        episodic_temp: input.episodic_temp ?? {},
-        growth_backlog: input.growth_backlog ?? {},
+        profile_body: input.profile_body,
         proposed_by: input.proposed_by,
         proposed_reason: input.proposed_reason ?? null,
         approved_by: null,
@@ -413,12 +408,13 @@ describe('P4 operational identity — end-to-end', () => {
         expect(v.status).toBe('active');
         expect(v.version).toBe(1);
         expect(v.proposed_by).toBe('system_seed');
-        const core = v.core_immutable as {
-          identity_block: string;
-          principles: string[];
+        // The generator packs legacy 4-layer keys inside profile_body during
+        // the v3.1.1 migration window. Read core_immutable from there.
+        const body = v.profile_body as {
+          core_immutable: { identity_block: string; principles: string[] };
         };
-        expect(core.identity_block).toBeTruthy();
-        expect(core.principles.length).toBeGreaterThanOrEqual(3);
+        expect(body.core_immutable.identity_block).toBeTruthy();
+        expect(body.core_immutable.principles.length).toBeGreaterThanOrEqual(3);
 
         // Spies confirm: create + transition foram invocados.
         expect(operationalProfileVersionsCreate).toHaveBeenCalledTimes(1);

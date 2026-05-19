@@ -14,16 +14,18 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import type { SelfState } from '@/db/schema.js';
 
+// ProfileRow mirrors AgentOperationalProfileVersion with profile_body as the
+// single JSONB column (v3.1.1). The generator embeds legacy keys
+// (core_immutable / operational_profile / episodic_temp / growth_backlog)
+// inside profile_body during the migration window, so assertions read them
+// from there.
 type ProfileRow = {
   id: string;
   tenant_id: string;
   agent_id: string;
   version: number;
   status: 'proposed' | 'active' | 'frozen' | 'rolled_back';
-  core_immutable: unknown;
-  operational_profile: unknown;
-  episodic_temp: unknown;
-  growth_backlog: unknown;
+  profile_body: unknown;
   proposed_by: string;
   proposed_reason: string | null;
   approved_by: string | null;
@@ -82,10 +84,7 @@ vi.mock('@/db/repositories.js', async () => {
     ...actual,
     operationalProfileVersionsRepo: {
       create: vi.fn(async (input: {
-        core_immutable: unknown;
-        operational_profile: unknown;
-        episodic_temp?: unknown;
-        growth_backlog?: unknown;
+        profile_body: unknown;
         proposed_by: string;
         proposed_reason?: string;
       }) => {
@@ -99,10 +98,7 @@ vi.mock('@/db/repositories.js', async () => {
           agent_id,
           version,
           status: 'proposed',
-          core_immutable: input.core_immutable,
-          operational_profile: input.operational_profile,
-          episodic_temp: input.episodic_temp ?? {},
-          growth_backlog: input.growth_backlog ?? {},
+          profile_body: input.profile_body,
           proposed_by: input.proposed_by,
           proposed_reason: input.proposed_reason ?? null,
           approved_by: null,
@@ -245,27 +241,26 @@ describe('seedInitialOperationalProfile', () => {
         expect(v.approved_by).toBe('system_seed');
         expect(v.activated_at).toBeInstanceOf(Date);
 
-        // 4 camadas: core_immutable
-        const core = v.core_immutable as {
-          identity_block: string;
-          principles: string[];
+        // The generator packs the legacy 4-layer keys inside profile_body
+        // during the v3.1.1 migration window. Read them from there.
+        const body = v.profile_body as {
+          core_immutable: { identity_block: string; principles: string[] };
+          operational_profile: { voice_descriptor: string; thresholds: Record<string, unknown> };
+          episodic_temp: unknown;
+          growth_backlog: unknown;
         };
-        expect(core.identity_block).toContain('Você é a **Maia**');
-        expect(Array.isArray(core.principles)).toBe(true);
-        expect(core.principles.length).toBeGreaterThanOrEqual(3);
-        expect(core.principles[0]).toContain('Separação');
+        expect(body.core_immutable.identity_block).toContain('Você é a **Maia**');
+        expect(Array.isArray(body.core_immutable.principles)).toBe(true);
+        expect(body.core_immutable.principles.length).toBeGreaterThanOrEqual(3);
+        expect(body.core_immutable.principles[0]).toContain('Separação');
 
         // operational_profile
-        const op = v.operational_profile as {
-          voice_descriptor: string;
-          thresholds: Record<string, unknown>;
-        };
-        expect(op.voice_descriptor).toContain('Português brasileiro');
-        expect(op.thresholds).toEqual({});
+        expect(body.operational_profile.voice_descriptor).toContain('Português brasileiro');
+        expect(body.operational_profile.thresholds).toEqual({});
 
         // episodic_temp + growth_backlog
-        expect(v.episodic_temp).toEqual({});
-        expect(v.growth_backlog).toEqual([]);
+        expect(body.episodic_temp).toEqual({});
+        expect(body.growth_backlog).toEqual([]);
       },
     );
   });
@@ -310,10 +305,14 @@ describe('seedInitialOperationalProfile', () => {
         if (!result.created) throw new Error('expected created=true');
 
         const v = result.version;
-        expect(v.episodic_temp).toEqual({});
-        expect(v.growth_backlog).toEqual([]);
-        const op = v.operational_profile as { thresholds: Record<string, unknown> };
-        expect(op.thresholds).toEqual({});
+        const body2 = v.profile_body as {
+          episodic_temp: unknown;
+          growth_backlog: unknown;
+          operational_profile: { thresholds: Record<string, unknown> };
+        };
+        expect(body2.episodic_temp).toEqual({});
+        expect(body2.growth_backlog).toEqual([]);
+        expect(body2.operational_profile.thresholds).toEqual({});
       },
     );
   });
@@ -338,11 +337,11 @@ describe('seedInitialOperationalProfile', () => {
         expect(result.created).toBe(true);
         if (!result.created) throw new Error('expected created=true');
 
-        const op = result.version.operational_profile as {
-          thresholds: { resumo: string; versao_legacy: number };
+        const body3 = result.version.profile_body as {
+          operational_profile: { thresholds: { resumo: string; versao_legacy: number } };
         };
-        expect(op.thresholds.resumo).toBe('Mendes prefere objetividade.');
-        expect(op.thresholds.versao_legacy).toBe(42);
+        expect(body3.operational_profile.thresholds.resumo).toBe('Mendes prefere objetividade.');
+        expect(body3.operational_profile.thresholds.versao_legacy).toBe(42);
       },
     );
   });
@@ -377,10 +376,7 @@ describe('seedInitialOperationalProfile', () => {
           agent_id: 'default',
           version: 99,
           status: 'active',
-          core_immutable: {},
-          operational_profile: {},
-          episodic_temp: {},
-          growth_backlog: [],
+          profile_body: {},
           proposed_by: 'race-condition',
           proposed_reason: null,
           approved_by: 'race',

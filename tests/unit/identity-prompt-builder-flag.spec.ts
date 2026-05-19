@@ -66,8 +66,17 @@ vi.mock('../../src/lib/logger.js', () => ({
   },
 }));
 
+/**
+ * Build a fake AgentOperationalProfileVersion for prompt-builder tests.
+ *
+ * The renderer reads legacy 4-layer keys via an `as unknown` cast. During the
+ * migration window the generator also packs them inside profile_body. We keep
+ * them at the top level of the fake row so the renderer/prompt-builder can
+ * find them regardless of which access path is active, and cast the result to
+ * satisfy TypeScript without touching production code.
+ */
 function buildVersion(
-  overrides: Partial<AgentOperationalProfileVersion>,
+  overrides: Record<string, unknown>,
 ): AgentOperationalProfileVersion {
   return {
     id: 'prof-1',
@@ -75,16 +84,20 @@ function buildVersion(
     agent_id: 'default',
     version: 3,
     status: 'active',
-    core_immutable: {
-      identity_block: 'V2_IDENTITY_BLOCK',
-      principles: ['princípio A', 'princípio B'],
-    },
-    operational_profile: {
-      voice_descriptor: 'voz V2',
-      thresholds: { confirm_limit_brl: 500 },
-    },
-    episodic_temp: {},
-    growth_backlog: {},
+    // profile_body satisfies the Drizzle type; legacy keys are merged at the
+    // top level so the renderer's `(version as unknown).core_immutable` cast works.
+    profile_body: {
+      core_immutable: {
+        identity_block: 'V2_IDENTITY_BLOCK',
+        principles: ['princípio A', 'princípio B'],
+      },
+      operational_profile: {
+        voice_descriptor: 'voz V2',
+        thresholds: { confirm_limit_brl: 500 },
+      },
+      episodic_temp: {},
+      growth_backlog: {},
+    } as unknown as AgentOperationalProfileVersion['profile_body'],
     proposed_by: 'system_seed',
     proposed_reason: null,
     approved_by: null,
@@ -95,7 +108,7 @@ function buildVersion(
     rollback_reason: null,
     created_at: new Date(),
     ...overrides,
-  };
+  } as unknown as AgentOperationalProfileVersion;
 }
 
 const pessoa = {
