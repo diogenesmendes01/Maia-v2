@@ -813,6 +813,12 @@ export const factsRepo = {
     if (escopos.length === 0) return [];
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
+    // P10a (review #104 critical): every read path that surfaces knowledge
+    // to the LLM MUST filter by lifecycle_status. Without this, a
+    // propose_fact row with lifecycle_status='pending_review' (or even
+    // 'revoked') reaches the prompt because the legacy path filtered only
+    // by tenant/agent/escopo. The 5 visible states mirror
+    // visibility.VISIBLE_STATES.
     return db
       .select()
       .from(agent_facts)
@@ -821,6 +827,13 @@ export const factsRepo = {
           eq(agent_facts.tenant_id, tenant_id),
           eq(agent_facts.agent_id, agent_id),
           inArray(agent_facts.escopo, escopos),
+          inArray(agent_facts.lifecycle_status, [
+            'ephemeral',
+            'observed',
+            'reinforced',
+            'verified',
+            'active',
+          ]),
         ),
       );
   },
@@ -853,12 +866,17 @@ export const factsRepo = {
     if (escopos.length === 0) return [];
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
+    // P10a (review #104 critical): lifecycle_status filter is mandatory
+    // on every read that the LLM can see. pending_review / deprecated /
+    // revoked rows MUST NOT reach the prompt — they live behind the
+    // Admin UI Proposal Inbox until a human acts on them.
     const result = await db.execute<AgentFact>(sql`
       SELECT af.*
       FROM agent_facts af
       WHERE af.tenant_id = ${tenant_id}
         AND af.agent_id = ${agent_id}
         AND af.escopo = ANY(${escopos})
+        AND af.lifecycle_status IN ('ephemeral', 'observed', 'reinforced', 'verified', 'active')
         AND NOT EXISTS (
           SELECT 1 FROM memory_entry me
           WHERE me.tenant_id = af.tenant_id
@@ -881,6 +899,15 @@ export const rulesRepo = {
   async listActive(tipo: string): Promise<LearnedRule[]> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
+    // Codex round-2 finding 2: lifecycle_status is the source of truth
+    // for "is this rule visible to the LLM". The legacy `ativa=true`
+    // requirement was double-bookkeeping: KSM-proposed rules transitioned
+    // through pending_review → … → active never flipped `ativa`, so
+    // approved proposals stayed invisible forever. We drop the
+    // `ativa=true` predicate here and rely on lifecycle_status alone.
+    // (The `ativa` column is preserved for ops/admin "soft disable"
+    // outside the lifecycle pipeline; if it gets set to false in the
+    // DB, a follow-up migration can join it back.)
     return db
       .select()
       .from(learned_rules)
@@ -888,14 +915,34 @@ export const rulesRepo = {
         and(
           eq(learned_rules.tenant_id, tenant_id),
           eq(learned_rules.agent_id, agent_id),
-          eq(learned_rules.ativa, true),
           eq(learned_rules.tipo, tipo),
+          inArray(learned_rules.lifecycle_status, [
+            'ephemeral',
+            'observed',
+            'reinforced',
+            'verified',
+            'active',
+          ]),
         ),
       )
       .orderBy(desc(learned_rules.confianca), desc(learned_rules.updated_at))
       .limit(50);
   },
-  async create(input: Omit<LearnedRule, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>): Promise<LearnedRule> {
+  async create(
+    input: Omit<
+      LearnedRule,
+      | 'id'
+      | 'tenant_id'
+      | 'agent_id'
+      | 'created_at'
+      | 'updated_at'
+      // P10a: lifecycle columns have DB defaults — callers don't supply them.
+      | 'lifecycle_status'
+      | 'evidence_count'
+      | 'lifecycle_transitions'
+      | 'last_recall_at'
+    >,
+  ): Promise<LearnedRule> {
     const guarded = applyTenantGuard(input);
     const rows = await db.insert(learned_rules).values(guarded).returning();
     return rows[0]!;
@@ -903,6 +950,9 @@ export const rulesRepo = {
   async findByContext(tipo: string, contexto: string): Promise<LearnedRule | null> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
+    // Codex round-2 finding 2: same drop of legacy `ativa=true` here —
+    // lifecycle_status is the source of truth for visibility (see
+    // listActive comment above).
     const rows = await db
       .select()
       .from(learned_rules)
@@ -912,7 +962,13 @@ export const rulesRepo = {
           eq(learned_rules.agent_id, agent_id),
           eq(learned_rules.tipo, tipo),
           eq(learned_rules.contexto, contexto),
-          eq(learned_rules.ativa, true),
+          inArray(learned_rules.lifecycle_status, [
+            'ephemeral',
+            'observed',
+            'reinforced',
+            'verified',
+            'active',
+          ]),
         ),
       )
       .limit(1);
@@ -1494,7 +1550,20 @@ export const cognitiveCandidatesRepo = {
 
 export const memoryEntryRepo = {
   async create(
-    input: Omit<MemoryEntry, 'id' | 'created_at' | 'updated_at' | 'tenant_id' | 'agent_id'>,
+    input: Omit<
+      MemoryEntry,
+      | 'id'
+      | 'created_at'
+      | 'updated_at'
+      | 'tenant_id'
+      | 'agent_id'
+      // P10a: lifecycle columns have DB defaults — callers don't supply them.
+      | 'lifecycle_status'
+      | 'evidence_count'
+      | 'confidence'
+      | 'lifecycle_transitions'
+      | 'last_recall_at'
+    >,
   ): Promise<MemoryEntry> {
     const guarded = applyTenantGuard(input);
     const [row] = await db.insert(memory_entry).values(guarded).returning();
@@ -1519,6 +1588,16 @@ export const memoryEntryRepo = {
       // be enforced at query time. Entries past expires_at MUST NOT be
       // returned to the prompt builder. NULL expires_at = no TTL.
       or(isNull(memory_entry.expires_at), gt(memory_entry.expires_at, now)),
+      // P10a (review #104 critical): lifecycle_status filter enforced on
+      // every prompt-exposing read. pending_review / deprecated / revoked
+      // entries stay hidden from the LLM.
+      inArray(memory_entry.lifecycle_status, [
+        'ephemeral',
+        'observed',
+        'reinforced',
+        'verified',
+        'active',
+      ]),
     ];
     // Filtrar por scope_type + subject_id apropriado. PR #82 review
     // (Superpowers Critical #4): role/channel devem só ser incluídos
@@ -1609,7 +1688,21 @@ export const memoryEntryRepo = {
 
 export const behavioralHintRepo = {
   async create(
-    input: Omit<BehavioralHint, 'id' | 'created_at' | 'tenant_id' | 'agent_id'>,
+    input: Omit<
+      BehavioralHint,
+      | 'id'
+      | 'created_at'
+      | 'tenant_id'
+      | 'agent_id'
+      // P10a: lifecycle columns + updated_at have DB defaults — callers
+      // don't supply them.
+      | 'updated_at'
+      | 'lifecycle_status'
+      | 'evidence_count'
+      | 'confidence'
+      | 'lifecycle_transitions'
+      | 'last_recall_at'
+    >,
   ): Promise<BehavioralHint> {
     const guarded = applyTenantGuard(input);
     const [row] = await db.insert(behavioral_hint).values(guarded).returning();
@@ -1628,6 +1721,17 @@ export const behavioralHintRepo = {
       eq(behavioral_hint.agent_id, agent_id),
       eq(behavioral_hint.scope_type, opts.scope_type),
       isNull(behavioral_hint.revoked_at),
+      // P10a (review #104 critical): hints proposed via propose_hint
+      // start in pending_review / ephemeral. The LLM-facing path must
+      // include only visible states so a pending hint never steers
+      // behavior before a human approves it.
+      inArray(behavioral_hint.lifecycle_status, [
+        'ephemeral',
+        'observed',
+        'reinforced',
+        'verified',
+        'active',
+      ]),
     ];
     if (opts.subject_id) conds.push(eq(behavioral_hint.subject_id, opts.subject_id));
     return db

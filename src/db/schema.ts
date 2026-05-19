@@ -223,10 +223,14 @@ export const agent_facts = pgTable(
     confianca: numeric('confianca', { precision: 3, scale: 2 }).notNull().default('1.00'),
     fonte: text('fonte').notNull().default('aprendido'),
     ultima_validacao: timestamp('ultima_validacao', { withTimezone: true }),
-    // P8c — Knowledge State Machine columns (migration 036)
+    // P8c + P10a — Knowledge State Machine lifecycle columns
+    // (P8c added lifecycle_status/evidence_count/lifecycle_transitions in
+    // migration 041; P10a added last_recall_at in migration 050. P8c
+    // shapes win because IF NOT EXISTS in 050 makes column ADDs no-ops.)
     lifecycle_status: text('lifecycle_status').notNull().default('active'),
     evidence_count: integer('evidence_count').notNull().default(1),
     lifecycle_transitions: jsonb('lifecycle_transitions').notNull().default(sql`'[]'::jsonb`),
+    last_recall_at: timestamp('last_recall_at', { withTimezone: true }),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -254,10 +258,13 @@ export const learned_rules = pgTable('learned_rules', {
   erros: integer('erros').notNull().default(0),
   ativa: boolean('ativa').notNull().default(true),
   exemplo_origem_id: uuid('exemplo_origem_id'),
-  // P8c — Knowledge State Machine columns (migration 036)
+  // P8c + P10a — Knowledge State Machine lifecycle columns
+  // (P8c added lifecycle_status/evidence_count/lifecycle_transitions in
+  // migration 041; P10a added last_recall_at in migration 050.)
   lifecycle_status: text('lifecycle_status').notNull().default('active'),
   evidence_count: integer('evidence_count').notNull().default(1),
   lifecycle_transitions: jsonb('lifecycle_transitions').notNull().default(sql`'[]'::jsonb`),
+  last_recall_at: timestamp('last_recall_at', { withTimezone: true }),
   created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 });
@@ -698,11 +705,15 @@ export const memory_entry = pgTable(
     needs_review: boolean('needs_review').notNull().default(false),
     source_event_id: uuid('source_event_id'),
     expires_at: timestamp('expires_at', { withTimezone: true }),
-    // P8c — Knowledge State Machine columns (migration 036)
+    // P8c + P10a — Knowledge State Machine lifecycle columns
+    // (P8c added lifecycle_status/evidence_count/confidence/lifecycle_transitions
+    // in migration 041; P10a added last_recall_at in migration 050. P8c
+    // shapes win because IF NOT EXISTS in 050 makes column ADDs no-ops.)
     lifecycle_status: text('lifecycle_status').notNull().default('active'),
     evidence_count: integer('evidence_count').notNull().default(1),
     confidence: numeric('confidence', { precision: 3, scale: 2 }).notNull().default('1.00'),
     lifecycle_transitions: jsonb('lifecycle_transitions').notNull().default(sql`'[]'::jsonb`),
+    last_recall_at: timestamp('last_recall_at', { withTimezone: true }),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -732,12 +743,16 @@ export const behavioral_hint = pgTable(
     extension_approved_at: timestamp('extension_approved_at', { withTimezone: true }),
     expires_at: timestamp('expires_at', { withTimezone: true }),
     revoked_at: timestamp('revoked_at', { withTimezone: true }),
-    // P8c — Knowledge State Machine columns (migration 036)
+    // P8c + P10a — Knowledge State Machine lifecycle columns
+    // (P8c added lifecycle_status/evidence_count/confidence/lifecycle_transitions
+    // in migration 041; P10a added last_recall_at + updated_at in migration 050.)
     lifecycle_status: text('lifecycle_status').notNull().default('active'),
     evidence_count: integer('evidence_count').notNull().default(1),
     confidence: numeric('confidence', { precision: 3, scale: 2 }).notNull().default('1.00'),
     lifecycle_transitions: jsonb('lifecycle_transitions').notNull().default(sql`'[]'::jsonb`),
+    last_recall_at: timestamp('last_recall_at', { withTimezone: true }),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
     tenantScopeIdx: index('behavioral_hint_tenant_scope_idx').on(

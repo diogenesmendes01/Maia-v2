@@ -54,7 +54,7 @@ export async function runPatternDetector(): Promise<void> {
         if (!reflected) continue;
         const classified = await classify(reflected.insight);
         if (!classified) continue;
-        await persistCandidate(classified, event);
+        await persistCandidate(classified, event, 'worker');
       } catch (err) {
         logger.warn({ err: (err as Error).message, pattern: r.pattern }, 'pattern_detector.failed');
       }

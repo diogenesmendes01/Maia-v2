@@ -49,4 +49,12 @@ export const featureFlags = new FeatureFlags({
   [FeatureFlagName.FEATURE_SOUL_LAYER_V1]: config.FEATURE_SOUL_LAYER_V1,
   [FeatureFlagName.POLICY_RESOLVER_V1]: config.FEATURE_POLICY_RESOLVER_V1,
   [FeatureFlagName.SKILL_REGISTRY_V1]: config.FEATURE_SKILL_REGISTRY_V1,
+  [FeatureFlagName.KNOWLEDGE_STATE_MACHINE_V1]: config.FEATURE_KNOWLEDGE_STATE_MACHINE_V1,
 });
+
+/**
+ * P10a — Knowledge State Machine feature flag, exposed as named constant
+ * for module-level early-returns (workers, tool registration).
+ */
+export const FEATURE_KNOWLEDGE_STATE_MACHINE_V1 =
+  config.FEATURE_KNOWLEDGE_STATE_MACHINE_V1;

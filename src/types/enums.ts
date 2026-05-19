@@ -366,5 +366,7 @@ export const FeatureFlagName = {
   POLICY_RESOLVER_V1: 'POLICY_RESOLVER_V1',
   // P9a — Skill Registry v1 (skills table + SkillRunner + 4 execution modes).
   SKILL_REGISTRY_V1: 'SKILL_REGISTRY_V1',
+  // P10a — Knowledge State Machine (9 estados + auto-promoter + propose_* tools)
+  KNOWLEDGE_STATE_MACHINE_V1: 'KNOWLEDGE_STATE_MACHINE_V1',
 } as const;
 export type FeatureFlagName = typeof FeatureFlagName[keyof typeof FeatureFlagName];

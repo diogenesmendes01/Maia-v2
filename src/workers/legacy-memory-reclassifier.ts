@@ -75,12 +75,7 @@ async function reclassifyForTenant(): Promise<{ reclassified: number; failed: nu
                 extension_reason: null,
                 extension_approved_by: null,
                 extension_approved_at: null,
-                lifecycle_status: 'active',
-                evidence_count: 1,
-                // PR #94 round-2: pass [] not JSON.stringify([]) — Drizzle
-                // jsonb mapper serializes; double-encoding fails CHECK.
-                lifecycle_transitions: [],
-                confidence: '0.5',
+                // P10a: lifecycle columns populated by DB defaults.
                 expires_at,
                 revoked_at: null,
               });
