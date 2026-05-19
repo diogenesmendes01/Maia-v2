@@ -21,6 +21,7 @@ import { escopoDetector } from './escopo.js';
 import { linguagemDetector } from './linguagem.js';
 import { procedimentoDetector } from './procedimento.js';
 import { papelDriftDetector } from './papel.js';
+import { soulDriftDetector } from './soul.js';
 import type { DriftDetector, DriftDetectionInput, DriftEvidence } from './types.js';
 import { featureFlags } from '@/config/feature-flags.js';
 import { FeatureFlagName } from '@/types/enums.js';
@@ -36,16 +37,27 @@ export const BASE_DETECTORS: DriftDetector[] = [
   procedimentoDetector,
 ];
 
-// P8d §6 — papelDriftDetector gated on FEATURE_OPERATIONAL_PROFILE_V2.
-// When the flag is off, papel_drift remains dormant: no Anthropic call,
-// no freeze/rollback, no alert row. P8b adds soul_drift on a separate branch;
-// when that merges it adds its own gated detector alongside this one.
-//
-// `DETECTORS` is kept for backwards-compatibility with existing tests that
-// inspect the list. It reflects the currently active set — re-computed each
-// call so runtime flag changes (e.g. kill switch) are respected immediately.
+/**
+ * Builds the active detector list.
+ *
+ * - P8b: soulDriftDetector appended only when FEATURE_SOUL_LAYER_V1 is on
+ *   (runtime kill switch — no soul-layer DB/LLM work when off).
+ * - P8d: papelDriftDetector appended only when OPERATIONAL_PROFILE_V2 is on
+ *   (kill switch — no Anthropic call, freeze/rollback or alert row when off).
+ *
+ * NOTE: evaluated at call time (not module load time) so runtime override()
+ * and killSwitch() calls in tests take effect without re-importing the module.
+ *
+ * `DETECTORS` is kept for backwards-compatibility with existing tests that
+ * inspect the list (base-only).
+ */
 export function buildDetectors(): DriftDetector[] {
   const detectors = [...BASE_DETECTORS];
+  if (featureFlags.isEnabled(FeatureFlagName.FEATURE_SOUL_LAYER_V1)) {
+    // P8b: 8º detector. Severidade NUNCA promove rollback de profile
+    // (decision-engine mapeia soul_drift → queued_human no máximo).
+    detectors.push(soulDriftDetector);
+  }
   if (featureFlags.isEnabled(FeatureFlagName.OPERATIONAL_PROFILE_V2)) {
     detectors.push(papelDriftDetector);
   }

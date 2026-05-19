@@ -49,6 +49,7 @@ export async function seedInitialOperationalProfile(args?: {
   } catch (err) {
     throw new Error(
       `seed_prompt_unavailable: ${path} (${err instanceof Error ? err.message : String(err)})`,
+      { cause: err },
     );
   }
 
@@ -134,7 +135,9 @@ export async function seedInitialOperationalProfile(args?: {
 function parseMarkdownSections(content: string): Map<string, string> {
   const sections = new Map<string, string>();
   // Match "## Title" headers e captura tudo até o próximo "## " ou EOF.
-  const regex = /^## ([^\n]+)\n([\s\S]*?)(?=^## |\Z)/gm;
+  // `(?=^## |$(?![\s\S]))` — lookahead for either the next ## header or true
+  // end-of-string (JS regex has no \Z; the `$(?![\s\S])` idiom emulates it).
+  const regex = /^## ([^\n]+)\n([\s\S]*?)(?=^## |$(?![\s\S]))/gm;
   let m: RegExpExecArray | null;
   while ((m = regex.exec(content)) !== null) {
     const title = (m[1] ?? '').trim().toLowerCase();

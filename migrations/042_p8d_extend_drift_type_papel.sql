@@ -12,8 +12,8 @@
 -- merged first) this CHECK keeps them valid; if they don't exist yet (P8d merges
 -- first) the value is pre-registered harmlessly — future P8b rows will pass.
 --
--- Migration numbers 036–039 are coordinated for P8e/P8c/P8b reviews on PRs
--- #93/#94/#95; this branch owns 040.
+-- Migration numbers 036–041 are coordinated for P8e/P8c/P8b reviews on PRs
+-- #93/#94/#95; this branch owns 042 (renumbered from 040 on merge).
 --
 -- Idempotent via DROP CONSTRAINT IF EXISTS — re-running this migration after
 -- partial failure leaves the table with the new CHECK and a single audit row.

@@ -1,8 +1,8 @@
 /**
- * Migration 040 — enum superset safety test.
+ * Migration 042 — enum superset safety test.
  *
  * Asserts that the CHECK constraint defined in
- * migrations/040_p8d_extend_drift_type_papel.sql includes the FULL set of
+ * migrations/042_p8d_extend_drift_type_papel.sql includes the FULL set of
  * expected drift_type values: the original 7 P4 values + soul_drift (P8b)
  * + papel_drift (P8d).
  *
@@ -15,7 +15,7 @@ import { describe, it, expect, beforeAll } from 'vitest';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 
-const MIGRATION_FILE = join(process.cwd(), 'migrations', '040_p8d_extend_drift_type_papel.sql');
+const MIGRATION_FILE = join(process.cwd(), 'migrations', '042_p8d_extend_drift_type_papel.sql');
 
 const EXPECTED_VALUES = [
   'tom',
@@ -29,7 +29,7 @@ const EXPECTED_VALUES = [
   'papel_drift',   // P8d — this branch's addition
 ];
 
-describe('migration 040 — drift_type CHECK enum superset', () => {
+describe('migration 042 — drift_type CHECK enum superset', () => {
   let sql: string;
 
   beforeAll(() => {

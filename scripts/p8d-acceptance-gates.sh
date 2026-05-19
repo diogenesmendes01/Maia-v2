@@ -18,9 +18,12 @@ else
 fi
 
 echo "=== Gate 2/6: IdentitySlice builder exists ==="
+# Post-merge: IdentitySlice type moved into the canonical
+# src/runtime/context-packet/types.ts (extended with optional p8d fields).
+# The standalone slice-builders/types/identity-slice.ts was removed on merge.
 if [ -f "src/runtime/context-assembly/slice-builders/identity-slice-builder.ts" ] \
-  && [ -f "src/runtime/context-assembly/slice-builders/types/identity-slice.ts" ] \
-  && grep -q "buildIdentitySlice" src/runtime/context-assembly/slice-builders/identity-slice-builder.ts; then
+  && grep -q "buildIdentitySlice" src/runtime/context-assembly/slice-builders/identity-slice-builder.ts \
+  && grep -q "identity_block" src/runtime/context-packet/types.ts; then
   echo "[GATE 2/6] IdentitySlice builder ... PASS"
   PASSED=$((PASSED + 1))
 else

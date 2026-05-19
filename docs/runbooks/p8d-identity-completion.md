@@ -11,11 +11,11 @@ Quatro completions sobre o `profile_body` (schema v3.1.1, já em produção via 
 3. **`papel_drift`** — 9º detector de drift (alongside `soul_drift` de P8b).
 4. **`identity-slice-builder`** — produz `IdentitySlice` (consumido por `ContextPacket` de P8a).
 
-Uma migration DDL pequena (040 — extende CHECK do `drift_type`); tudo o mais é código + dados.
+Uma migration DDL pequena (042 — extende CHECK do `drift_type`); tudo o mais é código + dados.
 
 ## Escopo
 
-- 1 migration DDL (`040_p8d_extend_drift_type_papel.sql`) — adiciona `'papel_drift'` ao CHECK constraint de `agent_drift_alerts.drift_type` (idempotente, com `IF EXISTS`). Necessária porque migration 026 fixou os 7 tipos iniciais; sem 040 a `INSERT` de alert papel_drift falha **depois** de freeze/rollback ter mutado o profile (review #100).
+- 1 migration DDL (`042_p8d_extend_drift_type_papel.sql`) — adiciona `'papel_drift'` ao CHECK constraint de `agent_drift_alerts.drift_type` (idempotente, com `IF EXISTS`). Necessária porque migration 026 fixou os 7 tipos iniciais; sem 042 a `INSERT` de alert papel_drift falha **depois** de freeze/rollback ter mutado o profile (review #100).
 - 1 detector novo (`papel_drift`).
 - 1 enum novo (`DriftType.PAPEL_DRIFT='papel_drift'`).
 - 1 case novo no `decision-engine.ts` (`PAPEL_DRIFT` com floor rules).
