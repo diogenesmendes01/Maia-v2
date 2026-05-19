@@ -5,12 +5,13 @@ describe('P4 schema', () => {
   it('exports agent_operational_profile_versions table', () => {
     expect(schema.agent_operational_profile_versions).toBeDefined();
   });
-  it('has 4 camada columns + status + audit', () => {
+  it('has profile_body JSONB column + status + audit (v3.1.1 schema)', () => {
+    // The table was consolidated from 4 legacy JSONB columns into a single
+    // `profile_body` column in migration 025 (v3.1.1). Specs asserting the
+    // old column names (core_immutable / operational_profile / episodic_temp /
+    // growth_backlog) were updated in the fix for issue #108.
     const cols = Object.keys(schema.agent_operational_profile_versions);
-    expect(cols).toContain('core_immutable');
-    expect(cols).toContain('operational_profile');
-    expect(cols).toContain('episodic_temp');
-    expect(cols).toContain('growth_backlog');
+    expect(cols).toContain('profile_body');
     expect(cols).toContain('status');
     expect(cols).toContain('proposed_by');
     expect(cols).toContain('rollback_reason');

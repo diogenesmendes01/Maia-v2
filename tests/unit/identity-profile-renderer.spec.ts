@@ -14,8 +14,20 @@ import { describe, it, expect } from 'vitest';
 import { renderOperationalProfile } from '@/identity/profile-renderer.js';
 import type { AgentOperationalProfileVersion } from '@/db/schema.js';
 
+/**
+ * Build a fake AgentOperationalProfileVersion for renderer tests.
+ *
+ * The renderer still reads the legacy 4-layer keys (core_immutable /
+ * operational_profile / episodic_temp / growth_backlog) via an `as unknown`
+ * cast (migration TODO in profile-renderer.ts).  We embed them at the top
+ * level of the fake row so the renderer can find them, and cast the result to
+ * satisfy TypeScript without touching production code.
+ *
+ * When the renderer migrates to read from `profile_body`, update this helper
+ * to nest the keys inside profile_body instead.
+ */
 function buildVersion(
-  overrides: Partial<AgentOperationalProfileVersion>,
+  overrides: Record<string, unknown>,
 ): AgentOperationalProfileVersion {
   return {
     id: 'prof-1',
@@ -23,10 +35,9 @@ function buildVersion(
     agent_id: 'default',
     version: 1,
     status: 'active',
-    core_immutable: {},
-    operational_profile: {},
-    episodic_temp: {},
-    growth_backlog: {},
+    // profile_body satisfies the Drizzle type; legacy keys are merged at the
+    // top level so the renderer's `(version as unknown).core_immutable` cast works.
+    profile_body: {} as unknown as AgentOperationalProfileVersion['profile_body'],
     proposed_by: 'system_seed',
     proposed_reason: null,
     approved_by: null,
@@ -37,7 +48,7 @@ function buildVersion(
     rollback_reason: null,
     created_at: new Date(),
     ...overrides,
-  };
+  } as unknown as AgentOperationalProfileVersion;
 }
 
 describe('renderOperationalProfile', () => {
