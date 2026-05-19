@@ -11,8 +11,8 @@
  *  - sem mensagens do agente → retorna null sem chamar Anthropic
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import type { AgentOperationalProfileVersion } from '@/db/schema.js';
 import type { DriftRecentMessage } from '@/cognition/drift/types.js';
+import { buildProfileVersion } from '../fixtures/agentProfile.js';
 
 const messagesCreateMock = vi.fn();
 
@@ -33,34 +33,19 @@ function makeAnthropicReply(jsonObj: Record<string, unknown>): {
   };
 }
 
-function makeProfile(): AgentOperationalProfileVersion {
-  const now = new Date();
-  return {
-    id: 'prof-1',
-    tenant_id: 'default',
-    agent_id: 'default',
-    version: 1,
-    status: 'active',
-    core_immutable: {
-      identity_block: 'Você é a Maia, assistente financeira.',
-      principles: ['Direta, não burocrática.'],
-    } as unknown,
-    operational_profile: {
-      voice_descriptor: 'Português brasileiro, coloquial-profissional. Sem emojis.',
-      thresholds: {},
-    } as unknown,
-    episodic_temp: {} as unknown,
-    growth_backlog: [] as unknown,
-    proposed_by: 'system_seed',
-    proposed_reason: null,
-    approved_by: 'system_seed',
-    approved_at: now,
-    activated_at: now,
-    frozen_at: null,
-    rolled_back_at: null,
-    rollback_reason: null,
-    created_at: now,
-  } as unknown as AgentOperationalProfileVersion;
+function makeProfile() {
+  return buildProfileVersion({
+    _legacy: {
+      core_immutable: {
+        identity_block: 'Você é a Maia, assistente financeira.',
+        principles: ['Direta, não burocrática.'],
+      },
+      operational_profile: {
+        voice_descriptor: 'Português brasileiro, coloquial-profissional. Sem emojis.',
+        thresholds: {},
+      },
+    },
+  });
 }
 
 function makeAgentMsg(text: string, id = 'm-' + Math.random().toString(36).slice(2)): DriftRecentMessage {

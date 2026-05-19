@@ -6,8 +6,8 @@
  * de P8b). Padrão idêntico ao `valores.ts`.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import type { AgentOperationalProfileVersion, ProfileBody } from '@/db/schema.js';
 import type { DriftRecentMessage } from '@/cognition/drift/types.js';
+import { buildProfileVersion } from '../fixtures/agentProfile.js';
 
 const messagesCreateMock = vi.fn();
 
@@ -31,16 +31,9 @@ function makeAnthropicReply(jsonObj: Record<string, unknown>): {
 function makeProfile(opts: {
   role_descriptor?: string;
   priorities?: string[];
-} = {}): AgentOperationalProfileVersion {
-  const now = new Date();
-  return {
-    id: 'prof-1',
-    tenant_id: 'default',
-    agent_id: 'default',
-    version: 1,
-    status: 'active',
+} = {}) {
+  return buildProfileVersion({
     profile_body: {
-      schema_version: 'v3.1.1-2026-05-15',
       identity: {
         role_descriptor: opts.role_descriptor ?? 'atendimento_financeiro_pf',
         voice: { tone: '', formality: 'medium', verbosity: 'concise' },
@@ -52,23 +45,8 @@ function makeProfile(opts: {
         priorities: opts.priorities ?? ['preservar_capital', 'clareza'],
         learned_voice_modifiers: [],
       },
-      style: { language: 'pt-BR', rhythm: {} },
-      metadata: {
-        effective_from: now.toISOString(),
-        created_by: 'test',
-        previous_version_id: null,
-      },
-    } as unknown as ProfileBody,
-    proposed_by: 'system_seed',
-    proposed_reason: null,
-    approved_by: 'system_seed',
-    approved_at: now,
-    activated_at: now,
-    frozen_at: null,
-    rolled_back_at: null,
-    rollback_reason: null,
-    created_at: now,
-  } as unknown as AgentOperationalProfileVersion;
+    },
+  });
 }
 
 function makeAgentMsg(text: string, id = 'm-' + Math.random().toString(36).slice(2)): DriftRecentMessage {
