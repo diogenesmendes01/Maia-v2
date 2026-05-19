@@ -16,8 +16,18 @@ describe('P5 enums', () => {
       'silent',
     ]);
   });
-  it('ProposalStatus has 5 values', () => {
-    expect(Object.values(ProposalStatus)).toHaveLength(5);
+  it('ProposalStatus values match snapshot', () => {
+    expect(Object.values(ProposalStatus)).toMatchInlineSnapshot(`
+      [
+        "draft",
+        "submitted",
+        "approved",
+        "testing",
+        "rejected",
+        "delivered",
+        "reverted",
+      ]
+    `);
   });
   it('CapabilityTestOutcome has 3 values', () => {
     expect(Object.values(CapabilityTestOutcome).sort()).toEqual(['error', 'fail', 'pass']);
