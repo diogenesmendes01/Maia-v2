@@ -104,6 +104,7 @@ async function runReflectionBatchInner(): Promise<void> {
         erros: 0,
         ativa: true,
         exemplo_origem_id: cluster.signals[0]?.alvo_id ?? null,
+        // P10a: lifecycle columns populated by DB defaults.
       });
       await audit({
         acao: 'rule_learned',

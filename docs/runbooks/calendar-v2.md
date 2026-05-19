@@ -33,13 +33,13 @@ Reverte instantâneo (<1min) sem deploy. As 5 tools `calendar_*` continuam expos
 
 | # | Arquivo | Conteúdo |
 |---|---------|----------|
-| 036 | `036_calendar_a_entidades_location.sql` | `entidades.cidade` + `entidades.uf` (NULL ok) |
-| 037 | `037_calendar_b_holidays.sql` | tabela `holidays` + CHECK `regional_consistency` + CHECK `pending_must_have_proposal` |
-| 038 | `038_calendar_c_holiday_entidades.sql` | junction `holiday_entidades` (composite PK) |
-| 039 | `039_calendar_d_capability_proposals_holiday_type.sql` | adiciona `'holiday'` ao CHECK de `capability_proposals.capability_type` |
-| 040 | `040_calendar_e_holidays_unique_idem.sql` | UNIQUE index para idempotência de seed |
+| 055 | `055_calendar_a_entidades_location.sql` | `entidades.cidade` + `entidades.uf` (NULL ok) |
+| 056 | `056_calendar_b_holidays.sql` | tabela `holidays` + CHECK `regional_consistency` + CHECK `pending_must_have_proposal` |
+| 057 | `057_calendar_c_holiday_entidades.sql` | junction `holiday_entidades` (composite PK) |
+| 058 | `058_calendar_d_capability_proposals_holiday_type.sql` | adiciona `'holiday'` ao CHECK de `capability_proposals.capability_type` |
+| 059 | `059_calendar_e_holidays_unique_idem.sql` | UNIQUE index para idempotência de seed |
 
-Cada um tem `_down.sql` correspondente (wrapped em `BEGIN/COMMIT`; migration 039 inclui `LOCK EXCLUSIVE` antes do DELETE para evitar race com INSERTs concorrentes).
+Cada um tem `_down.sql` correspondente (wrapped em `BEGIN/COMMIT`; migration 058 inclui `LOCK EXCLUSIVE` antes do DELETE para evitar race com INSERTs concorrentes).
 
 ## Seed
 

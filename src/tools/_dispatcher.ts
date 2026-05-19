@@ -2,7 +2,7 @@ import type { Pessoa, Conversa } from '@/db/schema.js';
 import type { ResolvedPermission } from '@/governance/permissions.js';
 import { canAct } from '@/governance/permissions.js';
 import { constitutionalCheck } from '@/governance/rules.js';
-import { REGISTRY, type AnyTool } from './_registry.js';
+import { REGISTRY, isToolEnabled, type AnyTool } from './_registry.js';
 import { computeIdempotencyKey } from '@/governance/idempotency.js';
 import { idempotencyRepo } from '@/db/repositories.js';
 import { audit } from '@/governance/audit.js';
@@ -57,10 +57,24 @@ export async function dispatchTool(input: {
   // já em execução ainda exporiam (e executariam) o tool sem essa checagem.
   // Verifica AQUI, antes de auth e idempotência, para que o flag desligado
   // bloqueie execução imediatamente — incluindo retries de tools cacheadas.
+  // Per-tool `feature_flag` é mais específico que o gate KSM genérico, então
+  // vem primeiro e retorna o erro tipado `feature_disabled` com o flag name.
   if (tool.feature_flag !== undefined && !featureFlags.isEnabled(tool.feature_flag)) {
     return {
       error: 'feature_disabled',
       details: { tool: tool.name, feature_flag: tool.feature_flag },
+    };
+  }
+
+  // P10a (review #104 high): runtime feature-flag gate genérico (KSM
+  // propose_* tools). A killed feature flag must block the handler
+  // in-flight, not just hide the schema. Without this, the LLM could
+  // still call propose_* during a canary rollback and produce rows whose
+  // lifecycle columns may not exist in the database yet.
+  if (!isToolEnabled(input.tool)) {
+    return {
+      error: 'tool_disabled',
+      details: { tool: input.tool, reason: 'feature_flag_off' },
     };
   }
 
