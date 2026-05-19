@@ -122,6 +122,18 @@ function makeFakeRepo(
       }
       return findActive(tenant_id, null, args.descriptor);
     },
+    async findActiveCandidates(args) {
+      const tenant_id = (await import('@/db/tenant-context.js')).getCurrentTenant();
+      const candidates: PolicyRule[] = [];
+      // Agent-specific row first, then tenant-wide (agent_id IS NULL).
+      if (args.agent_id) {
+        const agentRow = findActive(tenant_id, args.agent_id, args.descriptor);
+        if (agentRow) candidates.push(agentRow);
+      }
+      const tenantRow = findActive(tenant_id, null, args.descriptor);
+      if (tenantRow) candidates.push(tenantRow);
+      return candidates;
+    },
     async listActiveForTenant() {
       const tenant_id = (await import('@/db/tenant-context.js')).getCurrentTenant();
       return Object.values(state).filter(
