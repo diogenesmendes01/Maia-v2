@@ -22,6 +22,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { runCognitiveModule } from './runner.js';
 import { capabilityProposalsRepo } from '@/db/repositories.js';
+import type { CapabilityProposalType } from '@/db/repositories.js';
 import { featureFlags } from '@/config/feature-flags.js';
 import { FeatureFlagName } from '@/types/enums.js';
 import type { AgentCapabilityGap, ActivationContext } from '@/db/schema.js';
@@ -50,9 +51,18 @@ export type SoulBiasProposalSpec = {
   source_drift_alert_id?: string;
 };
 
+/**
+ * Discriminated union de drafts de propostas.
+ *
+ * - P5 baseline: 'tool' | 'knowledge' | 'procedure' | 'integration' | 'other'.
+ * - P8b: adiciona 'soul_bias' com spec tipada (SoulBiasProposalSpec).
+ * - P9a (migration 044): estende o CHECK em capability_proposals para 'skill'.
+ *   O capability-proposer pode gerar drafts de Skill Contract via mesma rota;
+ *   owner aprova no Admin UI.
+ */
 export type ProposalDraft =
   | {
-      capability_type: 'tool' | 'knowledge' | 'procedure' | 'integration' | 'other';
+      capability_type: 'tool' | 'knowledge' | 'procedure' | 'integration' | 'other' | 'skill';
       title: string;
       description: string;
       proposed_spec: Record<string, unknown>;
@@ -168,7 +178,7 @@ export async function proposeCapabilityForGap(args: {
   try {
     const proposal = await capabilityProposalsRepo.create({
       gap_id: args.gap.id,
-      capability_type: draft.output.capability_type as 'tool' | 'knowledge' | 'procedure' | 'integration' | 'other',
+      capability_type: draft.output.capability_type as CapabilityProposalType,
       title: draft.output.title,
       description: draft.output.description,
       proposed_spec: draft.output.proposed_spec,

@@ -3045,10 +3045,25 @@ export const gapEscalationRulesRepo = {
 // reason: 'not_found' | 'invalid_transition' }. Cada transição seta um
 // timestamp (submitted_at | decided_at | delivered_at) + campos opcionais
 // (decided_by, decision_reason, delivery_artifact_ref).
+// P9a — extended capability_type set (migration 044). 'skill' enables
+// the P9a Skill Registry to flow proposals through the same approval inbox;
+// 'soul_bias' / 'policy_rule' / 'holiday' antecipam P8e/P9b/scheduling sem
+// ativar uso até o respectivo phase.
+export type CapabilityProposalType =
+  | 'tool'
+  | 'knowledge'
+  | 'procedure'
+  | 'integration'
+  | 'other'
+  | 'skill'
+  | 'soul_bias'
+  | 'policy_rule'
+  | 'holiday';
+
 export const capabilityProposalsRepo = {
   async create(input: {
     gap_id?: string;
-    capability_type: 'tool' | 'knowledge' | 'procedure' | 'integration' | 'other';
+    capability_type: CapabilityProposalType;
     title: string;
     description: string;
     proposed_spec: unknown;
@@ -3084,7 +3099,7 @@ export const capabilityProposalsRepo = {
     tx: typeof db,
     input: {
       gap_id?: string;
-      capability_type: 'tool' | 'knowledge' | 'procedure' | 'integration' | 'other';
+      capability_type: CapabilityProposalType;
       title: string;
       description: string;
       proposed_spec: unknown;
@@ -3794,3 +3809,10 @@ export const roleSelectorDecisionsRepo = {
     return typeof raw === 'string' ? Number(raw) : raw;
   },
 };
+
+// P9a — re-export skillsRepo from control-plane/skill-registry. Convention:
+// `repositories.ts` é o ponto único de import para callers; `control-plane/`
+// hospeda a implementação propriamente dita (Source of Truth + Admin UI).
+// Ver `src/control-plane/skill-registry/skills-repo.ts`.
+export { skillsRepo } from '@/control-plane/skill-registry/index.js';
+export type { SkillsRepo, ProposeInput as SkillProposeInput } from '@/control-plane/skill-registry/index.js';

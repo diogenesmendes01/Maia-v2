@@ -48,4 +48,5 @@ export const featureFlags = new FeatureFlags({
   [FeatureFlagName.P8C_USER_LAYER_NAMESPACE_V1]: config.FEATURE_P8C_USER_LAYER_NAMESPACE_V1,
   [FeatureFlagName.FEATURE_SOUL_LAYER_V1]: config.FEATURE_SOUL_LAYER_V1,
   [FeatureFlagName.POLICY_RESOLVER_V1]: config.FEATURE_POLICY_RESOLVER_V1,
+  [FeatureFlagName.SKILL_REGISTRY_V1]: config.FEATURE_SKILL_REGISTRY_V1,
 });

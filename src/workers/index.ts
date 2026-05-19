@@ -1,5 +1,4 @@
-import cron from 'node-cron';
-import type { ScheduledTask } from 'node-cron';
+import cron, { type ScheduledTask } from 'node-cron';
 import { logger } from '@/lib/logger.js';
 import { runHealthMonitor } from './health-monitor.js';
 import { runPendingExpirer } from './pending-expirer.js';
