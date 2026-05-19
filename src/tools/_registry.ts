@@ -31,6 +31,17 @@ import { generateReportTool } from './generate-report.js';
 import { config } from '@/config/env.js';
 import { featureFlags } from '@/config/feature-flags.js';
 import { FeatureFlagName } from '@/types/enums.js';
+// Calendar v2 — read-only tools
+import { calendarIsBusinessDayTool } from './calendar/calendar-is-business-day.js';
+import { calendarNextHolidayTool } from './calendar/calendar-next-holiday.js';
+import { calendarListHolidaysTool } from './calendar/calendar-list-holidays.js';
+import { calendarBusinessDaysBetweenTool } from './calendar/calendar-business-days-between.js';
+import { calendarAddBusinessDaysTool } from './calendar/calendar-add-business-days.js';
+// Calendar v2 — write tools + P5 closure
+import { registerCustomHolidayTool } from './register-custom-holiday.js';
+import { approveCapabilityProposalTool } from './approve-capability-proposal.js';
+import { rejectCapabilityProposalTool } from './reject-capability-proposal.js';
+import { listPendingProposalsTool } from './list-pending-proposals.js';
 
 export type ToolHandlerCtx = {
   pessoa: import('@/db/schema.js').Pessoa;
@@ -61,6 +72,16 @@ export type Tool<I extends z.ZodTypeAny, O extends z.ZodTypeAny> = {
    * reply into view-once (B3a). OR-logic across all tools in the turn.
    */
   sensitive?: boolean;
+  /**
+   * Codex review #105 (medium): kill-switch em runtime. Quando setado, o
+   * dispatcher checa o flag IMEDIATAMENTE antes de autorizar/executar — se
+   * o flag estiver off (kill switch ativo), o tool é tratado como
+   * inexistente para a chamada. O filtro em `REGISTRY` no module-load
+   * continua valendo para o schema exposto ao LLM, mas processos já
+   * carregados que recebam o tool name via chamada direta também respeitam
+   * o flag pós-load.
+   */
+  feature_flag?: FeatureFlagName;
 };
 
 export type AnyTool = Tool<z.ZodTypeAny, z.ZodTypeAny>;
@@ -126,6 +147,21 @@ export const REGISTRY: Record<string, AnyTool> = {
   ...(config.FEATURE_PDF_REPORTS
     ? { generate_report: generateReportTool as unknown as AnyTool }
     : {}),
+  // Calendar v2 — read-only tools (sempre expostas; flag OFF retorna fallback
+  // legacy só-nacionais sem quebrar).
+  calendar_is_business_day: calendarIsBusinessDayTool as unknown as AnyTool,
+  calendar_next_holiday: calendarNextHolidayTool as unknown as AnyTool,
+  calendar_list_holidays: calendarListHolidaysTool as unknown as AnyTool,
+  calendar_business_days_between: calendarBusinessDaysBetweenTool as unknown as AnyTool,
+  calendar_add_business_days: calendarAddBusinessDaysTool as unknown as AnyTool,
+  // Calendar v2 — write tools. Cada uma declara `feature_flag` para que o
+  // gate seja avaliado em runtime (kill-switch funciona em processos já
+  // carregados, schema exposto ao LLM sincroniza com o flag). Codex review
+  // #105 medium.
+  register_custom_holiday: registerCustomHolidayTool as unknown as AnyTool,
+  approve_capability_proposal: approveCapabilityProposalTool as unknown as AnyTool,
+  reject_capability_proposal: rejectCapabilityProposalTool as unknown as AnyTool,
+  list_pending_proposals: listPendingProposalsTool as unknown as AnyTool,
 };
 
 /**
@@ -140,6 +176,12 @@ export function isToolEnabled(name: string): boolean {
   if (KSM_PROPOSE_TOOLS.has(name)) {
     return featureFlags.isEnabled(FeatureFlagName.KNOWLEDGE_STATE_MACHINE_V1);
   }
+  // Calendar v2 + outras tools opcionais — honra `feature_flag` declarado
+  // na definição do tool (kill switch em runtime sem redeploy).
+  const tool = REGISTRY[name];
+  if (tool?.feature_flag !== undefined) {
+    return featureFlags.isEnabled(tool.feature_flag);
+  }
   return true;
 }
 
@@ -153,6 +195,10 @@ export function getToolSchemas(byEntity: Map<string, ResolvedPermission>) {
     }
     for (const a of rp.profile.acoes) allowed.add(a);
   }
+  // Codex review #105 (medium) + KSM: além do filtro de permissão, oculta tools
+  // cujo feature_flag esteja desligado em runtime. Mantém schema exposto
+  // ao LLM sincronizado com o gate do dispatcher. `isToolEnabled` honra
+  // tanto KSM propose_* tools quanto o `feature_flag` declarado por tool.
   const tools = Object.values(REGISTRY).filter((t) => isToolEnabled(t.name));
   if (isOwner) return tools.map(toolToSchema);
   return tools

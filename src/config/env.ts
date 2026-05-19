@@ -154,6 +154,11 @@ const envSchema = z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
+    // Calendar v2 — feriados nacionais/regionais + business-day calendar + rrule extension
+    FEATURE_CALENDAR_V2: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
     // P8b — Soul Layer (biases comportamentais persistentes que modulam, nunca bloqueiam).
     // Kill switch: set FEATURE_SOUL_LAYER_V1=false para desativar todo o soul pipeline
     // (detector de drift, slice injection, activator worker) sem alterar DB.

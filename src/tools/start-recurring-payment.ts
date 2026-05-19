@@ -3,6 +3,11 @@ import type { Tool } from './_registry.js';
 import { audit } from '@/governance/audit.js';
 import { seriesRepo } from '@/scheduling/repos.js';
 import { computeNext, parseRRule } from '@/scheduling/rrule.js';
+import {
+  parseRRule as parseRRuleExtended,
+  usesBusinessDayExtension,
+  computeNextWithBusinessDays,
+} from '@/scheduling/business-day-rrule.js';
 import { paymentTaskBlueprint } from '@/scheduling/engine.js';
 
 const inputSchema = z.object({
@@ -52,11 +57,18 @@ export const startRecurringPaymentTool: Tool<typeof inputSchema, typeof outputSc
     if (!ctx.scope.entidades.includes(args.entidade_id)) {
       throw new Error('entidade fora do escopo');
     }
-    const first_scheduled_for = computeNext(
-      parseRRule(args.rrule),
-      new Date(),
-      args.month_end_policy,
-    );
+    // Codex review #105 (medium): detecta extensão business-day (BYNTHWORKDAY
+    // ou BYWORKDAY=true) e roteia para o parser/engine async correspondente.
+    // Sem isso, regras como "5° dia útil do mês" (BYNTHWORKDAY=5) ou "DAILY
+    // pulando feriados" (BYWORKDAY=true) seriam rejeitadas pelo parser
+    // legacy e a extensão fica inalcançável pelo product path.
+    const extParsed = parseRRuleExtended(args.rrule);
+    const first_scheduled_for = usesBusinessDayExtension(extParsed)
+      ? await computeNextWithBusinessDays(extParsed, new Date(), {
+          monthEndPolicy: args.month_end_policy,
+          entidadeId: args.entidade_id,
+        })
+      : computeNext(parseRRule(args.rrule), new Date(), args.month_end_policy);
     const contexto = {
       conta_id: args.conta_id,
       valor: args.valor,

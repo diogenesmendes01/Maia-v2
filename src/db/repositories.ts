@@ -3933,6 +3933,10 @@ export const roleSelectorDecisionsRepo = {
   },
 };
 
+// Calendar v2 — re-export of holidaysRepo + holidayEntidadesRepo from dedicated modules.
+export { holidaysRepo } from './repositories/holidays-repo.js';
+export { holidayEntidadesRepo, CrossTenantIntegrityError } from './repositories/holiday-entidades-repo.js';
+
 // =====================================================================
 // P8.5 Admin UI v1 — auth, approvals, audit log, debug snapshot grants
 // =====================================================================
