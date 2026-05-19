@@ -19,7 +19,6 @@ const selfStateGetActive = vi.fn();
 const operationalProfileVersionsGetActive = vi.fn();
 const mensagensRecent = vi.fn();
 const entidadesByIds = vi.fn();
-const factsListForScopes = vi.fn();
 const factsListMentionableForScopes = vi.fn();
 const rulesListActive = vi.fn();
 const entityStatesById = vi.fn();
@@ -35,10 +34,7 @@ vi.mock('../../src/db/repositories.js', () => ({
   operationalProfileVersionsRepo: { getActive: operationalProfileVersionsGetActive },
   mensagensRepo: { recentInConversation: mensagensRecent },
   entidadesRepo: { byIds: entidadesByIds },
-  factsRepo: {
-    listForScopes: factsListForScopes,
-    listMentionableForScopes: factsListMentionableForScopes,
-  },
+  factsRepo: { listMentionableForScopes: factsListMentionableForScopes },
   rulesRepo: { listActive: rulesListActive },
   entityStatesRepo: { byId: entityStatesById },
   memoryEntryRepo: { findRelevant: memoryEntryFindRelevant },
@@ -135,7 +131,6 @@ beforeEach(async () => {
   operationalProfileVersionsGetActive.mockReset();
   mensagensRecent.mockReset();
   entidadesByIds.mockReset();
-  factsListForScopes.mockReset();
   factsListMentionableForScopes.mockReset();
   rulesListActive.mockReset();
   entityStatesById.mockReset();
@@ -155,7 +150,6 @@ beforeEach(async () => {
   });
   mensagensRecent.mockResolvedValue([]);
   entidadesByIds.mockResolvedValue([]);
-  factsListForScopes.mockResolvedValue([]);
   factsListMentionableForScopes.mockResolvedValue([]);
   rulesListActive.mockResolvedValue([]);
   entityStatesById.mockResolvedValue(null);
