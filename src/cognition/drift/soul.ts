@@ -187,7 +187,7 @@ async function llmJudgeBiasAdherence(
       messages: [{ role: 'user', content: user }],
     });
     const text = completion.content
-      .filter((c): c is { type: 'text'; text: string } => c.type === 'text')
+      .filter((c): c is Anthropic.TextBlock => c.type === 'text')
       .map((c) => c.text)
       .join('');
     const match = text.match(/\{[\s\S]*\}/);
