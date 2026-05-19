@@ -42,7 +42,7 @@ vi.mock('../../src/db/repositories.js', () => ({
   pendingQuestionsRepo: { findActiveSnapshot: vi.fn() },
   conversasRepo: { touch: vi.fn() },
   selfStateRepo: { getActive: vi.fn().mockResolvedValue(null) },
-  factsRepo: { listForScopes: vi.fn().mockResolvedValue([]) },
+  factsRepo: { listForScopes: vi.fn().mockResolvedValue([]), listMentionableForScopes: vi.fn().mockResolvedValue([]) },
   rulesRepo: { listActive: vi.fn().mockResolvedValue([]) },
   entityStatesRepo: { byId: vi.fn().mockResolvedValue(null) },
   entidadesRepo: { byIds: vi.fn().mockResolvedValue([]) },

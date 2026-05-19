@@ -83,7 +83,7 @@ const {
   driftAlertsResolve,
   mensagensRecent,
   entidadesByIds,
-  factsListForScopes,
+  factsListMentionableForScopes,
   rulesListActive,
   entityStatesById,
   memoryEntryFindRelevant,
@@ -110,7 +110,7 @@ const {
   driftAlertsResolve: vi.fn(),
   mensagensRecent: vi.fn(),
   entidadesByIds: vi.fn(),
-  factsListForScopes: vi.fn(),
+  factsListMentionableForScopes: vi.fn(),
   rulesListActive: vi.fn(),
   entityStatesById: vi.fn(),
   memoryEntryFindRelevant: vi.fn(),
@@ -143,7 +143,7 @@ vi.mock('@/db/repositories.js', () => ({
   },
   mensagensRepo: { recentInConversation: mensagensRecent },
   entidadesRepo: { byIds: entidadesByIds },
-  factsRepo: { listForScopes: factsListForScopes },
+  factsRepo: { listMentionableForScopes: factsListMentionableForScopes },
   rulesRepo: { listActive: rulesListActive },
   entityStatesRepo: { byId: entityStatesById },
   memoryEntryRepo: { findRelevant: memoryEntryFindRelevant },
@@ -262,7 +262,7 @@ describe('P4 operational identity — end-to-end', () => {
     });
     mensagensRecent.mockResolvedValue([]);
     entidadesByIds.mockResolvedValue([]);
-    factsListForScopes.mockResolvedValue([]);
+    factsListMentionableForScopes.mockResolvedValue([]);
     rulesListActive.mockResolvedValue([]);
     entityStatesById.mockResolvedValue(null);
     memoryEntryFindRelevant.mockResolvedValue([]);
