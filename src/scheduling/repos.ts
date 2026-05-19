@@ -454,6 +454,29 @@ export const occurrencesRepo = {
   },
 
   /**
+   * Codex review #105 round-2 (high): release only the lease (claimed_by /
+   * claimed_at) while keeping `status='in_progress'`. Used by the engine
+   * when an in_progress occurrence is waiting on an external resource
+   * (outbox-drain finishing a forward send) and must NOT regress to
+   * `pending` — otherwise the next `claimDue` tick would re-run the
+   * outreach initial step and silently rewind progress.
+   *
+   * The next `claimInProgressForAdvance` tick re-picks it up via the
+   * `claimed_at IS NULL OR claimed_at < now() - 30s` predicate.
+   */
+  async releaseLeaseOnly(id: string): Promise<void> {
+    await db
+      .update(occurrencesTable)
+      .set({
+        claimed_by: null,
+        claimed_at: null,
+      })
+      .where(
+        and(eq(occurrencesTable.id, id), eq(occurrencesTable.status, 'in_progress')),
+      );
+  },
+
+  /**
    * For `recurring_outreach`, after a response is captured the engine needs
    * to advance the occurrence through its remaining steps (forward + next
    * cycle). The original `claimDue` only picks up `pending`, so we have a

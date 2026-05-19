@@ -41,13 +41,20 @@ import * as procedureEngine from '@/procedures/engine.js';
 import { CognitiveEventType } from '@/types/enums.js';
 import { sendOutbound } from './output-dispatch.js';
 import { runReActLoop } from './react-loop.js';
-import { runWithTenantContext } from '@/db/tenant-context.js';
+import { runWithTenantContext, getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import { db } from '@/db/client.js';
 import { mensagens } from '@/db/schema.js';
 import { eq } from 'drizzle-orm';
 import { runNodes } from '@/cognitive-graph/orchestrator.js';
 import { buildPreturnNodes, type PreturnContext } from '@/cognitive-graph/preturn-graph.js';
 import { buildPostturnNodes } from '@/cognitive-graph/postturn-graph.js';
+// P8a context-packet dual-path (FEATURE_CONTEXT_PACKET_V1)
+import { isContextPacketV1Enabled } from '@/runtime/feature-flags/context-packet-flag.js';
+import { buildContextPacket } from '@/runtime/context-packet/build-context-packet.js';
+import { buildPromptFromPacket } from '@/runtime/prompt/build-prompt-from-packet.js';
+import { createDecisionPacketStub } from '@/runtime/context-packet/decision-packet-stub.js';
+import { getProductionBuilderSet } from '@/runtime/context-packet/production-builder-set.js';
+import type { BaseContextPacket } from '@/runtime/context-packet/types.js';
 
 const TYPING_DEBOUNCE_MS = 1500;
 
@@ -701,13 +708,81 @@ async function runAgentForMensagemInner(
     }
   }
 
-  const { system, messages } = await buildPrompt({
-    pessoa,
-    conversa: c,
-    scope,
-    inbound,
-    activeRole,
-  });
+  // P8a dual-path — FEATURE_CONTEXT_PACKET_V1 routes here when enabled.
+  // When disabled (default) or when the packet path throws, falls back to
+  // the legacy buildPrompt. This makes the flag operational in production
+  // so the runbook kill-switch actually controls which builder fires.
+  let system: string;
+  let messages: import('@/lib/claude.js').LLMMessage[];
+
+  const tenantId = getCurrentTenant();
+  const usePacketPath = await isContextPacketV1Enabled(tenantId).catch(() => false);
+
+  if (usePacketPath) {
+    try {
+      const agentId = getCurrentAgent();
+      const base: BaseContextPacket = {
+        trace_id: inbound.id,
+        tenant_id: tenantId,
+        agent_id: agentId,
+        session_id: c.id,
+        conversation_id: c.id,
+        channel: {
+          id: channel_id ?? 'default',
+          kind: 'whatsapp',
+          is_locked_down: false,
+        },
+        actor: {
+          user_id: null,
+          pessoa_id: pessoa.id,
+          role: 'end_user',
+          is_authenticated: true,
+        },
+        input: {
+          kind: 'text',
+          content_ref: inbound.id,
+          content_hmac: '',
+          received_at: inbound.created_at?.toISOString() ?? new Date().toISOString(),
+        },
+        active_procedure_execution_id: activeExecution?.id ?? null,
+        feature_flags_snapshot: { FEATURE_CONTEXT_PACKET_V1: true },
+        entered_at_ms: Date.now(),
+      };
+      const decision = createDecisionPacketStub(base);
+      const { builders, cache } = getProductionBuilderSet();
+      // P8a stub history loader — no DB call yet; history surfaced via legacy
+      // messages array.  Real loader wired when P9b integrates context packet.
+      const historyLoader = async (): Promise<import('@/runtime/context-packet/types.js').HistorySlice> => ({
+        turns: [],
+        truncated: false,
+      });
+      const packet = await buildContextPacket({ base, decision }, { builders, cache, historyLoader });
+      const rendered = buildPromptFromPacket(packet);
+      system = rendered.system;
+      messages = rendered.messages as import('@/lib/claude.js').LLMMessage[];
+      logger.debug(
+        {
+          tenant_id: tenantId,
+          duration_ms: packet.assembly_meta.duration_ms,
+          fallbacks: Object.keys(packet.assembly_meta.fallback_depths_applied),
+        },
+        'agent.context_packet_path',
+      );
+    } catch (err) {
+      // Packet path failed — degrade to legacy builder so the turn succeeds.
+      logger.warn(
+        { tenant_id: tenantId, err: (err as Error).message },
+        'agent.context_packet_path_failed_fallback_legacy',
+      );
+      const legacy = await buildPrompt({ pessoa, conversa: c, scope, inbound, activeRole, activeExecution });
+      system = legacy.system;
+      messages = legacy.messages;
+    }
+  } else {
+    const legacy = await buildPrompt({ pessoa, conversa: c, scope, inbound, activeRole, activeExecution });
+    system = legacy.system;
+    messages = legacy.messages;
+  }
 
   const tools = getToolSchemas(scope.byEntity);
   // Use the JID the inbound message arrived on so replies stay on the same
@@ -720,8 +795,8 @@ async function runAgentForMensagemInner(
       : pessoa.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
   const stopTyping = scheduleTypingDebounce(jid, inbound.id);
   let totalTokens: number;
-  let reactOutboundText = '';
-  let reactToolsCalled: Array<{ name: string; result: unknown }> = [];
+  let reactOutboundText: string;
+  let reactToolsCalled: Array<{ name: string; result: unknown }>;
   try {
     const result = await runReActLoop({
       pessoa,

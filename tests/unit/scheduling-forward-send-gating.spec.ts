@@ -15,6 +15,7 @@ const listAwaitingTimedOutMock = vi.fn().mockResolvedValue([]);
 const occByIdMock = vi.fn();
 const setStatusMock = vi.fn().mockResolvedValue(undefined);
 const releaseClaimMock = vi.fn().mockResolvedValue(undefined);
+const releaseLeaseOnlyMock = vi.fn().mockResolvedValue(undefined);
 const hasOpenExclMock = vi.fn().mockResolvedValue(false);
 const listOverdueMock = vi.fn().mockResolvedValue([]);
 const findSeriesMock = vi.fn();
@@ -32,6 +33,7 @@ vi.mock('../../src/scheduling/repos.js', () => ({
     listAwaitingTimedOut: listAwaitingTimedOutMock,
     setStatus: setStatusMock,
     releaseClaim: releaseClaimMock,
+    releaseLeaseOnly: releaseLeaseOnlyMock,
     hasOpenForDestinatarioExcluding: hasOpenExclMock,
     listOverdueForSeries: listOverdueMock,
     byId: occByIdMock,
@@ -105,6 +107,7 @@ beforeEach(() => {
   listAwaitingTimedOutMock.mockResolvedValue([]);
   setStatusMock.mockResolvedValue(undefined);
   releaseClaimMock.mockResolvedValue(undefined);
+  releaseLeaseOnlyMock.mockResolvedValue(undefined);
   hasOpenExclMock.mockResolvedValue(false);
   listOverdueMock.mockResolvedValue([]);
   tasksSetStatusMock.mockResolvedValue(undefined);
@@ -148,7 +151,11 @@ describe('advanceInProgressOccurrence — Blocker 3 (review 2)', () => {
     expect(insertNextMock).not.toHaveBeenCalled();
   });
 
-  it('forward task already in_progress (outbox still sending): release claim, do not finalize', async () => {
+  it('forward task already in_progress (outbox still sending): release LEASE ONLY, keep status=in_progress, do not finalize', async () => {
+    // Codex review #105 round-2 (high): MUST use releaseLeaseOnly here.
+    // releaseClaim would regress status to `pending`, letting the next
+    // pending-path tick re-run the outreach initial step and silently
+    // duplicate the send / reset to awaiting_third_party.
     claimInProgressMock.mockResolvedValue([occBase]);
     findSeriesMock.mockResolvedValue(seriesBase);
     tasksByOccMock.mockResolvedValue([
@@ -159,7 +166,9 @@ describe('advanceInProgressOccurrence — Blocker 3 (review 2)', () => {
     const { runSchedulingTick } = await import('../../src/scheduling/engine.js');
     await runSchedulingTick();
 
-    expect(releaseClaimMock).toHaveBeenCalledWith(occBase.id, 30);
+    expect(releaseLeaseOnlyMock).toHaveBeenCalledWith(occBase.id);
+    // Crucial: must NOT call releaseClaim (which would regress to pending).
+    expect(releaseClaimMock).not.toHaveBeenCalled();
     expect(setStatusMock.mock.calls.find((c) => c[1] === 'completed')).toBeUndefined();
     expect(insertNextMock).not.toHaveBeenCalled();
   });
@@ -204,5 +213,42 @@ describe('advanceInProgressOccurrence — Blocker 3 (review 2)', () => {
       'completed',
       expect.objectContaining({ outcome: 'fired' }),
     );
+  });
+
+  // Codex review #105 round-2 (high): full regression for delayed forward.
+  // Simulates two consecutive ticks: first tick finds forward in_progress
+  // and releases lease only. Between ticks, the row REMAINS in_progress
+  // (we mock the in-memory occurrence accordingly). Next tick's pending-path
+  // (`claimDue`) MUST NOT pick it up because the row's status is still
+  // `in_progress`, not `pending` — so the engine never re-runs the initial
+  // outreach step. Only `claimInProgressForAdvance` picks it up again,
+  // which then re-enters the forward branch.
+  it('round-2 regression: delayed forward — lease release keeps status=in_progress so claimDue does NOT see the row, no outreach re-run', async () => {
+    // First tick: forward still in_progress → releaseLeaseOnly fires.
+    claimInProgressMock.mockResolvedValueOnce([occBase]);
+    // claimDue gets no work (since status=in_progress).
+    claimDueMock.mockResolvedValue([]);
+    findSeriesMock.mockResolvedValue(seriesBase);
+    tasksByOccMock.mockResolvedValue([
+      { id: 'tw', kind: 'await_response', status: 'completed' },
+      { id: 'tf', kind: 'forward', status: 'in_progress' },
+    ]);
+
+    const { runSchedulingTick } = await import('../../src/scheduling/engine.js');
+    await runSchedulingTick();
+
+    // Lease cleared, status stays in_progress (verified by mock contract).
+    expect(releaseLeaseOnlyMock).toHaveBeenCalledTimes(1);
+    expect(releaseLeaseOnlyMock).toHaveBeenCalledWith(occBase.id);
+    // No pending-path regression: releaseClaim NEVER called.
+    expect(releaseClaimMock).not.toHaveBeenCalled();
+    // No outreach re-run: outbox not enqueued again (no forward template
+    // dispatch + no initial outreach `send_outreach` enqueue).
+    expect(enqueueMock).not.toHaveBeenCalled();
+    // No status mutations on the occurrence (in particular: not back to
+    // awaiting_third_party, completed, failed, etc.).
+    expect(setStatusMock).not.toHaveBeenCalled();
+    // Next-cycle insert NEVER fires while waiting.
+    expect(insertNextMock).not.toHaveBeenCalled();
   });
 });

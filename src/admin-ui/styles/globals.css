@@ -1,0 +1,20 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --foreground-rgb: 17, 17, 17;
+  --background-rgb: 255, 255, 255;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;
+  color: rgb(var(--foreground-rgb));
+  background-color: rgb(var(--background-rgb));
+}
+
+.risk-low { color: theme('colors.risk.low'); }
+.risk-medium { color: theme('colors.risk.medium'); }
+.risk-high { color: theme('colors.risk.high'); }
+.risk-critical { color: theme('colors.risk.critical'); }
