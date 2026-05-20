@@ -108,29 +108,31 @@ export const PDF_FONTS = {
  *
  * Caller is responsible for setting `defaultStyle.font: 'Helvetica'` in the
  * docDefinition (or any custom font config consistent with PDF_FONTS above).
+ *
+ * IMPORTANT: pdfmake's top-level export (`js/index.js`, the package `main`) is
+ * a runtime *instance* of the pdfmake class, not the PdfPrinter constructor.
+ * We use the instance API: setFonts() + createPdf() + getBuffer(). Do NOT try
+ * to use `new pdfmake.default()` — it will throw "PdfPrinter is not a
+ * constructor". See: https://github.com/diogenesmendes01/Maia-v2/issues/138
  */
 export async function renderPdfToBuffer(docDefinition: unknown): Promise<Buffer> {
-  // Top-level `pdfmake` resolves to `src/printer.js` (the Node entry per
-  // pdfmake's package.json `main` field). The default export is the
-  // PdfPrinter constructor.
-  const mod = (await import('pdfmake')) as unknown as {
-    default: new (fonts: unknown) => {
-      createPdfKitDocument: (def: unknown) => {
-        on: (e: string, cb: (...args: unknown[]) => void) => void;
-        end: () => void;
-      };
-    };
-  };
-  const PdfPrinter = mod.default;
-  const printer = new PdfPrinter(PDF_FONTS);
-  const doc = printer.createPdfKitDocument(docDefinition);
-  return await new Promise<Buffer>((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    doc.on('data', (chunk: unknown) => {
-      chunks.push(chunk as Buffer);
-    });
-    doc.on('end', () => resolve(Buffer.concat(chunks)));
-    doc.on('error', (err: unknown) => reject(err as Error));
-    doc.end();
-  });
+  // The `pdfmake` CommonJS module exports a singleton instance (not a class).
+  // We must use require() here because the module's `main` is a CommonJS file
+  // that uses `module.exports = new pdfmake()`, which dynamic import() wraps
+  // differently across bundlers. Using createRequire keeps the instance stable.
+  const { createRequire } = await import('node:module');
+  const req = createRequire(import.meta.url);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const pdfmakeInstance = req('pdfmake') as any;
+
+  // Configure fonts and access policies on the shared instance.
+  pdfmakeInstance.setFonts(PDF_FONTS);
+  // Allow local font resolution (built-in Helvetica from pdfkit).
+  // Block external URL fetches — our fonts are all built-in.
+  pdfmakeInstance.setLocalAccessPolicy(() => true);
+  pdfmakeInstance.setUrlAccessPolicy(() => false);
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const outputDoc = pdfmakeInstance.createPdf(docDefinition as any);
+  return outputDoc.getBuffer() as Promise<Buffer>;
 }

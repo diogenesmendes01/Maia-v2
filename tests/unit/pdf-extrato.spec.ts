@@ -47,7 +47,7 @@ afterAll(async () => {
 // Tracked separately; these tests are skipped until the production code is fixed.
 // requires docker-compose: no (pure Node PDF gen, but blocked by production bug)
 describe('generateExtratoPdf', () => {
-  it.skip('produces a valid PDF (magic bytes %PDF) at <MEDIA_ROOT>/tmp/*.pdf', async () => {
+  it('produces a valid PDF (magic bytes %PDF) at <MEDIA_ROOT>/tmp/*.pdf', async () => {
     const { generateExtratoPdf } = await import('../../src/lib/pdf/extrato.js');
     const result = await generateExtratoPdf({
       ownerName: 'Owner Test',
@@ -69,7 +69,7 @@ describe('generateExtratoPdf', () => {
     await unlink(result.path);
   });
 
-  it.skip('truncates at 500 rows and reports it in summary.rowCount', async () => {
+  it('truncates at 500 rows and reports it in summary.rowCount', async () => {
     const { generateExtratoPdf } = await import('../../src/lib/pdf/extrato.js');
     const txns = Array.from({ length: 600 }, (_, i) => ({
       data_competencia: `2026-04-${String((i % 30) + 1).padStart(2, '0')}`,
@@ -86,7 +86,7 @@ describe('generateExtratoPdf', () => {
     await unlink(result.path);
   });
 
-  it.skip('handles empty transaction list (header + empty table + zero totals)', async () => {
+  it('handles empty transaction list (header + empty table + zero totals)', async () => {
     const { generateExtratoPdf } = await import('../../src/lib/pdf/extrato.js');
     const result = await generateExtratoPdf({
       ownerName: 'Owner', entidadeName: 'Empresa Z',
