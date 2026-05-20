@@ -88,7 +88,7 @@ Cada um governa **um aspecto** de "o que a Maia sabe fazer". Nenhum captura **a 
 
 ## 2. Migration SQL — `skills` table
 
-**Tipo de `tenant_id`:** master spec usa `UUID`. Schema atual da Maia (`capability_proposals`, etc.) usa `TEXT`. P9a segue v3.1.1: **`UUID`** para alinhar com o resto do Control Plane que está sendo introduzido em P8/P9. Migration adicional pode normalizar pré-existentes em P11.
+**Tipo de `tenant_id`:** Schema atual da Maia (`tenants.id`, `agents.id`, `capability_proposals`, etc.) usa `TEXT PRIMARY KEY`. P9a segue esse padrão: `tenant_id TEXT` e `agent_id TEXT` para FK types compatíveis. UUID seria incompatível com os PKs TEXT existentes.
 
 ### 2.1 `043_p9a_skills.sql`
 
@@ -99,8 +99,8 @@ Cada um governa **um aspecto** de "o que a Maia sabe fazer". Nenhum captura **a 
 
 CREATE TABLE skills (
   id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  tenant_id           UUID NOT NULL REFERENCES tenants(id),
-  agent_id            UUID NULL REFERENCES agents(id),     -- NULL = tenant-wide skill
+  tenant_id           TEXT NOT NULL REFERENCES tenants(id),
+  agent_id            TEXT REFERENCES agents(id),          -- NULL = tenant-wide skill
 
   -- Identificação
   skill_descriptor    TEXT NOT NULL,                       -- ex.: 'detect_legal_risk', 'collect_missing_cpf'
@@ -1123,7 +1123,7 @@ if (args.proposal.capability_type === 'skill') {
 | G23 | Slice builder cache 5-10min + evento invalida | Set cache, emit `skill_activated`, get cache → miss |
 | G24 | Admin UI Tela 2 mostra Skill Contract completo | E2E playwright/cypress (placeholder) |
 
-`scripts/p9a-acceptance-gates.sh` orquestra G1-G23 (G24 manual ou via test UI). Falha em qualquer um → exit non-zero.
+`scripts/p9a-acceptance-gates.sh` orquestra G1-G18. G19-G23 pending automation (script não implementado); G24 manual (E2E placeholder). Falha em qualquer um dos G1-G18 → exit non-zero.
 
 ---
 

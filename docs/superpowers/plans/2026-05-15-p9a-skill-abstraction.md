@@ -73,8 +73,8 @@ cat > migrations/043_p9a_skills.sql << 'EOF'
 
 CREATE TABLE skills (
   id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  tenant_id           UUID NOT NULL REFERENCES tenants(id),
-  agent_id            UUID NULL REFERENCES agents(id),     -- NULL = tenant-wide skill
+  tenant_id           TEXT NOT NULL REFERENCES tenants(id),
+  agent_id            TEXT REFERENCES agents(id),          -- NULL = tenant-wide skill
 
   -- Identificação
   skill_descriptor    TEXT NOT NULL,                       -- ex.: 'detect_legal_risk', 'collect_missing_cpf'
