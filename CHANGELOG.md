@@ -4,6 +4,41 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-05-20 — "Hot-path wiring + governance functional"
+
+This release closes the build-then-wire gap from v3.0.0: components that
+were implemented in isolation now actually execute in production.
+
+### Added — wiring
+- **Context Packet (P8a) — wired to hot path** ([#151](https://github.com/diogenesmendes01/Maia-v2/pull/151)): `agent/core.ts` now builds and renders via `buildContextPacket` when `FEATURE_CONTEXT_PACKET_V1=true`, falling back to legacy on error.
+- **Decision Engine (P9b) — wired to hot path** ([#152](https://github.com/diogenesmendes01/Maia-v2/pull/152)): `runDecisionEngineIfEnabled` invoked before every LLM call. Honors all 5 `decision_class` values + applies `tool_reductions`. `engine_error` is **fail-closed by default** (`FEATURE_DECISION_ENGINE_ERROR_FALLBACK=legacy` reverts to pre-P9b behavior).
+- **Risk Scoring (P9c) — both callsites wired** ([#153](https://github.com/diogenesmendes01/Maia-v2/pull/153)): `RiskScorerStubImpl` and KSM stub replaced with real `TurnRiskScorer` + `KnowledgeRiskScorer` wrappers (no-downgrade invariant + gate fallback escalation active).
+
+### Added — DecisionEngine real adapters (Camada 2/3)
+- **Real deps inside `getDecisionEngine()`** ([#154](https://github.com/diogenesmendes01/Maia-v2/pull/154)): `PolicyDescriptorResolver`, `PolicyRulesRepo`, `PolicyDSLEvaluator`, `SkillsRepo` no longer stubbed.
+- **`LockdownReader` real** ([#155](https://github.com/diogenesmendes01/Maia-v2/pull/155)): dual-layer enforcement — channel via `BaseContextPacket.channel.is_locked_down` + entity/permissao via `entity_states.flags['lockdown_snapshot']` + `permissoes.status='suspensa'`.
+- **`procedure_domain` real** ([#156](https://github.com/diogenesmendes01/Maia-v2/pull/156)): migration `060_p3a_procedure_definitions_domain.sql` adds `domain TEXT` column; adapter performs JOIN; `WorkflowSelector` no longer falls back to TTL heuristic.
+- **`ChannelPoliciesReader` real** ([#157](https://github.com/diogenesmendes01/Maia-v2/pull/157)): drizzle query on `channel_policies` with mandatory `tenant_id` predicate (cross-tenant isolation preserved).
+- **`RiskScorerProdAdapter` (engine-internal)** ([#158](https://github.com/diogenesmendes01/Maia-v2/pull/158)): bridges DE's `{intent, base}` interface to P9c's `TurnRiskSignals` + maps 4-level `ScoredRisk` to 3-level `RiskLevel` (CRITICAL caps to HIGH + `requires_human_review=true`).
+- **`active_sensitive_memory_count` field** ([#159](https://github.com/diogenesmendes01/Maia-v2/pull/159)): added to `BaseContextPacket`, populated by `buildBaseContextPacketFromTurn` (with agent-isolation preserved), consumed by `RiskScorerProdAdapter` for risk-floor calculation.
+
+### Migrations
+- `060_p3a_procedure_definitions_domain.sql` — `ALTER TABLE procedure_definitions ADD COLUMN domain TEXT` with CHECK allowlist (onboarding/support/transfer/cancel/unknown) + partial index.
+
+### Production readiness
+With this release, the following can be enabled together in production:
+- `FEATURE_CONTEXT_PACKET_V1=true`
+- `FEATURE_DECISION_ENGINE_V1=true` (default `FEATURE_DECISION_ENGINE_ERROR_FALLBACK=fail-closed`)
+- `FEATURE_SOUL_LAYER_V1=true`
+- `FEATURE_POLICY_RESOLVER_V1=true`
+- `FEATURE_SKILL_REGISTRY_V1=true`
+- `FEATURE_KNOWLEDGE_STATE_MACHINE_V1=true`
+- `FEATURE_CALENDAR_V2=true`
+- `FEATURE_RUNTIME_TRACE_V1=true` (requires `RUNTIME_TRACE_HMAC_MASTER_SECRET` + `RUNTIME_TRACE_DEBUG_S3_BUCKET` + `RUNTIME_TRACE_DEBUG_AES_KEY`)
+
+### Known limitations
+- Admin UI auth (P8.5) still returns `providers=[]` in production until OIDC/SAML/magic-link is wired. Setting `FEATURE_ADMIN_UI_V1=true` does not enable production login.
+
 ## [3.0.0] - 2026-05-20 — "Maia v3 Runtime Architecture"
 
 Full Runtime Architecture v3.1.1 cutover: Hot Path stages, Context Packet,
