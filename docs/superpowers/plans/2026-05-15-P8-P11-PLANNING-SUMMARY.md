@@ -1,18 +1,16 @@
 # P8–P11 Planning Summary
 
 **Date:** 2026-05-15  
-**Status:** All specs + implementation plans complete; ready for agentic execution  
+**Status:** P9a plan + spec committed in this PR. Other phases shipped separately via individual PRs (see Completion Summary below). **Note:** not all files listed in the References section are present in the repository — only `p9a-skill-abstraction.md` (plan) and `2026-05-15-p9a-skill-abstraction-design.md` (spec) were committed here. The handoff checklists (`P9-HANDOFF-CHECKLIST.txt`, `P10-HANDOFF-CHECKLIST.txt`) and other phase plans/specs referenced below have not been committed to this path.  
 **Scope:** 16 implementation phases across 5 vertical slices (P8, P9, P10, P11)
 
 ---
 
 ## Overview
 
-This document summarizes the completion of design → implementation planning for all four major vertical slices (P8 Governance & Identity, P9 Cognitive & Control, P10 Observability & Knowledge, P11 Cleanup). Every phase now has:
+This document summarizes the design → implementation planning for all four major vertical slices (P8 Governance & Identity, P9 Cognitive & Control, P10 Observability & Knowledge, P11 Cleanup). The P9a plan and spec (committed with this PR) follow the template described here.
 
-1. **Design Specification** — complete technical vision (constraints, invariants, ASTs, examples)
-2. **Implementation Plan** — task-by-task breakdown with TDD step-by-step guidance
-3. **Handoff Checklist** — preconditions, dependencies, execution order, quality gates
+> **Inventory disclaimer:** The "Documentation Artifacts" section and References list below describe the *intended* full inventory of plans, specs, and checklists. Only a subset of those files are actually present in the repository. Check `docs/superpowers/plans/` and `docs/superpowers/specs/` for what has been committed. Do not treat this summary's file list as proof that a file exists.
 
 ---
 
@@ -20,19 +18,19 @@ This document summarizes the completion of design → implementation planning fo
 
 | Slice | Phase | Title | Plan Lines | Status |
 |-------|-------|-------|-----------|--------|
-| P8 Governance & Identity | 8.5 | Admin UI v1 | 2092 | ✓ Complete |
-| | 8a | Context Packet | ~1400 | ✓ Complete |
-| | 8b | Soul Layer | ~1300 | ✓ Complete |
-| | 8c | User Layer Namespace | ~1600 | ✓ Complete |
-| | 8d | Identity Completion | ~1200 | ✓ Complete |
-| | 8e | Policy Descriptor Resolver | ~1500 | ✓ Complete |
-| P9 Cognitive & Control | 9a | Skill Abstraction | 1849 | ✓ Complete |
-| | 9b | Decision Engine | ~2200 | ✓ Complete |
-| | 9c | Risk Scoring | 2142 | ✓ Complete |
-| | 9d | Policy DSL Evaluator | ~1800 | ✓ Complete |
-| P10 Observability & Knowledge | 10a | Knowledge State Machine | ~1400 | ✓ Complete |
-| | 10b | Runtime Trace Envelope/Body | ~1200 | ✓ Complete |
-| P11 Cleanup | 11 | Cleanup (destructive) | ~900 | ✓ Complete |
+| P8 Governance & Identity | 8.5 | Admin UI v1 | 2092 | Shipped (PR #101) — plan/spec not in this path |
+| | 8a | Context Packet | ~1400 | Shipped (PR #96) — plan/spec not in this path |
+| | 8b | Soul Layer | ~1300 | Shipped (PR #95) — plan/spec not in this path |
+| | 8c | User Layer Namespace | ~1600 | Shipped (PR #94) — plan/spec not in this path |
+| | 8d | Identity Completion | ~1200 | Shipped (PR #100) — plan/spec not in this path |
+| | 8e | Policy Descriptor Resolver | ~1500 | Shipped (PR #93) — plan/spec not in this path |
+| P9 Cognitive & Control | 9a | Skill Abstraction | 1849 | ✓ Plan + spec committed in this PR |
+| | 9b | Decision Engine | ~2200 | Shipped (PR #103) — plan/spec not in this path |
+| | 9c | Risk Scoring | 2142 | Shipped (PR #97) — plan/spec not in this path |
+| | 9d | Policy DSL Evaluator | ~1800 | Shipped (PR #98) — plan/spec not in this path |
+| P10 Observability & Knowledge | 10a | Knowledge State Machine | ~1400 | Shipped (PR #104) — plan/spec not in this path |
+| | 10b | Runtime Trace Envelope/Body | ~1200 | Shipped (PR #102) — plan/spec not in this path |
+| P11 Cleanup | 11 | Cleanup (destructive) | ~900 | Not yet shipped — plan/spec not in this path |
 | | | **Totals** | **~19,674 lines** | |
 
 ---
@@ -51,7 +49,7 @@ All plans follow a **consistent template** with:
 - **Operations Runbook** — alert response, manual procedures
 - **Risk & Mitigation** — documented with handling strategies
 
-**Location:** `docs/superpowers/plans/2026-05-15-p*.md`
+**Location:** `docs/superpowers/plans/2026-05-15-p*.md` (only P9a present)
 
 ### Design Specifications
 Each phase has a detailed spec covering:
@@ -62,20 +60,12 @@ Each phase has a detailed spec covering:
 - **Error Codes & Handling** — exhaustive error taxonomy
 - **Security Model** — threat model, mitigations
 
-**Location:** `docs/superpowers/specs/2026-05-15-p*.md`
+**Location:** `docs/superpowers/specs/2026-05-15-p*.md` (only P9a present)
 
 ### Handoff Checklists
-Two coordination documents:
+Two coordination documents are referenced but **not yet committed**:
 - **P9-HANDOFF-CHECKLIST.txt** — 4 phases (P8.5 + P9a–c)
 - **P10-HANDOFF-CHECKLIST.txt** — 3 phases (P9d + P10a–b)
-
-Each includes:
-- Deliverables summary
-- Dependency graph
-- Parallelism opportunities
-- Execution workflow
-- Quality gates
-- Timeline estimates
 
 ---
 
@@ -188,21 +178,20 @@ P0–P7 (Foundation)
 
 | Phase | Est. Duration | Status | Next |
 |-------|---|---|---|
-| P8.5 Admin UI | 3–4d | Ready | Assign to worker |
-| P9a Skill | 3–4d | Ready | Parallel with P8.5 |
-| P8a Context | 3–4d | Ready | After P9a merged |
-| P9b Decision | 4–5d | Ready | After P8a merged |
-| P8b Soul | 3–4d | Ready | Parallel with P9b |
-| P9c Risk | 3–4d | Ready | After P9b merged |
-| P8c User Layer | 4–5d | Ready | After P8b + P9c |
-| P8d Identity | 3–4d | Ready | After P8c |
-| P10a Knowledge | 3–4d | Ready | After P8c + P9c |
-| P8e Policy | 3–4d | Ready | (no blocker) |
-| P9d Policy DSL | 3–4d | Ready | After P8e |
-| P10b Trace | 4–5d | Ready | After P9d |
+| P8.5 Admin UI | 3–4d | Shipped | — |
+| P9a Skill | 3–4d | Shipped | — |
+| P8a Context | 3–4d | Shipped | — |
+| P9b Decision | 4–5d | Shipped | — |
+| P8b Soul | 3–4d | Shipped | — |
+| P9c Risk | 3–4d | Shipped | — |
+| P8c User Layer | 4–5d | Shipped | — |
+| P8d Identity | 3–4d | Shipped | — |
+| P10a Knowledge | 3–4d | Shipped | — |
+| P8e Policy | 3–4d | Shipped | — |
+| P9d Policy DSL | 3–4d | Shipped | — |
+| P10b Trace | 4–5d | Shipped | — |
+| P11 Cleanup | TBD | Pending canary | After 30d stable |
 | **Total** | **~8–10 weeks** | — | — |
-
-**Actual elapsed:** ~6–7 weeks (with parallelism)
 
 ---
 
@@ -238,19 +227,32 @@ Changes to these require **founder approval**:
 
 ## Handoff Status
 
-### Ready for Execution
-- ✓ All 13 implementation plans complete
-- ✓ All 13 design specs complete
-- ✓ Precondition verification scripts included
-- ✓ TDD step-by-step guidance per task
-- ✓ SQL migrations inline
-- ✓ Test templates + acceptance gates
-- ✓ Dependency graph clear
-- ✓ Parallelism identified
-- ✓ Quality gates defined
+### Files Present in This PR
+- ✓ `docs/superpowers/plans/2026-05-15-p9a-skill-abstraction.md` — P9a implementation plan
+- ✓ `docs/superpowers/specs/2026-05-15-p9a-skill-abstraction-design.md` — P9a design spec
+
+### Files Referenced but Not Committed
+The following files are referenced in the sections below but are **not present** in the repository at this time. Do not treat this list as evidence that they exist:
+- `docs/superpowers/plans/2026-05-15-p8.5-admin-ui-v1.md`
+- `docs/superpowers/plans/2026-05-15-p8a-context-packet.md`
+- `docs/superpowers/plans/2026-05-15-p8b-soul-layer.md`
+- `docs/superpowers/plans/2026-05-15-p8c-user-layer-namespace.md`
+- `docs/superpowers/plans/2026-05-15-p8d-identity-completion.md`
+- `docs/superpowers/plans/2026-05-15-p8e-policy-descriptor-resolver.md`
+- `docs/superpowers/plans/2026-05-15-p9b-decision-engine.md`
+- `docs/superpowers/plans/2026-05-15-p9c-risk-scoring.md`
+- `docs/superpowers/plans/2026-05-15-p9d-policy-dsl-evaluator.md`
+- `docs/superpowers/plans/2026-05-15-p10a-knowledge-state-machine.md`
+- `docs/superpowers/plans/2026-05-15-p10b-runtime-trace.md`
+- `docs/superpowers/plans/2026-05-15-p11-cleanup.md`
+- `docs/superpowers/plans/P9-HANDOFF-CHECKLIST.txt`
+- `docs/superpowers/plans/P10-HANDOFF-CHECKLIST.txt`
+- `docs/superpowers/specs/2026-05-15-runtime-architecture-v3-final.md`
+- `docs/superpowers/specs/2026-05-15-p8.5-admin-ui-v1-design.md`
+- (all other phase specs except P9a)
 
 ### Next Steps
-1. **Assign phases to workers** — use P9/P10 handoff checklists
+1. **Assign phases to workers** — use P9/P10 handoff checklists (once committed)
 2. **Create worktrees** — per execution workflow in checklists
 3. **Run precondition checks** — fail-fast before starting tasks
 4. **Execute tasks** — TDD (failing test → implementation → pass)
@@ -262,34 +264,29 @@ Changes to these require **founder approval**:
 
 ## References
 
-### Implementation Plans
-- `docs/superpowers/plans/2026-05-15-p8.5-admin-ui-v1.md`
-- `docs/superpowers/plans/2026-05-15-p8a-context-packet.md`
-- `docs/superpowers/plans/2026-05-15-p8b-soul-layer.md`
-- `docs/superpowers/plans/2026-05-15-p8c-user-layer-namespace.md`
-- `docs/superpowers/plans/2026-05-15-p8d-identity-completion.md`
-- `docs/superpowers/plans/2026-05-15-p8e-policy-descriptor-resolver.md`
-- `docs/superpowers/plans/2026-05-15-p9a-skill-abstraction.md`
-- `docs/superpowers/plans/2026-05-15-p9b-decision-engine.md`
-- `docs/superpowers/plans/2026-05-15-p9c-risk-scoring.md`
-- `docs/superpowers/plans/2026-05-15-p9d-policy-dsl-evaluator.md`
-- `docs/superpowers/plans/2026-05-15-p10a-knowledge-state-machine.md`
-- `docs/superpowers/plans/2026-05-15-p10b-runtime-trace.md`
-- `docs/superpowers/plans/2026-05-15-p11-cleanup.md`
+### Implementation Plans (only P9a present)
+- `docs/superpowers/plans/2026-05-15-p9a-skill-abstraction.md` ← **present**
+- `docs/superpowers/plans/2026-05-15-p8.5-admin-ui-v1.md` ← not committed
+- `docs/superpowers/plans/2026-05-15-p8a-context-packet.md` ← not committed
+- `docs/superpowers/plans/2026-05-15-p8b-soul-layer.md` ← not committed
+- `docs/superpowers/plans/2026-05-15-p8c-user-layer-namespace.md` ← not committed
+- `docs/superpowers/plans/2026-05-15-p8d-identity-completion.md` ← not committed
+- `docs/superpowers/plans/2026-05-15-p8e-policy-descriptor-resolver.md` ← not committed
+- `docs/superpowers/plans/2026-05-15-p9b-decision-engine.md` ← not committed
+- `docs/superpowers/plans/2026-05-15-p9c-risk-scoring.md` ← not committed
+- `docs/superpowers/plans/2026-05-15-p9d-policy-dsl-evaluator.md` ← not committed
+- `docs/superpowers/plans/2026-05-15-p10a-knowledge-state-machine.md` ← not committed
+- `docs/superpowers/plans/2026-05-15-p10b-runtime-trace.md` ← not committed
+- `docs/superpowers/plans/2026-05-15-p11-cleanup.md` ← not committed
 
-### Design Specs
-- `docs/superpowers/specs/2026-05-15-runtime-architecture-v3-final.md` (master spec)
-- `docs/superpowers/specs/2026-05-15-p8.5-admin-ui-v1-design.md`
-- `docs/superpowers/specs/2026-05-15-p8a-context-packet-design.md`
-- [... one per phase ...]
+### Design Specs (only P9a present)
+- `docs/superpowers/specs/2026-05-15-runtime-architecture-v3-final.md` ← not committed
+- `docs/superpowers/specs/2026-05-15-p9a-skill-abstraction-design.md` ← **present**
+- [all other phase specs] ← not committed
 
-### Handoff Checklists
-- `docs/superpowers/plans/P9-HANDOFF-CHECKLIST.txt` (4 phases: P8.5 + P9a–c)
-- `docs/superpowers/plans/P10-HANDOFF-CHECKLIST.txt` (3 phases: P9d + P10a–b)
-
-### Superpowers Skills (Recommended)
-- `superpowers:subagent-driven-development`
-- `superpowers:executing-plans`
+### Handoff Checklists (not committed)
+- `docs/superpowers/plans/P9-HANDOFF-CHECKLIST.txt` ← not committed
+- `docs/superpowers/plans/P10-HANDOFF-CHECKLIST.txt` ← not committed
 
 ---
 
@@ -297,8 +294,8 @@ Changes to these require **founder approval**:
 
 **Generated by:** Superpowers Planning Agent  
 **Date:** 2026-05-15  
-**Validation:** All preconditions syntactically verified; all task sequences confirmed; all dependency chains validated; all quality gates defined.
+**Validation:** P9a preconditions syntactically verified; P9a task sequences confirmed; P9a dependency chains validated; P9a quality gates defined. Other phases are referenced but their artifacts are not committed here.
 
-**Status:** Ready for agentic execution. Assign phases to workers and begin implementation.
+**Status:** P9a ready for agentic execution. Other phases: shipped separately — see individual PRs.
 
 ---
