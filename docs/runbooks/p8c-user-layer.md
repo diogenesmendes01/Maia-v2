@@ -144,7 +144,7 @@ tabelas de user-layer: `lifecycle_status`, `evidence_count`, `confidence`,
 ### Rollback — DESTRUTIVO e BLOQUEADO após P10a (migration 050)
 
 > **PARE ANTES DE CONTINUAR.** O script abaixo dropa colunas de lifecycle
-> (`lifecycle_status`, `evidence_count`, `confidence`, `lifecycle_transitions`)
+> (`lifecycle_status`, `evidence_count`, `confidence`/`confianca`, `lifecycle_transitions`)
 > de todas as 4 tabelas de user-layer. Se a migration `050_p10a_ksm_lifecycle_and_indexes`
 > já foi aplicada neste ambiente, essas colunas contêm histórico de transições
 > KSM e scores de risco gravados pelo P10a. Dropar sem coordenação **destrói
@@ -194,13 +194,37 @@ tabelas de user-layer: `lifecycle_status`, `evidence_count`, `confidence`,
       );
       -- deve retornar 0 linhas
       ```
-   c. **Exporte backup das colunas de lifecycle antes de dropar:**
+   c. **Exporte backup das colunas de lifecycle antes de dropar.**
+      Cada tabela tem um schema ligeiramente diferente — use os comandos
+      exatos abaixo. `memory_entry` usa `confidence`; `agent_facts` e
+      `learned_rules` mantêm a coluna legacy `confianca` (não `confidence`).
+      Para `behavioral_hint`, confirme o nome da coluna via `\d behavioral_hint`
+      antes de rodar.
+
       ```sql
+      -- memory_entry (coluna: confidence)
       \COPY (
         SELECT id, lifecycle_status, evidence_count, confidence, lifecycle_transitions
         FROM memory_entry
       ) TO 'backup_memory_entry_lifecycle.csv' CSV HEADER;
-      -- Repetir para agent_facts, learned_rules, behavioral_hint
+
+      -- agent_facts (coluna legacy: confianca, não confidence)
+      \COPY (
+        SELECT id, lifecycle_status, evidence_count, confianca, lifecycle_transitions
+        FROM agent_facts
+      ) TO 'backup_agent_facts_lifecycle.csv' CSV HEADER;
+
+      -- learned_rules (coluna legacy: confianca, não confidence)
+      \COPY (
+        SELECT id, lifecycle_status, evidence_count, confianca, lifecycle_transitions
+        FROM learned_rules
+      ) TO 'backup_learned_rules_lifecycle.csv' CSV HEADER;
+
+      -- behavioral_hint — verifique o nome da coluna via \d behavioral_hint
+      \COPY (
+        SELECT id, lifecycle_status, evidence_count, lifecycle_transitions
+        FROM behavioral_hint
+      ) TO 'backup_behavioral_hint_lifecycle.csv' CSV HEADER;
       ```
    d. Guarde os CSVs em local seguro. Eles são o único ponto de recuperação.
 
@@ -212,9 +236,34 @@ tabelas de user-layer: `lifecycle_status`, `evidence_count`, `confidence`,
    com segurança se interrompido.
 
 4. **Plano de reparo se dados forem necessários novamente:**
-   Re-apply P8c forward → re-apply P10a forward → restaure os CSVs via
-   `COPY ... FROM`. Não há replay automático de transições históricas;
-   o KSM reconstruirá scores a partir das próximas escritas.
+   Re-apply P8c forward → re-apply P10a forward → restaure as colunas de
+   lifecycle via tabelas temporárias. Use UPDATE (não COPY direto, que
+   inseriria novas rows em vez de restaurar as existentes):
+
+   ```sql
+   -- Exemplo para memory_entry (adaptar para cada tabela com colunas corretas)
+   CREATE TEMP TABLE t_restore_memory AS
+     SELECT id, lifecycle_status, evidence_count, confidence, lifecycle_transitions
+     FROM memory_entry LIMIT 0;
+
+   \COPY t_restore_memory
+     FROM 'backup_memory_entry_lifecycle.csv' CSV HEADER;
+
+   UPDATE memory_entry m
+     SET lifecycle_status      = r.lifecycle_status,
+         evidence_count        = r.evidence_count,
+         confidence            = r.confidence,
+         lifecycle_transitions = r.lifecycle_transitions::jsonb
+     FROM t_restore_memory r
+     WHERE m.id = r.id;
+
+   DROP TABLE t_restore_memory;
+   -- Repetir para agent_facts (coluna confianca), learned_rules (coluna confianca),
+   -- e behavioral_hint com o nome de coluna correto.
+   ```
+
+   Não há replay automático de transições históricas; o KSM reconstruirá
+   scores a partir das próximas escritas.
 
 Nota de numeração: o issue menciona `037_p8c_*` mas a migration real que
 aterrou é `041_p8c_lifecycle_status.sql` (numeração coordenada em review
