@@ -91,9 +91,12 @@ Admin UI v1, Calendar v2, and all P0–P11 foundation phases.
 ### Known issues (open at release)
 - **Production bugs tracked for follow-up**: #135 `transitionProcedureStatus` event recording, #136 contradiction TTL, #137 events-block cardinality, #138 pdfmake import
 - **Runbook gaps**: #129 P8c, #130 P8.5, #131 P9b, #132 P9c
-- **Admin UI**: 3 specs failing due to missing `@trpc/server` install in `src/admin-ui/`
+- **Admin UI**: 3 specs (`proposals-router`, `tenant-resolver`, `versions-router`) fail because `@trpc/server` is not yet installed at the repo root. Fix tracked in #139 (PR #146). **The `v3.0.0` git tag must NOT be cut until PR #146 merges.**
 - **next-auth**: still on beta.31 — waiting for v5 stable upstream (#110)
-- **Note**: `package.json` version not yet bumped to 3.0.0 (separate concern); a `v3.0.0` git tag should be created after merge
+
+### Notes
+- `package.json` bumped to `3.0.0` in this PR to align with the CHANGELOG entry.
+- The `v3.0.0` git tag should be cut after both this PR and PR #146 (`@trpc/server` hoist) are merged to `main`.
 
 ---
 
