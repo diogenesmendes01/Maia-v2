@@ -1,8 +1,17 @@
 # Runbook — P9b Decision Engine
 
-> **Este é o componente central do Hot Path em Runtime v3.1.1.** Todo turno passa
-> pelo Decision Engine. Quando um turno se comporta de forma inesperada, **o primeiro
-> lugar a olhar é o `DecisionPacket`** produzido por este componente.
+> **STATUS: IMPLEMENTADO EM ISOLAMENTO — NÃO CONECTADO AO HOT PATH.**
+>
+> O Decision Engine está implementado e coberto por testes, mas **ainda não está
+> ligado ao caminho real de execução de turnos**. O arquivo
+> `src/runtime/decision/integration.ts` documenta explicitamente:
+> *"today: nothing — when P8a #96 lands and `react-loop.ts` is wired to build
+> BaseContextPacket, that file will import this helper"*.
+>
+> O helper `runDecisionEngineIfEnabled` é importado apenas em barrel/testes.
+> Nenhum código de produção o chama. **`DecisionPacket`s NÃO são produzidos
+> em produção agora.** Quando o hot path for conectado (P8a #96), este banner
+> será removido.
 
 ---
 
@@ -33,7 +42,10 @@ Fixes do round-2 (Codex review #103):
 
 ---
 
-## Lugar no Hot Path
+## Lugar no Hot Path (planejado — ainda não conectado)
+
+> O diagrama abaixo mostra a arquitetura **pretendida** após a conexão via P8a #96.
+> Hoje nenhum caller de produção invoca `runDecisionEngineIfEnabled`.
 
 ```
 [Camada 1] BaseContextPacket (P8a)
@@ -153,8 +165,12 @@ superfície real — antes recebia preview vazio, aprovando tools que apareciam 
 **Não implementado em P9b.** Roda na Camada 5 e anota resultados no mesmo
 `policy_decisions` via `PepAudit`. Não há implementação em `src/runtime/decision/`.
 
-**Invariante 14:** PEPs rodam independente da feature flag. O flag controla apenas
-se o Decision Engine v1 produz o DecisionPacket; PEPs nunca são bypassados.
+**Invariante 14 (revisado):** Quando o flag está OFF, `runDecisionEngineIfEnabled`
+retorna `{ engine_ran: false, skip_reason: 'flag_off' }` **sem executar PEPs**.
+PEPs são avaliados *dentro* do engine; com o engine desativado, PEPs não rodam.
+O path de fallback para `engine_error` (flag ON + engine falha) passa para o
+legacy path, que ainda executa PEPs via wrapper — mas isso é excepcional.
+Enquanto o engine não estiver conectado ao hot path, nenhum PEP roda em produção.
 
 ---
 
@@ -229,8 +245,10 @@ Kill switch (emergência):
 FEATURE_DECISION_ENGINE_V1_KILL_SWITCH=true
 ```
 
-Com kill switch ativo, o hot path cai para o legacy path que ainda executa Early/Mid/Late
-PEPs mas não produz `DecisionPacket` v1.
+Com kill switch ativo, `runDecisionEngineIfEnabled` retorna `skip_reason='flag_off'`
+sem executar PEPs. Enquanto o engine não estiver conectado ao hot path (P8a #96
+pendente), o kill switch não tem efeito em produção — não há hot path ativo a
+desativar. Após a conexão, o kill switch será o mecanismo de rollback imediato.
 
 **Tenant override** (canary parcial, disponível P11):
 
@@ -262,8 +280,11 @@ await tenantFeatureFlagsRepo.setOverride('tenant-x', 'decision_engine_v1', true)
    que não existiam em `allowed_tools` são ignoradas no merge (não causam erro, mas não
    aparecem em `blocked_tools`).
 
-7. **PEPs rodam independente da flag** — `FEATURE_DECISION_ENGINE_V1` controla apenas a
-   produção do DecisionPacket v1; PEPs (Early/Mid/Late) não têm flag própria (Invariante 14).
+7. **Flag OFF pula PEPs inteiramente** — quando `FEATURE_DECISION_ENGINE_V1=false`,
+   `runDecisionEngineIfEnabled` retorna `skip_reason='flag_off'` sem avaliar PEPs.
+   PEPs rodam *dentro* do engine; desativar o engine desativa os PEPs. O fallback
+   de `engine_error` (flag ON + crash inesperado) passa ao legacy path que ainda
+   executa PEPs via wrapper — mas flag OFF não aciona esse path.
 
 ---
 
@@ -386,8 +407,10 @@ unset FEATURE_DECISION_ENGINE_V1  # ou setar 'false'
 # Reiniciar workers
 ```
 
-Com kill switch ativo: todos os turnos caem para o legacy path. Nenhuma quebra
-funcional — legacy path ainda executa PEPs mas não produz DecisionPacket v1.
+Com kill switch ativo: `runDecisionEngineIfEnabled` retorna `skip_reason='flag_off'`
+imediatamente. **PEPs não são avaliados** com o kill switch ativo — policy enforcement
+não roda neste path. Quando o engine estiver conectado ao hot path (P8a #96), o
+kill switch será o mecanismo de rollback seguro; até lá, não há hot path a reverter.
 
 ### Tenant override (canary)
 
