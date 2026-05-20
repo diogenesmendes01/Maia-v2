@@ -141,8 +141,52 @@ tabelas de user-layer: `lifecycle_status`, `evidence_count`, `confidence`,
 `lifecycle_transitions`. DEFAULT `'active'` preserva backward compat. CHECK
 `jsonb_typeof = 'array'` protege contra double-stringify.
 
-Rollback: `migrations/041_p8c_lifecycle_status_down.sql` remove as colunas
-com `DROP COLUMN IF EXISTS`. Idempotente em ambas as direções.
+### Rollback — DESTRUTIVO e BLOQUEADO após P10a (migration 050)
+
+> **PARE ANTES DE CONTINUAR.** O script abaixo dropa colunas de lifecycle
+> (`lifecycle_status`, `evidence_count`, `confidence`, `lifecycle_transitions`)
+> de todas as 4 tabelas de user-layer. Se a migration `050_p10a_ksm_lifecycle_and_indexes`
+> já foi aplicada neste ambiente, essas colunas contêm histórico de transições
+> KSM e scores de risco gravados pelo P10a. Dropar sem coordenação **destrói
+> esse histórico e quebra leituras/escritas KSM**.
+
+**Pré-condições obrigatórias — verifique todas antes de rodar qualquer DROP:**
+
+1. **Confirmar se P10a (050) foi aplicado.**
+   ```sql
+   SELECT version FROM schema_migrations WHERE version = '050';
+   ```
+   - Se retornar linha: **P10a está aplicado. Siga o fluxo coordenado abaixo.**
+   - Se não retornar: você pode prosseguir direto para o passo 3.
+
+2. **Fluxo coordenado (P10a aplicado):**
+   a. Faça rollback de P10a primeiro:
+      ```bash
+      psql $DATABASE_URL -f migrations/050_p10a_ksm_lifecycle_and_indexes_down.sql
+      psql $DATABASE_URL -f migrations/051_p10a_enforce_lifecycle_transition_down.sql
+      ```
+   b. Confirme que `050` e `051` saíram de `schema_migrations`.
+   c. **Exporte backup das colunas de lifecycle antes de dropar:**
+      ```sql
+      \COPY (
+        SELECT id, lifecycle_status, evidence_count, confidence, lifecycle_transitions
+        FROM memory_entry
+      ) TO 'backup_memory_entry_lifecycle.csv' CSV HEADER;
+      -- Repetir para agent_facts, learned_rules, behavioral_hint
+      ```
+   d. Guarde os CSVs em local seguro. Eles são o único ponto de recuperação.
+
+3. **Rodar o down-script P8c (somente após as pré-condições acima):**
+   ```bash
+   psql $DATABASE_URL -f migrations/041_p8c_lifecycle_status_down.sql
+   ```
+   O script é idempotente (`DROP COLUMN IF EXISTS`); pode ser re-executado
+   com segurança se interrompido.
+
+4. **Plano de reparo se dados forem necessários novamente:**
+   Re-apply P8c forward → re-apply P10a forward → restaure os CSVs via
+   `COPY ... FROM`. Não há replay automático de transições históricas;
+   o KSM reconstruirá scores a partir das próximas escritas.
 
 Nota de numeração: o issue menciona `037_p8c_*` mas a migration real que
 aterrou é `041_p8c_lifecycle_status.sql` (numeração coordenada em review

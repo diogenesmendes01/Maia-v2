@@ -21,8 +21,18 @@ de cada turno e de cada registro de conhecimento da Maia.
 llm_attempted_downgrade, triggers, decided_by }` — carrega o diagnóstico
 completo para audit sem precisar reprocessar a entrada.
 
-**Sempre ligado** — não há feature flag. Risk Scoring é um invariante de
-cada turno.
+**Status de wiring: wrapper implementado, NÃO conectado ao caminho crítico.**
+O módulo `TurnRiskScorer` (`src/runtime/decision/turn-risk-scorer.ts`) existe
+e está testado, mas `createDecisionEngine` (`src/runtime/decision/index.ts`)
+ainda instancia `RiskScorerStubImpl` (P9b) — ver TODO(P9c #97) em
+`risk-scorer.ts:12`. O `KnowledgeRiskScorer` de P10a está conectado ao KSM
+e funciona normalmente. A conexão de `TurnRiskScorer` ao `DecisionEngine` é
+rastreada separadamente e será feita em PR dedicado de cutover.
+
+**Risk Scoring de turno (via stub P9b):** está ligado e roda a cada turno,
+mas usa a heurística determinística sem gate LLM. A pontuação HIGH/CRITICAL
+via LLM (`ambiguous=true` → Haiku) **não está ativa** no caminho de turno
+até o cutover de `TurnRiskScorer`.
 
 ## Arquivos relevantes
 
@@ -205,8 +215,30 @@ triggers são logados em `cognitive_module_log.metadata.triggers`.
 
 ## Rollout
 
-Sem flag. Risk Scoring é invariante de todo turno desde o aterrizamento.
-Adicionar um novo topic é mudança de config (editar tabela em `heuristic.ts`);
+### Estado atual
+
+| Componente | Estado |
+|---|---|
+| `src/shared/risk/` (heurística + scorer + gate) | Implementado e testado |
+| `KnowledgeRiskScorer` (P10a/KSM) | **Conectado e ativo** |
+| `TurnRiskScorer` (P9c wrapper) | **Implementado, NÃO conectado ao hot path** |
+| `RiskScorerStubImpl` (P9b) | **Em produção** — usado por `createDecisionEngine` |
+
+### Cutover pendente
+
+`TurnRiskScorer` substituirá `RiskScorerStubImpl` em `createDecisionEngine`
+(ver `src/runtime/decision/index.ts:105` e TODO em `risk-scorer.ts:12`).
+Esse cutover é rastreado em issue/PR separado e **não faz parte deste PR**.
+
+Até o cutover:
+- Turnos são pontuados pela heurística do P9b stub (determinística, sem LLM).
+- `HIGH`/`CRITICAL` via gate Haiku **não está ativo** para risco de turno.
+- `KnowledgeRiskScorer` já usa o gate LLM normalmente via KSM.
+
+### Pós-cutover
+
+Sem flag — o cutover é feito trocando a instância em `createDecisionEngine`.
+Adicionar um novo topic após o cutover: editar `TOPIC_RISK` em `heuristic.ts`;
 turnos em andamento não são re-scored retroativamente.
 
 ## Known issues
