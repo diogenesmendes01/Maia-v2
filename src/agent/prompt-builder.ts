@@ -315,21 +315,51 @@ function renderEventsBlock(events: ToolExecutionSummary[]): string {
 }
 
 /**
- * Tag for write/communication successes that exceed the contradiction TTL.
- * They are exempt from silent drop: instead they are marked as stale so
- * `renderContradictionOverlay` can emit a compact warning rather than
- * omitting the overlay entirely.
+ * Round-2 review fix: split contradiction detection results into fresh
+ * (< TTL, authoritative) and stale (>= TTL, historical/lower-authority).
  *
- * Round-1 review fix #2: durable side effects (write/communication) must
- * never be silently forgotten. After TTL they become "stale-success" entries
- * — the duplicate-check window for tools like `register_transaction` is only
- * 2h, so a user following up after a day may be guided into a real duplicate
- * unless the overlay stays visible in some form.
+ * Round-1 review fix #2 context: durable side effects (write/communication)
+ * must never be silently forgotten after TTL. They are now surfaced in a
+ * SEPARATE lower-authority section so the model doesn't treat old side
+ * effects as current authoritative truth (which could suppress retries or
+ * claim canceled/corrected actions are still operative).
+ *
+ * STALE_SUCCESS_MARKER is kept for internal tagging during detection only;
+ * it never reaches the rendered prompt — the renderer dispatches by bucket.
  */
 const STALE_SUCCESS_MARKER = '__stale_success__';
 
-function detectContradictions(turns: AssistantTurn[], now: number): ToolExecutionSummary[] {
-  const overlays: ToolExecutionSummary[] = [];
+/**
+ * Output shape from detectContradictions — two distinct buckets so the
+ * renderer can emit authoritative vs lower-authority sections separately.
+ */
+type ContradictionBuckets = {
+  fresh: ToolExecutionSummary[];
+  stale: ToolExecutionSummary[];
+};
+
+/**
+ * Returns true when two result_keys objects share at least one key with
+ * the SAME value. Used to detect when a later event (cancel/correction)
+ * supersedes an older stale entry for the same logical resource.
+ */
+function resultKeysOverlap(a: ToolExecutionSummary['result_keys'], b: ToolExecutionSummary['result_keys']): boolean {
+  if (!a || !b) return false;
+  for (const key of Object.keys(a)) {
+    if (key in b) {
+      // Compare as strings to avoid type coercion surprises.
+      const va = Array.isArray(a[key]) ? (a[key] as (string | number)[]).join(',') : String(a[key]);
+      const vb = Array.isArray(b[key]) ? (b[key] as (string | number)[]).join(',') : String(b[key]);
+      if (va === vb) return true;
+    }
+  }
+  return false;
+}
+
+function detectContradictions(turns: AssistantTurn[], now: number): ContradictionBuckets {
+  const fresh: ToolExecutionSummary[] = [];
+  const staleRaw: ToolExecutionSummary[] = [];
+
   for (const t of turns) {
     const text = t.message.conteudo ?? '';
     if (!text) continue;
@@ -350,37 +380,77 @@ function detectContradictions(turns: AssistantTurn[], now: number): ToolExecutio
       const matched = kws.some((kw) => lower.includes(kw.toLowerCase()));
       if (!matched) continue;
       if (isExpired) {
-        // Round-1 fix #2: write/communication overlays are exempt from silent
-        // TTL drop. Emit a compact stale-success marker so the LLM remains
-        // aware that a durable side effect occurred (even if it's old) until
-        // a fresher authoritative state source replaces it.
-        overlays.push({ ...s, result_summary: `${STALE_SUCCESS_MARKER} ${s.result_summary}` });
+        // Round-1 fix #2 / Round-2 refinement: stale entries go to a
+        // lower-authority bucket (rendered separately, not as authoritative).
+        staleRaw.push(s);
       } else {
-        overlays.push(s);
+        fresh.push(s);
       }
     }
   }
-  return overlays;
+
+  // Round-2 fix: for each stale candidate, check whether ANY LATER event
+  // across ALL turns shares at least one result_key value with it — indicating
+  // a cancel, correction, or supersession. If found, suppress the stale entry.
+  const allSummaries: Array<{ s: ToolExecutionSummary; turnOccurredMs: number }> = [];
+  for (const t of turns) {
+    for (const s of t.summaries) {
+      const ms = Date.parse(s.occurred_at);
+      if (Number.isFinite(ms)) allSummaries.push({ s, turnOccurredMs: ms });
+    }
+  }
+
+  const stale: ToolExecutionSummary[] = staleRaw.filter((candidate) => {
+    const candidateMs = Date.parse(candidate.occurred_at);
+    if (!Number.isFinite(candidateMs)) return true; // keep if timestamp unparseable
+    if (!candidate.result_keys || Object.keys(candidate.result_keys).length === 0) return true;
+    // Suppress if a LATER event (any tool, any status) overlaps result_keys.
+    const superseded = allSummaries.some(
+      ({ s, turnOccurredMs }) =>
+        turnOccurredMs > candidateMs &&
+        s.tool_call_id !== candidate.tool_call_id &&
+        resultKeysOverlap(candidate.result_keys, s.result_keys),
+    );
+    return !superseded;
+  });
+
+  return { fresh, stale };
 }
 
-function renderContradictionOverlay(overlays: ToolExecutionSummary[]): string {
-  if (overlays.length === 0) return '';
-  const items = overlays.map((s) => {
-    const isStale = s.result_summary.startsWith(STALE_SUCCESS_MARKER);
-    const summary = isStale
-      ? s.result_summary.slice(STALE_SUCCESS_MARKER.length + 1)
-      : s.result_summary;
-    const staleSuffix = isStale
-      ? ' (sucesso antigo — verificar se já existe antes de repetir)'
-      : '. Sua afirmação contraditória anterior está obsoleta.';
-    return `- ${s.tool_name} (${s.side_effect}): ${summary}${staleSuffix}`;
-  });
-  return [
-    '## ⚠ Conflito detectado em turno anterior',
-    'Você escreveu uma mensagem de falha, mas o backend confirmou sucesso para a(s) tool(s) abaixo.',
-    'Trate a afirmação contraditória anterior como inválida. A verdade é o evento do backend:',
-    ...items,
-  ].join('\n');
+function renderContradictionOverlay({ fresh, stale }: ContradictionBuckets): string {
+  const parts: string[] = [];
+
+  if (fresh.length > 0) {
+    const items = fresh.map(
+      (s) =>
+        `- ${s.tool_name} (${s.side_effect}): ${s.result_summary}. Sua afirmação contraditória anterior está obsoleta.`,
+    );
+    parts.push(
+      [
+        '## ⚠ Contradições do backend (autoritativo)',
+        'Você escreveu uma mensagem de falha, mas o backend confirmou sucesso para a(s) tool(s) abaixo.',
+        'Trate a afirmação contraditória anterior como inválida. A verdade é o evento do backend:',
+        ...items,
+      ].join('\n'),
+    );
+  }
+
+  if (stale.length > 0) {
+    const items = stale.map((s) => {
+      const dateLabel = s.occurred_at.slice(0, 10); // YYYY-MM-DD
+      return `- ${s.tool_name} (${s.side_effect}) em ${dateLabel}: ${s.result_summary} — faça uma leitura atualizada antes de agir (não autoritativo).`;
+    });
+    parts.push(
+      [
+        '## Histórico — verificar antes de repetir (não autoritativo)',
+        'Os eventos abaixo ocorreram há mais de 24h. Não os trate como verdade atual.',
+        'Execute uma leitura atualizada (fresh read) antes de decidir repetir ou descartar a ação.',
+        ...items,
+      ].join('\n'),
+    );
+  }
+
+  return parts.join('\n\n');
 }
 
 /**

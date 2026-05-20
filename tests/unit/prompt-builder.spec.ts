@@ -409,6 +409,9 @@ describe('prompt-builder — backend events block', () => {
   });
 });
 
+// Helper regex to match either the authoritative or historical contradiction section.
+const ANY_OVERLAY_RE = /Contradi[çc][õo]es do backend|Hist[oó]rico.*verificar antes de repetir/i;
+
 describe('prompt-builder — contradiction overlay', () => {
   it('emits overlay when assistant text contains failure phrase AND a tool with matching domain succeeded', async () => {
     const summary = {
@@ -427,7 +430,8 @@ describe('prompt-builder — contradiction overlay', () => {
       mkInbound(),
     ]);
     const { system } = await build();
-    expect(system).toMatch(/Conflito detectado/i);
+    // Fresh success → authoritative section.
+    expect(system).toMatch(/Contradi[çc][õo]es do backend/i);
     expect(system).toMatch(/trate.*invalid|descarte|obsolet/i);
   });
 
@@ -448,7 +452,7 @@ describe('prompt-builder — contradiction overlay', () => {
       mkInbound(),
     ]);
     const { system } = await build();
-    expect(system).not.toMatch(/Conflito detectado/i);
+    expect(system).not.toMatch(ANY_OVERLAY_RE);
   });
 
   it('does NOT emit overlay when assistant text has no failure phrase', async () => {
@@ -468,7 +472,7 @@ describe('prompt-builder — contradiction overlay', () => {
       mkInbound(),
     ]);
     const { system } = await build();
-    expect(system).not.toMatch(/Conflito detectado/i);
+    expect(system).not.toMatch(ANY_OVERLAY_RE);
   });
 
   it('does NOT emit overlay when the tool failed (status error) — only success matters', async () => {
@@ -489,16 +493,16 @@ describe('prompt-builder — contradiction overlay', () => {
       mkInbound(),
     ]);
     const { system } = await build();
-    expect(system).not.toMatch(/Conflito detectado/i);
+    expect(system).not.toMatch(ANY_OVERLAY_RE);
   });
 });
 
 describe('prompt-builder — contradiction overlay (PR #74 review fixes)', () => {
-  it('Superpowers I1 (updated round-1): write/communication overlays older than 24h emit a stale-success marker instead of being silently dropped', async () => {
-    // Round-1 fix #2: durable side effects (write/communication) must never be
-    // silently dropped past the TTL. They render as a compact stale-success
-    // marker so the LLM knows the action previously succeeded and avoids guiding
-    // the user into a duplicate side effect (e.g. a second register_transaction).
+  it('Superpowers I1 (round-2 update): write/communication overlays older than 24h render in lower-authority historical section (not silently dropped)', async () => {
+    // Round-1 fix #2 / round-2 refinement: durable side effects must never be
+    // silently dropped past the TTL. After round-2 they render in a SEPARATE
+    // lower-authority section ("Histórico") with occurred_at and "fresh read"
+    // instruction, NOT in the authoritative "Contradições do backend" block.
     const summary = {
       tool_call_id: 'tu_stale',
       tool_name: 'schedule_reminder',
@@ -518,10 +522,12 @@ describe('prompt-builder — contradiction overlay (PR #74 review fixes)', () =>
     const { system } = await build({
       inbound: mkInbound({ created_at: new Date('2026-05-11T15:00:00Z') }),
     });
-    // Overlay MUST appear (as either full conflict or stale-success marker).
-    expect(system).toMatch(/Conflito detectado/i);
-    // The stale annotation must distinguish it from a fresh overlay.
-    expect(system).toMatch(/sucesso antigo|verificar se j[áa] existe/i);
+    // Must appear in the lower-authority historical section.
+    expect(system).toMatch(/Hist[oó]rico.*verificar antes de repetir/i);
+    // The historical section must be present and distinguish from authoritative.
+    expect(system).toMatch(/n[ãa]o autoritat/i);
+    // Must NOT render as authoritative contradiction (that's only for fresh entries).
+    expect(system).not.toMatch(/Contradi[çc][õo]es do backend/i);
   });
 
   it('Superpowers I2: does NOT emit overlay when the same message also contains a positive-confirmation phrase ("agora foi")', async () => {
@@ -762,10 +768,153 @@ describe('prompt-builder — round-1 review (write-priority + durable TTL)', () 
     const { system } = await build({
       inbound: mkInbound({ created_at: new Date('2026-05-11T15:00:00Z') }),
     });
-    // Contradiction overlay OR stale-success marker must appear — never silently dropped.
-    const hasConflict = /Conflito detectado/i.test(system);
-    const hasStaleMarker = /stale.success|sucesso.*anterior|register_transaction.*sucesso.*antigo/i.test(system);
-    expect(hasConflict || hasStaleMarker).toBe(true);
+    // Round-2: stale entries render in the lower-authority historical section — never silently dropped.
+    const hasHistorical = /Hist[oó]rico.*verificar antes de repetir/i.test(system);
+    const hasAnyMarker = /n[ãa]o autoritat|leitura atualizada|transação registrada.*id tx-999/i.test(system);
+    expect(hasHistorical || hasAnyMarker).toBe(true);
+  });
+});
+
+describe('prompt-builder — round-2 review (stale-success authority separation)', () => {
+  /**
+   * R2-A: expired success + later cancel event with same result_keys →
+   * stale entry SUPPRESSED (no overlay for this entry at all).
+   *
+   * A register_transaction succeeded 25h ago (stale). A later cancel_transaction
+   * event in the same conversation targets the same transacao_id. The stale
+   * overlay entry must be suppressed entirely — it is not truth anymore.
+   */
+  it('[R2-A] expired success superseded by later cancel/correction with same result_keys → entry suppressed', async () => {
+    const staleSuccess = {
+      tool_call_id: 'tu_stale_tx',
+      tool_name: 'register_transaction',
+      status: 'success' as const,
+      side_effect: 'write' as const,
+      result_summary: 'transação registrada (id tx-555)',
+      result_keys: { transacao_id: 'tx-555' },
+      occurred_at: '2026-05-10T10:00:00Z', // 29h before inbound
+    };
+    // Later turn: cancel_transaction that references the same transacao_id.
+    const laterCancel = {
+      tool_call_id: 'tu_cancel_tx',
+      tool_name: 'cancel_transaction',
+      status: 'success' as const,
+      side_effect: 'write' as const,
+      result_summary: 'transação cancelada (id tx-555)',
+      result_keys: { transacao_id: 'tx-555' },
+      occurred_at: '2026-05-11T08:00:00Z', // 7h before inbound, AFTER stale
+    };
+    h.recentInConversation.mockResolvedValue([
+      // newest-first order as mensagensRepo returns
+      mkAssistantMsg({
+        id: 'asst-cancel',
+        conteudo: 'Cancelei a transação conforme pedido.',
+        ferramentas_chamadas: [laterCancel],
+        created_at: new Date('2026-05-11T08:00:00Z'),
+        processada_em: new Date('2026-05-11T08:00:00Z'),
+      }),
+      mkAssistantMsg({
+        id: 'asst-stale',
+        conteudo: 'Não consegui registrar a transação — backend retornou erro.',
+        ferramentas_chamadas: [staleSuccess],
+        created_at: new Date('2026-05-10T10:00:00Z'),
+        processada_em: new Date('2026-05-10T10:00:00Z'),
+      }),
+      mkInbound({ created_at: new Date('2026-05-11T15:00:00Z') }),
+    ]);
+    const { system } = await build({
+      inbound: mkInbound({ created_at: new Date('2026-05-11T15:00:00Z') }),
+    });
+    // The stale register_transaction overlay must be suppressed entirely.
+    expect(system).not.toContain('transação registrada (id tx-555)');
+    // "Histórico" section should not appear either (no surviving stale entries).
+    expect(system).not.toMatch(/Hist[oó]rico.*verificar antes/i);
+  });
+
+  /**
+   * R2-B: expired success with NO later supersession →
+   * renders in a lower-authority section (not the authoritative contradictions
+   * block) WITH occurred_at timestamp AND "fresh read required" wording.
+   * Must NOT appear in the authoritative "Contradições do backend" block.
+   */
+  it('[R2-B] expired-only success → lower-authority section with occurred_at + "fresh read required"', async () => {
+    const staleSummary = {
+      tool_call_id: 'tu_stale_rem',
+      tool_name: 'schedule_reminder',
+      status: 'success' as const,
+      side_effect: 'write' as const,
+      result_summary: 'lembrete agendado para 2026-05-09',
+      result_keys: { series_id: 'ser-42' },
+      occurred_at: '2026-05-09T10:00:00Z', // 53h before inbound
+    };
+    h.recentInConversation.mockResolvedValue([
+      mkAssistantMsg({
+        id: 'asst-stale',
+        conteudo: 'Não consegui agendar o lembrete — backend retornou erro.',
+        ferramentas_chamadas: [staleSummary],
+        created_at: new Date('2026-05-09T10:00:00Z'),
+        processada_em: new Date('2026-05-09T10:00:00Z'),
+      }),
+      mkInbound({ created_at: new Date('2026-05-11T15:00:00Z') }),
+    ]);
+    const { system } = await build({
+      inbound: mkInbound({ created_at: new Date('2026-05-11T15:00:00Z') }),
+    });
+    // Must appear in a SEPARATE lower-authority section (not authoritative).
+    expect(system).toMatch(/Hist[oó]rico.*verificar|Sucessos antigos.*n[ãa]o autoritat/i);
+    // Must include occurred_at timestamp in the entry.
+    expect(system).toContain('2026-05-09');
+    // Must require a fresh read before acting.
+    expect(system).toMatch(/fresh read|leitura atualizada|antes de agir|antes de repetir/i);
+    // The stale summary text must appear in the historical section.
+    expect(system).toContain('lembrete agendado para 2026-05-09');
+    // Must NOT appear inside the authoritative contradictions block header.
+    const authIdx = system.search(/Contradi[çc][õo]es do backend.*autorit[áa]tivo/i);
+    const histIdx = system.search(/Hist[oó]rico.*verificar|Sucessos antigos/i);
+    // If authoritative block exists at all it must come BEFORE the historical one
+    // and the stale entry must only appear AFTER the historical header.
+    if (authIdx !== -1 && histIdx !== -1) {
+      const staleIdx = system.indexOf('lembrete agendado para 2026-05-09');
+      expect(staleIdx).toBeGreaterThan(histIdx);
+    }
+  });
+
+  /**
+   * R2-C: fresh (< TTL) success contradicted by recent failure phrase →
+   * still renders in the AUTHORITATIVE section as before (regression guard).
+   * Must NOT be downgraded to the historical section.
+   */
+  it('[R2-C] fresh success contradiction → authoritative section, no regression', async () => {
+    const freshSummary = {
+      tool_call_id: 'tu_fresh',
+      tool_name: 'register_transaction',
+      status: 'success' as const,
+      side_effect: 'write' as const,
+      result_summary: 'transação registrada (id tx-999)',
+      result_keys: { transacao_id: 'tx-999' },
+      occurred_at: '2026-05-11T14:00:00Z', // 1h before inbound — within TTL
+    };
+    h.recentInConversation.mockResolvedValue([
+      mkAssistantMsg({
+        id: 'asst-fresh',
+        conteudo: 'Não consegui registrar a transação — backend retornou erro.',
+        ferramentas_chamadas: [freshSummary],
+        created_at: new Date('2026-05-11T14:00:00Z'),
+        processada_em: new Date('2026-05-11T14:00:00Z'),
+      }),
+      mkInbound({ created_at: new Date('2026-05-11T15:00:00Z') }),
+    ]);
+    const { system } = await build({
+      inbound: mkInbound({ created_at: new Date('2026-05-11T15:00:00Z') }),
+    });
+    // Authoritative contradiction block must be present.
+    expect(system).toMatch(/Contradi[çc][õo]es do backend|Conflito detectado/i);
+    // The fresh summary must appear.
+    expect(system).toContain('transação registrada (id tx-999)');
+    // Must NOT be in lower-authority section — it is authoritative truth.
+    expect(system).not.toMatch(/Hist[oó]rico.*verificar antes.*transação registrada/i);
+    // Must carry authority framing (A verdade é o evento do backend or equivalent).
+    expect(system).toMatch(/verdade.*evento do backend|autorit[áa]tivo|trate.*inválid|descarte|obsolet/i);
   });
 });
 
