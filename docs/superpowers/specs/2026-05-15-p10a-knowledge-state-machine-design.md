@@ -1300,7 +1300,7 @@ export const FEATURE_KNOWLEDGE_STATE_MACHINE_V1 =
 - [ ] Property tests verdes: §11.3.1, §11.3.2, §11.3.3, §11.4.
 - [ ] Integration tests verdes: §11.2 cenários 1–7.
 - [ ] CODEOWNERS configurado com founder approval para `transitions.ts`/`visibility.ts`/`decideInitialStatus`.
-- [ ] Runbook `docs/superpowers/runbooks/p10a-knowledge-state-machine.md` publicado.
+- [ ] Runbook `docs/runbooks/p10a-knowledge-state-machine.md` publicado.
 - [ ] Feature flag `FEATURE_KNOWLEDGE_STATE_MACHINE_V1=true` rolled out 100%.
 - [ ] Memórias de design atualizadas se houver desvio do master spec.
 - [ ] Cognitive module log mostra `module='knowledge-state-machine'` rows com p95 latency <300ms para `propose`, <60s para `auto-promoter`.

@@ -142,6 +142,25 @@ export type EntityScope = {
   entidades: string[];
 };
 
+/**
+ * Valid procedure lifecycle statuses. Mirrors ProcedureStatus in
+ * procedure-status.ts — duplicated here to avoid a circular import
+ * (repositories.ts ← procedure-status.ts already).
+ */
+export type ProcedureStatus = 'draft' | 'proposed' | 'active' | 'frozen' | 'rolled_back';
+
+/**
+ * Thrown by atomicActivate when the locked row's status no longer matches
+ * the expected_from_status passed by the caller. Indicates a concurrent
+ * write raced ahead — callers should re-fetch and retry if appropriate.
+ */
+export class OptimisticLockError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'OptimisticLockError';
+  }
+}
+
 export class EmptyScopeError extends TypedError {
   constructor() {
     super('empty_scope', 'Repository called without entity scope');
@@ -2143,6 +2162,7 @@ export const procedureDefinitionsRepo = {
     target_id: string;
     actor: string;
     preserve_activated_at?: boolean;
+    expected_from_status: ProcedureStatus;
   }): Promise<{
     activated: ProcedureDefinition;
     deactivated: ProcedureDefinition | null;
@@ -2166,6 +2186,17 @@ export const procedureDefinitionsRepo = {
       const target = targetRows[0];
       if (!target) {
         throw new Error(`procedure_definition ${args.target_id} not found in current tenant`);
+      }
+
+      // Round-3 fix: after acquiring the row lock, verify the persisted status
+      // still matches what the caller observed at read time (owned.status). If a
+      // concurrent transaction already advanced the row — including to a terminal
+      // state like rolled_back — this guard catches the race and throws instead of
+      // silently promoting a terminal row to active.
+      if (target.status !== args.expected_from_status) {
+        throw new OptimisticLockError(
+          `atomicActivate: locked row status='${target.status}' does not match expected_from_status='${args.expected_from_status}' for procedure ${args.target_id} — concurrent write raced ahead`,
+        );
       }
 
       // 2) Lock any currently active sibling rows (same nome) so two
