@@ -92,7 +92,8 @@ import {
 } from '@/control-plane/policy/policy-rules-repo.js';
 import { evaluate as p9dEvaluate } from '@/governance/policy-dsl/evaluator.js';
 import { skillsRepo as p9aSkillsRepo } from '@/control-plane/skill-registry/skills-repo.js';
-import { procedureExecutionsRepo } from '@/db/repositories.js';
+import { procedureExecutionsRepo, procedureDefinitionsRepo } from '@/db/repositories.js';
+import { logger } from '@/lib/logger.js';
 import { getCurrentAgent } from '@/db/tenant-context.js';
 import { incCounter, observeHistogram } from '@/lib/metrics.js';
 import { callLLM } from '@/lib/claude.js';
@@ -329,47 +330,43 @@ const skillsRepoAdapter: SkillsRepo = {
 // Default TTL for procedure executions: 30 minutes.
 const DEFAULT_PROCEDURE_TTL_MS = 30 * 60 * 1000;
 
+/**
+ * Reads the active procedure execution and joins procedure_definitions to
+ * obtain the domain field (migration 060_p3a_procedure_definitions_domain.sql).
+ *
+ * Returns null if:
+ *   - execution not found or status !== 'in_progress'
+ *
+ * Returns procedure_domain = 'unknown' (with a warn log) if:
+ *   - procedure_definitions.domain IS NULL (backfill pending)
+ */
 const proceduresRepoAdapter: ProceduresRepo = {
   async findExecution(execution_id) {
     const exec = await procedureExecutionsRepo.findById(execution_id);
     if (!exec || exec.status !== 'in_progress') return null;
+
     const now = Date.now();
     const lastActivity = exec.last_activity_at.getTime();
     const elapsed = now - lastActivity;
     const ttl_remaining_ms = Math.max(0, DEFAULT_PROCEDURE_TTL_MS - elapsed);
-    // procedure_domain: P9b WorkflowSelector uses this to match intent → domain
-    // via DOMAIN_INTENT_MAP (keys: 'onboarding', 'support', 'transfer', 'cancel').
-    //
-    // BLOCKER — domain column missing from both tables (Camada 3 stub #4/4):
-    //   • procedure_executions  — no domain column (confirmed schema.ts:1016-1048)
-    //   • procedure_definitions — no domain column (confirmed schema.ts:896-956,
-    //     migration 018_p3a_procedure_definitions.sql, migrations 019-025 all clear)
-    //   • intencao (free-text prose on procedure_definitions) cannot be used as a
-    //     substitute — it is a human description, NOT a structured domain key that
-    //     maps into DOMAIN_INTENT_MAP.
-    //
-    // Returning 'unknown' means intentMatchesProcedureDomain always returns false
-    // (DOMAIN_INTENT_MAP has no 'unknown' key), so WorkflowSelector always falls
-    // back to the TTL heuristic path (continue if ttl > 30s, switch otherwise).
-    //
-    // REQUIRED FIX (out of scope for this PR — needs its own migration):
-    //   1. Add migration: ALTER TABLE procedure_definitions ADD COLUMN domain TEXT
-    //      CHECK (domain IN ('onboarding','support','transfer','cancel',…))
-    //   2. Update schema.ts procedure_definitions table to include domain field.
-    //   3. Replace this stub with a JOIN:
-    //        db.select({ ..., procedure_domain: procedure_definitions.domain })
-    //          .from(procedure_executions)
-    //          .innerJoin(procedure_definitions,
-    //            eq(procedure_executions.definition_id, procedure_definitions.id))
-    //          .where(eq(procedure_executions.id, execution_id))
-    //      Fallback: procedure_definitions.domain IS NULL → return 'unknown' + warn.
-    //   4. Add T1-T4 tests in tests/unit/decision-prod-env-procedures.spec.ts
-    //      (T1: domain read from definition JOIN; T2: null exec → null return;
-    //       T3: definition.domain IS NULL → 'unknown' + warn; T4: cross-tenant isolation).
+
+    // Fetch the definition to read the domain field.
+    // Tenant isolation is enforced by procedureDefinitionsRepo.findById
+    // via getCurrentTenant() + WHERE tenant_id/agent_id.
+    const definition = await procedureDefinitionsRepo.findById(exec.definition_id);
+    const rawDomain = (definition as { domain?: string | null } | null)?.domain ?? null;
+
+    if (rawDomain === null) {
+      logger.warn(
+        { definition_id: exec.definition_id, execution_id, tenant_id: exec.tenant_id },
+        'procedure_definitions.domain is NULL — WorkflowSelector will use unknown fallback',
+      );
+    }
+
     return {
       execution_id: exec.id,
       procedure_id: exec.definition_id,
-      procedure_domain: 'unknown',
+      procedure_domain: rawDomain ?? 'unknown',
       ttl_remaining_ms,
     };
   },

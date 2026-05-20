@@ -1,23 +1,14 @@
 /**
  * Camada 3 stub #4/4 — ProceduresRepoAdapter acceptance tests.
  *
- * BLOCKER: procedure_definitions has no `domain` column in the DB schema
- * (confirmed migration 018_p3a_procedure_definitions.sql, schema.ts:896-956,
- * all migrations 019-059 checked — none add a domain column to procedure_definitions).
+ * CLOSED: migration 060_p3a_procedure_definitions_domain.sql added the domain
+ * column to procedure_definitions. schema.ts and prod-env.ts updated accordingly.
  *
- * These tests describe the DESIRED behavior once the following migration + fix
- * is applied:
- *
- *   1. Migration: ALTER TABLE procedure_definitions ADD COLUMN domain TEXT
- *      CHECK (domain IN ('onboarding','support','transfer','cancel', ...));
- *   2. schema.ts: add `domain` field to procedure_definitions table definition.
- *   3. prod-env.ts adapter: JOIN procedure_executions → procedure_definitions
- *      ON definition_id to read domain, with NULL fallback to 'unknown'.
- *
- * Tests T1 and T3 FAIL today because the adapter hardcodes `procedure_domain: 'unknown'`
- * (prod-env.ts:348). T2 and T4 PASS today (structural behavior unaffected by the stub).
- *
- * DO NOT remove or skip these tests — they are the acceptance gate for the future fix.
+ * All four tests should pass after the fix:
+ *   T1: domain read from definition JOIN — GREEN (was RED: stub returned 'unknown')
+ *   T2: no active execution → null — GREEN (was GREEN: structural behavior)
+ *   T3: definition.domain IS NULL → 'unknown' + warn — GREEN (was RED for wrong reason)
+ *   T4: cross-tenant isolation — GREEN (was GREEN: enforced at repo layer)
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -80,7 +71,7 @@ function makeExecution(overrides: Partial<{
   };
 }
 
-function makeDefinition(domain: string | null = 'financeiro') {
+function makeDefinition(domain: string | null = 'transfer') {
   return {
     id: 'def-001',
     tenant_id: 'tenant-A',
@@ -117,15 +108,15 @@ describe('ProceduresRepoAdapter — Camada 3 stub #4/4 acceptance gate', () => {
   });
 
   /**
-   * T1: Active execution with definition.domain = 'financeiro'
-   * Expected: adapter returns { procedure_domain: 'financeiro', ... }
+   * T1: Active execution with definition.domain = 'transfer'
+   * Expected: adapter returns { procedure_domain: 'transfer', ... }
    *
-   * FAILS today: adapter returns 'unknown' (hardcoded, no JOIN to definitions).
-   * Passes after: migration adds domain column + adapter does JOIN.
+   * GREEN after: migration 060 adds domain column + adapter reads it via
+   * procedureDefinitionsRepo.findById. 'transfer' is a real DOMAIN_INTENT_MAP key.
    */
   it('T1 — returns procedure_domain from procedure_definitions JOIN when domain exists', async () => {
     mockFindById.mockResolvedValue(makeExecution());
-    mockDefinitionsFindById.mockResolvedValue(makeDefinition('financeiro'));
+    mockDefinitionsFindById.mockResolvedValue(makeDefinition('transfer'));
 
     const result = await runWithTenantContext(
       { tenant_id: 'tenant-A', agent_id: 'agent-1' },
@@ -135,8 +126,7 @@ describe('ProceduresRepoAdapter — Camada 3 stub #4/4 acceptance gate', () => {
     expect(result).not.toBeNull();
     expect(result!.execution_id).toBe('exec-001');
     expect(result!.procedure_id).toBe('def-001');
-    // BLOCKER: this assertion fails until migration + JOIN adapter is in place
-    expect(result!.procedure_domain).toBe('financeiro');
+    expect(result!.procedure_domain).toBe('transfer');
     expect(result!.ttl_remaining_ms).toBeGreaterThan(0);
   });
 
@@ -161,13 +151,10 @@ describe('ProceduresRepoAdapter — Camada 3 stub #4/4 acceptance gate', () => {
    * T3: Active execution exists but procedure_definitions.domain IS NULL
    * Expected: adapter returns { procedure_domain: 'unknown', ... } with a warn log
    *
-   * FAILS today: adapter returns 'unknown' for the wrong reason (no JOIN at all,
-   * not because definition.domain is NULL). After the fix, 'unknown' is returned
-   * only when the JOIN finds a NULL domain — with a warn log to make it visible.
+   * GREEN after: adapter calls procedureDefinitionsRepo.findById, finds domain=null,
+   * emits a logger.warn, and returns procedure_domain='unknown' as the NULL fallback.
    *
-   * To verify the warn: this test only asserts procedure_domain='unknown' because
-   * intercepting console.warn requires additional setup. The warn log requirement
-   * is enforced by code review of the final adapter.
+   * The warn log requirement is verified by code review of the adapter.
    */
   it('T3 — returns procedure_domain as "unknown" when definition.domain is NULL', async () => {
     mockFindById.mockResolvedValue(makeExecution());
