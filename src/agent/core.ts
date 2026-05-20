@@ -756,6 +756,11 @@ async function runAgentForMensagemInner(
         active_procedure_execution_id: activeExecution?.id ?? null,
         feature_flags_snapshot: { FEATURE_CONTEXT_PACKET_V1: true },
         entered_at_ms: Date.now(),
+        // P9c: sensitive-memory risk floor. The legacy hot-path here doesn't
+        // have async DB access at this point — the real BaseContextBuilder
+        // (used by the packet path) populates this via countActiveSensitive.
+        // Conservative default: 0 (no false floor in this legacy branch).
+        active_sensitive_memory_count: 0,
       };
       const decision = createDecisionPacketStub(base);
       const { builders, cache } = getProductionBuilderSet();

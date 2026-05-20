@@ -235,6 +235,55 @@ export const memoryResolver = {
   },
 
   /**
+   * Count active sensitive memories in scope (tenant + agent + optional conversation).
+   *
+   * Used by BaseContextBuilder to populate active_sensitive_memory_count in
+   * BaseContextPacket, which RiskScorer P9c consumes for the sensitive-memory
+   * risk floor. Agent isolation is mandatory — never omit agent_id.
+   *
+   * @returns count >= 0. Returns 0 on any DB error (fail-open for risk scoring).
+   */
+  async countActiveSensitive(input: {
+    tenant_id: string;
+    /** PR #94 round-2: agent isolation — always required for this method. */
+    agent_id: string;
+    conversation_id?: string;
+  }): Promise<number> {
+    const now = new Date();
+    const conditions = [
+      eq(memory_entry.tenant_id, input.tenant_id),
+      eq(memory_entry.agent_id, input.agent_id),
+      eq(memory_entry.sensitivity, 'high'),
+      isVisibleLifecycle(memory_entry.lifecycle_status),
+      eq(memory_entry.needs_review, false),
+      or(
+        isNull(memory_entry.expires_at),
+        gt(memory_entry.expires_at, now),
+      ),
+    ];
+
+    if (input.conversation_id) {
+      // Narrow to conversation-scoped OR agent-broadcast sensitive memories.
+      conditions.push(
+        or(
+          and(
+            eq(memory_entry.scope_type, 'conversation'),
+            eq(memory_entry.subject_id, input.conversation_id),
+          ),
+          eq(memory_entry.scope_type, 'agent'),
+        )!,
+      );
+    }
+
+    const rows = await db
+      .select({ id: memory_entry.id })
+      .from(memory_entry)
+      .where(and(...conditions));
+
+    return rows.length;
+  },
+
+  /**
    * P8c: stub — full KSM lifecycle transitions land in P10a.
    *
    * Requires tenant_id explicitly to keep the cross-tenant invariant intact
