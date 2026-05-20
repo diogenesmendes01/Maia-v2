@@ -88,6 +88,7 @@ function mkBase(overrides?: Partial<BaseContextPacket>): BaseContextPacket {
     active_procedure_execution_id: null,
     feature_flags_snapshot: {},
     entered_at_ms: Date.now(),
+    active_sensitive_memory_count: 0,
     ...overrides,
   };
 }
@@ -237,5 +238,36 @@ describe('RiskScorerProdAdapter (Camada 3, stub #1/4)', () => {
     expect(scoreTurnMock).toHaveBeenCalledOnce();
     const signalsArg = scoreTurnMock.mock.calls[0]?.[0] as Record<string, unknown>;
     expect(signalsArg?.topic).toBe('unknown');
+  });
+
+  /**
+   * T5: active_sensitive_memory_count in BaseContextPacket → adapter passes the
+   * count to TurnRiskSignals so P9c heuristic can derive the sensitive-memory
+   * risk floor. Verified by inspecting what scoreTurn receives.
+   */
+  it('T5: active_sensitive_memory_count=5 → scoreTurn receives active_sensitive_memory_count=5', async () => {
+    // Arrange: P9c returns MEDIUM (the count may push it there).
+    scoreTurnMock.mockResolvedValue(
+      mkScoredRisk(RiskLevel.MEDIUM, {
+        triggers: [
+          {
+            signal: 'sensitive_memory_count',
+            contributes_to: RiskLevel.MEDIUM,
+            weight: 1,
+          },
+        ],
+      }),
+    );
+
+    const adapter = new RiskScorerProdAdapter();
+    await adapter.score({
+      intent: { label: 'chat', confidence: 0.9 },
+      base: mkBase({ active_sensitive_memory_count: 5 }),
+    });
+
+    // The adapter must pass active_sensitive_memory_count through to TurnRiskSignals.
+    expect(scoreTurnMock).toHaveBeenCalledOnce();
+    const signals = scoreTurnMock.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(signals?.active_sensitive_memory_count).toBe(5);
   });
 });
