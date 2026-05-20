@@ -258,8 +258,13 @@ function selectEventsForBlock(
     ? (firstTurn.message.created_at?.getTime() ?? 0)
     : 0;
 
-  const latestTurnEvents: ToolExecutionSummary[] = [];
-  const olderTurnEvents: ToolExecutionSummary[] = [];
+  // Round-1 fix #1: pin ONLY write/communication successes from the latest turn.
+  // Read successes from the latest turn fall into the global pool and compete
+  // with older events on priority rank (writes > reads). This prevents a
+  // read-heavy latest turn from consuming all budget slots and evicting
+  // confirmed writes from older turns.
+  const pinnedLatestEvents: ToolExecutionSummary[] = [];
+  const globalPoolEvents: ToolExecutionSummary[] = [];
 
   for (const t of turns) {
     const turnCreatedAt = t.message.created_at?.getTime() ?? 0;
@@ -269,16 +274,18 @@ function selectEventsForBlock(
       const occurredMs = Date.parse(s.occurred_at);
       if (!Number.isFinite(occurredMs)) continue;
       if (now - occurredMs > EVENTS_BLOCK_WINDOW_MS) continue;
-      if (isLatestTurn) {
-        latestTurnEvents.push(s);
+      if (isLatestTurn && (s.side_effect === 'write' || s.side_effect === 'communication')) {
+        // Durable side effects from the latest turn are pinned unconditionally
+        // (Issue #137 / Codex C3: no cap on same-turn write/communication successes).
+        pinnedLatestEvents.push(s);
       } else {
-        olderTurnEvents.push(s);
+        // Read successes from the latest turn AND all events from older turns
+        // compete globally — writes/communications rank above reads.
+        globalPoolEvents.push(s);
       }
     }
   }
 
-  // Issue #137 (Codex C3): all events from the most-recent turn are preserved
-  // unconditionally. EVENTS_BLOCK_MAX_ITEMS caps only the older-turn backfill.
   const sortEvents = (arr: ToolExecutionSummary[]): ToolExecutionSummary[] =>
     [...arr].sort((a, b) => {
       const r = priorityRank(a) - priorityRank(b);
@@ -286,11 +293,11 @@ function selectEventsForBlock(
       return Date.parse(b.occurred_at) - Date.parse(a.occurred_at);
     });
 
-  const sortedLatest = sortEvents(latestTurnEvents);
-  const remainingSlots = Math.max(0, EVENTS_BLOCK_MAX_ITEMS - sortedLatest.length);
-  const sortedOlder = sortEvents(olderTurnEvents).slice(0, remainingSlots);
+  const sortedPinned = sortEvents(pinnedLatestEvents);
+  const remainingSlots = Math.max(0, EVENTS_BLOCK_MAX_ITEMS - sortedPinned.length);
+  const sortedPool = sortEvents(globalPoolEvents).slice(0, remainingSlots);
 
-  return [...sortedLatest, ...sortedOlder];
+  return [...sortedPinned, ...sortedPool];
 }
 
 function renderEventsBlock(events: ToolExecutionSummary[]): string {
@@ -307,6 +314,20 @@ function renderEventsBlock(events: ToolExecutionSummary[]): string {
   return ['## Eventos confirmados pelo backend', ...lines].join('\n');
 }
 
+/**
+ * Tag for write/communication successes that exceed the contradiction TTL.
+ * They are exempt from silent drop: instead they are marked as stale so
+ * `renderContradictionOverlay` can emit a compact warning rather than
+ * omitting the overlay entirely.
+ *
+ * Round-1 review fix #2: durable side effects (write/communication) must
+ * never be silently forgotten. After TTL they become "stale-success" entries
+ * — the duplicate-check window for tools like `register_transaction` is only
+ * 2h, so a user following up after a day may be guided into a real duplicate
+ * unless the overlay stays visible in some form.
+ */
+const STALE_SUCCESS_MARKER = '__stale_success__';
+
 function detectContradictions(turns: AssistantTurn[], now: number): ToolExecutionSummary[] {
   const overlays: ToolExecutionSummary[] = [];
   for (const t of turns) {
@@ -320,16 +341,23 @@ function detectContradictions(turns: AssistantTurn[], now: number): ToolExecutio
     for (const s of t.summaries) {
       if (s.status !== 'success') continue;
       if (s.side_effect !== 'write' && s.side_effect !== 'communication') continue;
-      // Issue #136 (Superpowers I1): TTL guard — skip contradiction overlay
-      // when the resolving event is older than CONTRADICTION_OVERLAY_TTL_MS.
-      // Events without a parseable occurred_at are treated as current (don't skip).
       const occurredMs = Date.parse(s.occurred_at);
-      if (Number.isFinite(occurredMs) && now - occurredMs > CONTRADICTION_OVERLAY_TTL_MS) continue;
+      const isExpired =
+        Number.isFinite(occurredMs) && now - occurredMs > CONTRADICTION_OVERLAY_TTL_MS;
       const kws = DOMAIN_KEYWORDS[s.tool_name];
       if (!kws || kws.length === 0) continue;
       const lower = text.toLowerCase();
       const matched = kws.some((kw) => lower.includes(kw.toLowerCase()));
-      if (matched) overlays.push(s);
+      if (!matched) continue;
+      if (isExpired) {
+        // Round-1 fix #2: write/communication overlays are exempt from silent
+        // TTL drop. Emit a compact stale-success marker so the LLM remains
+        // aware that a durable side effect occurred (even if it's old) until
+        // a fresher authoritative state source replaces it.
+        overlays.push({ ...s, result_summary: `${STALE_SUCCESS_MARKER} ${s.result_summary}` });
+      } else {
+        overlays.push(s);
+      }
     }
   }
   return overlays;
@@ -337,10 +365,16 @@ function detectContradictions(turns: AssistantTurn[], now: number): ToolExecutio
 
 function renderContradictionOverlay(overlays: ToolExecutionSummary[]): string {
   if (overlays.length === 0) return '';
-  const items = overlays.map(
-    (s) =>
-      `- ${s.tool_name} (${s.side_effect}): ${s.result_summary}. Sua afirmação contraditória anterior está obsoleta.`,
-  );
+  const items = overlays.map((s) => {
+    const isStale = s.result_summary.startsWith(STALE_SUCCESS_MARKER);
+    const summary = isStale
+      ? s.result_summary.slice(STALE_SUCCESS_MARKER.length + 1)
+      : s.result_summary;
+    const staleSuffix = isStale
+      ? ' (sucesso antigo — verificar se já existe antes de repetir)'
+      : '. Sua afirmação contraditória anterior está obsoleta.';
+    return `- ${s.tool_name} (${s.side_effect}): ${summary}${staleSuffix}`;
+  });
   return [
     '## ⚠ Conflito detectado em turno anterior',
     'Você escreveu uma mensagem de falha, mas o backend confirmou sucesso para a(s) tool(s) abaixo.',

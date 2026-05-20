@@ -494,7 +494,11 @@ describe('prompt-builder — contradiction overlay', () => {
 });
 
 describe('prompt-builder — contradiction overlay (PR #74 review fixes)', () => {
-  it('Superpowers I1: does NOT emit overlay when the successful tool occurred_at is older than 24h (TTL)', async () => {
+  it('Superpowers I1 (updated round-1): write/communication overlays older than 24h emit a stale-success marker instead of being silently dropped', async () => {
+    // Round-1 fix #2: durable side effects (write/communication) must never be
+    // silently dropped past the TTL. They render as a compact stale-success
+    // marker so the LLM knows the action previously succeeded and avoids guiding
+    // the user into a duplicate side effect (e.g. a second register_transaction).
     const summary = {
       tool_call_id: 'tu_stale',
       tool_name: 'schedule_reminder',
@@ -514,7 +518,10 @@ describe('prompt-builder — contradiction overlay (PR #74 review fixes)', () =>
     const { system } = await build({
       inbound: mkInbound({ created_at: new Date('2026-05-11T15:00:00Z') }),
     });
-    expect(system).not.toMatch(/Conflito detectado/i);
+    // Overlay MUST appear (as either full conflict or stale-success marker).
+    expect(system).toMatch(/Conflito detectado/i);
+    // The stale annotation must distinguish it from a fresh overlay.
+    expect(system).toMatch(/sucesso antigo|verificar se j[áa] existe/i);
   });
 
   it('Superpowers I2: does NOT emit overlay when the same message also contains a positive-confirmation phrase ("agora foi")', async () => {
@@ -676,6 +683,89 @@ describe('prompt-builder — role coalescing and event-only rows (PR #74)', () =
     // The messages array DOES NOT include the empty assistant row.
     const assistantMessages = messages.filter((m) => m.role === 'assistant');
     expect(assistantMessages).toHaveLength(0);
+  });
+});
+
+describe('prompt-builder — round-1 review (write-priority + durable TTL)', () => {
+  it('[round-1 finding #1] write/communication successes from older turn are NOT displaced when latest turn is read-only', async () => {
+    // Repro: newest turn has 5 reads, older turn has 3 writes.
+    // Bug: pinning ALL events from the latest turn consumes all 5 budget slots,
+    // causing the 3 older writes to be dropped.
+    // Fix: only writes/communications from the latest turn are pinned;
+    // reads from the latest turn compete globally with older events.
+    const latestReads = Array.from({ length: 5 }, (_, i) => ({
+      tool_call_id: 'tu_r' + i,
+      tool_name: 'query_balance',
+      status: 'success' as const,
+      side_effect: 'read' as const,
+      result_summary: `consulta read latest ${i}`,
+      occurred_at: '2026-05-11T14:59:00Z',
+    }));
+    const olderWrites = Array.from({ length: 3 }, (_, i) => ({
+      tool_call_id: 'tu_w' + i,
+      tool_name: 'schedule_reminder',
+      status: 'success' as const,
+      side_effect: 'write' as const,
+      result_summary: `write older ${i}`,
+      occurred_at: '2026-05-11T14:00:00Z',
+    }));
+    h.recentInConversation.mockResolvedValue([
+      mkAssistantMsg({
+        id: 'latest-asst',
+        ferramentas_chamadas: latestReads,
+        created_at: new Date('2026-05-11T14:59:00Z'),
+        processada_em: new Date('2026-05-11T14:59:00Z'),
+      }),
+      mkAssistantMsg({
+        id: 'older-asst',
+        ferramentas_chamadas: olderWrites,
+        created_at: new Date('2026-05-11T14:00:00Z'),
+        processada_em: new Date('2026-05-11T14:00:00Z'),
+      }),
+      mkInbound({ created_at: new Date('2026-05-11T15:00:00Z') }),
+    ]);
+    const { system } = await build({
+      inbound: mkInbound({ created_at: new Date('2026-05-11T15:00:00Z') }),
+    });
+    // All 3 older writes must appear (writes outrank reads globally).
+    for (let i = 0; i < 3; i++) {
+      expect(system).toContain(`write older ${i}`);
+    }
+  });
+
+  it('[round-1 finding #2] durable write/communication contradiction overlay is NOT silently dropped after TTL', async () => {
+    // Repro: assistant said "register_transaction failed" 25h ago + matching
+    // success event 25h ago. Bug: TTL guard drops the overlay because
+    // occurred_at > 24h, but for durable writes there is no fresher
+    // authoritative state source — the LLM can guide the user to repeat a
+    // real write (duplicate side-effect).
+    // Fix: write/communication overlays are exempt from TTL drop; they either
+    // always render OR render as a compact stale-success marker.
+    const staleSummary = {
+      tool_call_id: 'tu_stale_write',
+      tool_name: 'register_transaction',
+      status: 'success' as const,
+      side_effect: 'write' as const,
+      result_summary: 'transação registrada (id tx-999)',
+      occurred_at: '2026-05-10T12:00:00Z', // 27h before inbound
+    };
+    h.recentInConversation.mockResolvedValue([
+      mkAssistantMsg({
+        id: 'asst-stale',
+        conteudo: 'Não consegui registrar a transação — backend retornou erro.',
+        ferramentas_chamadas: [staleSummary],
+        created_at: new Date('2026-05-10T12:00:00Z'),
+        processada_em: new Date('2026-05-10T12:00:00Z'),
+      }),
+      mkInbound({ created_at: new Date('2026-05-11T15:00:00Z') }),
+    ]);
+    const { system } = await build({
+      inbound: mkInbound({ created_at: new Date('2026-05-11T15:00:00Z') }),
+    });
+    // Contradiction overlay OR stale-success marker must appear — never silently dropped.
+    const hasConflict = /Conflito detectado/i.test(system);
+    const hasStaleMarker = /stale.success|sucesso.*anterior|register_transaction.*sucesso.*antigo/i.test(system);
+    expect(hasConflict || hasStaleMarker).toBe(true);
   });
 });
 
