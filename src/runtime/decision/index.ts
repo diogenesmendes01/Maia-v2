@@ -149,7 +149,6 @@ import type {
   PolicyEvaluator,
   PolicyRulesRepo,
   ProceduresRepo,
-  RiskScorer,
   SkillsRepo,
 } from './types.js';
 
