@@ -152,20 +152,48 @@ tabelas de user-layer: `lifecycle_status`, `evidence_count`, `confidence`,
 
 **Pré-condições obrigatórias — verifique todas antes de rodar qualquer DROP:**
 
-1. **Confirmar se P10a (050) foi aplicado.**
+> **Forma da tabela `schema_migrations`:** a coluna é `id TEXT PRIMARY KEY`
+> e contém o **nome completo do arquivo** (ex:
+> `050_p10a_ksm_lifecycle_and_indexes.sql`). Não existe coluna `version` nem
+> chave numérica curta.
+
+1. **Confirmar se P10a (050 + 051) foi aplicado.**
    ```sql
-   SELECT version FROM schema_migrations WHERE version = '050';
+   SELECT id FROM schema_migrations
+   WHERE id IN (
+     '050_p10a_ksm_lifecycle_and_indexes.sql',
+     '051_p10a_enforce_lifecycle_transition.sql'
+   );
    ```
-   - Se retornar linha: **P10a está aplicado. Siga o fluxo coordenado abaixo.**
-   - Se não retornar: você pode prosseguir direto para o passo 3.
+   - Se retornar 1 ou 2 linhas: **P10a está aplicado. Siga o fluxo coordenado abaixo.**
+   - Se não retornar linhas: você pode prosseguir direto para o passo 3.
 
 2. **Fluxo coordenado (P10a aplicado):**
-   a. Faça rollback de P10a primeiro:
+   a. Faça rollback de P10a em **ordem reversa** (051 primeiro, depois 050):
       ```bash
-      psql $DATABASE_URL -f migrations/050_p10a_ksm_lifecycle_and_indexes_down.sql
-      psql $DATABASE_URL -f migrations/051_p10a_enforce_lifecycle_transition_down.sql
+      psql -v ON_ERROR_STOP=1 $DATABASE_URL \
+        -f migrations/051_p10a_enforce_lifecycle_transition_down.sql
+      psql -v ON_ERROR_STOP=1 $DATABASE_URL \
+        -f migrations/050_p10a_ksm_lifecycle_and_indexes_down.sql
       ```
-   b. Confirme que `050` e `051` saíram de `schema_migrations`.
+   b. Remova os registros de `schema_migrations` para que um futuro
+      `npm run db:migrate` os re-aplique corretamente:
+      ```sql
+      DELETE FROM schema_migrations
+      WHERE id IN (
+        '051_p10a_enforce_lifecycle_transition.sql',
+        '050_p10a_ksm_lifecycle_and_indexes.sql'
+      );
+      ```
+      Confirme que 0 linhas permanecem:
+      ```sql
+      SELECT id FROM schema_migrations
+      WHERE id IN (
+        '050_p10a_ksm_lifecycle_and_indexes.sql',
+        '051_p10a_enforce_lifecycle_transition.sql'
+      );
+      -- deve retornar 0 linhas
+      ```
    c. **Exporte backup das colunas de lifecycle antes de dropar:**
       ```sql
       \COPY (

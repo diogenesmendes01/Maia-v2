@@ -21,18 +21,29 @@ de cada turno e de cada registro de conhecimento da Maia.
 llm_attempted_downgrade, triggers, decided_by }` — carrega o diagnóstico
 completo para audit sem precisar reprocessar a entrada.
 
-**Status de wiring: wrapper implementado, NÃO conectado ao caminho crítico.**
-O módulo `TurnRiskScorer` (`src/runtime/decision/turn-risk-scorer.ts`) existe
-e está testado, mas `createDecisionEngine` (`src/runtime/decision/index.ts`)
-ainda instancia `RiskScorerStubImpl` (P9b) — ver TODO(P9c #97) em
-`risk-scorer.ts:12`. O `KnowledgeRiskScorer` de P10a está conectado ao KSM
-e funciona normalmente. A conexão de `TurnRiskScorer` ao `DecisionEngine` é
-rastreada separadamente e será feita em PR dedicado de cutover.
+**Status de wiring: ambos os wrappers implementados, NENHUM conectado ao
+caminho crítico ainda.**
+
+- `TurnRiskScorer` (`src/runtime/decision/turn-risk-scorer.ts`) existe e está
+  testado, mas `createDecisionEngine` (`src/runtime/decision/index.ts`) ainda
+  instancia `RiskScorerStubImpl` (P9b) — ver TODO(P9c #97) em
+  `risk-scorer.ts:12`.
+- `KnowledgeRiskScorer` (`src/control-plane/knowledge-state-machine/knowledge-risk-scorer.ts`)
+  existe e está testado, mas o KSM (`state-machine.ts:22`) importa e usa
+  `KnowledgeRiskScorer` de `./risk-scorer.js` — que é o **stub P10a**
+  (`source: 'stub:p10a'`), NÃO o wrapper P9c. O stub usa heurística
+  determinística simples (kind=rule → high, confidence≥0.6 → low) sem gate LLM.
+  Cutover pendente em PR dedicado.
 
 **Risk Scoring de turno (via stub P9b):** está ligado e roda a cada turno,
 mas usa a heurística determinística sem gate LLM. A pontuação HIGH/CRITICAL
 via LLM (`ambiguous=true` → Haiku) **não está ativa** no caminho de turno
 até o cutover de `TurnRiskScorer`.
+
+**Risk Scoring de conhecimento (via stub P10a):** o KSM usa
+`KnowledgeRiskScorer` de `./risk-scorer.js` (stub), não o wrapper P9c. O gate
+Haiku **não está ativo** no caminho de conhecimento até o cutover de
+`KnowledgeRiskScorer`.
 
 ## Arquivos relevantes
 
@@ -220,20 +231,35 @@ triggers são logados em `cognitive_module_log.metadata.triggers`.
 | Componente | Estado |
 |---|---|
 | `src/shared/risk/` (heurística + scorer + gate) | Implementado e testado |
-| `KnowledgeRiskScorer` (P10a/KSM) | **Conectado e ativo** |
-| `TurnRiskScorer` (P9c wrapper) | **Implementado, NÃO conectado ao hot path** |
+| `TurnRiskScorer` (P9c wrapper, turno) | **Implementado, NÃO conectado ao hot path** |
+| `KnowledgeRiskScorer` (P9c wrapper, conhecimento) | **Implementado, NÃO conectado ao KSM** |
 | `RiskScorerStubImpl` (P9b) | **Em produção** — usado por `createDecisionEngine` |
+| `KnowledgeRiskScorer` stub em `./risk-scorer.js` | **Em produção** — usado pelo KSM (`state-machine.ts:22`), `source: 'stub:p10a'` |
+
+> **Nota de verificação (round-1 incorreto):** a revisão round-1 afirmou que
+> `KnowledgeRiskScorer` de P9c estava "conectado ao KSM e funcionando
+> normalmente". Isso estava errado. O KSM importa `KnowledgeRiskScorer` de
+> `./risk-scorer.js` (stub P10a, `src/control-plane/knowledge-state-machine/risk-scorer.ts`),
+> não do wrapper P9c (`knowledge-risk-scorer.ts`). O stub retorna
+> `source: 'stub:p10a'` e não consulta o gate Haiku.
 
 ### Cutover pendente
 
-`TurnRiskScorer` substituirá `RiskScorerStubImpl` em `createDecisionEngine`
-(ver `src/runtime/decision/index.ts:105` e TODO em `risk-scorer.ts:12`).
-Esse cutover é rastreado em issue/PR separado e **não faz parte deste PR**.
+Dois cutovers são necessários, cada um em PR dedicado:
 
-Até o cutover:
+1. **TurnRiskScorer** substituirá `RiskScorerStubImpl` em `createDecisionEngine`
+   (ver `src/runtime/decision/index.ts:105` e TODO em `risk-scorer.ts:12`).
+2. **KnowledgeRiskScorer P9c** substituirá o stub em
+   `src/control-plane/knowledge-state-machine/state-machine.ts:22` — a linha
+   `import { KnowledgeRiskScorer } from './risk-scorer.js'` passará a importar
+   de `./knowledge-risk-scorer.js`.
+
+Nenhum desses cutovers faz parte deste PR.
+
+Até os cutovers:
 - Turnos são pontuados pela heurística do P9b stub (determinística, sem LLM).
 - `HIGH`/`CRITICAL` via gate Haiku **não está ativo** para risco de turno.
-- `KnowledgeRiskScorer` já usa o gate LLM normalmente via KSM.
+- Conhecimento é pontuado pelo stub P10a (heurística simples, sem gate Haiku).
 
 ### Pós-cutover
 
@@ -243,4 +269,19 @@ turnos em andamento não são re-scored retroativamente.
 
 ## Known issues
 
-Nenhum ativo.
+### KSM ainda usa stub P10a — gate Haiku inativo para conhecimento
+
+**Arquivo:** `src/control-plane/knowledge-state-machine/state-machine.ts:22`
+**Evidência:** `import { KnowledgeRiskScorer } from './risk-scorer.js'` →
+`src/control-plane/knowledge-state-machine/risk-scorer.ts` — stub que retorna
+`source: 'stub:p10a'` em todos os caminhos normais, sem consultar o gate LLM.
+
+O wrapper P9c (`knowledge-risk-scorer.ts`) existe mas não é referenciado pelo
+KSM. O cutover (trocar o import em `state-machine.ts`) é rastreado em PR
+dedicado separado deste.
+
+**Impacto:** risk scores de conhecimento usam heurística simples
+(kind=rule → high, confidence≥0.6 → low, origin humano → low, resto → medium).
+Casos ambíguos que deveriam escalar via Haiku gate **não escalam**. O
+comportamento é conservador (regras sempre vão para `pending_review`), mas
+menos preciso para tipos fact/memory/hint com baixa confiança.
