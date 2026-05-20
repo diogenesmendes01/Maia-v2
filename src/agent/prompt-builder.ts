@@ -117,6 +117,16 @@ const POSITIVE_CONFIRMATION_RE =
 const EVENTS_BLOCK_MAX_ITEMS = 5;
 const EVENTS_BLOCK_WINDOW_MS = 24 * 60 * 60 * 1000;
 
+// Issue #136 — TTL guard for contradiction overlay (Superpowers I1).
+// Only surface a contradiction if the resolving successful event is recent.
+// Configurable via env for future tuning; defaults to 24h.
+const CONTRADICTION_OVERLAY_TTL_HOURS = (() => {
+  const raw = process.env.CONTRADICTION_OVERLAY_TTL_HOURS;
+  const parsed = raw ? Number(raw) : NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 24;
+})();
+const CONTRADICTION_OVERLAY_TTL_MS = CONTRADICTION_OVERLAY_TTL_HOURS * 60 * 60 * 1000;
+
 /**
  * Sanitizes user-supplied text and wraps it in <user_message> tags so the
  * LLM treats the content as data rather than instruction.
@@ -233,30 +243,54 @@ function selectEventsForBlock(
   turns: AssistantTurn[],
   now: number,
 ): ToolExecutionSummary[] {
-  const successOnly: ToolExecutionSummary[] = [];
-  for (const t of turns) {
-    for (const s of t.summaries) {
-      if (s.status !== 'success') continue;
-      const occurredMs = Date.parse(s.occurred_at);
-      if (!Number.isFinite(occurredMs)) continue;
-      if (now - occurredMs > EVENTS_BLOCK_WINDOW_MS) continue;
-      successOnly.push(s);
-    }
-  }
-
   // Most recent first, side-effect priority (write/communication > read).
   const priorityRank = (s: ToolExecutionSummary): number => {
     if (s.side_effect === 'write' || s.side_effect === 'communication') return 0;
     if (s.side_effect === 'read') return 1;
     return 2;
   };
-  successOnly.sort((a, b) => {
-    const r = priorityRank(a) - priorityRank(b);
-    if (r !== 0) return r;
-    return Date.parse(b.occurred_at) - Date.parse(a.occurred_at);
-  });
 
-  return successOnly.slice(0, EVENTS_BLOCK_MAX_ITEMS);
+  // Identify the most-recent assistant turn by message timestamp.
+  // collectPriorAssistantTurns returns messages from recentInConversation which
+  // lists newest-first, so turns[0] is the most recent.
+  const firstTurn = turns[0];
+  const latestTurnCreatedAt = firstTurn
+    ? (firstTurn.message.created_at?.getTime() ?? 0)
+    : 0;
+
+  const latestTurnEvents: ToolExecutionSummary[] = [];
+  const olderTurnEvents: ToolExecutionSummary[] = [];
+
+  for (const t of turns) {
+    const turnCreatedAt = t.message.created_at?.getTime() ?? 0;
+    const isLatestTurn = turnCreatedAt === latestTurnCreatedAt;
+    for (const s of t.summaries) {
+      if (s.status !== 'success') continue;
+      const occurredMs = Date.parse(s.occurred_at);
+      if (!Number.isFinite(occurredMs)) continue;
+      if (now - occurredMs > EVENTS_BLOCK_WINDOW_MS) continue;
+      if (isLatestTurn) {
+        latestTurnEvents.push(s);
+      } else {
+        olderTurnEvents.push(s);
+      }
+    }
+  }
+
+  // Issue #137 (Codex C3): all events from the most-recent turn are preserved
+  // unconditionally. EVENTS_BLOCK_MAX_ITEMS caps only the older-turn backfill.
+  const sortEvents = (arr: ToolExecutionSummary[]): ToolExecutionSummary[] =>
+    [...arr].sort((a, b) => {
+      const r = priorityRank(a) - priorityRank(b);
+      if (r !== 0) return r;
+      return Date.parse(b.occurred_at) - Date.parse(a.occurred_at);
+    });
+
+  const sortedLatest = sortEvents(latestTurnEvents);
+  const remainingSlots = Math.max(0, EVENTS_BLOCK_MAX_ITEMS - sortedLatest.length);
+  const sortedOlder = sortEvents(olderTurnEvents).slice(0, remainingSlots);
+
+  return [...sortedLatest, ...sortedOlder];
 }
 
 function renderEventsBlock(events: ToolExecutionSummary[]): string {
@@ -273,7 +307,7 @@ function renderEventsBlock(events: ToolExecutionSummary[]): string {
   return ['## Eventos confirmados pelo backend', ...lines].join('\n');
 }
 
-function detectContradictions(turns: AssistantTurn[]): ToolExecutionSummary[] {
+function detectContradictions(turns: AssistantTurn[], now: number): ToolExecutionSummary[] {
   const overlays: ToolExecutionSummary[] = [];
   for (const t of turns) {
     const text = t.message.conteudo ?? '';
@@ -286,6 +320,11 @@ function detectContradictions(turns: AssistantTurn[]): ToolExecutionSummary[] {
     for (const s of t.summaries) {
       if (s.status !== 'success') continue;
       if (s.side_effect !== 'write' && s.side_effect !== 'communication') continue;
+      // Issue #136 (Superpowers I1): TTL guard — skip contradiction overlay
+      // when the resolving event is older than CONTRADICTION_OVERLAY_TTL_MS.
+      // Events without a parseable occurred_at are treated as current (don't skip).
+      const occurredMs = Date.parse(s.occurred_at);
+      if (Number.isFinite(occurredMs) && now - occurredMs > CONTRADICTION_OVERLAY_TTL_MS) continue;
       const kws = DOMAIN_KEYWORDS[s.tool_name];
       if (!kws || kws.length === 0) continue;
       const lower = text.toLowerCase();
@@ -655,7 +694,7 @@ ${stateJson}`;
   const events = selectEventsForBlock(priorAssistantTurns, nowMs);
   const eventsBlock = renderEventsBlock(events);
 
-  const overlays = detectContradictions(priorAssistantTurns);
+  const overlays = detectContradictions(priorAssistantTurns, nowMs);
   const overlayBlock = renderContradictionOverlay(overlays);
 
   const systemSections: string[] = [
@@ -771,6 +810,8 @@ export const _internal = {
   POSITIVE_CONFIRMATION_RE,
   EVENTS_BLOCK_MAX_ITEMS,
   EVENTS_BLOCK_WINDOW_MS,
+  CONTRADICTION_OVERLAY_TTL_HOURS,
+  CONTRADICTION_OVERLAY_TTL_MS,
   selectEventsForBlock,
   detectContradictions,
 };
