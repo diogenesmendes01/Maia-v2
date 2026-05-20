@@ -1184,7 +1184,7 @@ if (args.proposal.capability_type === 'skill') {
 - [ ] `skill-proposer` detector roda em batch async; gate flag-off respeitado
 - [ ] `capability-proposer` branch `'skill'` + `capability-test-runner` strategy `skill_evaluator` + `capability-revert` branch
 - [ ] Admin UI: Tela 1 lista skills proposed; Tela 2 mostra Skill Contract diff; Tela 3 version history + rollback
-- [ ] 24 acceptance gates passam (script `scripts/p9a-acceptance-gates.sh`)
+- [ ] 18 acceptance gates automatizados passam (script `scripts/p9a-acceptance-gates.sh`); G19-G23 pending automation; G24 manual
 - [ ] 4 sample skills (A/B/C/D) executáveis em ambiente de teste
 - [ ] Runbook `docs/runbooks/p9a-skill-abstraction.md` publicado
 - [ ] Feature flag `FEATURE_SKILL_REGISTRY_V1` em `feature-flags.ts` e default off

@@ -1900,7 +1900,7 @@ gh pr create \
 - [x] SkillSlice builder tests
 - [x] skill-proposer detector tests
 - [x] Integration E2E (6 cenários)
-- [x] Acceptance gates (24 gates)
+- [x] Acceptance gates (G1-G18 automated; G19-G23 pending; G24 manual)
 - [x] Full test suite 100% PASS
 - [x] Lint + typecheck clean
 
@@ -1930,7 +1930,7 @@ When all 12 tasks (+ subtasks) have [x] and:
 1. ✅ `npm test` 100% PASS
 2. ✅ `npm run lint` zero errors
 3. ✅ `npm run typecheck` zero errors
-4. ✅ `scripts/p9a-acceptance-gates.sh` PASS (all 24 gates)
+4. ✅ `scripts/p9a-acceptance-gates.sh` PASS (G1-G18 automated; G19-G23 pending automation; G24 manual/E2E placeholder)
 5. ✅ Migration 043 + 044 apply cleanly in dev DB
 6. ✅ `skillsRepo.propose` creates `status='proposed'`
 7. ✅ `skillsRepo.activate` moves proposed→active, deprecates previous (transaction)
