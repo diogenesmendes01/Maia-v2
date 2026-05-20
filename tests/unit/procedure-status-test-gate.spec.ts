@@ -21,11 +21,40 @@ const testsState: Record<string, any> = {};
 
 // ---------------------------------------------------------------------------
 // Mock @/db/client.js so the non-active path (which now uses withTx) does not
-// attempt a real DB connection. The mock simply runs the callback immediately.
+// attempt a real DB connection.
+//
+// After round-2 fix, transitionProcedureStatus inlines tx.update(...) and
+// tx.insert(...) directly on the tx handle for non-active transitions. The
+// mock therefore provides a drizzle-like tx sentinel that:
+//   - tx.update(table).set(patch).where(cond).returning() → applies patch to
+//     definitionsState and returns [{id}] (1 row = success)
+//   - tx.insert(table).values(vals) → no-op (events not asserted in this spec)
 // ---------------------------------------------------------------------------
 vi.mock('@/db/client.js', () => ({
   db: {},
-  withTx: vi.fn(async (fn: (tx: any) => Promise<any>) => fn({} as any)),
+  withTx: vi.fn(async (fn: (tx: any) => Promise<any>) => {
+    const tx = {
+      update: (_table: any) => ({
+        set: (patch: any) => ({
+          where: (_cond: any) => ({
+            returning: () => {
+              // Apply the patch to all rows in definitionsState (single-row tests)
+              const updated: any[] = [];
+              for (const [k, v] of Object.entries(definitionsState)) {
+                definitionsState[k] = { ...(v as any), ...patch };
+                updated.push({ id: k });
+              }
+              return Promise.resolve(updated);
+            },
+          }),
+        }),
+      }),
+      insert: (_table: any) => ({
+        values: (_vals: any) => Promise.resolve(),
+      }),
+    };
+    return fn(tx as any);
+  }),
 }));
 
 vi.mock('@/db/repositories.js', async () => {

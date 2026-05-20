@@ -40,12 +40,33 @@ vi.mock('@anthropic-ai/sdk', () => {
 });
 
 // ---------- db/client mock (PR #85 fix P85-I1: reaper uses withTx) ----------
-// Passthrough — repo mocks below provide the tx-variants, so the closure
-// runs the same in-memory mutations without actually opening a pg
-// connection. Real transactional semantics are implicitly covered by the
-// repo-pair behaviour in the integration scenario.
+// After round-2 fix, transitionProcedureStatus inlines tx.update() and
+// tx.insert() on the tx handle for non-active transitions. The mock provides
+// a drizzle-like tx sentinel instead of a bare {} object.
 vi.mock('@/db/client.js', () => ({
-  withTx: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})),
+  withTx: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => {
+    const tx = {
+      update: (_table: any) => ({
+        set: (patch: any) => ({
+          where: (_cond: any) => ({
+            returning: () => {
+              // Apply patch to all rows in definitionsState (single-row per test)
+              const updated: any[] = [];
+              for (const [k, v] of Object.entries(definitionsState)) {
+                definitionsState[k] = { ...(v as any), ...patch };
+                updated.push({ id: k });
+              }
+              return Promise.resolve(updated);
+            },
+          }),
+        }),
+      }),
+      insert: (_table: any) => ({
+        values: (_vals: any) => Promise.resolve(),
+      }),
+    };
+    return fn(tx as any);
+  }),
   db: {},
 }));
 
