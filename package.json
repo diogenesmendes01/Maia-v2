@@ -73,6 +73,7 @@
     "protobufjs": "^7.5.5"
   },
   "devDependencies": {
+    "@trpc/server": "11.0.0-rc.682",
     "@eslint/js": "^10.0.1",
     "@types/node": "^25.9.1",
     "@types/node-cron": "^3.0.11",
