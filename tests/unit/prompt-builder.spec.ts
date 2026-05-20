@@ -918,6 +918,178 @@ describe('prompt-builder — round-2 review (stale-success authority separation)
   });
 });
 
+describe('prompt-builder — round-3 review (supersession before bucket + tool-specific identity)', () => {
+  /**
+   * Test A: fresh success in authoritative bucket THEN a LATER cancel event
+   * referencing the same transacao_id → fresh entry must be SUPPRESSED in
+   * the authoritative bucket (supersession runs before bucket assignment,
+   * not only for stale entries).
+   *
+   * Round-3 finding [high]: supersession was only applied to stale entries.
+   * Fresh successes pushed straight to authoritative bucket WITHOUT checking
+   * whether a later event cancelled them.
+   */
+  it('[R3-A] fresh success superseded by later cancel event → suppressed in authoritative bucket', async () => {
+    const freshSuccess = {
+      tool_call_id: 'tu_fresh_tx',
+      tool_name: 'register_transaction',
+      status: 'success' as const,
+      side_effect: 'write' as const,
+      result_summary: 'transação registrada (id tx-777)',
+      result_keys: { transacao_id: 'tx-777' },
+      // 2h ago — well within 24h TTL → goes to fresh bucket
+      occurred_at: '2026-05-11T13:00:00Z',
+    };
+    // Later turn: cancel_transaction for the same transacao_id
+    const laterCancel = {
+      tool_call_id: 'tu_cancel_fresh',
+      tool_name: 'cancel_transaction',
+      status: 'success' as const,
+      side_effect: 'write' as const,
+      result_summary: 'transação cancelada (id tx-777)',
+      result_keys: { transacao_id: 'tx-777' },
+      // 1h ago — AFTER the fresh success
+      occurred_at: '2026-05-11T14:00:00Z',
+    };
+    h.recentInConversation.mockResolvedValue([
+      // newest-first as mensagensRepo returns
+      mkAssistantMsg({
+        id: 'asst-cancel',
+        conteudo: 'Cancelei a transação conforme pedido.',
+        ferramentas_chamadas: [laterCancel],
+        created_at: new Date('2026-05-11T14:00:00Z'),
+        processada_em: new Date('2026-05-11T14:00:00Z'),
+      }),
+      mkAssistantMsg({
+        id: 'asst-fresh',
+        conteudo: 'Não consegui registrar a transação — backend retornou erro.',
+        ferramentas_chamadas: [freshSuccess],
+        created_at: new Date('2026-05-11T13:00:00Z'),
+        processada_em: new Date('2026-05-11T13:00:00Z'),
+      }),
+      mkInbound({ created_at: new Date('2026-05-11T15:00:00Z') }),
+    ]);
+    const { system } = await build({
+      inbound: mkInbound({ created_at: new Date('2026-05-11T15:00:00Z') }),
+    });
+    // The fresh register_transaction must NOT appear in the authoritative
+    // contradiction overlay — it was superseded by the later cancel event.
+    expect(system).not.toMatch(/Contradi[çc][õo]es do backend/i);
+    // Specifically must not appear in the overlay framing (obsolete/descarte wording).
+    const hasOverlayEntry = /transação registrada \(id tx-777\)[\s\S]*?obsoleta|obsoleta[\s\S]*?transação registrada \(id tx-777\)/i.test(system);
+    expect(hasOverlayEntry).toBe(false);
+  });
+
+  /**
+   * Test B: two reminders share the same `scheduled_for` timestamp but have
+   * DIFFERENT `lembrete_id` / `series_id` — the overlap heuristic must NOT
+   * treat them as the same resource.
+   *
+   * Round-3 finding [medium]: `resultKeysOverlap` returned true on ANY single
+   * matching key/value. A later reminder with the same scheduled_for could
+   * suppress a stale warning for an unrelated older reminder.
+   */
+  it('[R3-B] two reminders with same scheduled_for but different series_id → no false overlap (tool-specific identity)', async () => {
+    const staleReminder = {
+      tool_call_id: 'tu_rem_stale',
+      tool_name: 'schedule_reminder',
+      status: 'success' as const,
+      side_effect: 'write' as const,
+      result_summary: 'lembrete agendado para 2026-05-09 (stale)',
+      result_keys: { series_id: 'ser-100', scheduled_for: '2026-05-12T10:00:00Z' },
+      // > 24h → stale bucket
+      occurred_at: '2026-05-09T10:00:00Z',
+    };
+    // A later, DIFFERENT reminder that happens to share the same scheduled_for
+    // timestamp but is a completely different series.
+    const laterUnrelated = {
+      tool_call_id: 'tu_rem_later',
+      tool_name: 'schedule_reminder',
+      status: 'success' as const,
+      side_effect: 'write' as const,
+      result_summary: 'lembrete agendado para 2026-05-12 (diferente)',
+      result_keys: { series_id: 'ser-999', scheduled_for: '2026-05-12T10:00:00Z' },
+      // Later, but different resource
+      occurred_at: '2026-05-10T12:00:00Z',
+    };
+    h.recentInConversation.mockResolvedValue([
+      mkAssistantMsg({
+        id: 'asst-later',
+        conteudo: 'Agendei outro lembrete para o mesmo horário.',
+        ferramentas_chamadas: [laterUnrelated],
+        created_at: new Date('2026-05-10T12:00:00Z'),
+        processada_em: new Date('2026-05-10T12:00:00Z'),
+      }),
+      mkAssistantMsg({
+        id: 'asst-stale',
+        conteudo: 'Não consegui agendar os lembretes — backend retornou erro.',
+        ferramentas_chamadas: [staleReminder],
+        created_at: new Date('2026-05-09T10:00:00Z'),
+        processada_em: new Date('2026-05-09T10:00:00Z'),
+      }),
+      mkInbound({ created_at: new Date('2026-05-11T15:00:00Z') }),
+    ]);
+    const { system } = await build({
+      inbound: mkInbound({ created_at: new Date('2026-05-11T15:00:00Z') }),
+    });
+    // The stale reminder must NOT be suppressed — different series_id means
+    // tool-specific identity does NOT overlap despite same scheduled_for.
+    expect(system).toContain('lembrete agendado para 2026-05-09 (stale)');
+    // Historical section must appear with the stale entry.
+    expect(system).toMatch(/Hist[oó]rico.*verificar antes de repetir/i);
+  });
+
+  /**
+   * Test C: regression guard — existing supersession for stale entries
+   * (round-2 behavior) still works correctly after round-3 changes.
+   * A stale entry with the SAME transacao_id as a later event must still
+   * be suppressed (the round-2 behavior must not be broken).
+   */
+  it('[R3-C] regression: stale entry with same transacao_id as later cancel still suppressed (round-2 behavior intact)', async () => {
+    const staleSuccess = {
+      tool_call_id: 'tu_stale_r3c',
+      tool_name: 'register_transaction',
+      status: 'success' as const,
+      side_effect: 'write' as const,
+      result_summary: 'transação registrada (id tx-888)',
+      result_keys: { transacao_id: 'tx-888' },
+      occurred_at: '2026-05-10T10:00:00Z', // > 24h → stale
+    };
+    const laterCancel = {
+      tool_call_id: 'tu_cancel_r3c',
+      tool_name: 'cancel_transaction',
+      status: 'success' as const,
+      side_effect: 'write' as const,
+      result_summary: 'transação cancelada (id tx-888)',
+      result_keys: { transacao_id: 'tx-888' },
+      occurred_at: '2026-05-11T08:00:00Z', // later, same identity key
+    };
+    h.recentInConversation.mockResolvedValue([
+      mkAssistantMsg({
+        id: 'asst-cancel-r3c',
+        conteudo: 'Cancelei conforme pedido.',
+        ferramentas_chamadas: [laterCancel],
+        created_at: new Date('2026-05-11T08:00:00Z'),
+        processada_em: new Date('2026-05-11T08:00:00Z'),
+      }),
+      mkAssistantMsg({
+        id: 'asst-stale-r3c',
+        conteudo: 'Não consegui registrar a transação — backend retornou erro.',
+        ferramentas_chamadas: [staleSuccess],
+        created_at: new Date('2026-05-10T10:00:00Z'),
+        processada_em: new Date('2026-05-10T10:00:00Z'),
+      }),
+      mkInbound({ created_at: new Date('2026-05-11T15:00:00Z') }),
+    ]);
+    const { system } = await build({
+      inbound: mkInbound({ created_at: new Date('2026-05-11T15:00:00Z') }),
+    });
+    // The stale register_transaction must be suppressed (same identity key).
+    expect(system).not.toContain('transação registrada (id tx-888)');
+    expect(system).not.toMatch(/Hist[oó]rico.*verificar antes/i);
+  });
+});
+
 describe('prompt-builder — raw conversation history preserved', () => {
   it('leaves assistant message conteudo unchanged in the messages array (no rewrite/collapse)', async () => {
     const summary = {

@@ -339,24 +339,116 @@ type ContradictionBuckets = {
 };
 
 /**
- * Returns true when two result_keys objects share at least one key with
- * the SAME value. Used to detect when a later event (cancel/correction)
- * supersedes an older stale entry for the same logical resource.
+ * Round-3 fix [medium]: tool-specific identity keys for supersession matching.
+ *
+ * `resultKeysOverlap` used to return true on ANY single shared key/value.
+ * That caused false positives: two unrelated reminders sharing the same
+ * `scheduled_for` timestamp (a non-identity timestamp) would be treated as
+ * the same resource, suppressing a valid stale warning.
+ *
+ * Fix: define which keys ARE the identity for each known tool. Overlap is
+ * declared only when ALL identity keys for the tool match in both entries.
+ * Unknown tools fall back to OR-mode (any shared key) — conservative, errs
+ * on the side of suppression which is safer than showing stale ghost entries.
  */
-function resultKeysOverlap(a: ToolExecutionSummary['result_keys'], b: ToolExecutionSummary['result_keys']): boolean {
+const IDENTITY_KEYS_BY_TOOL: Record<string, string[]> = {
+  register_transaction: ['transacao_id'],
+  update_transaction: ['transacao_id'],
+  cancel_transaction: ['transacao_id'],
+  classify_transaction: ['transacao_id'],
+  schedule_reminder: ['series_id', 'occurrence_id'],
+  cancel_reminder: ['series_id'],
+  set_reminder: ['lembrete_id', 'series_id'],
+  cancel_reminder_occurrence: ['occurrence_id'],
+  start_recurring_outreach: ['series_id'],
+  start_recurring_payment: ['series_id'],
+  ask_pending_question: ['pending_question_id'],
+  generate_report: ['fileName'],
+};
+
+function keyValueStr(keys: ToolExecutionSummary['result_keys'], key: string): string | undefined {
+  if (!keys || !(key in keys)) return undefined;
+  const v = keys[key];
+  return Array.isArray(v) ? (v as (string | number)[]).join(',') : String(v);
+}
+
+/**
+ * Returns true when two result_keys objects represent the same logical resource
+ * for a given tool, based on tool-specific identity keys.
+ *
+ * - For known tools: ALL identity keys present in both entries must match.
+ *   If an identity key is absent from either entry, it is skipped (partial
+ *   identity is treated as non-overlapping for that key dimension).
+ * - For unknown tools: falls back to OR-mode (any shared key/value match) —
+ *   conservative, avoids showing ghost entries for unregistered tools.
+ */
+function resultKeysOverlap(
+  a: ToolExecutionSummary['result_keys'],
+  b: ToolExecutionSummary['result_keys'],
+  toolName?: string,
+): boolean {
   if (!a || !b) return false;
+
+  const identityKeys = toolName ? IDENTITY_KEYS_BY_TOOL[toolName] : undefined;
+
+  if (identityKeys && identityKeys.length > 0) {
+    // Tool-specific mode: find identity keys present in BOTH entries.
+    const matchableKeys = identityKeys.filter(
+      (k) => k in a && k in b,
+    );
+    // If no identity keys are shared by both entries, they can't be the same resource.
+    if (matchableKeys.length === 0) return false;
+    // ALL matchable identity keys must have the same value.
+    return matchableKeys.every((k) => {
+      const va = keyValueStr(a, k);
+      const vb = keyValueStr(b, k);
+      return va !== undefined && vb !== undefined && va === vb;
+    });
+  }
+
+  // Fallback for unknown tools: any shared key/value match (original OR-mode).
   for (const key of Object.keys(a)) {
     if (key in b) {
-      // Compare as strings to avoid type coercion surprises.
-      const va = Array.isArray(a[key]) ? (a[key] as (string | number)[]).join(',') : String(a[key]);
-      const vb = Array.isArray(b[key]) ? (b[key] as (string | number)[]).join(',') : String(b[key]);
-      if (va === vb) return true;
+      const va = keyValueStr(a, key);
+      const vb = keyValueStr(b, key);
+      if (va !== undefined && vb !== undefined && va === vb) return true;
     }
   }
   return false;
 }
 
 function detectContradictions(turns: AssistantTurn[], now: number): ContradictionBuckets {
+  // Round-3 fix [high]: build the full allSummaries index FIRST so supersession
+  // can be evaluated BEFORE bucket assignment. Previously this was only done
+  // for stale entries, meaning fresh contradictions were pushed to the
+  // authoritative bucket without checking whether a later event cancelled them.
+  const allSummaries: Array<{ s: ToolExecutionSummary; turnOccurredMs: number }> = [];
+  for (const t of turns) {
+    for (const s of t.summaries) {
+      const ms = Date.parse(s.occurred_at);
+      if (Number.isFinite(ms)) allSummaries.push({ s, turnOccurredMs: ms });
+    }
+  }
+
+  /**
+   * Returns true when the candidate has been superseded by a LATER event
+   * that references the same logical resource (tool-specific identity match).
+   * Applied to BOTH fresh and stale candidates before bucket assignment.
+   */
+  function isSuperseded(candidate: ToolExecutionSummary): boolean {
+    const candidateMs = Date.parse(candidate.occurred_at);
+    if (!Number.isFinite(candidateMs)) return false; // can't determine order
+    if (!candidate.result_keys || Object.keys(candidate.result_keys).length === 0) return false;
+    return allSummaries.some(
+      ({ s, turnOccurredMs }) =>
+        turnOccurredMs > candidateMs &&
+        s.tool_call_id !== candidate.tool_call_id &&
+        // Round-3 fix [medium]: pass tool_name so identity matching uses
+        // IDENTITY_KEYS_BY_TOOL instead of any-key OR-mode.
+        resultKeysOverlap(candidate.result_keys, s.result_keys, candidate.tool_name),
+    );
+  }
+
   const fresh: ToolExecutionSummary[] = [];
   const staleRaw: ToolExecutionSummary[] = [];
 
@@ -379,6 +471,11 @@ function detectContradictions(turns: AssistantTurn[], now: number): Contradictio
       const lower = text.toLowerCase();
       const matched = kws.some((kw) => lower.includes(kw.toLowerCase()));
       if (!matched) continue;
+
+      // Round-3 fix [high]: check supersession BEFORE assigning to any bucket.
+      // A fresh entry cancelled by a later event must not appear as authoritative.
+      if (isSuperseded(s)) continue;
+
       if (isExpired) {
         // Round-1 fix #2 / Round-2 refinement: stale entries go to a
         // lower-authority bucket (rendered separately, not as authoritative).
@@ -389,30 +486,11 @@ function detectContradictions(turns: AssistantTurn[], now: number): Contradictio
     }
   }
 
-  // Round-2 fix: for each stale candidate, check whether ANY LATER event
-  // across ALL turns shares at least one result_key value with it — indicating
-  // a cancel, correction, or supersession. If found, suppress the stale entry.
-  const allSummaries: Array<{ s: ToolExecutionSummary; turnOccurredMs: number }> = [];
-  for (const t of turns) {
-    for (const s of t.summaries) {
-      const ms = Date.parse(s.occurred_at);
-      if (Number.isFinite(ms)) allSummaries.push({ s, turnOccurredMs: ms });
-    }
-  }
-
-  const stale: ToolExecutionSummary[] = staleRaw.filter((candidate) => {
-    const candidateMs = Date.parse(candidate.occurred_at);
-    if (!Number.isFinite(candidateMs)) return true; // keep if timestamp unparseable
-    if (!candidate.result_keys || Object.keys(candidate.result_keys).length === 0) return true;
-    // Suppress if a LATER event (any tool, any status) overlaps result_keys.
-    const superseded = allSummaries.some(
-      ({ s, turnOccurredMs }) =>
-        turnOccurredMs > candidateMs &&
-        s.tool_call_id !== candidate.tool_call_id &&
-        resultKeysOverlap(candidate.result_keys, s.result_keys),
-    );
-    return !superseded;
-  });
+  // Round-2 / Round-3: stale bucket still filtered for supersession.
+  // (isSuperseded above already handles this for candidates that passed the
+  // domain-keyword gate, but we keep the staleRaw → stale pass for clarity
+  // and as a defense-in-depth layer.)
+  const stale: ToolExecutionSummary[] = staleRaw.filter((candidate) => !isSuperseded(candidate));
 
   return { fresh, stale };
 }
