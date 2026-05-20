@@ -44,7 +44,7 @@ afterAll(async () => {
 // is updated to import from 'pdfmake/js/printer.js'. Skipped pending fix.
 // requires docker-compose: no (blocked by production bug, not infra)
 describe('generateComparativoPdf', () => {
-  it.skip('produces valid PDF with rows per entidade and a consolidado row in summary', async () => {
+  it('produces valid PDF with rows per entidade and a consolidado row in summary', async () => {
     const { generateComparativoPdf } = await import('../../src/lib/pdf/comparativo.js');
     const result = await generateComparativoPdf({
       ownerName: 'Owner',

@@ -110,7 +110,7 @@ describe('generate_report — extrato handler', () => {
   // which is undefined at runtime (pdfmake/js/index.js exports an instance, not
   // a class). Handler silently returns { error: 'pdf_generation_failed' } so
   // mimetype is undefined. Skipped until _helpers.ts is fixed.
-  it.skip('produces a valid PDF with summary on happy path', async () => {
+  it('produces a valid PDF with summary on happy path', async () => {
     const eUuid = '00000000-0000-0000-0000-00000000000e';
     const ctxWithE = { ...ctx, scope: { entidades: [eUuid], byEntity: new Map() } };
     entidadeById.mockResolvedValue({ id: eUuid, nome: 'Empresa Teste' });
@@ -166,7 +166,7 @@ describe('generate_report — comparativo handler', () => {
 
   // TODO(production-regression): same pdfmake constructor issue as above.
   // Skipped until src/lib/pdf/_helpers.ts is fixed.
-  it.skip('happy path: 2 entidades produces valid PDF', async () => {
+  it('happy path: 2 entidades produces valid PDF', async () => {
     entidadesByIds.mockResolvedValue([
       { id: 'e1', nome: 'A' }, { id: 'e2', nome: 'B' },
     ]);

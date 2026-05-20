@@ -55,6 +55,15 @@ import { buildPromptFromPacket } from '@/runtime/prompt/build-prompt-from-packet
 import { createDecisionPacketStub } from '@/runtime/context-packet/decision-packet-stub.js';
 import { getProductionBuilderSet } from '@/runtime/context-packet/production-builder-set.js';
 import type { BaseContextPacket } from '@/runtime/context-packet/types.js';
+// P9b — Decision Engine hot-path wiring
+import {
+  runDecisionEngineForTurn,
+  DecisionEngineFailClosedError,
+} from '@/runtime/decision/integration.js';
+import {
+  buildBaseContextPacketFromTurn,
+  applyToolReductions,
+} from '@/runtime/decision/build-base-context.js';
 
 const TYPING_DEBOUNCE_MS = 1500;
 
@@ -784,7 +793,92 @@ async function runAgentForMensagemInner(
     messages = legacy.messages;
   }
 
-  const tools = getToolSchemas(scope.byEntity);
+  let tools = getToolSchemas(scope.byEntity);
+
+  // P9b — Decision Engine gate: runs BEFORE the LLM call.
+  // Flag OFF (default) → zero behaviour change.
+  // Flag ON → engine gates the turn; tool_reductions applied to toolSet.
+  try {
+    const baseCtx = buildBaseContextPacketFromTurn({
+      inbound,
+      conversa: c,
+      pessoa,
+      tenant_id: tenantId,
+      agent_id: getCurrentAgent(),
+      channel_id,
+      active_procedure_execution_id: activeExecution?.id ?? null,
+    });
+    const deResult = await runDecisionEngineForTurn(baseCtx);
+    if (deResult.engine_ran && deResult.result) {
+      const { packet, block } = deResult.result;
+
+      // Honor decision outcome: block and approval flows short-circuit the turn.
+      if (block) {
+        // 'block' or 'escalate' from a PEP → reply to user and skip LLM
+        const blockMsg =
+          block.user_facing_message ??
+          'Esta ação não está disponível no momento. Em caso de dúvidas, entre em contato.';
+        await sendOutbound(pessoa.id, c.id, blockMsg, inbound.id).catch((err) =>
+          logger.warn({ err: (err as Error).message }, 'agent.decision_engine.blocked_reply_failed'),
+        );
+        await markAllProcessed(0);
+        await conversasRepo.touch(c.id);
+        await clearDebounceState(pessoa.telefone_whatsapp);
+        return;
+      }
+
+      // action_mode='escalate' without a hard block → still escalate (dual-approval path)
+      if (packet.action_mode === 'escalate') {
+        const escalateMsg =
+          'Esta ação requer aprovação adicional. O responsável será notificado.';
+        await sendOutbound(pessoa.id, c.id, escalateMsg, inbound.id).catch((err) =>
+          logger.warn({ err: (err as Error).message }, 'agent.decision_engine.escalate_reply_failed'),
+        );
+        await markAllProcessed(0);
+        await conversasRepo.touch(c.id);
+        await clearDebounceState(pessoa.telefone_whatsapp);
+        return;
+      }
+
+      // action_mode='ask_clarification' → surface as user-facing message and skip LLM
+      // This covers budget-fallback and skill-not-found paths.
+      if (packet.action_mode === 'ask_clarification') {
+        const clarifyMsg = 'Pode me dar mais detalhes sobre o que você precisa?';
+        await sendOutbound(pessoa.id, c.id, clarifyMsg, inbound.id).catch((err) =>
+          logger.warn({ err: (err as Error).message }, 'agent.decision_engine.clarify_reply_failed'),
+        );
+        await markAllProcessed(0);
+        await conversasRepo.touch(c.id);
+        await clearDebounceState(pessoa.telefone_whatsapp);
+        return;
+      }
+
+      // 'respond', 'call_tool', 'continue_workflow' → proceed to LLM with
+      // possibly-reduced toolSet.
+      if (packet.tool_permissions.blocked_tools.length > 0) {
+        tools = applyToolReductions(tools, packet.tool_permissions);
+      }
+    }
+  } catch (err) {
+    if (err instanceof DecisionEngineFailClosedError) {
+      // fail-closed: engine errored and FEATURE_DECISION_ENGINE_ERROR_FALLBACK='fail-closed'
+      // → block the turn, reply to user, skip LLM
+      const failMsg = 'Sistema indisponível temporariamente. Tente novamente em alguns instantes.';
+      await sendOutbound(pessoa.id, c.id, failMsg, inbound.id).catch((e) =>
+        logger.warn({ err: (e as Error).message }, 'agent.decision_engine.fail_closed_reply_failed'),
+      );
+      await markAllProcessed(0);
+      await conversasRepo.touch(c.id);
+      await clearDebounceState(pessoa.telefone_whatsapp);
+      return;
+    }
+    // Unexpected error from the wiring itself (not the engine) → warn and continue
+    logger.warn(
+      { err: (err as Error).message },
+      'agent.decision_engine.wiring_error_continuing',
+    );
+  }
+
   // Use the JID the inbound message arrived on so replies stay on the same
   // thread — critical when WhatsApp routes via `@lid` (privacy IDs) instead
   // of the raw `phone@s.whatsapp.net` form. Falls back to phone-derived JID.

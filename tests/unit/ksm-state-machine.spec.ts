@@ -258,7 +258,9 @@ describe('P10a KnowledgeStateMachine.propose — appends initial transition with
     expect(first.decided_by).toBe('state_machine_propose');
     expect(first.risk_score).toBeDefined();
     expect(first.risk_score?.level).toBe('low');
-    expect(first.risk_score?.source).toBe('stub:p10a');
+    // P9c wiring: stub replaced — source is now 'p9c:knowledge' (not 'stub:p10a').
+    expect(first.risk_score?.source).not.toBe('stub:p10a');
+    expect(first.risk_score?.source).toBe('p9c:knowledge');
     expect(first.reason).toContain('risk=low');
     expect(first.reason).toContain('kind=fact');
   });

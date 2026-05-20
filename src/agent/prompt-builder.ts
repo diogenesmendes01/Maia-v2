@@ -117,6 +117,16 @@ const POSITIVE_CONFIRMATION_RE =
 const EVENTS_BLOCK_MAX_ITEMS = 5;
 const EVENTS_BLOCK_WINDOW_MS = 24 * 60 * 60 * 1000;
 
+// Issue #136 — TTL guard for contradiction overlay (Superpowers I1).
+// Only surface a contradiction if the resolving successful event is recent.
+// Configurable via env for future tuning; defaults to 24h.
+const CONTRADICTION_OVERLAY_TTL_HOURS = (() => {
+  const raw = process.env.CONTRADICTION_OVERLAY_TTL_HOURS;
+  const parsed = raw ? Number(raw) : NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 24;
+})();
+const CONTRADICTION_OVERLAY_TTL_MS = CONTRADICTION_OVERLAY_TTL_HOURS * 60 * 60 * 1000;
+
 /**
  * Sanitizes user-supplied text and wraps it in <user_message> tags so the
  * LLM treats the content as data rather than instruction.
@@ -233,30 +243,61 @@ function selectEventsForBlock(
   turns: AssistantTurn[],
   now: number,
 ): ToolExecutionSummary[] {
-  const successOnly: ToolExecutionSummary[] = [];
-  for (const t of turns) {
-    for (const s of t.summaries) {
-      if (s.status !== 'success') continue;
-      const occurredMs = Date.parse(s.occurred_at);
-      if (!Number.isFinite(occurredMs)) continue;
-      if (now - occurredMs > EVENTS_BLOCK_WINDOW_MS) continue;
-      successOnly.push(s);
-    }
-  }
-
   // Most recent first, side-effect priority (write/communication > read).
   const priorityRank = (s: ToolExecutionSummary): number => {
     if (s.side_effect === 'write' || s.side_effect === 'communication') return 0;
     if (s.side_effect === 'read') return 1;
     return 2;
   };
-  successOnly.sort((a, b) => {
-    const r = priorityRank(a) - priorityRank(b);
-    if (r !== 0) return r;
-    return Date.parse(b.occurred_at) - Date.parse(a.occurred_at);
-  });
 
-  return successOnly.slice(0, EVENTS_BLOCK_MAX_ITEMS);
+  // Identify the most-recent assistant turn by message timestamp.
+  // collectPriorAssistantTurns returns messages from recentInConversation which
+  // lists newest-first, so turns[0] is the most recent.
+  const firstTurn = turns[0];
+  const latestTurnCreatedAt = firstTurn
+    ? (firstTurn.message.created_at?.getTime() ?? 0)
+    : 0;
+
+  // Round-1 fix #1: pin ONLY write/communication successes from the latest turn.
+  // Read successes from the latest turn fall into the global pool and compete
+  // with older events on priority rank (writes > reads). This prevents a
+  // read-heavy latest turn from consuming all budget slots and evicting
+  // confirmed writes from older turns.
+  const pinnedLatestEvents: ToolExecutionSummary[] = [];
+  const globalPoolEvents: ToolExecutionSummary[] = [];
+
+  for (const t of turns) {
+    const turnCreatedAt = t.message.created_at?.getTime() ?? 0;
+    const isLatestTurn = turnCreatedAt === latestTurnCreatedAt;
+    for (const s of t.summaries) {
+      if (s.status !== 'success') continue;
+      const occurredMs = Date.parse(s.occurred_at);
+      if (!Number.isFinite(occurredMs)) continue;
+      if (now - occurredMs > EVENTS_BLOCK_WINDOW_MS) continue;
+      if (isLatestTurn && (s.side_effect === 'write' || s.side_effect === 'communication')) {
+        // Durable side effects from the latest turn are pinned unconditionally
+        // (Issue #137 / Codex C3: no cap on same-turn write/communication successes).
+        pinnedLatestEvents.push(s);
+      } else {
+        // Read successes from the latest turn AND all events from older turns
+        // compete globally — writes/communications rank above reads.
+        globalPoolEvents.push(s);
+      }
+    }
+  }
+
+  const sortEvents = (arr: ToolExecutionSummary[]): ToolExecutionSummary[] =>
+    [...arr].sort((a, b) => {
+      const r = priorityRank(a) - priorityRank(b);
+      if (r !== 0) return r;
+      return Date.parse(b.occurred_at) - Date.parse(a.occurred_at);
+    });
+
+  const sortedPinned = sortEvents(pinnedLatestEvents);
+  const remainingSlots = Math.max(0, EVENTS_BLOCK_MAX_ITEMS - sortedPinned.length);
+  const sortedPool = sortEvents(globalPoolEvents).slice(0, remainingSlots);
+
+  return [...sortedPinned, ...sortedPool];
 }
 
 function renderEventsBlock(events: ToolExecutionSummary[]): string {
@@ -273,8 +314,144 @@ function renderEventsBlock(events: ToolExecutionSummary[]): string {
   return ['## Eventos confirmados pelo backend', ...lines].join('\n');
 }
 
-function detectContradictions(turns: AssistantTurn[]): ToolExecutionSummary[] {
-  const overlays: ToolExecutionSummary[] = [];
+/**
+ * Round-2 review fix: split contradiction detection results into fresh
+ * (< TTL, authoritative) and stale (>= TTL, historical/lower-authority).
+ *
+ * Round-1 review fix #2 context: durable side effects (write/communication)
+ * must never be silently forgotten after TTL. They are now surfaced in a
+ * SEPARATE lower-authority section so the model doesn't treat old side
+ * effects as current authoritative truth (which could suppress retries or
+ * claim canceled/corrected actions are still operative).
+ *
+ * STALE_SUCCESS_MARKER is kept for internal tagging during detection only;
+ * it never reaches the rendered prompt — the renderer dispatches by bucket.
+ */
+const STALE_SUCCESS_MARKER = '__stale_success__';
+
+/**
+ * Output shape from detectContradictions — two distinct buckets so the
+ * renderer can emit authoritative vs lower-authority sections separately.
+ */
+type ContradictionBuckets = {
+  fresh: ToolExecutionSummary[];
+  stale: ToolExecutionSummary[];
+};
+
+/**
+ * Round-3 fix [medium]: tool-specific identity keys for supersession matching.
+ *
+ * `resultKeysOverlap` used to return true on ANY single shared key/value.
+ * That caused false positives: two unrelated reminders sharing the same
+ * `scheduled_for` timestamp (a non-identity timestamp) would be treated as
+ * the same resource, suppressing a valid stale warning.
+ *
+ * Fix: define which keys ARE the identity for each known tool. Overlap is
+ * declared only when ALL identity keys for the tool match in both entries.
+ * Unknown tools fall back to OR-mode (any shared key) — conservative, errs
+ * on the side of suppression which is safer than showing stale ghost entries.
+ */
+const IDENTITY_KEYS_BY_TOOL: Record<string, string[]> = {
+  register_transaction: ['transacao_id'],
+  update_transaction: ['transacao_id'],
+  cancel_transaction: ['transacao_id'],
+  classify_transaction: ['transacao_id'],
+  schedule_reminder: ['series_id', 'occurrence_id'],
+  cancel_reminder: ['series_id'],
+  set_reminder: ['lembrete_id', 'series_id'],
+  cancel_reminder_occurrence: ['occurrence_id'],
+  start_recurring_outreach: ['series_id'],
+  start_recurring_payment: ['series_id'],
+  ask_pending_question: ['pending_question_id'],
+  generate_report: ['fileName'],
+};
+
+function keyValueStr(keys: ToolExecutionSummary['result_keys'], key: string): string | undefined {
+  if (!keys || !(key in keys)) return undefined;
+  const v = keys[key];
+  return Array.isArray(v) ? (v as (string | number)[]).join(',') : String(v);
+}
+
+/**
+ * Returns true when two result_keys objects represent the same logical resource
+ * for a given tool, based on tool-specific identity keys.
+ *
+ * - For known tools: ALL identity keys present in both entries must match.
+ *   If an identity key is absent from either entry, it is skipped (partial
+ *   identity is treated as non-overlapping for that key dimension).
+ * - For unknown tools: falls back to OR-mode (any shared key/value match) —
+ *   conservative, avoids showing ghost entries for unregistered tools.
+ */
+function resultKeysOverlap(
+  a: ToolExecutionSummary['result_keys'],
+  b: ToolExecutionSummary['result_keys'],
+  toolName?: string,
+): boolean {
+  if (!a || !b) return false;
+
+  const identityKeys = toolName ? IDENTITY_KEYS_BY_TOOL[toolName] : undefined;
+
+  if (identityKeys && identityKeys.length > 0) {
+    // Tool-specific mode: find identity keys present in BOTH entries.
+    const matchableKeys = identityKeys.filter(
+      (k) => k in a && k in b,
+    );
+    // If no identity keys are shared by both entries, they can't be the same resource.
+    if (matchableKeys.length === 0) return false;
+    // ALL matchable identity keys must have the same value.
+    return matchableKeys.every((k) => {
+      const va = keyValueStr(a, k);
+      const vb = keyValueStr(b, k);
+      return va !== undefined && vb !== undefined && va === vb;
+    });
+  }
+
+  // Fallback for unknown tools: any shared key/value match (original OR-mode).
+  for (const key of Object.keys(a)) {
+    if (key in b) {
+      const va = keyValueStr(a, key);
+      const vb = keyValueStr(b, key);
+      if (va !== undefined && vb !== undefined && va === vb) return true;
+    }
+  }
+  return false;
+}
+
+function detectContradictions(turns: AssistantTurn[], now: number): ContradictionBuckets {
+  // Round-3 fix [high]: build the full allSummaries index FIRST so supersession
+  // can be evaluated BEFORE bucket assignment. Previously this was only done
+  // for stale entries, meaning fresh contradictions were pushed to the
+  // authoritative bucket without checking whether a later event cancelled them.
+  const allSummaries: Array<{ s: ToolExecutionSummary; turnOccurredMs: number }> = [];
+  for (const t of turns) {
+    for (const s of t.summaries) {
+      const ms = Date.parse(s.occurred_at);
+      if (Number.isFinite(ms)) allSummaries.push({ s, turnOccurredMs: ms });
+    }
+  }
+
+  /**
+   * Returns true when the candidate has been superseded by a LATER event
+   * that references the same logical resource (tool-specific identity match).
+   * Applied to BOTH fresh and stale candidates before bucket assignment.
+   */
+  function isSuperseded(candidate: ToolExecutionSummary): boolean {
+    const candidateMs = Date.parse(candidate.occurred_at);
+    if (!Number.isFinite(candidateMs)) return false; // can't determine order
+    if (!candidate.result_keys || Object.keys(candidate.result_keys).length === 0) return false;
+    return allSummaries.some(
+      ({ s, turnOccurredMs }) =>
+        turnOccurredMs > candidateMs &&
+        s.tool_call_id !== candidate.tool_call_id &&
+        // Round-3 fix [medium]: pass tool_name so identity matching uses
+        // IDENTITY_KEYS_BY_TOOL instead of any-key OR-mode.
+        resultKeysOverlap(candidate.result_keys, s.result_keys, candidate.tool_name),
+    );
+  }
+
+  const fresh: ToolExecutionSummary[] = [];
+  const staleRaw: ToolExecutionSummary[] = [];
+
   for (const t of turns) {
     const text = t.message.conteudo ?? '';
     if (!text) continue;
@@ -286,28 +463,72 @@ function detectContradictions(turns: AssistantTurn[]): ToolExecutionSummary[] {
     for (const s of t.summaries) {
       if (s.status !== 'success') continue;
       if (s.side_effect !== 'write' && s.side_effect !== 'communication') continue;
+      const occurredMs = Date.parse(s.occurred_at);
+      const isExpired =
+        Number.isFinite(occurredMs) && now - occurredMs > CONTRADICTION_OVERLAY_TTL_MS;
       const kws = DOMAIN_KEYWORDS[s.tool_name];
       if (!kws || kws.length === 0) continue;
       const lower = text.toLowerCase();
       const matched = kws.some((kw) => lower.includes(kw.toLowerCase()));
-      if (matched) overlays.push(s);
+      if (!matched) continue;
+
+      // Round-3 fix [high]: check supersession BEFORE assigning to any bucket.
+      // A fresh entry cancelled by a later event must not appear as authoritative.
+      if (isSuperseded(s)) continue;
+
+      if (isExpired) {
+        // Round-1 fix #2 / Round-2 refinement: stale entries go to a
+        // lower-authority bucket (rendered separately, not as authoritative).
+        staleRaw.push(s);
+      } else {
+        fresh.push(s);
+      }
     }
   }
-  return overlays;
+
+  // Round-2 / Round-3: stale bucket still filtered for supersession.
+  // (isSuperseded above already handles this for candidates that passed the
+  // domain-keyword gate, but we keep the staleRaw → stale pass for clarity
+  // and as a defense-in-depth layer.)
+  const stale: ToolExecutionSummary[] = staleRaw.filter((candidate) => !isSuperseded(candidate));
+
+  return { fresh, stale };
 }
 
-function renderContradictionOverlay(overlays: ToolExecutionSummary[]): string {
-  if (overlays.length === 0) return '';
-  const items = overlays.map(
-    (s) =>
-      `- ${s.tool_name} (${s.side_effect}): ${s.result_summary}. Sua afirmação contraditória anterior está obsoleta.`,
-  );
-  return [
-    '## ⚠ Conflito detectado em turno anterior',
-    'Você escreveu uma mensagem de falha, mas o backend confirmou sucesso para a(s) tool(s) abaixo.',
-    'Trate a afirmação contraditória anterior como inválida. A verdade é o evento do backend:',
-    ...items,
-  ].join('\n');
+function renderContradictionOverlay({ fresh, stale }: ContradictionBuckets): string {
+  const parts: string[] = [];
+
+  if (fresh.length > 0) {
+    const items = fresh.map(
+      (s) =>
+        `- ${s.tool_name} (${s.side_effect}): ${s.result_summary}. Sua afirmação contraditória anterior está obsoleta.`,
+    );
+    parts.push(
+      [
+        '## ⚠ Contradições do backend (autoritativo)',
+        'Você escreveu uma mensagem de falha, mas o backend confirmou sucesso para a(s) tool(s) abaixo.',
+        'Trate a afirmação contraditória anterior como inválida. A verdade é o evento do backend:',
+        ...items,
+      ].join('\n'),
+    );
+  }
+
+  if (stale.length > 0) {
+    const items = stale.map((s) => {
+      const dateLabel = s.occurred_at.slice(0, 10); // YYYY-MM-DD
+      return `- ${s.tool_name} (${s.side_effect}) em ${dateLabel}: ${s.result_summary} — faça uma leitura atualizada antes de agir (não autoritativo).`;
+    });
+    parts.push(
+      [
+        '## Histórico — verificar antes de repetir (não autoritativo)',
+        'Os eventos abaixo ocorreram há mais de 24h. Não os trate como verdade atual.',
+        'Execute uma leitura atualizada (fresh read) antes de decidir repetir ou descartar a ação.',
+        ...items,
+      ].join('\n'),
+    );
+  }
+
+  return parts.join('\n\n');
 }
 
 /**
@@ -655,7 +876,7 @@ ${stateJson}`;
   const events = selectEventsForBlock(priorAssistantTurns, nowMs);
   const eventsBlock = renderEventsBlock(events);
 
-  const overlays = detectContradictions(priorAssistantTurns);
+  const overlays = detectContradictions(priorAssistantTurns, nowMs);
   const overlayBlock = renderContradictionOverlay(overlays);
 
   const systemSections: string[] = [
@@ -771,6 +992,8 @@ export const _internal = {
   POSITIVE_CONFIRMATION_RE,
   EVENTS_BLOCK_MAX_ITEMS,
   EVENTS_BLOCK_WINDOW_MS,
+  CONTRADICTION_OVERLAY_TTL_HOURS,
+  CONTRADICTION_OVERLAY_TTL_MS,
   selectEventsForBlock,
   detectContradictions,
 };
