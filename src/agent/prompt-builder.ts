@@ -233,30 +233,63 @@ function selectEventsForBlock(
   turns: AssistantTurn[],
   now: number,
 ): ToolExecutionSummary[] {
-  const successOnly: ToolExecutionSummary[] = [];
-  for (const t of turns) {
+  // Codex C3: preserve ALL write/communication successes from the most recent
+  // assistant turn, even if their count exceeds EVENTS_BLOCK_MAX_ITEMS. The
+  // cap applies only to lower-priority events (reads, older turns) so that a
+  // batch operation (e.g. 6 schedule_reminder calls in one turn) is fully
+  // represented in the events block.
+  const [mostRecentTurn, ...olderTurns] = turns;
+
+  // Phase 1: pin all write/communication from the most recent turn.
+  const pinned: ToolExecutionSummary[] = [];
+  if (mostRecentTurn) {
+    for (const s of mostRecentTurn.summaries) {
+      if (s.status !== 'success') continue;
+      if (s.side_effect !== 'write' && s.side_effect !== 'communication') continue;
+      const occurredMs = Date.parse(s.occurred_at);
+      if (!Number.isFinite(occurredMs)) continue;
+      if (now - occurredMs > EVENTS_BLOCK_WINDOW_MS) continue;
+      pinned.push(s);
+    }
+  }
+
+  // Phase 2: collect remaining events (reads from the most recent turn +
+  // everything from older turns) within the TTL window.
+  const rest: ToolExecutionSummary[] = [];
+  if (mostRecentTurn) {
+    for (const s of mostRecentTurn.summaries) {
+      if (s.status !== 'success') continue;
+      if (s.side_effect === 'write' || s.side_effect === 'communication') continue; // already pinned
+      const occurredMs = Date.parse(s.occurred_at);
+      if (!Number.isFinite(occurredMs)) continue;
+      if (now - occurredMs > EVENTS_BLOCK_WINDOW_MS) continue;
+      rest.push(s);
+    }
+  }
+  for (const t of olderTurns) {
     for (const s of t.summaries) {
       if (s.status !== 'success') continue;
       const occurredMs = Date.parse(s.occurred_at);
       if (!Number.isFinite(occurredMs)) continue;
       if (now - occurredMs > EVENTS_BLOCK_WINDOW_MS) continue;
-      successOnly.push(s);
+      rest.push(s);
     }
   }
 
-  // Most recent first, side-effect priority (write/communication > read).
+  // Sort rest by priority then recency; fill remaining budget.
   const priorityRank = (s: ToolExecutionSummary): number => {
     if (s.side_effect === 'write' || s.side_effect === 'communication') return 0;
     if (s.side_effect === 'read') return 1;
     return 2;
   };
-  successOnly.sort((a, b) => {
+  rest.sort((a, b) => {
     const r = priorityRank(a) - priorityRank(b);
     if (r !== 0) return r;
     return Date.parse(b.occurred_at) - Date.parse(a.occurred_at);
   });
 
-  return successOnly.slice(0, EVENTS_BLOCK_MAX_ITEMS);
+  const remainingBudget = Math.max(0, EVENTS_BLOCK_MAX_ITEMS - pinned.length);
+  return [...pinned, ...rest.slice(0, remainingBudget)];
 }
 
 function renderEventsBlock(events: ToolExecutionSummary[]): string {
@@ -273,7 +306,7 @@ function renderEventsBlock(events: ToolExecutionSummary[]): string {
   return ['## Eventos confirmados pelo backend', ...lines].join('\n');
 }
 
-function detectContradictions(turns: AssistantTurn[]): ToolExecutionSummary[] {
+function detectContradictions(turns: AssistantTurn[], now: number): ToolExecutionSummary[] {
   const overlays: ToolExecutionSummary[] = [];
   for (const t of turns) {
     const text = t.message.conteudo ?? '';
@@ -286,6 +319,13 @@ function detectContradictions(turns: AssistantTurn[]): ToolExecutionSummary[] {
     for (const s of t.summaries) {
       if (s.status !== 'success') continue;
       if (s.side_effect !== 'write' && s.side_effect !== 'communication') continue;
+      // Superpowers I1: ignore stale tool results — if occurred_at is older
+      // than 24h from now, the contradiction overlay would refer to an
+      // ancient event and mislead the LLM. Apply the same TTL window as
+      // selectEventsForBlock.
+      const occurredMs = Date.parse(s.occurred_at);
+      if (!Number.isFinite(occurredMs)) continue;
+      if (now - occurredMs > EVENTS_BLOCK_WINDOW_MS) continue;
       const kws = DOMAIN_KEYWORDS[s.tool_name];
       if (!kws || kws.length === 0) continue;
       const lower = text.toLowerCase();
@@ -655,7 +695,7 @@ ${stateJson}`;
   const events = selectEventsForBlock(priorAssistantTurns, nowMs);
   const eventsBlock = renderEventsBlock(events);
 
-  const overlays = detectContradictions(priorAssistantTurns);
+  const overlays = detectContradictions(priorAssistantTurns, nowMs);
   const overlayBlock = renderContradictionOverlay(overlays);
 
   const systemSections: string[] = [

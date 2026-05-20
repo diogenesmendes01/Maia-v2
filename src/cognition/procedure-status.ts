@@ -1,4 +1,4 @@
-import { procedureDefinitionsRepo, procedureTestsRepo } from '@/db/repositories.js';
+import { procedureDefinitionsRepo, procedureTestsRepo, procedureStatusEventsRepo } from '@/db/repositories.js';
 import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import type { ProcedureDefinition, ProcedureStatusUpdate, ProcedureTest } from '@/db/schema.js';
 
@@ -104,10 +104,27 @@ export async function transitionProcedureStatus(args: {
     updates.deactivated_at = now;
   }
 
-  await procedureDefinitionsRepo.updateStatus(
+  const rowsUpdated = await procedureDefinitionsRepo.updateStatus(
     args.definition.id,
     updates as Parameters<typeof procedureDefinitionsRepo.updateStatus>[1],
   );
+
+  // P83-H5 guard: if updateStatus returns 0 the row does not belong to this
+  // tenant (tenant guard in the repo filters it out) or no longer exists.
+  // Throw instead of silently returning ok:true with stale data.
+  if (rowsUpdated === 0) {
+    throw new Error(`Procedure definition ${args.definition.id} was not updated — does not exist or belongs to another tenant`);
+  }
+
+  // P83-H2: record the status transition event so the audit trail is
+  // complete for non-active transitions (active transitions are recorded by
+  // atomicActivate above).
+  await procedureStatusEventsRepo.record({
+    definition_id: args.definition.id,
+    from_status: args.definition.status,
+    to_status: args.to,
+    actor: args.actor,
+  });
 
   return {
     ok: true,
