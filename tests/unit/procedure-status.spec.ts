@@ -43,7 +43,7 @@ vi.mock('@/db/repositories.js', async () => {
         return 0; // cross-tenant / not-found
       }),
       atomicActivate: vi.fn(
-        async (args: { target_id: string; actor: string; preserve_activated_at?: boolean }) => {
+        async (args: { target_id: string; actor: string; preserve_activated_at?: boolean; expected_from_status: string }) => {
           const target = mockState[args.target_id];
           if (!target) throw new Error('not found');
           const now = new Date();
@@ -590,6 +590,125 @@ describe('transitionProcedureStatus — D3: optimistic lock prevents silent over
 
       // State must be unchanged (rollback)
       expect(mockState['d3-race-id']?.status).toBe('draft');
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests R1, R2, R3 (round-3): atomicActivate must enforce expected_from_status.
+//
+// Race scenario: Thread A reads owned.status from DB. Thread B races and
+// advances the row to a different (possibly terminal) status. Thread A's
+// atomicActivate must detect the mismatch after locking the row and throw
+// OptimisticLockError rather than silently promoting a terminal row to active.
+//
+// R1: frozen → rolled_back race vs frozen → active   (terminal-state violation)
+// R2: proposed → draft race vs proposed → active     (status divergence)
+// R3: happy path — proposed → active with no race still succeeds (regression)
+// ---------------------------------------------------------------------------
+describe('transitionProcedureStatus — R1/R2/R3: atomicActivate expected_from_status guard [round-3]', () => {
+  beforeEach(() => {
+    for (const k of Object.keys(mockState)) delete mockState[k];
+    for (const k of Object.keys(mockTests)) delete mockTests[k];
+    mockEvents.length = 0;
+    vi.clearAllMocks();
+  });
+
+  it('R1: frozen → rolled_back race — atomicActivate throws OptimisticLockError when locked row is rolled_back but caller expected frozen', async () => {
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { procedureDefinitionsRepo } = await import('@/db/repositories.js');
+
+      // Row starts as 'frozen' (Thread A reads this via findById → owned.status = 'frozen')
+      seedDef('r1-frozen-id', 'frozen');
+
+      // Thread B races: transitions frozen → rolled_back (terminal) before Thread A's atomicActivate fires.
+      // We simulate by overriding atomicActivate to mimic the post-fix behaviour:
+      // inside the tx it re-reads status='rolled_back' but expected 'frozen' → throws.
+      (procedureDefinitionsRepo.atomicActivate as any).mockImplementationOnce(
+        async (args: { target_id: string; actor: string; preserve_activated_at?: boolean; expected_from_status: string }) => {
+          // Simulate Thread B having advanced the row to rolled_back just before the lock.
+          const lockedStatus = 'rolled_back'; // what the DB row now contains
+          if (lockedStatus !== args.expected_from_status) {
+            throw new OptimisticLockError(
+              `atomicActivate: locked row status='${lockedStatus}' does not match expected_from_status='${args.expected_from_status}' — concurrent write raced ahead`,
+            );
+          }
+          // Should never reach here in this test.
+          return { activated: mockState[args.target_id], deactivated: null };
+        },
+      );
+
+      // Caller: Thread A's definition reflects 'frozen' (matching DB at read time)
+      const def = { id: 'r1-frozen-id', status: 'frozen', nome: 'proc' } as any;
+
+      await expect(
+        transitionProcedureStatus({ definition: def, to: 'active', actor: 'thread-a' }),
+      ).rejects.toThrow(OptimisticLockError);
+
+      // Row must NOT have been promoted to active (terminal state preserved)
+      expect(mockState['r1-frozen-id']?.status).toBe('frozen');
+    });
+  });
+
+  it('R2: proposed → draft race — atomicActivate throws OptimisticLockError when locked row is draft but caller expected proposed', async () => {
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { procedureDefinitionsRepo, procedureTestsRepo } = await import('@/db/repositories.js');
+
+      // Row starts as 'proposed' (Thread A reads this → owned.status = 'proposed')
+      seedDef('r2-proposed-id', 'proposed');
+
+      // Add tests so the P3c gate does not block us before atomicActivate.
+      await procedureTestsRepo.create({ definition_id: 'r2-proposed-id', name: 'p', scenario: {}, expected_outcome: 'ok' });
+
+      // Thread B races: proposed → draft before atomicActivate fires.
+      (procedureDefinitionsRepo.atomicActivate as any).mockImplementationOnce(
+        async (args: { target_id: string; actor: string; preserve_activated_at?: boolean; expected_from_status: string }) => {
+          const lockedStatus = 'draft'; // Thread B moved it back to draft
+          if (lockedStatus !== args.expected_from_status) {
+            throw new OptimisticLockError(
+              `atomicActivate: locked row status='${lockedStatus}' does not match expected_from_status='${args.expected_from_status}' — concurrent write raced ahead`,
+            );
+          }
+          return { activated: mockState[args.target_id], deactivated: null };
+        },
+      );
+
+      const def = { id: 'r2-proposed-id', status: 'proposed', nome: 'proc' } as any;
+
+      await expect(
+        transitionProcedureStatus({ definition: def, to: 'active', actor: 'thread-a' }),
+      ).rejects.toThrow(OptimisticLockError);
+
+      // Row status must not have changed to active
+      expect(mockState['r2-proposed-id']?.status).toBe('proposed');
+    });
+  });
+
+  it('R3 (regression): happy proposed → active with no race still succeeds', async () => {
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { procedureTestsRepo } = await import('@/db/repositories.js');
+
+      seedDef('r3-happy-id', 'proposed');
+      await procedureTestsRepo.create({ definition_id: 'r3-happy-id', name: 'p', scenario: {}, expected_outcome: 'ok' });
+
+      // Default atomicActivate mock (no race) should now receive expected_from_status='proposed'
+      // and succeed normally. The default mock does NOT check expected_from_status, so this
+      // test validates: (a) the call succeeds, (b) the result is ok=true, (c) atomicActivate
+      // was called with the expected_from_status argument matching owned.status.
+      const { procedureDefinitionsRepo } = await import('@/db/repositories.js');
+
+      const def = { id: 'r3-happy-id', status: 'proposed', nome: 'proc' } as any;
+      const result = await transitionProcedureStatus({ definition: def, to: 'active', actor: 'approver' });
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.definition.status).toBe('active');
+      }
+
+      // atomicActivate must have been called with expected_from_status = 'proposed'
+      expect(procedureDefinitionsRepo.atomicActivate).toHaveBeenCalledWith(
+        expect.objectContaining({ expected_from_status: 'proposed' }),
+      );
     });
   });
 });

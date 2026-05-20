@@ -1,9 +1,13 @@
 import { eq, and } from 'drizzle-orm';
 import { procedureDefinitionsRepo, procedureTestsRepo } from '@/db/repositories.js';
+import { OptimisticLockError } from '@/db/repositories.js';
 import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import { withTx } from '@/db/client.js';
 import { procedure_definitions, procedure_status_events } from '@/db/schema.js';
 import type { ProcedureDefinition, ProcedureTest } from '@/db/schema.js';
+
+// Re-export so callers and tests can import OptimisticLockError from either location.
+export { OptimisticLockError };
 
 /**
  * Thrown when `updateStatus` returns 0 rows — meaning the procedure ID
@@ -27,18 +31,6 @@ export class StatusMismatchError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'StatusMismatchError';
-  }
-}
-
-/**
- * Thrown when a concurrent write races ahead of this call — the WHERE
- * status = owned.status predicate matched 0 rows, meaning another actor
- * already advanced the row. Callers should re-fetch and retry if appropriate.
- */
-export class OptimisticLockError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'OptimisticLockError';
   }
 }
 
@@ -155,10 +147,15 @@ export async function transitionProcedureStatus(args: {
       }
     }
     // Atomic path: locking + freeze-previous + event log in one tx.
+    // Round-3 fix: pass expected_from_status so atomicActivate can enforce
+    // an optimistic lock after re-acquiring the row lock. If a concurrent
+    // write raced ahead (e.g., proposed→frozen→rolled_back), the guard
+    // detects the mismatch and throws OptimisticLockError.
     const { activated } = await procedureDefinitionsRepo.atomicActivate({
       target_id: args.definition.id,
       actor: args.actor,
       preserve_activated_at: true,
+      expected_from_status: owned.status as ProcedureStatus,
     });
     return { ok: true, definition: activated };
   }
