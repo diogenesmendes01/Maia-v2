@@ -42,6 +42,11 @@ export type {
 
 export {
   runDecisionEngineIfEnabled,
+  runDecisionEngineForTurn,
+  getDecisionEngine,
+  _resetDecisionEngineSingleton,
+  _overrideDecisionEngineSingleton,
+  DecisionEngineFailClosedError,
   type RunDecisionEngineResult,
 } from './integration.js';
 
