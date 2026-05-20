@@ -126,7 +126,7 @@ interface DecisionPacket {
 |---|---|
 | `respond` | Fluxo normal sem tool use |
 | `call_tool` | Skill `tool_mediated` ou `decide` com tools disponíveis |
-| `ask_clarification` | Skill ausente OU confidence < 0.6 OU tools reduzidas a zero |
+| `ask_clarification` | Skill ausente OU confidence < 0.6 OU tools reduzidas a zero por policy |
 | `escalate` | Dual approval, lockdown, human review, budget fallback em tenant sensitivo |
 | `continue_workflow` | Procedure ativa em modo `continue` |
 
@@ -289,11 +289,13 @@ await tenantFeatureFlagsRepo.setOverride('tenant-x', 'decision_engine_v1', true)
    que não existiam em `allowed_tools` são ignoradas no merge (não causam erro, mas não
    aparecem em `blocked_tools`).
 
-7. **Flag OFF pula PEPs inteiramente** — quando `FEATURE_DECISION_ENGINE_V1=false`,
+7. **Flag OFF e `engine_error` pulam PEPs inteiramente** — quando `FEATURE_DECISION_ENGINE_V1=false`,
    `runDecisionEngineIfEnabled` retorna `skip_reason='flag_off'` sem avaliar PEPs.
    PEPs rodam *dentro* do engine; desativar o engine desativa os PEPs. O fallback
-   de `engine_error` (flag ON + crash inesperado) passa ao legacy path que ainda
-   executa PEPs via wrapper — mas flag OFF não aciona esse path.
+   de `engine_error` (flag ON + crash inesperado) também **não executa PEPs** —
+   retorna `{ engine_ran: false, skip_reason: 'engine_error' }` sem wrapper legado.
+   Callers DEVEM tratar `engine_ran: false` como block/escalate até um contrato
+   explícito de `engine_error` ser definido no cutover.
 
 ---
 
@@ -303,8 +305,15 @@ await tenantFeatureFlagsRepo.setOverride('tenant-x', 'decision_engine_v1', true)
 
 1. Recuperar o `trace_id` da conversa.
 2. Verificar `DecisionPacket.action_mode`:
-   - `blocked` / `escalate` → olhar `policy_decisions` no packet para o policy_id e rule_descriptor que disparou.
-   - `ask_clarification` → skill ausente ou `intent.confidence < 0.6`. Ver `rationale`.
+   - `escalate` → olhar `policy_decisions` no packet para o `policy_id` e `rule_descriptor`
+     que disparou.
+   - `ask_clarification` → pode ser skill ausente / `intent.confidence < 0.6`, **mas também**
+     pode indicar bloqueio de policy que removeu todos os tools (Mid PEP `decision='block'`
+     com zero tools restantes). Sempre verificar `policy_decisions` completo — não apenas
+     `action_mode` — para distinguir bloqueio de policy de confidence baixa.
+     (`blocked` não é um `ActionMode` válido em P9b — bloqueios do Mid PEP surfaceiam como
+     `escalate` ou, quando todos os tools foram removidos, `ask_clarification`.)
+   Ver `rationale` em ambos os casos.
 3. Verificar se Early PEP bloqueou: `channel.is_locked_down` ou tenant em lockdown global.
 
 ```sql
