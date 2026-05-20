@@ -168,8 +168,17 @@ superfície real — antes recebia preview vazio, aprovando tools que apareciam 
 **Invariante 14 (revisado):** Quando o flag está OFF, `runDecisionEngineIfEnabled`
 retorna `{ engine_ran: false, skip_reason: 'flag_off' }` **sem executar PEPs**.
 PEPs são avaliados *dentro* do engine; com o engine desativado, PEPs não rodam.
-O path de fallback para `engine_error` (flag ON + engine falha) passa para o
-legacy path, que ainda executa PEPs via wrapper — mas isso é excepcional.
+
+**`engine_error` é fail-closed — não há wrapper legado:** Se o engine lançar uma exceção
+inesperada com o flag ON, `runDecisionEngineIfEnabled` retorna
+`{ engine_ran: false, skip_reason: 'engine_error' }` e incrementa a métrica
+`decision_engine.error_fallback`. O caller recebe esse resultado e constrói um
+`DecisionPacket` stub. **Não existe wrapper legado de PEPs para `engine_error`**
+(ao contrário do que a docstring de `integration.ts` sugere — essa nota está
+desatualizada). PEPs **não rodam** em nenhum path de fallback em P9b.
+TODO(P9b-cutover): quando o engine for conectado ao hot path, definir política
+de `engine_error` explícita (block-by-default vs. permit-with-audit).
+
 Enquanto o engine não estiver conectado ao hot path, nenhum PEP roda em produção.
 
 ---
@@ -382,8 +391,11 @@ Nenhuma. Decision Engine consome tabelas existentes:
 ### Ativar o Decision Engine v1
 
 ```bash
-# 1. Validar acceptance gates
-bash scripts/p9b-acceptance-gates.sh
+# 1. Validar acceptance gates (script p9b-acceptance-gates.sh não existe — usar
+#    os comandos abaixo diretamente; criar o script está fora do escopo deste PR)
+npx vitest run src/runtime/decision-engine src/runtime/decision --no-coverage
+npx vitest run tests/integration/p9b-decision-engine --no-coverage
+npx tsc --noEmit
 
 # 2. Ativar para um tenant canário (P11 tenant overrides)
 # (ou globalmente em staging)
