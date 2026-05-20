@@ -196,13 +196,13 @@ tabelas de user-layer: `lifecycle_status`, `evidence_count`, `confidence`,
       ```
    c. **Exporte backup das colunas de lifecycle antes de dropar.**
       Cada tabela tem um schema ligeiramente diferente — use os comandos
-      exatos abaixo. `memory_entry` usa `confidence`; `agent_facts` e
-      `learned_rules` mantêm a coluna legacy `confianca` (não `confidence`).
-      Para `behavioral_hint`, confirme o nome da coluna via `\d behavioral_hint`
-      antes de rodar.
+      exatos abaixo. `memory_entry` e `behavioral_hint` usam `confidence`
+      (adicionado pela migração P8c 041). `agent_facts` e `learned_rules`
+      mantêm a coluna legacy `confianca` (não `confidence`); a migração 041
+      não adiciona `confidence` a essas tabelas.
 
       ```sql
-      -- memory_entry (coluna: confidence)
+      -- memory_entry (coluna: confidence — adicionada por 041_p8c_lifecycle_status.sql)
       \COPY (
         SELECT id, lifecycle_status, evidence_count, confidence, lifecycle_transitions
         FROM memory_entry
@@ -220,9 +220,9 @@ tabelas de user-layer: `lifecycle_status`, `evidence_count`, `confidence`,
         FROM learned_rules
       ) TO 'backup_learned_rules_lifecycle.csv' CSV HEADER;
 
-      -- behavioral_hint — verifique o nome da coluna via \d behavioral_hint
+      -- behavioral_hint (coluna: confidence — adicionada por 041_p8c_lifecycle_status.sql)
       \COPY (
-        SELECT id, lifecycle_status, evidence_count, lifecycle_transitions
+        SELECT id, lifecycle_status, evidence_count, confidence, lifecycle_transitions
         FROM behavioral_hint
       ) TO 'backup_behavioral_hint_lifecycle.csv' CSV HEADER;
       ```
@@ -259,7 +259,7 @@ tabelas de user-layer: `lifecycle_status`, `evidence_count`, `confidence`,
 
    DROP TABLE t_restore_memory;
    -- Repetir para agent_facts (coluna confianca), learned_rules (coluna confianca),
-   -- e behavioral_hint com o nome de coluna correto.
+   -- e behavioral_hint (coluna confidence).
    ```
 
    Não há replay automático de transições históricas; o KSM reconstruirá
