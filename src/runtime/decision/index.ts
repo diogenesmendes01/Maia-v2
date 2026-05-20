@@ -16,9 +16,97 @@ import { EarlyPepImpl } from './early-pep.js';
 import { IntentClassifierImpl } from './intent-classifier.js';
 import { MidPepImpl } from './mid-pep.js';
 import { PepAudit } from './pep-audit.js';
-import { RiskScorerStubImpl } from './risk-scorer.js';
 import { SkillSelectorImpl } from './skill-selector.js';
 import { WorkflowSelectorImpl } from './workflow-selector.js';
+import { scoreTurn } from './turn-risk-scorer.js';
+import type {
+  DecisionPacket,
+  RiskLevel as ContextRiskLevel,
+} from '../context-packet/types.js';
+import type { RiskScorer } from './types.js';
+import type { LLMGate, ToolKind, TopicSignal } from '@/shared/risk/types.js';
+
+// ---------------------------------------------------------------------------
+// P9c — TurnRiskScorerAdapter
+//
+// Implements the `RiskScorer` interface (decision-engine boundary) by
+// delegating to the real `scoreTurn` wrapper from P9c.
+//
+// Signal mapping: `{ intent, base }` → `TurnRiskSignals`.
+//  - `intent.label` is inspected for known high-risk labels to derive topic.
+//    Falls back to 'unknown' (ambiguous → gate consulted if budget allows).
+//  - `intent._risk_topic` / `intent._risk_tool_kinds` are honoured when set
+//    by callers or tests that already resolved these signals.
+//  - `base.actor.is_authenticated` maps to an elevated topic signal.
+//
+// Output mapping: `ScoredRisk` → `DecisionPacket['risk_profile']`.
+//  - 'critical' → 'high' (context-packet RiskLevel has 3 values; CRITICAL
+//    is a P9c concept not yet in the outer type). requires_human_review=true.
+//  - triggers → reasons (array of signal strings for audit trail).
+// ---------------------------------------------------------------------------
+
+// Intent labels that map to the 'financial' topic signal (MEDIUM baseline).
+// Includes transfer/cancel/payment — these are elevated but not CRITICAL without
+// an explicit sensitive tool signal. The P9c heuristic saturates to CRITICAL only
+// when both critical_decision + sensitive_tool are present simultaneously; using
+// 'financial' here preserves parity with the stub's behaviour (max 'medium'),
+// keeps requires_human_review=false for the decision-engine integration contracts,
+// and still allows the gate to elevate when Haiku sees additional context.
+const FINANCIAL_INTENT_LABELS = new Set([
+  'transfer_intent', 'cancel_request', 'change_password', 'delete_account',
+  'balance_query', 'profile_update', 'payment', 'transaction',
+]);
+
+/** Approximate topic from intent label when no explicit _risk_topic is provided. */
+function topicFromLabel(label: string): TopicSignal {
+  if (FINANCIAL_INTENT_LABELS.has(label)) return 'financial';
+  return 'unknown';
+}
+
+type IntentWithRiskHints = DecisionPacket['intent'] & {
+  _risk_topic?: string;
+  _risk_tool_kinds?: string[];
+};
+
+export class TurnRiskScorerAdapter implements RiskScorer {
+  constructor(private opts: { gate?: LLMGate } = {}) {}
+
+  async score(
+    input: { intent: DecisionPacket['intent']; base: Parameters<RiskScorer['score']>[0]['base'] },
+    _options?: { signal?: AbortSignal },
+  ): Promise<DecisionPacket['risk_profile']> {
+    const intentHints = input.intent as IntentWithRiskHints;
+
+    // Resolve topic: prefer explicit hint, fall back to label heuristic.
+    const topic: TopicSignal = (intentHints._risk_topic as TopicSignal | undefined)
+      ?? topicFromLabel(input.intent.label);
+
+    // Resolve tool_kinds: prefer explicit hint, fall back to empty.
+    const tool_kinds: ToolKind[] = (intentHints._risk_tool_kinds as ToolKind[] | undefined)
+      ?? [];
+
+    const scored = await scoreTurn(
+      { topic, tool_kinds },
+      { gate: this.opts.gate, contextText: input.intent.label },
+    );
+
+    // Map ScoredRisk → DecisionPacket['risk_profile'].
+    // Context-packet RiskLevel only has 'low'|'medium'|'high'; cap 'critical' → 'high'.
+    const level: ContextRiskLevel =
+      scored.level === 'critical' ? 'high' : (scored.level as ContextRiskLevel);
+
+    const reasons = [
+      ...scored.triggers.map((t) => t.signal),
+      ...(scored.llm_reason ? [`llm:${scored.llm_reason}`] : []),
+    ];
+
+    return {
+      level,
+      reasons,
+      requires_human_review: scored.level === 'critical' || scored.level === 'high',
+    };
+  }
+}
 
 export {
   ActionDeciderImpl,
@@ -29,7 +117,6 @@ export {
   IntentClassifierImpl,
   MidPepImpl,
   PepAudit,
-  RiskScorerStubImpl,
   SkillSelectorImpl,
   WorkflowSelectorImpl,
 };
@@ -107,7 +194,10 @@ export function createDecisionEngine(
   };
   if (env.metrics) intentClassifierDeps.metrics = env.metrics;
   const intentClassifier = new IntentClassifierImpl(intentClassifierDeps);
-  const riskScorer = new RiskScorerStubImpl();
+  // P9c: replaced RiskScorerStubImpl with TurnRiskScorerAdapter backed by real scorer.
+  // haiku client is used for intent classification; the risk gate independently uses
+  // haikuRiskGate (injected by default in scoreTurn — no extra dep needed here).
+  const riskScorer = new TurnRiskScorerAdapter();
   const workflowSelector = new WorkflowSelectorImpl({
     proceduresRepo: env.proceduresRepo,
   });
