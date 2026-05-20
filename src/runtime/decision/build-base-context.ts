@@ -78,6 +78,10 @@ export function buildBaseContextPacketFromTurn(
     active_procedure_execution_id,
     feature_flags_snapshot,
     entered_at_ms: Date.now(),
+    // Fail-open default: 0 sensitive memories. The real count is provided by
+    // BaseContextBuilder.build(); this hot-path builder lacks access to the
+    // memory resolver, so we use the conservative floor (no false floor).
+    active_sensitive_memory_count: 0,
   };
 }
 

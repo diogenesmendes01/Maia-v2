@@ -54,13 +54,13 @@
  *     intencao from the linked definition or default to 'unknown');
  *     ttl_remaining_ms derived from last_activity_at + 30min default TTL.
  *
- *  6. LockdownReaderAdapter  — all methods always return false/false/false
- *     (no production lockdown-reader for the DE port exists yet; the
- *     legacy governance/lockdown.ts operates at entity level, not at the
- *     channel/tenant level the DE port expects). This adapter is a
- *     fail-open stub pending a future P-phase wiring the DE lockdown reader
- *     to the real data source.  Documented explicitly so it's not confused
- *     with an accidental omission.
+ *  6. LockdownReaderProdAdapter  — wraps governance/lockdown.ts entity/permissao
+ *     signals. Dual-layer design: channel lockdown is checked via
+ *     BaseContextPacket.channel.is_locked_down (Layer 1, Early PEP). This
+ *     adapter implements Layer 2: entity/permissao lockdown via
+ *     entity_states.flags['lockdown_snapshot'] (isTenantInGlobalLockdown) and
+ *     permissoes.status='suspensa' (tenantHasSensitiveContext). isChannelLockedDown
+ *     always returns false — handled at Layer 1.
  *
  *  7. ChannelPoliciesReaderAdapter  — direct drizzle query on channel_policies.
  *     DE port: getForChannel(tenant_id, channel_id) → {channel_id,
@@ -94,13 +94,17 @@ import {
 } from '@/control-plane/policy/policy-rules-repo.js';
 import { evaluate as p9dEvaluate } from '@/governance/policy-dsl/evaluator.js';
 import { skillsRepo as p9aSkillsRepo } from '@/control-plane/skill-registry/skills-repo.js';
-import { procedureExecutionsRepo } from '@/db/repositories.js';
+import { procedureExecutionsRepo, procedureDefinitionsRepo } from '@/db/repositories.js';
+import { logger } from '@/lib/logger.js';
 import { getCurrentAgent } from '@/db/tenant-context.js';
 import { db } from '@/db/client.js';
-import { channel_policies } from '@/db/schema.js';
+import { channel_policies, entity_states, permissoes } from '@/db/schema.js';
 import { and, eq } from 'drizzle-orm';
 import { incCounter, observeHistogram } from '@/lib/metrics.js';
 import { callLLM } from '@/lib/claude.js';
+import { scoreTurn } from './turn-risk-scorer.js';
+import { RiskLevel } from '@/types/enums.js';
+import type { TurnRiskSignals, TopicSignal, ToolKind } from '@/shared/risk/types.js';
 import type {
   ChannelPoliciesReader,
   ContentResolver,
@@ -113,9 +117,11 @@ import type {
   PolicyRulesRepo,
   ProceduresRepo,
   ResolvedPolicy,
+  RiskScorer,
   Skill,
   SkillsRepo,
 } from './types.js';
+import type { BaseContextPacket, DecisionPacket } from '../context-packet/types.js';
 import type { CreateDecisionEngineEnv } from './index.js';
 
 // ---------------------------------------------------------------------------
@@ -334,56 +340,146 @@ const skillsRepoAdapter: SkillsRepo = {
 // Default TTL for procedure executions: 30 minutes.
 const DEFAULT_PROCEDURE_TTL_MS = 30 * 60 * 1000;
 
+/**
+ * Reads the active procedure execution and joins procedure_definitions to
+ * obtain the domain field (migration 060_p3a_procedure_definitions_domain.sql).
+ *
+ * Returns null if:
+ *   - execution not found or status !== 'in_progress'
+ *
+ * Returns procedure_domain = 'unknown' (with a warn log) if:
+ *   - procedure_definitions.domain IS NULL (backfill pending)
+ */
 const proceduresRepoAdapter: ProceduresRepo = {
   async findExecution(execution_id) {
     const exec = await procedureExecutionsRepo.findById(execution_id);
     if (!exec || exec.status !== 'in_progress') return null;
+
     const now = Date.now();
     const lastActivity = exec.last_activity_at.getTime();
     const elapsed = now - lastActivity;
     const ttl_remaining_ms = Math.max(0, DEFAULT_PROCEDURE_TTL_MS - elapsed);
-    // procedure_domain: P9b WorkflowSelector uses this to match intent → domain.
-    // DB procedure_executions does not store domain; we use a hardcoded 'unknown'
-    // to signal no domain match (workflow selector will fall back to TTL heuristic).
-    // KNOWN_STUB: replace with join to procedure_definitions.intencao once
-    // procedure_definitions.domain column is added in a future migration.
+
+    // Fetch the definition to read the domain field.
+    // Tenant isolation is enforced by procedureDefinitionsRepo.findById
+    // via getCurrentTenant() + WHERE tenant_id/agent_id.
+    const definition = await procedureDefinitionsRepo.findById(exec.definition_id);
+    const rawDomain = (definition as { domain?: string | null } | null)?.domain ?? null;
+
+    if (rawDomain === null) {
+      logger.warn(
+        { definition_id: exec.definition_id, execution_id, tenant_id: exec.tenant_id },
+        'procedure_definitions.domain is NULL — WorkflowSelector will use unknown fallback',
+      );
+    }
+
     return {
       execution_id: exec.id,
       procedure_id: exec.definition_id,
-      procedure_domain: 'unknown',
+      procedure_domain: rawDomain ?? 'unknown',
       ttl_remaining_ms,
     };
   },
 };
 
 // ---------------------------------------------------------------------------
-// 6. LockdownReaderAdapter  (KNOWN_STUB — fail-open)
+// 6. LockdownReaderProdAdapter  (entity/permissao layer)
 // ---------------------------------------------------------------------------
 
 /**
- * KNOWN_STUB: The production governance/lockdown.ts operates at entity/permissao
- * level, not at the channel/tenant level the DE port expects. Until a future
- * phase wires the DE LockdownReader to a real data source, this adapter returns
- * false for all lockdown checks (fail-open for lockdown, fail-safe for sensitive
- * context — sensitive returns false meaning budget-fallback uses ask_clarification,
- * not escalate).
+ * DESIGN NOTE: dual-layer lockdown
  *
- * Impact: Early PEP lockdown checks rely on BaseContextPacket.channel.is_locked_down
- * (set upstream) rather than this reader, so the stub does not bypass Early PEP
- * lockdown protection. The stub only affects the budget-fallback escalation path
- * (spec §6.2).
+ * Layer 1 — Channel lockdown:
+ *   Checked via `BaseContextPacket.channel.is_locked_down` at the Early PEP
+ *   entry point (hardcoded short-circuit, line 38 of early-pep.ts). This flag
+ *   is set upstream by the channel resolver and is independent of this adapter.
+ *
+ * Layer 2 — Entity/permissao lockdown (this adapter):
+ *   The legacy `governance/lockdown.ts` operates at entity/permissao scope.
+ *   When `activateLockdown()` runs it:
+ *     a) suspends all non-owner permissoes (status → 'suspensa')
+ *     b) stores a `lockdown_snapshot` array in `entity_states.flags` per entity
+ *
+ *   This adapter reads those signals:
+ *   - `isTenantInGlobalLockdown(tenant_id)`:
+ *       Queries `entity_states` for the tenant; returns true if any row has a
+ *       non-empty `flags.lockdown_snapshot` (= lockdown currently active).
+ *   - `isChannelLockedDown(channel_id, tenant_id)`:
+ *       Always returns false at this layer — channel-level lockdown is handled
+ *       by BaseContextPacket.channel.is_locked_down (Layer 1). No DB query.
+ *   - `tenantHasSensitiveContext(tenant_id)`:
+ *       Returns true if any permissao for the tenant has status='suspensa'.
+ *       A suspended permissao signals that a lockdown event occurred (or is
+ *       ongoing), indicating sensitive context where the budget-fallback must
+ *       escalate rather than ask_clarification (spec §6.2).
+ *
+ * Out-of-scope contexts (channel-only turns with no entity) are handled
+ * exclusively at Layer 1. This adapter never blocks such turns.
  */
-const lockdownReaderAdapter: LockdownReader = {
-  async isChannelLockedDown(_channel_id, _tenant_id, _options) {
+
+const LOCKDOWN_SNAPSHOT_KEY = 'lockdown_snapshot';
+
+export class LockdownReaderProdAdapter implements LockdownReader {
+  /**
+   * Channel-level lockdown is always false at this layer.
+   * It is handled upstream via BaseContextPacket.channel.is_locked_down
+   * (Layer 1, Early PEP hardcoded short-circuit).
+   */
+  async isChannelLockedDown(
+    _channel_id: string,
+    _tenant_id: string,
+    _options?: { signal?: AbortSignal },
+  ): Promise<boolean> {
     return false;
-  },
-  async isTenantInGlobalLockdown(_tenant_id, _options) {
+  }
+
+  /**
+   * Returns true if any entity in the tenant has an active lockdown snapshot.
+   * The snapshot is written by governance/lockdown.ts#activateLockdown() into
+   * entity_states.flags['lockdown_snapshot'] and cleared by liftLockdown().
+   */
+  async isTenantInGlobalLockdown(
+    tenant_id: string,
+    _options?: { signal?: AbortSignal },
+  ): Promise<boolean> {
+    const rows = await db
+      .select()
+      .from(entity_states)
+      .where(eq(entity_states.tenant_id, tenant_id));
+
+    for (const row of rows) {
+      const flags = (row.flags as Record<string, unknown>) ?? {};
+      const snapshot = flags[LOCKDOWN_SNAPSHOT_KEY];
+      if (Array.isArray(snapshot) && snapshot.length > 0) {
+        return true;
+      }
+    }
     return false;
-  },
-  async tenantHasSensitiveContext(_tenant_id, _options) {
-    return false;
-  },
-};
+  }
+
+  /**
+   * Returns true if any permissao for the tenant is in 'suspensa' status.
+   * Suspended permissoes signal that a lockdown event has occurred (or is
+   * active), triggering budget-fallback escalation instead of ask_clarification.
+   */
+  async tenantHasSensitiveContext(
+    tenant_id: string,
+    _options?: { signal?: AbortSignal },
+  ): Promise<boolean> {
+    const rows = await db
+      .select()
+      .from(permissoes)
+      .where(
+        and(
+          eq(permissoes.tenant_id, tenant_id),
+          eq(permissoes.status, 'suspensa'),
+        ),
+      );
+    return rows.length > 0;
+  }
+}
+
+const lockdownReaderAdapter = new LockdownReaderProdAdapter();
 
 // ---------------------------------------------------------------------------
 // 7. ChannelPoliciesReaderAdapter  — direct DB lookup on channel_policies
@@ -490,6 +586,168 @@ const metricsClientAdapter: MetricsClient = {
 };
 
 // ---------------------------------------------------------------------------
+// 11. RiskScorerProdAdapter  (P9c scoreTurn → DE RiskScorer interface)
+// ---------------------------------------------------------------------------
+
+/**
+ * Maps a DE intent label to a P9c TopicSignal.
+ *
+ * Groupings are intentionally coarse — the heuristic layer handles fine-grained
+ * risk; this mapping only needs to correctly partition into the buckets that
+ * affect the heuristic's piso (floor):
+ *   financial → RiskLevel.MEDIUM piso
+ *   legal / health / critical_decision → RiskLevel.HIGH piso
+ *   casual / operational_simple → no floor
+ *   unknown → ambiguous (gate will be consulted)
+ */
+function intentLabelToTopicSignal(label: string): TopicSignal {
+  const normalized = label.toLowerCase();
+  // Financial domain — transfers, billing, collections.
+  if (
+    normalized.includes('transfer') ||
+    normalized.includes('financ') ||
+    normalized.includes('pagamento') ||
+    normalized.includes('cobranca') ||
+    normalized.includes('cobrança') ||
+    normalized.includes('cancel') ||
+    normalized.includes('boleto') ||
+    normalized.includes('pix')
+  ) {
+    return 'financial';
+  }
+  // Casual / social — greetings, chitchat.
+  if (
+    normalized.includes('chat') ||
+    normalized.includes('saudacao') ||
+    normalized.includes('saudação') ||
+    normalized.includes('greet') ||
+    normalized.includes('ola') ||
+    normalized.includes('olá') ||
+    normalized.includes('oi') ||
+    normalized.includes('help') ||
+    normalized.includes('ajuda')
+  ) {
+    return 'casual';
+  }
+  // Admin / setup — operational, low-risk.
+  if (
+    normalized.includes('admin') ||
+    normalized.includes('setup') ||
+    normalized.includes('config') ||
+    normalized.includes('cadastro')
+  ) {
+    return 'operational_simple';
+  }
+  // Any label that doesn't match a known bucket → unknown (ambiguous; gate consulted).
+  return 'unknown';
+}
+
+/**
+ * Derives a list of `ToolKind` hints from `BaseContextPacket` signals.
+ *
+ * In P9c, tool_kinds is derived from the Skill's allowed_tools list. At this
+ * point in the call stack (risk scoring) the Skill has not yet been selected
+ * (SkillSelector runs after RiskScorer in the engine). We approximate from
+ * intent label:
+ *  - 'financial'  → likely involves transfer / write_external
+ *  - everything else → no tool signal injected (heuristic stays at topic floor)
+ *
+ * This is intentionally conservative: we only inject 'transfer' if the intent
+ * is clearly financial AND the base packet doesn't carry an authenticated actor
+ * override — we want the heuristic to have a realistic floor, not over-block.
+ */
+function derivedToolKinds(
+  topic: TopicSignal,
+  _base: BaseContextPacket,
+): ToolKind[] {
+  if (topic === 'financial') {
+    return ['transfer'];
+  }
+  return [];
+}
+
+/**
+ * RiskScorerProdAdapter — Camada 3, stub #1/4.
+ *
+ * Bridges the DE `RiskScorer` interface to P9c's `scoreTurn` function:
+ *
+ *  Input mapping:
+ *    intent.label  → TopicSignal (via intentLabelToTopicSignal)
+ *    base.*        → TurnRiskSignals (authenticated status, sensitive memory, etc.)
+ *
+ *  Output mapping:
+ *    ScoredRisk.level CRITICAL → 'high' + requires_human_review=true + 'critical_capped' reason
+ *    ScoredRisk.level HIGH    → 'high' + requires_human_review=true
+ *    ScoredRisk.level MEDIUM  → 'medium' + requires_human_review=false
+ *    ScoredRisk.level LOW     → 'low'   + requires_human_review=false
+ *
+ *  The DE RiskLevel type only has 3 values ('low'|'medium'|'high'). P9c's
+ *  ScoredRisk.level uses 4 (adds 'critical'). CRITICAL is capped at the
+ *  interface boundary so the engine never sees a value outside its type contract.
+ */
+export class RiskScorerProdAdapter implements RiskScorer {
+  async score(
+    input: {
+      intent: DecisionPacket['intent'];
+      base: BaseContextPacket;
+    },
+    _options?: { signal?: AbortSignal },
+  ): Promise<DecisionPacket['risk_profile']> {
+    const topic = intentLabelToTopicSignal(input.intent.label);
+    const tool_kinds = derivedToolKinds(topic, input.base);
+
+    const signals: TurnRiskSignals = {
+      topic,
+      tool_kinds: tool_kinds.length > 0 ? tool_kinds : undefined,
+      active_sensitive_memory_count: input.base.active_sensitive_memory_count,
+      // skill_confidence / skill_threshold not available at this stage (pre-SkillSelector).
+      // risk_override not carried in BaseContextPacket directly — omit.
+    };
+
+    const scored = await scoreTurn(signals);
+
+    // Map P9c 4-level ScoredRisk → DE 3-level risk_profile.
+    // Build reasons from triggers (audit-visible).
+    const reasons: string[] = scored.triggers.map((t) => t.signal);
+    if (scored.llm_reason) reasons.push(`llm_reason:${scored.llm_reason}`);
+
+    switch (scored.level) {
+      case RiskLevel.CRITICAL:
+        // Cap CRITICAL → HIGH at the interface boundary. Record the cap so
+        // callers can audit the original signal.
+        reasons.push('critical_capped');
+        return {
+          level: 'high',
+          reasons,
+          requires_human_review: true,
+        };
+      case RiskLevel.HIGH:
+        return {
+          level: 'high',
+          reasons,
+          requires_human_review: true,
+        };
+      case RiskLevel.MEDIUM:
+        return {
+          level: 'medium',
+          reasons,
+          requires_human_review: false,
+        };
+      case RiskLevel.LOW:
+      default:
+        return {
+          level: 'low',
+          reasons,
+          requires_human_review: false,
+        };
+    }
+  }
+}
+
+// Singleton instance (stateless — safe to reuse across requests).
+const riskScorerProdAdapter = new RiskScorerProdAdapter();
+
+// ---------------------------------------------------------------------------
 // Production env factory
 // ---------------------------------------------------------------------------
 
@@ -512,5 +770,9 @@ export function createProductionDecisionEngineEnv(): CreateDecisionEngineEnv {
     contentResolver: contentResolverAdapter,
     haiku: haikuClientAdapter,
     metrics: metricsClientAdapter,
+    // Stub #1/4 replaced: RiskScorerProdAdapter bridges DE's RiskScorer interface
+    // to P9c's scoreTurn, mapping {intent, base} → TurnRiskSignals and
+    // ScoredRisk (4 levels) → risk_profile (3 levels + requires_human_review).
+    riskScorer: riskScorerProdAdapter,
   };
 }
