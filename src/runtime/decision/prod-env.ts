@@ -337,11 +337,35 @@ const proceduresRepoAdapter: ProceduresRepo = {
     const lastActivity = exec.last_activity_at.getTime();
     const elapsed = now - lastActivity;
     const ttl_remaining_ms = Math.max(0, DEFAULT_PROCEDURE_TTL_MS - elapsed);
-    // procedure_domain: P9b WorkflowSelector uses this to match intent → domain.
-    // DB procedure_executions does not store domain; we use a hardcoded 'unknown'
-    // to signal no domain match (workflow selector will fall back to TTL heuristic).
-    // KNOWN_STUB: replace with join to procedure_definitions.intencao once
-    // procedure_definitions.domain column is added in a future migration.
+    // procedure_domain: P9b WorkflowSelector uses this to match intent → domain
+    // via DOMAIN_INTENT_MAP (keys: 'onboarding', 'support', 'transfer', 'cancel').
+    //
+    // BLOCKER — domain column missing from both tables (Camada 3 stub #4/4):
+    //   • procedure_executions  — no domain column (confirmed schema.ts:1016-1048)
+    //   • procedure_definitions — no domain column (confirmed schema.ts:896-956,
+    //     migration 018_p3a_procedure_definitions.sql, migrations 019-025 all clear)
+    //   • intencao (free-text prose on procedure_definitions) cannot be used as a
+    //     substitute — it is a human description, NOT a structured domain key that
+    //     maps into DOMAIN_INTENT_MAP.
+    //
+    // Returning 'unknown' means intentMatchesProcedureDomain always returns false
+    // (DOMAIN_INTENT_MAP has no 'unknown' key), so WorkflowSelector always falls
+    // back to the TTL heuristic path (continue if ttl > 30s, switch otherwise).
+    //
+    // REQUIRED FIX (out of scope for this PR — needs its own migration):
+    //   1. Add migration: ALTER TABLE procedure_definitions ADD COLUMN domain TEXT
+    //      CHECK (domain IN ('onboarding','support','transfer','cancel',…))
+    //   2. Update schema.ts procedure_definitions table to include domain field.
+    //   3. Replace this stub with a JOIN:
+    //        db.select({ ..., procedure_domain: procedure_definitions.domain })
+    //          .from(procedure_executions)
+    //          .innerJoin(procedure_definitions,
+    //            eq(procedure_executions.definition_id, procedure_definitions.id))
+    //          .where(eq(procedure_executions.id, execution_id))
+    //      Fallback: procedure_definitions.domain IS NULL → return 'unknown' + warn.
+    //   4. Add T1-T4 tests in tests/unit/decision-prod-env-procedures.spec.ts
+    //      (T1: domain read from definition JOIN; T2: null exec → null return;
+    //       T3: definition.domain IS NULL → 'unknown' + warn; T4: cross-tenant isolation).
     return {
       execution_id: exec.id,
       procedure_id: exec.definition_id,
