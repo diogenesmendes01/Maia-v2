@@ -57,16 +57,16 @@ Expected: new branch tracking origin, clean working tree.
 
 ---
 
-### Task 2: Migration 041 — `skills` table (15 columns, schema v3.1.1)
+### Task 2: Migration 043 — `skills` table (15 columns, schema v3.1.1)
 
 **Files:**
-- Create: `migrations/041_p9a_skills.sql`
-- Create: `migrations/041_p9a_skills_down.sql`
+- Create: `migrations/043_p9a_skills.sql`
+- Create: `migrations/043_p9a_skills_down.sql`
 
 - [ ] **Step 1: Create UP migration**
 
 ```bash
-cat > migrations/041_p9a_skills.sql << 'EOF'
+cat > migrations/043_p9a_skills.sql << 'EOF'
 -- P9a: skills — Skill Contracts versionados (Source of Truth)
 -- Master spec v3.1.1 §2.4 + §2.5 (runtime_hints).
 -- NOTE: no BEGIN/COMMIT — migrate.ts wraps in transaction.
@@ -156,8 +156,8 @@ EOF
 - [ ] **Step 2: Create DOWN migration**
 
 ```bash
-cat > migrations/041_p9a_skills_down.sql << 'EOF'
--- Down de 041: drop integral.
+cat > migrations/043_p9a_skills_down.sql << 'EOF'
+-- Down de 043: drop integral.
 
 DROP INDEX IF EXISTS idx_skills_proposed;
 DROP INDEX IF EXISTS idx_skills_one_active_uq;
@@ -171,24 +171,24 @@ EOF
 - [ ] **Step 3: Commit**
 
 ```bash
-git add migrations/041_p9a_skills.sql migrations/041_p9a_skills_down.sql
-git commit -m "feat(p9a): migration 041 skills table (15 cols, status=proposed DEFAULT)"
+git add migrations/043_p9a_skills.sql migrations/043_p9a_skills_down.sql
+git commit -m "feat(p9a): migration 043 skills table (15 cols, status=proposed DEFAULT)"
 ```
 
 Expected: 2 files committed.
 
 ---
 
-### Task 3: Migration 042 — Extend `capability_proposals.capability_type`
+### Task 3: Migration 044 — Extend `capability_proposals.capability_type`
 
 **Files:**
-- Create: `migrations/042_p9a_extend_capability_proposal_type.sql`
-- Create: `migrations/042_p9a_extend_capability_proposal_type_down.sql`
+- Create: `migrations/044_p9a_extend_capability_proposal_type.sql`
+- Create: `migrations/044_p9a_extend_capability_proposal_type_down.sql`
 
 - [ ] **Step 1: Create UP migration**
 
 ```bash
-cat > migrations/042_p9a_extend_capability_proposal_type.sql << 'EOF'
+cat > migrations/044_p9a_extend_capability_proposal_type.sql << 'EOF'
 -- P9a: estende CHECK de capability_proposals.capability_type para 'skill'.
 -- Antecipa P8e ('soul_bias') e P9b ('policy_rule') também, sem ativar uso.
 
@@ -207,8 +207,8 @@ EOF
 - [ ] **Step 2: Create DOWN migration**
 
 ```bash
-cat > migrations/042_p9a_extend_capability_proposal_type_down.sql << 'EOF'
--- Revert 042: restore CHECK para valores antigos.
+cat > migrations/044_p9a_extend_capability_proposal_type_down.sql << 'EOF'
+-- Revert 044: restore CHECK para valores antigos.
 
 ALTER TABLE capability_proposals
   DROP CONSTRAINT IF EXISTS capability_proposals_capability_type_check;
@@ -224,8 +224,8 @@ EOF
 - [ ] **Step 3: Commit**
 
 ```bash
-git add migrations/042_p9a_extend_capability_proposal_type.sql migrations/042_p9a_extend_capability_proposal_type_down.sql
-git commit -m "feat(p9a): migration 042 extend capability_type CHECK (antecipa P8e/P9b)"
+git add migrations/044_p9a_extend_capability_proposal_type.sql migrations/044_p9a_extend_capability_proposal_type_down.sql
+git commit -m "feat(p9a): migration 044 extend capability_type CHECK (antecipa P8e/P9b)"
 ```
 
 ---
@@ -1611,19 +1611,19 @@ set -e
 
 echo "=== P9a Acceptance Gates ==="
 
-# G1: Migration 041 creates skills table
-echo "G1: Migration 041 skills table..."
-grep -q "CREATE TABLE skills" migrations/041_p9a_skills.sql || { echo "FAIL: migration 041"; exit 1; }
-grep -q "profile_body" migrations/041_p9a_skills.sql || { echo "FAIL: runtime_hints missing"; exit 1; }
+# G1: Migration 043 creates skills table
+echo "G1: Migration 043 skills table..."
+grep -q "CREATE TABLE skills" migrations/043_p9a_skills.sql || { echo "FAIL: migration 043"; exit 1; }
+grep -q "runtime_hints" migrations/043_p9a_skills.sql || { echo "FAIL: runtime_hints missing"; exit 1; }
 
 # G2: DEFAULT status='proposed'
 echo "G2: DEFAULT status='proposed'..."
-grep -q "DEFAULT 'proposed'" migrations/041_p9a_skills.sql || { echo "FAIL"; exit 1; }
+grep -q "DEFAULT 'proposed'" migrations/043_p9a_skills.sql || { echo "FAIL"; exit 1; }
 
 # G3-G5: Partial unique, version monotônica, tenant guard (DB constraints)
 echo "G3-G5: DB constraints..."
-grep -q "idx_skills_one_active_uq" migrations/041_p9a_skills.sql || { echo "FAIL: partial unique"; exit 1; }
-grep -q "idx_skills_version_uq" migrations/041_p9a_skills.sql || { echo "FAIL: version unique"; exit 1; }
+grep -q "idx_skills_one_active_uq" migrations/043_p9a_skills.sql || { echo "FAIL: partial unique"; exit 1; }
+grep -q "idx_skills_version_uq" migrations/043_p9a_skills.sql || { echo "FAIL: version unique"; exit 1; }
 
 # G6-G16: SkillRunner gates
 echo "G6-G16: SkillRunner tests..."
@@ -1635,7 +1635,7 @@ npm test -- tests/unit/skills/skills-repo.spec.ts || { echo "FAIL: repo tests"; 
 
 # G19: capability_type CHECK
 echo "G19: capability_type CHECK..."
-grep -q "capability_type IN" migrations/042_p9a_extend_capability_proposal_type.sql || { echo "FAIL"; exit 1; }
+grep -q "capability_type IN" migrations/044_p9a_extend_capability_proposal_type.sql || { echo "FAIL"; exit 1; }
 
 # G20-G22: Detector + capability integration
 echo "G20-G22: Proposer + integration..."
