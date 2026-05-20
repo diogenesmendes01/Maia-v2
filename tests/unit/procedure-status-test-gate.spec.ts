@@ -19,6 +19,15 @@ import { transitionProcedureStatus } from '@/cognition/procedure-status.js';
 const definitionsState: Record<string, any> = {};
 const testsState: Record<string, any> = {};
 
+// ---------------------------------------------------------------------------
+// Mock @/db/client.js so the non-active path (which now uses withTx) does not
+// attempt a real DB connection. The mock simply runs the callback immediately.
+// ---------------------------------------------------------------------------
+vi.mock('@/db/client.js', () => ({
+  db: {},
+  withTx: vi.fn(async (fn: (tx: any) => Promise<any>) => fn({} as any)),
+}));
+
 vi.mock('@/db/repositories.js', async () => {
   const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
     '@/db/repositories.js',

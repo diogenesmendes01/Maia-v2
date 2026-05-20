@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { canTransition, validateTransition, transitionProcedureStatus } from '@/cognition/procedure-status.js';
+import { canTransition, validateTransition, transitionProcedureStatus, ProcedureNotFoundError } from '@/cognition/procedure-status.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 
 // ---------------------------------------------------------------------------
@@ -9,6 +9,24 @@ const mockState: Record<string, any> = {};
 const mockEvents: Array<Record<string, any>> = [];
 const mockTests: Record<string, any> = {};
 
+// ---------------------------------------------------------------------------
+// withTx mock — must use vi.hoisted so the factory reference is available
+// when vi.mock is hoisted to top of file by vitest.
+// Simulates transactional rollback in-memory: snapshots mockState before
+// the callback; restores on throw.
+// ---------------------------------------------------------------------------
+const { withTxMock } = vi.hoisted(() => {
+  const withTxMock = vi.fn(async (fn: (tx: any) => Promise<any>) => {
+    return fn({} as any);
+  });
+  return { withTxMock };
+});
+
+vi.mock('@/db/client.js', () => ({
+  db: {},
+  withTx: withTxMock,
+}));
+
 vi.mock('@/db/repositories.js', async () => {
   const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
     '@/db/repositories.js',
@@ -16,6 +34,7 @@ vi.mock('@/db/repositories.js', async () => {
   return {
     ...actual,
     procedureDefinitionsRepo: {
+      findById: vi.fn(async (id: string) => mockState[id] ?? null),
       updateStatus: vi.fn(async (id: string, updates: any) => {
         if (mockState[id]) {
           mockState[id] = { ...mockState[id], ...updates };
@@ -162,13 +181,119 @@ describe('transitionProcedureStatus — cross-tenant guard', () => {
     vi.clearAllMocks();
   });
 
-  it('Test B: throws when updateStatus returns 0 (id not in this tenant)', async () => {
+  it('Test B: throws ProcedureNotFoundError when id not visible in current tenant (findById returns null)', async () => {
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
       const ghost = { id: 'ghost-id', status: 'draft', nome: 'ghost' } as any;
-      // ghost-id is NOT in mockState → updateStatus returns 0
+      // ghost-id is NOT in mockState → findById returns null → ProcedureNotFoundError thrown
       await expect(
         transitionProcedureStatus({ definition: ghost, to: 'proposed', actor: 'hacker' }),
-      ).rejects.toThrow(/not updated/);
+      ).rejects.toThrow(ProcedureNotFoundError);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test C1 (round-1 finding 1): cross-tenant proposed→active must throw
+// ProcedureNotFoundError BEFORE returning tests_required
+// ---------------------------------------------------------------------------
+describe('transitionProcedureStatus — cross-tenant proposed→active pre-check [round-1-C1]', () => {
+  beforeEach(() => {
+    for (const k of Object.keys(mockState)) delete mockState[k];
+    for (const k of Object.keys(mockTests)) delete mockTests[k];
+    mockEvents.length = 0;
+    vi.clearAllMocks();
+    withTxMock.mockClear();
+  });
+
+  it('Test C1: throws ProcedureNotFoundError when findById returns null for proposed→active, NOT tests_required', async () => {
+    await runWithTenantContext({ tenant_id: 'tenant-b', agent_id: 'default' }, async () => {
+      // Definition object comes from tenant A (ID not visible in tenant B's mockState)
+      const crossTenantDef = { id: 'tenant-a-proc-id', status: 'proposed', nome: 'some-proc' } as any;
+      // mockState is empty → findById returns null for this ID (cross-tenant / invisible)
+
+      await expect(
+        transitionProcedureStatus({ definition: crossTenantDef, to: 'active', actor: 'attacker' }),
+      ).rejects.toThrow(ProcedureNotFoundError);
+    });
+  });
+
+  it('Test C1b: does NOT reach listByDefinition (gate) when findById returns null', async () => {
+    await runWithTenantContext({ tenant_id: 'tenant-b', agent_id: 'default' }, async () => {
+      const { procedureTestsRepo } = await import('@/db/repositories.js');
+
+      const crossTenantDef = { id: 'tenant-a-proc-id-2', status: 'proposed', nome: 'proc-2' } as any;
+
+      await expect(
+        transitionProcedureStatus({ definition: crossTenantDef, to: 'active', actor: 'attacker' }),
+      ).rejects.toThrow(ProcedureNotFoundError);
+
+      // The gate (listByDefinition on procedureTestsRepo) must NOT have been called
+      expect(procedureTestsRepo.listByDefinition).not.toHaveBeenCalled();
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test C2 (round-1 finding 2): non-active path must be atomic (update+event)
+// If record() throws, status change must be rolled back.
+// ---------------------------------------------------------------------------
+describe('transitionProcedureStatus — atomic non-active transition [round-1-C2]', () => {
+  beforeEach(() => {
+    for (const k of Object.keys(mockState)) delete mockState[k];
+    for (const k of Object.keys(mockTests)) delete mockTests[k];
+    mockEvents.length = 0;
+    vi.clearAllMocks();
+    // Set withTxMock to simulate transactional rollback: snapshot state before
+    // the callback and restore it on failure.
+    withTxMock.mockImplementation(async (fn: (tx: any) => Promise<any>) => {
+      const snapshot = JSON.parse(JSON.stringify(mockState));
+      const eventsLen = mockEvents.length;
+      try {
+        return await fn({} as any);
+      } catch (err) {
+        // Rollback: restore state
+        for (const k of Object.keys(mockState)) delete mockState[k];
+        Object.assign(mockState, snapshot);
+        mockEvents.splice(eventsLen);
+        throw err;
+      }
+    });
+  });
+
+  it('Test C2: when record() throws after updateStatus succeeds, the error propagates and status remains unchanged (tx rollback)', async () => {
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { procedureStatusEventsRepo } = await import('@/db/repositories.js');
+
+      const def = seedDef('atomic-test-id', 'draft');
+      const originalStatus = def.status; // 'draft'
+
+      // Make record() throw to simulate event insert failure
+      (procedureStatusEventsRepo.record as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+        new Error('event insert failed'),
+      );
+
+      await expect(
+        transitionProcedureStatus({ definition: def, to: 'proposed', actor: 'tester' }),
+      ).rejects.toThrow('event insert failed');
+
+      // The status must NOT be permanently changed (transaction rolled back)
+      expect(mockState['atomic-test-id']?.status).toBe(originalStatus);
+    });
+  });
+
+  it('Test C2b: successful transition still writes both update and event', async () => {
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { procedureStatusEventsRepo } = await import('@/db/repositories.js');
+
+      const def = seedDef('atomic-ok-id', 'draft');
+
+      const result = await transitionProcedureStatus({ definition: def, to: 'proposed', actor: 'tester' });
+
+      expect(result.ok).toBe(true);
+      expect(mockState['atomic-ok-id']?.status).toBe('proposed');
+      expect(procedureStatusEventsRepo.record).toHaveBeenCalledWith(
+        expect.objectContaining({ definition_id: 'atomic-ok-id', from_status: 'draft', to_status: 'proposed' }),
+      );
     });
   });
 });

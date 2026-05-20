@@ -1,5 +1,6 @@
 import { procedureDefinitionsRepo, procedureStatusEventsRepo, procedureTestsRepo } from '@/db/repositories.js';
 import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
+import { withTx } from '@/db/client.js';
 import type { ProcedureDefinition, ProcedureStatusUpdate, ProcedureTest } from '@/db/schema.js';
 
 /**
@@ -80,6 +81,21 @@ export async function transitionProcedureStatus(args: {
   getCurrentTenant();
   getCurrentAgent();
 
+  // -------------------------------------------------------------------------
+  // Round-1 Fix 1: tenant-scoped ownership/existence check BEFORE any gate
+  // evaluation. A cross-tenant caller may possess a definition object from
+  // another tenant; `findById` is tenant-scoped so it returns null for any
+  // row invisible to the current context. Throwing here prevents the gate
+  // (listByDefinition / tests_required) from masking the trust-boundary
+  // violation with a soft governance result.
+  // -------------------------------------------------------------------------
+  const owned = await procedureDefinitionsRepo.findById(args.definition.id);
+  if (!owned) {
+    throw new ProcedureNotFoundError(
+      `procedure ${args.definition.id} not found or not accessible from the current tenant context`,
+    );
+  }
+
   if (args.to === 'active') {
     // P3c gate: proposed → active requires green tests. Fires ONLY on
     // proposed → active; other transitions to active (e.g., frozen → active
@@ -103,6 +119,11 @@ export async function transitionProcedureStatus(args: {
     return { ok: true, definition: activated };
   }
 
+  // -------------------------------------------------------------------------
+  // Round-1 Fix 2: wrap update + event insert in a single transaction so
+  // that a failure in either step rolls back both. Prior to this fix, a
+  // failed `record()` call left the status changed with no audit trail.
+  // -------------------------------------------------------------------------
   const now = new Date();
   // P83-L1: use the exported ProcedureStatusUpdate type directly instead of
   // a `Parameters<typeof ...>[1]` lookup. Both refer to the same shape; the
@@ -117,29 +138,31 @@ export async function transitionProcedureStatus(args: {
     updates.deactivated_at = now;
   }
 
-  const rowCount = await procedureDefinitionsRepo.updateStatus(
-    args.definition.id,
-    updates as Parameters<typeof procedureDefinitionsRepo.updateStatus>[1],
-  );
-
-  if (rowCount === 0) {
-    throw new ProcedureNotFoundError(
-      `procedure ${args.definition.id} was not updated — id not found or not accessible from the current tenant context`,
+  return withTx(async () => {
+    const rowCount = await procedureDefinitionsRepo.updateStatus(
+      args.definition.id,
+      updates as Parameters<typeof procedureDefinitionsRepo.updateStatus>[1],
     );
-  }
 
-  // Record an audit event for every accepted non-active transition.
-  // (Active transitions are handled inside atomicActivate, which records its
-  // own event row atomically within the same transaction.)
-  await procedureStatusEventsRepo.record({
-    definition_id: args.definition.id,
-    from_status: args.definition.status,
-    to_status: args.to,
-    actor: args.actor,
+    if (rowCount === 0) {
+      throw new ProcedureNotFoundError(
+        `procedure ${args.definition.id} was not updated — id not found or not accessible from the current tenant context`,
+      );
+    }
+
+    // Record an audit event for every accepted non-active transition.
+    // (Active transitions are handled inside atomicActivate, which records its
+    // own event row atomically within the same transaction.)
+    await procedureStatusEventsRepo.record({
+      definition_id: args.definition.id,
+      from_status: args.definition.status,
+      to_status: args.to,
+      actor: args.actor,
+    });
+
+    return {
+      ok: true as const,
+      definition: { ...args.definition, ...(updates as Partial<ProcedureDefinition>) },
+    };
   });
-
-  return {
-    ok: true,
-    definition: { ...args.definition, ...(updates as Partial<ProcedureDefinition>) },
-  };
 }

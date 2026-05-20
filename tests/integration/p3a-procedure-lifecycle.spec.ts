@@ -10,6 +10,15 @@ const testsState: Record<string, any> = {};
 // In-memory event log: every state transition emits a {definition_id, from_status, to_status, actor} row.
 const events: Array<Record<string, any>> = [];
 
+// ---------------------------------------------------------------------------
+// Mock @/db/client.js so the non-active path (which now uses withTx) does not
+// attempt a real DB connection. The mock simply runs the callback immediately.
+// ---------------------------------------------------------------------------
+vi.mock('@/db/client.js', () => ({
+  db: {},
+  withTx: vi.fn(async (fn: (tx: any) => Promise<any>) => fn({} as any)),
+}));
+
 vi.mock('@/db/repositories.js', async () => {
   const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
     '@/db/repositories.js',
@@ -365,16 +374,16 @@ describe('P3a procedure lifecycle integration', () => {
     ).rejects.toThrow();
   });
 
-  it('cenário 7: updateStatus retorna 0 quando o id pertence a outro tenant (P83-H5)', async () => {
+  it('cenário 7: id não pertence ao tenant atual lança ProcedureNotFoundError (P83-H5)', async () => {
     // Simulate the in-memory state having a definition that does NOT
-    // exist in our state map → updateStatus returns 0 → transition throws.
+    // exist in our state map → findById returns null → ProcedureNotFoundError thrown.
     await runWithTenantContext(
       { tenant_id: 'default', agent_id: 'default' },
       async () => {
         const ghost = { id: 'does-not-exist', status: 'draft', nome: 'x' } as any;
         await expect(
           transitionProcedureStatus({ definition: ghost, to: 'proposed', actor: 'owner' }),
-        ).rejects.toThrow(/not updated/);
+        ).rejects.toThrow(/not found or not accessible/);
       },
     );
   });
