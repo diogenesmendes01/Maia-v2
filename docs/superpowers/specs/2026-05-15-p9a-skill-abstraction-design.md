@@ -48,8 +48,8 @@ Cada um governa **um aspecto** de "o que a Maia sabe fazer". Nenhum captura **a 
 
 | Path | Action | Responsibility |
 |---|---|---|
-| `migrations/036_p9a_skills.sql` + down | Create | Tabela `skills` v3.1.1 com 15 colunas + `runtime_hints` |
-| `migrations/037_p9a_extend_capability_proposal_type.sql` + down | Create | Estende CHECK de `capability_proposals.capability_type` pra incluir `'skill'` (e `'soul_bias'`, `'policy_rule'` antecipando P8e/P9b) |
+| `migrations/043_p9a_skills.sql` + down | Create | Tabela `skills` v3.1.1 com 15 colunas + `runtime_hints` |
+| `migrations/044_p9a_extend_capability_proposal_type.sql` + down | Create | Estende CHECK de `capability_proposals.capability_type` pra incluir `'skill'` (e `'soul_bias'`, `'policy_rule'` antecipando P8e/P9b) |
 | `src/db/schema.ts` | Modify | `skills` table + types `SkillRow`, `SkillExecutionMode`, `SkillCategory` |
 | `src/db/repositories.ts` | Modify | `skillsRepo` export |
 | `src/control-plane/skill-registry/skills-repo.ts` | Create | Métodos `findActive`, `listByCategory`, `propose`, `activate`, `deprecate`, `rollback`, `getById`, `getByDescriptor` |
@@ -90,7 +90,7 @@ Cada um governa **um aspecto** de "o que a Maia sabe fazer". Nenhum captura **a 
 
 **Tipo de `tenant_id`:** master spec usa `UUID`. Schema atual da Maia (`capability_proposals`, etc.) usa `TEXT`. P9a segue v3.1.1: **`UUID`** para alinhar com o resto do Control Plane que está sendo introduzido em P8/P9. Migration adicional pode normalizar pré-existentes em P11.
 
-### 2.1 `036_p9a_skills.sql`
+### 2.1 `043_p9a_skills.sql`
 
 ```sql
 -- P9a: skills — Skill Contracts versionados (Source of Truth)
@@ -178,13 +178,13 @@ COMMENT ON TABLE skills IS
   'Skill Contracts versionados. DEFAULT status=proposed (nunca nasce active). Partial unique "one active" garante invariante. Master spec v3.1.1 §2.4.';
 ```
 
-### 2.2 `036_p9a_skills_down.sql`
+### 2.2 `043_p9a_skills_down.sql`
 
 ```sql
 DROP TABLE IF EXISTS skills CASCADE;
 ```
 
-### 2.3 `037_p9a_extend_capability_proposal_type.sql`
+### 2.3 `044_p9a_extend_capability_proposal_type.sql`
 
 ```sql
 -- P9a: estende CHECK de capability_proposals.capability_type para 'skill'.
@@ -1116,7 +1116,7 @@ if (args.proposal.capability_type === 'skill') {
 | G16 | Output validado contra `output_schema` | Output inválido → `reason='invalid_output'` |
 | G17 | `activate` deprecate anterior em transação | Antes: 1 active. Depois `activate`: nova active, anterior `deprecated`, timestamp coerente |
 | G18 | `rollback` reativa anterior | Cenário com v1 deprecated + v2 active. Rollback v2 → v2 rolled_back, v1 reactivated |
-| G19 | `capability_proposals.capability_type='skill'` aceito | Migration 037 permite valor `'skill'` |
+| G19 | `capability_proposals.capability_type='skill'` aceito | Migration 044 permite valor `'skill'` |
 | G20 | Detector `skill_proposer` cria capability_proposal | Run com mock pattern → row em capability_proposals |
 | G21 | `capability-test-runner` strategy `skill_evaluator` executa evaluator | Mock skill + mock evaluator → outcome correto |
 | G22 | `capability-revert` chama `skillsRepo.rollback` para skill | Mock proposal `capability_type='skill'` → rollback chamado |
@@ -1175,7 +1175,7 @@ if (args.proposal.capability_type === 'skill') {
 
 ## 15. Done criteria
 
-- [ ] Migration 036 + 037 aplicadas em staging
+- [ ] Migration 043 + 044 aplicadas em staging
 - [ ] `skillsRepo` com 9 métodos + testes unit cobrindo `propose`/`activate`/`rollback`
 - [ ] `SkillRunner` com 4 modos implementados + testes por modo
 - [ ] `policyDescriptorResolver` integration (stub ou real conforme P8e)

@@ -444,11 +444,20 @@ git commit -m "feat(p9a): drizzle schema skills table + enums + feature flag"
 
 ```typescript
 // tests/unit/skills/skills-repo.spec.ts
+// MUST: set tenant + agent context before calling any skillsRepo method.
+//       All methods scope internally via getCurrentTenant() / getCurrentAgent().
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { skillsRepo } from '../../src/control-plane/skill-registry/skills-repo.js';
+import { setCurrentTenant, setCurrentAgent } from '../../src/db/tenant-context.js';
 import type { SkillRow } from '../../src/db/schema.js';
 
 describe('skillsRepo', () => {
+  beforeEach(() => {
+    // MUST: tenant-scoped + agent-scoped — context set before every test.
+    setCurrentTenant('tenant-test-uuid');
+    setCurrentAgent('agent-test-uuid');
+  });
+
   it('propose creates skill with status=proposed', async () => {
     const input = {
       skill_descriptor: 'test_skill',
@@ -461,6 +470,7 @@ describe('skillsRepo', () => {
       input_schema: { type: 'object' },
       output_schema: { type: 'object' },
       proposed_by: 'test',
+      // agent_id omitted → defaults to getCurrentAgent() (NEVER tenant-wide from agent ctx)
     };
     const proposed = await skillsRepo.propose(input);
     expect(proposed.status).toBe('proposed');
@@ -468,6 +478,8 @@ describe('skillsRepo', () => {
   });
 
   it('findActive returns null if not found', async () => {
+    // MUST: tenant-scoped — getCurrentTenant() applied internally.
+    // MUST: agent-scoped — agent_id omitted → (current agent OR tenant-wide).
     const result = await skillsRepo.findActive('nonexistent');
     expect(result).toBeNull();
   });
@@ -480,6 +492,7 @@ describe('skillsRepo', () => {
     const v2 = await skillsRepo.propose({ /* ... */ });
     await skillsRepo.activate(v2.id, 'approver', 'better');
     // v1 should now be deprecated
+    // MUST: getById guards tenant mismatch internally via getCurrentTenant().
     const v1Check = await skillsRepo.getById(v1.id);
     expect(v1Check?.status).toBe('deprecated');
   });
@@ -493,6 +506,7 @@ describe('skillsRepo', () => {
     // Rollback v2
     await skillsRepo.rollback(v2.id, 'bad', 'approver');
     // v2 should be rolled_back, v1 should be active again
+    // MUST: getById guards tenant mismatch internally.
     const v2Check = await skillsRepo.getById(v2.id);
     const v1Check = await skillsRepo.getById(v1.id);
     expect(v2Check?.status).toBe('rolled_back');
@@ -500,22 +514,31 @@ describe('skillsRepo', () => {
   });
 
   it('listByCategory returns only active in category', async () => {
-    // Propose and activate skills in 'classify' category
+    // MUST: tenant-scoped + agent-scoped — getCurrentTenant()/getCurrentAgent() applied.
     const s1 = await skillsRepo.propose({ category: 'classify', /* ... */ });
     await skillsRepo.activate(s1.id, 'approver');
     const s2 = await skillsRepo.propose({ category: 'extract', /* ... */ });
     await skillsRepo.activate(s2.id, 'approver');
-    
+
     const classified = await skillsRepo.listByCategory('classify');
     expect(classified.length).toBeGreaterThanOrEqual(1);
     expect(classified.every(s => s.category === 'classify')).toBe(true);
   });
 
-  it('tenant guard: lookup of different tenant returns null', async () => {
-    const skill = await skillsRepo.propose({ tenant_id: 'tenant1', /* ... */ });
-    // Simulate different tenant context
-    const result = await skillsRepo.getById(skill.id); // uses current tenant
-    // If tenant context switched, should be null or error
+  it('tenant guard: getById for different tenant returns null', async () => {
+    // MUST: getByIdForTenantAndAgent — id-based lookup guards tenant mismatch.
+    const skill = await skillsRepo.propose({ /* ... */ });
+    // Switch to a different tenant context — getById must return null.
+    setCurrentTenant('tenant-other-uuid');
+    const result = await skillsRepo.getById(skill.id);
+    expect(result).toBeNull(); // tenant guard rejects cross-tenant id lookup
+  });
+
+  it('agent scope violation: explicit agent_id mismatch throws', async () => {
+    // MUST: agent-scoped — cross-agent findActive throws agent_scope_violation.
+    await expect(
+      skillsRepo.findActive('some_skill', 'agent-other-uuid'),
+    ).rejects.toThrow('agent_scope_violation');
   });
 
   it('version monotonic: duplicate version fails', async () => {
@@ -535,16 +558,33 @@ describe('skillsRepo', () => {
 
 ```typescript
 // src/control-plane/skill-registry/skills-repo.ts
-import { db } from '../../db/index.js';
-import { skills } from '../../db/schema.js';
-import { eq, and } from 'drizzle-orm';
-import { applyTenantGuard } from '../../db/tenant-guard.js';
-import type { SkillRow, SkillContract } from '../../db/schema.js';
+// MUST: every DB call is tenant-scoped via getCurrentTenant() — NEVER unscoped.
+// MUST: hot-path lookups (findActive, listByCategory) are agent-scoped via
+//        getCurrentAgent() — cross-agent reads throw agent_scope_violation.
+//        See review #99 finding 1 for the isolation invariant.
+import { eq, and, desc, or, sql } from 'drizzle-orm';
+import { db, withTx } from '@/db/client.js';
+import { skills } from '@/db/schema.js';
+import type { SkillRow, SkillContract } from '@/db/schema.js';
+import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
+
+export type ProposeInput = SkillContract & {
+  proposed_by: string;
+  proposed_reason?: string;
+  agent_id?: string | null;
+  tenant_id?: string;
+};
 
 export interface SkillsRepo {
-  findActive(descriptor: string): Promise<SkillRow | null>;
+  // MUST: tenant-scoped — reads getCurrentTenant() + getCurrentAgent() from context.
+  // agent_id param: undefined → (current agent OR tenant-wide), null → tenant-wide only,
+  // explicit → must match context agent or throws agent_scope_violation.
+  findActive(descriptor: string, agent_id?: string | null): Promise<SkillRow | null>;
+
+  // MUST: tenant-scoped + agent-scoped via getCurrentTenant()/getCurrentAgent().
   listByCategory(category: string): Promise<SkillRow[]>;
-  propose(input: SkillContract & { proposed_by: string; proposed_reason?: string; agent_id?: string; tenant_id?: string }): Promise<SkillRow>;
+
+  propose(input: ProposeInput): Promise<SkillRow>;
   activate(id: string, approver: string, reason?: string): Promise<SkillRow>;
   deprecate(id: string, deprecator: string, reason: string): Promise<SkillRow>;
   rollback(id: string, reason: string, rolledBackBy: string): Promise<SkillRow>;
@@ -554,36 +594,97 @@ export interface SkillsRepo {
 }
 
 export const skillsRepo: SkillsRepo = {
-  async findActive(descriptor: string): Promise<SkillRow | null> {
-    const [skill] = await db.select().from(skills)
-      .where(and(eq(skills.status, 'active'), eq(skills.skill_descriptor, descriptor)))
+  // MUST: tenant-scoped — getCurrentTenant() is always applied.
+  // MUST: agent-scoped via enforceTenantBoundary — undefined agent_id defaults to
+  //        (current agent OR tenant-wide). NEVER falls through to "any agent in tenant".
+  async findActive(descriptor: string, agent_id?: string | null): Promise<SkillRow | null> {
+    const tenant_id = getCurrentTenant(); // MUST: tenant-scoped
+    const ctxAgent = getCurrentAgent();   // MUST: agent-scoped via enforceTenantBoundary
+    let scopeClause;
+    if (agent_id === undefined) {
+      // Default: current agent OR tenant-wide (agent-specific skill wins via ORDER).
+      scopeClause = or(eq(skills.agent_id, ctxAgent), sql`agent_id IS NULL`);
+    } else if (agent_id === null) {
+      scopeClause = sql`agent_id IS NULL`;
+    } else {
+      // Explicit agent_id: must match context agent — cross-agent reads throw.
+      if (agent_id !== ctxAgent) {
+        throw new Error(`agent_scope_violation: input agent ${agent_id} vs context ${ctxAgent}`);
+      }
+      scopeClause = eq(skills.agent_id, agent_id);
+    }
+    const rows = await db
+      .select()
+      .from(skills)
+      .where(
+        and(
+          eq(skills.tenant_id, tenant_id),
+          eq(skills.skill_descriptor, descriptor),
+          eq(skills.status, 'active'),
+          scopeClause,
+        ),
+      )
+      .orderBy(sql`agent_id IS NULL`) // agent-scoped match beats tenant-wide
       .limit(1);
-    return skill ?? null;
+    return rows[0] ?? null;
   },
 
+  // MUST: tenant-scoped + agent-scoped (current agent OR tenant-wide).
   async listByCategory(category: string): Promise<SkillRow[]> {
-    return await db.select().from(skills)
-      .where(and(eq(skills.status, 'active'), eq(skills.category, category)));
+    const tenant_id = getCurrentTenant(); // MUST: tenant-scoped
+    const ctxAgent = getCurrentAgent();   // MUST: agent-scoped via enforceTenantBoundary
+    return db
+      .select()
+      .from(skills)
+      .where(
+        and(
+          eq(skills.tenant_id, tenant_id),
+          eq(skills.category, category),
+          eq(skills.status, 'active'),
+          // MUST: agent scope — never returns skills from other agents in same tenant.
+          or(eq(skills.agent_id, ctxAgent), sql`agent_id IS NULL`),
+        ),
+      );
   },
 
-  async propose(input: any): Promise<SkillRow> {
-    const tenantId = input.tenant_id || getCurrentTenant();
-    const agentId = input.agent_id || null;
+  async propose(input: ProposeInput): Promise<SkillRow> {
+    const ctxTenant = getCurrentTenant(); // MUST: tenant-scoped
+    const ctxAgent = getCurrentAgent();   // MUST: agent-scoped via enforceTenantBoundary
+    const tenant_id = input.tenant_id ?? ctxTenant;
+    if (input.tenant_id && input.tenant_id !== ctxTenant) {
+      throw new Error(`tenant mismatch: input ${input.tenant_id} vs context ${ctxTenant}`);
+    }
+    // MUST: agent scope — explicit agent_id must match context or be null (tenant-wide).
+    // null requires tenant-admin authorization (privilege escalation guard).
+    let agent_id: string | null;
+    if (input.agent_id === undefined) {
+      agent_id = ctxAgent;
+    } else if (input.agent_id === null) {
+      throw new Error(
+        'tenant_admin_required: tenant-wide skills (agent_id=null) cannot be proposed from agent context',
+      );
+    } else if (input.agent_id !== ctxAgent) {
+      throw new Error(
+        `agent_scope_violation: input agent ${input.agent_id} vs context ${ctxAgent}`,
+      );
+    } else {
+      agent_id = input.agent_id;
+    }
 
-    // Determine next version
+    // Determine next version (scoped to tenant + agent + descriptor).
     const [latest] = await db.select().from(skills)
       .where(and(
-        eq(skills.tenant_id, tenantId),
+        eq(skills.tenant_id, tenant_id),
         eq(skills.skill_descriptor, input.skill_descriptor),
-        ...(agentId ? [eq(skills.agent_id, agentId)] : []),
+        agent_id ? eq(skills.agent_id, agent_id) : sql`agent_id IS NULL`,
       ))
       .orderBy(desc(skills.version))
       .limit(1);
     const version = (latest?.version ?? 0) + 1;
 
     const [proposed] = await db.insert(skills).values({
-      tenant_id: tenantId,
-      agent_id: agentId,
+      tenant_id,
+      agent_id,
       skill_descriptor: input.skill_descriptor,
       category: input.category,
       execution_mode: input.execution_mode,
@@ -608,28 +709,25 @@ export const skillsRepo: SkillsRepo = {
   },
 
   async activate(id: string, approver: string, reason?: string): Promise<SkillRow> {
-    return await db.transaction(async (tx) => {
-      const [skill] = await tx.select().from(skills).where(eq(skills.id, id));
+    return withTx(async (tx) => {
+      // MUST: getByIdForTenantAndAgent — id-based mutations guard tenant mismatch.
+      const [skill] = await tx.select().from(skills)
+        .where(and(eq(skills.id, id), eq(skills.tenant_id, getCurrentTenant())));
       if (!skill) throw new Error('skill_not_found');
       if (skill.status !== 'proposed') throw new Error(`cannot_activate_from_${skill.status}`);
 
-      // Deprecate previous active version
+      // Deprecate previous active version (tenant + agent + descriptor scoped).
       await tx.update(skills)
         .set({ status: 'deprecated', deprecated_at: new Date() })
         .where(and(
           eq(skills.tenant_id, skill.tenant_id),
+          skill.agent_id ? eq(skills.agent_id, skill.agent_id) : sql`agent_id IS NULL`,
           eq(skills.skill_descriptor, skill.skill_descriptor),
           eq(skills.status, 'active'),
         ));
 
-      // Activate this one
       const [activated] = await tx.update(skills)
-        .set({
-          status: 'active',
-          activated_at: new Date(),
-          approved_by: approver,
-          approved_at: new Date(),
-        })
+        .set({ status: 'active', activated_at: new Date(), approved_by: approver, approved_at: new Date() })
         .where(eq(skills.id, id))
         .returning();
 
@@ -638,27 +736,31 @@ export const skillsRepo: SkillsRepo = {
   },
 
   async deprecate(id: string, deprecator: string, reason: string): Promise<SkillRow> {
+    // MUST: getByIdForTenantAndAgent — guard tenant mismatch before mutation.
     const [deprecated] = await db.update(skills)
       .set({ status: 'deprecated', deprecated_at: new Date() })
-      .where(eq(skills.id, id))
+      .where(and(eq(skills.id, id), eq(skills.tenant_id, getCurrentTenant())))
       .returning();
+    if (!deprecated) throw new Error('skill_not_found_or_tenant_mismatch');
     return deprecated;
   },
 
   async rollback(id: string, reason: string, rolledBackBy: string): Promise<SkillRow> {
-    return await db.transaction(async (tx) => {
-      const [skill] = await tx.select().from(skills).where(eq(skills.id, id));
-      if (!skill) throw new Error('skill_not_found');
+    return withTx(async (tx) => {
+      // MUST: getByIdForTenantAndAgent — guard tenant mismatch before mutation.
+      const [skill] = await tx.select().from(skills)
+        .where(and(eq(skills.id, id), eq(skills.tenant_id, getCurrentTenant())));
+      if (!skill) throw new Error('skill_not_found_or_tenant_mismatch');
 
-      // Mark as rolled_back
       await tx.update(skills)
         .set({ status: 'rolled_back', rolled_back_at: new Date(), rollback_reason: reason })
         .where(eq(skills.id, id));
 
-      // Find previous active version (v-1, deprecated)
+      // Find previous version (v-1, deprecated) — scoped to tenant + agent + descriptor.
       const [previous] = await tx.select().from(skills)
         .where(and(
           eq(skills.tenant_id, skill.tenant_id),
+          skill.agent_id ? eq(skills.agent_id, skill.agent_id) : sql`agent_id IS NULL`,
           eq(skills.skill_descriptor, skill.skill_descriptor),
           eq(skills.version, skill.version - 1),
         ));
@@ -675,22 +777,33 @@ export const skillsRepo: SkillsRepo = {
   },
 
   async getById(id: string): Promise<SkillRow | null> {
-    const [skill] = await db.select().from(skills).where(eq(skills.id, id));
+    // MUST: getByIdForTenantAndAgent — tenant guard on every id-based lookup.
+    const [skill] = await db.select().from(skills)
+      .where(and(eq(skills.id, id), eq(skills.tenant_id, getCurrentTenant())));
     return skill ?? null;
   },
 
   async getByDescriptor(descriptor: string, version?: number): Promise<SkillRow | null> {
-    const conditions = [eq(skills.skill_descriptor, descriptor)];
-    if (version) conditions.push(eq(skills.version, version));
+    // MUST: tenant-scoped — getCurrentTenant() applied.
+    const conditions = [
+      eq(skills.tenant_id, getCurrentTenant()),
+      eq(skills.skill_descriptor, descriptor),
+    ];
+    if (version !== undefined) conditions.push(eq(skills.version, version));
     const [skill] = await db.select().from(skills)
       .where(and(...conditions))
+      .orderBy(desc(skills.version))
       .limit(1);
     return skill ?? null;
   },
 
   async listVersions(descriptor: string): Promise<SkillRow[]> {
-    return await db.select().from(skills)
-      .where(eq(skills.skill_descriptor, descriptor))
+    // MUST: tenant-scoped — getCurrentTenant() applied.
+    return db.select().from(skills)
+      .where(and(
+        eq(skills.tenant_id, getCurrentTenant()),
+        eq(skills.skill_descriptor, descriptor),
+      ))
       .orderBy(desc(skills.version));
   },
 };
@@ -1781,7 +1894,7 @@ gh pr create \
 - Admin UI Telas 1-3 (Proposal Inbox, Diff & Approval, Version History) — placeholder
 
 ## Test plan
-- [x] Schema + migrations (041, 042)
+- [x] Schema + migrations (043, 044)
 - [x] skillsRepo unit tests (9 methods)
 - [x] SkillRunner unit tests (7 gates + 4 modes)
 - [x] SkillSlice builder tests
@@ -1818,7 +1931,7 @@ When all 12 tasks (+ subtasks) have [x] and:
 2. ✅ `npm run lint` zero errors
 3. ✅ `npm run typecheck` zero errors
 4. ✅ `scripts/p9a-acceptance-gates.sh` PASS (all 24 gates)
-5. ✅ Migration 041 + 042 apply cleanly in dev DB
+5. ✅ Migration 043 + 044 apply cleanly in dev DB
 6. ✅ `skillsRepo.propose` creates `status='proposed'`
 7. ✅ `skillsRepo.activate` moves proposed→active, deprecates previous (transaction)
 8. ✅ `skillsRepo.rollback` moves active→rolled_back, reactivates previous
