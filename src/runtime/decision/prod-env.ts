@@ -54,13 +54,13 @@
  *     intencao from the linked definition or default to 'unknown');
  *     ttl_remaining_ms derived from last_activity_at + 30min default TTL.
  *
- *  6. LockdownReaderAdapter  — all methods always return false/false/false
- *     (no production lockdown-reader for the DE port exists yet; the
- *     legacy governance/lockdown.ts operates at entity level, not at the
- *     channel/tenant level the DE port expects). This adapter is a
- *     fail-open stub pending a future P-phase wiring the DE lockdown reader
- *     to the real data source.  Documented explicitly so it's not confused
- *     with an accidental omission.
+ *  6. LockdownReaderProdAdapter  — wraps governance/lockdown.ts entity/permissao
+ *     signals. Dual-layer design: channel lockdown is checked via
+ *     BaseContextPacket.channel.is_locked_down (Layer 1, Early PEP). This
+ *     adapter implements Layer 2: entity/permissao lockdown via
+ *     entity_states.flags['lockdown_snapshot'] (isTenantInGlobalLockdown) and
+ *     permissoes.status='suspensa' (tenantHasSensitiveContext). isChannelLockedDown
+ *     always returns false — handled at Layer 1.
  *
  *  7. ChannelPoliciesReaderAdapter  — direct drizzle query on channel_policies.
  *     DE port: getForChannel(tenant_id, channel_id) → {channel_id,
@@ -97,7 +97,7 @@ import { skillsRepo as p9aSkillsRepo } from '@/control-plane/skill-registry/skil
 import { procedureExecutionsRepo } from '@/db/repositories.js';
 import { getCurrentAgent } from '@/db/tenant-context.js';
 import { db } from '@/db/client.js';
-import { channel_policies } from '@/db/schema.js';
+import { channel_policies, entity_states, permissoes } from '@/db/schema.js';
 import { and, eq } from 'drizzle-orm';
 import { incCounter, observeHistogram } from '@/lib/metrics.js';
 import { callLLM } from '@/lib/claude.js';
@@ -362,33 +362,103 @@ const proceduresRepoAdapter: ProceduresRepo = {
 };
 
 // ---------------------------------------------------------------------------
-// 6. LockdownReaderAdapter  (KNOWN_STUB — fail-open)
+// 6. LockdownReaderProdAdapter  (entity/permissao layer)
 // ---------------------------------------------------------------------------
 
 /**
- * KNOWN_STUB: The production governance/lockdown.ts operates at entity/permissao
- * level, not at the channel/tenant level the DE port expects. Until a future
- * phase wires the DE LockdownReader to a real data source, this adapter returns
- * false for all lockdown checks (fail-open for lockdown, fail-safe for sensitive
- * context — sensitive returns false meaning budget-fallback uses ask_clarification,
- * not escalate).
+ * DESIGN NOTE: dual-layer lockdown
  *
- * Impact: Early PEP lockdown checks rely on BaseContextPacket.channel.is_locked_down
- * (set upstream) rather than this reader, so the stub does not bypass Early PEP
- * lockdown protection. The stub only affects the budget-fallback escalation path
- * (spec §6.2).
+ * Layer 1 — Channel lockdown:
+ *   Checked via `BaseContextPacket.channel.is_locked_down` at the Early PEP
+ *   entry point (hardcoded short-circuit, line 38 of early-pep.ts). This flag
+ *   is set upstream by the channel resolver and is independent of this adapter.
+ *
+ * Layer 2 — Entity/permissao lockdown (this adapter):
+ *   The legacy `governance/lockdown.ts` operates at entity/permissao scope.
+ *   When `activateLockdown()` runs it:
+ *     a) suspends all non-owner permissoes (status → 'suspensa')
+ *     b) stores a `lockdown_snapshot` array in `entity_states.flags` per entity
+ *
+ *   This adapter reads those signals:
+ *   - `isTenantInGlobalLockdown(tenant_id)`:
+ *       Queries `entity_states` for the tenant; returns true if any row has a
+ *       non-empty `flags.lockdown_snapshot` (= lockdown currently active).
+ *   - `isChannelLockedDown(channel_id, tenant_id)`:
+ *       Always returns false at this layer — channel-level lockdown is handled
+ *       by BaseContextPacket.channel.is_locked_down (Layer 1). No DB query.
+ *   - `tenantHasSensitiveContext(tenant_id)`:
+ *       Returns true if any permissao for the tenant has status='suspensa'.
+ *       A suspended permissao signals that a lockdown event occurred (or is
+ *       ongoing), indicating sensitive context where the budget-fallback must
+ *       escalate rather than ask_clarification (spec §6.2).
+ *
+ * Out-of-scope contexts (channel-only turns with no entity) are handled
+ * exclusively at Layer 1. This adapter never blocks such turns.
  */
-const lockdownReaderAdapter: LockdownReader = {
-  async isChannelLockedDown(_channel_id, _tenant_id, _options) {
+
+const LOCKDOWN_SNAPSHOT_KEY = 'lockdown_snapshot';
+
+export class LockdownReaderProdAdapter implements LockdownReader {
+  /**
+   * Channel-level lockdown is always false at this layer.
+   * It is handled upstream via BaseContextPacket.channel.is_locked_down
+   * (Layer 1, Early PEP hardcoded short-circuit).
+   */
+  async isChannelLockedDown(
+    _channel_id: string,
+    _tenant_id: string,
+    _options?: { signal?: AbortSignal },
+  ): Promise<boolean> {
     return false;
-  },
-  async isTenantInGlobalLockdown(_tenant_id, _options) {
+  }
+
+  /**
+   * Returns true if any entity in the tenant has an active lockdown snapshot.
+   * The snapshot is written by governance/lockdown.ts#activateLockdown() into
+   * entity_states.flags['lockdown_snapshot'] and cleared by liftLockdown().
+   */
+  async isTenantInGlobalLockdown(
+    tenant_id: string,
+    _options?: { signal?: AbortSignal },
+  ): Promise<boolean> {
+    const rows = await db
+      .select()
+      .from(entity_states)
+      .where(eq(entity_states.tenant_id, tenant_id));
+
+    for (const row of rows) {
+      const flags = (row.flags as Record<string, unknown>) ?? {};
+      const snapshot = flags[LOCKDOWN_SNAPSHOT_KEY];
+      if (Array.isArray(snapshot) && snapshot.length > 0) {
+        return true;
+      }
+    }
     return false;
-  },
-  async tenantHasSensitiveContext(_tenant_id, _options) {
-    return false;
-  },
-};
+  }
+
+  /**
+   * Returns true if any permissao for the tenant is in 'suspensa' status.
+   * Suspended permissoes signal that a lockdown event has occurred (or is
+   * active), triggering budget-fallback escalation instead of ask_clarification.
+   */
+  async tenantHasSensitiveContext(
+    tenant_id: string,
+    _options?: { signal?: AbortSignal },
+  ): Promise<boolean> {
+    const rows = await db
+      .select()
+      .from(permissoes)
+      .where(
+        and(
+          eq(permissoes.tenant_id, tenant_id),
+          eq(permissoes.status, 'suspensa'),
+        ),
+      );
+    return rows.length > 0;
+  }
+}
+
+const lockdownReaderAdapter = new LockdownReaderProdAdapter();
 
 // ---------------------------------------------------------------------------
 // 7. ChannelPoliciesReaderAdapter  — direct DB lookup on channel_policies
