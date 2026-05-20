@@ -1,26 +1,34 @@
 /**
- * P10a — KnowledgeRiskScorer.
+ * P9c — KnowledgeRiskScorer (real implementation).
  *
- * **STUB IMPLEMENTATION** — the canonical implementation lives in P9c
- * (`src/control-plane/knowledge-risk-scorer/index.ts`). When that lands,
- * this file becomes a thin re-export of the canonical class.
+ * Replaces the P10a stub (`source: 'stub:p10a'`) with the actual P9c
+ * scorer from `src/control-plane/knowledge-state-machine/knowledge-risk-scorer.ts`.
  *
- * The stub implements the conservative-fallback contract documented in
- * the P10a plan ("if PR #97 not merged use stub: rule → SEMPRE
- * pending_review-shape inputs, low+conf>=0.6 → ephemeral-shape, default
- * → pending_review-shape"):
+ * Adapter responsibilities (inline, <25 LoC):
+ *  1. Maps `KnowledgeRiskScoreInput` (KSM-domain types) → `KnowledgeRiskSignals`
+ *     (shared-risk domain types).
+ *  2. Maps `KnowledgeKind` ('fact','rule','memory',...) → `knowledge_type`
+ *     ('fato','regra','procedimento','lacuna','tool_request').
+ *  3. Maps `ScoredRisk` → `KnowledgeRiskScoreOutput` (same shape the KSM
+ *     state machine already reads: level/sensitivity/reasons/source).
  *
- *   - kind='rule' → risk='high' (so decideInitialStatus routes to
- *     pending_review).
- *   - kind != 'rule' AND confidence >= 0.6 → risk='low' (so eligible
- *     for ephemeral when other gates allow).
- *   - otherwise → risk='medium' (forces pending_review).
+ * Signal mapping:
+ *  - `kind` → `knowledge_type` via KIND_TO_KNOWLEDGE_TYPE table.
+ *  - `confidence` → `derived_confidence`.
+ *  - `origin` 'user_explicit'/'human_approved' → mark as high-evidence
+ *    by setting derived_confidence=max(input, 0.8).
+ *  - `proposer_sensitivity_hint` → `topic` proxy (high → 'critical_decision',
+ *    medium → 'financial', low → omit).
+ *  - Gate can be injected for tests via `input.gate` or the second arg.
  *
- * The scorer never downgrades a sensitivity hint coming from the
- * proposer — this preserves the master §5 "no-downgrade" invariant
- * even in stub mode.
+ * The new `score()` signature adds an optional second argument `{ gate }`
+ * so tests can inject a mock gate without touching state-machine.ts.
+ * `state-machine.ts` calls `KnowledgeRiskScorer.score(input)` (no second
+ * arg) and gets `haikuRiskGate` as default.
  */
 
+import { scoreKnowledge } from './knowledge-risk-scorer.js';
+import type { LLMGate } from '@/shared/risk/types.js';
 import type {
   KnowledgeKind,
   KnowledgeOrigin,
@@ -28,6 +36,7 @@ import type {
   KnowledgeScope,
   KnowledgeSensitivity,
 } from './types.js';
+import type { TopicSignal } from '@/shared/risk/types.js';
 
 export interface KnowledgeRiskScoreInput {
   trace_id: string;
@@ -39,61 +48,99 @@ export interface KnowledgeRiskScoreInput {
   confidence: number;
   origin: KnowledgeOrigin;
   proposer_sensitivity_hint?: KnowledgeSensitivity;
+  /** Optional gate injection for tests (avoids real Haiku calls). */
+  gate?: LLMGate;
+  /** @internal Test-only: force knowledge_type to an arbitrary string. */
+  _test_force_knowledge_type?: string;
 }
 
 export interface KnowledgeRiskScoreOutput {
   level: KnowledgeRiskLevel;
   sensitivity: KnowledgeSensitivity;
   reasons: string[];
-  source: 'stub:p10a' | 'heuristic' | 'llm_elevated' | 'cache';
+  source: 'p9c:knowledge' | 'heuristic' | 'llm_elevated' | 'cache';
 }
+
+// ---------------------------------------------------------------------------
+// Adapter: KnowledgeKind → knowledge_type
+// ---------------------------------------------------------------------------
+
+const KIND_TO_KNOWLEDGE_TYPE: Record<
+  KnowledgeKind,
+  'fato' | 'regra' | 'procedimento' | 'lacuna' | 'tool_request'
+> = {
+  fact: 'fato',
+  rule: 'regra',
+  memory: 'fato',           // memory is a scoped fact
+  behavioral_hint: 'lacuna', // behavioral hints are observed gaps / tendencies
+  procedure_hint: 'procedimento',
+};
+
+// ---------------------------------------------------------------------------
+// Adapter: sensitivity_hint → topic proxy
+// ---------------------------------------------------------------------------
+
+function sensitivityToTopic(
+  s: KnowledgeSensitivity | undefined,
+): TopicSignal | undefined {
+  if (s === 'high') return 'critical_decision';
+  if (s === 'medium') return 'financial';
+  return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Real scorer class (same static API as the stub)
+// ---------------------------------------------------------------------------
 
 export class KnowledgeRiskScorer {
   static async score(
     input: KnowledgeRiskScoreInput,
+    opts?: { gate?: LLMGate },
   ): Promise<KnowledgeRiskScoreOutput> {
-    const reasons: string[] = [];
+    const gate = opts?.gate ?? input.gate;
 
-    // Rule kind is always elevated risk so decideInitialStatus routes
-    // it to pending_review (master §2.6 — non-negotiable).
-    if (input.kind === 'rule') {
-      reasons.push('kind=rule:always_human_review');
-      return {
-        level: 'high',
-        sensitivity: input.proposer_sensitivity_hint ?? 'medium',
-        reasons,
-        source: 'stub:p10a',
-      };
-    }
+    // Derive knowledge_type (allow test override for coercion path validation)
+    const knowledge_type = (
+      input._test_force_knowledge_type ??
+      KIND_TO_KNOWLEDGE_TYPE[input.kind]
+    ) as 'fato' | 'regra' | 'procedimento' | 'lacuna' | 'tool_request';
 
-    // user_explicit and human_approved skip the confidence check and
-    // get a low risk floor — the human is the source.
-    if (input.origin === 'user_explicit' || input.origin === 'human_approved') {
-      reasons.push(`origin=${input.origin}:human_provided`);
-      return {
-        level: 'low',
-        sensitivity: input.proposer_sensitivity_hint ?? 'low',
-        reasons,
-        source: 'stub:p10a',
-      };
-    }
+    // Boost derived_confidence for human-provided origins
+    const isHumanProvided =
+      input.origin === 'user_explicit' || input.origin === 'human_approved';
+    const derived_confidence = isHumanProvided
+      ? Math.max(input.confidence, 0.8)
+      : input.confidence;
 
-    if (input.confidence >= 0.6) {
-      reasons.push(`confidence>=0.6:${input.confidence.toFixed(2)}`);
-      return {
-        level: 'low',
-        sensitivity: input.proposer_sensitivity_hint ?? 'low',
-        reasons,
-        source: 'stub:p10a',
-      };
-    }
+    const scored = await scoreKnowledge(
+      {
+        knowledge_type,
+        topic: sensitivityToTopic(input.proposer_sensitivity_hint),
+        derived_confidence,
+        // evidence_count: not available in the KSM input shape; omit (scorer
+        // treats undefined as 0, which makes regra/procedimento ambiguous —
+        // conservative default, matches stub behaviour of routing rule→pending).
+      },
+      { gate, contextText: input.content_text.slice(0, 200) },
+    );
 
-    reasons.push(`confidence_below_threshold:${input.confidence.toFixed(2)}`);
-    return {
-      level: 'medium',
-      sensitivity: input.proposer_sensitivity_hint ?? 'low',
-      reasons,
-      source: 'stub:p10a',
-    };
+    // Map ScoredRisk → KnowledgeRiskScoreOutput
+    const level = scored.level as KnowledgeRiskLevel;
+    const sensitivity: KnowledgeSensitivity =
+      level === 'critical' || level === 'high'
+        ? 'high'
+        : level === 'medium'
+          ? 'medium'
+          : 'low';
+
+    const reasons = [
+      ...scored.triggers.map((t) => t.signal),
+      ...(scored.llm_reason ? [`llm:${scored.llm_reason}`] : []),
+    ];
+
+    const source: KnowledgeRiskScoreOutput['source'] =
+      scored.decided_by === 'llm_upgrade' ? 'llm_elevated' : 'p9c:knowledge';
+
+    return { level, sensitivity, reasons, source };
   }
 }
