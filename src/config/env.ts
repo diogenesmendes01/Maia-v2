@@ -282,6 +282,28 @@ const envSchema = z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
+    // P9b — Decision Engine V1 hot-path wiring.
+    // FEATURE_DECISION_ENGINE_V1: gates whether the Decision Engine produces
+    //   the DecisionPacket before each LLM call. Default OFF so no behaviour
+    //   change in production until explicitly enabled per tenant or globally.
+    // FEATURE_DECISION_ENGINE_V1_KILL_SWITCH: highest-precedence off-ramp.
+    //   Set to 'true' to hard-disable the engine across ALL tenants immediately
+    //   (no redeploy needed). Kill switch beats the flag.
+    // FEATURE_DECISION_ENGINE_ERROR_FALLBACK: controls what happens when the
+    //   engine throws unexpectedly (not budget-fallback, which is internal).
+    //   'fail-closed' (default): blocks the turn — caller sees blockedResponse.
+    //   'legacy': swallows the error and falls through to the pre-P9b path.
+    FEATURE_DECISION_ENGINE_V1: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
+    FEATURE_DECISION_ENGINE_V1_KILL_SWITCH: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
+    FEATURE_DECISION_ENGINE_ERROR_FALLBACK: z
+      .enum(['fail-closed', 'legacy'])
+      .default('fail-closed'),
   })
   .superRefine((cfg, ctx) => {
     if (cfg.LLM_PROVIDER === 'anthropic' && !cfg.ANTHROPIC_API_KEY) {
