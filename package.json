@@ -73,8 +73,6 @@
     "protobufjs": "^7.5.5"
   },
   "devDependencies": {
-    "@trpc/client": "11.0.0-rc.682",
-    "@trpc/react-query": "11.0.0-rc.682",
     "@trpc/server": "11.0.0-rc.682",
     "@eslint/js": "^10.0.1",
     "@types/node": "^25.9.1",
