@@ -62,14 +62,16 @@
  *     to the real data source.  Documented explicitly so it's not confused
  *     with an accidental omission.
  *
- *  7. ChannelPoliciesReaderAdapter  — wraps channelPoliciesRepo.
+ *  7. ChannelPoliciesReaderAdapter  — direct drizzle query on channel_policies.
  *     DE port: getForChannel(tenant_id, channel_id) → {channel_id,
  *              tenant_id, default_agent_id}
- *     DB schema: channel_policies.default_role_id (roles table has agent_id).
- *     We return agent_id from the context agent (getCurrentAgent()) as
- *     default_agent_id because the DB channel_policies model uses roles, not
- *     agent ids directly. Documented as KNOWN_STUB pending role→agent
- *     resolution.
+ *     DB schema: channel_policies has agent_id directly (no JOIN required).
+ *     The adapter queries channel_policies WHERE tenant_id=$1 AND channel_id=$2
+ *     and returns channel_policies.agent_id as default_agent_id. Tenant
+ *     isolation is guaranteed by the WHERE predicate.  If no row exists
+ *     (channel not yet configured), falls back to getCurrentAgent() so the
+ *     engine keeps the current context agent — identical to the old stub
+ *     behaviour for unconfigured channels.
  *
  *  8. ContentResolverAdapter  — wraps mensagensRepo.findById for content_ref
  *     resolution.  Falls back to empty string if not found.
@@ -94,6 +96,9 @@ import { evaluate as p9dEvaluate } from '@/governance/policy-dsl/evaluator.js';
 import { skillsRepo as p9aSkillsRepo } from '@/control-plane/skill-registry/skills-repo.js';
 import { procedureExecutionsRepo } from '@/db/repositories.js';
 import { getCurrentAgent } from '@/db/tenant-context.js';
+import { db } from '@/db/client.js';
+import { channel_policies } from '@/db/schema.js';
+import { and, eq } from 'drizzle-orm';
 import { incCounter, observeHistogram } from '@/lib/metrics.js';
 import { callLLM } from '@/lib/claude.js';
 import type {
@@ -381,29 +386,37 @@ const lockdownReaderAdapter: LockdownReader = {
 };
 
 // ---------------------------------------------------------------------------
-// 7. ChannelPoliciesReaderAdapter  (KNOWN_STUB — uses agent context)
+// 7. ChannelPoliciesReaderAdapter  — direct DB lookup on channel_policies
 // ---------------------------------------------------------------------------
 
 /**
- * KNOWN_STUB: DB channel_policies maps channel → role (not agent). To resolve
- * default_agent_id we would need to join channel_policies → roles → agents.
- * Until that join is implemented, we return the current context agent as the
- * default_agent_id (no channel-level routing override).
+ * Queries channel_policies with explicit tenant_id + channel_id predicates so
+ * there is no dependency on the request-scoped tenant context. Tenant isolation
+ * is enforced by the WHERE clause. If no row is found (channel not yet
+ * configured in DB), falls back to getCurrentAgent() — same behaviour as the
+ * former stub — so existing unconfigured channels are unaffected.
  *
- * Impact: AgentSelector always returns base.agent_id (which is already the
- * context agent). Channel routing overrides are not applied until this adapter
- * is upgraded.
+ * channel_policies.agent_id is the owning/default agent for the channel.  No
+ * JOIN to roles or agents is needed because agent_id is a direct column.
  */
 const channelPoliciesReaderAdapter: ChannelPoliciesReader = {
   async getForChannel(tenant_id, channel_id) {
-    // getCurrentAgent() is safe here: this is called inside the runtime hot
-    // path where tenant context is always set.
-    const agent_id = getCurrentAgent();
-    return {
-      tenant_id,
-      channel_id,
-      default_agent_id: agent_id,
-    };
+    const rows = await db
+      .select({ agent_id: channel_policies.agent_id })
+      .from(channel_policies)
+      .where(
+        and(
+          eq(channel_policies.tenant_id, tenant_id),
+          eq(channel_policies.channel_id, channel_id),
+        ),
+      )
+      .limit(1);
+
+    const stored_agent_id = rows[0]?.agent_id ?? null;
+    // Fall back to context agent for channels not yet configured in DB.
+    const default_agent_id = stored_agent_id ?? getCurrentAgent();
+
+    return { tenant_id, channel_id, default_agent_id };
   },
 };
 
