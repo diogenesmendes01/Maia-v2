@@ -103,6 +103,29 @@ export const PDF_FONTS = {
 } as const;
 
 /**
+ * Tight allowlist of local paths that renderPdfToBuffer is permitted to access.
+ *
+ * pdfmake calls localAccessPolicy(path) for every local resource:
+ *   • built-in font names (e.g. 'Helvetica', 'Helvetica-Bold') — loaded by pdfkit
+ *   • filesystem paths from docDefinition.images / .attachments / .files
+ *
+ * We allow ONLY the four Helvetica variants registered in PDF_FONTS.  All other
+ * paths — including arbitrary OS paths like '/etc/passwd' or '.env' — are denied,
+ * causing pdfmake to throw "Access to local file denied by resource access policy".
+ *
+ * SECURITY: do NOT broaden this set without a deliberate review.  Adding a wildcard
+ * or directory prefix here would re-open the SSRF / local-file-embedding vector.
+ */
+const ALLOWED_LOCAL_PATHS = new Set<string>([
+  // Exact font names used as PDF_FONTS values (pdfmake passes these to the policy
+  // when it needs to resolve built-in pdfkit fonts — they are NOT filesystem paths).
+  'Helvetica',
+  'Helvetica-Bold',
+  'Helvetica-Oblique',
+  'Helvetica-BoldOblique',
+]);
+
+/**
  * Render a pdfmake docDefinition to a Buffer using the Node API. Lazy-loads
  * the pdfmake top-level module (~5MB) the first time it's called per process.
  *
@@ -127,9 +150,11 @@ export async function renderPdfToBuffer(docDefinition: unknown): Promise<Buffer>
 
   // Configure fonts and access policies on the shared instance.
   pdfmakeInstance.setFonts(PDF_FONTS);
-  // Allow local font resolution (built-in Helvetica from pdfkit).
-  // Block external URL fetches — our fonts are all built-in.
-  pdfmakeInstance.setLocalAccessPolicy(() => true);
+  // Only allow access to the exact built-in Helvetica font names registered in
+  // PDF_FONTS.  All other local paths (including docDefinition.images / attachments
+  // / files with filesystem paths) are denied by default — this blocks arbitrary
+  // local file embedding.  Block all external URL fetches too.
+  pdfmakeInstance.setLocalAccessPolicy((path: string) => ALLOWED_LOCAL_PATHS.has(path));
   pdfmakeInstance.setUrlAccessPolicy(() => false);
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
