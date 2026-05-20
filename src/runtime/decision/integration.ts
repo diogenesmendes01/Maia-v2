@@ -1,5 +1,5 @@
 /**
- * P9b — Integration shim for Decision Engine in the runtime hot path.
+ * P9b (Camada 2) — Integration shim for Decision Engine in the runtime hot path.
  *
  * Spec §12.2 + master invariante 14: the FEATURE_DECISION_ENGINE_V1 flag
  * controls only whether the Decision Engine V1 produces the DecisionPacket.
@@ -13,7 +13,8 @@
  *
  *  2. `runDecisionEngineForTurn(base)` — production hot-path wrapper used by
  *     agent/core.ts. Reads env vars from config singleton, instantiates a
- *     shared engine singleton, and enforces fail-closed semantics:
+ *     shared engine singleton wired with REAL production adapters
+ *     (P8e/P9a/P9d/P9c), and enforces fail-closed semantics:
  *       • kill switch ON  → { engine_ran: false, skip_reason: 'kill_switch' }
  *       • flag OFF        → { engine_ran: false, skip_reason: 'flag_off' }
  *       • engine throws   →
@@ -21,6 +22,16 @@
  *             → { engine_ran: false, skip_reason: 'engine_error' }
  *           FEATURE_DECISION_ENGINE_ERROR_FALLBACK='fail-closed' (default)
  *             → throws DecisionEngineFailClosedError (caller blocks the turn)
+ *
+ * `getDecisionEngine()` returns the process-lifetime singleton wired with
+ * REAL production adapters (P8e/P9a/P9d/P9c). With FEATURE_DECISION_ENGINE_V1=true
+ * this performs real policy + skill + DSL evaluation per spec §12.
+ *
+ * TODO(P8a #96): update `src/agent/react-loop.ts` to:
+ *   1. build BaseContextPacket from incoming Mensagem + Pessoa + Conversa
+ *   2. call `runDecisionEngineIfEnabled(base)`  (no env arg needed — uses singleton)
+ *   3. if `result.block` present → handle blocked turn (escalate / template)
+ *   4. otherwise pass `result.packet` to existing prompt/response pipeline
  */
 import {
   createDecisionEngine,
@@ -30,6 +41,7 @@ import {
 import { isDecisionEngineV1Enabled } from '../feature-flags/decision-engine-flag.js';
 import type { BaseContextPacket } from '../context-packet/types.js';
 import type { MetricsClient } from './types.js';
+import { createProductionDecisionEngineEnv } from './prod-env.js';
 import { logger } from '@/lib/logger.js';
 import { config } from '@/config/env.js';
 
@@ -82,10 +94,15 @@ export class DecisionEngineFailClosedError extends Error {
  *
  * Note: budget exhaustion is NOT an unexpected error — the engine returns
  * a `fallback_applied` packet and `engine_ran: true`.
+ *
+ * @param base  — The BaseContextPacket for the current turn.
+ * @param env   — Optional override env (defaults to real production singleton).
+ *               Pass a mock env in tests that don't want the real adapters.
+ * @param metrics — Optional metrics client override.
  */
 export async function runDecisionEngineIfEnabled(
   base: BaseContextPacket,
-  env: CreateDecisionEngineEnv,
+  env?: CreateDecisionEngineEnv,
   metrics?: MetricsClient,
 ): Promise<RunDecisionEngineResult> {
   const enabled = await isDecisionEngineV1Enabled(base.tenant_id);
@@ -95,7 +112,8 @@ export async function runDecisionEngineIfEnabled(
   }
 
   try {
-    const engine = createDecisionEngine(env);
+    // Use the real production singleton when no override env is supplied.
+    const engine = env ? createDecisionEngine(env) : getDecisionEngine();
     const result = await engine.run({ base });
     return { engine_ran: true, result };
   } catch (err) {
@@ -108,62 +126,24 @@ export async function runDecisionEngineIfEnabled(
 }
 
 // ============================================================================
-// Production hot-path singleton
+// Production hot-path singleton — wired with real production adapters (PR #154)
 // ============================================================================
 
 let _singleton: ReturnType<typeof createDecisionEngine> | null = null;
 
 /**
- * Returns the process-wide Decision Engine singleton.
- * Constructed lazily on first call with production stub deps (real deps wired
- * as P8e/P9a/P9d phases complete). Call only when the flag is ON.
+ * Returns the process-lifetime Decision Engine singleton backed by real
+ * production adapters (P8e/P9a/P9d/P9c).  Creates it on first call.
+ *
+ * The singleton is safe to reuse across requests because all per-request
+ * state lives in BudgetTracker + PepAudit created inside `engine.run()`.
  *
  * @internal — exported for test spy injection; prefer `runDecisionEngineForTurn`.
  */
 export function getDecisionEngine(): ReturnType<typeof createDecisionEngine> {
   if (_singleton) return _singleton;
-
-  // Production stub deps (mirrors what integration tests use; real adapters
-  // arrive with P8e PolicyDescriptorResolver + P9a SkillsRepo + P9d evaluator).
-  const stubEnv: CreateDecisionEngineEnv = {
-    resolver: {
-      resolveDescriptors: async () => [],
-    },
-    policyEvaluator: {
-      evaluate: async () => ({ action: 'allow', reason: 'stub-allow' }),
-    },
-    policyRepo: {
-      getBody: async () => null,
-      getBodySync: () => null,
-    },
-    skillsRepo: {
-      findActive: async () => [],
-      find: async () => null,
-    },
-    channelPolicies: {
-      getForChannel: async (tenant_id, channel_id) => ({
-        tenant_id,
-        channel_id,
-        default_agent_id: 'default',
-      }),
-    },
-    lockdownReader: {
-      isChannelLockedDown: async () => false,
-      isTenantInGlobalLockdown: async () => false,
-      tenantHasSensitiveContext: async () => false,
-    },
-    proceduresRepo: {
-      findExecution: async () => null,
-    },
-    contentResolver: {
-      text: async () => '',
-    },
-    haiku: {
-      classify: async () => ({ label: 'unknown', confidence: 0.5 }),
-    },
-  };
-
-  _singleton = createDecisionEngine(stubEnv);
+  const env = createProductionDecisionEngineEnv();
+  _singleton = createDecisionEngine(env);
   return _singleton;
 }
 
