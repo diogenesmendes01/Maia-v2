@@ -1513,7 +1513,7 @@ git commit -m "feat(p10a): barrel export + architecture lock CODEOWNERS"
 **Files:**
 - Create: `tests/integration/p10a-knowledge-lifecycle.spec.ts` (full 7 cenários)
 - Create: `scripts/acceptance/p10a-knowledge-state-machine.sh`
-- Create: `docs/superpowers/runbooks/p10a-knowledge-state-machine.md`
+- Create: `docs/runbooks/p10a-knowledge-state-machine.md`
 
 - [ ] **Step 1: Write integration tests** (7 cenários per spec §11.2)
 
@@ -1653,7 +1653,7 @@ Create `scripts/acceptance/p10a-knowledge-state-machine.sh` per spec §12.
 
 - [ ] **Step 3: Write runbook**
 
-Create `docs/superpowers/runbooks/p10a-knowledge-state-machine.md` documenting:
+Create `docs/runbooks/p10a-knowledge-state-machine.md` documenting:
 - 9 states + transitions
 - Auto-promoter thresholds (1 in 24h, 3 in 30d, 7 in 90d)
 - TTL defaults (30d ephemeral, 90d others)
@@ -1697,7 +1697,7 @@ Expected: all 12 gates pass.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add tests/integration/p10a-knowledge-lifecycle.spec.ts scripts/acceptance/p10a-knowledge-state-machine.sh docs/superpowers/runbooks/p10a-knowledge-state-machine.md
+git add tests/integration/p10a-knowledge-lifecycle.spec.ts scripts/acceptance/p10a-knowledge-state-machine.sh docs/runbooks/p10a-knowledge-state-machine.md
 git commit -m "feat(p10a): integration tests + acceptance gates + runbook"
 ```
 
@@ -1717,7 +1717,7 @@ When all 12 tasks + sub-steps completed:
 - [ ] All 7 integration test cenários pass (§11.2).
 - [ ] All 12 acceptance gates pass (§12).
 - [ ] CODEOWNERS configured: founder approval for transitions.ts / visibility.ts / decideInitialStatus.
-- [ ] Runbook published at `docs/superpowers/runbooks/p10a-knowledge-state-machine.md`.
+- [ ] Runbook published at `docs/runbooks/p10a-knowledge-state-machine.md`.
 - [ ] Feature flag `FEATURE_KNOWLEDGE_STATE_MACHINE_V1=true` ready for canary rollout.
 - [ ] Cognitive module log emits rows with module='knowledge-state-machine' + p95 latency <300ms propose, <60s auto-promoter.
 - [ ] `npm run lint` / `npm run typecheck` / `npm test` all zero errors/warnings.

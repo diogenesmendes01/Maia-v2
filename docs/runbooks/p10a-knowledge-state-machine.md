@@ -221,14 +221,29 @@ either:
 
 Test fence: `tests/unit/ksm-conflict-detection.spec.ts`.
 
-### 6.3 DB-level enforcement (migration 044)
+### 6.3 DB-level enforcement (migrations 050 + 051)
 
 `enforce_lifecycle_transition()` PL/pgSQL trigger fires `BEFORE UPDATE
 OF lifecycle_status` on all 4 user-layer tables and mirrors
 `ALLOWED_TRANSITIONS`. This blocks **direct SQL UPDATEs** that bypass
 the state machine — even `psql` sessions, ad-hoc scripts, or buggy
-migrations. Error code: `check_violation` with message
-`illegal knowledge lifecycle transition: <from> -> <to>`.
+migrations. Error code: `check_violation` (SQLSTATE `check_violation`)
+with message `illegal knowledge lifecycle transition: <from> -> <to>`.
+
+The trigger is attached to tables `memory_entry`, `agent_facts`,
+`learned_rules`, and `behavioral_hint` via
+`trg_enforce_lifecycle_transition_<table>` (created by
+`051_p10a_enforce_lifecycle_transition.sql`). Lifecycle columns and
+indexes are added by `050_p10a_ksm_lifecycle_and_indexes.sql`.
+
+To roll back DB enforcement during an incident:
+```sql
+DROP TRIGGER IF EXISTS trg_enforce_lifecycle_transition_memory_entry ON memory_entry;
+DROP TRIGGER IF EXISTS trg_enforce_lifecycle_transition_agent_facts ON agent_facts;
+DROP TRIGGER IF EXISTS trg_enforce_lifecycle_transition_learned_rules ON learned_rules;
+DROP TRIGGER IF EXISTS trg_enforce_lifecycle_transition_behavioral_hint ON behavioral_hint;
+```
+(Re-apply by re-running `psql < migrations/051_p10a_enforce_lifecycle_transition.sql`.)
 
 The trigger function must be kept in sync with `transitions.ts`.
 
@@ -271,7 +286,7 @@ Run before each rollout step:
 bash scripts/acceptance/p10a-knowledge-state-machine.sh
 ```
 
-All 12 gates must pass. Failing gates indicate that one of the
+All 18 gates must pass. Failing gates indicate that one of the
 Architecture-Lock invariants has been weakened — escalate to founder
 before proceeding.
 
