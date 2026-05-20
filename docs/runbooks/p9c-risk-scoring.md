@@ -221,8 +221,15 @@ Indica regressão no prompt do Haiku.
 
 ## Migrations
 
-Nenhuma — `risk_band` é campo de packet, não persiste standalone. Os
-triggers são logados em `cognitive_module_log.metadata.triggers`.
+Nenhuma — `risk_band` é campo de packet, não persiste standalone.
+
+Os triggers são retornados em `ScoredRisk.triggers` (em memória) mas **não são
+persistidos** em `cognitive_module_log.metadata`. O campo `metadata` é registrado
+como `{}` por `runCognitiveModule` — `scoreTurnRisk`/`scoreKnowledgeRisk` retornam
+triggers no objeto `ScoredRisk`, mas não gravam esse dado no log de audit. Para
+post-mortems baseados em triggers, capture-os no callback do scorer antes de
+descartar o `ScoredRisk`; queries em `cognitive_module_log.metadata.triggers`
+sempre retornarão `{}`.
 
 ## Rollout
 
