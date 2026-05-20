@@ -41,6 +41,12 @@ export interface BaseContextPacket {
   active_procedure_execution_id: string | null;
   feature_flags_snapshot: Record<string, boolean>;
   entered_at_ms: number;
+  /**
+   * Count of active sensitive memories visible to this turn (user-layer scope).
+   * Used by RiskScorer P9c to derive a risk floor — many sensitive memories
+   * = higher risk surface. Always >= 0.
+   */
+  active_sensitive_memory_count: number;
 }
 
 // ============================================================================

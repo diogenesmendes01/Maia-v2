@@ -595,8 +595,8 @@ export class RiskScorerProdAdapter implements RiskScorer {
     const signals: TurnRiskSignals = {
       topic,
       tool_kinds: tool_kinds.length > 0 ? tool_kinds : undefined,
+      active_sensitive_memory_count: input.base.active_sensitive_memory_count,
       // skill_confidence / skill_threshold not available at this stage (pre-SkillSelector).
-      // active_sensitive_memory_count not in BaseContextPacket — omit (conservative: no floor).
       // risk_override not carried in BaseContextPacket directly — omit.
     };
 
