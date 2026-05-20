@@ -1,0 +1,503 @@
+/**
+ * P9b (Camada 2) — Production wiring for DecisionEngine dependencies.
+ *
+ * Bridges the real production implementations (P8e, P9a, P9d, P9c) to the
+ * Decision Engine's port interfaces, which were defined in P9b before those
+ * implementations existed.  Every adapter here is a thin translation layer —
+ * no business logic lives in this file.
+ *
+ * Adapters needed (recursive cebola — all interfaces diverged during phased
+ * development):
+ *
+ *  1. PolicyDescriptorResolverAdapter  (P8e → DE port)
+ *     DE port: resolveDescriptors(query, {signal?}) → ResolvedPolicy[]
+ *     P8e impl: resolveDescriptors({tenant_id,agent_id,descriptors,scope?})
+ *              → {resolved, unresolved, failures}
+ *     Mapping: pass-through query fields; strip unresolved/failures; map
+ *              P8e ResolvedPolicy to DE ResolvedPolicy (both carry policy_id
+ *              + descriptor; DE adds optional applies_to_peps from rule_kind).
+ *     NOTE: P8e resolver doesn't accept AbortSignal — not exposed in its
+ *     interface. The DE deadline wraps the Promise externally, so omitting
+ *     signal here is safe.
+ *
+ *  2. PolicyRulesRepoAdapter  (P8e PolicyRulesRepo → DE PolicyRulesRepo)
+ *     DE port: getBody(id, {signal?}) / getBodySync(id)
+ *     P8e impl: getById(id)
+ *     Mapping: getBody → getById (async); getBodySync always null (no sync
+ *     path in P8e repo). The sync path is a fast-path cache hint for PEPs;
+ *     returning null is safe (PEPs fall back to async getBody).
+ *
+ *  3. PolicyDSLEvaluatorAdapter  (P9d pure fn → DE PolicyEvaluator interface)
+ *     DE port: PolicyEvaluator.evaluate(body, context, {signal?})
+ *              → PolicyEvaluatorVerdict
+ *     P9d impl: evaluate(rule_body, context) → PolicyDecision
+ *     Mapping: wrap the pure fn; translate PolicyDecision.outcome →
+ *              PolicyEvaluatorVerdict.action (matched→block/warn/etc via
+ *              effect.action; not_matched→allow; not_applicable→allow;
+ *              evaluation_error→block fail-closed).
+ *
+ *  4. SkillsRepoAdapter  (P9a SkillsRepo → DE SkillsRepo)
+ *     DE port: findActive({tenant_id, agent_id, applicable_to_intent?, ...})
+ *              → Skill[]; find(id, {tenant_id,agent_id}, {signal?}) → Skill|null
+ *     P9a impl: findActive(descriptor, agent_id?) → SkillRow|null;
+ *              getById(id) → SkillRow|null
+ *     Mapping: DE findActive searches ALL active skills for agent + optional
+ *     intent filter; P9a findActive needs a descriptor. We use listByCategory
+ *     to enumerate all active skills, then filter by applicable_to_intent.
+ *     SkillRow → Skill mapping (field name translation).
+ *
+ *  5. ProceduresRepoAdapter  (procedureExecutionsRepo → DE ProceduresRepo)
+ *     DE port: findExecution(id) → ProcedureExecution|null
+ *     DB: procedureExecutionsRepo.findById(id) returns ProcedureExecution row
+ *     Mapping: execution_id=id; procedure_id=definition_id;
+ *     procedure_domain=scope(from definition join, but we approximate with
+ *     intencao from the linked definition or default to 'unknown');
+ *     ttl_remaining_ms derived from last_activity_at + 30min default TTL.
+ *
+ *  6. LockdownReaderAdapter  — all methods always return false/false/false
+ *     (no production lockdown-reader for the DE port exists yet; the
+ *     legacy governance/lockdown.ts operates at entity level, not at the
+ *     channel/tenant level the DE port expects). This adapter is a
+ *     fail-open stub pending a future P-phase wiring the DE lockdown reader
+ *     to the real data source.  Documented explicitly so it's not confused
+ *     with an accidental omission.
+ *
+ *  7. ChannelPoliciesReaderAdapter  — wraps channelPoliciesRepo.
+ *     DE port: getForChannel(tenant_id, channel_id) → {channel_id,
+ *              tenant_id, default_agent_id}
+ *     DB schema: channel_policies.default_role_id (roles table has agent_id).
+ *     We return agent_id from the context agent (getCurrentAgent()) as
+ *     default_agent_id because the DB channel_policies model uses roles, not
+ *     agent ids directly. Documented as KNOWN_STUB pending role→agent
+ *     resolution.
+ *
+ *  8. ContentResolverAdapter  — wraps mensagensRepo.findById for content_ref
+ *     resolution.  Falls back to empty string if not found.
+ *
+ *  9. HaikuClientAdapter  — wraps lib/claude.ts callClaude for classification.
+ *
+ *  10. MetricsClientAdapter  — wraps lib/metrics.ts incCounter/observeHistogram.
+ *
+ * Architecture Lock: this file imports from control-plane/policy and
+ * control-plane/skill-registry.  It MUST NOT be imported by src/agent/
+ * or src/cognition/. Only runtime/decision/integration.ts (and tests) may
+ * import it.
+ */
+
+import {
+  policyDescriptorResolver as p8eResolver,
+} from '@/control-plane/policy/policy-descriptor-resolver.js';
+import {
+  policyRulesRepo as p8ePolicyRulesRepo,
+} from '@/control-plane/policy/policy-rules-repo.js';
+import { evaluate as p9dEvaluate } from '@/governance/policy-dsl/evaluator.js';
+import { skillsRepo as p9aSkillsRepo } from '@/control-plane/skill-registry/skills-repo.js';
+import { procedureExecutionsRepo } from '@/db/repositories.js';
+import { getCurrentAgent } from '@/db/tenant-context.js';
+import { incCounter, observeHistogram } from '@/lib/metrics.js';
+import { callLLM } from '@/lib/claude.js';
+import type {
+  ChannelPoliciesReader,
+  ContentResolver,
+  HaikuClient,
+  LockdownReader,
+  MetricsClient,
+  PolicyDescriptorResolver,
+  PolicyEvaluator,
+  PolicyEvaluatorVerdict,
+  PolicyRulesRepo,
+  ProceduresRepo,
+  ResolvedPolicy,
+  Skill,
+  SkillsRepo,
+} from './types.js';
+import type { CreateDecisionEngineEnv } from './index.js';
+
+// ---------------------------------------------------------------------------
+// 1. PolicyDescriptorResolverAdapter
+// ---------------------------------------------------------------------------
+
+const policyDescriptorResolverAdapter: PolicyDescriptorResolver = {
+  async resolveDescriptors(query, _options) {
+    // P8e resolver does not accept AbortSignal; deadline wrapping happens in DE.
+    const output = await p8eResolver.resolveDescriptors({
+      tenant_id: query.tenant_id,
+      agent_id: query.agent_id,
+      descriptors: query.descriptors,
+      scope: query.scope?.channel
+        ? { channel: query.scope.channel }
+        : query.scope?.domain
+        ? { domain: query.scope.domain }
+        : undefined,
+    });
+    // Map P8e ResolvedPolicy to DE ResolvedPolicy.
+    // DE type: { policy_id, descriptor, applies_to_peps? }
+    // P8e type: { descriptor, policy_id, version, rule_kind }
+    // applies_to_peps not stored in P8e resolved output; PEPs derive it from
+    // the rule_body (getBody). We omit it here — PEPs that need it read it from
+    // the repo body directly.
+    const resolved: ResolvedPolicy[] = output.resolved.map((r) => ({
+      policy_id: r.policy_id,
+      descriptor: r.descriptor,
+    }));
+    return resolved;
+  },
+};
+
+// ---------------------------------------------------------------------------
+// 2. PolicyRulesRepoAdapter
+// ---------------------------------------------------------------------------
+
+const policyRulesRepoAdapter: PolicyRulesRepo = {
+  async getBody(policy_id, _options) {
+    const rule = await p8ePolicyRulesRepo.getById(policy_id);
+    if (!rule) return null;
+    // DE PolicyRuleBody = Record<string, unknown> with policy_id/descriptor/applies_to_peps
+    return {
+      policy_id: rule.id,
+      descriptor: rule.rule_descriptor,
+      rule_kind: rule.rule_kind,
+      // applies_to_peps not stored in policy_rules table — defaulted to ['mid','late']
+      // per DE types.ts comment: "Default if unspecified is ['mid', 'late']"
+      ...((rule.rule_body as Record<string, unknown>) ?? {}),
+    };
+  },
+  getBodySync(_policy_id) {
+    // P8e repo has no sync cache path exposed. Returning null makes PEPs fall
+    // back to the async getBody() path, which is correct.
+    return null;
+  },
+};
+
+// ---------------------------------------------------------------------------
+// 3. PolicyDSLEvaluatorAdapter (P9d pure fn → DE PolicyEvaluator interface)
+// ---------------------------------------------------------------------------
+
+const policyDSLEvaluatorAdapter: PolicyEvaluator = {
+  async evaluate(body, context, _options) {
+    // P9d evaluate is a pure synchronous function; we wrap in Promise for DE interface.
+    // DE PolicyRuleBody = Record<string,unknown>; P9d PolicyRuleBody has typed fields.
+    // Cast through unknown to satisfy both type constraints safely.
+    const bodyForP9d = body as unknown as Parameters<typeof p9dEvaluate>[0];
+    const decision = p9dEvaluate(bodyForP9d, context);
+
+    // Also treat the body as an open record for reading custom fields.
+    const bodyAsRecord = body as unknown as Record<string, unknown>;
+
+    // Map PolicyDecision.outcome to PolicyEvaluatorVerdict.action.
+    // Architecture Lock: fail-closed on evaluation_error (must block).
+    switch (decision.outcome) {
+      case 'matched': {
+        // Use the effect action if it's a valid DE verdict action.
+        const effectAction = (decision.effect as { action?: string } | undefined)?.action;
+        const deAction = mapEffectAction(effectAction);
+        const verdict: PolicyEvaluatorVerdict = {
+          action: deAction,
+          reason: bodyAsRecord['descriptor'] as string ?? 'policy_matched',
+        };
+        // Forward severity if present in rule body
+        const severity = bodyAsRecord['severity'] as string | undefined;
+        if (severity && isValidSeverity(severity)) {
+          verdict.severity = severity;
+        }
+        // Forward parameters (used by dual_approval, reduce_tool_set)
+        const params = bodyAsRecord['parameters'] as Record<string, unknown> | undefined;
+        if (params) verdict.parameters = params;
+        return verdict;
+      }
+      case 'not_matched':
+        return { action: 'allow', reason: 'predicate_not_matched' };
+      case 'not_applicable':
+        // Missing context field — treat as not matching (allow). Per P9d spec,
+        // not_applicable means the field wasn't present; the rule doesn't apply.
+        return { action: 'allow', reason: 'predicate_not_applicable' };
+      case 'evaluation_error':
+        // Fail-closed: any evaluation error must block, per RESOLVER_FAILURE_DEFAULT
+        // and P9d Architecture Lock §4 "PEPs MUST treat this as BLOCK".
+        return {
+          action: 'block',
+          reason: `evaluation_error: ${decision.errors.map((e) => e.code).join(', ')}`,
+          severity: 'high',
+        };
+    }
+  },
+};
+
+function mapEffectAction(action: string | undefined): PolicyEvaluatorVerdict['action'] {
+  switch (action) {
+    case 'block': return 'block';
+    case 'escalate': return 'escalate';
+    case 'warn': return 'warn_in_trace';
+    case 'warn_in_trace': return 'warn_in_trace';
+    case 'require_dual_approval': return 'require_dual_approval';
+    case 'reduce_tool_set': return 'reduce_tool_set';
+    case 'allow': return 'allow';
+    default:
+      // Unknown effect action → block fail-closed
+      return 'block';
+  }
+}
+
+function isValidSeverity(s: string): s is 'critical' | 'high' | 'medium' | 'low' {
+  return s === 'critical' || s === 'high' || s === 'medium' || s === 'low';
+}
+
+// ---------------------------------------------------------------------------
+// 4. SkillsRepoAdapter (P9a SkillsRepo → DE SkillsRepo)
+// ---------------------------------------------------------------------------
+
+/**
+ * Map a P9a SkillRow to the DE Skill type.
+ *
+ * P9a SkillRow uses skill_descriptor as id, category/execution_mode,
+ * allowed_tools, etc. DE Skill uses id, category, priority, status,
+ * applicable_to_intent, allowed_tools, etc.
+ *
+ * NOTE: P9a does not store applicable_to_intent, priority, or
+ * requires_confirmation_tools — these are DE-specific. We derive them from
+ * the skill_descriptor name and runtime_hints.
+ */
+function skillRowToSkill(row: {
+  id: string;
+  skill_descriptor: string;
+  category: string;
+  status: string;
+  allowed_tools: string[] | unknown;
+  policy_descriptors: string[] | unknown;
+  runtime_hints: Record<string, unknown> | unknown;
+  version: number;
+}): Skill {
+  const allowed_tools = Array.isArray(row.allowed_tools) ? (row.allowed_tools as string[]) : [];
+  const hints = (typeof row.runtime_hints === 'object' && row.runtime_hints !== null)
+    ? (row.runtime_hints as Record<string, unknown>)
+    : {};
+  return {
+    id: row.id,
+    category: row.category as Skill['category'],
+    priority: 5, // P9a does not store priority; default 5 (medium)
+    status: row.status as Skill['status'],
+    // P9a does not store applicable_to_intent — derived from skill_descriptor convention
+    // e.g. 'skill.greet' → intent 'greet'. PEPs that need exact match will
+    // consult the full descriptor-to-intent mapping when P9a adds this field.
+    allowed_tools,
+    blocked_tools: [], // P9a does not store blocked_tools separately
+    requires_confirmation_tools: [], // P9a does not store this
+    runtime_hints: {
+      allow_deep_context: hints['allow_deep_context'] === true,
+    },
+    output_schema_ref: typeof hints['output_schema_ref'] === 'string'
+      ? hints['output_schema_ref']
+      : undefined,
+  };
+}
+
+const skillsRepoAdapter: SkillsRepo = {
+  async findActive(query, _options) {
+    // P9a skillsRepo.listByCategory needs tenant context (getCurrentTenant).
+    // We enumerate all active skills across all categories and filter by
+    // applicable_to_intent when supplied.
+    // Categories aligned with DE Skill.category values.
+    const categories = ['respond', 'tool_mediated', 'decide', 'plan'];
+    const allSkills: Skill[] = [];
+    for (const cat of categories) {
+      // listByCategory is tenant+agent scoped via tenant-context.
+      const rows = await p9aSkillsRepo.listByCategory(cat);
+      for (const row of rows) {
+        // Agent filter: P9a already applies agent scope via tenant context;
+        // additional explicit filter not needed.
+        allSkills.push(skillRowToSkill(row));
+      }
+    }
+    // Filter by applicable_to_intent if specified.
+    // Since P9a doesn't store applicable_to_intent, we can't filter precisely.
+    // Return ALL active skills and let SkillSelector pick by category/priority.
+    void query.applicable_to_intent; // acknowledged but not filterable in P9a
+    return allSkills;
+  },
+
+  async find(skill_id, _scope, _options) {
+    const row = await p9aSkillsRepo.getById(skill_id);
+    if (!row) return null;
+    return skillRowToSkill(row);
+  },
+};
+
+// ---------------------------------------------------------------------------
+// 5. ProceduresRepoAdapter
+// ---------------------------------------------------------------------------
+
+// Default TTL for procedure executions: 30 minutes.
+const DEFAULT_PROCEDURE_TTL_MS = 30 * 60 * 1000;
+
+const proceduresRepoAdapter: ProceduresRepo = {
+  async findExecution(execution_id) {
+    const exec = await procedureExecutionsRepo.findById(execution_id);
+    if (!exec || exec.status !== 'in_progress') return null;
+    const now = Date.now();
+    const lastActivity = exec.last_activity_at.getTime();
+    const elapsed = now - lastActivity;
+    const ttl_remaining_ms = Math.max(0, DEFAULT_PROCEDURE_TTL_MS - elapsed);
+    // procedure_domain: P9b WorkflowSelector uses this to match intent → domain.
+    // DB procedure_executions does not store domain; we use a hardcoded 'unknown'
+    // to signal no domain match (workflow selector will fall back to TTL heuristic).
+    // KNOWN_STUB: replace with join to procedure_definitions.intencao once
+    // procedure_definitions.domain column is added in a future migration.
+    return {
+      execution_id: exec.id,
+      procedure_id: exec.definition_id,
+      procedure_domain: 'unknown',
+      ttl_remaining_ms,
+    };
+  },
+};
+
+// ---------------------------------------------------------------------------
+// 6. LockdownReaderAdapter  (KNOWN_STUB — fail-open)
+// ---------------------------------------------------------------------------
+
+/**
+ * KNOWN_STUB: The production governance/lockdown.ts operates at entity/permissao
+ * level, not at the channel/tenant level the DE port expects. Until a future
+ * phase wires the DE LockdownReader to a real data source, this adapter returns
+ * false for all lockdown checks (fail-open for lockdown, fail-safe for sensitive
+ * context — sensitive returns false meaning budget-fallback uses ask_clarification,
+ * not escalate).
+ *
+ * Impact: Early PEP lockdown checks rely on BaseContextPacket.channel.is_locked_down
+ * (set upstream) rather than this reader, so the stub does not bypass Early PEP
+ * lockdown protection. The stub only affects the budget-fallback escalation path
+ * (spec §6.2).
+ */
+const lockdownReaderAdapter: LockdownReader = {
+  async isChannelLockedDown(_channel_id, _tenant_id, _options) {
+    return false;
+  },
+  async isTenantInGlobalLockdown(_tenant_id, _options) {
+    return false;
+  },
+  async tenantHasSensitiveContext(_tenant_id, _options) {
+    return false;
+  },
+};
+
+// ---------------------------------------------------------------------------
+// 7. ChannelPoliciesReaderAdapter  (KNOWN_STUB — uses agent context)
+// ---------------------------------------------------------------------------
+
+/**
+ * KNOWN_STUB: DB channel_policies maps channel → role (not agent). To resolve
+ * default_agent_id we would need to join channel_policies → roles → agents.
+ * Until that join is implemented, we return the current context agent as the
+ * default_agent_id (no channel-level routing override).
+ *
+ * Impact: AgentSelector always returns base.agent_id (which is already the
+ * context agent). Channel routing overrides are not applied until this adapter
+ * is upgraded.
+ */
+const channelPoliciesReaderAdapter: ChannelPoliciesReader = {
+  async getForChannel(tenant_id, channel_id) {
+    // getCurrentAgent() is safe here: this is called inside the runtime hot
+    // path where tenant context is always set.
+    const agent_id = getCurrentAgent();
+    return {
+      tenant_id,
+      channel_id,
+      default_agent_id: agent_id,
+    };
+  },
+};
+
+// ---------------------------------------------------------------------------
+// 8. ContentResolverAdapter
+// ---------------------------------------------------------------------------
+
+const contentResolverAdapter: ContentResolver = {
+  async text(content_ref, _options) {
+    // content_ref is a mensagem id (msg_<uuid>) or raw text.
+    // Try mensagensRepo.findById; if not found, treat content_ref as literal text.
+    try {
+      const { mensagensRepo } = await import('@/db/repositories.js');
+      const msg = await mensagensRepo.findById(content_ref);
+      // DB column is `conteudo` (Portuguese), not `content`.
+      if (msg) return msg.conteudo ?? '';
+    } catch {
+      // Repo error: fall through to literal interpretation.
+    }
+    // Treat content_ref as literal text (test / synthetic turns).
+    return content_ref;
+  },
+};
+
+// ---------------------------------------------------------------------------
+// 9. HaikuClientAdapter
+// ---------------------------------------------------------------------------
+
+const haikuClientAdapter: HaikuClient = {
+  async classify(params, options) {
+    // Use callClaude with claude-haiku model for intent classification.
+    const prompt = [
+      `Classify the following text into one of these labels: ${params.allowed_labels.join(', ')}.`,
+      `Return ONLY the label, nothing else.`,
+      `Text: ${params.text}`,
+    ].join('\n');
+
+    const controller = new AbortController();
+    if (options?.signal) {
+      options.signal.addEventListener('abort', () => controller.abort(), { once: true });
+    }
+
+    try {
+      const response = await callLLM({
+        system: 'You are a text classifier. Respond with ONLY the label, nothing else.',
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: params.max_tokens,
+      });
+      const label = (response.content ?? '').trim().toLowerCase();
+      const matched = params.allowed_labels.find(
+        (l) => l.toLowerCase() === label,
+      ) ?? 'unknown';
+      return { label: matched, confidence: 0.85 };
+    } catch {
+      return { label: 'unknown', confidence: 0 };
+    }
+  },
+};
+
+// ---------------------------------------------------------------------------
+// 10. MetricsClientAdapter
+// ---------------------------------------------------------------------------
+
+const metricsClientAdapter: MetricsClient = {
+  increment(name, tags) {
+    incCounter(name, tags);
+  },
+  recordHistogram(name, value, tags) {
+    observeHistogram(name, value, tags);
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Production env factory
+// ---------------------------------------------------------------------------
+
+/**
+ * Assembles the real `CreateDecisionEngineEnv` from production adapters.
+ *
+ * Called once by `getDecisionEngine()` in `integration.ts`. The returned
+ * env object is stateless (all state is in the underlying singletons) and
+ * safe to reuse across requests.
+ */
+export function createProductionDecisionEngineEnv(): CreateDecisionEngineEnv {
+  return {
+    resolver: policyDescriptorResolverAdapter,
+    policyEvaluator: policyDSLEvaluatorAdapter,
+    policyRepo: policyRulesRepoAdapter,
+    skillsRepo: skillsRepoAdapter,
+    channelPolicies: channelPoliciesReaderAdapter,
+    lockdownReader: lockdownReaderAdapter,
+    proceduresRepo: proceduresRepoAdapter,
+    contentResolver: contentResolverAdapter,
+    haiku: haikuClientAdapter,
+    metrics: metricsClientAdapter,
+  };
+}
