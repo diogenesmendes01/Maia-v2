@@ -100,6 +100,9 @@ import { entity_states, permissoes } from '@/db/schema.js';
 import { eq, and } from 'drizzle-orm';
 import { incCounter, observeHistogram } from '@/lib/metrics.js';
 import { callLLM } from '@/lib/claude.js';
+import { scoreTurn } from './turn-risk-scorer.js';
+import { RiskLevel } from '@/types/enums.js';
+import type { TurnRiskSignals, TopicSignal, ToolKind } from '@/shared/risk/types.js';
 import type {
   ChannelPoliciesReader,
   ContentResolver,
@@ -112,9 +115,11 @@ import type {
   PolicyRulesRepo,
   ProceduresRepo,
   ResolvedPolicy,
+  RiskScorer,
   Skill,
   SkillsRepo,
 } from './types.js';
+import type { BaseContextPacket, DecisionPacket } from '../context-packet/types.js';
 import type { CreateDecisionEngineEnv } from './index.js';
 
 // ---------------------------------------------------------------------------
@@ -571,6 +576,168 @@ const metricsClientAdapter: MetricsClient = {
 };
 
 // ---------------------------------------------------------------------------
+// 11. RiskScorerProdAdapter  (P9c scoreTurn → DE RiskScorer interface)
+// ---------------------------------------------------------------------------
+
+/**
+ * Maps a DE intent label to a P9c TopicSignal.
+ *
+ * Groupings are intentionally coarse — the heuristic layer handles fine-grained
+ * risk; this mapping only needs to correctly partition into the buckets that
+ * affect the heuristic's piso (floor):
+ *   financial → RiskLevel.MEDIUM piso
+ *   legal / health / critical_decision → RiskLevel.HIGH piso
+ *   casual / operational_simple → no floor
+ *   unknown → ambiguous (gate will be consulted)
+ */
+function intentLabelToTopicSignal(label: string): TopicSignal {
+  const normalized = label.toLowerCase();
+  // Financial domain — transfers, billing, collections.
+  if (
+    normalized.includes('transfer') ||
+    normalized.includes('financ') ||
+    normalized.includes('pagamento') ||
+    normalized.includes('cobranca') ||
+    normalized.includes('cobrança') ||
+    normalized.includes('cancel') ||
+    normalized.includes('boleto') ||
+    normalized.includes('pix')
+  ) {
+    return 'financial';
+  }
+  // Casual / social — greetings, chitchat.
+  if (
+    normalized.includes('chat') ||
+    normalized.includes('saudacao') ||
+    normalized.includes('saudação') ||
+    normalized.includes('greet') ||
+    normalized.includes('ola') ||
+    normalized.includes('olá') ||
+    normalized.includes('oi') ||
+    normalized.includes('help') ||
+    normalized.includes('ajuda')
+  ) {
+    return 'casual';
+  }
+  // Admin / setup — operational, low-risk.
+  if (
+    normalized.includes('admin') ||
+    normalized.includes('setup') ||
+    normalized.includes('config') ||
+    normalized.includes('cadastro')
+  ) {
+    return 'operational_simple';
+  }
+  // Any label that doesn't match a known bucket → unknown (ambiguous; gate consulted).
+  return 'unknown';
+}
+
+/**
+ * Derives a list of `ToolKind` hints from `BaseContextPacket` signals.
+ *
+ * In P9c, tool_kinds is derived from the Skill's allowed_tools list. At this
+ * point in the call stack (risk scoring) the Skill has not yet been selected
+ * (SkillSelector runs after RiskScorer in the engine). We approximate from
+ * intent label:
+ *  - 'financial'  → likely involves transfer / write_external
+ *  - everything else → no tool signal injected (heuristic stays at topic floor)
+ *
+ * This is intentionally conservative: we only inject 'transfer' if the intent
+ * is clearly financial AND the base packet doesn't carry an authenticated actor
+ * override — we want the heuristic to have a realistic floor, not over-block.
+ */
+function derivedToolKinds(
+  topic: TopicSignal,
+  _base: BaseContextPacket,
+): ToolKind[] {
+  if (topic === 'financial') {
+    return ['transfer'];
+  }
+  return [];
+}
+
+/**
+ * RiskScorerProdAdapter — Camada 3, stub #1/4.
+ *
+ * Bridges the DE `RiskScorer` interface to P9c's `scoreTurn` function:
+ *
+ *  Input mapping:
+ *    intent.label  → TopicSignal (via intentLabelToTopicSignal)
+ *    base.*        → TurnRiskSignals (authenticated status, sensitive memory, etc.)
+ *
+ *  Output mapping:
+ *    ScoredRisk.level CRITICAL → 'high' + requires_human_review=true + 'critical_capped' reason
+ *    ScoredRisk.level HIGH    → 'high' + requires_human_review=true
+ *    ScoredRisk.level MEDIUM  → 'medium' + requires_human_review=false
+ *    ScoredRisk.level LOW     → 'low'   + requires_human_review=false
+ *
+ *  The DE RiskLevel type only has 3 values ('low'|'medium'|'high'). P9c's
+ *  ScoredRisk.level uses 4 (adds 'critical'). CRITICAL is capped at the
+ *  interface boundary so the engine never sees a value outside its type contract.
+ */
+export class RiskScorerProdAdapter implements RiskScorer {
+  async score(
+    input: {
+      intent: DecisionPacket['intent'];
+      base: BaseContextPacket;
+    },
+    _options?: { signal?: AbortSignal },
+  ): Promise<DecisionPacket['risk_profile']> {
+    const topic = intentLabelToTopicSignal(input.intent.label);
+    const tool_kinds = derivedToolKinds(topic, input.base);
+
+    const signals: TurnRiskSignals = {
+      topic,
+      tool_kinds: tool_kinds.length > 0 ? tool_kinds : undefined,
+      active_sensitive_memory_count: input.base.active_sensitive_memory_count,
+      // skill_confidence / skill_threshold not available at this stage (pre-SkillSelector).
+      // risk_override not carried in BaseContextPacket directly — omit.
+    };
+
+    const scored = await scoreTurn(signals);
+
+    // Map P9c 4-level ScoredRisk → DE 3-level risk_profile.
+    // Build reasons from triggers (audit-visible).
+    const reasons: string[] = scored.triggers.map((t) => t.signal);
+    if (scored.llm_reason) reasons.push(`llm_reason:${scored.llm_reason}`);
+
+    switch (scored.level) {
+      case RiskLevel.CRITICAL:
+        // Cap CRITICAL → HIGH at the interface boundary. Record the cap so
+        // callers can audit the original signal.
+        reasons.push('critical_capped');
+        return {
+          level: 'high',
+          reasons,
+          requires_human_review: true,
+        };
+      case RiskLevel.HIGH:
+        return {
+          level: 'high',
+          reasons,
+          requires_human_review: true,
+        };
+      case RiskLevel.MEDIUM:
+        return {
+          level: 'medium',
+          reasons,
+          requires_human_review: false,
+        };
+      case RiskLevel.LOW:
+      default:
+        return {
+          level: 'low',
+          reasons,
+          requires_human_review: false,
+        };
+    }
+  }
+}
+
+// Singleton instance (stateless — safe to reuse across requests).
+const riskScorerProdAdapter = new RiskScorerProdAdapter();
+
+// ---------------------------------------------------------------------------
 // Production env factory
 // ---------------------------------------------------------------------------
 
@@ -593,5 +760,9 @@ export function createProductionDecisionEngineEnv(): CreateDecisionEngineEnv {
     contentResolver: contentResolverAdapter,
     haiku: haikuClientAdapter,
     metrics: metricsClientAdapter,
+    // Stub #1/4 replaced: RiskScorerProdAdapter bridges DE's RiskScorer interface
+    // to P9c's scoreTurn, mapping {intent, base} → TurnRiskSignals and
+    // ScoredRisk (4 levels) → risk_profile (3 levels + requires_human_review).
+    riskScorer: riskScorerProdAdapter,
   };
 }

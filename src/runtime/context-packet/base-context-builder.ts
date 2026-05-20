@@ -13,6 +13,7 @@
 import crypto from 'node:crypto';
 import { randomUUID } from 'node:crypto';
 import type { BaseContextPacket } from './types.js';
+import { memoryResolver } from '@/user-layer/resolvers/memory-resolver.js';
 
 export interface BaseContextBuilderInput {
   raw_input: Record<string, unknown>;
@@ -48,10 +49,24 @@ export interface FeatureFlagsPort {
   snapshot(tenant_id: string): Promise<Record<string, boolean>>;
 }
 
+/**
+ * Port for counting active sensitive memories in scope.
+ * Injected so BaseContextBuilder is testable without a real DB.
+ * Agent isolation is mandatory — implementations MUST filter by agent_id.
+ */
+export interface SensitiveMemoryCounterPort {
+  countActiveSensitive(input: {
+    tenant_id: string;
+    agent_id: string;
+    conversation_id?: string;
+  }): Promise<number>;
+}
+
 export class BaseContextBuilder {
   constructor(
     private readonly resolver: IdentityResolverPort = defaultResolver,
     private readonly featureFlags: FeatureFlagsPort = defaultFeatureFlags,
+    private readonly sensitiveCounter: SensitiveMemoryCounterPort = defaultSensitiveCounter,
   ) {}
 
   async build(input: BaseContextBuilderInput): Promise<BaseContextPacket> {
@@ -85,13 +100,25 @@ export class BaseContextBuilder {
     // which flags to expose.
     const featureFlagsSnapshot = await this.featureFlags.snapshot(tenant_id);
 
+    const conversationId =
+      input.conversation_id ?? `conv_${Date.now()}_${crypto.randomBytes(2).toString('hex')}`;
+
+    // Count active sensitive memories in scope (tenant + agent + conversation).
+    // Fail-open: 0 if the counter throws (conservative — no false floor).
+    const activeSensitiveMemoryCount = await this.sensitiveCounter
+      .countActiveSensitive({
+        tenant_id,
+        agent_id,
+        conversation_id: conversationId,
+      })
+      .catch(() => 0);
+
     return {
       trace_id: randomUUID(),
       tenant_id,
       agent_id,
       session_id: input.session_id ?? input.channel_id,
-      conversation_id:
-        input.conversation_id ?? `conv_${Date.now()}_${crypto.randomBytes(2).toString('hex')}`,
+      conversation_id: conversationId,
       channel: {
         id: input.channel_id,
         kind: input.channel_kind ?? 'api',
@@ -112,6 +139,7 @@ export class BaseContextBuilder {
       active_procedure_execution_id: input.active_procedure_execution_id ?? null,
       feature_flags_snapshot: featureFlagsSnapshot,
       entered_at_ms: enteredAtMs,
+      active_sensitive_memory_count: activeSensitiveMemoryCount,
     };
   }
 }
@@ -146,4 +174,12 @@ const defaultFeatureFlags: FeatureFlagsPort = {
       FEATURE_CONTEXT_PACKET_V1: enabled,
     };
   },
+};
+
+/**
+ * Default sensitive-memory counter: delegates to the production memoryResolver.
+ * Tests inject a mock counter via the constructor to avoid DB access.
+ */
+const defaultSensitiveCounter: SensitiveMemoryCounterPort = {
+  countActiveSensitive: (input) => memoryResolver.countActiveSensitive(input),
 };

@@ -23,7 +23,6 @@ import type {
   DecisionPacket,
   RiskLevel as ContextRiskLevel,
 } from '../context-packet/types.js';
-import type { RiskScorer } from './types.js';
 import type { LLMGate, ToolKind, TopicSignal } from '@/shared/risk/types.js';
 
 // ---------------------------------------------------------------------------
@@ -149,6 +148,7 @@ import type {
   PolicyEvaluator,
   PolicyRulesRepo,
   ProceduresRepo,
+  RiskScorer,
   SkillsRepo,
 } from './types.js';
 
@@ -164,6 +164,14 @@ export interface CreateDecisionEngineEnv {
   haiku: HaikuClient;
   metrics?: MetricsClient;
   clock?: () => number;
+  /**
+   * Optional RiskScorer override. When not provided, the composition root
+   * falls back to `RiskScorerStubImpl` for backward compatibility with
+   * test harnesses that build their own env.
+   * The production singleton (via `createProductionDecisionEngineEnv`) always
+   * supplies `RiskScorerProdAdapter` so the real P9c scorer is used in prod.
+   */
+  riskScorer?: RiskScorer;
 }
 
 /**
@@ -194,10 +202,11 @@ export function createDecisionEngine(
   };
   if (env.metrics) intentClassifierDeps.metrics = env.metrics;
   const intentClassifier = new IntentClassifierImpl(intentClassifierDeps);
-  // P9c: replaced RiskScorerStubImpl with TurnRiskScorerAdapter backed by real scorer.
-  // haiku client is used for intent classification; the risk gate independently uses
-  // haikuRiskGate (injected by default in scoreTurn — no extra dep needed here).
-  const riskScorer = new TurnRiskScorerAdapter();
+  // Use the injected riskScorer if provided (production uses createProductionDecisionEngineEnv
+  // which supplies TurnRiskScorerAdapter); fall back to TurnRiskScorerAdapter for test
+  // harnesses that do not supply an override. RiskScorerStubImpl is no longer used as
+  // the default — real P9c scorer applies even in default env.
+  const riskScorer = env.riskScorer ?? new TurnRiskScorerAdapter();
   const workflowSelector = new WorkflowSelectorImpl({
     proceduresRepo: env.proceduresRepo,
   });
