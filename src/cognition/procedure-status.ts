@@ -1,6 +1,19 @@
-import { procedureDefinitionsRepo, procedureTestsRepo } from '@/db/repositories.js';
+import { procedureDefinitionsRepo, procedureStatusEventsRepo, procedureTestsRepo } from '@/db/repositories.js';
 import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import type { ProcedureDefinition, ProcedureStatusUpdate, ProcedureTest } from '@/db/schema.js';
+
+/**
+ * Thrown when `updateStatus` returns 0 rows — meaning the procedure ID
+ * does not belong to the current tenant/agent, or simply does not exist.
+ * Callers MUST NOT treat this as a soft failure; a 0-row update is a
+ * security boundary violation in multi-tenant code.
+ */
+export class ProcedureNotFoundError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ProcedureNotFoundError';
+  }
+}
 
 export type ProcedureStatus = 'draft' | 'proposed' | 'active' | 'frozen' | 'rolled_back';
 
@@ -104,10 +117,26 @@ export async function transitionProcedureStatus(args: {
     updates.deactivated_at = now;
   }
 
-  await procedureDefinitionsRepo.updateStatus(
+  const rowCount = await procedureDefinitionsRepo.updateStatus(
     args.definition.id,
     updates as Parameters<typeof procedureDefinitionsRepo.updateStatus>[1],
   );
+
+  if (rowCount === 0) {
+    throw new ProcedureNotFoundError(
+      `procedure ${args.definition.id} was not updated — id not found or not accessible from the current tenant context`,
+    );
+  }
+
+  // Record an audit event for every accepted non-active transition.
+  // (Active transitions are handled inside atomicActivate, which records its
+  // own event row atomically within the same transaction.)
+  await procedureStatusEventsRepo.record({
+    definition_id: args.definition.id,
+    from_status: args.definition.status,
+    to_status: args.to,
+    actor: args.actor,
+  });
 
   return {
     ok: true,

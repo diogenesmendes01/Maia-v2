@@ -68,7 +68,9 @@ vi.mock('@/db/repositories.js', async () => {
       updateStatus: vi.fn(async (id: string, updates: any) => {
         if (definitionsState[id]) {
           definitionsState[id] = { ...definitionsState[id], ...updates };
+          return 1;
         }
+        return 0;
       }),
       create: vi.fn(async (input: any) => {
         const id = `def-${Math.random().toString(36).slice(2)}`;
@@ -115,6 +117,10 @@ vi.mock('@/db/repositories.js', async () => {
           return { activated: definitionsState[args.target_id], deactivated };
         },
       ),
+    },
+    procedureStatusEventsRepo: {
+      record: vi.fn(async () => {}),
+      listByDefinition: vi.fn(async () => []),
     },
     procedureTestsRepo: {
       create: vi.fn(async (input: any) => {

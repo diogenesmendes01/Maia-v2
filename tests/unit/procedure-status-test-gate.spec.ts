@@ -37,7 +37,9 @@ vi.mock('@/db/repositories.js', async () => {
       updateStatus: vi.fn(async (id: string, updates: any) => {
         if (definitionsState[id]) {
           definitionsState[id] = { ...definitionsState[id], ...updates };
+          return 1;
         }
+        return 0;
       }),
       // P83-C4: atomicActivate is the single entry point for `→ active`
       // transitions (locks + freezes siblings + emits event in one tx).
@@ -68,6 +70,10 @@ vi.mock('@/db/repositories.js', async () => {
         definitionsState[id] = { id, ...input };
         return definitionsState[id];
       }),
+    },
+    procedureStatusEventsRepo: {
+      record: vi.fn(async () => {}),
+      listByDefinition: vi.fn(async () => []),
     },
     procedureTestsRepo: {
       create: vi.fn(async (input: any) => {
