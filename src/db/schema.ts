@@ -912,6 +912,13 @@ export const procedure_definitions = pgTable(
     failure_modes: jsonb('failure_modes').notNull().default(sql`'[]'::jsonb`),
     tools_referenced: jsonb('tools_referenced').notNull().default(sql`'[]'::jsonb`),
     source: text('source').notNull(),
+    /**
+     * Domain key consumed by WorkflowSelector (DOMAIN_INTENT_MAP keys:
+     * 'onboarding' | 'support' | 'transfer' | 'cancel').
+     * NULL = backfill pending; code falls back to 'unknown' + logs a warn.
+     * Migration: 060_p3a_procedure_definitions_domain.sql
+     */
+    domain: text('domain'),
     proposed_by: text('proposed_by'),
     approved_by: text('approved_by'),
     approved_at: timestamp('approved_at', { withTimezone: true }),

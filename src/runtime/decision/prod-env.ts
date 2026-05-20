@@ -94,7 +94,8 @@ import {
 } from '@/control-plane/policy/policy-rules-repo.js';
 import { evaluate as p9dEvaluate } from '@/governance/policy-dsl/evaluator.js';
 import { skillsRepo as p9aSkillsRepo } from '@/control-plane/skill-registry/skills-repo.js';
-import { procedureExecutionsRepo } from '@/db/repositories.js';
+import { procedureExecutionsRepo, procedureDefinitionsRepo } from '@/db/repositories.js';
+import { logger } from '@/lib/logger.js';
 import { getCurrentAgent } from '@/db/tenant-context.js';
 import { db } from '@/db/client.js';
 import { channel_policies, entity_states, permissoes } from '@/db/schema.js';
@@ -339,23 +340,43 @@ const skillsRepoAdapter: SkillsRepo = {
 // Default TTL for procedure executions: 30 minutes.
 const DEFAULT_PROCEDURE_TTL_MS = 30 * 60 * 1000;
 
+/**
+ * Reads the active procedure execution and joins procedure_definitions to
+ * obtain the domain field (migration 060_p3a_procedure_definitions_domain.sql).
+ *
+ * Returns null if:
+ *   - execution not found or status !== 'in_progress'
+ *
+ * Returns procedure_domain = 'unknown' (with a warn log) if:
+ *   - procedure_definitions.domain IS NULL (backfill pending)
+ */
 const proceduresRepoAdapter: ProceduresRepo = {
   async findExecution(execution_id) {
     const exec = await procedureExecutionsRepo.findById(execution_id);
     if (!exec || exec.status !== 'in_progress') return null;
+
     const now = Date.now();
     const lastActivity = exec.last_activity_at.getTime();
     const elapsed = now - lastActivity;
     const ttl_remaining_ms = Math.max(0, DEFAULT_PROCEDURE_TTL_MS - elapsed);
-    // procedure_domain: P9b WorkflowSelector uses this to match intent → domain.
-    // DB procedure_executions does not store domain; we use a hardcoded 'unknown'
-    // to signal no domain match (workflow selector will fall back to TTL heuristic).
-    // KNOWN_STUB: replace with join to procedure_definitions.intencao once
-    // procedure_definitions.domain column is added in a future migration.
+
+    // Fetch the definition to read the domain field.
+    // Tenant isolation is enforced by procedureDefinitionsRepo.findById
+    // via getCurrentTenant() + WHERE tenant_id/agent_id.
+    const definition = await procedureDefinitionsRepo.findById(exec.definition_id);
+    const rawDomain = (definition as { domain?: string | null } | null)?.domain ?? null;
+
+    if (rawDomain === null) {
+      logger.warn(
+        { definition_id: exec.definition_id, execution_id, tenant_id: exec.tenant_id },
+        'procedure_definitions.domain is NULL — WorkflowSelector will use unknown fallback',
+      );
+    }
+
     return {
       execution_id: exec.id,
       procedure_id: exec.definition_id,
-      procedure_domain: 'unknown',
+      procedure_domain: rawDomain ?? 'unknown',
       ttl_remaining_ms,
     };
   },
