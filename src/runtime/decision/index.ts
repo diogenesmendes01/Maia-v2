@@ -57,6 +57,7 @@ import type {
   PolicyEvaluator,
   PolicyRulesRepo,
   ProceduresRepo,
+  RiskScorer,
   SkillsRepo,
 } from './types.js';
 
@@ -72,6 +73,14 @@ export interface CreateDecisionEngineEnv {
   haiku: HaikuClient;
   metrics?: MetricsClient;
   clock?: () => number;
+  /**
+   * Optional RiskScorer override. When not provided, the composition root
+   * falls back to `RiskScorerStubImpl` for backward compatibility with
+   * test harnesses that build their own env.
+   * The production singleton (via `createProductionDecisionEngineEnv`) always
+   * supplies `RiskScorerProdAdapter` so the real P9c scorer is used in prod.
+   */
+  riskScorer?: RiskScorer;
 }
 
 /**
@@ -102,7 +111,10 @@ export function createDecisionEngine(
   };
   if (env.metrics) intentClassifierDeps.metrics = env.metrics;
   const intentClassifier = new IntentClassifierImpl(intentClassifierDeps);
-  const riskScorer = new RiskScorerStubImpl();
+  // Use the injected riskScorer if provided (production uses RiskScorerProdAdapter
+  // via createProductionDecisionEngineEnv); fall back to stub for test harnesses
+  // that do not supply an override.
+  const riskScorer = env.riskScorer ?? new RiskScorerStubImpl();
   const workflowSelector = new WorkflowSelectorImpl({
     proceduresRepo: env.proceduresRepo,
   });
