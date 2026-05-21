@@ -97,10 +97,20 @@ BEGIN
                  THEN profile_body->'episodic_temp'
                ELSE episodic_temp
              END,
+             -- Codex review #163 round 7: the resolver/renderer accept
+             -- both supported growth_backlog shapes — an array of strings
+             -- OR `{ items: [...] }`. Restore both rather than only
+             -- non-empty arrays, otherwise an object-shaped backlog with
+             -- valid items[] would be dropped on rollback.
              growth_backlog = CASE
                WHEN profile_body->'growth_backlog' IS NOT NULL
                 AND jsonb_typeof(profile_body->'growth_backlog') = 'array'
                 AND jsonb_array_length(profile_body->'growth_backlog') > 0
+                 THEN profile_body->'growth_backlog'
+               WHEN profile_body->'growth_backlog' IS NOT NULL
+                AND jsonb_typeof(profile_body->'growth_backlog') = 'object'
+                AND jsonb_typeof(profile_body->'growth_backlog'->'items') = 'array'
+                AND jsonb_array_length(profile_body->'growth_backlog'->'items') > 0
                  THEN profile_body->'growth_backlog'
                ELSE growth_backlog
              END

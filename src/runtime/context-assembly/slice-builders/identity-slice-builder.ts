@@ -148,12 +148,35 @@ export class IdentitySliceBuilder
     }
 
     const body = record.profile_body;
+    // Codex review #163 round 7 [high]: prefer the canonical priorities[]
+    // slug array but fall back to identity.principles / core_immutable.principles
+    // when priorities is empty. After migration 061, legacy rows have
+    // priorities=[] until `scripts/p8d-migration-priorities.ts` runs the
+    // slug extraction. Without this fallback the identity slice would
+    // render with no priorities during the rollout gap.
+    const bodyAsRec = body as unknown as Record<string, unknown>;
+    const identityRec = (bodyAsRec.identity ?? {}) as Record<string, unknown>;
+    const coreImm = (bodyAsRec.core_immutable ?? {}) as Record<string, unknown>;
+    const explicitPriorities = Array.isArray(body.identity.priorities)
+      ? body.identity.priorities.filter((p): p is string => typeof p === 'string')
+      : [];
+    const fallbackPriorities =
+      explicitPriorities.length === 0
+        ? Array.isArray(identityRec.principles)
+          ? (identityRec.principles as unknown[]).filter(
+              (p): p is string => typeof p === 'string',
+            )
+          : Array.isArray(coreImm.principles)
+            ? (coreImm.principles as unknown[]).filter(
+                (p): p is string => typeof p === 'string',
+              )
+            : []
+        : explicitPriorities;
     const slice: IdentitySlice = {
       role_descriptor: body.identity.role_descriptor,
       voice: body.identity.voice,
       cognitive_limits: body.identity.cognitive_limits,
-      priorities:
-        input.requirements.depth === 'full' ? (body.identity.priorities ?? []) : [],
+      priorities: input.requirements.depth === 'full' ? fallbackPriorities : [],
       learned_voice_modifiers:
         input.requirements.depth === 'full'
           ? (body.identity.learned_voice_modifiers ?? [])
@@ -223,9 +246,31 @@ export async function buildIdentitySlice(args: {
     role_descriptor:
       typeof identity.role_descriptor === 'string' ? identity.role_descriptor : 'unset',
     identity_block: identityBlock,
-    priorities: Array.isArray(identity.priorities)
-      ? (identity.priorities as unknown[]).filter((p): p is string => typeof p === 'string')
-      : [],
+    // Codex review #163 round 7 [high]: priorities[] is the canonical slug
+    // field, but post-migration-061 legacy rows have priorities=[] until
+    // scripts/p8d-migration-priorities.ts runs. Fall back to
+    // identity.principles → core_immutable.principles so the slice stays
+    // populated during the rollout gap.
+    priorities: (() => {
+      const explicit = Array.isArray(identity.priorities)
+        ? (identity.priorities as unknown[]).filter(
+            (p): p is string => typeof p === 'string',
+          )
+        : [];
+      if (explicit.length > 0) return explicit;
+      const principlesFromIdentity = Array.isArray(identity.principles)
+        ? (identity.principles as unknown[]).filter(
+            (p): p is string => typeof p === 'string',
+          )
+        : [];
+      if (principlesFromIdentity.length > 0) return principlesFromIdentity;
+      const principlesFromCore = Array.isArray(coreImmutable.principles)
+        ? (coreImmutable.principles as unknown[]).filter(
+            (p): p is string => typeof p === 'string',
+          )
+        : [];
+      return principlesFromCore;
+    })(),
     voice: extractVoice(identity.voice),
     cognitive_limits: extractCognitiveLimits(identity.cognitive_limits),
     learned_voice_modifiers: [],
