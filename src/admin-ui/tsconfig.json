@@ -17,19 +17,44 @@
     "declaration": false,
     "sourceMap": true,
     "jsx": "preserve",
-    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "lib": [
+      "ES2022",
+      "DOM",
+      "DOM.Iterable"
+    ],
     "incremental": true,
     "isolatedModules": true,
     "noEmit": true,
-    "plugins": [{ "name": "next" }],
+    "plugins": [
+      {
+        "name": "next"
+      }
+    ],
     "baseUrl": "../..",
     "paths": {
-      "@/*": ["src/*"],
-      "@admin/*": ["src/admin-ui/*"],
-      "@db/*": ["src/db/*"],
-      "@governance/*": ["src/governance/*"]
-    }
+      "@/*": [
+        "src/*"
+      ],
+      "@admin/*": [
+        "src/admin-ui/*"
+      ],
+      "@db/*": [
+        "src/db/*"
+      ],
+      "@governance/*": [
+        "src/governance/*"
+      ]
+    },
+    "allowJs": true
   },
-  "include": ["**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
-  "exclude": ["node_modules", "dist", ".next"]
+  "include": [
+    "**/*.ts",
+    "**/*.tsx",
+    ".next/types/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    ".next"
+  ]
 }

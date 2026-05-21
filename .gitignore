@@ -59,3 +59,4 @@ src/admin-ui/package-lock.json
 p8.5-plan.md
 p8.5-spec.md
 
+src/admin-ui/next-env.d.ts
