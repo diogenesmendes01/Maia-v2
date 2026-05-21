@@ -1,0 +1,9 @@
+# gitleaks allowlist by fingerprint (commit:file:rule:line).
+# Each entry suppresses a SPECIFIC historical finding — never a global pattern.
+
+# PR #162: OIDC test fixture had a placeholder string with enough entropy to
+# trip generic-api-key. The placeholder was defanged in a follow-up commit
+# (e4d5388), but gitleaks still scans the original commit when running
+# `--log-opts="origin/main..HEAD"`. Suppress by fingerprint so a NEW leak
+# elsewhere is still detected.
+d9a4afbefc0a8c911ec6628611e1f5889c913e75:tests/admin-ui/unit/auth-gating.spec.ts:generic-api-key:133

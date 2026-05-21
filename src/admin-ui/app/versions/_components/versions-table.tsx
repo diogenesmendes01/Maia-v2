@@ -9,7 +9,8 @@ interface VersionItem {
   sot_id: string;
   version: number;
   status: string;
-  created_at: Date;
+  // tRPC over HTTP serializes Dates as ISO strings.
+  created_at: Date | string;
 }
 
 export default function VersionsTable({ versions }: { versions: VersionItem[] }) {
