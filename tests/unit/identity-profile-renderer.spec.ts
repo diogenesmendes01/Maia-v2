@@ -384,6 +384,42 @@ describe('renderOperationalProfile', () => {
     expect(result.system_prompt_block).not.toContain('derived');
   });
 
+  it('admin-ui-created row (canonical profile_body.identity only) renders cognitive_limits as thresholds', () => {
+    // Codex review #163 round 4 [medium]: admin-ui agents.create writes a
+    // ProfileBody with identity.cognitive_limits but no direct-embed legacy
+    // payload. The synthesized fallback must surface cognitive_limits as
+    // operational_profile.thresholds so the "## Parâmetros calibrados"
+    // section actually renders.
+    const version = buildVersion({
+      profile_body: {
+        schema_version: 'v3.1.1-2026-05-15',
+        identity: {
+          role_descriptor: 'Você é a Bot da Acme.',
+          voice: { tone: 'profissional', formality: 'medium', verbosity: 'concise' },
+          cognitive_limits: {
+            max_inference_depth: 4,
+            max_speculation_in_response: 0.15,
+            confidence_floor_for_action: 0.75,
+          },
+          priorities: ['precisao', 'clareza'],
+          learned_voice_modifiers: [],
+        },
+        style: { language: 'pt-BR', rhythm: {} },
+        metadata: { effective_from: '', created_by: 'system', previous_version_id: null },
+        // Intentionally no legacy direct-embed keys.
+      },
+    });
+    const result = renderOperationalProfile({ version });
+    expect(result.system_prompt_block).toContain('Você é a Bot da Acme.');
+    expect(result.system_prompt_block).toContain('## Voz operacional');
+    expect(result.system_prompt_block).toContain('profissional');
+    // Cognitive limits surfaced under thresholds:
+    expect(result.system_prompt_block).toContain('## Parâmetros calibrados');
+    expect(result.system_prompt_block).toContain('max_inference_depth');
+    expect(result.system_prompt_block).toContain('4');
+    expect(result.system_prompt_block).toContain('confidence_floor_for_action');
+  });
+
   it('mixed row (legacy + profile_body) prefers legacy (keeps full payload)', () => {
     // After migration 061 a row carries BOTH the legacy columns (untouched)
     // and a backfilled profile_body. The renderer must keep using the legacy

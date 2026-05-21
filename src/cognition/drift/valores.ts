@@ -13,15 +13,22 @@ import Anthropic from '@anthropic-ai/sdk';
 import { DriftType } from '@/types/enums.js';
 import type { DriftDetector, DriftDetectionInput, DriftEvidence } from './types.js';
 
-type CoreImmutable = { principles?: string[] };
+import { resolveLegacyPayload } from '@/identity/profile-legacy-resolver.js';
 
 export const valoresDetector: DriftDetector = {
   type: DriftType.VALORES,
   async detect(input: DriftDetectionInput): Promise<DriftEvidence | null> {
-    // TODO(v3.1.1 migration): legacy `core_immutable` shape — see tom.ts comment.
-    const legacy = (input.profile_active as unknown) as { core_immutable?: CoreImmutable };
-    const core = (legacy.core_immutable ?? {}) as CoreImmutable;
-    const principles = Array.isArray(core.principles) ? core.principles : [];
+    // v3.1.1 contract (migration 061 + Codex review #163 round 4):
+    // The legacy core_immutable now lives at profile_body.core_immutable on
+    // a Drizzle-shaped row. The shared resolver handles read precedence
+    // (profile_body direct-embed → top-level legacy → synthesized).
+    const { core_immutable } = resolveLegacyPayload(input.profile_active);
+    const principlesRaw = Array.isArray(core_immutable.principles)
+      ? core_immutable.principles
+      : [];
+    const principles = principlesRaw.filter(
+      (p): p is string => typeof p === 'string' && p.trim().length > 0,
+    );
     if (principles.length === 0) return null;
 
     const agentMessages = input.recent_messages.filter((m) => m.from === 'agent');

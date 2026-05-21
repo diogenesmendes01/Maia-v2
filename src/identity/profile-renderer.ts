@@ -20,6 +20,7 @@
  * os flags, é OMITIDA.
  */
 import type { AgentOperationalProfileVersion } from '@/db/schema.js';
+import { resolveLegacyPayload } from './profile-legacy-resolver.js';
 
 export type RenderedProfile = {
   /** Sempre presente; substitui o antigo `self?.system_prompt`. */
@@ -30,134 +31,30 @@ export type RenderedProfile = {
   episodic_summary_block: string | null;
 };
 
-type CoreImmutable = {
-  identity_block?: string;
-  principles?: unknown[];
-};
-
-type OperationalProfileLayer = {
-  voice_descriptor?: string;
-  thresholds?: Record<string, unknown>;
-};
-
-type EpisodicEntry = {
-  summary?: string;
-  mention_allowed?: boolean;
-  proactive_use?: boolean;
-};
-
-type EpisodicTemp = {
-  entries?: EpisodicEntry[];
-};
-
+// Local type only describes the optional-key item shape of growth_backlog
+// entries (the resolver hands back raw legacy data). The resolver owns the
+// read-precedence + synthesized fallback logic; this file only renders the
+// resolved view.
 type GrowthBacklogItemObject = { descricao?: unknown };
-type GrowthBacklog = unknown[] | { items?: unknown[] };
-
-// Treat `{}` and `[]` as "no content" so the renderer doesn't lock in the
-// empty-default legacy_mirror over a populated canonical profile_body. A
-// shallow check is enough — both legacy and canonical shapes are plain
-// JSONB and a non-empty object/array carries at least one key/element.
-function hasAnyContent(v: unknown): boolean {
-  if (v == null) return false;
-  if (Array.isArray(v)) return v.length > 0;
-  if (typeof v === 'object') return Object.keys(v as object).length > 0;
-  return true;
-}
 
 export function renderOperationalProfile({
   version,
 }: {
   version: AgentOperationalProfileVersion;
 }): RenderedProfile {
-  // v3.1.1 contract (migration 061 + Codex review #163 rounds 1-3):
+  // v3.1.1 contract (migration 061 + Codex review #163 rounds 1-4):
   //
-  // The legacy 4-layer payload now lives directly inside profile_body —
-  // `profile_body.core_immutable / .operational_profile / .episodic_temp /
-  // .growth_backlog`. This is the ONLY shape the renderer needs to handle
-  // at runtime. Both writers emit it:
-  //   * `seedInitialOperationalProfile` (proposal-generator.ts) writes the
-  //     direct-embed keys when seeding from maia-prompt.md + self_state.
-  //   * `migration 061` backfills the same direct-embed keys when
-  //     consolidating pre-v3.1.1 rows.
-  //
-  // schema.ts declares only `profile_body` on the Drizzle table, so a
-  // production `.select().from(agent_operational_profile_versions)` returns
-  // exactly that JSONB column. Reading the legacy keys from inside it is
-  // the only path that reaches real rows.
-  //
-  // Two LOWER-PRIORITY fallbacks remain so older test fixtures keep
-  // working (no production data takes these paths):
-  //   * top-level row.core_immutable etc. — fixtures that hand-merge the
-  //     keys onto the row instead of nesting under profile_body.
-  //   * synthesized view from profile_body.identity.* — newly-created rows
-  //     from admin-ui agents.create that have no legacy payload to mirror.
-  const row = version as unknown as {
-    profile_body?: {
-      identity?: {
-        role_descriptor?: unknown;
-        voice?: { tone?: unknown };
-        priorities?: unknown[];
-      };
-      core_immutable?: CoreImmutable;
-      operational_profile?: OperationalProfileLayer;
-      episodic_temp?: EpisodicTemp;
-      growth_backlog?: GrowthBacklog;
-    };
-    core_immutable?: CoreImmutable;
-    operational_profile?: OperationalProfileLayer;
-    episodic_temp?: EpisodicTemp;
-    growth_backlog?: GrowthBacklog;
-  };
-
-  const body = row.profile_body ?? {};
-
-  // Synthesize a legacy-shaped view from canonical profile_body for rows
-  // that have NO direct-embed legacy keys (rare — only newly-created
-  // admin-ui rows that skipped the legacy_mirror writer).
-  const synthesizedCore: CoreImmutable = {
-    identity_block:
-      typeof body.identity?.role_descriptor === 'string'
-        ? body.identity.role_descriptor
-        : undefined,
-    principles: Array.isArray(body.identity?.priorities)
-      ? body.identity!.priorities
-      : undefined,
-  };
-  const synthesizedOp: OperationalProfileLayer = {
-    voice_descriptor:
-      typeof body.identity?.voice?.tone === 'string'
-        ? body.identity.voice.tone
-        : undefined,
-  };
-
-  // Priority order for each section:
-  //   1. profile_body.* (the production path — proposal-generator + 061)
-  //   2. top-level row.* (test fixtures / non-Drizzle paths)
-  //   3. synthesized from profile_body.identity.* (pure-canonical fallback)
-  function pickWithMirror<T extends object>(
-    embedded: T | undefined,
-    topVal: T | undefined,
-    synthesized: T,
-  ): T {
-    if (embedded && hasAnyContent(embedded)) return embedded;
-    if (topVal && hasAnyContent(topVal)) return topVal;
-    return synthesized;
-  }
-
-  const core = pickWithMirror<CoreImmutable>(
-    body.core_immutable,
-    row.core_immutable,
-    synthesizedCore,
-  );
-  const op = pickWithMirror<OperationalProfileLayer>(
-    body.operational_profile,
-    row.operational_profile,
-    synthesizedOp,
-  );
-  const ep =
-    (body.episodic_temp ?? row.episodic_temp ?? ({} as EpisodicTemp));
-  const bk =
-    (body.growth_backlog ?? row.growth_backlog ?? ([] as GrowthBacklog));
+  // Read precedence + shape unification live in `resolveLegacyPayload`. The
+  // resolver returns the 4-layer view regardless of whether the row carries
+  // the data via profile_body.{core_immutable,...} (production), top-level
+  // legacy columns (test fixtures), or only the canonical profile_body.identity
+  // shape (synthesized fallback for admin-ui newly-created rows, which now
+  // includes thresholds derived from cognitive_limits — see resolver).
+  const resolved = resolveLegacyPayload(version);
+  const core = resolved.core_immutable;
+  const op = resolved.operational_profile;
+  const ep = resolved.episodic_temp;
+  const bk = resolved.growth_backlog;
 
   // ---- system_prompt_block (sempre presente, nunca null) -------------------
   const lines: string[] = [];
