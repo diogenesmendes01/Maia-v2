@@ -1,105 +1,51 @@
 -- P4 (v3.1.1 alignment): add `profile_body` JSONB alongside the four legacy
--- columns and embed a `legacy_mirror` snapshot inside it so the runtime
--- renderer can read both shapes through the Drizzle schema.
+-- columns and embed the legacy 4-layer payload directly under profile_body
+-- (matching what `seedInitialOperationalProfile` already writes).
 --
--- Why this migration exists:
+-- Why this migration exists, why it's additive, why direct-embed under
+-- profile_body, and why the immutability function guards every retained
+-- content column — see the long-form comments preserved through the
+-- review history below.
+--
+-- v3.1.1 background:
 --   * Migration 025 created the table with four legacy JSONB columns
 --     (core_immutable / operational_profile / episodic_temp / growth_backlog).
 --   * The v3.1.1-2026-05-15 refactor introduced a consolidated `profile_body`
 --     column in `schema.ts` and `operationalProfileVersionsRepo.create`, but
 --     no SQL migration was ever shipped. A fresh `npm run db:migrate` left
 --     the table without the new column; any INSERT errored with
---     `column "profile_body" does not exist`. Surfaced while smoke-testing
---     the admin-ui agent-setup flow (PR #163).
+--     `column "profile_body" does not exist`.
 --
--- Why ADDITIVE (Codex review #163 round 1, [high]):
---   The first draft dropped the legacy columns. That broke the runtime
---   renderer (`renderOperationalProfile`) which reads them directly: any
---   legacy active profile would have rendered as a near-empty prompt.
+-- Additive design (Codex review #163 round 1):
+--   This migration keeps the four legacy columns. They carry data the
+--   runtime renderer + drift detectors still read; dropping them would
+--   silently degrade active prompts on any tenant with pre-3.1.1 data.
+--   The `legacy_mirror` envelope tried in round 2 is gone — both writers
+--   (proposal-generator + migration backfill) emit the legacy payload
+--   DIRECTLY under profile_body so the renderer reads one shape.
 --
--- Why `legacy_mirror` embedded inside profile_body (Codex review #163 round
--- 2, [high]):
---   `schema.ts` declares only `profile_body` on the table, so
---   `operationalProfileVersionsRepo.getActive()` (Drizzle `.select().from(...)`)
---   returns rows that contain `profile_body` and nothing else — even though
---   the DB still has the legacy columns physically present. A renderer
---   fallback to top-level row.core_immutable is therefore dead code in
---   production. Embedding the legacy snapshot inside profile_body lets the
---   renderer reach it through the Drizzle-shaped row.
+-- Trigger generation (Codex review #163 round 5, [high]):
+--   The immutability function from migration 027 referenced
+--   `NEW.profile_body` only. After 061 the function must also guard the
+--   retained legacy columns (round 2, [medium]). BUT — PostgreSQL plpgsql
+--   evaluates field refs against NEW/OLD at execution time. Dereferencing
+--   a missing column ERRORS, it does not fall through to NULL. So the
+--   function body has to match the actual column set of the table:
 --
--- Why the immutability trigger is rewritten (Codex review #163 round 2,
--- [medium]):
---   The original trigger only compared `NEW.profile_body`. With the legacy
---   columns retained AND copied into profile_body.legacy_mirror, a stray
---   direct SQL update to e.g. `core_immutable` would mutate runtime content
---   without appending a new version or hitting the audit trail. The new
---   trigger function rejects any change to the four legacy content columns
---   too — those columns remain append-only just like profile_body.
+--      * Legacy columns PRESENT  → "full" body (profile_body + 4 legacy).
+--      * Legacy columns ABSENT   → "canonical" body (profile_body only).
+--
+--   We pick the body at migration time by introspecting information_schema
+--   and EXECUTE-format the CREATE OR REPLACE FUNCTION accordingly. Both
+--   variants enforce the same invariant — content columns are append-only,
+--   identity primary keys are immutable.
 --
 -- NOTE: no BEGIN/COMMIT — migrate.ts wraps in transaction.
 
 ALTER TABLE agent_operational_profile_versions
   ADD COLUMN IF NOT EXISTS profile_body JSONB NOT NULL DEFAULT '{}'::jsonb;
 
--- Rewrite the immutability function to also guard the four legacy content
--- columns. Created with OR REPLACE so it's safe regardless of whether the
--- original trigger function from migration 027 ran already.
-CREATE OR REPLACE FUNCTION agent_op_profile_content_immutable()
-RETURNS trigger AS $$
-BEGIN
-  IF NEW.profile_body         IS DISTINCT FROM OLD.profile_body         THEN
-    RAISE EXCEPTION 'agent_operational_profile_versions.profile_body is append-only (insert a new version row instead of mutating)';
-  END IF;
-  -- v3.1.1: the four legacy content columns are retained for the runtime
-  -- renderer; they MUST stay append-only too. If a future migration drops
-  -- them, this block becomes inert (column references against a missing
-  -- column simply return NULL on both NEW and OLD, so IS DISTINCT FROM
-  -- evaluates to false). Until then it's a real append-only guard.
-  IF NEW.core_immutable       IS DISTINCT FROM OLD.core_immutable       THEN
-    RAISE EXCEPTION 'agent_operational_profile_versions.core_immutable is append-only';
-  END IF;
-  IF NEW.operational_profile  IS DISTINCT FROM OLD.operational_profile  THEN
-    RAISE EXCEPTION 'agent_operational_profile_versions.operational_profile is append-only';
-  END IF;
-  IF NEW.episodic_temp        IS DISTINCT FROM OLD.episodic_temp        THEN
-    RAISE EXCEPTION 'agent_operational_profile_versions.episodic_temp is append-only';
-  END IF;
-  IF NEW.growth_backlog       IS DISTINCT FROM OLD.growth_backlog       THEN
-    RAISE EXCEPTION 'agent_operational_profile_versions.growth_backlog is append-only';
-  END IF;
-  -- Identity primary keys are also locked (same as before).
-  IF NEW.version              IS DISTINCT FROM OLD.version              THEN
-    RAISE EXCEPTION 'agent_operational_profile_versions.version is immutable after insert';
-  END IF;
-  IF NEW.tenant_id            IS DISTINCT FROM OLD.tenant_id            THEN
-    RAISE EXCEPTION 'agent_operational_profile_versions.tenant_id is immutable after insert';
-  END IF;
-  IF NEW.agent_id             IS DISTINCT FROM OLD.agent_id             THEN
-    RAISE EXCEPTION 'agent_operational_profile_versions.agent_id is immutable after insert';
-  END IF;
-  RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
--- Backfill: for each row with an empty profile_body, build a profile_body
--- shape that matches BOTH the canonical ProfileBody (identity/style/metadata)
--- AND the legacy direct-embed contract that
--- `proposal-generator.ts#seedInitialOperationalProfile` already writes —
--- core_immutable, operational_profile, episodic_temp, growth_backlog
--- nested directly under profile_body (no `legacy_mirror` envelope).
---
--- Why direct-embed (Codex review #163 round 3, [high]):
---   The proposal-generator has been writing the legacy payload directly
---   under profile_body since v3.1.1. If migration 061 had introduced a
---   different envelope (`legacy_mirror`), the renderer would have to handle
---   two contracts indefinitely. Aligning with the existing writer collapses
---   the contract to ONE shape: `profile_body.{core_immutable,
---   operational_profile, episodic_temp, growth_backlog}` is the canonical
---   home for the legacy payload, in addition to the
---   identity/style/metadata canonical fields.
---
--- The UPDATE runs with the immutability trigger dropped — same as before.
-DO $$
+DO $outer$
 DECLARE
   has_legacy boolean;
 BEGIN
@@ -110,10 +56,50 @@ BEGIN
        AND column_name = 'core_immutable'
   ) INTO has_legacy;
 
+  -- Drop the existing trigger first so the backfill UPDATE doesn't fire it,
+  -- and so we can replace the function body cleanly. The CREATE TRIGGER at
+  -- the bottom re-attaches it.
   EXECUTE 'DROP TRIGGER IF EXISTS agent_op_profile_content_immutable_trg
              ON agent_operational_profile_versions';
 
   IF has_legacy THEN
+    -- "Full" function: guards profile_body + four legacy columns + identity
+    -- primary keys. Used while the legacy columns are still on the table.
+    EXECUTE $fn$
+      CREATE OR REPLACE FUNCTION agent_op_profile_content_immutable()
+      RETURNS trigger AS $body$
+      BEGIN
+        IF NEW.profile_body         IS DISTINCT FROM OLD.profile_body         THEN
+          RAISE EXCEPTION 'agent_operational_profile_versions.profile_body is append-only (insert a new version row instead of mutating)';
+        END IF;
+        IF NEW.core_immutable       IS DISTINCT FROM OLD.core_immutable       THEN
+          RAISE EXCEPTION 'agent_operational_profile_versions.core_immutable is append-only';
+        END IF;
+        IF NEW.operational_profile  IS DISTINCT FROM OLD.operational_profile  THEN
+          RAISE EXCEPTION 'agent_operational_profile_versions.operational_profile is append-only';
+        END IF;
+        IF NEW.episodic_temp        IS DISTINCT FROM OLD.episodic_temp        THEN
+          RAISE EXCEPTION 'agent_operational_profile_versions.episodic_temp is append-only';
+        END IF;
+        IF NEW.growth_backlog       IS DISTINCT FROM OLD.growth_backlog       THEN
+          RAISE EXCEPTION 'agent_operational_profile_versions.growth_backlog is append-only';
+        END IF;
+        IF NEW.version              IS DISTINCT FROM OLD.version              THEN
+          RAISE EXCEPTION 'agent_operational_profile_versions.version is immutable after insert';
+        END IF;
+        IF NEW.tenant_id            IS DISTINCT FROM OLD.tenant_id            THEN
+          RAISE EXCEPTION 'agent_operational_profile_versions.tenant_id is immutable after insert';
+        END IF;
+        IF NEW.agent_id             IS DISTINCT FROM OLD.agent_id             THEN
+          RAISE EXCEPTION 'agent_operational_profile_versions.agent_id is immutable after insert';
+        END IF;
+        RETURN NEW;
+      END;
+      $body$ LANGUAGE plpgsql;
+    $fn$;
+
+    -- Backfill: build profile_body from legacy data with the direct-embed
+    -- contract (matches what proposal-generator writes).
     EXECUTE $sql$
       UPDATE agent_operational_profile_versions
          SET profile_body = jsonb_build_object(
@@ -142,10 +128,6 @@ BEGIN
              'previous_version_id', NULL,
              'migrated_from_legacy', true
            ),
-           -- Direct-embed: matches the proposal-generator's existing layout
-           -- (profile_body.core_immutable / .operational_profile / etc.).
-           -- This is the SAME contract both writers (admin-ui + seed) use,
-           -- so the renderer only has to handle ONE shape.
            'core_immutable',      core_immutable,
            'operational_profile', operational_profile,
            'episodic_temp',       episodic_temp,
@@ -153,6 +135,31 @@ BEGIN
          )
        WHERE profile_body = '{}'::jsonb
     $sql$;
+  ELSE
+    -- "Canonical" function: guards profile_body + identity primary keys
+    -- only. Used when the four legacy columns are absent (a future schema
+    -- state after they're physically dropped). PostgreSQL would error on
+    -- the "full" body if any legacy column reference can't be resolved.
+    EXECUTE $fn$
+      CREATE OR REPLACE FUNCTION agent_op_profile_content_immutable()
+      RETURNS trigger AS $body$
+      BEGIN
+        IF NEW.profile_body  IS DISTINCT FROM OLD.profile_body  THEN
+          RAISE EXCEPTION 'agent_operational_profile_versions.profile_body is append-only (insert a new version row instead of mutating)';
+        END IF;
+        IF NEW.version       IS DISTINCT FROM OLD.version       THEN
+          RAISE EXCEPTION 'agent_operational_profile_versions.version is immutable after insert';
+        END IF;
+        IF NEW.tenant_id     IS DISTINCT FROM OLD.tenant_id     THEN
+          RAISE EXCEPTION 'agent_operational_profile_versions.tenant_id is immutable after insert';
+        END IF;
+        IF NEW.agent_id      IS DISTINCT FROM OLD.agent_id      THEN
+          RAISE EXCEPTION 'agent_operational_profile_versions.agent_id is immutable after insert';
+        END IF;
+        RETURN NEW;
+      END;
+      $body$ LANGUAGE plpgsql;
+    $fn$;
   END IF;
 
   EXECUTE 'CREATE TRIGGER agent_op_profile_content_immutable_trg
@@ -160,4 +167,4 @@ BEGIN
              FOR EACH ROW
              EXECUTE FUNCTION agent_op_profile_content_immutable()';
 END;
-$$;
+$outer$;
