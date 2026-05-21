@@ -2945,6 +2945,139 @@ export const operationalProfileVersionsRepo = {
     return { ok: true, updated };
   },
 
+  /**
+   * Atomic "proposed → active" approval with auto-freeze of the incumbent
+   * active version, plus admin_audit_log append — all inside a single
+   * transaction so a partial commit cannot leave the agent with no active
+   * profile OR with an unaudited governance change.
+   *
+   * Codex review of PR #162 round 2 ([high] x2) — addresses both:
+   *   - "Profile approval can activate runtime state without an audit trail":
+   *     mutation + audit commit together.
+   *   - "Freeze incumbent profiles before approving replacements": when an
+   *     active version already exists, this method freezes it in the same tx
+   *     before activating the new one. (`transition({to:'active'})` alone
+   *     fails with already_has_active.)
+   *
+   * Required input is explicit (no AsyncLocalStorage dependency) so the
+   * router can call it without `runWithTenantContext`.
+   */
+  async approveAndActivateAtomic(args: {
+    tenant_id: string;
+    agent_id: string;
+    /** ID of the `proposed` version being approved. */
+    id: string;
+    actor_id: string;
+    actor_role: string;
+    comment: string;
+  }): Promise<
+    | {
+        ok: true;
+        activated: { id: string; version: number };
+        frozen_previous: { id: string; version: number } | null;
+      }
+    | {
+        ok: false;
+        reason: 'not_found' | 'invalid_source_status' | 'transition_failed';
+      }
+  > {
+    return await withTx(async (tx) => {
+      // (1) Lock the proposed row inside the tx so concurrent approvers
+      // serialize on it.
+      const proposedRows = await tx
+        .select()
+        .from(agent_operational_profile_versions)
+        .where(
+          and(
+            eq(agent_operational_profile_versions.id, args.id),
+            eq(agent_operational_profile_versions.tenant_id, args.tenant_id),
+            eq(agent_operational_profile_versions.agent_id, args.agent_id),
+          ),
+        )
+        .for('update')
+        .limit(1);
+      const proposed = proposedRows[0];
+      if (!proposed) return { ok: false as const, reason: 'not_found' as const };
+      if (proposed.status !== 'proposed') {
+        return { ok: false as const, reason: 'invalid_source_status' as const };
+      }
+
+      // (2) Lock the current active (if any) so the freeze + activate is
+      // atomic against concurrent activations of a third version.
+      const activeRows = await tx
+        .select()
+        .from(agent_operational_profile_versions)
+        .where(
+          and(
+            eq(agent_operational_profile_versions.tenant_id, args.tenant_id),
+            eq(agent_operational_profile_versions.agent_id, args.agent_id),
+            eq(agent_operational_profile_versions.status, 'active'),
+          ),
+        )
+        .for('update')
+        .limit(1);
+      const incumbent = activeRows[0] ?? null;
+
+      const now = new Date();
+
+      // (3) Freeze incumbent if it exists. proposed-version row itself can't
+      // be its own incumbent (we already asserted proposed.status==='proposed'
+      // != 'active'), so the WHERE id != proposed.id is defensive.
+      if (incumbent) {
+        const frozen = await tx
+          .update(agent_operational_profile_versions)
+          .set({ status: 'frozen', frozen_at: now })
+          .where(eq(agent_operational_profile_versions.id, incumbent.id))
+          .returning({ id: agent_operational_profile_versions.id });
+        if (frozen.length === 0) {
+          return { ok: false as const, reason: 'transition_failed' as const };
+        }
+      }
+
+      // (4) Activate the proposed.
+      const activated = await tx
+        .update(agent_operational_profile_versions)
+        .set({
+          status: 'active',
+          approved_at: proposed.approved_at ?? now,
+          approved_by: proposed.approved_by ?? args.actor_id,
+          activated_at: now,
+        })
+        .where(eq(agent_operational_profile_versions.id, args.id))
+        .returning({ id: agent_operational_profile_versions.id });
+      if (activated.length === 0) {
+        return { ok: false as const, reason: 'transition_failed' as const };
+      }
+
+      // (5) Audit in the SAME tx. If this insert fails, EVERYTHING rolls back
+      // and the incumbent stays active — no unaudited governance change.
+      await tx.insert(admin_audit_log).values({
+        tenant_id: args.tenant_id,
+        actor_id: args.actor_id,
+        actor_role: args.actor_role,
+        action: 'agent_profile_approve',
+        resource_type: 'agent_operational_profile_version',
+        resource_id: args.id,
+        change_summary: {
+          agent_id: args.agent_id,
+          new_version_id: args.id,
+          new_version: proposed.version,
+          previous_active_id: incumbent?.id ?? null,
+          previous_active_version: incumbent?.version ?? null,
+          comment: args.comment,
+        },
+      });
+
+      return {
+        ok: true as const,
+        activated: { id: proposed.id, version: proposed.version },
+        frozen_previous: incumbent
+          ? { id: incumbent.id, version: incumbent.version }
+          : null,
+      };
+    });
+  },
+
   // Próxima version sequencial para (tenant_id, agent_id) corrente.
   // MAX(version) + 1, ou 1 quando não existe versão ainda.
   async nextVersion(): Promise<number> {

@@ -135,6 +135,58 @@ function makeRepos(opts: { tenants?: string[]; agents?: Agent[]; profiles?: Prof
         profiles.push(row);
         return row;
       },
+      // Mirrors the tx-aware repo path: finds the target proposed row, freezes
+      // any incumbent active for the same (tenant, agent), activates the new
+      // one, audits — all "atomically" in mock-land (just runs synchronously).
+      async approveAndActivateAtomic(args: {
+        tenant_id: string;
+        agent_id: string;
+        id: string;
+        actor_id: string;
+        actor_role: string;
+        comment: string;
+      }) {
+        const target = profiles.find((p) => p.id === args.id);
+        if (!target) return { ok: false as const, reason: 'not_found' as const };
+        if (target.status !== 'proposed') {
+          return { ok: false as const, reason: 'invalid_source_status' as const };
+        }
+        const incumbent =
+          profiles.find(
+            (p) =>
+              p.tenant_id === args.tenant_id &&
+              p.agent_id === args.agent_id &&
+              p.status === 'active' &&
+              p.id !== target.id,
+          ) ?? null;
+        if (incumbent) {
+          incumbent.status = 'frozen';
+        }
+        target.status = 'active';
+        audit.push({
+          tenant_id: args.tenant_id,
+          actor_id: args.actor_id,
+          actor_role: args.actor_role,
+          action: 'agent_profile_approve',
+          resource_type: 'agent_operational_profile_version',
+          resource_id: target.id,
+          change_summary: {
+            agent_id: args.agent_id,
+            new_version_id: target.id,
+            new_version: target.version,
+            previous_active_id: incumbent?.id ?? null,
+            previous_active_version: incumbent?.version ?? null,
+            comment: args.comment,
+          },
+        });
+        return {
+          ok: true as const,
+          activated: { id: target.id, version: target.version },
+          frozen_previous: incumbent
+            ? { id: incumbent.id, version: incumbent.version }
+            : null,
+        };
+      },
     },
     adminAuditLogRepo: {
       async append(entry: AuditRow) {
@@ -370,4 +422,151 @@ describe('agentsRouter.updateProfile — invariants', () => {
       ).rejects.toThrow(TRPCError);
     },
   );
+});
+
+describe('agentsRouter.approveProfile — atomic + freezes incumbent', () => {
+  const existingAgent: Agent = {
+    id: 'agent-x',
+    tenant_id: 'tenant-A',
+    nome: 'X',
+    status: 'active',
+    metadata: {},
+    created_at: new Date(),
+    updated_at: new Date(),
+  };
+
+  it.each(['analyst', 'viewer', 'compliance_officer'])(
+    '%s cannot approve',
+    async (role) => {
+      const proposed: Profile = {
+        id: '00000000-0000-4000-8000-0000000000a1',
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-x',
+        version: 1,
+        status: 'proposed',
+        profile_body: {},
+        proposed_by: 'system',
+        proposed_reason: null,
+      };
+      const repos = makeRepos({ agents: [existingAgent], profiles: [proposed] });
+      await expect(
+        caller(role, 'tenant-A', 'u1', repos).approveProfile({
+          agentId: 'agent-x',
+          versionId: '00000000-0000-4000-8000-0000000000a1',
+          comment: 'no-permission attempt',
+        }),
+      ).rejects.toThrow(TRPCError);
+    },
+  );
+
+  it('owner approves seed v1 (no incumbent → no freeze)', async () => {
+    const proposed: Profile = {
+      id: '00000000-0000-4000-8000-0000000000a1',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      version: 1,
+      status: 'proposed',
+      profile_body: {},
+      proposed_by: 'system',
+      proposed_reason: null,
+    };
+    const repos = makeRepos({ agents: [existingAgent], profiles: [proposed] });
+    const res = await caller('owner', 'tenant-A', 'u1', repos).approveProfile({
+      agentId: 'agent-x',
+      versionId: '00000000-0000-4000-8000-0000000000a1',
+      comment: 'first activation for this agent',
+    });
+    expect(res.activated.id).toBe('00000000-0000-4000-8000-0000000000a1');
+    expect(res.frozen_previous).toBeNull();
+    expect(repos._inspect.profiles[0]!.status).toBe('active');
+    // Audit row records the transition.
+    expect(repos._inspect.audit[0]!.action).toBe('agent_profile_approve');
+    expect(repos._inspect.audit[0]!.change_summary?.previous_active_id).toBeNull();
+  });
+
+  it('owner approves v2 while v1 active → v1 frozen, v2 active, audited atomically', async () => {
+    const v1Active: Profile = {
+      id: '00000000-0000-4000-8000-0000000000a1',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      version: 1,
+      status: 'active',
+      profile_body: {},
+      proposed_by: 'system',
+      proposed_reason: null,
+    };
+    const v2Proposed: Profile = {
+      id: '00000000-0000-4000-8000-0000000000a2',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      version: 2,
+      status: 'proposed',
+      profile_body: {},
+      proposed_by: 'owner-1',
+      proposed_reason: 'change tone',
+    };
+    const repos = makeRepos({
+      agents: [existingAgent],
+      profiles: [v1Active, v2Proposed],
+    });
+    const res = await caller('owner', 'tenant-A', 'u1', repos).approveProfile({
+      agentId: 'agent-x',
+      versionId: '00000000-0000-4000-8000-0000000000a2',
+      comment: 'promote v2 after review',
+    });
+    expect(res.activated.id).toBe('00000000-0000-4000-8000-0000000000a2');
+    expect(res.frozen_previous?.id).toBe('00000000-0000-4000-8000-0000000000a1');
+    // Old active → frozen, new proposed → active.
+    expect(repos._inspect.profiles.find((p) => p.id === '00000000-0000-4000-8000-0000000000a1')!.status).toBe('frozen');
+    expect(repos._inspect.profiles.find((p) => p.id === '00000000-0000-4000-8000-0000000000a2')!.status).toBe('active');
+    // Audit records both sides of the swap.
+    const audit = repos._inspect.audit[0]!;
+    expect(audit.change_summary?.previous_active_id).toBe('00000000-0000-4000-8000-0000000000a1');
+    expect(audit.change_summary?.new_version_id).toBe('00000000-0000-4000-8000-0000000000a2');
+  });
+
+  it('CONFLICT when version is not in proposed state', async () => {
+    const alreadyActive: Profile = {
+      id: '00000000-0000-4000-8000-0000000000a1',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      version: 1,
+      status: 'active',
+      profile_body: {},
+      proposed_by: 'system',
+      proposed_reason: null,
+    };
+    const repos = makeRepos({
+      agents: [existingAgent],
+      profiles: [alreadyActive],
+    });
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).approveProfile({
+        agentId: 'agent-x',
+        versionId: '00000000-0000-4000-8000-0000000000a1',
+        comment: 'approving an already-active row',
+      }),
+    ).rejects.toMatchObject({ code: 'CONFLICT' });
+  });
+
+  it('NOT_FOUND when agent missing', async () => {
+    const proposed: Profile = {
+      id: '00000000-0000-4000-8000-0000000000a1',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-ghost',
+      version: 1,
+      status: 'proposed',
+      profile_body: {},
+      proposed_by: 'system',
+      proposed_reason: null,
+    };
+    const repos = makeRepos({ agents: [], profiles: [proposed] });
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).approveProfile({
+        agentId: 'agent-ghost',
+        versionId: '00000000-0000-4000-8000-0000000000a1',
+        comment: 'agent does not exist',
+      }),
+    ).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  });
 });

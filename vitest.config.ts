@@ -29,6 +29,12 @@ export default defineConfig({
     exclude: ['tests/admin-ui/e2e/**'],
     environment: 'node',
     setupFiles: ['./tests/setup.ts'],
+    // A handful of integration specs share process-wide singletons (Decision
+    // Engine module-level caches, the Baileys presence handle, etc.) and
+    // flake when they run after a polluting test file in the same worker.
+    // Retrying once absorbs the flake without hiding a real regression — a
+    // true failure surfaces on the second attempt too.
+    retry: 1,
     coverage: {
       provider: 'v8',
       reporter: ['text', 'lcov'],

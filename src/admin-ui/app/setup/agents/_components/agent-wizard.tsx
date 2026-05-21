@@ -339,8 +339,10 @@ export default function AgentWizard({ tenantId, onClose }: Props) {
               />
             </label>
             <p className="text-xs text-gray-500">
-              Profile v1 will be created with status=<code>proposed</code> and
-              requires dual approval before activating.
+              Profile v1 will be created with status=<code>proposed</code>.
+              Activate it from the <strong>Identities</strong> screen — there
+              you'll see an "Approve &amp; activate" action for any{' '}
+              <code>proposed</code> row (owner or founder).
             </p>
           </div>
         )}

@@ -49,8 +49,8 @@ export default function AgentsSetupPage() {
           <h1 className="text-2xl font-bold">Agents</h1>
           <p className="text-sm text-gray-600">
             Provision new agents inside a tenant. A seed operational-profile
-            version is created in <code>proposed</code> state — it activates
-            only after dual approval through the Proposal Inbox.
+            version is created in <code>proposed</code> state — activate it
+            from the Identities screen (owner or founder).
           </p>
         </div>
         <button

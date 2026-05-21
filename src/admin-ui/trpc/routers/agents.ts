@@ -264,16 +264,21 @@ export const agentsRouter = router({
 
   /**
    * Approve a `proposed` agent_operational_profile_versions row, transitioning
-   * it to `active`. The agent_operational_profile_versions SoT is not part of
-   * the unified Proposal Inbox in main yet (the inbox enumerates 5 types:
-   * policy_rule / soul_bias / skill / capability_proposal / knowledge_proposal),
-   * so without this direct route the seeded v1 from `create` and every new
-   * proposal from `updateProfile` would stay in 'proposed' forever.
+   * it to `active` and atomically freezing the previous active version (if any).
    *
-   * Codex review #162 (P2): adds a real approval path so setup is reachable.
-   * Architecture-lock semantics are NOT applied here — the operational profile
-   * is per-agent state, not part of the immutable identity_immutable_core. If
-   * we later decide it warrants dual approval, switch this to a Proposal Inbox
+   * Codex review #162 round 2 ([high] x2) — uses
+   * `operationalProfileVersionsRepo.approveAndActivateAtomic`, which wraps:
+   *   - lock proposed row
+   *   - lock incumbent active (if any) and freeze it
+   *   - activate proposed
+   *   - append admin_audit_log
+   * in a single transaction so partial commits cannot leave runtime state
+   * mutated without an audit row, AND so subsequent updateProfile approvals
+   * don't get stuck on `already_has_active`.
+   *
+   * Architecture-lock semantics are NOT applied here — operational profile is
+   * per-agent state, not part of the immutable identity_immutable_core. If we
+   * later decide it warrants dual approval, switch this to a Proposal Inbox
    * source.
    */
   approveProfile: protectedProcedure
@@ -287,54 +292,34 @@ export const agentsRouter = router({
         throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent not found' });
       }
 
-      const result = await runWithTenantContext(
-        { tenant_id: tenantId, agent_id: agent.id },
-        async () =>
-          ctx.repos.operationalProfileVersionsRepo.transition({
-            id: input.versionId,
-            to: 'active',
-            approved_by: ctx.userId,
-          }),
-      );
+      const result = await ctx.repos.operationalProfileVersionsRepo.approveAndActivateAtomic({
+        tenant_id: tenantId,
+        agent_id: agent.id,
+        id: input.versionId,
+        actor_id: ctx.userId,
+        actor_role: ctx.userRole,
+        comment: input.comment,
+      });
 
       if (!result.ok) {
         if (result.reason === 'not_found') {
           throw new TRPCError({ code: 'NOT_FOUND', message: 'Version not found' });
         }
-        if (result.reason === 'already_has_active') {
+        if (result.reason === 'invalid_source_status') {
           throw new TRPCError({
             code: 'CONFLICT',
-            message: 'Another version is already active; freeze it first',
+            message: 'Version is not in proposed state; refresh and retry',
           });
         }
         throw new TRPCError({
-          code: 'BAD_REQUEST',
-          message: `Invalid transition: ${result.reason}`,
+          code: 'INTERNAL_SERVER_ERROR',
+          message: `Approval transition failed: ${result.reason}`,
         });
       }
 
-      await ctx.repos.adminAuditLogRepo.append({
-        tenant_id: tenantId,
-        actor_id: ctx.userId,
-        actor_role: ctx.userRole,
-        action: 'agent_profile_approve',
-        resource_type: 'agent_operational_profile_version',
-        resource_id: result.updated.id,
-        change_summary: {
-          agent_id: agent.id,
-          version: result.updated.version,
-          previous_status: 'proposed',
-          new_status: result.updated.status,
-          comment: input.comment,
-        },
-      });
-
       return {
-        version: {
-          id: result.updated.id,
-          version: result.updated.version,
-          status: result.updated.status,
-        },
+        activated: result.activated,
+        frozen_previous: result.frozen_previous,
       };
     }),
 });

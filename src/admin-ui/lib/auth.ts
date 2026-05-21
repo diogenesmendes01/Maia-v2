@@ -182,16 +182,32 @@ const authConfig: NextAuthConfig = {
   providers: buildProviders(),
   callbacks: {
     /**
-     * Authorization gate after authentication. For the OIDC provider, the
-     * user object we just received from the IdP has NO id we can trust — we
-     * resolve it against app_users by email. If no match, reject the sign-in
-     * (NextAuth treats `false` as "access denied").
+     * Authorization gate after authentication. For the OIDC provider:
+     *
+     *   1. The IdP MUST emit `email_verified === true` in the profile/ID-token.
+     *      Without this guard, a misconfigured IdP that lets any email pass
+     *      through unverified would let an attacker bind to any admin account
+     *      we have an app_users row for (Codex review #162 round 2,
+     *      [critical]).
+     *   2. We resolve authorization against app_users (verified email there +
+     *      known role + tenant pinned by OIDC_TENANT_SLUGS + tenant.status =
+     *      active for non-founders).
+     *   3. If either gate fails, returning `false` makes NextAuth surface
+     *      AccessDenied — no session is created.
      *
      * For the dev Magic-Link CredentialsProvider, `authorize()` already
      * returned an id-bearing user from app_users, so we pass through.
      */
-    async signIn({ account, user }) {
+    async signIn({ account, user, profile }) {
       if (account?.provider === 'oidc') {
+        // Read the verified-email claim from the IdP. `profile.email_verified`
+        // is the canonical OIDC core claim; some providers also surface
+        // boolean-looking strings — accept both true and 'true'.
+        const verified = (profile as { email_verified?: boolean | string } | undefined)
+          ?.email_verified;
+        const emailVerified = verified === true || verified === 'true';
+        if (!emailVerified) return false;
+
         const email = (user?.email ?? '').toLowerCase().trim();
         if (!email) return false;
         const appUser = await resolveOidcAppUser(email);
