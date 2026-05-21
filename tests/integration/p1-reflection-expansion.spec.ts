@@ -52,7 +52,10 @@ describe('P1 reflection expansion — 4 triggers integration', () => {
       const classified = await classify(reflected!.insight);
       expect(classified?.type).toBe('fato');
       const result = await persistCandidate(classified!, event);
-      expect(result.persisted_to).toBe('agent_facts');
+      // P2: persister classifies + writes to memory_entry alongside agent_facts.
+      // Accept either return value depending on whether classifier produced an
+      // entry (the legacy 'agent_facts' path stays valid for classifier no-ops).
+      expect(['agent_facts', 'agent_facts+memory_entry']).toContain(result.persisted_to);
     });
   });
 

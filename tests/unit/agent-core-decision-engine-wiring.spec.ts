@@ -52,19 +52,19 @@ function patchConfig(overrides: Partial<ConfigMutated>): () => void {
     config.FEATURE_DECISION_ENGINE_V1 = overrides.FEATURE_DECISION_ENGINE_V1;
   }
   if ('FEATURE_DECISION_ENGINE_V1_KILL_SWITCH' in overrides) {
-    // @ts-expect-error
+    // @ts-expect-error — test override of parsed config
     config.FEATURE_DECISION_ENGINE_V1_KILL_SWITCH = overrides.FEATURE_DECISION_ENGINE_V1_KILL_SWITCH;
   }
   if ('FEATURE_DECISION_ENGINE_ERROR_FALLBACK' in overrides) {
-    // @ts-expect-error
+    // @ts-expect-error — test override of parsed config
     config.FEATURE_DECISION_ENGINE_ERROR_FALLBACK = overrides.FEATURE_DECISION_ENGINE_ERROR_FALLBACK;
   }
   return () => {
-    // @ts-expect-error
+    // @ts-expect-error — restore original parsed config
     config.FEATURE_DECISION_ENGINE_V1 = saved.FEATURE_DECISION_ENGINE_V1;
-    // @ts-expect-error
+    // @ts-expect-error — restore original parsed config
     config.FEATURE_DECISION_ENGINE_V1_KILL_SWITCH = saved.FEATURE_DECISION_ENGINE_V1_KILL_SWITCH;
-    // @ts-expect-error
+    // @ts-expect-error — restore original parsed config
     config.FEATURE_DECISION_ENGINE_ERROR_FALLBACK = saved.FEATURE_DECISION_ENGINE_ERROR_FALLBACK;
   };
 }
