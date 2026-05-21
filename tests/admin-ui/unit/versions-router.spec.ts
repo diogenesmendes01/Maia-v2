@@ -1,14 +1,12 @@
 /**
- * P8.5 — versionsRouter unit tests (post Codex review #101).
+ * P8.5 — versionsRouter unit tests.
  *
- * Verifies that rollback NO LONGER fakes success. Until a per-SoT
- * implementation lands, every rollback attempt:
- *   1. Writes an audit row (action='version_rollback_attempt').
- *   2. Throws NOT_IMPLEMENTED with a clear message.
- *
- * Pre-fix: returned { status: 'rolled_back' } for every SoT, even though no
- * actual mutation happened. That was a critical false-positive during incident
- * response.
+ * Two surfaces:
+ *   - rollback() still fails loud (NOT_IMPLEMENTED) because no per-SoT
+ *     transition is wired yet — that pre-existing behavior is retained.
+ *   - listVersions() now returns real rows for agent_operational_profile_versions
+ *     (the only SoT with a list helper on main); other SoTs surface
+ *     partially_implemented for observability.
  */
 import { describe, it, expect } from 'vitest';
 import { TRPCError } from '@trpc/server';
@@ -24,8 +22,28 @@ type AuditRow = {
   change_summary: Record<string, unknown> | null;
 };
 
-function makeCtx(role: string) {
+type ProfileVersion = {
+  id: string;
+  tenant_id: string;
+  agent_id: string;
+  version: number;
+  status: 'proposed' | 'active' | 'frozen' | 'rolled_back';
+  created_at: Date;
+};
+
+function makeCtx(role: string, opts?: { agents?: string[]; versions?: ProfileVersion[] }) {
   const audit: AuditRow[] = [];
+  const agentList = (opts?.agents ?? []).map((id) => ({
+    id,
+    tenant_id: 'tenant-A',
+    nome: id,
+    status: 'active',
+  }));
+  const versionsByAgent: Record<string, ProfileVersion[]> = {};
+  for (const v of opts?.versions ?? []) {
+    (versionsByAgent[v.agent_id] ??= []).push(v);
+  }
+
   return {
     ctx: {
       session: { user: { id: 'user-1', role, tenant_id: 'tenant-A' } },
@@ -37,6 +55,29 @@ function makeCtx(role: string) {
           async append(row: AuditRow) {
             audit.push(row);
             return { ...row, id: audit.length, created_at: new Date() };
+          },
+        },
+        agentsRepo: {
+          async listByTenant(_tenant_id: string) {
+            return agentList;
+          },
+        },
+        operationalProfileVersionsRepo: {
+          // Read tenant context via runWithTenantContext from the test? The
+          // router wraps each call with runWithTenantContext({ tenant, agent }).
+          // The mock falls back: filters its in-memory versions by status only;
+          // tenant scoping is asserted in dedicated repo tests, not here.
+          async listByStatus(status: string) {
+            return (
+              opts?.versions?.filter(
+                (v) =>
+                  v.status === status &&
+                  Object.values(versionsByAgent).some((arr) => arr.includes(v)),
+              ) ?? []
+            );
+          },
+          async getActive() {
+            return opts?.versions?.find((v) => v.status === 'active') ?? null;
           },
         },
       } as unknown as typeof import('@/db/repositories.js'),
@@ -98,13 +139,42 @@ describe('versionsRouter.rollback — fail loud, not silent', () => {
     ).rejects.toThrowError(/BAD_REQUEST|Invalid rollback target/);
   });
 
-  it('listVersions returns the not_implemented flag (operators see honest state)', async () => {
-    const { ctx } = makeCtx('viewer');
+  it('listVersions returns operational_profile_versions across the tenant', async () => {
+    const v1: ProfileVersion = {
+      id: 'pv-1',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-a',
+      version: 1,
+      status: 'active',
+      created_at: new Date('2026-04-01'),
+    };
+    const v2: ProfileVersion = {
+      id: 'pv-2',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-a',
+      version: 2,
+      status: 'proposed',
+      created_at: new Date('2026-05-01'),
+    };
+    const { ctx } = makeCtx('viewer', {
+      agents: ['agent-a'],
+      versions: [v1, v2],
+    });
     const caller = versionsRouter.createCaller(ctx);
     const res = await caller.listVersions({
       sotKind: 'agent_operational_profile_versions',
     });
+    expect(res.items.length).toBe(2);
+    // newest-first
+    expect(res.items[0]!.id).toBe('pv-2');
+    expect(res.partially_implemented).toEqual([]);
+  });
+
+  it('listVersions for unwired SoT surfaces partially_implemented honestly', async () => {
+    const { ctx } = makeCtx('viewer', { agents: [] });
+    const caller = versionsRouter.createCaller(ctx);
+    const res = await caller.listVersions({ sotKind: 'policy_rules' });
     expect(res.items).toEqual([]);
-    expect(res.not_implemented).toBe(true);
+    expect(res.partially_implemented).toEqual(['policy_rules']);
   });
 });

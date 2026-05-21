@@ -45,22 +45,42 @@ import NextAuth from 'next-auth';
 import type { NextAuthConfig, Session } from 'next-auth';
 import type { JWT } from 'next-auth/jwt';
 import CredentialsProvider from 'next-auth/providers/credentials';
-import { appUsersRepo } from '../../db/repositories.js';
+import { appUsersRepo, tenantsRepo } from '../../db/repositories.js';
 import {
   KNOWN_ROLES,
   timingSafeEqual,
   devCredentialsProviderEnabled,
+  oidcProviderEnabled,
   resolveSecret,
 } from './auth-gating.js';
 
 function buildProviders(): NextAuthConfig['providers'] {
-  if (!devCredentialsProviderEnabled()) {
-    // Fail-closed: no providers. NextAuth will refuse sign-in until OIDC/SAML
-    // is wired (P10). This is intentional — see module-level comment.
-    return [];
+  const providers: NextAuthConfig['providers'] = [];
+
+  // Production-grade OIDC provider. Registers in ANY environment if
+  // OIDC_ISSUER + OIDC_CLIENT_ID + OIDC_CLIENT_SECRET are configured. Works
+  // with any compliant OIDC IdP — Auth0, Okta, Azure AD, Keycloak, etc.
+  if (oidcProviderEnabled()) {
+    providers.push({
+      id: 'oidc',
+      name: 'SSO',
+      type: 'oidc' as const,
+      issuer: process.env.OIDC_ISSUER!,
+      clientId: process.env.OIDC_CLIENT_ID!,
+      clientSecret: process.env.OIDC_CLIENT_SECRET!,
+      authorization: { params: { scope: 'openid email profile' } },
+      // Trust the IdP for verified-email — authorization is then enforced in
+      // the signIn callback against app_users.
+    });
   }
 
-  return [
+  if (!devCredentialsProviderEnabled()) {
+    // No dev provider — return whatever OIDC contributed (possibly empty,
+    // which is fail-closed if no IdP is configured).
+    return providers;
+  }
+
+  providers.push(
     CredentialsProvider({
       id: 'magic-link',
       name: 'Magic Link (dev only)',
@@ -106,13 +126,101 @@ function buildProviders(): NextAuthConfig['providers'] {
         };
       },
     }),
-  ];
+  );
+
+  return providers;
+}
+
+/**
+ * Resolve an OIDC sign-in to an app_users row. The OIDC provider gives us a
+ * verified email; we look it up across every configured tenant slug supplied
+ * in env `OIDC_TENANT_SLUGS` (comma-separated). If a matching app_users row
+ * exists AND has email_verified set AND has a known role, that user signs in
+ * with that tenant. Otherwise reject.
+ *
+ * Why an env list instead of just `email`? Maia is multi-tenant: the same
+ * email could (in principle) appear in multiple tenants. The env list pins
+ * which tenants the OIDC pool can authenticate into. For a single-tenant
+ * deployment set OIDC_TENANT_SLUGS=acme.
+ */
+async function resolveOidcAppUser(email: string): Promise<{
+  id: string;
+  email: string;
+  name?: string | null;
+  image?: string | null;
+} | null> {
+  const tenantSlugs = (process.env.OIDC_TENANT_SLUGS ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  if (tenantSlugs.length === 0) return null;
+
+  for (const tenant of tenantSlugs) {
+    const user = await appUsersRepo.getByEmail(tenant, email);
+    if (!user) continue;
+    if (!user.email_verified) continue;
+    if (!user.role || !KNOWN_ROLES.has(user.role)) continue;
+    // Codex review #162: refuse OIDC sign-in into a suspended tenant. Founders
+    // get a sign-in path via the dev provider (where applicable) for recovery
+    // operations; here we keep the same posture as protectedProcedure.
+    if (user.role !== 'founder') {
+      const tenantRow = await tenantsRepo.findById(tenant);
+      if (!tenantRow || tenantRow.status !== 'active') continue;
+    }
+    return {
+      id: user.id,
+      email: user.email,
+      name: user.name ?? null,
+      image: user.image ?? null,
+    };
+  }
+  return null;
 }
 
 // v5 NextAuthConfig (replaces v4 NextAuthOptions).
 const authConfig: NextAuthConfig = {
   providers: buildProviders(),
   callbacks: {
+    /**
+     * Authorization gate after authentication. For the OIDC provider:
+     *
+     *   1. The IdP MUST emit `email_verified === true` in the profile/ID-token.
+     *      Without this guard, a misconfigured IdP that lets any email pass
+     *      through unverified would let an attacker bind to any admin account
+     *      we have an app_users row for (Codex review #162 round 2,
+     *      [critical]).
+     *   2. We resolve authorization against app_users (verified email there +
+     *      known role + tenant pinned by OIDC_TENANT_SLUGS + tenant.status =
+     *      active for non-founders).
+     *   3. If either gate fails, returning `false` makes NextAuth surface
+     *      AccessDenied — no session is created.
+     *
+     * For the dev Magic-Link CredentialsProvider, `authorize()` already
+     * returned an id-bearing user from app_users, so we pass through.
+     */
+    async signIn({ account, user, profile }) {
+      if (account?.provider === 'oidc') {
+        // Read the verified-email claim from the IdP. `profile.email_verified`
+        // is the canonical OIDC core claim; some providers also surface
+        // boolean-looking strings — accept both true and 'true'.
+        const verified = (profile as { email_verified?: boolean | string } | undefined)
+          ?.email_verified;
+        const emailVerified = verified === true || verified === 'true';
+        if (!emailVerified) return false;
+
+        const email = (user?.email ?? '').toLowerCase().trim();
+        if (!email) return false;
+        const appUser = await resolveOidcAppUser(email);
+        if (!appUser) return false;
+        // Mutate the user object so the jwt callback picks up the resolved id.
+        // NextAuth v5 keeps the user reference between signIn → jwt for the
+        // initial sign-in.
+        (user as { id?: string }).id = appUser.id;
+        return true;
+      }
+      return true;
+    },
+
     async jwt({ token, user }: { token: JWT; user?: { id?: string } }) {
       if (user?.id) {
         // Always re-derive role + tenant_id from the DB row, never trust the
@@ -161,6 +269,7 @@ export const { handlers, auth } = NextAuth(authConfig);
  */
 export const __testing = {
   devCredentialsProviderEnabled,
+  oidcProviderEnabled,
   timingSafeEqual,
   KNOWN_ROLES,
 };

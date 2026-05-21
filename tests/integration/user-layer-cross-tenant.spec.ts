@@ -95,7 +95,7 @@ d('user-layer cross-tenant isolation (real DB)', () => {
         agent_id: AG_A,
         interlocutor_id: pA!.id,
         content: LEAK_MARKER_A,
-        memory_type: 'fact',
+        memory_type: 'operational',
         scope_type: 'interlocutor',
         subject_id: pA!.id,
         sensitivity: 'low',
@@ -109,7 +109,7 @@ d('user-layer cross-tenant isolation (real DB)', () => {
         agent_id: AG_B,
         interlocutor_id: pB!.id,
         content: LEAK_MARKER_B,
-        memory_type: 'fact',
+        memory_type: 'operational',
         scope_type: 'interlocutor',
         subject_id: pB!.id,
         sensitivity: 'low',
@@ -235,7 +235,7 @@ d('user-layer cross-tenant isolation (real DB)', () => {
         // Cross-tenant pessoa_id — tenant A asking about tenant B's pessoa
         // MUST return empty (NOT tenant B's data scoped by the foreign id).
         { tenant_id: T_A, pessoa_id: pessoaB!.id, limit: 100 },
-        { tenant_id: T_A, memory_types: ['fact', 'preference'], limit: 100 },
+        { tenant_id: T_A, memory_types: ['operational', 'preference'], limit: 100 },
         { tenant_id: T_A, intent_filter: LEAK_MARKER_B, limit: 100 },
         { tenant_id: T_A, role_id: 'fake-role', limit: 100 },
         { tenant_id: T_A, channel_id: 'fake-channel', limit: 100 },

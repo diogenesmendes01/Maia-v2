@@ -18,7 +18,17 @@
  *
  * Skipped without TEST_DB_URL.
  */
-import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it as itRaw, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest';
+import { runWithTenantContext } from '@/db/tenant-context.js';
+
+// Wrap every test body in the default tenant context — every repo call in this
+// file uses applyTenantGuard, which reads getCurrentTenant() from
+// AsyncLocalStorage. Without this wrapper the first repo call throws
+// MissingTenantContextError before any assertion can run.
+const it: typeof itRaw = ((name: string, fn: () => Promise<void>) =>
+  itRaw(name, async () =>
+    runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, fn),
+  )) as unknown as typeof itRaw;
 import pg from 'pg';
 import { randomInt, randomUUID } from 'node:crypto';
 

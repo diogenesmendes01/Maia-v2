@@ -8,6 +8,13 @@ import { versionsRouter } from './versions.js';
 import { driftRouter } from './drift.js';
 import { tracesRouter } from './traces.js';
 import { auditRouter } from './audit.js';
+import { tenantsRouter } from './tenants.js';
+import { agentsRouter } from './agents.js';
+import { channelPoliciesRouter } from './channelPolicies.js';
+import { dashboardRouter } from './dashboard.js';
+import { capabilitiesRouter } from './capabilities.js';
+import { proceduresRouter } from './procedures.js';
+import { knowledgeRouter } from './knowledge.js';
 
 export const appRouter = router({
   inbox: inboxRouter,
@@ -16,6 +23,13 @@ export const appRouter = router({
   drift: driftRouter,
   traces: tracesRouter,
   audit: auditRouter,
+  tenants: tenantsRouter,
+  agents: agentsRouter,
+  channelPolicies: channelPoliciesRouter,
+  dashboard: dashboardRouter,
+  capabilities: capabilitiesRouter,
+  procedures: proceduresRouter,
+  knowledge: knowledgeRouter,
 });
 
 export type AppRouter = typeof appRouter;

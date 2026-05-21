@@ -82,7 +82,49 @@ vi.mock('@/db/repositories.js', () => ({
   mensagensRepo: {
     findById: vi.fn().mockResolvedValue(null),
   },
+  procedureDefinitionsRepo: {
+    findById: vi.fn().mockResolvedValue(null),
+  },
 }));
+
+// Mock: raw drizzle `db` client. The LockdownReaderProdAdapter + a couple of
+// other prod-env adapters (channel_policies + permissoes lookups) reach through
+// the global `db` rather than via a repo. Without this mock the engine throws
+// inside Early PEP on every non-locked-channel run (T2/T3 hit it; T1 short-
+// circuits before because is_locked_down=true).
+//
+// We return a chainable that always resolves to []. That's the correct
+// "no global lockdown / no sensitive context / no policy" answer for an
+// engine integration test that exercises the empty-state path.
+vi.mock('@/db/client.js', () => {
+  const empty = Promise.resolve([]);
+  const chain: Record<string, unknown> = {};
+  const methods = [
+    'select',
+    'from',
+    'where',
+    'leftJoin',
+    'innerJoin',
+    'orderBy',
+    'limit',
+    'offset',
+    'insert',
+    'into',
+    'values',
+    'returning',
+    'update',
+    'set',
+    'delete',
+    'onConflictDoNothing',
+    'onConflictDoUpdate',
+  ];
+  for (const m of methods) {
+    chain[m] = vi.fn(() => chain);
+  }
+  // `.then` makes the chain awaitable as a promise of [].
+  (chain as { then: unknown }).then = (resolve: (v: unknown[]) => unknown) => empty.then(resolve);
+  return { db: chain, withTx: async <T>(fn: (tx: unknown) => Promise<T>) => fn(chain) };
+});
 
 // Mock: DB tenant context
 vi.mock('@/db/tenant-context.js', () => ({

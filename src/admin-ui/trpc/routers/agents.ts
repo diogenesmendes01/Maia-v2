@@ -1,0 +1,325 @@
+/**
+ * Admin UI Setup — agents router.
+ *
+ * Procedures:
+ *   - list           — list agents for a tenant
+ *   - getById        — fetch a single agent
+ *   - create         — create an agent AND seed agent_operational_profile_versions
+ *                      v1 with status='proposed'. Audit row appended.
+ *   - updateProfile  — propose a new operational_profile_version for an existing
+ *                      agent. Status='proposed' — the proposal still has to be
+ *                      approved through the standard proposal-inbox flow.
+ *
+ * Notes:
+ *   - operationalProfileVersionsRepo uses applyTenantGuard, so we wrap with
+ *     runWithTenantContext({ tenant_id, agent_id }). The tenant_id ALWAYS
+ *     comes from the resolved ctx tenant (no body override).
+ *   - We deliberately do NOT auto-activate the seeded profile. P8.5 invariant
+ *     is "no profile activates without an approval"; admin-ui setup respects
+ *     this — a freshly-created agent has no active profile until owner/founder
+ *     approves the seed via the Proposal Inbox.
+ *   - role gate: founder or owner. analyst/viewer cannot create agents.
+ */
+import { z } from 'zod';
+import { TRPCError } from '@trpc/server';
+import { router, protectedProcedure } from '../server.js';
+import { resolveTenantId } from '../tenant-resolver.js';
+import { runWithTenantContext } from '../../../db/tenant-context.js';
+import { PROFILE_BODY_SCHEMA_VERSION, type ProfileBody } from '../../../db/schema.js';
+
+const AgentIdSchema = z
+  .string()
+  .min(1)
+  .max(64)
+  .regex(/^[a-z0-9][a-z0-9_-]*$/, 'must be lowercase letters/digits/_/- and start with alnum');
+
+const AgentStatusSchema = z.enum(['active', 'suspended']);
+
+const FormalitySchema = z.enum(['low', 'medium', 'high']);
+const VerbositySchema = z.enum(['concise', 'medium', 'detailed']);
+
+// Operational profile body shape (mirrors ProfileBody in schema.ts).
+// We accept the user-visible subset and fill schema_version + metadata
+// server-side.
+const ProfileBodyInputSchema = z.object({
+  identity: z.object({
+    role_descriptor: z.string().min(1).max(500),
+    voice: z.object({
+      tone: z.string().min(1).max(200),
+      formality: FormalitySchema,
+      verbosity: VerbositySchema,
+    }),
+    cognitive_limits: z.object({
+      max_inference_depth: z.number().int().min(0).max(10),
+      max_speculation_in_response: z.number().min(0).max(1),
+      confidence_floor_for_action: z.number().min(0).max(1),
+    }),
+    priorities: z.array(z.string().min(1).max(200)).max(20),
+  }),
+  style: z.object({
+    language: z.string().min(2).max(20),
+    rhythm: z.record(z.string(), z.unknown()).default({}),
+  }),
+});
+
+const ListInputSchema = z.object({ tenantId: z.string().optional() });
+
+const GetByIdInputSchema = z.object({
+  tenantId: z.string().optional(),
+  id: AgentIdSchema,
+});
+
+const CreateInputSchema = z.object({
+  tenantId: z.string().optional(),
+  id: AgentIdSchema,
+  nome: z.string().min(1).max(200),
+  status: AgentStatusSchema.optional(),
+  profile_body: ProfileBodyInputSchema,
+  proposed_reason: z.string().min(10).max(2000),
+});
+
+const UpdateProfileInputSchema = z.object({
+  tenantId: z.string().optional(),
+  agentId: AgentIdSchema,
+  profile_body: ProfileBodyInputSchema,
+  proposed_reason: z.string().min(10).max(2000),
+});
+
+const ApproveProfileInputSchema = z.object({
+  tenantId: z.string().optional(),
+  agentId: AgentIdSchema,
+  versionId: z.string().uuid(),
+  comment: z.string().min(10).max(2000),
+});
+
+/**
+ * Build a full ProfileBody from the user-supplied subset. `previous_version_id`
+ * is null for the seed; for `updateProfile` we pass the current active id (if
+ * any) so the chain links.
+ */
+function buildProfileBody(
+  input: z.infer<typeof ProfileBodyInputSchema>,
+  proposedBy: string,
+  previousVersionId: string | null,
+): ProfileBody {
+  return {
+    schema_version: PROFILE_BODY_SCHEMA_VERSION,
+    identity: {
+      role_descriptor: input.identity.role_descriptor,
+      voice: input.identity.voice,
+      cognitive_limits: input.identity.cognitive_limits,
+      priorities: input.identity.priorities,
+      learned_voice_modifiers: [],
+    },
+    style: {
+      language: input.style.language,
+      rhythm: input.style.rhythm,
+    },
+    metadata: {
+      effective_from: new Date().toISOString(),
+      created_by: proposedBy,
+      previous_version_id: previousVersionId,
+    },
+  };
+}
+
+export const agentsRouter = router({
+  list: protectedProcedure.input(ListInputSchema).query(async ({ input, ctx }) => {
+    const tenantId = resolveTenantId(ctx, input.tenantId);
+    const items = await ctx.repos.agentsRepo.listByTenant(tenantId);
+    return { items };
+  }),
+
+  getById: protectedProcedure.input(GetByIdInputSchema).query(async ({ input, ctx }) => {
+    const tenantId = resolveTenantId(ctx, input.tenantId);
+    const agent = await ctx.repos.agentsRepo.findById(input.id);
+    if (!agent) throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent not found' });
+    if (agent.tenant_id !== tenantId) {
+      throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent not found' });
+    }
+    return agent;
+  }),
+
+  create: protectedProcedure.input(CreateInputSchema).mutation(async ({ input, ctx }) => {
+    ctx.assertRole('owner', 'founder');
+    const tenantId = resolveTenantId(ctx, input.tenantId);
+
+    const tenant = await ctx.repos.tenantsRepo.findById(tenantId);
+    if (!tenant) {
+      throw new TRPCError({ code: 'NOT_FOUND', message: `Tenant ${tenantId} not found` });
+    }
+
+    const existing = await ctx.repos.agentsRepo.findById(input.id);
+    if (existing) {
+      throw new TRPCError({
+        code: 'CONFLICT',
+        message: `Agent '${input.id}' already exists`,
+      });
+    }
+
+    const created = await ctx.repos.agentsRepo.create({
+      id: input.id,
+      tenant_id: tenantId,
+      nome: input.nome,
+      status: input.status ?? 'active',
+    });
+
+    // Seed v1 operational profile in 'proposed' state. The tenant_id + agent_id
+    // context is required by applyTenantGuard inside operationalProfileVersionsRepo.
+    const profileBody = buildProfileBody(input.profile_body, ctx.userId, null);
+    const version = await runWithTenantContext(
+      { tenant_id: tenantId, agent_id: created.id },
+      async () =>
+        ctx.repos.operationalProfileVersionsRepo.create({
+          profile_body: profileBody,
+          proposed_by: ctx.userId,
+          proposed_reason: input.proposed_reason,
+        }),
+    );
+
+    await ctx.repos.adminAuditLogRepo.append({
+      tenant_id: tenantId,
+      actor_id: ctx.userId,
+      actor_role: ctx.userRole,
+      action: 'agent_create',
+      resource_type: 'agent',
+      resource_id: created.id,
+      change_summary: {
+        agent_id: created.id,
+        agent_nome: created.nome,
+        seed_profile_version_id: version.id,
+        seed_profile_version: version.version,
+        seed_profile_status: version.status,
+        proposed_reason: input.proposed_reason,
+      },
+    });
+
+    return {
+      agent: created,
+      seed_profile: {
+        id: version.id,
+        version: version.version,
+        status: version.status,
+      },
+    };
+  }),
+
+  updateProfile: protectedProcedure
+    .input(UpdateProfileInputSchema)
+    .mutation(async ({ input, ctx }) => {
+      ctx.assertRole('owner', 'founder');
+      const tenantId = resolveTenantId(ctx, input.tenantId);
+
+      const agent = await ctx.repos.agentsRepo.findById(input.agentId);
+      if (!agent || agent.tenant_id !== tenantId) {
+        throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent not found' });
+      }
+
+      const activeVersion = await runWithTenantContext(
+        { tenant_id: tenantId, agent_id: agent.id },
+        async () => ctx.repos.operationalProfileVersionsRepo.getActive(),
+      );
+
+      const profileBody = buildProfileBody(
+        input.profile_body,
+        ctx.userId,
+        activeVersion?.id ?? null,
+      );
+
+      const version = await runWithTenantContext(
+        { tenant_id: tenantId, agent_id: agent.id },
+        async () =>
+          ctx.repos.operationalProfileVersionsRepo.create({
+            profile_body: profileBody,
+            proposed_by: ctx.userId,
+            proposed_reason: input.proposed_reason,
+          }),
+      );
+
+      await ctx.repos.adminAuditLogRepo.append({
+        tenant_id: tenantId,
+        actor_id: ctx.userId,
+        actor_role: ctx.userRole,
+        action: 'agent_profile_propose',
+        resource_type: 'agent_operational_profile_version',
+        resource_id: version.id,
+        change_summary: {
+          agent_id: agent.id,
+          previous_version_id: activeVersion?.id ?? null,
+          new_version: version.version,
+          status: version.status,
+          proposed_reason: input.proposed_reason,
+        },
+      });
+
+      return {
+        version: {
+          id: version.id,
+          version: version.version,
+          status: version.status,
+        },
+        previous_version_id: activeVersion?.id ?? null,
+      };
+    }),
+
+  /**
+   * Approve a `proposed` agent_operational_profile_versions row, transitioning
+   * it to `active` and atomically freezing the previous active version (if any).
+   *
+   * Codex review #162 round 2 ([high] x2) — uses
+   * `operationalProfileVersionsRepo.approveAndActivateAtomic`, which wraps:
+   *   - lock proposed row
+   *   - lock incumbent active (if any) and freeze it
+   *   - activate proposed
+   *   - append admin_audit_log
+   * in a single transaction so partial commits cannot leave runtime state
+   * mutated without an audit row, AND so subsequent updateProfile approvals
+   * don't get stuck on `already_has_active`.
+   *
+   * Architecture-lock semantics are NOT applied here — operational profile is
+   * per-agent state, not part of the immutable identity_immutable_core. If we
+   * later decide it warrants dual approval, switch this to a Proposal Inbox
+   * source.
+   */
+  approveProfile: protectedProcedure
+    .input(ApproveProfileInputSchema)
+    .mutation(async ({ input, ctx }) => {
+      ctx.assertRole('owner', 'founder');
+      const tenantId = resolveTenantId(ctx, input.tenantId);
+
+      const agent = await ctx.repos.agentsRepo.findById(input.agentId);
+      if (!agent || agent.tenant_id !== tenantId) {
+        throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent not found' });
+      }
+
+      const result = await ctx.repos.operationalProfileVersionsRepo.approveAndActivateAtomic({
+        tenant_id: tenantId,
+        agent_id: agent.id,
+        id: input.versionId,
+        actor_id: ctx.userId,
+        actor_role: ctx.userRole,
+        comment: input.comment,
+      });
+
+      if (!result.ok) {
+        if (result.reason === 'not_found') {
+          throw new TRPCError({ code: 'NOT_FOUND', message: 'Version not found' });
+        }
+        if (result.reason === 'invalid_source_status') {
+          throw new TRPCError({
+            code: 'CONFLICT',
+            message: 'Version is not in proposed state; refresh and retry',
+          });
+        }
+        throw new TRPCError({
+          code: 'INTERNAL_SERVER_ERROR',
+          message: `Approval transition failed: ${result.reason}`,
+        });
+      }
+
+      return {
+        activated: result.activated,
+        frozen_previous: result.frozen_previous,
+      };
+    }),
+});

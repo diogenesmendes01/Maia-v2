@@ -8,7 +8,7 @@ import {
   contas_bancarias,
   pessoas,
 } from '@/db/schema.js';
-import { tenantsRepo, transacoesRepo } from '@/db/repositories.js';
+import { tenantsRepo, transacoesRepo, pessoasRepo } from '@/db/repositories.js';
 import {
   runWithTenantContext,
   getCurrentTenant,

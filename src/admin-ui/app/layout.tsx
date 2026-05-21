@@ -19,8 +19,11 @@ export default async function RootLayout({ children }: { children: React.ReactNo
           {session ? (
             <>
               <nav className="bg-gray-900 text-white p-4 flex justify-between items-center">
-                <div className="flex gap-6">
-                  <Link href="/inbox" className="hover:underline font-medium">
+                <div className="flex gap-4 flex-wrap text-sm">
+                  <Link href="/dashboard" className="hover:underline font-medium">
+                    Dashboard
+                  </Link>
+                  <Link href="/inbox" className="hover:underline">
                     Inbox
                   </Link>
                   <Link href="/versions" className="hover:underline">
@@ -31,6 +34,28 @@ export default async function RootLayout({ children }: { children: React.ReactNo
                   </Link>
                   <Link href="/traces" className="hover:underline">
                     Traces
+                  </Link>
+                  <Link href="/identities" className="hover:underline">
+                    Identities
+                  </Link>
+                  <Link href="/capabilities" className="hover:underline">
+                    Capabilities
+                  </Link>
+                  <Link href="/procedures" className="hover:underline">
+                    Procedures
+                  </Link>
+                  <Link href="/knowledge" className="hover:underline">
+                    Knowledge
+                  </Link>
+                  <span className="opacity-50">|</span>
+                  <Link href="/setup/tenants" className="hover:underline">
+                    Tenants
+                  </Link>
+                  <Link href="/setup/agents" className="hover:underline">
+                    Agents
+                  </Link>
+                  <Link href="/setup/channels" className="hover:underline">
+                    Channels
                   </Link>
                 </div>
                 <div className="flex gap-4 items-center text-sm">
