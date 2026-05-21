@@ -45,7 +45,7 @@ import NextAuth from 'next-auth';
 import type { NextAuthConfig, Session } from 'next-auth';
 import type { JWT } from 'next-auth/jwt';
 import CredentialsProvider from 'next-auth/providers/credentials';
-import { appUsersRepo, tenantsRepo } from '../../db/repositories.js';
+import { appUsersRepo } from '../../db/repositories.js';
 import {
   KNOWN_ROLES,
   timingSafeEqual,
@@ -53,6 +53,14 @@ import {
   oidcProviderEnabled,
   resolveSecret,
 } from './auth-gating.js';
+import { resolveOidcAppUser } from './auth-resolver.js';
+
+// Re-export for backwards compatibility with any consumer importing the
+// resolver type/function from `./auth.js`. The canonical home is now
+// `./auth-resolver.js` (NextAuth-free, unit-testable from repo root vitest
+// without `next-auth` installed in the root node_modules).
+export { resolveOidcAppUser } from './auth-resolver.js';
+export type { ResolveOidcAppUserDeps } from './auth-resolver.js';
 
 function buildProviders(): NextAuthConfig['providers'] {
   const providers: NextAuthConfig['providers'] = [];
@@ -131,118 +139,12 @@ function buildProviders(): NextAuthConfig['providers'] {
   return providers;
 }
 
-/**
- * Resolve an OIDC sign-in to an app_users row. The OIDC provider gives us a
- * verified email; we look it up across every configured tenant slug supplied
- * in env `OIDC_TENANT_SLUGS` (comma-separated).
- *
- * Resolution rules (fail-closed):
- *   1. Enumerate EVERY allowed tenant — we do not return on the first match.
- *      This is required to detect ambiguous bindings (see #2).
- *   2. AMBIGUOUS-TENANT REJECTION (issue #164, Codex adversarial round 3 on
- *      PR #163 → originally introduced by PR #162):
- *        The `app_users` table is only unique on (tenant_id, email). The same
- *        email can legitimately exist in multiple tenants. Under a real OIDC
- *        IdP wired against `OIDC_TENANT_SLUGS=acme,foundry,demo`, the previous
- *        "first match wins" strategy would silently bind the user to whichever
- *        tenant appeared first in the env list — a tenant-isolation failure.
- *        Hard policy: if the (verified, known-role, active-tenant) candidate
- *        set has size > 1, reject the sign-in entirely (return null → NextAuth
- *        surfaces AccessDenied). The user must be explicitly disambiguated at
- *        the IdP / app_users level before sign-in is allowed.
- *   3. Per-candidate guards stay as before:
- *        - email_verified must be set
- *        - role must be in KNOWN_ROLES
- *        - non-founders cannot sign in to a non-active tenant
- *
- * Why an env list instead of just `email`? Maia is multi-tenant: the same
- * email could (in principle) appear in multiple tenants. The env list pins
- * which tenants the OIDC pool can authenticate into. For a single-tenant
- * deployment set OIDC_TENANT_SLUGS=acme — that case avoids the ambiguity trap
- * by construction.
- */
-export type ResolveOidcAppUserDeps = {
-  appUsersRepo: Pick<typeof appUsersRepo, 'getByEmail'>;
-  tenantsRepo: Pick<typeof tenantsRepo, 'findById'>;
-  /** Pluggable logger. Defaults to console; tests can inject a spy. */
-  logger?: { warn: (msg: string, meta?: Record<string, unknown>) => void };
-};
-
-const DEFAULT_RESOLVE_OIDC_DEPS: ResolveOidcAppUserDeps = {
-  appUsersRepo,
-  tenantsRepo,
-  logger: { warn: (msg, meta) => console.warn(msg, meta ?? {}) },
-};
-
-export async function resolveOidcAppUser(
-  email: string,
-  deps: ResolveOidcAppUserDeps = DEFAULT_RESOLVE_OIDC_DEPS,
-): Promise<{
-  id: string;
-  email: string;
-  name?: string | null;
-  image?: string | null;
-} | null> {
-  const tenantSlugs = (process.env.OIDC_TENANT_SLUGS ?? '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
-  if (tenantSlugs.length === 0) return null;
-
-  const candidates: Array<{
-    tenant: string;
-    id: string;
-    email: string;
-    name?: string | null;
-    image?: string | null;
-  }> = [];
-
-  for (const tenant of tenantSlugs) {
-    const user = await deps.appUsersRepo.getByEmail(tenant, email);
-    if (!user) continue;
-    if (!user.email_verified) continue;
-    if (!user.role || !KNOWN_ROLES.has(user.role)) continue;
-    // Codex review #162: refuse OIDC sign-in into a suspended tenant. Founders
-    // get a sign-in path via the dev provider (where applicable) for recovery
-    // operations; here we keep the same posture as protectedProcedure.
-    if (user.role !== 'founder') {
-      const tenantRow = await deps.tenantsRepo.findById(tenant);
-      if (!tenantRow || tenantRow.status !== 'active') continue;
-    }
-    candidates.push({
-      tenant,
-      id: user.id,
-      email: user.email,
-      name: user.name ?? null,
-      image: user.image ?? null,
-    });
-  }
-
-  if (candidates.length === 0) return null;
-
-  if (candidates.length > 1) {
-    // Issue #164 — fail-closed under ambiguity. Log the matched tenants for
-    // operator investigation; we deliberately do NOT log the email (it's
-    // attacker-controlled IdP input at this point).
-    const logger = deps.logger ?? DEFAULT_RESOLVE_OIDC_DEPS.logger!;
-    logger.warn(
-      '[admin-ui/auth] OIDC sign-in rejected: email matches multiple allowed tenants (ambiguous binding)',
-      {
-        tenant_count: candidates.length,
-        tenants: candidates.map((c) => c.tenant),
-      },
-    );
-    return null;
-  }
-
-  const only = candidates[0]!;
-  return {
-    id: only.id,
-    email: only.email,
-    name: only.name,
-    image: only.image,
-  };
-}
+// `resolveOidcAppUser` (issue #164 ambiguous-tenant rejection) and its types
+// now live in `./auth-resolver.ts`. That module is intentionally NextAuth-free
+// so the root vitest job (which does not install `next-auth`) can unit-test
+// the resolver without aliasing or stubbing `next-auth`. Re-exported above
+// for backwards compatibility. See `./auth-resolver.ts` for the full design
+// rationale (ambiguity policy, slug dedupe, per-candidate guards).
 
 // v5 NextAuthConfig (replaces v4 NextAuthOptions).
 const authConfig: NextAuthConfig = {

@@ -10,25 +10,29 @@
  * would silently bind a colliding user to whichever slug appeared first. That
  * is a tenant-isolation failure.
  *
- * Fix (this PR): fail-closed when the email matches in more than one allowed
+ * Fix (PR #170): fail-closed when the email matches in more than one allowed
  * tenant; sign-in returns null → NextAuth surfaces AccessDenied.
+ *
+ * Codex review on PR #170 surfaced two follow-ups, both addressed here:
+ *   [P1] The test previously imported from `@/admin-ui/lib/auth.js`, which
+ *        pulls in `next-auth` and `next-auth/providers/credentials` at the
+ *        module top. Those packages live only in
+ *        `src/admin-ui/node_modules/`; the root `npm ci` (which the CI
+ *        validate job runs) does NOT install them. Even with `vi.mock`,
+ *        Vite must still resolve the specifier before it can be intercepted,
+ *        so the test would fail in a fresh checkout. The resolver now lives
+ *        in `auth-resolver.ts` (NextAuth-free); this test imports from there
+ *        directly, mirroring the precedent set by `auth-gating.spec.ts`.
+ *   [P2] `OIDC_TENANT_SLUGS='acme,acme'` previously caused false ambiguity
+ *        (same row collected twice). The resolver now dedupes via
+ *        `new Set(...)`; see the regression test below.
  *
  * These tests would all have FALSELY PASSED on the pre-fix "first wins"
  * implementation only for the "0 tenants" and "1 tenant" cases. The "≥ 2
  * tenants" case is the regression guard.
- *
- * Test harness note: `auth.ts` imports `next-auth` at module top, which is
- * only installed inside `src/admin-ui/node_modules/`, NOT at the repo root
- * where vitest runs. We mock `next-auth`, `next-auth/providers/credentials`,
- * and the repositories module so `auth.ts` is loadable from the root test
- * runner. This matches the indirection already used in `auth-gating.spec.ts`
- * (which avoids the problem by importing from the sibling `auth-gating.ts`
- * module — that file's existence is itself a precedent for this pattern).
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
-vi.mock('next-auth', () => ({ default: () => ({ handlers: {}, auth: () => null }) }));
-vi.mock('next-auth/providers/credentials', () => ({ default: () => ({}) }));
 vi.mock('@/db/repositories.js', () => ({
   appUsersRepo: {
     getByEmail: vi.fn(),
@@ -38,8 +42,14 @@ vi.mock('@/db/repositories.js', () => ({
   tenantsRepo: { findById: vi.fn() },
 }));
 
-// Static import is fine because the mocks above are hoisted by vi.mock.
-import { resolveOidcAppUser, type ResolveOidcAppUserDeps } from '@/admin-ui/lib/auth.js';
+// Static import is fine because the mock above is hoisted by vi.mock.
+// Importing from `auth-resolver.js` (not `auth.js`) keeps the test free of
+// any next-auth dependency, so it runs cleanly from the repo-root vitest job
+// where next-auth is not installed.
+import {
+  resolveOidcAppUser,
+  type ResolveOidcAppUserDeps,
+} from '@/admin-ui/lib/auth-resolver.js';
 
 type AppUserRow = {
   id: string;
@@ -311,6 +321,55 @@ describe('resolveOidcAppUser — issue #164 ambiguous-tenant fix', () => {
     const result = await resolveOidcAppUser('single@example.com', deps);
     expect(result).not.toBeNull();
     expect(result!.id).toBe('user-acme-single@example.com');
+    expect(deps._logger.warnings).toHaveLength(0);
+  });
+
+  it('OIDC_TENANT_SLUGS=acme,acme (duplicate slug) ⇒ deduped, single resolve (Codex PR #170 [P2])', async () => {
+    // Regression for Codex review on PR #170 finding [P2]: a duplicated slug
+    // in env (typo / templating bug) previously made the loop query the same
+    // app_users row twice and push two identical candidates, falsely tripping
+    // the `candidates.length > 1` ambiguity check and rejecting a valid
+    // single-tenant sign-in with AccessDenied. The resolver now dedupes via
+    // `new Set(...)` after trim/filter, so the duplicate is collapsed before
+    // the loop runs.
+    process.env.OIDC_TENANT_SLUGS = 'acme,acme';
+    const deps = makeDeps({
+      appUsers: [makeOwner('acme', 'dup@example.com')],
+      tenants: [{ id: 'acme', status: 'active' }],
+    });
+
+    // Spy on the repo so we can prove the duplicated slug results in EXACTLY
+    // one lookup, not two — i.e. the dedupe is happening at the right layer
+    // (slug parsing), not being masked by candidate-set dedupe.
+    const getByEmailSpy = vi.fn(deps.appUsersRepo.getByEmail);
+    const depsWithSpy: ResolveOidcAppUserDeps & typeof deps = {
+      ...deps,
+      appUsersRepo: { getByEmail: getByEmailSpy },
+    };
+
+    const result = await resolveOidcAppUser('dup@example.com', depsWithSpy);
+    expect(result).not.toBeNull();
+    expect(result!.id).toBe('user-acme-dup@example.com');
+    expect(getByEmailSpy).toHaveBeenCalledTimes(1);
+    expect(getByEmailSpy).toHaveBeenCalledWith('acme', 'dup@example.com');
+    expect(deps._logger.warnings).toHaveLength(0);
+  });
+
+  it('OIDC_TENANT_SLUGS with whitespace + duplicates ⇒ trimmed and deduped (Codex PR #170 [P2])', async () => {
+    // Defensive variant: `' acme , acme , foundry '` should collapse to
+    // ['acme', 'foundry'] after trim+dedupe. Only `acme` has a matching
+    // app_user, so the sign-in must resolve cleanly (no ambiguity).
+    process.env.OIDC_TENANT_SLUGS = ' acme , acme , foundry ';
+    const deps = makeDeps({
+      appUsers: [makeOwner('acme', 'mixedws@example.com')],
+      tenants: [
+        { id: 'acme', status: 'active' },
+        { id: 'foundry', status: 'active' },
+      ],
+    });
+    const result = await resolveOidcAppUser('mixedws@example.com', deps);
+    expect(result).not.toBeNull();
+    expect(result!.id).toBe('user-acme-mixedws@example.com');
     expect(deps._logger.warnings).toHaveLength(0);
   });
 });
