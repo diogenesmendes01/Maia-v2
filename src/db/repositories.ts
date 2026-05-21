@@ -53,6 +53,9 @@ import {
   proposal_approvals,
   admin_audit_log,
   debug_snapshot_grants,
+  policy_rules,
+  soul_biases,
+  skills,
 } from './schema.js';
 import type {
   AppUser,
@@ -1468,6 +1471,17 @@ export const tenantsRepo = {
   async list(): Promise<Tenant[]> {
     return db.select().from(tenants).orderBy(tenants.id);
   },
+
+  // Admin UI setup: muda status do tenant (active|suspended). Não retorna nada
+  // útil em erro — caller checa findById depois se precisar verificar.
+  async updateStatus(id: string, status: string): Promise<Tenant | null> {
+    const [updated] = await db
+      .update(tenants)
+      .set({ status, updated_at: new Date() })
+      .where(eq(tenants.id, id))
+      .returning();
+    return updated ?? null;
+  },
 };
 
 export const agentsRepo = {
@@ -1478,6 +1492,29 @@ export const agentsRepo = {
 
   async listByTenant(tenant_id: string): Promise<Agent[]> {
     return db.select().from(agents).where(eq(agents.tenant_id, tenant_id));
+  },
+
+  // Admin UI setup: cria um agent dentro de um tenant existente. NÃO usa
+  // applyTenantGuard porque o caller já validou o tenant via founderProcedure
+  // ou assertRole + resolveTenantId; passamos tenant_id explícito.
+  async create(input: {
+    id: string;
+    tenant_id: string;
+    nome: string;
+    status?: string;
+    metadata?: Record<string, unknown>;
+  }): Promise<Agent> {
+    const [created] = await db
+      .insert(agents)
+      .values({
+        id: input.id,
+        tenant_id: input.tenant_id,
+        nome: input.nome,
+        status: input.status ?? 'active',
+        ...(input.metadata !== undefined ? { metadata: input.metadata } : {}),
+      })
+      .returning();
+    return created!;
   },
 };
 
@@ -4448,9 +4485,170 @@ export const proposalsUnifiedRepo = {
         };
       }
 
-      // Future sources land here. Returning source_not_supported is the
-      // fail-safe — surface NOT_IMPLEMENTED to the operator instead of
-      // pretending success.
+      // Versioned-source family: policy_rule / soul_bias / skill all share the
+      // same 'proposed → active' (approve) / 'proposed → rolled_back' (reject)
+      // shape, with status/approved_*/activated_at columns. We run a uniform
+      // path against the right pg table object per type.
+      const versionedTableMeta = ((): {
+        table: typeof policy_rules | typeof soul_biases | typeof skills;
+        tableName: 'policy_rules' | 'soul_biases' | 'skills';
+        resource: 'policy_rule' | 'soul_bias' | 'skill';
+      } | null => {
+        if (input.type === 'policy_rule') {
+          return { table: policy_rules, tableName: 'policy_rules', resource: 'policy_rule' };
+        }
+        if (input.type === 'soul_bias') {
+          return { table: soul_biases, tableName: 'soul_biases', resource: 'soul_bias' };
+        }
+        if (input.type === 'skill') {
+          return { table: skills, tableName: 'skills', resource: 'skill' };
+        }
+        return null;
+      })();
+
+      if (versionedTableMeta) {
+        const { table, tableName, resource } = versionedTableMeta;
+        if (!available.includes(tableName)) {
+          return { ok: false, reason: 'source_not_supported' as const };
+        }
+        const rows = await tx
+          .select()
+          .from(table)
+          .where(and(eq(table.tenant_id, input.tenantId), eq(table.id, input.proposalId)))
+          .for('update')
+          .limit(1);
+        const sourceRow = rows[0];
+        if (!sourceRow) return { ok: false, reason: 'not_found' as const };
+        if (sourceRow.status !== 'proposed') {
+          return { ok: false, reason: 'invalid_source_status' as const };
+        }
+
+        // Dup-check + gate recomputation, identical to the capability_proposal path.
+        let resolvedDualComplete = input.dualComplete;
+        if (input.decision === 'approved' && input.gateParams) {
+          const existingInTx = await tx
+            .select()
+            .from(proposal_approvals)
+            .where(eq(proposal_approvals.proposal_id, input.proposalId));
+          if (existingInTx.some(
+            (a) => a.approver_user_id === input.actorId && a.decision === 'approved',
+          )) {
+            return { ok: false, reason: 'already_approved_by_user' as const };
+          }
+          const { dualRequired, requiredRoles, allLocks } = input.gateParams;
+          if (dualRequired && allLocks.length === 0) {
+            if (existingInTx.some(
+              (a) => a.approver_role === input.actorRole && a.decision === 'approved',
+            )) {
+              return { ok: false, reason: 'already_approved_by_role' as const };
+            }
+          }
+          if (allLocks.length > 0) {
+            const priorFounderIds = new Set(
+              existingInTx
+                .filter((a) => a.decision === 'approved' && a.approver_role === 'founder')
+                .map((a) => a.approver_user_id),
+            );
+            priorFounderIds.add(input.actorId);
+            resolvedDualComplete = priorFounderIds.size >= 2;
+          } else if (dualRequired) {
+            const approvedRoles = new Set(
+              existingInTx.filter((a) => a.decision === 'approved').map((a) => a.approver_role),
+            );
+            approvedRoles.add(input.actorRole);
+            resolvedDualComplete = requiredRoles.every((r) => approvedRoles.has(r));
+          } else {
+            resolvedDualComplete = true;
+          }
+        }
+
+        const insertedApprovals = await tx
+          .insert(proposal_approvals)
+          .values({
+            tenant_id: input.tenantId,
+            proposal_id: input.proposalId,
+            approval_class: input.approvalClass,
+            approver_user_id: input.actorId,
+            approver_role: input.actorRole,
+            decision: input.decision,
+            comment: input.comment,
+          })
+          .returning();
+        const approval = insertedApprovals[0];
+        if (!approval) {
+          throw new TypedError('approval_insert_failed', 'Could not record approval');
+        }
+
+        await tx.insert(admin_audit_log).values({
+          tenant_id: input.tenantId,
+          actor_id: input.actorId,
+          actor_role: input.actorRole,
+          action: input.decision === 'approved' ? 'proposal_approve' : 'proposal_reject',
+          resource_type: resource,
+          resource_id: input.proposalId,
+          change_summary: {
+            approval_class: input.approvalClass,
+            comment: input.comment,
+            dual_complete: resolvedDualComplete,
+            source_transition_attempted:
+              input.decision === 'rejected' || resolvedDualComplete,
+          },
+        });
+
+        let finalStatus: ProposalUnifiedStatus = 'pending_review';
+        let sourceTransitioned = false;
+        const now = new Date();
+        if (input.decision === 'rejected') {
+          // proposed → rolled_back (terminal). NB: rolled_back is the only
+          // post-proposed terminal state shared by all 3 versioned tables.
+          const patched = await tx
+            .update(table)
+            .set({
+              status: 'rolled_back',
+              rolled_back_at: now,
+              rollback_reason: input.comment,
+            })
+            .where(eq(table.id, input.proposalId))
+            .returning();
+          if (patched.length === 0) {
+            return { ok: false, reason: 'transition_failed' as const };
+          }
+          finalStatus = 'rejected';
+          sourceTransitioned = true;
+        } else if (resolvedDualComplete) {
+          // proposed → active. The partial unique "one active" index (for
+          // soul_biases / skills) enforces that no two active rows exist for
+          // the same descriptor — the constraint either passes (this is the
+          // active) or raises a unique violation that aborts the tx.
+          const patched = await tx
+            .update(table)
+            .set({
+              status: 'active',
+              approved_by: input.actorId,
+              approved_at: now,
+              activated_at: now,
+            })
+            .where(eq(table.id, input.proposalId))
+            .returning();
+          if (patched.length === 0) {
+            return { ok: false, reason: 'transition_failed' as const };
+          }
+          finalStatus = 'pending_review';
+          sourceTransitioned = true;
+        }
+
+        return {
+          ok: true as const,
+          sourceTransitioned,
+          approval,
+          finalStatus,
+          dualComplete: resolvedDualComplete,
+        };
+      }
+
+      // knowledge_proposal: table `knowledge_pending_review` is not in main
+      // yet. Returning source_not_supported is the fail-safe — the tRPC layer
+      // maps this to NOT_IMPLEMENTED rather than pretending success.
       return { ok: false, reason: 'source_not_supported' as const };
     });
   },

@@ -19,6 +19,7 @@ import { TRPCError } from '@trpc/server';
 import { router, protectedProcedure } from '../server.js';
 import { resolveTenantId } from '../tenant-resolver.js';
 import { validateRollbackTarget } from '../../lib/rollback-targets.js';
+import { runWithTenantContext } from '../../../db/tenant-context.js';
 
 const SotKindSchema = z.enum([
   'agent_operational_profile_versions',
@@ -30,11 +31,13 @@ const SotKindSchema = z.enum([
 const ListInputSchema = z.object({
   tenantId: z.string().optional(),
   sotKind: SotKindSchema.optional(),
+  agentId: z.string().optional(),
   limit: z.number().int().min(1).max(200).default(50),
 });
 
 const GetInUseBySchema = z.object({
   tenantId: z.string().optional(),
+  agentId: z.string(),
   sotKind: SotKindSchema,
   sotId: z.string(),
 });
@@ -64,28 +67,89 @@ export const versionsRouter = router({
   listVersions: protectedProcedure
     .input(ListInputSchema)
     .query(async ({ input, ctx }) => {
-      const _tenantId = resolveTenantId(ctx, input.tenantId);
-      // Stub: returns empty array; real implementation joins per sotKind.
-      // For agent_operational_profile_versions, list all versions ordered by version desc.
+      const tenantId = resolveTenantId(ctx, input.tenantId);
+
+      // agent_operational_profile_versions is the only SoT with a wired list
+      // path on main. It REQUIRES (tenant, agent) context (uses applyTenantGuard
+      // + listByStatus). Other SoTs return [] until they get a repo helper.
+      const wantKinds = input.sotKind
+        ? [input.sotKind]
+        : ['agent_operational_profile_versions' as const];
+
+      const items: Array<{
+        id: string;
+        sot_kind: string;
+        sot_id: string;
+        version: number;
+        status: string;
+        created_at: Date;
+      }> = [];
+
+      const partiallyImplemented: string[] = [];
+
+      for (const kind of wantKinds) {
+        if (kind === 'agent_operational_profile_versions') {
+          // Fan out: if agentId is supplied, use just that one; otherwise list
+          // every agent in this tenant.
+          const agentIds = input.agentId
+            ? [input.agentId]
+            : (await ctx.repos.agentsRepo.listByTenant(tenantId)).map((a) => a.id);
+
+          for (const agentId of agentIds) {
+            for (const status of ['proposed', 'active', 'frozen', 'rolled_back'] as const) {
+              const rows = await runWithTenantContext(
+                { tenant_id: tenantId, agent_id: agentId },
+                async () =>
+                  ctx.repos.operationalProfileVersionsRepo.listByStatus(status),
+              );
+              for (const r of rows) {
+                items.push({
+                  id: r.id,
+                  sot_kind: 'agent_operational_profile_versions',
+                  sot_id: r.agent_id,
+                  version: r.version,
+                  status: r.status,
+                  created_at: r.created_at,
+                });
+              }
+            }
+          }
+        } else {
+          // policy_rules / soul_biases / skills don't have an admin-ui-shaped
+          // list helper yet — track partial wiring so the UI can surface it.
+          partiallyImplemented.push(kind);
+        }
+      }
+
+      // Stable sort: newest first.
+      items.sort((a, b) => b.created_at.getTime() - a.created_at.getTime());
+      const limited = items.slice(0, input.limit);
+
       return {
-        items: [] as Array<{
-          id: string;
-          sot_kind: string;
-          sot_id: string;
-          version: number;
-          status: string;
-          created_at: Date;
-        }>,
-        not_implemented: true as const,
+        items: limited,
+        partially_implemented: partiallyImplemented,
       };
     }),
 
   getInUseBy: protectedProcedure
     .input(GetInUseBySchema)
     .query(async ({ input, ctx }) => {
-      const _tenantId = resolveTenantId(ctx, input.tenantId);
-      // Stub: full implementation joins agent assignments + active conversations.
-      return { in_use_by: [] as string[], not_implemented: true as const };
+      const tenantId = resolveTenantId(ctx, input.tenantId);
+
+      if (input.sotKind === 'agent_operational_profile_versions') {
+        // For an operational profile version, "in use by" = is it the active
+        // version of its agent? If yes, surface the agent_id. Otherwise empty.
+        const active = await runWithTenantContext(
+          { tenant_id: tenantId, agent_id: input.agentId },
+          async () => ctx.repos.operationalProfileVersionsRepo.getActive(),
+        );
+        const in_use_by: string[] = active && active.id === input.sotId ? [input.agentId] : [];
+        return { in_use_by, partially_implemented: false as const };
+      }
+
+      // Other SoTs: in-use lookup not implemented yet — surface honestly
+      // instead of silently saying "nothing uses it".
+      return { in_use_by: [] as string[], partially_implemented: true as const };
     }),
 
   rollback: protectedProcedure

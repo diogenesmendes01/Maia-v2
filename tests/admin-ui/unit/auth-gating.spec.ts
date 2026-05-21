@@ -14,6 +14,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
   devCredentialsProviderEnabled,
+  oidcProviderEnabled,
   timingSafeEqual,
   KNOWN_ROLES,
   resolveSecret,
@@ -27,6 +28,9 @@ const TOGGLES = [
   'ALLOW_DEV_AUTH',
   'ADMIN_UI_DEV_LOGIN_TOKEN',
   'NEXTAUTH_SECRET',
+  'OIDC_ISSUER',
+  'OIDC_CLIENT_ID',
+  'OIDC_CLIENT_SECRET',
 ] as const;
 
 function snapshotEnv() {
@@ -119,6 +123,62 @@ describe('devCredentialsProviderEnabled — gating', () => {
     process.env.ALLOW_DEV_AUTH = 'true';
     process.env.ADMIN_UI_DEV_LOGIN_TOKEN = 'production-cannot-be-bypassed-this-way';
     expect(devCredentialsProviderEnabled()).toBe(false);
+  });
+});
+
+describe('oidcProviderEnabled — gating', () => {
+  function setOidcEnabledEnv() {
+    process.env.OIDC_ISSUER = 'https://login.example.com/realms/maia';
+    process.env.OIDC_CLIENT_ID = 'maia-admin';
+    process.env.OIDC_CLIENT_SECRET = 'sufficient-length-secret-1234567890';
+  }
+
+  it('all three env set ⇒ enabled', () => {
+    setOidcEnabledEnv();
+    expect(oidcProviderEnabled()).toBe(true);
+  });
+
+  it('works in production too (no NODE_ENV gating)', () => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'production';
+    expect(oidcProviderEnabled()).toBe(true);
+  });
+
+  it('OIDC_ISSUER without http(s) prefix ⇒ disabled', () => {
+    setOidcEnabledEnv();
+    process.env.OIDC_ISSUER = 'login.example.com';
+    expect(oidcProviderEnabled()).toBe(false);
+  });
+
+  it('OIDC_ISSUER unset ⇒ disabled', () => {
+    setOidcEnabledEnv();
+    delete process.env.OIDC_ISSUER;
+    expect(oidcProviderEnabled()).toBe(false);
+  });
+
+  it('OIDC_CLIENT_ID unset ⇒ disabled', () => {
+    setOidcEnabledEnv();
+    delete process.env.OIDC_CLIENT_ID;
+    expect(oidcProviderEnabled()).toBe(false);
+  });
+
+  it('OIDC_CLIENT_SECRET < 16 chars ⇒ disabled (weak secret guard)', () => {
+    setOidcEnabledEnv();
+    process.env.OIDC_CLIENT_SECRET = 'short';
+    expect(oidcProviderEnabled()).toBe(false);
+  });
+
+  it('OIDC_CLIENT_SECRET unset ⇒ disabled', () => {
+    setOidcEnabledEnv();
+    delete process.env.OIDC_CLIENT_SECRET;
+    expect(oidcProviderEnabled()).toBe(false);
+  });
+
+  it('none of the env vars set ⇒ disabled (no accidental enable)', () => {
+    delete process.env.OIDC_ISSUER;
+    delete process.env.OIDC_CLIENT_ID;
+    delete process.env.OIDC_CLIENT_SECRET;
+    expect(oidcProviderEnabled()).toBe(false);
   });
 });
 
