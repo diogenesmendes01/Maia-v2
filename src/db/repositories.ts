@@ -1513,6 +1513,108 @@ export const agentsRepo = {
       .returning();
     return created!;
   },
+
+  /**
+   * Atomic "create agent + seed v1 operational profile + admin audit" — all
+   * inside a single transaction so a partial commit cannot leave:
+   *   - an agent row with no seed profile (Approve & activate target missing
+   *     in /identities, retry of `create` hits CONFLICT),
+   *   - or agent + seed profile with no audit row (forensics gap on who
+   *     created the agent).
+   *
+   * Codex review of PR #162 round 3 (issue #166) — addresses the same class
+   * of multi-write atomicity gap that `approveAndActivateAtomic` solved for
+   * `approveProfile`.
+   *
+   * Required input is explicit (no AsyncLocalStorage dependency) so the
+   * router can call it without `runWithTenantContext` — tenant_id/agent_id
+   * are stamped on the seed profile_version directly inside the tx.
+   *
+   * The seed version is always `version=1` and `status='proposed'`
+   * (P8.5 invariant — no profile activates without an approval).
+   */
+  async createWithSeedAndAudit(args: {
+    agent: {
+      id: string;
+      tenant_id: string;
+      nome: string;
+      status?: string;
+      metadata?: Record<string, unknown>;
+    };
+    seed_profile: {
+      profile_body: ProfileBody;
+      proposed_by: string;
+      proposed_reason: string;
+    };
+    audit: {
+      actor_id: string;
+      actor_role: string;
+    };
+  }): Promise<{
+    agent: Agent;
+    seed_profile: AgentOperationalProfileVersion;
+  }> {
+    // Validate before opening the tx so a malformed body fails fast without
+    // touching the DB. Mirrors the `seedNewActiveAtomic` pattern.
+    validateProfileBodyP8d(args.seed_profile.profile_body);
+
+    return await withTx(async (tx) => {
+      // (1) Insert agent row.
+      const [createdAgent] = await tx
+        .insert(agents)
+        .values({
+          id: args.agent.id,
+          tenant_id: args.agent.tenant_id,
+          nome: args.agent.nome,
+          status: args.agent.status ?? 'active',
+          ...(args.agent.metadata !== undefined ? { metadata: args.agent.metadata } : {}),
+        })
+        .returning();
+      if (!createdAgent) {
+        throw new Error('create_with_seed_atomic_agent_insert_failed: returning() empty');
+      }
+
+      // (2) Insert seed v1 operational profile_version with status='proposed'.
+      //     No need for applyTenantGuard — tenant_id/agent_id are explicit and
+      //     match the agent row we just inserted.
+      const [seedProfile] = await tx
+        .insert(agent_operational_profile_versions)
+        .values({
+          tenant_id: args.agent.tenant_id,
+          agent_id: createdAgent.id,
+          version: 1,
+          status: 'proposed',
+          profile_body: args.seed_profile.profile_body,
+          proposed_by: args.seed_profile.proposed_by,
+          proposed_reason: args.seed_profile.proposed_reason,
+        })
+        .returning();
+      if (!seedProfile) {
+        throw new Error('create_with_seed_atomic_profile_insert_failed: returning() empty');
+      }
+
+      // (3) Audit in the SAME tx. If this insert fails, EVERYTHING rolls back
+      //     and the agent + seed profile DO NOT persist — no orphaned setup.
+      await tx.insert(admin_audit_log).values({
+        tenant_id: args.agent.tenant_id,
+        actor_id: args.audit.actor_id,
+        actor_role: args.audit.actor_role,
+        action: 'agent_create',
+        resource_type: 'agent',
+        resource_id: createdAgent.id,
+        change_summary: {
+          agent_id: createdAgent.id,
+          agent_nome: createdAgent.nome,
+          seed_profile_version_id: seedProfile.id,
+          seed_profile_version: seedProfile.version,
+          seed_profile_status: seedProfile.status,
+          proposed_reason: args.seed_profile.proposed_reason,
+        },
+      });
+
+      return { agent: createdAgent, seed_profile: seedProfile };
+    });
+  },
 };
 
 export const cognitiveModuleLogRepo = {
@@ -2943,6 +3045,95 @@ export const operationalProfileVersionsRepo = {
       return { ok: false, reason: 'not_found' };
     }
     return { ok: true, updated };
+  },
+
+  /**
+   * Atomic "propose new version + admin audit" — both writes inside a single
+   * transaction so a partial commit cannot leave a profile_version row with
+   * no audit record of who proposed it (forensics gap).
+   *
+   * Codex review of PR #162 round 3 (issue #166) — same class of multi-write
+   * atomicity gap that `approveAndActivateAtomic` solved for approve. The
+   * proposal stays in `status='proposed'`; only `approveAndActivateAtomic`
+   * activates it (P8.5 invariant — no profile activates without approval).
+   *
+   * Required input is explicit (no AsyncLocalStorage dependency) so the
+   * router can call it without `runWithTenantContext`. The previous active
+   * id is captured by the caller (router) BEFORE this call because the
+   * read is part of the same logical operation but doesn't need tx
+   * isolation — concurrent updateProfile + approveProfile races are guarded
+   * by `approveAndActivateAtomic`'s FOR UPDATE on the active row.
+   */
+  async proposeAndAuditAtomic(args: {
+    tenant_id: string;
+    agent_id: string;
+    profile_body: ProfileBody;
+    proposed_by: string;
+    proposed_reason: string;
+    /** Captured by caller from getActive() before opening the tx. */
+    previous_active_id: string | null;
+    actor_id: string;
+    actor_role: string;
+  }): Promise<{
+    version: AgentOperationalProfileVersion;
+    previous_version_id: string | null;
+  }> {
+    // Validate before opening the tx so a malformed body fails fast without
+    // touching the DB.
+    validateProfileBodyP8d(args.profile_body);
+
+    return await withTx(async (tx) => {
+      // (1) Compute next version inside the tx so concurrent inserts can't
+      //     collide on (tenant, agent, version) unique index.
+      const maxRes = await tx.execute<{ max: number | null }>(sql`
+        SELECT MAX(version) AS max
+          FROM agent_operational_profile_versions
+         WHERE tenant_id = ${args.tenant_id}
+           AND agent_id = ${args.agent_id}
+      `);
+      const max = maxRes.rows[0]?.max ?? null;
+      const nextV = max == null ? 1 : Number(max) + 1;
+
+      // (2) Insert the proposed row.
+      const [version] = await tx
+        .insert(agent_operational_profile_versions)
+        .values({
+          tenant_id: args.tenant_id,
+          agent_id: args.agent_id,
+          version: nextV,
+          status: 'proposed',
+          profile_body: args.profile_body,
+          proposed_by: args.proposed_by,
+          proposed_reason: args.proposed_reason,
+        })
+        .returning();
+      if (!version) {
+        throw new Error('propose_atomic_insert_failed: returning() empty');
+      }
+
+      // (3) Audit in the SAME tx. If this fails, the profile_version insert
+      //     rolls back and there's no orphaned proposal.
+      await tx.insert(admin_audit_log).values({
+        tenant_id: args.tenant_id,
+        actor_id: args.actor_id,
+        actor_role: args.actor_role,
+        action: 'agent_profile_propose',
+        resource_type: 'agent_operational_profile_version',
+        resource_id: version.id,
+        change_summary: {
+          agent_id: args.agent_id,
+          previous_version_id: args.previous_active_id,
+          new_version: version.version,
+          status: version.status,
+          proposed_reason: args.proposed_reason,
+        },
+      });
+
+      return {
+        version,
+        previous_version_id: args.previous_active_id,
+      };
+    });
   },
 
   /**

@@ -4,13 +4,17 @@
  * Drives the router through tRPC's caller with in-memory repos. Verifies:
  *   1. create requires role founder|owner; viewer/analyst/compliance get FORBIDDEN.
  *   2. create writes the agent row AND seeds an operational_profile_version
- *      with status='proposed' AND appends an audit row, in that order.
+ *      with status='proposed' AND appends an audit row — ATOMICALLY (via
+ *      agentsRepo.createWithSeedAndAudit; issue #166).
  *   3. create against a non-existent tenant returns NOT_FOUND.
  *   4. create with a duplicate agent id returns CONFLICT.
  *   5. updateProfile chains previous_version_id from the active version.
  *   6. updateProfile on a foreign-tenant agent returns NOT_FOUND (tenant
  *      isolation invariant).
  *   7. resolveTenantId still rejects a body-supplied tenant for non-founder.
+ *   8. ATOMICITY (issue #166): if the audit insert throws inside
+ *      createWithSeedAndAudit / proposeAndAuditAtomic, neither the agent row
+ *      nor the profile_version row are persisted (full rollback).
  */
 import { describe, it, expect } from 'vitest';
 import { TRPCError } from '@trpc/server';
@@ -45,7 +49,22 @@ type AuditRow = {
   change_summary: Record<string, unknown> | null;
 };
 
-function makeRepos(opts: { tenants?: string[]; agents?: Agent[]; profiles?: Profile[] } = {}) {
+/**
+ * Options for makeRepos:
+ *   - failAuditOnAction: when set, the audit insert performed inside the
+ *     atomic helpers (createWithSeedAndAudit / proposeAndAuditAtomic) throws.
+ *     The mock then ROLLS BACK the agent/profile writes performed earlier in
+ *     the same logical tx, mirroring real Postgres `withTx` semantics. Used
+ *     to prove the multi-write atomicity invariant (issue #166).
+ */
+function makeRepos(
+  opts: {
+    tenants?: string[];
+    agents?: Agent[];
+    profiles?: Profile[];
+    failAuditOnAction?: 'agent_create' | 'agent_profile_propose';
+  } = {},
+) {
   const tenantIds = new Set(opts.tenants ?? ['tenant-A']);
   const agentsMap: Record<string, Agent> = {};
   for (const a of opts.agents ?? []) agentsMap[a.id] = { ...a };
@@ -92,6 +111,92 @@ function makeRepos(opts: { tenants?: string[]; agents?: Agent[]; profiles?: Prof
         agentsMap[input.id] = row;
         return row;
       },
+      // Atomic create+seed+audit. Mock emulates `withTx` rollback: if any of
+      // the three writes throws, everything previously inserted in THIS call
+      // is removed. Mirrors the real-DB invariant tested in #166.
+      async createWithSeedAndAudit(args: {
+        agent: {
+          id: string;
+          tenant_id: string;
+          nome: string;
+          status?: string;
+        };
+        seed_profile: {
+          profile_body: unknown;
+          proposed_by: string;
+          proposed_reason: string;
+        };
+        audit: {
+          actor_id: string;
+          actor_role: string;
+        };
+      }) {
+        // Snapshot for rollback.
+        const insertedAgentId = args.agent.id;
+        const insertedProfileIds: string[] = [];
+        const insertedAuditIdx: number[] = [];
+        try {
+          // (1) Insert agent.
+          const createdAgent: Agent = {
+            id: args.agent.id,
+            tenant_id: args.agent.tenant_id,
+            nome: args.agent.nome,
+            status: args.agent.status ?? 'active',
+            metadata: {},
+            created_at: new Date(),
+            updated_at: new Date(),
+          };
+          agentsMap[insertedAgentId] = createdAgent;
+          // (2) Insert seed profile_version (version=1, status=proposed).
+          const seedProfile: Profile = {
+            id: `prof-${profiles.length + 1}`,
+            tenant_id: args.agent.tenant_id,
+            agent_id: createdAgent.id,
+            version: 1,
+            status: 'proposed',
+            profile_body: args.seed_profile.profile_body,
+            proposed_by: args.seed_profile.proposed_by,
+            proposed_reason: args.seed_profile.proposed_reason,
+          };
+          profiles.push(seedProfile);
+          insertedProfileIds.push(seedProfile.id);
+          // (3) Append audit. May throw if failAuditOnAction matches.
+          if (opts.failAuditOnAction === 'agent_create') {
+            throw new Error('simulated audit insert failure');
+          }
+          audit.push({
+            tenant_id: args.agent.tenant_id,
+            actor_id: args.audit.actor_id,
+            actor_role: args.audit.actor_role,
+            action: 'agent_create',
+            resource_type: 'agent',
+            resource_id: createdAgent.id,
+            change_summary: {
+              agent_id: createdAgent.id,
+              agent_nome: createdAgent.nome,
+              seed_profile_version_id: seedProfile.id,
+              seed_profile_version: seedProfile.version,
+              seed_profile_status: seedProfile.status,
+              proposed_reason: args.seed_profile.proposed_reason,
+            },
+          });
+          insertedAuditIdx.push(audit.length - 1);
+          return { agent: createdAgent, seed_profile: seedProfile };
+        } catch (err) {
+          // ROLLBACK: undo every write made above. This is the invariant the
+          // test asserts — if audit throws, agent + profile_version DO NOT
+          // persist.
+          if (agentsMap[insertedAgentId]) delete agentsMap[insertedAgentId];
+          for (const pid of insertedProfileIds) {
+            const idx = profiles.findIndex((p) => p.id === pid);
+            if (idx >= 0) profiles.splice(idx, 1);
+          }
+          for (const aidx of insertedAuditIdx.slice().reverse()) {
+            audit.splice(aidx, 1);
+          }
+          throw err;
+        }
+      },
     },
     operationalProfileVersionsRepo: {
       // The real repo uses applyTenantGuard + getCurrentTenant(); the router
@@ -107,33 +212,63 @@ function makeRepos(opts: { tenants?: string[]; agents?: Agent[]; profiles?: Prof
         const active = profiles.find((p) => p.status === 'active');
         return active ?? null;
       },
-      async create(input: {
+      // Atomic propose+audit. Mock emulates `withTx` rollback: if the audit
+      // insert throws, the profile_version row inserted earlier is removed.
+      async proposeAndAuditAtomic(args: {
+        tenant_id: string;
+        agent_id: string;
         profile_body: unknown;
         proposed_by: string;
-        proposed_reason?: string;
+        proposed_reason: string;
+        previous_active_id: string | null;
+        actor_id: string;
+        actor_role: string;
       }) {
-        // We can't read the tenant context from the test mock easily, but the
-        // router always passes the SAME tenant+agent in runWithTenantContext as
-        // the one supplied to agentsRepo.create. So we tag from the latest agent
-        // create (best-effort for tests).
-        const lastAgent = Object.values(agentsMap).at(-1);
-        const tenant_id = lastAgent?.tenant_id ?? 'unknown';
-        const agent_id = lastAgent?.id ?? 'unknown';
-        const version =
-          profiles.filter((p) => p.tenant_id === tenant_id && p.agent_id === agent_id)
-            .length + 1;
-        const row: Profile = {
-          id: `prof-${profiles.length + 1}`,
-          tenant_id,
-          agent_id,
-          version,
-          status: 'proposed',
-          profile_body: input.profile_body,
-          proposed_by: input.proposed_by,
-          proposed_reason: input.proposed_reason ?? null,
-        };
-        profiles.push(row);
-        return row;
+        const insertedProfileIds: string[] = [];
+        try {
+          const version =
+            profiles.filter(
+              (p) => p.tenant_id === args.tenant_id && p.agent_id === args.agent_id,
+            ).length + 1;
+          const row: Profile = {
+            id: `prof-${profiles.length + 1}`,
+            tenant_id: args.tenant_id,
+            agent_id: args.agent_id,
+            version,
+            status: 'proposed',
+            profile_body: args.profile_body,
+            proposed_by: args.proposed_by,
+            proposed_reason: args.proposed_reason,
+          };
+          profiles.push(row);
+          insertedProfileIds.push(row.id);
+
+          if (opts.failAuditOnAction === 'agent_profile_propose') {
+            throw new Error('simulated audit insert failure');
+          }
+          audit.push({
+            tenant_id: args.tenant_id,
+            actor_id: args.actor_id,
+            actor_role: args.actor_role,
+            action: 'agent_profile_propose',
+            resource_type: 'agent_operational_profile_version',
+            resource_id: row.id,
+            change_summary: {
+              agent_id: args.agent_id,
+              previous_version_id: args.previous_active_id,
+              new_version: row.version,
+              status: row.status,
+              proposed_reason: args.proposed_reason,
+            },
+          });
+          return { version: row, previous_version_id: args.previous_active_id };
+        } catch (err) {
+          for (const pid of insertedProfileIds) {
+            const idx = profiles.findIndex((p) => p.id === pid);
+            if (idx >= 0) profiles.splice(idx, 1);
+          }
+          throw err;
+        }
       },
       // Mirrors the tx-aware repo path: finds the target proposed row, freezes
       // any incumbent active for the same (tenant, agent), activates the new
@@ -568,5 +703,128 @@ describe('agentsRouter.approveProfile — atomic + freezes incumbent', () => {
         comment: 'agent does not exist',
       }),
     ).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  });
+});
+
+/**
+ * ATOMICITY (issue #166) — the agentsRouter must not commit a partial
+ * create/updateProfile sequence. If the audit insert throws (sim. via the
+ * `failAuditOnAction` knob, which the mock honors by rolling back earlier
+ * inserts in the same logical tx), neither the agent row nor the seed/new
+ * profile_version row may persist.
+ *
+ * These tests exercise the contract of `agentsRepo.createWithSeedAndAudit`
+ * and `operationalProfileVersionsRepo.proposeAndAuditAtomic` from the router's
+ * perspective — the real repo wraps the writes in `withTx` so a Postgres
+ * exception triggers ROLLBACK at the DB level.
+ */
+describe('agentsRouter — multi-write atomicity (#166)', () => {
+  it('create: audit failure rolls back agent + seed profile_version', async () => {
+    const repos = makeRepos({ failAuditOnAction: 'agent_create' });
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).create({
+        id: 'agent-x',
+        nome: 'X',
+        profile_body: validProfile,
+        proposed_reason: 'seed that should rollback when audit fails',
+      }),
+    ).rejects.toThrow(/simulated audit insert failure/);
+
+    // Neither the agent row nor the seed profile_version was persisted.
+    expect(repos._inspect.agentsMap['agent-x']).toBeUndefined();
+    expect(repos._inspect.profiles.find((p) => p.agent_id === 'agent-x')).toBeUndefined();
+    // And no audit row was appended (would be a forensics ghost otherwise).
+    expect(repos._inspect.audit).toHaveLength(0);
+  });
+
+  it('create: happy path persists all three rows', async () => {
+    const repos = makeRepos();
+    const res = await caller('owner', 'tenant-A', 'u1', repos).create({
+      id: 'agent-x',
+      nome: 'X',
+      profile_body: validProfile,
+      proposed_reason: 'happy-path baseline for the rollback test above',
+    });
+    expect(res.agent.id).toBe('agent-x');
+    expect(repos._inspect.agentsMap['agent-x']).toBeDefined();
+    expect(repos._inspect.profiles).toHaveLength(1);
+    expect(repos._inspect.audit).toHaveLength(1);
+    expect(repos._inspect.audit[0]!.action).toBe('agent_create');
+  });
+
+  it('updateProfile: audit failure rolls back the new profile_version', async () => {
+    const existingAgent: Agent = {
+      id: 'agent-x',
+      tenant_id: 'tenant-A',
+      nome: 'X',
+      status: 'active',
+      metadata: {},
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+    const v1Active: Profile = {
+      id: 'prof-v1',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      version: 1,
+      status: 'active',
+      profile_body: {},
+      proposed_by: 'system',
+      proposed_reason: null,
+    };
+    const repos = makeRepos({
+      agents: [existingAgent],
+      profiles: [v1Active],
+      failAuditOnAction: 'agent_profile_propose',
+    });
+
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).updateProfile({
+        agentId: 'agent-x',
+        profile_body: validProfile,
+        proposed_reason: 'update that should rollback when audit fails',
+      }),
+    ).rejects.toThrow(/simulated audit insert failure/);
+
+    // Only the pre-existing v1 active row remains; the proposed v2 did NOT
+    // persist, even though it was inserted before the audit threw.
+    expect(repos._inspect.profiles).toHaveLength(1);
+    expect(repos._inspect.profiles[0]!.id).toBe('prof-v1');
+    expect(repos._inspect.profiles[0]!.status).toBe('active');
+    // No audit row was appended.
+    expect(repos._inspect.audit).toHaveLength(0);
+  });
+
+  it('updateProfile: happy path persists v2 proposed + audit row', async () => {
+    const existingAgent: Agent = {
+      id: 'agent-x',
+      tenant_id: 'tenant-A',
+      nome: 'X',
+      status: 'active',
+      metadata: {},
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+    const v1Active: Profile = {
+      id: 'prof-v1',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      version: 1,
+      status: 'active',
+      profile_body: {},
+      proposed_by: 'system',
+      proposed_reason: null,
+    };
+    const repos = makeRepos({ agents: [existingAgent], profiles: [v1Active] });
+    const res = await caller('owner', 'tenant-A', 'u1', repos).updateProfile({
+      agentId: 'agent-x',
+      profile_body: validProfile,
+      proposed_reason: 'happy-path baseline for the rollback test above',
+    });
+    expect(res.version.status).toBe('proposed');
+    expect(res.previous_version_id).toBe('prof-v1');
+    expect(repos._inspect.profiles).toHaveLength(2);
+    expect(repos._inspect.audit).toHaveLength(1);
+    expect(repos._inspect.audit[0]!.action).toBe('agent_profile_propose');
   });
 });

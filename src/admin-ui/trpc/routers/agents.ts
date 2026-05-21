@@ -5,15 +5,21 @@
  *   - list           — list agents for a tenant
  *   - getById        — fetch a single agent
  *   - create         — create an agent AND seed agent_operational_profile_versions
- *                      v1 with status='proposed'. Audit row appended.
+ *                      v1 with status='proposed' AND append audit row, all in a
+ *                      single transaction (agentsRepo.createWithSeedAndAudit).
  *   - updateProfile  — propose a new operational_profile_version for an existing
- *                      agent. Status='proposed' — the proposal still has to be
+ *                      agent AND append audit row, in a single transaction
+ *                      (operationalProfileVersionsRepo.proposeAndAuditAtomic).
+ *                      Status='proposed' — the proposal still has to be
  *                      approved through the standard proposal-inbox flow.
  *
  * Notes:
- *   - operationalProfileVersionsRepo uses applyTenantGuard, so we wrap with
- *     runWithTenantContext({ tenant_id, agent_id }). The tenant_id ALWAYS
- *     comes from the resolved ctx tenant (no body override).
+ *   - All three mutations (create / updateProfile / approveProfile) now go
+ *     through repo-level "atomic" methods that take explicit tenant_id/agent_id
+ *     and wrap their writes in `withTx`. Codex review of PR #162 round 3
+ *     (issue #166) closed the multi-write atomicity gap.
+ *   - The tenant_id ALWAYS comes from the resolved ctx tenant (no body
+ *     override for owner — only founder can supply a body tenantId).
  *   - We deliberately do NOT auto-activate the seeded profile. P8.5 invariant
  *     is "no profile activates without an approval"; admin-ui setup respects
  *     this — a freshly-created agent has no active profile until owner/founder
@@ -157,42 +163,31 @@ export const agentsRouter = router({
       });
     }
 
-    const created = await ctx.repos.agentsRepo.create({
-      id: input.id,
-      tenant_id: tenantId,
-      nome: input.nome,
-      status: input.status ?? 'active',
-    });
-
-    // Seed v1 operational profile in 'proposed' state. The tenant_id + agent_id
-    // context is required by applyTenantGuard inside operationalProfileVersionsRepo.
+    // Codex review of PR #162 round 3 (issue #166) — agent insert + seed
+    // profile_version + audit are now wrapped in a single tx via
+    // agentsRepo.createWithSeedAndAudit. A failure on any of the three
+    // rolls back the other two, so we cannot leave an agent with no seed
+    // profile (which would break /identities setup) nor an unaudited
+    // governance change. Same pattern as `approveAndActivateAtomic`.
     const profileBody = buildProfileBody(input.profile_body, ctx.userId, null);
-    const version = await runWithTenantContext(
-      { tenant_id: tenantId, agent_id: created.id },
-      async () =>
-        ctx.repos.operationalProfileVersionsRepo.create({
+    const { agent: created, seed_profile: version } =
+      await ctx.repos.agentsRepo.createWithSeedAndAudit({
+        agent: {
+          id: input.id,
+          tenant_id: tenantId,
+          nome: input.nome,
+          status: input.status ?? 'active',
+        },
+        seed_profile: {
           profile_body: profileBody,
           proposed_by: ctx.userId,
           proposed_reason: input.proposed_reason,
-        }),
-    );
-
-    await ctx.repos.adminAuditLogRepo.append({
-      tenant_id: tenantId,
-      actor_id: ctx.userId,
-      actor_role: ctx.userRole,
-      action: 'agent_create',
-      resource_type: 'agent',
-      resource_id: created.id,
-      change_summary: {
-        agent_id: created.id,
-        agent_nome: created.nome,
-        seed_profile_version_id: version.id,
-        seed_profile_version: version.version,
-        seed_profile_status: version.status,
-        proposed_reason: input.proposed_reason,
-      },
-    });
+        },
+        audit: {
+          actor_id: ctx.userId,
+          actor_role: ctx.userRole,
+        },
+      });
 
     return {
       agent: created,
@@ -215,6 +210,12 @@ export const agentsRouter = router({
         throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent not found' });
       }
 
+      // Read current active version OUTSIDE the tx — it's only used to chain
+      // previous_version_id into the profile_body metadata. Concurrent
+      // approveProfile races are guarded inside `approveAndActivateAtomic`
+      // via FOR UPDATE on the active row, so a stale read here is bounded
+      // (worst case: previous_version_id chains to a now-frozen row, which
+      // is still a valid lineage marker).
       const activeVersion = await runWithTenantContext(
         { tenant_id: tenantId, agent_id: agent.id },
         async () => ctx.repos.operationalProfileVersionsRepo.getActive(),
@@ -226,31 +227,22 @@ export const agentsRouter = router({
         activeVersion?.id ?? null,
       );
 
-      const version = await runWithTenantContext(
-        { tenant_id: tenantId, agent_id: agent.id },
-        async () =>
-          ctx.repos.operationalProfileVersionsRepo.create({
-            profile_body: profileBody,
-            proposed_by: ctx.userId,
-            proposed_reason: input.proposed_reason,
-          }),
-      );
-
-      await ctx.repos.adminAuditLogRepo.append({
-        tenant_id: tenantId,
-        actor_id: ctx.userId,
-        actor_role: ctx.userRole,
-        action: 'agent_profile_propose',
-        resource_type: 'agent_operational_profile_version',
-        resource_id: version.id,
-        change_summary: {
+      // Codex review of PR #162 round 3 (issue #166) — profile_version
+      // insert + audit are now wrapped in a single tx via
+      // operationalProfileVersionsRepo.proposeAndAuditAtomic. A failure on
+      // either rolls back the other, so we cannot leave a proposal with no
+      // audit row.
+      const { version, previous_version_id } =
+        await ctx.repos.operationalProfileVersionsRepo.proposeAndAuditAtomic({
+          tenant_id: tenantId,
           agent_id: agent.id,
-          previous_version_id: activeVersion?.id ?? null,
-          new_version: version.version,
-          status: version.status,
+          profile_body: profileBody,
+          proposed_by: ctx.userId,
           proposed_reason: input.proposed_reason,
-        },
-      });
+          previous_active_id: activeVersion?.id ?? null,
+          actor_id: ctx.userId,
+          actor_role: ctx.userRole,
+        });
 
       return {
         version: {
@@ -258,7 +250,7 @@ export const agentsRouter = router({
           version: version.version,
           status: version.status,
         },
-        previous_version_id: activeVersion?.id ?? null,
+        previous_version_id,
       };
     }),
 
