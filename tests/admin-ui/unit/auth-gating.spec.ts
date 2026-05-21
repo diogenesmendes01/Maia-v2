@@ -130,7 +130,7 @@ describe('oidcProviderEnabled — gating', () => {
   function setOidcEnabledEnv() {
     process.env.OIDC_ISSUER = 'https://login.example.com/realms/maia';
     process.env.OIDC_CLIENT_ID = 'maia-admin';
-    process.env.OIDC_CLIENT_SECRET = 'sufficient-length-secret-1234567890';
+    process.env.OIDC_CLIENT_SECRET = 'NOT_A_REAL_SECRET_ok_for_unit_test_only_xx';
   }
 
   it('all three env set ⇒ enabled', () => {
