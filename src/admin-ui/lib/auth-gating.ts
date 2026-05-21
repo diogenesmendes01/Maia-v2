@@ -51,6 +51,12 @@ export function devCredentialsProviderEnabled(): boolean {
  *
  * Requires all of:
  *   - OIDC_ISSUER         (e.g. https://login.example.com/realms/maia)
+ *                          MUST be https:// in production. In dev/test, plain
+ *                          http:// is only tolerated for the loopback hosts
+ *                          `localhost` and `127.0.0.1` (any port) so operators
+ *                          can stand up a local IdP. Anything else (incl.
+ *                          private RFC1918 IPs over http) is rejected — see
+ *                          issue #167 (cleartext OIDC in prod) for rationale.
  *   - OIDC_CLIENT_ID
  *   - OIDC_CLIENT_SECRET  (>= 16 chars; rejecting empty/placeholder)
  *   - OIDC_TENANT_SLUGS   (non-empty comma list; without this every OIDC
@@ -73,7 +79,27 @@ export function oidcProviderEnabled(): boolean {
     .split(',')
     .map((s) => s.trim())
     .filter((s) => s.length > 0);
-  if (!issuer || !issuer.startsWith('http')) return false;
+  if (!issuer) return false;
+  // Validate parseability AND scheme. `new URL` throws TypeError for malformed
+  // input — catch and fail-closed rather than crashing provider registration.
+  let url: URL;
+  try {
+    url = new URL(issuer);
+  } catch {
+    return false;
+  }
+  if (process.env.NODE_ENV === 'production') {
+    // Production: https:// only. No exceptions — cleartext leaks redirect
+    // URLs, ID tokens, and client credentials to any network observer.
+    if (url.protocol !== 'https:') return false;
+  } else {
+    // Dev/test: https:// always OK; http:// only for loopback hosts so a
+    // local IdP (Keycloak, dex, etc.) can be exercised without TLS.
+    const isLoopbackHttp =
+      url.protocol === 'http:' &&
+      (url.hostname === 'localhost' || url.hostname === '127.0.0.1');
+    if (url.protocol !== 'https:' && !isLoopbackHttp) return false;
+  }
   if (!clientId) return false;
   if (clientSecret.length < 16) return false;
   if (tenantSlugs.length === 0) return false;

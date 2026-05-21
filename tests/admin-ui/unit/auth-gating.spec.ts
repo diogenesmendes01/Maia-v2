@@ -158,6 +158,72 @@ describe('oidcProviderEnabled — gating', () => {
     expect(oidcProviderEnabled()).toBe(false);
   });
 
+  // Issue #167 — cleartext OIDC issuer must be rejected in production. The
+  // pre-fix gate only checked `startsWith('http')` which also matched http://.
+  // Misconfigured OIDC_ISSUER=http://... in prod would have registered the
+  // provider, leaking redirect URLs, ID tokens, and client credentials.
+  it('PROD: OIDC_ISSUER=http:// ⇒ disabled (cleartext rejected)', () => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'production';
+    process.env.OIDC_ISSUER = 'http://idp.internal/realms/maia';
+    expect(oidcProviderEnabled()).toBe(false);
+  });
+
+  it('PROD: OIDC_ISSUER=http://localhost ⇒ disabled (no loopback exception in prod)', () => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'production';
+    process.env.OIDC_ISSUER = 'http://localhost:8080/realms/maia';
+    expect(oidcProviderEnabled()).toBe(false);
+  });
+
+  it('PROD: OIDC_ISSUER=https:// ⇒ enabled', () => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'production';
+    process.env.OIDC_ISSUER = 'https://idp.internal/realms/maia';
+    expect(oidcProviderEnabled()).toBe(true);
+  });
+
+  it('DEV: OIDC_ISSUER=http://localhost:8080 ⇒ enabled (local IdP testing)', () => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'development';
+    process.env.OIDC_ISSUER = 'http://localhost:8080/realms/maia';
+    expect(oidcProviderEnabled()).toBe(true);
+  });
+
+  it('DEV: OIDC_ISSUER=http://127.0.0.1 ⇒ enabled (loopback IP)', () => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'development';
+    process.env.OIDC_ISSUER = 'http://127.0.0.1:8080/realms/maia';
+    expect(oidcProviderEnabled()).toBe(true);
+  });
+
+  it('DEV: OIDC_ISSUER=http://192.168.1.10 ⇒ disabled (non-loopback http rejected)', () => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'development';
+    process.env.OIDC_ISSUER = 'http://192.168.1.10/realms/maia';
+    expect(oidcProviderEnabled()).toBe(false);
+  });
+
+  it('DEV: OIDC_ISSUER=http://idp.internal ⇒ disabled (non-loopback hostname)', () => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'development';
+    process.env.OIDC_ISSUER = 'http://idp.internal/realms/maia';
+    expect(oidcProviderEnabled()).toBe(false);
+  });
+
+  it('OIDC_ISSUER malformed (unparseable) ⇒ disabled (no throw)', () => {
+    setOidcEnabledEnv();
+    process.env.OIDC_ISSUER = 'not a url ::::';
+    expect(() => oidcProviderEnabled()).not.toThrow();
+    expect(oidcProviderEnabled()).toBe(false);
+  });
+
+  it('OIDC_ISSUER with unsupported scheme (e.g. ftp://) ⇒ disabled', () => {
+    setOidcEnabledEnv();
+    process.env.OIDC_ISSUER = 'ftp://idp.example.com/realms/maia';
+    expect(oidcProviderEnabled()).toBe(false);
+  });
+
   it('OIDC_CLIENT_ID unset ⇒ disabled', () => {
     setOidcEnabledEnv();
     delete process.env.OIDC_CLIENT_ID;
