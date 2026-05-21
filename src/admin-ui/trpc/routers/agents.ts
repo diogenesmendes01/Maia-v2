@@ -311,6 +311,21 @@ export const agentsRouter = router({
             message: 'Version is not in proposed state; refresh and retry',
           });
         }
+        // Codex Adversarial Review of PR #171 round 2 — predecessor mismatch.
+        // The active profile changed between the time this proposal was
+        // authored and now. Approving would silently overwrite the newer
+        // approved version with stale content. Surface a CONFLICT with the
+        // diff so the client can refresh + re-propose against the current
+        // incumbent.
+        if (result.reason === 'predecessor_conflict') {
+          throw new TRPCError({
+            code: 'CONFLICT',
+            message:
+              `Active profile changed since this proposal was authored ` +
+              `(expected predecessor ${String(result.expected)}, current ${String(result.current)}). ` +
+              `Refresh and re-propose against the current active version.`,
+          });
+        }
         throw new TRPCError({
           code: 'INTERNAL_SERVER_ERROR',
           message: `Approval transition failed: ${result.reason}`,

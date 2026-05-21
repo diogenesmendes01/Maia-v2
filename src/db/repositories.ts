@@ -2884,6 +2884,87 @@ function validateProfileBodyP8d(body: ProfileBody): void {
   }
 }
 
+/**
+ * Extract the proposal's expected predecessor active id from `profile_body`.
+ *
+ * The Admin UI `updateProfile` flow populates `metadata.previous_version_id`
+ * with the active version id observed at the time the proposal was authored.
+ * `approveAndActivateAtomic` compares this against the freshly-locked
+ * incumbent active id to detect write-skew (two stale proposals racing).
+ *
+ * Returns:
+ *   - `string`     — explicit predecessor id from the proposal body
+ *   - `null`       — explicit "no predecessor expected" (e.g., seed v1)
+ *   - `'unknown'`  — `metadata.previous_version_id` is absent entirely. The
+ *                    proposal predates this codepath; the caller's policy
+ *                    decides whether to reject conservatively or accept.
+ */
+function readExpectedPredecessor(profile_body: unknown): string | null | 'unknown' {
+  const md = (profile_body as { metadata?: Record<string, unknown> } | null)?.metadata;
+  if (!md || !('previous_version_id' in md)) return 'unknown';
+  const v = md.previous_version_id;
+  if (v === null) return null;
+  if (typeof v === 'string') return v;
+  // Some other JSON type (number, boolean, object) — treat as legacy.
+  return 'unknown';
+}
+
+/**
+ * Shared per-agent version allocator for `agent_operational_profile_versions`.
+ *
+ * Codex Adversarial Review of PR #171 round 2 (issue #166 follow-up) — three
+ * different writers allocate `version` via `MAX(version)+1`:
+ *   - `operationalProfileVersionsRepo.create`        (proposal-generator)
+ *   - `operationalProfileVersionsRepo.proposeAndAuditAtomic` (Admin UI)
+ *   - `operationalProfileVersionsRepo.seedNewActiveAtomic`   (migration script)
+ *
+ * Until this helper, each writer chose its own lock strategy (none, agent row,
+ * or active row), so a *mixed-allocator* race between e.g. an Admin UI propose
+ * and the priorities migration could still read the same `MAX(version)` and
+ * collide on `agent_op_profile_version_uq`.
+ *
+ * This helper centralizes the lock target on the parent `agents` row by PK +
+ * tenant. All version allocators MUST go through it. The lock is held until
+ * the surrounding tx commits/rollbacks, so subsequent `INSERT` lands behind
+ * the same lock and the unique-index collision is impossible.
+ *
+ * Returns `null` if the parent agent was deleted (or never existed) — callers
+ * translate that into their own typed-miss sentinel (`agent_missing: true`,
+ * NOT_FOUND, etc.). Throws nothing of its own — surfacing as a Postgres error
+ * only on lock acquisition failures (deadlock, statement_timeout).
+ *
+ * @param tx        the in-tx drizzle handle (caller must already be inside `withTx`)
+ * @param tenant_id tenant slug — tested in both the lock predicate and MAX scope
+ * @param agent_id  agent id (PK) — locked with FOR UPDATE
+ */
+async function acquireNextVersionForAgent(
+  tx: typeof db,
+  tenant_id: string,
+  agent_id: string,
+): Promise<number | null> {
+  // (1) Lock the parent agent row. PK + tenant_id avoids accidentally locking
+  //     a same-id agent under a different tenant — defense-in-depth even
+  //     though `agents.id` is globally unique today, because the schema
+  //     contract is "id is unique per tenant".
+  const lock = await tx
+    .select({ id: agents.id })
+    .from(agents)
+    .where(and(eq(agents.id, agent_id), eq(agents.tenant_id, tenant_id)))
+    .for('update')
+    .limit(1);
+  if (lock.length === 0) return null;
+
+  // (2) Read MAX(version) BEHIND the lock so concurrent allocators serialize.
+  const maxRes = await tx.execute<{ max: number | null }>(sql`
+    SELECT MAX(version) AS max
+      FROM agent_operational_profile_versions
+     WHERE tenant_id = ${tenant_id}
+       AND agent_id = ${agent_id}
+  `);
+  const max = maxRes.rows[0]?.max ?? null;
+  return max == null ? 1 : Number(max) + 1;
+}
+
 export const operationalProfileVersionsRepo = {
   async create(input: {
     profile_body: ProfileBody;
@@ -2897,24 +2978,37 @@ export const operationalProfileVersionsRepo = {
 
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
-    const version = await operationalProfileVersionsRepo.nextVersion();
-    const guarded = applyTenantGuard({
-      version,
-      status: 'proposed',
-      profile_body: input.profile_body,
-      proposed_by: input.proposed_by,
-      proposed_reason: input.proposed_reason ?? null,
+
+    // Codex Adversarial Review of PR #171 round 2 (issue #166) — version
+    // allocation now goes through the shared `acquireNextVersionForAgent`
+    // helper, which locks the parent agent row before reading MAX(version).
+    // This serializes against the OTHER allocators (`proposeAndAuditAtomic`,
+    // `seedNewActiveAtomic`), closing the mixed-allocator race where two
+    // different writers for the same (tenant, agent) could both read the
+    // same MAX and collide on `agent_op_profile_version_uq`. Wrapping the
+    // insert in `withTx` keeps the lock held across the INSERT so a third
+    // writer cannot squeeze in between MAX and INSERT.
+    return withTx(async (tx) => {
+      const version = await acquireNextVersionForAgent(tx, tenant_id, agent_id);
+      if (version == null) {
+        throw new Error(
+          `operationalProfileVersionsRepo.create: parent agent ${agent_id} ` +
+            `not found in tenant ${tenant_id}`,
+        );
+      }
+      const guarded = applyTenantGuard({
+        version,
+        status: 'proposed',
+        profile_body: input.profile_body,
+        proposed_by: input.proposed_by,
+        proposed_reason: input.proposed_reason ?? null,
+      });
+      const [row] = await tx
+        .insert(agent_operational_profile_versions)
+        .values(guarded)
+        .returning();
+      return row!;
     });
-    // tenant_id/agent_id são injetados pelo applyTenantGuard. Os types do
-    // Drizzle agora alinham naturalmente com o $inferInsert da tabela (1
-    // coluna JSONB `profile_body` em vez das 4 legacy) — sem cast necessário.
-    void tenant_id;
-    void agent_id;
-    const [row] = await db
-      .insert(agent_operational_profile_versions)
-      .values(guarded)
-      .returning();
-    return row!;
   },
 
   async getActive(): Promise<AgentOperationalProfileVersion | null> {
@@ -3070,6 +3164,11 @@ export const operationalProfileVersionsRepo = {
    * because the row lock is naturally scoped, debuggable via `pg_locks`,
    * and consistent with the rest of this repo.
    *
+   * Codex Adversarial Review of PR #171 round 2 — version allocation moved
+   * to the shared `acquireNextVersionForAgent` helper so this method, the
+   * priorities-migration `seedNewActiveAtomic`, and `create` ALL serialize
+   * on the same parent-agent FOR UPDATE lock. Mixed-allocator race closed.
+   *
    * Required input is explicit (no AsyncLocalStorage dependency) so the
    * router can call it without `runWithTenantContext`. The previous active
    * id is captured by the caller (router) BEFORE this call because the
@@ -3104,37 +3203,20 @@ export const operationalProfileVersionsRepo = {
     validateProfileBodyP8d(args.profile_body);
 
     return await withTx(async (tx) => {
-      // (0) Lock the parent agent row to serialize concurrent version
-      //     allocation for the same (tenant, agent). Without this lock, two
-      //     concurrent updateProfile calls under READ COMMITTED can both
-      //     read the same MAX(version) and both insert max+1, colliding on
-      //     the (tenant_id, agent_id, version) unique index. Locking by PK
-      //     keeps the contention scope minimal — proposals against
-      //     different agents never block each other.
-      const agentLock = await tx
-        .select({ id: agents.id })
-        .from(agents)
-        .where(and(eq(agents.id, args.agent_id), eq(agents.tenant_id, args.tenant_id)))
-        .for('update')
-        .limit(1);
-      if (agentLock.length === 0) {
+      // (1) Allocate next version via the shared helper, which (a) locks the
+      //     parent agent row FOR UPDATE and (b) reads MAX(version) behind
+      //     that lock. The lock is held until tx commit so the subsequent
+      //     INSERT lands behind it, eliminating both same-allocator and
+      //     mixed-allocator races (Codex round 2 #166: other writers like
+      //     `seedNewActiveAtomic` and `operationalProfileVersionsRepo.create`
+      //     now use the same helper).
+      const nextV = await acquireNextVersionForAgent(tx, args.tenant_id, args.agent_id);
+      if (nextV == null) {
         // Agent was deleted between the router's findById and this tx.
         // Surface a typed sentinel so the caller can translate to NOT_FOUND
         // instead of leaking a half-applied transaction or generic 500.
         return { agent_missing: true as const };
       }
-
-      // (1) Compute next version inside the tx + behind the row lock so
-      //     concurrent inserts can't collide on (tenant, agent, version)
-      //     unique index.
-      const maxRes = await tx.execute<{ max: number | null }>(sql`
-        SELECT MAX(version) AS max
-          FROM agent_operational_profile_versions
-         WHERE tenant_id = ${args.tenant_id}
-           AND agent_id = ${args.agent_id}
-      `);
-      const max = maxRes.rows[0]?.max ?? null;
-      const nextV = max == null ? 1 : Number(max) + 1;
 
       // (2) Insert the proposed row.
       const [version] = await tx
@@ -3192,6 +3274,28 @@ export const operationalProfileVersionsRepo = {
    *     before activating the new one. (`transition({to:'active'})` alone
    *     fails with already_has_active.)
    *
+   * Codex Adversarial Review of PR #171 round 2 ([high] #1) — adds predecessor
+   * enforcement. The router's `updateProfile` reads the active version OUTSIDE
+   * the proposal tx and chains its id into `profile_body.metadata.previous_version_id`
+   * (the "expected predecessor"). If a *different* proposal gets approved
+   * between that read and this approval, the active row id no longer matches
+   * the predecessor — approving would silently overwrite the newer version
+   * with stale content while the audit lineage still points at the original
+   * predecessor (write-skew).
+   *
+   * Mitigation: inside this tx, after locking BOTH the proposed row AND the
+   * incumbent active row FOR UPDATE, compare the proposed's expected
+   * predecessor against the freshly-locked incumbent. If they diverge,
+   * reject with `predecessor_conflict` so the caller can refresh + re-propose.
+   *
+   * Policy on legacy / missing predecessor metadata: a `profile_body` without
+   * `metadata.previous_version_id` (key absent, NOT explicit `null`) is rare
+   * but possible for proposals authored before this codepath existed. We
+   * REJECT those defensively with `predecessor_conflict` (expected: 'unknown')
+   * — operators must re-propose under the new flow. Conservative choice over
+   * "accept with warning" because the worst case (silent overwrite of a
+   * newer approved version) is exactly the bug we're closing.
+   *
    * Required input is explicit (no AsyncLocalStorage dependency) so the
    * router can call it without `runWithTenantContext`.
    */
@@ -3212,6 +3316,14 @@ export const operationalProfileVersionsRepo = {
     | {
         ok: false;
         reason: 'not_found' | 'invalid_source_status' | 'transition_failed';
+      }
+    | {
+        ok: false;
+        reason: 'predecessor_conflict';
+        /** What the proposal expected the incumbent active id to be. */
+        expected: string | null | 'unknown';
+        /** What the incumbent active id actually is right now (post-lock). */
+        current: string | null;
       }
   > {
     return await withTx(async (tx) => {
@@ -3236,7 +3348,9 @@ export const operationalProfileVersionsRepo = {
       }
 
       // (2) Lock the current active (if any) so the freeze + activate is
-      // atomic against concurrent activations of a third version.
+      // atomic against concurrent activations of a third version. This
+      // also gives us a fresh post-lock read of the incumbent id for the
+      // predecessor-conflict check below.
       const activeRows = await tx
         .select()
         .from(agent_operational_profile_versions)
@@ -3250,6 +3364,34 @@ export const operationalProfileVersionsRepo = {
         .for('update')
         .limit(1);
       const incumbent = activeRows[0] ?? null;
+
+      // (2b) Predecessor enforcement — Codex round 2 [high] #1.
+      // The proposal was built against a specific incumbent id (recorded in
+      // profile_body.metadata.previous_version_id). If the current incumbent
+      // (re-read post-lock) doesn't match, a different proposal won the
+      // race — approving this one would silently dropthat newer version's
+      // changes while the audit lineage still pointed at the old
+      // predecessor. Reject so the caller can refresh + re-propose.
+      const expectedPredecessor = readExpectedPredecessor(proposed.profile_body);
+      const currentPredecessor = incumbent?.id ?? null;
+      if (expectedPredecessor === 'unknown') {
+        // Legacy proposal authored before this codepath — see policy in
+        // the doccomment above. Refuse rather than risk silent overwrite.
+        return {
+          ok: false as const,
+          reason: 'predecessor_conflict' as const,
+          expected: 'unknown' as const,
+          current: currentPredecessor,
+        };
+      }
+      if (expectedPredecessor !== currentPredecessor) {
+        return {
+          ok: false as const,
+          reason: 'predecessor_conflict' as const,
+          expected: expectedPredecessor,
+          current: currentPredecessor,
+        };
+      }
 
       const now = new Date();
 
@@ -3297,6 +3439,10 @@ export const operationalProfileVersionsRepo = {
           new_version: proposed.version,
           previous_active_id: incumbent?.id ?? null,
           previous_active_version: incumbent?.version ?? null,
+          // Codex round 2: record the predecessor expectation declared by
+          // the proposal so forensics can prove this approval did NOT win
+          // a write-skew race (expected == current at lock time).
+          expected_predecessor_id: expectedPredecessor,
           comment: args.comment,
         },
       });
@@ -3327,13 +3473,28 @@ export const operationalProfileVersionsRepo = {
   },
 
   // Review #100 fix: atomic create-frozen-active in one transaction with
-  // FOR UPDATE locking on the current active row. Used by data migration
-  // scripts (P8d priorities) to avoid the create→freeze→activate window
-  // where a crash leaves the agent with no active profile.
+  // FOR UPDATE locking. Used by data migration scripts (P8d priorities) to
+  // avoid the create→freeze→activate window where a crash leaves the agent
+  // with no active profile.
+  //
+  // Codex Adversarial Review of PR #171 round 2 (issue #166) — the lock
+  // target moved from the active-row tuple to the parent `agents` row via
+  // `acquireNextVersionForAgent`. Locking the active row only serializes
+  // concurrent seeds against EACH OTHER; it does NOT block a concurrent
+  // `proposeAndAuditAtomic` (which only has a proposed insert, not an active
+  // freeze) from also reading MAX(version) and colliding on
+  // `agent_op_profile_version_uq`. By harmonizing on the parent-agent lock,
+  // every writer for the same (tenant, agent) now serializes regardless of
+  // status.
+  //
+  // We STILL re-read the current active row inside the tx (after the agent
+  // lock) to (a) keep the freeze→activate semantics intact and (b) honor
+  // `expected_current_active_id` for the stale-read guard.
   //
   // Semantics:
-  //   - Locks the current active row (if any) FOR UPDATE so concurrent
-  //     callers serialize on that tuple.
+  //   - Locks the parent agent row FOR UPDATE so EVERY allocator of
+  //     `agent_operational_profile_versions.version` for this (tenant, agent)
+  //     serializes here.
   //   - Verifies tenant scope on both the lock and the inserts.
   //   - On any error inside the closure, the transaction rolls back —
   //     the old active row stays active.
@@ -3358,8 +3519,22 @@ export const operationalProfileVersionsRepo = {
     const agent_id = getCurrentAgent();
 
     return withTx(async (tx) => {
-      // 1) Lock the current active row FOR UPDATE (if any). Two concurrent
-      //    seeds against the same agent now serialize on this tuple.
+      // 1) Allocate next version via the shared helper. This (a) takes the
+      //    parent agent FOR UPDATE lock and (b) reads MAX(version) behind
+      //    it. Throws on missing agent — historically this method was
+      //    invoked only by migration scripts that pre-verified the agent
+      //    exists, so a missing agent here is a real programmer error.
+      const nextV = await acquireNextVersionForAgent(tx, tenant_id, agent_id);
+      if (nextV == null) {
+        throw new Error(
+          `seed_atomic_missing_agent: ${tenant_id}/${agent_id} not found before lock`,
+        );
+      }
+
+      // 2) Re-read the current active row INSIDE the tx so the stale-read
+      //    guard (`expected_current_active_id`) sees post-lock state. We
+      //    no longer need to lock this row separately — the parent agent
+      //    lock above already serializes every writer.
       const activeRows = await tx
         .select()
         .from(agent_operational_profile_versions)
@@ -3370,7 +3545,7 @@ export const operationalProfileVersionsRepo = {
             eq(agent_operational_profile_versions.status, 'active'),
           ),
         )
-        .for('update');
+        .limit(1);
       const currentActive = activeRows[0] ?? null;
 
       if (
@@ -3381,17 +3556,6 @@ export const operationalProfileVersionsRepo = {
           `seed_atomic_stale_active: expected ${input.expected_current_active_id}, found ${currentActive?.id ?? 'none'}`,
         );
       }
-
-      // 2) Compute next version inside the tx so concurrent inserts can't
-      //    collide on (tenant, agent, version) unique index.
-      const maxRes = await tx.execute<{ max: number | null }>(sql`
-        SELECT MAX(version) AS max
-          FROM agent_operational_profile_versions
-         WHERE tenant_id = ${tenant_id}
-           AND agent_id = ${agent_id}
-      `);
-      const max = maxRes.rows[0]?.max ?? null;
-      const nextV = max == null ? 1 : Number(max) + 1;
 
       const now = new Date();
 

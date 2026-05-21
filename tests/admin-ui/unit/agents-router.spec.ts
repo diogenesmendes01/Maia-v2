@@ -273,6 +273,12 @@ function makeRepos(
       // Mirrors the tx-aware repo path: finds the target proposed row, freezes
       // any incumbent active for the same (tenant, agent), activates the new
       // one, audits — all "atomically" in mock-land (just runs synchronously).
+      //
+      // Codex Adversarial Review of PR #171 round 2 — also mirrors the new
+      // predecessor enforcement: reads
+      // `profile_body.metadata.previous_version_id` from the proposed row and
+      // rejects with `predecessor_conflict` when it doesn't match the current
+      // incumbent.
       async approveAndActivateAtomic(args: {
         tenant_id: string;
         agent_id: string;
@@ -294,6 +300,27 @@ function makeRepos(
               p.status === 'active' &&
               p.id !== target.id,
           ) ?? null;
+
+        // Predecessor enforcement (mirrors repo behavior).
+        const md = (target.profile_body as { metadata?: Record<string, unknown> } | null)
+          ?.metadata;
+        let expected: string | null | 'unknown';
+        if (!md || !('previous_version_id' in md)) {
+          expected = 'unknown';
+        } else {
+          const v = md.previous_version_id;
+          expected = v === null ? null : typeof v === 'string' ? v : 'unknown';
+        }
+        const current = incumbent?.id ?? null;
+        if (expected === 'unknown' || expected !== current) {
+          return {
+            ok: false as const,
+            reason: 'predecessor_conflict' as const,
+            expected,
+            current,
+          };
+        }
+
         if (incumbent) {
           incumbent.status = 'frozen';
         }
@@ -311,6 +338,7 @@ function makeRepos(
             new_version: target.version,
             previous_active_id: incumbent?.id ?? null,
             previous_active_version: incumbent?.version ?? null,
+            expected_predecessor_id: expected,
             comment: args.comment,
           },
         });
@@ -570,6 +598,13 @@ describe('agentsRouter.approveProfile — atomic + freezes incumbent', () => {
     updated_at: new Date(),
   };
 
+  // Codex round 2: proposals authored under the new flow carry
+  // `metadata.previous_version_id` so `approveAndActivateAtomic` can detect
+  // write-skew. Helpers to build well-formed profile_body for these tests.
+  const bodyWithPrev = (prev: string | null) => ({
+    metadata: { previous_version_id: prev },
+  });
+
   it.each(['analyst', 'viewer', 'compliance_officer'])(
     '%s cannot approve',
     async (role) => {
@@ -579,7 +614,7 @@ describe('agentsRouter.approveProfile — atomic + freezes incumbent', () => {
         agent_id: 'agent-x',
         version: 1,
         status: 'proposed',
-        profile_body: {},
+        profile_body: bodyWithPrev(null),
         proposed_by: 'system',
         proposed_reason: null,
       };
@@ -601,7 +636,7 @@ describe('agentsRouter.approveProfile — atomic + freezes incumbent', () => {
       agent_id: 'agent-x',
       version: 1,
       status: 'proposed',
-      profile_body: {},
+      profile_body: bodyWithPrev(null),
       proposed_by: 'system',
       proposed_reason: null,
     };
@@ -617,6 +652,7 @@ describe('agentsRouter.approveProfile — atomic + freezes incumbent', () => {
     // Audit row records the transition.
     expect(repos._inspect.audit[0]!.action).toBe('agent_profile_approve');
     expect(repos._inspect.audit[0]!.change_summary?.previous_active_id).toBeNull();
+    expect(repos._inspect.audit[0]!.change_summary?.expected_predecessor_id).toBeNull();
   });
 
   it('owner approves v2 while v1 active → v1 frozen, v2 active, audited atomically', async () => {
@@ -626,7 +662,7 @@ describe('agentsRouter.approveProfile — atomic + freezes incumbent', () => {
       agent_id: 'agent-x',
       version: 1,
       status: 'active',
-      profile_body: {},
+      profile_body: bodyWithPrev(null),
       proposed_by: 'system',
       proposed_reason: null,
     };
@@ -636,7 +672,8 @@ describe('agentsRouter.approveProfile — atomic + freezes incumbent', () => {
       agent_id: 'agent-x',
       version: 2,
       status: 'proposed',
-      profile_body: {},
+      // v2 was proposed against v1 — predecessor matches incumbent.
+      profile_body: bodyWithPrev('00000000-0000-4000-8000-0000000000a1'),
       proposed_by: 'owner-1',
       proposed_reason: 'change tone',
     };
@@ -654,10 +691,11 @@ describe('agentsRouter.approveProfile — atomic + freezes incumbent', () => {
     // Old active → frozen, new proposed → active.
     expect(repos._inspect.profiles.find((p) => p.id === '00000000-0000-4000-8000-0000000000a1')!.status).toBe('frozen');
     expect(repos._inspect.profiles.find((p) => p.id === '00000000-0000-4000-8000-0000000000a2')!.status).toBe('active');
-    // Audit records both sides of the swap.
+    // Audit records both sides of the swap + the predecessor expectation.
     const audit = repos._inspect.audit[0]!;
     expect(audit.change_summary?.previous_active_id).toBe('00000000-0000-4000-8000-0000000000a1');
     expect(audit.change_summary?.new_version_id).toBe('00000000-0000-4000-8000-0000000000a2');
+    expect(audit.change_summary?.expected_predecessor_id).toBe('00000000-0000-4000-8000-0000000000a1');
   });
 
   it('CONFLICT when version is not in proposed state', async () => {
@@ -691,7 +729,7 @@ describe('agentsRouter.approveProfile — atomic + freezes incumbent', () => {
       agent_id: 'agent-ghost',
       version: 1,
       status: 'proposed',
-      profile_body: {},
+      profile_body: bodyWithPrev(null),
       proposed_by: 'system',
       proposed_reason: null,
     };
@@ -703,6 +741,123 @@ describe('agentsRouter.approveProfile — atomic + freezes incumbent', () => {
         comment: 'agent does not exist',
       }),
     ).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  });
+
+  /**
+   * Codex Adversarial Review of PR #171 round 2 — predecessor enforcement.
+   *
+   * Sequencial scenario: v1 active, owner Bob proposes v2 (predecessor=v1)
+   * and Alice proposes v3 (predecessor=v1). Bob's v2 gets approved first
+   * → v1 frozen, v2 active. If Alice's v3 is approved next without
+   * predecessor enforcement, v2 would be silently frozen and v3 would
+   * become active even though its content was written against v1 — Alice
+   * had no chance to incorporate Bob's changes.
+   *
+   * The fix: approving v3 must detect the mismatch (expected: v1, current:
+   * v2) and reject with CONFLICT so Alice refreshes and re-proposes
+   * against v2.
+   */
+  it('predecessor_conflict: v3 (proposed against v1) is rejected after v2 was approved', async () => {
+    const v1Active: Profile = {
+      id: '00000000-0000-4000-8000-0000000000a1',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      version: 1,
+      status: 'active',
+      profile_body: bodyWithPrev(null),
+      proposed_by: 'system',
+      proposed_reason: null,
+    };
+    const v2Proposed: Profile = {
+      id: '00000000-0000-4000-8000-0000000000a2',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      version: 2,
+      status: 'proposed',
+      profile_body: bodyWithPrev('00000000-0000-4000-8000-0000000000a1'),
+      proposed_by: 'bob',
+      proposed_reason: 'bob update',
+    };
+    const v3Proposed: Profile = {
+      id: '00000000-0000-4000-8000-0000000000a3',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      version: 3,
+      status: 'proposed',
+      // Alice's v3 was authored against v1 too — she didn't see Bob's v2.
+      profile_body: bodyWithPrev('00000000-0000-4000-8000-0000000000a1'),
+      proposed_by: 'alice',
+      proposed_reason: 'alice update',
+    };
+    const repos = makeRepos({
+      agents: [existingAgent],
+      profiles: [v1Active, v2Proposed, v3Proposed],
+    });
+
+    // Step 1: Bob's v2 is approved successfully — v1 → frozen, v2 → active.
+    const approveV2 = await caller('owner', 'tenant-A', 'u1', repos).approveProfile({
+      agentId: 'agent-x',
+      versionId: '00000000-0000-4000-8000-0000000000a2',
+      comment: 'approve bob v2',
+    });
+    expect(approveV2.activated.id).toBe('00000000-0000-4000-8000-0000000000a2');
+    expect(
+      repos._inspect.profiles.find((p) => p.id === '00000000-0000-4000-8000-0000000000a2')!
+        .status,
+    ).toBe('active');
+
+    // Step 2: Alice's v3 was proposed against v1, but v2 is now active.
+    // Approving v3 must be rejected with CONFLICT — otherwise Bob's v2
+    // would be silently overwritten.
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).approveProfile({
+        agentId: 'agent-x',
+        versionId: '00000000-0000-4000-8000-0000000000a3',
+        comment: 'approve alice v3',
+      }),
+    ).rejects.toMatchObject({
+      code: 'CONFLICT',
+      message: expect.stringMatching(/active profile changed/i),
+    });
+
+    // v2 must STILL be active, v3 must STILL be proposed — the rejected
+    // approval did not corrupt the lineage.
+    expect(
+      repos._inspect.profiles.find((p) => p.id === '00000000-0000-4000-8000-0000000000a2')!
+        .status,
+    ).toBe('active');
+    expect(
+      repos._inspect.profiles.find((p) => p.id === '00000000-0000-4000-8000-0000000000a3')!
+        .status,
+    ).toBe('proposed');
+  });
+
+  it('predecessor_conflict (legacy): proposal without metadata.previous_version_id is rejected', async () => {
+    const proposed: Profile = {
+      id: '00000000-0000-4000-8000-0000000000a1',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      version: 1,
+      status: 'proposed',
+      // No metadata — pretends to be a legacy proposal authored before
+      // this codepath existed. Policy: reject conservatively.
+      profile_body: {},
+      proposed_by: 'system',
+      proposed_reason: null,
+    };
+    const repos = makeRepos({ agents: [existingAgent], profiles: [proposed] });
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).approveProfile({
+        agentId: 'agent-x',
+        versionId: '00000000-0000-4000-8000-0000000000a1',
+        comment: 'legacy proposal approval attempt',
+      }),
+    ).rejects.toMatchObject({
+      code: 'CONFLICT',
+      message: expect.stringMatching(/expected predecessor unknown/i),
+    });
+    // Profile MUST still be proposed — nothing was activated.
+    expect(repos._inspect.profiles[0]!.status).toBe('proposed');
   });
 });
 
