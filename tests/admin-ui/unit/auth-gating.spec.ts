@@ -137,6 +137,7 @@ describe('oidcProviderEnabled — gating', () => {
 
   it('all three env set ⇒ enabled', () => {
     setOidcEnabledEnv();
+    process.env.NODE_ENV = 'development';
     expect(oidcProviderEnabled()).toBe(true);
   });
 
@@ -146,45 +147,188 @@ describe('oidcProviderEnabled — gating', () => {
     expect(oidcProviderEnabled()).toBe(true);
   });
 
-  it('OIDC_ISSUER without http(s) prefix ⇒ disabled', () => {
+  it('DEV: OIDC_ISSUER without http(s) prefix ⇒ disabled (silent in dev)', () => {
     setOidcEnabledEnv();
+    process.env.NODE_ENV = 'development';
     process.env.OIDC_ISSUER = 'login.example.com';
     expect(oidcProviderEnabled()).toBe(false);
   });
 
   it('OIDC_ISSUER unset ⇒ disabled', () => {
     setOidcEnabledEnv();
+    process.env.NODE_ENV = 'development';
     delete process.env.OIDC_ISSUER;
     expect(oidcProviderEnabled()).toBe(false);
   });
 
-  it('OIDC_CLIENT_ID unset ⇒ disabled', () => {
+  // Issue #167 — cleartext OIDC issuer must be rejected in production. The
+  // pre-fix gate only checked `startsWith('http')` which also matched http://.
+  // Misconfigured OIDC_ISSUER=http://... in prod would have registered the
+  // provider, leaking redirect URLs, ID tokens, and client credentials.
+  //
+  // Codex Adversarial Review on PR #168: in production, an INVALID issuer
+  // must FAIL-FAST (throw) instead of silently returning false. A silent
+  // false here removes the only production auth provider and surfaces as a
+  // generic "no providers configured" screen — operators can't tell whether
+  // OIDC was intentionally unconfigured or accidentally misconfigured.
+  it('PROD: OIDC_ISSUER=http:// ⇒ THROWS (cleartext rejected, fail-fast)', () => {
     setOidcEnabledEnv();
+    process.env.NODE_ENV = 'production';
+    process.env.OIDC_ISSUER = 'http://idp.internal/realms/maia';
+    expect(() => oidcProviderEnabled()).toThrow(
+      /OIDC_ISSUER must use https:\/\/ in production/,
+    );
+    // Message must surface the offending protocol AND the issuer value so
+    // an operator reading the crash log can immediately see what was set.
+    expect(() => oidcProviderEnabled()).toThrow(/http:\/\//);
+    expect(() => oidcProviderEnabled()).toThrow(/idp\.internal/);
+  });
+
+  it('PROD: OIDC_ISSUER=http://localhost ⇒ THROWS (no loopback exception in prod)', () => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'production';
+    process.env.OIDC_ISSUER = 'http://localhost:8080/realms/maia';
+    expect(() => oidcProviderEnabled()).toThrow(
+      /OIDC_ISSUER must use https:\/\/ in production/,
+    );
+  });
+
+  it('PROD: OIDC_ISSUER malformed (unparseable) ⇒ THROWS (fail-fast, descriptive)', () => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'production';
+    process.env.OIDC_ISSUER = 'not-a-url';
+    expect(() => oidcProviderEnabled()).toThrow(
+      /OIDC_ISSUER is set but is not a valid URL/,
+    );
+    // The bad value should be in the error message so operators can spot it.
+    expect(() => oidcProviderEnabled()).toThrow(/not-a-url/);
+  });
+
+  it('PROD: OIDC_ISSUER=ftp:// ⇒ THROWS (unsupported scheme rejected)', () => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'production';
+    process.env.OIDC_ISSUER = 'ftp://idp.example.com/realms/maia';
+    expect(() => oidcProviderEnabled()).toThrow(
+      /OIDC_ISSUER must use https:\/\/ in production/,
+    );
+  });
+
+  it('PROD: OIDC_ISSUER unset ⇒ false silently (NOT throw — "not configured" is OK)', () => {
+    // Distinguishes "OIDC not configured" (silent) from "OIDC configured but
+    // invalid" (throws). Many prod deployments run without OIDC; we must not
+    // crash them just because the env var is absent.
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'production';
+    delete process.env.OIDC_ISSUER;
+    expect(() => oidcProviderEnabled()).not.toThrow();
+    expect(oidcProviderEnabled()).toBe(false);
+  });
+
+  it('PROD: OIDC_ISSUER="" ⇒ false silently (empty == not configured)', () => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'production';
+    process.env.OIDC_ISSUER = '';
+    expect(() => oidcProviderEnabled()).not.toThrow();
+    expect(oidcProviderEnabled()).toBe(false);
+  });
+
+  it('PROD: OIDC_ISSUER=https:// ⇒ enabled', () => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'production';
+    process.env.OIDC_ISSUER = 'https://idp.internal/realms/maia';
+    expect(() => oidcProviderEnabled()).not.toThrow();
+    expect(oidcProviderEnabled()).toBe(true);
+  });
+
+  it('DEV: OIDC_ISSUER=http://localhost:8080 ⇒ enabled (local IdP testing)', () => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'development';
+    process.env.OIDC_ISSUER = 'http://localhost:8080/realms/maia';
+    expect(oidcProviderEnabled()).toBe(true);
+  });
+
+  it('DEV: OIDC_ISSUER=http://127.0.0.1 ⇒ enabled (loopback IP)', () => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'development';
+    process.env.OIDC_ISSUER = 'http://127.0.0.1:8080/realms/maia';
+    expect(oidcProviderEnabled()).toBe(true);
+  });
+
+  it('DEV: OIDC_ISSUER=http://192.168.1.10 ⇒ disabled (non-loopback http rejected)', () => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'development';
+    process.env.OIDC_ISSUER = 'http://192.168.1.10/realms/maia';
+    expect(oidcProviderEnabled()).toBe(false);
+  });
+
+  it('DEV: OIDC_ISSUER=http://idp.internal ⇒ disabled (non-loopback hostname)', () => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'development';
+    process.env.OIDC_ISSUER = 'http://idp.internal/realms/maia';
+    expect(oidcProviderEnabled()).toBe(false);
+  });
+
+  it('DEV: OIDC_ISSUER malformed (unparseable) ⇒ disabled (no throw, silent in dev)', () => {
+    // Dev/test preserves the silent fail-closed behavior so local iteration
+    // and unit tests that intentionally exercise invalid configs don't crash.
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'development';
+    process.env.OIDC_ISSUER = 'not a url ::::';
+    expect(() => oidcProviderEnabled()).not.toThrow();
+    expect(oidcProviderEnabled()).toBe(false);
+  });
+
+  it('DEV: OIDC_ISSUER with unsupported scheme (e.g. ftp://) ⇒ disabled (silent)', () => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'development';
+    process.env.OIDC_ISSUER = 'ftp://idp.example.com/realms/maia';
+    expect(() => oidcProviderEnabled()).not.toThrow();
+    expect(oidcProviderEnabled()).toBe(false);
+  });
+
+  // ============================================================
+  // DEV BEHAVIOR for missing client_id / weak-secret / empty slugs:
+  // silent `false` is preserved so local iteration & unit tests that
+  // intentionally exercise invalid configs don't crash.
+  // ============================================================
+
+  it('DEV: OIDC_CLIENT_ID unset ⇒ disabled (silent in dev)', () => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'development';
     delete process.env.OIDC_CLIENT_ID;
+    expect(() => oidcProviderEnabled()).not.toThrow();
     expect(oidcProviderEnabled()).toBe(false);
   });
 
-  it('OIDC_CLIENT_SECRET < 16 chars ⇒ disabled (weak secret guard)', () => {
+  it('DEV: OIDC_CLIENT_SECRET < 16 chars ⇒ disabled (silent in dev, weak secret guard)', () => {
     setOidcEnabledEnv();
+    process.env.NODE_ENV = 'development';
     process.env.OIDC_CLIENT_SECRET = 'short';
+    expect(() => oidcProviderEnabled()).not.toThrow();
     expect(oidcProviderEnabled()).toBe(false);
   });
 
-  it('OIDC_CLIENT_SECRET unset ⇒ disabled', () => {
+  it('DEV: OIDC_CLIENT_SECRET unset ⇒ disabled (silent in dev)', () => {
     setOidcEnabledEnv();
+    process.env.NODE_ENV = 'development';
     delete process.env.OIDC_CLIENT_SECRET;
+    expect(() => oidcProviderEnabled()).not.toThrow();
     expect(oidcProviderEnabled()).toBe(false);
   });
 
-  it('OIDC_TENANT_SLUGS unset ⇒ disabled (prevents SSO-but-AccessDenied UX)', () => {
+  it('DEV: OIDC_TENANT_SLUGS unset ⇒ disabled (silent in dev, prevents SSO-but-AccessDenied UX)', () => {
     setOidcEnabledEnv();
+    process.env.NODE_ENV = 'development';
     delete process.env.OIDC_TENANT_SLUGS;
+    expect(() => oidcProviderEnabled()).not.toThrow();
     expect(oidcProviderEnabled()).toBe(false);
   });
 
-  it('OIDC_TENANT_SLUGS empty/whitespace ⇒ disabled', () => {
+  it('DEV: OIDC_TENANT_SLUGS empty/whitespace ⇒ disabled (silent in dev)', () => {
     setOidcEnabledEnv();
+    process.env.NODE_ENV = 'development';
     process.env.OIDC_TENANT_SLUGS = ' , , ';
+    expect(() => oidcProviderEnabled()).not.toThrow();
     expect(oidcProviderEnabled()).toBe(false);
   });
 
@@ -194,6 +338,124 @@ describe('oidcProviderEnabled — gating', () => {
     delete process.env.OIDC_CLIENT_SECRET;
     delete process.env.OIDC_TENANT_SLUGS;
     expect(oidcProviderEnabled()).toBe(false);
+  });
+
+  // ============================================================
+  // PROD partial-config FAIL-FAST (Codex Adversarial Review on PR #168, round 2).
+  //
+  // Round 1 hardened OIDC_ISSUER (throw on missing https/malformed in prod).
+  // Round 2 extends the throw contract to every other required var: with the
+  // dev CredentialsProvider disabled in production, a silent false on any of
+  // CLIENT_ID/CLIENT_SECRET/TENANT_SLUGS would register zero auth providers
+  // and surface as the same opaque "no providers configured" screen the
+  // round-1 fix was meant to prevent.
+  //
+  // Silent false in prod is now RESERVED for "OIDC_ISSUER unset/empty"
+  // (= "OIDC genuinely not configured for this deployment").
+  // ============================================================
+
+  it('PROD: ISSUER valid + CLIENT_ID empty ⇒ THROWS with descriptive message', () => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'production';
+    process.env.OIDC_CLIENT_ID = '';
+    expect(() => oidcProviderEnabled()).toThrow(
+      /OIDC_ISSUER is set but OIDC_CLIENT_ID is empty\/missing/,
+    );
+  });
+
+  it('PROD: ISSUER valid + CLIENT_ID unset ⇒ THROWS', () => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'production';
+    delete process.env.OIDC_CLIENT_ID;
+    expect(() => oidcProviderEnabled()).toThrow(
+      /OIDC_ISSUER is set but OIDC_CLIENT_ID is empty\/missing/,
+    );
+  });
+
+  it('PROD: ISSUER valid + CLIENT_SECRET empty ⇒ THROWS', () => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'production';
+    process.env.OIDC_CLIENT_SECRET = '';
+    expect(() => oidcProviderEnabled()).toThrow(
+      /OIDC_CLIENT_SECRET is missing or too short/,
+    );
+    // Length must be reported so operators can self-diagnose; secret value
+    // must NEVER leak into the message.
+    expect(() => oidcProviderEnabled()).toThrow(/length: 0/);
+  });
+
+  it('PROD: ISSUER valid + CLIENT_SECRET unset ⇒ THROWS', () => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'production';
+    delete process.env.OIDC_CLIENT_SECRET;
+    expect(() => oidcProviderEnabled()).toThrow(
+      /OIDC_CLIENT_SECRET is missing or too short/,
+    );
+    expect(() => oidcProviderEnabled()).toThrow(/length: 0/);
+  });
+
+  it('PROD: ISSUER valid + CLIENT_SECRET too short (< 16 chars) ⇒ THROWS and does NOT leak secret value', () => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'production';
+    const weakSecret = 'placeholder-x42'; // 15 chars (below threshold)
+    process.env.OIDC_CLIENT_SECRET = weakSecret;
+    expect(() => oidcProviderEnabled()).toThrow(
+      /OIDC_CLIENT_SECRET is missing or too short/,
+    );
+    expect(() => oidcProviderEnabled()).toThrow(/length: 15/);
+    expect(() => oidcProviderEnabled()).toThrow(/required: >=16/);
+    // Critical: the secret VALUE itself must never appear in the error.
+    try {
+      oidcProviderEnabled();
+      throw new Error('expected throw');
+    } catch (err) {
+      const msg = (err as Error).message;
+      expect(msg).not.toContain(weakSecret);
+    }
+  });
+
+  it('PROD: ISSUER valid + TENANT_SLUGS unset ⇒ THROWS', () => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'production';
+    delete process.env.OIDC_TENANT_SLUGS;
+    expect(() => oidcProviderEnabled()).toThrow(
+      /OIDC_ISSUER is set but OIDC_TENANT_SLUGS is empty/,
+    );
+  });
+
+  it('PROD: ISSUER valid + TENANT_SLUGS empty string ⇒ THROWS', () => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'production';
+    process.env.OIDC_TENANT_SLUGS = '';
+    expect(() => oidcProviderEnabled()).toThrow(
+      /OIDC_ISSUER is set but OIDC_TENANT_SLUGS is empty/,
+    );
+  });
+
+  it('PROD: ISSUER valid + TENANT_SLUGS whitespace-only ⇒ THROWS (trim+filter leaves empty list)', () => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'production';
+    process.env.OIDC_TENANT_SLUGS = ' , , ';
+    expect(() => oidcProviderEnabled()).toThrow(
+      /OIDC_ISSUER is set but OIDC_TENANT_SLUGS is empty/,
+    );
+  });
+
+  it('PROD: ISSUER unset + every other var empty ⇒ silent false ("not configured" is the ONLY silent branch in prod)', () => {
+    process.env.NODE_ENV = 'production';
+    delete process.env.OIDC_ISSUER;
+    delete process.env.OIDC_CLIENT_ID;
+    delete process.env.OIDC_CLIENT_SECRET;
+    delete process.env.OIDC_TENANT_SLUGS;
+    expect(() => oidcProviderEnabled()).not.toThrow();
+    expect(oidcProviderEnabled()).toBe(false);
+  });
+
+  it('PROD: ISSUER valid + ALL other vars valid ⇒ enabled (happy path)', () => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'production';
+    expect(() => oidcProviderEnabled()).not.toThrow();
+    expect(oidcProviderEnabled()).toBe(true);
   });
 });
 

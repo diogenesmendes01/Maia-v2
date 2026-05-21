@@ -51,6 +51,12 @@ export function devCredentialsProviderEnabled(): boolean {
  *
  * Requires all of:
  *   - OIDC_ISSUER         (e.g. https://login.example.com/realms/maia)
+ *                          MUST be https:// in production. In dev/test, plain
+ *                          http:// is only tolerated for the loopback hosts
+ *                          `localhost` and `127.0.0.1` (any port) so operators
+ *                          can stand up a local IdP. Anything else (incl.
+ *                          private RFC1918 IPs over http) is rejected — see
+ *                          issue #167 (cleartext OIDC in prod) for rationale.
  *   - OIDC_CLIENT_ID
  *   - OIDC_CLIENT_SECRET  (>= 16 chars; rejecting empty/placeholder)
  *   - OIDC_TENANT_SLUGS   (non-empty comma list; without this every OIDC
@@ -64,7 +70,44 @@ export function devCredentialsProviderEnabled(): boolean {
  * authorization fail-closed even after authentication succeeds.
  *
  * Works in any NODE_ENV (development as well, for local OIDC testing).
+ *
+ * Fail-mode contract (Codex Adversarial Review on PR #168, rounds 1 & 2):
+ *
+ *   - `OIDC_ISSUER` empty/unset
+ *       → "not configured" → returns `false` silently (intentional: many
+ *         deployments don't run OIDC, the dev CredentialsProvider covers them).
+ *         This is the ONLY silent-false branch in production. Round 2 hardened
+ *         the contract so that "OIDC_ISSUER set + any other var missing/weak"
+ *         can no longer drop the provider silently.
+ *   - `OIDC_ISSUER` set but INVALID (unparseable, wrong scheme, cleartext)
+ *       in `NODE_ENV === 'production'`
+ *       → "configured but broken" → THROWS with a descriptive message so the
+ *         admin-ui crashes at startup rather than silently dropping the only
+ *         production auth provider and leaving operators with a generic
+ *         "no providers configured" screen.
+ *   - `OIDC_ISSUER` set (valid https://) but `OIDC_CLIENT_ID`,
+ *     `OIDC_CLIENT_SECRET`, or `OIDC_TENANT_SLUGS` missing/empty/weak
+ *       in `NODE_ENV === 'production'`
+ *       → "partially configured" → THROWS (Codex round 2). Reasoning: in
+ *         production, the dev CredentialsProvider is disabled — a silent
+ *         `false` here would register zero providers and present operators
+ *         with the same opaque "no providers configured" screen the round-1
+ *         fail-fast was meant to prevent. The secret never appears in the
+ *         error message; only its length is reported.
+ *   - `OIDC_ISSUER` set but INVALID in dev/test
+ *       → returns `false` silently. Test suites and local dev frequently
+ *         exercise the invalid-config branches; we don't want to crash them.
+ *
+ * `MIN_OIDC_CLIENT_SECRET_LEN` (16 chars) is the same threshold used by
+ * `devCredentialsProviderEnabled` for `ADMIN_UI_DEV_LOGIN_TOKEN`. It's
+ * intentionally modest — 16 random chars is a hard floor against trivially
+ * guessable placeholders ("changeme", "secret", short paste artifacts) without
+ * being so strict that it rejects values an upstream IdP may have generated
+ * for us. Real OIDC client secrets from Keycloak/Auth0/etc. are typically
+ * 32-64 chars and easily clear this bar.
  */
+export const MIN_OIDC_CLIENT_SECRET_LEN = 16;
+
 export function oidcProviderEnabled(): boolean {
   const issuer = process.env.OIDC_ISSUER ?? '';
   const clientId = process.env.OIDC_CLIENT_ID ?? '';
@@ -73,9 +116,99 @@ export function oidcProviderEnabled(): boolean {
     .split(',')
     .map((s) => s.trim())
     .filter((s) => s.length > 0);
-  if (!issuer || !issuer.startsWith('http')) return false;
+  // Empty/unset issuer = "OIDC not configured for this deployment". Always
+  // silent: this is the expected state for any non-OIDC install.
+  if (!issuer) return false;
+
+  const isProd = process.env.NODE_ENV === 'production';
+
+  // Validate parseability. `new URL` throws TypeError for malformed input —
+  // in prod that's a misconfiguration we MUST surface; in dev we tolerate it.
+  let url: URL;
+  try {
+    url = new URL(issuer);
+  } catch {
+    if (isProd) {
+      throw new Error(
+        `P8.5 auth: OIDC_ISSUER is set but is not a valid URL ` +
+          `(received: ${JSON.stringify(issuer)}). ` +
+          `Refusing to boot — set OIDC_ISSUER to a parseable https:// URL ` +
+          `or unset it entirely to disable the OIDC provider. See issue #167.`,
+      );
+    }
+    return false;
+  }
+
+  if (isProd) {
+    // Production: https:// only. No exceptions — cleartext leaks redirect
+    // URLs, ID tokens, and client credentials to any network observer.
+    // Fail-fast (not silent) so a typo in OIDC_ISSUER doesn't quietly remove
+    // the only production auth provider and surface as "no providers".
+    if (url.protocol !== 'https:') {
+      throw new Error(
+        `P8.5 auth: OIDC_ISSUER must use https:// in production ` +
+          `(received protocol: ${url.protocol.replace(':', '')}://, ` +
+          `issuer: ${issuer}). ` +
+          `Refusing to boot — cleartext OIDC leaks redirect URLs, ID tokens, ` +
+          `and client credentials to any on-path observer. ` +
+          `Either set OIDC_ISSUER to an https:// URL or unset it entirely ` +
+          `to disable the OIDC provider. See issue #167.`,
+      );
+    }
+
+    // ISSUER is valid in prod — all other required vars must also be set,
+    // otherwise we'd register no provider and produce the same opaque
+    // "no providers configured" outage the round-1 fail-fast prevents.
+    // (Codex Adversarial Review on PR #168, round 2.)
+    if (!clientId) {
+      throw new Error(
+        `P8.5 auth: OIDC_ISSUER is set but OIDC_CLIENT_ID is empty/missing. ` +
+          `Refusing to boot — a partially configured OIDC provider would ` +
+          `register zero auth providers in production (dev CredentialsProvider ` +
+          `is disabled in prod) and surface as a generic "no providers ` +
+          `configured" screen. Set OIDC_CLIENT_ID, or unset OIDC_ISSUER ` +
+          `entirely to disable the OIDC provider. See issue #167.`,
+      );
+    }
+    if (clientSecret.length < MIN_OIDC_CLIENT_SECRET_LEN) {
+      // NEVER include the secret value in the error message — only its length.
+      // Length alone is enough to diagnose "I set a 6-char placeholder" vs.
+      // "I set a real 48-char secret"; the value itself would leak into logs.
+      throw new Error(
+        `P8.5 auth: OIDC_ISSUER is set but OIDC_CLIENT_SECRET is missing or ` +
+          `too short (length: ${clientSecret.length}, required: >=${MIN_OIDC_CLIENT_SECRET_LEN}). ` +
+          `Refusing to boot — a partially configured OIDC provider would ` +
+          `register zero auth providers in production and surface as a generic ` +
+          `"no providers configured" screen. Set OIDC_CLIENT_SECRET to a ` +
+          `random >=${MIN_OIDC_CLIENT_SECRET_LEN}-char value (typical IdP-issued secrets are 32-64 chars), ` +
+          `or unset OIDC_ISSUER entirely to disable the OIDC provider. ` +
+          `See issue #167.`,
+      );
+    }
+    if (tenantSlugs.length === 0) {
+      throw new Error(
+        `P8.5 auth: OIDC_ISSUER is set but OIDC_TENANT_SLUGS is empty ` +
+          `(received: ${JSON.stringify(process.env.OIDC_TENANT_SLUGS ?? '')}). ` +
+          `Without a non-empty comma list of tenant slugs every OIDC sign-in ` +
+          `resolves to no app_users row and returns AccessDenied. Refusing ` +
+          `to boot — a partially configured OIDC provider would register ` +
+          `zero auth providers in production and surface as a generic ` +
+          `"no providers configured" screen. Set OIDC_TENANT_SLUGS to a ` +
+          `comma-separated list (e.g. "acme,default"), or unset OIDC_ISSUER ` +
+          `entirely to disable the OIDC provider. See issue #167.`,
+      );
+    }
+    return true;
+  }
+
+  // Dev/test: https:// always OK; http:// only for loopback hosts so a
+  // local IdP (Keycloak, dex, etc.) can be exercised without TLS.
+  const isLoopbackHttp =
+    url.protocol === 'http:' &&
+    (url.hostname === 'localhost' || url.hostname === '127.0.0.1');
+  if (url.protocol !== 'https:' && !isLoopbackHttp) return false;
   if (!clientId) return false;
-  if (clientSecret.length < 16) return false;
+  if (clientSecret.length < MIN_OIDC_CLIENT_SECRET_LEN) return false;
   if (tenantSlugs.length === 0) return false;
   return true;
 }
