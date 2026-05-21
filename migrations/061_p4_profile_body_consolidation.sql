@@ -81,16 +81,24 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Backfill: for each row with an empty profile_body, build the canonical
--- ProfileBody shape AND embed `legacy_mirror.{core_immutable,operational_profile,
--- episodic_temp,growth_backlog}` so the Drizzle-shaped (profile_body-only)
--- read in the repo carries the legacy data with it.
+-- Backfill: for each row with an empty profile_body, build a profile_body
+-- shape that matches BOTH the canonical ProfileBody (identity/style/metadata)
+-- AND the legacy direct-embed contract that
+-- `proposal-generator.ts#seedInitialOperationalProfile` already writes —
+-- core_immutable, operational_profile, episodic_temp, growth_backlog
+-- nested directly under profile_body (no `legacy_mirror` envelope).
 --
--- This UPDATE must run while the immutability trigger is dropped (the new
--- one rejects any change to the legacy columns even when they're equal-
--- by-value — `IS DISTINCT FROM` compares NULL-safely so equal-by-value
--- passes, but defense-in-depth: we still drop the trigger to keep this
--- migration's UPDATE path uncoupled from trigger semantics).
+-- Why direct-embed (Codex review #163 round 3, [high]):
+--   The proposal-generator has been writing the legacy payload directly
+--   under profile_body since v3.1.1. If migration 061 had introduced a
+--   different envelope (`legacy_mirror`), the renderer would have to handle
+--   two contracts indefinitely. Aligning with the existing writer collapses
+--   the contract to ONE shape: `profile_body.{core_immutable,
+--   operational_profile, episodic_temp, growth_backlog}` is the canonical
+--   home for the legacy payload, in addition to the
+--   identity/style/metadata canonical fields.
+--
+-- The UPDATE runs with the immutability trigger dropped — same as before.
 DO $$
 DECLARE
   has_legacy boolean;
@@ -112,6 +120,8 @@ BEGIN
            'schema_version', 'v3.1.1-2026-05-15',
            'identity', jsonb_build_object(
              'role_descriptor', COALESCE(core_immutable->>'identity_block', ''),
+             'identity_block',  COALESCE(core_immutable->>'identity_block', ''),
+             'principles',      COALESCE(core_immutable->'principles', '[]'::jsonb),
              'voice', jsonb_build_object(
                'tone',      COALESCE(operational_profile->>'voice_descriptor', ''),
                'formality', 'medium',
@@ -132,14 +142,14 @@ BEGIN
              'previous_version_id', NULL,
              'migrated_from_legacy', true
            ),
-           -- Embedded mirror: lets the renderer reach the legacy payload
-           -- via the Drizzle-shaped row (which only carries profile_body).
-           'legacy_mirror', jsonb_build_object(
-             'core_immutable',      core_immutable,
-             'operational_profile', operational_profile,
-             'episodic_temp',       episodic_temp,
-             'growth_backlog',      growth_backlog
-           )
+           -- Direct-embed: matches the proposal-generator's existing layout
+           -- (profile_body.core_immutable / .operational_profile / etc.).
+           -- This is the SAME contract both writers (admin-ui + seed) use,
+           -- so the renderer only has to handle ONE shape.
+           'core_immutable',      core_immutable,
+           'operational_profile', operational_profile,
+           'episodic_temp',       episodic_temp,
+           'growth_backlog',      growth_backlog
          )
        WHERE profile_body = '{}'::jsonb
     $sql$;

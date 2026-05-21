@@ -335,56 +335,52 @@ describe('renderOperationalProfile', () => {
     expect(result.system_prompt_block).toContain('caloroso e direto');
   });
 
-  it('Drizzle-shaped row (profile_body.legacy_mirror only, no top-level legacy) renders full legacy payload', () => {
-    // This is THE production case: operationalProfileVersionsRepo.getActive()
-    // returns rows shaped per schema.ts — only profile_body. The legacy
-    // payload reaches the renderer through profile_body.legacy_mirror,
-    // which migration 061 embeds. The renderer MUST read from there.
+  it('Drizzle-shaped row (legacy keys direct under profile_body) renders full legacy payload', () => {
+    // This is THE production case (Codex review #163 round 3):
+    // `seedInitialOperationalProfile` writes legacy keys (core_immutable,
+    // operational_profile, episodic_temp, growth_backlog) DIRECTLY under
+    // profile_body. Migration 061 backfills the same shape. The renderer
+    // MUST read from there.
     const version = buildVersion({
-      // No top-level core_immutable / operational_profile / episodic_temp /
-      // growth_backlog — Drizzle doesn't surface them.
+      // No top-level legacy fields — Drizzle returns ONLY profile_body.
       profile_body: {
         schema_version: 'v3.1.1-2026-05-15',
         identity: {
-          // Canonical fields exist but are derived; mirror is authoritative.
+          // Canonical fields are present but should be ignored when the
+          // direct-embed legacy keys carry the authoritative payload.
           role_descriptor: 'derived role (synthesized — should be ignored)',
           voice: { tone: 'derived tone (synthesized — should be ignored)' },
           priorities: ['derived (should be ignored)'],
         },
-        legacy_mirror: {
-          core_immutable: {
-            identity_block: 'Você é a Maia (do legacy_mirror).',
-            principles: ['Princípio A', 'Princípio B'],
-          },
-          operational_profile: {
-            voice_descriptor: 'Voz do mirror.',
-            thresholds: { max_inference_depth: 4 },
-          },
-          episodic_temp: {
-            entries: [
-              {
-                summary: 'evento mirror',
-                mention_allowed: true,
-                proactive_use: true,
-              },
-            ],
-          },
-          growth_backlog: ['Hint do mirror'],
+        // Direct-embed: how proposal-generator + migration 061 write it.
+        core_immutable: {
+          identity_block: 'Você é a Maia (do profile_body direct-embed).',
+          principles: ['Princípio A', 'Princípio B'],
         },
+        operational_profile: {
+          voice_descriptor: 'Voz direct-embed.',
+          thresholds: { max_inference_depth: 4 },
+        },
+        episodic_temp: {
+          entries: [
+            { summary: 'evento direct', mention_allowed: true, proactive_use: true },
+          ],
+        },
+        growth_backlog: ['Hint direct'],
       },
     });
     const result = renderOperationalProfile({ version });
-    expect(result.system_prompt_block).toContain('Você é a Maia (do legacy_mirror).');
+    expect(result.system_prompt_block).toContain('Você é a Maia (do profile_body direct-embed).');
     expect(result.system_prompt_block).toContain('## Princípios');
     expect(result.system_prompt_block).toContain('- Princípio A');
     expect(result.system_prompt_block).toContain('- Princípio B');
     expect(result.system_prompt_block).toContain('## Voz operacional');
-    expect(result.system_prompt_block).toContain('Voz do mirror.');
+    expect(result.system_prompt_block).toContain('Voz direct-embed.');
     expect(result.system_prompt_block).toContain('## Parâmetros calibrados');
     expect(result.system_prompt_block).toContain('max_inference_depth');
-    expect(result.episodic_summary_block).toContain('evento mirror');
-    expect(result.growth_hints_block).toContain('Hint do mirror');
-    // Derived/canonical values must NOT leak when mirror is present.
+    expect(result.episodic_summary_block).toContain('evento direct');
+    expect(result.growth_hints_block).toContain('Hint direct');
+    // Canonical identity.* must NOT leak when the direct-embed is present.
     expect(result.system_prompt_block).not.toContain('derived');
   });
 

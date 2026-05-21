@@ -69,24 +69,28 @@ export function renderOperationalProfile({
 }: {
   version: AgentOperationalProfileVersion;
 }): RenderedProfile {
-  // v3.1.1 migration (migration 061 + Codex review #163 round 2):
+  // v3.1.1 contract (migration 061 + Codex review #163 rounds 1-3):
   //
-  // schema.ts only declares `profile_body` on this table, so
-  // `operationalProfileVersionsRepo.getActive()` (Drizzle `.select().from(...)`)
-  // returns rows that carry ONLY profile_body — the four legacy columns are
-  // physically present in the DB but invisible to the ORM. Reading
-  // `version.core_immutable` from a Drizzle-shaped row is therefore dead
-  // code in production.
+  // The legacy 4-layer payload now lives directly inside profile_body —
+  // `profile_body.core_immutable / .operational_profile / .episodic_temp /
+  // .growth_backlog`. This is the ONLY shape the renderer needs to handle
+  // at runtime. Both writers emit it:
+  //   * `seedInitialOperationalProfile` (proposal-generator.ts) writes the
+  //     direct-embed keys when seeding from maia-prompt.md + self_state.
+  //   * `migration 061` backfills the same direct-embed keys when
+  //     consolidating pre-v3.1.1 rows.
   //
-  // Migration 061 embeds the legacy payload at `profile_body.legacy_mirror`
-  // so the renderer can reach it through the Drizzle row. We prefer that
-  // embedded mirror when present (preserves `principles`, `voice_descriptor`,
-  // `thresholds`, episodic and growth_backlog content), and fall back to
-  // the canonical ProfileBody shape (newly-created rows from the admin-ui
-  // agent setup flow that have no legacy data to mirror).
+  // schema.ts declares only `profile_body` on the Drizzle table, so a
+  // production `.select().from(agent_operational_profile_versions)` returns
+  // exactly that JSONB column. Reading the legacy keys from inside it is
+  // the only path that reaches real rows.
   //
-  // Top-level row.core_immutable/etc. is checked LAST as a belt-and-braces
-  // for tests/fixtures that hand-construct a non-Drizzle shape.
+  // Two LOWER-PRIORITY fallbacks remain so older test fixtures keep
+  // working (no production data takes these paths):
+  //   * top-level row.core_immutable etc. — fixtures that hand-merge the
+  //     keys onto the row instead of nesting under profile_body.
+  //   * synthesized view from profile_body.identity.* — newly-created rows
+  //     from admin-ui agents.create that have no legacy payload to mirror.
   const row = version as unknown as {
     profile_body?: {
       identity?: {
@@ -94,12 +98,10 @@ export function renderOperationalProfile({
         voice?: { tone?: unknown };
         priorities?: unknown[];
       };
-      legacy_mirror?: {
-        core_immutable?: CoreImmutable;
-        operational_profile?: OperationalProfileLayer;
-        episodic_temp?: EpisodicTemp;
-        growth_backlog?: GrowthBacklog;
-      };
+      core_immutable?: CoreImmutable;
+      operational_profile?: OperationalProfileLayer;
+      episodic_temp?: EpisodicTemp;
+      growth_backlog?: GrowthBacklog;
     };
     core_immutable?: CoreImmutable;
     operational_profile?: OperationalProfileLayer;
@@ -108,10 +110,10 @@ export function renderOperationalProfile({
   };
 
   const body = row.profile_body ?? {};
-  const mirror = body.legacy_mirror ?? {};
 
   // Synthesize a legacy-shaped view from canonical profile_body for rows
-  // that have NO legacy_mirror (newly-created via admin-ui).
+  // that have NO direct-embed legacy keys (rare — only newly-created
+  // admin-ui rows that skipped the legacy_mirror writer).
   const synthesizedCore: CoreImmutable = {
     identity_block:
       typeof body.identity?.role_descriptor === 'string'
@@ -129,33 +131,33 @@ export function renderOperationalProfile({
   };
 
   // Priority order for each section:
-  //   1. profile_body.legacy_mirror.* — what migration 061 stored
-  //   2. top-level row.* — test fixtures / non-Drizzle paths
-  //   3. synthesized from canonical profile_body.identity.* — pure new rows
+  //   1. profile_body.* (the production path — proposal-generator + 061)
+  //   2. top-level row.* (test fixtures / non-Drizzle paths)
+  //   3. synthesized from profile_body.identity.* (pure-canonical fallback)
   function pickWithMirror<T extends object>(
-    mirrorVal: T | undefined,
+    embedded: T | undefined,
     topVal: T | undefined,
     synthesized: T,
   ): T {
-    if (mirrorVal && hasAnyContent(mirrorVal)) return mirrorVal;
+    if (embedded && hasAnyContent(embedded)) return embedded;
     if (topVal && hasAnyContent(topVal)) return topVal;
     return synthesized;
   }
 
   const core = pickWithMirror<CoreImmutable>(
-    mirror.core_immutable,
+    body.core_immutable,
     row.core_immutable,
     synthesizedCore,
   );
   const op = pickWithMirror<OperationalProfileLayer>(
-    mirror.operational_profile,
+    body.operational_profile,
     row.operational_profile,
     synthesizedOp,
   );
   const ep =
-    (mirror.episodic_temp ?? row.episodic_temp ?? ({} as EpisodicTemp));
+    (body.episodic_temp ?? row.episodic_temp ?? ({} as EpisodicTemp));
   const bk =
-    (mirror.growth_backlog ?? row.growth_backlog ?? ([] as GrowthBacklog));
+    (body.growth_backlog ?? row.growth_backlog ?? ([] as GrowthBacklog));
 
   // ---- system_prompt_block (sempre presente, nunca null) -------------------
   const lines: string[] = [];
