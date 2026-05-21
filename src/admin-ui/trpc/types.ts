@@ -70,6 +70,11 @@ export const ProposalUnifiedStatusSchema = z.enum([
 // Row shapes for React components / TanStack Table
 // =====================================================================
 
+// tRPC over HTTP serializes Date instances as ISO strings; UI components
+// that consume these rows therefore receive `string` at runtime even though
+// the server returns `Date`. The widened type below makes both the
+// server-side caller and the JSON-serialized client-side consumer satisfy
+// the same shape without per-call casts.
 export interface ProposalRow {
   id: string;
   type: ProposalTypeId;
@@ -77,7 +82,7 @@ export interface ProposalRow {
   risk: RiskLevelId;
   source: string;
   status: ProposalUnifiedStatus;
-  proposed_at: Date;
+  proposed_at: Date | string;
   proposed_by: string;
 }
 
@@ -93,7 +98,7 @@ export interface VersionRow {
   sot_id: string;
   version: number;
   status: 'proposed' | 'active' | 'frozen' | 'rolled_back';
-  created_at: Date;
+  created_at: Date | string;
   inUseBy?: string[];
 }
 
@@ -102,7 +107,7 @@ export interface DriftAlertRow {
   drift_type: string;
   severity: 'low' | 'medium' | 'high' | 'critical';
   decision: 'auto_fix' | 'queue' | 'freeze' | 'rollback' | null;
-  detected_at: Date;
+  detected_at: Date | string;
 }
 
 export interface TraceRow {
@@ -110,7 +115,7 @@ export interface TraceRow {
   conversa_id: string | null;
   agent_id: string;
   tenant_id: string;
-  started_at: Date;
+  started_at: Date | string;
   duration_ms: number | null;
   outcome: 'ok' | 'error' | 'blocked' | null;
 }
@@ -122,6 +127,6 @@ export interface AuditRow {
   action: string;
   resource_type: string;
   resource_id: string | null;
-  created_at: Date;
+  created_at: Date | string;
   change_summary: Record<string, unknown> | null;
 }

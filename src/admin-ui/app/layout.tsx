@@ -9,6 +9,13 @@ export const metadata = {
   description: 'Governance & approval control plane (P8.5)',
 };
 
+// Every route in the admin-ui depends on the NextAuth session (the layout
+// calls `auth()`, every page reads `useSession()`). Static prerendering would
+// either bake in an empty session or throw `useContext is null`. Force-dynamic
+// on the root layout makes Next render at request time, which is the only
+// correct behavior for a session-gated app.
+export const dynamic = 'force-dynamic';
+
 export default async function RootLayout({ children }: { children: React.ReactNode }) {
   const session = await auth();
 

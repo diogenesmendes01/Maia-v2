@@ -8,7 +8,9 @@ interface DriftItem {
   drift_type: string;
   severity: string;
   decision: string | null;
-  detected_at: Date;
+  // tRPC over HTTP serializes Dates as ISO strings; accept both shapes so
+  // server-side handlers and JSON responses both type-check cleanly.
+  detected_at: Date | string;
 }
 
 const SEVERITY_CLASS: Record<string, string> = {
