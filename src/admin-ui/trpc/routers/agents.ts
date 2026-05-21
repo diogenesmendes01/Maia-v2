@@ -232,25 +232,33 @@ export const agentsRouter = router({
       // operationalProfileVersionsRepo.proposeAndAuditAtomic. A failure on
       // either rolls back the other, so we cannot leave a proposal with no
       // audit row.
-      const { version, previous_version_id } =
-        await ctx.repos.operationalProfileVersionsRepo.proposeAndAuditAtomic({
-          tenant_id: tenantId,
-          agent_id: agent.id,
-          profile_body: profileBody,
-          proposed_by: ctx.userId,
-          proposed_reason: input.proposed_reason,
-          previous_active_id: activeVersion?.id ?? null,
-          actor_id: ctx.userId,
-          actor_role: ctx.userRole,
-        });
+      //
+      // Codex Adversarial Review of PR #171 — the atomic helper now locks
+      // the parent agent row with FOR UPDATE to serialize version
+      // allocation. If the agent was deleted between our findById above
+      // and the lock acquisition, the helper returns { agent_missing: true }
+      // and we translate to NOT_FOUND (same outcome as the upfront check).
+      const result = await ctx.repos.operationalProfileVersionsRepo.proposeAndAuditAtomic({
+        tenant_id: tenantId,
+        agent_id: agent.id,
+        profile_body: profileBody,
+        proposed_by: ctx.userId,
+        proposed_reason: input.proposed_reason,
+        previous_active_id: activeVersion?.id ?? null,
+        actor_id: ctx.userId,
+        actor_role: ctx.userRole,
+      });
+      if ('agent_missing' in result) {
+        throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent not found' });
+      }
 
       return {
         version: {
-          id: version.id,
-          version: version.version,
-          status: version.status,
+          id: result.version.id,
+          version: result.version.version,
+          status: result.version.status,
         },
-        previous_version_id,
+        previous_version_id: result.previous_version_id,
       };
     }),
 

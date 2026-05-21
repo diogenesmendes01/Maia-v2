@@ -3057,12 +3057,30 @@ export const operationalProfileVersionsRepo = {
    * proposal stays in `status='proposed'`; only `approveAndActivateAtomic`
    * activates it (P8.5 invariant — no profile activates without approval).
    *
+   * Codex Adversarial Review of PR #171 (issue #166 follow-up) — even with
+   * MAX(version)+1 computed inside the tx, two concurrent `updateProfile`
+   * calls for the same (tenant, agent) under READ COMMITTED can both read
+   * the same `max` and both attempt to insert `max+1`, colliding on the
+   * `(tenant_id, agent_id, version)` unique index. The router translates
+   * that DB error into an unhelpful 500 with no retry. Fix: lock the parent
+   * `agents` row with `SELECT ... FOR UPDATE` BEFORE reading MAX. This
+   * serializes version allocation per-agent (different agents don't
+   * contend) and matches the `.for('update')` pattern already used in
+   * `approveAndActivateAtomic`. We chose row-lock over `pg_advisory_xact_lock`
+   * because the row lock is naturally scoped, debuggable via `pg_locks`,
+   * and consistent with the rest of this repo.
+   *
    * Required input is explicit (no AsyncLocalStorage dependency) so the
    * router can call it without `runWithTenantContext`. The previous active
    * id is captured by the caller (router) BEFORE this call because the
    * read is part of the same logical operation but doesn't need tx
    * isolation — concurrent updateProfile + approveProfile races are guarded
    * by `approveAndActivateAtomic`'s FOR UPDATE on the active row.
+   *
+   * Returns `null` if the agent was deleted between the caller's
+   * `findById` check and this call — the router translates that into
+   * NOT_FOUND. Otherwise the proposal commits atomically with the audit
+   * row.
    */
   async proposeAndAuditAtomic(args: {
     tenant_id: string;
@@ -3074,17 +3092,41 @@ export const operationalProfileVersionsRepo = {
     previous_active_id: string | null;
     actor_id: string;
     actor_role: string;
-  }): Promise<{
-    version: AgentOperationalProfileVersion;
-    previous_version_id: string | null;
-  }> {
+  }): Promise<
+    | {
+        version: AgentOperationalProfileVersion;
+        previous_version_id: string | null;
+      }
+    | { agent_missing: true }
+  > {
     // Validate before opening the tx so a malformed body fails fast without
     // touching the DB.
     validateProfileBodyP8d(args.profile_body);
 
     return await withTx(async (tx) => {
-      // (1) Compute next version inside the tx so concurrent inserts can't
-      //     collide on (tenant, agent, version) unique index.
+      // (0) Lock the parent agent row to serialize concurrent version
+      //     allocation for the same (tenant, agent). Without this lock, two
+      //     concurrent updateProfile calls under READ COMMITTED can both
+      //     read the same MAX(version) and both insert max+1, colliding on
+      //     the (tenant_id, agent_id, version) unique index. Locking by PK
+      //     keeps the contention scope minimal — proposals against
+      //     different agents never block each other.
+      const agentLock = await tx
+        .select({ id: agents.id })
+        .from(agents)
+        .where(and(eq(agents.id, args.agent_id), eq(agents.tenant_id, args.tenant_id)))
+        .for('update')
+        .limit(1);
+      if (agentLock.length === 0) {
+        // Agent was deleted between the router's findById and this tx.
+        // Surface a typed sentinel so the caller can translate to NOT_FOUND
+        // instead of leaking a half-applied transaction or generic 500.
+        return { agent_missing: true as const };
+      }
+
+      // (1) Compute next version inside the tx + behind the row lock so
+      //     concurrent inserts can't collide on (tenant, agent, version)
+      //     unique index.
       const maxRes = await tx.execute<{ max: number | null }>(sql`
         SELECT MAX(version) AS max
           FROM agent_operational_profile_versions
