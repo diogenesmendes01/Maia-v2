@@ -1471,6 +1471,11 @@ export const tenantsRepo = {
 
   // Admin UI setup: muda status do tenant (active|suspended). Não retorna nada
   // útil em erro — caller checa findById depois se precisar verificar.
+  //
+  // DEPRECATED for tRPC `tenants.updateStatus` — use `updateStatusAtomic`
+  // instead so the status flip and admin_audit_log append commit together.
+  // Kept for any direct caller that doesn't need the audit record (none today;
+  // remove once eslint rule confirms zero hits).
   async updateStatus(id: string, status: string): Promise<Tenant | null> {
     const [updated] = await db
       .update(tenants)
@@ -1478,6 +1483,100 @@ export const tenantsRepo = {
       .where(eq(tenants.id, id))
       .returning();
     return updated ?? null;
+  },
+
+  /**
+   * Atomic status flip + admin_audit_log append.
+   *
+   * Codex Adversarial Review round 3 on PR #163 (issue #165) — `updateStatus`
+   * followed by a separate `adminAuditLogRepo.append` was not atomic: if the
+   * audit insert failed (or the request was interrupted) between the two
+   * statements, the tenant was already suspended/reactivated but no forensic
+   * record existed. Retry then hit `BAD_REQUEST` ("already X") and the audit
+   * row was lost forever — violating the append-only mutation-trail invariant
+   * for `admin_audit_log`.
+   *
+   * This method follows the same pattern as
+   * `operationalProfileVersionsRepo.approveAndActivateAtomic` (PR #162 r2)
+   * and `proposalsUnifiedRepo.decideAtomically` (PR #101):
+   *   1. Open transaction.
+   *   2. SELECT ... FOR UPDATE the tenant row (serialize concurrent flips).
+   *   3. Re-check status inside the tx (prevents lost-update races where two
+   *      founders read 'active' and both try to suspend).
+   *   4. UPDATE status.
+   *   5. INSERT admin_audit_log inside the same tx — if this throws, the
+   *      UPDATE rolls back and the tenant status is unchanged.
+   *
+   * Returns a discriminated union so the router can map outcomes to TRPC
+   * codes without inspecting exceptions.
+   */
+  async updateStatusAtomic(input: {
+    id: string;
+    status: string;
+    audit: {
+      tenant_id: string;
+      actor_id: string;
+      actor_role: string;
+      comment: string;
+    };
+  }): Promise<
+    | { ok: true; before: Tenant; after: Tenant }
+    | { ok: false; reason: 'not_found' | 'already_in_status' }
+  > {
+    return await withTx(async (tx) => {
+      // (1) Lock the tenant row FOR UPDATE so concurrent flips serialize.
+      const lockedRows = await tx
+        .select()
+        .from(tenants)
+        .where(eq(tenants.id, input.id))
+        .for('update')
+        .limit(1);
+      const before = lockedRows[0];
+      if (!before) return { ok: false as const, reason: 'not_found' as const };
+
+      // (2) Re-check status INSIDE the tx — the router's pre-flight findById
+      // ran outside any transaction, so two concurrent suspend calls could
+      // both see 'active' and race to flip. Without this check, one would
+      // succeed with from=active→suspended and the other would (incorrectly)
+      // commit from=active→suspended a second time, producing a duplicate
+      // audit row and a misleading mutation trail.
+      if (before.status === input.status) {
+        return { ok: false as const, reason: 'already_in_status' as const };
+      }
+
+      // (3) Flip status.
+      const [after] = await tx
+        .update(tenants)
+        .set({ status: input.status, updated_at: new Date() })
+        .where(eq(tenants.id, input.id))
+        .returning();
+      if (!after) {
+        // Should be unreachable — we just held FOR UPDATE on this row.
+        throw new TypedError(
+          'tenant_status_update_failed',
+          `UPDATE returned no row for tenant ${input.id}`,
+        );
+      }
+
+      // (4) Audit in the SAME tx. If this throws, EVERYTHING rolls back and
+      // the tenant status is restored — no unaudited governance change.
+      await tx.insert(admin_audit_log).values({
+        tenant_id: input.audit.tenant_id,
+        actor_id: input.audit.actor_id,
+        actor_role: input.audit.actor_role,
+        action: 'tenant_update_status',
+        resource_type: 'tenant',
+        resource_id: after.id,
+        change_summary: {
+          target_tenant_id: after.id,
+          from_status: before.status,
+          to_status: after.status,
+          reason: input.audit.comment,
+        },
+      });
+
+      return { ok: true as const, before, after };
+    });
   },
 };
 
