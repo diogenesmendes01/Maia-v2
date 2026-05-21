@@ -134,16 +134,50 @@ function buildProviders(): NextAuthConfig['providers'] {
 /**
  * Resolve an OIDC sign-in to an app_users row. The OIDC provider gives us a
  * verified email; we look it up across every configured tenant slug supplied
- * in env `OIDC_TENANT_SLUGS` (comma-separated). If a matching app_users row
- * exists AND has email_verified set AND has a known role, that user signs in
- * with that tenant. Otherwise reject.
+ * in env `OIDC_TENANT_SLUGS` (comma-separated).
+ *
+ * Resolution rules (fail-closed):
+ *   1. Enumerate EVERY allowed tenant — we do not return on the first match.
+ *      This is required to detect ambiguous bindings (see #2).
+ *   2. AMBIGUOUS-TENANT REJECTION (issue #164, Codex adversarial round 3 on
+ *      PR #163 → originally introduced by PR #162):
+ *        The `app_users` table is only unique on (tenant_id, email). The same
+ *        email can legitimately exist in multiple tenants. Under a real OIDC
+ *        IdP wired against `OIDC_TENANT_SLUGS=acme,foundry,demo`, the previous
+ *        "first match wins" strategy would silently bind the user to whichever
+ *        tenant appeared first in the env list — a tenant-isolation failure.
+ *        Hard policy: if the (verified, known-role, active-tenant) candidate
+ *        set has size > 1, reject the sign-in entirely (return null → NextAuth
+ *        surfaces AccessDenied). The user must be explicitly disambiguated at
+ *        the IdP / app_users level before sign-in is allowed.
+ *   3. Per-candidate guards stay as before:
+ *        - email_verified must be set
+ *        - role must be in KNOWN_ROLES
+ *        - non-founders cannot sign in to a non-active tenant
  *
  * Why an env list instead of just `email`? Maia is multi-tenant: the same
  * email could (in principle) appear in multiple tenants. The env list pins
  * which tenants the OIDC pool can authenticate into. For a single-tenant
- * deployment set OIDC_TENANT_SLUGS=acme.
+ * deployment set OIDC_TENANT_SLUGS=acme — that case avoids the ambiguity trap
+ * by construction.
  */
-async function resolveOidcAppUser(email: string): Promise<{
+export type ResolveOidcAppUserDeps = {
+  appUsersRepo: Pick<typeof appUsersRepo, 'getByEmail'>;
+  tenantsRepo: Pick<typeof tenantsRepo, 'findById'>;
+  /** Pluggable logger. Defaults to console; tests can inject a spy. */
+  logger?: { warn: (msg: string, meta?: Record<string, unknown>) => void };
+};
+
+const DEFAULT_RESOLVE_OIDC_DEPS: ResolveOidcAppUserDeps = {
+  appUsersRepo,
+  tenantsRepo,
+  logger: { warn: (msg, meta) => console.warn(msg, meta ?? {}) },
+};
+
+export async function resolveOidcAppUser(
+  email: string,
+  deps: ResolveOidcAppUserDeps = DEFAULT_RESOLVE_OIDC_DEPS,
+): Promise<{
   id: string;
   email: string;
   name?: string | null;
@@ -155,8 +189,16 @@ async function resolveOidcAppUser(email: string): Promise<{
     .filter((s) => s.length > 0);
   if (tenantSlugs.length === 0) return null;
 
+  const candidates: Array<{
+    tenant: string;
+    id: string;
+    email: string;
+    name?: string | null;
+    image?: string | null;
+  }> = [];
+
   for (const tenant of tenantSlugs) {
-    const user = await appUsersRepo.getByEmail(tenant, email);
+    const user = await deps.appUsersRepo.getByEmail(tenant, email);
     if (!user) continue;
     if (!user.email_verified) continue;
     if (!user.role || !KNOWN_ROLES.has(user.role)) continue;
@@ -164,17 +206,42 @@ async function resolveOidcAppUser(email: string): Promise<{
     // get a sign-in path via the dev provider (where applicable) for recovery
     // operations; here we keep the same posture as protectedProcedure.
     if (user.role !== 'founder') {
-      const tenantRow = await tenantsRepo.findById(tenant);
+      const tenantRow = await deps.tenantsRepo.findById(tenant);
       if (!tenantRow || tenantRow.status !== 'active') continue;
     }
-    return {
+    candidates.push({
+      tenant,
       id: user.id,
       email: user.email,
       name: user.name ?? null,
       image: user.image ?? null,
-    };
+    });
   }
-  return null;
+
+  if (candidates.length === 0) return null;
+
+  if (candidates.length > 1) {
+    // Issue #164 — fail-closed under ambiguity. Log the matched tenants for
+    // operator investigation; we deliberately do NOT log the email (it's
+    // attacker-controlled IdP input at this point).
+    const logger = deps.logger ?? DEFAULT_RESOLVE_OIDC_DEPS.logger!;
+    logger.warn(
+      '[admin-ui/auth] OIDC sign-in rejected: email matches multiple allowed tenants (ambiguous binding)',
+      {
+        tenant_count: candidates.length,
+        tenants: candidates.map((c) => c.tenant),
+      },
+    );
+    return null;
+  }
+
+  const only = candidates[0]!;
+  return {
+    id: only.id,
+    email: only.email,
+    name: only.name,
+    image: only.image,
+  };
 }
 
 // v5 NextAuthConfig (replaces v4 NextAuthOptions).
