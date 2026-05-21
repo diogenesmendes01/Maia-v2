@@ -305,6 +305,12 @@ export const agentsRouter = router({
         if (result.reason === 'not_found') {
           throw new TRPCError({ code: 'NOT_FOUND', message: 'Version not found' });
         }
+        if (result.reason === 'agent_missing') {
+          // Codex Adversarial Review of PR #171 round 3 — the agent was
+          // deleted between findById above and the parent-agent FOR UPDATE
+          // lock inside the tx. Same outcome as the upfront NOT_FOUND.
+          throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent not found' });
+        }
         if (result.reason === 'invalid_source_status') {
           throw new TRPCError({
             code: 'CONFLICT',
@@ -324,6 +330,22 @@ export const agentsRouter = router({
               `Active profile changed since this proposal was authored ` +
               `(expected predecessor ${String(result.expected)}, current ${String(result.current)}). ` +
               `Refresh and re-propose against the current active version.`,
+          });
+        }
+        // Codex Adversarial Review of PR #171 round 3 (#173) — migration 061
+        // backfilled `metadata.previous_version_id = null` + `migrated_from_legacy: true`
+        // for every legacy row. Without distinguishing migrated proposals
+        // from intentional seeds, an explicit-null predecessor on a
+        // migrated row would silently activate against an empty active
+        // slot. Surface a distinct CONFLICT so the operator re-proposes
+        // under the post-migration flow with a real predecessor link.
+        if (result.reason === 'migrated_legacy_proposal') {
+          throw new TRPCError({
+            code: 'CONFLICT',
+            message:
+              `This proposal was created by the v3.1.1 legacy backfill and has ` +
+              `no known predecessor lineage. Re-propose the change against the ` +
+              `current active version before approving.`,
           });
         }
         throw new TRPCError({

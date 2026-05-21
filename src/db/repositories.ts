@@ -2910,6 +2910,66 @@ function readExpectedPredecessor(profile_body: unknown): string | null | 'unknow
 }
 
 /**
+ * Detect whether a profile_body was backfilled by migration 061 (or any
+ * other migration that stamps `metadata.migrated_from_legacy = true`).
+ *
+ * Codex Adversarial Review of PR #171 round 3 ([high] #173) — migration 061
+ * writes `metadata.previous_version_id = null` (explicit) for every legacy
+ * row backfilled from the four `core_immutable`/`operational_profile`/...
+ * columns. Without a discriminator, `approveAndActivateAtomic`'s
+ * predecessor check would accept that explicit `null` as "no predecessor
+ * expected" (the same shape used for intentional seed v1) and a stale
+ * migrated proposal could silently activate against an empty active slot.
+ *
+ * The migration stamps `metadata.migrated_from_legacy = true` alongside the
+ * null predecessor; this helper exposes that marker to the approval path so
+ * it can reject the ambiguous case (explicit null predecessor whose lineage
+ * is actually unknown, NOT an intentional seed) with a distinct typed
+ * sentinel.
+ */
+function isMigratedLegacy(profile_body: unknown): boolean {
+  const md = (profile_body as { metadata?: Record<string, unknown> } | null)?.metadata;
+  if (!md) return false;
+  return md.migrated_from_legacy === true;
+}
+
+/**
+ * Take a `FOR UPDATE` lock on the parent `agents` row for a given
+ * `(tenant_id, agent_id)`. Held until the surrounding `withTx` commits.
+ *
+ * Returns `true` if the row exists (and is now locked), `false` if the
+ * agent was deleted (or never existed) — caller decides whether that is a
+ * typed-miss (`agent_missing: true`) or an error condition.
+ *
+ * Codex Adversarial Review of PR #171 round 3 ([medium]) — the parent-agent
+ * lock target was previously only acquired by `acquireNextVersionForAgent`
+ * (i.e. only by version allocators). `approveAndActivateAtomic` did NOT
+ * take this lock, so a concurrent `seedNewActiveAtomic` (priorities
+ * migration) and `approveAndActivateAtomic` could race on the active-row
+ * freeze/insert: the partial unique index on (tenant, agent) WHERE
+ * status='active' would roll one tx back, surfacing as a 500 instead of a
+ * serialized update. Extracting the lock primitive into its own helper
+ * lets every writer that touches active state share the same lock target.
+ *
+ * @param tx        the in-tx drizzle handle (caller MUST already be inside `withTx`)
+ * @param tenant_id tenant slug — part of the lock predicate
+ * @param agent_id  agent id (PK) — locked with FOR UPDATE
+ */
+async function lockParentAgent(
+  tx: typeof db,
+  tenant_id: string,
+  agent_id: string,
+): Promise<boolean> {
+  const lock = await tx
+    .select({ id: agents.id })
+    .from(agents)
+    .where(and(eq(agents.id, agent_id), eq(agents.tenant_id, tenant_id)))
+    .for('update')
+    .limit(1);
+  return lock.length > 0;
+}
+
+/**
  * Shared per-agent version allocator for `agent_operational_profile_versions`.
  *
  * Codex Adversarial Review of PR #171 round 2 (issue #166 follow-up) — three
@@ -2942,17 +3002,15 @@ async function acquireNextVersionForAgent(
   tenant_id: string,
   agent_id: string,
 ): Promise<number | null> {
-  // (1) Lock the parent agent row. PK + tenant_id avoids accidentally locking
-  //     a same-id agent under a different tenant — defense-in-depth even
-  //     though `agents.id` is globally unique today, because the schema
-  //     contract is "id is unique per tenant".
-  const lock = await tx
-    .select({ id: agents.id })
-    .from(agents)
-    .where(and(eq(agents.id, agent_id), eq(agents.tenant_id, tenant_id)))
-    .for('update')
-    .limit(1);
-  if (lock.length === 0) return null;
+  // (1) Lock the parent agent row via the shared `lockParentAgent` helper.
+  //     PK + tenant_id avoids accidentally locking a same-id agent under a
+  //     different tenant — defense-in-depth even though `agents.id` is
+  //     globally unique today, because the schema contract is "id is unique
+  //     per tenant". Sharing this primitive with `approveAndActivateAtomic`
+  //     (Codex round 3) ensures every writer that touches active state OR
+  //     allocates a version serializes on the same lock target.
+  const locked = await lockParentAgent(tx, tenant_id, agent_id);
+  if (!locked) return null;
 
   // (2) Read MAX(version) BEHIND the lock so concurrent allocators serialize.
   const maxRes = await tx.execute<{ max: number | null }>(sql`
@@ -3288,13 +3346,41 @@ export const operationalProfileVersionsRepo = {
    * predecessor against the freshly-locked incumbent. If they diverge,
    * reject with `predecessor_conflict` so the caller can refresh + re-propose.
    *
-   * Policy on legacy / missing predecessor metadata: a `profile_body` without
-   * `metadata.previous_version_id` (key absent, NOT explicit `null`) is rare
-   * but possible for proposals authored before this codepath existed. We
-   * REJECT those defensively with `predecessor_conflict` (expected: 'unknown')
-   * — operators must re-propose under the new flow. Conservative choice over
-   * "accept with warning" because the worst case (silent overwrite of a
-   * newer approved version) is exactly the bug we're closing.
+   * Codex Adversarial Review of PR #171 round 3 ([medium]) — the parent-agent
+   * `FOR UPDATE` lock is now the FIRST thing this tx takes, BEFORE reading
+   * the proposed or active rows. This closes the cross-allocator race where
+   * a concurrent `seedNewActiveAtomic` (priorities migration) could freeze
+   * and insert a new active row between this tx's active read and freeze,
+   * surfacing as a partial-unique-index conflict / 500 instead of a
+   * serialized update. Every writer that touches active state OR allocates
+   * a version now shares the same lock target via `lockParentAgent`.
+   *
+   * Codex Adversarial Review of PR #171 round 3 ([high] #173) — explicit
+   * `null` predecessor is now context-sensitive:
+   *
+   *   - **Intentional seed (no incumbent + version === 1)**: ACCEPT. This is
+   *     the first activation of a freshly-created agent; there's nothing for
+   *     a predecessor to point at. Matches the router's `create → approve`
+   *     flow (`createWithSeedAndAudit` inserts a `proposed` v1 with
+   *     `previous_version_id: null` and the owner immediately approves it).
+   *
+   *   - **Migrated legacy (any version, `metadata.migrated_from_legacy === true`)**:
+   *     REJECT with `migrated_legacy_proposal`. Migration 061 stamps every
+   *     backfilled row with `previous_version_id: null` + the
+   *     `migrated_from_legacy` marker because the original lineage is
+   *     unknowable from the legacy four-column shape. Accepting these would
+   *     let a stale migrated proposal silently activate against an empty
+   *     active slot (#173 finding).
+   *
+   *   - **Other explicit `null` cases** (e.g. test fixtures, non-seed non-
+   *     migrated): the no-incumbent + v1 rule covers them. If a caller
+   *     proposes v2+ with explicit `null` predecessor against an incumbent,
+   *     it falls through to `predecessor_conflict` (expected !== current).
+   *
+   *   - **`previous_version_id` key absent entirely**: REJECT with
+   *     `predecessor_conflict` (`expected: 'unknown'`). Same conservative
+   *     policy as round 2 — worst case is silent overwrite of a newer
+   *     approved version.
    *
    * Required input is explicit (no AsyncLocalStorage dependency) so the
    * router can call it without `runWithTenantContext`.
@@ -3315,7 +3401,11 @@ export const operationalProfileVersionsRepo = {
       }
     | {
         ok: false;
-        reason: 'not_found' | 'invalid_source_status' | 'transition_failed';
+        reason:
+          | 'not_found'
+          | 'invalid_source_status'
+          | 'transition_failed'
+          | 'agent_missing';
       }
     | {
         ok: false;
@@ -3325,8 +3415,35 @@ export const operationalProfileVersionsRepo = {
         /** What the incumbent active id actually is right now (post-lock). */
         current: string | null;
       }
+    | {
+        ok: false;
+        reason: 'migrated_legacy_proposal';
+        /** Always `null` for this case — migration 061 backfills explicit null. */
+        expected: null;
+        /** What the incumbent active id actually is right now (post-lock). */
+        current: string | null;
+      }
   > {
     return await withTx(async (tx) => {
+      // (0) Lock the parent agent row FIRST. This serializes against EVERY
+      // other writer that touches `(tenant, agent)` operational profile
+      // state — `proposeAndAuditAtomic`, `seedNewActiveAtomic`, and
+      // `operationalProfileVersionsRepo.create` all go through
+      // `lockParentAgent` (directly or via `acquireNextVersionForAgent`).
+      // Without this lock, a concurrent `seedNewActiveAtomic` could freeze
+      // and insert a new active row between our read and freeze, causing
+      // the partial unique index on (tenant, agent) WHERE status='active'
+      // to reject one tx as a 500 instead of a serialized update
+      // (Codex round 3 [medium]).
+      const agentLocked = await lockParentAgent(tx, args.tenant_id, args.agent_id);
+      if (!agentLocked) {
+        // The agent was deleted between the router's findById check and
+        // this lock acquisition. Surface a typed-miss so the caller can
+        // translate to NOT_FOUND (same outcome as the upfront check) and
+        // we don't leak a half-applied transaction.
+        return { ok: false as const, reason: 'agent_missing' as const };
+      }
+
       // (1) Lock the proposed row inside the tx so concurrent approvers
       // serialize on it.
       const proposedRows = await tx
@@ -3347,10 +3464,10 @@ export const operationalProfileVersionsRepo = {
         return { ok: false as const, reason: 'invalid_source_status' as const };
       }
 
-      // (2) Lock the current active (if any) so the freeze + activate is
-      // atomic against concurrent activations of a third version. This
-      // also gives us a fresh post-lock read of the incumbent id for the
-      // predecessor-conflict check below.
+      // (2) Lock the current active (if any). Note: the parent-agent lock
+      // already serializes every writer, so this row lock is defense-in-
+      // depth (catches any future codepath that bypasses the parent lock
+      // and only touches the active row directly).
       const activeRows = await tx
         .select()
         .from(agent_operational_profile_versions)
@@ -3365,11 +3482,12 @@ export const operationalProfileVersionsRepo = {
         .limit(1);
       const incumbent = activeRows[0] ?? null;
 
-      // (2b) Predecessor enforcement — Codex round 2 [high] #1.
+      // (2b) Predecessor enforcement — Codex round 2 [high] #1 + round 3
+      // [high] #173.
       // The proposal was built against a specific incumbent id (recorded in
       // profile_body.metadata.previous_version_id). If the current incumbent
       // (re-read post-lock) doesn't match, a different proposal won the
-      // race — approving this one would silently dropthat newer version's
+      // race — approving this one would silently drop that newer version's
       // changes while the audit lineage still pointed at the old
       // predecessor. Reject so the caller can refresh + re-propose.
       const expectedPredecessor = readExpectedPredecessor(proposed.profile_body);
@@ -3384,7 +3502,34 @@ export const operationalProfileVersionsRepo = {
           current: currentPredecessor,
         };
       }
-      if (expectedPredecessor !== currentPredecessor) {
+
+      // Round 3 [high] #173: explicit `null` predecessor needs context.
+      // Migration 061 backfills `null` + `migrated_from_legacy: true` for
+      // every legacy row whose original lineage is unknowable. Without this
+      // discriminator, a stale migrated proposal could silently activate
+      // against an empty active slot (the (no incumbent + null predecessor)
+      // pair is indistinguishable from intentional seed v1). Reject migrated
+      // proposals with a distinct sentinel so the operator must re-propose
+      // under the new flow.
+      if (expectedPredecessor === null && isMigratedLegacy(proposed.profile_body)) {
+        return {
+          ok: false as const,
+          reason: 'migrated_legacy_proposal' as const,
+          expected: null,
+          current: currentPredecessor,
+        };
+      }
+
+      // Round 3 [high] #173: intentional-seed exception. Explicit `null`
+      // predecessor is legitimate when (a) there's no incumbent active row
+      // AND (b) this is version 1 — the first activation of a freshly-
+      // created agent (`createWithSeedAndAudit` → owner approves the seed).
+      // Any OTHER explicit-null case (v2+ with null, or v1 with an
+      // incumbent) falls through to the strict equality check below.
+      const isIntentionalSeed =
+        expectedPredecessor === null && currentPredecessor === null && proposed.version === 1;
+
+      if (!isIntentionalSeed && expectedPredecessor !== currentPredecessor) {
         return {
           ok: false as const,
           reason: 'predecessor_conflict' as const,

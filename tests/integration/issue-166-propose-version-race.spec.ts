@@ -327,6 +327,237 @@ d('operationalProfileVersionsRepo.approveAndActivateAtomic (predecessor conflict
       }
     }
   });
+
+  /**
+   * Codex Adversarial Review of PR #171 round 3 ([high] #173) — migration 061
+   * backfilled `metadata.previous_version_id = null` + `migrated_from_legacy:
+   * true` for every legacy row. Without the discriminator, the predecessor
+   * check would accept that explicit `null` as "no predecessor expected"
+   * (valid for seed v1) and a stale migrated proposal could silently
+   * activate against an empty active slot. The new `migrated_legacy_proposal`
+   * sentinel forces operators to re-propose under the post-migration flow
+   * with a real predecessor link.
+   */
+  it('rejects migrated legacy proposal (explicit null + migrated_from_legacy marker)', async () => {
+    const { operationalProfileVersionsRepo } = await import('../../src/db/repositories.js');
+
+    const c = await pool.connect();
+    let migratedId: string;
+    try {
+      // Mirrors exactly what migration 061 writes: the consolidated
+      // profile_body with metadata.previous_version_id=null and the
+      // migrated_from_legacy=true marker.
+      const r = await c.query<{ id: string }>(
+        `INSERT INTO agent_operational_profile_versions
+           (tenant_id, agent_id, version, status, profile_body, proposed_by, proposed_reason)
+         VALUES ($1, $2, 1, 'proposed',
+                 jsonb_build_object(
+                   'metadata', jsonb_build_object(
+                     'previous_version_id', null,
+                     'migrated_from_legacy', true
+                   )
+                 ),
+                 $3, 'migrated by 061')
+         RETURNING id`,
+        [T, A, ACTOR],
+      );
+      migratedId = r.rows[0]!.id;
+    } finally {
+      c.release();
+    }
+
+    const res = await operationalProfileVersionsRepo.approveAndActivateAtomic({
+      tenant_id: T,
+      agent_id: A,
+      id: migratedId,
+      actor_id: ACTOR,
+      actor_role: 'founder',
+      comment: 'migrated legacy approval attempt',
+    });
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.reason).toBe('migrated_legacy_proposal');
+      if (res.reason === 'migrated_legacy_proposal') {
+        expect(res.expected).toBeNull();
+        expect(res.current).toBeNull();
+      }
+    }
+
+    // Row must STILL be proposed — atomicity invariant under rejection.
+    const c2 = await pool.connect();
+    try {
+      const r = await c2.query<{ status: string }>(
+        `SELECT status FROM agent_operational_profile_versions WHERE id = $1`,
+        [migratedId],
+      );
+      expect(r.rows[0]!.status).toBe('proposed');
+    } finally {
+      c2.release();
+    }
+  });
+
+  /**
+   * Codex Adversarial Review of PR #171 round 3 — confirms the intentional-
+   * seed path still works under real-DB conditions. v1, no incumbent,
+   * explicit null predecessor (no migrated marker) → approve succeeds.
+   * Matches the `createWithSeedAndAudit → approveProfile` happy path.
+   */
+  it('approves intentional seed (v1, no incumbent, explicit null predecessor)', async () => {
+    const { operationalProfileVersionsRepo } = await import('../../src/db/repositories.js');
+
+    const c = await pool.connect();
+    let seedId: string;
+    try {
+      const r = await c.query<{ id: string }>(
+        `INSERT INTO agent_operational_profile_versions
+           (tenant_id, agent_id, version, status, profile_body, proposed_by, proposed_reason)
+         VALUES ($1, $2, 1, 'proposed',
+                 jsonb_build_object(
+                   'metadata', jsonb_build_object('previous_version_id', null)
+                 ),
+                 $3, 'intentional seed v1')
+         RETURNING id`,
+        [T, A, ACTOR],
+      );
+      seedId = r.rows[0]!.id;
+    } finally {
+      c.release();
+    }
+
+    const res = await operationalProfileVersionsRepo.approveAndActivateAtomic({
+      tenant_id: T,
+      agent_id: A,
+      id: seedId,
+      actor_id: ACTOR,
+      actor_role: 'founder',
+      comment: 'first activation for this agent',
+    });
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.frozen_previous).toBeNull();
+      expect(res.activated.id).toBe(seedId);
+    }
+  });
+});
+
+d('cross-allocator concurrency: seedNewActiveAtomic + approveAndActivateAtomic', () => {
+  /**
+   * Codex Adversarial Review of PR #171 round 3 ([medium]) — `seedNewActiveAtomic`
+   * (priorities migration) and `approveAndActivateAtomic` (Admin UI approve)
+   * both mutate the `(tenant, agent)` active slot. Until round 3, only
+   * `seedNewActiveAtomic` took the parent-agent FOR UPDATE lock; approve
+   * only locked the proposed and active ROW tuples. A concurrent migration
+   * + approve could race on the freeze/insert and surface a partial-unique-
+   * index error as a 500.
+   *
+   * The fix: `approveAndActivateAtomic` now takes `lockParentAgent` as its
+   * FIRST step, before reading proposed/active rows. This test fires both
+   * writers concurrently against the same agent and asserts:
+   *   - both complete without an unhandled throw,
+   *   - one freezes the other's output OR both run sequentially (lock
+   *     serialization → no partial-unique-index 500),
+   *   - there is exactly one `active` row at the end (invariant preserved).
+   */
+  it('seedNewActiveAtomic + approveAndActivateAtomic concurrent → serialized, one active', async () => {
+    const { operationalProfileVersionsRepo } = await import('../../src/db/repositories.js');
+    const { runWithTenantContext } = await import('../../src/db/tenant-context.js');
+
+    // Setup: seed v1 active and v2 proposed (predecessor=v1) — so the
+    // approve call has a valid target with a non-null predecessor that
+    // matches the incumbent.
+    const c = await pool.connect();
+    let v1Id: string;
+    let v2Id: string;
+    try {
+      const r1 = await c.query<{ id: string }>(
+        `INSERT INTO agent_operational_profile_versions
+           (tenant_id, agent_id, version, status, profile_body, proposed_by, proposed_reason,
+            approved_by, approved_at, activated_at)
+         VALUES ($1, $2, 1, 'active',
+                 jsonb_build_object('metadata', jsonb_build_object('previous_version_id', null)),
+                 $3, 'seed', $3, now(), now())
+         RETURNING id`,
+        [T, A, ACTOR],
+      );
+      v1Id = r1.rows[0]!.id;
+
+      const r2 = await c.query<{ id: string }>(
+        `INSERT INTO agent_operational_profile_versions
+           (tenant_id, agent_id, version, status, profile_body, proposed_by, proposed_reason)
+         VALUES ($1, $2, 2, 'proposed',
+                 jsonb_build_object('metadata', jsonb_build_object('previous_version_id', $4::text)),
+                 'admin', 'admin update')
+         RETURNING id`,
+        [T, A, ACTOR, v1Id],
+      );
+      v2Id = r2.rows[0]!.id;
+    } finally {
+      c.release();
+    }
+
+    // approveAndActivateAtomic: tries to promote v2 (predecessor=v1).
+    const approveCall = operationalProfileVersionsRepo.approveAndActivateAtomic({
+      tenant_id: T,
+      agent_id: A,
+      id: v2Id,
+      actor_id: ACTOR,
+      actor_role: 'founder',
+      comment: 'approve v2 concurrently with migration',
+    });
+
+    // seedNewActiveAtomic: priorities-migration style call. Allocates next
+    // version, freezes current active, inserts new active. Wraps in
+    // runWithTenantContext for the AsyncLocalStorage reads.
+    const seedCall = runWithTenantContext({ tenant_id: T, agent_id: A }, async () =>
+      operationalProfileVersionsRepo.seedNewActiveAtomic({
+        profile_body: {
+          metadata: { previous_version_id: null },
+        } as unknown as Parameters<
+          typeof operationalProfileVersionsRepo.seedNewActiveAtomic
+        >[0]['profile_body'],
+        proposed_by: 'p8d-migration',
+        proposed_reason: 'priorities migration concurrent with admin approve',
+      }),
+    );
+
+    // Both must resolve — no unhandled throws, no partial-unique-index 500.
+    // Either outcome is acceptable as long as the invariant (exactly one
+    // active row at the end) is preserved:
+    //   (a) Approve runs first → v1 frozen, v2 active; then seed allocates
+    //       v3, freezes v2, inserts v3 active.
+    //   (b) Seed runs first → allocates v2 (oh wait, v2 is taken), so seed
+    //       allocates v3, freezes v1, inserts v3 active. Then approve fires
+    //       on v2 — predecessor mismatch (expected v1, current v3) → rejects
+    //       cleanly with `predecessor_conflict`.
+    //
+    // Either way: ZERO partial-unique-index errors, exactly one row active.
+    const results = await Promise.allSettled([approveCall, seedCall]);
+
+    // Every promise must either fulfill with a result OR reject with the
+    // typed `predecessor_conflict` (acceptable serialized outcome). NO
+    // promise may reject with a Postgres unique-index error.
+    for (const r of results) {
+      if (r.status === 'rejected') {
+        const msg = String(r.reason);
+        // The unique-index violation message we are guarding against.
+        expect(msg).not.toMatch(/agent_op_profile_active_uniq/i);
+        expect(msg).not.toMatch(/duplicate key/i);
+      }
+    }
+
+    // Invariant: exactly one `active` row.
+    const c2 = await pool.connect();
+    try {
+      const r = await c2.query<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM agent_operational_profile_versions
+          WHERE tenant_id = $1 AND agent_id = $2 AND status = 'active'`,
+        [T, A],
+      );
+      expect(r.rows[0]!.count).toBe('1');
+    } finally {
+      c2.release();
+    }
+  });
 });
 
 d('mixed-allocator concurrency: proposeAndAuditAtomic + operationalProfileVersionsRepo.create', () => {

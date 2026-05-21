@@ -279,6 +279,14 @@ function makeRepos(
       // `profile_body.metadata.previous_version_id` from the proposed row and
       // rejects with `predecessor_conflict` when it doesn't match the current
       // incumbent.
+      //
+      // Codex Adversarial Review of PR #171 round 3 — also mirrors:
+      //   - parent-agent existence check (returns `agent_missing` if the
+      //     agent was deleted between findById and the lock acquisition);
+      //   - migrated-legacy detection (`metadata.migrated_from_legacy === true`
+      //     + explicit null predecessor → `migrated_legacy_proposal`);
+      //   - intentional-seed exception (`version === 1` + no incumbent +
+      //     explicit null predecessor → accept).
       async approveAndActivateAtomic(args: {
         tenant_id: string;
         agent_id: string;
@@ -287,6 +295,12 @@ function makeRepos(
         actor_role: string;
         comment: string;
       }) {
+        // Mirror the parent-agent FOR UPDATE lock — if the agent row was
+        // deleted between the router's findById and the tx lock, surface
+        // the typed-miss instead of falling through to predecessor checks.
+        if (!agentsMap[args.agent_id] || agentsMap[args.agent_id]!.tenant_id !== args.tenant_id) {
+          return { ok: false as const, reason: 'agent_missing' as const };
+        }
         const target = profiles.find((p) => p.id === args.id);
         if (!target) return { ok: false as const, reason: 'not_found' as const };
         if (target.status !== 'proposed') {
@@ -312,7 +326,29 @@ function makeRepos(
           expected = v === null ? null : typeof v === 'string' ? v : 'unknown';
         }
         const current = incumbent?.id ?? null;
-        if (expected === 'unknown' || expected !== current) {
+        if (expected === 'unknown') {
+          return {
+            ok: false as const,
+            reason: 'predecessor_conflict' as const,
+            expected: 'unknown' as const,
+            current,
+          };
+        }
+
+        // Round 3 #173: migrated legacy rejected with distinct sentinel.
+        const isMigrated = md?.migrated_from_legacy === true;
+        if (expected === null && isMigrated) {
+          return {
+            ok: false as const,
+            reason: 'migrated_legacy_proposal' as const,
+            expected: null,
+            current,
+          };
+        }
+
+        // Round 3 #173: intentional seed (v1 + no incumbent + null predecessor).
+        const isIntentionalSeed = expected === null && current === null && target.version === 1;
+        if (!isIntentionalSeed && expected !== current) {
           return {
             ok: false as const,
             reason: 'predecessor_conflict' as const,
@@ -858,6 +894,152 @@ describe('agentsRouter.approveProfile — atomic + freezes incumbent', () => {
     });
     // Profile MUST still be proposed — nothing was activated.
     expect(repos._inspect.profiles[0]!.status).toBe('proposed');
+  });
+
+  /**
+   * Codex Adversarial Review of PR #171 round 3 ([high] #173) — migration 061
+   * backfilled `metadata.previous_version_id = null` + `migrated_from_legacy:
+   * true` for every legacy row. Without the discriminator, the predecessor
+   * check accepted explicit `null` as "no predecessor expected" (valid for
+   * intentional seed v1), so a stale migrated proposal whose true lineage
+   * is unknowable could silently activate against an empty active slot.
+   * The new policy rejects migrated proposals with a distinct sentinel.
+   */
+  it('migrated_legacy_proposal: explicit null + migrated_from_legacy marker is rejected', async () => {
+    const migrated: Profile = {
+      id: '00000000-0000-4000-8000-0000000000a1',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      // Could be any version — migration 061 backfilled all of them.
+      version: 1,
+      status: 'proposed',
+      profile_body: {
+        metadata: {
+          previous_version_id: null,
+          migrated_from_legacy: true,
+        },
+      },
+      proposed_by: 'system',
+      proposed_reason: null,
+    };
+    const repos = makeRepos({ agents: [existingAgent], profiles: [migrated] });
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).approveProfile({
+        agentId: 'agent-x',
+        versionId: '00000000-0000-4000-8000-0000000000a1',
+        comment: 'attempt to approve a migrated legacy proposal',
+      }),
+    ).rejects.toMatchObject({
+      code: 'CONFLICT',
+      message: expect.stringMatching(/v3\.1\.1 legacy backfill/i),
+    });
+    // Profile MUST still be proposed — nothing was activated.
+    expect(repos._inspect.profiles[0]!.status).toBe('proposed');
+    // No audit row appended — the rejection happened before the audit step.
+    expect(repos._inspect.audit).toHaveLength(0);
+  });
+
+  /**
+   * Codex Adversarial Review of PR #171 round 3 — the intentional-seed
+   * exception accepts explicit `null` predecessor ONLY when (a) there's no
+   * incumbent active row AND (b) this is version 1. Any non-seed null case
+   * (v2+ with null, or v1 with an incumbent) falls through to
+   * predecessor_conflict. Matches the `create → approve` seed flow shipped
+   * with `createWithSeedAndAudit`.
+   */
+  it('intentional seed: v1 + no incumbent + null predecessor (no marker) is approved', async () => {
+    const seed: Profile = {
+      id: '00000000-0000-4000-8000-0000000000a1',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      version: 1,
+      status: 'proposed',
+      profile_body: { metadata: { previous_version_id: null } },
+      proposed_by: 'system',
+      proposed_reason: null,
+    };
+    const repos = makeRepos({ agents: [existingAgent], profiles: [seed] });
+    const res = await caller('owner', 'tenant-A', 'u1', repos).approveProfile({
+      agentId: 'agent-x',
+      versionId: '00000000-0000-4000-8000-0000000000a1',
+      comment: 'first activation for this agent',
+    });
+    expect(res.activated.id).toBe('00000000-0000-4000-8000-0000000000a1');
+    expect(res.frozen_previous).toBeNull();
+    expect(repos._inspect.profiles[0]!.status).toBe('active');
+  });
+
+  /**
+   * Documents the strict-equality behavior for null predecessor + no
+   * incumbent on a non-v1 version. This case is NOT rejected because the
+   * structural invariant (`expected_predecessor === current_incumbent`) is
+   * satisfied — null === null. The intentional-seed gate is an
+   * ACCEPTANCE bypass; the strict-equality check is the rejection gate.
+   * The dangerous shape (null predecessor with an incumbent present) is
+   * caught by `expected !== current` when current is non-null.
+   */
+  it('explicit null predecessor on v2 (no incumbent) is accepted (null === null structurally)', async () => {
+    const v2NoIncumbent: Profile = {
+      id: '00000000-0000-4000-8000-0000000000a2',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      version: 2,
+      status: 'proposed',
+      profile_body: { metadata: { previous_version_id: null } },
+      proposed_by: 'system',
+      proposed_reason: null,
+    };
+    const repos = makeRepos({ agents: [existingAgent], profiles: [v2NoIncumbent] });
+    const res = await caller('owner', 'tenant-A', 'u1', repos).approveProfile({
+      agentId: 'agent-x',
+      versionId: '00000000-0000-4000-8000-0000000000a2',
+      comment: 'approve v2 against empty active slot',
+    });
+    expect(res.activated.id).toBe('00000000-0000-4000-8000-0000000000a2');
+  });
+
+  /**
+   * Codex Adversarial Review of PR #171 round 3 — `agent_missing` typed-miss
+   * surfaces as NOT_FOUND. Simulates the agent being deleted between the
+   * router's findById check and the parent-agent FOR UPDATE lock inside
+   * the tx (mock checks agentsMap[args.agent_id] presence to mirror).
+   */
+  it('NOT_FOUND when parent agent vanished between findById and lock', async () => {
+    // No agent in the map — but a proposal exists pointing at it. In real
+    // life this is the (rare) race where the agent was deleted after the
+    // router's findById succeeded but before the FOR UPDATE lock fired.
+    const orphanProposal: Profile = {
+      id: '00000000-0000-4000-8000-0000000000a1',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-deleted',
+      version: 1,
+      status: 'proposed',
+      profile_body: { metadata: { previous_version_id: null } },
+      proposed_by: 'system',
+      proposed_reason: null,
+    };
+    // Pre-populate with the agent so router.findById succeeds, then we
+    // delete it right before calling. The mock's approveAndActivateAtomic
+    // re-checks agentsMap so the typed-miss fires correctly.
+    const agent: Agent = {
+      id: 'agent-deleted',
+      tenant_id: 'tenant-A',
+      nome: 'about to vanish',
+      status: 'active',
+      metadata: {},
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+    const repos = makeRepos({ agents: [agent], profiles: [orphanProposal] });
+    // Vanish the agent before approve (simulates the race).
+    delete repos._inspect.agentsMap['agent-deleted'];
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).approveProfile({
+        agentId: 'agent-deleted',
+        versionId: '00000000-0000-4000-8000-0000000000a1',
+        comment: 'race against agent deletion',
+      }),
+    ).rejects.toMatchObject({ code: 'NOT_FOUND' });
   });
 });
 
