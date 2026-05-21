@@ -33,26 +33,23 @@ export const dashboardRouter = router({
       const activeAgents = agents.filter((a) => a.status === 'active');
 
       let activeChannelsTotal = 0;
+      let driftOpenTotal = 0;
       for (const agent of activeAgents) {
-        const channels = await runWithTenantContext(
+        const [channels, drifts] = await runWithTenantContext(
           { tenant_id: tenantId, agent_id: agent.id },
-          async () => ctx.repos.channelsRepo.listActive(),
+          async () =>
+            Promise.all([
+              ctx.repos.channelsRepo.listActive(),
+              // driftAlertsRepo.listUnresolved is scoped to (tenant, agent)
+              // by applyTenantGuard, so the fan-out across agents gives us
+              // the tenant-wide unresolved total. Codex review #162: the
+              // previous code called a non-existent agentDriftAlertsRepo and
+              // always returned 0.
+              ctx.repos.driftAlertsRepo.listUnresolved(),
+            ]),
         );
         activeChannelsTotal += channels.length;
-      }
-
-      // Unresolved drift alerts — open across all agents in this tenant. The
-      // drift router already exposes a per-agent feed; here we just want the
-      // total. We reuse the agentDriftAlertsRepo.listOpen helper if available;
-      // fallback to 0 if not yet wired.
-      let driftOpenTotal = 0;
-      const repo = (ctx.repos as unknown as {
-        agentDriftAlertsRepo?: {
-          countOpenForTenant?: (tenantId: string) => Promise<number>;
-        };
-      }).agentDriftAlertsRepo;
-      if (repo?.countOpenForTenant) {
-        driftOpenTotal = await repo.countOpenForTenant(tenantId);
+        driftOpenTotal += drifts.length;
       }
 
       const proposalsTotal = Object.values(proposalsByType).reduce<number>(

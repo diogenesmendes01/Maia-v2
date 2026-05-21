@@ -238,6 +238,40 @@ describe('tenantsRouter.updateStatus — gate + audit + invariants', () => {
   });
 });
 
+describe('protectedProcedure — tenant suspension enforcement', () => {
+  // Verifies the fix for the Codex review #162 [high] finding: when a founder
+  // suspends a tenant via tenants.updateStatus, NON-founder sessions must stop
+  // working immediately. We exercise this through tenantsRouter.getById since
+  // it's protectedProcedure (not founder-only) and we already have the right
+  // mock surface here.
+  const suspended: Tenant = {
+    id: 'tenant-suspended',
+    nome: 'Suspended Co',
+    status: 'suspended',
+    metadata: {},
+    created_at: new Date(),
+    updated_at: new Date(),
+  };
+
+  it('owner of a suspended tenant gets FORBIDDEN on every protected call', async () => {
+    const repos = makeRepos([suspended]);
+    await expect(
+      caller('owner', 'tenant-suspended', 'u1', repos).getById({
+        id: 'tenant-suspended',
+      }),
+    ).rejects.toMatchObject({ code: 'FORBIDDEN' });
+  });
+
+  it('founder of a suspended tenant CAN still call protected routes (recovery)', async () => {
+    const repos = makeRepos([suspended]);
+    // Founders bypass the suspension check so they can reactivate the tenant.
+    const result = await caller('founder', 'tenant-suspended', 'f1', repos).getById({
+      id: 'tenant-suspended',
+    });
+    expect(result.id).toBe('tenant-suspended');
+  });
+});
+
 describe('tenantsRouter.getById — tenant isolation for non-founders', () => {
   it('owner can read their own tenant', async () => {
     const seed: Tenant = {

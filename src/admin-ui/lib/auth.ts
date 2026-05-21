@@ -45,7 +45,7 @@ import NextAuth from 'next-auth';
 import type { NextAuthConfig, Session } from 'next-auth';
 import type { JWT } from 'next-auth/jwt';
 import CredentialsProvider from 'next-auth/providers/credentials';
-import { appUsersRepo } from '../../db/repositories.js';
+import { appUsersRepo, tenantsRepo } from '../../db/repositories.js';
 import {
   KNOWN_ROLES,
   timingSafeEqual,
@@ -160,6 +160,13 @@ async function resolveOidcAppUser(email: string): Promise<{
     if (!user) continue;
     if (!user.email_verified) continue;
     if (!user.role || !KNOWN_ROLES.has(user.role)) continue;
+    // Codex review #162: refuse OIDC sign-in into a suspended tenant. Founders
+    // get a sign-in path via the dev provider (where applicable) for recovery
+    // operations; here we keep the same posture as protectedProcedure.
+    if (user.role !== 'founder') {
+      const tenantRow = await tenantsRepo.findById(tenant);
+      if (!tenantRow || tenantRow.status !== 'active') continue;
+    }
     return {
       id: user.id,
       email: user.email,

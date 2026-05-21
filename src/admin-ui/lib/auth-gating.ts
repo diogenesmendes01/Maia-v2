@@ -53,6 +53,10 @@ export function devCredentialsProviderEnabled(): boolean {
  *   - OIDC_ISSUER         (e.g. https://login.example.com/realms/maia)
  *   - OIDC_CLIENT_ID
  *   - OIDC_CLIENT_SECRET  (>= 16 chars; rejecting empty/placeholder)
+ *   - OIDC_TENANT_SLUGS   (non-empty comma list; without this every OIDC
+ *                          sign-in resolves to no app_users row and returns
+ *                          AccessDenied — better to not register the provider
+ *                          at all than to expose a broken SSO button).
  *
  * The provider issues a JWT-backed session whose `email` claim is matched
  * against `app_users` rows. A user without a matching app_users row (with
@@ -65,9 +69,14 @@ export function oidcProviderEnabled(): boolean {
   const issuer = process.env.OIDC_ISSUER ?? '';
   const clientId = process.env.OIDC_CLIENT_ID ?? '';
   const clientSecret = process.env.OIDC_CLIENT_SECRET ?? '';
+  const tenantSlugs = (process.env.OIDC_TENANT_SLUGS ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
   if (!issuer || !issuer.startsWith('http')) return false;
   if (!clientId) return false;
   if (clientSecret.length < 16) return false;
+  if (tenantSlugs.length === 0) return false;
   return true;
 }
 

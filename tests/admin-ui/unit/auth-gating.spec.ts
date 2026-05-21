@@ -31,6 +31,7 @@ const TOGGLES = [
   'OIDC_ISSUER',
   'OIDC_CLIENT_ID',
   'OIDC_CLIENT_SECRET',
+  'OIDC_TENANT_SLUGS',
 ] as const;
 
 function snapshotEnv() {
@@ -131,6 +132,7 @@ describe('oidcProviderEnabled — gating', () => {
     process.env.OIDC_ISSUER = 'https://login.example.com/realms/maia';
     process.env.OIDC_CLIENT_ID = 'maia-admin';
     process.env.OIDC_CLIENT_SECRET = 'NOT_A_REAL_SECRET_ok_for_unit_test_only_xx';
+    process.env.OIDC_TENANT_SLUGS = 'acme,default';
   }
 
   it('all three env set ⇒ enabled', () => {
@@ -174,10 +176,23 @@ describe('oidcProviderEnabled — gating', () => {
     expect(oidcProviderEnabled()).toBe(false);
   });
 
+  it('OIDC_TENANT_SLUGS unset ⇒ disabled (prevents SSO-but-AccessDenied UX)', () => {
+    setOidcEnabledEnv();
+    delete process.env.OIDC_TENANT_SLUGS;
+    expect(oidcProviderEnabled()).toBe(false);
+  });
+
+  it('OIDC_TENANT_SLUGS empty/whitespace ⇒ disabled', () => {
+    setOidcEnabledEnv();
+    process.env.OIDC_TENANT_SLUGS = ' , , ';
+    expect(oidcProviderEnabled()).toBe(false);
+  });
+
   it('none of the env vars set ⇒ disabled (no accidental enable)', () => {
     delete process.env.OIDC_ISSUER;
     delete process.env.OIDC_CLIENT_ID;
     delete process.env.OIDC_CLIENT_SECRET;
+    delete process.env.OIDC_TENANT_SLUGS;
     expect(oidcProviderEnabled()).toBe(false);
   });
 });

@@ -89,9 +89,9 @@ export default function CapabilitiesPage() {
           query={proposalsQuery}
           columns={[
             { key: 'title', label: 'Title' },
-            { key: 'risk_level', label: 'Risk' },
+            { key: 'capability_type', label: 'Type' },
             { key: 'status', label: 'Status' },
-            { key: 'created_at', label: 'Created', date: true },
+            { key: 'submitted_at', label: 'Submitted', date: true },
           ]}
           emptyLabel="No pending capability proposals."
         />
@@ -99,9 +99,10 @@ export default function CapabilitiesPage() {
         <SimpleTable
           query={gapsQuery}
           columns={[
-            { key: 'capability_descriptor', label: 'Capability' },
-            { key: 'level', label: 'Level' },
-            { key: 'last_seen_at', label: 'Last seen', date: true },
+            { key: 'capability_description', label: 'Capability' },
+            { key: 'current_level', label: 'Level' },
+            { key: 'tipo', label: 'Type' },
+            { key: 'last_observed', label: 'Last observed', date: true },
           ]}
           emptyLabel="No capability gaps recorded."
         />
@@ -110,8 +111,9 @@ export default function CapabilitiesPage() {
           query={skillsQuery}
           columns={[
             { key: 'domain', label: 'Domain' },
-            { key: 'skill', label: 'Skill' },
-            { key: 'level', label: 'Level' },
+            { key: 'skill_name', label: 'Skill' },
+            { key: 'confidence', label: 'Confidence' },
+            { key: 'evidence_count', label: 'Evidences' },
           ]}
           emptyLabel="No skills cataloged yet."
         />
@@ -120,7 +122,9 @@ export default function CapabilitiesPage() {
           query={domainsQuery}
           columns={[
             { key: 'domain', label: 'Domain' },
-            { key: 'level', label: 'Level' },
+            { key: 'confidence', label: 'Confidence' },
+            { key: 'evidence_count', label: 'Evidences' },
+            { key: 'updated_at', label: 'Updated', date: true },
           ]}
           emptyLabel="No domains cataloged yet."
         />

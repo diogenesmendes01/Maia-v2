@@ -85,6 +85,13 @@ const UpdateProfileInputSchema = z.object({
   proposed_reason: z.string().min(10).max(2000),
 });
 
+const ApproveProfileInputSchema = z.object({
+  tenantId: z.string().optional(),
+  agentId: AgentIdSchema,
+  versionId: z.string().uuid(),
+  comment: z.string().min(10).max(2000),
+});
+
 /**
  * Build a full ProfileBody from the user-supplied subset. `previous_version_id`
  * is null for the seed; for `updateProfile` we pass the current active id (if
@@ -252,6 +259,82 @@ export const agentsRouter = router({
           status: version.status,
         },
         previous_version_id: activeVersion?.id ?? null,
+      };
+    }),
+
+  /**
+   * Approve a `proposed` agent_operational_profile_versions row, transitioning
+   * it to `active`. The agent_operational_profile_versions SoT is not part of
+   * the unified Proposal Inbox in main yet (the inbox enumerates 5 types:
+   * policy_rule / soul_bias / skill / capability_proposal / knowledge_proposal),
+   * so without this direct route the seeded v1 from `create` and every new
+   * proposal from `updateProfile` would stay in 'proposed' forever.
+   *
+   * Codex review #162 (P2): adds a real approval path so setup is reachable.
+   * Architecture-lock semantics are NOT applied here — the operational profile
+   * is per-agent state, not part of the immutable identity_immutable_core. If
+   * we later decide it warrants dual approval, switch this to a Proposal Inbox
+   * source.
+   */
+  approveProfile: protectedProcedure
+    .input(ApproveProfileInputSchema)
+    .mutation(async ({ input, ctx }) => {
+      ctx.assertRole('owner', 'founder');
+      const tenantId = resolveTenantId(ctx, input.tenantId);
+
+      const agent = await ctx.repos.agentsRepo.findById(input.agentId);
+      if (!agent || agent.tenant_id !== tenantId) {
+        throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent not found' });
+      }
+
+      const result = await runWithTenantContext(
+        { tenant_id: tenantId, agent_id: agent.id },
+        async () =>
+          ctx.repos.operationalProfileVersionsRepo.transition({
+            id: input.versionId,
+            to: 'active',
+            approved_by: ctx.userId,
+          }),
+      );
+
+      if (!result.ok) {
+        if (result.reason === 'not_found') {
+          throw new TRPCError({ code: 'NOT_FOUND', message: 'Version not found' });
+        }
+        if (result.reason === 'already_has_active') {
+          throw new TRPCError({
+            code: 'CONFLICT',
+            message: 'Another version is already active; freeze it first',
+          });
+        }
+        throw new TRPCError({
+          code: 'BAD_REQUEST',
+          message: `Invalid transition: ${result.reason}`,
+        });
+      }
+
+      await ctx.repos.adminAuditLogRepo.append({
+        tenant_id: tenantId,
+        actor_id: ctx.userId,
+        actor_role: ctx.userRole,
+        action: 'agent_profile_approve',
+        resource_type: 'agent_operational_profile_version',
+        resource_id: result.updated.id,
+        change_summary: {
+          agent_id: agent.id,
+          version: result.updated.version,
+          previous_status: 'proposed',
+          new_status: result.updated.status,
+          comment: input.comment,
+        },
+      });
+
+      return {
+        version: {
+          id: result.updated.id,
+          version: result.updated.version,
+          status: result.updated.status,
+        },
       };
     }),
 });
