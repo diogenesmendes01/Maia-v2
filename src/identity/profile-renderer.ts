@@ -58,20 +58,64 @@ export function renderOperationalProfile({
 }: {
   version: AgentOperationalProfileVersion;
 }): RenderedProfile {
-  // TODO(v3.1.1 migration): the schema collapsed core_immutable +
-  // operational_profile + episodic_temp + growth_backlog into a single
-  // `profile_body` JSONB. The renderer still consumes the legacy shape;
-  // when migrated, read from `version.profile_body` (typed as ProfileBody).
-  const legacy = (version as unknown) as {
+  // v3.1.1 migration: schema.ts now exposes a single `profile_body` JSONB
+  // column. Migration 061 added the column alongside the four legacy ones
+  // (core_immutable / operational_profile / episodic_temp / growth_backlog)
+  // and best-effort-backfilled it. The renderer prefers the canonical
+  // ProfileBody shape when populated, then falls back to the legacy columns
+  // so existing active profiles keep rendering even before they're rewritten
+  // by the proposal pipeline.
+  const row = version as unknown as {
+    profile_body?: {
+      identity?: {
+        role_descriptor?: unknown;
+        voice?: { tone?: unknown };
+        priorities?: unknown[];
+      };
+    };
     core_immutable?: CoreImmutable;
     operational_profile?: OperationalProfileLayer;
     episodic_temp?: EpisodicTemp;
     growth_backlog?: GrowthBacklog;
   };
-  const core = (legacy.core_immutable ?? {}) as CoreImmutable;
-  const op = (legacy.operational_profile ?? {}) as OperationalProfileLayer;
-  const ep = (legacy.episodic_temp ?? {}) as EpisodicTemp;
-  const bk = (legacy.growth_backlog ?? {}) as GrowthBacklog;
+
+  // Derive legacy-shaped views: prefer the explicit legacy columns when
+  // present (they carry the full original payload including `principles`,
+  // `voice_descriptor`, `thresholds`, etc.). Synthesize from profile_body
+  // only if the row is post-migration and the legacy columns are empty.
+  const body = row.profile_body ?? {};
+  const synthesizedCore: CoreImmutable = {
+    identity_block:
+      typeof body.identity?.role_descriptor === 'string'
+        ? body.identity.role_descriptor
+        : undefined,
+    principles: Array.isArray(body.identity?.priorities)
+      ? body.identity!.priorities
+      : undefined,
+  };
+  const synthesizedOp: OperationalProfileLayer = {
+    voice_descriptor:
+      typeof body.identity?.voice?.tone === 'string'
+        ? body.identity.voice.tone
+        : undefined,
+  };
+
+  const legacyCore = (row.core_immutable ?? {}) as CoreImmutable;
+  const legacyOp = (row.operational_profile ?? {}) as OperationalProfileLayer;
+
+  // "Has any legacy content" guard: if the legacy column carries actual
+  // identity data, use it (preserves principles + thresholds that profile_body
+  // doesn't model). Otherwise fall back to the synthesized view.
+  const hasLegacyCore =
+    typeof legacyCore.identity_block === 'string' ||
+    (Array.isArray(legacyCore.principles) && legacyCore.principles.length > 0);
+  const hasLegacyOp =
+    typeof legacyOp.voice_descriptor === 'string' || legacyOp.thresholds !== undefined;
+
+  const core: CoreImmutable = hasLegacyCore ? legacyCore : synthesizedCore;
+  const op: OperationalProfileLayer = hasLegacyOp ? legacyOp : synthesizedOp;
+  const ep = (row.episodic_temp ?? {}) as EpisodicTemp;
+  const bk = (row.growth_backlog ?? {}) as GrowthBacklog;
 
   // ---- system_prompt_block (sempre presente, nunca null) -------------------
   const lines: string[] = [];

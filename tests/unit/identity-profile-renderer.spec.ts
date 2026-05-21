@@ -278,6 +278,93 @@ describe('renderOperationalProfile', () => {
     expect(result.system_prompt_block).toContain('## Voz operacional');
   });
 
+  // -------------------------------------------------------------------------
+  // Migration-061 / Codex review #163 coverage:
+  // After migration 061 added `profile_body` alongside the legacy columns,
+  // the renderer must still produce the same output for rows with ONLY
+  // legacy data (existing active profiles), AND it must derive a minimum
+  // render from rows that have ONLY profile_body (newly created via the
+  // admin-ui agent setup flow). Mixed rows prefer the explicit legacy
+  // columns because profile_body lacks the legacy-only fields (principles
+  // detail, thresholds, etc.).
+  // -------------------------------------------------------------------------
+
+  it('legacy-only row (pre-061 data) still renders the legacy blocks', () => {
+    const version = buildVersion({
+      core_immutable: {
+        identity_block: 'Você é a Maia.',
+        principles: ['Separação acima de tudo.'],
+      },
+      operational_profile: { voice_descriptor: 'Direta e profissional.' },
+    });
+    const result = renderOperationalProfile({ version });
+    expect(result.system_prompt_block).toContain('Você é a Maia.');
+    expect(result.system_prompt_block).toContain('## Princípios');
+    expect(result.system_prompt_block).toContain('- Separação acima de tudo.');
+    expect(result.system_prompt_block).toContain('## Voz operacional');
+    expect(result.system_prompt_block).toContain('Direta e profissional.');
+  });
+
+  it('profile_body-only row (post-admin-ui setup) renders identity + voice', () => {
+    const version = buildVersion({
+      // Legacy columns are missing (or empty {} from the column DEFAULT after
+      // an old DB ran migration 061). The renderer falls back to profile_body.
+      profile_body: {
+        schema_version: 'v3.1.1-2026-05-15',
+        identity: {
+          role_descriptor: 'Você é a Acme Bot.',
+          voice: { tone: 'caloroso e direto', formality: 'medium', verbosity: 'concise' },
+          cognitive_limits: {
+            max_inference_depth: 3,
+            max_speculation_in_response: 0.2,
+            confidence_floor_for_action: 0.7,
+          },
+          priorities: ['precisao', 'clareza'],
+          learned_voice_modifiers: [],
+        },
+        style: { language: 'pt-BR', rhythm: {} },
+        metadata: { effective_from: '', created_by: 'system', previous_version_id: null },
+      },
+    });
+    const result = renderOperationalProfile({ version });
+    expect(result.system_prompt_block).toContain('Você é a Acme Bot.');
+    expect(result.system_prompt_block).toContain('## Princípios');
+    expect(result.system_prompt_block).toContain('- precisao');
+    expect(result.system_prompt_block).toContain('- clareza');
+    expect(result.system_prompt_block).toContain('## Voz operacional');
+    expect(result.system_prompt_block).toContain('caloroso e direto');
+  });
+
+  it('mixed row (legacy + profile_body) prefers legacy (keeps full payload)', () => {
+    // After migration 061 a row carries BOTH the legacy columns (untouched)
+    // and a backfilled profile_body. The renderer must keep using the legacy
+    // payload because profile_body's best-effort backfill loses things like
+    // operational_profile.thresholds that the legacy column still has.
+    const version = buildVersion({
+      core_immutable: {
+        identity_block: 'Você é a Maia (legacy).',
+        principles: ['Princípio legacy 1', 'Princípio legacy 2'],
+      },
+      operational_profile: {
+        voice_descriptor: 'Voz legacy explícita.',
+        thresholds: { max_inference_depth: 3 },
+      },
+      profile_body: {
+        identity: {
+          role_descriptor: 'Você é a Maia (do profile_body, deve ser ignorada).',
+          voice: { tone: 'tom do profile_body que deve ser ignorado' },
+          priorities: ['this-must-not-render'],
+        },
+      },
+    });
+    const result = renderOperationalProfile({ version });
+    expect(result.system_prompt_block).toContain('Você é a Maia (legacy).');
+    expect(result.system_prompt_block).toContain('Voz legacy explícita.');
+    expect(result.system_prompt_block).toContain('## Parâmetros calibrados');
+    expect(result.system_prompt_block).not.toContain('profile_body');
+    expect(result.system_prompt_block).not.toContain('this-must-not-render');
+  });
+
   it('bonus: null/undefined threshold values are skipped silently', () => {
     const version = buildVersion({
       core_immutable: { identity_block: 'id' },

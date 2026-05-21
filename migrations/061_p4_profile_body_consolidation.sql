@@ -1,31 +1,59 @@
--- P4 (v3.1.1 alignment): consolidate the four legacy JSONB columns
--- (core_immutable, operational_profile, episodic_temp, growth_backlog) into
--- a single `profile_body` JSONB matching the schema.ts definition.
+-- P4 (v3.1.1 alignment): add `profile_body` JSONB alongside the four legacy
+-- columns. This migration is intentionally ADDITIVE — it does NOT drop
+-- `core_immutable`, `operational_profile`, `episodic_temp`, or
+-- `growth_backlog`, because the runtime renderer (`renderOperationalProfile`)
+-- still reads those legacy columns directly from the row.
 --
--- Why this migration exists separately from 025:
---   * Migration 025 was authored when the table had four layers per the
---     original P4 design.
---   * The v3.1.1-2026-05-15 refactor folded them into a single column, and
---     schema.ts + the operationalProfileVersionsRepo were updated, but the
---     SQL migration for the column change was never added — so any fresh
---     `npm run db:migrate` left the table with the old four-column layout
---     while ORM inserts targeted `profile_body`, throwing
---     `column "profile_body" of relation "agent_operational_profile_versions"
---      does not exist`. Surfaced while smoke-testing the admin-ui agent setup
---     flow (PR #162).
+-- Why this migration exists:
+--   * Migration 025 created the table with four legacy JSONB columns
+--     reflecting the original P4 design.
+--   * The v3.1.1-2026-05-15 refactor introduced a consolidated `profile_body`
+--     column in `schema.ts` and `operationalProfileVersionsRepo.create`, but
+--     no SQL migration was ever shipped, so a fresh `npm run db:migrate`
+--     left the table without the new column. Any new INSERT then errored
+--     with `column "profile_body" does not exist`. Surfaced while
+--     smoke-testing the admin-ui agent-setup flow (PR #163).
 --
--- Strategy:
---   1. Add `profile_body` with the immutability-trigger temporarily disabled.
---   2. Backfill existing rows by composing the four legacy columns into the
---      shape ProfileBody expects.
---   3. Drop the four legacy columns.
---   4. Re-enable the trigger.
+-- Why ADDITIVE (Codex review of PR #163, [high]):
+--   The first draft of this migration dropped the legacy columns and
+--   backfilled `profile_body.identity = core_immutable`. That mapping does
+--   NOT produce the canonical ProfileBody shape (identity.role_descriptor,
+--   identity.voice, identity.cognitive_limits, identity.priorities), and
+--   `renderOperationalProfile` still reads the legacy columns by name. Any
+--   legacy active profile would render as a near-empty prompt after the
+--   migration. Keeping the legacy columns preserves the runtime contract
+--   while letting new code write to `profile_body`. A follow-up migration
+--   can drop the legacy columns once the renderer is updated to read from
+--   `profile_body` (or once those rows are re-written by the proposal
+--   pipeline).
+--
+-- Trigger handling: `agent_op_profile_content_immutable_trg` (created in
+-- migration 027) compares `NEW.profile_body` against `OLD.profile_body`.
+-- That works once the column exists; until 061 has run, the trigger was
+-- effectively dormant on legacy DBs because `agent_operational_profile_versions`
+-- is append-only (no UPDATE path triggers it). After 061 the column is
+-- present so the immutability guard becomes functional.
 --
 -- NOTE: no BEGIN/COMMIT — migrate.ts wraps in transaction.
 
--- 1) Detect whether the legacy columns are still present. If profile_body
---    already exists (e.g. someone manually applied this earlier), this
---    migration is a no-op.
+ALTER TABLE agent_operational_profile_versions
+  ADD COLUMN IF NOT EXISTS profile_body JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+-- Best-effort backfill: synthesize a partial ProfileBody from legacy data so
+-- callers that ONLY read `profile_body` (e.g. the new admin-ui flow) have
+-- at least the identity bits populated. The renderer keeps reading legacy
+-- columns; this backfill is a parallel snapshot, not a replacement.
+--
+-- Mapping (best effort — legacy shape is not the canonical ProfileBody shape):
+--   identity.role_descriptor  ← core_immutable.identity_block      (string)
+--   identity.priorities       ← core_immutable.principles          (array)
+--   identity.voice.tone       ← operational_profile.voice_descriptor (string)
+--   style                     ← {} (no legacy equivalent)
+--   metadata                  ← { effective_from: created_at, created_by: proposed_by }
+--
+-- Rows where the legacy columns don't exist (already-migrated DBs) end up
+-- with an empty `profile_body` from the column default — that's fine because
+-- the trigger is disabled during the UPDATE.
 DO $$
 DECLARE
   has_legacy boolean;
@@ -41,38 +69,39 @@ BEGIN
     RETURN;
   END IF;
 
-  -- 2) Add new column with default '{}'. Trigger fires on UPDATE only, so
-  --    ALTER TABLE ADD COLUMN is fine.
-  EXECUTE 'ALTER TABLE agent_operational_profile_versions
-             ADD COLUMN IF NOT EXISTS profile_body JSONB NOT NULL
-                                       DEFAULT ''{}''::jsonb';
-
-  -- 3) Disable the immutability trigger for the backfill UPDATE.
   EXECUTE 'DROP TRIGGER IF EXISTS agent_op_profile_content_immutable_trg
              ON agent_operational_profile_versions';
 
-  -- 4) Backfill: compose ProfileBody from legacy columns. Existing rows
-  --    that don't have a populated operational_profile.style/metadata
-  --    block end up with empty `style` / `metadata` — the runtime will
-  --    treat them as a v3.1.1 profile with the legacy identity preserved.
-  EXECUTE 'UPDATE agent_operational_profile_versions
-              SET profile_body = jsonb_build_object(
-                ''schema_version'', ''v3.1.1-2026-05-15'',
-                ''identity'',        COALESCE(core_immutable, ''{}''::jsonb),
-                ''style'',           COALESCE(operational_profile->''style'', ''{}''::jsonb),
-                ''metadata'',        COALESCE(operational_profile->''metadata'', ''{}''::jsonb)
-              )
-            WHERE profile_body = ''{}''::jsonb';
+  EXECUTE $sql$
+    UPDATE agent_operational_profile_versions
+       SET profile_body = jsonb_build_object(
+         'schema_version', 'v3.1.1-2026-05-15',
+         'identity', jsonb_build_object(
+           'role_descriptor', COALESCE(core_immutable->>'identity_block', ''),
+           'voice', jsonb_build_object(
+             'tone',      COALESCE(operational_profile->>'voice_descriptor', ''),
+             'formality', 'medium',
+             'verbosity', 'medium'
+           ),
+           'cognitive_limits', jsonb_build_object(
+             'max_inference_depth',         3,
+             'max_speculation_in_response', 0.2,
+             'confidence_floor_for_action', 0.7
+           ),
+           'priorities', COALESCE(core_immutable->'principles', '[]'::jsonb),
+           'learned_voice_modifiers', '[]'::jsonb
+         ),
+         'style', jsonb_build_object('language', 'pt-BR', 'rhythm', '{}'::jsonb),
+         'metadata', jsonb_build_object(
+           'effective_from',      COALESCE(activated_at, created_at),
+           'created_by',          proposed_by,
+           'previous_version_id', NULL,
+           'migrated_from_legacy', true
+         )
+       )
+     WHERE profile_body = '{}'::jsonb
+  $sql$;
 
-  -- 5) Drop the four legacy columns.
-  EXECUTE 'ALTER TABLE agent_operational_profile_versions
-             DROP COLUMN core_immutable,
-             DROP COLUMN operational_profile,
-             DROP COLUMN episodic_temp,
-             DROP COLUMN growth_backlog';
-
-  -- 6) Re-create the immutability trigger now that the column shape matches
-  --    the function (which references NEW.profile_body).
   EXECUTE 'CREATE TRIGGER agent_op_profile_content_immutable_trg
              BEFORE UPDATE ON agent_operational_profile_versions
              FOR EACH ROW
