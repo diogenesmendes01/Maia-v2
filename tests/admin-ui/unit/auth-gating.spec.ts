@@ -137,6 +137,7 @@ describe('oidcProviderEnabled — gating', () => {
 
   it('all three env set ⇒ enabled', () => {
     setOidcEnabledEnv();
+    process.env.NODE_ENV = 'development';
     expect(oidcProviderEnabled()).toBe(true);
   });
 
@@ -146,14 +147,16 @@ describe('oidcProviderEnabled — gating', () => {
     expect(oidcProviderEnabled()).toBe(true);
   });
 
-  it('OIDC_ISSUER without http(s) prefix ⇒ disabled', () => {
+  it('DEV: OIDC_ISSUER without http(s) prefix ⇒ disabled (silent in dev)', () => {
     setOidcEnabledEnv();
+    process.env.NODE_ENV = 'development';
     process.env.OIDC_ISSUER = 'login.example.com';
     expect(oidcProviderEnabled()).toBe(false);
   });
 
   it('OIDC_ISSUER unset ⇒ disabled', () => {
     setOidcEnabledEnv();
+    process.env.NODE_ENV = 'development';
     delete process.env.OIDC_ISSUER;
     expect(oidcProviderEnabled()).toBe(false);
   });
@@ -162,17 +165,70 @@ describe('oidcProviderEnabled — gating', () => {
   // pre-fix gate only checked `startsWith('http')` which also matched http://.
   // Misconfigured OIDC_ISSUER=http://... in prod would have registered the
   // provider, leaking redirect URLs, ID tokens, and client credentials.
-  it('PROD: OIDC_ISSUER=http:// ⇒ disabled (cleartext rejected)', () => {
+  //
+  // Codex Adversarial Review on PR #168: in production, an INVALID issuer
+  // must FAIL-FAST (throw) instead of silently returning false. A silent
+  // false here removes the only production auth provider and surfaces as a
+  // generic "no providers configured" screen — operators can't tell whether
+  // OIDC was intentionally unconfigured or accidentally misconfigured.
+  it('PROD: OIDC_ISSUER=http:// ⇒ THROWS (cleartext rejected, fail-fast)', () => {
     setOidcEnabledEnv();
     process.env.NODE_ENV = 'production';
     process.env.OIDC_ISSUER = 'http://idp.internal/realms/maia';
-    expect(oidcProviderEnabled()).toBe(false);
+    expect(() => oidcProviderEnabled()).toThrow(
+      /OIDC_ISSUER must use https:\/\/ in production/,
+    );
+    // Message must surface the offending protocol AND the issuer value so
+    // an operator reading the crash log can immediately see what was set.
+    expect(() => oidcProviderEnabled()).toThrow(/http:\/\//);
+    expect(() => oidcProviderEnabled()).toThrow(/idp\.internal/);
   });
 
-  it('PROD: OIDC_ISSUER=http://localhost ⇒ disabled (no loopback exception in prod)', () => {
+  it('PROD: OIDC_ISSUER=http://localhost ⇒ THROWS (no loopback exception in prod)', () => {
     setOidcEnabledEnv();
     process.env.NODE_ENV = 'production';
     process.env.OIDC_ISSUER = 'http://localhost:8080/realms/maia';
+    expect(() => oidcProviderEnabled()).toThrow(
+      /OIDC_ISSUER must use https:\/\/ in production/,
+    );
+  });
+
+  it('PROD: OIDC_ISSUER malformed (unparseable) ⇒ THROWS (fail-fast, descriptive)', () => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'production';
+    process.env.OIDC_ISSUER = 'not-a-url';
+    expect(() => oidcProviderEnabled()).toThrow(
+      /OIDC_ISSUER is set but is not a valid URL/,
+    );
+    // The bad value should be in the error message so operators can spot it.
+    expect(() => oidcProviderEnabled()).toThrow(/not-a-url/);
+  });
+
+  it('PROD: OIDC_ISSUER=ftp:// ⇒ THROWS (unsupported scheme rejected)', () => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'production';
+    process.env.OIDC_ISSUER = 'ftp://idp.example.com/realms/maia';
+    expect(() => oidcProviderEnabled()).toThrow(
+      /OIDC_ISSUER must use https:\/\/ in production/,
+    );
+  });
+
+  it('PROD: OIDC_ISSUER unset ⇒ false silently (NOT throw — "not configured" is OK)', () => {
+    // Distinguishes "OIDC not configured" (silent) from "OIDC configured but
+    // invalid" (throws). Many prod deployments run without OIDC; we must not
+    // crash them just because the env var is absent.
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'production';
+    delete process.env.OIDC_ISSUER;
+    expect(() => oidcProviderEnabled()).not.toThrow();
+    expect(oidcProviderEnabled()).toBe(false);
+  });
+
+  it('PROD: OIDC_ISSUER="" ⇒ false silently (empty == not configured)', () => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'production';
+    process.env.OIDC_ISSUER = '';
+    expect(() => oidcProviderEnabled()).not.toThrow();
     expect(oidcProviderEnabled()).toBe(false);
   });
 
@@ -180,6 +236,7 @@ describe('oidcProviderEnabled — gating', () => {
     setOidcEnabledEnv();
     process.env.NODE_ENV = 'production';
     process.env.OIDC_ISSUER = 'https://idp.internal/realms/maia';
+    expect(() => oidcProviderEnabled()).not.toThrow();
     expect(oidcProviderEnabled()).toBe(true);
   });
 
@@ -211,16 +268,21 @@ describe('oidcProviderEnabled — gating', () => {
     expect(oidcProviderEnabled()).toBe(false);
   });
 
-  it('OIDC_ISSUER malformed (unparseable) ⇒ disabled (no throw)', () => {
+  it('DEV: OIDC_ISSUER malformed (unparseable) ⇒ disabled (no throw, silent in dev)', () => {
+    // Dev/test preserves the silent fail-closed behavior so local iteration
+    // and unit tests that intentionally exercise invalid configs don't crash.
     setOidcEnabledEnv();
+    process.env.NODE_ENV = 'development';
     process.env.OIDC_ISSUER = 'not a url ::::';
     expect(() => oidcProviderEnabled()).not.toThrow();
     expect(oidcProviderEnabled()).toBe(false);
   });
 
-  it('OIDC_ISSUER with unsupported scheme (e.g. ftp://) ⇒ disabled', () => {
+  it('DEV: OIDC_ISSUER with unsupported scheme (e.g. ftp://) ⇒ disabled (silent)', () => {
     setOidcEnabledEnv();
+    process.env.NODE_ENV = 'development';
     process.env.OIDC_ISSUER = 'ftp://idp.example.com/realms/maia';
+    expect(() => oidcProviderEnabled()).not.toThrow();
     expect(oidcProviderEnabled()).toBe(false);
   });
 

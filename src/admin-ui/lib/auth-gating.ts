@@ -70,6 +70,21 @@ export function devCredentialsProviderEnabled(): boolean {
  * authorization fail-closed even after authentication succeeds.
  *
  * Works in any NODE_ENV (development as well, for local OIDC testing).
+ *
+ * Fail-mode contract (Codex Adversarial Review on PR #168):
+ *
+ *   - `OIDC_ISSUER` empty/unset
+ *       → "not configured" → returns `false` silently (intentional: many
+ *         deployments don't run OIDC, the dev CredentialsProvider covers them).
+ *   - `OIDC_ISSUER` set but INVALID (unparseable, wrong scheme, cleartext)
+ *       in `NODE_ENV === 'production'`
+ *       → "configured but broken" → THROWS with a descriptive message so the
+ *         admin-ui crashes at startup rather than silently dropping the only
+ *         production auth provider and leaving operators with a generic
+ *         "no providers configured" screen.
+ *   - `OIDC_ISSUER` set but INVALID in dev/test
+ *       → returns `false` silently. Test suites and local dev frequently
+ *         exercise the invalid-config branches; we don't want to crash them.
  */
 export function oidcProviderEnabled(): boolean {
   const issuer = process.env.OIDC_ISSUER ?? '';
@@ -79,19 +94,45 @@ export function oidcProviderEnabled(): boolean {
     .split(',')
     .map((s) => s.trim())
     .filter((s) => s.length > 0);
+  // Empty/unset issuer = "OIDC not configured for this deployment". Always
+  // silent: this is the expected state for any non-OIDC install.
   if (!issuer) return false;
-  // Validate parseability AND scheme. `new URL` throws TypeError for malformed
-  // input — catch and fail-closed rather than crashing provider registration.
+
+  const isProd = process.env.NODE_ENV === 'production';
+
+  // Validate parseability. `new URL` throws TypeError for malformed input —
+  // in prod that's a misconfiguration we MUST surface; in dev we tolerate it.
   let url: URL;
   try {
     url = new URL(issuer);
   } catch {
+    if (isProd) {
+      throw new Error(
+        `P8.5 auth: OIDC_ISSUER is set but is not a valid URL ` +
+          `(received: ${JSON.stringify(issuer)}). ` +
+          `Refusing to boot — set OIDC_ISSUER to a parseable https:// URL ` +
+          `or unset it entirely to disable the OIDC provider. See issue #167.`,
+      );
+    }
     return false;
   }
-  if (process.env.NODE_ENV === 'production') {
+
+  if (isProd) {
     // Production: https:// only. No exceptions — cleartext leaks redirect
     // URLs, ID tokens, and client credentials to any network observer.
-    if (url.protocol !== 'https:') return false;
+    // Fail-fast (not silent) so a typo in OIDC_ISSUER doesn't quietly remove
+    // the only production auth provider and surface as "no providers".
+    if (url.protocol !== 'https:') {
+      throw new Error(
+        `P8.5 auth: OIDC_ISSUER must use https:// in production ` +
+          `(received protocol: ${url.protocol.replace(':', '')}://, ` +
+          `issuer: ${issuer}). ` +
+          `Refusing to boot — cleartext OIDC leaks redirect URLs, ID tokens, ` +
+          `and client credentials to any on-path observer. ` +
+          `Either set OIDC_ISSUER to an https:// URL or unset it entirely ` +
+          `to disable the OIDC provider. See issue #167.`,
+      );
+    }
   } else {
     // Dev/test: https:// always OK; http:// only for loopback hosts so a
     // local IdP (Keycloak, dex, etc.) can be exercised without TLS.
