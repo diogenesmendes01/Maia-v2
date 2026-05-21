@@ -100,6 +100,20 @@ BEGIN
 
     -- Backfill: build profile_body from legacy data with the direct-embed
     -- contract (matches what proposal-generator writes).
+    --
+    -- IMPORTANT: priorities[] is intentionally left as an empty array even
+    -- when core_immutable.principles is non-empty (Codex review #163 round 6,
+    -- [P2]). The follow-up `scripts/p8d-migration-priorities.ts` is the
+    -- canonical writer for priorities — it slug-extracts from
+    -- maia-prompt.md and treats any non-empty identity.priorities array as
+    -- "already migrated, skip". Prefilling priorities with the full
+    -- human-readable principles strings here would lock those rows out of
+    -- the slug migration and leave non-slug priorities flowing into the
+    -- context packet + papel-drift path. Keeping priorities empty preserves
+    -- the contract: legacy principles stay reachable via
+    -- profile_body.core_immutable.principles (direct-embed) AND
+    -- profile_body.identity.principles for renderers; identity.priorities
+    -- waits for the slug migration.
     EXECUTE $sql$
       UPDATE agent_operational_profile_versions
          SET profile_body = jsonb_build_object(
@@ -118,7 +132,9 @@ BEGIN
                'max_speculation_in_response', 0.2,
                'confidence_floor_for_action', 0.7
              ),
-             'priorities', COALESCE(core_immutable->'principles', '[]'::jsonb),
+             -- Empty array — see comment above; p8d-migration-priorities
+             -- is the canonical writer for slug-extracted priorities.
+             'priorities', '[]'::jsonb,
              'learned_voice_modifiers', '[]'::jsonb
            ),
            'style', jsonb_build_object('language', 'pt-BR', 'rhythm', '{}'::jsonb),

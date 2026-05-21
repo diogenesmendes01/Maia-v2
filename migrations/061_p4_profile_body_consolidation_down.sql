@@ -1,34 +1,40 @@
--- Reverse of 061: drop `profile_body` and restore an append-only guard for
--- the legacy content columns that remain on the table.
+-- Reverse of 061: backfill legacy content columns from profile_body, then
+-- drop profile_body and restore an append-only guard for the legacy columns.
 --
--- Why we install a legacy-only trigger (Codex review #163 round 5, [medium]):
---   The naive rollback path just drops the immutability trigger and the
---   profile_body column. That leaves the four legacy content columns
---   (core_immutable / operational_profile / episodic_temp / growth_backlog)
---   physically present BUT unguarded — direct SQL could rewrite
---   operational identity content without appending a new version or audit
---   trail.
+-- Why we backfill BEFORE dropping (Codex review #163 round 6, [high]):
+--   After 061 lands, every new row written by
+--   `operationalProfileVersionsRepo.create` carries data only inside
+--   `profile_body` (the legacy columns get the column default `'{}'::jsonb`).
+--   A naive `DROP COLUMN profile_body` would erase those rows' identity
+--   payload entirely — runtime renderer + drift detectors would see blank
+--   content for any profile version created post-061.
 --
---   To preserve the append-only invariant across the rollback, we install
---   a legacy-only variant of the immutability function (the one migration
---   027 would have installed if profile_body had never existed).
+--   Strategy: before the DROP, copy the direct-embed legacy keys back into
+--   the four legacy columns. For canonical-only rows (no direct-embed but
+--   `profile_body.identity` populated), synthesize plausible legacy values
+--   from canonical identity.* — same lossy mapping the resolver uses in
+--   reverse, so at minimum identity_block, principles, voice_descriptor,
+--   and thresholds survive the rollback.
 --
--- Symmetry with 061: the up migration picks the function body based on
--- whether the legacy columns exist; down does the same so it works on
--- either a "full" post-061 schema or a "post-067-drops-legacy" future
--- schema (where the rollback is a no-op for content guards).
+-- Why we install a legacy-only append-only trigger (Codex review #163
+-- round 5, [medium]):
+--   Without it, direct SQL could mutate core_immutable / operational_profile
+--   / episodic_temp / growth_backlog on the post-rollback schema, breaking
+--   the append-only invariant.
 --
 -- NOTE: no BEGIN/COMMIT — migrate.ts wraps in transaction.
 
 DO $outer$
 DECLARE
   has_legacy boolean;
+  has_profile_body boolean;
 BEGIN
-  EXECUTE 'DROP TRIGGER IF EXISTS agent_op_profile_content_immutable_trg
-             ON agent_operational_profile_versions';
-
-  EXECUTE 'ALTER TABLE agent_operational_profile_versions
-             DROP COLUMN IF EXISTS profile_body';
+  SELECT EXISTS (
+    SELECT 1
+      FROM information_schema.columns
+     WHERE table_name = 'agent_operational_profile_versions'
+       AND column_name = 'profile_body'
+  ) INTO has_profile_body;
 
   SELECT EXISTS (
     SELECT 1
@@ -37,10 +43,79 @@ BEGIN
        AND column_name = 'core_immutable'
   ) INTO has_legacy;
 
+  EXECUTE 'DROP TRIGGER IF EXISTS agent_op_profile_content_immutable_trg
+             ON agent_operational_profile_versions';
+
+  -- (1) Backfill the legacy content columns from profile_body before the
+  -- DROP, so post-061 rows don't lose their identity payload on rollback.
+  IF has_profile_body AND has_legacy THEN
+    EXECUTE $sql$
+      UPDATE agent_operational_profile_versions
+         SET core_immutable = CASE
+               -- Prefer the direct-embed mirror that migration 061 + the
+               -- proposal-generator both write.
+               WHEN profile_body->'core_immutable' IS NOT NULL
+                AND profile_body->'core_immutable' <> '{}'::jsonb
+                 THEN profile_body->'core_immutable'
+               -- Fallback: synthesize from canonical identity.*. Lossy but
+               -- preserves identity_block + principles for the renderer.
+               WHEN profile_body->'identity' IS NOT NULL
+                 THEN jsonb_build_object(
+                   'identity_block', COALESCE(
+                     profile_body->'identity'->>'identity_block',
+                     profile_body->'identity'->>'role_descriptor',
+                     ''
+                   ),
+                   'principles', COALESCE(
+                     profile_body->'identity'->'principles',
+                     profile_body->'identity'->'priorities',
+                     '[]'::jsonb
+                   )
+                 )
+               ELSE core_immutable
+             END,
+             operational_profile = CASE
+               WHEN profile_body->'operational_profile' IS NOT NULL
+                AND profile_body->'operational_profile' <> '{}'::jsonb
+                 THEN profile_body->'operational_profile'
+               WHEN profile_body->'identity'->'voice' IS NOT NULL
+                 THEN jsonb_build_object(
+                   'voice_descriptor', COALESCE(
+                     profile_body->'identity'->'voice'->>'tone',
+                     ''
+                   ),
+                   'thresholds', COALESCE(
+                     profile_body->'identity'->'cognitive_limits',
+                     '{}'::jsonb
+                   )
+                 )
+               ELSE operational_profile
+             END,
+             episodic_temp = CASE
+               WHEN profile_body->'episodic_temp' IS NOT NULL
+                AND profile_body->'episodic_temp' <> '{}'::jsonb
+                 THEN profile_body->'episodic_temp'
+               ELSE episodic_temp
+             END,
+             growth_backlog = CASE
+               WHEN profile_body->'growth_backlog' IS NOT NULL
+                AND jsonb_typeof(profile_body->'growth_backlog') = 'array'
+                AND jsonb_array_length(profile_body->'growth_backlog') > 0
+                 THEN profile_body->'growth_backlog'
+               ELSE growth_backlog
+             END
+       WHERE profile_body IS NOT NULL
+         AND profile_body <> '{}'::jsonb
+    $sql$;
+  END IF;
+
+  -- (2) Drop the profile_body column.
+  EXECUTE 'ALTER TABLE agent_operational_profile_versions
+             DROP COLUMN IF EXISTS profile_body';
+
+  -- (3) Reinstall an append-only guard for the legacy columns so the
+  -- post-rollback table preserves the invariant.
   IF has_legacy THEN
-    -- Install a legacy-only append-only function and re-attach the trigger.
-    -- Matches the invariant the table had before v3.1.1 introduced
-    -- profile_body, just expressed against the four legacy content columns.
     EXECUTE $fn$
       CREATE OR REPLACE FUNCTION agent_op_profile_content_immutable()
       RETURNS trigger AS $body$
