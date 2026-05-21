@@ -53,24 +53,52 @@ type EpisodicTemp = {
 type GrowthBacklogItemObject = { descricao?: unknown };
 type GrowthBacklog = unknown[] | { items?: unknown[] };
 
+// Treat `{}` and `[]` as "no content" so the renderer doesn't lock in the
+// empty-default legacy_mirror over a populated canonical profile_body. A
+// shallow check is enough — both legacy and canonical shapes are plain
+// JSONB and a non-empty object/array carries at least one key/element.
+function hasAnyContent(v: unknown): boolean {
+  if (v == null) return false;
+  if (Array.isArray(v)) return v.length > 0;
+  if (typeof v === 'object') return Object.keys(v as object).length > 0;
+  return true;
+}
+
 export function renderOperationalProfile({
   version,
 }: {
   version: AgentOperationalProfileVersion;
 }): RenderedProfile {
-  // v3.1.1 migration: schema.ts now exposes a single `profile_body` JSONB
-  // column. Migration 061 added the column alongside the four legacy ones
-  // (core_immutable / operational_profile / episodic_temp / growth_backlog)
-  // and best-effort-backfilled it. The renderer prefers the canonical
-  // ProfileBody shape when populated, then falls back to the legacy columns
-  // so existing active profiles keep rendering even before they're rewritten
-  // by the proposal pipeline.
+  // v3.1.1 migration (migration 061 + Codex review #163 round 2):
+  //
+  // schema.ts only declares `profile_body` on this table, so
+  // `operationalProfileVersionsRepo.getActive()` (Drizzle `.select().from(...)`)
+  // returns rows that carry ONLY profile_body — the four legacy columns are
+  // physically present in the DB but invisible to the ORM. Reading
+  // `version.core_immutable` from a Drizzle-shaped row is therefore dead
+  // code in production.
+  //
+  // Migration 061 embeds the legacy payload at `profile_body.legacy_mirror`
+  // so the renderer can reach it through the Drizzle row. We prefer that
+  // embedded mirror when present (preserves `principles`, `voice_descriptor`,
+  // `thresholds`, episodic and growth_backlog content), and fall back to
+  // the canonical ProfileBody shape (newly-created rows from the admin-ui
+  // agent setup flow that have no legacy data to mirror).
+  //
+  // Top-level row.core_immutable/etc. is checked LAST as a belt-and-braces
+  // for tests/fixtures that hand-construct a non-Drizzle shape.
   const row = version as unknown as {
     profile_body?: {
       identity?: {
         role_descriptor?: unknown;
         voice?: { tone?: unknown };
         priorities?: unknown[];
+      };
+      legacy_mirror?: {
+        core_immutable?: CoreImmutable;
+        operational_profile?: OperationalProfileLayer;
+        episodic_temp?: EpisodicTemp;
+        growth_backlog?: GrowthBacklog;
       };
     };
     core_immutable?: CoreImmutable;
@@ -79,11 +107,11 @@ export function renderOperationalProfile({
     growth_backlog?: GrowthBacklog;
   };
 
-  // Derive legacy-shaped views: prefer the explicit legacy columns when
-  // present (they carry the full original payload including `principles`,
-  // `voice_descriptor`, `thresholds`, etc.). Synthesize from profile_body
-  // only if the row is post-migration and the legacy columns are empty.
   const body = row.profile_body ?? {};
+  const mirror = body.legacy_mirror ?? {};
+
+  // Synthesize a legacy-shaped view from canonical profile_body for rows
+  // that have NO legacy_mirror (newly-created via admin-ui).
   const synthesizedCore: CoreImmutable = {
     identity_block:
       typeof body.identity?.role_descriptor === 'string'
@@ -100,22 +128,34 @@ export function renderOperationalProfile({
         : undefined,
   };
 
-  const legacyCore = (row.core_immutable ?? {}) as CoreImmutable;
-  const legacyOp = (row.operational_profile ?? {}) as OperationalProfileLayer;
+  // Priority order for each section:
+  //   1. profile_body.legacy_mirror.* — what migration 061 stored
+  //   2. top-level row.* — test fixtures / non-Drizzle paths
+  //   3. synthesized from canonical profile_body.identity.* — pure new rows
+  function pickWithMirror<T extends object>(
+    mirrorVal: T | undefined,
+    topVal: T | undefined,
+    synthesized: T,
+  ): T {
+    if (mirrorVal && hasAnyContent(mirrorVal)) return mirrorVal;
+    if (topVal && hasAnyContent(topVal)) return topVal;
+    return synthesized;
+  }
 
-  // "Has any legacy content" guard: if the legacy column carries actual
-  // identity data, use it (preserves principles + thresholds that profile_body
-  // doesn't model). Otherwise fall back to the synthesized view.
-  const hasLegacyCore =
-    typeof legacyCore.identity_block === 'string' ||
-    (Array.isArray(legacyCore.principles) && legacyCore.principles.length > 0);
-  const hasLegacyOp =
-    typeof legacyOp.voice_descriptor === 'string' || legacyOp.thresholds !== undefined;
-
-  const core: CoreImmutable = hasLegacyCore ? legacyCore : synthesizedCore;
-  const op: OperationalProfileLayer = hasLegacyOp ? legacyOp : synthesizedOp;
-  const ep = (row.episodic_temp ?? {}) as EpisodicTemp;
-  const bk = (row.growth_backlog ?? {}) as GrowthBacklog;
+  const core = pickWithMirror<CoreImmutable>(
+    mirror.core_immutable,
+    row.core_immutable,
+    synthesizedCore,
+  );
+  const op = pickWithMirror<OperationalProfileLayer>(
+    mirror.operational_profile,
+    row.operational_profile,
+    synthesizedOp,
+  );
+  const ep =
+    (mirror.episodic_temp ?? row.episodic_temp ?? ({} as EpisodicTemp));
+  const bk =
+    (mirror.growth_backlog ?? row.growth_backlog ?? ([] as GrowthBacklog));
 
   // ---- system_prompt_block (sempre presente, nunca null) -------------------
   const lines: string[] = [];
