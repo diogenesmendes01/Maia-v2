@@ -3,6 +3,11 @@ const nextConfig = {
   reactStrictMode: true,
   swcMinify: true,
   pageExtensions: ['ts', 'tsx'],
+  // `standalone` lets the production Dockerfile copy a minimal Node runtime
+  // (`.next/standalone/server.js` + its node_modules subset) into a small
+  // image instead of dragging the full repo's node_modules. Required by
+  // the dedicated admin-ui container for Coolify (`src/admin-ui/Dockerfile`).
+  output: 'standalone',
   experimental: {
     serverActions: {
       allowedOrigins: ['localhost:4000', 'localhost:3000'],
