@@ -16,16 +16,19 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { DriftType, DriftSeverity, DriftDecision } from '@/types/enums.js';
 import type { DriftEvidence } from '@/cognition/drift/types.js';
 
-const { transitionMock, createAlertMock, getActiveContextForAgentMock } = vi.hoisted(() => ({
+const TENANT_ID = 'tenant-unit-1';
+const AGENT_ID = 'agent-unit-1';
+
+const { transitionMock, createAlertMock, escalateRollbackIfStillFrozenMock } = vi.hoisted(() => ({
   transitionMock: vi.fn(),
   createAlertMock: vi.fn(),
-  getActiveContextForAgentMock: vi.fn(),
+  escalateRollbackIfStillFrozenMock: vi.fn(),
 }));
 
 vi.mock('@/db/repositories.js', () => ({
   operationalProfileVersionsRepo: {
     transition: transitionMock,
-    getActiveContextForAgent: getActiveContextForAgentMock,
+    escalateRollbackIfStillFrozen: escalateRollbackIfStillFrozenMock,
   },
   driftAlertsRepo: {
     create: createAlertMock,
@@ -33,6 +36,20 @@ vi.mock('@/db/repositories.js', () => ({
 }));
 
 import { decideAndApply, classifySeverity } from '@/cognition/drift/decision-engine.js';
+import { runWithTenantContext } from '@/db/tenant-context.js';
+
+/**
+ * Wrapper that runs `decideAndApply` inside a `runWithTenantContext` scope —
+ * required after PR #196 round 2 because the engine pulls tenant/agent from
+ * AsyncLocalStorage to call the new atomic `escalateRollbackIfStillFrozen`
+ * repo method.
+ */
+async function runDecideAndApply(args: Parameters<typeof decideAndApply>[0]) {
+  return await runWithTenantContext(
+    { tenant_id: TENANT_ID, agent_id: AGENT_ID },
+    async () => decideAndApply(args),
+  );
+}
 
 function makeEvidence(
   drift_type: DriftType,
@@ -250,13 +267,13 @@ describe('decideAndApply', () => {
   beforeEach(() => {
     transitionMock.mockReset();
     createAlertMock.mockReset();
-    getActiveContextForAgentMock.mockReset();
+    escalateRollbackIfStillFrozenMock.mockReset();
     defaultAlertMockImpl();
   });
 
   it('baixo (TOM, examples.length=1) → auto_approved, applied=false, alert criado, sem chamar transition', async () => {
     const ev = makeEvidence(DriftType.TOM, { examples: ['x'] }, 'um exemplo');
-    const out = await decideAndApply({
+    const out = await runDecideAndApply({
       evidences: [ev],
       active_profile_id: PROFILE_ID,
     });
@@ -284,7 +301,7 @@ describe('decideAndApply', () => {
 
   it('medio (TOM, examples.length=2) → queued_human, applied=false, alert criado, sem transition', async () => {
     const ev = makeEvidence(DriftType.TOM, { examples: ['a', 'b'] });
-    const out = await decideAndApply({
+    const out = await runDecideAndApply({
       evidences: [ev],
       active_profile_id: PROFILE_ID,
     });
@@ -301,7 +318,7 @@ describe('decideAndApply', () => {
       examples: ['a', 'b', 'c'],
       severity_hint: 'alto',
     });
-    const out = await decideAndApply({
+    const out = await runDecideAndApply({
       evidences: [ev],
       active_profile_id: PROFILE_ID,
     });
@@ -328,7 +345,7 @@ describe('decideAndApply', () => {
       { offensive: true },
       'mensagem ofensiva detectada',
     );
-    const out = await decideAndApply({
+    const out = await runDecideAndApply({
       evidences: [ev],
       active_profile_id: PROFILE_ID,
     });
@@ -350,7 +367,7 @@ describe('decideAndApply', () => {
   it('CONFIANCA max_gap=0.8 → critico → rollback', async () => {
     transitionOk();
     const ev = makeEvidence(DriftType.CONFIANCA, { max_gap: 0.8 });
-    const out = await decideAndApply({
+    const out = await runDecideAndApply({
       evidences: [ev],
       active_profile_id: PROFILE_ID,
     });
@@ -362,7 +379,7 @@ describe('decideAndApply', () => {
   it('VALORES violated_principles=[0] → alto → frozen', async () => {
     transitionOk();
     const ev = makeEvidence(DriftType.VALORES, { violated_principles: [0] });
-    const out = await decideAndApply({
+    const out = await runDecideAndApply({
       evidences: [ev],
       active_profile_id: PROFILE_ID,
     });
@@ -376,7 +393,7 @@ describe('decideAndApply', () => {
     const ev = makeEvidence(DriftType.ESCOPO, {
       unfulfillable_promises: ['a', 'b', 'c', 'd'],
     });
-    const out = await decideAndApply({
+    const out = await runDecideAndApply({
       evidences: [ev],
       active_profile_id: PROFILE_ID,
     });
@@ -390,7 +407,7 @@ describe('decideAndApply', () => {
       count: 2,
       any_active: true,
     });
-    const out = await decideAndApply({
+    const out = await runDecideAndApply({
       evidences: [ev],
       active_profile_id: PROFILE_ID,
     });
@@ -401,7 +418,7 @@ describe('decideAndApply', () => {
   it('transition retorna invalid_transition → applied=false + applied_error="invalid_transition", alert ainda criado', async () => {
     transitionMock.mockResolvedValue({ ok: false, reason: 'invalid_transition' });
     const ev = makeEvidence(DriftType.VALORES, { violated_principles: [0] });
-    const out = await decideAndApply({
+    const out = await runDecideAndApply({
       evidences: [ev],
       active_profile_id: PROFILE_ID,
     });
@@ -420,7 +437,7 @@ describe('decideAndApply', () => {
       severity_hint: 'alto',
     });
     const ev2 = makeEvidence(DriftType.TOM, { examples: ['x', 'y'] });
-    const out = await decideAndApply({
+    const out = await runDecideAndApply({
       evidences: [ev1, ev2],
       active_profile_id: PROFILE_ID,
     });
@@ -464,7 +481,7 @@ describe('decideAndApply', () => {
       'critico evidence',
     );
 
-    const out = await decideAndApply({
+    const out = await runDecideAndApply({
       evidences: [evAlto, evCritico],
       active_profile_id: PROFILE_ID,
     });
@@ -512,7 +529,7 @@ describe('decideAndApply', () => {
       'alto evidence',
     );
 
-    const out = await decideAndApply({
+    const out = await runDecideAndApply({
       evidences: [evCritico, evAlto],
       active_profile_id: PROFILE_ID,
     });
@@ -547,7 +564,7 @@ describe('decideAndApply', () => {
       'alto 2',
     );
 
-    const out = await decideAndApply({
+    const out = await runDecideAndApply({
       evidences: [ev1, ev2],
       active_profile_id: PROFILE_ID,
     });
@@ -568,7 +585,7 @@ describe('decideAndApply', () => {
     const ev2 = makeEvidence(DriftType.LINGUAGEM, { offensive: true }, 'critico');
     const ev3 = makeEvidence(DriftType.VALORES, { violated_principles: [1] }, 'alto 2');
 
-    const out = await decideAndApply({
+    const out = await runDecideAndApply({
       evidences: [ev1, ev2, ev3],
       active_profile_id: PROFILE_ID,
     });
@@ -588,7 +605,7 @@ describe('decideAndApply', () => {
   it('batch collapse: single evidence (alto sozinho) → comportamento atual preservado (applied=true, sem superseded_by)', async () => {
     transitionOk();
     const ev = makeEvidence(DriftType.VALORES, { violated_principles: [0] });
-    const out = await decideAndApply({
+    const out = await runDecideAndApply({
       evidences: [ev],
       active_profile_id: PROFILE_ID,
     });
@@ -606,7 +623,7 @@ describe('decideAndApply', () => {
     const evAlto = makeEvidence(DriftType.VALORES, { violated_principles: [0] });
     const evMedio = makeEvidence(DriftType.TOM, { examples: ['a', 'b'] });
 
-    const out = await decideAndApply({
+    const out = await runDecideAndApply({
       evidences: [evBaixo, evAlto, evMedio],
       active_profile_id: PROFILE_ID,
     });
@@ -635,7 +652,7 @@ describe('decideAndApply', () => {
       'valores critico',
     );
 
-    const out = await decideAndApply({
+    const out = await runDecideAndApply({
       evidences: [evSoul, evValores],
       active_profile_id: PROFILE_ID,
     });
@@ -688,7 +705,7 @@ describe('decideAndApply', () => {
       'critico evidence',
     );
 
-    const out = await decideAndApply({
+    const out = await runDecideAndApply({
       evidences: [evAlto, evCritico],
       active_profile_id: PROFILE_ID,
     });
@@ -728,7 +745,7 @@ describe('decideAndApply', () => {
     const evCritico = makeEvidence(DriftType.LINGUAGEM, { offensive: true }, 'critico');
     const evAlto2 = makeEvidence(DriftType.VALORES, { violated_principles: [1] }, 'alto 2');
 
-    const out = await decideAndApply({
+    const out = await runDecideAndApply({
       evidences: [evAlto1, evCritico, evAlto2],
       active_profile_id: PROFILE_ID,
     });
@@ -763,7 +780,7 @@ describe('decideAndApply', () => {
     const evAlto = makeEvidence(DriftType.VALORES, { violated_principles: [0] });
     const evCritico = makeEvidence(DriftType.LINGUAGEM, { offensive: true });
 
-    const out = await decideAndApply({
+    const out = await runDecideAndApply({
       evidences: [evAlto, evCritico],
       active_profile_id: PROFILE_ID,
     });
@@ -792,7 +809,7 @@ describe('decideAndApply', () => {
 
     const evCritico = makeEvidence(DriftType.LINGUAGEM, { offensive: true });
 
-    const out = await decideAndApply({
+    const out = await runDecideAndApply({
       evidences: [evCritico],
       active_profile_id: PROFILE_ID,
     });
@@ -823,7 +840,7 @@ describe('decideAndApply', () => {
     const evAlto2 = makeEvidence(DriftType.VALORES, { violated_principles: [1] }, 'alto2');
     const evCritico = makeEvidence(DriftType.LINGUAGEM, { offensive: true }, 'critico');
 
-    const out = await decideAndApply({
+    const out = await runDecideAndApply({
       evidences: [evAlto1, evAlto2, evCritico],
       active_profile_id: PROFILE_ID,
     });
@@ -849,7 +866,7 @@ describe('decideAndApply', () => {
 
   it('severity baixo NÃO chama repo.transition (verificado via mock counter)', async () => {
     const ev = makeEvidence(DriftType.LINGUAGEM, { offensive: false });
-    await decideAndApply({
+    await runDecideAndApply({
       evidences: [ev],
       active_profile_id: PROFILE_ID,
     });
@@ -867,7 +884,7 @@ describe('decideAndApply', () => {
 
     const ev1 = makeEvidence(DriftType.TOM, { examples: ['a'] });
     const ev2 = makeEvidence(DriftType.LINGUAGEM, { offensive: false });
-    const out = await decideAndApply({
+    const out = await runDecideAndApply({
       evidences: [ev1, ev2],
       active_profile_id: PROFILE_ID,
     });
@@ -885,7 +902,7 @@ describe('decideAndApply', () => {
   it('transition LANÇA erro (não retorna ok:false) → applied=false, applied_error tem a mensagem, alert ainda criado', async () => {
     transitionMock.mockRejectedValueOnce(new Error('db timeout'));
     const ev = makeEvidence(DriftType.VALORES, { violated_principles: [0] });
-    const out = await decideAndApply({
+    const out = await runDecideAndApply({
       evidences: [ev],
       active_profile_id: PROFILE_ID,
     });
@@ -905,33 +922,28 @@ describe('decideAndApply', () => {
   // `expected_from='active'` guard demotes its rollback to `applied=false`.
   // The critical drift ends up `frozen` instead of `rolled_back`.
   //
-  // Codex Adversarial Review of PR #196 round 1 — refetch semantics. The
-  // earlier round 4 helper queried `WHERE status='active'`, so in the exact
-  // race the patch was meant to handle (target row frozen, no replacement),
-  // it returned null and the engine took the `active_replaced` skip path,
-  // dropping the rollback in the scenario the escalation was designed to
-  // recover. The new helper (`getActiveContextForAgent`) reports current
-  // active-slot occupancy; the engine combines it with the original
-  // `profileId` and distinguishes:
-  //   - active_profile_id === null → target frozen, no replacement.
-  //     ESCALATE via `transition({to:'rolled_back', expected_from:'frozen'})`.
-  //     Log `drift.rollback.escalated`.
-  //   - active_profile_id !== null && !== profileId → replacement seeded.
-  //     SKIP with `drift.skip.active_replaced`.
-  //   - active_profile_id === profileId → defensive (not a legal edge
-  //     today). SKIP with `drift.skip.refetch_anomaly`.
-  //   - retry also stale/terminal → log `drift.skip.terminal_state`.
+  // Codex Adversarial Review of PR #196 round 2 — TOCTOU under one lock. The
+  // round-1 fix split the escalation into a refetch + a separate retry; the
+  // two reads ran outside any shared lock, so a concurrent `seedNewActiveAtomic`
+  // could promote a new v2 between them (rollback applied to wrong row) or
+  // the target itself could be re-activated. The engine now calls a single
+  // atomic repo method (`escalateRollbackIfStillFrozen`) that re-reads
+  // target + active slot under `lockParentAgent` FOR UPDATE before committing
+  // the rollback. Five typed outcomes drive the engine:
+  //   - ok                  → drift.rollback.escalated, applied=true
+  //   - replaced            → drift.skip.active_replaced
+  //   - reactivated (new!)  → drift.skip.reactivated
+  //   - terminal_state      → drift.skip.terminal_state
+  //   - target_missing      → drift.skip.target_missing warn
 
-  it('PR #196 escalation: critico race vs concurrent freeze (no replacement) → retry with expected_from=frozen succeeds', async () => {
-    // CASE A: an `alto` batch from another invocation froze v1 between this
-    // engine's pre-lock read and the actual transition call. The first
-    // transition (to:'rolled_back', expected_from:'active') comes back
-    // stale with actual='frozen'. The engine then re-fetches active
-    // context. In the real DB the helper does `SELECT WHERE
-    // status='active'`, so a frozen target with no replacement returns
-    // null (the previous round's mock used the impossible `PROFILE_ID`
-    // value, which masked the bug Codex flagged on PR #196). The engine
-    // recognises null + original frozen → escalate.
+  it('PR #196 escalation CASE A: critico race vs concurrent freeze (no replacement) → atomic escalate succeeds', async () => {
+    // CASE A — regression for Codex P1: an `alto` batch from another
+    // invocation froze v1 between this engine's pre-lock read and the
+    // first transition. The first transition (to:'rolled_back',
+    // expected_from:'active') comes back stale with actual='frozen'.
+    // The engine then calls `escalateRollbackIfStillFrozen`, which under
+    // the parent-agent lock observes target=frozen + no replacement and
+    // commits the rollback atomically.
 
     // First transition: stale (actual='frozen').
     transitionMock.mockResolvedValueOnce({
@@ -940,14 +952,11 @@ describe('decideAndApply', () => {
       expected_from: 'active',
       actual: 'frozen',
     });
-    // Re-fetch: NO active slot occupant (target row was frozen, nobody
-    // seeded a replacement). This is what real Postgres returns when
-    // status='active' filters the row out.
-    getActiveContextForAgentMock.mockResolvedValueOnce({ active_profile_id: null });
-    // Retry transition: ok (frozen → rolled_back is a valid transition).
-    transitionMock.mockResolvedValueOnce({
+    // Atomic escalation: succeeds, rolled_back committed under the lock.
+    escalateRollbackIfStillFrozenMock.mockResolvedValueOnce({
       ok: true,
-      updated: { id: PROFILE_ID, status: 'rolled_back' },
+      target_profile_id: PROFILE_ID,
+      rolled_back_at: new Date(),
     });
 
     const evCritico = makeEvidence(
@@ -956,7 +965,7 @@ describe('decideAndApply', () => {
       'critico cross-invocation evidence',
     );
 
-    const out = await decideAndApply({
+    const out = await runDecideAndApply({
       evidences: [evCritico],
       active_profile_id: PROFILE_ID,
     });
@@ -968,34 +977,30 @@ describe('decideAndApply', () => {
     expect(out[0]!.applied_error).toBeUndefined();
     expect(out[0]!.alert_id).toMatch(/^alert-/);
 
-    // Two transition calls: first with expected_from='active' (stale),
-    // second with expected_from='frozen' (escalation).
-    expect(transitionMock).toHaveBeenCalledTimes(2);
+    // The engine calls transition ONCE (stale), then the atomic
+    // escalation ONCE — no second `transition` round-trip.
+    expect(transitionMock).toHaveBeenCalledTimes(1);
     expect(transitionMock.mock.calls[0]![0]).toMatchObject({
       to: 'rolled_back',
       expected_from: 'active',
       approved_by: 'auto:drift_critico',
     });
-    expect(transitionMock.mock.calls[1]![0]).toMatchObject({
-      to: 'rolled_back',
-      expected_from: 'frozen',
+    expect(escalateRollbackIfStillFrozenMock).toHaveBeenCalledTimes(1);
+    expect(escalateRollbackIfStillFrozenMock.mock.calls[0]![0]).toMatchObject({
+      tenant_id: TENANT_ID,
+      agent_id: AGENT_ID,
+      target_profile_id: PROFILE_ID,
       approved_by: 'auto:drift_critico',
       rollback_reason: 'critico cross-invocation evidence',
     });
-
-    // Re-fetch happened exactly once between the two transitions.
-    expect(getActiveContextForAgentMock).toHaveBeenCalledTimes(1);
   });
 
-  it('PR #196 escalation: critico race vs concurrent seed (active was REPLACED) → skip, no retry', async () => {
+  it('PR #196 escalation CASE B: critico race vs concurrent seed (active was REPLACED) → skip, no retry', async () => {
     // CASE B: a concurrent `seedNewActiveAtomic` froze v1 and seeded v2 as
-    // the new active. The first transition comes back stale with
-    // actual='frozen'. The engine re-fetches active context and sees
-    // active_profile_id is now PROFILE_ID_V2 (DIFFERENT from PROFILE_ID/
-    // v1). The evidence was scored against v1; rolling back v1 is
-    // meaningless when v2 is the agent's current contract surface. Skip
-    // with `drift.skip.active_replaced`; the next drift cycle will
-    // re-evaluate against v2.
+    // the new active. Inside the atomic escalation tx, the active-slot
+    // re-read FOR UPDATE finds v2. The original target is no longer the
+    // contract surface; skip with `drift.skip.active_replaced`. Next
+    // drift cycle re-evaluates against v2.
 
     transitionMock.mockResolvedValueOnce({
       ok: false,
@@ -1003,9 +1008,10 @@ describe('decideAndApply', () => {
       expected_from: 'active',
       actual: 'frozen',
     });
-    // Re-fetch: DIFFERENT id → active was replaced.
-    getActiveContextForAgentMock.mockResolvedValueOnce({
-      active_profile_id: 'prof-active-v2',
+    escalateRollbackIfStillFrozenMock.mockResolvedValueOnce({
+      ok: false,
+      reason: 'replaced',
+      current_active_profile_id: 'prof-active-v2',
     });
 
     const evCritico = makeEvidence(
@@ -1014,7 +1020,7 @@ describe('decideAndApply', () => {
       'critico vs replaced active',
     );
 
-    const out = await decideAndApply({
+    const out = await runDecideAndApply({
       evidences: [evCritico],
       active_profile_id: PROFILE_ID,
     });
@@ -1028,19 +1034,17 @@ describe('decideAndApply', () => {
     );
     expect(out[0]!.alert_id).toMatch(/^alert-/);
 
-    // Only ONE transition call — escalation NOT attempted because v1 is no
-    // longer the current contract surface.
     expect(transitionMock).toHaveBeenCalledTimes(1);
-    expect(getActiveContextForAgentMock).toHaveBeenCalledTimes(1);
+    expect(escalateRollbackIfStillFrozenMock).toHaveBeenCalledTimes(1);
   });
 
-  it('PR #196 escalation: terminal state (third invocation, row already rolled_back) → no-op, log terminal_state', async () => {
-    // CASE C: another worker already escalated v1 to rolled_back between
-    // this engine's stale observation and the retry. The retry
-    // `transition({to:'rolled_back', expected_from:'frozen'})` also sees
-    // stale (actual='rolled_back') OR terminal. The desired terminal
-    // state is achieved (by someone else), so mark applied=false with a
-    // log line pointing at the converging path.
+  it('PR #196 round 2 NEW CASE: target row reactivated under lock → skip with reactivated', async () => {
+    // CASE C (NEW, from Codex P1 round 2): between the engine's stale
+    // observation (actual='frozen') and the atomic escalation acquiring
+    // the lock, the frozen target row itself was re-activated
+    // (`frozen → active` is a legal state-machine edge). The escalation
+    // re-reads the target FOR UPDATE inside the tx and sees status='active'.
+    // Refuse to roll back a row that's back in service.
 
     transitionMock.mockResolvedValueOnce({
       ok: false,
@@ -1048,14 +1052,48 @@ describe('decideAndApply', () => {
       expected_from: 'active',
       actual: 'frozen',
     });
-    // Refetch: no active slot occupant (target rolled_back, no
-    // replacement). The helper would return null here as well.
-    getActiveContextForAgentMock.mockResolvedValueOnce({ active_profile_id: null });
-    // Retry transition: another worker already rolled it back; transition
-    // returns terminal (the state machine treats rolled_back as terminal).
+    escalateRollbackIfStillFrozenMock.mockResolvedValueOnce({
+      ok: false,
+      reason: 'reactivated',
+    });
+
+    const evCritico = makeEvidence(
+      DriftType.LINGUAGEM,
+      { offensive: true },
+      'critico vs reactivated row',
+    );
+
+    const out = await runDecideAndApply({
+      evidences: [evCritico],
+      active_profile_id: PROFILE_ID,
+    });
+
+    expect(out).toHaveLength(1);
+    expect(out[0]!.applied).toBe(false);
+    expect(out[0]!.applied_error).toBe(
+      'stale:expected=active,actual=frozen;reactivated',
+    );
+    expect(out[0]!.alert_id).toMatch(/^alert-/);
+
+    expect(transitionMock).toHaveBeenCalledTimes(1);
+    expect(escalateRollbackIfStillFrozenMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('PR #196 escalation CASE D: target already rolled_back (terminal_state) → no-op, log', async () => {
+    // CASE D: another worker already escalated v1 to rolled_back between
+    // this engine's stale observation and the atomic escalation. The
+    // re-read under the lock surfaces actual_status='rolled_back'.
+
     transitionMock.mockResolvedValueOnce({
       ok: false,
-      reason: 'terminal',
+      reason: 'stale',
+      expected_from: 'active',
+      actual: 'frozen',
+    });
+    escalateRollbackIfStillFrozenMock.mockResolvedValueOnce({
+      ok: false,
+      reason: 'terminal_state',
+      actual_status: 'rolled_back',
     });
 
     const evCritico = makeEvidence(
@@ -1064,27 +1102,56 @@ describe('decideAndApply', () => {
       'critico vs already-rolled-back row',
     );
 
-    const out = await decideAndApply({
+    const out = await runDecideAndApply({
       evidences: [evCritico],
       active_profile_id: PROFILE_ID,
     });
 
     expect(out).toHaveLength(1);
     expect(out[0]!.applied).toBe(false);
-    expect(out[0]!.applied_error).toBe('terminal');
+    expect(out[0]!.applied_error).toBe('terminal:actual=rolled_back');
 
-    // Two transitions, one re-fetch — same shape as CASE A, just no
-    // success on the retry.
-    expect(transitionMock).toHaveBeenCalledTimes(2);
-    expect(getActiveContextForAgentMock).toHaveBeenCalledTimes(1);
-    expect(transitionMock.mock.calls[1]![0].expected_from).toBe('frozen');
+    expect(transitionMock).toHaveBeenCalledTimes(1);
+    expect(escalateRollbackIfStillFrozenMock).toHaveBeenCalledTimes(1);
   });
 
-  it('PR #196 escalation: FROZEN winner (alto) racing concurrent freeze → no escalation, original stale path', async () => {
+  it('PR #196 escalation: target_missing extreme race → skip with warn', async () => {
+    // Extreme race: target row was deleted between the engine's
+    // observation and the atomic escalation tx. The escalation surfaces
+    // `target_missing`; the engine warns and marks applied=false.
+
+    transitionMock.mockResolvedValueOnce({
+      ok: false,
+      reason: 'stale',
+      expected_from: 'active',
+      actual: 'frozen',
+    });
+    escalateRollbackIfStillFrozenMock.mockResolvedValueOnce({
+      ok: false,
+      reason: 'target_missing',
+    });
+
+    const evCritico = makeEvidence(DriftType.LINGUAGEM, { offensive: true });
+
+    const out = await runDecideAndApply({
+      evidences: [evCritico],
+      active_profile_id: PROFILE_ID,
+    });
+
+    expect(out[0]!.applied).toBe(false);
+    expect(out[0]!.applied_error).toBe(
+      'stale:expected=active,actual=frozen;target_missing',
+    );
+
+    expect(transitionMock).toHaveBeenCalledTimes(1);
+    expect(escalateRollbackIfStillFrozenMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('PR #196 escalation: FROZEN winner (alto) racing concurrent freeze → no escalation', async () => {
     // Belt-and-suspenders: an ALTO winner (decision=FROZEN) that races a
     // concurrent freeze does NOT trigger escalation — the row is already
     // at the desired state, so the original `stale:expected=active,
-    // actual=frozen` outcome is correct (no retry, no re-fetch).
+    // actual=frozen` outcome is correct.
     transitionMock.mockResolvedValueOnce({
       ok: false,
       reason: 'stale',
@@ -1094,7 +1161,7 @@ describe('decideAndApply', () => {
 
     const evAlto = makeEvidence(DriftType.VALORES, { violated_principles: [0] });
 
-    const out = await decideAndApply({
+    const out = await runDecideAndApply({
       evidences: [evAlto],
       active_profile_id: PROFILE_ID,
     });
@@ -1104,17 +1171,16 @@ describe('decideAndApply', () => {
     expect(out[0]!.applied).toBe(false);
     expect(out[0]!.applied_error).toBe('stale:expected=active,actual=frozen');
 
-    // No re-fetch, no retry.
+    // No atomic escalation — the FROZEN target reached the desired state.
     expect(transitionMock).toHaveBeenCalledTimes(1);
-    expect(getActiveContextForAgentMock).not.toHaveBeenCalled();
+    expect(escalateRollbackIfStillFrozenMock).not.toHaveBeenCalled();
   });
 
-  it('PR #196 escalation: re-fetch helper THROWS → conservative skip with refetch_failed in error', async () => {
-    // Defensive coverage: if `getActiveContextForAgent` itself fails (DB
-    // outage, network glitch), we cannot decide between CASE A (escalate)
-    // and CASE B (skip). The engine must NOT retry blindly — that could
-    // rollback a replaced active. Mark applied=false with both the
-    // original stale signal AND the refetch failure for forensics.
+  it('PR #196 escalation: atomic escalation THROWS → applied=false with the error', async () => {
+    // Defensive coverage: if `escalateRollbackIfStillFrozen` itself throws
+    // (DB outage, network glitch), the engine catches and reports
+    // applied=false with the error message. No partial state can persist —
+    // the atomic tx either commits the rollback or rolls back entirely.
 
     transitionMock.mockResolvedValueOnce({
       ok: false,
@@ -1122,64 +1188,21 @@ describe('decideAndApply', () => {
       expected_from: 'active',
       actual: 'frozen',
     });
-    getActiveContextForAgentMock.mockRejectedValueOnce(
+    escalateRollbackIfStillFrozenMock.mockRejectedValueOnce(
       new Error('connection reset'),
     );
 
     const evCritico = makeEvidence(DriftType.LINGUAGEM, { offensive: true });
 
-    const out = await decideAndApply({
+    const out = await runDecideAndApply({
       evidences: [evCritico],
       active_profile_id: PROFILE_ID,
     });
 
     expect(out[0]!.applied).toBe(false);
-    expect(out[0]!.applied_error).toContain('stale:expected=active,actual=frozen');
-    expect(out[0]!.applied_error).toContain('refetch_failed');
-    expect(out[0]!.applied_error).toContain('connection reset');
+    expect(out[0]!.applied_error).toBe('connection reset');
 
-    // Only the first transition attempted — no retry without a confirmed
-    // re-fetch.
     expect(transitionMock).toHaveBeenCalledTimes(1);
-  });
-
-  it('PR #196 escalation: refetch_anomaly defensive path (impossible same-id observation) → skip, no retry', async () => {
-    // Defensive coverage: if the refetch somehow reports
-    // active_profile_id === profileId AFTER the transition observed
-    // status='frozen', the row would have had to transition
-    // `frozen → active` between the two reads — not a legal edge today.
-    // The engine refuses to retry (could rollback a row that's back in
-    // service) and logs the anomaly. This case is the previous round's
-    // INCORRECT test mock; the bug Codex flagged was that the engine
-    // treated this impossible observation as "escalate", which would
-    // wrongly rollback a re-activated row.
-
-    transitionMock.mockResolvedValueOnce({
-      ok: false,
-      reason: 'stale',
-      expected_from: 'active',
-      actual: 'frozen',
-    });
-    // Impossible-in-practice but defensible refetch outcome.
-    getActiveContextForAgentMock.mockResolvedValueOnce({
-      active_profile_id: PROFILE_ID,
-    });
-
-    const evCritico = makeEvidence(DriftType.LINGUAGEM, { offensive: true });
-
-    const out = await decideAndApply({
-      evidences: [evCritico],
-      active_profile_id: PROFILE_ID,
-    });
-
-    expect(out[0]!.applied).toBe(false);
-    expect(out[0]!.applied_error).toBe(
-      'stale:expected=active,actual=frozen;refetch_anomaly',
-    );
-
-    // Only the FIRST transition was attempted — defensive skip refuses to
-    // retry against a row that the refetch says is `active`.
-    expect(transitionMock).toHaveBeenCalledTimes(1);
-    expect(getActiveContextForAgentMock).toHaveBeenCalledTimes(1);
+    expect(escalateRollbackIfStillFrozenMock).toHaveBeenCalledTimes(1);
   });
 });

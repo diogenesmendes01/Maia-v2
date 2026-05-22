@@ -3323,61 +3323,6 @@ export const operationalProfileVersionsRepo = {
     return rows[0] ?? null;
   },
 
-  /**
-   * Thin helper that returns the current "active context" for
-   * `(getCurrentTenant(), getCurrentAgent())`: only the id of the row whose
-   * status is currently `'active'` (or `null` if no row holds the active slot).
-   *
-   * Codex Adversarial Review of PR #196 round 1 (issue #177 follow-up) — the
-   * helper deliberately reports ONLY active-slot occupancy. It does NOT
-   * report on the original row's status. Callers (the drift decision engine)
-   * combine `active_profile_id` with their own knowledge of
-   * `args.active_profile_id` (the row they scored evidence against) to
-   * distinguish three race outcomes after `transition({to:'rolled_back',
-   * expected_from:'active'})` returns `stale` with `actual='frozen'`:
-   *
-   *   - `active_profile_id === null`:
-   *     The original row is frozen AND no replacement holds the active slot.
-   *     A concurrent `alto` invocation froze the row but did NOT seed a new
-   *     version. The original row is still the agent's logical contract
-   *     surface (just transitioned `active → frozen`). The engine ESCALATES
-   *     via `transition({to:'rolled_back', expected_from:'frozen'})`.
-   *
-   *   - `active_profile_id !== null && active_profile_id !== original_id`:
-   *     A new version was seeded as active (e.g. `seedNewActiveAtomic`
-   *     promoted v2). The original v1 (now frozen) is no longer the agent's
-   *     contract surface, so escalating its rollback is meaningless. The
-   *     engine SKIPS with `drift.skip.active_replaced`.
-   *
-   *   - `active_profile_id === original_id`:
-   *     Defensive only — the prior `transition` told us status='frozen', so
-   *     this would mean the row transitioned `frozen → active` between the
-   *     transition and the refetch. Not a legal state-machine edge today
-   *     (and would race against this engine anyway). The engine logs and
-   *     skips defensively rather than retrying blindly.
-   *
-   * Kept SEPARATE from `getActive()` because callers only need the id
-   * (no payload, no metadata) and we want the read to be as cheap as
-   * possible to minimize the race window between the stale observation and
-   * the retry.
-   */
-  async getActiveContextForAgent(): Promise<{ active_profile_id: string | null }> {
-    const tenant_id = getCurrentTenant();
-    const agent_id = getCurrentAgent();
-    const rows = await db
-      .select({ id: agent_operational_profile_versions.id })
-      .from(agent_operational_profile_versions)
-      .where(
-        and(
-          eq(agent_operational_profile_versions.tenant_id, tenant_id),
-          eq(agent_operational_profile_versions.agent_id, agent_id),
-          eq(agent_operational_profile_versions.status, 'active'),
-        ),
-      )
-      .limit(1);
-    return { active_profile_id: rows[0]?.id ?? null };
-  },
-
   async getById(id: string): Promise<AgentOperationalProfileVersion | null> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
@@ -3636,6 +3581,219 @@ export const operationalProfileVersionsRepo = {
         return { ok: false as const, reason: 'invalid_transition' as const };
       }
       return { ok: true as const, updated: updated[0]! };
+    });
+  },
+
+  /**
+   * Atomic escalation: if `target_profile_id` is STILL `frozen` and no other
+   * row holds the active slot under the same lock, transition it to
+   * `rolled_back`. Used by the drift decision engine when an `active →
+   * rolled_back` rollback was demoted to `stale + actual='frozen'` by a
+   * concurrent `alto` invocation that froze the target first.
+   *
+   * Codex Adversarial Review of PR #196 round 2 (issue #177 follow-up) — the
+   * round-1 fix split the escalation into TWO steps:
+   *   1. `getActiveContextForAgent()` — reads the active-slot occupant
+   *      OUTSIDE any lock (regular `db.select` with no `FOR UPDATE`).
+   *   2. `transition({to:'rolled_back', expected_from:'frozen'})` — opens a
+   *      fresh tx, acquires `lockParentAgent`, re-reads the target row.
+   *
+   * Between steps 1 and 2 the snapshot of the active slot is **released**, so
+   * any concurrent writer with the parent lock can land a new state:
+   *
+   *   - `seedNewActiveAtomic` can promote a brand-new v2 to `active` between
+   *     the refetch (which saw `null`) and the retry — the retry then sees
+   *     target still `frozen`, transitions it to `rolled_back`, and reports
+   *     `applied: true` even though v2 is now the agent's live contract
+   *     surface (rollback was applied to the wrong row).
+   *
+   *   - The state machine permits `frozen → active` (e.g. an operator
+   *     re-activates the frozen row via the Admin UI). If the row is
+   *     re-activated between the refetch and the retry, the retry's
+   *     `expected_from='frozen'` guard surfaces stale, but the original
+   *     observation that "no replacement exists" was already wrong — the
+   *     row IS the replacement.
+   *
+   * Fix: collapse both reads into ONE transaction held under
+   * `lockParentAgent`. Inside the tx we re-read the target row FOR UPDATE,
+   * re-read the active slot FOR UPDATE, and then commit the rollback ONLY
+   * if both predicates still hold (target is still `frozen` AND no other
+   * row holds the active slot). Every TOCTOU window is closed under the
+   * same lock that every other writer of this table uses.
+   *
+   * Five typed outcomes, all rejected at the source so the caller decides
+   * the right log/audit shape:
+   *
+   *   - `ok: true` — atomically transitioned `frozen → rolled_back`. The
+   *     engine logs `drift.rollback.escalated` and reports applied.
+   *
+   *   - `replaced` — a different row holds the active slot. The seed (or
+   *     equivalent writer) won between the engine's pre-lock observation and
+   *     this tx. The original target is no longer the contract surface, so
+   *     the rollback would be meaningless. Engine skips with
+   *     `drift.skip.active_replaced`.
+   *
+   *   - `reactivated` — the target row itself transitioned `frozen → active`
+   *     between the engine's stale observation and this tx (operator
+   *     re-activate, future codepath, etc). The engine refuses to roll back
+   *     a row that's back in service; skips with `drift.skip.reactivated`.
+   *
+   *   - `terminal_state` — the target reached a non-frozen non-active state
+   *     (e.g. another worker already escalated to `rolled_back`). The
+   *     desired terminal is achieved (or close); engine logs
+   *     `drift.skip.terminal_state`.
+   *
+   *   - `target_missing` — the target row was deleted between the engine's
+   *     observation and this tx. Extreme race; engine logs as warning.
+   *
+   * Inputs are explicit (tenant_id, agent_id, target_profile_id) — no
+   * AsyncLocalStorage dependency — so this method is callable from any
+   * worker context (including ones that haven't `runWithTenantContext`-
+   * wrapped their call).
+   */
+  async escalateRollbackIfStillFrozen(args: {
+    tenant_id: string;
+    agent_id: string;
+    target_profile_id: string;
+    approved_by?: string;
+    rollback_reason?: string;
+  }): Promise<
+    | { ok: true; target_profile_id: string; rolled_back_at: Date }
+    | { ok: false; reason: 'replaced'; current_active_profile_id: string }
+    | { ok: false; reason: 'reactivated' }
+    | { ok: false; reason: 'terminal_state'; actual_status: ProfileStatus }
+    | { ok: false; reason: 'target_missing' }
+    | { ok: false; reason: 'agent_missing' }
+  > {
+    return await withTx(async (tx) => {
+      // (1) Lock the parent agent row FIRST — same lock target as
+      //     `transition`, `approveAndActivateAtomic`, `proposeAndAuditAtomic`,
+      //     `seedNewActiveAtomic`, and `acquireNextVersionForAgent`. This
+      //     serializes us against every writer that could change the active
+      //     slot OR the target row's status between our reads and the UPDATE.
+      const agentLocked = await lockParentAgent(tx, args.tenant_id, args.agent_id);
+      if (!agentLocked) {
+        return { ok: false as const, reason: 'agent_missing' as const };
+      }
+
+      // (2) Re-read the target row INSIDE the tx + behind the parent lock,
+      //     FOR UPDATE. Status may have changed since the engine's
+      //     observation; we drive the decision from the post-lock value.
+      const targetRows = await tx
+        .select({
+          id: agent_operational_profile_versions.id,
+          status: agent_operational_profile_versions.status,
+        })
+        .from(agent_operational_profile_versions)
+        .where(
+          and(
+            eq(agent_operational_profile_versions.id, args.target_profile_id),
+            eq(agent_operational_profile_versions.tenant_id, args.tenant_id),
+            eq(agent_operational_profile_versions.agent_id, args.agent_id),
+          ),
+        )
+        .for('update')
+        .limit(1);
+      const target = targetRows[0];
+      if (!target) {
+        return { ok: false as const, reason: 'target_missing' as const };
+      }
+
+      const targetStatus = target.status as ProfileStatus;
+
+      // The target was already re-activated (frozen → active is a legal
+      // edge). The engine's observation that "no replacement exists" was
+      // wrong — this row IS the replacement. Refuse to roll back; the
+      // operator/next-cycle re-evaluation will see the live row.
+      if (targetStatus === 'active') {
+        return { ok: false as const, reason: 'reactivated' as const };
+      }
+
+      // Anything other than `frozen` is a terminal/non-recoverable state for
+      // our escalation contract (we never escalate from `proposed` or
+      // `rolled_back`). Surface the actual status so the caller can log it.
+      if (targetStatus !== 'frozen') {
+        return {
+          ok: false as const,
+          reason: 'terminal_state' as const,
+          actual_status: targetStatus,
+        };
+      }
+
+      // (3) Re-read the active slot INSIDE the tx + behind the parent lock,
+      //     FOR UPDATE. If a different row holds the slot, the seed (or
+      //     equivalent) committed a replacement between the engine's
+      //     observation and this tx — we must NOT roll back the original
+      //     target because it's no longer the contract surface.
+      const activeRows = await tx
+        .select({ id: agent_operational_profile_versions.id })
+        .from(agent_operational_profile_versions)
+        .where(
+          and(
+            eq(agent_operational_profile_versions.tenant_id, args.tenant_id),
+            eq(agent_operational_profile_versions.agent_id, args.agent_id),
+            eq(agent_operational_profile_versions.status, 'active'),
+          ),
+        )
+        .for('update')
+        .limit(1);
+      const active = activeRows[0];
+      if (active) {
+        // Defensive: a `frozen` target should never share the active slot,
+        // but if it somehow did (status==='frozen' AND active row has the
+        // same id — impossible under the unique partial index but cheap to
+        // guard), treat it as reactivated rather than replaced.
+        if (active.id === args.target_profile_id) {
+          return { ok: false as const, reason: 'reactivated' as const };
+        }
+        return {
+          ok: false as const,
+          reason: 'replaced' as const,
+          current_active_profile_id: active.id,
+        };
+      }
+
+      // (4) All predicates still hold under the lock — target is frozen
+      //     AND no replacement exists. Atomically roll it back. The status
+      //     predicate in the WHERE clause is belt-and-suspenders: if a
+      //     future codepath ever bypassed this lock, the UPDATE would match
+      //     zero rows and we'd still surface a typed miss.
+      const now = new Date();
+      const updated = await tx
+        .update(agent_operational_profile_versions)
+        .set({
+          status: 'rolled_back',
+          rolled_back_at: now,
+          rollback_reason: args.rollback_reason ?? null,
+        })
+        .where(
+          and(
+            eq(agent_operational_profile_versions.id, args.target_profile_id),
+            eq(agent_operational_profile_versions.tenant_id, args.tenant_id),
+            eq(agent_operational_profile_versions.agent_id, args.agent_id),
+            eq(agent_operational_profile_versions.status, 'frozen'),
+          ),
+        )
+        .returning({ id: agent_operational_profile_versions.id });
+
+      if (updated.length === 0) {
+        // Should be unreachable: we hold the parent lock AND a row-level
+        // FOR UPDATE on the target, so its status cannot change between our
+        // read and this UPDATE. If it somehow did (future codepath that
+        // bypasses both locks), surface as terminal_state so the caller
+        // doesn't double-process.
+        return {
+          ok: false as const,
+          reason: 'terminal_state' as const,
+          actual_status: targetStatus,
+        };
+      }
+
+      return {
+        ok: true as const,
+        target_profile_id: args.target_profile_id,
+        rolled_back_at: now,
+      };
     });
   },
 

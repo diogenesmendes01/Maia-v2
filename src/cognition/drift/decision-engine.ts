@@ -38,6 +38,7 @@ import {
   operationalProfileVersionsRepo,
   driftAlertsRepo,
 } from '@/db/repositories.js';
+import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import { logger } from '@/lib/logger.js';
 import type { DriftEvidence } from './types.js';
 
@@ -320,27 +321,39 @@ function classifyAndDecide(ev: DriftEvidence): {
  * `active_replaced`, dropping the critical rollback in the very scenario
  * the escalation was designed to recover.
  *
- * Final shape: on `stale + actual='frozen'` for a ROLLBACK winner, call
- * `operationalProfileVersionsRepo.getActiveContextForAgent()` (which
- * reports current active-slot occupancy) and combine its answer with the
- * engine's known `args.active_profile_id`:
- *   - `active_profile_id === null` → target row frozen, NO replacement
- *     holds the active slot. The original row is still the agent's logical
- *     contract surface. ESCALATE via a single retry
- *     `transition({to:'rolled_back', expected_from:'frozen'})`. Log
- *     `drift.rollback.escalated` on success;
- *     `drift.skip.terminal_state` if the retry also hits stale/terminal
- *     (someone else converged the same target).
- *   - `active_profile_id !== null` AND `!== original_id` → active was
- *     replaced by a new version. Skip with `drift.skip.active_replaced`
- *     log; next drift call will re-evaluate against the new active.
- *   - `active_profile_id === original_id` → defensive only (would mean
- *     status transitioned `frozen → active` between the transition and
- *     the refetch, which is not a legal edge today). Skip with
- *     `drift.skip.active_replaced` and log it so the anomaly surfaces.
+ * Codex Adversarial Review round 2 on PR #196 — TOCTOU under lock. Round 1
+ * split the escalation into refetch + retry, but the refetch
+ * (`getActiveContextForAgent`) ran OUTSIDE any lock and the retry took its
+ * own lock fresh. Between those two steps, the active-slot snapshot was
+ * released — a concurrent `seedNewActiveAtomic` could promote a new active
+ * v2 between the refetch (saw null) and the retry, causing the retry to
+ * roll back the original target while v2 was the live contract surface
+ * (rollback applied to the wrong row). The `frozen → active` reactivation
+ * edge was also unprotected.
  *
- * Bounded to one retry (no loop) so a pathological row that keeps
- * transitioning never traps the engine. Only ROLLBACK winners trigger the
+ * Round 2 fix: collapse the entire escalation into ONE transaction held
+ * under `lockParentAgent` via the new
+ * `operationalProfileVersionsRepo.escalateRollbackIfStillFrozen` method.
+ * The repo method re-reads the target row FOR UPDATE, re-reads the active
+ * slot FOR UPDATE, then commits the rollback only if both predicates
+ * still hold. Engine's job is just to translate the five typed outcomes
+ * into log shapes:
+ *
+ *   - `ok` → `drift.rollback.escalated`, mark applied.
+ *   - `replaced` (different row holds active slot) →
+ *     `drift.skip.active_replaced`; next cycle re-evaluates against the
+ *     new active.
+ *   - `reactivated` (target itself `frozen → active`) →
+ *     `drift.skip.reactivated`; refuse to roll back a row that's back in
+ *     service.
+ *   - `terminal_state` (target reached non-frozen non-active state, e.g.
+ *     `rolled_back` because someone else escalated) →
+ *     `drift.skip.terminal_state`.
+ *   - `target_missing` (extreme race, row deleted) →
+ *     `drift.skip.target_missing` warn log.
+ *
+ * Single-shot under one lock (no bounded retry needed; the atomic method
+ * makes the right decision once). Only ROLLBACK winners trigger the
  * escalation path — FROZEN winners that race a concurrent freeze are
  * already at the desired state, so the stale path stays the original
  * `applied=false / stale:...` outcome.
@@ -568,151 +581,165 @@ export async function decideAndApply(args: {
         r.actual === 'frozen' &&
         winner.decision === DriftDecision.ROLLBACK
       ) {
-        // Codex Adversarial Review of PR #196 round 1 (issue #177 follow-up) —
-        // CROSS-INVOCATION escalation, refetch semantics fixed.
+        // Codex Adversarial Review of PR #196 round 2 (issue #177 follow-up) —
+        // CROSS-INVOCATION escalation, NOW UNDER A SINGLE LOCK.
         //
-        // Two concurrent `decideAndApply` calls can race for the same
-        // agent: an `alto` invocation freezes the active row first; a
-        // `critico` invocation arrives second, takes the parent-agent
-        // lock, observes the row as `frozen` (no longer `active`), and is
-        // rejected by `expected_from='active'` with
-        // `{stale, actual:'frozen'}`. Without escalation the critical
-        // rollback is silently demoted to `applied=false`.
+        // Round 1 split the escalation into two unlocked steps: a refetch
+        // (`getActiveContextForAgent`) outside any lock, then a `transition`
+        // retry that took its own lock. Between those steps the active-slot
+        // snapshot was RELEASED, opening a TOCTOU window:
         //
-        // The refetch (`getActiveContextForAgent`) reports current active-
-        // slot occupancy ONLY — `active_profile_id` is the id of whichever
-        // row currently holds `status='active'`, or `null` if no row does.
-        // The engine combines that with `profileId` (the row evidence was
-        // scored against, currently observed as `frozen`):
+        //   - `seedNewActiveAtomic` could promote a brand-new v2 to `active`
+        //     between the refetch (which saw `null`) and the retry — the
+        //     retry then transitioned the original target `frozen →
+        //     rolled_back` and returned `applied:true` while v2 was the
+        //     agent's live contract surface (rollback applied to the wrong
+        //     row).
         //
-        //   - `active_profile_id === null`:
-        //     The original row is frozen AND no replacement holds the
-        //     active slot. A concurrent worker froze the row but did NOT
-        //     seed a new version. The original row is still the agent's
-        //     logical contract surface. ESCALATE `frozen → rolled_back`.
+        //   - `frozen → active` is a legal edge: an operator could
+        //     re-activate the original target between the two reads. The
+        //     retry's `expected_from='frozen'` guard surfaced stale, but
+        //     the original "no replacement exists" observation was already
+        //     wrong — the row itself was the replacement.
         //
-        //   - `active_profile_id !== null && !== profileId`:
-        //     A different row holds the active slot — a new version was
-        //     seeded (e.g. `seedNewActiveAtomic` promoted v2). The
-        //     original row is no longer the agent's contract surface, so
-        //     escalating its rollback is meaningless. SKIP with
-        //     `active_replaced`; next drift cycle re-evaluates against the
-        //     new active.
+        // Round 2 fix: collapse both reads + the UPDATE into ONE transaction
+        // held under `lockParentAgent`. The new repo method re-reads the
+        // target row FOR UPDATE, re-reads the active slot FOR UPDATE, then
+        // commits the rollback only if both predicates still hold under the
+        // lock. Every TOCTOU window is closed under the same lock that
+        // every other writer of this table acquires.
         //
-        //   - `active_profile_id === profileId`:
-        //     Defensive only — would mean the row transitioned
-        //     `frozen → active` between the original transition and the
-        //     refetch, which is not a legal state-machine edge today. The
-        //     engine refuses to retry (could rollback a row that's back
-        //     in service) and logs an anomaly.
-        //
-        // Bounded to ONE re-try to avoid infinite loops in case the row
-        // transitions again between our re-fetch and the retry.
-        let activeProfileId: string | null = null;
-        let refetchErr: string | undefined;
+        // Five typed outcomes drive the engine's decision:
+        //   - ok: rollback committed atomically. Log
+        //     `drift.rollback.escalated`, mark applied.
+        //   - replaced: a different row holds the active slot. Skip with
+        //     `drift.skip.active_replaced`.
+        //   - reactivated: target itself transitioned `frozen → active`.
+        //     Skip with `drift.skip.reactivated`; refuse to roll back a
+        //     row that's back in service.
+        //   - terminal_state: target reached non-frozen non-active state
+        //     (e.g. another worker already escalated). Log
+        //     `drift.skip.terminal_state`.
+        //   - target_missing: extreme race, target deleted. Warn.
+        let tenantId: string;
+        let agentId: string;
         try {
-          const ctx = await operationalProfileVersionsRepo.getActiveContextForAgent();
-          activeProfileId = ctx.active_profile_id;
+          tenantId = getCurrentTenant();
+          agentId = getCurrentAgent();
         } catch (e) {
-          refetchErr = e instanceof Error ? e.message : String(e);
+          // Caller didn't wrap us in `runWithTenantContext` — preserve the
+          // original stale outcome with the context error so postmortems
+          // see why the escalation couldn't run.
+          const ctxErr = e instanceof Error ? e.message : String(e);
+          applyResult.set(winnerIndex, {
+            applied: false,
+            applied_error: `stale:expected=${r.expected_from},actual=${r.actual};context_missing:${ctxErr}`,
+          });
+          continue;
         }
 
-        if (refetchErr !== undefined) {
-          // Re-fetch failed → conservative skip, keep stale error so the
-          // original race is still visible in postmortems.
-          applyResult.set(winnerIndex, {
-            applied: false,
-            applied_error: `stale:expected=${r.expected_from},actual=${r.actual};refetch_failed:${refetchErr}`,
+        try {
+          const r2 = await operationalProfileVersionsRepo.escalateRollbackIfStillFrozen({
+            tenant_id: tenantId,
+            agent_id: agentId,
+            target_profile_id: profileId,
+            approved_by: `auto:drift_${winner.severity}`,
+            rollback_reason: winner.ev.evidence_summary,
           });
-        } else if (activeProfileId === null) {
-          // CASE A — original row frozen, NO replacement holds the active
-          // slot. ESCALATE.
-          try {
-            const r2 = await operationalProfileVersionsRepo.transition({
-              id: profileId,
-              to: 'rolled_back',
-              expected_from: 'frozen',
-              approved_by: `auto:drift_${winner.severity}`,
-              rollback_reason: winner.ev.evidence_summary,
+          if (r2.ok) {
+            applyResult.set(winnerIndex, { applied: true });
+            logger.info(
+              {
+                active_profile_id: profileId,
+                from: 'frozen',
+                to: 'rolled_back',
+                original_alert_id: winnerAlertId,
+                severity: winner.severity,
+              },
+              'drift.rollback.escalated',
+            );
+          } else if (r2.reason === 'replaced') {
+            // Active slot is owned by a different row — a new version was
+            // seeded between the engine's observation and this tx. Skip;
+            // next drift cycle re-evaluates against the new active.
+            applyResult.set(winnerIndex, {
+              applied: false,
+              applied_error: `stale:expected=${r.expected_from},actual=${r.actual};active_replaced`,
             });
-            if (r2.ok) {
-              applyResult.set(winnerIndex, { applied: true });
-              logger.info(
-                {
-                  active_profile_id: profileId,
-                  from: 'frozen',
-                  to: 'rolled_back',
-                  original_alert_id: winnerAlertId,
-                  severity: winner.severity,
-                },
-                'drift.rollback.escalated',
-              );
-            } else if (r2.reason === 'stale' || r2.reason === 'terminal') {
-              // Re-try also saw a transition between our re-fetch and the
-              // retry (e.g. another worker already escalated to
-              // rolled_back, or the row reached the rolled_back terminal).
-              // The desired terminal state is achieved (or about to be) —
-              // mark applied=false but log it so postmortems see the
-              // converging path.
-              applyResult.set(winnerIndex, {
-                applied: false,
-                applied_error:
-                  r2.reason === 'stale'
-                    ? `stale:expected=${r2.expected_from},actual=${r2.actual}`
-                    : 'terminal',
-              });
-              logger.info(
-                {
-                  active_profile_id: profileId,
-                  reason: r2.reason,
-                  original_alert_id: winnerAlertId,
-                },
-                'drift.skip.terminal_state',
-              );
-            } else {
-              applyResult.set(winnerIndex, {
-                applied: false,
-                applied_error: r2.reason,
-              });
-            }
-          } catch (e2) {
-            const applied_error = e2 instanceof Error ? e2.message : String(e2);
-            applyResult.set(winnerIndex, { applied: false, applied_error });
+            logger.info(
+              {
+                original_active_id: profileId,
+                new_active_id: r2.current_active_profile_id,
+                dropped_evidence: winner.severity,
+                original_alert_id: winnerAlertId,
+              },
+              'drift.skip.active_replaced',
+            );
+          } else if (r2.reason === 'reactivated') {
+            // Target itself transitioned `frozen → active` under the lock.
+            // Refuse to roll back a row that's back in service; log so
+            // postmortems can trace the converging path.
+            applyResult.set(winnerIndex, {
+              applied: false,
+              applied_error: `stale:expected=${r.expected_from},actual=${r.actual};reactivated`,
+            });
+            logger.warn(
+              {
+                active_profile_id: profileId,
+                original_alert_id: winnerAlertId,
+                dropped_evidence: winner.severity,
+              },
+              'drift.skip.reactivated',
+            );
+          } else if (r2.reason === 'terminal_state') {
+            // Target reached a non-frozen non-active state (most commonly
+            // `rolled_back` because another worker escalated first). The
+            // desired terminal is achieved (or close); applied=false but
+            // logged so the converging path is discoverable.
+            applyResult.set(winnerIndex, {
+              applied: false,
+              applied_error: `terminal:actual=${r2.actual_status}`,
+            });
+            logger.info(
+              {
+                active_profile_id: profileId,
+                actual_status: r2.actual_status,
+                original_alert_id: winnerAlertId,
+              },
+              'drift.skip.terminal_state',
+            );
+          } else if (r2.reason === 'target_missing') {
+            // Extreme race: the target row was deleted between observation
+            // and this tx. Should be impossible in normal traffic; warn so
+            // anomalies surface.
+            applyResult.set(winnerIndex, {
+              applied: false,
+              applied_error: `stale:expected=${r.expected_from},actual=${r.actual};target_missing`,
+            });
+            logger.warn(
+              {
+                active_profile_id: profileId,
+                original_alert_id: winnerAlertId,
+              },
+              'drift.skip.target_missing',
+            );
+          } else {
+            // agent_missing — the agent was deleted out from under us.
+            applyResult.set(winnerIndex, {
+              applied: false,
+              applied_error: `stale:expected=${r.expected_from},actual=${r.actual};agent_missing`,
+            });
+            logger.warn(
+              {
+                active_profile_id: profileId,
+                original_alert_id: winnerAlertId,
+              },
+              'drift.skip.agent_missing',
+            );
           }
-        } else if (activeProfileId !== profileId) {
-          // CASE B — active was replaced by a new version. Skip; next
-          // drift call will re-evaluate against the new active.
-          applyResult.set(winnerIndex, {
-            applied: false,
-            applied_error: `stale:expected=${r.expected_from},actual=${r.actual};active_replaced`,
-          });
-          logger.info(
-            {
-              original_active_id: profileId,
-              new_active_id: activeProfileId,
-              dropped_evidence: winner.severity,
-              original_alert_id: winnerAlertId,
-            },
-            'drift.skip.active_replaced',
-          );
-        } else {
-          // DEFENSIVE — refetch says active_profile_id === profileId but
-          // the transition just observed it as `frozen`. The row would
-          // have had to transition `frozen → active` in between, which is
-          // not a legal edge today. Refuse to retry (could rollback a row
-          // that's back in service) and log so the anomaly surfaces.
-          applyResult.set(winnerIndex, {
-            applied: false,
-            applied_error: `stale:expected=${r.expected_from},actual=${r.actual};refetch_anomaly`,
-          });
-          logger.warn(
-            {
-              active_profile_id: profileId,
-              original_alert_id: winnerAlertId,
-              dropped_evidence: winner.severity,
-            },
-            'drift.skip.refetch_anomaly',
-          );
+        } catch (e2) {
+          const applied_error = e2 instanceof Error ? e2.message : String(e2);
+          applyResult.set(winnerIndex, { applied: false, applied_error });
         }
       } else {
         const applied_error =
