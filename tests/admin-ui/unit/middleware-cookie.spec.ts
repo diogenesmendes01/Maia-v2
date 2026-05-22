@@ -195,17 +195,98 @@ describe('hasSessionCookie — pass / fail behavior', () => {
     ).toBe(false);
   });
 
-  it('passes when at least one chunk has a value', () => {
-    // Defensive: if the browser somehow sends one chunk cleared and another
-    // populated, treat it as "session present" — the JWT verify at the trpc
-    // layer will catch it. We don't want middleware to second-guess Auth.js's
-    // chunking format.
+  // ---------------------------------------------------------------------------
+  // PR #181 Codex Adversarial regression — orphan / gapped chunked cookies.
+  //
+  // The pre-fix `hasSessionCookie` returned true as soon as any chunked
+  // variant had a value, so:
+  //   - a request with only `.1` (no `.0`) silently bypassed the gate
+  //   - `.0` empty + `.1` populated bypassed the gate
+  //   - `.0,.2` (gap in `.1`) bypassed the gate
+  // None of those are reconstructible by Auth.js (which concatenates chunks
+  // starting from `.0` until the next index is missing), so the root layout
+  // would render the protected page tree with `auth()` returning null. The
+  // gate now requires `.0` present + non-empty AND contiguous indexes.
+  // ---------------------------------------------------------------------------
+
+  it('fails for an orphan chunk `.1` with no `.0` (PR #181 Codex finding)', () => {
+    // Plausible after stale cleanup or partial cookie injection. Auth.js
+    // cannot reconstruct without `.0`, so the middleware must not let it
+    // through.
+    expect(
+      hasSessionCookie([c('__Secure-authjs.session-token.1', FIXTURE_JWT)]),
+    ).toBe(false);
+  });
+
+  it('fails for a gapped chunk set `.0` + `.2` (missing `.1`)', () => {
+    // Auth.js stops concatenating at the first missing index, yielding a
+    // truncated JWT that won't verify. Treat as unreconstructible.
+    expect(
+      hasSessionCookie([
+        c('__Secure-authjs.session-token.0', FIXTURE_JWT.slice(0, 20)),
+        c('__Secure-authjs.session-token.2', FIXTURE_JWT.slice(40)),
+      ]),
+    ).toBe(false);
+  });
+
+  it('fails when `.0` is present but empty and `.1` has a value', () => {
+    // This was the pre-PR-#181 behavior considered "defensive". It's actually
+    // unreconstructible: Auth.js sees an empty `.0` and produces a
+    // truncated/garbage JWT. Must NOT pass the gate.
     expect(
       hasSessionCookie([
         c('__Secure-authjs.session-token.0', ''),
         c('__Secure-authjs.session-token.1', FIXTURE_JWT),
       ]),
+    ).toBe(false);
+  });
+
+  it('fails when only `.0` is present and its value is empty', () => {
+    // Sign-out / cleared-session single-chunk variant.
+    expect(
+      hasSessionCookie([c('__Secure-authjs.session-token.0', '')]),
+    ).toBe(false);
+  });
+
+  it('passes for a contiguous chunk set `.0` + `.1` + `.2` (happy path)', () => {
+    expect(
+      hasSessionCookie([
+        c('__Secure-authjs.session-token.0', FIXTURE_JWT.slice(0, 20)),
+        c('__Secure-authjs.session-token.1', FIXTURE_JWT.slice(20, 40)),
+        c('__Secure-authjs.session-token.2', FIXTURE_JWT.slice(40)),
+      ]),
     ).toBe(true);
+  });
+
+  it('passes for a single-chunk session (`.0` only with non-empty value)', () => {
+    // Edge case: small enough JWT that Auth.js still chunked once (e.g. a
+    // forward-compat scenario). Single non-empty `.0` is trivially contiguous.
+    expect(
+      hasSessionCookie([c('__Secure-authjs.session-token.0', FIXTURE_JWT)]),
+    ).toBe(true);
+  });
+
+  it('passes when an unchunked session cookie coexists with orphan chunks of another prefix', () => {
+    // E.g. unchunked v5 cookie present (valid) plus a stale orphan `.1` of
+    // the v4 cookie from before a deployment rotation. Unchunked match alone
+    // is sufficient.
+    expect(
+      hasSessionCookie([
+        c('__Secure-authjs.session-token', FIXTURE_JWT),
+        c('__Secure-next-auth.session-token.1', 'stale-orphan'),
+      ]),
+    ).toBe(true);
+  });
+
+  it('fails when the only chunked match has an empty middle chunk', () => {
+    // `.0` and `.2` non-empty, `.1` empty → contiguity check rejects.
+    expect(
+      hasSessionCookie([
+        c('__Secure-authjs.session-token.0', FIXTURE_JWT.slice(0, 20)),
+        c('__Secure-authjs.session-token.1', ''),
+        c('__Secure-authjs.session-token.2', FIXTURE_JWT.slice(40)),
+      ]),
+    ).toBe(false);
   });
 
   // Note on "expired / malformed JWT" cases from the task description:

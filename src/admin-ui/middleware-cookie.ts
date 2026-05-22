@@ -63,21 +63,116 @@ export function isSessionCookieName(cookieName: string): boolean {
 }
 
 /**
- * True iff the request carries a (non-empty) NextAuth session cookie under
- * any of the v4/v5 names or any chunked variant.
+ * Internal: classify a cookie name against the known session-cookie prefixes.
  *
- * Note: this only checks "a cookie is present" — it does NOT verify the JWT
- * signature, expiry, or contents. That's auth.ts's job at the tRPC context
- * boundary. The middleware is a coarse first gate that prevents authenticated
- * users from being bounced to /auth/signin (issue #179) and prevents
- * unauthenticated users from rendering an admin page shell.
+ * Returns:
+ *   - `{ kind: 'exact', prefix }`   for an unchunked match (`name === prefix`)
+ *   - `{ kind: 'chunk', prefix, index }` for a chunked match (`<prefix>.N`)
+ *   - `null` if the name is not a known session cookie
+ *
+ * Used by `hasSessionCookie` to group chunked variants by prefix so we can
+ * enforce the "chunk `.0` present and contiguous" rule (see that function's
+ * doc-comment for why).
+ */
+function classifySessionCookieName(
+  cookieName: string,
+): { kind: 'exact'; prefix: string } | { kind: 'chunk'; prefix: string; index: number } | null {
+  for (const prefix of SESSION_COOKIE_PREFIXES) {
+    if (cookieName === prefix) return { kind: 'exact', prefix };
+    if (cookieName.length > prefix.length + 1 && cookieName.startsWith(prefix + '.')) {
+      const suffix = cookieName.slice(prefix.length + 1);
+      if (/^\d+$/.test(suffix)) {
+        return { kind: 'chunk', prefix, index: Number.parseInt(suffix, 10) };
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * True iff the request carries a (non-empty) NextAuth session cookie that
+ * Auth.js could plausibly reconstruct into a session.
+ *
+ * Rules:
+ *
+ *   1. **Unchunked cookie** (e.g. `__Secure-authjs.session-token`): present
+ *      and non-empty value ⇒ valid.
+ *
+ *   2. **Chunked cookies** (e.g. `__Secure-authjs.session-token.0`,
+ *      `__Secure-authjs.session-token.1`, …): per Auth.js's chunking format,
+ *      Auth.js reconstructs the session JWT by concatenating chunks in order
+ *      starting from index `0`. For the middleware gate to mirror that:
+ *        - chunk `.0` for that prefix MUST be present AND have a non-empty value
+ *        - the chunk index set MUST be contiguous starting at 0 (`0,1,2,…,N`).
+ *      All present chunks must be non-empty.
+ *      Orphan chunks (e.g. only `.1` with no `.0`) or gapped chunks
+ *      (e.g. `.0,.2` missing `.1`) cannot be reconstructed by Auth.js and
+ *      MUST NOT pass the gate — otherwise the root layout renders the
+ *      protected page tree with `auth()` returning null. See PR #181 Codex
+ *      Adversarial finding.
+ *
+ *   3. A request may have a valid unchunked cookie under one prefix AND
+ *      stale chunks under another; the unchunked match alone is sufficient.
+ *
+ * Note: this only checks "a cookie is plausibly reconstructible" — it does
+ * NOT verify the JWT signature, expiry, or contents. That's auth.ts's job
+ * at the tRPC context boundary. The middleware is a coarse first gate that
+ * prevents authenticated users from being bounced to /auth/signin (issue
+ * #179) and prevents unauthenticated users from rendering an admin page
+ * shell.
  */
 export function hasSessionCookie(
   cookies: ReadonlyArray<{ name: string; value: string }>,
 ): boolean {
+  // Group chunked cookies by prefix; track exact (unchunked) matches separately.
+  // We need both buckets per-prefix because a request can technically carry
+  // (stale) chunks under one prefix and a fresh unchunked cookie under another
+  // — the unchunked match alone is still sufficient.
+  const exactValid = new Set<string>(); // prefixes with a non-empty unchunked match
+  const chunks = new Map<string, Map<number, string>>(); // prefix → (index → value)
+
   for (const c of cookies) {
-    if (c.value && isSessionCookieName(c.name)) return true;
+    const cls = classifySessionCookieName(c.name);
+    if (cls === null) continue;
+    if (cls.kind === 'exact') {
+      if (c.value) exactValid.add(cls.prefix);
+      continue;
+    }
+    // chunk
+    let perPrefix = chunks.get(cls.prefix);
+    if (perPrefix === undefined) {
+      perPrefix = new Map<number, string>();
+      chunks.set(cls.prefix, perPrefix);
+    }
+    perPrefix.set(cls.index, c.value);
   }
+
+  if (exactValid.size > 0) return true;
+
+  // For each prefix with chunked cookies, enforce: `.0` present + non-empty,
+  // contiguous indexes starting at 0, and every present chunk non-empty.
+  // (An empty `.0` is the sign-out / cleared-cookie state — must NOT pass.)
+  for (const perPrefix of chunks.values()) {
+    const zero = perPrefix.get(0);
+    if (zero === undefined || zero === '') continue; // no .0 or empty .0 ⇒ unreconstructible
+
+    const indexes = [...perPrefix.keys()].sort((a, b) => a - b);
+    let contiguous = true;
+    for (let i = 0; i < indexes.length; i++) {
+      if (indexes[i] !== i) {
+        contiguous = false;
+        break;
+      }
+      // All present chunks must be non-empty — Auth.js concatenates raw
+      // values, so an empty middle chunk yields a truncated/garbage JWT.
+      if (perPrefix.get(i) === '') {
+        contiguous = false;
+        break;
+      }
+    }
+    if (contiguous) return true;
+  }
+
   return false;
 }
 
