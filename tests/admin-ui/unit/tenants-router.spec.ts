@@ -11,6 +11,9 @@
  *   7. getById refuses to read another tenant for non-founder roles.
  *   8. updateStatus is atomic — if the audit insert throws inside the
  *      tx-aware repo method, the tenant status MUST NOT persist (issue #165).
+ *   9. create is atomic — if the audit insert throws inside the tx-aware
+ *      repo method, the tenant row MUST NOT persist, and a retry succeeds
+ *      WITHOUT hitting CONFLICT (issue #184).
  */
 import { describe, it, expect } from 'vitest';
 import { TRPCError } from '@trpc/server';
@@ -43,15 +46,21 @@ type AuditRow = {
  * issue #165 fixes (audit insert error mid-tx) — the mock simulates rollback
  * by snapshotting state pre-mutation and restoring it on throw, matching
  * Postgres BEGIN/ROLLBACK semantics.
+ *
+ * `opts.failCreateAuditOnce`: throw the FIRST time `createWithAuditAtomic`
+ * reaches the audit-insert step, then succeed on retry. Models the real
+ * failure mode that issue #184 fixes (audit insert error mid-tx, leaving an
+ * orphaned tenant row that retry can't recover from due to PK CONFLICT).
  */
 function makeRepos(
   seed: Tenant[] = [],
-  opts: { failAuditOnce?: boolean } = {},
+  opts: { failAuditOnce?: boolean; failCreateAuditOnce?: boolean } = {},
 ) {
   const tenants: Record<string, Tenant> = {};
   for (const t of seed) tenants[t.id] = { ...t };
   const audit: AuditRow[] = [];
   let auditShouldFail = opts.failAuditOnce ?? false;
+  let createAuditShouldFail = opts.failCreateAuditOnce ?? false;
 
   return {
     tenantsRepo: {
@@ -65,6 +74,8 @@ function makeRepos(
           .map((t) => ({ ...t }))
           .sort((a, b) => a.id.localeCompare(b.id));
       },
+      // DEPRECATED for the router path; kept so test setup (and any non-router
+      // caller) can seed tenants without dragging an audit fixture along.
       async create(input: { id: string; nome: string; status?: string }) {
         const row: Tenant = {
           id: input.id,
@@ -76,6 +87,61 @@ function makeRepos(
         };
         tenants[input.id] = row;
         return { ...row };
+      },
+      // Atomic create + audit. Mock emulates `withTx` rollback: if the audit
+      // step throws, the tenant row inserted earlier is removed. Mirrors the
+      // real-DB invariant tested in #184.
+      async createWithAuditAtomic(input: {
+        tenant: { id: string; nome: string; status?: string };
+        audit: { tenant_id: string; actor_id: string; actor_role: string };
+      }) {
+        // (1) Duplicate-id check — the real method relies on the PRIMARY KEY
+        //     constraint to surface 23505, which we translate to a typed
+        //     reason. Mirror that in the mock so the router sees the same
+        //     contract on conflict.
+        if (tenants[input.tenant.id]) {
+          return { ok: false as const, reason: 'duplicate_id' as const };
+        }
+
+        // (2) Tentatively insert the tenant row (would be INSERT ... RETURNING
+        //     in DB). Snapshot is implicit — the row didn't exist before.
+        const created: Tenant = {
+          id: input.tenant.id,
+          nome: input.tenant.nome,
+          status: input.tenant.status ?? 'active',
+          metadata: {},
+          created_at: new Date(),
+          updated_at: new Date(),
+        };
+        tenants[input.tenant.id] = created;
+
+        // (3) Audit step — may throw to model a mid-tx audit insert failure.
+        try {
+          if (createAuditShouldFail) {
+            createAuditShouldFail = false;
+            throw new Error('simulated create audit insert failure');
+          }
+          audit.push({
+            tenant_id: input.audit.tenant_id,
+            actor_id: input.audit.actor_id,
+            actor_role: input.audit.actor_role,
+            action: 'tenant_create',
+            resource_type: 'tenant',
+            resource_id: created.id,
+            change_summary: {
+              target_tenant_id: created.id,
+              nome: created.nome,
+              status: created.status,
+            },
+          });
+        } catch (err) {
+          // ROLLBACK: undo the INSERT. This is the invariant the test asserts —
+          // if audit throws, the tenant row DOES NOT persist (mirrors withTx).
+          delete tenants[input.tenant.id];
+          throw err;
+        }
+
+        return { ok: true as const, tenant: { ...created } };
       },
       // Kept for any direct caller; the router uses updateStatusAtomic below.
       async updateStatus(id: string, status: string) {
@@ -257,6 +323,52 @@ describe('tenantsRouter.create — founder gate + audit', () => {
     await expect(
       caller('founder', 'home', 'f1', repos).create({ id: 'BAD', nome: 'X' }),
     ).rejects.toThrow();
+  });
+
+  // Issue #184 — Codex Adversarial Review on PR #180.
+  //
+  // Pre-fix: the router called `tenantsRepo.create` followed by a separate
+  // `adminAuditLogRepo.append`. If the audit insert failed in the window
+  // between them, the tenant row was already committed but no audit record
+  // existed. Retry then hit a duplicate-primary-key CONFLICT
+  // ("Tenant 'x' already exists") and the forensic row was lost forever —
+  // violating the append-only mutation-trail invariant for admin_audit_log
+  // on tenant provisioning.
+  //
+  // Post-fix: `tenantsRepo.createWithAuditAtomic` wraps the tenant insert
+  // and audit insert in one tx. If the audit step throws, the tenant INSERT
+  // rolls back and no tenant row exists. A subsequent retry succeeds
+  // normally — both rows commit together with no CONFLICT.
+  it('audit insert failure rolls back the tenant insert (atomic, issue #184)', async () => {
+    const repos = makeRepos([], { failCreateAuditOnce: true });
+
+    // First attempt — audit insert throws; the router surfaces it as an
+    // INTERNAL_SERVER_ERROR (or whatever tRPC wraps the raw Error into).
+    await expect(
+      caller('founder', 'home', 'f1', repos).create({
+        id: 'tenant-new',
+        nome: 'New Tenant',
+      }),
+    ).rejects.toThrow(/simulated create audit insert failure/);
+
+    // CRITICAL invariant: the tenant row MUST NOT exist. Pre-fix, it would
+    // have been committed with no audit row, blocking any retry on CONFLICT.
+    expect(repos._inspect.tenants['tenant-new']).toBeUndefined();
+    expect(repos._inspect.audit.length).toBe(0);
+
+    // Retry: now the audit step succeeds; both rows commit atomically.
+    // No CONFLICT because the rolled-back insert left no orphaned tenant row.
+    const res = await caller('founder', 'home', 'f1', repos).create({
+      id: 'tenant-new',
+      nome: 'New Tenant',
+    });
+    expect(res.id).toBe('tenant-new');
+    expect(repos._inspect.tenants['tenant-new']).toBeDefined();
+    expect(repos._inspect.audit.length).toBe(1);
+    expect(repos._inspect.audit[0]!.action).toBe('tenant_create');
+    expect(repos._inspect.audit[0]!.change_summary?.target_tenant_id).toBe(
+      'tenant-new',
+    );
   });
 });
 
