@@ -285,6 +285,23 @@ function classifyAndDecide(ev: DriftEvidence): {
  * alert_id. baixo/medio (auto_approved/queued_human) and soul_drift never
  * touch the profile, so they are exempt from the collapse step and always
  * round-trip individually.
+ *
+ * Codex Adversarial Review round 3 on PR #182 — partial-failure fallback:
+ * the round-2 collapse picked the winner BEFORE alert persistence. If the
+ * intended winner's alert insert failed (real Postgres outage, CHECK
+ * constraint mismatch, transient connection drop), the engine would
+ * (a) mark that winner `applied=false` with `alert_persist_failed:...`,
+ * and (b) mark every other mutator `superseded_by: null` with no
+ * transition fired — leaving the active profile running uncovered even
+ * when a weaker-but-persisted alto/critico was ready to act.
+ *
+ * The round-3 ordering pushes winner selection BELOW alert persistence:
+ * pass 1 inserts alerts for every evidence; pass 2 re-ranks ONLY mutators
+ * with a persisted `alert_id` and elects the strongest of THAT subset as
+ * the real winner; pass 3 fires the single transition. Forensic trail:
+ * a structured `drift.batch.collapse.fallback` log fires whenever the
+ * intended winner (by raw rank) differs from the real winner (by
+ * persisted rank), so the rescue path is discoverable in postmortems.
  */
 export async function decideAndApply(args: {
   evidences: DriftEvidence[];
@@ -318,27 +335,23 @@ export async function decideAndApply(args: {
     mutatorsByProfile.set(args.active_profile_id, list);
   }
 
-  // (2) For each profile, pick the strongest mutator: highest severity rank
-  //     wins; on tie, the lower input index wins (deterministic). The
-  //     winners-set lookup is by input index so we can preserve the
-  //     original ordering when emitting `results` below.
-  const winnerIndexByProfile = new Map<string, number>();
-  for (const [profileId, items] of mutatorsByProfile) {
-    let winner = items[0]!;
-    for (const item of items) {
-      const stronger =
-        SEVERITY_RANK[item.severity] > SEVERITY_RANK[winner.severity];
-      if (stronger) winner = item;
-    }
-    winnerIndexByProfile.set(profileId, winner.index);
-  }
-  const winningIndices = new Set(winnerIndexByProfile.values());
-
-  // (3) PASS 1 — alert persistence. Persist alert row for EVERY evidence in
+  // (2) PASS 1 — alert persistence. Persist alert row for EVERY evidence in
   //     input order, regardless of whether it'll win or lose the collapse.
   //     This preserves the forensic trail (every detector signal becomes a
   //     row) and lets us populate `superseded_by` accurately in pass 2 even
   //     when discarded evidences appear BEFORE the winner in input order.
+  //
+  //     Codex Adversarial Review of PR #182 round 3 — winner selection has
+  //     moved BELOW this loop. Previously the winner was chosen BEFORE
+  //     alert persistence (by raw severity rank), so a batch like
+  //     `[alto, critico]` whose top mutator's alert insert failed would
+  //     drop the entire batch's transition while the active profile kept
+  //     running. The alto's alert WAS persisted but it was already demoted
+  //     to `superseded_by null`, so no fallback action ever fired. The new
+  //     ordering — persist all alerts first, THEN rank only persisted
+  //     mutators — lets a strong-but-failed evidence fall back to the next
+  //     strongest persisted mutator so the batch still produces an
+  //     auditable governance action.
   //
   //     Review #100 invariant: persist alert BEFORE attempting transition.
   //     The prior ordering (transition → alert) could freeze/rollback the
@@ -369,24 +382,108 @@ export async function decideAndApply(args: {
     }
   }
 
-  // (4) PASS 2 — single transition per winning profile. Only the winner of
-  //     each profile group attempts `transition`; discarded mutators are
-  //     marked `applied=false` with `superseded_by` pointing at the
-  //     winner's alert_id (or null if the winner's alert insert failed).
+  // (3) Round 3 alert-aware winner selection.
   //
-  //     The applied-only-if-alert-persisted invariant still holds: a winner
-  //     whose alert row failed cannot mutate the profile.
+  //     For each profile, pick the strongest mutator AMONG THOSE WHOSE ALERT
+  //     ROW PERSISTED. Mutators with `alert_persist_failed` are excluded
+  //     from the candidate set: they cannot become the real winner because
+  //     the applied-only-if-alert-persisted invariant would force them to
+  //     applied=false anyway, and treating them as the winner would silently
+  //     skip the batch's whole transition (the original Codex round 3 bug —
+  //     `[alto, critico]` with the critico alert failing would leave the
+  //     alto marked `superseded_by null` and no transition fired, so the
+  //     active profile kept running uncovered).
+  //
+  //     Tie-break: highest severity rank wins; on equal rank, the lower
+  //     input index wins (preserves prior deterministic behavior).
+  //
+  //     If no mutators persisted (all failed alert insert), `realWinnerIndex`
+  //     is left unset for the profile — pass 2 then attempts no transition
+  //     and every mutator stays applied=false with its own alert_persist_failed.
+  const realWinnerIndexByProfile = new Map<string, number>();
+  for (const [profileId, items] of mutatorsByProfile) {
+    const persisted = items.filter((it) => perItem[it.index]!.alert_id);
+    if (persisted.length === 0) continue;
+    let winner = persisted[0]!;
+    for (const item of persisted) {
+      const stronger =
+        SEVERITY_RANK[item.severity] > SEVERITY_RANK[winner.severity];
+      if (stronger) winner = item;
+    }
+    realWinnerIndexByProfile.set(profileId, winner.index);
+  }
+  const realWinningIndices = new Set(realWinnerIndexByProfile.values());
+
+  // Forensic trail: per-profile log of {intended winner by raw rank, real
+  // winner by alert-persisted rank}. This makes it discoverable when the
+  // batch was rescued by the fallback (intended !== real) vs. baseline
+  // (intended === real).
+  for (const [profileId, items] of mutatorsByProfile) {
+    let intendedWinner = items[0]!;
+    for (const item of items) {
+      const stronger =
+        SEVERITY_RANK[item.severity] > SEVERITY_RANK[intendedWinner.severity];
+      if (stronger) intendedWinner = item;
+    }
+    const realWinnerIdx = realWinnerIndexByProfile.get(profileId);
+    if (realWinnerIdx === undefined) {
+      logger.warn(
+        {
+          active_profile_id: profileId,
+          intended_winner: {
+            index: intendedWinner.index,
+            severity: intendedWinner.severity,
+            decision: intendedWinner.decision,
+          },
+          real_winner: null,
+          reason: 'all_mutators_alert_persist_failed',
+        },
+        'drift.batch.collapse.no_winner',
+      );
+    } else if (realWinnerIdx !== intendedWinner.index) {
+      const realWinner = classified[realWinnerIdx]!;
+      logger.warn(
+        {
+          active_profile_id: profileId,
+          intended_winner: {
+            index: intendedWinner.index,
+            severity: intendedWinner.severity,
+            decision: intendedWinner.decision,
+          },
+          real_winner: {
+            index: realWinner.index,
+            severity: realWinner.severity,
+            decision: realWinner.decision,
+            alert_id: perItem[realWinnerIdx]!.alert_id ?? null,
+          },
+          reason: 'intended_winner_alert_persist_failed',
+        },
+        'drift.batch.collapse.fallback',
+      );
+    }
+  }
+
+  // (4) PASS 2 — single transition per real winner. Only the real winner of
+  //     each profile group attempts `transition`; persisted mutators that
+  //     lost the collapse are marked `applied=false` with `superseded_by`
+  //     pointing at the real winner's alert_id. Mutators whose alert failed
+  //     to persist keep their own `alert_persist_failed:<msg>` error from
+  //     pass 1 and `superseded_by: null` (no alert, no link).
+  //
+  //     The applied-only-if-alert-persisted invariant still holds: the
+  //     winner selection step above ALREADY filtered out unpersisted
+  //     mutators, so the winner here always has an alert_id.
   const applyResult = new Map<
     number,
     { applied: boolean; applied_error?: string }
   >();
-  for (const [profileId, winnerIndex] of winnerIndexByProfile) {
+  for (const [profileId, winnerIndex] of realWinnerIndexByProfile) {
     const winner = classified[winnerIndex]!;
     const winnerAlertId = perItem[winnerIndex]!.alert_id;
+    // Invariant: realWinnerIndex always points at a mutator with a
+    // persisted alert_id (filtered above). The defensive `if` below is
+    // belt-and-suspenders for future refactors.
     if (!winnerAlertId) {
-      // Alert insert failed for the winner. Skip transition (invariant) and
-      // surface the alert error via applied_error. The pass-1 message
-      // already encodes `alert_persist_failed:<msg>`.
       applyResult.set(winnerIndex, {
         applied: false,
         applied_error: perItem[winnerIndex]!.applied_error,
@@ -440,11 +537,18 @@ export async function decideAndApply(args: {
     }
   }
 
-  // (5) Assemble results in input order. Each discarded mutator gets
-  //     `superseded_by = <winner's alert_id or null>` so the operator can
-  //     trace WHY this evidence's transition wasn't applied. Log one
-  //     `drift.batch.collapsed` line per discarded evidence to keep the
-  //     forensic narrative discoverable.
+  // (5) Assemble results in input order. Each mutator that lost the
+  //     collapse gets `superseded_by = <real winner's alert_id or null>`
+  //     so the operator can trace WHY this evidence's transition wasn't
+  //     applied. Log one `drift.batch.collapsed` line per discarded
+  //     evidence to keep the forensic narrative discoverable.
+  //
+  //     Round 3 nuance: a mutator whose own alert insert FAILED is NOT
+  //     marked `superseded_by`. Its `applied_error` already encodes
+  //     `alert_persist_failed:<msg>` (from pass 1) and there is no causal
+  //     link to a winning alert — it lost because it had no audit row,
+  //     not because a stronger evidence beat it. This keeps the
+  //     forensic story honest.
   const results: DriftDecisionResult[] = [];
   for (const item of classified) {
     const { ev, severity, decision, mutatesProfile, index } = item;
@@ -455,7 +559,7 @@ export async function decideAndApply(args: {
     let superseded_by: string | null | undefined;
 
     if (mutatesProfile) {
-      if (winningIndices.has(index)) {
+      if (realWinningIndices.has(index)) {
         const ap = applyResult.get(index);
         if (ap) {
           applied = ap.applied;
@@ -464,11 +568,13 @@ export async function decideAndApply(args: {
           // If pass 1 succeeded and pass 2 succeeded, no error.
           if (ap.applied_error !== undefined) applied_error = ap.applied_error;
         }
-      } else {
-        const winnerIndex = winnerIndexByProfile.get(args.active_profile_id);
-        const winnerAlertId =
-          winnerIndex !== undefined ? perItem[winnerIndex]!.alert_id : undefined;
-        superseded_by = winnerAlertId ?? null;
+      } else if (alert_id) {
+        // Lost the collapse but its own alert persisted — link to the
+        // real winner so postmortems can trace the supersession.
+        const realWinnerIndex = realWinnerIndexByProfile.get(args.active_profile_id);
+        const realWinnerAlertId =
+          realWinnerIndex !== undefined ? perItem[realWinnerIndex]!.alert_id : undefined;
+        superseded_by = realWinnerAlertId ?? null;
         logger.info(
           {
             active_profile_id: args.active_profile_id,
@@ -478,11 +584,15 @@ export async function decideAndApply(args: {
               decision,
               alert_id,
             },
-            kept_alert_id: winnerAlertId ?? null,
+            kept_alert_id: realWinnerAlertId ?? null,
           },
           'drift.batch.collapsed',
         );
       }
+      // else: alert_id is falsy → this mutator's own alert failed to
+      // persist. Leave `superseded_by` undefined and `applied_error` set
+      // to `alert_persist_failed:<msg>` from pass 1. The result still
+      // appears in the output for forensic completeness.
     }
 
     results.push({

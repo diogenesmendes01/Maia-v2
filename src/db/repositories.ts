@@ -3619,15 +3619,35 @@ export const operationalProfileVersionsRepo = {
    *     let a stale migrated proposal silently activate against an empty
    *     active slot (#173 finding).
    *
-   *   - **Other explicit `null` cases** (e.g. test fixtures, non-seed non-
-   *     migrated): the no-incumbent + v1 rule covers them. If a caller
-   *     proposes v2+ with explicit `null` predecessor against an incumbent,
-   *     it falls through to `predecessor_conflict` (expected !== current).
-   *
    *   - **`previous_version_id` key absent entirely**: REJECT with
    *     `predecessor_conflict` (`expected: 'unknown'`). Same conservative
    *     policy as round 2 — worst case is silent overwrite of a newer
    *     approved version.
+   *
+   * Codex Adversarial Review of PR #182 round 3 ([high] #186) — explicit
+   * `null` predecessor on a non-seed proposal is now REJECTED outright with
+   * the new `missing_predecessor` typed reason:
+   *
+   *   - **v2+ with `null` predecessor, no incumbent active**: REJECT. The
+   *     round-2 policy structurally accepted `null === null` here, so an
+   *     agent with `frozen`/`rolled_back` versions but no active row could
+   *     approve a v2+ proposal with no lineage anchor — bypassing the
+   *     stale-predecessor guard and reactivating profile state after
+   *     rollback without binding to the last known version. Recovery from
+   *     this state must go through an explicit recovery flow that binds the
+   *     new proposal to the last frozen/rolled_back row, not through the
+   *     normal approve path.
+   *
+   *   - **v1 with an incumbent active**: REJECT. A genuine v1 cannot
+   *     coexist with an active incumbent (the version allocator wouldn't
+   *     have produced v1 in that state). Treat as missing_predecessor
+   *     rather than predecessor_conflict so the operator sees the right
+   *     diagnosis.
+   *
+   *   - **v2+ with explicit `null` predecessor against a non-null
+   *     incumbent**: still rejected — now via `missing_predecessor` (was
+   *     `predecessor_conflict` in round 2). The dangerous shape is the
+   *     same; the new reason name better describes the cause.
    *
    * Required input is explicit (no AsyncLocalStorage dependency) so the
    * router can call it without `runWithTenantContext`.
@@ -3669,6 +3689,14 @@ export const operationalProfileVersionsRepo = {
         expected: null;
         /** What the incumbent active id actually is right now (post-lock). */
         current: string | null;
+      }
+    | {
+        ok: false;
+        reason: 'missing_predecessor';
+        /** The proposal's declared version — useful for the operator message. */
+        proposed_version: number;
+        /** What the incumbent active id actually is right now (post-lock). */
+        current_predecessor: string | null;
       }
   > {
     return await withTx(async (tx) => {
@@ -3771,10 +3799,36 @@ export const operationalProfileVersionsRepo = {
       // predecessor is legitimate when (a) there's no incumbent active row
       // AND (b) this is version 1 — the first activation of a freshly-
       // created agent (`createWithSeedAndAudit` → owner approves the seed).
-      // Any OTHER explicit-null case (v2+ with null, or v1 with an
-      // incumbent) falls through to the strict equality check below.
       const isIntentionalSeed =
         expectedPredecessor === null && currentPredecessor === null && proposed.version === 1;
+
+      // Codex Adversarial Review of PR #182 round 3 ([high] #186): explicit
+      // `null` predecessor on any non-seed proposal must be rejected.
+      // Without this gate, an agent with `frozen`/`rolled_back` versions but
+      // no active row (e.g. post-rollback recovery window) could approve a
+      // v2+ proposal whose `previous_version_id` is `null` — the structural
+      // `null === null` equality would pass and the new active row would
+      // appear with no lineage anchor at all, silently bypassing the
+      // stale-predecessor guard that round 2/3 introduced.
+      //
+      // The four explicit cases we now distinguish:
+      //   - v1 + no incumbent + null pred       → ACCEPT (intentional seed, handled above)
+      //   - v1 + incumbent present + null pred  → REJECT as missing_predecessor
+      //       (a v1 cannot coexist with an active row — the version allocator
+      //       would never produce v1 in that state)
+      //   - v2+ + no incumbent + null pred      → REJECT as missing_predecessor
+      //       (recovery requires explicit lineage to the last frozen/rolled_back row)
+      //   - v2+ + incumbent + null pred         → REJECT as missing_predecessor
+      //       (round 2 already caught this as predecessor_conflict; the new
+      //       reason name better describes the cause)
+      if (!isIntentionalSeed && expectedPredecessor === null) {
+        return {
+          ok: false as const,
+          reason: 'missing_predecessor' as const,
+          proposed_version: proposed.version,
+          current_predecessor: currentPredecessor,
+        };
+      }
 
       if (!isIntentionalSeed && expectedPredecessor !== currentPredecessor) {
         return {

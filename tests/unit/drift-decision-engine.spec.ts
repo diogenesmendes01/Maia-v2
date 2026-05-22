@@ -650,13 +650,111 @@ describe('decideAndApply', () => {
     expect(transitionMock.mock.calls[0]![0].to).toBe('rolled_back');
   });
 
-  it('batch collapse: winner alert insert falha → discarded.superseded_by é null (winner sem id)', async () => {
+  // ---- Codex Adversarial Review of PR #182 round 3: alert-aware fallback ----
+  //
+  // Round 2 picked the winner by raw severity rank BEFORE persisting alerts.
+  // If the top mutator's alert insert failed (DB outage, CHECK constraint),
+  // the engine dropped the whole batch's transition and left the active
+  // profile running uncovered, even when a weaker-but-persisted mutator was
+  // ready to act.
+  //
+  // Round 3 fix: re-rank winners AFTER alert persistence, ignoring any
+  // mutator with `alert_persist_failed`. The real winner is the strongest
+  // mutator AMONG persisted ones. The intended winner that failed alert
+  // insert keeps its own `applied_error: 'alert_persist_failed:...'` for
+  // forensics. A structured `drift.batch.collapse.fallback` log fires when
+  // intended !== real so the rescue path is discoverable.
+
+  it('round 3 fallback: [alto, critico] critico alert FAILS → real winner is alto, freeze applied', async () => {
     transitionOk();
-    // Sequência de inserts: 1º (alto, descartado) ok, 2º (critico, winner) falha.
+    // Order: alto (index 0) alert ok, critico (index 1) alert fails.
     createAlertMock.mockReset();
     createAlertMock.mockImplementationOnce(async () => ({ id: 'alert-alto' }));
     createAlertMock.mockImplementationOnce(async () => {
       throw new Error('db down');
+    });
+
+    const evAlto = makeEvidence(
+      DriftType.VALORES,
+      { violated_principles: [0] },
+      'alto evidence',
+    );
+    const evCritico = makeEvidence(
+      DriftType.LINGUAGEM,
+      { offensive: true },
+      'critico evidence',
+    );
+
+    const out = await decideAndApply({
+      evidences: [evAlto, evCritico],
+      active_profile_id: PROFILE_ID,
+    });
+
+    // Alto: alert ok, real winner now (critico's alert failed) → freeze applied.
+    expect(out[0]!.alert_id).toBe('alert-alto');
+    expect(out[0]!.applied).toBe(true);
+    expect(out[0]!.applied_error).toBeUndefined();
+    expect(out[0]!.superseded_by).toBeUndefined();
+    expect(out[0]!.decision).toBe(DriftDecision.FROZEN);
+
+    // Critico: alert failed → applied=false with alert_persist_failed,
+    // NOT marked superseded_by (it lost because it had no audit row, not
+    // because alto beat it).
+    expect(out[1]!.alert_id).toBeUndefined();
+    expect(out[1]!.applied).toBe(false);
+    expect(out[1]!.applied_error).toContain('alert_persist_failed');
+    expect(out[1]!.superseded_by).toBeUndefined();
+
+    // CRITICAL: one transition fired (alto → frozen), batch was rescued.
+    expect(transitionMock).toHaveBeenCalledTimes(1);
+    const transArgs = transitionMock.mock.calls[0]![0];
+    expect(transArgs.to).toBe('frozen');
+    expect(transArgs.approved_by).toBe('auto:drift_alto');
+  });
+
+  it('round 3 fallback: [alto1, critico, alto2] critico alert FAILS → alto1 wins by index tie-break', async () => {
+    transitionOk();
+    createAlertMock.mockReset();
+    createAlertMock.mockImplementationOnce(async () => ({ id: 'alert-alto1' }));
+    createAlertMock.mockImplementationOnce(async () => {
+      throw new Error('db down for critico');
+    });
+    createAlertMock.mockImplementationOnce(async () => ({ id: 'alert-alto2' }));
+
+    const evAlto1 = makeEvidence(DriftType.VALORES, { violated_principles: [0] }, 'alto 1');
+    const evCritico = makeEvidence(DriftType.LINGUAGEM, { offensive: true }, 'critico');
+    const evAlto2 = makeEvidence(DriftType.VALORES, { violated_principles: [1] }, 'alto 2');
+
+    const out = await decideAndApply({
+      evidences: [evAlto1, evCritico, evAlto2],
+      active_profile_id: PROFILE_ID,
+    });
+
+    // alto1: real winner (critico filtered out, tie-break by lower index)
+    expect(out[0]!.alert_id).toBe('alert-alto1');
+    expect(out[0]!.applied).toBe(true);
+    expect(out[0]!.superseded_by).toBeUndefined();
+
+    // critico: alert failed → applied=false, NOT superseded_by
+    expect(out[1]!.alert_id).toBeUndefined();
+    expect(out[1]!.applied).toBe(false);
+    expect(out[1]!.applied_error).toContain('alert_persist_failed');
+    expect(out[1]!.superseded_by).toBeUndefined();
+
+    // alto2: alert ok but lost the tie-break → superseded_by alto1
+    expect(out[2]!.alert_id).toBe('alert-alto2');
+    expect(out[2]!.applied).toBe(false);
+    expect(out[2]!.superseded_by).toBe('alert-alto1');
+
+    expect(transitionMock).toHaveBeenCalledTimes(1);
+    expect(transitionMock.mock.calls[0]![0].approved_by).toBe('auto:drift_alto');
+  });
+
+  it('round 3 fallback: ALL mutators alert FAIL → no transition, no winner', async () => {
+    transitionOk();
+    createAlertMock.mockReset();
+    createAlertMock.mockImplementation(async () => {
+      throw new Error('db unavailable');
     });
 
     const evAlto = makeEvidence(DriftType.VALORES, { violated_principles: [0] });
@@ -667,18 +765,83 @@ describe('decideAndApply', () => {
       active_profile_id: PROFILE_ID,
     });
 
-    // Alto: alert ok, descartado, superseded_by aponta para winner (que é null pq alert do critico falhou).
-    expect(out[0]!.alert_id).toBe('alert-alto');
+    // No mutator was persisted → no real winner → no transition.
+    expect(out[0]!.alert_id).toBeUndefined();
     expect(out[0]!.applied).toBe(false);
-    expect(out[0]!.superseded_by).toBeNull();
+    expect(out[0]!.applied_error).toContain('alert_persist_failed');
+    expect(out[0]!.superseded_by).toBeUndefined();
 
-    // Critico: alert falhou → applied=false (invariante: sem alert, sem transition).
     expect(out[1]!.alert_id).toBeUndefined();
     expect(out[1]!.applied).toBe(false);
     expect(out[1]!.applied_error).toContain('alert_persist_failed');
+    expect(out[1]!.superseded_by).toBeUndefined();
 
-    // CRITICAL: transition NUNCA foi chamado (winner sem audit row).
+    // CRITICAL: zero transitions when no mutator persisted.
     expect(transitionMock).not.toHaveBeenCalled();
+  });
+
+  it('round 3 fallback: single mutator alert FAILS → no transition (same as before)', async () => {
+    transitionOk();
+    createAlertMock.mockReset();
+    createAlertMock.mockImplementationOnce(async () => {
+      throw new Error('db down');
+    });
+
+    const evCritico = makeEvidence(DriftType.LINGUAGEM, { offensive: true });
+
+    const out = await decideAndApply({
+      evidences: [evCritico],
+      active_profile_id: PROFILE_ID,
+    });
+
+    expect(out).toHaveLength(1);
+    expect(out[0]!.alert_id).toBeUndefined();
+    expect(out[0]!.applied).toBe(false);
+    expect(out[0]!.applied_error).toContain('alert_persist_failed');
+    expect(out[0]!.superseded_by).toBeUndefined();
+
+    // No transition — there's nothing to fall back to.
+    expect(transitionMock).not.toHaveBeenCalled();
+  });
+
+  it('round 3 fallback: discarded mutator that ALSO failed alert insert → superseded_by NOT set', async () => {
+    transitionOk();
+    // [alto1 alert ok, alto2 alert fails, critico alert ok] → critico is real winner.
+    // alto1: persisted but lost → superseded_by = critico.alert_id
+    // alto2: alert failed → applied_error, superseded_by undefined
+    createAlertMock.mockReset();
+    createAlertMock.mockImplementationOnce(async () => ({ id: 'alert-alto1' }));
+    createAlertMock.mockImplementationOnce(async () => {
+      throw new Error('db down for alto2');
+    });
+    createAlertMock.mockImplementationOnce(async () => ({ id: 'alert-critico' }));
+
+    const evAlto1 = makeEvidence(DriftType.VALORES, { violated_principles: [0] }, 'alto1');
+    const evAlto2 = makeEvidence(DriftType.VALORES, { violated_principles: [1] }, 'alto2');
+    const evCritico = makeEvidence(DriftType.LINGUAGEM, { offensive: true }, 'critico');
+
+    const out = await decideAndApply({
+      evidences: [evAlto1, evAlto2, evCritico],
+      active_profile_id: PROFILE_ID,
+    });
+
+    // critico is the real winner (all persisted; critico is strongest).
+    expect(out[2]!.applied).toBe(true);
+    expect(out[2]!.superseded_by).toBeUndefined();
+
+    // alto1: persisted but lost → superseded_by = critico
+    expect(out[0]!.alert_id).toBe('alert-alto1');
+    expect(out[0]!.applied).toBe(false);
+    expect(out[0]!.superseded_by).toBe('alert-critico');
+
+    // alto2: alert failed → applied_error, NO superseded_by
+    expect(out[1]!.alert_id).toBeUndefined();
+    expect(out[1]!.applied).toBe(false);
+    expect(out[1]!.applied_error).toContain('alert_persist_failed');
+    expect(out[1]!.superseded_by).toBeUndefined();
+
+    expect(transitionMock).toHaveBeenCalledTimes(1);
+    expect(transitionMock.mock.calls[0]![0].to).toBe('rolled_back');
   });
 
   it('severity baixo NÃO chama repo.transition (verificado via mock counter)', async () => {
