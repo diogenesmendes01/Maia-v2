@@ -475,17 +475,53 @@ describe('llmSettingsRouter — provider gate (Codex round 4)', () => {
     expect(atomicCalls).toHaveLength(1);
   });
 
-  // Round 4 [high]: dots are rejected in Anthropic mode too. The SDK
-  // format is hyphens (`claude-sonnet-4-6`) not dots (`claude-sonnet-4.6`).
-  it('update rejects dot-form short ID when provider=anthropic', async () => {
+  // Codex round 5 [P2]: dots in the tail ARE now allowed in Anthropic
+  // mode (the regex `^claude-[a-z0-9.-]+$` covers both forms). Round 4
+  // rejected them on the assumption that the SDK only accepts hyphens,
+  // but historical Anthropic IDs (`claude-3.5-sonnet-*`) use dots and
+  // the SDK accepts them too. The slug-shape gate is now `claude-`
+  // prefix + permissive tail.
+  it('update accepts dot-form short ID when provider=anthropic (round 5 relaxation)', async () => {
+    mockProvider = 'anthropic';
+    const res = await caller('founder').update({
+      main: 'claude-sonnet-4.6',
+      fast: 'claude-haiku-4-5-20251001',
+      expected_main: 'claude-sonnet-4-6',
+      expected_fast: 'claude-haiku-4-5-20251001',
+      comment: 'dot-form short ID is now accepted on anthropic',
+    });
+    expect(res.ok).toBe(true);
+    expect(atomicCalls).toHaveLength(1);
+  });
+
+  // Codex round 5 [P2]: the new claude- prefix requirement rejects
+  // generic lowercase-hyphenated slugs that round 4 incorrectly let
+  // through (the runtime would 404 on every call). `gpt-5` reaches
+  // AnthropicProvider.callLLM → messages.create({model:'gpt-5'}) →
+  // 404 → every LLM call fails globally for every tenant.
+  it('update rejects generic lowercase-hyphenated slug (gpt-5) when provider=anthropic', async () => {
     mockProvider = 'anthropic';
     await expect(
       caller('founder').update({
-        main: 'claude-sonnet-4.6',
+        main: 'gpt-5',
         fast: 'claude-haiku-4-5-20251001',
         expected_main: 'claude-sonnet-4-6',
         expected_fast: 'claude-haiku-4-5-20251001',
-        comment: 'dots are not part of native Anthropic IDs',
+        comment: 'gpt-5 has no claude- prefix — must be rejected',
+      }),
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+    expect(atomicCalls).toHaveLength(0);
+  });
+
+  it('update rejects non-claude prefixed custom slug (not-a-model) when provider=anthropic', async () => {
+    mockProvider = 'anthropic';
+    await expect(
+      caller('founder').update({
+        main: 'not-a-model',
+        fast: 'claude-haiku-4-5-20251001',
+        expected_main: 'claude-sonnet-4-6',
+        expected_fast: 'claude-haiku-4-5-20251001',
+        comment: 'arbitrary lowercase-hyphenated typo must be rejected',
       }),
     ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
     expect(atomicCalls).toHaveLength(0);

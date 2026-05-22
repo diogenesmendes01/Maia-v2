@@ -53,8 +53,34 @@ const globalSettingsRepoMock = {
   ),
 };
 
+// Codex round 5 [high]: legacy shim now writes back to agent_facts via
+// factsRepo.upsert. Mock it so we can assert call shape without hitting
+// the real applyTenantGuard path.
+const factsRepoUpsertMock = vi.fn(
+  async (input: {
+    escopo: string;
+    chave: string;
+    valor: unknown;
+    fonte: string;
+  }) => ({ id: 'mock-id', ...input }),
+);
+
 vi.mock('../../src/db/repositories.js', () => ({
   globalSettingsRepo: globalSettingsRepoMock,
+  factsRepo: { upsert: factsRepoUpsertMock },
+}));
+
+// Codex round 5 [high]: the legacy shim wraps factsRepo.upsert in
+// runWithTenantContext({tenant_id:'default', agent_id:'default'}) so
+// applyTenantGuard finds a context. Mock the wrapper to a no-op that
+// just runs the callback so tests don't need AsyncLocalStorage state.
+const runWithTenantContextMock = vi.fn(
+  async <T>(_ctx: { tenant_id: string; agent_id: string }, fn: () => Promise<T>) =>
+    fn(),
+);
+
+vi.mock('../../src/db/tenant-context.js', () => ({
+  runWithTenantContext: runWithTenantContextMock,
 }));
 
 // Codex round 3 on PR #188 [high]: getCurrent*Model now dual-reads —
@@ -124,9 +150,17 @@ vi.mock('../../src/lib/logger.js', () => ({
   },
 }));
 
+// Codex round 5 [high]: `LLM_PROVIDER` is now read dynamically by the
+// source — on every read for the provider-mismatch check and on every
+// write for the stamped `provider` field. Use a mutable reference so
+// each test can flip the active provider without re-creating the mock.
+let mockLlmProvider: 'anthropic' | 'openrouter' = 'openrouter';
+
 vi.mock('../../src/config/env.js', () => ({
   config: {
-    LLM_PROVIDER: 'openrouter',
+    get LLM_PROVIDER() {
+      return mockLlmProvider;
+    },
     OPENROUTER_MODEL_MAIN: 'anthropic/claude-sonnet-4.6',
     OPENROUTER_MODEL_FAST: 'anthropic/claude-haiku-4.5',
     CLAUDE_MODEL_MAIN: 'claude-sonnet-4-6',
@@ -140,6 +174,9 @@ beforeEach(() => {
   legacyReadShouldThrow = false;
   globalSettingsRepoMock.getByKey.mockClear();
   globalSettingsRepoMock.updateAtomic.mockClear();
+  factsRepoUpsertMock.mockClear();
+  runWithTenantContextMock.mockClear();
+  mockLlmProvider = 'openrouter';
 });
 
 describe('llm-settings (global_settings storage)', () => {
@@ -163,35 +200,74 @@ describe('llm-settings (global_settings storage)', () => {
     expect(await getCurrentMainModel()).toBe('openai/gpt-5');
   });
 
-  // Codex round 2 on PR #188 [P1]: the legacy `setCurrent*Model` shims
-  // used to round-trip through `globalSettingsRepo.updateAtomic`. That
-  // silently let the legacy POST `/dashboard/llm-settings` route (gated
-  // only on `isOwnerType`, no reason required) bypass the new founder-
-  // only tRPC gate and change the process-wide model for every tenant.
-  // The shims now THROW so the bypass becomes a loud error until PR #176
-  // removes the legacy caller.
-  it('legacy setCurrentMainModel throws (founder-only path is the new global_settings flow)', async () => {
-    const { setCurrentMainModel, getCurrentMainModel } = await import(
+  // Codex round 5 on PR #188 [high]: the round-2 fail-loud throw was
+  // wrong. Until PR #176 retires the legacy `/dashboard/llm-settings`
+  // route, that form's POST handler is still wired up — throwing would
+  // 500 the page during incident response (precisely the window the
+  // feature exists to support). Round 5 reverts the shims to legacy
+  // behavior: write back to `agent_facts` via `factsRepo.upsert`, with
+  // a `llm_settings.legacy_write_used` warn log so the deprecated
+  // route can be charted to zero usage. The new admin-ui
+  // `/setup/llm-settings` still owns the canonical `global_settings`
+  // path; the shims never touch it.
+  it('legacy setCurrentMainModel writes to agent_facts via factsRepo (no global_settings touched)', async () => {
+    const { setCurrentMainModel } = await import(
       '../../src/lib/llm-settings.js'
     );
-    await expect(setCurrentMainModel('openai/gpt-5')).rejects.toThrow(
-      /forbidden after global_settings migration/,
+    await setCurrentMainModel('openai/gpt-5');
+
+    // Wrote to agent_facts under the legacy storage shape — the
+    // round-3 dual-read fallback can find it.
+    expect(factsRepoUpsertMock).toHaveBeenCalledTimes(1);
+    expect(factsRepoUpsertMock).toHaveBeenCalledWith({
+      escopo: 'global',
+      chave: 'llm.model.main',
+      valor: { model: 'openai/gpt-5' },
+      fonte: 'configurado',
+    });
+    // Wrapped in runWithTenantContext({tenant_id:'default',
+    // agent_id:'default'}) so applyTenantGuard finds a context. The
+    // legacy single-tenant dashboard handler doesn't establish one.
+    expect(runWithTenantContextMock).toHaveBeenCalledWith(
+      { tenant_id: 'default', agent_id: 'default' },
+      expect.any(Function),
     );
-    // And it definitely did NOT write — getCurrentMainModel still returns
-    // the env default.
-    expect(await getCurrentMainModel()).toBe('anthropic/claude-sonnet-4.6');
+    // The canonical (founder-only) path is NOT touched.
     expect(globalSettingsRepoMock.updateAtomic).not.toHaveBeenCalled();
   });
 
-  it('legacy setCurrentFastModel throws (same fail-loud reason as the main shim)', async () => {
-    const { setCurrentFastModel, getCurrentFastModel } = await import(
+  it('legacy setCurrentFastModel mirrors the main shim behavior', async () => {
+    const { setCurrentFastModel } = await import(
       '../../src/lib/llm-settings.js'
     );
-    await expect(setCurrentFastModel('deepseek/deepseek-r1')).rejects.toThrow(
-      /forbidden after global_settings migration/,
-    );
-    expect(await getCurrentFastModel()).toBe('anthropic/claude-haiku-4.5');
+    await setCurrentFastModel('deepseek/deepseek-r1');
+
+    expect(factsRepoUpsertMock).toHaveBeenCalledTimes(1);
+    expect(factsRepoUpsertMock).toHaveBeenCalledWith({
+      escopo: 'global',
+      chave: 'llm.model.fast',
+      valor: { model: 'deepseek/deepseek-r1' },
+      fonte: 'configurado',
+    });
+    expect(runWithTenantContextMock).toHaveBeenCalled();
     expect(globalSettingsRepoMock.updateAtomic).not.toHaveBeenCalled();
+  });
+
+  // Codex round 5 [high]: the deprecation warn log is the signal
+  // operators chart to monitor legacy-form usage. Confirm it fires.
+  it('legacy shim emits llm_settings.legacy_write_used warn', async () => {
+    const logger = (await import('../../src/lib/logger.js')).logger as {
+      warn: ReturnType<typeof vi.fn>;
+    };
+    logger.warn.mockClear();
+    const { setCurrentMainModel } = await import(
+      '../../src/lib/llm-settings.js'
+    );
+    await setCurrentMainModel('openai/gpt-5');
+    const calls = logger.warn.mock.calls.filter(
+      (c: unknown[]) => c[1] === 'llm_settings.legacy_write_used',
+    );
+    expect(calls.length).toBeGreaterThanOrEqual(1);
   });
 
   it('falls back to env default if DB throws on read (no legacy row either)', async () => {
@@ -310,13 +386,18 @@ describe('llm-settings (global_settings storage)', () => {
   });
 
   it('setGlobalLLMSettingsAtomic returns no_changes when nothing differs', async () => {
+    // Codex round 5 [high]: writes stamp `provider` too, so we seed
+    // the full round-5 shape here. A pre-round-5 row missing the
+    // provider field would correctly be UPDATED on the next save
+    // (the helper would now write the marker) — exercised in the
+    // separate "stamps provider" tests above.
     globalByKey.set('llm.model.main', {
-      value: { model: 'openai/gpt-5' },
+      value: { model: 'openai/gpt-5', provider: 'openrouter' },
       updated_at: new Date(),
       updated_by: 'seed',
     });
     globalByKey.set('llm.model.fast', {
-      value: { model: 'openai/gpt-5' },
+      value: { model: 'openai/gpt-5', provider: 'openrouter' },
       updated_at: new Date(),
       updated_by: 'seed',
     });
@@ -507,6 +588,155 @@ describe('llm-settings (global_settings storage)', () => {
       );
       const r = await getCurrentLLMSettings();
       expect(r.main).toEqual({ value: 'openai/gpt-5', source: 'legacy' });
+    });
+  });
+
+  // ============================================================
+  // Codex round 5 on PR #188 [high]: provider field on write +
+  // provider-mismatch fallback on read. Writes stamp `provider`
+  // alongside `model` (config.LLM_PROVIDER snapshot at write time).
+  // Reads compare stored provider against current config; mismatch
+  // → fallback to env default + warn log. Pre-round-5 rows with no
+  // provider field are trusted.
+  // ============================================================
+  describe('provider field (Codex round 5)', () => {
+    it('write stamps provider alongside model (provider=anthropic mode)', async () => {
+      mockLlmProvider = 'anthropic';
+      const { setGlobalLLMSettingsAtomic } = await import(
+        '../../src/lib/llm-settings.js',
+      );
+      await setGlobalLLMSettingsAtomic({
+        main: 'claude-sonnet-4-6',
+        fast: 'claude-haiku-4-5-20251001',
+        expected_main: null,
+        expected_fast: null,
+        updated_by: 'founder@example.com',
+        actor_role: 'founder',
+        tenant_id: 'tenant-test',
+        comment: 'first install on anthropic provider',
+      });
+      const lastCall = globalSettingsRepoMock.updateAtomic.mock.calls.at(-1);
+      expect(lastCall).toBeDefined();
+      const passed = lastCall![0];
+      expect(passed.keys[0]!.value).toEqual({
+        model: 'claude-sonnet-4-6',
+        provider: 'anthropic',
+      });
+      expect(passed.keys[1]!.value).toEqual({
+        model: 'claude-haiku-4-5-20251001',
+        provider: 'anthropic',
+      });
+    });
+
+    it('write stamps provider=openrouter when LLM_PROVIDER=openrouter', async () => {
+      mockLlmProvider = 'openrouter';
+      const { setGlobalLLMSettingsAtomic } = await import(
+        '../../src/lib/llm-settings.js',
+      );
+      await setGlobalLLMSettingsAtomic({
+        main: 'openai/gpt-5',
+        fast: 'x-ai/grok-4.1-fast',
+        expected_main: null,
+        expected_fast: null,
+        updated_by: 'founder@example.com',
+        actor_role: 'founder',
+        tenant_id: 'tenant-test',
+        comment: 'router stamps openrouter',
+      });
+      const lastCall = globalSettingsRepoMock.updateAtomic.mock.calls.at(-1);
+      const passed = lastCall![0];
+      expect(passed.keys[0]!.value).toEqual({
+        model: 'openai/gpt-5',
+        provider: 'openrouter',
+      });
+    });
+
+    // Mismatch: stored under anthropic, current env says openrouter.
+    // Runtime must not feed claude-sonnet-4-6 to the OpenRouter client.
+    it('read falls back to env default on stored.provider !== current.provider', async () => {
+      mockLlmProvider = 'openrouter';
+      globalByKey.set('llm.model.main', {
+        value: { model: 'claude-sonnet-4-6', provider: 'anthropic' },
+        updated_at: new Date(),
+        updated_by: 'someone-on-anthropic',
+      });
+      const { getCurrentMainModel } = await import(
+        '../../src/lib/llm-settings.js',
+      );
+      // Env default for openrouter is anthropic/claude-sonnet-4.6.
+      // The stored anthropic-native slug must NOT be served.
+      expect(await getCurrentMainModel()).toBe('anthropic/claude-sonnet-4.6');
+    });
+
+    it('read uses stored value when provider matches', async () => {
+      mockLlmProvider = 'anthropic';
+      globalByKey.set('llm.model.main', {
+        value: { model: 'claude-sonnet-4-6', provider: 'anthropic' },
+        updated_at: new Date(),
+        updated_by: 'founder@example.com',
+      });
+      const { getCurrentMainModel } = await import(
+        '../../src/lib/llm-settings.js',
+      );
+      expect(await getCurrentMainModel()).toBe('claude-sonnet-4-6');
+    });
+
+    it('symmetric: stored=openrouter slug but current=anthropic → fallback', async () => {
+      mockLlmProvider = 'anthropic';
+      globalByKey.set('llm.model.main', {
+        value: { model: 'openai/gpt-5', provider: 'openrouter' },
+        updated_at: new Date(),
+        updated_by: 'someone-on-openrouter',
+      });
+      const { getCurrentMainModel } = await import(
+        '../../src/lib/llm-settings.js',
+      );
+      // Env default for anthropic is claude-sonnet-4-6.
+      expect(await getCurrentMainModel()).toBe('claude-sonnet-4-6');
+    });
+
+    it('pre-round-5 row (no provider field) is trusted unchanged', async () => {
+      mockLlmProvider = 'anthropic';
+      // Old shape: just {model}. The compat check returns ok=true so
+      // the read serves it. Migration 062 backfills the provider
+      // marker, so this branch shrinks to deployments stuck mid-rollout
+      // — explicit by design.
+      globalByKey.set('llm.model.main', {
+        value: { model: 'claude-sonnet-4-6' },
+        updated_at: new Date(),
+        updated_by: 'pre-round-5-writer',
+      });
+      const { getCurrentMainModel } = await import(
+        '../../src/lib/llm-settings.js',
+      );
+      expect(await getCurrentMainModel()).toBe('claude-sonnet-4-6');
+    });
+
+    it('mismatch emits llm_settings.provider_mismatch warn', async () => {
+      mockLlmProvider = 'openrouter';
+      globalByKey.set('llm.model.main', {
+        value: { model: 'claude-sonnet-4-6', provider: 'anthropic' },
+        updated_at: new Date(),
+        updated_by: 'someone-on-anthropic',
+      });
+      const logger = (await import('../../src/lib/logger.js')).logger as {
+        warn: ReturnType<typeof vi.fn>;
+      };
+      logger.warn.mockClear();
+      const { getCurrentMainModel } = await import(
+        '../../src/lib/llm-settings.js',
+      );
+      await getCurrentMainModel();
+      const warns = logger.warn.mock.calls.filter(
+        (c: unknown[]) => c[1] === 'llm_settings.provider_mismatch',
+      );
+      expect(warns.length).toBeGreaterThanOrEqual(1);
+      // The log payload includes both providers + the stored model so
+      // ops can spot the env flip vs the staleness in one shot.
+      const payload = warns[0]![0] as Record<string, unknown>;
+      expect(payload.stored_provider).toBe('anthropic');
+      expect(payload.current_provider).toBe('openrouter');
+      expect(payload.stored_model).toBe('claude-sonnet-4-6');
     });
   });
 

@@ -108,10 +108,39 @@ BEGIN
   END IF;
 END $$;
 
+-- Codex round 5 on PR #188 [high]: writes through the new admin-ui
+-- helper now persist `{ model, provider }` so the read path can
+-- detect `LLM_PROVIDER` env flips that would brick the runtime
+-- (Anthropic-native slug feeding the OpenRouter HTTP client and
+-- vice versa). The backfill below stamps a `provider` on the
+-- migrated value too, INFERRING it from the slug shape:
+--
+--   slug containing `/` → OpenRouter canonical form
+--   (anthropic/claude-..., openai/gpt-5, x-ai/grok-..., ...). The
+--   OpenRouter HTTP API is the only consumer of this form.
+--
+--   slug without `/` → Anthropic-native short ID (claude-sonnet-4-6,
+--   claude-haiku-4-5-20251001, ...). AnthropicProvider passes the
+--   slug straight to messages.create(), which only accepts this form.
+--
+-- This is a best-effort inference: if the operator stored an
+-- ambiguous custom slug (e.g. a fine-tune ID with no `/`), the
+-- backfill defaults to `anthropic` and the read-path provider gate
+-- will surface a `llm_settings.provider_mismatch` warn on the next
+-- call under `LLM_PROVIDER=openrouter`, prompting the operator to
+-- re-save through the admin UI. The warn includes both the stored
+-- slug and the stored vs current provider so the misclassification
+-- is observable rather than silent.
 INSERT INTO global_settings (key, value, updated_at, updated_by)
 SELECT
   'llm.model.main' AS key,
-  valor AS value,
+  jsonb_build_object(
+    'model', valor->>'model',
+    'provider', CASE
+      WHEN (valor->>'model') LIKE '%/%' THEN 'openrouter'
+      ELSE 'anthropic'
+    END
+  ) AS value,
   updated_at,
   'system:migration_062_backfill' AS updated_by
 FROM agent_facts
@@ -125,7 +154,13 @@ ON CONFLICT (key) DO NOTHING;
 INSERT INTO global_settings (key, value, updated_at, updated_by)
 SELECT
   'llm.model.fast' AS key,
-  valor AS value,
+  jsonb_build_object(
+    'model', valor->>'model',
+    'provider', CASE
+      WHEN (valor->>'model') LIKE '%/%' THEN 'openrouter'
+      ELSE 'anthropic'
+    END
+  ) AS value,
   updated_at,
   'system:migration_062_backfill' AS updated_by
 FROM agent_facts

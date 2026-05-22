@@ -21,23 +21,31 @@ import { logger } from '@/lib/logger.js';
  * the change under a single tx with `SELECT ... FOR UPDATE` so concurrent
  * founder updates can't corrupt the audit trail (round 1 [medium]).
  *
+ * Codex round 5 on PR #188 [high]: writes now persist `{ model, provider }`
+ * instead of just `{ model }`. The provider field is the snapshot of
+ * `config.LLM_PROVIDER` at write time. On read we compare the stored
+ * provider against the CURRENT `config.LLM_PROVIDER`; on mismatch we
+ * fall back to the env default (with a `llm_settings.provider_mismatch`
+ * warn) so a provider env flip can't feed an Anthropic-native slug to
+ * the OpenRouter HTTP client (or vice versa). Pre-round-5 rows that
+ * carry only `{ model }` are trusted unchanged — migration 062 backfills
+ * the provider marker via slug-shape inference, so the unmarked case
+ * shrinks to deployments mid-rollout.
+ *
  * The legacy `setCurrentMainModel` / `setCurrentFastModel` helpers below
- * are DEPRECATED SHIMS — they exist only because `src/dashboard/index.ts`
- * (legacy Fastify dashboard, removed by PR #176) still imports them. Once
- * #176 lands, both shims and the dashboard go away together.
+ * are DEPRECATED SHIMS that exist only because `src/dashboard/index.ts`
+ * (legacy Fastify dashboard, removed by PR #176) still imports them.
  *
- * Codex round 2 on PR #188 [P1]: until #176 lands, the legacy POST
- * `/dashboard/llm-settings` route still gates only on `isOwnerType` (NOT
- * founder-only) and does NOT require an audit reason. If those shims kept
- * writing to `global_settings`, ANY owner could bypass the new founder-
- * only tRPC gate and silently change the process-wide model for every
- * tenant — defeating the whole point of the founder lockdown.
- *
- * Fix: the shims now THROW. Fail-loud forces operators to use the new
- * admin-ui `/setup/llm-settings` (founder-only, audited). If PR #176 has
- * already removed the caller in prod, the throw never executes. If the
- * legacy caller is still wired up (overlap window), the operator sees a
- * clear error instead of a silent owner-tier bypass.
+ * Codex round 5 on PR #188 [high]: round 2 turned those shims into
+ * unconditional throws to lock down the legacy owner-tier bypass. That
+ * was too strict — the legacy POST handler is still mounted until
+ * #176 lands, so every owner hitting the legacy form gets a 500 during
+ * the very incident-response window the feature exists to support.
+ * Round 5 reverts the shims to legacy storage (`agent_facts`) with a
+ * `llm_settings.legacy_write_used` warn log; the dual-read fallback
+ * still picks the value up at runtime. The founder gate on the new
+ * `/setup/llm-settings` is unaffected. Both shims and the legacy
+ * dashboard go away together when #176 merges.
  */
 const KEY_MAIN = 'llm.model.main';
 const KEY_FAST = 'llm.model.fast';
@@ -64,6 +72,22 @@ function extractModel(value: unknown): string | null {
   if (value && typeof value === 'object' && 'model' in value) {
     const m = (value as { model?: unknown }).model;
     if (typeof m === 'string' && m.length > 0) return m;
+  }
+  return null;
+}
+
+/**
+ * Codex round 5 on PR #188 [high]: extract the optional `.provider`
+ * marker persisted alongside `.model`. Returns null when missing
+ * (legacy pre-round-5 rows that only stored `{ model: ... }`) or when
+ * present but malformed. Callers treat null as "trust the stored
+ * value" so existing pre-round-5 rows keep working — only rows
+ * actively written under the new shape get the strict cross-check.
+ */
+function extractProvider(value: unknown): string | null {
+  if (value && typeof value === 'object' && 'provider' in value) {
+    const p = (value as { provider?: unknown }).provider;
+    if (typeof p === 'string' && p.length > 0) return p;
   }
   return null;
 }
@@ -197,12 +221,68 @@ async function readLegacyAgentFactModel(key: string): Promise<string | null> {
 export type LLMModelSource = 'global' | 'legacy' | 'env';
 export type LLMModelRead = { value: string; source: LLMModelSource };
 
+/**
+ * Codex round 5 on PR #188 [high]: provider-compat check on read.
+ *
+ * Why: round 1 moved storage to global_settings but persisted only
+ * `{ model }`. If the founder picked `claude-sonnet-4-6` while
+ * `LLM_PROVIDER=anthropic`, then a deploy flipped `LLM_PROVIDER` to
+ * `openrouter`, the runtime would happily feed the Anthropic-native
+ * slug to the OpenRouter HTTP client — which would 400 on every call
+ * because OpenRouter requires the `anthropic/claude-...` prefixed form.
+ * Symmetric failure mode for the opposite flip.
+ *
+ * Fix: writes now persist `{ model, provider }` so each row carries
+ * the provider context in which the value is valid. On read we compare
+ * the stored `provider` against the current `config.LLM_PROVIDER`; if
+ * they don't match we fall back to the env default (via the caller —
+ * we return `null` here) and emit `llm_settings.provider_mismatch`.
+ *
+ * Pre-round-5 rows have no `.provider` field. We treat those as
+ * "trust the stored slug" — backwards-compat with deployments that
+ * already wrote `{ model }` before this round. The migration 062
+ * backfill stamps a provider on existing rows so the gap is bounded.
+ */
+function isModelCompatibleWithCurrentProvider(value: unknown): {
+  ok: boolean;
+  storedProvider: string | null;
+} {
+  const storedProvider = extractProvider(value);
+  if (storedProvider === null) {
+    // Legacy shape (no provider marker) — trust it. Round 5 mostly
+    // back-stops this with the migration 062 backfill that stamps a
+    // provider, so this branch becomes increasingly rare in prod.
+    return { ok: true, storedProvider: null };
+  }
+  return {
+    ok: storedProvider === config.LLM_PROVIDER,
+    storedProvider,
+  };
+}
+
 async function readMainModelWithSource(): Promise<LLMModelRead> {
   // (1) Canonical source: global_settings.
   try {
     const f = await globalSettingsRepo.getByKey(KEY_MAIN);
     const model = extractModel(f?.value);
-    if (model) return { value: model, source: 'global' };
+    if (model) {
+      const compat = isModelCompatibleWithCurrentProvider(f?.value);
+      if (!compat.ok) {
+        logger.warn(
+          {
+            key: KEY_MAIN,
+            stored_provider: compat.storedProvider,
+            current_provider: config.LLM_PROVIDER,
+            stored_model: model,
+          },
+          'llm_settings.provider_mismatch',
+        );
+        // Fall through to legacy → env default. Persisted value is
+        // unsafe to feed the runtime under the current provider.
+      } else {
+        return { value: model, source: 'global' };
+      }
+    }
   } catch (err) {
     logger.warn(
       { err: (err as Error).message, key: KEY_MAIN },
@@ -225,7 +305,22 @@ async function readFastModelWithSource(): Promise<LLMModelRead> {
   try {
     const f = await globalSettingsRepo.getByKey(KEY_FAST);
     const model = extractModel(f?.value);
-    if (model) return { value: model, source: 'global' };
+    if (model) {
+      const compat = isModelCompatibleWithCurrentProvider(f?.value);
+      if (!compat.ok) {
+        logger.warn(
+          {
+            key: KEY_FAST,
+            stored_provider: compat.storedProvider,
+            current_provider: config.LLM_PROVIDER,
+            stored_model: model,
+          },
+          'llm_settings.provider_mismatch',
+        );
+      } else {
+        return { value: model, source: 'global' };
+      }
+    }
   } catch (err) {
     logger.warn(
       { err: (err as Error).message, key: KEY_FAST },
@@ -268,30 +363,121 @@ export async function getCurrentFastModel(): Promise<string> {
 }
 
 /**
- * @deprecated Forbidden after the `global_settings` migration. Use the
- * admin-ui `/setup/llm-settings` page (founder-only, audited via
- * `llmSettingsRouter.update` → `setGlobalLLMSettingsAtomic`).
+ * Codex round 5 on PR #188 [high]: legacy shim soft-deprecation.
  *
- * Codex round 2 on PR #188 [P1]: the legacy POST `/dashboard/llm-settings`
- * route gates only on `isOwnerType` and does NOT require a reason. If
- * this shim wrote to `global_settings`, any owner could bypass the new
- * founder-only tRPC gate. Throwing here is the conservative fix until
- * PR #176 removes the legacy caller entirely; the throw turns a silent
- * bypass into a loud, actionable error.
+ * Why the previous fail-loud was wrong:
+ *   Round 2 turned these shims into unconditional throws on the theory
+ *   that PR #176 was about to remove the only caller (legacy
+ *   `/dashboard/llm-settings` POST). Until #176 lands, the legacy
+ *   route stays wired up — so every owner who hits the legacy form
+ *   gets a 500 during the very incident-response window the feature
+ *   exists to support. That's worse than the original bypass risk
+ *   (the founder gate has been live since round 1; legacy callers
+ *   can't reach `global_settings` regardless).
+ *
+ * Round 5 fix (Option A):
+ *   The shim now writes back to `agent_facts` (the legacy storage)
+ *   under the caller's `tenant_id`/`agent_id` context, exactly as
+ *   pre-round-1 code did. This keeps the legacy form functional —
+ *   the founder/owner can still flip the model from the legacy UI —
+ *   while the runtime read path (`getCurrent*Model`) primarily
+ *   consults `global_settings` and falls back to `agent_facts` only
+ *   when the canonical row is absent (the round 3 dual-read).
+ *
+ * Trade-off, fully spelled out so the next reader doesn't have to
+ * reconstruct it:
+ *   - In production with a single founder who uses ONLY the legacy
+ *     form, `global_settings` stays empty and the runtime continues
+ *     to serve from `agent_facts` (per the dual-read fallback). The
+ *     dual-read fallback (round 4) refuses to promote when multiple
+ *     distinct legacy values exist, so single-tenant operators are
+ *     unaffected by that guard.
+ *   - The legacy form's gate (`isOwnerType`) is weaker than the new
+ *     `/setup/llm-settings` (founder-only + audited comment). Round
+ *     2's lockdown reasoning still applies: ANY owner from the
+ *     legacy form can change a runtime model with no audit comment.
+ *     Round 5 accepts that risk for the bounded overlap window — PR
+ *     #176 retires the legacy route entirely, at which point this
+ *     shim becomes dead code and can be deleted along with these
+ *     comments.
+ *   - Each shim invocation emits `llm_settings.legacy_write_used` so
+ *     operators can monitor how often the legacy form is still in
+ *     play (chart it; when it goes to 0 in prod, #176 is safe to
+ *     ship and this code is safe to delete).
+ *
+ * Restriction: we MUST NOT touch `src/dashboard/index.ts` from this
+ * PR (it belongs to #176). That's why the soft-deprecation lives in
+ * the shim and not at the route handler.
+ *
+ * @deprecated The supported write path is admin-ui
+ * `/setup/llm-settings` (founder-only, audited via
+ * `llmSettingsRouter.update` → `setGlobalLLMSettingsAtomic`). The
+ * legacy shims remain only for the brief overlap window between this
+ * PR and #176.
  */
-export async function setCurrentMainModel(_model: string): Promise<void> {
-  throw new Error(
-    'legacy setCurrentMainModel is forbidden after global_settings migration (PR #188); use admin-ui /setup/llm-settings (founder-only)',
-  );
+export async function setCurrentMainModel(model: string): Promise<void> {
+  await writeLegacyAgentFactModel(KEY_MAIN, model);
 }
 
 /**
- * @deprecated See `setCurrentMainModel` — same fail-loud, same reason
- * (founder-only gate must own the global model switch).
+ * @deprecated See `setCurrentMainModel` — same legacy-storage fallback,
+ * same overlap-window rationale.
  */
-export async function setCurrentFastModel(_model: string): Promise<void> {
-  throw new Error(
-    'legacy setCurrentFastModel is forbidden after global_settings migration (PR #188); use admin-ui /setup/llm-settings (founder-only)',
+export async function setCurrentFastModel(model: string): Promise<void> {
+  await writeLegacyAgentFactModel(KEY_FAST, model);
+}
+
+/**
+ * Internal helper for the round-5 legacy shims. Writes the
+ * `{ "model": <slug> }` payload into `agent_facts` under a
+ * synthetic tenant/agent context (matching the pre-round-1
+ * single-tenant behavior of these setters). NOT used by the new
+ * admin-ui flow — that path goes through `setGlobalLLMSettingsAtomic`
+ * directly.
+ *
+ * Why the synthetic context: the legacy POST `/dashboard/llm-settings`
+ * Fastify handler does NOT wrap the request in `runWithTenantContext`
+ * (there's no global tenant middleware in `src/dashboard/index.ts`).
+ * Pre-round-1 callers therefore relied on `agent_facts.tenant_id`'s
+ * default value (`'default'`) — but `factsRepo.upsert` runs through
+ * `applyTenantGuard`, which raises `MissingTenantContextError` when no
+ * context is active. To preserve the legacy single-tenant behavior
+ * we wrap the upsert in `runWithTenantContext({tenant_id:'default',
+ * agent_id:'default'}, ...)`. That mirrors the original storage row
+ * (`agent_facts (tenant_id='default', agent_id='default', escopo=
+ * 'global', chave='llm.model.*')`), which the dual-read fallback in
+ * `readLegacyAgentFactModel` knows how to find.
+ *
+ * The deprecation log is emitted at WARN so operators can chart the
+ * legacy-form usage and confirm zero hits before PR #176 retires the
+ * legacy route — at which point this entire helper and both shims
+ * become dead code.
+ */
+async function writeLegacyAgentFactModel(
+  key: string,
+  model: string,
+): Promise<void> {
+  logger.warn(
+    { key, caller_route: 'legacy /dashboard/llm-settings (presumed)', model },
+    'llm_settings.legacy_write_used',
+  );
+  // Imported here (not at module top) so the unit test mock for
+  // `repositories.js` and `tenant-context.js` can swap the real
+  // implementations before this code runs — module-level imports
+  // would resolve before the vi.mock hooks fire on first import of
+  // llm-settings.ts.
+  const { factsRepo } = await import('@/db/repositories.js');
+  const { runWithTenantContext } = await import('@/db/tenant-context.js');
+  await runWithTenantContext(
+    { tenant_id: 'default', agent_id: 'default' },
+    async () => {
+      await factsRepo.upsert({
+        escopo: 'global',
+        chave: key,
+        valor: { model },
+        fonte: 'configurado',
+      });
+    },
   );
 }
 
@@ -360,19 +546,33 @@ export async function setGlobalLLMSettingsAtomic(input: {
   // compares `lockedValue === null` (placeholder JSON null) against
   // `null` and proceeds. When expected_* is a string we wrap it in
   // the same `{ model: <slug> }` shape persisted writes use.
+  //
+  // Codex round 5 [high]: writes now ALSO persist `provider` so the
+  // read path can detect provider env flips and refuse to feed an
+  // incompatible slug to the runtime. The `expected` comparison still
+  // wraps only `{ model }` because pre-round-5 rows have no provider
+  // marker — comparing against the stored shape (which includes
+  // provider on round-5+ writes) would falsely conflict on any row
+  // observed before the first round-5 write. The expected check is
+  // a model-identity guard, not a provider-marker guard.
   const wrapExpected = (v: string | null): Record<string, unknown> | null =>
     v === null ? null : { model: v };
+
+  // Codex round 5 [high]: stamp the CURRENT provider on each write
+  // so the read path can validate that the slug was authored under
+  // the same provider context now in effect.
+  const currentProvider = config.LLM_PROVIDER;
 
   const res = await globalSettingsRepo.updateAtomic({
     keys: [
       {
         key: KEY_MAIN,
-        value: { model: input.main },
+        value: { model: input.main, provider: currentProvider },
         expected: wrapExpected(input.expected_main),
       },
       {
         key: KEY_FAST,
-        value: { model: input.fast },
+        value: { model: input.fast, provider: currentProvider },
         expected: wrapExpected(input.expected_fast),
       },
     ],

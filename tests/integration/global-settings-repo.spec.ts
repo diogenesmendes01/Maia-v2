@@ -703,4 +703,215 @@ d('globalSettingsRepo.getByKey + updateAtomic (real DB)', () => {
     const main = await globalSettingsRepo.getByKey('llm.model.main');
     expect(main?.value).toEqual({ model: 'someone-already-wrote' });
   });
+
+  /**
+   * Codex round 5 on PR #188 [high]: round-5 writes through the helper
+   * stamp `{ model, provider }` on each global_settings row. The
+   * repo's `updateAtomic` now uses a "key-subset" compare semantic so
+   * an expected token observed in the pre-round-5 shape (just
+   * `{ model }`) still matches a round-5 row (`{ model, provider }`).
+   * This protects the optimistic-conflict path from false positives
+   * during the rolling deploy between this PR and the migration
+   * stamping `provider` on existing rows.
+   */
+  it('round 5: subset-compare lets {model} expected match {model, provider} locked', async () => {
+    const { globalSettingsRepo } = await import('../../src/db/repositories.js');
+
+    // Seed under the round-5 shape (model + provider).
+    await globalSettingsRepo.updateAtomic({
+      keys: [
+        {
+          key: 'llm.model.main',
+          value: { model: 'claude-sonnet-4-6', provider: 'anthropic' },
+        },
+      ],
+      audit: {
+        tenant_id: T,
+        actor_id: 'seed',
+        actor_role: 'system',
+        action: 'llm_model_changed',
+        resource_type: 'llm_settings',
+      },
+    });
+
+    // Caller observed only the model (pre-round-5 shape). Subset
+    // compare must accept it.
+    const res = await globalSettingsRepo.updateAtomic({
+      keys: [
+        {
+          key: 'llm.model.main',
+          value: { model: 'claude-haiku-4-5', provider: 'anthropic' },
+          expected: { model: 'claude-sonnet-4-6' },
+        },
+      ],
+      audit: {
+        tenant_id: T,
+        actor_id: ACTOR_A,
+        actor_role: 'founder',
+        action: 'llm_model_changed',
+        resource_type: 'llm_settings',
+      },
+    });
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error('unreachable');
+    expect(res.after).toEqual({
+      'llm.model.main': { model: 'claude-haiku-4-5', provider: 'anthropic' },
+    });
+  });
+
+  /**
+   * Codex round 5 [high]: even with subset compare, a model-field
+   * mismatch still produces optimistic_conflict. The guard is "expected
+   * fields equal corresponding locked fields"; if expected.model
+   * disagrees with locked.model, the lock catches it.
+   */
+  it('round 5: subset-compare still fires on real model mismatch', async () => {
+    const { globalSettingsRepo } = await import('../../src/db/repositories.js');
+
+    await globalSettingsRepo.updateAtomic({
+      keys: [
+        {
+          key: 'llm.model.main',
+          value: { model: 'claude-sonnet-4-6', provider: 'anthropic' },
+        },
+      ],
+      audit: {
+        tenant_id: T,
+        actor_id: 'seed',
+        actor_role: 'system',
+        action: 'llm_model_changed',
+        resource_type: 'llm_settings',
+      },
+    });
+
+    const res = await globalSettingsRepo.updateAtomic({
+      keys: [
+        {
+          key: 'llm.model.main',
+          value: { model: 'claude-opus-4-7', provider: 'anthropic' },
+          expected: { model: 'a-stale-snapshot' },
+        },
+      ],
+      audit: {
+        tenant_id: T,
+        actor_id: ACTOR_A,
+        actor_role: 'founder',
+        action: 'llm_model_changed',
+        resource_type: 'llm_settings',
+      },
+    });
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error('unreachable');
+    expect(res.reason).toBe('optimistic_conflict');
+  });
+});
+
+/**
+ * Codex round 5 on PR #188 [medium]: migration 062 down preserves
+ * founder-driven `global_settings.llm.model.*` choices by backfilling
+ * them into `agent_facts` (the legacy storage the pre-062 code reads)
+ * before dropping the table. Without this, a rollback right after an
+ * incident-time model switch silently loses the operator's pick.
+ *
+ * The test applies the down migration's SQL directly so we don't need
+ * a migration runner: it's the same SQL the runner would emit.
+ */
+d('migration 062 down: backfill into agent_facts before DROP', () => {
+  it('preserves llm.model.main/fast from global_settings into agent_facts', async () => {
+    const c = await pool.connect();
+    try {
+      // Seed global_settings with the round-5 shape so the backfill
+      // SQL has something to copy.
+      await c.query(
+        `INSERT INTO global_settings(key, value, updated_at, updated_by)
+         VALUES ($1, $2, now(), 'test-seeder')
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+        [
+          'llm.model.main',
+          JSON.stringify({ model: 'claude-sonnet-4-6', provider: 'anthropic' }),
+        ],
+      );
+      await c.query(
+        `INSERT INTO global_settings(key, value, updated_at, updated_by)
+         VALUES ($1, $2, now(), 'test-seeder')
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+        [
+          'llm.model.fast',
+          JSON.stringify({
+            model: 'claude-haiku-4-5-20251001',
+            provider: 'anthropic',
+          }),
+        ],
+      );
+
+      // Purge any pre-existing legacy rows so the test is deterministic.
+      await c.query(
+        `DELETE FROM agent_facts
+         WHERE tenant_id = 'default'
+           AND agent_id = 'default'
+           AND escopo = 'global'
+           AND chave IN ('llm.model.main', 'llm.model.fast')`,
+      );
+
+      // Run the same SQL the down migration ships. NOT the final DROP —
+      // that would break other tests in this suite that need the table.
+      await c.query(`
+        INSERT INTO agent_facts (
+          tenant_id, agent_id, escopo, chave, valor, confianca, fonte, updated_at
+        )
+        SELECT
+          'default','default','global','llm.model.main',
+          jsonb_build_object('model', value->>'model'),
+          1.00,'configurado',updated_at
+        FROM global_settings
+        WHERE key = 'llm.model.main' AND value ? 'model'
+        ON CONFLICT (tenant_id, agent_id, escopo, chave) DO UPDATE
+          SET valor = EXCLUDED.valor,
+              updated_at = EXCLUDED.updated_at,
+              fonte = EXCLUDED.fonte;
+      `);
+      await c.query(`
+        INSERT INTO agent_facts (
+          tenant_id, agent_id, escopo, chave, valor, confianca, fonte, updated_at
+        )
+        SELECT
+          'default','default','global','llm.model.fast',
+          jsonb_build_object('model', value->>'model'),
+          1.00,'configurado',updated_at
+        FROM global_settings
+        WHERE key = 'llm.model.fast' AND value ? 'model'
+        ON CONFLICT (tenant_id, agent_id, escopo, chave) DO UPDATE
+          SET valor = EXCLUDED.valor,
+              updated_at = EXCLUDED.updated_at,
+              fonte = EXCLUDED.fonte;
+      `);
+
+      const mainRow = await c.query<{ valor: { model: string } }>(
+        `SELECT valor FROM agent_facts
+         WHERE tenant_id='default' AND agent_id='default'
+           AND escopo='global' AND chave='llm.model.main'`,
+      );
+      expect(mainRow.rows[0]!.valor).toEqual({ model: 'claude-sonnet-4-6' });
+
+      const fastRow = await c.query<{ valor: { model: string } }>(
+        `SELECT valor FROM agent_facts
+         WHERE tenant_id='default' AND agent_id='default'
+           AND escopo='global' AND chave='llm.model.fast'`,
+      );
+      expect(fastRow.rows[0]!.valor).toEqual({
+        model: 'claude-haiku-4-5-20251001',
+      });
+
+      // Cleanup our seeded legacy rows so other tests aren't affected.
+      await c.query(
+        `DELETE FROM agent_facts
+         WHERE tenant_id = 'default'
+           AND agent_id = 'default'
+           AND escopo = 'global'
+           AND chave IN ('llm.model.main', 'llm.model.fast')`,
+      );
+    } finally {
+      c.release();
+    }
+  });
 });

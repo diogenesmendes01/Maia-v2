@@ -6007,6 +6007,62 @@ export const debugSnapshotGrantsRepo = {
  *   UPSERT, then audit — all in one withTx. Audit `before` is the actual
  *   locked value; audit `after` is what the UPSERT just committed.
  */
+/**
+ * Codex round 5 on PR #188 [high]: subset-match comparator used by
+ * `globalSettingsRepo.updateAtomic`'s optimistic-concurrency check.
+ *
+ *   - `expected === null` ⇔ "no row should exist". Matches only when
+ *     `locked === null` (covers both SQL NULL and the placeholder
+ *     'null'::jsonb that updateAtomic INSERTs before the FOR UPDATE).
+ *   - `expected = { k1: v1, ... }` ⇔ for each key in `expected`, the
+ *     corresponding key in `locked` must deep-equal that value. Extra
+ *     keys in `locked` (e.g. `provider` stamped by round-5 writes when
+ *     the caller only observed `model`) are allowed. This is the
+ *     key behavioral change that lets the LLM settings helper grow
+ *     the persisted jsonb shape without breaking clients that observed
+ *     only the older shape.
+ *
+ * Equality on nested values is JSON-canonical (`JSON.stringify`
+ * after a stable key sort). All values stored in `global_settings` so
+ * far are plain JSON (no functions, dates, etc.), so this is safe.
+ */
+function matchesExpected(
+  locked: unknown,
+  expected: Record<string, unknown> | null,
+): boolean {
+  if (expected === null) {
+    // "Expect no row" — locked must be one of the null shapes.
+    return locked === null;
+  }
+  if (locked === null || typeof locked !== 'object') {
+    // Caller asked for fields; locked has none to offer.
+    return false;
+  }
+  const lockedObj = locked as Record<string, unknown>;
+  for (const k of Object.keys(expected)) {
+    if (canonicalize(lockedObj[k]) !== canonicalize(expected[k])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function canonicalize(v: unknown): string {
+  return JSON.stringify(sortKeys(v));
+}
+
+function sortKeys(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(sortKeys);
+  if (v && typeof v === 'object') {
+    const o: Record<string, unknown> = {};
+    for (const k of Object.keys(v as object).sort()) {
+      o[k] = sortKeys((v as Record<string, unknown>)[k]);
+    }
+    return o;
+  }
+  return v;
+}
+
 export const globalSettingsRepo = {
   /**
    * Read a single global setting by key. Returns null if the key is not
@@ -6066,12 +6122,21 @@ export const globalSettingsRepo = {
       key: string;
       value: Record<string, unknown>;
       // Codex round 3 on PR #188 [P2]: optional optimistic-concurrency
-      // pre-check. When set, the locked value MUST deep-equal `expected`
+      // pre-check. When set, the locked value MUST match `expected`
       // or the whole tx aborts with `reason: 'optimistic_conflict'`. The
       // check runs INSIDE the tx, AFTER the SELECT ... FOR UPDATE, so
       // it's race-free against concurrent writers. `expected = null`
       // means "expect the key to be unset"; `expected = undefined` (or
       // omitted) means "no expectation, proceed unconditionally".
+      //
+      // Codex round 5 on PR #188 [high]: the comparison semantic is
+      // "expected is a key-subset of locked" — every field in
+      // `expected` must equal the same field in `lockedValue`, but
+      // locked may have additional fields. This lets writes that grow
+      // the persisted shape (e.g. adding `provider` alongside `model`)
+      // keep accepting clients that observed only the old shape. If a
+      // caller wants strict full-shape equality, pass every locked-
+      // shape field in `expected`.
       expected?: Record<string, unknown> | null;
     }>;
     audit: {
@@ -6173,10 +6238,20 @@ export const globalSettingsRepo = {
         // throw, and so `before` is populated for the response. The
         // throw below converts the conflict into the typed return
         // shape after the loop.
+        //
+        // Codex round 5 [high]: comparison is "expected is a key-subset
+        // of locked" — every key present in `expected` must match the
+        // same key in `lockedValue`, but lockedValue may have extra
+        // keys. This lets the LLM settings helper grow the persisted
+        // shape (adding `provider` next to `model`) without breaking
+        // optimistic-conflict checks from clients that observed only
+        // the older `{ model }` shape. The two edge cases (expected
+        // === null and locked === null) keep their original strict
+        // equality — those signal "no row" and must match exactly.
         if (
           entry.expected !== undefined &&
           conflict === null &&
-          JSON.stringify(lockedValue) !== JSON.stringify(entry.expected)
+          !matchesExpected(lockedValue, entry.expected)
         ) {
           conflict = {
             key: entry.key,

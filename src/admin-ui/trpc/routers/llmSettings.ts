@@ -79,6 +79,23 @@ const ModelSlugSchema = z
  * vendor prefix, lower-case alphanumerics + dashes. The catalog
  * route hides incompatible items in anthropic mode (see `catalog`).
  *
+ * Codex round 5 on PR #188 [P2]: round 4 still accepted ANY lowercase-
+ * hyphenated short ID (`gpt-5`, `not-a-model`, ...). That blew up at
+ * runtime because AnthropicProvider passes the stored slug straight to
+ * `messages.create({ model })`, which 404s on every non-Anthropic slug.
+ * Constrain the regex to require the `claude-` prefix. This is
+ * conservative — every Anthropic model since 2023 is `claude-*` — and
+ * forward-compatible with future Claude families that the SDK accepts
+ * directly. Dots ARE allowed in the tail because some published
+ * Anthropic IDs use them (e.g. `claude-3.5-sonnet-...`); the SDK
+ * accepts both hyphen and dot variants for those.
+ *
+ * Trade-off: if Anthropic ever ships a non-claude-prefixed model ID
+ * (no current sign of this), this regex must be updated. A more
+ * defensive alternative is an explicit allowlist that we bump per
+ * release, but that requires a code change every time Anthropic
+ * publishes a new ID. The regex form is the middle ground.
+ *
  * The check runs at the router boundary (NOT zod, because it needs the
  * runtime config). A future provider could be added with no schema
  * change — just extend the switch.
@@ -89,16 +106,19 @@ function isSlugCompatible(
 ): boolean {
   if (provider === 'openrouter') return true;
   if (provider === 'anthropic') {
-    // Codex round 4 [high]: Anthropic native short IDs ONLY. No slash
-    // means no vendor prefix; the AnthropicProvider passes the slug
-    // straight to the SDK so it MUST be a real Anthropic model ID
-    // (`claude-sonnet-4-6`, `claude-haiku-4-5-20251001`, etc.).
+    // Codex round 5 [P2]: Anthropic native IDs MUST start with
+    // `claude-` so we reject generic lowercase-hyphenated slugs like
+    // `gpt-5` or `not-a-model` that would runtime-404 the moment the
+    // founder applies them. AnthropicProvider passes the stored value
+    // straight to messages.create({ model }), so persisting an
+    // incompatible slug bricks every LLM call.
+    //
+    // The `[a-z0-9.-]+` tail is intentionally generous (hyphens AND
+    // dots) — historical Anthropic IDs use either separator
+    // (`claude-sonnet-4-6` vs `claude-3.5-sonnet-...`). Both forms are
+    // accepted by the SDK.
     if (slug.includes('/')) return false;
-    // Native IDs: lower-case letters/digits/hyphens only. The SDK is
-    // strict about format — reject anything with dots, underscores, or
-    // upper-case to avoid persisting a typo that the runtime would
-    // then 404 on.
-    return /^[a-z0-9-]+$/.test(slug);
+    return /^claude-[a-z0-9.-]+$/.test(slug);
   }
   // Unknown provider: be permissive — config validation upstream should
   // catch this before we ever reach the router.
@@ -113,17 +133,26 @@ function isSlugCompatible(
  * entry (the OpenRouter API returns its anthropic items in
  * `anthropic/claude-sonnet-4.6` form, but the Anthropic SDK needs
  * `claude-sonnet-4-6`). Conservative: only normalize when the result
- * passes `isSlugCompatible` (`/^[a-z0-9-]+$/`). On any ambiguity we
- * drop the item rather than guess.
+ * passes `isSlugCompatible`. On any ambiguity we drop the item
+ * rather than guess.
+ *
+ * Codex round 5 [P2]: aligned the gate to `^claude-[a-z0-9.-]+$`. The
+ * tail-after-prefix check below has to agree with that or the catalog
+ * filter would hide entries that the gate would actually accept on
+ * update.
  */
 function normalizeAnthropicSlug(slug: string): string | null {
   if (!slug.startsWith('anthropic/')) return null;
   const tail = slug.slice('anthropic/'.length);
   // Map `.` → `-` (OpenRouter uses `claude-sonnet-4.6`; Anthropic SDK
-  // uses `claude-sonnet-4-6`). Drop anything that still doesn't pass
-  // the native-format check.
+  // historically uses `claude-sonnet-4-6`). The gate now accepts dots
+  // too, but normalizing to hyphens preserves the safer canonical form
+  // for SDK calls — Anthropic accepts both, the hyphen form is the
+  // documented one.
   const candidate = tail.replace(/\./g, '-');
-  return /^[a-z0-9-]+$/.test(candidate) ? candidate : null;
+  // Final sanity: must still pass the same regex `isSlugCompatible`
+  // uses in Anthropic mode. Drop the entry rather than guess.
+  return /^claude-[a-z0-9.-]+$/.test(candidate) ? candidate : null;
 }
 
 const UpdateInputSchema = z.object({
@@ -284,14 +313,14 @@ export const llmSettingsRouter = router({
             message:
               `${field}=${slug} is incompatible with the active LLM provider (${provider}). ` +
               (provider === 'anthropic'
-                ? // Codex round 4 [high]: Anthropic mode requires the
-                  // SDK-native short ID (no slash, no vendor prefix —
-                  // e.g. `claude-sonnet-4-6`). OpenRouter-formatted
-                  // slugs like `anthropic/claude-sonnet-4.6` are
-                  // rejected because the runtime passes the value
-                  // straight to messages.create() and the SDK rejects
-                  // anything that isn't a native ID.
-                  'Anthropic provider requires the SDK-native short ID (e.g. claude-sonnet-4-6 — no slash, no vendor prefix). OpenRouter-style slugs like anthropic/claude-sonnet-4.6 are not accepted.'
+                ? // Codex round 5 [P2]: Anthropic mode requires a
+                  // `claude-` prefixed SDK-native ID (e.g.
+                  // `claude-sonnet-4-6`). Generic lowercase-hyphenated
+                  // slugs like `gpt-5` or `not-a-model` are rejected
+                  // because the runtime passes the value straight to
+                  // messages.create() and the SDK 404s on every
+                  // non-Anthropic slug.
+                  'Anthropic provider requires a claude-* native short ID (e.g. claude-sonnet-4-6 — no slash, no vendor prefix). OpenRouter-style slugs like anthropic/claude-sonnet-4.6 and non-Anthropic IDs like gpt-5 are not accepted.'
                 : `Provider ${provider} does not accept this slug.`),
           });
         }
