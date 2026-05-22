@@ -185,6 +185,26 @@ export function oidcProviderEnabled(): boolean {
           `See issue #167.`,
       );
     }
+    // Codex Adversarial Review round 3 on PR #176, [high]: the length guard
+    // alone passes a long-but-public placeholder like the `changeme-...`
+    // value shipped in `.env.example`. Re-use the placeholder rejection
+    // already applied to NEXTAUTH_SECRET so an operator who forgets to
+    // rotate doesn't boot prod with a publicly-known confidential-client
+    // secret. The value itself is never echoed back — only the fact that
+    // it matched a known pattern.
+    if (isKnownPlaceholderSecret(clientSecret)) {
+      throw new Error(
+        `P8.5 auth: OIDC_CLIENT_SECRET matches a known placeholder pattern ` +
+          `(starts with "changeme-", contains "changeme", "__PLACEHOLDER", ` +
+          `"__SET_ME__", or "dev-secret-change-in-prod"). ` +
+          `Refusing to boot — placeholders ship in \`.env.example\` and are ` +
+          `publicly known, so a confidential-client OIDC secret using one is ` +
+          `forgeable by anyone with read access to the repo. ` +
+          `Rotate to a real IdP-issued secret (typically 32-64 random chars), ` +
+          `or unset OIDC_ISSUER to disable the OIDC provider entirely. ` +
+          `See PR #176 review.`,
+      );
+    }
     if (tenantSlugs.length === 0) {
       throw new Error(
         `P8.5 auth: OIDC_ISSUER is set but OIDC_TENANT_SLUGS is empty ` +

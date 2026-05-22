@@ -414,6 +414,49 @@ describe('oidcProviderEnabled — gating', () => {
     }
   });
 
+  // Codex Adversarial Review round 3 on PR #176, [high]: the length guard
+  // alone passes a long-but-public placeholder. The placeholder-rejection
+  // helper must fire on OIDC_CLIENT_SECRET too, not just NEXTAUTH_SECRET.
+  it('PROD: OIDC_CLIENT_SECRET = .env.example placeholder ⇒ THROWS placeholder rejection', () => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'production';
+    // The literal `.env.example` value (post-fix): 32-64 chars, "__SET_ME__".
+    process.env.OIDC_CLIENT_SECRET =
+      '__SET_ME__copy_from_IdP_typically_32_to_64_random_chars';
+    expect(() => oidcProviderEnabled()).toThrow(/known placeholder pattern/i);
+    // Value itself must not appear in the error.
+    try {
+      oidcProviderEnabled();
+      throw new Error('expected throw');
+    } catch (err) {
+      const msg = (err as Error).message;
+      expect(msg).not.toContain('__SET_ME__copy_from_IdP_typically_32_to_64_random_chars');
+    }
+  });
+
+  it.each([
+    'changeme-generate-with-openssl-rand-32-64-chars-please',
+    'changeme-32-to-64-random-chars-padded-to-length-32',
+    'admin__PLACEHOLDER__1234567890abcdef',
+    'oidc-dev-secret-change-in-prod-pad-to-32-chars',
+  ])('PROD: OIDC_CLIENT_SECRET = %s ⇒ THROWS placeholder rejection', (val) => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'production';
+    process.env.OIDC_CLIENT_SECRET = val;
+    expect(() => oidcProviderEnabled()).toThrow(/placeholder/i);
+  });
+
+  it('PROD: high-entropy real OIDC secret passes (regression)', () => {
+    setOidcEnabledEnv();
+    process.env.NODE_ENV = 'production';
+    // Typical Auth0/Keycloak/Okta secret shape — 64 chars, no placeholder
+    // substring. Must NOT be rejected.
+    process.env.OIDC_CLIENT_SECRET =
+      'jH8xL4mP9qN3vK7tF2cR6yS5wB1zA0eD8gM4nQ6uV9pT3rX2hY7kJ5fZbCdGeI';
+    expect(() => oidcProviderEnabled()).not.toThrow();
+    expect(oidcProviderEnabled()).toBe(true);
+  });
+
   it('PROD: ISSUER valid + TENANT_SLUGS unset ⇒ THROWS', () => {
     setOidcEnabledEnv();
     process.env.NODE_ENV = 'production';

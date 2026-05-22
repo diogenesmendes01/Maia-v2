@@ -10,10 +10,26 @@
 #   intermediate layers (and remote builder caches), and slows the build.
 
 # ─── Secrets / operator state ────────────────────────────────────────────
-.env
-.env.local
-.env.*.local
-# .env.example IS public and intentionally included.
+# Codex Adversarial Review round 3 on PR #176, [high]: the previous list
+# (`.env`, `.env.local`, `.env.*.local`) still let `.env.production`,
+# `.env.staging`, `.env.development`, etc. through. Block ALL `.env*` files
+# and un-ignore only `.env.example` (the public template).
+.env*
+!.env.example
+
+# .npmrc commonly carries registry tokens. Same with shell-history,
+# OS-keystore exports, PEM/PFX/PKCS#12 material.
+.npmrc
+.netrc
+.aws/
+.ssh/
+*.pem
+*.key
+*.crt
+*.pfx
+*.p12
+secrets/
+secret/
 
 # ─── Auth / runtime state ────────────────────────────────────────────────
 .baileys-auth/
