@@ -66,9 +66,15 @@ const UpdateInputSchema = z.object({
   // that as a no-op for that side (see logic below).
   main: ModelSlugSchema,
   fast: ModelSlugSchema,
+  // Codex round 2 on PR #188 [P3]: the previous schema validated the raw
+  // character count, so a 10-space comment passed validation and the
+  // audit row would record a forensically-useless reason. `.trim()` runs
+  // BEFORE `.min(10)` so whitespace-only comments are rejected at the
+  // server (the audit boundary), not just at the UI which already trims.
   comment: z
     .string()
-    .min(10, 'comment must be at least 10 characters')
+    .trim()
+    .min(10, 'comment must be at least 10 non-whitespace characters')
     .max(1000, 'comment must be at most 1000 characters'),
 });
 

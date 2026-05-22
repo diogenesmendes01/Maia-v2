@@ -4,4 +4,9 @@
 -- caller (llmSettingsRouter + getCurrent*Model fallback) tolerates the
 -- table being absent — getByKey returns null on error and the env-var
 -- default takes over.
+--
+-- The Codex round 2 [P2] backfill from `agent_facts` is also wiped by
+-- this DROP — that is intentional: the source rows in `agent_facts`
+-- still exist (we don't delete them in the up migration), so re-running
+-- 062 up replays the backfill cleanly without manual operator work.
 DROP TABLE IF EXISTS global_settings;

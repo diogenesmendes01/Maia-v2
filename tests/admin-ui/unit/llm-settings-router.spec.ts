@@ -289,6 +289,32 @@ describe('llmSettingsRouter.update — input validation', () => {
     ).rejects.toThrow();
   });
 
+  // Codex round 2 on PR #188 [P3]: the previous schema validated raw
+  // character count, so a 10-space comment slipped through and the audit
+  // row was forensically empty. The schema now trims before min-length
+  // check.
+  it('rejects whitespace-only comment (10 spaces, was a bypass pre-trim)', async () => {
+    await expect(
+      caller('founder').update({
+        main: 'openai/gpt-5',
+        fast: 'x-ai/grok-4.1-fast',
+        comment: '          ', // 10 spaces — would have passed pre-trim
+      }),
+    ).rejects.toThrow();
+    expect(atomicCalls).toHaveLength(0); // never reached the atomic helper
+  });
+
+  it('rejects tab/newline-only comment (whitespace audit reason is useless)', async () => {
+    await expect(
+      caller('founder').update({
+        main: 'openai/gpt-5',
+        fast: 'x-ai/grok-4.1-fast',
+        comment: '\t\t\n\n  \t  \n  \t', // mixed whitespace, > 10 chars
+      }),
+    ).rejects.toThrow();
+    expect(atomicCalls).toHaveLength(0);
+  });
+
   it('rejects comment over 1000 chars', async () => {
     await expect(
       caller('founder').update({

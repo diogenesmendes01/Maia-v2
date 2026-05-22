@@ -6034,10 +6034,20 @@ export const globalSettingsRepo = {
    * back together.
    *
    * Steps inside the tx:
-   *   1. For each key, `SELECT value FROM global_settings WHERE key = $1
-   *      FOR UPDATE` — locks the row (or no rows, if absent). Concurrent
-   *      writers wait here.
-   *   2. Compute `before[key]` from the locked value (or null for absent).
+   *   1. For each key, first `INSERT ... ON CONFLICT DO NOTHING` with a
+   *      JSON-null placeholder, then `SELECT value FROM global_settings
+   *      WHERE key = $1 FOR UPDATE` — Codex round 2 [P2] showed that
+   *      without the placeholder, `FOR UPDATE` on a non-existent row
+   *      doesn't take any lock, so two concurrent first-writers on a
+   *      fresh deploy could both read null and both UPSERT, producing
+   *      audit rows whose `before`/`after` don't match the committed DB
+   *      state. The placeholder INSERT serializes the race because the
+   *      conflict path waits on the inserting tx's row-level lock; the
+   *      subsequent SELECT FOR UPDATE then holds the lock for the rest
+   *      of this tx. Concurrent writers wait here.
+   *   2. Compute `before[key]` from the locked value (JSON null and SQL
+   *      NULL both coalesce to JS null — pre-062 rows and the new
+   *      placeholder look identical to callers).
    *   3. For each key where `before !== requested`, UPSERT new value with
    *      `updated_at = now`, `updated_by = audit.actor_id`.
    *   4. If NO key actually changed, return `{ ok:false, reason:'no_changes', before }`
@@ -6089,12 +6099,37 @@ export const globalSettingsRepo = {
       const sortedKeys = [...input.keys].sort((a, b) => a.key.localeCompare(b.key));
 
       for (const entry of sortedKeys) {
+        // Codex round 2 on PR #188 [P2]: `SELECT ... FOR UPDATE` does NOT
+        // lock a row that doesn't exist. Migration 062 ships the
+        // `global_settings` table empty, so two concurrent founders on a
+        // fresh deploy could both read `null` here, both UPSERT, and end
+        // up with an audit row whose `before` claims null but whose
+        // `after` reflects only one founder's input — the same forensic-
+        // gap class as round 1 [medium]. Fix: insert a placeholder row
+        // via ON CONFLICT DO NOTHING BEFORE the FOR UPDATE select. The
+        // placeholder uses `'null'::jsonb` as the value so the lineage
+        // starts at literal null (not at a fake string) — `before[key]`
+        // computed below honors that. Once the row exists, the FOR
+        // UPDATE on the next select actually serializes concurrent txs.
+        await tx.execute(sql`
+          INSERT INTO ${global_settings} (key, value, updated_at, updated_by)
+          VALUES (${entry.key}, 'null'::jsonb, now(), ${input.audit.actor_id})
+          ON CONFLICT (key) DO NOTHING
+        `);
+
         const locked = await tx
           .select()
           .from(global_settings)
           .where(eq(global_settings.key, entry.key))
           .for('update')
           .limit(1);
+        // Treat the placeholder JSON null exactly like a never-set row so
+        // existing callers (and the "no_changes" check below) keep the
+        // null-as-absent semantics. With the placeholder INSERT above the
+        // row now always exists, but its value can be SQL NULL (legacy
+        // pre-062 rows, if any) OR JSON null (placeholder from this tx)
+        // OR a real `{model: "..."}` payload (a prior committed write).
+        // Both null shapes coalesce to JS `null` here.
         const lockedValue = locked[0]?.value ?? null;
         before[entry.key] = lockedValue;
         after[entry.key] = entry.value;

@@ -19,13 +19,22 @@ import { config } from '@/config/env.js';
  * founder updates can't corrupt the audit trail (round 1 [medium]).
  *
  * The legacy `setCurrentMainModel` / `setCurrentFastModel` helpers below
- * are SHIMS — they exist only because `src/dashboard/index.ts` (legacy
- * Fastify dashboard, removed by PR #176) still imports them. Once #176
- * mergers, both shims and the dashboard go away together. The shims write
- * directly to `global_settings` (single-key, no audit row) so behavior
- * stays consistent if anyone manages to hit the legacy route mid-overlap;
- * they DO NOT use the atomic helper because the legacy dashboard wasn't
- * audited either, and a partial-write fallback there is fine.
+ * are DEPRECATED SHIMS — they exist only because `src/dashboard/index.ts`
+ * (legacy Fastify dashboard, removed by PR #176) still imports them. Once
+ * #176 lands, both shims and the dashboard go away together.
+ *
+ * Codex round 2 on PR #188 [P1]: until #176 lands, the legacy POST
+ * `/dashboard/llm-settings` route still gates only on `isOwnerType` (NOT
+ * founder-only) and does NOT require an audit reason. If those shims kept
+ * writing to `global_settings`, ANY owner could bypass the new founder-
+ * only tRPC gate and silently change the process-wide model for every
+ * tenant — defeating the whole point of the founder lockdown.
+ *
+ * Fix: the shims now THROW. Fail-loud forces operators to use the new
+ * admin-ui `/setup/llm-settings` (founder-only, audited). If PR #176 has
+ * already removed the caller in prod, the throw never executes. If the
+ * legacy caller is still wired up (overlap window), the operator sees a
+ * clear error instead of a silent owner-tier bypass.
  */
 const KEY_MAIN = 'llm.model.main';
 const KEY_FAST = 'llm.model.fast';
@@ -69,41 +78,31 @@ export async function getCurrentFastModel(): Promise<string> {
 }
 
 /**
- * @deprecated Use `setGlobalLLMSettingsAtomic` from llmSettingsRouter (or
- * `globalSettingsRepo.updateAtomic` directly) so the change is audited
- * atomically. Kept here only as a compat shim for `src/dashboard/index.ts`
- * (legacy Fastify dashboard removed by PR #176). When #176 lands, delete
- * this function and its caller in the legacy dashboard together.
+ * @deprecated Forbidden after the `global_settings` migration. Use the
+ * admin-ui `/setup/llm-settings` page (founder-only, audited via
+ * `llmSettingsRouter.update` → `setGlobalLLMSettingsAtomic`).
+ *
+ * Codex round 2 on PR #188 [P1]: the legacy POST `/dashboard/llm-settings`
+ * route gates only on `isOwnerType` and does NOT require a reason. If
+ * this shim wrote to `global_settings`, any owner could bypass the new
+ * founder-only tRPC gate. Throwing here is the conservative fix until
+ * PR #176 removes the legacy caller entirely; the throw turns a silent
+ * bypass into a loud, actionable error.
  */
-export async function setCurrentMainModel(model: string): Promise<void> {
-  await globalSettingsRepo.updateAtomic({
-    keys: [{ key: KEY_MAIN, value: { model } }],
-    audit: {
-      tenant_id: 'system',
-      actor_id: 'legacy-dashboard',
-      actor_role: 'system',
-      action: 'llm_model_changed_legacy',
-      resource_type: 'llm_settings',
-      meta: { source: 'legacy_dashboard_shim' },
-    },
-  });
+export async function setCurrentMainModel(_model: string): Promise<void> {
+  throw new Error(
+    'legacy setCurrentMainModel is forbidden after global_settings migration (PR #188); use admin-ui /setup/llm-settings (founder-only)',
+  );
 }
 
 /**
- * @deprecated See `setCurrentMainModel` — same shim, same removal plan.
+ * @deprecated See `setCurrentMainModel` — same fail-loud, same reason
+ * (founder-only gate must own the global model switch).
  */
-export async function setCurrentFastModel(model: string): Promise<void> {
-  await globalSettingsRepo.updateAtomic({
-    keys: [{ key: KEY_FAST, value: { model } }],
-    audit: {
-      tenant_id: 'system',
-      actor_id: 'legacy-dashboard',
-      actor_role: 'system',
-      action: 'llm_model_changed_legacy',
-      resource_type: 'llm_settings',
-      meta: { source: 'legacy_dashboard_shim' },
-    },
-  });
+export async function setCurrentFastModel(_model: string): Promise<void> {
+  throw new Error(
+    'legacy setCurrentFastModel is forbidden after global_settings migration (PR #188); use admin-ui /setup/llm-settings (founder-only)',
+  );
 }
 
 /**

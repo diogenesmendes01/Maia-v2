@@ -86,20 +86,35 @@ describe('llm-settings (global_settings storage)', () => {
     expect(await getCurrentMainModel()).toBe('openai/gpt-5');
   });
 
-  it('round-trips: legacy setCurrentMainModel shim then getCurrentMainModel', async () => {
+  // Codex round 2 on PR #188 [P1]: the legacy `setCurrent*Model` shims
+  // used to round-trip through `globalSettingsRepo.updateAtomic`. That
+  // silently let the legacy POST `/dashboard/llm-settings` route (gated
+  // only on `isOwnerType`, no reason required) bypass the new founder-
+  // only tRPC gate and change the process-wide model for every tenant.
+  // The shims now THROW so the bypass becomes a loud error until PR #176
+  // removes the legacy caller.
+  it('legacy setCurrentMainModel throws (founder-only path is the new global_settings flow)', async () => {
     const { setCurrentMainModel, getCurrentMainModel } = await import(
       '../../src/lib/llm-settings.js'
     );
-    await setCurrentMainModel('openai/gpt-5');
-    expect(await getCurrentMainModel()).toBe('openai/gpt-5');
+    await expect(setCurrentMainModel('openai/gpt-5')).rejects.toThrow(
+      /forbidden after global_settings migration/,
+    );
+    // And it definitely did NOT write — getCurrentMainModel still returns
+    // the env default.
+    expect(await getCurrentMainModel()).toBe('anthropic/claude-sonnet-4.6');
+    expect(globalSettingsRepoMock.updateAtomic).not.toHaveBeenCalled();
   });
 
-  it('round-trips: legacy setCurrentFastModel shim then getCurrentFastModel', async () => {
+  it('legacy setCurrentFastModel throws (same fail-loud reason as the main shim)', async () => {
     const { setCurrentFastModel, getCurrentFastModel } = await import(
       '../../src/lib/llm-settings.js'
     );
-    await setCurrentFastModel('deepseek/deepseek-r1');
-    expect(await getCurrentFastModel()).toBe('deepseek/deepseek-r1');
+    await expect(setCurrentFastModel('deepseek/deepseek-r1')).rejects.toThrow(
+      /forbidden after global_settings migration/,
+    );
+    expect(await getCurrentFastModel()).toBe('anthropic/claude-haiku-4.5');
+    expect(globalSettingsRepoMock.updateAtomic).not.toHaveBeenCalled();
   });
 
   it('falls back to env default if DB throws on read', async () => {
