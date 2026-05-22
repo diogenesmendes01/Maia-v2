@@ -37,14 +37,25 @@ let mockFast = 'anthropic/claude-haiku-4.5';
 type AtomicCall = {
   main: string;
   fast: string;
+  // Codex round 3 on PR #188 [P2]: optimistic concurrency. Tests now
+  // exercise the expected_* round-trip from router input to helper
+  // call, including the conflict-mode mock below.
+  expected_main: string;
+  expected_fast: string;
   updated_by: string;
   actor_role: string;
   tenant_id: string;
   comment: string;
 };
 const atomicCalls: AtomicCall[] = [];
-let atomicMode: 'flip' | 'no_changes' | 'throw' = 'flip';
+let atomicMode: 'flip' | 'no_changes' | 'throw' | 'conflict' = 'flip';
 let atomicThrow: Error = new Error('simulated atomic failure');
+let conflictPayload: {
+  field: 'main' | 'fast';
+  expected: string | null;
+  current: string | null;
+} = { field: 'main', expected: 'X', current: 'Y' };
+let mockProvider: 'openrouter' | 'anthropic' = 'openrouter';
 
 vi.mock('@/lib/llm-settings.js', () => ({
   getCurrentMainModel: vi.fn(async () => mockMain),
@@ -52,7 +63,7 @@ vi.mock('@/lib/llm-settings.js', () => ({
   envDefaults: vi.fn(() => ({
     main: 'anthropic/claude-sonnet-4.6',
     fast: 'anthropic/claude-haiku-4.5',
-    provider: 'openrouter',
+    provider: mockProvider,
   })),
   setGlobalLLMSettingsAtomic: vi.fn(async (input: AtomicCall) => {
     atomicCalls.push(input);
@@ -64,6 +75,15 @@ vi.mock('@/lib/llm-settings.js', () => ({
         ok: false as const,
         reason: 'no_changes' as const,
         before: { main: mockMain, fast: mockFast },
+      };
+    }
+    if (atomicMode === 'conflict') {
+      return {
+        ok: false as const,
+        reason: 'optimistic_conflict' as const,
+        field: conflictPayload.field,
+        expected: conflictPayload.expected,
+        current: conflictPayload.current,
       };
     }
     const before = { main: mockMain, fast: mockFast };
@@ -129,6 +149,7 @@ function caller(role: string, tenantId = 'tenant-test', userId = 'user-1') {
 beforeEach(() => {
   atomicCalls.length = 0;
   atomicMode = 'flip';
+  mockProvider = 'openrouter';
   mockMain = 'anthropic/claude-sonnet-4.6';
   mockFast = 'anthropic/claude-haiku-4.5';
 });
@@ -165,10 +186,12 @@ describe('llmSettingsRouter.catalog — founder gate', () => {
 });
 
 describe('llmSettingsRouter.update — gate + delegate + atomic semantics', () => {
-  it('founder flips both sides; atomic helper receives actor metadata + comment', async () => {
+  it('founder flips both sides; atomic helper receives actor metadata + comment + expected_*', async () => {
     const res = await caller('founder', 'tenant-x', 'founder-1').update({
       main: 'openai/gpt-5',
       fast: 'openai/gpt-5',
+      expected_main: 'anthropic/claude-sonnet-4.6',
+      expected_fast: 'anthropic/claude-haiku-4.5',
       comment: 'Anthropic outage 14:30 UTC, swap to OpenAI',
     });
     expect(res.ok).toBe(true);
@@ -186,6 +209,8 @@ describe('llmSettingsRouter.update — gate + delegate + atomic semantics', () =
     expect(atomicCalls[0]).toMatchObject({
       main: 'openai/gpt-5',
       fast: 'openai/gpt-5',
+      expected_main: 'anthropic/claude-sonnet-4.6',
+      expected_fast: 'anthropic/claude-haiku-4.5',
       comment: 'Anthropic outage 14:30 UTC, swap to OpenAI',
       updated_by: 'founder-1',
       actor_role: 'founder',
@@ -200,6 +225,8 @@ describe('llmSettingsRouter.update — gate + delegate + atomic semantics', () =
         caller(role).update({
           main: 'openai/gpt-5',
           fast: 'openai/gpt-5',
+          expected_main: 'anthropic/claude-sonnet-4.6',
+          expected_fast: 'anthropic/claude-haiku-4.5',
           comment: 'trying to bypass the founder gate',
         }),
       ).rejects.toThrow(TRPCError);
@@ -214,10 +241,54 @@ describe('llmSettingsRouter.update — gate + delegate + atomic semantics', () =
       caller('founder').update({
         main: 'anthropic/claude-sonnet-4.6',
         fast: 'anthropic/claude-haiku-4.5',
+        expected_main: 'anthropic/claude-sonnet-4.6',
+        expected_fast: 'anthropic/claude-haiku-4.5',
         comment: 'this should be rejected — nothing actually changed',
       }),
     ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
     expect(atomicCalls).toHaveLength(1); // helper WAS called; it returned no_changes
+  });
+
+  // Codex round 3 on PR #188 [P2]: optimistic-conflict mapping. Helper
+  // returns reason='optimistic_conflict' → router maps to 409 CONFLICT
+  // with a message including the field/expected/current diagnostics.
+  it('CONFLICT when atomic helper reports optimistic_conflict (main)', async () => {
+    atomicMode = 'conflict';
+    conflictPayload = {
+      field: 'main',
+      expected: 'anthropic/claude-sonnet-4.6',
+      current: 'openai/gpt-5',
+    };
+    await expect(
+      caller('founder').update({
+        main: 'x-ai/grok-4.1-fast',
+        fast: 'anthropic/claude-haiku-4.5',
+        expected_main: 'anthropic/claude-sonnet-4.6', // founder thought main was sonnet
+        expected_fast: 'anthropic/claude-haiku-4.5',
+        comment: 'race with another founder — should 409',
+      }),
+    ).rejects.toMatchObject({
+      code: 'CONFLICT',
+    });
+    expect(atomicCalls).toHaveLength(1);
+  });
+
+  it('CONFLICT when atomic helper reports optimistic_conflict (fast)', async () => {
+    atomicMode = 'conflict';
+    conflictPayload = {
+      field: 'fast',
+      expected: 'anthropic/claude-haiku-4.5',
+      current: 'x-ai/grok-4.1-fast',
+    };
+    await expect(
+      caller('founder').update({
+        main: 'anthropic/claude-sonnet-4.6',
+        fast: 'openai/gpt-5',
+        expected_main: 'anthropic/claude-sonnet-4.6',
+        expected_fast: 'anthropic/claude-haiku-4.5',
+        comment: 'race on the fast side — should 409',
+      }),
+    ).rejects.toMatchObject({ code: 'CONFLICT' });
   });
 
   // The actual rollback semantics live in tests/integration/global-settings-repo.spec.ts
@@ -233,6 +304,8 @@ describe('llmSettingsRouter.update — gate + delegate + atomic semantics', () =
       caller('founder').update({
         main: 'openai/gpt-5',
         fast: 'x-ai/grok-4.1-fast',
+        expected_main: 'anthropic/claude-sonnet-4.6',
+        expected_fast: 'anthropic/claude-haiku-4.5',
         comment: 'audit will fail on this attempt',
       }),
     ).rejects.toThrow(/simulated audit insert failure/);
@@ -255,6 +328,8 @@ describe('llmSettingsRouter.update — gate + delegate + atomic semantics', () =
     const res = await caller('founder').update({
       main: 'openai/gpt-5',
       fast: 'openai/gpt-5',
+      expected_main: 'anthropic/claude-sonnet-4.6',
+      expected_fast: 'anthropic/claude-haiku-4.5',
       comment: 'fresh DB, no global_settings rows yet',
     });
     expect(res.ok).toBe(true);
@@ -268,12 +343,108 @@ describe('llmSettingsRouter.update — gate + delegate + atomic semantics', () =
   });
 });
 
+// Codex round 3 on PR #188 [P2]: provider gate. With LLM_PROVIDER=
+// anthropic, the runtime callLLM passes the stored slug straight to
+// AnthropicProvider — any OpenRouter-style slug other than `anthropic/*`
+// breaks every LLM call. The router enforces this BEFORE the audited
+// write; the catalog query also filters its items so the UI doesn't
+// offer doomed picks.
+describe('llmSettingsRouter — provider gate (Codex round 3)', () => {
+  it('catalog filters OpenRouter slugs when provider=anthropic', async () => {
+    mockProvider = 'anthropic';
+    const res = await caller('founder').catalog();
+    expect(res.provider).toBe('anthropic');
+    // Mock catalog has two items: anthropic/claude-sonnet-4.6 (keep)
+    // and openai/gpt-5 (filter out). Only one should survive.
+    expect(res.items.map((m) => m.id)).toEqual(['anthropic/claude-sonnet-4.6']);
+  });
+
+  it('catalog returns full set when provider=openrouter', async () => {
+    mockProvider = 'openrouter';
+    const res = await caller('founder').catalog();
+    expect(res.provider).toBe('openrouter');
+    expect(res.items.map((m) => m.id)).toEqual([
+      'anthropic/claude-sonnet-4.6',
+      'openai/gpt-5',
+    ]);
+  });
+
+  it('update rejects openai/* slug when provider=anthropic (main side)', async () => {
+    mockProvider = 'anthropic';
+    await expect(
+      caller('founder').update({
+        main: 'openai/gpt-5',
+        fast: 'anthropic/claude-haiku-4.5',
+        expected_main: 'anthropic/claude-sonnet-4.6',
+        expected_fast: 'anthropic/claude-haiku-4.5',
+        comment: 'should be rejected — openai slug with anthropic provider',
+      }),
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+    // Atomic helper must NOT be called — rejection happens before the
+    // tx so no audit row gets written for the bad attempt.
+    expect(atomicCalls).toHaveLength(0);
+  });
+
+  it('update rejects x-ai/* slug when provider=anthropic (fast side)', async () => {
+    mockProvider = 'anthropic';
+    await expect(
+      caller('founder').update({
+        main: 'anthropic/claude-sonnet-4.6',
+        fast: 'x-ai/grok-4.1-fast',
+        expected_main: 'anthropic/claude-sonnet-4.6',
+        expected_fast: 'anthropic/claude-haiku-4.5',
+        comment: 'should be rejected — x-ai slug with anthropic provider',
+      }),
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+    expect(atomicCalls).toHaveLength(0);
+  });
+
+  it('update accepts anthropic/* slugs when provider=anthropic', async () => {
+    mockProvider = 'anthropic';
+    const res = await caller('founder').update({
+      main: 'anthropic/claude-opus-4.7',
+      fast: 'anthropic/claude-haiku-4.5',
+      expected_main: 'anthropic/claude-sonnet-4.6',
+      expected_fast: 'anthropic/claude-haiku-4.5',
+      comment: 'anthropic-native slug should pass the gate',
+    });
+    expect(res.ok).toBe(true);
+    expect(atomicCalls).toHaveLength(1);
+  });
+
+  it('update accepts Anthropic short ID (no slash) when provider=anthropic', async () => {
+    mockProvider = 'anthropic';
+    const res = await caller('founder').update({
+      main: 'claude-sonnet-4-6',
+      fast: 'claude-haiku-4-5-20251001',
+      expected_main: 'anthropic/claude-sonnet-4.6',
+      expected_fast: 'anthropic/claude-haiku-4.5',
+      comment: 'anthropic-native short ID should pass the gate',
+    });
+    expect(res.ok).toBe(true);
+  });
+
+  it('update accepts any slug when provider=openrouter', async () => {
+    mockProvider = 'openrouter';
+    const res = await caller('founder').update({
+      main: 'openai/gpt-5',
+      fast: 'x-ai/grok-4.1-fast',
+      expected_main: 'anthropic/claude-sonnet-4.6',
+      expected_fast: 'anthropic/claude-haiku-4.5',
+      comment: 'openrouter accepts every vendor prefix',
+    });
+    expect(res.ok).toBe(true);
+  });
+});
+
 describe('llmSettingsRouter.update — input validation', () => {
   it('rejects slug with invalid characters', async () => {
     await expect(
       caller('founder').update({
         main: 'has spaces and !punct',
         fast: 'openai/gpt-5',
+        expected_main: 'anthropic/claude-sonnet-4.6',
+        expected_fast: 'anthropic/claude-haiku-4.5',
         comment: 'should be rejected by zod schema',
       }),
     ).rejects.toThrow();
@@ -284,6 +455,8 @@ describe('llmSettingsRouter.update — input validation', () => {
       caller('founder').update({
         main: 'openai/gpt-5',
         fast: 'openai/gpt-5',
+        expected_main: 'anthropic/claude-sonnet-4.6',
+        expected_fast: 'anthropic/claude-haiku-4.5',
         comment: 'short',
       }),
     ).rejects.toThrow();
@@ -298,6 +471,8 @@ describe('llmSettingsRouter.update — input validation', () => {
       caller('founder').update({
         main: 'openai/gpt-5',
         fast: 'x-ai/grok-4.1-fast',
+        expected_main: 'anthropic/claude-sonnet-4.6',
+        expected_fast: 'anthropic/claude-haiku-4.5',
         comment: '          ', // 10 spaces — would have passed pre-trim
       }),
     ).rejects.toThrow();
@@ -309,6 +484,8 @@ describe('llmSettingsRouter.update — input validation', () => {
       caller('founder').update({
         main: 'openai/gpt-5',
         fast: 'x-ai/grok-4.1-fast',
+        expected_main: 'anthropic/claude-sonnet-4.6',
+        expected_fast: 'anthropic/claude-haiku-4.5',
         comment: '\t\t\n\n  \t  \n  \t', // mixed whitespace, > 10 chars
       }),
     ).rejects.toThrow();
@@ -320,6 +497,8 @@ describe('llmSettingsRouter.update — input validation', () => {
       caller('founder').update({
         main: 'openai/gpt-5',
         fast: 'openai/gpt-5',
+        expected_main: 'anthropic/claude-sonnet-4.6',
+        expected_fast: 'anthropic/claude-haiku-4.5',
         comment: 'x'.repeat(1001),
       }),
     ).rejects.toThrow();
@@ -330,8 +509,40 @@ describe('llmSettingsRouter.update — input validation', () => {
       caller('founder').update({
         main: '',
         fast: 'openai/gpt-5',
+        expected_main: 'anthropic/claude-sonnet-4.6',
+        expected_fast: 'anthropic/claude-haiku-4.5',
         comment: 'main slug must be non-empty',
       }),
     ).rejects.toThrow();
+  });
+
+  // Codex round 3 on PR #188 [P2]: schema requires expected_*; missing
+  // them is a hard validation error (no defaults, no implicit skip).
+  it('rejects missing expected_main (zod validation)', async () => {
+    await expect(
+      caller('founder').update({
+        main: 'openai/gpt-5',
+        fast: 'openai/gpt-5',
+        // expected_main intentionally omitted
+        expected_fast: 'anthropic/claude-haiku-4.5',
+        comment: 'expected_main must be present',
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any),
+    ).rejects.toThrow();
+    expect(atomicCalls).toHaveLength(0);
+  });
+
+  it('rejects missing expected_fast (zod validation)', async () => {
+    await expect(
+      caller('founder').update({
+        main: 'openai/gpt-5',
+        fast: 'openai/gpt-5',
+        expected_main: 'anthropic/claude-sonnet-4.6',
+        // expected_fast intentionally omitted
+        comment: 'expected_fast must be present',
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any),
+    ).rejects.toThrow();
+    expect(atomicCalls).toHaveLength(0);
   });
 });

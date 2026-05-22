@@ -98,9 +98,18 @@ export default function LlmSettingsPage() {
     e.preventDefault();
     setSuccessAt(null);
     try {
+      // Codex round 3 on PR #188 [P2]: optimistic concurrency. Pass the
+      // values the founder OBSERVED (`getQuery.data.main` / `.fast`) as
+      // expected_*. The server compares against the locked current values
+      // INSIDE the tx; on mismatch tRPC throws CONFLICT and the founder
+      // sees "Settings changed concurrently — refresh and try again."
+      // After refresh, useQuery.invalidate() picks up the new state and
+      // the founder re-decides.
       const res = await mutation.mutateAsync({
         main: effectiveMain,
         fast: effectiveFast,
+        expected_main: getQuery.data?.main ?? '',
+        expected_fast: getQuery.data?.fast ?? '',
         comment: comment.trim(),
       });
       if (res.ok) {
@@ -191,6 +200,23 @@ export default function LlmSettingsPage() {
             <p className="text-xs text-gray-500">
               {catalogQuery.data?.items.length ?? 0} model(s) with tool-calling
               support (OpenRouter, cached 1h).
+              {/* Codex round 3 on PR #188 [P2]: the catalog is filtered
+                  by the active LLM_PROVIDER on the server. With
+                  provider=anthropic, only anthropic/* slugs are shown
+                  because the runtime can't call OpenRouter-style slugs
+                  via AnthropicProvider. Surface the filter so the
+                  operator understands why the list is shorter than
+                  OpenRouter's full catalog. */}
+              {catalogQuery.data?.provider &&
+                catalogQuery.data.provider !== 'openrouter' && (
+                  <>
+                    {' '}
+                    Filtered for provider=
+                    <code>{catalogQuery.data.provider}</code> — slugs from
+                    other vendors are hidden because the runtime can't call
+                    them with the active provider.
+                  </>
+                )}
             </p>
           )}
 
@@ -358,7 +384,29 @@ export default function LlmSettingsPage() {
         )}
 
         {mutation.error && (
-          <p className="text-sm text-red-600">Error: {mutation.error.message}</p>
+          <div className="text-sm text-red-600 space-y-2">
+            <p>Error: {mutation.error.message}</p>
+            {/* Codex round 3 on PR #188 [P2]: explicit CONFLICT hint —
+                the router returns code='CONFLICT' when another founder
+                updated the settings between page load and submit. Show
+                a refresh button so the operator picks up the new state
+                without having to reload the whole page. */}
+            {mutation.error.data?.code === 'CONFLICT' && (
+              <button
+                type="button"
+                onClick={() => {
+                  void utils.llmSettings.get.invalidate();
+                  setMainCustom('');
+                  setFastCustom('');
+                  setMainPick('');
+                  setFastPick('');
+                }}
+                className="bg-yellow-600 text-white px-3 py-1 rounded text-xs"
+              >
+                Refresh current state and start over
+              </button>
+            )}
+          </div>
         )}
 
         {successAt && !mutation.error && (

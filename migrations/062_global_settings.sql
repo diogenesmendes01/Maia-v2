@@ -49,10 +49,30 @@ COMMENT ON COLUMN global_settings.updated_by IS
 -- to the env default for everyone on the first deploy after this
 -- migration runs, until a founder re-saves via the new admin-ui page.
 --
--- Backfill is deterministic: pick the agent_facts row with the most
--- recent `updated_at` for each chave. If two founders/agents both
--- touched the legacy UI, we honor the freshest one — same heuristic an
--- operator would apply mentally when reading the legacy dashboard.
+-- Codex round 3 on PR #188 [high]: the original backfill below picked
+-- the `agent_facts` row with the most recent `updated_at` per chave and
+-- promoted its `valor` to process-wide `global_settings`. But the legacy
+-- table was keyed by `(tenant_id, agent_id, escopo, chave)`, so multiple
+-- tenants/agents may legitimately hold DIFFERENT `llm.model.*` rows —
+-- e.g. tenant A picked `openai/gpt-5` mid-incident while tenant B kept
+-- the env default and tenant C experimented with `x-ai/grok-4.1-fast`.
+-- Picking "freshest" silently globalizes ONE tenant's stale or
+-- experimental setting to EVERY tenant on upgrade, with no conflict
+-- detection and no record of what was discarded. That's a worse
+-- forensic gap than just leaving the key unset.
+--
+-- Fix: fail-closed. If multiple distinct `valor->>'model'` values exist
+-- for either key, RAISE EXCEPTION and abort the migration. The operator
+-- has to manually pick the canonical row (DELETE the others, or move
+-- them to a tenant-scoped key first) before re-running 062 up. If
+-- exactly one distinct value exists across all rows, the existing
+-- `INSERT ... SELECT ... LIMIT 1 ON CONFLICT DO NOTHING` is correct
+-- (any row → same value). If zero rows exist (fresh deploy / no legacy
+-- use), the SELECT is empty and the INSERT is a no-op, so the key stays
+-- unset and the env default takes over until a founder uses the new
+-- admin-ui page. This is the most conservative path: forcing a manual
+-- choice on upgrade beats silently promoting one tenant's value to all.
+--
 -- `agent_facts.valor` is already jsonb in the same `{"model": "..."}`
 -- shape `getCurrent*Model` expects (see src/lib/llm-settings.ts), so we
 -- copy it verbatim. `ON CONFLICT (key) DO NOTHING` makes the backfill
@@ -62,6 +82,32 @@ COMMENT ON COLUMN global_settings.updated_by IS
 -- `updated_by = 'system:migration_062_backfill'` is the forensic marker;
 -- the source `agent_facts.updated_at` is preserved so operators can see
 -- when the value was originally set in the legacy table.
+DO $$
+DECLARE
+  distinct_main int;
+  distinct_fast int;
+BEGIN
+  SELECT COUNT(DISTINCT valor->>'model') INTO distinct_main
+  FROM agent_facts
+  WHERE escopo = 'global'
+    AND chave = 'llm.model.main'
+    AND valor ? 'model';
+
+  SELECT COUNT(DISTINCT valor->>'model') INTO distinct_fast
+  FROM agent_facts
+  WHERE escopo = 'global'
+    AND chave = 'llm.model.fast'
+    AND valor ? 'model';
+
+  IF distinct_main > 1 THEN
+    RAISE EXCEPTION 'Migration 062: % distinct llm.model.main values found in legacy agent_facts. Backfill aborted — promoting one tenant''s value to every tenant would silently override the others. Resolve manually before re-running: pick the canonical agent_facts row, DELETE the rest, then re-run migration 062 up.', distinct_main;
+  END IF;
+
+  IF distinct_fast > 1 THEN
+    RAISE EXCEPTION 'Migration 062: % distinct llm.model.fast values found in legacy agent_facts. Same resolution as llm.model.main above.', distinct_fast;
+  END IF;
+END $$;
+
 INSERT INTO global_settings (key, value, updated_at, updated_by)
 SELECT
   'llm.model.main' AS key,

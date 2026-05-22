@@ -59,6 +59,44 @@ const ModelSlugSchema = z
     'must contain only letters, digits, dot, underscore, hyphen, slash, or colon',
   );
 
+/**
+ * Codex round 3 on PR #188 [P2]: provider gate. The active provider
+ * (env LLM_PROVIDER) decides which slugs are runtime-callable:
+ *
+ *   - `openrouter`: any slug is valid; the OpenRouter API accepts the
+ *     `<vendor>/<model>` form and routes to the matching upstream.
+ *   - `anthropic`: only Anthropic-native slugs work, because
+ *     `AnthropicProvider.callLLM` passes the slug straight to the SDK,
+ *     and `openai/gpt-5` (or `x-ai/grok-4.1-fast`) is not a valid
+ *     Anthropic model ID. The SDK rejects with 404, breaking every
+ *     runtime LLM call until a founder switches back.
+ *
+ * We accept slugs that EITHER start with `anthropic/` (OpenRouter-style
+ * canonical form) OR have no slash at all (Anthropic native short IDs
+ * like `claude-sonnet-4-6`). Slugs starting with any other vendor
+ * prefix (`openai/`, `x-ai/`, `google/`, etc.) are rejected when
+ * `LLM_PROVIDER=anthropic`.
+ *
+ * The check runs at the router boundary (NOT zod, because it needs the
+ * runtime config). A future provider could be added with no schema
+ * change — just extend the switch.
+ */
+function isSlugCompatible(
+  slug: string,
+  provider: 'anthropic' | 'openrouter',
+): boolean {
+  if (provider === 'openrouter') return true;
+  if (provider === 'anthropic') {
+    if (slug.startsWith('anthropic/')) return true;
+    // Anthropic native short ID (no vendor prefix): no slash.
+    if (!slug.includes('/')) return true;
+    return false;
+  }
+  // Unknown provider: be permissive — config validation upstream should
+  // catch this before we ever reach the router.
+  return true;
+}
+
 const UpdateInputSchema = z.object({
   // Both required: operators must always set both explicitly so an incident
   // switch can't accidentally leave one side on the broken provider. Pass
@@ -66,6 +104,25 @@ const UpdateInputSchema = z.object({
   // that as a no-op for that side (see logic below).
   main: ModelSlugSchema,
   fast: ModelSlugSchema,
+  // Codex round 3 on PR #188 [P2]: optimistic concurrency control. Two
+  // founders loading the page from the same snapshot, where founder B
+  // changes ONLY the `fast` side but submits the stale `main` along
+  // with it, would silently revert founder A's `main` commit. The
+  // expected_* fields carry the values the founder OBSERVED at load
+  // time; the server compares them against the locked current values
+  // INSIDE the tx and refuses the write if anything moved underneath
+  // — the UI then prompts the founder to refresh and re-decide. This
+  // is the same pattern as `If-Match` / ETag in HTTP and the same
+  // pattern `tenantsRepo.updateStatusAtomic` uses for its expected_
+  // status field.
+  //
+  // Both are required so a founder can't accidentally skip the lock by
+  // omitting them. To bypass intentionally (e.g. emergency override
+  // when the UI is stuck), the operator passes whatever it currently
+  // sees — there's no special "skip lock" sentinel because the cost of
+  // a wrong override during an incident outweighs the convenience.
+  expected_main: ModelSlugSchema,
+  expected_fast: ModelSlugSchema,
   // Codex round 2 on PR #188 [P3]: the previous schema validated the raw
   // character count, so a 10-space comment passed validation and the
   // audit row would record a forensically-useless reason. `.trim()` runs
@@ -99,10 +156,25 @@ export const llmSettingsRouter = router({
    * `getToolCallingModels` (see `src/lib/openrouter-models.ts`); on
    * network failure or first-call timeout, returns a curated fallback
    * list so the UI stays usable mid-Anthropic-outage.
+   *
+   * Codex round 3 on PR #188 [P2]: filter the catalog by the active
+   * provider so the UI doesn't offer slugs the runtime can't actually
+   * use. With `LLM_PROVIDER=anthropic`, callLLM passes the stored slug
+   * straight to AnthropicProvider, so `openai/gpt-5` etc. would break
+   * every runtime call. The server-side validation in `update` is the
+   * source of truth (don't trust the client to filter); this catalog
+   * filter exists to spare the operator from selecting a doomed option
+   * in the first place. Returns the full set when provider=openrouter.
    */
   catalog: founderProcedure.query(async () => {
-    const items = await getToolCallingModels();
-    return { items };
+    const all = await getToolCallingModels();
+    const env = envDefaults();
+    const provider = env.provider as 'anthropic' | 'openrouter';
+    const items =
+      provider === 'openrouter'
+        ? all
+        : all.filter((m) => isSlugCompatible(m.id, provider));
+    return { items, provider };
   }),
 
   /**
@@ -127,9 +199,35 @@ export const llmSettingsRouter = router({
     .input(UpdateInputSchema)
     .mutation(async ({ input, ctx }) => {
       const env = envDefaults();
+
+      // Codex round 3 on PR #188 [P2]: provider gate (server-side
+      // source of truth). The UI filters the catalog by provider, but
+      // we can't trust the client — a stale tab, a freshly-changed
+      // LLM_PROVIDER env, or a hand-crafted tRPC call could still
+      // submit an incompatible slug. Reject here BEFORE the audited
+      // write so we never persist a slug that the runtime can't call.
+      const provider = env.provider as 'anthropic' | 'openrouter';
+      for (const [field, slug] of [
+        ['main', input.main],
+        ['fast', input.fast],
+      ] as const) {
+        if (!isSlugCompatible(slug, provider)) {
+          throw new TRPCError({
+            code: 'BAD_REQUEST',
+            message:
+              `${field}=${slug} is incompatible with the active LLM provider (${provider}). ` +
+              (provider === 'anthropic'
+                ? 'Anthropic provider accepts only anthropic/* or unprefixed Anthropic-native slugs.'
+                : `Provider ${provider} does not accept this slug.`),
+          });
+        }
+      }
+
       const result = await setGlobalLLMSettingsAtomic({
         main: input.main,
         fast: input.fast,
+        expected_main: input.expected_main,
+        expected_fast: input.expected_fast,
         updated_by: ctx.userId,
         actor_role: ctx.userRole,
         tenant_id: ctx.tenantId,
@@ -137,7 +235,17 @@ export const llmSettingsRouter = router({
       });
 
       if (!result.ok) {
-        // Exhaustive narrowing: only one failure reason today.
+        // Codex round 3 on PR #188 [P2]: optimistic-conflict path. The
+        // UI surfaces the current/expected mismatch so the founder can
+        // refresh, see the new state, and re-decide.
+        if (result.reason === 'optimistic_conflict') {
+          throw new TRPCError({
+            code: 'CONFLICT',
+            message:
+              `Settings changed concurrently — refresh and try again. ` +
+              `field=${result.field} expected=${result.expected ?? '(unset)'} current=${result.current ?? '(unset)'}`,
+          });
+        }
         if (result.reason === 'no_changes') {
           throw new TRPCError({
             code: 'BAD_REQUEST',
@@ -145,7 +253,11 @@ export const llmSettingsRouter = router({
               'No changes — both main and fast already match the requested models',
           });
         }
-        const _exhaustive: never = result.reason;
+        // Exhaustive narrowing — both failure variants handled above.
+        // If a third variant is added to setGlobalLLMSettingsAtomic in
+        // the future, this assignment will fail compile and force the
+        // operator to update the router.
+        const _exhaustive: never = result;
         throw new TRPCError({
           code: 'INTERNAL_SERVER_ERROR',
           message: `llmSettings.update unknown failure: ${String(_exhaustive)}`,

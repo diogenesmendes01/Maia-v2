@@ -340,8 +340,32 @@ d('globalSettingsRepo.getByKey + updateAtomic (real DB)', () => {
       'llm.model.fast': { model: finalFast },
     };
 
-    const aIsFirst = JSON.stringify(aRow.before) === JSON.stringify(seed);
-    const bIsFirst = JSON.stringify(bRow.before) === JSON.stringify(seed);
+    // Codex round 3 on PR #188 [P3]: `jsonb` does NOT preserve object
+    // key insertion order on round-trip through Postgres. The seed
+    // literal puts `main` first; `updateAtomic` sorts keys before
+    // locking and builds `before` in sorted order (`fast` first); so
+    // a `JSON.stringify(...)` equality check could legitimately
+    // mismatch despite identical contents. Use vitest's deep-equal
+    // matchers (`toEqual`) — they walk object keys, not strings —
+    // for ALL jsonb comparisons in this file.
+    function deepEqual(a: unknown, b: unknown): boolean {
+      // Tiny helper so the "which row is first" disambiguation below
+      // matches the toEqual semantics used elsewhere in this file.
+      return JSON.stringify(sortKeys(a)) === JSON.stringify(sortKeys(b));
+    }
+    function sortKeys(v: unknown): unknown {
+      if (Array.isArray(v)) return v.map(sortKeys);
+      if (v && typeof v === 'object') {
+        const o: Record<string, unknown> = {};
+        for (const k of Object.keys(v as object).sort()) {
+          o[k] = sortKeys((v as Record<string, unknown>)[k]);
+        }
+        return o;
+      }
+      return v;
+    }
+    const aIsFirst = deepEqual(aRow.before, seed);
+    const bIsFirst = deepEqual(bRow.before, seed);
     expect(aIsFirst !== bIsFirst).toBe(true); // exactly one is first
 
     const first = aIsFirst ? aRow : bRow;
@@ -412,5 +436,160 @@ d('globalSettingsRepo.getByKey + updateAtomic (real DB)', () => {
     } finally {
       c.release();
     }
+  });
+
+  /**
+   * Codex round 3 on PR #188 [P2]: optimistic concurrency. The repo
+   * accepts an optional `expected` per key; if the locked value doesn't
+   * match, the helper returns reason='optimistic_conflict' and writes
+   * NOTHING (no upsert, no audit row). This guards against two
+   * founders loading the page from the same snapshot — Founder A
+   * changes `main`, Founder B changes ONLY `fast` but submits the
+   * stale `main` along with it. Without the check, B's stale `main`
+   * silently reverts A's commit.
+   */
+  it('optimistic conflict: expected mismatch aborts the tx with no writes', async () => {
+    const { globalSettingsRepo } = await import('../../src/db/repositories.js');
+
+    // Seed the current state. Both founders observe this.
+    await globalSettingsRepo.updateAtomic({
+      keys: [
+        { key: 'llm.model.main', value: { model: 'anthropic/claude-sonnet-4.6' } },
+        { key: 'llm.model.fast', value: { model: 'anthropic/claude-haiku-4.5' } },
+      ],
+      audit: {
+        tenant_id: T,
+        actor_id: 'seed',
+        actor_role: 'system',
+        action: 'llm_model_changed',
+        resource_type: 'llm_settings',
+        meta: { comment: 'seed' },
+      },
+    });
+
+    // Founder A wins the race: changes main to openai/gpt-5.
+    await globalSettingsRepo.updateAtomic({
+      keys: [
+        {
+          key: 'llm.model.main',
+          value: { model: 'openai/gpt-5' },
+          expected: { model: 'anthropic/claude-sonnet-4.6' },
+        },
+      ],
+      audit: {
+        tenant_id: T,
+        actor_id: ACTOR_A,
+        actor_role: 'founder',
+        action: 'llm_model_changed',
+        resource_type: 'llm_settings',
+        meta: { comment: 'founder A wins' },
+      },
+    });
+
+    // Founder B submits a stale snapshot — expected_main still points
+    // to the seed value, but the DB now holds openai/gpt-5. The repo
+    // must refuse the write.
+    const res = await globalSettingsRepo.updateAtomic({
+      keys: [
+        {
+          key: 'llm.model.main',
+          // B sends back the stale main from page load (unchanged on
+          // B's side). Without the check, this would NOT trigger a
+          // "no_changes" because it differs from current, but it WOULD
+          // overwrite the openai/gpt-5 commit with the stale value —
+          // exactly the reverted-A bug. The `expected` here is the
+          // stale `anthropic/claude-sonnet-4.6` B observed at page
+          // load, NOT the actual current `openai/gpt-5`.
+          value: { model: 'anthropic/claude-sonnet-4.6' },
+          expected: { model: 'anthropic/claude-sonnet-4.6' },
+        },
+        {
+          key: 'llm.model.fast',
+          value: { model: 'x-ai/grok-4.1-fast' }, // B's actual change
+          expected: { model: 'anthropic/claude-haiku-4.5' },
+        },
+      ],
+      audit: {
+        tenant_id: T,
+        actor_id: ACTOR_B,
+        actor_role: 'founder',
+        action: 'llm_model_changed',
+        resource_type: 'llm_settings',
+        meta: { comment: 'founder B with stale snapshot' },
+      },
+    });
+
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error('unreachable');
+    expect(res.reason).toBe('optimistic_conflict');
+    if (res.reason !== 'optimistic_conflict') throw new Error('unreachable');
+    expect(res.key).toBe('llm.model.main');
+    expect(res.expected).toEqual({ model: 'anthropic/claude-sonnet-4.6' });
+    expect(res.current).toEqual({ model: 'openai/gpt-5' });
+
+    // DB state unchanged: A's commit still stands. No audit row from
+    // B's failed attempt (audit only fires after successful upsert).
+    const c = await pool.connect();
+    try {
+      const main = await c.query<{ value: { model: string } }>(
+        `SELECT value FROM global_settings WHERE key = 'llm.model.main'`,
+      );
+      expect(main.rows[0]!.value).toEqual({ model: 'openai/gpt-5' });
+
+      const fast = await c.query<{ value: { model: string } }>(
+        `SELECT value FROM global_settings WHERE key = 'llm.model.fast'`,
+      );
+      // fast remains at seed because B's whole tx aborted.
+      expect(fast.rows[0]!.value).toEqual({
+        model: 'anthropic/claude-haiku-4.5',
+      });
+
+      // Audit count: 1 (seed) + 1 (A) = 2. Nothing from B.
+      const audit = await c.query<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM admin_audit_log
+          WHERE tenant_id = $1 AND action = 'llm_model_changed'`,
+        [T],
+      );
+      expect(audit.rows[0]!.count).toBe('2');
+    } finally {
+      c.release();
+    }
+  });
+
+  it('optimistic conflict: expected matches → upsert proceeds normally', async () => {
+    const { globalSettingsRepo } = await import('../../src/db/repositories.js');
+
+    // Seed.
+    await globalSettingsRepo.updateAtomic({
+      keys: [{ key: 'llm.model.main', value: { model: 'seed' } }],
+      audit: {
+        tenant_id: T,
+        actor_id: 'seed',
+        actor_role: 'system',
+        action: 'llm_model_changed',
+        resource_type: 'llm_settings',
+      },
+    });
+
+    // Update with correct expected → proceeds.
+    const res = await globalSettingsRepo.updateAtomic({
+      keys: [
+        {
+          key: 'llm.model.main',
+          value: { model: 'after' },
+          expected: { model: 'seed' },
+        },
+      ],
+      audit: {
+        tenant_id: T,
+        actor_id: ACTOR_A,
+        actor_role: 'founder',
+        action: 'llm_model_changed',
+        resource_type: 'llm_settings',
+      },
+    });
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error('unreachable');
+    expect(res.after).toEqual({ 'llm.model.main': { model: 'after' } });
   });
 });

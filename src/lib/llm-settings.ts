@@ -1,5 +1,8 @@
+import { sql } from 'drizzle-orm';
 import { globalSettingsRepo } from '@/db/repositories.js';
+import { db } from '@/db/client.js';
 import { config } from '@/config/env.js';
+import { logger } from '@/lib/logger.js';
 
 /**
  * Runtime LLM model selection.
@@ -51,29 +54,129 @@ function envDefaultFast(): string {
     : config.CLAUDE_MODEL_FAST;
 }
 
+/**
+ * Extract a non-empty string `.model` from an unknown jsonb value, or
+ * return null. Shared between the global_settings read and the legacy
+ * agent_facts fallback so both honor the same `{ "model": "<slug>" }`
+ * payload shape.
+ */
+function extractModel(value: unknown): string | null {
+  if (value && typeof value === 'object' && 'model' in value) {
+    const m = (value as { model?: unknown }).model;
+    if (typeof m === 'string' && m.length > 0) return m;
+  }
+  return null;
+}
+
+/**
+ * Codex round 3 on PR #188 [high]: dual-read fallback for runtime LLM
+ * model lookup.
+ *
+ * Why: getCurrent*Model used to read ONLY `global_settings`. But the
+ * legacy storage in `agent_facts (tenant_id=<founder>, agent_id=<founder>,
+ * escopo='global', chave='llm.model.*')` still holds operator-selected
+ * values until migration 062 runs. In a rolling deploy where new code
+ * ships before the migration completes, or where the migration fails
+ * mid-rollout, every runtime LLM call would silently ignore the
+ * previously configured model and revert to the env default — exactly
+ * the dangerous path during a provider outage or model deprecation
+ * (the very scenarios the founder switched models for in the first
+ * place).
+ *
+ * The fallback queries `agent_facts` directly via raw SQL — NOT through
+ * `factsRepo`, because that reads under the current tenant_id/agent_id
+ * context (and the runtime LLM call may not have any context set, or
+ * may be set to a tenant other than the one that wrote the legacy row).
+ * Read pattern: ANY row with `escopo='global' AND chave=<key>` ordered
+ * by `updated_at DESC LIMIT 1` — same heuristic as the migration 062
+ * backfill. Multi-tenant disagreement at runtime falls back to "freshest
+ * wins"; the migration 062 conflict detection refuses to globalize that
+ * value at upgrade time, which is the durable fix. The runtime fallback
+ * is a SAFETY NET for the rolling-deploy window only.
+ *
+ * Logging: `llm_settings.legacy_fallback_used` (warn) when we used the
+ * legacy row, `llm_settings.env_fallback_used` (warn) when we landed on
+ * the env default despite global_settings being expected to have a row.
+ * The legacy_read_failed branch is debug-level because the table is
+ * always present in this codebase — that error would be a real DB
+ * outage and the env fallback below it would already emit a warn.
+ *
+ * After the next major release (when no production deployment can be
+ * pre-062), the legacy branch can be deleted along with the rest of
+ * `agent_facts.escopo='global' AND chave LIKE 'llm.model.%'` cleanup.
+ */
+async function readLegacyAgentFactModel(key: string): Promise<string | null> {
+  try {
+    const result = await db.execute<{ valor: unknown }>(sql`
+      SELECT valor
+      FROM agent_facts
+      WHERE escopo = 'global'
+        AND chave = ${key}
+        AND valor ? 'model'
+      ORDER BY updated_at DESC
+      LIMIT 1
+    `);
+    const rows = result.rows as Array<{ valor: unknown }>;
+    if (rows.length === 0) return null;
+    const model = extractModel(rows[0]!.valor);
+    if (model) {
+      logger.warn(
+        { source: 'agent_facts', key },
+        'llm_settings.legacy_fallback_used',
+      );
+      return model;
+    }
+    return null;
+  } catch (err) {
+    logger.warn(
+      { err: (err as Error).message, key },
+      'llm_settings.legacy_read_failed',
+    );
+    return null;
+  }
+}
+
 export async function getCurrentMainModel(): Promise<string> {
+  // (1) Canonical source: global_settings.
   try {
     const f = await globalSettingsRepo.getByKey(KEY_MAIN);
-    const valor = f?.value as { model?: unknown } | null | undefined;
-    if (valor && typeof valor.model === 'string' && valor.model.length > 0) {
-      return valor.model;
-    }
-  } catch {
-    // DB hiccup: fall through to env default rather than block the LLM call.
+    const model = extractModel(f?.value);
+    if (model) return model;
+  } catch (err) {
+    // Continue to legacy fallback; DB hiccup logged here so the warn
+    // chain (legacy → env) below makes sense in context.
+    logger.warn(
+      { err: (err as Error).message, key: KEY_MAIN },
+      'llm_settings.global_read_failed',
+    );
   }
+
+  // (2) Rolling-deploy / pre-062 fallback: legacy agent_facts.
+  const legacy = await readLegacyAgentFactModel(KEY_MAIN);
+  if (legacy) return legacy;
+
+  // (3) Final fallback: env default. Warn so observability can detect
+  // the gap (e.g. migration 062 not yet run in this process).
+  logger.warn({ key: KEY_MAIN }, 'llm_settings.env_fallback_used');
   return envDefaultMain();
 }
 
 export async function getCurrentFastModel(): Promise<string> {
   try {
     const f = await globalSettingsRepo.getByKey(KEY_FAST);
-    const valor = f?.value as { model?: unknown } | null | undefined;
-    if (valor && typeof valor.model === 'string' && valor.model.length > 0) {
-      return valor.model;
-    }
-  } catch {
-    // ditto
+    const model = extractModel(f?.value);
+    if (model) return model;
+  } catch (err) {
+    logger.warn(
+      { err: (err as Error).message, key: KEY_FAST },
+      'llm_settings.global_read_failed',
+    );
   }
+
+  const legacy = await readLegacyAgentFactModel(KEY_FAST);
+  if (legacy) return legacy;
+
+  logger.warn({ key: KEY_FAST }, 'llm_settings.env_fallback_used');
   return envDefaultFast();
 }
 
@@ -118,6 +221,16 @@ export async function setCurrentFastModel(_model: string): Promise<void> {
 export async function setGlobalLLMSettingsAtomic(input: {
   main: string;
   fast: string;
+  // Codex round 3 on PR #188 [P2]: optimistic concurrency. The founder
+  // passes the values they OBSERVED on page load. Inside the tx (under
+  // FOR UPDATE), the repo verifies the locked value matches each
+  // expected_*; if anything moved underneath, the helper returns
+  // `optimistic_conflict` and the router maps it to 409 CONFLICT. The
+  // UI then prompts "Settings changed concurrently — refresh and try
+  // again." Both required so the founder can't accidentally skip the
+  // check (pass the env default explicitly for "I observed no row").
+  expected_main: string;
+  expected_fast: string;
   updated_by: string;
   actor_role: string;
   tenant_id: string;
@@ -134,11 +247,31 @@ export async function setGlobalLLMSettingsAtomic(input: {
       reason: 'no_changes';
       before: { main: string | null; fast: string | null };
     }
+  | {
+      ok: false;
+      reason: 'optimistic_conflict';
+      // Which side conflicted ('main' | 'fast' for LLM use; pass-through
+      // of the repo's `key` minus the 'llm.model.' prefix).
+      field: 'main' | 'fast';
+      // Both are slug strings (or null for "expected unset" / "currently
+      // unset") — the helper normalizes the repo's jsonb shape into the
+      // string form the UI expects.
+      expected: string | null;
+      current: string | null;
+    }
 > {
   const res = await globalSettingsRepo.updateAtomic({
     keys: [
-      { key: KEY_MAIN, value: { model: input.main } },
-      { key: KEY_FAST, value: { model: input.fast } },
+      {
+        key: KEY_MAIN,
+        value: { model: input.main },
+        expected: { model: input.expected_main },
+      },
+      {
+        key: KEY_FAST,
+        value: { model: input.fast },
+        expected: { model: input.expected_fast },
+      },
     ],
     audit: {
       tenant_id: input.tenant_id,
@@ -155,7 +288,7 @@ export async function setGlobalLLMSettingsAtomic(input: {
   // was never set, or { model: '<slug>' } otherwise — normalize to the
   // slug string (or null).
   function normalize(raw: unknown): string | null {
-    if (raw && typeof raw === 'object' && 'model' in raw) {
+    if (raw && typeof raw === 'object' && raw !== null && 'model' in raw) {
       const m = (raw as { model?: unknown }).model;
       if (typeof m === 'string' && m.length > 0) return m;
     }
@@ -163,6 +296,18 @@ export async function setGlobalLLMSettingsAtomic(input: {
   }
 
   if (!res.ok) {
+    if (res.reason === 'optimistic_conflict') {
+      // Translate the repo's key namespace back to the LLM-domain
+      // `main`/`fast` discriminator the router exposes to the UI.
+      const field: 'main' | 'fast' = res.key === KEY_MAIN ? 'main' : 'fast';
+      return {
+        ok: false as const,
+        reason: 'optimistic_conflict' as const,
+        field,
+        expected: normalize(res.expected),
+        current: normalize(res.current),
+      };
+    }
     return {
       ok: false as const,
       reason: res.reason,

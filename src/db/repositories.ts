@@ -6062,7 +6062,18 @@ export const globalSettingsRepo = {
    * schema that future callers won't need.
    */
   async updateAtomic(input: {
-    keys: ReadonlyArray<{ key: string; value: Record<string, unknown> }>;
+    keys: ReadonlyArray<{
+      key: string;
+      value: Record<string, unknown>;
+      // Codex round 3 on PR #188 [P2]: optional optimistic-concurrency
+      // pre-check. When set, the locked value MUST deep-equal `expected`
+      // or the whole tx aborts with `reason: 'optimistic_conflict'`. The
+      // check runs INSIDE the tx, AFTER the SELECT ... FOR UPDATE, so
+      // it's race-free against concurrent writers. `expected = null`
+      // means "expect the key to be unset"; `expected = undefined` (or
+      // omitted) means "no expectation, proceed unconditionally".
+      expected?: Record<string, unknown> | null;
+    }>;
     audit: {
       tenant_id: string;
       actor_id: string;
@@ -6084,12 +6095,31 @@ export const globalSettingsRepo = {
         reason: 'no_changes';
         before: Record<string, unknown>;
       }
+    | {
+        ok: false;
+        reason: 'optimistic_conflict';
+        // Identify the FIRST key that failed the expected check (sorted
+        // key order — same order as the lock acquisition).
+        key: string;
+        expected: Record<string, unknown> | null;
+        current: unknown;
+        // Full `before` snapshot of all keys read up to the conflict
+        // point. Callers use this to render a useful UI message.
+        before: Record<string, unknown>;
+      }
   > {
     return await withTx(async (tx) => {
       const now = new Date();
       const before: Record<string, unknown> = {};
       const after: Record<string, unknown> = {};
       let changedCount = 0;
+      let conflict:
+        | {
+            key: string;
+            expected: Record<string, unknown> | null;
+            current: unknown;
+          }
+        | null = null;
 
       // (1) Lock each row FOR UPDATE in deterministic key order. Sorting
       // the keys before locking prevents two concurrent updates that touch
@@ -6134,6 +6164,35 @@ export const globalSettingsRepo = {
         before[entry.key] = lockedValue;
         after[entry.key] = entry.value;
 
+        // Codex round 3 on PR #188 [P2]: optimistic-concurrency check.
+        // If the caller supplied `expected`, compare against the LOCKED
+        // value (NOT the pre-tx snapshot — same reason the rest of this
+        // function reads under FOR UPDATE). On mismatch we don't break
+        // the loop yet: we continue locking remaining keys so all
+        // subsequent rows get released cleanly when the tx aborts via
+        // throw, and so `before` is populated for the response. The
+        // throw below converts the conflict into the typed return
+        // shape after the loop.
+        if (
+          entry.expected !== undefined &&
+          conflict === null &&
+          JSON.stringify(lockedValue) !== JSON.stringify(entry.expected)
+        ) {
+          conflict = {
+            key: entry.key,
+            expected: entry.expected,
+            current: lockedValue,
+          };
+          // Don't break: finish locking so `before` is complete and the
+          // tx rolls back the placeholder INSERTs uniformly. We skip
+          // the upsert below by short-circuiting on `conflict !== null`.
+          continue;
+        }
+
+        // If a prior key conflicted, don't write this one either —
+        // we're going to abort below.
+        if (conflict !== null) continue;
+
         // Deep-equal comparison via JSON canonicalization. Both sides are
         // simple JSON (no functions, no Dates) so JSON.stringify is a safe
         // canonical form. Skipping the UPSERT when the value matches avoids
@@ -6162,6 +6221,28 @@ export const globalSettingsRepo = {
         changedCount++;
       }
 
+      // (2) Optimistic-conflict abort. We did NOT call the upsert for the
+      // conflicting key (or any subsequent key), so the only DB effect
+      // inside this tx is the placeholder INSERTs from step (1) — those
+      // are harmless on rollback. We do NOT write the audit row because
+      // there's no real state change to record.
+      if (conflict !== null) {
+        // Throw to force a rollback of the placeholder INSERTs above.
+        // The withTx wrapper catches and re-raises, so we package the
+        // typed payload as a non-Error sentinel that updateAtomic itself
+        // unwraps. But the simpler path here: since we haven't UPSERTED
+        // anything, the placeholder INSERTs of a NULL jsonb are
+        // observationally equivalent to "key was never set" for the
+        // null-as-absent semantics callers rely on. Still, we rely on
+        // rollback for correctness if any side effects existed.
+        throw new ConflictAbortSignal({
+          key: conflict.key,
+          expected: conflict.expected,
+          current: conflict.current,
+          before,
+        });
+      }
+
       if (changedCount === 0) {
         // No real change under the lock → caller can map to BAD_REQUEST.
         // The tx will commit empty (no audit row, no upsert) — cheap and
@@ -6170,7 +6251,7 @@ export const globalSettingsRepo = {
         return { ok: false as const, reason: 'no_changes' as const, before };
       }
 
-      // (2) Audit in the SAME tx. before/after here are the REAL locked
+      // (3) Audit in the SAME tx. before/after here are the REAL locked
       // values, not whatever the caller read pre-tx — so concurrent
       // founders can't corrupt the audit trail.
       await tx.insert(admin_audit_log).values({
@@ -6188,9 +6269,42 @@ export const globalSettingsRepo = {
       });
 
       return { ok: true as const, applied_at: now, before, after };
+    }).catch((err: unknown) => {
+      // Unwrap the optimistic-conflict sentinel into the typed return.
+      // Any other error (DB, audit-insert FK violation, etc.) is a real
+      // failure — propagate it so callers preserve the atomicity
+      // invariant: a thrown error means NO state changed.
+      if (err instanceof ConflictAbortSignal) {
+        return {
+          ok: false as const,
+          reason: 'optimistic_conflict' as const,
+          key: err.payload.key,
+          expected: err.payload.expected,
+          current: err.payload.current,
+          before: err.payload.before,
+        };
+      }
+      throw err;
     });
   },
 };
+
+// Sentinel used to abort the withTx callback when an optimistic check
+// fails. Throwing inside withTx is the standard way to force a ROLLBACK;
+// catching this specific type lets us convert the rollback into a typed
+// `{ ok: false, reason: 'optimistic_conflict' }` return without leaking
+// the throw to callers. Not exported — the conflict path is observable
+// via the discriminated union only.
+class ConflictAbortSignal {
+  constructor(
+    public readonly payload: {
+      key: string;
+      expected: Record<string, unknown> | null;
+      current: unknown;
+      before: Record<string, unknown>;
+    },
+  ) {}
+}
 
 // P9a — re-export skillsRepo from control-plane/skill-registry. Convention:
 // `repositories.ts` é o ponto único de import para callers; `control-plane/`
