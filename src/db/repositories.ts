@@ -3324,39 +3324,44 @@ export const operationalProfileVersionsRepo = {
   },
 
   /**
-   * Thin helper that returns ONLY the id of the currently-active profile row
-   * for `(getCurrentTenant(), getCurrentAgent())`. Returns `null` when the
-   * agent has no active row (e.g. between a rollback and the next seed, or
-   * for an agent that never seeded a v1).
+   * Thin helper that returns the current "active context" for
+   * `(getCurrentTenant(), getCurrentAgent())`: only the id of the row whose
+   * status is currently `'active'` (or `null` if no row holds the active slot).
    *
-   * Codex Adversarial Review of PR #182 round 4 (issue #177 follow-up) — the
-   * drift decision engine uses this after `transition({to:'rolled_back',
-   * expected_from:'active'})` returns `stale` with `actual='frozen'` to
-   * disambiguate two scenarios:
+   * Codex Adversarial Review of PR #196 round 1 (issue #177 follow-up) — the
+   * helper deliberately reports ONLY active-slot occupancy. It does NOT
+   * report on the original row's status. Callers (the drift decision engine)
+   * combine `active_profile_id` with their own knowledge of
+   * `args.active_profile_id` (the row they scored evidence against) to
+   * distinguish three race outcomes after `transition({to:'rolled_back',
+   * expected_from:'active'})` returns `stale` with `actual='frozen'`:
    *
-   *   1. **Same row was frozen between invocations** (concurrent
-   *      `decideAndApply` for the same agent: an `alto` batch froze the row
-   *      first; this `critico` batch hit the stale guard). The current
-   *      active id MATCHES the engine's `args.active_profile_id`, meaning
-   *      the row is still the agent's "current" active in the sense that no
-   *      newer version replaced it. The engine retries the transition with
-   *      `expected_from:'frozen'` to ESCALATE `frozen → rolled_back` so the
-   *      critical rollback isn't silently lost.
+   *   - `active_profile_id === null`:
+   *     The original row is frozen AND no replacement holds the active slot.
+   *     A concurrent `alto` invocation froze the row but did NOT seed a new
+   *     version. The original row is still the agent's logical contract
+   *     surface (just transitioned `active → frozen`). The engine ESCALATES
+   *     via `transition({to:'rolled_back', expected_from:'frozen'})`.
    *
-   *   2. **Active was replaced by a new version** (e.g. seed promoted v2
-   *      while this batch was queued). The current active id is DIFFERENT
-   *      from `args.active_profile_id`. The critical evidence was scored
-   *      against v1; v1 is no longer the agent's contract surface, so
-   *      escalating its rollback is meaningless. The engine logs
-   *      `drift.skip.active_replaced` and lets the next drift cycle
-   *      re-evaluate against the new active.
+   *   - `active_profile_id !== null && active_profile_id !== original_id`:
+   *     A new version was seeded as active (e.g. `seedNewActiveAtomic`
+   *     promoted v2). The original v1 (now frozen) is no longer the agent's
+   *     contract surface, so escalating its rollback is meaningless. The
+   *     engine SKIPS with `drift.skip.active_replaced`.
    *
-   * Kept SEPARATE from `getActive()` because callers in the escalation path
-   * only need the id (no payload, no metadata) and we want the read to be
-   * as cheap as possible to minimize the race window between the stale
-   * observation and the retry.
+   *   - `active_profile_id === original_id`:
+   *     Defensive only — the prior `transition` told us status='frozen', so
+   *     this would mean the row transitioned `frozen → active` between the
+   *     transition and the refetch. Not a legal state-machine edge today
+   *     (and would race against this engine anyway). The engine logs and
+   *     skips defensively rather than retrying blindly.
+   *
+   * Kept SEPARATE from `getActive()` because callers only need the id
+   * (no payload, no metadata) and we want the read to be as cheap as
+   * possible to minimize the race window between the stale observation and
+   * the retry.
    */
-  async getCurrentActiveProfileId(): Promise<string | null> {
+  async getActiveContextForAgent(): Promise<{ active_profile_id: string | null }> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
     const rows = await db
@@ -3370,7 +3375,7 @@ export const operationalProfileVersionsRepo = {
         ),
       )
       .limit(1);
-    return rows[0]?.id ?? null;
+    return { active_profile_id: rows[0]?.id ?? null };
   },
 
   async getById(id: string): Promise<AgentOperationalProfileVersion | null> {

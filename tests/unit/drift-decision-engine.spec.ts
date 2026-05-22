@@ -16,16 +16,16 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { DriftType, DriftSeverity, DriftDecision } from '@/types/enums.js';
 import type { DriftEvidence } from '@/cognition/drift/types.js';
 
-const { transitionMock, createAlertMock, getCurrentActiveProfileIdMock } = vi.hoisted(() => ({
+const { transitionMock, createAlertMock, getActiveContextForAgentMock } = vi.hoisted(() => ({
   transitionMock: vi.fn(),
   createAlertMock: vi.fn(),
-  getCurrentActiveProfileIdMock: vi.fn(),
+  getActiveContextForAgentMock: vi.fn(),
 }));
 
 vi.mock('@/db/repositories.js', () => ({
   operationalProfileVersionsRepo: {
     transition: transitionMock,
-    getCurrentActiveProfileId: getCurrentActiveProfileIdMock,
+    getActiveContextForAgent: getActiveContextForAgentMock,
   },
   driftAlertsRepo: {
     create: createAlertMock,
@@ -250,7 +250,7 @@ describe('decideAndApply', () => {
   beforeEach(() => {
     transitionMock.mockReset();
     createAlertMock.mockReset();
-    getCurrentActiveProfileIdMock.mockReset();
+    getActiveContextForAgentMock.mockReset();
     defaultAlertMockImpl();
   });
 
@@ -905,21 +905,33 @@ describe('decideAndApply', () => {
   // `expected_from='active'` guard demotes its rollback to `applied=false`.
   // The critical drift ends up `frozen` instead of `rolled_back`.
   //
-  // Round 4 fix: on `stale + actual='frozen'` for a ROLLBACK winner, re-fetch
-  // the current active_profile_id:
-  //   - same id → escalate via retry `transition({to:'rolled_back',
-  //     expected_from:'frozen'})`. Log `drift.rollback.escalated`.
-  //   - different id → active was replaced. Skip with
-  //     `drift.skip.active_replaced` log.
+  // Codex Adversarial Review of PR #196 round 1 — refetch semantics. The
+  // earlier round 4 helper queried `WHERE status='active'`, so in the exact
+  // race the patch was meant to handle (target row frozen, no replacement),
+  // it returned null and the engine took the `active_replaced` skip path,
+  // dropping the rollback in the scenario the escalation was designed to
+  // recover. The new helper (`getActiveContextForAgent`) reports current
+  // active-slot occupancy; the engine combines it with the original
+  // `profileId` and distinguishes:
+  //   - active_profile_id === null → target frozen, no replacement.
+  //     ESCALATE via `transition({to:'rolled_back', expected_from:'frozen'})`.
+  //     Log `drift.rollback.escalated`.
+  //   - active_profile_id !== null && !== profileId → replacement seeded.
+  //     SKIP with `drift.skip.active_replaced`.
+  //   - active_profile_id === profileId → defensive (not a legal edge
+  //     today). SKIP with `drift.skip.refetch_anomaly`.
   //   - retry also stale/terminal → log `drift.skip.terminal_state`.
 
-  it('round 4 escalation: critico race vs concurrent freeze (same row) → retry with expected_from=frozen succeeds', async () => {
-    // CASE 1 from spec: an `alto` batch from another invocation froze v1
-    // between this engine's pre-lock read and the actual transition call.
-    // The first transition (to:'rolled_back', expected_from:'active') comes
-    // back stale with actual='frozen'. The engine then re-fetches the
-    // current active_profile_id, sees it's STILL PROFILE_ID (same row), and
-    // retries with expected_from='frozen' to escalate frozen → rolled_back.
+  it('PR #196 escalation: critico race vs concurrent freeze (no replacement) → retry with expected_from=frozen succeeds', async () => {
+    // CASE A: an `alto` batch from another invocation froze v1 between this
+    // engine's pre-lock read and the actual transition call. The first
+    // transition (to:'rolled_back', expected_from:'active') comes back
+    // stale with actual='frozen'. The engine then re-fetches active
+    // context. In the real DB the helper does `SELECT WHERE
+    // status='active'`, so a frozen target with no replacement returns
+    // null (the previous round's mock used the impossible `PROFILE_ID`
+    // value, which masked the bug Codex flagged on PR #196). The engine
+    // recognises null + original frozen → escalate.
 
     // First transition: stale (actual='frozen').
     transitionMock.mockResolvedValueOnce({
@@ -928,9 +940,10 @@ describe('decideAndApply', () => {
       expected_from: 'active',
       actual: 'frozen',
     });
-    // Re-fetch: same active id (concurrent freezer didn't replace the
-    // version, just froze it).
-    getCurrentActiveProfileIdMock.mockResolvedValueOnce(PROFILE_ID);
+    // Re-fetch: NO active slot occupant (target row was frozen, nobody
+    // seeded a replacement). This is what real Postgres returns when
+    // status='active' filters the row out.
+    getActiveContextForAgentMock.mockResolvedValueOnce({ active_profile_id: null });
     // Retry transition: ok (frozen → rolled_back is a valid transition).
     transitionMock.mockResolvedValueOnce({
       ok: true,
@@ -971,18 +984,18 @@ describe('decideAndApply', () => {
     });
 
     // Re-fetch happened exactly once between the two transitions.
-    expect(getCurrentActiveProfileIdMock).toHaveBeenCalledTimes(1);
+    expect(getActiveContextForAgentMock).toHaveBeenCalledTimes(1);
   });
 
-  it('round 4 escalation: critico race vs concurrent seed (active was REPLACED) → skip, no retry', async () => {
-    // CASE 2 from spec: a concurrent `seedNewActiveAtomic` froze v1 and
-    // seeded v2 as the new active. The first transition comes back stale
-    // with actual='frozen'. The engine re-fetches the current active id and
-    // sees it's now PROFILE_ID_V2 (DIFFERENT from PROFILE_ID/v1). The
-    // evidence was scored against v1; rolling back v1 is meaningless when
-    // v2 is the agent's current contract surface. Skip with
-    // `drift.skip.active_replaced`; the next drift cycle will re-evaluate
-    // against v2.
+  it('PR #196 escalation: critico race vs concurrent seed (active was REPLACED) → skip, no retry', async () => {
+    // CASE B: a concurrent `seedNewActiveAtomic` froze v1 and seeded v2 as
+    // the new active. The first transition comes back stale with
+    // actual='frozen'. The engine re-fetches active context and sees
+    // active_profile_id is now PROFILE_ID_V2 (DIFFERENT from PROFILE_ID/
+    // v1). The evidence was scored against v1; rolling back v1 is
+    // meaningless when v2 is the agent's current contract surface. Skip
+    // with `drift.skip.active_replaced`; the next drift cycle will
+    // re-evaluate against v2.
 
     transitionMock.mockResolvedValueOnce({
       ok: false,
@@ -991,7 +1004,9 @@ describe('decideAndApply', () => {
       actual: 'frozen',
     });
     // Re-fetch: DIFFERENT id → active was replaced.
-    getCurrentActiveProfileIdMock.mockResolvedValueOnce('prof-active-v2');
+    getActiveContextForAgentMock.mockResolvedValueOnce({
+      active_profile_id: 'prof-active-v2',
+    });
 
     const evCritico = makeEvidence(
       DriftType.LINGUAGEM,
@@ -1016,16 +1031,16 @@ describe('decideAndApply', () => {
     // Only ONE transition call — escalation NOT attempted because v1 is no
     // longer the current contract surface.
     expect(transitionMock).toHaveBeenCalledTimes(1);
-    expect(getCurrentActiveProfileIdMock).toHaveBeenCalledTimes(1);
+    expect(getActiveContextForAgentMock).toHaveBeenCalledTimes(1);
   });
 
-  it('round 4 escalation: terminal state (third invocation, row already rolled_back) → no-op, log terminal_state', async () => {
-    // CASE 3 from spec: another worker already escalated v1 to rolled_back
-    // between this engine's stale observation and the retry. The retry
+  it('PR #196 escalation: terminal state (third invocation, row already rolled_back) → no-op, log terminal_state', async () => {
+    // CASE C: another worker already escalated v1 to rolled_back between
+    // this engine's stale observation and the retry. The retry
     // `transition({to:'rolled_back', expected_from:'frozen'})` also sees
-    // stale (actual='rolled_back') OR terminal. The desired terminal state
-    // is achieved (by someone else), so mark applied=false with a log line
-    // pointing at the converging path.
+    // stale (actual='rolled_back') OR terminal. The desired terminal
+    // state is achieved (by someone else), so mark applied=false with a
+    // log line pointing at the converging path.
 
     transitionMock.mockResolvedValueOnce({
       ok: false,
@@ -1033,7 +1048,9 @@ describe('decideAndApply', () => {
       expected_from: 'active',
       actual: 'frozen',
     });
-    getCurrentActiveProfileIdMock.mockResolvedValueOnce(PROFILE_ID);
+    // Refetch: no active slot occupant (target rolled_back, no
+    // replacement). The helper would return null here as well.
+    getActiveContextForAgentMock.mockResolvedValueOnce({ active_profile_id: null });
     // Retry transition: another worker already rolled it back; transition
     // returns terminal (the state machine treats rolled_back as terminal).
     transitionMock.mockResolvedValueOnce({
@@ -1056,14 +1073,14 @@ describe('decideAndApply', () => {
     expect(out[0]!.applied).toBe(false);
     expect(out[0]!.applied_error).toBe('terminal');
 
-    // Two transitions, one re-fetch — same shape as CASE 1, just no success
-    // on the retry.
+    // Two transitions, one re-fetch — same shape as CASE A, just no
+    // success on the retry.
     expect(transitionMock).toHaveBeenCalledTimes(2);
-    expect(getCurrentActiveProfileIdMock).toHaveBeenCalledTimes(1);
+    expect(getActiveContextForAgentMock).toHaveBeenCalledTimes(1);
     expect(transitionMock.mock.calls[1]![0].expected_from).toBe('frozen');
   });
 
-  it('round 4 escalation: FROZEN winner (alto) racing concurrent freeze → no escalation, original stale path', async () => {
+  it('PR #196 escalation: FROZEN winner (alto) racing concurrent freeze → no escalation, original stale path', async () => {
     // Belt-and-suspenders: an ALTO winner (decision=FROZEN) that races a
     // concurrent freeze does NOT trigger escalation — the row is already
     // at the desired state, so the original `stale:expected=active,
@@ -1089,13 +1106,13 @@ describe('decideAndApply', () => {
 
     // No re-fetch, no retry.
     expect(transitionMock).toHaveBeenCalledTimes(1);
-    expect(getCurrentActiveProfileIdMock).not.toHaveBeenCalled();
+    expect(getActiveContextForAgentMock).not.toHaveBeenCalled();
   });
 
-  it('round 4 escalation: re-fetch helper THROWS → conservative skip with refetch_failed in error', async () => {
-    // Defensive coverage: if `getCurrentActiveProfileId` itself fails (DB
-    // outage, network glitch), we cannot decide between CASE 1 (escalate)
-    // and CASE 2 (skip). The engine must NOT retry blindly — that could
+  it('PR #196 escalation: re-fetch helper THROWS → conservative skip with refetch_failed in error', async () => {
+    // Defensive coverage: if `getActiveContextForAgent` itself fails (DB
+    // outage, network glitch), we cannot decide between CASE A (escalate)
+    // and CASE B (skip). The engine must NOT retry blindly — that could
     // rollback a replaced active. Mark applied=false with both the
     // original stale signal AND the refetch failure for forensics.
 
@@ -1105,7 +1122,7 @@ describe('decideAndApply', () => {
       expected_from: 'active',
       actual: 'frozen',
     });
-    getCurrentActiveProfileIdMock.mockRejectedValueOnce(
+    getActiveContextForAgentMock.mockRejectedValueOnce(
       new Error('connection reset'),
     );
 
@@ -1124,5 +1141,45 @@ describe('decideAndApply', () => {
     // Only the first transition attempted — no retry without a confirmed
     // re-fetch.
     expect(transitionMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('PR #196 escalation: refetch_anomaly defensive path (impossible same-id observation) → skip, no retry', async () => {
+    // Defensive coverage: if the refetch somehow reports
+    // active_profile_id === profileId AFTER the transition observed
+    // status='frozen', the row would have had to transition
+    // `frozen → active` between the two reads — not a legal edge today.
+    // The engine refuses to retry (could rollback a row that's back in
+    // service) and logs the anomaly. This case is the previous round's
+    // INCORRECT test mock; the bug Codex flagged was that the engine
+    // treated this impossible observation as "escalate", which would
+    // wrongly rollback a re-activated row.
+
+    transitionMock.mockResolvedValueOnce({
+      ok: false,
+      reason: 'stale',
+      expected_from: 'active',
+      actual: 'frozen',
+    });
+    // Impossible-in-practice but defensible refetch outcome.
+    getActiveContextForAgentMock.mockResolvedValueOnce({
+      active_profile_id: PROFILE_ID,
+    });
+
+    const evCritico = makeEvidence(DriftType.LINGUAGEM, { offensive: true });
+
+    const out = await decideAndApply({
+      evidences: [evCritico],
+      active_profile_id: PROFILE_ID,
+    });
+
+    expect(out[0]!.applied).toBe(false);
+    expect(out[0]!.applied_error).toBe(
+      'stale:expected=active,actual=frozen;refetch_anomaly',
+    );
+
+    // Only the FIRST transition was attempted — defensive skip refuses to
+    // retry against a row that the refetch says is `active`.
+    expect(transitionMock).toHaveBeenCalledTimes(1);
+    expect(getActiveContextForAgentMock).toHaveBeenCalledTimes(1);
   });
 });

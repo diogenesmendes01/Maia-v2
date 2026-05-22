@@ -311,17 +311,33 @@ function classifyAndDecide(ev: DriftEvidence): {
  * rollback to `applied=false`. The critical drift ends up `frozen` instead
  * of `rolled_back`.
  *
- * Round 4 fix: on `stale + actual='frozen'` for a ROLLBACK winner, re-fetch
- * the current active_profile_id via `operationalProfileVersionsRepo
- * .getCurrentActiveProfileId()` and:
- *   - Same id → same row was frozen by a concurrent worker. ESCALATE via
- *     a single retry `transition({to:'rolled_back', expected_from:'frozen'})`.
- *     Log `drift.rollback.escalated` on success;
+ * Codex Adversarial Review round 1 on PR #196 — refetch semantics. The
+ * round-4 helper queried `WHERE status='active' LIMIT 1`, so in the EXACT
+ * race the patch was meant to handle — target row already frozen by a
+ * concurrent invocation, no replacement seeded — the helper returned
+ * `null` because the target row was no longer active. The engine then
+ * took the `currentActiveId !== profileId` branch and skipped with
+ * `active_replaced`, dropping the critical rollback in the very scenario
+ * the escalation was designed to recover.
+ *
+ * Final shape: on `stale + actual='frozen'` for a ROLLBACK winner, call
+ * `operationalProfileVersionsRepo.getActiveContextForAgent()` (which
+ * reports current active-slot occupancy) and combine its answer with the
+ * engine's known `args.active_profile_id`:
+ *   - `active_profile_id === null` → target row frozen, NO replacement
+ *     holds the active slot. The original row is still the agent's logical
+ *     contract surface. ESCALATE via a single retry
+ *     `transition({to:'rolled_back', expected_from:'frozen'})`. Log
+ *     `drift.rollback.escalated` on success;
  *     `drift.skip.terminal_state` if the retry also hits stale/terminal
  *     (someone else converged the same target).
- *   - Different id (or null) → active was replaced by a new version. Skip
- *     with `drift.skip.active_replaced` log; next drift call will
- *     re-evaluate against the new active.
+ *   - `active_profile_id !== null` AND `!== original_id` → active was
+ *     replaced by a new version. Skip with `drift.skip.active_replaced`
+ *     log; next drift call will re-evaluate against the new active.
+ *   - `active_profile_id === original_id` → defensive only (would mean
+ *     status transitioned `frozen → active` between the transition and
+ *     the refetch, which is not a legal edge today). Skip with
+ *     `drift.skip.active_replaced` and log it so the anomaly surfaces.
  *
  * Bounded to one retry (no loop) so a pathological row that keeps
  * transitioning never traps the engine. Only ROLLBACK winners trigger the
@@ -552,38 +568,51 @@ export async function decideAndApply(args: {
         r.actual === 'frozen' &&
         winner.decision === DriftDecision.ROLLBACK
       ) {
-        // Codex Adversarial Review of PR #182 round 4 (issue #177 follow-up) —
-        // CROSS-INVOCATION escalation. The round 2 collapse fixed
-        // intra-batch ordering (alto and critico in the SAME invocation),
-        // but two concurrent `decideAndApply` calls can still race for the
-        // same agent: an alto invocation freezes the active row first; a
-        // critico invocation arrives second, takes the parent-agent lock,
-        // observes the row as `frozen` (no longer `active`), and is
-        // rejected by the `expected_from='active'` guard with
-        // `{stale, actual:'frozen'}`. The critical rollback is silently
-        // demoted to `applied=false`.
+        // Codex Adversarial Review of PR #196 round 1 (issue #177 follow-up) —
+        // CROSS-INVOCATION escalation, refetch semantics fixed.
         //
-        // Distinguish two scenarios via a thin re-fetch:
-        //   1. **Same row was frozen by concurrent invocation**: current
-        //      active_profile_id MATCHES our `profileId`. The row is still
-        //      the agent's logical "current" version (no replacement seed
-        //      ran), it was just transitioned `active → frozen` by a
-        //      different drift worker. Critical rollback should ESCALATE
-        //      `frozen → rolled_back` (a valid transition per the state
-        //      machine). Re-try `transition` with `expected_from:'frozen'`.
-        //   2. **Active was replaced by a new version**: current
-        //      active_profile_id is DIFFERENT (or null). This evidence was
-        //      scored against the old contract; rolling back the now-frozen
-        //      v1 doesn't affect the current active vN. Re-evaluation
-        //      happens on the next drift call against the new active.
-        //      Skip with `drift.skip.active_replaced` log.
+        // Two concurrent `decideAndApply` calls can race for the same
+        // agent: an `alto` invocation freezes the active row first; a
+        // `critico` invocation arrives second, takes the parent-agent
+        // lock, observes the row as `frozen` (no longer `active`), and is
+        // rejected by `expected_from='active'` with
+        // `{stale, actual:'frozen'}`. Without escalation the critical
+        // rollback is silently demoted to `applied=false`.
+        //
+        // The refetch (`getActiveContextForAgent`) reports current active-
+        // slot occupancy ONLY — `active_profile_id` is the id of whichever
+        // row currently holds `status='active'`, or `null` if no row does.
+        // The engine combines that with `profileId` (the row evidence was
+        // scored against, currently observed as `frozen`):
+        //
+        //   - `active_profile_id === null`:
+        //     The original row is frozen AND no replacement holds the
+        //     active slot. A concurrent worker froze the row but did NOT
+        //     seed a new version. The original row is still the agent's
+        //     logical contract surface. ESCALATE `frozen → rolled_back`.
+        //
+        //   - `active_profile_id !== null && !== profileId`:
+        //     A different row holds the active slot — a new version was
+        //     seeded (e.g. `seedNewActiveAtomic` promoted v2). The
+        //     original row is no longer the agent's contract surface, so
+        //     escalating its rollback is meaningless. SKIP with
+        //     `active_replaced`; next drift cycle re-evaluates against the
+        //     new active.
+        //
+        //   - `active_profile_id === profileId`:
+        //     Defensive only — would mean the row transitioned
+        //     `frozen → active` between the original transition and the
+        //     refetch, which is not a legal state-machine edge today. The
+        //     engine refuses to retry (could rollback a row that's back
+        //     in service) and logs an anomaly.
         //
         // Bounded to ONE re-try to avoid infinite loops in case the row
         // transitions again between our re-fetch and the retry.
-        let currentActiveId: string | null = null;
+        let activeProfileId: string | null = null;
         let refetchErr: string | undefined;
         try {
-          currentActiveId = await operationalProfileVersionsRepo.getCurrentActiveProfileId();
+          const ctx = await operationalProfileVersionsRepo.getActiveContextForAgent();
+          activeProfileId = ctx.active_profile_id;
         } catch (e) {
           refetchErr = e instanceof Error ? e.message : String(e);
         }
@@ -595,8 +624,9 @@ export async function decideAndApply(args: {
             applied: false,
             applied_error: `stale:expected=${r.expected_from},actual=${r.actual};refetch_failed:${refetchErr}`,
           });
-        } else if (currentActiveId === profileId) {
-          // CASE 1 — same row, was frozen between invocations. Escalate.
+        } else if (activeProfileId === null) {
+          // CASE A — original row frozen, NO replacement holds the active
+          // slot. ESCALATE.
           try {
             const r2 = await operationalProfileVersionsRepo.transition({
               id: profileId,
@@ -649,9 +679,9 @@ export async function decideAndApply(args: {
             const applied_error = e2 instanceof Error ? e2.message : String(e2);
             applyResult.set(winnerIndex, { applied: false, applied_error });
           }
-        } else {
-          // CASE 2 — active was replaced. Skip; next drift call will
-          // re-evaluate against the new active.
+        } else if (activeProfileId !== profileId) {
+          // CASE B — active was replaced by a new version. Skip; next
+          // drift call will re-evaluate against the new active.
           applyResult.set(winnerIndex, {
             applied: false,
             applied_error: `stale:expected=${r.expected_from},actual=${r.actual};active_replaced`,
@@ -659,11 +689,29 @@ export async function decideAndApply(args: {
           logger.info(
             {
               original_active_id: profileId,
-              new_active_id: currentActiveId,
+              new_active_id: activeProfileId,
               dropped_evidence: winner.severity,
               original_alert_id: winnerAlertId,
             },
             'drift.skip.active_replaced',
+          );
+        } else {
+          // DEFENSIVE — refetch says active_profile_id === profileId but
+          // the transition just observed it as `frozen`. The row would
+          // have had to transition `frozen → active` in between, which is
+          // not a legal edge today. Refuse to retry (could rollback a row
+          // that's back in service) and log so the anomaly surfaces.
+          applyResult.set(winnerIndex, {
+            applied: false,
+            applied_error: `stale:expected=${r.expected_from},actual=${r.actual};refetch_anomaly`,
+          });
+          logger.warn(
+            {
+              active_profile_id: profileId,
+              original_alert_id: winnerAlertId,
+              dropped_evidence: winner.severity,
+            },
+            'drift.skip.refetch_anomaly',
           );
         }
       } else {
