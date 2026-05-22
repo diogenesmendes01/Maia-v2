@@ -3185,6 +3185,56 @@ export const operationalProfileVersionsRepo = {
     return rows[0] ?? null;
   },
 
+  /**
+   * Thin helper that returns ONLY the id of the currently-active profile row
+   * for `(getCurrentTenant(), getCurrentAgent())`. Returns `null` when the
+   * agent has no active row (e.g. between a rollback and the next seed, or
+   * for an agent that never seeded a v1).
+   *
+   * Codex Adversarial Review of PR #182 round 4 (issue #177 follow-up) — the
+   * drift decision engine uses this after `transition({to:'rolled_back',
+   * expected_from:'active'})` returns `stale` with `actual='frozen'` to
+   * disambiguate two scenarios:
+   *
+   *   1. **Same row was frozen between invocations** (concurrent
+   *      `decideAndApply` for the same agent: an `alto` batch froze the row
+   *      first; this `critico` batch hit the stale guard). The current
+   *      active id MATCHES the engine's `args.active_profile_id`, meaning
+   *      the row is still the agent's "current" active in the sense that no
+   *      newer version replaced it. The engine retries the transition with
+   *      `expected_from:'frozen'` to ESCALATE `frozen → rolled_back` so the
+   *      critical rollback isn't silently lost.
+   *
+   *   2. **Active was replaced by a new version** (e.g. seed promoted v2
+   *      while this batch was queued). The current active id is DIFFERENT
+   *      from `args.active_profile_id`. The critical evidence was scored
+   *      against v1; v1 is no longer the agent's contract surface, so
+   *      escalating its rollback is meaningless. The engine logs
+   *      `drift.skip.active_replaced` and lets the next drift cycle
+   *      re-evaluate against the new active.
+   *
+   * Kept SEPARATE from `getActive()` because callers in the escalation path
+   * only need the id (no payload, no metadata) and we want the read to be
+   * as cheap as possible to minimize the race window between the stale
+   * observation and the retry.
+   */
+  async getCurrentActiveProfileId(): Promise<string | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select({ id: agent_operational_profile_versions.id })
+      .from(agent_operational_profile_versions)
+      .where(
+        and(
+          eq(agent_operational_profile_versions.tenant_id, tenant_id),
+          eq(agent_operational_profile_versions.agent_id, agent_id),
+          eq(agent_operational_profile_versions.status, 'active'),
+        ),
+      )
+      .limit(1);
+    return rows[0]?.id ?? null;
+  },
+
   async getById(id: string): Promise<AgentOperationalProfileVersion | null> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();

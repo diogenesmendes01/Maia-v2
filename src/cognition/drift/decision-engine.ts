@@ -302,6 +302,32 @@ function classifyAndDecide(ev: DriftEvidence): {
  * a structured `drift.batch.collapse.fallback` log fires whenever the
  * intended winner (by raw rank) differs from the real winner (by
  * persisted rank), so the rescue path is discoverable in postmortems.
+ *
+ * Codex Adversarial Review round 4 on PR #182 — CROSS-INVOCATION escalation.
+ * Round 2 fixed intra-batch ordering, but two concurrent `decideAndApply`
+ * calls for the same agent could still race: an `alto` batch freezes the
+ * active row; the `critico` batch arrives second, sees the row as `frozen`
+ * (not `active`), and the `expected_from='active'` guard demotes its
+ * rollback to `applied=false`. The critical drift ends up `frozen` instead
+ * of `rolled_back`.
+ *
+ * Round 4 fix: on `stale + actual='frozen'` for a ROLLBACK winner, re-fetch
+ * the current active_profile_id via `operationalProfileVersionsRepo
+ * .getCurrentActiveProfileId()` and:
+ *   - Same id → same row was frozen by a concurrent worker. ESCALATE via
+ *     a single retry `transition({to:'rolled_back', expected_from:'frozen'})`.
+ *     Log `drift.rollback.escalated` on success;
+ *     `drift.skip.terminal_state` if the retry also hits stale/terminal
+ *     (someone else converged the same target).
+ *   - Different id (or null) → active was replaced by a new version. Skip
+ *     with `drift.skip.active_replaced` log; next drift call will
+ *     re-evaluate against the new active.
+ *
+ * Bounded to one retry (no loop) so a pathological row that keeps
+ * transitioning never traps the engine. Only ROLLBACK winners trigger the
+ * escalation path — FROZEN winners that race a concurrent freeze are
+ * already at the desired state, so the stale path stays the original
+ * `applied=false / stale:...` outcome.
  */
 export async function decideAndApply(args: {
   evidences: DriftEvidence[];
@@ -521,6 +547,125 @@ export async function decideAndApply(args: {
       });
       if (r.ok) {
         applyResult.set(winnerIndex, { applied: true });
+      } else if (
+        r.reason === 'stale' &&
+        r.actual === 'frozen' &&
+        winner.decision === DriftDecision.ROLLBACK
+      ) {
+        // Codex Adversarial Review of PR #182 round 4 (issue #177 follow-up) —
+        // CROSS-INVOCATION escalation. The round 2 collapse fixed
+        // intra-batch ordering (alto and critico in the SAME invocation),
+        // but two concurrent `decideAndApply` calls can still race for the
+        // same agent: an alto invocation freezes the active row first; a
+        // critico invocation arrives second, takes the parent-agent lock,
+        // observes the row as `frozen` (no longer `active`), and is
+        // rejected by the `expected_from='active'` guard with
+        // `{stale, actual:'frozen'}`. The critical rollback is silently
+        // demoted to `applied=false`.
+        //
+        // Distinguish two scenarios via a thin re-fetch:
+        //   1. **Same row was frozen by concurrent invocation**: current
+        //      active_profile_id MATCHES our `profileId`. The row is still
+        //      the agent's logical "current" version (no replacement seed
+        //      ran), it was just transitioned `active → frozen` by a
+        //      different drift worker. Critical rollback should ESCALATE
+        //      `frozen → rolled_back` (a valid transition per the state
+        //      machine). Re-try `transition` with `expected_from:'frozen'`.
+        //   2. **Active was replaced by a new version**: current
+        //      active_profile_id is DIFFERENT (or null). This evidence was
+        //      scored against the old contract; rolling back the now-frozen
+        //      v1 doesn't affect the current active vN. Re-evaluation
+        //      happens on the next drift call against the new active.
+        //      Skip with `drift.skip.active_replaced` log.
+        //
+        // Bounded to ONE re-try to avoid infinite loops in case the row
+        // transitions again between our re-fetch and the retry.
+        let currentActiveId: string | null = null;
+        let refetchErr: string | undefined;
+        try {
+          currentActiveId = await operationalProfileVersionsRepo.getCurrentActiveProfileId();
+        } catch (e) {
+          refetchErr = e instanceof Error ? e.message : String(e);
+        }
+
+        if (refetchErr !== undefined) {
+          // Re-fetch failed → conservative skip, keep stale error so the
+          // original race is still visible in postmortems.
+          applyResult.set(winnerIndex, {
+            applied: false,
+            applied_error: `stale:expected=${r.expected_from},actual=${r.actual};refetch_failed:${refetchErr}`,
+          });
+        } else if (currentActiveId === profileId) {
+          // CASE 1 — same row, was frozen between invocations. Escalate.
+          try {
+            const r2 = await operationalProfileVersionsRepo.transition({
+              id: profileId,
+              to: 'rolled_back',
+              expected_from: 'frozen',
+              approved_by: `auto:drift_${winner.severity}`,
+              rollback_reason: winner.ev.evidence_summary,
+            });
+            if (r2.ok) {
+              applyResult.set(winnerIndex, { applied: true });
+              logger.info(
+                {
+                  active_profile_id: profileId,
+                  from: 'frozen',
+                  to: 'rolled_back',
+                  original_alert_id: winnerAlertId,
+                  severity: winner.severity,
+                },
+                'drift.rollback.escalated',
+              );
+            } else if (r2.reason === 'stale' || r2.reason === 'terminal') {
+              // Re-try also saw a transition between our re-fetch and the
+              // retry (e.g. another worker already escalated to
+              // rolled_back, or the row reached the rolled_back terminal).
+              // The desired terminal state is achieved (or about to be) —
+              // mark applied=false but log it so postmortems see the
+              // converging path.
+              applyResult.set(winnerIndex, {
+                applied: false,
+                applied_error:
+                  r2.reason === 'stale'
+                    ? `stale:expected=${r2.expected_from},actual=${r2.actual}`
+                    : 'terminal',
+              });
+              logger.info(
+                {
+                  active_profile_id: profileId,
+                  reason: r2.reason,
+                  original_alert_id: winnerAlertId,
+                },
+                'drift.skip.terminal_state',
+              );
+            } else {
+              applyResult.set(winnerIndex, {
+                applied: false,
+                applied_error: r2.reason,
+              });
+            }
+          } catch (e2) {
+            const applied_error = e2 instanceof Error ? e2.message : String(e2);
+            applyResult.set(winnerIndex, { applied: false, applied_error });
+          }
+        } else {
+          // CASE 2 — active was replaced. Skip; next drift call will
+          // re-evaluate against the new active.
+          applyResult.set(winnerIndex, {
+            applied: false,
+            applied_error: `stale:expected=${r.expected_from},actual=${r.actual};active_replaced`,
+          });
+          logger.info(
+            {
+              original_active_id: profileId,
+              new_active_id: currentActiveId,
+              dropped_evidence: winner.severity,
+              original_alert_id: winnerAlertId,
+            },
+            'drift.skip.active_replaced',
+          );
+        }
       } else {
         const applied_error =
           r.reason === 'stale'
