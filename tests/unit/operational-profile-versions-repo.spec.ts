@@ -107,12 +107,24 @@ vi.mock('@/db/repositories.js', async () => {
         async (args: {
           id: string;
           to: 'proposed' | 'active' | 'frozen' | 'rolled_back';
+          expected_from?: 'proposed' | 'active' | 'frozen' | 'rolled_back';
           approved_by?: string;
           rollback_reason?: string;
         }) => {
           const row = profilesState[args.id];
           if (!row) return { ok: false as const, reason: 'not_found' as const };
           const from = row.status;
+          // Codex Adversarial Review of PR #182 round 1: mirror the real
+          // contract — if the caller passed `expected_from` and the row's
+          // status diverged, return `stale` with the observed state.
+          if (args.expected_from !== undefined && from !== args.expected_from) {
+            return {
+              ok: false as const,
+              reason: 'stale' as const,
+              expected_from: args.expected_from,
+              actual: from,
+            };
+          }
           if (from === 'rolled_back') return { ok: false as const, reason: 'terminal' as const };
           if (from === args.to) return { ok: false as const, reason: 'invalid_transition' as const };
 

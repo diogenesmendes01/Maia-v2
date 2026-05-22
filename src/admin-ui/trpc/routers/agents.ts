@@ -348,6 +348,31 @@ export const agentsRouter = router({
               `current active version before approving.`,
           });
         }
+        // Codex Adversarial Review of PR #182 round 3 (#186) — explicit
+        // `null` predecessor on a non-seed proposal. Rejected because
+        // approving would create a v2+ active row with no lineage anchor
+        // (bypassing the stale-predecessor guard). The most common case is
+        // a recovery window — agent has frozen/rolled_back versions but no
+        // active row — and the operator tried to use the normal approve
+        // path instead of re-proposing against the last known version.
+        // PRECONDITION_FAILED communicates "the request is structurally
+        // wrong for the current state" better than CONFLICT (which implies
+        // someone else changed the state under you).
+        if (result.reason === 'missing_predecessor') {
+          throw new TRPCError({
+            code: 'PRECONDITION_FAILED',
+            message:
+              `Proposal v${result.proposed_version} has no predecessor lineage ` +
+              `(metadata.previous_version_id is null), but it is not a ` +
+              `v1 intentional seed. ` +
+              (result.current_predecessor === null
+                ? `There is no active version to chain from — if this agent has ` +
+                  `frozen or rolled_back versions, re-propose the change against ` +
+                  `the last known version explicitly.`
+                : `Current active version is ${String(result.current_predecessor)} — ` +
+                  `re-propose the change against it.`),
+          });
+        }
         throw new TRPCError({
           code: 'INTERNAL_SERVER_ERROR',
           message: `Approval transition failed: ${result.reason}`,

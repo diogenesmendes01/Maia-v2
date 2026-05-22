@@ -348,6 +348,19 @@ function makeRepos(
 
         // Round 3 #173: intentional seed (v1 + no incumbent + null predecessor).
         const isIntentionalSeed = expected === null && current === null && target.version === 1;
+
+        // Codex Adversarial Review of PR #182 round 3 (#186): explicit
+        // `null` predecessor on any non-seed proposal must be rejected with
+        // the new `missing_predecessor` typed reason. Mirrors the repo.
+        if (!isIntentionalSeed && expected === null) {
+          return {
+            ok: false as const,
+            reason: 'missing_predecessor' as const,
+            proposed_version: target.version,
+            current_predecessor: current,
+          };
+        }
+
         if (!isIntentionalSeed && expected !== current) {
           return {
             ok: false as const,
@@ -970,15 +983,19 @@ describe('agentsRouter.approveProfile — atomic + freezes incumbent', () => {
   });
 
   /**
-   * Documents the strict-equality behavior for null predecessor + no
-   * incumbent on a non-v1 version. This case is NOT rejected because the
-   * structural invariant (`expected_predecessor === current_incumbent`) is
-   * satisfied — null === null. The intentional-seed gate is an
-   * ACCEPTANCE bypass; the strict-equality check is the rejection gate.
-   * The dangerous shape (null predecessor with an incumbent present) is
-   * caught by `expected !== current` when current is non-null.
+   * Codex Adversarial Review of PR #182 round 3 (#186) — the dangerous
+   * shape that was missed in round 3 of PR #171: explicit `null`
+   * predecessor on v2+ with NO incumbent active row. The round-3
+   * intentional-seed gate only fired for v === 1, so v2+ + null + null
+   * structurally satisfied the equality check (`null === null`) and got
+   * activated with no lineage anchor. That bypasses the stale-predecessor
+   * guard and can reactivate profile state after rollback without binding
+   * to the last known version.
+   *
+   * The new policy: any non-seed proposal with `previous_version_id: null`
+   * is REJECTED as missing_predecessor (PRECONDITION_FAILED).
    */
-  it('explicit null predecessor on v2 (no incumbent) is accepted (null === null structurally)', async () => {
+  it('missing_predecessor: v2 + no incumbent + null predecessor is REJECTED (was bypass in PR #181)', async () => {
     const v2NoIncumbent: Profile = {
       id: '00000000-0000-4000-8000-0000000000a2',
       tenant_id: 'tenant-A',
@@ -990,12 +1007,141 @@ describe('agentsRouter.approveProfile — atomic + freezes incumbent', () => {
       proposed_reason: null,
     };
     const repos = makeRepos({ agents: [existingAgent], profiles: [v2NoIncumbent] });
-    const res = await caller('owner', 'tenant-A', 'u1', repos).approveProfile({
-      agentId: 'agent-x',
-      versionId: '00000000-0000-4000-8000-0000000000a2',
-      comment: 'approve v2 against empty active slot',
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).approveProfile({
+        agentId: 'agent-x',
+        versionId: '00000000-0000-4000-8000-0000000000a2',
+        comment: 'approve v2 against empty active slot — should be rejected',
+      }),
+    ).rejects.toMatchObject({
+      code: 'PRECONDITION_FAILED',
+      message: expect.stringMatching(/has no predecessor lineage/i),
     });
-    expect(res.activated.id).toBe('00000000-0000-4000-8000-0000000000a2');
+    // Profile MUST still be proposed — nothing was activated.
+    expect(repos._inspect.profiles[0]!.status).toBe('proposed');
+  });
+
+  it('missing_predecessor: v1 + incumbent + null predecessor is REJECTED', async () => {
+    // v1 cannot coexist with an active incumbent. Reject as
+    // missing_predecessor rather than predecessor_conflict so the
+    // operator sees the right diagnosis.
+    const v1Active: Profile = {
+      id: '00000000-0000-4000-8000-0000000000a1',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      version: 1,
+      status: 'active',
+      profile_body: bodyWithPrev(null),
+      proposed_by: 'system',
+      proposed_reason: null,
+    };
+    const v1Extra: Profile = {
+      id: '00000000-0000-4000-8000-0000000000b1',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      version: 1,
+      status: 'proposed',
+      profile_body: { metadata: { previous_version_id: null } },
+      proposed_by: 'system',
+      proposed_reason: null,
+    };
+    const repos = makeRepos({ agents: [existingAgent], profiles: [v1Active, v1Extra] });
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).approveProfile({
+        agentId: 'agent-x',
+        versionId: '00000000-0000-4000-8000-0000000000b1',
+        comment: 'v1 + incumbent + null pred — should be rejected',
+      }),
+    ).rejects.toMatchObject({
+      code: 'PRECONDITION_FAILED',
+      message: expect.stringMatching(/has no predecessor lineage/i),
+    });
+    // Both rows untouched.
+    expect(
+      repos._inspect.profiles.find((p) => p.id === '00000000-0000-4000-8000-0000000000a1')!.status,
+    ).toBe('active');
+    expect(
+      repos._inspect.profiles.find((p) => p.id === '00000000-0000-4000-8000-0000000000b1')!.status,
+    ).toBe('proposed');
+  });
+
+  it('missing_predecessor: v2 + incumbent + null predecessor is REJECTED (was predecessor_conflict in round 2)', async () => {
+    // Round 2's check (`expected !== current`) caught this too. We now
+    // surface a clearer reason: the proposal is missing its predecessor,
+    // not that someone changed the incumbent under it.
+    const v1Active: Profile = {
+      id: '00000000-0000-4000-8000-0000000000a1',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      version: 1,
+      status: 'active',
+      profile_body: bodyWithPrev(null),
+      proposed_by: 'system',
+      proposed_reason: null,
+    };
+    const v2NullPred: Profile = {
+      id: '00000000-0000-4000-8000-0000000000a2',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      version: 2,
+      status: 'proposed',
+      profile_body: { metadata: { previous_version_id: null } },
+      proposed_by: 'system',
+      proposed_reason: null,
+    };
+    const repos = makeRepos({ agents: [existingAgent], profiles: [v1Active, v2NullPred] });
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).approveProfile({
+        agentId: 'agent-x',
+        versionId: '00000000-0000-4000-8000-0000000000a2',
+        comment: 'v2 null pred with v1 active — should be rejected',
+      }),
+    ).rejects.toMatchObject({
+      code: 'PRECONDITION_FAILED',
+      message: expect.stringMatching(/has no predecessor lineage/i),
+    });
+    // v1 still active, v2 still proposed.
+    expect(
+      repos._inspect.profiles.find((p) => p.id === '00000000-0000-4000-8000-0000000000a1')!.status,
+    ).toBe('active');
+    expect(
+      repos._inspect.profiles.find((p) => p.id === '00000000-0000-4000-8000-0000000000a2')!.status,
+    ).toBe('proposed');
+  });
+
+  it('migrated_legacy_proposal precedence: null + marker still rejected as migrated (not missing_predecessor)', async () => {
+    // The migrated-legacy check fires BEFORE the null-predecessor check
+    // (so the operator sees the most specific diagnosis). v2+ with
+    // migrated_from_legacy marker + null predecessor → migrated_legacy_proposal,
+    // not missing_predecessor.
+    const migrated: Profile = {
+      id: '00000000-0000-4000-8000-0000000000a1',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      version: 5, // any non-v1 version
+      status: 'proposed',
+      profile_body: {
+        metadata: {
+          previous_version_id: null,
+          migrated_from_legacy: true,
+        },
+      },
+      proposed_by: 'system',
+      proposed_reason: null,
+    };
+    const repos = makeRepos({ agents: [existingAgent], profiles: [migrated] });
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).approveProfile({
+        agentId: 'agent-x',
+        versionId: '00000000-0000-4000-8000-0000000000a1',
+        comment: 'migrated v5 with null pred — should be rejected as migrated',
+      }),
+    ).rejects.toMatchObject({
+      code: 'CONFLICT',
+      message: expect.stringMatching(/v3\.1\.1 legacy backfill/i),
+    });
+    // Not a PRECONDITION_FAILED with missing_predecessor message.
+    expect(repos._inspect.profiles[0]!.status).toBe('proposed');
   });
 
   /**

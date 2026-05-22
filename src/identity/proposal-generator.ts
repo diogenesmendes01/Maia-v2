@@ -115,15 +115,30 @@ export async function seedInitialOperationalProfile(args?: {
     proposed_reason: 'initial seed from self_state + maia-prompt.md',
   });
 
+  // Codex Adversarial Review of PR #182 round 1: pass `expected_from:
+  // 'proposed'` so a concurrent writer that somehow mutated the
+  // freshly-created proposed row before we acquired the parent-agent lock
+  // (very narrow window — `create` itself is locked, but a concurrent
+  // admin-driven `transition` on the same id could still race) surfaces
+  // as `stale` instead of silently transitioning from an unexpected state.
   const r = await operationalProfileVersionsRepo.transition({
     id: created.id,
     to: 'active',
+    expected_from: 'proposed',
     approved_by: 'system_seed',
   });
   if (!r.ok) {
     // Corrida: outra propose foi promovida a active entre nosso getActive
     // inicial e a transition. Devolve a vencedora.
     if (r.reason === 'already_has_active') {
+      const existing = await operationalProfileVersionsRepo.getActive();
+      if (existing) return { created: false, existing, reason: 'already_active' };
+    }
+    // `stale` means the row we just created was mutated to a non-`proposed`
+    // state between create and transition. Treat it like an
+    // already-promoted race: return the current active (if any) so the
+    // bootstrap caller can choose to no-op cleanly.
+    if (r.reason === 'stale') {
       const existing = await operationalProfileVersionsRepo.getActive();
       if (existing) return { created: false, existing, reason: 'already_active' };
     }
