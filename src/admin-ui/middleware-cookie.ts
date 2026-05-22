@@ -96,20 +96,33 @@ function classifySessionCookieName(
  * Rules:
  *
  *   1. **Unchunked cookie** (e.g. `__Secure-authjs.session-token`): present
- *      and non-empty value ⇒ valid.
+ *      and non-empty value ⇒ valid. A single unchunked match is sufficient
+ *      because Auth.js only chunks when the JWT exceeds the per-cookie size
+ *      ceiling (~4KB); a JWT that fits the single-cookie form is by
+ *      construction reconstructible from that one cookie alone.
  *
  *   2. **Chunked cookies** (e.g. `__Secure-authjs.session-token.0`,
  *      `__Secure-authjs.session-token.1`, …): per Auth.js's chunking format,
  *      Auth.js reconstructs the session JWT by concatenating chunks in order
  *      starting from index `0`. For the middleware gate to mirror that:
- *        - chunk `.0` for that prefix MUST be present AND have a non-empty value
- *        - the chunk index set MUST be contiguous starting at 0 (`0,1,2,…,N`).
+ *        - chunks `.0` AND `.1` for that prefix MUST both be present and
+ *          non-empty (i.e. at least TWO contiguous non-empty chunks).
+ *        - if more chunks are present, the chunk index set MUST be contiguous
+ *          starting at 0 (`0,1,2,…,N` with `N >= 1`).
  *      All present chunks must be non-empty.
+ *
+ *      Why at least two? Auth.js only emits the chunked form when the JWT
+ *      exceeds the single-cookie ceiling — i.e. it would never produce a
+ *      lone `.0` (it would have written the unchunked cookie instead). So a
+ *      request that carries only `.0` is by construction either truncated
+ *      (intermediary dropped `.1`+) or stale (the rest expired / were
+ *      cleared first). Either way the JWT cannot be reconstructed, and
+ *      letting it through renders the protected app shell with `auth()`
+ *      returning null. See PR #181 Codex Adversarial finding (round 2).
+ *
  *      Orphan chunks (e.g. only `.1` with no `.0`) or gapped chunks
- *      (e.g. `.0,.2` missing `.1`) cannot be reconstructed by Auth.js and
- *      MUST NOT pass the gate — otherwise the root layout renders the
- *      protected page tree with `auth()` returning null. See PR #181 Codex
- *      Adversarial finding.
+ *      (e.g. `.0,.2` missing `.1`) likewise cannot be reconstructed and
+ *      MUST NOT pass the gate.
  *
  *   3. A request may have a valid unchunked cookie under one prefix AND
  *      stale chunks under another; the unchunked match alone is sufficient.
@@ -149,12 +162,20 @@ export function hasSessionCookie(
 
   if (exactValid.size > 0) return true;
 
-  // For each prefix with chunked cookies, enforce: `.0` present + non-empty,
-  // contiguous indexes starting at 0, and every present chunk non-empty.
-  // (An empty `.0` is the sign-out / cleared-cookie state — must NOT pass.)
+  // For each prefix with chunked cookies, enforce:
+  //   - `.0` present + non-empty (otherwise Auth.js cannot start concatenation)
+  //   - `.1` present + non-empty too (chunked form is only emitted when the
+  //     JWT exceeds the single-cookie ceiling, so a lone `.0` is always
+  //     truncated/stale — see PR #181 round-2 Codex finding)
+  //   - if more chunks are present, contiguous indexes starting at 0
+  //   - every present chunk non-empty (an empty middle chunk yields a
+  //     truncated/garbage JWT under Auth.js's raw concatenation)
   for (const perPrefix of chunks.values()) {
     const zero = perPrefix.get(0);
     if (zero === undefined || zero === '') continue; // no .0 or empty .0 ⇒ unreconstructible
+
+    const one = perPrefix.get(1);
+    if (one === undefined || one === '') continue; // lone/empty .1 ⇒ not a real chunked session
 
     const indexes = [...perPrefix.keys()].sort((a, b) => a - b);
     let contiguous = true;

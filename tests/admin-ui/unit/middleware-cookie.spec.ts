@@ -205,8 +205,16 @@ describe('hasSessionCookie — pass / fail behavior', () => {
   //   - `.0,.2` (gap in `.1`) bypassed the gate
   // None of those are reconstructible by Auth.js (which concatenates chunks
   // starting from `.0` until the next index is missing), so the root layout
-  // would render the protected page tree with `auth()` returning null. The
-  // gate now requires `.0` present + non-empty AND contiguous indexes.
+  // would render the protected page tree with `auth()` returning null.
+  //
+  // ROUND 2 finding: a lone non-empty `.0` (no `.1+`) is also unreconstructible
+  // in practice — Auth.js only emits the chunked form when the JWT exceeds the
+  // single-cookie size ceiling, so it would never produce a lone `.0` (it would
+  // have written the unchunked cookie instead). A lone `.0` is therefore
+  // always either truncated mid-flight or a stale leftover after `.1+` were
+  // cleared/expired. The gate now requires AT LEAST two contiguous non-empty
+  // chunks (`.0` + `.1`) for the chunked path; the unchunked single-cookie
+  // path is unchanged.
   // ---------------------------------------------------------------------------
 
   it('fails for an orphan chunk `.1` with no `.0` (PR #181 Codex finding)', () => {
@@ -258,12 +266,30 @@ describe('hasSessionCookie — pass / fail behavior', () => {
     ).toBe(true);
   });
 
-  it('passes for a single-chunk session (`.0` only with non-empty value)', () => {
-    // Edge case: small enough JWT that Auth.js still chunked once (e.g. a
-    // forward-compat scenario). Single non-empty `.0` is trivially contiguous.
+  it('fails for a lone non-empty `.0` chunk with no `.1` (PR #181 round-2 finding)', () => {
+    // ROUND 2 regression: Auth.js only emits the chunked cookie form when the
+    // session JWT exceeds the per-cookie size ceiling — i.e. it would NEVER
+    // produce a lone `.0` (it would have written the unchunked cookie
+    // instead). A request that carries `.0` alone is therefore either a
+    // truncated copy (intermediary dropped `.1+`) or a stale leftover after
+    // `.1+` expired/were cleared. Either way Auth.js cannot reconstruct, and
+    // letting it through would render the protected app shell with `auth()`
+    // returning null — the exact failure mode the gate exists to prevent.
     expect(
       hasSessionCookie([c('__Secure-authjs.session-token.0', FIXTURE_JWT)]),
-    ).toBe(true);
+    ).toBe(false);
+  });
+
+  it('fails for `.0` non-empty + `.1` empty (chunked form needs both populated)', () => {
+    // Same root cause as the lone-`.0` case: Auth.js's chunked form is only
+    // emitted when there's payload to put in `.1+`, so an empty `.1` is the
+    // signature of a partially-cleared sign-out or truncated copy.
+    expect(
+      hasSessionCookie([
+        c('__Secure-authjs.session-token.0', FIXTURE_JWT),
+        c('__Secure-authjs.session-token.1', ''),
+      ]),
+    ).toBe(false);
   });
 
   it('passes when an unchunked session cookie coexists with orphan chunks of another prefix', () => {
