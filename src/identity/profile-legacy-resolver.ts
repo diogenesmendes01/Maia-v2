@@ -19,6 +19,25 @@
  * The synthesized fallback is intentionally lossy (the canonical ProfileBody
  * doesn't model `principles` strings or `thresholds`), but with cognitive
  * limits it can at least surface admin-ui calibrated parameters.
+ *
+ * Issue #189 — cross-domain contamination guard:
+ *   The synthesized view used to backfill `core_immutable.principles` from
+ *   `identity.priorities` so admin-ui-created rows would render *something*
+ *   under "## Princípios". That was unsafe: the valores drift detector
+ *   consumed those operational priority labels as core principles, and any
+ *   apparent violation got floored to `alto` → `frozen` by the decision
+ *   engine (or `critico` → `rollback`). Admin-created profiles that only
+ *   declared priorities could have user-visible auto-freezes triggered by
+ *   routine operational labels.
+ *
+ *   The resolver no longer synthesizes principles from priorities. Consumers
+ *   that semantically audit priorities (e.g. papelDriftDetector — issue
+ *   #172) keep a local priority-first fallback chain because it is correct
+ *   for THEIR domain. Consumers that semantically require true principles
+ *   (e.g. valoresDetector) now skip silently when none are configured.
+ *
+ *   DO NOT re-add a priority↔principle synth here. Domain-specific
+ *   fallbacks belong in the callers, not in the shared resolver.
  */
 import type { AgentOperationalProfileVersion } from '@/db/schema.js';
 
@@ -96,6 +115,16 @@ export function resolveLegacyPayload(
   // when no direct-embed or top-level legacy data is reachable. Includes
   // `thresholds` derived from cognitive_limits so admin-ui-calibrated
   // parameters surface in the legacy renderer/detectors.
+  //
+  // identity_block synth from role_descriptor: legitimate cross-shape lift —
+  // role_descriptor IS the identity label (proposal-generator writes the
+  // same string to both fields). Different field NAMES, same SEMANTIC
+  // contract (the agent's declared identity text).
+  //
+  // principles synth: explicitly NOT done. Issue #189 — using priorities
+  // as principles is a cross-DOMAIN contamination (operational labels
+  // becoming core value contracts) and can trigger user-visible auto-freezes
+  // via the valores detector. See module JSDoc.
   const synthesizedCore: LegacyCoreImmutable = {
     identity_block:
       typeof body.identity?.identity_block === 'string'
@@ -105,9 +134,7 @@ export function resolveLegacyPayload(
           : undefined,
     principles: Array.isArray(body.identity?.principles)
       ? body.identity!.principles
-      : Array.isArray(body.identity?.priorities)
-        ? body.identity!.priorities
-        : undefined,
+      : undefined,
   };
   const synthesizedOp: LegacyOperationalProfile = {
     voice_descriptor:
