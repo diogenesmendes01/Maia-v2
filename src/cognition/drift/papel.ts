@@ -112,6 +112,17 @@ export const papelDriftDetector: DriftDetector = {
     const role = typeof identity.role_descriptor === 'string' ? identity.role_descriptor : '';
     if (!role || role === 'unset') return null;
 
+    // Codex Adversarial Review on PR #180: gate the fallback resolution +
+    // observability log behind the "agent has actually spoken" check. The
+    // priorities-source observability is only meaningful for runs where the
+    // detector goes on to audit a real prompt; emitting it for empty drift
+    // runs (e.g., bootstrap windows, user-only turns) leaked tenant-specific
+    // identity text into log infra without ever using the fallback in any
+    // LLM call, which both is noisy and risks profile-identity persistence
+    // in log sinks that don't strip it via the logger redaction list.
+    const agentMessages = input.recent_messages.filter((m) => m.from === 'agent');
+    if (agentMessages.length === 0) return null;
+
     const { priorities, source } = resolvePriorities(input, identity);
 
     // Observability for issue #172 fix: emit ONE structured log per
@@ -119,6 +130,13 @@ export const papelDriftDetector: DriftDetector = {
     // Production case worth flagging: source='empty' on a profile with a
     // declared role — drift still runs (LLM can audit role-only), but the
     // guardrail loses the priorities signal and someone should investigate.
+    //
+    // role_descriptor itself is intentionally NOT in the log payload: it is
+    // derived from core_immutable.identity_block (migration 061) which is
+    // free-form profile-identity text and is not covered by the logger's
+    // redaction list. We log only the length as a non-reversible proxy so
+    // an operator can correlate "this profile has a configured role" with
+    // the missing-priorities signal without leaking the text itself.
     if (source !== 'priorities') {
       const profileId = input.profile_active.id;
       const logKey = `${profileId}::${source}`;
@@ -130,7 +148,7 @@ export const papelDriftDetector: DriftDetector = {
               profile_id: profileId,
               tenant_id: input.profile_active.tenant_id,
               agent_id: input.profile_active.agent_id,
-              role_descriptor: role,
+              role_descriptor_length: role.length,
             },
             'papel_drift.priorities_empty_all_sources',
           );
@@ -148,9 +166,6 @@ export const papelDriftDetector: DriftDetector = {
         }
       }
     }
-
-    const agentMessages = input.recent_messages.filter((m) => m.from === 'agent');
-    if (agentMessages.length === 0) return null;
 
     const sample = agentMessages
       .slice(-20)

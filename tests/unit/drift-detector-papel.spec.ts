@@ -294,7 +294,7 @@ describe('papelDriftDetector (§6)', () => {
     expect(prompt).not.toContain('PRIORIDADES: (nenhuma)');
   });
 
-  it('tudo vazio → segue auditando role (LLM ainda é chamado, PRIORIDADES=(nenhuma)) e loga warn', async () => {
+  it('tudo vazio → segue auditando role (LLM ainda é chamado, PRIORIDADES=(nenhuma)) e loga warn (sem vazar role_descriptor)', async () => {
     const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
     messagesCreateMock.mockResolvedValueOnce(
       makeAnthropicReply({ drift_detected: false }),
@@ -316,11 +316,73 @@ describe('papelDriftDetector (§6)', () => {
     expect(messagesCreateMock).toHaveBeenCalledOnce();
     const prompt = getLastUserPrompt();
     expect(prompt).toContain('PRIORIDADES: (nenhuma)');
+    // Codex Adversarial Review on PR #180: warning must NOT leak the
+    // free-form role_descriptor text (sourced from
+    // core_immutable.identity_block, not redacted by logger). Instead, we
+    // assert the length-only proxy is emitted.
     expect(warnSpy).toHaveBeenCalledWith(
-      expect.objectContaining({ role_descriptor: 'atendimento_financeiro_pf' }),
+      expect.objectContaining({
+        role_descriptor_length: 'atendimento_financeiro_pf'.length,
+      }),
       'papel_drift.priorities_empty_all_sources',
     );
+    const warnPayload = warnSpy.mock.calls[0]?.[0];
+    expect(warnPayload).not.toHaveProperty('role_descriptor');
     warnSpy.mockRestore();
+  });
+
+  it('Codex #180: sem mensagens do agente + priorities vazias → não loga fallback warning', async () => {
+    // Regression: before the fix the fallback resolver + warning log ran
+    // BEFORE the agent-messages check, so a worker waking up on a turn
+    // with only user messages would persist tenant-specific identity text
+    // to the log even though the priorities never reached an LLM call.
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const infoSpy = vi.spyOn(logger, 'info').mockImplementation(() => undefined);
+    const out = await papelDriftDetector.detect({
+      profile_active: makeMigration061Profile({
+        priorities: [],
+        identityPrinciples: [],
+        coreImmutablePrinciples: [],
+      }),
+      recent_messages: [
+        { id: 'u1', from: 'user', text: 'oi', created_at: new Date() },
+      ],
+    });
+    expect(out).toBeNull();
+    expect(messagesCreateMock).not.toHaveBeenCalled();
+    const emptyWarnCalls = warnSpy.mock.calls.filter(
+      ([, msg]) => msg === 'papel_drift.priorities_empty_all_sources',
+    );
+    expect(emptyWarnCalls).toHaveLength(0);
+    const fallbackInfoCalls = infoSpy.mock.calls.filter(
+      ([, msg]) => msg === 'papel_drift.priorities_fallback_used',
+    );
+    expect(fallbackInfoCalls).toHaveLength(0);
+    warnSpy.mockRestore();
+    infoSpy.mockRestore();
+  });
+
+  it('Codex #180: sem mensagens do agente + identity.principles populadas → não loga fallback info', async () => {
+    // Same regression as above, but with a populated principles fallback —
+    // before the fix this emitted the info log even when no audit happened.
+    const infoSpy = vi.spyOn(logger, 'info').mockImplementation(() => undefined);
+    const out = await papelDriftDetector.detect({
+      profile_active: makeMigration061Profile({
+        priorities: [],
+        identityPrinciples: ['preservar_capital', 'clareza_acima_de_tudo'],
+        coreImmutablePrinciples: ['preservar_capital', 'clareza_acima_de_tudo'],
+      }),
+      recent_messages: [
+        { id: 'u1', from: 'user', text: 'oi', created_at: new Date() },
+      ],
+    });
+    expect(out).toBeNull();
+    expect(messagesCreateMock).not.toHaveBeenCalled();
+    const fallbackInfoCalls = infoSpy.mock.calls.filter(
+      ([, msg]) => msg === 'papel_drift.priorities_fallback_used',
+    );
+    expect(fallbackInfoCalls).toHaveLength(0);
+    infoSpy.mockRestore();
   });
 
   it('fallback usado uma vez (info) → não loga novamente para o mesmo profile_id', async () => {
