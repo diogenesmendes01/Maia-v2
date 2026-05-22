@@ -155,46 +155,60 @@ export const agentsRouter = router({
       throw new TRPCError({ code: 'NOT_FOUND', message: `Tenant ${tenantId} not found` });
     }
 
-    const existing = await ctx.repos.agentsRepo.findById(input.id);
-    if (existing) {
-      throw new TRPCError({
-        code: 'CONFLICT',
-        message: `Agent '${input.id}' already exists`,
-      });
-    }
-
     // Codex review of PR #162 round 3 (issue #166) — agent insert + seed
     // profile_version + audit are now wrapped in a single tx via
     // agentsRepo.createWithSeedAndAudit. A failure on any of the three
     // rolls back the other two, so we cannot leave an agent with no seed
     // profile (which would break /identities setup) nor an unaudited
     // governance change. Same pattern as `approveAndActivateAtomic`.
+    //
+    // Codex Adversarial Review on PR #187 round 1 (issue #184) — the
+    // pre-flight `agentsRepo.findById` here is gone: the atomic helper now
+    // catches the agents primary-key 23505 inside the tx and returns
+    // `{ ok: false, reason: 'duplicate_id' }`, which we map to CONFLICT.
+    // This closes the TOCTOU window where two concurrent creates both passed
+    // the existence check and one ended up bubbling a pg unique violation as
+    // a 500 instead of the documented CONFLICT.
     const profileBody = buildProfileBody(input.profile_body, ctx.userId, null);
-    const { agent: created, seed_profile: version } =
-      await ctx.repos.agentsRepo.createWithSeedAndAudit({
-        agent: {
-          id: input.id,
-          tenant_id: tenantId,
-          nome: input.nome,
-          status: input.status ?? 'active',
-        },
-        seed_profile: {
-          profile_body: profileBody,
-          proposed_by: ctx.userId,
-          proposed_reason: input.proposed_reason,
-        },
-        audit: {
-          actor_id: ctx.userId,
-          actor_role: ctx.userRole,
-        },
+    const result = await ctx.repos.agentsRepo.createWithSeedAndAudit({
+      agent: {
+        id: input.id,
+        tenant_id: tenantId,
+        nome: input.nome,
+        status: input.status ?? 'active',
+      },
+      seed_profile: {
+        profile_body: profileBody,
+        proposed_by: ctx.userId,
+        proposed_reason: input.proposed_reason,
+      },
+      audit: {
+        actor_id: ctx.userId,
+        actor_role: ctx.userRole,
+      },
+    });
+
+    if (!result.ok) {
+      if (result.reason === 'duplicate_id') {
+        throw new TRPCError({
+          code: 'CONFLICT',
+          message: `Agent '${result.agent_id}' already exists`,
+        });
+      }
+      // Exhaustiveness check — any future reason must be handled above.
+      const _exhaustive: never = result.reason;
+      throw new TRPCError({
+        code: 'INTERNAL_SERVER_ERROR',
+        message: `createWithSeedAndAudit failed: ${String(_exhaustive)}`,
       });
+    }
 
     return {
-      agent: created,
+      agent: result.agent,
       seed_profile: {
-        id: version.id,
-        version: version.version,
-        status: version.status,
+        id: result.seed_profile.id,
+        version: result.seed_profile.version,
+        status: result.seed_profile.status,
       },
     };
   }),

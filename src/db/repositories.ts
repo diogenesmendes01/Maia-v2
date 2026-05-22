@@ -1726,6 +1726,17 @@ export const agentsRepo = {
    *
    * The seed version is always `version=1` and `status='proposed'`
    * (P8.5 invariant — no profile activates without an approval).
+   *
+   * Returns a discriminated union so the router can map the duplicate-agent-id
+   * race to TRPC CONFLICT without inspecting raw pg error codes.
+   *
+   * Codex Adversarial Review on PR #187 round 1 (issue #184) — this method
+   * previously let a primary-key 23505 bubble up as an INTERNAL_SERVER_ERROR
+   * (500) when the router's out-of-tx `findById` preflight raced with a
+   * concurrent create that won the INSERT first. We now catch 23505 here and
+   * return `{ ok: false, reason: 'duplicate_id' }` — the tx aborts naturally
+   * (no orphaned seed_profile or audit row), and the router maps to CONFLICT.
+   * Mirrors `tenantsRepo.createWithAuditAtomic` (PR #187).
    */
   async createWithSeedAndAudit(args: {
     agent: {
@@ -1744,70 +1755,102 @@ export const agentsRepo = {
       actor_id: string;
       actor_role: string;
     };
-  }): Promise<{
-    agent: Agent;
-    seed_profile: AgentOperationalProfileVersion;
-  }> {
+  }): Promise<
+    | { ok: true; agent: Agent; seed_profile: AgentOperationalProfileVersion }
+    | { ok: false; reason: 'duplicate_id'; agent_id: string }
+  > {
     // Validate before opening the tx so a malformed body fails fast without
     // touching the DB. Mirrors the `seedNewActiveAtomic` pattern.
     validateProfileBodyP8d(args.seed_profile.profile_body);
 
-    return await withTx(async (tx) => {
-      // (1) Insert agent row.
-      const [createdAgent] = await tx
-        .insert(agents)
-        .values({
-          id: args.agent.id,
-          tenant_id: args.agent.tenant_id,
-          nome: args.agent.nome,
-          status: args.agent.status ?? 'active',
-          ...(args.agent.metadata !== undefined ? { metadata: args.agent.metadata } : {}),
-        })
-        .returning();
-      if (!createdAgent) {
-        throw new Error('create_with_seed_atomic_agent_insert_failed: returning() empty');
-      }
+    try {
+      return await withTx(async (tx) => {
+        // (1) Insert agent row. PK collision (23505) here is the only
+        //     legitimate "duplicate" path — agent ids are caller-supplied
+        //     slugs unique on the `agents` PRIMARY KEY. Two concurrent
+        //     creates that both passed the (now-removed) router preflight
+        //     will both reach this INSERT; the loser hits 23505 and we
+        //     surface a typed reason instead of letting the raw pg error
+        //     leak as a 500.
+        const [createdAgent] = await tx
+          .insert(agents)
+          .values({
+            id: args.agent.id,
+            tenant_id: args.agent.tenant_id,
+            nome: args.agent.nome,
+            status: args.agent.status ?? 'active',
+            ...(args.agent.metadata !== undefined ? { metadata: args.agent.metadata } : {}),
+          })
+          .returning();
+        if (!createdAgent) {
+          throw new Error('create_with_seed_atomic_agent_insert_failed: returning() empty');
+        }
 
-      // (2) Insert seed v1 operational profile_version with status='proposed'.
-      //     No need for applyTenantGuard — tenant_id/agent_id are explicit and
-      //     match the agent row we just inserted.
-      const [seedProfile] = await tx
-        .insert(agent_operational_profile_versions)
-        .values({
-          tenant_id: args.agent.tenant_id,
-          agent_id: createdAgent.id,
-          version: 1,
-          status: 'proposed',
-          profile_body: args.seed_profile.profile_body,
-          proposed_by: args.seed_profile.proposed_by,
-          proposed_reason: args.seed_profile.proposed_reason,
-        })
-        .returning();
-      if (!seedProfile) {
-        throw new Error('create_with_seed_atomic_profile_insert_failed: returning() empty');
-      }
+        // (2) Insert seed v1 operational profile_version with status='proposed'.
+        //     No need for applyTenantGuard — tenant_id/agent_id are explicit and
+        //     match the agent row we just inserted. 23505 here would mean a
+        //     pre-existing seed v1 for a brand-new agent id, which is
+        //     impossible (the agent insert above just created the row), so we
+        //     do NOT map it to duplicate_id.
+        const [seedProfile] = await tx
+          .insert(agent_operational_profile_versions)
+          .values({
+            tenant_id: args.agent.tenant_id,
+            agent_id: createdAgent.id,
+            version: 1,
+            status: 'proposed',
+            profile_body: args.seed_profile.profile_body,
+            proposed_by: args.seed_profile.proposed_by,
+            proposed_reason: args.seed_profile.proposed_reason,
+          })
+          .returning();
+        if (!seedProfile) {
+          throw new Error('create_with_seed_atomic_profile_insert_failed: returning() empty');
+        }
 
-      // (3) Audit in the SAME tx. If this insert fails, EVERYTHING rolls back
-      //     and the agent + seed profile DO NOT persist — no orphaned setup.
-      await tx.insert(admin_audit_log).values({
-        tenant_id: args.agent.tenant_id,
-        actor_id: args.audit.actor_id,
-        actor_role: args.audit.actor_role,
-        action: 'agent_create',
-        resource_type: 'agent',
-        resource_id: createdAgent.id,
-        change_summary: {
-          agent_id: createdAgent.id,
-          agent_nome: createdAgent.nome,
-          seed_profile_version_id: seedProfile.id,
-          seed_profile_version: seedProfile.version,
-          seed_profile_status: seedProfile.status,
-          proposed_reason: args.seed_profile.proposed_reason,
-        },
+        // (3) Audit in the SAME tx. If this insert fails, EVERYTHING rolls back
+        //     and the agent + seed profile DO NOT persist — no orphaned setup.
+        await tx.insert(admin_audit_log).values({
+          tenant_id: args.agent.tenant_id,
+          actor_id: args.audit.actor_id,
+          actor_role: args.audit.actor_role,
+          action: 'agent_create',
+          resource_type: 'agent',
+          resource_id: createdAgent.id,
+          change_summary: {
+            agent_id: createdAgent.id,
+            agent_nome: createdAgent.nome,
+            seed_profile_version_id: seedProfile.id,
+            seed_profile_version: seedProfile.version,
+            seed_profile_status: seedProfile.status,
+            proposed_reason: args.seed_profile.proposed_reason,
+          },
+        });
+
+        return { ok: true as const, agent: createdAgent, seed_profile: seedProfile };
       });
-
-      return { agent: createdAgent, seed_profile: seedProfile };
-    });
+    } catch (err) {
+      // Map duplicate-primary-key violation (agents.id is PRIMARY KEY) to a
+      // typed reason so the router returns CONFLICT without inspecting pg
+      // error codes. Concurrent racers that both passed the (now-removed)
+      // router preflight BOTH see this branch — one wins the INSERT, the
+      // other's tx aborts with 23505 and rolls back the seed_profile/audit
+      // writes it never made (`acquireNextVersionForAgent` and the audit
+      // step never executed because the agents INSERT threw first).
+      //
+      // We do NOT distinguish by constraint name here: the only 23505 in
+      // step (1) is the agents PK; step (2) PK collision is unreachable for
+      // a row whose agent_id was just inserted in the same tx; step (3)
+      // admin_audit_log has no unique index that could collide.
+      if ((err as { code?: string })?.code === '23505') {
+        return {
+          ok: false as const,
+          reason: 'duplicate_id' as const,
+          agent_id: args.agent.id,
+        };
+      }
+      throw err;
+    }
   },
 };
 

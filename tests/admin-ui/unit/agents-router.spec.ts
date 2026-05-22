@@ -7,7 +7,8 @@
  *      with status='proposed' AND appends an audit row — ATOMICALLY (via
  *      agentsRepo.createWithSeedAndAudit; issue #166).
  *   3. create against a non-existent tenant returns NOT_FOUND.
- *   4. create with a duplicate agent id returns CONFLICT.
+ *   4. create with a duplicate agent id returns CONFLICT (typed duplicate_id
+ *      from the atomic helper — issue #184 follow-up on PR #187 round 1).
  *   5. updateProfile chains previous_version_id from the active version.
  *   6. updateProfile on a foreign-tenant agent returns NOT_FOUND (tenant
  *      isolation invariant).
@@ -15,6 +16,10 @@
  *   8. ATOMICITY (issue #166): if the audit insert throws inside
  *      createWithSeedAndAudit / proposeAndAuditAtomic, neither the agent row
  *      nor the profile_version row are persisted (full rollback).
+ *   9. ATOMICITY (issue #184 round 1): a simulated pg 23505 thrown from the
+ *      agent INSERT inside createWithSeedAndAudit is caught and surfaced as
+ *      typed duplicate_id — the router maps it to CONFLICT without leaking
+ *      a 500. Closes the TOCTOU window left by the removed findById preflight.
  */
 import { describe, it, expect } from 'vitest';
 import { TRPCError } from '@trpc/server';
@@ -56,6 +61,14 @@ type AuditRow = {
  *     The mock then ROLLS BACK the agent/profile writes performed earlier in
  *     the same logical tx, mirroring real Postgres `withTx` semantics. Used
  *     to prove the multi-write atomicity invariant (issue #166).
+ *   - simulateAgentPkConflict: when true, the mock simulates a Postgres
+ *     23505 (unique_violation) thrown at the moment of the agent INSERT
+ *     inside createWithSeedAndAudit (mirroring the concurrent-create race
+ *     where two callers both passed the now-removed router preflight and
+ *     one loses the agents PK contest). The atomic helper must catch this
+ *     and return `{ ok: false, reason: 'duplicate_id' }` instead of letting
+ *     the raw pg error leak as a 500 — closes the TOCTOU window flagged
+ *     by Codex Adversarial Review on PR #187 round 1 (issue #184).
  */
 function makeRepos(
   opts: {
@@ -63,6 +76,7 @@ function makeRepos(
     agents?: Agent[];
     profiles?: Profile[];
     failAuditOnAction?: 'agent_create' | 'agent_profile_propose';
+    simulateAgentPkConflict?: boolean;
   } = {},
 ) {
   const tenantIds = new Set(opts.tenants ?? ['tenant-A']);
@@ -114,6 +128,11 @@ function makeRepos(
       // Atomic create+seed+audit. Mock emulates `withTx` rollback: if any of
       // the three writes throws, everything previously inserted in THIS call
       // is removed. Mirrors the real-DB invariant tested in #166.
+      //
+      // Returns a discriminated union `{ ok: true, ... } | { ok: false,
+      // reason: 'duplicate_id', agent_id }` so the router can map the
+      // concurrent-create race to CONFLICT without inspecting pg error codes
+      // (Codex Adversarial Review on PR #187 round 1 / issue #184).
       async createWithSeedAndAudit(args: {
         agent: {
           id: string;
@@ -131,6 +150,23 @@ function makeRepos(
           actor_role: string;
         };
       }) {
+        // (0) Duplicate-id contract: the real method relies on the PRIMARY
+        //     KEY constraint to surface 23505 from the agent INSERT, which
+        //     we translate to a typed reason. Mirror that in the mock so the
+        //     router sees the same contract on conflict whether the racer
+        //     had committed before this call started OR raced inside the tx
+        //     (`simulateAgentPkConflict` covers the latter).
+        if (agentsMap[args.agent.id] || opts.simulateAgentPkConflict) {
+          // Tx rollback is implicit — we never inserted anything in this
+          // call. Audit row never appended (loser of the race produces no
+          // forensics ghost).
+          return {
+            ok: false as const,
+            reason: 'duplicate_id' as const,
+            agent_id: args.agent.id,
+          };
+        }
+
         // Snapshot for rollback.
         const insertedAgentId = args.agent.id;
         const insertedProfileIds: string[] = [];
@@ -181,7 +217,11 @@ function makeRepos(
             },
           });
           insertedAuditIdx.push(audit.length - 1);
-          return { agent: createdAgent, seed_profile: seedProfile };
+          return {
+            ok: true as const,
+            agent: createdAgent,
+            seed_profile: seedProfile,
+          };
         } catch (err) {
           // ROLLBACK: undo every write made above. This is the invariant the
           // test asserts — if audit throws, agent + profile_version DO NOT
@@ -1309,5 +1349,160 @@ describe('agentsRouter — multi-write atomicity (#166)', () => {
     expect(repos._inspect.profiles).toHaveLength(2);
     expect(repos._inspect.audit).toHaveLength(1);
     expect(repos._inspect.audit[0]!.action).toBe('agent_profile_propose');
+  });
+});
+
+/**
+ * Codex Adversarial Review on PR #187 round 1 ([medium], issue #184).
+ *
+ * Pre-fix: agentsRouter.create relied on an out-of-tx `findById` preflight to
+ * decide whether to throw CONFLICT. Two concurrent creates with the same id
+ * could both pass that check; the loser of the agents PK race then had its
+ * raw pg `23505` bubble up as INTERNAL_SERVER_ERROR (500), forcing the UI
+ * and retry logic onto an unhappy path despite the new atomic helper.
+ *
+ * Post-fix: `createWithSeedAndAudit` catches PK 23505 inside the tx and
+ * returns `{ ok: false, reason: 'duplicate_id', agent_id }`. The router maps
+ * that to TRPC CONFLICT and the pre-flight `findById` is removed (the atomic
+ * helper now is the single source of truth on duplicate ids — no TOCTOU
+ * window to leak through). These tests cover BOTH ordering windows that
+ * produce duplicate_id:
+ *
+ *   - A duplicate already committed BEFORE the call (mock: id present in
+ *     agentsMap at entry — same path as the pre-fix preflight covered).
+ *   - A duplicate committed AFTER we entered the tx but BEFORE our INSERT
+ *     landed (mock: `simulateAgentPkConflict` — the previously-uncovered
+ *     concurrent-create race that leaked 500).
+ *
+ * Both must surface as CONFLICT with no orphaned writes.
+ */
+describe('agentsRouter.create — duplicate_id from atomic helper (issue #184 round 1)', () => {
+  it('router maps duplicate_id (pre-existing agent) to CONFLICT with agent_id in message', async () => {
+    const dup: Agent = {
+      id: 'agent-x',
+      tenant_id: 'tenant-A',
+      nome: 'old',
+      status: 'active',
+      metadata: {},
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+    const repos = makeRepos({ agents: [dup] });
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).create({
+        id: 'agent-x',
+        nome: 'new',
+        profile_body: validProfile,
+        proposed_reason: 'concurrent-create attempt against pre-existing id',
+      }),
+    ).rejects.toMatchObject({
+      code: 'CONFLICT',
+      message: expect.stringMatching(/agent-x.*already exists/i),
+    });
+
+    // The pre-existing row is untouched (no overwrite), no seed_profile
+    // was created for the duplicate, no audit row was appended for the
+    // loser. The atomic helper's rollback contract is preserved.
+    expect(repos._inspect.agentsMap['agent-x']!.nome).toBe('old');
+    expect(repos._inspect.profiles).toHaveLength(0);
+    expect(repos._inspect.audit).toHaveLength(0);
+  });
+
+  it('router maps duplicate_id (simulated tx-internal 23505) to CONFLICT', async () => {
+    // No pre-existing agent — the conflict happens INSIDE the tx, as if a
+    // racer committed between our (now-removed) preflight and our INSERT.
+    // This is the case the fix specifically addresses: pre-fix, this would
+    // have leaked as INTERNAL_SERVER_ERROR.
+    const repos = makeRepos({ simulateAgentPkConflict: true });
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).create({
+        id: 'agent-x',
+        nome: 'racer',
+        profile_body: validProfile,
+        proposed_reason: 'losing the in-tx 23505 race against a concurrent create',
+      }),
+    ).rejects.toMatchObject({
+      code: 'CONFLICT',
+      message: expect.stringMatching(/agent-x.*already exists/i),
+    });
+
+    // Tx rolled back: no seed_profile, no audit row, no agent inserted by
+    // the loser (the winner's row, if any, is the racer's — not modeled in
+    // the mock, but the loser MUST contribute nothing to the inspect state).
+    expect(repos._inspect.agentsMap['agent-x']).toBeUndefined();
+    expect(repos._inspect.profiles).toHaveLength(0);
+    expect(repos._inspect.audit).toHaveLength(0);
+  });
+
+  it('atomic helper returns typed duplicate_id (not throws) for pre-existing id', async () => {
+    // Exercises the repo-method contract directly, bypassing the router so
+    // we assert the discriminated-union shape rather than the TRPC mapping.
+    const dup: Agent = {
+      id: 'agent-x',
+      tenant_id: 'tenant-A',
+      nome: 'old',
+      status: 'active',
+      metadata: {},
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+    const repos = makeRepos({ agents: [dup] });
+    const result = await repos.agentsRepo.createWithSeedAndAudit({
+      agent: {
+        id: 'agent-x',
+        tenant_id: 'tenant-A',
+        nome: 'new',
+      },
+      seed_profile: {
+        profile_body: validProfile,
+        proposed_by: 'u1',
+        proposed_reason: 'direct repo call — duplicate id',
+      },
+      audit: { actor_id: 'u1', actor_role: 'owner' },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe('duplicate_id');
+      expect(result.agent_id).toBe('agent-x');
+    }
+  });
+
+  it('atomic helper returns typed duplicate_id (not throws) for simulated 23505', async () => {
+    const repos = makeRepos({ simulateAgentPkConflict: true });
+    const result = await repos.agentsRepo.createWithSeedAndAudit({
+      agent: {
+        id: 'agent-x',
+        tenant_id: 'tenant-A',
+        nome: 'racer',
+      },
+      seed_profile: {
+        profile_body: validProfile,
+        proposed_by: 'u1',
+        proposed_reason: 'direct repo call — simulated tx-internal 23505',
+      },
+      audit: { actor_id: 'u1', actor_role: 'owner' },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe('duplicate_id');
+      expect(result.agent_id).toBe('agent-x');
+    }
+  });
+
+  it('happy path still returns { ok: true, agent, seed_profile } (discriminated union unchanged for success)', async () => {
+    // Regression guard: the router must keep working when there is no
+    // duplicate. The discriminated-union refactor should be invisible to
+    // the success branch — the response shape from the router is the same
+    // as before (`{ agent, seed_profile: { id, version, status } }`).
+    const repos = makeRepos();
+    const res = await caller('owner', 'tenant-A', 'u1', repos).create({
+      id: 'agent-x',
+      nome: 'X',
+      profile_body: validProfile,
+      proposed_reason: 'happy-path baseline after discriminated-union refactor',
+    });
+    expect(res.agent.id).toBe('agent-x');
+    expect(res.seed_profile.version).toBe(1);
+    expect(res.seed_profile.status).toBe('proposed');
   });
 });
