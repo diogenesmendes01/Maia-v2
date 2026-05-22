@@ -33,6 +33,12 @@ import { TRPCError } from '@trpc/server';
 
 let mockMain = 'anthropic/claude-sonnet-4.6';
 let mockFast = 'anthropic/claude-haiku-4.5';
+// Codex round 4 on PR #188 [high]: source-aware read. The UI uses
+// these to decide whether to pass null vs the observed value as
+// expected_*. Default 'global' so the existing tests keep their
+// pre-round-4 behavior.
+let mockMainSource: 'global' | 'legacy' | 'env' = 'global';
+let mockFastSource: 'global' | 'legacy' | 'env' = 'global';
 
 type AtomicCall = {
   main: string;
@@ -40,8 +46,9 @@ type AtomicCall = {
   // Codex round 3 on PR #188 [P2]: optimistic concurrency. Tests now
   // exercise the expected_* round-trip from router input to helper
   // call, including the conflict-mode mock below.
-  expected_main: string;
-  expected_fast: string;
+  // Codex round 4 [high]: nullable for fresh-install path.
+  expected_main: string | null;
+  expected_fast: string | null;
   updated_by: string;
   actor_role: string;
   tenant_id: string;
@@ -58,6 +65,14 @@ let conflictPayload: {
 let mockProvider: 'openrouter' | 'anthropic' = 'openrouter';
 
 vi.mock('@/lib/llm-settings.js', () => ({
+  // Codex round 4 [high]: router now uses getCurrentLLMSettings
+  // (source-aware) instead of the single-value getters. Both helpers
+  // remain mocked because the integration tests still reach for the
+  // legacy names.
+  getCurrentLLMSettings: vi.fn(async () => ({
+    main: { value: mockMain, source: mockMainSource },
+    fast: { value: mockFast, source: mockFastSource },
+  })),
   getCurrentMainModel: vi.fn(async () => mockMain),
   getCurrentFastModel: vi.fn(async () => mockFast),
   envDefaults: vi.fn(() => ({
@@ -152,6 +167,8 @@ beforeEach(() => {
   mockProvider = 'openrouter';
   mockMain = 'anthropic/claude-sonnet-4.6';
   mockFast = 'anthropic/claude-haiku-4.5';
+  mockMainSource = 'global';
+  mockFastSource = 'global';
 });
 
 describe('llmSettingsRouter.get — founder gate', () => {
@@ -160,6 +177,30 @@ describe('llmSettingsRouter.get — founder gate', () => {
     expect(res.main).toBe('anthropic/claude-sonnet-4.6');
     expect(res.fast).toBe('anthropic/claude-haiku-4.5');
     expect(res.env.provider).toBe('openrouter');
+    // Codex round 4 [high]: source flags surface to the UI so it knows
+    // whether to send `expected_*: null` (no global_settings row) or
+    // the observed value (global row exists, race-checkable).
+    expect(res.mainSource).toBe('global');
+    expect(res.fastSource).toBe('global');
+  });
+
+  // Codex round 4 [high]: fresh install — source='env' surfaces so the
+  // UI knows to pass `expected_*: null`. Without this, the first-ever
+  // update on a fresh DB loops forever on optimistic_conflict.
+  it('founder sees source=env when no global_settings row exists', async () => {
+    mockMainSource = 'env';
+    mockFastSource = 'env';
+    const res = await caller('founder').get();
+    expect(res.mainSource).toBe('env');
+    expect(res.fastSource).toBe('env');
+  });
+
+  it('founder sees source=legacy when legacy agent_facts fallback fires', async () => {
+    mockMainSource = 'legacy';
+    mockFastSource = 'env';
+    const res = await caller('founder').get();
+    expect(res.mainSource).toBe('legacy');
+    expect(res.fastSource).toBe('env');
   });
 
   it.each(['owner', 'compliance_officer', 'analyst', 'viewer'])(
@@ -343,23 +384,25 @@ describe('llmSettingsRouter.update — gate + delegate + atomic semantics', () =
   });
 });
 
-// Codex round 3 on PR #188 [P2]: provider gate. With LLM_PROVIDER=
-// anthropic, the runtime callLLM passes the stored slug straight to
-// AnthropicProvider — any OpenRouter-style slug other than `anthropic/*`
-// breaks every LLM call. The router enforces this BEFORE the audited
-// write; the catalog query also filters its items so the UI doesn't
-// offer doomed picks.
-describe('llmSettingsRouter — provider gate (Codex round 3)', () => {
-  it('catalog filters OpenRouter slugs when provider=anthropic', async () => {
+// Codex round 4 on PR #188 [high]: provider gate is now STRICTER. The
+// runtime AnthropicProvider passes the stored slug straight to the
+// Anthropic SDK, which requires the native short ID form
+// (`claude-sonnet-4-6`, NOT `anthropic/claude-sonnet-4.6`). Round 3
+// accepted both; round 4 only accepts native (no slash). The catalog
+// in Anthropic mode now NORMALIZES openrouter-format anthropic
+// entries to their native form, dropping non-anthropic vendors.
+describe('llmSettingsRouter — provider gate (Codex round 4)', () => {
+  it('catalog normalizes anthropic/* slugs to native form when provider=anthropic', async () => {
     mockProvider = 'anthropic';
     const res = await caller('founder').catalog();
     expect(res.provider).toBe('anthropic');
-    // Mock catalog has two items: anthropic/claude-sonnet-4.6 (keep)
-    // and openai/gpt-5 (filter out). Only one should survive.
-    expect(res.items.map((m) => m.id)).toEqual(['anthropic/claude-sonnet-4.6']);
+    // Mock catalog has two items:
+    //   - anthropic/claude-sonnet-4.6 → normalized to claude-sonnet-4-6
+    //   - openai/gpt-5 → dropped entirely (can't be normalized)
+    expect(res.items.map((m) => m.id)).toEqual(['claude-sonnet-4-6']);
   });
 
-  it('catalog returns full set when provider=openrouter', async () => {
+  it('catalog returns full unfiltered set when provider=openrouter', async () => {
     mockProvider = 'openrouter';
     const res = await caller('founder').catalog();
     expect(res.provider).toBe('openrouter');
@@ -374,9 +417,9 @@ describe('llmSettingsRouter — provider gate (Codex round 3)', () => {
     await expect(
       caller('founder').update({
         main: 'openai/gpt-5',
-        fast: 'anthropic/claude-haiku-4.5',
-        expected_main: 'anthropic/claude-sonnet-4.6',
-        expected_fast: 'anthropic/claude-haiku-4.5',
+        fast: 'claude-haiku-4-5-20251001',
+        expected_main: 'claude-sonnet-4-6',
+        expected_fast: 'claude-haiku-4-5-20251001',
         comment: 'should be rejected — openai slug with anthropic provider',
       }),
     ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
@@ -389,27 +432,34 @@ describe('llmSettingsRouter — provider gate (Codex round 3)', () => {
     mockProvider = 'anthropic';
     await expect(
       caller('founder').update({
-        main: 'anthropic/claude-sonnet-4.6',
+        main: 'claude-sonnet-4-6',
         fast: 'x-ai/grok-4.1-fast',
-        expected_main: 'anthropic/claude-sonnet-4.6',
-        expected_fast: 'anthropic/claude-haiku-4.5',
+        expected_main: 'claude-sonnet-4-6',
+        expected_fast: 'claude-haiku-4-5-20251001',
         comment: 'should be rejected — x-ai slug with anthropic provider',
       }),
     ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
     expect(atomicCalls).toHaveLength(0);
   });
 
-  it('update accepts anthropic/* slugs when provider=anthropic', async () => {
+  // Codex round 4 [high]: this is the regression we're guarding
+  // against. `anthropic/claude-sonnet-4.6` is the OpenRouter canonical
+  // form, but AnthropicProvider passes the slug straight to the SDK,
+  // which only accepts the native short ID (`claude-sonnet-4-6`).
+  // Allowing the prefixed form to be persisted bricks every runtime
+  // LLM call until a founder switches back.
+  it('update REJECTS anthropic/* slug when provider=anthropic (round 4 tightening)', async () => {
     mockProvider = 'anthropic';
-    const res = await caller('founder').update({
-      main: 'anthropic/claude-opus-4.7',
-      fast: 'anthropic/claude-haiku-4.5',
-      expected_main: 'anthropic/claude-sonnet-4.6',
-      expected_fast: 'anthropic/claude-haiku-4.5',
-      comment: 'anthropic-native slug should pass the gate',
-    });
-    expect(res.ok).toBe(true);
-    expect(atomicCalls).toHaveLength(1);
+    await expect(
+      caller('founder').update({
+        main: 'anthropic/claude-sonnet-4.6',
+        fast: 'claude-haiku-4-5-20251001',
+        expected_main: 'claude-sonnet-4-6',
+        expected_fast: 'claude-haiku-4-5-20251001',
+        comment: 'should be rejected — openrouter-format anthropic slug',
+      }),
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+    expect(atomicCalls).toHaveLength(0);
   });
 
   it('update accepts Anthropic short ID (no slash) when provider=anthropic', async () => {
@@ -417,11 +467,28 @@ describe('llmSettingsRouter — provider gate (Codex round 3)', () => {
     const res = await caller('founder').update({
       main: 'claude-sonnet-4-6',
       fast: 'claude-haiku-4-5-20251001',
-      expected_main: 'anthropic/claude-sonnet-4.6',
-      expected_fast: 'anthropic/claude-haiku-4.5',
+      expected_main: 'claude-sonnet-4-6',
+      expected_fast: 'claude-haiku-4-5-20251001',
       comment: 'anthropic-native short ID should pass the gate',
     });
     expect(res.ok).toBe(true);
+    expect(atomicCalls).toHaveLength(1);
+  });
+
+  // Round 4 [high]: dots are rejected in Anthropic mode too. The SDK
+  // format is hyphens (`claude-sonnet-4-6`) not dots (`claude-sonnet-4.6`).
+  it('update rejects dot-form short ID when provider=anthropic', async () => {
+    mockProvider = 'anthropic';
+    await expect(
+      caller('founder').update({
+        main: 'claude-sonnet-4.6',
+        fast: 'claude-haiku-4-5-20251001',
+        expected_main: 'claude-sonnet-4-6',
+        expected_fast: 'claude-haiku-4-5-20251001',
+        comment: 'dots are not part of native Anthropic IDs',
+      }),
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+    expect(atomicCalls).toHaveLength(0);
   });
 
   it('update accepts any slug when provider=openrouter', async () => {
@@ -544,5 +611,38 @@ describe('llmSettingsRouter.update — input validation', () => {
       } as any),
     ).rejects.toThrow();
     expect(atomicCalls).toHaveLength(0);
+  });
+
+  // Codex round 4 [high]: expected_* must accept null (fresh-install
+  // path). The UI sends null when source is 'env' or 'legacy' so the
+  // first-ever update doesn't loop forever on optimistic_conflict.
+  it('accepts expected_main=null + expected_fast=null (fresh install)', async () => {
+    const res = await caller('founder').update({
+      main: 'openai/gpt-5',
+      fast: 'openai/gpt-5',
+      expected_main: null,
+      expected_fast: null,
+      comment: 'fresh install — first ever update from env defaults',
+    });
+    expect(res.ok).toBe(true);
+    // The atomic helper sees nulls — it's the helper's job to map
+    // those into the repo's `expected: null` request shape.
+    expect(atomicCalls).toHaveLength(1);
+    expect(atomicCalls[0]!.expected_main).toBeNull();
+    expect(atomicCalls[0]!.expected_fast).toBeNull();
+  });
+
+  // Round 4 — mixed: one side null, one side string.
+  it('accepts expected_main=null + expected_fast=<observed>', async () => {
+    const res = await caller('founder').update({
+      main: 'openai/gpt-5',
+      fast: 'openai/gpt-5',
+      expected_main: null,
+      expected_fast: 'anthropic/claude-haiku-4.5',
+      comment: 'main is env default, fast has a global row',
+    });
+    expect(res.ok).toBe(true);
+    expect(atomicCalls[0]!.expected_main).toBeNull();
+    expect(atomicCalls[0]!.expected_fast).toBe('anthropic/claude-haiku-4.5');
   });
 });

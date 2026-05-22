@@ -105,11 +105,29 @@ export default function LlmSettingsPage() {
       // sees "Settings changed concurrently — refresh and try again."
       // After refresh, useQuery.invalidate() picks up the new state and
       // the founder re-decides.
+      //
+      // Codex round 4 on PR #188 [high]: pass `null` when the observed
+      // source is NOT 'global' — i.e. the displayed value came from the
+      // env default or the legacy agent_facts fallback, not a real
+      // global_settings row. On a fresh install (zero rows) the UI used
+      // to send the env default as expected_*, and the server's
+      // compare-locked-against-{model: <env>} always failed because the
+      // locked value is the placeholder JSON null. Now we explicitly
+      // say "I didn't observe a row" and the server accepts that —
+      // making the first-ever update apply correctly.
+      const expectedMain =
+        getQuery.data?.mainSource === 'global'
+          ? (getQuery.data?.main ?? null)
+          : null;
+      const expectedFast =
+        getQuery.data?.fastSource === 'global'
+          ? (getQuery.data?.fast ?? null)
+          : null;
       const res = await mutation.mutateAsync({
         main: effectiveMain,
         fast: effectiveFast,
-        expected_main: getQuery.data?.main ?? '',
-        expected_fast: getQuery.data?.fast ?? '',
+        expected_main: expectedMain,
+        expected_fast: expectedFast,
         comment: comment.trim(),
       });
       if (res.ok) {
@@ -394,8 +412,22 @@ export default function LlmSettingsPage() {
             {mutation.error.data?.code === 'CONFLICT' && (
               <button
                 type="button"
-                onClick={() => {
-                  void utils.llmSettings.get.invalidate();
+                onClick={async () => {
+                  // Codex round 4 on PR #188 [P2]: sequence the refetch
+                  // BEFORE clearing picks. Previously we called
+                  // `invalidate()` and immediately cleared mainPick /
+                  // fastPick, but the React-Query cache still served
+                  // the stale `getQuery.data` until the refetch
+                  // landed. The seeding effect (which depends on
+                  // `mainPick === '' && fastPick === ''`) would fire
+                  // against that stale snapshot, then the fresh
+                  // response would land but the picks were no longer
+                  // empty so the effect didn't re-run. The form
+                  // remained on the old snapshot in spite of the
+                  // promised refresh. Awaiting refetch BEFORE
+                  // clearing forces the cache to hold the fresh data
+                  // when the seeding effect runs.
+                  await utils.llmSettings.get.refetch();
                   setMainCustom('');
                   setFastCustom('');
                   setMainPick('');

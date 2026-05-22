@@ -87,19 +87,25 @@ function extractModel(value: unknown): string | null {
  * `factsRepo`, because that reads under the current tenant_id/agent_id
  * context (and the runtime LLM call may not have any context set, or
  * may be set to a tenant other than the one that wrote the legacy row).
- * Read pattern: ANY row with `escopo='global' AND chave=<key>` ordered
- * by `updated_at DESC LIMIT 1` — same heuristic as the migration 062
- * backfill. Multi-tenant disagreement at runtime falls back to "freshest
- * wins"; the migration 062 conflict detection refuses to globalize that
- * value at upgrade time, which is the durable fix. The runtime fallback
- * is a SAFETY NET for the rolling-deploy window only.
  *
- * Logging: `llm_settings.legacy_fallback_used` (warn) when we used the
- * legacy row, `llm_settings.env_fallback_used` (warn) when we landed on
- * the env default despite global_settings being expected to have a row.
- * The legacy_read_failed branch is debug-level because the table is
- * always present in this codebase — that error would be a real DB
- * outage and the env fallback below it would already emit a warn.
+ * Codex round 4 on PR #188 [high]: legacy_fallback_conflict guard.
+ * Previously the fallback ordered by `updated_at DESC LIMIT 1` —
+ * "freshest wins". This contradicts migration 062 which DETECTS distinct
+ * legacy values across tenants and ABORTS rather than globalize them,
+ * to avoid promoting one tenant's choice to every tenant at runtime.
+ * The runtime fallback now mirrors that guard: if multiple distinct
+ * model values exist across legacy rows, fail closed to env default
+ * with a loud log. Single distinct value → promote it (safe; that's
+ * the only legacy choice present). Zero rows → null (env handled by
+ * caller).
+ *
+ * Logging:
+ *   - `llm_settings.legacy_fallback_used` (warn) when we used the
+ *     legacy row.
+ *   - `llm_settings.legacy_fallback_conflict` (error) when multiple
+ *     distinct legacy values exist — fail-closed to env.
+ *   - `llm_settings.env_fallback_used` (warn) when we landed on the
+ *     env default despite global_settings being expected to have a row.
  *
  * After the next major release (when no production deployment can be
  * pre-062), the legacy branch can be deleted along with the rest of
@@ -107,6 +113,37 @@ function extractModel(value: unknown): string | null {
  */
 async function readLegacyAgentFactModel(key: string): Promise<string | null> {
   try {
+    // Codex round 4 [high]: count distinct model values across all
+    // legacy rows for this key. If more than one, the fallback would
+    // promote one tenant's choice over another — exactly the unsafe
+    // promotion migration 062 refuses. Fail-closed instead.
+    const distinctResult = await db.execute<{ distinct_count: string }>(sql`
+      SELECT COUNT(DISTINCT valor->>'model')::text AS distinct_count
+      FROM agent_facts
+      WHERE escopo = 'global'
+        AND chave = ${key}
+        AND valor ? 'model'
+    `);
+    const distinctRows = distinctResult.rows as Array<{ distinct_count: string }>;
+    const distinctCount = Number(distinctRows[0]?.distinct_count ?? '0');
+
+    if (distinctCount > 1) {
+      logger.error(
+        { distinct_count: distinctCount, key },
+        'llm_settings.legacy_fallback_conflict',
+      );
+      // Fail-closed: refuse to promote any single tenant's choice
+      // process-wide. Caller falls back to env default.
+      return null;
+    }
+
+    if (distinctCount === 0) {
+      return null;
+    }
+
+    // Exactly one distinct value — safe to promote it. Still pick the
+    // freshest row in case multiple tenants wrote the SAME value (so the
+    // returned row's updated_by/updated_at is the most recent observer).
     const result = await db.execute<{ valor: unknown }>(sql`
       SELECT valor
       FROM agent_facts
@@ -136,36 +173,59 @@ async function readLegacyAgentFactModel(key: string): Promise<string | null> {
   }
 }
 
-export async function getCurrentMainModel(): Promise<string> {
+/**
+ * Codex round 4 on PR #188 [high]: source-aware read for the admin UI.
+ *
+ * Why: the UI uses `expected_*` as an optimistic concurrency token. When
+ * `global_settings` has zero rows (fresh install), `getCurrent*Model`
+ * happily returns the env default, the UI submits THAT as expected, and
+ * the helper builds `expected: { model: <env-default> }`. Inside the tx
+ * the locked value is `null` (placeholder INSERT just landed), the
+ * compare is `null !== { model: <env-default> }` → CONFLICT — every
+ * first-ever update is rejected. Fresh deploys cannot use the page.
+ *
+ * Fix: return both the value AND its source. The admin UI now passes
+ * `expected_main: null` when source is 'env' or 'legacy' (no
+ * `global_settings` row to race against), and the repo's compare path
+ * accepts `expected: null` as "no row expected" (already supported by
+ * the `JSON.stringify` deep-equal — `null === null`).
+ *
+ * The legacy `getCurrentMainModel` / `getCurrentFastModel` helpers below
+ * keep the string-only signature for runtime LLM callers that don't
+ * need source info; they just delegate here and unwrap `.value`.
+ */
+export type LLMModelSource = 'global' | 'legacy' | 'env';
+export type LLMModelRead = { value: string; source: LLMModelSource };
+
+async function readMainModelWithSource(): Promise<LLMModelRead> {
   // (1) Canonical source: global_settings.
   try {
     const f = await globalSettingsRepo.getByKey(KEY_MAIN);
     const model = extractModel(f?.value);
-    if (model) return model;
+    if (model) return { value: model, source: 'global' };
   } catch (err) {
-    // Continue to legacy fallback; DB hiccup logged here so the warn
-    // chain (legacy → env) below makes sense in context.
     logger.warn(
       { err: (err as Error).message, key: KEY_MAIN },
       'llm_settings.global_read_failed',
     );
   }
 
-  // (2) Rolling-deploy / pre-062 fallback: legacy agent_facts.
+  // (2) Rolling-deploy / pre-062 fallback: legacy agent_facts. Source
+  // is 'legacy' so the UI can mark the expected token as null (the
+  // global_settings row doesn't exist yet).
   const legacy = await readLegacyAgentFactModel(KEY_MAIN);
-  if (legacy) return legacy;
+  if (legacy) return { value: legacy, source: 'legacy' };
 
-  // (3) Final fallback: env default. Warn so observability can detect
-  // the gap (e.g. migration 062 not yet run in this process).
+  // (3) Final fallback: env default.
   logger.warn({ key: KEY_MAIN }, 'llm_settings.env_fallback_used');
-  return envDefaultMain();
+  return { value: envDefaultMain(), source: 'env' };
 }
 
-export async function getCurrentFastModel(): Promise<string> {
+async function readFastModelWithSource(): Promise<LLMModelRead> {
   try {
     const f = await globalSettingsRepo.getByKey(KEY_FAST);
     const model = extractModel(f?.value);
-    if (model) return model;
+    if (model) return { value: model, source: 'global' };
   } catch (err) {
     logger.warn(
       { err: (err as Error).message, key: KEY_FAST },
@@ -174,10 +234,37 @@ export async function getCurrentFastModel(): Promise<string> {
   }
 
   const legacy = await readLegacyAgentFactModel(KEY_FAST);
-  if (legacy) return legacy;
+  if (legacy) return { value: legacy, source: 'legacy' };
 
   logger.warn({ key: KEY_FAST }, 'llm_settings.env_fallback_used');
-  return envDefaultFast();
+  return { value: envDefaultFast(), source: 'env' };
+}
+
+/**
+ * Source-aware read used by the admin UI to know whether `expected_*`
+ * tokens should be the observed value (source='global') or null (no
+ * global_settings row exists — env/legacy source). See the comment on
+ * LLMModelRead for the rationale.
+ */
+export async function getCurrentLLMSettings(): Promise<{
+  main: LLMModelRead;
+  fast: LLMModelRead;
+}> {
+  const [main, fast] = await Promise.all([
+    readMainModelWithSource(),
+    readFastModelWithSource(),
+  ]);
+  return { main, fast };
+}
+
+export async function getCurrentMainModel(): Promise<string> {
+  const { value } = await readMainModelWithSource();
+  return value;
+}
+
+export async function getCurrentFastModel(): Promise<string> {
+  const { value } = await readFastModelWithSource();
+  return value;
 }
 
 /**
@@ -228,9 +315,17 @@ export async function setGlobalLLMSettingsAtomic(input: {
   // `optimistic_conflict` and the router maps it to 409 CONFLICT. The
   // UI then prompts "Settings changed concurrently — refresh and try
   // again." Both required so the founder can't accidentally skip the
-  // check (pass the env default explicitly for "I observed no row").
-  expected_main: string;
-  expected_fast: string;
+  // check.
+  //
+  // Codex round 4 on PR #188 [high]: null means "I expect no row in
+  // global_settings" (source='env' or 'legacy' — the UI didn't observe
+  // any persisted row, just a fallback value). The repo compares the
+  // locked value against `null` and proceeds when the row genuinely
+  // has no payload (placeholder JSON null, never-set, etc.). String
+  // means "I observed exactly this stored value." Either is valid;
+  // the router schema accepts both (z.string().nullable()).
+  expected_main: string | null;
+  expected_fast: string | null;
   updated_by: string;
   actor_role: string;
   tenant_id: string;
@@ -260,17 +355,25 @@ export async function setGlobalLLMSettingsAtomic(input: {
       current: string | null;
     }
 > {
+  // Codex round 4 [high]: when expected_* is null the UI is telling
+  // us "no row should exist" (source was env or legacy). The repo
+  // compares `lockedValue === null` (placeholder JSON null) against
+  // `null` and proceeds. When expected_* is a string we wrap it in
+  // the same `{ model: <slug> }` shape persisted writes use.
+  const wrapExpected = (v: string | null): Record<string, unknown> | null =>
+    v === null ? null : { model: v };
+
   const res = await globalSettingsRepo.updateAtomic({
     keys: [
       {
         key: KEY_MAIN,
         value: { model: input.main },
-        expected: { model: input.expected_main },
+        expected: wrapExpected(input.expected_main),
       },
       {
         key: KEY_FAST,
         value: { model: input.fast },
-        expected: { model: input.expected_fast },
+        expected: wrapExpected(input.expected_fast),
       },
     ],
     audit: {

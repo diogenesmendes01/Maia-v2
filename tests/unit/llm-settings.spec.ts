@@ -18,7 +18,13 @@ const globalSettingsRepoMock = {
   }),
   updateAtomic: vi.fn(
     async (input: {
-      keys: ReadonlyArray<{ key: string; value: Record<string, unknown> }>;
+      keys: ReadonlyArray<{
+        key: string;
+        value: Record<string, unknown>;
+        // Codex round 4: optional expected for optimistic concurrency.
+        // null means "expect no row"; undefined means no check.
+        expected?: Record<string, unknown> | null;
+      }>;
       audit: { actor_id: string };
     }) => {
       const now = new Date();
@@ -54,31 +60,55 @@ vi.mock('../../src/db/repositories.js', () => ({
 // Codex round 3 on PR #188 [high]: getCurrent*Model now dual-reads —
 // global_settings → agent_facts (legacy) → env. The legacy fallback
 // queries agent_facts via raw `db.execute(sql...)`, so we mock the
-// `db` client to control what the legacy branch returns. Each row in
-// `legacyAgentFacts` becomes a candidate `agent_facts` row keyed by
-// chave; tests can populate this Map to exercise the fallback path
-// without standing up a real DB.
+// `db` client to control what the legacy branch returns. Tests
+// populate `legacyAgentFacts` with one OR MORE rows per key; the mock
+// answers both the COUNT(DISTINCT) preflight (Codex round 4 [high]
+// conflict guard) and the LIMIT 1 fetch from the same store.
 type LegacyRow = { valor: unknown };
-const legacyAgentFacts = new Map<string, LegacyRow>();
+const legacyAgentFacts = new Map<string, LegacyRow[]>();
 let legacyReadShouldThrow = false;
 const _dialect = new PgDialect();
+
+function setLegacyRow(key: string, row: LegacyRow): void {
+  legacyAgentFacts.set(key, [row]);
+}
+
+function setLegacyRows(key: string, rows: LegacyRow[]): void {
+  legacyAgentFacts.set(key, rows);
+}
 
 const dbExecuteMock = vi.fn(async (query: SQL) => {
   if (legacyReadShouldThrow) {
     throw new Error('simulated legacy read failure');
   }
   // Use the drizzle PgDialect to render the SQL to its bound params
-  // form, then pull the chave (always the only string param matching
-  // 'llm.model.*' in the fallback query). Integration coverage in
-  // tests/integration/global-settings-repo.spec.ts exercises the real
-  // SQL execution against Postgres.
+  // form. The fallback fires TWO queries:
+  //   1. COUNT(DISTINCT valor->>'model') — the round-4 conflict guard.
+  //   2. SELECT valor ... ORDER BY updated_at DESC LIMIT 1 — the
+  //      original fetch.
+  // Both bind only the chave string, so we pull it from params, then
+  // disambiguate by inspecting the rendered SQL string.
   const rendered = _dialect.sqlToQuery(query);
+  const sqlText = rendered.sql;
   const key = (rendered.params as unknown[]).find(
     (p) => typeof p === 'string' && p.startsWith('llm.model.'),
   ) as string | undefined;
   if (!key) return { rows: [] };
-  const row = legacyAgentFacts.get(key);
-  return { rows: row ? [row] : [] };
+  const rows = legacyAgentFacts.get(key) ?? [];
+
+  if (sqlText.includes('COUNT(DISTINCT')) {
+    // Compute distinct model count across all rows for this key.
+    const distinct = new Set<string>();
+    for (const r of rows) {
+      const v = r.valor as { model?: unknown };
+      if (v && typeof v.model === 'string') distinct.add(v.model);
+    }
+    return { rows: [{ distinct_count: String(distinct.size) }] };
+  }
+
+  // ORDER BY updated_at DESC LIMIT 1 — return the first row (the mock
+  // store is already in "freshest first" order by convention).
+  return { rows: rows.length > 0 ? [rows[0]!] : [] };
 });
 
 vi.mock('../../src/db/client.js', () => ({
@@ -182,7 +212,7 @@ describe('llm-settings (global_settings storage)', () => {
   // last-good choice — exactly the dangerous path during a provider
   // outage. With the fallback, agent_facts is consulted before env.
   it('dual-read fallback: agent_facts read when global_settings is empty (main)', async () => {
-    legacyAgentFacts.set('llm.model.main', {
+    setLegacyRow('llm.model.main', {
       valor: { model: 'openai/gpt-5' },
     });
     const { getCurrentMainModel } = await import('../../src/lib/llm-settings.js');
@@ -190,7 +220,7 @@ describe('llm-settings (global_settings storage)', () => {
   });
 
   it('dual-read fallback: agent_facts read when global_settings is empty (fast)', async () => {
-    legacyAgentFacts.set('llm.model.fast', {
+    setLegacyRow('llm.model.fast', {
       valor: { model: 'x-ai/grok-4.1-fast' },
     });
     const { getCurrentFastModel } = await import('../../src/lib/llm-settings.js');
@@ -203,7 +233,7 @@ describe('llm-settings (global_settings storage)', () => {
       updated_at: new Date(),
       updated_by: 'founder@example.com',
     });
-    legacyAgentFacts.set('llm.model.main', {
+    setLegacyRow('llm.model.main', {
       valor: { model: 'anthropic/claude-opus-4.7' }, // older legacy row
     });
     const { getCurrentMainModel } = await import('../../src/lib/llm-settings.js');
@@ -221,7 +251,7 @@ describe('llm-settings (global_settings storage)', () => {
     globalSettingsRepoMock.getByKey.mockRejectedValueOnce(
       new Error('connection lost'),
     );
-    legacyAgentFacts.set('llm.model.main', {
+    setLegacyRow('llm.model.main', {
       valor: { model: 'openai/gpt-5' },
     });
     const { getCurrentMainModel } = await import('../../src/lib/llm-settings.js');
@@ -229,7 +259,7 @@ describe('llm-settings (global_settings storage)', () => {
   });
 
   it('dual-read fallback: malformed legacy valor (no .model) ignored, env wins', async () => {
-    legacyAgentFacts.set('llm.model.main', {
+    setLegacyRow('llm.model.main', {
       valor: { not_model: 'garbage' },
     });
     const { getCurrentMainModel } = await import('../../src/lib/llm-settings.js');
@@ -379,5 +409,172 @@ describe('llm-settings (global_settings storage)', () => {
     expect(res.reason).toBe('optimistic_conflict');
     if (res.reason !== 'optimistic_conflict') throw new Error('unreachable');
     expect(res.field).toBe('fast');
+  });
+
+  // ============================================================
+  // Codex round 4 on PR #188 [high]: source-aware read (Finding 1).
+  // The admin UI needs to know whether each side's value came from a
+  // real global_settings row, a legacy agent_facts fallback, or the
+  // env default — so it can pass `expected_*: null` on a fresh install
+  // and avoid the first-update CONFLICT loop.
+  // ============================================================
+  describe('getCurrentLLMSettings (source-aware)', () => {
+    it('source=env when no global_settings row and no legacy row exists', async () => {
+      const { getCurrentLLMSettings } = await import(
+        '../../src/lib/llm-settings.js',
+      );
+      const r = await getCurrentLLMSettings();
+      expect(r.main).toEqual({
+        value: 'anthropic/claude-sonnet-4.6',
+        source: 'env',
+      });
+      expect(r.fast).toEqual({
+        value: 'anthropic/claude-haiku-4.5',
+        source: 'env',
+      });
+    });
+
+    it('source=global when global_settings has a row', async () => {
+      globalByKey.set('llm.model.main', {
+        value: { model: 'openai/gpt-5' },
+        updated_at: new Date(),
+        updated_by: 'founder@example.com',
+      });
+      const { getCurrentLLMSettings } = await import(
+        '../../src/lib/llm-settings.js',
+      );
+      const r = await getCurrentLLMSettings();
+      expect(r.main).toEqual({ value: 'openai/gpt-5', source: 'global' });
+      // fast still env (no global, no legacy)
+      expect(r.fast.source).toBe('env');
+    });
+
+    it('source=legacy when only legacy agent_facts row exists', async () => {
+      setLegacyRow('llm.model.main', {
+        valor: { model: 'openai/gpt-5' },
+      });
+      const { getCurrentLLMSettings } = await import(
+        '../../src/lib/llm-settings.js',
+      );
+      const r = await getCurrentLLMSettings();
+      expect(r.main).toEqual({ value: 'openai/gpt-5', source: 'legacy' });
+      expect(r.fast.source).toBe('env');
+    });
+  });
+
+  // ============================================================
+  // Codex round 4 on PR #188 [high]: legacy fallback conflict guard
+  // (Finding 3). When agent_facts contains multiple DISTINCT model
+  // values for the same key (e.g. two tenants picked different models
+  // pre-migration), the fallback must NOT pick one and promote it
+  // process-wide — that would silently impose one tenant's choice on
+  // every tenant. Mirror migration 062's behavior: fail-closed to
+  // env default and log llm_settings.legacy_fallback_conflict.
+  // ============================================================
+  describe('legacy fallback conflict guard', () => {
+    it('two distinct legacy values → env default (fail-closed)', async () => {
+      setLegacyRows('llm.model.main', [
+        { valor: { model: 'openai/gpt-5' } },
+        { valor: { model: 'anthropic/claude-opus-4.7' } },
+      ]);
+      const { getCurrentMainModel } = await import(
+        '../../src/lib/llm-settings.js',
+      );
+      // Distinct count = 2 → guard trips → env default served.
+      expect(await getCurrentMainModel()).toBe('anthropic/claude-sonnet-4.6');
+    });
+
+    it('one distinct legacy value across multiple rows → promote it', async () => {
+      // Two rows from different tenants, but same model — safe to
+      // promote.
+      setLegacyRows('llm.model.main', [
+        { valor: { model: 'openai/gpt-5' } },
+        { valor: { model: 'openai/gpt-5' } },
+      ]);
+      const { getCurrentMainModel } = await import(
+        '../../src/lib/llm-settings.js',
+      );
+      expect(await getCurrentMainModel()).toBe('openai/gpt-5');
+    });
+
+    it('source=legacy still flagged when single distinct value present', async () => {
+      setLegacyRows('llm.model.main', [
+        { valor: { model: 'openai/gpt-5' } },
+        { valor: { model: 'openai/gpt-5' } },
+      ]);
+      const { getCurrentLLMSettings } = await import(
+        '../../src/lib/llm-settings.js',
+      );
+      const r = await getCurrentLLMSettings();
+      expect(r.main).toEqual({ value: 'openai/gpt-5', source: 'legacy' });
+    });
+  });
+
+  // ============================================================
+  // Codex round 4 on PR #188 [high]: expected_*=null support for the
+  // first-ever update on a fresh install (Finding 1). The helper
+  // must accept null and pass it through to the repo as expected:
+  // null so the locked placeholder (JSON null) matches.
+  // ============================================================
+  describe('setGlobalLLMSettingsAtomic accepts expected_*=null', () => {
+    it('first update succeeds when expected_main=null and no global row exists', async () => {
+      const { setGlobalLLMSettingsAtomic } = await import(
+        '../../src/lib/llm-settings.js',
+      );
+      const res = await setGlobalLLMSettingsAtomic({
+        main: 'openai/gpt-5',
+        fast: 'x-ai/grok-4.1-fast',
+        expected_main: null,
+        expected_fast: null,
+        updated_by: 'founder@example.com',
+        actor_role: 'founder',
+        tenant_id: 'tenant-test',
+        comment: 'fresh install — first ever update',
+      });
+      expect(res.ok).toBe(true);
+      // The mock updateAtomic doesn't enforce expected, but we want to
+      // confirm that the helper PASSES expected:null (not wraps it in
+      // {model: null}) so the real repo's `null === null` match fires.
+      const lastCall = globalSettingsRepoMock.updateAtomic.mock.calls.at(-1);
+      expect(lastCall).toBeDefined();
+      const passedInput = lastCall![0];
+      expect(passedInput.keys[0]!.expected).toBeNull();
+      expect(passedInput.keys[1]!.expected).toBeNull();
+    });
+
+    it('expected_*=string still wraps into {model: <slug>}', async () => {
+      globalByKey.set('llm.model.main', {
+        value: { model: 'anthropic/claude-sonnet-4.6' },
+        updated_at: new Date(),
+        updated_by: 'seed',
+      });
+      globalByKey.set('llm.model.fast', {
+        value: { model: 'anthropic/claude-haiku-4.5' },
+        updated_at: new Date(),
+        updated_by: 'seed',
+      });
+      const { setGlobalLLMSettingsAtomic } = await import(
+        '../../src/lib/llm-settings.js',
+      );
+      await setGlobalLLMSettingsAtomic({
+        main: 'openai/gpt-5',
+        fast: 'openai/gpt-5',
+        expected_main: 'anthropic/claude-sonnet-4.6',
+        expected_fast: 'anthropic/claude-haiku-4.5',
+        updated_by: 'founder@example.com',
+        actor_role: 'founder',
+        tenant_id: 'tenant-test',
+        comment: 'standard update with observed expected values',
+      });
+      const lastCall = globalSettingsRepoMock.updateAtomic.mock.calls.at(-1);
+      expect(lastCall).toBeDefined();
+      const passedInput = lastCall![0];
+      expect(passedInput.keys[0]!.expected).toEqual({
+        model: 'anthropic/claude-sonnet-4.6',
+      });
+      expect(passedInput.keys[1]!.expected).toEqual({
+        model: 'anthropic/claude-haiku-4.5',
+      });
+    });
   });
 });

@@ -592,4 +592,115 @@ d('globalSettingsRepo.getByKey + updateAtomic (real DB)', () => {
     if (!res.ok) throw new Error('unreachable');
     expect(res.after).toEqual({ 'llm.model.main': { model: 'after' } });
   });
+
+  /**
+   * Codex round 4 on PR #188 [high]: fresh-install path. When
+   * `global_settings` is empty, the admin UI must be able to apply the
+   * first update with `expected: null` ("I observed no row"). The
+   * helper inserts the placeholder JSON null, takes the FOR UPDATE
+   * lock, sees `lockedValue === null`, compares `null === null`, and
+   * proceeds. Previously this loop went the other way — the UI sent
+   * the env default as expected, the helper wrapped it in {model:
+   * <env-default>}, locked value was null, compare failed, every
+   * fresh install was stuck.
+   */
+  it('fresh install: expected=null + empty global_settings → first update succeeds', async () => {
+    const { globalSettingsRepo } = await import('../../src/db/repositories.js');
+
+    // Confirm baseline: no row exists.
+    const baseline = await globalSettingsRepo.getByKey('llm.model.main');
+    expect(baseline).toBeNull();
+
+    // First update with expected: null. The pre-round-4 helper would
+    // wrap this in {model: <env-default>} (or similar) and CONFLICT
+    // against the placeholder JSON null; round-4 propagates null
+    // through and the comparison succeeds.
+    const res = await globalSettingsRepo.updateAtomic({
+      keys: [
+        {
+          key: 'llm.model.main',
+          value: { model: 'openai/gpt-5' },
+          expected: null,
+        },
+        {
+          key: 'llm.model.fast',
+          value: { model: 'x-ai/grok-4.1-fast' },
+          expected: null,
+        },
+      ],
+      audit: {
+        tenant_id: T,
+        actor_id: ACTOR_A,
+        actor_role: 'founder',
+        action: 'llm_model_changed',
+        resource_type: 'llm_settings',
+        meta: { comment: 'first ever update on a fresh DB' },
+      },
+    });
+
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error('unreachable');
+    expect(res.after).toEqual({
+      'llm.model.main': { model: 'openai/gpt-5' },
+      'llm.model.fast': { model: 'x-ai/grok-4.1-fast' },
+    });
+
+    // And both rows actually landed.
+    const main = await globalSettingsRepo.getByKey('llm.model.main');
+    const fast = await globalSettingsRepo.getByKey('llm.model.fast');
+    expect(main?.value).toEqual({ model: 'openai/gpt-5' });
+    expect(fast?.value).toEqual({ model: 'x-ai/grok-4.1-fast' });
+  });
+
+  /**
+   * Codex round 4 [high]: the OTHER side of the null match — if
+   * expected=null but a real row already exists, the compare correctly
+   * fires CONFLICT. This guards against a stale tab from before the
+   * first update.
+   */
+  it('expected=null but row exists → optimistic_conflict (not silent overwrite)', async () => {
+    const { globalSettingsRepo } = await import('../../src/db/repositories.js');
+
+    // Seed a real value.
+    await globalSettingsRepo.updateAtomic({
+      keys: [{ key: 'llm.model.main', value: { model: 'someone-already-wrote' } }],
+      audit: {
+        tenant_id: T,
+        actor_id: 'seed',
+        actor_role: 'system',
+        action: 'llm_model_changed',
+        resource_type: 'llm_settings',
+      },
+    });
+
+    // Stale tab from before that write submits expected: null.
+    const res = await globalSettingsRepo.updateAtomic({
+      keys: [
+        {
+          key: 'llm.model.main',
+          value: { model: 'stale-tab-write' },
+          expected: null,
+        },
+      ],
+      audit: {
+        tenant_id: T,
+        actor_id: ACTOR_A,
+        actor_role: 'founder',
+        action: 'llm_model_changed',
+        resource_type: 'llm_settings',
+        meta: { comment: 'stale tab, should NOT overwrite' },
+      },
+    });
+
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error('unreachable');
+    expect(res.reason).toBe('optimistic_conflict');
+    if (res.reason !== 'optimistic_conflict') throw new Error('unreachable');
+    expect(res.expected).toBeNull();
+    expect(res.current).toEqual({ model: 'someone-already-wrote' });
+
+    // DB state unchanged.
+    const main = await globalSettingsRepo.getByKey('llm.model.main');
+    expect(main?.value).toEqual({ model: 'someone-already-wrote' });
+  });
 });

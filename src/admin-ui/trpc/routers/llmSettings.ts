@@ -35,8 +35,7 @@ import { z } from 'zod';
 import { TRPCError } from '@trpc/server';
 import { router, founderProcedure } from '../server.js';
 import {
-  getCurrentMainModel,
-  getCurrentFastModel,
+  getCurrentLLMSettings,
   envDefaults,
   setGlobalLLMSettingsAtomic,
 } from '../../../lib/llm-settings.js';
@@ -65,17 +64,20 @@ const ModelSlugSchema = z
  *
  *   - `openrouter`: any slug is valid; the OpenRouter API accepts the
  *     `<vendor>/<model>` form and routes to the matching upstream.
- *   - `anthropic`: only Anthropic-native slugs work, because
- *     `AnthropicProvider.callLLM` passes the slug straight to the SDK,
- *     and `openai/gpt-5` (or `x-ai/grok-4.1-fast`) is not a valid
- *     Anthropic model ID. The SDK rejects with 404, breaking every
- *     runtime LLM call until a founder switches back.
+ *   - `anthropic`: only Anthropic-NATIVE slugs work, because
+ *     `AnthropicProvider.callLLM` passes the slug straight to
+ *     `messages.create({ model })`. The Anthropic SDK accepts IDs like
+ *     `claude-sonnet-4-6` or `claude-haiku-4-5-20251001` — NEVER the
+ *     OpenRouter-prefixed form `anthropic/claude-sonnet-4.6`.
  *
- * We accept slugs that EITHER start with `anthropic/` (OpenRouter-style
- * canonical form) OR have no slash at all (Anthropic native short IDs
- * like `claude-sonnet-4-6`). Slugs starting with any other vendor
- * prefix (`openai/`, `x-ai/`, `google/`, etc.) are rejected when
- * `LLM_PROVIDER=anthropic`.
+ * Codex round 4 on PR #188 [high]: the previous gate ALSO accepted
+ * `anthropic/*` slugs in Anthropic mode, on the theory that the
+ * OpenRouter canonical form was harmless. That was wrong: the runtime
+ * never strips the prefix or normalizes the dots-vs-hyphens (the
+ * Anthropic native form replaces `.` with `-`), so the SDK rejected
+ * every call. We now require Anthropic-native form ONLY: no slash, no
+ * vendor prefix, lower-case alphanumerics + dashes. The catalog
+ * route hides incompatible items in anthropic mode (see `catalog`).
  *
  * The check runs at the router boundary (NOT zod, because it needs the
  * runtime config). A future provider could be added with no schema
@@ -87,14 +89,41 @@ function isSlugCompatible(
 ): boolean {
   if (provider === 'openrouter') return true;
   if (provider === 'anthropic') {
-    if (slug.startsWith('anthropic/')) return true;
-    // Anthropic native short ID (no vendor prefix): no slash.
-    if (!slug.includes('/')) return true;
-    return false;
+    // Codex round 4 [high]: Anthropic native short IDs ONLY. No slash
+    // means no vendor prefix; the AnthropicProvider passes the slug
+    // straight to the SDK so it MUST be a real Anthropic model ID
+    // (`claude-sonnet-4-6`, `claude-haiku-4-5-20251001`, etc.).
+    if (slug.includes('/')) return false;
+    // Native IDs: lower-case letters/digits/hyphens only. The SDK is
+    // strict about format — reject anything with dots, underscores, or
+    // upper-case to avoid persisting a typo that the runtime would
+    // then 404 on.
+    return /^[a-z0-9-]+$/.test(slug);
   }
   // Unknown provider: be permissive — config validation upstream should
   // catch this before we ever reach the router.
   return true;
+}
+
+/**
+ * Codex round 4 on PR #188 [high]: best-effort normalization of an
+ * OpenRouter-style anthropic slug into the Anthropic-native short ID
+ * the SDK expects. We use this in the catalog filter so the operator
+ * sees a meaningful list in Anthropic mode without us hiding every
+ * entry (the OpenRouter API returns its anthropic items in
+ * `anthropic/claude-sonnet-4.6` form, but the Anthropic SDK needs
+ * `claude-sonnet-4-6`). Conservative: only normalize when the result
+ * passes `isSlugCompatible` (`/^[a-z0-9-]+$/`). On any ambiguity we
+ * drop the item rather than guess.
+ */
+function normalizeAnthropicSlug(slug: string): string | null {
+  if (!slug.startsWith('anthropic/')) return null;
+  const tail = slug.slice('anthropic/'.length);
+  // Map `.` → `-` (OpenRouter uses `claude-sonnet-4.6`; Anthropic SDK
+  // uses `claude-sonnet-4-6`). Drop anything that still doesn't pass
+  // the native-format check.
+  const candidate = tail.replace(/\./g, '-');
+  return /^[a-z0-9-]+$/.test(candidate) ? candidate : null;
 }
 
 const UpdateInputSchema = z.object({
@@ -111,18 +140,18 @@ const UpdateInputSchema = z.object({
   // expected_* fields carry the values the founder OBSERVED at load
   // time; the server compares them against the locked current values
   // INSIDE the tx and refuses the write if anything moved underneath
-  // — the UI then prompts the founder to refresh and re-decide. This
-  // is the same pattern as `If-Match` / ETag in HTTP and the same
-  // pattern `tenantsRepo.updateStatusAtomic` uses for its expected_
-  // status field.
+  // — the UI then prompts the founder to refresh and re-decide.
   //
-  // Both are required so a founder can't accidentally skip the lock by
-  // omitting them. To bypass intentionally (e.g. emergency override
-  // when the UI is stuck), the operator passes whatever it currently
-  // sees — there's no special "skip lock" sentinel because the cost of
-  // a wrong override during an incident outweighs the convenience.
-  expected_main: ModelSlugSchema,
-  expected_fast: ModelSlugSchema,
+  // Codex round 4 on PR #188 [high]: nullable. On a fresh install with
+  // no global_settings rows, getCurrentLLMSettings reports source='env'
+  // (or 'legacy') and the UI passes `null` to mean "I did not observe
+  // a global_settings row". The repo's compare path treats locked
+  // null + expected null as a match, so the first-ever update goes
+  // through instead of looping forever on optimistic_conflict. Both
+  // are required (no implicit skip) — the UI must explicitly state
+  // what it saw.
+  expected_main: ModelSlugSchema.nullable(),
+  expected_fast: ModelSlugSchema.nullable(),
   // Codex round 2 on PR #188 [P3]: the previous schema validated the raw
   // character count, so a 10-space comment passed validation and the
   // audit row would record a forensically-useless reason. `.trim()` runs
@@ -138,17 +167,34 @@ const UpdateInputSchema = z.object({
 export const llmSettingsRouter = router({
   /**
    * Read current main+fast model along with env defaults and provider.
-   * No tenant context wrap: `getCurrentMainModel`/`getCurrentFastModel`
-   * now read from `global_settings` (process-wide), which is NOT scoped
-   * to tenant/agent.
+   * No tenant context wrap: getCurrentLLMSettings reads from
+   * `global_settings` (process-wide), which is NOT scoped to
+   * tenant/agent.
+   *
+   * Codex round 4 on PR #188 [high]: surface `source` per side so the
+   * UI knows whether the displayed value comes from `global_settings`
+   * ('global'), the legacy `agent_facts` fallback ('legacy'), or the
+   * env default ('env'). The UI maps source !== 'global' → `null`
+   * when building `expected_*` for the next mutation — that way the
+   * first-ever update on a fresh install doesn't infinite-loop on
+   * optimistic_conflict.
+   *
+   * Top-level `main` / `fast` keep returning the string value so
+   * existing consumers (tests, older UI snapshots) don't break.
    */
   get: founderProcedure.query(async () => {
-    const [main, fast] = await Promise.all([
-      getCurrentMainModel(),
-      getCurrentFastModel(),
-    ]);
+    const settings = await getCurrentLLMSettings();
     const env = envDefaults();
-    return { main, fast, env };
+    return {
+      main: settings.main.value,
+      fast: settings.fast.value,
+      // Codex round 4 [high]: source flags consumed by the UI to
+      // decide whether expected_* should be the observed value or
+      // null. Tests assert the shape of this struct.
+      mainSource: settings.main.source,
+      fastSource: settings.fast.source,
+      env,
+    };
   }),
 
   /**
@@ -160,20 +206,41 @@ export const llmSettingsRouter = router({
    * Codex round 3 on PR #188 [P2]: filter the catalog by the active
    * provider so the UI doesn't offer slugs the runtime can't actually
    * use. With `LLM_PROVIDER=anthropic`, callLLM passes the stored slug
-   * straight to AnthropicProvider, so `openai/gpt-5` etc. would break
-   * every runtime call. The server-side validation in `update` is the
-   * source of truth (don't trust the client to filter); this catalog
-   * filter exists to spare the operator from selecting a doomed option
-   * in the first place. Returns the full set when provider=openrouter.
+   * straight to AnthropicProvider.
+   *
+   * Codex round 4 on PR #188 [high]: in Anthropic mode the OpenRouter
+   * catalog lists Anthropic items in `anthropic/claude-sonnet-4.6`
+   * form — but the AnthropicProvider needs `claude-sonnet-4-6` (no
+   * prefix, hyphens not dots). We now NORMALIZE OpenRouter entries
+   * to native Anthropic IDs in Anthropic mode: any item whose slug
+   * starts with `anthropic/` is rewritten via `normalizeAnthropicSlug`
+   * and re-emitted with the native ID; items from other vendors are
+   * dropped entirely (the runtime cannot call them). The server-side
+   * `update` validation remains the source of truth, but the catalog
+   * filter spares the operator from selecting a doomed option in the
+   * first place. Returns the full unfiltered set when
+   * provider=openrouter.
    */
   catalog: founderProcedure.query(async () => {
     const all = await getToolCallingModels();
     const env = envDefaults();
     const provider = env.provider as 'anthropic' | 'openrouter';
-    const items =
-      provider === 'openrouter'
-        ? all
-        : all.filter((m) => isSlugCompatible(m.id, provider));
+    if (provider === 'openrouter') {
+      return { items: all, provider };
+    }
+    // provider === 'anthropic'. Normalize anthropic/* slugs to native
+    // short IDs; drop anything else. Items already in native form
+    // (no slash) pass straight through.
+    const items = all.flatMap((m) => {
+      if (isSlugCompatible(m.id, 'anthropic')) {
+        return [m];
+      }
+      const native = normalizeAnthropicSlug(m.id);
+      if (native && isSlugCompatible(native, 'anthropic')) {
+        return [{ ...m, id: native }];
+      }
+      return [];
+    });
     return { items, provider };
   }),
 
@@ -217,7 +284,14 @@ export const llmSettingsRouter = router({
             message:
               `${field}=${slug} is incompatible with the active LLM provider (${provider}). ` +
               (provider === 'anthropic'
-                ? 'Anthropic provider accepts only anthropic/* or unprefixed Anthropic-native slugs.'
+                ? // Codex round 4 [high]: Anthropic mode requires the
+                  // SDK-native short ID (no slash, no vendor prefix —
+                  // e.g. `claude-sonnet-4-6`). OpenRouter-formatted
+                  // slugs like `anthropic/claude-sonnet-4.6` are
+                  // rejected because the runtime passes the value
+                  // straight to messages.create() and the SDK rejects
+                  // anything that isn't a native ID.
+                  'Anthropic provider requires the SDK-native short ID (e.g. claude-sonnet-4-6 — no slash, no vendor prefix). OpenRouter-style slugs like anthropic/claude-sonnet-4.6 are not accepted.'
                 : `Provider ${provider} does not accept this slug.`),
           });
         }
