@@ -4,13 +4,17 @@
  * Drives the router through tRPC's caller with in-memory repos. Verifies:
  *   1. create requires role founder|owner; viewer/analyst/compliance get FORBIDDEN.
  *   2. create writes the agent row AND seeds an operational_profile_version
- *      with status='proposed' AND appends an audit row, in that order.
+ *      with status='proposed' AND appends an audit row — ATOMICALLY (via
+ *      agentsRepo.createWithSeedAndAudit; issue #166).
  *   3. create against a non-existent tenant returns NOT_FOUND.
  *   4. create with a duplicate agent id returns CONFLICT.
  *   5. updateProfile chains previous_version_id from the active version.
  *   6. updateProfile on a foreign-tenant agent returns NOT_FOUND (tenant
  *      isolation invariant).
  *   7. resolveTenantId still rejects a body-supplied tenant for non-founder.
+ *   8. ATOMICITY (issue #166): if the audit insert throws inside
+ *      createWithSeedAndAudit / proposeAndAuditAtomic, neither the agent row
+ *      nor the profile_version row are persisted (full rollback).
  */
 import { describe, it, expect } from 'vitest';
 import { TRPCError } from '@trpc/server';
@@ -45,7 +49,22 @@ type AuditRow = {
   change_summary: Record<string, unknown> | null;
 };
 
-function makeRepos(opts: { tenants?: string[]; agents?: Agent[]; profiles?: Profile[] } = {}) {
+/**
+ * Options for makeRepos:
+ *   - failAuditOnAction: when set, the audit insert performed inside the
+ *     atomic helpers (createWithSeedAndAudit / proposeAndAuditAtomic) throws.
+ *     The mock then ROLLS BACK the agent/profile writes performed earlier in
+ *     the same logical tx, mirroring real Postgres `withTx` semantics. Used
+ *     to prove the multi-write atomicity invariant (issue #166).
+ */
+function makeRepos(
+  opts: {
+    tenants?: string[];
+    agents?: Agent[];
+    profiles?: Profile[];
+    failAuditOnAction?: 'agent_create' | 'agent_profile_propose';
+  } = {},
+) {
   const tenantIds = new Set(opts.tenants ?? ['tenant-A']);
   const agentsMap: Record<string, Agent> = {};
   for (const a of opts.agents ?? []) agentsMap[a.id] = { ...a };
@@ -92,6 +111,92 @@ function makeRepos(opts: { tenants?: string[]; agents?: Agent[]; profiles?: Prof
         agentsMap[input.id] = row;
         return row;
       },
+      // Atomic create+seed+audit. Mock emulates `withTx` rollback: if any of
+      // the three writes throws, everything previously inserted in THIS call
+      // is removed. Mirrors the real-DB invariant tested in #166.
+      async createWithSeedAndAudit(args: {
+        agent: {
+          id: string;
+          tenant_id: string;
+          nome: string;
+          status?: string;
+        };
+        seed_profile: {
+          profile_body: unknown;
+          proposed_by: string;
+          proposed_reason: string;
+        };
+        audit: {
+          actor_id: string;
+          actor_role: string;
+        };
+      }) {
+        // Snapshot for rollback.
+        const insertedAgentId = args.agent.id;
+        const insertedProfileIds: string[] = [];
+        const insertedAuditIdx: number[] = [];
+        try {
+          // (1) Insert agent.
+          const createdAgent: Agent = {
+            id: args.agent.id,
+            tenant_id: args.agent.tenant_id,
+            nome: args.agent.nome,
+            status: args.agent.status ?? 'active',
+            metadata: {},
+            created_at: new Date(),
+            updated_at: new Date(),
+          };
+          agentsMap[insertedAgentId] = createdAgent;
+          // (2) Insert seed profile_version (version=1, status=proposed).
+          const seedProfile: Profile = {
+            id: `prof-${profiles.length + 1}`,
+            tenant_id: args.agent.tenant_id,
+            agent_id: createdAgent.id,
+            version: 1,
+            status: 'proposed',
+            profile_body: args.seed_profile.profile_body,
+            proposed_by: args.seed_profile.proposed_by,
+            proposed_reason: args.seed_profile.proposed_reason,
+          };
+          profiles.push(seedProfile);
+          insertedProfileIds.push(seedProfile.id);
+          // (3) Append audit. May throw if failAuditOnAction matches.
+          if (opts.failAuditOnAction === 'agent_create') {
+            throw new Error('simulated audit insert failure');
+          }
+          audit.push({
+            tenant_id: args.agent.tenant_id,
+            actor_id: args.audit.actor_id,
+            actor_role: args.audit.actor_role,
+            action: 'agent_create',
+            resource_type: 'agent',
+            resource_id: createdAgent.id,
+            change_summary: {
+              agent_id: createdAgent.id,
+              agent_nome: createdAgent.nome,
+              seed_profile_version_id: seedProfile.id,
+              seed_profile_version: seedProfile.version,
+              seed_profile_status: seedProfile.status,
+              proposed_reason: args.seed_profile.proposed_reason,
+            },
+          });
+          insertedAuditIdx.push(audit.length - 1);
+          return { agent: createdAgent, seed_profile: seedProfile };
+        } catch (err) {
+          // ROLLBACK: undo every write made above. This is the invariant the
+          // test asserts — if audit throws, agent + profile_version DO NOT
+          // persist.
+          if (agentsMap[insertedAgentId]) delete agentsMap[insertedAgentId];
+          for (const pid of insertedProfileIds) {
+            const idx = profiles.findIndex((p) => p.id === pid);
+            if (idx >= 0) profiles.splice(idx, 1);
+          }
+          for (const aidx of insertedAuditIdx.slice().reverse()) {
+            audit.splice(aidx, 1);
+          }
+          throw err;
+        }
+      },
     },
     operationalProfileVersionsRepo: {
       // The real repo uses applyTenantGuard + getCurrentTenant(); the router
@@ -107,37 +212,81 @@ function makeRepos(opts: { tenants?: string[]; agents?: Agent[]; profiles?: Prof
         const active = profiles.find((p) => p.status === 'active');
         return active ?? null;
       },
-      async create(input: {
+      // Atomic propose+audit. Mock emulates `withTx` rollback: if the audit
+      // insert throws, the profile_version row inserted earlier is removed.
+      async proposeAndAuditAtomic(args: {
+        tenant_id: string;
+        agent_id: string;
         profile_body: unknown;
         proposed_by: string;
-        proposed_reason?: string;
+        proposed_reason: string;
+        previous_active_id: string | null;
+        actor_id: string;
+        actor_role: string;
       }) {
-        // We can't read the tenant context from the test mock easily, but the
-        // router always passes the SAME tenant+agent in runWithTenantContext as
-        // the one supplied to agentsRepo.create. So we tag from the latest agent
-        // create (best-effort for tests).
-        const lastAgent = Object.values(agentsMap).at(-1);
-        const tenant_id = lastAgent?.tenant_id ?? 'unknown';
-        const agent_id = lastAgent?.id ?? 'unknown';
-        const version =
-          profiles.filter((p) => p.tenant_id === tenant_id && p.agent_id === agent_id)
-            .length + 1;
-        const row: Profile = {
-          id: `prof-${profiles.length + 1}`,
-          tenant_id,
-          agent_id,
-          version,
-          status: 'proposed',
-          profile_body: input.profile_body,
-          proposed_by: input.proposed_by,
-          proposed_reason: input.proposed_reason ?? null,
-        };
-        profiles.push(row);
-        return row;
+        const insertedProfileIds: string[] = [];
+        try {
+          const version =
+            profiles.filter(
+              (p) => p.tenant_id === args.tenant_id && p.agent_id === args.agent_id,
+            ).length + 1;
+          const row: Profile = {
+            id: `prof-${profiles.length + 1}`,
+            tenant_id: args.tenant_id,
+            agent_id: args.agent_id,
+            version,
+            status: 'proposed',
+            profile_body: args.profile_body,
+            proposed_by: args.proposed_by,
+            proposed_reason: args.proposed_reason,
+          };
+          profiles.push(row);
+          insertedProfileIds.push(row.id);
+
+          if (opts.failAuditOnAction === 'agent_profile_propose') {
+            throw new Error('simulated audit insert failure');
+          }
+          audit.push({
+            tenant_id: args.tenant_id,
+            actor_id: args.actor_id,
+            actor_role: args.actor_role,
+            action: 'agent_profile_propose',
+            resource_type: 'agent_operational_profile_version',
+            resource_id: row.id,
+            change_summary: {
+              agent_id: args.agent_id,
+              previous_version_id: args.previous_active_id,
+              new_version: row.version,
+              status: row.status,
+              proposed_reason: args.proposed_reason,
+            },
+          });
+          return { version: row, previous_version_id: args.previous_active_id };
+        } catch (err) {
+          for (const pid of insertedProfileIds) {
+            const idx = profiles.findIndex((p) => p.id === pid);
+            if (idx >= 0) profiles.splice(idx, 1);
+          }
+          throw err;
+        }
       },
       // Mirrors the tx-aware repo path: finds the target proposed row, freezes
       // any incumbent active for the same (tenant, agent), activates the new
       // one, audits — all "atomically" in mock-land (just runs synchronously).
+      //
+      // Codex Adversarial Review of PR #171 round 2 — also mirrors the new
+      // predecessor enforcement: reads
+      // `profile_body.metadata.previous_version_id` from the proposed row and
+      // rejects with `predecessor_conflict` when it doesn't match the current
+      // incumbent.
+      //
+      // Codex Adversarial Review of PR #171 round 3 — also mirrors:
+      //   - parent-agent existence check (returns `agent_missing` if the
+      //     agent was deleted between findById and the lock acquisition);
+      //   - migrated-legacy detection (`metadata.migrated_from_legacy === true`
+      //     + explicit null predecessor → `migrated_legacy_proposal`);
+      //   - intentional-seed exception (`version === 1` + no incumbent +
+      //     explicit null predecessor → accept).
       async approveAndActivateAtomic(args: {
         tenant_id: string;
         agent_id: string;
@@ -146,6 +295,12 @@ function makeRepos(opts: { tenants?: string[]; agents?: Agent[]; profiles?: Prof
         actor_role: string;
         comment: string;
       }) {
+        // Mirror the parent-agent FOR UPDATE lock — if the agent row was
+        // deleted between the router's findById and the tx lock, surface
+        // the typed-miss instead of falling through to predecessor checks.
+        if (!agentsMap[args.agent_id] || agentsMap[args.agent_id]!.tenant_id !== args.tenant_id) {
+          return { ok: false as const, reason: 'agent_missing' as const };
+        }
         const target = profiles.find((p) => p.id === args.id);
         if (!target) return { ok: false as const, reason: 'not_found' as const };
         if (target.status !== 'proposed') {
@@ -159,6 +314,49 @@ function makeRepos(opts: { tenants?: string[]; agents?: Agent[]; profiles?: Prof
               p.status === 'active' &&
               p.id !== target.id,
           ) ?? null;
+
+        // Predecessor enforcement (mirrors repo behavior).
+        const md = (target.profile_body as { metadata?: Record<string, unknown> } | null)
+          ?.metadata;
+        let expected: string | null | 'unknown';
+        if (!md || !('previous_version_id' in md)) {
+          expected = 'unknown';
+        } else {
+          const v = md.previous_version_id;
+          expected = v === null ? null : typeof v === 'string' ? v : 'unknown';
+        }
+        const current = incumbent?.id ?? null;
+        if (expected === 'unknown') {
+          return {
+            ok: false as const,
+            reason: 'predecessor_conflict' as const,
+            expected: 'unknown' as const,
+            current,
+          };
+        }
+
+        // Round 3 #173: migrated legacy rejected with distinct sentinel.
+        const isMigrated = md?.migrated_from_legacy === true;
+        if (expected === null && isMigrated) {
+          return {
+            ok: false as const,
+            reason: 'migrated_legacy_proposal' as const,
+            expected: null,
+            current,
+          };
+        }
+
+        // Round 3 #173: intentional seed (v1 + no incumbent + null predecessor).
+        const isIntentionalSeed = expected === null && current === null && target.version === 1;
+        if (!isIntentionalSeed && expected !== current) {
+          return {
+            ok: false as const,
+            reason: 'predecessor_conflict' as const,
+            expected,
+            current,
+          };
+        }
+
         if (incumbent) {
           incumbent.status = 'frozen';
         }
@@ -176,6 +374,7 @@ function makeRepos(opts: { tenants?: string[]; agents?: Agent[]; profiles?: Prof
             new_version: target.version,
             previous_active_id: incumbent?.id ?? null,
             previous_active_version: incumbent?.version ?? null,
+            expected_predecessor_id: expected,
             comment: args.comment,
           },
         });
@@ -435,6 +634,13 @@ describe('agentsRouter.approveProfile — atomic + freezes incumbent', () => {
     updated_at: new Date(),
   };
 
+  // Codex round 2: proposals authored under the new flow carry
+  // `metadata.previous_version_id` so `approveAndActivateAtomic` can detect
+  // write-skew. Helpers to build well-formed profile_body for these tests.
+  const bodyWithPrev = (prev: string | null) => ({
+    metadata: { previous_version_id: prev },
+  });
+
   it.each(['analyst', 'viewer', 'compliance_officer'])(
     '%s cannot approve',
     async (role) => {
@@ -444,7 +650,7 @@ describe('agentsRouter.approveProfile — atomic + freezes incumbent', () => {
         agent_id: 'agent-x',
         version: 1,
         status: 'proposed',
-        profile_body: {},
+        profile_body: bodyWithPrev(null),
         proposed_by: 'system',
         proposed_reason: null,
       };
@@ -466,7 +672,7 @@ describe('agentsRouter.approveProfile — atomic + freezes incumbent', () => {
       agent_id: 'agent-x',
       version: 1,
       status: 'proposed',
-      profile_body: {},
+      profile_body: bodyWithPrev(null),
       proposed_by: 'system',
       proposed_reason: null,
     };
@@ -482,6 +688,7 @@ describe('agentsRouter.approveProfile — atomic + freezes incumbent', () => {
     // Audit row records the transition.
     expect(repos._inspect.audit[0]!.action).toBe('agent_profile_approve');
     expect(repos._inspect.audit[0]!.change_summary?.previous_active_id).toBeNull();
+    expect(repos._inspect.audit[0]!.change_summary?.expected_predecessor_id).toBeNull();
   });
 
   it('owner approves v2 while v1 active → v1 frozen, v2 active, audited atomically', async () => {
@@ -491,7 +698,7 @@ describe('agentsRouter.approveProfile — atomic + freezes incumbent', () => {
       agent_id: 'agent-x',
       version: 1,
       status: 'active',
-      profile_body: {},
+      profile_body: bodyWithPrev(null),
       proposed_by: 'system',
       proposed_reason: null,
     };
@@ -501,7 +708,8 @@ describe('agentsRouter.approveProfile — atomic + freezes incumbent', () => {
       agent_id: 'agent-x',
       version: 2,
       status: 'proposed',
-      profile_body: {},
+      // v2 was proposed against v1 — predecessor matches incumbent.
+      profile_body: bodyWithPrev('00000000-0000-4000-8000-0000000000a1'),
       proposed_by: 'owner-1',
       proposed_reason: 'change tone',
     };
@@ -519,10 +727,11 @@ describe('agentsRouter.approveProfile — atomic + freezes incumbent', () => {
     // Old active → frozen, new proposed → active.
     expect(repos._inspect.profiles.find((p) => p.id === '00000000-0000-4000-8000-0000000000a1')!.status).toBe('frozen');
     expect(repos._inspect.profiles.find((p) => p.id === '00000000-0000-4000-8000-0000000000a2')!.status).toBe('active');
-    // Audit records both sides of the swap.
+    // Audit records both sides of the swap + the predecessor expectation.
     const audit = repos._inspect.audit[0]!;
     expect(audit.change_summary?.previous_active_id).toBe('00000000-0000-4000-8000-0000000000a1');
     expect(audit.change_summary?.new_version_id).toBe('00000000-0000-4000-8000-0000000000a2');
+    expect(audit.change_summary?.expected_predecessor_id).toBe('00000000-0000-4000-8000-0000000000a1');
   });
 
   it('CONFLICT when version is not in proposed state', async () => {
@@ -556,7 +765,7 @@ describe('agentsRouter.approveProfile — atomic + freezes incumbent', () => {
       agent_id: 'agent-ghost',
       version: 1,
       status: 'proposed',
-      profile_body: {},
+      profile_body: bodyWithPrev(null),
       proposed_by: 'system',
       proposed_reason: null,
     };
@@ -568,5 +777,391 @@ describe('agentsRouter.approveProfile — atomic + freezes incumbent', () => {
         comment: 'agent does not exist',
       }),
     ).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  });
+
+  /**
+   * Codex Adversarial Review of PR #171 round 2 — predecessor enforcement.
+   *
+   * Sequencial scenario: v1 active, owner Bob proposes v2 (predecessor=v1)
+   * and Alice proposes v3 (predecessor=v1). Bob's v2 gets approved first
+   * → v1 frozen, v2 active. If Alice's v3 is approved next without
+   * predecessor enforcement, v2 would be silently frozen and v3 would
+   * become active even though its content was written against v1 — Alice
+   * had no chance to incorporate Bob's changes.
+   *
+   * The fix: approving v3 must detect the mismatch (expected: v1, current:
+   * v2) and reject with CONFLICT so Alice refreshes and re-proposes
+   * against v2.
+   */
+  it('predecessor_conflict: v3 (proposed against v1) is rejected after v2 was approved', async () => {
+    const v1Active: Profile = {
+      id: '00000000-0000-4000-8000-0000000000a1',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      version: 1,
+      status: 'active',
+      profile_body: bodyWithPrev(null),
+      proposed_by: 'system',
+      proposed_reason: null,
+    };
+    const v2Proposed: Profile = {
+      id: '00000000-0000-4000-8000-0000000000a2',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      version: 2,
+      status: 'proposed',
+      profile_body: bodyWithPrev('00000000-0000-4000-8000-0000000000a1'),
+      proposed_by: 'bob',
+      proposed_reason: 'bob update',
+    };
+    const v3Proposed: Profile = {
+      id: '00000000-0000-4000-8000-0000000000a3',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      version: 3,
+      status: 'proposed',
+      // Alice's v3 was authored against v1 too — she didn't see Bob's v2.
+      profile_body: bodyWithPrev('00000000-0000-4000-8000-0000000000a1'),
+      proposed_by: 'alice',
+      proposed_reason: 'alice update',
+    };
+    const repos = makeRepos({
+      agents: [existingAgent],
+      profiles: [v1Active, v2Proposed, v3Proposed],
+    });
+
+    // Step 1: Bob's v2 is approved successfully — v1 → frozen, v2 → active.
+    const approveV2 = await caller('owner', 'tenant-A', 'u1', repos).approveProfile({
+      agentId: 'agent-x',
+      versionId: '00000000-0000-4000-8000-0000000000a2',
+      comment: 'approve bob v2',
+    });
+    expect(approveV2.activated.id).toBe('00000000-0000-4000-8000-0000000000a2');
+    expect(
+      repos._inspect.profiles.find((p) => p.id === '00000000-0000-4000-8000-0000000000a2')!
+        .status,
+    ).toBe('active');
+
+    // Step 2: Alice's v3 was proposed against v1, but v2 is now active.
+    // Approving v3 must be rejected with CONFLICT — otherwise Bob's v2
+    // would be silently overwritten.
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).approveProfile({
+        agentId: 'agent-x',
+        versionId: '00000000-0000-4000-8000-0000000000a3',
+        comment: 'approve alice v3',
+      }),
+    ).rejects.toMatchObject({
+      code: 'CONFLICT',
+      message: expect.stringMatching(/active profile changed/i),
+    });
+
+    // v2 must STILL be active, v3 must STILL be proposed — the rejected
+    // approval did not corrupt the lineage.
+    expect(
+      repos._inspect.profiles.find((p) => p.id === '00000000-0000-4000-8000-0000000000a2')!
+        .status,
+    ).toBe('active');
+    expect(
+      repos._inspect.profiles.find((p) => p.id === '00000000-0000-4000-8000-0000000000a3')!
+        .status,
+    ).toBe('proposed');
+  });
+
+  it('predecessor_conflict (legacy): proposal without metadata.previous_version_id is rejected', async () => {
+    const proposed: Profile = {
+      id: '00000000-0000-4000-8000-0000000000a1',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      version: 1,
+      status: 'proposed',
+      // No metadata — pretends to be a legacy proposal authored before
+      // this codepath existed. Policy: reject conservatively.
+      profile_body: {},
+      proposed_by: 'system',
+      proposed_reason: null,
+    };
+    const repos = makeRepos({ agents: [existingAgent], profiles: [proposed] });
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).approveProfile({
+        agentId: 'agent-x',
+        versionId: '00000000-0000-4000-8000-0000000000a1',
+        comment: 'legacy proposal approval attempt',
+      }),
+    ).rejects.toMatchObject({
+      code: 'CONFLICT',
+      message: expect.stringMatching(/expected predecessor unknown/i),
+    });
+    // Profile MUST still be proposed — nothing was activated.
+    expect(repos._inspect.profiles[0]!.status).toBe('proposed');
+  });
+
+  /**
+   * Codex Adversarial Review of PR #171 round 3 ([high] #173) — migration 061
+   * backfilled `metadata.previous_version_id = null` + `migrated_from_legacy:
+   * true` for every legacy row. Without the discriminator, the predecessor
+   * check accepted explicit `null` as "no predecessor expected" (valid for
+   * intentional seed v1), so a stale migrated proposal whose true lineage
+   * is unknowable could silently activate against an empty active slot.
+   * The new policy rejects migrated proposals with a distinct sentinel.
+   */
+  it('migrated_legacy_proposal: explicit null + migrated_from_legacy marker is rejected', async () => {
+    const migrated: Profile = {
+      id: '00000000-0000-4000-8000-0000000000a1',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      // Could be any version — migration 061 backfilled all of them.
+      version: 1,
+      status: 'proposed',
+      profile_body: {
+        metadata: {
+          previous_version_id: null,
+          migrated_from_legacy: true,
+        },
+      },
+      proposed_by: 'system',
+      proposed_reason: null,
+    };
+    const repos = makeRepos({ agents: [existingAgent], profiles: [migrated] });
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).approveProfile({
+        agentId: 'agent-x',
+        versionId: '00000000-0000-4000-8000-0000000000a1',
+        comment: 'attempt to approve a migrated legacy proposal',
+      }),
+    ).rejects.toMatchObject({
+      code: 'CONFLICT',
+      message: expect.stringMatching(/v3\.1\.1 legacy backfill/i),
+    });
+    // Profile MUST still be proposed — nothing was activated.
+    expect(repos._inspect.profiles[0]!.status).toBe('proposed');
+    // No audit row appended — the rejection happened before the audit step.
+    expect(repos._inspect.audit).toHaveLength(0);
+  });
+
+  /**
+   * Codex Adversarial Review of PR #171 round 3 — the intentional-seed
+   * exception accepts explicit `null` predecessor ONLY when (a) there's no
+   * incumbent active row AND (b) this is version 1. Any non-seed null case
+   * (v2+ with null, or v1 with an incumbent) falls through to
+   * predecessor_conflict. Matches the `create → approve` seed flow shipped
+   * with `createWithSeedAndAudit`.
+   */
+  it('intentional seed: v1 + no incumbent + null predecessor (no marker) is approved', async () => {
+    const seed: Profile = {
+      id: '00000000-0000-4000-8000-0000000000a1',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      version: 1,
+      status: 'proposed',
+      profile_body: { metadata: { previous_version_id: null } },
+      proposed_by: 'system',
+      proposed_reason: null,
+    };
+    const repos = makeRepos({ agents: [existingAgent], profiles: [seed] });
+    const res = await caller('owner', 'tenant-A', 'u1', repos).approveProfile({
+      agentId: 'agent-x',
+      versionId: '00000000-0000-4000-8000-0000000000a1',
+      comment: 'first activation for this agent',
+    });
+    expect(res.activated.id).toBe('00000000-0000-4000-8000-0000000000a1');
+    expect(res.frozen_previous).toBeNull();
+    expect(repos._inspect.profiles[0]!.status).toBe('active');
+  });
+
+  /**
+   * Documents the strict-equality behavior for null predecessor + no
+   * incumbent on a non-v1 version. This case is NOT rejected because the
+   * structural invariant (`expected_predecessor === current_incumbent`) is
+   * satisfied — null === null. The intentional-seed gate is an
+   * ACCEPTANCE bypass; the strict-equality check is the rejection gate.
+   * The dangerous shape (null predecessor with an incumbent present) is
+   * caught by `expected !== current` when current is non-null.
+   */
+  it('explicit null predecessor on v2 (no incumbent) is accepted (null === null structurally)', async () => {
+    const v2NoIncumbent: Profile = {
+      id: '00000000-0000-4000-8000-0000000000a2',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      version: 2,
+      status: 'proposed',
+      profile_body: { metadata: { previous_version_id: null } },
+      proposed_by: 'system',
+      proposed_reason: null,
+    };
+    const repos = makeRepos({ agents: [existingAgent], profiles: [v2NoIncumbent] });
+    const res = await caller('owner', 'tenant-A', 'u1', repos).approveProfile({
+      agentId: 'agent-x',
+      versionId: '00000000-0000-4000-8000-0000000000a2',
+      comment: 'approve v2 against empty active slot',
+    });
+    expect(res.activated.id).toBe('00000000-0000-4000-8000-0000000000a2');
+  });
+
+  /**
+   * Codex Adversarial Review of PR #171 round 3 — `agent_missing` typed-miss
+   * surfaces as NOT_FOUND. Simulates the agent being deleted between the
+   * router's findById check and the parent-agent FOR UPDATE lock inside
+   * the tx (mock checks agentsMap[args.agent_id] presence to mirror).
+   */
+  it('NOT_FOUND when parent agent vanished between findById and lock', async () => {
+    // No agent in the map — but a proposal exists pointing at it. In real
+    // life this is the (rare) race where the agent was deleted after the
+    // router's findById succeeded but before the FOR UPDATE lock fired.
+    const orphanProposal: Profile = {
+      id: '00000000-0000-4000-8000-0000000000a1',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-deleted',
+      version: 1,
+      status: 'proposed',
+      profile_body: { metadata: { previous_version_id: null } },
+      proposed_by: 'system',
+      proposed_reason: null,
+    };
+    // Pre-populate with the agent so router.findById succeeds, then we
+    // delete it right before calling. The mock's approveAndActivateAtomic
+    // re-checks agentsMap so the typed-miss fires correctly.
+    const agent: Agent = {
+      id: 'agent-deleted',
+      tenant_id: 'tenant-A',
+      nome: 'about to vanish',
+      status: 'active',
+      metadata: {},
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+    const repos = makeRepos({ agents: [agent], profiles: [orphanProposal] });
+    // Vanish the agent before approve (simulates the race).
+    delete repos._inspect.agentsMap['agent-deleted'];
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).approveProfile({
+        agentId: 'agent-deleted',
+        versionId: '00000000-0000-4000-8000-0000000000a1',
+        comment: 'race against agent deletion',
+      }),
+    ).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  });
+});
+
+/**
+ * ATOMICITY (issue #166) — the agentsRouter must not commit a partial
+ * create/updateProfile sequence. If the audit insert throws (sim. via the
+ * `failAuditOnAction` knob, which the mock honors by rolling back earlier
+ * inserts in the same logical tx), neither the agent row nor the seed/new
+ * profile_version row may persist.
+ *
+ * These tests exercise the contract of `agentsRepo.createWithSeedAndAudit`
+ * and `operationalProfileVersionsRepo.proposeAndAuditAtomic` from the router's
+ * perspective — the real repo wraps the writes in `withTx` so a Postgres
+ * exception triggers ROLLBACK at the DB level.
+ */
+describe('agentsRouter — multi-write atomicity (#166)', () => {
+  it('create: audit failure rolls back agent + seed profile_version', async () => {
+    const repos = makeRepos({ failAuditOnAction: 'agent_create' });
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).create({
+        id: 'agent-x',
+        nome: 'X',
+        profile_body: validProfile,
+        proposed_reason: 'seed that should rollback when audit fails',
+      }),
+    ).rejects.toThrow(/simulated audit insert failure/);
+
+    // Neither the agent row nor the seed profile_version was persisted.
+    expect(repos._inspect.agentsMap['agent-x']).toBeUndefined();
+    expect(repos._inspect.profiles.find((p) => p.agent_id === 'agent-x')).toBeUndefined();
+    // And no audit row was appended (would be a forensics ghost otherwise).
+    expect(repos._inspect.audit).toHaveLength(0);
+  });
+
+  it('create: happy path persists all three rows', async () => {
+    const repos = makeRepos();
+    const res = await caller('owner', 'tenant-A', 'u1', repos).create({
+      id: 'agent-x',
+      nome: 'X',
+      profile_body: validProfile,
+      proposed_reason: 'happy-path baseline for the rollback test above',
+    });
+    expect(res.agent.id).toBe('agent-x');
+    expect(repos._inspect.agentsMap['agent-x']).toBeDefined();
+    expect(repos._inspect.profiles).toHaveLength(1);
+    expect(repos._inspect.audit).toHaveLength(1);
+    expect(repos._inspect.audit[0]!.action).toBe('agent_create');
+  });
+
+  it('updateProfile: audit failure rolls back the new profile_version', async () => {
+    const existingAgent: Agent = {
+      id: 'agent-x',
+      tenant_id: 'tenant-A',
+      nome: 'X',
+      status: 'active',
+      metadata: {},
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+    const v1Active: Profile = {
+      id: 'prof-v1',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      version: 1,
+      status: 'active',
+      profile_body: {},
+      proposed_by: 'system',
+      proposed_reason: null,
+    };
+    const repos = makeRepos({
+      agents: [existingAgent],
+      profiles: [v1Active],
+      failAuditOnAction: 'agent_profile_propose',
+    });
+
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).updateProfile({
+        agentId: 'agent-x',
+        profile_body: validProfile,
+        proposed_reason: 'update that should rollback when audit fails',
+      }),
+    ).rejects.toThrow(/simulated audit insert failure/);
+
+    // Only the pre-existing v1 active row remains; the proposed v2 did NOT
+    // persist, even though it was inserted before the audit threw.
+    expect(repos._inspect.profiles).toHaveLength(1);
+    expect(repos._inspect.profiles[0]!.id).toBe('prof-v1');
+    expect(repos._inspect.profiles[0]!.status).toBe('active');
+    // No audit row was appended.
+    expect(repos._inspect.audit).toHaveLength(0);
+  });
+
+  it('updateProfile: happy path persists v2 proposed + audit row', async () => {
+    const existingAgent: Agent = {
+      id: 'agent-x',
+      tenant_id: 'tenant-A',
+      nome: 'X',
+      status: 'active',
+      metadata: {},
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+    const v1Active: Profile = {
+      id: 'prof-v1',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      version: 1,
+      status: 'active',
+      profile_body: {},
+      proposed_by: 'system',
+      proposed_reason: null,
+    };
+    const repos = makeRepos({ agents: [existingAgent], profiles: [v1Active] });
+    const res = await caller('owner', 'tenant-A', 'u1', repos).updateProfile({
+      agentId: 'agent-x',
+      profile_body: validProfile,
+      proposed_reason: 'happy-path baseline for the rollback test above',
+    });
+    expect(res.version.status).toBe('proposed');
+    expect(res.previous_version_id).toBe('prof-v1');
+    expect(repos._inspect.profiles).toHaveLength(2);
+    expect(repos._inspect.audit).toHaveLength(1);
+    expect(repos._inspect.audit[0]!.action).toBe('agent_profile_propose');
   });
 });
