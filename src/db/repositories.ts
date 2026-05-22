@@ -3221,8 +3221,38 @@ export const operationalProfileVersionsRepo = {
   // Validated state-machine transition. Retorna typed result, sem throw.
   // - not_found:           id desconhecido
   // - terminal:            row já está rolled_back (terminal)
-  // - invalid_transition:  destino não permitido a partir do source ou same-state
+  // - invalid_transition:  destino não permitido a partir do source, same-state,
+  //                        OR source status changed concurrently between read
+  //                        and write (status predicate guard fired)
   // - already_has_active:  to:'active' mas outra row ativa existe para (tenant,agent)
+  //
+  // Codex Adversarial Review of PR #171 round 4 (issue #177) — until this
+  // refactor, `transition` was the LAST writer of
+  // `agent_operational_profile_versions` that bypassed the parent-agent
+  // `FOR UPDATE` lock established by `acquireNextVersionForAgent` /
+  // `lockParentAgent`. The drift decision engine calls this method to
+  // freeze/rollback the active profile when a drift severity threshold is
+  // crossed, and the priorities seed script calls `seedNewActiveAtomic`
+  // (which DOES take the lock) on the same `(tenant, agent)` slot. The
+  // documented race was: seed reads active A → drift `transition` rolls A
+  // back/frozen → seed re-writes A as `frozen` using only `id/tenant/agent`
+  // → silently undoes `rolled_back` (the terminal state per the doccomment).
+  //
+  // Fix is twofold:
+  //   (a) Wrap the whole transition in `withTx` and acquire `lockParentAgent`
+  //       as the FIRST step. Every other writer of this table now goes
+  //       through the same lock target (`approveAndActivateAtomic`,
+  //       `proposeAndAuditAtomic`, `seedNewActiveAtomic`, and
+  //       `operationalProfileVersionsRepo.create`), so concurrent writers
+  //       serialize on `agents(id)` regardless of which transition shape
+  //       they perform.
+  //   (b) Add a `status = <from>` predicate to the UPDATE itself + check
+  //       `returning().length === 1`. Belt-and-suspenders for the case where
+  //       another writer somehow holds the row in a different lock domain
+  //       (or future codepath bypasses the parent lock): if the source
+  //       status changed concurrently, the UPDATE matches zero rows and we
+  //       surface `invalid_transition` (the source predicate the caller
+  //       asked about no longer holds) instead of silently overwriting it.
   async transition(args: {
     id: string;
     to: ProfileStatus;
@@ -3232,70 +3262,126 @@ export const operationalProfileVersionsRepo = {
     | { ok: true; updated: AgentOperationalProfileVersion }
     | { ok: false; reason: 'not_found' | 'invalid_transition' | 'already_has_active' | 'terminal' }
   > {
-    const row = await operationalProfileVersionsRepo.getById(args.id);
-    if (!row) return { ok: false, reason: 'not_found' };
-
-    const from = row.status as ProfileStatus;
-    if (from === 'rolled_back') return { ok: false, reason: 'terminal' };
-    if (from === args.to) return { ok: false, reason: 'invalid_transition' };
-
-    const allowed: Record<string, readonly string[]> = {
-      proposed: ['active', 'frozen', 'rolled_back'],
-      active: ['frozen', 'rolled_back'],
-      frozen: ['active', 'rolled_back'],
-    };
-    if (!allowed[from]?.includes(args.to)) {
-      return { ok: false, reason: 'invalid_transition' };
-    }
-
-    if (args.to === 'active') {
-      const active = await operationalProfileVersionsRepo.getActive();
-      if (active && active.id !== row.id) {
-        return { ok: false, reason: 'already_has_active' };
-      }
-    }
-
-    const now = new Date();
-    const patch: Record<string, unknown> = { status: args.to };
-    if (args.to === 'active') {
-      // approved_at é definido na primeira vez que se aprova; re-ativações
-      // a partir de frozen preservam o approved_at original.
-      if (!row.approved_at) {
-        patch.approved_at = now;
-        if (args.approved_by) patch.approved_by = args.approved_by;
-      }
-      patch.activated_at = now;
-    } else if (args.to === 'frozen') {
-      patch.frozen_at = now;
-    } else if (args.to === 'rolled_back') {
-      patch.rolled_back_at = now;
-      patch.rollback_reason = args.rollback_reason ?? null;
-    }
-
-    // [P86-C3] tenant-scoped write predicate: even though `getById` above
-    // already filtered by tenant_id/agent_id, the actual UPDATE must
-    // include them in WHERE as defense-in-depth (an alert UUID alone is
-    // not enough authorization to mutate identity in a different tenant
-    // context). This is the inviolable tenant isolation invariant.
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
-    const [updated] = await db
-      .update(agent_operational_profile_versions)
-      .set(patch as Partial<typeof agent_operational_profile_versions.$inferInsert>)
-      .where(
-        and(
-          eq(agent_operational_profile_versions.id, args.id),
-          eq(agent_operational_profile_versions.tenant_id, tenant_id),
-          eq(agent_operational_profile_versions.agent_id, agent_id),
-        ),
-      )
-      .returning();
-    if (!updated) {
-      // Could only happen if tenant context changed between the read above
-      // and the update — treat as not_found to keep the contract.
-      return { ok: false, reason: 'not_found' };
-    }
-    return { ok: true, updated };
+
+    return await withTx(async (tx) => {
+      // (0) Lock the parent `agents` row FIRST so we serialize against every
+      //     OTHER writer that touches `(tenant, agent)` profile state
+      //     (`approveAndActivateAtomic`, `proposeAndAuditAtomic`,
+      //     `seedNewActiveAtomic`, `operationalProfileVersionsRepo.create`).
+      //     Round 4 (#177): closes the seed-vs-drift `transition` race.
+      const agentLocked = await lockParentAgent(tx, tenant_id, agent_id);
+      if (!agentLocked) {
+        // Agent was deleted between caller's read and this lock. Treat as
+        // not_found to preserve the existing contract.
+        return { ok: false as const, reason: 'not_found' as const };
+      }
+
+      // (1) Re-read the target row INSIDE the tx + behind the parent lock so
+      //     post-lock state drives the validation. `for('update')` on the row
+      //     itself is defense-in-depth (a future codepath that bypasses
+      //     `lockParentAgent` but still does row-level locks would still
+      //     serialize with us).
+      const rows = await tx
+        .select()
+        .from(agent_operational_profile_versions)
+        .where(
+          and(
+            eq(agent_operational_profile_versions.id, args.id),
+            eq(agent_operational_profile_versions.tenant_id, tenant_id),
+            eq(agent_operational_profile_versions.agent_id, agent_id),
+          ),
+        )
+        .for('update')
+        .limit(1);
+      const row = rows[0];
+      if (!row) return { ok: false as const, reason: 'not_found' as const };
+
+      const from = row.status as ProfileStatus;
+      if (from === 'rolled_back') return { ok: false as const, reason: 'terminal' as const };
+      if (from === args.to) return { ok: false as const, reason: 'invalid_transition' as const };
+
+      const allowed: Record<string, readonly string[]> = {
+        proposed: ['active', 'frozen', 'rolled_back'],
+        active: ['frozen', 'rolled_back'],
+        frozen: ['active', 'rolled_back'],
+      };
+      if (!allowed[from]?.includes(args.to)) {
+        return { ok: false as const, reason: 'invalid_transition' as const };
+      }
+
+      if (args.to === 'active') {
+        // Re-read inside the tx + behind the parent lock so a concurrent
+        // approve/seed that landed before we acquired the lock is visible.
+        const activeRows = await tx
+          .select()
+          .from(agent_operational_profile_versions)
+          .where(
+            and(
+              eq(agent_operational_profile_versions.tenant_id, tenant_id),
+              eq(agent_operational_profile_versions.agent_id, agent_id),
+              eq(agent_operational_profile_versions.status, 'active'),
+            ),
+          )
+          .limit(1);
+        const active = activeRows[0];
+        if (active && active.id !== row.id) {
+          return { ok: false as const, reason: 'already_has_active' as const };
+        }
+      }
+
+      const now = new Date();
+      const patch: Record<string, unknown> = { status: args.to };
+      if (args.to === 'active') {
+        // approved_at é definido na primeira vez que se aprova; re-ativações
+        // a partir de frozen preservam o approved_at original.
+        if (!row.approved_at) {
+          patch.approved_at = now;
+          if (args.approved_by) patch.approved_by = args.approved_by;
+        }
+        patch.activated_at = now;
+      } else if (args.to === 'frozen') {
+        patch.frozen_at = now;
+      } else if (args.to === 'rolled_back') {
+        patch.rolled_back_at = now;
+        patch.rollback_reason = args.rollback_reason ?? null;
+      }
+
+      // [P86-C3] tenant-scoped write predicate: even though the SELECT above
+      // already filtered by tenant_id/agent_id, the actual UPDATE must
+      // include them in WHERE as defense-in-depth (an alert UUID alone is
+      // not enough authorization to mutate identity in a different tenant
+      // context). This is the inviolable tenant isolation invariant.
+      //
+      // Round 4 (#177): also include `status = from` in the WHERE so a
+      // concurrent state change (under READ COMMITTED a snapshot inversion
+      // is theoretically possible even with FOR UPDATE if a future writer
+      // bypasses the parent lock) cannot be silently overwritten. If the
+      // status changed between our locked re-read and the UPDATE, the
+      // UPDATE matches zero rows and we surface `invalid_transition` —
+      // the source predicate the caller asked about no longer holds.
+      const updated = await tx
+        .update(agent_operational_profile_versions)
+        .set(patch as Partial<typeof agent_operational_profile_versions.$inferInsert>)
+        .where(
+          and(
+            eq(agent_operational_profile_versions.id, args.id),
+            eq(agent_operational_profile_versions.tenant_id, tenant_id),
+            eq(agent_operational_profile_versions.agent_id, agent_id),
+            eq(agent_operational_profile_versions.status, from),
+          ),
+        )
+        .returning();
+      if (updated.length === 0) {
+        // Status changed concurrently between our locked re-read and this
+        // UPDATE — surface as invalid_transition (the source predicate the
+        // caller asked about no longer holds). Caller can re-read and decide
+        // whether to retry the transition from the new source state.
+        return { ok: false as const, reason: 'invalid_transition' as const };
+      }
+      return { ok: true as const, updated: updated[0]! };
+    });
   },
 
   /**
