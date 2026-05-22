@@ -76,7 +76,8 @@ const envSchema = z.object({
   REDIS_PORT: z.coerce.number().int().positive().default(6379),
 
   // LLM (primary). Operators wanting GPT / Llama / Gemini / DeepSeek route
-  // through OpenRouter — runtime model picked via /dashboard/llm-settings.
+  // through OpenRouter — runtime model picked via admin-ui /setup/llm-settings
+  // (founder-only, audited).
   LLM_PROVIDER: z.enum(['anthropic', 'openrouter']).default('anthropic'),
   ANTHROPIC_API_KEY: z.string().startsWith('sk-ant-').optional(),
   CLAUDE_MODEL_MAIN: z.string().default('claude-sonnet-4-6'),
@@ -221,7 +222,7 @@ All exits are **before** any external connection (DB, Redis, Anthropic). No part
 - [ ] `npm run dev` with empty `.env` exits in < 1s with a list of every missing required field.
 - [ ] `process.env` is referenced in exactly one file (`src/config/env.ts`).
 - [ ] Logs contain no API keys after running a sample interaction (verified by grep on log fixtures).
-- [ ] Switching `LLM_PROVIDER` between `anthropic` and `openrouter` requires only env change + restart, no code edit. Once on `openrouter`, switching individual models is operator-driven via `/dashboard/llm-settings` (no restart).
+- [ ] Switching `LLM_PROVIDER` between `anthropic` and `openrouter` requires only env change + restart, no code edit. Once on `openrouter`, switching individual models is operator-driven via the admin-ui at `/setup/llm-settings` (founder-only, no restart, audited).
 - [ ] Tests cover: missing field, invalid URL, cross-field violation, owner==Maia phone collision.
 
 ## 10. References

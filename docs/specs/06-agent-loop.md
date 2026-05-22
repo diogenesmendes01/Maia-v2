@@ -260,9 +260,9 @@ Uses `@anthropic-ai/sdk`. Tool use via the native Tools API. Prompt caching is e
 
 ### 8.3 OpenRouter (multi-provider gateway)
 
-Uses the `openai` SDK pointed at `https://openrouter.ai/api/v1`. Tool use via OpenAI Function Calling (OpenRouter standardises the surface across upstream models). The provider adapter (`toOpenAIMessages` / `toOpenAITools` / `fromOpenAIResponse` in `src/lib/claude.ts`) translates Anthropic-style messages to/from OpenAI Chat Completions. Active when `LLM_PROVIDER=openrouter`. The actual model is read at call time from `agent_facts` (`escopo='global'`, `chave='llm.model.main'|'llm.model.fast'`) with env-var fallback (`OPENROUTER_MODEL_MAIN` / `OPENROUTER_MODEL_FAST`). Operator changes the model from `/dashboard/llm-settings` and the next ReAct turn uses the new value — no restart.
+Uses the `openai` SDK pointed at `https://openrouter.ai/api/v1`. Tool use via OpenAI Function Calling (OpenRouter standardises the surface across upstream models). The provider adapter (`toOpenAIMessages` / `toOpenAITools` / `fromOpenAIResponse` in `src/lib/claude.ts`) translates Anthropic-style messages to/from OpenAI Chat Completions. Active when `LLM_PROVIDER=openrouter`. The actual model is read at call time from `agent_facts` (`escopo='global'`, `chave='llm.model.main'|'llm.model.fast'`) with env-var fallback (`OPENROUTER_MODEL_MAIN` / `OPENROUTER_MODEL_FAST`). Operator changes the model from the admin-ui at `/setup/llm-settings` (founder-only, audited) and the next ReAct turn uses the new value — no restart.
 
-Models without tool-calling are filtered out of the dashboard dropdown (the agent loop requires tools).
+Models without tool-calling are filtered out of the admin-ui dropdown (the agent loop requires tools).
 
 ## 9. Fallback chain
 

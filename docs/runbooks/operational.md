@@ -83,7 +83,7 @@ GROUP BY acao;
 **Mitigação**:
 
 1. **Confirmar é o provider**: `curl -i https://api.anthropic.com/v1/health` (Anthropic) ou `curl -i https://openrouter.ai/api/v1/health` (OpenRouter), sem auth.
-2. **Workaround imediato (LLM_PROVIDER=openrouter)**: troque o modelo em `/dashboard/llm-settings`. Se o main estava num provider down (ex: `anthropic/...`), pula pra outro (ex: `openai/gpt-5`, `google/gemini-2.5-pro`, `x-ai/grok-4.1-fast`). Próxima mensagem usa o modelo novo, sem restart.
+2. **Workaround imediato (LLM_PROVIDER=openrouter)**: troque o modelo no admin-ui em `/setup/llm-settings` (requer role `founder` — model switch é high-blast-radius, audited atomicamente). Se o main estava num provider down (ex: `anthropic/...`), pula pra outro (ex: `openai/gpt-5`, `google/gemini-2.5-pro`, `x-ai/grok-4.1-fast`). Próxima mensagem usa o modelo novo, sem restart. A mudança aparece em `admin_audit_log` com `action='llm_model_changed'` e o `change_summary` carrega `{ before, after, comment }` que o operador forneceu.
 3. **Workaround imediato (LLM_PROVIDER=anthropic)**: edite `LLM_PROVIDER=openrouter` no `.env` + setup `OPENROUTER_API_KEY`, restart. Funcionalmente equivalente ao circuit breaker, mais flexível.
 4. **Sem fallback configurado**: o circuit breaker já está aberto, agente responde "estou processando, volte em alguns minutos" (graceful). Aguarde provider voltar.
 4. **Cost spike** durante outage (retries): o `cost-monitor` cron pega no dia seguinte (alerta `Daily LLM cost USD…above…`).
