@@ -305,7 +305,13 @@ describe('renderOperationalProfile', () => {
     expect(result.system_prompt_block).toContain('Direta e profissional.');
   });
 
-  it('profile_body-only row (post-admin-ui setup) renders identity + voice', () => {
+  it('profile_body-only row (post-admin-ui setup, only priorities) renders identity + voice WITHOUT "## Princípios"', () => {
+    // Issue #189 — admin-ui-created profiles that populate identity.priorities
+    // but NOT identity.principles / core_immutable.principles must NOT have
+    // priorities synthesized as principles in the rendered prompt. Doing so
+    // (a) misrepresents operational labels as core value contracts in the
+    // system prompt, and (b) wired the valoresDetector to treat them as
+    // contracts, enabling user-visible auto-freezes.
     const version = buildVersion({
       // Legacy columns are missing (or empty {} from the column DEFAULT after
       // an old DB ran migration 061). The renderer falls back to profile_body.
@@ -328,11 +334,47 @@ describe('renderOperationalProfile', () => {
     });
     const result = renderOperationalProfile({ version });
     expect(result.system_prompt_block).toContain('Você é a Acme Bot.');
-    expect(result.system_prompt_block).toContain('## Princípios');
-    expect(result.system_prompt_block).toContain('- precisao');
-    expect(result.system_prompt_block).toContain('- clareza');
+    // No principles synthesized from priorities: section header is omitted
+    // entirely, and the priority labels do NOT appear in the prompt.
+    expect(result.system_prompt_block).not.toContain('## Princípios');
+    expect(result.system_prompt_block).not.toContain('- precisao');
+    expect(result.system_prompt_block).not.toContain('- clareza');
     expect(result.system_prompt_block).toContain('## Voz operacional');
     expect(result.system_prompt_block).toContain('caloroso e direto');
+  });
+
+  it('profile_body-only row with REAL identity.principles renders "## Princípios" (issue #189 positive)', () => {
+    // Mirror of the previous test: when identity.principles IS populated
+    // (i.e. the operator did configure real principles), the synthesized
+    // path lifts them into core_immutable.principles and the renderer
+    // produces the "## Princípios" section. This is the contract that
+    // distinguishes "true principles configured" from "only priorities".
+    const version = buildVersion({
+      profile_body: {
+        schema_version: 'v3.1.1-2026-05-15',
+        identity: {
+          role_descriptor: 'Você é a Acme Bot.',
+          voice: { tone: 'profissional', formality: 'medium', verbosity: 'concise' },
+          cognitive_limits: {
+            max_inference_depth: 3,
+            max_speculation_in_response: 0.2,
+            confidence_floor_for_action: 0.7,
+          },
+          priorities: ['precisao', 'clareza'],
+          principles: ['Honestidade acima de tudo.', 'Transparência sempre.'],
+          learned_voice_modifiers: [],
+        },
+        style: { language: 'pt-BR', rhythm: {} },
+        metadata: { effective_from: '', created_by: 'system', previous_version_id: null },
+      },
+    });
+    const result = renderOperationalProfile({ version });
+    expect(result.system_prompt_block).toContain('## Princípios');
+    expect(result.system_prompt_block).toContain('- Honestidade acima de tudo.');
+    expect(result.system_prompt_block).toContain('- Transparência sempre.');
+    // Priorities are NOT rendered as principles.
+    expect(result.system_prompt_block).not.toContain('- precisao');
+    expect(result.system_prompt_block).not.toContain('- clareza');
   });
 
   it('Drizzle-shaped row (legacy keys direct under profile_body) renders full legacy payload', () => {
