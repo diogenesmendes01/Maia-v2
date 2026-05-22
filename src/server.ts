@@ -2,7 +2,6 @@ import Fastify from 'fastify';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 import { checkAll, checkDb, checkRedis, checkWhatsApp } from '@/lib/healthcheck.js';
-import { registerDashboardRoutes } from '@/dashboard/index.js';
 import { renderPrometheus, setGaugeProvider } from '@/lib/metrics.js';
 import { isRedisConnected } from '@/lib/redis.js';
 import { isBaileysConnected } from '@/gateway/baileys.js';
@@ -33,8 +32,6 @@ export async function buildServer() {
     reply.header('content-type', 'text/plain; version=0.0.4');
     return renderPrometheus();
   });
-
-  await registerDashboardRoutes(app);
 
   // Setup pairing routes — mounted always (no flag gate). See spec §4.5.
   const { registerSetupRoutes } = await import('@/setup/index.js');

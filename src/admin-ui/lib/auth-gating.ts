@@ -185,6 +185,26 @@ export function oidcProviderEnabled(): boolean {
           `See issue #167.`,
       );
     }
+    // Codex Adversarial Review round 3 on PR #176, [high]: the length guard
+    // alone passes a long-but-public placeholder like the `changeme-...`
+    // value shipped in `.env.example`. Re-use the placeholder rejection
+    // already applied to NEXTAUTH_SECRET so an operator who forgets to
+    // rotate doesn't boot prod with a publicly-known confidential-client
+    // secret. The value itself is never echoed back — only the fact that
+    // it matched a known pattern.
+    if (isKnownPlaceholderSecret(clientSecret)) {
+      throw new Error(
+        `P8.5 auth: OIDC_CLIENT_SECRET matches a known placeholder pattern ` +
+          `(starts with "changeme-", contains "changeme", "__PLACEHOLDER", ` +
+          `"__SET_ME__", or "dev-secret-change-in-prod"). ` +
+          `Refusing to boot — placeholders ship in \`.env.example\` and are ` +
+          `publicly known, so a confidential-client OIDC secret using one is ` +
+          `forgeable by anyone with read access to the repo. ` +
+          `Rotate to a real IdP-issued secret (typically 32-64 random chars), ` +
+          `or unset OIDC_ISSUER to disable the OIDC provider entirely. ` +
+          `See PR #176 review.`,
+      );
+    }
     if (tenantSlugs.length === 0) {
       throw new Error(
         `P8.5 auth: OIDC_ISSUER is set but OIDC_TENANT_SLUGS is empty ` +
@@ -214,8 +234,46 @@ export function oidcProviderEnabled(): boolean {
 }
 
 /**
+ * Known placeholder patterns we ship in `.env.example` (and that operators
+ * commonly leave in place during a copy-and-tweak workflow). Even when these
+ * pass the >=32 char length guard they are PUBLIC strings — a deployment
+ * using one of them has a session-signing secret that anyone with read
+ * access to the repo can forge. We reject them outright in production.
+ *
+ * Match heuristics, in order of specificity:
+ *   1. The exact `.env.example` placeholder (`changeme-generate-with-...`).
+ *   2. The legacy dev fallback (`dev-secret-change-in-prod`).
+ *   3. Any value containing `changeme`, `change-me`, `change_me`,
+ *      `__PLACEHOLDER`, or `__SET_ME__` (case-insensitive).
+ *
+ * Keep the list short and specific — too-aggressive heuristics would falsely
+ * reject high-entropy operator secrets that happen to share a substring.
+ */
+const KNOWN_PLACEHOLDER_PATTERNS = [
+  /^changeme-/i,
+  /change-?me/i,
+  /change_me/i,
+  /__PLACEHOLDER/i,
+  /__SET_ME__/i,
+  // The legacy dev fallback is 25 chars and is normally caught by the
+  // length guard. Substring match (not just the exact 25-char string) so a
+  // deliberately-padded version (`dev-secret-change-in-prod-pad-to-32-chars`)
+  // is still rejected.
+  /dev-secret-change-in-prod/i,
+];
+
+function isKnownPlaceholderSecret(value: string): boolean {
+  return KNOWN_PLACEHOLDER_PATTERNS.some((rx) => rx.test(value));
+}
+
+/**
  * Resolve the runtime secret. Throws in production if NEXTAUTH_SECRET is too
  * weak (defense in depth — NextAuth itself doesn't enforce a length minimum).
+ *
+ * Codex Adversarial Review on PR #176, [critical]: also rejects known
+ * placeholder values that pass the length guard but are public strings
+ * (`.env.example` ships a 56-char `changeme-...` line that would otherwise
+ * boot prod silently with a forgeable session secret).
  */
 export function resolveSecret(): string {
   const secret = process.env.NEXTAUTH_SECRET;
@@ -224,6 +282,18 @@ export function resolveSecret(): string {
       throw new Error(
         'P8.5 auth: NEXTAUTH_SECRET must be set to a >=32-char value in production. ' +
           'Refusing to boot with a weak/default secret.',
+      );
+    }
+    if (isKnownPlaceholderSecret(secret)) {
+      throw new Error(
+        'P8.5 auth: NEXTAUTH_SECRET matches a known placeholder pattern ' +
+          '(starts with "changeme-", contains "changeme", "__PLACEHOLDER", ' +
+          '"__SET_ME__", or equals "dev-secret-change-in-prod"). ' +
+          'Refusing to boot — placeholders ship in `.env.example` and are ' +
+          'publicly known, so a session-signing secret using one is forgeable ' +
+          'by anyone with read access to the repo. ' +
+          'Generate a fresh one: `openssl rand -base64 48`. ' +
+          'See Codex review on PR #176.',
       );
     }
     return secret;

@@ -59,6 +59,40 @@ services:
       - maia_baileys_auth:/app/.baileys-auth
       - maia_media:/app/media
 
+  # admin-ui (Next.js) — separate container so Coolify routes
+  # `admin.${DOMAIN}` to :4000 while `${DOMAIN}` keeps pointing at the
+  # Fastify `app` service on :3000. Build context is the REPO ROOT because
+  # admin-ui imports `@/db/schema.ts`, `@/lib/*`, etc.
+  admin-ui:
+    build:
+      context: .
+      dockerfile: src/admin-ui/Dockerfile
+    container_name: maia-admin-ui
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      DATABASE_URL: postgres://${POSTGRES_USER:-maia}:${POSTGRES_PASSWORD:-maia}@postgres:5432/${POSTGRES_DB:-maia}
+      # NEXTAUTH_URL and NEXTAUTH_SECRET come from .env — they MUST be set
+      # for the admin-ui to boot in production (see `resolveSecret()` in
+      # src/admin-ui/lib/auth-gating.ts: refuses to boot with a <32-char
+      # secret in prod).
+      #
+      # AUTH_TRUST_HOST=true: required when running behind a reverse proxy
+      # (Coolify, nginx, ALB) that terminates TLS upstream. Without it,
+      # NextAuth v5 rejects any request whose Host header doesn't match
+      # NEXTAUTH_URL exactly — which is the normal case for proxied
+      # traffic (proxy passes localhost or internal hostname to the
+      # container). The proxy is now the trusted edge for host validation.
+      AUTH_TRUST_HOST: 'true'
+      TZ: America/Sao_Paulo
+    ports:
+      - "${ADMIN_UI_PORT:-4000}:4000"
+
 volumes:
   maia_pg_data:
   maia_redis_data:

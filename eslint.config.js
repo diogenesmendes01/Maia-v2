@@ -112,6 +112,10 @@ export default [
       'tmp-*/**',
       '.tmp-*.py',
       '.claude/**',
+      // Next.js build artifacts (admin-ui). The dev `next build` produces
+      // .next/{static,standalone,server}/*.js bundles that ESLint shouldn't
+      // try to type-check.
+      'src/admin-ui/.next/**',
     ],
   },
 
