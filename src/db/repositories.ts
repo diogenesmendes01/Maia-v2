@@ -1457,6 +1457,11 @@ export const tenantsRepo = {
     return rows[0] ?? null;
   },
 
+  // DEPRECATED for tRPC `tenants.create` — use `createWithAuditAtomic` instead
+  // so the tenant insert and `admin_audit_log` append commit together. Kept
+  // for callers that don't need an audit row (test fixtures + integration
+  // setup such as `tests/integration/tenant-isolation.spec.ts`). All new
+  // production code paths MUST go through `createWithAuditAtomic` (issue #184).
   async create(t: { id: string; nome: string; status?: string }): Promise<Tenant> {
     const [created] = await db.insert(tenants).values(t).returning();
     return created!;
@@ -1467,6 +1472,96 @@ export const tenantsRepo = {
   // truth para enumeração, sem RLS implícito.
   async list(): Promise<Tenant[]> {
     return db.select().from(tenants).orderBy(tenants.id);
+  },
+
+  /**
+   * Atomic tenant insert + admin_audit_log append.
+   *
+   * Codex Adversarial Review on PR #180 (issue #184) — `tenantsRepo.create`
+   * followed by a separate `adminAuditLogRepo.append` was not atomic: if the
+   * audit insert failed (or the request was interrupted) between the two
+   * statements, the tenant row was already committed but no forensic record
+   * existed. Retry then hit a duplicate-primary-key CONFLICT (`Tenant 'x'
+   * already exists`) and the `tenant_create` audit row was lost forever —
+   * violating the append-only mutation-trail invariant for `admin_audit_log`
+   * for tenant provisioning.
+   *
+   * This method follows the same pattern as `updateStatusAtomic` (PR #169,
+   * issue #165) and `agentsRepo.createWithSeedAndAudit` (PR #171, issue
+   * #166):
+   *   1. Open transaction.
+   *   2. INSERT into `tenants`.
+   *   3. INSERT into `admin_audit_log` inside the same tx — if this throws,
+   *      the tenant INSERT rolls back and no orphaned tenant exists.
+   *
+   * Returns a discriminated union so the router can map outcomes to TRPC
+   * codes without inspecting exceptions (matches the `updateStatusAtomic`
+   * shape).
+   */
+  async createWithAuditAtomic(input: {
+    tenant: {
+      id: string;
+      nome: string;
+      status?: string;
+    };
+    audit: {
+      tenant_id: string;
+      actor_id: string;
+      actor_role: string;
+    };
+  }): Promise<
+    | { ok: true; tenant: Tenant }
+    | { ok: false; reason: 'duplicate_id' }
+  > {
+    try {
+      return await withTx(async (tx) => {
+        // (1) Insert tenant row.
+        const [created] = await tx
+          .insert(tenants)
+          .values({
+            id: input.tenant.id,
+            nome: input.tenant.nome,
+            status: input.tenant.status ?? 'active',
+          })
+          .returning();
+        if (!created) {
+          // Should be unreachable — INSERT ... RETURNING either errors or
+          // returns the inserted row.
+          throw new TypedError(
+            'tenant_create_failed',
+            `INSERT returned no row for tenant ${input.tenant.id}`,
+          );
+        }
+
+        // (2) Audit in the SAME tx. If this throws, the tenant INSERT rolls
+        //     back — no orphaned tenant row, no missing audit record.
+        await tx.insert(admin_audit_log).values({
+          tenant_id: input.audit.tenant_id,
+          actor_id: input.audit.actor_id,
+          actor_role: input.audit.actor_role,
+          action: 'tenant_create',
+          resource_type: 'tenant',
+          resource_id: created.id,
+          change_summary: {
+            target_tenant_id: created.id,
+            nome: created.nome,
+            status: created.status,
+          },
+        });
+
+        return { ok: true as const, tenant: created };
+      });
+    } catch (err) {
+      // Map duplicate-primary-key violation (tenants.id is PRIMARY KEY) to a
+      // typed reason so the router can return CONFLICT without inspecting the
+      // pg error code. Concurrent racers (two founders trying to create the
+      // same id at once) BOTH see this branch — one wins the INSERT, the
+      // other's tx aborts with 23505 and rolls back as expected.
+      if ((err as { code?: string })?.code === '23505') {
+        return { ok: false as const, reason: 'duplicate_id' as const };
+      }
+      throw err;
+    }
   },
 
   // Admin UI setup: muda status do tenant (active|suspended). Não retorna nada
