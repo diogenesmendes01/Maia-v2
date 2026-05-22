@@ -16,14 +16,16 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { DriftType, DriftSeverity, DriftDecision } from '@/types/enums.js';
 import type { DriftEvidence } from '@/cognition/drift/types.js';
 
-const { transitionMock, createAlertMock } = vi.hoisted(() => ({
+const { transitionMock, createAlertMock, getCurrentActiveProfileIdMock } = vi.hoisted(() => ({
   transitionMock: vi.fn(),
   createAlertMock: vi.fn(),
+  getCurrentActiveProfileIdMock: vi.fn(),
 }));
 
 vi.mock('@/db/repositories.js', () => ({
   operationalProfileVersionsRepo: {
     transition: transitionMock,
+    getCurrentActiveProfileId: getCurrentActiveProfileIdMock,
   },
   driftAlertsRepo: {
     create: createAlertMock,
@@ -248,6 +250,7 @@ describe('decideAndApply', () => {
   beforeEach(() => {
     transitionMock.mockReset();
     createAlertMock.mockReset();
+    getCurrentActiveProfileIdMock.mockReset();
     defaultAlertMockImpl();
   });
 
@@ -891,5 +894,235 @@ describe('decideAndApply', () => {
     expect(out[0]!.applied_error).toBe('db timeout');
     expect(out[0]!.decision).toBe(DriftDecision.FROZEN);
     expect(createAlertMock).toHaveBeenCalledTimes(1);
+  });
+
+  // ---- Codex Adversarial Review of PR #182 round 4: cross-invocation escalation ----
+  //
+  // Round 2 collapse fixed intra-batch ordering (alto + critico in the SAME
+  // invocation). But two concurrent `decideAndApply` calls for the same agent
+  // can still race: an alto invocation freezes the active row first; the
+  // critico invocation arrives second, sees the row as `frozen`, and the
+  // `expected_from='active'` guard demotes its rollback to `applied=false`.
+  // The critical drift ends up `frozen` instead of `rolled_back`.
+  //
+  // Round 4 fix: on `stale + actual='frozen'` for a ROLLBACK winner, re-fetch
+  // the current active_profile_id:
+  //   - same id → escalate via retry `transition({to:'rolled_back',
+  //     expected_from:'frozen'})`. Log `drift.rollback.escalated`.
+  //   - different id → active was replaced. Skip with
+  //     `drift.skip.active_replaced` log.
+  //   - retry also stale/terminal → log `drift.skip.terminal_state`.
+
+  it('round 4 escalation: critico race vs concurrent freeze (same row) → retry with expected_from=frozen succeeds', async () => {
+    // CASE 1 from spec: an `alto` batch from another invocation froze v1
+    // between this engine's pre-lock read and the actual transition call.
+    // The first transition (to:'rolled_back', expected_from:'active') comes
+    // back stale with actual='frozen'. The engine then re-fetches the
+    // current active_profile_id, sees it's STILL PROFILE_ID (same row), and
+    // retries with expected_from='frozen' to escalate frozen → rolled_back.
+
+    // First transition: stale (actual='frozen').
+    transitionMock.mockResolvedValueOnce({
+      ok: false,
+      reason: 'stale',
+      expected_from: 'active',
+      actual: 'frozen',
+    });
+    // Re-fetch: same active id (concurrent freezer didn't replace the
+    // version, just froze it).
+    getCurrentActiveProfileIdMock.mockResolvedValueOnce(PROFILE_ID);
+    // Retry transition: ok (frozen → rolled_back is a valid transition).
+    transitionMock.mockResolvedValueOnce({
+      ok: true,
+      updated: { id: PROFILE_ID, status: 'rolled_back' },
+    });
+
+    const evCritico = makeEvidence(
+      DriftType.LINGUAGEM,
+      { offensive: true },
+      'critico cross-invocation evidence',
+    );
+
+    const out = await decideAndApply({
+      evidences: [evCritico],
+      active_profile_id: PROFILE_ID,
+    });
+
+    expect(out).toHaveLength(1);
+    expect(out[0]!.severity).toBe(DriftSeverity.CRITICO);
+    expect(out[0]!.decision).toBe(DriftDecision.ROLLBACK);
+    expect(out[0]!.applied).toBe(true);
+    expect(out[0]!.applied_error).toBeUndefined();
+    expect(out[0]!.alert_id).toMatch(/^alert-/);
+
+    // Two transition calls: first with expected_from='active' (stale),
+    // second with expected_from='frozen' (escalation).
+    expect(transitionMock).toHaveBeenCalledTimes(2);
+    expect(transitionMock.mock.calls[0]![0]).toMatchObject({
+      to: 'rolled_back',
+      expected_from: 'active',
+      approved_by: 'auto:drift_critico',
+    });
+    expect(transitionMock.mock.calls[1]![0]).toMatchObject({
+      to: 'rolled_back',
+      expected_from: 'frozen',
+      approved_by: 'auto:drift_critico',
+      rollback_reason: 'critico cross-invocation evidence',
+    });
+
+    // Re-fetch happened exactly once between the two transitions.
+    expect(getCurrentActiveProfileIdMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('round 4 escalation: critico race vs concurrent seed (active was REPLACED) → skip, no retry', async () => {
+    // CASE 2 from spec: a concurrent `seedNewActiveAtomic` froze v1 and
+    // seeded v2 as the new active. The first transition comes back stale
+    // with actual='frozen'. The engine re-fetches the current active id and
+    // sees it's now PROFILE_ID_V2 (DIFFERENT from PROFILE_ID/v1). The
+    // evidence was scored against v1; rolling back v1 is meaningless when
+    // v2 is the agent's current contract surface. Skip with
+    // `drift.skip.active_replaced`; the next drift cycle will re-evaluate
+    // against v2.
+
+    transitionMock.mockResolvedValueOnce({
+      ok: false,
+      reason: 'stale',
+      expected_from: 'active',
+      actual: 'frozen',
+    });
+    // Re-fetch: DIFFERENT id → active was replaced.
+    getCurrentActiveProfileIdMock.mockResolvedValueOnce('prof-active-v2');
+
+    const evCritico = makeEvidence(
+      DriftType.LINGUAGEM,
+      { offensive: true },
+      'critico vs replaced active',
+    );
+
+    const out = await decideAndApply({
+      evidences: [evCritico],
+      active_profile_id: PROFILE_ID,
+    });
+
+    expect(out).toHaveLength(1);
+    expect(out[0]!.severity).toBe(DriftSeverity.CRITICO);
+    expect(out[0]!.decision).toBe(DriftDecision.ROLLBACK);
+    expect(out[0]!.applied).toBe(false);
+    expect(out[0]!.applied_error).toBe(
+      'stale:expected=active,actual=frozen;active_replaced',
+    );
+    expect(out[0]!.alert_id).toMatch(/^alert-/);
+
+    // Only ONE transition call — escalation NOT attempted because v1 is no
+    // longer the current contract surface.
+    expect(transitionMock).toHaveBeenCalledTimes(1);
+    expect(getCurrentActiveProfileIdMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('round 4 escalation: terminal state (third invocation, row already rolled_back) → no-op, log terminal_state', async () => {
+    // CASE 3 from spec: another worker already escalated v1 to rolled_back
+    // between this engine's stale observation and the retry. The retry
+    // `transition({to:'rolled_back', expected_from:'frozen'})` also sees
+    // stale (actual='rolled_back') OR terminal. The desired terminal state
+    // is achieved (by someone else), so mark applied=false with a log line
+    // pointing at the converging path.
+
+    transitionMock.mockResolvedValueOnce({
+      ok: false,
+      reason: 'stale',
+      expected_from: 'active',
+      actual: 'frozen',
+    });
+    getCurrentActiveProfileIdMock.mockResolvedValueOnce(PROFILE_ID);
+    // Retry transition: another worker already rolled it back; transition
+    // returns terminal (the state machine treats rolled_back as terminal).
+    transitionMock.mockResolvedValueOnce({
+      ok: false,
+      reason: 'terminal',
+    });
+
+    const evCritico = makeEvidence(
+      DriftType.LINGUAGEM,
+      { offensive: true },
+      'critico vs already-rolled-back row',
+    );
+
+    const out = await decideAndApply({
+      evidences: [evCritico],
+      active_profile_id: PROFILE_ID,
+    });
+
+    expect(out).toHaveLength(1);
+    expect(out[0]!.applied).toBe(false);
+    expect(out[0]!.applied_error).toBe('terminal');
+
+    // Two transitions, one re-fetch — same shape as CASE 1, just no success
+    // on the retry.
+    expect(transitionMock).toHaveBeenCalledTimes(2);
+    expect(getCurrentActiveProfileIdMock).toHaveBeenCalledTimes(1);
+    expect(transitionMock.mock.calls[1]![0].expected_from).toBe('frozen');
+  });
+
+  it('round 4 escalation: FROZEN winner (alto) racing concurrent freeze → no escalation, original stale path', async () => {
+    // Belt-and-suspenders: an ALTO winner (decision=FROZEN) that races a
+    // concurrent freeze does NOT trigger escalation — the row is already
+    // at the desired state, so the original `stale:expected=active,
+    // actual=frozen` outcome is correct (no retry, no re-fetch).
+    transitionMock.mockResolvedValueOnce({
+      ok: false,
+      reason: 'stale',
+      expected_from: 'active',
+      actual: 'frozen',
+    });
+
+    const evAlto = makeEvidence(DriftType.VALORES, { violated_principles: [0] });
+
+    const out = await decideAndApply({
+      evidences: [evAlto],
+      active_profile_id: PROFILE_ID,
+    });
+
+    expect(out[0]!.severity).toBe(DriftSeverity.ALTO);
+    expect(out[0]!.decision).toBe(DriftDecision.FROZEN);
+    expect(out[0]!.applied).toBe(false);
+    expect(out[0]!.applied_error).toBe('stale:expected=active,actual=frozen');
+
+    // No re-fetch, no retry.
+    expect(transitionMock).toHaveBeenCalledTimes(1);
+    expect(getCurrentActiveProfileIdMock).not.toHaveBeenCalled();
+  });
+
+  it('round 4 escalation: re-fetch helper THROWS → conservative skip with refetch_failed in error', async () => {
+    // Defensive coverage: if `getCurrentActiveProfileId` itself fails (DB
+    // outage, network glitch), we cannot decide between CASE 1 (escalate)
+    // and CASE 2 (skip). The engine must NOT retry blindly — that could
+    // rollback a replaced active. Mark applied=false with both the
+    // original stale signal AND the refetch failure for forensics.
+
+    transitionMock.mockResolvedValueOnce({
+      ok: false,
+      reason: 'stale',
+      expected_from: 'active',
+      actual: 'frozen',
+    });
+    getCurrentActiveProfileIdMock.mockRejectedValueOnce(
+      new Error('connection reset'),
+    );
+
+    const evCritico = makeEvidence(DriftType.LINGUAGEM, { offensive: true });
+
+    const out = await decideAndApply({
+      evidences: [evCritico],
+      active_profile_id: PROFILE_ID,
+    });
+
+    expect(out[0]!.applied).toBe(false);
+    expect(out[0]!.applied_error).toContain('stale:expected=active,actual=frozen');
+    expect(out[0]!.applied_error).toContain('refetch_failed');
+    expect(out[0]!.applied_error).toContain('connection reset');
+
+    // Only the first transition attempted — no retry without a confirmed
+    // re-fetch.
+    expect(transitionMock).toHaveBeenCalledTimes(1);
   });
 });
