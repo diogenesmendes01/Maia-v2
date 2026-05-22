@@ -3225,8 +3225,14 @@ export const operationalProfileVersionsRepo = {
   //                        OR source status changed concurrently between read
   //                        and write (status predicate guard fired)
   // - already_has_active:  to:'active' mas outra row ativa existe para (tenant,agent)
+  // - stale:               caller passed `expected_from` and the row's status
+  //                        changed between caller's pre-lock read and our
+  //                        post-lock re-read (concurrent writer won the lock
+  //                        first and committed a transition the caller never
+  //                        saw). Returned with `actual` so the caller can
+  //                        decide whether to retry against the new state.
   //
-  // Codex Adversarial Review of PR #171 round 4 (issue #177) — until this
+  // Codex Adversarial Review of PR #171 round 4 (issue #177) — until that
   // refactor, `transition` was the LAST writer of
   // `agent_operational_profile_versions` that bypassed the parent-agent
   // `FOR UPDATE` lock established by `acquireNextVersionForAgent` /
@@ -3238,7 +3244,7 @@ export const operationalProfileVersionsRepo = {
   // back/frozen → seed re-writes A as `frozen` using only `id/tenant/agent`
   // → silently undoes `rolled_back` (the terminal state per the doccomment).
   //
-  // Fix is twofold:
+  // Round 4 fix was twofold:
   //   (a) Wrap the whole transition in `withTx` and acquire `lockParentAgent`
   //       as the FIRST step. Every other writer of this table now goes
   //       through the same lock target (`approveAndActivateAtomic`,
@@ -3253,14 +3259,52 @@ export const operationalProfileVersionsRepo = {
   //       status changed concurrently, the UPDATE matches zero rows and we
   //       surface `invalid_transition` (the source predicate the caller
   //       asked about no longer holds) instead of silently overwriting it.
+  //
+  // Codex Adversarial Review of PR #182 round 1 (issue #177 follow-up) —
+  // the parent lock + status-predicate guard prevent the silent overwrite,
+  // but they did NOT prevent a different fail-open: if `seedNewActiveAtomic`
+  // wins the lock first (freezing the old active A and seeding a new active
+  // B), a waiting drift `transition({to:'rolled_back'})` caller wakes up,
+  // re-reads A as `frozen`, the state machine still permits `frozen →
+  // rolled_back`, so the UPDATE succeeds and `transition` returns `ok:true`.
+  // The decision engine then marks the rollback as APPLIED even though the
+  // newly-seeded version B remains `active` — the rollback was NOT applied
+  // to the currently-active row. Critical rollback fails open with false
+  // success.
+  //
+  // Fix: a typed `expected_from` parameter. Callers that have a snapshot
+  // expectation of the source state (drift engine: `active`; priorities
+  // seed promotion: `proposed`) MUST pass it; after the parent lock + row
+  // re-read, if the row's status no longer matches, we surface
+  // `{ok:false, reason:'stale', expected_from, actual}` so the caller can
+  // observe the race explicitly and decide (retry against the new active,
+  // log+skip, etc) instead of silently completing the wrong write.
+  //
+  // The parameter is OPTIONAL for backwards-compat with sequential callers
+  // (unit tests, single-threaded admin scripts) that genuinely do not have
+  // a snapshot expectation. Concurrent callers MUST pass it — see the
+  // `decision-engine.ts` and `proposal-generator.ts` usages for examples.
   async transition(args: {
     id: string;
     to: ProfileStatus;
+    /**
+     * The status the caller saw when they decided to transition. After we
+     * take the parent-agent lock and re-read the row, if the status changed
+     * (a concurrent writer landed first), we return `{ok:false,
+     * reason:'stale'}` instead of applying the transition from a state the
+     * caller never saw. REQUIRED for concurrent callers (drift engine,
+     * priorities seed, any background worker). Optional only for
+     * sequential single-writer callers (unit tests, admin scripts running
+     * with no concurrent traffic) where the snapshot expectation is
+     * implicitly satisfied.
+     */
+    expected_from?: ProfileStatus;
     approved_by?: string;
     rollback_reason?: string;
   }): Promise<
     | { ok: true; updated: AgentOperationalProfileVersion }
     | { ok: false; reason: 'not_found' | 'invalid_transition' | 'already_has_active' | 'terminal' }
+    | { ok: false; reason: 'stale'; expected_from: ProfileStatus; actual: ProfileStatus }
   > {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
@@ -3299,6 +3343,24 @@ export const operationalProfileVersionsRepo = {
       if (!row) return { ok: false as const, reason: 'not_found' as const };
 
       const from = row.status as ProfileStatus;
+
+      // (1.5) Codex Adversarial Review of PR #182 round 1 fail-open guard:
+      //       if the caller passed an `expected_from`, enforce that the
+      //       row is STILL in that state under our lock. If a concurrent
+      //       writer (e.g. seedNewActiveAtomic, approveAndActivateAtomic)
+      //       transitioned the row to a different state while we waited
+      //       for the lock, we surface `stale` so the caller can react
+      //       explicitly rather than silently completing a write against
+      //       a state they never observed.
+      if (args.expected_from !== undefined && from !== args.expected_from) {
+        return {
+          ok: false as const,
+          reason: 'stale' as const,
+          expected_from: args.expected_from,
+          actual: from,
+        };
+      }
+
       if (from === 'rolled_back') return { ok: false as const, reason: 'terminal' as const };
       if (from === args.to) return { ok: false as const, reason: 'invalid_transition' as const };
 

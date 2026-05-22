@@ -13,8 +13,13 @@
  *        alto    → frozen
  *        critico → rollback
  *  3) Para `frozen`/`rollback`, transiciona o perfil ativo via
- *     `operationalProfileVersionsRepo.transition`. Falhas no transition NÃO
- *     bloqueiam o pipeline: marcam `applied=false` + `applied_error`.
+ *     `operationalProfileVersionsRepo.transition` passando
+ *     `expected_from: 'active'` para que uma corrida concorrente que troque
+ *     o active sob o lock (ex.: priorities seed promovendo nova versão)
+ *     surfaça como `{ok:false, reason:'stale'}` em vez de aplicar o rollback
+ *     no row antigo já-congelado. Falhas no transition NÃO bloqueiam o
+ *     pipeline: marcam `applied=false` + `applied_error` (com o estado
+ *     observado quando `stale`).
  *  4) Persiste SEMPRE 1 row em `agent_drift_alerts` (incluindo decisões
  *     baixo/medio que não tocam no perfil). Falhas no `create` do alert são
  *     concatenadas em `applied_error` mas não interrompem as evidências
@@ -269,15 +274,33 @@ export async function decideAndApply(args: {
       (decision === DriftDecision.FROZEN || decision === DriftDecision.ROLLBACK)
     ) {
       try {
+        // Codex Adversarial Review of PR #182 round 1: pass `expected_from:
+        // 'active'` so a concurrent `seedNewActiveAtomic` that won the
+        // parent-agent lock first (freezing `active_profile_id` and seeding
+        // a new active row) doesn't cause this caller to silently transition
+        // the FROZEN old row to `rolled_back` while the NEW active row keeps
+        // running. With `expected_from`, that race surfaces as
+        // `{ok:false, reason:'stale'}` and we mark the rollback as NOT
+        // applied — the operator/next drift cycle will see the new active
+        // and can re-evaluate against fresh evidence. The alert was already
+        // persisted so the attempt is still auditable.
         const r = await operationalProfileVersionsRepo.transition({
           id: args.active_profile_id,
           to: decision === DriftDecision.FROZEN ? 'frozen' : 'rolled_back',
+          expected_from: 'active',
           approved_by: `auto:drift_${severity}`,
           rollback_reason:
             decision === DriftDecision.ROLLBACK ? ev.evidence_summary : undefined,
         });
         applied = r.ok;
-        if (!r.ok) applied_error = r.reason;
+        if (!r.ok) {
+          applied_error = r.reason === 'stale'
+            // Encode the observed-state in the error string so postmortems
+            // can see WHY the rollback was skipped (active row was already
+            // frozen/rolled_back/replaced by a concurrent writer).
+            ? `stale:expected=${r.expected_from},actual=${r.actual}`
+            : r.reason;
+        }
       } catch (e) {
         applied_error = e instanceof Error ? e.message : String(e);
       }

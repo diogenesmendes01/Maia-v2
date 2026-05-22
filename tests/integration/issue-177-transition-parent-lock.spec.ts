@@ -79,16 +79,30 @@ if (SHOULD_RUN) {
 
 d('operationalProfileVersionsRepo.transition (parent-agent lock, real DB)', () => {
   /**
-   * Scenario A (the canonical #177 race): `seedNewActiveAtomic` racing
-   * `transition({ to: 'rolled_back' })`. Pre-fix, the seed could re-write
-   * the just-rolled-back row as `frozen` using only `{id, tenant, agent}`,
-   * silently undoing the terminal state. Post-fix, both serialize on the
-   * parent agent FOR UPDATE lock and the terminal `rolled_back` state is
-   * preserved (either the seed runs first and produces v2 active + v1
-   * frozen, or `transition` runs first and the seed inherits a
-   * `rolled_back` row that it then freezes into a NEW v2 active).
+   * Scenario A (the canonical #177 race + Codex PR #182 round 1 regression):
+   * `seedNewActiveAtomic` racing the drift engine's
+   * `transition({ to: 'rolled_back', expected_from: 'active' })`.
+   *
+   * Pre-#177 fix: the seed could re-write the just-rolled-back row as
+   * `frozen` using only `{id, tenant, agent}`, silently undoing the
+   * terminal state.
+   *
+   * Pre-PR #182 round 1 fix: the seed wins the parent-agent lock, freezes
+   * v1, seeds v2 as active, commits. The waiting drift `transition` then
+   * acquires the lock, re-reads v1 as `frozen`, finds `frozen →
+   * rolled_back` is a valid state-machine edge, and returns `ok:true` —
+   * the decision engine then records the rollback as APPLIED even though
+   * the live (v2) active row was untouched. Critical rollback fails open
+   * with false success.
+   *
+   * Post-fix: the drift engine passes `expected_from: 'active'`. When
+   * seed wins the lock first and freezes v1, the waiting transition
+   * re-reads v1 as `frozen`, sees `frozen !== expected 'active'`, and
+   * returns `{ok:false, reason:'stale', expected_from:'active',
+   * actual:'frozen'}`. v2 (the new active) is NOT marked rolled_back —
+   * the regression is closed.
    */
-  it('seedNewActiveAtomic + transition(rolled_back) concurrent → serialized, terminal preserved', async () => {
+  it('seedNewActiveAtomic + transition(rolled_back, expected_from:active) → seed-wins surfaces stale, no false rollback', async () => {
     const { operationalProfileVersionsRepo } = await import('../../src/db/repositories.js');
     const { runWithTenantContext } = await import('../../src/db/tenant-context.js');
 
@@ -115,6 +129,7 @@ d('operationalProfileVersionsRepo.transition (parent-agent lock, real DB)', () =
       operationalProfileVersionsRepo.transition({
         id: v1Id,
         to: 'rolled_back',
+        expected_from: 'active',
         rollback_reason: 'drift_critical_concurrent_with_seed',
       }),
     );
@@ -146,12 +161,13 @@ d('operationalProfileVersionsRepo.transition (parent-agent lock, real DB)', () =
       }
     }
 
-    // CRITICAL invariant from #177: the rolled_back terminal state is
-    // preserved if the drift transition won the race. Read v1's final
-    // state — if `transition` won the lock first, v1 MUST be `rolled_back`
-    // (and stay that way even if seed ran after). If `seed` won first, v1
-    // is `frozen` and a v2 is active. Either way is acceptable; what is
-    // NOT acceptable is v1 being `frozen` AFTER a successful rollback.
+    // CRITICAL invariant from #177 + PR #182 round 1: read v1's final
+    // state. If `transition` won the lock first, v1 MUST be `rolled_back`
+    // (and stay that way even if seed ran after, since seed checks for
+    // stale active). If `seed` won first, v1 is `frozen` (NOT
+    // `rolled_back`) and a v2 is active — AND transition MUST have
+    // returned `stale` (not silently flipped v1 to `rolled_back` via the
+    // valid frozen→rolled_back edge).
     const c2 = await pool.connect();
     try {
       const r = await c2.query<{ id: string; version: number; status: string }>(
@@ -168,20 +184,35 @@ d('operationalProfileVersionsRepo.transition (parent-agent lock, real DB)', () =
 
       if (transitionRes.status === 'fulfilled' && transitionRes.value.ok) {
         // Drift transition won the race → v1 MUST stay rolled_back.
-        // Pre-fix bug: seed would re-write v1 to 'frozen' silently.
         expect(v1!.status).toBe('rolled_back');
+      } else if (
+        transitionRes.status === 'fulfilled' &&
+        !transitionRes.value.ok &&
+        transitionRes.value.reason === 'stale'
+      ) {
+        // Seed won the race → status changed under transition's lock to
+        // `frozen`, expected_from='active' fires `stale` cleanly.
+        // CRITICAL REGRESSION CHECK (Codex PR #182 round 1): v1 must be
+        // 'frozen' (NOT 'rolled_back' — that would mean transition
+        // fail-opened on the frozen→rolled_back edge). v2 is now active.
+        expect(transitionRes.value.expected_from).toBe('active');
+        expect(transitionRes.value.actual).toBe('frozen');
+        expect(v1!.status).toBe('frozen');
+        const v2 = r.rows.find((row) => row.status === 'active');
+        expect(v2).toBeDefined();
+        expect(v2!.version).toBe(2);
+        // The new active was NOT marked rolled_back. This is the entire
+        // point of the `expected_from` contract.
+        expect(v2!.status).toBe('active');
       } else if (
         transitionRes.status === 'fulfilled' &&
         !transitionRes.value.ok &&
         transitionRes.value.reason === 'invalid_transition'
       ) {
-        // Seed won the race → status changed under transition's lock, so
-        // it cleanly returned invalid_transition. v1 is now 'frozen' and
-        // there's a v2 'active'.
+        // Defense-in-depth path: status predicate guard fired before
+        // expected_from check (very narrow window). v1 is frozen, v2 is
+        // active. Same end state, also acceptable.
         expect(v1!.status).toBe('frozen');
-        const v2 = r.rows.find((row) => row.status === 'active');
-        expect(v2).toBeDefined();
-        expect(v2!.version).toBe(2);
       } else {
         // Catch-all: log the actual state so a regression is obvious.
         throw new Error(
@@ -231,6 +262,7 @@ d('operationalProfileVersionsRepo.transition (parent-agent lock, real DB)', () =
       operationalProfileVersionsRepo.transition({
         id: v1Id,
         to: 'frozen',
+        expected_from: 'active',
       }),
     );
 
@@ -319,10 +351,18 @@ d('operationalProfileVersionsRepo.transition (parent-agent lock, real DB)', () =
       actor_role: 'founder',
       comment: 'approve concurrent with rollback',
     });
+    // Codex Adversarial Review of PR #182 round 1: this test originally
+    // asserted single-winner but was flaky — pre-fix, if approve won the
+    // lock first the row became `active`, and the waiting transition then
+    // saw `active` and was allowed to transition active→rolled_back
+    // (a valid state-machine edge), so BOTH succeeded. With the new
+    // `expected_from` contract the caller declares "I expected proposed"
+    // and the post-lock re-read catches the state divergence cleanly.
     const transitionCall = runWithTenantContext({ tenant_id: T, agent_id: A }, async () =>
       operationalProfileVersionsRepo.transition({
         id: proposedId,
         to: 'rolled_back',
+        expected_from: 'proposed',
         rollback_reason: 'concurrent rollback',
       }),
     );
@@ -336,11 +376,8 @@ d('operationalProfileVersionsRepo.transition (parent-agent lock, real DB)', () =
     if (approveRes.status === 'fulfilled' && approveRes.value.ok) approveWon = true;
     if (transitionRes.status === 'fulfilled' && transitionRes.value.ok) transitionWon = true;
 
-    // Exactly one writer must have succeeded — both succeeding would mean
-    // the row was first activated, then rolled back, OR transitioned
-    // proposed→rolled_back before approval saw it (round 4 #177 says the
-    // approve sees the locked row and gets invalid_source_status). Both
-    // outcomes single-winner are the lock-correctness invariant.
+    // Exactly one writer must have succeeded — single-winner is now the
+    // hard contract once `expected_from` is enforced.
     expect(approveWon !== transitionWon).toBe(true);
 
     // Whichever lost must have surfaced a typed reason (NOT a thrown
@@ -359,15 +396,16 @@ d('operationalProfileVersionsRepo.transition (parent-agent lock, real DB)', () =
     if (!transitionWon) {
       expect(transitionRes.status).toBe('fulfilled');
       if (transitionRes.status === 'fulfilled' && !transitionRes.value.ok) {
-        // Expected: transition sees the locked row in `active` →
-        // `invalid_transition` (active→rolled_back is allowed, BUT the
-        // status changed under the lock so the predicate guard fires —
-        // OR it transitions cleanly if approve hadn't committed yet).
-        // Either typed reason is acceptable; what we forbid is a thrown
-        // duplicate-key.
-        expect(['invalid_transition', 'not_found', 'terminal']).toContain(
-          transitionRes.value.reason,
-        );
+        // Expected (post-fix): approve won the lock first, committed the
+        // proposed→active transition, and our `expected_from:'proposed'`
+        // catches the state divergence → `stale` with actual='active'.
+        // `not_found` is still acceptable if approve somehow deleted/
+        // remapped the id (defensive).
+        expect(['stale', 'not_found']).toContain(transitionRes.value.reason);
+        if (transitionRes.value.reason === 'stale') {
+          expect(transitionRes.value.expected_from).toBe('proposed');
+          expect(transitionRes.value.actual).toBe('active');
+        }
       }
     }
 
@@ -431,13 +469,26 @@ d('operationalProfileVersionsRepo.transition (parent-agent lock, real DB)', () =
       c.release();
     }
 
+    // Codex Adversarial Review of PR #182 round 1: both callers declare
+    // `expected_from: 'active'` reflecting the snapshot they observed
+    // before racing. Pre-fix, this test was flaky because the chained
+    // transition `active → frozen → rolled_back` was a valid state-machine
+    // path, so when freeze won first, the waiting rollback re-read
+    // `frozen` and was still allowed to commit (winners=2). With the
+    // `expected_from` contract, the loser observes a state different from
+    // what it snapshotted and surfaces `stale`.
     const freezeCall = runWithTenantContext({ tenant_id: T, agent_id: A }, async () =>
-      operationalProfileVersionsRepo.transition({ id: activeId, to: 'frozen' }),
+      operationalProfileVersionsRepo.transition({
+        id: activeId,
+        to: 'frozen',
+        expected_from: 'active',
+      }),
     );
     const rollbackCall = runWithTenantContext({ tenant_id: T, agent_id: A }, async () =>
       operationalProfileVersionsRepo.transition({
         id: activeId,
         to: 'rolled_back',
+        expected_from: 'active',
         rollback_reason: 'concurrent transition',
       }),
     );
@@ -456,11 +507,16 @@ d('operationalProfileVersionsRepo.transition (parent-agent lock, real DB)', () =
         if (r.value.ok) winners++;
         else {
           losers++;
-          // The loser must report a typed reason — invalid_transition is
-          // what the status predicate guard produces when status changed
-          // under the lock. `terminal` is what we'd see if rollback won
-          // first and freeze sees the locked-in `rolled_back` state.
-          expect(['invalid_transition', 'terminal']).toContain(r.value.reason);
+          // The loser must report a typed reason. Post-fix the canonical
+          // outcome is `stale` (the active state the loser snapshotted
+          // no longer holds). `invalid_transition`/`terminal` remain
+          // acceptable for the narrow defense-in-depth window where the
+          // status changed mid-write.
+          expect(['stale', 'invalid_transition', 'terminal']).toContain(r.value.reason);
+          if (r.value.reason === 'stale') {
+            expect(r.value.expected_from).toBe('active');
+            expect(['frozen', 'rolled_back']).toContain(r.value.actual);
+          }
         }
       }
     }
