@@ -108,6 +108,16 @@ export default function LlmSettingsPage() {
         setMainCustom('');
         setFastCustom('');
         setComment('');
+        // PR #188 Codex round 1 [P2]: after a custom-slug submit, the dropdowns
+        // used to retain the OLD picks (e.g. the env default the user never
+        // touched). On a subsequent one-sided edit, the form would have
+        // submitted the stale dropdown selection for the untouched side —
+        // silently reverting the custom model the founder just set. Resync
+        // both picks to what the mutation actually persisted (res.after, NOT
+        // the refetch which races the invalidation above and would land
+        // stale values into the picks again).
+        setMainPick(res.after.main);
+        setFastPick(res.after.fast);
       }
     } catch {
       // tRPC mutation error surfaces via mutation.error below — no action

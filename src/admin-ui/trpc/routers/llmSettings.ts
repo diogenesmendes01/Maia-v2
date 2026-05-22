@@ -15,22 +15,21 @@
  *   - catalog  — OpenRouter tool-calling-capable model list (cached 1 h).
  *                Founder-only for the same reason as `get`.
  *   - update   — flips `llm.model.main` / `llm.model.fast` AND appends an
- *                `admin_audit_log` row, both inside a single `withTx` —
- *                same atomicity pattern as `tenants.updateStatusAtomic`
- *                (issue #165) and `proposals.decideAtomically` (PR #101):
- *                if the audit insert throws, BOTH model facts roll back.
+ *                `admin_audit_log` row, both inside a single `withTx`,
+ *                with `SELECT ... FOR UPDATE` on each global_settings row
+ *                — Codex round 1 on PR #188 made this atomic so concurrent
+ *                founders can't corrupt the audit trail (medium) and the
+ *                storage is process-global so every tenant's next ReAct
+ *                turn sees the new model (high).
  *
- * Tenant-scope reality:
- *   The legacy llm-settings module stores the picks in `agent_facts` with
- *   `escopo='global'`, but `agent_facts` rows are keyed by
- *   `(tenant_id, agent_id, escopo, chave)` — the storage is silently
- *   tenant-scoped. We preserve that semantic by writing under
- *   `(session.tenant_id, 'default')` to match the env-default fallback
- *   shape. Runtime `callLLM` (in `src/lib/claude.ts`) reads inside its own
- *   `(tenant_id, agent_id)` context, so a founder's change here affects
- *   the founder's own tenant agents — not necessarily other tenants. This
- *   is the same scoping the legacy `/dashboard/llm-settings` had; making
- *   it truly global requires a separate `global_settings` table (deferred).
+ * Storage scope (issue #183, Codex round 1 on PR #188, [high]):
+ *   This router writes to `global_settings` (process-wide singleton), NOT
+ *   `agent_facts`. The old storage was silently scoped to the founder's
+ *   `(tenant_id, agent_id='default')` row — any non-default agent or any
+ *   other tenant kept reading the env model, defeating the incident-time
+ *   purpose of this page. The runtime read path (`getCurrentMainModel` /
+ *   `getCurrentFastModel`) reads from `global_settings` too, so a founder
+ *   change here is visible to EVERY agent's next call.
  */
 import { z } from 'zod';
 import { TRPCError } from '@trpc/server';
@@ -39,16 +38,9 @@ import {
   getCurrentMainModel,
   getCurrentFastModel,
   envDefaults,
+  setGlobalLLMSettingsAtomic,
 } from '../../../lib/llm-settings.js';
 import { getToolCallingModels } from '../../../lib/openrouter-models.js';
-import { runWithTenantContext } from '../../../db/tenant-context.js';
-import { withTx } from '../../../db/client.js';
-import { admin_audit_log, agent_facts } from '../../../db/schema.js';
-
-// Default agent slot used for storing the "global" model selection (see
-// tenant-scope note in the file header). Hardcoded to 'default' to match
-// the schema column DEFAULTs and the legacy dashboard's expectation.
-const STORAGE_AGENT_ID = 'default';
 
 const KEY_MAIN = 'llm.model.main';
 const KEY_FAST = 'llm.model.fast';
@@ -83,15 +75,15 @@ const UpdateInputSchema = z.object({
 export const llmSettingsRouter = router({
   /**
    * Read current main+fast model along with env defaults and provider.
-   * Wrapped in `runWithTenantContext` because `getCurrentMainModel` reads
-   * `factsRepo.getByKey` which calls `getCurrentTenant()` internally.
+   * No tenant context wrap: `getCurrentMainModel`/`getCurrentFastModel`
+   * now read from `global_settings` (process-wide), which is NOT scoped
+   * to tenant/agent.
    */
-  get: founderProcedure.query(async ({ ctx }) => {
-    const [main, fast] = await runWithTenantContext(
-      { tenant_id: ctx.tenantId, agent_id: STORAGE_AGENT_ID },
-      async () =>
-        Promise.all([getCurrentMainModel(), getCurrentFastModel()]),
-    );
+  get: founderProcedure.query(async () => {
+    const [main, fast] = await Promise.all([
+      getCurrentMainModel(),
+      getCurrentFastModel(),
+    ]);
     const env = envDefaults();
     return { main, fast, env };
   }),
@@ -108,139 +100,35 @@ export const llmSettingsRouter = router({
   }),
 
   /**
-   * Atomic update: writes both model facts AND the audit row inside one
-   * `withTx`. If the audit insert throws, neither model fact persists —
-   * the surrounding transaction rolls back. Same invariant as
-   * `tenantsRepo.updateStatusAtomic` (issue #165).
+   * Atomic update: writes both model rows + audit row inside one withTx
+   * with `SELECT ... FOR UPDATE` per global_settings key (Codex round 1
+   * on PR #188, [medium]). The previous implementation read current
+   * values OUTSIDE the tx then conditional-skipped writes based on that
+   * stale snapshot, so two concurrent founders could land an audit row
+   * whose `before` claimed one value but `after` reflected the other
+   * founder's write. The new path reads-then-writes under the lock, so
+   * the audit row sees exactly what persisted.
    *
-   * Steps inside the tx:
-   *   1. Read current main/fast (FOR UPDATE locks not needed — concurrent
-   *      founders running this at the same moment is acceptable; the last
-   *      writer wins and both writes are audited).
-   *   2. UPSERT `llm.model.main` (only if changed — no-op write would
-   *      pollute the audit "before"/"after" with identical values).
-   *   3. UPSERT `llm.model.fast` (idem).
-   *   4. INSERT `admin_audit_log` with action=`llm_model_changed`,
-   *      change_summary capturing before/after for both sides + comment.
+   * Returns `{ ok: true, applied_at, before, after }` — before is the
+   * REAL pre-lock value (not the router's pre-tx read). If neither side
+   * changed, throws BAD_REQUEST (no DB writes, no audit row).
    *
-   * Returns `{ ok: true, applied_at, before, after }` so the UI can show
-   * exactly what changed. If neither side changed, `applied_at` is null
-   * and `before === after`; no DB writes happen and no audit row is
-   * appended (BAD_REQUEST instead).
+   * Note: `before.main` / `before.fast` can be null if the key was never
+   * set (fresh DB — runtime was on the env default). The router maps
+   * null → the env default for the UI's convenience.
    */
   update: founderProcedure
     .input(UpdateInputSchema)
     .mutation(async ({ input, ctx }) => {
-      const result = await runWithTenantContext(
-        { tenant_id: ctx.tenantId, agent_id: STORAGE_AGENT_ID },
-        async () => {
-          // Read CURRENT values OUTSIDE the tx for the before-snapshot.
-          // Reading them inside withTx would also work but the snapshot is
-          // for the audit row, not for any race-sensitive invariant.
-          const beforeMain = await getCurrentMainModel();
-          const beforeFast = await getCurrentFastModel();
-
-          // No-op detection: if nothing changes, refuse rather than write
-          // a meaningless audit row. (Caller can pass the same values to
-          // intentionally "renew" the fact — but the operator workflow is
-          // "change a model in incident", not "ping the audit log".)
-          if (beforeMain === input.main && beforeFast === input.fast) {
-            return {
-              ok: false as const,
-              reason: 'no_changes' as const,
-              before: { main: beforeMain, fast: beforeFast },
-            };
-          }
-
-          return await withTx(async (tx) => {
-            const now = new Date();
-
-            // Same upsert shape as factsRepo.upsert — kept inline so the
-            // UPSERT runs against the in-tx `tx` (factsRepo.upsert uses
-            // the connection-pool `db` and can't enroll in the caller's
-            // transaction).
-            if (beforeMain !== input.main) {
-              await tx
-                .insert(agent_facts)
-                .values({
-                  tenant_id: ctx.tenantId,
-                  agent_id: STORAGE_AGENT_ID,
-                  escopo: 'global',
-                  chave: KEY_MAIN,
-                  valor: { model: input.main },
-                  fonte: 'configurado',
-                  confianca: '1.00',
-                  updated_at: now,
-                })
-                .onConflictDoUpdate({
-                  target: [
-                    agent_facts.tenant_id,
-                    agent_facts.agent_id,
-                    agent_facts.escopo,
-                    agent_facts.chave,
-                  ],
-                  set: {
-                    valor: { model: input.main },
-                    fonte: 'configurado',
-                    updated_at: now,
-                  },
-                });
-            }
-
-            if (beforeFast !== input.fast) {
-              await tx
-                .insert(agent_facts)
-                .values({
-                  tenant_id: ctx.tenantId,
-                  agent_id: STORAGE_AGENT_ID,
-                  escopo: 'global',
-                  chave: KEY_FAST,
-                  valor: { model: input.fast },
-                  fonte: 'configurado',
-                  confianca: '1.00',
-                  updated_at: now,
-                })
-                .onConflictDoUpdate({
-                  target: [
-                    agent_facts.tenant_id,
-                    agent_facts.agent_id,
-                    agent_facts.escopo,
-                    agent_facts.chave,
-                  ],
-                  set: {
-                    valor: { model: input.fast },
-                    fonte: 'configurado',
-                    updated_at: now,
-                  },
-                });
-            }
-
-            // Audit in the SAME tx. If this throws, both UPSERTs above
-            // roll back together — no unaudited model change reaches the
-            // runtime read path.
-            await tx.insert(admin_audit_log).values({
-              tenant_id: ctx.tenantId,
-              actor_id: ctx.userId,
-              actor_role: ctx.userRole,
-              action: 'llm_model_changed',
-              resource_type: 'llm_settings',
-              resource_id: null,
-              change_summary: {
-                before: { main: beforeMain, fast: beforeFast },
-                after: { main: input.main, fast: input.fast },
-                comment: input.comment,
-              },
-            });
-
-            return {
-              ok: true as const,
-              applied_at: now,
-              before: { main: beforeMain, fast: beforeFast },
-              after: { main: input.main, fast: input.fast },
-            };
-          });
-        },
-      );
+      const env = envDefaults();
+      const result = await setGlobalLLMSettingsAtomic({
+        main: input.main,
+        fast: input.fast,
+        updated_by: ctx.userId,
+        actor_role: ctx.userRole,
+        tenant_id: ctx.tenantId,
+        comment: input.comment,
+      });
 
       if (!result.ok) {
         // Exhaustive narrowing: only one failure reason today.
@@ -258,7 +146,17 @@ export const llmSettingsRouter = router({
         });
       }
 
-      return result;
+      // Surface env defaults for null-before slots so the UI doesn't have
+      // to do a second round-trip to render the "Previously" line.
+      return {
+        ok: true as const,
+        applied_at: result.applied_at,
+        before: {
+          main: result.before.main ?? env.main,
+          fast: result.before.fast ?? env.fast,
+        },
+        after: result.after,
+      };
     }),
 });
 
@@ -269,10 +167,4 @@ export const _internal = {
   ModelSlugSchema,
   KEY_MAIN,
   KEY_FAST,
-  STORAGE_AGENT_ID,
 };
-
-// Re-export aliases that the router test imports from `@/db/schema.js`
-// indirectly (agent_facts / admin_audit_log are not exported here — only
-// the schema reference is needed if a downstream test wants to introspect
-// the table at runtime). Kept for future extension.

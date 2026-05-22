@@ -53,6 +53,7 @@ import {
   proposal_approvals,
   admin_audit_log,
   debug_snapshot_grants,
+  global_settings,
 } from './schema.js';
 import type {
   AppUser,
@@ -5971,6 +5972,188 @@ export const debugSnapshotGrantsRepo = {
       )
       .limit(1);
     return rows[0] ?? null;
+  },
+};
+
+// =====================================================================
+// global_settings — issue #183 / PR #188 Codex round 1 (high + medium)
+// =====================================================================
+
+/**
+ * globalSettingsRepo — process-wide singleton settings (NOT scoped to
+ * tenant/agent). Currently backs the founder-only LLM model switch
+ * (/setup/llm-settings) but the table is intentionally generic so future
+ * deployment-wide settings can reuse it.
+ *
+ * Why a new table (round 1, [high]):
+ *   The previous storage in `agent_facts (tenant_id, agent_id, escopo, chave)`
+ *   silently scoped the founder's "global" model pick to the founder's own
+ *   `default` agent. Runtime `callLLM` reads inside the CURRENT request's
+ *   (tenant_id, agent_id) AsyncLocalStorage context — for any non-default
+ *   agent or any other tenant, that's a different row. Founder UI showed
+ *   "audited successfully", but those callers kept using the env model.
+ *   In incident-time (Anthropic outage, model deprecation) this defeats the
+ *   entire purpose of the page. The fix is structural: a table with NO
+ *   tenant/agent discriminator.
+ *
+ * Why `updateAtomic` instead of separate `set` + audit (round 1, [medium]):
+ *   The router originally read current values OUTSIDE the tx, then skipped
+ *   writes based on that stale snapshot, then audited
+ *   `after={input.main, input.fast}`. Two concurrent founders updating
+ *   different sides could observe stale `before`, write different values
+ *   than what the audit row claims, and leave the DB in a state where the
+ *   audit trail is corrupted (forensic gap). Fix: read the current value
+ *   INSIDE the tx under `SELECT ... FOR UPDATE` on the row's PK, then
+ *   UPSERT, then audit — all in one withTx. Audit `before` is the actual
+ *   locked value; audit `after` is what the UPSERT just committed.
+ */
+export const globalSettingsRepo = {
+  /**
+   * Read a single global setting by key. Returns null if the key is not
+   * set (caller must apply its own default — for LLM models, that's the
+   * env var fallback). Caller-tolerant of DB errors via the surrounding
+   * try/catch in `getCurrent*Model` (DB hiccup → env default rather than
+   * blocking the LLM call).
+   */
+  async getByKey(key: string): Promise<{ value: unknown; updated_at: Date; updated_by: string | null } | null> {
+    const rows = await db
+      .select()
+      .from(global_settings)
+      .where(eq(global_settings.key, key))
+      .limit(1);
+    const row = rows[0];
+    if (!row) return null;
+    return { value: row.value, updated_at: row.updated_at, updated_by: row.updated_by };
+  },
+
+  /**
+   * Atomic multi-key update + audit. All keys are upserted under a single
+   * tx with `SELECT ... FOR UPDATE` on each row (serializes concurrent
+   * founders). Audit row sees the REAL before/after under the lock — not a
+   * stale pre-tx snapshot. If the audit insert throws, every upsert rolls
+   * back together.
+   *
+   * Steps inside the tx:
+   *   1. For each key, `SELECT value FROM global_settings WHERE key = $1
+   *      FOR UPDATE` — locks the row (or no rows, if absent). Concurrent
+   *      writers wait here.
+   *   2. Compute `before[key]` from the locked value (or null for absent).
+   *   3. For each key where `before !== requested`, UPSERT new value with
+   *      `updated_at = now`, `updated_by = audit.actor_id`.
+   *   4. If NO key actually changed, return `{ ok:false, reason:'no_changes', before }`
+   *      so the caller can map to BAD_REQUEST without polluting the audit
+   *      log with a no-op row.
+   *   5. INSERT admin_audit_log with `action`, `change_summary={ before, after, ...meta }`.
+   *      If this throws, ROLLBACK reverts every UPSERT (atomicity invariant
+   *      matching `tenantsRepo.updateStatusAtomic`).
+   *
+   * `meta` is merged into `change_summary` so the caller can stamp extra
+   * fields (operator comment, scope label, etc.) without us hardcoding a
+   * schema that future callers won't need.
+   */
+  async updateAtomic(input: {
+    keys: ReadonlyArray<{ key: string; value: Record<string, unknown> }>;
+    audit: {
+      tenant_id: string;
+      actor_id: string;
+      actor_role: string;
+      action: string;
+      resource_type: string;
+      resource_id?: string | null;
+      meta?: Record<string, unknown>;
+    };
+  }): Promise<
+    | {
+        ok: true;
+        applied_at: Date;
+        before: Record<string, unknown>;
+        after: Record<string, unknown>;
+      }
+    | {
+        ok: false;
+        reason: 'no_changes';
+        before: Record<string, unknown>;
+      }
+  > {
+    return await withTx(async (tx) => {
+      const now = new Date();
+      const before: Record<string, unknown> = {};
+      const after: Record<string, unknown> = {};
+      let changedCount = 0;
+
+      // (1) Lock each row FOR UPDATE in deterministic key order. Sorting
+      // the keys before locking prevents two concurrent updates that touch
+      // an overlapping set of keys from deadlocking each other (a holds
+      // main waiting for fast, b holds fast waiting for main). Same trick
+      // we use elsewhere in the codebase for multi-row locks.
+      const sortedKeys = [...input.keys].sort((a, b) => a.key.localeCompare(b.key));
+
+      for (const entry of sortedKeys) {
+        const locked = await tx
+          .select()
+          .from(global_settings)
+          .where(eq(global_settings.key, entry.key))
+          .for('update')
+          .limit(1);
+        const lockedValue = locked[0]?.value ?? null;
+        before[entry.key] = lockedValue;
+        after[entry.key] = entry.value;
+
+        // Deep-equal comparison via JSON canonicalization. Both sides are
+        // simple JSON (no functions, no Dates) so JSON.stringify is a safe
+        // canonical form. Skipping the UPSERT when the value matches avoids
+        // a wasted write AND keeps `updated_at` honest (it should reflect
+        // the last actual change, not a no-op renew).
+        if (JSON.stringify(lockedValue) === JSON.stringify(entry.value)) {
+          continue;
+        }
+
+        await tx
+          .insert(global_settings)
+          .values({
+            key: entry.key,
+            value: entry.value,
+            updated_at: now,
+            updated_by: input.audit.actor_id,
+          })
+          .onConflictDoUpdate({
+            target: [global_settings.key],
+            set: {
+              value: entry.value,
+              updated_at: now,
+              updated_by: input.audit.actor_id,
+            },
+          });
+        changedCount++;
+      }
+
+      if (changedCount === 0) {
+        // No real change under the lock → caller can map to BAD_REQUEST.
+        // The tx will commit empty (no audit row, no upsert) — cheap and
+        // honest. Returning `before` lets the caller surface what's
+        // currently in DB if it wants to.
+        return { ok: false as const, reason: 'no_changes' as const, before };
+      }
+
+      // (2) Audit in the SAME tx. before/after here are the REAL locked
+      // values, not whatever the caller read pre-tx — so concurrent
+      // founders can't corrupt the audit trail.
+      await tx.insert(admin_audit_log).values({
+        tenant_id: input.audit.tenant_id,
+        actor_id: input.audit.actor_id,
+        actor_role: input.audit.actor_role,
+        action: input.audit.action,
+        resource_type: input.audit.resource_type,
+        resource_id: input.audit.resource_id ?? null,
+        change_summary: {
+          before,
+          after,
+          ...(input.audit.meta ?? {}),
+        },
+      });
+
+      return { ok: true as const, applied_at: now, before, after };
+    });
   },
 };
 

@@ -1,46 +1,81 @@
 /**
  * Admin UI Setup — llmSettingsRouter unit tests.
  *
- * Drives the router through tRPC's caller with mocks for:
- *   - withTx (executes the fn with a fake tx that records inserts/upserts)
- *   - getCurrentMainModel / getCurrentFastModel (return seeded values)
- *   - getToolCallingModels (returns a small canned catalog)
+ * Storage history:
+ *   PR #183 originally stored model picks in `agent_facts` scoped by
+ *   (tenant_id, agent_id='default'). PR #188 Codex round 1 [high] showed
+ *   that silently meant the founder UI only affected the founder's
+ *   `default` agent — every other agent and every other tenant kept
+ *   using the env model. The fix moved storage to `global_settings`
+ *   (process-wide singleton; see migration 062), so we no longer mock
+ *   agent_facts here. Atomic before/after under SELECT FOR UPDATE is
+ *   exercised in tests/integration/global-settings-repo.spec.ts.
  *
- * Verifies:
+ * Mocks in this file:
+ *   - getCurrentMainModel / getCurrentFastModel (return seeded values).
+ *   - setGlobalLLMSettingsAtomic (records the call shape and returns a
+ *     fake before/after / no_changes / throws on demand).
+ *   - getToolCallingModels (canned 2-item catalog).
+ *
+ * Verifies (router-layer concerns):
  *   1. get/catalog/update require role=founder (founderProcedure gate).
  *   2. Non-founder roles get FORBIDDEN.
  *   3. update with both sides unchanged returns BAD_REQUEST (no audit row).
- *   4. update flips both sides + appends an admin_audit_log row with
- *      action='llm_model_changed' and a change_summary containing before/after
- *      and the comment.
- *   5. Audit insert failure rolls back the model upserts atomically — the
- *      next read sees the OLD values, not the half-committed new ones (issue
- *      #183 ports the issue #165 atomicity invariant).
- *   6. update with only one side changed still works (the other side's upsert
- *      is skipped, but the audit row still records both before/after).
+ *   4. update forwards comment + actor metadata into setGlobalLLMSettingsAtomic.
+ *   5. update maps a thrown error from the atomic helper through to tRPC
+ *      (the actual rollback semantics live in the repo integration test).
+ *   6. update fills null `before.main/fast` slots with env defaults so the
+ *      UI doesn't need a second round-trip.
  *   7. Input validation: invalid slug characters / oversized comment.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { TRPCError } from '@trpc/server';
 
-// Mock the LLM settings helpers BEFORE importing the router so the router
-// picks up the mocks at module-load. We mutate the backing state from each
-// test via `setMockMain` / `setMockFast`.
 let mockMain = 'anthropic/claude-sonnet-4.6';
 let mockFast = 'anthropic/claude-haiku-4.5';
+
+type AtomicCall = {
+  main: string;
+  fast: string;
+  updated_by: string;
+  actor_role: string;
+  tenant_id: string;
+  comment: string;
+};
+const atomicCalls: AtomicCall[] = [];
+let atomicMode: 'flip' | 'no_changes' | 'throw' = 'flip';
+let atomicThrow: Error = new Error('simulated atomic failure');
 
 vi.mock('@/lib/llm-settings.js', () => ({
   getCurrentMainModel: vi.fn(async () => mockMain),
   getCurrentFastModel: vi.fn(async () => mockFast),
-  // setCurrent* helpers aren't called by the router (it inlines the upsert
-  // into the tx) — kept as no-op spies for completeness.
-  setCurrentMainModel: vi.fn(async () => undefined),
-  setCurrentFastModel: vi.fn(async () => undefined),
   envDefaults: vi.fn(() => ({
     main: 'anthropic/claude-sonnet-4.6',
     fast: 'anthropic/claude-haiku-4.5',
     provider: 'openrouter',
   })),
+  setGlobalLLMSettingsAtomic: vi.fn(async (input: AtomicCall) => {
+    atomicCalls.push(input);
+    if (atomicMode === 'throw') {
+      throw atomicThrow;
+    }
+    if (atomicMode === 'no_changes') {
+      return {
+        ok: false as const,
+        reason: 'no_changes' as const,
+        before: { main: mockMain, fast: mockFast },
+      };
+    }
+    const before = { main: mockMain, fast: mockFast };
+    mockMain = input.main;
+    mockFast = input.fast;
+    return {
+      ok: true as const,
+      applied_at: new Date('2026-05-22T14:30:00Z'),
+      before,
+      after: { main: input.main, fast: input.fast },
+    };
+  }),
 }));
 
 vi.mock('@/lib/openrouter-models.js', () => ({
@@ -62,105 +97,7 @@ vi.mock('@/lib/openrouter-models.js', () => ({
   ]),
 }));
 
-// In-memory "tx" recorder: every upsert/insert appends to a typed log so the
-// test can assert what got written. `auditShouldFail` triggers an exception
-// at the audit-insert step (simulates the real failure mode that the atomic
-// pattern protects against — issue #165 ported to issue #183).
-type UpsertOp = { table: 'agent_facts'; key: string; model: string };
-type AuditOp = {
-  table: 'admin_audit_log';
-  action: string;
-  resource_type: string;
-  change_summary: Record<string, unknown> | null;
-};
-let txLog: Array<UpsertOp | AuditOp> = [];
-let auditShouldFail = false;
-
-vi.mock('@/db/client.js', () => ({
-  db: {},
-  withTx: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => {
-    // Snapshot pre-tx state so we can simulate ROLLBACK if fn throws.
-    const snapshotLog = [...txLog];
-    const snapshotMain = mockMain;
-    const snapshotFast = mockFast;
-
-    const tx = {
-      insert: (_table: { _: { name?: string } } | unknown) => ({
-        values: (vals: Record<string, unknown>) => {
-          // Sniff the table by which fields the row has (matches the
-          // router's payload — agent_facts has `chave`, admin_audit_log
-          // has `action`). This is jankier than checking `table` but
-          // works against the opaque drizzle table reference.
-          if ('chave' in vals && 'valor' in vals) {
-            const chave = String(vals.chave);
-            const valor = vals.valor as { model?: string };
-            return {
-              onConflictDoUpdate: (_args: unknown) => {
-                txLog.push({
-                  table: 'agent_facts',
-                  key: chave,
-                  model: valor.model ?? '',
-                });
-                // Reflect the upsert in the mocked "current value" so a
-                // subsequent get inside the same test sees it.
-                if (chave === 'llm.model.main') mockMain = valor.model ?? '';
-                if (chave === 'llm.model.fast') mockFast = valor.model ?? '';
-                return Promise.resolve();
-              },
-            };
-          }
-          if ('action' in vals) {
-            if (auditShouldFail) {
-              throw new Error('simulated audit insert failure');
-            }
-            txLog.push({
-              table: 'admin_audit_log',
-              action: String(vals.action),
-              resource_type: String(vals.resource_type),
-              change_summary: vals.change_summary as Record<string, unknown> | null,
-            });
-            return Promise.resolve();
-          }
-          return Promise.resolve();
-        },
-      }),
-    };
-
-    try {
-      return await fn(tx);
-    } catch (err) {
-      // ROLLBACK simulation: restore pre-tx state. Real Postgres does this
-      // implicitly; here we restore the test mocks so a subsequent get()
-      // sees the original values (the invariant we test for).
-      txLog = snapshotLog;
-      mockMain = snapshotMain;
-      mockFast = snapshotFast;
-      throw err;
-    }
-  }),
-}));
-
-// Tenant context — the router wraps each procedure in runWithTenantContext.
-// The mock just executes the callback directly (no AsyncLocalStorage needed
-// since the inner code paths are all mocked).
-vi.mock('@/db/tenant-context.js', () => ({
-  runWithTenantContext: vi.fn(
-    async (_ctx: unknown, fn: () => Promise<unknown>) => fn(),
-  ),
-  getCurrentTenant: vi.fn(() => 'tenant-test'),
-  getCurrentAgent: vi.fn(() => 'default'),
-  MissingTenantContextError: class MissingTenantContextError extends Error {},
-}));
-
-// Stub schema imports — the router references the table objects but our
-// fake tx ignores them (sniffs by row shape instead).
-vi.mock('@/db/schema.js', () => ({
-  agent_facts: { _: { name: 'agent_facts' } },
-  admin_audit_log: { _: { name: 'admin_audit_log' } },
-}));
-
-// Now import the router. The async-friendly import path avoids hoisting
-// issues with the mocks above.
+// Import the router after mocks are in place.
 const { llmSettingsRouter } = await import(
   '@/admin-ui/trpc/routers/llmSettings.js'
 );
@@ -172,11 +109,6 @@ function caller(role: string, tenantId = 'tenant-test', userId = 'user-1') {
     userRole: role,
     tenantId,
     repos: {
-      // tenantsRepo.findById is consulted by protectedProcedure for the
-      // suspension check on non-founder roles. Founders bypass it, so for
-      // founder tests we don't need this; for the FORBIDDEN tests we DO
-      // need the role check to fire before any repo call, so a minimal
-      // stub keeps the middleware happy.
       tenantsRepo: {
         findById: async (_id: string) => ({
           id: tenantId,
@@ -195,14 +127,14 @@ function caller(role: string, tenantId = 'tenant-test', userId = 'user-1') {
 }
 
 beforeEach(() => {
-  txLog = [];
-  auditShouldFail = false;
+  atomicCalls.length = 0;
+  atomicMode = 'flip';
   mockMain = 'anthropic/claude-sonnet-4.6';
   mockFast = 'anthropic/claude-haiku-4.5';
 });
 
 describe('llmSettingsRouter.get — founder gate', () => {
-  it('founder can read current settings + env defaults', async () => {
+  it('founder can read current settings + env defaults (no tenant context wrap)', async () => {
     const res = await caller('founder').get();
     expect(res.main).toBe('anthropic/claude-sonnet-4.6');
     expect(res.fast).toBe('anthropic/claude-haiku-4.5');
@@ -232,9 +164,9 @@ describe('llmSettingsRouter.catalog — founder gate', () => {
   );
 });
 
-describe('llmSettingsRouter.update — gate + audit + atomicity', () => {
-  it('founder flips both sides, audit row captures before/after + comment', async () => {
-    const res = await caller('founder').update({
+describe('llmSettingsRouter.update — gate + delegate + atomic semantics', () => {
+  it('founder flips both sides; atomic helper receives actor metadata + comment', async () => {
+    const res = await caller('founder', 'tenant-x', 'founder-1').update({
       main: 'openai/gpt-5',
       fast: 'openai/gpt-5',
       comment: 'Anthropic outage 14:30 UTC, swap to OpenAI',
@@ -250,29 +182,14 @@ describe('llmSettingsRouter.update — gate + audit + atomicity', () => {
       fast: 'openai/gpt-5',
     });
 
-    // Two upserts + one audit row.
-    expect(txLog.length).toBe(3);
-    expect(txLog[0]).toMatchObject({
-      table: 'agent_facts',
-      key: 'llm.model.main',
-      model: 'openai/gpt-5',
-    });
-    expect(txLog[1]).toMatchObject({
-      table: 'agent_facts',
-      key: 'llm.model.fast',
-      model: 'openai/gpt-5',
-    });
-    const auditOp = txLog[2] as AuditOp;
-    expect(auditOp.table).toBe('admin_audit_log');
-    expect(auditOp.action).toBe('llm_model_changed');
-    expect(auditOp.resource_type).toBe('llm_settings');
-    expect(auditOp.change_summary).toMatchObject({
-      before: {
-        main: 'anthropic/claude-sonnet-4.6',
-        fast: 'anthropic/claude-haiku-4.5',
-      },
-      after: { main: 'openai/gpt-5', fast: 'openai/gpt-5' },
+    expect(atomicCalls).toHaveLength(1);
+    expect(atomicCalls[0]).toMatchObject({
+      main: 'openai/gpt-5',
+      fast: 'openai/gpt-5',
       comment: 'Anthropic outage 14:30 UTC, swap to OpenAI',
+      updated_by: 'founder-1',
+      actor_role: 'founder',
+      tenant_id: 'tenant-x',
     });
   });
 
@@ -286,12 +203,13 @@ describe('llmSettingsRouter.update — gate + audit + atomicity', () => {
           comment: 'trying to bypass the founder gate',
         }),
       ).rejects.toThrow(TRPCError);
-      // No DB writes happened — gate rejected before any tx.
-      expect(txLog.length).toBe(0);
+      // No atomic helper call — gate rejected before any tx.
+      expect(atomicCalls).toHaveLength(0);
     },
   );
 
-  it('BAD_REQUEST when both sides match current (no-op)', async () => {
+  it('BAD_REQUEST when atomic helper reports no_changes', async () => {
+    atomicMode = 'no_changes';
     await expect(
       caller('founder').update({
         main: 'anthropic/claude-sonnet-4.6',
@@ -299,51 +217,17 @@ describe('llmSettingsRouter.update — gate + audit + atomicity', () => {
         comment: 'this should be rejected — nothing actually changed',
       }),
     ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
-    // No tx ran, no audit row.
-    expect(txLog.length).toBe(0);
+    expect(atomicCalls).toHaveLength(1); // helper WAS called; it returned no_changes
   });
 
-  it('only-main changed: still writes audit row with both before/after, skips fast upsert', async () => {
-    const res = await caller('founder').update({
-      main: 'openai/gpt-5',
-      fast: 'anthropic/claude-haiku-4.5', // unchanged
-      comment: 'Sonnet flapping, swap main only',
-    });
-    expect(res.ok).toBe(true);
-    // 1 upsert (main only) + 1 audit row.
-    expect(txLog.length).toBe(2);
-    expect(txLog[0]).toMatchObject({ key: 'llm.model.main' });
-    const auditOp = txLog[1] as AuditOp;
-    expect(auditOp.change_summary).toMatchObject({
-      before: {
-        main: 'anthropic/claude-sonnet-4.6',
-        fast: 'anthropic/claude-haiku-4.5',
-      },
-      after: {
-        main: 'openai/gpt-5',
-        fast: 'anthropic/claude-haiku-4.5',
-      },
-    });
-  });
-
-  // CRITICAL — issue #183 ports issue #165's atomicity invariant.
-  //
-  // Pre-fix (the legacy /dashboard/llm-settings):
-  //   setCurrentMainModel(main)   ← commits immediately
-  //   setCurrentFastModel(fast)   ← commits immediately
-  //   audit({ ... })              ← if this throws, the model facts are
-  //                                  ALREADY persisted with no audit row.
-  //                                  Runtime callLLM picks up the new model
-  //                                  silently — high-blast-radius change with
-  //                                  no forensic trail. Retry after fix would
-  //                                  hit no-op BAD_REQUEST and the audit row
-  //                                  is lost forever.
-  //
-  // Post-fix: all three writes inside one withTx. Audit throw → ROLLBACK →
-  // both model facts revert. The runtime keeps using the OLD model, and the
-  // founder sees an error, can retry, and the audit row IS written.
-  it('audit insert failure rolls back both model upserts (atomic, issue #183/#165 pattern)', async () => {
-    auditShouldFail = true;
+  // The actual rollback semantics live in tests/integration/global-settings-repo.spec.ts
+  // (real Postgres + concurrent founder regression). At the router layer we
+  // just need to confirm that a thrown error propagates instead of being
+  // swallowed into a misleading success — the legacy bug class was a
+  // committed model change with no audit row.
+  it('propagates an atomic helper failure (no fake success on the wire)', async () => {
+    atomicMode = 'throw';
+    atomicThrow = new Error('simulated audit insert failure');
 
     await expect(
       caller('founder').update({
@@ -352,32 +236,35 @@ describe('llmSettingsRouter.update — gate + audit + atomicity', () => {
         comment: 'audit will fail on this attempt',
       }),
     ).rejects.toThrow(/simulated audit insert failure/);
+  });
 
-    // CRITICAL invariants:
-    //   - txLog is empty after rollback (our fake tx restores the snapshot).
-    //   - Current values are unchanged (next get() returns the OLD models).
-    expect(txLog.length).toBe(0);
-    expect(mockMain).toBe('anthropic/claude-sonnet-4.6');
-    expect(mockFast).toBe('anthropic/claude-haiku-4.5');
+  it('null `before.main/fast` from the helper is filled with env defaults', async () => {
+    // Simulate first-ever update where no global_settings rows exist yet:
+    // the helper would normally return before={main:null, fast:null}. We
+    // bypass the mock's normal flip path and craft the return shape directly.
+    const llmModule = await import('@/lib/llm-settings.js');
+    const spy = vi
+      .spyOn(llmModule, 'setGlobalLLMSettingsAtomic')
+      .mockResolvedValueOnce({
+        ok: true as const,
+        applied_at: new Date('2026-05-22T14:30:00Z'),
+        before: { main: null, fast: null },
+        after: { main: 'openai/gpt-5', fast: 'openai/gpt-5' },
+      });
 
-    // Subsequent get() confirms the runtime sees the pre-attempt values.
-    const after = await caller('founder').get();
-    expect(after.main).toBe('anthropic/claude-sonnet-4.6');
-    expect(after.fast).toBe('anthropic/claude-haiku-4.5');
-
-    // Retry without the failure trigger — now both upserts + audit commit.
-    auditShouldFail = false;
     const res = await caller('founder').update({
       main: 'openai/gpt-5',
-      fast: 'x-ai/grok-4.1-fast',
-      comment: 'retry after rollback',
+      fast: 'openai/gpt-5',
+      comment: 'fresh DB, no global_settings rows yet',
     });
     expect(res.ok).toBe(true);
-    expect(txLog.length).toBe(3);
-    const auditOp = txLog[2] as AuditOp;
-    expect(auditOp.change_summary).toMatchObject({
-      comment: 'retry after rollback',
+    // Router fills the null with env defaults so the UI's "Previously" line
+    // is always meaningful without a separate round-trip.
+    expect(res.before).toEqual({
+      main: 'anthropic/claude-sonnet-4.6',
+      fast: 'anthropic/claude-haiku-4.5',
     });
+    spy.mockRestore();
   });
 });
 
