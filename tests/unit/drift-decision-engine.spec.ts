@@ -434,6 +434,253 @@ describe('decideAndApply', () => {
     expect(createAlertMock).toHaveBeenCalledTimes(2);
   });
 
+  // ---- Codex Adversarial Review of PR #182 round 2: batch collapse ----
+  //
+  // The bug: `decideAndApply` processed evidences sequentially and hard-coded
+  // `expected_from:'active'` for EVERY profile transition. If an alto froze
+  // the row first, a subsequent critico tried `rolled_back` against the
+  // already-frozen row with `expected_from='active'` and hit the repository's
+  // stale guard. Critical rollback was silently demoted to applied=false and
+  // the profile ended frozen instead of rolled_back.
+  //
+  // Fix: collapse to strongest mutator per active_profile_id per batch.
+  // Discarded evidences still persist their alert row (forensic trail) and
+  // get `superseded_by` pointing at the winner's alert_id, but they do NOT
+  // call `transition` — so the engine can never atropelar itself.
+
+  it('batch collapse: [alto, critico] same profile → rollback aplicado, alto descartado com superseded_by', async () => {
+    transitionOk();
+    const evAlto = makeEvidence(
+      DriftType.VALORES,
+      { violated_principles: [0] },
+      'alto evidence',
+    );
+    const evCritico = makeEvidence(
+      DriftType.LINGUAGEM,
+      { offensive: true },
+      'critico evidence',
+    );
+
+    const out = await decideAndApply({
+      evidences: [evAlto, evCritico],
+      active_profile_id: PROFILE_ID,
+    });
+
+    expect(out).toHaveLength(2);
+
+    // Ordem de input preservada: alto (índice 0), critico (índice 1).
+    const altoResult = out[0]!;
+    const criticoResult = out[1]!;
+
+    expect(altoResult.severity).toBe(DriftSeverity.ALTO);
+    expect(altoResult.decision).toBe(DriftDecision.FROZEN);
+    expect(altoResult.applied).toBe(false); // descartado
+    expect(altoResult.applied_error).toBeUndefined();
+    expect(altoResult.alert_id).toMatch(/^alert-/); // alert ainda persistido
+    expect(altoResult.superseded_by).toBe(criticoResult.alert_id);
+
+    expect(criticoResult.severity).toBe(DriftSeverity.CRITICO);
+    expect(criticoResult.decision).toBe(DriftDecision.ROLLBACK);
+    expect(criticoResult.applied).toBe(true); // strongest wins
+    expect(criticoResult.superseded_by).toBeUndefined();
+
+    // EXATAMENTE 1 transition (rolled_back), não 2.
+    expect(transitionMock).toHaveBeenCalledTimes(1);
+    const transArgs = transitionMock.mock.calls[0]![0];
+    expect(transArgs.to).toBe('rolled_back');
+    expect(transArgs.approved_by).toBe('auto:drift_critico');
+    expect(transArgs.expected_from).toBe('active');
+    expect(transArgs.rollback_reason).toBe('critico evidence');
+
+    // Ambos alerts criados (audit trail preservado).
+    expect(createAlertMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('batch collapse: [critico, alto] same profile (ordem invertida) → mesmo resultado, rollback aplicado', async () => {
+    transitionOk();
+    const evCritico = makeEvidence(
+      DriftType.LINGUAGEM,
+      { offensive: true },
+      'critico evidence',
+    );
+    const evAlto = makeEvidence(
+      DriftType.VALORES,
+      { violated_principles: [0] },
+      'alto evidence',
+    );
+
+    const out = await decideAndApply({
+      evidences: [evCritico, evAlto],
+      active_profile_id: PROFILE_ID,
+    });
+
+    expect(out).toHaveLength(2);
+
+    const criticoResult = out[0]!;
+    const altoResult = out[1]!;
+
+    expect(criticoResult.severity).toBe(DriftSeverity.CRITICO);
+    expect(criticoResult.applied).toBe(true);
+    expect(criticoResult.superseded_by).toBeUndefined();
+
+    expect(altoResult.severity).toBe(DriftSeverity.ALTO);
+    expect(altoResult.applied).toBe(false);
+    expect(altoResult.superseded_by).toBe(criticoResult.alert_id);
+
+    expect(transitionMock).toHaveBeenCalledTimes(1);
+    expect(transitionMock.mock.calls[0]![0].to).toBe('rolled_back');
+  });
+
+  it('batch collapse: [alto, alto] same profile → primeiro alto vence (tie-break por índice), segundo descartado', async () => {
+    transitionOk();
+    const ev1 = makeEvidence(
+      DriftType.VALORES,
+      { violated_principles: [0] },
+      'alto 1',
+    );
+    const ev2 = makeEvidence(
+      DriftType.VALORES,
+      { violated_principles: [1, 2] },
+      'alto 2',
+    );
+
+    const out = await decideAndApply({
+      evidences: [ev1, ev2],
+      active_profile_id: PROFILE_ID,
+    });
+
+    expect(out[0]!.applied).toBe(true);
+    expect(out[0]!.superseded_by).toBeUndefined();
+
+    expect(out[1]!.applied).toBe(false);
+    expect(out[1]!.superseded_by).toBe(out[0]!.alert_id);
+
+    expect(transitionMock).toHaveBeenCalledTimes(1);
+    expect(transitionMock.mock.calls[0]![0].to).toBe('frozen');
+  });
+
+  it('batch collapse: [alto, critico, alto] same profile → critico vence, ambos altos descartados', async () => {
+    transitionOk();
+    const ev1 = makeEvidence(DriftType.VALORES, { violated_principles: [0] }, 'alto 1');
+    const ev2 = makeEvidence(DriftType.LINGUAGEM, { offensive: true }, 'critico');
+    const ev3 = makeEvidence(DriftType.VALORES, { violated_principles: [1] }, 'alto 2');
+
+    const out = await decideAndApply({
+      evidences: [ev1, ev2, ev3],
+      active_profile_id: PROFILE_ID,
+    });
+
+    expect(out).toHaveLength(3);
+    expect(out[0]!.applied).toBe(false);
+    expect(out[0]!.superseded_by).toBe(out[1]!.alert_id);
+    expect(out[1]!.applied).toBe(true);
+    expect(out[1]!.superseded_by).toBeUndefined();
+    expect(out[2]!.applied).toBe(false);
+    expect(out[2]!.superseded_by).toBe(out[1]!.alert_id);
+
+    expect(transitionMock).toHaveBeenCalledTimes(1);
+    expect(createAlertMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('batch collapse: single evidence (alto sozinho) → comportamento atual preservado (applied=true, sem superseded_by)', async () => {
+    transitionOk();
+    const ev = makeEvidence(DriftType.VALORES, { violated_principles: [0] });
+    const out = await decideAndApply({
+      evidences: [ev],
+      active_profile_id: PROFILE_ID,
+    });
+
+    expect(out).toHaveLength(1);
+    expect(out[0]!.decision).toBe(DriftDecision.FROZEN);
+    expect(out[0]!.applied).toBe(true);
+    expect(out[0]!.superseded_by).toBeUndefined();
+    expect(transitionMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('batch collapse: [baixo, alto, medio] same profile → alto único mutator, aplicado normalmente; baixo/medio não tocam superseded_by', async () => {
+    transitionOk();
+    const evBaixo = makeEvidence(DriftType.TOM, { examples: ['x'] });
+    const evAlto = makeEvidence(DriftType.VALORES, { violated_principles: [0] });
+    const evMedio = makeEvidence(DriftType.TOM, { examples: ['a', 'b'] });
+
+    const out = await decideAndApply({
+      evidences: [evBaixo, evAlto, evMedio],
+      active_profile_id: PROFILE_ID,
+    });
+
+    expect(out).toHaveLength(3);
+    expect(out[0]!.decision).toBe(DriftDecision.AUTO_APPROVED);
+    expect(out[0]!.superseded_by).toBeUndefined(); // baixo nunca é mutator
+    expect(out[1]!.decision).toBe(DriftDecision.FROZEN);
+    expect(out[1]!.applied).toBe(true);
+    expect(out[1]!.superseded_by).toBeUndefined();
+    expect(out[2]!.decision).toBe(DriftDecision.QUEUED_HUMAN);
+    expect(out[2]!.superseded_by).toBeUndefined(); // medio nunca é mutator
+
+    expect(transitionMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('batch collapse: soul_drift critico + valores critico → valores vence porque soul nunca é mutator', async () => {
+    transitionOk();
+    const evSoul = makeEvidence(DriftType.SOUL_DRIFT, {
+      violations: ['v1', 'v2'],
+      severity_hint: 'critico',
+    });
+    const evValores = makeEvidence(
+      DriftType.VALORES,
+      { violated_principles: [0], severity_hint: 'critico' },
+      'valores critico',
+    );
+
+    const out = await decideAndApply({
+      evidences: [evSoul, evValores],
+      active_profile_id: PROFILE_ID,
+    });
+
+    expect(out[0]!.severity).toBe(DriftSeverity.CRITICO);
+    expect(out[0]!.decision).toBe(DriftDecision.QUEUED_HUMAN); // soul_drift NUNCA rollback
+    expect(out[0]!.superseded_by).toBeUndefined(); // soul nunca participa do collapse
+
+    expect(out[1]!.severity).toBe(DriftSeverity.CRITICO);
+    expect(out[1]!.decision).toBe(DriftDecision.ROLLBACK);
+    expect(out[1]!.applied).toBe(true);
+    expect(out[1]!.superseded_by).toBeUndefined();
+
+    expect(transitionMock).toHaveBeenCalledTimes(1);
+    expect(transitionMock.mock.calls[0]![0].to).toBe('rolled_back');
+  });
+
+  it('batch collapse: winner alert insert falha → discarded.superseded_by é null (winner sem id)', async () => {
+    transitionOk();
+    // Sequência de inserts: 1º (alto, descartado) ok, 2º (critico, winner) falha.
+    createAlertMock.mockReset();
+    createAlertMock.mockImplementationOnce(async () => ({ id: 'alert-alto' }));
+    createAlertMock.mockImplementationOnce(async () => {
+      throw new Error('db down');
+    });
+
+    const evAlto = makeEvidence(DriftType.VALORES, { violated_principles: [0] });
+    const evCritico = makeEvidence(DriftType.LINGUAGEM, { offensive: true });
+
+    const out = await decideAndApply({
+      evidences: [evAlto, evCritico],
+      active_profile_id: PROFILE_ID,
+    });
+
+    // Alto: alert ok, descartado, superseded_by aponta para winner (que é null pq alert do critico falhou).
+    expect(out[0]!.alert_id).toBe('alert-alto');
+    expect(out[0]!.applied).toBe(false);
+    expect(out[0]!.superseded_by).toBeNull();
+
+    // Critico: alert falhou → applied=false (invariante: sem alert, sem transition).
+    expect(out[1]!.alert_id).toBeUndefined();
+    expect(out[1]!.applied).toBe(false);
+    expect(out[1]!.applied_error).toContain('alert_persist_failed');
+
+    // CRITICAL: transition NUNCA foi chamado (winner sem audit row).
+    expect(transitionMock).not.toHaveBeenCalled();
+  });
+
   it('severity baixo NÃO chama repo.transition (verificado via mock counter)', async () => {
     const ev = makeEvidence(DriftType.LINGUAGEM, { offensive: false });
     await decideAndApply({
