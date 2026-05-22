@@ -20,7 +20,11 @@ vi.mock('@anthropic-ai/sdk', () => {
   return { default: Anthropic };
 });
 
-import { papelDriftDetector } from '@/cognition/drift/papel.js';
+import {
+  papelDriftDetector,
+  __test_only_resetFallbackLogCache,
+} from '@/cognition/drift/papel.js';
+import { logger } from '@/lib/logger.js';
 
 function makeAnthropicReply(jsonObj: Record<string, unknown>): {
   content: Array<{ type: 'text'; text: string }>;
@@ -63,6 +67,7 @@ function makeAgentMsg(text: string, id = 'm-' + Math.random().toString(36).slice
 describe('papelDriftDetector (§6)', () => {
   beforeEach(() => {
     messagesCreateMock.mockReset();
+    __test_only_resetFallbackLogCache();
   });
 
   it('drift_detected=true → retorna DriftEvidence com type papel_drift, payload completo', async () => {
@@ -188,5 +193,241 @@ describe('papelDriftDetector (§6)', () => {
     });
     expect(out).toBeNull();
     expect(messagesCreateMock).toHaveBeenCalledOnce();
+  });
+
+  // -------------------------------------------------------------------------
+  // Issue #172 — fallback chain when migration 061 backfilled identity.principles
+  // but persisted identity.priorities as [].
+  // -------------------------------------------------------------------------
+
+  /** Capture the Anthropic user prompt so we can assert which list got rendered. */
+  function getLastUserPrompt(): string {
+    const calls = messagesCreateMock.mock.calls;
+    const last = calls[calls.length - 1] as
+      | [{ messages: Array<{ role: string; content: string }> }]
+      | undefined;
+    if (!last) throw new Error('expected at least one anthropic call');
+    return last[0].messages[0].content;
+  }
+
+  /**
+   * Build a profile in the exact shape migration 061 leaves rows in:
+   *  - identity.priorities: []
+   *  - identity.principles: [...backfilled from core_immutable.principles]
+   *  - core_immutable.principles: [...same list, direct-embed in profile_body]
+   *
+   * Caller can opt to omit either layer to simulate further degradation.
+   */
+  function makeMigration061Profile(opts: {
+    priorities?: unknown[];
+    identityPrinciples?: unknown[];
+    coreImmutablePrinciples?: unknown[];
+    role_descriptor?: string;
+  } = {}) {
+    const profile = buildProfileVersion({
+      profile_body: {
+        identity: {
+          role_descriptor: opts.role_descriptor ?? 'atendimento_financeiro_pf',
+          voice: { tone: '', formality: 'medium', verbosity: 'concise' },
+          cognitive_limits: {
+            max_inference_depth: 3,
+            max_speculation_in_response: 0.2,
+            confidence_floor_for_action: 0.7,
+          },
+          priorities: (opts.priorities ?? []) as string[],
+          // `principles` is an extra field migration 061 writes into
+          // profile_body.identity even though the canonical ProfileBody
+          // schema doesn't name it. The detector reads it via runtime cast.
+          principles: opts.identityPrinciples as string[] | undefined,
+          learned_voice_modifiers: [],
+        },
+      } as Record<string, unknown>,
+      _legacy: {
+        core_immutable: {
+          identity_block: opts.role_descriptor ?? 'atendimento_financeiro_pf',
+          principles: (opts.coreImmutablePrinciples ?? []) as string[],
+        },
+      },
+    });
+    return profile;
+  }
+
+  it('priorities=[] + identity.principles populated → usa identity.principles (fallback 1)', async () => {
+    messagesCreateMock.mockResolvedValueOnce(
+      makeAnthropicReply({ drift_detected: false }),
+    );
+    const out = await papelDriftDetector.detect({
+      profile_active: makeMigration061Profile({
+        priorities: [],
+        identityPrinciples: ['preservar_capital', 'clareza_acima_de_tudo'],
+        coreImmutablePrinciples: ['preservar_capital', 'clareza_acima_de_tudo'],
+      }),
+      recent_messages: [makeAgentMsg('algo')],
+    });
+    expect(out).toBeNull();
+    expect(messagesCreateMock).toHaveBeenCalledOnce();
+    const prompt = getLastUserPrompt();
+    expect(prompt).toContain('PRIORIDADES: preservar_capital, clareza_acima_de_tudo');
+    expect(prompt).not.toContain('PRIORIDADES: (nenhuma)');
+  });
+
+  it('priorities=[] + identity.principles=[] + core_immutable.principles populated → usa core_immutable (fallback 2)', async () => {
+    messagesCreateMock.mockResolvedValueOnce(
+      makeAnthropicReply({ drift_detected: false }),
+    );
+    const out = await papelDriftDetector.detect({
+      profile_active: makeMigration061Profile({
+        priorities: [],
+        identityPrinciples: [],
+        coreImmutablePrinciples: [
+          'Separação acima de tudo.',
+          'Confirme antes de agir em coisas relevantes.',
+        ],
+      }),
+      recent_messages: [makeAgentMsg('algo')],
+    });
+    expect(out).toBeNull();
+    const prompt = getLastUserPrompt();
+    expect(prompt).toContain(
+      'PRIORIDADES: Separação acima de tudo., Confirme antes de agir em coisas relevantes.',
+    );
+    expect(prompt).not.toContain('PRIORIDADES: (nenhuma)');
+  });
+
+  it('tudo vazio → segue auditando role (LLM ainda é chamado, PRIORIDADES=(nenhuma)) e loga warn (sem vazar role_descriptor)', async () => {
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    messagesCreateMock.mockResolvedValueOnce(
+      makeAnthropicReply({ drift_detected: false }),
+    );
+    const out = await papelDriftDetector.detect({
+      profile_active: makeMigration061Profile({
+        priorities: [],
+        identityPrinciples: [],
+        coreImmutablePrinciples: [],
+        // Force resolver synthesized fallback to also produce nothing by
+        // having no priorities AND no principles anywhere reachable. The
+        // buildProfileVersion default IDENTITY priorities would otherwise
+        // synthesize a core.principles list — we explicitly nuke them all
+        // through the overrides above.
+      }),
+      recent_messages: [makeAgentMsg('algo')],
+    });
+    expect(out).toBeNull();
+    expect(messagesCreateMock).toHaveBeenCalledOnce();
+    const prompt = getLastUserPrompt();
+    expect(prompt).toContain('PRIORIDADES: (nenhuma)');
+    // Codex Adversarial Review on PR #180: warning must NOT leak the
+    // free-form role_descriptor text (sourced from
+    // core_immutable.identity_block, not redacted by logger). Instead, we
+    // assert the length-only proxy is emitted.
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        role_descriptor_length: 'atendimento_financeiro_pf'.length,
+      }),
+      'papel_drift.priorities_empty_all_sources',
+    );
+    const warnPayload = warnSpy.mock.calls[0]?.[0];
+    expect(warnPayload).not.toHaveProperty('role_descriptor');
+    warnSpy.mockRestore();
+  });
+
+  it('Codex #180: sem mensagens do agente + priorities vazias → não loga fallback warning', async () => {
+    // Regression: before the fix the fallback resolver + warning log ran
+    // BEFORE the agent-messages check, so a worker waking up on a turn
+    // with only user messages would persist tenant-specific identity text
+    // to the log even though the priorities never reached an LLM call.
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const infoSpy = vi.spyOn(logger, 'info').mockImplementation(() => undefined);
+    const out = await papelDriftDetector.detect({
+      profile_active: makeMigration061Profile({
+        priorities: [],
+        identityPrinciples: [],
+        coreImmutablePrinciples: [],
+      }),
+      recent_messages: [
+        { id: 'u1', from: 'user', text: 'oi', created_at: new Date() },
+      ],
+    });
+    expect(out).toBeNull();
+    expect(messagesCreateMock).not.toHaveBeenCalled();
+    const emptyWarnCalls = warnSpy.mock.calls.filter(
+      ([, msg]) => msg === 'papel_drift.priorities_empty_all_sources',
+    );
+    expect(emptyWarnCalls).toHaveLength(0);
+    const fallbackInfoCalls = infoSpy.mock.calls.filter(
+      ([, msg]) => msg === 'papel_drift.priorities_fallback_used',
+    );
+    expect(fallbackInfoCalls).toHaveLength(0);
+    warnSpy.mockRestore();
+    infoSpy.mockRestore();
+  });
+
+  it('Codex #180: sem mensagens do agente + identity.principles populadas → não loga fallback info', async () => {
+    // Same regression as above, but with a populated principles fallback —
+    // before the fix this emitted the info log even when no audit happened.
+    const infoSpy = vi.spyOn(logger, 'info').mockImplementation(() => undefined);
+    const out = await papelDriftDetector.detect({
+      profile_active: makeMigration061Profile({
+        priorities: [],
+        identityPrinciples: ['preservar_capital', 'clareza_acima_de_tudo'],
+        coreImmutablePrinciples: ['preservar_capital', 'clareza_acima_de_tudo'],
+      }),
+      recent_messages: [
+        { id: 'u1', from: 'user', text: 'oi', created_at: new Date() },
+      ],
+    });
+    expect(out).toBeNull();
+    expect(messagesCreateMock).not.toHaveBeenCalled();
+    const fallbackInfoCalls = infoSpy.mock.calls.filter(
+      ([, msg]) => msg === 'papel_drift.priorities_fallback_used',
+    );
+    expect(fallbackInfoCalls).toHaveLength(0);
+    infoSpy.mockRestore();
+  });
+
+  it('fallback usado uma vez (info) → não loga novamente para o mesmo profile_id', async () => {
+    const infoSpy = vi.spyOn(logger, 'info').mockImplementation(() => undefined);
+    messagesCreateMock.mockResolvedValue(
+      makeAnthropicReply({ drift_detected: false }),
+    );
+
+    const profile = makeMigration061Profile({
+      priorities: [],
+      identityPrinciples: ['clareza', 'preservar_capital'],
+      coreImmutablePrinciples: ['clareza', 'preservar_capital'],
+    });
+
+    await papelDriftDetector.detect({
+      profile_active: profile,
+      recent_messages: [makeAgentMsg('a')],
+    });
+    await papelDriftDetector.detect({
+      profile_active: profile,
+      recent_messages: [makeAgentMsg('b')],
+    });
+
+    const fallbackLogs = infoSpy.mock.calls.filter(
+      ([, msg]) => msg === 'papel_drift.priorities_fallback_used',
+    );
+    expect(fallbackLogs).toHaveLength(1);
+    infoSpy.mockRestore();
+  });
+
+  it('non-string entries em principles são filtradas (não vazam pro prompt)', async () => {
+    messagesCreateMock.mockResolvedValueOnce(
+      makeAnthropicReply({ drift_detected: false }),
+    );
+    await papelDriftDetector.detect({
+      profile_active: makeMigration061Profile({
+        priorities: [],
+        identityPrinciples: ['valido', 42, null, { obj: true }, '   '],
+        coreImmutablePrinciples: [],
+      }),
+      recent_messages: [makeAgentMsg('algo')],
+    });
+    const prompt = getLastUserPrompt();
+    expect(prompt).toContain('PRIORIDADES: valido');
+    expect(prompt).not.toContain('42');
+    expect(prompt).not.toContain('[object Object]');
   });
 });
