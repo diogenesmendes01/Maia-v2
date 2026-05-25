@@ -4329,8 +4329,16 @@ export const operationalProfileVersionsRepo = {
     profile_body: ProfileBody;
     proposed_by: string;
     proposed_reason?: string;
-    /** Expected current active id; if mismatch, throws — protects against
-     *  the caller having read stale data outside the tx. */
+    /**
+     * Expected current active id; if mismatch, throws — protects against
+     * the caller having read stale data outside the tx.
+     *
+     * Codex PR #202 [HIGH]: REQUIRED for non-initial seeds (any seed where
+     * prior versions exist for this agent). The seed throws
+     * `seed_atomic_missing_predecessor_expectation` when omitted on a
+     * non-initial allocation. Initial seeds (`nextV === 1`, no prior
+     * versions) accept an absent expectation.
+     */
     expected_current_active_id?: string;
   }): Promise<{
     new_active: AgentOperationalProfileVersion;
@@ -4382,6 +4390,53 @@ export const operationalProfileVersionsRepo = {
         .for('update')
         .limit(1);
       const currentActive = activeRows[0] ?? null;
+
+      // Codex Adversarial Review of PR #202 (issue #195 follow-up, [HIGH]) —
+      // closed lost-write window for the "rolled-back-before-lock" path.
+      //
+      // After the `FOR UPDATE` re-read above, a row whose status was
+      // concurrently flipped to a non-active value (e.g. `rolled_back` by
+      // the drift engine, `frozen` by another writer) disappears from the
+      // `status='active'` result set. Pre-#202, when the caller omitted
+      // `expected_current_active_id`, this code:
+      //
+      //   1. Saw `currentActive == null` (the rolled-back row is no
+      //      longer 'active').
+      //   2. Skipped the freeze step entirely (no active row to freeze).
+      //   3. Inserted a brand-new `status='active'` row, immediately
+      //      re-enabling runtime profile state — defeating the rollback's
+      //      intent (the decision engine wanted the agent OFF, not
+      //      OFF-then-ON-with-a-new-row).
+      //
+      // The single production caller (`scripts/p8d-migration-priorities.ts`)
+      // already passes `expected_current_active_id` because it has read
+      // `getActive()` first. There is no legitimate production code path
+      // today that creates a non-initial active version without first
+      // observing the predecessor. Make that contract explicit:
+      //
+      //   - `nextV === 1` (no prior versions for this agent) is the
+      //     legitimate "initial seed" case — there is no predecessor to be
+      //     stale against, so omitting `expected_current_active_id` is OK.
+      //   - `nextV > 1` (prior versions exist) means the caller is
+      //     re-seeding an agent whose history is non-empty. The caller
+      //     MUST declare which active row they expect to supersede,
+      //     because that is the ONLY way to detect "the predecessor was
+      //     rolled back under us between my `getActive()` and this lock".
+      //     Omitting the expectation throws and the tx rolls back —
+      //     no silent re-activation post-rollback.
+      //
+      // Future intentional "no-active recovery seed" (e.g. operator
+      // creating a fresh active after every prior version was rolled back
+      // manually) should add an explicit `allow_no_predecessor: true`
+      // input. Today no caller needs that path; surface it as a typed
+      // error so any future addition has to opt in deliberately.
+      if (nextV > 1 && !input.expected_current_active_id) {
+        throw new Error(
+          'seed_atomic_missing_predecessor_expectation: ' +
+            `non-initial seed (nextV=${nextV}) requires expected_current_active_id ` +
+            'to detect concurrent rollback/freeze of the predecessor',
+        );
+      }
 
       if (
         input.expected_current_active_id &&

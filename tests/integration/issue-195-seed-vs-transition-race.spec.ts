@@ -444,4 +444,140 @@ d('seedNewActiveAtomic vs transition cross-writer race (issue #195, real DB)', (
       verify.release();
     }
   });
+
+  /**
+   * Scenario D — Codex Adversarial Review of PR #202 [HIGH] regression.
+   *
+   * After the new `FOR UPDATE` re-read inside `seedNewActiveAtomic`, a
+   * row whose status was concurrently flipped to a non-active value
+   * (e.g. `rolled_back` by the drift engine) disappears from the
+   * `status='active'` result set. The pre-#202 contract treated that as
+   * `currentActive = null` and silently fell through to:
+   *
+   *   1. Skip the freeze step entirely (no active row to freeze).
+   *   2. Insert a brand-new `status='active'` row.
+   *
+   * That preserves v1's `rolled_back` state but immediately re-enables
+   * runtime profile state on v2 — defeating the rollback's intent (the
+   * decision engine wanted the agent OFF, not OFF-then-ON-with-a-new-row).
+   *
+   * The fix: when the seed sees a non-initial allocation (`nextV > 1`,
+   * meaning prior versions exist for this agent), the caller MUST
+   * declare `expected_current_active_id`. Omitting it on a non-initial
+   * seed throws `seed_atomic_missing_predecessor_expectation` and rolls
+   * the tx back. Initial seeds (`nextV === 1`, no prior versions) still
+   * accept an absent expectation — there is nothing to be stale against.
+   *
+   * Pre-fix behaviour: seed succeeds, two rows end up in the DB
+   * (v1 rolled_back + v2 active).
+   *
+   * Post-fix behaviour: seed throws, tx rolls back, only v1 remains.
+   */
+  it('non-initial seed without expected_current_active_id throws after concurrent rollback', async () => {
+    const { operationalProfileVersionsRepo } = await import('../../src/db/repositories.js');
+    const { runWithTenantContext } = await import('../../src/db/tenant-context.js');
+
+    const v1Id = await seedV1Active();
+
+    // Roll v1 back out-of-band so when the seed runs its FOR UPDATE
+    // re-read, no `status='active'` row exists. This simulates the
+    // drift engine's rollback landing BEFORE the seed acquired its lock
+    // (the harder-to-detect case Codex flagged — the seed has no way to
+    // distinguish "agent never had an active row" from "agent's active
+    // row was just rolled back" without an explicit expectation).
+    const setup = await pool.connect();
+    try {
+      await setup.query(
+        `UPDATE agent_operational_profile_versions
+            SET status = 'rolled_back',
+                rolled_back_at = now(),
+                rollback_reason = $2
+          WHERE id = $1`,
+        [v1Id, 'drift_critical_before_seed_lock'],
+      );
+    } finally {
+      setup.release();
+    }
+
+    // Caller forgets to pass `expected_current_active_id`. Pre-fix this
+    // would silently insert v2 as `active`, re-enabling runtime state
+    // post-rollback. Post-fix the seed must refuse.
+    const seedPromise = runWithTenantContext({ tenant_id: T, agent_id: A }, async () =>
+      operationalProfileVersionsRepo.seedNewActiveAtomic({
+        profile_body: {
+          metadata: { previous_version_id: v1Id },
+        } as unknown as Parameters<
+          typeof operationalProfileVersionsRepo.seedNewActiveAtomic
+        >[0]['profile_body'],
+        proposed_by: 'p8d-migration',
+        proposed_reason: 'forgot to pass expectation after concurrent rollback',
+      }),
+    );
+
+    await expect(seedPromise).rejects.toThrow(
+      /seed_atomic_missing_predecessor_expectation/i,
+    );
+
+    // Verify tx rolled back — only v1 exists, still rolled_back.
+    const verify = await pool.connect();
+    try {
+      const r = await verify.query<{ count: string }>(
+        `SELECT COUNT(*)::text AS count
+           FROM agent_operational_profile_versions
+          WHERE tenant_id = $1 AND agent_id = $2`,
+        [T, A],
+      );
+      expect(r.rows[0]!.count).toBe('1');
+
+      const v1 = await verify.query<{ status: string }>(
+        `SELECT status FROM agent_operational_profile_versions WHERE id = $1`,
+        [v1Id],
+      );
+      expect(v1.rows[0]!.status).toBe('rolled_back');
+
+      // CRITICAL invariant: no active row exists. The agent is OFF, as
+      // the rollback intended.
+      const active = await verify.query<{ count: string }>(
+        `SELECT COUNT(*)::text AS count
+           FROM agent_operational_profile_versions
+          WHERE tenant_id = $1 AND agent_id = $2 AND status = 'active'`,
+        [T, A],
+      );
+      expect(active.rows[0]!.count).toBe('0');
+    } finally {
+      verify.release();
+    }
+  });
+
+  /**
+   * Scenario E — Codex PR #202 [HIGH]: initial seeds (nextV === 1, no
+   * prior versions) MUST still accept an absent `expected_current_active_id`.
+   * There is no predecessor to be stale against, so the requirement only
+   * binds when prior versions exist. This is the "don't break legitimate
+   * first-version creation" guard.
+   */
+  it('initial seed (no prior versions) without expected_current_active_id succeeds', async () => {
+    const { operationalProfileVersionsRepo } = await import('../../src/db/repositories.js');
+    const { runWithTenantContext } = await import('../../src/db/tenant-context.js');
+
+    // No versions seeded for this agent — the reset in beforeEach already
+    // truncated. The seed should treat this as an initial allocation.
+    const result = await runWithTenantContext(
+      { tenant_id: T, agent_id: A },
+      async () =>
+        operationalProfileVersionsRepo.seedNewActiveAtomic({
+          profile_body: {
+            metadata: { previous_version_id: null },
+          } as unknown as Parameters<
+            typeof operationalProfileVersionsRepo.seedNewActiveAtomic
+          >[0]['profile_body'],
+          proposed_by: 'p8d-migration',
+          proposed_reason: 'initial seed for brand-new agent',
+        }),
+    );
+
+    expect(result.new_active.version).toBe(1);
+    expect(result.new_active.status).toBe('active');
+    expect(result.frozen_previous).toBeNull();
+  });
 });
