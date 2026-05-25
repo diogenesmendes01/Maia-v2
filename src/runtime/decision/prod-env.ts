@@ -495,8 +495,24 @@ const lockdownReaderAdapter = new LockdownReaderProdAdapter();
  * channel_policies.agent_id is the owning/default agent for the channel.  No
  * JOIN to roles or agents is needed because agent_id is a direct column.
  */
+// `channel_policies.channel_id` is a `uuid` column. The single-channel hot
+// path (FEATURE_MULTI_CHANNEL off) feeds the sentinel string 'default' as the
+// channel id (see build-base-context.ts: `channel_id ?? 'default'`), which is
+// not a uuid. Querying the uuid column with it makes Postgres throw
+// `invalid input syntax for type uuid: "default"`, which propagates up and
+// fail-closes the entire Decision Engine turn. A non-uuid channel id can never
+// match a stored policy row anyway, so short-circuit to the context agent —
+// the same outcome as the zero-row fallback below for an unconfigured (but
+// uuid-shaped) channel.
+const CHANNEL_ID_UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 const channelPoliciesReaderAdapter: ChannelPoliciesReader = {
   async getForChannel(tenant_id, channel_id) {
+    if (!CHANNEL_ID_UUID_RE.test(channel_id)) {
+      return { tenant_id, channel_id, default_agent_id: getCurrentAgent() };
+    }
+
     const rows = await db
       .select({ agent_id: channel_policies.agent_id })
       .from(channel_policies)
