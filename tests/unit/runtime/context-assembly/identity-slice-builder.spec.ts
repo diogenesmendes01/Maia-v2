@@ -10,6 +10,7 @@ import {
   type OperationalProfilePort,
   type OperationalProfileRecord,
 } from '@/runtime/context-assembly/slice-builders/identity-slice-builder.js';
+import type { IdentitySlice } from '@/runtime/context-packet/types.js';
 import { InMemorySliceCache } from '@/runtime/context-packet/cache/slice-cache.js';
 import {
   InvalidationBus,
@@ -221,6 +222,71 @@ describe('IdentitySliceBuilder', () => {
       signal: AbortSignal.timeout(600),
     });
     expect(result.slice.priorities).toEqual([]);
+  });
+
+  // Issue #200 codex review [HIGH] — pre-fix leaked entries remain cache-compatible.
+  // Before the fix, the cache scope was salted with schema_version='v3.1.1' and
+  // the builder synthesized priorities from principles when identity.priorities
+  // was empty. Any cache row produced by that fallback still contained leaked
+  // principle text under slice.priorities and would be served verbatim until
+  // expiry (5min TTL) or explicit invalidation. The fix bumps the cache scope
+  // version so post-deploy lookups generate a fresh key — old entries become
+  // unreachable, and the strict extraction always runs.
+  it('Issue #200 [HIGH]: cached pre-fix slice with leaked priorities is NOT served after deploy', async () => {
+    const builder = new IdentitySliceBuilder(withRepo(PROFILE_RECORD), cache);
+
+    // Simulate a pre-fix cache entry: priorities contains principles text.
+    // Reproduce the OLD cache key by salting the scope with the previous
+    // version literal — this is exactly what stale Redis rows look like
+    // post-deploy.
+    const { createHash } = await import('node:crypto');
+    const oldScope = createHash('sha256')
+      .update(
+        JSON.stringify({
+          agent_id: 'agent1',
+          depth: 'full',
+          schema_version: 'v3.1.1',
+        }),
+      )
+      .digest('hex')
+      .substring(0, 12);
+    const oldKey = `maia:context:tenant1:identity:${oldScope}`;
+    const leaked: IdentitySlice = {
+      role_descriptor: 'Assistente financeira',
+      voice: { tone: 'amistoso', formality: 'medium', verbosity: 'concise' },
+      cognitive_limits: {
+        max_inference_depth: 3,
+        max_speculation_in_response: 0.2,
+        confidence_floor_for_action: 0.7,
+      },
+      // The pre-fix bug: principles synthesized into priorities.
+      priorities: ['transparência radical', 'preservar a evidência'],
+      learned_voice_modifiers: [],
+      schema_version: 'v3.1.1-2026-05-15',
+      version_id: 'old-leaked-profile',
+    };
+    await cache.set(oldKey, leaked, 300);
+
+    // After the fix, the cache key is salted with a NEW version. The leaked
+    // entry above must NOT be served — the builder must miss cache, rebuild
+    // strictly from identity.priorities=['proteger autonomia do owner', ...]
+    // (the fixture's canonical priorities), and the leaked principle text
+    // must NOT appear in slice.priorities.
+    const result = await builder.build({
+      base: mockBase(),
+      requirements: { depth: 'full' },
+      decision: mockDecision(),
+      signal: AbortSignal.timeout(600),
+    });
+
+    expect(result.cache_hit).toBe(false);
+    expect(result.slice.priorities).not.toContain('transparência radical');
+    expect(result.slice.priorities).not.toContain('preservar a evidência');
+    // Confirms a fresh strict extraction ran.
+    expect(result.slice.priorities).toEqual([
+      'proteger autonomia do owner',
+      'preservar evidência',
+    ]);
   });
 
   it('cache invalidates on identity_profile_activated event', async () => {

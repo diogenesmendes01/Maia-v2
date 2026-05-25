@@ -107,7 +107,14 @@ export class IdentitySliceBuilder
     const scope = hashShort({
       agent_id: base.agent_id,
       depth: req.depth,
-      schema_version: 'v3.1.1',
+      // Issue #200 codex review [HIGH]: bumped from 'v3.1.1' to
+      // 'v3.1.1-issue192' so post-deploy lookups generate a fresh cache key.
+      // Pre-fix entries (which leaked principles into slice.priorities) become
+      // unreachable and the strict extraction always re-runs. Without this
+      // bump, leaked cache rows continue to serve the cross-channel leak for
+      // up to one full identity TTL (5min) after deploy. See migration 061's
+      // SQL comment forbidding this leak.
+      schema_version: 'v3.1.1-issue192',
     });
     return sliceCacheKey(base.tenant_id, 'identity', scope);
   }
