@@ -37,8 +37,15 @@ let mockFast = 'anthropic/claude-haiku-4.5';
 // these to decide whether to pass null vs the observed value as
 // expected_*. Default 'global' so the existing tests keep their
 // pre-round-4 behavior.
-let mockMainSource: 'global' | 'legacy' | 'env' = 'global';
-let mockFastSource: 'global' | 'legacy' | 'env' = 'global';
+// Codex round 6 [high]: 'global_mismatched' added. When this source
+// is set, the router exposes the stored row in stored_main/stored_fast
+// and the UI sends that row back as the expected token.
+let mockMainSource: 'global' | 'global_mismatched' | 'legacy' | 'env' =
+  'global';
+let mockFastSource: 'global' | 'global_mismatched' | 'legacy' | 'env' =
+  'global';
+let mockMainStored: Record<string, unknown> | undefined;
+let mockFastStored: Record<string, unknown> | undefined;
 
 type AtomicCall = {
   main: string;
@@ -47,8 +54,10 @@ type AtomicCall = {
   // exercise the expected_* round-trip from router input to helper
   // call, including the conflict-mode mock below.
   // Codex round 4 [high]: nullable for fresh-install path.
-  expected_main: string | null;
-  expected_fast: string | null;
+  // Codex round 6 [high]: also accepts a Record<string, unknown> for
+  // the global_mismatched UI repair path.
+  expected_main: string | Record<string, unknown> | null;
+  expected_fast: string | Record<string, unknown> | null;
   updated_by: string;
   actor_role: string;
   tenant_id: string;
@@ -69,9 +78,27 @@ vi.mock('@/lib/llm-settings.js', () => ({
   // (source-aware) instead of the single-value getters. Both helpers
   // remain mocked because the integration tests still reach for the
   // legacy names.
+  // Codex round 6 [high]: shape grew a `stored` field for the
+  // 'global_mismatched' source. The mock returns it only when the
+  // source is 'global_mismatched' (matches the real helper's
+  // discriminated-union return type).
   getCurrentLLMSettings: vi.fn(async () => ({
-    main: { value: mockMain, source: mockMainSource },
-    fast: { value: mockFast, source: mockFastSource },
+    main:
+      mockMainSource === 'global_mismatched'
+        ? {
+            value: mockMain,
+            source: 'global_mismatched' as const,
+            stored: mockMainStored ?? {},
+          }
+        : { value: mockMain, source: mockMainSource },
+    fast:
+      mockFastSource === 'global_mismatched'
+        ? {
+            value: mockFast,
+            source: 'global_mismatched' as const,
+            stored: mockFastStored ?? {},
+          }
+        : { value: mockFast, source: mockFastSource },
   })),
   getCurrentMainModel: vi.fn(async () => mockMain),
   getCurrentFastModel: vi.fn(async () => mockFast),
@@ -169,6 +196,8 @@ beforeEach(() => {
   mockFast = 'anthropic/claude-haiku-4.5';
   mockMainSource = 'global';
   mockFastSource = 'global';
+  mockMainStored = undefined;
+  mockFastStored = undefined;
 });
 
 describe('llmSettingsRouter.get — founder gate', () => {
@@ -402,7 +431,11 @@ describe('llmSettingsRouter — provider gate (Codex round 4)', () => {
     expect(res.items.map((m) => m.id)).toEqual(['claude-sonnet-4-6']);
   });
 
-  it('catalog returns full unfiltered set when provider=openrouter', async () => {
+  it('catalog returns vendor/model items when provider=openrouter (round 6 filter)', async () => {
+    // Codex round 6 [medium]: catalog now applies isSlugCompatible to
+    // every item before emit, mirroring the update-gate. Both mock
+    // catalog items pass (`anthropic/claude-sonnet-4.6` and
+    // `openai/gpt-5` both match the vendor/model regex).
     mockProvider = 'openrouter';
     const res = await caller('founder').catalog();
     expect(res.provider).toBe('openrouter');
@@ -527,7 +560,7 @@ describe('llmSettingsRouter — provider gate (Codex round 4)', () => {
     expect(atomicCalls).toHaveLength(0);
   });
 
-  it('update accepts any slug when provider=openrouter', async () => {
+  it('update accepts vendor/model slug when provider=openrouter', async () => {
     mockProvider = 'openrouter';
     const res = await caller('founder').update({
       main: 'openai/gpt-5',
@@ -537,6 +570,128 @@ describe('llmSettingsRouter — provider gate (Codex round 4)', () => {
       comment: 'openrouter accepts every vendor prefix',
     });
     expect(res.ok).toBe(true);
+  });
+
+  // Codex round 6 [medium]: OpenRouter requires `<vendor>/<model>`
+  // shape. Persisting a bare Anthropic-native ID under
+  // provider=openrouter would 400 on every runtime LLM call (the
+  // OpenRouter Chat Completions endpoint rejects unprefixed IDs).
+  // Reject at validation instead of waiting for the runtime fault.
+  it('update REJECTS bare Anthropic-native slug when provider=openrouter (round 6)', async () => {
+    mockProvider = 'openrouter';
+    await expect(
+      caller('founder').update({
+        main: 'claude-sonnet-4-6',
+        fast: 'anthropic/claude-haiku-4.5',
+        expected_main: 'anthropic/claude-sonnet-4.6',
+        expected_fast: 'anthropic/claude-haiku-4.5',
+        comment: 'bare claude slug under openrouter would 400 at runtime',
+      }),
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+    expect(atomicCalls).toHaveLength(0);
+  });
+
+  it('update rejects bare slug on fast side when provider=openrouter (round 6)', async () => {
+    mockProvider = 'openrouter';
+    await expect(
+      caller('founder').update({
+        main: 'anthropic/claude-sonnet-4.6',
+        fast: 'gpt-5', // no vendor prefix
+        expected_main: 'anthropic/claude-sonnet-4.6',
+        expected_fast: 'anthropic/claude-haiku-4.5',
+        comment: 'bare gpt-5 under openrouter is unroutable',
+      }),
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+    expect(atomicCalls).toHaveLength(0);
+  });
+
+  it('update error message names the vendor/model shape OpenRouter needs (round 6)', async () => {
+    mockProvider = 'openrouter';
+    await expect(
+      caller('founder').update({
+        main: 'claude-sonnet-4-6',
+        fast: 'anthropic/claude-haiku-4.5',
+        expected_main: null,
+        expected_fast: null,
+        comment: 'message should mention vendor/model shape',
+      }),
+    ).rejects.toMatchObject({
+      code: 'BAD_REQUEST',
+      message: expect.stringContaining('vendor/model'),
+    });
+  });
+
+  it('update accepts anthropic/claude-* (with prefix) when provider=openrouter (round 6)', async () => {
+    mockProvider = 'openrouter';
+    const res = await caller('founder').update({
+      main: 'anthropic/claude-sonnet-4.6',
+      fast: 'anthropic/claude-haiku-4.5',
+      expected_main: 'anthropic/claude-sonnet-4.6',
+      expected_fast: 'anthropic/claude-haiku-4.5',
+      comment: 'OpenRouter form with vendor prefix is the canonical shape',
+    });
+    expect(res.ok).toBe(true);
+  });
+});
+
+// Codex round 6 on PR #188 [high]: provider-mismatch UI repair.
+// `get` now exposes `stored_main`/`stored_fast` when the corresponding
+// source is `'global_mismatched'`; the UI passes those values to
+// `update` as `expected_*` so the repo's subset-match accepts the
+// override and overwrites the mismatched row atomically.
+describe('llmSettingsRouter — global_mismatched UI repair (Codex round 6)', () => {
+  it("get exposes stored_main when mainSource === 'global_mismatched'", async () => {
+    mockMainSource = 'global_mismatched';
+    mockMainStored = { model: 'claude-sonnet-4-6', provider: 'anthropic' };
+    mockProvider = 'openrouter';
+    const res = await caller('founder').get();
+    expect(res.mainSource).toBe('global_mismatched');
+    expect(res.stored_main).toEqual({
+      model: 'claude-sonnet-4-6',
+      provider: 'anthropic',
+    });
+    // fast side stays in the global path; its stored is null.
+    expect(res.fastSource).toBe('global');
+    expect(res.stored_fast).toBeNull();
+  });
+
+  it("get sets stored_main=null when source is 'global'/'env'/'legacy'", async () => {
+    mockMainSource = 'global';
+    mockFastSource = 'env';
+    const res = await caller('founder').get();
+    expect(res.stored_main).toBeNull();
+    expect(res.stored_fast).toBeNull();
+  });
+
+  it('update accepts an object expected_main (UI sends stored row back)', async () => {
+    const storedRow = { model: 'claude-sonnet-4-6', provider: 'anthropic' };
+    const res = await caller('founder').update({
+      main: 'openai/gpt-5',
+      fast: 'x-ai/grok-4.1-fast',
+      // The UI saw source='global_mismatched' and is sending the
+      // full stored row back as the expected token.
+      expected_main: storedRow,
+      expected_fast: null,
+      comment: 'repair provider-mismatched row by overwriting it',
+    });
+    expect(res.ok).toBe(true);
+    expect(atomicCalls).toHaveLength(1);
+    expect(atomicCalls[0]!.expected_main).toEqual(storedRow);
+    expect(atomicCalls[0]!.expected_fast).toBeNull();
+  });
+
+  it('update accepts object on fast side too', async () => {
+    const storedRow = { model: 'openai/gpt-5', provider: 'openrouter' };
+    mockProvider = 'anthropic';
+    const res = await caller('founder').update({
+      main: 'claude-sonnet-4-6',
+      fast: 'claude-haiku-4-5-20251001',
+      expected_main: null,
+      expected_fast: storedRow,
+      comment: 'repair fast side from openrouter-stored to anthropic-native',
+    });
+    expect(res.ok).toBe(true);
+    expect(atomicCalls[0]!.expected_fast).toEqual(storedRow);
   });
 });
 

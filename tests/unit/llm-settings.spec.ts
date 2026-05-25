@@ -53,34 +53,13 @@ const globalSettingsRepoMock = {
   ),
 };
 
-// Codex round 5 [high]: legacy shim now writes back to agent_facts via
-// factsRepo.upsert. Mock it so we can assert call shape without hitting
-// the real applyTenantGuard path.
-const factsRepoUpsertMock = vi.fn(
-  async (input: {
-    escopo: string;
-    chave: string;
-    valor: unknown;
-    fonte: string;
-  }) => ({ id: 'mock-id', ...input }),
-);
+// Codex round 6 [high]: setCurrent*Model shims were removed in this
+// round (PR #176 retired the legacy /dashboard/llm-settings route, the
+// only caller). factsRepo / tenant-context mocks are no longer needed
+// by these tests.
 
 vi.mock('../../src/db/repositories.js', () => ({
   globalSettingsRepo: globalSettingsRepoMock,
-  factsRepo: { upsert: factsRepoUpsertMock },
-}));
-
-// Codex round 5 [high]: the legacy shim wraps factsRepo.upsert in
-// runWithTenantContext({tenant_id:'default', agent_id:'default'}) so
-// applyTenantGuard finds a context. Mock the wrapper to a no-op that
-// just runs the callback so tests don't need AsyncLocalStorage state.
-const runWithTenantContextMock = vi.fn(
-  async <T>(_ctx: { tenant_id: string; agent_id: string }, fn: () => Promise<T>) =>
-    fn(),
-);
-
-vi.mock('../../src/db/tenant-context.js', () => ({
-  runWithTenantContext: runWithTenantContextMock,
 }));
 
 // Codex round 3 on PR #188 [high]: getCurrent*Model now dual-reads —
@@ -174,8 +153,6 @@ beforeEach(() => {
   legacyReadShouldThrow = false;
   globalSettingsRepoMock.getByKey.mockClear();
   globalSettingsRepoMock.updateAtomic.mockClear();
-  factsRepoUpsertMock.mockClear();
-  runWithTenantContextMock.mockClear();
   mockLlmProvider = 'openrouter';
 });
 
@@ -200,75 +177,14 @@ describe('llm-settings (global_settings storage)', () => {
     expect(await getCurrentMainModel()).toBe('openai/gpt-5');
   });
 
-  // Codex round 5 on PR #188 [high]: the round-2 fail-loud throw was
-  // wrong. Until PR #176 retires the legacy `/dashboard/llm-settings`
-  // route, that form's POST handler is still wired up — throwing would
-  // 500 the page during incident response (precisely the window the
-  // feature exists to support). Round 5 reverts the shims to legacy
-  // behavior: write back to `agent_facts` via `factsRepo.upsert`, with
-  // a `llm_settings.legacy_write_used` warn log so the deprecated
-  // route can be charted to zero usage. The new admin-ui
-  // `/setup/llm-settings` still owns the canonical `global_settings`
-  // path; the shims never touch it.
-  it('legacy setCurrentMainModel writes to agent_facts via factsRepo (no global_settings touched)', async () => {
-    const { setCurrentMainModel } = await import(
-      '../../src/lib/llm-settings.js'
-    );
-    await setCurrentMainModel('openai/gpt-5');
-
-    // Wrote to agent_facts under the legacy storage shape — the
-    // round-3 dual-read fallback can find it.
-    expect(factsRepoUpsertMock).toHaveBeenCalledTimes(1);
-    expect(factsRepoUpsertMock).toHaveBeenCalledWith({
-      escopo: 'global',
-      chave: 'llm.model.main',
-      valor: { model: 'openai/gpt-5' },
-      fonte: 'configurado',
-    });
-    // Wrapped in runWithTenantContext({tenant_id:'default',
-    // agent_id:'default'}) so applyTenantGuard finds a context. The
-    // legacy single-tenant dashboard handler doesn't establish one.
-    expect(runWithTenantContextMock).toHaveBeenCalledWith(
-      { tenant_id: 'default', agent_id: 'default' },
-      expect.any(Function),
-    );
-    // The canonical (founder-only) path is NOT touched.
-    expect(globalSettingsRepoMock.updateAtomic).not.toHaveBeenCalled();
-  });
-
-  it('legacy setCurrentFastModel mirrors the main shim behavior', async () => {
-    const { setCurrentFastModel } = await import(
-      '../../src/lib/llm-settings.js'
-    );
-    await setCurrentFastModel('deepseek/deepseek-r1');
-
-    expect(factsRepoUpsertMock).toHaveBeenCalledTimes(1);
-    expect(factsRepoUpsertMock).toHaveBeenCalledWith({
-      escopo: 'global',
-      chave: 'llm.model.fast',
-      valor: { model: 'deepseek/deepseek-r1' },
-      fonte: 'configurado',
-    });
-    expect(runWithTenantContextMock).toHaveBeenCalled();
-    expect(globalSettingsRepoMock.updateAtomic).not.toHaveBeenCalled();
-  });
-
-  // Codex round 5 [high]: the deprecation warn log is the signal
-  // operators chart to monitor legacy-form usage. Confirm it fires.
-  it('legacy shim emits llm_settings.legacy_write_used warn', async () => {
-    const logger = (await import('../../src/lib/logger.js')).logger as {
-      warn: ReturnType<typeof vi.fn>;
-    };
-    logger.warn.mockClear();
-    const { setCurrentMainModel } = await import(
-      '../../src/lib/llm-settings.js'
-    );
-    await setCurrentMainModel('openai/gpt-5');
-    const calls = logger.warn.mock.calls.filter(
-      (c: unknown[]) => c[1] === 'llm_settings.legacy_write_used',
-    );
-    expect(calls.length).toBeGreaterThanOrEqual(1);
-  });
+  // Codex round 6 on PR #188 [high]: setCurrent*Model shims were
+  // REMOVED in this round. PR #176 retired the legacy Fastify
+  // `/dashboard/llm-settings` POST handler — the only caller of the
+  // shims. With no callers remaining the shims are dead code; the
+  // canonical write path is the admin-ui `llmSettingsRouter.update`
+  // (founder-only, audited, atomic). Tests that previously asserted
+  // shim behavior (write to agent_facts, deprecation warn log) were
+  // deleted in the same round.
 
   it('falls back to env default if DB throws on read (no legacy row either)', async () => {
     globalSettingsRepoMock.getByKey.mockRejectedValueOnce(
@@ -737,6 +653,190 @@ describe('llm-settings (global_settings storage)', () => {
       expect(payload.stored_provider).toBe('anthropic');
       expect(payload.current_provider).toBe('openrouter');
       expect(payload.stored_model).toBe('claude-sonnet-4-6');
+    });
+  });
+
+  // ============================================================
+  // Codex round 6 on PR #188 [high]: provider-mismatch UI repair.
+  //
+  // Before round 6: mismatch fell through to legacy/env, surface
+  // reported source='env'. UI submitted expected_*: null. The
+  // global_settings row still EXISTS (its provider just doesn't
+  // match current LLM_PROVIDER), so the repo's locked value is
+  // {model, provider} — not null. expected:null vs locked:{...}
+  // → CONFLICT. The UI couldn't save: "save → CONFLICT → refresh
+  // → still env → save → CONFLICT" never resolved.
+  //
+  // Round 6: getCurrentLLMSettings returns source='global_mismatched'
+  // and exposes the FULL stored row in `.stored`. UI sends `.stored`
+  // as expected_*, the repo's subset-match accepts it (stored matches
+  // itself), and the update overwrites the mismatched row atomically.
+  // ============================================================
+  describe('global_mismatched source (Codex round 6)', () => {
+    it('source=global_mismatched exposes stored row when provider differs', async () => {
+      mockLlmProvider = 'openrouter';
+      const storedRow = {
+        model: 'claude-sonnet-4-6',
+        provider: 'anthropic',
+      };
+      globalByKey.set('llm.model.main', {
+        value: storedRow,
+        updated_at: new Date(),
+        updated_by: 'someone-on-anthropic',
+      });
+      const { getCurrentLLMSettings } = await import(
+        '../../src/lib/llm-settings.js',
+      );
+      const r = await getCurrentLLMSettings();
+      // value must be the env default (runtime-safe slug for openrouter).
+      expect(r.main.value).toBe('anthropic/claude-sonnet-4.6');
+      expect(r.main.source).toBe('global_mismatched');
+      // The full stored row is surfaced so the UI can use it as the
+      // expected token on the next update.
+      if (r.main.source !== 'global_mismatched') throw new Error('unreachable');
+      expect(r.main.stored).toEqual(storedRow);
+    });
+
+    it('symmetric: stored=openrouter, current=anthropic → source=global_mismatched', async () => {
+      mockLlmProvider = 'anthropic';
+      const storedRow = { model: 'openai/gpt-5', provider: 'openrouter' };
+      globalByKey.set('llm.model.fast', {
+        value: storedRow,
+        updated_at: new Date(),
+        updated_by: 'someone-on-openrouter',
+      });
+      const { getCurrentLLMSettings } = await import(
+        '../../src/lib/llm-settings.js',
+      );
+      const r = await getCurrentLLMSettings();
+      expect(r.fast.source).toBe('global_mismatched');
+      if (r.fast.source !== 'global_mismatched') throw new Error('unreachable');
+      expect(r.fast.stored).toEqual(storedRow);
+      // value is env default for anthropic
+      expect(r.fast.value).toBe('claude-haiku-4-5-20251001');
+    });
+
+    it('end-to-end UI repair: submit stored row as expected → update succeeds', async () => {
+      mockLlmProvider = 'openrouter';
+      const storedRow = {
+        model: 'claude-sonnet-4-6',
+        provider: 'anthropic',
+      };
+      globalByKey.set('llm.model.main', {
+        value: storedRow,
+        updated_at: new Date(),
+        updated_by: 'someone-on-anthropic',
+      });
+      // Configure the mock to enforce subset-match for this scenario:
+      // when expected === stored, accept; when expected === null and
+      // locked !== null, conflict. This is what the real repo does.
+      globalSettingsRepoMock.updateAtomic.mockImplementationOnce(
+        async (input: {
+          keys: ReadonlyArray<{
+            key: string;
+            value: Record<string, unknown>;
+            expected?: Record<string, unknown> | null;
+          }>;
+          audit: { actor_id: string };
+        }) => {
+          const now = new Date();
+          const before: Record<string, unknown> = {};
+          const after: Record<string, unknown> = {};
+          let changed = 0;
+          for (const entry of input.keys) {
+            const lockedRow = globalByKey.get(entry.key) ?? null;
+            const lockedValue = lockedRow?.value ?? null;
+            // Strict subset-match for this test: every key in expected
+            // must equal the same key in locked.
+            const expected = entry.expected;
+            if (expected !== undefined) {
+              const matches =
+                expected === null
+                  ? lockedValue === null
+                  : lockedValue !== null &&
+                    typeof lockedValue === 'object' &&
+                    Object.keys(expected).every(
+                      (k) =>
+                        JSON.stringify(
+                          (lockedValue as Record<string, unknown>)[k],
+                        ) === JSON.stringify(expected[k]),
+                    );
+              if (!matches) {
+                return {
+                  ok: false as const,
+                  reason: 'optimistic_conflict' as const,
+                  key: entry.key,
+                  expected,
+                  current: lockedValue,
+                  before,
+                };
+              }
+            }
+            before[entry.key] = lockedValue;
+            after[entry.key] = entry.value;
+            globalByKey.set(entry.key, {
+              value: entry.value,
+              updated_at: now,
+              updated_by: input.audit.actor_id,
+            });
+            changed++;
+          }
+          if (changed === 0) {
+            return {
+              ok: false as const,
+              reason: 'no_changes' as const,
+              before,
+            };
+          }
+          return { ok: true as const, applied_at: now, before, after };
+        },
+      );
+
+      // Simulate the UI flow: read → submit with stored row as expected.
+      const { getCurrentLLMSettings, setGlobalLLMSettingsAtomic } =
+        await import('../../src/lib/llm-settings.js');
+      const observed = await getCurrentLLMSettings();
+      // Sanity: read surfaces source=global_mismatched with the stored row.
+      if (observed.main.source !== 'global_mismatched') {
+        throw new Error('expected global_mismatched');
+      }
+      // UI passes the stored row through verbatim as expected_main.
+      const res = await setGlobalLLMSettingsAtomic({
+        main: 'openai/gpt-5',
+        fast: 'x-ai/grok-4.1-fast',
+        expected_main: observed.main.stored,
+        expected_fast: null, // fast has no row at all in this scenario
+        updated_by: 'founder@example.com',
+        actor_role: 'founder',
+        tenant_id: 'tenant-test',
+        comment: 'repair provider-mismatched row',
+      });
+      expect(res.ok).toBe(true);
+      if (!res.ok) throw new Error('unreachable');
+      // Before reflects the REAL mismatched row, not the env default.
+      expect(res.before.main).toBe('claude-sonnet-4-6');
+      expect(res.after.main).toBe('openai/gpt-5');
+    });
+
+    it('expected_*=object passes through to the repo unchanged', async () => {
+      const storedRow = { model: 'claude-sonnet-4-6', provider: 'anthropic' };
+      const { setGlobalLLMSettingsAtomic } = await import(
+        '../../src/lib/llm-settings.js',
+      );
+      await setGlobalLLMSettingsAtomic({
+        main: 'openai/gpt-5',
+        fast: 'x-ai/grok-4.1-fast',
+        expected_main: storedRow,
+        expected_fast: null,
+        updated_by: 'founder@example.com',
+        actor_role: 'founder',
+        tenant_id: 'tenant-test',
+        comment: 'object expected passes through',
+      });
+      const lastCall = globalSettingsRepoMock.updateAtomic.mock.calls.at(-1);
+      const passed = lastCall![0];
+      // Object form should pass through verbatim (NOT wrapped in {model:...}).
+      expect(passed.keys[0]!.expected).toEqual(storedRow);
     });
   });
 

@@ -115,14 +115,36 @@ export default function LlmSettingsPage() {
       // locked value is the placeholder JSON null. Now we explicitly
       // say "I didn't observe a row" and the server accepts that —
       // making the first-ever update apply correctly.
-      const expectedMain =
-        getQuery.data?.mainSource === 'global'
-          ? (getQuery.data?.main ?? null)
-          : null;
-      const expectedFast =
-        getQuery.data?.fastSource === 'global'
-          ? (getQuery.data?.fast ?? null)
-          : null;
+      //
+      // Codex round 6 on PR #188 [high]: when source === 'global_mismatched'
+      // a row exists in global_settings but its stored provider does
+      // not match the active LLM_PROVIDER. The runtime served the env
+      // default to avoid feeding the unsafe slug to the wrong
+      // provider's client. We submit the FULL stored row as
+      // expected_*: the repo's subset-match accepts it (the stored
+      // row matches itself) and the update overwrites the mismatched
+      // row atomically, recording the real before/after in the audit
+      // log.
+      const pickExpected = (
+        source: string | undefined,
+        observedValue: string | undefined,
+        stored: Record<string, unknown> | null | undefined,
+      ): string | Record<string, unknown> | null => {
+        if (source === 'global') return observedValue ?? null;
+        if (source === 'global_mismatched') return stored ?? null;
+        // 'env' | 'legacy' | undefined → no row to race against.
+        return null;
+      };
+      const expectedMain = pickExpected(
+        getQuery.data?.mainSource,
+        getQuery.data?.main,
+        getQuery.data?.stored_main,
+      );
+      const expectedFast = pickExpected(
+        getQuery.data?.fastSource,
+        getQuery.data?.fast,
+        getQuery.data?.stored_fast,
+      );
       const res = await mutation.mutateAsync({
         main: effectiveMain,
         fast: effectiveFast,
@@ -169,38 +191,78 @@ export default function LlmSettingsPage() {
       ) : getQuery.error ? (
         <p className="text-red-600">Error: {getQuery.error.message}</p>
       ) : getQuery.data ? (
-        <section className="border rounded p-4 bg-gray-50 space-y-2">
-          <h2 className="font-semibold">Currently active</h2>
-          <dl className="grid grid-cols-[120px_1fr] gap-y-1 text-sm">
-            <dt className="font-medium">Provider:</dt>
-            <dd>
-              <code>{getQuery.data.env.provider}</code>
-            </dd>
-            <dt className="font-medium">Main model:</dt>
-            <dd>
-              <code>{getQuery.data.main}</code>
-              {getQuery.data.main === getQuery.data.env.main && (
-                <span className="ml-2 text-xs text-gray-500">
-                  (env default)
-                </span>
-              )}
-            </dd>
-            <dt className="font-medium">Fast model:</dt>
-            <dd>
-              <code>{getQuery.data.fast}</code>
-              {getQuery.data.fast === getQuery.data.env.fast && (
-                <span className="ml-2 text-xs text-gray-500">
-                  (env default)
-                </span>
-              )}
-            </dd>
-            <dt className="font-medium">Env defaults:</dt>
-            <dd className="text-xs text-gray-600">
-              main=<code>{getQuery.data.env.main}</code>, fast=
-              <code>{getQuery.data.env.fast}</code>
-            </dd>
-          </dl>
-        </section>
+        <>
+          {/* Codex round 6 on PR #188 [high]: surface the provider
+              mismatch when a stored row's provider differs from the
+              active LLM_PROVIDER. The runtime is currently serving
+              the env default for safety; saving from this page will
+              overwrite the mismatched row atomically (we send the
+              full stored value as the expected token so the
+              optimistic-conflict check accepts the override).
+              Without this banner the operator sees the env default
+              and might assume the row simply doesn't exist. */}
+          {(getQuery.data.mainSource === 'global_mismatched' ||
+            getQuery.data.fastSource === 'global_mismatched') && (
+            <section className="border rounded p-4 bg-yellow-50 border-yellow-300 space-y-1 text-sm text-yellow-900">
+              <p className="font-semibold">
+                Provider mismatch detected on stored settings
+              </p>
+              <p>
+                A persisted row's stored provider does not match the
+                active provider (<code>{getQuery.data.env.provider}</code>).
+                The runtime is serving the env default for safety. Saving
+                here will overwrite the mismatched row with a
+                provider-compatible value, atomically.
+              </p>
+              <ul className="list-disc list-inside text-xs">
+                {getQuery.data.mainSource === 'global_mismatched' && (
+                  <li>
+                    main: stored=
+                    <code>{JSON.stringify(getQuery.data.stored_main)}</code>
+                  </li>
+                )}
+                {getQuery.data.fastSource === 'global_mismatched' && (
+                  <li>
+                    fast: stored=
+                    <code>{JSON.stringify(getQuery.data.stored_fast)}</code>
+                  </li>
+                )}
+              </ul>
+            </section>
+          )}
+          <section className="border rounded p-4 bg-gray-50 space-y-2">
+            <h2 className="font-semibold">Currently active</h2>
+            <dl className="grid grid-cols-[120px_1fr] gap-y-1 text-sm">
+              <dt className="font-medium">Provider:</dt>
+              <dd>
+                <code>{getQuery.data.env.provider}</code>
+              </dd>
+              <dt className="font-medium">Main model:</dt>
+              <dd>
+                <code>{getQuery.data.main}</code>
+                {getQuery.data.main === getQuery.data.env.main && (
+                  <span className="ml-2 text-xs text-gray-500">
+                    (env default)
+                  </span>
+                )}
+              </dd>
+              <dt className="font-medium">Fast model:</dt>
+              <dd>
+                <code>{getQuery.data.fast}</code>
+                {getQuery.data.fast === getQuery.data.env.fast && (
+                  <span className="ml-2 text-xs text-gray-500">
+                    (env default)
+                  </span>
+                )}
+              </dd>
+              <dt className="font-medium">Env defaults:</dt>
+              <dd className="text-xs text-gray-600">
+                main=<code>{getQuery.data.env.main}</code>, fast=
+                <code>{getQuery.data.env.fast}</code>
+              </dd>
+            </dl>
+          </section>
+        </>
       ) : null}
 
       <form onSubmit={handleSubmit} className="space-y-4">
