@@ -73,6 +73,36 @@ describe('buildPromptFromPacket', () => {
     expect(result.system).toContain('proteger autonomia');
   });
 
+  // Issue #192 — once identity-slice-builder is fixed to keep slice.priorities
+  // strictly from identity.priorities, a profile migrated by 061 (priorities=[],
+  // principles=[...]) renders an IdentitySlice whose .priorities is []. The
+  // renderer must NOT emit a "Prioridades:" line populated with principles
+  // text — otherwise migrated rows ship human principles under the priorities
+  // channel until the slug migration runs.
+  it('Issue #192: migrated profile with priorities=[] does not render principles under "Prioridades"', () => {
+    const result = buildPromptFromPacket(
+      minimalPacket({
+        identity: {
+          role_descriptor: 'maia',
+          voice: { tone: 'amistoso', formality: 'medium', verbosity: 'concise' },
+          cognitive_limits: {
+            max_inference_depth: 2,
+            max_speculation_in_response: 0.2,
+            confidence_floor_for_action: 0.7,
+          },
+          priorities: [], // post-061 migrated row, slug migration not yet run
+          learned_voice_modifiers: [],
+          schema_version: 'v3.1.1',
+          version_id: 'v1',
+          principles: ['transparência radical', 'preservar a evidência'],
+        },
+      }),
+    );
+    expect(result.system).not.toContain('Prioridades:');
+    expect(result.system).not.toContain('transparência radical');
+    expect(result.system).not.toContain('preservar a evidência');
+  });
+
   it('skips empty slices (no policy, soul, knowledge, user, skill, tool)', () => {
     const result = buildPromptFromPacket(minimalPacket());
     expect(result.system).not.toContain('## Políticas');

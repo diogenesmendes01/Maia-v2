@@ -140,6 +140,89 @@ describe('IdentitySliceBuilder', () => {
     expect(second.slice.role_descriptor).toBe('Assistente financeira');
   });
 
+  // Issue #192 — migration 061 leaves identity.priorities=[] for legacy rows
+  // intentionally; only the p8d slug migration may populate canonical
+  // priorities. The slice MUST NOT synthesize priorities from principles
+  // (identity.principles or core_immutable.principles), otherwise the
+  // build-prompt-from-packet renderer would surface human principles text
+  // under "## Prioridades" until the slug migration runs — exactly the leak
+  // migration 061's comment warns against. principles still flow through
+  // the (future, separate) slice.principles channel — never through
+  // slice.priorities.
+  it('Issue #192: priorities=[] + identity.principles → slice.priorities stays []', async () => {
+    const builder = new IdentitySliceBuilder(
+      withRepo({
+        id: 'profile-migrated-061',
+        profile_body: {
+          schema_version: 'v3.1.1-2026-05-15',
+          identity: {
+            role_descriptor: 'Assistente financeira',
+            voice: { tone: 'claro', formality: 'medium', verbosity: 'concise' },
+            cognitive_limits: {
+              max_inference_depth: 3,
+              max_speculation_in_response: 0.2,
+              confidence_floor_for_action: 0.7,
+            },
+            priorities: [],
+            // Migration 061 backfills identity.principles from
+            // core_immutable.principles. These are human-readable
+            // principles, NOT canonical priority slugs.
+            // @ts-expect-error principles isn't in the P8a port shape; the
+            // builder reads it as an unknown record at runtime, which is
+            // exactly what migrated rows look like.
+            principles: ['transparência radical', 'preservar a evidência'],
+            learned_voice_modifiers: [],
+          },
+        },
+      }),
+      cache,
+    );
+    const result = await builder.build({
+      base: mockBase(),
+      requirements: { depth: 'full' },
+      decision: mockDecision(),
+      signal: AbortSignal.timeout(600),
+    });
+    // Critical: priorities must be empty — never leak principles.
+    expect(result.slice.priorities).toEqual([]);
+  });
+
+  it('Issue #192: priorities=[] + core_immutable.principles → slice.priorities stays []', async () => {
+    const builder = new IdentitySliceBuilder(
+      withRepo({
+        id: 'profile-migrated-061-core',
+        profile_body: {
+          schema_version: 'v3.1.1-2026-05-15',
+          identity: {
+            role_descriptor: 'Assistente financeira',
+            voice: { tone: 'claro', formality: 'medium', verbosity: 'concise' },
+            cognitive_limits: {
+              max_inference_depth: 3,
+              max_speculation_in_response: 0.2,
+              confidence_floor_for_action: 0.7,
+            },
+            priorities: [],
+            learned_voice_modifiers: [],
+          },
+          // Direct-embed legacy layer left by migration 061.
+          // @ts-expect-error core_immutable isn't in the P8a port shape; the
+          // builder reads it as an unknown record at runtime.
+          core_immutable: {
+            principles: ['transparência radical', 'preservar a evidência'],
+          },
+        },
+      }),
+      cache,
+    );
+    const result = await builder.build({
+      base: mockBase(),
+      requirements: { depth: 'full' },
+      decision: mockDecision(),
+      signal: AbortSignal.timeout(600),
+    });
+    expect(result.slice.priorities).toEqual([]);
+  });
+
   it('cache invalidates on identity_profile_activated event', async () => {
     const builder = new IdentitySliceBuilder(withRepo(PROFILE_RECORD), cache);
     const bus = new InvalidationBus();
