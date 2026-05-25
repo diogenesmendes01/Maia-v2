@@ -88,6 +88,18 @@ function renderIdentity(slice: IdentitySlice): string {
           .join('; '),
     );
   }
+  // Issue #200 codex review [MEDIUM]: dedicated "Princípios" channel,
+  // strictly separated from "Prioridades". Migrated rows (post-061, pre-slug
+  // migration) carry operational guidance under slice.principles instead of
+  // slice.priorities; rendering it under its own heading preserves the
+  // guidance to the LLM while keeping the two channels disjoint — exactly
+  // what migration 061's SQL comment forbids cross-channel.
+  if (slice.principles && slice.principles.length > 0) {
+    lines.push('## Princípios');
+    for (const p of slice.principles) {
+      lines.push(`- ${p}`);
+    }
+  }
   return lines.join('\n');
 }
 

@@ -164,7 +164,8 @@ export class IdentitySliceBuilder
     // slice.priorities, which build-prompt-from-packet renders as
     // "## Prioridades" — exactly the cross-channel leak the migration's
     // comment forbids. principles surface through their own channel
-    // (slice.principles in the function-form builder); never via priorities.
+    // (slice.principles, populated below for depth='full'); never via
+    // priorities.
     const explicitPriorities = Array.isArray(body.identity.priorities)
       ? body.identity.priorities.filter((p): p is string => typeof p === 'string')
       : [];
@@ -180,6 +181,30 @@ export class IdentitySliceBuilder
       schema_version: body.schema_version ?? 'v3.1.1-2026-05-15',
       version_id: record.id,
     };
+
+    // Issue #200 codex review [MEDIUM]: populate slice.principles for
+    // depth='full' from identity.principles → core_immutable.principles.
+    // Mirrors the function-form builder (buildIdentitySlice below). Without
+    // this, migrated rows (priorities=[], principles=[...]) lose operational
+    // guidance entirely until scripts/p8d-migration-priorities.ts runs.
+    // The dedicated principles channel is rendered under "## Princípios" by
+    // build-prompt-from-packet — strictly separate from "## Prioridades".
+    if (input.requirements.depth === 'full') {
+      const bodyAsRec = body as unknown as Record<string, unknown>;
+      const identityRec = (bodyAsRec.identity ?? {}) as Record<string, unknown>;
+      const coreImm = (bodyAsRec.core_immutable ?? {}) as Record<string, unknown>;
+      const principlesRaw = Array.isArray(identityRec.principles)
+        ? identityRec.principles
+        : Array.isArray(coreImm.principles)
+          ? coreImm.principles
+          : null;
+      if (principlesRaw) {
+        const principles = (principlesRaw as unknown[]).filter(
+          (p): p is string => typeof p === 'string',
+        );
+        if (principles.length > 0) slice.principles = principles;
+      }
+    }
 
     await this.cache.set(key, slice, getTTLForSlice('identity'));
     return {

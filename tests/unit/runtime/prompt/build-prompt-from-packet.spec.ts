@@ -78,7 +78,9 @@ describe('buildPromptFromPacket', () => {
   // principles=[...]) renders an IdentitySlice whose .priorities is []. The
   // renderer must NOT emit a "Prioridades:" line populated with principles
   // text — otherwise migrated rows ship human principles under the priorities
-  // channel until the slug migration runs.
+  // channel until the slug migration runs. With Issue #200's principles
+  // channel, principle text appears under "## Princípios" — strictly NOT
+  // under "Prioridades:".
   it('Issue #192: migrated profile with priorities=[] does not render principles under "Prioridades"', () => {
     const result = buildPromptFromPacket(
       minimalPacket({
@@ -98,9 +100,54 @@ describe('buildPromptFromPacket', () => {
         },
       }),
     );
+    // The "Prioridades:" heading must NOT appear for migrated rows.
     expect(result.system).not.toContain('Prioridades:');
-    expect(result.system).not.toContain('transparência radical');
-    expect(result.system).not.toContain('preservar a evidência');
+    // The principle text MAY appear, but only under the "Princípios" channel
+    // (Issue #200). The strict invariant: the line right after "Prioridades:"
+    // must not contain principle text. Since "Prioridades:" doesn't render
+    // at all here, the only place principle text can appear is under
+    // "## Princípios" — which is the correct, dedicated channel.
+    const prioridadesIdx = result.system.indexOf('Prioridades');
+    expect(prioridadesIdx).toBe(-1);
+    // Principles surface through their own channel.
+    expect(result.system).toContain('## Princípios');
+  });
+
+  // Issue #200 codex review [MEDIUM] — once class builder populates
+  // slice.principles for migrated rows, the renderer must emit them under
+  // their OWN heading ("Princípios"), never under "Prioridades". This
+  // preserves operational guidance during the rollout gap while keeping the
+  // priorities/principles channels strictly separated.
+  it('Issue #200 [MEDIUM]: slice.principles renders under "Princípios" heading (not "Prioridades")', () => {
+    const result = buildPromptFromPacket(
+      minimalPacket({
+        identity: {
+          role_descriptor: 'maia',
+          voice: { tone: 'amistoso', formality: 'medium', verbosity: 'concise' },
+          cognitive_limits: {
+            max_inference_depth: 2,
+            max_speculation_in_response: 0.2,
+            confidence_floor_for_action: 0.7,
+          },
+          priorities: [], // migrated row pre-slug-migration
+          learned_voice_modifiers: [],
+          schema_version: 'v3.1.1',
+          version_id: 'v1',
+          principles: ['transparência radical', 'preservar a evidência'],
+        },
+      }),
+    );
+    // Principles surface through their dedicated channel.
+    expect(result.system).toContain('## Princípios');
+    expect(result.system).toContain('transparência radical');
+    expect(result.system).toContain('preservar a evidência');
+    // And critically, NOT under the priorities heading.
+    expect(result.system).not.toContain('Prioridades:');
+  });
+
+  it('Issue #200 [MEDIUM]: empty slice.principles does NOT emit the Princípios heading', () => {
+    const result = buildPromptFromPacket(minimalPacket());
+    expect(result.system).not.toContain('## Princípios');
   });
 
   it('skips empty slices (no policy, soul, knowledge, user, skill, tool)', () => {

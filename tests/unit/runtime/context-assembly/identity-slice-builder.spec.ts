@@ -188,6 +188,121 @@ describe('IdentitySliceBuilder', () => {
     expect(result.slice.priorities).toEqual([]);
   });
 
+  // Issue #200 codex review [MEDIUM] — class builder previously dropped
+  // migrated principles entirely. For depth='full' the slice MUST surface
+  // principles through the dedicated `slice.principles` channel so operational
+  // guidance is preserved during the rollout gap, without leaking under
+  // `priorities`. Mirrors the function-form buildIdentitySlice() behavior.
+  it('Issue #200 [MEDIUM]: identity.principles → slice.principles populated for depth=full', async () => {
+    const builder = new IdentitySliceBuilder(
+      withRepo({
+        id: 'profile-migrated-061-principles',
+        profile_body: {
+          schema_version: 'v3.1.1-2026-05-15',
+          identity: {
+            role_descriptor: 'Assistente financeira',
+            voice: { tone: 'claro', formality: 'medium', verbosity: 'concise' },
+            cognitive_limits: {
+              max_inference_depth: 3,
+              max_speculation_in_response: 0.2,
+              confidence_floor_for_action: 0.7,
+            },
+            priorities: [],
+            // @ts-expect-error principles isn't in the P8a port shape; the
+            // builder reads it as an unknown record at runtime.
+            principles: ['transparência radical', 'preservar a evidência'],
+            learned_voice_modifiers: [],
+          },
+        },
+      }),
+      cache,
+    );
+    const result = await builder.build({
+      base: mockBase(),
+      requirements: { depth: 'full' },
+      decision: mockDecision(),
+      signal: AbortSignal.timeout(600),
+    });
+    expect(result.slice.priorities).toEqual([]);
+    // Principles surface through the dedicated channel, not via priorities.
+    expect(result.slice.principles).toEqual([
+      'transparência radical',
+      'preservar a evidência',
+    ]);
+  });
+
+  it('Issue #200 [MEDIUM]: core_immutable.principles → slice.principles populated for depth=full', async () => {
+    const builder = new IdentitySliceBuilder(
+      withRepo({
+        id: 'profile-migrated-061-core-principles',
+        profile_body: {
+          schema_version: 'v3.1.1-2026-05-15',
+          identity: {
+            role_descriptor: 'Assistente financeira',
+            voice: { tone: 'claro', formality: 'medium', verbosity: 'concise' },
+            cognitive_limits: {
+              max_inference_depth: 3,
+              max_speculation_in_response: 0.2,
+              confidence_floor_for_action: 0.7,
+            },
+            priorities: [],
+            learned_voice_modifiers: [],
+          },
+          // @ts-expect-error core_immutable isn't in the P8a port shape.
+          core_immutable: {
+            principles: ['transparência radical', 'preservar a evidência'],
+          },
+        },
+      }),
+      cache,
+    );
+    const result = await builder.build({
+      base: mockBase(),
+      requirements: { depth: 'full' },
+      decision: mockDecision(),
+      signal: AbortSignal.timeout(600),
+    });
+    expect(result.slice.priorities).toEqual([]);
+    expect(result.slice.principles).toEqual([
+      'transparência radical',
+      'preservar a evidência',
+    ]);
+  });
+
+  it('Issue #200 [MEDIUM]: depth=minimal does NOT populate slice.principles', async () => {
+    const builder = new IdentitySliceBuilder(
+      withRepo({
+        id: 'profile-minimal-principles',
+        profile_body: {
+          schema_version: 'v3.1.1-2026-05-15',
+          identity: {
+            role_descriptor: 'Assistente financeira',
+            voice: { tone: 'claro', formality: 'medium', verbosity: 'concise' },
+            cognitive_limits: {
+              max_inference_depth: 3,
+              max_speculation_in_response: 0.2,
+              confidence_floor_for_action: 0.7,
+            },
+            priorities: [],
+            // @ts-expect-error principles isn't in the P8a port shape.
+            principles: ['transparência radical'],
+            learned_voice_modifiers: [],
+          },
+        },
+      }),
+      cache,
+    );
+    const result = await builder.build({
+      base: mockBase(),
+      requirements: { depth: 'minimal' },
+      decision: mockDecision(),
+      signal: AbortSignal.timeout(600),
+    });
+    expect(result.slice.priorities).toEqual([]);
+    // Minimal depth: principles must NOT be surfaced.
+    expect(result.slice.principles).toBeUndefined();
+  });
+
   it('Issue #192: priorities=[] + core_immutable.principles → slice.priorities stays []', async () => {
     const builder = new IdentitySliceBuilder(
       withRepo({
