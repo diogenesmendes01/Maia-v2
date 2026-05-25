@@ -47,6 +47,17 @@ const VerbositySchema = z.enum(['concise', 'medium', 'detailed']);
 // Operational profile body shape (mirrors ProfileBody in schema.ts).
 // We accept the user-visible subset and fill schema_version + metadata
 // server-side.
+//
+// Issue #193 — `principles` is a distinct input from `priorities`:
+//   - priorities: operational labels the agent should weight when prioritizing
+//     actions (audited by papelDriftDetector — soft drift, no auto-freeze).
+//   - principles: CORE VALUE CONTRACTS — inviolable behavioral guardrails
+//     audited by valoresDetector. Violations floor to `alto` → `frozen`
+//     (or `critico` → `rollback`) via the decision engine.
+//   Because the two have radically different governance consequences, the
+//   setup MUST keep them as separate inputs. The legacy resolver explicitly
+//   forbids synthesizing principles from priorities (#189) and this router
+//   MUST NOT auto-copy across the two arrays either.
 const ProfileBodyInputSchema = z.object({
   identity: z.object({
     role_descriptor: z.string().min(1).max(500),
@@ -61,6 +72,11 @@ const ProfileBodyInputSchema = z.object({
       confidence_floor_for_action: z.number().min(0).max(1),
     }),
     priorities: z.array(z.string().min(1).max(200)).max(20),
+    // Optional — when empty/omitted, the resolver returns no principles and
+    // valoresDetector skips with `no_principles_configured` (the existing,
+    // intentional behavior introduced in #189/#191). Items mirror priorities'
+    // 1..200 bounds.
+    principles: z.array(z.string().min(1).max(200)).max(20).optional(),
   }),
   style: z.object({
     language: z.string().min(2).max(20),
@@ -108,6 +124,17 @@ function buildProfileBody(
   proposedBy: string,
   previousVersionId: string | null,
 ): ProfileBody {
+  // Issue #193 — persist `principles` at profile_body.identity.principles.
+  // The legacy resolver (`src/identity/profile-legacy-resolver.ts`) reads this
+  // path directly into `core_immutable.principles` for valoresDetector. When
+  // the input omits principles we DO NOT fall back to priorities — that is
+  // the explicit cross-domain contamination bug class fixed in #189/#191.
+  // An empty principles array (or omission) intentionally leaves the VALORES
+  // guardrail disabled for this profile, matching the resolver's contract:
+  // no true principles configured → detector emits a one-shot observability
+  // log and skips silently. Operators that want the guardrail must declare
+  // explicit core principles in the wizard.
+  const principles = input.identity.principles ?? [];
   return {
     schema_version: PROFILE_BODY_SCHEMA_VERSION,
     identity: {
@@ -115,8 +142,9 @@ function buildProfileBody(
       voice: input.identity.voice,
       cognitive_limits: input.identity.cognitive_limits,
       priorities: input.identity.priorities,
+      principles,
       learned_voice_modifiers: [],
-    },
+    } as ProfileBody['identity'] & { principles: string[] },
     style: {
       language: input.style.language,
       rhythm: input.style.rhythm,
