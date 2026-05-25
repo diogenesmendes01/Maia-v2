@@ -1701,3 +1701,136 @@ describe('agentsRouter — identity.principles field (#193)', () => {
     ).rejects.toThrow();
   });
 });
+
+/**
+ * Codex Adversarial Review of PR #201 [HIGH] — cross-field overlap guard.
+ *
+ * Bug class: even with a distinct `principles` input (#193), a UI/API client
+ * could submit the SAME operational labels in both `priorities` and
+ * `principles`. The legacy resolver would surface them as core_immutable
+ * principles → valoresDetector treats them as core value contracts → the
+ * decision engine can freeze/rollback the profile for ordinary priority
+ * drift. UI warnings are not a trust boundary; the router schema must reject
+ * such submissions server-side.
+ *
+ * This is the same failure mode that #189/#191 closed at the resolver layer;
+ * #201 round 2 closes the symmetric hole at the API ingress so no client
+ * (legitimate or hostile) can re-introduce it.
+ *
+ * Contract:
+ *   - Items are compared trimmed + case-insensitive.
+ *   - ANY overlap between the two arrays is a rejection with a clear error
+ *     pointing at the offending item.
+ *   - The original strings are still persisted as supplied; only the
+ *     comparison is normalized.
+ *   - Applies to BOTH `create` AND `updateProfile` (same ProfileBodyInputSchema).
+ */
+describe('agentsRouter — priorities/principles overlap guard (#201 round 2)', () => {
+  it('create: rejects exact duplicate between priorities and principles', async () => {
+    const repos = makeRepos();
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).create({
+        id: 'agent-x',
+        nome: 'X',
+        profile_body: {
+          ...validProfile,
+          identity: {
+            ...validProfile.identity,
+            priorities: ['precisao', 'clareza'],
+            // 'clareza' overlaps exactly with priorities.
+            principles: ['Separação acima de tudo.', 'clareza'],
+          },
+        },
+        proposed_reason: 'should reject — exact overlap between fields',
+      }),
+    ).rejects.toThrow(/clareza/i);
+    // No agent / profile should have been persisted.
+    expect(Object.keys(repos._inspect.agentsMap).length).toBe(0);
+    expect(repos._inspect.profiles.length).toBe(0);
+  });
+
+  it('create: rejects case-insensitive overlap (Foo vs foo)', async () => {
+    const repos = makeRepos();
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).create({
+        id: 'agent-x',
+        nome: 'X',
+        profile_body: {
+          ...validProfile,
+          identity: {
+            ...validProfile.identity,
+            priorities: ['Foo', 'bar'],
+            // case-insensitive overlap with 'Foo'.
+            principles: ['foo', 'baz'],
+          },
+        },
+        proposed_reason: 'should reject — case-insensitive overlap',
+      }),
+    ).rejects.toThrow(/foo/i);
+    expect(Object.keys(repos._inspect.agentsMap).length).toBe(0);
+    expect(repos._inspect.profiles.length).toBe(0);
+  });
+
+  it('create: rejects whitespace-differing overlap ("foo " vs "foo")', async () => {
+    const repos = makeRepos();
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).create({
+        id: 'agent-x',
+        nome: 'X',
+        profile_body: {
+          ...validProfile,
+          identity: {
+            ...validProfile.identity,
+            priorities: ['foo ', 'bar'],
+            // trimmed overlap with priorities[0].
+            principles: ['foo', 'baz'],
+          },
+        },
+        proposed_reason: 'should reject — whitespace-differing overlap',
+      }),
+    ).rejects.toThrow(/foo/i);
+    expect(Object.keys(repos._inspect.agentsMap).length).toBe(0);
+    expect(repos._inspect.profiles.length).toBe(0);
+  });
+
+  it('create: accepts disjoint priorities and principles (regression)', async () => {
+    const repos = makeRepos();
+    const res = await caller('owner', 'tenant-A', 'u1', repos).create({
+      id: 'agent-x',
+      nome: 'X',
+      profile_body: validProfileWithPrinciples,
+      proposed_reason: 'happy path — fields are disjoint',
+    });
+    expect(res.agent.id).toBe('agent-x');
+    expect(res.seed_profile.status).toBe('proposed');
+  });
+
+  it('updateProfile: rejects exact duplicate between priorities and principles', async () => {
+    const existingAgent: Agent = {
+      id: 'agent-x',
+      tenant_id: 'tenant-A',
+      nome: 'X',
+      status: 'active',
+      metadata: {},
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+    const repos = makeRepos({ agents: [existingAgent] });
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).updateProfile({
+        agentId: 'agent-x',
+        profile_body: {
+          ...validProfile,
+          identity: {
+            ...validProfile.identity,
+            priorities: ['precisao', 'clareza'],
+            principles: ['Separação acima de tudo.', 'CLAREZA'],
+          },
+        },
+        proposed_reason: 'should reject — overlap on updateProfile too',
+      }),
+    ).rejects.toThrow(/clareza/i);
+    // No new profile row should have been persisted.
+    expect(repos._inspect.profiles.length).toBe(0);
+  });
+});

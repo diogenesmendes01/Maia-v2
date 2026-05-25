@@ -58,31 +58,73 @@ const VerbositySchema = z.enum(['concise', 'medium', 'detailed']);
 //   setup MUST keep them as separate inputs. The legacy resolver explicitly
 //   forbids synthesizing principles from priorities (#189) and this router
 //   MUST NOT auto-copy across the two arrays either.
-const ProfileBodyInputSchema = z.object({
-  identity: z.object({
-    role_descriptor: z.string().min(1).max(500),
-    voice: z.object({
-      tone: z.string().min(1).max(200),
-      formality: FormalitySchema,
-      verbosity: VerbositySchema,
+const ProfileBodyInputSchema = z
+  .object({
+    identity: z.object({
+      role_descriptor: z.string().min(1).max(500),
+      voice: z.object({
+        tone: z.string().min(1).max(200),
+        formality: FormalitySchema,
+        verbosity: VerbositySchema,
+      }),
+      cognitive_limits: z.object({
+        max_inference_depth: z.number().int().min(0).max(10),
+        max_speculation_in_response: z.number().min(0).max(1),
+        confidence_floor_for_action: z.number().min(0).max(1),
+      }),
+      priorities: z.array(z.string().min(1).max(200)).max(20),
+      // Optional — when empty/omitted, the resolver returns no principles and
+      // valoresDetector skips with `no_principles_configured` (the existing,
+      // intentional behavior introduced in #189/#191). Items mirror priorities'
+      // 1..200 bounds.
+      principles: z.array(z.string().min(1).max(200)).max(20).optional(),
     }),
-    cognitive_limits: z.object({
-      max_inference_depth: z.number().int().min(0).max(10),
-      max_speculation_in_response: z.number().min(0).max(1),
-      confidence_floor_for_action: z.number().min(0).max(1),
+    style: z.object({
+      language: z.string().min(2).max(20),
+      rhythm: z.record(z.string(), z.unknown()).default({}),
     }),
-    priorities: z.array(z.string().min(1).max(200)).max(20),
-    // Optional — when empty/omitted, the resolver returns no principles and
-    // valoresDetector skips with `no_principles_configured` (the existing,
-    // intentional behavior introduced in #189/#191). Items mirror priorities'
-    // 1..200 bounds.
-    principles: z.array(z.string().min(1).max(200)).max(20).optional(),
-  }),
-  style: z.object({
-    language: z.string().min(2).max(20),
-    rhythm: z.record(z.string(), z.unknown()).default({}),
-  }),
-});
+  })
+  // Codex Adversarial Review of PR #201 round 1 [HIGH] — cross-field guard.
+  //
+  // Even with `principles` as a distinct input (#193), a client could submit
+  // the SAME operational labels in both arrays. The legacy resolver surfaces
+  // them as core_immutable principles → valoresDetector treats them as core
+  // value contracts → the decision engine can freeze/rollback the profile
+  // for ordinary priority drift. This is the symmetric, ingress-side hole
+  // matching the resolver-side bug #189/#191 closed.
+  //
+  // We reject ANY overlap, comparing case-insensitively + trimmed. The
+  // original strings are still PERSISTED as supplied; only the comparison is
+  // normalized. Operators may not "spell around" the guard with case or
+  // whitespace variants — semantically the same label cannot be both a soft
+  // priority and an inviolable principle.
+  //
+  // UI warnings are not a trust boundary. This is the server-side gate.
+  .superRefine((data, ctx) => {
+    const principles = data.identity.principles;
+    if (!principles || principles.length === 0) return;
+    const normalize = (s: string) => s.trim().toLowerCase();
+    const priorityKeys = new Map<string, string>();
+    for (const p of data.identity.priorities) {
+      priorityKeys.set(normalize(p), p);
+    }
+    principles.forEach((principle, idx) => {
+      const key = normalize(principle);
+      const collidingPriority = priorityKeys.get(key);
+      if (collidingPriority !== undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['identity', 'principles', idx],
+          message:
+            `principle "${principle}" overlaps with priority "${collidingPriority}" ` +
+            `(compared trimmed + case-insensitive). priorities are operational ` +
+            `labels (soft, papelDriftDetector); principles are core value ` +
+            `contracts (hard, valoresDetector — may auto-freeze). The same ` +
+            `label cannot be both — pick one field.`,
+        });
+      }
+    });
+  });
 
 const ListInputSchema = z.object({ tenantId: z.string().optional() });
 
