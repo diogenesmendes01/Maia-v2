@@ -367,6 +367,16 @@ d('seedNewActiveAtomic vs transition cross-writer race (issue #195, real DB)', (
         expect(transitionRes.value.expected_from).toBe('active');
         expect(transitionRes.value.actual).toBe('frozen');
         expect(v1!.status).toBe('frozen');
+      } else {
+        // Codex review of PR #202 [P3]: any other outcome (transition
+        // rejected, or returned ok:false with a reason other than 'stale')
+        // is unexpected for this race and would let a broken rollback path
+        // silently pass the active-row count check below. Mirror the
+        // catch-all that `issue-177-transition-parent-lock.spec.ts`
+        // scenario A uses so the regression is obvious instead of hidden.
+        throw new Error(
+          `unexpected transition result: ${JSON.stringify(transitionRes)}; rows=${JSON.stringify(r.rows)}`,
+        );
       }
 
       // Active-slot invariant: at most one active row.
