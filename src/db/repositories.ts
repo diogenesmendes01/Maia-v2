@@ -53,6 +53,7 @@ import {
   proposal_approvals,
   admin_audit_log,
   debug_snapshot_grants,
+  global_settings,
 } from './schema.js';
 import type {
   AppUser,
@@ -5973,6 +5974,412 @@ export const debugSnapshotGrantsRepo = {
     return rows[0] ?? null;
   },
 };
+
+// =====================================================================
+// global_settings — issue #183 / PR #188 Codex round 1 (high + medium)
+// =====================================================================
+
+/**
+ * globalSettingsRepo — process-wide singleton settings (NOT scoped to
+ * tenant/agent). Currently backs the founder-only LLM model switch
+ * (/setup/llm-settings) but the table is intentionally generic so future
+ * deployment-wide settings can reuse it.
+ *
+ * Why a new table (round 1, [high]):
+ *   The previous storage in `agent_facts (tenant_id, agent_id, escopo, chave)`
+ *   silently scoped the founder's "global" model pick to the founder's own
+ *   `default` agent. Runtime `callLLM` reads inside the CURRENT request's
+ *   (tenant_id, agent_id) AsyncLocalStorage context — for any non-default
+ *   agent or any other tenant, that's a different row. Founder UI showed
+ *   "audited successfully", but those callers kept using the env model.
+ *   In incident-time (Anthropic outage, model deprecation) this defeats the
+ *   entire purpose of the page. The fix is structural: a table with NO
+ *   tenant/agent discriminator.
+ *
+ * Why `updateAtomic` instead of separate `set` + audit (round 1, [medium]):
+ *   The router originally read current values OUTSIDE the tx, then skipped
+ *   writes based on that stale snapshot, then audited
+ *   `after={input.main, input.fast}`. Two concurrent founders updating
+ *   different sides could observe stale `before`, write different values
+ *   than what the audit row claims, and leave the DB in a state where the
+ *   audit trail is corrupted (forensic gap). Fix: read the current value
+ *   INSIDE the tx under `SELECT ... FOR UPDATE` on the row's PK, then
+ *   UPSERT, then audit — all in one withTx. Audit `before` is the actual
+ *   locked value; audit `after` is what the UPSERT just committed.
+ */
+/**
+ * Codex round 5 on PR #188 [high]: subset-match comparator used by
+ * `globalSettingsRepo.updateAtomic`'s optimistic-concurrency check.
+ *
+ *   - `expected === null` ⇔ "no row should exist". Matches only when
+ *     `locked === null` (covers both SQL NULL and the placeholder
+ *     'null'::jsonb that updateAtomic INSERTs before the FOR UPDATE).
+ *   - `expected = { k1: v1, ... }` ⇔ for each key in `expected`, the
+ *     corresponding key in `locked` must deep-equal that value. Extra
+ *     keys in `locked` (e.g. `provider` stamped by round-5 writes when
+ *     the caller only observed `model`) are allowed. This is the
+ *     key behavioral change that lets the LLM settings helper grow
+ *     the persisted jsonb shape without breaking clients that observed
+ *     only the older shape.
+ *
+ * Equality on nested values is JSON-canonical (`JSON.stringify`
+ * after a stable key sort). All values stored in `global_settings` so
+ * far are plain JSON (no functions, dates, etc.), so this is safe.
+ */
+function matchesExpected(
+  locked: unknown,
+  expected: Record<string, unknown> | null,
+): boolean {
+  if (expected === null) {
+    // "Expect no row" — locked must be one of the null shapes.
+    return locked === null;
+  }
+  if (locked === null || typeof locked !== 'object') {
+    // Caller asked for fields; locked has none to offer.
+    return false;
+  }
+  const lockedObj = locked as Record<string, unknown>;
+  for (const k of Object.keys(expected)) {
+    if (canonicalize(lockedObj[k]) !== canonicalize(expected[k])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function canonicalize(v: unknown): string {
+  return JSON.stringify(sortKeys(v));
+}
+
+function sortKeys(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(sortKeys);
+  if (v && typeof v === 'object') {
+    const o: Record<string, unknown> = {};
+    for (const k of Object.keys(v as object).sort()) {
+      o[k] = sortKeys((v as Record<string, unknown>)[k]);
+    }
+    return o;
+  }
+  return v;
+}
+
+export const globalSettingsRepo = {
+  /**
+   * Read a single global setting by key. Returns null if the key is not
+   * set (caller must apply its own default — for LLM models, that's the
+   * env var fallback). Caller-tolerant of DB errors via the surrounding
+   * try/catch in `getCurrent*Model` (DB hiccup → env default rather than
+   * blocking the LLM call).
+   */
+  async getByKey(key: string): Promise<{ value: unknown; updated_at: Date; updated_by: string | null } | null> {
+    const rows = await db
+      .select()
+      .from(global_settings)
+      .where(eq(global_settings.key, key))
+      .limit(1);
+    const row = rows[0];
+    if (!row) return null;
+    return { value: row.value, updated_at: row.updated_at, updated_by: row.updated_by };
+  },
+
+  /**
+   * Atomic multi-key update + audit. All keys are upserted under a single
+   * tx with `SELECT ... FOR UPDATE` on each row (serializes concurrent
+   * founders). Audit row sees the REAL before/after under the lock — not a
+   * stale pre-tx snapshot. If the audit insert throws, every upsert rolls
+   * back together.
+   *
+   * Steps inside the tx:
+   *   1. For each key, first `INSERT ... ON CONFLICT DO NOTHING` with a
+   *      JSON-null placeholder, then `SELECT value FROM global_settings
+   *      WHERE key = $1 FOR UPDATE` — Codex round 2 [P2] showed that
+   *      without the placeholder, `FOR UPDATE` on a non-existent row
+   *      doesn't take any lock, so two concurrent first-writers on a
+   *      fresh deploy could both read null and both UPSERT, producing
+   *      audit rows whose `before`/`after` don't match the committed DB
+   *      state. The placeholder INSERT serializes the race because the
+   *      conflict path waits on the inserting tx's row-level lock; the
+   *      subsequent SELECT FOR UPDATE then holds the lock for the rest
+   *      of this tx. Concurrent writers wait here.
+   *   2. Compute `before[key]` from the locked value (JSON null and SQL
+   *      NULL both coalesce to JS null — pre-062 rows and the new
+   *      placeholder look identical to callers).
+   *   3. For each key where `before !== requested`, UPSERT new value with
+   *      `updated_at = now`, `updated_by = audit.actor_id`.
+   *   4. If NO key actually changed, return `{ ok:false, reason:'no_changes', before }`
+   *      so the caller can map to BAD_REQUEST without polluting the audit
+   *      log with a no-op row.
+   *   5. INSERT admin_audit_log with `action`, `change_summary={ before, after, ...meta }`.
+   *      If this throws, ROLLBACK reverts every UPSERT (atomicity invariant
+   *      matching `tenantsRepo.updateStatusAtomic`).
+   *
+   * `meta` is merged into `change_summary` so the caller can stamp extra
+   * fields (operator comment, scope label, etc.) without us hardcoding a
+   * schema that future callers won't need.
+   */
+  async updateAtomic(input: {
+    keys: ReadonlyArray<{
+      key: string;
+      value: Record<string, unknown>;
+      // Codex round 3 on PR #188 [P2]: optional optimistic-concurrency
+      // pre-check. When set, the locked value MUST match `expected`
+      // or the whole tx aborts with `reason: 'optimistic_conflict'`. The
+      // check runs INSIDE the tx, AFTER the SELECT ... FOR UPDATE, so
+      // it's race-free against concurrent writers. `expected = null`
+      // means "expect the key to be unset"; `expected = undefined` (or
+      // omitted) means "no expectation, proceed unconditionally".
+      //
+      // Codex round 5 on PR #188 [high]: the comparison semantic is
+      // "expected is a key-subset of locked" — every field in
+      // `expected` must equal the same field in `lockedValue`, but
+      // locked may have additional fields. This lets writes that grow
+      // the persisted shape (e.g. adding `provider` alongside `model`)
+      // keep accepting clients that observed only the old shape. If a
+      // caller wants strict full-shape equality, pass every locked-
+      // shape field in `expected`.
+      expected?: Record<string, unknown> | null;
+    }>;
+    audit: {
+      tenant_id: string;
+      actor_id: string;
+      actor_role: string;
+      action: string;
+      resource_type: string;
+      resource_id?: string | null;
+      meta?: Record<string, unknown>;
+    };
+  }): Promise<
+    | {
+        ok: true;
+        applied_at: Date;
+        before: Record<string, unknown>;
+        after: Record<string, unknown>;
+      }
+    | {
+        ok: false;
+        reason: 'no_changes';
+        before: Record<string, unknown>;
+      }
+    | {
+        ok: false;
+        reason: 'optimistic_conflict';
+        // Identify the FIRST key that failed the expected check (sorted
+        // key order — same order as the lock acquisition).
+        key: string;
+        expected: Record<string, unknown> | null;
+        current: unknown;
+        // Full `before` snapshot of all keys read up to the conflict
+        // point. Callers use this to render a useful UI message.
+        before: Record<string, unknown>;
+      }
+  > {
+    return await withTx(async (tx) => {
+      const now = new Date();
+      const before: Record<string, unknown> = {};
+      const after: Record<string, unknown> = {};
+      let changedCount = 0;
+      let conflict:
+        | {
+            key: string;
+            expected: Record<string, unknown> | null;
+            current: unknown;
+          }
+        | null = null;
+
+      // (1) Lock each row FOR UPDATE in deterministic key order. Sorting
+      // the keys before locking prevents two concurrent updates that touch
+      // an overlapping set of keys from deadlocking each other (a holds
+      // main waiting for fast, b holds fast waiting for main). Same trick
+      // we use elsewhere in the codebase for multi-row locks.
+      const sortedKeys = [...input.keys].sort((a, b) => a.key.localeCompare(b.key));
+
+      for (const entry of sortedKeys) {
+        // Codex round 2 on PR #188 [P2]: `SELECT ... FOR UPDATE` does NOT
+        // lock a row that doesn't exist. Migration 062 ships the
+        // `global_settings` table empty, so two concurrent founders on a
+        // fresh deploy could both read `null` here, both UPSERT, and end
+        // up with an audit row whose `before` claims null but whose
+        // `after` reflects only one founder's input — the same forensic-
+        // gap class as round 1 [medium]. Fix: insert a placeholder row
+        // via ON CONFLICT DO NOTHING BEFORE the FOR UPDATE select. The
+        // placeholder uses `'null'::jsonb` as the value so the lineage
+        // starts at literal null (not at a fake string) — `before[key]`
+        // computed below honors that. Once the row exists, the FOR
+        // UPDATE on the next select actually serializes concurrent txs.
+        await tx.execute(sql`
+          INSERT INTO ${global_settings} (key, value, updated_at, updated_by)
+          VALUES (${entry.key}, 'null'::jsonb, now(), ${input.audit.actor_id})
+          ON CONFLICT (key) DO NOTHING
+        `);
+
+        const locked = await tx
+          .select()
+          .from(global_settings)
+          .where(eq(global_settings.key, entry.key))
+          .for('update')
+          .limit(1);
+        // Treat the placeholder JSON null exactly like a never-set row so
+        // existing callers (and the "no_changes" check below) keep the
+        // null-as-absent semantics. With the placeholder INSERT above the
+        // row now always exists, but its value can be SQL NULL (legacy
+        // pre-062 rows, if any) OR JSON null (placeholder from this tx)
+        // OR a real `{model: "..."}` payload (a prior committed write).
+        // Both null shapes coalesce to JS `null` here.
+        const lockedValue = locked[0]?.value ?? null;
+        before[entry.key] = lockedValue;
+        after[entry.key] = entry.value;
+
+        // Codex round 3 on PR #188 [P2]: optimistic-concurrency check.
+        // If the caller supplied `expected`, compare against the LOCKED
+        // value (NOT the pre-tx snapshot — same reason the rest of this
+        // function reads under FOR UPDATE). On mismatch we don't break
+        // the loop yet: we continue locking remaining keys so all
+        // subsequent rows get released cleanly when the tx aborts via
+        // throw, and so `before` is populated for the response. The
+        // throw below converts the conflict into the typed return
+        // shape after the loop.
+        //
+        // Codex round 5 [high]: comparison is "expected is a key-subset
+        // of locked" — every key present in `expected` must match the
+        // same key in `lockedValue`, but lockedValue may have extra
+        // keys. This lets the LLM settings helper grow the persisted
+        // shape (adding `provider` next to `model`) without breaking
+        // optimistic-conflict checks from clients that observed only
+        // the older `{ model }` shape. The two edge cases (expected
+        // === null and locked === null) keep their original strict
+        // equality — those signal "no row" and must match exactly.
+        if (
+          entry.expected !== undefined &&
+          conflict === null &&
+          !matchesExpected(lockedValue, entry.expected)
+        ) {
+          conflict = {
+            key: entry.key,
+            expected: entry.expected,
+            current: lockedValue,
+          };
+          // Don't break: finish locking so `before` is complete and the
+          // tx rolls back the placeholder INSERTs uniformly. We skip
+          // the upsert below by short-circuiting on `conflict !== null`.
+          continue;
+        }
+
+        // If a prior key conflicted, don't write this one either —
+        // we're going to abort below.
+        if (conflict !== null) continue;
+
+        // Deep-equal comparison via JSON canonicalization. Both sides are
+        // simple JSON (no functions, no Dates) so JSON.stringify is a safe
+        // canonical form. Skipping the UPSERT when the value matches avoids
+        // a wasted write AND keeps `updated_at` honest (it should reflect
+        // the last actual change, not a no-op renew).
+        if (JSON.stringify(lockedValue) === JSON.stringify(entry.value)) {
+          continue;
+        }
+
+        await tx
+          .insert(global_settings)
+          .values({
+            key: entry.key,
+            value: entry.value,
+            updated_at: now,
+            updated_by: input.audit.actor_id,
+          })
+          .onConflictDoUpdate({
+            target: [global_settings.key],
+            set: {
+              value: entry.value,
+              updated_at: now,
+              updated_by: input.audit.actor_id,
+            },
+          });
+        changedCount++;
+      }
+
+      // (2) Optimistic-conflict abort. We did NOT call the upsert for the
+      // conflicting key (or any subsequent key), so the only DB effect
+      // inside this tx is the placeholder INSERTs from step (1) — those
+      // are harmless on rollback. We do NOT write the audit row because
+      // there's no real state change to record.
+      if (conflict !== null) {
+        // Throw to force a rollback of the placeholder INSERTs above.
+        // The withTx wrapper catches and re-raises, so we package the
+        // typed payload as a non-Error sentinel that updateAtomic itself
+        // unwraps. But the simpler path here: since we haven't UPSERTED
+        // anything, the placeholder INSERTs of a NULL jsonb are
+        // observationally equivalent to "key was never set" for the
+        // null-as-absent semantics callers rely on. Still, we rely on
+        // rollback for correctness if any side effects existed.
+        throw new ConflictAbortSignal({
+          key: conflict.key,
+          expected: conflict.expected,
+          current: conflict.current,
+          before,
+        });
+      }
+
+      if (changedCount === 0) {
+        // No real change under the lock → caller can map to BAD_REQUEST.
+        // The tx will commit empty (no audit row, no upsert) — cheap and
+        // honest. Returning `before` lets the caller surface what's
+        // currently in DB if it wants to.
+        return { ok: false as const, reason: 'no_changes' as const, before };
+      }
+
+      // (3) Audit in the SAME tx. before/after here are the REAL locked
+      // values, not whatever the caller read pre-tx — so concurrent
+      // founders can't corrupt the audit trail.
+      await tx.insert(admin_audit_log).values({
+        tenant_id: input.audit.tenant_id,
+        actor_id: input.audit.actor_id,
+        actor_role: input.audit.actor_role,
+        action: input.audit.action,
+        resource_type: input.audit.resource_type,
+        resource_id: input.audit.resource_id ?? null,
+        change_summary: {
+          before,
+          after,
+          ...(input.audit.meta ?? {}),
+        },
+      });
+
+      return { ok: true as const, applied_at: now, before, after };
+    }).catch((err: unknown) => {
+      // Unwrap the optimistic-conflict sentinel into the typed return.
+      // Any other error (DB, audit-insert FK violation, etc.) is a real
+      // failure — propagate it so callers preserve the atomicity
+      // invariant: a thrown error means NO state changed.
+      if (err instanceof ConflictAbortSignal) {
+        return {
+          ok: false as const,
+          reason: 'optimistic_conflict' as const,
+          key: err.payload.key,
+          expected: err.payload.expected,
+          current: err.payload.current,
+          before: err.payload.before,
+        };
+      }
+      throw err;
+    });
+  },
+};
+
+// Sentinel used to abort the withTx callback when an optimistic check
+// fails. Throwing inside withTx is the standard way to force a ROLLBACK;
+// catching this specific type lets us convert the rollback into a typed
+// `{ ok: false, reason: 'optimistic_conflict' }` return without leaking
+// the throw to callers. Not exported — the conflict path is observable
+// via the discriminated union only.
+class ConflictAbortSignal {
+  constructor(
+    public readonly payload: {
+      key: string;
+      expected: Record<string, unknown> | null;
+      current: unknown;
+      before: Record<string, unknown>;
+    },
+  ) {}
+}
 
 // P9a — re-export skillsRepo from control-plane/skill-registry. Convention:
 // `repositories.ts` é o ponto único de import para callers; `control-plane/`

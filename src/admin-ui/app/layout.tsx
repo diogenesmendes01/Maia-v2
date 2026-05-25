@@ -64,6 +64,9 @@ export default async function RootLayout({ children }: { children: React.ReactNo
                   <Link href="/setup/channels" className="hover:underline">
                     Channels
                   </Link>
+                  <Link href="/setup/llm-settings" className="hover:underline">
+                    LLM Settings
+                  </Link>
                 </div>
                 <div className="flex gap-4 items-center text-sm">
                   <span className="opacity-80">

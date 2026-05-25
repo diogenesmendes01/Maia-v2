@@ -1623,6 +1623,20 @@ export const admin_audit_log = pgTable(
   }),
 );
 
+// 062 (issue #183, PR #188 Codex round 1, [high]): global_settings —
+// process-wide singleton settings (NOT scoped to tenant/agent by design).
+// Used by /setup/llm-settings to flip the runtime LLM model slug so the
+// change is visible to every tenant's next ReAct turn. Previous storage
+// in agent_facts (scoped by tenant_id+agent_id) silently meant the
+// founder UI only affected the founder's `default` agent — every other
+// agent/tenant kept calling the old/env model.
+export const global_settings = pgTable('global_settings', {
+  key: text('key').primaryKey(),
+  value: jsonb('value').notNull(),
+  updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  updated_by: text('updated_by'),
+});
+
 // 048: debug_snapshot_grants — TTL-bounded access to runtime_trace_bodies
 export const debug_snapshot_grants = pgTable(
   'debug_snapshot_grants',

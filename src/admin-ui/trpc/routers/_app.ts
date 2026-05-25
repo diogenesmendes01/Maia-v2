@@ -15,6 +15,7 @@ import { dashboardRouter } from './dashboard.js';
 import { capabilitiesRouter } from './capabilities.js';
 import { proceduresRouter } from './procedures.js';
 import { knowledgeRouter } from './knowledge.js';
+import { llmSettingsRouter } from './llmSettings.js';
 
 export const appRouter = router({
   inbox: inboxRouter,
@@ -30,6 +31,7 @@ export const appRouter = router({
   capabilities: capabilitiesRouter,
   procedures: proceduresRouter,
   knowledge: knowledgeRouter,
+  llmSettings: llmSettingsRouter,
 });
 
 export type AppRouter = typeof appRouter;
