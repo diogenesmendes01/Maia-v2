@@ -4289,10 +4289,37 @@ export const operationalProfileVersionsRepo = {
   // lock) to (a) keep the freeze→activate semantics intact and (b) honor
   // `expected_current_active_id` for the stale-read guard.
   //
+  // Codex Adversarial Review of PR #190 (issue #195, [high]) — the
+  // doccomment that previously said "we no longer need to lock this row
+  // separately — the parent agent lock above already serializes every
+  // writer" was DEFENSE-IN-DEPTH FALSE. `lockParentAgent` locks the
+  // `agents` row, not the profile_versions row. Under READ COMMITTED a
+  // concurrent writer that holds the v1 row lock — e.g. an out-of-band
+  // SQL repair, a future codepath that drops `lockParentAgent`, or
+  // (theoretically) `operationalProfileVersionsRepo.transition` running
+  // in a tx whose lock ordering interleaves with our snapshot read —
+  // can commit a `status` change to v1 between the snapshot SELECT here
+  // and the freeze UPDATE below. Without `FOR UPDATE` on the read AND a
+  // `status='active'` predicate on the freeze, the seed would silently
+  // overwrite a just-rolled-back v1 back to `frozen`, undoing a drift
+  // rollback and reporting success.
+  //
+  // Strategy A from the issue (preferred): keep `lockParentAgent` as the
+  // primary serialization point, AND restore `FOR UPDATE` on the active-row
+  // read here (so we hold a real row lock through the freeze window), AND
+  // add `status='active'` to the freeze UPDATE WHERE so the DB itself
+  // refuses to overwrite a row whose status changed under us regardless
+  // of which locks any writer holds. Either guard alone would close the
+  // lost-write window; both together make the invariant explicit at the
+  // SQL level for any future reviewer.
+  //
   // Semantics:
   //   - Locks the parent agent row FOR UPDATE so EVERY allocator of
   //     `agent_operational_profile_versions.version` for this (tenant, agent)
   //     serializes here.
+  //   - Locks the current active profile-version row FOR UPDATE so the
+  //     freeze window is held under a row-level lock (defense-in-depth
+  //     against any writer that bypasses `lockParentAgent`).
   //   - Verifies tenant scope on both the lock and the inserts.
   //   - On any error inside the closure, the transaction rolls back —
   //     the old active row stays active.
@@ -4330,9 +4357,18 @@ export const operationalProfileVersionsRepo = {
       }
 
       // 2) Re-read the current active row INSIDE the tx so the stale-read
-      //    guard (`expected_current_active_id`) sees post-lock state. We
-      //    no longer need to lock this row separately — the parent agent
-      //    lock above already serializes every writer.
+      //    guard (`expected_current_active_id`) sees post-lock state.
+      //
+      //    Issue #195: this read is now `FOR UPDATE`. The parent-agent lock
+      //    already serializes every writer that goes through
+      //    `lockParentAgent` / `acquireNextVersionForAgent`, but it does
+      //    NOT block a writer that holds a row-level lock on this
+      //    profile_versions row in a different lock domain (out-of-band
+      //    SQL, future refactor, edge-case `transition` interleaving).
+      //    Re-acquiring `FOR UPDATE` here turns the snapshot read into a
+      //    hard row lock that's held through the freeze UPDATE below,
+      //    closing the lost-write window even when callers race in ways
+      //    `lockParentAgent` alone can't serialize.
       const activeRows = await tx
         .select()
         .from(agent_operational_profile_versions)
@@ -4343,6 +4379,7 @@ export const operationalProfileVersionsRepo = {
             eq(agent_operational_profile_versions.status, 'active'),
           ),
         )
+        .for('update')
         .limit(1);
       const currentActive = activeRows[0] ?? null;
 
@@ -4360,6 +4397,18 @@ export const operationalProfileVersionsRepo = {
       // 3) Freeze the previous active row FIRST so the partial unique index
       //    on (tenant, agent) WHERE status='active' is satisfied before the
       //    new insert lands. Otherwise both rows would compete for activeness.
+      //
+      //    Issue #195: `status = 'active'` is now in the WHERE clause as
+      //    defense-in-depth. Under READ COMMITTED, if a concurrent writer
+      //    committed a status change between our snapshot (step 2) and this
+      //    UPDATE, EvalPlanQual re-evaluates the predicate against the new
+      //    committed row — `status != 'active'` matches zero rows and we
+      //    throw `seed_atomic_freeze_failed`, rolling the seed tx back
+      //    rather than silently undoing the concurrent state change (e.g.
+      //    a drift `transition({to:'rolled_back'})` win). With the
+      //    `FOR UPDATE` lock in step 2 this path is the unreachable
+      //    defense-in-depth tier; without it, this predicate alone still
+      //    closes the lost-write window.
       let frozenPrevious: AgentOperationalProfileVersion | null = null;
       if (currentActive) {
         const [updated] = await tx
@@ -4370,11 +4419,20 @@ export const operationalProfileVersionsRepo = {
               eq(agent_operational_profile_versions.id, currentActive.id),
               eq(agent_operational_profile_versions.tenant_id, tenant_id),
               eq(agent_operational_profile_versions.agent_id, agent_id),
+              eq(agent_operational_profile_versions.status, 'active'),
             ),
           )
           .returning();
         if (!updated) {
-          throw new Error('seed_atomic_freeze_failed: previous active row vanished mid-tx');
+          // Either the row vanished (rare; agent deletion under the parent
+          // lock is impossible) or — issue #195 — a concurrent writer
+          // changed `status` out from under us between the FOR UPDATE
+          // snapshot and this UPDATE. Surface as `seed_atomic_freeze_failed`
+          // so the seed tx rolls back and the caller observes the race
+          // rather than silently overwriting a non-active row.
+          throw new Error(
+            'seed_atomic_freeze_failed: previous active row vanished or status changed mid-tx',
+          );
         }
         frozenPrevious = updated;
       }
