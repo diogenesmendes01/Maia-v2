@@ -13,8 +13,12 @@
  * the detail drawer fetches the full contract per-row via skills.getById
  * (review PR #209 findings 2 & 5).
  *
- * Phase 3 will add propose/activate/deprecate/rollback. There are intentionally
- * NO create / edit / action buttons here.
+ * Phase 3 (this commit) adds the lifecycle mutations, all gated to `founder`
+ * (spec §2 "solo operator": founder proposes AND activates):
+ *   - a "New skill" button + propose form (skill-form.tsx);
+ *   - Activate / Deprecate / Rollback action buttons in the detail drawer,
+ *     each prompting for a required reason.
+ * Non-founders keep the read-only view (no button, no form, no actions).
  *
  * Server boundary: this page imports NOTHING from backend modules. It consumes
  * the serialized JSON from the `trpc.skills.*` queries only — the repo (and its
@@ -24,6 +28,7 @@
 import * as React from 'react';
 import { useSession } from 'next-auth/react';
 import { trpc } from '../../trpc/client.js';
+import { SkillForm } from './_components/skill-form.js';
 
 type SkillStatus = 'active' | 'proposed' | 'deprecated' | 'rolled_back';
 
@@ -116,6 +121,8 @@ export default function SkillsPage() {
   const { data: session, status: sessionStatus } = useSession();
   const role = session?.user?.role ?? '';
   const sessionTenant = session?.user?.tenant_id ?? '';
+  // Phase 3: ALL skill mutations are founder-gated (spec §2 "solo operator").
+  const isFounder = role === 'founder';
 
   // FIX 4 (review PR #209): founders can inspect other tenants via a selector;
   // every other role stays pinned to their own tenant. Mirrors the setup pages.
@@ -127,6 +134,9 @@ export default function SkillsPage() {
   const [agentId, setAgentId] = React.useState('');
   const [tab, setTab] = React.useState<SkillStatus>('active');
   const [selectedId, setSelectedId] = React.useState<string | null>(null);
+  const [showForm, setShowForm] = React.useState(false);
+
+  const utils = trpc.useUtils();
 
   const tenantsQuery = trpc.tenants.list.useQuery(undefined, {
     enabled: role === 'founder',
@@ -239,6 +249,16 @@ export default function SkillsPage() {
             <TabButton key={s} id={s} />
           ))}
         </div>
+        {isFounder && (
+          <button
+            onClick={() => setShowForm(true)}
+            disabled={!agentId}
+            className="ml-auto px-3 py-1 text-sm rounded bg-blue-600 text-white disabled:opacity-50"
+            title={agentId ? 'Propose a new skill' : 'Pick an agent first'}
+          >
+            New skill
+          </button>
+        )}
       </div>
 
       {!agentId ? (
@@ -302,7 +322,24 @@ export default function SkillsPage() {
           id={selectedId}
           tenantId={tenantId}
           agentId={agentId}
+          isFounder={isFounder}
           onClose={() => setSelectedId(null)}
+          onMutated={() => {
+            void utils.skills.list.invalidate();
+            void utils.skills.getById.invalidate();
+            void utils.skills.listVersions.invalidate();
+          }}
+        />
+      )}
+
+      {showForm && isFounder && agentId && (
+        <SkillForm
+          tenantId={tenantId}
+          agentId={agentId}
+          onClose={() => setShowForm(false)}
+          onProposed={() => {
+            void utils.skills.list.invalidate();
+          }}
         />
       )}
     </div>
@@ -345,12 +382,16 @@ function SkillDetailDrawer({
   id,
   tenantId,
   agentId,
+  isFounder,
   onClose,
+  onMutated,
 }: {
   id: string;
   tenantId: string;
   agentId: string;
+  isFounder: boolean;
   onClose: () => void;
+  onMutated: () => void;
 }) {
   const detailQuery = trpc.skills.getById.useQuery({ id, tenantId, agentId });
   const skill = (detailQuery.data?.item ?? null) as SkillRow | null;
@@ -433,6 +474,14 @@ function SkillDetailDrawer({
                 </div>
               </dl>
             </div>
+
+            {isFounder && skill.agent_id !== null && (
+              <SkillActions
+                skill={skill}
+                tenantId={tenantId}
+                onMutated={onMutated}
+              />
+            )}
 
             <Section title="Goal">
               <p className="text-sm text-gray-800 whitespace-pre-wrap">{skill.goal}</p>
@@ -545,6 +594,183 @@ function SkillDetailDrawer({
           </>
         )}
       </aside>
+    </div>
+  );
+}
+
+type LifecycleAction = 'activate' | 'deprecate' | 'rollback';
+
+const ACTION_LABEL: Record<LifecycleAction, string> = {
+  activate: 'Activate',
+  deprecate: 'Deprecate',
+  rollback: 'Rollback',
+};
+
+// Map a TRPCError data.code + the SERVER's message to an operator-facing
+// string. `serverMessage` is the TRPCError.message the router sent.
+//
+// Round-2 FIX C: for CONFLICT, surface the SERVER's message verbatim instead
+// of a hardcoded activate-only line. The router's mapRepoError now returns
+// TRANSITION-SPECIFIC conflict copy (activate → "not in the proposed state…";
+// deprecate/rollback → "not in a state that allows this transition…"), so the
+// message already reflects which action raced. Falls back to a generic line if
+// the server somehow sent an empty message.
+function actionErrorMessage(
+  code: string | undefined,
+  serverMessage: string,
+): string {
+  if (code === 'CONFLICT') {
+    return (
+      serverMessage.trim() ||
+      'This skill changed status — refresh and retry.'
+    );
+  }
+  if (code === 'FORBIDDEN') {
+    return `Not permitted: ${serverMessage}`;
+  }
+  if (code === 'NOT_FOUND') {
+    return 'Skill not found — it may have been removed. Refresh.';
+  }
+  return serverMessage;
+}
+
+/**
+ * Founder-only lifecycle actions for the selected skill. Buttons appear by
+ * status: Activate when 'proposed'; Deprecate when 'active'/'proposed';
+ * Rollback when 'active'. Each opens an inline required-reason prompt; on
+ * confirm we mutateAsync, then onMutated() invalidates the list/detail/versions
+ * so the drawer reflects the new state. Errors surface by error.data.code.
+ */
+function SkillActions({
+  skill,
+  tenantId,
+  onMutated,
+}: {
+  skill: SkillRow;
+  tenantId: string;
+  onMutated: () => void;
+}) {
+  const [pending, setPending] = React.useState<LifecycleAction | null>(null);
+  const [reason, setReason] = React.useState('');
+
+  const activate = trpc.skills.activate.useMutation();
+  const deprecate = trpc.skills.deprecate.useMutation();
+  const rollback = trpc.skills.rollback.useMutation();
+
+  const mutationFor = (a: LifecycleAction) =>
+    a === 'activate' ? activate : a === 'deprecate' ? deprecate : rollback;
+
+  const activeError =
+    activate.error ?? deprecate.error ?? rollback.error ?? null;
+  const isPending =
+    activate.isPending || deprecate.isPending || rollback.isPending;
+
+  // The skill's own agent (never null here — the parent only renders this for
+  // agent-scoped skills, which the repo's mutations require).
+  const agentId = skill.agent_id ?? '';
+
+  const reasonOk = reason.trim().length >= 10;
+
+  const start = (a: LifecycleAction) => {
+    setPending(a);
+    setReason('');
+  };
+
+  const confirm = async () => {
+    if (!pending || !reasonOk) return;
+    try {
+      await mutationFor(pending).mutateAsync({
+        id: skill.id,
+        tenantId,
+        agentId,
+        reason: reason.trim(),
+      });
+      setPending(null);
+      setReason('');
+      onMutated();
+    } catch {
+      // Surfaced via activeError below.
+    }
+  };
+
+  const canActivate = skill.status === 'proposed';
+  const canDeprecate = skill.status === 'active' || skill.status === 'proposed';
+  const canRollback = skill.status === 'active';
+
+  return (
+    <div className="border rounded p-3 bg-gray-50 space-y-2">
+      <h3 className="text-sm font-semibold text-gray-700">Lifecycle actions</h3>
+      {pending === null ? (
+        <div className="flex flex-wrap gap-2">
+          {canActivate && (
+            <button
+              onClick={() => start('activate')}
+              className="px-3 py-1 text-sm rounded bg-green-600 text-white"
+            >
+              Activate
+            </button>
+          )}
+          {canDeprecate && (
+            <button
+              onClick={() => start('deprecate')}
+              className="px-3 py-1 text-sm rounded bg-gray-600 text-white"
+            >
+              Deprecate
+            </button>
+          )}
+          {canRollback && (
+            <button
+              onClick={() => start('rollback')}
+              className="px-3 py-1 text-sm rounded bg-red-600 text-white"
+            >
+              Rollback
+            </button>
+          )}
+          {!canActivate && !canDeprecate && !canRollback && (
+            <p className="text-xs text-gray-500">
+              No actions available for a {skill.status} skill.
+            </p>
+          )}
+        </div>
+      ) : (
+        <div className="space-y-2">
+          <p className="text-sm">
+            <strong>{ACTION_LABEL[pending]}</strong> skill{' '}
+            <code>{skill.skill_descriptor}</code> v{skill.version}. Provide a
+            reason (audited, min 10 chars):
+          </p>
+          <textarea
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            rows={2}
+            className="w-full border rounded p-2 text-sm"
+            autoFocus
+          />
+          <div className="flex gap-2">
+            <button
+              onClick={confirm}
+              disabled={!reasonOk || isPending}
+              className="px-3 py-1 text-sm rounded bg-blue-600 text-white disabled:opacity-50"
+            >
+              {isPending ? 'Working…' : `Confirm ${ACTION_LABEL[pending]}`}
+            </button>
+            <button
+              onClick={() => {
+                setPending(null);
+                setReason('');
+              }}
+              className="px-3 py-1 text-sm rounded border"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+      {activeError && (
+        <p className="text-sm text-red-600">
+          {actionErrorMessage(activeError.data?.code, activeError.message)}
+        </p>
+      )}
     </div>
   );
 }
