@@ -59,9 +59,25 @@ type Captured = {
 /**
  * Mock repos. Each lifecycle method records its args + the tenant/agent context
  * it ran under, and returns a believable SkillRow. `behavior` lets a test make a
- * method throw a typed repo error so we can assert the TRPCError mapping. The
- * audit repo records every append.
+ * method throw a typed repo error so we can assert the TRPCError mapping.
+ *
+ * PR #213 FIX 1: the audit row is now written INSIDE the repo method (same tx),
+ * driven by the optional `audit` payload the router passes. The mock mirrors
+ * that: when `audit` is supplied it records the equivalent admin_audit_log
+ * entry (merging the before/after status the real repo computes in-tx) into
+ * `capture.auditCalls` BEFORE the `behavior.*` throw — EXCEPT the throw models
+ * a failed mutation, so we only record the audit if the mutation "succeeds".
+ * The separate `adminAuditLogRepo.append` is kept as a spy that the router must
+ * NOT call anymore (asserted in a regression test).
  */
+type AuditPayload = {
+  actor_id: string;
+  actor_role: string;
+  action: string;
+  tenant_id: string;
+  change_summary?: Record<string, unknown>;
+};
+
 function makeRepos(
   capture: Captured,
   behavior: {
@@ -84,32 +100,64 @@ function makeRepos(
     created_at: new Date(),
     ...over,
   });
+  // Mirror the repo's appendSkillAudit: merge descriptor/version/before/after
+  // into change_summary, build the full admin_audit_log entry, record it.
+  const recordAudit = (
+    audit: AuditPayload | undefined,
+    r: ReturnType<typeof row>,
+    beforeStatus: string | null,
+  ) => {
+    if (!audit) return;
+    capture.auditCalls.push({
+      tenant_id: audit.tenant_id,
+      actor_id: audit.actor_id,
+      actor_role: audit.actor_role,
+      action: audit.action,
+      resource_type: 'skill',
+      resource_id: r.id,
+      change_summary: {
+        ...(audit.change_summary ?? {}),
+        skill_descriptor: r.skill_descriptor,
+        version: r.version,
+        before_status: beforeStatus,
+        after_status: r.status,
+      },
+    });
+  };
   return {
     skillsRepo: {
       async getById(_id: string) {
         return row({ status: 'proposed' });
       },
-      async propose(input: Record<string, unknown>) {
+      async propose(input: Record<string, unknown>, audit?: AuditPayload) {
         capture.proposeArg = input;
         capture.proposeCtx = { tenant: getCurrentTenant(), agent: getCurrentAgent() };
         if (behavior.propose) behavior.propose();
-        return row({ status: 'proposed', version: 1 });
+        const r = row({ status: 'proposed', version: 1 });
+        recordAudit(audit, r, null);
+        return r;
       },
-      async activate(id: string, approver: string, reason?: string) {
+      async activate(id: string, approver: string, reason?: string, audit?: AuditPayload) {
         capture.activateArgs = [id, approver, reason];
         capture.activateCtx = { tenant: getCurrentTenant(), agent: getCurrentAgent() };
         if (behavior.activate) behavior.activate();
-        return row({ status: 'active', version: 1 });
+        const r = row({ status: 'active', version: 1 });
+        recordAudit(audit, r, 'proposed');
+        return r;
       },
-      async deprecate(id: string, by: string, reason: string) {
+      async deprecate(id: string, by: string, reason: string, audit?: AuditPayload) {
         capture.deprecateArgs = [id, by, reason];
         if (behavior.deprecate) behavior.deprecate();
-        return row({ status: 'deprecated', version: 1 });
+        const r = row({ status: 'deprecated', version: 1 });
+        recordAudit(audit, r, 'active');
+        return r;
       },
-      async rollback(id: string, reason: string, by: string) {
+      async rollback(id: string, reason: string, by: string, audit?: AuditPayload) {
         capture.rollbackArgs = [id, reason, by];
         if (behavior.rollback) behavior.rollback();
-        return row({ status: 'rolled_back', version: 2 });
+        const r = row({ status: 'rolled_back', version: 2 });
+        recordAudit(audit, r, 'active');
+        return r;
       },
     },
     adminAuditLogRepo: {
@@ -334,14 +382,95 @@ describe('skillsRouter mutations — repo error → TRPCError mapping', () => {
       }),
     ).rejects.toMatchObject({ code: 'FORBIDDEN' });
   });
+
+  // PR #213 FIX 2: the repo's lifecycle guards throw typed conflicts; the router
+  // must map them to CONFLICT (and NOT append an audit row).
+  it('deprecate maps cannot_deprecate_from_<status> → CONFLICT', async () => {
+    const capture = freshCapture();
+    const repos = makeRepos(capture, {
+      deprecate: () => {
+        throw new Error('cannot_deprecate_from_rolled_back');
+      },
+    });
+    await expect(
+      caller('founder', 'tenant-A', repos).deprecate({
+        id: 'skill-1',
+        agentId: 'agent-x',
+        reason: 'deprecate an already-terminal skill',
+      }),
+    ).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(capture.auditCalls).toHaveLength(0);
+  });
+
+  it('rollback maps cannot_rollback_from_<status> → CONFLICT', async () => {
+    const capture = freshCapture();
+    const repos = makeRepos(capture, {
+      rollback: () => {
+        throw new Error('cannot_rollback_from_proposed');
+      },
+    });
+    await expect(
+      caller('founder', 'tenant-A', repos).rollback({
+        id: 'skill-1',
+        agentId: 'agent-x',
+        reason: 'rollback a non-active skill',
+      }),
+    ).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(capture.auditCalls).toHaveLength(0);
+  });
+});
+
+// PR #213 FIX 3: the server rejects allowed_tools that name a tool which is not
+// currently enabled (gating flag off) or is unknown. The propose router builds
+// the enabled-set from the SAME generated catalog + FLAG_TO_CONFIG the
+// tools-catalog router uses. In the test env all gating flags default to false,
+// so `generate_report` (gated by FEATURE_PDF_REPORTS) is a reliably-disabled
+// tool and `register_transaction` (ungated) is reliably enabled.
+describe('skillsRouter.propose — disabled/unknown tool rejection (FIX 3)', () => {
+  it('rejects allowed_tools containing a disabled (flag-off) tool with BAD_REQUEST', async () => {
+    const capture = freshCapture();
+    const repos = makeRepos(capture);
+    await expect(
+      caller('founder', 'tenant-A', repos).propose(
+        validProposeInput({ allowed_tools: ['generate_report'] }),
+      ),
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+    // Rejected BEFORE the repo runs — no skill row, no audit row.
+    expect(capture.proposeArg).toBeUndefined();
+    expect(capture.auditCalls).toHaveLength(0);
+  });
+
+  it('rejects allowed_tools containing an unknown tool with BAD_REQUEST', async () => {
+    const capture = freshCapture();
+    const repos = makeRepos(capture);
+    await expect(
+      caller('founder', 'tenant-A', repos).propose(
+        validProposeInput({ allowed_tools: ['no_such_tool_xyz'] }),
+      ),
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+    expect(capture.proposeArg).toBeUndefined();
+  });
+
+  it('allows allowed_tools containing only enabled (ungated) tools', async () => {
+    const capture = freshCapture();
+    const repos = makeRepos(capture);
+    const res = await caller('founder', 'tenant-A', repos).propose(
+      validProposeInput({ allowed_tools: ['register_transaction'] }),
+    );
+    expect(res.item).toBeDefined();
+    expect(capture.proposeArg?.allowed_tools).toEqual(['register_transaction']);
+  });
 });
 
 describe('skillsRouter mutations — audit row per mutation', () => {
-  it('propose appends a skill_proposed audit row for the new skill', async () => {
+  it('propose appends a skill_proposed audit row for the new skill (in-tx)', async () => {
     const capture = freshCapture();
     const repos = makeRepos(capture);
     await caller('founder', 'tenant-A', repos).propose(validProposeInput());
-    expect(repos.adminAuditLogRepo.append).toHaveBeenCalledTimes(1);
+    // FIX 1: the audit row is written inside the repo's propose tx (via the
+    // audit payload), NOT via a separate post-commit append.
+    expect(repos.adminAuditLogRepo.append).not.toHaveBeenCalled();
+    expect(capture.auditCalls).toHaveLength(1);
     expect(capture.auditCalls[0]).toMatchObject({
       action: 'skill_proposed',
       resource_type: 'skill',
@@ -351,7 +480,7 @@ describe('skillsRouter mutations — audit row per mutation', () => {
     });
   });
 
-  it('activate appends a skill_activated audit row with before/after status', async () => {
+  it('activate appends a skill_activated audit row with before/after status (in-tx)', async () => {
     const capture = freshCapture();
     const repos = makeRepos(capture);
     await caller('founder', 'tenant-A', repos).activate({
@@ -359,7 +488,8 @@ describe('skillsRouter mutations — audit row per mutation', () => {
       agentId: 'agent-x',
       reason: 'approving this version',
     });
-    expect(repos.adminAuditLogRepo.append).toHaveBeenCalledTimes(1);
+    expect(repos.adminAuditLogRepo.append).not.toHaveBeenCalled();
+    expect(capture.auditCalls).toHaveLength(1);
     expect(capture.auditCalls[0]).toMatchObject({
       action: 'skill_activated',
       resource_type: 'skill',

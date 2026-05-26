@@ -135,7 +135,8 @@ describe('round-2 finding 1 — tenant-wide skill guard (agent context rejected)
   });
 
   it('[neg] deprecate a tenant-wide skill (agent_id=null) from agent context → tenant_admin_required', async () => {
-    // deprecate reads the row first (no withTx), then checks scope.
+    // deprecate reads the row first (inside withTx since PR #213), then checks
+    // scope — the tenant-wide guard fires before the status-conditioned UPDATE.
     nextSelectRows = [tenantWideRow('active')];
 
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'agent-A' }, async () => {

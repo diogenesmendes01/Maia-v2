@@ -155,6 +155,14 @@ export function SkillForm({
   // allowed_tools picker source = the Phase-1 Tools Catalog (the coupling).
   const catalogQuery = trpc.toolsCatalog.listCatalog.useQuery();
   const tools = catalogQuery.data ?? [];
+  // FIX 3 (PR #213): the set of tools the operator may actually select. A
+  // disabled tool (its gating flag is off) is filtered out of allowed_tools on
+  // submit so we never send a tool the server will reject. The server enforces
+  // the same rule authoritatively (skills.propose).
+  const enabledToolNames = React.useMemo(
+    () => new Set(tools.filter((t) => t.enabled).map((t) => t.name)),
+    [tools],
+  );
 
   // Evaluator skills MUST have empty allowed_tools (repo + router rule). Clear
   // any selection the moment the operator switches to evaluator so the form
@@ -214,8 +222,12 @@ export function SkillForm({
         constraints: parsed.constraints as Array<Record<string, unknown>>,
         input_schema: parsed.input_schema as Record<string, unknown>,
         output_schema: parsed.output_schema as Record<string, unknown>,
-        // Evaluator → force empty regardless of any stale selection.
-        allowed_tools: isEvaluator ? [] : allowedTools,
+        // Evaluator → force empty regardless of any stale selection. FIX 3:
+        // also drop any tool that is no longer enabled (gating flag off) so the
+        // server doesn't reject the whole propose.
+        allowed_tools: isEvaluator
+          ? []
+          : allowedTools.filter((name) => enabledToolNames.has(name)),
         policy_descriptors: parseTags(policyDescriptors),
         success_criteria: parsed.success_criteria as Array<Record<string, unknown>>,
         failure_modes: parsed.failure_modes as Array<Record<string, unknown>>,
@@ -343,11 +355,17 @@ export function SkillForm({
                 {tools.map((t) => (
                   <label
                     key={t.name}
-                    className="flex items-center gap-2 text-sm"
+                    className={`flex items-center gap-2 text-sm ${
+                      t.enabled ? '' : 'opacity-50'
+                    }`}
                   >
+                    {/* FIX 3 (PR #213): a disabled tool (gating flag off) cannot
+                        be toggled on — the checkbox is disabled and the server
+                        rejects it anyway. */}
                     <input
                       type="checkbox"
                       checked={allowedTools.includes(t.name)}
+                      disabled={!t.enabled}
                       onChange={() => toggleTool(t.name)}
                     />
                     <code>{t.name}</code>

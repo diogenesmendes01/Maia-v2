@@ -49,6 +49,35 @@ import { config } from '@/config/env.js';
 import { router, protectedProcedure } from '../server.js';
 import { resolveTenantId } from '../tenant-resolver.js';
 import { runWithTenantContext } from '../../../db/tenant-context.js';
+import { TOOL_CATALOG } from '../../generated/tool-catalog.js';
+
+/**
+ * Server-side set of currently-ENABLED tool names (PR #213 FIX 3).
+ *
+ * Reuses the SAME side-effect-free building blocks as the Tools Catalog router:
+ * the generated `TOOL_CATALOG` (static metadata incl. each tool's gating
+ * `feature_flag` NAME) + a `FLAG_TO_CONFIG` map from that flag name to the live
+ * `config.FEATURE_*` boolean. A tool is enabled iff it has no gating flag, or
+ * its mapped flag is on (an unknown flag conservatively reads as disabled — a
+ * generator/router drift bug, surfaced by treating the tool as off). Computed
+ * ONCE at module load (config is immutable per process); importing this pulls
+ * in ZERO tool handlers / gateway code, identical to tools-catalog.ts.
+ */
+const FLAG_TO_CONFIG: Readonly<Record<string, boolean>> = {
+  FEATURE_SCHEDULING_V2: config.FEATURE_SCHEDULING_V2,
+  FEATURE_PDF_REPORTS: config.FEATURE_PDF_REPORTS,
+  calendar_v2: config.FEATURE_CALENDAR_V2,
+  KNOWLEDGE_STATE_MACHINE_V1: config.FEATURE_KNOWLEDGE_STATE_MACHINE_V1,
+};
+
+function isCatalogToolEnabled(feature_flag: string | null): boolean {
+  if (feature_flag === null) return true;
+  return FLAG_TO_CONFIG[feature_flag] ?? false;
+}
+
+const ENABLED_TOOL_NAMES: ReadonlySet<string> = new Set(
+  TOOL_CATALOG.filter((t) => isCatalogToolEnabled(t.feature_flag)).map((t) => t.name),
+);
 
 /**
  * Single role gate for ALL skill mutations (spec §2 open-decision 3 — "solo
@@ -163,10 +192,13 @@ const LifecycleInput = z.object({
  * TRPCError code. The repo throws Error(`<code>: ...`) for its typed failures:
  *   - not_found                       → NOT_FOUND
  *   - cannot_activate_from_<status>   → CONFLICT (target not in 'proposed')
+ *   - cannot_deprecate_from_<status>  → CONFLICT (target not in active/proposed)
+ *   - cannot_rollback_from_<status>   → CONFLICT (target not 'active')
  *   - agent_scope_violation           → FORBIDDEN (cross-agent target)
  *   - tenant_admin_required           → FORBIDDEN (tenant-wide needs admin path)
  *   - tenant mismatch                 → FORBIDDEN
  *   - evaluator_mode_disallows_tools  → BAD_REQUEST (also caught by zod)
+ *   - disabled_tools_not_allowed      → BAD_REQUEST (allowed_tools has off/unknown tool)
  * Anything else surfaces as INTERNAL_SERVER_ERROR with the original message.
  */
 function mapRepoError(err: unknown): TRPCError {
@@ -182,6 +214,21 @@ function mapRepoError(err: unknown): TRPCError {
         'deprecated, or rolled back already. Refresh and retry.',
     });
   }
+  // PR #213 FIX 2: lifecycle-guard conflicts from deprecate/rollback. The repo's
+  // status-conditioned UPDATE affected 0 rows because the row was in an invalid
+  // state (e.g. already deprecated / rolled_back) — surface as CONFLICT so the
+  // UI re-fetches instead of silently no-op'ing.
+  if (
+    message.includes('cannot_deprecate_from_') ||
+    message.includes('cannot_rollback_from_')
+  ) {
+    return new TRPCError({
+      code: 'CONFLICT',
+      message:
+        'Skill is not in a state that allows this transition — it may have ' +
+        'changed status already. Refresh and retry.',
+    });
+  }
   if (
     message.includes('agent_scope_violation') ||
     message.includes('tenant_admin_required') ||
@@ -189,7 +236,10 @@ function mapRepoError(err: unknown): TRPCError {
   ) {
     return new TRPCError({ code: 'FORBIDDEN', message });
   }
-  if (message.includes('evaluator_mode_disallows_tools')) {
+  if (
+    message.includes('evaluator_mode_disallows_tools') ||
+    message.includes('disabled_tools_not_allowed')
+  ) {
     return new TRPCError({ code: 'BAD_REQUEST', message });
   }
   return new TRPCError({ code: 'INTERNAL_SERVER_ERROR', message });
@@ -302,64 +352,81 @@ export const skillsRouter = router({
    * so we run inside runWithTenantContext({ tenant_id, agent_id: input.agentId })
    * and DON'T pass agent_id to propose (undefined → context agent).
    *
-   * Audit: appends a `skill_proposed` admin_audit_log row AFTER the insert
-   * succeeds (the repo's propose is a single insert, not a withTx exposed to
-   * callers). change_summary carries the new row's id/descriptor/version plus
-   * the target tenant/agent for cross-tenant founder forensics.
+   * Audit (PR #213 FIX 1): the `skill_proposed` admin_audit_log row is written
+   * inside the SAME transaction as the INSERT by passing an `audit` payload to
+   * skillsRepo.propose. If the audit insert fails, the proposed row rolls back —
+   * a skill version can never commit without its forensic record. change_summary
+   * carries the target tenant/agent + category/execution_mode + allowed_tools.
+   *
+   * FIX 3: reject allowed_tools that name a DISABLED or UNKNOWN tool server-side
+   * (in addition to the evaluator⇒empty rule). Reuses the catalog's enabled
+   * computation (ENABLED_TOOL_NAMES) so the server is authoritative even if the
+   * form is bypassed.
    */
   propose: protectedProcedure
     .input(SkillContractInputSchema)
     .mutation(async ({ input, ctx }) => {
       ctx.assertRole(MUTATION_ROLE);
       const tenantId = resolveTenantId(ctx, input.tenantId);
-      let row;
+
+      // FIX 3: server-side disabled/unknown tool rejection. The form disables
+      // these checkboxes, but the server must not trust the client — an
+      // allowed_tools entry that is not a currently-enabled catalog tool is a
+      // BAD_REQUEST (would otherwise persist a reference to a tool the runtime
+      // won't expose). Evaluator skills already force empty allowed_tools.
+      const offending = input.allowed_tools.filter(
+        (name) => !ENABLED_TOOL_NAMES.has(name),
+      );
+      if (offending.length > 0) {
+        throw new TRPCError({
+          code: 'BAD_REQUEST',
+          message: `disabled_tools_not_allowed: allowed_tools contains tool(s) that are not enabled: ${offending.join(', ')}`,
+        });
+      }
+
       try {
-        row = await runWithTenantContext(
+        const row = await runWithTenantContext(
           { tenant_id: tenantId, agent_id: input.agentId },
           async () =>
-            ctx.repos.skillsRepo.propose({
-              skill_descriptor: input.skill_descriptor,
-              category: input.category,
-              execution_mode: input.execution_mode,
-              goal: input.goal,
-              when_to_use: input.when_to_use,
-              procedure: input.procedure,
-              constraints: input.constraints,
-              input_schema: input.input_schema,
-              output_schema: input.output_schema,
-              allowed_tools: input.allowed_tools,
-              policy_descriptors: input.policy_descriptors,
-              success_criteria: input.success_criteria,
-              failure_modes: input.failure_modes,
-              runtime_hints: input.runtime_hints,
-              proposed_by: ctx.userId,
-              proposed_reason: input.proposed_reason,
-            }),
+            ctx.repos.skillsRepo.propose(
+              {
+                skill_descriptor: input.skill_descriptor,
+                category: input.category,
+                execution_mode: input.execution_mode,
+                goal: input.goal,
+                when_to_use: input.when_to_use,
+                procedure: input.procedure,
+                constraints: input.constraints,
+                input_schema: input.input_schema,
+                output_schema: input.output_schema,
+                allowed_tools: input.allowed_tools,
+                policy_descriptors: input.policy_descriptors,
+                success_criteria: input.success_criteria,
+                failure_modes: input.failure_modes,
+                runtime_hints: input.runtime_hints,
+                proposed_by: ctx.userId,
+                proposed_reason: input.proposed_reason,
+              },
+              {
+                actor_id: ctx.userId,
+                actor_role: ctx.userRole,
+                action: 'skill_proposed',
+                tenant_id: tenantId,
+                change_summary: {
+                  target_tenant_id: tenantId,
+                  agent_id: input.agentId,
+                  category: input.category,
+                  execution_mode: input.execution_mode,
+                  allowed_tools: input.allowed_tools,
+                  reason: input.proposed_reason,
+                },
+              },
+            ),
         );
+        return { item: row };
       } catch (err) {
         throw mapRepoError(err);
       }
-
-      await ctx.repos.adminAuditLogRepo.append({
-        tenant_id: tenantId,
-        actor_id: ctx.userId,
-        actor_role: ctx.userRole,
-        action: 'skill_proposed',
-        resource_type: 'skill',
-        resource_id: row.id,
-        change_summary: {
-          target_tenant_id: tenantId,
-          agent_id: input.agentId,
-          skill_descriptor: row.skill_descriptor,
-          category: row.category,
-          execution_mode: row.execution_mode,
-          version: row.version,
-          allowed_tools: input.allowed_tools,
-          reason: input.proposed_reason,
-        },
-      });
-
-      return { item: row };
     }),
 
   /**
@@ -369,150 +436,112 @@ export const skillsRouter = router({
    * agent_scope_violation / tenant_admin_required (→ FORBIDDEN) for cross-agent
    * or tenant-wide targets, skill_not_found (→ NOT_FOUND).
    *
-   * Audit (`skill_activated`) records the before-status so the trail shows the
-   * transition; we read the row inside the context BEFORE activating.
+   * Audit (PR #213 FIX 1): the `skill_activated` row commits inside the repo's
+   * activation transaction (audit payload arg). The repo records before/after
+   * status from the row it locks in-tx, so the trail always reflects the real
+   * transition; a failed audit insert rolls the whole activation back.
    */
   activate: protectedProcedure
     .input(LifecycleInput)
     .mutation(async ({ input, ctx }) => {
       ctx.assertRole(MUTATION_ROLE);
       const tenantId = resolveTenantId(ctx, input.tenantId);
-      let result;
       try {
-        result = await runWithTenantContext(
+        const row = await runWithTenantContext(
           { tenant_id: tenantId, agent_id: input.agentId },
-          async () => {
-            const before = await ctx.repos.skillsRepo.getById(input.id);
-            const row = await ctx.repos.skillsRepo.activate(
-              input.id,
-              ctx.userId,
-              input.reason,
-            );
-            return { before, row };
-          },
+          async () =>
+            ctx.repos.skillsRepo.activate(input.id, ctx.userId, input.reason, {
+              actor_id: ctx.userId,
+              actor_role: ctx.userRole,
+              action: 'skill_activated',
+              tenant_id: tenantId,
+              change_summary: {
+                target_tenant_id: tenantId,
+                agent_id: input.agentId,
+                reason: input.reason,
+              },
+            }),
         );
+        return { item: row };
       } catch (err) {
         throw mapRepoError(err);
       }
-
-      await ctx.repos.adminAuditLogRepo.append({
-        tenant_id: tenantId,
-        actor_id: ctx.userId,
-        actor_role: ctx.userRole,
-        action: 'skill_activated',
-        resource_type: 'skill',
-        resource_id: result.row.id,
-        change_summary: {
-          target_tenant_id: tenantId,
-          agent_id: input.agentId,
-          skill_descriptor: result.row.skill_descriptor,
-          version: result.row.version,
-          before_status: result.before?.status ?? null,
-          after_status: result.row.status,
-          reason: input.reason,
-        },
-      });
-
-      return { item: result.row };
     }),
 
   /**
    * deprecate — mark an active/proposed skill as deprecated (does NOT reactivate
    * anything). Founder-only. Repo throws skill_not_found (→ NOT_FOUND),
-   * agent_scope_violation / tenant_admin_required (→ FORBIDDEN).
+   * agent_scope_violation / tenant_admin_required (→ FORBIDDEN), and
+   * cannot_deprecate_from_<status> (→ CONFLICT) when the row is not in
+   * active/proposed (FIX 2 — server-authoritative lifecycle guard).
+   *
+   * Audit (PR #213 FIX 1): the `skill_deprecated` row commits inside the repo's
+   * transaction (audit payload arg) alongside the status-conditioned UPDATE.
    */
   deprecate: protectedProcedure
     .input(LifecycleInput)
     .mutation(async ({ input, ctx }) => {
       ctx.assertRole(MUTATION_ROLE);
       const tenantId = resolveTenantId(ctx, input.tenantId);
-      let result;
       try {
-        result = await runWithTenantContext(
+        const row = await runWithTenantContext(
           { tenant_id: tenantId, agent_id: input.agentId },
-          async () => {
-            const before = await ctx.repos.skillsRepo.getById(input.id);
-            const row = await ctx.repos.skillsRepo.deprecate(
-              input.id,
-              ctx.userId,
-              input.reason,
-            );
-            return { before, row };
-          },
+          async () =>
+            ctx.repos.skillsRepo.deprecate(input.id, ctx.userId, input.reason, {
+              actor_id: ctx.userId,
+              actor_role: ctx.userRole,
+              action: 'skill_deprecated',
+              tenant_id: tenantId,
+              change_summary: {
+                target_tenant_id: tenantId,
+                agent_id: input.agentId,
+                reason: input.reason,
+              },
+            }),
         );
+        return { item: row };
       } catch (err) {
         throw mapRepoError(err);
       }
-
-      await ctx.repos.adminAuditLogRepo.append({
-        tenant_id: tenantId,
-        actor_id: ctx.userId,
-        actor_role: ctx.userRole,
-        action: 'skill_deprecated',
-        resource_type: 'skill',
-        resource_id: result.row.id,
-        change_summary: {
-          target_tenant_id: tenantId,
-          agent_id: input.agentId,
-          skill_descriptor: result.row.skill_descriptor,
-          version: result.row.version,
-          before_status: result.before?.status ?? null,
-          after_status: result.row.status,
-          reason: input.reason,
-        },
-      });
-
-      return { item: result.row };
     }),
 
   /**
    * rollback — mark an active skill as rolled_back and (best-effort) reactivate
    * the prior version; the repo does both inside one withTx. Founder-only. Repo
    * throws skill_not_found (→ NOT_FOUND), agent_scope_violation /
-   * tenant_admin_required (→ FORBIDDEN). Note the repo's rollback signature is
-   * (id, reason, rolledBackBy).
+   * tenant_admin_required (→ FORBIDDEN), and cannot_rollback_from_<status>
+   * (→ CONFLICT) when the row is not 'active' (FIX 2 — server-authoritative
+   * lifecycle guard). Note the repo's rollback signature is
+   * (id, reason, rolledBackBy, audit?).
+   *
+   * Audit (PR #213 FIX 1): the `skill_rolled_back` row commits inside the repo's
+   * transaction (audit payload arg) alongside the status-conditioned UPDATE and
+   * any v-1 reactivation.
    */
   rollback: protectedProcedure
     .input(LifecycleInput)
     .mutation(async ({ input, ctx }) => {
       ctx.assertRole(MUTATION_ROLE);
       const tenantId = resolveTenantId(ctx, input.tenantId);
-      let result;
       try {
-        result = await runWithTenantContext(
+        const row = await runWithTenantContext(
           { tenant_id: tenantId, agent_id: input.agentId },
-          async () => {
-            const before = await ctx.repos.skillsRepo.getById(input.id);
-            const row = await ctx.repos.skillsRepo.rollback(
-              input.id,
-              input.reason,
-              ctx.userId,
-            );
-            return { before, row };
-          },
+          async () =>
+            ctx.repos.skillsRepo.rollback(input.id, input.reason, ctx.userId, {
+              actor_id: ctx.userId,
+              actor_role: ctx.userRole,
+              action: 'skill_rolled_back',
+              tenant_id: tenantId,
+              change_summary: {
+                target_tenant_id: tenantId,
+                agent_id: input.agentId,
+                reason: input.reason,
+              },
+            }),
         );
+        return { item: row };
       } catch (err) {
         throw mapRepoError(err);
       }
-
-      await ctx.repos.adminAuditLogRepo.append({
-        tenant_id: tenantId,
-        actor_id: ctx.userId,
-        actor_role: ctx.userRole,
-        action: 'skill_rolled_back',
-        resource_type: 'skill',
-        resource_id: result.row.id,
-        change_summary: {
-          target_tenant_id: tenantId,
-          agent_id: input.agentId,
-          skill_descriptor: result.row.skill_descriptor,
-          version: result.row.version,
-          before_status: result.before?.status ?? null,
-          after_status: result.row.status,
-          reason: input.reason,
-        },
-      });
-
-      return { item: result.row };
     }),
 });
