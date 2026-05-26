@@ -170,8 +170,18 @@ d('seedNewActiveAtomic vs transition cross-writer race (issue #195, real DB)', (
       //     proceeds to freeze UPDATE which blocks on us. Post-fix:
       //     FOR UPDATE read blocks on us right here.
       //   - either way, the seed is now blocked on the v1 row lock.
+      // Codex round 2 [P2/HIGH]: this is a NON-INITIAL seed (v1 already
+      // exists), so per the new `seedNewActiveAtomic` contract introduced
+      // in cc04b369 we MUST declare which active row we expect to
+      // supersede. Omitting `expected_current_active_id` would short-
+      // circuit on `seed_atomic_missing_predecessor_expectation` BEFORE
+      // the test ever exercises the FOR UPDATE / freeze-predicate race
+      // this scenario is meant to verify. With the expectation in place,
+      // the test models the realistic migration path (caller observed v1
+      // active via `getActive()`, then raced the drift rollback).
       const seedPromise = runWithTenantContext({ tenant_id: T, agent_id: A }, async () =>
         operationalProfileVersionsRepo.seedNewActiveAtomic({
+          expected_current_active_id: v1Id,
           profile_body: {
             metadata: { previous_version_id: v1Id },
           } as unknown as Parameters<
@@ -221,11 +231,26 @@ d('seedNewActiveAtomic vs transition cross-writer race (issue #195, real DB)', (
         expect(v1Final.status).toBe('rolled_back');
         expect(v1Final.rolled_back_at).not.toBeNull();
 
-        // Now characterize how the seed terminated:
+        // Codex round 2: with `expected_current_active_id: v1Id` now
+        // declared, this orchestration has a deterministic terminal
+        // state — the seed MUST reject. Reasoning: the side connection
+        // commits v1→rolled_back BEFORE releasing the row lock, so when
+        // the seed's `FOR UPDATE` re-read wakes, the now-current snapshot
+        // returns zero rows (rolled_back is filtered out by
+        // `status='active'`). With currentActive=null and an explicit
+        // expectation, the stale-active guard fires and the seed throws
+        // `seed_atomic_stale_active`, rolling the tx back. The
+        // `seed_atomic_freeze_failed` branch is the alternate
+        // defense-in-depth outcome that would fire if `FOR UPDATE` were
+        // ever bypassed and the freeze UPDATE's `status='active'`
+        // predicate matched zero rows instead. Either rejection
+        // preserves the same end-state: v1 stays rolled_back, no v2 is
+        // inserted, and the rollback is honoured.
         if (seedResult.status === 'fulfilled') {
-          // Post-fix happy path: seed observed v1 as non-active after its
-          // FOR UPDATE re-read, treated currentActive as null, skipped
-          // the freeze entirely, and inserted v2 as active.
+          // Defensive: a fulfilled seed under this orchestration would
+          // mean the new contract (mandatory expectation + stale-active
+          // guard) silently regressed. Surface the full state so the
+          // failure is actionable.
           const allRows = await verify.query<{ version: number; status: string }>(
             `SELECT version, status
                FROM agent_operational_profile_versions
@@ -233,28 +258,24 @@ d('seedNewActiveAtomic vs transition cross-writer race (issue #195, real DB)', (
               ORDER BY version`,
             [T, A],
           );
-          // Exactly two rows: v1 rolled_back, v2 active.
-          expect(allRows.rows.length).toBe(2);
-          const v2 = allRows.rows.find((row) => row.version === 2);
-          expect(v2).toBeDefined();
-          expect(v2!.status).toBe('active');
-        } else {
-          // Acceptable post-fix outcome on the defense-in-depth path: the
-          // freeze UPDATE's `status='active'` predicate matched zero rows
-          // → seed threw `seed_atomic_freeze_failed`, the whole seed tx
-          // rolled back, no v2 was inserted. v1 still rolled_back.
-          const msg = String(seedResult.reason);
-          expect(msg).toMatch(/seed_atomic_freeze_failed|stale_active/i);
-
-          const allRows = await verify.query<{ count: string }>(
-            `SELECT COUNT(*)::text AS count
-               FROM agent_operational_profile_versions
-              WHERE tenant_id = $1 AND agent_id = $2`,
-            [T, A],
+          throw new Error(
+            'seed unexpectedly fulfilled with expected_current_active_id set ' +
+              'and v1 already rolled_back — stale-active guard regressed. ' +
+              `rows=${JSON.stringify(allRows.rows)}`,
           );
-          // Only v1 should exist (seed tx rolled back so no v2 inserted).
-          expect(allRows.rows[0]!.count).toBe('1');
         }
+
+        const msg = String(seedResult.reason);
+        expect(msg).toMatch(/seed_atomic_freeze_failed|seed_atomic_stale_active/i);
+
+        const allRows = await verify.query<{ count: string }>(
+          `SELECT COUNT(*)::text AS count
+             FROM agent_operational_profile_versions
+            WHERE tenant_id = $1 AND agent_id = $2`,
+          [T, A],
+        );
+        // Only v1 should exist (seed tx rolled back so no v2 inserted).
+        expect(allRows.rows[0]!.count).toBe('1');
 
         // Active-slot invariant: AT MOST one active row at any time.
         const active = await verify.query<{ count: string }>(
@@ -304,10 +325,18 @@ d('seedNewActiveAtomic vs transition cross-writer race (issue #195, real DB)', (
       }),
     );
 
+    // Codex round 2 [P2/HIGH]: non-initial seed (v1 already exists) now
+    // requires `expected_current_active_id`. Omitting it would make this
+    // call degenerate into an immediate `seed_atomic_missing_predecessor_
+    // expectation` rejection instead of exercising the freeze/insert
+    // serialization against `transition`. With `v1Id` declared the test
+    // models the realistic migration-script path (`p8d-migration-
+    // priorities` reads `getActive()` first and passes its id).
     const seedCall = runWithTenantContext({ tenant_id: T, agent_id: A }, async () =>
       operationalProfileVersionsRepo.seedNewActiveAtomic({
+        expected_current_active_id: v1Id,
         profile_body: {
-          metadata: { previous_version_id: null },
+          metadata: { previous_version_id: v1Id },
         } as unknown as Parameters<
           typeof operationalProfileVersionsRepo.seedNewActiveAtomic
         >[0]['profile_body'],
@@ -341,6 +370,7 @@ d('seedNewActiveAtomic vs transition cross-writer race (issue #195, real DB)', (
       expect(v1).toBeDefined();
 
       const transitionRes = results[0];
+      const seedRes = results[1];
 
       // If `transition` returned `ok:true`, the drift rollback was applied.
       // CRITICAL INVARIANT (issue #195): v1 MUST stay `rolled_back`. Pre-fix,
@@ -349,14 +379,18 @@ d('seedNewActiveAtomic vs transition cross-writer race (issue #195, real DB)', (
       // predicate.
       if (transitionRes.status === 'fulfilled' && transitionRes.value.ok) {
         expect(v1!.status).toBe('rolled_back');
-        // If the rollback succeeded, the seed may or may not have inserted
-        // v2 — but if it did, v2 is the only active row.
-        const activeRows = r.rows.filter((row) => row.status === 'active');
-        expect(activeRows.length).toBeLessThanOrEqual(1);
-        if (activeRows.length === 1) {
-          expect(activeRows[0]!.version).toBeGreaterThan(1);
-          expect(activeRows[0]!.id).not.toBe(v1Id);
+        // Codex round 2: with `expected_current_active_id: v1Id` declared,
+        // the seed CANNOT silently insert a v2 after a successful
+        // rollback — its `FOR UPDATE` re-read sees no active row, the
+        // expectation/currentActive mismatch fires
+        // `seed_atomic_stale_active`, and the tx rolls back. So the seed
+        // must have rejected and zero new active rows exist.
+        expect(seedRes!.status).toBe('rejected');
+        if (seedRes!.status === 'rejected') {
+          expect(String(seedRes!.reason)).toMatch(/seed_atomic_stale_active/i);
         }
+        const activeRows = r.rows.filter((row) => row.status === 'active');
+        expect(activeRows.length).toBe(0);
       } else if (
         transitionRes.status === 'fulfilled' &&
         !transitionRes.value.ok &&
@@ -367,6 +401,13 @@ d('seedNewActiveAtomic vs transition cross-writer race (issue #195, real DB)', (
         expect(transitionRes.value.expected_from).toBe('active');
         expect(transitionRes.value.actual).toBe('frozen');
         expect(v1!.status).toBe('frozen');
+        // Seed must have fulfilled (it observed v1=active under its
+        // FOR UPDATE, expectation matched, freeze+insert ran cleanly).
+        expect(seedRes!.status).toBe('fulfilled');
+        if (seedRes!.status === 'fulfilled') {
+          expect(seedRes!.value.new_active.version).toBe(2);
+          expect(seedRes!.value.new_active.status).toBe('active');
+        }
       } else {
         // Codex review of PR #202 [P3]: any other outcome (transition
         // rejected, or returned ok:false with a reason other than 'stale')
@@ -375,7 +416,8 @@ d('seedNewActiveAtomic vs transition cross-writer race (issue #195, real DB)', (
         // catch-all that `issue-177-transition-parent-lock.spec.ts`
         // scenario A uses so the regression is obvious instead of hidden.
         throw new Error(
-          `unexpected transition result: ${JSON.stringify(transitionRes)}; rows=${JSON.stringify(r.rows)}`,
+          `unexpected transition result: ${JSON.stringify(transitionRes)}; ` +
+            `seed=${JSON.stringify(seedRes)}; rows=${JSON.stringify(r.rows)}`,
         );
       }
 
