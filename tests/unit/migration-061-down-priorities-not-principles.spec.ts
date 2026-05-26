@@ -71,12 +71,21 @@ describe('migration 061 down — issue #194 priority-as-principle contamination 
 
   it('does NOT reference profile_body->\'identity\'->\'priorities\' as a fallback for principles', () => {
     // This is the exact bug: a COALESCE chain that promotes priorities
-    // into the principles slot. After the fix, the priorities JSON path
-    // must not appear in the down SQL at all (the down migration only
-    // restores the legacy 4 columns; priorities live under
-    // profile_body.identity.priorities, which is dropped with profile_body).
-    expect(code).not.toMatch(/profile_body->'identity'->'priorities'/);
-    // Defensive: also lock the field name lookup form just in case.
+    // into the principles slot. The contamination guard is "priorities
+    // must never feed the principles builder", not "priorities must
+    // never appear at all" — issue #203 archives identity.priorities
+    // into a sidecar column (`_rollback_archive_priorities`) BEFORE the
+    // profile_body DROP, which is a legitimate read of the same JSON
+    // path. The narrow guard checks: priorities never appears within
+    // 200 chars of a `'principles'` JSON key, which is where the bug
+    // lived (a COALESCE for the principles slot).
+    const contamWindow = new RegExp(
+      `'principles'[\\s\\S]{0,200}profile_body->'identity'->'priorities'`,
+    );
+    expect(code).not.toMatch(contamWindow);
+    // Defensive: the ->>'priorities' (string lookup) form must not
+    // appear anywhere — the sidecar archive uses ->'priorities' (jsonb
+    // lookup), so this still pins the lookup-as-string anti-pattern.
     expect(code).not.toMatch(/->>'priorities'/);
   });
 
