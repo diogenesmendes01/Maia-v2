@@ -134,10 +134,21 @@ d('operationalProfileVersionsRepo.transition (parent-agent lock, real DB)', () =
       }),
     );
 
+    // PR #202 / issue #208 follow-up: non-initial seed (v1 already exists
+    // and was inserted by the test setup above) now REQUIRES
+    // `expected_current_active_id` per the contract introduced in
+    // cc04b369. Omitting it would short-circuit on
+    // `seed_atomic_missing_predecessor_expectation` BEFORE the test ever
+    // exercises the parent-lock contention against `transition` that
+    // this scenario claims to verify. With `v1Id` declared the test
+    // models the realistic migration-script path
+    // (`p8d-migration-priorities` reads `getActive()` first and passes
+    // the observed active id).
     const seedCall = runWithTenantContext({ tenant_id: T, agent_id: A }, async () =>
       operationalProfileVersionsRepo.seedNewActiveAtomic({
+        expected_current_active_id: v1Id,
         profile_body: {
-          metadata: { previous_version_id: null },
+          metadata: { previous_version_id: v1Id },
         } as unknown as Parameters<
           typeof operationalProfileVersionsRepo.seedNewActiveAtomic
         >[0]['profile_body'],
@@ -181,10 +192,26 @@ d('operationalProfileVersionsRepo.transition (parent-agent lock, real DB)', () =
 
       // The transition result tells us which path the system took.
       const transitionRes = results[0];
+      const seedRes = results[1];
 
       if (transitionRes.status === 'fulfilled' && transitionRes.value.ok) {
         // Drift transition won the race → v1 MUST stay rolled_back.
         expect(v1!.status).toBe('rolled_back');
+        // PR #202 / issue #208: with `expected_current_active_id: v1Id`
+        // declared on the seed, the seed CANNOT silently insert a v2
+        // after a successful rollback. When the seed's `FOR UPDATE`
+        // re-read wakes after `transition` committed v1→rolled_back,
+        // the `status='active'` filter returns zero rows
+        // (currentActive=null), the expectation/currentActive mismatch
+        // fires `seed_atomic_stale_active`, and the seed tx rolls back.
+        // So the seed MUST have rejected and zero new active rows
+        // exist after this branch.
+        expect(seedRes!.status).toBe('rejected');
+        if (seedRes!.status === 'rejected') {
+          expect(String(seedRes!.reason)).toMatch(/seed_atomic_stale_active/i);
+        }
+        const activeRowsAfterRollback = r.rows.filter((row) => row.status === 'active');
+        expect(activeRowsAfterRollback.length).toBe(0);
       } else if (
         transitionRes.status === 'fulfilled' &&
         !transitionRes.value.ok &&
@@ -204,6 +231,14 @@ d('operationalProfileVersionsRepo.transition (parent-agent lock, real DB)', () =
         // The new active was NOT marked rolled_back. This is the entire
         // point of the `expected_from` contract.
         expect(v2!.status).toBe('active');
+        // PR #202 / issue #208: seed must have fulfilled — it observed
+        // v1=active under its FOR UPDATE, the expectation matched, and
+        // the freeze+insert ran cleanly.
+        expect(seedRes!.status).toBe('fulfilled');
+        if (seedRes!.status === 'fulfilled') {
+          expect(seedRes!.value.new_active.version).toBe(2);
+          expect(seedRes!.value.new_active.status).toBe('active');
+        }
       } else if (
         transitionRes.status === 'fulfilled' &&
         !transitionRes.value.ok &&
@@ -216,7 +251,8 @@ d('operationalProfileVersionsRepo.transition (parent-agent lock, real DB)', () =
       } else {
         // Catch-all: log the actual state so a regression is obvious.
         throw new Error(
-          `unexpected transition result: ${JSON.stringify(transitionRes)}; rows=${JSON.stringify(r.rows)}`,
+          `unexpected transition result: ${JSON.stringify(transitionRes)}; ` +
+            `seed=${JSON.stringify(seedRes)}; rows=${JSON.stringify(r.rows)}`,
         );
       }
 
