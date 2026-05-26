@@ -22,6 +22,26 @@
 --   / episodic_temp / growth_backlog on the post-rollback schema, breaking
 --   the append-only invariant.
 --
+-- Why we archive identity.priorities into a sidecar JSONB column before
+-- the DROP (issue #203, follow-up to #194/#199):
+--   #199 removed the priorities→principles synthesis to stop VALORES
+--   contamination on rollback (#194). That's semantically correct but
+--   LOSSY for `identity.priorities`: admin-ui rows with priorities
+--   populated but no real principles see their priorities dropped along
+--   with `profile_body` and there's no recovery path. The previous
+--   pre-#199 fallback was equally lossy AND contaminated VALORES.
+--
+--   Fix (option (a) from #203): add a sidecar column
+--   `_rollback_archive_priorities` outside any VALORES-read path,
+--   populate it from `profile_body.identity.priorities` before the
+--   `DROP COLUMN profile_body`. The (re-)up migration (#061 up) reads
+--   the sidecar back into `profile_body.identity.priorities` and clears
+--   it so the column is ready for a future re-rollback. The sidecar
+--   never feeds `core_immutable.principles` — that would reintroduce
+--   the #194 contamination. Tenant isolation is row-local: the archive
+--   UPDATE is row-by-row, no JOIN, no cross-row subquery, so each
+--   row's priorities stay inside its own tenant_id/agent_id pair.
+--
 -- NOTE: no BEGIN/COMMIT — migrate.ts wraps in transaction.
 
 DO $outer$
@@ -124,6 +144,34 @@ BEGIN
              END
        WHERE profile_body IS NOT NULL
          AND profile_body <> '{}'::jsonb
+    $sql$;
+  END IF;
+
+  -- (1b) Archive identity.priorities into a sidecar column BEFORE the DROP
+  -- (issue #203). The sidecar lives outside any VALORES-read path: it is
+  -- not read by `resolveLegacyPayload` and not consulted by the VALORES
+  -- detector. The only consumer is the (re-)up migration, which restores
+  -- profile_body.identity.priorities and clears the sidecar. Idempotent:
+  -- ADD COLUMN IF NOT EXISTS so a repeated down on an already-rolled-back
+  -- schema does not error. The archive UPDATE is row-local — each row's
+  -- priorities are copied into its own sidecar, with no JOIN and no
+  -- cross-row subquery, preserving tenant isolation by construction.
+  EXECUTE 'ALTER TABLE agent_operational_profile_versions
+             ADD COLUMN IF NOT EXISTS _rollback_archive_priorities JSONB NOT NULL DEFAULT ''{}''::jsonb';
+
+  IF has_profile_body THEN
+    EXECUTE $sql$
+      UPDATE agent_operational_profile_versions
+         SET _rollback_archive_priorities = CASE
+               WHEN profile_body IS NOT NULL
+                AND jsonb_typeof(profile_body->'identity'->'priorities') = 'array'
+                AND jsonb_array_length(profile_body->'identity'->'priorities') > 0
+                 THEN jsonb_build_object(
+                   'priorities', profile_body->'identity'->'priorities'
+                 )
+               ELSE _rollback_archive_priorities
+             END
+       WHERE profile_body IS NOT NULL
     $sql$;
   END IF;
 

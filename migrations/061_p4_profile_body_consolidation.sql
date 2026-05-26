@@ -48,6 +48,7 @@ ALTER TABLE agent_operational_profile_versions
 DO $outer$
 DECLARE
   has_legacy boolean;
+  has_rollback_archive boolean;
 BEGIN
   SELECT EXISTS (
     SELECT 1
@@ -55,6 +56,19 @@ BEGIN
      WHERE table_name = 'agent_operational_profile_versions'
        AND column_name = 'core_immutable'
   ) INTO has_legacy;
+
+  -- Issue #203: detect the sidecar column written by the down migration
+  -- (`_rollback_archive_priorities`). When present, restore
+  -- profile_body.identity.priorities from it and clear the sidecar so a
+  -- subsequent re-rollback captures a fresh snapshot. The column is NOT
+  -- dropped on up — keeping it around makes the down idempotent and lets
+  -- a future re-rollback archive again without an extra ADD COLUMN.
+  SELECT EXISTS (
+    SELECT 1
+      FROM information_schema.columns
+     WHERE table_name = 'agent_operational_profile_versions'
+       AND column_name = '_rollback_archive_priorities'
+  ) INTO has_rollback_archive;
 
   -- Drop the existing trigger first so the backfill UPDATE doesn't fire it,
   -- and so we can replace the function body cleanly. The CREATE TRIGGER at
@@ -176,6 +190,36 @@ BEGIN
       END;
       $body$ LANGUAGE plpgsql;
     $fn$;
+  END IF;
+
+  -- Issue #203 restore: if the sidecar archive column exists and any row
+  -- carries a non-empty `_rollback_archive_priorities.priorities`, merge
+  -- those priorities back into `profile_body.identity.priorities`. This
+  -- recovers the priorities that the previous down migration parked in
+  -- the sidecar so they don't get lost across a down→up cycle.
+  --
+  -- Why we do NOT drop the sidecar column on up: keeping it around makes
+  -- the down idempotent (its `ADD COLUMN IF NOT EXISTS` is a no-op next
+  -- time) and lets a future re-rollback archive a fresh snapshot without
+  -- another schema change. We DO reset the sidecar to '{}'::jsonb after
+  -- restore so the next down captures a clean snapshot rather than
+  -- replaying a stale one. Idempotence: a second up call finds the
+  -- sidecar already cleared and the UPDATE is a no-op.
+  IF has_rollback_archive THEN
+    EXECUTE $sql$
+      UPDATE agent_operational_profile_versions
+         SET profile_body = jsonb_set(
+               COALESCE(profile_body, '{}'::jsonb),
+               '{identity,priorities}',
+               _rollback_archive_priorities->'priorities',
+               true
+             ),
+             _rollback_archive_priorities = '{}'::jsonb
+       WHERE _rollback_archive_priorities IS NOT NULL
+         AND _rollback_archive_priorities <> '{}'::jsonb
+         AND jsonb_typeof(_rollback_archive_priorities->'priorities') = 'array'
+         AND jsonb_array_length(_rollback_archive_priorities->'priorities') > 0
+    $sql$;
   END IF;
 
   EXECUTE 'CREATE TRIGGER agent_op_profile_content_immutable_trg
