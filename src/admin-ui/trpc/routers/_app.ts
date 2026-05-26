@@ -17,6 +17,7 @@ import { proceduresRouter } from './procedures.js';
 import { knowledgeRouter } from './knowledge.js';
 import { llmSettingsRouter } from './llmSettings.js';
 import { toolsCatalogRouter } from './tools-catalog.js';
+import { skillsRouter } from './skills.js';
 
 export const appRouter = router({
   inbox: inboxRouter,
@@ -34,6 +35,7 @@ export const appRouter = router({
   knowledge: knowledgeRouter,
   llmSettings: llmSettingsRouter,
   toolsCatalog: toolsCatalogRouter,
+  skills: skillsRouter,
 });
 
 export type AppRouter = typeof appRouter;

@@ -35,6 +35,14 @@ export interface SkillsRepo {
   /** Lista todas active dentro de uma category (para slice builder / Admin UI). */
   listByCategory(category: string): Promise<SkillRow[]>;
 
+  /**
+   * Lista todas as skills do tenant (Admin UI catalog), opcionalmente
+   * filtradas por status. Tenant + agent-scoped (current agent OR tenant-wide),
+   * mesma regra de visibilidade que listVersions/getById (review #99 finding 1).
+   * Mais recente primeiro (status, descriptor, version desc).
+   */
+  listAll(status?: string): Promise<SkillRow[]>;
+
   /** Cria uma nova versão em status='proposed' (jamais 'active'). */
   propose(input: ProposeInput): Promise<SkillRow>;
 
@@ -122,6 +130,25 @@ export const skillsRepo: SkillsRepo = {
           or(eq(skills.agent_id, ctxAgent), sql`agent_id IS NULL`),
         ),
       );
+  },
+
+  async listAll(status): Promise<SkillRow[]> {
+    const tenant_id = getCurrentTenant();
+    const ctxAgent = getCurrentAgent();
+    const filters = [
+      eq(skills.tenant_id, tenant_id),
+      // Agent scope (review #99 finding 1): current agent OR tenant-wide.
+      // Never expose another agent's skills within the same tenant.
+      or(eq(skills.agent_id, ctxAgent), sql`agent_id IS NULL`),
+    ];
+    if (status !== undefined) {
+      filters.push(eq(skills.status, status));
+    }
+    return db
+      .select()
+      .from(skills)
+      .where(and(...filters))
+      .orderBy(skills.skill_descriptor, desc(skills.version));
   },
 
   async propose(input): Promise<SkillRow> {
