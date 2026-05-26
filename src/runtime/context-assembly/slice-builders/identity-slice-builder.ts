@@ -119,14 +119,92 @@ export class IdentitySliceBuilder
     return sliceCacheKey(base.tenant_id, 'identity', scope);
   }
 
+  /**
+   * Build a cache key whose scope hash ALSO encodes the active profile's
+   * `id` (the "version stamp"). This is the key actually used by `build()`
+   * for cache get/set so that a profile state change (freeze, rollback, or
+   * a brand-new active row) naturally produces a DIFFERENT key — the next
+   * lookup misses and we re-read the post-state-change row.
+   *
+   * Issue #206 follow-up (Codex round 2, [HIGH]): without the version stamp,
+   * once `(tenant, agent, depth, schema_version)` cached a slice, subsequent
+   * `build()` calls served it for up to one identity TTL (300s) even after
+   * the control-plane state transitioned the profile out of `active`. The
+   * agent would keep emitting revoked operational instructions for minutes
+   * after the rollback.
+   *
+   * `wireDefaultInvalidationHandlers` exists in
+   * `src/runtime/context-packet/cache/invalidation-bus.ts` but is NOT
+   * dispatched from production write paths (no
+   * `identity_profile_activated`/`identity_profile_rolled_back` emitter in
+   * `src/`). Rather than wire a post-tx event bus (which can fail, drop, or
+   * race the cached turn between commit and delivery), encode the version
+   * directly in the cache key — self-healing, no missed events.
+   *
+   * Tenant isolation: tenant_id is still in the key prefix via
+   * `sliceCacheKey`; the active profile id is per-tenant by the schema's
+   * `(tenant_id, agent_id, status='active')` partial unique index. Two
+   * tenants cannot collide.
+   *
+   * @param activeProfileId  the `id` of the current active row, or `null`
+   *                         when there's no active profile (post-rollback /
+   *                         post-freeze with no new active).
+   */
+  private versionedCacheKey(
+    base: BaseContextPacket,
+    req: IdentityRequirements,
+    activeProfileId: string | null,
+  ): string {
+    const scope = hashShort({
+      agent_id: base.agent_id,
+      depth: req.depth,
+      schema_version: 'v3.1.1-issue192',
+      // Stamp the active profile's id (or a "no-active" sentinel) into the
+      // scope hash. Any state change that flips this value produces a fresh
+      // key on the next call.
+      active_profile_id: activeProfileId ?? '__no_active__',
+    });
+    return sliceCacheKey(base.tenant_id, 'identity', scope);
+  }
+
   async build(
     input: SliceBuilderInput<IdentityRequirements>,
   ): Promise<SliceBuilderResult<IdentitySlice>> {
     const start = performance.now();
     throwIfAborted(input.signal);
-    const key = this.cacheKey(input.base, input.requirements);
 
-    // Cache lookup
+    // Issue #206 follow-up (Codex round 2, [HIGH]): fetch the active profile
+    // BEFORE the cache lookup so the cache key can encode the active row's
+    // `id`. This converts "stale-until-TTL" into a self-healing miss
+    // whenever the active-row id changes (freeze → no row; rollback → no
+    // row; new active → different row).
+    //
+    // Cost trade-off: we pay one indexed DB lookup per turn (the
+    // `agent_op_profile_tenant_agent_status_idx` index makes this O(1) in
+    // practice). What the cache still buys us: skipping the JSON.parse of
+    // `profile_body` + the slice-extraction work (priorities, principles,
+    // voice modifiers) on hits. Profile bodies are small but the extraction
+    // is non-trivial, especially under high turn rates.
+    //
+    // If a future profile read becomes expensive (e.g. body grows large
+    // enough that the index lookup dominates), reintroduce a lighter
+    // `getActiveIdAndStatus()` probe — same cache-key strategy, smaller
+    // payload. The contract (cache invalidates on state change) does NOT
+    // depend on the probe shape.
+    const record = await this.repo.getActive(
+      input.base.tenant_id,
+      input.base.agent_id,
+    );
+    throwIfAborted(input.signal);
+
+    const key = this.versionedCacheKey(
+      input.base,
+      input.requirements,
+      record?.id ?? null,
+    );
+
+    // Cache lookup (now keyed by the active profile id, so a state change
+    // since the previous turn naturally falls through to a fresh build).
     const cached = await this.cache.get<IdentitySlice>(key);
     if (cached) {
       return {
@@ -135,13 +213,6 @@ export class IdentitySliceBuilder
         duration_ms: performance.now() - start,
       };
     }
-
-    // Load active profile
-    throwIfAborted(input.signal);
-    const record = await this.repo.getActive(
-      input.base.tenant_id,
-      input.base.agent_id,
-    );
 
     if (!record) {
       // No active profile — return empty slice. Cache briefly so we don't
