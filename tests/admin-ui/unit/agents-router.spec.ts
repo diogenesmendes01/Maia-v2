@@ -2014,6 +2014,79 @@ describe('agentsRouter.updateProfile — principles omission preserves active (#
     expect(persisted.identity?.principles ?? []).toEqual([]);
   });
 
+  it('REJECT: non-empty principles with empty priorities is refused at schema (#201 round 2 P2)', async () => {
+    // Codex round 2 [P2] cross-PR interaction: IdentitySliceBuilder (P8a/P8d)
+    // still falls back to `identity.principles` when `identity.priorities`
+    // is empty (PR #200 is still pending merge). If a client submits
+    // `priorities: []` + non-empty `principles`, the persisted body's
+    // principles would be surfaced as priorities by the slice builder —
+    // exactly the cross-domain contamination this PR's principles field
+    // is trying to prevent.
+    //
+    // Defensive gate: refuse the combination at schema so the anti-pattern
+    // is blocked at ingress, not at the resolver layer. When PR #200
+    // (#192) merges the slice-builder fallback, this gate can be relaxed.
+    const repos = makeRepos({ agents: [existingAgent] });
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).updateProfile({
+        agentId: 'agent-x',
+        profile_body: {
+          ...validProfile,
+          identity: {
+            ...validProfile.identity,
+            priorities: [], // empty
+            principles: ['Separação acima de tudo.'],
+          },
+        },
+        proposed_reason: 'should reject — principles without priorities',
+      }),
+    ).rejects.toThrow(/priorities/i);
+    // No new profile row should have been persisted.
+    expect(repos._inspect.profiles.length).toBe(0);
+  });
+
+  it('REJECT: create with non-empty principles + empty priorities is also refused', async () => {
+    const repos = makeRepos();
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).create({
+        id: 'agent-x',
+        nome: 'X',
+        profile_body: {
+          ...validProfile,
+          identity: {
+            ...validProfile.identity,
+            priorities: [],
+            principles: ['Separação acima de tudo.'],
+          },
+        },
+        proposed_reason: 'should reject — principles without priorities',
+      }),
+    ).rejects.toThrow(/priorities/i);
+    expect(Object.keys(repos._inspect.agentsMap).length).toBe(0);
+    expect(repos._inspect.profiles.length).toBe(0);
+  });
+
+  it('ACCEPT: empty priorities + empty/omitted principles is still allowed (no fallback risk)', async () => {
+    // When BOTH are empty, there's no principles content to leak via the
+    // slice-builder fallback — the gate must not over-trigger.
+    const repos = makeRepos();
+    const res = await caller('owner', 'tenant-A', 'u1', repos).create({
+      id: 'agent-x',
+      nome: 'X',
+      profile_body: {
+        ...validProfile,
+        identity: {
+          ...validProfile.identity,
+          priorities: [],
+          // principles omitted
+        },
+      },
+      proposed_reason: 'no priorities and no principles — explicit blank',
+    });
+    expect(res.agent.id).toBe('agent-x');
+    expect(res.seed_profile.status).toBe('proposed');
+  });
+
   it('PRESERVE w/ malformed active: active.profile_body without identity.principles → empty (defensive)', async () => {
     // Defensive case: pre-#193 active rows may not have an `identity.principles`
     // key at all. Omission in the request must not blow up — it must yield

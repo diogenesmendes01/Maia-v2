@@ -124,6 +124,45 @@ const ProfileBodyInputSchema = z
         });
       }
     });
+  })
+  // Codex `/codex:review` of PR #201 round 2 [P2] — cross-PR fallback hazard.
+  //
+  // The runtime IdentitySliceBuilder (`src/runtime/context-assembly/slice-
+  // builders/identity-slice-builder.ts`, both P8a class and P8d function)
+  // still falls back to `identity.principles` for `slice.priorities` when
+  // `identity.priorities` is empty. PR #200 (#192) is the symmetric fix to
+  // remove that fallback but is still OPEN at the time of this PR.
+  //
+  // If we let a client write `priorities: []` + non-empty `principles` now,
+  // the persisted body's core value contracts would be rendered/audited as
+  // operational priorities — exactly the cross-domain contamination this
+  // PR is trying to fix at the API ingress. We refuse the combination
+  // server-side until #200 removes the slice-builder fallback. Once that
+  // ships, this gate becomes redundant and can be relaxed (but it does no
+  // harm to keep — there is no legitimate "principles without priorities"
+  // workflow; principles are an addition on top of, not a replacement for,
+  // operational priorities).
+  //
+  // Trade-off: the gate forces operators to declare at least one priority
+  // when they configure principles. We accept this — the wizard already
+  // surfaces both fields and an agent with declared core value contracts
+  // but no operational priorities is an incoherent identity descriptor.
+  .superRefine((data, ctx) => {
+    const principles = data.identity.principles;
+    if (!principles || principles.length === 0) return;
+    if (data.identity.priorities.length === 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['identity', 'priorities'],
+        message:
+          `priorities cannot be empty when principles are declared. The runtime ` +
+          `slice builder (IdentitySliceBuilder, #192/PR #200 pending) falls back ` +
+          `to identity.principles when priorities is empty, which would surface ` +
+          `core value contracts as operational priorities — the same cross-domain ` +
+          `contamination this PR forbids. Declare at least one priority alongside ` +
+          `principles.`,
+      });
+    }
   });
 
 const ListInputSchema = z.object({ tenantId: z.string().optional() });
