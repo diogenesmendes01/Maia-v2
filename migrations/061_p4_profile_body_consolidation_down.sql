@@ -66,9 +66,17 @@ BEGIN
                      profile_body->'identity'->>'role_descriptor',
                      ''
                    ),
+                   -- Issue #194: do NOT fall back to identity.priorities.
+                   -- Admin-ui rows post-061 commonly have priorities
+                   -- populated but true principles absent; copying
+                   -- priorities into legacy core_immutable.principles let
+                   -- the legacy VALORES drift detector audit operational
+                   -- labels as core value contracts and triggered the
+                   -- same false freeze/rollback path that #189/#191
+                   -- eliminated in the runtime resolver. Leave principles
+                   -- empty when none were configured.
                    'principles', COALESCE(
                      profile_body->'identity'->'principles',
-                     profile_body->'identity'->'priorities',
                      '[]'::jsonb
                    )
                  )
