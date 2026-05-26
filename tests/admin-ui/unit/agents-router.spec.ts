@@ -492,6 +492,24 @@ const validProfile = {
   style: { language: 'pt-BR', rhythm: {} },
 } as const;
 
+const validProfileWithPrinciples = {
+  identity: {
+    role_descriptor: 'assistente fiscal',
+    voice: { tone: 'profissional', formality: 'medium', verbosity: 'medium' },
+    cognitive_limits: {
+      max_inference_depth: 3,
+      max_speculation_in_response: 0.2,
+      confidence_floor_for_action: 0.7,
+    },
+    priorities: ['precisao', 'clareza'],
+    principles: [
+      'Separação acima de tudo. PF é PF.',
+      'Confirme antes de agir em coisas relevantes.',
+    ],
+  },
+  style: { language: 'pt-BR', rhythm: {} },
+} as const;
+
 describe('agentsRouter.create — role gate', () => {
   it.each(['analyst', 'viewer', 'compliance_officer'])(
     '%s gets FORBIDDEN',
@@ -1504,5 +1522,604 @@ describe('agentsRouter.create — duplicate_id from atomic helper (issue #184 ro
     expect(res.agent.id).toBe('agent-x');
     expect(res.seed_profile.version).toBe(1);
     expect(res.seed_profile.status).toBe('proposed');
+  });
+});
+
+/**
+ * Issue #193 — distinct identity.principles field.
+ *
+ * Bug: admin-ui setup accepted role, voice, cognitive_limits and priorities
+ * but had NO distinct input for `principles`. The post-#189 valoresDetector
+ * refuses to treat priorities as principles and silently returns null when no
+ * true principles are configured, so every admin-created profile shipped with
+ * the VALORES guardrail disabled. Operators putting "core value" text into the
+ * priorities textarea (or who simply didn't realize principles existed as a
+ * separate concept) had core-value violations go un-frozen.
+ *
+ * Fix contract (these tests are the gate):
+ *   1. The router input schema accepts `identity.principles: string[]` (with
+ *      the same per-item bounds as priorities).
+ *   2. `buildProfileBody` persists them at `profile_body.identity.principles`
+ *      so the legacy resolver — which already reads
+ *      `body.identity.principles` — surfaces them to valoresDetector. The
+ *      audited profile_body that landed in the seed proposal is the assertion
+ *      target.
+ *   3. principles is optional (missing → no principles, matches current
+ *      behavior — VALORES skipped, no auto-freeze for that profile).
+ *   4. priorities are NEVER auto-copied into principles. Submitting only
+ *      priorities still yields `principles === []` (or undefined) in the
+ *      persisted body. This is the explicit anti-pattern that #189/#191 closed
+ *      and the resolver/detector contract depends on.
+ */
+describe('agentsRouter — identity.principles field (#193)', () => {
+  it('create: principles persist into profile_body.identity.principles', async () => {
+    const repos = makeRepos();
+    await caller('owner', 'tenant-A', 'u1', repos).create({
+      id: 'agent-x',
+      nome: 'X',
+      profile_body: validProfileWithPrinciples,
+      proposed_reason: 'seed agent with explicit core principles',
+    });
+    const persisted = repos._inspect.profiles[0]!.profile_body as {
+      identity?: { principles?: unknown[]; priorities?: unknown[] };
+    };
+    expect(persisted.identity?.principles).toEqual([
+      'Separação acima de tudo. PF é PF.',
+      'Confirme antes de agir em coisas relevantes.',
+    ]);
+    // priorities must remain distinct.
+    expect(persisted.identity?.priorities).toEqual(['precisao', 'clareza']);
+  });
+
+  it('create: omitting principles persists empty principles (NO auto-copy from priorities)', async () => {
+    // The exact anti-pattern #189/#191 forbids: priorities MUST NOT be silently
+    // promoted to principles. A submission with only priorities yields a body
+    // where principles is empty/missing, so valoresDetector correctly skips.
+    const repos = makeRepos();
+    await caller('owner', 'tenant-A', 'u1', repos).create({
+      id: 'agent-x',
+      nome: 'X',
+      profile_body: validProfile,
+      proposed_reason: 'priorities-only profile — VALORES must stay disabled',
+    });
+    const persisted = repos._inspect.profiles[0]!.profile_body as {
+      identity?: { principles?: unknown[]; priorities?: unknown[] };
+    };
+    expect(persisted.identity?.priorities).toEqual(['precisao', 'clareza']);
+    // principles is either an empty array OR undefined — both are honored by
+    // the resolver as "no true principles configured" (length === 0 branch).
+    expect(persisted.identity?.principles ?? []).toEqual([]);
+  });
+
+  it('updateProfile: principles persist into profile_body.identity.principles', async () => {
+    const existingAgent: Agent = {
+      id: 'agent-x',
+      tenant_id: 'tenant-A',
+      nome: 'X',
+      status: 'active',
+      metadata: {},
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+    const repos = makeRepos({ agents: [existingAgent] });
+    await caller('owner', 'tenant-A', 'u1', repos).updateProfile({
+      agentId: 'agent-x',
+      profile_body: validProfileWithPrinciples,
+      proposed_reason: 'update with explicit core principles',
+    });
+    // The new v1 proposed row carries the principles in profile_body.identity.
+    const persisted = repos._inspect.profiles[0]!.profile_body as {
+      identity?: { principles?: unknown[] };
+    };
+    expect(persisted.identity?.principles).toEqual([
+      'Separação acima de tudo. PF é PF.',
+      'Confirme antes de agir em coisas relevantes.',
+    ]);
+  });
+
+  /**
+   * Cross-module regression: a profile body persisted by the router with
+   * explicit principles is audited by valoresDetector (it issues a real
+   * LLM call). A profile body with priorities-only IS NOT audited
+   * (detector short-circuits with `no_principles_configured`).
+   *
+   * Uses resolveLegacyPayload directly to assert the contract at the
+   * resolver boundary — that's exactly what valoresDetector consumes.
+   * Avoids the Anthropic mock plumbing in the router spec.
+   */
+  it('VALORES contract: persisted body with principles is auditable; priorities-only is not', async () => {
+    // Lazy require so we don't pollute test imports for unrelated cases.
+    type Persisted = { identity?: { principles?: unknown[] } };
+    const { resolveLegacyPayload } =
+      await import('@/identity/profile-legacy-resolver.js');
+
+    // (1) With principles configured — resolver surfaces them.
+    const reposWith = makeRepos();
+    await caller('owner', 'tenant-A', 'u1', reposWith).create({
+      id: 'agent-with',
+      nome: 'With',
+      profile_body: validProfileWithPrinciples,
+      proposed_reason: 'principles seeded — valores detector active',
+    });
+    const bodyWith = reposWith._inspect.profiles[0]!.profile_body as Persisted;
+    const resolvedWith = resolveLegacyPayload({ profile_body: bodyWith });
+    const principlesWith = Array.isArray(resolvedWith.core_immutable.principles)
+      ? resolvedWith.core_immutable.principles.filter(
+          (p): p is string => typeof p === 'string' && p.trim().length > 0,
+        )
+      : [];
+    expect(principlesWith.length).toBeGreaterThan(0);
+
+    // (2) priorities-only — resolver MUST NOT synthesize principles from
+    //     priorities. valoresDetector will short-circuit (length === 0).
+    const reposOnly = makeRepos();
+    await caller('owner', 'tenant-A', 'u1', reposOnly).create({
+      id: 'agent-only',
+      nome: 'Only',
+      profile_body: validProfile,
+      proposed_reason: 'priorities-only — valores detector must skip',
+    });
+    const bodyOnly = reposOnly._inspect.profiles[0]!.profile_body as Persisted;
+    const resolvedOnly = resolveLegacyPayload({ profile_body: bodyOnly });
+    const principlesOnly = Array.isArray(resolvedOnly.core_immutable.principles)
+      ? resolvedOnly.core_immutable.principles.filter(
+          (p): p is string => typeof p === 'string' && p.trim().length > 0,
+        )
+      : [];
+    expect(principlesOnly).toEqual([]);
+  });
+
+  it('input schema: principles items have same per-item bounds as priorities (rejects empty / overlong)', async () => {
+    const repos = makeRepos();
+    // Empty string item is invalid.
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).create({
+        id: 'agent-x',
+        nome: 'X',
+        profile_body: {
+          ...validProfile,
+          identity: { ...validProfile.identity, principles: [''] },
+        },
+        proposed_reason: 'should reject empty principle item',
+      }),
+    ).rejects.toThrow();
+
+    // Overlong item is invalid (priorities cap is 200 chars; mirror).
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).create({
+        id: 'agent-y',
+        nome: 'Y',
+        profile_body: {
+          ...validProfile,
+          identity: {
+            ...validProfile.identity,
+            principles: ['x'.repeat(201)],
+          },
+        },
+        proposed_reason: 'should reject overlong principle item',
+      }),
+    ).rejects.toThrow();
+  });
+});
+
+/**
+ * Codex Adversarial Review of PR #201 [HIGH] — cross-field overlap guard.
+ *
+ * Bug class: even with a distinct `principles` input (#193), a UI/API client
+ * could submit the SAME operational labels in both `priorities` and
+ * `principles`. The legacy resolver would surface them as core_immutable
+ * principles → valoresDetector treats them as core value contracts → the
+ * decision engine can freeze/rollback the profile for ordinary priority
+ * drift. UI warnings are not a trust boundary; the router schema must reject
+ * such submissions server-side.
+ *
+ * This is the same failure mode that #189/#191 closed at the resolver layer;
+ * #201 round 2 closes the symmetric hole at the API ingress so no client
+ * (legitimate or hostile) can re-introduce it.
+ *
+ * Contract:
+ *   - Items are compared trimmed + case-insensitive.
+ *   - ANY overlap between the two arrays is a rejection with a clear error
+ *     pointing at the offending item.
+ *   - The original strings are still persisted as supplied; only the
+ *     comparison is normalized.
+ *   - Applies to BOTH `create` AND `updateProfile` (same ProfileBodyInputSchema).
+ */
+describe('agentsRouter — priorities/principles overlap guard (#201 round 2)', () => {
+  it('create: rejects exact duplicate between priorities and principles', async () => {
+    const repos = makeRepos();
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).create({
+        id: 'agent-x',
+        nome: 'X',
+        profile_body: {
+          ...validProfile,
+          identity: {
+            ...validProfile.identity,
+            priorities: ['precisao', 'clareza'],
+            // 'clareza' overlaps exactly with priorities.
+            principles: ['Separação acima de tudo.', 'clareza'],
+          },
+        },
+        proposed_reason: 'should reject — exact overlap between fields',
+      }),
+    ).rejects.toThrow(/clareza/i);
+    // No agent / profile should have been persisted.
+    expect(Object.keys(repos._inspect.agentsMap).length).toBe(0);
+    expect(repos._inspect.profiles.length).toBe(0);
+  });
+
+  it('create: rejects case-insensitive overlap (Foo vs foo)', async () => {
+    const repos = makeRepos();
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).create({
+        id: 'agent-x',
+        nome: 'X',
+        profile_body: {
+          ...validProfile,
+          identity: {
+            ...validProfile.identity,
+            priorities: ['Foo', 'bar'],
+            // case-insensitive overlap with 'Foo'.
+            principles: ['foo', 'baz'],
+          },
+        },
+        proposed_reason: 'should reject — case-insensitive overlap',
+      }),
+    ).rejects.toThrow(/foo/i);
+    expect(Object.keys(repos._inspect.agentsMap).length).toBe(0);
+    expect(repos._inspect.profiles.length).toBe(0);
+  });
+
+  it('create: rejects whitespace-differing overlap ("foo " vs "foo")', async () => {
+    const repos = makeRepos();
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).create({
+        id: 'agent-x',
+        nome: 'X',
+        profile_body: {
+          ...validProfile,
+          identity: {
+            ...validProfile.identity,
+            priorities: ['foo ', 'bar'],
+            // trimmed overlap with priorities[0].
+            principles: ['foo', 'baz'],
+          },
+        },
+        proposed_reason: 'should reject — whitespace-differing overlap',
+      }),
+    ).rejects.toThrow(/foo/i);
+    expect(Object.keys(repos._inspect.agentsMap).length).toBe(0);
+    expect(repos._inspect.profiles.length).toBe(0);
+  });
+
+  it('create: accepts disjoint priorities and principles (regression)', async () => {
+    const repos = makeRepos();
+    const res = await caller('owner', 'tenant-A', 'u1', repos).create({
+      id: 'agent-x',
+      nome: 'X',
+      profile_body: validProfileWithPrinciples,
+      proposed_reason: 'happy path — fields are disjoint',
+    });
+    expect(res.agent.id).toBe('agent-x');
+    expect(res.seed_profile.status).toBe('proposed');
+  });
+
+  it('updateProfile: rejects exact duplicate between priorities and principles', async () => {
+    const existingAgent: Agent = {
+      id: 'agent-x',
+      tenant_id: 'tenant-A',
+      nome: 'X',
+      status: 'active',
+      metadata: {},
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+    const repos = makeRepos({ agents: [existingAgent] });
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).updateProfile({
+        agentId: 'agent-x',
+        profile_body: {
+          ...validProfile,
+          identity: {
+            ...validProfile.identity,
+            priorities: ['precisao', 'clareza'],
+            principles: ['Separação acima de tudo.', 'CLAREZA'],
+          },
+        },
+        proposed_reason: 'should reject — overlap on updateProfile too',
+      }),
+    ).rejects.toThrow(/clareza/i);
+    // No new profile row should have been persisted.
+    expect(repos._inspect.profiles.length).toBe(0);
+  });
+});
+
+/**
+ * Codex Adversarial Review of PR #201 round 2 [HIGH] — VALORES guardrail
+ * data-loss on omitted principles in updateProfile.
+ *
+ * Bug class: `updateProfile` rebuilds the next profile_body entirely from the
+ * request. Because `identity.principles` is optional in
+ * `ProfileBodyInputSchema`, an older client or a partial-edit caller that
+ * updates the profile WITHOUT sending `principles` would propose a new
+ * version with empty principles. Once approved, `valoresDetector` sees zero
+ * configured principles and silently skips — disabling the hard value
+ * guardrail for a profile that previously had it. Pure version-skew/data-loss
+ * path introduced by adding an optional field to a full-replacement mutation.
+ *
+ * Fix contract (this PR round 2 follow-up):
+ *   - On `updateProfile`: when `identity.principles` is OMITTED (undefined),
+ *     preserve the active version's principles into the new proposed body.
+ *   - When `identity.principles` is EXPLICITLY supplied as `[]`, it is an
+ *     intentional audited clear — the proposed body carries `principles: []`.
+ *   - When there is NO active version yet and principles is omitted, the
+ *     proposed body's principles is `[]` (no source to preserve from).
+ *   - When `identity.principles` is supplied non-empty, it replaces.
+ *
+ * `create` keeps the original semantics: omission means principles=[] (no
+ * prior body to preserve from; the operator must declare principles
+ * explicitly to enable VALORES).
+ */
+describe('agentsRouter.updateProfile — principles omission preserves active (#201 round 2)', () => {
+  const existingAgent: Agent = {
+    id: 'agent-x',
+    tenant_id: 'tenant-A',
+    nome: 'X',
+    status: 'active',
+    metadata: {},
+    created_at: new Date(),
+    updated_at: new Date(),
+  };
+
+  it('PRESERVE: omitted principles inherits from activeVersion.profile_body.identity.principles', async () => {
+    // Active profile has principles configured (VALORES guardrail active).
+    const activeWithPrinciples = {
+      id: 'prof-active',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      version: 1,
+      status: 'active',
+      profile_body: {
+        identity: {
+          priorities: ['precisao', 'clareza'],
+          principles: [
+            'Separação acima de tudo. PF é PF.',
+            'Confirme antes de agir em coisas relevantes.',
+          ],
+        },
+      } as unknown,
+      proposed_by: 'system',
+      proposed_reason: null,
+    };
+    const repos = makeRepos({
+      agents: [existingAgent],
+      profiles: [activeWithPrinciples],
+    });
+    // Update WITHOUT sending the principles key — legacy client / partial edit.
+    await caller('owner', 'tenant-A', 'u1', repos).updateProfile({
+      agentId: 'agent-x',
+      profile_body: validProfile, // no `principles` key
+      proposed_reason: 'change priorities; principles deliberately untouched',
+    });
+    // The new v2 proposed row MUST retain the existing principles.
+    const proposed = repos._inspect.profiles.find((p) => p.status === 'proposed');
+    expect(proposed).toBeDefined();
+    const persisted = proposed!.profile_body as {
+      identity?: { principles?: unknown[]; priorities?: unknown[] };
+    };
+    expect(persisted.identity?.principles).toEqual([
+      'Separação acima de tudo. PF é PF.',
+      'Confirme antes de agir em coisas relevantes.',
+    ]);
+    // priorities still updated from the request.
+    expect(persisted.identity?.priorities).toEqual(['precisao', 'clareza']);
+  });
+
+  it('EXPLICIT CLEAR: explicit principles=[] persists empty (intentional audited clear)', async () => {
+    // An operator explicitly clearing principles should still succeed; the
+    // audit row carries the new body with principles=[] so the diff is
+    // captured. This is the deliberate "I want VALORES disabled now" path.
+    const activeWithPrinciples = {
+      id: 'prof-active',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      version: 1,
+      status: 'active',
+      profile_body: {
+        identity: {
+          priorities: ['precisao'],
+          principles: ['Separação acima de tudo.'],
+        },
+      } as unknown,
+      proposed_by: 'system',
+      proposed_reason: null,
+    };
+    const repos = makeRepos({
+      agents: [existingAgent],
+      profiles: [activeWithPrinciples],
+    });
+    await caller('owner', 'tenant-A', 'u1', repos).updateProfile({
+      agentId: 'agent-x',
+      profile_body: {
+        ...validProfile,
+        identity: {
+          ...validProfile.identity,
+          principles: [], // explicit clear
+        },
+      },
+      proposed_reason: 'intentionally remove principles — see ticket FOO-123',
+    });
+    const proposed = repos._inspect.profiles.find((p) => p.status === 'proposed');
+    expect(proposed).toBeDefined();
+    const persisted = proposed!.profile_body as {
+      identity?: { principles?: unknown[] };
+    };
+    expect(persisted.identity?.principles).toEqual([]);
+  });
+
+  it('REPLACE: non-empty principles overwrites the active set', async () => {
+    const activeWithPrinciples = {
+      id: 'prof-active',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      version: 1,
+      status: 'active',
+      profile_body: {
+        identity: {
+          priorities: ['precisao'],
+          principles: ['old principle 1', 'old principle 2'],
+        },
+      } as unknown,
+      proposed_by: 'system',
+      proposed_reason: null,
+    };
+    const repos = makeRepos({
+      agents: [existingAgent],
+      profiles: [activeWithPrinciples],
+    });
+    await caller('owner', 'tenant-A', 'u1', repos).updateProfile({
+      agentId: 'agent-x',
+      profile_body: validProfileWithPrinciples, // has its own principles
+      proposed_reason: 'tighten principles for Q3',
+    });
+    const proposed = repos._inspect.profiles.find((p) => p.status === 'proposed');
+    expect(proposed).toBeDefined();
+    const persisted = proposed!.profile_body as {
+      identity?: { principles?: unknown[] };
+    };
+    // From validProfileWithPrinciples — the request's principles win.
+    expect(persisted.identity?.principles).toEqual([
+      'Separação acima de tudo. PF é PF.',
+      'Confirme antes de agir em coisas relevantes.',
+    ]);
+  });
+
+  it('NO ACTIVE: omitted principles + no active version → empty (nothing to preserve)', async () => {
+    // Agent exists but has no active profile (e.g., seed not yet approved).
+    // Omitting principles should not synthesize them; we just have nothing
+    // to inherit, so the proposed body's principles is [].
+    const repos = makeRepos({ agents: [existingAgent] });
+    await caller('owner', 'tenant-A', 'u1', repos).updateProfile({
+      agentId: 'agent-x',
+      profile_body: validProfile, // no `principles` key
+      proposed_reason: 'first update against an unseeded agent',
+    });
+    const proposed = repos._inspect.profiles.find((p) => p.status === 'proposed');
+    expect(proposed).toBeDefined();
+    const persisted = proposed!.profile_body as {
+      identity?: { principles?: unknown[] };
+    };
+    // No source to preserve from — principles is [] (matches old contract).
+    expect(persisted.identity?.principles ?? []).toEqual([]);
+  });
+
+  it('REJECT: non-empty principles with empty priorities is refused at schema (#201 round 2 P2)', async () => {
+    // Codex round 2 [P2] cross-PR interaction: IdentitySliceBuilder (P8a/P8d)
+    // still falls back to `identity.principles` when `identity.priorities`
+    // is empty (PR #200 is still pending merge). If a client submits
+    // `priorities: []` + non-empty `principles`, the persisted body's
+    // principles would be surfaced as priorities by the slice builder —
+    // exactly the cross-domain contamination this PR's principles field
+    // is trying to prevent.
+    //
+    // Defensive gate: refuse the combination at schema so the anti-pattern
+    // is blocked at ingress, not at the resolver layer. When PR #200
+    // (#192) merges the slice-builder fallback, this gate can be relaxed.
+    const repos = makeRepos({ agents: [existingAgent] });
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).updateProfile({
+        agentId: 'agent-x',
+        profile_body: {
+          ...validProfile,
+          identity: {
+            ...validProfile.identity,
+            priorities: [], // empty
+            principles: ['Separação acima de tudo.'],
+          },
+        },
+        proposed_reason: 'should reject — principles without priorities',
+      }),
+    ).rejects.toThrow(/priorities/i);
+    // No new profile row should have been persisted.
+    expect(repos._inspect.profiles.length).toBe(0);
+  });
+
+  it('REJECT: create with non-empty principles + empty priorities is also refused', async () => {
+    const repos = makeRepos();
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).create({
+        id: 'agent-x',
+        nome: 'X',
+        profile_body: {
+          ...validProfile,
+          identity: {
+            ...validProfile.identity,
+            priorities: [],
+            principles: ['Separação acima de tudo.'],
+          },
+        },
+        proposed_reason: 'should reject — principles without priorities',
+      }),
+    ).rejects.toThrow(/priorities/i);
+    expect(Object.keys(repos._inspect.agentsMap).length).toBe(0);
+    expect(repos._inspect.profiles.length).toBe(0);
+  });
+
+  it('ACCEPT: empty priorities + empty/omitted principles is still allowed (no fallback risk)', async () => {
+    // When BOTH are empty, there's no principles content to leak via the
+    // slice-builder fallback — the gate must not over-trigger.
+    const repos = makeRepos();
+    const res = await caller('owner', 'tenant-A', 'u1', repos).create({
+      id: 'agent-x',
+      nome: 'X',
+      profile_body: {
+        ...validProfile,
+        identity: {
+          ...validProfile.identity,
+          priorities: [],
+          // principles omitted
+        },
+      },
+      proposed_reason: 'no priorities and no principles — explicit blank',
+    });
+    expect(res.agent.id).toBe('agent-x');
+    expect(res.seed_profile.status).toBe('proposed');
+  });
+
+  it('PRESERVE w/ malformed active: active.profile_body without identity.principles → empty (defensive)', async () => {
+    // Defensive case: pre-#193 active rows may not have an `identity.principles`
+    // key at all. Omission in the request must not blow up — it must yield
+    // principles=[] (treated as "no source to preserve").
+    const activeNoPrinciplesKey = {
+      id: 'prof-active',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      version: 1,
+      status: 'active',
+      profile_body: {
+        identity: {
+          priorities: ['precisao'],
+          // no `principles` key at all
+        },
+      } as unknown,
+      proposed_by: 'system',
+      proposed_reason: null,
+    };
+    const repos = makeRepos({
+      agents: [existingAgent],
+      profiles: [activeNoPrinciplesKey],
+    });
+    await caller('owner', 'tenant-A', 'u1', repos).updateProfile({
+      agentId: 'agent-x',
+      profile_body: validProfile, // no `principles` key
+      proposed_reason: 'update against pre-#193 row',
+    });
+    const proposed = repos._inspect.profiles.find((p) => p.status === 'proposed');
+    expect(proposed).toBeDefined();
+    const persisted = proposed!.profile_body as {
+      identity?: { principles?: unknown[] };
+    };
+    expect(persisted.identity?.principles ?? []).toEqual([]);
   });
 });

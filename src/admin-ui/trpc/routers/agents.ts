@@ -47,26 +47,123 @@ const VerbositySchema = z.enum(['concise', 'medium', 'detailed']);
 // Operational profile body shape (mirrors ProfileBody in schema.ts).
 // We accept the user-visible subset and fill schema_version + metadata
 // server-side.
-const ProfileBodyInputSchema = z.object({
-  identity: z.object({
-    role_descriptor: z.string().min(1).max(500),
-    voice: z.object({
-      tone: z.string().min(1).max(200),
-      formality: FormalitySchema,
-      verbosity: VerbositySchema,
+//
+// Issue #193 — `principles` is a distinct input from `priorities`:
+//   - priorities: operational labels the agent should weight when prioritizing
+//     actions (audited by papelDriftDetector — soft drift, no auto-freeze).
+//   - principles: CORE VALUE CONTRACTS — inviolable behavioral guardrails
+//     audited by valoresDetector. Violations floor to `alto` → `frozen`
+//     (or `critico` → `rollback`) via the decision engine.
+//   Because the two have radically different governance consequences, the
+//   setup MUST keep them as separate inputs. The legacy resolver explicitly
+//   forbids synthesizing principles from priorities (#189) and this router
+//   MUST NOT auto-copy across the two arrays either.
+const ProfileBodyInputSchema = z
+  .object({
+    identity: z.object({
+      role_descriptor: z.string().min(1).max(500),
+      voice: z.object({
+        tone: z.string().min(1).max(200),
+        formality: FormalitySchema,
+        verbosity: VerbositySchema,
+      }),
+      cognitive_limits: z.object({
+        max_inference_depth: z.number().int().min(0).max(10),
+        max_speculation_in_response: z.number().min(0).max(1),
+        confidence_floor_for_action: z.number().min(0).max(1),
+      }),
+      priorities: z.array(z.string().min(1).max(200)).max(20),
+      // Optional — when empty/omitted, the resolver returns no principles and
+      // valoresDetector skips with `no_principles_configured` (the existing,
+      // intentional behavior introduced in #189/#191). Items mirror priorities'
+      // 1..200 bounds.
+      principles: z.array(z.string().min(1).max(200)).max(20).optional(),
     }),
-    cognitive_limits: z.object({
-      max_inference_depth: z.number().int().min(0).max(10),
-      max_speculation_in_response: z.number().min(0).max(1),
-      confidence_floor_for_action: z.number().min(0).max(1),
+    style: z.object({
+      language: z.string().min(2).max(20),
+      rhythm: z.record(z.string(), z.unknown()).default({}),
     }),
-    priorities: z.array(z.string().min(1).max(200)).max(20),
-  }),
-  style: z.object({
-    language: z.string().min(2).max(20),
-    rhythm: z.record(z.string(), z.unknown()).default({}),
-  }),
-});
+  })
+  // Codex Adversarial Review of PR #201 round 1 [HIGH] — cross-field guard.
+  //
+  // Even with `principles` as a distinct input (#193), a client could submit
+  // the SAME operational labels in both arrays. The legacy resolver surfaces
+  // them as core_immutable principles → valoresDetector treats them as core
+  // value contracts → the decision engine can freeze/rollback the profile
+  // for ordinary priority drift. This is the symmetric, ingress-side hole
+  // matching the resolver-side bug #189/#191 closed.
+  //
+  // We reject ANY overlap, comparing case-insensitively + trimmed. The
+  // original strings are still PERSISTED as supplied; only the comparison is
+  // normalized. Operators may not "spell around" the guard with case or
+  // whitespace variants — semantically the same label cannot be both a soft
+  // priority and an inviolable principle.
+  //
+  // UI warnings are not a trust boundary. This is the server-side gate.
+  .superRefine((data, ctx) => {
+    const principles = data.identity.principles;
+    if (!principles || principles.length === 0) return;
+    const normalize = (s: string) => s.trim().toLowerCase();
+    const priorityKeys = new Map<string, string>();
+    for (const p of data.identity.priorities) {
+      priorityKeys.set(normalize(p), p);
+    }
+    principles.forEach((principle, idx) => {
+      const key = normalize(principle);
+      const collidingPriority = priorityKeys.get(key);
+      if (collidingPriority !== undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['identity', 'principles', idx],
+          message:
+            `principle "${principle}" overlaps with priority "${collidingPriority}" ` +
+            `(compared trimmed + case-insensitive). priorities are operational ` +
+            `labels (soft, papelDriftDetector); principles are core value ` +
+            `contracts (hard, valoresDetector — may auto-freeze). The same ` +
+            `label cannot be both — pick one field.`,
+        });
+      }
+    });
+  })
+  // Codex `/codex:review` of PR #201 round 2 [P2] — cross-PR fallback hazard.
+  //
+  // The runtime IdentitySliceBuilder (`src/runtime/context-assembly/slice-
+  // builders/identity-slice-builder.ts`, both P8a class and P8d function)
+  // still falls back to `identity.principles` for `slice.priorities` when
+  // `identity.priorities` is empty. PR #200 (#192) is the symmetric fix to
+  // remove that fallback but is still OPEN at the time of this PR.
+  //
+  // If we let a client write `priorities: []` + non-empty `principles` now,
+  // the persisted body's core value contracts would be rendered/audited as
+  // operational priorities — exactly the cross-domain contamination this
+  // PR is trying to fix at the API ingress. We refuse the combination
+  // server-side until #200 removes the slice-builder fallback. Once that
+  // ships, this gate becomes redundant and can be relaxed (but it does no
+  // harm to keep — there is no legitimate "principles without priorities"
+  // workflow; principles are an addition on top of, not a replacement for,
+  // operational priorities).
+  //
+  // Trade-off: the gate forces operators to declare at least one priority
+  // when they configure principles. We accept this — the wizard already
+  // surfaces both fields and an agent with declared core value contracts
+  // but no operational priorities is an incoherent identity descriptor.
+  .superRefine((data, ctx) => {
+    const principles = data.identity.principles;
+    if (!principles || principles.length === 0) return;
+    if (data.identity.priorities.length === 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['identity', 'priorities'],
+        message:
+          `priorities cannot be empty when principles are declared. The runtime ` +
+          `slice builder (IdentitySliceBuilder, #192/PR #200 pending) falls back ` +
+          `to identity.principles when priorities is empty, which would surface ` +
+          `core value contracts as operational priorities — the same cross-domain ` +
+          `contamination this PR forbids. Declare at least one priority alongside ` +
+          `principles.`,
+      });
+    }
+  });
 
 const ListInputSchema = z.object({ tenantId: z.string().optional() });
 
@@ -102,12 +199,45 @@ const ApproveProfileInputSchema = z.object({
  * Build a full ProfileBody from the user-supplied subset. `previous_version_id`
  * is null for the seed; for `updateProfile` we pass the current active id (if
  * any) so the chain links.
+ *
+ * `principlesOverride` lets `updateProfile` inject a preserved-from-active
+ * principles array when the request omits the field. `create` and explicit
+ * supply paths leave `principlesOverride` null, in which case we use
+ * `input.identity.principles ?? []` (omission ⇒ no principles, matching the
+ * #193 contract).
  */
 function buildProfileBody(
   input: z.infer<typeof ProfileBodyInputSchema>,
   proposedBy: string,
   previousVersionId: string | null,
+  principlesOverride: string[] | null = null,
 ): ProfileBody {
+  // Issue #193 — persist `principles` at profile_body.identity.principles.
+  // The legacy resolver (`src/identity/profile-legacy-resolver.ts`) reads this
+  // path directly into `core_immutable.principles` for valoresDetector. When
+  // the input omits principles on `create` we DO NOT fall back to priorities —
+  // that is the explicit cross-domain contamination bug class fixed in #189/#191.
+  // An empty principles array (or omission on create) intentionally leaves
+  // the VALORES guardrail disabled, matching the resolver's contract: no true
+  // principles configured → detector emits a one-shot observability log and
+  // skips silently. Operators that want the guardrail must declare explicit
+  // core principles in the wizard.
+  //
+  // Codex Adversarial Review of PR #201 round 2 [HIGH] — VALORES guardrail
+  // data-loss on omitted principles in updateProfile:
+  //   updateProfile rebuilds the next profile_body entirely from the request.
+  //   Because `identity.principles` is optional, an older client / partial
+  //   edit that updates a profile WITHOUT sending `principles` would propose
+  //   a new version with empty principles. Once approved, valoresDetector
+  //   sees zero principles → skips silently → guardrail disabled.
+  //
+  // Fix: `updateProfile` passes `principlesOverride` = activeVersion's
+  // principles ONLY when the request OMITS `principles` (key undefined).
+  // Explicit `principles: []` is honored (intentional audited clear: the
+  // proposed profile_body shows principles=[], the diff against the active
+  // body is captured implicitly through the version chain). Non-empty
+  // principles in the request replace.
+  const principles = principlesOverride ?? input.identity.principles ?? [];
   return {
     schema_version: PROFILE_BODY_SCHEMA_VERSION,
     identity: {
@@ -115,8 +245,9 @@ function buildProfileBody(
       voice: input.identity.voice,
       cognitive_limits: input.identity.cognitive_limits,
       priorities: input.identity.priorities,
+      principles,
       learned_voice_modifiers: [],
-    },
+    } as ProfileBody['identity'] & { principles: string[] },
     style: {
       language: input.style.language,
       rhythm: input.style.rhythm,
@@ -127,6 +258,29 @@ function buildProfileBody(
       previous_version_id: previousVersionId,
     },
   };
+}
+
+/**
+ * Extract the active version's `identity.principles` array for preservation
+ * on omit-on-update (#201 round 2 HIGH). Returns null when:
+ *   - there is no active version (e.g., seed not yet approved); OR
+ *   - the active version's profile_body has no `identity.principles` key
+ *     (pre-#193 row); OR
+ *   - the value is not an array of strings (defensive — refuse to inherit
+ *     malformed data).
+ *
+ * Returning null is the signal to `buildProfileBody` that there is "nothing
+ * to preserve from" — falls back to the request's own (possibly empty)
+ * principles, which is the safe baseline.
+ */
+function extractActivePrinciples(activeProfileBody: unknown): string[] | null {
+  if (!activeProfileBody || typeof activeProfileBody !== 'object') return null;
+  const identity = (activeProfileBody as { identity?: unknown }).identity;
+  if (!identity || typeof identity !== 'object') return null;
+  const principles = (identity as { principles?: unknown }).principles;
+  if (!Array.isArray(principles)) return null;
+  if (!principles.every((p): p is string => typeof p === 'string')) return null;
+  return principles;
 }
 
 export const agentsRouter = router({
@@ -235,10 +389,21 @@ export const agentsRouter = router({
         async () => ctx.repos.operationalProfileVersionsRepo.getActive(),
       );
 
+      // Codex Adversarial Review of PR #201 round 2 [HIGH] — preserve
+      // active.identity.principles when the request OMITS the field
+      // (`undefined`). Explicit `principles: []` is honored (intentional
+      // audited clear: the resulting profile_body documents the change for
+      // diff). See buildProfileBody jsdoc for the full contract.
+      const principlesOverride =
+        input.profile_body.identity.principles === undefined
+          ? extractActivePrinciples(activeVersion?.profile_body)
+          : null;
+
       const profileBody = buildProfileBody(
         input.profile_body,
         ctx.userId,
         activeVersion?.id ?? null,
+        principlesOverride,
       );
 
       // Codex review of PR #162 round 3 (issue #166) — profile_version

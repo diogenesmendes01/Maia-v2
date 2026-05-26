@@ -21,6 +21,10 @@ interface WizardState {
   formality: 'low' | 'medium' | 'high';
   verbosity: 'concise' | 'medium' | 'detailed';
   priorities: string;
+  // Issue #193 — principles is a DISTINCT field from priorities. Empty
+  // string default keeps it opt-in: leaving the field blank reproduces the
+  // current behavior (no principles configured → valoresDetector skips).
+  principles: string;
   // Step 3 (style + limits)
   language: string;
   max_inference_depth: number;
@@ -38,6 +42,11 @@ const INITIAL: WizardState = {
   formality: 'medium',
   verbosity: 'medium',
   priorities: 'precisao\nclareza\nrespeito',
+  // Issue #193 — empty by default. We deliberately DO NOT pre-fill the
+  // priorities text here: principles are core value contracts (violations
+  // freeze the agent), not operational labels. Forcing the operator to
+  // type them explicitly is the whole point of separating the two inputs.
+  principles: '',
   language: 'pt-BR',
   max_inference_depth: 3,
   max_speculation_in_response: 0.2,
@@ -107,6 +116,17 @@ export default function AgentWizard({ tenantId, onClose }: Props) {
         .split('\n')
         .map((p) => p.trim())
         .filter((p) => p.length > 0);
+      // Issue #193 — `principles` is a distinct collection from `priorities`.
+      // We send `undefined` (not `[]`) when the operator left the field empty
+      // so the server-side schema treats it as "not declared"; the resolver
+      // returns no principles and valoresDetector skips silently (the
+      // intentional post-#189 behavior). NEVER auto-promote priorities here.
+      const principlesParsed = state.principles
+        .split('\n')
+        .map((p) => p.trim())
+        .filter((p) => p.length > 0);
+      const principles =
+        principlesParsed.length > 0 ? principlesParsed : undefined;
       await mutation.mutateAsync({
         tenantId,
         id: state.id,
@@ -126,6 +146,7 @@ export default function AgentWizard({ tenantId, onClose }: Props) {
               confidence_floor_for_action: state.confidence_floor_for_action,
             },
             priorities,
+            principles,
           },
           style: {
             language: state.language,
@@ -261,6 +282,43 @@ export default function AgentWizard({ tenantId, onClose }: Props) {
                 rows={4}
                 className="w-full p-2 border rounded mt-1 text-sm font-mono"
               />
+              <span className="text-xs text-gray-500">
+                Operational labels — what the agent weights when deciding what
+                to focus on. Audited softly by <code>papelDriftDetector</code>{' '}
+                (no auto-freeze).
+              </span>
+            </label>
+            {/*
+              Issue #193 — principles is a DISTINCT input from priorities.
+              Same shape (string per line) but radically different governance:
+              violations are floored to `alto` → `frozen` (or `critico` →
+              `rollback`) by the decision engine. Leaving this blank is
+              valid — the VALORES guardrail stays disabled for this profile
+              and the operator can come back later via updateProfile. We
+              intentionally do NOT copy priorities into this field.
+            */}
+            <label className="block">
+              <span className="text-sm font-medium">
+                principles (one per line) — core value contracts
+              </span>
+              <textarea
+                value={state.principles}
+                onChange={(e) => set('principles', e.target.value)}
+                rows={4}
+                placeholder={
+                  'Ex.: Separação acima de tudo. PF é PF.\n' +
+                  'Ex.: Confirme antes de agir em coisas relevantes.'
+                }
+                className="w-full p-2 border rounded mt-1 text-sm font-mono"
+              />
+              <span className="text-xs text-gray-500">
+                <strong>Core values</strong> — inviolable behavioral guardrails
+                audited by <code>valoresDetector</code>. Violations may
+                auto-freeze the profile. Different from priorities: do{' '}
+                <strong>not</strong> repeat operational labels here. Leave
+                empty if you don&apos;t want to declare value guardrails yet
+                (VALORES check stays disabled until principles are declared).
+              </span>
             </label>
           </div>
         )}
