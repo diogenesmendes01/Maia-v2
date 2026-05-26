@@ -33,18 +33,22 @@ export const toolsCatalogRouter = router({
    */
   listCatalog: protectedProcedure.query(async () => {
     // Dynamic, server-only import — see the server-only boundary note above.
-    const { REGISTRY, isToolEnabled } = await import('@/tools/_registry.js');
+    const { buildToolCatalog } = await import('@/tools/_registry.js');
     const { describeZodObject } = await import('@/tools/describe-schema.js');
 
-    return Object.values(REGISTRY).map((t) => ({
+    // `buildToolCatalog()` (NOT `Object.values(REGISTRY)`) so feature-gated
+    // tools whose flag is off — scheduling tools, generate_report — still
+    // appear as disabled with their gating flag name, instead of being
+    // silently dropped from the conditional REGISTRY construction.
+    return buildToolCatalog().map(({ tool: t, enabled, feature_flag }) => ({
       name: t.name,
       description: t.description,
       side_effect: t.side_effect, // none | read | write | communication
       operation_type: t.operation_type,
       sensitive: t.sensitive ?? false, // view-once outputs (balances etc.)
-      feature_flag: t.feature_flag ?? null,
+      feature_flag, // gating flag NAME (env var / FeatureFlagName) or null
       required_actions: [...t.required_actions],
-      enabled: isToolEnabled(t.name), // false when its feature flag is off
+      enabled, // false when its gating flag is off
       inputs: describeZodObject(t.input_schema), // [{ name, type, optional }]
     }));
   }),

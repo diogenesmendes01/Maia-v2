@@ -63,10 +63,26 @@ export function reconnectDelayMs(attempt: number): number {
 }
 
 export const MEDIA_ROOT = join(config.BAILEYS_AUTH_DIR, '..', 'media');
-mkdirSync(MEDIA_ROOT, { recursive: true });
-// B3b: tmp subdir for in-flight PDF reports. Created here (idempotent) so any
-// caller importing MEDIA_ROOT can rely on `<MEDIA_ROOT>/tmp` existing.
-mkdirSync(join(MEDIA_ROOT, 'tmp'), { recursive: true });
+
+/**
+ * Create the media directories (`<MEDIA_ROOT>` and `<MEDIA_ROOT>/tmp`).
+ *
+ * Idempotent (`recursive: true`). IMPORTING THIS MODULE MUST HAVE NO
+ * FILESYSTEM SIDE EFFECTS: the admin-ui imports the tool registry (via
+ * `send-proactive-message.ts` → baileys), and an admin-ui process must never
+ * write `media/` dirs on import. The backend (`maia-app`) calls this at boot
+ * from `startBaileys()`; every code path that WRITES under `MEDIA_ROOT` /
+ * `MEDIA_ROOT/tmp` (inbound media downloads via `mediaPathFor`, PDF report
+ * generation in `lib/pdf/*`) also calls it (or guards with `existsSync`), so
+ * the dirs exist before any write even when `startBaileys()` has not run
+ * (tests, isolated PDF generation). Backend behaviour is unchanged — the only
+ * difference is that a bare `import` no longer touches the filesystem.
+ */
+export function ensureMediaDirs(): void {
+  mkdirSync(MEDIA_ROOT, { recursive: true });
+  // B3b: tmp subdir for in-flight PDF reports.
+  mkdirSync(join(MEDIA_ROOT, 'tmp'), { recursive: true });
+}
 
 export function isBaileysConnected(): boolean {
   return connected;
@@ -175,6 +191,10 @@ async function handleConnectionUpdate(update: ConnectionUpdate): Promise<void> {
 }
 
 export async function startBaileys(): Promise<void> {
+  // Backend boot (maia-app): create media dirs here, NOT at module load, so
+  // importing this module (e.g. from the admin-ui tool catalog) has no fs side
+  // effects. Idempotent.
+  ensureMediaDirs();
   const { state, saveCreds } = await useMultiFileAuthState(config.BAILEYS_AUTH_DIR);
   // Pin the WA Web protocol version to whatever WhatsApp is currently
   // serving. Without this, Baileys uses the version hardcoded at the time
@@ -540,6 +560,9 @@ export const _internal = {
 
 // Helper to deterministically create per-message media filenames
 export function mediaPathFor(buf: Buffer, ext: string): { path: string; sha: string } {
+  // Defensive: ensure MEDIA_ROOT exists even when startBaileys() hasn't run
+  // (module load no longer creates it). Idempotent.
+  ensureMediaDirs();
   const sha = sha256(buf);
   const month = new Date().toISOString().slice(0, 7);
   const dir = join(MEDIA_ROOT, month);
