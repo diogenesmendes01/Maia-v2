@@ -50,19 +50,27 @@ export type SkillSummary = Pick<
   | 'created_at'
 >;
 
-/** Column set selected for SkillSummary (no large JSONB). */
-const SUMMARY_COLUMNS = {
-  id: skills.id,
-  tenant_id: skills.tenant_id,
-  agent_id: skills.agent_id,
-  skill_descriptor: skills.skill_descriptor,
-  category: skills.category,
-  execution_mode: skills.execution_mode,
-  version: skills.version,
-  status: skills.status,
-  activated_at: skills.activated_at,
-  created_at: skills.created_at,
-} as const;
+/**
+ * Column set selected for SkillSummary (no large JSONB).
+ *
+ * A FUNCTION (not a module-level const) so `skills.*` is dereferenced lazily at
+ * query time, never at import. A module-load deref crashes any test that
+ * partially mocks `@/db/schema` without a `skills` export and transitively
+ * imports this repo (e.g. via `runtime/decision/prod-env.ts`). See PR #213 CI.
+ */
+const summaryColumns = () =>
+  ({
+    id: skills.id,
+    tenant_id: skills.tenant_id,
+    agent_id: skills.agent_id,
+    skill_descriptor: skills.skill_descriptor,
+    category: skills.category,
+    execution_mode: skills.execution_mode,
+    version: skills.version,
+    status: skills.status,
+    activated_at: skills.activated_at,
+    created_at: skills.created_at,
+  }) as const;
 
 /**
  * Summary projection for the version-history list in the Admin UI drawer
@@ -87,19 +95,20 @@ export type SkillVersionSummary = Pick<
   | 'approved_by'
 >;
 
-/** Column set selected for SkillVersionSummary (no large JSONB). */
-const VERSION_SUMMARY_COLUMNS = {
-  id: skills.id,
-  version: skills.version,
-  status: skills.status,
-  agent_id: skills.agent_id,
-  activated_at: skills.activated_at,
-  deprecated_at: skills.deprecated_at,
-  rolled_back_at: skills.rolled_back_at,
-  created_at: skills.created_at,
-  proposed_by: skills.proposed_by,
-  approved_by: skills.approved_by,
-} as const;
+/** Column set selected for SkillVersionSummary (no large JSONB). Lazy — see summaryColumns(). */
+const versionSummaryColumns = () =>
+  ({
+    id: skills.id,
+    version: skills.version,
+    status: skills.status,
+    agent_id: skills.agent_id,
+    activated_at: skills.activated_at,
+    deprecated_at: skills.deprecated_at,
+    rolled_back_at: skills.rolled_back_at,
+    created_at: skills.created_at,
+    proposed_by: skills.proposed_by,
+    approved_by: skills.approved_by,
+  }) as const;
 
 /**
  * Server-enforced cap on the number of rows returned by the summary list
@@ -330,7 +339,7 @@ export const skillsRepo: SkillsRepo = {
     // Summary projection (review PR #209 finding 2): only the table columns,
     // never the big JSONB contract fields, capped at SKILLS_LIST_MAX_LIMIT.
     return db
-      .select(SUMMARY_COLUMNS)
+      .select(summaryColumns())
       .from(skills)
       .where(and(...filters))
       .orderBy(skills.skill_descriptor, desc(skills.version))
@@ -355,7 +364,7 @@ export const skillsRepo: SkillsRepo = {
     // probe row. Same projection/scope as listSummaries.
     const effectiveLimit = clampSkillsLimit(limit);
     const rows = await db
-      .select(SUMMARY_COLUMNS)
+      .select(summaryColumns())
       .from(skills)
       .where(and(...filters))
       .orderBy(skills.skill_descriptor, desc(skills.version))
@@ -662,7 +671,7 @@ export const skillsRepo: SkillsRepo = {
     // JSONB) and cap the row count at SKILLS_LIST_MAX_LIMIT — the drawer's
     // Versions list never needs the full contract per version.
     return db
-      .select(VERSION_SUMMARY_COLUMNS)
+      .select(versionSummaryColumns())
       .from(skills)
       .where(
         and(
