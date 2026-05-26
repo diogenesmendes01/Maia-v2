@@ -160,23 +160,45 @@ const ApproveProfileInputSchema = z.object({
  * Build a full ProfileBody from the user-supplied subset. `previous_version_id`
  * is null for the seed; for `updateProfile` we pass the current active id (if
  * any) so the chain links.
+ *
+ * `principlesOverride` lets `updateProfile` inject a preserved-from-active
+ * principles array when the request omits the field. `create` and explicit
+ * supply paths leave `principlesOverride` null, in which case we use
+ * `input.identity.principles ?? []` (omission ⇒ no principles, matching the
+ * #193 contract).
  */
 function buildProfileBody(
   input: z.infer<typeof ProfileBodyInputSchema>,
   proposedBy: string,
   previousVersionId: string | null,
+  principlesOverride: string[] | null = null,
 ): ProfileBody {
   // Issue #193 — persist `principles` at profile_body.identity.principles.
   // The legacy resolver (`src/identity/profile-legacy-resolver.ts`) reads this
   // path directly into `core_immutable.principles` for valoresDetector. When
-  // the input omits principles we DO NOT fall back to priorities — that is
-  // the explicit cross-domain contamination bug class fixed in #189/#191.
-  // An empty principles array (or omission) intentionally leaves the VALORES
-  // guardrail disabled for this profile, matching the resolver's contract:
-  // no true principles configured → detector emits a one-shot observability
-  // log and skips silently. Operators that want the guardrail must declare
-  // explicit core principles in the wizard.
-  const principles = input.identity.principles ?? [];
+  // the input omits principles on `create` we DO NOT fall back to priorities —
+  // that is the explicit cross-domain contamination bug class fixed in #189/#191.
+  // An empty principles array (or omission on create) intentionally leaves
+  // the VALORES guardrail disabled, matching the resolver's contract: no true
+  // principles configured → detector emits a one-shot observability log and
+  // skips silently. Operators that want the guardrail must declare explicit
+  // core principles in the wizard.
+  //
+  // Codex Adversarial Review of PR #201 round 2 [HIGH] — VALORES guardrail
+  // data-loss on omitted principles in updateProfile:
+  //   updateProfile rebuilds the next profile_body entirely from the request.
+  //   Because `identity.principles` is optional, an older client / partial
+  //   edit that updates a profile WITHOUT sending `principles` would propose
+  //   a new version with empty principles. Once approved, valoresDetector
+  //   sees zero principles → skips silently → guardrail disabled.
+  //
+  // Fix: `updateProfile` passes `principlesOverride` = activeVersion's
+  // principles ONLY when the request OMITS `principles` (key undefined).
+  // Explicit `principles: []` is honored (intentional audited clear: the
+  // proposed profile_body shows principles=[], the diff against the active
+  // body is captured implicitly through the version chain). Non-empty
+  // principles in the request replace.
+  const principles = principlesOverride ?? input.identity.principles ?? [];
   return {
     schema_version: PROFILE_BODY_SCHEMA_VERSION,
     identity: {
@@ -197,6 +219,29 @@ function buildProfileBody(
       previous_version_id: previousVersionId,
     },
   };
+}
+
+/**
+ * Extract the active version's `identity.principles` array for preservation
+ * on omit-on-update (#201 round 2 HIGH). Returns null when:
+ *   - there is no active version (e.g., seed not yet approved); OR
+ *   - the active version's profile_body has no `identity.principles` key
+ *     (pre-#193 row); OR
+ *   - the value is not an array of strings (defensive — refuse to inherit
+ *     malformed data).
+ *
+ * Returning null is the signal to `buildProfileBody` that there is "nothing
+ * to preserve from" — falls back to the request's own (possibly empty)
+ * principles, which is the safe baseline.
+ */
+function extractActivePrinciples(activeProfileBody: unknown): string[] | null {
+  if (!activeProfileBody || typeof activeProfileBody !== 'object') return null;
+  const identity = (activeProfileBody as { identity?: unknown }).identity;
+  if (!identity || typeof identity !== 'object') return null;
+  const principles = (identity as { principles?: unknown }).principles;
+  if (!Array.isArray(principles)) return null;
+  if (!principles.every((p): p is string => typeof p === 'string')) return null;
+  return principles;
 }
 
 export const agentsRouter = router({
@@ -305,10 +350,21 @@ export const agentsRouter = router({
         async () => ctx.repos.operationalProfileVersionsRepo.getActive(),
       );
 
+      // Codex Adversarial Review of PR #201 round 2 [HIGH] — preserve
+      // active.identity.principles when the request OMITS the field
+      // (`undefined`). Explicit `principles: []` is honored (intentional
+      // audited clear: the resulting profile_body documents the change for
+      // diff). See buildProfileBody jsdoc for the full contract.
+      const principlesOverride =
+        input.profile_body.identity.principles === undefined
+          ? extractActivePrinciples(activeVersion?.profile_body)
+          : null;
+
       const profileBody = buildProfileBody(
         input.profile_body,
         ctx.userId,
         activeVersion?.id ?? null,
+        principlesOverride,
       );
 
       // Codex review of PR #162 round 3 (issue #166) — profile_version

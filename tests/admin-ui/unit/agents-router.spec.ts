@@ -1834,3 +1834,219 @@ describe('agentsRouter — priorities/principles overlap guard (#201 round 2)', 
     expect(repos._inspect.profiles.length).toBe(0);
   });
 });
+
+/**
+ * Codex Adversarial Review of PR #201 round 2 [HIGH] — VALORES guardrail
+ * data-loss on omitted principles in updateProfile.
+ *
+ * Bug class: `updateProfile` rebuilds the next profile_body entirely from the
+ * request. Because `identity.principles` is optional in
+ * `ProfileBodyInputSchema`, an older client or a partial-edit caller that
+ * updates the profile WITHOUT sending `principles` would propose a new
+ * version with empty principles. Once approved, `valoresDetector` sees zero
+ * configured principles and silently skips — disabling the hard value
+ * guardrail for a profile that previously had it. Pure version-skew/data-loss
+ * path introduced by adding an optional field to a full-replacement mutation.
+ *
+ * Fix contract (this PR round 2 follow-up):
+ *   - On `updateProfile`: when `identity.principles` is OMITTED (undefined),
+ *     preserve the active version's principles into the new proposed body.
+ *   - When `identity.principles` is EXPLICITLY supplied as `[]`, it is an
+ *     intentional audited clear — the proposed body carries `principles: []`.
+ *   - When there is NO active version yet and principles is omitted, the
+ *     proposed body's principles is `[]` (no source to preserve from).
+ *   - When `identity.principles` is supplied non-empty, it replaces.
+ *
+ * `create` keeps the original semantics: omission means principles=[] (no
+ * prior body to preserve from; the operator must declare principles
+ * explicitly to enable VALORES).
+ */
+describe('agentsRouter.updateProfile — principles omission preserves active (#201 round 2)', () => {
+  const existingAgent: Agent = {
+    id: 'agent-x',
+    tenant_id: 'tenant-A',
+    nome: 'X',
+    status: 'active',
+    metadata: {},
+    created_at: new Date(),
+    updated_at: new Date(),
+  };
+
+  it('PRESERVE: omitted principles inherits from activeVersion.profile_body.identity.principles', async () => {
+    // Active profile has principles configured (VALORES guardrail active).
+    const activeWithPrinciples = {
+      id: 'prof-active',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      version: 1,
+      status: 'active',
+      profile_body: {
+        identity: {
+          priorities: ['precisao', 'clareza'],
+          principles: [
+            'Separação acima de tudo. PF é PF.',
+            'Confirme antes de agir em coisas relevantes.',
+          ],
+        },
+      } as unknown,
+      proposed_by: 'system',
+      proposed_reason: null,
+    };
+    const repos = makeRepos({
+      agents: [existingAgent],
+      profiles: [activeWithPrinciples],
+    });
+    // Update WITHOUT sending the principles key — legacy client / partial edit.
+    await caller('owner', 'tenant-A', 'u1', repos).updateProfile({
+      agentId: 'agent-x',
+      profile_body: validProfile, // no `principles` key
+      proposed_reason: 'change priorities; principles deliberately untouched',
+    });
+    // The new v2 proposed row MUST retain the existing principles.
+    const proposed = repos._inspect.profiles.find((p) => p.status === 'proposed');
+    expect(proposed).toBeDefined();
+    const persisted = proposed!.profile_body as {
+      identity?: { principles?: unknown[]; priorities?: unknown[] };
+    };
+    expect(persisted.identity?.principles).toEqual([
+      'Separação acima de tudo. PF é PF.',
+      'Confirme antes de agir em coisas relevantes.',
+    ]);
+    // priorities still updated from the request.
+    expect(persisted.identity?.priorities).toEqual(['precisao', 'clareza']);
+  });
+
+  it('EXPLICIT CLEAR: explicit principles=[] persists empty (intentional audited clear)', async () => {
+    // An operator explicitly clearing principles should still succeed; the
+    // audit row carries the new body with principles=[] so the diff is
+    // captured. This is the deliberate "I want VALORES disabled now" path.
+    const activeWithPrinciples = {
+      id: 'prof-active',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      version: 1,
+      status: 'active',
+      profile_body: {
+        identity: {
+          priorities: ['precisao'],
+          principles: ['Separação acima de tudo.'],
+        },
+      } as unknown,
+      proposed_by: 'system',
+      proposed_reason: null,
+    };
+    const repos = makeRepos({
+      agents: [existingAgent],
+      profiles: [activeWithPrinciples],
+    });
+    await caller('owner', 'tenant-A', 'u1', repos).updateProfile({
+      agentId: 'agent-x',
+      profile_body: {
+        ...validProfile,
+        identity: {
+          ...validProfile.identity,
+          principles: [], // explicit clear
+        },
+      },
+      proposed_reason: 'intentionally remove principles — see ticket FOO-123',
+    });
+    const proposed = repos._inspect.profiles.find((p) => p.status === 'proposed');
+    expect(proposed).toBeDefined();
+    const persisted = proposed!.profile_body as {
+      identity?: { principles?: unknown[] };
+    };
+    expect(persisted.identity?.principles).toEqual([]);
+  });
+
+  it('REPLACE: non-empty principles overwrites the active set', async () => {
+    const activeWithPrinciples = {
+      id: 'prof-active',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      version: 1,
+      status: 'active',
+      profile_body: {
+        identity: {
+          priorities: ['precisao'],
+          principles: ['old principle 1', 'old principle 2'],
+        },
+      } as unknown,
+      proposed_by: 'system',
+      proposed_reason: null,
+    };
+    const repos = makeRepos({
+      agents: [existingAgent],
+      profiles: [activeWithPrinciples],
+    });
+    await caller('owner', 'tenant-A', 'u1', repos).updateProfile({
+      agentId: 'agent-x',
+      profile_body: validProfileWithPrinciples, // has its own principles
+      proposed_reason: 'tighten principles for Q3',
+    });
+    const proposed = repos._inspect.profiles.find((p) => p.status === 'proposed');
+    expect(proposed).toBeDefined();
+    const persisted = proposed!.profile_body as {
+      identity?: { principles?: unknown[] };
+    };
+    // From validProfileWithPrinciples — the request's principles win.
+    expect(persisted.identity?.principles).toEqual([
+      'Separação acima de tudo. PF é PF.',
+      'Confirme antes de agir em coisas relevantes.',
+    ]);
+  });
+
+  it('NO ACTIVE: omitted principles + no active version → empty (nothing to preserve)', async () => {
+    // Agent exists but has no active profile (e.g., seed not yet approved).
+    // Omitting principles should not synthesize them; we just have nothing
+    // to inherit, so the proposed body's principles is [].
+    const repos = makeRepos({ agents: [existingAgent] });
+    await caller('owner', 'tenant-A', 'u1', repos).updateProfile({
+      agentId: 'agent-x',
+      profile_body: validProfile, // no `principles` key
+      proposed_reason: 'first update against an unseeded agent',
+    });
+    const proposed = repos._inspect.profiles.find((p) => p.status === 'proposed');
+    expect(proposed).toBeDefined();
+    const persisted = proposed!.profile_body as {
+      identity?: { principles?: unknown[] };
+    };
+    // No source to preserve from — principles is [] (matches old contract).
+    expect(persisted.identity?.principles ?? []).toEqual([]);
+  });
+
+  it('PRESERVE w/ malformed active: active.profile_body without identity.principles → empty (defensive)', async () => {
+    // Defensive case: pre-#193 active rows may not have an `identity.principles`
+    // key at all. Omission in the request must not blow up — it must yield
+    // principles=[] (treated as "no source to preserve").
+    const activeNoPrinciplesKey = {
+      id: 'prof-active',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      version: 1,
+      status: 'active',
+      profile_body: {
+        identity: {
+          priorities: ['precisao'],
+          // no `principles` key at all
+        },
+      } as unknown,
+      proposed_by: 'system',
+      proposed_reason: null,
+    };
+    const repos = makeRepos({
+      agents: [existingAgent],
+      profiles: [activeNoPrinciplesKey],
+    });
+    await caller('owner', 'tenant-A', 'u1', repos).updateProfile({
+      agentId: 'agent-x',
+      profile_body: validProfile, // no `principles` key
+      proposed_reason: 'update against pre-#193 row',
+    });
+    const proposed = repos._inspect.profiles.find((p) => p.status === 'proposed');
+    expect(proposed).toBeDefined();
+    const persisted = proposed!.profile_body as {
+      identity?: { principles?: unknown[] };
+    };
+    expect(persisted.identity?.principles ?? []).toEqual([]);
+  });
+});
