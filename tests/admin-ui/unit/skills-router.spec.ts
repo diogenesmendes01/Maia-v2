@@ -40,39 +40,47 @@ type Skill = {
 };
 
 /**
- * Faithful in-memory skillsRepo. listSummaries / getById / listVersions apply
- * the exact same visibility rules as the real repo (tenant from context;
+ * Faithful in-memory skillsRepo. listSummariesPage / getById / listVersions
+ * apply the exact same visibility rules as the real repo (tenant from context;
  * agent scope current-OR-tenant-wide for summaries, EXACT scope for
  * listVersions). lastListLimit records the cap the router forwarded.
  */
 function makeRepos(skills: Skill[], capture?: { lastListLimit?: number }) {
   const rows = skills.map((s) => ({ ...s }));
+  // Shared scope filter for the summary list paths.
+  const visibleSummaries = (status?: string) => {
+    const tenant = getCurrentTenant();
+    const agent = getCurrentAgent();
+    return rows
+      .filter(
+        (r) =>
+          r.tenant_id === tenant &&
+          (r.agent_id === agent || r.agent_id === null) &&
+          (status === undefined || r.status === status),
+      )
+      .map((r) => ({
+        id: r.id,
+        tenant_id: r.tenant_id,
+        agent_id: r.agent_id,
+        skill_descriptor: r.skill_descriptor,
+        category: r.category,
+        execution_mode: r.execution_mode,
+        version: r.version,
+        status: r.status,
+        activated_at: r.activated_at,
+        created_at: r.created_at,
+      }));
+  };
   return {
     skillsRepo: {
-      async listSummaries(status?: string, limit?: number) {
+      // Review PR #209 finding A: the router now consumes listSummariesPage,
+      // which fetches limit+1 internally and returns { items, hasMore }.
+      async listSummariesPage(status?: string, limit?: number) {
         if (capture) capture.lastListLimit = limit;
-        const tenant = getCurrentTenant();
-        const agent = getCurrentAgent();
-        let out = rows.filter(
-          (r) =>
-            r.tenant_id === tenant &&
-            (r.agent_id === agent || r.agent_id === null) &&
-            (status === undefined || r.status === status),
-        );
-        // Mirror the server cap behaviour.
-        if (typeof limit === 'number') out = out.slice(0, limit);
-        return out.map((r) => ({
-          id: r.id,
-          tenant_id: r.tenant_id,
-          agent_id: r.agent_id,
-          skill_descriptor: r.skill_descriptor,
-          category: r.category,
-          execution_mode: r.execution_mode,
-          version: r.version,
-          status: r.status,
-          activated_at: r.activated_at,
-          created_at: r.created_at,
-        }));
+        const all = visibleSummaries(status);
+        const effective = typeof limit === 'number' ? limit : all.length;
+        const hasMore = all.length > effective;
+        return { items: hasMore ? all.slice(0, effective) : all, hasMore };
       },
       async getById(id: string) {
         const tenant = getCurrentTenant();
@@ -83,6 +91,8 @@ function makeRepos(skills: Skill[], capture?: { lastListLimit?: number }) {
         if (r.agent_id !== null && r.agent_id !== agent) return null;
         return r;
       },
+      // Review PR #209 finding B: returns the VERSION SUMMARY shape (scalar
+      // version metadata only — no large JSONB), still scope-exact.
       async listVersions(descriptor: string, agentId?: string | null) {
         const tenant = getCurrentTenant();
         const agent = getCurrentAgent();
@@ -103,7 +113,19 @@ function makeRepos(skills: Skill[], capture?: { lastListLimit?: number }) {
             }
             return r.agent_id === agentId;
           })
-          .sort((a, b) => b.version - a.version);
+          .sort((a, b) => b.version - a.version)
+          .map((r) => ({
+            id: r.id,
+            version: r.version,
+            status: r.status,
+            agent_id: r.agent_id,
+            activated_at: r.activated_at,
+            deprecated_at: null,
+            rolled_back_at: null,
+            created_at: r.created_at,
+            proposed_by: 'u1',
+            approved_by: null,
+          }));
       },
     },
     _rows: rows,
@@ -261,5 +283,74 @@ describe('skillsRouter.list — summary cap forwarded (review PR #209 finding 2)
     // input schema caps at 200, but assert the router clamps defensively too.
     await caller('owner', 'tenant-A', repos).list({ agentId: 'agent-x', limit: 200 });
     expect(capture.lastListLimit).toBeLessThanOrEqual(200);
+  });
+});
+
+describe('skillsRouter.list — truncation signal (review PR #209 finding A)', () => {
+  // Fixture with N agent-scoped skills sharing an agent so we can drive the cap.
+  function manySkills(n: number): Skill[] {
+    return Array.from({ length: n }, (_, i) => ({
+      id: `m${i}`,
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      skill_descriptor: `d${i}`,
+      category: 'classify',
+      execution_mode: 'prompt_only',
+      version: 1,
+      status: 'active',
+      activated_at: null,
+      created_at: new Date(),
+    }));
+  }
+
+  it('hasMore=true and items clamped to the cap when more than cap skills exist', async () => {
+    const repos = makeRepos(manySkills(205));
+    const res = await caller('owner', 'tenant-A', repos).list({ agentId: 'agent-x' });
+    expect(res.hasMore).toBe(true);
+    expect(res.items).toHaveLength(200);
+  });
+
+  it('hasMore=false when at or under the cap', async () => {
+    const repos = makeRepos(manySkills(200));
+    const res = await caller('owner', 'tenant-A', repos).list({ agentId: 'agent-x' });
+    expect(res.hasMore).toBe(false);
+    expect(res.items).toHaveLength(200);
+  });
+
+  it('hasMore=false for a small result set', async () => {
+    const repos = makeRepos(manySkills(3));
+    const res = await caller('owner', 'tenant-A', repos).list({ agentId: 'agent-x' });
+    expect(res.hasMore).toBe(false);
+    expect(res.items).toHaveLength(3);
+  });
+});
+
+describe('skillsRouter.listVersions — summary shape (review PR #209 finding B)', () => {
+  const BIG_JSONB = [
+    'procedure',
+    'input_schema',
+    'output_schema',
+    'constraints',
+    'success_criteria',
+    'failure_modes',
+    'runtime_hints',
+  ];
+
+  it('returns only scalar version metadata — no large JSONB fields', async () => {
+    const repos = makeRepos(collisionFixture());
+    const res = await caller('owner', 'tenant-A', repos).listVersions({
+      descriptor: SHARED,
+      agentId: 'agent-x',
+    });
+    expect(res.items.length).toBeGreaterThan(0);
+    for (const v of res.items) {
+      for (const f of BIG_JSONB) {
+        expect(v).not.toHaveProperty(f);
+      }
+      // The scalar columns the drawer renders ARE present.
+      expect(v).toHaveProperty('version');
+      expect(v).toHaveProperty('status');
+      expect(v).toHaveProperty('created_at');
+    }
   });
 });

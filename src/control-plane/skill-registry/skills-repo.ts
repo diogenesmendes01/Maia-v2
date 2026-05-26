@@ -65,6 +65,43 @@ const SUMMARY_COLUMNS = {
 } as const;
 
 /**
+ * Summary projection for the version-history list in the Admin UI drawer
+ * (review PR #209 finding B). The drawer's Versions list only renders scalar
+ * version metadata (version / status / timestamps / actors), so listVersions
+ * MUST NOT pull the large JSONB contract columns (procedure, input_schema,
+ * output_schema, constraints, success_criteria, failure_modes, runtime_hints)
+ * for every historical version. The drawer's MAIN contract view still uses
+ * getById for the full contract of the selected row.
+ */
+export type SkillVersionSummary = Pick<
+  SkillRow,
+  | 'id'
+  | 'version'
+  | 'status'
+  | 'agent_id'
+  | 'activated_at'
+  | 'deprecated_at'
+  | 'rolled_back_at'
+  | 'created_at'
+  | 'proposed_by'
+  | 'approved_by'
+>;
+
+/** Column set selected for SkillVersionSummary (no large JSONB). */
+const VERSION_SUMMARY_COLUMNS = {
+  id: skills.id,
+  version: skills.version,
+  status: skills.status,
+  agent_id: skills.agent_id,
+  activated_at: skills.activated_at,
+  deprecated_at: skills.deprecated_at,
+  rolled_back_at: skills.rolled_back_at,
+  created_at: skills.created_at,
+  proposed_by: skills.proposed_by,
+  approved_by: skills.approved_by,
+} as const;
+
+/**
  * Server-enforced cap on the number of rows returned by the summary list
  * (review PR #209 finding 2). Callers may request fewer but never more; an
  * out-of-range / missing limit is clamped to this value to keep the unbounded
@@ -136,6 +173,19 @@ export interface SkillsRepo {
    */
   listSummaries(status?: string, limit?: number): Promise<SkillSummary[]>;
 
+  /**
+   * Como listSummaries, mas devolve também um sinal de truncamento (review PR
+   * #209 finding A). Para detectar "tem mais" de forma barata, busca `limit + 1`
+   * linhas (a própria sonda fica capada em SKILLS_LIST_MAX_LIMIT + 1), define
+   * `hasMore = rows.length > limit` e corta `items` exatamente em `limit`. Sem
+   * paginação por cursor (over-engineering nesta escala) — apenas o aviso de
+   * que existem skills além do teto exibido.
+   */
+  listSummariesPage(
+    status?: string,
+    limit?: number,
+  ): Promise<{ items: SkillSummary[]; hasMore: boolean }>;
+
   /** Cria uma nova versão em status='proposed' (jamais 'active'). */
   propose(input: ProposeInput): Promise<SkillRow>;
 
@@ -162,7 +212,7 @@ export interface SkillsRepo {
   getByDescriptor(descriptor: string, version?: number): Promise<SkillRow | null>;
 
   /**
-   * Lista todas as versões de um descriptor, mais recente primeiro.
+   * Lista as versões de um descriptor (projeção SUMMARY), mais recente primeiro.
    *
    * Review PR #209 finding 3 (scope-exact version history): o histórico DEVE
    * ser exato por escopo. `agentId` é opcional para retrocompat:
@@ -171,8 +221,16 @@ export interface SkillsRepo {
    *   - null      → SOMENTE tenant-wide (agent_id IS NULL).
    * Assim uma skill agent-scoped e uma tenant-wide com o mesmo descriptor não
    * se misturam no histórico de versões.
+   *
+   * Review PR #209 finding B: retorna apenas colunas escalares de versão (SEM
+   * os JSONB grandes — procedure/schemas/constraints/etc.), capado em
+   * SKILLS_LIST_MAX_LIMIT, pois a lista de versões do drawer só mostra metadados
+   * escalares. O contrato completo de uma versão continua atrás de getById.
    */
-  listVersions(descriptor: string, agentId?: string | null): Promise<SkillRow[]>;
+  listVersions(
+    descriptor: string,
+    agentId?: string | null,
+  ): Promise<SkillVersionSummary[]>;
 }
 
 export const skillsRepo: SkillsRepo = {
@@ -277,6 +335,33 @@ export const skillsRepo: SkillsRepo = {
       .where(and(...filters))
       .orderBy(skills.skill_descriptor, desc(skills.version))
       .limit(clampSkillsLimit(limit));
+  },
+
+  async listSummariesPage(status, limit): Promise<{ items: SkillSummary[]; hasMore: boolean }> {
+    const tenant_id = getCurrentTenant();
+    const ctxAgent = getCurrentAgent();
+    const filters = [
+      eq(skills.tenant_id, tenant_id),
+      // Same visibility rule as listSummaries (review #99 finding 1).
+      or(eq(skills.agent_id, ctxAgent), sql`agent_id IS NULL`),
+    ];
+    if (status !== undefined) {
+      filters.push(eq(skills.status, status));
+    }
+    // Review PR #209 finding A: cheapest truncation signal. Clamp the effective
+    // page size to the cap, then fetch ONE extra row (the probe stays bounded at
+    // SKILLS_LIST_MAX_LIMIT + 1). If we got more than the page size there are
+    // more skills than we display; slice back down so callers never see the
+    // probe row. Same projection/scope as listSummaries.
+    const effectiveLimit = clampSkillsLimit(limit);
+    const rows = await db
+      .select(SUMMARY_COLUMNS)
+      .from(skills)
+      .where(and(...filters))
+      .orderBy(skills.skill_descriptor, desc(skills.version))
+      .limit(effectiveLimit + 1);
+    const hasMore = rows.length > effectiveLimit;
+    return { items: hasMore ? rows.slice(0, effectiveLimit) : rows, hasMore };
   },
 
   async propose(input): Promise<SkillRow> {
@@ -564,7 +649,7 @@ export const skillsRepo: SkillsRepo = {
     return rows[0] ?? null;
   },
 
-  async listVersions(descriptor, agentId): Promise<SkillRow[]> {
+  async listVersions(descriptor, agentId): Promise<SkillVersionSummary[]> {
     const tenant_id = getCurrentTenant();
     const ctxAgent = getCurrentAgent();
     // Review PR #209 finding 3: scope-exact version history. When agentId is
@@ -572,8 +657,12 @@ export const skillsRepo: SkillsRepo = {
     // only) so an agent-scoped skill and a tenant-wide one that share a
     // descriptor never bleed into each other's version list. undefined keeps
     // the legacy (current agent OR tenant-wide) behaviour for old callers.
+    //
+    // Review PR #209 finding B: project only scalar version columns (no large
+    // JSONB) and cap the row count at SKILLS_LIST_MAX_LIMIT — the drawer's
+    // Versions list never needs the full contract per version.
     return db
-      .select()
+      .select(VERSION_SUMMARY_COLUMNS)
       .from(skills)
       .where(
         and(
@@ -582,6 +671,7 @@ export const skillsRepo: SkillsRepo = {
           scopeClauseFor(agentId, ctxAgent),
         ),
       )
-      .orderBy(desc(skills.version));
+      .orderBy(desc(skills.version))
+      .limit(SKILLS_LIST_MAX_LIMIT);
   },
 };

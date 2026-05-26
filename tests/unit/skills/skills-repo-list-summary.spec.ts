@@ -159,3 +159,119 @@ describe('skillsRepo.listAll — full-row path stays bounded (review PR #209 fin
     expect(calls[1]!.limitArg).toBe(SKILLS_LIST_MAX_LIMIT);
   });
 });
+
+describe('skillsRepo.listSummariesPage — truncation signal (review PR #209 finding A)', () => {
+  beforeEach(() => {
+    calls.length = 0;
+    cannedRows = [];
+  });
+
+  // Build n believable summary rows.
+  function summaryRows(n: number) {
+    return Array.from({ length: n }, (_, i) => ({
+      id: `s${i}`,
+      tenant_id: 'default',
+      agent_id: 'agent-x',
+      skill_descriptor: `d${i}`,
+      category: 'classify',
+      execution_mode: 'prompt_only',
+      version: 1,
+      status: 'active',
+      activated_at: null,
+      created_at: new Date(),
+    }));
+  }
+
+  it('uses the summary projection (no large JSONB) like listSummaries', async () => {
+    cannedRows = summaryRows(1);
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'agent-x' }, async () => {
+      await skillsRepo.listSummariesPage();
+    });
+    const projection = calls[0]!.selectArg as Record<string, unknown>;
+    expect(projection).toBeTruthy();
+    expect(Object.keys(projection).sort()).toEqual([...SUMMARY_FIELDS].sort());
+    for (const f of BIG_JSONB_FIELDS) {
+      expect(Object.keys(projection)).not.toContain(f);
+    }
+  });
+
+  it('fetches cap+1 rows to probe for more (default limit)', async () => {
+    cannedRows = summaryRows(SKILLS_LIST_MAX_LIMIT + 1);
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'agent-x' }, async () => {
+      await skillsRepo.listSummariesPage();
+    });
+    // The probe is the cap + 1 — never an unbounded select.
+    expect(calls[0]!.limitArg).toBe(SKILLS_LIST_MAX_LIMIT + 1);
+  });
+
+  it('hasMore=true and items sliced to the cap when more than cap rows exist', async () => {
+    cannedRows = summaryRows(SKILLS_LIST_MAX_LIMIT + 1);
+    const res = await runWithTenantContext(
+      { tenant_id: 'default', agent_id: 'agent-x' },
+      async () => skillsRepo.listSummariesPage(),
+    );
+    expect(res.hasMore).toBe(true);
+    expect(res.items).toHaveLength(SKILLS_LIST_MAX_LIMIT);
+  });
+
+  it('hasMore=false and returns all rows when at or under the cap', async () => {
+    cannedRows = summaryRows(SKILLS_LIST_MAX_LIMIT); // exactly cap, no probe overflow
+    const res = await runWithTenantContext(
+      { tenant_id: 'default', agent_id: 'agent-x' },
+      async () => skillsRepo.listSummariesPage(),
+    );
+    expect(res.hasMore).toBe(false);
+    expect(res.items).toHaveLength(SKILLS_LIST_MAX_LIMIT);
+  });
+
+  it('respects a smaller in-range limit for the probe (limit+1)', async () => {
+    cannedRows = summaryRows(11); // 11 = limit(10) + 1 → hasMore
+    const res = await runWithTenantContext(
+      { tenant_id: 'default', agent_id: 'agent-x' },
+      async () => skillsRepo.listSummariesPage('active', 10),
+    );
+    expect(calls[0]!.limitArg).toBe(11);
+    expect(res.hasMore).toBe(true);
+    expect(res.items).toHaveLength(10);
+  });
+});
+
+describe('skillsRepo.listVersions — summary projection + cap (review PR #209 finding B)', () => {
+  beforeEach(() => {
+    calls.length = 0;
+    cannedRows = [];
+  });
+
+  const VERSION_SUMMARY_FIELDS = [
+    'id',
+    'version',
+    'status',
+    'agent_id',
+    'activated_at',
+    'deprecated_at',
+    'rolled_back_at',
+    'created_at',
+    'proposed_by',
+    'approved_by',
+  ];
+
+  it('selects ONLY scalar version columns — no large JSONB fields', async () => {
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'agent-x' }, async () => {
+      await skillsRepo.listVersions('detect_legal_risk');
+    });
+    expect(calls).toHaveLength(1);
+    const projection = calls[0]!.selectArg as Record<string, unknown>;
+    expect(projection).toBeTruthy();
+    expect(Object.keys(projection).sort()).toEqual([...VERSION_SUMMARY_FIELDS].sort());
+    for (const f of BIG_JSONB_FIELDS) {
+      expect(Object.keys(projection)).not.toContain(f);
+    }
+  });
+
+  it('caps the version history at SKILLS_LIST_MAX_LIMIT', async () => {
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'agent-x' }, async () => {
+      await skillsRepo.listVersions('detect_legal_risk');
+    });
+    expect(calls[0]!.limitArg).toBe(SKILLS_LIST_MAX_LIMIT);
+  });
+});

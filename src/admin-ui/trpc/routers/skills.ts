@@ -4,7 +4,8 @@
  * Read endpoints for the /skills screen, surfacing the `skills` table (P9a
  * Skill Registry) so operators can list/view versioned, tenant/agent-scoped
  * Skill Contracts instead of hand-writing SQL:
- *   - list         — SUMMARY rows for the tenant/agent (no large JSONB), capped
+ *   - list         — SUMMARY rows for the tenant/agent (no large JSONB), capped,
+ *                    plus a `hasMore` truncation signal when the cap is hit
  *   - getById      — the full contract for one skill row
  *   - listVersions — every version of a descriptor in an EXACT scope (newest
  *                    first); the caller passes the selected row's agent_id
@@ -61,15 +62,21 @@ export const skillsRouter = router({
    * SUMMARY rows for the tenant/agent, optionally filtered by status, capped at
    * LIST_LIMIT_CAP (review PR #209 finding 2). Returns only the table columns
    * (no large JSONB) — the full contract is fetched per-row via getById.
+   *
+   * Review PR #209 finding A: also returns `hasMore` so the UI can warn when the
+   * result was truncated at the cap instead of silently dropping skills. The
+   * repo fetches limit+1 rows to compute this cheaply (no full cursor
+   * pagination — out of scope at this volume); narrow the filter (agent/status)
+   * to see the rest.
    */
   list: protectedProcedure.input(ListInput).query(async ({ input, ctx }) => {
     const tenantId = resolveTenantId(ctx, input.tenantId);
     const limit = Math.min(input.limit ?? LIST_LIMIT_CAP, LIST_LIMIT_CAP);
-    const items = await runWithTenantContext(
+    const { items, hasMore } = await runWithTenantContext(
       { tenant_id: tenantId, agent_id: input.agentId },
-      async () => ctx.repos.skillsRepo.listSummaries(input.status, limit),
+      async () => ctx.repos.skillsRepo.listSummariesPage(input.status, limit),
     );
-    return { items };
+    return { items, hasMore };
   }),
 
   /** The full contract for a single skill row (or null when not visible). */

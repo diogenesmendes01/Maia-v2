@@ -59,8 +59,25 @@ type SkillSummary = {
   created_at: string;
 };
 
-// Full contract returned by skills.getById (and skills.listVersions) — mirror
-// of SkillRow (src/db/schema.ts:1967). jsonb columns arrive as plain JSON.
+// Version-history summary returned by skills.listVersions (review PR #209
+// finding B): only scalar version metadata, NO large JSONB. The drawer's
+// Versions list renders just these columns; the full contract of the selected
+// row still comes from skills.getById. timestamps arrive as ISO strings.
+type SkillVersionSummary = {
+  id: string;
+  version: number;
+  status: string;
+  agent_id: string | null;
+  activated_at: string | null;
+  deprecated_at: string | null;
+  rolled_back_at: string | null;
+  created_at: string;
+  proposed_by: string;
+  approved_by: string | null;
+};
+
+// Full contract returned by skills.getById — mirror of SkillRow
+// (src/db/schema.ts:1967). jsonb columns arrive as plain JSON.
 type SkillRow = SkillSummary & {
   goal: string;
   when_to_use: string;
@@ -130,6 +147,9 @@ export default function SkillsPage() {
   if (sessionStatus === 'loading') return <p>Loading session...</p>;
 
   const skills = (listQuery.data?.items ?? []) as SkillSummary[];
+  // FIX A (review PR #209): the list is capped at 200; surface truncation
+  // explicitly instead of letting >200 skills silently vanish.
+  const listTruncated = listQuery.data?.hasMore === true;
   // FIX 1 (review PR #209): this only reflects THIS admin-ui's own config.
   const adminUiFlagOff = flagQuery.data
     ? flagQuery.data.adminUiSkillRegistryEnabled === false
@@ -232,7 +252,14 @@ export default function SkillsPage() {
           No {STATUS_LABEL[tab].toLowerCase()} skills for this agent.
         </p>
       ) : (
-        <table className="w-full text-sm border-collapse">
+        <div className="space-y-2">
+          {listTruncated && (
+            <div className="border border-amber-300 bg-amber-50 text-amber-900 rounded p-3 text-sm">
+              Showing the first {skills.length} skills. There are more than this
+              for the current filter — refine by agent or status to see the rest.
+            </div>
+          )}
+          <table className="w-full text-sm border-collapse">
           <thead>
             <tr className="bg-gray-100">
               <th className="text-left p-2 border-b">Descriptor</th>
@@ -266,7 +293,8 @@ export default function SkillsPage() {
               </tr>
             ))}
           </tbody>
-        </table>
+          </table>
+        </div>
       )}
 
       {selectedId && (
@@ -338,7 +366,7 @@ function SkillDetailDrawer({
     },
     { enabled: skill != null },
   );
-  const versions = (versionsQuery.data?.items ?? []) as SkillRow[];
+  const versions = (versionsQuery.data?.items ?? []) as SkillVersionSummary[];
 
   return (
     <div className="fixed inset-0 z-40 flex justify-end">
