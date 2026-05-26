@@ -2,18 +2,29 @@
  * P8a — Production SliceBuilderSet factory.
  *
  * Wires the seven P8a slice builders with stub adapters for sub-phases that are
- * not yet shipped (P8b Soul, P8c User facade, P8e Policy resolver).
+ * not yet shipped (P8c User facade, P8e Policy resolver, P9a Skill catalog,
+ * P11 Tool registry).
  * Real adapters will replace the stubs in those phases.
  *
  * Exported as a lazy singleton (created once on first call) so the builders
  * share the same InMemorySliceCache instance across turns in the process.
  *
  * P8b: soulBiasesRepoPort wired (real port backed by soulBiasesRepo).
+ * Issue #206: realIdentityPort wired (real port backed by
+ * operationalProfileVersionsRepo). Tenant/agent resolve via AsyncLocalStorage
+ * inside the repo — the port adapter passes no tenant argument so the
+ * tenant-isolation invariant cannot be violated by a confused caller.
  * TODO(P8c): replace stub user repo with real user-layer facade.
  * TODO(P8e): replace stubPolicyDescriptorResolver with real resolver.
+ * TODO(P9a): replace stubSkillRepo with real skill catalog facade.
+ * TODO(P11): replace stubToolRegistry with real tool registry binding.
  */
 
 import { IdentitySliceBuilder } from '../context-assembly/slice-builders/identity-slice-builder.js';
+import type {
+  OperationalProfilePort,
+  OperationalProfileRecord,
+} from '../context-assembly/slice-builders/identity-slice-builder.js';
 import { UserSliceBuilder } from '../context-assembly/slice-builders/user-slice-builder.js';
 import {
   KnowledgeSliceBuilder,
@@ -31,12 +42,44 @@ import { SkillSliceBuilder } from '../context-assembly/slice-builders/skill-slic
 import { ToolPermissionSliceBuilder } from '../context-assembly/slice-builders/tool-slice-builder.js';
 import { InMemorySliceCache } from './cache/slice-cache.js';
 import type { SliceBuilderSet } from './build-context-packet.js';
+import { operationalProfileVersionsRepo } from '@/db/repositories.js';
 
-// ─── Stub repo adapters (replaced in later phases) ───────────────────────────
+// ─── Real Identity port (Issue #206) ──────────────────────────────────────────
 
-const stubIdentityPort = {
-  async getActive(_tenant_id: string) {
-    return null;
+/**
+ * Real OperationalProfilePort backed by `operationalProfileVersionsRepo`.
+ *
+ * Issue #206: replaces the previous `stubIdentityPort` that always returned
+ * `null`. With the stub in place, `IdentitySliceBuilder` always rendered
+ * `EMPTY_IDENTITY` when `FEATURE_CONTEXT_PACKET_V1=true`, so migrated rows
+ * (priorities=[], principles=[...]) never reached the prompt renderer.
+ *
+ * Tenant isolation:
+ *   The underlying `operationalProfileVersionsRepo.getActive()` resolves
+ *   `tenant_id` and `agent_id` from AsyncLocalStorage via
+ *   `getCurrentTenant()` / `getCurrentAgent()`. Agent core wraps each turn
+ *   in `runWithTenantContext` (`src/agent/core.ts`), so the active context
+ *   is always present at the call site. The port adapter intentionally
+ *   ignores its positional `tenant_id` / `agent_id` arguments — the
+ *   AsyncLocalStorage value is the only trusted source. A confused caller
+ *   passing a wrong tenant_id literal would be silently overridden by the
+ *   context, preserving the inviolable tenant-isolation invariant.
+ *
+ * Status filter:
+ *   Defense-in-depth: even though `operationalProfileVersionsRepo.getActive`
+ *   already filters `WHERE status = 'active'`, we re-check
+ *   `profile.status === 'active'` and treat any drift (frozen, rolled_back)
+ *   as "no active profile". Mirrors `buildIdentitySlice()` in
+ *   `identity-slice-builder.ts`.
+ */
+const realIdentityPort: OperationalProfilePort = {
+  async getActive(_tenant_id: string, _agent_id: string) {
+    const profile = await operationalProfileVersionsRepo.getActive();
+    if (!profile || profile.status !== 'active') return null;
+    return {
+      id: profile.id,
+      profile_body: profile.profile_body as OperationalProfileRecord['profile_body'],
+    };
   },
 };
 
@@ -94,7 +137,7 @@ export function getProductionBuilderSet(): {
 
   const builders: SliceBuilderSet = {
     identity: new IdentitySliceBuilder(
-      stubIdentityPort,
+      realIdentityPort,
       cache,
     ) as unknown as SliceBuilderSet['identity'],
     user: new UserSliceBuilder(
