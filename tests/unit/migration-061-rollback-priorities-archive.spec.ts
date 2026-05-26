@@ -249,4 +249,68 @@ describe('migration 061 — issue #203 rollback priorities sidecar archive', () 
       expect(archiveBlock).not.toMatch(/\bFROM\b\s+agent_operational_profile_versions\b/i);
     });
   });
+
+  // Codex review [P2] follow-up: the restore must work on the canonical-only
+  // re-up path (no legacy columns). Without seeding `identity` first,
+  // `jsonb_set(profile_body, '{identity,priorities}', ..., true)` is a no-op
+  // when profile_body has no `identity` key — PostgreSQL's `create_missing`
+  // creates only the LEAF key, NOT intermediate path segments. The sidecar
+  // would then be cleared while priorities silently vanish.
+  describe('canonical-only re-up path (Codex [P2])', () => {
+    it('seeds identity object before jsonb_set so missing intermediates do not drop priorities', () => {
+      // The restore SET expression must build profile_body's identity key
+      // before (or together with) the jsonb_set on identity.priorities.
+      // We accept either pattern:
+      //   1) jsonb_build_object('identity', ...) merged via `||`
+      //   2) a nested jsonb_set that first writes '{identity}' to an empty
+      //      object, then writes '{identity,priorities}'.
+      // Both ensure the leaf write lands even when profile_body = '{}'.
+      const seedJsonbBuildObjectRe = new RegExp(
+        `jsonb_build_object\\(\\s*'identity'[\\s\\S]*${SIDECAR_COL}`,
+        'i',
+      );
+      const nestedJsonbSetIdentityRe = new RegExp(
+        `jsonb_set\\([\\s\\S]*'\\{identity\\}'[\\s\\S]*'\\{identity,priorities\\}'[\\s\\S]*${SIDECAR_COL}`,
+        'i',
+      );
+      const seedsIdentity =
+        seedJsonbBuildObjectRe.test(upCode) ||
+        nestedJsonbSetIdentityRe.test(upCode);
+      expect(
+        seedsIdentity,
+        'expected the restore SET to seed profile_body.identity (jsonb_build_object or nested jsonb_set) before writing identity.priorities, otherwise canonical-only re-up loses archived priorities',
+      ).toBe(true);
+    });
+
+    it('clears the sidecar only when the restore actually lands priorities', () => {
+      // Defensive coupling: the sidecar clear must be atomic with the
+      // priorities restore on the SAME row. Acceptable shapes:
+      //   - both updates happen inside the SAME UPDATE statement (the
+      //     existing implementation), OR
+      //   - the clear is guarded by a CASE / WHEN expression that fires
+      //     only when the jsonb_set actually wrote to identity.priorities.
+      // We assert (minimally) that the SET that clears the sidecar lives in
+      // the SAME UPDATE statement that writes identity.priorities.
+      //
+      // Lock onto the RESTORE block specifically — search for the UPDATE
+      // whose SET expression mentions the sidecar column. The legacy
+      // backfill UPDATE earlier in the file never references the sidecar.
+      const restoreBlockRe = new RegExp(
+        `UPDATE\\s+agent_operational_profile_versions[\\s\\S]*?SET\\s+profile_body\\s*=[\\s\\S]*?${SIDECAR_COL}[\\s\\S]*?WHERE`,
+        'i',
+      );
+      const restoreBlockMatch = upCode.match(restoreBlockRe);
+      expect(
+        restoreBlockMatch,
+        'restore UPDATE block (with sidecar reference) must be present',
+      ).not.toBeNull();
+      const block = restoreBlockMatch![0];
+      // Same statement must touch BOTH the sidecar clear AND the
+      // identity.priorities write.
+      expect(block).toMatch(
+        new RegExp(`${SIDECAR_COL}\\s*=\\s*'\\{\\}'::jsonb`, 'i'),
+      );
+      expect(block).toMatch(/identity[\s\S]*priorities/i);
+    });
+  });
 });

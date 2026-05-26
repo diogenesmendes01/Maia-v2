@@ -205,11 +205,30 @@ BEGIN
   -- restore so the next down captures a clean snapshot rather than
   -- replaying a stale one. Idempotence: a second up call finds the
   -- sidecar already cleared and the UPDATE is a no-op.
+  --
+  -- Codex review [P2] follow-up: seed `profile_body.identity` BEFORE the
+  -- `jsonb_set` on `{identity,priorities}`. PostgreSQL's `jsonb_set` with
+  -- `create_missing=true` creates ONLY the leaf key — it does NOT
+  -- materialize missing intermediate path segments. On the canonical-only
+  -- re-up path (no legacy columns → the backfill UPDATE above is skipped
+  -- and `profile_body` stays at its `'{}'::jsonb` default), `profile_body`
+  -- has no `identity` key, so a bare `jsonb_set` would leave `profile_body`
+  -- unchanged and the subsequent sidecar clear would silently lose the
+  -- archived priorities. The `||` merge `jsonb_build_object('identity',
+  -- COALESCE(profile_body->'identity', '{}'::jsonb))` is idempotent: when
+  -- `identity` already exists it round-trips the same value; when it is
+  -- absent, it materialises an empty object so `jsonb_set` can then write
+  -- the leaf. The result is always a JSONB object whose `identity` key
+  -- exists by the time the priorities are merged in.
   IF has_rollback_archive THEN
     EXECUTE $sql$
       UPDATE agent_operational_profile_versions
          SET profile_body = jsonb_set(
-               COALESCE(profile_body, '{}'::jsonb),
+               COALESCE(profile_body, '{}'::jsonb)
+                 || jsonb_build_object(
+                      'identity',
+                      COALESCE(profile_body->'identity', '{}'::jsonb)
+                    ),
                '{identity,priorities}',
                _rollback_archive_priorities->'priorities',
                true
