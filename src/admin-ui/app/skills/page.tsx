@@ -5,8 +5,13 @@
  *
  * Lists/views the `skills` table (P9a Skill Registry) for the selected agent,
  * filterable by status, with a detail drawer that pretty-prints the full
- * declarative contract and a "Versions" list. Founders may switch tenant; every
- * other role is pinned to their own tenant by the router (resolveTenantId).
+ * declarative contract and a "Versions" list. Founders may switch tenant via a
+ * selector; every other role is pinned to their own tenant (the router's
+ * resolveTenantId also enforces this server-side).
+ *
+ * The table consumes a SUMMARY projection (no large JSONB) from skills.list;
+ * the detail drawer fetches the full contract per-row via skills.getById
+ * (review PR #209 findings 2 & 5).
  *
  * Phase 3 will add propose/activate/deprecate/rollback. There are intentionally
  * NO create / edit / action buttons here.
@@ -38,16 +43,25 @@ const STATUS_BADGE: Record<string, string> = {
   rolled_back: 'bg-red-100 text-red-800',
 };
 
-// Mirror of SkillRow (src/db/schema.ts:1967) — the serialized tRPC output. Kept
-// local so the page stays free of backend imports. jsonb columns arrive as
-// plain JSON; timestamps arrive as ISO strings.
-type SkillRow = {
+// SUMMARY shape returned by skills.list (review PR #209 finding 2): only the
+// table columns, NO large JSONB. Kept local so the page stays free of backend
+// imports. timestamps arrive as ISO strings.
+type SkillSummary = {
   id: string;
   tenant_id: string;
   agent_id: string | null;
   skill_descriptor: string;
   category: string;
   execution_mode: string;
+  version: number;
+  status: string;
+  activated_at: string | null;
+  created_at: string;
+};
+
+// Full contract returned by skills.getById (and skills.listVersions) — mirror
+// of SkillRow (src/db/schema.ts:1967). jsonb columns arrive as plain JSON.
+type SkillRow = SkillSummary & {
   goal: string;
   when_to_use: string;
   procedure: unknown;
@@ -59,17 +73,13 @@ type SkillRow = {
   success_criteria: unknown;
   failure_modes: unknown;
   runtime_hints: unknown;
-  status: string;
-  version: number;
   proposed_by: string;
   proposed_reason: string | null;
   approved_by: string | null;
   approved_at: string | null;
-  activated_at: string | null;
   deprecated_at: string | null;
   rolled_back_at: string | null;
   rollback_reason: string | null;
-  created_at: string;
 };
 
 function fmtDate(v: string | null): string {
@@ -87,11 +97,23 @@ function Badge({ label, className }: { label: string; className: string }) {
 
 export default function SkillsPage() {
   const { data: session, status: sessionStatus } = useSession();
-  const tenantId = session?.user?.tenant_id ?? '';
+  const role = session?.user?.role ?? '';
+  const sessionTenant = session?.user?.tenant_id ?? '';
+
+  // FIX 4 (review PR #209): founders can inspect other tenants via a selector;
+  // every other role stays pinned to their own tenant. Mirrors the setup pages.
+  const [tenantId, setTenantId] = React.useState(sessionTenant);
+  React.useEffect(() => {
+    if (sessionTenant && !tenantId) setTenantId(sessionTenant);
+  }, [sessionTenant, tenantId]);
 
   const [agentId, setAgentId] = React.useState('');
   const [tab, setTab] = React.useState<SkillStatus>('active');
   const [selectedId, setSelectedId] = React.useState<string | null>(null);
+
+  const tenantsQuery = trpc.tenants.list.useQuery(undefined, {
+    enabled: role === 'founder',
+  });
 
   const agentsQuery = trpc.agents.list.useQuery(
     { tenantId },
@@ -107,8 +129,19 @@ export default function SkillsPage() {
 
   if (sessionStatus === 'loading') return <p>Loading session...</p>;
 
-  const skills = (listQuery.data?.items ?? []) as SkillRow[];
-  const flagOff = flagQuery.data ? flagQuery.data.skillRegistryEnabled === false : false;
+  const skills = (listQuery.data?.items ?? []) as SkillSummary[];
+  // FIX 1 (review PR #209): this only reflects THIS admin-ui's own config.
+  const adminUiFlagOff = flagQuery.data
+    ? flagQuery.data.adminUiSkillRegistryEnabled === false
+    : false;
+
+  // Reset agent + selection whenever the founder switches tenant — agents and
+  // skills are tenant-scoped, so a stale agentId/selectedId would be wrong.
+  const onTenantChange = (next: string) => {
+    setTenantId(next);
+    setAgentId('');
+    setSelectedId(null);
+  };
 
   const TabButton = ({ id }: { id: SkillStatus }) => (
     <button
@@ -135,16 +168,36 @@ export default function SkillsPage() {
         </p>
       </header>
 
-      {flagOff && (
+      {adminUiFlagOff && (
         <div className="border border-amber-300 bg-amber-50 text-amber-900 rounded p-3 text-sm">
-          Skills are managed here but won&apos;t execute until{' '}
-          <code className="font-medium">FEATURE_SKILL_REGISTRY_V1</code> is
-          enabled on maia-app.
+          This admin-ui sees{' '}
+          <code className="font-medium">FEATURE_SKILL_REGISTRY_V1</code> ={' '}
+          <strong>off</strong>. Skills are managed here, but execution depends on{' '}
+          <strong>maia-app</strong>&apos;s own config (a separate container) —
+          verify the flag there. This banner reflects only this admin-ui&apos;s
+          environment, not maia-app&apos;s runtime state.
         </div>
       )}
 
       <div className="flex flex-wrap items-center gap-3 text-sm">
-        <span className="font-medium">Agent:</span>
+        <span className="font-medium">Tenant:</span>
+        {role === 'founder' ? (
+          <select
+            value={tenantId}
+            onChange={(e) => onTenantChange(e.target.value)}
+            className="border rounded p-1"
+          >
+            <option value="">Select…</option>
+            {(tenantsQuery.data?.items ?? []).map((t) => (
+              <option key={t.id} value={t.id}>
+                {t.id} ({t.nome})
+              </option>
+            ))}
+          </select>
+        ) : (
+          <code className="px-2 py-0.5 bg-gray-100 rounded">{sessionTenant}</code>
+        )}
+        <span className="font-medium ml-2">Agent:</span>
         <select
           value={agentId}
           onChange={(e) => {
@@ -152,6 +205,7 @@ export default function SkillsPage() {
             setSelectedId(null);
           }}
           className="border rounded p-1"
+          disabled={!tenantId}
         >
           <option value="">Select…</option>
           {(agentsQuery.data?.items ?? []).map((a) => (
@@ -273,8 +327,15 @@ function SkillDetailDrawer({
   const detailQuery = trpc.skills.getById.useQuery({ id, tenantId, agentId });
   const skill = (detailQuery.data?.item ?? null) as SkillRow | null;
 
+  // FIX 3 (review PR #209): scope version history to the SELECTED row's own
+  // agent_id (null = tenant-wide), NOT the page's agent filter, so an
+  // agent-scoped skill and a tenant-wide one sharing a descriptor don't blend.
   const versionsQuery = trpc.skills.listVersions.useQuery(
-    { descriptor: skill?.skill_descriptor ?? '', tenantId, agentId },
+    {
+      descriptor: skill?.skill_descriptor ?? '',
+      tenantId,
+      agentId: skill ? skill.agent_id : agentId,
+    },
     { enabled: skill != null },
   );
   const versions = (versionsQuery.data?.items ?? []) as SkillRow[];
@@ -355,12 +416,24 @@ function SkillDetailDrawer({
               </p>
             </Section>
 
+            {/* FIX 5 (review PR #209): procedure is part of the full contract
+                and was previously omitted — render it. */}
+            <Section title="Procedure">
+              <JsonBlock value={skill.procedure} />
+            </Section>
+
             <Section title="Allowed tools">
               <TagList items={skill.allowed_tools} empty="None (no tool access)." />
             </Section>
 
             <Section title="Policy descriptors">
               <TagList items={skill.policy_descriptors} empty="None." />
+            </Section>
+
+            {/* FIX 5 (review PR #209): constraints is part of the full
+                contract and was previously omitted — render it. */}
+            <Section title="Constraints">
+              <JsonBlock value={skill.constraints} />
             </Section>
 
             <Section title="Input schema">

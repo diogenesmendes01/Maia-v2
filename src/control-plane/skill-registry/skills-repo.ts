@@ -15,7 +15,7 @@
  *
  * Master spec v3.1.1 §2.4. Plan P9a Tasks 4.
  */
-import { eq, and, desc, or, sql } from 'drizzle-orm';
+import { eq, and, desc, or, sql, type SQL } from 'drizzle-orm';
 import { db, withTx } from '@/db/client.js';
 import { skills } from '@/db/schema.js';
 import type { SkillRow, SkillContract } from '@/db/schema.js';
@@ -27,6 +27,85 @@ export type ProposeInput = SkillContract & {
   agent_id?: string | null;
   tenant_id?: string;
 };
+
+/**
+ * Summary projection for the Admin UI list view (review PR #209 finding 2).
+ * Deliberately EXCLUDES the large JSONB columns (procedure, input_schema,
+ * output_schema, constraints, success_criteria, failure_modes, runtime_hints,
+ * allowed_tools, policy_descriptors) — the list path only needs the table
+ * columns; the full contract is fetched per-row via getById. Keeps the list
+ * response bounded in size regardless of how big the contracts are.
+ */
+export type SkillSummary = Pick<
+  SkillRow,
+  | 'id'
+  | 'tenant_id'
+  | 'agent_id'
+  | 'skill_descriptor'
+  | 'category'
+  | 'execution_mode'
+  | 'version'
+  | 'status'
+  | 'activated_at'
+  | 'created_at'
+>;
+
+/** Column set selected for SkillSummary (no large JSONB). */
+const SUMMARY_COLUMNS = {
+  id: skills.id,
+  tenant_id: skills.tenant_id,
+  agent_id: skills.agent_id,
+  skill_descriptor: skills.skill_descriptor,
+  category: skills.category,
+  execution_mode: skills.execution_mode,
+  version: skills.version,
+  status: skills.status,
+  activated_at: skills.activated_at,
+  created_at: skills.created_at,
+} as const;
+
+/**
+ * Server-enforced cap on the number of rows returned by the summary list
+ * (review PR #209 finding 2). Callers may request fewer but never more; an
+ * out-of-range / missing limit is clamped to this value to keep the unbounded
+ * select from shipping arbitrarily large result sets to the Admin UI.
+ */
+export const SKILLS_LIST_MAX_LIMIT = 200;
+
+/**
+ * Clamp a caller-supplied limit to (1, SKILLS_LIST_MAX_LIMIT]. Missing,
+ * non-positive or oversized limits collapse to the cap so the list path is
+ * always bounded server-side (review PR #209 finding 2).
+ */
+function clampSkillsLimit(limit?: number): number {
+  if (limit === undefined || !Number.isFinite(limit) || limit <= 0) {
+    return SKILLS_LIST_MAX_LIMIT;
+  }
+  return Math.min(Math.floor(limit), SKILLS_LIST_MAX_LIMIT);
+}
+
+/**
+ * Build the exact scope clause for version-history reads (review PR #209
+ * finding 3). Returns null when no extra scoping is needed.
+ *   - undefined → legacy "current agent OR tenant-wide";
+ *   - string    → exactly that agent_id (must equal the context agent, else
+ *     a scope violation — cross-agent reads are rejected);
+ *   - null      → exactly tenant-wide (agent_id IS NULL).
+ */
+function scopeClauseFor(agentId: string | null | undefined, ctxAgent: string): SQL {
+  if (agentId === undefined) {
+    return or(eq(skills.agent_id, ctxAgent), sql`agent_id IS NULL`)!;
+  }
+  if (agentId === null) {
+    return sql`agent_id IS NULL`;
+  }
+  if (agentId !== ctxAgent) {
+    throw new Error(
+      `agent_scope_violation: input agent ${agentId} vs context ${ctxAgent}`,
+    );
+  }
+  return eq(skills.agent_id, agentId);
+}
 
 export interface SkillsRepo {
   /** Lookup hot path por descriptor + status='active'. Tenant-scoped. */
@@ -40,8 +119,22 @@ export interface SkillsRepo {
    * filtradas por status. Tenant + agent-scoped (current agent OR tenant-wide),
    * mesma regra de visibilidade que listVersions/getById (review #99 finding 1).
    * Mais recente primeiro (status, descriptor, version desc).
+   *
+   * Review PR #209 finding 2: retorna rows COMPLETAS (com JSONB grande) e é o
+   * caminho legado para callers que precisam do contrato inteiro. O Admin UI
+   * usa listSummaries (projeção leve + cap). O `limit` é opcional e é clampado
+   * a SKILLS_LIST_MAX_LIMIT no servidor.
    */
-  listAll(status?: string): Promise<SkillRow[]>;
+  listAll(status?: string, limit?: number): Promise<SkillRow[]>;
+
+  /**
+   * Projeção SUMMARY para a list view do Admin UI (review PR #209 finding 2):
+   * apenas colunas de tabela, SEM os JSONB grandes (procedure/schemas/etc.).
+   * Tenant + agent-scoped igual a listAll. `limit` é clampado a
+   * SKILLS_LIST_MAX_LIMIT (default = cap). O contrato completo continua atrás
+   * de getById.
+   */
+  listSummaries(status?: string, limit?: number): Promise<SkillSummary[]>;
 
   /** Cria uma nova versão em status='proposed' (jamais 'active'). */
   propose(input: ProposeInput): Promise<SkillRow>;
@@ -68,8 +161,18 @@ export interface SkillsRepo {
   /** Lookup por descriptor + version (tenant-scoped). Sem version, retorna a mais recente. */
   getByDescriptor(descriptor: string, version?: number): Promise<SkillRow | null>;
 
-  /** Lista todas as versões de um descriptor, mais recente primeiro. */
-  listVersions(descriptor: string): Promise<SkillRow[]>;
+  /**
+   * Lista todas as versões de um descriptor, mais recente primeiro.
+   *
+   * Review PR #209 finding 3 (scope-exact version history): o histórico DEVE
+   * ser exato por escopo. `agentId` é opcional para retrocompat:
+   *   - undefined → comportamento legado (agent atual OU tenant-wide);
+   *   - string    → SOMENTE aquele agent_id (deve ser o agent do contexto);
+   *   - null      → SOMENTE tenant-wide (agent_id IS NULL).
+   * Assim uma skill agent-scoped e uma tenant-wide com o mesmo descriptor não
+   * se misturam no histórico de versões.
+   */
+  listVersions(descriptor: string, agentId?: string | null): Promise<SkillRow[]>;
 }
 
 export const skillsRepo: SkillsRepo = {
@@ -132,7 +235,7 @@ export const skillsRepo: SkillsRepo = {
       );
   },
 
-  async listAll(status): Promise<SkillRow[]> {
+  async listAll(status, limit): Promise<SkillRow[]> {
     const tenant_id = getCurrentTenant();
     const ctxAgent = getCurrentAgent();
     const filters = [
@@ -144,11 +247,36 @@ export const skillsRepo: SkillsRepo = {
     if (status !== undefined) {
       filters.push(eq(skills.status, status));
     }
+    // Review PR #209 finding 2: bound the result set even on the full-row
+    // path. Clamp to the server cap so no caller can request an unbounded
+    // select of the large JSONB columns.
     return db
       .select()
       .from(skills)
       .where(and(...filters))
-      .orderBy(skills.skill_descriptor, desc(skills.version));
+      .orderBy(skills.skill_descriptor, desc(skills.version))
+      .limit(clampSkillsLimit(limit));
+  },
+
+  async listSummaries(status, limit): Promise<SkillSummary[]> {
+    const tenant_id = getCurrentTenant();
+    const ctxAgent = getCurrentAgent();
+    const filters = [
+      eq(skills.tenant_id, tenant_id),
+      // Same visibility rule as listAll (review #99 finding 1).
+      or(eq(skills.agent_id, ctxAgent), sql`agent_id IS NULL`),
+    ];
+    if (status !== undefined) {
+      filters.push(eq(skills.status, status));
+    }
+    // Summary projection (review PR #209 finding 2): only the table columns,
+    // never the big JSONB contract fields, capped at SKILLS_LIST_MAX_LIMIT.
+    return db
+      .select(SUMMARY_COLUMNS)
+      .from(skills)
+      .where(and(...filters))
+      .orderBy(skills.skill_descriptor, desc(skills.version))
+      .limit(clampSkillsLimit(limit));
   },
 
   async propose(input): Promise<SkillRow> {
@@ -436,9 +564,14 @@ export const skillsRepo: SkillsRepo = {
     return rows[0] ?? null;
   },
 
-  async listVersions(descriptor): Promise<SkillRow[]> {
+  async listVersions(descriptor, agentId): Promise<SkillRow[]> {
     const tenant_id = getCurrentTenant();
     const ctxAgent = getCurrentAgent();
+    // Review PR #209 finding 3: scope-exact version history. When agentId is
+    // provided we match ONLY that scope (an explicit null means tenant-wide
+    // only) so an agent-scoped skill and a tenant-wide one that share a
+    // descriptor never bleed into each other's version list. undefined keeps
+    // the legacy (current agent OR tenant-wide) behaviour for old callers.
     return db
       .select()
       .from(skills)
@@ -446,7 +579,7 @@ export const skillsRepo: SkillsRepo = {
         and(
           eq(skills.tenant_id, tenant_id),
           eq(skills.skill_descriptor, descriptor),
-          or(eq(skills.agent_id, ctxAgent), sql`agent_id IS NULL`),
+          scopeClauseFor(agentId, ctxAgent),
         ),
       )
       .orderBy(desc(skills.version));
