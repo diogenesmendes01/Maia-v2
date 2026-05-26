@@ -1,143 +1,134 @@
-# Spec — F1: Decision-Engine-driven Skill Execution
+# Spec — F1: Decision-Engine-driven Skill Execution (v2)
 
-Status: **draft / proposed** · Surface: backend runtime (`maia-app`) · Risk: **HIGH** (modifies the live agent hot path + the Decision Engine's routing). Read with the investigation report in mind.
+Status: **draft / proposed** · v2 incorporates the Codex review of v1 (#214). Surface: backend runtime (`maia-app`). Risk: **HIGH** (live agent hot path + Decision Engine routing).
 
-Goal: make the live agent turn actually **execute a selected skill via `runSkill`**, using the Decision Engine to select it — the "official" architecture — WITHOUT breaking normal free-form conversation.
-
----
-
-## 0. The crux (read first)
-
-Today, with `FEATURE_DECISION_ENGINE_V1` ON:
-- The engine pipeline runs `SkillSelector` → `ActionDecider`.
-- `action-decider.ts:94-108`: if **no skill is selected** (`!selected_skill_id`) → `action_mode='ask_clarification'` → `core.ts:850-859` sends the canned *"Pode me dar mais detalhes?"* and **skips the LLM**.
-- Result: every free-form turn that doesn't map to an active skill stops answering normally. **This is the incident.**
-
-Also: the engine path **never calls `runSkill`** — `action_mode='call_tool'` (for `category ∈ {tool_mediated, decide}`) only constrains the ReAct tool set; `action_mode='respond'` only feeds the skill in as prompt context. So "the engine uses skills" today means *metadata-shaping*, not *execution*.
-
-**Therefore F1 = three changes, in this order of importance:**
-1. **Coexistence fix** — `ActionDecider`: no-skill ⇒ `respond` (normal LLM turn), not `ask_clarification`. (Without this, the engine breaks free-form chat the moment it's on.)
-2. **Execution wiring** — a real path that turns a selected skill into a `runSkill(...)` call and routes its output to the user.
-3. **The plumbing** — id→descriptor mapping, input building, output→reply, and (for `tool_mediated` execution) the tool-dispatcher/`ModeContext` bridge.
+Goal: make the live agent turn **execute a selected skill via `runSkill`**, using the Decision Engine to select it, WITHOUT (a) breaking free-form chat, (b) hijacking unrelated turns, (c) executing the wrong skill, (d) double-acting on side effects, or (e) regressing outbound safety.
 
 ---
 
-## 1. Scope & contracts (verified)
+## 0. The crux — F1 is SIX design requirements, not one
 
-- `DecisionPacket.routing` (`context-packet/types.ts:134-139`) exposes `selected_skill_id?` + `candidate_skill_ids` — **id only, no descriptor**. `runSkill` keys off `skill_descriptor` (`skills/types.ts:27`) → a translation is required.
-- `runSkill(input: SkillExecutionInput)` (`skills/types.ts:26-49`): `{ skill_descriptor, input, conversa_id?, turno_id?, triggered_by, agent_id?, signal? }`; runs inside `runWithTenantContext`; Gate 1 = `FEATURE_SKILL_REGISTRY_V1`.
-- `SkillExecutionOutput` (`skills/types.ts:73-81`): `{ ok, output?: Record<string,unknown>, reason?, message?, latency_ms, ... }` — **structured output, not user text**. The call site must turn `output` into a reply.
-- `execution_mode` (how `runSkill` runs: prompt_only/procedure_adapter/tool_mediated/evaluator) is **distinct** from `category` (what the action-decider routes on: classify/extract/compose/decide/tool_mediated/diagnose/plan/evaluator). We exploit this: a skill can have `category='decide'` (→ engine emits `call_tool`) AND `execution_mode='prompt_only'` (→ `runSkill` needs no tool dispatcher). **Phase 1 uses exactly that combo to avoid the bridge.**
+The Codex review of v1 confirmed F1 is bigger than "wire a call site." All of these must hold:
 
----
-
-## 2. Change 1 — ActionDecider coexistence fix (the unblocker)
-
-File: `src/runtime/decision/action-decider.ts:94-108`.
-
-- Restructure rule 3 so **`!selected_skill_id` ⇒ `respond`** with `skill: null` context (the normal free-form turn; `buildContextRequirements` already accepts `skill: null`, see line 84). 
-- Keep `ask_clarification` ONLY for a deliberately narrow case — recommend: **remove the low-intent-confidence auto-clarify for v1** (it also degrades free-form chat), or gate it behind an explicit "clarify-eligible intent" signal. Default v1: no-skill and/or low-confidence ⇒ `respond`. `ask_clarification` reserved for future explicit use.
-- Net effect: the engine, when on, is **transparent** for turns with no matching skill — it behaves like today's legacy path (normal LLM/ReAct), and only diverges when a skill IS selected.
-- Tests: engine ON + no active skill ⇒ `respond` (LLM answers normally), NOT `ask_clarification`. This is the regression guard against the incident.
+1. **Coexistence** — `ActionDecider`: no skill selected ⇒ `respond` (normal LLM), NOT `ask_clarification`. (Else the engine breaks free-form chat = the incident.)
+2. **Selector intent-matching** — the prod `SkillSelector` must actually match the message to a skill (`when_to_use` + threshold). Today it ranks ALL active skills by category/priority and returns one regardless of intent — so with any active skill, EVERY turn gets a `selected_skill_id` and the coexistence fix doesn't protect chat (a skill IS selected — the wrong one). **This is a hard prerequisite.**
+3. **Immutable identity** — carry `selected_skill_id` + `version` + routed `agent_id` (not just descriptor) end-to-end, and assert the active row still matches before executing. (Else an activate/rollback race or routed-agent mismatch executes a *different* skill than the engine evaluated.)
+4. **Execution-mode gating** — Phase 1 executes ONLY `execution_mode ∈ {prompt_only, evaluator}` (terminal, no side effects). Gate by `execution_mode`, NOT `category` (they're independent — a `decide`-category skill can be `tool_mediated`/`procedure_adapter` and start state). Fall-through to ReAct is allowed ONLY for pre-side-effect failures.
+5. **Output safety** — route skill replies through `dispatchOutput` (view-once for sensitive, audit, pending-question, media handling), NEVER raw `sendOutbound`.
+6. **Terminal-path invariants** — the skill-terminal branch must `conversasRepo.touch(c.id)` + `markAllProcessed` + `clearDebounceState`, like every other terminal path.
 
 ---
 
-## 3. Change 2 — Skill execution wiring
+## 1. Contracts (verified + corrected)
 
-### 3.1 Routing: a dedicated `execute_skill` action
-- Add `action_mode='execute_skill'` (new `ActionMode`) emitted by `ActionDecider` when a skill is selected AND we intend to run it via the SkillRunner (rather than merely shape the prompt).
-- v1 policy: emit `execute_skill` for selected skills whose `category ∈ {tool_mediated, decide}` (the same set that today maps to `call_tool`). For other categories keep `respond` (skill as context). Carry the resolved `selected_skill_descriptor` on the packet (see 3.2).
-- Rationale for a new mode (vs overloading `call_tool`): keeps "constrain the ReAct tool set" (`call_tool`) distinct from "run the SkillRunner" (`execute_skill`); avoids ambiguity in `core.ts`.
-
-### 3.2 id→descriptor on the packet
-- Extend `DecisionPacket.routing` with `selected_skill_descriptor?: string`, populated by the engine from the `SkillSelector`'s already-resolved `selected_skill` object (no extra DB hit). `core.ts` reads the descriptor directly (no id→descriptor refetch).
-
-### 3.3 The call site (`core.ts`, in the engine result block ~803-885)
-- After `runDecisionEngineForTurn`, add a branch: `if (action_mode === 'execute_skill' && routing.selected_skill_descriptor)`:
-  1. Build `SkillExecutionInput`: `{ skill_descriptor, input: buildSkillInput(inbound, scope, conversa), conversa_id: c.id, turno_id, triggered_by: 'user_message', signal }`.
-  2. `const result = await runSkill(input)` (already inside `runWithTenantContext`).
-  3. **On `result.ok`** → route output to reply (3.4) → `markAllProcessed` → `clearDebounceState` → `return` (skip the normal LLM/ReAct turn).
-  4. **On `!result.ok`** → **fall through to the normal LLM/ReAct turn** (do NOT fail-closed). Log `skill.execution_failed{reason}`. This is critical: a skill failure must degrade to a normal answer, never a dead turn.
-- For `respond` / `call_tool` / `continue_workflow` → unchanged (existing behavior; `call_tool` keeps applying `blocked_tools`, and — optional Phase 2 — start honoring `allowed_tools`).
-
-### 3.4 Output → reply (`buildSkillReply`)
-- Convention: skills used on this path declare an `output_schema` with a user-facing text field — recommend `output.reply: string`. The call site sends `result.output.reply` via `sendOutbound(...)`.
-- If `output.reply` is absent (structured-only skill), v1 fallback: do NOT invent text — fall through to the normal LLM turn (treat as non-terminal). (Phase 2 may feed `output` back into the LLM to phrase a reply.)
-
-### 3.5 Input building (`buildSkillInput`)
-- v1: `{ message: <aggregated inbound text>, pessoa_id, conversa_id }`. Skills validate via their `input_schema` (Gate 3; empty schema = permissive). Keep minimal; richer context is a later iteration.
+- `DecisionPacket.routing` (`context-packet/types.ts:134-139`): `selected_skill_id?` + `candidate_skill_ids` — **id only**.
+- The DE `Skill` type (`runtime/decision/types.ts`) + its prod adapter (`prod-env.ts`) keep only the DB `id` and **discard `skill_descriptor`/`version`** → v1's "carry the descriptor from `selected_skill`, no DB hit" is **impossible as written** (Codex P2). Fix: extend the DE `Skill` type + adapter mapping to include `skill_descriptor`, `version`, `agent_id`; thread them onto `DecisionPacket.routing` (`selected_skill_id`, `selected_skill_descriptor`, `selected_skill_version`).
+- `runSkill(input: SkillExecutionInput)` (`skills/types.ts:26-49`) resolves the active skill **by descriptor under the current-context agent** → race risk (Codex HIGH-1). Fix: the call site (or a new `runSkillPinned`) must verify the freshly-resolved active row's `id` + `version` equal the packet's pinned values BEFORE execution; mismatch ⇒ treat as `skill_not_found` (safe fall-through), never execute a divergent row.
+- `SkillExecutionOutput` (`skills/types.ts:73-81`): `{ ok, output?, reason?, message?, ... }` — structured, no sensitivity/dispatch metadata. The reply path must adapt it to `dispatchOutput`'s contract (see §4.4).
+- `execution_mode` (prompt_only/procedure_adapter/tool_mediated/evaluator) is distinct from `category`. Phase 1 gates on `execution_mode`.
 
 ---
 
-## 4. Change 3 — the tool-dispatcher bridge (DEFERRED to Phase 2)
+## 2. Change 1 — ActionDecider coexistence (the unblocker)
 
-`tool_mediated` `execution_mode` needs `setToolDispatcher(...)` (never called in prod) AND a `ToolContext { pessoa, scope, conversa, mensagem_id }` that `ModeContext` lacks. Phase 1 avoids this entirely by using `execution_mode='prompt_only'` (or `evaluator`). Phase 2 wiring:
-- Plumb the turn's `ToolContext` into `runSkill` (extend `SkillExecutionInput` with an optional `toolContext`, threaded to `ModeContext`).
-- Implement + `setToolDispatcher` an adapter mapping the skill `ToolDispatcher (name,args,{signal,idempotency_key})` → `dispatchTool({tool,args,ctx})` using that `ToolContext`.
-- Re-assert `allowed_tools` (already enforced inside `tool-mediated.ts`).
+`src/runtime/decision/action-decider.ts:94-108`: restructure so **`!selected_skill_id` ⇒ `respond`** (`skill: null` context; `buildContextRequirements` accepts null). Remove the low-intent-confidence auto-`ask_clarification` for v1 (it also degrades free-form). `ask_clarification` reserved for explicit future use. Test: engine ON + no selected skill ⇒ `respond` (LLM answers), not `ask_clarification`.
 
 ---
 
-## 5. Flags, activation order, rollout
+## 3. Change 2 — SkillSelector intent matching (HARD PREREQUISITE, Codex P1)
 
-1. **Seed ≥1 `active` skill** (status MUST be `active`, not `proposed`) under tenant `default` (or the routed agent), `execution_mode='prompt_only'`, `category='decide'`, **empty `policy_descriptors`** (avoid Gate-4 fail-close), `output_schema` with `reply`.
-2. **`FEATURE_SKILL_REGISTRY_V1=true`** (maia-app) — Gate 1.
-3. **`FEATURE_DECISION_ENGINE_V1=true`** — only AFTER Change 1 (coexistence) is merged + deployed, and ≥1 active skill exists. Set **`FEATURE_DECISION_ENGINE_ERROR_FALLBACK='legacy'`** during rollout so engine errors degrade to the normal turn instead of "Sistema indisponível".
-4. **`FEATURE_POLICY_RESOLVER_V1=true`** only before any skill declares `policy_descriptors`.
-5. Kill switch: `FEATURE_DECISION_ENGINE_V1_KILL_SWITCH=true` disables the engine instantly (no redeploy).
-6. **Per-tenant canary is NOT wired** in the hot path (`integration.ts:195` reads the global flag; `decision-engine-flag.ts:42-52` override repo is a TODO). So enabling the engine is **global**. Mitigate by validating on a staging instance / synthetic turns first.
+`src/runtime/decision/skill-selector.ts` + the prod adapter currently rank active skills by category/priority with **no intent/`when_to_use` evaluation**. Fix: a skill is selected ONLY when the message matches its `when_to_use` above a confidence threshold (deterministic match and/or a cheap classifier). When nothing matches ⇒ no `selected_skill_id` ⇒ Change 1 makes it a normal `respond`.
+
+**Until this lands, Phase 1 MUST be isolated to a synthetic/canary tenant** — enabling the engine with an active skill in a real tenant would route every turn into that skill. This is the single most dangerous rollout footgun.
 
 ---
 
-## 6. The 3 fail-close vectors (and how this spec neutralizes them)
+## 4. Change 3 — Skill execution wiring (corrected)
 
-| Vector | Mechanism | Mitigation in this spec |
-|---|---|---|
-| **no-skill ⇒ ask_clarification** | `action-decider.ts:96` | Change 1 (no-skill ⇒ respond). The core fix. |
-| **budget fallback** | 400ms budget; Haiku intent `callLLM` slow ⇒ `ask_clarification`/`escalate` (`decision-engine.ts:388-415`) | `ERROR_FALLBACK='legacy'` during rollout; monitor `decision_engine.budget_fallback`; consider raising the budget. With Change 1, the fallback's `ask_clarification` is also less harmful, but legacy-degrade is safest. |
-| **non-UUID channel_id** | `'default'` vs `uuid` column | Already guarded (`prod-env.ts:507-513`, PR #207). Confirm the guard stays. |
+### 4.1 Routing — `execute_skill`, gated by execution_mode
+- New `action_mode='execute_skill'`, emitted by `ActionDecider` ONLY when a skill is selected (post-match, §3) AND `skill.execution_mode ∈ {prompt_only, evaluator}`. Other execution_modes ⇒ `respond` (skill as context; not executed in Phase 1). Carry `selected_skill_id` + `selected_skill_version` + `selected_skill_descriptor` on the packet.
 
----
+### 4.2 Call site (`src/agent/core.ts`, engine result block ~803-885)
+On `action_mode==='execute_skill'`:
+1. **Assert identity**: re-resolve active by descriptor (under routed agent); if its `id`/`version` ≠ packet's pinned values ⇒ skip execution, fall through to normal turn (log `skill.identity_mismatch`).
+2. `runSkill({ skill_descriptor, input: buildSkillInput(...), conversa_id, turno_id, triggered_by:'user_message', agent_id: routedAgent, signal })`.
+3. **On `result.ok`** ⇒ `dispatchOutput(buildSkillReply(result), ...)` (§4.4) ⇒ `conversasRepo.touch(c.id)` ⇒ `markAllProcessed` ⇒ `clearDebounceState` ⇒ `return`.
+4. **On `!result.ok`** ⇒ fall through to the normal LLM/ReAct turn ONLY when `reason ∈ {flag_off, skill_not_found, unresolved_policy, policy_blocked, hard_limit_block, invalid_input, invalid_output, agent_scope_violation}` (all pre-output, and — for prompt_only/evaluator — pre-side-effect). For any other/ambiguous reason, send a safe generic reply rather than risk a double-action. (prompt_only/evaluator have no side effects, so this is safe by construction; the restriction matters once Phase 2 adds side-effecting modes.)
 
-## 7. Testing (without breaking live Maia)
+### 4.3 Input (`buildSkillInput`)
+v1: `{ message: <aggregated inbound text>, pessoa_id, conversa_id }`; validated by the skill's `input_schema` (Gate 3).
 
-- **Unit (ActionDecider):** no-skill ⇒ `respond`; selected `decide`/`tool_mediated` skill ⇒ `execute_skill` with descriptor on the packet.
-- **Unit (core call site):** mock `runSkill`; `execute_skill` + ok ⇒ `sendOutbound(output.reply)` + turn ends; `!ok` ⇒ falls through to the normal turn (assert ReAct still runs).
-- **Integration:** engine ON + 0 active skills ⇒ a normal question gets a normal LLM answer (the incident regression guard). engine ON + 1 active prompt_only skill whose `when_to_use` matches ⇒ `runSkill` executes + its `reply` is sent.
-- **Full suite** (`npx vitest run`) must stay green (the #209 lesson).
-- **Manual:** staging/synthetic turns first; flip the kill switch as the abort.
-
----
-
-## 8. Delivery phases (each = its own PR)
-
-- **Phase 0 — Coexistence:** Change 1 (ActionDecider no-skill ⇒ respond) + the regression test. Deploy. Then it's safe to turn the engine on without breaking chat. (Engine still doesn't execute skills — but stops being a footgun.)
-- **Phase 1 — prompt_only execution:** `execute_skill` mode + `selected_skill_descriptor` on the packet + the `core.ts` call site + `buildSkillInput`/`buildSkillReply` + seed one `prompt_only`/`decide` active skill. Engine on (global, with legacy fallback). End-to-end: a matching message runs a skill.
-- **Phase 2 — tool_mediated execution:** the dispatcher bridge (§4) + `allowed_tools` enforcement on the hot path.
-- **Phase 3 (optional):** richer input/output (feed structured output back to the LLM), per-tenant canary for the engine flag, multi-channel agent scoping.
+### 4.4 Output via `dispatchOutput` (Codex HIGH-3)
+- `buildSkillReply(result)` maps `result.output` to `dispatchOutput`'s input. Convention: `output.reply: string` is the user text. Crucially, route through `dispatchOutput` (NOT `sendOutbound`) so view-once/sensitive handling, outbound audit, pending-question metadata and media paths are preserved.
+- Sensitivity: a skill flagged sensitive (or producing balance-like output) must carry that through so `dispatchOutput` applies view-once. If `output.reply` is absent ⇒ do NOT fabricate text; fall through to the normal turn.
 
 ---
 
-## 9. Risks
-- Touches the live hot path of every WhatsApp message + the Decision Engine — the highest-blast-radius area in the system.
-- The engine adds a Haiku `callLLM` (intent) to every turn (latency + cost) once on.
-- Global engine flag (no canary) until the override repo is built.
-- A wrong `ActionDecider` change re-introduces the incident — Phase 0's regression test is the guard; the kill switch is the abort.
+## 5. Change 4 — tool-dispatcher bridge (Phase 2 — tool_mediated)
+Deferred. `tool_mediated` needs `setToolDispatcher` (never wired) + a `ToolContext{pessoa,scope,conversa,mensagem_id}` threaded into `ModeContext`, plus a `side_effects_started`/terminality contract so failures can't double-act. Phase 1 excludes it via §4.1's execution_mode gate.
 
-## 10. Acceptance criteria
-- [ ] Engine ON + no matching skill ⇒ normal LLM answer (no "Pode me dar mais detalhes" loop).
-- [ ] A seeded `active` `prompt_only` skill executes via `runSkill` on a matching turn; its `reply` reaches the user.
-- [ ] A skill failure (`!ok`) degrades to a normal turn, never a dead/"indisponível" turn.
-- [ ] Kill switch instantly reverts to legacy behavior.
-- [ ] Full unit suite green.
+---
+
+## 6. Flags + activation order
+1. Land **Change 1 (coexistence)** + **Change 2 (selector matching)** first. Until both ship, do NOT enable the engine with active skills in a real tenant.
+2. Seed ≥1 `active` skill: `execution_mode='prompt_only'`, a real `when_to_use`, empty `policy_descriptors`, `output_schema` with `reply`. (Initially in a **canary tenant**.)
+3. `FEATURE_SKILL_REGISTRY_V1=true`.
+4. `FEATURE_DECISION_ENGINE_V1=true` + `FEATURE_DECISION_ENGINE_ERROR_FALLBACK='legacy'` (engine errors degrade to normal turn).
+5. `FEATURE_POLICY_RESOLVER_V1=true` only before any skill declares `policy_descriptors`.
+6. Kill switch `FEATURE_DECISION_ENGINE_V1_KILL_SWITCH=true` = instant abort. NOTE: engine flag is **global** (per-tenant canary not wired, `integration.ts:195`) — rely on synthetic-tenant validation + the kill switch.
+
+---
+
+## 7. Fail-close / safety vectors
+| Vector | Mitigation |
+|---|---|
+| no-skill ⇒ ask_clarification | Change 1 |
+| **selector hijacks every turn** | Change 2 (intent match) + canary isolation |
+| **wrong-skill race** | §1/§4.2 immutable id+version assert |
+| **side-effect double-action** | §4.1 execution_mode gate + §4.2 safe-fallthrough reasons |
+| **sensitive leak / missing audit** | §4.4 dispatchOutput |
+| budget fallback ⇒ ask_clarification | `ERROR_FALLBACK='legacy'`; monitor `decision_engine.budget_fallback` |
+| non-UUID channel_id | already guarded (`prod-env.ts:507-513`) |
+
+---
+
+## 8. Testing
+- ActionDecider: no-skill ⇒ respond; matched prompt_only/evaluator skill ⇒ execute_skill w/ id+version+descriptor on packet; side-effecting execution_mode ⇒ NOT execute_skill.
+- SkillSelector: non-matching message ⇒ no selection; matching ⇒ selection. (Regression against hijack.)
+- Call site: identity mismatch ⇒ fall through (no execution); ok ⇒ dispatchOutput + touch + return; !ok pre-side-effect ⇒ fall through.
+- Output: sensitive skill output ⇒ view-once applied via dispatchOutput; outbound audit present.
+- Full `npx vitest run` green (the #209 lesson).
+- Manual: synthetic tenant first; kill switch as abort.
+
+---
+
+## 9. Phases
+- **Phase 0 — Safe-to-enable:** Change 1 (coexistence) + Change 2 (selector intent matching) + regression tests. After this, the engine can be on without breaking or hijacking chat (still no skill execution).
+- **Phase 1 — prompt_only/evaluator execution:** Change 3 (execute_skill gated by execution_mode + immutable identity + dispatchOutput + touch) + seed a matching prompt_only skill in a canary tenant. End-to-end: a matching message runs a skill safely.
+- **Phase 2 — tool_mediated:** the dispatcher bridge + side-effect/terminality contract.
+
+---
+
+## 10. Risks
+Highest blast radius in the system (every WhatsApp turn + the engine). Adds a Haiku intent `callLLM`/turn once on. Global engine flag (no per-tenant canary). A wrong ActionDecider/selector change re-introduces the incident or hijacks chat — Phase 0 tests + kill switch are the guards.
+
+## 11. Acceptance criteria
+- [ ] Engine ON + non-matching message ⇒ normal LLM answer (no clarification loop, no skill hijack).
+- [ ] A matched `active` prompt_only skill executes via `runSkill`; reply delivered through `dispatchOutput` (audit + sensitivity preserved); conversa touched.
+- [ ] Activate/rollback race cannot execute a divergent skill (id+version assert).
+- [ ] No side-effecting execution_mode runs in Phase 1.
+- [ ] Skill failure degrades to a normal turn (no dead/"indisponível"/duplicate-action turn).
+- [ ] Kill switch reverts instantly. Full unit suite green.
 
 ## Appendix — files
 | Concern | File |
 |---|---|
-| ActionDecider fix + `execute_skill` | `src/runtime/decision/action-decider.ts` |
-| `ActionMode` + packet `selected_skill_descriptor` | `src/runtime/context-packet/types.ts` |
-| Engine populates descriptor | `src/runtime/decision/decision-engine.ts` (skill step) |
-| Call site + buildSkillInput/Reply | `src/agent/core.ts` (~803-918) |
+| Coexistence + execute_skill + execution_mode gate | `src/runtime/decision/action-decider.ts` |
+| Selector intent matching | `src/runtime/decision/skill-selector.ts` (+ prod adapter `prod-env.ts`) |
+| DE `Skill` type carries id+version+descriptor | `src/runtime/decision/types.ts` + `prod-env.ts` adapter |
+| `ActionMode` + packet pinned identity | `src/runtime/context-packet/types.ts` |
+| Call site + identity assert + buildSkillInput/Reply + dispatchOutput + touch | `src/agent/core.ts` (~803-918) |
+| Output pipeline (reuse) | `dispatchOutput` (agent/react-loop.ts / output dispatch) |
 | SkillRunner (unchanged) | `src/skills/skill-runner.ts`, `src/skills/modes/*` |
-| Dispatcher bridge (Phase 2) | `src/skills/modes/tool-mediated.ts` (`setToolDispatcher`), `src/tools/_dispatcher.ts` |
-| Flags | `src/config/env.ts`, `src/config/feature-flags.ts`, `src/runtime/decision/integration.ts` |
+| Dispatcher bridge (Phase 2) | `src/skills/modes/tool-mediated.ts`, `src/tools/_dispatcher.ts` |
+| Flags | `src/config/env.ts`, `feature-flags.ts`, `runtime/decision/integration.ts` |
