@@ -563,11 +563,18 @@ export const skillsRepo: SkillsRepo = {
     const tenant_id = getCurrentTenant();
     const ctxAgent = getCurrentAgent();
     return withTx(async (tx) => {
+      // Round-2 review FIX A: close the activation TOCTOU race. Take a row
+      // lock (SELECT ... FOR UPDATE) on the target FIRST, before any check or
+      // write. A concurrent `deprecate` (which also locks/updates this same
+      // row) then BLOCKS until this tx commits, serializing the two; combined
+      // with the status-conditioned write below it guarantees exactly one of
+      // {activate, concurrent deprecate} wins — the loser sees the row already
+      // moved and fails its own status-conditioned guard.
       const targetRows = await tx
         .select()
         .from(skills)
         .where(and(eq(skills.tenant_id, tenant_id), eq(skills.id, id)))
-        .limit(1);
+        .for('update');
       const target = targetRows[0];
       if (!target) throw new Error('skill_not_found');
       const beforeStatus = target.status;
@@ -586,6 +593,9 @@ export const skillsRepo: SkillsRepo = {
           `agent_scope_violation: target agent ${target.agent_id} vs context ${ctxAgent}`,
         );
       }
+      // Fast-fail on the locked read so a clearly non-proposed target short
+      // circuits before the deprecate step. The status-conditioned UPDATE
+      // below is the AUTHORITATIVE guard — this check is an early-out only.
       if (target.status !== 'proposed') {
         throw new Error(`cannot_activate_from_${target.status}`);
       }
@@ -606,6 +616,14 @@ export const skillsRepo: SkillsRepo = {
         );
 
       const now = new Date();
+      // Status-conditioned activation (FIX A): only flip a row that is STILL
+      // 'proposed' at write time. If a concurrent deprecate (or any other
+      // transition) moved it out of 'proposed' after our read — including the
+      // TOCTOU window between the lock release and a serialized writer — this
+      // UPDATE matches 0 rows and we throw `cannot_activate_from_<status>`
+      // instead of blindly resurrecting a deprecated/rolled_back row via an
+      // unconditioned `WHERE id = ?`. Mirrors deprecate/rollback's guarded
+      // UPDATE + RETURNING pattern.
       const [updated] = await tx
         .update(skills)
         .set({
@@ -619,12 +637,30 @@ export const skillsRepo: SkillsRepo = {
             ? `${target.proposed_reason ?? ''}${target.proposed_reason ? ' | ' : ''}approved: ${reason}`
             : target.proposed_reason,
         })
-        .where(eq(skills.id, id))
+        .where(
+          and(
+            eq(skills.tenant_id, tenant_id),
+            eq(skills.id, id),
+            eq(skills.status, 'proposed'),
+          ),
+        )
         .returning();
+      if (!updated) {
+        // Re-read the current status for an accurate conflict message (the row
+        // raced out of 'proposed' under us). Stays inside the tx; the failure
+        // rolls the prior-active deprecation back too.
+        const currentRows = await tx
+          .select()
+          .from(skills)
+          .where(and(eq(skills.tenant_id, tenant_id), eq(skills.id, id)))
+          .limit(1);
+        const current = currentRows[0];
+        throw new Error(`cannot_activate_from_${current?.status ?? 'unknown'}`);
+      }
       // PR #213: audit in the SAME tx — a failed audit insert rolls the
       // activation (and the prior-active deprecation) back.
-      if (audit) await appendSkillAudit(tx, audit, updated!, beforeStatus);
-      return updated!;
+      if (audit) await appendSkillAudit(tx, audit, updated, beforeStatus);
+      return updated;
     });
   },
 
@@ -635,12 +671,16 @@ export const skillsRepo: SkillsRepo = {
     // insert commit together. The read-for-scope, the guarded UPDATE, and the
     // audit row are one atomic unit.
     return withTx(async (tx) => {
-      // Read first to enforce agent scope (review #99 finding 1).
+      // Read first to enforce agent scope (review #99 finding 1). Round-2
+      // review FIX A: lock the row (FOR UPDATE) so a concurrent activate on
+      // the SAME target serializes against us — only one of {activate,
+      // deprecate} can hold the lock at a time, and the status-conditioned
+      // UPDATE below makes the loser a no-op (→ typed conflict).
       const existingRows = await tx
         .select()
         .from(skills)
         .where(and(eq(skills.tenant_id, tenant_id), eq(skills.id, id)))
-        .limit(1);
+        .for('update');
       const existing = existingRows[0];
       if (!existing) throw new Error('skill_not_found');
       // Round-2 review #99 finding 1: tenant-wide skills (agent_id=null)
@@ -683,11 +723,14 @@ export const skillsRepo: SkillsRepo = {
     const tenant_id = getCurrentTenant();
     const ctxAgent = getCurrentAgent();
     return withTx(async (tx) => {
+      // Round-2 review FIX A: lock the target (FOR UPDATE) so a concurrent
+      // activate/deprecate on the same row serializes; the status-conditioned
+      // UPDATE below (status='active') then makes the loser a typed conflict.
       const targetRows = await tx
         .select()
         .from(skills)
         .where(and(eq(skills.tenant_id, tenant_id), eq(skills.id, id)))
-        .limit(1);
+        .for('update');
       const target = targetRows[0];
       if (!target) throw new Error('skill_not_found');
       // Agent-scope check (round-2 review #99 finding 1): tenant-wide skills

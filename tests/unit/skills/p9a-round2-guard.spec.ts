@@ -32,6 +32,9 @@ vi.mock('@/db/client.js', () => {
           limit: (n: number) => Promise.resolve(nextSelectRows.slice(0, n)),
         }),
         limit: (n: number) => Promise.resolve(nextSelectRows.slice(0, n)),
+        // `.for('update')` row-lock hint (FIX A). No-op in this fake — resolve
+        // the staged rows just like awaiting the chain would.
+        for: (_mode: string) => Promise.resolve(nextSelectRows.slice()),
       }),
     }),
   });

@@ -50,34 +50,29 @@ import { router, protectedProcedure } from '../server.js';
 import { resolveTenantId } from '../tenant-resolver.js';
 import { runWithTenantContext } from '../../../db/tenant-context.js';
 import { TOOL_CATALOG } from '../../generated/tool-catalog.js';
+import { isToolEnabledByFlag } from '../tool-enablement.js';
 
 /**
- * Server-side set of currently-ENABLED tool names (PR #213 FIX 3).
+ * Server-side set of currently-ENABLED tool names (PR #213 FIX 3; round-2 FIX B).
  *
  * Reuses the SAME side-effect-free building blocks as the Tools Catalog router:
  * the generated `TOOL_CATALOG` (static metadata incl. each tool's gating
- * `feature_flag` NAME) + a `FLAG_TO_CONFIG` map from that flag name to the live
- * `config.FEATURE_*` boolean. A tool is enabled iff it has no gating flag, or
- * its mapped flag is on (an unknown flag conservatively reads as disabled — a
- * generator/router drift bug, surfaced by treating the tool as off). Computed
- * ONCE at module load (config is immutable per process); importing this pulls
- * in ZERO tool handlers / gateway code, identical to tools-catalog.ts.
+ * `feature_flag` NAME) + the SHARED, import-safe `isToolEnabledByFlag` helper.
+ *
+ * Round-2 FIX B: the enabled set is now computed PER CALL (not once at module
+ * load) and resolves each declared `FeatureFlagName` flag through the runtime
+ * `featureFlags.isEnabled()` path — the SAME gate the dispatcher uses — so a
+ * tool disabled by a runtime kill switch / override is rejected by `propose`
+ * even when static `config.FEATURE_*` still has the flag on. (The previous
+ * module-load snapshot read static config, which DIVERGED from dispatch.)
+ * Importing this still pulls in ZERO tool handlers / gateway code — see
+ * `tool-enablement.ts` for the import-safety + cross-container caveat.
  */
-const FLAG_TO_CONFIG: Readonly<Record<string, boolean>> = {
-  FEATURE_SCHEDULING_V2: config.FEATURE_SCHEDULING_V2,
-  FEATURE_PDF_REPORTS: config.FEATURE_PDF_REPORTS,
-  calendar_v2: config.FEATURE_CALENDAR_V2,
-  KNOWLEDGE_STATE_MACHINE_V1: config.FEATURE_KNOWLEDGE_STATE_MACHINE_V1,
-};
-
-function isCatalogToolEnabled(feature_flag: string | null): boolean {
-  if (feature_flag === null) return true;
-  return FLAG_TO_CONFIG[feature_flag] ?? false;
+function enabledToolNames(): ReadonlySet<string> {
+  return new Set(
+    TOOL_CATALOG.filter((t) => isToolEnabledByFlag(t.feature_flag)).map((t) => t.name),
+  );
 }
-
-const ENABLED_TOOL_NAMES: ReadonlySet<string> = new Set(
-  TOOL_CATALOG.filter((t) => isCatalogToolEnabled(t.feature_flag)).map((t) => t.name),
-);
 
 /**
  * Single role gate for ALL skill mutations (spec §2 open-decision 3 — "solo
@@ -374,8 +369,12 @@ export const skillsRouter = router({
       // allowed_tools entry that is not a currently-enabled catalog tool is a
       // BAD_REQUEST (would otherwise persist a reference to a tool the runtime
       // won't expose). Evaluator skills already force empty allowed_tools.
+      // Round-2 FIX B: the enabled set is resolved through the runtime
+      // featureFlags gate (computed per-call), so a tool killed at runtime is
+      // rejected here just as the dispatcher would refuse to run it.
+      const enabledTools = enabledToolNames();
       const offending = input.allowed_tools.filter(
-        (name) => !ENABLED_TOOL_NAMES.has(name),
+        (name) => !enabledTools.has(name),
       );
       if (offending.length > 0) {
         throw new TRPCError({

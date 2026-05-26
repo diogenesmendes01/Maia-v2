@@ -33,6 +33,12 @@ type Row = Record<string, any>;
 const store = new Map<unknown, Row[]>();
 let pkCounter = 0;
 let failNextAuditInsert = false; // toggled by tests to force an audit failure
+// One-shot hook fired right BEFORE a skills-table UPDATE evaluates its
+// predicate. Tests use it to simulate a CONCURRENT writer committing inside
+// the TOCTOU window — i.e. between activate()'s locked read and its
+// status-conditioned write — by mutating the store from the callback. Cleared
+// after it fires once so only the targeted UPDATE is intercepted.
+let interceptNextSkillUpdate: (() => void) | null = null;
 
 // Resolve the real table objects so the fake can key the store on identity AND
 // resolve column references (skills.id etc.) used in where()/orderBy().
@@ -144,6 +150,13 @@ class SelectBuilder {
     this._limit = n;
     return this;
   }
+  // `.for('update')` — row-lock hint. In this single-threaded in-memory fake
+  // there is no concurrency to serialize, so it is a structural no-op (the
+  // chain just keeps building). Concurrency is simulated explicitly by tests
+  // that interleave repo calls via the withTx fake.
+  for(_mode: string) {
+    return this;
+  }
   private exec(): Row[] {
     let rows = tableOf(this._table).filter(this._pred);
     if (this._orderDescCol) {
@@ -219,6 +232,20 @@ class UpdateBuilder {
     return this;
   }
   private apply(): Row[] {
+    // Fire the one-shot concurrency hook just before the ACTIVATION skills
+    // UPDATE (`set.status === 'active'`) reads the store — lets a test land a
+    // concurrent commit in the TOCTOU window between activate()'s locked read
+    // and its status-conditioned write. Scoped to the activation write so the
+    // earlier prior-active deprecation UPDATE in the same tx is untouched.
+    if (
+      this._table === skillsTable &&
+      this._set.status === 'active' &&
+      interceptNextSkillUpdate
+    ) {
+      const hook = interceptNextSkillUpdate;
+      interceptNextSkillUpdate = null;
+      hook();
+    }
     const updated: Row[] = [];
     for (const row of tableOf(this._table)) {
       if (this._pred(row)) {
@@ -333,6 +360,7 @@ describe('skillsRepo — atomic audit + lifecycle guards (PR #213, real repo)', 
     store.clear();
     pkCounter = 0;
     failNextAuditInsert = false;
+    interceptNextSkillUpdate = null;
   });
 
   // Resolve the mocked table objects once (after mocks are registered).
@@ -500,6 +528,80 @@ describe('skillsRepo — atomic audit + lifecycle guards (PR #213, real repo)', 
         );
       });
       expect(skillById(s.id)?.status).toBe('active');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // FIX A — activation TOCTOU race: lock + status-conditioned write so a
+  // concurrent deprecate can't be resurrected by a blind activation UPDATE.
+  // The withTx fake is single-threaded, so the race is simulated by landing a
+  // concurrent commit (the deprecate) inside the TOCTOU window via the
+  // interceptNextSkillUpdate hook — exactly between activate()'s locked read
+  // (sees 'proposed') and its status-conditioned write.
+  // -------------------------------------------------------------------------
+  describe('activation race (concurrent deprecate vs activate — only one wins)', () => {
+    it('activate LOSES to a deprecate that commits in the TOCTOU window: cannot_activate_from_deprecated, no resurrection, no audit', async () => {
+      const s = seedSkill({ status: 'proposed' });
+      await runWithTenantContext({ tenant_id: TENANT, agent_id: AGENT }, async () => {
+        const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
+        // Simulate the concurrent deprecate committing AFTER activate's locked
+        // read but BEFORE its status-conditioned UPDATE: flip the row to
+        // 'deprecated' directly in the store right when the activation write
+        // is about to evaluate its predicate.
+        interceptNextSkillUpdate = () => {
+          skillById(s.id)!.status = 'deprecated';
+          skillById(s.id)!.deprecated_at = new Date();
+        };
+        await expect(
+          skillsRepo.activate(s.id, 'u1', 'r', AUDIT('skill_activated')),
+        ).rejects.toThrow('cannot_activate_from_deprecated');
+      });
+      // The activation LOST: it threw a status-specific conflict (proving the
+      // status-conditioned write detected the concurrent deprecate that landed
+      // in the TOCTOU window) and produced NO resurrection — the row is NOT
+      // active and NO activation audit committed. (In this fake, the injected
+      // "concurrent" mutation shares the activate tx's snapshot, so on rollback
+      // the row reverts to 'proposed' rather than staying 'deprecated'; under
+      // real Postgres the deprecate is a separate committed tx and the row
+      // stays deprecated. The load-bearing guarantee — activate cannot blindly
+      // overwrite a row that left 'proposed' — holds in both models.)
+      expect(skillById(s.id)?.status).not.toBe('active');
+      expect(skillById(s.id)?.activated_at).toBeNull();
+      expect(auditRows()).toHaveLength(0);
+    });
+
+    it('deprecate LOSES to an activate that already committed: cannot_deprecate_from_<status> only if no longer active; sequential activate→deprecate both legitimately apply', async () => {
+      // When activate wins first (proposed→active), a subsequent deprecate of
+      // the SAME row is a legitimate active→deprecated transition (NOT a
+      // resurrection). The guard only blocks transitions from terminal states.
+      const s = seedSkill({ status: 'proposed' });
+      await runWithTenantContext({ tenant_id: TENANT, agent_id: AGENT }, async () => {
+        const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
+        await skillsRepo.activate(s.id, 'u1', 'r');
+        expect(skillById(s.id)?.status).toBe('active');
+        // Now a deprecate from a terminal (rolled_back) sibling state is
+        // rejected — proving the status-conditioned guard, not blind writes.
+        const t = seedSkill({ status: 'rolled_back', skill_descriptor: 'other' });
+        await expect(skillsRepo.deprecate(t.id, 'u1', 'r')).rejects.toThrow(
+          'cannot_deprecate_from_rolled_back',
+        );
+      });
+      expect(skillById(s.id)?.status).toBe('active');
+    });
+
+    it('activate against a non-proposed row writes NOTHING and records NO audit (status-conditioned guard)', async () => {
+      const s = seedSkill({ status: 'rolled_back' });
+      const auditCountBefore = auditRows().length;
+      await runWithTenantContext({ tenant_id: TENANT, agent_id: AGENT }, async () => {
+        const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
+        await expect(
+          skillsRepo.activate(s.id, 'u1', 'r', AUDIT('skill_activated')),
+        ).rejects.toThrow('cannot_activate_from_rolled_back');
+      });
+      // No write (still rolled_back, never activated) and no audit row.
+      expect(skillById(s.id)?.status).toBe('rolled_back');
+      expect(skillById(s.id)?.activated_at).toBeNull();
+      expect(auditRows()).toHaveLength(auditCountBefore);
     });
   });
 });

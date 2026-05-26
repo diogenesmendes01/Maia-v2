@@ -606,22 +606,32 @@ const ACTION_LABEL: Record<LifecycleAction, string> = {
   rollback: 'Rollback',
 };
 
-// Map a TRPCError data.code to an operator-facing message. CONFLICT is the
-// "raced / not in proposed state" case the spec calls out for activate.
+// Map a TRPCError data.code + the SERVER's message to an operator-facing
+// string. `serverMessage` is the TRPCError.message the router sent.
+//
+// Round-2 FIX C: for CONFLICT, surface the SERVER's message verbatim instead
+// of a hardcoded activate-only line. The router's mapRepoError now returns
+// TRANSITION-SPECIFIC conflict copy (activate → "not in the proposed state…";
+// deprecate/rollback → "not in a state that allows this transition…"), so the
+// message already reflects which action raced. Falls back to a generic line if
+// the server somehow sent an empty message.
 function actionErrorMessage(
   code: string | undefined,
-  fallback: string,
+  serverMessage: string,
 ): string {
   if (code === 'CONFLICT') {
-    return 'Settings changed — this skill is no longer in the proposed state. Refresh and retry.';
+    return (
+      serverMessage.trim() ||
+      'This skill changed status — refresh and retry.'
+    );
   }
   if (code === 'FORBIDDEN') {
-    return `Not permitted: ${fallback}`;
+    return `Not permitted: ${serverMessage}`;
   }
   if (code === 'NOT_FOUND') {
     return 'Skill not found — it may have been removed. Refresh.';
   }
-  return fallback;
+  return serverMessage;
 }
 
 /**
