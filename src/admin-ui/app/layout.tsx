@@ -55,6 +55,9 @@ export default async function RootLayout({ children }: { children: React.ReactNo
                     Knowledge
                   </Link>
                   <span className="opacity-50">|</span>
+                  <Link href="/tools" className="hover:underline">
+                    Tools
+                  </Link>
                   <Link href="/setup/tenants" className="hover:underline">
                     Tenants
                   </Link>

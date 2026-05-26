@@ -1,7 +1,7 @@
 import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { MEDIA_ROOT } from '@/gateway/baileys.js';
+import { MEDIA_ROOT, ensureMediaDirs } from '@/gateway/baileys.js';
 import { fmtBR } from '@/lib/brazilian.js';
 import {
   buildPdfHeader,
@@ -127,6 +127,10 @@ export async function generateExtratoPdf(input: ExtratoInput): Promise<ExtratoRe
   };
 
   const buf = await renderPdfToBuffer(docDefinition);
+  // Defensive: `<MEDIA_ROOT>/tmp` is created at backend boot (startBaileys),
+  // but PDF generation can run before/without it (tests, isolated calls).
+  // Idempotent; replaces the removed module-load mkdir side effect.
+  ensureMediaDirs();
   const path = join(MEDIA_ROOT, 'tmp', `${randomUUID()}.pdf`);
   await writeFile(path, buf);
 
