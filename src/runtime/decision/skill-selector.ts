@@ -73,9 +73,7 @@ export class SkillSelectorImpl implements SkillSelector {
     }
 
     const ranked = [...candidates].sort(rankByCategoryAndPriority);
-    const result: SkillSelectorResult = {
-      candidate_skill_ids: ranked.slice(0, MAX_CANDIDATES).map((s) => s.id),
-    };
+    let candidateIds = ranked.slice(0, MAX_CANDIDATES).map((s) => s.id);
 
     // F1 Phase 0 anti-hijack: commit to a single skill ONLY when one clearly
     // matches the intent. Pick the BEST match (highest score; category/priority
@@ -92,7 +90,20 @@ export class SkillSelectorImpl implements SkillSelector {
       }
     }
 
+    const result: SkillSelectorResult = { candidate_skill_ids: candidateIds };
+
     if (best && bestScore >= SKILL_MATCH_THRESHOLD) {
+      // Invariant (Codex PR #215 review, CORRECTNESS 3): selected_skill_id MUST
+      // appear in the frozen top-N candidate_skill_ids. The best MATCH is chosen
+      // by score, but candidates are the top-N by category×priority — so a skill
+      // that matches the intent best can rank outside the top-N (e.g. a relevant
+      // but low-priority skill). When that happens, prepend it and re-trim to
+      // MAX_CANDIDATES so the selection is always present in the candidate set
+      // and the list stays bounded.
+      if (!candidateIds.includes(best.id)) {
+        candidateIds = [best.id, ...candidateIds].slice(0, MAX_CANDIDATES);
+        result.candidate_skill_ids = candidateIds;
+      }
       result.selected_skill_id = best.id;
       // Codex round-2 findings 2+3: carry the scoped Skill object forward so
       // Mid PEP and ActionDecider use the SAME instance the routed-agent

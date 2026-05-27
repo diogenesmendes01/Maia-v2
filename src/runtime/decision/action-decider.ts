@@ -7,19 +7,27 @@
  *   - continue_workflow     (active procedure in continue mode)
  *   - call_tool             (FOUND + selected skill is tool_mediated / decide)
  *   - respond               (default — incl. no selected skill = free-form chat)
- *   - ask_clarification     (reserved: only reachable when a Mid PEP
- *                            reduce_tool_set empties a selected tool skill —
- *                            never from a normal no-skill turn)
+ *   - ask_clarification     (NOT a normal no-skill outcome — a no-skill turn
+ *                            routes to `respond`, see F1 Phase 0 below. The
+ *                            engine still emits ask_clarification from a few
+ *                            specific paths: this ActionDecider emits it when a
+ *                            selected tool skill can't be resolved
+ *                            (`skill_lookup_failed`) or a Mid PEP
+ *                            `reduce_tool_set` strips every tool from a
+ *                            tool-mediated skill; and DecisionEngine emits it on
+ *                            a non-escalating Mid PEP block and on the
+ *                            non-sensitive budget fallback
+ *                            (decision-engine.ts ~:302 / ~:397).)
  *
  * Spec §9.3 derives context_requirements + evaluation_plan from skill hints.
  *
  * F1 Phase 0 (skill-execution coexistence): the Decision Engine must be SAFE
  * to enable. Two regressions are closed here:
  *   1. A turn with NO selected skill used to fall into `ask_clarification`,
- *      which `core.ts` surfaces as a canned "Pode me dar mais detalhes?" and
- *      skips the LLM — i.e. it broke ALL free-form chat the moment the engine
- *      was switched on. It now routes to `respond` with `skill: null`, a
- *      normal free-form turn.
+ *      which `src/agent/core.ts` surfaces as a canned "Pode me dar mais
+ *      detalhes?" and skips the LLM — i.e. it broke ALL free-form chat the
+ *      moment the engine was switched on. It now routes to `respond` with
+ *      `skill: null`, a normal free-form turn.
  *   2. The low-intent-confidence auto-`ask_clarification` was removed for the
  *      same reason (a perfectly normal chat message often classifies below the
  *      threshold and would have been hijacked into the canned reply).

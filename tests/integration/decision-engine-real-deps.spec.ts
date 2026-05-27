@@ -126,10 +126,16 @@ vi.mock('@/db/client.js', () => {
   return { db: chain, withTx: async <T>(fn: (tx: unknown) => Promise<T>) => fn(chain) };
 });
 
-// Mock: DB tenant context
+// Mock: DB tenant context. `runWithTenantContext` must be present because the
+// SkillsRepoAdapter now wraps its P9a lookups in it to scope to the routed
+// agent (Codex PR #215 review, BLOCKER 2). The mock just runs the callback —
+// getCurrentAgent stays pinned to 'agent_test' for this empty-state test.
 vi.mock('@/db/tenant-context.js', () => ({
   getCurrentTenant: vi.fn().mockReturnValue('tn_test'),
   getCurrentAgent: vi.fn().mockReturnValue('agent_test'),
+  runWithTenantContext: vi.fn(
+    async <T>(_ctx: unknown, fn: () => Promise<T>): Promise<T> => fn(),
+  ),
 }));
 
 // Mock: LLM client
