@@ -4,7 +4,7 @@ import type { Pessoa, Conversa, Mensagem } from '@/db/schema.js';
 import { audit } from '@/governance/audit.js';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
-import { sendOutboundText, sendOutboundDocument, sendOutboundVoice } from '@/gateway/baileys.js';
+import { sendOutboundText, sendOutboundDocument, sendOutboundVoice, isBaileysConnected } from '@/gateway/baileys.js';
 import { synthesizeSpeech, OUTBOUND_VOICE_MAX_CHARS } from '@/lib/tts.js';
 import { quotedReplyContext } from '@/gateway/presence.js';
 import type { WAQuotedContext } from '@/gateway/presence.js';
@@ -92,11 +92,11 @@ export type DispatchOutputCtx = {
  *     risking a duplicate.
  *   - `delivered: true`  — the message WAS sent but the DB persist failed; the
  *     user already received it, so the caller must NOT re-send (double-send).
- * Tagged across pre-send (recipient + quote lookup), text, voice and the PDF
- * document send. The poll branch leans on its text fallback (also tagged) plus
- * `safeDispatchOutput`'s catch-all. Callers should go through
- * `safeDispatchOutput`, which centralises this classification + records the
- * failed attempt; an untyped throw is treated conservatively as delivered.
+ * Tagged across EVERY branch of `dispatchOutput`/`sendOutbound`: pre-send
+ * (recipient + quote lookup), text, voice, the PDF document send+persist, and
+ * the poll send+persist. Callers should go through `safeDispatchOutput`, which
+ * centralises this classification + records the failed attempt; an untyped throw
+ * is still treated conservatively as delivered (no re-send).
  * Extends Error (carries the cause message) so existing generic
  * `catch (e) { (e as Error).message }` callers are unaffected.
  */
@@ -107,6 +107,25 @@ export class OutboundDeliveryError extends Error {
     this.name = 'OutboundDeliveryError';
     this.delivered = delivered;
   }
+}
+
+/**
+ * The baileys send fns return `null` in TWO distinct cases: (a) the socket was
+ * DISCONNECTED so the send never happened, and (b) `sendMessage` resolved but
+ * returned no `key.id` — the send most likely HAPPENED, we just have no id.
+ * Disambiguate by connection state so we NEVER fall through (→ re-send) on a
+ * possibly-delivered message (Codex #216 round-3, item 3):
+ *   - connected + null ⇒ delivered:true (sent-but-unconfirmed → caller must NOT
+ *     re-send; no double-send of a financial message).
+ *   - disconnected      ⇒ delivered:false (nothing sent → safe to recover).
+ * The residual TOCTOU (sent, then the socket drops before this check) is the
+ * #227 "entregou-mas-lançou" window, tracked separately.
+ */
+function throwForNullSend(channel: string): never {
+  if (isBaileysConnected()) {
+    throw new OutboundDeliveryError(true, `${channel}_sent_without_id`);
+  }
+  throw new OutboundDeliveryError(false, `${channel}_disconnected`);
 }
 
 export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
@@ -147,54 +166,65 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
     const pdf = latestReportPdf;
     try {
       const captionText = text.slice(0, 1024);
-      const wid = await sendOutboundDocument(jid, pdf.path, {
-        mimetype: pdf.mimetype,
-        fileName: pdf.fileName,
-        caption: captionText,
-        quoted: quotedContext,
-      });
-      if (!wid) {
-        // Disconnected gateway → baileys returns null (not a throw). Nothing
-        // reached the user → tag delivered:false (Codex #216 HIGH-1). The tmp
-        // PDF is still removed by the `finally` below.
-        throw new OutboundDeliveryError(false, 'document_channel_disconnected');
-      }
-      const file_size_bytes = await stat(pdf.path)
-        .then((s) => s.size)
-        .catch((err) => {
-          logger.warn(
-            { err, path: pdf.path },
-            'pdf.stat_failed_audit_size_zero',
-          );
-          return 0;
+      let wid: string | null;
+      try {
+        wid = await sendOutboundDocument(jid, pdf.path, {
+          mimetype: pdf.mimetype,
+          fileName: pdf.fileName,
+          caption: captionText,
+          quoted: quotedContext,
         });
-      await audit({
-        acao: 'outbound_sent_document',
-        pessoa_id: pessoa.id,
-        conversa_id: c.id,
-        mensagem_id: inbound.id,
-        metadata: {
-          whatsapp_id: wid,
-          tipo: pdf.tipo,
-          file_size_bytes,
-        },
-      });
-      await mensagensRepo.create({
-        conversa_id: c.id,
-        direcao: 'out',
-        tipo: 'documento',
-        conteudo: captionText,
-        midia_url: null,
-        metadata: {
-          whatsapp_id: wid,
-          in_reply_to: inbound.id,
-          document_tipo: pdf.tipo,
-          document_filename: pdf.fileName,
-        },
-        processada_em: new Date(),
-        ferramentas_chamadas: toolSummaries,
-        tokens_usados: null,
-      });
+      } catch (e) {
+        // Pre-send: the document never left the channel → delivered:false.
+        throw new OutboundDeliveryError(false, (e as Error).message);
+      }
+      if (!wid) {
+        // null ⇒ disconnected (not sent) OR sent-without-id; disambiguate by
+        // connection state (Codex #216 HIGH-1 + round-3 item 3). The tmp PDF is
+        // still removed by the `finally` below either way.
+        throwForNullSend('document_channel');
+      }
+      try {
+        const file_size_bytes = await stat(pdf.path)
+          .then((s) => s.size)
+          .catch((err) => {
+            logger.warn(
+              { err, path: pdf.path },
+              'pdf.stat_failed_audit_size_zero',
+            );
+            return 0;
+          });
+        await audit({
+          acao: 'outbound_sent_document',
+          pessoa_id: pessoa.id,
+          conversa_id: c.id,
+          mensagem_id: inbound.id,
+          metadata: {
+            whatsapp_id: wid,
+            tipo: pdf.tipo,
+            file_size_bytes,
+          },
+        });
+        await mensagensRepo.create({
+          conversa_id: c.id,
+          direcao: 'out',
+          tipo: 'documento',
+          conteudo: captionText,
+          midia_url: null,
+          metadata: {
+            whatsapp_id: wid,
+            in_reply_to: inbound.id,
+            document_tipo: pdf.tipo,
+            document_filename: pdf.fileName,
+          },
+          processada_em: new Date(),
+          ferramentas_chamadas: toolSummaries,
+          tokens_usados: null,
+        });
+      } catch (e) {
+        // Sent but not persisted → user already has the document; must NOT re-send.
+        throw new OutboundDeliveryError(true, (e as Error).message);
+      }
     } finally {
       await cleanupPDF(pdf.path);
     }
@@ -233,11 +263,11 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
         // so the skill caller falls through to ReAct (no double-send).
         throw new OutboundDeliveryError(false, (e as Error).message);
       }
-      // null ⇒ gateway disconnected (baileys returns null, not a throw) →
-      // nothing reached the user. Tag delivered:false so the caller recovers
-      // without a double-send, matching the text path (Codex #216 HIGH-1).
+      // null ⇒ disconnected (not sent) OR sent-without-id; disambiguate by
+      // connection state so a sent voice note is never re-sent (Codex #216
+      // HIGH-1 + round-3 item 3), matching the text path.
       if (!wid) {
-        throw new OutboundDeliveryError(false, 'voice_channel_disconnected');
+        throwForNullSend('voice_channel');
       }
       try {
         await audit({
@@ -456,12 +486,12 @@ export async function sendOutbound(
   } catch (e) {
     throw new OutboundDeliveryError(false, (e as Error).message);
   }
-  // A null id means the gateway did NOT send (disconnected socket — baileys
-  // returns null instead of throwing). Pre-send: nothing reached the user, so
-  // tag delivered:false and DON'T persist a phantom whatsapp_id:null row
-  // (Codex #216 HIGH-1 — the disconnected-gateway silent-drop path).
+  // A null id means the gateway did NOT confirm a send. Disambiguate
+  // disconnected (not sent → delivered:false) from sent-without-id (→
+  // delivered:true) so we don't drop silently NOR risk a double-send, and never
+  // persist a phantom whatsapp_id:null row (Codex #216 HIGH-1 + round-3 item 3).
   if (wid === null) {
-    throw new OutboundDeliveryError(false, 'channel_disconnected');
+    throwForNullSend('channel');
   }
   const metadata: Record<string, unknown> = { whatsapp_id: wid, remote_jid: jid, in_reply_to };
   if (opts?.pending_question_id) metadata.pending_question_id = opts.pending_question_id;
@@ -492,14 +522,30 @@ export async function sendOutboundPoll(
   pending: { id: string; opcoes_validas: Array<{ key: string; label: string }> },
   opts?: { tool_summaries?: ToolExecutionSummary[] },
 ): Promise<{ fell_back: boolean }> {
-  const pessoa = await pessoasRepo.findById(pessoa_id);
-  if (!pessoa) return { fell_back: false };
-  const jid = await resolveOutboundJid(pessoa, in_reply_to);
+  // PRE-SEND (recipient + JID): a throw or missing recipient means nothing was
+  // sent → delivered:false so the caller can recover (Codex #216 round-3).
+  let jid: string;
+  try {
+    const pessoa = await pessoasRepo.findById(pessoa_id);
+    if (!pessoa) throw new OutboundDeliveryError(false, 'pessoa_not_found');
+    jid = await resolveOutboundJid(pessoa, in_reply_to);
+  } catch (e) {
+    if (e instanceof OutboundDeliveryError) throw e;
+    throw new OutboundDeliveryError(false, (e as Error).message);
+  }
   const { sendPoll } = await import('@/gateway/presence.js');
-  const sent = await sendPoll(jid, text, pending.opcoes_validas);
+  let sent: Awaited<ReturnType<typeof sendPoll>>;
+  try {
+    sent = await sendPoll(jid, text, pending.opcoes_validas);
+  } catch (e) {
+    // The poll never left the channel → delivered:false. (The text fallback
+    // below only covers missing decryption secrets, not a hard send failure.)
+    throw new OutboundDeliveryError(false, (e as Error).message);
+  }
   // Without all three (whatsapp_id, message_secret, creator_jid) the inbound
   // vote can't be decrypted (creator_jid feeds the HMAC in decryptPollVote),
-  // so the user would see a poll they can't actually answer. Fall back.
+  // so the user would see a poll they can't actually answer. Fall back to text
+  // (sendOutbound is itself phase-tagged, so its failures propagate correctly).
   if (!sent.whatsapp_id || !sent.message_secret || !sent.creator_jid) {
     const numbered = pending.opcoes_validas.map((o, i) => `${i + 1}. ${o.label}`).join('\n');
     await sendOutbound(pessoa_id, conversa_id, `${text}\n\n${numbered}`, in_reply_to, {
@@ -508,24 +554,29 @@ export async function sendOutboundPoll(
     });
     return { fell_back: true };
   }
-  await mensagensRepo.create({
-    conversa_id,
-    direcao: 'out',
-    tipo: 'texto',
-    conteudo: text,
-    midia_url: null,
-    metadata: {
-      whatsapp_id: sent.whatsapp_id,
-      remote_jid: jid,
-      in_reply_to,
-      pending_question_id: pending.id,
-      poll_options: pending.opcoes_validas,
-      poll_message_secret: sent.message_secret,
-      poll_creator_jid: sent.creator_jid,
-    },
-    processada_em: new Date(),
-    ferramentas_chamadas: opts?.tool_summaries ?? [],
-    tokens_usados: null,
-  });
+  try {
+    await mensagensRepo.create({
+      conversa_id,
+      direcao: 'out',
+      tipo: 'texto',
+      conteudo: text,
+      midia_url: null,
+      metadata: {
+        whatsapp_id: sent.whatsapp_id,
+        remote_jid: jid,
+        in_reply_to,
+        pending_question_id: pending.id,
+        poll_options: pending.opcoes_validas,
+        poll_message_secret: sent.message_secret,
+        poll_creator_jid: sent.creator_jid,
+      },
+      processada_em: new Date(),
+      ferramentas_chamadas: opts?.tool_summaries ?? [],
+      tokens_usados: null,
+    });
+  } catch (e) {
+    // Sent but not persisted → user already saw the poll; must NOT re-send.
+    throw new OutboundDeliveryError(true, (e as Error).message);
+  }
   return { fell_back: false };
 }

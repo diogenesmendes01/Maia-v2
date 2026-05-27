@@ -26,6 +26,8 @@ const { cfg, m } = vi.hoisted(() => ({
     sendOutboundText: vi.fn(),
     sendOutboundVoice: vi.fn(),
     sendOutboundDocument: vi.fn(),
+    isBaileysConnected: vi.fn(),
+    sendPoll: vi.fn(),
     createMensagem: vi.fn(),
     findPessoa: vi.fn(),
     findActiveSnapshot: vi.fn(),
@@ -38,6 +40,7 @@ vi.mock('@/gateway/baileys.js', () => ({
   sendOutboundText: m.sendOutboundText,
   sendOutboundVoice: m.sendOutboundVoice,
   sendOutboundDocument: m.sendOutboundDocument,
+  isBaileysConnected: m.isBaileysConnected,
 }));
 vi.mock('@/db/repositories.js', () => ({
   mensagensRepo: { create: m.createMensagem, findById: vi.fn().mockResolvedValue(null) },
@@ -53,7 +56,10 @@ vi.mock('@/lib/tts.js', () => ({
   synthesizeSpeech: m.synthesizeSpeech,
   OUTBOUND_VOICE_MAX_CHARS: 300,
 }));
-vi.mock('@/gateway/presence.js', () => ({ quotedReplyContext: () => undefined }));
+vi.mock('@/gateway/presence.js', () => ({
+  quotedReplyContext: () => undefined,
+  sendPoll: m.sendPoll,
+}));
 vi.mock('@/agent/reflection.js', () => ({ detectCorrection: () => false }));
 vi.mock('@/agent/pdf-cleanup.js', () => ({ cleanupPDF: vi.fn() }));
 
@@ -90,11 +96,28 @@ beforeEach(() => {
   cfg.FEATURE_ONE_TAP = false;
   m.findPessoa.mockResolvedValue(pessoa);
   m.findActiveSnapshot.mockResolvedValue(null);
+  // Default to DISCONNECTED so a null send id reads as "not sent" (delivered:false);
+  // the sent-without-id cases flip this to true explicitly.
+  m.isBaileysConnected.mockReturnValue(false);
   m.sendOutboundText.mockResolvedValue('wid_text');
   m.sendOutboundVoice.mockResolvedValue('wid_voice');
+  m.sendPoll.mockResolvedValue({
+    whatsapp_id: 'wid_poll',
+    message_secret: 'secret',
+    creator_jid: 'creator_jid',
+  });
   m.synthesizeSpeech.mockResolvedValue(Buffer.from('ogg'));
   m.createMensagem.mockResolvedValue(undefined);
 });
+
+const pollPending = {
+  id: 'pq_1',
+  opcoes_validas: [
+    { key: 'a', label: 'A' },
+    { key: 'b', label: 'B' },
+    { key: 'c', label: 'C' },
+  ],
+};
 
 describe('dispatchOutput — delivery-phase tagging (HIGH-1)', () => {
   it('quote-lookup throws (pre-send) ⇒ OutboundDeliveryError(delivered:false), nothing sent', async () => {
@@ -185,6 +208,29 @@ describe('dispatchOutput — delivery-phase tagging (HIGH-1)', () => {
     expect(m.createMensagem).not.toHaveBeenCalled();
   });
 
+  // Codex #216 round-3 item 3 — `null` is OVERLOADED: disconnected (not sent)
+  // vs sendMessage-resolved-without-key.id (sent, no id). When STILL CONNECTED,
+  // a null id means the send most likely happened → delivered:true so the caller
+  // does NOT re-send (no double-send), instead of falling through to ReAct.
+
+  it('text send returns null while still CONNECTED (sent-without-id) ⇒ delivered:true, no re-send', async () => {
+    m.isBaileysConnected.mockReturnValue(true);
+    m.sendOutboundText.mockResolvedValue(null);
+    const err = await dispatchOutput(mkCtx()).catch((e) => e);
+    expect(err).toBeInstanceOf(OutboundDeliveryError);
+    expect((err as OutboundDeliveryError).delivered).toBe(true);
+    expect(m.createMensagem).not.toHaveBeenCalled(); // no phantom row
+  });
+
+  it('voice send returns null while still CONNECTED (sent-without-id) ⇒ delivered:true', async () => {
+    cfg.FEATURE_OUTBOUND_VOICE = true;
+    m.isBaileysConnected.mockReturnValue(true);
+    m.sendOutboundVoice.mockResolvedValue(null);
+    const err = await dispatchOutput(mkCtx({ inbound: audioInbound })).catch((e) => e);
+    expect(err).toBeInstanceOf(OutboundDeliveryError);
+    expect((err as OutboundDeliveryError).delivered).toBe(true);
+  });
+
   it('pre-send recipient lookup throws ⇒ delivered:false, nothing sent', async () => {
     m.findPessoa.mockRejectedValue(new Error('pessoas_db_down'));
     const err = await dispatchOutput(mkCtx()).catch((e) => e);
@@ -199,6 +245,71 @@ describe('dispatchOutput — delivery-phase tagging (HIGH-1)', () => {
     expect(err).toBeInstanceOf(OutboundDeliveryError);
     expect((err as OutboundDeliveryError).delivered).toBe(false);
     expect(m.sendOutboundText).not.toHaveBeenCalled();
+  });
+});
+
+describe('dispatchOutput — PDF + poll phase tagging (Codex #216 round-3)', () => {
+  const pdfCtx = () =>
+    mkCtx({
+      latestReportPdf: {
+        path: '/tmp/report.pdf',
+        fileName: 'report.pdf',
+        mimetype: 'application/pdf',
+        tipo: 'extrato',
+      },
+    });
+
+  it('document send throws (pre-send) ⇒ delivered:false, nothing persisted', async () => {
+    m.sendOutboundDocument.mockRejectedValue(new Error('doc_socket_closed'));
+    const err = await dispatchOutput(pdfCtx()).catch((e) => e);
+    expect(err).toBeInstanceOf(OutboundDeliveryError);
+    expect((err as OutboundDeliveryError).delivered).toBe(false);
+    expect(m.createMensagem).not.toHaveBeenCalled();
+  });
+
+  it('document sent but persist throws (post-send) ⇒ delivered:true', async () => {
+    m.sendOutboundDocument.mockResolvedValue('wid_doc');
+    m.createMensagem.mockRejectedValue(new Error('persist_failed'));
+    const err = await dispatchOutput(pdfCtx()).catch((e) => e);
+    expect(err).toBeInstanceOf(OutboundDeliveryError);
+    expect((err as OutboundDeliveryError).delivered).toBe(true);
+    expect(m.sendOutboundDocument).toHaveBeenCalledOnce();
+  });
+
+  it('poll pre-send recipient lookup throws ⇒ delivered:false, poll not sent', async () => {
+    cfg.FEATURE_ONE_TAP = true;
+    m.findPessoa.mockRejectedValue(new Error('pessoas_db_down'));
+    const err = await dispatchOutput(mkCtx({ latestPending: pollPending })).catch((e) => e);
+    expect(err).toBeInstanceOf(OutboundDeliveryError);
+    expect((err as OutboundDeliveryError).delivered).toBe(false);
+    expect(m.sendPoll).not.toHaveBeenCalled();
+  });
+
+  it('poll send throws (pre-send) ⇒ delivered:false', async () => {
+    cfg.FEATURE_ONE_TAP = true;
+    m.sendPoll.mockRejectedValue(new Error('poll_socket_closed'));
+    const err = await dispatchOutput(mkCtx({ latestPending: pollPending })).catch((e) => e);
+    expect(err).toBeInstanceOf(OutboundDeliveryError);
+    expect((err as OutboundDeliveryError).delivered).toBe(false);
+    expect(m.createMensagem).not.toHaveBeenCalled();
+  });
+
+  it('poll sent but persist throws (post-send) ⇒ delivered:true', async () => {
+    cfg.FEATURE_ONE_TAP = true;
+    m.createMensagem.mockRejectedValue(new Error('persist_failed'));
+    const err = await dispatchOutput(mkCtx({ latestPending: pollPending })).catch((e) => e);
+    expect(err).toBeInstanceOf(OutboundDeliveryError);
+    expect((err as OutboundDeliveryError).delivered).toBe(true);
+    expect(m.sendPoll).toHaveBeenCalledOnce();
+  });
+
+  it('poll happy path ⇒ resolves, persisted once', async () => {
+    cfg.FEATURE_ONE_TAP = true;
+    await expect(
+      dispatchOutput(mkCtx({ latestPending: pollPending })),
+    ).resolves.toBeUndefined();
+    expect(m.sendPoll).toHaveBeenCalledOnce();
+    expect(m.createMensagem).toHaveBeenCalledOnce();
   });
 });
 
