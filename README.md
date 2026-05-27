@@ -169,6 +169,32 @@ docker compose logs -f app
 
 ---
 
+## Admin UI
+
+Painel web em **Next.js 14 + tRPC + NextAuth + Drizzle**, em `src/admin-ui/` — porta **`4000`** em dev.
+
+```bash
+cd src/admin-ui
+npm install
+npm run dev          # → http://localhost:4000
+```
+
+É o **plano de governança** da plataforma — onde o owner aprova evolução, audita comportamento e administra a operação.
+
+| Área | O que faz | Router tRPC |
+|---|---|---|
+| **Aprovações** | Capability proposals, identity proposals, dual-approval flow | `proposals`, `capabilities` |
+| **Drift & incidents** | Alertas de deriva (7 tipos × 4 severidades), resolução, histórico | `drift` |
+| **Trace explorer** | Runtime traces, cognitive module logs, audit por turno | `traces`, `audit` |
+| **Versions** | Diff + rollback de identity profiles (via `react-diff-viewer-continued`) | `versions` |
+| **Gestão** | Tenants, agentes, skills, procedures, tools-catalog, channel policies, LLM settings | `tenants`, `agents`, `skills`, `procedures`, `tools-catalog`, `channelPolicies`, `llmSettings` |
+| **Inbox & knowledge** | Propostas pendentes, base de conhecimento por tenant | `inbox`, `knowledge` |
+| **Dashboard** | KPIs por tenant/agente — execuções, drift, custo | `dashboard` |
+
+Lista completa de routers: [`src/admin-ui/trpc/routers/`](src/admin-ui/trpc/routers/).
+
+---
+
 ## Testes de integração
 
 Testes de integração tocam Postgres real e (em alguns casos) Redis real. Eles
@@ -210,15 +236,14 @@ CI roda esses testes automaticamente em job dedicado (`integration` em
 
 ---
 
-## Roadmap
+## Roadmap (histórico de fases)
 
-Implementação faseada, aditiva ou com feature flag + rollback. As **10 fases originais P0–P7** cobrem o núcleo da plataforma. O código já avançou para iterações posteriores (P8–P10, ex. `054_p10b_unified_trace_events_matview`) — `docs/specs/` tem o estado detalhado por subsistema.
+> ⚠️ **Esta é a sequência original de planejamento.** O código já avançou: temos **152 migrations** (com fases `p3a`, `p2`, `p4`, `p10b` etc.), **33 workers** e o admin-ui completo — boa parte do que está marcado como ✅ aqui já foi shipped há iterações. As durações listadas são **estimativas originais** do plano, não cronograma futuro. Para o estado real por subsistema, ver [`docs/specs/`](docs/specs/).
 
-> **Legenda:** ✅ em código · 🚧 parcial / em iteração · ⏳ planejado.
-> Status reflete presença de migrations e módulos no repo, não garantia de cobertura 100% — auditar via specs e testes.
+> **Legenda:** ✅ em código (migrations e módulos presentes) · 🚧 parcial / em iteração · ⏳ planejado.
 
-| Fase | Entrega | Duração | Status |
-|------|---------|---------|--------|
+| Fase | Entrega | Estimativa original | Status |
+|------|---------|---------------------|--------|
 | **P0** | **Foundation** — `tenant_id`/`agent_id` NOT NULL forçado, tenant-guard middleware, índices, tabelas dormentes (migrations `007_p0`–`015_p0`) | 2 sem | ✅ |
 | **P1** | **Reflexão expandida + Classificador + Cognitive Wrapper** — `cognition/reflector.ts`, `classifier.ts`, `runCognitiveModule({timeout, fallback, audit})`, novos triggers (conversation_closed, success_explicit, pattern_detected, internal_gap) | 2–3 sem | ✅ |
 | **P2** | **Memory scoping + Self-model** — tabela `memory_entry` com 6 controles, migração conservadora (legacy → `unknown`/`restricted`/`needs_review`), `agent_capabilities_*`, confiança determinística | 3–4 sem | ✅ |
@@ -229,6 +254,7 @@ Implementação faseada, aditiva ou com feature flag + rollback. As **10 fases o
 | **P5** | **Aquisição dialógica de capacidades** — `gap_escalation_rules`, `capability_proposals`, `capability_test_results`, 4 níveis de escalada, dashboard de gaps + propostas, loop de teste pós-aquisição | 3 sem | ✅ |
 | **P6** | **Channel / Role / Policy** — tabelas de canais, roles, policies; `role-selector` (sugere) + `role-engine` (decide via policy); multi-channel Baileys; migração: estado atual = 1 agent / 1 channel / 1 role default | 5–7 sem | 🚧 |
 | **P7** | **Grafo cognitivo completo** — DAG topológico, paralelização, `runWhen` condicional; refactor de todos os módulos pro formato node. Sem mudança user-facing — só governança formal. | 2–3 sem | 🚧 |
+| **P8+** | **Iterações posteriores** — admin-ui (P8.5), unified trace events matview (P10b), calendar/holidays, profile body consolidation, e demais refinamentos pós-MVP da plataforma | — | ✅ |
 
 **Sequência de valor:**
 
