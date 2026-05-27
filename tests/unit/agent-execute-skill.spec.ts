@@ -16,6 +16,7 @@ import {
   executeSelectedSkill,
   buildSkillInput,
   buildSkillReply,
+  SKILL_FALLBACK_TEXT,
   type ExecuteSelectedSkillDeps,
   type PinnedSkillIdentity,
 } from '@/agent/execute-skill.js';
@@ -161,6 +162,9 @@ describe('F1 Phase 1 — executeSelectedSkill', () => {
     expect(input.conversa_id).toBe('c_1');
     expect(input.turno_id).toBe('msg_1');
     expect(input.agent_id).toBe('ag_1');
+    // Immutable-identity pin forwarded so runSkill can close the TOCTOU (HIGH-B).
+    expect(input.expected_skill_id).toBe('skill_faq');
+    expect(input.expected_skill_version).toBe(3);
     expect(input.input).toEqual({
       message: 'oi, qual o horário?',
       pessoa_id: 'p_1',
@@ -270,11 +274,11 @@ describe('F1 Phase 1 — executeSelectedSkill', () => {
     );
   });
 
-  it('dispatchOutput THROWS after send ⇒ handled:true (no ReAct fall-through, no double-send) + loud log (item 2)', async () => {
-    // Q1 decision (Codex #216 review item 2): dispatchOutput sends BEFORE it
-    // persists, so once delivery is attempted the turn is terminal. A throw must
-    // NOT fall through (would risk a second message). We report handled and log
-    // the inconsistency at error level with an ops_alert flag for reconciliation.
+  it('dispatchOutput throws with UNKNOWN delivery phase ⇒ handled (no fallback, no double-send) + loud log (HIGH-A)', async () => {
+    // A throw with no `delivered` flag is treated CONSERVATIVELY as delivered:
+    // the message may have reached the user, so we must NOT re-send (no canned
+    // fallback, no ReAct fall-through) — just report handled and log the
+    // inconsistency at error level with an ops_alert flag for reconciliation.
     const deps = mkDeps({
       dispatchOutput: vi.fn().mockRejectedValue(new Error('db_commit_failed')),
     });
@@ -282,10 +286,51 @@ describe('F1 Phase 1 — executeSelectedSkill', () => {
 
     expect(outcome).toEqual({ handled: true });
     expect(deps.runSkill).toHaveBeenCalledOnce();
-    expect(deps.dispatchOutput).toHaveBeenCalledOnce();
+    expect(deps.dispatchOutput).toHaveBeenCalledOnce(); // no second (fallback) send
     expect(deps.logger.error).toHaveBeenCalledWith(
       expect.objectContaining({ ops_alert: true, err: 'db_commit_failed' }),
       'skill.dispatch_failed_after_send_inconsistency',
+    );
+  });
+
+  it('dispatchOutput fails PRE-send (delivered:false) ⇒ canned fallback delivered + handled (HIGH-A)', async () => {
+    // The channel send itself threw, so NOTHING reached the user. We must still
+    // respond: a canned fallback is delivered (best effort) and the turn is
+    // handled — never silence, never a double-send.
+    const sendErr = Object.assign(new Error('send_failed'), { delivered: false });
+    const dispatchOutput = vi
+      .fn()
+      .mockRejectedValueOnce(sendErr) // skill reply send fails pre-delivery
+      .mockResolvedValueOnce(undefined); // canned fallback send succeeds
+    const deps = mkDeps({ dispatchOutput });
+    const outcome = await executeSelectedSkill(mkArgs(), deps);
+
+    expect(outcome).toEqual({ handled: true });
+    expect(dispatchOutput).toHaveBeenCalledTimes(2);
+    const fallbackCtx = dispatchOutput.mock.calls[1]![0];
+    expect(fallbackCtx.text).toBe(SKILL_FALLBACK_TEXT);
+    expect(deps.logger.warn).toHaveBeenCalledWith(
+      expect.anything(),
+      'skill.dispatch_send_failed_fallback',
+    );
+  });
+
+  it('canned fallback ALSO failing (channel down) ⇒ still handled, no throw (best effort)', async () => {
+    // If even the fallback send fails we log and stop — we never loop or let the
+    // exception escape executeSelectedSkill.
+    const sendErr = Object.assign(new Error('send_failed'), { delivered: false });
+    const dispatchOutput = vi
+      .fn()
+      .mockRejectedValueOnce(sendErr) // skill reply send fails
+      .mockRejectedValueOnce(new Error('channel_down')); // fallback also fails
+    const deps = mkDeps({ dispatchOutput });
+    const outcome = await executeSelectedSkill(mkArgs(), deps);
+
+    expect(outcome).toEqual({ handled: true });
+    expect(dispatchOutput).toHaveBeenCalledTimes(2);
+    expect(deps.logger.error).toHaveBeenCalledWith(
+      expect.objectContaining({ ops_alert: true }),
+      'skill.fallback_send_failed',
     );
   });
 

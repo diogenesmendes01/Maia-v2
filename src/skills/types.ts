@@ -46,6 +46,16 @@ export interface SkillExecutionInput {
    * Promise.race (review #99 finding 3).
    */
   signal?: AbortSignal;
+  /**
+   * Optional immutable-identity pin (F1 Phase 1, Codex #216 review HIGH-B).
+   * When set, the runner asserts the resolved active skill still matches AFTER
+   * its own lookup — closing the TOCTOU between a caller's pre-check and this
+   * lookup (an activate/rollback in the window would otherwise execute a
+   * divergent active row). Mismatch ⇒ fail-closed with reason
+   * 'identity_mismatch'. Absent ⇒ no assertion (legacy callers unaffected).
+   */
+  expected_skill_id?: string;
+  expected_skill_version?: number;
 }
 
 export type SkillFailureReason =
@@ -59,6 +69,7 @@ export type SkillFailureReason =
   | 'invalid_input'
   | 'invalid_output'
   | 'executor_error'
+  | 'identity_mismatch'
   | 'timeout';
 
 export interface SkillExecutionTrace {

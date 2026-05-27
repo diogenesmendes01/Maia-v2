@@ -81,6 +81,26 @@ export type DispatchOutputCtx = {
  *   4. Else → send plain text, applying view-once when sensitive tools were
  *      dispatched in this turn (unless the user disabled it).
  */
+/**
+ * Thrown by `sendOutbound` (and surfaced through `dispatchOutput`) to tell a
+ * caller WHICH phase of delivery failed (Codex #216 review HIGH-A):
+ *   - `delivered: false` — the channel send itself threw; NOTHING reached the
+ *     user, so the caller may safely recover (retry / canned fallback / respond
+ *     another way) without risking a duplicate.
+ *   - `delivered: true`  — the message WAS sent but the DB persist failed; the
+ *     user already received it, so the caller must NOT re-send (double-send).
+ * Extends Error (carries the cause message) so existing generic
+ * `catch (e) { (e as Error).message }` callers are unaffected.
+ */
+export class OutboundDeliveryError extends Error {
+  readonly delivered: boolean;
+  constructor(delivered: boolean, message: string) {
+    super(message);
+    this.name = 'OutboundDeliveryError';
+    this.delivered = delivered;
+  }
+}
+
 export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
   const { pessoa, conversa: c, inbound, jid, text, latestPending, latestReportPdf, turnHasSensitive, sensitiveTools } = ctx;
   const toolSummaries = ctx.toolSummaries ?? [];
@@ -293,25 +313,38 @@ export async function sendOutbound(
   const sendOpts: { quoted?: WAQuotedContext; view_once?: boolean } = {};
   if (opts?.quoted) sendOpts.quoted = opts.quoted;
   if (opts?.view_once) sendOpts.view_once = true;
-  const wid = await sendOutboundText(
-    jid,
-    text,
-    Object.keys(sendOpts).length ? sendOpts : undefined,
-  );
+  // Delivery happens in two phases: send to the channel, THEN persist the
+  // outbound row. Tag failures by phase (Codex #216 review HIGH-A) so callers
+  // can tell "nothing was sent" (safe to recover) from "sent but not persisted"
+  // (must not re-send).
+  let wid: string | null;
+  try {
+    wid = await sendOutboundText(
+      jid,
+      text,
+      Object.keys(sendOpts).length ? sendOpts : undefined,
+    );
+  } catch (e) {
+    throw new OutboundDeliveryError(false, (e as Error).message);
+  }
   const metadata: Record<string, unknown> = { whatsapp_id: wid, remote_jid: jid, in_reply_to };
   if (opts?.pending_question_id) metadata.pending_question_id = opts.pending_question_id;
   if (opts?.view_once) metadata.view_once = true;
-  await mensagensRepo.create({
-    conversa_id,
-    direcao: 'out',
-    tipo: 'texto',
-    conteudo: text,
-    midia_url: null,
-    metadata,
-    processada_em: new Date(),
-    ferramentas_chamadas: opts?.tool_summaries ?? [],
-    tokens_usados: null,
-  });
+  try {
+    await mensagensRepo.create({
+      conversa_id,
+      direcao: 'out',
+      tipo: 'texto',
+      conteudo: text,
+      midia_url: null,
+      metadata,
+      processada_em: new Date(),
+      ferramentas_chamadas: opts?.tool_summaries ?? [],
+      tokens_usados: null,
+    });
+  } catch (e) {
+    throw new OutboundDeliveryError(true, (e as Error).message);
+  }
   return wid;
 }
 

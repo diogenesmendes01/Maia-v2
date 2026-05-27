@@ -155,6 +155,63 @@ describe('SkillRunner — 7-gate flow', () => {
     expect(result.reason).toBe('skill_not_found');
   });
 
+  it('Gate 1.6: returns identity_mismatch when the resolved row diverges from the pinned identity (TOCTOU)', async () => {
+    // The caller validated {skill-1, v1} then routed here; an activate/rollback
+    // in the window made the active row v2. runSkill must re-assert the pin and
+    // fail-closed rather than execute the divergent row (Codex #216 review HIGH-B).
+    vi.mocked(skillsRepo.findActive).mockResolvedValue({
+      ...baseSkillRow,
+      id: 'skill-1',
+      version: 2,
+    } as any);
+    const result = await runWithTenantContext(
+      { tenant_id: 'default', agent_id: 'default' },
+      async () =>
+        runSkill({
+          skill_descriptor: 'detect_legal_risk',
+          input: {},
+          triggered_by: 'user_message',
+          expected_skill_id: 'skill-1',
+          expected_skill_version: 1,
+        }),
+    );
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('identity_mismatch');
+    // The divergent row must NOT have been executed.
+    expect(vi.mocked(promptOnlyMode)).not.toHaveBeenCalled();
+  });
+
+  it('Gate 1.6: proceeds when the pinned identity matches the resolved row', async () => {
+    vi.mocked(skillsRepo.findActive).mockResolvedValue(baseSkillRow as any);
+    vi.mocked(promptOnlyMode).mockResolvedValue({ classification: 'ok' });
+    const result = await runWithTenantContext(
+      { tenant_id: 'default', agent_id: 'default' },
+      async () =>
+        runSkill({
+          skill_descriptor: 'detect_legal_risk',
+          input: {},
+          triggered_by: 'user_message',
+          expected_skill_id: 'skill-1',
+          expected_skill_version: 1,
+        }),
+    );
+    expect(result.ok).toBe(true);
+  });
+
+  it('Gate 1.6: no pin ⇒ no identity assertion (legacy callers unaffected)', async () => {
+    vi.mocked(skillsRepo.findActive).mockResolvedValue({
+      ...baseSkillRow,
+      version: 99,
+    } as any);
+    vi.mocked(promptOnlyMode).mockResolvedValue({ classification: 'ok' });
+    const result = await runWithTenantContext(
+      { tenant_id: 'default', agent_id: 'default' },
+      async () =>
+        runSkill({ skill_descriptor: 'detect_legal_risk', input: {}, triggered_by: 'user_message' }),
+    );
+    expect(result.ok).toBe(true);
+  });
+
   it('Gate 3: returns invalid_input when input fails schema', async () => {
     vi.mocked(skillsRepo.findActive).mockResolvedValue({
       ...baseSkillRow,
