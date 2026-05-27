@@ -26,7 +26,7 @@ inviolável entre tenants.
 - **Multi-agente por tenant** — `Agent ≠ Channel ≠ Role`. Um tenant pode ter vários agentes; cada um com seu escopo.
 - **Agentes aprendem habilidades e ferramentas** — a plataforma propõe novas skills/tools a partir do uso real; o owner decide.
 - **Pessoal e corporativo** — mesma plataforma serve PF e PJ; o que muda é o vertical, não o motor.
-- **Canal: WhatsApp** — entrada/saída padrão, com texto, áudio e foto.
+- **WhatsApp como canal habilitado hoje, multi-canal por design** — texto, áudio e foto via Baileys; infra de `channels` / `channel_policies` / `roles` já no schema, pronta pra outros canais.
 
 ---
 
@@ -41,7 +41,7 @@ inviolável entre tenants.
 | 5 | **Self-model + reflexão tipada** | Modelo de si em 3 camadas (domínio/skill/gap), confiança determinística sobre evidência. Toda reflexão vira candidato classificado em fato / regra / procedimento / lacuna / tool-request / descarte. |
 | 6 | **Skills + Procedures executáveis** | O que um agente aprende vira artefato versionado, event-sourced, com success criteria tipados e métricas derivadas. |
 | 7 | **Memória escopada** | 6 controles por memória (`type` / `scope` / `sensitivity` / `proactive_use` / `mention_allowed` / `ttl_days`). Memória sensível influencia cuidado, nunca é verbalizada. |
-| 8 | **WhatsApp como canal** | Gateway Baileys com áudio (Whisper), imagem (Claude Vision) e texto. Separação por interlocutor; auditoria por mensagem. |
+| 8 | **WhatsApp como canal (multi-canal por design)** | Gateway Baileys com texto, áudio (Whisper) e imagem (Claude Vision). Separação por interlocutor; auditoria por mensagem. Tabelas de `channels` / `channel_policies` / `roles` já no schema; `gateway/channel-resolver.ts` e `runtime/decision/agent-selector.ts` em produção. |
 | 9 | **Primeiro vertical: finanças PF + PJ** | Caso de uso concreto: lançamentos, classificação, fluxo de caixa, briefing, conversas separadas com contadores e funcionários. É a **prova** do produto — não a definição dele. |
 
 ---
@@ -98,7 +98,13 @@ maia/
 │   ├── user-layer/                 # Camada de usuário / interlocutor
 │   ├── import/                     # Importadores (OFX etc.)
 │   ├── setup/                      # Bootstrap (owner, entidades, permissões)
-│   ├── admin-ui/                   # Dashboard web (Fastify)
+│   ├── admin-ui/                   # Next.js 14 + tRPC + NextAuth —
+│   │                               # governance, approvals, audit, trace
+│   │                               # exploration (16 routers: agents, audit,
+│   │                               # capabilities, channelPolicies, drift,
+│   │                               # inbox, knowledge, llmSettings, procedures,
+│   │                               # proposals, skills, tenants, tools-catalog,
+│   │                               # traces, versions, dashboard)
 │   ├── config/                     # Validação de envs (Zod)
 │   ├── db/                         # Drizzle, repositories
 │   ├── lib/                        # Wrappers (Claude, Whisper, Redis)
@@ -108,6 +114,8 @@ maia/
 ```
 
 > **Nota sobre memória.** As 5 camadas (`episodic`, `semantic`, `procedural`, `working`, `vector`) são fachadas finas sobre Postgres+pgvector e Redis. Eviction, TTL e ranking ficam delegados ao banco/Redis, não à camada de memória. Expansão (LRU em `working`, ranking ponderado em `semantic`) fica como evolução futura.
+
+> **Estado do código.** 152 migrations · 33 workers · 16 tRPC routers no admin-ui · 19 specs em `docs/specs/` · 392 test/spec files · pgvector + Redis + BullMQ + Baileys em produção.
 
 ---
 
@@ -134,7 +142,7 @@ docker compose up -d postgres redis
 # 4. Aplique migrations (ordem alfabética)
 npm run db:migrate
 
-# 5. Wizard de bootstrap (cria tenant + owner + agente + entidades + permissões)
+# 5. Wizard de bootstrap (cria tenant + owner + 1º agente + entidades + permissões)
 npm run setup
 
 # 6. Inicie em dev
@@ -144,6 +152,9 @@ npm run dev
 # Adicionar pessoa nova depois (CLI):
 npm run pessoa:add -- --nome="Joana" --telefone="+55..." \
   --profile=contador_leitura --entidades=E1,E3
+
+# Adicionar agente novo a um tenant existente:
+# via Admin UI em src/admin-ui (router `agents`)
 ```
 
 ---
@@ -199,22 +210,25 @@ CI roda esses testes automaticamente em job dedicado (`integration` em
 
 ---
 
-## Roadmap (10 fases)
+## Roadmap
 
-Implementação faseada, ~6–7,5 meses de dev focado. Toda mudança é **aditiva ou com feature flag + rollback**.
+Implementação faseada, aditiva ou com feature flag + rollback. As **10 fases originais P0–P7** cobrem o núcleo da plataforma. O código já avançou para iterações posteriores (P8–P10, ex. `054_p10b_unified_trace_events_matview`) — `docs/specs/` tem o estado detalhado por subsistema.
 
-| Fase | Entrega | Duração |
-|------|---------|---------|
-| **P0** | **Foundation** — `tenant_id`/`agent_id` NOT NULL forçado, tenant-guard middleware em todas queries, índices, tabelas dormentes pra fases seguintes | 2 sem |
-| **P1** | **Reflexão expandida + Classificador + Cognitive Wrapper** — `reflector`, `classifier`, `runCognitiveModule({timeout, fallback, audit})`, novos triggers (conversation_closed, success_explicit, pattern_detected, internal_gap) | 2–3 sem |
-| **P2** | **Memory scoping + Self-model** — tabela `memory_entry` com 6 controles, migração conservadora (legacy → `unknown`/`restricted`/`needs_review`), `agent_capabilities_*`, confiança determinística | 3–4 sem |
-| **P3a** | **Procedures: definição** — `procedure_definitions`, `procedure_assignments`, modo ENSINO funcional (owner ensina, agente armazena) | 2 sem |
-| **P3b** | **Procedures: execução runtime** — `procedure_executions`, `procedure_execution_events`, `selector_decisions`, `procedure-selector`, `step-evaluator` (machine_check + tool_result), engine stateful | 2–3 sem |
-| **P3c** | **Procedures: governança operacional** — `procedure_metrics` (view materializada), `procedure_tests` + test runner, TTL pra execuções zumbis, `step-evaluator` completo (llm_judge, user_signal, human_confirmed) | 2 sem |
-| **P4** | **Identidade operacional versionada** — `agent_operational_profile_versions`, `agent_drift_alerts`, detector (7 tipos × 4 severidades), proposal generator semanal, paralelo ao legado com feature flag | 3 sem |
-| **P5** | **Aquisição dialógica de capacidades** — `gap_escalation_rules`, `capability_proposals`, `capability_test_results`, 4 níveis de escalada, dashboard de gaps + propostas, loop de teste pós-aquisição | 3 sem |
-| **P6** | **Channel / Role / Policy** — tabelas de canais, roles, policies; `role-selector` (sugere) + `role-engine` (decide via policy); multi-channel Baileys; migração: estado atual = 1 agent / 1 channel / 1 role default | 5–7 sem |
-| **P7** | **Grafo cognitivo completo** — DAG topológico, paralelização, `runWhen` condicional; refactor de todos os módulos pro formato node. Sem mudança user-facing — só governança formal. | 2–3 sem |
+> **Legenda:** ✅ em código · 🚧 parcial / em iteração · ⏳ planejado.
+> Status reflete presença de migrations e módulos no repo, não garantia de cobertura 100% — auditar via specs e testes.
+
+| Fase | Entrega | Duração | Status |
+|------|---------|---------|--------|
+| **P0** | **Foundation** — `tenant_id`/`agent_id` NOT NULL forçado, tenant-guard middleware, índices, tabelas dormentes (migrations `007_p0`–`015_p0`) | 2 sem | ✅ |
+| **P1** | **Reflexão expandida + Classificador + Cognitive Wrapper** — `cognition/reflector.ts`, `classifier.ts`, `runCognitiveModule({timeout, fallback, audit})`, novos triggers (conversation_closed, success_explicit, pattern_detected, internal_gap) | 2–3 sem | ✅ |
+| **P2** | **Memory scoping + Self-model** — tabela `memory_entry` com 6 controles, migração conservadora (legacy → `unknown`/`restricted`/`needs_review`), `agent_capabilities_*`, confiança determinística | 3–4 sem | ✅ |
+| **P3a** | **Procedures: definição** — `procedure_definitions`, `procedure_assignments`, modo ENSINO funcional (owner ensina, agente armazena) | 2 sem | ✅ |
+| **P3b** | **Procedures: execução runtime** — `procedure_executions`, `procedure_execution_events`, `selector_decisions`, `procedure-selector`, `step-evaluator` (machine_check + tool_result), engine stateful | 2–3 sem | ✅ |
+| **P3c** | **Procedures: governança operacional** — `procedure_metrics` (view materializada), `procedure_tests` + test runner, TTL pra execuções zumbis, `step-evaluator` completo (llm_judge, user_signal, human_confirmed) | 2 sem | 🚧 |
+| **P4** | **Identidade operacional versionada** — `agent_operational_profile_versions`, `agent_drift_alerts`, detector (7 tipos × 4 severidades), proposal generator semanal, paralelo ao legado com feature flag | 3 sem | ✅ |
+| **P5** | **Aquisição dialógica de capacidades** — `gap_escalation_rules`, `capability_proposals`, `capability_test_results`, 4 níveis de escalada, dashboard de gaps + propostas, loop de teste pós-aquisição | 3 sem | ✅ |
+| **P6** | **Channel / Role / Policy** — tabelas de canais, roles, policies; `role-selector` (sugere) + `role-engine` (decide via policy); multi-channel Baileys; migração: estado atual = 1 agent / 1 channel / 1 role default | 5–7 sem | 🚧 |
+| **P7** | **Grafo cognitivo completo** — DAG topológico, paralelização, `runWhen` condicional; refactor de todos os módulos pro formato node. Sem mudança user-facing — só governança formal. | 2–3 sem | 🚧 |
 
 **Sequência de valor:**
 
@@ -237,6 +251,16 @@ Implementação faseada, ~6–7,5 meses de dev focado. Toda mudança é **aditiv
 5. **Confirmação de ações relevantes** — agentes não movem dinheiro, não modificam acessos e não tomam ações irreversíveis sem confirmação humana.
 6. **Aprendizado dentro de escopo** — toda capacidade aprendida nasce escopada (tenant, agente, canal, role); sem vazamento por construção.
 7. **Fail-closed em segurança** — query sem `tenant_id`/`agent_id` falha; memória nova entra como `restricted`/`needs_review`; capacidade não aprovada não executa.
+
+---
+
+## Contribuindo
+
+- **Specs por subsistema:** `docs/specs/00-overview.md` → `18-scheduling-and-recurring-workflows.md`. Cada subsistema (gateway, identity resolver, agent loop, tools, memory, governance, multimídia, workflows, workers, OFX import, Brazilian domain, dashboard, testing, observability, scheduling) tem seu doc.
+- **Runbooks:** [`docs/runbooks/`](docs/runbooks/) — operação e respostas a incidentes.
+- **Testes:** `npm test` (sem infra) ou `npm run test:integration` (Postgres + Redis ao vivo).
+- **CI:** typecheck + lint + build + unit + integration + e2e + gitleaks em cada PR (`.github/workflows/ci.yml`).
+- **Convenção de PR:** mudanças aditivas ou com feature flag + rollback; toda mudança de schema acompanha migration `_up` + `_down`.
 
 ---
 
