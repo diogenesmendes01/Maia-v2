@@ -269,50 +269,49 @@ describe('SkillsRepoAdapter — Codex PR #215 review', () => {
   });
 
   // -------------------------------------------------------------------------
-  // Issue #218 — CROSS-TENANT (cross-empresa) isolation.
+  // Issue #218 — CROSS-TENANT (cross-empresa) isolation @ DE ADAPTER LAYER.
+  //
   // The tests above prove the DE adapter never leaks cross-AGENT inside the
   // same tenant. The product invariant — "Maias de empresas diferentes NUNCA
   // compartilham dados ou herdam aprendizado" — is STRONGER: an agent on
   // tenant-A must NEVER see ANY skill belonging to tenant-B, including
-  // tenant-B's tenant-wide (agent_id = null) skills. These tests seed BOTH
-  // tenants with owned + tenant-wide rows and assert each tenant's adapter
-  // call returns only that tenant's rows.
+  // tenant-B's tenant-wide (agent_id = null) skills.
+  //
+  // SCOPE OF THIS SECTION: the ADAPTER's contract — that it runs every P9a
+  // lookup inside `runWithTenantContext({tenant_id, agent_id}_routed)`. The
+  // ACTUAL cross-tenant filtering in the SQL WHERE clauses is proved by
+  // `tests/unit/skills/skills-repo-cross-tenant-isolation.spec.ts` against the
+  // REAL `skillsRepo` + in-memory fake-Drizzle (38 tests, exercises the
+  // production query shape end-to-end). Re-proving WHERE-clause filtering
+  // HERE would be tautological — the adapter delegates to `skillsRepo`, so we
+  // assert the DELEGATION shape (routed context observed, never ambient) and
+  // trust the sibling spec for the underlying SQL contract.
   //
   // CONTRACT (documented at skillsRepoAdapter in prod-env.ts):
   //   `agent_id IS NULL` skills are tenant-WIDE (shared across agents of the
   //   SAME tenant), NEVER cross-tenant. The repo's WHERE always pins
   //   `tenant_id = <ctx>` so the `agent_id IS NULL` branch can only union
   //   skills from the routed tenant.
+  //
+  // Codex PR #222 review item 1 (DE-TAUTOLOGIZE): the previous tests in this
+  // section mocked `skillsRepo.listByCategory`/`.getById` AND reimplemented
+  // the tenant filter INSIDE the mock — which only proved the mock filters
+  // by tenant, not that the adapter routes correctly. Replaced with strict
+  // delegation-shape assertions: the routed `{tenant_id, agent_id}` is what
+  // each P9a call observes via `getCurrentTenant()`/`getCurrentAgent()`.
   // -------------------------------------------------------------------------
-  function seededCrossTenantStore() {
-    return [
-      // tenant-A skills
-      { ...mkRow({ id: 's_A_owned',  skill_descriptor: 'a.owned',  category: 'tool_mediated' }), tenant_id: 'tenant-A', agent_id: 'agent-A' },
-      { ...mkRow({ id: 's_A_shared', skill_descriptor: 'a.shared', category: 'tool_mediated' }), tenant_id: 'tenant-A', agent_id: null },
-      // tenant-B skills (must NEVER surface for tenant-A and vice-versa)
-      { ...mkRow({ id: 's_B_owned',  skill_descriptor: 'b.owned',  category: 'tool_mediated' }), tenant_id: 'tenant-B', agent_id: 'agent-B' },
-      { ...mkRow({ id: 's_B_shared', skill_descriptor: 'b.shared', category: 'tool_mediated' }), tenant_id: 'tenant-B', agent_id: null },
-    ];
-  }
 
-  it('issue #218 — findActive: tenant-A query returns ONLY tenant-A skills (own + tenant-A-shared); zero tenant-B leak', async () => {
-    const store = seededCrossTenantStore();
-    // Reproduce the FULL P9a listByCategory predicate, including the
-    // `tenant_id = <ctx>` clause that is the real cross-tenant gate.
-    mockListByCategory.mockImplementation(async (cat: string) => {
+  it('issue #218 / item 1 — every listByCategory call observes the ROUTED {tenant_id, agent_id}, never the ambient context', async () => {
+    const observed: Array<{ tenant_id: string; agent_id: string }> = [];
+    mockListByCategory.mockImplementation(async () => {
       const ctxTenant = (await import('@/db/tenant-context.js')).getCurrentTenant();
-      const ctxAgent = getCurrentAgent();
-      return store.filter(
-        (r) =>
-          r.category === cat &&
-          r.tenant_id === ctxTenant &&
-          (r.agent_id === ctxAgent || r.agent_id === null),
-      );
+      observed.push({ tenant_id: ctxTenant, agent_id: getCurrentAgent() });
+      return [];
     });
 
-    // Route to tenant-A / agent-A. Ambient context is set to a tenant-B agent
-    // — would-be leak. The adapter MUST repin the nested context to tenant-A.
-    const skills = await runWithTenantContext(
+    // Ambient context belongs to tenant-B / agent-B (the would-be leak).
+    // The DE query routes to tenant-A / agent-A.
+    await runWithTenantContext(
       { tenant_id: 'tenant-B', agent_id: 'agent-B' },
       () =>
         adapter.findActive({
@@ -321,28 +320,29 @@ describe('SkillsRepoAdapter — Codex PR #215 review', () => {
           applicable_to_intent: 'x',
         }),
     );
-    const ids = skills.map((s) => s.id);
-    expect(ids).toContain('s_A_owned');   // tenant-A own
-    expect(ids).toContain('s_A_shared');  // tenant-A tenant-wide
-    expect(ids).not.toContain('s_B_owned');  // cross-tenant LEAK (forbidden)
-    expect(ids).not.toContain('s_B_shared'); // cross-tenant LEAK including tenant-wide (forbidden)
+
+    expect(observed.length).toBeGreaterThan(0);
+    // Every call must observe the ROUTED context — never the ambient one.
+    // A bug that forgot to wrap the P9a call in runWithTenantContext would
+    // surface here as observed = [{ tenant_id: 'tenant-B', agent_id: 'agent-B' }, ...].
+    for (const o of observed) {
+      expect(o.tenant_id).toBe('tenant-A');
+      expect(o.agent_id).toBe('agent-A');
+    }
+    expect(observed.find((o) => o.tenant_id === 'tenant-B')).toBeUndefined();
+    expect(observed.find((o) => o.agent_id === 'agent-B')).toBeUndefined();
   });
 
-  it('issue #218 — findActive: symmetric — tenant-B query returns ONLY tenant-B skills; zero tenant-A leak', async () => {
-    const store = seededCrossTenantStore();
-    mockListByCategory.mockImplementation(async (cat: string) => {
+  it('issue #218 / item 1 — symmetric: every listByCategory call observes routed tenant-B, never ambient tenant-A', async () => {
+    const observed: Array<{ tenant_id: string; agent_id: string }> = [];
+    mockListByCategory.mockImplementation(async () => {
       const ctxTenant = (await import('@/db/tenant-context.js')).getCurrentTenant();
-      const ctxAgent = getCurrentAgent();
-      return store.filter(
-        (r) =>
-          r.category === cat &&
-          r.tenant_id === ctxTenant &&
-          (r.agent_id === ctxAgent || r.agent_id === null),
-      );
+      observed.push({ tenant_id: ctxTenant, agent_id: getCurrentAgent() });
+      return [];
     });
 
-    // Ambient is tenant-A; route to tenant-B / agent-B.
-    const skills = await runWithTenantContext(
+    // Ambient is tenant-A; route to tenant-B (cross-tenant symmetric leak path).
+    await runWithTenantContext(
       { tenant_id: 'tenant-A', agent_id: 'agent-A' },
       () =>
         adapter.findActive({
@@ -351,52 +351,61 @@ describe('SkillsRepoAdapter — Codex PR #215 review', () => {
           applicable_to_intent: 'x',
         }),
     );
-    const ids = skills.map((s) => s.id);
-    expect(ids).toContain('s_B_owned');
-    expect(ids).toContain('s_B_shared');
-    expect(ids).not.toContain('s_A_owned');
-    expect(ids).not.toContain('s_A_shared');
+
+    expect(observed.length).toBeGreaterThan(0);
+    for (const o of observed) {
+      expect(o.tenant_id).toBe('tenant-B');
+      expect(o.agent_id).toBe('agent-B');
+    }
+    expect(observed.find((o) => o.tenant_id === 'tenant-A')).toBeUndefined();
+    expect(observed.find((o) => o.agent_id === 'agent-A')).toBeUndefined();
   });
 
-  it("issue #218 — find()/getById: skill belonging to tenant-B NEVER resolves under tenant-A scope (incl. tenant-wide)", async () => {
-    const store = seededCrossTenantStore();
-    // Reproduce the FULL getById predicate including tenant_id WHERE.
-    mockGetById.mockImplementation(async (id: string) => {
-      const ctxTenant = (await import('@/db/tenant-context.js')).getCurrentTenant();
-      const ctxAgent = getCurrentAgent();
-      const row = store.find((r) => r.id === id && r.tenant_id === ctxTenant);
-      if (!row) return null;
-      if (row.agent_id !== null && row.agent_id !== ctxAgent) return null;
-      return row;
+  it('issue #218 / item 1 — find() runs getById under the routed scope, never the ambient one', async () => {
+    let observedTenant: string | undefined;
+    let observedAgent: string | undefined;
+    mockGetById.mockImplementation(async () => {
+      observedTenant = (await import('@/db/tenant-context.js')).getCurrentTenant();
+      observedAgent = getCurrentAgent();
+      return null;
     });
 
-    const scopeA = { tenant_id: 'tenant-A', agent_id: 'agent-A' };
-    // Try to read each tenant-B skill under tenant-A scope.
-    const leakedBOwned = await runWithTenantContext(
+    await runWithTenantContext(
       { tenant_id: 'tenant-B', agent_id: 'agent-B' },
-      () => adapter.find('s_B_owned', scopeA),
-    );
-    const leakedBShared = await runWithTenantContext(
-      { tenant_id: 'tenant-B', agent_id: 'agent-B' },
-      () => adapter.find('s_B_shared', scopeA),
-    );
-    // Own tenant-A skills must still resolve under their own scope (sanity).
-    const ownA = await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-      () => adapter.find('s_A_owned', scopeA),
-    );
-    const sharedA = await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-      () => adapter.find('s_A_shared', scopeA),
+      () =>
+        adapter.find('s_target', {
+          tenant_id: 'tenant-A',
+          agent_id: 'agent-A',
+        }),
     );
 
-    expect(leakedBOwned).toBeNull();
-    expect(leakedBShared).toBeNull(); // tenant-wide ≠ cross-tenant. NEVER.
-    expect(ownA?.id).toBe('s_A_owned');
-    expect(sharedA?.id).toBe('s_A_shared');
+    expect(observedTenant).toBe('tenant-A');
+    expect(observedAgent).toBe('agent-A');
   });
 
-  it('issue #218 — every P9a lookup runs under the ROUTED tenant_id (not ambient) — observed via getCurrentTenant', async () => {
+  it('issue #218 / item 1 — symmetric: find() runs getById under routed tenant-B, never ambient tenant-A', async () => {
+    let observedTenant: string | undefined;
+    let observedAgent: string | undefined;
+    mockGetById.mockImplementation(async () => {
+      observedTenant = (await import('@/db/tenant-context.js')).getCurrentTenant();
+      observedAgent = getCurrentAgent();
+      return null;
+    });
+
+    await runWithTenantContext(
+      { tenant_id: 'tenant-A', agent_id: 'agent-A' },
+      () =>
+        adapter.find('s_target', {
+          tenant_id: 'tenant-B',
+          agent_id: 'agent-B',
+        }),
+    );
+
+    expect(observedTenant).toBe('tenant-B');
+    expect(observedAgent).toBe('agent-B');
+  });
+
+  it('issue #218 / item 1 — every P9a lookup runs under the ROUTED tenant_id (not ambient) — observed via getCurrentTenant', async () => {
     const observedTenants = new Set<string>();
     mockListByCategory.mockImplementation(async () => {
       const ctxTenant = (await import('@/db/tenant-context.js')).getCurrentTenant();
