@@ -1,0 +1,134 @@
+name: Auto Issue Solver
+
+# Cron que verifica as issues abertas e dispara o agente (Claude Code) para
+# resolvê-las, abrindo um PR em draft por issue.
+#
+# IMPORTANTE:
+#   * Workflows agendados só disparam a partir do branch PADRÃO (main). Enquanto
+#     este arquivo viver apenas num branch de feature, use "Run workflow"
+#     (workflow_dispatch) para testar manualmente.
+#   * Requer o secret ANTHROPIC_API_KEY no repositório
+#     (Settings -> Secrets and variables -> Actions).
+
+on:
+  schedule:
+    - cron: '*/15 * * * *' # a cada 15 minutos
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: 'Número de uma issue específica (vazio = varre todas as abertas)'
+        required: false
+        type: string
+
+# Impede que rodadas agendadas se acumulem/sobreponham.
+concurrency:
+  group: auto-issue-solver
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  discover:
+    name: Descobrir issues a resolver
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      issues: ${{ steps.list.outputs.issues }}
+      count: ${{ steps.list.outputs.count }}
+    steps:
+      - name: Listar issues abertas ainda não despachadas
+        id: list
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MANUAL_ISSUE: ${{ github.event.inputs.issue }}
+        run: |
+          set -euo pipefail
+          if [ -n "${MANUAL_ISSUE:-}" ]; then
+            if ! [[ "$MANUAL_ISSUE" =~ ^[0-9]+$ ]]; then
+              echo "Input 'issue' inválido: '$MANUAL_ISSUE' (esperado um número)." >&2
+              exit 1
+            fi
+            issues="[${MANUAL_ISSUE}]"
+          else
+            # Issues abertas (gh issue list não inclui PRs), excluindo as que já
+            # têm a label 'claude-dispatched' — a trava que evita re-disparar na
+            # mesma issue a cada 15 min.
+            issues=$(gh issue list \
+              --repo "$GITHUB_REPOSITORY" \
+              --state open \
+              --limit 100 \
+              --json number,labels \
+              --jq '[.[] | select((.labels | map(.name) | index("claude-dispatched")) | not) | .number]' \
+              | jq -c '.')
+          fi
+          count=$(echo "$issues" | jq 'length')
+          {
+            echo "issues=$issues"
+            echo "count=$count"
+          } >> "$GITHUB_OUTPUT"
+          echo "Issues selecionadas ($count): $issues"
+
+  solve:
+    name: 'Resolver issue #${{ matrix.issue }}'
+    needs: discover
+    if: needs.discover.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      # Uma issue por vez para não estourar rate limits nem custo de uma só vez.
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        issue: ${{ fromJSON(needs.discover.outputs.issues) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Marcar issue como despachada (trava anti-duplicação)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Cria a label de forma idempotente (ignora erro se já existir).
+          gh label create claude-dispatched \
+            --repo "$GITHUB_REPOSITORY" \
+            --color BFD4F2 \
+            --description "Pega pelo Auto Issue Solver" 2>/dev/null || true
+          gh issue edit "${{ matrix.issue }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --add-label claude-dispatched
+
+      - name: Rodar o agente (Claude Code)
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            Você está resolvendo a issue #${{ matrix.issue }} do repositório ${{ github.repository }}.
+
+            Passos:
+            1. Leia a issue e os comentários: `gh issue view ${{ matrix.issue }} --comments`.
+            2. Explore o código e entenda o que é pedido. Siga as convenções do
+               projeto (CONTRIBUTING.md e o padrão do código existente).
+            3. Crie um branch NOVO chamado `claude/issue-${{ matrix.issue }}` e
+               implemente a solução nele (nunca commite direto na main).
+            4. Garanta qualidade: rode `npm run typecheck`, `npm run lint` e
+               `npx vitest run`; só prossiga se passarem.
+            5. Faça commit e abra um Pull Request em DRAFT cuja descrição contenha
+               "Closes #${{ matrix.issue }}".
+            6. Se a issue NÃO for acionável (pergunta, discussão, falta de
+               contexto) ou você não conseguir resolver com confiança: poste um
+               comentário curto na issue explicando o motivo e PARE — não abra PR
+               e NÃO remova a label `claude-dispatched` (isso evita re-tentativas
+               custosas a cada 15 min). Um humano pode remover a label para pedir
+               nova tentativa.
+          # Default no Sonnet 4.6 (custo menor para um loop automático).
+          # Para usar o modelo mais capaz, troque por: --model claude-opus-4-7
+          claude_args: |
+            --max-turns 50
+            --model claude-sonnet-4-6
