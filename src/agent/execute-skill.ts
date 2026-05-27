@@ -80,6 +80,7 @@ export interface ExecuteSelectedSkillDeps {
   logger: {
     info: (obj: unknown, msg: string) => void;
     warn: (obj: unknown, msg: string) => void;
+    error: (obj: unknown, msg: string) => void;
   };
 }
 
@@ -121,6 +122,17 @@ export function buildSkillInput(args: {
  * object is the dispatch-relevant subset; the caller fills the channel context
  * (pessoa/conversa/inbound/jid). `turnHasSensitive` is derived from the skill
  * output so `dispatchOutput` applies view-once to sensitive replies.
+ *
+ * EVALUATOR CONTRACT (Codex #216 review item 4): an `evaluator`-mode skill is
+ * allowed in the execute gate, but to be user-TERMINAL it must place its
+ * user-facing text in `output.reply` like any other mode. Its native
+ * `{ score, verdict, reasons }` are internal (audit/log) and are NEVER shown to
+ * the user — an evaluator that produces no `reply` returns null here and the
+ * caller falls through to the normal turn (a verdict-only evaluator never
+ * surfaces raw scores to the user).
+ *
+ * A whitespace-only `reply` is treated as absent (item 8) so we never dispatch
+ * a visibly blank message.
  */
 export function buildSkillReply(result: SkillExecutionOutput): {
   text: string;
@@ -131,7 +143,7 @@ export function buildSkillReply(result: SkillExecutionOutput): {
   const output = result.output;
   if (!output) return null;
   const reply = output['reply'];
-  if (typeof reply !== 'string' || reply.length === 0) return null;
+  if (typeof reply !== 'string' || reply.trim().length === 0) return null;
   // A skill may flag its output sensitive (e.g. balance-like data) so the
   // outbound is delivered view-once. We read `output.sensitive === true`
   // conservatively; absent ⇒ not sensitive.
@@ -228,7 +240,26 @@ export async function executeSelectedSkill(
     ...(args.signal ? { signal: args.signal } : {}),
   };
 
-  const result = await deps.runSkill(runInput);
+  // Contract 3 (item 1, Codex #216 review): runSkill must never throw past
+  // here. A rejection/timeout is treated exactly like a resolved `!ok` — log
+  // `skill.execution_failed` and fall through. prompt_only/evaluator have no
+  // side effects, so a pre-dispatch failure is always safe to degrade to the
+  // normal LLM/ReAct turn (no double-action risk — nothing was sent yet).
+  let result: SkillExecutionOutput;
+  try {
+    result = await deps.runSkill(runInput);
+  } catch (e) {
+    deps.logger.warn(
+      {
+        conversa_id: conversa.id,
+        turno_id: inbound.id,
+        skill_descriptor: pinned.selected_skill_descriptor,
+        reason: (e as Error).message,
+      },
+      'skill.execution_failed',
+    );
+    return { handled: false, reason: 'execution_failed' };
+  }
 
   // Contract 3: prompt_only/evaluator have no side effects — any failure is
   // safe to degrade to the normal LLM/ReAct turn.
@@ -261,17 +292,43 @@ export async function executeSelectedSkill(
 
   // Contract 2: deliver through the shared pipeline (view-once / audit /
   // pending / media) — never raw sendOutbound.
-  await deps.dispatchOutput({
-    pessoa,
-    conversa,
-    inbound,
-    jid,
-    text: reply.text,
-    latestPending: null,
-    latestReportPdf: null,
-    turnHasSensitive: reply.turnHasSensitive,
-    sensitiveTools: reply.sensitiveTools,
-  });
+  //
+  // EXACTLY-ONCE (item 2, Codex #216 review): dispatchOutput sends to the
+  // channel BEFORE persisting the outbound row. Once delivery is ATTEMPTED the
+  // turn is terminal — a throw here must NOT fall through to the normal
+  // LLM/ReAct turn, or a "sent-but-not-persisted" failure would deliver a
+  // SECOND, possibly contradictory message to the user (unacceptable for a
+  // financial assistant). So we catch, log the inconsistency LOUDLY (error +
+  // `ops_alert` flag so ops can reconcile the sent-but-unaudited message), and
+  // still report `handled` — we never double-send. The rare "send itself
+  // failed" case degrades to no reply, which the user simply re-asks
+  // (recoverable, non-misleading).
+  try {
+    await deps.dispatchOutput({
+      pessoa,
+      conversa,
+      inbound,
+      jid,
+      text: reply.text,
+      latestPending: null,
+      latestReportPdf: null,
+      turnHasSensitive: reply.turnHasSensitive,
+      sensitiveTools: reply.sensitiveTools,
+    });
+  } catch (e) {
+    deps.logger.error(
+      {
+        conversa_id: conversa.id,
+        turno_id: inbound.id,
+        skill_descriptor: pinned.selected_skill_descriptor,
+        skill_version: pinned.selected_skill_version,
+        err: (e as Error).message,
+        ops_alert: true,
+      },
+      'skill.dispatch_failed_after_send_inconsistency',
+    );
+    return { handled: true };
+  }
 
   deps.logger.info(
     {

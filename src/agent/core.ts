@@ -904,7 +904,22 @@ async function runAgentForMensagemInner(
                 // (and any lookup error) as "not the pinned skill" so we fall
                 // through safely rather than executing a divergent row.
                 const row = await skillsRepo.findActive(descriptor, agent_id);
-                return row ? { id: row.id, version: row.version } : null;
+                if (row) return { id: row.id, version: row.version };
+                // Q3-A (Codex #216 review item 5): a tenant-wide skill
+                // (agent_id IS NULL) can be SELECTED (selection unions IS NULL)
+                // but is intentionally NOT executable yet — this re-resolution
+                // scopes to the EXACT routed agent, which never matches IS NULL.
+                // Probe explicitly so the block is a VISIBLE "deferred pending
+                // #218 (tenant-wide isolation proof)" rather than a silent
+                // fall-through. We still return null (do NOT execute it).
+                const tenantWide = await skillsRepo.findActive(descriptor, null);
+                if (tenantWide) {
+                  logger.warn(
+                    { skill_descriptor: descriptor, agent_id },
+                    'skill.tenant_wide_not_executable_pending_218',
+                  );
+                }
+                return null;
               } catch (e) {
                 logger.warn(
                   { err: (e as Error).message, skill_descriptor: descriptor, agent_id },

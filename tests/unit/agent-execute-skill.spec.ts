@@ -48,7 +48,7 @@ function mkDeps(overrides?: Partial<ExecuteSelectedSkillDeps>): ExecuteSelectedS
       trace: { mode: 'prompt_only', skill_version: 3, skill_id: 'skill_faq' },
     } satisfies SkillExecutionOutput),
     dispatchOutput: vi.fn().mockResolvedValue(undefined),
-    logger: { info: vi.fn(), warn: vi.fn() },
+    logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     ...overrides,
   };
 }
@@ -117,6 +117,18 @@ describe('F1 Phase 1 — buildSkillReply', () => {
         latency_ms: 1,
         resolved_policies: [],
         trace: { mode: null, skill_version: null, skill_id: null },
+      }),
+    ).toBeNull();
+  });
+
+  it('returns null when reply is only whitespace (item 8 — never dispatch a blank message)', () => {
+    expect(
+      buildSkillReply({
+        ok: true,
+        output: { reply: '   \n\t  ' },
+        latency_ms: 1,
+        resolved_policies: [],
+        trace: { mode: 'prompt_only', skill_version: 1, skill_id: 's' },
       }),
     ).toBeNull();
   });
@@ -238,5 +250,62 @@ describe('F1 Phase 1 — executeSelectedSkill', () => {
 
     expect(outcome).toEqual({ handled: false, reason: 'no_reply' });
     expect(deps.dispatchOutput).not.toHaveBeenCalled();
+  });
+
+  it('runSkill REJECTS (timeout/throw) ⇒ fall through, dispatchOutput NOT called (item 1/3)', async () => {
+    // Codex #216 review item 1/3: a rejected runSkill promise must be caught and
+    // treated like a resolved !ok — controlled fall-through, no dispatch. Nothing
+    // was sent, so degrading to the normal turn is safe (no double-action).
+    const deps = mkDeps({
+      runSkill: vi.fn().mockRejectedValue(new Error('skill_runner_timeout')),
+    });
+    const outcome = await executeSelectedSkill(mkArgs(), deps);
+
+    expect(outcome).toEqual({ handled: false, reason: 'execution_failed' });
+    expect(deps.runSkill).toHaveBeenCalledOnce();
+    expect(deps.dispatchOutput).not.toHaveBeenCalled();
+    expect(deps.logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: 'skill_runner_timeout' }),
+      'skill.execution_failed',
+    );
+  });
+
+  it('dispatchOutput THROWS after send ⇒ handled:true (no ReAct fall-through, no double-send) + loud log (item 2)', async () => {
+    // Q1 decision (Codex #216 review item 2): dispatchOutput sends BEFORE it
+    // persists, so once delivery is attempted the turn is terminal. A throw must
+    // NOT fall through (would risk a second message). We report handled and log
+    // the inconsistency at error level with an ops_alert flag for reconciliation.
+    const deps = mkDeps({
+      dispatchOutput: vi.fn().mockRejectedValue(new Error('db_commit_failed')),
+    });
+    const outcome = await executeSelectedSkill(mkArgs(), deps);
+
+    expect(outcome).toEqual({ handled: true });
+    expect(deps.runSkill).toHaveBeenCalledOnce();
+    expect(deps.dispatchOutput).toHaveBeenCalledOnce();
+    expect(deps.logger.error).toHaveBeenCalledWith(
+      expect.objectContaining({ ops_alert: true, err: 'db_commit_failed' }),
+      'skill.dispatch_failed_after_send_inconsistency',
+    );
+  });
+
+  it('evaluator WITH a user-facing reply ⇒ dispatched + handled (item 4 contract)', async () => {
+    // Evaluator that chooses to speak to the user: verdict/score stay internal,
+    // the user-facing text is in `reply` (the sibling no-reply evaluator test
+    // above proves the verdict-only case falls through without surfacing scores).
+    const deps = mkDeps({
+      runSkill: vi.fn().mockResolvedValue({
+        ok: true,
+        output: { reply: 'Sua solicitação foi aprovada.', verdict: 'pass', score: 0.92 },
+        latency_ms: 8,
+        resolved_policies: [],
+        trace: { mode: 'evaluator', skill_version: 3, skill_id: 'skill_faq' },
+      } satisfies SkillExecutionOutput),
+    });
+    const outcome = await executeSelectedSkill(mkArgs(), deps);
+
+    expect(outcome).toEqual({ handled: true });
+    const ctx = (deps.dispatchOutput as ReturnType<typeof vi.fn>).mock.calls[0]![0];
+    expect(ctx.text).toBe('Sua solicitação foi aprovada.');
   });
 });

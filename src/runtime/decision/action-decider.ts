@@ -275,6 +275,13 @@ export class ActionDeciderImpl implements ActionDecider {
  * `tool_mediated` / `procedure_adapter` (side-effecting) are EXCLUDED — they
  * are Phase 2. An absent/unknown execution_mode is NOT executable (fail-safe:
  * legacy/stub skills route to respond/call_tool as before).
+ *
+ * `evaluator` stays in the gate (Codex #216 review item 4), but it is only
+ * user-TERMINAL when it produces an `output.reply`; its native
+ * `{ score, verdict, reasons }` are internal and never shown to the user. An
+ * evaluator that yields no reply falls through to the normal turn downstream
+ * (see `buildSkillReply` in execute-skill.ts) — so admitting it here is safe,
+ * never surfaces raw scores, and only "wins" the turn when it speaks to the user.
  */
 function isDirectlyExecutable(execution_mode: Skill['execution_mode']): boolean {
   return execution_mode === 'prompt_only' || execution_mode === 'evaluator';
