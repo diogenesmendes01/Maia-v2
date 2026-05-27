@@ -32,7 +32,7 @@ import type {
   SkillExecutionInput,
   SkillExecutionOutput,
 } from '@/skills/types.js';
-import type { DispatchOutputCtx } from './output-dispatch.js';
+import type { DispatchOutputCtx, DispatchOutcome } from './output-dispatch.js';
 
 /** Minimal active-skill identity needed for the pre-execution assert. */
 export interface ActiveSkillIdentity {
@@ -76,8 +76,12 @@ export interface ExecuteSelectedSkillDeps {
   ) => Promise<ActiveSkillIdentity | null>;
   /** Execute the skill (the stable P9a SkillRunner). */
   runSkill: (input: SkillExecutionInput) => Promise<SkillExecutionOutput>;
-  /** Deliver the skill reply through the shared outbound pipeline. */
-  dispatchOutput: (ctx: DispatchOutputCtx) => Promise<void>;
+  /**
+   * Deliver the skill reply through the shared outbound pipeline. Centralised
+   * and never-throwing (Codex #216 HIGH-1): returns a phase-classified outcome
+   * the caller maps to fall-through vs. handled, instead of throwing.
+   */
+  safeDispatchOutput: (ctx: DispatchOutputCtx) => Promise<DispatchOutcome>;
   logger: {
     info: (obj: unknown, msg: string) => void;
     warn: (obj: unknown, msg: string) => void;
@@ -297,63 +301,51 @@ export async function executeSelectedSkill(
   }
 
   // Contract 2: deliver through the shared pipeline (view-once / audit /
-  // pending / media) — never raw sendOutbound.
-  //
-  // EXACTLY-ONCE (Codex #216 review HIGH-A): dispatchOutput sends to the channel
-  // BEFORE persisting, so the typed OutboundDeliveryError tells us WHICH phase
-  // failed and we react accordingly (LLM-first: prefer letting ReAct recover):
-  //   - delivered === false (send threw, NOTHING reached the user) → fall
-  //     through to the normal ReAct turn so the agent still answers with a real,
-  //     adaptive reply. Safe: nothing was sent, so there is no double-send.
-  //   - delivered === true / unknown (sent, persist failed) → report handled
-  //     WITHOUT re-sending (a fall-through would double-send a financial
-  //     message) and log the inconsistency loudly for ops reconciliation.
-  // A canned fallback is reserved for Phase-2 "last resort" cases (e.g. a
-  // side-effecting confirmation that must NOT let ReAct improvise); Phase 1 only
+  // pending / media) — never raw sendOutbound. `safeDispatchOutput` centralises
+  // the EXACTLY-ONCE phase handling (Codex #216 HIGH-1) and never throws:
+  //   - not_sent (pre-send / disconnected gateway / channel threw — NOTHING
+  //     reached the user) → fall through to the normal ReAct turn so the agent
+  //     still answers adaptively. Safe: nothing was sent, so no double-send.
+  //   - sent_no_persist (sent but persist failed, or an ambiguous error) →
+  //     report handled WITHOUT re-sending (a fall-through would double-send a
+  //     financial message) and log the inconsistency loudly for ops.
+  // A canned fallback is reserved for Phase-2 "last resort" cases; Phase 1 only
   // runs side-effect-free prompt_only/evaluator, so ReAct recovery is best.
-  try {
-    await deps.dispatchOutput({
-      pessoa,
-      conversa,
-      inbound,
-      jid,
-      text: reply.text,
-      latestPending: null,
-      latestReportPdf: null,
-      turnHasSensitive: reply.turnHasSensitive,
-      sensitiveTools: reply.sensitiveTools,
-    });
-  } catch (e) {
-    const delivered = (e as { delivered?: unknown }).delivered;
-    if (delivered === false) {
-      // Pre-send failure: the channel send threw. In practice this means nothing
-      // reached the user (connection/crypto/serialization), so we fall through to
-      // the normal ReAct turn to still answer with a real, adaptive reply.
-      // CAVEAT (#227): the transport does NOT guarantee throw ⇒ not-delivered; a
-      // post-relay timeout could throw after delivery → a 2nd ReAct send would
-      // double-send. Narrow + low-harm for Phase-1 read-only replies; the outbound
-      // idempotency/dedupe ledger that closes this fully is tracked in #227.
-      deps.logger.warn(
-        {
-          conversa_id: conversa.id,
-          turno_id: inbound.id,
-          skill_descriptor: pinned.selected_skill_descriptor,
-          err: (e as Error).message,
-        },
-        'skill.dispatch_send_failed_fallthrough',
-      );
-      return { handled: false, reason: 'dispatch_send_failed' };
-    }
-    // delivered === true (sent, persist failed) OR unknown error: the message
-    // likely reached the user — report handled WITHOUT re-sending (no
-    // double-send) and log the inconsistency loudly for ops reconciliation.
+  // CAVEAT (#227): the transport does NOT guarantee throw ⇒ not-delivered; a
+  // post-relay timeout could be tagged not_sent after delivery → a 2nd ReAct
+  // send would double-send. Narrow + low-harm for Phase-1 read-only replies; the
+  // outbound idempotency/dedupe ledger that closes this fully is tracked in #227.
+  const outcome = await deps.safeDispatchOutput({
+    pessoa,
+    conversa,
+    inbound,
+    jid,
+    text: reply.text,
+    latestPending: null,
+    latestReportPdf: null,
+    turnHasSensitive: reply.turnHasSensitive,
+    sensitiveTools: reply.sensitiveTools,
+  });
+  if (outcome.status === 'not_sent') {
+    deps.logger.warn(
+      {
+        conversa_id: conversa.id,
+        turno_id: inbound.id,
+        skill_descriptor: pinned.selected_skill_descriptor,
+        err: outcome.error,
+      },
+      'skill.dispatch_send_failed_fallthrough',
+    );
+    return { handled: false, reason: 'dispatch_send_failed' };
+  }
+  if (outcome.status === 'sent_no_persist') {
     deps.logger.error(
       {
         conversa_id: conversa.id,
         turno_id: inbound.id,
         skill_descriptor: pinned.selected_skill_descriptor,
         skill_version: pinned.selected_skill_version,
-        err: (e as Error).message,
+        err: outcome.error,
         ops_alert: true,
       },
       'skill.dispatch_failed_after_send_inconsistency',

@@ -39,7 +39,7 @@ import { selectProcedure, type SelectorDecision } from '@/cognition/procedure-se
 import { evaluateCurrentStep } from '@/cognition/step-evaluator.js';
 import * as procedureEngine from '@/procedures/engine.js';
 import { CognitiveEventType } from '@/types/enums.js';
-import { sendOutbound, dispatchOutput } from './output-dispatch.js';
+import { sendOutbound, safeDispatchOutput } from './output-dispatch.js';
 import { executeSelectedSkill } from './execute-skill.js';
 import { runSkill } from '@/skills/index.js';
 import { skillsRepo } from '@/db/repositories.js';
@@ -929,7 +929,7 @@ async function runAgentForMensagemInner(
               }
             },
             runSkill,
-            dispatchOutput,
+            safeDispatchOutput,
             logger,
           },
         );

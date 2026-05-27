@@ -57,7 +57,11 @@ vi.mock('@/gateway/presence.js', () => ({ quotedReplyContext: () => undefined })
 vi.mock('@/agent/reflection.js', () => ({ detectCorrection: () => false }));
 vi.mock('@/agent/pdf-cleanup.js', () => ({ cleanupPDF: vi.fn() }));
 
-import { dispatchOutput, OutboundDeliveryError } from '@/agent/output-dispatch.js';
+import {
+  dispatchOutput,
+  safeDispatchOutput,
+  OutboundDeliveryError,
+} from '@/agent/output-dispatch.js';
 
 const pessoa = { id: 'p_1', telefone_whatsapp: '+5511999999999', preferencias: null } as unknown as Pessoa;
 const conversa = { id: 'c_1' } as Conversa;
@@ -141,5 +145,100 @@ describe('dispatchOutput — delivery-phase tagging (HIGH-1)', () => {
     await expect(dispatchOutput(mkCtx())).resolves.toBeUndefined();
     expect(m.sendOutboundText).toHaveBeenCalledOnce();
     expect(m.createMensagem).toHaveBeenCalledOnce();
+  });
+
+  // Codex #216 review (round 2) BLOCKER — a DISCONNECTED gateway makes baileys
+  // RETURN null (it does NOT throw). The phase-tagging must convert that null
+  // into delivered:false, else HIGH-1's silent drop stays reachable from the
+  // skill caller (text + voice) and a phantom whatsapp_id:null row gets written.
+
+  it('text send returns null (gateway disconnected) ⇒ delivered:false, NO phantom persist', async () => {
+    m.sendOutboundText.mockResolvedValue(null);
+    const err = await dispatchOutput(mkCtx()).catch((e) => e);
+    expect(err).toBeInstanceOf(OutboundDeliveryError);
+    expect((err as OutboundDeliveryError).delivered).toBe(false);
+    expect(m.createMensagem).not.toHaveBeenCalled(); // no whatsapp_id:null row
+  });
+
+  it('voice send returns null (gateway disconnected) ⇒ delivered:false, nothing persisted', async () => {
+    cfg.FEATURE_OUTBOUND_VOICE = true;
+    m.sendOutboundVoice.mockResolvedValue(null);
+    const err = await dispatchOutput(mkCtx({ inbound: audioInbound })).catch((e) => e);
+    expect(err).toBeInstanceOf(OutboundDeliveryError);
+    expect((err as OutboundDeliveryError).delivered).toBe(false);
+    expect(m.createMensagem).not.toHaveBeenCalled();
+  });
+
+  it('document send returns null (gateway disconnected) ⇒ delivered:false', async () => {
+    m.sendOutboundDocument.mockResolvedValue(null);
+    const ctx = mkCtx({
+      latestReportPdf: {
+        path: '/tmp/report.pdf',
+        fileName: 'report.pdf',
+        mimetype: 'application/pdf',
+        tipo: 'extrato',
+      },
+    });
+    const err = await dispatchOutput(ctx).catch((e) => e);
+    expect(err).toBeInstanceOf(OutboundDeliveryError);
+    expect((err as OutboundDeliveryError).delivered).toBe(false);
+    expect(m.createMensagem).not.toHaveBeenCalled();
+  });
+
+  it('pre-send recipient lookup throws ⇒ delivered:false, nothing sent', async () => {
+    m.findPessoa.mockRejectedValue(new Error('pessoas_db_down'));
+    const err = await dispatchOutput(mkCtx()).catch((e) => e);
+    expect(err).toBeInstanceOf(OutboundDeliveryError);
+    expect((err as OutboundDeliveryError).delivered).toBe(false);
+    expect(m.sendOutboundText).not.toHaveBeenCalled();
+  });
+
+  it('recipient not found ⇒ delivered:false, nothing sent', async () => {
+    m.findPessoa.mockResolvedValue(null);
+    const err = await dispatchOutput(mkCtx()).catch((e) => e);
+    expect(err).toBeInstanceOf(OutboundDeliveryError);
+    expect((err as OutboundDeliveryError).delivered).toBe(false);
+    expect(m.sendOutboundText).not.toHaveBeenCalled();
+  });
+});
+
+describe('safeDispatchOutput — centralised, never-throwing wrapper (HIGH-1)', () => {
+  it('happy path ⇒ { status: "delivered" }, no failure audit', async () => {
+    const out = await safeDispatchOutput(mkCtx());
+    expect(out).toEqual({ status: 'delivered' });
+    expect(m.audit).not.toHaveBeenCalledWith(
+      expect.objectContaining({ acao: 'outbound_dispatch_failed' }),
+    );
+  });
+
+  it('disconnected gateway (text null) ⇒ not_sent + failure audit (phase pre_send), no phantom row', async () => {
+    m.sendOutboundText.mockResolvedValue(null);
+    const out = await safeDispatchOutput(mkCtx());
+    expect(out).toMatchObject({ status: 'not_sent' });
+    expect(m.createMensagem).not.toHaveBeenCalled();
+    expect(m.audit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        acao: 'outbound_dispatch_failed',
+        metadata: expect.objectContaining({
+          phase: 'pre_send',
+          delivered: false,
+          idempotency_key: 'c_1:msg_1',
+        }),
+      }),
+    );
+  });
+
+  it('post-send persist failure ⇒ sent_no_persist + failure audit (phase post_send), no re-send', async () => {
+    m.sendOutboundText.mockResolvedValue('wid_text');
+    m.createMensagem.mockRejectedValue(new Error('persist_failed'));
+    const out = await safeDispatchOutput(mkCtx());
+    expect(out).toMatchObject({ status: 'sent_no_persist' });
+    expect(m.sendOutboundText).toHaveBeenCalledOnce();
+    expect(m.audit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        acao: 'outbound_dispatch_failed',
+        metadata: expect.objectContaining({ phase: 'post_send', delivered: true }),
+      }),
+    );
   });
 });
