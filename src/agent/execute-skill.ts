@@ -326,9 +326,13 @@ export async function executeSelectedSkill(
   } catch (e) {
     const delivered = (e as { delivered?: unknown }).delivered;
     if (delivered === false) {
-      // Pre-send failure: nothing reached the user. Fall through to the normal
-      // ReAct turn so the agent still answers (a real, adaptive reply). Safe —
-      // nothing was sent, so there is no double-send risk.
+      // Pre-send failure: the channel send threw. In practice this means nothing
+      // reached the user (connection/crypto/serialization), so we fall through to
+      // the normal ReAct turn to still answer with a real, adaptive reply.
+      // CAVEAT (#227): the transport does NOT guarantee throw ⇒ not-delivered; a
+      // post-relay timeout could throw after delivery → a 2nd ReAct send would
+      // double-send. Narrow + low-harm for Phase-1 read-only replies; the outbound
+      // idempotency/dedupe ledger that closes this fully is tracked in #227.
       deps.logger.warn(
         {
           conversa_id: conversa.id,
