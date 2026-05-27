@@ -117,13 +117,17 @@ describe('sendOutboundDocument', () => {
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
-  it('returns null and logs error when readFile throws (file vanished)', async () => {
+  it('THROWS and logs error when readFile fails (file vanished); sendMessage NOT called', async () => {
+    // Read failure is BEFORE the send → nothing left the channel. Throwing (not
+    // returning null) lets the PDF dispatch tag it delivered:false instead of
+    // mistaking a connected read-failure for a sent-without-id (Codex #216 round-4).
     const mod = await import('../../src/gateway/baileys.js');
     mod._internal._setSocketForTests(fakeSocket as never, true);
-    const wid = await mod.sendOutboundDocument('jid', '/no/such/file.pdf', {
-      mimetype: 'application/pdf', fileName: 'gone.pdf',
-    });
-    expect(wid).toBeNull();
+    await expect(
+      mod.sendOutboundDocument('jid', '/no/such/file.pdf', {
+        mimetype: 'application/pdf', fileName: 'gone.pdf',
+      }),
+    ).rejects.toThrow();
     expect(sendMessage).not.toHaveBeenCalled();
   });
 });

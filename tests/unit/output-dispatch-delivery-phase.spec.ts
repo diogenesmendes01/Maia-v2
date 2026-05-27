@@ -276,6 +276,17 @@ describe('dispatchOutput — PDF + poll phase tagging (Codex #216 round-3)', () 
     expect(m.sendOutboundDocument).toHaveBeenCalledOnce();
   });
 
+  it('document returns null while CONNECTED (sent-without-id) ⇒ delivered:true', async () => {
+    // After the round-4 fix a connected read-failure THROWS (→ delivered:false,
+    // covered above); a connected null can now only mean sent-without-id, so it
+    // must be delivered:true (no re-send). A disconnected null stays delivered:false.
+    m.isBaileysConnected.mockReturnValue(true);
+    m.sendOutboundDocument.mockResolvedValue(null);
+    const err = await dispatchOutput(pdfCtx()).catch((e) => e);
+    expect(err).toBeInstanceOf(OutboundDeliveryError);
+    expect((err as OutboundDeliveryError).delivered).toBe(true);
+  });
+
   it('poll pre-send recipient lookup throws ⇒ delivered:false, poll not sent', async () => {
     cfg.FEATURE_ONE_TAP = true;
     m.findPessoa.mockRejectedValue(new Error('pessoas_db_down'));

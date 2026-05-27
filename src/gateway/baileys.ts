@@ -489,8 +489,13 @@ export async function sendOutboundDocument(
   try {
     buf = await readFile(path);
   } catch (err) {
+    // Read failure happens BEFORE socket.sendMessage → nothing was sent. THROW
+    // (instead of returning null) so the caller can't confuse this with the
+    // disconnected / sent-without-id null cases and misclassify it as delivered
+    // (Codex #216 round-4 — document silent-drop). The sole caller (PDF dispatch)
+    // tags this delivered:false and recovers.
     logger.error({ err, path }, 'baileys.send_document.read_failed');
-    return null;
+    throw err;
   }
   const result = await socket.sendMessage(
     jid,
