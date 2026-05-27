@@ -79,12 +79,33 @@ vi.mock('@/gateway/presence.js', () => ({
 vi.mock('@/agent/reflection.js', () => ({ detectCorrection: () => false }));
 vi.mock('@/agent/pdf-cleanup.js', () => ({ cleanupPDF }));
 
-import { dispatchOutput, OutboundDeliveryError } from '@/agent/output-dispatch.js';
+import { dispatchOutput, safeDispatchOutput, OutboundDeliveryError } from '@/agent/output-dispatch.js';
 import * as baileys from '@/gateway/baileys.js';
 
 const pessoa = { id: 'p_1', telefone_whatsapp: '+5511999999999', preferencias: null } as unknown as Pessoa;
 const conversa = { id: 'c_1' } as Conversa;
 const inbound = { id: 'msg_1', conteudo: 'manda o extrato', metadata: null, tipo: 'texto' } as unknown as Mensagem;
+
+// Fresh ctx each call with a NEW random missing path so the real readFile is the
+// thing that fails (deterministically — the file cannot pre-exist).
+function mkPdfCtx(): Parameters<typeof dispatchOutput>[0] {
+  return {
+    pessoa,
+    conversa,
+    inbound,
+    jid: '5511999999999@s.whatsapp.net',
+    text: 'Segue o extrato.',
+    latestPending: null,
+    latestReportPdf: {
+      path: join(tmpdir(), `nope-${Math.random().toString(36).slice(2)}.pdf`),
+      fileName: 'extrato.pdf',
+      mimetype: 'application/pdf',
+      tipo: 'extrato',
+    },
+    turnHasSensitive: false,
+    sensitiveTools: [],
+  };
+}
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -99,22 +120,7 @@ beforeEach(() => {
 
 describe('dispatchOutput — document readFile failure (integrated, Codex #216 round-4)', () => {
   it('real readFile failure → real sendOutboundDocument throws → delivered:false (not a silent drop)', async () => {
-    const err = await dispatchOutput({
-      pessoa,
-      conversa,
-      inbound,
-      jid: '5511999999999@s.whatsapp.net',
-      text: 'Segue o extrato.',
-      latestPending: null,
-      latestReportPdf: {
-        path: join(tmpdir(), `nope-${Math.random().toString(36).slice(2)}.pdf`),
-        fileName: 'extrato.pdf',
-        mimetype: 'application/pdf',
-        tipo: 'extrato',
-      },
-      turnHasSensitive: false,
-      sensitiveTools: [],
-    }).catch((e) => e);
+    const err = await dispatchOutput(mkPdfCtx()).catch((e) => e);
 
     expect(err).toBeInstanceOf(OutboundDeliveryError);
     // readFile failed BEFORE the send → nothing reached the user → recoverable.
@@ -122,6 +128,17 @@ describe('dispatchOutput — document readFile failure (integrated, Codex #216 r
     // The socket was never asked to send (the throw came from readFile).
     expect(sendMessage).not.toHaveBeenCalled();
     // The tmp PDF cleanup still ran via `finally`.
+    expect(cleanupPDF).toHaveBeenCalledOnce();
+  });
+
+  it('through safeDispatchOutput ⇒ { status: "not_sent" } — the contract the skill caller maps', async () => {
+    // Same real chain, one level up: the centralised wrapper must classify the
+    // readFile failure as not_sent (→ caller falls through to ReAct), never as a
+    // silently-handled delivery.
+    const outcome = await safeDispatchOutput(mkPdfCtx());
+
+    expect(outcome).toMatchObject({ status: 'not_sent' });
+    expect(sendMessage).not.toHaveBeenCalled();
     expect(cleanupPDF).toHaveBeenCalledOnce();
   });
 });
