@@ -267,4 +267,155 @@ describe('SkillsRepoAdapter — Codex PR #215 review', () => {
     expect(observed.has('ambient-X')).toBe(false);
     expect(observed.has('ambient-Y')).toBe(false);
   });
+
+  // -------------------------------------------------------------------------
+  // Issue #218 — CROSS-TENANT (cross-empresa) isolation.
+  // The tests above prove the DE adapter never leaks cross-AGENT inside the
+  // same tenant. The product invariant — "Maias de empresas diferentes NUNCA
+  // compartilham dados ou herdam aprendizado" — is STRONGER: an agent on
+  // tenant-A must NEVER see ANY skill belonging to tenant-B, including
+  // tenant-B's tenant-wide (agent_id = null) skills. These tests seed BOTH
+  // tenants with owned + tenant-wide rows and assert each tenant's adapter
+  // call returns only that tenant's rows.
+  //
+  // CONTRACT (documented at skillsRepoAdapter in prod-env.ts):
+  //   `agent_id IS NULL` skills are tenant-WIDE (shared across agents of the
+  //   SAME tenant), NEVER cross-tenant. The repo's WHERE always pins
+  //   `tenant_id = <ctx>` so the `agent_id IS NULL` branch can only union
+  //   skills from the routed tenant.
+  // -------------------------------------------------------------------------
+  function seededCrossTenantStore() {
+    return [
+      // tenant-A skills
+      { ...mkRow({ id: 's_A_owned',  skill_descriptor: 'a.owned',  category: 'tool_mediated' }), tenant_id: 'tenant-A', agent_id: 'agent-A' },
+      { ...mkRow({ id: 's_A_shared', skill_descriptor: 'a.shared', category: 'tool_mediated' }), tenant_id: 'tenant-A', agent_id: null },
+      // tenant-B skills (must NEVER surface for tenant-A and vice-versa)
+      { ...mkRow({ id: 's_B_owned',  skill_descriptor: 'b.owned',  category: 'tool_mediated' }), tenant_id: 'tenant-B', agent_id: 'agent-B' },
+      { ...mkRow({ id: 's_B_shared', skill_descriptor: 'b.shared', category: 'tool_mediated' }), tenant_id: 'tenant-B', agent_id: null },
+    ];
+  }
+
+  it('issue #218 — findActive: tenant-A query returns ONLY tenant-A skills (own + tenant-A-shared); zero tenant-B leak', async () => {
+    const store = seededCrossTenantStore();
+    // Reproduce the FULL P9a listByCategory predicate, including the
+    // `tenant_id = <ctx>` clause that is the real cross-tenant gate.
+    mockListByCategory.mockImplementation(async (cat: string) => {
+      const ctxTenant = (await import('@/db/tenant-context.js')).getCurrentTenant();
+      const ctxAgent = getCurrentAgent();
+      return store.filter(
+        (r) =>
+          r.category === cat &&
+          r.tenant_id === ctxTenant &&
+          (r.agent_id === ctxAgent || r.agent_id === null),
+      );
+    });
+
+    // Route to tenant-A / agent-A. Ambient context is set to a tenant-B agent
+    // — would-be leak. The adapter MUST repin the nested context to tenant-A.
+    const skills = await runWithTenantContext(
+      { tenant_id: 'tenant-B', agent_id: 'agent-B' },
+      () =>
+        adapter.findActive({
+          tenant_id: 'tenant-A',
+          agent_id: 'agent-A',
+          applicable_to_intent: 'x',
+        }),
+    );
+    const ids = skills.map((s) => s.id);
+    expect(ids).toContain('s_A_owned');   // tenant-A own
+    expect(ids).toContain('s_A_shared');  // tenant-A tenant-wide
+    expect(ids).not.toContain('s_B_owned');  // cross-tenant LEAK (forbidden)
+    expect(ids).not.toContain('s_B_shared'); // cross-tenant LEAK including tenant-wide (forbidden)
+  });
+
+  it('issue #218 — findActive: symmetric — tenant-B query returns ONLY tenant-B skills; zero tenant-A leak', async () => {
+    const store = seededCrossTenantStore();
+    mockListByCategory.mockImplementation(async (cat: string) => {
+      const ctxTenant = (await import('@/db/tenant-context.js')).getCurrentTenant();
+      const ctxAgent = getCurrentAgent();
+      return store.filter(
+        (r) =>
+          r.category === cat &&
+          r.tenant_id === ctxTenant &&
+          (r.agent_id === ctxAgent || r.agent_id === null),
+      );
+    });
+
+    // Ambient is tenant-A; route to tenant-B / agent-B.
+    const skills = await runWithTenantContext(
+      { tenant_id: 'tenant-A', agent_id: 'agent-A' },
+      () =>
+        adapter.findActive({
+          tenant_id: 'tenant-B',
+          agent_id: 'agent-B',
+          applicable_to_intent: 'x',
+        }),
+    );
+    const ids = skills.map((s) => s.id);
+    expect(ids).toContain('s_B_owned');
+    expect(ids).toContain('s_B_shared');
+    expect(ids).not.toContain('s_A_owned');
+    expect(ids).not.toContain('s_A_shared');
+  });
+
+  it("issue #218 — find()/getById: skill belonging to tenant-B NEVER resolves under tenant-A scope (incl. tenant-wide)", async () => {
+    const store = seededCrossTenantStore();
+    // Reproduce the FULL getById predicate including tenant_id WHERE.
+    mockGetById.mockImplementation(async (id: string) => {
+      const ctxTenant = (await import('@/db/tenant-context.js')).getCurrentTenant();
+      const ctxAgent = getCurrentAgent();
+      const row = store.find((r) => r.id === id && r.tenant_id === ctxTenant);
+      if (!row) return null;
+      if (row.agent_id !== null && row.agent_id !== ctxAgent) return null;
+      return row;
+    });
+
+    const scopeA = { tenant_id: 'tenant-A', agent_id: 'agent-A' };
+    // Try to read each tenant-B skill under tenant-A scope.
+    const leakedBOwned = await runWithTenantContext(
+      { tenant_id: 'tenant-B', agent_id: 'agent-B' },
+      () => adapter.find('s_B_owned', scopeA),
+    );
+    const leakedBShared = await runWithTenantContext(
+      { tenant_id: 'tenant-B', agent_id: 'agent-B' },
+      () => adapter.find('s_B_shared', scopeA),
+    );
+    // Own tenant-A skills must still resolve under their own scope (sanity).
+    const ownA = await runWithTenantContext(
+      { tenant_id: 'tenant-A', agent_id: 'agent-A' },
+      () => adapter.find('s_A_owned', scopeA),
+    );
+    const sharedA = await runWithTenantContext(
+      { tenant_id: 'tenant-A', agent_id: 'agent-A' },
+      () => adapter.find('s_A_shared', scopeA),
+    );
+
+    expect(leakedBOwned).toBeNull();
+    expect(leakedBShared).toBeNull(); // tenant-wide ≠ cross-tenant. NEVER.
+    expect(ownA?.id).toBe('s_A_owned');
+    expect(sharedA?.id).toBe('s_A_shared');
+  });
+
+  it('issue #218 — every P9a lookup runs under the ROUTED tenant_id (not ambient) — observed via getCurrentTenant', async () => {
+    const observedTenants = new Set<string>();
+    mockListByCategory.mockImplementation(async () => {
+      const ctxTenant = (await import('@/db/tenant-context.js')).getCurrentTenant();
+      observedTenants.add(ctxTenant);
+      return [];
+    });
+
+    // Ambient = tenant-B, route = tenant-A. Every listByCategory call inside
+    // the adapter MUST observe tenant-A — never tenant-B.
+    await runWithTenantContext(
+      { tenant_id: 'tenant-B', agent_id: 'agent-B' },
+      () =>
+        adapter.findActive({
+          tenant_id: 'tenant-A',
+          agent_id: 'agent-A',
+        }),
+    );
+
+    expect(observedTenants.has('tenant-A')).toBe(true);
+    expect(observedTenants.has('tenant-B')).toBe(false); // ambient never observed
+  });
 });
