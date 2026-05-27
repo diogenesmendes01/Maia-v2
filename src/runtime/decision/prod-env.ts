@@ -273,6 +273,8 @@ function skillRowToSkill(row: {
   skill_descriptor: string;
   category: string;
   status: string;
+  goal?: string | unknown;
+  when_to_use?: string | unknown;
   allowed_tools: string[] | unknown;
   policy_descriptors: string[] | unknown;
   runtime_hints: Record<string, unknown> | unknown;
@@ -282,14 +284,23 @@ function skillRowToSkill(row: {
   const hints = (typeof row.runtime_hints === 'object' && row.runtime_hints !== null)
     ? (row.runtime_hints as Record<string, unknown>)
     : {};
+  const when_to_use = typeof row.when_to_use === 'string' ? row.when_to_use : '';
   return {
     id: row.id,
     category: row.category as Skill['category'],
     priority: 5, // P9a does not store priority; default 5 (medium)
     status: row.status as Skill['status'],
-    // P9a does not store applicable_to_intent — derived from skill_descriptor convention
-    // e.g. 'skill.greet' → intent 'greet'. PEPs that need exact match will
-    // consult the full descriptor-to-intent mapping when P9a adds this field.
+    // F1 Phase 0: P9a doesn't store a structured applicable_to_intent list,
+    // but the `skill_descriptor` follows a convention (e.g. 'skill.greet',
+    // 'transfer_intent') whose terminal token names the intent. We surface the
+    // descriptor token(s) as applicable_to_intent so SkillSelector's exact-match
+    // path works for descriptor-named skills; the free-text `when_to_use` below
+    // carries the rest of the matching signal.
+    applicable_to_intent: deriveIntentLabels(row.skill_descriptor),
+    // F1 Phase 0: free-text matching guidance from the Skill Contract. The
+    // anti-hijack matcher tokenises this against the classified intent so a
+    // skill is only selected when the turn clearly relates to it.
+    when_to_use,
     allowed_tools,
     blocked_tools: [], // P9a does not store blocked_tools separately
     requires_confirmation_tools: [], // P9a does not store this
@@ -300,6 +311,25 @@ function skillRowToSkill(row: {
       ? hints['output_schema_ref']
       : undefined,
   };
+}
+
+/**
+ * Derive candidate intent labels from a skill descriptor (F1 Phase 0).
+ *
+ * Descriptors follow loose conventions: dotted ('skill.greet', 'billing.cancel')
+ * or snake/flat ('transfer_intent'). We surface the FULL descriptor and its
+ * terminal segment as exact-match candidates so a descriptor that literally
+ * equals (or ends with) the classified intent label selects deterministically.
+ * The free-text `when_to_use` provides the fuzzier token-overlap signal.
+ */
+function deriveIntentLabels(descriptor: string): string[] {
+  if (!descriptor) return [];
+  const labels = new Set<string>();
+  const full = descriptor.trim().toLowerCase();
+  if (full) labels.add(full);
+  const lastDotSegment = full.split('.').pop();
+  if (lastDotSegment) labels.add(lastDotSegment);
+  return Array.from(labels);
 }
 
 const skillsRepoAdapter: SkillsRepo = {

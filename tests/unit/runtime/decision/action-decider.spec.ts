@@ -103,22 +103,52 @@ describe('P9b — ActionDecider', () => {
     expect(r.rationale).toContain('wf_123');
   });
 
-  it('asks clarification when no skill selected', async () => {
-    const decider = new ActionDeciderImpl(mkDeps());
+  it('F1 Phase 0 — responds (NOT ask_clarification) when no skill selected', async () => {
+    // Anti-regression: a turn with no selected skill is a normal free-form chat
+    // turn and MUST reach the LLM via `respond`. The old `ask_clarification`
+    // here made core.ts send a canned reply and skip the LLM — breaking all
+    // free-form chat the moment the engine was enabled.
+    const deps = mkDeps();
+    const decider = new ActionDeciderImpl(deps);
     const r = await decider.decide(
       mkInput({ skill: { selected_skill_id: undefined, candidate_skill_ids: [] } }),
     );
-    expect(r.action_mode).toBe('ask_clarification');
-    expect(r.rationale).toBe('skill_missing');
+    expect(r.action_mode).toBe('respond');
+    expect(r.rationale).toBe('respond:no_skill');
+    // No skill lookup should be attempted for a no-skill turn.
+    expect(deps.skillsRepo.find).not.toHaveBeenCalled();
   });
 
-  it('asks clarification when intent confidence below threshold', async () => {
+  it('F1 Phase 0 — responds even with low intent confidence (no auto ask_clarification)', async () => {
+    // A normal chat message frequently classifies below any confidence
+    // threshold; it must NOT be hijacked into the canned clarification reply.
     const decider = new ActionDeciderImpl(mkDeps());
+    const r = await decider.decide(
+      mkInput({
+        intent: { label: 'unknown', confidence: 0.3 },
+        skill: { selected_skill_id: undefined, candidate_skill_ids: [] },
+      }),
+    );
+    expect(r.action_mode).toBe('respond');
+    expect(r.rationale).toBe('respond:no_skill');
+  });
+
+  it('F1 Phase 0 — low intent confidence with a FOUND respond skill still responds', async () => {
+    // Confidence is no longer a gate in ActionDecider; a selected respond skill
+    // routes to `respond` regardless of intent confidence.
+    const skill = mkSkill({ id: 'skill_x', category: 'respond' });
+    const deps = mkDeps({
+      skillsRepo: {
+        find: vi.fn().mockResolvedValue(skill),
+        findActive: vi.fn().mockResolvedValue([skill]),
+      },
+    });
+    const decider = new ActionDeciderImpl(deps);
     const r = await decider.decide(
       mkInput({ intent: { label: 'unknown', confidence: 0.3 } }),
     );
-    expect(r.action_mode).toBe('ask_clarification');
-    expect(r.rationale).toContain('low_intent_confidence');
+    expect(r.action_mode).toBe('respond');
+    expect(r.rationale).toBe('respond:skill_x');
   });
 
   it('calls tool when skill.category=tool_mediated', async () => {
