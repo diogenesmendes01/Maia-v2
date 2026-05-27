@@ -366,6 +366,25 @@ const SKILL_DB_CATEGORIES = [
   'evaluator',
 ] as const;
 
+/**
+ * The DE's SkillsRepoAdapter. Its COMPLETE P9a surface is exactly two calls:
+ *   - findActive → p9aSkillsRepo.listByCategory (once per DB category)
+ *   - find       → p9aSkillsRepo.getById
+ * BOTH run inside a nested runWithTenantContext pinned to the ROUTED
+ * {tenant_id, agent_id} (Codex #215 BLOCKER 2). Any P9a query added here in the
+ * future MUST be wrapped the same way — otherwise it would silently scope to
+ * the AMBIENT context agent (getCurrentAgent) and leak another agent's skills.
+ *
+ * Tenant-wide skills (agent_id IS NULL) are SHARED across every agent in the
+ * tenant BY DESIGN — that is P9a's semantic for an ownerless/shared skill, NOT
+ * a leak (Codex #217 review item 3). The nested context only changes which
+ * agent P9a's `agent_id = <ctx> OR agent_id IS NULL` clause resolves <ctx> to;
+ * it can never surface a row OWNED by a different agent. So the inter-agent
+ * isolation guarantee is precisely: an agent-OWNED skill never resolves under
+ * a different agent, while ownerless/tenant-wide skills remain shared. This is
+ * proven with seeded rows (not just context observation) by the `items 3+4`,
+ * `item 5`, and `item 6` tests in tests/unit/decision-prod-env-skills.spec.ts.
+ */
 const skillsRepoAdapter: SkillsRepo = {
   async findActive(query, _options) {
     // TENANT ISOLATION (Codex PR #215 review, BLOCKER 2): P9a's listByCategory

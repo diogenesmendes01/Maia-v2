@@ -153,6 +153,14 @@ export function scoreSkillMatch(
   // legitimate single-token intent) and ≥2 covered tokens keep the raw ratio;
   // a lone covered token amid others is damped below SKILL_MATCH_THRESHOLD so
   // the `1/2 = 0.5` boundary case can never commit a selection.
+  //
+  // The `covered >= 2` branch is DELIBERATE (Codex #217 review item 1):
+  // covering two DISTINCT meaningful intent tokens is a genuine signal, so e.g.
+  // 2-of-4 (raw ratio exactly 0.5) is allowed to clear SKILL_MATCH_THRESHOLD and
+  // select — in contrast to the damped lone-token case. A thinner spread still
+  // fails on the ratio alone (e.g. 2-of-6 = 0.33 < 0.5). Both the 2-of-4
+  // (selects) and 1-of-2 (does not) boundaries are pinned by tests at the
+  // scoreSkillMatch AND SkillSelector levels.
   if (covered >= 2 || covered === iTokens.length) {
     return ratio;
   }

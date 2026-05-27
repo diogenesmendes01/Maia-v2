@@ -267,6 +267,50 @@ describe('P9b — SkillSelector', () => {
     expect(r.selected_skill_id).toBeUndefined();
   });
 
+  it('Codex #217 item 2 — anti-hijack holds at the SELECTOR level for the 1-of-2 boundary', async () => {
+    // The canonical hijack case proven end-to-end through SkillSelector (not
+    // just scoreSkillMatch): a 2-token intent `cancel_order` sharing exactly ONE
+    // token (`cancel`) with a `cancel_subscription` skill scores a damped 0.25,
+    // so NO selection is committed while the candidate stays visible.
+    const deps = mkDeps([
+      mkSkill({
+        id: 's_billing',
+        category: 'tool_mediated',
+        priority: 10,
+        applicable_to_intent: ['billing_question', 'cancel_subscription'],
+        when_to_use: 'When the customer asks to cancel their subscription.',
+      }),
+    ]);
+    const selector = new SkillSelectorImpl(deps);
+    const r = await selector.select(mkBase(), {
+      label: 'cancel_order',
+      confidence: 0.9,
+    });
+    expect(r.selected_skill_id).toBeUndefined();
+    expect(r.selected_skill).toBeUndefined();
+    expect(r.candidate_skill_ids).toEqual(['s_billing']);
+  });
+
+  it('Codex #217 item 1 — the 2-of-4 boundary (ratio 0.5) DOES select at the selector level', async () => {
+    // Sibling to the boundary above: an intent with four meaningful tokens that
+    // shares exactly two with the skill scores 2/4 = 0.5 (≥2 covered, not damped)
+    // and commits a selection — pinning the ≥2 branch end-to-end.
+    const deps = mkDeps([
+      mkSkill({
+        id: 's_transfer',
+        category: 'tool_mediated',
+        priority: 5,
+        when_to_use: 'Use to transfer money.',
+      }),
+    ]);
+    const selector = new SkillSelectorImpl(deps);
+    const r = await selector.select(mkBase(), {
+      label: 'transfer_money_international_urgent',
+      confidence: 0.8,
+    });
+    expect(r.selected_skill_id).toBe('s_transfer');
+  });
+
   it('F1 Phase 0 — picks the BEST match, not the highest-ranked irrelevant skill', async () => {
     // High-priority skill is irrelevant to the turn; a lower-priority skill
     // matches. The matcher must win over raw category×priority ranking.
