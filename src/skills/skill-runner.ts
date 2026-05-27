@@ -314,11 +314,26 @@ export async function runSkill(input: SkillExecutionInput): Promise<SkillExecuti
   const hints = (skill.runtime_hints ?? {}) as Record<string, unknown>;
   const timeoutMs = typeof hints.timeout_ms === 'number' ? hints.timeout_ms : DEFAULT_TIMEOUT_MS;
 
+  // AbortController composes external caller cancellation with internal
+  // timeout cancellation (issue #220). Modes read `ctx.signal` and forward
+  // it to `callLLM` / `toolDispatcher` so the actual HTTP/tool work is
+  // cancelled — not just the JS Promise.race winner.
+  //
+  // The abort reason is preserved so observers (logs, dispatcher) can tell
+  // whether the cancel came from the caller (`caller_cancelled`) or from the
+  // SkillRunner's own timeout (`skill_runner_timeout`).
   const abortController = new AbortController();
   if (input.signal) {
     // Forward caller cancellation to our internal controller.
-    if (input.signal.aborted) abortController.abort();
-    else input.signal.addEventListener('abort', () => abortController.abort(), { once: true });
+    if (input.signal.aborted) {
+      abortController.abort(input.signal.reason ?? 'caller_cancelled');
+    } else {
+      input.signal.addEventListener(
+        'abort',
+        () => abortController.abort(input.signal?.reason ?? 'caller_cancelled'),
+        { once: true },
+      );
+    }
   }
 
   const fallbackOutput: SkillExecutionOutput = {
@@ -340,8 +355,9 @@ export async function runSkill(input: SkillExecutionInput): Promise<SkillExecuti
       fallback: () => {
         // Timeout firing here means runCognitiveModule rejected the racing
         // promise — signal the in-flight mode so it stops dispatching tools
-        // (review #99 finding 3).
-        abortController.abort();
+        // (review #99 finding 3). Aborting also propagates through ctx.signal
+        // to `callLLM` so the HTTP request itself is cancelled (issue #220).
+        abortController.abort('skill_runner_timeout');
         return {
           ...fallbackOutput,
           latency_ms: Date.now() - startTime,
@@ -389,7 +405,7 @@ export async function runSkill(input: SkillExecutionInput): Promise<SkillExecuti
   );
 
   if (moduleResult.status === 'timeout') {
-    abortController.abort();
+    abortController.abort('skill_runner_timeout');
     return {
       ok: false,
       reason: 'timeout',

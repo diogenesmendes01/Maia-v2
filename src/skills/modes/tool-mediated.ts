@@ -142,6 +142,11 @@ export async function toolMediatedMode(
       messages,
       tools: tools.length > 0 ? tools : undefined,
       max_tokens,
+      // Forwarded so the SDK cancels the in-flight HTTP request when the
+      // SkillRunner aborts mid-iteration. Pre/post-iteration abort checks
+      // above already cut the loop; this catches cancellation that lands
+      // while the LLM call itself is pending. Issue #220.
+      signal: ctx.signal,
     });
     totalIn += res.usage.input_tokens;
     totalOut += res.usage.output_tokens;

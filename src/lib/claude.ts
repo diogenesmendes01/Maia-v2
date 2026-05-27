@@ -48,6 +48,12 @@ export interface LLMProvider {
     temperature?: number;
     max_tokens?: number;
     model?: string;
+    /**
+     * Optional AbortSignal forwarded to the underlying SDK request. When the
+     * signal aborts (e.g. SkillRunner timeout fires), the in-flight HTTP call
+     * is cancelled rather than left running to completion. Issue #220.
+     */
+    signal?: AbortSignal;
   }): Promise<LLMResponse>;
 }
 
@@ -75,17 +81,23 @@ class AnthropicProvider implements LLMProvider {
     max_tokens?: number;
     model?: string;
     pessoa_id?: string;
+    signal?: AbortSignal;
   }): Promise<LLMResponse> {
     const model = params.model ?? config.CLAUDE_MODEL_MAIN;
     const start = Date.now();
-    const res = await this.getClient().messages.create({
-      model,
-      max_tokens: params.max_tokens ?? 1024,
-      temperature: params.temperature ?? 0.2,
-      system: params.system,
-      messages: params.messages as Anthropic.MessageParam[],
-      tools: params.tools as Anthropic.Tool[] | undefined,
-    });
+    const res = await this.getClient().messages.create(
+      {
+        model,
+        max_tokens: params.max_tokens ?? 1024,
+        temperature: params.temperature ?? 0.2,
+        system: params.system,
+        messages: params.messages as Anthropic.MessageParam[],
+        tools: params.tools as Anthropic.Tool[] | undefined,
+      },
+      // signal: forwarded so callers (e.g. SkillRunner) can cancel the
+      // in-flight HTTP request when their timeout fires. Issue #220.
+      params.signal ? { signal: params.signal } : undefined,
+    );
     const tool_uses: LLMResponse['tool_uses'] = [];
     let textOut: string | null = null;
     for (const block of res.content) {
@@ -235,16 +247,22 @@ class OpenRouterProvider implements LLMProvider {
     max_tokens?: number;
     model?: string;
     pessoa_id?: string;
+    signal?: AbortSignal;
   }): Promise<LLMResponse> {
     const model = params.model ?? config.OPENROUTER_MODEL_MAIN;
     const start = Date.now();
-    const res = await this.getClient().chat.completions.create({
-      model,
-      messages: toOpenAIMessages(params.system, params.messages),
-      tools: toOpenAITools(params.tools),
-      max_tokens: params.max_tokens ?? 1024,
-      temperature: params.temperature ?? 0.2,
-    });
+    const res = await this.getClient().chat.completions.create(
+      {
+        model,
+        messages: toOpenAIMessages(params.system, params.messages),
+        tools: toOpenAITools(params.tools),
+        max_tokens: params.max_tokens ?? 1024,
+        temperature: params.temperature ?? 0.2,
+      },
+      // signal: forwarded so callers (e.g. SkillRunner) can cancel the
+      // in-flight HTTP request when their timeout fires. Issue #220.
+      params.signal ? { signal: params.signal } : undefined,
+    );
     const out = fromOpenAIResponse(res);
     incCounter('maia_llm_calls_total', { provider: 'openrouter', model, status: 'ok' });
     incCounter('maia_llm_tokens_total', { provider: 'openrouter', model, kind: 'input' }, out.usage.input_tokens);
@@ -286,6 +304,13 @@ export async function callLLM(params: {
    * undefined → only the global counter moves.
    */
   pessoa_id?: string;
+  /**
+   * Optional AbortSignal forwarded to the underlying provider SDK. When the
+   * signal aborts mid-call (e.g. SkillRunner timeout fires while a retry is
+   * pending), the loop is short-circuited so we don't keep retrying a
+   * cancelled request. Issue #220.
+   */
+  signal?: AbortSignal;
 }): Promise<LLMResponse> {
   // Read current model selection from facts (operator-changeable via dashboard).
   // Falls back to env defaults on miss or DB hiccup.
@@ -294,10 +319,19 @@ export async function callLLM(params: {
 
   let lastErr: unknown = null;
   for (let attempt = 0; attempt < config.CLAUDE_MAX_RETRIES; attempt++) {
+    // Honor caller cancellation before each attempt — refuse to start a new
+    // request when the signal has already aborted. Issue #220.
+    if (params.signal?.aborted) {
+      throw new Error('llm_call_aborted', { cause: params.signal.reason });
+    }
     try {
       return await provider.call({ ...params, model: mainModel });
     } catch (err) {
       lastErr = err;
+      // Abort surfaced through the SDK — do not retry. Issue #220.
+      if (params.signal?.aborted || isAbortError(err)) {
+        throw err;
+      }
       logger.warn({ attempt, err: (err as Error).message, model: mainModel }, 'llm.retry');
       if (attempt < config.CLAUDE_MAX_RETRIES - 1) {
         await sleep(2000 * Math.pow(2, attempt));
@@ -305,6 +339,9 @@ export async function callLLM(params: {
     }
   }
   // fallback to fast model
+  if (params.signal?.aborted) {
+    throw lastErr ?? new Error('llm_call_aborted');
+  }
   try {
     logger.warn({ fallback_model: fastModel }, 'llm.fallback_to_fast');
     return await provider.call({ ...params, model: fastModel });
@@ -312,4 +349,16 @@ export async function callLLM(params: {
     logger.error({ err }, 'llm.fast_fallback_failed');
     throw lastErr ?? err;
   }
+}
+
+/**
+ * Detect SDK-thrown abort errors. Both Anthropic and OpenAI SDKs raise an
+ * APIUserAbortError (`name === 'AbortError'`) when the request signal aborts;
+ * a plain DOMException with name 'AbortError' is also possible from native
+ * fetch. We check name to stay provider-agnostic. Issue #220.
+ */
+function isAbortError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const name = (err as { name?: unknown }).name;
+  return name === 'AbortError' || name === 'APIUserAbortError';
 }
