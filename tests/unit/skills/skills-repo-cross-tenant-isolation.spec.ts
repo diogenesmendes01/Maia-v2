@@ -375,6 +375,57 @@ function seedTwoTenantsReverse() {
   );
 }
 
+// Item 3 (CRITICAL — adversarial seed for `agent_id IS NULL` branch).
+//
+// The previous adversarial seeds still left an agent-scoped row for the routed
+// tenant in the table. Production's `findActive(descriptor)` (default arg)
+// builds:
+//   WHERE tenant_id=ctx AND descriptor=... AND status='active'
+//         AND (agent_id = ctxAgent OR agent_id IS NULL)
+//   ORDER BY agent_id IS NULL ASC
+//   LIMIT 1
+// If a regression DROPPED only the `tenant_id` filter, the WHERE would still
+// match `agent_id = 'agent-A' OR agent_id IS NULL`. That admits BOTH `s_A_owned`
+// (agent-A, sort key 0) AND any tenant-wide row including `s_B_shared`. With
+// `s_A_owned` at sort key 0 and the tenant-wide rows at sort key 1, `s_A_owned`
+// STILL wins by ORDER BY — so the old test passes by accident regardless of
+// the `tenant_id` filter being present or not. The `agent_id IS NULL` BRANCH
+// (the only one that could leak the OTHER tenant's tenant-wide row) is never
+// adversarially exercised by that seed.
+//
+// This seed contains ONLY tenant-wide rows from BOTH tenants (no agent-scoped
+// rows at all). With the tenant filter dropped, both `s_A_shared` and
+// `s_B_shared` match the WHERE (both have `agent_id IS NULL`); ORDER BY puts
+// them at the SAME sort key (1), so the sort cannot disambiguate, and `limit(1)`
+// returns whichever was seeded FIRST. By seeding B FIRST, a missing `tenant_id`
+// filter would return `s_B_shared` under tenant-A's context → assertion fails.
+// With the filter present, only `s_A_shared` matches and the test passes.
+// This is the only seed that proves the `tenant_id` guard actually fires on
+// the `agent_id IS NULL` branch.
+function seedTenantWideOnlyBFirst() {
+  // B's tenant-wide row goes FIRST so it sorts ahead of A's in insertion order.
+  tableOf(skillsTable).push(
+    baseRow({ id: 's_B_shared', tenant_id: 'tenant-B', agent_id: null, skill_descriptor: 'shared.descr', category: 'tool_mediated' }),
+  );
+  tableOf(skillsTable).push(
+    baseRow({ id: 's_A_shared', tenant_id: 'tenant-A', agent_id: null, skill_descriptor: 'shared.descr', category: 'tool_mediated' }),
+  );
+}
+
+// Symmetric pair for `seedTenantWideOnlyBFirst`. Same shape (tenant-wide rows
+// only, no agent-scoped rows) but with A FIRST, so tenant-B reads must STILL
+// return tenant-B's row even though tenant-A's tenant-wide row was inserted
+// first. Covers the cross-tenant guard on the `agent_id IS NULL` branch from
+// the tenant-B direction (item 4 / symmetry).
+function seedTenantWideOnlyAFirst() {
+  tableOf(skillsTable).push(
+    baseRow({ id: 's_A_shared', tenant_id: 'tenant-A', agent_id: null, skill_descriptor: 'shared.descr', category: 'tool_mediated' }),
+  );
+  tableOf(skillsTable).push(
+    baseRow({ id: 's_B_shared', tenant_id: 'tenant-B', agent_id: null, skill_descriptor: 'shared.descr', category: 'tool_mediated' }),
+  );
+}
+
 function idsOf<T extends { id: string }>(rows: T[]): string[] {
   return rows.map((r) => r.id);
 }
@@ -709,6 +760,81 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
         expect(['s_A_owned', 's_A_shared']).not.toContain(got!.id);
       });
     }
+
+    // ---------------------------------------------------------------------
+    // Item 3 (CRITICAL — adversarial for the `agent_id IS NULL` branch).
+    //
+    // The two seeds above include an agent-scoped row for the routed tenant,
+    // so production's ORDER BY agent_id IS NULL ASC always sorts that row
+    // first regardless of whether the tenant_id filter is present — the test
+    // passes by accident. This seed pair contains ONLY tenant-wide rows from
+    // BOTH tenants (no agent-scoped rows). With the tenant_id filter dropped,
+    // both rows match the WHERE and tie on the ORDER BY sort key (both
+    // `agent_id IS NULL` evaluates to true → sort key 1); `limit(1)` then
+    // returns whichever was seeded FIRST. B-first insertion under tenant-A's
+    // context would return s_B_shared → wrong tenant → assertion fails.
+    // ---------------------------------------------------------------------
+    it('findActive (default) with TENANT-WIDE-ONLY seed [B-first]: tenant-A returns s_A_shared (proves tenant_id WHERE guard fires on agent_id IS NULL branch)', async () => {
+      // B's tenant-wide row is inserted FIRST. If the production query lost
+      // its `tenant_id` filter, both `s_A_shared` and `s_B_shared` would match
+      // the WHERE; the ORDER BY `agent_id IS NULL` cannot disambiguate (both
+      // are NULL); `limit(1)` would return s_B_shared (seeded first) — wrong
+      // tenant. The assertion below catches that.
+      seedTenantWideOnlyBFirst();
+      const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
+      const got = await runWithTenantContext(
+        { tenant_id: 'tenant-A', agent_id: 'agent-A' },
+        () => skillsRepo.findActive('shared.descr'),
+      );
+      expect(got).not.toBeNull();
+      expect(got!.id).toBe('s_A_shared');
+      expect(got!.tenant_id).toBe('tenant-A');
+    });
+
+    it('findActive (default) with TENANT-WIDE-ONLY seed [A-first]: symmetric — tenant-B returns s_B_shared (proves guard fires from the other direction)', async () => {
+      // Symmetry: A's tenant-wide row goes first. Under tenant-B context,
+      // a missing tenant filter would surface s_A_shared (seeded first) →
+      // wrong tenant. With the guard in place, only s_B_shared matches.
+      seedTenantWideOnlyAFirst();
+      const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
+      const got = await runWithTenantContext(
+        { tenant_id: 'tenant-B', agent_id: 'agent-B' },
+        () => skillsRepo.findActive('shared.descr'),
+      );
+      expect(got).not.toBeNull();
+      expect(got!.id).toBe('s_B_shared');
+      expect(got!.tenant_id).toBe('tenant-B');
+    });
+
+    // Item 4 (symmetry) — same shape but with explicit `agent_id=null` (the
+    // explicit-tenant-wide branch of findActive). Production WHERE is then
+    // `tenant_id=ctx AND descriptor=... AND status='active' AND agent_id IS NULL`.
+    // Both tenant-wide rows match without a tenant filter; insertion order
+    // decides who wins. B-first ⇒ tenant-A's read must STILL return s_A_shared
+    // (proves the tenant_id WHERE guard fires on the explicit-null branch too).
+    it('findActive(d, null) with TENANT-WIDE-ONLY seed [B-first]: tenant-A returns s_A_shared (explicit-null branch)', async () => {
+      seedTenantWideOnlyBFirst();
+      const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
+      const got = await runWithTenantContext(
+        { tenant_id: 'tenant-A', agent_id: 'agent-A' },
+        () => skillsRepo.findActive('shared.descr', null),
+      );
+      expect(got).not.toBeNull();
+      expect(got!.id).toBe('s_A_shared');
+      expect(got!.tenant_id).toBe('tenant-A');
+    });
+
+    it('findActive(d, null) with TENANT-WIDE-ONLY seed [A-first]: symmetric — tenant-B returns s_B_shared (explicit-null branch)', async () => {
+      seedTenantWideOnlyAFirst();
+      const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
+      const got = await runWithTenantContext(
+        { tenant_id: 'tenant-B', agent_id: 'agent-B' },
+        () => skillsRepo.findActive('shared.descr', null),
+      );
+      expect(got).not.toBeNull();
+      expect(got!.id).toBe('s_B_shared');
+      expect(got!.tenant_id).toBe('tenant-B');
+    });
   });
 
   // ---------------------------------------------------------------------
@@ -883,6 +1009,23 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
       // excluded (scopeClauseFor explicit string = exactly that agent_id),
       // and tenant-B's two rows are excluded by tenant_id.
       expect(ids).toEqual(['s_A_owned']);
+    });
+
+    // Item 4 (symmetry) — same shape but tenant-B asking for agent-B. Mirrors
+    // the test above so the explicit-agent branch of scopeClauseFor is proven
+    // tenant-scoped from BOTH directions.
+    it('listVersions(descriptor, explicit agentId): symmetric — tenant-B asks for agent-B — returns only s_B_owned, excludes tenant-wide AND tenant-A', async () => {
+      seedTwoTenants();
+      const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
+      const got = await runWithTenantContext(
+        { tenant_id: 'tenant-B', agent_id: 'agent-B' },
+        () => skillsRepo.listVersions('shared.descr', 'agent-B'),
+      );
+      const ids = idsOf(got);
+      // ONLY the agent-scoped tenant-B version — tenant-wide s_B_shared is
+      // excluded by the explicit agent filter, and tenant-A's two rows are
+      // excluded by tenant_id.
+      expect(ids).toEqual(['s_B_owned']);
     });
 
     it('listVersions(descriptor, agentId: null): tenant-A asks for tenant-wide — returns only s_A_shared, excludes tenant-B tenant-wide', async () => {
