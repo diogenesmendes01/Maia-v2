@@ -47,17 +47,19 @@ describe('F1 Phase 0 — scoreSkillMatch', () => {
     ).toBe(1);
   });
 
-  it('returns a partial ratio when only some intent tokens overlap', () => {
+  it('damps a single-token partial overlap (anti-hijack) well below threshold', () => {
     const skill = mkSkill({
       id: 's_pay',
       when_to_use: 'Use to process a payment.',
     });
-    // intent tokens {schedule, payment, reminder}; only "payment" overlaps.
+    // intent tokens {schedule, payment, reminder}; only "payment" overlaps →
+    // raw ratio 1/3, then damped (×0.5) because exactly one token is covered
+    // while the intent has more. BLOCKER 1: a lone shared token must not select.
     const score = scoreSkillMatch(skill, {
       label: 'schedule_payment_reminder',
       confidence: 0.8,
     });
-    expect(score).toBeCloseTo(1 / 3, 5);
+    expect(score).toBeCloseTo((1 / 3) * 0.5, 5);
     expect(score).toBeLessThan(SKILL_MATCH_THRESHOLD);
   });
 
@@ -105,5 +107,77 @@ describe('F1 Phase 0 — scoreSkillMatch', () => {
     expect(
       scoreSkillMatch(skill, { label: 'transfer_money', confidence: 0.9 }),
     ).toBe(0);
+  });
+
+  // ---------------------------------------------------------------------------
+  // BLOCKER 1 (Codex PR #215 review): the exact 1-of-2-tokens boundary.
+  // ---------------------------------------------------------------------------
+
+  it('BLOCKER 1 — a 1-of-2 token overlap (raw ratio 0.5) does NOT clear the threshold', () => {
+    // The canonical hijack case: a 2-token intent `cancel_order` shares exactly
+    // ONE meaningful token (`cancel`) with a `cancel_subscription` skill. The
+    // raw coverage ratio is 1/2 == 0.5 == SKILL_MATCH_THRESHOLD; un-damped this
+    // would select and hijack the turn. Damping pushes it to 0.25 < threshold.
+    const skill = mkSkill({
+      id: 's_billing',
+      applicable_to_intent: ['billing_question', 'cancel_subscription'],
+      when_to_use: 'When the customer asks to cancel their subscription.',
+    });
+    const score = scoreSkillMatch(skill, {
+      label: 'cancel_order',
+      confidence: 0.9,
+    });
+    // Raw ratio would be exactly 0.5; damped single-token coverage is 0.25.
+    expect(score).toBeCloseTo(0.25, 5);
+    expect(score).toBeLessThan(SKILL_MATCH_THRESHOLD);
+  });
+
+  it('BLOCKER 1 — a clearly-matching 2-of-2 token overlap DOES clear the threshold', () => {
+    // Contrast case: every meaningful intent token is covered → full coverage →
+    // raw ratio 1.0, no damping, selects.
+    const skill = mkSkill({
+      id: 's_cancel',
+      when_to_use: 'Use to cancel an order for the customer.',
+    });
+    const score = scoreSkillMatch(skill, {
+      label: 'cancel_order',
+      confidence: 0.9,
+    });
+    expect(score).toBe(1);
+    expect(score).toBeGreaterThanOrEqual(SKILL_MATCH_THRESHOLD);
+  });
+
+  it('BLOCKER 1 — covering 2 of 3 tokens (no full coverage) still clears via the ≥2 rule', () => {
+    // Two meaningful tokens covered out of three → ratio 2/3 ≈ 0.667, kept
+    // (not damped) because ≥2 tokens are covered. This is a legitimately strong
+    // partial match and SHOULD select.
+    const skill = mkSkill({
+      id: 's_transfer',
+      when_to_use: 'Use to transfer money to another account.',
+    });
+    const score = scoreSkillMatch(skill, {
+      label: 'transfer_money_now',
+      confidence: 0.8,
+    });
+    expect(score).toBeCloseTo(2 / 3, 5);
+    expect(score).toBeGreaterThanOrEqual(SKILL_MATCH_THRESHOLD);
+  });
+
+  // ---------------------------------------------------------------------------
+  // ROBUSTNESS 5 (Codex PR #215 review): NFD diacritic-insensitive tokenizing.
+  // ---------------------------------------------------------------------------
+
+  it('ROBUSTNESS 5 — matches an unaccented intent against an accented when_to_use (pt-BR NFD)', () => {
+    // The classified intent label is unaccented snake_case (`saudacao`); the
+    // skill guidance is accented pt-BR (`saudação`). After NFD + diacritic
+    // stripping both reduce to `saudacao`, so the single-token intent is fully
+    // covered → ratio 1.0.
+    const skill = mkSkill({
+      id: 's_greet',
+      when_to_use: 'Use para uma saudação calorosa ao cliente.',
+    });
+    expect(
+      scoreSkillMatch(skill, { label: 'saudacao', confidence: 0.9 }),
+    ).toBe(1);
   });
 });

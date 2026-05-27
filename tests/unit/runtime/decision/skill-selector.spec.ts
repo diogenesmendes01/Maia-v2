@@ -317,4 +317,71 @@ describe('P9b — SkillSelector', () => {
     expect(SKILL_MATCH_THRESHOLD).toBeGreaterThan(0);
     expect(SKILL_MATCH_THRESHOLD).toBeLessThanOrEqual(1);
   });
+
+  // ---------------------------------------------------------------------------
+  // CORRECTNESS 3 (Codex PR #215 review): selected_skill_id ∈ candidate_skill_ids
+  // ---------------------------------------------------------------------------
+
+  it('CORRECTNESS 3 — selected_skill_id is always present in candidate_skill_ids', async () => {
+    // Six irrelevant HIGH-priority skills fill the top-5 candidate slice; the
+    // ONLY skill that matches the intent has the LOWEST priority, so it ranks
+    // outside the top-5 by category×priority. The invariant requires the
+    // committed selection to still appear in the (bounded) candidate list.
+    const skills: Skill[] = [
+      ...Array.from({ length: 6 }, (_, i) =>
+        mkSkill({
+          id: `irrelevant_${i}`,
+          category: 'respond',
+          priority: 100 - i, // all high; fill the top of the ranking
+          applicable_to_intent: ['complaint'],
+          when_to_use: 'When the user files a complaint.',
+        }),
+      ),
+      mkSkill({
+        id: 's_match_low',
+        category: 'tool_mediated',
+        priority: 1, // lowest → ranks last
+        applicable_to_intent: ['balance_query'],
+        when_to_use: 'When the user asks for their account balance.',
+      }),
+    ];
+    const deps = mkDeps(skills);
+    const selector = new SkillSelectorImpl(deps);
+    const r = await selector.select(mkBase(), {
+      label: 'balance_query',
+      confidence: 0.85,
+    });
+
+    expect(r.selected_skill_id).toBe('s_match_low');
+    // The invariant: the selection must be in the candidate set...
+    expect(r.candidate_skill_ids).toContain('s_match_low');
+    // ...and the candidate set must stay bounded at MAX_CANDIDATES (5).
+    expect(r.candidate_skill_ids.length).toBeLessThanOrEqual(5);
+  });
+
+  it('CORRECTNESS 3 — does not duplicate the selected id when it is already a top candidate', async () => {
+    const deps = mkDeps([
+      mkSkill({
+        id: 's_top',
+        category: 'respond',
+        priority: 10,
+        applicable_to_intent: ['balance_query'],
+      }),
+      mkSkill({
+        id: 's_other',
+        category: 'respond',
+        priority: 1,
+        applicable_to_intent: ['something_else'],
+      }),
+    ]);
+    const selector = new SkillSelectorImpl(deps);
+    const r = await selector.select(mkBase(), {
+      label: 'balance_query',
+      confidence: 0.85,
+    });
+    expect(r.selected_skill_id).toBe('s_top');
+    expect(
+      r.candidate_skill_ids.filter((id) => id === 's_top'),
+    ).toHaveLength(1);
+  });
 });
