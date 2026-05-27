@@ -2,7 +2,6 @@ import Anthropic from '@anthropic-ai/sdk';
 import OpenAI from 'openai';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
-import { sleep } from '@/lib/utils.js';
 import { recordLLMCost } from '@/lib/cost-ledger.js';
 import { incCounter, observeHistogram } from '@/lib/metrics.js';
 import { getCurrentMainModel, getCurrentFastModel } from '@/lib/llm-settings.js';
@@ -312,6 +311,14 @@ export async function callLLM(params: {
    */
   signal?: AbortSignal;
 }): Promise<LLMResponse> {
+  // Early cancellation — refuse to start any work (including the model
+  // lookup) when the signal has already aborted. PR #221 review, item 4:
+  // a caller that aborts before this entry point shouldn't pay for the
+  // settings-fact read or any other setup.
+  if (params.signal?.aborted) {
+    throw new Error('llm_call_aborted', { cause: params.signal.reason });
+  }
+
   // Read current model selection from facts (operator-changeable via dashboard).
   // Falls back to env defaults on miss or DB hiccup.
   const mainModel = await getCurrentMainModel();
@@ -334,7 +341,11 @@ export async function callLLM(params: {
       }
       logger.warn({ attempt, err: (err as Error).message, model: mainModel }, 'llm.retry');
       if (attempt < config.CLAUDE_MAX_RETRIES - 1) {
-        await sleep(2000 * Math.pow(2, attempt));
+        // Abort-aware backoff (PR #221 review, item 5): abort during the
+        // retry sleep must short-circuit the timer instead of waiting it
+        // out. Plain `await sleep(ms)` delays the abort by up to the
+        // backoff duration.
+        await abortableSleep(2000 * Math.pow(2, attempt), params.signal);
       }
     }
   }
@@ -346,9 +357,42 @@ export async function callLLM(params: {
     logger.warn({ fallback_model: fastModel }, 'llm.fallback_to_fast');
     return await provider.call({ ...params, model: fastModel });
   } catch (err) {
+    // If the fallback request was aborted (caller cancelled mid-fallback),
+    // surface the abort untouched. Throwing `lastErr ?? err` here would
+    // mask the abort behind a prior main-model retry error and rob the
+    // caller of the cancellation signal. PR #221 review, item 2.
+    if (params.signal?.aborted || isAbortError(err)) {
+      throw err;
+    }
     logger.error({ err }, 'llm.fast_fallback_failed');
     throw lastErr ?? err;
   }
+}
+
+/**
+ * Sleep for `ms` milliseconds, but reject immediately if `signal` aborts in
+ * the meantime. Clears the timer on abort so the timeout doesn't stay
+ * pending. Issue #220 / PR #221 review, item 5.
+ */
+function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error('llm_call_aborted', { cause: signal.reason }));
+      return;
+    }
+    let onAbort: (() => void) | null = null;
+    const timer = setTimeout(() => {
+      if (onAbort && signal) signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    if (signal) {
+      onAbort = () => {
+        clearTimeout(timer);
+        reject(new Error('llm_call_aborted', { cause: signal.reason }));
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+  });
 }
 
 /**
