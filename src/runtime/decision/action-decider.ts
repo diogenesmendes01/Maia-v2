@@ -2,10 +2,14 @@
  * P9b — Action Decider.
  *
  * Spec §9.2: consolidates inputs from all upstream steps and chooses one of
- * 5 ActionModes:
+ * 6 ActionModes:
  *   - escalate              (require_dual_approval, require_human_review)
  *   - continue_workflow     (active procedure in continue mode)
- *   - call_tool             (FOUND + selected skill is tool_mediated / decide)
+ *   - execute_skill         (F1 Phase 1: FOUND + selected skill's execution_mode
+ *                            ∈ {prompt_only, evaluator} — terminal, side-effect
+ *                            free; core.ts runs it via runSkill)
+ *   - call_tool             (FOUND + skill is tool_mediated / decide category
+ *                            with a side-effecting execution_mode)
  *   - respond               (default — incl. no selected skill = free-form chat)
  *   - ask_clarification     (NOT a normal no-skill outcome — a no-skill turn
  *                            routes to `respond`, see F1 Phase 0 below. The
@@ -184,6 +188,34 @@ export class ActionDeciderImpl implements ActionDecider {
       };
     }
 
+    // 4.5 F1 Phase 1 — direct skill execution, gated by execution_mode.
+    //
+    // Spec §4.1: emit `execute_skill` ONLY when the selected skill's
+    // execution_mode is terminal AND side-effect free (`prompt_only` |
+    // `evaluator`). This gate is on `execution_mode`, NOT `category` — they are
+    // independent (a `decide`-category skill can be `tool_mediated`, and a
+    // `respond`-category skill could in principle be `evaluator`). Side-effecting
+    // modes (`tool_mediated` / `procedure_adapter`) are EXCLUDED here and fall
+    // through to the category-based call_tool/respond branches below — they need
+    // the Phase 2 dispatcher bridge + a side-effect/terminality contract before
+    // they can be executed directly. The pinned identity (descriptor + version)
+    // is threaded onto the packet by the engine's skill step so the core.ts call
+    // site can assert the active row is still the one evaluated here.
+    if (isDirectlyExecutable(skill.execution_mode)) {
+      return {
+        action_mode: 'execute_skill',
+        tool_permissions: EMPTY_TOOL_PERMS,
+        context_requirements: buildContextRequirements({
+          skill,
+          intent: input.intent,
+          risk: input.risk,
+          workflow: input.workflow,
+        }),
+        evaluation_plan: DEFAULT_EVAL_PLAN,
+        rationale: `execute_skill:${skill.id}`,
+      };
+    }
+
     if (skill.category === 'tool_mediated' || skill.category === 'decide') {
       // Codex review #103: enforce Mid PEP `reduce_tool_set` reductions
       // BEFORE emitting the packet. If reducing removes every available tool
@@ -235,6 +267,17 @@ export class ActionDeciderImpl implements ActionDecider {
       rationale: `respond:${skill.id}`,
     };
   }
+}
+
+/**
+ * F1 Phase 1 — execution_mode gate (spec §4.1). Returns true ONLY for the
+ * terminal, side-effect-free modes Phase 1 is allowed to execute directly.
+ * `tool_mediated` / `procedure_adapter` (side-effecting) are EXCLUDED — they
+ * are Phase 2. An absent/unknown execution_mode is NOT executable (fail-safe:
+ * legacy/stub skills route to respond/call_tool as before).
+ */
+function isDirectlyExecutable(execution_mode: Skill['execution_mode']): boolean {
+  return execution_mode === 'prompt_only' || execution_mode === 'evaluator';
 }
 
 function buildToolPerms(skill: Skill): DecisionPacket['tool_permissions'] {

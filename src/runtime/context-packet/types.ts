@@ -59,7 +59,12 @@ export type ActionMode =
   | 'ask_clarification'
   | 'call_tool'
   | 'escalate'
-  | 'continue_workflow';
+  | 'continue_workflow'
+  // F1 Phase 1: a selected skill whose execution_mode is terminal + side-effect
+  // free (`prompt_only` | `evaluator`) is executed directly via `runSkill` at
+  // the core.ts call site. Side-effecting modes (`tool_mediated` /
+  // `procedure_adapter`) are explicitly NOT routed here — they remain Phase 2.
+  | 'execute_skill';
 export type PolicyDecision =
   | 'allow'
   | 'block'
@@ -135,6 +140,17 @@ export interface DecisionPacket {
     workflow_id?: string;
     agent_id: string;
     selected_skill_id?: string;
+    /**
+     * F1 Phase 1 (Codex HIGH/P2 — immutable identity): the selected skill's
+     * stable descriptor + version, pinned at decision time. The execute_skill
+     * call site re-resolves the active skill by descriptor under the routed
+     * agent and asserts the freshly-read `id`/`version` still equal these
+     * pinned values before executing — otherwise an activate/rollback race (or
+     * routed-agent mismatch) could execute a *different* skill than the engine
+     * evaluated. Present only when a skill was selected.
+     */
+    selected_skill_descriptor?: string;
+    selected_skill_version?: number;
     candidate_skill_ids: string[];
   };
   action_mode: ActionMode;

@@ -471,6 +471,179 @@ describe('P9b — ActionDecider', () => {
     expect(r.tool_permissions.allowed_tools).toEqual([]);
   });
 
+  // ──────────────────────────────────────────────────────────────────────────
+  // F1 Phase 1 — execute_skill gated by execution_mode (spec §4.1)
+  // ──────────────────────────────────────────────────────────────────────────
+
+  it('F1 Phase 1 — selected prompt_only skill ⇒ execute_skill', async () => {
+    const skill = mkSkill({
+      id: 'skill_faq',
+      skill_descriptor: 'faq.answer',
+      version: 3,
+      category: 'respond',
+      execution_mode: 'prompt_only',
+    });
+    const deps = mkDeps({
+      skillsRepo: {
+        find: vi.fn().mockResolvedValue(skill),
+        findActive: vi.fn().mockResolvedValue([skill]),
+      },
+    });
+    const decider = new ActionDeciderImpl(deps);
+    const r = await decider.decide(
+      mkInput({
+        skill: {
+          selected_skill_id: 'skill_faq',
+          candidate_skill_ids: ['skill_faq'],
+          selected_skill: skill,
+        },
+      }),
+    );
+    expect(r.action_mode).toBe('execute_skill');
+    expect(r.rationale).toBe('execute_skill:skill_faq');
+    // execute_skill carries no tool permissions.
+    expect(r.tool_permissions.allowed_tools).toEqual([]);
+  });
+
+  it('F1 Phase 1 — selected evaluator skill ⇒ execute_skill', async () => {
+    const skill = mkSkill({
+      id: 'skill_eval',
+      skill_descriptor: 'capability.eval',
+      version: 1,
+      category: 'decide',
+      execution_mode: 'evaluator',
+    });
+    const deps = mkDeps({
+      skillsRepo: {
+        find: vi.fn().mockResolvedValue(skill),
+        findActive: vi.fn().mockResolvedValue([skill]),
+      },
+    });
+    const decider = new ActionDeciderImpl(deps);
+    const r = await decider.decide(
+      mkInput({
+        skill: {
+          selected_skill_id: 'skill_eval',
+          candidate_skill_ids: ['skill_eval'],
+          selected_skill: skill,
+        },
+      }),
+    );
+    expect(r.action_mode).toBe('execute_skill');
+    expect(r.rationale).toBe('execute_skill:skill_eval');
+  });
+
+  it('F1 Phase 1 — selected tool_mediated skill ⇒ NOT execute_skill (call_tool, Phase 2 excluded)', async () => {
+    const skill = mkSkill({
+      id: 'skill_transfer',
+      skill_descriptor: 'transfer.run',
+      version: 2,
+      category: 'tool_mediated',
+      execution_mode: 'tool_mediated',
+      allowed_tools: ['transfer_money'],
+    });
+    const deps = mkDeps({
+      skillsRepo: {
+        find: vi.fn().mockResolvedValue(skill),
+        findActive: vi.fn().mockResolvedValue([skill]),
+      },
+    });
+    const decider = new ActionDeciderImpl(deps);
+    const r = await decider.decide(
+      mkInput({
+        intent: { label: 'transfer_intent', confidence: 0.9 },
+        skill: {
+          selected_skill_id: 'skill_transfer',
+          candidate_skill_ids: ['skill_transfer'],
+          selected_skill: skill,
+        },
+      }),
+    );
+    expect(r.action_mode).not.toBe('execute_skill');
+    expect(r.action_mode).toBe('call_tool');
+  });
+
+  it('F1 Phase 1 — selected procedure_adapter skill ⇒ NOT execute_skill (Phase 2 excluded)', async () => {
+    // A `decide`-category skill with a side-effecting procedure_adapter mode:
+    // the execution_mode gate (not category) keeps it out of execute_skill.
+    const skill = mkSkill({
+      id: 'skill_proc',
+      skill_descriptor: 'onboard.step',
+      version: 1,
+      category: 'decide',
+      execution_mode: 'procedure_adapter',
+    });
+    const deps = mkDeps({
+      skillsRepo: {
+        find: vi.fn().mockResolvedValue(skill),
+        findActive: vi.fn().mockResolvedValue([skill]),
+      },
+    });
+    const decider = new ActionDeciderImpl(deps);
+    const r = await decider.decide(
+      mkInput({
+        skill: {
+          selected_skill_id: 'skill_proc',
+          candidate_skill_ids: ['skill_proc'],
+          selected_skill: skill,
+        },
+      }),
+    );
+    expect(r.action_mode).not.toBe('execute_skill');
+    // decide category ⇒ call_tool branch (side-effecting; Phase 2 handles it).
+    expect(r.action_mode).toBe('call_tool');
+  });
+
+  it('F1 Phase 1 — gate is on execution_mode, NOT category (decide + prompt_only ⇒ execute_skill)', async () => {
+    const skill = mkSkill({
+      id: 'skill_decide_prompt',
+      skill_descriptor: 'decide.prompt',
+      version: 1,
+      category: 'decide', // would normally route to call_tool…
+      execution_mode: 'prompt_only', // …but the mode gate wins ⇒ execute_skill
+    });
+    const deps = mkDeps({
+      skillsRepo: {
+        find: vi.fn().mockResolvedValue(skill),
+        findActive: vi.fn().mockResolvedValue([skill]),
+      },
+    });
+    const decider = new ActionDeciderImpl(deps);
+    const r = await decider.decide(
+      mkInput({
+        skill: {
+          selected_skill_id: 'skill_decide_prompt',
+          candidate_skill_ids: ['skill_decide_prompt'],
+          selected_skill: skill,
+        },
+      }),
+    );
+    expect(r.action_mode).toBe('execute_skill');
+  });
+
+  it('F1 Phase 1 — a respond skill with no execution_mode still responds (legacy/stub safe)', async () => {
+    // Absent execution_mode must NOT be treated as executable.
+    const skill = mkSkill({ id: 'skill_legacy', category: 'respond' });
+    const deps = mkDeps({
+      skillsRepo: {
+        find: vi.fn().mockResolvedValue(skill),
+        findActive: vi.fn().mockResolvedValue([skill]),
+      },
+    });
+    const decider = new ActionDeciderImpl(deps);
+    const r = await decider.decide(
+      mkInput({
+        skill: {
+          selected_skill_id: 'skill_legacy',
+          candidate_skill_ids: ['skill_legacy'],
+          selected_skill: skill,
+        },
+      }),
+    );
+    expect(r.action_mode).toBe('respond');
+    expect(r.rationale).toBe('respond:skill_legacy');
+  });
+
   it('Codex #103 — reduce_tool_set is a no-op when removed_tools is empty', async () => {
     const skill = mkSkill({
       id: 'skill_x',

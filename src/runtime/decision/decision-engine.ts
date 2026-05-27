@@ -354,6 +354,18 @@ export class DecisionEngine {
           ...(skill.selected_skill_id !== undefined
             ? { selected_skill_id: skill.selected_skill_id }
             : {}),
+          // F1 Phase 1 (Codex HIGH/P2 — immutable identity): pin the selected
+          // skill's stable descriptor + version from the SAME scoped Skill
+          // instance the SkillSelector resolved under the routed agent. The
+          // execute_skill call site re-resolves by descriptor and asserts the
+          // active row's id/version still match these, so an activate/rollback
+          // race can never execute a divergent skill.
+          ...(selectedSkill?.skill_descriptor !== undefined
+            ? { selected_skill_descriptor: selectedSkill.skill_descriptor }
+            : {}),
+          ...(selectedSkill?.version !== undefined
+            ? { selected_skill_version: selectedSkill.version }
+            : {}),
           candidate_skill_ids: skill.candidate_skill_ids,
         },
         action_mode: decision.action_mode,

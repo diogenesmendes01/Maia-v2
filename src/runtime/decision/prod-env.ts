@@ -281,6 +281,7 @@ function skillRowToSkill(row: {
   id: string;
   skill_descriptor: string;
   category: string;
+  execution_mode: string;
   status: string;
   goal?: string | unknown;
   when_to_use?: string | unknown;
@@ -296,6 +297,13 @@ function skillRowToSkill(row: {
   const when_to_use = typeof row.when_to_use === 'string' ? row.when_to_use : '';
   return {
     id: row.id,
+    // F1 Phase 1 (immutable identity): carry the stable descriptor + version
+    // + execution_mode forward so ActionDecider can gate execute_skill on the
+    // mode and pin the descriptor/version onto the packet for the call site's
+    // identity assert. Previously these were discarded (Codex P2).
+    skill_descriptor: row.skill_descriptor,
+    version: row.version,
+    execution_mode: row.execution_mode as Skill['execution_mode'],
     category: row.category as Skill['category'],
     priority: 5, // P9a does not store priority; default 5 (medium)
     status: row.status as Skill['status'],
