@@ -24,11 +24,21 @@ export async function promptOnlyMode(ctx: ModeContext): Promise<Record<string, u
 
   const max_tokens = typeof hints.max_output_tokens === 'number' ? hints.max_output_tokens : 1024;
 
+  // Honor caller cancellation before issuing the LLM call. Mirrors the
+  // tool-mediated pattern and avoids spending tokens on a request that the
+  // SkillRunner has already given up on. Issue #220.
+  if (ctx.signal?.aborted) {
+    throw new Error('aborted');
+  }
+
   const res = await callLLM({
     system,
     messages: [{ role: 'user', content: JSON.stringify(ctx.input) }],
     max_tokens,
     temperature: 0.2,
+    // Forwarded so the underlying SDK actually cancels the HTTP request when
+    // the SkillRunner aborts (timeout or external cancellation). Issue #220.
+    signal: ctx.signal,
   });
 
   const text = res.content ?? '';

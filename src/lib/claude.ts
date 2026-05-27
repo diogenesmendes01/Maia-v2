@@ -2,7 +2,6 @@ import Anthropic from '@anthropic-ai/sdk';
 import OpenAI from 'openai';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
-import { sleep } from '@/lib/utils.js';
 import { recordLLMCost } from '@/lib/cost-ledger.js';
 import { incCounter, observeHistogram } from '@/lib/metrics.js';
 import { getCurrentMainModel, getCurrentFastModel } from '@/lib/llm-settings.js';
@@ -48,6 +47,12 @@ export interface LLMProvider {
     temperature?: number;
     max_tokens?: number;
     model?: string;
+    /**
+     * Optional AbortSignal forwarded to the underlying SDK request. When the
+     * signal aborts (e.g. SkillRunner timeout fires), the in-flight HTTP call
+     * is cancelled rather than left running to completion. Issue #220.
+     */
+    signal?: AbortSignal;
   }): Promise<LLMResponse>;
 }
 
@@ -75,17 +80,23 @@ class AnthropicProvider implements LLMProvider {
     max_tokens?: number;
     model?: string;
     pessoa_id?: string;
+    signal?: AbortSignal;
   }): Promise<LLMResponse> {
     const model = params.model ?? config.CLAUDE_MODEL_MAIN;
     const start = Date.now();
-    const res = await this.getClient().messages.create({
-      model,
-      max_tokens: params.max_tokens ?? 1024,
-      temperature: params.temperature ?? 0.2,
-      system: params.system,
-      messages: params.messages as Anthropic.MessageParam[],
-      tools: params.tools as Anthropic.Tool[] | undefined,
-    });
+    const res = await this.getClient().messages.create(
+      {
+        model,
+        max_tokens: params.max_tokens ?? 1024,
+        temperature: params.temperature ?? 0.2,
+        system: params.system,
+        messages: params.messages as Anthropic.MessageParam[],
+        tools: params.tools as Anthropic.Tool[] | undefined,
+      },
+      // signal: forwarded so callers (e.g. SkillRunner) can cancel the
+      // in-flight HTTP request when their timeout fires. Issue #220.
+      params.signal ? { signal: params.signal } : undefined,
+    );
     const tool_uses: LLMResponse['tool_uses'] = [];
     let textOut: string | null = null;
     for (const block of res.content) {
@@ -235,16 +246,22 @@ class OpenRouterProvider implements LLMProvider {
     max_tokens?: number;
     model?: string;
     pessoa_id?: string;
+    signal?: AbortSignal;
   }): Promise<LLMResponse> {
     const model = params.model ?? config.OPENROUTER_MODEL_MAIN;
     const start = Date.now();
-    const res = await this.getClient().chat.completions.create({
-      model,
-      messages: toOpenAIMessages(params.system, params.messages),
-      tools: toOpenAITools(params.tools),
-      max_tokens: params.max_tokens ?? 1024,
-      temperature: params.temperature ?? 0.2,
-    });
+    const res = await this.getClient().chat.completions.create(
+      {
+        model,
+        messages: toOpenAIMessages(params.system, params.messages),
+        tools: toOpenAITools(params.tools),
+        max_tokens: params.max_tokens ?? 1024,
+        temperature: params.temperature ?? 0.2,
+      },
+      // signal: forwarded so callers (e.g. SkillRunner) can cancel the
+      // in-flight HTTP request when their timeout fires. Issue #220.
+      params.signal ? { signal: params.signal } : undefined,
+    );
     const out = fromOpenAIResponse(res);
     incCounter('maia_llm_calls_total', { provider: 'openrouter', model, status: 'ok' });
     incCounter('maia_llm_tokens_total', { provider: 'openrouter', model, kind: 'input' }, out.usage.input_tokens);
@@ -286,7 +303,22 @@ export async function callLLM(params: {
    * undefined → only the global counter moves.
    */
   pessoa_id?: string;
+  /**
+   * Optional AbortSignal forwarded to the underlying provider SDK. When the
+   * signal aborts mid-call (e.g. SkillRunner timeout fires while a retry is
+   * pending), the loop is short-circuited so we don't keep retrying a
+   * cancelled request. Issue #220.
+   */
+  signal?: AbortSignal;
 }): Promise<LLMResponse> {
+  // Early cancellation — refuse to start any work (including the model
+  // lookup) when the signal has already aborted. PR #221 review, item 4:
+  // a caller that aborts before this entry point shouldn't pay for the
+  // settings-fact read or any other setup.
+  if (params.signal?.aborted) {
+    throw new Error('llm_call_aborted', { cause: params.signal.reason });
+  }
+
   // Read current model selection from facts (operator-changeable via dashboard).
   // Falls back to env defaults on miss or DB hiccup.
   const mainModel = await getCurrentMainModel();
@@ -294,22 +326,83 @@ export async function callLLM(params: {
 
   let lastErr: unknown = null;
   for (let attempt = 0; attempt < config.CLAUDE_MAX_RETRIES; attempt++) {
+    // Honor caller cancellation before each attempt — refuse to start a new
+    // request when the signal has already aborted. Issue #220.
+    if (params.signal?.aborted) {
+      throw new Error('llm_call_aborted', { cause: params.signal.reason });
+    }
     try {
       return await provider.call({ ...params, model: mainModel });
     } catch (err) {
       lastErr = err;
+      // Abort surfaced through the SDK — do not retry. Issue #220.
+      if (params.signal?.aborted || isAbortError(err)) {
+        throw err;
+      }
       logger.warn({ attempt, err: (err as Error).message, model: mainModel }, 'llm.retry');
       if (attempt < config.CLAUDE_MAX_RETRIES - 1) {
-        await sleep(2000 * Math.pow(2, attempt));
+        // Abort-aware backoff (PR #221 review, item 5): abort during the
+        // retry sleep must short-circuit the timer instead of waiting it
+        // out. Plain `await sleep(ms)` delays the abort by up to the
+        // backoff duration.
+        await abortableSleep(2000 * Math.pow(2, attempt), params.signal);
       }
     }
   }
   // fallback to fast model
+  if (params.signal?.aborted) {
+    throw lastErr ?? new Error('llm_call_aborted');
+  }
   try {
     logger.warn({ fallback_model: fastModel }, 'llm.fallback_to_fast');
     return await provider.call({ ...params, model: fastModel });
   } catch (err) {
+    // If the fallback request was aborted (caller cancelled mid-fallback),
+    // surface the abort untouched. Throwing `lastErr ?? err` here would
+    // mask the abort behind a prior main-model retry error and rob the
+    // caller of the cancellation signal. PR #221 review, item 2.
+    if (params.signal?.aborted || isAbortError(err)) {
+      throw err;
+    }
     logger.error({ err }, 'llm.fast_fallback_failed');
     throw lastErr ?? err;
   }
+}
+
+/**
+ * Sleep for `ms` milliseconds, but reject immediately if `signal` aborts in
+ * the meantime. Clears the timer on abort so the timeout doesn't stay
+ * pending. Issue #220 / PR #221 review, item 5.
+ */
+function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error('llm_call_aborted', { cause: signal.reason }));
+      return;
+    }
+    let onAbort: (() => void) | null = null;
+    const timer = setTimeout(() => {
+      if (onAbort && signal) signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    if (signal) {
+      onAbort = () => {
+        clearTimeout(timer);
+        reject(new Error('llm_call_aborted', { cause: signal.reason }));
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+  });
+}
+
+/**
+ * Detect SDK-thrown abort errors. Both Anthropic and OpenAI SDKs raise an
+ * APIUserAbortError (`name === 'AbortError'`) when the request signal aborts;
+ * a plain DOMException with name 'AbortError' is also possible from native
+ * fetch. We check name to stay provider-agnostic. Issue #220.
+ */
+function isAbortError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const name = (err as { name?: unknown }).name;
+  return name === 'AbortError' || name === 'APIUserAbortError';
 }
