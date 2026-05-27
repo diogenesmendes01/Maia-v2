@@ -16,7 +16,6 @@ import {
   executeSelectedSkill,
   buildSkillInput,
   buildSkillReply,
-  SKILL_FALLBACK_TEXT,
   type ExecuteSelectedSkillDeps,
   type PinnedSkillIdentity,
 } from '@/agent/execute-skill.js';
@@ -293,44 +292,22 @@ describe('F1 Phase 1 — executeSelectedSkill', () => {
     );
   });
 
-  it('dispatchOutput fails PRE-send (delivered:false) ⇒ canned fallback delivered + handled (HIGH-A)', async () => {
-    // The channel send itself threw, so NOTHING reached the user. We must still
-    // respond: a canned fallback is delivered (best effort) and the turn is
-    // handled — never silence, never a double-send.
+  it('dispatchOutput fails PRE-send (delivered:false) ⇒ fall through to ReAct (handled:false), no second send (HIGH-A)', async () => {
+    // The channel send threw, so NOTHING reached the user. LLM-first: fall
+    // through to the normal ReAct turn so the agent still answers with a real,
+    // adaptive reply — not a canned message. Safe: nothing was sent (no
+    // double-send), and we never re-dispatch from here.
     const sendErr = Object.assign(new Error('send_failed'), { delivered: false });
-    const dispatchOutput = vi
-      .fn()
-      .mockRejectedValueOnce(sendErr) // skill reply send fails pre-delivery
-      .mockResolvedValueOnce(undefined); // canned fallback send succeeds
-    const deps = mkDeps({ dispatchOutput });
+    const deps = mkDeps({
+      dispatchOutput: vi.fn().mockRejectedValue(sendErr),
+    });
     const outcome = await executeSelectedSkill(mkArgs(), deps);
 
-    expect(outcome).toEqual({ handled: true });
-    expect(dispatchOutput).toHaveBeenCalledTimes(2);
-    const fallbackCtx = dispatchOutput.mock.calls[1]![0];
-    expect(fallbackCtx.text).toBe(SKILL_FALLBACK_TEXT);
+    expect(outcome).toEqual({ handled: false, reason: 'dispatch_send_failed' });
+    expect(deps.dispatchOutput).toHaveBeenCalledOnce(); // no second (fallback) send
     expect(deps.logger.warn).toHaveBeenCalledWith(
       expect.anything(),
-      'skill.dispatch_send_failed_fallback',
-    );
-  });
-
-  it('canned fallback ALSO failing (channel down) ⇒ still handled, no throw (best effort)', async () => {
-    // If even the fallback send fails we log and stop — we never loop or let the
-    // exception escape executeSelectedSkill.
-    const sendErr = Object.assign(new Error('send_failed'), { delivered: false });
-    const dispatchOutput = vi
-      .fn()
-      .mockRejectedValueOnce(sendErr) // skill reply send fails
-      .mockRejectedValueOnce(new Error('channel_down')); // fallback also fails
-    const deps = mkDeps({ dispatchOutput });
-    const outcome = await executeSelectedSkill(mkArgs(), deps);
-
-    expect(outcome).toEqual({ handled: true });
-    expect(dispatchOutput).toHaveBeenCalledTimes(2);
-    expect(deps.logger.error).toHaveBeenCalledWith(
-      expect.objectContaining({ ops_alert: true }),
-      'skill.fallback_send_failed',
+      'skill.dispatch_send_failed_fallthrough',
     );
   });
 

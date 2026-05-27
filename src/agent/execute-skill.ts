@@ -34,16 +34,6 @@ import type {
 } from '@/skills/types.js';
 import type { DispatchOutputCtx } from './output-dispatch.js';
 
-/**
- * User-facing fallback when a skill reply CANNOT be delivered (the channel send
- * itself failed before anything reached the user). Guarantees the user is never
- * left in silence (Codex #216 review HIGH-A). Generic + reassuring, pt-BR
- * (Maia is pt-BR first). Exported for assertion in tests.
- */
-export const SKILL_FALLBACK_TEXT =
-  'Entendi sua solicitação, mas estou com uma dificuldade técnica no momento. ' +
-  'Pode tentar de novo em instantes ou me dar mais detalhes?';
-
 /** Minimal active-skill identity needed for the pre-execution assert. */
 export interface ActiveSkillIdentity {
   id: string;
@@ -74,6 +64,7 @@ export type ExecuteSkillOutcome =
         | 'identity_mismatch'
         | 'skill_not_resolved'
         | 'execution_failed'
+        | 'dispatch_send_failed'
         | 'no_reply';
     };
 
@@ -308,15 +299,18 @@ export async function executeSelectedSkill(
   // Contract 2: deliver through the shared pipeline (view-once / audit /
   // pending / media) — never raw sendOutbound.
   //
-  // EXACTLY-ONCE + NO-SILENCE (Codex #216 review HIGH-A): dispatchOutput sends
-  // to the channel BEFORE persisting, so the typed OutboundDeliveryError tells
-  // us WHICH phase failed:
-  //   - delivered === false (send threw, nothing reached the user) → deliver a
-  //     canned FALLBACK so the user is never left in silence.
+  // EXACTLY-ONCE (Codex #216 review HIGH-A): dispatchOutput sends to the channel
+  // BEFORE persisting, so the typed OutboundDeliveryError tells us WHICH phase
+  // failed and we react accordingly (LLM-first: prefer letting ReAct recover):
+  //   - delivered === false (send threw, NOTHING reached the user) → fall
+  //     through to the normal ReAct turn so the agent still answers with a real,
+  //     adaptive reply. Safe: nothing was sent, so there is no double-send.
   //   - delivered === true / unknown (sent, persist failed) → report handled
-  //     WITHOUT re-sending (a fallback here would double-send a financial
+  //     WITHOUT re-sending (a fall-through would double-send a financial
   //     message) and log the inconsistency loudly for ops reconciliation.
-  // Either way we never fall through to the ReAct turn after an attempted send.
+  // A canned fallback is reserved for Phase-2 "last resort" cases (e.g. a
+  // side-effecting confirmation that must NOT let ReAct improvise); Phase 1 only
+  // runs side-effect-free prompt_only/evaluator, so ReAct recovery is best.
   try {
     await deps.dispatchOutput({
       pessoa,
@@ -332,9 +326,9 @@ export async function executeSelectedSkill(
   } catch (e) {
     const delivered = (e as { delivered?: unknown }).delivered;
     if (delivered === false) {
-      // Pre-send failure: nothing reached the user. Guarantee a response with a
-      // canned fallback (best effort — if even this send fails we log and stop
-      // rather than loop or fall through to a double-send-prone ReAct turn).
+      // Pre-send failure: nothing reached the user. Fall through to the normal
+      // ReAct turn so the agent still answers (a real, adaptive reply). Safe —
+      // nothing was sent, so there is no double-send risk.
       deps.logger.warn(
         {
           conversa_id: conversa.id,
@@ -342,33 +336,9 @@ export async function executeSelectedSkill(
           skill_descriptor: pinned.selected_skill_descriptor,
           err: (e as Error).message,
         },
-        'skill.dispatch_send_failed_fallback',
+        'skill.dispatch_send_failed_fallthrough',
       );
-      try {
-        await deps.dispatchOutput({
-          pessoa,
-          conversa,
-          inbound,
-          jid,
-          text: SKILL_FALLBACK_TEXT,
-          latestPending: null,
-          latestReportPdf: null,
-          turnHasSensitive: false,
-          sensitiveTools: [],
-        });
-      } catch (e2) {
-        deps.logger.error(
-          {
-            conversa_id: conversa.id,
-            turno_id: inbound.id,
-            skill_descriptor: pinned.selected_skill_descriptor,
-            err: (e2 as Error).message,
-            ops_alert: true,
-          },
-          'skill.fallback_send_failed',
-        );
-      }
-      return { handled: true };
+      return { handled: false, reason: 'dispatch_send_failed' };
     }
     // delivered === true (sent, persist failed) OR unknown error: the message
     // likely reached the user — report handled WITHOUT re-sending (no
