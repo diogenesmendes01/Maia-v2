@@ -12,37 +12,38 @@
 > *"Agentes na Maia aprendem com a experiência, mas só evoluem
 >  dentro de governança, escopo e evidência."*
 
+> ⚠️ **Status do produto.** Plataforma em construção. O schema é multi-tenant + multi-agente, mas o runtime opera hoje com `tenant_id='default'` e `agent-selector` no-op (`MULTI_AGENT_SELECTOR_V2` reservado pro futuro). Pilares marcados 🔴 têm gap conhecido (issues abertas). Detalhes em [Estado atual & gaps conhecidos](#estado-atual--gaps-conhecidos).
+
 ---
 
 ## O que é
 
-**Maia é a plataforma** — não um agente. Cada tenant (pessoa ou empresa)
-cria e opera **seus próprios agentes** dentro dela, conversando por WhatsApp,
-com identidade versionada, capacidades que crescem sob aprovação e isolamento
-inviolável entre tenants.
+**Maia é a plataforma** — não um agente. O **objetivo arquitetural** é que cada tenant (pessoa ou empresa) opere seus próprios agentes dentro dela, conversando por WhatsApp, com identidade versionada e capacidades que crescem sob aprovação. Hoje opera em modo single-tenant (`'default'`) com 1 agente Maia atendendo via channel policy; a infra multi-tenant/multi-agente está no schema, gated por feature flag no runtime.
 
 - **Maia é o projeto / a plataforma.** Os agentes têm nome próprio, definido pelo tenant.
-- **Multi-tenant com isolamento inviolável** — agentes de tenants diferentes nunca se cruzam, nem por aprendizado.
-- **Multi-agente por tenant** — `Agent ≠ Channel ≠ Role`. Um tenant pode ter vários agentes; cada um com seu escopo.
-- **Agentes aprendem habilidades e ferramentas** — a plataforma propõe novas skills/tools a partir do uso real; o owner decide.
-- **Pessoal e corporativo** — mesma plataforma serve PF e PJ; o que muda é o vertical, não o motor.
-- **WhatsApp como canal habilitado hoje, multi-canal por design** — texto, áudio e foto via Baileys; infra de `channels` / `channel_policies` / `roles` já no schema, pronta pra outros canais.
+- **Multi-tenant por design, single-tenant em produção hoje** — schema, índices e tenant-guard nas queries principais; runtime ainda opera com `tenant_id='default'`. Isolamento é o **objetivo** com 2 gaps rastreados ([#229](https://github.com/diogenesmendes01/Maia-v2/issues/229), [#230](https://github.com/diogenesmendes01/Maia-v2/issues/230)).
+- **Multi-agente por design** — `Agent ≠ Channel ≠ Role`; `channel_policies` define qual agente atende qual canal. Hoje: 1 agente por canal via policy (`agent-selector` é no-op). Seleção dinâmica reservada pra `MULTI_AGENT_SELECTOR_V2`.
+- **Agentes aprendem habilidades e ferramentas** — `capability-proposer` / `skill-proposer` em produção; owner aprova via admin-ui.
+- **Pessoal e corporativo** — vertical único hoje (finanças PF + PJ do owner); arquitetura genérica.
+- **WhatsApp como canal habilitado, multi-canal por design** — texto, áudio e foto via Baileys; tabelas `channels` / `channel_policies` / `roles` no schema, gateways adicionais não implementados ainda.
 
 ---
 
 ## Os 9 pilares
 
-| # | Pilar | O que faz |
-|---|---|---|
-| 1 | **Agentes que aprendem** | `capability-proposer`, `skill-proposer`, aquisição dialógica em 4 níveis (silent → dashboard → mentionable → proposed). A plataforma propõe; owner decide. |
-| 2 | **Governança versionada** | Identidade operacional em 4 camadas (núcleo imutável / perfil aprendido / episódica / backlog). Toda evolução tem aprovação e versão. |
-| 3 | **Isolamento inviolável** | Toda query passa por `tenant_id` + `agent_id` (NOT NULL forçado). PF de PJ, tenant de tenant, role de role — sem exceção. |
-| 4 | **Cognitive graph** | Orquestração como grafo leve: pre-turn + post-turn, com `runWhen`/`timeout`/`fallback`/`model`/`version` por node. |
-| 5 | **Self-model + reflexão tipada** | Modelo de si em 3 camadas (domínio/skill/gap), confiança determinística sobre evidência. Toda reflexão vira candidato classificado em fato / regra / procedimento / lacuna / tool-request / descarte. |
-| 6 | **Skills + Procedures executáveis** | O que um agente aprende vira artefato versionado, event-sourced, com success criteria tipados e métricas derivadas. |
-| 7 | **Memória escopada** | 6 controles por memória (`type` / `scope` / `sensitivity` / `proactive_use` / `mention_allowed` / `ttl_days`). Memória sensível influencia cuidado, nunca é verbalizada. |
-| 8 | **WhatsApp como canal (multi-canal por design)** | Gateway Baileys com texto, áudio (Whisper) e imagem (Claude Vision). Separação por interlocutor; auditoria por mensagem. Tabelas de `channels` / `channel_policies` / `roles` já no schema; `gateway/channel-resolver.ts` e `runtime/decision/agent-selector.ts` em produção. |
-| 9 | **Primeiro vertical: finanças PF + PJ** | Caso de uso concreto: lançamentos, classificação, fluxo de caixa, briefing, conversas separadas com contadores e funcionários. É a **prova** do produto — não a definição dele. |
+> **Legenda:** ✅ implementado e em produção · 🚧 parcial / em iteração · 🔴 implementado **com gap conhecido** (issue aberta) · ⏳ roadmap.
+
+| # | Pilar | O que faz | Status |
+|---|---|---|---|
+| 1 | **Agentes que aprendem** | `capability-proposer`, `skill-proposer`, aquisição dialógica em 4 níveis (silent → dashboard → mentionable → proposed). A plataforma propõe; owner decide. | ✅ |
+| 2 | **Governança versionada** | Identidade operacional em 4 camadas (núcleo imutável / perfil aprendido / episódica / backlog). Toda evolução tem aprovação e versão. | ✅ |
+| 3 | **Isolamento como objetivo (com gaps)** | `tenant_id`/`agent_id` NOT NULL nas tabelas centrais, tenant-guard middleware no caminho principal de queries. **Gaps em vector memory ([#229](https://github.com/diogenesmendes01/Maia-v2/issues/229)) e procedural memory ([#230](https://github.com/diogenesmendes01/Maia-v2/issues/230))** — recall/mutações sem escopo. Runtime opera single-tenant via `'default'`. | 🔴 |
+| 4 | **Cognitive graph** | Orquestração como grafo leve: pre-turn + post-turn, com `runWhen`/`timeout`/`fallback`/`model`/`version` por node. P7 refactor total ainda parcial. | 🚧 |
+| 5 | **Self-model + reflexão tipada** | Modelo de si em 3 camadas (domínio/skill/gap), confiança determinística sobre evidência. Toda reflexão vira candidato classificado em fato / regra / procedimento / lacuna / tool-request / descarte. | ✅ |
+| 6 | **Skills + Procedures executáveis** | O que um agente aprende vira artefato versionado, event-sourced, com success criteria tipados e métricas derivadas. P3a/b em produção; P3c (test runner completo, view materializada) parcial. | 🚧 |
+| 7 | **Memória escopada (com gaps)** | 6 controles por memória (`type` / `scope` / `sensitivity` / `proactive_use` / `mention_allowed` / `ttl_days`). Memória sensível influencia cuidado, nunca é verbalizada. **Vector e procedural sem guard runtime** ([#229](https://github.com/diogenesmendes01/Maia-v2/issues/229), [#230](https://github.com/diogenesmendes01/Maia-v2/issues/230)); working memory (Redis) sem namespace de tenant. | 🔴 |
+| 8 | **WhatsApp como canal (multi-canal por design)** | Gateway Baileys com texto, áudio (Whisper) e imagem (Claude Vision). Separação por interlocutor; auditoria por mensagem. Tabelas `channels` / `channel_policies` / `roles` no schema; gateways adicionais não implementados. | 🚧 |
+| 9 | **Primeiro vertical: finanças PF + PJ** | Caso de uso concreto: lançamentos, classificação, fluxo de caixa, briefing, conversas separadas com contadores e funcionários. É a **prova** do produto — não a definição dele. | ✅ |
 
 ---
 
@@ -142,8 +143,10 @@ docker compose up -d postgres redis
 # 4. Aplique migrations (ordem alfabética)
 npm run db:migrate
 
-# 5. Wizard de bootstrap (cria tenant + owner + 1º agente + entidades + permissões)
+# 5. Wizard de bootstrap (cria self_state + owner; opcional: entidades, contas, permissões, co-dona)
 npm run setup
+# Tenant e agente padrão (`'default'`) são seedados pelas migrations P0 — o wizard
+# não os cria.
 
 # 6. Inicie em dev
 npm run dev
@@ -153,8 +156,9 @@ npm run dev
 npm run pessoa:add -- --nome="Joana" --telefone="+55..." \
   --profile=contador_leitura --entidades=E1,E3
 
-# Adicionar agente novo a um tenant existente:
-# via Admin UI em src/admin-ui (router `agents`)
+# Gerir agentes / tenants existentes: via Admin UI em src/admin-ui
+# (routers `agents`, `tenants`). Provisionamento de novos tenants via UI ainda
+# em iteração — multi-tenant runtime está gated.
 ```
 
 ---
@@ -270,13 +274,46 @@ CI roda esses testes automaticamente em job dedicado (`integration` em
 
 ## Princípios não-negociáveis
 
-1. **Isolamento entre tenants é inviolável** — agentes de tenants diferentes nunca se comunicam, compartilham dados ou herdam aprendizado. Sem exceção.
+1. **Isolamento entre tenants é objetivo inviolável** — `tenant_id`/`agent_id` NOT NULL nas tabelas centrais e tenant-guard no caminho principal de queries. Gaps em camadas específicas (vector/procedural memory — [#229](https://github.com/diogenesmendes01/Maia-v2/issues/229), [#230](https://github.com/diogenesmendes01/Maia-v2/issues/230)) são tratados como bugs de produção a fechar, não como design aceitável.
 2. **Governança antes de evolução** — agentes geram evidências; comportamento só muda quando policy + owner aprovam.
 3. **Evidência > opinião** — confiança vem de fórmula determinística sobre evidência, nunca do LLM.
 4. **Audit log de tudo** — qualquer ação, decisão ou mudança de identidade é rastreável.
 5. **Confirmação de ações relevantes** — agentes não movem dinheiro, não modificam acessos e não tomam ações irreversíveis sem confirmação humana.
 6. **Aprendizado dentro de escopo** — toda capacidade aprendida nasce escopada (tenant, agente, canal, role); sem vazamento por construção.
-7. **Fail-closed em segurança** — query sem `tenant_id`/`agent_id` falha; memória nova entra como `restricted`/`needs_review`; capacidade não aprovada não executa.
+7. **Fail-closed em segurança (em construção)** — queries pelo tenant-guard falham sem `tenant_id`/`agent_id`; memória nova entra como `restricted`/`needs_review`; capacidade não aprovada não executa. **Cobertura do guard não é total** — ver [Estado atual & gaps conhecidos](#estado-atual--gaps-conhecidos).
+
+---
+
+## Estado atual & gaps conhecidos
+
+A plataforma está em construção contínua. Resumo honesto do estado vs objetivo arquitetural:
+
+### Em produção hoje
+
+- **1 agente Maia** atendendo via `channel_policies` — `src/runtime/decision/agent-selector.ts` é no-op e retorna `default_agent_id` do policy.
+- **1 tenant ativo** (`tenant_id='default'`). Schema, índices e tenant-guard já comportam múltiplos; runtime de provisionamento não.
+- **WhatsApp** como canal habilitado via Baileys; texto/áudio (Whisper) / imagem (Claude Vision).
+- Cognition (reflector, classifier, self-model, capability/skill proposers, drift, gap-escalation), memory layers, identity (com versioning e drift), skills, procedures, governance, control-plane e admin-ui — todos rodando.
+
+### Gaps conhecidos (issues abertas)
+
+- **[#229](https://github.com/diogenesmendes01/Maia-v2/issues/229) — Vector memory cross-tenant.** `src/memory/vector.ts` faz INSERT/recall em `agent_memories` sem `tenant_id`/`agent_id`; o filtro é apenas por `escopo`. Bucket compartilhado de fato — recall pode cruzar tenants.
+- **[#230](https://github.com/diogenesmendes01/Maia-v2/issues/230) — Procedural memory sem guard.** Mutações `incrementAcerto` / `incrementErro` / `setStatus` em `rulesRepo` usam `WHERE id = ?` sem `tenant_id`/`agent_id`.
+- **Working memory (Redis):** chaves usam `conversa_id`/`pessoa_id` sem namespace de tenant — defense-in-depth ausente, exploitabilidade depende da unicidade global dos IDs.
+
+Esses gaps **violam o princípio de isolamento inviolável** e são tratados como prioridade de produto, não dívida aceitável.
+
+### Reservado para o futuro
+
+- `MULTI_AGENT_SELECTOR_V2` — seleção dinâmica de agente por turno.
+- Multi-tenant runtime + admin-ui de provisionamento de tenants.
+- P3c — procedure governance ops (`procedure_metrics` view materializada, test runner completo, step-evaluator com `llm_judge`/`user_signal`/`human_confirmed`).
+- P7 — refactor completo do grafo cognitivo (orchestrator existe; nem todos os módulos foram migrados pro formato node).
+- Gateways adicionais (não-WhatsApp).
+
+### Reconciliação com `docs/specs/00-overview.md`
+
+O spec 00 (`docs/specs/00-overview.md`, revisado 2026-04-28) descreve Maia como *"single-tenant AI agent"* / *"not a multi-tenant SaaS"* / *"Multi-Agent explicitly not used"*. Isso reflete fielmente o estado runtime atual, mas **não** a visão arquitetural deste README. O spec será atualizado em PR separado pra refletir a v3.
 
 ---
 
