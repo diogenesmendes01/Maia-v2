@@ -13,6 +13,17 @@
  *      * propose / activate / deprecate / rollback rejeitam mismatched
  *        agent_id (review #99 finding 1).
  *
+ * INVARIANTE DE PRODUTO — ISOLAMENTO CROSS-TENANT INVIOLÁVEL (issue #218):
+ *   "Maias de empresas diferentes NUNCA se comunicam, compartilham dados ou
+ *    herdam aprendizado. Sem exceção."
+ *
+ *   Skills com `agent_id IS NULL` são **TENANT-WIDE** (compartilhadas entre os
+ *   agentes do MESMO tenant), mas NUNCA cross-tenant. Toda query DEVE rodar
+ *   dentro de `runWithTenantContext` — `getCurrentTenant()` pina a WHERE
+ *   clause `tenant_id = <ctx>` em TODOS os métodos de leitura. O ramo
+ *   `agent_id IS NULL` só pode unir skills do tenant roteado; nunca de outra
+ *   empresa. Provado por tests/unit/skills/skills-repo-cross-tenant-isolation.spec.ts.
+ *
  * Master spec v3.1.1 §2.4. Plan P9a Tasks 4.
  */
 import { eq, and, desc, or, sql, type SQL } from 'drizzle-orm';
@@ -334,6 +345,20 @@ export interface SkillsRepo {
   ): Promise<SkillVersionSummary[]>;
 }
 
+/**
+ * TENANT-BOUNDARY CONTRACT (issue #218) — applies to EVERY read method below
+ * (findActive, listByCategory, listAll, listSummaries, listSummariesPage,
+ * getById, getByDescriptor, listVersions):
+ *
+ *   1. Skills `agent_id IS NULL` são TENANT-WIDE — compartilhadas entre os
+ *      agentes do MESMO tenant, NUNCA cross-tenant.
+ *   2. Todas as queries DEVEM ser tenant-scoped pelo caller via
+ *      runWithTenantContext. `getCurrentTenant()` pins a WHERE clause
+ *      `tenant_id = <ctx>` em cada método; o ramo `agent_id IS NULL` só
+ *      pode unir skills do tenant roteado.
+ *   3. Provado por tests/unit/skills/skills-repo-cross-tenant-isolation.spec.ts
+ *      (todos os métodos de leitura, simétrico em A↔B).
+ */
 export const skillsRepo: SkillsRepo = {
   async findActive(descriptor, agent_id): Promise<SkillRow | null> {
     const tenant_id = getCurrentTenant();
