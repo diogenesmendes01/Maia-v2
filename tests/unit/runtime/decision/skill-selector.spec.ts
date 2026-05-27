@@ -291,10 +291,12 @@ describe('P9b — SkillSelector', () => {
     expect(r.candidate_skill_ids).toEqual(['s_billing']);
   });
 
-  it('Codex #217 item 1 — the 2-of-4 boundary (ratio 0.5) DOES select at the selector level', async () => {
-    // Sibling to the boundary above: an intent with four meaningful tokens that
-    // shares exactly two with the skill scores 2/4 = 0.5 (≥2 covered, not damped)
-    // and commits a selection — pinning the ≥2 branch end-to-end.
+  it('Issue #219 — the 2-of-4 boundary (ratio exactly 0.5) does NOT select under strict `>`', async () => {
+    // Inverted from the previous pin. Owner decision (issue #219): with the
+    // selector hardened to `bestScore > SKILL_MATCH_THRESHOLD`, an intent with
+    // four meaningful tokens that shares exactly two with the skill scores 2/4
+    // = 0.5 and lands EXACTLY on the threshold — no longer commits a selection.
+    // The candidate stays visible; ActionDecider falls back to free-form respond.
     const deps = mkDeps([
       mkSkill({
         id: 's_transfer',
@@ -308,7 +310,54 @@ describe('P9b — SkillSelector', () => {
       label: 'transfer_money_international_urgent',
       confidence: 0.8,
     });
+    expect(r.selected_skill_id).toBeUndefined();
+    expect(r.selected_skill).toBeUndefined();
+    expect(r.candidate_skill_ids).toEqual(['s_transfer']);
+  });
+
+  it('Issue #219 — a score JUST ABOVE the threshold (3-of-5 = 0.6) STILL selects', async () => {
+    // Positive boundary: strictness only rejects EXACT ties. A 3-of-5 overlap
+    // = 0.6, which is strictly greater than 0.5, must still commit a selection
+    // so the hardening does not break legitimately strong partial matches.
+    const deps = mkDeps([
+      mkSkill({
+        id: 's_transfer',
+        category: 'tool_mediated',
+        priority: 5,
+        when_to_use: 'Use to transfer money urgent.',
+      }),
+    ]);
+    const selector = new SkillSelectorImpl(deps);
+    const r = await selector.select(mkBase(), {
+      // 5 meaningful tokens: transfer, money, urgent, international, business.
+      // 3 covered (transfer, money, urgent) → 3/5 = 0.6 > 0.5.
+      label: 'transfer_money_urgent_international_business',
+      confidence: 0.8,
+    });
     expect(r.selected_skill_id).toBe('s_transfer');
+  });
+
+  it('Issue #219 — SINGLE_TOKEN_DAMPING regression: 1-of-2 still rejects', async () => {
+    // Regression guard for the original BLOCKER 1 path: a 2-token intent that
+    // shares exactly ONE token gets the single-token damping (0.5 * 0.5 = 0.25),
+    // landing well below the threshold. Hardening the selector to strict `>` must
+    // not weaken this case.
+    const deps = mkDeps([
+      mkSkill({
+        id: 's_billing',
+        category: 'tool_mediated',
+        priority: 10,
+        applicable_to_intent: ['billing_question', 'cancel_subscription'],
+        when_to_use: 'When the customer asks to cancel their subscription.',
+      }),
+    ]);
+    const selector = new SkillSelectorImpl(deps);
+    const r = await selector.select(mkBase(), {
+      label: 'cancel_order',
+      confidence: 0.9,
+    });
+    expect(r.selected_skill_id).toBeUndefined();
+    expect(r.selected_skill).toBeUndefined();
   });
 
   it('F1 Phase 0 — picks the BEST match, not the highest-ranked irrelevant skill', async () => {

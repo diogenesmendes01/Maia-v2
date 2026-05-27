@@ -39,12 +39,15 @@ import type { DecisionPacket } from '../context-packet/types.js';
 
 /**
  * Minimum match score for the selector to commit to a `selected_skill_id`.
- * Anything below routes the turn to a normal free-form `respond`.
+ * Compared STRICTLY (selector uses `score > THRESHOLD`, not `>=`), so an exact
+ * tie at this value does NOT select — owner decision per issue #219 to close the
+ * 2-of-4 = 0.5 boundary that previously over-selected. Anything below routes
+ * the turn to a normal free-form `respond`.
  *
  * Combined with the single-token damping in `scoreSkillMatch` (see the module
  * header), a single shared token out of a multi-token intent scores below this
  * bar and can NOT select; an explicit `applicable_to_intent` hit, full
- * token-coverage, or ≥2 covered meaningful tokens clears it.
+ * token-coverage, or a ≥2-covered-token ratio STRICTLY above this bar clears it.
  */
 export const SKILL_MATCH_THRESHOLD = 0.5;
 
@@ -155,11 +158,15 @@ export function scoreSkillMatch(
   // the `1/2 = 0.5` boundary case can never commit a selection.
   //
   // The `covered >= 2` branch is DELIBERATE (Codex #217 review item 1):
-  // covering two DISTINCT meaningful intent tokens is a genuine signal, so e.g.
-  // 2-of-4 (raw ratio exactly 0.5) is allowed to clear SKILL_MATCH_THRESHOLD and
-  // select — in contrast to the damped lone-token case. A thinner spread still
-  // fails on the ratio alone (e.g. 2-of-6 = 0.33 < 0.5). Both the 2-of-4
-  // (selects) and 1-of-2 (does not) boundaries are pinned by tests at the
+  // covering two DISTINCT meaningful intent tokens is a genuine SCORE signal —
+  // a thin spread (e.g. 2-of-6 ≈ 0.33) still fails the threshold on the ratio
+  // alone, while a wider hit (2-of-3 ≈ 0.667) clears it comfortably.
+  //
+  // Issue #219 update: the 2-of-4 case scores exactly 0.5 here, but the SELECTOR
+  // now compares strictly with `>` (not `>=`), so the boundary tie no longer
+  // commits a selection. The score math is unchanged; only the selector's
+  // commit comparator was hardened. Both the 2-of-4 (no longer selects) and
+  // 1-of-2 (still does not) boundaries are pinned by tests at the
   // scoreSkillMatch AND SkillSelector levels.
   if (covered >= 2 || covered === iTokens.length) {
     return ratio;

@@ -163,12 +163,16 @@ describe('F1 Phase 0 — scoreSkillMatch', () => {
     expect(score).toBeGreaterThanOrEqual(SKILL_MATCH_THRESHOLD);
   });
 
-  it('Codex #217 item 1 — the 2-of-4 token boundary (raw ratio exactly 0.5) DOES clear the threshold', () => {
+  it('Issue #219 — the 2-of-4 token boundary scores exactly 0.5 (selector will reject under strict `>`)', () => {
     // Sibling boundary to the damped 1-of-2 case. An intent with FOUR meaningful
     // tokens that shares exactly TWO with the skill scores 2/4 == 0.5. Because
-    // ≥2 distinct tokens are covered the ratio is NOT damped, so it lands on the
-    // threshold and selects — pinning the ≥2 branch as intended-to-select (the
-    // residual boundary Codex flagged as untested).
+    // ≥2 distinct tokens are covered the ratio is NOT damped here — the SCORE
+    // math returns 0.5.
+    //
+    // Owner decision (issue #219): the SkillSelector compares with strict `>`,
+    // so an exact tie at SKILL_MATCH_THRESHOLD does NOT commit a selection. This
+    // test pins the score math; the selector-level rejection is pinned by the
+    // corresponding test in skill-selector.spec.ts.
     const skill = mkSkill({
       id: 's_transfer',
       when_to_use: 'Use to transfer money.',
@@ -178,7 +182,9 @@ describe('F1 Phase 0 — scoreSkillMatch', () => {
       confidence: 0.8,
     });
     expect(score).toBeCloseTo(0.5, 5);
-    expect(score).toBeGreaterThanOrEqual(SKILL_MATCH_THRESHOLD);
+    // Score lands exactly on the threshold — not strictly above it.
+    expect(score).toBe(SKILL_MATCH_THRESHOLD);
+    expect(score).not.toBeGreaterThan(SKILL_MATCH_THRESHOLD);
   });
 
   it('Codex #217 item 1 — a wider 2-of-6 spread stays BELOW the threshold on the ratio alone', () => {

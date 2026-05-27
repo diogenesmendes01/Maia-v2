@@ -92,7 +92,12 @@ export class SkillSelectorImpl implements SkillSelector {
 
     const result: SkillSelectorResult = { candidate_skill_ids: candidateIds };
 
-    if (best && bestScore >= SKILL_MATCH_THRESHOLD) {
+    // Strict `>` (not `>=`): owner decision following PR #217 review (issue #219).
+    // An exact tie at SKILL_MATCH_THRESHOLD (e.g. 2-of-4 = 0.5) MUST NOT commit a
+    // selection — boundary ties are ambiguous and historically allowed over-selection.
+    // Tie-breaking ABOVE the threshold remains deterministic via the pre-sorted
+    // category×priority order.
+    if (best && bestScore > SKILL_MATCH_THRESHOLD) {
       // Invariant (Codex PR #215 review, CORRECTNESS 3): selected_skill_id MUST
       // appear in the frozen top-N candidate_skill_ids. The best MATCH is chosen
       // by score, but candidates are the top-N by category×priority — so a skill
