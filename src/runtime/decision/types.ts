@@ -113,6 +113,15 @@ export interface Skill {
   status: 'active' | 'deprecated' | 'draft';
   applicable_to_intent?: string[];
   applicable_to_workflow?: string[];
+  /**
+   * F1 Phase 0: free-text "when to use this skill" guidance from the Skill
+   * Contract (`skills.when_to_use`). SkillSelector matches the classified
+   * intent against this text (plus `applicable_to_intent`) so a skill is only
+   * selected when the turn clearly relates to it — the anti-hijack guard. May
+   * be absent for legacy/stub skills, in which case matching falls back to
+   * `applicable_to_intent` / the descriptor.
+   */
+  when_to_use?: string;
   allowed_tools?: string[];
   blocked_tools?: string[];
   requires_confirmation_tools?: string[];
