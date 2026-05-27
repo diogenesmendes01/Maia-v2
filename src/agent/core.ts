@@ -939,8 +939,11 @@ async function runAgentForMensagemInner(
           await clearDebounceState(pessoa.telefone_whatsapp);
           return;
         }
-        // Not handled (identity mismatch / !ok / no reply) → fall through to
-        // the normal LLM/ReAct turn below. Safe: no side effects ran.
+        // Not handled → fall through to the normal LLM/ReAct turn below. Cases:
+        // identity mismatch / !ok / no reply (no side effects ran), OR
+        // dispatch_send_failed — a send was ATTEMPTED but threw pre-delivery
+        // (delivered:false), so nothing reached the user and ReAct can safely
+        // answer without a double-send (Codex #216 HIGH-1).
       }
 
       // 'respond', 'call_tool', 'continue_workflow' → proceed to LLM with

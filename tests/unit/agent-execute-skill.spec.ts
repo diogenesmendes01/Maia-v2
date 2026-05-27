@@ -292,6 +292,24 @@ describe('F1 Phase 1 — executeSelectedSkill', () => {
     );
   });
 
+  it('dispatchOutput fails POST-send (delivered:true, persist failed) ⇒ handled, NO re-send + loud log (HIGH-1)', async () => {
+    // The channel send SUCCEEDED but the DB persist threw: the user already has
+    // the reply. We must NOT re-send (a fall-through to ReAct would double-send a
+    // financial message) — report handled and log the inconsistency for ops.
+    const persistErr = Object.assign(new Error('persist_failed'), { delivered: true });
+    const deps = mkDeps({
+      dispatchOutput: vi.fn().mockRejectedValue(persistErr),
+    });
+    const outcome = await executeSelectedSkill(mkArgs(), deps);
+
+    expect(outcome).toEqual({ handled: true });
+    expect(deps.dispatchOutput).toHaveBeenCalledOnce(); // never re-dispatch
+    expect(deps.logger.error).toHaveBeenCalledWith(
+      expect.objectContaining({ ops_alert: true, err: 'persist_failed' }),
+      'skill.dispatch_failed_after_send_inconsistency',
+    );
+  });
+
   it('dispatchOutput fails PRE-send (delivered:false) ⇒ fall through to ReAct (handled:false), no second send (HIGH-A)', async () => {
     // The channel send threw, so NOTHING reached the user. LLM-first: fall
     // through to the normal ReAct turn so the agent still answers with a real,

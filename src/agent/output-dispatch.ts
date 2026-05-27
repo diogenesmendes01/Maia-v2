@@ -89,6 +89,9 @@ export type DispatchOutputCtx = {
  *     another way) without risking a duplicate.
  *   - `delivered: true`  — the message WAS sent but the DB persist failed; the
  *     user already received it, so the caller must NOT re-send (double-send).
+ * Tagged across the pre-send (quote lookup), text and voice paths — the branches
+ * reachable from the skill-execution caller (PDF/poll need latestReportPdf /
+ * latestPending, which that caller passes as null).
  * Extends Error (carries the cause message) so existing generic
  * `catch (e) { (e as Error).message }` callers are unaffected.
  */
@@ -110,15 +113,25 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
   // can't drift between copies.
   // Pending check via canonical repo (post-B0). `||` short-circuits
   // on detected correction so the DB hit only happens when needed.
-  const shouldQuote =
-    (inbound.conteudo && detectCorrection(inbound.conteudo)) ||
-    (await pendingQuestionsRepo.findActiveSnapshot(c.id)) !== null;
-  const quotedContext = shouldQuote
-    ? quotedReplyContext(
-        inbound.metadata as Record<string, unknown> | null,
-        inbound.conteudo,
-      )
-    : undefined;
+  // Everything up to the first channel send is PRE-send work: if it throws,
+  // NOTHING reached the user. Tag it delivered:false (Codex #216 HIGH-1) so the
+  // skill-execution caller falls through to ReAct (never silence) with no
+  // double-send risk (nothing was dispatched).
+  let quotedContext: WAQuotedContext | undefined;
+  try {
+    const shouldQuote =
+      !!(inbound.conteudo && detectCorrection(inbound.conteudo)) ||
+      (await pendingQuestionsRepo.findActiveSnapshot(c.id)) !== null;
+    quotedContext = shouldQuote
+      ? quotedReplyContext(
+          inbound.metadata as Record<string, unknown> | null,
+          inbound.conteudo,
+        )
+      : undefined;
+  } catch (e) {
+    if (e instanceof OutboundDeliveryError) throw e;
+    throw new OutboundDeliveryError(false, (e as Error).message);
+  }
 
   // B3b: PDF report path — takes precedence over poll/text. The LLM's
   // text becomes the document caption (truncated to WhatsApp's 1024-
@@ -201,37 +214,49 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
       );
     }
     if (voiceBuf) {
-      const wid = await sendOutboundVoice(jid, voiceBuf, {
-        quoted: quotedContext,
-      });
+      let wid: string | null;
+      try {
+        wid = await sendOutboundVoice(jid, voiceBuf, {
+          quoted: quotedContext,
+        });
+      } catch (e) {
+        // Pre-send: the voice note never left the channel → tag delivered:false
+        // so the skill caller falls through to ReAct (no double-send).
+        throw new OutboundDeliveryError(false, (e as Error).message);
+      }
       if (wid) {
-        await audit({
-          acao: 'outbound_sent_voice',
-          pessoa_id: pessoa.id,
-          conversa_id: c.id,
-          mensagem_id: inbound.id,
-          metadata: {
-            whatsapp_id: wid,
-            char_count: text.length,
-            byte_size: voiceBuf.length,
-          },
-        });
-        await mensagensRepo.create({
-          conversa_id: c.id,
-          direcao: 'out',
-          tipo: 'audio',
-          conteudo: text,
-          midia_url: null,
-          metadata: {
-            whatsapp_id: wid,
-            remote_jid: jid,
-            in_reply_to: inbound.id,
-            voice: 'nova',
-          },
-          processada_em: new Date(),
-          ferramentas_chamadas: toolSummaries,
-          tokens_usados: null,
-        });
+        try {
+          await audit({
+            acao: 'outbound_sent_voice',
+            pessoa_id: pessoa.id,
+            conversa_id: c.id,
+            mensagem_id: inbound.id,
+            metadata: {
+              whatsapp_id: wid,
+              char_count: text.length,
+              byte_size: voiceBuf.length,
+            },
+          });
+          await mensagensRepo.create({
+            conversa_id: c.id,
+            direcao: 'out',
+            tipo: 'audio',
+            conteudo: text,
+            midia_url: null,
+            metadata: {
+              whatsapp_id: wid,
+              remote_jid: jid,
+              in_reply_to: inbound.id,
+              voice: 'nova',
+            },
+            processada_em: new Date(),
+            ferramentas_chamadas: toolSummaries,
+            tokens_usados: null,
+          });
+        } catch (e) {
+          // Sent but not persisted → user already heard it; must NOT re-send.
+          throw new OutboundDeliveryError(true, (e as Error).message);
+        }
       }
     } else {
       // TTS failed — fall back to text path (re-uses existing sendOutbound).
