@@ -19,12 +19,19 @@ export async function runCognitiveModule<TOut>(
   let fallback_triggered = false;
   let error_message: string | undefined;
 
+  // Issue #224: store the timeout handle and clear it once the race settles.
+  // Without this, every fn() that resolves (or rejects) before the timer fires
+  // leaves a pending setTimeout in the event loop — accumulating closures,
+  // delaying graceful shutdowns, and producing "open handles" warnings in
+  // tests. The same shape as the listener-cleanup fix landing in
+  // skill-runner.ts (sibling PR #221).
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
   try {
     output = await Promise.race([
       fn(),
-      new Promise<TOut>((_, reject) =>
-        setTimeout(() => reject(new Error('timeout')), timeoutMs),
-      ),
+      new Promise<TOut>((_, reject) => {
+        timeoutHandle = setTimeout(() => reject(new Error('timeout')), timeoutMs);
+      }),
     ]);
   } catch (err) {
     const e = err as Error;
@@ -38,6 +45,12 @@ export async function runCognitiveModule<TOut>(
     } else {
       output = null;
     }
+  } finally {
+    // Always clear the timeout — covers all exit paths:
+    //  - fn() resolved first (timeoutHandle still scheduled)
+    //  - fn() rejected first (timeoutHandle still scheduled)
+    //  - timeout fired first (clearTimeout on an already-fired handle is a no-op)
+    if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
   }
 
   const latency_ms = Date.now() - startTime;
