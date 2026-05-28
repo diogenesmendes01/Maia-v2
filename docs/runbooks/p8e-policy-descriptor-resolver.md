@@ -70,7 +70,8 @@ POLICY_RESOLVER_CACHE_TTL_MS=300000     # default 5min
 POLICY_RESOLVER_CACHE_MAX_ENTRIES=10000 # default 10k
 ```
 
-Invalidacao por evento Redis pub/sub no canal `policy_rule_lifecycle`:
+Invalidacao por evento Redis pub/sub no canal **per-tenant**
+`policy_rule_lifecycle:{tenant_id}` (issue #249 round-2):
 
 | Evento | Origem | Acao no cache |
 |---|---|---|
@@ -78,6 +79,13 @@ Invalidacao por evento Redis pub/sub no canal `policy_rule_lifecycle`:
 | `policy_rule_deprecated` | `repo.deprecate()` ok | Idem |
 | `policy_rule_rolled_back` | `repo.rollback()` ok | Idem |
 | (TTL natural) | `Date.now() > expireAt` | Tratado como miss; re-fetch + re-cache |
+
+**Subscriber lifecycle (lazy per-tenant SUBSCRIBE):** ao boot o subscriber conecta no Redis
+SEM nenhuma subscription ativa. Na primeira escrita do cache para um tenant (`set` ou
+`setUnresolved`), o hook `onTenantTouched(tenant_id)` dispara `SUBSCRIBE policy_rule_lifecycle:<tenant_id>`
+exatamente uma vez por (processo, tenant). Isso garante que o BROKER soh entrega eventos
+dos tenants que este processo de fato cacheia — substitui o antigo `PSUBSCRIBE
+policy_rule_lifecycle:*` que recebia eventos cross-tenant e dependia do handler para filtrar.
 
 Se Redis cai: TTL natural (5min) bound a janela de staleness. Workers e API continuam servindo do cache local. Master §11 risco "cache stale".
 
@@ -298,6 +306,11 @@ bash scripts/p8e-acceptance-gates.sh
 ### Cache stale apos `activate` em multi-instancia
 
 - Confira que Redis pub/sub esta funcionando (`redis-cli MONITOR | grep policy_rule_lifecycle`).
+  Espera-se mensagens em `policy_rule_lifecycle:<tenant_id>` (issue #249 — canal per-tenant).
+- Verifique que o subscriber deste processo deu `SUBSCRIBE` no canal do tenant em questao.
+  No log procure por `policy_cache.tenant_channel_subscribed_issue_249` apos a primeira
+  escrita do cache para esse tenant. Se nao aparecer, o cache nunca cacheou nada desse
+  tenant (lazy subscribe). Force uma resolucao para acionar a inscricao.
 - TTL natural de 5min limita a janela. Para forcar invalidacao global imediata, faca `policyResolverCache.invalidateAll()` em cada instancia (kill switch local).
 - P9d adicionara read-after-write strict mode para hard_limit.
 

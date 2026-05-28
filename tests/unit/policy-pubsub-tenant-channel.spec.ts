@@ -7,8 +7,12 @@
  * cache pollution if a subscriber ever forgot to filter by
  * `payload.tenant_id`. The fix moves routing onto the channel name itself:
  * publishers emit on `policy_rule_lifecycle:{tenant_id}` and subscribers
- * use PSUBSCRIBE on `policy_rule_lifecycle:*`. The handler re-derives the
- * tenant from the channel name and cross-checks it against the payload.
+ * use explicit per-tenant SUBSCRIBE on `policy_rule_lifecycle:<tenant_id>`
+ * (NOT PSUBSCRIBE wildcard — Codex round-2 verdict: a wildcard pattern
+ * subscriber still receives broker-side delivery of every tenant's event,
+ * making handler-level filtering a defense-in-depth measure, not isolation).
+ * The handler still re-derives the tenant from the channel name and
+ * cross-checks it against the payload as a safety net.
  *
  * Coverage (mandated by the task spec):
  *   - Publish in tenant-A context routes to tenant-A's channel only.
@@ -17,6 +21,8 @@
  *   - Publish with missing ALS context THROWS (MissingTenantContextError).
  *   - Channel ↔ payload tenant mismatch is dropped (defense-in-depth).
  *   - Legacy bare channel name is rejected.
+ *   - Lazy `onTenantTouched` hook fires once per tenant on first cache write
+ *     (drives explicit per-tenant SUBSCRIBE).
  *
  * No real Redis — we use ioredis-mock semantics via an EventEmitter we
  * control, and we exercise the pure handler / repo paths directly.
@@ -55,7 +61,10 @@ describe('issue #249 — channel name format', () => {
     expect(ch.includes('acme-corp')).toBe(true);
   });
 
-  it('the PSUBSCRIBE pattern is `policy_rule_lifecycle:*`', () => {
+  it('legacy PSUBSCRIBE pattern constant is `policy_rule_lifecycle:*` (kept for back-compat; subscriber uses explicit per-tenant SUBSCRIBE now)', () => {
+    // Issue #249 round-2: the subscriber no longer uses PSUBSCRIBE — see
+    // policy-cache.ts. This constant is retained as a documentation /
+    // mock-compatibility symbol only.
     expect(POLICY_LIFECYCLE_CHANNEL_PATTERN).toBe('policy_rule_lifecycle:*');
   });
 
@@ -389,5 +398,141 @@ describe('issue #249 — subscriber tenant routing', () => {
         scope: {},
       }),
     ).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 4. Lazy per-tenant SUBSCRIBE — Codex round-2 critical fix.
+// ---------------------------------------------------------------------------
+//
+// The previous implementation used PSUBSCRIBE policy_rule_lifecycle:* which
+// caused the BROKER to deliver events for every tenant to every subscriber.
+// The fix: each cache instance fires `onTenantTouched(tenant_id)` on first
+// write per tenant, and the subscriber issues explicit
+// `SUBSCRIBE policy_rule_lifecycle:<tenant_id>` for it. The broker then
+// only delivers events for the tenants this process has subscribed to.
+describe('issue #249 round-2 — lazy per-tenant SUBSCRIBE hook', () => {
+  it('cache.set() fires onTenantTouched exactly once per tenant', () => {
+    const touched: string[] = [];
+    const cache = new PolicyResolverCacheImpl({
+      ttl_ms: 60_000,
+      max_entries: 100,
+      onTenantTouched: (tid) => {
+        touched.push(tid);
+      },
+    });
+    // 3 writes for tenant-a → 1 hook fire
+    for (let i = 0; i < 3; i++) {
+      cache.set(
+        { tenant_id: 'tenant-a', agent_id: null, descriptor: `d${i}`, scope: {} },
+        { descriptor: `d${i}`, policy_id: 'p', version: 1, rule_kind: 'soft_guidance' },
+      );
+    }
+    expect(touched).toEqual(['tenant-a']);
+
+    // First write for tenant-b → second hook fire
+    cache.set(
+      { tenant_id: 'tenant-b', agent_id: null, descriptor: 'd', scope: {} },
+      { descriptor: 'd', policy_id: 'p', version: 1, rule_kind: 'soft_guidance' },
+    );
+    expect(touched).toEqual(['tenant-a', 'tenant-b']);
+
+    // Second write for tenant-b → no new hook fire
+    cache.set(
+      { tenant_id: 'tenant-b', agent_id: null, descriptor: 'd2', scope: {} },
+      { descriptor: 'd2', policy_id: 'p', version: 1, rule_kind: 'soft_guidance' },
+    );
+    expect(touched).toEqual(['tenant-a', 'tenant-b']);
+  });
+
+  it('cache.setUnresolved() also fires onTenantTouched (negative-cache writes are still tenant touches)', () => {
+    const touched: string[] = [];
+    const cache = new PolicyResolverCacheImpl({
+      ttl_ms: 60_000,
+      max_entries: 100,
+      onTenantTouched: (tid) => {
+        touched.push(tid);
+      },
+    });
+    cache.setUnresolved({
+      tenant_id: 'tenant-a',
+      agent_id: null,
+      descriptor: 'missing',
+      scope: {},
+    });
+    expect(touched).toEqual(['tenant-a']);
+  });
+
+  it('cache without onTenantTouched still works (no hook → no error)', () => {
+    const cache = new PolicyResolverCacheImpl({ ttl_ms: 60_000, max_entries: 100 });
+    expect(() => {
+      cache.set(
+        { tenant_id: 'tenant-a', agent_id: null, descriptor: 'd', scope: {} },
+        { descriptor: 'd', policy_id: 'p', version: 1, rule_kind: 'soft_guidance' },
+      );
+    }).not.toThrow();
+  });
+
+  it('onTenantTouched throwing does NOT propagate to the caller (cache write must not fail on Redis blip)', () => {
+    const cache = new PolicyResolverCacheImpl({
+      ttl_ms: 60_000,
+      max_entries: 100,
+      onTenantTouched: () => {
+        throw new Error('redis exploded');
+      },
+    });
+    expect(() => {
+      cache.set(
+        { tenant_id: 'tenant-a', agent_id: null, descriptor: 'd', scope: {} },
+        { descriptor: 'd', policy_id: 'p', version: 1, rule_kind: 'soft_guidance' },
+      );
+    }).not.toThrow();
+    // Entry still cached even though hook threw.
+    expect(
+      cache.get({ tenant_id: 'tenant-a', agent_id: null, descriptor: 'd', scope: {} }),
+    ).toBeDefined();
+  });
+
+  it('first touch of N distinct tenants fires N distinct hook calls (drives explicit SUBSCRIBE per tenant)', () => {
+    const touched: string[] = [];
+    const cache = new PolicyResolverCacheImpl({
+      ttl_ms: 60_000,
+      max_entries: 100,
+      onTenantTouched: (tid) => {
+        touched.push(tid);
+      },
+    });
+    for (const tid of ['tenant-a', 'tenant-b', 'tenant-c', 'tenant-d']) {
+      cache.set(
+        { tenant_id: tid, agent_id: null, descriptor: 'd', scope: {} },
+        { descriptor: 'd', policy_id: 'p', version: 1, rule_kind: 'soft_guidance' },
+      );
+    }
+    expect(touched).toEqual(['tenant-a', 'tenant-b', 'tenant-c', 'tenant-d']);
+    // Subscriber would have issued 4 explicit SUBSCRIBE calls, one per
+    // tenant — never a wildcard. The broker then ONLY delivers messages
+    // for these 4 channels to this process.
+  });
+
+  it('two cache instances each maintain independent tenant-touched sets (no cross-contamination)', () => {
+    const aTouched: string[] = [];
+    const bTouched: string[] = [];
+    const cacheA = new PolicyResolverCacheImpl({
+      ttl_ms: 60_000,
+      max_entries: 100,
+      onTenantTouched: (tid) => aTouched.push(tid),
+    });
+    const cacheB = new PolicyResolverCacheImpl({
+      ttl_ms: 60_000,
+      max_entries: 100,
+      onTenantTouched: (tid) => bTouched.push(tid),
+    });
+    cacheA.set(
+      { tenant_id: 'tenant-x', agent_id: null, descriptor: 'd', scope: {} },
+      { descriptor: 'd', policy_id: 'p', version: 1, rule_kind: 'soft_guidance' },
+    );
+    // cacheB has NOT touched tenant-x; would not subscribe to it.
+    expect(aTouched).toEqual(['tenant-x']);
+    expect(bTouched).toEqual([]);
   });
 });
