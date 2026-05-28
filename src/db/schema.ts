@@ -477,6 +477,69 @@ export const outbox_messages = pgTable(
   }),
 );
 
+/**
+ * Issue #227 — synchronous reply outbound dedupe ledger.
+ *
+ * Closes the double-send crux from PR #216 review HIGH-1: when a throw
+ * from the channel send ambiguously straddles "delivered vs not", the
+ * ReAct fall-through risks producing a second visible reply. This table
+ * is the source of truth for "has this exact turn-reply already been
+ * attempted, and what was the outcome?".
+ *
+ * Status semantics (see migration 063 header for the full rationale):
+ *   pending — reserved pre-send; not yet resolved.
+ *   sent    — provider returned an id; safe to skip on retry.
+ *   failed  — pre-send failure that definitively did NOT reach the
+ *             provider; the ReAct fall-through MAY proceed (no
+ *             risk of double-send because nothing was sent).
+ *   unknown — ambiguous throw; treated as a do-not-resend signal by
+ *             the per-turn guard. Trades a fraction of risk-of-silence
+ *             for zero double-send (owner's explicit choice).
+ *
+ * Why not reuse `idempotency_keys` (tool-shaped) or `outbox_messages`
+ * (async/worker-driven): see migration 063 header.
+ *
+ * Tenant scope: `tenant_id NOT NULL` per the inviolable tenant isolation
+ * invariant. `agent_id` is nullable for parity with `outbox_messages`;
+ * the per-turn guard always carries the tenant filter regardless.
+ */
+export const outbound_messages = pgTable(
+  'outbound_messages',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id'),
+    idempotency_key: text('idempotency_key').notNull().unique(),
+    conversa_id: uuid('conversa_id').notNull(),
+    in_reply_to: uuid('in_reply_to').notNull(),
+    provider_message_id: text('provider_message_id'),
+    status: text('status').notNull().default('pending'),
+    sent_at: timestamp('sent_at', { withTimezone: true }),
+    error: text('error'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    by_turn_lookup: index('idx_outbound_messages_turn_lookup').on(
+      t.conversa_id,
+      t.in_reply_to,
+      t.tenant_id,
+      t.created_at,
+    ),
+    by_tenant_status: index('idx_outbound_messages_tenant_status').on(
+      t.tenant_id,
+      t.status,
+      t.created_at,
+    ),
+    statusCheck: check(
+      'outbound_messages_status_check',
+      sql`status IN ('pending', 'sent', 'failed', 'unknown')`,
+    ),
+  }),
+);
+
+export type OutboundMessage = typeof outbound_messages.$inferSelect;
+export type NewOutboundMessage = typeof outbound_messages.$inferInsert;
+
 export const workflow_steps = pgTable('workflow_steps', {
   id: uuid('id').primaryKey().defaultRandom(),
   tenant_id: text('tenant_id').notNull().default('default'),

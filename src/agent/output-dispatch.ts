@@ -1,5 +1,7 @@
 import { stat } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { mensagensRepo, pessoasRepo, pendingQuestionsRepo } from '@/db/repositories.js';
+import { outboundMessagesRepo } from '@/db/repositories/outbound-messages-repo.js';
 import type { Pessoa, Conversa, Mensagem } from '@/db/schema.js';
 import { audit } from '@/governance/audit.js';
 import { config } from '@/config/env.js';
@@ -11,6 +13,29 @@ import type { WAQuotedContext } from '@/gateway/presence.js';
 import { detectCorrection } from './reflection.js';
 import { cleanupPDF } from './pdf-cleanup.js';
 import type { ToolExecutionSummary } from './tool-execution-summary.js';
+
+/**
+ * Issue #227 — derive the per-turn idempotency key from
+ * `(conversa_id, in_reply_to, sha256(text))`.
+ *
+ * The hash uses the FULL outbound text so a content change between
+ * retries reserves a fresh row (different idempotency_key) and never
+ * collides with a prior attempt's status. A retry that sends the SAME
+ * text re-resolves to the same key and gets the prior row back,
+ * letting `upsertPending` short-circuit when status='sent'.
+ *
+ * Exported so future guard callers can compute the same key for
+ * diagnostics — but the production per-turn lookup uses
+ * `findByConversaTurn` (conversa + in_reply_to), not the key.
+ */
+export function computeOutboundIdempotencyKey(args: {
+  conversa_id: string;
+  in_reply_to: string;
+  text: string;
+}): string {
+  const h = createHash('sha256').update(args.text).digest('hex');
+  return `${args.conversa_id}:${args.in_reply_to}:${h}`;
+}
 
 /**
  * Returns the JID the outbound reply should target. Looks up the inbound
@@ -452,6 +477,106 @@ export async function sendOutbound(
     tool_summaries?: ToolExecutionSummary[];
   },
 ): Promise<string | null> {
+  // Issue #227 — outbound idempotency ledger. Compute the stable key BEFORE
+  // any provider work and reserve a `pending` row. If a prior attempt for this
+  // exact (conversa, turn, content) already succeeded, `upsertPending` returns
+  // `skip=true` and we return early WITHOUT re-invoking the provider. This
+  // closes the double-send window from PR #216 review HIGH-1.
+  //
+  // Phase boundaries (mapped onto OutboundDeliveryError.delivered) used to
+  // assign the FINAL ledger status on failure:
+  //   delivered:false  → markFailed (pre-send, nothing reached the provider).
+  //   delivered:true   → markUnknown (sent-but-X: user may have received it;
+  //                      do NOT resend).
+  //   untyped throw    → markUnknown (conservative — surface ambiguity, never
+  //                      double-send).
+  // The ledger is best-effort: a failure to interact with it never breaks the
+  // user-facing reply (DB hiccup must not silence the user). We log and
+  // proceed; the per-turn guard's own read also fails open.
+  const idempotency_key = computeOutboundIdempotencyKey({
+    conversa_id,
+    in_reply_to,
+    text,
+  });
+  let ledgerActive = true;
+  try {
+    const upsert = await outboundMessagesRepo.upsertPending({
+      idempotency_key,
+      conversa_id,
+      in_reply_to,
+    });
+    if (upsert.skip) {
+      // Prior attempt already succeeded for this exact text + turn.
+      // Surface the prior `provider_message_id` so callers / metrics can
+      // correlate without thinking a new message was sent.
+      logger.info(
+        {
+          conversa_id,
+          in_reply_to,
+          provider_message_id: upsert.row.provider_message_id,
+          sent_at: upsert.row.sent_at,
+        },
+        'outbound.dedupe_skip_already_sent',
+      );
+      return upsert.row.provider_message_id ?? null;
+    }
+  } catch (err) {
+    // Ledger unavailable (DB down, migration not applied). Log loudly and
+    // proceed WITHOUT the ledger so the user still gets a reply — the
+    // double-send window is narrow + low-harm; total silence is worse.
+    ledgerActive = false;
+    logger.warn(
+      {
+        conversa_id,
+        in_reply_to,
+        err: (err as Error).message,
+      },
+      'outbound.ledger_unavailable_proceeding_unguarded',
+    );
+  }
+
+  // markLedger* never throws — wraps the ledger writes so callers don't have
+  // to defensively try/catch every transition. A ledger write failure is
+  // non-fatal: the user already got the reply (or didn't), and the legacy
+  // double-send risk is narrow.
+  const markLedgerFailed = async (error: string): Promise<void> => {
+    if (!ledgerActive) return;
+    try {
+      await outboundMessagesRepo.markFailed({ idempotency_key, error });
+    } catch (err) {
+      logger.warn(
+        { err: (err as Error).message, idempotency_key },
+        'outbound.ledger_mark_failed_failed',
+      );
+    }
+  };
+  const markLedgerUnknown = async (error: string): Promise<void> => {
+    if (!ledgerActive) return;
+    try {
+      await outboundMessagesRepo.markUnknown({ idempotency_key, error });
+    } catch (err) {
+      logger.warn(
+        { err: (err as Error).message, idempotency_key },
+        'outbound.ledger_mark_unknown_failed',
+      );
+    }
+  };
+  const markLedgerSent = async (provider_message_id: string | null): Promise<void> => {
+    if (!ledgerActive) return;
+    try {
+      await outboundMessagesRepo.markSent({
+        idempotency_key,
+        provider_message_id,
+        sent_at: new Date(),
+      });
+    } catch (err) {
+      logger.warn(
+        { err: (err as Error).message, idempotency_key },
+        'outbound.ledger_mark_sent_failed',
+      );
+    }
+  };
+
   // PRE-SEND (recipient + JID resolution). If any of this throws, or there's no
   // recipient to resolve a JID for, NOTHING reached the user → tag
   // delivered:false so callers recover (fall through / retry) without a
@@ -466,8 +591,14 @@ export async function sendOutbound(
     // Falls back to the phone-derived JID for non-reply outbounds.
     jid = await resolveOutboundJid(pessoa, in_reply_to);
   } catch (e) {
-    if (e instanceof OutboundDeliveryError) throw e;
-    throw new OutboundDeliveryError(false, (e as Error).message);
+    const wrapped =
+      e instanceof OutboundDeliveryError
+        ? e
+        : new OutboundDeliveryError(false, (e as Error).message);
+    // Pre-send (delivered:false) → markFailed; ambiguous (delivered:true) →
+    // markUnknown. Pre-send is the expected case for this branch.
+    await (wrapped.delivered ? markLedgerUnknown(wrapped.message) : markLedgerFailed(wrapped.message));
+    throw wrapped;
   }
   const sendOpts: { quoted?: WAQuotedContext; view_once?: boolean } = {};
   if (opts?.quoted) sendOpts.quoted = opts.quoted;
@@ -475,7 +606,7 @@ export async function sendOutbound(
   // Delivery happens in two phases: send to the channel, THEN persist the
   // outbound row. Tag failures by phase (Codex #216 review HIGH-A) so callers
   // can tell "nothing was sent" (safe to recover) from "sent but not persisted"
-  // (must not re-send).
+  // (must not re-send). The ledger transitions mirror that taxonomy.
   let wid: string | null;
   try {
     wid = await sendOutboundText(
@@ -484,6 +615,15 @@ export async function sendOutbound(
       Object.keys(sendOpts).length ? sendOpts : undefined,
     );
   } catch (e) {
+    // The provider call is the ambiguous boundary. A throw HERE could mean
+    // the message was relayed-then-acked-late or never sent at all — the
+    // transport doesn't distinguish. Per the owner's spec (issue #227 §Design
+    // nuance), we record this as `unknown` so the per-turn guard blocks the
+    // ReAct fall-through. delivered:false at this point is the conservative
+    // OutboundDeliveryError tagging (we wrap any raw throw as delivered:false
+    // here, but the ledger marks it `unknown` to honour the owner's choice of
+    // zero double-send).
+    await markLedgerUnknown((e as Error).message);
     throw new OutboundDeliveryError(false, (e as Error).message);
   }
   // A null id means the gateway did NOT confirm a send. Disambiguate
@@ -491,7 +631,14 @@ export async function sendOutbound(
   // delivered:true) so we don't drop silently NOR risk a double-send, and never
   // persist a phantom whatsapp_id:null row (Codex #216 HIGH-1 + round-3 item 3).
   if (wid === null) {
-    throwForNullSend('channel');
+    if (isBaileysConnected()) {
+      // sent-but-no-id: treat as ambiguous → unknown (block fall-through).
+      await markLedgerUnknown('channel_sent_without_id');
+      throw new OutboundDeliveryError(true, 'channel_sent_without_id');
+    }
+    // disconnected: definitely nothing sent → failed (safe to retry).
+    await markLedgerFailed('channel_disconnected');
+    throw new OutboundDeliveryError(false, 'channel_disconnected');
   }
   const metadata: Record<string, unknown> = { whatsapp_id: wid, remote_jid: jid, in_reply_to };
   if (opts?.pending_question_id) metadata.pending_question_id = opts.pending_question_id;
@@ -509,8 +656,17 @@ export async function sendOutbound(
       tokens_usados: null,
     });
   } catch (e) {
+    // POST-send persist throw: the user ALREADY received the reply but our DB
+    // row is missing. Mark unknown so the per-turn guard blocks a redundant
+    // ReAct reply (we lost the auditable record, but the user got the
+    // message). The OutboundDeliveryError(true) preserves the legacy
+    // delivered:true tagging for the safeDispatchOutput classifier.
+    await markLedgerUnknown(`mensagens_persist_failed: ${(e as Error).message}`);
     throw new OutboundDeliveryError(true, (e as Error).message);
   }
+  // Successful send + persist → commit `sent`. The per-turn guard now treats
+  // this turn as terminal: a redundant ReAct fall-through is blocked.
+  await markLedgerSent(wid);
   return wid;
 }
 

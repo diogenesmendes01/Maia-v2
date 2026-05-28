@@ -33,6 +33,7 @@ import type {
   SkillExecutionOutput,
 } from '@/skills/types.js';
 import type { DispatchOutputCtx, DispatchOutcome } from './output-dispatch.js';
+import type { outboundMessagesRepo as OutboundMessagesRepoT } from '@/db/repositories/outbound-messages-repo.js';
 
 /** Minimal active-skill identity needed for the pre-execution assert. */
 export interface ActiveSkillIdentity {
@@ -54,6 +55,10 @@ export interface PinnedSkillIdentity {
  *    clearDebounceState) and `return` (no LLM turn).
  *  - `handled: false` — fall through to the normal LLM/ReAct turn. `reason`
  *    is for logging/metrics only.
+ *  - `reason: 'outbound_guard_blocked'` (#227) — a prior outbound attempt for
+ *    THIS turn already landed at `sent`/`unknown`/`pending`. The guard
+ *    BLOCKS ReAct from sending a second reply (`handled: true` semantics
+ *    upstream — caller treats this turn as terminal, no LLM turn).
  */
 export type ExecuteSkillOutcome =
   | { handled: true }
@@ -82,6 +87,14 @@ export interface ExecuteSelectedSkillDeps {
    * the caller maps to fall-through vs. handled, instead of throwing.
    */
   safeDispatchOutput: (ctx: DispatchOutputCtx) => Promise<DispatchOutcome>;
+  /**
+   * Issue #227 — per-turn outbound idempotency guard. Looks up the latest
+   * attempt for (conversa_id, in_reply_to) under the current tenant. The
+   * caller checks `.status` BEFORE letting ReAct/skill send: `sent`/`unknown`/
+   * `pending` ⇒ BLOCK (prior reply may have reached the user); `failed`
+   * or no row ⇒ proceed (nothing was sent yet).
+   */
+  outboundMessagesRepo: Pick<typeof OutboundMessagesRepoT, 'findByConversaTurn'>;
   logger: {
     info: (obj: unknown, msg: string) => void;
     warn: (obj: unknown, msg: string) => void;
@@ -174,6 +187,60 @@ export async function executeSelectedSkill(
   deps: ExecuteSelectedSkillDeps,
 ): Promise<ExecuteSkillOutcome> {
   const { pinned, routedAgentId, pessoa, conversa, inbound, jid } = args;
+
+  // Issue #227 — per-turn outbound idempotency guard.
+  // BEFORE running the skill (and before any subsequent ReAct fall-through), check
+  // whether a prior outbound attempt for this exact turn already happened:
+  //   - status `sent`    → the user received the reply; do NOT send again.
+  //   - status `unknown` → ambiguous throw (could have delivered); do NOT send
+  //                        again (trades risk-of-silence for zero double-send).
+  //   - status `pending` → a previous attempt crashed mid-resolve; conservatively
+  //                        block so we don't race a phantom send.
+  //   - status `failed`  → pre-send failure, NOTHING reached the user. The skill
+  //                        (and any later ReAct fall-through) MAY proceed.
+  //   - no row           → no prior attempt; proceed.
+  // The guard reading fails OPEN (proceed) on a DB hiccup — silencing the user
+  // because the ledger is down would be a worse failure mode than a narrow
+  // double-send risk that was already tolerated pre-#227.
+  let priorAttempt = null;
+  try {
+    priorAttempt = await deps.outboundMessagesRepo.findByConversaTurn({
+      conversa_id: conversa.id,
+      in_reply_to: inbound.id,
+    });
+  } catch (err) {
+    deps.logger.warn(
+      {
+        conversa_id: conversa.id,
+        turno_id: inbound.id,
+        err: (err as Error).message,
+      },
+      'skill.outbound_guard_lookup_failed_proceeding',
+    );
+  }
+  if (
+    priorAttempt &&
+    (priorAttempt.status === 'sent' ||
+      priorAttempt.status === 'unknown' ||
+      priorAttempt.status === 'pending')
+  ) {
+    // BLOCK any subsequent send for this turn. `handled: true` signals the
+    // caller (core.ts) that this turn is terminal: the post-handled invariants
+    // run (touch / markAllProcessed / clearDebounceState) and no ReAct turn
+    // is started. The prior attempt already produced the user-facing audit
+    // trail (mensagens row when sent, audit breadcrumb for unknown/pending).
+    deps.logger.warn(
+      {
+        conversa_id: conversa.id,
+        turno_id: inbound.id,
+        prior_status: priorAttempt.status,
+        prior_provider_message_id: priorAttempt.provider_message_id,
+        prior_idempotency_key: priorAttempt.idempotency_key,
+      },
+      'skill.outbound_guard_blocked_double_send',
+    );
+    return { handled: true };
+  }
 
   // Contract 1a: the engine must have pinned the skill's stable identity. If it
   // didn't (legacy/stub skill with no descriptor/version), we cannot safely
@@ -311,10 +378,11 @@ export async function executeSelectedSkill(
   //     financial message) and log the inconsistency loudly for ops.
   // A canned fallback is reserved for Phase-2 "last resort" cases; Phase 1 only
   // runs side-effect-free prompt_only/evaluator, so ReAct recovery is best.
-  // CAVEAT (#227): the transport does NOT guarantee throw ⇒ not-delivered; a
-  // post-relay timeout could be tagged not_sent after delivery → a 2nd ReAct
-  // send would double-send. Narrow + low-harm for Phase-1 read-only replies; the
-  // outbound idempotency/dedupe ledger that closes this fully is tracked in #227.
+  // The ambiguous-delivery window (#216 HIGH-1) is closed by the #227 outbound
+  // idempotency ledger: the pre-skill guard above blocks a 2nd ReAct send if
+  // the prior attempt landed at `sent`/`unknown`/`pending`, and sendOutbound's
+  // pre-send ledger reservation skips a duplicate provider call when the same
+  // text+turn already succeeded.
   const outcome = await deps.safeDispatchOutput({
     pessoa,
     conversa,

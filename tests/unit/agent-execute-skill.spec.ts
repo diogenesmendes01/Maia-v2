@@ -48,6 +48,9 @@ function mkDeps(overrides?: Partial<ExecuteSelectedSkillDeps>): ExecuteSelectedS
       trace: { mode: 'prompt_only', skill_version: 3, skill_id: 'skill_faq' },
     } satisfies SkillExecutionOutput),
     safeDispatchOutput: vi.fn().mockResolvedValue({ status: 'delivered' }),
+    // Issue #227 — by default the guard finds no prior attempt, so all
+    // existing tests proceed exactly as they did pre-guard.
+    outboundMessagesRepo: { findByConversaTurn: vi.fn().mockResolvedValue(null) },
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     ...overrides,
   };

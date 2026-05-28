@@ -43,6 +43,7 @@ import { sendOutbound, safeDispatchOutput } from './output-dispatch.js';
 import { executeSelectedSkill } from './execute-skill.js';
 import { runSkill } from '@/skills/index.js';
 import { skillsRepo } from '@/db/repositories.js';
+import { outboundMessagesRepo } from '@/db/repositories/outbound-messages-repo.js';
 import { runReActLoop } from './react-loop.js';
 import { runWithTenantContext, getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import { db } from '@/db/client.js';
@@ -930,6 +931,7 @@ async function runAgentForMensagemInner(
             },
             runSkill,
             safeDispatchOutput,
+            outboundMessagesRepo,
             logger,
           },
         );
