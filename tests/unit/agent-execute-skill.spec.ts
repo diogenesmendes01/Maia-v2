@@ -47,7 +47,7 @@ function mkDeps(overrides?: Partial<ExecuteSelectedSkillDeps>): ExecuteSelectedS
       resolved_policies: [],
       trace: { mode: 'prompt_only', skill_version: 3, skill_id: 'skill_faq' },
     } satisfies SkillExecutionOutput),
-    safeDispatchOutput: vi.fn().mockResolvedValue({ status: 'delivered' }),
+    safeDispatchOutput: vi.fn().mockResolvedValue({ status: 'delivered', allowReact: false }),
     // Issue #227 — by default the guard finds no prior attempt, so all
     // existing tests proceed exactly as they did pre-guard.
     outboundMessagesRepo: { findByConversaTurn: vi.fn().mockResolvedValue(null) },
@@ -284,7 +284,7 @@ describe('F1 Phase 1 — executeSelectedSkill', () => {
     const deps = mkDeps({
       safeDispatchOutput: vi
         .fn()
-        .mockResolvedValue({ status: 'sent_no_persist', error: 'db_commit_failed' }),
+        .mockResolvedValue({ status: 'sent_no_persist', allowReact: false, error: 'db_commit_failed' }),
     });
     const outcome = await executeSelectedSkill(mkArgs(), deps);
 
@@ -304,7 +304,7 @@ describe('F1 Phase 1 — executeSelectedSkill', () => {
     const deps = mkDeps({
       safeDispatchOutput: vi
         .fn()
-        .mockResolvedValue({ status: 'sent_no_persist', error: 'persist_failed' }),
+        .mockResolvedValue({ status: 'sent_no_persist', allowReact: false, error: 'persist_failed' }),
     });
     const outcome = await executeSelectedSkill(mkArgs(), deps);
 
@@ -324,7 +324,7 @@ describe('F1 Phase 1 — executeSelectedSkill', () => {
     const deps = mkDeps({
       safeDispatchOutput: vi
         .fn()
-        .mockResolvedValue({ status: 'not_sent', error: 'channel_disconnected' }),
+        .mockResolvedValue({ status: 'not_sent', allowReact: true, error: 'channel_disconnected' }),
     });
     const outcome = await executeSelectedSkill(mkArgs(), deps);
 

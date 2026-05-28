@@ -486,30 +486,32 @@ export const outbox_messages = pgTable(
  * is the source of truth for "has this exact turn-reply already been
  * attempted, and what was the outcome?".
  *
- * Status semantics (see migration 063 header for the full rationale):
- *   pending — reserved pre-send; not yet resolved.
+ * Status semantics (see migration 065 header for the full rationale):
+ *   pending — reserved pre-send; not yet resolved. Reclaimable after 30s.
  *   sent    — provider returned an id; safe to skip on retry.
  *   failed  — pre-send failure that definitively did NOT reach the
  *             provider; the ReAct fall-through MAY proceed (no
  *             risk of double-send because nothing was sent).
- *   unknown — ambiguous throw; treated as a do-not-resend signal by
- *             the per-turn guard. Trades a fraction of risk-of-silence
- *             for zero double-send (owner's explicit choice).
+ *   unknown — ambiguous throw; TERMINAL-SKIP — does NOT cascade to
+ *             ReAct fall-through in the same turn. Trades a fraction
+ *             of risk-of-silence for zero double-send (owner's
+ *             explicit choice; see migration 065 header).
  *
  * Why not reuse `idempotency_keys` (tool-shaped) or `outbox_messages`
- * (async/worker-driven): see migration 063 header.
+ * (async/worker-driven): see migration 065 header.
  *
- * Tenant scope: `tenant_id NOT NULL` per the inviolable tenant isolation
- * invariant. `agent_id` is nullable for parity with `outbox_messages`;
- * the per-turn guard always carries the tenant filter regardless.
+ * Tenant scope: `tenant_id NOT NULL` AND `agent_id NOT NULL` (default
+ * 'default') per the #232/#237 pattern. UNIQUE is composite on
+ * `(tenant_id, agent_id, idempotency_key)` so cross-tenant key
+ * collisions never race. All queries carry the agent_id filter.
  */
 export const outbound_messages = pgTable(
   'outbound_messages',
   {
     id: uuid('id').primaryKey().defaultRandom(),
     tenant_id: text('tenant_id').notNull(),
-    agent_id: text('agent_id'),
-    idempotency_key: text('idempotency_key').notNull().unique(),
+    agent_id: text('agent_id').notNull().default('default'),
+    idempotency_key: text('idempotency_key').notNull(),
     conversa_id: uuid('conversa_id').notNull(),
     in_reply_to: uuid('in_reply_to').notNull(),
     provider_message_id: text('provider_message_id'),
@@ -517,19 +519,35 @@ export const outbound_messages = pgTable(
     sent_at: timestamp('sent_at', { withTimezone: true }),
     error: text('error'),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    // TTL hint for cleanup (operator-side cron / follow-up worker).
+    // Default 30d retention — see migration 065 header.
+    expires_at: timestamp('expires_at', { withTimezone: true })
+      .notNull()
+      .default(sql`(now() + INTERVAL '30 days')`),
   },
   (t) => ({
+    // Composite UNIQUE — the atomic-claim conflict target. Same pattern
+    // as #232/#237 (rules_repo, agent_memories). Never UNIQUE on key
+    // alone (cross-tenant collision risk).
+    by_tenant_agent_key: uniqueIndex('idx_outbound_messages_tenant_agent_key').on(
+      t.tenant_id,
+      t.agent_id,
+      t.idempotency_key,
+    ),
     by_turn_lookup: index('idx_outbound_messages_turn_lookup').on(
       t.conversa_id,
       t.in_reply_to,
       t.tenant_id,
+      t.agent_id,
       t.created_at,
     ),
     by_tenant_status: index('idx_outbound_messages_tenant_status').on(
       t.tenant_id,
+      t.agent_id,
       t.status,
       t.created_at,
     ),
+    by_expires_at: index('idx_outbound_messages_expires_at').on(t.expires_at),
     statusCheck: check(
       'outbound_messages_status_check',
       sql`status IN ('pending', 'sent', 'failed', 'unknown')`,

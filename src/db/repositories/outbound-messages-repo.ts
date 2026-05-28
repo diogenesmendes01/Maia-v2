@@ -2,53 +2,83 @@
  * outboundMessagesRepo — Issue #227 idempotency / dedupe ledger.
  *
  * Closes the double-send crux from PR #216 review HIGH-1. See migration
- * 063 and `src/db/schema.ts` (outbound_messages) for the table shape +
+ * 065 and `src/db/schema.ts` (outbound_messages) for the table shape +
  * status semantics. This repo enforces:
  *
  *   1. Tenant isolation — every read AND every write is scoped to
- *      `tenant_id = getCurrentTenant()` (the inviolable invariant from
- *      the project north star). Cross-tenant rows are invisible. Insert
- *      paths run through `applyTenantGuard` so the row carries the
- *      caller's tenant_id/agent_id, never the schema default. Adversarial
- *      cross-tenant seed tests live in `tests/unit/repos/outbound-messages-repo.spec.ts`
- *      (PR #222 pattern: A-first AND B-first ordering).
+ *      `tenant_id = getCurrentTenant()` AND `agent_id = getCurrentAgent()`
+ *      (the inviolable invariant from the project north star). The
+ *      UNIQUE is composite on `(tenant_id, agent_id, idempotency_key)`
+ *      so cross-tenant key collisions never surface. Adversarial
+ *      cross-tenant seed tests live in
+ *      `tests/unit/repos/outbound-messages-repo.spec.ts` (PR #222
+ *      pattern: A-first AND B-first ordering).
  *
- *   2. Optimistic pre-send (`upsertPending`) — the caller computes the
- *      `idempotency_key` from `(conversa_id, in_reply_to, hash(text))`
- *      and calls this BEFORE the provider. If a prior attempt for the
- *      same key already landed at `status='sent'`, we return that row
- *      with `skip=true` so the caller can avoid the second provider
- *      call (the user already received the reply). Otherwise we insert
- *      a fresh `pending` row.
+ *   2. Atomic pre-send claim (`upsertPending`) — uses Postgres-native
+ *      `INSERT ... ON CONFLICT (tenant_id, agent_id, idempotency_key)
+ *      DO UPDATE` with a WHERE clause that ONLY overwrites a stale
+ *      pending row (created_at older than the 30s stale threshold) OR
+ *      a `failed` row. The RETURNING clause exposes `xmax = 0` so the
+ *      caller knows whether IT inserted (claim winner) or saw a prior
+ *      row (loser / dedupe). This handles atomically:
+ *        - Race A/B same turn → one inserts, the other sees existing.
+ *        - DB drop mid-claim → stale pending gets reclaimed after 30s.
+ *        - markSent failure → pending becomes stale and is recoverable.
  *
- *   3. Status transitions only forward (`markSent`, `markFailed`,
- *      `markUnknown`). The semantics differ on the RETRY path:
- *        - `failed` does NOT block ReAct fall-through (pre-send failure,
- *          nothing reached the provider — safe to retry).
- *        - `unknown` DOES block fall-through (ambiguous throw — trades
- *          risk-of-silence for zero double-send).
- *        - `sent` always blocks (provider acknowledged).
+ *   3. CAS-guarded transitions (`markSent`, `markFailed`,
+ *      `markUnknown`) — `markFailed`/`markUnknown` carry
+ *      `WHERE status NOT IN ('sent', 'unknown')` so a stale background
+ *      retry CAN NEVER degrade a `sent`/`unknown` row. `markSent` is
+ *      idempotent (last-writer-wins on success metadata). The
+ *      RETURNING is used to detect a no-op (the row was already at a
+ *      higher status) — we log and proceed rather than throw.
  *
  *   4. Per-turn guard (`findByConversaTurn`) — returns the latest
  *      attempt for `(conversa_id, in_reply_to)` under the current
- *      tenant context. Caller (execute-skill / future call sites) reads
- *      `.status` and decides whether ReAct may send.
+ *      tenant + agent context. Caller (execute-skill / future call
+ *      sites) reads `.status` and decides whether ReAct may send.
+ *      `unknown` is TERMINAL-SKIP (does NOT cascade to ReAct) per
+ *      owner's "rare silence > zero double-send" trade-off.
  */
-import { and, desc, eq } from 'drizzle-orm';
+import { and, desc, eq, sql } from 'drizzle-orm';
 import { db } from '../client.js';
 import { outbound_messages } from '../schema.js';
 import type { OutboundMessage } from '../schema.js';
-import { applyTenantGuard } from '../tenant-guard.js';
-import { getCurrentTenant } from '../tenant-context.js';
+import { getCurrentTenant, getCurrentAgent } from '../tenant-context.js';
+import { logger } from '@/lib/logger.js';
 
 /**
- * Result of `upsertPending`. `skip=true` means a prior attempt for this
- * key already succeeded; the caller MUST NOT re-invoke the provider.
- * The returned `row` is the existing successful row (so the caller can
- * log the prior `provider_message_id` / `sent_at`).
+ * Stale-pending threshold. A `pending` row older than this is
+ * considered abandoned (the previous claim crashed mid-resolve, or
+ * `markSent`/`markFailed`/`markUnknown` failed) and is reclaimable
+ * via ON CONFLICT DO UPDATE. 30s is generous enough for any normal
+ * provider timeout but short enough that user-visible retry latency
+ * stays bounded.
+ */
+export const STALE_PENDING_SECONDS = 30;
+
+/**
+ * Result of `upsertPending`. Three orthogonal flags the caller maps to
+ * its own send decision:
+ *  - `inserted` true ⇔ THIS caller atomically claimed the row (it is
+ *     the winner of any race). The caller MUST proceed with the send.
+ *  - `inserted` false + `skip` true ⇔ a prior attempt for this key
+ *     ALREADY succeeded (status='sent'). The caller MUST NOT re-invoke
+ *     the provider; the returned `row` carries the prior
+ *     `provider_message_id`.
+ *  - `inserted` false + `skip` false ⇔ a prior attempt is `pending`
+ *     (not yet stale), `failed`, or `unknown`. The caller decides
+ *     based on the row's status (see migration 065 header).
  */
 export interface UpsertPendingResult {
   row: OutboundMessage;
+  /**
+   * true ⇔ THIS call atomically inserted the row (claim winner). The
+   * caller has exclusive rights to send. Derived from Postgres
+   * `xmax = 0` on the RETURNING clause (a freshly-inserted row has
+   * xmax=0; an UPDATE-by-conflict has the conflicting xact's id).
+   */
+  inserted: boolean;
   /**
    * true ⇔ the existing row already had `status='sent'`. The caller
    * skips the provider call.
@@ -58,25 +88,24 @@ export interface UpsertPendingResult {
 
 export const outboundMessagesRepo = {
   /**
-   * Reserve a pre-send row, or detect a prior success and signal skip.
+   * Atomic pre-send claim via `INSERT ON CONFLICT DO UPDATE`.
    *
-   * Semantics:
-   *  - If NO row exists for the key → INSERT a fresh `pending` row.
-   *  - If a row exists at `status='sent'` → return it with `skip=true`.
-   *  - If a row exists at `status='pending' | 'failed' | 'unknown'`
-   *    → return it with `skip=false` (caller may retry / interpret).
-   *    The pending case is rare in practice (a previous attempt
-   *    crashed without resolving the status); the caller proceeds and
-   *    `markSent`/`markFailed`/`markUnknown` overwrites the status.
+   * Race-safe by construction: two concurrent claims for the same
+   * `(tenant_id, agent_id, idempotency_key)` both attempt the INSERT;
+   * Postgres serialises the conflict and applies the DO UPDATE branch
+   * to the loser. The DO UPDATE clause OVERWRITES the row only when
+   * the existing row is `failed` OR a stale `pending` (older than
+   * `STALE_PENDING_SECONDS`) — otherwise the UPDATE is a SET-to-same
+   * no-op and the prior row is returned as-is.
    *
-   * Tenant-scoped: the lookup AND the insert both go through the
-   * current `runWithTenantContext`. A row inserted under tenant-A is
-   * invisible to a lookup from tenant-B context. The unique constraint
-   * is at the global level on `idempotency_key`, but we filter on
-   * tenant_id in every read so an accidental key collision across
-   * tenants (e.g., a caller that forgets to include tenant in the
-   * recipe) is contained: tenant-B can never read or update the
-   * tenant-A row.
+   * The `was_inserted` flag (derived from `xmax = 0` in RETURNING)
+   * tells the caller whether IT claimed the row. The caller's send
+   * MUST be guarded by `inserted === true` to guarantee exactly-one
+   * provider call across the race.
+   *
+   * Tenant-scoped: the conflict target includes `(tenant_id,
+   * agent_id, idempotency_key)`. Cross-tenant key collisions are
+   * physically impossible (different rows in the unique index).
    */
   async upsertPending(args: {
     idempotency_key: string;
@@ -84,74 +113,138 @@ export const outboundMessagesRepo = {
     in_reply_to: string;
   }): Promise<UpsertPendingResult> {
     const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
 
-    // Lookup first — tenant-scoped so a cross-tenant key collision can
-    // never surface (defense in depth on top of the UNIQUE constraint).
-    const existing = await db
-      .select()
-      .from(outbound_messages)
-      .where(
-        and(
-          eq(outbound_messages.idempotency_key, args.idempotency_key),
-          eq(outbound_messages.tenant_id, tenant_id),
-        ),
+    // ON CONFLICT DO UPDATE — atomic claim with stale-pending recovery.
+    //
+    // The WHERE clause on the DO UPDATE makes the overwrite CONDITIONAL:
+    //   - `failed` rows are always reclaimable (pre-send failure, safe
+    //     to retry).
+    //   - `pending` rows are reclaimable only when older than
+    //     STALE_PENDING_SECONDS (abandoned attempt).
+    //   - `sent`/`unknown`/recent-`pending` rows are NOT overwritten;
+    //     the UPDATE is filtered out by WHERE, and RETURNING returns
+    //     the prior row unchanged.
+    //
+    // The `was_inserted = (xmax = 0)` trick: Postgres assigns
+    // xmax=0 to a freshly-inserted tuple; an UPDATE-by-conflict
+    // carries the conflicting transaction's id. This is the canonical
+    // pattern for distinguishing insert vs update in a single
+    // upsert (Postgres docs: "Concurrency Control" §UPSERT).
+    //
+    // Note: when the DO UPDATE WHERE is FALSE the row is not updated
+    // and RETURNING yields no row (the conflict was filtered out). We
+    // fall through to a SELECT to surface the existing row below.
+    type Returned = {
+      id: string;
+      tenant_id: string;
+      agent_id: string;
+      idempotency_key: string;
+      conversa_id: string;
+      in_reply_to: string;
+      provider_message_id: string | null;
+      status: 'pending' | 'sent' | 'failed' | 'unknown';
+      sent_at: Date | null;
+      error: string | null;
+      created_at: Date;
+      expires_at: Date;
+      was_inserted: boolean;
+    };
+    const result = await db.execute<Returned>(sql`
+      INSERT INTO outbound_messages (
+        tenant_id, agent_id, idempotency_key, conversa_id, in_reply_to, status
+      ) VALUES (
+        ${tenant_id}, ${agent_id}, ${args.idempotency_key},
+        ${args.conversa_id}::uuid, ${args.in_reply_to}::uuid, 'pending'
       )
-      .limit(1);
+      ON CONFLICT (tenant_id, agent_id, idempotency_key)
+      DO UPDATE SET
+        status = 'pending',
+        conversa_id = EXCLUDED.conversa_id,
+        in_reply_to = EXCLUDED.in_reply_to,
+        provider_message_id = NULL,
+        sent_at = NULL,
+        error = NULL,
+        created_at = now(),
+        expires_at = now() + INTERVAL '30 days'
+      WHERE
+        outbound_messages.status = 'failed'
+        OR (
+          outbound_messages.status = 'pending'
+          AND outbound_messages.created_at < now() - (${STALE_PENDING_SECONDS}::text || ' seconds')::interval
+        )
+      RETURNING *, (xmax = 0) AS was_inserted
+    `);
 
-    if (existing[0]) {
-      return { row: existing[0], skip: existing[0].status === 'sent' };
-    }
+    const rows = Array.from(result.rows as unknown as Returned[]);
+    const row = rows[0] ?? null;
 
-    // No row yet — insert a fresh pending. applyTenantGuard injects
-    // tenant_id/agent_id from the current context so the row matches
-    // the read filter above.
-    const guarded = applyTenantGuard({
-      idempotency_key: args.idempotency_key,
-      conversa_id: args.conversa_id,
-      in_reply_to: args.in_reply_to,
-      status: 'pending' as const,
-    });
-
-    try {
-      const inserted = await db
-        .insert(outbound_messages)
-        .values(guarded)
-        .returning();
-      return { row: inserted[0]!, skip: false };
-    } catch (e) {
-      // UNIQUE collision — a parallel writer beat us. Re-read so the
-      // caller sees the winner's state (which may already be `sent`).
-      // The unique constraint is on `idempotency_key` globally, so the
-      // winning row is unambiguous; we still filter by tenant_id in the
-      // re-read to protect against the hypothetical cross-tenant key
-      // collision (defense in depth).
-      const code = (e as { code?: string }).code;
-      if (code === '23505') {
-        const winner = await db
-          .select()
-          .from(outbound_messages)
-          .where(
-            and(
-              eq(outbound_messages.idempotency_key, args.idempotency_key),
-              eq(outbound_messages.tenant_id, tenant_id),
-            ),
-          )
-          .limit(1);
-        if (winner[0]) {
-          return { row: winner[0], skip: winner[0].status === 'sent' };
-        }
+    if (!row) {
+      // Conflict matched a NON-reclaimable row (sent / unknown /
+      // recent pending) — the DO UPDATE WHERE filtered the UPDATE out
+      // and RETURNING produced no row. Re-read the existing row.
+      const existing = await db
+        .select()
+        .from(outbound_messages)
+        .where(
+          and(
+            eq(outbound_messages.tenant_id, tenant_id),
+            eq(outbound_messages.agent_id, agent_id),
+            eq(outbound_messages.idempotency_key, args.idempotency_key),
+          ),
+        )
+        .limit(1);
+      if (!existing[0]) {
+        // Extremely unlikely race: conflict was filtered out AND the
+        // row vanished before our re-read. Fail loudly — the caller's
+        // outer try/catch in sendOutbound treats this as a ledger
+        // outage and proceeds without the ledger (fail-open by design).
+        throw new Error(
+          'outbound_ledger_invariant: ON CONFLICT filtered + row missing on re-read',
+        );
       }
-      // Different error (not the unique collision we expected) — rethrow.
-      throw e;
+      return {
+        row: existing[0],
+        inserted: false,
+        skip: existing[0].status === 'sent',
+      };
     }
+
+    const wasInserted = Boolean(row.was_inserted);
+    const typed: OutboundMessage = {
+      id: row.id,
+      tenant_id: row.tenant_id,
+      agent_id: row.agent_id,
+      idempotency_key: row.idempotency_key,
+      conversa_id: row.conversa_id,
+      in_reply_to: row.in_reply_to,
+      provider_message_id: row.provider_message_id ?? null,
+      status: row.status,
+      sent_at: row.sent_at ?? null,
+      error: row.error ?? null,
+      created_at: row.created_at,
+      expires_at: row.expires_at,
+    };
+    return {
+      row: typed,
+      inserted: wasInserted,
+      // The DO UPDATE branch above resets `status = 'pending'` on a
+      // successful reclaim, so `skip` here only ever surfaces on the
+      // NO-row path above (handled separately). Defensive check.
+      skip: typed.status === 'sent',
+    };
   },
 
   /**
-   * Transition `pending` → `sent` after a successful provider send.
-   * Idempotent: re-calling on an already-`sent` row is a no-op
-   * (last-writer-wins on the timestamps, status stays `sent`).
-   * Tenant-scoped: a tenant-B caller cannot mark a tenant-A row sent
-   * (the WHERE filters by both idempotency_key AND tenant_id).
+   * Transition pending → sent after a successful provider send.
+   *
+   * Idempotent: re-calling on an already-`sent` row updates the
+   * timestamps and provider_message_id. The CAS guard is implicit —
+   * `sent` is terminal forward, last-writer-wins is acceptable on
+   * the success metadata.
+   *
+   * Tenant + agent-scoped: a tenant-B caller cannot mark a tenant-A
+   * row sent (the WHERE filters by tenant_id, agent_id, idempotency_key).
    */
   async markSent(args: {
     idempotency_key: string;
@@ -159,6 +252,7 @@ export const outboundMessagesRepo = {
     sent_at: Date;
   }): Promise<void> {
     const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     await db
       .update(outbound_messages)
       .set({
@@ -169,25 +263,34 @@ export const outboundMessagesRepo = {
       })
       .where(
         and(
-          eq(outbound_messages.idempotency_key, args.idempotency_key),
           eq(outbound_messages.tenant_id, tenant_id),
+          eq(outbound_messages.agent_id, agent_id),
+          eq(outbound_messages.idempotency_key, args.idempotency_key),
         ),
       );
   },
 
   /**
-   * Transition `pending` → `failed` for a pre-send failure that
+   * Transition pending → failed for a pre-send failure that
    * DEFINITIVELY did not reach the provider (JID resolution, payload
-   * serialization, etc.). The per-turn guard treats `failed` as
-   * "ReAct fall-through allowed" because nothing was sent.
-   * Tenant-scoped: same guarantees as markSent.
+   * serialization, etc.).
+   *
+   * CAS-guarded: `WHERE status NOT IN ('sent', 'unknown')` so a stale
+   * background `markFailed` CAN NEVER degrade a row that already
+   * reached `sent` or `unknown`. The RETURNING is inspected; if the
+   * row was not updated (already at a higher status), we log and
+   * no-op rather than throw — the higher status is the correct
+   * outcome (no double-send risk; pre-send failure is the safe state).
+   *
+   * Tenant + agent-scoped: same guarantees as markSent.
    */
   async markFailed(args: {
     idempotency_key: string;
     error: string;
   }): Promise<void> {
     const tenant_id = getCurrentTenant();
-    await db
+    const agent_id = getCurrentAgent();
+    const updated = await db
       .update(outbound_messages)
       .set({
         status: 'failed',
@@ -195,28 +298,42 @@ export const outboundMessagesRepo = {
       })
       .where(
         and(
-          eq(outbound_messages.idempotency_key, args.idempotency_key),
           eq(outbound_messages.tenant_id, tenant_id),
+          eq(outbound_messages.agent_id, agent_id),
+          eq(outbound_messages.idempotency_key, args.idempotency_key),
+          // CAS — never degrade `sent` or `unknown`.
+          sql`${outbound_messages.status} NOT IN ('sent', 'unknown')`,
         ),
+      )
+      .returning({ id: outbound_messages.id });
+    if (updated.length === 0) {
+      logger.info(
+        { idempotency_key: args.idempotency_key, tenant_id, agent_id },
+        'outbound_ledger.mark_failed_noop_higher_status',
       );
+    }
   },
 
   /**
-   * Transition `pending` → `unknown` for an ambiguous throw (the
-   * provider call returned an error but the message COULD have
-   * delivered before the throw, or the post-persist failed with the
-   * user already seeing the reply). The per-turn guard treats
-   * `unknown` as a do-not-resend signal — trades a fraction of
-   * risk-of-silence for zero double-send (owner's explicit choice;
-   * see migration 063 header and the issue spec §Design point 3).
-   * Tenant-scoped: same guarantees as markSent.
+   * Transition pending → unknown for an ambiguous throw (provider
+   * call errored after a possible partial relay, or post-persist
+   * failed with the user already seeing the reply).
+   *
+   * CAS-guarded: `WHERE status NOT IN ('sent', 'unknown')` so we never
+   * overwrite a `sent` row (the higher confidence). `unknown` ↔
+   * `unknown` is a no-op (idempotent). The per-turn guard treats
+   * `unknown` as a TERMINAL-SKIP signal — owner's "zero double-send"
+   * choice (see migration 065 header).
+   *
+   * Tenant + agent-scoped: same guarantees as markSent.
    */
   async markUnknown(args: {
     idempotency_key: string;
     error: string;
   }): Promise<void> {
     const tenant_id = getCurrentTenant();
-    await db
+    const agent_id = getCurrentAgent();
+    const updated = await db
       .update(outbound_messages)
       .set({
         status: 'unknown',
@@ -224,32 +341,47 @@ export const outboundMessagesRepo = {
       })
       .where(
         and(
-          eq(outbound_messages.idempotency_key, args.idempotency_key),
           eq(outbound_messages.tenant_id, tenant_id),
+          eq(outbound_messages.agent_id, agent_id),
+          eq(outbound_messages.idempotency_key, args.idempotency_key),
+          // CAS — never degrade `sent`. `unknown` → `unknown` is a
+          // no-op (excluded by the same predicate, so RETURNING is
+          // empty; we log and proceed).
+          sql`${outbound_messages.status} NOT IN ('sent', 'unknown')`,
         ),
+      )
+      .returning({ id: outbound_messages.id });
+    if (updated.length === 0) {
+      logger.info(
+        { idempotency_key: args.idempotency_key, tenant_id, agent_id },
+        'outbound_ledger.mark_unknown_noop_higher_status',
       );
+    }
   },
 
   /**
    * Per-turn guard primary read.
    *
    * Returns the LATEST attempt (by `created_at`) for the
-   * `(conversa_id, in_reply_to)` pair under the current tenant.
-   * The caller (execute-skill / future call sites) reads `.status`:
-   *   - `sent` or `unknown` → BLOCK ReAct from sending.
+   * `(conversa_id, in_reply_to)` pair under the current tenant +
+   * agent. The caller (execute-skill / future call sites) reads
+   * `.status`:
+   *   - `sent` or `unknown` → BLOCK ReAct from sending (terminal-skip).
    *   - `failed`            → ReAct MAY send (safe retry).
    *   - `pending`           → BLOCK conservatively (an attempt is
    *                           still in flight or crashed mid-resolve).
    *   - null (no row)       → no attempt yet, ReAct MAY send.
    *
-   * Tenant-scoped: a tenant-B caller cannot see tenant-A rows even
-   * if they happened to share a (conversa_id, in_reply_to) pair.
+   * Tenant + agent-scoped: a tenant-B (or agent-B) caller cannot see
+   * tenant-A rows even if they happened to share a (conversa_id,
+   * in_reply_to) pair.
    */
   async findByConversaTurn(args: {
     conversa_id: string;
     in_reply_to: string;
   }): Promise<OutboundMessage | null> {
     const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const rows = await db
       .select()
       .from(outbound_messages)
@@ -258,6 +390,7 @@ export const outboundMessagesRepo = {
           eq(outbound_messages.conversa_id, args.conversa_id),
           eq(outbound_messages.in_reply_to, args.in_reply_to),
           eq(outbound_messages.tenant_id, tenant_id),
+          eq(outbound_messages.agent_id, agent_id),
         ),
       )
       .orderBy(desc(outbound_messages.created_at))

@@ -45,7 +45,7 @@ function mkDeps(
       resolved_policies: [],
       trace: { mode: 'prompt_only', skill_version: 3, skill_id: 'skill_faq' },
     } satisfies SkillExecutionOutput),
-    safeDispatchOutput: vi.fn().mockResolvedValue({ status: 'delivered' }),
+    safeDispatchOutput: vi.fn().mockResolvedValue({ status: 'delivered', allowReact: false }),
     outboundMessagesRepo: {
       findByConversaTurn: vi.fn().mockResolvedValue(guardPriorAttempt),
     },

@@ -370,19 +370,21 @@ export async function executeSelectedSkill(
   // Contract 2: deliver through the shared pipeline (view-once / audit /
   // pending / media) — never raw sendOutbound. `safeDispatchOutput` centralises
   // the EXACTLY-ONCE phase handling (Codex #216 HIGH-1) and never throws:
-  //   - not_sent (pre-send / disconnected gateway / channel threw — NOTHING
-  //     reached the user) → fall through to the normal ReAct turn so the agent
-  //     still answers adaptively. Safe: nothing was sent, so no double-send.
-  //   - sent_no_persist (sent but persist failed, or an ambiguous error) →
-  //     report handled WITHOUT re-sending (a fall-through would double-send a
-  //     financial message) and log the inconsistency loudly for ops.
-  // A canned fallback is reserved for Phase-2 "last resort" cases; Phase 1 only
-  // runs side-effect-free prompt_only/evaluator, so ReAct recovery is best.
+  //   - delivered + allowReact:false  → handled, done.
+  //   - not_sent + allowReact:true    → fall through to the normal ReAct turn.
+  //                                     Safe: nothing was sent, no double-send.
+  //   - sent_no_persist + allowReact:false → handled (terminal-skip). A
+  //                                     fall-through here would risk a
+  //                                     double-send: log + return handled.
+  //
+  // Owner's "rare silence > zero double-send" (#227) is enforced by the
+  // `allowReact` flag: any ambiguous outcome (unknown ledger status) sets
+  // `allowReact:false` and we DO NOT cascade to ReAct in the same turn.
   // The ambiguous-delivery window (#216 HIGH-1) is closed by the #227 outbound
   // idempotency ledger: the pre-skill guard above blocks a 2nd ReAct send if
-  // the prior attempt landed at `sent`/`unknown`/`pending`, and sendOutbound's
-  // pre-send ledger reservation skips a duplicate provider call when the same
-  // text+turn already succeeded.
+  // the prior attempt landed at `sent`/`unknown`/`pending`, and wrapWithLedger's
+  // pre-send claim skips a duplicate provider call when the same text+turn
+  // already succeeded.
   const outcome = await deps.safeDispatchOutput({
     pessoa,
     conversa,
@@ -394,7 +396,7 @@ export async function executeSelectedSkill(
     turnHasSensitive: reply.turnHasSensitive,
     sensitiveTools: reply.sensitiveTools,
   });
-  if (outcome.status === 'not_sent') {
+  if (outcome.status === 'not_sent' && outcome.allowReact) {
     deps.logger.warn(
       {
         conversa_id: conversa.id,
@@ -406,7 +408,11 @@ export async function executeSelectedSkill(
     );
     return { handled: false, reason: 'dispatch_send_failed' };
   }
-  if (outcome.status === 'sent_no_persist') {
+  if (outcome.status === 'sent_no_persist' && !outcome.allowReact) {
+    // #227 terminal-skip: the message may have reached the user
+    // (ambiguous throw, post-persist failure, untyped error). Owner's
+    // choice: do NOT cascade to ReAct — accept the small risk of
+    // silence in exchange for zero double-send of a financial reply.
     deps.logger.error(
       {
         conversa_id: conversa.id,

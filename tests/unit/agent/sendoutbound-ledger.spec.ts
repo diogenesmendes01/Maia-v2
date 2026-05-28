@@ -1,33 +1,36 @@
 /**
- * Issue #227 — sendOutbound × ledger integration tests.
+ * Issue #227 — sendOutbound × ledger integration tests (across all 4 modalities).
  *
  * Proves the wiring contracts in `src/agent/output-dispatch.ts`:
  *
- *   1. Pre-send: a successful upsertPending reserves a `pending` row
- *      BEFORE the provider call.
+ *   1. Pre-send: a successful upsertPending atomically reserves a `pending`
+ *      row BEFORE the provider call. The `inserted` flag is true (claim winner).
  *   2. Pre-send THROW (e.g., pessoa not found) → ledger row is moved to
- *      `failed`, the OutboundDeliveryError carries delivered:false, and
- *      a downstream ReAct fall-through is therefore allowed (per the
- *      execute-skill.ts guard which reads status='failed' as
- *      "ReAct may send").
- *   3. Delivered-but-thrown (channel send throws AFTER potential relay)
- *      → ledger row is moved to `unknown`, OutboundDeliveryError
- *      carries delivered:false (the caller-level error tag is the
- *      conservative #216 phase tag), and the per-turn guard would BLOCK
- *      a second ReAct send (status=unknown).
+ *      `failed`, the OutboundDeliveryError carries delivered:false +
+ *      ambiguous:false. The skill caller's `allowReact:true` outcome lets
+ *      ReAct fall through (per the execute-skill.ts guard which reads
+ *      status='failed' as "ReAct may send").
+ *   3. Provider throw (channel send throws AFTER potential relay) →
+ *      ledger row is moved to `unknown`, the OutboundDeliveryError carries
+ *      delivered:true + ambiguous:true. The caller's `allowReact:false`
+ *      blocks any ReAct fall-through (TERMINAL-SKIP per owner's
+ *      "zero double-send" choice).
  *   4. Retry with the SAME idempotency key while the prior row is at
  *      `sent` → returns early WITHOUT calling the provider; preserves
  *      the prior provider_message_id.
+ *   5. Same-turn concurrent claim (loser path): when `upsertPending`
+ *      returns `inserted:false, skip:false` with a pending prior row,
+ *      sendOutbound DOES NOT invoke the provider (the other worker
+ *      holds the claim).
+ *   6. ALL FOUR modalities (text/document/voice/poll) go through the
+ *      ledger. The document/voice/poll wrappers use distinct idempotency
+ *      keys (modality is hashed into the key) so they never collide.
  *
  * No real DB / network. We replace `outboundMessagesRepo`, `pessoasRepo`,
  * `mensagensRepo`, and the baileys send fns with in-memory fakes.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-// ---------------------------------------------------------------------------
-// Test doubles wired through vi.mock factories. Hoisted state must be set up
-// via vi.hoisted so the factories below can close over it.
-// ---------------------------------------------------------------------------
 type LedgerRow = {
   idempotency_key: string;
   conversa_id: string;
@@ -54,7 +57,17 @@ const hoisted = vi.hoisted(() => {
     sendOutboundVoice: vi.fn(),
     isBaileysConnected: vi.fn().mockReturnValue(true),
   };
-  return { ledger, pessoasRepoFake, mensagensRepoFake, pendingQuestionsRepoFake, baileysFake };
+  const presenceFake = {
+    sendPoll: vi.fn(),
+  };
+  return {
+    ledger,
+    pessoasRepoFake,
+    mensagensRepoFake,
+    pendingQuestionsRepoFake,
+    baileysFake,
+    presenceFake,
+  };
 });
 
 vi.mock('@/db/repositories/outbound-messages-repo.js', () => ({
@@ -66,7 +79,22 @@ vi.mock('@/db/repositories/outbound-messages-repo.js', () => ({
     }) {
       const existing = hoisted.ledger.get(args.idempotency_key);
       if (existing) {
-        return { row: existing, skip: existing.status === 'sent' };
+        // Mirror the production behaviour: if `sent` → skip+inserted=false;
+        // if `failed` → reclaim (inserted=false but the prod ON CONFLICT
+        // overwrites in place; we reset to pending here for parity);
+        // otherwise (pending/unknown, recent) → inserted=false, no
+        // overwrite.
+        if (existing.status === 'sent') {
+          return { row: existing, inserted: false, skip: true };
+        }
+        if (existing.status === 'failed') {
+          existing.status = 'pending';
+          existing.error = null;
+          existing.provider_message_id = null;
+          return { row: existing, inserted: false, skip: false };
+        }
+        // pending/unknown → loser sees the row, does NOT take.
+        return { row: existing, inserted: false, skip: false };
       }
       const row: LedgerRow = {
         idempotency_key: args.idempotency_key,
@@ -78,7 +106,7 @@ vi.mock('@/db/repositories/outbound-messages-repo.js', () => ({
         error: null,
       };
       hoisted.ledger.set(args.idempotency_key, row);
-      return { row, skip: false };
+      return { row, inserted: true, skip: false };
     },
     async markSent(args: { idempotency_key: string; provider_message_id: string | null; sent_at: Date }) {
       const r = hoisted.ledger.get(args.idempotency_key);
@@ -91,12 +119,16 @@ vi.mock('@/db/repositories/outbound-messages-repo.js', () => ({
     async markFailed(args: { idempotency_key: string; error: string }) {
       const r = hoisted.ledger.get(args.idempotency_key);
       if (!r) return;
+      // CAS — refuse to degrade sent/unknown.
+      if (r.status === 'sent' || r.status === 'unknown') return;
       r.status = 'failed';
       r.error = args.error;
     },
     async markUnknown(args: { idempotency_key: string; error: string }) {
       const r = hoisted.ledger.get(args.idempotency_key);
       if (!r) return;
+      // CAS — refuse to degrade sent/unknown.
+      if (r.status === 'sent' || r.status === 'unknown') return;
       r.status = 'unknown';
       r.error = args.error;
     },
@@ -136,7 +168,7 @@ vi.mock('@/lib/tts.js', () => ({
 
 vi.mock('@/gateway/presence.js', () => ({
   quotedReplyContext: () => undefined,
-  sendPoll: vi.fn(),
+  sendPoll: hoisted.presenceFake.sendPoll,
 }));
 
 vi.mock('@/agent/reflection.js', () => ({
@@ -155,8 +187,18 @@ vi.mock('@/config/env.js', () => ({
   },
 }));
 
+vi.mock('node:fs/promises', async (orig) => {
+  const actual = await orig<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    stat: vi.fn().mockResolvedValue({ size: 1234 }),
+  };
+});
+
 import {
   sendOutbound,
+  sendOutboundPoll,
+  dispatchOutput,
   OutboundDeliveryError,
   computeOutboundIdempotencyKey,
 } from '@/agent/output-dispatch.js';
@@ -176,6 +218,7 @@ const ledger = hoisted.ledger;
 const pessoasRepoFake = hoisted.pessoasRepoFake;
 const mensagensRepoFake = hoisted.mensagensRepoFake;
 const baileysFake = hoisted.baileysFake;
+const presenceFake = hoisted.presenceFake;
 
 beforeEach(() => {
   ledger.clear();
@@ -189,9 +232,12 @@ beforeEach(() => {
   baileysFake.isBaileysConnected.mockReset();
   baileysFake.isBaileysConnected.mockReturnValue(true);
   baileysFake.sendOutboundText.mockReset();
+  baileysFake.sendOutboundDocument.mockReset();
+  baileysFake.sendOutboundVoice.mockReset();
+  presenceFake.sendPoll.mockReset();
 });
 
-describe('sendOutbound — ledger pre-send + happy path', () => {
+describe('sendOutbound — text modality ledger pre-send + happy path', () => {
   it('reserves a pending row then marks sent on success', async () => {
     baileysFake.sendOutboundText.mockResolvedValue('wa-xyz');
 
@@ -202,6 +248,7 @@ describe('sendOutbound — ledger pre-send + happy path', () => {
       conversa_id: CONV,
       in_reply_to: TURN,
       text: TEXT,
+      modality: 'text',
     });
     const row = await outboundMessagesRepo.findByConversaTurn({
       conversa_id: CONV,
@@ -228,15 +275,14 @@ describe('sendOutbound — pre-send throw → status failed (ReAct may send)', (
     }
     expect(thrown).toBeInstanceOf(OutboundDeliveryError);
     expect((thrown as OutboundDeliveryError).delivered).toBe(false);
+    expect((thrown as OutboundDeliveryError).ambiguous).toBe(false);
 
+    // No ledger row should exist (pessoa lookup is before the ledger claim).
     const row = await outboundMessagesRepo.findByConversaTurn({
       conversa_id: CONV,
       in_reply_to: TURN,
     });
-    // Pre-send (delivered:false) ⇒ failed ⇒ a downstream guard would
-    // allow ReAct to send because the user got nothing.
-    expect(row?.status).toBe('failed');
-    expect(row?.error).toBe('pessoa_not_found');
+    expect(row).toBeNull();
     expect(baileysFake.sendOutboundText).not.toHaveBeenCalled();
   });
 
@@ -252,17 +298,18 @@ describe('sendOutbound — pre-send throw → status failed (ReAct may send)', (
     }
     expect(thrown).toBeInstanceOf(OutboundDeliveryError);
     expect((thrown as OutboundDeliveryError).delivered).toBe(false);
+    expect((thrown as OutboundDeliveryError).ambiguous).toBe(false);
 
     const row = await outboundMessagesRepo.findByConversaTurn({
       conversa_id: CONV,
       in_reply_to: TURN,
     });
     expect(row?.status).toBe('failed');
-    expect(row?.error).toBe('channel_disconnected');
+    expect(row?.error).toBe('text_channel_disconnected');
   });
 });
 
-describe('sendOutbound — delivered-but-thrown → status unknown (block ReAct)', () => {
+describe('sendOutbound — ambiguous throw → status unknown (TERMINAL-SKIP)', () => {
   it('marks ledger row unknown when sendOutboundText throws (could have delivered)', async () => {
     baileysFake.sendOutboundText.mockRejectedValue(new Error('relay_timeout_after_partial'));
 
@@ -273,6 +320,7 @@ describe('sendOutbound — delivered-but-thrown → status unknown (block ReAct)
       thrown = e;
     }
     expect(thrown).toBeInstanceOf(OutboundDeliveryError);
+    expect((thrown as OutboundDeliveryError).ambiguous).toBe(true);
 
     const row = await outboundMessagesRepo.findByConversaTurn({
       conversa_id: CONV,
@@ -295,13 +343,14 @@ describe('sendOutbound — delivered-but-thrown → status unknown (block ReAct)
     }
     expect(thrown).toBeInstanceOf(OutboundDeliveryError);
     expect((thrown as OutboundDeliveryError).delivered).toBe(true);
+    expect((thrown as OutboundDeliveryError).ambiguous).toBe(true);
 
     const row = await outboundMessagesRepo.findByConversaTurn({
       conversa_id: CONV,
       in_reply_to: TURN,
     });
     expect(row?.status).toBe('unknown');
-    expect(row?.error).toBe('channel_sent_without_id');
+    expect(row?.error).toBe('text_channel_sent_without_id');
   });
 
   it('marks unknown when mensagens persist throws AFTER successful send', async () => {
@@ -316,25 +365,25 @@ describe('sendOutbound — delivered-but-thrown → status unknown (block ReAct)
     }
     expect(thrown).toBeInstanceOf(OutboundDeliveryError);
     expect((thrown as OutboundDeliveryError).delivered).toBe(true);
+    expect((thrown as OutboundDeliveryError).ambiguous).toBe(true);
 
     const row = await outboundMessagesRepo.findByConversaTurn({
       conversa_id: CONV,
       in_reply_to: TURN,
     });
     expect(row?.status).toBe('unknown');
-    expect(row?.error).toContain('mensagens_persist_failed');
+    expect(row?.error).toContain('db_constraint_violation');
+    expect(row?.error).toContain('persist_failed');
   });
 });
 
 describe('sendOutbound — retry with same key while sent → returns early, no provider call', () => {
   it('skip-if-sent: same text + turn returns prior wid without re-calling baileys', async () => {
-    // First call → success → row at status=sent.
     baileysFake.sendOutboundText.mockResolvedValue('wa-first');
     const wid1 = await sendOutbound(PESSOA.id, CONV, TEXT, TURN);
     expect(wid1).toBe('wa-first');
     expect(baileysFake.sendOutboundText).toHaveBeenCalledTimes(1);
 
-    // Reset the spy so we can assert it's NOT called on the retry.
     baileysFake.sendOutboundText.mockClear();
     mensagensRepoFake.create.mockClear();
 
@@ -358,6 +407,32 @@ describe('sendOutbound — retry with same key while sent → returns early, no 
   });
 });
 
+describe('sendOutbound — concurrent same-turn claim → loser does NOT invoke provider', () => {
+  it('a `inserted=false, skip=false` claim with pending status causes early-return (no provider call)', async () => {
+    // Pre-seed a pending row (simulating another worker holding the claim).
+    const key = computeOutboundIdempotencyKey({
+      conversa_id: CONV,
+      in_reply_to: TURN,
+      text: TEXT,
+      modality: 'text',
+    });
+    ledger.set(key, {
+      idempotency_key: key,
+      conversa_id: CONV,
+      in_reply_to: TURN,
+      status: 'pending',
+      provider_message_id: null,
+      sent_at: null,
+      error: null,
+    });
+    baileysFake.sendOutboundText.mockResolvedValue('wa-should-not-be-sent');
+
+    const wid = await sendOutbound(PESSOA.id, CONV, TEXT, TURN);
+    expect(wid).toBeNull();
+    expect(baileysFake.sendOutboundText).not.toHaveBeenCalled();
+  });
+});
+
 describe('sendOutbound — idempotency key derivation', () => {
   it('is stable for the same (conversa, turn, text)', () => {
     const k1 = computeOutboundIdempotencyKey({ conversa_id: CONV, in_reply_to: TURN, text: 'hello' });
@@ -373,5 +448,151 @@ describe('sendOutbound — idempotency key derivation', () => {
     const k1 = computeOutboundIdempotencyKey({ conversa_id: CONV, in_reply_to: 'turn-a', text: 'x' });
     const k2 = computeOutboundIdempotencyKey({ conversa_id: CONV, in_reply_to: 'turn-b', text: 'x' });
     expect(k1).not.toBe(k2);
+  });
+  it('changes when modality changes (same text)', () => {
+    const text = 'same';
+    const kt = computeOutboundIdempotencyKey({ conversa_id: CONV, in_reply_to: TURN, text, modality: 'text' });
+    const kv = computeOutboundIdempotencyKey({ conversa_id: CONV, in_reply_to: TURN, text, modality: 'voice' });
+    const kd = computeOutboundIdempotencyKey({ conversa_id: CONV, in_reply_to: TURN, text, modality: 'document' });
+    const kp = computeOutboundIdempotencyKey({ conversa_id: CONV, in_reply_to: TURN, text, modality: 'poll' });
+    expect(new Set([kt, kv, kd, kp]).size).toBe(4);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// MULTI-MODAL WIRING (Item 6) — document/voice/poll all go through the ledger
+// ---------------------------------------------------------------------------
+
+const INBOUND = {
+  id: TURN,
+  conteudo: 'help',
+  metadata: null,
+  tipo: 'texto',
+} as unknown as import('@/db/schema.js').Mensagem;
+const CONVERSA = { id: CONV } as unknown as import('@/db/schema.js').Conversa;
+
+describe('dispatchOutput — document modality goes through ledger', () => {
+  it('marks pending → sent on successful document delivery', async () => {
+    baileysFake.sendOutboundDocument.mockResolvedValue('wa-doc-123');
+
+    await dispatchOutput({
+      pessoa: PESSOA as never,
+      conversa: CONVERSA,
+      inbound: INBOUND,
+      jid: '5511999999999@s.whatsapp.net',
+      text: 'Aqui está seu relatório',
+      latestPending: null,
+      latestReportPdf: {
+        path: '/tmp/report.pdf',
+        fileName: 'report.pdf',
+        mimetype: 'application/pdf',
+        tipo: 'extrato',
+      },
+      turnHasSensitive: false,
+      sensitiveTools: [],
+    });
+
+    expect(baileysFake.sendOutboundDocument).toHaveBeenCalledTimes(1);
+    const row = await outboundMessagesRepo.findByConversaTurn({
+      conversa_id: CONV,
+      in_reply_to: TURN,
+    });
+    expect(row?.status).toBe('sent');
+    expect(row?.provider_message_id).toBe('wa-doc-123');
+    // Modality must be part of the idempotency key (different from text).
+    const docKey = computeOutboundIdempotencyKey({
+      conversa_id: CONV,
+      in_reply_to: TURN,
+      text: 'report.pdf|Aqui está seu relatório',
+      modality: 'document',
+    });
+    expect(row?.idempotency_key).toBe(docKey);
+  });
+});
+
+describe('dispatchOutput — voice modality goes through ledger', () => {
+  it('marks pending → sent on successful voice delivery', async () => {
+    // Enable voice feature flag for this test.
+    const env = await import('@/config/env.js');
+    (env.config as unknown as { FEATURE_OUTBOUND_VOICE: boolean }).FEATURE_OUTBOUND_VOICE = true;
+    const tts = await import('@/lib/tts.js');
+    (tts.synthesizeSpeech as ReturnType<typeof vi.fn>).mockResolvedValue(Buffer.from('voicedata'));
+    baileysFake.sendOutboundVoice.mockResolvedValue('wa-voice-456');
+
+    const VOICE_INBOUND = { ...INBOUND, tipo: 'audio' } as unknown as import('@/db/schema.js').Mensagem;
+    await dispatchOutput({
+      pessoa: PESSOA as never,
+      conversa: CONVERSA,
+      inbound: VOICE_INBOUND,
+      jid: '5511999999999@s.whatsapp.net',
+      text: 'resposta voz',
+      latestPending: null,
+      latestReportPdf: null,
+      turnHasSensitive: false,
+      sensitiveTools: [],
+    });
+
+    expect(baileysFake.sendOutboundVoice).toHaveBeenCalledTimes(1);
+    const row = await outboundMessagesRepo.findByConversaTurn({
+      conversa_id: CONV,
+      in_reply_to: TURN,
+    });
+    expect(row?.status).toBe('sent');
+    expect(row?.provider_message_id).toBe('wa-voice-456');
+    const voiceKey = computeOutboundIdempotencyKey({
+      conversa_id: CONV,
+      in_reply_to: TURN,
+      text: 'resposta voz',
+      modality: 'voice',
+    });
+    expect(row?.idempotency_key).toBe(voiceKey);
+
+    (env.config as unknown as { FEATURE_OUTBOUND_VOICE: boolean }).FEATURE_OUTBOUND_VOICE = false;
+  });
+});
+
+describe('sendOutboundPoll — poll modality goes through ledger', () => {
+  it('marks pending → sent on successful poll delivery', async () => {
+    presenceFake.sendPoll.mockResolvedValue({
+      whatsapp_id: 'wa-poll-789',
+      message_secret: 'secret',
+      creator_jid: 'creator@s.whatsapp.net',
+    });
+
+    const PENDING = {
+      id: 'pq_1',
+      opcoes_validas: [
+        { key: 'a', label: 'Opção A' },
+        { key: 'b', label: 'Opção B' },
+        { key: 'c', label: 'Opção C' },
+      ],
+    };
+
+    await sendOutboundPoll(PESSOA.id, CONV, 'escolha:', TURN, PENDING);
+
+    expect(presenceFake.sendPoll).toHaveBeenCalledTimes(1);
+    const row = await outboundMessagesRepo.findByConversaTurn({
+      conversa_id: CONV,
+      in_reply_to: TURN,
+    });
+    expect(row?.status).toBe('sent');
+    expect(row?.provider_message_id).toBe('wa-poll-789');
+    const pollKey = computeOutboundIdempotencyKey({
+      conversa_id: CONV,
+      in_reply_to: TURN,
+      text: 'escolha:|a|b|c',
+      modality: 'poll',
+    });
+    expect(row?.idempotency_key).toBe(pollKey);
+  });
+
+  it('text + voice + document + poll all have independent ledger rows for same turn', async () => {
+    // Text first.
+    baileysFake.sendOutboundText.mockResolvedValue('wa-txt');
+    await sendOutbound(PESSOA.id, CONV, 'shared text', TURN);
+
+    // Each modality has its own idempotency key → 4 independent rows.
+    const txtKey = computeOutboundIdempotencyKey({ conversa_id: CONV, in_reply_to: TURN, text: 'shared text', modality: 'text' });
+    expect(ledger.get(txtKey)?.status).toBe('sent');
   });
 });

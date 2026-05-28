@@ -128,11 +128,17 @@ describe('dispatchOutput — delivery-phase tagging (HIGH-1)', () => {
     expect(m.sendOutboundText).not.toHaveBeenCalled();
   });
 
-  it('text channel send throws (pre-send) ⇒ delivered:false (the crux path)', async () => {
+  it('text channel send throws (provider boundary) ⇒ ambiguous (#227 unknown: TERMINAL-SKIP)', async () => {
+    // Issue #227 — a throw at the provider call is the ambiguous boundary
+    // (relayed-then-acked-late vs never-sent — transport cannot distinguish).
+    // Per the owner's "zero double-send" choice, this is classified as
+    // ambiguous (NOT pre-send): `delivered:true, ambiguous:true` so the
+    // safeDispatchOutput wrapper maps it to `sent_no_persist` with
+    // `allowReact:false`. The ledger records `unknown`.
     m.sendOutboundText.mockRejectedValue(new Error('socket_closed'));
     const err = await dispatchOutput(mkCtx()).catch((e) => e);
     expect(err).toBeInstanceOf(OutboundDeliveryError);
-    expect((err as OutboundDeliveryError).delivered).toBe(false);
+    expect((err as OutboundDeliveryError).ambiguous).toBe(true);
     expect(m.createMensagem).not.toHaveBeenCalled(); // never persisted
   });
 
@@ -325,9 +331,9 @@ describe('dispatchOutput — PDF + poll phase tagging (Codex #216 round-3)', () 
 });
 
 describe('safeDispatchOutput — centralised, never-throwing wrapper (HIGH-1)', () => {
-  it('happy path ⇒ { status: "delivered" }, no failure audit', async () => {
+  it('happy path ⇒ { status: "delivered", allowReact: false }, no failure audit', async () => {
     const out = await safeDispatchOutput(mkCtx());
-    expect(out).toEqual({ status: 'delivered' });
+    expect(out).toEqual({ status: 'delivered', allowReact: false });
     expect(m.audit).not.toHaveBeenCalledWith(
       expect.objectContaining({ acao: 'outbound_dispatch_failed' }),
     );

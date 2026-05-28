@@ -1,4 +1,4 @@
--- Reverse of 063: drop the outbound idempotency ledger.
+-- Reverse of 065: drop the outbound idempotency ledger.
 --
 -- The table is a runtime-only dedupe surface; rows are never the
 -- source of truth for any other table (mensagens persists the
@@ -13,6 +13,8 @@
 --
 -- NOTE: no BEGIN/COMMIT — migrate.ts wraps the script in a transaction.
 
+DROP INDEX IF EXISTS idx_outbound_messages_expires_at;
 DROP INDEX IF EXISTS idx_outbound_messages_tenant_status;
 DROP INDEX IF EXISTS idx_outbound_messages_turn_lookup;
+DROP INDEX IF EXISTS idx_outbound_messages_tenant_agent_key;
 DROP TABLE IF EXISTS outbound_messages;

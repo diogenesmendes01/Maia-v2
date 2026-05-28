@@ -1,29 +1,43 @@
 /**
  * Issue #227 — outboundMessagesRepo unit tests.
  *
- * Pattern: in-memory db fake (drizzle predicates evaluated against a
- * `Map<table, Row[]>`), mirroring the production skills-repo tests under
- * PR #222. Tests prove:
- *   1. upsertPending inserts a fresh `pending` row when no prior key.
- *   2. upsertPending returns `skip:true` when a row for the key is
- *      already at status='sent'.
- *   3. upsertPending returns `skip:false` for pending/failed/unknown
- *      prior rows (the retry case where the caller decides what to do).
- *   4. markSent / markFailed / markUnknown move the row forward.
- *   5. findByConversaTurn returns the LATEST attempt for the turn.
- *   6. All methods throw without tenant context (MissingTenantContextError).
- *   7. CROSS-TENANT: a row inserted under tenant-A is invisible from
+ * Pattern: in-memory db fake that emulates the production atomic
+ * `INSERT ... ON CONFLICT (tenant_id, agent_id, idempotency_key)
+ * DO UPDATE` path. Tests prove:
+ *   1. upsertPending atomically inserts a fresh `pending` row when no
+ *      prior key exists; the `inserted` flag is true (claim winner).
+ *   2. upsertPending returns `skip:true, inserted:false` when a prior
+ *      row for the key is already at status='sent'.
+ *   3. upsertPending returns `inserted:false` and DOES NOT overwrite
+ *      when the prior row is `pending` and NOT stale (the conservative
+ *      same-turn race outcome — the other writer holds the claim).
+ *   4. upsertPending reclaims a `failed` row (overwrites it with a
+ *      fresh `pending`) — pre-send failures are always recoverable.
+ *   5. upsertPending reclaims a `pending` row older than
+ *      STALE_PENDING_SECONDS (DB drop mid-claim / markSent failure
+ *      recovery). The `inserted` flag is false but `status` is reset
+ *      to `pending`.
+ *   6. markSent / markFailed / markUnknown move the row forward.
+ *   7. markFailed / markUnknown REFUSE to degrade `sent` or `unknown`
+ *      (CAS — silent no-op via `WHERE status NOT IN (...)`).
+ *   8. findByConversaTurn returns the LATEST attempt for the turn.
+ *   9. All methods throw without tenant context (MissingTenantContextError).
+ *  10. CROSS-TENANT: a row inserted under tenant-A is invisible from
  *      tenant-B context (the inviolable tenant isolation invariant).
  *      Both insertion orders (A-first AND B-first) are exercised
- *      adversarially per the PR #222 pattern.
- *   8. UNIQUE collision on idempotency_key is handled: the repo
- *      re-reads the prior winner and returns it instead of throwing.
+ *      adversarially per the PR #222 pattern. The UNIQUE is composite
+ *      `(tenant_id, agent_id, idempotency_key)` so cross-tenant key
+ *      reuse is physically allowed (different rows).
+ *  11. AGENT scope: rows are filtered by `agent_id` too — a tenant-A
+ *      / agent-X row is invisible from tenant-A / agent-Y context.
+ *  12. CONCURRENT claims: two Promise.all upserts for the same key
+ *      resolve to exactly one `inserted:true` (atomic claim winner).
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 
 // ---------------------------------------------------------------------------
-// In-memory store + drizzle/db fakes (pattern from skills-repo-atomic.spec.ts)
+// In-memory store + drizzle/db fakes
 // ---------------------------------------------------------------------------
 type Row = Record<string, unknown>;
 const store = new Map<unknown, Row[]>();
@@ -53,6 +67,31 @@ interface SortKey {
 function isSortKey(x: unknown): x is SortKey {
   return !!x && typeof x === 'object' && '__sortKey' in (x as object);
 }
+interface SqlExpr {
+  __sql: true;
+  strings: TemplateStringsArray;
+  values: unknown[];
+}
+function isSqlExpr(x: unknown): x is SqlExpr {
+  return !!x && typeof x === 'object' && '__sql' in (x as object);
+}
+
+// Translate a drizzle `sql\`\`` template into a row predicate by
+// pattern-matching the specific shapes this repo uses. Currently only
+// `${column} NOT IN ('a', 'b', ...)` is recognised — that's enough for
+// the CAS predicates in markFailed/markUnknown.
+function sqlExprToPred(expr: SqlExpr): Pred | null {
+  const joined = expr.strings.join('?');
+  const notInMatch = /NOT\s+IN\s*\(([^)]+)\)/i.exec(joined);
+  if (notInMatch && expr.values[0] && isColRef(expr.values[0])) {
+    const col = (expr.values[0] as ColRef).__col;
+    const literals = notInMatch[1]!
+      .split(',')
+      .map((s) => s.trim().replace(/^'|'$/g, ''));
+    return (row: Row) => !literals.includes(String(row[col]));
+  }
+  return null;
+}
 
 vi.mock('drizzle-orm', () => {
   const eq = (left: unknown, right: unknown): PredObj => ({
@@ -63,7 +102,14 @@ vi.mock('drizzle-orm', () => {
   });
   const and = (...conds: unknown[]): PredObj => ({
     __pred: (row: Row) =>
-      conds.every((c) => (isPredObj(c) ? c.__pred(row) : true)),
+      conds.every((c) => {
+        if (isPredObj(c)) return c.__pred(row);
+        if (isSqlExpr(c)) {
+          const pred = sqlExprToPred(c);
+          if (pred) return pred(row);
+        }
+        return true;
+      }),
   });
   const desc = (col: unknown): SortKey => {
     if (isColRef(col)) {
@@ -84,14 +130,25 @@ vi.mock('drizzle-orm', () => {
     }
     return { __sortKey: () => 0, __dir: 'desc' };
   };
-  return { eq, and, desc };
+  // sql template tag — surfaces the raw template so `db.execute` can
+  // interpret the upsert command intent without parsing SQL, AND so
+  // `and(...)` can translate CAS predicates to row filters.
+  const sql = (strings: TemplateStringsArray, ...values: unknown[]): SqlExpr => ({
+    __sql: true,
+    strings,
+    values,
+  });
+  return { eq, and, desc, sql };
 });
 
 function makeTable(): unknown {
   return new Proxy(
-    {},
+    { __tableName: 'outbound_messages' },
     {
-      get: (_t, prop: string) => ({ __col: prop }),
+      get: (t, prop: string) => {
+        if (prop === '__tableName') return (t as Record<string, unknown>)['__tableName'];
+        return { __col: prop };
+      },
     },
   );
 }
@@ -99,6 +156,17 @@ function makeTable(): unknown {
 vi.mock('@/db/schema.js', () => ({
   outbound_messages: makeTable(),
 }));
+
+vi.mock('@/lib/logger.js', () => ({
+  logger: {
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+  },
+}));
+
+// Stale threshold (must match the prod constant). 30 seconds.
+const STALE_MS = 30_000;
 
 class SelectBuilder {
   private _table: unknown = null;
@@ -148,55 +216,6 @@ class SelectBuilder {
   }
 }
 
-class InsertBuilder {
-  private _table: unknown = null;
-  private _values: Row | null = null;
-  constructor(t: unknown) {
-    this._table = t;
-  }
-  values(v: Row) {
-    this._values = v;
-    return this;
-  }
-  returning() {
-    return this;
-  }
-  then(resolve: (v: Row[]) => unknown, reject?: (e: unknown) => unknown) {
-    try {
-      if (!this._values) {
-        resolve([]);
-        return;
-      }
-      // Enforce the UNIQUE constraint on idempotency_key per the
-      // production schema. A collision throws a `code=23505` shaped
-      // error to mirror the postgres path the repo catches.
-      const dupe = tableOf(this._table).find(
-        (r) => r.idempotency_key === this._values!.idempotency_key,
-      );
-      if (dupe) {
-        const err = new Error(
-          'duplicate key value violates unique constraint "outbound_messages_idempotency_key_key"',
-        ) as Error & { code: string };
-        err.code = '23505';
-        reject?.(err);
-        return;
-      }
-      const row: Row = {
-        id: `om-${Math.random().toString(36).slice(2)}`,
-        provider_message_id: null,
-        sent_at: null,
-        error: null,
-        created_at: new Date(),
-        ...this._values,
-      };
-      tableOf(this._table).push(row);
-      resolve([{ ...row }]);
-    } catch (e) {
-      reject?.(e);
-    }
-  }
-}
-
 class UpdateBuilder {
   private _table: unknown = null;
   private _set: Partial<Row> | null = null;
@@ -212,6 +231,9 @@ class UpdateBuilder {
     if (isPredObj(p)) this._pred = p.__pred;
     return this;
   }
+  returning(_selector?: unknown) {
+    return this;
+  }
   then(resolve: (v: Row[]) => unknown, reject?: (e: unknown) => unknown) {
     try {
       if (!this._set) {
@@ -219,27 +241,118 @@ class UpdateBuilder {
         return;
       }
       const rows = tableOf(this._table);
+      const updated: Row[] = [];
       for (const r of rows) {
         if (this._pred(r)) {
           Object.assign(r, this._set);
+          updated.push({ ...r });
         }
       }
-      resolve([]);
+      resolve(updated);
     } catch (e) {
       reject?.(e);
     }
   }
 }
 
+// Fake `db.execute` — interprets the upsert SQL template by inspecting
+// the values array (tenant_id, agent_id, idempotency_key, conversa_id,
+// in_reply_to, stale_seconds). This is a deliberate simplification: it
+// only supports the one upsert shape used by the repo. The storage
+// key is always the schema's `outbound_messages` proxy so SELECT /
+// UPDATE paths share the same table.
+let outboundTableRef: unknown = null;
+async function getOutboundTable(): Promise<unknown> {
+  if (outboundTableRef) return outboundTableRef;
+  const schema = await import('@/db/schema.js');
+  outboundTableRef = (schema as Record<string, unknown>)['outbound_messages'];
+  return outboundTableRef;
+}
+
+async function executeUpsert(values: unknown[]): Promise<{ rows: Row[] }> {
+  const [tenant_id, agent_id, idempotency_key, conversa_id, in_reply_to, _stale_seconds] = values as [
+    string,
+    string,
+    string,
+    string,
+    string,
+    number,
+  ];
+  const table = await getOutboundTable();
+  const rows = tableOf(table);
+  const existing = rows.find(
+    (r) =>
+      r.tenant_id === tenant_id &&
+      r.agent_id === agent_id &&
+      r.idempotency_key === idempotency_key,
+  );
+  if (!existing) {
+    // INSERT branch — fresh row, xmax=0.
+    const row: Row = {
+      id: `om-${Math.random().toString(36).slice(2)}`,
+      tenant_id,
+      agent_id,
+      idempotency_key,
+      conversa_id,
+      in_reply_to,
+      provider_message_id: null,
+      status: 'pending',
+      sent_at: null,
+      error: null,
+      created_at: new Date(),
+      expires_at: new Date(Date.now() + 30 * 24 * 3600 * 1000),
+      was_inserted: true,
+    };
+    rows.push(row);
+    return { rows: [{ ...row }] };
+  }
+  // ON CONFLICT DO UPDATE — overwrite when (failed) OR
+  // (pending AND created_at < now - STALE_MS).
+  const isFailed = existing.status === 'failed';
+  const createdAt = existing.created_at instanceof Date ? existing.created_at : new Date(existing.created_at as string);
+  const isStalePending =
+    existing.status === 'pending' && Date.now() - createdAt.getTime() >= STALE_MS;
+  if (isFailed || isStalePending) {
+    Object.assign(existing, {
+      status: 'pending',
+      conversa_id,
+      in_reply_to,
+      provider_message_id: null,
+      sent_at: null,
+      error: null,
+      created_at: new Date(),
+      expires_at: new Date(Date.now() + 30 * 24 * 3600 * 1000),
+    });
+    return { rows: [{ ...existing, was_inserted: false }] };
+  }
+  // WHERE filtered the UPDATE out — RETURNING is empty.
+  return { rows: [] };
+}
+
+// Serialize concurrent `db.execute` calls so the fake mirrors Postgres
+// ON CONFLICT serialization: two writers race the INSERT, exactly one
+// wins. Without this guard the two microtask-interleaved Promise.all
+// calls both observe "no existing" and both insert (real Postgres
+// would let one INSERT win and the other hit the conflict branch).
+let executeChain: Promise<unknown> = Promise.resolve();
 vi.mock('@/db/client.js', () => ({
   db: {
     select: () => new SelectBuilder(),
-    insert: (t: unknown) => new InsertBuilder(t),
     update: (t: unknown) => new UpdateBuilder(t),
+    execute: (expr: unknown) => {
+      const next = executeChain.then(() => {
+        if (isSqlExpr(expr)) {
+          return executeUpsert(expr.values);
+        }
+        throw new Error('fake_db.execute_unsupported_expression');
+      });
+      executeChain = next.catch(() => undefined);
+      return next;
+    },
   },
 }));
 
-import { outboundMessagesRepo } from '@/db/repositories/outbound-messages-repo.js';
+import { outboundMessagesRepo, STALE_PENDING_SECONDS } from '@/db/repositories/outbound-messages-repo.js';
 import { MissingTenantContextError } from '@/db/tenant-context.js';
 
 const CONV = '00000000-0000-0000-0000-000000000001';
@@ -248,16 +361,18 @@ const KEY = 'tenant-a-test-key-1';
 
 beforeEach(() => {
   store.clear();
+  vi.useRealTimers();
 });
 
-describe('outboundMessagesRepo — basic CRUD + status transitions', () => {
-  it('upsertPending inserts a fresh pending row when no prior key', async () => {
+describe('outboundMessagesRepo — atomic claim + status transitions', () => {
+  it('upsertPending inserts a fresh pending row + reports inserted=true', async () => {
     await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'agent-a' }, async () => {
       const res = await outboundMessagesRepo.upsertPending({
         idempotency_key: KEY,
         conversa_id: CONV,
         in_reply_to: TURN,
       });
+      expect(res.inserted).toBe(true);
       expect(res.skip).toBe(false);
       expect(res.row.status).toBe('pending');
       expect(res.row.tenant_id).toBe('tenant-a');
@@ -269,81 +384,95 @@ describe('outboundMessagesRepo — basic CRUD + status transitions', () => {
 
   it('upsertPending returns skip=true when prior row is status=sent', async () => {
     await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'agent-a' }, async () => {
-      // First call → pending.
       await outboundMessagesRepo.upsertPending({
         idempotency_key: KEY,
         conversa_id: CONV,
         in_reply_to: TURN,
       });
-      // Move to sent.
       await outboundMessagesRepo.markSent({
         idempotency_key: KEY,
         provider_message_id: 'wa-xyz',
         sent_at: new Date(),
       });
-      // Retry — must short-circuit.
       const retry = await outboundMessagesRepo.upsertPending({
         idempotency_key: KEY,
         conversa_id: CONV,
         in_reply_to: TURN,
       });
+      expect(retry.inserted).toBe(false);
       expect(retry.skip).toBe(true);
       expect(retry.row.status).toBe('sent');
       expect(retry.row.provider_message_id).toBe('wa-xyz');
     });
   });
 
-  it('upsertPending returns skip=false for prior pending/failed/unknown', async () => {
+  it('upsertPending does NOT overwrite a recent (non-stale) pending row', async () => {
     await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'agent-a' }, async () => {
-      // Seed: a row stuck in pending (crashed prior attempt).
       await outboundMessagesRepo.upsertPending({
-        idempotency_key: 'key-pending',
+        idempotency_key: KEY,
         conversa_id: CONV,
         in_reply_to: TURN,
       });
-      const r1 = await outboundMessagesRepo.upsertPending({
-        idempotency_key: 'key-pending',
+      // Re-claim immediately — must NOT take the row (race: another
+      // worker already holds it). `inserted=false`, status still pending.
+      const retry = await outboundMessagesRepo.upsertPending({
+        idempotency_key: KEY,
         conversa_id: CONV,
         in_reply_to: TURN,
       });
-      expect(r1.skip).toBe(false);
-      expect(r1.row.status).toBe('pending');
+      expect(retry.inserted).toBe(false);
+      expect(retry.skip).toBe(false);
+      expect(retry.row.status).toBe('pending');
+    });
+  });
 
-      // Failed.
+  it('upsertPending reclaims a `failed` row (overwrites with fresh pending)', async () => {
+    await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'agent-a' }, async () => {
       await outboundMessagesRepo.upsertPending({
-        idempotency_key: 'key-failed',
+        idempotency_key: KEY,
         conversa_id: CONV,
         in_reply_to: TURN,
       });
       await outboundMessagesRepo.markFailed({
-        idempotency_key: 'key-failed',
-        error: 'no_socket',
+        idempotency_key: KEY,
+        error: 'jid_resolution_failed',
       });
-      const r2 = await outboundMessagesRepo.upsertPending({
-        idempotency_key: 'key-failed',
+      // Retry — the `failed` row IS reclaimable. The conflict matched
+      // but the DO UPDATE branch overwrote it; inserted=false (not a
+      // fresh INSERT) but status reset to pending.
+      const retry = await outboundMessagesRepo.upsertPending({
+        idempotency_key: KEY,
         conversa_id: CONV,
         in_reply_to: TURN,
       });
-      expect(r2.skip).toBe(false);
-      expect(r2.row.status).toBe('failed');
+      expect(retry.inserted).toBe(false);
+      expect(retry.skip).toBe(false);
+      expect(retry.row.status).toBe('pending');
+      expect(retry.row.error).toBeNull();
+    });
+  });
 
-      // Unknown.
+  it('upsertPending reclaims a STALE pending row (>30s old)', async () => {
+    await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'agent-a' }, async () => {
+      const start = Date.now();
+      vi.useFakeTimers();
+      vi.setSystemTime(start);
       await outboundMessagesRepo.upsertPending({
-        idempotency_key: 'key-unknown',
+        idempotency_key: KEY,
         conversa_id: CONV,
         in_reply_to: TURN,
       });
-      await outboundMessagesRepo.markUnknown({
-        idempotency_key: 'key-unknown',
-        error: 'ambiguous_throw',
-      });
-      const r3 = await outboundMessagesRepo.upsertPending({
-        idempotency_key: 'key-unknown',
+      // Advance 31s — the prior pending row is now stale.
+      vi.setSystemTime(start + (STALE_PENDING_SECONDS + 1) * 1000);
+      const retry = await outboundMessagesRepo.upsertPending({
+        idempotency_key: KEY,
         conversa_id: CONV,
         in_reply_to: TURN,
       });
-      expect(r3.skip).toBe(false);
-      expect(r3.row.status).toBe('unknown');
+      expect(retry.inserted).toBe(false);
+      expect(retry.skip).toBe(false);
+      expect(retry.row.status).toBe('pending');
+      vi.useRealTimers();
     });
   });
 
@@ -412,10 +541,81 @@ describe('outboundMessagesRepo — basic CRUD + status transitions', () => {
     });
   });
 
+  it('markFailed CAS: REFUSES to degrade a `sent` row', async () => {
+    await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'agent-a' }, async () => {
+      await outboundMessagesRepo.upsertPending({
+        idempotency_key: KEY,
+        conversa_id: CONV,
+        in_reply_to: TURN,
+      });
+      await outboundMessagesRepo.markSent({
+        idempotency_key: KEY,
+        provider_message_id: 'wa-id-final',
+        sent_at: new Date(),
+      });
+      // A stale background retry tries to mark failed — must NOT take.
+      await outboundMessagesRepo.markFailed({
+        idempotency_key: KEY,
+        error: 'stale_retry_error',
+      });
+      const found = await outboundMessagesRepo.findByConversaTurn({
+        conversa_id: CONV,
+        in_reply_to: TURN,
+      });
+      expect(found?.status).toBe('sent');
+      expect(found?.provider_message_id).toBe('wa-id-final');
+    });
+  });
+
+  it('markUnknown CAS: REFUSES to degrade a `sent` row', async () => {
+    await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'agent-a' }, async () => {
+      await outboundMessagesRepo.upsertPending({
+        idempotency_key: KEY,
+        conversa_id: CONV,
+        in_reply_to: TURN,
+      });
+      await outboundMessagesRepo.markSent({
+        idempotency_key: KEY,
+        provider_message_id: 'wa-id-final',
+        sent_at: new Date(),
+      });
+      await outboundMessagesRepo.markUnknown({
+        idempotency_key: KEY,
+        error: 'stale_unknown',
+      });
+      const found = await outboundMessagesRepo.findByConversaTurn({
+        conversa_id: CONV,
+        in_reply_to: TURN,
+      });
+      expect(found?.status).toBe('sent');
+    });
+  });
+
+  it('markFailed CAS: REFUSES to degrade an `unknown` row', async () => {
+    await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'agent-a' }, async () => {
+      await outboundMessagesRepo.upsertPending({
+        idempotency_key: KEY,
+        conversa_id: CONV,
+        in_reply_to: TURN,
+      });
+      await outboundMessagesRepo.markUnknown({
+        idempotency_key: KEY,
+        error: 'ambiguous',
+      });
+      await outboundMessagesRepo.markFailed({
+        idempotency_key: KEY,
+        error: 'stale_failed',
+      });
+      const found = await outboundMessagesRepo.findByConversaTurn({
+        conversa_id: CONV,
+        in_reply_to: TURN,
+      });
+      expect(found?.status).toBe('unknown');
+    });
+  });
+
   it('findByConversaTurn returns the LATEST attempt by created_at', async () => {
     await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'agent-a' }, async () => {
-      // Two attempts for the same turn, different text → different keys.
-      // The fake store inserts in order; the second has a later created_at.
       await outboundMessagesRepo.upsertPending({
         idempotency_key: 'first-attempt',
         conversa_id: CONV,
@@ -425,8 +625,6 @@ describe('outboundMessagesRepo — basic CRUD + status transitions', () => {
         idempotency_key: 'first-attempt',
         error: 'first_attempt_failed',
       });
-      // Force a strictly-later created_at so the ORDER BY DESC test is
-      // deterministic on machines with coarse Date.now resolution.
       await new Promise((r) => setTimeout(r, 5));
       await outboundMessagesRepo.upsertPending({
         idempotency_key: 'second-attempt',
@@ -457,87 +655,69 @@ describe('outboundMessagesRepo — basic CRUD + status transitions', () => {
     });
   });
 
-  it('UNIQUE collision: parallel-writer race resolves to existing row', async () => {
+  it('CONCURRENT claims: Promise.all of two upsertPending → exactly one inserted', async () => {
+    // Real-DB ON CONFLICT semantics: two same-key writers, only one
+    // wins the INSERT. Our fake executes each call SEQUENTIALLY (no
+    // real concurrency), but the SAME serialisation is what real
+    // Postgres guarantees — the loser observes the existing pending
+    // row and gets `inserted=false`.
     await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'agent-a' }, async () => {
-      // Step 1: prime the fake store by doing a real insert through
-      // the repo. This both proves the happy path AND ensures the
-      // schema-mocked table object is available as a key in `store`.
-      await outboundMessagesRepo.upsertPending({
-        idempotency_key: 'seed-key-for-race',
-        conversa_id: CONV,
-        in_reply_to: TURN,
-      });
-
-      // Step 2: simulate a CONCURRENT commit by inserting a row
-      // directly into the fake's table for a DIFFERENT key — this is
-      // the parallel-writer winner. We then call upsertPending with
-      // the same key as the planted row.
-      const tbl = Array.from(store.keys()).find((k) => k !== null) as unknown;
-      const rows = tableOf(tbl);
-      rows.push({
-        id: 'pre-existing',
-        tenant_id: 'tenant-a',
-        agent_id: 'agent-a',
-        idempotency_key: KEY,
-        conversa_id: CONV,
-        in_reply_to: TURN,
-        status: 'sent',
-        provider_message_id: 'wa-original',
-        sent_at: new Date(),
-        error: null,
-        created_at: new Date(),
-      });
-      const retry = await outboundMessagesRepo.upsertPending({
-        idempotency_key: KEY,
-        conversa_id: CONV,
-        in_reply_to: TURN,
-      });
-      // SELECT path finds the row → returns it with skip=true.
-      expect(retry.skip).toBe(true);
-      expect(retry.row.provider_message_id).toBe('wa-original');
+      const results = await Promise.all([
+        outboundMessagesRepo.upsertPending({
+          idempotency_key: KEY,
+          conversa_id: CONV,
+          in_reply_to: TURN,
+        }),
+        outboundMessagesRepo.upsertPending({
+          idempotency_key: KEY,
+          conversa_id: CONV,
+          in_reply_to: TURN,
+        }),
+      ]);
+      const winners = results.filter((r) => r.inserted);
+      expect(winners.length).toBe(1);
+      // The loser sees the existing pending row but doesn't get to send.
+      const losers = results.filter((r) => !r.inserted);
+      expect(losers.length).toBe(1);
+      expect(losers[0]!.skip).toBe(false);
+      expect(losers[0]!.row.status).toBe('pending');
     });
   });
-});
 
-describe('outboundMessagesRepo — valid status transitions', () => {
-  it('a pending → sent → markUnknown is captured (last-writer-wins at row level)', async () => {
-    // The repo doesn't enforce a state machine in code — the migration's
-    // CHECK constraint only enforces the value set. This test documents
-    // the actual behaviour: an explicit transition overwrites status.
-    // Real callers in output-dispatch never do this; the test guards
-    // against an accidental code change that would silently freeze a
-    // status.
+  it('markSent failure recovery via stale-pending: 31s later the row is reclaimable', async () => {
     await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'agent-a' }, async () => {
-      await outboundMessagesRepo.upsertPending({
+      const start = Date.now();
+      vi.useFakeTimers();
+      vi.setSystemTime(start);
+      // 1st turn: claim succeeds, but markSent never runs (simulated
+      // crash mid-send).
+      const claim1 = await outboundMessagesRepo.upsertPending({
         idempotency_key: KEY,
         conversa_id: CONV,
         in_reply_to: TURN,
       });
-      await outboundMessagesRepo.markSent({
-        idempotency_key: KEY,
-        provider_message_id: 'wa-x',
-        sent_at: new Date(),
-      });
-      const afterSent = await outboundMessagesRepo.findByConversaTurn({
-        conversa_id: CONV,
-        in_reply_to: TURN,
-      });
-      expect(afterSent?.status).toBe('sent');
+      expect(claim1.inserted).toBe(true);
 
-      // A subsequent markUnknown for the same key (e.g., a stale
-      // background retry) overwrites the status. Production code does
-      // NOT do this — the markSent path is the terminal one. Documented
-      // so a future tightening (e.g., refuse-transition-from-sent) is
-      // an explicit decision.
-      await outboundMessagesRepo.markUnknown({
+      // Immediate retry: pending is too fresh, the conflict UPDATE is
+      // filtered out → `inserted:false, status:pending`.
+      const retryFresh = await outboundMessagesRepo.upsertPending({
         idempotency_key: KEY,
-        error: 'stale_retry',
-      });
-      const afterUnknown = await outboundMessagesRepo.findByConversaTurn({
         conversa_id: CONV,
         in_reply_to: TURN,
       });
-      expect(afterUnknown?.status).toBe('unknown');
+      expect(retryFresh.inserted).toBe(false);
+
+      // Advance 31s. The prior pending is now stale.
+      vi.setSystemTime(start + 31_000);
+      const retryStale = await outboundMessagesRepo.upsertPending({
+        idempotency_key: KEY,
+        conversa_id: CONV,
+        in_reply_to: TURN,
+      });
+      // The reclaim overwrites in-place — `inserted:false` but
+      // `status:pending` (reset). The caller can proceed with the send.
+      expect(retryStale.row.status).toBe('pending');
+      vi.useRealTimers();
     });
   });
 });
@@ -585,9 +765,8 @@ describe('outboundMessagesRepo — tenant context enforcement', () => {
   });
 });
 
-describe('outboundMessagesRepo — cross-tenant isolation (inviolable)', () => {
+describe('outboundMessagesRepo — cross-tenant + cross-agent isolation (inviolable)', () => {
   it('tenant-A row is INVISIBLE from tenant-B context (A-first)', async () => {
-    // Adversarial seed order: insert tenant-A first.
     await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'agent-a' }, async () => {
       await outboundMessagesRepo.upsertPending({
         idempotency_key: 'cross-key',
@@ -601,8 +780,6 @@ describe('outboundMessagesRepo — cross-tenant isolation (inviolable)', () => {
       });
     });
 
-    // Same conversa_id + in_reply_to under tenant-B. The (conversa, turn)
-    // pair would naturally collide if isolation weren't enforced.
     await runWithTenantContext({ tenant_id: 'tenant-b', agent_id: 'agent-b' }, async () => {
       const found = await outboundMessagesRepo.findByConversaTurn({
         conversa_id: CONV,
@@ -613,8 +790,6 @@ describe('outboundMessagesRepo — cross-tenant isolation (inviolable)', () => {
   });
 
   it('tenant-A row is INVISIBLE from tenant-B context (B-first adversarial)', async () => {
-    // Adversarial seed order: insert tenant-B first so a missing
-    // WHERE tenant_id filter would surface tenant-B's row to tenant-A.
     await runWithTenantContext({ tenant_id: 'tenant-b', agent_id: 'agent-b' }, async () => {
       await outboundMessagesRepo.upsertPending({
         idempotency_key: 'b-first-key',
@@ -645,9 +820,6 @@ describe('outboundMessagesRepo — cross-tenant isolation (inviolable)', () => {
       });
     });
 
-    // Tenant-B tries to forcibly mark the row sent (e.g., a malicious or
-    // buggy caller). Even though the key is unique globally, the WHERE
-    // includes tenant_id so the UPDATE is a no-op.
     await runWithTenantContext({ tenant_id: 'tenant-b', agent_id: 'agent-b' }, async () => {
       await outboundMessagesRepo.markSent({
         idempotency_key: 'shared-key',
@@ -656,7 +828,6 @@ describe('outboundMessagesRepo — cross-tenant isolation (inviolable)', () => {
       });
     });
 
-    // Back to tenant-A: the row must still be pending.
     await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'agent-a' }, async () => {
       const found = await outboundMessagesRepo.findByConversaTurn({
         conversa_id: CONV,
@@ -668,29 +839,29 @@ describe('outboundMessagesRepo — cross-tenant isolation (inviolable)', () => {
   });
 
   it('both tenants can hold INDEPENDENT rows for the same (conversa, turn) pair', async () => {
-    // The (conversa_id, in_reply_to) pair is shared but the keys differ
-    // because the caller hashes content into the key. Each tenant
-    // operates on its own row; neither sees the other's.
+    // Composite UNIQUE allows cross-tenant key reuse — different
+    // (tenant_id, agent_id, idempotency_key) tuples.
     await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'agent-a' }, async () => {
       await outboundMessagesRepo.upsertPending({
-        idempotency_key: 'parallel-a',
+        idempotency_key: 'parallel-key',
         conversa_id: CONV,
         in_reply_to: TURN,
       });
       await outboundMessagesRepo.markSent({
-        idempotency_key: 'parallel-a',
+        idempotency_key: 'parallel-key',
         provider_message_id: 'wa-tenant-a',
         sent_at: new Date(),
       });
     });
     await runWithTenantContext({ tenant_id: 'tenant-b', agent_id: 'agent-b' }, async () => {
+      // Same key under different tenant — composite unique allows it.
       await outboundMessagesRepo.upsertPending({
-        idempotency_key: 'parallel-b',
+        idempotency_key: 'parallel-key',
         conversa_id: CONV,
         in_reply_to: TURN,
       });
       await outboundMessagesRepo.markSent({
-        idempotency_key: 'parallel-b',
+        idempotency_key: 'parallel-key',
         provider_message_id: 'wa-tenant-b',
         sent_at: new Date(),
       });
@@ -711,6 +882,30 @@ describe('outboundMessagesRepo — cross-tenant isolation (inviolable)', () => {
       });
       expect(found?.provider_message_id).toBe('wa-tenant-b');
       expect(found?.tenant_id).toBe('tenant-b');
+    });
+  });
+
+  it('AGENT scope: tenant-A/agent-X row is invisible from tenant-A/agent-Y', async () => {
+    // Same tenant, different agents → composite unique allows separate
+    // rows, and findByConversaTurn filters by agent_id too.
+    await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'agent-x' }, async () => {
+      await outboundMessagesRepo.upsertPending({
+        idempotency_key: 'same-key-cross-agent',
+        conversa_id: CONV,
+        in_reply_to: TURN,
+      });
+      await outboundMessagesRepo.markSent({
+        idempotency_key: 'same-key-cross-agent',
+        provider_message_id: 'wa-agent-x',
+        sent_at: new Date(),
+      });
+    });
+    await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'agent-y' }, async () => {
+      const found = await outboundMessagesRepo.findByConversaTurn({
+        conversa_id: CONV,
+        in_reply_to: TURN,
+      });
+      expect(found).toBeNull();
     });
   });
 });
