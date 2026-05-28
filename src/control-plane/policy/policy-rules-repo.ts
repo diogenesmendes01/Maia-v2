@@ -38,8 +38,76 @@ import type {
 /**
  * Cache invalidation channel: shared with policy-cache.ts. Writers publish;
  * caches subscribe. JSON-encoded {event, tenant_id, agent_id, descriptor}.
+ *
+ * Issue #249 (Codex revalidation of #241): the channel name MUST embed
+ * `tenant_id`. A globally-named channel let every subscriber receive every
+ * tenant's lifecycle payload (information disclosure + cache pollution risk
+ * if the consumer ever forgets to filter by `payload.tenant_id`). The new
+ * shape `policy_rule_lifecycle:{tenant_id}` enforces routing isolation at
+ * the broker level — Redis only delivers to subscribers whose pattern
+ * matches the per-tenant channel.
+ *
+ *  - `POLICY_LIFECYCLE_CHANNEL_PREFIX`: the literal `policy_rule_lifecycle`
+ *    (kept as a stable identifier for tests / docs / observability).
+ *  - `buildPolicyLifecycleChannel(tenant_id)`: returns the full per-tenant
+ *    channel `policy_rule_lifecycle:<tenant_id>`. Throws via
+ *    `MissingTenantContextError` when called with empty input — see
+ *    publisher and `getCurrentTenant()`.
+ *  - `POLICY_LIFECYCLE_CHANNEL_PATTERN`: the Redis PSUBSCRIBE glob the
+ *    cache subscriber uses (`policy_rule_lifecycle:*`).
+ *  - `POLICY_LIFECYCLE_CHANNEL` (deprecated alias = prefix): retained so
+ *    legacy integration tests / mocks that referenced the bare channel
+ *    name keep typechecking. New code MUST use the per-tenant builder.
+ *    Tests that previously published on the bare name now publish on the
+ *    per-tenant channel via `buildPolicyLifecycleChannel`.
  */
-export const POLICY_LIFECYCLE_CHANNEL = 'policy_rule_lifecycle';
+export const POLICY_LIFECYCLE_CHANNEL_PREFIX = 'policy_rule_lifecycle' as const;
+export const POLICY_LIFECYCLE_CHANNEL_PATTERN = `${POLICY_LIFECYCLE_CHANNEL_PREFIX}:*` as const;
+
+/**
+ * Build the per-tenant Redis pub/sub channel for policy lifecycle events.
+ * Refuses empty / whitespace tenant_id to make the contract explicit:
+ * publishing without a tenant context is a programmer error, not a quiet
+ * fallthrough to a global channel.
+ */
+export function buildPolicyLifecycleChannel(tenant_id: string): string {
+  if (typeof tenant_id !== 'string' || tenant_id.trim() === '') {
+    // Match the contract of MissingTenantContextError: programmer error,
+    // not a runtime fallback.
+    throw new TypedError(
+      'invalid_tenant_id_for_pubsub_channel',
+      'tenant_id is required to build policy lifecycle channel',
+    );
+  }
+  return `${POLICY_LIFECYCLE_CHANNEL_PREFIX}:${tenant_id}`;
+}
+
+/**
+ * Parse a per-tenant channel back into its tenant_id. Returns `null` when
+ * the channel does NOT match the per-tenant shape — the subscriber uses
+ * this to drop unrelated messages and detect mis-routing (defense-in-depth
+ * against payload smuggling).
+ */
+export function parsePolicyLifecycleChannel(channel: string): string | null {
+  if (typeof channel !== 'string') return null;
+  const expectedPrefix = `${POLICY_LIFECYCLE_CHANNEL_PREFIX}:`;
+  if (!channel.startsWith(expectedPrefix)) return null;
+  const tenant = channel.slice(expectedPrefix.length);
+  if (tenant.trim() === '') return null;
+  return tenant;
+}
+
+/**
+ * Deprecated alias for `POLICY_LIFECYCLE_CHANNEL_PREFIX`. New code MUST
+ * use `buildPolicyLifecycleChannel(tenant_id)` for publish and the
+ * `POLICY_LIFECYCLE_CHANNEL_PATTERN` for subscribe. Kept exported only so
+ * existing test files that imported the bare name remain backwards-source-
+ * compatible (they still treat it as the prefix label).
+ *
+ * @deprecated Use `buildPolicyLifecycleChannel` (publisher) or
+ * `POLICY_LIFECYCLE_CHANNEL_PATTERN` (subscriber).
+ */
+export const POLICY_LIFECYCLE_CHANNEL = POLICY_LIFECYCLE_CHANNEL_PREFIX;
 
 /**
  * Row -> domain mapper. Drizzle returns JSONB as `unknown`; we narrow here
@@ -71,15 +139,34 @@ function rowToDomain(row: PolicyRuleRow): PolicyRule {
 }
 
 /**
- * Publish a lifecycle event. Failure is logged but never thrown — cache
- * invalidation is best-effort; TTL handles eventual consistency.
+ * Publish a lifecycle event. Failure to *deliver* is logged but never
+ * thrown — cache invalidation is best-effort; TTL handles eventual
+ * consistency. However, failure to *build a tenant-scoped channel* (i.e.
+ * the publisher was invoked without a tenant context, or the event
+ * payload's tenant_id doesn't match the ALS tenant) IS a programmer
+ * error and propagates — see #249 (tenant-channel routing isolation).
+ *
+ * Defense-in-depth: we cross-check `evt.tenant_id === getCurrentTenant()`
+ * before publishing. If they diverge, ALS leaked or a caller built the
+ * event in the wrong context — both bugs we want surfaced loudly, not
+ * routed to a foreign tenant's channel.
  */
 async function publishLifecycle(evt: PolicyLifecycleEvent): Promise<void> {
+  // getCurrentTenant() throws MissingTenantContextError when ALS is empty
+  // — that is the desired behaviour at publish time (issue #249).
+  const ctxTenant = getCurrentTenant();
+  if (evt.tenant_id !== ctxTenant) {
+    throw new TypedError(
+      'policy_lifecycle_tenant_mismatch',
+      `event.tenant_id=${evt.tenant_id} differs from ALS tenant=${ctxTenant}`,
+    );
+  }
+  const channel = buildPolicyLifecycleChannel(ctxTenant);
   try {
-    await redis.publish(POLICY_LIFECYCLE_CHANNEL, JSON.stringify(evt));
+    await redis.publish(channel, JSON.stringify(evt));
   } catch (err) {
     logger.warn(
-      { err: (err as Error).message, evt },
+      { err: (err as Error).message, evt, channel },
       'policy_rules_repo.publish_failed',
     );
   }
