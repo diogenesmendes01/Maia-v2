@@ -1017,3 +1017,327 @@ describe('issue #226 — ActionDeciderImpl fallback branch coverage (3 missing b
     expect(result.tool_permissions.allowed_tools).toEqual([]);
   });
 });
+
+// ===========================================================================
+// PR #236 review v3 — two additional gaps Codex flagged on REQUEST_CHANGES:
+//
+//   GAP-1 (primary): ambiguous-skill fallback — multi-candidate WITHOUT an
+//   explicit `selected_skill_id`. Production routes this to the no-skill
+//   `respond:no_skill` branch (action-decider.ts:133). The previous spec only
+//   exercised the path where `selected_skill_id` is set, so a regression that
+//   sneakily resolved a candidate (e.g. by reading `candidate_skill_ids[0]`
+//   when `selected_skill_id` is absent) would NOT have been caught. This
+//   suite locks in the deterministic outcome AND proves no tool perms /
+//   skill identity from the candidates leak into the packet.
+//
+//   GAP-2 (reval): same-tenant DIFFERENT-agent owned-skill. The cross-tenant
+//   suite above proves the SQL `WHERE tenant_id = ...` predicate fires for
+//   different tenants. It does NOT exercise the agent-scope POST-FILTER at
+//   `skills-repo.ts:836` (`if (row.agent_id !== null && row.agent_id !==
+//   ctxAgent) return null`). A mutation deleting that line would still pass
+//   the cross-tenant tests (the SQL WHERE drops the wrong-tenant row) but
+//   would leak an owner-agent's skill to a sibling agent inside the SAME
+//   tenant. This suite seeds two agents in tenant-A and proves agent-A2's
+//   lookup of agent-A1's owned skill returns null end-to-end via the real
+//   ActionDecider fallback.
+// ===========================================================================
+describe('issue #226 — PR #236 review v3 additional gaps', () => {
+  // -------------------------------------------------------------------------
+  // GAP-1 — ambiguous-skill fallback: multi-candidate WITHOUT selected_skill_id.
+  // -------------------------------------------------------------------------
+  function mkInputAmbiguous(args: {
+    tenant_id: string;
+    agent_id: string;
+    candidate_skill_ids: string[];
+  }): ActionDeciderInput {
+    return {
+      base: mkBaseContextPacket({
+        tenant_id: args.tenant_id,
+        agent_id: args.agent_id,
+      }),
+      intent: { label: 'shared.descr', confidence: 0.9 },
+      risk: { level: 'low', reasons: [], requires_human_review: false },
+      workflow: { mode: 'none' },
+      // AMBIGUOUS PATH: multiple candidates, NO selected_skill_id, NO
+      // selected_skill. ActionDecider must NOT pick a candidate on its own —
+      // the production branch at action-decider.ts:133 routes the turn to
+      // `respond:no_skill` (free-form chat). A regression that read
+      // `candidate_skill_ids[0]` when `selected_skill_id` is absent would
+      // resolve the first candidate and emit `call_tool`/`execute_skill`
+      // with leaking permissions; this test pins the deterministic
+      // no-resolution outcome.
+      skill: {
+        candidate_skill_ids: args.candidate_skill_ids,
+      },
+      midPepOutcome: { pep: 'mid', warnings: [] },
+      earlyWarnings: [],
+    };
+  }
+
+  it('ambiguous-skill: multi-candidate WITHOUT selected_skill_id routes to respond:no_skill (no candidate auto-resolved)', async () => {
+    // Seed two real, otherwise-resolvable skills in the routed tenant so a
+    // regression that auto-picks `candidate_skill_ids[0]` would surface a
+    // real tool. With the production branch intact, NEITHER candidate is
+    // touched (the fallback `find()` is never called).
+    pushSkills([
+      mkRow({
+        id: 's_A_one',
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-A',
+        allowed_tools: ['tool_for_s_A_one'],
+      }),
+      mkRow({
+        id: 's_A_two',
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-A',
+        allowed_tools: ['tool_for_s_A_two'],
+      }),
+    ]);
+
+    const env = createProductionDecisionEngineEnv();
+    const decider = new ActionDeciderImpl({ skillsRepo: env.skillsRepo });
+
+    const result = await runWithTenantContext(
+      { tenant_id: 'tenant-A', agent_id: 'agent-A' },
+      () =>
+        decider.decide(
+          mkInputAmbiguous({
+            tenant_id: 'tenant-A',
+            agent_id: 'agent-A',
+            candidate_skill_ids: ['s_A_one', 's_A_two'],
+          }),
+        ),
+    );
+
+    // Deterministic outcome: the no-skill-selected branch (action-decider.ts:133)
+    // emits `respond:no_skill` with EMPTY_TOOL_PERMS and NO selected skill id.
+    expect(result.action_mode).toBe('respond');
+    expect(result.rationale).toBe('respond:no_skill');
+    expect(result.tool_permissions.allowed_tools).toEqual([]);
+    // Neither candidate's tool leaked — proves no `candidate_skill_ids[0]`
+    // shortcut auto-resolved one of them.
+    expect(result.tool_permissions.allowed_tools).not.toContain('tool_for_s_A_one');
+    expect(result.tool_permissions.allowed_tools).not.toContain('tool_for_s_A_two');
+  });
+
+  it('ambiguous-skill: empty candidate list + missing selected_skill_id ALSO routes to respond:no_skill', async () => {
+    // The SkillSelector returning zero candidates is the canonical no-skill
+    // turn — but the spec must lock it in alongside the multi-candidate case
+    // so a refactor cannot accidentally invert the branch (e.g. emit
+    // ask_clarification on empty candidates and respond:no_skill only on
+    // multi-candidate, or vice versa).
+    pushSkills([
+      mkRow({ id: 's_A_one', tenant_id: 'tenant-A', agent_id: 'agent-A' }),
+    ]);
+
+    const env = createProductionDecisionEngineEnv();
+    const decider = new ActionDeciderImpl({ skillsRepo: env.skillsRepo });
+
+    const result = await runWithTenantContext(
+      { tenant_id: 'tenant-A', agent_id: 'agent-A' },
+      () =>
+        decider.decide(
+          mkInputAmbiguous({
+            tenant_id: 'tenant-A',
+            agent_id: 'agent-A',
+            candidate_skill_ids: [],
+          }),
+        ),
+    );
+
+    expect(result.action_mode).toBe('respond');
+    expect(result.rationale).toBe('respond:no_skill');
+    expect(result.tool_permissions.allowed_tools).toEqual([]);
+  });
+
+  // -------------------------------------------------------------------------
+  // GAP-2 — same-tenant cross-agent owned-skill: prove the agent_id POST-FILTER
+  // at `skills-repo.ts:836` fires end-to-end via the real ActionDecider
+  // fallback. The existing cross-tenant suite proves the SQL `WHERE tenant_id
+  // = ...` predicate; this suite proves the JS post-filter that drops a
+  // wrong-agent same-tenant row.
+  //
+  // Mutation kill: deleting `skills-repo.ts:836` (the
+  // `if (row.agent_id !== null && row.agent_id !== ctxAgent) return null`
+  // post-filter) lets the SQL return tenant-A's agent-A1 row when queried
+  // under {tenant-A, agent-A2}. The cross-tenant assertions stay green; this
+  // assertion turns red.
+  // -------------------------------------------------------------------------
+  it('same-tenant cross-agent: agent-A2 NEVER resolves agent-A1 owned skill in tenant-A (agent_id post-filter fires)', async () => {
+    // Two agents in the SAME tenant. agent-A1 owns `s_owner`; agent-A2 has
+    // its own unrelated skill so the lookup scope is realistic.
+    pushSkills([
+      mkRow({
+        id: 's_owner',
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-A1', // owned by agent-A1
+        allowed_tools: ['tool_for_s_owner_A1'],
+      }),
+      mkRow({
+        id: 's_other',
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-A2',
+        allowed_tools: ['tool_for_s_other_A2'],
+      }),
+    ]);
+
+    const env = createProductionDecisionEngineEnv();
+    const decider = new ActionDeciderImpl({ skillsRepo: env.skillsRepo });
+
+    // Ambient context = agent-A1 (the owner). The decider operates as
+    // agent-A2 inside the SAME tenant-A, and the fallback `find()` MUST
+    // re-pin to the routed agent — not the ambient owner.
+    const result = await runWithTenantContext(
+      { tenant_id: 'tenant-A', agent_id: 'agent-A1' },
+      () =>
+        decider.decide(
+          mkInputFallback({
+            tenant_id: 'tenant-A',
+            agent_id: 'agent-A2', // routed scope = sibling agent
+            selected_skill_id: 's_owner', // owned by agent-A1, NOT agent-A2
+          }),
+        ),
+    );
+
+    // agent_id post-filter fires → null → skill_lookup_failed.
+    expect(result.action_mode).toBe('ask_clarification');
+    expect(result.rationale).toBe('skill_lookup_failed:s_owner');
+    expect(result.tool_permissions.allowed_tools).toEqual([]);
+    // Critical mutation-kill assertion: agent-A1's tool MUST NOT leak into
+    // agent-A2's packet. A regression deleting the post-filter at
+    // skills-repo.ts:836 would surface `tool_for_s_owner_A1` here.
+    expect(result.tool_permissions.allowed_tools).not.toContain('tool_for_s_owner_A1');
+  });
+
+  it('same-tenant cross-agent (symmetric): agent-A1 NEVER resolves agent-A2 owned skill in tenant-A', async () => {
+    pushSkills([
+      mkRow({
+        id: 's_owner',
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-A2', // owned by agent-A2 this time
+        allowed_tools: ['tool_for_s_owner_A2'],
+      }),
+    ]);
+
+    const env = createProductionDecisionEngineEnv();
+    const decider = new ActionDeciderImpl({ skillsRepo: env.skillsRepo });
+
+    const result = await runWithTenantContext(
+      { tenant_id: 'tenant-A', agent_id: 'agent-A2' }, // ambient = agent-A2 (owner)
+      () =>
+        decider.decide(
+          mkInputFallback({
+            tenant_id: 'tenant-A',
+            agent_id: 'agent-A1', // routed = sibling
+            selected_skill_id: 's_owner',
+          }),
+        ),
+    );
+
+    expect(result.action_mode).toBe('ask_clarification');
+    expect(result.rationale).toBe('skill_lookup_failed:s_owner');
+    expect(result.tool_permissions.allowed_tools).not.toContain('tool_for_s_owner_A2');
+  });
+
+  it('same-tenant cross-agent sanity: agent-A1 DOES resolve its OWN skill inside tenant-A (fallback path is exercised)', async () => {
+    // Companion to the two negative cases above — proves the fallback `find()`
+    // is genuinely hit and the agent_id post-filter only drops cross-agent
+    // rows, not own-agent rows.
+    pushSkills([
+      mkRow({
+        id: 's_owner',
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-A1',
+        allowed_tools: ['tool_for_s_owner_A1'],
+      }),
+      mkRow({
+        id: 's_other',
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-A2',
+        allowed_tools: ['tool_for_s_other_A2'],
+      }),
+    ]);
+
+    const env = createProductionDecisionEngineEnv();
+    const decider = new ActionDeciderImpl({ skillsRepo: env.skillsRepo });
+
+    const result = await runWithTenantContext(
+      { tenant_id: 'tenant-A', agent_id: 'agent-A2' }, // ambient = sibling
+      () =>
+        decider.decide(
+          mkInputFallback({
+            tenant_id: 'tenant-A',
+            agent_id: 'agent-A1', // routed = owner
+            selected_skill_id: 's_owner',
+          }),
+        ),
+    );
+
+    expect(result.action_mode).toBe('call_tool');
+    expect(result.rationale).toBe('call_tool:s_owner');
+    expect(result.tool_permissions.allowed_tools).toContain('tool_for_s_owner_A1');
+    expect(result.tool_permissions.allowed_tools).not.toContain('tool_for_s_other_A2');
+  });
+
+  // -------------------------------------------------------------------------
+  // Combined adversarial — same-id collision across BOTH dimensions
+  // simultaneously: same tenant, different agents, SAME skill id. Each agent
+  // owns its own `s_shared_id` skill; the WHERE predicate's tenant clause
+  // returns BOTH rows (same tenant_id, same id), and the agent_id post-filter
+  // is the SOLE mechanism preventing one agent's row from leaking into the
+  // other's lookup.
+  //
+  // Note: in the real DB, `id` is a primary key so two rows with the same
+  // `id` cannot coexist — but the production code at skills-repo.ts:826-829
+  // builds WHERE only on `tenant_id` + `id`, then post-filters by `agent_id`
+  // in JS. A historical regression where two rows did share an id (e.g. a
+  // migration glitch or a non-unique constraint) would still be safely
+  // filtered by the agent_id post-filter. The fake DB here lets us simulate
+  // that adversarial state and prove the post-filter holds.
+  // -------------------------------------------------------------------------
+  it('same-tenant cross-agent same-id collision: agent-A2 returns NO row when both agents own `s_shared_id` in tenant-A', async () => {
+    pushSkills([
+      mkRow({
+        id: 's_shared_id',
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-A1',
+        allowed_tools: ['tool_for_A1_shared'],
+      }),
+      mkRow({
+        id: 's_shared_id',
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-A2',
+        allowed_tools: ['tool_for_A2_shared'],
+      }),
+    ]);
+
+    const env = createProductionDecisionEngineEnv();
+    const decider = new ActionDeciderImpl({ skillsRepo: env.skillsRepo });
+
+    // Query as agent-A2. Both rows match the SQL WHERE (same tenant, same
+    // id); `limit(1)` returns the first match (agent-A1's row by insertion
+    // order). The post-filter then drops it because `agent_id ('agent-A1')
+    // !== ctxAgent ('agent-A2')`. agent-A2's own row is at index 1 and is
+    // never reached because `limit(1)` already returned. So the safe
+    // behaviour here is null (lookup failed), NOT auto-fall-through to the
+    // next row. This pins both invariants: post-filter fires AND we don't
+    // silently substitute another agent's row.
+    const result = await runWithTenantContext(
+      { tenant_id: 'tenant-A', agent_id: 'agent-A2' },
+      () =>
+        decider.decide(
+          mkInputFallback({
+            tenant_id: 'tenant-A',
+            agent_id: 'agent-A2',
+            selected_skill_id: 's_shared_id',
+          }),
+        ),
+    );
+
+    expect(result.action_mode).toBe('ask_clarification');
+    expect(result.rationale).toBe('skill_lookup_failed:s_shared_id');
+    // Neither agent's tool leaked.
+    expect(result.tool_permissions.allowed_tools).not.toContain('tool_for_A1_shared');
+    expect(result.tool_permissions.allowed_tools).not.toContain('tool_for_A2_shared');
+  });
+});
