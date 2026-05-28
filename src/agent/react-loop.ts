@@ -8,7 +8,7 @@ import { dispatchTool } from '@/tools/_dispatcher.js';
 import { REGISTRY } from '@/tools/_registry.js';
 import { sendReaction } from '@/gateway/presence.js';
 import { uuid } from '@/lib/utils.js';
-import { dispatchOutput, type LatestPending, type LatestReportPdf } from './output-dispatch.js';
+import { safeDispatchOutput, type LatestPending, type LatestReportPdf } from './output-dispatch.js';
 import { detectGap } from './gap-detector.js';
 import { reflect } from '@/cognition/reflector.js';
 import { classify } from '@/cognition/classifier.js';
@@ -171,7 +171,12 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
           : rawText;
       outboundText = text;
       if (text) {
-        await dispatchOutput({
+        // Centralised, never-throwing dispatch (Codex #216 HIGH-1). We are the
+        // terminal ReAct turn, so there's no further fallback: on a not_sent
+        // (pre-send / disconnected) outcome NOTHING reached the user — record an
+        // outbound_failure exit (tool summaries still flush below) instead of
+        // silently marking the turn delivered.
+        const outcome = await safeDispatchOutput({
           pessoa,
           conversa: c,
           inbound,
@@ -182,6 +187,21 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
           turnHasSensitive,
           sensitiveTools,
         });
+        if (outcome.status === 'not_sent') {
+          logger.warn(
+            { conversa_id: c.id, mensagem_id: inbound.id, err: outcome.error },
+            'react_loop.outbound_not_delivered',
+          );
+          exitReason = 'outbound_failure';
+          break;
+        }
+        if (outcome.status === 'sent_no_persist') {
+          // Sent but persist failed (or ambiguous) — user has it; do NOT re-send.
+          logger.error(
+            { conversa_id: c.id, mensagem_id: inbound.id, err: outcome.error, ops_alert: true },
+            'react_loop.dispatch_inconsistency',
+          );
+        }
         outboundDispatched = true;
 
         // P1 reflection trigger: INTERNAL_GAP. Inspects the final outbound
@@ -387,7 +407,7 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
       c.id,
       inbound.id,
       toolSummaries,
-      exitReason === 'iteration_cap' ? 'iteration_cap' : 'empty_final_text',
+      exitReason,
     );
   }
 

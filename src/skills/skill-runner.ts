@@ -206,6 +206,36 @@ export async function runSkill(input: SkillExecutionInput): Promise<SkillExecuti
     skill_id: skill.id,
   };
 
+  // Gate 1.6 (Codex #216 review HIGH-B): close the execution TOCTOU. When the
+  // caller pinned an expected identity (the Decision Engine validated a specific
+  // active row before routing here), the row we just re-resolved by descriptor
+  // MUST still match it. An activate/rollback in the window between the caller's
+  // pre-check and this lookup would otherwise execute a DIVERGENT active row.
+  // Fail-closed on mismatch so the caller degrades safely instead of running it.
+  if (
+    (input.expected_skill_id !== undefined && skill.id !== input.expected_skill_id) ||
+    (input.expected_skill_version !== undefined &&
+      skill.version !== input.expected_skill_version)
+  ) {
+    logger.warn(
+      {
+        descriptor: input.skill_descriptor,
+        expected_id: input.expected_skill_id,
+        expected_version: input.expected_skill_version,
+        resolved_id: skill.id,
+        resolved_version: skill.version,
+      },
+      'p9a.runner.identity_mismatch',
+    );
+    return {
+      ok: false,
+      reason: 'identity_mismatch',
+      latency_ms: Date.now() - startTime,
+      resolved_policies: [],
+      trace: skillTrace,
+    };
+  }
+
   // Gate 1.5b: re-assert agent scope on the resolved skill (defense in
   // depth — findActive should have prevented cross-agent skills surfacing,
   // but tests / future repo refactors could leak).

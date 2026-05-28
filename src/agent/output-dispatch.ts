@@ -4,7 +4,7 @@ import type { Pessoa, Conversa, Mensagem } from '@/db/schema.js';
 import { audit } from '@/governance/audit.js';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
-import { sendOutboundText, sendOutboundDocument, sendOutboundVoice } from '@/gateway/baileys.js';
+import { sendOutboundText, sendOutboundDocument, sendOutboundVoice, isBaileysConnected } from '@/gateway/baileys.js';
 import { synthesizeSpeech, OUTBOUND_VOICE_MAX_CHARS } from '@/lib/tts.js';
 import { quotedReplyContext } from '@/gateway/presence.js';
 import type { WAQuotedContext } from '@/gateway/presence.js';
@@ -81,6 +81,53 @@ export type DispatchOutputCtx = {
  *   4. Else → send plain text, applying view-once when sensitive tools were
  *      dispatched in this turn (unless the user disabled it).
  */
+/**
+ * Thrown by `sendOutbound` (and surfaced through `dispatchOutput`) to tell a
+ * caller WHICH phase of delivery failed (Codex #216 review HIGH-A / HIGH-1):
+ *   - `delivered: false` — NOTHING reached the user. Either a pre-send step
+ *     failed (recipient/JID lookup, quote lookup), the channel send threw, or
+ *     the gateway was DISCONNECTED (baileys returns `null` instead of throwing —
+ *     we convert that `null` to delivered:false here so it isn't a silent drop).
+ *     The caller may safely recover (fall through to ReAct / retry) without
+ *     risking a duplicate.
+ *   - `delivered: true`  — the message WAS sent but the DB persist failed; the
+ *     user already received it, so the caller must NOT re-send (double-send).
+ * Tagged across EVERY branch of `dispatchOutput`/`sendOutbound`: pre-send
+ * (recipient + quote lookup), text, voice, the PDF document send+persist, and
+ * the poll send+persist. Callers should go through `safeDispatchOutput`, which
+ * centralises this classification + records the failed attempt; an untyped throw
+ * is still treated conservatively as delivered (no re-send).
+ * Extends Error (carries the cause message) so existing generic
+ * `catch (e) { (e as Error).message }` callers are unaffected.
+ */
+export class OutboundDeliveryError extends Error {
+  readonly delivered: boolean;
+  constructor(delivered: boolean, message: string) {
+    super(message);
+    this.name = 'OutboundDeliveryError';
+    this.delivered = delivered;
+  }
+}
+
+/**
+ * The baileys send fns return `null` in TWO distinct cases: (a) the socket was
+ * DISCONNECTED so the send never happened, and (b) `sendMessage` resolved but
+ * returned no `key.id` — the send most likely HAPPENED, we just have no id.
+ * Disambiguate by connection state so we NEVER fall through (→ re-send) on a
+ * possibly-delivered message (Codex #216 round-3, item 3):
+ *   - connected + null ⇒ delivered:true (sent-but-unconfirmed → caller must NOT
+ *     re-send; no double-send of a financial message).
+ *   - disconnected      ⇒ delivered:false (nothing sent → safe to recover).
+ * The residual TOCTOU (sent, then the socket drops before this check) is the
+ * #227 "entregou-mas-lançou" window, tracked separately.
+ */
+function throwForNullSend(channel: string): never {
+  if (isBaileysConnected()) {
+    throw new OutboundDeliveryError(true, `${channel}_sent_without_id`);
+  }
+  throw new OutboundDeliveryError(false, `${channel}_disconnected`);
+}
+
 export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
   const { pessoa, conversa: c, inbound, jid, text, latestPending, latestReportPdf, turnHasSensitive, sensitiveTools } = ctx;
   const toolSummaries = ctx.toolSummaries ?? [];
@@ -90,15 +137,25 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
   // can't drift between copies.
   // Pending check via canonical repo (post-B0). `||` short-circuits
   // on detected correction so the DB hit only happens when needed.
-  const shouldQuote =
-    (inbound.conteudo && detectCorrection(inbound.conteudo)) ||
-    (await pendingQuestionsRepo.findActiveSnapshot(c.id)) !== null;
-  const quotedContext = shouldQuote
-    ? quotedReplyContext(
-        inbound.metadata as Record<string, unknown> | null,
-        inbound.conteudo,
-      )
-    : undefined;
+  // Everything up to the first channel send is PRE-send work: if it throws,
+  // NOTHING reached the user. Tag it delivered:false (Codex #216 HIGH-1) so the
+  // skill-execution caller falls through to ReAct (never silence) with no
+  // double-send risk (nothing was dispatched).
+  let quotedContext: WAQuotedContext | undefined;
+  try {
+    const shouldQuote =
+      !!(inbound.conteudo && detectCorrection(inbound.conteudo)) ||
+      (await pendingQuestionsRepo.findActiveSnapshot(c.id)) !== null;
+    quotedContext = shouldQuote
+      ? quotedReplyContext(
+          inbound.metadata as Record<string, unknown> | null,
+          inbound.conteudo,
+        )
+      : undefined;
+  } catch (e) {
+    if (e instanceof OutboundDeliveryError) throw e;
+    throw new OutboundDeliveryError(false, (e as Error).message);
+  }
 
   // B3b: PDF report path — takes precedence over poll/text. The LLM's
   // text becomes the document caption (truncated to WhatsApp's 1024-
@@ -109,13 +166,25 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
     const pdf = latestReportPdf;
     try {
       const captionText = text.slice(0, 1024);
-      const wid = await sendOutboundDocument(jid, pdf.path, {
-        mimetype: pdf.mimetype,
-        fileName: pdf.fileName,
-        caption: captionText,
-        quoted: quotedContext,
-      });
-      if (wid) {
+      let wid: string | null;
+      try {
+        wid = await sendOutboundDocument(jid, pdf.path, {
+          mimetype: pdf.mimetype,
+          fileName: pdf.fileName,
+          caption: captionText,
+          quoted: quotedContext,
+        });
+      } catch (e) {
+        // Pre-send: the document never left the channel → delivered:false.
+        throw new OutboundDeliveryError(false, (e as Error).message);
+      }
+      if (!wid) {
+        // null ⇒ disconnected (not sent) OR sent-without-id; disambiguate by
+        // connection state (Codex #216 HIGH-1 + round-3 item 3). The tmp PDF is
+        // still removed by the `finally` below either way.
+        throwForNullSend('document_channel');
+      }
+      try {
         const file_size_bytes = await stat(pdf.path)
           .then((s) => s.size)
           .catch((err) => {
@@ -152,6 +221,9 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
           ferramentas_chamadas: toolSummaries,
           tokens_usados: null,
         });
+      } catch (e) {
+        // Sent but not persisted → user already has the document; must NOT re-send.
+        throw new OutboundDeliveryError(true, (e as Error).message);
       }
     } finally {
       await cleanupPDF(pdf.path);
@@ -181,10 +253,23 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
       );
     }
     if (voiceBuf) {
-      const wid = await sendOutboundVoice(jid, voiceBuf, {
-        quoted: quotedContext,
-      });
-      if (wid) {
+      let wid: string | null;
+      try {
+        wid = await sendOutboundVoice(jid, voiceBuf, {
+          quoted: quotedContext,
+        });
+      } catch (e) {
+        // Pre-send: the voice note never left the channel → tag delivered:false
+        // so the skill caller falls through to ReAct (no double-send).
+        throw new OutboundDeliveryError(false, (e as Error).message);
+      }
+      // null ⇒ disconnected (not sent) OR sent-without-id; disambiguate by
+      // connection state so a sent voice note is never re-sent (Codex #216
+      // HIGH-1 + round-3 item 3), matching the text path.
+      if (!wid) {
+        throwForNullSend('voice_channel');
+      }
+      try {
         await audit({
           acao: 'outbound_sent_voice',
           pessoa_id: pessoa.id,
@@ -212,6 +297,9 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
           ferramentas_chamadas: toolSummaries,
           tokens_usados: null,
         });
+      } catch (e) {
+        // Sent but not persisted → user already heard it; must NOT re-send.
+        throw new OutboundDeliveryError(true, (e as Error).message);
       }
     } else {
       // TTS failed — fall back to text path (re-uses existing sendOutbound).
@@ -267,6 +355,86 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
   }
 }
 
+/**
+ * Outcome of a `safeDispatchOutput` call. Lets the caller pick its own recovery
+ * WITHOUT having to know the `OutboundDeliveryError` phase taxonomy:
+ *   - `delivered`       — sent AND persisted. Caller: done.
+ *   - `not_sent`        — NOTHING reached the user (pre-send / disconnected
+ *                         gateway / channel threw). Caller MAY recover (fall
+ *                         through to ReAct, retry) — no double-send risk.
+ *   - `sent_no_persist` — the message reached the user but a later step failed
+ *                         (DB persist), OR an untyped error left delivery
+ *                         ambiguous. Caller must NOT re-send (double-send risk).
+ */
+export type DispatchOutcome =
+  | { status: 'delivered' }
+  | { status: 'not_sent'; error: string }
+  | { status: 'sent_no_persist'; error: string };
+
+/**
+ * Centralised, resilient entry point for outbound delivery (Codex #216 HIGH-1).
+ * Wraps `dispatchOutput`, classifies any failure by phase, records the failed
+ * attempt and returns a `DispatchOutcome` the caller maps to its own recovery.
+ * NEVER throws — so every caller (skill execution, ReAct loop) is guaranteed a
+ * decision and the user is never silently dropped.
+ */
+export async function safeDispatchOutput(ctx: DispatchOutputCtx): Promise<DispatchOutcome> {
+  try {
+    await dispatchOutput(ctx);
+    return { status: 'delivered' };
+  } catch (e) {
+    return handleDispatchError(e, ctx);
+  }
+}
+
+/**
+ * Classify a dispatch failure by phase, record it, and map it to a
+ * `DispatchOutcome`. Pre-send (delivered:false) ⇒ nothing reached the user, so
+ * recovery is safe. Post-send (delivered:true) OR an untyped/unknown throw ⇒
+ * the message may have reached the user, so we conservatively forbid a re-send.
+ */
+async function handleDispatchError(
+  e: unknown,
+  ctx: DispatchOutputCtx,
+): Promise<DispatchOutcome> {
+  const delivered = e instanceof OutboundDeliveryError ? e.delivered : undefined;
+  const phase: 'pre_send' | 'post_send' | 'unknown' =
+    delivered === false ? 'pre_send' : delivered === true ? 'post_send' : 'unknown';
+  const error = (e as Error).message;
+  await recordOutboundAttempt(ctx, phase, error);
+  return phase === 'pre_send'
+    ? { status: 'not_sent', error }
+    : { status: 'sent_no_persist', error };
+}
+
+/**
+ * Record a FAILED outbound attempt for ops visibility + as a breadcrumb for the
+ * #227 idempotency ledger. Only failures are recorded — a successful send is
+ * already captured by the persisted `mensagens` row (+ `outbound_sent_*`
+ * audits), so auditing successes here would only double hot-path audit volume.
+ * `audit` swallows its own errors, so this never breaks the caller.
+ */
+async function recordOutboundAttempt(
+  ctx: DispatchOutputCtx,
+  phase: 'pre_send' | 'post_send' | 'unknown',
+  error: string,
+): Promise<void> {
+  await audit({
+    acao: 'outbound_dispatch_failed',
+    pessoa_id: ctx.pessoa.id,
+    conversa_id: ctx.conversa.id,
+    mensagem_id: ctx.inbound.id,
+    metadata: {
+      phase,
+      delivered: phase === 'post_send',
+      // Turn-scoped dedupe unit (one reply per inbound turn, any channel) — the
+      // #227 ledger keys its pre-send optimistic insert on this.
+      idempotency_key: `${ctx.conversa.id}:${ctx.inbound.id}`,
+      error,
+    },
+  });
+}
+
 export async function sendOutbound(
   pessoa_id: string,
   conversa_id: string,
@@ -284,34 +452,65 @@ export async function sendOutbound(
     tool_summaries?: ToolExecutionSummary[];
   },
 ): Promise<string | null> {
-  const pessoa = await pessoasRepo.findById(pessoa_id);
-  if (!pessoa) return null;
-  // Reply to whatever JID the inbound used (handles `@lid` privacy IDs that
-  // wouldn't survive the round-trip through `phone + @s.whatsapp.net`).
-  // Falls back to the phone-derived JID for non-reply outbounds.
-  const jid = await resolveOutboundJid(pessoa, in_reply_to);
+  // PRE-SEND (recipient + JID resolution). If any of this throws, or there's no
+  // recipient to resolve a JID for, NOTHING reached the user → tag
+  // delivered:false so callers recover (fall through / retry) without a
+  // double-send. (Previously a lookup throw escaped untyped and a missing pessoa
+  // returned null — both read as "handled" by the skill caller = silent drop.)
+  let jid: string;
+  try {
+    const pessoa = await pessoasRepo.findById(pessoa_id);
+    if (!pessoa) throw new OutboundDeliveryError(false, 'pessoa_not_found');
+    // Reply to whatever JID the inbound used (handles `@lid` privacy IDs that
+    // wouldn't survive the round-trip through `phone + @s.whatsapp.net`).
+    // Falls back to the phone-derived JID for non-reply outbounds.
+    jid = await resolveOutboundJid(pessoa, in_reply_to);
+  } catch (e) {
+    if (e instanceof OutboundDeliveryError) throw e;
+    throw new OutboundDeliveryError(false, (e as Error).message);
+  }
   const sendOpts: { quoted?: WAQuotedContext; view_once?: boolean } = {};
   if (opts?.quoted) sendOpts.quoted = opts.quoted;
   if (opts?.view_once) sendOpts.view_once = true;
-  const wid = await sendOutboundText(
-    jid,
-    text,
-    Object.keys(sendOpts).length ? sendOpts : undefined,
-  );
+  // Delivery happens in two phases: send to the channel, THEN persist the
+  // outbound row. Tag failures by phase (Codex #216 review HIGH-A) so callers
+  // can tell "nothing was sent" (safe to recover) from "sent but not persisted"
+  // (must not re-send).
+  let wid: string | null;
+  try {
+    wid = await sendOutboundText(
+      jid,
+      text,
+      Object.keys(sendOpts).length ? sendOpts : undefined,
+    );
+  } catch (e) {
+    throw new OutboundDeliveryError(false, (e as Error).message);
+  }
+  // A null id means the gateway did NOT confirm a send. Disambiguate
+  // disconnected (not sent → delivered:false) from sent-without-id (→
+  // delivered:true) so we don't drop silently NOR risk a double-send, and never
+  // persist a phantom whatsapp_id:null row (Codex #216 HIGH-1 + round-3 item 3).
+  if (wid === null) {
+    throwForNullSend('channel');
+  }
   const metadata: Record<string, unknown> = { whatsapp_id: wid, remote_jid: jid, in_reply_to };
   if (opts?.pending_question_id) metadata.pending_question_id = opts.pending_question_id;
   if (opts?.view_once) metadata.view_once = true;
-  await mensagensRepo.create({
-    conversa_id,
-    direcao: 'out',
-    tipo: 'texto',
-    conteudo: text,
-    midia_url: null,
-    metadata,
-    processada_em: new Date(),
-    ferramentas_chamadas: opts?.tool_summaries ?? [],
-    tokens_usados: null,
-  });
+  try {
+    await mensagensRepo.create({
+      conversa_id,
+      direcao: 'out',
+      tipo: 'texto',
+      conteudo: text,
+      midia_url: null,
+      metadata,
+      processada_em: new Date(),
+      ferramentas_chamadas: opts?.tool_summaries ?? [],
+      tokens_usados: null,
+    });
+  } catch (e) {
+    throw new OutboundDeliveryError(true, (e as Error).message);
+  }
   return wid;
 }
 
@@ -323,14 +522,30 @@ export async function sendOutboundPoll(
   pending: { id: string; opcoes_validas: Array<{ key: string; label: string }> },
   opts?: { tool_summaries?: ToolExecutionSummary[] },
 ): Promise<{ fell_back: boolean }> {
-  const pessoa = await pessoasRepo.findById(pessoa_id);
-  if (!pessoa) return { fell_back: false };
-  const jid = await resolveOutboundJid(pessoa, in_reply_to);
+  // PRE-SEND (recipient + JID): a throw or missing recipient means nothing was
+  // sent → delivered:false so the caller can recover (Codex #216 round-3).
+  let jid: string;
+  try {
+    const pessoa = await pessoasRepo.findById(pessoa_id);
+    if (!pessoa) throw new OutboundDeliveryError(false, 'pessoa_not_found');
+    jid = await resolveOutboundJid(pessoa, in_reply_to);
+  } catch (e) {
+    if (e instanceof OutboundDeliveryError) throw e;
+    throw new OutboundDeliveryError(false, (e as Error).message);
+  }
   const { sendPoll } = await import('@/gateway/presence.js');
-  const sent = await sendPoll(jid, text, pending.opcoes_validas);
+  let sent: Awaited<ReturnType<typeof sendPoll>>;
+  try {
+    sent = await sendPoll(jid, text, pending.opcoes_validas);
+  } catch (e) {
+    // The poll never left the channel → delivered:false. (The text fallback
+    // below only covers missing decryption secrets, not a hard send failure.)
+    throw new OutboundDeliveryError(false, (e as Error).message);
+  }
   // Without all three (whatsapp_id, message_secret, creator_jid) the inbound
   // vote can't be decrypted (creator_jid feeds the HMAC in decryptPollVote),
-  // so the user would see a poll they can't actually answer. Fall back.
+  // so the user would see a poll they can't actually answer. Fall back to text
+  // (sendOutbound is itself phase-tagged, so its failures propagate correctly).
   if (!sent.whatsapp_id || !sent.message_secret || !sent.creator_jid) {
     const numbered = pending.opcoes_validas.map((o, i) => `${i + 1}. ${o.label}`).join('\n');
     await sendOutbound(pessoa_id, conversa_id, `${text}\n\n${numbered}`, in_reply_to, {
@@ -339,24 +554,29 @@ export async function sendOutboundPoll(
     });
     return { fell_back: true };
   }
-  await mensagensRepo.create({
-    conversa_id,
-    direcao: 'out',
-    tipo: 'texto',
-    conteudo: text,
-    midia_url: null,
-    metadata: {
-      whatsapp_id: sent.whatsapp_id,
-      remote_jid: jid,
-      in_reply_to,
-      pending_question_id: pending.id,
-      poll_options: pending.opcoes_validas,
-      poll_message_secret: sent.message_secret,
-      poll_creator_jid: sent.creator_jid,
-    },
-    processada_em: new Date(),
-    ferramentas_chamadas: opts?.tool_summaries ?? [],
-    tokens_usados: null,
-  });
+  try {
+    await mensagensRepo.create({
+      conversa_id,
+      direcao: 'out',
+      tipo: 'texto',
+      conteudo: text,
+      midia_url: null,
+      metadata: {
+        whatsapp_id: sent.whatsapp_id,
+        remote_jid: jid,
+        in_reply_to,
+        pending_question_id: pending.id,
+        poll_options: pending.opcoes_validas,
+        poll_message_secret: sent.message_secret,
+        poll_creator_jid: sent.creator_jid,
+      },
+      processada_em: new Date(),
+      ferramentas_chamadas: opts?.tool_summaries ?? [],
+      tokens_usados: null,
+    });
+  } catch (e) {
+    // Sent but not persisted → user already saw the poll; must NOT re-send.
+    throw new OutboundDeliveryError(true, (e as Error).message);
+  }
   return { fell_back: false };
 }

@@ -91,6 +91,7 @@ export const AUDIT_ACTIONS = [
   'outbound_view_once_skipped_by_preference',
   'outbound_sent_document',
   'outbound_sent_voice',
+  'outbound_dispatch_failed',
   'pairing_qr_displayed',
   'pairing_code_requested',
   'pairing_completed',

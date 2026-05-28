@@ -39,7 +39,10 @@ import { selectProcedure, type SelectorDecision } from '@/cognition/procedure-se
 import { evaluateCurrentStep } from '@/cognition/step-evaluator.js';
 import * as procedureEngine from '@/procedures/engine.js';
 import { CognitiveEventType } from '@/types/enums.js';
-import { sendOutbound } from './output-dispatch.js';
+import { sendOutbound, safeDispatchOutput } from './output-dispatch.js';
+import { executeSelectedSkill } from './execute-skill.js';
+import { runSkill } from '@/skills/index.js';
+import { skillsRepo } from '@/db/repositories.js';
 import { runReActLoop } from './react-loop.js';
 import { runWithTenantContext, getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import { db } from '@/db/client.js';
@@ -856,6 +859,91 @@ async function runAgentForMensagemInner(
         await conversasRepo.touch(c.id);
         await clearDebounceState(pessoa.telefone_whatsapp);
         return;
+      }
+
+      // action_mode='execute_skill' (F1 Phase 1) → run the selected
+      // prompt_only/evaluator skill via runSkill and deliver its reply through
+      // dispatchOutput. The execution_mode gate lives in ActionDecider; here we
+      // enforce the immutable-identity assert (re-resolve by descriptor under
+      // the routed agent; pinned id+version must still match) and the safe
+      // fall-through contract — a !ok / identity-mismatch / no-reply skill
+      // degrades to the normal LLM/ReAct turn (prompt_only/evaluator have no
+      // side effects, so this can't double-act).
+      if (packet.action_mode === 'execute_skill') {
+        const replyJid =
+          typeof (inbound.metadata as Record<string, unknown> | null)?.['remote_jid'] === 'string' &&
+          ((inbound.metadata as Record<string, unknown>)['remote_jid'] as string).length > 0
+            ? ((inbound.metadata as Record<string, unknown>)['remote_jid'] as string)
+            : pessoa.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
+        const routedAgentId = packet.routing.agent_id;
+        const pinned =
+          packet.routing.selected_skill_descriptor !== undefined &&
+          packet.routing.selected_skill_version !== undefined &&
+          packet.routing.selected_skill_id !== undefined
+            ? {
+                selected_skill_descriptor: packet.routing.selected_skill_descriptor,
+                selected_skill_version: packet.routing.selected_skill_version,
+                selected_skill_id: packet.routing.selected_skill_id,
+              }
+            : null;
+        const outcome = await executeSelectedSkill(
+          {
+            pinned,
+            routedAgentId,
+            pessoa,
+            conversa: c,
+            inbound,
+            jid: replyJid,
+            aggregatedText: inbound.conteudo ?? '',
+          },
+          {
+            resolveActiveSkill: async (descriptor, agent_id) => {
+              try {
+                // findActive throws agent_scope_violation when the routed agent
+                // differs from the current tenant-context agent — treat that
+                // (and any lookup error) as "not the pinned skill" so we fall
+                // through safely rather than executing a divergent row.
+                const row = await skillsRepo.findActive(descriptor, agent_id);
+                if (row) return { id: row.id, version: row.version };
+                // Q3-A (Codex #216 review item 5): a tenant-wide skill
+                // (agent_id IS NULL) can be SELECTED (selection unions IS NULL)
+                // but is intentionally NOT executable yet — this re-resolution
+                // scopes to the EXACT routed agent, which never matches IS NULL.
+                // Probe explicitly so the block is a VISIBLE "deferred pending
+                // #218 (tenant-wide isolation proof)" rather than a silent
+                // fall-through. We still return null (do NOT execute it).
+                const tenantWide = await skillsRepo.findActive(descriptor, null);
+                if (tenantWide) {
+                  logger.warn(
+                    { skill_descriptor: descriptor, agent_id },
+                    'skill.tenant_wide_not_executable_pending_218',
+                  );
+                }
+                return null;
+              } catch (e) {
+                logger.warn(
+                  { err: (e as Error).message, skill_descriptor: descriptor, agent_id },
+                  'skill.identity_resolve_failed',
+                );
+                return null;
+              }
+            },
+            runSkill,
+            safeDispatchOutput,
+            logger,
+          },
+        );
+        if (outcome.handled) {
+          await markAllProcessed(0);
+          await conversasRepo.touch(c.id);
+          await clearDebounceState(pessoa.telefone_whatsapp);
+          return;
+        }
+        // Not handled → fall through to the normal LLM/ReAct turn below. Cases:
+        // identity mismatch / !ok / no reply (no side effects ran), OR
+        // dispatch_send_failed — a send was ATTEMPTED but threw pre-delivery
+        // (delivered:false), so nothing reached the user and ReAct can safely
+        // answer without a double-send (Codex #216 HIGH-1).
       }
 
       // 'respond', 'call_tool', 'continue_workflow' → proceed to LLM with
