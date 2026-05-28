@@ -459,17 +459,77 @@ describe('Issue #260 — scripts/reflection-memory-cleanup.ts', () => {
       expect(parsed.execute).toBe(false);
     });
 
-    it('ACCEPT — --execute sets execute=true, dryRun=false', async () => {
+    it('ACCEPT — --execute + --accept-heuristic sets execute=true, dryRun=false, acceptHeuristic=true', async () => {
       const { parseArgs } = await import('@/../scripts/reflection-memory-cleanup.ts');
       const argv = [
         'node',
         'reflection-memory-cleanup.ts',
         '--cutoff=2026-05-28T12:55:08Z',
         '--execute',
+        '--accept-heuristic',
       ];
       const parsed = parseArgs(argv, { now: () => new Date('2026-05-29T00:00:00Z') });
       expect(parsed.execute).toBe(true);
       expect(parsed.dryRun).toBe(false);
+      expect(parsed.acceptHeuristic).toBe(true);
+    });
+
+    it('REJECTION — --execute WITHOUT --accept-heuristic throws RequiredArgsError', async () => {
+      // The cleanup predicate is a HEURISTIC (no provenance column on
+      // pre-#251 rows). `--accept-heuristic` is the forced acknowledgement
+      // that the operator has verified `tenant_id='default'` is not a real
+      // production tenant. Missing it must hard-fail with exit code 2
+      // semantics (RequiredArgsError, distinguishable from InvalidArgsError).
+      const { parseArgs, RequiredArgsError } = await import(
+        '@/../scripts/reflection-memory-cleanup.ts'
+      );
+      const argv = [
+        'node',
+        'reflection-memory-cleanup.ts',
+        '--cutoff=2026-05-28T12:55:08Z',
+        '--execute',
+      ];
+      const now = () => new Date('2026-05-29T00:00:00Z');
+      expect(() => parseArgs(argv, { now })).toThrowError(RequiredArgsError);
+      try {
+        parseArgs(argv, { now });
+      } catch (err) {
+        expect((err as { code: string }).code).toBe('MISSING_REQUIRED_ARGS');
+        expect((err as Error).message).toMatch(/--accept-heuristic/);
+        // The error message must surface the structural limitation so the
+        // operator understands WHY the flag is required, not just that it is.
+        expect((err as Error).message).toMatch(/heuristic|provenance/i);
+      }
+    });
+
+    it('ACCEPT — --accept-heuristic with default (dry-run) is allowed and harmless', async () => {
+      // The flag is meaningful only with --execute, but passing it with the
+      // default dry-run is not an error — it's just a no-op. Operators
+      // commonly leave their flag set across dry-run/execute iterations and
+      // we should not punish that workflow.
+      const { parseArgs } = await import('@/../scripts/reflection-memory-cleanup.ts');
+      const argv = [
+        'node',
+        'reflection-memory-cleanup.ts',
+        '--cutoff=2026-05-28T12:55:08Z',
+        '--accept-heuristic',
+      ];
+      const parsed = parseArgs(argv, { now: () => new Date('2026-05-29T00:00:00Z') });
+      expect(parsed.dryRun).toBe(true);
+      expect(parsed.execute).toBe(false);
+      expect(parsed.acceptHeuristic).toBe(true);
+    });
+
+    it('ACCEPT — default dry-run without --accept-heuristic also exposes acceptHeuristic=false', async () => {
+      const { parseArgs } = await import('@/../scripts/reflection-memory-cleanup.ts');
+      const argv = [
+        'node',
+        'reflection-memory-cleanup.ts',
+        '--cutoff=2026-05-28T12:55:08Z',
+      ];
+      const parsed = parseArgs(argv, { now: () => new Date('2026-05-29T00:00:00Z') });
+      expect(parsed.acceptHeuristic).toBe(false);
+      expect(parsed.dryRun).toBe(true);
     });
 
     it('ACCEPT — explicit --dry-run is accepted', async () => {
@@ -576,6 +636,37 @@ describe('Issue #260 — scripts/reflection-memory-cleanup.ts', () => {
       expect(memoryStore.find((r) => r.id === 'mem_tenantA_pre')).toBeDefined();
       // - DIFFERENT agent under the same tenant (defense-in-depth)
       expect(memoryStore.find((r) => r.id === 'mem_other_agent')).toBeDefined();
+    });
+
+    it('WARNING — runExecute prints the heuristic warning before the confirmation prompt', async () => {
+      // Belt-and-suspenders: parseArgs requires --accept-heuristic at the
+      // CLI boundary, AND runExecute prints a loud reminder right before
+      // the [y/N] prompt so the operator re-reads the limitation at the
+      // moment they're about to commit. This proves the warning is wired
+      // and contains the key terms ("heuristic", "default", "provenance").
+      seedPolluted();
+      const { runExecute } = await import('@/../scripts/reflection-memory-cleanup.ts');
+      const lines: string[] = [];
+      let confirmCalled = false;
+      await runExecute({
+        cutoff: CUTOFF,
+        executedByUser: 'op',
+        confirmReader: async () => {
+          confirmCalled = true;
+          return 'n'; // decline to keep the test focused on the warning
+        },
+        log: (m) => lines.push(m),
+      });
+      expect(confirmCalled).toBe(true);
+      // The warning block must be present and visible BEFORE the confirm
+      // prompt is invoked. We test for the canonical signal strings.
+      const joined = lines.join('\n');
+      expect(joined).toMatch(/HEURISTIC WARNING/i);
+      // Surfaces the structural cause (no provenance marker on past rows).
+      expect(joined).toMatch(/provenance|no provenance/i);
+      // Surfaces the specific risk (default may be a real production tenant).
+      expect(joined).toMatch(/default/);
+      expect(joined).toMatch(/indistinguishable|legitimate/i);
     });
 
     it('SUCCESS — appends an admin_audit_log row with the full payload', async () => {

@@ -41,10 +41,11 @@
  *      embedding was computed from `conteudo` text we may not retain
  *      elsewhere).
  *
- *   3. `--execute` is the explicit destructive flag. It prompts the
- *      operator for confirmation (`[y/N]`, default NO), then DELETEs the
- *      matching rows in batches inside a transaction. Any error mid-batch
- *      rolls back the in-flight batch and aborts.
+ *   3. `--execute` is the explicit destructive flag. It REQUIRES the
+ *      operator to also pass `--accept-heuristic` (see #5 below for why),
+ *      then prompts for confirmation (`[y/N]`, default NO), then DELETEs
+ *      the matching rows in batches inside a transaction. Any error
+ *      mid-batch rolls back the in-flight batch and aborts.
  *
  *   4. The WHERE predicate is:
  *
@@ -57,7 +58,30 @@
  *      that legitimately landed in the default bucket (e.g. an admin
  *      writing a fact under the seeded `default` tenant) are preserved.
  *
- *   5. Every executed run appends ONE audit row to `admin_audit_log` with
+ *   5. STRUCTURAL LIMITATION — the predicate is a HEURISTIC, not a
+ *      provenance check. The pre-#251 worker did NOT stamp any
+ *      `created_by='reflection-batch-v1'` marker on the rows it wrote
+ *      under default/default, so there is NO column we can read at
+ *      cleanup time to distinguish "polluted by the buggy worker" from
+ *      "legitimate reflection written under a real `default` tenant".
+ *
+ *      In practice this script is safe IFF the operator can answer "yes"
+ *      to: "I have verified that `tenant_id='default'` is not used as a
+ *      real production tenant in this environment". If `default` IS a
+ *      real tenant (seed, demo, sandbox), the script will delete its
+ *      legitimate reflection rows together with the polluted ones — they
+ *      are indistinguishable at the row level.
+ *
+ *      To force the operator to acknowledge this, `--execute` requires a
+ *      paired `--accept-heuristic` flag. The flag exists ONLY as a
+ *      forced acknowledgement; it does not change the SQL. Owner reviewed
+ *      and accepted this heuristic explicitly on issue #260 (Option A,
+ *      "hard DELETE polluted rows"); a provenance-based solution
+ *      (Option A in the PR #276 review — backfill a `created_by` column)
+ *      was rejected because no such column exists on the pre-#251 rows
+ *      and adding one now does not help past data.
+ *
+ *   6. Every executed run appends ONE audit row to `admin_audit_log` with
  *      action='reflection_memory_cleanup', resource_type='agent_memories',
  *      and a change_summary JSON containing `cutoff`, `rows_deleted`,
  *      `executed_by_user`, `started_at`, `ended_at`. This is the operator-
@@ -73,13 +97,13 @@
  *     npx tsx scripts/reflection-memory-cleanup.ts \
  *       --cutoff=2026-05-28T12:55:08Z --dry-run
  *
- *     # Execute deletion (with [y/N] confirmation prompt)
+ *     # Execute deletion (requires --accept-heuristic + [y/N] confirmation)
  *     npx tsx scripts/reflection-memory-cleanup.ts \
- *       --cutoff=2026-05-28T12:55:08Z --execute
+ *       --cutoff=2026-05-28T12:55:08Z --execute --accept-heuristic
  *
  *     # Custom batch size (default 1000 per COMMIT)
  *     npx tsx scripts/reflection-memory-cleanup.ts \
- *       --cutoff=2026-05-28T12:55:08Z --execute --limit=500
+ *       --cutoff=2026-05-28T12:55:08Z --execute --accept-heuristic --limit=500
  *
  *   The cutoff above is the merge time of PR #251 (commit 4102556a — the
  *   `reflection-batch` per-tenant context fix). Anything earlier was
@@ -89,8 +113,9 @@
  * EXIT CODES:
  *
  *     0  — success (counted in dry-run, or deleted in execute mode)
- *     2  — usage error: missing/invalid --cutoff, conflicting flags, or
- *          confirmation declined
+ *     2  — usage error: missing/invalid --cutoff, conflicting flags,
+ *          `--execute` without `--accept-heuristic`, or confirmation
+ *          declined
  *     1  — unexpected error during execution (DB failure, etc.)
  */
 import { db } from '@/db/client.js';
@@ -165,6 +190,7 @@ export type ParsedArgs = {
   execute: boolean;
   dryRun: boolean;
   limit: number;
+  acceptHeuristic: boolean;
 };
 
 /**
@@ -183,6 +209,12 @@ export type ParsedArgs = {
  *     just gets a count — they don't accidentally wipe anything.
  *   - `--limit` must be a positive integer if present; defaults to
  *     `DEFAULT_BATCH_SIZE`.
+ *   - `--execute` REQUIRES `--accept-heuristic`. The cleanup predicate is
+ *     a heuristic (no provenance column on past rows; see file docblock
+ *     section #5), so the operator MUST positively acknowledge that
+ *     `tenant_id='default'` is not a real production tenant in this
+ *     environment. `--execute` without `--accept-heuristic` is rejected
+ *     with `RequiredArgsError`.
  */
 export function parseArgs(
   argv: string[],
@@ -216,6 +248,19 @@ export function parseArgs(
   // Default to dry-run when neither flag is present.
   const dryRun = !execute;
 
+  const acceptHeuristic = hasFlag(argv, 'accept-heuristic');
+  if (execute && !acceptHeuristic) {
+    throw new RequiredArgsError(
+      '--execute requires --accept-heuristic. The cleanup predicate is a ' +
+        "heuristic, not a provenance check: rows are matched by (tenant='default', " +
+        "agent='default', tipo='reflexao', created_at<cutoff), which is " +
+        'indistinguishable from a legitimate reflection written under a real ' +
+        "`default` tenant. Pass --accept-heuristic to acknowledge you have " +
+        "verified that `tenant_id='default'` is NOT a real production tenant in " +
+        'this environment. See the file docblock (section #5) for details.',
+    );
+  }
+
   const limitRaw = arg(argv, 'limit');
   let limit = DEFAULT_BATCH_SIZE;
   if (limitRaw !== undefined) {
@@ -228,20 +273,24 @@ export function parseArgs(
     limit = parsed;
   }
 
-  return { cutoff, cutoffRaw, execute, dryRun, limit };
+  return { cutoff, cutoffRaw, execute, dryRun, limit, acceptHeuristic };
 }
 
 function printUsage(extra?: string): void {
   if (extra) console.error(extra);
   console.error(
-    'usage: npx tsx scripts/reflection-memory-cleanup.ts --cutoff=<ISO_DATETIME> [--dry-run|--execute] [--limit=<N>]',
+    'usage: npx tsx scripts/reflection-memory-cleanup.ts --cutoff=<ISO_DATETIME> [--dry-run|--execute --accept-heuristic] [--limit=<N>]',
   );
   console.error('');
-  console.error('  --cutoff=<ISO>    REQUIRED. Rows with created_at < cutoff are in scope.');
-  console.error('                    Recommended: PR #251 merge time (2026-05-28T12:55:08Z).');
-  console.error('  --dry-run         DEFAULT. Count and sample, do NOT delete.');
-  console.error('  --execute         Destructive. Prompts [y/N] then deletes.');
-  console.error('  --limit=<N>       Batch size for DELETE loop. Default: ' + DEFAULT_BATCH_SIZE + '.');
+  console.error('  --cutoff=<ISO>        REQUIRED. Rows with created_at < cutoff are in scope.');
+  console.error('                        Recommended: PR #251 merge time (2026-05-28T12:55:08Z).');
+  console.error('  --dry-run             DEFAULT. Count and sample, do NOT delete.');
+  console.error('  --execute             Destructive. Prompts [y/N] then deletes.');
+  console.error('  --accept-heuristic    REQUIRED with --execute. Acknowledges that the');
+  console.error('                        predicate is heuristic (no provenance marker on');
+  console.error("                        past rows) and that tenant_id='default' is NOT");
+  console.error('                        a real production tenant in this environment.');
+  console.error('  --limit=<N>           Batch size for DELETE loop. Default: ' + DEFAULT_BATCH_SIZE + '.');
   console.error('');
   console.error('See file header docblock for the full contract (issue #260).');
 }
@@ -595,6 +644,22 @@ export async function runExecute(args: {
     log('Nothing to delete. Exiting cleanly.');
     return { confirmed: true, result: { rowsDeleted: 0, batches: 0, startedAt: new Date().toISOString(), endedAt: new Date().toISOString() } };
   }
+
+  // HEURISTIC WARNING — printed loud, every execute run, so the operator
+  // re-reads it AT confirm time, not just at flag-parse time. The flag-time
+  // check (parseArgs) catches the missing acknowledgement; this line keeps
+  // the limitation in front of the operator even with the flag set.
+  log('');
+  log('!!! HEURISTIC WARNING !!!');
+  log("The cleanup predicate matches rows by (tenant='default', agent='default',");
+  log("tipo='reflexao', created_at<cutoff) — there is NO provenance marker on the");
+  log("pre-#251 rows. If `tenant_id='default'` is a real production tenant in this");
+  log('environment, this DELETE will remove its legitimate reflections together with');
+  log('the polluted ones. They are indistinguishable at the row level.');
+  log('');
+  log('You passed --accept-heuristic; by answering [y] below you are confirming AGAIN');
+  log("that `default` is not a real tenant here. See issue #260 + file docblock #5.");
+  log('');
 
   const confirmed = await confirmDestructive({
     prompt: 'Are you sure? [y/N] ',
