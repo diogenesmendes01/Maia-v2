@@ -282,10 +282,35 @@ export class KnowledgeStateMachine {
    * terminal absolute. Calling revoke on an already-revoked row is
    * an idempotent no-op (returns a synthetic record marking the
    * existing state).
+   *
+   * Concurrency (issue #256 — revalidation of PR #243):
+   *   Under 3+ concurrent actors mutating the same row, the previous
+   *   single-shot retry could lose the race: writer A revokes, writer B
+   *   transitions back to active, writer C (our revoke) re-reads
+   *   `active`, then writer A revokes again before C's retry lands —
+   *   C's retry sees `revoked` again and throws KnowledgeConflictError
+   *   to the caller, breaking the idempotency contract.
+   *
+   *   Fix: bounded retry loop. Up to MAX_REVOKE_RETRIES attempts; on
+   *   each conflict we re-read the row, short-circuit if it's already
+   *   `revoked`, otherwise try again against the freshly observed
+   *   status. Small exponential backoff (10ms, 30ms) absorbs the
+   *   contention window without unbounded waits. If MAX_REVOKE_RETRIES
+   *   is exhausted (continuous concurrent mutation), the final
+   *   KnowledgeConflictError surfaces to the caller — at that point the
+   *   row is being mutated so aggressively that the caller needs to
+   *   decide whether to give up or wrap in its own retry.
+   *
+   *   Audit-emit semantics: we log ONCE at the end of the call (after
+   *   success or after the early-exit idempotent branch). No
+   *   double-emit on retry; the `attempts` field records how many tries
+   *   it took to land.
    */
   static async revoke(
     args: KnowledgeRevokeInput,
   ): Promise<KnowledgeRevokeResult> {
+    const MAX_REVOKE_RETRIES = 3;
+
     const current = await knowledgeRepos.findById(args.kind, args.proposal_id);
     if (!current) {
       throw new Error(
@@ -303,27 +328,44 @@ export class KnowledgeStateMachine {
       };
     }
 
-    const transition: KnowledgeTransitionRecord = {
-      from: current.lifecycle_status,
-      to: 'revoked',
-      at: new Date().toISOString(),
-      reason: args.reason,
-      decided_by: args.decided_by,
-    };
+    let observed = current;
+    let lastConflict: KnowledgeConflictError | undefined;
 
-    // Revoke wins on conflict: if another writer transitioned the row
-    // first, we re-read once. If the row is now revoked, treat as
-    // idempotent. Otherwise, re-attempt the revoke against the newly
-    // observed status — revoke is allowed from any non-terminal state,
-    // so the second try succeeds (or the row was already revoked).
-    try {
-      await knowledgeRepos.update(args.kind, args.proposal_id, {
-        lifecycle_status: 'revoked',
-        lifecycle_transitions: [...current.lifecycle_transitions, transition],
-        expected_previous_status: current.lifecycle_status,
-      });
-    } catch (err) {
-      if (err instanceof KnowledgeConflictError) {
+    for (let attempt = 0; attempt < MAX_REVOKE_RETRIES; attempt++) {
+      const transition: KnowledgeTransitionRecord = {
+        from: observed.lifecycle_status,
+        to: 'revoked',
+        at: new Date().toISOString(),
+        reason: args.reason,
+        decided_by: args.decided_by,
+      };
+
+      try {
+        await knowledgeRepos.update(args.kind, args.proposal_id, {
+          lifecycle_status: 'revoked',
+          lifecycle_transitions: [
+            ...observed.lifecycle_transitions,
+            transition,
+          ],
+          expected_previous_status: observed.lifecycle_status,
+        });
+        logger.warn(
+          {
+            proposal_id: args.proposal_id,
+            kind: args.kind,
+            from: observed.lifecycle_status,
+            reason: args.reason,
+            decided_by: args.decided_by,
+            attempts: attempt + 1,
+          },
+          'knowledge_state_machine.revoked',
+        );
+        return transition;
+      } catch (err) {
+        if (!(err instanceof KnowledgeConflictError)) throw err;
+        lastConflict = err;
+
+        // Re-read to see what the row actually became.
         const fresh = await knowledgeRepos.findById(
           args.kind,
           args.proposal_id,
@@ -344,53 +386,33 @@ export class KnowledgeStateMachine {
             decided_by: 'idempotent',
           };
         }
-        // Retry against the new observed status. Revoke is allowed from
-        // every non-terminal state in ALLOWED_TRANSITIONS, so the
-        // second try will succeed unless another concurrent revoke
-        // beat us again — in which case the re-read above catches it.
-        const retryTransition: KnowledgeTransitionRecord = {
-          from: fresh.lifecycle_status,
-          to: 'revoked',
-          at: new Date().toISOString(),
-          reason: args.reason,
-          decided_by: args.decided_by,
-        };
-        await knowledgeRepos.update(args.kind, args.proposal_id, {
-          lifecycle_status: 'revoked',
-          lifecycle_transitions: [
-            ...fresh.lifecycle_transitions,
-            retryTransition,
-          ],
-          expected_previous_status: fresh.lifecycle_status,
-        });
-        logger.warn(
-          {
-            proposal_id: args.proposal_id,
-            kind: args.kind,
-            from: fresh.lifecycle_status,
-            reason: args.reason,
-            decided_by: args.decided_by,
-            retried: true,
-          },
-          'knowledge_state_machine.revoked',
-        );
-        return retryTransition;
+        observed = fresh;
+
+        // Small exponential backoff between attempts (10ms, 30ms) to
+        // absorb the contention window. No sleep after the last attempt
+        // (we'll throw lastConflict).
+        if (attempt < MAX_REVOKE_RETRIES - 1) {
+          const delayMs = 10 * Math.pow(3, attempt);
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        }
       }
-      throw err;
     }
 
+    // MAX_REVOKE_RETRIES exhausted under continuous concurrent mutation.
+    // Surface the last conflict so the caller can decide (e.g.
+    // incident-response operators may want to retry manually; workers
+    // typically skip and move on).
     logger.warn(
       {
         proposal_id: args.proposal_id,
         kind: args.kind,
-        from: current.lifecycle_status,
         reason: args.reason,
         decided_by: args.decided_by,
+        attempts: MAX_REVOKE_RETRIES,
       },
-      'knowledge_state_machine.revoked',
+      'knowledge_state_machine.revoke_exhausted_retries',
     );
-
-    return transition;
+    throw lastConflict ?? new Error('knowledge_state_machine.revoke:unreachable');
   }
 }
 
