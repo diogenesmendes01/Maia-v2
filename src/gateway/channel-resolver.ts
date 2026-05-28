@@ -39,11 +39,16 @@ export type ChannelResolutionFailureContext = {
   channel_type: string;
   external_id: string;
   /** Which fallback branch tripped — useful for audit/triage. */
-  resolver_path: 'legacy_flag_off' | 'unknown_or_inactive_channel';
+  resolver_path:
+    | 'legacy_flag_off'
+    | 'unknown_or_inactive_channel'
+    | 'ambiguous_active_channels';
   /** When `unknown_or_inactive_channel`: did we find a row at all? */
   found?: boolean;
   /** When `unknown_or_inactive_channel`: was the row marked active? */
   active?: boolean;
+  /** When `ambiguous_active_channels`: which tenants are conflicting. */
+  conflicting_tenant_ids?: string[];
 };
 
 export async function resolveChannel(args: {
@@ -71,6 +76,12 @@ export async function resolveChannel(args: {
 
   // 2. Lookup cross-tenant (único método autorizado a bypassar tenant guard,
   //    pois aqui ainda não há contexto — estamos justamente descobrindo qual).
+  //
+  //    [Codex review #277] O repo agora itera matches preferindo `active=true`
+  //    e lança `channel_resolution_failed` (resolver_path: ambiguous_active_channels)
+  //    se houver 2+ canais ativos em tenants distintos para o mesmo
+  //    (channel_type, external_id). Não capturamos aqui — o try/catch do caller
+  //    em `agent/core.ts` já emite o audit padrão.
   const channel = await channelsRepo.findByExternalCrossTenant({
     channel_type: args.channel_type,
     external_id: args.external_id,

@@ -267,6 +267,32 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
       // default/default — that's exactly the bypass issue #268 closed.
       throw err;
     }
+
+    // [Codex review #277] Adoption helper — bridge the baileys/resolver gap.
+    //
+    // Baileys ingress persists every inbound under (default, default) — it has
+    // no tenant context to use (the resolver only runs HERE, after persistence).
+    // Without adoption, the inner findById (tenant-scoped) would return null
+    // because the row still carries (default, default), not the resolved
+    // (tenant_id, agent_id). Every successfully-resolved message would then
+    // bounce off `agent.message_not_found` and the turn would silently drop —
+    // functionally identical to the bug issue #268 closed.
+    //
+    // Adoption bypasses the tenant guard via `adoptToResolvedTenantCrossTenant`
+    // — same sanctioned pattern as `channelsRepo.findByExternalCrossTenant`:
+    // the entry point legitimately operates without a tenant context (it is
+    // the one DISCOVERING which tenant owns the row). Once adopted, all
+    // downstream reads inside `runWithTenantContext` see the resolved triplet.
+    //
+    // Idempotency: re-running with the same target tenant/agent is a no-op at
+    // the SQL level (UPDATE writing identical values). Safe for BullMQ retries.
+    if (resolved.tenant_id !== 'default' || resolved.agent_id !== 'default') {
+      await mensagensRepo.adoptToResolvedTenantCrossTenant({
+        id: mensagem_id,
+        tenant_id: resolved.tenant_id,
+        agent_id: resolved.agent_id,
+      });
+    }
   }
 
   await runWithTenantContext(

@@ -5126,6 +5126,28 @@ export const channelsRepo = {
   // EXPLICITLY bypasses applyTenantGuard — used by resolver (entry point,
   // before context exists). The (channel_type, external_id) lookup discovers
   // which tenant/agent owns the inbound message.
+  //
+  // [Codex review #277] UNIQUE in `migrations/031_p6_channels.sql` is
+  // `(tenant_id, channel_type, external_id)` — same (channel_type, external_id)
+  // CAN coexist across distinct tenants (e.g., a number switching providers,
+  // or a tenant deactivating an old channel before another tenant claims it).
+  // A naive `limit(1)` would arbitrarily pick one row, and if the resolver
+  // landed on the inactive one it would reject a message belonging to the
+  // active tenant — silently dropping legitimate traffic.
+  //
+  // Strategy: fetch ALL matches, then collapse:
+  //   - 0 active rows → return any inactive (resolver will throw with
+  //     found:true, active:false → unknown_or_inactive_channel audit).
+  //   - 1 active row  → return it (the only sensible owner).
+  //   - 2+ active rows → cross-tenant ambiguity. Surface explicitly via
+  //     TypedError so the channel ownership conflict is visible in
+  //     audit/triage rather than being masked by a non-deterministic pick.
+  //     The PROPER fix is an operator deactivating one side; the resolver
+  //     refusing to choose is the fail-loud counterpart of the rate-limit
+  //     bucket collapse that issue #268 closed.
+  //
+  // Cardinality is bounded by `channels_external_idx` and in practice expected
+  // to be ≤ 2 (one prior, one current); fetching all rows is O(few).
   async findByExternalCrossTenant(args: {
     channel_type: string;
     external_id: string;
@@ -5138,9 +5160,30 @@ export const channelsRepo = {
           eq(channels.channel_type, args.channel_type),
           eq(channels.external_id, args.external_id),
         ),
-      )
-      .limit(1);
-    return rows[0] ?? null;
+      );
+    if (rows.length === 0) return null;
+
+    const activeRows = rows.filter((r) => r.active);
+    if (activeRows.length === 0) {
+      // No active owner — return any inactive to preserve the (found:true,
+      // active:false) audit signature the resolver expects.
+      return rows[0]!;
+    }
+    if (activeRows.length > 1) {
+      // Multiple active tenants claim the same external_id — refuse to choose.
+      // Caller (resolveChannel) wraps this in the standard fail-loud path.
+      throw new TypedError(
+        'channel_resolution_failed',
+        'channel ownership ambiguous: multiple active channels match (channel_type, external_id)',
+        {
+          channel_type: args.channel_type,
+          external_id: args.external_id,
+          resolver_path: 'ambiguous_active_channels',
+          conflicting_tenant_ids: activeRows.map((r) => r.tenant_id),
+        },
+      );
+    }
+    return activeRows[0]!;
   },
 
   async listActive(): Promise<Channel[]> {

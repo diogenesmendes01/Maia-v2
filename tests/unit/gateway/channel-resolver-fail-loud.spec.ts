@@ -227,6 +227,40 @@ describe('resolveChannel — fail-loud (issue #268)', () => {
     });
   });
 
+  describe('ambiguous lookup — multiple active matches (issue #268 reval)', () => {
+    it('repo lança ambiguous_active_channels → resolver propaga, audit/triagem visível', async () => {
+      // O resolver não captura o throw do repo — o caller (agent/core.ts)
+      // captura via try/catch padrão. Aqui simulamos o throw direto do repo.
+      featureFlags.override(FeatureFlagName.MULTI_CHANNEL, true);
+      const ambiguous = new TypedError(
+        'channel_resolution_failed',
+        'channel ownership ambiguous: multiple active channels match (channel_type, external_id)',
+        {
+          channel_type: 'whatsapp',
+          external_id: '5511999999999',
+          resolver_path: 'ambiguous_active_channels',
+          conflicting_tenant_ids: ['tenant-a', 'tenant-b'],
+        },
+      );
+      findByExternalCrossTenantMock.mockRejectedValueOnce(ambiguous);
+
+      const { resolveChannel } = await import('@/gateway/channel-resolver.js');
+      const promise = resolveChannel({
+        channel_type: 'whatsapp',
+        external_id: '5511999999999',
+      });
+
+      await expect(promise).rejects.toBeInstanceOf(TypedError);
+      await expect(promise).rejects.toMatchObject({
+        code: 'channel_resolution_failed',
+        details: {
+          resolver_path: 'ambiguous_active_channels',
+          conflicting_tenant_ids: ['tenant-a', 'tenant-b'],
+        },
+      });
+    });
+  });
+
   describe('isolation invariant', () => {
     it('NUNCA retorna {tenant_id: "default", agent_id: "default"} — qualquer path que faria isso lança erro', async () => {
       // Itera os 3 caminhos que ANTES colapsavam em default/default.

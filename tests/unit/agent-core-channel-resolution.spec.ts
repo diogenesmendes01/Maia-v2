@@ -31,6 +31,7 @@ const {
   auditMock,
   loggerMock,
   findMensagemMock,
+  adoptToResolvedTenantMock,
   runWithTenantContextMock,
   buildPromptMock,
   runReActLoopMock,
@@ -47,6 +48,7 @@ const {
     error: vi.fn(),
   };
   const findMensagemMock = vi.fn();
+  const adoptToResolvedTenantMock = vi.fn().mockResolvedValue(undefined);
   const runWithTenantContextMock = vi.fn(
     async (_ctx: unknown, fn: () => Promise<unknown>) => fn(),
   );
@@ -63,6 +65,7 @@ const {
     auditMock,
     loggerMock,
     findMensagemMock,
+    adoptToResolvedTenantMock,
     runWithTenantContextMock,
     buildPromptMock,
     runReActLoopMock,
@@ -122,6 +125,7 @@ vi.mock('@/db/repositories.js', () => ({
     setConversaId: vi.fn().mockResolvedValue(undefined),
     setConversaIdMany: vi.fn().mockResolvedValue(undefined),
     listUnprocessedByTelefone: vi.fn().mockResolvedValue([]),
+    adoptToResolvedTenantCrossTenant: adoptToResolvedTenantMock,
   },
   conversasRepo: {
     touch: vi.fn().mockResolvedValue(undefined),
@@ -315,12 +319,24 @@ describe('runAgentForMensagem — channel resolution fail-loud (issue #268)', ()
     });
   });
 
-  it('Flag ON + resolveChannel sucesso → tenant/agent reais, sem audit de falha', async () => {
+  it('Flag ON + resolveChannel sucesso → tenant/agent reais, sem audit de falha, adoção chamada ANTES do runWithTenantContext', async () => {
     isMultiChannelOn.value = true;
     resolveChannelMock.mockResolvedValueOnce({
       tenant_id: 'tenant-acme',
       agent_id: 'agent-main',
       channel_id: 'ch-abc',
+    });
+
+    // Track ordem de chamadas: a adoção tem que rodar ANTES do
+    // runWithTenantContext, senão o findById tenant-scoped lá dentro
+    // veria a row ainda em default/default e retornaria null.
+    const callOrder: string[] = [];
+    adoptToResolvedTenantMock.mockImplementationOnce(async () => {
+      callOrder.push('adopt');
+    });
+    runWithTenantContextMock.mockImplementationOnce(async (_ctx, fn) => {
+      callOrder.push('runWithTenantContext');
+      return fn();
     });
 
     const { runAgentForMensagem } = await import('@/agent/core.js');
@@ -331,11 +347,64 @@ describe('runAgentForMensagem — channel resolution fail-loud (issue #268)', ()
       (call) => call[0]?.acao === 'channel_resolution_failed',
     );
     expect(failedAudits).toHaveLength(0);
+
+    // [Codex review #277] Adoção: move row de default/default → tenant resolvido
+    // ANTES de entrar no contexto tenant-scoped (caso contrário findById retorna
+    // null porque baileys persistiu o inbound em default/default).
+    expect(adoptToResolvedTenantMock).toHaveBeenCalledTimes(1);
+    expect(adoptToResolvedTenantMock).toHaveBeenCalledWith({
+      id: 'msg1',
+      tenant_id: 'tenant-acme',
+      agent_id: 'agent-main',
+    });
+    expect(callOrder).toEqual(['adopt', 'runWithTenantContext']);
+
     expect(runWithTenantContextMock).toHaveBeenCalled();
     expect(runWithTenantContextMock.mock.calls[0]![0]).toEqual({
       tenant_id: 'tenant-acme',
       agent_id: 'agent-main',
     });
+  });
+
+  it('Flag ON + resolveChannel devolve default/default (cenário degenerado) → adoção NÃO é chamada (no-op skip)', async () => {
+    // Defensive: a resolução de um canal legítimo NUNCA deveria retornar
+    // 'default'/'default' (channels seedados sempre têm tenant/agent reais).
+    // Mas se algum dia retornar, queremos garantir que NÃO chamamos adopção —
+    // seria um UPDATE no-op que mascara o real estado e poluiria logs.
+    isMultiChannelOn.value = true;
+    resolveChannelMock.mockResolvedValueOnce({
+      tenant_id: 'default',
+      agent_id: 'default',
+      channel_id: 'ch-degenerate',
+    });
+
+    const { runAgentForMensagem } = await import('@/agent/core.js');
+    await runAgentForMensagem('msg1');
+
+    expect(resolveChannelMock).toHaveBeenCalledTimes(1);
+    expect(adoptToResolvedTenantMock).not.toHaveBeenCalled();
+    expect(runWithTenantContextMock).toHaveBeenCalled();
+    expect(runWithTenantContextMock.mock.calls[0]![0]).toEqual({
+      tenant_id: 'default',
+      agent_id: 'default',
+    });
+  });
+
+  it('Flag ON + resolveChannel throw → adoção NÃO é chamada (não há tenant resolvido)', async () => {
+    isMultiChannelOn.value = true;
+    const { TypedError } = await import('@/lib/utils.js');
+    resolveChannelMock.mockRejectedValueOnce(
+      new TypedError(
+        'channel_resolution_failed',
+        'channel not found or inactive',
+        { resolver_path: 'unknown_or_inactive_channel' },
+      ),
+    );
+
+    const { runAgentForMensagem } = await import('@/agent/core.js');
+    await expect(runAgentForMensagem('msg1')).rejects.toBeInstanceOf(TypedError);
+
+    expect(adoptToResolvedTenantMock).not.toHaveBeenCalled();
   });
 
   it('Flag ON + resolveChannel throw → emite audit channel_resolution_failed e propaga o erro', async () => {
