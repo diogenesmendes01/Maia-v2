@@ -526,13 +526,27 @@ export const outbound_messages = pgTable(
       .default(sql`(now() + INTERVAL '30 days')`),
   },
   (t) => ({
-    // Composite UNIQUE — the atomic-claim conflict target. Same pattern
+    // Composite UNIQUE — same-content cross-retry dedupe. Same pattern
     // as #232/#237 (rules_repo, agent_memories). Never UNIQUE on key
     // alone (cross-tenant collision risk).
     by_tenant_agent_key: uniqueIndex('idx_outbound_messages_tenant_agent_key').on(
       t.tenant_id,
       t.agent_id,
       t.idempotency_key,
+    ),
+    // TURN-LEVEL UNIQUE — atomic-claim conflict target. Closes the
+    // "same-turn / different-content double-send" race: two workers
+    // for the same (conversa_id, in_reply_to) generating different
+    // content (different keys) used to each claim their own row and
+    // BOTH send. This constraint enforces AT MOST ONE row per turn
+    // across all idempotency keys. The repo's `upsertPending` targets
+    // this constraint via ON CONFLICT; the per-key UNIQUE stays for
+    // cross-turn same-content dedupe. See migration 065.
+    by_turn_uniq: unique('outbound_messages_turn_uniq').on(
+      t.tenant_id,
+      t.agent_id,
+      t.conversa_id,
+      t.in_reply_to,
     ),
     by_turn_lookup: index('idx_outbound_messages_turn_lookup').on(
       t.conversa_id,

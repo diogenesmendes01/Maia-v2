@@ -77,24 +77,45 @@ vi.mock('@/db/repositories/outbound-messages-repo.js', () => ({
       conversa_id: string;
       in_reply_to: string;
     }) {
-      const existing = hoisted.ledger.get(args.idempotency_key);
+      // Turn-level UNIQUE — key the fake by `(conversa_id,
+      // in_reply_to)` to mirror the prod
+      // `ON CONFLICT ON CONSTRAINT outbound_messages_turn_uniq`. A
+      // same-turn / different-content racer hits THIS branch and the
+      // loser sees `existing_key !== candidate_key`.
+      const turnKey = `${args.conversa_id}::${args.in_reply_to}`;
+      const existing = hoisted.ledger.get(turnKey);
       if (existing) {
-        // Mirror the production behaviour: if `sent` → skip+inserted=false;
-        // if `failed` → reclaim (inserted=false but the prod ON CONFLICT
-        // overwrites in place; we reset to pending here for parity);
-        // otherwise (pending/unknown, recent) → inserted=false, no
-        // overwrite.
         if (existing.status === 'sent') {
-          return { row: existing, inserted: false, skip: true };
+          return {
+            row: existing,
+            inserted: false,
+            skip: true,
+            existing_key: existing.idempotency_key,
+          };
         }
         if (existing.status === 'failed') {
+          // Reclaim — the new content's key takes over the turn slot.
+          existing.idempotency_key = args.idempotency_key;
           existing.status = 'pending';
           existing.error = null;
           existing.provider_message_id = null;
-          return { row: existing, inserted: false, skip: false };
+          return {
+            row: existing,
+            inserted: false,
+            skip: false,
+            existing_key: args.idempotency_key,
+          };
         }
-        // pending/unknown → loser sees the row, does NOT take.
-        return { row: existing, inserted: false, skip: false };
+        // pending/unknown → loser sees the row, does NOT take. The
+        // row's idempotency_key is the CURRENT holder's key (the
+        // earlier inserter). This is what lets the caller detect
+        // same-turn / different-content races.
+        return {
+          row: existing,
+          inserted: false,
+          skip: false,
+          existing_key: existing.idempotency_key,
+        };
       }
       const row: LedgerRow = {
         idempotency_key: args.idempotency_key,
@@ -105,11 +126,15 @@ vi.mock('@/db/repositories/outbound-messages-repo.js', () => ({
         sent_at: null,
         error: null,
       };
-      hoisted.ledger.set(args.idempotency_key, row);
-      return { row, inserted: true, skip: false };
+      hoisted.ledger.set(turnKey, row);
+      return { row, inserted: true, skip: false, existing_key: args.idempotency_key };
     },
     async markSent(args: { idempotency_key: string; provider_message_id: string | null; sent_at: Date }) {
-      const r = hoisted.ledger.get(args.idempotency_key);
+      // Per-key lookup mirrors prod: prod queries by
+      // (tenant_id, agent_id, idempotency_key).
+      const r = Array.from(hoisted.ledger.values()).find(
+        (row) => row.idempotency_key === args.idempotency_key,
+      );
       if (!r) return;
       r.status = 'sent';
       r.provider_message_id = args.provider_message_id;
@@ -117,7 +142,9 @@ vi.mock('@/db/repositories/outbound-messages-repo.js', () => ({
       r.error = null;
     },
     async markFailed(args: { idempotency_key: string; error: string }) {
-      const r = hoisted.ledger.get(args.idempotency_key);
+      const r = Array.from(hoisted.ledger.values()).find(
+        (row) => row.idempotency_key === args.idempotency_key,
+      );
       if (!r) return;
       // CAS — refuse to degrade sent/unknown.
       if (r.status === 'sent' || r.status === 'unknown') return;
@@ -125,7 +152,9 @@ vi.mock('@/db/repositories/outbound-messages-repo.js', () => ({
       r.error = args.error;
     },
     async markUnknown(args: { idempotency_key: string; error: string }) {
-      const r = hoisted.ledger.get(args.idempotency_key);
+      const r = Array.from(hoisted.ledger.values()).find(
+        (row) => row.idempotency_key === args.idempotency_key,
+      );
       if (!r) return;
       // CAS — refuse to degrade sent/unknown.
       if (r.status === 'sent' || r.status === 'unknown') return;
@@ -133,10 +162,8 @@ vi.mock('@/db/repositories/outbound-messages-repo.js', () => ({
       r.error = args.error;
     },
     async findByConversaTurn(args: { conversa_id: string; in_reply_to: string }) {
-      const matches = Array.from(hoisted.ledger.values()).filter(
-        (r) => r.conversa_id === args.conversa_id && r.in_reply_to === args.in_reply_to,
-      );
-      return matches[matches.length - 1] ?? null;
+      const turnKey = `${args.conversa_id}::${args.in_reply_to}`;
+      return hoisted.ledger.get(turnKey) ?? null;
     },
   },
 }));
@@ -394,29 +421,53 @@ describe('sendOutbound — retry with same key while sent → returns early, no 
     expect(mensagensRepoFake.create).not.toHaveBeenCalled();
   });
 
-  it('different text for SAME turn does NOT skip (different idempotency_key)', async () => {
-    baileysFake.sendOutboundText
-      .mockResolvedValueOnce('wa-first')
-      .mockResolvedValueOnce('wa-second');
+  it('different text for SAME turn IS DROPPED (terminal-skip via turn-level UNIQUE)', async () => {
+    // Updated expectation after turn-level UNIQUE landed.
+    //
+    // Before: two completions for the same turn with different text
+    // would each claim a distinct idempotency_key row and BOTH would
+    // send → double-send.
+    //
+    // After: both writers conflict on
+    // `(tenant_id, agent_id, conversa_id, in_reply_to)`. The first
+    // claims the row; the second sees `existing_key !== candidate_key`
+    // and DROPS its send (terminal-skip, audit emitted). Owner's
+    // "zero double-send" choice.
+    baileysFake.sendOutboundText.mockResolvedValueOnce('wa-first');
 
     await sendOutbound(PESSOA.id, CONV, 'first text', TURN);
     expect(baileysFake.sendOutboundText).toHaveBeenCalledTimes(1);
 
-    await sendOutbound(PESSOA.id, CONV, 'second text', TURN);
-    expect(baileysFake.sendOutboundText).toHaveBeenCalledTimes(2);
+    // Second call with DIFFERENT content for the same turn must
+    // throw OutboundDeliveryError(ambiguous:true) — caller should
+    // funnel this through safeDispatchOutput in production. The
+    // provider is NOT invoked.
+    baileysFake.sendOutboundText.mockClear();
+    // First send marked the row as `sent`. A different-content retry
+    // for the same turn now sees a SENT prior row (skip=true) and
+    // returns the prior provider_message_id WITHOUT a provider call.
+    // (The "racing-against-pending" different-content scenario is
+    // covered in the repo-level same-turn-different-content tests.)
+    const wid2 = await sendOutbound(PESSOA.id, CONV, 'second text', TURN);
+    expect(baileysFake.sendOutboundText).not.toHaveBeenCalled();
+    expect(wid2).toBe('wa-first');
   });
 });
 
 describe('sendOutbound — concurrent same-turn claim → loser does NOT invoke provider', () => {
-  it('a `inserted=false, skip=false` claim with pending status causes early-return (no provider call)', async () => {
-    // Pre-seed a pending row (simulating another worker holding the claim).
+  it('a `inserted=false, skip=false` claim with pending status (SAME content key) causes early-return (no provider call)', async () => {
+    // Pre-seed a pending row (simulating another worker holding the
+    // claim with the SAME content key — idempotent same-content
+    // race, not the same-turn / different-content race).
     const key = computeOutboundIdempotencyKey({
       conversa_id: CONV,
       in_reply_to: TURN,
       text: TEXT,
       modality: 'text',
     });
-    ledger.set(key, {
+    // Fake's storage key is `${conversa}::${in_reply_to}` to mirror
+    // the turn-level UNIQUE on `outbound_messages`.
+    ledger.set(`${CONV}::${TURN}`, {
       idempotency_key: key,
       conversa_id: CONV,
       in_reply_to: TURN,
@@ -586,13 +637,28 @@ describe('sendOutboundPoll — poll modality goes through ledger', () => {
     expect(row?.idempotency_key).toBe(pollKey);
   });
 
-  it('text + voice + document + poll all have independent ledger rows for same turn', async () => {
-    // Text first.
+  it('text modality writes a ledger row keyed by the modality-aware idempotency key', async () => {
+    // After the turn-level UNIQUE landed: AT MOST ONE row per turn
+    // across all modalities. The "4 independent rows for the same
+    // turn" pre-condition is no longer reachable (it was always a
+    // theoretical scenario — in practice dispatchOutput picks ONE
+    // modality per turn via the precedence ladder). We now assert
+    // the realistic invariant: the chosen modality's send writes
+    // the row with its modality-specific idempotency_key.
     baileysFake.sendOutboundText.mockResolvedValue('wa-txt');
     await sendOutbound(PESSOA.id, CONV, 'shared text', TURN);
 
-    // Each modality has its own idempotency key → 4 independent rows.
-    const txtKey = computeOutboundIdempotencyKey({ conversa_id: CONV, in_reply_to: TURN, text: 'shared text', modality: 'text' });
-    expect(ledger.get(txtKey)?.status).toBe('sent');
+    const txtKey = computeOutboundIdempotencyKey({
+      conversa_id: CONV,
+      in_reply_to: TURN,
+      text: 'shared text',
+      modality: 'text',
+    });
+    const row = await outboundMessagesRepo.findByConversaTurn({
+      conversa_id: CONV,
+      in_reply_to: TURN,
+    });
+    expect(row?.status).toBe('sent');
+    expect(row?.idempotency_key).toBe(txtKey);
   });
 });

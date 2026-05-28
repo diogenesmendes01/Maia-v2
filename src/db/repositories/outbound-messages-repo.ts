@@ -15,13 +15,25 @@
  *      pattern: A-first AND B-first ordering).
  *
  *   2. Atomic pre-send claim (`upsertPending`) — uses Postgres-native
- *      `INSERT ... ON CONFLICT (tenant_id, agent_id, idempotency_key)
+ *      `INSERT ... ON CONFLICT ON CONSTRAINT outbound_messages_turn_uniq
  *      DO UPDATE` with a WHERE clause that ONLY overwrites a stale
  *      pending row (created_at older than the 30s stale threshold) OR
- *      a `failed` row. The RETURNING clause exposes `xmax = 0` so the
- *      caller knows whether IT inserted (claim winner) or saw a prior
- *      row (loser / dedupe). This handles atomically:
- *        - Race A/B same turn → one inserts, the other sees existing.
+ *      a `failed` row. The conflict target is the TURN-LEVEL UNIQUE
+ *      `(tenant_id, agent_id, conversa_id, in_reply_to)` — picked so
+ *      a same-turn / different-content race (two workers, different
+ *      idempotency_keys, same turn) is caught here too: both writers
+ *      conflict on the TURN even when their keys differ. The
+ *      per-key UNIQUE
+ *      `(tenant_id, agent_id, idempotency_key)` stays in place for
+ *      cross-turn same-content dedupe (post-content retries with the
+ *      same hash short-circuit on the prior row). The RETURNING
+ *      exposes `xmax = 0` AND `idempotency_key AS existing_key` so
+ *      the caller can distinguish:
+ *        - Race A/B same turn, SAME content → one inserts, the other
+ *          sees existing_key=winner's_key (idempotent retry).
+ *        - Race A/B same turn, DIFF content → one inserts, the other
+ *          sees existing_key ≠ candidate_key → caller MUST skip
+ *          (terminal-skip, owner's "zero double-send" choice).
  *        - DB drop mid-claim → stale pending gets reclaimed after 30s.
  *        - markSent failure → pending becomes stale and is recoverable.
  *
@@ -58,17 +70,27 @@ import { logger } from '@/lib/logger.js';
 export const STALE_PENDING_SECONDS = 30;
 
 /**
- * Result of `upsertPending`. Three orthogonal flags the caller maps to
+ * Result of `upsertPending`. Four orthogonal signals the caller maps to
  * its own send decision:
  *  - `inserted` true ⇔ THIS caller atomically claimed the row (it is
  *     the winner of any race). The caller MUST proceed with the send.
- *  - `inserted` false + `skip` true ⇔ a prior attempt for this key
+ *  - `inserted` false + `skip` true ⇔ a prior attempt for this turn
  *     ALREADY succeeded (status='sent'). The caller MUST NOT re-invoke
  *     the provider; the returned `row` carries the prior
  *     `provider_message_id`.
- *  - `inserted` false + `skip` false ⇔ a prior attempt is `pending`
- *     (not yet stale), `failed`, or `unknown`. The caller decides
- *     based on the row's status (see migration 065 header).
+ *  - `inserted` false + `skip` false + `existing_key === candidate_key`
+ *     ⇔ a prior attempt is `pending`/`failed`/`unknown` with the SAME
+ *     content. Idempotent retry — caller decides based on status.
+ *  - `inserted` false + `existing_key !== candidate_key` ⇔ another
+ *     worker is processing the SAME TURN with DIFFERENT content. The
+ *     caller MUST treat this as TERMINAL-SKIP (zero double-send) per
+ *     owner choice — emit audit and DO NOT send.
+ *
+ * `existing_key` reflects the idempotency_key of whichever row currently
+ * sits in the table for this turn — for the winner this equals the
+ * candidate key it just inserted; for losers it's the WINNER's key.
+ * The caller compares it against its own candidate key to detect the
+ * "same turn, different content" race.
  */
 export interface UpsertPendingResult {
   row: OutboundMessage;
@@ -84,6 +106,16 @@ export interface UpsertPendingResult {
    * skips the provider call.
    */
   skip: boolean;
+  /**
+   * The `idempotency_key` of the row that currently holds the turn
+   * claim. When `inserted=true` this equals the candidate key. When
+   * `inserted=false`, the caller compares this against the candidate
+   * key it supplied to detect the same-turn-different-content race:
+   *   - existing_key === candidate_key → idempotent same-content retry.
+   *   - existing_key !== candidate_key → DIFFERENT content racing on
+   *     the SAME turn; caller MUST skip the send (terminal-skip).
+   */
+  existing_key: string;
 }
 
 export const outboundMessagesRepo = {
@@ -91,21 +123,33 @@ export const outboundMessagesRepo = {
    * Atomic pre-send claim via `INSERT ON CONFLICT DO UPDATE`.
    *
    * Race-safe by construction: two concurrent claims for the same
-   * `(tenant_id, agent_id, idempotency_key)` both attempt the INSERT;
-   * Postgres serialises the conflict and applies the DO UPDATE branch
-   * to the loser. The DO UPDATE clause OVERWRITES the row only when
-   * the existing row is `failed` OR a stale `pending` (older than
-   * `STALE_PENDING_SECONDS`) — otherwise the UPDATE is a SET-to-same
-   * no-op and the prior row is returned as-is.
+   * `(tenant_id, agent_id, conversa_id, in_reply_to)` both attempt
+   * the INSERT; Postgres serialises the conflict and applies the
+   * DO UPDATE branch to the loser. The conflict target is the
+   * TURN-LEVEL UNIQUE (one row per turn across all idempotency keys)
+   * so a same-turn / different-content race is caught here — both
+   * writers conflict on the turn even when their idempotency_keys
+   * differ. The DO UPDATE clause OVERWRITES the row only when the
+   * existing row is `failed` OR a stale `pending` (older than
+   * `STALE_PENDING_SECONDS`) — otherwise the UPDATE is filtered out
+   * by WHERE and the prior row is returned as-is.
    *
    * The `was_inserted` flag (derived from `xmax = 0` in RETURNING)
-   * tells the caller whether IT claimed the row. The caller's send
-   * MUST be guarded by `inserted === true` to guarantee exactly-one
-   * provider call across the race.
+   * tells the caller whether IT claimed the row. The `existing_key`
+   * returned alongside lets the caller detect the same-turn /
+   * different-content race:
+   *   - inserted=true                              → claim winner
+   *   - inserted=false + existing_key=candidate    → idempotent same-
+   *                                                  content retry
+   *   - inserted=false + existing_key≠candidate    → SAME TURN, DIFF
+   *                                                  CONTENT race;
+   *                                                  caller MUST skip
+   *                                                  the send (no
+   *                                                  double-send).
    *
    * Tenant-scoped: the conflict target includes `(tenant_id,
-   * agent_id, idempotency_key)`. Cross-tenant key collisions are
-   * physically impossible (different rows in the unique index).
+   * agent_id, ...)`. Cross-tenant collisions are physically
+   * impossible (different rows in the unique index).
    */
   async upsertPending(args: {
     idempotency_key: string;
@@ -117,6 +161,12 @@ export const outboundMessagesRepo = {
 
     // ON CONFLICT DO UPDATE — atomic claim with stale-pending recovery.
     //
+    // Conflict target: the TURN-LEVEL UNIQUE
+    // `(tenant_id, agent_id, conversa_id, in_reply_to)`. Picked
+    // instead of the per-key UNIQUE to catch the same-turn /
+    // different-content race (two workers, same turn, different
+    // payload hash → different keys → both would otherwise INSERT).
+    //
     // The WHERE clause on the DO UPDATE makes the overwrite CONDITIONAL:
     //   - `failed` rows are always reclaimable (pre-send failure, safe
     //     to retry).
@@ -124,7 +174,8 @@ export const outboundMessagesRepo = {
     //     STALE_PENDING_SECONDS (abandoned attempt).
     //   - `sent`/`unknown`/recent-`pending` rows are NOT overwritten;
     //     the UPDATE is filtered out by WHERE, and RETURNING returns
-    //     the prior row unchanged.
+    //     no row. We fall through to a SELECT to surface the existing
+    //     row below.
     //
     // The `was_inserted = (xmax = 0)` trick: Postgres assigns
     // xmax=0 to a freshly-inserted tuple; an UPDATE-by-conflict
@@ -132,9 +183,9 @@ export const outboundMessagesRepo = {
     // pattern for distinguishing insert vs update in a single
     // upsert (Postgres docs: "Concurrency Control" §UPSERT).
     //
-    // Note: when the DO UPDATE WHERE is FALSE the row is not updated
-    // and RETURNING yields no row (the conflict was filtered out). We
-    // fall through to a SELECT to surface the existing row below.
+    // RETURNING also exposes `idempotency_key AS existing_key` so the
+    // caller knows WHICH key now owns the turn — same-turn / different-
+    // content racers see existing_key ≠ candidate_key and skip.
     type Returned = {
       id: string;
       tenant_id: string;
@@ -149,6 +200,7 @@ export const outboundMessagesRepo = {
       created_at: Date;
       expires_at: Date;
       was_inserted: boolean;
+      existing_key: string;
     };
     const result = await db.execute<Returned>(sql`
       INSERT INTO outbound_messages (
@@ -157,11 +209,10 @@ export const outboundMessagesRepo = {
         ${tenant_id}, ${agent_id}, ${args.idempotency_key},
         ${args.conversa_id}::uuid, ${args.in_reply_to}::uuid, 'pending'
       )
-      ON CONFLICT (tenant_id, agent_id, idempotency_key)
+      ON CONFLICT ON CONSTRAINT outbound_messages_turn_uniq
       DO UPDATE SET
         status = 'pending',
-        conversa_id = EXCLUDED.conversa_id,
-        in_reply_to = EXCLUDED.in_reply_to,
+        idempotency_key = EXCLUDED.idempotency_key,
         provider_message_id = NULL,
         sent_at = NULL,
         error = NULL,
@@ -173,7 +224,7 @@ export const outboundMessagesRepo = {
           outbound_messages.status = 'pending'
           AND outbound_messages.created_at < now() - (${STALE_PENDING_SECONDS}::text || ' seconds')::interval
         )
-      RETURNING *, (xmax = 0) AS was_inserted
+      RETURNING *, (xmax = 0) AS was_inserted, idempotency_key AS existing_key
     `);
 
     const rows = Array.from(result.rows as unknown as Returned[]);
@@ -182,7 +233,10 @@ export const outboundMessagesRepo = {
     if (!row) {
       // Conflict matched a NON-reclaimable row (sent / unknown /
       // recent pending) — the DO UPDATE WHERE filtered the UPDATE out
-      // and RETURNING produced no row. Re-read the existing row.
+      // and RETURNING produced no row. Re-read the existing row by
+      // the TURN (not the key — the existing row may carry a
+      // different key when this is a same-turn/different-content
+      // race).
       const existing = await db
         .select()
         .from(outbound_messages)
@@ -190,7 +244,8 @@ export const outboundMessagesRepo = {
           and(
             eq(outbound_messages.tenant_id, tenant_id),
             eq(outbound_messages.agent_id, agent_id),
-            eq(outbound_messages.idempotency_key, args.idempotency_key),
+            eq(outbound_messages.conversa_id, args.conversa_id),
+            eq(outbound_messages.in_reply_to, args.in_reply_to),
           ),
         )
         .limit(1);
@@ -207,6 +262,7 @@ export const outboundMessagesRepo = {
         row: existing[0],
         inserted: false,
         skip: existing[0].status === 'sent',
+        existing_key: existing[0].idempotency_key,
       };
     }
 
@@ -232,6 +288,12 @@ export const outboundMessagesRepo = {
       // successful reclaim, so `skip` here only ever surfaces on the
       // NO-row path above (handled separately). Defensive check.
       skip: typed.status === 'sent',
+      // Source-of-truth for the same-turn / different-content guard.
+      // For the winner this equals the candidate key (we just INSERT-
+      // ed it). For a reclaim of a stale/failed row the DO UPDATE
+      // overwrites idempotency_key with EXCLUDED.idempotency_key, so
+      // this is the CALLER's key in that branch too.
+      existing_key: row.existing_key ?? row.idempotency_key,
     };
   },
 

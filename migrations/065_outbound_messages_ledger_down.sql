@@ -13,6 +13,12 @@
 --
 -- NOTE: no BEGIN/COMMIT — migrate.ts wraps the script in a transaction.
 
+-- Drop the turn-level UNIQUE first so the DROP TABLE below can succeed
+-- on an environment where the constraint exists. IF EXISTS for safety
+-- in partially-rolled-back environments.
+ALTER TABLE IF EXISTS outbound_messages
+  DROP CONSTRAINT IF EXISTS outbound_messages_turn_uniq;
+
 DROP INDEX IF EXISTS idx_outbound_messages_expires_at;
 DROP INDEX IF EXISTS idx_outbound_messages_tenant_status;
 DROP INDEX IF EXISTS idx_outbound_messages_turn_lookup;

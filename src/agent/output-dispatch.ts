@@ -272,10 +272,68 @@ async function wrapWithLedger<R>(args: {
       };
     }
 
+    // SAME TURN, DIFFERENT CONTENT race detection. With the
+    // turn-level UNIQUE in place, two workers handling the same
+    // (conversa_id, in_reply_to) with DIFFERENT content
+    // (→ different idempotency_keys) BOTH conflict on the turn.
+    // The loser sees `inserted=false` AND
+    // `existing_key !== candidate_key`. Per owner's "zero double-
+    // send" choice this is TERMINAL-SKIP: the other worker's content
+    // already (or will shortly) be on the wire; emitting a second
+    // different reply would be the exact failure mode the ledger
+    // exists to prevent.
+    if (!claimedRow.inserted && claimedRow.existing_key !== idempotency_key) {
+      logger.warn(
+        {
+          conversa_id: args.conversa_id,
+          in_reply_to: args.in_reply_to,
+          modality: args.modality,
+          prior_status: claimedRow.row.status,
+          candidate_key: idempotency_key,
+          existing_key: claimedRow.existing_key,
+        },
+        'outbound.same_turn_different_content_dropped',
+      );
+      try {
+        await audit({
+          acao: 'outbound_same_turn_different_content_dropped',
+          conversa_id: args.conversa_id,
+          mensagem_id: args.in_reply_to,
+          metadata: {
+            modality: args.modality,
+            prior_status: claimedRow.row.status,
+            candidate_key: idempotency_key,
+            existing_key: claimedRow.existing_key,
+            provider_message_id: claimedRow.row.provider_message_id,
+          },
+        });
+      } catch (auditErr) {
+        // Audit own its errors; never break the user-facing path.
+        logger.warn(
+          {
+            err: (auditErr as Error).message,
+            conversa_id: args.conversa_id,
+            in_reply_to: args.in_reply_to,
+          },
+          'outbound.same_turn_audit_failed',
+        );
+      }
+      // Throw an ambiguous OutboundDeliveryError so the dispatch
+      // outcome maps to `sent_no_persist` (allowReact=false) — the
+      // turn does NOT cascade to ReAct. The other worker is the
+      // authoritative reply for this turn.
+      throw new OutboundDeliveryError(
+        true,
+        'outbound_same_turn_different_content',
+        { ambiguous: true },
+      );
+    }
+
     // We did not insert AND the prior row is not sent: this means the
     // ON CONFLICT WHERE filtered the UPDATE out (recent pending /
-    // unknown). Conservatively skip the send — another worker holds
-    // the claim, or an ambiguous prior attempt blocks us.
+    // unknown) AND the existing key matches the candidate key — same
+    // content, same turn, another worker holds the claim. Skip
+    // conservatively.
     if (!claimedRow.inserted && claimedRow.row.status !== 'failed') {
       logger.warn(
         {

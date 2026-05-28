@@ -137,6 +137,38 @@ COMMENT ON COLUMN outbound_messages.expires_at IS
 CREATE UNIQUE INDEX IF NOT EXISTS idx_outbound_messages_tenant_agent_key
   ON outbound_messages (tenant_id, agent_id, idempotency_key);
 
+-- TURN-LEVEL UNIQUE constraint: closes the
+-- "same-turn / different-content double-send" race surfaced after the
+-- initial idempotency-key UNIQUE landed.
+--
+-- The crux: two workers handling the same `(conversa_id, in_reply_to)`
+-- pair can deterministically generate DIFFERENT content (different LLM
+-- completions, view-once toggles flipping, retry with edited input,
+-- etc.), which hash to DIFFERENT `idempotency_key` values. With ONLY
+-- the per-key UNIQUE in place each worker would CLAIM ITS OWN row
+-- (no conflict between distinct keys) and BOTH would send. The user
+-- receives two replies for one inbound turn — the exact failure mode
+-- the ledger was supposed to prevent.
+--
+-- The fix is a SECOND, NARROWER UNIQUE on the turn boundary:
+--   (tenant_id, agent_id, conversa_id, in_reply_to)
+-- A turn has AT MOST ONE row across all idempotency keys. The atomic
+-- claim in `upsertPending` now targets this constraint instead of the
+-- key constraint; same-turn / different-content racers conflict on the
+-- turn, the WHERE clause forbids overwriting a non-stale claim, and
+-- the loser sees `inserted=false` with `existing_key ≠ candidate_key`
+-- — the caller treats this as TERMINAL-SKIP (audit emitted) per the
+-- owner's "zero double-send" choice.
+--
+-- The per-key UNIQUE stays for cross-turn idempotency (a retried turn
+-- with the SAME content still resolves to the same key and short-
+-- circuits on the prior row). Both constraints are required:
+--   - key UNIQUE: dedupe across retries with identical content.
+--   - turn UNIQUE: dedupe across racers with conflicting content.
+ALTER TABLE outbound_messages
+  ADD CONSTRAINT outbound_messages_turn_uniq
+  UNIQUE (tenant_id, agent_id, conversa_id, in_reply_to);
+
 -- Per-turn lookup hot path: the guard reads
 -- `WHERE conversa_id=? AND in_reply_to=? AND tenant_id=? AND agent_id=? ORDER BY created_at DESC LIMIT 1`.
 -- Composite index keys the common case; `created_at DESC` lets the

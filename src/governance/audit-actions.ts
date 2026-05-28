@@ -92,6 +92,12 @@ export const AUDIT_ACTIONS = [
   'outbound_sent_document',
   'outbound_sent_voice',
   'outbound_dispatch_failed',
+  // Issue #227 — emitted when two workers race the same
+  // (conversa_id, in_reply_to) with DIFFERENT content (different
+  // idempotency_keys). The TURN-LEVEL UNIQUE on `outbound_messages`
+  // makes one of the two win the claim; the loser drops its send
+  // (terminal-skip) so the user receives exactly one reply per turn.
+  'outbound_same_turn_different_content_dropped',
   'pairing_qr_displayed',
   'pairing_code_requested',
   'pairing_completed',

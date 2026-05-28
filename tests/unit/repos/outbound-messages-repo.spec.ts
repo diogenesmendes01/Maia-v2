@@ -2,12 +2,18 @@
  * Issue #227 — outboundMessagesRepo unit tests.
  *
  * Pattern: in-memory db fake that emulates the production atomic
- * `INSERT ... ON CONFLICT (tenant_id, agent_id, idempotency_key)
- * DO UPDATE` path. Tests prove:
+ * `INSERT ... ON CONFLICT ON CONSTRAINT outbound_messages_turn_uniq
+ * DO UPDATE` path. The conflict target is the TURN-LEVEL UNIQUE
+ * `(tenant_id, agent_id, conversa_id, in_reply_to)` — picked so a
+ * same-turn / different-content race (two workers, same turn,
+ * different payload hash → different keys) collides on the turn and
+ * exactly one survives. Tests prove:
  *   1. upsertPending atomically inserts a fresh `pending` row when no
- *      prior key exists; the `inserted` flag is true (claim winner).
+ *      prior turn exists; the `inserted` flag is true (claim winner)
+ *      and `existing_key` equals the candidate key.
  *   2. upsertPending returns `skip:true, inserted:false` when a prior
- *      row for the key is already at status='sent'.
+ *      row for the turn is already at status='sent' AND the same key
+ *      (idempotent same-content retry).
  *   3. upsertPending returns `inserted:false` and DOES NOT overwrite
  *      when the prior row is `pending` and NOT stale (the conservative
  *      same-turn race outcome — the other writer holds the claim).
@@ -30,8 +36,16 @@
  *      reuse is physically allowed (different rows).
  *  11. AGENT scope: rows are filtered by `agent_id` too — a tenant-A
  *      / agent-X row is invisible from tenant-A / agent-Y context.
- *  12. CONCURRENT claims: two Promise.all upserts for the same key
- *      resolve to exactly one `inserted:true` (atomic claim winner).
+ *  12. CONCURRENT claims: two Promise.all upserts for the same turn
+ *      with the SAME content resolve to exactly one `inserted:true`
+ *      (atomic claim winner); the loser sees `existing_key` ==
+ *      candidate (idempotent retry).
+ *  13. SAME TURN, DIFFERENT CONTENT: two Promise.all upserts for the
+ *      same `(conversa_id, in_reply_to)` but DIFFERENT keys resolve
+ *      to exactly one `inserted:true`; the loser sees `existing_key`
+ *      = winner's key (≠ its own candidate) → caller MUST skip the
+ *      send (terminal-skip). This is the race the turn-level UNIQUE
+ *      closes.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { runWithTenantContext } from '@/db/tenant-context.js';
@@ -280,11 +294,17 @@ async function executeUpsert(values: unknown[]): Promise<{ rows: Row[] }> {
   ];
   const table = await getOutboundTable();
   const rows = tableOf(table);
+  // Conflict target is the TURN-LEVEL UNIQUE
+  // `(tenant_id, agent_id, conversa_id, in_reply_to)` — NOT the
+  // per-key UNIQUE. This mirrors the prod
+  // `ON CONFLICT ON CONSTRAINT outbound_messages_turn_uniq` so a
+  // same-turn / different-content race is caught.
   const existing = rows.find(
     (r) =>
       r.tenant_id === tenant_id &&
       r.agent_id === agent_id &&
-      r.idempotency_key === idempotency_key,
+      r.conversa_id === conversa_id &&
+      r.in_reply_to === in_reply_to,
   );
   if (!existing) {
     // INSERT branch — fresh row, xmax=0.
@@ -302,12 +322,15 @@ async function executeUpsert(values: unknown[]): Promise<{ rows: Row[] }> {
       created_at: new Date(),
       expires_at: new Date(Date.now() + 30 * 24 * 3600 * 1000),
       was_inserted: true,
+      existing_key: idempotency_key,
     };
     rows.push(row);
     return { rows: [{ ...row }] };
   }
   // ON CONFLICT DO UPDATE — overwrite when (failed) OR
-  // (pending AND created_at < now - STALE_MS).
+  // (pending AND created_at < now - STALE_MS). The DO UPDATE branch
+  // overwrites idempotency_key with EXCLUDED.idempotency_key — the
+  // new content's key takes over the turn slot.
   const isFailed = existing.status === 'failed';
   const createdAt = existing.created_at instanceof Date ? existing.created_at : new Date(existing.created_at as string);
   const isStalePending =
@@ -315,15 +338,16 @@ async function executeUpsert(values: unknown[]): Promise<{ rows: Row[] }> {
   if (isFailed || isStalePending) {
     Object.assign(existing, {
       status: 'pending',
-      conversa_id,
-      in_reply_to,
+      idempotency_key,
       provider_message_id: null,
       sent_at: null,
       error: null,
       created_at: new Date(),
       expires_at: new Date(Date.now() + 30 * 24 * 3600 * 1000),
     });
-    return { rows: [{ ...existing, was_inserted: false }] };
+    return {
+      rows: [{ ...existing, was_inserted: false, existing_key: idempotency_key }],
+    };
   }
   // WHERE filtered the UPDATE out — RETURNING is empty.
   return { rows: [] };
@@ -365,7 +389,7 @@ beforeEach(() => {
 });
 
 describe('outboundMessagesRepo — atomic claim + status transitions', () => {
-  it('upsertPending inserts a fresh pending row + reports inserted=true', async () => {
+  it('upsertPending inserts a fresh pending row + reports inserted=true + existing_key equals candidate', async () => {
     await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'agent-a' }, async () => {
       const res = await outboundMessagesRepo.upsertPending({
         idempotency_key: KEY,
@@ -374,6 +398,9 @@ describe('outboundMessagesRepo — atomic claim + status transitions', () => {
       });
       expect(res.inserted).toBe(true);
       expect(res.skip).toBe(false);
+      // existing_key matches the candidate key on a fresh insert —
+      // the per-key idempotency invariant.
+      expect(res.existing_key).toBe(KEY);
       expect(res.row.status).toBe('pending');
       expect(res.row.tenant_id).toBe('tenant-a');
       expect(res.row.agent_id).toBe('agent-a');
@@ -382,7 +409,7 @@ describe('outboundMessagesRepo — atomic claim + status transitions', () => {
     });
   });
 
-  it('upsertPending returns skip=true when prior row is status=sent', async () => {
+  it('upsertPending returns skip=true when prior row is status=sent (same key — idempotent retry)', async () => {
     await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'agent-a' }, async () => {
       await outboundMessagesRepo.upsertPending({
         idempotency_key: KEY,
@@ -403,6 +430,8 @@ describe('outboundMessagesRepo — atomic claim + status transitions', () => {
       expect(retry.skip).toBe(true);
       expect(retry.row.status).toBe('sent');
       expect(retry.row.provider_message_id).toBe('wa-xyz');
+      // Same-content retry — existing_key matches the candidate key.
+      expect(retry.existing_key).toBe(KEY);
     });
   });
 
@@ -660,7 +689,9 @@ describe('outboundMessagesRepo — atomic claim + status transitions', () => {
     // wins the INSERT. Our fake executes each call SEQUENTIALLY (no
     // real concurrency), but the SAME serialisation is what real
     // Postgres guarantees — the loser observes the existing pending
-    // row and gets `inserted=false`.
+    // row and gets `inserted=false`. The loser's `existing_key`
+    // equals the winner's key (== the candidate) because both racers
+    // submitted the same key.
     await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'agent-a' }, async () => {
       const results = await Promise.all([
         outboundMessagesRepo.upsertPending({
@@ -676,11 +707,107 @@ describe('outboundMessagesRepo — atomic claim + status transitions', () => {
       ]);
       const winners = results.filter((r) => r.inserted);
       expect(winners.length).toBe(1);
+      expect(winners[0]!.existing_key).toBe(KEY);
       // The loser sees the existing pending row but doesn't get to send.
       const losers = results.filter((r) => !r.inserted);
       expect(losers.length).toBe(1);
       expect(losers[0]!.skip).toBe(false);
       expect(losers[0]!.row.status).toBe('pending');
+      // Idempotent same-content retry — existing_key equals the
+      // candidate (no same-turn / different-content race).
+      expect(losers[0]!.existing_key).toBe(KEY);
+    });
+  });
+
+  it('SAME TURN, DIFFERENT CONTENT race: Promise.all of two upsertPending with DIFFERENT keys → exactly one wins; loser sees existing_key=winner_key (caller MUST skip)', async () => {
+    // This is the race the turn-level UNIQUE
+    // `(tenant_id, agent_id, conversa_id, in_reply_to)` closes:
+    // two workers process the same inbound turn but generate
+    // DIFFERENT content (different LLM completions, retry with edited
+    // input, etc.) which hash to DIFFERENT idempotency_keys. Without
+    // the turn UNIQUE each worker would CLAIM ITS OWN row and BOTH
+    // would send. With the turn UNIQUE the conflict target is the
+    // turn — both writers race the same row, exactly one wins, the
+    // other sees `existing_key !== candidate_key` and MUST skip
+    // (terminal-skip per owner's "zero double-send" choice).
+    const KEY_CONTENT_A = 'key-content-a';
+    const KEY_CONTENT_B = 'key-content-b';
+    await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'agent-a' }, async () => {
+      const results = await Promise.all([
+        outboundMessagesRepo.upsertPending({
+          idempotency_key: KEY_CONTENT_A,
+          conversa_id: CONV,
+          in_reply_to: TURN,
+        }),
+        outboundMessagesRepo.upsertPending({
+          idempotency_key: KEY_CONTENT_B,
+          conversa_id: CONV,
+          in_reply_to: TURN,
+        }),
+      ]);
+      const winners = results.filter((r) => r.inserted);
+      expect(winners.length).toBe(1);
+      const winner = winners[0]!;
+      // Winner's existing_key equals its own candidate.
+      expect(winner.existing_key).toBe(winner.row.idempotency_key);
+      const winnerKey = winner.row.idempotency_key;
+
+      const losers = results.filter((r) => !r.inserted);
+      expect(losers.length).toBe(1);
+      const loser = losers[0]!;
+      // The defining assertion: the loser's view of the turn shows
+      // the WINNER's key — NOT the loser's candidate. The caller's
+      // guard `existing_key !== candidate_key` fires here and the
+      // send is dropped.
+      expect(loser.existing_key).toBe(winnerKey);
+      // Loser candidate key is the one NOT held by the row.
+      expect([KEY_CONTENT_A, KEY_CONTENT_B]).toContain(loser.existing_key);
+      expect(loser.skip).toBe(false);
+      // The row stays at status='pending' (the winner holds it).
+      expect(loser.row.status).toBe('pending');
+
+      // Sanity: exactly one row exists for this turn — the
+      // turn-level UNIQUE guarantees this.
+      const found = await outboundMessagesRepo.findByConversaTurn({
+        conversa_id: CONV,
+        in_reply_to: TURN,
+      });
+      expect(found?.idempotency_key).toBe(winnerKey);
+    });
+  });
+
+  it('SAME TURN, DIFFERENT CONTENT, after winner marks sent: loser observes winner_key and skip=true', async () => {
+    // Sequential variant: winner finishes its send pipeline (markSent)
+    // before the loser even tries upsertPending. The loser still
+    // observes existing_key = winner_key AND skip=true (winner row
+    // is `sent`), so the caller short-circuits to "prior send" with
+    // no provider invocation. Different code path than the racing
+    // pending-vs-pending case but the same invariant: zero double-send.
+    const WINNER_KEY = 'winner-content-key';
+    const LOSER_KEY = 'loser-content-key';
+    await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'agent-a' }, async () => {
+      await outboundMessagesRepo.upsertPending({
+        idempotency_key: WINNER_KEY,
+        conversa_id: CONV,
+        in_reply_to: TURN,
+      });
+      await outboundMessagesRepo.markSent({
+        idempotency_key: WINNER_KEY,
+        provider_message_id: 'wa-winner',
+        sent_at: new Date(),
+      });
+      const loserAttempt = await outboundMessagesRepo.upsertPending({
+        idempotency_key: LOSER_KEY,
+        conversa_id: CONV,
+        in_reply_to: TURN,
+      });
+      expect(loserAttempt.inserted).toBe(false);
+      expect(loserAttempt.skip).toBe(true);
+      expect(loserAttempt.existing_key).toBe(WINNER_KEY);
+      expect(loserAttempt.row.provider_message_id).toBe('wa-winner');
+      // The candidate key (LOSER_KEY) does NOT replace the row's key
+      // — the `sent` row is preserved as-is by the WHERE filter.
+      expect(loserAttempt.row.idempotency_key).toBe(WINNER_KEY);
     });
   });
 
