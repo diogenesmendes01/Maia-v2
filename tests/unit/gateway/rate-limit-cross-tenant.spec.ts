@@ -449,4 +449,171 @@ describe('issue #245 — gateway rate-limit Redis keys are tenant+agent scoped',
       }
     });
   });
+
+  // -------------------------------------------------------------------------
+  // Aliasing-safe key encoding (PR #258 review, mirrors PR #257 `buildKey`).
+  // Each segment is URI-encoded so a tenant/agent id containing `:` cannot
+  // collide with a key where a later segment starts with the same prefix.
+  // The encoding is required to keep the isolation invariant robust against
+  // future tenant slugs / agent slugs that contain reserved characters.
+  // -------------------------------------------------------------------------
+  describe('aliasing-safe key encoding (buildKey pattern)', () => {
+    it('tenant_id containing `:` is URI-encoded so it cannot alias another tuple', async () => {
+      // Adversarial: a tenant slug `acme:dev` with a normal agent `prod`
+      // must NOT produce the same key as tenant `acme` + agent `dev:prod`
+      // — otherwise the `:` delimiter would let a crafted slug collapse
+      // two distinct tenant/agent buckets into one.
+      const pessoa = pessoaFixture(PESSOA_SHARED);
+
+      await runWithTenantContext(
+        { tenant_id: 'acme:dev', agent_id: 'prod' },
+        async () => {
+          await checkRateLimit(pessoa);
+        },
+      );
+      const keyA = calls.find((c) => c.op === 'zadd')?.key;
+
+      resetStub();
+
+      await runWithTenantContext(
+        { tenant_id: 'acme', agent_id: 'dev:prod' },
+        async () => {
+          await checkRateLimit(pessoa);
+        },
+      );
+      const keyB = calls.find((c) => c.op === 'zadd')?.key;
+
+      expect(keyA).toBeDefined();
+      expect(keyB).toBeDefined();
+      expect(keyA).not.toBe(keyB);
+      // Concrete: `:` inside a segment is `%3A`, leaving exactly 4 raw
+      // `:` separators in the key (after `maia`, `ratelimit`, tenant,
+      // agent — and the `flavor:pessoa_id` pair).
+      expect(keyA).toBe(`maia:ratelimit:acme%3Adev:prod:hour:${PESSOA_SHARED}`);
+      expect(keyB).toBe(`maia:ratelimit:acme:dev%3Aprod:hour:${PESSOA_SHARED}`);
+    });
+
+    it('pessoa_id containing `:` is URI-encoded (defense-in-depth)', async () => {
+      // pessoa.id is a uuid in production but the encoding is still
+      // applied as defense-in-depth against future ID-generation changes
+      // or test fixtures that use free-form ids.
+      const pessoa = pessoaFixture('weird:id');
+      await runWithTenantContext(
+        { tenant_id: TENANT_A, agent_id: AGENT_A },
+        async () => {
+          await checkRateLimit(pessoa);
+        },
+      );
+      const key = calls.find((c) => c.op === 'zadd')?.key;
+      expect(key).toBe(`maia:ratelimit:${TENANT_A}:${AGENT_A}:hour:weird%3Aid`);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Fail-closed contract for the overage path (PR #258 review, P1 HIGH).
+  // The `get`/`set` calls that probe and rearm the silence/warned flags
+  // run after the sorted-set block has determined count > threshold for a
+  // non-owner. The original code wrapped only the zset block in try/catch,
+  // so a transient Redis failure on the overage path (latency spike, key
+  // eviction, network blip) would surface to the dispatcher as an
+  // unhandled rejection. Post-fix: those calls share the same fail-closed
+  // contract — Redis error → `silence` for non-owners.
+  // -------------------------------------------------------------------------
+  describe('overage-path fail-closed (Redis failure during get/set)', () => {
+    it('redis.get failure on silence probe → silence decision (not propagated)', async () => {
+      const pessoa = pessoaFixture(PESSOA_SHARED);
+
+      // Saturate threshold (3 allowed) so the NEXT call enters the
+      // overage path where `redis.get(silenceKey)` is the first Redis op
+      // outside the zset block.
+      await runWithTenantContext(
+        { tenant_id: TENANT_A, agent_id: AGENT_A },
+        async () => {
+          await checkRateLimit(pessoa);
+          await checkRateLimit(pessoa);
+          await checkRateLimit(pessoa);
+        },
+      );
+
+      // Arm a one-shot rejection on the NEXT `get` call.
+      redisStub.get.mockImplementationOnce(async () => {
+        throw new Error('redis blip during silence probe');
+      });
+
+      await runWithTenantContext(
+        { tenant_id: TENANT_A, agent_id: AGENT_A },
+        async () => {
+          const decision = await checkRateLimit(pessoa);
+          expect(decision.kind).toBe('silence');
+        },
+      );
+    });
+
+    it('redis.get failure on warned probe → silence decision (not propagated)', async () => {
+      const pessoa = pessoaFixture(PESSOA_SHARED);
+
+      await runWithTenantContext(
+        { tenant_id: TENANT_A, agent_id: AGENT_A },
+        async () => {
+          await checkRateLimit(pessoa);
+          await checkRateLimit(pessoa);
+          await checkRateLimit(pessoa);
+        },
+      );
+
+      // First `get` (silence probe) returns null, second (warned probe)
+      // throws — exercises the deeper branch of the overage path.
+      let getCount = 0;
+      redisStub.get.mockImplementation(async (_k: string) => {
+        getCount++;
+        if (getCount === 1) return null;
+        throw new Error('redis blip during warned probe');
+      });
+
+      await runWithTenantContext(
+        { tenant_id: TENANT_A, agent_id: AGENT_A },
+        async () => {
+          const decision = await checkRateLimit(pessoa);
+          expect(decision.kind).toBe('silence');
+        },
+      );
+
+      // Restore the default `get` implementation for other tests in this
+      // describe block (resetStub between top-level `it`s handles this,
+      // but be defensive here since we used .mockImplementation, not
+      // .mockImplementationOnce).
+      redisStub.get.mockImplementation(async (key: string) => {
+        evictIfExpired(key);
+        return kv.get(key)?.value ?? null;
+      });
+    });
+
+    it('redis.set failure on warn-flag write → silence decision (not propagated)', async () => {
+      const pessoa = pessoaFixture(PESSOA_SHARED);
+
+      await runWithTenantContext(
+        { tenant_id: TENANT_A, agent_id: AGENT_A },
+        async () => {
+          await checkRateLimit(pessoa);
+          await checkRateLimit(pessoa);
+          await checkRateLimit(pessoa);
+        },
+      );
+
+      // Both `get` probes return null (no silence, no prior warn), so the
+      // overage path proceeds to `redis.set(warnedKey, …)`. Make THAT
+      // call throw to exercise the write-side fail-closed branch.
+      redisStub.set.mockImplementationOnce(async () => {
+        throw new Error('redis blip during warned write');
+      });
+
+      await runWithTenantContext(
+        { tenant_id: TENANT_A, agent_id: AGENT_A },
+        async () => {
+          const decision = await checkRateLimit(pessoa);
+          expect(decision.kind).toBe('silence');
+        },
+      );
+    });
+  });
 });
