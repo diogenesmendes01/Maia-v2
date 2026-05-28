@@ -33,7 +33,20 @@
  *      status get applied across tenants — denying service on the
  *      primary tenant by acting in a secondary one.
  *
- * Key format: `maia:botdet:${tenant_id}:${agent_id}:${phone}`.
+ * Key format: `maia:botdet:${enc(tenant_id)}:${enc(agent_id)}:${enc(phone)}`,
+ * where each segment is URI-encoded via `encodeURIComponent` so the `:`
+ * delimiter is unambiguous. Rationale (Codex review on PR #252, adopted
+ * from PR #257 `_vision-cache.ts` `buildKey`):
+ *   `tenants.id` and `agents.id` are `TEXT PRIMARY KEY` (free-form slug;
+ *   see `migrations/007_p0_tenants_agents.sql`), so a tenant slug like
+ *   `acme:dev` would otherwise collide with a `(tenant=acme,
+ *   agent=dev:something, phone=...)` tuple — defeating the isolation
+ *   invariant by *key aliasing*, not by missing context. `phone` is
+ *   typically `+E164` and unlikely to contain `:`, but encoding it too
+ *   keeps the rule "every segment is encoded" uniform and lets callers
+ *   pass any string without re-deriving safety. `encodeURIComponent`
+ *   makes the encoding reversible and segment-unambiguous (the only `%`
+ *   in a key is a quoting prefix introduced by us).
  *
  * Note: `pessoasRepo.findByPhone` / `updateStatus` are themselves tenant-
  * scoped at the repo layer (tenant_id filter in SQL), so the "block the
@@ -46,7 +59,29 @@
  * Pre-existing Redis entries under the OLD prefix (`maia:botdet:${phone}`)
  * are no longer reachable through the public API and will age out via the
  * existing 60-second TTL. No explicit migration job is required — the
- * counter is short-lived by construction.
+ * counter is short-lived by construction. The encoding refinement has the
+ * same property: previously-written keys (whose unencoded form differed
+ * only when a segment contained `:` or `%`) simply expire on the 60s TTL.
+ *
+ * SCOPE NOTE (Codex review on PR #252):
+ *   The Codex review flagged a CRITICAL systemic issue at
+ *   `src/gateway/baileys.ts:229-240` (`messages.upsert`) and `:242-261`
+ *   (`messages.update`): both wrap callbacks in
+ *   `runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, …)`
+ *   — meaning that in production, every inbound message resolves to the
+ *   same `(default, default)` tuple, collapsing every tenant's
+ *   bot-detection counter back onto a shared bucket regardless of the
+ *   per-key namespacing implemented here. This affects EVERY gateway-
+ *   layer PR in the same family (#252, #253, #257, #258, #259, #264) and
+ *   the fix (resolve `tenant_id`/`agent_id` from the inbound JID/channel
+ *   before invoking the handler — or fail-closed if it can't be
+ *   resolved) belongs in a coordinated upstream change to
+ *   `src/gateway/baileys.ts`, NOT in any single per-layer fix. Doing it
+ *   here would entangle this PR with five sibling PRs already in flight.
+ *   The helper in this file is correct in isolation and ready to receive
+ *   real `(tenant_id, agent_id)` tuples the moment the baileys ingress
+ *   resolution lands. Until then the counter remains effectively shared
+ *   in production — see baileys.ts:227-228 inline TODO.
  */
 import { redis, isRedisConnected } from '@/lib/redis.js';
 import { pessoasRepo } from '@/db/repositories.js';
@@ -54,12 +89,26 @@ import { audit } from '@/governance/audit.js';
 import { logger } from '@/lib/logger.js';
 import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 
+const KEY_PREFIX = 'maia:botdet:';
+
+/**
+ * Build the tenant-scoped Redis key. Each segment is URI-encoded so the `:`
+ * delimiter is unambiguous: a tenant slug like `acme:dev` becomes
+ * `acme%3Adev`, which can never collide with a tuple where the tenant is
+ * `acme` and the agent starts with `dev:`. See the invariant block at the
+ * top of the file for the full rationale. Not exported — the public surface
+ * is `checkBotAndMaybeBlock`.
+ */
+function buildKey(tenant_id: string, agent_id: string, phone: string): string {
+  return `${KEY_PREFIX}${encodeURIComponent(tenant_id)}:${encodeURIComponent(agent_id)}:${encodeURIComponent(phone)}`;
+}
+
 function botDetectionKey(phone: string): string {
   // `getCurrentTenant()` / `getCurrentAgent()` throw `MissingTenantContextError`
   // if the caller isn't wrapped in `runWithTenantContext` — see invariant block.
   const tenant_id = getCurrentTenant();
   const agent_id = getCurrentAgent();
-  return `maia:botdet:${tenant_id}:${agent_id}:${phone}`;
+  return buildKey(tenant_id, agent_id, phone);
 }
 
 const WINDOW_SECONDS = 60;

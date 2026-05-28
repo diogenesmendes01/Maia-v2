@@ -9,9 +9,10 @@
  * Bot-detection-specific contract this spec PROVES:
  *   Every Redis key emitted by `src/gateway/bot-detection.ts`
  *   (`checkBotAndMaybeBlock`) is prefixed with `tenant_id` AND `agent_id`
- *   from the AsyncLocalStorage tenant context, AND the function throws
- *   `MissingTenantContextError` (loud failure) when invoked outside a
- *   `runWithTenantContext` boundary.
+ *   from the AsyncLocalStorage tenant context (each segment URI-encoded
+ *   so the `:` delimiter is unambiguous — see ALIASING test below), AND
+ *   the function throws `MissingTenantContextError` (loud failure) when
+ *   invoked outside a `runWithTenantContext` boundary.
  *
  * Before this fix the key was `maia:botdet:${phone}` — no tenant/agent
  * namespace. Three concrete failure modes the fix closes:
@@ -132,10 +133,12 @@ describe('issue #246 — bot-detection Redis key is tenant+agent scoped', () => 
   });
 
   // -------------------------------------------------------------------------
-  // Key shape — the counter key MUST include tenant_id + agent_id.
+  // Key shape — the counter key MUST include tenant_id + agent_id, with
+  // every segment URI-encoded so the `:` delimiter is unambiguous (Codex
+  // review on PR #252, pattern from PR #257 `_vision-cache.ts`).
   // -------------------------------------------------------------------------
   describe('checkBotAndMaybeBlock — key shape', () => {
-    it('emits a key prefixed with both tenant_id and agent_id', async () => {
+    it('emits a key prefixed with encoded tenant_id and agent_id segments', async () => {
       await runWithTenantContext(
         { tenant_id: TENANT_A, agent_id: AGENT_A },
         async () => {
@@ -144,10 +147,79 @@ describe('issue #246 — bot-detection Redis key is tenant+agent scoped', () => 
       );
 
       // First call also fires `expire` (count === 1 branch). Both ops target
-      // the SAME key string.
-      const expected = `maia:botdet:${TENANT_A}:${AGENT_A}:${PHONE_SHARED}`;
+      // the SAME key string. The UUIDs and `+E164` phone are URI-safe so
+      // encodeURIComponent leaves them untouched.
+      const expected = `maia:botdet:${encodeURIComponent(TENANT_A)}:${encodeURIComponent(AGENT_A)}:${encodeURIComponent(PHONE_SHARED)}`;
       expect(keysOf('incr')).toEqual([expected]);
       expect(keysOf('expire')).toEqual([expected]);
+    });
+
+    // -----------------------------------------------------------------------
+    // ALIASING — tenants.id and agents.id are TEXT PRIMARY KEY (free-form
+    // slug; see migrations/007_p0_tenants_agents.sql). Without per-segment
+    // encoding, a tenant slug containing `:` would collide with a tuple
+    // where the colon falls on the agent boundary instead — defeating the
+    // tenant-isolation invariant by KEY ALIASING, not by missing context.
+    // This test PROVES the encoding closes that hole.
+    //
+    //   Pair A: tenant='acme:dev'   agent='router'   → "acme%3Adev:router"
+    //   Pair B: tenant='acme'       agent='dev:router' → "acme:dev%3Arouter"
+    //
+    // Decoded these would both spell "acme:dev:router", but the encoded
+    // forms are distinct so the Redis counter stays per-tenant.
+    // -----------------------------------------------------------------------
+    it('per-segment encoding prevents aliasing between (tenant, agent) tuples that share a colon-joined form', async () => {
+      const PAIR_A_TENANT = 'acme:dev';
+      const PAIR_A_AGENT = 'router';
+      const PAIR_B_TENANT = 'acme';
+      const PAIR_B_AGENT = 'dev:router';
+
+      await runWithTenantContext(
+        { tenant_id: PAIR_A_TENANT, agent_id: PAIR_A_AGENT },
+        async () => {
+          await checkBotAndMaybeBlock(PHONE_SHARED);
+        },
+      );
+      await runWithTenantContext(
+        { tenant_id: PAIR_B_TENANT, agent_id: PAIR_B_AGENT },
+        async () => {
+          await checkBotAndMaybeBlock(PHONE_SHARED);
+        },
+      );
+
+      const incrKeys = keysOf('incr');
+      expect(incrKeys).toHaveLength(2);
+
+      const keyA = `maia:botdet:${encodeURIComponent(PAIR_A_TENANT)}:${encodeURIComponent(PAIR_A_AGENT)}:${encodeURIComponent(PHONE_SHARED)}`;
+      const keyB = `maia:botdet:${encodeURIComponent(PAIR_B_TENANT)}:${encodeURIComponent(PAIR_B_AGENT)}:${encodeURIComponent(PHONE_SHARED)}`;
+
+      expect(incrKeys[0]).toBe(keyA);
+      expect(incrKeys[1]).toBe(keyB);
+      expect(keyA).not.toBe(keyB);
+
+      // Independent counters — both at 1, not at 2 — proves no aliasing.
+      expect(counters.get(keyA)).toBe(1);
+      expect(counters.get(keyB)).toBe(1);
+    });
+
+    // Belt-and-suspenders: even a `%` already present inside the segment
+    // must be re-encoded (`%` → `%25`) so the encoded key is unambiguous
+    // when read back. Without this rule, `acme%3Adev` (already encoded
+    // somewhere upstream) would re-emit identically — but `acme:dev`
+    // (raw) would encode to the SAME string. The encoding round-trips
+    // through encodeURIComponent so this can't happen.
+    it('percent characters in a segment are themselves encoded', async () => {
+      const TENANT_WITH_PERCENT = 'acme%3Adev'; // looks pre-encoded
+      await runWithTenantContext(
+        { tenant_id: TENANT_WITH_PERCENT, agent_id: AGENT_A },
+        async () => {
+          await checkBotAndMaybeBlock(PHONE_SHARED);
+        },
+      );
+      const incrKey = keysOf('incr')[0]!;
+      // The `%` becomes `%25`, so the literal `%3A` shows up as `%253A`
+      // — distinguishable from a raw `:` (which would have encoded to `%3A`).
+      expect(incrKey).toContain('acme%253Adev');
     });
   });
 
@@ -171,11 +243,14 @@ describe('issue #246 — bot-detection Redis key is tenant+agent scoped', () => 
 
       const incrKeys = keysOf('incr');
       expect(incrKeys).toHaveLength(2);
+      // The UUIDs and `+E164` phone are URI-safe so the encoded form
+      // matches the raw form; the assertion still goes through
+      // encodeURIComponent to prove the contract regardless of input shape.
       expect(incrKeys[0]).toBe(
-        `maia:botdet:${TENANT_A}:${AGENT_A}:${PHONE_SHARED}`,
+        `maia:botdet:${encodeURIComponent(TENANT_A)}:${encodeURIComponent(AGENT_A)}:${encodeURIComponent(PHONE_SHARED)}`,
       );
       expect(incrKeys[1]).toBe(
-        `maia:botdet:${TENANT_B}:${AGENT_B}:${PHONE_SHARED}`,
+        `maia:botdet:${encodeURIComponent(TENANT_B)}:${encodeURIComponent(AGENT_B)}:${encodeURIComponent(PHONE_SHARED)}`,
       );
       expect(incrKeys[0]).not.toBe(incrKeys[1]);
 
@@ -206,8 +281,12 @@ describe('issue #246 — bot-detection Redis key is tenant+agent scoped', () => 
 
       const incrKeys = keysOf('incr');
       expect(incrKeys).toHaveLength(2);
-      expect(incrKeys[0]).toContain(`:${AGENT_A}:`);
-      expect(incrKeys[1]).toContain(`:${AGENT_B}:`);
+      // AGENT_A / AGENT_B are URI-safe UUIDs so the encoded form is
+      // identical to the raw form. Still go through encodeURIComponent so
+      // the assertion holds even if the constants are later replaced with
+      // a slug containing `:` or `%`.
+      expect(incrKeys[0]).toContain(`:${encodeURIComponent(AGENT_A)}:`);
+      expect(incrKeys[1]).toContain(`:${encodeURIComponent(AGENT_B)}:`);
       expect(incrKeys[0]).not.toBe(incrKeys[1]);
     });
 
@@ -233,10 +312,10 @@ describe('issue #246 — bot-detection Redis key is tenant+agent scoped', () => 
       const tenantAKey = calls.find((c) => c.op === 'incr')?.key;
 
       expect(tenantBKey).toBe(
-        `maia:botdet:${TENANT_B}:${AGENT_B}:${PHONE_SHARED}`,
+        `maia:botdet:${encodeURIComponent(TENANT_B)}:${encodeURIComponent(AGENT_B)}:${encodeURIComponent(PHONE_SHARED)}`,
       );
       expect(tenantAKey).toBe(
-        `maia:botdet:${TENANT_A}:${AGENT_A}:${PHONE_SHARED}`,
+        `maia:botdet:${encodeURIComponent(TENANT_A)}:${encodeURIComponent(AGENT_A)}:${encodeURIComponent(PHONE_SHARED)}`,
       );
       expect(tenantAKey).not.toBe(tenantBKey);
     });
@@ -273,7 +352,7 @@ describe('issue #246 — bot-detection Redis key is tenant+agent scoped', () => 
         },
       );
 
-      const tenantAKey = `maia:botdet:${TENANT_A}:${AGENT_A}:${PHONE_SHARED}`;
+      const tenantAKey = `maia:botdet:${encodeURIComponent(TENANT_A)}:${encodeURIComponent(AGENT_A)}:${encodeURIComponent(PHONE_SHARED)}`;
       expect(counters.get(tenantAKey)).toBe(TENANT_A_FLOOD);
 
       // findByPhone should have fired for tenant-A AFTER crossing
@@ -296,7 +375,7 @@ describe('issue #246 — bot-detection Redis key is tenant+agent scoped', () => 
       );
 
       // Tenant-B used its OWN key, not tenant-A's.
-      const tenantBKey = `maia:botdet:${TENANT_B}:${AGENT_B}:${PHONE_SHARED}`;
+      const tenantBKey = `maia:botdet:${encodeURIComponent(TENANT_B)}:${encodeURIComponent(AGENT_B)}:${encodeURIComponent(PHONE_SHARED)}`;
       expect(keysOf('incr')).toEqual([tenantBKey]);
       expect(tenantBKey).not.toBe(tenantAKey);
 
