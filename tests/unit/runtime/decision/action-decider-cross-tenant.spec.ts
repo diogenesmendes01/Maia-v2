@@ -349,51 +349,42 @@ vi.mock('@/db/client.js', () => {
 import { createProductionDecisionEngineEnv } from '@/runtime/decision/prod-env.js';
 import { ActionDeciderImpl } from '@/runtime/decision/action-decider.js';
 import type { ActionDeciderInput } from '@/runtime/decision/types.js';
+import type { NewSkillRow } from '@/db/schema.js';
 import { mkBaseContextPacket } from '../../../fixtures/base-context-packet.js';
+import { mkSkillRow } from '../../../fixtures/skill-row.js';
 
 // ---------------------------------------------------------------------------
-// Seed shape. Mirrors the rows returned by P9a `getById` — only the columns
+// Seed shape. We seed using the REAL `NewSkillRow` type (`skills.$inferInsert`)
+// via the centralised `mkSkillRow` fixture (Codex PR #236 review v2): rows
+// carry every NOT NULL column of the production schema, not just the columns
 // `skillRowToSkill` (prod-env.ts) projects from + the columns the WHERE
-// predicate inspects (`tenant_id`, `id`, `agent_id`, `status`).
+// predicate inspects (`tenant_id`, `id`, `agent_id`, `status`). A future
+// regression where the production INSERT path adds a real constraint OR where
+// a code path begins reading one of the previously-omitted JSONB columns
+// (`goal`/`procedure`/`input_schema`/...) would PASS the stripped-down
+// fixture but FAIL in production. Mirroring the full row shape closes that
+// gap.
 // ---------------------------------------------------------------------------
-type SeedRow = {
-  id: string;
-  tenant_id: string;
-  agent_id: string | null;
-  skill_descriptor: string;
-  category: 'tool_mediated' | 'respond' | 'decide' | 'plan' | 'evaluator' | 'classify' | 'extract' | 'compose' | 'diagnose' | string;
-  execution_mode: 'prompt_only' | 'evaluator' | 'tool_mediated' | 'procedure_adapter';
-  status: 'active' | 'deprecated' | 'draft';
-  allowed_tools: string[];
-  policy_descriptors: string[];
-  runtime_hints: Record<string, unknown>;
-  when_to_use: string;
-  version: number;
-};
+type SeedRow = NewSkillRow;
 
 function mkRow(over: {
   id: string;
   tenant_id: string;
   agent_id: string | null;
   descriptor?: string;
-  category?: SeedRow['category'];
-  execution_mode?: SeedRow['execution_mode'];
+  category?: NewSkillRow['category'];
+  execution_mode?: NewSkillRow['execution_mode'];
   allowed_tools?: string[];
 }): SeedRow {
-  return {
+  return mkSkillRow({
     id: over.id,
     tenant_id: over.tenant_id,
     agent_id: over.agent_id,
     skill_descriptor: over.descriptor ?? over.id,
     category: over.category ?? 'tool_mediated',
     execution_mode: over.execution_mode ?? 'tool_mediated',
-    status: 'active',
     allowed_tools: over.allowed_tools ?? ['tool_for_' + over.id],
-    policy_descriptors: [],
-    runtime_hints: {},
-    when_to_use: '',
-    version: 1,
-  };
+  });
 }
 
 // ---------------------------------------------------------------------------
