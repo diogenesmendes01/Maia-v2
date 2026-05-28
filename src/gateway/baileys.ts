@@ -365,7 +365,12 @@ async function handleIncoming(msg: proto.IWebMessageInfo): Promise<void> {
   // — out of scope for this change.
   if (config.FEATURE_MESSAGE_DEBOUNCE && type === 'texto') {
     try {
-      const result = await scheduleDebouncedAgent({ key: tel, mensagem_id: stored.id });
+      // `phone` (the user's tel) feeds the tenant-scoped debounce identity.
+      // The composite key (`${tenant_id}:${agent_id}:${phone}`) is derived
+      // inside `scheduleDebouncedAgent` from the ALS tenant context that
+      // `messages.upsert` installs above — so a shared phone across two
+      // tenants gets two INDEPENDENT debouncers (issue #248).
+      const result = await scheduleDebouncedAgent({ phone: tel, mensagem_id: stored.id });
       logger.info(
         {
           mensagem_id: stored.id,
