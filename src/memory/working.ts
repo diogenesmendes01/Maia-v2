@@ -24,6 +24,14 @@
  *   a real leak. Prefixing now eliminates that class of bug at the storage
  *   layer.
  *
+ * Fail-closed guard order (Codex review #241 MAJOR #1):
+ *   `getCurrentTenant()` / `getCurrentAgent()` MUST be called BEFORE the
+ *   `isRedisConnected()` early-return. Otherwise, a Redis outage would let
+ *   a missing-context caller bypass the tenant guard entirely (Redis down →
+ *   function returns silently → accessor never fires → invariant violated).
+ *   The accessors run first so a missing-context bug crashes loudly even
+ *   when Redis is unavailable, matching the inviolable-isolation invariant.
+ *
  * Key formats:
  *   working:${tenant_id}:${agent_id}:conv:${conversa_id}:messages
  *
@@ -53,16 +61,21 @@ function workingMessagesKey(conversa_id: string): string {
 }
 
 export async function pushMessage(conversa_id: string, role: 'user' | 'assistant', text: string): Promise<void> {
-  if (!isRedisConnected()) return;
+  // Resolve the scoped key BEFORE the Redis-availability check. Calling the
+  // tenant accessors first guarantees a missing-context caller crashes loudly
+  // (MissingTenantContextError) even when Redis is down — Codex #241 MAJOR #1.
   const key = workingMessagesKey(conversa_id);
+  if (!isRedisConnected()) return;
   await redis.rpush(key, JSON.stringify({ role, text, ts: Date.now() }));
   await redis.ltrim(key, -20, -1);
   await redis.expire(key, 60 * 60 * 24);
 }
 
 export async function readRecent(conversa_id: string): Promise<Array<{ role: 'user' | 'assistant'; text: string }>> {
-  if (!isRedisConnected()) return [];
+  // Resolve the scoped key BEFORE the Redis-availability check — same rationale
+  // as `pushMessage`. Missing tenant context must crash, not fall through.
   const key = workingMessagesKey(conversa_id);
+  if (!isRedisConnected()) return [];
   const items = await redis.lrange(key, 0, -1);
   return items
     .map((s) => {
