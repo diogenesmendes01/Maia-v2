@@ -1,18 +1,22 @@
 /**
  * P6 Task 5 — channel resolver (gateway lookup, flag-gated, cross-tenant fallback).
  *
+ * Atualizado pelo issue #268 — fallback default/default substituído por
+ * fail-loud (TypedError). Veja `tests/unit/gateway/channel-resolver-fail-loud.spec.ts`
+ * para a suite focada no novo contrato. Este arquivo cobre o smoke contract:
+ *
+ *   - Flag OFF (MULTI_CHANNEL=false)        -> throw TypedError('channel_resolution_failed').
+ *   - Flag ON + active channel encontrado   -> {channel.tenant_id, channel.agent_id, channel.id}.
+ *   - Flag ON + channel não encontrado      -> throw TypedError('channel_resolution_failed').
+ *   - Flag ON + channel encontrado inativo  -> throw TypedError('channel_resolution_failed').
+ *
  * O resolver é o ENTRY POINT — roda ANTES de tenant context existir. Por isso usa
  * `channelsRepo.findByExternalCrossTenant` que explicitamente bypassa o tenant guard.
- *
- * Contrato:
- *   - Flag OFF (MULTI_CHANNEL=false)        -> {default,default,null}, sem consultar repo.
- *   - Flag ON + active channel encontrado   -> {channel.tenant_id, channel.agent_id, channel.id}.
- *   - Flag ON + channel não encontrado      -> fallback {default,default,null} + warning.
- *   - Flag ON + channel encontrado inativo  -> fallback {default,default,null} + warning.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { FeatureFlagName } from '@/types/enums.js';
 import { featureFlags } from '@/config/feature-flags.js';
+import { TypedError } from '@/lib/utils.js';
 import type { Channel } from '@/db/schema.js';
 
 // Mock do repositório — único side-effect que importa para o resolver.
@@ -51,22 +55,22 @@ function makeChannel(overrides: Partial<Channel> = {}): Channel {
   } as Channel;
 }
 
-describe('resolveChannel — flag-gated + cross-tenant lookup + warning fallback', () => {
+describe('resolveChannel — flag-gated + cross-tenant lookup + fail-loud (issue #268)', () => {
   beforeEach(() => {
     findByExternalCrossTenantMock.mockReset();
     loggerWarnMock.mockReset();
     featureFlags.reset();
   });
 
-  it('Flag OFF → retorna default/default/null SEM consultar o repo', async () => {
+  it('Flag OFF → throw TypedError("channel_resolution_failed") SEM consultar o repo', async () => {
     featureFlags.override(FeatureFlagName.MULTI_CHANNEL, false);
     const { resolveChannel } = await import('@/gateway/channel-resolver.js');
 
-    const out = await resolveChannel({ channel_type: 'whatsapp', external_id: '5511999999999' });
+    const promise = resolveChannel({ channel_type: 'whatsapp', external_id: '5511999999999' });
 
-    expect(out).toEqual({ tenant_id: 'default', agent_id: 'default', channel_id: null });
+    await expect(promise).rejects.toBeInstanceOf(TypedError);
+    await expect(promise).rejects.toMatchObject({ code: 'channel_resolution_failed' });
     expect(findByExternalCrossTenantMock).not.toHaveBeenCalled();
-    expect(loggerWarnMock).not.toHaveBeenCalled();
   });
 
   it('Flag ON + canal ativo encontrado → retorna {tenant_id, agent_id, channel_id} sem warning', async () => {
@@ -95,41 +99,45 @@ describe('resolveChannel — flag-gated + cross-tenant lookup + warning fallback
     expect(loggerWarnMock).not.toHaveBeenCalled();
   });
 
-  it('Flag ON + canal encontrado mas INATIVO → fallback default + warning com active:false', async () => {
+  it('Flag ON + canal encontrado mas INATIVO → throw com details.active:false', async () => {
     featureFlags.override(FeatureFlagName.MULTI_CHANNEL, true);
     findByExternalCrossTenantMock.mockResolvedValueOnce(makeChannel({ active: false }));
 
     const { resolveChannel } = await import('@/gateway/channel-resolver.js');
-    const out = await resolveChannel({ channel_type: 'telegram', external_id: '@bot' });
+    const promise = resolveChannel({ channel_type: 'telegram', external_id: '@bot' });
 
-    expect(out).toEqual({ tenant_id: 'default', agent_id: 'default', channel_id: null });
-    expect(loggerWarnMock).toHaveBeenCalledTimes(1);
-    const [meta, msg] = loggerWarnMock.mock.calls[0]!;
-    expect(meta).toMatchObject({
-      channel_type: 'telegram',
-      external_id: '@bot',
-      found: true,
-      active: false,
+    await expect(promise).rejects.toBeInstanceOf(TypedError);
+    await expect(promise).rejects.toMatchObject({
+      code: 'channel_resolution_failed',
+      details: {
+        channel_type: 'telegram',
+        external_id: '@bot',
+        found: true,
+        active: false,
+        resolver_path: 'unknown_or_inactive_channel',
+      },
     });
-    expect(msg).toBe('channel_resolver.unknown_or_inactive_channel_fallback');
+    expect(loggerWarnMock).toHaveBeenCalledTimes(1);
   });
 
-  it('Flag ON + canal NÃO encontrado → fallback default + warning com found:false', async () => {
+  it('Flag ON + canal NÃO encontrado → throw com details.found:false', async () => {
     featureFlags.override(FeatureFlagName.MULTI_CHANNEL, true);
     findByExternalCrossTenantMock.mockResolvedValueOnce(null);
 
     const { resolveChannel } = await import('@/gateway/channel-resolver.js');
-    const out = await resolveChannel({ channel_type: 'sms', external_id: 'unknown-555' });
+    const promise = resolveChannel({ channel_type: 'sms', external_id: 'unknown-555' });
 
-    expect(out).toEqual({ tenant_id: 'default', agent_id: 'default', channel_id: null });
-    expect(loggerWarnMock).toHaveBeenCalledTimes(1);
-    const [meta, msg] = loggerWarnMock.mock.calls[0]!;
-    expect(meta).toMatchObject({
-      channel_type: 'sms',
-      external_id: 'unknown-555',
-      found: false,
-      active: false,
+    await expect(promise).rejects.toBeInstanceOf(TypedError);
+    await expect(promise).rejects.toMatchObject({
+      code: 'channel_resolution_failed',
+      details: {
+        channel_type: 'sms',
+        external_id: 'unknown-555',
+        found: false,
+        active: false,
+        resolver_path: 'unknown_or_inactive_channel',
+      },
     });
-    expect(msg).toBe('channel_resolver.unknown_or_inactive_channel_fallback');
+    expect(loggerWarnMock).toHaveBeenCalledTimes(1);
   });
 });
