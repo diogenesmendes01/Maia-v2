@@ -27,7 +27,12 @@
  */
 import { callLLM, type LLMMessage, type ToolSchema } from '@/lib/claude.js';
 import { logger } from '@/lib/logger.js';
-import { tryGetCurrentContext } from '@/db/tenant-context.js';
+import { incCounter } from '@/lib/metrics.js';
+import {
+  getCurrentAgent,
+  getCurrentTenant,
+  MissingTenantContextError,
+} from '@/db/tenant-context.js';
 import type { ModeContext } from '../types.js';
 
 /**
@@ -120,9 +125,46 @@ export async function toolMediatedMode(
       'idempotency_key_unstable: tool_mediated skills require a stable turno_id or conversa_id in ModeContext to derive idempotency keys; aborting to prevent duplicate side effects',
     );
   }
-  const tenantCtx = tryGetCurrentContext();
-  const tenant = tenantCtx?.tenant_id ?? 'unknown';
-  const agent = tenantCtx?.agent_id ?? 'unknown';
+  // Fail-closed on missing ALS context (issue #262). Previously the code
+  // degraded to a shared 'unknown:unknown' bucket via `tryGetCurrentContext`,
+  // which (a) opened a cross-tenant idempotency collision surface and
+  // (b) silenced caller bugs that forgot to wrap execution in
+  // `runWithTenantContext`. We now match the fail-closed pattern of
+  // rulesRepo / agent_memories / ledgers (#232/#237/#241/#243): if there
+  // is no active tenant context, `getCurrentTenant`/`getCurrentAgent`
+  // throw `MissingTenantContextError` so the misuse surfaces loudly.
+  // In production, the SkillRunner (gate 1.5) already guarantees context
+  // exists before dispatching here, so this only fires on direct calls
+  // or test misconfiguration.
+  //
+  // Observability (PR #269 reval): emit a structured log + counter BEFORE
+  // re-throwing so rejections are visible in production even when no
+  // upstream handler captures the error. Without this, fail-closed
+  // rejections at this gate would be silent in metrics/dashboards and only
+  // discoverable via incidental error traces.
+  let tenant: string;
+  let agent: string;
+  try {
+    tenant = getCurrentTenant();
+    agent = getCurrentAgent();
+  } catch (err) {
+    if (err instanceof MissingTenantContextError) {
+      logger.warn(
+        {
+          code: err.code,
+          skill_id: ctx.skill.id,
+          skill_version: ctx.skill.version,
+          turno_id: ctx.turno_id ?? null,
+          conversa_id: ctx.conversa_id ?? null,
+        },
+        'p9a.tool_mediated.missing_tenant_context',
+      );
+      incCounter('maia_tool_mediated_missing_tenant_context_total', {
+        skill_id: ctx.skill.id,
+      });
+    }
+    throw err;
+  }
   const idempotencyBase = `${tenant}:${agent}:${ctx.skill.id}:${ctx.skill.version}:${stableExecId}`;
 
   // Safety upper bound for the loop: allow a few extra iterations beyond
