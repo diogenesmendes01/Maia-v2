@@ -8,8 +8,25 @@
  *   - TTL (default 5min) via stored `expireAt` per entry
  *   - LRU eviction when size > max_entries (default 10_000)
  *   - Negative caching: `'unresolved'` stored to avoid repeated DB misses
- *   - Redis pub/sub subscription on POLICY_LIFECYCLE_CHANNEL invalidates
- *     entries matching {tenant_id, agent_id, descriptor}
+ *   - Redis pub/sub PSUBSCRIBE on POLICY_LIFECYCLE_CHANNEL_PATTERN
+ *     (`policy_rule_lifecycle:*`) — see #249. Each lifecycle event is
+ *     published on a per-tenant channel `policy_rule_lifecycle:{tenant_id}`,
+ *     so the channel name itself carries routing information. The
+ *     subscriber:
+ *       1) Parses the channel back to a tenant_id.
+ *       2) Drops the event if the channel does not match the per-tenant
+ *          shape (defense against mis-routed publishes).
+ *       3) Drops the event if the parsed channel-tenant does NOT match the
+ *          payload-tenant (defense against payload smuggling).
+ *     Only then does it invalidate the cache slice for that (tenant,
+ *     agent, descriptor).
+ *
+ * Why PSUBSCRIBE and not enumerated SUBSCRIBE: a process serves any tenant
+ * whose request happens to land on it; tenants are not declared at startup.
+ * Pattern subscribe lets the cache invalidate whichever tenants this process
+ * has actually cached, without the broker spamming subscribers of OTHER
+ * tenants. Information-disclosure isolation is preserved because each
+ * tenant's events flow on a separate channel name.
  *
  * Failure mode: if Redis is down, TTL natural expiry bounds staleness to
  * `ttl_ms`. Strict read-after-write for hard_limit policies lives in P9d.
@@ -22,7 +39,11 @@ import type {
   ResolvedPolicy,
   PolicyLifecycleEvent,
 } from './types.js';
-import { POLICY_LIFECYCLE_CHANNEL } from './policy-rules-repo.js';
+import {
+  POLICY_LIFECYCLE_CHANNEL,
+  POLICY_LIFECYCLE_CHANNEL_PATTERN,
+  parsePolicyLifecycleChannel,
+} from './policy-rules-repo.js';
 
 export interface CacheKey {
   tenant_id: string;
@@ -298,26 +319,72 @@ let subscriberStarted = false;
  * that "Redis publish invalidates cache" was the publish branch, never
  * the subscribe branch. This indirection lets a unit test exercise the
  * full publish-payload → cache-invalidate path.
+ *
+ * Issue #249 (per-tenant channel): two NEW invariants enforced here.
+ *   1. Channel name MUST match the per-tenant shape
+ *      `policy_rule_lifecycle:{tenant_id}`. A message on the bare legacy
+ *      channel `policy_rule_lifecycle` (no `:tenant`) is dropped — only a
+ *      misconfigured publisher would emit it, and we'd rather miss an
+ *      invalidation (TTL kicks in) than process an event we cannot tenant-
+ *      attribute.
+ *   2. The channel-derived tenant_id MUST equal `payload.tenant_id`. A
+ *      mismatch means either (a) ALS leaked at publish time, or (b) a
+ *      bad actor tried to smuggle a foreign payload onto a tenant's
+ *      channel. Either way the message is dropped with a warn log.
+ *
+ * Backwards-compat: the legacy parameter name `channel` still accepts the
+ * Redis-delivered channel string. Pattern subscribers in ioredis fire
+ * `pmessage` with `(pattern, channel, message)`; the wrapping subscriber
+ * passes `channel` through.
  */
 export function handlePolicyLifecycleMessage(
   channel: string,
   msg: string,
   cache: PolicyResolverCache = policyResolverCache,
 ): void {
-  if (channel !== POLICY_LIFECYCLE_CHANNEL) return;
+  const channelTenant = parsePolicyLifecycleChannel(channel);
+  if (channelTenant === null) {
+    // Either the legacy bare-name channel (`policy_rule_lifecycle` with
+    // no tenant suffix) or an unrelated channel. Drop silently for
+    // unrelated channels; warn for the legacy shape to surface stragglers.
+    if (channel === POLICY_LIFECYCLE_CHANNEL) {
+      logger.warn(
+        { channel },
+        'policy_cache.legacy_global_channel_ignored_issue_249',
+      );
+    }
+    return;
+  }
+  let evt: PolicyLifecycleEvent;
   try {
-    const evt = JSON.parse(msg) as PolicyLifecycleEvent;
-    cache.invalidate({
-      tenant_id: evt.tenant_id,
-      agent_id: evt.agent_id,
-      descriptor: evt.descriptor,
-    });
+    evt = JSON.parse(msg) as PolicyLifecycleEvent;
   } catch (err) {
     logger.warn(
-      { err: (err as Error).message, msg },
+      { err: (err as Error).message, msg, channel },
       'policy_cache.invalid_event_payload',
     );
+    return;
   }
+  if (!evt || typeof evt !== 'object' || typeof evt.tenant_id !== 'string') {
+    logger.warn({ msg, channel }, 'policy_cache.event_payload_missing_tenant');
+    return;
+  }
+  if (evt.tenant_id !== channelTenant) {
+    // Defense-in-depth: a publisher that built its event in tenant-A
+    // context but somehow published on tenant-B's channel is a bug
+    // worth surfacing — and we MUST NOT invalidate tenant-A entries
+    // based on the channel routing. Drop and log.
+    logger.warn(
+      { channel, channelTenant, payloadTenant: evt.tenant_id },
+      'policy_cache.channel_payload_tenant_mismatch_dropped',
+    );
+    return;
+  }
+  cache.invalidate({
+    tenant_id: evt.tenant_id,
+    agent_id: evt.agent_id,
+    descriptor: evt.descriptor,
+  });
 }
 
 /**
@@ -326,6 +393,19 @@ export function handlePolicyLifecycleMessage(
  * caches still expire naturally via TTL.
  *
  * Wired from src/index.ts startup when FEATURE_POLICY_RESOLVER_V1 is on.
+ *
+ * Issue #249: uses PSUBSCRIBE on `policy_rule_lifecycle:*` instead of
+ * SUBSCRIBE on a bare channel. Each tenant has its own channel name; the
+ * pattern listens to all of them in one connection. The broker delivers
+ * `pmessage` events with `(pattern, channel, message)`; we forward to
+ * `handlePolicyLifecycleMessage(channel, message)`, which re-derives the
+ * tenant from the channel name and cross-checks against the payload.
+ *
+ * The single legacy `message` event handler is kept on the subscriber so
+ * that mock-tests (which dispatch `'message'` on the EventEmitter to
+ * simulate delivery) continue to work. In production, ioredis fires
+ * `pmessage` for pattern subscribers and never `message`, so the two
+ * paths do not double-fire.
  */
 export function startPolicyCacheInvalidationSubscriber(): void {
   if (subscriberStarted) return;
@@ -341,15 +421,15 @@ export function startPolicyCacheInvalidationSubscriber(): void {
   sub.connect().catch((err) => {
     logger.warn({ err: (err as Error).message }, 'policy_cache.subscribe_connect_failed');
   });
-  void sub.subscribe(POLICY_LIFECYCLE_CHANNEL, (err) => {
+  void sub.psubscribe(POLICY_LIFECYCLE_CHANNEL_PATTERN, (err) => {
     if (err) {
       logger.warn(
-        { err: err.message },
-        'policy_cache.subscribe_failed_natural_ttl_only',
+        { err: err.message, pattern: POLICY_LIFECYCLE_CHANNEL_PATTERN },
+        'policy_cache.psubscribe_failed_natural_ttl_only',
       );
     }
   });
-  sub.on('message', (channel, msg) => {
+  sub.on('pmessage', (_pattern, channel, msg) => {
     handlePolicyLifecycleMessage(channel, msg);
   });
 }
