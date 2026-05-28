@@ -127,12 +127,12 @@ const dbExecuteMock = vi.fn(async (query: SQL) => {
   const params = rendered.params as unknown[];
   renderedSqls.push({ sql: sqlText, params });
 
-  // ---- pg_try_advisory_xact_lock ---------------------------------------
-  // Production:
-  //   SELECT pg_try_advisory_xact_lock($1, $2) AS acquired
-  if (/pg_try_advisory_xact_lock/i.test(sqlText)) {
-    return { rows: [{ acquired: !lockHeld }] };
-  }
+  // NOTE (review v2 fix): the advisory lock SQL is NO LONGER routed through
+  // `db.execute`. Production now uses session-level `pg_try_advisory_lock` on
+  // a dedicated pool client (see `poolConnectMock` below) so the lock
+  // survives statement boundaries and is released explicitly via
+  // `pg_advisory_unlock` in `finally`. We assert the lock call shape against
+  // `lockClientQueryMock` instead of `renderedSqls`.
 
   // ---- COUNT(*) pending (pending-only) ----------------------------------
   // Production:
@@ -229,8 +229,32 @@ const dbExecuteMock = vi.fn(async (query: SQL) => {
   return { rows: [] };
 });
 
+// ─── pool.connect() fake (review v2 fix) ────────────────────────────────────
+// Production now acquires the advisory lock on a dedicated pool client via
+// `pool.connect()` so the session-scoped lock survives statement boundaries
+// and the explicit `pg_advisory_unlock` in `finally` actually targets the
+// same session. The fake tracks every `client.query()` call (lock + unlock)
+// and the `release()` call so tests can assert the lifecycle.
+const lockClientQueryMock = vi.fn(
+  async (sqlText: string, params: unknown[] = []) => {
+    if (/pg_try_advisory_lock\s*\(/i.test(sqlText)) {
+      return { rows: [{ acquired: !lockHeld }], rowCount: 1 };
+    }
+    if (/pg_advisory_unlock\s*\(/i.test(sqlText)) {
+      return { rows: [{ pg_advisory_unlock: true }], rowCount: 1 };
+    }
+    return { rows: [], rowCount: 0 };
+  },
+);
+const lockClientReleaseMock = vi.fn(() => undefined);
+const poolConnectMock = vi.fn(async () => ({
+  query: lockClientQueryMock,
+  release: lockClientReleaseMock,
+}));
+
 vi.mock('@/db/client.js', () => ({
   db: { execute: dbExecuteMock },
+  pool: { connect: poolConnectMock },
 }));
 
 // The embedding provider returns a constant vector of the configured length,
@@ -275,6 +299,9 @@ beforeEach(() => {
   auditLogInserts.length = 0;
   lockHeld = false;
   dbExecuteMock.mockClear();
+  lockClientQueryMock.mockClear();
+  lockClientReleaseMock.mockClear();
+  poolConnectMock.mockClear();
 });
 
 const expectedDim = config.EMBEDDING_DIMENSIONS;
@@ -832,7 +859,7 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
   // and LOWs (dry-run, RETURNING verification, audit trail).
   // -------------------------------------------------------------------------
 
-  describe('concurrency — pg_try_advisory_xact_lock', () => {
+  describe('concurrency — pg_try_advisory_lock (session-level, review v2)', () => {
     it('LOCK BUSY — another run holds the lock → throws ConcurrentRunError, no mutation', async () => {
       seedTwoTenants();
       lockHeld = true; // simulate another process holding the lock for this tuple
@@ -848,9 +875,21 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
       expect(providerCalls.length).toBe(0);
       const aAlpha = store.find((r) => r.id === 'mem_A_alpha');
       expect(aAlpha!.embedding).toBeNull();
+
+      // Lock acquire fired but unlock MUST NOT fire (we never acquired it).
+      const acquireCalls = lockClientQueryMock.mock.calls.filter((c) =>
+        /pg_try_advisory_lock/i.test(c[0] as string),
+      );
+      const unlockCalls = lockClientQueryMock.mock.calls.filter((c) =>
+        /pg_advisory_unlock/i.test(c[0] as string),
+      );
+      expect(acquireCalls.length).toBe(1);
+      expect(unlockCalls.length).toBe(0);
+      // Client MUST still be released so it returns to the pool.
+      expect(lockClientReleaseMock).toHaveBeenCalledTimes(1);
     });
 
-    it('LOCK FREE — acquired → run proceeds normally', async () => {
+    it('LOCK FREE — acquired → run proceeds normally, then releases lock + client', async () => {
       seedTwoTenants();
       lockHeld = false;
 
@@ -859,25 +898,114 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
       );
       const result = await rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 });
       expect(result.updated).toBe(2);
+
+      // Both lock and unlock fired exactly once, in order, on the same client.
+      const acquireCalls = lockClientQueryMock.mock.calls.filter((c) =>
+        /pg_try_advisory_lock/i.test(c[0] as string),
+      );
+      const unlockCalls = lockClientQueryMock.mock.calls.filter((c) =>
+        /pg_advisory_unlock/i.test(c[0] as string),
+      );
+      expect(acquireCalls.length).toBe(1);
+      expect(unlockCalls.length).toBe(1);
+      // Client MUST be released so it returns to the pool.
+      expect(lockClientReleaseMock).toHaveBeenCalledTimes(1);
     });
 
-    it('LOCK CALL SHAPE — uses pg_try_advisory_xact_lock with two int4 keys', async () => {
+    it('LOCK PINNED TO ONE CLIENT — exactly one pool.connect() per run', async () => {
+      // Review v2 critical fix: the lock + unlock MUST hit the SAME session,
+      // otherwise the unlock targets a different connection and the original
+      // lock leaks until the pool closes the holding connection. We assert
+      // the script checks out exactly one pool client per run.
+      seedTwoTenants();
+      const { rebuildEmbeddingsForTuple } = await import(
+        '@/../scripts/embeddings-rebuild.ts'
+      );
+      await rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 });
+      expect(poolConnectMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('LOCK CALL SHAPE — uses session-level pg_try_advisory_lock with two int4 keys', async () => {
       seedTwoTenants();
       const { rebuildEmbeddingsForTuple } = await import(
         '@/../scripts/embeddings-rebuild.ts'
       );
       await rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 });
 
-      const lockSql = renderedSqls.find((r) =>
-        /pg_try_advisory_xact_lock/i.test(r.sql),
+      const acquireCall = lockClientQueryMock.mock.calls.find((c) =>
+        /pg_try_advisory_lock/i.test(c[0] as string),
       );
-      expect(lockSql).toBeDefined();
+      expect(acquireCall).toBeDefined();
+      // Critical: NOT the transactional variant (review v2). The _xact_
+      // variant would release at end of the acquiring SELECT under autocommit.
+      expect(acquireCall![0]).not.toMatch(/pg_try_advisory_xact_lock/i);
+      expect(acquireCall![0]).toMatch(/pg_try_advisory_lock/i);
       // Two bound integer params (namespace + tuple key). Both must be in the
       // int4 range so the call signature matches the two-arg overload.
-      expect(lockSql!.params.length).toBe(2);
-      for (const p of lockSql!.params) {
+      const params = acquireCall![1] as unknown[];
+      expect(params.length).toBe(2);
+      for (const p of params) {
         expect(Number.isInteger(p as number)).toBe(true);
         expect(Math.abs(p as number)).toBeLessThanOrEqual(0x7fffffff);
+      }
+    });
+
+    it('UNLOCK CALL SHAPE — pg_advisory_unlock with the same two int4 keys as the acquire', async () => {
+      seedTwoTenants();
+      const { rebuildEmbeddingsForTuple } = await import(
+        '@/../scripts/embeddings-rebuild.ts'
+      );
+      await rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 });
+
+      const acquireCall = lockClientQueryMock.mock.calls.find((c) =>
+        /pg_try_advisory_lock/i.test(c[0] as string),
+      );
+      const unlockCall = lockClientQueryMock.mock.calls.find((c) =>
+        /pg_advisory_unlock/i.test(c[0] as string),
+      );
+      expect(unlockCall).toBeDefined();
+      // Unlock must target the exact same lock key (namespace, tuple).
+      expect(unlockCall![1]).toEqual(acquireCall![1]);
+    });
+
+    it('UNLOCK ON ERROR — UPDATE throws → lock still released, client still released', async () => {
+      // finally{} contract: a mid-run failure MUST NOT leak the advisory lock
+      // (without this, a poison row would block the next operator until the
+      // pool idle-timeout closes the connection).
+      seedTwoTenants();
+
+      // One-shot `db.execute` override: throw on the FIRST UPDATE so the run
+      // fails after the lock has been acquired. The provider has already
+      // returned vectors at that point.
+      const originalImpl = dbExecuteMock.getMockImplementation()!;
+      let updateSeen = false;
+      dbExecuteMock.mockImplementation(async (query: SQL) => {
+        const rendered = _dialect.sqlToQuery(query);
+        const sqlText = rendered.sql;
+        if (!updateSeen && /^\s*UPDATE\s+agent_memories/i.test(sqlText)) {
+          updateSeen = true;
+          throw new Error('simulated update failure');
+        }
+        return originalImpl(query);
+      });
+
+      const { rebuildEmbeddingsForTuple } = await import(
+        '@/../scripts/embeddings-rebuild.ts'
+      );
+
+      try {
+        await expect(
+          rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 }),
+        ).rejects.toThrow(/simulated update failure/);
+
+        // The lock was acquired; finally must have unlocked it + released client.
+        const unlockCalls = lockClientQueryMock.mock.calls.filter((c) =>
+          /pg_advisory_unlock/i.test(c[0] as string),
+        );
+        expect(unlockCalls.length).toBe(1);
+        expect(lockClientReleaseMock).toHaveBeenCalledTimes(1);
+      } finally {
+        dbExecuteMock.mockImplementation(originalImpl);
       }
     });
 

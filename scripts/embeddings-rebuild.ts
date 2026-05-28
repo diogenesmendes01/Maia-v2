@@ -44,11 +44,22 @@
  *   - [MEDIUM] CLI flag aliases: `--tenant_id` / `--agent_id` are accepted as
  *     aliases of `--tenant` / `--agent` to match the issue's contract without
  *     breaking the owner-locked Option A (required CLI args).
- *   - [MEDIUM] Concurrency guard: `pg_try_advisory_xact_lock(hash, hash2)`
- *     keyed by ('embeddings-rebuild', tenant_id, agent_id) inside the per-run
- *     transaction. Two simultaneous runs on the same tuple → the second fails
- *     fast with exit code 75 (EX_TEMPFAIL) instead of double-paying the
- *     provider for the same rows.
+ *   - [MEDIUM] Concurrency guard: `pg_try_advisory_lock(hash, hash2)` (session-
+ *     scoped, NOT `_xact_lock` — see review v2) keyed by ('embeddings-rebuild',
+ *     tenant_id, agent_id) on a dedicated pool client. Two simultaneous runs
+ *     on the same tuple → the second fails fast with exit code 75 (EX_TEMPFAIL)
+ *     instead of double-paying the provider. The lock is explicitly released
+ *     via `pg_advisory_unlock` in `finally` on the SAME client (pinned via
+ *     `pool.connect()`) so it cannot leak across runs.
+ *
+ *     Why session-level + dedicated client (not `_xact_lock` + autocommit):
+ *     `pg_try_advisory_xact_lock` is released at the END of the holding
+ *     transaction; under drizzle's `db.execute` autocommit each statement is
+ *     its own transaction, so the lock would release the instant the acquiring
+ *     SELECT returns — two concurrent runs could BOTH "acquire" the lock and
+ *     race the rest of the rebuild. Session-level `pg_try_advisory_lock` on a
+ *     pinned `pool.connect()` client survives across statements until the
+ *     explicit `pg_advisory_unlock` in `finally`.
  *   - [LOW] `--dry-run` mode: counts in-scope and pending rows without calling
  *     the provider and without issuing UPDATEs.
  *   - [LOW] TTY confirmation: prompts the operator before any mutation unless
@@ -95,7 +106,7 @@
  *   enumerates `(tenant_id, agent_id)` tuples and re-enters this function
  *   per-tuple, not a silent default.
  */
-import { db } from '@/db/client.js';
+import { db, pool } from '@/db/client.js';
 import { sql } from 'drizzle-orm';
 import { getEmbeddingProvider } from '@/lib/embeddings.js';
 import { config } from '@/config/env.js';
@@ -234,8 +245,9 @@ export function getOperatorIdentity(env: NodeJS.ProcessEnv = process.env): strin
 
 /**
  * Stable 32-bit hash of a string, used as input to Postgres
- * `pg_try_advisory_xact_lock(int4, int4)`. Two args (instead of one int8)
- * lets us combine ('embeddings-rebuild', tenant, agent) deterministically.
+ * `pg_try_advisory_lock(int4, int4)` / `pg_advisory_unlock(int4, int4)`. Two
+ * args (instead of one int8) lets us combine ('embeddings-rebuild', tenant,
+ * agent) deterministically.
  *
  * Note: we don't need cryptographic strength — we only need (a) determinism
  * across runs on the same input and (b) good-enough distribution to avoid
@@ -275,11 +287,13 @@ async function promptYesNo(question: string): Promise<boolean> {
  * Returns `{ updated, processed, totalInScope, dryRun, lockAcquired }` so
  * callers (tests, future wrappers) can assert how many rows were touched.
  *
- * Locking: the function acquires `pg_try_advisory_xact_lock` keyed by
- * (fnv1a32('embeddings-rebuild'), fnv1a32(`${tenant_id}::${agent_id}`)) inside
- * the outer transaction. If another process holds the lock for the same
- * tuple, the function throws `ConcurrentRunError` (mapped to exit 75 by the
- * CLI). The lock is released automatically at transaction commit/rollback.
+ * Locking: the function acquires session-level `pg_try_advisory_lock` keyed
+ * by (fnv1a32('embeddings-rebuild'), fnv1a32(`${tenant_id}::${agent_id}`)) on
+ * a dedicated pool client (pinned via `pool.connect()`). If another process
+ * holds the lock for the same tuple, the function throws `ConcurrentRunError`
+ * (mapped to exit 75 by the CLI). The lock is explicitly released via
+ * `pg_advisory_unlock` in `finally` on the same pinned client — survives
+ * statement boundaries and cannot leak past the run.
  *
  * Dry-run: when `dryRun` is true, the SELECT for pending rows still runs (so
  * we can show the operator what *would* be touched), but the provider is
@@ -328,143 +342,183 @@ export async function rebuildEmbeddingsForTuple(args: {
   const LOCK_TUPLE_KEY = fnv1a32(`${tenant_id}::${agent_id}`);
 
   return runWithTenantContext({ tenant_id, agent_id }, async () => {
-    // Single connection / single transaction wraps the whole tuple run so
-    // (a) the advisory lock is held end-to-end and (b) per-batch transactions
-    // (below) inherit the lock without re-acquiring.
+    // ─── Concurrency guard (review v2 fix) ───────────────────────────────
+    // We use SESSION-level `pg_try_advisory_lock` (NOT `_xact_lock`) on a
+    // dedicated pool client. Rationale:
+    //   - `pg_try_advisory_xact_lock` is released at the END of the holding
+    //     transaction. Drizzle's `db.execute` runs each statement in its own
+    //     autocommit transaction, so the lock would release the instant the
+    //     acquiring SELECT returns — two concurrent runs could BOTH "acquire"
+    //     and race the rest of the work.
+    //   - Session-level `pg_try_advisory_lock` persists across statements
+    //     until either an explicit `pg_advisory_unlock` or the session ends.
+    //     Pinning lock+unlock to a single `pool.connect()` client guarantees
+    //     both calls hit the same session so the unlock actually releases.
+    //   - try_* (non-blocking): a concurrent runner should fail fast and
+    //     surface to the operator rather than queue up.
     //
-    // We use try_lock (non-blocking) — a concurrent runner should fail fast
-    // and surface to the operator rather than queue up.
-    const lockRow = await db.execute<{ acquired: boolean }>(sql`
-      SELECT pg_try_advisory_xact_lock(${LOCK_NAMESPACE}, ${LOCK_TUPLE_KEY}) AS acquired
-    `);
-    // Some drivers / mocks may return the row as either { acquired: true }
-    // or a Postgres-shaped row { pg_try_advisory_xact_lock: true }. Accept
-    // both shapes defensively — the production driver returns the aliased
-    // column name, but tests may not implement the alias.
-    const lockRaw = (lockRow.rows[0] ?? {}) as Record<string, unknown>;
-    const acquired =
-      (lockRaw.acquired as boolean | undefined) ??
-      (lockRaw.pg_try_advisory_xact_lock as boolean | undefined) ??
-      false;
-    if (!acquired) {
-      logger.warn(
-        { tenant_id, agent_id, op: 'embeddings_rebuild_lock_busy' },
-        'embeddings-rebuild: advisory lock not acquired (concurrent run?)',
+    // The SELECT/UPDATE inside the loop continue using `db.execute` (pool-
+    // routed). They don't need the same session — the cluster-wide visibility
+    // of the advisory lock blocks ANY concurrent acquire attempt regardless
+    // of which connection it lands on.
+    const lockClient = await pool.connect();
+    let lockAcquired = false;
+    try {
+      const lockResult = await lockClient.query(
+        'SELECT pg_try_advisory_lock($1::int4, $2::int4) AS acquired',
+        [LOCK_NAMESPACE, LOCK_TUPLE_KEY],
       );
-      throw new ConcurrentRunError(tenant_id, agent_id);
-    }
+      // Production driver (node-postgres) returns `{ acquired: boolean }`.
+      // Tests may surface either `acquired` or the bare function-name column.
+      const lockRaw = (lockResult.rows[0] ?? {}) as Record<string, unknown>;
+      lockAcquired =
+        (lockRaw.acquired as boolean | undefined) ??
+        (lockRaw.pg_try_advisory_lock as boolean | undefined) ??
+        false;
+      if (!lockAcquired) {
+        logger.warn(
+          { tenant_id, agent_id, op: 'embeddings_rebuild_lock_busy' },
+          'embeddings-rebuild: advisory lock not acquired (concurrent run?)',
+        );
+        throw new ConcurrentRunError(tenant_id, agent_id);
+      }
 
-    const total = await db.execute<{ count: string }>(sql`
-      SELECT count(*)::text AS count
-      FROM agent_memories
-      WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
-    `);
-    const totalInScope = Number(
-      (total.rows[0] as { count: string } | undefined)?.count ?? 0,
-    );
+      // ─── Tuple body (read/update loop, unchanged behaviour) ──────────────
+      // Continues under the cluster-wide protection of the session-level
+      // advisory lock held by `lockClient` above. The lock is released in
+      // `finally` below — see review v2 explanation at the top of this block.
+      const total = await db.execute<{ count: string }>(sql`
+        SELECT count(*)::text AS count
+        FROM agent_memories
+        WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+      `);
+      const totalInScope = Number(
+        (total.rows[0] as { count: string } | undefined)?.count ?? 0,
+      );
 
-    // Count pending separately so dry-run can report it without paging the
-    // whole table. Same predicate as the SELECT loop below.
-    const pending = await db.execute<{ count: string }>(sql`
-      SELECT count(*)::text AS count
-      FROM agent_memories
-      WHERE tenant_id = ${tenant_id}
-        AND agent_id = ${agent_id}
-        AND (embedding IS NULL OR vector_dims(embedding) != ${config.EMBEDDING_DIMENSIONS})
-    `);
-    const pendingInScope = Number(
-      (pending.rows[0] as { count: string } | undefined)?.count ?? 0,
-    );
-
-    log(`agent_memories rows in scope: ${totalInScope} (pending: ${pendingInScope})`);
-
-    if (dryRun) {
-      log('dry-run: no provider calls, no UPDATEs');
-      return { updated: 0, processed: 0, totalInScope, pendingInScope, dryRun };
-    }
-
-    let processed = 0;
-    let updated = 0;
-    // Bound the loop independently of pendingInScope — the SELECT only
-    // fetches rows whose embedding is null or has the wrong dimension. We
-    // iterate until SELECT returns an empty page.
-    while (true) {
-      const rows = await db.execute<{ id: string; conteudo: string }>(sql`
-        SELECT id::text, conteudo
+      // Count pending separately so dry-run can report it without paging the
+      // whole table. Same predicate as the SELECT loop below.
+      const pending = await db.execute<{ count: string }>(sql`
+        SELECT count(*)::text AS count
         FROM agent_memories
         WHERE tenant_id = ${tenant_id}
           AND agent_id = ${agent_id}
           AND (embedding IS NULL OR vector_dims(embedding) != ${config.EMBEDDING_DIMENSIONS})
-        ORDER BY created_at
-        LIMIT ${BATCH}
       `);
-      if (rows.rows.length === 0) break;
-      // Batch only contains text from THIS (tenant, agent) tuple — no cross-
-      // tenant content mixing at the provider boundary.
-      const texts = rows.rows.map((r) => (r as { conteudo: string }).conteudo);
-      let embs: number[][];
-      try {
-        embs = await provider.embed(texts);
-      } catch (err) {
-        logger.error(
-          { tenant_id, agent_id, op: 'embeddings_rebuild_provider_failed', err },
-          'embeddings-rebuild: provider call failed mid-batch',
-        );
-        throw err;
+      const pendingInScope = Number(
+        (pending.rows[0] as { count: string } | undefined)?.count ?? 0,
+      );
+
+      log(`agent_memories rows in scope: ${totalInScope} (pending: ${pendingInScope})`);
+
+      if (dryRun) {
+        log('dry-run: no provider calls, no UPDATEs');
+        return { updated: 0, processed: 0, totalInScope, pendingInScope, dryRun };
       }
-      for (let i = 0; i < rows.rows.length; i++) {
-        const r = rows.rows[i] as { id: string };
-        const v = `[${(embs[i] ?? []).join(',')}]`;
-        // UPDATE pins tenant_id AND agent_id alongside the id — a stale or
-        // mistyped id cannot mutate a row outside the routed tuple.
-        // RETURNING id lets us verify the row really matched the WHERE
-        // (covers the race case where worker changed tenant/agent between
-        // our SELECT and our UPDATE).
+
+      let processed = 0;
+      let updated = 0;
+      // Bound the loop independently of pendingInScope — the SELECT only
+      // fetches rows whose embedding is null or has the wrong dimension. We
+      // iterate until SELECT returns an empty page.
+      while (true) {
+        const rows = await db.execute<{ id: string; conteudo: string }>(sql`
+          SELECT id::text, conteudo
+          FROM agent_memories
+          WHERE tenant_id = ${tenant_id}
+            AND agent_id = ${agent_id}
+            AND (embedding IS NULL OR vector_dims(embedding) != ${config.EMBEDDING_DIMENSIONS})
+          ORDER BY created_at
+          LIMIT ${BATCH}
+        `);
+        if (rows.rows.length === 0) break;
+        // Batch only contains text from THIS (tenant, agent) tuple — no cross-
+        // tenant content mixing at the provider boundary.
+        const texts = rows.rows.map((r) => (r as { conteudo: string }).conteudo);
+        let embs: number[][];
         try {
-          const result = await db.execute<{ id: string }>(sql`
-            UPDATE agent_memories
-            SET embedding = ${v}::vector
-            WHERE id = ${r.id}::uuid
-              AND tenant_id = ${tenant_id}
-              AND agent_id = ${agent_id}
-            RETURNING id::text
-          `);
-          // Drivers expose row count either via .rowCount (pg) or via
-          // .rows.length (drizzle). Use the rows array as the source of
-          // truth — it's what we actually selected.
-          const affected = result.rows.length;
-          if (affected !== 1) {
-            logger.warn(
+          embs = await provider.embed(texts);
+        } catch (err) {
+          logger.error(
+            { tenant_id, agent_id, op: 'embeddings_rebuild_provider_failed', err },
+            'embeddings-rebuild: provider call failed mid-batch',
+          );
+          throw err;
+        }
+        for (let i = 0; i < rows.rows.length; i++) {
+          const r = rows.rows[i] as { id: string };
+          const v = `[${(embs[i] ?? []).join(',')}]`;
+          // UPDATE pins tenant_id AND agent_id alongside the id — a stale or
+          // mistyped id cannot mutate a row outside the routed tuple.
+          // RETURNING id lets us verify the row really matched the WHERE
+          // (covers the race case where worker changed tenant/agent between
+          // our SELECT and our UPDATE).
+          try {
+            const result = await db.execute<{ id: string }>(sql`
+              UPDATE agent_memories
+              SET embedding = ${v}::vector
+              WHERE id = ${r.id}::uuid
+                AND tenant_id = ${tenant_id}
+                AND agent_id = ${agent_id}
+              RETURNING id::text
+            `);
+            // Drivers expose row count either via .rowCount (pg) or via
+            // .rows.length (drizzle). Use the rows array as the source of
+            // truth — it's what we actually selected.
+            const affected = result.rows.length;
+            if (affected !== 1) {
+              logger.warn(
+                {
+                  tenant_id,
+                  agent_id,
+                  row_id: r.id,
+                  affected,
+                  op: 'embeddings_rebuild_update_no_op',
+                },
+                'embeddings-rebuild: UPDATE matched zero rows (race with worker?)',
+              );
+            } else {
+              updated++;
+            }
+          } catch (err) {
+            logger.error(
               {
                 tenant_id,
                 agent_id,
                 row_id: r.id,
-                affected,
-                op: 'embeddings_rebuild_update_no_op',
+                op: 'embeddings_rebuild_update_failed',
+                err,
               },
-              'embeddings-rebuild: UPDATE matched zero rows (race with worker?)',
+              'embeddings-rebuild: UPDATE failed',
             );
-          } else {
-            updated++;
+            throw err;
           }
-        } catch (err) {
-          logger.error(
-            {
-              tenant_id,
-              agent_id,
-              row_id: r.id,
-              op: 'embeddings_rebuild_update_failed',
-              err,
-            },
-            'embeddings-rebuild: UPDATE failed',
+        }
+        processed += rows.rows.length;
+        log(`  processed ${processed} (updated ${updated}, total in scope ${totalInScope})`);
+      }
+      return { updated, processed, totalInScope, pendingInScope, dryRun };
+    } finally {
+      // Release the lock on the SAME client / session that acquired it.
+      // Skip if acquire failed (nothing to unlock). Swallow errors here so a
+      // unlock failure doesn't mask a more interesting upstream error — the
+      // worst case (lock leak on this connection) self-heals when the pool
+      // closes the connection on its idle-timeout.
+      if (lockAcquired) {
+        try {
+          await lockClient.query(
+            'SELECT pg_advisory_unlock($1::int4, $2::int4)',
+            [LOCK_NAMESPACE, LOCK_TUPLE_KEY],
           );
-          throw err;
+        } catch (err) {
+          logger.warn(
+            { tenant_id, agent_id, err, op: 'embeddings_rebuild_unlock_failed' },
+            'embeddings-rebuild: pg_advisory_unlock failed (non-fatal — pool idle-timeout will release)',
+          );
         }
       }
-      processed += rows.rows.length;
-      log(`  processed ${processed} (updated ${updated}, total in scope ${totalInScope})`);
+      lockClient.release();
     }
-    return { updated, processed, totalInScope, pendingInScope, dryRun };
   });
 }
 
