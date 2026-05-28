@@ -49,11 +49,26 @@ export async function audit(input: {
 
   const write = async (): Promise<void> => {
     await auditRepo.write(payload);
-    incCounter('maia_audit_events_total', { action: input.acao });
+    // Issue #271: include tenant_id/agent_id labels so dashboards/alerts can
+    // distinguish per-tenant rate-limit overage (and every other audit action)
+    // instead of seeing one global aggregate. Read from the active ALS context
+    // — when this branch runs, write() is always inside a runWithTenantContext
+    // (either the caller's, or the synthetic `system` bucket below).
+    const ctx = tryGetCurrentContext();
+    incCounter('maia_audit_events_total', {
+      action: input.acao,
+      tenant_id: ctx?.tenant_id ?? 'system',
+      agent_id: ctx?.agent_id ?? 'system',
+    });
   };
 
+  // Capture caller context BEFORE entering the fallback so the failure-path
+  // counter (below) sees the same tenant attribution as the success path —
+  // otherwise an in-tenant write that DB-errors would be labeled `system`.
+  const callerCtx = tryGetCurrentContext();
+
   try {
-    if (tryGetCurrentContext()) {
+    if (callerCtx) {
       await write();
     } else {
       // System bucket — preserves the row for setup/gateway/startup events
@@ -66,6 +81,10 @@ export async function audit(input: {
     }
   } catch (err) {
     logger.error({ err, acao: input.acao }, 'audit.write_failed');
-    incCounter('maia_audit_write_failed_total', { action: input.acao });
+    incCounter('maia_audit_write_failed_total', {
+      action: input.acao,
+      tenant_id: callerCtx?.tenant_id ?? 'system',
+      agent_id: callerCtx?.agent_id ?? 'system',
+    });
   }
 }
