@@ -36,16 +36,26 @@
 -- This migration adds ONLY the schema. The repo + dispatch wiring + retry
 -- guard land in subsequent commits on the same PR so the schema can be
 -- reviewed in isolation before the critical-path code starts depending on it.
+--
+-- #227 Codex review: the UNIQUE was originally on idempotency_key alone — that
+-- was inconsistent with #232/#237 which establish (tenant_id, agent_id, …) as
+-- the multi-tenant invariant. Modified in place (migration not yet merged) to
+-- a composite UNIQUE (tenant_id, agent_id, idempotency_key). The repo's
+-- advisory-lock partition hashes the same tuple so the lock matches the unique.
 CREATE TABLE IF NOT EXISTS outbound_messages (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id text NOT NULL DEFAULT 'default',
   agent_id text NOT NULL DEFAULT 'default',
   -- Turn-scoped dedupe unit: '${conversa_id}:${in_reply_to}'. Matches the
   -- 'outbound_dispatch_failed' audit metadata.idempotency_key already emitted
-  -- by #216. UNIQUE → one row per inbound turn (any channel). Channel
-  -- fall-backs within a turn (e.g. poll → text) UPDATE the channel column on
-  -- the same row rather than inserting a second row — one reply per turn.
-  idempotency_key text NOT NULL UNIQUE,
+  -- by #216. UNIQUE per (tenant_id, agent_id, idempotency_key) → one row per
+  -- inbound turn (any channel) WITHIN a tenant+agent scope. Channel fall-backs
+  -- within a turn (e.g. poll → text) UPDATE the channel column on the same row
+  -- rather than inserting a second row — one reply per turn. The composite key
+  -- matches the multi-tenant invariant established by #232/#237: two tenants
+  -- (or two agents in the same tenant) with the same '${conversa_id}:${in_reply_to}'
+  -- string MUST NOT collide globally.
+  idempotency_key text NOT NULL,
   conversa_id uuid NOT NULL,
   -- The inbound mensagem.id this reply is responding to.
   in_reply_to uuid NOT NULL,
@@ -55,7 +65,11 @@ CREATE TABLE IF NOT EXISTS outbound_messages (
   -- send that returned no key.id (the 'sent without id' case discriminated by
   -- isBaileysConnected() in output-dispatch.ts).
   provider_message_id text,
-  -- 'pending'  — pre-send optimistic insert; no provider ack yet.
+  -- 'pending'  — pre-send optimistic insert; no provider ack yet. With the
+  --              advisory-lock + strict-pending semantic (see repo), this is
+  --              now an IN-FLIGHT marker: a concurrent claim sees 'pending' and
+  --              SKIPS (the other worker owns this turn). Only 'failed' rows
+  --              are reclaimable for retry.
   -- 'sent'     — provider acked with an id; safe to skip re-attempts.
   -- 'failed'   — pre-send failure (disconnected gateway, recipient lookup
   --              throw, etc.); nothing reached the user → ReAct re-attempt is
@@ -70,7 +84,11 @@ CREATE TABLE IF NOT EXISTS outbound_messages (
   CONSTRAINT outbound_messages_status_check
     CHECK (status IN ('pending', 'sent', 'failed', 'unknown')),
   CONSTRAINT outbound_messages_channel_check
-    CHECK (channel IN ('text', 'voice', 'document', 'poll'))
+    CHECK (channel IN ('text', 'voice', 'document', 'poll')),
+  -- Composite UNIQUE per (tenant_id, agent_id, idempotency_key). Aligns with
+  -- #232 (merged) + #237 (in review): tenant/agent isolation is the global
+  -- invariant, not a global string namespace on idempotency_key.
+  CONSTRAINT outbound_messages_tenant_agent_key UNIQUE (tenant_id, agent_id, idempotency_key)
 );
 
 -- Hot-path access (pre-send optimistic upsert + per-turn guard) keys off
@@ -83,7 +101,7 @@ COMMENT ON TABLE outbound_messages IS
   'Issue #227: outbound delivery idempotency ledger. One row per inbound turn (any channel). Pre-send optimistic insert + status-aware guard closes the "delivered-but-threw" window left open by #216 phase-tagging. NOT the same as outbox_messages (async worker queue).';
 
 COMMENT ON COLUMN outbound_messages.idempotency_key IS
-  'Turn-scoped dedupe unit: ${conversa_id}:${in_reply_to}. Matches metadata.idempotency_key on outbound_dispatch_failed audits emitted by #216.';
+  'Turn-scoped dedupe unit: ${conversa_id}:${in_reply_to}. UNIQUE per (tenant_id, agent_id, idempotency_key) — multi-tenant invariant per #232/#237. Matches metadata.idempotency_key on outbound_dispatch_failed audits emitted by #216.';
 
 COMMENT ON COLUMN outbound_messages.status IS
   'pending|sent|failed|unknown. ''unknown'' is the crux: ambiguous delivery (likely sent) — guard treats as sent (NO re-send) to forbid double-sends, trading a sliver of silence risk for zero double-send.';

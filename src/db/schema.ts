@@ -536,7 +536,8 @@ export const outbound_messages = pgTable(
     agent_id: text('agent_id').notNull().default('default'),
     // Turn-scoped: `${conversa_id}:${in_reply_to}`. Mirrors the
     // outbound_dispatch_failed audit metadata.idempotency_key from #216.
-    idempotency_key: text('idempotency_key').notNull().unique(),
+    // UNIQUE per (tenant_id, agent_id, idempotency_key) — see composite below.
+    idempotency_key: text('idempotency_key').notNull(),
     conversa_id: uuid('conversa_id').notNull(),
     in_reply_to: uuid('in_reply_to').notNull(),
     channel: text('channel').notNull(),
@@ -550,6 +551,15 @@ export const outbound_messages = pgTable(
     byTenantCreated: index('idx_outbound_messages_tenant_created').on(
       t.tenant_id,
       t.created_at,
+    ),
+    // Multi-tenant invariant (#232/#237): tenant+agent scope the dedupe namespace.
+    // Two tenants (or two agents in one tenant) can share the same idempotency_key
+    // string without colliding; the advisory-lock in upsertPending hashes the same
+    // (tenant_id, agent_id, idempotency_key) tuple so lock partitioning matches.
+    byTenantAgentKey: unique('outbound_messages_tenant_agent_key').on(
+      t.tenant_id,
+      t.agent_id,
+      t.idempotency_key,
     ),
   }),
 );

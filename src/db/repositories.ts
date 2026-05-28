@@ -1239,17 +1239,36 @@ export type OutboundStatus = 'pending' | 'sent' | 'failed' | 'unknown';
 
 export const outboundMessagesRepo = {
   /**
-   * Pre-send optimistic upsert. Returns the current row and a `skip` flag:
+   * Pre-send optimistic claim. Returns the current row and a `skip` flag:
    *   - skip=false: we claimed this turn (inserted a new pending row OR took
-   *     over an existing pending/failed row by resetting it to pending).
-   *     Caller proceeds with the gateway send, then markSent/markFailed.
-   *   - skip=true: the existing row already has status 'sent' or 'unknown' —
-   *     the user got (or might have gotten) this turn's reply. Caller MUST NOT
-   *     send again. The returned row's provider_message_id is the original ack
-   *     (NULL when status='unknown').
-   * Atomic via INSERT … ON CONFLICT DO UPDATE … WHERE (the WHERE rejects the
-   * takeover for non-retryable statuses). No race window: two concurrent
-   * dispatchers for the same turn can't both come back with skip=false.
+   *     over a prior 'failed' row by resetting it to pending). Caller proceeds
+   *     with the gateway send, then markSent/markFailed.
+   *   - skip=true: a prior attempt is already in-flight or terminal — i.e. an
+   *     existing row has status 'pending' (another worker owns it), 'sent'
+   *     (already delivered), or 'unknown' (could-be-delivered). The user has
+   *     received (or might have received) this turn's reply, OR another worker
+   *     is sending it RIGHT NOW. Caller MUST NOT send again. The returned row's
+   *     provider_message_id is the prior ack (NULL when status='pending' or
+   *     'unknown').
+   *
+   * Race-safety:
+   *   1. The tx acquires `pg_advisory_xact_lock(hashtext(<scope>))` BEFORE the
+   *      INSERT. All concurrent claimers for the same (tenant, agent, key)
+   *      serialize on this lock — guarantees only ONE worker gets skip=false.
+   *      Lock auto-releases on tx commit/rollback (xact_lock).
+   *   2. ON CONFLICT DO UPDATE … WHERE `status = 'failed'` — only a prior
+   *      'failed' row is reclaimable. 'pending' rows are now in-flight markers
+   *      (the previous "reclaim pending" behavior allowed two workers to BOTH
+   *      get skip=false: worker A INSERTed pending → worker B's ON CONFLICT
+   *      hit the WHERE and also got skip=false → DOUBLE-SEND).
+   *
+   * TODO(#227-sweeper): stale-pending recovery (markSent never landed because
+   * the worker crashed) is OUT OF SCOPE for this PR. Under normal flow each
+   * turn's idempotency_key is `${conversa_id}:${in_reply_to}` and `in_reply_to`
+   * is unique-per-inbound, so stale pending only blocks future RE-ATTEMPTS of
+   * the SAME turn — effectively never an issue in production. A background
+   * sweeper would mark sufficiently-old 'pending' rows 'failed' to allow
+   * a manual replay; tracked separately.
    */
   async upsertPending(input: {
     idempotency_key: string;
@@ -1259,53 +1278,96 @@ export const outboundMessagesRepo = {
     tenant_id?: string;
     agent_id?: string;
   }): Promise<{ row: OutboundMessageRow; skip: boolean }> {
-    const claimed = await db
-      .insert(outbound_messages)
-      .values({
-        idempotency_key: input.idempotency_key,
-        conversa_id: input.conversa_id,
-        in_reply_to: input.in_reply_to,
-        channel: input.channel,
-        tenant_id: input.tenant_id ?? 'default',
-        agent_id: input.agent_id ?? 'default',
-        status: 'pending',
-      })
-      .onConflictDoUpdate({
-        target: outbound_messages.idempotency_key,
-        // Reset to pending + new channel ONLY when the prior status is retryable.
-        // The WHERE filters out 'sent' / 'unknown' (must NOT be re-attempted).
-        set: {
-          status: 'pending',
+    // Tenant/agent isolation: the dedupe namespace is per (tenant, agent), not
+    // a global string. Reads pull from the tenant context (set by webhook
+    // routes via runWithTenantContext) unless the caller explicitly overrides
+    // — call sites in output-dispatch.ts always run inside such a context.
+    const tenant_id = input.tenant_id ?? getCurrentTenant();
+    const agent_id = input.agent_id ?? getCurrentAgent();
+    // Lock partition matches the UNIQUE: tenant + agent + key. hashtext is
+    // 32-bit, so collisions across distinct keys are possible but harmless
+    // (worst case: brief serialization of two unrelated turns).
+    const lockKey = `${tenant_id}:${agent_id}:${input.idempotency_key}`;
+    return withTx(async (tx) => {
+      // (1) Serialize concurrent claimers for the same scope. Auto-released
+      //     when the tx commits/rolls back.
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`);
+      // (2) INSERT … ON CONFLICT DO UPDATE … WHERE status = 'failed'. Only
+      //     'failed' rows are reclaimable; 'pending' is now in-flight.
+      const claimed = await tx
+        .insert(outbound_messages)
+        .values({
+          idempotency_key: input.idempotency_key,
+          conversa_id: input.conversa_id,
+          in_reply_to: input.in_reply_to,
           channel: input.channel,
-          error: null,
-          sent_at: null,
-        },
-        where: sql`${outbound_messages.status} IN ('pending', 'failed')`,
-      })
-      .returning();
-    if (claimed.length > 0) {
-      return { row: claimed[0]!, skip: false };
-    }
-    // Conflict rejected by the WHERE: the existing row is 'sent' or 'unknown' —
-    // re-sending would risk double-send. Read it back so the caller can return
-    // its provider_message_id (if any) without another send.
-    const [existing] = await db
-      .select()
-      .from(outbound_messages)
-      .where(eq(outbound_messages.idempotency_key, input.idempotency_key))
-      .limit(1);
-    return { row: existing!, skip: true };
+          tenant_id,
+          agent_id,
+          status: 'pending',
+        })
+        .onConflictDoUpdate({
+          target: [
+            outbound_messages.tenant_id,
+            outbound_messages.agent_id,
+            outbound_messages.idempotency_key,
+          ],
+          set: {
+            status: 'pending',
+            channel: input.channel,
+            error: null,
+            sent_at: null,
+          },
+          // STRICT pending: only reclaim 'failed' rows. Race-safe — see method
+          // doc. Without this, the prior WHERE `IN ('pending','failed')` let
+          // two concurrent workers both come back with skip=false.
+          where: sql`${outbound_messages.status} = 'failed'`,
+        })
+        .returning();
+      if (claimed.length > 0) {
+        return { row: claimed[0]!, skip: false };
+      }
+      // ON CONFLICT WHERE rejected: existing row is 'pending' (in-flight),
+      // 'sent', or 'unknown'. All three are skip=true — re-sending would either
+      // double-send (sent) or race the in-flight worker (pending).
+      const [existing] = await tx
+        .select()
+        .from(outbound_messages)
+        .where(
+          and(
+            eq(outbound_messages.tenant_id, tenant_id),
+            eq(outbound_messages.agent_id, agent_id),
+            eq(outbound_messages.idempotency_key, input.idempotency_key),
+          ),
+        )
+        .limit(1);
+      return { row: existing!, skip: true };
+    });
   },
   /**
    * Record a successful send. `provider_message_id` may be NULL when the
    * gateway returned no key.id but isBaileysConnected() confirmed the send
    * happened (the 'sent without id' case dispatchOutput tags delivered:true).
+   *
+   * CAS guard: only transition from non-terminal statuses ('pending'/'failed').
+   * A pre-existing 'sent' or 'unknown' row stays as-is — protects against
+   * double-marking that could clobber the original provider_message_id, and
+   * defensively guards against programming errors that would mark sent after
+   * markFailed.
    */
   async markSent(key: string, provider_message_id: string | null): Promise<void> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     await db
       .update(outbound_messages)
       .set({ status: 'sent', provider_message_id, sent_at: sql`now()` })
-      .where(eq(outbound_messages.idempotency_key, key));
+      .where(
+        and(
+          eq(outbound_messages.tenant_id, tenant_id),
+          eq(outbound_messages.agent_id, agent_id),
+          eq(outbound_messages.idempotency_key, key),
+          inArray(outbound_messages.status, ['pending', 'failed']),
+        ),
+      );
   },
   /**
    * Record a failed attempt. `ambiguous=true` (the crux) means "could have
@@ -1313,23 +1375,45 @@ export const outboundMessagesRepo = {
    * (no re-send), trading a sliver of silence risk for zero double-send.
    * `ambiguous=false` means "definitely not delivered" (pre-send disconnect /
    * throw before the wire) — record 'failed', a retry is safe.
+   *
+   * CAS guard: only transition from non-terminal statuses ('pending'/'failed').
+   * A LATE markFailed against an already-'sent' row would otherwise degrade
+   * 'sent' → 'failed', re-opening the row to reclaim → DOUBLE-SEND. The CAS
+   * makes the call a no-op when a terminal status already won the race.
    */
   async markFailed(
     key: string,
     error: string,
     ambiguous: boolean,
   ): Promise<void> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     await db
       .update(outbound_messages)
       .set({ status: ambiguous ? 'unknown' : 'failed', error })
-      .where(eq(outbound_messages.idempotency_key, key));
+      .where(
+        and(
+          eq(outbound_messages.tenant_id, tenant_id),
+          eq(outbound_messages.agent_id, agent_id),
+          eq(outbound_messages.idempotency_key, key),
+          inArray(outbound_messages.status, ['pending', 'failed']),
+        ),
+      );
   },
-  /** Convenience for tests / ops. */
+  /** Convenience for tests / ops. Scoped to current tenant/agent. */
   async findByKey(key: string): Promise<OutboundMessageRow | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const rows = await db
       .select()
       .from(outbound_messages)
-      .where(eq(outbound_messages.idempotency_key, key))
+      .where(
+        and(
+          eq(outbound_messages.tenant_id, tenant_id),
+          eq(outbound_messages.agent_id, agent_id),
+          eq(outbound_messages.idempotency_key, key),
+        ),
+      )
       .limit(1);
     return rows[0] ?? null;
   },
