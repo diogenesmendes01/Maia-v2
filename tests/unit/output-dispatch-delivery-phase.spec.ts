@@ -516,3 +516,114 @@ describe('dispatchOutput — text ledger wiring (#227 FEATURE_OUTBOUND_DEDUP)', 
     expect(m.markFailed).not.toHaveBeenCalled();
   });
 });
+
+// ---------------------------------------------------------------------------
+// #227 Codex review fixes:
+//   - Document readFile vs transport discrimination (DOC_READ_FAILED).
+//   - Fail-open guards on findByKey + upsertPending throws.
+// ---------------------------------------------------------------------------
+
+describe('dispatchOutput — document discriminator (#227 DOC_READ_FAILED)', () => {
+  beforeEach(() => {
+    cfg.FEATURE_OUTBOUND_DEDUP = true;
+  });
+
+  const pdfCtx = () =>
+    mkCtx({
+      latestReportPdf: {
+        path: '/tmp/report.pdf',
+        fileName: 'report.pdf',
+        mimetype: 'application/pdf',
+        tipo: 'extrato',
+      },
+    });
+
+  it("readFile failure (code='DOC_READ_FAILED') ⇒ markFailed(ambiguous=false) — retry safe", async () => {
+    // baileys wraps readFile errors with `code: 'DOC_READ_FAILED'` so the
+    // dispatch can tell them apart from transport throws. The discriminator
+    // sets ambiguous=false → ledger 'failed' → retryable; without it the
+    // dispatch would record 'unknown' and the boundary guard would block
+    // retry, reviving the HIGH-1 silent-drop #216 closed for documents.
+    const docReadErr = new Error(
+      'document_read_failed: ENOENT',
+    ) as Error & { code?: string };
+    docReadErr.code = 'DOC_READ_FAILED';
+    m.sendOutboundDocument.mockRejectedValue(docReadErr);
+    const err = await dispatchOutput(pdfCtx()).catch((e) => e);
+    expect(err).toBeInstanceOf(OutboundDeliveryError);
+    expect((err as OutboundDeliveryError).delivered).toBe(false);
+    expect(m.markFailed).toHaveBeenCalledWith(
+      'c_1:msg_1',
+      expect.stringContaining('document_read_failed'),
+      false, // NOT ambiguous — definitely pre-send
+    );
+  });
+
+  it('transport throw (no code) ⇒ markFailed(ambiguous=true) — re-attempt blocked', async () => {
+    // socket.sendMessage failures could be delivered-but-threw → conservative
+    // 'unknown' to avoid double-send.
+    m.sendOutboundDocument.mockRejectedValue(new Error('socket_send_failed'));
+    const err = await dispatchOutput(pdfCtx()).catch((e) => e);
+    expect(err).toBeInstanceOf(OutboundDeliveryError);
+    expect((err as OutboundDeliveryError).delivered).toBe(false);
+    expect(m.markFailed).toHaveBeenCalledWith(
+      'c_1:msg_1',
+      'socket_send_failed',
+      true, // ambiguous — transport could have delivered
+    );
+  });
+});
+
+describe('safeDispatchOutput — fail-open on findByKey throw (#227 blocker 5)', () => {
+  beforeEach(() => {
+    cfg.FEATURE_OUTBOUND_DEDUP = true;
+  });
+
+  it('findByKey throws ⇒ dispatch proceeds, no exception escapes the wrapper', async () => {
+    // The boundary guard's findByKey lives outside try{}; a raw throw would
+    // escape the never-throw contract. Fail-open: log + proceed as if there
+    // were no prior row. Liveness > strict dedupe — DB blips must not block
+    // legitimate sends.
+    m.findByKey.mockRejectedValue(new Error('db_unreachable'));
+    const out = await safeDispatchOutput(mkCtx());
+    expect(out).toEqual({ status: 'delivered' });
+    // The dispatch ran (text sent), even though the boundary guard's read
+    // threw — the failure was logged and swallowed, not propagated.
+    expect(m.sendOutboundText).toHaveBeenCalledOnce();
+  });
+});
+
+describe('dispatchOutput — fail-open on claim throw (#227 blocker 6)', () => {
+  beforeEach(() => {
+    cfg.FEATURE_OUTBOUND_DEDUP = true;
+  });
+
+  it('upsertPending throws ⇒ text send proceeds (does not become silent unknown)', async () => {
+    // If the claim itself fails (e.g. advisory_lock backend down), letting the
+    // throw propagate would cause safeDispatchOutput's handleDispatchError to
+    // classify it as 'unknown' → sent_no_persist → user silence. Fail-open
+    // instead: log + proceed as if skip=false, no prior row.
+    m.upsertPending.mockRejectedValue(new Error('claim_db_throw'));
+    m.sendOutboundText.mockResolvedValue('wid_text');
+    await expect(dispatchOutput(mkCtx())).resolves.toBeUndefined();
+    expect(m.sendOutboundText).toHaveBeenCalledOnce();
+    // markSent / markFailed are still attempted on the success path; they're
+    // no-ops in the absence of a row (the WHERE filters us to zero rows
+    // updated — the test mock returns undefined without effect).
+  });
+
+  it('upsertPending throws then transport throws ⇒ both fail-open paths converge cleanly', async () => {
+    // Defensive: even with the claim fail-open AND a transport throw, we end
+    // up in markFailed(ambiguous=true) — the boundary guard for next time.
+    m.upsertPending.mockRejectedValue(new Error('claim_db_throw'));
+    m.sendOutboundText.mockRejectedValue(new Error('socket_closed'));
+    const err = await dispatchOutput(mkCtx()).catch((e) => e);
+    expect(err).toBeInstanceOf(OutboundDeliveryError);
+    expect((err as OutboundDeliveryError).delivered).toBe(false);
+    expect(m.markFailed).toHaveBeenCalledWith(
+      'c_1:msg_1',
+      'socket_closed',
+      true,
+    );
+  });
+});
