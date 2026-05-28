@@ -577,6 +577,41 @@ export const mensagensRepo = {
       .set({ tenant_id: args.tenant_id, agent_id: args.agent_id })
       .where(eq(mensagens.id, args.id));
   },
+
+  // [Codex review #277 v2] EXPLICITLY bypasses applyTenantGuard — same
+  // sanctioned-entry-point pattern as `adoptToResolvedTenantCrossTenant`
+  // and `channelsRepo.findByExternalCrossTenant`. Used by the Baileys
+  // `messages.update` listener (edits + revokes), which runs BEFORE any
+  // tenant context exists (Baileys is the inbound entry point — the
+  // tenant of the original message is exactly what we need to DISCOVER
+  // here so the dispatch can re-enter inside the correct ALS context).
+  //
+  // Necessity: `runAgentForMensagem` adopts inbound rows from
+  // (default, default) into the resolved tenant via
+  // `adoptToResolvedTenantCrossTenant`. A subsequent edit/revoke arrives
+  // via `messages.update` with NO tenant context — running the tenant-
+  // scoped `findByWhatsappId` under `default/default` would miss the
+  // (now-adopted) original and the edit/revoke would be silently dropped
+  // (Codex BLOQUEADO iteração 2: edit_unknown_original / revoke_unknown_original).
+  //
+  // Safety: `migrations/003_review_fixes.sql` declares
+  //   CREATE UNIQUE INDEX uniq_mensagens_whatsapp_id
+  //     ON mensagens ((metadata->>'whatsapp_id')) WHERE metadata ? 'whatsapp_id';
+  // So at most one row exists for a given whatsapp_id globally — no
+  // cross-tenant ambiguity. The caller (gateway/baileys.ts) re-enters
+  // `runWithTenantContext({tenant_id, agent_id})` of the resolved row
+  // before invoking `routeMessageUpdate`, restoring full tenant scoping
+  // for every downstream read/write.
+  async findByWhatsappIdCrossTenant(
+    whatsapp_id: string,
+  ): Promise<Mensagem | null> {
+    const rows = await db
+      .select()
+      .from(mensagens)
+      .where(sql`metadata->>'whatsapp_id' = ${whatsapp_id}`)
+      .limit(1);
+    return rows[0] ?? null;
+  },
 };
 
 export const entidadesRepo = {

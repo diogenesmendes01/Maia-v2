@@ -247,18 +247,79 @@ export async function startBaileys(): Promise<void> {
         // We synthesise an IWebMessageInfo whose `message` is the `update.message`
         // payload so routeMessageUpdate can branch on editedMessage / protocolMessage.
         // The `as never` cast is intentional — runtime structure is what matters.
+        //
+        // [Codex review #277 v2 BLOQUEADO fix] Resolve target whatsapp_id
+        // cross-tenant BEFORE entering ALS, then run routeMessageUpdate in
+        // the resolved tenant context. Rationale: `runAgentForMensagem`
+        // adopts inbound rows from (default, default) into the real
+        // (tenant_id, agent_id) when the resolver succeeds. A subsequent
+        // edit/revoke arriving via this listener has no tenant context;
+        // running `routeMessageUpdate` under `default/default` would
+        // cause `mensagensRepo.findByWhatsappId` to miss the (now-adopted)
+        // original and the edit/revoke would be silently dropped
+        // (edit_unknown_original / revoke_unknown_original). The fix
+        // mirrors `runAgentForMensagem`'s adopt-then-runWithTenantContext
+        // ordering: discover the owning tenant via the sanctioned cross-
+        // tenant lookup, then operate fully scoped from that point on.
+        const target_whatsapp_id = extractMessageUpdateTargetId(update);
+        if (!target_whatsapp_id) {
+          // Read receipts / status updates / unsupported envelope shapes —
+          // routeMessageUpdate would no-op anyway. Skip without touching DB.
+          continue;
+        }
+        const original = await mensagensRepo.findByWhatsappIdCrossTenant(
+          target_whatsapp_id,
+        );
+        if (!original) {
+          // Genuinely unknown message (never inbound through us, or already
+          // GC'd). Preserve the existing fail-soft contract — routeMessageUpdate
+          // also returns silently on null `findByWhatsappId`. Log so triage
+          // can spot a pattern (e.g., a real bug producing stranded edits).
+          logger.debug(
+            { whatsapp_id: target_whatsapp_id },
+            'message_update.cross_tenant_lookup_miss',
+          );
+          continue;
+        }
         await runWithTenantContext(
-          { tenant_id: 'default', agent_id: 'default' },
-          () => routeMessageUpdate({
-            key: update.key,
-            message: update.update.message,
-          } as never),
+          { tenant_id: original.tenant_id, agent_id: original.agent_id },
+          () =>
+            routeMessageUpdate({
+              key: update.key,
+              message: update.update.message,
+            } as never),
         );
       } catch (err) {
         logger.error({ err: (err as Error).message }, 'message_update.dispatch_failed');
       }
     }
   });
+}
+
+/**
+ * Extract the whatsapp_id of the message being edited/revoked from a Baileys
+ * `messages.update` payload. Mirrors the dispatch logic in
+ * `routeMessageUpdate` (src/agent/message-update.ts):
+ *   - editedMessage  → the envelope's key.id IS the target id (the edit is
+ *                      delivered as an update for the original message key).
+ *   - protocolMessage type=0 (REVOKE) → target id is `protocolMessage.key.id`.
+ *   - anything else (read receipts, status updates) → null (caller skips).
+ *
+ * Exported as a `_internal` member so the unit test can drive it directly
+ * without a full Baileys handshake.
+ */
+function extractMessageUpdateTargetId(update: {
+  key?: { id?: string | null } | null;
+  update?: { message?: proto.IMessage | null | undefined } | null;
+}): string | null {
+  const envelopeId = update.key?.id ?? null;
+  const m = update.update?.message ?? null;
+  if (!m) return null;
+  if (m.editedMessage) return envelopeId;
+  if (m.protocolMessage?.type === 0 && m.protocolMessage.key?.id) {
+    return m.protocolMessage.key.id;
+  }
+  return null;
 }
 
 async function handleIncoming(msg: proto.IWebMessageInfo): Promise<void> {
@@ -560,6 +621,7 @@ export const _internal = {
   _getReconnectAttempts(): number {
     return reconnectAttempts;
   },
+  _extractMessageUpdateTargetId: extractMessageUpdateTargetId,
   RECONNECT_MAX_ATTEMPTS,
 };
 
