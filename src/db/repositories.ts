@@ -1010,34 +1010,105 @@ export const rulesRepo = {
       .limit(1);
     return rows[0] ?? null;
   },
+  // ---------------------------------------------------------------------------
+  // INVARIANT — TENANT/AGENT-SCOPED MUTATIONS (issue #230, north star):
+  //   "Maias de empresas diferentes NUNCA se comunicam, compartilham dados ou
+  //    herdam aprendizado. Sem exceção."
+  //
+  //   The 3 mutators below (incrementAcerto / incrementErro / setStatus) accept
+  //   a raw `rule_id`. BEFORE this fix the WHERE clause was `id = ?` only —
+  //   any agent in any tenant could mutate ANY rule by knowing the id. That
+  //   broke the inviolable cross-tenant isolation invariant for the procedural
+  //   memory layer (reads via `listActive` / `findByContext` were already
+  //   scoped, but writes leaked).
+  //
+  //   AFTER this fix every mutator pins `tenant_id = <ctx> AND agent_id = <ctx>`
+  //   into the WHERE. A mutation against a foreign-tenant/agent rule matches
+  //   0 rows on the UPDATE; we then throw a typed `rule_not_in_scope` error so
+  //   callers see a LOUD failure instead of a silent no-op. The silent no-op
+  //   was rejected because:
+  //     1. The invariant is INVIOLABLE — masking a violation is worse than
+  //        surfacing it; a thrown error is a louder signal than a swallowed
+  //        write that the calling reflection/promotion logic still trusts.
+  //     2. `recordAcerto` / `recordErro` (src/memory/procedural.ts) follow up
+  //        with `byId(rule_id)` + `setStatus`. Under the OLD code a foreign
+  //        id that somehow surfaced would silently chain to setStatus; throwing
+  //        here guarantees the promotion/deactivation side-effects never fire
+  //        on out-of-scope rows.
+  //     3. Detectable from telemetry: a thrown `rule_not_in_scope` is grep-
+  //        pable in logs; a silent no-op is not.
+  //
+  //   The status-conditioned UPDATE pattern (RETURNING + rows.length check) is
+  //   the same one `skillsRepo.deprecate` / `.activate` use for lifecycle
+  //   guards (PR #213 FIX 2). It is server-authoritative — no caller has to
+  //   remember to pre-filter; the SQL itself enforces the boundary.
+  // ---------------------------------------------------------------------------
   async incrementAcerto(id: string): Promise<void> {
-    await db
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
       .update(learned_rules)
       .set({
         acertos: sql`acertos + 1`,
         confianca: sql`LEAST(1.00, confianca + 0.10)`,
         updated_at: new Date(),
       })
-      .where(eq(learned_rules.id, id));
+      .where(and(
+        eq(learned_rules.id, id),
+        eq(learned_rules.tenant_id, tenant_id),
+        eq(learned_rules.agent_id, agent_id),
+      ))
+      .returning({ id: learned_rules.id });
+    if (rows.length === 0) {
+      // Loud failure — see INVARIANT block above. Either the id doesn't exist
+      // OR it belongs to a different tenant/agent; both surface as the same
+      // typed error so callers can't probe foreign-tenant existence.
+      throw new TypedError('rule_not_in_scope', `rule ${id} not found in current tenant/agent scope`);
+    }
   },
   async incrementErro(id: string): Promise<void> {
-    await db
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
       .update(learned_rules)
       .set({
         erros: sql`erros + 1`,
         confianca: sql`GREATEST(0.00, confianca - 0.20)`,
         updated_at: new Date(),
       })
-      .where(eq(learned_rules.id, id));
+      .where(and(
+        eq(learned_rules.id, id),
+        eq(learned_rules.tenant_id, tenant_id),
+        eq(learned_rules.agent_id, agent_id),
+      ))
+      .returning({ id: learned_rules.id });
+    if (rows.length === 0) {
+      // Loud failure — see INVARIANT block above.
+      throw new TypedError('rule_not_in_scope', `rule ${id} not found in current tenant/agent scope`);
+    }
   },
   async setStatus(
     id: string,
     update: { ativa?: boolean; confianca?: number },
   ): Promise<void> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const set: Record<string, unknown> = { updated_at: new Date() };
     if (update.ativa !== undefined) set.ativa = update.ativa;
     if (update.confianca !== undefined) set.confianca = String(update.confianca);
-    await db.update(learned_rules).set(set).where(eq(learned_rules.id, id));
+    const rows = await db
+      .update(learned_rules)
+      .set(set)
+      .where(and(
+        eq(learned_rules.id, id),
+        eq(learned_rules.tenant_id, tenant_id),
+        eq(learned_rules.agent_id, agent_id),
+      ))
+      .returning({ id: learned_rules.id });
+    if (rows.length === 0) {
+      // Loud failure — see INVARIANT block above.
+      throw new TypedError('rule_not_in_scope', `rule ${id} not found in current tenant/agent scope`);
+    }
   },
 };
 
