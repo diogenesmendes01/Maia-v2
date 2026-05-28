@@ -70,6 +70,8 @@ import type {
   ProposalUnifiedStatus,
 } from './schema.js';
 import { TypedError } from '@/lib/utils.js';
+import { logger } from '@/lib/logger.js';
+import { incCounter } from '@/lib/metrics.js';
 import { applyTenantGuard } from './tenant-guard.js';
 import { getCurrentTenant, getCurrentAgent } from './tenant-context.js';
 import { deriveCapabilityRisk, deriveCapabilityLocks } from './capability-risk.js';
@@ -1322,10 +1324,47 @@ export const pendingQuestionsRepo = {
  *     tenant context for audit; the SQL itself stays unscoped.
  */
 export const idempotencyRepo = {
-  async lookup(key: string): Promise<unknown | null> {
-    // Resolve tenant/agent — `getCurrentTenant`/`getCurrentAgent` throw
-    // `MissingTenantContextError` if no context. We refuse a silent
-    // fall-through to the legacy `'default'` bucket (see header).
+  /**
+   * Idempotency cache lookup with payload-hash revalidation (#299) and
+   * tenant/agent scoping (#261).
+   *
+   * Two-layer defense against a wrong-result cache hit:
+   *
+   * 1. Tenant/agent scope (#261). The WHERE pins `tenant_id = <ctx> AND
+   *    agent_id = <ctx> AND key = <key>`. `getCurrentTenant`/`getCurrentAgent`
+   *    throw `MissingTenantContextError` if no ALS context — we refuse a
+   *    silent fall-through to the legacy `'default'` bucket. This is defense
+   *    in depth on top of the hash-input change in `computeIdempotencyKey`
+   *    (src/governance/idempotency.ts).
+   *
+   * 2. Payload-hash revalidation (#299). The cache key is
+   *    `computeIdempotencyKey(...)` — already a fingerprint of the inputs
+   *    PLUS a bucket-minutes timestamp. If two distinct requests in the
+   *    same scope collide on that key (truncated hash, regression in the
+   *    derivator that drops a discriminant field, or stale cached payload
+   *    after a schema change), the older result would be returned for the
+   *    NEW request and the side effect would be silently wrong.
+   *
+   *    `payload_hash` is an independent SHA256 over (pessoa, entity, tool,
+   *    op, normalized_payload | file_sha256). On a hit we verify that the
+   *    STORED row's hash matches the EXPECTED hash; on mismatch we treat
+   *    as a miss, warn, and bump a metric. Caller will re-execute and the
+   *    `store` will overwrite (or no-op if the row is still there — see
+   *    `onConflictDoNothing` below; combined with #298 we'll switch to a
+   *    reservation pattern, but for this PR we keep the existing race
+   *    behavior intact).
+   *
+   * Note on existing rows: rows stored before this fix have
+   * `payload_hash == key` (legacy bug in _dispatcher.ts). Those rows will
+   * fail revalidation and be treated as miss → recomputed → overwritten.
+   * Acceptable: the tools whose side effects matter (HTTP, write) are
+   * naturally idempotent at the resource layer, and the bucket-minute TTL
+   * + cleanup worker drains stale rows.
+   */
+  async lookup(input: { key: string; payload_hash: string }): Promise<unknown | null> {
+    // Resolve tenant/agent — throws `MissingTenantContextError` if no
+    // context. Refuses silent fall-through to the legacy `'default'`
+    // bucket. See header for #261 rationale.
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
     const rows = await db
@@ -1335,11 +1374,29 @@ export const idempotencyRepo = {
         and(
           eq(idempotency_keys.tenant_id, tenant_id),
           eq(idempotency_keys.agent_id, agent_id),
-          eq(idempotency_keys.key, key),
+          eq(idempotency_keys.key, input.key),
         ),
       )
       .limit(1);
-    return rows[0]?.resultado ?? null;
+    const row = rows[0];
+    if (!row) return null;
+    if (row.payload_hash !== input.payload_hash) {
+      // Collision detected within tenant scope. Log + metric so we can
+      // detect drift. Treat as miss so caller re-executes.
+      logger.warn(
+        {
+          event: 'idempotency_key_collision_payload_mismatch',
+          key: input.key,
+          stored_payload_hash: row.payload_hash,
+          expected_payload_hash: input.payload_hash,
+          stored_tool_name: row.tool_name,
+        },
+        'idempotency.payload_hash_mismatch',
+      );
+      incCounter('maia_idempotency_payload_hash_collision_total');
+      return null;
+    }
+    return row.resultado;
   },
   async store(input: {
     key: string;

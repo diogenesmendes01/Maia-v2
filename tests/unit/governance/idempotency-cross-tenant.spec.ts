@@ -520,10 +520,13 @@ describe('Issue #261 — computeIdempotencyKey folds tenant_id+agent_id into the
 // ===========================================================================
 describe('Issue #261 — idempotencyRepo.lookup + .store are tenant/agent-scoped', () => {
   it('REJECTION — lookup OUTSIDE tenant context throws MissingTenantContextError', async () => {
+    // #299 widened the signature to `{ key, payload_hash }`. The tenant
+    // rejection still fires first because `getCurrentTenant()` runs before
+    // the WHERE is built.
     const { idempotencyRepo } = await import('@/db/repositories.js');
-    await expect(idempotencyRepo.lookup('any-key')).rejects.toBeInstanceOf(
-      MissingTenantContextError,
-    );
+    await expect(
+      idempotencyRepo.lookup({ key: 'any-key', payload_hash: 'any-hash' }),
+    ).rejects.toBeInstanceOf(MissingTenantContextError);
   });
 
   it('REJECTION — store OUTSIDE tenant context throws MissingTenantContextError', async () => {
@@ -603,7 +606,10 @@ describe('Issue #261 — idempotencyRepo.lookup + .store are tenant/agent-scoped
     });
     const { idempotencyRepo } = await import('@/db/repositories.js');
     const hit = await runWithTenantContext(A_CTX, async () =>
-      idempotencyRepo.lookup(sharedKey),
+      // #299: payload_hash is required; tenant filter already misses here
+      // so the hash value is irrelevant — we want to prove tenant scoping
+      // alone blocks the lookup BEFORE the hash check runs.
+      idempotencyRepo.lookup({ key: sharedKey, payload_hash: sharedKey }),
     );
     // The lookup MUST return null — tenant-A is NOT allowed to see tenant-B's
     // cached result, even when supplying an identical key.
@@ -627,7 +633,8 @@ describe('Issue #261 — idempotencyRepo.lookup + .store are tenant/agent-scoped
     });
     const { idempotencyRepo } = await import('@/db/repositories.js');
     const hit = await runWithTenantContext(B_CTX, async () =>
-      idempotencyRepo.lookup(sharedKey),
+      // #299: payload_hash matches the seeded row; tenant filter still misses.
+      idempotencyRepo.lookup({ key: sharedKey, payload_hash: sharedKey }),
     );
     expect(hit).toBeNull();
   });
@@ -652,7 +659,8 @@ describe('Issue #261 — idempotencyRepo.lookup + .store are tenant/agent-scoped
     });
     const { idempotencyRepo } = await import('@/db/repositories.js');
     const hit = await runWithTenantContext(A_CTX, async () =>
-      idempotencyRepo.lookup(sharedKey),
+      // #299: matching payload_hash isolates the test to the agent filter.
+      idempotencyRepo.lookup({ key: sharedKey, payload_hash: sharedKey }),
     );
     expect(hit).toBeNull();
   });
@@ -676,7 +684,8 @@ describe('Issue #261 — idempotencyRepo.lookup + .store are tenant/agent-scoped
     });
     const { idempotencyRepo } = await import('@/db/repositories.js');
     const hit = await runWithTenantContext(A_CTX, async () =>
-      idempotencyRepo.lookup(k),
+      // #299: payload_hash matches the seeded row so revalidation passes.
+      idempotencyRepo.lookup({ key: k, payload_hash: k }),
     );
     expect(hit).toEqual({ ok: 'A-cached' });
   });
@@ -686,33 +695,34 @@ describe('Issue #261 — idempotencyRepo.lookup + .store are tenant/agent-scoped
     // (so applyTenantGuard runs), then performs same-tenant and
     // cross-tenant lookups against it.
     const { idempotencyRepo } = await import('@/db/repositories.js');
+    const roundTripKey = 'round-trip-key';
     await runWithTenantContext(A_CTX, async () =>
       idempotencyRepo.store({
-        key: 'round-trip-key',
+        key: roundTripKey,
         tool_name: 'register_transaction',
         operation_type: 'create',
         pessoa_id: 'pA',
         entity_id: 'eA',
-        payload_hash: 'round-trip-key',
+        payload_hash: roundTripKey,
         resultado: { ok: 'A-round-trip' },
       }),
     );
 
-    // Same scope → hit.
+    // Same scope → hit. payload_hash matches what `store` wrote.
     const hitA = await runWithTenantContext(A_CTX, async () =>
-      idempotencyRepo.lookup('round-trip-key'),
+      idempotencyRepo.lookup({ key: roundTripKey, payload_hash: roundTripKey }),
     );
     expect(hitA).toEqual({ ok: 'A-round-trip' });
 
-    // Cross-tenant → miss.
+    // Cross-tenant → miss (tenant filter, not hash).
     const missB = await runWithTenantContext(B_CTX, async () =>
-      idempotencyRepo.lookup('round-trip-key'),
+      idempotencyRepo.lookup({ key: roundTripKey, payload_hash: roundTripKey }),
     );
     expect(missB).toBeNull();
 
-    // Cross-agent (same tenant) → miss.
+    // Cross-agent (same tenant) → miss (agent filter, not hash).
     const missOther = await runWithTenantContext(A_OTHER_AGENT_CTX, async () =>
-      idempotencyRepo.lookup('round-trip-key'),
+      idempotencyRepo.lookup({ key: roundTripKey, payload_hash: roundTripKey }),
     );
     expect(missOther).toBeNull();
   });

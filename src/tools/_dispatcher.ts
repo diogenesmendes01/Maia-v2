@@ -3,7 +3,7 @@ import type { ResolvedPermission } from '@/governance/permissions.js';
 import { canAct } from '@/governance/permissions.js';
 import { constitutionalCheck } from '@/governance/rules.js';
 import { REGISTRY, isToolEnabled, type AnyTool } from './_registry.js';
-import { computeIdempotencyKey } from '@/governance/idempotency.js';
+import { computeIdempotencyKey, computePayloadHash } from '@/governance/idempotency.js';
 import { idempotencyRepo } from '@/db/repositories.js';
 import { audit } from '@/governance/audit.js';
 import { isRedisConnected } from '@/lib/redis.js';
@@ -150,8 +150,21 @@ export async function dispatchTool(input: {
     payload: args,
     file_sha256,
   });
+  // #299: payload_hash is INDEPENDENT of idempotency_key (no bucket). On
+  // a cache hit the repo re-checks the stored row's payload_hash against
+  // this value — defends against key collision (truncated hash, derivator
+  // regression, or stale cache after a schema change) returning a wrong
+  // cached result for a distinct payload.
+  const payload_hash = computePayloadHash({
+    pessoa_id: input.ctx.pessoa.id,
+    entity_id,
+    tool_name: tool.name,
+    operation_type: tool.operation_type,
+    payload: args,
+    file_sha256,
+  });
 
-  const cached = await idempotencyRepo.lookup(idempotency_key);
+  const cached = await idempotencyRepo.lookup({ key: idempotency_key, payload_hash });
   if (cached !== null) {
     logger.debug({ tool: tool.name, idempotency_key }, 'tool.idempotency_hit');
     return cached;
@@ -184,7 +197,9 @@ export async function dispatchTool(input: {
     operation_type: tool.operation_type,
     pessoa_id: input.ctx.pessoa.id,
     entity_id,
-    payload_hash: idempotency_key,
+    // #299: store the real payload fingerprint (was incorrectly
+    // `idempotency_key` before, which masked the collision check).
+    payload_hash,
     file_sha256,
     resultado: out.data,
   });
