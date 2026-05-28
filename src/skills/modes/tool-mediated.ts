@@ -27,7 +27,7 @@
  */
 import { callLLM, type LLMMessage, type ToolSchema } from '@/lib/claude.js';
 import { logger } from '@/lib/logger.js';
-import { tryGetCurrentContext } from '@/db/tenant-context.js';
+import { getCurrentAgent, getCurrentTenant } from '@/db/tenant-context.js';
 import type { ModeContext } from '../types.js';
 
 /**
@@ -120,9 +120,19 @@ export async function toolMediatedMode(
       'idempotency_key_unstable: tool_mediated skills require a stable turno_id or conversa_id in ModeContext to derive idempotency keys; aborting to prevent duplicate side effects',
     );
   }
-  const tenantCtx = tryGetCurrentContext();
-  const tenant = tenantCtx?.tenant_id ?? 'unknown';
-  const agent = tenantCtx?.agent_id ?? 'unknown';
+  // Fail-closed on missing ALS context (issue #262). Previously the code
+  // degraded to a shared 'unknown:unknown' bucket via `tryGetCurrentContext`,
+  // which (a) opened a cross-tenant idempotency collision surface and
+  // (b) silenced caller bugs that forgot to wrap execution in
+  // `runWithTenantContext`. We now match the fail-closed pattern of
+  // rulesRepo / agent_memories / ledgers (#232/#237/#241/#243): if there
+  // is no active tenant context, `getCurrentTenant`/`getCurrentAgent`
+  // throw `MissingTenantContextError` so the misuse surfaces loudly.
+  // In production, the SkillRunner (gate 1.5) already guarantees context
+  // exists before dispatching here, so this only fires on direct calls
+  // or test misconfiguration.
+  const tenant = getCurrentTenant();
+  const agent = getCurrentAgent();
   const idempotencyBase = `${tenant}:${agent}:${ctx.skill.id}:${ctx.skill.version}:${stableExecId}`;
 
   // Safety upper bound for the loop: allow a few extra iterations beyond
