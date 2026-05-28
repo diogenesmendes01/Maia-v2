@@ -61,17 +61,20 @@ describe('user-layer cache-keys', () => {
   });
 
   describe('buildKnowledgeSliceCacheKey', () => {
-    it('canonical shape knowledge_slice:v1:tenant:depth:scope:domain:intent', () => {
+    it('canonical shape knowledge_slice:v2:tenant:agent:depth:scope:domain:intent', () => {
       const key = buildKnowledgeSliceCacheKey({
         tenant_id: 'tenant-A',
+        agent_id: 'agent-1',
         depth: 'relevant',
       });
-      expect(key).toMatch(/^knowledge_slice:v1:tenant-A:relevant:/);
+      // Issue #235: v2 layout includes agent_id in the prefix.
+      expect(key).toMatch(/^knowledge_slice:v2:tenant-A:agent-1:relevant:/);
     });
 
     it('is deterministic for same inputs', () => {
       const args = {
         tenant_id: 'tenant-A',
+        agent_id: 'agent-1',
         depth: 'deep',
         domain: 'billing',
       };
@@ -79,14 +82,88 @@ describe('user-layer cache-keys', () => {
     });
 
     it('differs for different tenants', () => {
-      const a = buildKnowledgeSliceCacheKey({ tenant_id: 'tenant-A', depth: 'relevant' });
-      const b = buildKnowledgeSliceCacheKey({ tenant_id: 'tenant-B', depth: 'relevant' });
+      const a = buildKnowledgeSliceCacheKey({
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-1',
+        depth: 'relevant',
+      });
+      const b = buildKnowledgeSliceCacheKey({
+        tenant_id: 'tenant-B',
+        agent_id: 'agent-1',
+        depth: 'relevant',
+      });
       expect(a).not.toBe(b);
     });
 
     it('domain defaults to "global" when omitted', () => {
-      const key = buildKnowledgeSliceCacheKey({ tenant_id: 'tenant-A', depth: 'relevant' });
+      const key = buildKnowledgeSliceCacheKey({
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-1',
+        depth: 'relevant',
+      });
       expect(key).toContain(':global:');
+    });
+
+    // ─── Issue #235 — cross-agent isolation (LOW, latent) ───────────────────
+    // The slice builder threads `boundary.agent_id` into fact/rule resolver
+    // calls (`knowledge-slice-builder.ts:50-68`), so the cache key MUST also
+    // include `agent_id` — otherwise two agents on the same tenant would
+    // silently collide on cached slices if a real cache backend were wired.
+
+    it('Issue #235: differs for different agents on the same tenant', () => {
+      const a = buildKnowledgeSliceCacheKey({
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-A',
+        depth: 'relevant',
+        domain: 'billing',
+      });
+      const b = buildKnowledgeSliceCacheKey({
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-B',
+        depth: 'relevant',
+        domain: 'billing',
+      });
+      expect(a).not.toBe(b);
+    });
+
+    it('Issue #235: symmetric — swapping agent ids swaps the keys', () => {
+      const baseArgs = {
+        tenant_id: 'tenant-A',
+        depth: 'relevant' as const,
+        domain: 'billing',
+      };
+      const a1 = buildKnowledgeSliceCacheKey({ ...baseArgs, agent_id: 'agent-A' });
+      const b1 = buildKnowledgeSliceCacheKey({ ...baseArgs, agent_id: 'agent-B' });
+      const a2 = buildKnowledgeSliceCacheKey({ ...baseArgs, agent_id: 'agent-A' });
+      const b2 = buildKnowledgeSliceCacheKey({ ...baseArgs, agent_id: 'agent-B' });
+      expect(a1).toBe(a2);
+      expect(b1).toBe(b2);
+      expect(a1).not.toBe(b1);
+    });
+
+    it('Issue #235: version bumped to v2 (regression for v1 → v2 cache invalidation)', () => {
+      const key = buildKnowledgeSliceCacheKey({
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-1',
+        depth: 'relevant',
+      });
+      expect(key.startsWith('knowledge_slice:v2:')).toBe(true);
+      expect(key).not.toContain('knowledge_slice:v1:');
+    });
+
+    it('Issue #235: agent_id appears in the prefix, before depth', () => {
+      const key = buildKnowledgeSliceCacheKey({
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-XYZ',
+        depth: 'relevant',
+      });
+      // Layout: knowledge_slice:v2:{tenant}:{agent}:{depth}:...
+      const parts = key.split(':');
+      expect(parts[0]).toBe('knowledge_slice');
+      expect(parts[1]).toBe('v2');
+      expect(parts[2]).toBe('tenant-A');
+      expect(parts[3]).toBe('agent-XYZ');
+      expect(parts[4]).toBe('relevant');
     });
   });
 });
