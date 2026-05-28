@@ -102,8 +102,9 @@ vi.mock('@/governance/audit.js', () => ({
   audit: (payload: unknown) => auditMock(payload),
 }));
 
+const loggerWarnMock = vi.fn();
 vi.mock('@/lib/logger.js', () => ({
-  logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn(), debug: vi.fn() },
+  logger: { warn: loggerWarnMock, error: vi.fn(), info: vi.fn(), debug: vi.fn() },
 }));
 
 // Pull production code AFTER mocks are installed so the redis import binds
@@ -129,6 +130,7 @@ describe('issue #246 — bot-detection Redis key is tenant+agent scoped', () => 
     findByPhoneMock.mockClear();
     updateStatusMock.mockClear();
     auditMock.mockClear();
+    loggerWarnMock.mockClear();
     findByPhoneMock.mockResolvedValue(null);
   });
 
@@ -392,6 +394,234 @@ describe('issue #246 — bot-detection Redis key is tenant+agent scoped', () => 
       );
       // No status flip either.
       expect(updateStatusMock).not.toHaveBeenCalled();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // TTL contract — Redis counter MUST expire after 60 seconds (spec 05
+  // §11.4 "sliding 60-second flood counter"). Without an enforced TTL the
+  // key would accumulate forever and slow flooders below 50 msgs/min would
+  // eventually trip the threshold over a long horizon — exactly the
+  // opposite of the intent. The TTL is set only on the FIRST hit (`count
+  // === 1` branch) because subsequent hits within the window share the
+  // existing TTL; that's correct behaviour, but easy to break in a refactor
+  // (e.g. set on every hit, or never set), so we pin it down here.
+  // -------------------------------------------------------------------------
+  describe('checkBotAndMaybeBlock — TTL contract', () => {
+    it('sets a 60-second TTL on the FIRST hit (count === 1 branch)', async () => {
+      await runWithTenantContext(
+        { tenant_id: TENANT_A, agent_id: AGENT_A },
+        async () => {
+          await checkBotAndMaybeBlock(PHONE_SHARED);
+        },
+      );
+      // Exactly one expire call, with TTL=60s (WINDOW_SECONDS in the
+      // production module). Asserting the second argument is what catches
+      // a refactor that drops it to e.g. 600s or leaves the TTL unset.
+      expect(redisStub.expire).toHaveBeenCalledTimes(1);
+      const expireCall = redisStub.expire.mock.calls[0]!;
+      expect(expireCall[1]).toBe(60);
+    });
+
+    it('does NOT re-arm the TTL on subsequent hits within the same window', async () => {
+      await runWithTenantContext(
+        { tenant_id: TENANT_A, agent_id: AGENT_A },
+        async () => {
+          await checkBotAndMaybeBlock(PHONE_SHARED);
+          await checkBotAndMaybeBlock(PHONE_SHARED);
+          await checkBotAndMaybeBlock(PHONE_SHARED);
+        },
+      );
+      // expire fires once, on the first hit only. The TTL set there
+      // governs the entire 60s window — re-arming on every hit would let
+      // a slow flooder keep the counter alive indefinitely.
+      expect(redisStub.expire).toHaveBeenCalledTimes(1);
+      expect(redisStub.incr).toHaveBeenCalledTimes(3);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Auto-block path — when a KNOWN pessoa crosses THRESHOLD, the function
+  // MUST flip `status` to 'bloqueada' via `pessoasRepo.updateStatus` AND
+  // emit an audit event AND return true. The existing adversarial test
+  // uses an unknown phone (findByPhone → null), which proves cross-tenant
+  // isolation but does NOT exercise the side-effect path. This closes
+  // that gap (Codex review on PR #252, "Test gaps" §4).
+  // -------------------------------------------------------------------------
+  describe('checkBotAndMaybeBlock — auto-block of a known pessoa', () => {
+    it('flips a known pessoa to bloqueada and audits when count crosses THRESHOLD', async () => {
+      const PESSOA_ID = 'pessoa-uuid-aaaa';
+      findByPhoneMock.mockResolvedValue({
+        id: PESSOA_ID,
+        tipo: 'cliente',
+        status: 'ativa',
+        telefone_whatsapp: PHONE_SHARED,
+      } as unknown as null);
+
+      // Drive past THRESHOLD (50) — the 51st call is the first to trigger
+      // the auto-block branch. We do 51 calls total: 50 below-threshold
+      // (returning false), then one crossing call.
+      let lastReturn: boolean | undefined;
+      await runWithTenantContext(
+        { tenant_id: TENANT_A, agent_id: AGENT_A },
+        async () => {
+          for (let i = 0; i < 51; i++) {
+            lastReturn = await checkBotAndMaybeBlock(PHONE_SHARED);
+          }
+        },
+      );
+
+      // The 51st call (count === 51 > 50) should:
+      //   1. Return true (caller must drop the message)
+      //   2. Have fired `updateStatus(PESSOA_ID, 'bloqueada')` exactly once
+      //   3. Have fired `audit` with `acao: 'auto_blocked_anomalous_volume'`
+      expect(lastReturn).toBe(true);
+      expect(updateStatusMock).toHaveBeenCalledTimes(1);
+      expect(updateStatusMock).toHaveBeenCalledWith(PESSOA_ID, 'bloqueada');
+      expect(auditMock).toHaveBeenCalledTimes(1);
+      const auditPayload = auditMock.mock.calls[0]![0] as {
+        acao: string;
+        pessoa_id: string;
+        metadata: { count: number; window_seconds: number };
+      };
+      expect(auditPayload.acao).toBe('auto_blocked_anomalous_volume');
+      expect(auditPayload.pessoa_id).toBe(PESSOA_ID);
+      expect(auditPayload.metadata.window_seconds).toBe(60);
+      expect(auditPayload.metadata.count).toBeGreaterThan(50);
+    });
+
+    it('does NOT auto-block owners — emits owner_threshold_exceeded log only', async () => {
+      // dono/co_dono are exempt from auto-block by design (spec 05 §11.4).
+      // We still want a warning log so a runaway loop on the owner's
+      // number is visible to operators.
+      const OWNER_ID = 'pessoa-owner-uuid';
+      findByPhoneMock.mockResolvedValue({
+        id: OWNER_ID,
+        tipo: 'dono',
+        status: 'ativa',
+        telefone_whatsapp: PHONE_SHARED,
+      } as unknown as null);
+
+      let lastReturn: boolean | undefined;
+      await runWithTenantContext(
+        { tenant_id: TENANT_A, agent_id: AGENT_A },
+        async () => {
+          for (let i = 0; i < 51; i++) {
+            lastReturn = await checkBotAndMaybeBlock(PHONE_SHARED);
+          }
+        },
+      );
+
+      // Owner path: return FALSE (don't drop), no status change, no audit.
+      expect(lastReturn).toBe(false);
+      expect(updateStatusMock).not.toHaveBeenCalled();
+      expect(auditMock).not.toHaveBeenCalled();
+      // But a warn log MUST fire so operators can see the threshold cross.
+      const ownerWarn = loggerWarnMock.mock.calls.find(
+        (call) => call[1] === 'bot_detection.owner_threshold_exceeded',
+      );
+      expect(ownerWarn).toBeDefined();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Log attribution — every `logger.warn` emitted from the function MUST
+  // carry `tenant_id` and `agent_id` so operators can attribute Redis
+  // failures, threshold crossings, and auto-blocks to the correct Maia in
+  // a multi-tenant deployment. The `lib/logger.ts` pino instance does NOT
+  // automatically inject ALS context, so the production code passes it
+  // explicitly. This was Codex review HIGH finding [2] on PR #252 —
+  // without the labels the logs collapse onto a shared bucket and a
+  // cross-tenant abuse pattern is invisible.
+  // -------------------------------------------------------------------------
+  describe('checkBotAndMaybeBlock — log attribution', () => {
+    it('redis_failed log includes tenant_id and agent_id', async () => {
+      // Force the redis incr to throw so we hit the catch branch.
+      redisStub.incr.mockRejectedValueOnce(new Error('CONN_RESET'));
+
+      await runWithTenantContext(
+        { tenant_id: TENANT_A, agent_id: AGENT_A },
+        async () => {
+          await checkBotAndMaybeBlock(PHONE_SHARED);
+        },
+      );
+
+      const redisFailedCall = loggerWarnMock.mock.calls.find(
+        (call) => call[1] === 'bot_detection.redis_failed',
+      );
+      expect(redisFailedCall).toBeDefined();
+      const payload = redisFailedCall![0] as {
+        tenant_id: string;
+        agent_id: string;
+        err: string;
+      };
+      expect(payload.tenant_id).toBe(TENANT_A);
+      expect(payload.agent_id).toBe(AGENT_A);
+      expect(payload.err).toBe('CONN_RESET');
+    });
+
+    it('auto_blocked log includes tenant_id and agent_id', async () => {
+      const PESSOA_ID = 'pessoa-uuid-bbbb';
+      findByPhoneMock.mockResolvedValue({
+        id: PESSOA_ID,
+        tipo: 'cliente',
+        status: 'ativa',
+        telefone_whatsapp: PHONE_SHARED,
+      } as unknown as null);
+
+      await runWithTenantContext(
+        { tenant_id: TENANT_B, agent_id: AGENT_B },
+        async () => {
+          for (let i = 0; i < 51; i++) {
+            await checkBotAndMaybeBlock(PHONE_SHARED);
+          }
+        },
+      );
+
+      const autoBlockedCall = loggerWarnMock.mock.calls.find(
+        (call) => call[1] === 'bot_detection.auto_blocked',
+      );
+      expect(autoBlockedCall).toBeDefined();
+      const payload = autoBlockedCall![0] as {
+        tenant_id: string;
+        agent_id: string;
+        pessoa_id: string;
+      };
+      expect(payload.tenant_id).toBe(TENANT_B);
+      expect(payload.agent_id).toBe(AGENT_B);
+      expect(payload.pessoa_id).toBe(PESSOA_ID);
+    });
+
+    it('owner_threshold_exceeded log includes tenant_id and agent_id', async () => {
+      const OWNER_ID = 'pessoa-owner-cccc';
+      findByPhoneMock.mockResolvedValue({
+        id: OWNER_ID,
+        tipo: 'co_dono',
+        status: 'ativa',
+        telefone_whatsapp: PHONE_SHARED,
+      } as unknown as null);
+
+      await runWithTenantContext(
+        { tenant_id: TENANT_A, agent_id: AGENT_B },
+        async () => {
+          for (let i = 0; i < 51; i++) {
+            await checkBotAndMaybeBlock(PHONE_SHARED);
+          }
+        },
+      );
+
+      const ownerCall = loggerWarnMock.mock.calls.find(
+        (call) => call[1] === 'bot_detection.owner_threshold_exceeded',
+      );
+      expect(ownerCall).toBeDefined();
+      const payload = ownerCall![0] as {
+        tenant_id: string;
+        agent_id: string;
+        pessoa_id: string;
+      };
+      expect(payload.tenant_id).toBe(TENANT_A);
+      expect(payload.agent_id).toBe(AGENT_B);
+      expect(payload.pessoa_id).toBe(OWNER_ID);
     });
   });
 
