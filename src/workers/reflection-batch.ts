@@ -1,4 +1,5 @@
-import { db } from '@/db/client.js';
+import type { PoolClient } from 'pg';
+import { db, pool } from '@/db/client.js';
 import { audit_log } from '@/db/schema.js';
 import { sql } from 'drizzle-orm';
 import { logger } from '@/lib/logger.js';
@@ -50,14 +51,129 @@ type TenantAgentRow = { tenant_id: string; agent_id: string };
  * tenant_id='default' (issue #240). A partir do fix, novas reflexões nunca
  * mais entram em 'default'; rows pré-existentes ficam como artefato (ver
  * follow-up de migração no PR body).
+ *
+ * Codex REQUEST_CHANGES (PR #251) MINOR: o predicate `tenant_id IS NOT NULL
+ * AND agent_id IS NOT NULL` é explicitamente solicitado pela issue #240.
+ * O schema já garante NOT NULL (com default 'default'), então estes
+ * predicados são belt-and-suspenders contra um futuro relaxamento do schema
+ * ou uma migração de coluna que temporariamente permita NULL.
  */
 async function listTenantsWithCorrections(since: ReturnType<typeof sql>): Promise<TenantAgentRow[]> {
   const result = await db.execute<TenantAgentRow>(sql`
     SELECT DISTINCT tenant_id, agent_id
     FROM ${audit_log}
-    WHERE acao = 'transaction_corrected' AND created_at >= ${since}
+    WHERE acao = 'transaction_corrected'
+      AND created_at >= ${since}
+      AND tenant_id IS NOT NULL
+      AND agent_id IS NOT NULL
   `);
   return Array.from(result.rows as unknown as TenantAgentRow[]);
+}
+
+/**
+ * Codex REQUEST_CHANGES (PR #251) MEDIUM #2 — concurrent worker guard.
+ *
+ * Cenário: 2 instâncias do reflection_batch rodam em paralelo (rolling deploy,
+ * restart, debug local). Cada uma:
+ *   1. Lê audit_log do tenant X
+ *   2. `rulesRepo.findByContext('classificacao', cluster.descricao)` → null
+ *      em ambos (read antes do write)
+ *   3. `rulesRepo.create` em ambos → DUAS regras duplicadas, mesma descricao
+ *
+ * Solução: Postgres session-level advisory lock por (tenant_id, agent_id).
+ * `pg_try_advisory_lock` retorna `false` se outro worker já segura a chave —
+ * nesse caso o tenant é SKIPADO com log, não bloqueia. O lock é session-level
+ * (não xact-level) porque o trabalho do tenant inclui chamadas LLM de até 30s
+ * que NÃO devem rodar dentro de uma transação Postgres (vão segurar
+ * conexão+xact bloat).
+ *
+ * Por que session-level + cliente dedicado: a advisory lock é amarrada à
+ * conexão Postgres. `db.execute(...)` no pool pode pegar uma conexão diferente
+ * a cada chamada — o lock perderia significado. Em vez disso, alocamos um
+ * cliente dedicado do pool, seguramos o lock NELE durante todo o
+ * processamento daquele tenant, e liberamos no `finally`. As queries internas
+ * (`db.execute`, `rulesRepo.*`, `writeMemory`) ainda usam o pool — o lock é
+ * apenas mutex EXTERNO contra outras instâncias do worker tentando o MESMO
+ * (tenant, agent).
+ *
+ * Chave: `pg_try_advisory_lock(int8)` exige um único bigint. Derivamos por
+ * `hashtextextended(tenant_id || '|' || agent_id, NAMESPACE_SEED)`.
+ * NAMESPACE_SEED isola o keyspace do reflection_batch de outros usos futuros
+ * de advisory lock no Maia (qualquer constante estável serve — não pode
+ * trocar entre deploys senão round-trip de release não bate).
+ *
+ * Retorno: { client, released() }. Caller chama `released()` no finally.
+ * `client` não é exposto pra inner — só serve pra segurar o lock na conexão.
+ */
+const REFLECTION_BATCH_LOCK_NAMESPACE = 4711_4711n;
+
+type AcquiredLock = {
+  /** Libera o lock e devolve o client ao pool. Safe to call multiple times. */
+  release: () => Promise<void>;
+};
+
+async function tryAcquireTenantLock(
+  tenant_id: string,
+  agent_id: string,
+): Promise<AcquiredLock | null> {
+  let client: PoolClient;
+  try {
+    client = await pool.connect();
+  } catch (err) {
+    // Even acquiring a pool client failed (pool exhaustion, DB down). Skip the
+    // tenant this tick; the next cron run will retry.
+    logger.warn(
+      { err: (err as Error).message, tenant_id, agent_id },
+      'reflection_batch.lock_acquire_failed',
+    );
+    return null;
+  }
+
+  let released = false;
+  try {
+    // Use hashtextextended (bigint) seeded com o namespace pra evitar colisão
+    // com outros consumidores de advisory lock no futuro. Key derivada do
+    // par (tenant, agent) — distintos pares têm chaves distintas com alta
+    // probabilidade.
+    const r = await client.query<{ locked: boolean }>(
+      `SELECT pg_try_advisory_lock(hashtextextended($1, $2)) AS locked`,
+      [`${tenant_id}|${agent_id}`, REFLECTION_BATCH_LOCK_NAMESPACE.toString()],
+    );
+    const locked = r.rows[0]?.locked === true;
+    if (!locked) {
+      client.release();
+      return null;
+    }
+  } catch (err) {
+    // Lock acquisition itself failed (e.g. connection error). Release client
+    // and treat as "could not acquire" — the tenant gets skipped this run.
+    client.release();
+    logger.warn(
+      { err: (err as Error).message, tenant_id, agent_id },
+      'reflection_batch.lock_acquire_failed',
+    );
+    return null;
+  }
+
+  return {
+    release: async () => {
+      if (released) return;
+      released = true;
+      try {
+        await client.query(
+          `SELECT pg_advisory_unlock(hashtextextended($1, $2))`,
+          [`${tenant_id}|${agent_id}`, REFLECTION_BATCH_LOCK_NAMESPACE.toString()],
+        );
+      } catch (err) {
+        logger.warn(
+          { err: (err as Error).message, tenant_id, agent_id },
+          'reflection_batch.lock_release_failed',
+        );
+      } finally {
+        client.release();
+      }
+    },
+  };
 }
 
 /**
@@ -105,25 +221,68 @@ export async function runReflectionBatch(): Promise<void> {
   let totalSignals = 0;
   let totalClusters = 0;
   let totalLlmCalls = 0;
+  let tenantsProcessed = 0;
+  let tenantsSkippedLocked = 0;
+  let tenantsFailed = 0;
 
   for (const { tenant_id, agent_id } of tenants) {
-    const stats = await runWithTenantContext({ tenant_id, agent_id }, () =>
-      runReflectionBatchInner(since),
-    );
-    totalCreated += stats.created;
-    totalSkipped += stats.skipped;
-    totalSignals += stats.signals;
-    totalClusters += stats.clusters;
-    totalLlmCalls += stats.llm_calls;
-    logger.info(
-      { tenant_id, agent_id, ...stats },
-      'reflection_batch.tenant_done',
-    );
+    // Codex REQUEST_CHANGES (PR #251) MEDIUM #2: tentar adquirir advisory
+    // lock per (tenant, agent). Se outro worker já está rodando esse par,
+    // skipar — não bloquear, não aguardar (o próximo cron tick pega).
+    const lock = await tryAcquireTenantLock(tenant_id, agent_id);
+    if (!lock) {
+      tenantsSkippedLocked++;
+      logger.info(
+        { tenant_id, agent_id },
+        'reflection_batch.tenant_skipped_locked',
+      );
+      continue;
+    }
+
+    try {
+      // Codex REQUEST_CHANGES (PR #251) MEDIUM #1: try/catch POR tenant
+      // garante fail-isolated. Antes, um erro não tratado em `findByContext`
+      // / `proposeRule` / inner SELECT abortaria o loop inteiro — uma falha
+      // em tenant X bloqueava reflexão de todos os outros tenants na janela.
+      // Agora o erro fica contido: loga + métrica e continua com o próximo.
+      const stats = await runWithTenantContext({ tenant_id, agent_id }, () =>
+        runReflectionBatchInner(since),
+      );
+      totalCreated += stats.created;
+      totalSkipped += stats.skipped;
+      totalSignals += stats.signals;
+      totalClusters += stats.clusters;
+      totalLlmCalls += stats.llm_calls;
+      tenantsProcessed++;
+      logger.info(
+        { tenant_id, agent_id, ...stats },
+        'reflection_batch.tenant_done',
+      );
+    } catch (err) {
+      // Fail-isolated: o erro de UM tenant não afeta os demais. O run total
+      // permanece "parcialmente ok" — telemetria distingue via
+      // `tenants_failed`/`tenants_processed` no `reflection_batch.done`.
+      tenantsFailed++;
+      logger.warn(
+        {
+          tenant_id,
+          agent_id,
+          err: (err as Error).message,
+          stack: (err as Error).stack,
+        },
+        'reflection_batch.tenant_failed',
+      );
+    } finally {
+      await lock.release();
+    }
   }
 
   logger.info(
     {
       tenants: tenants.length,
+      tenants_processed: tenantsProcessed,
+      tenants_skipped_locked: tenantsSkippedLocked,
+      tenants_failed: tenantsFailed,
       created: totalCreated,
       skipped_existing: totalSkipped,
       clusters: totalClusters,
@@ -241,11 +400,20 @@ async function runReflectionBatchInner(
         escopo: 'global',
         metadata: { rule_id: r.id, cluster_size: cluster.signals.length },
       }).catch((err) =>
-        logger.warn({ err: (err as Error).message }, 'reflection_batch.memory_write_failed'),
+        // Codex REQUEST_CHANGES (PR #251) LOW: incluir tenant/agent no log
+        // de falha pra simetria com o caminho de sucesso. Antes só `{err}`.
+        logger.warn(
+          { err: (err as Error).message, tenant_id, agent_id },
+          'reflection_batch.memory_write_failed',
+        ),
       );
       created++;
     } catch (err) {
-      logger.warn({ err: (err as Error).message }, 'reflection_batch.create_failed');
+      // Idem — log de falha simétrico ao de sucesso.
+      logger.warn(
+        { err: (err as Error).message, tenant_id, agent_id },
+        'reflection_batch.create_failed',
+      );
     }
   }
 

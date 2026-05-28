@@ -131,8 +131,60 @@ const dbExecuteMock = vi.fn(async (query: SQL) => {
   return { rows: [] };
 });
 
+// ---------------------------------------------------------------------------
+// Pool / Postgres client fake — REQUEST_CHANGES MEDIUM #2 (concurrent worker
+// guard). The worker now acquires `pg_try_advisory_lock(hashtextextended(...))`
+// on a dedicated client per tenant before processing. The fake tracks per-key
+// lock state so tests can assert acquire/skip behavior.
+// ---------------------------------------------------------------------------
+type AdvisoryLockKey = string; // composite of tenant|agent for assertion clarity
+
+/** Currently held advisory locks (keyed by the COMPOSITE input, not the hash). */
+const heldLocks = new Set<AdvisoryLockKey>();
+/** History of (action, key) pairs in chronological order for assertions. */
+const lockHistory: Array<{ action: 'try' | 'unlock'; key: AdvisoryLockKey; locked: boolean }> = [];
+
+const poolConnectMock = vi.fn(async () => {
+  let clientReleased = false;
+  const client = {
+    query: vi.fn(
+      async (
+        text: string,
+        params: unknown[],
+      ): Promise<{ rows: Array<{ locked?: boolean }> }> => {
+        if (/pg_try_advisory_lock/i.test(text)) {
+          // params[0] = composite key string, params[1] = namespace seed (text).
+          const key = params[0] as string;
+          if (heldLocks.has(key)) {
+            lockHistory.push({ action: 'try', key, locked: false });
+            return { rows: [{ locked: false }] };
+          }
+          heldLocks.add(key);
+          lockHistory.push({ action: 'try', key, locked: true });
+          return { rows: [{ locked: true }] };
+        }
+        if (/pg_advisory_unlock/i.test(text)) {
+          const key = params[0] as string;
+          const wasHeld = heldLocks.delete(key);
+          lockHistory.push({ action: 'unlock', key, locked: wasHeld });
+          return { rows: [{ locked: wasHeld }] };
+        }
+        return { rows: [] };
+      },
+    ),
+    release: vi.fn(() => {
+      clientReleased = true;
+    }),
+    get released(): boolean {
+      return clientReleased;
+    },
+  };
+  return client;
+});
+
 vi.mock('@/db/client.js', () => ({
   db: { execute: dbExecuteMock },
+  pool: { connect: poolConnectMock },
 }));
 
 // ---------------------------------------------------------------------------
@@ -312,7 +364,10 @@ beforeEach(() => {
   rulesRepoCreateCalls.length = 0;
   auditCalls.length = 0;
   nextRuleSeq = 1;
+  heldLocks.clear();
+  lockHistory.length = 0;
   dbExecuteMock.mockClear();
+  poolConnectMock.mockClear();
 });
 
 // ---------------------------------------------------------------------------
@@ -573,5 +628,271 @@ describe('Issue #240 — runReflectionBatch is per-tenant scoped (no default/def
     expect(writeMemoryCalls).toHaveLength(1);
     expect(writeMemoryCalls[0]!.tenant_id).toBe('tenant-B');
     expect(writeMemoryCalls[0]!.agent_id).toBe('agent-B');
+  });
+
+  it('DISPATCHER QUERY filters tenant_id IS NOT NULL AND agent_id IS NOT NULL (Codex REQUEST_CHANGES MINOR)', async () => {
+    // The MINOR ask from the #251 review: even though the schema enforces
+    // NOT NULL, the dispatcher SQL should include the explicit predicate
+    // (belt-and-suspenders against a future schema relaxation).
+    seedCorrection(A_CTX, 'A descricao');
+
+    const { runReflectionBatch } = await import('@/workers/reflection-batch.js');
+    await runReflectionBatch();
+
+    const dispatcherSql = renderedSqls.find((s) =>
+      /SELECT\s+DISTINCT\s+tenant_id,\s*agent_id/i.test(s),
+    );
+    expect(dispatcherSql).toBeDefined();
+    expect(dispatcherSql!).toMatch(/tenant_id\s+IS\s+NOT\s+NULL/i);
+    expect(dispatcherSql!).toMatch(/agent_id\s+IS\s+NOT\s+NULL/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// REQUEST_CHANGES on PR #251 — MEDIUM gaps
+// ---------------------------------------------------------------------------
+describe('PR #251 REQUEST_CHANGES — MEDIUM #1: fail-isolated per-tenant', () => {
+  it('a thrown error in tenant-A does NOT abort processing of tenant-B', async () => {
+    seedCorrection(A_CTX, 'A boom descricao');
+    seedCorrection(A_CTX, 'A boom descricao');
+    seedCorrection(B_CTX, 'B descricao');
+    seedCorrection(B_CTX, 'B descricao');
+
+    // Make tenant-A throw on findByContext (one of the catch-bypass paths the
+    // reviewer flagged: errors here would escape the create/write try/catch
+    // and unwind the per-tenant loop).
+    const repos = await import('@/db/repositories.js');
+    (repos.rulesRepo.findByContext as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      async () => {
+        throw new Error('synthetic tenant-A failure');
+      },
+    );
+    // Subsequent calls (tenant-B) return null as the default behavior.
+
+    const { runReflectionBatch } = await import('@/workers/reflection-batch.js');
+    await expect(runReflectionBatch()).resolves.toBeUndefined();
+
+    // tenant-B's write must have landed despite tenant-A blowing up. This is
+    // the entire point of fail-isolated: a buggy tenant doesn't take down
+    // the whole nightly batch.
+    expect(writeMemoryCalls).toHaveLength(1);
+    expect(writeMemoryCalls[0]!.tenant_id).toBe('tenant-B');
+    expect(writeMemoryCalls[0]!.agent_id).toBe('agent-B');
+    expect(rulesRepoCreateCalls).toHaveLength(1);
+    expect(rulesRepoCreateCalls[0]!.tenant_id).toBe('tenant-B');
+  });
+
+  it('tenant-A failure is logged with tenant_id+agent_id; other tenants still emit reflection_batch.tenant_done', async () => {
+    seedCorrection(A_CTX, 'A boom');
+    seedCorrection(A_CTX, 'A boom');
+    seedCorrection(B_CTX, 'B ok');
+    seedCorrection(B_CTX, 'B ok');
+
+    const repos = await import('@/db/repositories.js');
+    (repos.rulesRepo.findByContext as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      async () => {
+        throw new Error('synthetic failure for log assertion');
+      },
+    );
+
+    const loggerMod = await import('@/lib/logger.js');
+    const warnSpy = loggerMod.logger.warn as ReturnType<typeof vi.fn>;
+    const infoSpy = loggerMod.logger.info as ReturnType<typeof vi.fn>;
+    warnSpy.mockClear();
+    infoSpy.mockClear();
+
+    const { runReflectionBatch } = await import('@/workers/reflection-batch.js');
+    await runReflectionBatch();
+
+    // The warn log of the failed tenant must carry tenant_id+agent_id so
+    // ops can pinpoint which (tenant, agent) blew up.
+    const tenantFailedLogs = warnSpy.mock.calls.filter(
+      (c) => c[1] === 'reflection_batch.tenant_failed',
+    );
+    expect(tenantFailedLogs).toHaveLength(1);
+    expect(tenantFailedLogs[0]![0]).toMatchObject({
+      tenant_id: expect.any(String),
+      agent_id: expect.any(String),
+      err: expect.stringContaining('synthetic failure for log assertion'),
+    });
+
+    // tenant-B (the healthy one) must have emitted a tenant_done log too,
+    // proving the loop kept going.
+    const tenantDoneLogs = infoSpy.mock.calls.filter(
+      (c) => c[1] === 'reflection_batch.tenant_done',
+    );
+    expect(tenantDoneLogs.length).toBeGreaterThanOrEqual(1);
+    const doneTenants = new Set(tenantDoneLogs.map((c) => (c[0] as { tenant_id: string }).tenant_id));
+    expect(doneTenants.has('tenant-B')).toBe(true);
+  });
+
+  it('reflection_batch.done aggregate carries tenants_failed + tenants_processed counters', async () => {
+    seedCorrection(A_CTX, 'A boom');
+    seedCorrection(A_CTX, 'A boom');
+    seedCorrection(B_CTX, 'B ok');
+    seedCorrection(B_CTX, 'B ok');
+
+    const repos = await import('@/db/repositories.js');
+    (repos.rulesRepo.findByContext as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      async () => {
+        throw new Error('boom');
+      },
+    );
+
+    const loggerMod = await import('@/lib/logger.js');
+    const infoSpy = loggerMod.logger.info as ReturnType<typeof vi.fn>;
+    infoSpy.mockClear();
+
+    const { runReflectionBatch } = await import('@/workers/reflection-batch.js');
+    await runReflectionBatch();
+
+    const doneLogs = infoSpy.mock.calls.filter((c) => c[1] === 'reflection_batch.done');
+    expect(doneLogs).toHaveLength(1);
+    const doneFields = doneLogs[0]![0] as {
+      tenants: number;
+      tenants_processed: number;
+      tenants_failed: number;
+      tenants_skipped_locked: number;
+    };
+    expect(doneFields.tenants).toBe(2);
+    expect(doneFields.tenants_processed).toBe(1);
+    expect(doneFields.tenants_failed).toBe(1);
+    expect(doneFields.tenants_skipped_locked).toBe(0);
+  });
+});
+
+describe('PR #251 REQUEST_CHANGES — MEDIUM #2: concurrent worker guard (advisory lock)', () => {
+  it('acquires an advisory lock per (tenant, agent) BEFORE processing and releases it after', async () => {
+    seedCorrection(A_CTX, 'A descricao');
+    seedCorrection(A_CTX, 'A descricao');
+
+    const { runReflectionBatch } = await import('@/workers/reflection-batch.js');
+    await runReflectionBatch();
+
+    // The lock history records exactly one acquire + one unlock for tenant-A.
+    const aKey = 'tenant-A|agent-A';
+    const tries = lockHistory.filter((h) => h.action === 'try' && h.key === aKey);
+    const unlocks = lockHistory.filter((h) => h.action === 'unlock' && h.key === aKey);
+    expect(tries).toHaveLength(1);
+    expect(tries[0]!.locked).toBe(true);
+    expect(unlocks).toHaveLength(1);
+    expect(unlocks[0]!.locked).toBe(true);
+
+    // And acquire happens BEFORE the inner write (otherwise the lock can't
+    // be protecting the read-then-create race).
+    expect(heldLocks.size).toBe(0);
+    expect(writeMemoryCalls).toHaveLength(1);
+  });
+
+  it('if the lock is already held by another worker, the tenant is SKIPPED (no writes, no inner read)', async () => {
+    seedCorrection(A_CTX, 'A descricao');
+    seedCorrection(A_CTX, 'A descricao');
+
+    // Pre-seed the lock for tenant-A — simulates a second worker already
+    // holding it. pg_try_advisory_lock should return false → skip path.
+    heldLocks.add('tenant-A|agent-A');
+
+    const { runReflectionBatch } = await import('@/workers/reflection-batch.js');
+    await runReflectionBatch();
+
+    // No writes happened — the tenant was skipped before entering the inner.
+    expect(writeMemoryCalls).toHaveLength(0);
+    expect(rulesRepoCreateCalls).toHaveLength(0);
+
+    // The per-tenant inner SELECT (acao, alvo_id, ...) must NOT have fired
+    // for tenant-A because we skipped before opening the tenant context.
+    const innerReads = renderedSqls.filter((s) =>
+      /SELECT\s+acao,\s*alvo_id,\s*metadata,\s*pessoa_id/i.test(s),
+    );
+    expect(innerReads).toHaveLength(0);
+
+    // The pre-seeded lock is still held (we never unlocked it — the worker
+    // doesn't release locks it didn't acquire).
+    expect(heldLocks.has('tenant-A|agent-A')).toBe(true);
+  });
+
+  it('skipped-locked tenants are counted in reflection_batch.done.tenants_skipped_locked', async () => {
+    seedCorrection(A_CTX, 'A descricao');
+    seedCorrection(B_CTX, 'B descricao');
+
+    // tenant-A is pre-locked (by another worker), tenant-B is free.
+    heldLocks.add('tenant-A|agent-A');
+
+    const loggerMod = await import('@/lib/logger.js');
+    const infoSpy = loggerMod.logger.info as ReturnType<typeof vi.fn>;
+    infoSpy.mockClear();
+
+    const { runReflectionBatch } = await import('@/workers/reflection-batch.js');
+    await runReflectionBatch();
+
+    // tenant-B processed normally.
+    expect(writeMemoryCalls).toHaveLength(1);
+    expect(writeMemoryCalls[0]!.tenant_id).toBe('tenant-B');
+
+    // Counters reflect the skip.
+    const doneLogs = infoSpy.mock.calls.filter((c) => c[1] === 'reflection_batch.done');
+    expect(doneLogs).toHaveLength(1);
+    const doneFields = doneLogs[0]![0] as {
+      tenants_skipped_locked: number;
+      tenants_processed: number;
+    };
+    expect(doneFields.tenants_skipped_locked).toBe(1);
+    expect(doneFields.tenants_processed).toBe(1);
+
+    // A tenant_skipped_locked log was emitted for tenant-A specifically.
+    const skipLogs = infoSpy.mock.calls.filter(
+      (c) => c[1] === 'reflection_batch.tenant_skipped_locked',
+    );
+    expect(skipLogs).toHaveLength(1);
+    expect(skipLogs[0]![0]).toMatchObject({ tenant_id: 'tenant-A', agent_id: 'agent-A' });
+  });
+
+  it('lock is released even if the inner throws (finally guarantees no leaked lock)', async () => {
+    seedCorrection(A_CTX, 'A boom');
+    seedCorrection(A_CTX, 'A boom');
+
+    const repos = await import('@/db/repositories.js');
+    (repos.rulesRepo.findByContext as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      async () => {
+        throw new Error('synthetic failure');
+      },
+    );
+
+    const { runReflectionBatch } = await import('@/workers/reflection-batch.js');
+    await runReflectionBatch();
+
+    // Even though tenant-A blew up, the advisory lock must have been
+    // released — otherwise a sticky lock would block all subsequent worker
+    // ticks for this tenant forever.
+    expect(heldLocks.has('tenant-A|agent-A')).toBe(false);
+
+    // History confirms acquire then unlock in order.
+    const aKey = 'tenant-A|agent-A';
+    const events = lockHistory.filter((h) => h.key === aKey);
+    expect(events.map((e) => e.action)).toEqual(['try', 'unlock']);
+  });
+
+  it('distinct (tenant, agent) pairs each get their own lock — different pairs do not contend', async () => {
+    // Both pairs are free; both should acquire successfully.
+    seedCorrection({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, 'A1');
+    seedCorrection({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, 'A1');
+    seedCorrection({ tenant_id: 'tenant-A', agent_id: 'agent-OTHER' }, 'A2');
+    seedCorrection({ tenant_id: 'tenant-A', agent_id: 'agent-OTHER' }, 'A2');
+
+    const { runReflectionBatch } = await import('@/workers/reflection-batch.js');
+    await runReflectionBatch();
+
+    // Both pairs processed.
+    expect(writeMemoryCalls).toHaveLength(2);
+    const pairs = new Set(writeMemoryCalls.map((c) => `${c.tenant_id}|${c.agent_id}`));
+    expect(pairs).toEqual(new Set(['tenant-A|agent-A', 'tenant-A|agent-OTHER']));
+
+    // Both locks acquired and released — no held lock at end.
+    expect(heldLocks.size).toBe(0);
+    // Each pair has its own try+unlock pair.
+    for (const key of ['tenant-A|agent-A', 'tenant-A|agent-OTHER']) {
+      const events = lockHistory.filter((h) => h.key === key);
+      expect(events.map((e) => e.action)).toEqual(['try', 'unlock']);
+    }
   });
 });
