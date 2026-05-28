@@ -386,6 +386,21 @@ export const knowledgeRepos = {
         // Issue #254 — cross-tenant guard. Behavioral hints and
         // procedure hints share the `behavioral_hint` table; same
         // pattern as fact/memory/rule applies.
+        //
+        // Architectural note (Codex #267 review, concern 2 — LOW):
+        // The `behavioral_hint` table has no DB-level `kind`
+        // discriminator column. `behavioral_hint` and `procedure_hint`
+        // intentionally share storage — they only differ in callsite
+        // semantics (tone/style vs procedural step). Under
+        // `runWithTenantContext(tenant_id, agent_id)`, an id is unique
+        // within (tenant_id, agent_id) per the table's PK + index,
+        // so a single id cannot resolve to a different row for the
+        // two kinds. UUID v4 collision across kinds within the same
+        // (tenant, agent) scope has probability ≈ 0 (no IDs are
+        // user-supplied; the schema's `defaultRandom()` generates
+        // crypto-random uuids). A `kind`/`hint_kind` column is
+        // deferred to a future PR if telemetry shows callsite
+        // discrimination is needed.
         const tenant_id = getCurrentTenant();
         const agent_id = getCurrentAgent();
         const rows = await db
@@ -659,6 +674,15 @@ export const knowledgeRepos = {
         // The TypedError code is derived from the kind so callers can
         // grep by `behavioral_hint_not_in_scope` or
         // `procedure_hint_not_in_scope` independently in telemetry.
+        //
+        // Architectural note (Codex #267 review, concern 2 — LOW):
+        // see the matching note on `findById` above — no DB-level
+        // `kind` discriminator on the shared table is acceptable
+        // because (tenant_id, agent_id, id) is unique and UUID v4
+        // collision across kinds is ≈ 0. The kind is preserved on
+        // the error code for telemetry. Future PR may add a `kind`
+        // column if callsite discrimination becomes a hard
+        // requirement (e.g. for differential analytics).
         const tenant_id = getCurrentTenant();
         const agent_id = getCurrentAgent();
         const scopeErrorCode = `${kind}_not_in_scope`;

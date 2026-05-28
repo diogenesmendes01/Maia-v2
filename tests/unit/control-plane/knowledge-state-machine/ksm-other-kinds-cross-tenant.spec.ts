@@ -1022,4 +1022,120 @@ describe('Issue #254 — KSM facade for non-rule kinds is tenant/agent-scoped', 
       });
     });
   }
+
+  // ---------------------------------------------------------------------------
+  // Concern 2 (Codex #267 — LOW): behavioral_hint and procedure_hint share
+  // the `behavioral_hint` table without a DB-level `kind` discriminator.
+  // The architectural decision (documented in repos.ts) is that this is
+  // safe because (tenant_id, agent_id, id) is unique and UUID v4 collision
+  // across kinds is ≈ 0. These tests PIN the current intentional behavior:
+  //   - same-row lookup works under both kinds (proves shared storage)
+  //   - cross-tenant isolation still holds independently of kind label
+  // If a `kind` column is added later, these tests must be updated to
+  // reflect the new discrimination semantics.
+  // ---------------------------------------------------------------------------
+  describe('Concern 2 — behavioral_hint / procedure_hint shared table semantics', () => {
+    it('a row written under one hint-kind is findable under the OTHER hint-kind (same tenant/agent)', async () => {
+      // This documents the *intentional* shared-table design. If a real
+      // `kind` column is introduced, this test must flip to expect null
+      // for the foreign kind and become the regression guard for the
+      // discriminator.
+      tableOf(hintTable).push(
+        baseHint({
+          id: 'shared_hint_id_001',
+          tenant_id: 'tenant-A',
+          agent_id: 'agent-A',
+          lifecycle_status: 'pending_review',
+        }),
+      );
+      const { knowledgeRepos } = await import(
+        '@/control-plane/knowledge-state-machine/repos.js'
+      );
+      const asBehavioral = await runWithTenantContext(A_CTX, async () =>
+        knowledgeRepos.findById('behavioral_hint', 'shared_hint_id_001'),
+      );
+      const asProcedure = await runWithTenantContext(A_CTX, async () =>
+        knowledgeRepos.findById('procedure_hint', 'shared_hint_id_001'),
+      );
+      // Both lookups resolve to the same physical row — shared storage.
+      expect(asBehavioral).not.toBeNull();
+      expect(asProcedure).not.toBeNull();
+      expect(asBehavioral!.id).toBe('shared_hint_id_001');
+      expect(asProcedure!.id).toBe('shared_hint_id_001');
+    });
+
+    it('cross-tenant isolation holds for BOTH hint kinds against the same shared row', async () => {
+      // Defense-in-depth: even with shared storage and no kind column,
+      // a foreign-tenant context cannot read or mutate the row under
+      // EITHER hint-kind. The tenant_id+agent_id ALS guard does the
+      // work; the shared-table absence of a `kind` column does NOT
+      // open any cross-tenant path.
+      tableOf(hintTable).push(
+        baseHint({
+          id: 'shared_hint_id_002',
+          tenant_id: 'tenant-A',
+          agent_id: 'agent-A',
+          lifecycle_status: 'pending_review',
+        }),
+      );
+      const { knowledgeRepos } = await import(
+        '@/control-plane/knowledge-state-machine/repos.js'
+      );
+      // tenant-B sees null under both kinds.
+      const bSawBehavioral = await runWithTenantContext(B_CTX, async () =>
+        knowledgeRepos.findById('behavioral_hint', 'shared_hint_id_002'),
+      );
+      const bSawProcedure = await runWithTenantContext(B_CTX, async () =>
+        knowledgeRepos.findById('procedure_hint', 'shared_hint_id_002'),
+      );
+      expect(bSawBehavioral).toBeNull();
+      expect(bSawProcedure).toBeNull();
+
+      // tenant-B can't mutate under either kind label.
+      await runWithTenantContext(B_CTX, async () => {
+        await expect(
+          knowledgeRepos.update('behavioral_hint', 'shared_hint_id_002', {
+            lifecycle_status: 'active',
+          }),
+        ).rejects.toMatchObject({ code: 'behavioral_hint_not_in_scope' });
+        await expect(
+          knowledgeRepos.update('procedure_hint', 'shared_hint_id_002', {
+            lifecycle_status: 'active',
+          }),
+        ).rejects.toMatchObject({ code: 'procedure_hint_not_in_scope' });
+      });
+
+      // Row state unchanged.
+      expect(findRow(hintTable, 'shared_hint_id_002')!.lifecycle_status).toBe(
+        'pending_review',
+      );
+    });
+
+    it('an update under one hint-kind is observable under the OTHER hint-kind (shared row)', async () => {
+      // Pins the shared-storage write semantics. Updating
+      // `behavioral_hint`(id) and re-reading as `procedure_hint`(id)
+      // must reflect the change — they are the same row.
+      tableOf(hintTable).push(
+        baseHint({
+          id: 'shared_hint_id_003',
+          tenant_id: 'tenant-A',
+          agent_id: 'agent-A',
+          lifecycle_status: 'pending_review',
+        }),
+      );
+      const { knowledgeRepos } = await import(
+        '@/control-plane/knowledge-state-machine/repos.js'
+      );
+      await runWithTenantContext(A_CTX, async () => {
+        await knowledgeRepos.update('behavioral_hint', 'shared_hint_id_003', {
+          lifecycle_status: 'active',
+        });
+        const viaProcedure = await knowledgeRepos.findById(
+          'procedure_hint',
+          'shared_hint_id_003',
+        );
+        expect(viaProcedure!.lifecycle_status).toBe('active');
+      });
+    });
+  });
 });
