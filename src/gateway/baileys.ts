@@ -494,8 +494,19 @@ export async function sendOutboundDocument(
     // disconnected / sent-without-id null cases and misclassify it as delivered
     // (Codex #216 round-4 — document silent-drop). The sole caller (PDF dispatch)
     // tags this delivered:false and recovers.
+    //
+    // #227 review: tag the throw with `code = 'DOC_READ_FAILED'` so the dispatch
+    // catch can discriminate "definitely pre-send" (this branch) from "transport
+    // throw that may have delivered" (socket.sendMessage failure). Without the
+    // discriminator the dispatch records 'unknown' for read failures too — and
+    // 'unknown' marks the turn as "do-not-retry", reviving the HIGH-1 silent-drop
+    // that #216 closed for the document path.
     logger.error({ err, path }, 'baileys.send_document.read_failed');
-    throw err;
+    const wrapped = new Error(
+      `document_read_failed: ${(err as Error).message}`,
+    ) as Error & { code?: string };
+    wrapped.code = 'DOC_READ_FAILED';
+    throw wrapped;
   }
   const result = await socket.sendMessage(
     jid,

@@ -153,6 +153,61 @@ async function claimOutboundLedger(
   };
 }
 
+/**
+ * Fail-open wrapper around `claimOutboundLedger` (#227 review blocker 6).
+ *
+ * If the ledger claim itself throws (DB hiccup, advisory-lock backend down,
+ * etc.) we MUST NOT block the legitimate send — otherwise a DB issue turns
+ * into user-visible silence. The review prescribes liveness > strict dedupe:
+ * log the issue and proceed as if there's no prior row. The narrow window
+ * where this happens AND a true double-send would result is far smaller than
+ * the everyday risk of dropping live messages on transient DB blips.
+ *
+ * Note: `claimOutboundLedger` already no-ops when the flag is off, so this
+ * wrapper only adds value when the flag is on. We still wrap unconditionally —
+ * the cost is negligible and it keeps the call-sites uniform.
+ */
+async function claimOutboundLedgerOrFailOpen(
+  conversa_id: string,
+  in_reply_to: string,
+  channel: OutboundChannel,
+): Promise<{ skip: boolean; existing_provider_message_id: string | null }> {
+  try {
+    return await claimOutboundLedger(conversa_id, in_reply_to, channel);
+  } catch (err) {
+    logger.warn(
+      {
+        err: (err as Error).message,
+        conversa_id,
+        in_reply_to,
+        channel,
+      },
+      'outbound_ledger.claim_failed',
+    );
+    return { skip: false, existing_provider_message_id: null };
+  }
+}
+
+/**
+ * Discriminator for sendOutboundDocument throws (#227 review blocker 4).
+ *
+ * sendOutboundDocument throws BOTH from:
+ *   1. readFile failure — DEFINITELY pre-send, nothing reached the wire.
+ *      Tagged with `code: 'DOC_READ_FAILED'` (see src/gateway/baileys.ts).
+ *   2. socket.sendMessage failure — transport throw, COULD be delivered-but-threw.
+ *
+ * Without this discriminator the dispatch records 'unknown' for case (1) too,
+ * which the boundary guard treats as "do not retry" → silent drop. That's the
+ * exact HIGH-1 failure mode #216 closed for documents.
+ *
+ * Returns `ambiguous` matching outboundMessagesRepo.markFailed semantics:
+ *   - false → record 'failed' (retry safe, nothing was sent).
+ *   - true  → record 'unknown' (could be sent, block retry).
+ */
+function classifyDocumentThrow(e: unknown): boolean {
+  return (e as Error & { code?: string })?.code !== 'DOC_READ_FAILED';
+}
+
 async function recordLedgerSent(
   conversa_id: string,
   in_reply_to: string,
@@ -216,9 +271,10 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
   if (latestReportPdf) {
     const pdf = latestReportPdf;
     try {
-      // #227: claim the turn before the send (no-op when flag off). cleanupPDF
-      // still runs in the `finally` even when we short-circuit on skip.
-      const ledger = await claimOutboundLedger(c.id, inbound.id, 'document');
+      // #227: claim the turn before the send (no-op when flag off, fail-open on
+      // DB throws — see claimOutboundLedgerOrFailOpen). cleanupPDF still runs
+      // in the `finally` even when we short-circuit on skip.
+      const ledger = await claimOutboundLedgerOrFailOpen(c.id, inbound.id, 'document');
       if (ledger.skip) return;
       const captionText = text.slice(0, 1024);
       let wid: string | null;
@@ -231,11 +287,14 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
         });
       } catch (e) {
         // sendOutboundDocument throws on either readFile failure (definitely
-        // pre-send, would warrant 'failed') or socket.sendMessage failure
-        // (transport, could be delivered-but-threw — warrants 'unknown').
-        // Without disambiguation here we conservatively record 'unknown' so a
-        // re-attempt is blocked; outer error still tagged delivered:false.
-        await recordLedgerFailed(c.id, inbound.id, (e as Error).message, true);
+        // pre-send → 'failed', retryable) or socket.sendMessage failure
+        // (transport, could be delivered-but-threw → 'unknown', not retryable).
+        // The discriminator is the `code: 'DOC_READ_FAILED'` tag set on the
+        // wrapped throw in baileys.send_document. Without it, a readFile fail
+        // would record 'unknown' and the boundary guard would block retry —
+        // reviving the HIGH-1 silent-drop #216 closed for documents.
+        const ambiguous = classifyDocumentThrow(e);
+        await recordLedgerFailed(c.id, inbound.id, (e as Error).message, ambiguous);
         throw new OutboundDeliveryError(false, (e as Error).message);
       }
       if (!wid) {
@@ -322,8 +381,9 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
       );
     }
     if (voiceBuf) {
-      // #227: claim the turn before the voice send (no-op when flag off).
-      const ledger = await claimOutboundLedger(c.id, inbound.id, 'voice');
+      // #227: claim the turn before the voice send (no-op when flag off,
+      // fail-open on DB throws — see claimOutboundLedgerOrFailOpen).
+      const ledger = await claimOutboundLedgerOrFailOpen(c.id, inbound.id, 'voice');
       if (ledger.skip) return; // already attempted; do NOT re-send
       let wid: string | null;
       try {
@@ -467,17 +527,37 @@ export async function safeDispatchOutput(ctx: DispatchOutputCtx): Promise<Dispat
   // delivered. Do NOT dispatch — return an outcome the caller treats as
   // handled. 'failed' or stale 'pending' rows fall through; the inner
   // upsertPending atomically takes them over.
+  //
+  // Fail-open: if findByKey throws (DB hiccup), we proceed to dispatch as if
+  // there's no prior row. Liveness > strict dedupe — a DB blip must NOT block
+  // a legitimate send. The inner upsertPending will likely also fail and is
+  // handled by claimOutboundLedgerOrFailOpen with the same fail-open contract.
+  // safeDispatchOutput's never-throw guarantee depends on this: a raw throw
+  // from findByKey before the try{} below would escape the contract.
   if (config.FEATURE_OUTBOUND_DEDUP) {
     const key = outboundIdempotencyKey(ctx.conversa.id, ctx.inbound.id);
-    const existing = await outboundMessagesRepo.findByKey(key);
-    if (existing?.status === 'sent') {
-      return { status: 'delivered' };
-    }
-    if (existing?.status === 'unknown') {
-      return {
-        status: 'sent_no_persist',
-        error: existing.error ?? 'prior_attempt_unknown',
-      };
+    try {
+      const existing = await outboundMessagesRepo.findByKey(key);
+      if (existing?.status === 'sent') {
+        return { status: 'delivered' };
+      }
+      if (existing?.status === 'unknown') {
+        return {
+          status: 'sent_no_persist',
+          error: existing.error ?? 'prior_attempt_unknown',
+        };
+      }
+    } catch (err) {
+      logger.warn(
+        {
+          err: (err as Error).message,
+          conversa_id: ctx.conversa.id,
+          in_reply_to: ctx.inbound.id,
+        },
+        'outbound_ledger.findByKey_failed',
+      );
+      // Fall through to dispatch — the inner claim will fail-open too if the
+      // DB is genuinely down.
     }
   }
   try {
@@ -554,10 +634,11 @@ export async function sendOutbound(
   },
 ): Promise<string | null> {
   // #227: claim the turn in the ledger BEFORE any work. If a prior attempt
-  // already marked this turn 'sent' / 'unknown', short-circuit (the user got
-  // — or might have got — that reply; do NOT re-send). No-op when the flag
-  // is off.
-  const ledger = await claimOutboundLedger(conversa_id, in_reply_to, 'text');
+  // already marked this turn 'sent' / 'unknown' / 'pending' (in-flight),
+  // short-circuit (the user got — or might have got — that reply; do NOT
+  // re-send). No-op when the flag is off. Fail-open on DB throws so a DB
+  // hiccup never blocks a legitimate send (liveness > strict dedupe).
+  const ledger = await claimOutboundLedgerOrFailOpen(conversa_id, in_reply_to, 'text');
   if (ledger.skip) return ledger.existing_provider_message_id;
 
   // PRE-SEND (recipient + JID resolution). If any of this throws, or there's no
@@ -647,10 +728,10 @@ export async function sendOutboundPoll(
   pending: { id: string; opcoes_validas: Array<{ key: string; label: string }> },
   opts?: { tool_summaries?: ToolExecutionSummary[] },
 ): Promise<{ fell_back: boolean }> {
-  // #227: claim the turn before any work (no-op when flag off). On fallback to
-  // text, sendOutbound's own claim takes over the same row (pending→pending,
-  // channel→text) so the ledger always reflects the final channel.
-  const ledger = await claimOutboundLedger(conversa_id, in_reply_to, 'poll');
+  // #227: claim the turn before any work (no-op when flag off, fail-open on
+  // DB throws). The same-row reclaim during a poll→text fallback (below) is
+  // handled by markFailed-then-claim — see the fallback comment.
+  const ledger = await claimOutboundLedgerOrFailOpen(conversa_id, in_reply_to, 'poll');
   if (ledger.skip) return { fell_back: false };
 
   // PRE-SEND (recipient + JID): a throw or missing recipient means nothing was
@@ -686,6 +767,17 @@ export async function sendOutboundPoll(
   // (sendOutbound is itself phase-tagged AND claims/updates the same ledger
   // row, so its failures propagate correctly and the ledger reflects 'text').
   if (!sent.whatsapp_id || !sent.message_secret || !sent.creator_jid) {
+    // #227 strict-pending: with the new semantic, our 'pending' poll row would
+    // make sendOutbound's inner claim see "in-flight by another worker" and
+    // skip — silent drop on fallback. Release the row to 'failed' first so the
+    // text claim can reclaim it. ambiguous=false because the poll was
+    // configuration-incomplete (missing secrets) — nothing was sent.
+    await recordLedgerFailed(
+      conversa_id,
+      in_reply_to,
+      'poll_missing_secrets_fallback_to_text',
+      false,
+    );
     const numbered = pending.opcoes_validas.map((o, i) => `${i + 1}. ${o.label}`).join('\n');
     await sendOutbound(pessoa_id, conversa_id, `${text}\n\n${numbered}`, in_reply_to, {
       pending_question_id: pending.id,
