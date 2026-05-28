@@ -9,6 +9,7 @@ import {
   InMemorySliceCache,
   sliceCacheKey,
 } from '@/runtime/context-packet/cache/slice-cache.js';
+import { InvalidCacheScopeError } from '@/user-layer/internal/cache-keys.js';
 
 describe('SliceCache (in-memory)', () => {
   let cache: InMemorySliceCache;
@@ -111,5 +112,29 @@ describe('SliceCache (in-memory)', () => {
     await cache.set(keyA, { agent: 'A', rules: ['rA1', 'rA2'] }, 300);
     expect(await cache.get(keyB)).toBeNull();
     expect(await cache.get(keyA)).toEqual({ agent: 'A', rules: ['rA1', 'rA2'] });
+  });
+
+  // ─── Issue #235 — fail-closed on empty/invalid scope (Codex reval) ──────
+  // Silent interpolation of an empty agent_id would produce a key like
+  // `maia:context:v2:tenant::slice:hash` — a degenerate tenant-wide scope
+  // that re-introduces the cross-agent leak the v1→v2 bump was meant to
+  // close. The builder MUST throw instead.
+
+  it('Issue #235: sliceCacheKey throws when agent_id is empty string (fail-closed)', () => {
+    expect(() => sliceCacheKey('tenant1', '', 'identity', 'scope1')).toThrow(
+      InvalidCacheScopeError,
+    );
+  });
+
+  it('Issue #235: sliceCacheKey throws when tenant_id is empty string (fail-closed)', () => {
+    expect(() => sliceCacheKey('', 'agent1', 'identity', 'scope1')).toThrow(
+      InvalidCacheScopeError,
+    );
+  });
+
+  it('Issue #235: sliceCacheKey throws when both tenant_id and agent_id are empty', () => {
+    expect(() => sliceCacheKey('', '', 'identity', 'scope1')).toThrow(
+      InvalidCacheScopeError,
+    );
   });
 });

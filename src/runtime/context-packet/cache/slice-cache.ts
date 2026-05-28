@@ -16,6 +16,7 @@
  */
 
 import { jitteredTTL } from './ttl-policy.js';
+import { assertValidScope } from '../../../user-layer/internal/cache-keys.js';
 
 export interface SliceCache {
   get<T>(key: string): Promise<T | null>;
@@ -32,6 +33,12 @@ export interface SliceCache {
  * by `invalidateSliceForTenant` continue to work, and so two agents on the
  * same tenant cannot collide on a cached slice even when individual builders
  * forget to include agent_id in their scope hash.
+ *
+ * Issue #235 (Codex reval, HIGH): fails closed via `assertValidScope` when
+ * `tenant_id` or `agent_id` is empty / non-string. Silently interpolating an
+ * empty agent_id would produce a key like `maia:context:v2:tenant::slice:hash`
+ * — a tenant-wide degenerate scope that re-introduces the cross-agent leak the
+ * v1→v2 bump was meant to close. Throw instead.
  */
 export function sliceCacheKey(
   tenant_id: string,
@@ -39,6 +46,7 @@ export function sliceCacheKey(
   slice: string,
   scope_hash: string,
 ): string {
+  assertValidScope(tenant_id, agent_id);
   return `maia:context:v2:${tenant_id}:${agent_id}:${slice}:${scope_hash}`;
 }
 
