@@ -313,8 +313,10 @@ export async function executeSelectedSkill(
   // runs side-effect-free prompt_only/evaluator, so ReAct recovery is best.
   // CAVEAT (#227): the transport does NOT guarantee throw ⇒ not-delivered; a
   // post-relay timeout could be tagged not_sent after delivery → a 2nd ReAct
-  // send would double-send. Narrow + low-harm for Phase-1 read-only replies; the
-  // outbound idempotency/dedupe ledger that closes this fully is tracked in #227.
+  // send would double-send. The outbound idempotency ledger that closes this
+  // (transport throws record as 'unknown' so the boundary guard blocks the
+  // re-attempt) lands in #227 and is active when FEATURE_OUTBOUND_DEDUP is on;
+  // with the flag off this caveat still applies (low-harm for Phase-1 read-only).
   const outcome = await deps.safeDispatchOutput({
     pessoa,
     conversa,

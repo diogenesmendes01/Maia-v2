@@ -21,6 +21,7 @@ const { cfg, m } = vi.hoisted(() => ({
     FEATURE_OUTBOUND_VOICE: false,
     FEATURE_VIEW_ONCE_SENSITIVE: false,
     FEATURE_ONE_TAP: false,
+    FEATURE_OUTBOUND_DEDUP: false,
   },
   m: {
     sendOutboundText: vi.fn(),
@@ -33,6 +34,10 @@ const { cfg, m } = vi.hoisted(() => ({
     findActiveSnapshot: vi.fn(),
     audit: vi.fn(),
     synthesizeSpeech: vi.fn(),
+    upsertPending: vi.fn(),
+    markSent: vi.fn(),
+    markFailed: vi.fn(),
+    findByKey: vi.fn(),
   },
 }));
 
@@ -46,6 +51,12 @@ vi.mock('@/db/repositories.js', () => ({
   mensagensRepo: { create: m.createMensagem, findById: vi.fn().mockResolvedValue(null) },
   pessoasRepo: { findById: m.findPessoa },
   pendingQuestionsRepo: { findActiveSnapshot: m.findActiveSnapshot },
+  outboundMessagesRepo: {
+    upsertPending: m.upsertPending,
+    markSent: m.markSent,
+    markFailed: m.markFailed,
+    findByKey: m.findByKey,
+  },
 }));
 vi.mock('@/governance/audit.js', () => ({ audit: m.audit }));
 vi.mock('@/config/env.js', () => ({ config: cfg }));
@@ -94,6 +105,15 @@ beforeEach(() => {
   cfg.FEATURE_OUTBOUND_VOICE = false;
   cfg.FEATURE_VIEW_ONCE_SENSITIVE = false;
   cfg.FEATURE_ONE_TAP = false;
+  cfg.FEATURE_OUTBOUND_DEDUP = false;
+  // Default ledger behavior: empty (no prior attempt). Tests flip these per-case.
+  m.findByKey.mockResolvedValue(null);
+  m.upsertPending.mockResolvedValue({
+    row: { provider_message_id: null, status: 'pending' },
+    skip: false,
+  });
+  m.markSent.mockResolvedValue(undefined);
+  m.markFailed.mockResolvedValue(undefined);
   m.findPessoa.mockResolvedValue(pessoa);
   m.findActiveSnapshot.mockResolvedValue(null);
   // Default to DISCONNECTED so a null send id reads as "not sent" (delivered:false);
@@ -361,6 +381,249 @@ describe('safeDispatchOutput — centralised, never-throwing wrapper (HIGH-1)', 
         acao: 'outbound_dispatch_failed',
         metadata: expect.objectContaining({ phase: 'post_send', delivered: true }),
       }),
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #227 outbound idempotency ledger — flag-gated behavior. With
+// FEATURE_OUTBOUND_DEDUP on: safeDispatchOutput short-circuits on a prior
+// 'sent'/'unknown' row (boundary guard), and dispatch paths record sent /
+// failed / unknown in the ledger so re-attempts are blocked or retried
+// correctly. With the flag off, every helper no-ops (covered implicitly by
+// the existing tests above, which all pass with the flag off).
+// ---------------------------------------------------------------------------
+
+describe('safeDispatchOutput — boundary guard (#227 FEATURE_OUTBOUND_DEDUP)', () => {
+  beforeEach(() => {
+    cfg.FEATURE_OUTBOUND_DEDUP = true;
+  });
+
+  it("prior 'sent' row ⇒ returns { delivered }, dispatch NOT called (no double-send)", async () => {
+    m.findByKey.mockResolvedValue({ status: 'sent', error: null });
+    const out = await safeDispatchOutput(mkCtx());
+    expect(out).toEqual({ status: 'delivered' });
+    expect(m.sendOutboundText).not.toHaveBeenCalled();
+    expect(m.upsertPending).not.toHaveBeenCalled();
+  });
+
+  it("prior 'unknown' row ⇒ returns { sent_no_persist }, dispatch NOT called", async () => {
+    m.findByKey.mockResolvedValue({ status: 'unknown', error: 'prior_throw' });
+    const out = await safeDispatchOutput(mkCtx());
+    expect(out).toMatchObject({ status: 'sent_no_persist', error: 'prior_throw' });
+    expect(m.sendOutboundText).not.toHaveBeenCalled();
+  });
+
+  it("prior 'failed' row ⇒ dispatch IS called (retry allowed)", async () => {
+    m.findByKey.mockResolvedValue({ status: 'failed', error: 'pre_send_throw' });
+    const out = await safeDispatchOutput(mkCtx());
+    expect(out).toEqual({ status: 'delivered' });
+    expect(m.sendOutboundText).toHaveBeenCalledOnce();
+  });
+
+  it('no prior row ⇒ dispatch IS called', async () => {
+    m.findByKey.mockResolvedValue(null);
+    const out = await safeDispatchOutput(mkCtx());
+    expect(out).toEqual({ status: 'delivered' });
+    expect(m.sendOutboundText).toHaveBeenCalledOnce();
+  });
+
+  it('flag OFF ⇒ findByKey is NOT even consulted (guard bypassed)', async () => {
+    cfg.FEATURE_OUTBOUND_DEDUP = false;
+    await safeDispatchOutput(mkCtx());
+    expect(m.findByKey).not.toHaveBeenCalled();
+  });
+});
+
+describe('dispatchOutput — text ledger wiring (#227 FEATURE_OUTBOUND_DEDUP)', () => {
+  beforeEach(() => {
+    cfg.FEATURE_OUTBOUND_DEDUP = true;
+  });
+
+  it('claim skip=true ⇒ returns existing wid, sendOutboundText NOT called, no markSent/markFailed', async () => {
+    m.upsertPending.mockResolvedValue({
+      row: { provider_message_id: 'wid_prior', status: 'sent' },
+      skip: true,
+    });
+    await expect(dispatchOutput(mkCtx())).resolves.toBeUndefined();
+    expect(m.sendOutboundText).not.toHaveBeenCalled();
+    expect(m.markSent).not.toHaveBeenCalled();
+    expect(m.markFailed).not.toHaveBeenCalled();
+    expect(m.createMensagem).not.toHaveBeenCalled();
+  });
+
+  it('transport throw ⇒ markFailed(ambiguous=true) ⇒ throws delivered:false (re-attempt blocked by boundary guard)', async () => {
+    m.sendOutboundText.mockRejectedValue(new Error('socket_closed'));
+    const err = await dispatchOutput(mkCtx()).catch((e) => e);
+    expect(err).toBeInstanceOf(OutboundDeliveryError);
+    expect((err as OutboundDeliveryError).delivered).toBe(false);
+    expect(m.markFailed).toHaveBeenCalledWith(
+      'c_1:msg_1',
+      'socket_closed',
+      true, // ambiguous
+    );
+    expect(m.markSent).not.toHaveBeenCalled();
+  });
+
+  it('null + disconnected ⇒ markFailed(ambiguous=false) (retry safe)', async () => {
+    m.sendOutboundText.mockResolvedValue(null);
+    m.isBaileysConnected.mockReturnValue(false);
+    const err = await dispatchOutput(mkCtx()).catch((e) => e);
+    expect((err as OutboundDeliveryError).delivered).toBe(false);
+    expect(m.markFailed).toHaveBeenCalledWith(
+      'c_1:msg_1',
+      'channel_disconnected',
+      false, // not ambiguous — definitely not sent
+    );
+  });
+
+  it('null + connected (sent-without-id) ⇒ markSent(null) (re-attempt blocked)', async () => {
+    m.sendOutboundText.mockResolvedValue(null);
+    m.isBaileysConnected.mockReturnValue(true);
+    const err = await dispatchOutput(mkCtx()).catch((e) => e);
+    expect((err as OutboundDeliveryError).delivered).toBe(true);
+    expect(m.markSent).toHaveBeenCalledWith('c_1:msg_1', null);
+    expect(m.markFailed).not.toHaveBeenCalled();
+  });
+
+  it('send success ⇒ markSent(wid) recorded BEFORE persist', async () => {
+    m.sendOutboundText.mockResolvedValue('wid_text');
+    await expect(dispatchOutput(mkCtx())).resolves.toBeUndefined();
+    expect(m.markSent).toHaveBeenCalledWith('c_1:msg_1', 'wid_text');
+    expect(m.createMensagem).toHaveBeenCalledOnce();
+  });
+
+  it('pre-send recipient lookup throw ⇒ markFailed(ambiguous=false) (nothing was sent)', async () => {
+    m.findPessoa.mockRejectedValue(new Error('pessoas_db_down'));
+    const err = await dispatchOutput(mkCtx()).catch((e) => e);
+    expect((err as OutboundDeliveryError).delivered).toBe(false);
+    expect(m.markFailed).toHaveBeenCalledWith(
+      'c_1:msg_1',
+      'pessoas_db_down',
+      false, // not ambiguous — pre-transport
+    );
+    expect(m.sendOutboundText).not.toHaveBeenCalled();
+  });
+
+  it('persist throw AFTER successful send ⇒ ledger already markSent; re-throws delivered:true', async () => {
+    m.sendOutboundText.mockResolvedValue('wid_text');
+    m.createMensagem.mockRejectedValue(new Error('persist_failed'));
+    const err = await dispatchOutput(mkCtx()).catch((e) => e);
+    expect((err as OutboundDeliveryError).delivered).toBe(true);
+    // markSent was recorded BEFORE the persist throw (so the ledger reflects
+    // 'sent' even though the DB row failed) — protects against re-send.
+    expect(m.markSent).toHaveBeenCalledWith('c_1:msg_1', 'wid_text');
+    expect(m.markFailed).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #227 Codex review fixes:
+//   - Document readFile vs transport discrimination (DOC_READ_FAILED).
+//   - Fail-open guards on findByKey + upsertPending throws.
+// ---------------------------------------------------------------------------
+
+describe('dispatchOutput — document discriminator (#227 DOC_READ_FAILED)', () => {
+  beforeEach(() => {
+    cfg.FEATURE_OUTBOUND_DEDUP = true;
+  });
+
+  const pdfCtx = () =>
+    mkCtx({
+      latestReportPdf: {
+        path: '/tmp/report.pdf',
+        fileName: 'report.pdf',
+        mimetype: 'application/pdf',
+        tipo: 'extrato',
+      },
+    });
+
+  it("readFile failure (code='DOC_READ_FAILED') ⇒ markFailed(ambiguous=false) — retry safe", async () => {
+    // baileys wraps readFile errors with `code: 'DOC_READ_FAILED'` so the
+    // dispatch can tell them apart from transport throws. The discriminator
+    // sets ambiguous=false → ledger 'failed' → retryable; without it the
+    // dispatch would record 'unknown' and the boundary guard would block
+    // retry, reviving the HIGH-1 silent-drop #216 closed for documents.
+    const docReadErr = new Error(
+      'document_read_failed: ENOENT',
+    ) as Error & { code?: string };
+    docReadErr.code = 'DOC_READ_FAILED';
+    m.sendOutboundDocument.mockRejectedValue(docReadErr);
+    const err = await dispatchOutput(pdfCtx()).catch((e) => e);
+    expect(err).toBeInstanceOf(OutboundDeliveryError);
+    expect((err as OutboundDeliveryError).delivered).toBe(false);
+    expect(m.markFailed).toHaveBeenCalledWith(
+      'c_1:msg_1',
+      expect.stringContaining('document_read_failed'),
+      false, // NOT ambiguous — definitely pre-send
+    );
+  });
+
+  it('transport throw (no code) ⇒ markFailed(ambiguous=true) — re-attempt blocked', async () => {
+    // socket.sendMessage failures could be delivered-but-threw → conservative
+    // 'unknown' to avoid double-send.
+    m.sendOutboundDocument.mockRejectedValue(new Error('socket_send_failed'));
+    const err = await dispatchOutput(pdfCtx()).catch((e) => e);
+    expect(err).toBeInstanceOf(OutboundDeliveryError);
+    expect((err as OutboundDeliveryError).delivered).toBe(false);
+    expect(m.markFailed).toHaveBeenCalledWith(
+      'c_1:msg_1',
+      'socket_send_failed',
+      true, // ambiguous — transport could have delivered
+    );
+  });
+});
+
+describe('safeDispatchOutput — fail-open on findByKey throw (#227 blocker 5)', () => {
+  beforeEach(() => {
+    cfg.FEATURE_OUTBOUND_DEDUP = true;
+  });
+
+  it('findByKey throws ⇒ dispatch proceeds, no exception escapes the wrapper', async () => {
+    // The boundary guard's findByKey lives outside try{}; a raw throw would
+    // escape the never-throw contract. Fail-open: log + proceed as if there
+    // were no prior row. Liveness > strict dedupe — DB blips must not block
+    // legitimate sends.
+    m.findByKey.mockRejectedValue(new Error('db_unreachable'));
+    const out = await safeDispatchOutput(mkCtx());
+    expect(out).toEqual({ status: 'delivered' });
+    // The dispatch ran (text sent), even though the boundary guard's read
+    // threw — the failure was logged and swallowed, not propagated.
+    expect(m.sendOutboundText).toHaveBeenCalledOnce();
+  });
+});
+
+describe('dispatchOutput — fail-open on claim throw (#227 blocker 6)', () => {
+  beforeEach(() => {
+    cfg.FEATURE_OUTBOUND_DEDUP = true;
+  });
+
+  it('upsertPending throws ⇒ text send proceeds (does not become silent unknown)', async () => {
+    // If the claim itself fails (e.g. advisory_lock backend down), letting the
+    // throw propagate would cause safeDispatchOutput's handleDispatchError to
+    // classify it as 'unknown' → sent_no_persist → user silence. Fail-open
+    // instead: log + proceed as if skip=false, no prior row.
+    m.upsertPending.mockRejectedValue(new Error('claim_db_throw'));
+    m.sendOutboundText.mockResolvedValue('wid_text');
+    await expect(dispatchOutput(mkCtx())).resolves.toBeUndefined();
+    expect(m.sendOutboundText).toHaveBeenCalledOnce();
+    // markSent / markFailed are still attempted on the success path; they're
+    // no-ops in the absence of a row (the WHERE filters us to zero rows
+    // updated — the test mock returns undefined without effect).
+  });
+
+  it('upsertPending throws then transport throws ⇒ both fail-open paths converge cleanly', async () => {
+    // Defensive: even with the claim fail-open AND a transport throw, we end
+    // up in markFailed(ambiguous=true) — the boundary guard for next time.
+    m.upsertPending.mockRejectedValue(new Error('claim_db_throw'));
+    m.sendOutboundText.mockRejectedValue(new Error('socket_closed'));
+    const err = await dispatchOutput(mkCtx()).catch((e) => e);
+    expect(err).toBeInstanceOf(OutboundDeliveryError);
+    expect((err as OutboundDeliveryError).delivered).toBe(false);
+    expect(m.markFailed).toHaveBeenCalledWith(
+      'c_1:msg_1',
+      'socket_closed',
+      true,
     );
   });
 });

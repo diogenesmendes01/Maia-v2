@@ -522,6 +522,48 @@ export const idempotency_keys = pgTable('idempotency_keys', {
   created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
+// Issue #227: outbound delivery idempotency ledger. One row per inbound turn
+// (any channel). Pre-send optimistic insert + status-aware guard closes the
+// "delivered-but-threw" window left open by #216 phase-tagging. Distinct from
+// outbox_messages (async worker queue) — this is the synchronous reply ledger.
+// See migrations/063_outbound_messages.sql for the full design + status
+// semantics (pending|sent|failed|unknown — 'unknown' is the no-re-send crux).
+export const outbound_messages = pgTable(
+  'outbound_messages',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull().default('default'),
+    agent_id: text('agent_id').notNull().default('default'),
+    // Turn-scoped: `${conversa_id}:${in_reply_to}`. Mirrors the
+    // outbound_dispatch_failed audit metadata.idempotency_key from #216.
+    // UNIQUE per (tenant_id, agent_id, idempotency_key) — see composite below.
+    idempotency_key: text('idempotency_key').notNull(),
+    conversa_id: uuid('conversa_id').notNull(),
+    in_reply_to: uuid('in_reply_to').notNull(),
+    channel: text('channel').notNull(),
+    provider_message_id: text('provider_message_id'),
+    status: text('status').notNull().default('pending'),
+    error: text('error'),
+    sent_at: timestamp('sent_at', { withTimezone: true }),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    byTenantCreated: index('idx_outbound_messages_tenant_created').on(
+      t.tenant_id,
+      t.created_at,
+    ),
+    // Multi-tenant invariant (#232/#237): tenant+agent scope the dedupe namespace.
+    // Two tenants (or two agents in one tenant) can share the same idempotency_key
+    // string without colliding; the advisory-lock in upsertPending hashes the same
+    // (tenant_id, agent_id, idempotency_key) tuple so lock partitioning matches.
+    byTenantAgentKey: unique('outbound_messages_tenant_agent_key').on(
+      t.tenant_id,
+      t.agent_id,
+      t.idempotency_key,
+    ),
+  }),
+);
+
 export const system_health_events = pgTable('system_health_events', {
   id: uuid('id').primaryKey().defaultRandom(),
   tenant_id: text('tenant_id').notNull().default('default'),
