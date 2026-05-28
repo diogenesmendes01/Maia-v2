@@ -6,6 +6,7 @@ import { renderPrometheus, setGaugeProvider } from '@/lib/metrics.js';
 import { isRedisConnected } from '@/lib/redis.js';
 import { isBaileysConnected } from '@/gateway/baileys.js';
 import { isDbConnected, probeDb } from '@/db/client.js';
+import { startRedisMemoryCollector } from '@/observability/redis-memory-collector.js';
 
 export async function buildServer() {
   const app = Fastify({ logger: false });
@@ -23,6 +24,13 @@ export async function buildServer() {
   dbProbeTimer.unref?.();
   // Initial probe so the gauge is correct on the first scrape after boot.
   probeDb().catch(() => undefined);
+
+  // Issue #297 — Redis memory pressure gauges (used_memory / maxmemory /
+  // ratio / evicted_keys / rejected_connections). Periodic INFO collection
+  // populates a snapshot that the gauge providers read on each scrape.
+  // The timer self-`unref()`s so it never blocks process exit, matching
+  // `dbProbeTimer` above; no explicit shutdown hook is required.
+  startRedisMemoryCollector();
 
   app.get('/health', async () => checkAll());
   app.get('/health/db', async () => checkDb());
