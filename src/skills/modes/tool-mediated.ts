@@ -56,6 +56,65 @@ interface ProcedureSpec {
   tool_schemas?: ToolSchema[];
 }
 
+/**
+ * Tool dispatcher contract for tool_mediated mode.
+ *
+ * **Cache wrapper contract (issue #261 follow-up):** the injected dispatcher
+ * MUST route through `src/tools/_dispatcher.ts` (or equivalent tenant-scoped
+ * cache wrapper) so that the tenant+agent-scoped idempotency cache lookup
+ * (`idempotencyRepo.lookup`/`.store`) is applied. `_dispatcher.ts` computes
+ * its OWN cache key via `computeIdempotencyKey()` — which folds
+ * tenant_id/agent_id from ALS into the SHA — and reads/writes through the
+ * composite-PK `(tenant_id, agent_id, key)` row. A dispatcher that bypasses
+ * `_dispatcher.ts` (e.g. calls a tool handler directly with no cache layer)
+ * RE-OPENS the cross-tenant collision surface that issue #261 closed.
+ *
+ * The `opts.idempotency_key` passed here is an OPAQUE correlation ID derived
+ * from `tenant:agent:skill:version:turno_id:tool:args_hash` — useful for
+ * dispatcher-side telemetry and dedup-within-the-LLM-loop. It is **NOT** the
+ * cache key written to `idempotency_keys`: the production wrapper recomputes
+ * a stricter key from `computeIdempotencyKey()` over the validated tool args.
+ * Treating `opts.idempotency_key` as the storage key in a custom dispatcher
+ * implementation would skip the tool-arg validation and the
+ * tenant-context-resolution guarantees of `computeIdempotencyKey`.
+ *
+ * **Production enforcement status (PR #273 review iter 2/4):**
+ *
+ * Today, the cache-wrapper contract above is CONTRACTUAL (JSDoc + tests in
+ * `tests/unit/skills/p9a-round2-guard.spec.ts:329`), NOT type-system
+ * enforced. The Codex primary review of PR #273 flagged this as residual
+ * risk; the reval downgraded it to non-blocking on these grounds:
+ *
+ *  1. `setToolDispatcher` is NOT wired in production today. The agent's
+ *     main path (`src/agent/core.ts` → ReAct loop → `dispatchTool`) reaches
+ *     tool execution through `src/tools/_dispatcher.ts:144-152` directly,
+ *     so the tenant+agent-scoped `computeIdempotencyKey` + `idempotencyRepo`
+ *     are always invoked. No customer-facing surface exercises
+ *     `toolDispatcher` yet — the bypass is theoretical until Phase 2.
+ *  2. Tests in `p9a-round2-guard.spec.ts:329-384` pin that the dispatchKey
+ *     passed to a custom dispatcher already carries `tenant_id:agent_id:...`
+ *     in its prefix, so even a non-cache-aware dispatcher CANNOT collide
+ *     cross-tenant by accident on the correlation ID.
+ *
+ * **Phase 2 typed bridge plan (`docs/skill-execution-f1-spec.md §5`):**
+ *
+ * When `tool_mediated` mode goes live (Phase 2 of the skill-execution F1
+ * roll-out), `setToolDispatcher` MUST be wired to a typed bridge over
+ * `dispatchTool` that:
+ *
+ *   (a) accepts a `ToolContext{pessoa, scope, conversa, mensagem_id}` threaded
+ *       in via `ModeContext` (so `dispatchTool` has its required context),
+ *   (b) routes the call through `_dispatcher.ts`'s ID-scoped cache layer
+ *       (NOT directly to a tool's `handler`),
+ *   (c) carries a `side_effects_started` / terminality flag so a failure
+ *       between cache-miss and cache-store cannot cause double execution,
+ *   (d) is the ONLY exported wiring point in production code (a `module.ts`
+ *       boundary; tests can still inject mocks).
+ *
+ * Until Phase 2 ships, this file MUST NOT be reached in production. The
+ * `execution_mode` gate in `src/skills/run-skill.ts` is the kill-switch
+ * (see `docs/skill-execution-f1-spec.md §4.1`).
+ */
 export interface ToolDispatcher {
   (
     name: string,
@@ -70,6 +129,14 @@ let toolDispatcher: ToolDispatcher | null = null;
  * Permite injeção do dispatcher de tools (real registry em produção;
  * mock em testes). Em ausência de dispatcher injetado, qualquer
  * tool_use lança `tool_dispatcher_not_configured`.
+ *
+ * **Production wiring contract (issue #261):** the injected dispatcher MUST
+ * route through `src/tools/_dispatcher.ts` (which calls
+ * `computeIdempotencyKey()` and `idempotencyRepo.lookup`/`.store` with the
+ * tenant+agent-scoped composite key). A dispatcher that bypasses
+ * `_dispatcher.ts` and calls tool handlers directly re-opens the
+ * cross-tenant cache-leak surface that issue #261 closed. See
+ * `ToolDispatcher` JSDoc above for the full contract.
  */
 export function setToolDispatcher(d: ToolDispatcher | null): void {
   toolDispatcher = d;
@@ -286,8 +353,19 @@ export async function toolMediatedMode(
         throw new Error('tool_dispatcher_not_configured');
       }
       try {
-        // Per-dispatch key: base + tool_name + args_hash (not tu.id, which
-        // is LLM-generated and may repeat across turns per provider).
+        // Per-dispatch correlation ID: base + tool_name + args_hash (NOT tu.id,
+        // which is LLM-generated and may repeat across turns per provider).
+        //
+        // Cache wrapper contract (issue #261): the injected `toolDispatcher`
+        // MUST route through `src/tools/_dispatcher.ts` (or an equivalent
+        // tenant-scoped cache wrapper) for the cross-tenant invariant to
+        // hold. `_dispatcher.ts` computes its OWN cache key via
+        // `computeIdempotencyKey()` (folding tenant_id/agent_id from ALS into
+        // the SHA) and reads/writes through `idempotencyRepo` against the
+        // composite-PK `(tenant_id, agent_id, key)`. The `dispatchKey` below
+        // is an opaque correlation ID — useful for telemetry and dedup
+        // within this LLM loop, but NOT the row key written to
+        // `idempotency_keys`. See `ToolDispatcher` JSDoc above.
         const dispatchKey = `${idempotencyBase}:${tu.tool}:${simpleArgsHash(tu.args)}`;
         const result = await toolDispatcher(tu.tool, tu.args, {
           signal: ctx.signal,

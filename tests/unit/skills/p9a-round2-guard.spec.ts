@@ -315,4 +315,122 @@ describe('round-2 finding 3 — tool idempotency key stability', () => {
       expect(out.ok).toBe(true);
     });
   });
+
+  // ── Issue #261 (PR #273 review HIGH): cache wrapper contract ─────────────
+  //
+  // The Codex review of PR #273 flagged that `toolDispatcher` is injected
+  // externally and could be wired to bypass `src/tools/_dispatcher.ts`'s
+  // tenant-scoped cache. While production never wires `setToolDispatcher`
+  // today (deferred to F1 Phase 2 — see docs/skill-execution-f1-spec.md §5),
+  // the dispatchKey passed to the dispatcher MUST itself carry tenant+agent
+  // so that any future cache-aware dispatcher cannot collide cross-tenant.
+  // These tests pin the dispatchKey shape: same skill + same turno_id from
+  // distinct tenants → distinct keys (no shared cache bucket).
+  it('[pos] same skill + same turno_id from distinct tenants → distinct dispatch keys', async () => {
+    const dispatchedKeys: string[] = [];
+    setToolDispatcher(async (_name, _args, opts) => {
+      dispatchedKeys.push(opts?.idempotency_key ?? '');
+      return { ok: true };
+    });
+
+    const makeLLMResponses = () => {
+      vi.mocked(callLLM)
+        .mockResolvedValueOnce({
+          content: null,
+          tool_uses: [{ id: 't1', tool: 'write_db', args: { x: 1 } }],
+          stop_reason: 'tool_use',
+          usage: { input_tokens: 1, output_tokens: 1 },
+          model: 'x',
+        })
+        .mockResolvedValueOnce({
+          content: '{"done":true}',
+          tool_uses: [],
+          stop_reason: 'end_turn',
+          usage: { input_tokens: 1, output_tokens: 1 },
+          model: 'x',
+        });
+    };
+
+    // Tenant-A dispatches first.
+    await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-X' }, async () => {
+      makeLLMResponses();
+      await toolMediatedMode({
+        skill: { ...baseSkill, tenant_id: 'tenant-A', agent_id: 'agent-X' },
+        input: {},
+        resolvedPolicies: [],
+        turno_id: 'turn-shared-1',
+      });
+    });
+
+    // Tenant-B dispatches with IDENTICAL turno_id and same tool args.
+    await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-X' }, async () => {
+      makeLLMResponses();
+      await toolMediatedMode({
+        skill: { ...baseSkill, tenant_id: 'tenant-B', agent_id: 'agent-X' },
+        input: {},
+        resolvedPolicies: [],
+        turno_id: 'turn-shared-1',
+      });
+    });
+
+    expect(dispatchedKeys).toHaveLength(2);
+    expect(dispatchedKeys[0]).not.toBe(dispatchedKeys[1]);
+    // Adversarial regression: tenant token MUST appear; cache bucket cannot
+    // be the legacy 'unknown:unknown' shared bucket.
+    expect(dispatchedKeys[0]).toContain('tenant-A');
+    expect(dispatchedKeys[1]).toContain('tenant-B');
+    expect(dispatchedKeys[0]).not.toContain('unknown');
+    expect(dispatchedKeys[1]).not.toContain('unknown');
+  });
+
+  it('[pos] same tenant, different agents → distinct dispatch keys (per-agent isolation)', async () => {
+    const dispatchedKeys: string[] = [];
+    setToolDispatcher(async (_name, _args, opts) => {
+      dispatchedKeys.push(opts?.idempotency_key ?? '');
+      return { ok: true };
+    });
+
+    const makeLLMResponses = () => {
+      vi.mocked(callLLM)
+        .mockResolvedValueOnce({
+          content: null,
+          tool_uses: [{ id: 't1', tool: 'write_db', args: { x: 2 } }],
+          stop_reason: 'tool_use',
+          usage: { input_tokens: 1, output_tokens: 1 },
+          model: 'x',
+        })
+        .mockResolvedValueOnce({
+          content: '{"done":true}',
+          tool_uses: [],
+          stop_reason: 'end_turn',
+          usage: { input_tokens: 1, output_tokens: 1 },
+          model: 'x',
+        });
+    };
+
+    await runWithTenantContext({ tenant_id: 'tenant-shared', agent_id: 'agent-1' }, async () => {
+      makeLLMResponses();
+      await toolMediatedMode({
+        skill: { ...baseSkill, tenant_id: 'tenant-shared', agent_id: 'agent-1' },
+        input: {},
+        resolvedPolicies: [],
+        turno_id: 'turn-shared-2',
+      });
+    });
+
+    await runWithTenantContext({ tenant_id: 'tenant-shared', agent_id: 'agent-2' }, async () => {
+      makeLLMResponses();
+      await toolMediatedMode({
+        skill: { ...baseSkill, tenant_id: 'tenant-shared', agent_id: 'agent-2' },
+        input: {},
+        resolvedPolicies: [],
+        turno_id: 'turn-shared-2',
+      });
+    });
+
+    expect(dispatchedKeys).toHaveLength(2);
+    expect(dispatchedKeys[0]).not.toBe(dispatchedKeys[1]);
+    expect(dispatchedKeys[0]).toContain('agent-1');
+    expect(dispatchedKeys[1]).toContain('agent-2');
+  });
 });

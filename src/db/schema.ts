@@ -508,19 +508,33 @@ export const pending_questions = pgTable('pending_questions', {
   created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
-export const idempotency_keys = pgTable('idempotency_keys', {
-  key: text('key').primaryKey(),
-  tenant_id: text('tenant_id').notNull().default('default'),
-  agent_id: text('agent_id').notNull().default('default'),
-  tool_name: text('tool_name').notNull(),
-  operation_type: text('operation_type').notNull(),
-  pessoa_id: uuid('pessoa_id').notNull(),
-  entity_id: uuid('entity_id').notNull(),
-  payload_hash: text('payload_hash').notNull(),
-  file_sha256: text('file_sha256'),
-  resultado: jsonb('resultado').notNull(),
-  created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
-});
+// Issue #261: composite PK on (tenant_id, agent_id, key). Prior schema had
+// `key` as a singleton PRIMARY KEY, which allowed two tenants computing the
+// same idempotency_key to collide in the cache and leak tool output. The
+// hash input in `src/governance/idempotency.ts` ALSO folds tenant_id/agent_id
+// now, so a collision via the hash alone is no longer possible — but the
+// composite PK makes the storage layer reflect the true identity tuple and
+// guards against any future caller that bypasses `computeIdempotencyKey`.
+// See migration 063_p10_idempotency_keys_tenant_pk.
+export const idempotency_keys = pgTable(
+  'idempotency_keys',
+  {
+    key: text('key').notNull(),
+    tenant_id: text('tenant_id').notNull().default('default'),
+    agent_id: text('agent_id').notNull().default('default'),
+    tool_name: text('tool_name').notNull(),
+    operation_type: text('operation_type').notNull(),
+    pessoa_id: uuid('pessoa_id').notNull(),
+    entity_id: uuid('entity_id').notNull(),
+    payload_hash: text('payload_hash').notNull(),
+    file_sha256: text('file_sha256'),
+    resultado: jsonb('resultado').notNull(),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.tenant_id, t.agent_id, t.key] }),
+  }),
+);
 
 // Issue #227: outbound delivery idempotency ledger. One row per inbound turn
 // (any channel). Pre-send optimistic insert + status-aware guard closes the

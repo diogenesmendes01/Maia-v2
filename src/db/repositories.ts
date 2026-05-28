@@ -1261,12 +1261,48 @@ export const pendingQuestionsRepo = {
   },
 };
 
+/**
+ * idempotencyRepo — tool idempotency cache (`idempotency_keys` table).
+ *
+ * TENANT/AGENT-ISOLATION (issue #261). The `idempotency_keys` table has
+ * `tenant_id` + `agent_id` columns (migrations 009/012). Before #261 both
+ * `lookup` and `store` ignored both columns — `lookup` filtered ONLY by
+ * `key`, and `store` relied on column defaults (`'default'`). That allowed
+ * two tenants invoking the same tool with the same params to collide in
+ * the cache and leak each other's tool output.
+ *
+ * After #261:
+ *   - `lookup` pins `tenant_id = <ctx> AND agent_id = <ctx> AND key = <key>`
+ *     in the WHERE. Defense in depth on top of the hash-input change in
+ *     `computeIdempotencyKey` (src/governance/idempotency.ts).
+ *   - `store` writes through `applyTenantGuard`, which stamps the routed
+ *     `tenant_id`/`agent_id` and throws on mismatch. `onConflictDoNothing`
+ *     now targets the new composite PK `(tenant_id, agent_id, key)` per
+ *     migration 063, so a same-key collision across tenants does NOT silent-
+ *     swallow the second insert.
+ *   - `cleanup` stays global on purpose: it's a maintenance sweep run by
+ *     `workers/idempotency-cleanup.ts` and intentionally crosses tenants.
+ *     It does NOT read or return tool output, so it cannot leak — it only
+ *     prunes by `created_at`. The cleanup worker bootstraps with the system
+ *     tenant context for audit; the SQL itself stays unscoped.
+ */
 export const idempotencyRepo = {
   async lookup(key: string): Promise<unknown | null> {
+    // Resolve tenant/agent — `getCurrentTenant`/`getCurrentAgent` throw
+    // `MissingTenantContextError` if no context. We refuse a silent
+    // fall-through to the legacy `'default'` bucket (see header).
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const rows = await db
       .select()
       .from(idempotency_keys)
-      .where(eq(idempotency_keys.key, key))
+      .where(
+        and(
+          eq(idempotency_keys.tenant_id, tenant_id),
+          eq(idempotency_keys.agent_id, agent_id),
+          eq(idempotency_keys.key, key),
+        ),
+      )
       .limit(1);
     return rows[0]?.resultado ?? null;
   },
@@ -1280,18 +1316,21 @@ export const idempotencyRepo = {
     file_sha256?: string;
     resultado: unknown;
   }): Promise<void> {
+    // applyTenantGuard stamps tenant_id/agent_id from ALS context and rejects
+    // any explicit mismatch in the input. Also throws if no context.
+    const guarded = applyTenantGuard({
+      key: input.key,
+      tool_name: input.tool_name,
+      operation_type: input.operation_type,
+      pessoa_id: input.pessoa_id,
+      entity_id: input.entity_id,
+      payload_hash: input.payload_hash,
+      file_sha256: input.file_sha256 ?? null,
+      resultado: input.resultado as object,
+    });
     await db
       .insert(idempotency_keys)
-      .values({
-        key: input.key,
-        tool_name: input.tool_name,
-        operation_type: input.operation_type,
-        pessoa_id: input.pessoa_id,
-        entity_id: input.entity_id,
-        payload_hash: input.payload_hash,
-        file_sha256: input.file_sha256 ?? null,
-        resultado: input.resultado as object,
-      })
+      .values(guarded)
       .onConflictDoNothing();
   },
   async cleanup(olderThanDays: number): Promise<number> {
