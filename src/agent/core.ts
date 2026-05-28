@@ -42,7 +42,7 @@ import { CognitiveEventType } from '@/types/enums.js';
 import { sendOutbound, safeDispatchOutput } from './output-dispatch.js';
 import { executeSelectedSkill } from './execute-skill.js';
 import { runSkill } from '@/skills/index.js';
-import { skillsRepo } from '@/db/repositories.js';
+import { skillsRepo, outboundMessagesRepo } from '@/db/repositories.js';
 import { runReActLoop } from './react-loop.js';
 import { runWithTenantContext, getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import { db } from '@/db/client.js';
@@ -930,6 +930,14 @@ async function runAgentForMensagemInner(
             },
             runSkill,
             safeDispatchOutput,
+            // #227 per-turn guard (Improvement 2). Thin wrapper over
+            // outboundMessagesRepo.findByKey using the turn-scoped key the
+            // ledger keys off. Tenant + agent are resolved from the current
+            // context inside findByKey (no need to thread them here). The
+            // skill-side guard fail-opens on throw, so we don't try/catch
+            // here.
+            findOutboundLedgerForTurn: ({ conversa_id, in_reply_to }) =>
+              outboundMessagesRepo.findByKey(`${conversa_id}:${in_reply_to}`),
             logger,
           },
         );
