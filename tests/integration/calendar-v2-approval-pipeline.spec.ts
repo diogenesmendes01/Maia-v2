@@ -191,10 +191,10 @@ describe('Calendar v2 — approval pipeline (holiday)', () => {
   it('dispatchApproval(holiday) cria row + vincula entidade + invalida cache', async () => {
     // Pre-populate cache to verify invalidation
     _internal_cache.set(
-      cacheKey('tenant-a', 'entidade-001', 2026, 'standard'),
+      cacheKey('tenant-a', 'default', 'entidade-001', 2026, 'standard'),
       new Set(['2026-12-25']),
     );
-    expect(_internal_cache.get(cacheKey('tenant-a', 'entidade-001', 2026, 'standard'))).toBeDefined();
+    expect(_internal_cache.get(cacheKey('tenant-a', 'default', 'entidade-001', 2026, 'standard'))).toBeDefined();
 
     const { dispatchApproval } = await import('@/cognition/proposal-approval-handler.js');
     const proposal = makeProposal();
@@ -222,7 +222,7 @@ describe('Calendar v2 — approval pipeline (holiday)', () => {
 
     // Cache invalidado para o tenant
     expect(
-      _internal_cache.get(cacheKey('tenant-a', 'entidade-001', 2026, 'standard')),
+      _internal_cache.get(cacheKey('tenant-a', 'default', 'entidade-001', 2026, 'standard')),
     ).toBeUndefined();
   });
 
@@ -285,7 +285,7 @@ describe('Calendar v2 — cross-tenant isolation (Cenário 5)', () => {
   it('proposal aprovada em tenant-A NÃO cria registro nem invalida cache em tenant-B', async () => {
     // tenant-B tem cache pre-existente
     _internal_cache.set(
-      cacheKey('tenant-b', 'entidade-B', 2026, 'standard'),
+      cacheKey('tenant-b', 'default', 'entidade-B', 2026, 'standard'),
       new Set(['2026-12-25']),
     );
 
@@ -309,6 +309,6 @@ describe('Calendar v2 — cross-tenant isolation (Cenário 5)', () => {
     });
 
     // tenant-B cache continua intacto
-    expect(_internal_cache.get(cacheKey('tenant-b', 'entidade-B', 2026, 'standard'))).toBeDefined();
+    expect(_internal_cache.get(cacheKey('tenant-b', 'default', 'entidade-B', 2026, 'standard'))).toBeDefined();
   });
 });

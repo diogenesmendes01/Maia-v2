@@ -35,13 +35,35 @@ export async function runWithTenantContext<T>(
 // the empty/nullish value back and any downstream `WHERE tenant_id = $1`
 // would either crash on type mismatch (best case) or return rows scoped to
 // the wrong-and-likely-empty tenant (worst case, cross-tenant leak).
-// PR #269 review (Codex reval) — close the gap before merge.
+// Para cache keys (holidays-cache, etc.): falsy agent_id geraria key
+// malformada `holidays:v2:tenantA::entidade:2026:standard` que colide
+// silenciosamente com outros contextos malformados — exatamente o leak que
+// PR #263 fechou para o caso de `agent_id` ausente da key.
+//
+// **Whitespace-only IDs (#272 reval — convergente com issue #283):** strings
+// como `'   '` ou `'\t'` passariam o check `!str` (truthy), mas geram
+// namespace anômalo (`holidays:v3:acme:%20%20%20:...`) que ainda é
+// determinístico — colide com qualquer outro contexto que carregue o mesmo
+// padrão de whitespace. Rejeitar `.trim().length === 0` fecha a porta.
+//
+// **Overlap com PR #293:** PR #293 (`fix(tenant-context): reject whitespace-only
+// tenant_id/agent_id`) implementa o mesmo guard centralmente. Se #293 mergear
+// primeiro, este diff vira no-op (mesma validação, msg ligeiramente diferente).
+// Se este mergear primeiro, #293 resolve trivialmente. Sem conflito semântico.
+//
+// PRs #269 + #272 review (Codex reval) — close the gap before merge.
 function assertTruthyContext(ctx: TenantContext): void {
   if (!ctx.tenant_id || typeof ctx.tenant_id !== 'string') {
     throw new MissingTenantContextError('tenant_id is empty/non-string');
   }
+  if (ctx.tenant_id.trim().length === 0) {
+    throw new MissingTenantContextError('tenant_id is whitespace-only');
+  }
   if (!ctx.agent_id || typeof ctx.agent_id !== 'string') {
     throw new MissingTenantContextError('agent_id is empty/non-string');
+  }
+  if (ctx.agent_id.trim().length === 0) {
+    throw new MissingTenantContextError('agent_id is whitespace-only');
   }
 }
 
@@ -62,12 +84,19 @@ export function getCurrentAgent(): string {
 export function tryGetCurrentContext(): TenantContext | null {
   const ctx = storage.getStore();
   if (!ctx) return null;
-  // Malformed context (empty/nullish fields) must NOT silently leak through
-  // `tryGetCurrentContext`. Callers that opt into the "try" variant expect
-  // either a *valid* context or null — never a half-populated object.
-  // Returning null forces them down the same code path as missing-ALS,
+  // Malformed context (empty/whitespace-only/nullish fields) must NOT silently
+  // leak through `tryGetCurrentContext`. Callers that opt into the "try"
+  // variant expect either a *valid* context or null — never a half-populated
+  // object. Returning null forces them down the same code path as missing-ALS,
   // which today either skips the operation or escalates per their policy.
-  if (!ctx.tenant_id || !ctx.agent_id || typeof ctx.tenant_id !== 'string' || typeof ctx.agent_id !== 'string') {
+  if (
+    !ctx.tenant_id ||
+    !ctx.agent_id ||
+    typeof ctx.tenant_id !== 'string' ||
+    typeof ctx.agent_id !== 'string' ||
+    ctx.tenant_id.trim().length === 0 ||
+    ctx.agent_id.trim().length === 0
+  ) {
     return null;
   }
   return ctx;

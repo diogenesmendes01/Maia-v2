@@ -31,12 +31,15 @@ describe('tenant-context', () => {
   });
 
   // -------------------------------------------------------------------------
-  // PR #269 review (Codex reval): fail-closed when ALS carries malformed
-  // context — empty string, null, undefined, non-string. Previously the
-  // accessors returned the raw value, letting downstream queries scope by
-  // an empty tenant_id and (worst case) leak rows across tenants.
+  // PR #272 / #269 review (Codex reval): fail-closed when ALS carries
+  // malformed context — empty string, null, undefined, non-string.
+  // Previously the accessors returned the raw value, letting downstream
+  // queries scope by an empty tenant_id and (worst case) leak rows across
+  // tenants. Sem essa guarda, holidays-cache (#263) geraria keys malformadas
+  // (`holidays:v2:A::entidade:2026:standard`) que colidem silenciosamente
+  // entre contextos quebrados.
   // -------------------------------------------------------------------------
-  describe('PR #269 — truthy validation of ctx.tenant_id / ctx.agent_id', () => {
+  describe('PR #272 / #269 — truthy validation of ctx.tenant_id / ctx.agent_id', () => {
     it('getCurrentTenant lança quando tenant_id é string vazia', async () => {
       await runWithTenantContext({ tenant_id: '', agent_id: 'sofia' }, async () => {
         expect(() => getCurrentTenant()).toThrow(MissingTenantContextError);
@@ -109,6 +112,62 @@ describe('tenant-context', () => {
     it('tryGetCurrentContext retorna ctx quando ambos os campos são truthy', async () => {
       await runWithTenantContext({ tenant_id: 'acme', agent_id: 'sofia' }, async () => {
         expect(tryGetCurrentContext()).toEqual({ tenant_id: 'acme', agent_id: 'sofia' });
+      });
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // PR #272 reval (Codex) — whitespace-only IDs convergente com issue #283.
+  // Strings tipo `'   '` ou `'\t'` passam o check truthy mas geram namespace
+  // anômalo determinístico — colisão silenciosa entre contextos malformados.
+  // Overlap consciente com PR #293 (fix central também rejeita whitespace).
+  // -------------------------------------------------------------------------
+  describe('PR #272 reval / #283 — whitespace-only tenant_id / agent_id', () => {
+    it('getCurrentTenant lança quando tenant_id é whitespace-only', async () => {
+      await runWithTenantContext({ tenant_id: '   ', agent_id: 'sofia' }, async () => {
+        expect(() => getCurrentTenant()).toThrow(MissingTenantContextError);
+      });
+    });
+
+    it('getCurrentTenant lança quando tenant_id é tab/newline only', async () => {
+      await runWithTenantContext({ tenant_id: '\t\n', agent_id: 'sofia' }, async () => {
+        expect(() => getCurrentTenant()).toThrow(MissingTenantContextError);
+      });
+    });
+
+    it('getCurrentAgent lança quando agent_id é whitespace-only', async () => {
+      await runWithTenantContext({ tenant_id: 'acme', agent_id: '   ' }, async () => {
+        expect(() => getCurrentAgent()).toThrow(MissingTenantContextError);
+      });
+    });
+
+    it('getCurrentAgent lança quando agent_id é tab/newline only', async () => {
+      await runWithTenantContext({ tenant_id: 'acme', agent_id: '\t\n' }, async () => {
+        expect(() => getCurrentAgent()).toThrow(MissingTenantContextError);
+      });
+    });
+
+    it('tryGetCurrentContext retorna null quando tenant_id é whitespace-only', async () => {
+      await runWithTenantContext({ tenant_id: '   ', agent_id: 'sofia' }, async () => {
+        expect(tryGetCurrentContext()).toBeNull();
+      });
+    });
+
+    it('tryGetCurrentContext retorna null quando agent_id é whitespace-only', async () => {
+      await runWithTenantContext({ tenant_id: 'acme', agent_id: '\t' }, async () => {
+        expect(tryGetCurrentContext()).toBeNull();
+      });
+    });
+
+    it('mensagem de erro distingue empty vs whitespace para debugging', async () => {
+      await runWithTenantContext({ tenant_id: '   ', agent_id: 'sofia' }, async () => {
+        try {
+          getCurrentTenant();
+          throw new Error('expected throw');
+        } catch (err) {
+          expect(err).toBeInstanceOf(MissingTenantContextError);
+          expect((err as Error).message).toMatch(/whitespace-only/);
+        }
       });
     });
   });
