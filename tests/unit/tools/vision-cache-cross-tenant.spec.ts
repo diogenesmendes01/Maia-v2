@@ -1,6 +1,6 @@
 /**
- * Issue #250 — Cross-tenant (cross-empresa) isolation invariant for the
- * Vision-result cache (`src/tools/_vision-cache.ts`).
+ * Issue #250 — Cross-tenant (cross-empresa) AND cross-agent (within tenant)
+ * isolation invariant for the Vision-result cache (`src/tools/_vision-cache.ts`).
  *
  * Product invariant (project north star):
  *   "Maias de empresas diferentes NUNCA se comunicam, compartilham dados ou
@@ -8,25 +8,26 @@
  *
  * Vision-cache-specific contract this spec PROVES:
  *   `getCachedVision` / `setCachedVision` namespace EVERY Redis key with the
- *   active `tenant_id` (resolved from AsyncLocalStorage via
- *   `@/db/tenant-context`). A file with the same `sha256` cached under tenant
- *   A is NOT served to tenant B, even when the cached value contains
- *   tenant-A-specific artefacts (the adversarial case).
+ *   active `(tenant_id, agent_id)` (resolved from AsyncLocalStorage via
+ *   `@/db/tenant-context`). A file with the same `sha256` cached under
+ *   (tenant A, agent A) is NOT served to (tenant B, *) nor to
+ *   (tenant A, agent B), even when the cached value contains
+ *   tenant-specific artefacts (the adversarial case).
  *
  * Before this fix the key was `maia:vision:${tool}:${sha256}` — any tenant
- * receiving the same image would read another tenant's cached result. This
- * was a compliance gap (no separate audit for the second tenant's processing
- * event) and a latent semantic gap (if any future prompt customisation per
- * tenant were introduced, the leak would become a verbal one).
+ * receiving the same image would read another tenant's cached result. The
+ * v2 of this PR scoped by `tenant_id` only; the v3 (this iteration) scopes
+ * by `(tenant_id, agent_id)` to match the canonical Maia cache contract
+ * (#235/#241/#242/#272).
  *
  * Strategy:
  *   - Mock `@/lib/redis.js` with an in-memory `Map`-backed stub that captures
  *     the EXACT `get` / `setex` key strings emitted by production. Tests
  *     assert against those keys directly so a future code edit that drops
- *     the tenant segment surfaces as a test failure on the key shape, not
- *     just on read/write outcomes.
+ *     the tenant or agent segment surfaces as a test failure on the key
+ *     shape, not just on read/write outcomes.
  *   - Wrap every call in `runWithTenantContext({tenant_id, agent_id}, ...)`
- *     so `getCurrentTenant()` returns the routed value.
+ *     so `getCurrentTenant()` / `getCurrentAgent()` return the routed values.
  *
  * Coverage:
  *   - WRITE keys are scoped: tenant-A vs tenant-B writes for the same
@@ -37,10 +38,15 @@
  *   - ADVERSARIAL: tenant-B writes a recognisable artefact under
  *     (tool, sha256); tenant-A read for the SAME (tool, sha256) returns
  *     `null` (cache miss), never B's payload.
+ *   - CROSS-AGENT (same tenant): a write by (tenant-A, agent-A) is NOT
+ *     readable by (tenant-A, agent-B) — the canonical-contract gap closed
+ *     by the v3 iteration of PR #257.
  *   - MISSING CONTEXT: a call outside `runWithTenantContext` throws
  *     `MissingTenantContextError` AND emits ZERO Redis ops.
  *   - REDIS DOWN with valid context: returns `null` / no-ops gracefully
  *     (preserves the "best-effort cache" contract).
+ *   - OBSERVABILITY: hit / miss / failure logs all carry both `tenant_id`
+ *     and `agent_id` (PR #257 reval — observability gap closed).
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
@@ -70,12 +76,25 @@ vi.mock('@/lib/redis.js', () => ({
   isRedisConnected: () => connected,
 }));
 
+// Logger spy. Captured tuples are inspected by the OBSERVABILITY block to
+// prove that hit / miss / failure logs all carry (tenant_id, agent_id).
+type LogCall = { level: 'info' | 'warn' | 'error' | 'debug'; payload: unknown; event: string };
+let logCalls: LogCall[] = [];
+
 vi.mock('@/lib/logger.js', () => ({
   logger: {
-    info: () => undefined,
-    warn: () => undefined,
-    error: () => undefined,
-    debug: () => undefined,
+    info: (payload: unknown, event: string) => {
+      logCalls.push({ level: 'info', payload, event });
+    },
+    warn: (payload: unknown, event: string) => {
+      logCalls.push({ level: 'warn', payload, event });
+    },
+    error: (payload: unknown, event: string) => {
+      logCalls.push({ level: 'error', payload, event });
+    },
+    debug: (payload: unknown, event: string) => {
+      logCalls.push({ level: 'debug', payload, event });
+    },
   },
 }));
 
@@ -89,32 +108,34 @@ beforeEach(() => {
   ops = [];
   store = new Map();
   connected = true;
+  logCalls = [];
 });
 
-describe('Issue #250 — vision cache is tenant-scoped', () => {
+describe('Issue #250 — vision cache is (tenant, agent)-scoped (v3)', () => {
   // ---------------------------------------------------------------------
-  // Key shape — production emits `maia:vision:${tenant_id}:${tool}:${sha}`.
+  // Key shape — production emits
+  // `maia:vision:v3:${tenant_id}:${agent_id}:${tool}:${sha}`.
   // ---------------------------------------------------------------------
   describe('WRITE key shape', () => {
-    it('setCachedVision under tenant-A uses tenant-A in the key', async () => {
+    it('setCachedVision under tenant-A uses tenant-A + agent-A in the key', async () => {
       const { setCachedVision } = await import('@/tools/_vision-cache.js');
       await runWithTenantContext(A_CTX, async () => {
         await setCachedVision('parse_image', 'sha-X', { kind: 'boleto' });
       });
       const writes = ops.filter((o) => o.op === 'setex');
       expect(writes).toHaveLength(1);
-      expect(writes[0]!.key).toBe('maia:vision:tenant-A:parse_image:sha-X');
+      expect(writes[0]!.key).toBe('maia:vision:v3:tenant-A:agent-A:parse_image:sha-X');
       expect(writes[0]!.ttl).toBe(3600);
     });
 
-    it('setCachedVision under tenant-B uses tenant-B in the key (SYMMETRY)', async () => {
+    it('setCachedVision under tenant-B uses tenant-B + agent-B in the key (SYMMETRY)', async () => {
       const { setCachedVision } = await import('@/tools/_vision-cache.js');
       await runWithTenantContext(B_CTX, async () => {
         await setCachedVision('parse_image', 'sha-X', { kind: 'receipt' });
       });
       const writes = ops.filter((o) => o.op === 'setex');
       expect(writes).toHaveLength(1);
-      expect(writes[0]!.key).toBe('maia:vision:tenant-B:parse_image:sha-X');
+      expect(writes[0]!.key).toBe('maia:vision:v3:tenant-B:agent-B:parse_image:sha-X');
     });
 
     it('same (tool, sha256) under A vs B → DIFFERENT keys', async () => {
@@ -127,8 +148,8 @@ describe('Issue #250 — vision cache is tenant-scoped', () => {
       });
       const writeKeys = ops.filter((o) => o.op === 'setex').map((o) => o.key);
       expect(writeKeys).toEqual([
-        'maia:vision:tenant-A:parse_image:sha-COMMON',
-        'maia:vision:tenant-B:parse_image:sha-COMMON',
+        'maia:vision:v3:tenant-A:agent-A:parse_image:sha-COMMON',
+        'maia:vision:v3:tenant-B:agent-B:parse_image:sha-COMMON',
       ]);
       // Two independent store entries, never overwritten by each other.
       expect(store.size).toBe(2);
@@ -139,14 +160,14 @@ describe('Issue #250 — vision cache is tenant-scoped', () => {
   // Read key shape — getCachedVision looks in the tenant-scoped namespace.
   // ---------------------------------------------------------------------
   describe('READ key shape', () => {
-    it('getCachedVision under tenant-A reads from tenant-A namespace', async () => {
+    it('getCachedVision under tenant-A reads from tenant-A + agent-A namespace', async () => {
       const { getCachedVision } = await import('@/tools/_vision-cache.js');
       await runWithTenantContext(A_CTX, async () => {
         await getCachedVision('parse_image', 'sha-X');
       });
       const reads = ops.filter((o) => o.op === 'get');
       expect(reads).toHaveLength(1);
-      expect(reads[0]!.key).toBe('maia:vision:tenant-A:parse_image:sha-X');
+      expect(reads[0]!.key).toBe('maia:vision:v3:tenant-A:agent-A:parse_image:sha-X');
     });
 
     it('round-trip within tenant-A returns the cached payload', async () => {
@@ -204,7 +225,7 @@ describe('Issue #250 — vision cache is tenant-scoped', () => {
         });
       });
       // Verify the entry actually landed under tenant-B's namespace.
-      expect(store.has('maia:vision:tenant-B:parse_receipt:sha-RECEIPT')).toBe(true);
+      expect(store.has('maia:vision:v3:tenant-B:agent-B:parse_receipt:sha-RECEIPT')).toBe(true);
       // Tenant-A read for the SAME (tool, sha256) — must surface as a
       // miss, never as B's payload.
       const fromA = await runWithTenantContext(A_CTX, async () => {
@@ -215,7 +236,7 @@ describe('Issue #250 — vision cache is tenant-scoped', () => {
       // the B one.
       const reads = ops.filter((o) => o.op === 'get');
       expect(reads).toHaveLength(1);
-      expect(reads[0]!.key).toBe('maia:vision:tenant-A:parse_receipt:sha-RECEIPT');
+      expect(reads[0]!.key).toBe('maia:vision:v3:tenant-A:agent-A:parse_receipt:sha-RECEIPT');
     });
 
     it('two tenants caching different results for same sha do NOT overwrite each other', async () => {
@@ -340,17 +361,17 @@ describe('Issue #250 — vision cache is tenant-scoped', () => {
       const writes = ops.filter((o) => o.op === 'setex');
       expect(writes).toHaveLength(1);
       // `:` in the tenant id MUST be encoded — otherwise the key is
-      // ambiguous with `(tenant='acme', tool='dev', sha='parse_image:sha-X')`.
-      expect(writes[0]!.key).toBe('maia:vision:acme%3Adev:parse_image:sha-X');
+      // ambiguous with `(tenant='acme', agent='dev', ...)`.
+      expect(writes[0]!.key).toBe('maia:vision:v3:acme%3Adev:agent-X:parse_image:sha-X');
     });
 
     it('two ambiguous tuples that would alias under raw interpolation produce DIFFERENT encoded keys', async () => {
       // Pre-fix raw interpolation would yield IDENTICAL keys for these two
       // tuples — the very collision the review (#257 MEDIUM) called out:
-      //   T1 = ('acme:dev',   'parse_image',     'sha-X')
-      //        →  maia:vision:acme:dev:parse_image:sha-X
-      //   T2 = ('acme',       'dev:parse_image', 'sha-X')
-      //        →  maia:vision:acme:dev:parse_image:sha-X   ← SAME!
+      //   T1 = ('acme:dev',   'agent-1', 'parse_image',     'sha-X')
+      //        →  maia:vision:v3:acme:dev:agent-1:parse_image:sha-X
+      //   T2 = ('acme',       'dev', 'agent-1:parse_image', 'sha-X')
+      //        →  maia:vision:v3:acme:dev:agent-1:parse_image:sha-X   ← SAME!
       // Post-fix the `:` in each segment is encoded as `%3A`, so the two
       // tuples land in distinct cache buckets.
       const { setCachedVision } = await import('@/tools/_vision-cache.js');
@@ -360,13 +381,13 @@ describe('Issue #250 — vision cache is tenant-scoped', () => {
           await setCachedVision('parse_image', 'sha-X', { tag: 'T1' });
         },
       );
-      await runWithTenantContext({ tenant_id: 'acme', agent_id: 'agent-2' }, async () => {
-        await setCachedVision('dev:parse_image', 'sha-X', { tag: 'T2' });
+      await runWithTenantContext({ tenant_id: 'acme', agent_id: 'dev' }, async () => {
+        await setCachedVision('agent-1:parse_image', 'sha-X', { tag: 'T2' });
       });
       const writeKeys = ops.filter((o) => o.op === 'setex').map((o) => o.key);
       expect(writeKeys).toEqual([
-        'maia:vision:acme%3Adev:parse_image:sha-X',
-        'maia:vision:acme:dev%3Aparse_image:sha-X',
+        'maia:vision:v3:acme%3Adev:agent-1:parse_image:sha-X',
+        'maia:vision:v3:acme:dev:agent-1%3Aparse_image:sha-X',
       ]);
       // Defence in depth: store has TWO distinct entries, not one
       // overwritten — exactly the property the cross-tenant invariant
@@ -376,7 +397,7 @@ describe('Issue #250 — vision cache is tenant-scoped', () => {
 
     it('tenant id with `:` does NOT receive another tenant`s cached payload (aliasing → ISOLATION)', async () => {
       const { setCachedVision, getCachedVision } = await import('@/tools/_vision-cache.js');
-      // T1 caches under (tenant='acme:dev', tool='parse_image').
+      // T1 caches under (tenant='acme:dev', agent='agent-1', tool='parse_image').
       await runWithTenantContext(
         { tenant_id: 'acme:dev', agent_id: 'agent-1' },
         async () => {
@@ -384,15 +405,29 @@ describe('Issue #250 — vision cache is tenant-scoped', () => {
         },
       );
       // T2 reads from the would-be-aliased tuple
-      // (tenant='acme', tool='dev:parse_image'). Under raw interpolation
-      // this would have served T1's payload; post-fix it MUST miss.
+      // (tenant='acme', agent='dev', tool='agent-1:parse_image'). Under raw
+      // interpolation this would have served T1's payload; post-fix it MUST
+      // miss.
       const fromT2 = await runWithTenantContext(
-        { tenant_id: 'acme', agent_id: 'agent-2' },
+        { tenant_id: 'acme', agent_id: 'dev' },
         async () => {
-          return getCachedVision<{ tag: string }>('dev:parse_image', 'sha-X');
+          return getCachedVision<{ tag: string }>('agent-1:parse_image', 'sha-X');
         },
       );
       expect(fromT2).toBeNull();
+    });
+
+    it('agent id with `:` is URI-encoded (segment boundary stays unambiguous)', async () => {
+      const { setCachedVision } = await import('@/tools/_vision-cache.js');
+      await runWithTenantContext(
+        { tenant_id: 'tenant-A', agent_id: 'agent:weird' },
+        async () => {
+          await setCachedVision('parse_image', 'sha-X', { kind: 'boleto' });
+        },
+      );
+      const writes = ops.filter((o) => o.op === 'setex');
+      expect(writes).toHaveLength(1);
+      expect(writes[0]!.key).toBe('maia:vision:v3:tenant-A:agent%3Aweird:parse_image:sha-X');
     });
 
     it('tool name with `:` is URI-encoded (segment boundary stays unambiguous)', async () => {
@@ -402,7 +437,7 @@ describe('Issue #250 — vision cache is tenant-scoped', () => {
       });
       const writes = ops.filter((o) => o.op === 'setex');
       expect(writes).toHaveLength(1);
-      expect(writes[0]!.key).toBe('maia:vision:tenant-A:weird%3Atool:sha-X');
+      expect(writes[0]!.key).toBe('maia:vision:v3:tenant-A:agent-A:weird%3Atool:sha-X');
     });
 
     it('sha256 with `:` is URI-encoded (segment boundary stays unambiguous)', async () => {
@@ -417,7 +452,7 @@ describe('Issue #250 — vision cache is tenant-scoped', () => {
       const writes = ops.filter((o) => o.op === 'setex');
       expect(writes).toHaveLength(1);
       expect(writes[0]!.key).toBe(
-        'maia:vision:tenant-A:parse_image:sha%3Awith%3Acolons',
+        'maia:vision:v3:tenant-A:agent-A:parse_image:sha%3Awith%3Acolons',
       );
     });
 
@@ -433,6 +468,148 @@ describe('Issue #250 — vision cache is tenant-scoped', () => {
         },
       );
       expect(got).toEqual({ kind: 'boleto', tag: 'rt' });
+    });
+  });
+
+  // ---------------------------------------------------------------------
+  // Cross-AGENT (same tenant) isolation — v3 canonical-contract gap closed
+  // by PR #257 reval. Two agents within the SAME tenant must not collide.
+  // ---------------------------------------------------------------------
+  describe('CROSS-AGENT ISOLATION (same tenant)', () => {
+    const TENANT_AGENT_X = { tenant_id: 'tenant-A', agent_id: 'agent-X' };
+    const TENANT_AGENT_Y = { tenant_id: 'tenant-A', agent_id: 'agent-Y' };
+
+    it('agent-X WRITE and agent-Y READ for same (tool, sha) within same tenant → MISS', async () => {
+      const { setCachedVision, getCachedVision } = await import('@/tools/_vision-cache.js');
+      await runWithTenantContext(TENANT_AGENT_X, async () => {
+        await setCachedVision('parse_image', 'sha-AGENT', { kind: 'boleto', tag: 'X' });
+      });
+      const fromY = await runWithTenantContext(TENANT_AGENT_Y, async () => {
+        return getCachedVision<{ kind: string; tag: string }>('parse_image', 'sha-AGENT');
+      });
+      // Same tenant, different agent → MISS. Two agents of the same tenant
+      // must not collide on the cache key (canonical Maia cache contract:
+      // #235/#241/#242/#272).
+      expect(fromY).toBeNull();
+    });
+
+    it('keys differ in the agent_id segment for (same tenant, different agent)', async () => {
+      const { setCachedVision } = await import('@/tools/_vision-cache.js');
+      await runWithTenantContext(TENANT_AGENT_X, async () => {
+        await setCachedVision('parse_image', 'sha-AGENT', { tag: 'X' });
+      });
+      await runWithTenantContext(TENANT_AGENT_Y, async () => {
+        await setCachedVision('parse_image', 'sha-AGENT', { tag: 'Y' });
+      });
+      const writeKeys = ops.filter((o) => o.op === 'setex').map((o) => o.key);
+      expect(writeKeys).toEqual([
+        'maia:vision:v3:tenant-A:agent-X:parse_image:sha-AGENT',
+        'maia:vision:v3:tenant-A:agent-Y:parse_image:sha-AGENT',
+      ]);
+      // Two independent store entries, never overwritten by each other.
+      expect(store.size).toBe(2);
+    });
+
+    it('two agents in same tenant caching different results for same sha do NOT overwrite each other', async () => {
+      const { setCachedVision, getCachedVision } = await import('@/tools/_vision-cache.js');
+      await runWithTenantContext(TENANT_AGENT_X, async () => {
+        await setCachedVision('parse_image', 'sha-DUAL', { kind: 'boleto', tag: 'X' });
+      });
+      await runWithTenantContext(TENANT_AGENT_Y, async () => {
+        await setCachedVision('parse_image', 'sha-DUAL', { kind: 'receipt', tag: 'Y' });
+      });
+      const fromX = await runWithTenantContext(TENANT_AGENT_X, async () => {
+        return getCachedVision<{ kind: string; tag: string }>('parse_image', 'sha-DUAL');
+      });
+      const fromY = await runWithTenantContext(TENANT_AGENT_Y, async () => {
+        return getCachedVision<{ kind: string; tag: string }>('parse_image', 'sha-DUAL');
+      });
+      expect(fromX).toEqual({ kind: 'boleto', tag: 'X' });
+      expect(fromY).toEqual({ kind: 'receipt', tag: 'Y' });
+    });
+
+    it('SYMMETRY: agent-Y WRITE then agent-X READ → MISS', async () => {
+      const { setCachedVision, getCachedVision } = await import('@/tools/_vision-cache.js');
+      await runWithTenantContext(TENANT_AGENT_Y, async () => {
+        await setCachedVision('parse_image', 'sha-SYM', { tag: 'Y' });
+      });
+      const fromX = await runWithTenantContext(TENANT_AGENT_X, async () => {
+        return getCachedVision<{ tag: string }>('parse_image', 'sha-SYM');
+      });
+      expect(fromX).toBeNull();
+    });
+  });
+
+  // ---------------------------------------------------------------------
+  // Observability — hit / miss / failure logs all carry (tenant_id, agent_id)
+  // so cache effectiveness can be sliced per (tenant, agent). PR #257 reval
+  // observability gap closed.
+  // ---------------------------------------------------------------------
+  describe('OBSERVABILITY (per-tenant / per-agent telemetry)', () => {
+    it('cache HIT emits a debug log with tenant_id + agent_id + tool', async () => {
+      const { setCachedVision, getCachedVision } = await import('@/tools/_vision-cache.js');
+      await runWithTenantContext(A_CTX, async () => {
+        await setCachedVision('parse_image', 'sha-HIT', { kind: 'boleto' });
+        logCalls = []; // ignore any logs from the set path
+        await getCachedVision('parse_image', 'sha-HIT');
+      });
+      const hits = logCalls.filter((c) => c.event === 'vision_cache.hit');
+      expect(hits).toHaveLength(1);
+      expect(hits[0]!.level).toBe('debug');
+      expect(hits[0]!.payload).toMatchObject({
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-A',
+        tool: 'parse_image',
+      });
+    });
+
+    it('cache MISS emits a debug log with tenant_id + agent_id + tool', async () => {
+      const { getCachedVision } = await import('@/tools/_vision-cache.js');
+      await runWithTenantContext(A_CTX, async () => {
+        await getCachedVision('parse_image', 'sha-NOT-CACHED');
+      });
+      const misses = logCalls.filter((c) => c.event === 'vision_cache.miss');
+      expect(misses).toHaveLength(1);
+      expect(misses[0]!.level).toBe('debug');
+      expect(misses[0]!.payload).toMatchObject({
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-A',
+        tool: 'parse_image',
+      });
+    });
+
+    it('observability emits exactly ONE hit or miss per get call (no double-count)', async () => {
+      const { setCachedVision, getCachedVision } = await import('@/tools/_vision-cache.js');
+      await runWithTenantContext(A_CTX, async () => {
+        await setCachedVision('parse_image', 'sha-Z', { kind: 'boleto' });
+        logCalls = [];
+        await getCachedVision('parse_image', 'sha-Z'); // hit
+        await getCachedVision('parse_image', 'sha-MISSING'); // miss
+      });
+      const hits = logCalls.filter((c) => c.event === 'vision_cache.hit');
+      const misses = logCalls.filter((c) => c.event === 'vision_cache.miss');
+      expect(hits).toHaveLength(1);
+      expect(misses).toHaveLength(1);
+    });
+
+    it('read failure log carries tenant_id + agent_id + tool (not just tool)', async () => {
+      // Force a deserialization failure by writing a non-JSON sentinel
+      // directly into the store under the key the production read will
+      // probe.
+      store.set('maia:vision:v3:tenant-A:agent-A:parse_image:sha-BAD', '{not json');
+      const { getCachedVision } = await import('@/tools/_vision-cache.js');
+      const got = await runWithTenantContext(A_CTX, async () => {
+        return getCachedVision('parse_image', 'sha-BAD');
+      });
+      // Best-effort contract: returns null, does not throw.
+      expect(got).toBeNull();
+      const warns = logCalls.filter((c) => c.event === 'vision_cache.read_failed');
+      expect(warns).toHaveLength(1);
+      expect(warns[0]!.payload).toMatchObject({
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-A',
+        tool: 'parse_image',
+      });
     });
   });
 });
