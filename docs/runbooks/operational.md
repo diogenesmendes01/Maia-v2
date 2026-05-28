@@ -188,7 +188,7 @@ curl -s http://localhost:3000/metrics | grep -E "maia_(baileys|redis|llm|audit)_
 | `maia_llm_calls_total{status="error"}` | counter | rate alto |
 | `maia_llm_tokens_total{kind=...}` | counter | rate alto = custo |
 | `maia_llm_latency_ms` | histogram | p99 > 30s |
-| `maia_audit_events_total{action=...}` | counter | crescimento súbito em ações sensíveis |
+| `maia_audit_events_total{action,tenant_id,agent_id}` | counter | crescimento súbito em ações sensíveis (filtrável por tenant) |
 
 **Health endpoints** (em `src/server.ts`): `/health`, `/health/db`, `/health/redis`, `/health/whatsapp`. Não há `/health/llm` — use `maia_llm_calls_total{status}` no Prometheus.
 

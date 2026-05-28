@@ -56,7 +56,11 @@ describe('audit() — tenant context fallback (PR #75 #3)', () => {
     expect(observedAgent).toBe('system');
     expect(incCounterMock).toHaveBeenCalledWith(
       'maia_audit_events_total',
-      expect.objectContaining({ action: 'whatsapp_connected' }),
+      expect.objectContaining({
+        action: 'whatsapp_connected',
+        tenant_id: 'system',
+        agent_id: 'system',
+      }),
     );
   });
 
@@ -81,7 +85,13 @@ describe('audit() — tenant context fallback (PR #75 #3)', () => {
     await expect(audit({ acao: 'whatsapp_connected' })).resolves.toBeUndefined();
     expect(incCounterMock).toHaveBeenCalledWith(
       'maia_audit_write_failed_total',
-      expect.objectContaining({ action: 'whatsapp_connected' }),
+      expect.objectContaining({
+        action: 'whatsapp_connected',
+        // Out-of-context failure path falls through to `system` attribution,
+        // matching the synthetic bucket the success path would have used.
+        tenant_id: 'system',
+        agent_id: 'system',
+      }),
     );
   });
 });

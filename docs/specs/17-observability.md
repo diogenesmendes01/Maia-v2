@@ -90,7 +90,7 @@ maia_llm_tokens_total{provider, model, kind=input|output}
 maia_dual_approvals_total{status=requested|granted|denied|timeout|executed}
 maia_idempotency_hits_total{tool}
 maia_dlq_jobs_total{queue}
-maia_audit_events_total{action}
+maia_audit_events_total{action, tenant_id, agent_id}
 ```
 
 ### 5.2 Gauges
