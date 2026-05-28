@@ -64,10 +64,20 @@ import {
 // assign inside beforeAll without `// @ts-expect-error`.
 type SkillsRepoModule = typeof import('@/control-plane/skill-registry/skills-repo.js');
 type TenantContextModule = typeof import('@/db/tenant-context.js');
+type DbClientModule = typeof import('@/db/client.js');
 let skillsRepoMod: SkillsRepoModule;
 let tenantContextMod: TenantContextModule;
+let dbClientMod: DbClientModule;
 
 let pg: StartedPostgres;
+/**
+ * Snapshot of `process.env.DATABASE_URL` from before this suite mutated it.
+ * Restored in `afterAll` so subsequent specs in the same vitest run start
+ * from the original env — without this, the container URI lingers and any
+ * later suite that imports `@/db/client.js` would create a pool pointing
+ * at a stopped container.
+ */
+let previousDatabaseUrl: string | undefined;
 
 // Test-wide skip when Docker is not available. We probe the container
 // runtime synchronously at module-load (top-level await) so an unreachable
@@ -87,22 +97,77 @@ const TENANT_B = 'tenant-B-issue-218';
 const AGENT_A = 'agent-A-issue-218';
 const AGENT_B = 'agent-B-issue-218';
 
+/**
+ * Deterministic UUIDs per seed row.
+ *
+ * Production schema (`migrations/043_p9a_skills.sql`) declares
+ * `id UUID PRIMARY KEY` — Postgres rejects non-UUID literals with a type
+ * error during INSERT, which would crash the suite before any assertion
+ * runs. The in-memory fake spec (PR #222) used opaque string IDs because
+ * its fake table didn't enforce the UUID cast; we MUST use real UUIDs
+ * here. We keep the friendly names as the lookup KEY so assertions stay
+ * readable.
+ *
+ * UUIDs are deterministic (hardcoded) so a failing test points back at
+ * the same row across runs.
+ */
+const SEED_IDS = {
+  s_A_owned:  '00000000-0000-0000-0000-000000000a01',
+  s_A_shared: '00000000-0000-0000-0000-000000000a02',
+  s_A_extra:  '00000000-0000-0000-0000-000000000a03',
+  s_B_owned:  '00000000-0000-0000-0000-000000000b01',
+  s_B_shared: '00000000-0000-0000-0000-000000000b02',
+  s_B_extra:  '00000000-0000-0000-0000-000000000b03',
+} as const;
+type SeedKey = keyof typeof SEED_IDS;
+
 interface SeedSkill {
-  id: string;
+  /** Friendly name (e.g. 's_A_owned') — looked up in SEED_IDS for the real UUID. */
+  key: SeedKey;
   tenant_id: string;
   agent_id: string | null;
   skill_descriptor: string;
   category: string;
   status: string;
   version: number;
+  /**
+   * Explicit `created_at` for the row. We pin this so the seed order is
+   * BIT-deterministic from Postgres' perspective — when assertions reason
+   * about which row would surface in a `LIMIT 1` regression (mutation-kill
+   * scenario), they can rely on `created_at` instead of heap insertion
+   * order (which Postgres does not guarantee for tied ORDER BY keys).
+   * See `seedTenantWideOnlyBFirst` / `seedTenantWideOnlyAFirst` comments.
+   */
+  created_at: Date;
+}
+
+/**
+ * Resolve a friendly seed name to its deterministic UUID. Assertions
+ * compare against the UUID; the friendly name is kept only as a
+ * test-readable handle.
+ */
+function idOf(key: SeedKey): string {
+  return SEED_IDS[key];
 }
 
 /**
  * Insert a skill row directly via raw SQL so we can control insertion order
- * (which matters for the adversarial seeds — see PR #222 review item 3).
+ * AND `created_at` (which matters for the adversarial seeds — see PR #222
+ * review item 3, and PR #278 review item "mutation-kill determinism").
+ *
  * Mirrors `baseRow` in the in-memory spec: only the fields that participate
  * in the WHERE/ORDER BY are non-default; the rest fall back to schema
  * defaults (empty jsonb / text[] / etc.).
+ *
+ * The `id` is bound as UUID via `::uuid` cast — the schema column type is
+ * UUID PRIMARY KEY (see `migrations/043_p9a_skills.sql:6`), and Postgres
+ * rejects a TEXT literal as UUID without the cast under some driver
+ * configurations. Explicit cast keeps this driver-independent.
+ *
+ * `created_at` is bound explicitly (not `now()`) so seed order is
+ * deterministic from Postgres' perspective: an assertion that reasons about
+ * "row inserted first" can rely on `created_at` even when ORDER BY has
+ * tied sort keys (real Postgres does not guarantee heap order for ties).
  */
 async function insertSeed(row: SeedSkill): Promise<void> {
   await pg.pool.query(
@@ -112,12 +177,21 @@ async function insertSeed(row: SeedSkill): Promise<void> {
       goal, when_to_use, input_schema, output_schema, status, version,
       proposed_by, activated_at, created_at
     ) VALUES (
-      $1, $2, $3, $4, $5, 'prompt_only',
+      $1::uuid, $2, $3, $4, $5, 'prompt_only',
       'goal', 'when', '{}'::jsonb, '{}'::jsonb, $6, $7,
-      'test', now(), now()
+      'test', now(), $8
     )
     `,
-    [row.id, row.tenant_id, row.agent_id, row.skill_descriptor, row.category, row.status, row.version],
+    [
+      idOf(row.key),
+      row.tenant_id,
+      row.agent_id,
+      row.skill_descriptor,
+      row.category,
+      row.status,
+      row.version,
+      row.created_at,
+    ],
   );
 }
 
@@ -136,32 +210,42 @@ async function resetSkills(): Promise<void> {
 // ---------------------------------------------------------------------------
 // Seed fixtures — bit-for-bit mirrors of the in-memory spec (PR #222) so a
 // real-DB regression surfaces in the same shape as the in-memory one would.
+//
+// Each row gets an explicit `created_at` that encodes insertion order in the
+// timestamp itself (NOT just call order). This makes ordering DETERMINISTIC
+// on real Postgres: heap order is not guaranteed for tied ORDER BY keys, but
+// `created_at ASC` is. Tests that reason about "row inserted first" stay
+// reliable across PG versions and physical row layout.
 // ---------------------------------------------------------------------------
+
+/** Base timestamp; per-row offsets in milliseconds below. */
+const T0 = new Date('2025-01-01T00:00:00.000Z');
+const at = (ms: number): Date => new Date(T0.getTime() + ms);
 
 /** Default seed (tenant-A first, then tenant-B). */
 async function seedTwoTenants(): Promise<void> {
   // tenant-A: own agent skill + tenant-wide skill (shared INSIDE tenant-A).
-  await insertSeed({ id: 's_A_owned',  tenant_id: TENANT_A, agent_id: AGENT_A, skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1 });
-  await insertSeed({ id: 's_A_shared', tenant_id: TENANT_A, agent_id: null,    skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1 });
+  await insertSeed({ key: 's_A_owned',  tenant_id: TENANT_A, agent_id: AGENT_A, skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1, created_at: at(0) });
+  await insertSeed({ key: 's_A_shared', tenant_id: TENANT_A, agent_id: null,    skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1, created_at: at(1) });
   // tenant-B: own agent skill + tenant-wide skill. The s_B_shared row is the
   // canonical leak risk — tenant-wide for tenant-B but MUST NEVER appear
   // under tenant-A's context.
-  await insertSeed({ id: 's_B_owned',  tenant_id: TENANT_B, agent_id: AGENT_B, skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1 });
-  await insertSeed({ id: 's_B_shared', tenant_id: TENANT_B, agent_id: null,    skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1 });
+  await insertSeed({ key: 's_B_owned',  tenant_id: TENANT_B, agent_id: AGENT_B, skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1, created_at: at(2) });
+  await insertSeed({ key: 's_B_shared', tenant_id: TENANT_B, agent_id: null,    skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1, created_at: at(3) });
   // Extras so listAll/listSummaries surface > 1 row per tenant and the
   // cross-tenant absence is a stronger signal.
-  await insertSeed({ id: 's_A_extra', tenant_id: TENANT_A, agent_id: AGENT_A, skill_descriptor: 'a.extra', category: 'classify', status: 'active', version: 1 });
-  await insertSeed({ id: 's_B_extra', tenant_id: TENANT_B, agent_id: AGENT_B, skill_descriptor: 'b.extra', category: 'classify', status: 'active', version: 1 });
+  await insertSeed({ key: 's_A_extra', tenant_id: TENANT_A, agent_id: AGENT_A, skill_descriptor: 'a.extra', category: 'classify', status: 'active', version: 1, created_at: at(4) });
+  await insertSeed({ key: 's_B_extra', tenant_id: TENANT_B, agent_id: AGENT_B, skill_descriptor: 'b.extra', category: 'classify', status: 'active', version: 1, created_at: at(5) });
 }
 
 /** Adversarial seed: tenant-B FIRST, then tenant-A (PR #222 review item 3). */
 async function seedTwoTenantsReverse(): Promise<void> {
-  await insertSeed({ id: 's_B_owned',  tenant_id: TENANT_B, agent_id: AGENT_B, skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1 });
-  await insertSeed({ id: 's_B_shared', tenant_id: TENANT_B, agent_id: null,    skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1 });
-  await insertSeed({ id: 's_A_owned',  tenant_id: TENANT_A, agent_id: AGENT_A, skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1 });
-  await insertSeed({ id: 's_A_shared', tenant_id: TENANT_A, agent_id: null,    skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1 });
-  await insertSeed({ id: 's_B_extra', tenant_id: TENANT_B, agent_id: AGENT_B, skill_descriptor: 'b.extra', category: 'classify', status: 'active', version: 1 });
-  await insertSeed({ id: 's_A_extra', tenant_id: TENANT_A, agent_id: AGENT_A, skill_descriptor: 'a.extra', category: 'classify', status: 'active', version: 1 });
+  await insertSeed({ key: 's_B_owned',  tenant_id: TENANT_B, agent_id: AGENT_B, skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1, created_at: at(0) });
+  await insertSeed({ key: 's_B_shared', tenant_id: TENANT_B, agent_id: null,    skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1, created_at: at(1) });
+  await insertSeed({ key: 's_A_owned',  tenant_id: TENANT_A, agent_id: AGENT_A, skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1, created_at: at(2) });
+  await insertSeed({ key: 's_A_shared', tenant_id: TENANT_A, agent_id: null,    skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1, created_at: at(3) });
+  await insertSeed({ key: 's_B_extra', tenant_id: TENANT_B, agent_id: AGENT_B, skill_descriptor: 'b.extra', category: 'classify', status: 'active', version: 1, created_at: at(4) });
+  await insertSeed({ key: 's_A_extra', tenant_id: TENANT_A, agent_id: AGENT_A, skill_descriptor: 'a.extra', category: 'classify', status: 'active', version: 1, created_at: at(5) });
 }
 
 /**
@@ -179,9 +263,15 @@ async function seedTwoTenantsReverse(): Promise<void> {
  *     `s_A_shared` and `s_B_shared` would match the (now broken) WHERE
  *     because both have `agent_id IS NULL`.
  *   - The ORDER BY `agent_id IS NULL ASC` evaluates the SAME truthy value
- *     for both rows → cannot disambiguate by sort key.
- *   - `LIMIT 1` then returns whichever was inserted FIRST → tenant-B's row
- *     under tenant-A's context → leak surfaces.
+ *     for both rows → cannot disambiguate by sort key. Postgres makes NO
+ *     guarantee about which row surfaces in a `LIMIT 1` over tied keys
+ *     (heap order can flip across PG versions, planner choices, etc.).
+ *   - The seed assigns `s_B_shared` an EARLIER `created_at` so the
+ *     mutation-kill reasoning ("the wrong tenant's row wins") holds for
+ *     ANY downstream secondary sort by `created_at ASC` we (or a future
+ *     reviewer) might choose to add. Today's assertions only check the
+ *     POSITIVE case (tenant_id filter present → s_A_shared wins under
+ *     tenant-A context) — they do not depend on heap order at all.
  *
  * The unique partial index on `(tenant_id, COALESCE(agent_id, 'tenant_wide'),
  * skill_descriptor) WHERE status='active'` (migration 043 line 73) allows
@@ -189,15 +279,16 @@ async function seedTwoTenantsReverse(): Promise<void> {
  * what we exercise here.
  */
 async function seedTenantWideOnlyBFirst(): Promise<void> {
-  // B's tenant-wide row FIRST so it sorts ahead in insertion order.
-  await insertSeed({ id: 's_B_shared', tenant_id: TENANT_B, agent_id: null, skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1 });
-  await insertSeed({ id: 's_A_shared', tenant_id: TENANT_A, agent_id: null, skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1 });
+  // B's tenant-wide row FIRST (earlier `created_at`) — encodes the
+  // adversarial ordering deterministically.
+  await insertSeed({ key: 's_B_shared', tenant_id: TENANT_B, agent_id: null, skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1, created_at: at(0) });
+  await insertSeed({ key: 's_A_shared', tenant_id: TENANT_A, agent_id: null, skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1, created_at: at(1) });
 }
 
-/** Symmetric counterpart: A FIRST. */
+/** Symmetric counterpart: A FIRST (earlier `created_at`). */
 async function seedTenantWideOnlyAFirst(): Promise<void> {
-  await insertSeed({ id: 's_A_shared', tenant_id: TENANT_A, agent_id: null, skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1 });
-  await insertSeed({ id: 's_B_shared', tenant_id: TENANT_B, agent_id: null, skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1 });
+  await insertSeed({ key: 's_A_shared', tenant_id: TENANT_A, agent_id: null, skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1, created_at: at(0) });
+  await insertSeed({ key: 's_B_shared', tenant_id: TENANT_B, agent_id: null, skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1, created_at: at(1) });
 }
 
 function idsOf<T extends { id: string }>(rows: T[]): string[] {
@@ -210,6 +301,11 @@ function idsOf<T extends { id: string }>(rows: T[]): string[] {
 d('skillsRepo — cross-tenant isolation on REAL Postgres (issue #218)', () => {
   beforeAll(async () => {
     pg = await startPostgresContainer();
+    // Snapshot the prior DATABASE_URL so we can restore it in afterAll.
+    // Without this, the container URI lingers in env after the suite ends
+    // and any later real-db spec in the same vitest run imports a pool
+    // pointing at a stopped container.
+    previousDatabaseUrl = process.env.DATABASE_URL;
     // Set DATABASE_URL to the container's URI BEFORE importing anything that
     // pulls in @/db/client.js. The drizzle Pool captures the URL at module
     // load; if we imported earlier, it would point at the unreachable
@@ -217,10 +313,26 @@ d('skillsRepo — cross-tenant isolation on REAL Postgres (issue #218)', () => {
     process.env.DATABASE_URL = pg.uri;
     skillsRepoMod = await import('@/control-plane/skill-registry/skills-repo.js');
     tenantContextMod = await import('@/db/tenant-context.js');
+    // Hold a reference to the db client module so afterAll can drain the
+    // production pool we just created. Importing here (after the env mutation)
+    // guarantees the pool we shutdown is the SAME instance the repo is using.
+    dbClientMod = await import('@/db/client.js');
   }, /* timeout for image pull on first run */ 180_000);
 
   afterAll(async () => {
+    // Order matters:
+    //   1) drain the production-side pool created against the container,
+    //      so nothing tries to query a torn-down container afterwards.
+    //   2) stop the container (also closes the test-side fixture pool).
+    //   3) restore the original DATABASE_URL so subsequent suites don't
+    //      inherit the (now dead) container URI.
+    if (dbClientMod) await dbClientMod.shutdownDb().catch(() => undefined);
     if (pg) await stopPostgresContainer(pg);
+    if (previousDatabaseUrl === undefined) {
+      delete process.env.DATABASE_URL;
+    } else {
+      process.env.DATABASE_URL = previousDatabaseUrl;
+    }
   });
 
   beforeEach(async () => {
@@ -239,7 +351,7 @@ d('skillsRepo — cross-tenant isolation on REAL Postgres (issue #218)', () => {
       skillsRepoMod.skillsRepo.listByCategory('tool_mediated'),
     );
     const ids = idsOf(got);
-    expect(ids.sort()).toEqual(['s_A_owned', 's_A_shared'].sort());
+    expect(ids.sort()).toEqual([idOf('s_A_owned'), idOf('s_A_shared')].sort());
     expect(got.every((r) => r.tenant_id === TENANT_A)).toBe(true);
   });
 
@@ -249,7 +361,7 @@ d('skillsRepo — cross-tenant isolation on REAL Postgres (issue #218)', () => {
       skillsRepoMod.skillsRepo.listByCategory('tool_mediated'),
     );
     const ids = idsOf(got);
-    expect(ids.sort()).toEqual(['s_B_owned', 's_B_shared'].sort());
+    expect(ids.sort()).toEqual([idOf('s_B_owned'), idOf('s_B_shared')].sort());
     expect(got.every((r) => r.tenant_id === TENANT_B)).toBe(true);
   });
 
@@ -260,14 +372,18 @@ d('skillsRepo — cross-tenant isolation on REAL Postgres (issue #218)', () => {
     await seedTwoTenants();
     const got = await runAs(TENANT_A, AGENT_A, () => skillsRepoMod.skillsRepo.listAll());
     expect(got.every((r) => r.tenant_id === TENANT_A)).toBe(true);
-    expect(idsOf(got).sort()).toEqual(['s_A_extra', 's_A_owned', 's_A_shared'].sort());
+    expect(idsOf(got).sort()).toEqual(
+      [idOf('s_A_extra'), idOf('s_A_owned'), idOf('s_A_shared')].sort(),
+    );
   });
 
   it('listAll: symmetric — every row in tenant-B result is tenant-B', async () => {
     await seedTwoTenants();
     const got = await runAs(TENANT_B, AGENT_B, () => skillsRepoMod.skillsRepo.listAll());
     expect(got.every((r) => r.tenant_id === TENANT_B)).toBe(true);
-    expect(idsOf(got).sort()).toEqual(['s_B_extra', 's_B_owned', 's_B_shared'].sort());
+    expect(idsOf(got).sort()).toEqual(
+      [idOf('s_B_extra'), idOf('s_B_owned'), idOf('s_B_shared')].sort(),
+    );
   });
 
   it('listSummariesPage: every row in tenant-A page is tenant-A (per-row tenant_id check)', async () => {
@@ -276,7 +392,9 @@ d('skillsRepo — cross-tenant isolation on REAL Postgres (issue #218)', () => {
       skillsRepoMod.skillsRepo.listSummariesPage(),
     );
     expect(page.items.every((r) => r.tenant_id === TENANT_A)).toBe(true);
-    expect(idsOf(page.items).sort()).toEqual(['s_A_extra', 's_A_owned', 's_A_shared'].sort());
+    expect(idsOf(page.items).sort()).toEqual(
+      [idOf('s_A_extra'), idOf('s_A_owned'), idOf('s_A_shared')].sort(),
+    );
   });
 
   it('listSummariesPage: symmetric — every row in tenant-B page is tenant-B', async () => {
@@ -285,7 +403,9 @@ d('skillsRepo — cross-tenant isolation on REAL Postgres (issue #218)', () => {
       skillsRepoMod.skillsRepo.listSummariesPage(),
     );
     expect(page.items.every((r) => r.tenant_id === TENANT_B)).toBe(true);
-    expect(idsOf(page.items).sort()).toEqual(['s_B_extra', 's_B_owned', 's_B_shared'].sort());
+    expect(idsOf(page.items).sort()).toEqual(
+      [idOf('s_B_extra'), idOf('s_B_owned'), idOf('s_B_shared')].sort(),
+    );
   });
 
   // -------------------------------------------------------------------------
@@ -294,27 +414,27 @@ d('skillsRepo — cross-tenant isolation on REAL Postgres (issue #218)', () => {
   it('getById: tenant-A scope cannot read tenant-B ids (incl. tenant-wide)', async () => {
     await seedTwoTenants();
     const leakedOwned = await runAs(TENANT_A, AGENT_A, () =>
-      skillsRepoMod.skillsRepo.getById('s_B_owned'),
+      skillsRepoMod.skillsRepo.getById(idOf('s_B_owned')),
     );
     const leakedShared = await runAs(TENANT_A, AGENT_A, () =>
-      skillsRepoMod.skillsRepo.getById('s_B_shared'),
+      skillsRepoMod.skillsRepo.getById(idOf('s_B_shared')),
     );
     expect(leakedOwned).toBeNull();
     expect(leakedShared).toBeNull(); // tenant-WIDE ≠ cross-tenant
     // Positive control: own rows still resolve under tenant-A scope.
     const ownA = await runAs(TENANT_A, AGENT_A, () =>
-      skillsRepoMod.skillsRepo.getById('s_A_owned'),
+      skillsRepoMod.skillsRepo.getById(idOf('s_A_owned')),
     );
-    expect(ownA?.id).toBe('s_A_owned');
+    expect(ownA?.id).toBe(idOf('s_A_owned'));
   });
 
   it('getById: symmetric — tenant-B scope cannot read tenant-A ids', async () => {
     await seedTwoTenants();
     const leakedOwned = await runAs(TENANT_B, AGENT_B, () =>
-      skillsRepoMod.skillsRepo.getById('s_A_owned'),
+      skillsRepoMod.skillsRepo.getById(idOf('s_A_owned')),
     );
     const leakedShared = await runAs(TENANT_B, AGENT_B, () =>
-      skillsRepoMod.skillsRepo.getById('s_A_shared'),
+      skillsRepoMod.skillsRepo.getById(idOf('s_A_shared')),
     );
     expect(leakedOwned).toBeNull();
     expect(leakedShared).toBeNull();
@@ -334,7 +454,7 @@ d('skillsRepo — cross-tenant isolation on REAL Postgres (issue #218)', () => {
         );
         expect(got).not.toBeNull();
         expect(got!.tenant_id).toBe(TENANT_A);
-        expect(['s_A_owned', 's_A_shared']).toContain(got!.id);
+        expect([idOf('s_A_owned'), idOf('s_A_shared')]).toContain(got!.id);
       });
 
       it(`tenant-B with seed [${seedName}]: symmetric — returns ONLY a tenant-B row`, async () => {
@@ -344,7 +464,7 @@ d('skillsRepo — cross-tenant isolation on REAL Postgres (issue #218)', () => {
         );
         expect(got).not.toBeNull();
         expect(got!.tenant_id).toBe(TENANT_B);
-        expect(['s_B_owned', 's_B_shared']).toContain(got!.id);
+        expect([idOf('s_B_owned'), idOf('s_B_shared')]).toContain(got!.id);
       });
     }
   });
@@ -358,7 +478,7 @@ d('skillsRepo — cross-tenant isolation on REAL Postgres (issue #218)', () => {
       const got = await runAs(TENANT_A, AGENT_A, () =>
         skillsRepoMod.skillsRepo.findActive('shared.descr'),
       );
-      expect(got?.id).toBe('s_A_owned'); // ORDER BY agent_id IS NULL: real agent first
+      expect(got?.id).toBe(idOf('s_A_owned')); // ORDER BY agent_id IS NULL: real agent first
       expect(got?.tenant_id).toBe(TENANT_A);
     });
 
@@ -367,7 +487,7 @@ d('skillsRepo — cross-tenant isolation on REAL Postgres (issue #218)', () => {
       const got = await runAs(TENANT_B, AGENT_B, () =>
         skillsRepoMod.skillsRepo.findActive('shared.descr'),
       );
-      expect(got?.id).toBe('s_B_owned');
+      expect(got?.id).toBe(idOf('s_B_owned'));
       expect(got?.tenant_id).toBe(TENANT_B);
     });
 
@@ -378,12 +498,18 @@ d('skillsRepo — cross-tenant isolation on REAL Postgres (issue #218)', () => {
     // production `tenant_id` filter in place, only one matches the WHERE per
     // tenant context — fine. Without it (regression), both match the WHERE,
     // the ORDER BY agent_id IS NULL ASC sees `true=true` and CANNOT
-    // disambiguate; `LIMIT 1` then returns whichever was inserted first
-    // (B-first → s_B_shared under tenant-A's context → wrong tenant).
+    // disambiguate; `LIMIT 1` then returns the row Postgres feels like
+    // returning (heap order is NOT guaranteed for ties).
     //
-    // Real Postgres confirms the production WHERE actually excludes the
-    // other tenant's row — the in-memory fake would only prove this for the
-    // fake's own predicate semantics.
+    // The seed encodes the adversarial order via `created_at` (B earlier
+    // than A in seedTenantWideOnlyBFirst), so a future reviewer who adds a
+    // `created_at ASC` secondary sort to production findActive would still
+    // see the same regression scenario hold deterministically.
+    //
+    // Today's assertions check ONLY the positive case: with the tenant_id
+    // filter in place, only the tenant's own row matches the WHERE, so the
+    // ORDER BY tie-break is moot — there's a single candidate. No reliance
+    // on heap order at all.
     // ---------------------------------------------------------------------
     it('findActive (default): TENANT-WIDE-ONLY seed [B-first], tenant-A returns s_A_shared (ORDER BY tie-break on real Postgres)', async () => {
       await seedTenantWideOnlyBFirst();
@@ -391,7 +517,7 @@ d('skillsRepo — cross-tenant isolation on REAL Postgres (issue #218)', () => {
         skillsRepoMod.skillsRepo.findActive('shared.descr'),
       );
       expect(got).not.toBeNull();
-      expect(got!.id).toBe('s_A_shared');
+      expect(got!.id).toBe(idOf('s_A_shared'));
       expect(got!.tenant_id).toBe(TENANT_A);
     });
 
@@ -401,7 +527,7 @@ d('skillsRepo — cross-tenant isolation on REAL Postgres (issue #218)', () => {
         skillsRepoMod.skillsRepo.findActive('shared.descr'),
       );
       expect(got).not.toBeNull();
-      expect(got!.id).toBe('s_B_shared');
+      expect(got!.id).toBe(idOf('s_B_shared'));
       expect(got!.tenant_id).toBe(TENANT_B);
     });
 
@@ -411,7 +537,7 @@ d('skillsRepo — cross-tenant isolation on REAL Postgres (issue #218)', () => {
         skillsRepoMod.skillsRepo.findActive('shared.descr', null),
       );
       expect(got).not.toBeNull();
-      expect(got!.id).toBe('s_A_shared');
+      expect(got!.id).toBe(idOf('s_A_shared'));
       expect(got!.tenant_id).toBe(TENANT_A);
     });
 
@@ -421,7 +547,7 @@ d('skillsRepo — cross-tenant isolation on REAL Postgres (issue #218)', () => {
         skillsRepoMod.skillsRepo.findActive('shared.descr', null),
       );
       expect(got).not.toBeNull();
-      expect(got!.id).toBe('s_B_shared');
+      expect(got!.id).toBe(idOf('s_B_shared'));
       expect(got!.tenant_id).toBe(TENANT_B);
     });
 
@@ -446,9 +572,9 @@ d('skillsRepo — cross-tenant isolation on REAL Postgres (issue #218)', () => {
         skillsRepoMod.skillsRepo.listVersions('shared.descr'),
       );
       const ids = idsOf(got);
-      expect(ids.sort()).toEqual(['s_A_owned', 's_A_shared'].sort());
-      expect(ids).not.toContain('s_B_owned');
-      expect(ids).not.toContain('s_B_shared');
+      expect(ids.sort()).toEqual([idOf('s_A_owned'), idOf('s_A_shared')].sort());
+      expect(ids).not.toContain(idOf('s_B_owned'));
+      expect(ids).not.toContain(idOf('s_B_shared'));
     });
 
     it('listVersions(d, AGENT_A): explicit-agent branch — tenant-A asks for agent-A — returns only s_A_owned', async () => {
@@ -456,7 +582,7 @@ d('skillsRepo — cross-tenant isolation on REAL Postgres (issue #218)', () => {
       const got = await runAs(TENANT_A, AGENT_A, () =>
         skillsRepoMod.skillsRepo.listVersions('shared.descr', AGENT_A),
       );
-      expect(idsOf(got)).toEqual(['s_A_owned']);
+      expect(idsOf(got)).toEqual([idOf('s_A_owned')]);
     });
 
     it('listVersions(d, null): explicit-tenant-wide branch — tenant-A returns only s_A_shared, never tenant-B tenant-wide', async () => {
@@ -464,7 +590,7 @@ d('skillsRepo — cross-tenant isolation on REAL Postgres (issue #218)', () => {
       const got = await runAs(TENANT_A, AGENT_A, () =>
         skillsRepoMod.skillsRepo.listVersions('shared.descr', null),
       );
-      expect(idsOf(got)).toEqual(['s_A_shared']);
+      expect(idsOf(got)).toEqual([idOf('s_A_shared')]);
     });
 
     it('listVersions(d, null): symmetric — tenant-B returns only s_B_shared', async () => {
@@ -472,7 +598,7 @@ d('skillsRepo — cross-tenant isolation on REAL Postgres (issue #218)', () => {
       const got = await runAs(TENANT_B, AGENT_B, () =>
         skillsRepoMod.skillsRepo.listVersions('shared.descr', null),
       );
-      expect(idsOf(got)).toEqual(['s_B_shared']);
+      expect(idsOf(got)).toEqual([idOf('s_B_shared')]);
     });
   });
 });

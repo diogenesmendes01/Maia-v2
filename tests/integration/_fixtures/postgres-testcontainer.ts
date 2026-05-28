@@ -30,6 +30,7 @@
  */
 import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import pg from 'pg';
 
@@ -61,15 +62,26 @@ export interface StartedPostgres {
 
 /**
  * Find the migrations directory regardless of where vitest CWD ends up.
- * Walks up from this file's location until it finds /migrations.
+ * Resolves from this file's location to `/migrations` at the repo root.
+ *
+ * Uses `fileURLToPath` from `node:url` to convert the `file://` URL to a
+ * native filesystem path. This is the correct way to do it because:
+ *   - On Windows, `new URL(...).pathname` returns `/C:/Users/PC%20Di/...`
+ *     (leading slash + percent-encoded spaces). The old approach stripped
+ *     the leading slash with a regex but left the percent-encoding intact,
+ *     breaking on any path that contained a space (e.g. `PC Di`,
+ *     `Program Files`).
+ *   - `fileURLToPath` is the WHATWG-standard, OS-aware conversion: it
+ *     percent-decodes, drops the leading slash on Windows drive letters,
+ *     and uses the platform-correct separator.
  */
 async function findMigrationsDir(): Promise<string> {
   // tests/integration/_fixtures/postgres-testcontainer.ts → ../../../migrations
   const here = new URL('.', import.meta.url);
   const candidate = new URL('../../../migrations/', here);
-  // Smoke-test by reading the directory.
+  // Smoke-test by reading the directory. `readdir` accepts URL directly.
   await readdir(candidate);
-  return new URL(candidate).pathname.replace(/^\/([a-zA-Z]:)/, '$1'); // Windows: strip leading slash on /C:/...
+  return fileURLToPath(candidate);
 }
 
 /**
