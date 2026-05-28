@@ -19,6 +19,7 @@ import { clearDebounceState as clearDebounceStateRaw } from '@/gateway/debouncer
 import { buildPrompt } from './prompt-builder.js';
 import { hashScope } from './scope-hash.js';
 import { logger } from '@/lib/logger.js';
+import { TypedError } from '@/lib/utils.js';
 import type { Mensagem, ProcedureExecution, Role } from '@/db/schema.js';
 import { resolveChannel } from '@/gateway/channel-resolver.js';
 import { selectRole } from '@/cognition/role-selector/engine.js';
@@ -238,11 +239,19 @@ async function clearDebounceState(phone: string): Promise<void> {
 }
 
 export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
-  // P6 Task 9: roteamento via channel resolver quando flag MULTI_CHANNEL ON.
-  // O resolver é o entry point — roda ANTES de existir tenant context (faz
-  // cross-tenant lookup propositalmente). Falhas caem em default/default
-  // (legacy) para preservar compat com P0..P5 quando o canal não está
-  // registrado em `channels`.
+  // P6 Task 9 + issue #268 (fail-loud): roteamento via channel resolver.
+  //
+  // Quando MULTI_CHANNEL está OFF, opera direto em `default/default` (modo
+  // legacy single-tenant — preservado de P0..P5). O resolver NÃO é chamado
+  // nesse caminho.
+  //
+  // Quando MULTI_CHANNEL está ON, qualquer falha de resolução (probe sem
+  // telefone, canal não registrado, canal inativo) AGORA é fatal: o resolver
+  // levanta TypedError, este caller emite um audit `channel_resolution_failed`
+  // (com contexto suficiente pra triagem) e re-lança. BullMQ trata como job
+  // failure → retry policy → DLQ. Isso elimina o bypass do issue #268, em que
+  // tenants distintos colapsavam no bucket compartilhado
+  // `maia:ratelimit:default:default:*`.
   let resolved: { tenant_id: string; agent_id: string; channel_id: string | null } = {
     tenant_id: 'default',
     agent_id: 'default',
@@ -250,16 +259,72 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
   };
 
   if (featureFlags.isEnabled(FeatureFlagName.MULTI_CHANNEL)) {
+    let probe: { channel_type: 'whatsapp'; external_id: string } | null = null;
     try {
-      const probe = await probeMessageForChannel(mensagem_id);
-      if (probe) {
-        resolved = await resolveChannel(probe);
+      probe = await probeMessageForChannel(mensagem_id);
+      if (!probe) {
+        // Probe missing/incomplete metadata is also a resolution failure when
+        // MULTI_CHANNEL is ON — without (channel_type, external_id) we can't
+        // identify the tenant, and falling back to default/default would
+        // collapse buckets cross-tenant.
+        throw new TypedError(
+          'channel_resolution_failed',
+          'probe returned null — missing telefone metadata on inbound mensagem',
+          { mensagem_id, resolver_path: 'probe_missing_metadata' },
+        );
       }
+      resolved = await resolveChannel(probe);
     } catch (err) {
+      const typed = err as { code?: string; details?: unknown };
+      // Audit emitted at the caller level so the row carries `mensagem_id` +
+      // whatever probe context we collected. `audit()` wraps in synthetic
+      // `system` tenant context when none is active (we don't have one yet —
+      // we ARE the entry point).
+      await audit({
+        acao: 'channel_resolution_failed',
+        mensagem_id,
+        metadata: {
+          error_code: typed?.code ?? 'unknown',
+          error_message: (err as Error).message,
+          probe_external_id: probe?.external_id ?? null,
+          probe_channel_type: probe?.channel_type ?? null,
+          resolver_details: typed?.details ?? null,
+        },
+      });
       logger.warn(
         { mensagem_id, err: (err as Error).message },
-        'agent.channel_resolution_failed_fallback_default',
+        'agent.channel_resolution_failed_throw',
       );
+      // Propagate: the agent worker (BullMQ) will mark the job failed and
+      // apply the configured retry/DLQ policy. We do NOT fall back to
+      // default/default — that's exactly the bypass issue #268 closed.
+      throw err;
+    }
+
+    // [Codex review #277] Adoption helper — bridge the baileys/resolver gap.
+    //
+    // Baileys ingress persists every inbound under (default, default) — it has
+    // no tenant context to use (the resolver only runs HERE, after persistence).
+    // Without adoption, the inner findById (tenant-scoped) would return null
+    // because the row still carries (default, default), not the resolved
+    // (tenant_id, agent_id). Every successfully-resolved message would then
+    // bounce off `agent.message_not_found` and the turn would silently drop —
+    // functionally identical to the bug issue #268 closed.
+    //
+    // Adoption bypasses the tenant guard via `adoptToResolvedTenantCrossTenant`
+    // — same sanctioned pattern as `channelsRepo.findByExternalCrossTenant`:
+    // the entry point legitimately operates without a tenant context (it is
+    // the one DISCOVERING which tenant owns the row). Once adopted, all
+    // downstream reads inside `runWithTenantContext` see the resolved triplet.
+    //
+    // Idempotency: re-running with the same target tenant/agent is a no-op at
+    // the SQL level (UPDATE writing identical values). Safe for BullMQ retries.
+    if (resolved.tenant_id !== 'default' || resolved.agent_id !== 'default') {
+      await mensagensRepo.adoptToResolvedTenantCrossTenant({
+        id: mensagem_id,
+        tenant_id: resolved.tenant_id,
+        agent_id: resolved.agent_id,
+      });
     }
   }
 
