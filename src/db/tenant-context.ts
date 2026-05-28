@@ -35,7 +35,11 @@ export async function runWithTenantContext<T>(
 // the empty/nullish value back and any downstream `WHERE tenant_id = $1`
 // would either crash on type mismatch (best case) or return rows scoped to
 // the wrong-and-likely-empty tenant (worst case, cross-tenant leak).
-// PR #269 review (Codex reval) — close the gap before merge.
+// Para cache keys (holidays-cache, etc.): falsy agent_id geraria key
+// malformada `holidays:v2:tenantA::entidade:2026:standard` que colide
+// silenciosamente com outros contextos malformados — exatamente o leak que
+// PR #263 fechou para o caso de `agent_id` ausente da key.
+// PRs #269 + #272 review (Codex reval) — close the gap before merge.
 function assertTruthyContext(ctx: TenantContext): void {
   if (!ctx.tenant_id || typeof ctx.tenant_id !== 'string') {
     throw new MissingTenantContextError('tenant_id is empty/non-string');

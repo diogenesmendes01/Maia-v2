@@ -31,12 +31,15 @@ describe('tenant-context', () => {
   });
 
   // -------------------------------------------------------------------------
-  // PR #269 review (Codex reval): fail-closed when ALS carries malformed
-  // context — empty string, null, undefined, non-string. Previously the
-  // accessors returned the raw value, letting downstream queries scope by
-  // an empty tenant_id and (worst case) leak rows across tenants.
+  // PR #272 / #269 review (Codex reval): fail-closed when ALS carries
+  // malformed context — empty string, null, undefined, non-string.
+  // Previously the accessors returned the raw value, letting downstream
+  // queries scope by an empty tenant_id and (worst case) leak rows across
+  // tenants. Sem essa guarda, holidays-cache (#263) geraria keys malformadas
+  // (`holidays:v2:A::entidade:2026:standard`) que colidem silenciosamente
+  // entre contextos quebrados.
   // -------------------------------------------------------------------------
-  describe('PR #269 — truthy validation of ctx.tenant_id / ctx.agent_id', () => {
+  describe('PR #272 / #269 — truthy validation of ctx.tenant_id / ctx.agent_id', () => {
     it('getCurrentTenant lança quando tenant_id é string vazia', async () => {
       await runWithTenantContext({ tenant_id: '', agent_id: 'sofia' }, async () => {
         expect(() => getCurrentTenant()).toThrow(MissingTenantContextError);

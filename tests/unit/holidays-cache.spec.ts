@@ -82,6 +82,35 @@ describe('holidays cache', () => {
     ).rejects.toBeInstanceOf(MissingTenantContextError);
   });
 
+  // Issue #263 / PR #272 review — fail-closed on falsy agent_id mesmo COM ctx
+  // (cenário MAJOR do Codex: ALS presente mas malformado → key colidente).
+  it('getApplicableHolidaysSet lança quando agent_id é string vazia (ctx existe)', async () => {
+    await runWithTenantContext({ tenant_id: 'tenantA', agent_id: '' }, async () => {
+      await expect(
+        getApplicableHolidaysSet(2026, { entidadeId: 'e1' }, async () => new Set()),
+      ).rejects.toBeInstanceOf(MissingTenantContextError);
+    });
+  });
+
+  it('getApplicableHolidaysSet lança quando tenant_id é string vazia (ctx existe)', async () => {
+    await runWithTenantContext({ tenant_id: '', agent_id: 'agent-A' }, async () => {
+      await expect(
+        getApplicableHolidaysSet(2026, { entidadeId: 'e1' }, async () => new Set()),
+      ).rejects.toBeInstanceOf(MissingTenantContextError);
+    });
+  });
+
+  it('getApplicableHolidaysSet lança quando agent_id é null (ctx existe)', async () => {
+    await runWithTenantContext(
+      { tenant_id: 'tenantA', agent_id: null as unknown as string },
+      async () => {
+        await expect(
+          getApplicableHolidaysSet(2026, { entidadeId: 'e1' }, async () => new Set()),
+        ).rejects.toBeInstanceOf(MissingTenantContextError);
+      },
+    );
+  });
+
   it('getApplicableHolidaysSet usa agent_id do ALS context na chave', async () => {
     const loader = async (_tenant_id: string) => new Set(['2026-12-25']);
     await runWithTenantContext({ tenant_id: 'tenantA', agent_id: 'agent-X' }, async () => {
