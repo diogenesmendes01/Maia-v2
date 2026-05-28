@@ -73,10 +73,42 @@ interface ProcedureSpec {
  * implementation would skip the tool-arg validation and the
  * tenant-context-resolution guarantees of `computeIdempotencyKey`.
  *
- * Phase 2 of skill-execution will wire `setToolDispatcher` to a bridge over
- * `dispatchTool` (see docs/skill-execution-f1-spec.md §5). Until then,
- * production paths reach tool execution through the agent's main ReAct loop
- * (`src/agent/core.ts`) which goes through `_dispatcher.ts` directly.
+ * **Production enforcement status (PR #273 review iter 2/4):**
+ *
+ * Today, the cache-wrapper contract above is CONTRACTUAL (JSDoc + tests in
+ * `tests/unit/skills/p9a-round2-guard.spec.ts:329`), NOT type-system
+ * enforced. The Codex primary review of PR #273 flagged this as residual
+ * risk; the reval downgraded it to non-blocking on these grounds:
+ *
+ *  1. `setToolDispatcher` is NOT wired in production today. The agent's
+ *     main path (`src/agent/core.ts` → ReAct loop → `dispatchTool`) reaches
+ *     tool execution through `src/tools/_dispatcher.ts:144-152` directly,
+ *     so the tenant+agent-scoped `computeIdempotencyKey` + `idempotencyRepo`
+ *     are always invoked. No customer-facing surface exercises
+ *     `toolDispatcher` yet — the bypass is theoretical until Phase 2.
+ *  2. Tests in `p9a-round2-guard.spec.ts:329-384` pin that the dispatchKey
+ *     passed to a custom dispatcher already carries `tenant_id:agent_id:...`
+ *     in its prefix, so even a non-cache-aware dispatcher CANNOT collide
+ *     cross-tenant by accident on the correlation ID.
+ *
+ * **Phase 2 typed bridge plan (`docs/skill-execution-f1-spec.md §5`):**
+ *
+ * When `tool_mediated` mode goes live (Phase 2 of the skill-execution F1
+ * roll-out), `setToolDispatcher` MUST be wired to a typed bridge over
+ * `dispatchTool` that:
+ *
+ *   (a) accepts a `ToolContext{pessoa, scope, conversa, mensagem_id}` threaded
+ *       in via `ModeContext` (so `dispatchTool` has its required context),
+ *   (b) routes the call through `_dispatcher.ts`'s ID-scoped cache layer
+ *       (NOT directly to a tool's `handler`),
+ *   (c) carries a `side_effects_started` / terminality flag so a failure
+ *       between cache-miss and cache-store cannot cause double execution,
+ *   (d) is the ONLY exported wiring point in production code (a `module.ts`
+ *       boundary; tests can still inject mocks).
+ *
+ * Until Phase 2 ships, this file MUST NOT be reached in production. The
+ * `execution_mode` gate in `src/skills/run-skill.ts` is the kill-switch
+ * (see `docs/skill-execution-f1-spec.md §4.1`).
  */
 export interface ToolDispatcher {
   (

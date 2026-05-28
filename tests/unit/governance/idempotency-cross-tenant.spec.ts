@@ -431,6 +431,88 @@ describe('Issue #261 — computeIdempotencyKey folds tenant_id+agent_id into the
     );
     expect(k1).toBe(k2);
   });
+
+  // ── PR #273 review iter 2/4 — delimiter aliasing (defense in depth) ──────
+  //
+  // The Codex primary reviewer flagged that `[...].join('|')` could alias
+  // pairs if `'|'` were present in `tenant_id`/`agent_id`. The reval refuted
+  // this with evidence: admin UI restricts tenant/agent IDs to
+  // `[a-z0-9_-]` (`src/admin-ui/trpc/routers/{tenants,agents}.ts:25-29/37-41`)
+  // — `'|'` cannot appear in production.
+  //
+  // STILL, `runWithTenantContext` accepts arbitrary strings (see
+  // `src/db/tenant-context.ts:24-29`). If a future caller bypasses the admin
+  // UI (e.g. a test harness, a future router, a misconfigured fixture) and
+  // injects `'|'` (or any URI-reserved char) into the tenant context, the
+  // hash MUST still distinguish tuples — same defense-in-depth contract as
+  // `idempotencyRepo.lookup`/`.store`.
+  //
+  // Fix applied in PR #273: `computeIdempotencyKey` `encodeURIComponent`s each
+  // segment before joining. This pin proves the encoder is in place so the
+  // adversarial collision (which the admin UI today prevents anyway) does
+  // not regress.
+  it('DELIMITER ALIASING — adversarial tenant/agent with literal `|` MUST NOT alias to a real pair', async () => {
+    // Adversarial setup. If `computeIdempotencyKey` joined raw segments with
+    // `'|'`, these two tuples would produce the SAME hash input:
+    //   - tenant='alpha|beta', agent='gamma' → "alpha|beta|gamma|..."
+    //   - tenant='alpha',      agent='beta|gamma' → "alpha|beta|gamma|..."
+    // The encoder makes them distinct:
+    //   - "alpha%7Cbeta|gamma|..." vs "alpha|beta%7Cgamma|..."
+    const { computeIdempotencyKey } = await import('@/governance/idempotency.js');
+    const kAliased = await runWithTenantContext(
+      { tenant_id: 'alpha|beta', agent_id: 'gamma' },
+      async () => computeIdempotencyKey({ ...baseInput, timestamp: fixedTs }),
+    );
+    const kReal = await runWithTenantContext(
+      { tenant_id: 'alpha', agent_id: 'beta|gamma' },
+      async () => computeIdempotencyKey({ ...baseInput, timestamp: fixedTs }),
+    );
+    expect(kAliased).not.toBe(kReal);
+  });
+
+  it('DELIMITER ALIASING (file branch) — adversarial `|` in tenant/agent MUST NOT alias on file path', async () => {
+    const { computeIdempotencyKey } = await import('@/governance/idempotency.js');
+    const fileInput = {
+      pessoa_id: 'a',
+      entity_id: 'b',
+      tool_name: 'parse_boleto',
+      operation_type: 'parse_only',
+      payload: {},
+      file_sha256: 'sha-abc',
+      timestamp: fixedTs,
+    };
+    const kAliased = await runWithTenantContext(
+      { tenant_id: 'alpha|beta', agent_id: 'gamma' },
+      async () => computeIdempotencyKey(fileInput),
+    );
+    const kReal = await runWithTenantContext(
+      { tenant_id: 'alpha', agent_id: 'beta|gamma' },
+      async () => computeIdempotencyKey(fileInput),
+    );
+    expect(kAliased).not.toBe(kReal);
+  });
+
+  // ── PR #273 review iter 2/4 — mutation kill gap (reval finding) ──────────
+  //
+  // The cross-tenant tests above used A=tenant-A/agent-A and B=tenant-B/agent-B.
+  // A mutant that omits ONLY the `tenant_id` from the hash (keeping agent_id)
+  // would still see different agents (agent-A vs agent-B) and pass.
+  // Add a case where the agent_id is held CONSTANT across tenants so the
+  // mutation surfaces.
+  it('CROSS-TENANT (mutation kill) — tenant-A/agent-X vs tenant-B/agent-X → DIFFERENT keys', async () => {
+    const { computeIdempotencyKey } = await import('@/governance/idempotency.js');
+    const tenantA_agentX = { tenant_id: 'tenant-A', agent_id: 'agent-X' };
+    const tenantB_agentX = { tenant_id: 'tenant-B', agent_id: 'agent-X' };
+    const kA = await runWithTenantContext(tenantA_agentX, async () =>
+      computeIdempotencyKey({ ...baseInput, timestamp: fixedTs }),
+    );
+    const kB = await runWithTenantContext(tenantB_agentX, async () =>
+      computeIdempotencyKey({ ...baseInput, timestamp: fixedTs }),
+    );
+    // If a mutant drops tenant_id from the hash, kA === kB; this pin kills
+    // that mutation because agent_id is held constant.
+    expect(kA).not.toBe(kB);
+  });
 });
 
 // ===========================================================================
