@@ -12,8 +12,43 @@ export function uuid(): string {
   return randomUUID();
 }
 
-export function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
+/**
+ * Sleep for `ms` milliseconds. When `signal` is provided, the wait is
+ * cancellable: an abort clears the timer and rejects with an AbortError-
+ * shaped exception so callers can short-circuit instead of waiting the
+ * full backoff out. Mirrors the `abortableSleep` pattern from
+ * `src/lib/claude.ts` so retry loops elsewhere can reuse this helper
+ * without each rolling its own timer/listener bookkeeping.
+ *
+ * If the signal is already aborted on entry, we reject synchronously
+ * without scheduling any timer. The `name = 'AbortError'` on the rejected
+ * Error matches what `AbortSignal.throwIfAborted()` emits, so callers
+ * that use `err.name === 'AbortError'` discriminate cancellation from
+ * generic failures (Issue #256 — KSM.revoke cancellation).
+ */
+export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      const err = new Error('sleep_aborted', { cause: signal.reason });
+      err.name = 'AbortError';
+      reject(err);
+      return;
+    }
+    let onAbort: (() => void) | null = null;
+    const timer = setTimeout(() => {
+      if (onAbort && signal) signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    if (signal) {
+      onAbort = () => {
+        clearTimeout(timer);
+        const err = new Error('sleep_aborted', { cause: signal.reason });
+        err.name = 'AbortError';
+        reject(err);
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+  });
 }
 
 export function bucket5min(date: Date | number): string {
