@@ -363,9 +363,31 @@ async function handleIncoming(msg: proto.IWebMessageInfo): Promise<void> {
   // signal to process immediately, and aggregating media + text in one turn
   // would require reshaping extractContent and several agent-core branches
   // — out of scope for this change.
+  //
+  // FAIL-CLOSED CONTRACT (PR #259 review, MAJOR A second half):
+  //   When `scheduleDebouncedAgent` throws (Redis down, BullMQ blip, or
+  //   tenant-context error), we MUST NOT fall through to
+  //   `enqueueAgent` for the immediate (non-debounced) path. Doing so
+  //   re-creates the very bypass the tenant-scoped debounce key was
+  //   designed to prevent: `enqueueAgent` uses a different namespace
+  //   contract (`process-message` vs. `process-message-debounced`) and
+  //   issuing an unscoped job during a Redis outage on a shared phone
+  //   number would replay tenant A's pending message under tenant B's
+  //   context once Redis recovered. The message is preserved in
+  //   `mensagensRepo` (the inbound is already persisted upstream of this
+  //   block at line 333), so the next message under the same conversa
+  //   will trigger aggregation and the agent will pick up the stranded
+  //   inbound — no data loss, just delayed processing during the blip.
+  //   The metric / log here is the signal an operator uses to surface
+  //   the outage.
   if (config.FEATURE_MESSAGE_DEBOUNCE && type === 'texto') {
     try {
-      const result = await scheduleDebouncedAgent({ key: tel, mensagem_id: stored.id });
+      // `phone` (the user's tel) feeds the tenant-scoped debounce identity.
+      // The composite key (`${tenant_id}:${agent_id}:${phone}`) is derived
+      // inside `scheduleDebouncedAgent` from the ALS tenant context that
+      // `messages.upsert` installs above — so a shared phone across two
+      // tenants gets two INDEPENDENT debouncers (issue #248).
+      const result = await scheduleDebouncedAgent({ phone: tel, mensagem_id: stored.id });
       logger.info(
         {
           mensagem_id: stored.id,
@@ -377,13 +399,31 @@ async function handleIncoming(msg: proto.IWebMessageInfo): Promise<void> {
       );
       return;
     } catch (err) {
-      // Redis/BullMQ hiccup → fall through to immediate enqueue so the
-      // message isn't lost. The aggregation step in the agent worker is
-      // forgiving: it picks up unprocessed siblings either way.
+      // FAIL-CLOSED: stop here. The message is already persisted in
+      // `mensagensRepo` and `aggregateUnprocessedTexts` will sweep it
+      // up on the next debounce cycle (or when the operator restores
+      // Redis). Do NOT silently bypass the tenant-scoped debounce by
+      // dropping to `enqueueAgent` — see contract block above.
+      const errCode = (err as { code?: string }).code;
       logger.warn(
-        { err: (err as Error).message, mensagem_id: stored.id },
-        'baileys.debounce_failed_fallback_immediate',
+        {
+          err: (err as Error).message,
+          err_code: errCode,
+          mensagem_id: stored.id,
+          tel: '[REDACTED]',
+          // Distinguishing the two main failure modes lets ops alerts
+          // route correctly: REDIS_UNAVAILABLE is infrastructure (page),
+          // MISSING_TENANT_CONTEXT is a deploy regression (revert).
+          failure_class:
+            errCode === 'DEBOUNCER_REDIS_UNAVAILABLE'
+              ? 'redis_unavailable'
+              : errCode === 'MISSING_TENANT_CONTEXT'
+                ? 'tenant_context_missing'
+                : 'other',
+        },
+        'baileys.debounce_failed_fail_closed',
       );
+      return;
     }
   }
 
