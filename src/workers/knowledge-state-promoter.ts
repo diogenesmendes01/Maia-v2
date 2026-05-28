@@ -139,6 +139,25 @@ async function promote(args: {
         await runWithTenantContext(
           { tenant_id: row.tenant_id, agent_id: row.agent_id },
           async () => {
+            // Issue #255 Codex review (MAJOR) — preserve error identity
+            // across the runCognitiveModule boundary. The runner catches
+            // the inner throw, classifies it as status='error'|'timeout',
+            // and DOES NOT re-throw — so by the time `rowResult.status`
+            // is observed the original Error object (e.g.
+            // `IllegalTransitionError` from a parallel-promote race) is
+            // unreachable. Without capturing it here, the outer catch's
+            // `err instanceof IllegalTransitionError` branch (used to
+            // mark benign races as debug-skip) becomes dead code and
+            // every race increments `stats.errors`.
+            //
+            // We close over `capturedError` inside the inner callback,
+            // assign the real thrown object there, and re-throw it after
+            // runCognitiveModule returns. Status='timeout' (no error
+            // ever thrown — the runner generated the 'timeout' message
+            // itself) falls back to a synthetic Error so audit
+            // attribution still lands and the outer catch logs it
+            // through the normal "transition_failed" path.
+            let capturedError: unknown = null;
             const rowResult = await runCognitiveModule(
               {
                 name: 'knowledge-state-machine.auto-promoter.row',
@@ -153,21 +172,33 @@ async function promote(args: {
                 timeoutMs: 10_000,
                 audit: true,
               },
-              () =>
-                KnowledgeStateMachine.transition({
-                  kind,
-                  proposal_id: row.id,
-                  to: args.to,
-                  reason: args.reason,
-                  decided_by: args.decided_by,
-                }),
+              async () => {
+                try {
+                  return await KnowledgeStateMachine.transition({
+                    kind,
+                    proposal_id: row.id,
+                    to: args.to,
+                    reason: args.reason,
+                    decided_by: args.decided_by,
+                  });
+                } catch (err) {
+                  // Capture BEFORE the runner swallows the throw so the
+                  // outer catch can pattern-match on `IllegalTransitionError`
+                  // (parallel-promote race = benign) vs everything else.
+                  capturedError = err;
+                  throw err;
+                }
+              },
             );
-            // Surface inner timeout/error as a thrown error so the
-            // outer try/catch can classify it the same way it always
-            // did (IllegalTransitionError-vs-other) and update
-            // stats.errors. `runCognitiveModule` swallows the throw and
-            // exposes status, so we re-raise here.
+            // Re-raise the original error if transition() threw — keeps
+            // IllegalTransitionError identity intact for the outer catch.
+            // Timeout case: runCognitiveModule synthesizes its own
+            // 'timeout' Error in the race; nothing was captured, so we
+            // surface a synthetic Error tagged with the timeout reason.
             if (rowResult.status === 'error' || rowResult.status === 'timeout') {
+              if (capturedError !== null) {
+                throw capturedError;
+              }
               throw new Error(
                 `auto_promoter_row_${rowResult.status}` +
                   (rowResult.fallback_triggered ? ':fallback_triggered' : ''),
