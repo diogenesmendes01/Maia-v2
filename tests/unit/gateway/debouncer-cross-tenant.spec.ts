@@ -72,9 +72,14 @@ const redisStub = {
   }),
 };
 
+// Mutable flag so individual tests can toggle Redis to "disconnected"
+// without re-importing the debouncer (which would reset the ALS store
+// and break the tenant-context propagation under test).
+const redisConnected = { value: true };
+
 vi.mock('@/lib/redis.js', () => ({
   redis: redisStub,
-  isRedisConnected: () => true,
+  isRedisConnected: () => redisConnected.value,
 }));
 
 vi.mock('@/lib/logger.js', () => ({
@@ -140,6 +145,15 @@ const AGENT_B = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
 // support line; both Maias receive the same inbound.
 const SHARED_PHONE = '+5511999999999';
 
+/**
+ * URI-encoding wrapper to mirror the production `buildKey` segment encoding
+ * adopted in the PR #259 review (pattern from #257 `_vision-cache.ts` /
+ * #258 `bot-detection.ts`). Tests assert on encoded forms so the `+` in a
+ * phone (E.164) becomes `%2B` — anything else means the test is checking
+ * a key the production code no longer emits.
+ */
+const enc = encodeURIComponent;
+
 function keysOf(op: string): string[] {
   return redisCalls.filter((c) => c.op === op).map((c) => c.key);
 }
@@ -155,9 +169,30 @@ function reset(): void {
   redisStub.get.mockClear();
   redisStub.set.mockClear();
   redisStub.del.mockClear();
+  redisStub.get.mockImplementation(async (key: string, ...args: unknown[]) => {
+    redisCalls.push({ op: 'get', key, args });
+    return redisStore.get(key) ?? null;
+  });
+  redisStub.set.mockImplementation(async (key: string, value: string, ...args: unknown[]) => {
+    redisCalls.push({ op: 'set', key, args: [value, ...args] });
+    redisStore.set(key, value);
+    return 'OK';
+  });
+  redisStub.del.mockImplementation(async (key: string, ...args: unknown[]) => {
+    redisCalls.push({ op: 'del', key, args });
+    const had = redisStore.delete(key);
+    return had ? 1 : 0;
+  });
   queueGetJob.mockClear();
   queueGetJob.mockResolvedValue(null);
   queueAdd.mockClear();
+  queueAdd.mockImplementation(async (name: string, data: unknown, opts: { jobId: string } & Record<string, unknown>) => {
+    queueAdds.push({ name, data, opts });
+    return undefined;
+  });
+  // Restore Redis "connected" default — Redis-down tests flip this and
+  // beforeEach must reset it for sibling tests.
+  redisConnected.value = true;
 }
 
 describe('issue #248 — debouncer keys are tenant+agent scoped', () => {
@@ -189,11 +224,12 @@ describe('issue #248 — debouncer keys are tenant+agent scoped', () => {
 
       // Each scheduleDebouncedAgent emits one `get` (readState) + one
       // `set` (writeState). With independent keys we expect the SET-key
-      // for tenant A and tenant B to differ.
+      // for tenant A and tenant B to differ. Each segment is URI-encoded
+      // (PR #259 review, mirrors #257/#258 `buildKey`).
       const setKeys = keysOf('set');
       expect(setKeys).toHaveLength(2);
-      const expectedA = `agent-debounce:${TENANT_A}:${AGENT_A}:${SHARED_PHONE}`;
-      const expectedB = `agent-debounce:${TENANT_B}:${AGENT_B}:${SHARED_PHONE}`;
+      const expectedA = `agent-debounce:${enc(TENANT_A)}:${enc(AGENT_A)}:${enc(SHARED_PHONE)}`;
+      const expectedB = `agent-debounce:${enc(TENANT_B)}:${enc(AGENT_B)}:${enc(SHARED_PHONE)}`;
       expect(setKeys[0]).toBe(expectedA);
       expect(setKeys[1]).toBe(expectedB);
       expect(setKeys[0]).not.toBe(setKeys[1]);
@@ -228,8 +264,8 @@ describe('issue #248 — debouncer keys are tenant+agent scoped', () => {
 
       const jobIds = jobIdsAdded();
       expect(jobIds).toHaveLength(2);
-      expect(jobIds[0]).toBe(`debounce:${TENANT_A}:${AGENT_A}:${SHARED_PHONE}`);
-      expect(jobIds[1]).toBe(`debounce:${TENANT_B}:${AGENT_B}:${SHARED_PHONE}`);
+      expect(jobIds[0]).toBe(`debounce:${enc(TENANT_A)}:${enc(AGENT_A)}:${enc(SHARED_PHONE)}`);
+      expect(jobIds[1]).toBe(`debounce:${enc(TENANT_B)}:${enc(AGENT_B)}:${enc(SHARED_PHONE)}`);
       expect(jobIds[0]).not.toBe(jobIds[1]);
     });
   });
@@ -259,13 +295,13 @@ describe('issue #248 — debouncer keys are tenant+agent scoped', () => {
 
       const setKeys = keysOf('set');
       expect(setKeys).toHaveLength(2);
-      expect(setKeys[0]).toBe(`agent-debounce:${TENANT_B}:${AGENT_B}:${SHARED_PHONE}`);
-      expect(setKeys[1]).toBe(`agent-debounce:${TENANT_A}:${AGENT_A}:${SHARED_PHONE}`);
+      expect(setKeys[0]).toBe(`agent-debounce:${enc(TENANT_B)}:${enc(AGENT_B)}:${enc(SHARED_PHONE)}`);
+      expect(setKeys[1]).toBe(`agent-debounce:${enc(TENANT_A)}:${enc(AGENT_A)}:${enc(SHARED_PHONE)}`);
       expect(setKeys[0]).not.toBe(setKeys[1]);
 
       const jobIds = jobIdsAdded();
-      expect(jobIds[0]).toBe(`debounce:${TENANT_B}:${AGENT_B}:${SHARED_PHONE}`);
-      expect(jobIds[1]).toBe(`debounce:${TENANT_A}:${AGENT_A}:${SHARED_PHONE}`);
+      expect(jobIds[0]).toBe(`debounce:${enc(TENANT_B)}:${enc(AGENT_B)}:${enc(SHARED_PHONE)}`);
+      expect(jobIds[1]).toBe(`debounce:${enc(TENANT_A)}:${enc(AGENT_A)}:${enc(SHARED_PHONE)}`);
       expect(jobIds[0]).not.toBe(jobIds[1]);
     });
 
@@ -291,8 +327,9 @@ describe('issue #248 — debouncer keys are tenant+agent scoped', () => {
 
       const setKeys = keysOf('set');
       expect(setKeys).toHaveLength(2);
-      expect(setKeys[0]).toContain(`:${AGENT_A}:`);
-      expect(setKeys[1]).toContain(`:${AGENT_B}:`);
+      // Encoded agent_id segments (URI-safe UUIDs are unchanged by enc).
+      expect(setKeys[0]).toContain(`:${enc(AGENT_A)}:`);
+      expect(setKeys[1]).toContain(`:${enc(AGENT_B)}:`);
       expect(setKeys[0]).not.toBe(setKeys[1]);
     });
   });
@@ -394,8 +431,8 @@ describe('issue #248 — debouncer keys are tenant+agent scoped', () => {
       // (a) Both tenants emitted exactly one `add` each.
       expect(queueAdd).toHaveBeenCalledTimes(2);
       const jobIds = jobIdsAdded();
-      const expectedAJob = `debounce:${TENANT_A}:${AGENT_A}:${SHARED_PHONE}`;
-      const expectedBJob = `debounce:${TENANT_B}:${AGENT_B}:${SHARED_PHONE}`;
+      const expectedAJob = `debounce:${enc(TENANT_A)}:${enc(AGENT_A)}:${enc(SHARED_PHONE)}`;
+      const expectedBJob = `debounce:${enc(TENANT_B)}:${enc(AGENT_B)}:${enc(SHARED_PHONE)}`;
       expect(jobIds).toContain(expectedAJob);
       expect(jobIds).toContain(expectedBJob);
 
@@ -407,18 +444,18 @@ describe('issue #248 — debouncer keys are tenant+agent scoped', () => {
       // (c) The Redis state keys also diverge — independent debounce
       // windows that won't suppress each other on the next message.
       const setKeys = new Set(keysOf('set'));
-      expect(setKeys.has(`agent-debounce:${TENANT_A}:${AGENT_A}:${SHARED_PHONE}`)).toBe(true);
-      expect(setKeys.has(`agent-debounce:${TENANT_B}:${AGENT_B}:${SHARED_PHONE}`)).toBe(true);
+      expect(setKeys.has(`agent-debounce:${enc(TENANT_A)}:${enc(AGENT_A)}:${enc(SHARED_PHONE)}`)).toBe(true);
+      expect(setKeys.has(`agent-debounce:${enc(TENANT_B)}:${enc(AGENT_B)}:${enc(SHARED_PHONE)}`)).toBe(true);
     });
 
     it('a stale tenant-B state is UNREACHABLE from a tenant-A read (post-fix)', async () => {
       // Adversarial: pre-fix, tenant B could leave a stale state row
       // under the phone-only key that tenant A would then read on its
       // next message and treat as a same-window reset. Post-fix, the
-      // read key is `${TENANT_A}:${AGENT_A}:${phone}` — a stale entry
-      // under `${TENANT_B}:${AGENT_B}:${phone}` is in a different
-      // namespace and invisible.
-      const staleB = `agent-debounce:${TENANT_B}:${AGENT_B}:${SHARED_PHONE}`;
+      // read key is `${enc(TENANT_A)}:${enc(AGENT_A)}:${enc(phone)}` — a
+      // stale entry under `${enc(TENANT_B)}:${enc(AGENT_B)}:${enc(phone)}`
+      // is in a different namespace and invisible.
+      const staleB = `agent-debounce:${enc(TENANT_B)}:${enc(AGENT_B)}:${enc(SHARED_PHONE)}`;
       redisStore.set(staleB, JSON.stringify({ first_enqueued_at: Date.now() - 1500 }));
 
       const result = await runWithTenantContext(
@@ -440,7 +477,7 @@ describe('issue #248 — debouncer keys are tenant+agent scoped', () => {
       }
 
       // The read tenant A issued targeted tenant A's namespace.
-      const tenantAGetKey = `agent-debounce:${TENANT_A}:${AGENT_A}:${SHARED_PHONE}`;
+      const tenantAGetKey = `agent-debounce:${enc(TENANT_A)}:${enc(AGENT_A)}:${enc(SHARED_PHONE)}`;
       expect(keysOf('get')).toEqual([tenantAGetKey]);
     });
   });
@@ -457,12 +494,252 @@ describe('issue #248 — debouncer keys are tenant+agent scoped', () => {
   // for a clear failure message).
   // -------------------------------------------------------------------------
   describe('scopedKey composition', () => {
-    it('produces `${tenant_id}:${agent_id}:${phone}` under a given context', async () => {
+    it('produces `${enc(tenant_id)}:${enc(agent_id)}:${enc(phone)}` under a given context', async () => {
       const scoped = await runWithTenantContext(
         { tenant_id: TENANT_A, agent_id: AGENT_A },
         async () => _internal.scopedKey(SHARED_PHONE),
       );
-      expect(scoped).toBe(`${TENANT_A}:${AGENT_A}:${SHARED_PHONE}`);
+      expect(scoped).toBe(`${enc(TENANT_A)}:${enc(AGENT_A)}:${enc(SHARED_PHONE)}`);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // 6) Aliasing-safe key encoding (PR #259 review, mirrors PR #257/#258
+  //    `buildKey` pattern). Each segment is URI-encoded, so a tenant slug
+  //    or agent slug containing `:` cannot collide with a tuple where a
+  //    later segment starts with the same prefix.
+  // -------------------------------------------------------------------------
+  describe('aliasing-safe key encoding (buildKey pattern)', () => {
+    it('tenant_id containing `:` is URI-encoded so it cannot alias another tuple', async () => {
+      // Adversarial: a tenant slug `acme:dev` with a normal agent `prod`
+      // must NOT produce the same key as tenant `acme` + agent `dev:prod`
+      // — otherwise the `:` delimiter would let a crafted slug collapse
+      // two distinct tenant/agent buckets into one. `tenants.id` is
+      // TEXT PRIMARY KEY (free-form slug; see migration
+      // 007_p0_tenants_agents.sql).
+      await runWithTenantContext(
+        { tenant_id: 'acme:dev', agent_id: 'prod' },
+        async () => {
+          await scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'm1' });
+        },
+      );
+      const keyA = keysOf('set')[0];
+
+      // Reset between the two scenarios so we can compare cleanly.
+      redisCalls.length = 0;
+      redisStore.clear();
+      queueAdds.length = 0;
+      redisStub.get.mockClear();
+      redisStub.set.mockClear();
+      queueAdd.mockClear();
+
+      await runWithTenantContext(
+        { tenant_id: 'acme', agent_id: 'dev:prod' },
+        async () => {
+          await scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'm2' });
+        },
+      );
+      const keyB = keysOf('set')[0];
+
+      expect(keyA).toBeDefined();
+      expect(keyB).toBeDefined();
+      expect(keyA).not.toBe(keyB);
+      // Concrete pinned forms — `:` inside a segment is `%3A`.
+      expect(keyA).toBe(`agent-debounce:acme%3Adev:prod:${enc(SHARED_PHONE)}`);
+      expect(keyB).toBe(`agent-debounce:acme:dev%3Aprod:${enc(SHARED_PHONE)}`);
+    });
+
+    it('phone containing `:` is URI-encoded (defense-in-depth, future-proof)', async () => {
+      // Phones in production are E.164 (`+5511…`) and would not contain
+      // `:`. But a future caller may pass a free-form WhatsApp lid
+      // (`12345@s.whatsapp.net`) or a synthetic id with delimiters —
+      // encoding the phone segment makes the rule "every segment is
+      // encoded" uniform.
+      const weirdPhone = 'lid:12345@whatsapp';
+      await runWithTenantContext(
+        { tenant_id: TENANT_A, agent_id: AGENT_A },
+        async () => {
+          await scheduleDebouncedAgent({ phone: weirdPhone, mensagem_id: 'm1' });
+        },
+      );
+      const key = keysOf('set')[0];
+      expect(key).toBe(`agent-debounce:${enc(TENANT_A)}:${enc(AGENT_A)}:${enc(weirdPhone)}`);
+      // `:` inside the phone is encoded, so the key has exactly the right
+      // number of `:` separators (3 after the `agent-debounce` prefix).
+      expect(key?.split(':').length).toBe(4);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // 7) Malformed-context guard (PR #259 review, MAJOR B): a context object
+  //    with empty / whitespace-only / surround-whitespace tenant_id or
+  //    agent_id MUST throw at `scopedKey()`, BEFORE we compose any key or
+  //    touch Redis. The merge base of this branch does not include
+  //    `assertTruthyContext` from `tenant-context.ts` (commit c01c9c0 on
+  //    a sibling branch), so we test the local `assertScopeSegment`
+  //    equivalent embedded in `debouncer.ts`.
+  // -------------------------------------------------------------------------
+  describe('malformed context (empty / whitespace tenant or agent segment)', () => {
+    it('empty tenant_id throws MissingTenantContextError and emits zero side-effects', async () => {
+      await expect(
+        runWithTenantContext(
+          { tenant_id: '', agent_id: AGENT_A },
+          async () => scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'm' }),
+        ),
+      ).rejects.toThrow(MissingTenantContextError);
+
+      expect(redisStub.get).not.toHaveBeenCalled();
+      expect(redisStub.set).not.toHaveBeenCalled();
+      expect(queueAdd).not.toHaveBeenCalled();
+    });
+
+    it('whitespace-only agent_id throws MissingTenantContextError', async () => {
+      await expect(
+        runWithTenantContext(
+          { tenant_id: TENANT_A, agent_id: '   ' },
+          async () => scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'm' }),
+        ),
+      ).rejects.toThrow(MissingTenantContextError);
+
+      expect(queueAdd).not.toHaveBeenCalled();
+    });
+
+    it('surrounding-whitespace tenant_id throws (no implicit trim)', async () => {
+      // `' acme '` is intentionally rejected, not implicitly trimmed —
+      // cache keys would alias `' acme '` against `'acme'` for some
+      // codepaths but not others, hiding the upstream bug. Same rule as
+      // the project-wide `assertTruthyContext` in `tenant-context.ts`.
+      await expect(
+        runWithTenantContext(
+          { tenant_id: ' acme ', agent_id: AGENT_A },
+          async () => scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'm' }),
+        ),
+      ).rejects.toThrow(MissingTenantContextError);
+    });
+
+    it('null tenant_id (cast through `as any`) throws MissingTenantContextError', async () => {
+      await expect(
+        runWithTenantContext(
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          { tenant_id: null as any, agent_id: AGENT_A },
+          async () => scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'm' }),
+        ),
+      ).rejects.toThrow(MissingTenantContextError);
+
+      // CRITICAL: no `undefined:agent_id:phone` key escaped to Redis.
+      expect(redisStub.set).not.toHaveBeenCalled();
+      expect(queueAdd).not.toHaveBeenCalled();
+    });
+
+    it('clearDebounceState also enforces the malformed-context guard', async () => {
+      await expect(
+        runWithTenantContext(
+          { tenant_id: '', agent_id: AGENT_A },
+          async () => clearDebounceState(SHARED_PHONE),
+        ),
+      ).rejects.toThrow(MissingTenantContextError);
+      expect(redisStub.del).not.toHaveBeenCalled();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // 8) Redis-down fail-closed (PR #259 review, MAJOR A + MAJOR C). Pre-fix,
+  //    `readState`/`writeState`/`clearState` returned null/void early when
+  //    `isRedisConnected()` was false. The caller (`baileys.ts:362-393`)
+  //    catches throws and falls through to immediate enqueue, so a Redis
+  //    blip combined with the early-return silently bypassed the
+  //    tenant-scoped debounce window. Post-fix: each helper throws
+  //    `DebouncerRedisUnavailableError` and the caller's catch is the
+  //    EXPLICIT bypass decision, not an accident.
+  // -------------------------------------------------------------------------
+  describe('Redis-down fail-closed contract', () => {
+    it('scheduleDebouncedAgent throws DebouncerRedisUnavailableError when Redis is down', async () => {
+      // Flip the mutable flag so `isRedisConnected()` returns false for
+      // this test only — much safer than `vi.doMock + vi.resetModules`,
+      // which would also reset the AsyncLocalStorage store (and break
+      // the `runWithTenantContext` propagation under test).
+      redisConnected.value = false;
+
+      await expect(
+        runWithTenantContext(
+          { tenant_id: TENANT_A, agent_id: AGENT_A },
+          async () => scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'm' }),
+        ),
+      ).rejects.toMatchObject({
+        name: 'DebouncerRedisUnavailableError',
+        code: 'DEBOUNCER_REDIS_UNAVAILABLE',
+      });
+
+      // Side-effects: readState throws BEFORE we ever touch BullMQ, so
+      // there's no half-committed state (no jobId enqueued without a
+      // companion Redis state row).
+      expect(redisStub.get).not.toHaveBeenCalled();
+      expect(redisStub.set).not.toHaveBeenCalled();
+      expect(queueGetJob).not.toHaveBeenCalled();
+      expect(queueAdd).not.toHaveBeenCalled();
+    });
+
+    it('clearDebounceState throws DebouncerRedisUnavailableError when Redis is down', async () => {
+      redisConnected.value = false;
+
+      await expect(
+        runWithTenantContext(
+          { tenant_id: TENANT_A, agent_id: AGENT_A },
+          async () => clearDebounceState(SHARED_PHONE),
+        ),
+      ).rejects.toMatchObject({
+        name: 'DebouncerRedisUnavailableError',
+        code: 'DEBOUNCER_REDIS_UNAVAILABLE',
+      });
+      expect(redisStub.del).not.toHaveBeenCalled();
+    });
+
+    it('queue.add failure inside scheduleDebouncedAgent re-throws (no silent swallow)', async () => {
+      // Redis is up, but BullMQ blips on `add`. Pre-fix MAJOR D: the
+      // `await agentQueue.add(...)` ran outside any local try/catch, so
+      // the rejection propagated AND left state in an inconsistent
+      // shape (writeState had not yet run). Post-fix: the outer
+      // try/catch logs `debounce.schedule_failed` then re-throws so the
+      // caller can pick a fallback policy.
+      queueAdd.mockImplementationOnce(async () => {
+        throw new Error('bullmq blip');
+      });
+
+      await expect(
+        runWithTenantContext(
+          { tenant_id: TENANT_A, agent_id: AGENT_A },
+          async () => scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'm' }),
+        ),
+      ).rejects.toThrow('bullmq blip');
+
+      // writeState must NOT have run — the failure on `add` interrupted
+      // the sequence before the state stamp, so we don't leave a state
+      // row pointing at a nonexistent job.
+      expect(redisStub.set).not.toHaveBeenCalled();
+    });
+
+    it('writeState failure after a successful queue.add re-throws (state inconsistency surfaced)', async () => {
+      // The OTHER half of MAJOR D: writeState (which runs LAST) blowing
+      // up. Pre-fix, the throw went straight to the caller as an
+      // unhandled rejection — and the BullMQ job was already armed,
+      // so the next message would still find a job to remove, but
+      // there's no state row to drive the heldMs / max-hold logic.
+      // Post-fix, the outer try/catch logs the failure (attribution
+      // visible in `debounce.schedule_failed`) and re-throws.
+      redisStub.set.mockImplementationOnce(async () => {
+        throw new Error('redis set blip');
+      });
+
+      await expect(
+        runWithTenantContext(
+          { tenant_id: TENANT_A, agent_id: AGENT_A },
+          async () => scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'm' }),
+        ),
+      ).rejects.toThrow('redis set blip');
+
+      // BullMQ `add` ran (the failure was on the FOLLOWING writeState),
+      // proving the test exercises the post-add path.
+      expect(queueAdd).toHaveBeenCalledTimes(1);
     });
   });
 });

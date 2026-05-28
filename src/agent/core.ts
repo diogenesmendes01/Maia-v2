@@ -15,7 +15,7 @@ import { handleQuarantineFirstContact, handleOwnerIdentityReply } from '@/identi
 import { config } from '@/config/env.js';
 import { featureFlags } from '@/config/feature-flags.js';
 import { FeatureFlagName } from '@/types/enums.js';
-import { clearDebounceState } from '@/gateway/debouncer.js';
+import { clearDebounceState as clearDebounceStateRaw } from '@/gateway/debouncer.js';
 import { buildPrompt } from './prompt-builder.js';
 import { hashScope } from './scope-hash.js';
 import { logger } from '@/lib/logger.js';
@@ -201,6 +201,39 @@ async function probeMessageForChannel(
     return { channel_type: 'whatsapp', external_id: tel };
   } catch {
     return null;
+  }
+}
+
+/**
+ * Best-effort `clearDebounceState` wrapper for the post-turn cleanup
+ * callsites in this file. The debouncer's fail-closed contract (PR #259
+ * review) means `clearDebounceState` THROWS on a Redis blip — exactly
+ * the right behavior at the SCHEDULE entry-point (caller in
+ * `baileys.ts` must stop, not silently bypass the tenant-scoped
+ * debounce). At the CLEAR-after-turn callsites in core.ts, however, the
+ * agent has already done its work: dispatched the reply, persisted state,
+ * audited the turn. Propagating the throw here would only cause BullMQ
+ * to retry the entire turn (idempotent thanks to the dispatched-message
+ * dedup, but wasteful) and the next debounce window self-heals via the
+ * 10-minute Redis TTL on the state key.
+ *
+ * Swallow the throw + log it, so a Redis outage during cleanup is
+ * visible to operators (via `agent.clear_debounce_failed`) without
+ * cratering the turn. Schedule-path callers (`scheduleDebouncedAgent`)
+ * must NOT use this wrapper.
+ */
+async function clearDebounceState(phone: string): Promise<void> {
+  try {
+    await clearDebounceStateRaw(phone);
+  } catch (err) {
+    logger.warn(
+      {
+        err: (err as Error).message,
+        err_code: (err as { code?: string }).code,
+        phone: '[REDACTED]',
+      },
+      'agent.clear_debounce_failed',
+    );
   }
 }
 

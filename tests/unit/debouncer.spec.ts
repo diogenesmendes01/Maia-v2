@@ -59,13 +59,16 @@ import {
 } from '../../src/gateway/debouncer.js';
 import { runWithTenantContext } from '../../src/db/tenant-context.js';
 
-// Issue #248 — debounce keys are now namespaced by `${tenant_id}:${agent_id}:${phone}`.
-// All non-throw tests run inside a tenant context; missing-context behaviour
-// has its own dedicated spec in `tests/unit/gateway/debouncer-cross-tenant.spec.ts`.
+// Issue #248 — debounce keys are now namespaced by
+// `${enc(tenant_id)}:${enc(agent_id)}:${enc(phone)}` (PR #259 review,
+// adopts URI-encoding pattern from #257/#258). All non-throw tests run
+// inside a tenant context; missing-context + Redis-down behaviour has its
+// own dedicated spec in `tests/unit/gateway/debouncer-cross-tenant.spec.ts`.
 const T = 'default';
 const A = 'default';
 const PHONE = '+5511999999999';
-const SCOPED = `${T}:${A}:${PHONE}`;
+const enc = encodeURIComponent;
+const SCOPED = `${enc(T)}:${enc(A)}:${enc(PHONE)}`;
 const withCtx = <R>(fn: () => Promise<R>): Promise<R> =>
   runWithTenantContext({ tenant_id: T, agent_id: A }, fn);
 
@@ -154,23 +157,53 @@ describe('debouncer.scheduleDebouncedAgent', () => {
     expect(h.queueAdd).not.toHaveBeenCalled();
   });
 
-  it('redis disconnected: still schedules job (state best-effort)', async () => {
+  it('redis disconnected: throws DebouncerRedisUnavailableError (fail-closed) and emits no queue side-effects', async () => {
+    // PR #259 review (MAJOR A): the prior contract was "schedule
+    // anyway, state best-effort" — i.e. early-return null from
+    // `readState`/`writeState` when Redis was down. That created the
+    // exact tenant-scoping bypass the per-key namespace fix was meant
+    // to prevent: the `agentQueue.add` succeeded under the namespaced
+    // jobId, but the SECOND message under the same tenant lost the
+    // debounce reset (no state row to consult). And the caller in
+    // `baileys.ts` catches a `throw` and falls through to immediate
+    // enqueue — which silently bypassed the debounce window for every
+    // message during a Redis blip. Fail-closed: throw a specific error
+    // so the caller has to opt into the fallback explicitly.
     h.redisConnected.value = false;
 
-    const result = await withCtx(() =>
-      scheduleDebouncedAgent({
-        phone: PHONE,
-        mensagem_id: 'm1',
-      }),
-    );
+    await expect(
+      withCtx(() =>
+        scheduleDebouncedAgent({
+          phone: PHONE,
+          mensagem_id: 'm1',
+        }),
+      ),
+    ).rejects.toMatchObject({
+      name: 'DebouncerRedisUnavailableError',
+      code: 'DEBOUNCER_REDIS_UNAVAILABLE',
+    });
 
-    expect(result.kind).toBe('scheduled');
-    expect(h.queueAdd).toHaveBeenCalledTimes(1);
+    // No queue side-effect — readState throws BEFORE we touch BullMQ,
+    // so a Redis blip cannot leave a job armed without its companion
+    // Redis state row (which would break the next message's reset).
+    expect(h.queueGetJob).not.toHaveBeenCalled();
+    expect(h.queueAdd).not.toHaveBeenCalled();
+  });
+
+  it('redis disconnected during clearDebounceState: throws DebouncerRedisUnavailableError', async () => {
+    h.redisConnected.value = false;
+
+    await expect(
+      withCtx(() => clearDebounceState(PHONE)),
+    ).rejects.toMatchObject({
+      name: 'DebouncerRedisUnavailableError',
+      code: 'DEBOUNCER_REDIS_UNAVAILABLE',
+    });
   });
 
   it('clearDebounceState removes the redis key', async () => {
     const SHORT = '+55119';
-    const SHORT_SCOPED = `${T}:${A}:${SHORT}`;
+    const SHORT_SCOPED = `${enc(T)}:${enc(A)}:${enc(SHORT)}`;
     h.store.set(_internal.STATE_KEY(SHORT_SCOPED), JSON.stringify({ first_enqueued_at: 1 }));
     await withCtx(() => clearDebounceState(SHORT));
     expect(h.store.has(_internal.STATE_KEY(SHORT_SCOPED))).toBe(false);
