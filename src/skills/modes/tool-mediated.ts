@@ -27,7 +27,12 @@
  */
 import { callLLM, type LLMMessage, type ToolSchema } from '@/lib/claude.js';
 import { logger } from '@/lib/logger.js';
-import { getCurrentAgent, getCurrentTenant } from '@/db/tenant-context.js';
+import { incCounter } from '@/lib/metrics.js';
+import {
+  getCurrentAgent,
+  getCurrentTenant,
+  MissingTenantContextError,
+} from '@/db/tenant-context.js';
 import type { ModeContext } from '../types.js';
 
 /**
@@ -131,8 +136,35 @@ export async function toolMediatedMode(
   // In production, the SkillRunner (gate 1.5) already guarantees context
   // exists before dispatching here, so this only fires on direct calls
   // or test misconfiguration.
-  const tenant = getCurrentTenant();
-  const agent = getCurrentAgent();
+  //
+  // Observability (PR #269 reval): emit a structured log + counter BEFORE
+  // re-throwing so rejections are visible in production even when no
+  // upstream handler captures the error. Without this, fail-closed
+  // rejections at this gate would be silent in metrics/dashboards and only
+  // discoverable via incidental error traces.
+  let tenant: string;
+  let agent: string;
+  try {
+    tenant = getCurrentTenant();
+    agent = getCurrentAgent();
+  } catch (err) {
+    if (err instanceof MissingTenantContextError) {
+      logger.warn(
+        {
+          code: err.code,
+          skill_id: ctx.skill.id,
+          skill_version: ctx.skill.version,
+          turno_id: ctx.turno_id ?? null,
+          conversa_id: ctx.conversa_id ?? null,
+        },
+        'p9a.tool_mediated.missing_tenant_context',
+      );
+      incCounter('maia_tool_mediated_missing_tenant_context_total', {
+        skill_id: ctx.skill.id,
+      });
+    }
+    throw err;
+  }
   const idempotencyBase = `${tenant}:${agent}:${ctx.skill.id}:${ctx.skill.version}:${stableExecId}`;
 
   // Safety upper bound for the loop: allow a few extra iterations beyond

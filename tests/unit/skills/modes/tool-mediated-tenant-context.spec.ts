@@ -38,6 +38,8 @@ vi.mock('@/lib/claude.js', () => ({ callLLM: vi.fn() }));
 
 import { toolMediatedMode, setToolDispatcher } from '@/skills/modes/tool-mediated.js';
 import { callLLM } from '@/lib/claude.js';
+import { logger } from '@/lib/logger.js';
+import { _resetForTests as resetMetrics, renderPrometheus } from '@/lib/metrics.js';
 
 const baseSkill = {
   id: 'tm-262',
@@ -60,6 +62,7 @@ describe('tool_mediated: tenant context fail-closed (#262)', () => {
   beforeEach(() => {
     vi.resetAllMocks();
     setToolDispatcher(null);
+    resetMetrics();
   });
 
   it('throws MissingTenantContextError when called outside runWithTenantContext', async () => {
@@ -242,5 +245,87 @@ describe('tool_mediated: tenant context fail-closed (#262)', () => {
     expect(captured[0]).toMatch(/^tenantA:agentA:/);
     expect(captured[1]).toMatch(/^tenantB:agentB:/);
     expect(captured[0]).not.toEqual(captured[1]);
+  });
+
+  it('emits structured log + counter BEFORE re-throw on missing tenant context (PR #269 reval)', async () => {
+    // Observability gate: rejections at this fail-closed boundary must be
+    // visible in production even if no upstream handler captures the throw.
+    // The log carries enough identity to triangulate the offending call site
+    // (skill + version + turno_id + conversa_id), and the counter exposes
+    // the rejection rate via /metrics.
+    const warnSpy = vi.spyOn(logger, 'warn');
+    setToolDispatcher(async () => ({ ok: true }));
+    vi.mocked(callLLM).mockResolvedValue({
+      content: '{"answer":"never reached"}',
+      tool_uses: [],
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 1, output_tokens: 1 },
+      model: 'x',
+    });
+
+    await expect(
+      toolMediatedMode({
+        skill: baseSkill,
+        input: {},
+        resolvedPolicies: [],
+        turno_id: TURNO,
+        conversa_id: 'conv-262-obs',
+      }),
+    ).rejects.toThrow(MissingTenantContextError);
+
+    // Log assertion — required fields per review comment.
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        code: 'MISSING_TENANT_CONTEXT',
+        skill_id: baseSkill.id,
+        skill_version: baseSkill.version,
+        turno_id: TURNO,
+        conversa_id: 'conv-262-obs',
+      }),
+      'p9a.tool_mediated.missing_tenant_context',
+    );
+
+    // Metric assertion — counter must increment under the skill_id label.
+    const prom = await renderPrometheus();
+    expect(prom).toContain(
+      `maia_tool_mediated_missing_tenant_context_total{skill_id="${baseSkill.id}"} 1`,
+    );
+
+    // Regression: LLM must not have run.
+    expect(callLLM).not.toHaveBeenCalled();
+  });
+
+  it('does NOT emit missing-context log/metric on the happy path', async () => {
+    // Negative assertion: when context is set, the observability hook stays
+    // silent — no log spam, no false-positive metric.
+    const warnSpy = vi.spyOn(logger, 'warn');
+    setToolDispatcher(async () => ({ ok: true }));
+    vi.mocked(callLLM).mockResolvedValue({
+      content: '{"answer":"done"}',
+      tool_uses: [],
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 1, output_tokens: 1 },
+      model: 'x',
+    });
+
+    await runWithTenantContext(
+      { tenant_id: 'acme', agent_id: 'sofia' },
+      async () => {
+        await toolMediatedMode({
+          skill: baseSkill,
+          input: {},
+          resolvedPolicies: [],
+          turno_id: TURNO,
+        });
+      },
+    );
+
+    const missingCtxCalls = warnSpy.mock.calls.filter(
+      (c) => c[1] === 'p9a.tool_mediated.missing_tenant_context',
+    );
+    expect(missingCtxCalls).toHaveLength(0);
+
+    const prom = await renderPrometheus();
+    expect(prom).not.toContain('maia_tool_mediated_missing_tenant_context_total');
   });
 });
