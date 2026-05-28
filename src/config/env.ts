@@ -137,6 +137,14 @@ const envSchema = z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
+    // #292 — outbound_messages sweeper cutoffs (follow-up de #227/#233).
+    // OUTBOUND_SWEEPER_STALE_PENDING_SEC: rows em status='pending' com
+    //   created_at < now() - N são promovidas a 'unknown' (terminal per #233).
+    //   Default 300s (5min) — folga grande contra o tempo normal de send+persist.
+    // OUTBOUND_SWEEPER_RETENTION_DAYS: rows terminais (sent/failed/unknown) com
+    //   age > N dias são DELETADAS no mesmo sweeper pass. Default 30 dias.
+    OUTBOUND_SWEEPER_STALE_PENDING_SEC: z.coerce.number().int().positive().default(300),
+    OUTBOUND_SWEEPER_RETENTION_DAYS: z.coerce.number().int().positive().default(30),
     // Feature flags do roadmap Maia v2
     FEATURE_P0_TENANT_GUARD_ENFORCED: z
       .string()
