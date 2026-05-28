@@ -108,10 +108,26 @@ function arg(argv: string[], name: string): string | undefined {
   return undefined;
 }
 
-function hasFlag(argv: string[], name: string): boolean {
+/**
+ * Boolean flag detection. Accepts `--name` (bare) as truthy. For the
+ * `--name=value` form, only `true` / `1` / `yes` (case-insensitive) are
+ * truthy — any other value (including `false`, `0`, `no`, and empty) is
+ * falsy.
+ *
+ * Issue #288 (PR #244 follow-up): the previous implementation accepted
+ * ANY `--name=...` as truthy, so `--yes=false` silently bypassed the TTY
+ * confirmation gate. This contradicted operator intent for any user who
+ * typed `--yes=false` expecting the gate to fire. Exported so unit tests
+ * can assert the boolean-parse contract directly.
+ */
+export function hasFlag(argv: string[], name: string): boolean {
   const flag = `--${name}`;
-  for (const a of argv) if (a === flag || a.startsWith(`${flag}=`)) return true;
-  return false;
+  const idx = argv.findIndex((a) => a === flag || a.startsWith(`${flag}=`));
+  if (idx === -1) return false;
+  const a = argv[idx];
+  if (a === flag) return true;
+  const value = a.slice(`${flag}=`.length).toLowerCase();
+  return value === 'true' || value === '1' || value === 'yes';
 }
 
 /**

@@ -491,6 +491,87 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
     });
   });
 
+  // -------------------------------------------------------------------------
+  // [Issue #288] hasFlag — boolean parse contract
+  //
+  // Background: PR #244 introduced a TTY confirmation gate that uses
+  // `hasFlag(argv, 'yes')` to decide whether to skip the prompt. The original
+  // implementation accepted ANY `--yes=...` as truthy, so an operator who
+  // typed `--yes=false` (explicitly opting OUT of skipping) would have their
+  // intent inverted — confirmation was silently bypassed.
+  //
+  // The fixed contract: bare `--name` is truthy; `--name=value` is truthy
+  // only for `true` / `1` / `yes` (case-insensitive). Everything else is
+  // falsy, including `false`, `0`, `no`, and the empty value `--name=`.
+  // -------------------------------------------------------------------------
+  describe('hasFlag — boolean parse contract (#288)', () => {
+    it('TRUE — bare --yes is truthy', async () => {
+      const { hasFlag } = await import('@/../scripts/embeddings-rebuild.ts');
+      expect(hasFlag(['--yes'], 'yes')).toBe(true);
+    });
+
+    it('TRUE — explicit truthy values (--yes=true / --yes=1 / --yes=yes) are truthy', async () => {
+      const { hasFlag } = await import('@/../scripts/embeddings-rebuild.ts');
+      expect(hasFlag(['--yes=true'], 'yes')).toBe(true);
+      expect(hasFlag(['--yes=1'], 'yes')).toBe(true);
+      expect(hasFlag(['--yes=yes'], 'yes')).toBe(true);
+    });
+
+    it('TRUE — truthy values are case-insensitive (--yes=TRUE / --yes=Yes)', async () => {
+      const { hasFlag } = await import('@/../scripts/embeddings-rebuild.ts');
+      expect(hasFlag(['--yes=TRUE'], 'yes')).toBe(true);
+      expect(hasFlag(['--yes=Yes'], 'yes')).toBe(true);
+    });
+
+    it('FALSE — explicit falsy values (--yes=false / --yes=0 / --yes=no) are falsy', async () => {
+      // The #288 regression: previously these returned true, so an operator
+      // typing `--yes=false` to OPT OUT had their intent silently inverted.
+      const { hasFlag } = await import('@/../scripts/embeddings-rebuild.ts');
+      expect(hasFlag(['--yes=false'], 'yes')).toBe(false);
+      expect(hasFlag(['--yes=0'], 'yes')).toBe(false);
+      expect(hasFlag(['--yes=no'], 'yes')).toBe(false);
+    });
+
+    it('FALSE — falsy values are case-insensitive (--yes=FALSE / --yes=No)', async () => {
+      const { hasFlag } = await import('@/../scripts/embeddings-rebuild.ts');
+      expect(hasFlag(['--yes=FALSE'], 'yes')).toBe(false);
+      expect(hasFlag(['--yes=No'], 'yes')).toBe(false);
+    });
+
+    it('FALSE — empty value (--yes=) is falsy', async () => {
+      // An empty `--yes=` is almost certainly a typo or shell-expansion
+      // accident, not a deliberate opt-in.
+      const { hasFlag } = await import('@/../scripts/embeddings-rebuild.ts');
+      expect(hasFlag(['--yes='], 'yes')).toBe(false);
+    });
+
+    it('FALSE — unknown values (--yes=maybe / --yes=foo) are falsy', async () => {
+      // Reject-by-default for any unrecognised value — safer than silently
+      // accepting arbitrary strings as truthy.
+      const { hasFlag } = await import('@/../scripts/embeddings-rebuild.ts');
+      expect(hasFlag(['--yes=maybe'], 'yes')).toBe(false);
+      expect(hasFlag(['--yes=foo'], 'yes')).toBe(false);
+    });
+
+    it('FALSE — flag absent entirely is falsy', async () => {
+      const { hasFlag } = await import('@/../scripts/embeddings-rebuild.ts');
+      expect(hasFlag([], 'yes')).toBe(false);
+      expect(hasFlag(['--tenant=t', '--agent=a'], 'yes')).toBe(false);
+    });
+
+    it('parseCliOptions — yes=false propagates to CliOptions.yes (regression guard)', async () => {
+      // End-to-end: the #288 bug manifested at the parseCliOptions surface
+      // because parseCliOptions delegates to hasFlag. This locks in the fix
+      // at the same boundary the production CLI consumes.
+      const { parseCliOptions } = await import('@/../scripts/embeddings-rebuild.ts');
+      expect(parseCliOptions(['node', 'x', '--yes=false']).yes).toBe(false);
+      expect(parseCliOptions(['node', 'x', '--yes=0']).yes).toBe(false);
+      expect(parseCliOptions(['node', 'x', '--yes=no']).yes).toBe(false);
+      expect(parseCliOptions(['node', 'x', '--yes']).yes).toBe(true);
+      expect(parseCliOptions(['node', 'x', '--yes=true']).yes).toBe(true);
+    });
+  });
+
   describe('rebuildEmbeddingsForTuple — read step', () => {
     it('SUCCESS — tenant-A rebuild only reads tenant-A rows (NEVER tenant-B)', async () => {
       seedTwoTenants();
