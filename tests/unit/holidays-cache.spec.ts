@@ -60,20 +60,88 @@ describe('holidays cache', () => {
     expect(_internal_cache.get(keyB)).toBe(setA);
   });
 
-  it('key prefix é v2 (regression test para o bump v1 → v2)', () => {
+  it('key prefix é v3 (regression test para o bump v2 → v3 — encoding)', () => {
     const key = cacheKey('tenantA', 'agent-1', 'entidade-1', 2026, 'standard');
-    expect(key.startsWith('holidays:v2:')).toBe(true);
-    // Não regridir para v1
+    expect(key.startsWith('holidays:v3:')).toBe(true);
+    // Não regridir para v1 ou v2 (mudança de layout — encoded segments)
     expect(key.startsWith('holidays:v1:')).toBe(false);
+    expect(key.startsWith('holidays:v2:')).toBe(false);
   });
 
-  it('layout esperado: holidays:v2:{tenant}:{agent}:{entidade}:{year}:{kind}', () => {
+  it('layout esperado: holidays:v3:{enc(tenant)}:{enc(agent)}:{enc(entidade)}:{year}:{kind}', () => {
     expect(cacheKey('tenantA', 'agent-1', 'entidade-1', 2026, 'standard')).toBe(
-      'holidays:v2:tenantA:agent-1:entidade-1:2026:standard',
+      'holidays:v3:tenantA:agent-1:entidade-1:2026:standard',
     );
     expect(cacheKey('tenantA', 'agent-1', undefined, 2026, 'clt')).toBe(
-      'holidays:v2:tenantA:agent-1:global:2026:clt',
+      'holidays:v3:tenantA:agent-1:global:2026:clt',
     );
+  });
+
+  // ---------------------------------------------------------------------
+  // Issue #263 / PR #272 reval — collision por `:` delimiter sem escape.
+  // Sem encoding, `tenant="T", agent="A:B", entity="E"` colide com
+  // `tenant="T", agent="A", entity="B:E"` — mesma cache key, vazamento
+  // cross-agent. Pattern mirror'd de #257 (vision-cache) / #258 (embedding).
+  // ---------------------------------------------------------------------
+  describe('encoding de segmentos (#272 reval — collision por `:`)', () => {
+    it('agent_id contendo `:` não colide com particionamento alternativo', () => {
+      // (tenant=T, agent="A:B", entity="E") vs (tenant=T, agent="A", entity="B:E")
+      const k1 = cacheKey('T', 'A:B', 'E', 2026, 'standard');
+      const k2 = cacheKey('T', 'A', 'B:E', 2026, 'standard');
+      expect(k1).not.toBe(k2);
+    });
+
+    it('tenant_id contendo `:` não colide com particionamento alternativo', () => {
+      // (tenant="T:A", agent="B") vs (tenant="T", agent="A:B")
+      const k1 = cacheKey('T:A', 'B', 'E', 2026, 'standard');
+      const k2 = cacheKey('T', 'A:B', 'E', 2026, 'standard');
+      expect(k1).not.toBe(k2);
+    });
+
+    it('entidadeId contendo `:` é encodada', () => {
+      const key = cacheKey('T', 'A', 'ent:1', 2026, 'standard');
+      // `:` no entidadeId vira %3A
+      expect(key).toContain('ent%3A1');
+      // E o número de `:` cru na chave bate o layout estável
+      // holidays:v3:T:A:ent%3A1:2026:standard → 6 colons
+      expect(key.split(':').length).toBe(7);
+    });
+
+    it('tenant_id contendo `:` é encodada (acme:dev real-world slug)', () => {
+      const key = cacheKey('acme:dev', 'agent-1', undefined, 2026, 'standard');
+      expect(key).toContain('acme%3Adev');
+      expect(key).not.toContain('acme:dev:'); // delimitador-original NÃO aparece cru
+    });
+
+    it('agent_id com caracteres especiais (%, espaço) é encodada', () => {
+      const key = cacheKey('T', 'agent with space', 'E', 2026, 'standard');
+      expect(key).toContain('agent%20with%20space');
+    });
+
+    it('round-trip determinístico: mesma input gera mesma chave', () => {
+      const k1 = cacheKey('acme:dev', 'sof:ia', 'ent:1', 2026, 'standard');
+      const k2 = cacheKey('acme:dev', 'sof:ia', 'ent:1', 2026, 'standard');
+      expect(k1).toBe(k2);
+    });
+  });
+
+  // ---------------------------------------------------------------------
+  // Invalidação tenant-scoped com tenant contendo `:` — prefix encoding
+  // garante que `tenant="acme"` NÃO limpa entradas de `tenant="acme:dev"`.
+  // ---------------------------------------------------------------------
+  it('invalidação tenant-scoped não vaza entre tenants com `:` no slug', () => {
+    _internal_cache.set(cacheKey('acme', 'a', undefined, 2026, 'standard'), new Set(['2026-12-25']));
+    _internal_cache.set(cacheKey('acme:dev', 'a', undefined, 2026, 'standard'), new Set(['2026-12-25']));
+
+    invalidateCacheForHolidayChange(
+      { tenant_id: 'acme', type: 'national' },
+      { changeKind: 'create' },
+    );
+
+    // tenant="acme" limpo
+    expect(_internal_cache.get(cacheKey('acme', 'a', undefined, 2026, 'standard'))).toBeUndefined();
+    // tenant="acme:dev" INTACTO (não vazou)
+    expect(_internal_cache.get(cacheKey('acme:dev', 'a', undefined, 2026, 'standard'))).toBeDefined();
   });
 
   it('getApplicableHolidaysSet lança MissingTenantContextError fora do contexto', async () => {
@@ -109,6 +177,24 @@ describe('holidays cache', () => {
         ).rejects.toBeInstanceOf(MissingTenantContextError);
       },
     );
+  });
+
+  // Issue #283 / PR #272 reval — whitespace-only IDs gerariam namespace
+  // anômalo encoded (`holidays:v3:%20%20%20:...`) que ainda colide entre si.
+  it('getApplicableHolidaysSet lança quando agent_id é whitespace-only', async () => {
+    await runWithTenantContext({ tenant_id: 'tenantA', agent_id: '   ' }, async () => {
+      await expect(
+        getApplicableHolidaysSet(2026, { entidadeId: 'e1' }, async () => new Set()),
+      ).rejects.toBeInstanceOf(MissingTenantContextError);
+    });
+  });
+
+  it('getApplicableHolidaysSet lança quando tenant_id é whitespace-only', async () => {
+    await runWithTenantContext({ tenant_id: '\t', agent_id: 'agent-A' }, async () => {
+      await expect(
+        getApplicableHolidaysSet(2026, { entidadeId: 'e1' }, async () => new Set()),
+      ).rejects.toBeInstanceOf(MissingTenantContextError);
+    });
   });
 
   it('getApplicableHolidaysSet usa agent_id do ALS context na chave', async () => {
