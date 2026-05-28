@@ -24,7 +24,25 @@ services:
     image: redis:7-alpine
     container_name: maia-redis
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes"]
+    # IMPORTANT: --maxmemory-policy MUST stay `noeviction` (or `volatile-lru`)
+    # in any environment with more than one tenant. Redis key isolation in
+    # this codebase relies on tenant-prefixed keys (working memory, BullMQ
+    # jobs, idempotency ledger, etc. — see PR #241 and friends), but key-
+    # prefixing alone does NOT protect a tenant from being evicted to make
+    # room for another tenant under `allkeys-*` policies. `noeviction` makes
+    # writes fail under memory pressure instead of cross-tenant eviction;
+    # `volatile-lru` only evicts keys that carry an explicit TTL. Never use
+    # `allkeys-lru` / `allkeys-lfu` / `allkeys-random` here. See
+    # `docs/runbooks/redis.md` for context, sizing guidance, and the
+    # alerting threshold for memory pressure.
+    command:
+      - "redis-server"
+      - "--appendonly"
+      - "yes"
+      - "--maxmemory"
+      - "2gb"
+      - "--maxmemory-policy"
+      - "noeviction"
     ports:
       - "${REDIS_PORT:-6379}:6379"
     volumes:
