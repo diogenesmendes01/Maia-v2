@@ -79,6 +79,15 @@ describe('tenant-context', () => {
       );
     });
 
+    it('getCurrentAgent lança quando agent_id é undefined', async () => {
+      await runWithTenantContext(
+        { tenant_id: 'acme', agent_id: undefined as unknown as string },
+        async () => {
+          expect(() => getCurrentAgent()).toThrow(MissingTenantContextError);
+        },
+      );
+    });
+
     it('MissingTenantContextError preserva código estável e mensagem com razão', async () => {
       await runWithTenantContext({ tenant_id: '', agent_id: 'sofia' }, async () => {
         try {
@@ -117,13 +126,14 @@ describe('tenant-context', () => {
   });
 
   // -------------------------------------------------------------------------
-  // PR #272 reval (Codex) — whitespace-only IDs convergente com issue #283.
+  // PR #272 reval / Issue #283 / PR #293 — whitespace-only IDs.
   // Strings tipo `'   '` ou `'\t'` passam o check truthy mas geram namespace
   // anômalo determinístico — colisão silenciosa entre contextos malformados.
-  // Overlap consciente com PR #293 (fix central também rejeita whitespace).
+  // Fix central em assertTruthyContext (PR #293) rejeita whitespace-only
+  // E strings com whitespace ao redor (contrato strict, sem trim implícito).
   // -------------------------------------------------------------------------
-  describe('PR #272 reval / #283 — whitespace-only tenant_id / agent_id', () => {
-    it('getCurrentTenant lança quando tenant_id é whitespace-only', async () => {
+  describe('PR #272 reval / #283 / #293 — whitespace-only tenant_id / agent_id', () => {
+    it('getCurrentTenant lança quando tenant_id é whitespace-only (spaces)', async () => {
       await runWithTenantContext({ tenant_id: '   ', agent_id: 'sofia' }, async () => {
         expect(() => getCurrentTenant()).toThrow(MissingTenantContextError);
       });
@@ -135,7 +145,25 @@ describe('tenant-context', () => {
       });
     });
 
-    it('getCurrentAgent lança quando agent_id é whitespace-only', async () => {
+    it('rejeita tenant_id whitespace-only (tab)', async () => {
+      await runWithTenantContext({ tenant_id: '\t', agent_id: 'sofia' }, async () => {
+        expect(() => getCurrentTenant()).toThrow(MissingTenantContextError);
+      });
+    });
+
+    it('rejeita tenant_id whitespace-only (newline)', async () => {
+      await runWithTenantContext({ tenant_id: '\n', agent_id: 'sofia' }, async () => {
+        expect(() => getCurrentTenant()).toThrow(MissingTenantContextError);
+      });
+    });
+
+    it('rejeita tenant_id whitespace-only (mixed: tab+newline+space)', async () => {
+      await runWithTenantContext({ tenant_id: '\t\n  ', agent_id: 'sofia' }, async () => {
+        expect(() => getCurrentTenant()).toThrow(MissingTenantContextError);
+      });
+    });
+
+    it('getCurrentAgent lança quando agent_id é whitespace-only (spaces)', async () => {
       await runWithTenantContext({ tenant_id: 'acme', agent_id: '   ' }, async () => {
         expect(() => getCurrentAgent()).toThrow(MissingTenantContextError);
       });
@@ -144,6 +172,46 @@ describe('tenant-context', () => {
     it('getCurrentAgent lança quando agent_id é tab/newline only', async () => {
       await runWithTenantContext({ tenant_id: 'acme', agent_id: '\t\n' }, async () => {
         expect(() => getCurrentAgent()).toThrow(MissingTenantContextError);
+      });
+    });
+
+    it('rejeita agent_id whitespace-only (tab)', async () => {
+      await runWithTenantContext({ tenant_id: 'acme', agent_id: '\t' }, async () => {
+        expect(() => getCurrentAgent()).toThrow(MissingTenantContextError);
+      });
+    });
+
+    // Contrato: ' valid ' (whitespace ao redor) → REJECTED (strict, não trim)
+    it('rejeita tenant_id com whitespace ao redor (` valid `) — contrato strict', async () => {
+      await runWithTenantContext({ tenant_id: ' acme ', agent_id: 'sofia' }, async () => {
+        expect(() => getCurrentTenant()).toThrow(MissingTenantContextError);
+      });
+    });
+
+    it('rejeita agent_id com leading whitespace', async () => {
+      await runWithTenantContext({ tenant_id: 'acme', agent_id: ' sofia' }, async () => {
+        expect(() => getCurrentAgent()).toThrow(MissingTenantContextError);
+      });
+    });
+
+    it('rejeita agent_id com trailing whitespace', async () => {
+      await runWithTenantContext({ tenant_id: 'acme', agent_id: 'sofia\t' }, async () => {
+        expect(() => getCurrentAgent()).toThrow(MissingTenantContextError);
+      });
+    });
+
+    it('aceita strings normalizadas (sem whitespace ao redor)', async () => {
+      await runWithTenantContext({ tenant_id: 'acme', agent_id: 'sofia' }, async () => {
+        expect(getCurrentTenant()).toBe('acme');
+        expect(getCurrentAgent()).toBe('sofia');
+      });
+    });
+
+    it('aceita strings com whitespace interno (não ao redor) — `acme inc`', async () => {
+      // Whitespace interno é válido — só rejeitamos leading/trailing.
+      await runWithTenantContext({ tenant_id: 'acme inc', agent_id: 'sofia bot' }, async () => {
+        expect(getCurrentTenant()).toBe('acme inc');
+        expect(getCurrentAgent()).toBe('sofia bot');
       });
     });
 
@@ -159,6 +227,12 @@ describe('tenant-context', () => {
       });
     });
 
+    it('tryGetCurrentContext retorna null quando tenant_id tem whitespace ao redor', async () => {
+      await runWithTenantContext({ tenant_id: ' acme ', agent_id: 'sofia' }, async () => {
+        expect(tryGetCurrentContext()).toBeNull();
+      });
+    });
+
     it('mensagem de erro distingue empty vs whitespace para debugging', async () => {
       await runWithTenantContext({ tenant_id: '   ', agent_id: 'sofia' }, async () => {
         try {
@@ -168,6 +242,31 @@ describe('tenant-context', () => {
           expect(err).toBeInstanceOf(MissingTenantContextError);
           expect((err as Error).message).toMatch(/whitespace-only/);
         }
+      });
+    });
+  });
+
+  // tryGetCurrentContext semantics adicionais (consistente com asserts dos getters)
+  describe('tryGetCurrentContext — semantics', () => {
+    it('retorna null fora de contexto ALS', () => {
+      expect(tryGetCurrentContext()).toBeNull();
+    });
+
+    it('retorna ctx válido quando dentro de runWithTenantContext', async () => {
+      await runWithTenantContext({ tenant_id: 'acme', agent_id: 'sofia' }, async () => {
+        expect(tryGetCurrentContext()).toEqual({ tenant_id: 'acme', agent_id: 'sofia' });
+      });
+    });
+
+    it('retorna null quando tenant_id é empty string (preserva #269)', async () => {
+      await runWithTenantContext({ tenant_id: '', agent_id: 'sofia' }, async () => {
+        expect(tryGetCurrentContext()).toBeNull();
+      });
+    });
+
+    it('retorna null quando tenant_id é non-string (preserva #269)', async () => {
+      await runWithTenantContext({ tenant_id: null as any, agent_id: 'sofia' }, async () => {
+        expect(tryGetCurrentContext()).toBeNull();
       });
     });
   });
