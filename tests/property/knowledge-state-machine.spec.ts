@@ -132,7 +132,9 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', async () => {
       async listEligible(args: {
         kind: KnowledgeKind;
         from: KnowledgeLifecycleStatus;
-      }): Promise<Array<{ id: string }>> {
+      }): Promise<Array<{ id: string; tenant_id: string; agent_id: string }>> {
+        // Issue #234: include tenant_id/agent_id so the worker's
+        // runWithTenantContext wrapper has real values to set on ALS.
         const rows = listByStatus(args.kind, args.from);
         return rows
           .filter((row) => {
@@ -152,7 +154,11 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', async () => {
             }
             return true;
           })
-          .map((r) => ({ id: r.id }));
+          .map((r) => ({
+            id: r.id,
+            tenant_id: r.tenant_id,
+            agent_id: r.agent_id,
+          }));
       },
       buildUpdatedAtFilter() {
         return drizzle.sql`true`;
