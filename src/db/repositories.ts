@@ -1321,7 +1321,37 @@ export const pendingQuestionsRepo = {
  *     prunes by `created_at`. The cleanup worker bootstraps with the system
  *     tenant context for audit; the SQL itself stays unscoped.
  */
+
+/**
+ * Reservation outcome from `idempotencyRepo.tryReserve` (issue #298).
+ *
+ * Discriminated by `was_inserted`:
+ *   - `was_inserted=true`: this caller WON the reservation. They MUST run
+ *     the handler and call `markCompleted` (or `markFailed` → which
+ *     currently means deleting the in_progress row so the next caller can
+ *     re-claim). `state` will be 'in_progress' and `resultado` will be
+ *     undefined.
+ *   - `was_inserted=false`: someone else's row was already there. Inspect
+ *     `state`:
+ *       - 'completed': use `resultado` as the cached output (cache hit).
+ *       - 'in_progress': another worker is mid-execution. The caller MUST
+ *         NOT execute the handler; it should poll for completion (see
+ *         `waitForCompletion`).
+ */
+export type ReservationResult =
+  | { was_inserted: true; state: 'in_progress'; resultado: undefined }
+  | { was_inserted: false; state: 'completed'; resultado: unknown }
+  | { was_inserted: false; state: 'in_progress'; resultado: undefined };
+
 export const idempotencyRepo = {
+  /**
+   * Legacy read-only lookup. Returns the cached result IFF a 'completed'
+   * row exists. 'in_progress' rows are NOT considered cache hits — the
+   * caller would skip execution and return undefined to the user (silent
+   * data loss). Use `tryReserve` for the atomic dispatcher path; this
+   * helper exists for backward compat with non-dispatch callers (tests,
+   * one-off inspections).
+   */
   async lookup(key: string): Promise<unknown | null> {
     // Resolve tenant/agent — `getCurrentTenant`/`getCurrentAgent` throw
     // `MissingTenantContextError` if no context. We refuse a silent
@@ -1336,11 +1366,322 @@ export const idempotencyRepo = {
           eq(idempotency_keys.tenant_id, tenant_id),
           eq(idempotency_keys.agent_id, agent_id),
           eq(idempotency_keys.key, key),
+          eq(idempotency_keys.state, 'completed'),
         ),
       )
       .limit(1);
     return rows[0]?.resultado ?? null;
   },
+
+  /**
+   * Issue #298: atomic reservation. Replaces the racey check-then-act in
+   * the dispatcher.
+   *
+   * Single round-trip:
+   *   - INSERT a new row with state='in_progress', expires_at=now()+TTL,
+   *     resultado=NULL.
+   *   - ON CONFLICT (PK = `(tenant_id, agent_id, key)`) DO NOTHING. If a row already exists,
+   *     INSERT is a no-op; otherwise the row is created.
+   *   - RETURNING (xmax = 0) AS was_inserted, state, resultado. The xmax
+   *     trick: on a fresh insert, xmax=0; on a no-op caused by
+   *     ON CONFLICT DO NOTHING, xmax is the *current* transaction's xid
+   *     (non-zero). So `xmax = 0` is the canonical "I inserted vs row was
+   *     already there" probe.
+   *
+   * Stale-reservation reclaim: if an existing row is state='in_progress'
+   * AND expires_at < now(), it's an orphan (the previous worker crashed
+   * before completing). The reclaim path runs an UPDATE … WHERE
+   * state='in_progress' AND expires_at < now() — at most one caller wins
+   * the update (UPDATE … RETURNING is atomic). Winner re-acquires the
+   * reservation; losers see the winner's freshened row on next poll.
+   *
+   * The repository writes through `applyTenantGuard` (defense in depth:
+   * even before PR #273's composite PK lands, the tenant_id/agent_id
+   * columns are stamped from ALS context, so cross-tenant collisions are
+   * prevented at the application layer).
+   */
+  async tryReserve(input: {
+    key: string;
+    tool_name: string;
+    operation_type: string;
+    pessoa_id: string;
+    entity_id: string;
+    payload_hash: string;
+    file_sha256?: string;
+    ttl_seconds: number;
+  }): Promise<ReservationResult> {
+    // applyTenantGuard stamps tenant_id/agent_id from ALS context and
+    // rejects any explicit mismatch. Throws MissingTenantContextError if
+    // no context. The atomic-reservation path is dispatcher-driven and
+    // always runs inside runWithTenantContext (webhook routes, scheduler).
+    const guarded = applyTenantGuard({
+      key: input.key,
+      tool_name: input.tool_name,
+      operation_type: input.operation_type,
+      pessoa_id: input.pessoa_id,
+      entity_id: input.entity_id,
+      payload_hash: input.payload_hash,
+      file_sha256: input.file_sha256 ?? null,
+      state: 'in_progress' as const,
+    });
+
+    // Step 1: try INSERT … ON CONFLICT DO NOTHING. RETURNING captures
+    // both the "I inserted" probe and the existing-row state in the same
+    // round-trip — no separate SELECT needed in the common path.
+    // NOTE: `(xmax = 0)` is the Postgres ON CONFLICT DO NOTHING idiom for
+    // distinguishing inserted vs pre-existing rows. With RETURNING, the
+    // row body returned is the inserted-or-existing row in either case.
+    const ttl = `${input.ttl_seconds} seconds`;
+    const inserted = await db.execute<{
+      was_inserted: boolean;
+      state: string;
+      resultado: unknown;
+      expires_at: string | null;
+    }>(sql`
+      INSERT INTO idempotency_keys
+        (key, tenant_id, agent_id, tool_name, operation_type, pessoa_id,
+         entity_id, payload_hash, file_sha256, resultado, state, expires_at)
+      VALUES
+        (${guarded.key}, ${guarded.tenant_id}, ${guarded.agent_id},
+         ${guarded.tool_name}, ${guarded.operation_type}, ${guarded.pessoa_id},
+         ${guarded.entity_id}, ${guarded.payload_hash}, ${guarded.file_sha256},
+         NULL, 'in_progress', now() + ${ttl}::interval)
+      ON CONFLICT (tenant_id, agent_id, key) DO NOTHING
+      RETURNING (xmax = 0) AS was_inserted, state, resultado, expires_at
+    `);
+
+    const firstRow = inserted.rows[0];
+    if (firstRow && firstRow.was_inserted) {
+      return { was_inserted: true, state: 'in_progress', resultado: undefined };
+    }
+
+    // Step 2: ON CONFLICT triggered (or RETURNING returned the
+    // existing-but-not-inserted row). SELECT the row to inspect state.
+    // We tenant-scope the read; if PR #273 merges (composite PK), this
+    // also matches the new PK shape.
+    const existingRows = await db
+      .select({
+        state: idempotency_keys.state,
+        resultado: idempotency_keys.resultado,
+        expires_at: idempotency_keys.expires_at,
+      })
+      .from(idempotency_keys)
+      .where(
+        and(
+          eq(idempotency_keys.tenant_id, guarded.tenant_id),
+          eq(idempotency_keys.agent_id, guarded.agent_id),
+          eq(idempotency_keys.key, input.key),
+        ),
+      )
+      .limit(1);
+
+    const existing = existingRows[0];
+    if (!existing) {
+      // Extremely narrow race: row was deleted between ON CONFLICT and
+      // SELECT (cleanup worker or down-migration). Treat as "couldn't
+      // reserve" — caller re-enters. We retry the insert once to recover
+      // cleanly without bubbling up a misleading error.
+      const retry = await db.execute<{
+        was_inserted: boolean;
+      }>(sql`
+        INSERT INTO idempotency_keys
+          (key, tenant_id, agent_id, tool_name, operation_type, pessoa_id,
+           entity_id, payload_hash, file_sha256, resultado, state, expires_at)
+        VALUES
+          (${guarded.key}, ${guarded.tenant_id}, ${guarded.agent_id},
+           ${guarded.tool_name}, ${guarded.operation_type}, ${guarded.pessoa_id},
+           ${guarded.entity_id}, ${guarded.payload_hash}, ${guarded.file_sha256},
+           NULL, 'in_progress', now() + ${ttl}::interval)
+        ON CONFLICT (tenant_id, agent_id, key) DO NOTHING
+        RETURNING (xmax = 0) AS was_inserted
+      `);
+      if (retry.rows[0]?.was_inserted) {
+        return { was_inserted: true, state: 'in_progress', resultado: undefined };
+      }
+      // Still lost — fall through to a "stale" view; caller will poll and
+      // either find a completed row or time out.
+      return { was_inserted: false, state: 'in_progress', resultado: undefined };
+    }
+
+    if (existing.state === 'completed') {
+      return {
+        was_inserted: false,
+        state: 'completed',
+        resultado: existing.resultado,
+      };
+    }
+
+    // state='in_progress'. Check if expired — if so, try to reclaim.
+    // Atomic UPDATE … WHERE state='in_progress' AND expires_at < now()
+    // ensures at most one caller wins the reclaim.
+    if (existing.expires_at && new Date(existing.expires_at) < new Date()) {
+      const reclaimed = await db.execute<{ key: string }>(sql`
+        UPDATE idempotency_keys
+           SET expires_at = now() + ${ttl}::interval,
+               tool_name = ${guarded.tool_name},
+               operation_type = ${guarded.operation_type},
+               pessoa_id = ${guarded.pessoa_id},
+               entity_id = ${guarded.entity_id},
+               payload_hash = ${guarded.payload_hash},
+               file_sha256 = ${guarded.file_sha256}
+         WHERE tenant_id = ${guarded.tenant_id}
+           AND agent_id = ${guarded.agent_id}
+           AND key = ${input.key}
+           AND state = 'in_progress'
+           AND expires_at < now()
+         RETURNING key
+      `);
+      if (reclaimed.rows.length > 0) {
+        return { was_inserted: true, state: 'in_progress', resultado: undefined };
+      }
+      // Reclaim lost (someone else got it or row transitioned to
+      // completed). Re-check current state.
+      const recheck = await db
+        .select({
+          state: idempotency_keys.state,
+          resultado: idempotency_keys.resultado,
+        })
+        .from(idempotency_keys)
+        .where(
+          and(
+            eq(idempotency_keys.tenant_id, guarded.tenant_id),
+            eq(idempotency_keys.agent_id, guarded.agent_id),
+            eq(idempotency_keys.key, input.key),
+          ),
+        )
+        .limit(1);
+      const recheckRow = recheck[0];
+      if (recheckRow?.state === 'completed') {
+        return {
+          was_inserted: false,
+          state: 'completed',
+          resultado: recheckRow.resultado,
+        };
+      }
+      return { was_inserted: false, state: 'in_progress', resultado: undefined };
+    }
+
+    return { was_inserted: false, state: 'in_progress', resultado: undefined };
+  },
+
+  /**
+   * Transition an in_progress reservation to completed and persist the
+   * handler's result. Idempotent on the (tenant, agent, key) — if the
+   * row is already 'completed' (e.g., a duplicate completion attempt),
+   * we keep the existing resultado (the WHERE state='in_progress' makes
+   * it a no-op).
+   */
+  async markCompleted(input: { key: string; resultado: unknown }): Promise<void> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    await db
+      .update(idempotency_keys)
+      .set({
+        resultado: input.resultado as object,
+        state: 'completed',
+        expires_at: null,
+      })
+      .where(
+        and(
+          eq(idempotency_keys.tenant_id, tenant_id),
+          eq(idempotency_keys.agent_id, agent_id),
+          eq(idempotency_keys.key, input.key),
+          eq(idempotency_keys.state, 'in_progress'),
+        ),
+      );
+  },
+
+  /**
+   * Release a failed reservation so the next caller can retry. We DELETE
+   * the row rather than leave a stale 'in_progress' for the next caller
+   * to reclaim — semantically the failure means "no progress was made;
+   * the slot is free again". The next dispatch will INSERT fresh and own
+   * the new reservation. The DB-side CHECK constraint also forbids
+   * (state='in_progress' AND resultado IS NOT NULL), so we can't park a
+   * failure marker in the row body.
+   */
+  async releaseReservation(key: string): Promise<void> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    await db
+      .delete(idempotency_keys)
+      .where(
+        and(
+          eq(idempotency_keys.tenant_id, tenant_id),
+          eq(idempotency_keys.agent_id, agent_id),
+          eq(idempotency_keys.key, key),
+          eq(idempotency_keys.state, 'in_progress'),
+        ),
+      );
+  },
+
+  /**
+   * Poll for a competing worker's reservation to complete. Used by the
+   * dispatcher when `tryReserve` returns `was_inserted=false,
+   * state='in_progress'` — another worker owns the reservation and we
+   * want to return ITS result (not double-execute the side effect).
+   *
+   * Returns the cached `resultado` on success, or `null` if the deadline
+   * expires (caller should surface a typed `idempotency_wait_timeout`
+   * error — preserves the no-double-execution invariant; the user gets
+   * a retry-friendly error rather than a stale or empty response).
+   *
+   * Polling interval is short (100ms) so the latency penalty for the
+   * loser of the race is small. The loop also exits early if the
+   * reservation row disappears (release after failure) — caller should
+   * surface a not-completed error.
+   */
+  async waitForCompletion(
+    key: string,
+    timeout_ms: number,
+  ): Promise<{ status: 'completed'; resultado: unknown } | { status: 'timeout' } | { status: 'released' }> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const deadline = Date.now() + timeout_ms;
+    const pollIntervalMs = 100;
+    // Bounded loop. The deadline + interval shape avoids both a wall-
+    // clock-drift bug (don't trust `Date.now()` for `for (let i …)`) and
+    // a busy-wait if `setTimeout` resolves early.
+    while (Date.now() < deadline) {
+      const rows = await db
+        .select({
+          state: idempotency_keys.state,
+          resultado: idempotency_keys.resultado,
+        })
+        .from(idempotency_keys)
+        .where(
+          and(
+            eq(idempotency_keys.tenant_id, tenant_id),
+            eq(idempotency_keys.agent_id, agent_id),
+            eq(idempotency_keys.key, key),
+          ),
+        )
+        .limit(1);
+      const row = rows[0];
+      if (!row) {
+        // Reservation was released (handler failure) — caller should
+        // re-dispatch from scratch.
+        return { status: 'released' };
+      }
+      if (row.state === 'completed') {
+        return { status: 'completed', resultado: row.resultado };
+      }
+      // Still in progress; wait and retry.
+      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    }
+    return { status: 'timeout' };
+  },
+
+  /**
+   * Legacy write path. PRESERVED for backward compat with tests / call
+   * sites that haven't migrated to the tryReserve/markCompleted flow.
+   * Inserts a 'completed' row directly (matches the pre-#298 semantics:
+   * the row exists only after the handler returned, so it's correctly
+   * classified as completed).
+   *
+   * New code should use tryReserve + markCompleted instead — see
+   * src/tools/_dispatcher.ts for the canonical pattern.
+   */
   async store(input: {
     key: string;
     tool_name: string;
@@ -1362,18 +1703,39 @@ export const idempotencyRepo = {
       payload_hash: input.payload_hash,
       file_sha256: input.file_sha256 ?? null,
       resultado: input.resultado as object,
+      state: 'completed' as const,
+      expires_at: null,
     });
-    await db
-      .insert(idempotency_keys)
-      .values(guarded)
-      .onConflictDoNothing();
+    await db.insert(idempotency_keys).values(guarded).onConflictDoNothing();
   },
   async cleanup(olderThanDays: number): Promise<number> {
-    const rows = await db
+    // Two-phase sweep:
+    //   (1) Reap stale in_progress reservations (crashed workers) so they
+    //       don't block re-claim forever. The partial index from
+    //       migration 064 (`idx_idempotency_keys_in_progress_expires`)
+    //       makes this O(stale rows) regardless of total table size.
+    //   (2) Age out long-completed rows past the cache retention window.
+    // Both are global on purpose: cleanup is a maintenance sweep, not a
+    // tenant-scoped read; it cannot leak (no row body returned).
+    const reaped = await db
       .delete(idempotency_keys)
-      .where(sql`created_at < now() - (${olderThanDays} || ' days')::interval`)
+      .where(
+        and(
+          eq(idempotency_keys.state, 'in_progress'),
+          sql`expires_at < now()`,
+        ),
+      )
       .returning({ key: idempotency_keys.key });
-    return rows.length;
+    const aged = await db
+      .delete(idempotency_keys)
+      .where(
+        and(
+          eq(idempotency_keys.state, 'completed'),
+          sql`created_at < now() - (${olderThanDays} || ' days')::interval`,
+        ),
+      )
+      .returning({ key: idempotency_keys.key });
+    return reaped.length + aged.length;
   },
 };
 
