@@ -169,12 +169,14 @@ const dbExecuteMock = vi.fn(async (query: SQL) => {
   }
 
   // ---- SELECT pending rows ---------------------------------------------
-  // Production:
-  //   SELECT id::text, conteudo FROM agent_memories
+  // Production (post-#289):
+  //   SELECT id::text, tenant_id, agent_id, conteudo FROM agent_memories
   //   WHERE tenant_id = $1 AND agent_id = $2
   //     AND (embedding IS NULL OR vector_dims(embedding) != $3)
   //   ORDER BY created_at LIMIT $4
-  if (/SELECT\s+id::text,\s+conteudo/i.test(sqlText)) {
+  // (#289 added tenant_id + agent_id to the projection so the per-row
+  // skip audit in rebuildBatch can attribute under the row's own context.)
+  if (/SELECT\s+id::text,\s*tenant_id,\s*agent_id,\s*conteudo/i.test(sqlText)) {
     const tenant_id = params[0] as string;
     const agent_id = params[1] as string;
     const expectedDim = Number(params[2]);
@@ -188,7 +190,12 @@ const dbExecuteMock = vi.fn(async (query: SQL) => {
       )
       .sort((a, b) => a.created_at - b.created_at)
       .slice(0, limit)
-      .map((r) => ({ id: r.id, conteudo: r.conteudo }));
+      .map((r) => ({
+        id: r.id,
+        tenant_id: r.tenant_id,
+        agent_id: r.agent_id,
+        conteudo: r.conteudo,
+      }));
     return { rows: candidates };
   }
 
@@ -323,6 +330,17 @@ vi.mock('@/lib/logger.js', () => ({
   logger: { warn: vi.fn(), info: vi.fn(), debug: vi.fn(), error: vi.fn() },
 }));
 
+// Issue #289 — the script now calls `audit({...})` from `@/governance/audit.js`
+// to log per-row skips (missing / wrong-dim vectors). The real implementation
+// writes through `auditRepo.write` which hits Postgres, so we shim it for
+// these unit tests. Tests in the #289 describe block reset and inspect this
+// mock; the existing #239/#244 tests don't trigger it (provider always
+// returns full-cardinality, correct-dim vectors).
+const auditMock = vi.fn(async () => undefined);
+vi.mock('@/governance/audit.js', () => ({
+  audit: auditMock,
+}));
+
 // ---------------------------------------------------------------------------
 // Setup / helpers
 // ---------------------------------------------------------------------------
@@ -341,6 +359,7 @@ beforeEach(() => {
   lockClientQueryMock.mockClear();
   lockClientReleaseMock.mockClear();
   poolConnectMock.mockClear();
+  auditMock.mockClear();
 });
 
 const expectedDim = config.EMBEDDING_DIMENSIONS;
@@ -722,8 +741,13 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
       );
       await rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 });
 
+      // #289 added tenant_id + agent_id to the SELECT projection so the
+      // per-row skip audit in rebuildBatch can attribute under the row's
+      // own context. We match either the legacy two-column or the new
+      // four-column projection — both satisfy the #239 invariant tested
+      // here (WHERE pins the tuple).
       const selectSql = renderedSqls.find((r) =>
-        /SELECT\s+id::text,\s+conteudo/i.test(r.sql),
+        /SELECT\s+id::text,(\s*tenant_id,\s*agent_id,)?\s*conteudo/i.test(r.sql),
       );
       expect(selectSql).toBeDefined();
       expect(selectSql!.sql).toMatch(/tenant_id\s*=/);
@@ -1641,5 +1665,200 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
           original;
       }
     });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #289 — provider cardinality + per-row dimension validation
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Before the #289 fix, the per-row UPDATE used `embs[i] ?? []`: a missing or
+// short-cardinality provider response silently became `[]::vector`, which
+// pgvector treats as a zero-vector. Semantic search then returned similarity
+// 0 for those rows until the next run's re-detection predicate
+// (`embedding IS NULL OR vector_dims(...) != EXPECTED_DIM`) caught the wrong
+// dimension — a corruption window invisible to ops.
+//
+// After the fix:
+//   1. `rebuildBatch` validates provider cardinality BEFORE the per-row loop
+//      and throws `ProviderCardinalityError` if it mismatches. The outer
+//      transaction rolls back, so NO `[]::vector` is ever written and the
+//      pending rows remain pending for the next run.
+//   2. Each vector's dimension is checked BEFORE the UPDATE. Missing or
+//      wrong-dim vectors are skipped (not written) and audited under the
+//      row's own tenant context via `audit({...})`.
+//
+// These tests drive `rebuildBatch` directly with a custom `exec` shim so we
+// can assert the cardinality / dim / skip semantics without paying the cost
+// of the full advisory-lock + transaction harness exercised by the #239/#244
+// tests above.
+describe('Issue #289 — rebuildBatch cardinality + dimension validation', () => {
+  // Local exec mock — tracks UPDATE calls so tests can assert which rows
+  // (if any) were written. Returns rowCount=1 by default; a test can
+  // override the default to simulate a race (UPDATE matches zero rows).
+  let execMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    execMock = vi.fn(async () => ({ rows: [{ id: 'fake' }] }));
+  });
+
+  interface DimRow {
+    id: string;
+    tenant_id: string;
+    agent_id: string;
+    conteudo: string;
+  }
+
+  function makeProvider(returned: Array<number[] | undefined>): {
+    name: 'voyage';
+    modelId: 'voyage-3';
+    dimensions: number;
+    embed: ReturnType<typeof vi.fn>;
+  } {
+    return {
+      name: 'voyage',
+      modelId: 'voyage-3',
+      dimensions: expectedDim,
+      // Provider type is `number[][]`; we deliberately return holes/wrong-
+      // dim entries to simulate the bug path. Cast through unknown so TS
+      // doesn't fight us.
+      embed: vi.fn().mockResolvedValue(returned as unknown as number[][]),
+    };
+  }
+
+  it('skips rows with undefined vector and audits each skip under the row tenant', async () => {
+    const { rebuildBatch } = await import('@/../scripts/embeddings-rebuild.ts');
+
+    const rows: DimRow[] = [
+      { id: 'row-0', tenant_id: 'tenant-A', agent_id: 'agent-A', conteudo: 'a' },
+      { id: 'row-1', tenant_id: 'tenant-B', agent_id: 'agent-B', conteudo: 'b' },
+      { id: 'row-2', tenant_id: 'tenant-C', agent_id: 'agent-C', conteudo: 'c' },
+    ];
+    // Cardinality matches (3 vectors for 3 texts) but the middle one is a
+    // hole — exactly the original `embs[i] ?? []` corruption path.
+    const validVec = Array(expectedDim).fill(0.1);
+    const provider = makeProvider([validVec, undefined, validVec]);
+
+    const result = await rebuildBatch(
+      provider as never,
+      rows,
+      expectedDim,
+      execMock as never,
+    );
+
+    expect(result).toEqual({ updated: 2, skipped: 1 });
+    expect(execMock).toHaveBeenCalledTimes(2);
+
+    // Audited under the row's own context, with the expected metadata.
+    expect(auditMock).toHaveBeenCalledTimes(1);
+    const auditCall = auditMock.mock.calls[0]![0] as {
+      acao: string;
+      entidade_alvo: string;
+      alvo_id: string;
+      metadata: Record<string, unknown>;
+    };
+    expect(auditCall.acao).toBe('embeddings_rebuild_skip_invalid');
+    expect(auditCall.entidade_alvo).toBe('agent_memory');
+    expect(auditCall.alvo_id).toBe('row-1');
+    expect(auditCall.metadata.reason).toBe('missing_vector');
+  });
+
+  it('throws ProviderCardinalityError when provider returns fewer vectors than texts', async () => {
+    const { rebuildBatch, ProviderCardinalityError } = await import(
+      '@/../scripts/embeddings-rebuild.ts'
+    );
+
+    const rows: DimRow[] = [
+      { id: 'row-0', tenant_id: 't', agent_id: 'a', conteudo: 'a' },
+      { id: 'row-1', tenant_id: 't', agent_id: 'a', conteudo: 'b' },
+      { id: 'row-2', tenant_id: 't', agent_id: 'a', conteudo: 'c' },
+    ];
+    // 3 texts → 2 vectors. Pre-fix code would write `[]::vector` to row 2;
+    // post-fix code must abort the batch before any UPDATE.
+    const validVec = Array(expectedDim).fill(0.1);
+    const provider = makeProvider([validVec, validVec]);
+
+    await expect(
+      rebuildBatch(provider as never, rows, expectedDim, execMock as never),
+    ).rejects.toBeInstanceOf(ProviderCardinalityError);
+
+    // Zero UPDATEs — the batch never wrote anything.
+    expect(execMock).not.toHaveBeenCalled();
+    // No audit either — cardinality is a hard error, not a per-row skip.
+    expect(auditMock).not.toHaveBeenCalled();
+  });
+
+  it('skips vectors with wrong dimension (and never writes [] vector)', async () => {
+    const { rebuildBatch } = await import('@/../scripts/embeddings-rebuild.ts');
+
+    const rows: DimRow[] = [
+      { id: 'row-0', tenant_id: 't', agent_id: 'a', conteudo: 'a' },
+      { id: 'row-1', tenant_id: 't', agent_id: 'a', conteudo: 'b' },
+    ];
+    // Both vectors present, but row-1's is short.
+    // Pre-fix code would write the short literal, which pgvector accepts
+    // but silently breaks similarity search.
+    const validVec = Array(expectedDim).fill(0.1);
+    const shortVec = [0.7, 0.8]; // length 2, definitely != expectedDim
+    const provider = makeProvider([validVec, shortVec]);
+
+    const result = await rebuildBatch(
+      provider as never,
+      rows,
+      expectedDim,
+      execMock as never,
+    );
+
+    expect(result).toEqual({ updated: 1, skipped: 1 });
+    expect(execMock).toHaveBeenCalledTimes(1);
+    // Critically — no UPDATE call carried the literal `[]`.
+    const calls = execMock.mock.calls.map((c) => JSON.stringify(c[0])).join('|');
+    expect(calls).not.toContain('"[]"');
+
+    expect(auditMock).toHaveBeenCalledTimes(1);
+    const auditCall = auditMock.mock.calls[0]![0] as {
+      metadata: Record<string, unknown>;
+    };
+    expect(auditCall.metadata.reason).toBe('wrong_dimension');
+    expect(auditCall.metadata.got_dim).toBe(2);
+    expect(auditCall.metadata.expected_dim).toBe(expectedDim);
+  });
+
+  it('empty batch is a no-op (provider never called)', async () => {
+    const { rebuildBatch } = await import('@/../scripts/embeddings-rebuild.ts');
+    const provider = makeProvider([]);
+    const result = await rebuildBatch(
+      provider as never,
+      [],
+      expectedDim,
+      execMock as never,
+    );
+    expect(result).toEqual({ updated: 0, skipped: 0 });
+    expect(provider.embed).not.toHaveBeenCalled();
+    expect(execMock).not.toHaveBeenCalled();
+  });
+
+  it('UPDATE returning zero rows counts as skipped (race detection)', async () => {
+    // Simulate the mid-batch race: SELECT pulled row-0, but by the time
+    // UPDATE landed, another worker had flipped (tenant_id, agent_id) on
+    // that id. The UPDATE matches zero rows (RETURNING is empty). The
+    // production loop logs warn but does not throw — counts it as skipped
+    // so the batch totals stay consistent.
+    const { rebuildBatch } = await import('@/../scripts/embeddings-rebuild.ts');
+    const validVec = Array(expectedDim).fill(0.1);
+    const provider = makeProvider([validVec]);
+    const noRowsExec = vi.fn(async () => ({ rows: [] }));
+
+    const result = await rebuildBatch(
+      provider as never,
+      [{ id: 'row-0', tenant_id: 't', agent_id: 'a', conteudo: 'a' }],
+      expectedDim,
+      noRowsExec as never,
+    );
+
+    expect(result).toEqual({ updated: 0, skipped: 1 });
+    expect(noRowsExec).toHaveBeenCalledTimes(1);
+    // No audit — race is a warn-only signal, not a per-row audit event.
+    expect(auditMock).not.toHaveBeenCalled();
   });
 });

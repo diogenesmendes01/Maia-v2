@@ -137,6 +137,12 @@ export const AUDIT_ACTIONS = [
   // fails (legacy fallback removed). Surfaces previously-masked failures and
   // prevents cross-tenant rate-limit bucket collapse via default/default.
   'channel_resolution_failed',
+  // Issue #289 — emitted by scripts/embeddings-rebuild.ts when the embedding
+  // provider returns a vector with the wrong dimension (or no vector at all)
+  // for a row. We skip the UPDATE so the previous run's re-detection
+  // predicate keeps the row pending for the next execution, and the audit
+  // event makes the silent corruption visible to ops.
+  'embeddings_rebuild_skip_invalid',
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];
