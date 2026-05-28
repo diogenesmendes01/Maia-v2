@@ -25,9 +25,17 @@ const KEY_PREFIX = 'maia:vision:';
  * cache leaves NO audit trail for tenant B's processing event.
  *
  * AFTER this fix:
- *   - Key is `maia:vision:${tenant_id}:${tool}:${sha256}`, where `tenant_id`
- *     is resolved from `getCurrentTenant()` (AsyncLocalStorage via
- *     `@/db/tenant-context`).
+ *   - Key is `maia:vision:${enc(tenant_id)}:${enc(tool)}:${enc(sha256)}`,
+ *     where `tenant_id` is resolved from `getCurrentTenant()`
+ *     (AsyncLocalStorage via `@/db/tenant-context`) and each segment is
+ *     URI-encoded so `:` (the segment separator) and `%` can NEVER appear
+ *     unescaped inside a segment. Rationale (review #257, MEDIUM):
+ *       `tenants.id` is text/free-form (slug), so a tenant slug containing
+ *       `:` (e.g. `acme:dev`) would otherwise collide with a
+ *       `(tenant=acme, tool=dev:parse_image, sha=...)` tuple — defeating
+ *       the isolation invariant. `encodeURIComponent` makes the encoding
+ *       reversible and segment-unambiguous (the only `%` in a key is a
+ *       quoting prefix introduced by us).
  *   - Missing tenant context throws `MissingTenantContextError` — loud
  *     failure, never a silent fall-through to a shared bucket. Rationale:
  *     a cache entry written under a wrong/empty namespace would be
@@ -35,11 +43,26 @@ const KEY_PREFIX = 'maia:vision:';
  *     than mask it.
  *   - The old prefix is no longer reachable through this API; pre-existing
  *     entries age out via the existing 1h TTL (`TTL_SECONDS`). No explicit
- *     migration is required — the data is short-lived by construction.
+ *     migration is required — the data is short-lived by construction. The
+ *     encoding change has the same property: previously-written keys
+ *     (whose unencoded form differed only when a segment contained `:` or
+ *     `%`) simply expire on the 1h TTL.
  *
  * Cache misses (Redis down, deserialization error) remain silently ignored
  * — the tool falls back to a fresh Vision call.
  */
+
+/**
+ * Build the tenant-scoped Redis key. Each segment is URI-encoded so the `:`
+ * delimiter is unambiguous: a tenant slug like `acme:dev` becomes
+ * `acme%3Adev`, which can never collide with a tuple where the tenant is
+ * `acme` and the tool starts with `dev:`. Exported via the module's two
+ * public functions only — not part of the API surface.
+ */
+function buildKey(tenant_id: string, tool: string, file_sha256: string): string {
+  return `${KEY_PREFIX}${encodeURIComponent(tenant_id)}:${encodeURIComponent(tool)}:${encodeURIComponent(file_sha256)}`;
+}
+
 export async function getCachedVision<T>(tool: string, file_sha256: string): Promise<T | null> {
   // Resolve tenant BEFORE the Redis call — if there is no active tenant
   // context this throws `MissingTenantContextError`. We refuse to serve a
@@ -47,7 +70,7 @@ export async function getCachedVision<T>(tool: string, file_sha256: string): Pro
   const tenant_id = getCurrentTenant();
   if (!isRedisConnected()) return null;
   try {
-    const v = await redis.get(`${KEY_PREFIX}${tenant_id}:${tool}:${file_sha256}`);
+    const v = await redis.get(buildKey(tenant_id, tool, file_sha256));
     return v ? (JSON.parse(v) as T) : null;
   } catch (err) {
     logger.warn({ err: (err as Error).message, tool }, 'vision_cache.read_failed');
@@ -66,11 +89,7 @@ export async function setCachedVision(
   const tenant_id = getCurrentTenant();
   if (!isRedisConnected()) return;
   try {
-    await redis.setex(
-      `${KEY_PREFIX}${tenant_id}:${tool}:${file_sha256}`,
-      TTL_SECONDS,
-      JSON.stringify(value),
-    );
+    await redis.setex(buildKey(tenant_id, tool, file_sha256), TTL_SECONDS, JSON.stringify(value));
   } catch (err) {
     logger.warn({ err: (err as Error).message, tool }, 'vision_cache.write_failed');
   }

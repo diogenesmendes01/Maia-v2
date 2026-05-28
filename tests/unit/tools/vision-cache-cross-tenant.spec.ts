@@ -298,5 +298,141 @@ describe('Issue #250 — vision cache is tenant-scoped', () => {
         setCachedVision('parse_image', 'sha-X', { kind: 'boleto' }),
       ).rejects.toBeInstanceOf(MissingTenantContextError);
     });
+
+    // SYMMETRY of the fail-closed guard: getCachedVision must also throw
+    // when tenant context is missing even when Redis is down. This closes
+    // the asymmetric-coverage gap flagged by the review (#257 LOW).
+    it('but a Redis-down GET STILL throws when tenant context is missing', async () => {
+      connected = false;
+      const { getCachedVision } = await import('@/tools/_vision-cache.js');
+      // Fail-closed wins over best-effort: the tenant guard fires before
+      // the `isRedisConnected()` early return, so the missing-context
+      // signal is preserved even in the degraded mode.
+      await expect(getCachedVision('parse_image', 'sha-X')).rejects.toBeInstanceOf(
+        MissingTenantContextError,
+      );
+      // Defense in depth: NO Redis ops issued — the guard fires before
+      // any Redis call would have been attempted.
+      expect(ops).toHaveLength(0);
+    });
+  });
+
+  // ---------------------------------------------------------------------
+  // Key delimiter aliasing (review #257 MEDIUM).
+  //
+  // `tenants.id` is text/free-form (slug), so a tenant whose id contains
+  // `:` would otherwise collide with a different tuple if keys were
+  // built by raw `${tenant}:${tool}:${sha}` interpolation. Each segment
+  // is URI-encoded so `:` becomes `%3A` and the segment boundary stays
+  // unambiguous. These tests ASSERT the encoding so a future regression
+  // (someone removing the encode call) trips on the EXACT collision case
+  // the review flagged.
+  // ---------------------------------------------------------------------
+  describe('KEY ALIASING (delimiter escape)', () => {
+    it('tenant id with `:` is URI-encoded so the segment boundary stays unambiguous', async () => {
+      const { setCachedVision } = await import('@/tools/_vision-cache.js');
+      await runWithTenantContext(
+        { tenant_id: 'acme:dev', agent_id: 'agent-X' },
+        async () => {
+          await setCachedVision('parse_image', 'sha-X', { kind: 'boleto' });
+        },
+      );
+      const writes = ops.filter((o) => o.op === 'setex');
+      expect(writes).toHaveLength(1);
+      // `:` in the tenant id MUST be encoded — otherwise the key is
+      // ambiguous with `(tenant='acme', tool='dev', sha='parse_image:sha-X')`.
+      expect(writes[0]!.key).toBe('maia:vision:acme%3Adev:parse_image:sha-X');
+    });
+
+    it('two ambiguous tuples that would alias under raw interpolation produce DIFFERENT encoded keys', async () => {
+      // Pre-fix raw interpolation would yield IDENTICAL keys for these two
+      // tuples — the very collision the review (#257 MEDIUM) called out:
+      //   T1 = ('acme:dev',   'parse_image',     'sha-X')
+      //        →  maia:vision:acme:dev:parse_image:sha-X
+      //   T2 = ('acme',       'dev:parse_image', 'sha-X')
+      //        →  maia:vision:acme:dev:parse_image:sha-X   ← SAME!
+      // Post-fix the `:` in each segment is encoded as `%3A`, so the two
+      // tuples land in distinct cache buckets.
+      const { setCachedVision } = await import('@/tools/_vision-cache.js');
+      await runWithTenantContext(
+        { tenant_id: 'acme:dev', agent_id: 'agent-1' },
+        async () => {
+          await setCachedVision('parse_image', 'sha-X', { tag: 'T1' });
+        },
+      );
+      await runWithTenantContext({ tenant_id: 'acme', agent_id: 'agent-2' }, async () => {
+        await setCachedVision('dev:parse_image', 'sha-X', { tag: 'T2' });
+      });
+      const writeKeys = ops.filter((o) => o.op === 'setex').map((o) => o.key);
+      expect(writeKeys).toEqual([
+        'maia:vision:acme%3Adev:parse_image:sha-X',
+        'maia:vision:acme:dev%3Aparse_image:sha-X',
+      ]);
+      // Defence in depth: store has TWO distinct entries, not one
+      // overwritten — exactly the property the cross-tenant invariant
+      // demands.
+      expect(store.size).toBe(2);
+    });
+
+    it('tenant id with `:` does NOT receive another tenant`s cached payload (aliasing → ISOLATION)', async () => {
+      const { setCachedVision, getCachedVision } = await import('@/tools/_vision-cache.js');
+      // T1 caches under (tenant='acme:dev', tool='parse_image').
+      await runWithTenantContext(
+        { tenant_id: 'acme:dev', agent_id: 'agent-1' },
+        async () => {
+          await setCachedVision('parse_image', 'sha-X', { tag: 'T1' });
+        },
+      );
+      // T2 reads from the would-be-aliased tuple
+      // (tenant='acme', tool='dev:parse_image'). Under raw interpolation
+      // this would have served T1's payload; post-fix it MUST miss.
+      const fromT2 = await runWithTenantContext(
+        { tenant_id: 'acme', agent_id: 'agent-2' },
+        async () => {
+          return getCachedVision<{ tag: string }>('dev:parse_image', 'sha-X');
+        },
+      );
+      expect(fromT2).toBeNull();
+    });
+
+    it('tool name with `:` is URI-encoded (segment boundary stays unambiguous)', async () => {
+      const { setCachedVision } = await import('@/tools/_vision-cache.js');
+      await runWithTenantContext(A_CTX, async () => {
+        await setCachedVision('weird:tool', 'sha-X', { kind: 'boleto' });
+      });
+      const writes = ops.filter((o) => o.op === 'setex');
+      expect(writes).toHaveLength(1);
+      expect(writes[0]!.key).toBe('maia:vision:tenant-A:weird%3Atool:sha-X');
+    });
+
+    it('sha256 with `:` is URI-encoded (segment boundary stays unambiguous)', async () => {
+      // file_sha256 is `z.string().min(1)` (parse-image.ts), so the schema
+      // does NOT enforce a hex shape — any non-empty string is accepted.
+      // Encode it too: defence in depth against a future caller passing a
+      // delimiter-bearing identifier here.
+      const { setCachedVision } = await import('@/tools/_vision-cache.js');
+      await runWithTenantContext(A_CTX, async () => {
+        await setCachedVision('parse_image', 'sha:with:colons', { kind: 'boleto' });
+      });
+      const writes = ops.filter((o) => o.op === 'setex');
+      expect(writes).toHaveLength(1);
+      expect(writes[0]!.key).toBe(
+        'maia:vision:tenant-A:parse_image:sha%3Awith%3Acolons',
+      );
+    });
+
+    it('round-trip with delimiter-bearing tenant id works (encode is reversible-shaped)', async () => {
+      // The encode is consistent across get/set, so a write+read in the
+      // SAME (delimiter-bearing) tenant still round-trips correctly.
+      const { setCachedVision, getCachedVision } = await import('@/tools/_vision-cache.js');
+      const got = await runWithTenantContext(
+        { tenant_id: 'acme:dev', agent_id: 'agent-1' },
+        async () => {
+          await setCachedVision('parse_image', 'sha-RT', { kind: 'boleto', tag: 'rt' });
+          return getCachedVision<{ kind: string; tag: string }>('parse_image', 'sha-RT');
+        },
+      );
+      expect(got).toEqual({ kind: 'boleto', tag: 'rt' });
+    });
   });
 });
