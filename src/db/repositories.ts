@@ -16,6 +16,7 @@ import {
   learned_rules,
   pending_questions,
   idempotency_keys,
+  outbound_messages,
   audit_log,
   workflows,
   workflow_steps,
@@ -1228,6 +1229,109 @@ export const idempotencyRepo = {
       .where(sql`created_at < now() - (${olderThanDays} || ' days')::interval`)
       .returning({ key: idempotency_keys.key });
     return rows.length;
+  },
+};
+
+// Issue #227: outbound delivery idempotency ledger. Migration 063 schema.
+export type OutboundMessageRow = typeof outbound_messages.$inferSelect;
+export type OutboundChannel = 'text' | 'voice' | 'document' | 'poll';
+export type OutboundStatus = 'pending' | 'sent' | 'failed' | 'unknown';
+
+export const outboundMessagesRepo = {
+  /**
+   * Pre-send optimistic upsert. Returns the current row and a `skip` flag:
+   *   - skip=false: we claimed this turn (inserted a new pending row OR took
+   *     over an existing pending/failed row by resetting it to pending).
+   *     Caller proceeds with the gateway send, then markSent/markFailed.
+   *   - skip=true: the existing row already has status 'sent' or 'unknown' —
+   *     the user got (or might have gotten) this turn's reply. Caller MUST NOT
+   *     send again. The returned row's provider_message_id is the original ack
+   *     (NULL when status='unknown').
+   * Atomic via INSERT … ON CONFLICT DO UPDATE … WHERE (the WHERE rejects the
+   * takeover for non-retryable statuses). No race window: two concurrent
+   * dispatchers for the same turn can't both come back with skip=false.
+   */
+  async upsertPending(input: {
+    idempotency_key: string;
+    conversa_id: string;
+    in_reply_to: string;
+    channel: OutboundChannel;
+    tenant_id?: string;
+    agent_id?: string;
+  }): Promise<{ row: OutboundMessageRow; skip: boolean }> {
+    const claimed = await db
+      .insert(outbound_messages)
+      .values({
+        idempotency_key: input.idempotency_key,
+        conversa_id: input.conversa_id,
+        in_reply_to: input.in_reply_to,
+        channel: input.channel,
+        tenant_id: input.tenant_id ?? 'default',
+        agent_id: input.agent_id ?? 'default',
+        status: 'pending',
+      })
+      .onConflictDoUpdate({
+        target: outbound_messages.idempotency_key,
+        // Reset to pending + new channel ONLY when the prior status is retryable.
+        // The WHERE filters out 'sent' / 'unknown' (must NOT be re-attempted).
+        set: {
+          status: 'pending',
+          channel: input.channel,
+          error: null,
+          sent_at: null,
+        },
+        where: sql`${outbound_messages.status} IN ('pending', 'failed')`,
+      })
+      .returning();
+    if (claimed.length > 0) {
+      return { row: claimed[0]!, skip: false };
+    }
+    // Conflict rejected by the WHERE: the existing row is 'sent' or 'unknown' —
+    // re-sending would risk double-send. Read it back so the caller can return
+    // its provider_message_id (if any) without another send.
+    const [existing] = await db
+      .select()
+      .from(outbound_messages)
+      .where(eq(outbound_messages.idempotency_key, input.idempotency_key))
+      .limit(1);
+    return { row: existing!, skip: true };
+  },
+  /**
+   * Record a successful send. `provider_message_id` may be NULL when the
+   * gateway returned no key.id but isBaileysConnected() confirmed the send
+   * happened (the 'sent without id' case dispatchOutput tags delivered:true).
+   */
+  async markSent(key: string, provider_message_id: string | null): Promise<void> {
+    await db
+      .update(outbound_messages)
+      .set({ status: 'sent', provider_message_id, sent_at: sql`now()` })
+      .where(eq(outbound_messages.idempotency_key, key));
+  },
+  /**
+   * Record a failed attempt. `ambiguous=true` (the crux) means "could have
+   * been delivered" — record 'unknown' so the per-turn guard treats it as sent
+   * (no re-send), trading a sliver of silence risk for zero double-send.
+   * `ambiguous=false` means "definitely not delivered" (pre-send disconnect /
+   * throw before the wire) — record 'failed', a retry is safe.
+   */
+  async markFailed(
+    key: string,
+    error: string,
+    ambiguous: boolean,
+  ): Promise<void> {
+    await db
+      .update(outbound_messages)
+      .set({ status: ambiguous ? 'unknown' : 'failed', error })
+      .where(eq(outbound_messages.idempotency_key, key));
+  },
+  /** Convenience for tests / ops. */
+  async findByKey(key: string): Promise<OutboundMessageRow | null> {
+    const rows = await db
+      .select()
+      .from(outbound_messages)
+      .where(eq(outbound_messages.idempotency_key, key))
+      .limit(1);
+    return rows[0] ?? null;
   },
 };
 
