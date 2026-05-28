@@ -28,6 +28,8 @@ import {
   learned_rules,
   memory_entry,
 } from '@/db/schema.js';
+import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
+import { TypedError } from '@/lib/utils.js';
 import type {
   KnowledgeKind,
   KnowledgeLifecycleStatus,
@@ -317,10 +319,27 @@ export const knowledgeRepos = {
         return row ? normaliseRow(row as unknown as AnyRow) : null;
       }
       case 'rule': {
+        // Issue #234 — cross-tenant guard. `learned_rules` reads via the
+        // KSM facade must be tenant/agent-scoped so a UUID from tenant-B
+        // cannot be fetched (and subsequently mutated) under tenant-A's
+        // context. Reads through `rulesRepo.byId` already enforce this
+        // (src/db/repositories.ts); the KSM facade was bypassing it.
+        // ALS contract: callers MUST establish tenant context via
+        // `runWithTenantContext` before invoking the KSM. The
+        // auto-promoter wraps each per-row transition() call using the
+        // row's persisted tenant_id+agent_id (workers/knowledge-state-promoter.ts).
+        const tenant_id = getCurrentTenant();
+        const agent_id = getCurrentAgent();
         const rows = await db
           .select()
           .from(learned_rules)
-          .where(eq(learned_rules.id, id))
+          .where(
+            and(
+              eq(learned_rules.id, id),
+              eq(learned_rules.tenant_id, tenant_id),
+              eq(learned_rules.agent_id, agent_id),
+            ),
+          )
           .limit(1);
         const row = rows[0];
         return row ? normaliseRow(row as unknown as AnyRow) : null;
@@ -400,19 +419,81 @@ export const knowledgeRepos = {
         return;
       }
       case 'rule': {
+        // Issue #234 — cross-tenant guard. Pin tenant_id+agent_id into
+        // the UPDATE WHERE so a foreign-tenant rule id cannot be mutated
+        // through the KSM facade. The mutators on `rulesRepo`
+        // (incrementAcerto/incrementErro/setStatus) already enforce this
+        // (PR #232 / issue #230); the KSM facade was the remaining hole.
+        // Distinguishing the two failure modes:
+        //   1. 0 rows AND no `expected` → tenant_id/agent_id/id mismatch
+        //      → throw `TypedError('rule_not_in_scope', ...)` to match
+        //      rulesRepo behaviour (greppable in telemetry, never silent).
+        //   2. 0 rows AND `expected` set → either out-of-scope OR
+        //      optimistic-concurrency mismatch. We can't tell which from
+        //      affected_rows alone. A re-read scoped by tenant/agent
+        //      tells us: a NULL row means out-of-scope (throw
+        //      `rule_not_in_scope`); a non-NULL row with a different
+        //      lifecycle_status means concurrency mismatch (throw
+        //      `KnowledgeConflictError`, preserving the existing
+        //      state-machine catch path).
+        const tenant_id = getCurrentTenant();
+        const agent_id = getCurrentAgent();
         const where = expected
           ? and(
               eq(learned_rules.id, id),
+              eq(learned_rules.tenant_id, tenant_id),
+              eq(learned_rules.agent_id, agent_id),
               eq(learned_rules.lifecycle_status, expected),
             )
-          : eq(learned_rules.id, id);
+          : and(
+              eq(learned_rules.id, id),
+              eq(learned_rules.tenant_id, tenant_id),
+              eq(learned_rules.agent_id, agent_id),
+            );
         const rows = await db
           .update(learned_rules)
           .set(set)
           .where(where)
           .returning({ id: learned_rules.id });
-        if (expected && rows.length === 0) {
-          throw new KnowledgeConflictError(kind, id, expected);
+        if (rows.length === 0) {
+          if (expected) {
+            // Disambiguate scope-miss vs concurrency-miss by re-reading
+            // under the SAME tenant/agent scope. Disambiguation is
+            // important because the auto-promoter treats
+            // IllegalTransitionError (the state-machine's surfaced form
+            // of KnowledgeConflictError) as benign for parallel-promote
+            // races, but cross-tenant attempts MUST surface as
+            // `rule_not_in_scope` for telemetry/alerting.
+            const probe = await db
+              .select({
+                id: learned_rules.id,
+                lifecycle_status: learned_rules.lifecycle_status,
+              })
+              .from(learned_rules)
+              .where(
+                and(
+                  eq(learned_rules.id, id),
+                  eq(learned_rules.tenant_id, tenant_id),
+                  eq(learned_rules.agent_id, agent_id),
+                ),
+              )
+              .limit(1);
+            if (probe.length === 0) {
+              throw new TypedError(
+                'rule_not_in_scope',
+                `rule ${id} not found in current tenant/agent scope`,
+              );
+            }
+            // In-scope row exists but lifecycle_status diverged → real
+            // optimistic-concurrency conflict.
+            throw new KnowledgeConflictError(kind, id, expected);
+          }
+          // No `expected` and no rows matched → unambiguously out-of-scope
+          // (foreign tenant, foreign agent, or unknown id). Loud failure.
+          throw new TypedError(
+            'rule_not_in_scope',
+            `rule ${id} not found in current tenant/agent scope`,
+          );
         }
         return;
       }
@@ -460,11 +541,16 @@ export const knowledgeRepos = {
 
   /**
    * Used by the auto-promoter to find rows eligible for a state
-   * transition. Returns `{id, lifecycle_status}` pairs only — the
+   * transition. Returns `{id, tenant_id, agent_id}` pairs — the
    * promoter loops single-row transitions through
-   * KnowledgeStateMachine.transition so audit invariants hold.
+   * KnowledgeStateMachine.transition (so audit invariants hold) AND
+   * uses tenant_id/agent_id to establish ALS context via
+   * `runWithTenantContext` before invoking transition() (issue #234).
+   * Without ALS context the tenant-scoped guard on the KSM facade's
+   * `findById`/`update` for `kind: 'rule'` would throw
+   * MissingTenantContextError.
    *
-   * `evidenceFilter` is a SQL predicate string that gets ANDed onto
+   * `extraFilter` is a SQL predicate string that gets ANDed onto
    * the lifecycle_status filter. We build it via `sql.raw` only for
    * fixed-shape comparisons the promoter owns.
    */
@@ -473,46 +559,78 @@ export const knowledgeRepos = {
     from: KnowledgeLifecycleStatus;
     extraFilter: SQL;
     limit?: number;
-  }): Promise<Array<{ id: string }>> {
+  }): Promise<Array<{ id: string; tenant_id: string; agent_id: string }>> {
     const limit = args.limit ?? 100;
     const fromVal = args.from;
     switch (args.kind) {
       case 'fact': {
         return (await db
-          .select({ id: agent_facts.id })
+          .select({
+            id: agent_facts.id,
+            tenant_id: agent_facts.tenant_id,
+            agent_id: agent_facts.agent_id,
+          })
           .from(agent_facts)
           .where(
             and(eq(agent_facts.lifecycle_status, fromVal), args.extraFilter),
           )
-          .limit(limit)) as Array<{ id: string }>;
+          .limit(limit)) as Array<{
+          id: string;
+          tenant_id: string;
+          agent_id: string;
+        }>;
       }
       case 'rule': {
         return (await db
-          .select({ id: learned_rules.id })
+          .select({
+            id: learned_rules.id,
+            tenant_id: learned_rules.tenant_id,
+            agent_id: learned_rules.agent_id,
+          })
           .from(learned_rules)
           .where(
             and(eq(learned_rules.lifecycle_status, fromVal), args.extraFilter),
           )
-          .limit(limit)) as Array<{ id: string }>;
+          .limit(limit)) as Array<{
+          id: string;
+          tenant_id: string;
+          agent_id: string;
+        }>;
       }
       case 'memory': {
         return (await db
-          .select({ id: memory_entry.id })
+          .select({
+            id: memory_entry.id,
+            tenant_id: memory_entry.tenant_id,
+            agent_id: memory_entry.agent_id,
+          })
           .from(memory_entry)
           .where(
             and(eq(memory_entry.lifecycle_status, fromVal), args.extraFilter),
           )
-          .limit(limit)) as Array<{ id: string }>;
+          .limit(limit)) as Array<{
+          id: string;
+          tenant_id: string;
+          agent_id: string;
+        }>;
       }
       case 'behavioral_hint':
       case 'procedure_hint': {
         return (await db
-          .select({ id: behavioral_hint.id })
+          .select({
+            id: behavioral_hint.id,
+            tenant_id: behavioral_hint.tenant_id,
+            agent_id: behavioral_hint.agent_id,
+          })
           .from(behavioral_hint)
           .where(
             and(eq(behavioral_hint.lifecycle_status, fromVal), args.extraFilter),
           )
-          .limit(limit)) as Array<{ id: string }>;
+          .limit(limit)) as Array<{
+          id: string;
+          tenant_id: string;
+          agent_id: string;
+        }>;
       }
       default: {
         const _exhaustive: never = args.kind;

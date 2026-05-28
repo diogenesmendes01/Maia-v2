@@ -31,6 +31,7 @@ import { FeatureFlagName } from '@/types/enums.js';
 import { KnowledgeStateMachine } from '@/control-plane/knowledge-state-machine/state-machine.js';
 import { knowledgeRepos } from '@/control-plane/knowledge-state-machine/repos.js';
 import { IllegalTransitionError } from '@/control-plane/knowledge-state-machine/transitions.js';
+import { runWithTenantContext } from '@/db/tenant-context.js';
 import type {
   KnowledgeKind,
   KnowledgeDecidedBy,
@@ -94,7 +95,7 @@ async function promote(args: {
     typeof args.filter === 'function' ? args.filter(kind) : args.filter;
 
   for (const kind of KINDS) {
-    let rows: Array<{ id: string }>;
+    let rows: Array<{ id: string; tenant_id: string; agent_id: string }>;
     try {
       rows = await knowledgeRepos.listEligible({
         kind,
@@ -113,13 +114,26 @@ async function promote(args: {
 
     for (const row of rows) {
       try {
-        await KnowledgeStateMachine.transition({
-          kind,
-          proposal_id: row.id,
-          to: args.to,
-          reason: args.reason,
-          decided_by: args.decided_by,
-        });
+        // Issue #234 — establish ALS tenant context per row using the
+        // row's persisted tenant_id+agent_id. The KSM facade's
+        // findById/update for `kind: 'rule'` enforce
+        // tenant_id+agent_id scoping via ALS (mirrors rulesRepo
+        // mutators from PR #232). Without this wrapper the auto-
+        // promoter would throw MissingTenantContextError on every
+        // transition() against a rule. Same scope is used for non-rule
+        // kinds for consistency — the cognitive-module audit log path
+        // also benefits from a non-empty tenant context.
+        await runWithTenantContext(
+          { tenant_id: row.tenant_id, agent_id: row.agent_id },
+          () =>
+            KnowledgeStateMachine.transition({
+              kind,
+              proposal_id: row.id,
+              to: args.to,
+              reason: args.reason,
+              decided_by: args.decided_by,
+            }),
+        );
         (args.stats[args.counterKey] as number)++;
       } catch (err) {
         // IllegalTransitionError from a row that was already moved

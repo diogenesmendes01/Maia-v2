@@ -145,9 +145,12 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', async () => {
       async listEligible(args: {
         kind: KnowledgeKind;
         from: KnowledgeLifecycleStatus;
-      }): Promise<Array<{ id: string }>> {
+      }): Promise<Array<{ id: string; tenant_id: string; agent_id: string }>> {
         // Filter rows by status, then apply currentFilter set by the
         // test harness immediately before each promote() call.
+        // Issue #234: the production worker now reads tenant_id+agent_id
+        // off each eligible row to establish ALS context — return them
+        // from the mock too so the wrap doesn't see undefined values.
         const rows = listByStatus(args.kind, args.from);
         const now = Date.now();
         return rows
@@ -182,7 +185,11 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', async () => {
             }
             return true;
           })
-          .map((r) => ({ id: r.id }));
+          .map((r) => ({
+            id: r.id,
+            tenant_id: r.tenant_id,
+            agent_id: r.agent_id,
+          }));
       },
       buildUpdatedAtFilter() {
         return drizzle.sql`true`;
