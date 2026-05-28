@@ -107,13 +107,55 @@ function parseVectorLiteral(s: string): number[] {
 
 const _dialect = new PgDialect();
 
+// Concurrency / lock simulation. When `lockHeld` is true, the advisory lock
+// attempt returns false (simulating another process holding the lock for the
+// SAME key). When false (default), the lock is acquired.
+let lockHeld = false;
+
+// Capture audit_log inserts so tests can assert the run was recorded with
+// the correct tuple + operator identity.
+const auditLogInserts: Array<{
+  tenant_id: string;
+  agent_id: string;
+  acao: string;
+  metadata: Record<string, unknown>;
+}> = [];
+
 const dbExecuteMock = vi.fn(async (query: SQL) => {
   const rendered = _dialect.sqlToQuery(query);
   const sqlText = rendered.sql;
   const params = rendered.params as unknown[];
   renderedSqls.push({ sql: sqlText, params });
 
-  // ---- COUNT(*) ---------------------------------------------------------
+  // ---- pg_try_advisory_xact_lock ---------------------------------------
+  // Production:
+  //   SELECT pg_try_advisory_xact_lock($1, $2) AS acquired
+  if (/pg_try_advisory_xact_lock/i.test(sqlText)) {
+    return { rows: [{ acquired: !lockHeld }] };
+  }
+
+  // ---- COUNT(*) pending (pending-only) ----------------------------------
+  // Production:
+  //   SELECT count(*)::text AS count FROM agent_memories
+  //   WHERE tenant_id = $1 AND agent_id = $2
+  //     AND (embedding IS NULL OR vector_dims(embedding) != $3)
+  if (
+    /SELECT\s+count\(\*\)::text\s+AS\s+count/i.test(sqlText) &&
+    /embedding\s+IS\s+NULL/i.test(sqlText)
+  ) {
+    const tenant_id = params[0] as string;
+    const agent_id = params[1] as string;
+    const expectedDim = Number(params[2]);
+    const count = store.filter(
+      (r) =>
+        r.tenant_id === tenant_id &&
+        r.agent_id === agent_id &&
+        (r.embedding === null || r.embedding.length !== expectedDim),
+    ).length;
+    return { rows: [{ count: String(count) }] };
+  }
+
+  // ---- COUNT(*) total in scope -----------------------------------------
   // Production:
   //   SELECT count(*)::text AS count FROM agent_memories
   //   WHERE tenant_id = $1 AND agent_id = $2
@@ -150,10 +192,25 @@ const dbExecuteMock = vi.fn(async (query: SQL) => {
     return { rows: candidates };
   }
 
+  // ---- INSERT INTO audit_log -------------------------------------------
+  // Production:
+  //   INSERT INTO audit_log (tenant_id, agent_id, acao, metadata)
+  //   VALUES ($1, $2, $3, $4::jsonb)
+  if (/INSERT\s+INTO\s+audit_log/i.test(sqlText)) {
+    auditLogInserts.push({
+      tenant_id: params[0] as string,
+      agent_id: params[1] as string,
+      acao: params[2] as string,
+      metadata: JSON.parse(params[3] as string),
+    });
+    return { rows: [], rowCount: 1 };
+  }
+
   // ---- UPDATE one row ---------------------------------------------------
   // Production:
   //   UPDATE agent_memories SET embedding = $1::vector
   //   WHERE id = $2::uuid AND tenant_id = $3 AND agent_id = $4
+  //   RETURNING id::text
   if (/^\s*UPDATE\s+agent_memories/i.test(sqlText)) {
     const vec = parseVectorLiteral(params[0] as string);
     const id = params[1] as string;
@@ -164,7 +221,7 @@ const dbExecuteMock = vi.fn(async (query: SQL) => {
     );
     if (target) {
       target.embedding = vec;
-      return { rows: [], rowCount: 1 };
+      return { rows: [{ id: target.id }], rowCount: 1 };
     }
     return { rows: [], rowCount: 0 };
   }
@@ -215,6 +272,8 @@ beforeEach(() => {
   store.length = 0;
   renderedSqls.length = 0;
   providerCalls.length = 0;
+  auditLogInserts.length = 0;
+  lockHeld = false;
   dbExecuteMock.mockClear();
 });
 
@@ -357,6 +416,78 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
         tenant_id: 'tenant-A',
         agent_id: 'agent-A',
       });
+    });
+
+    // [Codex #244 MEDIUM] — the issue's contract used --tenant_id / --agent_id
+    // names. We accept both forms as aliases so README / CI snippets that
+    // adopted either spelling keep working. Owner-locked Option A (required)
+    // is preserved: at least one form of each is still required.
+    it('ALIAS — parseRequiredArgs accepts --tenant_id / --agent_id forms', async () => {
+      const { parseRequiredArgs } = await import('@/../scripts/embeddings-rebuild.ts');
+      const argv = [
+        'node',
+        'embeddings-rebuild.ts',
+        '--tenant_id=tenant-X',
+        '--agent_id=agent-X',
+      ];
+      expect(parseRequiredArgs(argv)).toEqual({
+        tenant_id: 'tenant-X',
+        agent_id: 'agent-X',
+      });
+    });
+
+    it('ALIAS — --tenant_id wins when both --tenant and --tenant_id are passed (explicit > short)', async () => {
+      const { parseRequiredArgs } = await import('@/../scripts/embeddings-rebuild.ts');
+      const argv = [
+        'node',
+        'embeddings-rebuild.ts',
+        '--tenant=tenant-OLD',
+        '--tenant_id=tenant-NEW',
+        '--agent_id=agent-X',
+      ];
+      // The longer form is more explicit / less likely to be a typo. Owner
+      // contract is unambiguous: exactly one tenant per run.
+      expect(parseRequiredArgs(argv).tenant_id).toBe('tenant-NEW');
+    });
+
+    it('MIXED — --tenant + --agent_id (one of each form) is accepted', async () => {
+      const { parseRequiredArgs } = await import('@/../scripts/embeddings-rebuild.ts');
+      const argv = [
+        'node',
+        'embeddings-rebuild.ts',
+        '--tenant=tenant-A',
+        '--agent_id=agent-A',
+      ];
+      expect(parseRequiredArgs(argv)).toEqual({
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-A',
+      });
+    });
+  });
+
+  describe('CLI options — dry-run, yes, batch', () => {
+    it('parseCliOptions defaults to {dryRun:false, yes:false, batchSize:undefined}', async () => {
+      const { parseCliOptions } = await import('@/../scripts/embeddings-rebuild.ts');
+      expect(parseCliOptions(['node', 'x', '--tenant=t', '--agent=a'])).toEqual({
+        dryRun: false,
+        yes: false,
+        batchSize: undefined,
+      });
+    });
+
+    it('parseCliOptions picks up --dry-run, --yes, --batch=10', async () => {
+      const { parseCliOptions } = await import('@/../scripts/embeddings-rebuild.ts');
+      expect(
+        parseCliOptions(['node', 'x', '--dry-run', '--yes', '--batch=10']),
+      ).toEqual({ dryRun: true, yes: true, batchSize: 10 });
+    });
+
+    it('parseCliOptions rejects non-positive / non-integer --batch', async () => {
+      const { parseCliOptions } = await import('@/../scripts/embeddings-rebuild.ts');
+      expect(() => parseCliOptions(['node', 'x', '--batch=0'])).toThrow(/invalid --batch/);
+      expect(() => parseCliOptions(['node', 'x', '--batch=-5'])).toThrow(/invalid --batch/);
+      expect(() => parseCliOptions(['node', 'x', '--batch=abc'])).toThrow(/invalid --batch/);
+      expect(() => parseCliOptions(['node', 'x', '--batch=1.5'])).toThrow(/invalid --batch/);
     });
   });
 
@@ -612,6 +743,250 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
       const aOther = store.find((r) => r.id === 'mem_A_other');
       expect(aSelf!.embedding).not.toBeNull();
       expect(aOther!.embedding).toBeNull();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // [Codex #244] Operational hardening — addresses MEDIUMs (CLI alias, lock)
+  // and LOWs (dry-run, RETURNING verification, audit trail).
+  // -------------------------------------------------------------------------
+
+  describe('concurrency — pg_try_advisory_xact_lock', () => {
+    it('LOCK BUSY — another run holds the lock → throws ConcurrentRunError, no mutation', async () => {
+      seedTwoTenants();
+      lockHeld = true; // simulate another process holding the lock for this tuple
+
+      const { rebuildEmbeddingsForTuple, ConcurrentRunError } = await import(
+        '@/../scripts/embeddings-rebuild.ts'
+      );
+      await expect(
+        rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 }),
+      ).rejects.toBeInstanceOf(ConcurrentRunError);
+
+      // No provider call, no UPDATEs: tenant-A rows still pending.
+      expect(providerCalls.length).toBe(0);
+      const aAlpha = store.find((r) => r.id === 'mem_A_alpha');
+      expect(aAlpha!.embedding).toBeNull();
+    });
+
+    it('LOCK FREE — acquired → run proceeds normally', async () => {
+      seedTwoTenants();
+      lockHeld = false;
+
+      const { rebuildEmbeddingsForTuple } = await import(
+        '@/../scripts/embeddings-rebuild.ts'
+      );
+      const result = await rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 });
+      expect(result.updated).toBe(2);
+    });
+
+    it('LOCK CALL SHAPE — uses pg_try_advisory_xact_lock with two int4 keys', async () => {
+      seedTwoTenants();
+      const { rebuildEmbeddingsForTuple } = await import(
+        '@/../scripts/embeddings-rebuild.ts'
+      );
+      await rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 });
+
+      const lockSql = renderedSqls.find((r) =>
+        /pg_try_advisory_xact_lock/i.test(r.sql),
+      );
+      expect(lockSql).toBeDefined();
+      // Two bound integer params (namespace + tuple key). Both must be in the
+      // int4 range so the call signature matches the two-arg overload.
+      expect(lockSql!.params.length).toBe(2);
+      for (const p of lockSql!.params) {
+        expect(Number.isInteger(p as number)).toBe(true);
+        expect(Math.abs(p as number)).toBeLessThanOrEqual(0x7fffffff);
+      }
+    });
+
+    it('LOCK NAMESPACING — different tuples produce different lock keys', async () => {
+      const { fnv1a32 } = await import('@/../scripts/embeddings-rebuild.ts');
+      const a = fnv1a32('tenant-A::agent-A');
+      const b = fnv1a32('tenant-B::agent-B');
+      const c = fnv1a32('tenant-A::agent-OTHER');
+      // No collisions across the seed combinations the test uses.
+      expect(a).not.toBe(b);
+      expect(a).not.toBe(c);
+      expect(b).not.toBe(c);
+    });
+  });
+
+  describe('dry-run mode', () => {
+    it('DRY-RUN — counts pending rows, never calls provider, never UPDATEs', async () => {
+      seedTwoTenants();
+      const { rebuildEmbeddingsForTuple } = await import(
+        '@/../scripts/embeddings-rebuild.ts'
+      );
+      const result = await rebuildEmbeddingsForTuple({
+        ...A_CTX,
+        batchSize: 32,
+        dryRun: true,
+      });
+
+      expect(result.dryRun).toBe(true);
+      expect(result.updated).toBe(0);
+      expect(result.processed).toBe(0);
+      // pendingInScope still reflects the real count so the operator can plan.
+      expect(result.pendingInScope).toBe(2);
+      expect(result.totalInScope).toBe(2);
+
+      // No provider call.
+      expect(providerCalls.length).toBe(0);
+      // No UPDATE issued (only counts + lock + pending count).
+      const updateSqls = renderedSqls.filter((r) =>
+        /^\s*UPDATE\s+agent_memories/i.test(r.sql),
+      );
+      expect(updateSqls.length).toBe(0);
+
+      // Rows untouched.
+      const aAlpha = store.find((r) => r.id === 'mem_A_alpha');
+      expect(aAlpha!.embedding).toBeNull();
+    });
+
+    it('DRY-RUN with zero pending — returns 0 cleanly', async () => {
+      // tenant-A row already correct.
+      store.push({
+        id: 'mem_A_done',
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-A',
+        conteudo: 'A-done',
+        embedding: Array(expectedDim).fill(0.5),
+        created_at: 1,
+      });
+      const { rebuildEmbeddingsForTuple } = await import(
+        '@/../scripts/embeddings-rebuild.ts'
+      );
+      const result = await rebuildEmbeddingsForTuple({
+        ...A_CTX,
+        dryRun: true,
+      });
+      expect(result.pendingInScope).toBe(0);
+      expect(result.totalInScope).toBe(1);
+    });
+  });
+
+  describe('post-write verification — UPDATE ... RETURNING', () => {
+    it('UPDATE SQL uses RETURNING id', async () => {
+      seedTwoTenants();
+      const { rebuildEmbeddingsForTuple } = await import(
+        '@/../scripts/embeddings-rebuild.ts'
+      );
+      await rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 });
+
+      const updateSql = renderedSqls.find((r) =>
+        /^\s*UPDATE\s+agent_memories/i.test(r.sql),
+      );
+      expect(updateSql).toBeDefined();
+      expect(updateSql!.sql).toMatch(/RETURNING/i);
+    });
+
+    it('RACE — UPDATE returning zero rows is NOT counted as updated', async () => {
+      // Seed a tenant-A row, then simulate "row moved out from under us": we
+      // mutate the store BEFORE the UPDATE runs by intercepting the SELECT.
+      // The test fakes the race by changing tenant_id on the row between the
+      // SELECT (which returned it) and the UPDATE (which won't match).
+      const seedRow: StoredRow = {
+        id: 'mem_A_race',
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-A',
+        conteudo: 'A-race-text',
+        embedding: null,
+        created_at: 1,
+      };
+      store.push(seedRow);
+
+      // After the SELECT but before the UPDATE, the row's tenant flips. We
+      // simulate that by hooking the mock to mutate the row right before any
+      // UPDATE call. This produces an UPDATE that matches zero rows under
+      // the tuple+id predicate — the production code must detect this and
+      // NOT increment `updated`.
+      const originalImpl = dbExecuteMock.getMockImplementation();
+      dbExecuteMock.mockImplementation(async (query) => {
+        const rendered = _dialect.sqlToQuery(query);
+        if (/^\s*UPDATE\s+agent_memories/i.test(rendered.sql)) {
+          // Flip tenant before the UPDATE lands.
+          const target = store.find((r) => r.id === 'mem_A_race');
+          if (target) target.tenant_id = 'tenant-MOVED';
+        }
+        return originalImpl!(query);
+      });
+
+      const { rebuildEmbeddingsForTuple } = await import(
+        '@/../scripts/embeddings-rebuild.ts'
+      );
+      const result = await rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 });
+      // Row was flipped out before UPDATE could match → updated must be 0.
+      expect(result.updated).toBe(0);
+      // processed still increments (we did fetch the row), so the operator
+      // sees the discrepancy.
+      expect(result.processed).toBe(1);
+    });
+  });
+
+  describe('audit + operator identity', () => {
+    it('OPERATOR — getOperatorIdentity reads USER / USERNAME / LOGNAME in order', async () => {
+      const { getOperatorIdentity } = await import(
+        '@/../scripts/embeddings-rebuild.ts'
+      );
+      expect(getOperatorIdentity({ USER: 'alice' })).toBe('alice');
+      expect(getOperatorIdentity({ USERNAME: 'bob' })).toBe('bob');
+      expect(getOperatorIdentity({ LOGNAME: 'carol' })).toBe('carol');
+      // USER takes priority over the others.
+      expect(
+        getOperatorIdentity({ USER: 'alice', USERNAME: 'bob', LOGNAME: 'carol' }),
+      ).toBe('alice');
+      expect(getOperatorIdentity({})).toBe('unknown');
+    });
+  });
+
+  describe('error log context', () => {
+    it('PROVIDER FAILURE — logs include tenant_id + agent_id (not just err)', async () => {
+      // Re-mock provider to throw, then assert the logger captured tuple
+      // context. We sniff this via the logger mock — see the top-of-file
+      // mock for `@/lib/logger.js`.
+      const { logger } = await import('@/lib/logger.js');
+      const errorSpy = logger.error as unknown as ReturnType<typeof vi.fn>;
+      errorSpy.mockClear();
+
+      // Replace provider with a failing one for this test only.
+      const embeddingsMod = await import('@/lib/embeddings.js');
+      const original = embeddingsMod.getEmbeddingProvider;
+      (embeddingsMod as unknown as { getEmbeddingProvider: typeof original }).getEmbeddingProvider =
+        () => ({
+          name: 'voyage',
+          modelId: 'fake',
+          dimensions: expectedDim,
+          embed: async () => {
+            throw new Error('provider boom');
+          },
+        });
+
+      try {
+        seedTwoTenants();
+        const { rebuildEmbeddingsForTuple } = await import(
+          '@/../scripts/embeddings-rebuild.ts'
+        );
+        await expect(
+          rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 }),
+        ).rejects.toThrow(/provider boom/);
+
+        // logger.error should have been called with an object that includes
+        // tenant_id + agent_id.
+        expect(errorSpy).toHaveBeenCalled();
+        const calls = errorSpy.mock.calls as unknown as Array<
+          [Record<string, unknown>, string]
+        >;
+        const matchingCall = calls.find(
+          (c) =>
+            (c[0] as Record<string, unknown>).tenant_id === 'tenant-A' &&
+            (c[0] as Record<string, unknown>).agent_id === 'agent-A',
+        );
+        expect(matchingCall).toBeDefined();
+      } finally {
+        (embeddingsMod as unknown as { getEmbeddingProvider: typeof original }).getEmbeddingProvider =
+          original;
+      }
     });
   });
 });
