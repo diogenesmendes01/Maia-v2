@@ -528,4 +528,3 @@ Three concurrency hot spots, all addressed:
 - Existing Fastify server: `src/server.ts`. New routes mount alongside `/health`, `/metrics`, `/dashboard*`.
 - Existing `BAILEYS_AUTH_DIR`: `src/config/env.ts:37`, default `./.baileys-auth`.
 - Existing `ALERT_CHANNELS`: `src/config/env.ts:58-65` (email/telegram via `src/lib/alerts.ts`).
-- Spec 04 — gateway WhatsApp (`docs/specs/04-gateway-whatsapp.md`) — current pairing flow described under "Onboarding".

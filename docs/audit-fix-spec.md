@@ -146,7 +146,7 @@ updates:
 ---
 
 ### Issue #12 — Documentar que camadas de memória são fachadas finas
-**Arquivos:** `docs/arquitetura.md`, `README.md` (seção Stack ou Estrutura)
+**Arquivos:** `README.md` (seção Stack ou Estrutura)
 **Mudança:** adicionar nota:
 > As 5 "camadas" (`episodic`, `semantic`, `procedural`, `working`, `vector`) são fachadas finas sobre Postgres+pgvector e Redis. Eviction, TTL e ranking ficam delegados ao banco/Redis, não à camada de memória. Se vier a precisar de eviction LRU em working ou ranking ponderado em semantic, fica como evolução futura.
 

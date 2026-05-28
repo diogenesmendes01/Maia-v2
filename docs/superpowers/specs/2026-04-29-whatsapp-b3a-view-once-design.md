@@ -244,5 +244,4 @@ Manual checklist on the PR (real WhatsApp Android receiver) — verify that `que
 
 - Sub-A design — `docs/superpowers/specs/2026-04-29-whatsapp-ux-polish-design.md` (`sendOutboundText` opts pattern)
 - B0 design — `docs/superpowers/specs/2026-04-29-whatsapp-b0-pending-gate-design.md` (`Tool` type at `_registry.ts`)
-- Spec 09 — audit taxonomy
 - Baileys docs: `viewOnce` flag on `sendMessage`. **Envelope produced by Baileys 6.7.0 is `viewOnceMessage` (V1)**, NOT `viewOnceMessageV2`. Tests that mock or assert the wrapped shape must match V1.
