@@ -2,34 +2,143 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import {
   _internal_cache,
   cacheKey,
+  getApplicableHolidaysSet,
   invalidateCacheForHolidayChange,
 } from '../../src/lib/holidays-cache.js';
+import { MissingTenantContextError, runWithTenantContext } from '../../src/db/tenant-context.js';
 
 describe('holidays cache', () => {
   beforeEach(() => _internal_cache.clear());
 
   it('cacheKey is tenant-scoped', () => {
-    const a = cacheKey('tenantA', undefined, 2026, 'standard');
-    const b = cacheKey('tenantB', undefined, 2026, 'standard');
+    const a = cacheKey('tenantA', 'agent-1', undefined, 2026, 'standard');
+    const b = cacheKey('tenantB', 'agent-1', undefined, 2026, 'standard');
     expect(a).not.toBe(b);
     expect(a).toContain('tenantA');
   });
 
   it('key inclui tenant_id (cross-tenant isolation)', () => {
     const set = new Set(['2026-12-25']);
-    _internal_cache.set(cacheKey('tenantA', undefined, 2026, 'standard'), set);
-    expect(_internal_cache.get(cacheKey('tenantA', undefined, 2026, 'standard'))).toBe(set);
-    expect(_internal_cache.get(cacheKey('tenantB', undefined, 2026, 'standard'))).toBeUndefined();
+    _internal_cache.set(cacheKey('tenantA', 'agent-1', undefined, 2026, 'standard'), set);
+    expect(_internal_cache.get(cacheKey('tenantA', 'agent-1', undefined, 2026, 'standard'))).toBe(set);
+    expect(_internal_cache.get(cacheKey('tenantB', 'agent-1', undefined, 2026, 'standard'))).toBeUndefined();
+  });
+
+  // Issue #263 — cross-agent isolation within the same tenant
+  it('key inclui agent_id — same (tenant, entidade, year, kind) com agents diferentes gera keys diferentes', () => {
+    const keyAgentA = cacheKey('tenantA', 'agent-A', 'entidade-1', 2026, 'standard');
+    const keyAgentB = cacheKey('tenantA', 'agent-B', 'entidade-1', 2026, 'standard');
+    expect(keyAgentA).not.toBe(keyAgentB);
+    expect(keyAgentA).toContain('agent-A');
+    expect(keyAgentB).toContain('agent-B');
+  });
+
+  it('cross-agent isolation: set para agentA NÃO vaza para agentB (mesmo tenant)', () => {
+    const setA = new Set(['2026-12-25', '2026-06-15']);
+    const setB = new Set(['2026-12-25']);
+    _internal_cache.set(cacheKey('tenantA', 'agent-A', 'entidade-1', 2026, 'standard'), setA);
+    _internal_cache.set(cacheKey('tenantA', 'agent-B', 'entidade-1', 2026, 'standard'), setB);
+
+    expect(_internal_cache.get(cacheKey('tenantA', 'agent-A', 'entidade-1', 2026, 'standard'))).toBe(setA);
+    expect(_internal_cache.get(cacheKey('tenantA', 'agent-B', 'entidade-1', 2026, 'standard'))).toBe(setB);
+    expect(setA).not.toBe(setB);
+  });
+
+  it('cross-agent isolation é simétrico (swap agent ids)', () => {
+    const setA = new Set(['2026-12-25']);
+    const setB = new Set(['2026-06-15']);
+    const keyA = cacheKey('tenantA', 'agent-A', 'entidade-1', 2026, 'standard');
+    const keyB = cacheKey('tenantA', 'agent-B', 'entidade-1', 2026, 'standard');
+    _internal_cache.set(keyA, setA);
+    _internal_cache.set(keyB, setB);
+    expect(_internal_cache.get(keyA)).toBe(setA);
+    expect(_internal_cache.get(keyB)).toBe(setB);
+    // swap returns swapped values
+    _internal_cache.set(keyA, setB);
+    _internal_cache.set(keyB, setA);
+    expect(_internal_cache.get(keyA)).toBe(setB);
+    expect(_internal_cache.get(keyB)).toBe(setA);
+  });
+
+  it('key prefix é v2 (regression test para o bump v1 → v2)', () => {
+    const key = cacheKey('tenantA', 'agent-1', 'entidade-1', 2026, 'standard');
+    expect(key.startsWith('holidays:v2:')).toBe(true);
+    // Não regridir para v1
+    expect(key.startsWith('holidays:v1:')).toBe(false);
+  });
+
+  it('layout esperado: holidays:v2:{tenant}:{agent}:{entidade}:{year}:{kind}', () => {
+    expect(cacheKey('tenantA', 'agent-1', 'entidade-1', 2026, 'standard')).toBe(
+      'holidays:v2:tenantA:agent-1:entidade-1:2026:standard',
+    );
+    expect(cacheKey('tenantA', 'agent-1', undefined, 2026, 'clt')).toBe(
+      'holidays:v2:tenantA:agent-1:global:2026:clt',
+    );
+  });
+
+  it('getApplicableHolidaysSet lança MissingTenantContextError fora do contexto', async () => {
+    await expect(
+      getApplicableHolidaysSet(2026, {}, async () => new Set()),
+    ).rejects.toBeInstanceOf(MissingTenantContextError);
+  });
+
+  it('getApplicableHolidaysSet usa agent_id do ALS context na chave', async () => {
+    const loader = async (_tenant_id: string) => new Set(['2026-12-25']);
+    await runWithTenantContext({ tenant_id: 'tenantA', agent_id: 'agent-X' }, async () => {
+      await getApplicableHolidaysSet(2026, { entidadeId: 'entidade-1' }, loader);
+    });
+    // o set foi cacheado sob a chave que inclui agent-X
+    expect(_internal_cache.get(cacheKey('tenantA', 'agent-X', 'entidade-1', 2026, 'standard'))).toBeDefined();
+    // mesmo tenant, agent diferente, é miss
+    expect(_internal_cache.get(cacheKey('tenantA', 'agent-Y', 'entidade-1', 2026, 'standard'))).toBeUndefined();
+  });
+
+  it('getApplicableHolidaysSet cross-agent: agent-A cacheia, agent-B chama loader novamente', async () => {
+    let loadCount = 0;
+    const loader = async (_tenant_id: string) => {
+      loadCount++;
+      return new Set([`2026-12-25:${loadCount}`]);
+    };
+    await runWithTenantContext({ tenant_id: 'tenantA', agent_id: 'agent-A' }, async () => {
+      await getApplicableHolidaysSet(2026, { entidadeId: 'entidade-1' }, loader);
+      await getApplicableHolidaysSet(2026, { entidadeId: 'entidade-1' }, loader);
+    });
+    expect(loadCount).toBe(1); // segundo call hit cache
+
+    await runWithTenantContext({ tenant_id: 'tenantA', agent_id: 'agent-B' }, async () => {
+      await getApplicableHolidaysSet(2026, { entidadeId: 'entidade-1' }, loader);
+    });
+    expect(loadCount).toBe(2); // agent-B é miss, chama loader
   });
 
   it('invalidateCacheForHolidayChange scopes to tenant', () => {
-    _internal_cache.set(cacheKey('tenantA', undefined, 2026, 'standard'), new Set(['2026-12-25']));
-    _internal_cache.set(cacheKey('tenantB', undefined, 2026, 'standard'), new Set(['2026-12-25']));
+    _internal_cache.set(cacheKey('tenantA', 'agent-1', undefined, 2026, 'standard'), new Set(['2026-12-25']));
+    _internal_cache.set(cacheKey('tenantB', 'agent-1', undefined, 2026, 'standard'), new Set(['2026-12-25']));
     invalidateCacheForHolidayChange(
       { tenant_id: 'tenantA', type: 'national' },
       { changeKind: 'create' },
     );
-    expect(_internal_cache.get(cacheKey('tenantA', undefined, 2026, 'standard'))).toBeUndefined();
-    expect(_internal_cache.get(cacheKey('tenantB', undefined, 2026, 'standard'))).toBeDefined();
+    expect(_internal_cache.get(cacheKey('tenantA', 'agent-1', undefined, 2026, 'standard'))).toBeUndefined();
+    expect(_internal_cache.get(cacheKey('tenantB', 'agent-1', undefined, 2026, 'standard'))).toBeDefined();
+  });
+
+  // Issue #263 — broad invalidation deve limpar TODOS os agents do tenant
+  it('invalidateCacheForHolidayChange limpa TODOS os agents do mesmo tenant (wildcard agent_id)', () => {
+    _internal_cache.set(cacheKey('tenantA', 'agent-A', undefined, 2026, 'standard'), new Set(['2026-12-25']));
+    _internal_cache.set(cacheKey('tenantA', 'agent-B', undefined, 2026, 'standard'), new Set(['2026-12-25']));
+    _internal_cache.set(cacheKey('tenantA', 'agent-C', 'entidade-1', 2026, 'clt'), new Set(['2026-06-15']));
+    _internal_cache.set(cacheKey('tenantB', 'agent-A', undefined, 2026, 'standard'), new Set(['2026-12-25']));
+
+    invalidateCacheForHolidayChange(
+      { tenant_id: 'tenantA', type: 'national' },
+      { changeKind: 'create' },
+    );
+
+    // todos os agents do tenantA limpos
+    expect(_internal_cache.get(cacheKey('tenantA', 'agent-A', undefined, 2026, 'standard'))).toBeUndefined();
+    expect(_internal_cache.get(cacheKey('tenantA', 'agent-B', undefined, 2026, 'standard'))).toBeUndefined();
+    expect(_internal_cache.get(cacheKey('tenantA', 'agent-C', 'entidade-1', 2026, 'clt'))).toBeUndefined();
+    // tenantB intacto
+    expect(_internal_cache.get(cacheKey('tenantB', 'agent-A', undefined, 2026, 'standard'))).toBeDefined();
   });
 });
