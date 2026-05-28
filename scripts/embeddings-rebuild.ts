@@ -68,10 +68,17 @@
  *   - [LOW] Post-write verification: each UPDATE returns the id; if the row
  *     count is not exactly 1 we log a `update_no_op` warning with full tuple
  *     context rather than incrementing the success counter blindly.
- *   - [LOW] Per-batch transaction: the SELECT + per-row UPDATEs run inside a
- *     single transaction. A mid-batch crash either commits the whole batch or
- *     loses it — never leaves the row in a state where the provider was paid
- *     but no UPDATE landed.
+ *   - [HIGH][#244 review] Per-batch transaction: all UPDATEs in one batch run
+ *     inside a single `db.transaction()`. A mid-batch DB failure rolls back
+ *     the entire batch — the caller no longer sees "rows 1..N-1 committed,
+ *     row N failed, batch advertised as failed" inconsistency. Previously the
+ *     loop did per-row autocommit, so a poison row at index N left the prior
+ *     N-1 rows committed under a failed return. Trade-off: the txn holds for
+ *     N UPDATEs (milliseconds at default BATCH=32) — the session-level
+ *     advisory lock acquired ABOVE on a separate client is orthogonal and
+ *     still released in `finally`. Race-detection (RETURNING id = 0 rows)
+ *     still logs warn but does NOT throw, so transient worker tenant-flips
+ *     don't roll back the whole batch.
  *   - [LOW] Audit trail: every run logs a structured `embeddings_rebuild_run`
  *     event with operator identity (USER env var) + tuple + mode (dry-run vs
  *     mutate) + outcome. Persisted via `logger.info` (pino → centralised log
@@ -106,6 +113,7 @@
  *   enumerates `(tenant_id, agent_id)` tuples and re-enters this function
  *   per-tuple, not a silent default.
  */
+import { pathToFileURL } from 'node:url';
 import { db, pool } from '@/db/client.js';
 import { sql } from 'drizzle-orm';
 import { getEmbeddingProvider } from '@/lib/embeddings.js';
@@ -445,55 +453,97 @@ export async function rebuildEmbeddingsForTuple(args: {
           );
           throw err;
         }
-        for (let i = 0; i < rows.rows.length; i++) {
-          const r = rows.rows[i] as { id: string };
-          const v = `[${(embs[i] ?? []).join(',')}]`;
-          // UPDATE pins tenant_id AND agent_id alongside the id — a stale or
-          // mistyped id cannot mutate a row outside the routed tuple.
-          // RETURNING id lets us verify the row really matched the WHERE
-          // (covers the race case where worker changed tenant/agent between
-          // our SELECT and our UPDATE).
-          try {
-            const result = await db.execute<{ id: string }>(sql`
-              UPDATE agent_memories
-              SET embedding = ${v}::vector
-              WHERE id = ${r.id}::uuid
-                AND tenant_id = ${tenant_id}
-                AND agent_id = ${agent_id}
-              RETURNING id::text
-            `);
-            // Drivers expose row count either via .rowCount (pg) or via
-            // .rows.length (drizzle). Use the rows array as the source of
-            // truth — it's what we actually selected.
-            const affected = result.rows.length;
-            if (affected !== 1) {
-              logger.warn(
-                {
-                  tenant_id,
-                  agent_id,
-                  row_id: r.id,
-                  affected,
-                  op: 'embeddings_rebuild_update_no_op',
-                },
-                'embeddings-rebuild: UPDATE matched zero rows (race with worker?)',
-              );
-            } else {
-              updated++;
+
+        // ─── Per-batch transaction (Codex review #244, HIGH blocker) ────────
+        // Wrap all UPDATEs in this batch in a single transaction so the batch
+        // is atomic: either ALL N rows in the batch commit, or NONE do. The
+        // previous per-row autocommit loop left rows 1..N-1 committed and rows
+        // N..end un-touched when row N's UPDATE failed mid-batch — the caller
+        // saw an error but partial state was already persisted.
+        //
+        // Trade-offs documented for ops:
+        //   - The transaction holds for the duration of N UPDATEs. With the
+        //     default BATCH=32 and pg row locks, this is fast (milliseconds);
+        //     larger batches mean longer hold time.
+        //   - The session-level advisory lock acquired above (on a SEPARATE
+        //     pinned client) is ORTHOGONAL to this txn — it survives across
+        //     batches and is released in `finally` below. The txn here only
+        //     governs the atomicity of the UPDATEs in ONE batch.
+        //   - On failure, we throw and the outer caller surfaces the error;
+        //     the lock is released in `finally` and `processed`/`updated` are
+        //     NOT incremented for the rolled-back batch (counter integrity).
+        //
+        // The race-detection / "RETURNING id matched zero rows" path (mid-batch
+        // worker tenant flip) still logs a warn but does NOT throw — we want
+        // the batch to commit the other N-1 rows that DID match. Only an
+        // exception from `tx.execute` (DB-level failure) rolls back the batch.
+        let batchUpdated = 0;
+        let batchNoOps: Array<{ id: string; affected: number }> = [];
+        try {
+          await db.transaction(async (tx) => {
+            // Reset per-batch counters inside the txn so a retry of this
+            // closure (drizzle/pg can retry on serialization failures) starts
+            // from zero.
+            batchUpdated = 0;
+            batchNoOps = [];
+            for (let i = 0; i < rows.rows.length; i++) {
+              const r = rows.rows[i] as { id: string };
+              const v = `[${(embs[i] ?? []).join(',')}]`;
+              // UPDATE pins tenant_id AND agent_id alongside the id — a stale
+              // or mistyped id cannot mutate a row outside the routed tuple.
+              // RETURNING id lets us verify the row really matched the WHERE
+              // (covers the race case where worker changed tenant/agent
+              // between our SELECT and our UPDATE).
+              const result = await tx.execute<{ id: string }>(sql`
+                UPDATE agent_memories
+                SET embedding = ${v}::vector
+                WHERE id = ${r.id}::uuid
+                  AND tenant_id = ${tenant_id}
+                  AND agent_id = ${agent_id}
+                RETURNING id::text
+              `);
+              // Drivers expose row count either via .rowCount (pg) or via
+              // .rows.length (drizzle). Use the rows array as the source of
+              // truth — it's what we actually selected.
+              const affected = result.rows.length;
+              if (affected !== 1) {
+                batchNoOps.push({ id: r.id, affected });
+              } else {
+                batchUpdated++;
+              }
             }
-          } catch (err) {
-            logger.error(
-              {
-                tenant_id,
-                agent_id,
-                row_id: r.id,
-                op: 'embeddings_rebuild_update_failed',
-                err,
-              },
-              'embeddings-rebuild: UPDATE failed',
-            );
-            throw err;
-          }
+          });
+        } catch (err) {
+          // The whole batch rolled back — none of the N UPDATEs committed.
+          // Counters are NOT incremented (we discard batchUpdated/batchNoOps).
+          logger.error(
+            {
+              tenant_id,
+              agent_id,
+              batch_size: rows.rows.length,
+              op: 'embeddings_rebuild_batch_failed',
+              err,
+            },
+            'embeddings-rebuild: batch failed — transaction rolled back, no UPDATEs committed for this batch',
+          );
+          throw err;
         }
+
+        // Commit succeeded → flush warn logs for no-op rows (race detection)
+        // and absorb the batch counters into the run totals.
+        for (const noOp of batchNoOps) {
+          logger.warn(
+            {
+              tenant_id,
+              agent_id,
+              row_id: noOp.id,
+              affected: noOp.affected,
+              op: 'embeddings_rebuild_update_no_op',
+            },
+            'embeddings-rebuild: UPDATE matched zero rows (race with worker?)',
+          );
+        }
+        updated += batchUpdated;
         processed += rows.rows.length;
         log(`  processed ${processed} (updated ${updated}, total in scope ${totalInScope})`);
       }
@@ -744,21 +794,41 @@ async function main(): Promise<void> {
 // (or the argv-handling shape) in isolation.
 //
 // `import.meta.url` resolves to a `file://` URL for the script entry; we
-// compare against argv[1] (a filesystem path) by normalising to a URL. The
-// guard is intentionally permissive — false positives mean tests would re-run
-// main(), so we use an env-var escape hatch (`EMBEDDINGS_REBUILD_NO_MAIN`)
-// that tests can set if needed. In practice vitest imports the module
-// dynamically so argv[1] is the vitest runner, not this script.
-const invokedDirectly = (() => {
+// compare against argv[1] (a filesystem PATH) by normalising it through
+// Node's `pathToFileURL` (`node:url`). This is the only correct way to
+// build a `file://` URL on Windows.
+//
+// Why the previous hand-rolled `new URL(\`file://${entry.replace(/\\/g, '/')}\`)`
+// failed on Windows (Codex review #244, HIGH blocker):
+//   - On Windows, `process.argv[1]` is a path like `C:\path\to\script.ts`.
+//   - Replacing backslashes yields `C:/path/to/script.ts`.
+//   - `new URL(\`file://${...}\`)` then produces `file://C:/path/to/script.ts`
+//     (host = `c:` — wrong) instead of `file:///C:/path/to/script.ts` (host
+//     empty, path absolute — correct, and what `import.meta.url` resolves to).
+//   - Result: the comparison is ALWAYS false on Windows, so `main()` is never
+//     invoked when running `npm run embeddings:rebuild` — the script loads
+//     and exits silently.
+//
+// `pathToFileURL` is OS-aware: on Windows it emits the proper
+// `file:///C:/...` (three slashes, drive letter), on POSIX it emits
+// `file:///abs/path`. Matches `import.meta.url` exactly on both platforms.
+//
+// We still wrap in try/catch (e.g. argv[1] could be undefined in unusual
+// invocations) and keep the `EMBEDDINGS_REBUILD_NO_MAIN` escape hatch so
+// tests / wrappers can override if needed.
+export function isDirectInvocation(
+  entry: string | undefined,
+  metaUrl: string,
+): boolean {
+  if (!entry) return false;
   try {
-    const entry = process.argv[1];
-    if (!entry) return false;
-    const url = new URL(`file://${entry.replace(/\\/g, '/')}`).href;
-    return url === import.meta.url;
+    return pathToFileURL(entry).href === metaUrl;
   } catch {
     return false;
   }
-})();
+}
+
+const invokedDirectly = isDirectInvocation(process.argv[1], import.meta.url);
 
 if (invokedDirectly && !process.env.EMBEDDINGS_REBUILD_NO_MAIN) {
   main().catch((e) => {

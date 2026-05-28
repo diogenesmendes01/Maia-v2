@@ -252,8 +252,45 @@ const poolConnectMock = vi.fn(async () => ({
   release: lockClientReleaseMock,
 }));
 
+// ─── db.transaction() fake (Codex review #244 HIGH blocker) ─────────────────
+// Production now wraps each batch's UPDATEs in `db.transaction(async tx =>
+// {...})` so a mid-batch DB failure rolls back the entire batch (all-or-
+// nothing semantics). The fake provides a `tx` shim that exposes `.execute`
+// identical to `db.execute` AND tracks BEGIN/COMMIT/ROLLBACK lifecycle so
+// tests can assert the rollback fires on error.
+//
+// Rollback model: we snapshot the store at txn start and restore on error.
+// This is the BEHAVIOURAL contract the production code relies on — if the
+// fake didn't roll back, the test couldn't distinguish "atomic batch
+// committed" from "per-row autocommit" outcomes.
+type TxnLifecycle = 'begin' | 'commit' | 'rollback';
+const txnLifecycle: TxnLifecycle[] = [];
+const dbTransactionMock = vi.fn(
+  async <T>(fn: (tx: { execute: typeof dbExecuteMock }) => Promise<T>): Promise<T> => {
+    txnLifecycle.push('begin');
+    // Snapshot embedding values for rollback (the only field UPDATEs mutate).
+    const snapshot = store.map((r) => ({
+      id: r.id,
+      embedding: r.embedding === null ? null : [...r.embedding],
+    }));
+    try {
+      const result = await fn({ execute: dbExecuteMock });
+      txnLifecycle.push('commit');
+      return result;
+    } catch (err) {
+      // Restore snapshot — all UPDATEs in this txn are rolled back.
+      for (const snap of snapshot) {
+        const row = store.find((r) => r.id === snap.id);
+        if (row) row.embedding = snap.embedding;
+      }
+      txnLifecycle.push('rollback');
+      throw err;
+    }
+  },
+);
+
 vi.mock('@/db/client.js', () => ({
-  db: { execute: dbExecuteMock },
+  db: { execute: dbExecuteMock, transaction: dbTransactionMock },
   pool: { connect: poolConnectMock },
 }));
 
@@ -297,8 +334,10 @@ beforeEach(() => {
   renderedSqls.length = 0;
   providerCalls.length = 0;
   auditLogInserts.length = 0;
+  txnLifecycle.length = 0;
   lockHeld = false;
   dbExecuteMock.mockClear();
+  dbTransactionMock.mockClear();
   lockClientQueryMock.mockClear();
   lockClientReleaseMock.mockClear();
   poolConnectMock.mockClear();
@@ -1146,6 +1185,411 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
         getOperatorIdentity({ USER: 'alice', USERNAME: 'bob', LOGNAME: 'carol' }),
       ).toBe('alice');
       expect(getOperatorIdentity({})).toBe('unknown');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // [Codex #244 HIGH blocker 1] Windows file:// entrypoint guard
+  //
+  // Background: `import.meta.url` is a file:// URL. The previous code built
+  // a comparison URL from `process.argv[1]` (a filesystem PATH) by string
+  // concatenation: `new URL(\`file://${entry.replace(/\\/g, '/')}\`)`. On
+  // Windows, `argv[1]` is `C:\foo\bar.ts`. After backslash → forward-slash
+  // substitution, the URL constructor parses `file://C:/foo/bar.ts` as
+  // host=`c:` + path=`/foo/bar.ts` — which is NOT how `import.meta.url`
+  // serialises (`file:///C:/foo/bar.ts`, host empty + drive in path).
+  //
+  // Result: the comparison was ALWAYS false on Windows → `npm run
+  // embeddings:rebuild` loaded the module, never invoked `main()`, exited
+  // silently with no usage error. The fix is to use Node's `pathToFileURL`,
+  // which is OS-aware and produces the exact serialisation `import.meta.url`
+  // uses on both platforms.
+  // -------------------------------------------------------------------------
+  describe('isDirectInvocation — Windows file:// entrypoint guard (#244 HIGH)', () => {
+    it('TRUE — matches when argv[1] resolves to the same file URL as import.meta.url', async () => {
+      // POSIX path. `pathToFileURL('/x/y.ts').href` → `file:///x/y.ts`.
+      // Importing the production helper itself proves the wiring is sound.
+      const { isDirectInvocation } = await import(
+        '@/../scripts/embeddings-rebuild.ts'
+      );
+      const { pathToFileURL } = await import('node:url');
+      // Use a synthetic path so the test is deterministic across CI hosts.
+      const fakeEntry = '/path/to/embeddings-rebuild.ts';
+      const fakeMetaUrl = pathToFileURL(fakeEntry).href;
+      expect(isDirectInvocation(fakeEntry, fakeMetaUrl)).toBe(true);
+    });
+
+    it('TRUE — Windows-style path matches its pathToFileURL output exactly', async () => {
+      // The bug specifically manifested on Windows with `C:\...` paths. We
+      // simulate the production comparison by funnelling a Windows path
+      // through pathToFileURL (the same helper production uses) and asserting
+      // the round-trip matches.
+      const { isDirectInvocation } = await import(
+        '@/../scripts/embeddings-rebuild.ts'
+      );
+      const { pathToFileURL } = await import('node:url');
+      // Pre-Windows `pathToFileURL` returns `file:///C:/path/to/file.ts`.
+      // On POSIX it also accepts absolute-style paths; the assertion below
+      // works regardless of host OS because we generate both sides via the
+      // same helper.
+      const windowsEntry = 'C:\\path\\to\\embeddings-rebuild.ts';
+      let expectedHref: string;
+      try {
+        expectedHref = pathToFileURL(windowsEntry).href;
+      } catch {
+        // On POSIX, pathToFileURL rejects a Windows-style path because the
+        // backslashes aren't recognised as separators. Skip the assertion in
+        // that case — the contract we care about (parity between argv[1] and
+        // import.meta.url) is exercised by the POSIX test above. We still
+        // assert the function doesn't throw.
+        expect(() => isDirectInvocation(windowsEntry, 'file:///x.ts')).not.toThrow();
+        return;
+      }
+      expect(isDirectInvocation(windowsEntry, expectedHref)).toBe(true);
+    });
+
+    it('FALSE — undefined entry (process.argv[1] missing) does not throw', async () => {
+      const { isDirectInvocation } = await import(
+        '@/../scripts/embeddings-rebuild.ts'
+      );
+      // Real-world: if the script is somehow loaded with no argv[1] (e.g.
+      // a wrapper that strips args), we MUST NOT throw — just return false.
+      expect(isDirectInvocation(undefined, 'file:///x.ts')).toBe(false);
+    });
+
+    it('FALSE — mismatched paths do not match', async () => {
+      // Sanity: a different argv[1] yields a different file:// URL, and the
+      // comparison correctly returns false. This proves the guard isn't
+      // accidentally permissive.
+      const { isDirectInvocation } = await import(
+        '@/../scripts/embeddings-rebuild.ts'
+      );
+      const { pathToFileURL } = await import('node:url');
+      const metaUrl = pathToFileURL('/scripts/embeddings-rebuild.ts').href;
+      expect(isDirectInvocation('/scripts/other.ts', metaUrl)).toBe(false);
+    });
+
+    it('REGRESSION — production uses pathToFileURL (not hand-rolled file://${path})', async () => {
+      // The Codex review #244 HIGH blocker reported that the hand-rolled
+      // form `new URL(\`file://${entry.replace(/\\/g, '/')}\`).href` is
+      // unreliable on Windows: depending on the Node URL parser version,
+      // the drive letter could be parsed as the host (yielding
+      // `file://c:/...`, host=`c:`) instead of as part of the path
+      // (yielding `file:///C:/...`, host empty). Even when modern Node
+      // parsers correctly normalise the two-slash form, case-sensitivity
+      // edge cases remain (host lowercased vs path preserved).
+      //
+      // The fix is to use Node's `pathToFileURL`, which is OS-aware and
+      // emits the EXACT serialisation `import.meta.url` uses. We pin the
+      // production form here by asserting it produces a URL of the
+      // correct shape (three slashes, drive letter preserved in path).
+      const { pathToFileURL } = await import('node:url');
+      // Skip when pathToFileURL can't parse a literal Windows path
+      // (POSIX-only nodes refuse `C:\...`).
+      let winFileUrl: string | null;
+      try {
+        winFileUrl = pathToFileURL('C:\\x\\y.ts').href;
+      } catch {
+        winFileUrl = null;
+      }
+      if (winFileUrl !== null) {
+        // Correct shape for Windows: `file:///C:/...` — three slashes
+        // (empty host), drive letter preserved with original case,
+        // forward slashes throughout the path.
+        expect(winFileUrl).toMatch(/^file:\/\/\/[A-Za-z]:\//);
+      }
+      // Absolute path → file:///... (three slashes, empty host). The
+      // exact path varies by host OS (on Windows it gets the current
+      // drive prepended), so we only assert the shape.
+      const absFileUrl = pathToFileURL('/x/y.ts').href;
+      expect(absFileUrl).toMatch(/^file:\/\/\/.*x\/y\.ts$/);
+    });
+
+    it('PROD WIRING — module exports isDirectInvocation as the entrypoint guard', async () => {
+      // The module-level invokedDirectly constant uses isDirectInvocation,
+      // so the test surface (exported function) and the production wiring
+      // (module-level constant) share the same code path. Without this,
+      // a future refactor could silently bypass the helper. We pin the
+      // export contract here.
+      const mod = await import('@/../scripts/embeddings-rebuild.ts');
+      expect(typeof (mod as Record<string, unknown>).isDirectInvocation).toBe(
+        'function',
+      );
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // [Codex #244 HIGH blocker 2] UPDATE rollback on mid-batch failure
+  //
+  // Background: the previous loop ran each UPDATE in autocommit (per-row).
+  // When row N's UPDATE failed, rows 1..N-1 were ALREADY committed but the
+  // caller saw an error — caller-visible state and DB state diverged. Fix:
+  // wrap all UPDATEs in a batch inside `db.transaction()` so the batch is
+  // atomic (all-or-nothing). Trade-off: the transaction holds for N UPDATEs
+  // (the session-level advisory lock is on a SEPARATE client and unaffected).
+  // -------------------------------------------------------------------------
+  describe('per-batch transaction — rollback on mid-batch UPDATE failure (#244 HIGH)', () => {
+    it('USES db.transaction() to wrap the UPDATE batch', async () => {
+      // The production code MUST route UPDATEs through `db.transaction(...)`
+      // not raw `db.execute`. We assert by counting how many times the
+      // transaction shim was invoked: at least once per non-empty batch.
+      seedTwoTenants();
+      const { rebuildEmbeddingsForTuple } = await import(
+        '@/../scripts/embeddings-rebuild.ts'
+      );
+      await rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 });
+
+      // Two pending tenant-A rows → fits in one batch of 32 → one txn.
+      expect(dbTransactionMock).toHaveBeenCalledTimes(1);
+      // Lifecycle ended with commit (no error).
+      expect(txnLifecycle).toEqual(['begin', 'commit']);
+    });
+
+    it('ROLLBACK — mid-batch UPDATE failure rolls back the WHOLE batch', async () => {
+      // Seed: TWO pending rows in the same batch (batchSize=32 → both in
+      // batch #1). Make the SECOND UPDATE throw. With per-row autocommit
+      // the first UPDATE would have committed; with the transactional fix,
+      // BOTH must remain pending (null embedding).
+      seedTwoTenants();
+
+      const originalImpl = dbExecuteMock.getMockImplementation()!;
+      let updateCount = 0;
+      dbExecuteMock.mockImplementation(async (query: SQL) => {
+        const rendered = _dialect.sqlToQuery(query);
+        if (/^\s*UPDATE\s+agent_memories/i.test(rendered.sql)) {
+          updateCount++;
+          if (updateCount === 2) {
+            throw new Error('simulated second-row failure');
+          }
+        }
+        return originalImpl(query);
+      });
+
+      const { rebuildEmbeddingsForTuple } = await import(
+        '@/../scripts/embeddings-rebuild.ts'
+      );
+
+      try {
+        await expect(
+          rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 }),
+        ).rejects.toThrow(/simulated second-row failure/);
+
+        // BOTH rows must remain pending — the first UPDATE was rolled back
+        // along with the failing second UPDATE.
+        const aAlpha = store.find((r) => r.id === 'mem_A_alpha');
+        const aBeta = store.find((r) => r.id === 'mem_A_beta');
+        // Either the original null/wrong-dim embedding (rollback restored)
+        // — neither row should hold the provider's fresh vector.
+        // The fake restores the pre-txn snapshot; both should be in their
+        // pre-rebuild state.
+        const isAlphaPreState =
+          aAlpha!.embedding === null ||
+          aAlpha!.embedding!.length !== expectedDim;
+        const isBetaPreState =
+          aBeta!.embedding === null ||
+          aBeta!.embedding!.length !== expectedDim;
+        expect(isAlphaPreState).toBe(true);
+        expect(isBetaPreState).toBe(true);
+
+        // Txn lifecycle: begin → rollback.
+        expect(txnLifecycle).toEqual(['begin', 'rollback']);
+      } finally {
+        dbExecuteMock.mockImplementation(originalImpl);
+      }
+    });
+
+    it('COMMIT — successful batch commits and counters reflect the batch', async () => {
+      // Mirror of the rollback test — happy path, both UPDATEs succeed,
+      // both rows now embedded, counters reflect the success.
+      seedTwoTenants();
+      const { rebuildEmbeddingsForTuple } = await import(
+        '@/../scripts/embeddings-rebuild.ts'
+      );
+      const result = await rebuildEmbeddingsForTuple({
+        ...A_CTX,
+        batchSize: 32,
+      });
+
+      expect(result.updated).toBe(2);
+      expect(result.processed).toBe(2);
+      expect(txnLifecycle).toEqual(['begin', 'commit']);
+      const aAlpha = store.find((r) => r.id === 'mem_A_alpha');
+      const aBeta = store.find((r) => r.id === 'mem_A_beta');
+      expect(aAlpha!.embedding!.length).toBe(expectedDim);
+      expect(aBeta!.embedding!.length).toBe(expectedDim);
+    });
+
+    it('MULTI-BATCH — each batch runs in its OWN transaction (batch failure isolates)', async () => {
+      // batchSize=1 → each row is its own batch + its own txn. Make the
+      // SECOND batch fail. The first batch should have committed; the
+      // second should have rolled back.
+      seedTwoTenants();
+
+      const originalImpl = dbExecuteMock.getMockImplementation()!;
+      let updateCount = 0;
+      dbExecuteMock.mockImplementation(async (query: SQL) => {
+        const rendered = _dialect.sqlToQuery(query);
+        if (/^\s*UPDATE\s+agent_memories/i.test(rendered.sql)) {
+          updateCount++;
+          if (updateCount === 2) {
+            throw new Error('simulated second-batch failure');
+          }
+        }
+        return originalImpl(query);
+      });
+
+      const { rebuildEmbeddingsForTuple } = await import(
+        '@/../scripts/embeddings-rebuild.ts'
+      );
+
+      try {
+        await expect(
+          rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 1 }),
+        ).rejects.toThrow(/simulated second-batch failure/);
+
+        // Batch 1 committed (one row embedded). Batch 2 rolled back (the
+        // other row still in pre-rebuild state).
+        const aRows = store.filter((r) => r.tenant_id === 'tenant-A');
+        const embedded = aRows.filter(
+          (r) => r.embedding !== null && r.embedding.length === expectedDim,
+        );
+        const pending = aRows.filter(
+          (r) => r.embedding === null || r.embedding.length !== expectedDim,
+        );
+        expect(embedded.length).toBe(1);
+        expect(pending.length).toBe(1);
+
+        // Txn lifecycle: begin → commit → begin → rollback.
+        expect(txnLifecycle).toEqual([
+          'begin',
+          'commit',
+          'begin',
+          'rollback',
+        ]);
+      } finally {
+        dbExecuteMock.mockImplementation(originalImpl);
+      }
+    });
+
+    it('LOCK STILL RELEASED — batch rollback does not leak advisory lock', async () => {
+      // The advisory lock is on a SEPARATE client; the per-batch txn is on
+      // the pool-routed `db`. A batch rollback must NOT prevent the lock
+      // from being released in `finally`.
+      seedTwoTenants();
+
+      const originalImpl = dbExecuteMock.getMockImplementation()!;
+      dbExecuteMock.mockImplementation(async (query: SQL) => {
+        const rendered = _dialect.sqlToQuery(query);
+        if (/^\s*UPDATE\s+agent_memories/i.test(rendered.sql)) {
+          throw new Error('simulated batch failure');
+        }
+        return originalImpl(query);
+      });
+
+      const { rebuildEmbeddingsForTuple } = await import(
+        '@/../scripts/embeddings-rebuild.ts'
+      );
+
+      try {
+        await expect(
+          rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 }),
+        ).rejects.toThrow(/simulated batch failure/);
+
+        const unlockCalls = lockClientQueryMock.mock.calls.filter((c) =>
+          /pg_advisory_unlock/i.test(c[0] as string),
+        );
+        expect(unlockCalls.length).toBe(1);
+        expect(lockClientReleaseMock).toHaveBeenCalledTimes(1);
+      } finally {
+        dbExecuteMock.mockImplementation(originalImpl);
+      }
+    });
+
+    it('COUNTER INTEGRITY — rolled-back batch does NOT increment updated/processed', async () => {
+      // The pre-fix path counted `updated++` per-row as the UPDATE returned,
+      // which meant a mid-batch failure left the caller seeing a non-zero
+      // `updated` count for rows that had ALREADY been committed but a
+      // failed run. With the transactional fix, the counter is only updated
+      // AFTER the txn commits — a rolled-back batch contributes zero.
+      seedTwoTenants();
+
+      const originalImpl = dbExecuteMock.getMockImplementation()!;
+      dbExecuteMock.mockImplementation(async (query: SQL) => {
+        const rendered = _dialect.sqlToQuery(query);
+        if (/^\s*UPDATE\s+agent_memories/i.test(rendered.sql)) {
+          throw new Error('simulated batch failure');
+        }
+        return originalImpl(query);
+      });
+
+      const { rebuildEmbeddingsForTuple } = await import(
+        '@/../scripts/embeddings-rebuild.ts'
+      );
+
+      try {
+        let caught: unknown;
+        try {
+          await rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 });
+        } catch (err) {
+          caught = err;
+        }
+        expect(caught).toBeDefined();
+        // The throw means the function didn't return a result — what we
+        // really want to assert is that NO row was committed. Already
+        // covered by the snapshot rollback above, but pin the no-side-
+        // effects contract explicitly here.
+        const aAlpha = store.find((r) => r.id === 'mem_A_alpha');
+        expect(aAlpha!.embedding).toBeNull();
+      } finally {
+        dbExecuteMock.mockImplementation(originalImpl);
+      }
+    });
+
+    it('RACE WITHIN BATCH — RETURNING 0 rows does NOT roll back the whole batch', async () => {
+      // Race detection (worker flipped tenant between SELECT and UPDATE)
+      // logs a warn but does NOT throw — the txn commits the OTHER UPDATEs
+      // in the batch that DID match. Without this carve-out, a transient
+      // race would discard genuine work.
+      seedTwoTenants();
+
+      // Flip tenant-A on `mem_A_alpha` only, just before its UPDATE lands.
+      // `mem_A_beta` should still embed.
+      const originalImpl = dbExecuteMock.getMockImplementation()!;
+      let updateCount = 0;
+      dbExecuteMock.mockImplementation(async (query: SQL) => {
+        const rendered = _dialect.sqlToQuery(query);
+        if (/^\s*UPDATE\s+agent_memories/i.test(rendered.sql)) {
+          updateCount++;
+          if (updateCount === 1) {
+            // Flip tenant on alpha BEFORE the UPDATE lands → 0 rows match.
+            const target = store.find((r) => r.id === 'mem_A_alpha');
+            if (target) target.tenant_id = 'tenant-MOVED';
+          }
+        }
+        return originalImpl(query);
+      });
+
+      const { rebuildEmbeddingsForTuple } = await import(
+        '@/../scripts/embeddings-rebuild.ts'
+      );
+
+      try {
+        const result = await rebuildEmbeddingsForTuple({
+          ...A_CTX,
+          batchSize: 32,
+        });
+
+        // The batch COMMITTED (no throw): one row genuinely updated, the
+        // other recorded as a race no-op.
+        expect(txnLifecycle).toEqual(['begin', 'commit']);
+        expect(result.updated).toBe(1); // beta succeeded; alpha was no-op
+        expect(result.processed).toBe(2);
+
+        const aBeta = store.find((r) => r.id === 'mem_A_beta');
+        expect(aBeta!.embedding!.length).toBe(expectedDim);
+      } finally {
+        dbExecuteMock.mockImplementation(originalImpl);
+      }
     });
   });
 
