@@ -205,8 +205,26 @@ vi.mock('@/lib/logger.js', () => ({
   },
 }));
 
+// Spy on incCounter so we can assert observability of every terminal
+// path (Codex PR #279 review — Critical [exhaustion observability] +
+// Blocker [3] [audit log on idempotent paths]).
+const incCounterMock = vi.fn();
+vi.mock('@/lib/metrics.js', async () => {
+  const actual = await vi.importActual<typeof import('@/lib/metrics.js')>(
+    '@/lib/metrics.js',
+  );
+  return {
+    ...actual,
+    incCounter: (name: string, labels?: Record<string, string>, by?: number) => {
+      incCounterMock(name, labels, by);
+      return actual.incCounter(name, labels, by);
+    },
+  };
+});
+
 import { KnowledgeStateMachine } from '@/control-plane/knowledge-state-machine/state-machine.js';
 import { KnowledgeConflictError } from '@/control-plane/knowledge-state-machine/repos.js';
+import { logger } from '@/lib/logger.js';
 
 const TENANT = 'tenant-a';
 const AGENT = 'agent-a';
@@ -227,6 +245,9 @@ beforeEach(() => {
   storeByKind.clear();
   conflictScriptByKindId.clear();
   updateCallCountByKindId.clear();
+  incCounterMock.mockClear();
+  (logger.info as ReturnType<typeof vi.fn>).mockClear();
+  (logger.warn as ReturnType<typeof vi.fn>).mockClear();
 });
 
 afterEach(() => {
@@ -433,5 +454,331 @@ describe('Issue #256 — KSM.revoke() bounded retry under optimistic-conflict', 
     expect(updateSpy).toHaveBeenCalledTimes(1);
 
     updateSpy.mockRestore();
+  });
+});
+
+// ===========================================================================
+// PR #279 Codex review — Blocker [1]: backoff jitter spreads bursts.
+// ===========================================================================
+describe('PR #279 Codex review — Blocker [1] backoff jitter', () => {
+  it('produces delays inside [base, 2*base) so concurrent callers do not collide on identical schedules', async () => {
+    // We assert the jitter range across many samples — each backoff
+    // must be at least `base` (no negative jitter) and strictly less
+    // than `2 * base` (jitter ∈ [0, base)). Spy on setTimeout to
+    // capture the actual delays emitted by the loop.
+    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+
+    // Seed + script a 3-attempt run for each sample so the loop hits
+    // both backoff slots (10ms base on attempt-0, 30ms base on
+    // attempt-1).
+    for (let sample = 0; sample < 5; sample++) {
+      const id = `rule-jitter-${sample}`;
+      seedRule(id, 'pending_review');
+      scriptConflicts('rule', id, [
+        { conflict: true, postReadStatus: 'active' },
+        { conflict: true, postReadStatus: 'deprecated' },
+        'success',
+      ]);
+
+      await KnowledgeStateMachine.revoke({
+        kind: 'rule',
+        proposal_id: id,
+        reason: 'jitter_sample',
+        decided_by: 'incident_response',
+      });
+    }
+
+    // Collect only the calls whose delay falls in our jitter bands —
+    // setTimeout is invoked by other infra (Promise scheduling etc.)
+    // with delays of 0/1, which we ignore.
+    const delaysAttempt0 = setTimeoutSpy.mock.calls
+      .map((c) => c[1] as number)
+      .filter((d) => d >= 10 && d < 20);
+    const delaysAttempt1 = setTimeoutSpy.mock.calls
+      .map((c) => c[1] as number)
+      .filter((d) => d >= 30 && d < 60);
+
+    // We ran 5 samples, each producing exactly one attempt-0 backoff
+    // and one attempt-1 backoff. Assert that all of them landed inside
+    // the documented jitter band [base, 2*base).
+    expect(delaysAttempt0.length).toBe(5);
+    expect(delaysAttempt1.length).toBe(5);
+    for (const d of delaysAttempt0) {
+      expect(d).toBeGreaterThanOrEqual(10);
+      expect(d).toBeLessThan(20);
+    }
+    for (const d of delaysAttempt1) {
+      expect(d).toBeGreaterThanOrEqual(30);
+      expect(d).toBeLessThan(60);
+    }
+
+    // At least one attempt-0 delay must differ from another — proves
+    // jitter is actually random and not a constant `base + 0`.
+    // (Probability of all 5 samples collapsing to identical Math.floor
+    //  is vanishingly small even with a degenerate RNG.)
+    const distinct0 = new Set(delaysAttempt0).size;
+    expect(distinct0).toBeGreaterThan(1);
+
+    setTimeoutSpy.mockRestore();
+  });
+
+  it('does not sleep after the final attempt (no off-by-one wait)', async () => {
+    // Even with 3 conflicts (exhaustion), only 2 backoff sleeps happen
+    // — between attempts 0→1 and 1→2. After attempt-2 fails we throw,
+    // not sleep.
+    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+
+    seedRule('rule-no-trailing-sleep', 'pending_review');
+    scriptConflicts('rule', 'rule-no-trailing-sleep', [
+      { conflict: true, postReadStatus: 'active' },
+      { conflict: true, postReadStatus: 'deprecated' },
+      { conflict: true, postReadStatus: 'active' },
+    ]);
+
+    await expect(
+      KnowledgeStateMachine.revoke({
+        kind: 'rule',
+        proposal_id: 'rule-no-trailing-sleep',
+        reason: 'no_trailing_sleep',
+        decided_by: 'incident_response',
+      }),
+    ).rejects.toBeInstanceOf(KnowledgeConflictError);
+
+    // Backoff sleeps land in the jitter bands [10,20) and [30,60).
+    // Anything in those bands is a backoff; anything else is infra.
+    const backoffSleeps = setTimeoutSpy.mock.calls
+      .map((c) => c[1] as number)
+      .filter((d) => (d >= 10 && d < 20) || (d >= 30 && d < 60));
+    expect(backoffSleeps.length).toBe(2);
+
+    setTimeoutSpy.mockRestore();
+  });
+});
+
+// ===========================================================================
+// PR #279 Codex review — Blocker [2]: AbortSignal cancellation.
+// ===========================================================================
+describe('PR #279 Codex review — Blocker [2] AbortSignal cancellation', () => {
+  it('pre-aborted signal short-circuits before any DB read', async () => {
+    seedRule('rule-pre-aborted', 'pending_review');
+
+    const controller = new AbortController();
+    controller.abort(new Error('caller_cancelled'));
+
+    const { knowledgeRepos } = await import(
+      '@/control-plane/knowledge-state-machine/repos.js'
+    );
+    const findSpy = vi.spyOn(knowledgeRepos, 'findById');
+    const updateSpy = vi.spyOn(knowledgeRepos, 'update');
+
+    await expect(
+      KnowledgeStateMachine.revoke({
+        kind: 'rule',
+        proposal_id: 'rule-pre-aborted',
+        reason: 'pre_aborted',
+        decided_by: 'incident_response',
+        signal: controller.signal,
+      }),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+
+    // Neither read nor write should have happened.
+    expect(findSpy).not.toHaveBeenCalled();
+    expect(updateSpy).not.toHaveBeenCalled();
+
+    // Aborted-counter is incremented.
+    expect(incCounterMock).toHaveBeenCalledWith(
+      'maia_ksm_revoke_total',
+      { kind: 'rule', result: 'aborted' },
+      undefined,
+    );
+
+    findSpy.mockRestore();
+    updateSpy.mockRestore();
+  });
+
+  it('mid-sleep abort clears the timer and rejects with AbortError before exhausting retries', async () => {
+    // First update conflicts → backoff sleep begins. We abort the
+    // signal mid-sleep. The retry loop must reject with AbortError
+    // and NOT proceed to attempt-1's update.
+    seedRule('rule-mid-sleep-abort', 'pending_review');
+    scriptConflicts('rule', 'rule-mid-sleep-abort', [
+      { conflict: true, postReadStatus: 'active' },
+      'success', // should NOT be reached
+    ]);
+
+    const controller = new AbortController();
+
+    // Capture setTimeout to abort during the first backoff sleep —
+    // any scheduled timer in the backoff bands gets us a fresh chance
+    // to abort.
+    const originalSetTimeout = globalThis.setTimeout;
+    const setTimeoutSpy = vi
+      .spyOn(globalThis, 'setTimeout')
+      .mockImplementation(((cb: (...a: unknown[]) => void, ms?: number) => {
+        if (ms !== undefined && ms >= 10 && ms < 20) {
+          // First backoff slot — abort the signal while the timer is
+          // still pending. The sleep() helper's abort listener will
+          // clear this timer.
+          queueMicrotask(() => controller.abort(new Error('mid_sleep')));
+        }
+        return originalSetTimeout(cb, ms);
+      }) as typeof setTimeout);
+
+    await expect(
+      KnowledgeStateMachine.revoke({
+        kind: 'rule',
+        proposal_id: 'rule-mid-sleep-abort',
+        reason: 'mid_sleep_abort',
+        decided_by: 'incident_response',
+        signal: controller.signal,
+      }),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+
+    // Only 1 update call — the second `success` step in the script
+    // must not have been reached.
+    expect(updateCallCountByKindId.get('rule:rule-mid-sleep-abort')).toBe(1);
+
+    // Aborted-counter incremented from the sleep-rejection path.
+    expect(incCounterMock).toHaveBeenCalledWith(
+      'maia_ksm_revoke_total',
+      { kind: 'rule', result: 'aborted' },
+      undefined,
+    );
+
+    setTimeoutSpy.mockRestore();
+  });
+});
+
+// ===========================================================================
+// PR #279 Codex review — Blocker [3]: audit log + counter on every
+// idempotent return.
+// ===========================================================================
+describe('PR #279 Codex review — Blocker [3] audit + counter on idempotent paths', () => {
+  it('initial-read already_revoked emits log + counter', async () => {
+    seedRule('rule-initial-already-revoked', 'revoked');
+
+    await KnowledgeStateMachine.revoke({
+      kind: 'rule',
+      proposal_id: 'rule-initial-already-revoked',
+      reason: 'redundant_call',
+      decided_by: 'incident_response',
+    });
+
+    // Audit log emitted with reason=already_revoked and attempts=0.
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.objectContaining({
+        proposal_id: 'rule-initial-already-revoked',
+        kind: 'rule',
+        reason: 'already_revoked',
+        decided_by: 'idempotent',
+        attempts: 0,
+      }),
+      'knowledge_state_machine.revoked',
+    );
+
+    // Counter incremented.
+    expect(incCounterMock).toHaveBeenCalledWith(
+      'maia_ksm_revoke_total',
+      { kind: 'rule', result: 'already_revoked' },
+      undefined,
+    );
+  });
+
+  it('concurrent-revoke-won (re-read shows revoked) emits log + counter', async () => {
+    seedRule('rule-concurrent-won', 'pending_review');
+    scriptConflicts('rule', 'rule-concurrent-won', [
+      { conflict: true, postReadStatus: 'revoked' },
+    ]);
+
+    await KnowledgeStateMachine.revoke({
+      kind: 'rule',
+      proposal_id: 'rule-concurrent-won',
+      reason: 'concurrent_won',
+      decided_by: 'incident_response',
+    });
+
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.objectContaining({
+        proposal_id: 'rule-concurrent-won',
+        kind: 'rule',
+        reason: 'already_revoked_concurrent',
+        decided_by: 'idempotent',
+        attempts: 1,
+      }),
+      'knowledge_state_machine.revoked',
+    );
+
+    expect(incCounterMock).toHaveBeenCalledWith(
+      'maia_ksm_revoke_total',
+      { kind: 'rule', result: 'already_revoked_concurrent' },
+      undefined,
+    );
+  });
+
+  it('successful update emits counter with result=success', async () => {
+    seedRule('rule-success-counter', 'active');
+
+    await KnowledgeStateMachine.revoke({
+      kind: 'rule',
+      proposal_id: 'rule-success-counter',
+      reason: 'normal_revoke',
+      decided_by: 'contraevidence',
+    });
+
+    expect(incCounterMock).toHaveBeenCalledWith(
+      'maia_ksm_revoke_total',
+      { kind: 'rule', result: 'success' },
+      undefined,
+    );
+  });
+});
+
+// ===========================================================================
+// PR #279 Codex review — Critical [exhaustion observability]: dedicated
+// counter so dashboards can alert without parsing the generic counter.
+// ===========================================================================
+describe('PR #279 Codex review — Critical [exhaustion observability]', () => {
+  it('exhaustion increments both generic and dedicated counter, log includes last_observed_status', async () => {
+    seedRule('rule-exhausted-counter', 'pending_review');
+    scriptConflicts('rule', 'rule-exhausted-counter', [
+      { conflict: true, postReadStatus: 'active' },
+      { conflict: true, postReadStatus: 'deprecated' },
+      { conflict: true, postReadStatus: 'active' },
+    ]);
+
+    await expect(
+      KnowledgeStateMachine.revoke({
+        kind: 'rule',
+        proposal_id: 'rule-exhausted-counter',
+        reason: 'exhausted_test',
+        decided_by: 'incident_response',
+      }),
+    ).rejects.toBeInstanceOf(KnowledgeConflictError);
+
+    // Generic counter with result=exhausted.
+    expect(incCounterMock).toHaveBeenCalledWith(
+      'maia_ksm_revoke_total',
+      { kind: 'rule', result: 'exhausted' },
+      undefined,
+    );
+    // Dedicated exhaustion counter.
+    expect(incCounterMock).toHaveBeenCalledWith(
+      'maia_ksm_revoke_exhausted_total',
+      { kind: 'rule' },
+      undefined,
+    );
+
+    // Log carries last_observed_status so on-call operators can see
+    // which lifecycle state the row was last seen in (the previous
+    // log was silent on that field).
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        proposal_id: 'rule-exhausted-counter',
+        kind: 'rule',
+        attempts: 3,
+        last_observed_status: 'active',
+      }),
+      'knowledge_state_machine.revoke_exhausted_retries',
+    );
   });
 });
