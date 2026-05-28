@@ -67,10 +67,8 @@
 ```
 maia/
 ├── docs/
-│   ├── arquitetura.md              # Desenho do sistema, pilares, fases
-│   ├── specs/                      # Specs 00–18 (um por subsistema)
-│   ├── runbooks/                   # Operação
-│   └── inventario.md               # Template de entidades/pessoas/permissões
+│   ├── runbooks/                   # Operação (P0–P10b, setup, migrações)
+│   └── superpowers/                # Design specs + planos de implementação
 ├── migrations/                     # Schema versionado
 ├── src/
 │   ├── agent/                      # Loop ReAct + tool use
@@ -116,7 +114,7 @@ maia/
 
 > **Nota sobre memória.** As 5 camadas (`episodic`, `semantic`, `procedural`, `working`, `vector`) são fachadas finas sobre Postgres+pgvector e Redis. Eviction, TTL e ranking ficam delegados ao banco/Redis, não à camada de memória. Expansão (LRU em `working`, ranking ponderado em `semantic`) fica como evolução futura.
 
-> **Estado do código.** 152 migrations · 33 workers · 16 tRPC routers no admin-ui · 19 specs em `docs/specs/` · 392 test/spec files · pgvector + Redis + BullMQ + Baileys em produção.
+> **Estado do código.** 152 migrations · 33 workers · 16 tRPC routers no admin-ui · 392 test/spec files · pgvector + Redis + BullMQ + Baileys em produção.
 
 ---
 
@@ -230,11 +228,9 @@ CI roda esses testes automaticamente em job dedicado (`integration` em
 
 ## Documentação
 
-- [`docs/arquitetura.md`](docs/arquitetura.md) — desenho do sistema, pilares, fases
-- [`docs/specs/00-overview.md`](docs/specs/00-overview.md) — visão geral
-- [`docs/specs/`](docs/specs/) — specs 00–18 (config, data model, permissões, gateway, identity resolver, agent loop, tools, memory, governance, multimídia, workflows, proactive workers, OFX import, Brazilian domain, dashboard, testing, observability, scheduling)
-- [`docs/runbooks/`](docs/runbooks/) — operação
-- [`docs/inventario.md`](docs/inventario.md) — template de inventário
+- [`docs/runbooks/`](docs/runbooks/) — operação e debug por subsistema (P0–P10b, setup, migrações)
+- [`docs/superpowers/specs/`](docs/superpowers/specs/) — design specs por feature
+- [`docs/superpowers/plans/`](docs/superpowers/plans/) — planos de implementação faseados
 - [`migrations/`](migrations/) — schema versionado
 - [`src/identity/maia-prompt.md`](src/identity/maia-prompt.md) — system prompt-base de agentes
 
@@ -242,7 +238,7 @@ CI roda esses testes automaticamente em job dedicado (`integration` em
 
 ## Roadmap (histórico de fases)
 
-> ⚠️ **Esta é a sequência original de planejamento.** O código já avançou: temos **152 migrations** (com fases `p3a`, `p2`, `p4`, `p10b` etc.), **33 workers** e o admin-ui completo — boa parte do que está marcado como ✅ aqui já foi shipped há iterações. As durações listadas são **estimativas originais** do plano, não cronograma futuro. Para o estado real por subsistema, ver [`docs/specs/`](docs/specs/).
+> ⚠️ **Esta é a sequência original de planejamento.** O código já avançou: temos **152 migrations** (com fases `p3a`, `p2`, `p4`, `p10b` etc.), **33 workers** e o admin-ui completo — boa parte do que está marcado como ✅ aqui já foi shipped há iterações. As durações listadas são **estimativas originais** do plano, não cronograma futuro. Para o estado real por subsistema, ver [`docs/runbooks/`](docs/runbooks/).
 
 > **Legenda:** ✅ em código (migrations e módulos presentes) · 🚧 parcial / em iteração · ⏳ planejado.
 
@@ -311,16 +307,12 @@ Esses gaps **violam o princípio de isolamento inviolável** e são tratados com
 - P7 — refactor completo do grafo cognitivo (orchestrator existe; nem todos os módulos foram migrados pro formato node).
 - Gateways adicionais (não-WhatsApp).
 
-### Reconciliação com `docs/specs/00-overview.md`
-
-O spec 00 (`docs/specs/00-overview.md`, revisado 2026-04-28) descreve Maia como *"single-tenant AI agent"* / *"not a multi-tenant SaaS"* / *"Multi-Agent explicitly not used"*. Isso reflete fielmente o estado runtime atual, mas **não** a visão arquitetural deste README. O spec será atualizado em PR separado pra refletir a v3.
-
 ---
 
 ## Contribuindo
 
-- **Specs por subsistema:** `docs/specs/00-overview.md` → `18-scheduling-and-recurring-workflows.md`. Cada subsistema (gateway, identity resolver, agent loop, tools, memory, governance, multimídia, workflows, workers, OFX import, Brazilian domain, dashboard, testing, observability, scheduling) tem seu doc.
-- **Runbooks:** [`docs/runbooks/`](docs/runbooks/) — operação e respostas a incidentes.
+- **Runbooks por subsistema:** [`docs/runbooks/`](docs/runbooks/) — operação e debug por fase (P0–P10b) e tópicos transversais (setup, migrações).
+- **Design specs por feature:** [`docs/superpowers/specs/`](docs/superpowers/specs/) e [`docs/superpowers/plans/`](docs/superpowers/plans/).
 - **Testes:** `npm test` (sem infra) ou `npm run test:integration` (Postgres + Redis ao vivo).
 - **CI:** typecheck + lint + build + unit + integration + e2e + gitleaks em cada PR (`.github/workflows/ci.yml`).
 - **Convenção de PR:** mudanças aditivas ou com feature flag + rollback; toda mudança de schema acompanha migration `_up` + `_down`.
