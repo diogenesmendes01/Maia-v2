@@ -25,7 +25,12 @@
 -- unique because the prior `key`-alone PK already made `key` unique
 -- globally. No data-conflict risk on apply.
 --
--- NOTE: no BEGIN/COMMIT — migrate.ts wraps in a transaction.
+-- Atomicidade: o forward migration runner (`scripts/migrate.ts`) embrulha
+-- cada arquivo `.sql` (sem o marker `-- maia:no-transaction`) em
+-- BEGIN/COMMIT, portanto este UP é atomic. Se DROP CONSTRAINT roda mas
+-- ADD CONSTRAINT falha, o runner faz ROLLBACK preservando a PK antiga.
+-- (Os `_down.sql` siblings são pulados pelo runner; eles trazem seu
+-- próprio BEGIN/COMMIT — ver 063_p10_idempotency_keys_tenant_pk_down.sql.)
 
 ALTER TABLE idempotency_keys DROP CONSTRAINT IF EXISTS idempotency_keys_pkey;
 
