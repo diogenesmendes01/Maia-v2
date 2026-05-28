@@ -107,8 +107,9 @@ describe('InvalidationBus', () => {
 
   it('default policy_rule_activated handler invalidates tenant policy cache', async () => {
     const cache = new InMemorySliceCache();
-    await cache.set('maia:context:tenant1:policy:scope1', { x: 1 }, 300);
-    await cache.set('maia:context:tenant2:policy:scope1', { y: 2 }, 300);
+    // Issue #235: layout is `maia:context:v2:{tenant}:{agent}:{slice}:{scope}`.
+    await cache.set('maia:context:v2:tenant1:agentA:policy:scope1', { x: 1 }, 300);
+    await cache.set('maia:context:v2:tenant2:agentA:policy:scope1', { y: 2 }, 300);
 
     wireDefaultInvalidationHandlers(bus, cache);
     await bus.dispatch({
@@ -117,16 +118,39 @@ describe('InvalidationBus', () => {
       occurred_at: new Date().toISOString(),
     });
 
-    expect(await cache.get('maia:context:tenant1:policy:scope1')).toBeNull();
-    expect(await cache.get('maia:context:tenant2:policy:scope1')).toEqual({
+    expect(await cache.get('maia:context:v2:tenant1:agentA:policy:scope1')).toBeNull();
+    expect(await cache.get('maia:context:v2:tenant2:agentA:policy:scope1')).toEqual({
       y: 2,
+    });
+  });
+
+  it('default policy_rule_activated handler invalidates all agents of the tenant', async () => {
+    // Issue #235: tenant-scoped invalidation MUST clear every agent's slice
+    // under that tenant. Wildcards the agent_id position in the key glob.
+    const cache = new InMemorySliceCache();
+    await cache.set('maia:context:v2:tenant1:agentA:policy:scope1', { x: 1 }, 300);
+    await cache.set('maia:context:v2:tenant1:agentB:policy:scope1', { y: 2 }, 300);
+    await cache.set('maia:context:v2:tenant1:agentA:identity:scope1', { z: 3 }, 300);
+
+    wireDefaultInvalidationHandlers(bus, cache);
+    await bus.dispatch({
+      type: 'policy_rule_activated',
+      tenant_id: 'tenant1',
+      occurred_at: new Date().toISOString(),
+    });
+
+    expect(await cache.get('maia:context:v2:tenant1:agentA:policy:scope1')).toBeNull();
+    expect(await cache.get('maia:context:v2:tenant1:agentB:policy:scope1')).toBeNull();
+    // Other slices stay.
+    expect(await cache.get('maia:context:v2:tenant1:agentA:identity:scope1')).toEqual({
+      z: 3,
     });
   });
 
   it('default identity_profile_activated handler invalidates identity slice only', async () => {
     const cache = new InMemorySliceCache();
-    await cache.set('maia:context:tenant1:identity:s1', { i: 1 }, 300);
-    await cache.set('maia:context:tenant1:policy:s1', { p: 1 }, 300);
+    await cache.set('maia:context:v2:tenant1:agentA:identity:s1', { i: 1 }, 300);
+    await cache.set('maia:context:v2:tenant1:agentA:policy:s1', { p: 1 }, 300);
 
     wireDefaultInvalidationHandlers(bus, cache);
     await bus.dispatch({
@@ -135,7 +159,7 @@ describe('InvalidationBus', () => {
       occurred_at: new Date().toISOString(),
     });
 
-    expect(await cache.get('maia:context:tenant1:identity:s1')).toBeNull();
-    expect(await cache.get('maia:context:tenant1:policy:s1')).toEqual({ p: 1 });
+    expect(await cache.get('maia:context:v2:tenant1:agentA:identity:s1')).toBeNull();
+    expect(await cache.get('maia:context:v2:tenant1:agentA:policy:s1')).toEqual({ p: 1 });
   });
 });

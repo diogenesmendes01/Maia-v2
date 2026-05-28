@@ -116,7 +116,7 @@ export class IdentitySliceBuilder
       // SQL comment forbidding this leak.
       schema_version: 'v3.1.1-issue192',
     });
-    return sliceCacheKey(base.tenant_id, 'identity', scope);
+    return sliceCacheKey(base.tenant_id, base.agent_id, 'identity', scope);
   }
 
   /**
@@ -164,7 +164,7 @@ export class IdentitySliceBuilder
       // key on the next call.
       active_profile_id: activeProfileId ?? '__no_active__',
     });
-    return sliceCacheKey(base.tenant_id, 'identity', scope);
+    return sliceCacheKey(base.tenant_id, base.agent_id, 'identity', scope);
   }
 
   async build(
