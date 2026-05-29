@@ -42,15 +42,21 @@ jobs:
           node-version-file: '.nvmrc'
           cache: 'npm'
 
-      - name: Pin npm via corepack
+      - name: Pin npm to 11.5.2
         # The npm bundled with Node varies by patch release, and an npm-major
         # mismatch between the lockfile generator and CI is exactly what broke
-        # CI in #312. corepack activates the `packageManager` field in
-        # package.json (npm@11.5.2) so CI's npm == the npm that regenerates
-        # the lockfile. Must run BEFORE `npm ci`.
-        run: |
-          corepack enable
-          npm --version
+        # CI in #312 (npm 10 lockfile) and #314's first attempt (npm 10 runner
+        # vs npm-11 lockfile). `corepack enable` alone did NOT switch the active
+        # npm on the runner, so CI kept running Node's bundled npm 10.x against
+        # the npm-11 lockfile. `npm install -g` definitively puts 11.5.2 on PATH
+        # (matching package.json's `packageManager` + the lockfile generator).
+        # Must run BEFORE `npm ci`.
+        run: npm install -g npm@11.5.2
+
+      - name: Assert npm version
+        # Fail loudly here if the pin didn't take, instead of surfacing a
+        # confusing `npm ci` lockfile-mismatch error later.
+        run: test "$(npm --version)" = "11.5.2"
 
       - name: Install dependencies
         run: npm ci
@@ -152,13 +158,17 @@ jobs:
           node-version-file: '.nvmrc'
           cache: 'npm'
 
-      - name: Pin npm via corepack
-        # See the validate job: corepack activates package.json's
-        # `packageManager` (npm@11.5.2) so CI's npm matches the lockfile
-        # generator. Must run BEFORE `npm ci`.
-        run: |
-          corepack enable
-          npm --version
+      - name: Pin npm to 11.5.2
+        # See the validate job: `corepack enable` did not reliably switch the
+        # active npm on the runner, so we install npm 11.5.2 globally to match
+        # package.json's `packageManager` + the lockfile generator. Must run
+        # BEFORE `npm ci`.
+        run: npm install -g npm@11.5.2
+
+      - name: Assert npm version
+        # Fail loudly here if the pin didn't take, instead of surfacing a
+        # confusing `npm ci` lockfile-mismatch error later.
+        run: test "$(npm --version)" = "11.5.2"
 
       - name: Install dependencies
         run: npm ci
