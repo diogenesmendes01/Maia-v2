@@ -1,0 +1,54 @@
+-- maia:no-transaction
+-- =====================================================================
+-- Maia — Migration 070 (Issue #316 / PR #326 Codex note (c))
+-- Retention-path partial index for idempotency_effect_outbox.
+--
+-- Why
+-- ---
+-- PR #326 made the relayer's dispatcher enumeration reach IDLE tenants that
+-- hold ONLY terminal rows (so retention is not gated on the pending path —
+-- the blocker fix). The relayer (src/workers/idempotency-outbox-relayer.ts)
+-- now issues, in addition to the pending claim:
+--
+--   dispatcher enumeration terminal arm:
+--     SELECT DISTINCT tenant_id, agent_id
+--     WHERE status IN ('sent','failed')
+--       AND updated_at < now() - <retention>
+--
+--   bounded retention DELETE (idempotencyOutboxRepo.cleanupTerminal):
+--     ... WHERE tenant_id = $1 AND agent_id = $2
+--           AND status IN ('sent','failed')
+--           AND updated_at < now() - <retention>
+--         ORDER BY updated_at ASC LIMIT <n> FOR UPDATE SKIP LOCKED
+--
+-- The pre-existing hot-path index (069) is keyed
+-- (tenant_id, agent_id, status, next_attempt_at) — it backs the PENDING claim
+-- (ORDER BY next_attempt_at) but NOT the terminal-retention scan, which filters
+-- on `status IN ('sent','failed')` and orders by `updated_at`. Without a
+-- supporting index a high-volume tenant's retention sweep degrades to a heap
+-- scan + sort each tick.
+--
+-- This PARTIAL index covers exactly the terminal-retention rows
+-- (`WHERE status IN ('sent','failed')`) and keys them
+-- (tenant_id, agent_id, updated_at): the equality columns anchor the probe and
+-- `updated_at` backs BOTH the `updated_at < now() - <retention>` range
+-- predicate AND the `ORDER BY updated_at ASC` the bounded LIMIT walks. Being
+-- partial keeps it small (pending rows — the hot write path — are excluded, so
+-- inserts/claims don't pay to maintain it).
+--
+-- Concurrency
+-- -----------
+-- CREATE INDEX CONCURRENTLY so the index builds against the live table without
+-- an ACCESS EXCLUSIVE lock (the outbox is on the tool-dispatch hot path). The
+-- `-- maia:no-transaction` marker tells the migration runner (scripts/migrate.ts)
+-- to apply this file OUTSIDE a BEGIN/COMMIT envelope — PostgreSQL rejects
+-- CONCURRENTLY inside a transaction block (error 25001). Single statement,
+-- one-per-`;`, IF NOT EXISTS for idempotent re-runs (see splitNoTxStatements).
+--
+-- WARNING — manual application: if running this file via `psql -f`, do NOT
+-- wrap it in BEGIN/COMMIT. The runner already handles the no-tx semantics.
+-- =====================================================================
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_idempotency_effect_outbox_tenant_agent_terminal_updated
+  ON idempotency_effect_outbox (tenant_id, agent_id, updated_at)
+  WHERE status IN ('sent', 'failed');

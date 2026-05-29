@@ -16,6 +16,7 @@ import {
   learned_rules,
   pending_questions,
   idempotency_keys,
+  idempotency_effect_outbox,
   outbound_messages,
   audit_log,
   workflows,
@@ -74,6 +75,7 @@ import { logger } from '@/lib/logger.js';
 import { incCounter } from '@/lib/metrics.js';
 import { applyTenantGuard } from './tenant-guard.js';
 import { getCurrentTenant, getCurrentAgent } from './tenant-context.js';
+import type { PlannedEffect } from '@/governance/idempotency-effects.js';
 import { isVersionedPayloadHash } from '@/governance/idempotency.js';
 import { deriveCapabilityRisk, deriveCapabilityLocks } from './capability-risk.js';
 import { LearnedVoiceModifierSchema } from '@/identity/learned-voice-modifier.js';
@@ -2192,6 +2194,326 @@ export const idempotencyRepo = {
     return reaped.length + aged.length + agedFailed.length;
   },
 };
+
+/**
+ * Issue #316 — transactional effect outbox repository
+ * (`idempotency_effect_outbox` table, migrations 068/069).
+ *
+ * The crux of exactly-once for NON-IDEMPOTENT external effects: the WINNING
+ * idempotency reservation's completion and the enqueue of its intended effect
+ * happen in ONE transaction (`markCompletedWithEffect`). The effect is thus
+ * bound to whichever worker WON the reservation — not to a racer. The tool
+ * handler never fires the effect inline (it only PLANS it), so a slow/preempted
+ * owner whose lease was reclaimed and whose `markCompleted` is fenced out never
+ * enqueues an effect (the UPDATE touches 0 rows → the whole tx no-ops the
+ * INSERT too). A single relayer (src/workers/idempotency-outbox-relayer.ts)
+ * dispatches each committed pending row EXACTLY ONCE with retry/backoff.
+ *
+ * TENANT ISOLATION (inviolable): every method scopes by the ALS-resolved
+ * (tenant_id, agent_id) and writes through `applyTenantGuard`. The relayer is a
+ * per-tenant dispatcher (mirrors reflection-batch #240/#251 +
+ * outbound-messages-sweeper #292) and never assumes the 'default' sentinel.
+ */
+export type IdempotencyEffectOutboxRow = typeof idempotency_effect_outbox.$inferSelect;
+export type OutboxEffectStatus = 'pending' | 'sent' | 'failed';
+
+/** A pending row claimed by the relayer for dispatch. */
+export type ClaimedOutboxEffect = {
+  id: string;
+  idempotency_key: string;
+  effect_type: string;
+  effect_payload: unknown;
+  attempts: number;
+  max_attempts: number;
+};
+
+export const idempotencyOutboxRepo = {
+  /**
+   * ATOMIC write side. Transition the in_progress reservation → completed AND
+   * enqueue the intended external effect in ONE transaction.
+   *
+   * Both writes are fenced by `reservation_token` (the markCompleted UPDATE is
+   * gated on it). If the owner was preempted (lease reclaimed → fresh token),
+   * the UPDATE matches 0 rows: we DETECT that inside the tx and ROLL BACK, so
+   * the effect is NOT enqueued under a reservation this worker no longer owns.
+   * Returns whether the row was transitioned (true) or fenced out (false) —
+   * same contract as `idempotencyRepo.markCompleted`, so the dispatcher's
+   * `idempotency_completion_fenced` branch is unchanged.
+   *
+   * The outbox INSERT is ON CONFLICT (tenant, agent, idempotency_key) DO
+   * NOTHING: if a previous (committed) completion already enqueued the effect,
+   * a re-entry is a no-op — never a second physical effect. Combined with the
+   * fencing UPDATE, the (completion, enqueue) pair is exactly-once.
+   */
+  async markCompletedWithEffect(input: {
+    key: string;
+    resultado: unknown;
+    reservation_token: string;
+    effect: PlannedEffect;
+    max_attempts?: number;
+  }): Promise<boolean> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const maxAttempts = input.max_attempts ?? 5;
+    return withTx(async (tx) => {
+      // Fence first: only the current reservation owner (matching token) may
+      // complete. A preempted owner's stale token matches 0 rows.
+      const completed = await tx
+        .update(idempotency_keys)
+        .set({
+          resultado: input.resultado as object,
+          state: 'completed',
+          expires_at: null,
+        })
+        .where(
+          and(
+            eq(idempotency_keys.tenant_id, tenant_id),
+            eq(idempotency_keys.agent_id, agent_id),
+            eq(idempotency_keys.key, input.key),
+            eq(idempotency_keys.state, 'in_progress'),
+            eq(idempotency_keys.reservation_token, input.reservation_token),
+          ),
+        )
+        .returning({ key: idempotency_keys.key });
+      if (completed.length === 0) {
+        // Fenced out / already settled. Roll back: do NOT enqueue an effect
+        // for a reservation we no longer own. Throwing aborts the tx; we
+        // translate it back to the boolean contract below.
+        throw new OutboxFenced();
+      }
+      // Enqueue the intended effect, atomic with the completion. ON CONFLICT
+      // DO NOTHING on (tenant, agent, key) makes a duplicate completion a
+      // no-op (never a second physical effect).
+      await tx
+        .insert(idempotency_effect_outbox)
+        .values(
+          applyTenantGuard({
+            idempotency_key: input.key,
+            effect_type: input.effect.kind,
+            effect_payload: input.effect as object,
+            status: 'pending' as const,
+            attempts: 0,
+            max_attempts: maxAttempts,
+          }),
+        )
+        .onConflictDoNothing({
+          target: [
+            idempotency_effect_outbox.tenant_id,
+            idempotency_effect_outbox.agent_id,
+            idempotency_effect_outbox.idempotency_key,
+          ],
+        });
+      return true;
+    }).catch((err) => {
+      if (err instanceof OutboxFenced) return false;
+      throw err;
+    });
+  },
+
+  /**
+   * Relayer dispatcher enumeration: DISTINCT (tenant_id, agent_id) tuples that
+   * have ANY WORK to do this pass — EITHER a dispatchable pending row
+   * (status='pending' AND backoff gate elapsed) OR a terminal row
+   * (status IN ('sent','failed')) past the retention window. Runs OUTSIDE
+   * tenant context — the relayer opens runWithTenantContext per tuple.
+   *
+   * The terminal-row arm is LOAD-BEARING for retention (Codex #326 blocker):
+   * an IDLE tenant whose outbox holds ONLY old terminal rows and NO pending
+   * row would otherwise never be enumerated, so its terminal rows would
+   * accumulate without bound. Including it here makes the bounded retention
+   * cleanup in `relayInner` reach a terminal-only tenant — cleanup is no
+   * longer GATED on the pending-dispatch path. Same shape as the sibling
+   * outbound-messages-sweeper `listTenantsWithWork` (#292). Belt-and-suspenders
+   * NOT NULL predicate (schema already enforces) mirrors #251/#292.
+   */
+  async listTenantsWithWork(retentionDays: number): Promise<
+    Array<{ tenant_id: string; agent_id: string }>
+  > {
+    const result = await db.execute<{ tenant_id: string; agent_id: string }>(sql`
+      SELECT DISTINCT tenant_id, agent_id
+      FROM ${idempotency_effect_outbox}
+      WHERE tenant_id IS NOT NULL
+        AND agent_id IS NOT NULL
+        AND (
+          (status = 'pending' AND next_attempt_at <= now())
+          OR (
+            status IN ('sent', 'failed')
+            AND updated_at < now() - (${retentionDays} || ' days')::interval
+          )
+        )
+    `);
+    return Array.from(result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>);
+  },
+
+  /**
+   * Claim a bounded, oldest-first batch of dispatchable pending rows for the
+   * CURRENT (tenant, agent). `FOR UPDATE SKIP LOCKED` lets concurrent relayer
+   * passes (or the per-tenant advisory lock failing open) never contend on the
+   * same row. The claim does NOT mutate status — dispatch + markSent/markRetry
+   * happen per row after the physical effect, so a crash mid-batch leaves the
+   * row pending (the next tick reclaims it). Bounded by `limit` for per-tenant
+   * fairness (a high-volume tenant can't starve others within one pass).
+   */
+  async claimPendingEffects(limit: number): Promise<ClaimedOutboxEffect[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db.execute<ClaimedOutboxEffect>(sql`
+      SELECT id, idempotency_key, effect_type, effect_payload, attempts, max_attempts
+      FROM ${idempotency_effect_outbox}
+      WHERE tenant_id = ${tenant_id}
+        AND agent_id = ${agent_id}
+        AND status = 'pending'
+        AND next_attempt_at <= now()
+      ORDER BY next_attempt_at ASC
+      LIMIT ${limit}
+      FOR UPDATE SKIP LOCKED
+    `);
+    return Array.from(rows.rows as unknown as ClaimedOutboxEffect[]);
+  },
+
+  /**
+   * Mark a dispatched effect as sent (terminal-ish; retained for audit +
+   * retention cleanup). Scoped + CAS on status='pending' so a concurrent
+   * relayer that already settled the row is a no-op. Stores the provider ref
+   * (external message id) for the audit trail.
+   */
+  async markEffectSent(input: { id: string; provider_ref: string | null }): Promise<boolean> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const updated = await db
+      .update(idempotency_effect_outbox)
+      .set({
+        status: 'sent',
+        provider_ref: input.provider_ref,
+        last_error: null,
+        updated_at: new Date(),
+      })
+      .where(
+        and(
+          eq(idempotency_effect_outbox.tenant_id, tenant_id),
+          eq(idempotency_effect_outbox.agent_id, agent_id),
+          eq(idempotency_effect_outbox.id, input.id),
+          eq(idempotency_effect_outbox.status, 'pending'),
+        ),
+      )
+      .returning({ id: idempotency_effect_outbox.id });
+    return updated.length > 0;
+  },
+
+  /**
+   * Record a transient dispatch failure: bump `attempts`, store the error, and
+   * push `next_attempt_at` forward by `backoff_seconds` (exponential backoff is
+   * computed by the relayer). The row STAYS pending so the next tick retries —
+   * UNLESS this attempt exhausts `max_attempts`, in which case the row is
+   * transitioned to the terminal 'failed' status (the failed-has-error CHECK is
+   * satisfied because we always store `error`). Returns the post-update status
+   * so the relayer can ops_alert on terminal failure.
+   */
+  async markEffectRetry(input: {
+    id: string;
+    error: string;
+    backoff_seconds: number;
+  }): Promise<OutboxEffectStatus | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const backoff = `${input.backoff_seconds} seconds`;
+    // Single statement: increment attempts, and if attempts+1 >= max_attempts
+    // flip to 'failed' (terminal); otherwise stay 'pending' with the backoff
+    // gate pushed forward. CAS on status='pending' so a concurrent settle wins.
+    const updated = await db.execute<{ status: OutboxEffectStatus }>(sql`
+      UPDATE ${idempotency_effect_outbox}
+         SET attempts = attempts + 1,
+             last_error = ${input.error},
+             status = CASE WHEN attempts + 1 >= max_attempts THEN 'failed' ELSE 'pending' END,
+             next_attempt_at = now() + ${backoff}::interval,
+             updated_at = now()
+       WHERE tenant_id = ${tenant_id}
+         AND agent_id = ${agent_id}
+         AND id = ${input.id}
+         AND status = 'pending'
+      RETURNING status
+    `);
+    return updated.rows[0]?.status ?? null;
+  },
+
+  /**
+   * FORCE-TERMINAL failure (Codex #326 note (b)): transition a pending row
+   * STRAIGHT to terminal 'failed' WITHOUT consuming the retry budget. Unlike
+   * `markEffectRetry` (which only increments `attempts` by one), this is for a
+   * permanently-unrecoverable row — e.g. an effect_payload that does not parse
+   * / validate. Retrying such a row is pointless: it will never become valid,
+   * so burning all `max_attempts` ticks on it just delays the ops_alert and
+   * wastes relayer passes. We flip to 'failed' immediately and store the error
+   * (the failed-has-error CHECK is satisfied because `error` is always set).
+   * CAS on status='pending' so a concurrent settle wins. Returns true when this
+   * call performed the transition.
+   */
+  async markEffectFailed(input: { id: string; error: string }): Promise<boolean> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const updated = await db.execute<{ id: string }>(sql`
+      UPDATE ${idempotency_effect_outbox}
+         SET status = 'failed',
+             last_error = ${input.error},
+             updated_at = now()
+       WHERE tenant_id = ${tenant_id}
+         AND agent_id = ${agent_id}
+         AND id = ${input.id}
+         AND status = 'pending'
+      RETURNING id
+    `);
+    return updated.rows.length > 0;
+  },
+
+  /**
+   * Retention cleanup: delete terminal rows (sent/failed) older than N days, in
+   * bounded batches (mirrors outbound-messages-sweeper #292 blocker #1). Scoped
+   * per current (tenant, agent). Returns the count deleted this call.
+   *
+   * The OUTER `DELETE` repeats the explicit `tenant_id`/`agent_id` predicate
+   * (Codex #326 note (a)) so the row removal is tenant-scoped at the DELETE
+   * itself, not only inside the `id IN (...)` subquery — defense-in-depth
+   * against the (theoretical) reuse of an `id` value across tenants.
+   */
+  async cleanupTerminal(input: {
+    olderThanDays: number;
+    batchSize: number;
+  }): Promise<number> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const deleted = await db.execute<{ id: string }>(sql`
+      DELETE FROM ${idempotency_effect_outbox}
+      WHERE tenant_id = ${tenant_id}
+        AND agent_id = ${agent_id}
+        AND id IN (
+          SELECT id
+          FROM ${idempotency_effect_outbox}
+          WHERE tenant_id = ${tenant_id}
+            AND agent_id = ${agent_id}
+            AND status IN ('sent', 'failed')
+            AND updated_at < now() - (${input.olderThanDays} || ' days')::interval
+          ORDER BY updated_at ASC
+          LIMIT ${input.batchSize}
+          FOR UPDATE SKIP LOCKED
+        )
+      RETURNING id
+    `);
+    return deleted.rows.length;
+  },
+};
+
+/**
+ * Sentinel thrown inside `markCompletedWithEffect`'s tx to abort + roll back
+ * when the fencing UPDATE matched 0 rows (preempted owner). Translated back to
+ * `false` by the `.catch` so the dispatcher sees the same boolean contract as
+ * plain `markCompleted`. Not exported — internal to the atomic write path.
+ */
+class OutboxFenced extends Error {
+  constructor() {
+    super('idempotency_outbox_completion_fenced');
+    this.name = 'OutboxFenced';
+  }
+}
 
 // Issue #227: outbound delivery idempotency ledger. Migration 063 schema.
 export type OutboundMessageRow = typeof outbound_messages.$inferSelect;

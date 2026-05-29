@@ -158,6 +158,29 @@ const envSchema = z
     //   */5min tick drains any remainder. Promotion is expected to be 0/rare in
     //   healthy operation (each promotion is an ops_alert).
     OUTBOUND_SWEEPER_RECOVERY_LIMIT_PER_TENANT: z.coerce.number().int().positive().default(500),
+    // #316 — idempotency transactional effect outbox relayer. The relayer
+    //   (src/workers/idempotency-outbox-relayer.ts) runs every minute, single-
+    //   flight (GLOBAL advisory lock), per-tenant fan-out, and dispatches each
+    //   committed pending effect EXACTLY ONCE with retry/backoff.
+    // OUTBOX_RELAYER_BATCH_PER_TENANT: max pending effects dispatched per
+    //   (tenant, agent) per pass (oldest-first fairness). Default 100 — the
+    //   next */1min tick drains any remainder; a high-volume tenant can't
+    //   starve others within one pass.
+    OUTBOX_RELAYER_BATCH_PER_TENANT: z.coerce.number().int().positive().default(100),
+    // OUTBOX_RELAYER_BASE_BACKOFF_SEC: base of the exponential backoff applied
+    //   on a transient dispatch failure. next_attempt_at is pushed forward by
+    //   base * 2^attempts (capped at the max below). Default 30s.
+    OUTBOX_RELAYER_BASE_BACKOFF_SEC: z.coerce.number().int().positive().default(30),
+    // OUTBOX_RELAYER_MAX_BACKOFF_SEC: cap on the backoff interval so a row that
+    //   has retried many times still gets revisited within a bounded window.
+    //   Default 3600s (1h).
+    OUTBOX_RELAYER_MAX_BACKOFF_SEC: z.coerce.number().int().positive().default(3600),
+    // OUTBOX_RELAYER_RETENTION_DAYS: terminal rows (sent/failed) older than this
+    //   are deleted in the same pass (bounded batched DELETE). Default 30 days.
+    OUTBOX_RELAYER_RETENTION_DAYS: z.coerce.number().int().positive().default(30),
+    // OUTBOX_RELAYER_RETENTION_BATCH_SIZE: bounded retention DELETE chunk size
+    //   (mirrors OUTBOUND_SWEEPER_RETENTION_BATCH_SIZE). Default 1000.
+    OUTBOX_RELAYER_RETENTION_BATCH_SIZE: z.coerce.number().int().positive().default(1000),
     // Feature flags do roadmap Maia v2
     FEATURE_P0_TENANT_GUARD_ENFORCED: z
       .string()

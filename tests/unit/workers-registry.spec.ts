@@ -38,6 +38,7 @@ const { noopAsync, noopWorkers, mockSchedule } = vi.hoisted(() => {
     runTraceBodyRecoverer: noopAsync,
     runTraceMatviewRefresh: noopAsync,
     runOutboundMessagesSweeper: noopAsync,
+    runIdempotencyOutboxRelayer: noopAsync,
   };
   const mockSchedule = vi.fn(() => ({ stop: vi.fn(), start: vi.fn() }));
   return { noopAsync, noopWorkers, mockSchedule };
@@ -68,6 +69,7 @@ vi.mock('../../src/workers/trace-body-writer.js', () => noopWorkers);
 vi.mock('../../src/workers/trace-body-recoverer.js', () => noopWorkers);
 vi.mock('../../src/workers/trace-matview-refresh.js', () => noopWorkers);
 vi.mock('../../src/workers/outbound-messages-sweeper.js', () => noopWorkers);
+vi.mock('../../src/workers/idempotency-outbox-relayer.js', () => noopWorkers);
 vi.mock('../../src/workflows/engine.js', () => ({ tickEngine: noopAsync }));
 
 // node-cron v4: ScheduledTask is an interface with stop() / start() / etc.
@@ -159,6 +161,21 @@ describe('workers registry', () => {
       expect(job!.phase).toBe(1);
       // No featureFlag — always on once merged (it's pure housekeeping +
       // recovery; no UX-visible behaviour change).
+      expect(job!.featureFlag).toBeUndefined();
+    });
+  });
+
+  // Issue #316 — transactional effect outbox relayer.
+  describe('idempotency_outbox_relayer (issue #316)', () => {
+    it('registered as phase-1 job with */1 * * * * cadence and no featureFlag', async () => {
+      const { JOBS } = await import('../../src/workers/index.js');
+      const job = JOBS.find((j) => j.name === 'idempotency_outbox_relayer');
+      expect(job).toBeDefined();
+      // Every minute so proactive-message latency stays low.
+      expect(job!.cron).toBe('*/1 * * * *');
+      expect(job!.phase).toBe(1);
+      // No featureFlag — it's the ONLY dispatch path for these effects once
+      // merged (the tool no longer sends inline), so it must always run.
       expect(job!.featureFlag).toBeUndefined();
     });
   });

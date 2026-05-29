@@ -31,6 +31,7 @@ import { runTraceBodyRecoverer } from './trace-body-recoverer.js';
 import { runTraceMatviewRefresh } from './trace-matview-refresh.js';
 import { runKnowledgeStatePromoter } from './knowledge-state-promoter.js';
 import { runOutboundMessagesSweeper } from './outbound-messages-sweeper.js';
+import { runIdempotencyOutboxRelayer } from './idempotency-outbox-relayer.js';
 import { tickEngine } from '@/workflows/engine.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 
@@ -83,6 +84,14 @@ export const JOBS: Job[] = [
   // Dispatcher per-tenant via runWithTenantContext (espelha reflection-batch
   // #240/#251) — NÃO usa sentinela 'default'.
   { name: 'outbound_messages_sweeper', cron: '*/5 * * * *', fn: runOutboundMessagesSweeper, phase: 1 },
+  // Issue #316 — transactional effect outbox relayer. Dispatches NON-IDEMPOTENT
+  // external effects (e.g. WhatsApp sends) recorded atomically with the winning
+  // idempotency reservation, EXACTLY ONCE, with retry/backoff. Every minute so
+  // proactive-message latency stays low. Single-flight (GLOBAL advisory lock)
+  // + per-tenant fan-out — mirrors outbound_messages_sweeper. No featureFlag:
+  // it's the only dispatch path for these effects once merged (the tool no
+  // longer sends inline), so it must always run.
+  { name: 'idempotency_outbox_relayer', cron: '*/1 * * * *', fn: runIdempotencyOutboxRelayer, phase: 1 },
   { name: 'inactivity_sweep', cron: '0 3 * * *', fn: runInactivitySweep, phase: 1 },
   { name: 'nightly_backup', cron: '0 3 * * *', fn: runNightlyBackup, phase: 1 },
   // Cloud backup rotation runs once a week (Sundays 04:00 BRT) so
