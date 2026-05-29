@@ -1,3 +1,4 @@
+import type { FastifyInstance } from 'fastify';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 import { ensureRedisConnect } from '@/lib/redis.js';
@@ -46,20 +47,26 @@ async function main() {
     logger.info('policy_resolver.cache_invalidation_subscriber_started');
   }
 
-  await startServer();
+  const app = await startServer();
   startAgentWorker(async (job) => {
     await runAgentForMensagem(job.data.mensagem_id);
   });
   startWorkers(1);
   await startBaileys();
 
+  // Close over `app` so shutdown() can run Fastify's `onClose` hooks, which
+  // stop the Redis memory-pressure collector + DB probe timers (server.ts).
+  const shutdown = () => void gracefulShutdown(app);
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
 }
 
-async function shutdown() {
+async function gracefulShutdown(app: FastifyInstance) {
   logger.info('maia.shutting_down');
   stopWorkers();
+  // Closing the Fastify app fires its `onClose` hooks (collector/timer
+  // cleanup) before we tear down the shared Redis/Postgres pools.
+  await app.close().catch((err) => logger.warn({ err }, 'maia.app_close_failed'));
   await audit({ acao: 'system_stopped' }).catch(() => undefined);
   await shutdownPools();
   process.exit(0);

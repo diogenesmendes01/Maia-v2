@@ -1,0 +1,508 @@
+/**
+ * Issue #297 — Redis memory pressure collector.
+ *
+ * Mocks `src/lib/redis.js` so we can drive `info('memory')` /
+ * `info('stats')` deterministically, then asserts:
+ *  1. INFO output is parsed correctly (used_memory, maxmemory, evicted_keys,
+ *     rejected_connections — including the lookalike `used_memory_rss` does
+ *     not contaminate the parse).
+ *  2. Gauges expose the parsed values via `/metrics` (renderPrometheus).
+ *  3. The derived ratio is `used / max` and handles `maxmemory=0`
+ *     (Redis "unbounded") as `0`, not `Infinity`/`NaN`.
+ *  4. A Redis-down `info()` rejection is caught — the snapshot keeps the
+ *     previous values (stale-but-not-zeroed), the collector does not throw,
+ *     and a warn is logged.
+ *  5. `parseInfoField` handles the substring-boundary edge case
+ *     (`used_memory_rss` vs `used_memory`).
+ */
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
+const { infoMock, loggerWarnMock } = vi.hoisted(() => ({
+  infoMock: vi.fn(),
+  loggerWarnMock: vi.fn(),
+}));
+
+vi.mock('../../../src/lib/redis.js', () => ({
+  redis: { info: infoMock },
+  isRedisConnected: () => true,
+  ensureRedisConnect: vi.fn(),
+}));
+
+vi.mock('../../../src/lib/logger.js', () => ({
+  logger: {
+    info: vi.fn(),
+    warn: loggerWarnMock,
+    error: vi.fn(),
+    debug: vi.fn(),
+  },
+}));
+
+import {
+  collectOnce,
+  getMemoryUsedRatio,
+  parseInfoField,
+  startRedisMemoryCollector,
+  isMemorySnapshotFresh,
+  CRITICAL_MEMORY_USED_RATIO,
+  SNAPSHOT_STALENESS_INTERVALS,
+  DEFAULT_COLLECT_INTERVAL_MS,
+  _resetForTests,
+} from '../../../src/observability/redis-memory-collector.js';
+import { renderPrometheus, _resetForTests as _resetMetrics } from '../../../src/lib/metrics.js';
+
+const SAMPLE_MEMORY_INFO = [
+  '# Memory',
+  'used_memory:1610612736', // 1.5 GiB
+  'used_memory_human:1.50G',
+  'used_memory_rss:1700000000',
+  'used_memory_peak:1700000000',
+  'maxmemory:2147483648', // 2 GiB
+  'maxmemory_human:2.00G',
+  'maxmemory_policy:noeviction',
+  '',
+].join('\r\n');
+
+const SAMPLE_STATS_INFO = [
+  '# Stats',
+  'total_connections_received:1234',
+  'rejected_connections:5',
+  'evicted_keys:0',
+  'expired_keys:42',
+  '',
+].join('\r\n');
+
+describe('redis-memory-collector — parseInfoField', () => {
+  it('extracts an integer field by exact name', () => {
+    expect(parseInfoField(SAMPLE_MEMORY_INFO, 'used_memory')).toBe(1610612736);
+    expect(parseInfoField(SAMPLE_MEMORY_INFO, 'maxmemory')).toBe(2147483648);
+    expect(parseInfoField(SAMPLE_STATS_INFO, 'evicted_keys')).toBe(0);
+    expect(parseInfoField(SAMPLE_STATS_INFO, 'rejected_connections')).toBe(5);
+  });
+
+  it('does NOT match a substring of a longer field name', () => {
+    // `used_memory_rss:1700000000` must not be returned for `used_memory`.
+    // The anchored regex ensures `used_memory` matches only the exact line,
+    // returning 1610612736 (not 1700000000).
+    expect(parseInfoField(SAMPLE_MEMORY_INFO, 'used_memory')).toBe(1610612736);
+  });
+
+  it('returns undefined when the field is absent', () => {
+    expect(parseInfoField(SAMPLE_MEMORY_INFO, 'nonexistent_field')).toBeUndefined();
+    expect(parseInfoField('', 'used_memory')).toBeUndefined();
+  });
+
+  it('returns undefined when the value is non-numeric', () => {
+    // Defensive: in practice Redis only emits integers in these slots, but
+    // we tolerate junk and surface `undefined` so collectOnce skips the
+    // update rather than zeroing the snapshot.
+    expect(parseInfoField('used_memory:not_a_number\r\n', 'used_memory')).toBeUndefined();
+  });
+});
+
+describe('redis-memory-collector — collectOnce + gauges', () => {
+  beforeEach(() => {
+    _resetMetrics();
+    _resetForTests();
+    infoMock.mockReset();
+    loggerWarnMock.mockReset();
+  });
+
+  afterEach(() => {
+    _resetMetrics();
+    _resetForTests();
+  });
+
+  it('parses INFO output and populates gauges (used / max / evicted / rejected)', async () => {
+    infoMock.mockImplementation((section: string) => {
+      if (section === 'memory') return Promise.resolve(SAMPLE_MEMORY_INFO);
+      if (section === 'stats') return Promise.resolve(SAMPLE_STATS_INFO);
+      return Promise.resolve('');
+    });
+
+    // Register gauges via startRedisMemoryCollector but stop the timer
+    // immediately so the test owns the lifecycle. startRedisMemoryCollector
+    // kicks off an initial collectOnce() via `void collectOnce()` — we await
+    // a fresh one below to make sure the snapshot is populated before the
+    // scrape, sidestepping the unhandled-microtask race.
+    const handle = startRedisMemoryCollector(60_000);
+    handle.stop();
+    await collectOnce();
+
+    const out = await renderPrometheus();
+    expect(out).toContain('redis_used_memory_bytes 1610612736');
+    expect(out).toContain('redis_maxmemory_bytes 2147483648');
+    expect(out).toContain('redis_evicted_keys_total 0');
+    expect(out).toContain('redis_rejected_connections_total 5');
+  });
+
+  it('derives memory_used_ratio = used / max (1.5GiB / 2GiB = 0.75)', async () => {
+    infoMock.mockImplementation((section: string) => {
+      if (section === 'memory') return Promise.resolve(SAMPLE_MEMORY_INFO);
+      if (section === 'stats') return Promise.resolve(SAMPLE_STATS_INFO);
+      return Promise.resolve('');
+    });
+
+    const handle = startRedisMemoryCollector(60_000);
+    handle.stop();
+    await collectOnce();
+
+    const out = await renderPrometheus();
+    // 1610612736 / 2147483648 = 0.75 exactly (both powers of two scaled).
+    expect(out).toContain('redis_memory_used_ratio 0.75');
+  });
+
+  it('reports ratio=0 when maxmemory is 0 (Redis unbounded — no cap)', async () => {
+    const unboundedMemoryInfo = [
+      '# Memory',
+      'used_memory:1000000',
+      'maxmemory:0',
+      '',
+    ].join('\r\n');
+    infoMock.mockImplementation((section: string) => {
+      if (section === 'memory') return Promise.resolve(unboundedMemoryInfo);
+      if (section === 'stats') return Promise.resolve(SAMPLE_STATS_INFO);
+      return Promise.resolve('');
+    });
+
+    const handle = startRedisMemoryCollector(60_000);
+    handle.stop();
+    await collectOnce();
+
+    const out = await renderPrometheus();
+    // With maxmemory=0 the ratio is undefined; we emit 0 so warning/critical
+    // alerts on `> 0.80` / `> 0.95` cannot fire spuriously.
+    expect(out).toContain('redis_memory_used_ratio 0');
+    expect(out).not.toContain('redis_memory_used_ratio Infinity');
+    expect(out).not.toContain('redis_memory_used_ratio NaN');
+  });
+
+  it('handles Redis-down gracefully — keeps last snapshot, does not throw, logs warn', async () => {
+    // 1) Populate the snapshot with a successful first collect.
+    infoMock.mockImplementation((section: string) => {
+      if (section === 'memory') return Promise.resolve(SAMPLE_MEMORY_INFO);
+      if (section === 'stats') return Promise.resolve(SAMPLE_STATS_INFO);
+      return Promise.resolve('');
+    });
+
+    const handle = startRedisMemoryCollector(60_000);
+    handle.stop();
+    await collectOnce();
+
+    // 2) Simulate Redis-down on the next collect. `Promise.all` rejects on
+    //    the first reject so we only need one of the two info() calls to
+    //    error to exercise the catch path.
+    infoMock.mockReset();
+    infoMock.mockRejectedValue(new Error('ECONNREFUSED'));
+
+    // Must not throw — collector swallows the error.
+    await expect(collectOnce()).resolves.toBeUndefined();
+
+    // Warn was emitted with the error message.
+    expect(loggerWarnMock).toHaveBeenCalled();
+    const warnArg = loggerWarnMock.mock.calls[0]?.[0];
+    expect(warnArg).toMatchObject({ err: 'ECONNREFUSED' });
+
+    // Gauges still reflect the previous successful snapshot — stale, not
+    // zeroed. (Going to zero would falsely trigger an "emptied Redis" panic.)
+    const out = await renderPrometheus();
+    expect(out).toContain('redis_used_memory_bytes 1610612736');
+    expect(out).toContain('redis_maxmemory_bytes 2147483648');
+  });
+
+  it('reports zeros when no successful collect has ever run', async () => {
+    // Cold start: collector never returned a valid INFO. The snapshot is
+    // initialized to zeros, which is the right "no observation" semantics
+    // for `redis_used_memory_bytes` (it's not lying about Redis being empty
+    // — `maia_redis_connected` is the canonical "Redis is up" signal).
+    infoMock.mockRejectedValue(new Error('boot — not connected yet'));
+
+    const handle = startRedisMemoryCollector(60_000);
+    handle.stop();
+    await collectOnce();
+
+    const out = await renderPrometheus();
+    expect(out).toContain('redis_used_memory_bytes 0');
+    expect(out).toContain('redis_maxmemory_bytes 0');
+    expect(out).toContain('redis_memory_used_ratio 0');
+    expect(out).toContain('redis_evicted_keys_total 0');
+    expect(out).toContain('redis_rejected_connections_total 0');
+  });
+
+  it('partial INFO response does not zero previously-good fields', async () => {
+    // 1) First collect: full snapshot.
+    infoMock.mockImplementation((section: string) => {
+      if (section === 'memory') return Promise.resolve(SAMPLE_MEMORY_INFO);
+      if (section === 'stats') return Promise.resolve(SAMPLE_STATS_INFO);
+      return Promise.resolve('');
+    });
+    const handle = startRedisMemoryCollector(60_000);
+    handle.stop();
+    await collectOnce();
+
+    // 2) Second collect: memory INFO omits `maxmemory` (e.g. truncated reply).
+    //    The collector must keep the previous `maxmemory` value rather than
+    //    falling back to 0 — otherwise the ratio gauge would jump to 0 and
+    //    silently disable the > 0.80 / > 0.95 alerts.
+    const truncatedMemoryInfo = [
+      '# Memory',
+      'used_memory:1700000000', // updated
+      '', // no maxmemory line
+    ].join('\r\n');
+    infoMock.mockReset();
+    infoMock.mockImplementation((section: string) => {
+      if (section === 'memory') return Promise.resolve(truncatedMemoryInfo);
+      if (section === 'stats') return Promise.resolve(SAMPLE_STATS_INFO);
+      return Promise.resolve('');
+    });
+
+    await collectOnce();
+
+    const out = await renderPrometheus();
+    expect(out).toContain('redis_used_memory_bytes 1700000000'); // updated
+    expect(out).toContain('redis_maxmemory_bytes 2147483648'); // preserved
+  });
+});
+
+describe('redis-memory-collector — startRedisMemoryCollector lifecycle', () => {
+  beforeEach(() => {
+    _resetMetrics();
+    _resetForTests();
+    infoMock.mockReset();
+    loggerWarnMock.mockReset();
+  });
+
+  afterEach(() => {
+    _resetMetrics();
+    _resetForTests();
+  });
+
+  it('runs collectOnce on a setInterval and stop() halts further collections', async () => {
+    vi.useFakeTimers();
+    try {
+      infoMock.mockImplementation((section: string) => {
+        if (section === 'memory') return Promise.resolve(SAMPLE_MEMORY_INFO);
+        if (section === 'stats') return Promise.resolve(SAMPLE_STATS_INFO);
+        return Promise.resolve('');
+      });
+
+      const handle = startRedisMemoryCollector(1000);
+      // Flush pending microtasks so the boot-time `void collectOnce()` runs.
+      // Each collect performs 2 info() calls (memory + stats) inside
+      // Promise.all, so the boot collect alone contributes 2 calls.
+      await vi.advanceTimersByTimeAsync(0);
+      const callsAfterBoot = infoMock.mock.calls.length;
+      // Boot collect must have fired at least once. Fake-timer scheduling
+      // semantics can race the initial setInterval tick with the boot
+      // collect, so we tolerate either 2 (just boot) or 4 (boot + first
+      // interval) — both prove the collector is wired.
+      expect(callsAfterBoot).toBeGreaterThanOrEqual(2);
+      expect(callsAfterBoot % 2).toBe(0); // always called in pairs
+
+      // Advance time so another interval tick fires; expect at least one
+      // more pair beyond the boot count.
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(infoMock.mock.calls.length).toBeGreaterThanOrEqual(callsAfterBoot + 2);
+
+      handle.stop();
+      const callsAfterStop = infoMock.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(5000);
+      // After stop(), the interval is cleared — no further info() calls.
+      expect(infoMock.mock.calls.length).toBe(callsAfterStop);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stop() is idempotent (safe to call twice)', () => {
+    infoMock.mockResolvedValue('');
+    const handle = startRedisMemoryCollector(60_000);
+    expect(() => handle.stop()).not.toThrow();
+    expect(() => handle.stop()).not.toThrow();
+  });
+
+  it('repeated start/stop cycles do not leak live intervals', async () => {
+    vi.useFakeTimers();
+    try {
+      infoMock.mockResolvedValue('');
+      // Simulate buildServer()/app.close() cycles (tests, hot reload): each
+      // start must be matched by stop() so no orphaned interval keeps firing.
+      for (let i = 0; i < 5; i++) {
+        const handle = startRedisMemoryCollector(1000);
+        handle.stop();
+      }
+      infoMock.mockClear();
+      // Advance well past several intervals — a leaked timer would fire here.
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(infoMock).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('redis-memory-collector — getMemoryUsedRatio (readiness gate input)', () => {
+  beforeEach(() => {
+    _resetMetrics();
+    _resetForTests();
+    infoMock.mockReset();
+    loggerWarnMock.mockReset();
+  });
+
+  afterEach(() => {
+    _resetMetrics();
+    _resetForTests();
+  });
+
+  it('returns used/max from the cached snapshot (no Redis round-trip)', async () => {
+    infoMock.mockImplementation((section: string) => {
+      if (section === 'memory') return Promise.resolve(SAMPLE_MEMORY_INFO);
+      if (section === 'stats') return Promise.resolve(SAMPLE_STATS_INFO);
+      return Promise.resolve('');
+    });
+    const handle = startRedisMemoryCollector(60_000);
+    handle.stop();
+    await collectOnce();
+
+    // 1.5GiB / 2GiB = 0.75. Crucially, reading the ratio does NOT call info()
+    // again (it reads the snapshot), so health checks stay cheap.
+    const callsBefore = infoMock.mock.calls.length;
+    expect(getMemoryUsedRatio()).toBeCloseTo(0.75, 5);
+    expect(infoMock.mock.calls.length).toBe(callsBefore);
+  });
+
+  it('returns 0 when maxmemory is 0 (unbounded — never reads as pressure)', async () => {
+    const unbounded = ['# Memory', 'used_memory:1000000', 'maxmemory:0', ''].join('\r\n');
+    infoMock.mockImplementation((section: string) =>
+      Promise.resolve(section === 'memory' ? unbounded : SAMPLE_STATS_INFO),
+    );
+    const handle = startRedisMemoryCollector(60_000);
+    handle.stop();
+    await collectOnce();
+    expect(getMemoryUsedRatio()).toBe(0);
+  });
+
+  it('crosses the critical threshold exactly at > 0.95', async () => {
+    // used/max = 0.96 → above critical; the readiness gate must drain on this.
+    const critical = [
+      '# Memory',
+      'used_memory:96',
+      'maxmemory:100',
+      '',
+    ].join('\r\n');
+    infoMock.mockImplementation((section: string) =>
+      Promise.resolve(section === 'memory' ? critical : SAMPLE_STATS_INFO),
+    );
+    const handle = startRedisMemoryCollector(60_000);
+    handle.stop();
+    await collectOnce();
+    expect(getMemoryUsedRatio()).toBeGreaterThan(CRITICAL_MEMORY_USED_RATIO);
+  });
+});
+
+describe('redis-memory-collector — isMemorySnapshotFresh (fail-closed gate input)', () => {
+  beforeEach(() => {
+    _resetMetrics();
+    _resetForTests();
+    infoMock.mockReset();
+    loggerWarnMock.mockReset();
+  });
+
+  afterEach(() => {
+    _resetMetrics();
+    _resetForTests();
+  });
+
+  it('is NOT fresh on cold start before any collect (zero-initialized snapshot)', () => {
+    // No collect has run; the snapshot is a zero placeholder, so the readiness
+    // gate must treat it as unknown and fail closed.
+    expect(isMemorySnapshotFresh()).toBe(false);
+  });
+
+  it('becomes fresh after a successful collect (bounded Redis)', async () => {
+    infoMock.mockImplementation((section: string) => {
+      if (section === 'memory') return Promise.resolve(SAMPLE_MEMORY_INFO);
+      if (section === 'stats') return Promise.resolve(SAMPLE_STATS_INFO);
+      return Promise.resolve('');
+    });
+    const handle = startRedisMemoryCollector(60_000);
+    handle.stop();
+    await collectOnce();
+    expect(isMemorySnapshotFresh()).toBe(true);
+  });
+
+  it('is fresh after a genuine unbounded (maxmemory=0) reading — stays ready', async () => {
+    // The whole point of the fail-closed/freshness split: a real maxmemory=0
+    // reading IS a fresh observation (ratio 0 → ready), distinct from the
+    // never-collected cold-start 0 (not fresh → fail closed).
+    const unbounded = ['# Memory', 'used_memory:1000000', 'maxmemory:0', ''].join('\r\n');
+    infoMock.mockImplementation((section: string) =>
+      Promise.resolve(section === 'memory' ? unbounded : SAMPLE_STATS_INFO),
+    );
+    const handle = startRedisMemoryCollector(60_000);
+    handle.stop();
+    await collectOnce();
+    expect(getMemoryUsedRatio()).toBe(0);
+    expect(isMemorySnapshotFresh()).toBe(true);
+  });
+
+  it('stays NOT fresh if a collect fails before any success (Redis down at boot)', async () => {
+    infoMock.mockRejectedValue(new Error('ECONNREFUSED'));
+    const handle = startRedisMemoryCollector(60_000);
+    handle.stop();
+    await collectOnce();
+    // The failed collect swallowed the error but never marked the snapshot
+    // fresh, so the gate keeps failing closed.
+    expect(isMemorySnapshotFresh()).toBe(false);
+  });
+
+  it('goes stale once the last successful collect ages past the staleness bound', async () => {
+    // Pin the clock so `lastCollectedAt` (set via Date.now() inside collectOnce)
+    // is exactly `collectAt` — otherwise the few-ms drift between capturing a
+    // timestamp and the internal Date.now() would make the bound assertions
+    // flaky.
+    vi.useFakeTimers();
+    try {
+      const collectAt = 1_000_000;
+      vi.setSystemTime(collectAt);
+      infoMock.mockImplementation((section: string) => {
+        if (section === 'memory') return Promise.resolve(SAMPLE_MEMORY_INFO);
+        if (section === 'stats') return Promise.resolve(SAMPLE_STATS_INFO);
+        return Promise.resolve('');
+      });
+      const intervalMs = 1000;
+      const handle = startRedisMemoryCollector(intervalMs);
+      handle.stop();
+      await collectOnce();
+
+      const maxAgeMs = SNAPSHOT_STALENESS_INTERVALS * intervalMs;
+      // At the exact bound it is still considered fresh (<=), just past it stale.
+      expect(isMemorySnapshotFresh(collectAt + maxAgeMs)).toBe(true);
+      expect(isMemorySnapshotFresh(collectAt + maxAgeMs + 1)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('derives the staleness bound from the configured collect interval', async () => {
+    vi.useFakeTimers();
+    try {
+      const collectAt = 2_000_000;
+      vi.setSystemTime(collectAt);
+      infoMock.mockImplementation((section: string) => {
+        if (section === 'memory') return Promise.resolve(SAMPLE_MEMORY_INFO);
+        if (section === 'stats') return Promise.resolve(SAMPLE_STATS_INFO);
+        return Promise.resolve('');
+      });
+      // Default interval (no arg) → bound is SNAPSHOT_STALENESS_INTERVALS × default.
+      const handle = startRedisMemoryCollector();
+      handle.stop();
+      await collectOnce();
+
+      const defaultBound = SNAPSHOT_STALENESS_INTERVALS * DEFAULT_COLLECT_INTERVAL_MS;
+      expect(isMemorySnapshotFresh(collectAt + defaultBound)).toBe(true);
+      expect(isMemorySnapshotFresh(collectAt + defaultBound + 1)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
