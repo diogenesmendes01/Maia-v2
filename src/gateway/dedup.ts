@@ -68,7 +68,12 @@
  * construction and the DB fallback (`findByWhatsappId`) still catches any
  * actual duplicate that races the cache miss.
  */
-import { redis, isRedisConnected } from '@/lib/redis.js';
+import {
+  redis,
+  isRedisConnected,
+  isRedisOomError,
+  recordRedisOomDegraded,
+} from '@/lib/redis.js';
 import { mensagensRepo } from '@/db/repositories.js';
 import {
   getCurrentTenant,
@@ -226,7 +231,26 @@ export async function isDuplicate(whatsapp_id: string): Promise<boolean> {
       // SET NX EX: only write if absent. Two concurrent `isDuplicate`
       // callers racing on the same DB hit will both attempt this; only
       // the first wins, the second is a cheap no-op.
-      await redis.set(key, '1', 'EX', TTL_SECONDS, 'NX');
+      //
+      // OOM handling (#309): this backfill is a pure cache OPTIMISATION — the
+      // duplicate has ALREADY been confirmed against Postgres (the source of
+      // truth, tenant+agent-scoped via `findByWhatsappId`). On a Redis OOM we
+      // skip the backfill and still return `true`. This does NOT risk
+      // double-processing: every future `isDuplicate` for this id re-runs the
+      // DB fallback when the cache stays empty. Degrade-to-DB matches runbook
+      // §4.5. Non-OOM errors still propagate.
+      try {
+        await redis.set(key, '1', 'EX', TTL_SECONDS, 'NX');
+      } catch (err) {
+        if (isRedisOomError(err)) {
+          recordRedisOomDegraded('dedup.backfill', {
+            tenant_id: getCurrentTenant(),
+            agent_id: getCurrentAgent(),
+          });
+        } else {
+          throw err;
+        }
+      }
     }
     return true;
   }
@@ -252,10 +276,31 @@ export async function isDuplicate(whatsapp_id: string): Promise<boolean> {
  * caller's next `isDuplicate` will fall through to the DB fallback (which
  * is the source of truth and is tenant+agent-scoped), so we do not
  * silently lose the dedup contract — we just defer it to the slower path.
+ *
+ * OOM branch (#309): an OOM write failure is handled IDENTICALLY to the
+ * Redis-down branch — degrade to the Postgres fallback. Not writing the
+ * marker is equivalent to never having seen it in the cache, and the next
+ * `isDuplicate` re-checks `mensagensRepo.findByWhatsappId` (tenant+agent-
+ * scoped), so a real duplicate is STILL detected — the dedup is correct,
+ * just one DB round-trip slower. This is fail-safe (does NOT risk double-
+ * processing) precisely because the DB check is authoritative; matches
+ * runbook §4.5. Any non-OOM Redis error still propagates so the dispatcher's
+ * `baileys.handle_failed` path captures it.
  */
 export async function markSeen(whatsapp_id: string): Promise<void> {
   const key = dedupKey(whatsapp_id);
   if (isRedisConnected()) {
-    await redis.set(key, '1', 'EX', TTL_SECONDS, 'NX');
+    try {
+      await redis.set(key, '1', 'EX', TTL_SECONDS, 'NX');
+    } catch (err) {
+      if (isRedisOomError(err)) {
+        recordRedisOomDegraded('dedup.mark_seen', {
+          tenant_id: getCurrentTenant(),
+          agent_id: getCurrentAgent(),
+        });
+        return;
+      }
+      throw err;
+    }
   }
 }

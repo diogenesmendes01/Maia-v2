@@ -29,6 +29,9 @@ const h = vi.hoisted(() => {
 vi.mock('../../src/lib/redis.js', () => ({
   redis: h.fakeRedis,
   isRedisConnected: () => h.redisConnected.value,
+  // #309: consulted in the debouncer's catch paths. No OOM injected here.
+  isRedisOomError: () => false,
+  recordRedisOomDegraded: () => {},
 }));
 
 vi.mock('../../src/lib/logger.js', () => ({

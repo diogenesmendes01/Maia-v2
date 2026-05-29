@@ -106,7 +106,12 @@
  *   list does not necessarily drop the marker (and vice-versa), which is
  *   exactly what lets an empty-read-with-live-marker be recognised as a miss.
  */
-import { redis, isRedisConnected } from '@/lib/redis.js';
+import {
+  redis,
+  isRedisConnected,
+  isRedisOomError,
+  recordRedisOomDegraded,
+} from '@/lib/redis.js';
 import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import { incCounter, observeHistogram } from '@/lib/metrics.js';
 import { logger } from '@/lib/logger.js';
@@ -193,17 +198,56 @@ export async function pushMessage(
   const markerKey = workingMarkerKey(conversa_id);
   const fingerprint = scopeFingerprint(conversa_id);
   if (!isRedisConnected()) return;
-  await redis.rpush(key, JSON.stringify({ role, text, ts: Date.now() }));
-  await redis.ltrim(key, -20, -1);
-  await redis.expire(key, MESSAGES_TTL_SECONDS);
+
+  // OOM handling (#309): working memory is a CACHE — Postgres is the source of
+  // truth (the buffer is rebuilt from persisted `mensagens` on the next turn;
+  // see the file docblock and runbook §4.5). On a Redis OOM under `noeviction`
+  // we degrade FAIL-OPEN: skip the data write, emit the OOM metric + warning,
+  // and return WITHOUT writing the TTL/collision marker (the buffer never
+  // landed, so a marker would manufacture a false TTL miss on the next read).
+  // Fail-open is safe here: the key is already tenant+agent-scoped (no
+  // isolation risk in dropping a write) and the read path falls back to
+  // Postgres on the resulting cache miss. Any NON-OOM Redis error still
+  // propagates — we only absorb the capacity signal.
+  try {
+    await redis.rpush(key, JSON.stringify({ role, text, ts: Date.now() }));
+    await redis.ltrim(key, -20, -1);
+    await redis.expire(key, MESSAGES_TTL_SECONDS);
+  } catch (err) {
+    if (isRedisOomError(err)) {
+      recordRedisOomDegraded('working_memory.push', {
+        tenant_id: getCurrentTenant(),
+        agent_id: getCurrentAgent(),
+        key_type: 'messages',
+      });
+      return;
+    }
+    throw err;
+  }
+
   // Write the TTL/collision marker alongside the data, with the SAME TTL so it
   // ages out exactly when the buffer would (#317 N1: bounded by Redis, no
   // in-process map to leak). Overwrite (no NX) so a re-used conversa_id under a
   // fresh write refreshes both the TTL and the fingerprint. Marker failures are
   // a degraded-observability event, never a write failure for the caller.
+  //
+  // OOM on the marker (#309): the DATA write already succeeded above, so the
+  // buffer is present and correct — only the observability marker is missing.
+  // We record the OOM degradation (capacity signal) and return; we do NOT also
+  // emit `working_memory_redis_error_total` for the same event. A subsequent
+  // read simply won't have a marker to detect a future eviction (degraded
+  // observability), which is strictly better than crashing the turn.
   try {
     await redis.set(markerKey, fingerprint, 'EX', MESSAGES_TTL_SECONDS);
-  } catch {
+  } catch (err) {
+    if (isRedisOomError(err)) {
+      recordRedisOomDegraded('working_memory.push', {
+        tenant_id: getCurrentTenant(),
+        agent_id: getCurrentAgent(),
+        key_type: 'messages',
+      });
+      return;
+    }
     recordRedisError('set');
   }
 }
