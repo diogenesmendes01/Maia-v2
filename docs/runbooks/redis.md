@@ -12,9 +12,12 @@ sizing, sinais de pressão, e o que NÃO mexer.
 
 A Maia hospeda múltiplos tenants no mesmo Redis. O isolamento entre tenants
 é feito **por prefixo de chave** (`tenant_id+agent_id` em working memory,
-BullMQ jobs, idempotency ledger, etc. — ver PR #241 e correlatas
-#258 / #252 / #253 / #259 / #272 / #273). Isso resolve leitura/escrita
-cruzada mas **não** protege contra o evictor do Redis.
+rate-limit, dedup, debouncer, vision cache, idempotency ledger, etc.). Esse
+scoping já está **merged em `main`** — cada caller crítico deriva o prefixo do
+`runWithTenantContext` e falha alto (`MissingTenantContextError`) se o
+contexto estiver ausente (PRs #245/#252/#253/#257/#258/#259/#264/#272, todas
+mergeadas). Isso resolve leitura/escrita cruzada mas **não** protege contra o
+evictor do Redis — daí esta política.
 
 Sob pressão de memória, a política `maxmemory-policy` decide o que fazer:
 
@@ -119,12 +122,50 @@ command:
 E redeploy. Não há necessidade de drop de dados — `redis-server` aceita o
 novo `maxmemory` imediatamente; chaves existentes ficam.
 
+### 3.1 Persistência (AOF) e interação com `maxmemory`
+
+Esta config roda **AOF-only** (`--appendonly yes`) e deixa o RDB snapshotting
+(`--save`) no **default do Redis 7** (snapshots periódicos por número de
+mudanças). Decisão consciente para esta entrega:
+
+- **AOF** é a garantia primária de durabilidade (perde no máximo ~1s de writes
+  em crash, com `appendfsync everysec` default).
+- **`maxmemory` conta a memória do dataset**, não o tamanho do arquivo AOF no
+  disco. Sob `noeviction`, o gatilho de OOM é o dataset em RAM — rewrite de AOF
+  (`BGREWRITEAOF`) usa um fork copy-on-write que pode dobrar transitoriamente o
+  uso de RAM; em pressão alta isso aproxima o limite. Por isso §4.1 monitora
+  `used_memory_peak`.
+
+**Fora de escopo desta PR:** tuning explícito de `--save` (latency-spike
+policy do RDB fork) e/ou `appendfsync always` são uma decisão de persistência
+separada — abrir PR dedicada se o perfil de durabilidade/latência exigir. Esta
+PR só fixa a política de eviction; não altera a política de persistência.
+
 ---
 
 ## 4. Sinais de pressão — o que monitorar
 
+> **Estado da entrega (importante):** sob `noeviction`, o **primeiro sinal de
+> pressão é um write falhando** — não há, nesta PR, coletor que dispare alerta
+> *antes* do limite. Esta PR entrega a **camada de infraestrutura** (a política
+> no compose). A observabilidade automatizada e a degradação aplicativa do OOM
+> são camadas companheiras, rastreadas e ainda **não mergeadas**:
+>
+> | Camada | O que entrega | Status |
+> |---|---|---|
+> | Esta PR (#294) | `maxmemory` + `noeviction` no compose | ✅ esta entrega |
+> | Coletor de memória + gauges Prometheus (#300, tracker #297) | emite `redis_used_memory_bytes`, `redis_maxmemory_bytes`, `redis_memory_used_ratio`, `redis_evicted_keys_total` e dispara os alertas abaixo | 🚧 pré-requisito (PR aberta) |
+> | OOM handling aplicativo (#309) | fail-closed / degradação em vez de propagar `ReplyError` no overage path, dedup, debouncer, working memory, BullMQ | 🚧 pré-requisito (issue aberta) |
+>
+> Até #300 mergear, o monitoramento é **manual** (comandos abaixo). Os
+> thresholds desta seção são a especificação que #300 implementa — eles não
+> disparam sozinhos ainda.
+
+### 4.1 Inspeção manual (disponível hoje)
+
 ```bash
 docker exec maia-redis redis-cli INFO memory | grep -E '^(used_memory|used_memory_peak|maxmemory|maxmemory_policy):'
+docker exec maia-redis redis-cli INFO stats  | grep -E '^evicted_keys:'
 ```
 
 Métricas relevantes:
@@ -136,23 +177,41 @@ Métricas relevantes:
   Se subir, alguém mudou a política em runtime (`CONFIG SET`) — investigar
   `audit_log` ou histórico de deploy.
 
-Alerta recomendado (Prometheus / Coolify monitoring):
+### 4.2 Alertas automatizados — especificação (implementa #300/#297)
+
+Quando o coletor (#300) estiver merged, ele exporá os gauges acima em
+`/metrics` e estas regras Prometheus passam a valer:
 
 ```
-used_memory / maxmemory > 0.80     # warning (degraded headroom)
-used_memory / maxmemory > 0.95     # critical (writes podem começar a falhar)
-evicted_keys_total > 0             # critical (política foi mudada)
+redis_memory_used_ratio > 0.80     # warning (degraded headroom)
+redis_memory_used_ratio > 0.95     # critical (writes podem começar a falhar)
+redis_evicted_keys_total > 0       # critical (política foi mudada em runtime)
 ```
 
-Quando o app vê OOM no Redis:
+Hoje, `GET /metrics` (`src/server.ts`) expõe apenas conectividade
+(`maia_redis_connected`) — **não** há gauge de memória até #300. Por isso o
+monitoramento atual é a inspeção manual de §4.1.
 
-- BullMQ falha enqueue → job vira erro determinístico → vai pra DLQ
-  (ver `docs/runbooks/operational.md` §5).
-- Idempotency ledger falha → outbound write é abortado (correto — não
-  enviar mensagem é melhor que enviar duplicada).
-- Working memory write falha → próxima leitura tem cache miss e o agente
-  reconstrói o estado das mensagens persistidas em Postgres
-  (degradação graciosa, mas com latência extra).
+### 4.3 Quando o app vê OOM no Redis
+
+**Estado atual (sem #309):** um `OOM` do Redis vira um `ReplyError` que a
+camada chamadora propaga. Caminhos já endurecidos em `main` degradam de forma
+controlada; o restante ainda propaga o erro até #309:
+
+- **Rate-limit** (`src/gateway/rate-limit.ts`) — overage path já está em
+  try/catch com **fail-closed para `silence`** em não-owner (mergeado via
+  #245/#258). OOM aqui silencia o usuário em vez de derrubar o job. ✅
+- **BullMQ enqueue** — falha vira erro determinístico → DLQ
+  (ver `docs/runbooks/operational.md` §5). Sem retry-once dedicado até #309.
+- **Idempotency ledger** — write falha → outbound write é abortado (correto —
+  não enviar é melhor que duplicar).
+- **Working memory** — write falha; próxima leitura tem cache miss e o agente
+  reconstrói o estado das mensagens persistidas em Postgres (degradação
+  graciosa, com latência extra).
+
+#309 unifica o tratamento (fail-closed/degradação homogênea) nos callers que
+ainda propagam. Até lá, trate um OOM como **incidente de capacidade**: aumente
+`maxmemory` (§3) e investigue o crescimento.
 
 ---
 
@@ -186,8 +245,10 @@ exige isolamento físico), considerar:
 4. **Instâncias dedicadas por tenant** — última escolha (custo linear no
    número de tenants). Justificável para clientes regulados (compliance).
 
-Hoje, `noeviction` + prefixo de chave + monitoramento de `used_memory` é
-suficiente. Reavaliar quando passarmos de ~100 tenants ativos.
+Hoje, `noeviction` + prefixo de chave (merged) + inspeção manual de
+`used_memory` (§4.1) cobre o caso. A observabilidade automatizada (#300) e o
+OOM handling homogêneo (#309) fecham o ciclo. Reavaliar isolamento físico
+quando passarmos de ~100 tenants ativos.
 
 ---
 
@@ -197,7 +258,26 @@ suficiente. Reavaliar quando passarmos de ~100 tenants ativos.
 - **`docs/runbooks/operational.md`** — §5 DLQ, §8 métricas, `/health/redis`.
 - **`src/lib/redis.ts`** — cliente compartilhado (`ioredis` com
   `lazyConnect`).
-- **PR #241** — tenant scoping de working memory (motivo original deste
-  runbook).
+- **PRs #245/#252/#253/#257/#258/#259/#264/#272** — tenant scoping dos callers
+  Redis críticos (working memory, rate-limit, dedup, debouncer, vision cache,
+  pubsub, holidays cache). Todas **merged** — base do pressuposto "keys
+  tenant-prefixed" deste runbook.
 - **Issue #284** — gap que originou esta documentação (`maxmemory-policy`
   default + risco de config drift cross-tenant).
+
+### Camadas companheiras (pré-requisitos declarados)
+
+Esta PR é a camada de infraestrutura de uma entrega faseada. As camadas que
+tornam a pressão de memória *observável* e *graciosamente degradável* são
+rastreadas separadamente:
+
+- **#297 / #300** — `obs(redis)`: coletor de `INFO memory/stats` + gauges
+  Prometheus (`redis_used_memory_bytes`, `redis_maxmemory_bytes`,
+  `redis_memory_used_ratio`, `redis_evicted_keys_total`) + alertas (§4.2).
+  Sem isso, o primeiro sinal de pressão é um write falhando.
+- **#309** — `redis`: OOM handling aplicativo (fail-closed / degradação em vez
+  de propagar `ReplyError`) nos callers que ainda propagam (§4.3).
+
+Ordem de mérito: cada camada melhora estritamente o estado anterior. Reverter
+esta PR enquanto se espera #300/#309 deixa o pior caso pior (eviction
+cross-tenant silenciosa é pior que write failure ruidoso e não-cross-tenant).

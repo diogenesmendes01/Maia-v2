@@ -32,9 +32,14 @@ services:
     # room for another tenant under `allkeys-*` policies. `noeviction` makes
     # writes fail under memory pressure instead of cross-tenant eviction;
     # `volatile-lru` only evicts keys that carry an explicit TTL. Never use
-    # `allkeys-lru` / `allkeys-lfu` / `allkeys-random` here. See
-    # `docs/runbooks/redis.md` for context, sizing guidance, and the
-    # alerting threshold for memory pressure.
+    # `allkeys-lru` / `allkeys-lfu` / `allkeys-random` here.
+    #
+    # Caveat: `noeviction` makes pressure surface as a WRITE FAILURE, not an
+    # alert — the automated memory-pressure collector + Prometheus alerts are
+    # a companion layer (issue #297 / PR #300), and homogeneous app-level OOM
+    # handling is tracked in #309. Until those land, monitoring is manual
+    # (`redis-cli INFO memory`). See `docs/runbooks/redis.md` §4 for the live
+    # vs. pending breakdown, sizing guidance, and the alert thresholds.
     command:
       - "redis-server"
       - "--appendonly"
