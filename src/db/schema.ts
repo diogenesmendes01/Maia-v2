@@ -300,33 +300,78 @@ export const agent_facts = pgTable(
       t.escopo,
       t.chave,
     ),
+    // Issue #281 (redesigned in PR #310) — KSM auto-promoter hot path.
+    // The promoter sweeps `WHERE lifecycle_status = X AND <updated_at /
+    // evidence filter> LIMIT 100` hourly (workers/knowledge-state-
+    // promoter.ts → repos.ts listEligible). Two partial indexes back it:
+    //   (1) in-flight states swept by promoter steps 1-5;
+    //   (2) the 'active' bulk swept by step 6 (active→deprecated).
+    // The old (tenant_id, agent_id, id) index was dropped — it was
+    // redundant with the PK on `id` for the findById/update path.
+    // Created via migration 066 CONCURRENTLY.
+    lifecycleInflightIdx: index('idx_agent_facts_lifecycle_inflight')
+      .on(t.lifecycle_status, t.updated_at)
+      .where(
+        sql`lifecycle_status IN ('ephemeral', 'observed', 'reinforced', 'verified')`,
+      ),
+    // Expression index on the coalesced value the promoter's active sweep
+    // ranges over (`COALESCE(last_recall_at, updated_at) < cutoff`). A
+    // btree over the two SEPARATE columns cannot back a range over the
+    // COALESCE(...) expression, so it must key on the expression itself
+    // (mirrors migration 066: `((COALESCE(last_recall_at, updated_at)))`).
+    lifecycleActiveIdx: index('idx_agent_facts_lifecycle_active')
+      .on(sql`COALESCE(last_recall_at, updated_at)`)
+      .where(sql`lifecycle_status = 'active'`),
   }),
 );
 
-export const learned_rules = pgTable('learned_rules', {
-  id: uuid('id').primaryKey().defaultRandom(),
-  tenant_id: text('tenant_id').notNull().default('default'),
-  agent_id: text('agent_id').notNull().default('default'),
-  tipo: text('tipo').notNull(),
-  contexto: text('contexto').notNull(),
-  acao: text('acao').notNull(),
-  contexto_jsonb: jsonb('contexto_jsonb').notNull().default(sql`'{}'::jsonb`),
-  acoes_jsonb: jsonb('acoes_jsonb').notNull().default(sql`'{}'::jsonb`),
-  confianca: numeric('confianca', { precision: 3, scale: 2 }).notNull().default('0.50'),
-  acertos: integer('acertos').notNull().default(0),
-  erros: integer('erros').notNull().default(0),
-  ativa: boolean('ativa').notNull().default(true),
-  exemplo_origem_id: uuid('exemplo_origem_id'),
-  // P8c + P10a — Knowledge State Machine lifecycle columns
-  // (P8c added lifecycle_status/evidence_count/lifecycle_transitions in
-  // migration 041; P10a added last_recall_at in migration 050.)
-  lifecycle_status: text('lifecycle_status').notNull().default('active'),
-  evidence_count: integer('evidence_count').notNull().default(1),
-  lifecycle_transitions: jsonb('lifecycle_transitions').notNull().default(sql`'[]'::jsonb`),
-  last_recall_at: timestamp('last_recall_at', { withTimezone: true }),
-  created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
-  updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
-});
+export const learned_rules = pgTable(
+  'learned_rules',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull().default('default'),
+    agent_id: text('agent_id').notNull().default('default'),
+    tipo: text('tipo').notNull(),
+    contexto: text('contexto').notNull(),
+    acao: text('acao').notNull(),
+    contexto_jsonb: jsonb('contexto_jsonb').notNull().default(sql`'{}'::jsonb`),
+    acoes_jsonb: jsonb('acoes_jsonb').notNull().default(sql`'{}'::jsonb`),
+    confianca: numeric('confianca', { precision: 3, scale: 2 }).notNull().default('0.50'),
+    acertos: integer('acertos').notNull().default(0),
+    erros: integer('erros').notNull().default(0),
+    ativa: boolean('ativa').notNull().default(true),
+    exemplo_origem_id: uuid('exemplo_origem_id'),
+    // P8c + P10a — Knowledge State Machine lifecycle columns
+    // (P8c added lifecycle_status/evidence_count/lifecycle_transitions in
+    // migration 041; P10a added last_recall_at in migration 050.)
+    lifecycle_status: text('lifecycle_status').notNull().default('active'),
+    evidence_count: integer('evidence_count').notNull().default(1),
+    lifecycle_transitions: jsonb('lifecycle_transitions').notNull().default(sql`'[]'::jsonb`),
+    last_recall_at: timestamp('last_recall_at', { withTimezone: true }),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    // Issue #281 (redesigned in PR #310, B3) — learned_rules was the
+    // fourth KSM table previously omitted. The auto-promoter sweeps it
+    // identically to the other three. Two partial lifecycle indexes back
+    // `listEligible` (see agent_facts above for the full rationale).
+    // Created via migration 066 CONCURRENTLY.
+    lifecycleInflightIdx: index('idx_learned_rules_lifecycle_inflight')
+      .on(t.lifecycle_status, t.updated_at)
+      .where(
+        sql`lifecycle_status IN ('ephemeral', 'observed', 'reinforced', 'verified')`,
+      ),
+    // Expression index on the coalesced value the promoter's active sweep
+    // ranges over (`COALESCE(last_recall_at, updated_at) < cutoff`). A
+    // btree over the two SEPARATE columns cannot back a range over the
+    // COALESCE(...) expression, so it must key on the expression itself
+    // (mirrors migration 066: `((COALESCE(last_recall_at, updated_at)))`).
+    lifecycleActiveIdx: index('idx_learned_rules_lifecycle_active')
+      .on(sql`COALESCE(last_recall_at, updated_at)`)
+      .where(sql`lifecycle_status = 'active'`),
+  }),
+);
 
 export const agent_memories = pgTable('agent_memories', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -856,6 +901,25 @@ export const memory_entry = pgTable(
     scopeIdx: index('memory_entry_scope_idx').on(t.scope_type, t.subject_id),
     needsReviewIdx: index('memory_entry_needs_review_idx').on(t.needs_review),
     expiresIdx: index('memory_entry_expires_idx').on(t.expires_at),
+    // Issue #281 (redesigned in PR #310) — KSM auto-promoter hot path.
+    // Two partial lifecycle indexes back `listEligible`; distinct from
+    // `memory_entry_tenant_agent_idx` (which orders by created_at for
+    // time-window scans). The old (tenant_id, agent_id, id) index was
+    // dropped as redundant with the PK. See agent_facts for the full
+    // rationale. Created via migration 066 CONCURRENTLY.
+    lifecycleInflightIdx: index('idx_memory_entry_lifecycle_inflight')
+      .on(t.lifecycle_status, t.updated_at)
+      .where(
+        sql`lifecycle_status IN ('ephemeral', 'observed', 'reinforced', 'verified')`,
+      ),
+    // Expression index on the coalesced value the promoter's active sweep
+    // ranges over (`COALESCE(last_recall_at, updated_at) < cutoff`). A
+    // btree over the two SEPARATE columns cannot back a range over the
+    // COALESCE(...) expression, so it must key on the expression itself
+    // (mirrors migration 066: `((COALESCE(last_recall_at, updated_at)))`).
+    lifecycleActiveIdx: index('idx_memory_entry_lifecycle_active')
+      .on(sql`COALESCE(last_recall_at, updated_at)`)
+      .where(sql`lifecycle_status = 'active'`),
   }),
 );
 
@@ -895,6 +959,26 @@ export const behavioral_hint = pgTable(
       t.subject_id,
     ),
     activeIdx: index('behavioral_hint_active_idx').on(t.revoked_at, t.expires_at),
+    // Issue #281 (redesigned in PR #310) — KSM auto-promoter hot path.
+    // The shared behavioral_hint table backs both `behavioral_hint` and
+    // `procedure_hint` kinds; the promoter sweeps both by lifecycle_status.
+    // Two partial lifecycle indexes back `listEligible`. The old
+    // (tenant_id, agent_id, id) index was dropped as redundant with the
+    // PK. See agent_facts for the full rationale. Created via migration
+    // 066 CONCURRENTLY.
+    lifecycleInflightIdx: index('idx_behavioral_hint_lifecycle_inflight')
+      .on(t.lifecycle_status, t.updated_at)
+      .where(
+        sql`lifecycle_status IN ('ephemeral', 'observed', 'reinforced', 'verified')`,
+      ),
+    // Expression index on the coalesced value the promoter's active sweep
+    // ranges over (`COALESCE(last_recall_at, updated_at) < cutoff`). A
+    // btree over the two SEPARATE columns cannot back a range over the
+    // COALESCE(...) expression, so it must key on the expression itself
+    // (mirrors migration 066: `((COALESCE(last_recall_at, updated_at)))`).
+    lifecycleActiveIdx: index('idx_behavioral_hint_lifecycle_active')
+      .on(sql`COALESCE(last_recall_at, updated_at)`)
+      .where(sql`lifecycle_status = 'active'`),
   }),
 );
 
