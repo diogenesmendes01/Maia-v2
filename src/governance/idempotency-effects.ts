@@ -161,6 +161,15 @@ function deriveWhatsappMessageId(identity: OutboxRowIdentity): string {
  * straight into the outgoing message key id, and WhatsApp keys messages on
  * `(remoteJid, fromMe, id)` — so a deterministic id IS a genuine provider-side
  * dedup key for this transport.
+ *
+ * KNOWN BOUND (non-blocking, documented per Codex #331 review): the WhatsApp key
+ * carries 18 hex chars = 72 bits of entropy. By the birthday bound the
+ * probability of ANY two distinct effects within one tenant colliding on the
+ * derived id is ~n^2 / 2^73; at n = 1e6 effects/tenant that is ~1e-10 —
+ * negligible at any realistic per-tenant send volume. A collision would only
+ * mean one effect's retry could be deduped against an unrelated effect's send
+ * within the SAME tenant (tenant isolation still holds — tenant/agent are folded
+ * into the hash). Widening the hex length is the lever if this ever matters.
  */
 export function deriveProviderDedupKey(
   effect: PlannedEffect,

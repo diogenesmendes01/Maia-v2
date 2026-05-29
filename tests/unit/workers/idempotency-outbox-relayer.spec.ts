@@ -91,6 +91,11 @@ const repoMock = {
       .slice(0, limit)
       .map((r) => ({
         id: r.id,
+        // #327: the real claim SELECTs tenant_id + agent_id onto the row so the
+        // relayer derives the dedup key from PERSISTED row fields (not ALS).
+        // The mock mirrors that — tests assert the key is row-derived.
+        tenant_id: r.tenant_id,
+        agent_id: r.agent_id,
         idempotency_key: r.idempotency_key,
         effect_type: r.effect_type,
         effect_payload: r.effect_payload,
@@ -317,6 +322,78 @@ describe('idempotency_outbox_relayer — #327 provider-side dedup key', () => {
     expect(opts?.messageId).toBe(expectedKey);
     // …and it is a valid WhatsApp message-id shape (3EB0 + 18 uppercase hex).
     expect(opts?.messageId).toMatch(/^3EB0[0-9A-F]{18}$/);
+  });
+
+  it('derives the key from the ROW identity, NOT the ambient ALS context (key is ALS-independent)', async () => {
+    // BLOCKER (Codex #331): the dedup key must come from the PERSISTED row, never
+    // the async-local context. If the ambient ALS tenant/agent ever diverges from
+    // the row being dispatched (e.g. a crash-recovered re-dispatch under a stale
+    // context), an ALS-derived key would differ from the original send's key and
+    // the transport could not dedup → the whole exactly-once guarantee collapses.
+    //
+    // We force that divergence: the relayer runs under ALS context tenant-A
+    // (the enumerated tuple), but the CLAIMED ROW carries a DIFFERENT identity
+    // (tenant-ROW/agent-ROW). The dispatched messageId MUST equal the key for the
+    // ROW's identity — and MUST NOT equal the key the ALS context would produce.
+    seed({ ...A_CTX });
+    const ROW_IDENTITY = {
+      tenant_id: 'tenant-ROW',
+      agent_id: 'agent-ROW',
+      idempotency_key: 'ik-row-only',
+    };
+    repoMock.claimPendingEffects.mockImplementationOnce(async () => {
+      const ctx = tryGetCurrentContext();
+      if (!ctx) throw new Error('claimPendingEffects ran with NO tenant context');
+      claimContexts.push({ tenant_id: ctx.tenant_id, agent_id: ctx.agent_id });
+      // Row identity intentionally DIFFERS from the ambient ALS context (ctx is
+      // tenant-A/agent-A). Proves the key is computed off the row, not ctx.
+      return [
+        {
+          id: 'ob-divergent',
+          tenant_id: ROW_IDENTITY.tenant_id,
+          agent_id: ROW_IDENTITY.agent_id,
+          idempotency_key: ROW_IDENTITY.idempotency_key,
+          effect_type: 'whatsapp_text',
+          effect_payload: {
+            kind: 'whatsapp_text',
+            jid: '5511999990000@s.whatsapp.net',
+            text: 'olá',
+            mensagem_id: 'm1',
+          },
+          attempts: 0,
+          max_attempts: 5,
+        },
+      ];
+    });
+
+    const { deriveProviderDedupKey } = await import(
+      '@/governance/idempotency-effects.js'
+    );
+    const effect = {
+      kind: 'whatsapp_text' as const,
+      jid: '5511999990000@s.whatsapp.net',
+      text: 'olá',
+      mensagem_id: 'm1',
+    };
+    const keyFromRow = deriveProviderDedupKey(effect, ROW_IDENTITY);
+    const keyFromAls = deriveProviderDedupKey(effect, {
+      ...A_CTX,
+      idempotency_key: ROW_IDENTITY.idempotency_key,
+    });
+    // Sanity: the two identities genuinely produce DIFFERENT keys, so the assert
+    // below is meaningful (it can actually distinguish row-derived from ALS).
+    expect(keyFromRow).not.toBe(keyFromAls);
+
+    const { runIdempotencyOutboxRelayer } = await import(
+      '@/workers/idempotency-outbox-relayer.js'
+    );
+    await runIdempotencyOutboxRelayer();
+
+    expect(sendOutboundTextMock).toHaveBeenCalledTimes(1);
+    const [, , opts] = sendOutboundTextMock.mock.calls[0]!;
+    // The send carried the ROW-derived key — ALS did NOT influence it.
+    expect(opts?.messageId).toBe(keyFromRow);
+    expect(opts?.messageId).not.toBe(keyFromAls);
   });
 
   it('a CRASH-WINDOW re-dispatch sends with the SAME provider dedup key (deterministic)', async () => {

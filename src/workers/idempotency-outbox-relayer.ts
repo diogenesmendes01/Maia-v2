@@ -260,12 +260,17 @@ async function relayInner(): Promise<RelayStats> {
 
     try {
       // #327: derive the provider-side dedup key from the row's STABLE identity
-      // (tenant_id+agent_id from the ALS context this pass runs under, plus the
-      // row's immutable idempotency_key). A later re-dispatch of THIS row
-      // recomputes the identical key → same provider message id → deduped.
+      // read STRAIGHT OFF THE PERSISTED ROW (tenant_id, agent_id,
+      // idempotency_key) — NOT the ambient ALS context (getCurrentTenant/Agent).
+      // The key must be byte-identical across a re-dispatch (including a
+      // crash-recovered one, the exact case this closes); if the ALS context
+      // ever diverged from the row being dispatched the re-send would compute a
+      // DIFFERENT provider id and the transport could not dedup it. Keying on
+      // persisted row fields makes the derivation independent of who/what
+      // context is dispatching.
       const providerRef = await dispatchEffect(effect, {
-        tenant_id,
-        agent_id,
+        tenant_id: row.tenant_id,
+        agent_id: row.agent_id,
         idempotency_key: row.idempotency_key,
       });
       const marked = await idempotencyOutboxRepo.markEffectSent({
