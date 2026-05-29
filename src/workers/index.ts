@@ -30,6 +30,7 @@ import { runTraceBodyWriter } from './trace-body-writer.js';
 import { runTraceBodyRecoverer } from './trace-body-recoverer.js';
 import { runTraceMatviewRefresh } from './trace-matview-refresh.js';
 import { runKnowledgeStatePromoter } from './knowledge-state-promoter.js';
+import { runOutboundMessagesSweeper } from './outbound-messages-sweeper.js';
 import { tickEngine } from '@/workflows/engine.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 
@@ -75,6 +76,13 @@ export const JOBS: Job[] = [
   },
   { name: 'audit_mode_expirer', cron: '*/15 * * * *', fn: runAuditModeExpirer, phase: 1 },
   { name: 'idempotency_cleanup', cron: '0 4 * * *', fn: runIdempotencyCleanup, phase: 1 },
+  // Issue #292 — outbound_messages sweeper (#227/#233 follow-up).
+  // Cadence ~5min: stale-pending cutoff é 5min default, então rodar a cada
+  // 5min dá detecção em <=10min de qualquer pending órfã. Cleanup retention
+  // (terminais > 30d) roda no mesmo pass (uma DELETE a mais por tenant).
+  // Dispatcher per-tenant via runWithTenantContext (espelha reflection-batch
+  // #240/#251) — NÃO usa sentinela 'default'.
+  { name: 'outbound_messages_sweeper', cron: '*/5 * * * *', fn: runOutboundMessagesSweeper, phase: 1 },
   { name: 'inactivity_sweep', cron: '0 3 * * *', fn: runInactivitySweep, phase: 1 },
   { name: 'nightly_backup', cron: '0 3 * * *', fn: runNightlyBackup, phase: 1 },
   // Cloud backup rotation runs once a week (Sundays 04:00 BRT) so
