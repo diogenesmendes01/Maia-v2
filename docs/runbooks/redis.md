@@ -66,9 +66,16 @@ aumentar `maxmemory`, baixar TTL, ou shardar Redis por tenant.
 
 ## 2. Config no `docker-compose.yml`
 
+O bloco relevante do `docker-compose.yml` (`services.redis`) é snapshotado
+aqui literalmente, para que a política seja **verificável junto com as
+métricas** (§4) sem precisar abrir outro arquivo:
+
 ```yaml
+# docker-compose.yml → services.redis
 redis:
   image: redis:7-alpine
+  container_name: maia-redis
+  restart: unless-stopped
   command:
     - "redis-server"
     - "--appendonly"
@@ -79,12 +86,24 @@ redis:
     - "noeviction"
 ```
 
+> **⚠️ Sync obrigatório (compose ↔ runbook).** Se `services.redis.command` no
+> `docker-compose.yml` mudar (cap diferente, política diferente), **atualize
+> este bloco junto** — caso contrário a tabela de alertas (§4) e o gate
+> `/readyz` ficam descrevendo uma política que não está mais ativa.
+
+Com o cap ativo (`--maxmemory 2gb` + `--maxmemory-policy noeviction`),
+`redis_maxmemory_bytes` reporta `2147483648` e `redis_memory_used_ratio`
+passa a ser significativo (0..1), habilitando os alertas de §4 e o gate
+`/readyz`. Se o cap for removido (`maxmemory 0`), o ratio reporta `0` e o
+gate nunca dispara — comportamento seguro e correto para "sem cap
+configurado" (ver §4, nota sobre `maxmemory=0`).
+
 Para deploys gerenciados (Coolify, AWS ElastiCache, Upstash, etc.):
 configurar o equivalente no painel/Terraform. **Não** aceitar default do
 provider se ele for `allkeys-lru` (Upstash, por exemplo, default é
 `allkeys-lru` no plano free — confirmar antes de produção).
 
-Verificar a config rodando:
+Conferir a política ativa em runtime:
 
 ```bash
 docker exec maia-redis redis-cli CONFIG GET maxmemory
@@ -147,7 +166,7 @@ mudanças). Decisão consciente para esta entrega:
 - **`maxmemory` conta a memória do dataset**, não o tamanho do arquivo AOF no
   disco. Sob `noeviction`, o gatilho de OOM é o dataset em RAM — rewrite de AOF
   (`BGREWRITEAOF`) usa um fork copy-on-write que pode dobrar transitoriamente o
-  uso de RAM; em pressão alta isso aproxima o limite. Por isso §4.1 monitora
+  uso de RAM; em pressão alta isso aproxima o limite. Por isso §4 monitora
   `used_memory_peak`.
 
 **Fora de escopo desta PR:** tuning explícito de `--save` (latency-spike
@@ -157,29 +176,123 @@ PR só fixa a política de eviction; não altera a política de persistência.
 
 ---
 
-## 4. Sinais de pressão — o que monitorar
+## 4. Sinais de pressão — métricas Prometheus + alertas
 
-> **Estado da entrega (importante):** sob `noeviction`, o **primeiro sinal de
-> pressão é um write falhando** — não há, nesta PR, coletor que dispare alerta
-> *antes* do limite. Esta PR entrega a **camada de infraestrutura** (a política
-> no compose). A observabilidade automatizada e a degradação aplicativa do OOM
-> são camadas companheiras, rastreadas e ainda **não mergeadas**:
->
-> | Camada | O que entrega | Status |
-> |---|---|---|
-> | Esta PR (#294) | `maxmemory` + `noeviction` no compose | ✅ esta entrega |
-> | Coletor de memória + gauges Prometheus (#300, tracker #297) | emite `redis_used_memory_bytes`, `redis_maxmemory_bytes`, `redis_memory_used_ratio`, `redis_evicted_keys_total` e dispara os alertas abaixo | 🚧 pré-requisito (PR aberta) |
-> | OOM handling aplicativo (#309) | fail-closed / degradação em vez de propagar `ReplyError` no overage path, dedup, debouncer, working memory, BullMQ | 🚧 pré-requisito (issue aberta) |
->
-> Até #300 mergear, o monitoramento é **manual** (comandos abaixo). Os
-> thresholds desta seção são a especificação que #300 implementa — eles não
-> disparam sozinhos ainda.
+A Maia expõe gauges de pressão de memória do Redis via `/metrics`
+(coletor em `src/observability/redis-memory-collector.ts`, registrado em
+`src/server.ts`). O coletor faz `INFO memory` + `INFO stats` a cada 15s
+e cacheia os valores; as gauges são pull-based via
+`src/lib/metrics.ts:setGaugeProvider` (custo zero entre scrapes).
 
-### 4.1 Inspeção manual (disponível hoje)
+### 4.1 Métricas expostas
+
+| Métrica | Tipo | Origem (Redis INFO) | Significado |
+|---|---|---|---|
+| `redis_used_memory_bytes` | gauge | `memory.used_memory` | Bytes em uso agora |
+| `redis_maxmemory_bytes` | gauge | `memory.maxmemory` | Cap configurado (0 = unbounded) |
+| `redis_memory_used_ratio` | gauge | derivado (`used / max`) | Pressão relativa (0..1) |
+| `redis_evicted_keys_total` | gauge | `stats.evicted_keys` | Cumulativo de evictions desde restart |
+| `redis_rejected_connections_total` | gauge | `stats.rejected_connections` | Cumulativo de rejected connections |
+
+> **Sem labels.** Todas Redis-wide — não há `tenant_id`/`agent_id` aqui.
+> Atribuição por-tenant de memória exigiria Redis expor accounting por
+> prefixo de chave (ele não expõe). Counters por-tenant vivem nas camadas
+> que usam Redis (working memory, cache layer, etc.).
+
+> **Quando `maxmemory=0` (Redis sem cap)** a gauge `redis_memory_used_ratio`
+> reporta `0` em vez de `Infinity`/`NaN` — alertas em `> 0.80` / `> 0.95`
+> não disparam espúrios. O sinal primário "sem cap configurado" é
+> `redis_maxmemory_bytes 0` direto. Com a política de §2 ativa o cap é
+> `2147483648` e o ratio passa a ser significativo.
+
+> **`evicted_keys` DEVE ficar em 0 com `noeviction`.** Se `redis_evicted_keys_total`
+> subir, alguém mudou a política em runtime (`CONFIG SET`) — investigar
+> `audit_log` ou histórico de deploy (o alerta `RedisEvictionDetected` abaixo
+> dispara nesse caso).
+
+### 4.2 Regras Prometheus / Alertmanager (config real, versionada)
+
+As regras **não são apenas sugestões textuais** — vivem como config
+versionada em **[`monitoring/alerts/redis.rules.yml`](../../monitoring/alerts/redis.rules.yml)**
+(carregável diretamente pelo Prometheus). Resumo:
+
+| Alerta | `expr` | `for` | Severidade |
+|---|---|---|---|
+| `RedisMemoryPressureWarning` | `redis_memory_used_ratio > 0.80` | 5m | warning |
+| `RedisMemoryPressureCritical` | `redis_memory_used_ratio > 0.95` | 1m | critical |
+| `RedisEvictionDetected` | `redis_evicted_keys_total > 0` | 1m | critical |
+| `RedisEvictionRising` | `increase(redis_evicted_keys_total[5m]) > 0` | 1m | critical |
+| `RedisRejectedConnectionsRising` | `increase(redis_rejected_connections_total[5m]) > 0` | 5m | warning |
+
+> **Sync obrigatório.** Os thresholds `0.80`/`0.95` aparecem em 3 lugares e
+> precisam mudar juntos: este arquivo de regras, `CRITICAL_MEMORY_USED_RATIO`
+> em `src/observability/redis-memory-collector.ts` (usado pelo gate `/readyz`)
+> e esta tabela. Se editar um, edite os três.
+
+#### Como ativar estas regras
+
+O Prometheus carrega regras via `rule_files`. Monte o arquivo read-only no
+container do Prometheus e referencie-o:
+
+```yaml
+# prometheus.yml (no deploy do Prometheus)
+rule_files:
+  - /etc/prometheus/rules/redis.rules.yml
+
+scrape_configs:
+  - job_name: maia
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['app:3000']   # serviço `app` do docker-compose.yml
+```
+
+```yaml
+# serviço prometheus no compose de observabilidade (exemplo)
+prometheus:
+  image: prom/prometheus
+  volumes:
+    - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    - ./monitoring/alerts/redis.rules.yml:/etc/prometheus/rules/redis.rules.yml:ro
+```
+
+> **Nota de deploy.** Este repositório expõe `/metrics` (in-house, sem
+> `prom-client`) mas **não embarca** um container Prometheus no
+> `docker-compose.yml` principal — o scrape/alerting roda na stack de
+> observabilidade do ambiente (Coolify/k8s/Prometheus gerenciado). O arquivo
+> de regras é o artefato versionado que essa stack consome; as instruções
+> acima são o contrato de wiring.
+
+### 4.3 Sinais correlacionados (não dependem deste coletor)
+
+Já expostas por `src/server.ts`:
+
+- `maia_redis_connected` (gauge 0/1) — coletor degrada para "última leitura
+  conhecida" se Redis cair; `maia_redis_connected=0` é o sinal canônico.
+- `/health/redis` — health endpoint Fastify (`connected + PING`). Probe de
+  componente, não decide rotação de LB.
+- **`/readyz`** — **gate de readiness para o load balancer** (issue #297).
+  Retorna **`503` (não-pronto)** quando `redis_memory_used_ratio > 0.95`,
+  caso contrário `200`. Sob `noeviction` (ver §1) a pressão crítica vira
+  write failure; tirar a instância de rotação **antes** disso evita que o
+  incident cascateie (BullMQ → DLQ, working memory → cache miss). Implementação:
+  `checkReadiness()` em `src/lib/healthcheck.ts`, lê o ratio do snapshot
+  cacheado do coletor (sem round-trip ao Redis). O threshold `0.95` =
+  `CRITICAL_MEMORY_USED_RATIO` (mesma constante do alerta
+  `RedisMemoryPressureCritical`).
+
+  ```bash
+  # 200 quando saudável, 503 quando ratio > 0.95
+  curl -s -o /dev/null -w '%{http_code}\n' http://localhost:3000/readyz
+  ```
+
+### 4.4 Sondagem manual
 
 ```bash
-docker exec maia-redis redis-cli INFO memory | grep -E '^(used_memory|used_memory_peak|maxmemory|maxmemory_policy):'
-docker exec maia-redis redis-cli INFO stats  | grep -E '^evicted_keys:'
+docker exec maia-redis redis-cli INFO memory | \
+  grep -E '^(used_memory|used_memory_peak|maxmemory|maxmemory_policy):'
+
+docker exec maia-redis redis-cli INFO stats | \
+  grep -E '^(evicted_keys|rejected_connections):'
 ```
 
 Métricas relevantes:
@@ -188,25 +301,16 @@ Métricas relevantes:
 - `used_memory_peak` — pico desde o último restart. Se peak ≈ maxmemory,
   você passou perto do limite.
 - `evicted_keys` (do `INFO stats`) — **DEVE ficar em 0 com `noeviction`**.
-  Se subir, alguém mudou a política em runtime (`CONFIG SET`) — investigar
-  `audit_log` ou histórico de deploy.
 
-### 4.2 Alertas automatizados — especificação (implementa #300/#297)
+Cross-check contra `/metrics`:
 
-Quando o coletor (#300) estiver merged, ele exporá os gauges acima em
-`/metrics` e estas regras Prometheus passam a valer:
-
-```
-redis_memory_used_ratio > 0.80     # warning (degraded headroom)
-redis_memory_used_ratio > 0.95     # critical (writes podem começar a falhar)
-redis_evicted_keys_total > 0       # critical (política foi mudada em runtime)
+```bash
+curl -s http://localhost:3000/metrics | grep -E '^redis_'
 ```
 
-Hoje, `GET /metrics` (`src/server.ts`) expõe apenas conectividade
-(`maia_redis_connected`) — **não** há gauge de memória até #300. Por isso o
-monitoramento atual é a inspeção manual de §4.1.
+Valores devem bater (snapshot do coletor é atualizado a cada 15s).
 
-### 4.3 Quando o app vê OOM no Redis
+### 4.5 Quando o app vê OOM no Redis
 
 **Estado atual (sem #309):** um `OOM` do Redis vira um `ReplyError` que a
 camada chamadora propaga. Caminhos já endurecidos em `main` degradam de forma
@@ -262,10 +366,9 @@ exige isolamento físico), considerar:
 4. **Instâncias dedicadas por tenant** — última escolha (custo linear no
    número de tenants). Justificável para clientes regulados (compliance).
 
-Hoje, `noeviction` + prefixo de chave (merged) + inspeção manual de
-`used_memory` (§4.1) cobre o caso. A observabilidade automatizada (#300) e o
-OOM handling homogêneo (#309) fecham o ciclo. Reavaliar isolamento físico
-quando passarmos de ~100 tenants ativos.
+Hoje, `noeviction` + prefixo de chave (merged) + as métricas/alertas de §4
+cobrem o caso. O OOM handling aplicativo homogêneo (#309) fecha o ciclo.
+Reavaliar isolamento físico quando passarmos de ~100 tenants ativos.
 
 ---
 
@@ -275,26 +378,21 @@ quando passarmos de ~100 tenants ativos.
 - **`docs/runbooks/operational.md`** — §5 DLQ, §8 métricas, `/health/redis`.
 - **`src/lib/redis.ts`** — cliente compartilhado (`ioredis` com
   `lazyConnect`).
+- **`src/observability/redis-memory-collector.ts`** — coletor de `INFO
+  memory/stats` + gauges Prometheus (issue #297).
+- **`src/server.ts`** — `startRedisMemoryCollector()` no boot + endpoints
+  `/metrics`, `/health/redis`, `/readyz`.
+- **`src/lib/healthcheck.ts`** — `checkReadiness()` (gate `/readyz`).
+- **`src/lib/metrics.ts`** — módulo interno de Prometheus (sem `prom-client`).
+- **`monitoring/alerts/redis.rules.yml`** — regras Prometheus versionadas (§4.2).
 - **PRs #245/#252/#253/#257/#258/#259/#264/#272** — tenant scoping dos callers
   Redis críticos (working memory, rate-limit, dedup, debouncer, vision cache,
   pubsub, holidays cache). Todas **merged** — base do pressuposto "keys
   tenant-prefixed" deste runbook.
-- **Issue #284** — gap que originou esta documentação (`maxmemory-policy`
-  default + risco de config drift cross-tenant).
-
-### Camadas companheiras (pré-requisitos declarados)
-
-Esta PR é a camada de infraestrutura de uma entrega faseada. As camadas que
-tornam a pressão de memória *observável* e *graciosamente degradável* são
-rastreadas separadamente:
-
-- **#297 / #300** — `obs(redis)`: coletor de `INFO memory/stats` + gauges
-  Prometheus (`redis_used_memory_bytes`, `redis_maxmemory_bytes`,
-  `redis_memory_used_ratio`, `redis_evicted_keys_total`) + alertas (§4.2).
-  Sem isso, o primeiro sinal de pressão é um write falhando.
-- **#309** — `redis`: OOM handling aplicativo (fail-closed / degradação em vez
-  de propagar `ReplyError`) nos callers que ainda propagam (§4.3).
-
-Ordem de mérito: cada camada melhora estritamente o estado anterior. Reverter
-esta PR enquanto se espera #300/#309 deixa o pior caso pior (eviction
-cross-tenant silenciosa é pior que write failure ruidoso e não-cross-tenant).
+- **PR #294 / Issue #284** — `maxmemory 2gb` + `noeviction` no compose (gap que
+  originou esta documentação: `maxmemory-policy` default + risco de config
+  drift cross-tenant).
+- **Issue #297** — coletor de memória + gauges Prometheus + gate `/readyz`
+  (sem essas métricas, OOM sob `noeviction` vira write failure invisível).
+- **#309** — OOM handling aplicativo (fail-closed / degradação em vez de
+  propagar `ReplyError`) nos callers que ainda propagam (§4.5).
