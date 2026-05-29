@@ -47,6 +47,10 @@ vi.mock('@/lib/redis.js', () => ({
     incCounter('redis_oom_degraded_total', { operation: caller });
     logWarn({ redis_oom: true, caller, ...extra }, 'redis.oom_degraded');
   },
+  recordRedisError: (caller: string, extra?: Record<string, unknown>) => {
+    incCounter('redis_error_total', { operation: caller });
+    logWarn({ redis_error: true, caller, ...extra }, 'redis.error');
+  },
 }));
 
 vi.mock('@/lib/logger.js', () => ({
@@ -100,7 +104,7 @@ describe('vision cache — OOM degradation (#309)', () => {
     expect(oom).toBeDefined();
   });
 
-  it('a NON-OOM setex error keeps the pre-existing fail-open (warn + no throw, no OOM metric)', async () => {
+  it('a NON-OOM setex error keeps fail-open (warn + no throw) AND is now VISIBLE via redis_error_total (#324 B2)', async () => {
     redisStub.setex.mockImplementationOnce(async () => {
       throw Object.assign(new Error('READONLY'), { name: 'ReplyError' });
     });
@@ -110,6 +114,8 @@ describe('vision cache — OOM degradation (#309)', () => {
     const writeFailed = logWarn.mock.calls.find((c) => c[1] === 'vision_cache.write_failed');
     expect(writeFailed).toBeDefined();
     const out = await renderPrometheus();
+    // Fail-open unchanged, but no longer silent on the metric side.
+    expect(out).toContain('redis_error_total{operation="vision_cache.set"} 1');
     expect(out).not.toContain('redis_oom_degraded_total');
   });
 });

@@ -81,10 +81,12 @@ vi.mock('@/lib/redis.js', () => ({
   isRedisConnected: () => true,
   // #309: consulted in the production catch path. This spec exercises a
   // NON-OOM Redis failure (`redis_failed` log), so OOM detection is false and
-  // the degrade hook is a no-op — behaviour unchanged. OOM-specific coverage
-  // lives in `bot-detection-oom.spec.ts`.
+  // the OOM degrade hook is a no-op. PR #324 B2 adds `recordRedisError` to the
+  // non-OOM branch — stub it too (no-op; metric coverage lives in
+  // `bot-detection-oom.spec.ts`). OOM-specific coverage lives there as well.
   isRedisOomError: () => false,
   recordRedisOomDegraded: () => {},
+  recordRedisError: () => {},
 }));
 
 // ---------------------------------------------------------------------------

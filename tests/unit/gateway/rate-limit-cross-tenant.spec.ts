@@ -122,6 +122,13 @@ const redisStub = {
 vi.mock('@/lib/redis.js', () => ({
   redis: redisStub,
   isRedisConnected: () => true,
+  // #309 follow-up (PR #324 B2): rate-limit now classifies OOM vs non-OOM in
+  // both catch blocks. These tests inject plain (non-OOM) Errors, so OOM
+  // detection is false and the non-OOM `recordRedisError` path runs — both
+  // must be present on the mock or the catch itself would throw.
+  isRedisOomError: () => false,
+  recordRedisOomDegraded: () => {},
+  recordRedisError: () => {},
 }));
 
 vi.mock('@/config/env.js', () => ({

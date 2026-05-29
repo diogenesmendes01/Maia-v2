@@ -78,7 +78,17 @@ export type RedisOomCaller =
   | 'debouncer.clear_state'
   | 'vision_cache.set'
   | 'bot_detection.incr'
-  | 'backpressure.acquire';
+  | 'backpressure.acquire'
+  // BullMQ enqueue path (#309 follow-up, PR #324 B1): an OOM on
+  // `agentQueue.add` outside the debouncer (non-debounced ingress +
+  // message-recovery sweep). Fail-closed — see `enqueueAgent` in
+  // `src/gateway/queue.ts`.
+  | 'enqueue_agent'
+  // Rate-limit (#309 follow-up, PR #324 B2 / W1): the sliding-window zset
+  // block and the overage get/set block now classify OOM explicitly while
+  // preserving the intentional fail-closed `silence` posture.
+  | 'rate_limit.zset'
+  | 'rate_limit.overage';
 
 /**
  * Record a graceful OOM degradation for `caller` — increments the
@@ -95,6 +105,52 @@ export function recordRedisOomDegraded(
 ): void {
   incCounter('redis_oom_degraded_total', { operation: caller });
   logger.warn({ redis_oom: true, caller, ...extra }, 'redis.oom_degraded');
+}
+
+/**
+ * Operation/caller label vocabulary for the `redis_error_total` counter
+ * (issue #309 follow-up, PR #324 B2). This is the NON-OOM sibling of
+ * `redis_oom_degraded_total`: it surfaces a real Redis fault (connection
+ * reset, failover, `READONLY`, `WRONGTYPE`, auth, etc.) at a site that
+ * catches-all-but-must-not-crash, so the fault is observable instead of
+ * silently absorbed by a fail-open/fail-closed branch.
+ *
+ * Same low-cardinality discipline as `RedisOomCaller`: these are code-path
+ * constants, NEVER raw tenant/agent IDs or keys. Per-tenant attribution
+ * flows through the structured `redis.error` log, not metric labels.
+ *
+ * NOTE: working-memory data-path errors keep their pre-existing
+ * `working_memory_redis_error_total{op}` counter (see
+ * `src/memory/working.ts`); this counter is for the catch-all sites that
+ * had NO error metric before PR #324.
+ */
+export type RedisErrorCaller =
+  | 'vision_cache.set'
+  | 'bot_detection.incr'
+  | 'rate_limit.zset'
+  | 'rate_limit.overage';
+
+/**
+ * Record a NON-OOM Redis error for `caller` — increments the low-cardinality
+ * `redis_error_total{operation}` counter and emits a structured `redis.error`
+ * warning. Centralised so every catch-all site reports identically.
+ *
+ * This does NOT change control flow: callers decide whether to fail-open,
+ * fail-closed, or re-throw AFTER calling this. Its sole purpose is to make
+ * the error visible (#309 follow-up, PR #324 B2): before this, a `READONLY`
+ * or connection-reset at these sites was logged-without-metric (bot-detection,
+ * vision-cache) or — for rate-limit — logged but never classified as OOM vs
+ * not, so a capacity incident and a real bug looked identical.
+ *
+ * `extra` carries per-tenant attribution (tenant_id/agent_id) into the LOG
+ * only — it is never used as a metric label.
+ */
+export function recordRedisError(
+  caller: RedisErrorCaller,
+  extra?: Record<string, unknown>,
+): void {
+  incCounter('redis_error_total', { operation: caller });
+  logger.warn({ redis_error: true, caller, ...extra }, 'redis.error');
 }
 
 let connected = false;

@@ -19,7 +19,7 @@ import { mensagensRepo } from '@/db/repositories.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import { isDuplicate, markSeen } from './dedup.js';
 import { markRead } from './presence.js';
-import { enqueueAgent } from './queue.js';
+import { enqueueAgent, QueueRedisUnavailableError } from './queue.js';
 import { scheduleDebouncedAgent } from './debouncer.js';
 import { checkBotAndMaybeBlock } from './bot-detection.js';
 import { audit } from '@/governance/audit.js';
@@ -705,7 +705,28 @@ async function handleIncoming(
     }
   }
 
-  await enqueueAgent({ mensagem_id: stored.id });
+  // Non-debounced path (media, or debounce feature off). FAIL-CLOSED on a
+  // Redis OOM (#309 follow-up, PR #324 B1): the inbound is already persisted
+  // above (`createInbound` with `processada_em: null`), so an OOM on
+  // `agentQueue.add` must NOT crash the ingress and must NOT mark the row
+  // processed — we stop here and let `runMessageRecovery` re-enqueue the
+  // still-pending row once Redis has headroom. `enqueueAgent` has already
+  // recorded `redis_oom_degraded_total{operation="enqueue_agent"}`; this log
+  // is the per-message breadcrumb. A NON-OOM error is left to propagate to the
+  // outer `handleIncoming` handler (real bug — surface it), again leaving the
+  // row pending (we never reach the "processed" write).
+  try {
+    await enqueueAgent({ mensagem_id: stored.id });
+  } catch (err) {
+    if (err instanceof QueueRedisUnavailableError) {
+      logger.warn(
+        { mensagem_id: stored.id, tel: '[REDACTED]', failure_class: 'redis_unavailable', oom: err.oom },
+        'baileys.enqueue_failed_fail_closed',
+      );
+      return;
+    }
+    throw err;
+  }
   logger.info({ mensagem_id: stored.id, tel: '[REDACTED]' }, 'baileys.message.enqueued');
 }
 

@@ -3,6 +3,7 @@ import {
   isRedisConnected,
   isRedisOomError,
   recordRedisOomDegraded,
+  recordRedisError,
 } from '@/lib/redis.js';
 import { logger } from '@/lib/logger.js';
 import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
@@ -153,6 +154,12 @@ export async function setCachedVision(
       recordRedisOomDegraded('vision_cache.set', { tenant_id, agent_id, tool });
       return;
     }
+    // Non-OOM (conn reset, failover, READONLY, auth, …): still fail-open
+    // (cache is best-effort, Vision API/Postgres is the source of truth), but
+    // make the fault VISIBLE (#309 follow-up, PR #324 B2) — record a distinct
+    // `redis_error_total{operation="vision_cache.set"}` metric alongside the
+    // structured warn so a real Redis bug doesn't hide behind the fail-open.
+    recordRedisError('vision_cache.set', { tenant_id, agent_id, tool });
     logger.warn(
       { err: (err as Error).message, tenant_id, agent_id, tool },
       'vision_cache.write_failed',

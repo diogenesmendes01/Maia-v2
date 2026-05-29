@@ -45,6 +45,10 @@ vi.mock('@/lib/redis.js', () => ({
     incCounter('redis_oom_degraded_total', { operation: caller });
     logWarn({ redis_oom: true, caller, ...extra }, 'redis.oom_degraded');
   },
+  recordRedisError: (caller: string, extra?: Record<string, unknown>) => {
+    incCounter('redis_error_total', { operation: caller });
+    logWarn({ redis_error: true, caller, ...extra }, 'redis.error');
+  },
 }));
 
 const findByPhoneMock = vi.fn();
@@ -110,13 +114,21 @@ describe('bot detection — OOM degradation (#309)', () => {
     expect(out).toContain('redis_oom_degraded_total{operation="bot_detection.incr"} 1');
   });
 
-  it('a NON-OOM Redis error still degrades via the generic branch (false, no OOM metric)', async () => {
+  it('a NON-OOM Redis error still degrades (false) but is now VISIBLE via redis_error_total (#324 B2)', async () => {
     redisStub.incr.mockImplementationOnce(async () => {
       throw Object.assign(new Error('READONLY'), { name: 'ReplyError' });
     });
     const result = await asTenantA(() => checkBotAndMaybeBlock(PHONE));
     expect(result).toBe(false);
     const out = await renderPrometheus();
+    // Fail-open behaviour unchanged, but the fault is no longer invisible:
+    // a distinct error counter fires (NOT the OOM counter).
+    expect(out).toContain('redis_error_total{operation="bot_detection.incr"} 1');
     expect(out).not.toContain('redis_oom_degraded_total');
+    // And it is still logged structurally.
+    expect(logWarn).toHaveBeenCalledWith(
+      expect.objectContaining({ tenant_id: TENANT_A, agent_id: AGENT_A }),
+      'bot_detection.redis_failed',
+    );
   });
 });
