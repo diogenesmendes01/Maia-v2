@@ -52,10 +52,11 @@ não o tenant.
 
 **Por que `noeviction` em vez de `volatile-lru`?**
 
-Hoje nem todas as chaves Redis carregam TTL (BullMQ guarda jobs sem TTL, e
-algumas estruturas de working memory também). Em `volatile-lru` sob pressão,
-o Redis evicta só o subset com TTL e ainda falha o write quando esgota esse
-subset — o pior dos dois mundos para o caller, sem o sinal claro de OOM.
+Hoje nem todas as chaves Redis carregam TTL — o BullMQ guarda jobs sem TTL.
+(As chaves de working memory **carregam** TTL: tanto a chave de dados quanto a
+de marker expiram em `MESSAGES_TTL_SECONDS`; ver §4.6.) Em `volatile-lru` sob
+pressão, o Redis evicta só o subset com TTL e ainda falha o write quando esgota
+esse subset — o pior dos dois mundos para o caller, sem o sinal claro de OOM.
 `noeviction` falha cedo e ruidosamente, deixando o operador decidir entre
 aumentar `maxmemory`, baixar TTL, ou shardar Redis por tenant.
 
@@ -369,6 +370,54 @@ Mesmo com a degradação, um OOM é um **incidente de capacidade**: o alerta
 `redis_oom_degraded_total` devem disparar a investigação — aumente `maxmemory`
 (§3) e investigue o crescimento.
 
+### 4.6 TTL de working memory e o sinal de TTL-miss
+
+Toda escrita de working memory (`pushMessage` em `src/memory/working.ts`) grava
+**duas** chaves, **ambas com o mesmo TTL** `MESSAGES_TTL_SECONDS` (24h):
+
+| Chave | Prefixo | Onde o TTL é setado |
+|---|---|---|
+| Dados (buffer da conversa) | `working:${tenant}:${agent}:conv:…:messages` | `expire(key, MESSAGES_TTL_SECONDS)` após `rpush`/`ltrim` |
+| Marker (TTL/colisão) | `nx_ttl:${tenant}:${agent}:conv:…:messages` | `set(markerKey, …, 'EX', MESSAGES_TTL_SECONDS)` |
+
+Os TTLs são **alinhados de propósito** (#330): cada `pushMessage` reescreve o
+marker (não-`NX`), então o marker rastreia o TTL dos dados exatamente — um
+marker vivo sempre implica que os dados **deveriam** existir. É isso que torna
+"leitura vazia com marker vivo" um sinal de perda precoce, não de expiração
+natural.
+
+> **Janela curta entre as duas escritas.** Os dois writes são round trips Redis
+> separados, **não** uma transação — há uma janela entre o `rpush`/`expire` dos
+> dados e o `set` do marker. A não-atomicidade é **aceita e documentada** no
+> bloco de comentário sobre `redis.set(markerKey, …)` em `src/memory/working.ts`
+> ("Marker/data NON-ATOMICITY — ACCEPTED observability window"): se o `set` do
+> marker falhar **após** o write de dados, a chave fica com **dados sem
+> marker** — um TTL-miss real vira **falso-negativo** (não contado) até o TTL
+> de 24h dos próprios dados expirar. Sem perda de dados nem risco de
+> isolamento; um `pushMessage` posterior no mesmo `conversa_id` cura a janela.
+
+**Sinal de TTL-miss:** o alerta **`WorkingMemoryTtlMissRising`** em
+[`monitoring/alerts/working-memory.rules.yml`](../../monitoring/alerts/working-memory.rules.yml)
+(`rate(working_memory_ttl_miss_total[5m]) > 1` por 10m) dispara quando uma
+leitura encontra o marker ainda vivo porém o buffer voltou vazio — entrada
+sumiu antes da hora (eviction, crash entre `rpush` e `expire`). É por-LEITURA
+(o marker não é consumido no miss), então alertamos sobre a TAXA sustentada,
+não uma contagem bruta. Quase sempre correlaciona com eviction: cross-check
+`RedisEvictionRising` / `RedisMemoryPressureWarning`/`Critical` (§4.2).
+
+**O que o TTL-miss NÃO cobre** (não conte com este alerta para estes casos):
+
+- **`FLUSHDB` total** — dados **e** marker são apagados juntos, então a leitura
+  vê `marker === null` e trata como leitura fria / expiração natural. Nenhum
+  `working_memory_ttl_miss_total` é incrementado (e `RedisEvictionDetected`
+  também não dispara — `FLUSHDB` não é eviction). Detecte um flush por outros
+  sinais: queda abrupta de `used_memory`, perda generalizada de cache, e o
+  histórico de deploy / `audit_log`.
+- **Dados sem TTL por falha entre `rpush` e `expire`** — se o processo morrer
+  depois do `rpush` mas antes do `expire`, o buffer fica **sem TTL** (vaza até
+  intervenção). Isso é uma lacuna distinta, **rastreada separadamente na issue
+  #333** — não é o que `WorkingMemoryTtlMissRising` mede.
+
 ---
 
 ## 5. Não-fazer (anti-padrões)
@@ -420,6 +469,10 @@ Reavaliar isolamento físico quando passarmos de ~100 tenants ativos.
 - **`src/lib/healthcheck.ts`** — `checkReadiness()` (gate `/readyz`).
 - **`src/lib/metrics.ts`** — módulo interno de Prometheus (sem `prom-client`).
 - **`monitoring/alerts/redis.rules.yml`** — regras Prometheus versionadas (§4.2).
+- **`monitoring/alerts/working-memory.rules.yml`** — regras de working memory
+  (`WorkingMemoryTtlMissRising` etc., §4.6).
+- **`src/memory/working.ts`** — working memory; TTL alinhado dados/marker e a
+  janela de não-atomicidade documentada (§4.6, PR #330).
 - **PRs #245/#252/#253/#257/#258/#259/#264/#272** — tenant scoping dos callers
   Redis críticos (working memory, rate-limit, dedup, debouncer, vision cache,
   pubsub, holidays cache). Todas **merged** — base do pressuposto "keys
