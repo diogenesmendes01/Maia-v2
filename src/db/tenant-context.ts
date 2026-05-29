@@ -46,6 +46,46 @@ type TenantContext = {
   agent_id: string;
 };
 
+/**
+ * Reserved sentinel for genuinely-GLOBAL maintenance work that has no single
+ * owning tenant (issue #323 phase 1).
+ *
+ * Why a distinct sentinel (and not `'default'`):
+ *   - `'default'` is the LEGACY single-tenant Maia bucket. Real per-tenant
+ *     work was historically collapsed onto it (issue #240 et al.), so it is
+ *     on the path to being REJECTED fail-closed (`assertNotDefaultLiteral` +
+ *     `MAIA_REJECT_DEFAULT_LITERAL`). Anything still running under `'default'`
+ *     is presumed-misrouted until proven otherwise.
+ *   - `'system'` is RESERVED and ALLOWED: it is the explicit home for work that
+ *     legitimately has no tenant attribution (DB-wide backup, DLQ depth probe,
+ *     health checks, idempotency-key GC, setup/pairing audit). The `tenants`/
+ *     `agents` rows are seeded by migration `014_p0_seed_system_tenant.sql`, so
+ *     FK-bearing writes (e.g. `audit_log`) under this context are valid.
+ *
+ * `audit()` already falls back to this context when no ALS context is active
+ * (`src/governance/audit.ts`). Exporting it as a single canonical constant lets
+ * global workers adopt the SAME bucket instead of each re-typing a literal — and
+ * keeps the "global → system / per-tenant → real tenant" split auditable in one
+ * place as the worker fleet is migrated off `'default'`.
+ *
+ * IMPORTANT: `'system'` is NOT a catch-all. It is ONLY for work that is global
+ * by NATURE (no per-tenant row to attribute to). Per-tenant work that merely
+ * lacks a tenant loop today must be migrated to iterate real tenants, never
+ * parked here — parking it here would re-create the cross-tenant collapse that
+ * the `'default'` rejection exists to kill.
+ */
+export const SYSTEM_TENANT_ID = 'system' as const;
+export const SYSTEM_AGENT_ID = 'system' as const;
+
+/**
+ * Canonical global-maintenance context. Frozen so callers can't mutate the
+ * shared object. Pass to `runWithTenantContext` (or use `runWithSystemContext`).
+ */
+export const SYSTEM_CONTEXT: TenantContext = Object.freeze({
+  tenant_id: SYSTEM_TENANT_ID,
+  agent_id: SYSTEM_AGENT_ID,
+});
+
 const storage = new AsyncLocalStorage<TenantContext>();
 
 /**
@@ -61,6 +101,33 @@ export async function runWithTenantContext<T>(
   fn: () => Promise<T>,
 ): Promise<T> {
   return storage.run(ctx, fn);
+}
+
+/**
+ * Run `fn` under the reserved global-maintenance context (`system`/`system`).
+ *
+ * Thin convenience wrapper over `runWithTenantContext(SYSTEM_CONTEXT, fn)` for
+ * genuinely-global workers (backup, DLQ monitor, health monitor, idempotency
+ * GC, …) so they declare their intent explicitly instead of hand-typing a
+ * `{ tenant_id: 'default', agent_id: 'default' }` literal that is on the path
+ * to being rejected. Additive (issue #323 phase 1): this introduces the
+ * vocabulary; migrating each worker to call it is a separate, reviewed step.
+ *
+ * Do NOT use for per-tenant work — see `SYSTEM_CONTEXT` docs. Per-tenant
+ * workers must enumerate real tenants and open `runWithTenantContext` per tuple
+ * (cf. `src/workers/reflection-batch.ts`).
+ */
+export async function runWithSystemContext<T>(fn: () => Promise<T>): Promise<T> {
+  return storage.run(SYSTEM_CONTEXT, fn);
+}
+
+/**
+ * True when both ids equal the reserved `system` sentinel. Lets callers/tests
+ * distinguish the sanctioned global-maintenance bucket from a real tenant
+ * without string-matching the literal at multiple sites.
+ */
+export function isSystemContext(ctx: { tenant_id: string; agent_id: string }): boolean {
+  return ctx.tenant_id === SYSTEM_TENANT_ID && ctx.agent_id === SYSTEM_AGENT_ID;
 }
 
 /**
@@ -137,6 +204,16 @@ function assertTruthyContext(value: unknown, name: string): asserts value is str
  * exact same gating + metering + throw semantics at packet-build time. Sharing
  * this single helper guarantees the builder guard and the ALS read-time guard
  * cannot silently diverge (same flag, same counter, same `DefaultLiteralRejectedError`).
+ *
+ * Scope of rejection (issue #323): this guard rejects ONLY the literal
+ * `'default'`. The reserved `'system'` sentinel (`SYSTEM_TENANT_ID` /
+ * `SYSTEM_CONTEXT`) is intentionally NOT rejected — it is the sanctioned home
+ * for genuinely-global maintenance with no owning tenant (backup, DLQ monitor,
+ * idempotency GC, setup/pairing audit). Keeping `'system'` permitted is what
+ * makes flipping `MAIA_REJECT_DEFAULT_LITERAL` to default-ON safe: global
+ * workers move to `'system'`, per-tenant workers iterate real tenants, and
+ * `'default'` becomes a hard-fail signal of a still-misrouted path. Do NOT add
+ * `'system'` to the rejection set without first re-homing every global worker.
  */
 export function assertNotDefaultLiteral(value: string, field: 'tenant_id' | 'agent_id'): void {
   if (value === 'default') {

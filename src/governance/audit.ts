@@ -3,7 +3,7 @@ import type { AuditAction } from './audit-actions.js';
 import { logger } from '@/lib/logger.js';
 import { incCounter } from '@/lib/metrics.js';
 import {
-  runWithTenantContext,
+  runWithSystemContext,
   tryGetCurrentContext,
 } from '@/db/tenant-context.js';
 
@@ -74,10 +74,9 @@ export async function audit(input: {
       // System bucket — preserves the row for setup/gateway/startup events
       // that legitimately have no tenant attached. Visible to the audit
       // watcher; distinct from 'default' (the legacy single-tenant Maia).
-      await runWithTenantContext(
-        { tenant_id: 'system', agent_id: 'system' },
-        write,
-      );
+      // Uses the canonical `runWithSystemContext` helper (issue #323) so the
+      // reserved sentinel lives in exactly one place.
+      await runWithSystemContext(write);
     }
   } catch (err) {
     logger.error({ err, acao: input.acao }, 'audit.write_failed');
