@@ -158,40 +158,48 @@ export function getCurrentAgent(): string {
   return ctx.agent_id;
 }
 
+/**
+ * Non-throwing variant. Contract: returns a *fully valid* `TenantContext` or
+ * `null` — never a half-populated / cross-tenant-readable scope.
+ *
+ * **Routed through the SAME helpers as the strict getters** (`assertTruthyContext`
+ * + `assertNotDefaultLiteral`) so the validation surface cannot silently diverge
+ * (PR #293 review, blocker 1). The helpers are invoked inside a `try/catch`
+ * because this variant signals "no usable context" with `null` rather than by
+ * throwing.
+ *
+ * Fail-closed `null` is returned when EITHER field is:
+ *  - non-string / empty / whitespace-only / surrounded by whitespace
+ *    (`assertTruthyContext` throws — always, regardless of the flag), OR
+ *  - the literal `'default'` sentinel while `MAIA_REJECT_DEFAULT_LITERAL=true`
+ *    (`assertNotDefaultLiteral` throws `DefaultLiteralRejectedError`).
+ *
+ * Closing the cross-tenant-isolation hole (PR #293 review, blocker 2): the old
+ * implementation metered the `'default'` literal and then STILL returned
+ * `{tenant_id:'default', agent_id:'default'}`, handing the caller a synthetic
+ * shared scope. Now a `'default'` literal with the flag ON yields `null`, so
+ * every caller takes its existing missing-context branch (all callers of this
+ * function fail closed on `null` — they skip the write / abort the operation,
+ * never fall back to a default scope).
+ *
+ * Flag OFF: `assertNotDefaultLiteral` only meters (no throw), so a `'default'`
+ * literal still returns the context — preserving the warning+counter
+ * observability rollout while the shape checks above remain enforced.
+ */
 export function tryGetCurrentContext(): TenantContext | null {
   const ctx = storage.getStore();
   if (!ctx) return null;
-  // Malformed context (empty/whitespace-only/surrounded fields) must NOT silently
-  // leak through `tryGetCurrentContext`. Callers that opt into the "try" variant
-  // expect either a *valid* context or null — never a half-populated object.
-  // Returning null forces them down the same code path as missing-ALS, which
-  // today either skips the operation or escalates per their policy.
-  if (
-    typeof ctx.tenant_id !== 'string' ||
-    typeof ctx.agent_id !== 'string' ||
-    ctx.tenant_id.length === 0 ||
-    ctx.agent_id.length === 0 ||
-    ctx.tenant_id.trim().length === 0 ||
-    ctx.agent_id.trim().length === 0 ||
-    ctx.tenant_id !== ctx.tenant_id.trim() ||
-    ctx.agent_id !== ctx.agent_id.trim()
-  ) {
+  try {
+    // Same shape + literal-default guards as getCurrentTenant/getCurrentAgent.
+    // assertTruthyContext narrows each field to a non-empty, fully-trimmed
+    // string; assertNotDefaultLiteral meters the 'default' sentinel and throws
+    // when MAIA_REJECT_DEFAULT_LITERAL=true. Any throw → fail-closed null.
+    assertTruthyContext(ctx.tenant_id, 'tenant_id');
+    assertNotDefaultLiteral(ctx.tenant_id, 'tenant_id');
+    assertTruthyContext(ctx.agent_id, 'agent_id');
+    assertNotDefaultLiteral(ctx.agent_id, 'agent_id');
+  } catch {
     return null;
-  }
-  // Mirror the literal-default observability of the strict getters: meter
-  // when callers receive a `default/default` context via the try variant so
-  // the counter captures every path, not just the strict ones.
-  if (ctx.tenant_id === 'default') {
-    incCounter('maia_tenant_id_default_literal_total', {
-      field: 'tenant_id',
-      via: 'tryGetCurrentContext',
-    });
-  }
-  if (ctx.agent_id === 'default') {
-    incCounter('maia_tenant_id_default_literal_total', {
-      field: 'agent_id',
-      via: 'tryGetCurrentContext',
-    });
   }
   return ctx;
 }

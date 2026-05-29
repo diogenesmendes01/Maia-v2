@@ -357,18 +357,65 @@ describe('tenant-context', () => {
       expect(incCounterMock).not.toHaveBeenCalled();
     });
 
-    it('tryGetCurrentContext meters literal "default" but still returns the context', async () => {
+    // PR #293 review (blocker 2): tryGetCurrentContext is routed through the
+    // SAME helpers as the strict getters and is fail-closed. With the flag ON,
+    // a 'default' literal must NOT yield a usable context — it returns null so
+    // callers take their missing-context branch instead of getting a synthetic
+    // cross-tenant-readable scope.
+    it('opt-in mode: tryGetCurrentContext returns null (fail-closed) on default/default', async () => {
+      process.env.MAIA_REJECT_DEFAULT_LITERAL = 'true';
+      let observed: ReturnType<typeof tryGetCurrentContext> | undefined;
+      await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+        observed = tryGetCurrentContext();
+      });
+      expect(observed).toBeNull();
+      // Metering still fires (via the shared assertNotDefaultLiteral helper)
+      // before the throw that drives the null — tenant_id is checked first and
+      // short-circuits, so at least the tenant_id field is metered.
+      const calls = incCounterMock.mock.calls.filter(
+        (c) => c[0] === 'maia_tenant_id_default_literal_total',
+      );
+      expect(calls.length).toBeGreaterThanOrEqual(1);
+      expect(calls.some((c) => c[1]?.field === 'tenant_id')).toBe(true);
+    });
+
+    it('opt-in mode: tryGetCurrentContext returns null when only agent_id is default', async () => {
+      process.env.MAIA_REJECT_DEFAULT_LITERAL = 'true';
+      let observed: ReturnType<typeof tryGetCurrentContext> | undefined;
+      await runWithTenantContext({ tenant_id: 'acme', agent_id: 'default' }, async () => {
+        observed = tryGetCurrentContext();
+      });
+      expect(observed).toBeNull();
+    });
+
+    // Flag OFF: the 'default' literal is metered but (since the shape checks
+    // pass) the context is still returned — preserving the observability
+    // rollout. Confirms tryGetCurrentContext reuses the shared metering helper.
+    it('default mode: tryGetCurrentContext meters default/default but still returns it', async () => {
       let observed: ReturnType<typeof tryGetCurrentContext> | undefined;
       await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
         observed = tryGetCurrentContext();
       });
       expect(observed).toEqual({ tenant_id: 'default', agent_id: 'default' });
-      // Both fields are 'default', so the counter should be incremented for both.
       const calls = incCounterMock.mock.calls.filter(
         (c) => c[0] === 'maia_tenant_id_default_literal_total',
       );
-      expect(calls.length).toBeGreaterThanOrEqual(2);
-      expect(calls.every((c) => c[1]?.via === 'tryGetCurrentContext')).toBe(true);
+      // Both fields metered (no throw short-circuits when the flag is off).
+      expect(calls.some((c) => c[1]?.field === 'tenant_id')).toBe(true);
+      expect(calls.some((c) => c[1]?.field === 'agent_id')).toBe(true);
+    });
+
+    // PR #293 review (blocker 3): surrounding-whitespace rejection at THIS call
+    // site (the strict getters already cover it via assertTruthyContext; verify
+    // the try variant rejects it too rather than handing back a padded id that
+    // would collide/diverge in cache-key namespaces). Independent of the flag.
+    it('tryGetCurrentContext returns null on surrounding-whitespace agent_id (flag on)', async () => {
+      process.env.MAIA_REJECT_DEFAULT_LITERAL = 'true';
+      let observed: ReturnType<typeof tryGetCurrentContext> | undefined;
+      await runWithTenantContext({ tenant_id: 'acme', agent_id: ' sofia ' }, async () => {
+        observed = tryGetCurrentContext();
+      });
+      expect(observed).toBeNull();
     });
 
     it('flag is read at access time, not module-load time', async () => {
