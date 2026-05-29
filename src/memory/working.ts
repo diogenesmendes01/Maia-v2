@@ -227,9 +227,50 @@ export async function pushMessage(
 
   // Write the TTL/collision marker alongside the data, with the SAME TTL so it
   // ages out exactly when the buffer would (#317 N1: bounded by Redis, no
-  // in-process map to leak). Overwrite (no NX) so a re-used conversa_id under a
-  // fresh write refreshes both the TTL and the fingerprint. Marker failures are
-  // a degraded-observability event, never a write failure for the caller.
+  // in-process map to leak). Marker failures are a degraded-observability
+  // event, never a write failure for the caller.
+  //
+  // NX intent — DELIBERATELY non-NX (plain overwrite), confirmed intended
+  // (#322). The data write above resets the buffer's TTL to a FRESH
+  // `MESSAGES_TTL_SECONDS` on EVERY `pushMessage` (the `expire` call). The
+  // marker must therefore ALSO refresh its TTL on every write so it stays
+  // aligned with the data key's lifetime:
+  //   - With overwrite (current): marker TTL tracks the data TTL exactly, so a
+  //     live marker always implies the data SHOULD still be present — an empty
+  //     read with a live marker is a true eviction/early-loss signal (#317 B3),
+  //     and the refreshed fingerprint keeps collision detection (#317 B2)
+  //     accurate for a re-used conversa_id.
+  //   - With `NX` (rejected): the marker would keep the TTL of the FIRST write
+  //     while the data key is repeatedly refreshed past it. The marker would
+  //     expire ~24h after the first message even on a still-active
+  //     conversation, after which a real eviction would be a false-NEGATIVE
+  //     (no marker → not counted). `NX` would also pin a STALE fingerprint,
+  //     defeating collision detection on legitimate re-writes. So `NX` is
+  //     strictly worse here, not a missing safety flag.
+  // (Contrast the gateway dedup/idempotency keys, where `NX` IS correct because
+  // those markers must NOT have their TTL reset by a duplicate write.)
+  //
+  // Marker/data NON-ATOMICITY — ACCEPTED observability window (#322, #317 B4).
+  // The data write (above) and this marker `SET` are two separate Redis round
+  // trips, NOT a transaction. If this `SET` fails (non-OOM error) AFTER the
+  // data write already succeeded, the key ends up with DATA BUT NO MARKER. The
+  // consequence is purely observational and bounded:
+  //   - TTL-miss detection (#317 B3) and key-collision detection (#317 B2) for
+  //     THIS key are a FALSE-NEGATIVE until the data key's own 24h TTL elapses
+  //     (an eviction during that window goes uncounted because `readRecent`
+  //     finds `marker === null` and treats it as a cold read / natural expiry).
+  //   - There is NO data loss and NO isolation risk: the buffer is present and
+  //     correctly tenant+agent-scoped; the source of truth is Postgres anyway
+  //     (the buffer is rebuilt from `mensagens` on a cache miss).
+  // We accept this rather than wrapping both writes in MULTI/Lua: the cost
+  // (extra round trip / scripting on a hot path) is not worth closing a
+  // bounded false-negative in a best-effort observability counter. The failure
+  // is still surfaced — the `SET` error increments
+  // `working_memory_redis_error_total{op="set"}` (alerted by
+  // `WorkingMemoryRedisErrorsRising`), so a SUSTAINED marker-write failure is
+  // visible even though each individual missing marker is silent on the read
+  // side. A subsequent successful `pushMessage` on the same conversa_id heals
+  // the window by writing the marker again.
   //
   // OOM on the marker (#309): the DATA write already succeeded above, so the
   // buffer is present and correct — only the observability marker is missing.
