@@ -62,23 +62,41 @@ groups:
     rules:
       # TTL miss = wrote a key whose marker is still alive, yet the buffer read
       # returned empty (eviction, FLUSHDB, crash before EXPIRE landed). A low
-      # background rate can be normal under memory pressure; a spike usually
-      # correlates with Redis eviction (cross-check redis.rules.yml's
-      # RedisEvictionRising / RedisMemoryPressure*).
+      # background rate can be normal under memory pressure; a sustained
+      # elevated rate usually correlates with Redis eviction (cross-check
+      # redis.rules.yml's RedisEvictionRising / RedisMemoryPressure*).
+      #
+      # Per-read counting (#317 B3/B4 vs #304's count-once, re-tuned in #322):
+      # the TTL marker is intentionally NOT consumed on a miss, so a single
+      # evicted-but-still-polled conversation re-counts a miss on EVERY empty
+      # read until the marker expires or is overwritten — per-READ, not
+      # per-EVICTION. That is correct (each empty read is a real Postgres
+      # reconstruct), but it amplifies the counter: one hot key being retried
+      # could alone clear a small fixed `increase[5m] > N` threshold and page on
+      # a non-event. We therefore alert on a SUSTAINED per-second RATE rather
+      # than a raw 5m count, and require it to hold for 10m. `rate(...[5m]) > 1`
+      # ≈ >300 reconstructs / 5m sustained for 10m — a broad eviction wave, not a
+      # single conversation being re-read. Re-tune the `> 1` against real traffic
+      # volume before tightening.
       - alert: WorkingMemoryTtlMissRising
-        expr: increase(working_memory_ttl_miss_total[5m]) > 10
-        for: 5m
+        expr: rate(working_memory_ttl_miss_total[5m]) > 1
+        for: 10m
         labels:
           severity: warning
         annotations:
           summary: "Working-memory TTL misses subindo (key_type={{ $labels.key_type }})"
           description: |
             Chaves com TTL ainda válido retornaram vazias na leitura — entrada
-            sumiu antes da hora (#317 B3/B4). Quase sempre correlaciona com
-            eviction do Redis: cross-check `RedisEvictionRising` e
-            `RedisMemoryPressureWarning/Critical` em redis.rules.yml (#300).
-            Cada miss vira reconstrução via Postgres (custo + latência).
-            Runbook: docs/runbooks/redis.md §3 (sizing) e §4 (alertas).
+            sumiu antes da hora (#317 B3/B4). O contador é por-LEITURA (#322): uma
+            única conversa despejada porém ainda lida re-conta a cada leitura
+            vazia (não por eviction), então alertamos sobre a TAXA sustentada
+            (`rate[5m] > 1`, ~300 reconstruções/5m por 10m) em vez de uma
+            contagem bruta — evita page por uma chave quente sendo re-lida.
+            Quase sempre correlaciona com eviction do Redis: cross-check
+            `RedisEvictionRising` e `RedisMemoryPressureWarning/Critical` em
+            redis.rules.yml (#300). Cada miss vira reconstrução via Postgres
+            (custo + latência). Runbook: docs/runbooks/redis.md §3 (sizing) e §4
+            (alertas).
 
       # A Redis call inside working memory threw. This is recorded SEPARATELY
       # from TTL misses (#317 B1) so a transient Redis failure is never
