@@ -96,6 +96,46 @@ vi.mock('@anthropic-ai/sdk', () => {
   return { default: Anthropic };
 });
 
+// ---------- db/client mock ----------
+// Issue #323 (Phase 3): runGapEscalationMonitor now enumerates DISTINCT
+// (tenant_id, agent_id) tuples with at least one OPEN-level gap
+// (silent/dashboard/mentionable) directly via `db.selectDistinct(...)` on the
+// `agent_capability_gaps` table (work-table fan-out, replacing the old
+// tenantsRepo.list() loop). That call bypasses the repositories mock below and
+// would otherwise hit the real pg pool (ECONNREFUSED in the no-DB unit lane).
+// Mirror the enumeration over the in-memory `gapsState` so the dispatcher
+// yields exactly the seeded open-gap tuples before opening per-tuple context —
+// same idiom as the sibling reaper integration spec (p3c) and the rewritten
+// unit spec (tests/unit/gap-escalation-monitor.spec.ts). The OPEN levels
+// (silent/dashboard/mentionable) are inlined to avoid any hoisting/TDZ
+// coupling with the vi.mock factory.
+vi.mock('@/db/client.js', () => ({
+  db: {
+    selectDistinct: () => ({
+      from: () => ({
+        where: async () => {
+          const openLevels = new Set<string>(['silent', 'dashboard', 'mentionable']);
+          const seen = new Set<string>();
+          const pairs: Array<{ tenant_id: string; agent_id: string }> = [];
+          for (const g of Object.values(gapsState)) {
+            if (!openLevels.has(g.current_level)) continue;
+            const key = `${g.tenant_id}|${g.agent_id}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            pairs.push({ tenant_id: g.tenant_id, agent_id: g.agent_id });
+          }
+          return pairs;
+        },
+      }),
+    }),
+  },
+  pool: {},
+  withTx: vi.fn(),
+  shutdownDb: vi.fn(),
+  isDbConnected: () => true,
+  probeDb: async () => true,
+}));
+
 vi.mock('@/db/repositories.js', () => ({
   tenantsRepo: {
     list: tenantsList,
