@@ -276,7 +276,21 @@ export async function startBaileys(): Promise<void> {
   // retries and for the legacy MULTI_CHANNEL=OFF code path.
   socket.ev.on('messages.upsert', async ({ messages }) => {
     for (const msg of messages) {
-      if (!msg.message) continue;
+      // [Codex review #311 — B3] Reaction stubs arrive with
+      // `msg.message === undefined` (the payload is a `messageStubType`, not a
+      // content envelope). The previous `if (!msg.message) continue` ran BEFORE
+      // `handleIncoming`, so the `isReactionStub` branch inside it was DEAD
+      // CODE — reactions never reached the one-tap dispatcher. We must let
+      // reaction stubs through, but they still need a tenant context:
+      // `dispatchReactionAsAnswer` calls tenant-scoped repos
+      // (`mensagensRepo.findByWhatsappId`, `pessoasRepo`, …) that throw without
+      // an ALS. Both reaction stubs AND content messages carry `msg.key`
+      // (remoteJid), which is all the JID→tenant resolver needs — so we resolve
+      // FIRST, then route inside `runWithTenantContext`. Any other envelope
+      // that has neither content nor a reaction stub (pure receipts) is skipped
+      // to avoid a pointless resolver round-trip.
+      const reactionStub = isReactionStub(msg);
+      if (!msg.message && !reactionStub) continue;
       try {
         const ctx = await resolveTenantCtxForUpsert(msg);
         if (!ctx) continue; // resolution failed → audit emitted + drop
@@ -415,6 +429,17 @@ async function resolveTenantCtxForUpsert(
   channel_id: string | null;
 } | null> {
   // Legacy single-tenant path — keep `default/default` exactly as P0..P5.
+  //
+  // [Codex review #311 — B1] MULTI_CHANNEL defaults to OFF, so this branch is
+  // the default deploy path. That is SAFE for a genuine single-tenant
+  // deployment: only one tenant (`default/default`) ever exists, so there is
+  // no other tenant for a row to leak to, and the worker's adoption step is
+  // skipped entirely (agent/core.ts only adopts when the resolved tenant is
+  // NOT default/default). Multi-tenant deployments MUST set MULTI_CHANNEL=ON
+  // so the JID→tenant resolver runs and every inbound is scoped to its real
+  // owner; the cross-tenant adoption that path enables is now a guarded
+  // compare-and-swap (see `mensagensRepo.adoptToResolvedTenantCrossTenant`),
+  // so isolation holds regardless of which path persisted the row.
   if (!featureFlags.isEnabled(FeatureFlagName.MULTI_CHANNEL)) {
     return {
       scope: {
@@ -425,7 +450,11 @@ async function resolveTenantCtxForUpsert(
     };
   }
 
-  const jid = msg.key.remoteJid ?? null;
+  // [Codex review #311 — minor] `msg.key` can be absent on malformed
+  // envelopes; optional-chain so a missing key resolves to a null JID
+  // (→ fail-closed in resolveScopeForJid) instead of a raw TypeError that
+  // would escape to the listener's catch as an opaque `baileys.handle_failed`.
+  const jid = msg.key?.remoteJid ?? null;
   // Mirror `handleIncoming`'s LID fallback: pull the real phone from
   // senderPn/participantPn when the visible JID is `@lid`.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
