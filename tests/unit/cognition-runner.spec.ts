@@ -63,6 +63,85 @@ describe('runCognitiveModule', () => {
     });
   });
 
+  // -------------------------------------------------------------------------
+  // PR #269 review — fail-closed audit when tenant context is missing or
+  // malformed. The primary module must still complete; only the audit row is
+  // skipped (the alternative — writing under ('default','default') — silenced
+  // caller bugs and polluted the audit table with a cross-tenant bucket).
+  // -------------------------------------------------------------------------
+  describe('PR #269 — fail-closed audit on missing tenant context', () => {
+    it('primary module still returns success when called OUTSIDE runWithTenantContext', async () => {
+      // No runWithTenantContext wrapper → audit must be skipped, but the
+      // primary module result must propagate normally.
+      const result = await runCognitiveModule(
+        { name: 'test.no-context', triggered_by: 'sync_required' },
+        async () => 'primary-ok',
+      );
+      expect(result.output).toBe('primary-ok');
+      expect(result.status).toBe('success');
+      expect(result.fallback_triggered).toBe(false);
+    });
+
+    it('audit log is NOT written when called OUTSIDE runWithTenantContext', async () => {
+      const repo = await import('@/db/repositories.js');
+      vi.mocked(repo.cognitiveModuleLogRepo.record).mockClear();
+      await runCognitiveModule(
+        { name: 'test.no-context.skip-audit', triggered_by: 'sync_required' },
+        async () => 'x',
+      );
+      // Regression: before #269 this branch wrote a row with
+      // tenant_id='default', agent_id='default'. Now it must skip entirely.
+      expect(repo.cognitiveModuleLogRepo.record).not.toHaveBeenCalled();
+    });
+
+    it('audit log is NOT written when ctx.tenant_id is empty string', async () => {
+      const repo = await import('@/db/repositories.js');
+      vi.mocked(repo.cognitiveModuleLogRepo.record).mockClear();
+      await runWithTenantContext({ tenant_id: '', agent_id: 'sofia' }, async () => {
+        await runCognitiveModule(
+          { name: 'test.empty-tenant', triggered_by: 'sync_required' },
+          async () => 'x',
+        );
+      });
+      // tryGetCurrentContext now returns null for malformed ctx, so audit is
+      // skipped — no row with the empty-string tenant should land.
+      expect(repo.cognitiveModuleLogRepo.record).not.toHaveBeenCalled();
+    });
+
+    it('audit log is NOT written when ctx.agent_id is null', async () => {
+      const repo = await import('@/db/repositories.js');
+      vi.mocked(repo.cognitiveModuleLogRepo.record).mockClear();
+      await runWithTenantContext(
+        { tenant_id: 'acme', agent_id: null as unknown as string },
+        async () => {
+          await runCognitiveModule(
+            { name: 'test.null-agent', triggered_by: 'sync_required' },
+            async () => 'x',
+          );
+        },
+      );
+      expect(repo.cognitiveModuleLogRepo.record).not.toHaveBeenCalled();
+    });
+
+    it('audit log IS written with real tenant_id / agent_id when context is valid', async () => {
+      const repo = await import('@/db/repositories.js');
+      vi.mocked(repo.cognitiveModuleLogRepo.record).mockClear();
+      await runWithTenantContext({ tenant_id: 'tenantX', agent_id: 'agentX' }, async () => {
+        await runCognitiveModule(
+          { name: 'test.valid-context', triggered_by: 'sync_required' },
+          async () => 'x',
+        );
+      });
+      expect(repo.cognitiveModuleLogRepo.record).toHaveBeenCalledTimes(1);
+      const call = vi.mocked(repo.cognitiveModuleLogRepo.record).mock.calls[0]![0];
+      expect(call.tenant_id).toBe('tenantX');
+      expect(call.agent_id).toBe('agentX');
+      // Regression guard: no fallback strings leak into the audit row.
+      expect(call.tenant_id).not.toBe('default');
+      expect(call.agent_id).not.toBe('default');
+    });
+  });
+
   // Issue #224 — regression: the Promise.race timeout handle must be cleared
   // on every exit path. Otherwise pending setTimeout handles accumulate in
   // the event loop, retain closures, and surface as "open handles" warnings

@@ -125,7 +125,8 @@ describe('knowledge-slice-builder', () => {
       trace_id: 'trace-1',
     });
 
-    expect(result.cache_key).toMatch(/^knowledge_slice:v1:/);
+    // Issue #235: version bumped v1 → v2; key now includes agent_id in the prefix.
+    expect(result.cache_key).toMatch(/^knowledge_slice:v2:tenant-1:agent-test:/);
     expect(typeof result.latency_ms).toBe('number');
   });
 

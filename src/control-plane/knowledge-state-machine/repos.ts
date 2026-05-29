@@ -310,10 +310,27 @@ export const knowledgeRepos = {
   ): Promise<KnowledgeRow | null> {
     switch (kind) {
       case 'fact': {
+        // Issue #254 — cross-tenant guard. `agent_facts` reads via the
+        // KSM facade must be tenant/agent-scoped so a UUID from tenant-B
+        // cannot be fetched (and subsequently mutated) under tenant-A's
+        // context. Mirrors the `kind: 'rule'` guard added in PR #243
+        // (issue #234). ALS contract: callers MUST establish tenant
+        // context via `runWithTenantContext` before invoking the KSM.
+        // The auto-promoter (workers/knowledge-state-promoter.ts) wraps
+        // each per-row transition() call using the row's persisted
+        // tenant_id+agent_id (extended for all 4 kinds by PR #243).
+        const tenant_id = getCurrentTenant();
+        const agent_id = getCurrentAgent();
         const rows = await db
           .select()
           .from(agent_facts)
-          .where(eq(agent_facts.id, id))
+          .where(
+            and(
+              eq(agent_facts.id, id),
+              eq(agent_facts.tenant_id, tenant_id),
+              eq(agent_facts.agent_id, agent_id),
+            ),
+          )
           .limit(1);
         const row = rows[0];
         return row ? normaliseRow(row as unknown as AnyRow) : null;
@@ -345,20 +362,57 @@ export const knowledgeRepos = {
         return row ? normaliseRow(row as unknown as AnyRow) : null;
       }
       case 'memory': {
+        // Issue #254 — cross-tenant guard. Same pattern as fact/rule.
+        // Memory rows are episodic/declarative memories and must never
+        // leak across tenants via the KSM facade.
+        const tenant_id = getCurrentTenant();
+        const agent_id = getCurrentAgent();
         const rows = await db
           .select()
           .from(memory_entry)
-          .where(eq(memory_entry.id, id))
+          .where(
+            and(
+              eq(memory_entry.id, id),
+              eq(memory_entry.tenant_id, tenant_id),
+              eq(memory_entry.agent_id, agent_id),
+            ),
+          )
           .limit(1);
         const row = rows[0];
         return row ? normaliseRow(row as unknown as AnyRow) : null;
       }
       case 'behavioral_hint':
       case 'procedure_hint': {
+        // Issue #254 — cross-tenant guard. Behavioral hints and
+        // procedure hints share the `behavioral_hint` table; same
+        // pattern as fact/memory/rule applies.
+        //
+        // Architectural note (Codex #267 review, concern 2 — LOW):
+        // The `behavioral_hint` table has no DB-level `kind`
+        // discriminator column. `behavioral_hint` and `procedure_hint`
+        // intentionally share storage — they only differ in callsite
+        // semantics (tone/style vs procedural step). Under
+        // `runWithTenantContext(tenant_id, agent_id)`, an id is unique
+        // within (tenant_id, agent_id) per the table's PK + index,
+        // so a single id cannot resolve to a different row for the
+        // two kinds. UUID v4 collision across kinds within the same
+        // (tenant, agent) scope has probability ≈ 0 (no IDs are
+        // user-supplied; the schema's `defaultRandom()` generates
+        // crypto-random uuids). A `kind`/`hint_kind` column is
+        // deferred to a future PR if telemetry shows callsite
+        // discrimination is needed.
+        const tenant_id = getCurrentTenant();
+        const agent_id = getCurrentAgent();
         const rows = await db
           .select()
           .from(behavioral_hint)
-          .where(eq(behavioral_hint.id, id))
+          .where(
+            and(
+              eq(behavioral_hint.id, id),
+              eq(behavioral_hint.tenant_id, tenant_id),
+              eq(behavioral_hint.agent_id, agent_id),
+            ),
+          )
           .limit(1);
         const row = rows[0];
         return row ? normaliseRow(row as unknown as AnyRow) : null;
@@ -405,16 +459,79 @@ export const knowledgeRepos = {
 
     switch (kind) {
       case 'fact': {
+        // Issue #254 — cross-tenant guard. Pin tenant_id+agent_id into
+        // the UPDATE WHERE so a foreign-tenant fact id cannot be mutated
+        // through the KSM facade. Mirrors the `kind: 'rule'` pattern
+        // added in PR #243 (issue #234).
+        // Failure-mode disambiguation:
+        //   1. 0 rows AND no `expected` → tenant_id/agent_id/id mismatch
+        //      → throw `TypedError('fact_not_in_scope', ...)`
+        //      (greppable in telemetry, never silent on cross-tenant
+        //      mutation attempts).
+        //   2. 0 rows AND `expected` set → either out-of-scope OR
+        //      optimistic-concurrency mismatch. Re-read scoped by
+        //      tenant/agent disambiguates: NULL probe → out-of-scope
+        //      (`fact_not_in_scope`); non-NULL probe with diverged
+        //      lifecycle_status → real concurrency conflict
+        //      (`KnowledgeConflictError`, preserves state-machine catch).
+        const tenant_id = getCurrentTenant();
+        const agent_id = getCurrentAgent();
         const where = expected
-          ? and(eq(agent_facts.id, id), eq(agent_facts.lifecycle_status, expected))
-          : eq(agent_facts.id, id);
+          ? and(
+              eq(agent_facts.id, id),
+              eq(agent_facts.tenant_id, tenant_id),
+              eq(agent_facts.agent_id, agent_id),
+              eq(agent_facts.lifecycle_status, expected),
+            )
+          : and(
+              eq(agent_facts.id, id),
+              eq(agent_facts.tenant_id, tenant_id),
+              eq(agent_facts.agent_id, agent_id),
+            );
         const rows = await db
           .update(agent_facts)
           .set(set)
           .where(where)
           .returning({ id: agent_facts.id });
-        if (expected && rows.length === 0) {
-          throw new KnowledgeConflictError(kind, id, expected);
+        if (rows.length === 0) {
+          if (expected) {
+            // Disambiguate scope-miss vs concurrency-miss by re-reading
+            // under the SAME tenant/agent scope. Disambiguation matters
+            // because the auto-promoter treats IllegalTransitionError
+            // (state-machine's surfaced form of KnowledgeConflictError)
+            // as benign for parallel-promote races, but cross-tenant
+            // attempts MUST surface as `fact_not_in_scope` for
+            // telemetry/alerting.
+            const probe = await db
+              .select({
+                id: agent_facts.id,
+                lifecycle_status: agent_facts.lifecycle_status,
+              })
+              .from(agent_facts)
+              .where(
+                and(
+                  eq(agent_facts.id, id),
+                  eq(agent_facts.tenant_id, tenant_id),
+                  eq(agent_facts.agent_id, agent_id),
+                ),
+              )
+              .limit(1);
+            if (probe.length === 0) {
+              throw new TypedError(
+                'fact_not_in_scope',
+                `fact ${id} not found in current tenant/agent scope`,
+              );
+            }
+            // In-scope row exists but lifecycle_status diverged → real
+            // optimistic-concurrency conflict.
+            throw new KnowledgeConflictError(kind, id, expected);
+          }
+          // No `expected` and no rows matched → unambiguously out-of-scope
+          // (foreign tenant, foreign agent, or unknown id). Loud failure.
+          throw new TypedError(
+            'fact_not_in_scope',
+            `fact ${id} not found in current tenant/agent scope`,
+          );
         }
         return;
       }
@@ -498,37 +615,122 @@ export const knowledgeRepos = {
         return;
       }
       case 'memory': {
+        // Issue #254 — cross-tenant guard. Same disambiguation pattern
+        // as fact/rule. See `case 'fact'` above for rationale.
+        const tenant_id = getCurrentTenant();
+        const agent_id = getCurrentAgent();
         const where = expected
           ? and(
               eq(memory_entry.id, id),
+              eq(memory_entry.tenant_id, tenant_id),
+              eq(memory_entry.agent_id, agent_id),
               eq(memory_entry.lifecycle_status, expected),
             )
-          : eq(memory_entry.id, id);
+          : and(
+              eq(memory_entry.id, id),
+              eq(memory_entry.tenant_id, tenant_id),
+              eq(memory_entry.agent_id, agent_id),
+            );
         const rows = await db
           .update(memory_entry)
           .set(set)
           .where(where)
           .returning({ id: memory_entry.id });
-        if (expected && rows.length === 0) {
-          throw new KnowledgeConflictError(kind, id, expected);
+        if (rows.length === 0) {
+          if (expected) {
+            const probe = await db
+              .select({
+                id: memory_entry.id,
+                lifecycle_status: memory_entry.lifecycle_status,
+              })
+              .from(memory_entry)
+              .where(
+                and(
+                  eq(memory_entry.id, id),
+                  eq(memory_entry.tenant_id, tenant_id),
+                  eq(memory_entry.agent_id, agent_id),
+                ),
+              )
+              .limit(1);
+            if (probe.length === 0) {
+              throw new TypedError(
+                'memory_not_in_scope',
+                `memory ${id} not found in current tenant/agent scope`,
+              );
+            }
+            throw new KnowledgeConflictError(kind, id, expected);
+          }
+          throw new TypedError(
+            'memory_not_in_scope',
+            `memory ${id} not found in current tenant/agent scope`,
+          );
         }
         return;
       }
       case 'behavioral_hint':
       case 'procedure_hint': {
+        // Issue #254 — cross-tenant guard. `behavioral_hint` table is
+        // shared by both `behavioral_hint` and `procedure_hint` kinds.
+        // The TypedError code is derived from the kind so callers can
+        // grep by `behavioral_hint_not_in_scope` or
+        // `procedure_hint_not_in_scope` independently in telemetry.
+        //
+        // Architectural note (Codex #267 review, concern 2 — LOW):
+        // see the matching note on `findById` above — no DB-level
+        // `kind` discriminator on the shared table is acceptable
+        // because (tenant_id, agent_id, id) is unique and UUID v4
+        // collision across kinds is ≈ 0. The kind is preserved on
+        // the error code for telemetry. Future PR may add a `kind`
+        // column if callsite discrimination becomes a hard
+        // requirement (e.g. for differential analytics).
+        const tenant_id = getCurrentTenant();
+        const agent_id = getCurrentAgent();
+        const scopeErrorCode = `${kind}_not_in_scope`;
         const where = expected
           ? and(
               eq(behavioral_hint.id, id),
+              eq(behavioral_hint.tenant_id, tenant_id),
+              eq(behavioral_hint.agent_id, agent_id),
               eq(behavioral_hint.lifecycle_status, expected),
             )
-          : eq(behavioral_hint.id, id);
+          : and(
+              eq(behavioral_hint.id, id),
+              eq(behavioral_hint.tenant_id, tenant_id),
+              eq(behavioral_hint.agent_id, agent_id),
+            );
         const rows = await db
           .update(behavioral_hint)
           .set(set)
           .where(where)
           .returning({ id: behavioral_hint.id });
-        if (expected && rows.length === 0) {
-          throw new KnowledgeConflictError(kind, id, expected);
+        if (rows.length === 0) {
+          if (expected) {
+            const probe = await db
+              .select({
+                id: behavioral_hint.id,
+                lifecycle_status: behavioral_hint.lifecycle_status,
+              })
+              .from(behavioral_hint)
+              .where(
+                and(
+                  eq(behavioral_hint.id, id),
+                  eq(behavioral_hint.tenant_id, tenant_id),
+                  eq(behavioral_hint.agent_id, agent_id),
+                ),
+              )
+              .limit(1);
+            if (probe.length === 0) {
+              throw new TypedError(
+                scopeErrorCode,
+                `${kind} ${id} not found in current tenant/agent scope`,
+              );
+            }
+            throw new KnowledgeConflictError(kind, id, expected);
+          }
+          throw new TypedError(
+            scopeErrorCode,
+            `${kind} ${id} not found in current tenant/agent scope`,
+          );
         }
         return;
       }

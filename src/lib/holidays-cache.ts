@@ -1,14 +1,33 @@
 /**
  * LRU cache tenant-aware para conjuntos de feriados aplicáveis.
  *
- * Cache key inclui tenant_id (invariant: P0 — sem cross-tenant leak), entidade
- * (NULL = global/só nacionais), ano e kind (standard | clt).
+ * Cache key inclui tenant_id + agent_id (invariant: P0 — sem cross-tenant nem
+ * cross-agent leak), entidade (NULL = global/só nacionais), ano e kind
+ * (standard | clt).
+ *
+ * Layout: `holidays:v3:{enc(tenant_id)}:{enc(agent_id)}:{enc(entidade)}:{year}:{kind}`
+ *
+ * Padrão arquitetural #235 / PR #242: TODA cache key tenant-scoped também
+ * inclui agent_id por consistência.
+ *
+ * **Encoding seguro de segmentos (#272 reval — Codex convergente):** cada
+ * segmento de ID livre-forma (`tenant_id`, `agent_id`, `entidadeId`) passa
+ * por `encodeURIComponent` para que o delimitador `:` nunca apareça cru
+ * dentro de um segmento. Sem isso, `tenant="T", agent="A:B", entity="E"`
+ * colide com `tenant="T", agent="A", entity="B:E"` — vazamento cross-agent
+ * que defeats o invariant de isolamento. Mesmo padrão usado em
+ * `src/tools/_vision-cache.ts` (#257) e `src/lib/embedding-cache.ts` (#258).
+ *
+ * **Bump v2 → v3:** invalida caches pré-existentes (intencional — entradas
+ * v2 não-encodadas ficam inalcançáveis, próximo miss reconstrói com a chave
+ * encodada). Idempotent com TTL de 24h.
  *
  * Invalidação: broad por tenant (MVP). Spec §4.5 lista regras finer-grained
  * mas a broad invalidation é correta + simples + tenant-scoped (não vaza).
- * Otimização específica entra quando cache miss rate medido >5%.
+ * Wildcard no agent_id mantém invalidação tenant-wide (limpa todos os agents
+ * do tenant). Otimização específica entra quando cache miss rate medido >5%.
  */
-import { getCurrentTenant } from '../db/tenant-context.js';
+import { getCurrentAgent, getCurrentTenant } from '../db/tenant-context.js';
 
 export type BusinessDayKind = 'standard' | 'clt';
 export type CacheKey = string;
@@ -16,6 +35,7 @@ export type CachedSet = Set<string>;
 
 const TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_ENTRIES = 2048;
+const KEY_PREFIX = 'holidays:v3';
 
 interface Entry {
   value: CachedSet;
@@ -31,14 +51,39 @@ export const _internal_cache = {
   size: () => _cache.size,
 };
 
-export function cacheKey(
+/**
+ * Build the (tenant, agent, entidade)-scoped cache key. Each free-form
+ * segment (tenant_id, agent_id, entidadeId) is URI-encoded so the `:`
+ * delimiter is unambiguous: a tenant slug like `acme:dev` becomes
+ * `acme%3Adev`, which can never collide with a tuple where the tenant is
+ * `acme` and another segment starts with `dev:`. `year` and `kind` are
+ * controlled values (number / enum) and don't need encoding.
+ *
+ * Mirrors `buildKey()` from `src/tools/_vision-cache.ts` (#257) and
+ * `src/lib/embedding-cache.ts` (#258) — canonical cache key contract.
+ */
+function buildKey(
   tenant_id: string,
+  agent_id: string,
   entidadeId: string | undefined,
   year: number,
   kind: BusinessDayKind,
 ): CacheKey {
-  return `${tenant_id}:${entidadeId ?? 'global'}:${year}:${kind}`;
+  return (
+    `${KEY_PREFIX}:` +
+    `${encodeURIComponent(tenant_id)}:` +
+    `${encodeURIComponent(agent_id)}:` +
+    `${encodeURIComponent(entidadeId ?? 'global')}:` +
+    `${year}:` +
+    `${kind}`
+  );
 }
+
+// Public alias for buildKey() preserved as `cacheKey` for backwards-compat
+// with existing tests and any downstream caller importing it. The function
+// itself is the same — `buildKey` is the canonical internal name (mirrors
+// #257/#258), `cacheKey` is the named export contract.
+export const cacheKey = buildKey;
 
 function lruGet(k: CacheKey): CachedSet | undefined {
   const entry = _cache.get(k);
@@ -67,7 +112,8 @@ export async function getApplicableHolidaysSet(
   loader: (tenant_id: string) => Promise<CachedSet>,
 ): Promise<CachedSet> {
   const tenant_id = getCurrentTenant();
-  const key = cacheKey(tenant_id, options.entidadeId, year, options.kind ?? 'standard');
+  const agent_id = getCurrentAgent();
+  const key = buildKey(tenant_id, agent_id, options.entidadeId, year, options.kind ?? 'standard');
   const hit = lruGet(key);
   if (hit) return hit;
   const fresh = await loader(tenant_id);
@@ -88,7 +134,14 @@ export function invalidateCacheForHolidayChange(
   _meta: { changeKind: 'create' | 'update' | 'delete' | 'status_change' },
 ): void {
   // Broad invalidation por tenant (MVP). Tenant-scoped — nunca vaza.
-  const prefix = `${ref.tenant_id}:`;
+  // Wildcard no agent_id: limpa TODOS os agents do tenant — porque holidays
+  // tenant-wide mudam dados de qualquer agent_id no mesmo tenant.
+  //
+  // **Prefix encoding (#272 reval):** o tenant_id no prefix passa pelo mesmo
+  // `encodeURIComponent` usado em `buildKey()`. Sem isso, `tenant="acme"`
+  // limparia também `tenant="acme:dev"` (cross-tenant invalidation) e
+  // vice-versa um `tenant="acme%3Adev"` literal mal-encodado escaparia.
+  const prefix = `${KEY_PREFIX}:${encodeURIComponent(ref.tenant_id)}:`;
   for (const k of Array.from(_cache.keys())) {
     if (k.startsWith(prefix)) _cache.delete(k);
   }

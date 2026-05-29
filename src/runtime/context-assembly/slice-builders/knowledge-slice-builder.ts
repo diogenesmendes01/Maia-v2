@@ -116,7 +116,9 @@ export class KnowledgeSliceBuilder
       // Include scope set so a cache miss for entity A never serves entity B.
       authorized_entity_ids: sortedEntityIds,
     });
-    return sliceCacheKey(base.tenant_id, 'knowledge', scope);
+    // Issue #235: agent_id is now in the sliceCacheKey prefix; two agents on
+    // the same tenant can no longer collide on a cached knowledge slice.
+    return sliceCacheKey(base.tenant_id, base.agent_id, 'knowledge', scope);
   }
 
   async build(

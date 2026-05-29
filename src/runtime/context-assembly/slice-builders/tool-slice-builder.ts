@@ -54,7 +54,9 @@ export class ToolPermissionSliceBuilder
   cacheKey(base: BaseContextPacket, _req: ToolRequirements): string {
     // Cache is keyed by the set of allowed/blocked from the decision —
     // computed at build-time. See cacheScope inside build().
-    return sliceCacheKey(base.tenant_id, 'tool', 'placeholder');
+    // Issue #235: agent_id flows in via sliceCacheKey's prefix so two
+    // agents in the same tenant with different tool grants never collide.
+    return sliceCacheKey(base.tenant_id, base.agent_id, 'tool', 'placeholder');
   }
 
   async build(
@@ -73,7 +75,7 @@ export class ToolPermissionSliceBuilder
       blocked,
       requires_confirmation,
     });
-    const key = sliceCacheKey(input.base.tenant_id, 'tool', cacheScope);
+    const key = sliceCacheKey(input.base.tenant_id, input.base.agent_id, 'tool', cacheScope);
 
     const cached = await this.cache.get<ToolPermissionSlice>(key);
     if (cached) {
