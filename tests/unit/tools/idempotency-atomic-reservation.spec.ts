@@ -40,18 +40,32 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 const { recorder } = vi.hoisted(() => ({
   recorder: {
     tryReserveCalls: [] as Array<unknown>,
-    tryReserveResult: { was_inserted: true, state: 'in_progress', resultado: undefined } as {
+    tryReserveResult: {
+      was_inserted: true,
+      state: 'in_progress',
+      resultado: undefined,
+      reservation_token: 'token-1',
+    } as {
       was_inserted: boolean;
-      state: 'in_progress' | 'completed';
+      state: 'in_progress' | 'completed' | 'failed';
       resultado: unknown;
+      reservation_token: string | undefined;
     },
     waitForCompletionCalls: [] as Array<unknown>,
     waitForCompletionResult: { status: 'completed', resultado: { ok: true } } as
       | { status: 'completed'; resultado: unknown }
       | { status: 'timeout' }
-      | { status: 'released' },
-    markCompletedCalls: [] as Array<{ key: string; resultado: unknown }>,
-    releaseReservationCalls: [] as Array<string>,
+      | { status: 'released' }
+      | { status: 'failed' },
+    // markCompleted now returns whether the row was actually transitioned
+    // (false ⇒ fenced out / preempted — issue #298 B2). Default true.
+    markCompletedResult: true,
+    markCompletedCalls: [] as Array<{
+      key: string;
+      resultado: unknown;
+      reservation_token: string;
+    }>,
+    releaseReservationCalls: [] as Array<{ key: string; reservation_token: string }>,
     handlerCalls: 0,
     handlerImpl: (async () => ({ ok: true })) as (
       args: unknown,
@@ -70,12 +84,18 @@ vi.mock('@/db/repositories.js', () => ({
       recorder.waitForCompletionCalls.push({ key, timeout });
       return recorder.waitForCompletionResult;
     }),
-    markCompleted: vi.fn(async (input: { key: string; resultado: unknown }) => {
-      recorder.markCompletedCalls.push(input);
-    }),
-    releaseReservation: vi.fn(async (key: string) => {
-      recorder.releaseReservationCalls.push(key);
-    }),
+    markCompleted: vi.fn(
+      async (input: { key: string; resultado: unknown; reservation_token: string }) => {
+        recorder.markCompletedCalls.push(input);
+        return recorder.markCompletedResult;
+      },
+    ),
+    releaseReservation: vi.fn(
+      async (input: { key: string; reservation_token: string }) => {
+        recorder.releaseReservationCalls.push(input);
+        return true;
+      },
+    ),
     // Legacy paths kept for backward compat; dispatcher should NOT touch
     // them in the post-#298 flow.
     lookup: vi.fn(async () => null),
@@ -171,10 +191,12 @@ beforeEach(() => {
   recorder.markCompletedCalls = [];
   recorder.releaseReservationCalls = [];
   recorder.handlerCalls = 0;
+  recorder.markCompletedResult = true;
   recorder.tryReserveResult = {
     was_inserted: true,
     state: 'in_progress',
     resultado: undefined,
+    reservation_token: 'token-1',
   };
   recorder.waitForCompletionResult = {
     status: 'completed',
@@ -195,6 +217,7 @@ describe('dispatcher — winner path: tryReserve → handler → markCompleted',
       was_inserted: true,
       state: 'in_progress',
       resultado: undefined,
+      reservation_token: 'token-1',
     };
     const result = await dispatchTool({
       tool: 'fake_tool',
@@ -206,6 +229,7 @@ describe('dispatcher — winner path: tryReserve → handler → markCompleted',
     expect(recorder.markCompletedCalls[0]).toEqual({
       key: 'computed-key-1',
       resultado: { ok: true, from: 'handler' },
+      reservation_token: 'token-1',
     });
     expect(result).toEqual({ ok: true, from: 'handler' });
   });
@@ -224,6 +248,7 @@ describe('dispatcher — cache-hit path: tryReserve returns completed', () => {
       was_inserted: false,
       state: 'completed',
       resultado: { cached: 'from_a_prior_dispatch' },
+      reservation_token: undefined,
     };
     const result = await dispatchTool({
       tool: 'fake_tool',
@@ -245,6 +270,7 @@ describe('dispatcher — wait path: tryReserve says someone else owns it', () =>
       was_inserted: false,
       state: 'in_progress',
       resultado: undefined,
+      reservation_token: undefined,
     };
     recorder.waitForCompletionResult = {
       status: 'completed',
@@ -265,6 +291,7 @@ describe('dispatcher — wait path: tryReserve says someone else owns it', () =>
       was_inserted: false,
       state: 'in_progress',
       resultado: undefined,
+      reservation_token: undefined,
     };
     recorder.waitForCompletionResult = { status: 'timeout' };
     const result = (await dispatchTool({
@@ -277,13 +304,14 @@ describe('dispatcher — wait path: tryReserve says someone else owns it', () =>
   });
 
   it('returns idempotency_owner_failed when owner released its reservation', async () => {
-    // Owner's handler threw → released the row. The waiter sees
+    // Owner's handler threw → row vanished (cleanup reap). The waiter sees
     // status='released' and must surface a typed error rather than
     // re-execute (a higher-level retry policy will re-dispatch).
     recorder.tryReserveResult = {
       was_inserted: false,
       state: 'in_progress',
       resultado: undefined,
+      reservation_token: undefined,
     };
     recorder.waitForCompletionResult = { status: 'released' };
     const result = (await dispatchTool({
@@ -294,14 +322,57 @@ describe('dispatcher — wait path: tryReserve says someone else owns it', () =>
     expect(recorder.handlerCalls).toBe(0);
     expect(result.error).toBe('idempotency_owner_failed');
   });
+
+  it('returns idempotency_owner_failed when owner marked the reservation failed (B3)', async () => {
+    // Issue #298 B3: releaseReservation now transitions the row to a
+    // terminal 'failed' state instead of deleting it. The waiter observes
+    // status='failed' and MUST surface a typed error (never re-execute).
+    recorder.tryReserveResult = {
+      was_inserted: false,
+      state: 'in_progress',
+      resultado: undefined,
+      reservation_token: undefined,
+    };
+    recorder.waitForCompletionResult = { status: 'failed' };
+    const result = (await dispatchTool({
+      tool: 'fake_tool',
+      args: {},
+      ctx: fakeCtx,
+    })) as { error?: string };
+    expect(recorder.handlerCalls).toBe(0);
+    expect(result.error).toBe('idempotency_owner_failed');
+  });
 });
 
-describe('dispatcher — handler-throws path: release reservation', () => {
-  it('releases reservation when handler throws (next caller can retry)', async () => {
+describe('dispatcher — prior-failed path: tryReserve returns failed (B3)', () => {
+  it('surfaces idempotency_prior_failed and never executes the handler', async () => {
+    // A prior attempt for this exact key terminally FAILED. The next
+    // dispatch must NOT silently re-run the (possibly partially-applied)
+    // handler — it surfaces a typed error so any retry is explicit.
+    recorder.tryReserveResult = {
+      was_inserted: false,
+      state: 'failed',
+      resultado: undefined,
+      reservation_token: undefined,
+    };
+    const result = (await dispatchTool({
+      tool: 'fake_tool',
+      args: {},
+      ctx: fakeCtx,
+    })) as { error?: string };
+    expect(recorder.handlerCalls).toBe(0);
+    expect(recorder.markCompletedCalls).toHaveLength(0);
+    expect(result.error).toBe('idempotency_prior_failed');
+  });
+});
+
+describe('dispatcher — handler-throws path: release reservation (→ failed)', () => {
+  it('marks reservation failed (with token) when handler throws', async () => {
     recorder.tryReserveResult = {
       was_inserted: true,
       state: 'in_progress',
       resultado: undefined,
+      reservation_token: 'token-1',
     };
     recorder.handlerImpl = async () => {
       throw new Error('simulated handler failure');
@@ -312,16 +383,20 @@ describe('dispatcher — handler-throws path: release reservation', () => {
       ctx: fakeCtx,
     })) as { error?: string };
     expect(recorder.handlerCalls).toBe(1);
-    expect(recorder.releaseReservationCalls).toEqual(['computed-key-1']);
+    // B2 + B3: release is now token-fenced and transitions to 'failed'.
+    expect(recorder.releaseReservationCalls).toEqual([
+      { key: 'computed-key-1', reservation_token: 'token-1' },
+    ]);
     expect(recorder.markCompletedCalls).toHaveLength(0);
     expect(result.error).toBe('execution_failed');
   });
 
-  it('releases reservation on output schema violation', async () => {
+  it('marks reservation failed (with token) on output schema violation', async () => {
     recorder.tryReserveResult = {
       was_inserted: true,
       state: 'in_progress',
       resultado: undefined,
+      reservation_token: 'token-1',
     };
     // Force the output schema to reject.
     registryMockState.outputSafeParse = () => ({
@@ -333,9 +408,37 @@ describe('dispatcher — handler-throws path: release reservation', () => {
       args: {},
       ctx: fakeCtx,
     })) as { error?: string; details?: { cause?: string } };
-    expect(recorder.releaseReservationCalls).toEqual(['computed-key-1']);
+    expect(recorder.releaseReservationCalls).toEqual([
+      { key: 'computed-key-1', reservation_token: 'token-1' },
+    ]);
     expect(result.error).toBe('execution_failed');
     expect(result.details?.cause).toBe('output_schema_violation');
+  });
+});
+
+describe('dispatcher — fencing: markCompleted preempted (B2)', () => {
+  it('surfaces idempotency_completion_fenced when markCompleted returns false', async () => {
+    // The owner's lease expired and another worker reclaimed the
+    // reservation mid-handler. markCompleted is fenced (token mismatch →
+    // 0 rows → false). The dispatcher must NOT return a result that won't
+    // match the new owner's cached entry; it surfaces a retry-friendly
+    // error instead.
+    recorder.tryReserveResult = {
+      was_inserted: true,
+      state: 'in_progress',
+      resultado: undefined,
+      reservation_token: 'stale-token',
+    };
+    recorder.markCompletedResult = false;
+    const result = (await dispatchTool({
+      tool: 'fake_tool',
+      args: {},
+      ctx: fakeCtx,
+    })) as { error?: string };
+    expect(recorder.handlerCalls).toBe(1);
+    expect(recorder.markCompletedCalls).toHaveLength(1);
+    expect(recorder.markCompletedCalls[0]!.reservation_token).toBe('stale-token');
+    expect(result.error).toBe('idempotency_completion_fenced');
   });
 });
 

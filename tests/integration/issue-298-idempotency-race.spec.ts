@@ -186,10 +186,14 @@ d('idempotencyRepo.tryReserve — race-safe under real Postgres ON CONFLICT', ()
       async () => {
         const first = await idempotencyRepo.tryReserve(baseInput);
         expect(first.was_inserted).toBe(true);
-        await idempotencyRepo.markCompleted({
+        // B2: the winner must echo its fencing token to markCompleted.
+        const token = first.was_inserted ? first.reservation_token : '';
+        const ok = await idempotencyRepo.markCompleted({
           key,
           resultado: { transacao_id: 'tx-1', saldo_apos: 1500 },
+          reservation_token: token,
         });
+        expect(ok).toBe(true);
 
         const second = await idempotencyRepo.tryReserve(baseInput);
         expect(second.was_inserted).toBe(false);
@@ -322,14 +326,22 @@ d('idempotencyRepo.tryReserve — race-safe under real Postgres ON CONFLICT', ()
     await runWithTenantContext(
       { tenant_id: TENANT_A, agent_id: AGENT },
       async () => {
-        await idempotencyRepo.tryReserve(baseInput);
-        await idempotencyRepo.markCompleted({ key, resultado: { val: 'first' } });
+        const reserved = await idempotencyRepo.tryReserve(baseInput);
+        const token = reserved.was_inserted ? reserved.reservation_token : '';
+        const first = await idempotencyRepo.markCompleted({
+          key,
+          resultado: { val: 'first' },
+          reservation_token: token,
+        });
+        expect(first).toBe(true);
         // Second markCompleted should NOT clobber because the row is now
         // in state='completed' (WHERE state='in_progress' makes this a no-op).
-        await idempotencyRepo.markCompleted({
+        const second = await idempotencyRepo.markCompleted({
           key,
           resultado: { val: 'should_not_clobber' },
+          reservation_token: token,
         });
+        expect(second).toBe(false);
       },
     );
 
@@ -346,7 +358,7 @@ d('idempotencyRepo.tryReserve — race-safe under real Postgres ON CONFLICT', ()
     await cleanupKey(key);
   });
 
-  it('releaseReservation deletes only in_progress rows', async () => {
+  it('releaseReservation transitions in_progress → failed (B3, terminal — not deleted)', async () => {
     const { idempotencyRepo } = await import('@/db/repositories.js');
     const key = `release-${Date.now()}-${Math.random()}`;
     const baseInput = {
@@ -361,19 +373,137 @@ d('idempotencyRepo.tryReserve — race-safe under real Postgres ON CONFLICT', ()
     await runWithTenantContext(
       { tenant_id: TENANT_A, agent_id: AGENT },
       async () => {
-        await idempotencyRepo.tryReserve(baseInput);
-        await idempotencyRepo.releaseReservation(key);
+        const reserved = await idempotencyRepo.tryReserve(baseInput);
+        const token = reserved.was_inserted ? reserved.reservation_token : '';
+        const released = await idempotencyRepo.releaseReservation({
+          key,
+          reservation_token: token,
+        });
+        expect(released).toBe(true);
       },
     );
     const c = await pool.connect();
     try {
-      const rows = await c.query(
-        `SELECT 1 FROM idempotency_keys WHERE key = $1`,
+      // The row is NOT deleted — it is parked in the terminal 'failed'
+      // state so the same key isn't silently re-executed.
+      const rows = await c.query<{ state: string; resultado: unknown; expires_at: string | null }>(
+        `SELECT state, resultado, expires_at FROM idempotency_keys WHERE key = $1`,
         [key],
       );
-      expect(rows.rows).toHaveLength(0);
+      expect(rows.rows).toHaveLength(1);
+      expect(rows.rows[0]!.state).toBe('failed');
+      expect(rows.rows[0]!.resultado).toBeNull();
+      expect(rows.rows[0]!.expires_at).toBeNull();
     } finally {
       c.release();
     }
+    await cleanupKey(key);
+  });
+
+  it('B3 — a terminally failed key is NOT re-executable by the next caller', async () => {
+    const { idempotencyRepo } = await import('@/db/repositories.js');
+    const key = `prior-failed-${Date.now()}-${Math.random()}`;
+    const baseInput = {
+      key,
+      tool_name: 'register_transaction',
+      operation_type: 'create',
+      pessoa_id: PESSOA_ID,
+      entity_id: ENTIDADE_ID,
+      payload_hash: key,
+      ttl_seconds: 30,
+    };
+    await runWithTenantContext(
+      { tenant_id: TENANT_A, agent_id: AGENT },
+      async () => {
+        const first = await idempotencyRepo.tryReserve(baseInput);
+        const token = first.was_inserted ? first.reservation_token : '';
+        await idempotencyRepo.releaseReservation({ key, reservation_token: token });
+
+        // The next caller must NOT win a fresh reservation — it observes
+        // the terminal failure instead of silently re-running the handler.
+        const second = await idempotencyRepo.tryReserve(baseInput);
+        expect(second.was_inserted).toBe(false);
+        expect(second.state).toBe('failed');
+
+        // waitForCompletion on a failed row returns 'failed', not 'timeout'
+        // and never 'completed'.
+        const waited = await idempotencyRepo.waitForCompletion(key, 1000);
+        expect(waited.status).toBe('failed');
+      },
+    );
+    await cleanupKey(key);
+  });
+
+  it('B2 — fencing: a preempted (reclaimed) owner cannot markCompleted the new reservation', async () => {
+    const { idempotencyRepo } = await import('@/db/repositories.js');
+    const key = `fence-${Date.now()}-${Math.random()}`;
+    const baseInput = {
+      key,
+      tool_name: 'register_transaction',
+      operation_type: 'create',
+      pessoa_id: PESSOA_ID,
+      entity_id: ENTIDADE_ID,
+      payload_hash: key,
+      ttl_seconds: 1,
+    };
+
+    await runWithTenantContext(
+      { tenant_id: TENANT_A, agent_id: AGENT },
+      async () => {
+        // Owner A wins the reservation and gets token A.
+        const a = await idempotencyRepo.tryReserve(baseInput);
+        expect(a.was_inserted).toBe(true);
+        const tokenA = a.was_inserted ? a.reservation_token : '';
+
+        // A's lease expires (simulate a slow handler / GC pause).
+        const c = await pool.connect();
+        try {
+          await c.query(
+            `UPDATE idempotency_keys
+                SET expires_at = now() - interval '5 seconds'
+              WHERE key = $1`,
+            [key],
+          );
+        } finally {
+          c.release();
+        }
+
+        // Owner B reclaims the stale reservation and gets a NEW token B.
+        const b = await idempotencyRepo.tryReserve(baseInput);
+        expect(b.was_inserted).toBe(true);
+        const tokenB = b.was_inserted ? b.reservation_token : '';
+        expect(tokenB).not.toBe(tokenA);
+
+        // A — still "alive" — now tries to complete with its STALE token.
+        // It must be fenced out (0 rows), leaving B's reservation intact.
+        const aCompleted = await idempotencyRepo.markCompleted({
+          key,
+          resultado: { winner: 'A-stale' },
+          reservation_token: tokenA,
+        });
+        expect(aCompleted).toBe(false);
+
+        // B completes legitimately with its own token.
+        const bCompleted = await idempotencyRepo.markCompleted({
+          key,
+          resultado: { winner: 'B' },
+          reservation_token: tokenB,
+        });
+        expect(bCompleted).toBe(true);
+      },
+    );
+
+    // The cached result is B's — A's stale completion never landed.
+    const c = await pool.connect();
+    try {
+      const rows = await c.query<{ resultado: { winner: string } }>(
+        `SELECT resultado FROM idempotency_keys WHERE key = $1`,
+        [key],
+      );
+      expect(rows.rows[0]!.resultado).toEqual({ winner: 'B' });
+    } finally {
+      c.release();
+    }
+    await cleanupKey(key);
   });
 });

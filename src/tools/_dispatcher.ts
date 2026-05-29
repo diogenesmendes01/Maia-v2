@@ -195,6 +195,23 @@ export async function dispatchTool(input: {
     return reservation.resultado;
   }
 
+  if (!reservation.was_inserted && reservation.state === 'failed') {
+    // Issue #298 B3: a prior attempt for this exact key terminally FAILED.
+    // The failed handler may have applied a partial side effect, so we MUST
+    // NOT silently re-execute. Surface a typed error; any retry is an
+    // explicit, higher-level decision (which would compute the same
+    // idempotency_key and re-enter here — still fenced by the 'failed' row
+    // until it ages out of the cache).
+    logger.warn(
+      { tool: tool.name, idempotency_key },
+      'tool.idempotency_prior_failed',
+    );
+    return {
+      error: 'idempotency_prior_failed',
+      details: { tool: tool.name, idempotency_key },
+    };
+  }
+
   if (!reservation.was_inserted && reservation.state === 'in_progress') {
     // Another worker owns the reservation. Wait for them to complete and
     // return their result — preserves the exact-once contract (we do NOT
@@ -214,14 +231,16 @@ export async function dispatchTool(input: {
       );
       return waited.resultado;
     }
-    if (waited.status === 'released') {
-      // Owning worker failed and released its reservation. The user-
-      // facing semantics: tell the caller the operation didn't complete
-      // and they should retry — we MUST NOT re-execute here, because if
-      // a retry happens at a higher level it will compute the same
-      // idempotency_key and re-enter this dispatcher with a clean slot.
+    if (waited.status === 'failed' || waited.status === 'released') {
+      // Owning worker terminally failed. `failed` = the reservation was
+      // marked terminal (issue #298 B3); `released` = the row vanished
+      // (cleanup reap / down-migration). Either way: tell the caller the
+      // operation didn't complete. We MUST NOT re-execute here — a
+      // higher-level retry would recompute the same idempotency_key and
+      // re-enter this dispatcher, where a 'failed' row keeps the slot
+      // fenced until it ages out (no silent partial-side-effect re-run).
       logger.warn(
-        { tool: tool.name, idempotency_key },
+        { tool: tool.name, idempotency_key, wait_status: waited.status },
         'tool.idempotency_owner_failed',
       );
       return {
@@ -243,7 +262,14 @@ export async function dispatchTool(input: {
 
   // was_inserted === true: this caller owns the reservation. Execute the
   // handler and either markCompleted (success) or releaseReservation
-  // (failure → next caller can re-claim with a fresh INSERT).
+  // (failure → mark the slot 'failed' so the same key isn't silently
+  // re-executed). All three transitions are fenced by `reservation_token`
+  // (issue #298 B2): if this owner's lease expired and was reclaimed by
+  // another worker mid-handler, the stale token won't match and the
+  // markCompleted/releaseReservation become no-ops — the new owner's
+  // reservation is preserved and this owner's side effect doesn't get
+  // double-counted as the winning result.
+  const reservation_token = reservation.reservation_token;
   let result: unknown;
   try {
     result = await tool.handler(args, {
@@ -255,14 +281,17 @@ export async function dispatchTool(input: {
       idempotency_key,
     });
   } catch (err) {
-    // Release the reservation so a higher-level retry doesn't get stuck
-    // waiting for an owner that already gave up.
-    await idempotencyRepo.releaseReservation(idempotency_key).catch((release_err) => {
-      logger.error(
-        { release_err, tool: tool.name, idempotency_key },
-        'tool.reservation_release_failed',
-      );
-    });
+    // Mark the reservation 'failed' (B3) so a higher-level retry doesn't
+    // get stuck waiting, and the same key isn't silently re-run while the
+    // failed marker stands.
+    await idempotencyRepo
+      .releaseReservation({ key: idempotency_key, reservation_token })
+      .catch((release_err) => {
+        logger.error(
+          { release_err, tool: tool.name, idempotency_key },
+          'tool.reservation_release_failed',
+        );
+      });
     logger.error({ err, tool: tool.name }, 'tool.execution_failed');
     return { error: 'execution_failed', details: { cause: (err as Error).message } };
   }
@@ -270,27 +299,46 @@ export async function dispatchTool(input: {
   const out = tool.output_schema.safeParse(result);
   if (!out.success) {
     // Output schema violation = handler ran (possibly with side effects)
-    // but produced a malformed response. Release the reservation: a retry
-    // is undesirable (would re-execute the side effect), but locking the
-    // slot in 'in_progress' for the full TTL would block all retries from
-    // ever surfacing the error — worse for the user. The reservation
-    // release sacrifices the cache slot for THIS specific malformed call;
-    // a higher-level retry will re-enter and either succeed (and cache)
-    // or fail-fast again. This trades cache utility against fail-fast UX.
-    await idempotencyRepo.releaseReservation(idempotency_key).catch((release_err) => {
-      logger.error(
-        { release_err, tool: tool.name, idempotency_key },
-        'tool.reservation_release_failed',
-      );
-    });
+    // but produced a malformed response. Mark the reservation 'failed':
+    // a retry is undesirable (would re-execute the side effect), but
+    // locking the slot in 'in_progress' for the full TTL would block all
+    // retries from ever surfacing the error — worse for the user. The
+    // terminal 'failed' marker fails subsequent same-key dispatches fast
+    // (no silent re-run) until it ages out of the cache.
+    await idempotencyRepo
+      .releaseReservation({ key: idempotency_key, reservation_token })
+      .catch((release_err) => {
+        logger.error(
+          { release_err, tool: tool.name, idempotency_key },
+          'tool.reservation_release_failed',
+        );
+      });
     logger.error({ tool: tool.name, issues: out.error.issues }, 'tool.output_invalid');
     return { error: 'execution_failed', details: { cause: 'output_schema_violation' } };
   }
 
-  await idempotencyRepo.markCompleted({
+  const completed = await idempotencyRepo.markCompleted({
     key: idempotency_key,
     resultado: out.data,
+    reservation_token,
   });
+  if (!completed) {
+    // Fenced out (B2): our lease expired and another worker reclaimed the
+    // reservation while our handler was still running. We do NOT cache our
+    // result under the new owner's reservation (that would clobber it).
+    // The handler's side effect already happened, but the new owner will
+    // produce the authoritative cached result; concurrent callers wait on
+    // IT. Surface a retry-friendly error rather than returning a result
+    // that won't match the cache.
+    logger.warn(
+      { tool: tool.name, idempotency_key },
+      'tool.idempotency_completion_fenced',
+    );
+    return {
+      error: 'idempotency_completion_fenced',
+      details: { tool: tool.name, idempotency_key },
+    };
+  }
   await audit({
     acao: tool.audit_action,
     pessoa_id: input.ctx.pessoa.id,
