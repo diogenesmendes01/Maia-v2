@@ -106,6 +106,11 @@ const redisStub = {
 vi.mock('@/lib/redis.js', () => ({
   redis: redisStub,
   isRedisConnected: () => redisConnected,
+  // #309: consulted in the production catch paths. This spec does not inject
+  // Redis errors, so OOM detection is false and the degrade hook is a no-op.
+  // OOM coverage lives in `dedup-oom.spec.ts`.
+  isRedisOomError: () => false,
+  recordRedisOomDegraded: () => {},
 }));
 
 // mensagensRepo.findByWhatsappId default: no DB hit. Individual tests

@@ -5,6 +5,7 @@ import { logger } from '@/lib/logger.js';
 import { dlqRepo } from '@/db/repositories.js';
 import { audit } from '@/governance/audit.js';
 import { sendAlert } from '@/lib/alerts.js';
+import { isRedisOomError, recordRedisOomDegraded } from '@/lib/redis.js';
 import type { AgentJob } from './types.js';
 
 const connection = new IORedis(config.REDIS_URL, {
@@ -55,11 +56,68 @@ export function startAgentWorker(processor: (job: Job<AgentJob>) => Promise<void
   return worker;
 }
 
+/**
+ * Signal that `enqueueAgent` could not arm the BullMQ job because Redis is at
+ * its memory cap (#309 follow-up, PR #324 B1). Mirrors the debouncer's
+ * `DebouncerRedisUnavailableError`: a raw ioredis `ReplyError` from
+ * `agentQueue.add` must NOT escape and crash the dispatcher — it becomes a
+ * typed, already-accounted signal the caller fail-closes on.
+ *
+ * Why a dedicated type (and not just re-throwing the ReplyError): the DLQ
+ * path in `worker.on('failed')` only fires for jobs that already EXIST. An
+ * OOM on `.add` happens BEFORE the job is created, so there is no job to DLQ.
+ * The fail-closed contract is therefore "leave the inbound row PERSISTED
+ * (processada_em IS NULL) and let `runMessageRecovery` re-enqueue it on the
+ * next sweep" — never silently drop, never half-arm.
+ */
+export class QueueRedisUnavailableError extends Error {
+  readonly code = 'QUEUE_REDIS_UNAVAILABLE';
+  /** True when the underlying cause was a Redis OOM (capacity) rather than a
+   *  connection-down condition — lets observability separate capacity
+   *  incidents from connectivity ones. */
+  readonly oom: boolean;
+  constructor(opts?: { oom?: boolean }) {
+    const cause = opts?.oom ? 'OOM (memory cap reached)' : 'unavailable';
+    super(`enqueueAgent: Redis ${cause} during agentQueue.add; message left pending for recovery sweep`);
+    this.name = 'QueueRedisUnavailableError';
+    this.oom = opts?.oom ?? false;
+  }
+}
+
+/**
+ * Enqueue an agent job for the non-debounced ingress path and the
+ * message-recovery sweep.
+ *
+ * OOM handling (#309 follow-up, PR #324 B1): wrap `agentQueue.add` so a Redis
+ * OOM `ReplyError` is converted to a typed `QueueRedisUnavailableError`
+ * (FAIL-CLOSED). On OOM we record `redis_oom_degraded_total{operation:
+ * 'enqueue_agent'}` and throw the typed error — we do NOT silently drop the
+ * message and do NOT arm a half-state. The caller is responsible for leaving
+ * the inbound row PERSISTED (it already is: `createInbound` writes
+ * `processada_em: null`), so `runMessageRecovery` re-enqueues it once Redis
+ * has headroom again. Non-OOM errors propagate UNCHANGED so a real Redis bug
+ * (conn reset, failover, auth) still surfaces to the caller's observability.
+ *
+ * @throws QueueRedisUnavailableError on a Redis OOM (oom=true).
+ * @throws the underlying error for any non-OOM failure.
+ */
 export async function enqueueAgent(data: AgentJob): Promise<void> {
-  await agentQueue.add('process-message', data, {
-    attempts: 3,
-    backoff: { type: 'exponential', delay: 2000 },
-  });
+  try {
+    await agentQueue.add('process-message', data, {
+      attempts: 3,
+      backoff: { type: 'exponential', delay: 2000 },
+    });
+  } catch (err) {
+    if (isRedisOomError(err)) {
+      recordRedisOomDegraded('enqueue_agent', { mensagem_id: data.mensagem_id });
+      logger.warn(
+        { mensagem_id: data.mensagem_id, redis_oom: true },
+        'queue.enqueue_failed_oom_fail_closed',
+      );
+      throw new QueueRedisUnavailableError({ oom: true });
+    }
+    throw err;
+  }
 }
 
 export async function shutdownQueue(): Promise<void> {

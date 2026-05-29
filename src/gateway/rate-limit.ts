@@ -63,8 +63,31 @@
  *   wrapped only the sorted-set block, so a transient Redis blip on the
  *   overage path (latency spike, eviction, network jitter) would surface
  *   the error to the caller — strictly worse than the documented contract.
+ *
+ * OOM coverage (issue #309 + follow-up PR #324 B2/W1):
+ *   A Redis OOM under `noeviction` (PR #294) surfaces as a `ReplyError` on
+ *   any of the `zadd`/`zremrangebyscore`/`get`/`set` writes below. Both
+ *   try/catch blocks absorb it into the SAME fail-closed `silence`
+ *   (non-owner) / `allow` (owner) decision the runbook §4.5 documents — the
+ *   control flow is INTENTIONAL and unchanged. What PR #324 adds is
+ *   CLASSIFICATION: each block now distinguishes an OOM (record
+ *   `redis_oom_degraded_total{operation="rate_limit.*"}` via
+ *   `recordRedisOomDegraded`) from any other Redis fault (record
+ *   `redis_error_total{operation="rate_limit.*"}` via `recordRedisError`).
+ *   Before this, an OOM and a real bug (`READONLY`, conn reset, auth) both
+ *   degraded to `silence` with only a generic warn — a capacity incident and
+ *   a code/infra bug looked identical. We deliberately do NOT re-throw the
+ *   non-OOM error: fail-closed-to-`silence` is the intended safety posture
+ *   here (W1), so we make the fault VISIBLE via metric+log instead of
+ *   breaking that posture.
  */
-import { redis, isRedisConnected } from '@/lib/redis.js';
+import {
+  redis,
+  isRedisConnected,
+  isRedisOomError,
+  recordRedisOomDegraded,
+  recordRedisError,
+} from '@/lib/redis.js';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 import type { Pessoa } from '@/db/schema.js';
@@ -164,6 +187,16 @@ export async function checkRateLimit(pessoa: Pessoa): Promise<RateLimitDecision>
     await redis.expire(countKey, HOUR_SECONDS);
     count = await redis.zcard(countKey);
   } catch (err) {
+    // Classify the fault (#309 follow-up, PR #324 B2/W1) WITHOUT changing the
+    // fail-closed decision: OOM → capacity counter, anything else → distinct
+    // error counter, so a real Redis bug here is no longer indistinguishable
+    // from a memory-cap incident. Both still fail closed (silence non-owner,
+    // allow owner) — that intentional safety posture is preserved.
+    if (isRedisOomError(err)) {
+      recordRedisOomDegraded('rate_limit.zset', { pessoa_id: pessoa.id, tenant_id, agent_id });
+    } else {
+      recordRedisError('rate_limit.zset', { pessoa_id: pessoa.id, tenant_id, agent_id });
+    }
     logger.warn(
       { err: (err as Error).message, pessoa_id: pessoa.id, tenant_id, agent_id },
       'rate_limit.zset_failed',
@@ -196,13 +229,20 @@ export async function checkRateLimit(pessoa: Pessoa): Promise<RateLimitDecision>
     await redis.set(silenceKey, '1', 'EX', SILENCE_SECONDS);
     return { kind: 'warn', count, threshold };
   } catch (err) {
+    // Same classification as the zset block (#309 follow-up, PR #324 B2/W1):
+    // OOM → capacity counter, anything else → distinct error counter. The
+    // fail-closed `silence` decision is unchanged (this branch is non-owner by
+    // construction — owners short-circuited on `isOwner || count <= threshold`
+    // above), we only make the fault visible.
+    if (isRedisOomError(err)) {
+      recordRedisOomDegraded('rate_limit.overage', { pessoa_id: pessoa.id, tenant_id, agent_id });
+    } else {
+      recordRedisError('rate_limit.overage', { pessoa_id: pessoa.id, tenant_id, agent_id });
+    }
     logger.warn(
       { err: (err as Error).message, pessoa_id: pessoa.id, tenant_id, agent_id },
       'rate_limit.overage_failed',
     );
-    // Non-owner already failed the count threshold — fail-closed to silence.
-    // (Owners short-circuited above on the `isOwner || count <= threshold`
-    // check, so this branch is non-owner by construction.)
     return { kind: 'silence' };
   }
 }

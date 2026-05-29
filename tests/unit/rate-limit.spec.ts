@@ -102,6 +102,13 @@ const stub = makeStub();
 vi.mock('../../src/lib/redis.js', () => ({
   redis: stub,
   isRedisConnected: () => true,
+  // #309 follow-up (PR #324 B2): rate-limit imports these for OOM/non-OOM
+  // classification in its catch blocks. These decision-logic tests stay on the
+  // happy path (no Redis error), so they are no-ops here; error-path coverage
+  // lives in `gateway/rate-limit-oom.spec.ts` + `gateway/rate-limit-cross-tenant.spec.ts`.
+  isRedisOomError: () => false,
+  recordRedisOomDegraded: () => {},
+  recordRedisError: () => {},
 }));
 
 vi.mock('../../src/config/env.js', () => ({

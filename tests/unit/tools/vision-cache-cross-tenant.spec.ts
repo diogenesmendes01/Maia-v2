@@ -74,6 +74,12 @@ const redisStub = {
 vi.mock('@/lib/redis.js', () => ({
   redis: redisStub,
   isRedisConnected: () => connected,
+  // #309: consulted in the production catch path. OOM coverage lives in
+  // `vision-cache-oom.spec.ts`; this spec injects no OOM so it's a no-op.
+  // PR #324 B2 adds `recordRedisError` to the non-OOM branch — stub it too.
+  isRedisOomError: () => false,
+  recordRedisOomDegraded: () => {},
+  recordRedisError: () => {},
 }));
 
 // Logger spy. Captured tuples are inspected by the OBSERVABILITY block to

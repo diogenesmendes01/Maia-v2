@@ -38,6 +38,10 @@ vi.mock('../../src/lib/redis.js', () => ({
   redis: {},
   isRedisConnected: () => false,
   ensureRedisConnect: vi.fn(),
+  // #309: the debouncer's catch path consults these. Redis is "down" here so
+  // the disconnect guard fires first; the no-ops keep behaviour unchanged.
+  isRedisOomError: () => false,
+  recordRedisOomDegraded: () => {},
 }));
 vi.mock('../../src/gateway/queue.js', () => ({
   agentQueue: { add: vi.fn(), getJob: vi.fn() },

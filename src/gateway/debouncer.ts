@@ -1,4 +1,9 @@
-import { redis, isRedisConnected } from '@/lib/redis.js';
+import {
+  redis,
+  isRedisConnected,
+  isRedisOomError,
+  recordRedisOomDegraded,
+} from '@/lib/redis.js';
 import { agentQueue } from './queue.js';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
@@ -132,9 +137,39 @@ const JOB_NAME = 'process-message-debounced';
  */
 export class DebouncerRedisUnavailableError extends Error {
   readonly code = 'DEBOUNCER_REDIS_UNAVAILABLE';
-  constructor(op: string) {
-    super(`debouncer: Redis unavailable during ${op}; refusing to bypass tenant-scoped debounce`);
+  /** True when the underlying cause was a Redis OOM (capacity) rather than a
+   *  connection-down condition. Both map to the same fail-closed handling in
+   *  the caller, but the flag lets observability separate capacity incidents
+   *  from connectivity ones. */
+  readonly oom: boolean;
+  constructor(op: string, opts?: { oom?: boolean }) {
+    const cause = opts?.oom ? 'OOM (memory cap reached)' : 'unavailable';
+    super(`debouncer: Redis ${cause} during ${op}; refusing to bypass tenant-scoped debounce`);
     this.name = 'DebouncerRedisUnavailableError';
+    this.oom = opts?.oom ?? false;
+  }
+}
+
+/**
+ * OOM handling (#309): convert a raw Redis OOM `ReplyError` into the
+ * debouncer's controlled `DebouncerRedisUnavailableError` so the caller's
+ * EXISTING fail-closed contract handles it (baileys.ts logs
+ * `baileys.debounce_failed_fail_closed` and stops — the message is already
+ * persisted in `mensagensRepo` and swept by `aggregateUnprocessedTexts` on
+ * the next cycle). This is FAIL-CLOSED, NOT fail-open: we deliberately do
+ * NOT silently "skip the debounce and continue", because that would either
+ * drop the message or leave a BullMQ job armed without its companion Redis
+ * state (the MAJOR D bug this module guards against). A raw `ReplyError`
+ * must never escape to crash the dispatcher — it becomes a typed,
+ * already-handled signal. Re-throws non-OOM errors untouched.
+ */
+function rethrowIfOom(err: unknown, op: string, scoped?: string): void {
+  if (isRedisOomError(err)) {
+    recordRedisOomDegraded(
+      op === 'clearState' ? 'debouncer.clear_state' : 'debouncer.write_state',
+      scoped ? { scoped_key: scoped } : undefined,
+    );
+    throw new DebouncerRedisUnavailableError(op, { oom: true });
   }
 }
 
@@ -253,14 +288,26 @@ async function writeState(scoped: string, state: DebounceState): Promise<void> {
   if (!isRedisConnected()) {
     throw new DebouncerRedisUnavailableError('writeState');
   }
-  await redis.set(STATE_KEY(scoped), JSON.stringify(state), 'EX', STATE_TTL_S);
+  try {
+    await redis.set(STATE_KEY(scoped), JSON.stringify(state), 'EX', STATE_TTL_S);
+  } catch (err) {
+    // OOM (#309) → typed fail-closed error; non-OOM falls through and propagates.
+    rethrowIfOom(err, 'writeState', scoped);
+    throw err;
+  }
 }
 
 async function clearState(scoped: string): Promise<void> {
   if (!isRedisConnected()) {
     throw new DebouncerRedisUnavailableError('clearState');
   }
-  await redis.del(STATE_KEY(scoped));
+  try {
+    await redis.del(STATE_KEY(scoped));
+  } catch (err) {
+    // OOM (#309) → typed fail-closed error; non-OOM falls through and propagates.
+    rethrowIfOom(err, 'clearState', scoped);
+    throw err;
+  }
 }
 
 export type DebounceResult =
@@ -373,6 +420,22 @@ export async function scheduleDebouncedAgent(params: {
 
     return { kind: 'scheduled', reset: !!prior, held_ms: heldMs };
   } catch (err) {
+    // OOM handling (#309): a raw OOM `ReplyError` can also surface from the
+    // BullMQ `agentQueue.add` enqueue or the `readState` GET above (the
+    // `writeState`/`clearState` helpers already converted theirs to a typed
+    // `DebouncerRedisUnavailableError`, which is NOT an OOM ReplyError, so no
+    // double-count here). Record the capacity signal and convert to the same
+    // typed fail-closed error so the caller's existing
+    // `baileys.debounce_failed_fail_closed` path handles it (message stays
+    // persisted in Postgres, no raw ReplyError crash, no double-enqueue).
+    if (isRedisOomError(err)) {
+      recordRedisOomDegraded('debouncer.write_state', { scoped_key: scoped });
+      logger.warn(
+        { scoped_key: scoped, mensagem_id, redis_oom: true },
+        'debounce.schedule_failed',
+      );
+      throw new DebouncerRedisUnavailableError('scheduleDebouncedAgent', { oom: true });
+    }
     // Log here so the failing operation is attributable even if the
     // caller's catch logs a generic "debounce failed". We re-throw so
     // the caller can pick its fallback policy — fail-closed at this

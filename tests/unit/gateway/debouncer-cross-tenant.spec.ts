@@ -80,6 +80,13 @@ const redisConnected = { value: true };
 vi.mock('@/lib/redis.js', () => ({
   redis: redisStub,
   isRedisConnected: () => redisConnected.value,
+  // #309: these exports are consulted in the production catch paths. This
+  // spec exercises NON-OOM failures (and Redis-down), so OOM detection is
+  // always false here and the degrade hook is a no-op — the existing
+  // fail-closed propagation behaviour is unchanged. OOM-specific behaviour
+  // is covered by `debouncer-oom.spec.ts`.
+  isRedisOomError: () => false,
+  recordRedisOomDegraded: () => {},
 }));
 
 vi.mock('@/lib/logger.js', () => ({

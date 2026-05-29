@@ -112,6 +112,9 @@ const { stub } = vi.hoisted(() => {
 vi.mock('@/lib/redis.js', () => ({
   redis: stub,
   isRedisConnected: () => true,
+  // #309: consulted in the production catch path. No OOM injected here.
+  isRedisOomError: () => false,
+  recordRedisOomDegraded: () => {},
 }));
 
 vi.mock('@/lib/logger.js', () => ({

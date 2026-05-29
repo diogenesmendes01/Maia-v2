@@ -11,6 +11,12 @@ const redisMock = {
 vi.mock('../../src/lib/redis.js', () => ({
   isRedisConnected: () => isRedisConnectedMock(),
   redis: redisMock,
+  // #309: consulted in the production catch path. This spec injects no OOM
+  // (its Redis ops resolve), so OOM detection is false and the degrade hook is
+  // a no-op. OOM fail-closed behaviour is covered by
+  // `tests/unit/scheduling/backpressure-oom.spec.ts`.
+  isRedisOomError: () => false,
+  recordRedisOomDegraded: () => {},
 }));
 
 vi.mock('../../src/config/env.js', () => ({
