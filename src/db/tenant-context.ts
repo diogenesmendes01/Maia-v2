@@ -132,8 +132,13 @@ function assertTruthyContext(value: unknown, name: string): asserts value is str
  * Kept as a distinct helper (instead of inline in `assertTruthyContext`) so the
  * per-field strict-string assertion stays a pure shape check while preserving
  * #296's observability + opt-in throw semantics.
+ *
+ * Exported (issue #315) so the upstream `BaseContextBuilder` can apply the
+ * exact same gating + metering + throw semantics at packet-build time. Sharing
+ * this single helper guarantees the builder guard and the ALS read-time guard
+ * cannot silently diverge (same flag, same counter, same `DefaultLiteralRejectedError`).
  */
-function assertNotDefaultLiteral(value: string, field: 'tenant_id' | 'agent_id'): void {
+export function assertNotDefaultLiteral(value: string, field: 'tenant_id' | 'agent_id'): void {
   if (value === 'default') {
     incCounter('maia_tenant_id_default_literal_total', { field });
     if (shouldThrowOnDefaultLiteral()) {

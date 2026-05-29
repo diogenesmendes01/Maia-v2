@@ -51,6 +51,17 @@ const redisStub = {
     calls.push({ op: 'get', key, args: [] });
     return null;
   }),
+  // #317: marker write/clear. Redis is DOWN for this whole file, so these are
+  // never reached (the isRedisConnected()===false guard short-circuits first);
+  // present only so the stub shape matches production if that guard ever moves.
+  set: vi.fn(async (key: string, ...args: unknown[]) => {
+    calls.push({ op: 'set', key, args });
+    return 'OK';
+  }),
+  del: vi.fn(async (key: string) => {
+    calls.push({ op: 'del', key, args: [] });
+    return 1;
+  }),
 };
 
 // Redis is DOWN for this whole file — this is the regression path.
