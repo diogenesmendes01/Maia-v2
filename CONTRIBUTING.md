@@ -2,6 +2,41 @@
 
 Projeto pessoal de Diógenes Mendes — uso interno por enquanto.
 
+## Toolchain (Node + npm fixos)
+
+O CI valida com `npm ci`, que falha se o `package-lock.json` não bater com o npm
+que o gerou. Em #312 um lockfile gerado localmente com npm 11 quebrou o CI (que
+rodava npm 10): a forma do bloco `esbuild` divergia. Para isso nunca mais
+acontecer, **a versão do Node e do npm é fixada e tem uma única fonte da
+verdade**:
+
+- **Node:** `.nvmrc` (`22`). O CI usa `node-version-file: '.nvmrc'`, então
+  local e CI nunca divergem.
+- **npm:** campo `packageManager` (`npm@11.5.2`) em `package.json`, ativado via
+  [corepack](https://github.com/nodejs/corepack). `engines` reforça
+  (`node >=22.0.0`, `npm >=11.5.2 <12`).
+
+### Setup (uma vez)
+
+```bash
+nvm install   # lê .nvmrc → Node 22
+nvm use       # ativa Node 22
+corepack enable
+npm --version # deve imprimir 11.5.2 (do packageManager)
+```
+
+### Regra do lockfile
+
+> **Toda mudança em `package-lock.json` DEVE ser feita com o toolchain fixado
+> (nvm + corepack).** Não regenere o lockfile com outra versão de npm — a forma
+> dos blocos de dependência muda entre majors de npm e o `npm ci` do CI vai
+> rejeitar. Confirme com `node --version` (v22.x) e `npm --version` (11.5.2)
+> antes de rodar `npm install`. Antes de commitar, valide do zero:
+
+```bash
+rm -rf node_modules && npm ci   # tem de passar — é exatamente o que o CI roda
+```
+
 ## Convenções
 
 ### Commits
