@@ -36,6 +36,17 @@ describe('buildCacheKey — collision-by-delimiter', () => {
     const c = buildCacheKey('p:', 'a', 'b', 'c:d');
     expect(new Set([a, b, c]).size).toBe(3);
   });
+
+  it.each([
+    // Each row is a set of tuples that a naive `:`-concat would alias to ONE
+    // key. With per-segment encoding they must all be DISTINCT.
+    [[['a:b', 'c'], ['a', 'b:c']]],
+    [[['a:b', 'c', 'd'], ['a', 'b:c', 'd'], ['a', 'b', 'c:d']]],
+    [[['x:', 'y'], ['x', ':y'], ['x', '', ':y']]],
+  ])('parametrized: colliding tuples #%# all produce distinct keys', (tuples) => {
+    const keys = tuples.map((segs) => buildCacheKey('p:', ...segs));
+    expect(new Set(keys).size).toBe(keys.length);
+  });
 });
 
 describe('buildCacheKey — type coercion', () => {
@@ -44,20 +55,47 @@ describe('buildCacheKey — type coercion', () => {
     expect(buildCacheKey('rl:', 0)).toBe('rl:0');
     expect(buildCacheKey('rl:', -1, 1.5)).toBe('rl:-1:1.5');
   });
+});
 
-  it('null segments encode to an empty placeholder (one slot in the join)', () => {
-    // Documented contract: null becomes '' so callers do not need to guard
-    // optional fields. The slot is still present in the join.
-    expect(buildCacheKey('p:', 'tenant', null, 'phone')).toBe('p:tenant::phone');
-    // (tenant, null, phone) and (tenant, '', phone) hash identically; that
-    // collapsing is intentional — both represent "missing middle segment".
-    expect(buildCacheKey('p:', 'tenant', null, 'phone')).toBe(
-      buildCacheKey('p:', 'tenant', '', 'phone'),
+describe('buildCacheKey — null/undefined fail closed (B3)', () => {
+  // Codex review of #305: a `null`/`undefined` segment must NOT collapse to
+  // ''. Coercing it would alias "missing" with "empty string" — distinct
+  // tuples hashing to the same key. The contract is fail-closed: throw.
+  it('rejects a null segment with a TypeError naming the index', () => {
+    expect(() => buildCacheKey('p:', 'tenant', null as unknown as string, 'phone')).toThrow(
+      TypeError,
+    );
+    expect(() => buildCacheKey('p:', 'tenant', null as unknown as string, 'phone')).toThrow(
+      /index 1/,
     );
   });
 
-  it('undefined segments encode the same as null', () => {
-    expect(buildCacheKey('p:', 'tenant', undefined, 'phone')).toBe('p:tenant::phone');
+  it('rejects an undefined segment with a TypeError naming the index', () => {
+    expect(() =>
+      buildCacheKey('p:', 'tenant', undefined as unknown as string, 'phone'),
+    ).toThrow(TypeError);
+    expect(() =>
+      buildCacheKey('p:', 'tenant', undefined as unknown as string, 'phone'),
+    ).toThrow(/index 1/);
+  });
+
+  it('rejects null/undefined in the first or last slot too', () => {
+    expect(() => buildCacheKey('p:', null as unknown as string)).toThrow(/index 0/);
+    expect(() => buildCacheKey('p:', 'a', undefined as unknown as string)).toThrow(
+      /index 1/,
+    );
+  });
+
+  it('an explicit empty string is still accepted (the documented sentinel)', () => {
+    // Callers that genuinely mean "empty segment" must opt in explicitly.
+    expect(buildCacheKey('p:', 'tenant', '', 'phone')).toBe('p:tenant::phone');
+  });
+
+  it('"missing" and "empty" no longer alias — there is no null path to ""', () => {
+    // The only way to produce 'p:tenant::phone' is an explicit '' — null/
+    // undefined throw, so the historical aliasing is structurally impossible.
+    expect(() => buildCacheKey('p:', 'tenant', null as unknown as string, 'phone')).toThrow();
+    expect(buildCacheKey('p:', 'tenant', '', 'phone')).toBe('p:tenant::phone');
   });
 });
 
@@ -85,6 +123,48 @@ describe('buildCacheKey — encoding', () => {
     // Brazilian-portuguese characters must round-trip through the encoder
     // without dropping bytes. `ç` is `%C3%A7`.
     expect(buildCacheKey('p:', 'avaliação')).toBe('p:avalia%C3%A7%C3%A3o');
+  });
+});
+
+describe('buildCacheKey — Redis glob metachar safety (B4)', () => {
+  // Codex review of #305 (same class of bug as PR #242): `encodeURIComponent`
+  // does NOT escape `*` (nor `!`), so a segment containing one could act as a
+  // wildcard inside a `KEYS`/`SCAN` `MATCH` pattern built from that segment,
+  // aliasing across unrelated keys. Every glob metachar must be neutralized so
+  // a segment is always a literal.
+  it('percent-encodes `*` so a segment cannot become a wildcard', () => {
+    expect(buildCacheKey('p:', 'tenant*')).toBe('p:tenant%2A');
+    expect(buildCacheKey('p:', '*')).toBe('p:%2A');
+  });
+
+  it('percent-encodes `?` (single-char glob wildcard)', () => {
+    expect(buildCacheKey('p:', 'slice?')).toBe('p:slice%3F');
+  });
+
+  it('percent-encodes `[`, `]` (glob character class)', () => {
+    expect(buildCacheKey('p:', 'a[bc]d')).toBe('p:a%5Bbc%5Dd');
+  });
+
+  it('percent-encodes `!` (glob char-class negation)', () => {
+    expect(buildCacheKey('p:', 'a!b')).toBe('p:a%21b');
+  });
+
+  it('a literal segment never aliases with a glob pattern segment', () => {
+    // The whole point: a key written for the literal value `*` must NOT be the
+    // same string as a key written for some other tenant — `*` is neutralized,
+    // so it can never match `tenant1`, `tenant2`, ... as a glob would.
+    const star = buildCacheKey('maia:bot:', 'tenant', '*');
+    const literalT1 = buildCacheKey('maia:bot:', 'tenant', 'tenant1');
+    const literalT2 = buildCacheKey('maia:bot:', 'tenant', 'tenant2');
+    expect(star).toBe('maia:bot:tenant:%2A');
+    expect(new Set([star, literalT1, literalT2]).size).toBe(3);
+    // And the encoded form contains no raw glob metacharacter at all.
+    expect(/[*?[\]!]/.test(star)).toBe(false);
+  });
+
+  it('combined: a segment full of metachars is fully neutralized', () => {
+    expect(/[*?[\]!]/.test(buildCacheKey('p:', '*?[]!'))).toBe(false);
+    expect(buildCacheKey('p:', '*?[]!')).toBe('p:%2A%3F%5B%5D%21');
   });
 });
 
