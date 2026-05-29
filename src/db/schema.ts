@@ -314,8 +314,13 @@ export const agent_facts = pgTable(
       .where(
         sql`lifecycle_status IN ('ephemeral', 'observed', 'reinforced', 'verified')`,
       ),
+    // Expression index on the coalesced value the promoter's active sweep
+    // ranges over (`COALESCE(last_recall_at, updated_at) < cutoff`). A
+    // btree over the two SEPARATE columns cannot back a range over the
+    // COALESCE(...) expression, so it must key on the expression itself
+    // (mirrors migration 066: `((COALESCE(last_recall_at, updated_at)))`).
     lifecycleActiveIdx: index('idx_agent_facts_lifecycle_active')
-      .on(t.lifecycle_status, t.last_recall_at, t.updated_at)
+      .on(sql`COALESCE(last_recall_at, updated_at)`)
       .where(sql`lifecycle_status = 'active'`),
   }),
 );
@@ -357,8 +362,13 @@ export const learned_rules = pgTable(
       .where(
         sql`lifecycle_status IN ('ephemeral', 'observed', 'reinforced', 'verified')`,
       ),
+    // Expression index on the coalesced value the promoter's active sweep
+    // ranges over (`COALESCE(last_recall_at, updated_at) < cutoff`). A
+    // btree over the two SEPARATE columns cannot back a range over the
+    // COALESCE(...) expression, so it must key on the expression itself
+    // (mirrors migration 066: `((COALESCE(last_recall_at, updated_at)))`).
     lifecycleActiveIdx: index('idx_learned_rules_lifecycle_active')
-      .on(t.lifecycle_status, t.last_recall_at, t.updated_at)
+      .on(sql`COALESCE(last_recall_at, updated_at)`)
       .where(sql`lifecycle_status = 'active'`),
   }),
 );
@@ -902,8 +912,13 @@ export const memory_entry = pgTable(
       .where(
         sql`lifecycle_status IN ('ephemeral', 'observed', 'reinforced', 'verified')`,
       ),
+    // Expression index on the coalesced value the promoter's active sweep
+    // ranges over (`COALESCE(last_recall_at, updated_at) < cutoff`). A
+    // btree over the two SEPARATE columns cannot back a range over the
+    // COALESCE(...) expression, so it must key on the expression itself
+    // (mirrors migration 066: `((COALESCE(last_recall_at, updated_at)))`).
     lifecycleActiveIdx: index('idx_memory_entry_lifecycle_active')
-      .on(t.lifecycle_status, t.last_recall_at, t.updated_at)
+      .on(sql`COALESCE(last_recall_at, updated_at)`)
       .where(sql`lifecycle_status = 'active'`),
   }),
 );
@@ -956,8 +971,13 @@ export const behavioral_hint = pgTable(
       .where(
         sql`lifecycle_status IN ('ephemeral', 'observed', 'reinforced', 'verified')`,
       ),
+    // Expression index on the coalesced value the promoter's active sweep
+    // ranges over (`COALESCE(last_recall_at, updated_at) < cutoff`). A
+    // btree over the two SEPARATE columns cannot back a range over the
+    // COALESCE(...) expression, so it must key on the expression itself
+    // (mirrors migration 066: `((COALESCE(last_recall_at, updated_at)))`).
     lifecycleActiveIdx: index('idx_behavioral_hint_lifecycle_active')
-      .on(t.lifecycle_status, t.last_recall_at, t.updated_at)
+      .on(sql`COALESCE(last_recall_at, updated_at)`)
       .where(sql`lifecycle_status = 'active'`),
   }),
 );

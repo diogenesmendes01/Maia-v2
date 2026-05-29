@@ -21,8 +21,10 @@
  * per table serve it:
  *   - `*_lifecycle_inflight` on (lifecycle_status, updated_at) WHERE
  *     lifecycle_status IN ('ephemeral','observed','reinforced','verified')
- *   - `*_lifecycle_active` on (lifecycle_status, last_recall_at,
- *     updated_at) WHERE lifecycle_status = 'active'
+ *   - `*_lifecycle_active` is an EXPRESSION index on
+ *     COALESCE(last_recall_at, updated_at) WHERE lifecycle_status =
+ *     'active' — the value the active sweep's range predicate compares,
+ *     which a btree on the two separate columns cannot serve.
  *
  * This test pins the index *names*, *column tuples*, and *partiality* so
  * any drift from migration 066 breaks the build loudly (rather than
@@ -86,10 +88,16 @@ describe('issue #281 (PR #310 redesign) — KSM lifecycle partial indexes', () =
       ]);
     });
 
-    it(`${cfg.name} declares ${prefix}_lifecycle_active on (lifecycle_status, last_recall_at, updated_at)`, () => {
+    it(`${cfg.name} declares ${prefix}_lifecycle_active as an expression index on COALESCE(last_recall_at, updated_at)`, () => {
+      // The promoter's active sweep ranges over the COALESCE(...) value
+      // (`COALESCE(last_recall_at, updated_at) < cutoff`), which a btree on
+      // the two separate columns cannot serve. So the index keys on the
+      // raw-SQL expression. Drizzle stores the SQL object (no `.name`) in
+      // `config.columns`, which indexSignatures maps to the `<expr>`
+      // sentinel — pinning that the column list is a single expression.
       expect(indexSignatures(cfg)).toContainEqual([
         `${prefix}_lifecycle_active`,
-        ['lifecycle_status', 'last_recall_at', 'updated_at'],
+        ['<expr>'],
       ]);
     });
 

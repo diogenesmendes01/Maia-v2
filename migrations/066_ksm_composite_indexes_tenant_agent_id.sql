@@ -47,10 +47,14 @@
 --
 -- (2) Active-deprecation sweep (promoter step 6: active→deprecated,
 --     predicate COALESCE(last_recall_at, updated_at) < cutoff). 'active'
---     is the bulk of the table, so status alone is not selective; but a
---     partial index on (lifecycle_status, last_recall_at, updated_at)
---     WHERE lifecycle_status='active' lets the LIMIT 100 walk the oldest
---     rows first and stop early instead of scanning + sorting the heap.
+--     is the bulk of the table, so status alone is not selective. The
+--     predicate ranges over the COALESCE(last_recall_at, updated_at)
+--     EXPRESSION, which a btree on the two separate columns cannot serve
+--     (the planner would seq-scan). So the partial index is keyed on the
+--     coalesced expression itself —
+--     ((COALESCE(last_recall_at, updated_at))) WHERE lifecycle_status=
+--     'active' — letting the LIMIT 100 walk the oldest rows first and
+--     stop early instead of scanning + sorting the heap.
 --
 -- This covers all four KSM tables (B3: learned_rules was previously
 -- omitted) and matches the queries the promoter actually issues (B2).
@@ -95,7 +99,7 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_agent_facts_lifecycle_inflight
   WHERE lifecycle_status IN ('ephemeral', 'observed', 'reinforced', 'verified');
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_agent_facts_lifecycle_active
-  ON agent_facts (lifecycle_status, last_recall_at, updated_at)
+  ON agent_facts ((COALESCE(last_recall_at, updated_at)))
   WHERE lifecycle_status = 'active';
 
 -- memory_entry ----------------------------------------------------------
@@ -104,7 +108,7 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_memory_entry_lifecycle_inflight
   WHERE lifecycle_status IN ('ephemeral', 'observed', 'reinforced', 'verified');
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_memory_entry_lifecycle_active
-  ON memory_entry (lifecycle_status, last_recall_at, updated_at)
+  ON memory_entry ((COALESCE(last_recall_at, updated_at)))
   WHERE lifecycle_status = 'active';
 
 -- behavioral_hint -------------------------------------------------------
@@ -113,7 +117,7 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_behavioral_hint_lifecycle_inflight
   WHERE lifecycle_status IN ('ephemeral', 'observed', 'reinforced', 'verified');
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_behavioral_hint_lifecycle_active
-  ON behavioral_hint (lifecycle_status, last_recall_at, updated_at)
+  ON behavioral_hint ((COALESCE(last_recall_at, updated_at)))
   WHERE lifecycle_status = 'active';
 
 -- learned_rules ---------------------------------------------------------
@@ -122,5 +126,5 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_learned_rules_lifecycle_inflight
   WHERE lifecycle_status IN ('ephemeral', 'observed', 'reinforced', 'verified');
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_learned_rules_lifecycle_active
-  ON learned_rules (lifecycle_status, last_recall_at, updated_at)
+  ON learned_rules ((COALESCE(last_recall_at, updated_at)))
   WHERE lifecycle_status = 'active';
