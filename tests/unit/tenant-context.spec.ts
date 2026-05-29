@@ -91,6 +91,15 @@ describe('tenant-context', () => {
       );
     });
 
+    it('getCurrentAgent lança quando agent_id é undefined', async () => {
+      await runWithTenantContext(
+        { tenant_id: 'acme', agent_id: undefined as unknown as string },
+        async () => {
+          expect(() => getCurrentAgent()).toThrow(MissingTenantContextError);
+        },
+      );
+    });
+
     it('MissingTenantContextError preserva código estável e mensagem com razão', async () => {
       await runWithTenantContext({ tenant_id: '', agent_id: 'sofia' }, async () => {
         try {
@@ -129,13 +138,14 @@ describe('tenant-context', () => {
   });
 
   // -------------------------------------------------------------------------
-  // PR #272 reval (Codex) — whitespace-only IDs convergente com issue #283.
+  // PR #272 reval / Issue #283 / PR #293 — whitespace-only IDs.
   // Strings tipo `'   '` ou `'\t'` passam o check truthy mas geram namespace
   // anômalo determinístico — colisão silenciosa entre contextos malformados.
-  // Overlap consciente com PR #293 (fix central também rejeita whitespace).
+  // Fix central em assertTruthyContext (PR #293) rejeita whitespace-only
+  // E strings com whitespace ao redor (contrato strict, sem trim implícito).
   // -------------------------------------------------------------------------
-  describe('PR #272 reval / #283 — whitespace-only tenant_id / agent_id', () => {
-    it('getCurrentTenant lança quando tenant_id é whitespace-only', async () => {
+  describe('PR #272 reval / #283 / #293 — whitespace-only tenant_id / agent_id', () => {
+    it('getCurrentTenant lança quando tenant_id é whitespace-only (spaces)', async () => {
       await runWithTenantContext({ tenant_id: '   ', agent_id: 'sofia' }, async () => {
         expect(() => getCurrentTenant()).toThrow(MissingTenantContextError);
       });
@@ -147,7 +157,25 @@ describe('tenant-context', () => {
       });
     });
 
-    it('getCurrentAgent lança quando agent_id é whitespace-only', async () => {
+    it('rejeita tenant_id whitespace-only (tab)', async () => {
+      await runWithTenantContext({ tenant_id: '\t', agent_id: 'sofia' }, async () => {
+        expect(() => getCurrentTenant()).toThrow(MissingTenantContextError);
+      });
+    });
+
+    it('rejeita tenant_id whitespace-only (newline)', async () => {
+      await runWithTenantContext({ tenant_id: '\n', agent_id: 'sofia' }, async () => {
+        expect(() => getCurrentTenant()).toThrow(MissingTenantContextError);
+      });
+    });
+
+    it('rejeita tenant_id whitespace-only (mixed: tab+newline+space)', async () => {
+      await runWithTenantContext({ tenant_id: '\t\n  ', agent_id: 'sofia' }, async () => {
+        expect(() => getCurrentTenant()).toThrow(MissingTenantContextError);
+      });
+    });
+
+    it('getCurrentAgent lança quando agent_id é whitespace-only (spaces)', async () => {
       await runWithTenantContext({ tenant_id: 'acme', agent_id: '   ' }, async () => {
         expect(() => getCurrentAgent()).toThrow(MissingTenantContextError);
       });
@@ -159,6 +187,46 @@ describe('tenant-context', () => {
       });
     });
 
+    it('rejeita agent_id whitespace-only (tab)', async () => {
+      await runWithTenantContext({ tenant_id: 'acme', agent_id: '\t' }, async () => {
+        expect(() => getCurrentAgent()).toThrow(MissingTenantContextError);
+      });
+    });
+
+    // Contrato: ' valid ' (whitespace ao redor) → REJECTED (strict, não trim)
+    it('rejeita tenant_id com whitespace ao redor (` valid `) — contrato strict', async () => {
+      await runWithTenantContext({ tenant_id: ' acme ', agent_id: 'sofia' }, async () => {
+        expect(() => getCurrentTenant()).toThrow(MissingTenantContextError);
+      });
+    });
+
+    it('rejeita agent_id com leading whitespace', async () => {
+      await runWithTenantContext({ tenant_id: 'acme', agent_id: ' sofia' }, async () => {
+        expect(() => getCurrentAgent()).toThrow(MissingTenantContextError);
+      });
+    });
+
+    it('rejeita agent_id com trailing whitespace', async () => {
+      await runWithTenantContext({ tenant_id: 'acme', agent_id: 'sofia\t' }, async () => {
+        expect(() => getCurrentAgent()).toThrow(MissingTenantContextError);
+      });
+    });
+
+    it('aceita strings normalizadas (sem whitespace ao redor)', async () => {
+      await runWithTenantContext({ tenant_id: 'acme', agent_id: 'sofia' }, async () => {
+        expect(getCurrentTenant()).toBe('acme');
+        expect(getCurrentAgent()).toBe('sofia');
+      });
+    });
+
+    it('aceita strings com whitespace interno (não ao redor) — `acme inc`', async () => {
+      // Whitespace interno é válido — só rejeitamos leading/trailing.
+      await runWithTenantContext({ tenant_id: 'acme inc', agent_id: 'sofia bot' }, async () => {
+        expect(getCurrentTenant()).toBe('acme inc');
+        expect(getCurrentAgent()).toBe('sofia bot');
+      });
+    });
+
     it('tryGetCurrentContext retorna null quando tenant_id é whitespace-only', async () => {
       await runWithTenantContext({ tenant_id: '   ', agent_id: 'sofia' }, async () => {
         expect(tryGetCurrentContext()).toBeNull();
@@ -167,6 +235,12 @@ describe('tenant-context', () => {
 
     it('tryGetCurrentContext retorna null quando agent_id é whitespace-only', async () => {
       await runWithTenantContext({ tenant_id: 'acme', agent_id: '\t' }, async () => {
+        expect(tryGetCurrentContext()).toBeNull();
+      });
+    });
+
+    it('tryGetCurrentContext retorna null quando tenant_id tem whitespace ao redor', async () => {
+      await runWithTenantContext({ tenant_id: ' acme ', agent_id: 'sofia' }, async () => {
         expect(tryGetCurrentContext()).toBeNull();
       });
     });
@@ -184,8 +258,33 @@ describe('tenant-context', () => {
     });
   });
 
+  // tryGetCurrentContext semantics adicionais (consistente com asserts dos getters)
+  describe('tryGetCurrentContext — semantics', () => {
+    it('retorna null fora de contexto ALS', () => {
+      expect(tryGetCurrentContext()).toBeNull();
+    });
+
+    it('retorna ctx válido quando dentro de runWithTenantContext', async () => {
+      await runWithTenantContext({ tenant_id: 'acme', agent_id: 'sofia' }, async () => {
+        expect(tryGetCurrentContext()).toEqual({ tenant_id: 'acme', agent_id: 'sofia' });
+      });
+    });
+
+    it('retorna null quando tenant_id é empty string (preserva #269)', async () => {
+      await runWithTenantContext({ tenant_id: '', agent_id: 'sofia' }, async () => {
+        expect(tryGetCurrentContext()).toBeNull();
+      });
+    });
+
+    it('retorna null quando tenant_id é non-string (preserva #269)', async () => {
+      await runWithTenantContext({ tenant_id: null as any, agent_id: 'sofia' }, async () => {
+        expect(tryGetCurrentContext()).toBeNull();
+      });
+    });
+  });
+
   // -------------------------------------------------------------------------
-  // Issue #282 — literal 'default' rejection
+  // Issue #282 / PR #296 — literal 'default' rejection
   //
   // Layered defense against silent synthetic-context leak from the legacy
   // sentinel `{tenant_id:'default', agent_id:'default'}`. Default mode meters
@@ -258,18 +357,65 @@ describe('tenant-context', () => {
       expect(incCounterMock).not.toHaveBeenCalled();
     });
 
-    it('tryGetCurrentContext meters literal "default" but still returns the context', async () => {
+    // PR #293 review (blocker 2): tryGetCurrentContext is routed through the
+    // SAME helpers as the strict getters and is fail-closed. With the flag ON,
+    // a 'default' literal must NOT yield a usable context — it returns null so
+    // callers take their missing-context branch instead of getting a synthetic
+    // cross-tenant-readable scope.
+    it('opt-in mode: tryGetCurrentContext returns null (fail-closed) on default/default', async () => {
+      process.env.MAIA_REJECT_DEFAULT_LITERAL = 'true';
+      let observed: ReturnType<typeof tryGetCurrentContext> | undefined;
+      await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+        observed = tryGetCurrentContext();
+      });
+      expect(observed).toBeNull();
+      // Metering still fires (via the shared assertNotDefaultLiteral helper)
+      // before the throw that drives the null — tenant_id is checked first and
+      // short-circuits, so at least the tenant_id field is metered.
+      const calls = incCounterMock.mock.calls.filter(
+        (c) => c[0] === 'maia_tenant_id_default_literal_total',
+      );
+      expect(calls.length).toBeGreaterThanOrEqual(1);
+      expect(calls.some((c) => c[1]?.field === 'tenant_id')).toBe(true);
+    });
+
+    it('opt-in mode: tryGetCurrentContext returns null when only agent_id is default', async () => {
+      process.env.MAIA_REJECT_DEFAULT_LITERAL = 'true';
+      let observed: ReturnType<typeof tryGetCurrentContext> | undefined;
+      await runWithTenantContext({ tenant_id: 'acme', agent_id: 'default' }, async () => {
+        observed = tryGetCurrentContext();
+      });
+      expect(observed).toBeNull();
+    });
+
+    // Flag OFF: the 'default' literal is metered but (since the shape checks
+    // pass) the context is still returned — preserving the observability
+    // rollout. Confirms tryGetCurrentContext reuses the shared metering helper.
+    it('default mode: tryGetCurrentContext meters default/default but still returns it', async () => {
       let observed: ReturnType<typeof tryGetCurrentContext> | undefined;
       await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
         observed = tryGetCurrentContext();
       });
       expect(observed).toEqual({ tenant_id: 'default', agent_id: 'default' });
-      // Both fields are 'default', so the counter should be incremented for both.
       const calls = incCounterMock.mock.calls.filter(
         (c) => c[0] === 'maia_tenant_id_default_literal_total',
       );
-      expect(calls.length).toBeGreaterThanOrEqual(2);
-      expect(calls.every((c) => c[1]?.via === 'tryGetCurrentContext')).toBe(true);
+      // Both fields metered (no throw short-circuits when the flag is off).
+      expect(calls.some((c) => c[1]?.field === 'tenant_id')).toBe(true);
+      expect(calls.some((c) => c[1]?.field === 'agent_id')).toBe(true);
+    });
+
+    // PR #293 review (blocker 3): surrounding-whitespace rejection at THIS call
+    // site (the strict getters already cover it via assertTruthyContext; verify
+    // the try variant rejects it too rather than handing back a padded id that
+    // would collide/diverge in cache-key namespaces). Independent of the flag.
+    it('tryGetCurrentContext returns null on surrounding-whitespace agent_id (flag on)', async () => {
+      process.env.MAIA_REJECT_DEFAULT_LITERAL = 'true';
+      let observed: ReturnType<typeof tryGetCurrentContext> | undefined;
+      await runWithTenantContext({ tenant_id: 'acme', agent_id: ' sofia ' }, async () => {
+        observed = tryGetCurrentContext();
+      });
+      expect(observed).toBeNull();
     });
 
     it('flag is read at access time, not module-load time', async () => {
