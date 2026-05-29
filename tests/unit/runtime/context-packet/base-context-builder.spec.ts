@@ -4,12 +4,13 @@
  * Builder must produce a BaseContextPacket in <100ms with stable HMACs and
  * a feature flag snapshot captured at entry time.
  */
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
   BaseContextBuilder,
   type FeatureFlagsPort,
   type IdentityResolverPort,
 } from '@/runtime/context-packet/base-context-builder.js';
+import { DefaultLiteralRejectedError } from '@/db/tenant-context.js';
 
 const mockResolver: IdentityResolverPort = {
   async resolve(_channel_id: string) {
@@ -151,6 +152,12 @@ describe('BaseContextBuilder', () => {
  * module.
  */
 describe('BaseContextBuilder — issue #282 fail-loud default resolver', () => {
+  // The passthrough-resolver case below depends on the flag being OFF (meter-
+  // only). Guard against env leakage from other tests/files (issue #315).
+  beforeEach(() => {
+    delete process.env.MAIA_REJECT_DEFAULT_LITERAL;
+  });
+
   it('default constructor (no resolver injected) throws when build() must resolve', async () => {
     const noFlags: FeatureFlagsPort = {
       async snapshot() {
@@ -232,7 +239,103 @@ describe('BaseContextBuilder — issue #282 fail-loud default resolver', () => {
     // Confirms the fixture preserves the legacy `default/default` shape so
     // tests that depended on it can opt in explicitly. assertTruthyContext
     // in tenant-context.ts is the second line of defence at ALS read time.
+    // (Flag is OFF here → builder meters but does not throw — issue #315.)
     expect(base.tenant_id).toBe('default');
     expect(base.agent_id).toBe('default');
+  });
+});
+
+/**
+ * Issue #315 — BaseContextBuilder rejects the literal 'default' tenant/agent.
+ *
+ * The builder reuses the SAME `assertNotDefaultLiteral` helper as the ALS
+ * read-time getters, so it shares one flag (`MAIA_REJECT_DEFAULT_LITERAL`),
+ * one counter (`maia_tenant_id_default_literal_total`), and one error type
+ * (`DefaultLiteralRejectedError`). Behaviour is opt-in: meter-only by default,
+ * hard throw when the flag is on (kept opt-in until every legacy worker /
+ * single-tenant path is migrated off the `default/default` sentinel).
+ */
+describe("BaseContextBuilder — issue #315 'default' literal rejection", () => {
+  const noFlags: FeatureFlagsPort = {
+    async snapshot() {
+      return {};
+    },
+  };
+  const sentinelResolver: IdentityResolverPort = {
+    async resolve() {
+      return { tenant_id: 'default', agent_id: 'default' };
+    },
+  };
+
+  beforeEach(() => {
+    delete process.env.MAIA_REJECT_DEFAULT_LITERAL;
+  });
+  afterEach(() => {
+    delete process.env.MAIA_REJECT_DEFAULT_LITERAL;
+  });
+
+  it('default mode (flag off): meters but does NOT throw on default/default', async () => {
+    const builder = new BaseContextBuilder(sentinelResolver, noFlags);
+    const base = await builder.build({
+      raw_input: { type: 'text' },
+      channel_id: 'ch1',
+      received_at: new Date(),
+    });
+    expect(base.tenant_id).toBe('default');
+    expect(base.agent_id).toBe('default');
+  });
+
+  it('opt-in mode (flag on): throws DefaultLiteralRejectedError on resolved default tenant', async () => {
+    process.env.MAIA_REJECT_DEFAULT_LITERAL = 'true';
+    const builder = new BaseContextBuilder(sentinelResolver, noFlags);
+    await expect(
+      builder.build({
+        raw_input: { type: 'text' },
+        channel_id: 'ch1',
+        received_at: new Date(),
+      }),
+    ).rejects.toThrow(DefaultLiteralRejectedError);
+  });
+
+  it('opt-in mode: throws on a pre-resolved default tenant_id (no resolver call)', async () => {
+    process.env.MAIA_REJECT_DEFAULT_LITERAL = 'true';
+    const builder = new BaseContextBuilder(undefined, noFlags);
+    await expect(
+      builder.build({
+        raw_input: { type: 'text' },
+        channel_id: 'ch1',
+        received_at: new Date(),
+        tenant_id: 'default',
+        agent_id: 'real_agent',
+      }),
+    ).rejects.toThrow(DefaultLiteralRejectedError);
+  });
+
+  it('opt-in mode: throws on a pre-resolved default agent_id', async () => {
+    process.env.MAIA_REJECT_DEFAULT_LITERAL = 'true';
+    const builder = new BaseContextBuilder(undefined, noFlags);
+    await expect(
+      builder.build({
+        raw_input: { type: 'text' },
+        channel_id: 'ch1',
+        received_at: new Date(),
+        tenant_id: 'real_tenant',
+        agent_id: 'default',
+      }),
+    ).rejects.toThrow(DefaultLiteralRejectedError);
+  });
+
+  it('opt-in mode: a real tenant/agent pair still builds (guard only fires on the sentinel)', async () => {
+    process.env.MAIA_REJECT_DEFAULT_LITERAL = 'true';
+    const builder = new BaseContextBuilder(undefined, noFlags);
+    const base = await builder.build({
+      raw_input: { type: 'text' },
+      channel_id: 'ch1',
+      received_at: new Date(),
+      tenant_id: 'acme_corp',
+      agent_id: 'sofia_v1',
+    });
+    expect(base.tenant_id).toBe('acme_corp');
+    expect(base.agent_id).toBe('sofia_v1');
   });
 });
