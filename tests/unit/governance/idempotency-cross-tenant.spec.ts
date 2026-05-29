@@ -726,4 +726,43 @@ describe('Issue #261 — idempotencyRepo.lookup + .store are tenant/agent-scoped
     );
     expect(missOther).toBeNull();
   });
+
+  it('COEXISTENCE (#298 + #299) — an in_progress row with a MATCHING payload_hash is still a miss', async () => {
+    // #298 added `state` + the `ne(state, 'in_progress')` filter to lookup;
+    // #299 added payload_hash revalidation. They must compose: an in-flight
+    // reservation (state='in_progress') must NOT surface as a cache hit even
+    // when scope AND payload_hash both match — there's no result yet, so
+    // returning it would skip execution and hand back undefined.
+    const inFlightKey = 'in-flight-key';
+    store.push({
+      key: inFlightKey,
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-A',
+      tool_name: 'register_transaction',
+      operation_type: 'create',
+      pessoa_id: 'pA',
+      entity_id: 'eA',
+      payload_hash: inFlightKey, // MATCHES the lookup below
+      file_sha256: null,
+      resultado: null,
+      state: 'in_progress',
+      created_at: new Date(),
+    });
+    const { idempotencyRepo } = await import('@/db/repositories.js');
+    const hit = await runWithTenantContext(A_CTX, async () =>
+      idempotencyRepo.lookup({ key: inFlightKey, payload_hash: inFlightKey }),
+    );
+    // Filtered out by `ne(state, 'in_progress')` BEFORE the hash check ever
+    // matters — exact-once contract preserved.
+    expect(hit).toBeNull();
+
+    // Sanity: the SAME row transitioned to 'completed' WOULD hit (proves the
+    // miss above is the state filter, not an unrelated mismatch).
+    store[store.length - 1]!.state = 'completed';
+    store[store.length - 1]!.resultado = { ok: 'now-complete' };
+    const hitAfterComplete = await runWithTenantContext(A_CTX, async () =>
+      idempotencyRepo.lookup({ key: inFlightKey, payload_hash: inFlightKey }),
+    );
+    expect(hitAfterComplete).toEqual({ ok: 'now-complete' });
+  });
 });

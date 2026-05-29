@@ -1,0 +1,54 @@
+-- maia:no-transaction
+-- =====================================================================
+-- Maia — Migration 067 (Issue #292, PR #306 Codex review NTH)
+-- Sweeper hot-path covering index for outbound_messages.
+--
+-- Why
+-- ---
+-- The outbound_messages sweeper (src/workers/outbound-messages-sweeper.ts)
+-- runs every 5 minutes and issues, per (tenant_id, agent_id):
+--
+--   (A) stale-pending recovery:
+--       WHERE tenant_id = $1 AND agent_id = $2
+--         AND status = 'pending'
+--         AND created_at < now() - <cutoff>
+--       ORDER BY created_at ASC LIMIT <n> FOR UPDATE SKIP LOCKED
+--
+--   (B) retention cleanup (bounded batched delete):
+--       WHERE tenant_id = $1 AND agent_id = $2
+--         AND status IN ('sent','failed','unknown')
+--         AND created_at < now() - <cutoff>
+--       ORDER BY created_at ASC LIMIT <n> FOR UPDATE SKIP LOCKED
+--
+-- The pre-existing index `idx_outbound_messages_tenant_created` is only
+-- (tenant_id, created_at) — it omits agent_id AND status, so for a sweep
+-- scoped to a single (tenant, agent) the planner falls back to filtering
+-- status + agent_id on the heap. As outbound_messages grows (one row per
+-- inbound turn, retained 30d by default) that turns each sweep pass into a
+-- range scan that reads + discards every other agent's / status's rows in
+-- the tenant.
+--
+-- This composite (tenant_id, agent_id, status, created_at) lets the three
+-- equality columns anchor the index probe and created_at back BOTH the
+-- range predicate (`created_at < cutoff`) and the `ORDER BY created_at ASC`
+-- that the per-tenant LIMIT walks — so the LIMIT can stop early instead of
+-- sorting the heap. It also covers the dispatcher enumeration
+-- (`listTenantsWithWork`), whose status/created_at predicate now has a
+-- leading-column index per (tenant_id, agent_id) bucket.
+--
+-- Concurrency
+-- -----------
+-- CREATE INDEX CONCURRENTLY so the index builds against the live table
+-- without an ACCESS EXCLUSIVE lock (outbound_messages is on the synchronous
+-- reply hot path). The `-- maia:no-transaction` marker tells the migration
+-- runner (scripts/migrate.ts) to apply this file OUTSIDE a BEGIN/COMMIT
+-- envelope — PostgreSQL rejects CONCURRENTLY inside a transaction block
+-- (error 25001). Single statement, one-per-`;`, IF NOT EXISTS for
+-- idempotent re-runs (see scripts/migrate.ts splitNoTxStatements).
+--
+-- WARNING — manual application: if running this file via `psql -f`, do NOT
+-- wrap it in BEGIN/COMMIT. The runner already handles the no-tx semantics.
+-- =====================================================================
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_outbound_messages_tenant_agent_status_created
+  ON outbound_messages (tenant_id, agent_id, status, created_at);

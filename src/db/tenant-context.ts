@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'async_hooks';
+import { incCounter } from '@/lib/metrics.js';
 
 export class MissingTenantContextError extends Error {
   // Error code estável (não-traduzível) pra UI/dashboards que precisem
@@ -15,12 +16,45 @@ export class MissingTenantContextError extends Error {
   }
 }
 
+/**
+ * Distinct error for `'default'` literal rejection (issue #282).
+ *
+ * Surfaces a separate code so dashboards/alerts can distinguish "no ALS at
+ * all" (`MISSING_TENANT_CONTEXT`) from "ALS carries the legacy sentinel"
+ * (`TENANT_ID_DEFAULT_LITERAL_REJECTED`). The latter signals a path that
+ * SHOULD have been migrated to a real tenant/agent pair (per the inviolable
+ * isolation invariant) but wasn't.
+ *
+ * Throw behaviour is opt-in via `MAIA_REJECT_DEFAULT_LITERAL=true` so we can
+ * land the warning+metric observability first, watch the counter in
+ * production, and flip the throw on once every legacy path is migrated.
+ */
+export class DefaultLiteralRejectedError extends Error {
+  readonly code = 'TENANT_ID_DEFAULT_LITERAL_REJECTED';
+
+  constructor(field: 'tenant_id' | 'agent_id') {
+    super(
+      `Tenant context carries literal 'default' for ${field} — this sentinel was reachable from legacy paths and violates the inviolable multi-tenant isolation invariant. ` +
+        `Migrate the caller to a real ${field} or remove the synthetic context.`,
+    );
+    this.name = 'DefaultLiteralRejectedError';
+  }
+}
+
 type TenantContext = {
   tenant_id: string;
   agent_id: string;
 };
 
 const storage = new AsyncLocalStorage<TenantContext>();
+
+/**
+ * Read the opt-in flag at access time (NOT module-load time) so tests can
+ * flip it per-case without re-importing.
+ */
+function shouldThrowOnDefaultLiteral(): boolean {
+  return process.env.MAIA_REJECT_DEFAULT_LITERAL === 'true';
+}
 
 export async function runWithTenantContext<T>(
   ctx: TenantContext,
@@ -51,6 +85,16 @@ export async function runWithTenantContext<T>(
 // primeiro, este diff vira no-op (mesma validação, msg ligeiramente diferente).
 // Se este mergear primeiro, #293 resolve trivialmente. Sem conflito semântico.
 //
+// **Literal `'default'` rejection (issue #282):** the legacy sentinel
+// `{tenant_id:'default', agent_id:'default'}` was reachable from several
+// paths (channel-resolver fallback, base-context-builder DI default,
+// worker scaffolding) and creates a synthetic shared context that
+// violates tenant isolation. Until every legacy path is migrated
+// (#268/#277, #240/#251, #262/#269, etc.), this guard emits a warning
+// + metric so operators can watch the counter. Once the counter is
+// flat at zero, owners can flip `MAIA_REJECT_DEFAULT_LITERAL=true` to
+// promote to a hard throw.
+//
 // PRs #269 + #272 review (Codex reval) — close the gap before merge.
 function assertTruthyContext(ctx: TenantContext): void {
   if (!ctx.tenant_id || typeof ctx.tenant_id !== 'string') {
@@ -64,6 +108,20 @@ function assertTruthyContext(ctx: TenantContext): void {
   }
   if (ctx.agent_id.trim().length === 0) {
     throw new MissingTenantContextError('agent_id is whitespace-only');
+  }
+  // Issue #282: reject (or warn-meter) the legacy `'default'` literal so any
+  // production path reaching it surfaces in metrics/alerts.
+  if (ctx.tenant_id === 'default') {
+    incCounter('maia_tenant_id_default_literal_total', { field: 'tenant_id' });
+    if (shouldThrowOnDefaultLiteral()) {
+      throw new DefaultLiteralRejectedError('tenant_id');
+    }
+  }
+  if (ctx.agent_id === 'default') {
+    incCounter('maia_tenant_id_default_literal_total', { field: 'agent_id' });
+    if (shouldThrowOnDefaultLiteral()) {
+      throw new DefaultLiteralRejectedError('agent_id');
+    }
   }
 }
 
@@ -98,6 +156,21 @@ export function tryGetCurrentContext(): TenantContext | null {
     ctx.agent_id.trim().length === 0
   ) {
     return null;
+  }
+  // Mirror the literal-default observability of the strict getters: meter
+  // when callers receive a `default/default` context via the try variant so
+  // the counter captures every path, not just the strict ones.
+  if (ctx.tenant_id === 'default') {
+    incCounter('maia_tenant_id_default_literal_total', {
+      field: 'tenant_id',
+      via: 'tryGetCurrentContext',
+    });
+  }
+  if (ctx.agent_id === 'default') {
+    incCounter('maia_tenant_id_default_literal_total', {
+      field: 'agent_id',
+      via: 'tryGetCurrentContext',
+    });
   }
   return ctx;
 }

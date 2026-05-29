@@ -1,0 +1,92 @@
+# Prometheus alerting rules — Redis memory pressure (issue #297).
+#
+# Source of truth for the alerts documented in docs/runbooks/redis.md §4.
+# The runbook narrates the operator reaction; THIS file is the committed,
+# loadable config. Keep the two in sync — if a threshold changes here, update
+# the runbook table and the collector constants
+# (src/observability/redis-memory-collector.ts: CRITICAL_MEMORY_USED_RATIO,
+# and the readiness gate in src/lib/healthcheck.ts).
+#
+# Metrics are exposed by src/observability/redis-memory-collector.ts on
+# /metrics (no labels — Redis-wide; see runbook §4 for the cardinality note).
+#
+# Wiring: load via Prometheus `rule_files` (the deployment's prometheus.yml
+# references this path), e.g.
+#
+#   rule_files:
+#     - /etc/prometheus/rules/redis.rules.yml   # this file
+#
+# In the docker-compose-based deploy, mount it read-only into the Prometheus
+# container at that path and add the `rule_files` entry. See runbook §4
+# ("Como ativar estas regras") for the exact compose/Prometheus snippet.
+groups:
+  - name: redis_memory_pressure
+    interval: 30s
+    rules:
+      - alert: RedisMemoryPressureWarning
+        expr: redis_memory_used_ratio > 0.80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis a {{ $value | humanizePercentage }} do maxmemory"
+          description: |
+            Investigar crescimento de cache (working memory leak?
+            BullMQ buffer crescente?) antes de aumentar o cap.
+            Runbook: docs/runbooks/redis.md §3 (sizing).
+
+      - alert: RedisMemoryPressureCritical
+        expr: redis_memory_used_ratio > 0.95
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis CRITICAL: writes vão falhar em breve (noeviction ativo)"
+          description: |
+            Política `noeviction` (ver §1) transforma OOM em write failures.
+            BullMQ enqueue → DLQ; idempotency ledger → outbound abortado;
+            working memory write → cache miss + reconstrução via Postgres.
+            Ação imediata: aumentar `maxmemory` no compose/painel +
+            investigar leak. Ver §5 ("Não-fazer").
+            NB: o endpoint /readyz já retorna 503 acima de 0.95 — o LB
+            deveria estar drenando esta instância (ver §4).
+
+      - alert: RedisEvictionDetected
+        expr: redis_evicted_keys_total > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis evicted_keys > 0 sob noeviction — config drift"
+          description: |
+            Sob `maxmemory-policy noeviction` evicted_keys DEVE ficar em 0.
+            Qualquer valor positivo significa que alguém mudou a política em
+            runtime (`CONFIG SET maxmemory-policy ...`) — risco de eviction
+            cross-tenant (ver §1). Auditar `audit_log` e histórico de deploy
+            imediatamente.
+
+      - alert: RedisEvictionRising
+        expr: increase(redis_evicted_keys_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis evicted_keys subindo nos últimos 5min — eviction ativa"
+          description: |
+            `evicted_keys` está aumentando (não apenas > 0 desde o restart):
+            há eviction acontecendo AGORA sob uma política que não deveria
+            evictar. Mesmo gatilho de config drift que RedisEvictionDetected,
+            porém detecta o caso em que o counter já era > 0 no boot.
+            Auditar `CONFIG GET maxmemory-policy` imediatamente.
+
+      - alert: RedisRejectedConnectionsRising
+        expr: increase(redis_rejected_connections_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis rejeitou conexões nos últimos 5min"
+          description: |
+            Pode indicar pressure no `maxclients` ou OOM (Redis rejeita
+            novas conexões quando memory > maxmemory). Cross-check com
+            `redis_memory_used_ratio` — se ambos subindo, é OOM iminente.

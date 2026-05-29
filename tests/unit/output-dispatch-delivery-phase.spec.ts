@@ -148,11 +148,16 @@ describe('dispatchOutput — delivery-phase tagging (HIGH-1)', () => {
     expect(m.sendOutboundText).not.toHaveBeenCalled();
   });
 
-  it('text channel send throws (pre-send) ⇒ delivered:false (the crux path)', async () => {
+  it('text channel transport throw ⇒ delivered:true (ledger=unknown blocks re-send)', async () => {
+    // #238 Improvement 1: a transport throw is ambiguous (could be
+    // delivered-but-threw) → ledger records 'unknown' AND the boundary guard
+    // blocks any re-send, so the outer signal carries delivered:true so the
+    // skill caller maps to `sent_no_persist`/`handled:true` and SKIPS the
+    // wasted ReAct fall-through. No double-send risk: the row is 'unknown'.
     m.sendOutboundText.mockRejectedValue(new Error('socket_closed'));
     const err = await dispatchOutput(mkCtx()).catch((e) => e);
     expect(err).toBeInstanceOf(OutboundDeliveryError);
-    expect((err as OutboundDeliveryError).delivered).toBe(false);
+    expect((err as OutboundDeliveryError).delivered).toBe(true);
     expect(m.createMensagem).not.toHaveBeenCalled(); // never persisted
   });
 
@@ -165,12 +170,15 @@ describe('dispatchOutput — delivery-phase tagging (HIGH-1)', () => {
     expect(m.sendOutboundText).toHaveBeenCalledOnce(); // sent exactly once
   });
 
-  it('voice channel send throws (pre-send) ⇒ delivered:false', async () => {
+  it('voice channel transport throw ⇒ delivered:true (ledger=unknown blocks re-send)', async () => {
+    // #238 Improvement 1: see text counterpart. Ambiguous transport throw →
+    // delivered:true so the skill caller skips the ReAct fall-through (the
+    // boundary guard would block it anyway).
     cfg.FEATURE_OUTBOUND_VOICE = true;
     m.sendOutboundVoice.mockRejectedValue(new Error('voice_socket_closed'));
     const err = await dispatchOutput(mkCtx({ inbound: audioInbound })).catch((e) => e);
     expect(err).toBeInstanceOf(OutboundDeliveryError);
-    expect((err as OutboundDeliveryError).delivered).toBe(false);
+    expect((err as OutboundDeliveryError).delivered).toBe(true);
     expect(m.createMensagem).not.toHaveBeenCalled();
   });
 
@@ -279,11 +287,16 @@ describe('dispatchOutput — PDF + poll phase tagging (Codex #216 round-3)', () 
       },
     });
 
-  it('document send throws (pre-send) ⇒ delivered:false, nothing persisted', async () => {
+  it('document transport throw (no DOC_READ_FAILED code) ⇒ delivered:true (ledger=unknown blocks re-send)', async () => {
+    // #238 Improvement 1: a transport throw without the DOC_READ_FAILED tag
+    // is ambiguous (could be delivered-but-threw) → ledger 'unknown', and the
+    // outer signal carries delivered:true so the skill caller skips the
+    // wasted ReAct fall-through. The DOC_READ_FAILED branch (separate test
+    // below) keeps delivered:false (genuine pre-send, retry safe).
     m.sendOutboundDocument.mockRejectedValue(new Error('doc_socket_closed'));
     const err = await dispatchOutput(pdfCtx()).catch((e) => e);
     expect(err).toBeInstanceOf(OutboundDeliveryError);
-    expect((err as OutboundDeliveryError).delivered).toBe(false);
+    expect((err as OutboundDeliveryError).delivered).toBe(true);
     expect(m.createMensagem).not.toHaveBeenCalled();
   });
 
@@ -316,12 +329,15 @@ describe('dispatchOutput — PDF + poll phase tagging (Codex #216 round-3)', () 
     expect(m.sendPoll).not.toHaveBeenCalled();
   });
 
-  it('poll send throws (pre-send) ⇒ delivered:false', async () => {
+  it('poll transport throw ⇒ delivered:true (ledger=unknown blocks re-send)', async () => {
+    // #238 Improvement 1: ambiguous transport throw → delivered:true so the
+    // skill caller skips the ReAct fall-through (boundary guard would block
+    // it anyway). pre-send recipient lookup (above) stays delivered:false.
     cfg.FEATURE_ONE_TAP = true;
     m.sendPoll.mockRejectedValue(new Error('poll_socket_closed'));
     const err = await dispatchOutput(mkCtx({ latestPending: pollPending })).catch((e) => e);
     expect(err).toBeInstanceOf(OutboundDeliveryError);
-    expect((err as OutboundDeliveryError).delivered).toBe(false);
+    expect((err as OutboundDeliveryError).delivered).toBe(true);
     expect(m.createMensagem).not.toHaveBeenCalled();
   });
 
@@ -452,11 +468,16 @@ describe('dispatchOutput — text ledger wiring (#227 FEATURE_OUTBOUND_DEDUP)', 
     expect(m.createMensagem).not.toHaveBeenCalled();
   });
 
-  it('transport throw ⇒ markFailed(ambiguous=true) ⇒ throws delivered:false (re-attempt blocked by boundary guard)', async () => {
+  it('transport throw ⇒ markFailed(ambiguous=true) ⇒ throws delivered:true (skill caller skips ReAct fall-through)', async () => {
+    // #238 Improvement 1: transport throw is ambiguous → ledger 'unknown'
+    // AND outer delivered:true so safeDispatchOutput maps to
+    // `sent_no_persist` → executeSelectedSkill returns `handled:true`. No
+    // ReAct turn started. No double-send risk: row is 'unknown', boundary
+    // guard would block re-send anyway. Saves the wasted LLM call.
     m.sendOutboundText.mockRejectedValue(new Error('socket_closed'));
     const err = await dispatchOutput(mkCtx()).catch((e) => e);
     expect(err).toBeInstanceOf(OutboundDeliveryError);
-    expect((err as OutboundDeliveryError).delivered).toBe(false);
+    expect((err as OutboundDeliveryError).delivered).toBe(true);
     expect(m.markFailed).toHaveBeenCalledWith(
       'c_1:msg_1',
       'socket_closed',
@@ -559,13 +580,18 @@ describe('dispatchOutput — document discriminator (#227 DOC_READ_FAILED)', () 
     );
   });
 
-  it('transport throw (no code) ⇒ markFailed(ambiguous=true) — re-attempt blocked', async () => {
+  it('transport throw (no code) ⇒ markFailed(ambiguous=true) + delivered:true (skill caller skips ReAct fall-through)', async () => {
     // socket.sendMessage failures could be delivered-but-threw → conservative
     // 'unknown' to avoid double-send.
+    //
+    // #238 Improvement 1: outer signal is delivered:true so safeDispatchOutput
+    // maps to `sent_no_persist` → executeSelectedSkill returns `handled:true`
+    // and ReAct is NOT started. No double-send risk: row is 'unknown',
+    // boundary guard would block ReAct's own dispatch anyway.
     m.sendOutboundDocument.mockRejectedValue(new Error('socket_send_failed'));
     const err = await dispatchOutput(pdfCtx()).catch((e) => e);
     expect(err).toBeInstanceOf(OutboundDeliveryError);
-    expect((err as OutboundDeliveryError).delivered).toBe(false);
+    expect((err as OutboundDeliveryError).delivered).toBe(true);
     expect(m.markFailed).toHaveBeenCalledWith(
       'c_1:msg_1',
       'socket_send_failed',
@@ -615,11 +641,15 @@ describe('dispatchOutput — fail-open on claim throw (#227 blocker 6)', () => {
   it('upsertPending throws then transport throws ⇒ both fail-open paths converge cleanly', async () => {
     // Defensive: even with the claim fail-open AND a transport throw, we end
     // up in markFailed(ambiguous=true) — the boundary guard for next time.
+    //
+    // #238 Improvement 1: outer signal is delivered:true on a transport
+    // throw (ambiguous → ledger 'unknown'); see the dedicated text-ledger
+    // transport-throw test above for the full rationale.
     m.upsertPending.mockRejectedValue(new Error('claim_db_throw'));
     m.sendOutboundText.mockRejectedValue(new Error('socket_closed'));
     const err = await dispatchOutput(mkCtx()).catch((e) => e);
     expect(err).toBeInstanceOf(OutboundDeliveryError);
-    expect((err as OutboundDeliveryError).delivered).toBe(false);
+    expect((err as OutboundDeliveryError).delivered).toBe(true);
     expect(m.markFailed).toHaveBeenCalledWith(
       'c_1:msg_1',
       'socket_closed',

@@ -51,6 +51,33 @@ const POSTGRES_IMAGE = 'pgvector/pgvector:pg16';
  */
 const NO_TX_MARKER = /^[ \t]*--[ \t]*maia:no-transaction\b/m;
 
+/**
+ * Split a no-transaction migration into individual statements. Copied
+ * verbatim (in behaviour) from `scripts/migrate.ts` so the test schema is
+ * built bit-identically to production.
+ *
+ * Required because node-postgres' simple-query protocol wraps MULTIPLE
+ * statements sent in one `client.query()` call in an implicit
+ * transaction. A no-tx file with more than one `CREATE INDEX
+ * CONCURRENTLY` (e.g. migration 066) therefore still trips
+ * "CREATE INDEX CONCURRENTLY cannot run inside a transaction block"
+ * unless each statement is executed on its own. We strip `--` line
+ * comments and split on `;`.
+ *
+ * Constraint (same as the prod runner): no-tx migrations may ONLY contain
+ * simple `;`-terminated statements (CONCURRENTLY index DDL) — no
+ * dollar-quoted bodies or `;`-bearing string literals.
+ */
+function splitNoTxStatements(sql: string): string[] {
+  return sql
+    .split('\n')
+    .map((line) => line.replace(/--.*$/, ''))
+    .join('\n')
+    .split(';')
+    .map((stmt) => stmt.trim())
+    .filter((stmt) => stmt.length > 0);
+}
+
 export interface StartedPostgres {
   /** Started testcontainer handle; pass to `stopPostgresContainer` to tear down. */
   container: StartedPostgreSqlContainer;
@@ -89,6 +116,9 @@ async function findMigrationsDir(): Promise<string> {
  * scripts/migrate.ts:
  *   - sort .sql files lexically, skip *_down.sql
  *   - wrap in BEGIN/COMMIT unless `-- maia:no-transaction` marker is present
+ *   - for no-tx files, send each statement separately (node-postgres wraps
+ *     a multi-statement query in an implicit transaction, which
+ *     CONCURRENTLY rejects — see splitNoTxStatements)
  *   - record each applied migration in `schema_migrations`
  * Returns the number of migrations applied.
  */
@@ -117,7 +147,12 @@ async function applyMigrations(pool: pg.Pool): Promise<number> {
         await client.query('INSERT INTO schema_migrations (id) VALUES ($1)', [file]);
         await client.query('COMMIT');
       } else {
-        await client.query(sql);
+        // Execute each statement separately — node-postgres wraps a
+        // multi-statement query() in an implicit transaction, which
+        // CONCURRENTLY rejects. See splitNoTxStatements above.
+        for (const stmt of splitNoTxStatements(sql)) {
+          await client.query(stmt);
+        }
         await client.query(
           'INSERT INTO schema_migrations (id) VALUES ($1) ON CONFLICT (id) DO NOTHING',
           [file],

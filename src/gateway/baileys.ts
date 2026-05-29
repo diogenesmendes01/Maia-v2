@@ -28,18 +28,26 @@ import { routeMessageUpdate } from '@/agent/message-update.js';
 import type { WhatsAppInbound, WAQuotedContext } from './types.js';
 import { setupState } from '@/setup/state.js';
 import { triggerRecovery } from '@/setup/recovery.js';
+import { resolveScopeForJid } from './jid-tenant-resolver.js';
+import { featureFlags } from '@/config/feature-flags.js';
+import { FeatureFlagName } from '@/types/enums.js';
 
 /**
- * P0 default tenant context for the WhatsApp gateway. The current Baileys
- * deployment is single-tenant (the legacy Maia), so every inbound is mapped
- * to the seeded `'default'` tenant/agent. P6 introduces multi-channel/
- * multi-agent routing and will resolve the tenant from the channel config
- * BEFORE invoking `handleIncoming` / `routeMessageUpdate`.
+ * Legacy default tenant context for the WhatsApp gateway. Only used when
+ * the MULTI_CHANNEL feature flag is OFF (single-tenant operation). When the
+ * flag is ON, `messages.upsert` resolves the real (tenant_id, agent_id)
+ * from the inbound JID via `resolveScopeForJid` BEFORE invoking
+ * `handleIncoming` — see issue #290 for the runtime tenant-isolation
+ * contract this closes.
  *
- * Lives at module scope so the fix is one-line at each call site and easy
- * to swap in P6 (a single replacement point).
+ * Lives at module scope so the legacy fallback is a single named constant
+ * (no `'default'/'default'` string literal scattered through the dispatch
+ * path), making it grep-friendly in audits.
  */
-const BAILEYS_DEFAULT_CTX = { tenant_id: 'default', agent_id: 'default' } as const;
+const BAILEYS_LEGACY_DEFAULT_CTX = {
+  tenant_id: 'default',
+  agent_id: 'default',
+} as const;
 
 let socket: WASocket | null = null;
 let connected = false;
@@ -218,20 +226,76 @@ export async function startBaileys(): Promise<void> {
 
   socket.ev.on('connection.update', handleConnectionUpdate);
 
-  // P1: Baileys ingress entry-points wrap every callback in a tenant
-  // context. The repos called by `handleIncoming`/`routeMessageUpdate`
+  // Baileys ingress entry-points wrap every callback in a tenant context.
+  // The repos called by `handleIncoming`/`routeMessageUpdate`
   // (mensagensRepo.findByWhatsappId, createInbound, …) call
   // `getCurrentTenant()` and throw MissingTenantContextError when run
   // outside a context — without this wrap the try/catch below would log
-  // baileys.handle_failed and silently drop every inbound message in
-  // production. P0 single-tenant: 'default'/'default' literal; P6 will
-  // resolve the tuple from the channel/JID before invoking the handler.
+  // `baileys.handle_failed` and silently drop every inbound message in
+  // production.
+  //
+  // [Issue #290 — CRITICAL runtime tenant resolution]
+  // PRs #252/#253/#257/#258/#259/#264/#277 scoped the gateway downstream
+  // (rate-limit, dedup, bot-detection, debouncer, pub/sub, vision-cache)
+  // by `tenant_id`+`agent_id` read from the ALS. Before this fix, the
+  // upsert handler hardcoded `{tenant_id:'default', agent_id:'default'}`
+  // as the ALS context, which collapsed EVERY tenant's traffic into the
+  // same shared bucket in production:
+  //   - `maia:ratelimit:default:default:*` shared across tenants,
+  //   - `maia:dedup:default:default:*` shared across tenants,
+  //   - bot-detection windowed counters shared,
+  //   - debounce identities shared (same phone in tenant A would
+  //     debounce tenant B's pending message),
+  //   - …
+  // Tests passed because the adversarial fixtures inject ALS manually;
+  // production never resolved the real tenant at the entry point.
+  //
+  // POST-FIX (this block):
+  //   - Flag MULTI_CHANNEL OFF (legacy single-tenant prod) → preserve the
+  //     historical `default/default` wrap. No regression for the single-
+  //     tenant deployment that has run on this path since P0.
+  //   - Flag MULTI_CHANNEL ON → call `resolveScopeForJid` BEFORE
+  //     `handleIncoming`. The resolver reuses the same
+  //     `channelsRepo.findByExternalCrossTenant` policy as agent/core.ts
+  //     (single source of truth for channel ownership and the issue #268
+  //     fail-loud contract). On success, every downstream layer sees the
+  //     REAL (tenant_id, agent_id) via the ALS.
+  //   - Fail-closed on resolution failure (unknown JID, inactive channel,
+  //     ambiguous, malformed JID, DB error): emit
+  //     `channel_resolution_failed` audit (system bucket — `audit()`
+  //     auto-wraps when no ALS context is active) and DROP the message.
+  //     We do NOT fall back to `default/default` — that is exactly the
+  //     bypass issue #240/#268 closed downstream; reintroducing it here
+  //     would re-collapse all unknown traffic on a different code path.
+  //
+  // The agent worker's adoption step (`adoptToResolvedTenantCrossTenant`
+  // in `runAgentForMensagem`) becomes a true no-op once this fix is live —
+  // the inbound row is already persisted under the resolved tenant.
+  // That noop is idempotent (UPDATE writing identical values), so the
+  // worker's adoption code remains safe defense-in-depth for BullMQ
+  // retries and for the legacy MULTI_CHANNEL=OFF code path.
   socket.ev.on('messages.upsert', async ({ messages }) => {
     for (const msg of messages) {
+      // [Codex review #311 — B3] Reaction stubs arrive with
+      // `msg.message === undefined` (the payload is a `messageStubType`, not a
+      // content envelope). The previous `if (!msg.message) continue` ran BEFORE
+      // `handleIncoming`, so the `isReactionStub` branch inside it was DEAD
+      // CODE — reactions never reached the one-tap dispatcher. We must let
+      // reaction stubs through, but they still need a tenant context:
+      // `dispatchReactionAsAnswer` calls tenant-scoped repos
+      // (`mensagensRepo.findByWhatsappId`, `pessoasRepo`, …) that throw without
+      // an ALS. Both reaction stubs AND content messages carry `msg.key`
+      // (remoteJid), which is all the JID→tenant resolver needs — so we resolve
+      // FIRST, then route inside `runWithTenantContext`. Any other envelope
+      // that has neither content nor a reaction stub (pure receipts) is skipped
+      // to avoid a pointless resolver round-trip.
+      const reactionStub = isReactionStub(msg);
+      if (!msg.message && !reactionStub) continue;
       try {
-        await runWithTenantContext(
-          { tenant_id: 'default', agent_id: 'default' },
-          () => handleIncoming(msg),
+        const ctx = await resolveTenantCtxForUpsert(msg);
+        if (!ctx) continue; // resolution failed → audit emitted + drop
+        await runWithTenantContext(ctx.scope, () =>
+          handleIncoming(msg, { channel_id: ctx.channel_id }),
         );
       } catch (err) {
         logger.error({ err }, 'baileys.handle_failed');
@@ -322,8 +386,155 @@ function extractMessageUpdateTargetId(update: {
   return null;
 }
 
-async function handleIncoming(msg: proto.IWebMessageInfo): Promise<void> {
+/**
+ * Issue #290 — resolve the (tenant_id, agent_id, channel_id) for an inbound
+ * Baileys message BEFORE entering `runWithTenantContext`, so every downstream
+ * tenant-scoped layer (rate-limit, dedup, bot-detection, debouncer, …) sees
+ * the real tenant in ALS instead of the synthetic `default/default`.
+ *
+ * RETURN CONTRACT:
+ *   - `{ scope, channel_id }`  → caller MUST run handleIncoming inside
+ *     `runWithTenantContext(scope, …)`.
+ *   - `null`                   → resolution failed (or skip path). Caller
+ *     MUST NOT process this message. The audit has already been written
+ *     (system bucket) and the message is dropped fail-closed.
+ *
+ * FLAG MULTI_CHANNEL OFF (legacy single-tenant prod):
+ *   Returns `{ scope: BAILEYS_LEGACY_DEFAULT_CTX, channel_id: null }`
+ *   without invoking the resolver. The single-tenant deployment that has
+ *   run on this path since P0 sees no behavior change.
+ *
+ * FLAG MULTI_CHANNEL ON (multi-tenant prod — the path this issue fixes):
+ *   Calls `resolveScopeForJid` which canonicalizes JID parsing
+ *   (`@s.whatsapp.net` / `@c.us` / `@lid` w/ senderPn) and delegates to
+ *   the shared `resolveChannel` (the same one `agent/core.ts` uses for the
+ *   post-persist adoption — single source of truth for ownership policy).
+ *
+ *   On `TypedError('channel_resolution_failed')` (unknown phone, inactive,
+ *   ambiguous, malformed JID, MULTI_CHANNEL OFF surface-as-defense): emit
+ *   `channel_resolution_failed` audit with the resolver details + JID
+ *   parsing context, and return null. The audit() helper wraps writes in
+ *   the synthetic `system` tenant when no ALS is active — we have none here
+ *   yet, by definition. We DO NOT fall back to `default/default`.
+ *
+ * Errors that are NOT TypedError (e.g. a sudden DB outage) are also
+ * audited and dropped here so a single transient failure does not crash
+ * the upsert listener — the per-message `for` loop continues with the
+ * next message.
+ */
+async function resolveTenantCtxForUpsert(
+  msg: proto.IWebMessageInfo,
+): Promise<{
+  scope: { tenant_id: string; agent_id: string };
+  channel_id: string | null;
+} | null> {
+  // Legacy single-tenant path — keep `default/default` exactly as P0..P5.
+  //
+  // [Codex review #311 — B1] MULTI_CHANNEL defaults to OFF, so this branch is
+  // the default deploy path. That is SAFE for a genuine single-tenant
+  // deployment: only one tenant (`default/default`) ever exists, so there is
+  // no other tenant for a row to leak to, and the worker's adoption step is
+  // skipped entirely (agent/core.ts only adopts when the resolved tenant is
+  // NOT default/default). Multi-tenant deployments MUST set MULTI_CHANNEL=ON
+  // so the JID→tenant resolver runs and every inbound is scoped to its real
+  // owner; the cross-tenant adoption that path enables is now a guarded
+  // compare-and-swap (see `mensagensRepo.adoptToResolvedTenantCrossTenant`),
+  // so isolation holds regardless of which path persisted the row.
+  if (!featureFlags.isEnabled(FeatureFlagName.MULTI_CHANNEL)) {
+    return {
+      scope: {
+        tenant_id: BAILEYS_LEGACY_DEFAULT_CTX.tenant_id,
+        agent_id: BAILEYS_LEGACY_DEFAULT_CTX.agent_id,
+      },
+      channel_id: null,
+    };
+  }
+
+  // [Codex review #311 — minor] `msg.key` can be absent on malformed
+  // envelopes; optional-chain so a missing key resolves to a null JID
+  // (→ fail-closed in resolveScopeForJid) instead of a raw TypeError that
+  // would escape to the listener's catch as an opaque `baileys.handle_failed`.
+  const jid = msg.key?.remoteJid ?? null;
+  // Mirror `handleIncoming`'s LID fallback: pull the real phone from
+  // senderPn/participantPn when the visible JID is `@lid`.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const key = msg.key as any;
+  const keyHints = {
+    senderPn: typeof key?.senderPn === 'string' ? key.senderPn : null,
+    participantPn:
+      typeof key?.participantPn === 'string' ? key.participantPn : null,
+  };
+
+  try {
+    const { scope, jid_context } = await resolveScopeForJid(jid, keyHints);
+    // jid_context is observability metadata (LID fallback, raw_jid,
+    // resolved phone) — propagated via logs, not via handleIncoming.
+    // handleIncoming derives `tel` from msg.key directly, mirroring its
+    // pre-#290 behavior; the ALS context is the only thing it consumes
+    // from upstream.
+    if (jid_context.via_lid_fallback) {
+      logger.debug(
+        {
+          raw_jid: jid_context.raw_jid,
+          whatsapp_id: msg.key.id ?? null,
+        },
+        'baileys.lid_fallback_resolved',
+      );
+    }
+    return {
+      scope: { tenant_id: scope.tenant_id, agent_id: scope.agent_id },
+      channel_id: scope.channel_id,
+    };
+  } catch (err) {
+    // Typed resolution failure → fail-closed audit + drop. Audit writer
+    // wraps in synthetic `system` ALS when none is active (which is the
+    // case here — we ARE the entry point).
+    const typed = err as { code?: string; details?: unknown };
+    const isResolutionFailure = typed?.code === 'channel_resolution_failed';
+    await audit({
+      acao: 'channel_resolution_failed',
+      metadata: {
+        // mensagem_id intentionally null — the inbound was NOT persisted
+        // (we audit BEFORE createInbound runs). whatsapp_id is the only
+        // stable handle the operator has for triage.
+        whatsapp_id: msg.key.id ?? null,
+        raw_jid: jid,
+        error_code: isResolutionFailure
+          ? 'channel_resolution_failed'
+          : (typed?.code ?? 'unknown'),
+        error_message: (err as Error).message,
+        resolver_details: typed?.details ?? null,
+        // Surface where this audit was emitted from so triage can
+        // distinguish gateway-entry failures from worker-level ones
+        // (agent/core.ts emits the same action name).
+        emitter: 'baileys_ingress',
+      },
+    });
+    logger.warn(
+      {
+        err: (err as Error).message,
+        err_code: typed?.code,
+        whatsapp_id: msg.key.id ?? null,
+        raw_jid: jid,
+      },
+      'baileys.channel_resolution_failed_drop',
+    );
+    return null;
+  }
+}
+
+async function handleIncoming(
+  msg: proto.IWebMessageInfo,
+  // [Issue #290] Optional channel_id resolved at the upsert listener. Kept
+  // optional so legacy single-tenant callers (MULTI_CHANNEL flag OFF) and
+  // existing unit tests that drive `handleIncoming` directly continue to
+  // work unchanged. The metadata is recorded on the inbound row when
+  // present so downstream agent logic can short-circuit the resolver
+  // probe (defense-in-depth; the worker's probe still functions as fallback).
+  opts?: { channel_id?: string | null },
+): Promise<void> {
   if (msg.key.fromMe) return;
+  const _resolvedChannelId = opts?.channel_id ?? null;
 
   // B1: poll vote arrives as a pollUpdateMessage. When FEATURE_ONE_TAP is on,
   // route to the one-tap dispatcher and drop. When off, fall through to the
@@ -406,6 +617,12 @@ async function handleIncoming(msg: proto.IWebMessageInfo): Promise<void> {
       timestamp_ms: Number(msg.messageTimestamp ?? 0) * 1000,
       media_mime: mediaMime,
       media_sha256: mediaSha256,
+      // [Issue #290] Channel resolved at the ingress (MULTI_CHANNEL ON).
+      // Null in legacy single-tenant mode or when the resolver path didn't
+      // surface a channel_id (e.g., tests driving handleIncoming directly).
+      // Persisted for triage and as defense-in-depth — the worker's
+      // adoption probe is unaffected by this field's presence/absence.
+      ingress_channel_id: _resolvedChannelId,
     },
     processada_em: null,
     ferramentas_chamadas: [],
