@@ -24,10 +24,41 @@ migrations/
 ```
 
 `scripts/migrate.ts` discovers and applies every `NNN_*.sql` that does
-not end in `_down.sql`, in numeric order. Files containing the marker
-`-- maia:no-transaction` on the first line (e.g. 005) are applied
-outside a `BEGIN/COMMIT` envelope so they can use
+not end in `_down.sql`, in **lexical filename order** (a plain
+`Array.prototype.sort()` over the filename — not a numeric parse). Files
+containing the marker `-- maia:no-transaction` on the first line (e.g.
+005) are applied outside a `BEGIN/COMMIT` envelope so they can use
 `CREATE INDEX CONCURRENTLY` / `DROP INDEX CONCURRENTLY`.
+
+Note: this is **not** Drizzle. `drizzle-orm` is used only as a query
+builder; the migration runner is the hand-rolled `scripts/migrate.ts`,
+which records applied migrations by **full filename** in a
+`schema_migrations (id TEXT PRIMARY KEY)` table.
+
+### Duplicate migration numbers (and why you must NOT rename to "fix" them)
+
+Several numbers are shared by more than one forward migration today
+(007, 014, 015, 018, 020, 023, 025, 026, 027, 031, 062, 063 — see issue
+#308). They all merged and are applied in real environments. This is
+**benign** here, because:
+
+- The runner tracks applied migrations by **filename**, not by number,
+  so two files sharing a number are two independent ledger rows.
+- Lexical sort is deterministic and locale-independent for ASCII
+  filenames, so files sharing a number always apply in the same order on
+  every platform, and the next number (`064_*`) always sorts after every
+  `063_*` (third char `4` > `3`) — there is no ordering ambiguity.
+- The colliding migrations to date touch disjoint objects, so their
+  relative order is immaterial anyway.
+
+**Do NOT rename an already-merged/applied migration to renumber it.**
+Because the ledger key is the filename, a rename makes the runner treat
+the file as un-applied (it re-runs) and orphans the old `schema_migrations`
+row — corrupting the applied history for zero benefit. The accepted set
+is grandfathered in
+`tests/unit/scripts/migration-number-uniqueness.spec.ts`, which **fails
+CI if a NEW duplicate number is introduced** (the actual fix: don't add
+new collisions — see "Adding a new migration" below).
 
 ## Applying migrations (up)
 
@@ -102,7 +133,13 @@ in reverse order — never skip an intermediate step.
 When you write a forward migration, write its down file at the same
 time. The two are reviewed together.
 
-1. Pick the next number: `NNN = max(existing) + 1`.
+1. Pick the next number: `NNN = max(existing) + 1`. It MUST be unused by
+   any existing forward migration — the
+   `migration-number-uniqueness.spec.ts` guard fails CI on a new
+   duplicate. (Pre-merge-wave collisions are grandfathered there; do not
+   add to them.) If you need to slot a migration between two already-used
+   numbers, append a lowercase letter to sequence it (`038b`, `038c`) —
+   that token is distinct and sorts after the bare number.
 2. Create `migrations/NNN_<short_name>.sql` with the forward changes.
 3. Create `migrations/NNN_<short_name>_down.sql` that reverses them
    coherently:
