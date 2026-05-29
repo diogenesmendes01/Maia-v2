@@ -1,0 +1,143 @@
+# Prometheus alerting rules — working memory observability (issues #286 / #317).
+#
+# Companion to monitoring/alerts/redis.rules.yml (#300). Those rules watch
+# Redis-wide health; THESE watch the per-feature signals emitted by
+# src/memory/working.ts on /metrics:
+#
+#   working_memory_read_latency_ms{key_type,hit}     histogram
+#   working_memory_ttl_miss_total{key_type}          counter (#317 B3/B4)
+#   working_memory_key_collision_total{key_type}     counter (#317 B2)
+#   working_memory_redis_error_total{key_type,op}    counter (#317 B1)
+#   working_memory_legacy_read_total{key_type}       counter (vestigial, #286)
+#
+# Cardinality note (#286): these series are deliberately low-cardinality — only
+# `key_type` ("messages"|"rate"), `hit` ("0"|"1") and `op`
+# ("lrange"|"get"|"set") appear as labels. There is NO raw tenant_id / agent_id
+# / conversa_id label (a canary test in
+# tests/unit/memory/working-observability.spec.ts rejects any such leak), so
+# per-tenant attribution is done via the structured logs emitted alongside each
+# increment (`working_memory.ttl_miss`, `working_memory.key_collision`,
+# `working_memory.redis_error`), NOT via Prometheus labels.
+#
+# Wiring: load via Prometheus `rule_files` (the deployment's prometheus.yml
+# references this path), e.g.
+#
+#   rule_files:
+#     - /etc/prometheus/rules/redis.rules.yml          # #300
+#     - /etc/prometheus/rules/working-memory.rules.yml  # this file
+#
+# In the docker-compose-based deploy, mount it read-only into the Prometheus
+# container at that path and add the `rule_files` entry — same procedure as the
+# redis rules (see docs/runbooks/redis.md §4 "Como ativar estas regras").
+groups:
+  - name: working_memory_correctness
+    interval: 30s
+    rules:
+      # Key collision is a CORRECTNESS / isolation signal: the read observed a
+      # TTL marker whose stored scope-fingerprint (tenant_id+agent_id+conversa_id)
+      # did NOT match the fingerprint recomputed from the current tenant context
+      # for the SAME physical Redis key. Under the tenant+agent-scoped key shape
+      # (#241) this should be impossible; any positive value means two distinct
+      # logical scopes hashed onto one key — a missing-prefix path, a truncated
+      # hash, or an ID-generation change. Treat as critical.
+      - alert: WorkingMemoryKeyCollisionDetected
+        expr: increase(working_memory_key_collision_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Working-memory key collision (key_type={{ $labels.key_type }})"
+          description: |
+            Uma leitura encontrou um marker `nx_ttl:` cujo scope-fingerprint
+            diverge do contexto tenant+agent atual para a MESMA chave Redis —
+            duas escopos lógicos colidindo numa chave (#317 B2). Sob o key shape
+            tenant+agent (#241) isso deveria ser impossível.
+            Ação: correlacionar com os logs estruturados
+            `working_memory.key_collision` (carregam tenant_id/agent_id) e
+            auditar paths que escrevem working memory sem o prefixo tenant+agent
+            ou com hash truncado. Risco de isolamento — inviolável (#231).
+
+  - name: working_memory_reliability
+    interval: 30s
+    rules:
+      # TTL miss = wrote a key whose marker is still alive, yet the buffer read
+      # returned empty (eviction, FLUSHDB, crash before EXPIRE landed). A low
+      # background rate can be normal under memory pressure; a spike usually
+      # correlates with Redis eviction (cross-check redis.rules.yml's
+      # RedisEvictionRising / RedisMemoryPressure*).
+      - alert: WorkingMemoryTtlMissRising
+        expr: increase(working_memory_ttl_miss_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Working-memory TTL misses subindo (key_type={{ $labels.key_type }})"
+          description: |
+            Chaves com TTL ainda válido retornaram vazias na leitura — entrada
+            sumiu antes da hora (#317 B3/B4). Quase sempre correlaciona com
+            eviction do Redis: cross-check `RedisEvictionRising` e
+            `RedisMemoryPressureWarning/Critical` em redis.rules.yml (#300).
+            Cada miss vira reconstrução via Postgres (custo + latência).
+            Runbook: docs/runbooks/redis.md §3 (sizing) e §4 (alertas).
+
+      # A Redis call inside working memory threw. This is recorded SEPARATELY
+      # from TTL misses (#317 B1) so a transient Redis failure is never
+      # miscounted as an eviction. Sustained errors mean the buffer is degraded
+      # (reads throw → the conversation context is rebuilt from Postgres).
+      - alert: WorkingMemoryRedisErrorsRising
+        expr: increase(working_memory_redis_error_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Working-memory Redis errors (op={{ $labels.op }}, key_type={{ $labels.key_type }})"
+          description: |
+            Uma operação Redis (`{{ $labels.op }}`) em working memory falhou.
+            Distinto de TTL miss por design (#317 B1) — não confundir com
+            eviction. Se sustentado, a conexão Redis está degradada: cross-check
+            `redis.error`/`redis.end` nos logs e o gauge de conectividade.
+            Leituras que lançam são reconstruídas via Postgres (fail-safe), mas
+            a latência sobe. Runbook: docs/runbooks/redis.md.
+
+      # p99 read latency. Working memory is hot-path; a slow Redis read stalls
+      # the whole turn. Histogram buckets are defined in src/lib/metrics.ts
+      # (DEFAULT_BUCKETS_MS). 500ms p99 is already pathological for a LRANGE of
+      # <=20 small entries against a local Redis.
+      - alert: WorkingMemoryReadLatencyHigh
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le, key_type) (rate(working_memory_read_latency_ms_bucket[5m]))
+          ) > 500
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Working-memory read p99 > 500ms (key_type={{ $labels.key_type }})"
+          description: |
+            p99 da leitura de working memory acima de 500ms por 10min. Para um
+            LRANGE de até 20 entradas curtas isso é patológico — investigar
+            saturação do Redis (CPU, big keys, swap) ou rede. Cross-check
+            `redis_memory_used_ratio` e a latência geral do Redis.
+
+  - name: working_memory_migration
+    interval: 1m
+    rules:
+      # Legacy-read counter is vestigial after #241 removed the non-tenant-scoped
+      # fallback (Option A). It MUST stay at 0 in production; any increment means
+      # a code path reintroduced a legacy/unscoped read — a regression of the
+      # tenant-scope migration and a potential isolation hole.
+      - alert: WorkingMemoryLegacyReadReappeared
+        expr: increase(working_memory_legacy_read_total[15m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Working-memory legacy (unscoped) read path reappeared (key_type={{ $labels.key_type }})"
+          description: |
+            `working_memory_legacy_read_total` incrementou — após #241 não há
+            caller legacy em produção (deveria ficar em 0). Algum path
+            reintroduziu uma leitura não-escopada por tenant+agent: regressão da
+            migração de isolamento (#231/#286). Auditar chamadas a
+            `recordLegacyRead(...)` e qualquer leitura de chave `working:conv:*`
+            sem prefixo tenant+agent.

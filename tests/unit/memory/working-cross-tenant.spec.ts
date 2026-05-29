@@ -73,6 +73,17 @@ const redisStub = {
     calls.push({ op: 'lrange', key, args });
     return [];
   }),
+  // #317: the TTL/collision marker is written via `set` and read via `get`.
+  // Record them too so we can assert the marker key is ALSO tenant+agent
+  // scoped (the inviolable-isolation invariant applies to it as well).
+  set: vi.fn(async (key: string, ...args: unknown[]) => {
+    calls.push({ op: 'set', key, args });
+    return 'OK';
+  }),
+  get: vi.fn(async (key: string, ...args: unknown[]) => {
+    calls.push({ op: 'get', key, args });
+    return null;
+  }),
 };
 
 vi.mock('@/lib/redis.js', () => ({
@@ -103,6 +114,8 @@ describe('issue #231 — working memory Redis keys are tenant+agent scoped', () 
     redisStub.ltrim.mockClear();
     redisStub.expire.mockClear();
     redisStub.lrange.mockClear();
+    redisStub.set.mockClear();
+    redisStub.get.mockClear();
   });
 
   // -------------------------------------------------------------------------
@@ -123,6 +136,42 @@ describe('issue #231 — working memory Redis keys are tenant+agent scoped', () 
       expect(keysOf('rpush')).toEqual([expected]);
       expect(keysOf('ltrim')).toEqual([expected]);
       expect(keysOf('expire')).toEqual([expected]);
+    });
+
+    it('the TTL/collision marker key is ALSO tenant+agent scoped (#317 B4)', async () => {
+      await runWithTenantContext(
+        { tenant_id: TENANT_A, agent_id: AGENT_A },
+        async () => {
+          await pushMessage(CONV_SHARED, 'user', 'hello');
+        },
+      );
+      // The Redis-backed TTL marker (#317) must carry the SAME tenant+agent
+      // prefix as the data key — it is per-conversation state and the inviolable
+      // isolation invariant applies. A non-scoped marker would let a foreign
+      // tenant's marker collide on a shared conversa_id.
+      expect(keysOf('set')).toEqual([
+        `nx_ttl:${TENANT_A}:${AGENT_A}:conv:${CONV_SHARED}:messages`,
+      ]);
+    });
+
+    it('marker key differs across tenants for the same conversa_id (#317 B4)', async () => {
+      await runWithTenantContext(
+        { tenant_id: TENANT_A, agent_id: AGENT_A },
+        async () => {
+          await pushMessage(CONV_SHARED, 'user', 'a');
+        },
+      );
+      await runWithTenantContext(
+        { tenant_id: TENANT_B, agent_id: AGENT_B },
+        async () => {
+          await pushMessage(CONV_SHARED, 'user', 'b');
+        },
+      );
+      const setKeys = keysOf('set');
+      expect(setKeys).toEqual([
+        `nx_ttl:${TENANT_A}:${AGENT_A}:conv:${CONV_SHARED}:messages`,
+        `nx_ttl:${TENANT_B}:${AGENT_B}:conv:${CONV_SHARED}:messages`,
+      ]);
     });
 
     it('same conversa_id under different tenants produces DIFFERENT keys', async () => {
