@@ -17,6 +17,7 @@ import {
   redis,
   isRedisOomError,
   recordRedisOomDegraded,
+  recordRedisError,
 } from '@/lib/redis.js';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
@@ -30,6 +31,34 @@ export type RateDecision =
       kind: 'deny';
       reason: 'redis_down' | 'redis_oom' | 'per_second' | 'per_hour' | 'per_recipient';
     };
+
+/**
+ * Best-effort cleanup of the pace key after a rate-bucket deny. The slot
+ * decision has ALREADY been made (we're returning `deny`), so this `DEL` must
+ * never throw or change control flow — but it must not be invisible either
+ * (#309 review, PR #324). Classify the failure: an OOM is a capacity incident
+ * (`recordRedisOomDegraded`), any other fault is a real Redis error
+ * (`recordRedisError` + structured warn). Either way we swallow and return.
+ *
+ * Why best-effort is still correct: the pace key has a 2s TTL, so a failed
+ * cleanup at worst delays the NEXT send to this jid by up to 2s — it never
+ * blocks indefinitely and never affects a different recipient.
+ */
+async function cleanupPaceKey(paceKey: string): Promise<void> {
+  try {
+    await redis.del(paceKey);
+  } catch (err) {
+    if (isRedisOomError(err)) {
+      recordRedisOomDegraded('backpressure.cleanup');
+    } else {
+      recordRedisError('backpressure.cleanup');
+      logger.warn(
+        { err: (err as Error).message },
+        'backpressure.cleanup_pace_failed',
+      );
+    }
+  }
+}
 
 /**
  * Atomically attempt to acquire one send slot. Burns one token from the
@@ -67,7 +96,7 @@ export async function tryAcquireSendSlot(jid: string): Promise<RateDecision> {
     const sec = await redis.incr(secKey);
     if (sec === 1) await redis.expire(secKey, 2);
     if (sec > config.OUTBOX_MAX_PER_SECOND) {
-      await redis.del(paceKey).catch(() => null);
+      await cleanupPaceKey(paceKey);
       return { kind: 'deny', reason: 'per_second' };
     }
 
@@ -76,7 +105,7 @@ export async function tryAcquireSendSlot(jid: string): Promise<RateDecision> {
     const hour = await redis.incr(hourKey);
     if (hour === 1) await redis.expire(hourKey, 3700);
     if (hour > config.OUTBOX_MAX_PER_HOUR) {
-      await redis.del(paceKey).catch(() => null);
+      await cleanupPaceKey(paceKey);
       return { kind: 'deny', reason: 'per_hour' };
     }
 

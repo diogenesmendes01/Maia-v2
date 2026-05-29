@@ -79,6 +79,11 @@ export type RedisOomCaller =
   | 'vision_cache.set'
   | 'bot_detection.incr'
   | 'backpressure.acquire'
+  // Best-effort pace-key cleanup after a rate-limit deny in
+  // `tryAcquireSendSlot` (#309 review, PR #324): the slot decision has
+  // already been made, so an OOM here is recorded (attributed to the
+  // cleanup site, not `backpressure.acquire`) but never throws.
+  | 'backpressure.cleanup'
   // BullMQ enqueue path (#309 follow-up, PR #324 B1): an OOM on
   // `agentQueue.add` outside the debouncer (non-debounced ingress +
   // message-recovery sweep). Fail-closed — see `enqueueAgent` in
@@ -128,7 +133,12 @@ export type RedisErrorCaller =
   | 'vision_cache.set'
   | 'bot_detection.incr'
   | 'rate_limit.zset'
-  | 'rate_limit.overage';
+  | 'rate_limit.overage'
+  // Best-effort pace-key cleanup in `tryAcquireSendSlot` (#309 review, PR
+  // #324): a non-OOM fault during the cleanup `DEL` is now metered+logged
+  // instead of silently swallowed by `.catch(() => null)`. Stays
+  // best-effort — the slot decision already happened, so it never throws.
+  | 'backpressure.cleanup';
 
 /**
  * Record a NON-OOM Redis error for `caller` — increments the low-cardinality

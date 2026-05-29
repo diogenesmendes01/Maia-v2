@@ -351,16 +351,18 @@ intencional é preservada.* Por site:
 | **Rate-limit** (`checkRateLimit`, ambos os blocos) | **engole** (fail-CLOSED → `silence`/`allow`) — postura de segurança intencional, NÃO re-lança | `recordRedisError('rate_limit.zset'\|'rate_limit.overage')` → `redis_error_total` + log `rate_limit.{zset,overage}_failed` |
 | **Debouncer** (`scheduleDebouncedAgent`) | **re-lança** o erro cru não-OOM (só o OOM vira `DebouncerRedisUnavailableError`) | a exceção sobe; o caller `baileys.ts` loga `baileys.debounce_failed_fail_closed` |
 | **enqueueAgent** (não-debounced + recovery) | **re-lança** o erro cru não-OOM (só o OOM vira `QueueRedisUnavailableError`) | a exceção sobe; recovery loga `message_recovery.enqueue_failed` por mensagem |
-| **Dedup** (`markSeen`/backfill) | **engole** (degrada para fallback Postgres) | log do caller; o Postgres é autoritativo |
-| **Backpressure** (`tryAcquireSendSlot`) | **re-lança** o erro cru não-OOM (só o OOM vira `reason: 'redis_oom'`) | a exceção sobe ao tick do sweeper |
+| **Dedup** (`markSeen`/backfill) | **re-lança** o erro cru não-OOM (só o OOM degrada para o fallback Postgres) — `throw err` em `dedup.ts:251` (backfill) e `:303` (`markSeen`) | a exceção sobe ao caller; o dispatcher `baileys.ts` captura via `baileys.handle_failed` |
+| **Backpressure — caminho principal** (`tryAcquireSendSlot`) | **re-lança** o erro cru não-OOM (só o OOM vira `reason: 'redis_oom'`) | a exceção sobe ao tick do sweeper |
+| **Backpressure — limpeza do pace key** (`cleanupPaceKey`, após deny de rate-bucket) | **engole** (best-effort; a decisão do slot já foi tomada, o pace key tem TTL de 2s) — NÃO re-lança | `recordRedisError('backpressure.cleanup')` → `redis_error_total` + log `backpressure.cleanup_pace_failed` |
 
 Resumindo: os sites **catch-all** (working-memory marker/reads, vision cache,
-bot-detection, rate-limit, dedup) agora SEMPRE emitem métrica + log no não-OOM
+bot-detection, rate-limit, e a limpeza best-effort do backpressure —
+`backpressure.cleanup`) agora SEMPRE emitem métrica + log no não-OOM
 (`redis_error_total{operation}` ou `working_memory_redis_error_total{op}`); os
 sites que **re-lançam** (working-memory data writes, debouncer, enqueueAgent,
-backpressure) deixam o `ReplyError` cru subir para o tratamento de erro do
-caller. Em nenhum caso um `WRONGTYPE`/`READONLY`/conn-reset some sem deixar
-rastro.
+dedup, e o caminho principal do backpressure `tryAcquireSendSlot`) deixam o
+`ReplyError` cru subir para o tratamento de erro do caller. Em nenhum caso um
+`WRONGTYPE`/`READONLY`/conn-reset some sem deixar rastro.
 
 Mesmo com a degradação, um OOM é um **incidente de capacidade**: o alerta
 `RedisMemoryPressureWarning`/`Critical` (§4.2) e o counter

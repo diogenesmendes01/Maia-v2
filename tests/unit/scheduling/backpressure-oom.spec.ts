@@ -48,6 +48,10 @@ vi.mock('@/lib/redis.js', () => ({
     incCounter('redis_oom_degraded_total', { operation: caller });
     logWarn({ redis_oom: true, caller, ...extra }, 'redis.oom_degraded');
   },
+  recordRedisError: (caller: string, extra?: Record<string, unknown>) => {
+    incCounter('redis_error_total', { operation: caller });
+    logWarn({ redis_error: true, caller, ...extra }, 'redis.error');
+  },
 }));
 
 vi.mock('@/config/env.js', () => ({
@@ -118,5 +122,72 @@ describe('backpressure — OOM fail-closed (#309)', () => {
     await expect(tryAcquireSendSlot(JID)).rejects.toBe(boom);
     const out = await renderPrometheus();
     expect(out).not.toContain('redis_oom_degraded_total');
+  });
+});
+
+/**
+ * #309 review (PR #324) — the best-effort pace-key CLEANUP after a rate-bucket
+ * deny must NOT silently swallow errors. The slot decision has already been
+ * made (we return `deny`), so cleanup never throws and never changes the
+ * decision — but a non-OOM fault is now metered+logged
+ * (`redis_error_total{operation="backpressure.cleanup"}` + `redis.error`
+ * warn) and an OOM is attributed to `backpressure.cleanup` rather than
+ * vanishing into the old `.catch(() => null)`.
+ *
+ * The cleanup runs only on the rate-bucket deny branches: we force the
+ * per-second bucket over its cap (config stub `OUTBOX_MAX_PER_SECOND = 10`)
+ * so `redis.del(paceKey)` fires, then make that `del` fail.
+ */
+describe('backpressure — cleanup error is metered+logged, never swallowed (#324 review)', () => {
+  const overSecondCap = async () => {
+    // pace SET succeeds, then the per-second INCR returns 11 (> cap of 10).
+    redisStub.set.mockResolvedValue('OK');
+    redisStub.incr.mockResolvedValueOnce(11);
+  };
+
+  it('still returns the rate deny even when cleanup DEL fails (best-effort, no throw)', async () => {
+    await overSecondCap();
+    redisStub.del.mockImplementationOnce(async () => {
+      throw Object.assign(new Error('READONLY'), { name: 'ReplyError' });
+    });
+    const decision = await tryAcquireSendSlot(JID);
+    expect(decision).toEqual({ kind: 'deny', reason: 'per_second' });
+  });
+
+  it('meters a NON-OOM cleanup failure as redis_error_total{operation="backpressure.cleanup"}', async () => {
+    await overSecondCap();
+    redisStub.del.mockImplementationOnce(async () => {
+      throw Object.assign(new Error('READONLY'), { name: 'ReplyError' });
+    });
+    await tryAcquireSendSlot(JID);
+    const out = await renderPrometheus();
+    expect(out).toContain('redis_error_total{operation="backpressure.cleanup"} 1');
+    // It is NOT misclassified as an OOM degradation.
+    expect(out).not.toContain('redis_oom_degraded_total');
+  });
+
+  it('logs a structured warn on a NON-OOM cleanup failure (no longer invisible)', async () => {
+    await overSecondCap();
+    redisStub.del.mockImplementationOnce(async () => {
+      throw Object.assign(new Error('READONLY'), { name: 'ReplyError' });
+    });
+    await tryAcquireSendSlot(JID);
+    expect(logWarn).toHaveBeenCalledWith(
+      expect.anything(),
+      'backpressure.cleanup_pace_failed',
+    );
+  });
+
+  it('attributes an OOM during cleanup to redis_oom_degraded_total{operation="backpressure.cleanup"}', async () => {
+    await overSecondCap();
+    redisStub.del.mockImplementationOnce(async () => {
+      throw redisStub.makeOom();
+    });
+    const decision = await tryAcquireSendSlot(JID);
+    expect(decision).toEqual({ kind: 'deny', reason: 'per_second' });
+    const out = await renderPrometheus();
+    expect(out).toContain('redis_oom_degraded_total{operation="backpressure.cleanup"} 1');
+    // OOM path does not also fire the non-OOM error counter.
+    expect(out).not.toContain('redis_error_total{operation="backpressure.cleanup"}');
   });
 });
