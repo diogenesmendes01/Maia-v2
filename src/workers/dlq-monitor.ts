@@ -4,7 +4,7 @@ import { sendAlert } from '@/lib/alerts.js';
 import { redis } from '@/lib/redis.js';
 import { logger } from '@/lib/logger.js';
 import { audit } from '@/governance/audit.js';
-import { runWithTenantContext } from '@/db/tenant-context.js';
+import { runWithSystemContext } from '@/db/tenant-context.js';
 
 /**
  * DLQ size guard. Reads the count of unresolved entries in `dead_letter_jobs`
@@ -23,8 +23,13 @@ const ALERT_KEY = 'maia:dlq_monitor:alerted';
 const ALERT_TTL_S = 60 * 60; // 1h
 
 export async function runDlqMonitor(): Promise<void> {
-  // P0: single-tenant default. P6 will fan-out per tenant.
-  await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, runDlqMonitorInner);
+  // Genuinely-GLOBAL maintenance (issue #323 phase 2): `dlqRepo.countOpen` is a
+  // bare `COUNT(*) … WHERE resolved = false` over `dead_letter_jobs` with no
+  // tenant_id/agent_id predicate (DLQ depth is a fleet-wide signal), and the
+  // `dlq_alert_emitted` audit row is an ownerless maintenance event the watcher
+  // finds by `acao` regardless of attribution. Re-homed from the legacy
+  // `default/default` literal to the reserved `system` sentinel.
+  await runWithSystemContext(runDlqMonitorInner);
 }
 
 async function runDlqMonitorInner(): Promise<void> {

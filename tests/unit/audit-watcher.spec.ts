@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import type { SQL } from 'drizzle-orm';
 import { AUDIT_ACTIONS } from '../../src/governance/audit-actions.js';
+import { SYSTEM_TENANT_ID, SYSTEM_AGENT_ID } from '../../src/db/tenant-context.js';
 
 const sendAlertMock = vi.fn().mockResolvedValue(undefined);
 const dbExecuteMock = vi.fn();
@@ -91,6 +92,31 @@ describe('audit-watcher', () => {
           `mate_acao "${rule.mate_acao}" of rule "${rule.id}"`,
         ).toBe(true);
       }
+    }
+  });
+
+  // Issue #323 phase 2: the watcher is a cross-tenant aggregate that runs as
+  // GLOBAL maintenance under the reserved `system` sentinel — NOT the legacy
+  // `default/default` literal. Read the live ALS context from inside the
+  // (mocked) `db.execute` to prove the wrapper. We resolve the context module
+  // dynamically so it shares the registry instance the worker uses after
+  // `vi.resetModules()`.
+  it('runs every query under the reserved system context (not default/default)', async () => {
+    const observed: Array<{ tenant_id: string; agent_id: string }> = [];
+    dbExecuteMock.mockImplementation(async () => {
+      const { tryGetCurrentContext } = await import('../../src/db/tenant-context.js');
+      const ctx = tryGetCurrentContext();
+      if (ctx) observed.push({ tenant_id: ctx.tenant_id, agent_id: ctx.agent_id });
+      return { rows: [{ c: 0 }] };
+    });
+    const { runAuditWatcher } = await import('../../src/workers/audit-watcher.js');
+    await runAuditWatcher();
+
+    expect(observed.length).toBeGreaterThan(0);
+    for (const ctx of observed) {
+      expect(ctx.tenant_id).toBe(SYSTEM_TENANT_ID);
+      expect(ctx.agent_id).toBe(SYSTEM_AGENT_ID);
+      expect(ctx.tenant_id).not.toBe('default');
     }
   });
 

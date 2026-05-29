@@ -2,7 +2,7 @@ import { checkAll } from '@/lib/healthcheck.js';
 import { sendAlert } from '@/lib/alerts.js';
 import { logger } from '@/lib/logger.js';
 import { healthRepo } from '@/db/repositories.js';
-import { runWithTenantContext } from '@/db/tenant-context.js';
+import { runWithSystemContext } from '@/db/tenant-context.js';
 
 const downSinceByComponent = new Map<string, Date>();
 const ALERTED = new Map<string, boolean>();
@@ -10,11 +10,12 @@ const DOWN_THRESHOLD_MS = 2 * 60 * 1000;
 const DEGRADED_THRESHOLD_MS = 10 * 60 * 1000;
 
 export async function runHealthMonitor(): Promise<void> {
-  // P0: single-tenant default. P6 will fan-out per tenant.
-  await runWithTenantContext(
-    { tenant_id: 'default', agent_id: 'default' },
-    runHealthMonitorInner,
-  );
+  // Genuinely-GLOBAL maintenance (issue #323 phase 2): component health pings
+  // (`checkAll()`) and `healthRepo.record` are tenant-agnostic — `record` is a
+  // bare INSERT into `system_health_events` that never reads the ALS context,
+  // so the rows it writes are identical under any context. Re-homed from the
+  // legacy `default/default` literal to the reserved `system` sentinel.
+  await runWithSystemContext(runHealthMonitorInner);
 }
 
 async function runHealthMonitorInner(): Promise<void> {

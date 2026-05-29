@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { tryGetCurrentContext, isSystemContext } from '../../src/db/tenant-context.js';
 
 const countOpenMock = vi.fn();
 const sendAlertMock = vi.fn().mockResolvedValue(undefined);
@@ -124,5 +125,24 @@ describe('dlq-monitor worker', () => {
     await expect(runDlqMonitor()).resolves.toBeUndefined();
     expect(redisSetMock).not.toHaveBeenCalled();
     expect(sendAlertMock).not.toHaveBeenCalled();
+  });
+
+  // Issue #323 phase 2: the worker runs as GLOBAL maintenance under the
+  // reserved `system` sentinel — NOT the legacy `default/default` literal that
+  // MAIA_REJECT_DEFAULT_LITERAL is on track to reject. Capture the live ALS
+  // context from inside the (mocked) repo call to prove the wrapper.
+  it('runs under the reserved system context (not default/default)', async () => {
+    let observed: { tenant_id: string; agent_id: string } | null = null;
+    countOpenMock.mockImplementation(async () => {
+      observed = tryGetCurrentContext();
+      return 0;
+    });
+    const { runDlqMonitor } = await import('../../src/workers/dlq-monitor.js');
+    await runDlqMonitor();
+
+    expect(observed).not.toBeNull();
+    expect(isSystemContext(observed!)).toBe(true);
+    expect(observed!.tenant_id).not.toBe('default');
+    expect(observed!.agent_id).not.toBe('default');
   });
 });
