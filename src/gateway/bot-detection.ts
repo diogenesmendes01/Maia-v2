@@ -97,7 +97,12 @@
  *   per (tenant_id, agent_id); the regression that keeps it from
  *   activating in prod is OWNED by #290.
  */
-import { redis, isRedisConnected } from '@/lib/redis.js';
+import {
+  redis,
+  isRedisConnected,
+  isRedisOomError,
+  recordRedisOomDegraded,
+} from '@/lib/redis.js';
 import { pessoasRepo } from '@/db/repositories.js';
 import { audit } from '@/governance/audit.js';
 import { logger } from '@/lib/logger.js';
@@ -163,6 +168,17 @@ export async function checkBotAndMaybeBlock(tel: string): Promise<boolean> {
     count = await redis.incr(key);
     if (count === 1) await redis.expire(key, WINDOW_SECONDS);
   } catch (err) {
+    // OOM handling (#309): the flood counter is a best-effort heuristic with
+    // NO Postgres source of truth — on a Redis OOM we degrade to "don't block"
+    // (return false), identical to the Redis-down skip above and the existing
+    // generic-failure branch. Failing to increment the counter must never
+    // block a legitimate user, and a raw `ReplyError` must never crash the
+    // ingress path. We single OOM out for its own counter (capacity signal)
+    // but the degraded behaviour is unchanged.
+    if (isRedisOomError(err)) {
+      recordRedisOomDegraded('bot_detection.incr', { tenant_id, agent_id });
+      return false;
+    }
     logger.warn(
       { err: (err as Error).message, tenant_id, agent_id },
       'bot_detection.redis_failed',

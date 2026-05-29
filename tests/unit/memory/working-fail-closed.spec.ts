@@ -68,6 +68,10 @@ const redisStub = {
 vi.mock('@/lib/redis.js', () => ({
   redis: redisStub,
   isRedisConnected: () => false,
+  // #309: consulted in the production catch path (not reached here — this spec
+  // exercises the Redis-down guard). No-op keeps behaviour unchanged.
+  isRedisOomError: () => false,
+  recordRedisOomDegraded: () => {},
 }));
 
 const { pushMessage, readRecent } = await import(

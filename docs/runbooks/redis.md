@@ -312,27 +312,38 @@ Valores devem bater (snapshot do coletor é atualizado a cada 15s).
 
 ### 4.5 Quando o app vê OOM no Redis
 
-**Estado atual (sem #309):** um `OOM` do Redis vira um `ReplyError` que a
-camada chamadora propaga. Caminhos já endurecidos em `main` degradam de forma
-controlada; o restante ainda propaga o erro até #309:
+Sob `noeviction` (§1) um write em pressão de memória volta como
+`ReplyError: OOM command not allowed when used memory > 'maxmemory'`. **#309
+(MERGED)** trata esse erro de forma homogênea em cada caller crítico, em vez de
+propagar um `ReplyError` cru que derrubaria um job/HTTP. O detector único é
+`isRedisOomError(err)` em `src/lib/redis.ts` (casa o prefixo `OOM` da reply,
+NÃO de qualquer mensagem que contenha "oom"); cada degradação incrementa o
+counter `redis_oom_degraded_total{operation}` (low-cardinality, SEM tenant_id;
+atribuição por-tenant vai no log estruturado `redis.oom_degraded`) via
+`recordRedisOomDegraded(caller, …)`.
 
-- **Rate-limit** (`src/gateway/rate-limit.ts`) — overage path já está em
-  try/catch com **fail-closed para `silence`** em não-owner (mergeado via
-  #245/#258). OOM aqui silencia o usuário em vez de derrubar o job. ✅
-- **BullMQ enqueue** — falha vira erro determinístico → DLQ
-  (ver `docs/runbooks/operational.md` §5). Sem retry-once dedicado até #309.
-- **Dedup de mensagem de gateway** (`src/gateway/dedup.ts`) — a marcação
-  "já visto" no Redis falha, mas o dedup degrada para o *fallback* Postgres
-  (`mensagensRepo.findByWhatsappId`, tenant+agent-scoped): a duplicata ainda é
-  detectada, só sem a fast-path do cache. (A idempotência de tool/outbound NÃO
-  aparece aqui — é Postgres, fora do alcance do OOM do Redis; ver §1.)
-- **Working memory** — write falha; próxima leitura tem cache miss e o agente
-  reconstrói o estado das mensagens persistidas em Postgres (degradação
-  graciosa, com latência extra).
+Política por caller (escolhida pelo papel do caller — fail-open só onde
+Postgres é a fonte de verdade e não há risco de isolamento/dupla-execução):
 
-#309 unifica o tratamento (fail-closed/degradação homogênea) nos callers que
-ainda propagam. Até lá, trate um OOM como **incidente de capacidade**: aumente
-`maxmemory` (§3) e investigue o crescimento.
+| Caller | Comportamento no OOM | Por quê |
+|---|---|---|
+| **Rate-limit** (`src/gateway/rate-limit.ts`) | **fail-closed → `silence`** (não-owner) / `allow` (owner). **Não alterado por #309** — já era OOM-safe via #245/#258. | Os dois try/catch já absorviam qualquer `ReplyError`; é o padrão de referência. |
+| **Working memory** (`src/memory/working.ts`, `pushMessage`) | **fail-open: pula o write**, conta a métrica, segue. Não grava `recordWrite` (evita falso TTL-miss). | É cache; Postgres é a fonte (`mensagens`). A leitura cai no Postgres no cache miss. Chave já é tenant+agent-scoped → dropar o write não viola isolamento. |
+| **Vision cache** (`src/tools/_vision-cache.ts`, `setCachedVision`) | **fail-open: pula o write**, conta a métrica. | Best-effort; a próxima chamada idêntica refaz a Vision API. Sem risco de isolamento (chave tenant+agent-scoped). |
+| **Dedup de gateway** (`src/gateway/dedup.ts`, `markSeen` + backfill) | **degrada para o fallback Postgres**: engole o OOM, conta a métrica; o próximo `isDuplicate` confirma a duplicata via `mensagensRepo.findByWhatsappId` (tenant+agent-scoped). | Fail-SAFE, não fail-open: o Postgres é autoritativo, então não há risco de dupla-processamento. (Idempotência de tool/outbound é Postgres — fora do alcance do OOM; ver §1.) |
+| **Bot-detection** (`src/gateway/bot-detection.ts`) | **fail-open: não bloqueia** (retorna `false`), conta a métrica. | Heurística best-effort sem fonte em Postgres; falhar o contador nunca deve bloquear um usuário legítimo. |
+| **Debouncer** (`src/gateway/debouncer.ts`) | **fail-CLOSED**: converte o OOM em `DebouncerRedisUnavailableError` (`oom=true`), conta a métrica; o caller (`baileys.ts`) para e a mensagem fica persistida no Postgres, varrida por `aggregateUnprocessedTexts` no próximo ciclo. | "Pular o debounce e seguir" silenciosamente poderia perder a mensagem ou armar um job BullMQ sem o estado Redis companheiro. Fail-closed preserva a mensagem sem `ReplyError` cru. |
+| **Backpressure de outbox** (`src/scheduling/backpressure.ts`, `tryAcquireSendSlot`) | **fail-CLOSED**: nega com `reason: 'redis_oom'`; a linha do outbox fica `pending` e o próximo tick re-tenta (backoff). | Igual ao contrato `redis_down`: recusar enviar é melhor que arriscar burst-ban/duplo-envio no WhatsApp. |
+| **BullMQ enqueue** | Erro determinístico → DLQ (ver `operational.md` §5). No debouncer, um OOM no `agentQueue.add` vira o mesmo `DebouncerRedisUnavailableError` fail-closed acima. | Retry-once dedicado segue fora de escopo; o caminho DLQ já é controlado. |
+
+> **Não-OOM ainda propaga.** Cada wrapper só absorve o sinal de OOM; qualquer
+> outro `ReplyError` (ex.: `WRONGTYPE`, `READONLY`) continua subindo para o
+> tratamento de erro existente do caller — não mascaramos bugs reais.
+
+Mesmo com a degradação, um OOM é um **incidente de capacidade**: o alerta
+`RedisMemoryPressureWarning`/`Critical` (§4.2) e o counter
+`redis_oom_degraded_total` devem disparar a investigação — aumente `maxmemory`
+(§3) e investigue o crescimento.
 
 ---
 
@@ -395,4 +406,7 @@ Reavaliar isolamento físico quando passarmos de ~100 tenants ativos.
 - **Issue #297** — coletor de memória + gauges Prometheus + gate `/readyz`
   (sem essas métricas, OOM sob `noeviction` vira write failure invisível).
 - **#309** — OOM handling aplicativo (fail-closed / degradação em vez de
-  propagar `ReplyError`) nos callers que ainda propagam (§4.5).
+  propagar `ReplyError`) nos callers críticos (§4.5). **MERGED**: detector
+  `isRedisOomError` + counter `redis_oom_degraded_total` em `src/lib/redis.ts`;
+  wrappers em working memory, vision cache, dedup, bot-detection, debouncer e
+  backpressure de outbox. Rate-limit já era OOM-safe e ficou intacto.

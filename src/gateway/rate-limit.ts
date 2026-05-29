@@ -63,6 +63,15 @@
  *   wrapped only the sorted-set block, so a transient Redis blip on the
  *   overage path (latency spike, eviction, network jitter) would surface
  *   the error to the caller — strictly worse than the documented contract.
+ *
+ * OOM coverage (issue #309 — CONFIRMED, no change):
+ *   A Redis OOM under `noeviction` (PR #294) surfaces as a `ReplyError` on
+ *   any of the `zadd`/`zremrangebyscore`/`get`/`set` writes below. Both
+ *   try/catch blocks already absorb it into the fail-closed `silence`
+ *   (non-owner) / `allow` (owner) decision — exactly the OOM contract the
+ *   runbook §4.5 documents for this caller. This module is therefore
+ *   intentionally NOT modified by #309; it is the reference pattern the
+ *   other callers were aligned to.
  */
 import { redis, isRedisConnected } from '@/lib/redis.js';
 import { config } from '@/config/env.js';

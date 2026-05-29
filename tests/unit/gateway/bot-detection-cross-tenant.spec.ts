@@ -79,6 +79,12 @@ const redisStub = {
 vi.mock('@/lib/redis.js', () => ({
   redis: redisStub,
   isRedisConnected: () => true,
+  // #309: consulted in the production catch path. This spec exercises a
+  // NON-OOM Redis failure (`redis_failed` log), so OOM detection is false and
+  // the degrade hook is a no-op — behaviour unchanged. OOM-specific coverage
+  // lives in `bot-detection-oom.spec.ts`.
+  isRedisOomError: () => false,
+  recordRedisOomDegraded: () => {},
 }));
 
 // ---------------------------------------------------------------------------

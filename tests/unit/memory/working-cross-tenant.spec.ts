@@ -89,6 +89,10 @@ const redisStub = {
 vi.mock('@/lib/redis.js', () => ({
   redis: redisStub,
   isRedisConnected: () => true,
+  // #309: consulted in the production catch path. No OOM injected here; OOM
+  // coverage lives in `working-oom.spec.ts`.
+  isRedisOomError: () => false,
+  recordRedisOomDegraded: () => {},
 }));
 
 // Pull production code AFTER mocks are installed so the redis import binds
