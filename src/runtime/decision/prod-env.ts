@@ -40,11 +40,20 @@
  *     DE port: findActive({tenant_id, agent_id, applicable_to_intent?, ...})
  *              → Skill[]; find(id, {tenant_id,agent_id}, {signal?}) → Skill|null
  *     P9a impl: findActive(descriptor, agent_id?) → SkillRow|null;
- *              getById(id) → SkillRow|null
- *     Mapping: DE findActive searches ALL active skills for agent + optional
- *     intent filter; P9a findActive needs a descriptor. We use listByCategory
- *     to enumerate all active skills, then filter by applicable_to_intent.
- *     SkillRow → Skill mapping (field name translation).
+ *              listByCategory(category) → SkillRow[]; getById(id) → SkillRow|null
+ *     Mapping: DE findActive searches ALL active skills for the ROUTED agent +
+ *     optional intent filter; P9a findActive needs a descriptor, so we use
+ *     listByCategory to enumerate active skills across EVERY DE/DB category,
+ *     then SkillSelector ranks/matches. SkillRow → Skill mapping (field name
+ *     translation).
+ *     TENANT ISOLATION (Codex PR #215 review, BLOCKER 2): P9a's listByCategory /
+ *     getById derive their scope from the ambient tenant-context
+ *     (getCurrentTenant + getCurrentAgent). The DE query carries the *routed*
+ *     agent (channel policy may route to an agent ≠ the context agent that
+ *     built the BaseContextPacket). We therefore run the P9a lookups inside a
+ *     nested runWithTenantContext pinned to {query.tenant_id, query.agent_id}
+ *     so selection scopes to the routed agent (the repo keeps its tenant-wide
+ *     `agent_id IS NULL` fallback) and NEVER leaks another agent's skills.
  *
  *  5. ProceduresRepoAdapter  (procedureExecutionsRepo → DE ProceduresRepo)
  *     DE port: findExecution(id) → ProcedureExecution|null
@@ -96,7 +105,7 @@ import { evaluate as p9dEvaluate } from '@/governance/policy-dsl/evaluator.js';
 import { skillsRepo as p9aSkillsRepo } from '@/control-plane/skill-registry/skills-repo.js';
 import { procedureExecutionsRepo, procedureDefinitionsRepo } from '@/db/repositories.js';
 import { logger } from '@/lib/logger.js';
-import { getCurrentAgent } from '@/db/tenant-context.js';
+import { getCurrentAgent, runWithTenantContext } from '@/db/tenant-context.js';
 import { db } from '@/db/client.js';
 import { channel_policies, entity_states, permissoes } from '@/db/schema.js';
 import { and, eq } from 'drizzle-orm';
@@ -272,7 +281,10 @@ function skillRowToSkill(row: {
   id: string;
   skill_descriptor: string;
   category: string;
+  execution_mode: string;
   status: string;
+  goal?: string | unknown;
+  when_to_use?: string | unknown;
   allowed_tools: string[] | unknown;
   policy_descriptors: string[] | unknown;
   runtime_hints: Record<string, unknown> | unknown;
@@ -282,14 +294,30 @@ function skillRowToSkill(row: {
   const hints = (typeof row.runtime_hints === 'object' && row.runtime_hints !== null)
     ? (row.runtime_hints as Record<string, unknown>)
     : {};
+  const when_to_use = typeof row.when_to_use === 'string' ? row.when_to_use : '';
   return {
     id: row.id,
+    // F1 Phase 1 (immutable identity): carry the stable descriptor + version
+    // + execution_mode forward so ActionDecider can gate execute_skill on the
+    // mode and pin the descriptor/version onto the packet for the call site's
+    // identity assert. Previously these were discarded (Codex P2).
+    skill_descriptor: row.skill_descriptor,
+    version: row.version,
+    execution_mode: row.execution_mode as Skill['execution_mode'],
     category: row.category as Skill['category'],
     priority: 5, // P9a does not store priority; default 5 (medium)
     status: row.status as Skill['status'],
-    // P9a does not store applicable_to_intent — derived from skill_descriptor convention
-    // e.g. 'skill.greet' → intent 'greet'. PEPs that need exact match will
-    // consult the full descriptor-to-intent mapping when P9a adds this field.
+    // F1 Phase 0: P9a doesn't store a structured applicable_to_intent list,
+    // but the `skill_descriptor` follows a convention (e.g. 'skill.greet',
+    // 'transfer_intent') whose terminal token names the intent. We surface the
+    // descriptor token(s) as applicable_to_intent so SkillSelector's exact-match
+    // path works for descriptor-named skills; the free-text `when_to_use` below
+    // carries the rest of the matching signal.
+    applicable_to_intent: deriveIntentLabels(row.skill_descriptor),
+    // F1 Phase 0: free-text matching guidance from the Skill Contract. The
+    // anti-hijack matcher tokenises this against the classified intent so a
+    // skill is only selected when the turn clearly relates to it.
+    when_to_use,
     allowed_tools,
     blocked_tools: [], // P9a does not store blocked_tools separately
     requires_confirmation_tools: [], // P9a does not store this
@@ -302,32 +330,108 @@ function skillRowToSkill(row: {
   };
 }
 
+/**
+ * Derive candidate intent labels from a skill descriptor (F1 Phase 0).
+ *
+ * Descriptors follow loose conventions: dotted ('skill.greet', 'billing.cancel')
+ * or snake/flat ('transfer_intent'). We surface the FULL descriptor and its
+ * terminal segment as exact-match candidates so a descriptor that literally
+ * equals (or ends with) the classified intent label selects deterministically.
+ * The free-text `when_to_use` provides the fuzzier token-overlap signal.
+ */
+function deriveIntentLabels(descriptor: string): string[] {
+  if (!descriptor) return [];
+  const labels = new Set<string>();
+  const full = descriptor.trim().toLowerCase();
+  if (full) labels.add(full);
+  const lastDotSegment = full.split('.').pop();
+  if (lastDotSegment) labels.add(lastDotSegment);
+  return Array.from(labels);
+}
+
+/**
+ * Every category the `skills.category` CHECK constraint allows
+ * (db/schema.ts: 'classify','extract','compose','decide','tool_mediated',
+ * 'diagnose','plan','evaluator'). Codex PR #215 review (CORRECTNESS 4): the
+ * adapter previously enumerated only respond/tool_mediated/decide/plan, so
+ * active skills in classify/extract/compose/diagnose/evaluator NEVER became
+ * candidates. We enumerate the full DB set here so all active skills are
+ * eligible; SkillSelector then ranks/matches them.
+ *
+ * NOTE: 'respond' is a DE-RUNTIME `Skill.category` value, not a DB category, so
+ * it is intentionally absent — `listByCategory('respond')` would always return
+ * zero rows. The DE-side ranking still treats `respond` specially when a Skill
+ * carries that category from another source.
+ */
+const SKILL_DB_CATEGORIES = [
+  'classify',
+  'extract',
+  'compose',
+  'decide',
+  'tool_mediated',
+  'diagnose',
+  'plan',
+  'evaluator',
+] as const;
+
+/**
+ * The DE's SkillsRepoAdapter. Its COMPLETE P9a surface is exactly two calls:
+ *   - findActive → p9aSkillsRepo.listByCategory (once per DB category)
+ *   - find       → p9aSkillsRepo.getById
+ * BOTH run inside a nested runWithTenantContext pinned to the ROUTED
+ * {tenant_id, agent_id} (Codex #215 BLOCKER 2). Any P9a query added here in the
+ * future MUST be wrapped the same way — otherwise it would silently scope to
+ * the AMBIENT context agent (getCurrentAgent) and leak another agent's skills.
+ *
+ * Tenant-wide skills (agent_id IS NULL) are SHARED across every agent in the
+ * tenant BY DESIGN — that is P9a's semantic for an ownerless/shared skill, NOT
+ * a leak (Codex #217 review item 3). The nested context only changes which
+ * agent P9a's `agent_id = <ctx> OR agent_id IS NULL` clause resolves <ctx> to;
+ * it can never surface a row OWNED by a different agent. So the inter-agent
+ * isolation guarantee is precisely: an agent-OWNED skill never resolves under
+ * a different agent, while ownerless/tenant-wide skills remain shared. This is
+ * proven with seeded rows (not just context observation) by the `items 3+4`,
+ * `item 5`, and `item 6` tests in tests/unit/decision-prod-env-skills.spec.ts.
+ */
 const skillsRepoAdapter: SkillsRepo = {
   async findActive(query, _options) {
-    // P9a skillsRepo.listByCategory needs tenant context (getCurrentTenant).
-    // We enumerate all active skills across all categories and filter by
-    // applicable_to_intent when supplied.
-    // Categories aligned with DE Skill.category values.
-    const categories = ['respond', 'tool_mediated', 'decide', 'plan'];
-    const allSkills: Skill[] = [];
-    for (const cat of categories) {
-      // listByCategory is tenant+agent scoped via tenant-context.
-      const rows = await p9aSkillsRepo.listByCategory(cat);
-      for (const row of rows) {
-        // Agent filter: P9a already applies agent scope via tenant context;
-        // additional explicit filter not needed.
-        allSkills.push(skillRowToSkill(row));
-      }
-    }
-    // Filter by applicable_to_intent if specified.
-    // Since P9a doesn't store applicable_to_intent, we can't filter precisely.
-    // Return ALL active skills and let SkillSelector pick by category/priority.
-    void query.applicable_to_intent; // acknowledged but not filterable in P9a
-    return allSkills;
+    // TENANT ISOLATION (Codex PR #215 review, BLOCKER 2): P9a's listByCategory
+    // scopes to the AMBIENT tenant-context agent (getCurrentAgent). The DE query
+    // carries the *routed* agent, which channel policy may resolve to a
+    // different agent than the one that built the BaseContextPacket. Pin the
+    // P9a lookups to {query.tenant_id, query.agent_id} via a nested
+    // runWithTenantContext so candidates belong to the ROUTED agent (P9a still
+    // unions its tenant-wide `agent_id IS NULL` skills) and we never leak the
+    // context agent's skills.
+    return runWithTenantContext(
+      { tenant_id: query.tenant_id, agent_id: query.agent_id },
+      async () => {
+        const allSkills: Skill[] = [];
+        for (const cat of SKILL_DB_CATEGORIES) {
+          const rows = await p9aSkillsRepo.listByCategory(cat);
+          for (const row of rows) {
+            allSkills.push(skillRowToSkill(row));
+          }
+        }
+        // P9a doesn't store a structured applicable_to_intent, so we can't
+        // pre-filter precisely here. Return ALL active scoped skills and let
+        // SkillSelector match by applicable_to_intent (derived from the
+        // descriptor) + when_to_use + category/priority.
+        void query.applicable_to_intent; // acknowledged; matched downstream
+        return allSkills;
+      },
+    );
   },
 
-  async find(skill_id, _scope, _options) {
-    const row = await p9aSkillsRepo.getById(skill_id);
+  async find(skill_id, scope, _options) {
+    // Scope the lookup to the supplied {tenant_id, agent_id} (the routed agent)
+    // rather than the ambient context (Codex PR #215 review, BLOCKER 2 /
+    // round-2 finding 3). getById is tenant+agent scoped via tenant-context and
+    // returns null for a skill owned by a different agent in the same tenant.
+    const row = await runWithTenantContext(
+      { tenant_id: scope.tenant_id, agent_id: scope.agent_id },
+      () => p9aSkillsRepo.getById(skill_id),
+    );
     if (!row) return null;
     return skillRowToSkill(row);
   },
@@ -495,8 +599,24 @@ const lockdownReaderAdapter = new LockdownReaderProdAdapter();
  * channel_policies.agent_id is the owning/default agent for the channel.  No
  * JOIN to roles or agents is needed because agent_id is a direct column.
  */
+// `channel_policies.channel_id` is a `uuid` column. The single-channel hot
+// path (FEATURE_MULTI_CHANNEL off) feeds the sentinel string 'default' as the
+// channel id (see build-base-context.ts: `channel_id ?? 'default'`), which is
+// not a uuid. Querying the uuid column with it makes Postgres throw
+// `invalid input syntax for type uuid: "default"`, which propagates up and
+// fail-closes the entire Decision Engine turn. A non-uuid channel id can never
+// match a stored policy row anyway, so short-circuit to the context agent —
+// the same outcome as the zero-row fallback below for an unconfigured (but
+// uuid-shaped) channel.
+const CHANNEL_ID_UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 const channelPoliciesReaderAdapter: ChannelPoliciesReader = {
   async getForChannel(tenant_id, channel_id) {
+    if (!CHANNEL_ID_UUID_RE.test(channel_id)) {
+      return { tenant_id, channel_id, default_agent_id: getCurrentAgent() };
+    }
+
     const rows = await db
       .select({ agent_id: channel_policies.agent_id })
       .from(channel_policies)

@@ -414,8 +414,6 @@ If two concurrent ReAct loops both generate PDFs (e.g., owner sends two requests
 - Sub-A design — `docs/superpowers/specs/2026-04-29-whatsapp-ux-polish-design.md` (`sendOutboundText` opts pattern, mirrored here)
 - B0 design — `docs/superpowers/specs/2026-04-29-whatsapp-b0-pending-gate-design.md` (`Tool` type, agent loop tracking pattern)
 - B3a design — `docs/superpowers/specs/2026-04-29-whatsapp-b3a-view-once-design.md` (referenced in §11 for the explicit "no view-once for PDFs" decision)
-- Spec 09 — audit taxonomy
-- Spec 10 — multimedia (inbound only — outbound media is new)
-- Spec 14 — Brazilian formatting (`src/lib/brazilian.ts`)
+- `src/lib/brazilian.ts` — Brazilian formatting helpers
 - pdfmake docs: <https://pdfmake.github.io/docs/>
 - Baileys docs: `sendMessage` document content type accepts `{ document: Buffer, mimetype, fileName, caption }`.

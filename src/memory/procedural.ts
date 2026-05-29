@@ -1,3 +1,31 @@
+/**
+ * Procedural memory — `learned_rules` mutation facade.
+ *
+ * TENANT/AGENT-ISOLATION INVARIANT (issue #230, north star principle):
+ *   "Maias de empresas diferentes NUNCA se comunicam, compartilham dados ou
+ *    herdam aprendizado. Sem exceção."
+ *
+ * Every function in this module operates on a raw `rule_id` (UUID). The
+ * underlying `rulesRepo` methods are SCOPE-AUTHORITATIVE — `listActive`,
+ * `findByContext`, `byId`, `incrementAcerto`, `incrementErro`, and `setStatus`
+ * all pin `tenant_id = <ctx> AND agent_id = <ctx>` into the WHERE clause.
+ *
+ * If a caller passes a `rule_id` that exists but belongs to a DIFFERENT
+ * tenant/agent, the mutation throws `TypedError('rule_not_in_scope', ...)`.
+ * That is a LOUD failure, not a silent no-op (see the INVARIANT block on
+ * rulesRepo in src/db/repositories.ts for rationale). Callers running inside
+ * a normal `runWithTenantContext` boundary will never see this for legitimate
+ * ids resolved from their OWN reads — by construction, `listActive` /
+ * `byId` only ever return same-scope rules. A `rule_not_in_scope` from this
+ * module signals either (a) caller bug — id sourced from outside the scoped
+ * read path, or (b) ATTEMPTED CROSS-TENANT MUTATION — both warrant a stack
+ * trace, not a no-op.
+ *
+ * Reflection / promotion logic (recordAcerto / recordErro below) chains
+ * `incrementAcerto/Erro` → `byId` → `setStatus`. The throw on the first
+ * mutator short-circuits the chain so the policy side-effects (promote to
+ * 0.8 confidence, deactivate after 2 errors) never fire on out-of-scope rows.
+ */
 import { rulesRepo } from '@/db/repositories.js';
 
 export async function listRulesForType(tipo: string) {

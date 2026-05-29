@@ -1,0 +1,82 @@
+# Exclude paths from the Docker build context. The repo ships TWO
+# Dockerfiles — main `Dockerfile` (Fastify) and `src/admin-ui/Dockerfile`
+# (Next.js admin-ui). Both use the same build context (the repo root), so
+# this file applies to both.
+#
+# Why this exists (Codex Adversarial Review on PR #176, [medium]):
+#   `COPY . .` in either Dockerfile would otherwise drag local `.env`,
+#   `.git`, `.baileys-auth/`, `media/`, `node_modules/`, and `.next/` into
+#   the build context. That bloats the image, leaks operator secrets into
+#   intermediate layers (and remote builder caches), and slows the build.
+
+# ─── Secrets / operator state ────────────────────────────────────────────
+# Codex Adversarial Review round 3 on PR #176, [high]: the previous list
+# (`.env`, `.env.local`, `.env.*.local`) still let `.env.production`,
+# `.env.staging`, `.env.development`, etc. through. Block ALL `.env*` files
+# and un-ignore only `.env.example` (the public template).
+.env*
+!.env.example
+
+# .npmrc commonly carries registry tokens. Same with shell-history,
+# OS-keystore exports, PEM/PFX/PKCS#12 material.
+.npmrc
+.netrc
+.aws/
+.ssh/
+*.pem
+*.key
+*.crt
+*.pfx
+*.p12
+secrets/
+secret/
+
+# ─── Auth / runtime state ────────────────────────────────────────────────
+.baileys-auth/
+auth_info_baileys/
+media/
+uploads/
+
+# ─── Version control ─────────────────────────────────────────────────────
+.git
+.gitignore
+.gitattributes
+
+# ─── Node / build artifacts (not needed in image, will be reinstalled) ──
+node_modules
+src/admin-ui/node_modules
+dist
+.next
+src/admin-ui/.next
+src/admin-ui/out
+*.tsbuildinfo
+.cache
+.turbo
+coverage
+.nyc_output
+
+# ─── Editor / OS junk ────────────────────────────────────────────────────
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# ─── Logs ────────────────────────────────────────────────────────────────
+logs
+*.log
+*.log.*
+
+# ─── Local PG / Redis volumes (dev only) ─────────────────────────────────
+pg_data
+redis_data
+
+# ─── Claude scratch files ────────────────────────────────────────────────
+.claude
+p8.5-plan.md
+p8.5-spec.md
+
+# ─── Test fixtures that aren't needed in the runtime image ──────────────
+tests
+backups

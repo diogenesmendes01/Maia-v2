@@ -15,10 +15,11 @@ import { handleQuarantineFirstContact, handleOwnerIdentityReply } from '@/identi
 import { config } from '@/config/env.js';
 import { featureFlags } from '@/config/feature-flags.js';
 import { FeatureFlagName } from '@/types/enums.js';
-import { clearDebounceState } from '@/gateway/debouncer.js';
+import { clearDebounceState as clearDebounceStateRaw } from '@/gateway/debouncer.js';
 import { buildPrompt } from './prompt-builder.js';
 import { hashScope } from './scope-hash.js';
 import { logger } from '@/lib/logger.js';
+import { TypedError } from '@/lib/utils.js';
 import type { Mensagem, ProcedureExecution, Role } from '@/db/schema.js';
 import { resolveChannel } from '@/gateway/channel-resolver.js';
 import { selectRole } from '@/cognition/role-selector/engine.js';
@@ -39,7 +40,10 @@ import { selectProcedure, type SelectorDecision } from '@/cognition/procedure-se
 import { evaluateCurrentStep } from '@/cognition/step-evaluator.js';
 import * as procedureEngine from '@/procedures/engine.js';
 import { CognitiveEventType } from '@/types/enums.js';
-import { sendOutbound } from './output-dispatch.js';
+import { sendOutbound, safeDispatchOutput } from './output-dispatch.js';
+import { executeSelectedSkill } from './execute-skill.js';
+import { runSkill } from '@/skills/index.js';
+import { skillsRepo } from '@/db/repositories.js';
 import { runReActLoop } from './react-loop.js';
 import { runWithTenantContext, getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import { db } from '@/db/client.js';
@@ -201,12 +205,53 @@ async function probeMessageForChannel(
   }
 }
 
+/**
+ * Best-effort `clearDebounceState` wrapper for the post-turn cleanup
+ * callsites in this file. The debouncer's fail-closed contract (PR #259
+ * review) means `clearDebounceState` THROWS on a Redis blip — exactly
+ * the right behavior at the SCHEDULE entry-point (caller in
+ * `baileys.ts` must stop, not silently bypass the tenant-scoped
+ * debounce). At the CLEAR-after-turn callsites in core.ts, however, the
+ * agent has already done its work: dispatched the reply, persisted state,
+ * audited the turn. Propagating the throw here would only cause BullMQ
+ * to retry the entire turn (idempotent thanks to the dispatched-message
+ * dedup, but wasteful) and the next debounce window self-heals via the
+ * 10-minute Redis TTL on the state key.
+ *
+ * Swallow the throw + log it, so a Redis outage during cleanup is
+ * visible to operators (via `agent.clear_debounce_failed`) without
+ * cratering the turn. Schedule-path callers (`scheduleDebouncedAgent`)
+ * must NOT use this wrapper.
+ */
+async function clearDebounceState(phone: string): Promise<void> {
+  try {
+    await clearDebounceStateRaw(phone);
+  } catch (err) {
+    logger.warn(
+      {
+        err: (err as Error).message,
+        err_code: (err as { code?: string }).code,
+        phone: '[REDACTED]',
+      },
+      'agent.clear_debounce_failed',
+    );
+  }
+}
+
 export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
-  // P6 Task 9: roteamento via channel resolver quando flag MULTI_CHANNEL ON.
-  // O resolver é o entry point — roda ANTES de existir tenant context (faz
-  // cross-tenant lookup propositalmente). Falhas caem em default/default
-  // (legacy) para preservar compat com P0..P5 quando o canal não está
-  // registrado em `channels`.
+  // P6 Task 9 + issue #268 (fail-loud): roteamento via channel resolver.
+  //
+  // Quando MULTI_CHANNEL está OFF, opera direto em `default/default` (modo
+  // legacy single-tenant — preservado de P0..P5). O resolver NÃO é chamado
+  // nesse caminho.
+  //
+  // Quando MULTI_CHANNEL está ON, qualquer falha de resolução (probe sem
+  // telefone, canal não registrado, canal inativo) AGORA é fatal: o resolver
+  // levanta TypedError, este caller emite um audit `channel_resolution_failed`
+  // (com contexto suficiente pra triagem) e re-lança. BullMQ trata como job
+  // failure → retry policy → DLQ. Isso elimina o bypass do issue #268, em que
+  // tenants distintos colapsavam no bucket compartilhado
+  // `maia:ratelimit:default:default:*`.
   let resolved: { tenant_id: string; agent_id: string; channel_id: string | null } = {
     tenant_id: 'default',
     agent_id: 'default',
@@ -214,16 +259,72 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
   };
 
   if (featureFlags.isEnabled(FeatureFlagName.MULTI_CHANNEL)) {
+    let probe: { channel_type: 'whatsapp'; external_id: string } | null = null;
     try {
-      const probe = await probeMessageForChannel(mensagem_id);
-      if (probe) {
-        resolved = await resolveChannel(probe);
+      probe = await probeMessageForChannel(mensagem_id);
+      if (!probe) {
+        // Probe missing/incomplete metadata is also a resolution failure when
+        // MULTI_CHANNEL is ON — without (channel_type, external_id) we can't
+        // identify the tenant, and falling back to default/default would
+        // collapse buckets cross-tenant.
+        throw new TypedError(
+          'channel_resolution_failed',
+          'probe returned null — missing telefone metadata on inbound mensagem',
+          { mensagem_id, resolver_path: 'probe_missing_metadata' },
+        );
       }
+      resolved = await resolveChannel(probe);
     } catch (err) {
+      const typed = err as { code?: string; details?: unknown };
+      // Audit emitted at the caller level so the row carries `mensagem_id` +
+      // whatever probe context we collected. `audit()` wraps in synthetic
+      // `system` tenant context when none is active (we don't have one yet —
+      // we ARE the entry point).
+      await audit({
+        acao: 'channel_resolution_failed',
+        mensagem_id,
+        metadata: {
+          error_code: typed?.code ?? 'unknown',
+          error_message: (err as Error).message,
+          probe_external_id: probe?.external_id ?? null,
+          probe_channel_type: probe?.channel_type ?? null,
+          resolver_details: typed?.details ?? null,
+        },
+      });
       logger.warn(
         { mensagem_id, err: (err as Error).message },
-        'agent.channel_resolution_failed_fallback_default',
+        'agent.channel_resolution_failed_throw',
       );
+      // Propagate: the agent worker (BullMQ) will mark the job failed and
+      // apply the configured retry/DLQ policy. We do NOT fall back to
+      // default/default — that's exactly the bypass issue #268 closed.
+      throw err;
+    }
+
+    // [Codex review #277] Adoption helper — bridge the baileys/resolver gap.
+    //
+    // Baileys ingress persists every inbound under (default, default) — it has
+    // no tenant context to use (the resolver only runs HERE, after persistence).
+    // Without adoption, the inner findById (tenant-scoped) would return null
+    // because the row still carries (default, default), not the resolved
+    // (tenant_id, agent_id). Every successfully-resolved message would then
+    // bounce off `agent.message_not_found` and the turn would silently drop —
+    // functionally identical to the bug issue #268 closed.
+    //
+    // Adoption bypasses the tenant guard via `adoptToResolvedTenantCrossTenant`
+    // — same sanctioned pattern as `channelsRepo.findByExternalCrossTenant`:
+    // the entry point legitimately operates without a tenant context (it is
+    // the one DISCOVERING which tenant owns the row). Once adopted, all
+    // downstream reads inside `runWithTenantContext` see the resolved triplet.
+    //
+    // Idempotency: re-running with the same target tenant/agent is a no-op at
+    // the SQL level (UPDATE writing identical values). Safe for BullMQ retries.
+    if (resolved.tenant_id !== 'default' || resolved.agent_id !== 'default') {
+      await mensagensRepo.adoptToResolvedTenantCrossTenant({
+        id: mensagem_id,
+        tenant_id: resolved.tenant_id,
+        agent_id: resolved.agent_id,
+      });
     }
   }
 
@@ -856,6 +957,91 @@ async function runAgentForMensagemInner(
         await conversasRepo.touch(c.id);
         await clearDebounceState(pessoa.telefone_whatsapp);
         return;
+      }
+
+      // action_mode='execute_skill' (F1 Phase 1) → run the selected
+      // prompt_only/evaluator skill via runSkill and deliver its reply through
+      // dispatchOutput. The execution_mode gate lives in ActionDecider; here we
+      // enforce the immutable-identity assert (re-resolve by descriptor under
+      // the routed agent; pinned id+version must still match) and the safe
+      // fall-through contract — a !ok / identity-mismatch / no-reply skill
+      // degrades to the normal LLM/ReAct turn (prompt_only/evaluator have no
+      // side effects, so this can't double-act).
+      if (packet.action_mode === 'execute_skill') {
+        const replyJid =
+          typeof (inbound.metadata as Record<string, unknown> | null)?.['remote_jid'] === 'string' &&
+          ((inbound.metadata as Record<string, unknown>)['remote_jid'] as string).length > 0
+            ? ((inbound.metadata as Record<string, unknown>)['remote_jid'] as string)
+            : pessoa.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
+        const routedAgentId = packet.routing.agent_id;
+        const pinned =
+          packet.routing.selected_skill_descriptor !== undefined &&
+          packet.routing.selected_skill_version !== undefined &&
+          packet.routing.selected_skill_id !== undefined
+            ? {
+                selected_skill_descriptor: packet.routing.selected_skill_descriptor,
+                selected_skill_version: packet.routing.selected_skill_version,
+                selected_skill_id: packet.routing.selected_skill_id,
+              }
+            : null;
+        const outcome = await executeSelectedSkill(
+          {
+            pinned,
+            routedAgentId,
+            pessoa,
+            conversa: c,
+            inbound,
+            jid: replyJid,
+            aggregatedText: inbound.conteudo ?? '',
+          },
+          {
+            resolveActiveSkill: async (descriptor, agent_id) => {
+              try {
+                // findActive throws agent_scope_violation when the routed agent
+                // differs from the current tenant-context agent — treat that
+                // (and any lookup error) as "not the pinned skill" so we fall
+                // through safely rather than executing a divergent row.
+                const row = await skillsRepo.findActive(descriptor, agent_id);
+                if (row) return { id: row.id, version: row.version };
+                // Q3-A (Codex #216 review item 5): a tenant-wide skill
+                // (agent_id IS NULL) can be SELECTED (selection unions IS NULL)
+                // but is intentionally NOT executable yet — this re-resolution
+                // scopes to the EXACT routed agent, which never matches IS NULL.
+                // Probe explicitly so the block is a VISIBLE "deferred pending
+                // #218 (tenant-wide isolation proof)" rather than a silent
+                // fall-through. We still return null (do NOT execute it).
+                const tenantWide = await skillsRepo.findActive(descriptor, null);
+                if (tenantWide) {
+                  logger.warn(
+                    { skill_descriptor: descriptor, agent_id },
+                    'skill.tenant_wide_not_executable_pending_218',
+                  );
+                }
+                return null;
+              } catch (e) {
+                logger.warn(
+                  { err: (e as Error).message, skill_descriptor: descriptor, agent_id },
+                  'skill.identity_resolve_failed',
+                );
+                return null;
+              }
+            },
+            runSkill,
+            safeDispatchOutput,
+            logger,
+          },
+        );
+        if (outcome.handled) {
+          await markAllProcessed(0);
+          await conversasRepo.touch(c.id);
+          await clearDebounceState(pessoa.telefone_whatsapp);
+          return;
+        }
+        // Not handled → fall through to the normal LLM/ReAct turn below. Cases:
+        // identity mismatch / !ok / no reply (no side effects ran), OR
+        // dispatch_send_failed — a send was ATTEMPTED but threw pre-delivery
+        // (delivered:false), so nothing reached the user and ReAct can safely
+        // answer without a double-send (Codex #216 HIGH-1).
       }
 
       // 'respond', 'call_tool', 'continue_workflow' → proceed to LLM with

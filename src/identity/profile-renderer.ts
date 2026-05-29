@@ -20,6 +20,7 @@
  * os flags, é OMITIDA.
  */
 import type { AgentOperationalProfileVersion } from '@/db/schema.js';
+import { resolveLegacyPayload } from './profile-legacy-resolver.js';
 
 export type RenderedProfile = {
   /** Sempre presente; substitui o antigo `self?.system_prompt`. */
@@ -30,48 +31,30 @@ export type RenderedProfile = {
   episodic_summary_block: string | null;
 };
 
-type CoreImmutable = {
-  identity_block?: string;
-  principles?: unknown[];
-};
-
-type OperationalProfileLayer = {
-  voice_descriptor?: string;
-  thresholds?: Record<string, unknown>;
-};
-
-type EpisodicEntry = {
-  summary?: string;
-  mention_allowed?: boolean;
-  proactive_use?: boolean;
-};
-
-type EpisodicTemp = {
-  entries?: EpisodicEntry[];
-};
-
+// Local type only describes the optional-key item shape of growth_backlog
+// entries (the resolver hands back raw legacy data). The resolver owns the
+// read-precedence + synthesized fallback logic; this file only renders the
+// resolved view.
 type GrowthBacklogItemObject = { descricao?: unknown };
-type GrowthBacklog = unknown[] | { items?: unknown[] };
 
 export function renderOperationalProfile({
   version,
 }: {
   version: AgentOperationalProfileVersion;
 }): RenderedProfile {
-  // TODO(v3.1.1 migration): the schema collapsed core_immutable +
-  // operational_profile + episodic_temp + growth_backlog into a single
-  // `profile_body` JSONB. The renderer still consumes the legacy shape;
-  // when migrated, read from `version.profile_body` (typed as ProfileBody).
-  const legacy = (version as unknown) as {
-    core_immutable?: CoreImmutable;
-    operational_profile?: OperationalProfileLayer;
-    episodic_temp?: EpisodicTemp;
-    growth_backlog?: GrowthBacklog;
-  };
-  const core = (legacy.core_immutable ?? {}) as CoreImmutable;
-  const op = (legacy.operational_profile ?? {}) as OperationalProfileLayer;
-  const ep = (legacy.episodic_temp ?? {}) as EpisodicTemp;
-  const bk = (legacy.growth_backlog ?? {}) as GrowthBacklog;
+  // v3.1.1 contract (migration 061 + Codex review #163 rounds 1-4):
+  //
+  // Read precedence + shape unification live in `resolveLegacyPayload`. The
+  // resolver returns the 4-layer view regardless of whether the row carries
+  // the data via profile_body.{core_immutable,...} (production), top-level
+  // legacy columns (test fixtures), or only the canonical profile_body.identity
+  // shape (synthesized fallback for admin-ui newly-created rows, which now
+  // includes thresholds derived from cognitive_limits — see resolver).
+  const resolved = resolveLegacyPayload(version);
+  const core = resolved.core_immutable;
+  const op = resolved.operational_profile;
+  const ep = resolved.episodic_temp;
+  const bk = resolved.growth_backlog;
 
   // ---- system_prompt_block (sempre presente, nunca null) -------------------
   const lines: string[] = [];

@@ -47,7 +47,20 @@ vi.mock('@/control-plane/policy/policy-rules-repo.js', () => ({
     nextVersion: vi.fn(),
     POLICY_LIFECYCLE_CHANNEL: 'policy_rule_lifecycle',
   },
+  // Issue #249: per-tenant channel routing. Keep the legacy bare-name
+  // export here for back-compat with other consumers that import the
+  // prefix as a label; add the new builder + pattern + parser so any
+  // consumer of the production module that this mock replaces still
+  // resolves all symbols.
   POLICY_LIFECYCLE_CHANNEL: 'policy_rule_lifecycle',
+  POLICY_LIFECYCLE_CHANNEL_PREFIX: 'policy_rule_lifecycle',
+  POLICY_LIFECYCLE_CHANNEL_PATTERN: 'policy_rule_lifecycle:*',
+  buildPolicyLifecycleChannel: (tenant_id: string) =>
+    `policy_rule_lifecycle:${tenant_id}`,
+  parsePolicyLifecycleChannel: (channel: string) =>
+    channel.startsWith('policy_rule_lifecycle:')
+      ? channel.slice('policy_rule_lifecycle:'.length) || null
+      : null,
   isValidDualApprovalEvidence: vi.fn().mockReturnValue(false),
 }));
 
@@ -126,10 +139,16 @@ vi.mock('@/db/client.js', () => {
   return { db: chain, withTx: async <T>(fn: (tx: unknown) => Promise<T>) => fn(chain) };
 });
 
-// Mock: DB tenant context
+// Mock: DB tenant context. `runWithTenantContext` must be present because the
+// SkillsRepoAdapter now wraps its P9a lookups in it to scope to the routed
+// agent (Codex PR #215 review, BLOCKER 2). The mock just runs the callback —
+// getCurrentAgent stays pinned to 'agent_test' for this empty-state test.
 vi.mock('@/db/tenant-context.js', () => ({
   getCurrentTenant: vi.fn().mockReturnValue('tn_test'),
   getCurrentAgent: vi.fn().mockReturnValue('agent_test'),
+  runWithTenantContext: vi.fn(
+    async <T>(_ctx: unknown, fn: () => Promise<T>): Promise<T> => fn(),
+  ),
 }));
 
 // Mock: LLM client

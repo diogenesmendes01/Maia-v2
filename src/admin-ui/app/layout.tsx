@@ -55,6 +55,12 @@ export default async function RootLayout({ children }: { children: React.ReactNo
                     Knowledge
                   </Link>
                   <span className="opacity-50">|</span>
+                  <Link href="/tools" className="hover:underline">
+                    Tools
+                  </Link>
+                  <Link href="/skills" className="hover:underline">
+                    Skills
+                  </Link>
                   <Link href="/setup/tenants" className="hover:underline">
                     Tenants
                   </Link>
@@ -63,6 +69,9 @@ export default async function RootLayout({ children }: { children: React.ReactNo
                   </Link>
                   <Link href="/setup/channels" className="hover:underline">
                     Channels
+                  </Link>
+                  <Link href="/setup/llm-settings" className="hover:underline">
+                    LLM Settings
                   </Link>
                 </div>
                 <div className="flex gap-4 items-center text-sm">

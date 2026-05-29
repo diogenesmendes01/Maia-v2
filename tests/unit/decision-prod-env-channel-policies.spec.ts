@@ -139,7 +139,7 @@ describe('ChannelPoliciesReaderAdapter — Camada 3 #3/4', () => {
       id: 'pol-1',
       tenant_id: 'tenant_A',
       agent_id: 'agent_A1',
-      channel_id: 'channel-whatsapp-001',
+      channel_id: '11111111-1111-1111-1111-111111111111',
       default_role_id: 'role-atendimento',
     });
     setupDbQuery(() => true);
@@ -147,12 +147,12 @@ describe('ChannelPoliciesReaderAdapter — Camada 3 #3/4', () => {
     const env = createProductionDecisionEngineEnv();
     const policy = await env.channelPolicies.getForChannel(
       'tenant_A',
-      'channel-whatsapp-001',
+      '11111111-1111-1111-1111-111111111111',
     );
 
     expect(policy.default_agent_id).toBe('agent_A1');
     expect(policy.tenant_id).toBe('tenant_A');
-    expect(policy.channel_id).toBe('channel-whatsapp-001');
+    expect(policy.channel_id).toBe('11111111-1111-1111-1111-111111111111');
   });
 
   // -------------------------------------------------------------------------
@@ -165,13 +165,13 @@ describe('ChannelPoliciesReaderAdapter — Camada 3 #3/4', () => {
     const env = createProductionDecisionEngineEnv();
     const policy = await env.channelPolicies.getForChannel(
       'tenant_B',
-      'channel-unknown-999',
+      '22222222-2222-2222-2222-222222222222',
     );
 
     // No row → fallback
     expect(policy.default_agent_id).toBe('fallback_agent');
     expect(policy.tenant_id).toBe('tenant_B');
-    expect(policy.channel_id).toBe('channel-unknown-999');
+    expect(policy.channel_id).toBe('22222222-2222-2222-2222-222222222222');
   });
 
   // -------------------------------------------------------------------------
@@ -182,7 +182,7 @@ describe('ChannelPoliciesReaderAdapter — Camada 3 #3/4', () => {
       id: 'pol-2',
       tenant_id: 'tenant_C',
       agent_id: 'agent_C9',
-      channel_id: 'channel-web-001',
+      channel_id: '33333333-3333-3333-3333-333333333333',
       default_role_id: 'role-suporte',
     });
     setupDbQuery(() => true);
@@ -191,7 +191,7 @@ describe('ChannelPoliciesReaderAdapter — Camada 3 #3/4', () => {
     // Querying a different channel_id than what's in the store
     const policy = await env.channelPolicies.getForChannel(
       'tenant_C',
-      'channel-api-999',  // not in store
+      '99999999-9999-9999-9999-999999999999',  // not in store
     );
 
     expect(policy.default_agent_id).toBe('fallback_agent');
@@ -205,7 +205,7 @@ describe('ChannelPoliciesReaderAdapter — Camada 3 #3/4', () => {
       id: 'pol-3',
       tenant_id: 'tenant_T1',
       agent_id: 'agent_T1_secret',
-      channel_id: 'channel-shared-id',
+      channel_id: '44444444-4444-4444-4444-444444444444',
       default_role_id: 'role-default',
     });
     setupDbQuery(() => true);
@@ -214,12 +214,33 @@ describe('ChannelPoliciesReaderAdapter — Camada 3 #3/4', () => {
     // T2 queries same channel_id but different tenant
     const policy = await env.channelPolicies.getForChannel(
       'tenant_T2',           // different tenant!
-      'channel-shared-id',   // same channel_id as T1
+      '44444444-4444-4444-4444-444444444444',   // same channel_id as T1
     );
 
     // Tenant isolation: must NOT return T1's agent
     expect(policy.default_agent_id).not.toBe('agent_T1_secret');
     // Falls back to context agent
     expect(policy.default_agent_id).toBe('fallback_agent');
+  });
+
+  // -------------------------------------------------------------------------
+  // T5: the single-channel 'default' sentinel is NOT a uuid. channel_policies
+  // .channel_id is a `uuid` column, so querying it with 'default' makes
+  // Postgres throw `invalid input syntax for type uuid` and fail-closes the
+  // whole Decision Engine turn. The adapter must short-circuit BEFORE the DB
+  // call and fall back to getCurrentAgent(). Regression for the prod incident
+  // where Maia replied "Sistema indisponível" / "Pode me dar mais detalhes".
+  // -------------------------------------------------------------------------
+  it("T5: 'default' channel sentinel → skips uuid query → fallback agent", async () => {
+    setupDbQuery(() => true);
+
+    const env = createProductionDecisionEngineEnv();
+    const policy = await env.channelPolicies.getForChannel('default', 'default');
+
+    expect(policy.default_agent_id).toBe('fallback_agent');
+    expect(policy.channel_id).toBe('default');
+    // The guard must run before any DB access — never query a uuid column
+    // with a non-uuid value.
+    expect(db.select).not.toHaveBeenCalled();
   });
 });

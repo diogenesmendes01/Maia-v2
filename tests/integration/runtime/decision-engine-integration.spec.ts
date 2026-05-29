@@ -319,6 +319,96 @@ describe('P9b — Decision Engine integration (7 cenários, spec §10.2)', () =>
     expect(r.block).toBeUndefined();
   });
 
+  it('F1 Phase 0 — Cenário 1b: active skill + UNRELATED message ⇒ respond, NO selected_skill_id', async () => {
+    // Anti-hijack at the engine level: the repo returns an active skill, but
+    // the classified intent does not relate to it. The selector must NOT
+    // commit it, and ActionDecider must route the turn to a normal `respond`
+    // (free-form chat reaches the LLM) — never `ask_clarification`.
+    fixture.setContent('quero transferir R$ 100'); // heuristic → transfer_intent
+    // Repo returns an active billing skill regardless of intent (mirrors the
+    // prod adapter, which lists ALL active skills and lets the selector match).
+    fixture.skillsRepo.findActive = vi.fn().mockResolvedValue([
+      {
+        id: 'skill_billing',
+        category: 'tool_mediated',
+        priority: 9,
+        status: 'active',
+        applicable_to_intent: ['billing_question'],
+        when_to_use: 'When the customer asks about an invoice or a charge.',
+        allowed_tools: ['issue_refund'],
+      } satisfies Skill,
+    ]);
+
+    const engine = createDecisionEngine(fixture);
+    const r = await engine.run({ base: mkBase(fixture) });
+
+    expect(r.packet.intent.label).toBe('transfer_intent');
+    expect(r.packet.action_mode).toBe('respond');
+    expect(r.packet.rationale).toBe('respond:no_skill');
+    expect(r.packet.routing.selected_skill_id).toBeUndefined();
+    // The irrelevant skill's tools never leak into the packet.
+    expect(r.packet.tool_permissions.allowed_tools).toEqual([]);
+    // It is still visible as a candidate (what was in scope), just not selected.
+    expect(r.packet.routing.candidate_skill_ids).toEqual(['skill_billing']);
+  });
+
+  it('F1 Phase 1 — matched prompt_only skill ⇒ execute_skill + pinned descriptor+version on packet', async () => {
+    // Engine ON + an active prompt_only skill whose when_to_use/intent matches
+    // the turn ⇒ ActionDecider emits execute_skill, and the engine pins the
+    // skill's stable descriptor + version onto routing for the call-site's
+    // immutable-identity assert.
+    fixture.setContent('olá, tudo bem?'); // heuristic → greet
+    fixture.skillsRepo.findActive = vi.fn().mockResolvedValue([
+      {
+        id: 'skill_faq_id',
+        skill_descriptor: 'faq.answer',
+        version: 7,
+        category: 'respond',
+        execution_mode: 'prompt_only',
+        priority: 5,
+        status: 'active',
+        applicable_to_intent: ['greet'],
+        when_to_use: 'Greeting and small talk.',
+      } satisfies Skill,
+    ]);
+
+    const engine = createDecisionEngine(fixture);
+    const r = await engine.run({ base: mkBase(fixture) });
+
+    expect(r.packet.action_mode).toBe('execute_skill');
+    expect(r.packet.routing.selected_skill_id).toBe('skill_faq_id');
+    expect(r.packet.routing.selected_skill_descriptor).toBe('faq.answer');
+    expect(r.packet.routing.selected_skill_version).toBe(7);
+    // execute_skill carries no tool permissions.
+    expect(r.packet.tool_permissions.allowed_tools).toEqual([]);
+    expect(r.block).toBeUndefined();
+  });
+
+  it('F1 Phase 1 — matched tool_mediated skill does NOT route to execute_skill (Phase 2 excluded)', async () => {
+    fixture.setContent('quero transferir R$ 100'); // heuristic → transfer_intent
+    fixture.skillsRepo.findActive = vi.fn().mockResolvedValue([
+      {
+        id: 'skill_transfer_id',
+        skill_descriptor: 'transfer.run',
+        version: 2,
+        category: 'tool_mediated',
+        execution_mode: 'tool_mediated',
+        priority: 3,
+        status: 'active',
+        applicable_to_intent: ['transfer_intent'],
+        when_to_use: 'When the user wants to transfer money.',
+        allowed_tools: ['transfer_money'],
+      } satisfies Skill,
+    ]);
+
+    const engine = createDecisionEngine(fixture);
+    const r = await engine.run({ base: mkBase(fixture) });
+
+    expect(r.packet.routing.selected_skill_id).toBe('skill_transfer_id');
+    expect(r.packet.action_mode).not.toBe('execute_skill');
+    expect(r.packet.action_mode).toBe('call_tool');
+  });
+
   it('Cenário 2: early block (channel.is_locked_down=true)', async () => {
     const engine = createDecisionEngine(fixture);
     const r = await engine.run({

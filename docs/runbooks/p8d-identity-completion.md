@@ -148,7 +148,12 @@ A versão `active` mudou entre o `getActive()` do script (fora da tx) e o lock `
 
 ### `seed_atomic_freeze_failed`
 
-A row `active` desapareceu mid-tx (deletada). Cenário muito raro — investigar audit log.
+A row `active` desapareceu mid-tx (deletada) OU seu `status` mudou para algo
+diferente de `'active'` entre o snapshot read (FOR UPDATE) e o UPDATE de
+freeze (issue #195 — predicate `status='active'` na WHERE captura escritores
+concorrentes que driblam o `lockParentAgent`, ex.: drift `transition`
+intercalando com um caminho de rollback out-of-band). Cenário muito raro com
+o lock atual — investigar audit log.
 
 ### Race com partial unique index
 

@@ -382,7 +382,5 @@ Single new action. The fall-back-to-text case reuses existing audit conventions 
 - B1 design — `docs/superpowers/specs/2026-04-29-whatsapp-b1-one-tap-design.md` (poll branch precedence)
 - B3a design — `docs/superpowers/specs/2026-04-29-whatsapp-b3a-view-once-design.md` (no-tool-uses branch shape, view-once integration)
 - B3b design — `docs/superpowers/specs/2026-04-30-whatsapp-b3b-pdf-reports-design.md` (`latestReportPdf` precedence, branch ordering after B3b)
-- Spec 09 — audit taxonomy
-- Spec 10 — multimedia (existing inbound Whisper pipeline; B4 mirrors but for outbound)
 - OpenAI TTS docs: `model: 'tts-1'`, `voice: 'nova'`, `response_format: 'opus'`. Returns Opus-in-OGG, compatible with WhatsApp voice notes.
 - Baileys docs: `sendMessage` audio content type accepts `{ audio: Buffer, mimetype, ptt: true }`. `ptt: true` produces voice-note bubbles.

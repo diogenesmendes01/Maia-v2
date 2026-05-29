@@ -206,6 +206,36 @@ export async function runSkill(input: SkillExecutionInput): Promise<SkillExecuti
     skill_id: skill.id,
   };
 
+  // Gate 1.6 (Codex #216 review HIGH-B): close the execution TOCTOU. When the
+  // caller pinned an expected identity (the Decision Engine validated a specific
+  // active row before routing here), the row we just re-resolved by descriptor
+  // MUST still match it. An activate/rollback in the window between the caller's
+  // pre-check and this lookup would otherwise execute a DIVERGENT active row.
+  // Fail-closed on mismatch so the caller degrades safely instead of running it.
+  if (
+    (input.expected_skill_id !== undefined && skill.id !== input.expected_skill_id) ||
+    (input.expected_skill_version !== undefined &&
+      skill.version !== input.expected_skill_version)
+  ) {
+    logger.warn(
+      {
+        descriptor: input.skill_descriptor,
+        expected_id: input.expected_skill_id,
+        expected_version: input.expected_skill_version,
+        resolved_id: skill.id,
+        resolved_version: skill.version,
+      },
+      'p9a.runner.identity_mismatch',
+    );
+    return {
+      ok: false,
+      reason: 'identity_mismatch',
+      latency_ms: Date.now() - startTime,
+      resolved_policies: [],
+      trace: skillTrace,
+    };
+  }
+
   // Gate 1.5b: re-assert agent scope on the resolved skill (defense in
   // depth — findActive should have prevented cross-agent skills surfacing,
   // but tests / future repo refactors could leak).
@@ -314,11 +344,30 @@ export async function runSkill(input: SkillExecutionInput): Promise<SkillExecuti
   const hints = (skill.runtime_hints ?? {}) as Record<string, unknown>;
   const timeoutMs = typeof hints.timeout_ms === 'number' ? hints.timeout_ms : DEFAULT_TIMEOUT_MS;
 
+  // AbortController composes external caller cancellation with internal
+  // timeout cancellation (issue #220). Modes read `ctx.signal` and forward
+  // it to `callLLM` / `toolDispatcher` so the actual HTTP/tool work is
+  // cancelled — not just the JS Promise.race winner.
+  //
+  // The abort reason is preserved so observers (logs, dispatcher) can tell
+  // whether the cancel came from the caller (`caller_cancelled`) or from the
+  // SkillRunner's own timeout (`skill_runner_timeout`).
   const abortController = new AbortController();
+  // Capture the caller-abort handler so we can remove it on every exit path
+  // (success, internal timeout, caller abort). Without removal, the listener
+  // remains attached to a potentially long-lived caller signal and retains
+  // the controller for as long as the caller signal lives (PR #221 review,
+  // item 1: listener leak).
+  let callerAbortHandler: (() => void) | null = null;
   if (input.signal) {
     // Forward caller cancellation to our internal controller.
-    if (input.signal.aborted) abortController.abort();
-    else input.signal.addEventListener('abort', () => abortController.abort(), { once: true });
+    if (input.signal.aborted) {
+      abortController.abort(input.signal.reason ?? 'caller_cancelled');
+    } else {
+      callerAbortHandler = () =>
+        abortController.abort(input.signal?.reason ?? 'caller_cancelled');
+      input.signal.addEventListener('abort', callerAbortHandler, { once: true });
+    }
   }
 
   const fallbackOutput: SkillExecutionOutput = {
@@ -329,86 +378,96 @@ export async function runSkill(input: SkillExecutionInput): Promise<SkillExecuti
     trace: skillTrace,
   };
 
-  const moduleResult = await runCognitiveModule<SkillExecutionOutput>(
-    {
-      name: `skill:${skill.skill_descriptor}`,
-      version: `v${skill.version}`,
-      triggered_by: mapTriggeredBy(input.triggered_by),
-      timeoutMs,
-      conversa_id: input.conversa_id,
-      turno_id: input.turno_id,
-      fallback: () => {
-        // Timeout firing here means runCognitiveModule rejected the racing
-        // promise — signal the in-flight mode so it stops dispatching tools
-        // (review #99 finding 3).
-        abortController.abort();
-        return {
-          ...fallbackOutput,
-          latency_ms: Date.now() - startTime,
-        };
-      },
-    },
-    async () => {
-      const modeHandler = MODE_DISPATCH[skill!.execution_mode];
-      if (!modeHandler) {
-        throw new Error(`unknown_execution_mode: ${skill!.execution_mode}`);
-      }
-      const modeOutput = await modeHandler({
-        skill: skill!,
-        input: input.input,
-        resolvedPolicies,
+  try {
+    const moduleResult = await runCognitiveModule<SkillExecutionOutput>(
+      {
+        name: `skill:${skill.skill_descriptor}`,
+        version: `v${skill.version}`,
+        triggered_by: mapTriggeredBy(input.triggered_by),
+        timeoutMs,
         conversa_id: input.conversa_id,
         turno_id: input.turno_id,
-        signal: abortController.signal,
-      });
+        fallback: () => {
+          // Timeout firing here means runCognitiveModule rejected the racing
+          // promise — signal the in-flight mode so it stops dispatching tools
+          // (review #99 finding 3). Aborting also propagates through ctx.signal
+          // to `callLLM` so the HTTP request itself is cancelled (issue #220).
+          abortController.abort('skill_runner_timeout');
+          return {
+            ...fallbackOutput,
+            latency_ms: Date.now() - startTime,
+          };
+        },
+      },
+      async () => {
+        const modeHandler = MODE_DISPATCH[skill!.execution_mode];
+        if (!modeHandler) {
+          throw new Error(`unknown_execution_mode: ${skill!.execution_mode}`);
+        }
+        const modeOutput = await modeHandler({
+          skill: skill!,
+          input: input.input,
+          resolvedPolicies,
+          conversa_id: input.conversa_id,
+          turno_id: input.turno_id,
+          signal: abortController.signal,
+        });
 
-      // Gate 7: output validation
-      const outputValidation = validateAgainstSchema(
-        modeOutput,
-        skill!.output_schema as Record<string, unknown>,
-      );
-      if (!outputValidation.valid) {
+        // Gate 7: output validation
+        const outputValidation = validateAgainstSchema(
+          modeOutput,
+          skill!.output_schema as Record<string, unknown>,
+        );
+        if (!outputValidation.valid) {
+          return {
+            ok: false,
+            reason: 'invalid_output' as const,
+            message: outputValidation.errors.join('; '),
+            latency_ms: Date.now() - startTime,
+            resolved_policies: resolvedPolicyIds,
+            trace: skillTrace,
+          };
+        }
+
         return {
-          ok: false,
-          reason: 'invalid_output' as const,
-          message: outputValidation.errors.join('; '),
+          ok: true,
+          output: modeOutput,
           latency_ms: Date.now() - startTime,
           resolved_policies: resolvedPolicyIds,
           trace: skillTrace,
         };
-      }
+      },
+    );
 
+    if (moduleResult.status === 'timeout') {
+      abortController.abort('skill_runner_timeout');
       return {
-        ok: true,
-        output: modeOutput,
-        latency_ms: Date.now() - startTime,
+        ok: false,
+        reason: 'timeout',
+        message: 'execution exceeded timeout_ms',
+        latency_ms: moduleResult.latency_ms,
         resolved_policies: resolvedPolicyIds,
         trace: skillTrace,
       };
-    },
-  );
-
-  if (moduleResult.status === 'timeout') {
-    abortController.abort();
-    return {
-      ok: false,
-      reason: 'timeout',
-      message: 'execution exceeded timeout_ms',
-      latency_ms: moduleResult.latency_ms,
-      resolved_policies: resolvedPolicyIds,
-      trace: skillTrace,
-    };
-  }
-
-  return (
-    moduleResult.output ?? {
-      ok: false,
-      reason: 'executor_error',
-      latency_ms: moduleResult.latency_ms,
-      resolved_policies: resolvedPolicyIds,
-      trace: skillTrace,
     }
-  );
+
+    return (
+      moduleResult.output ?? {
+        ok: false,
+        reason: 'executor_error',
+        latency_ms: moduleResult.latency_ms,
+        resolved_policies: resolvedPolicyIds,
+        trace: skillTrace,
+      }
+    );
+  } finally {
+    // Detach the caller-signal listener on every exit path so we don't pin
+    // the controller (and any closure it captures) to a long-lived caller
+    // signal after the runner returns. PR #221 review, item 1.
+    if (callerAbortHandler && input.signal) {
+      input.signal.removeEventListener('abort', callerAbortHandler);
+    }
+  }
 }
 
 /**

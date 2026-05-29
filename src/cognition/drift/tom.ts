@@ -13,22 +13,17 @@ import Anthropic from '@anthropic-ai/sdk';
 import { DriftType } from '@/types/enums.js';
 import type { DriftDetector, DriftDetectionInput, DriftEvidence } from './types.js';
 
-type CoreImmutable = { identity_block?: string };
-type OpProfile = { voice_descriptor?: string };
+import { resolveLegacyPayload } from '@/identity/profile-legacy-resolver.js';
 
 export const tomDetector: DriftDetector = {
   type: DriftType.TOM,
   async detect(input: DriftDetectionInput): Promise<DriftEvidence | null> {
-    // TODO(v3.1.1 migration): the schema collapsed core_immutable + operational_profile
-    // into a single `profile_body` JSONB. The detectors still read the legacy
-    // shape — read from `profile_body` (cast as legacy-compatible) until they
-    // are migrated to consume the new identity/style/metadata structure.
-    const legacy = (input.profile_active as unknown) as {
-      core_immutable?: CoreImmutable;
-      operational_profile?: OpProfile;
-    };
-    const core = (legacy.core_immutable ?? {}) as CoreImmutable;
-    const op = (legacy.operational_profile ?? {}) as OpProfile;
+    // v3.1.1 contract (migration 061 + Codex review #163 round 4): the legacy
+    // 4-layer payload now lives at profile_body.* on a Drizzle-shaped row.
+    // The shared resolver hides the read-precedence + synthesized fallback.
+    const { core_immutable: core, operational_profile: op } = resolveLegacyPayload(
+      input.profile_active,
+    );
     const agentMessages = input.recent_messages.filter((m) => m.from === 'agent');
     if (agentMessages.length === 0) return null;
 

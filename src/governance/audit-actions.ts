@@ -91,6 +91,7 @@ export const AUDIT_ACTIONS = [
   'outbound_view_once_skipped_by_preference',
   'outbound_sent_document',
   'outbound_sent_voice',
+  'outbound_dispatch_failed',
   'pairing_qr_displayed',
   'pairing_code_requested',
   'pairing_completed',
@@ -132,6 +133,10 @@ export const AUDIT_ACTIONS = [
   'manage_calendar',
   'capability_proposal_approved',
   'capability_proposal_rejected',
+  // Issue #268 — channel resolver fail-loud: emitted when channel resolution
+  // fails (legacy fallback removed). Surfaces previously-masked failures and
+  // prevents cross-tenant rate-limit bucket collapse via default/default.
+  'channel_resolution_failed',
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];

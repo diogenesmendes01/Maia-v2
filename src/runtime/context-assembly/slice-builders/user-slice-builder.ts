@@ -97,7 +97,9 @@ export class UserSliceBuilder
       depth: req.depth,
       max_items: req.max_items ?? 5,
     });
-    return sliceCacheKey(base.tenant_id, 'user', scope);
+    // Issue #235: include agent_id in the key prefix so two agents on the
+    // same tenant interacting with the same pessoa never share a user slice.
+    return sliceCacheKey(base.tenant_id, base.agent_id, 'user', scope);
   }
 
   async build(

@@ -63,10 +63,26 @@ export function reconnectDelayMs(attempt: number): number {
 }
 
 export const MEDIA_ROOT = join(config.BAILEYS_AUTH_DIR, '..', 'media');
-mkdirSync(MEDIA_ROOT, { recursive: true });
-// B3b: tmp subdir for in-flight PDF reports. Created here (idempotent) so any
-// caller importing MEDIA_ROOT can rely on `<MEDIA_ROOT>/tmp` existing.
-mkdirSync(join(MEDIA_ROOT, 'tmp'), { recursive: true });
+
+/**
+ * Create the media directories (`<MEDIA_ROOT>` and `<MEDIA_ROOT>/tmp`).
+ *
+ * Idempotent (`recursive: true`). IMPORTING THIS MODULE MUST HAVE NO
+ * FILESYSTEM SIDE EFFECTS: the admin-ui imports the tool registry (via
+ * `send-proactive-message.ts` → baileys), and an admin-ui process must never
+ * write `media/` dirs on import. The backend (`maia-app`) calls this at boot
+ * from `startBaileys()`; every code path that WRITES under `MEDIA_ROOT` /
+ * `MEDIA_ROOT/tmp` (inbound media downloads via `mediaPathFor`, PDF report
+ * generation in `lib/pdf/*`) also calls it (or guards with `existsSync`), so
+ * the dirs exist before any write even when `startBaileys()` has not run
+ * (tests, isolated PDF generation). Backend behaviour is unchanged — the only
+ * difference is that a bare `import` no longer touches the filesystem.
+ */
+export function ensureMediaDirs(): void {
+  mkdirSync(MEDIA_ROOT, { recursive: true });
+  // B3b: tmp subdir for in-flight PDF reports.
+  mkdirSync(join(MEDIA_ROOT, 'tmp'), { recursive: true });
+}
 
 export function isBaileysConnected(): boolean {
   return connected;
@@ -175,6 +191,10 @@ async function handleConnectionUpdate(update: ConnectionUpdate): Promise<void> {
 }
 
 export async function startBaileys(): Promise<void> {
+  // Backend boot (maia-app): create media dirs here, NOT at module load, so
+  // importing this module (e.g. from the admin-ui tool catalog) has no fs side
+  // effects. Idempotent.
+  ensureMediaDirs();
   const { state, saveCreds } = await useMultiFileAuthState(config.BAILEYS_AUTH_DIR);
   // Pin the WA Web protocol version to whatever WhatsApp is currently
   // serving. Without this, Baileys uses the version hardcoded at the time
@@ -227,18 +247,79 @@ export async function startBaileys(): Promise<void> {
         // We synthesise an IWebMessageInfo whose `message` is the `update.message`
         // payload so routeMessageUpdate can branch on editedMessage / protocolMessage.
         // The `as never` cast is intentional — runtime structure is what matters.
+        //
+        // [Codex review #277 v2 BLOQUEADO fix] Resolve target whatsapp_id
+        // cross-tenant BEFORE entering ALS, then run routeMessageUpdate in
+        // the resolved tenant context. Rationale: `runAgentForMensagem`
+        // adopts inbound rows from (default, default) into the real
+        // (tenant_id, agent_id) when the resolver succeeds. A subsequent
+        // edit/revoke arriving via this listener has no tenant context;
+        // running `routeMessageUpdate` under `default/default` would
+        // cause `mensagensRepo.findByWhatsappId` to miss the (now-adopted)
+        // original and the edit/revoke would be silently dropped
+        // (edit_unknown_original / revoke_unknown_original). The fix
+        // mirrors `runAgentForMensagem`'s adopt-then-runWithTenantContext
+        // ordering: discover the owning tenant via the sanctioned cross-
+        // tenant lookup, then operate fully scoped from that point on.
+        const target_whatsapp_id = extractMessageUpdateTargetId(update);
+        if (!target_whatsapp_id) {
+          // Read receipts / status updates / unsupported envelope shapes —
+          // routeMessageUpdate would no-op anyway. Skip without touching DB.
+          continue;
+        }
+        const original = await mensagensRepo.findByWhatsappIdCrossTenant(
+          target_whatsapp_id,
+        );
+        if (!original) {
+          // Genuinely unknown message (never inbound through us, or already
+          // GC'd). Preserve the existing fail-soft contract — routeMessageUpdate
+          // also returns silently on null `findByWhatsappId`. Log so triage
+          // can spot a pattern (e.g., a real bug producing stranded edits).
+          logger.debug(
+            { whatsapp_id: target_whatsapp_id },
+            'message_update.cross_tenant_lookup_miss',
+          );
+          continue;
+        }
         await runWithTenantContext(
-          { tenant_id: 'default', agent_id: 'default' },
-          () => routeMessageUpdate({
-            key: update.key,
-            message: update.update.message,
-          } as never),
+          { tenant_id: original.tenant_id, agent_id: original.agent_id },
+          () =>
+            routeMessageUpdate({
+              key: update.key,
+              message: update.update.message,
+            } as never),
         );
       } catch (err) {
         logger.error({ err: (err as Error).message }, 'message_update.dispatch_failed');
       }
     }
   });
+}
+
+/**
+ * Extract the whatsapp_id of the message being edited/revoked from a Baileys
+ * `messages.update` payload. Mirrors the dispatch logic in
+ * `routeMessageUpdate` (src/agent/message-update.ts):
+ *   - editedMessage  → the envelope's key.id IS the target id (the edit is
+ *                      delivered as an update for the original message key).
+ *   - protocolMessage type=0 (REVOKE) → target id is `protocolMessage.key.id`.
+ *   - anything else (read receipts, status updates) → null (caller skips).
+ *
+ * Exported as a `_internal` member so the unit test can drive it directly
+ * without a full Baileys handshake.
+ */
+function extractMessageUpdateTargetId(update: {
+  key?: { id?: string | null } | null;
+  update?: { message?: proto.IMessage | null | undefined } | null;
+}): string | null {
+  const envelopeId = update.key?.id ?? null;
+  const m = update.update?.message ?? null;
+  if (!m) return null;
+  if (m.editedMessage) return envelopeId;
+  if (m.protocolMessage?.type === 0 && m.protocolMessage.key?.id) {
+    return m.protocolMessage.key.id;
+  }
+  return null;
 }
 
 async function handleIncoming(msg: proto.IWebMessageInfo): Promise<void> {
@@ -343,9 +424,31 @@ async function handleIncoming(msg: proto.IWebMessageInfo): Promise<void> {
   // signal to process immediately, and aggregating media + text in one turn
   // would require reshaping extractContent and several agent-core branches
   // — out of scope for this change.
+  //
+  // FAIL-CLOSED CONTRACT (PR #259 review, MAJOR A second half):
+  //   When `scheduleDebouncedAgent` throws (Redis down, BullMQ blip, or
+  //   tenant-context error), we MUST NOT fall through to
+  //   `enqueueAgent` for the immediate (non-debounced) path. Doing so
+  //   re-creates the very bypass the tenant-scoped debounce key was
+  //   designed to prevent: `enqueueAgent` uses a different namespace
+  //   contract (`process-message` vs. `process-message-debounced`) and
+  //   issuing an unscoped job during a Redis outage on a shared phone
+  //   number would replay tenant A's pending message under tenant B's
+  //   context once Redis recovered. The message is preserved in
+  //   `mensagensRepo` (the inbound is already persisted upstream of this
+  //   block at line 333), so the next message under the same conversa
+  //   will trigger aggregation and the agent will pick up the stranded
+  //   inbound — no data loss, just delayed processing during the blip.
+  //   The metric / log here is the signal an operator uses to surface
+  //   the outage.
   if (config.FEATURE_MESSAGE_DEBOUNCE && type === 'texto') {
     try {
-      const result = await scheduleDebouncedAgent({ key: tel, mensagem_id: stored.id });
+      // `phone` (the user's tel) feeds the tenant-scoped debounce identity.
+      // The composite key (`${tenant_id}:${agent_id}:${phone}`) is derived
+      // inside `scheduleDebouncedAgent` from the ALS tenant context that
+      // `messages.upsert` installs above — so a shared phone across two
+      // tenants gets two INDEPENDENT debouncers (issue #248).
+      const result = await scheduleDebouncedAgent({ phone: tel, mensagem_id: stored.id });
       logger.info(
         {
           mensagem_id: stored.id,
@@ -357,13 +460,31 @@ async function handleIncoming(msg: proto.IWebMessageInfo): Promise<void> {
       );
       return;
     } catch (err) {
-      // Redis/BullMQ hiccup → fall through to immediate enqueue so the
-      // message isn't lost. The aggregation step in the agent worker is
-      // forgiving: it picks up unprocessed siblings either way.
+      // FAIL-CLOSED: stop here. The message is already persisted in
+      // `mensagensRepo` and `aggregateUnprocessedTexts` will sweep it
+      // up on the next debounce cycle (or when the operator restores
+      // Redis). Do NOT silently bypass the tenant-scoped debounce by
+      // dropping to `enqueueAgent` — see contract block above.
+      const errCode = (err as { code?: string }).code;
       logger.warn(
-        { err: (err as Error).message, mensagem_id: stored.id },
-        'baileys.debounce_failed_fallback_immediate',
+        {
+          err: (err as Error).message,
+          err_code: errCode,
+          mensagem_id: stored.id,
+          tel: '[REDACTED]',
+          // Distinguishing the two main failure modes lets ops alerts
+          // route correctly: REDIS_UNAVAILABLE is infrastructure (page),
+          // MISSING_TENANT_CONTEXT is a deploy regression (revert).
+          failure_class:
+            errCode === 'DEBOUNCER_REDIS_UNAVAILABLE'
+              ? 'redis_unavailable'
+              : errCode === 'MISSING_TENANT_CONTEXT'
+                ? 'tenant_context_missing'
+                : 'other',
+        },
+        'baileys.debounce_failed_fail_closed',
       );
+      return;
     }
   }
 
@@ -469,8 +590,24 @@ export async function sendOutboundDocument(
   try {
     buf = await readFile(path);
   } catch (err) {
+    // Read failure happens BEFORE socket.sendMessage → nothing was sent. THROW
+    // (instead of returning null) so the caller can't confuse this with the
+    // disconnected / sent-without-id null cases and misclassify it as delivered
+    // (Codex #216 round-4 — document silent-drop). The sole caller (PDF dispatch)
+    // tags this delivered:false and recovers.
+    //
+    // #227 review: tag the throw with `code = 'DOC_READ_FAILED'` so the dispatch
+    // catch can discriminate "definitely pre-send" (this branch) from "transport
+    // throw that may have delivered" (socket.sendMessage failure). Without the
+    // discriminator the dispatch records 'unknown' for read failures too — and
+    // 'unknown' marks the turn as "do-not-retry", reviving the HIGH-1 silent-drop
+    // that #216 closed for the document path.
     logger.error({ err, path }, 'baileys.send_document.read_failed');
-    return null;
+    const wrapped = new Error(
+      `document_read_failed: ${(err as Error).message}`,
+    ) as Error & { code?: string };
+    wrapped.code = 'DOC_READ_FAILED';
+    throw wrapped;
   }
   const result = await socket.sendMessage(
     jid,
@@ -535,11 +672,15 @@ export const _internal = {
   _getReconnectAttempts(): number {
     return reconnectAttempts;
   },
+  _extractMessageUpdateTargetId: extractMessageUpdateTargetId,
   RECONNECT_MAX_ATTEMPTS,
 };
 
 // Helper to deterministically create per-message media filenames
 export function mediaPathFor(buf: Buffer, ext: string): { path: string; sha: string } {
+  // Defensive: ensure MEDIA_ROOT exists even when startBaileys() hasn't run
+  // (module load no longer creates it). Idempotent.
+  ensureMediaDirs();
   const sha = sha256(buf);
   const month = new Date().toISOString().slice(0, 7);
   const dir = join(MEDIA_ROOT, month);

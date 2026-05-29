@@ -18,16 +18,15 @@ import Anthropic from '@anthropic-ai/sdk';
 import { DriftType } from '@/types/enums.js';
 import type { DriftDetector, DriftDetectionInput, DriftEvidence } from './types.js';
 
-type OpProfile = { voice_descriptor?: string };
+import { resolveLegacyPayload } from '@/identity/profile-legacy-resolver.js';
 
 export const linguagemDetector: DriftDetector = {
   type: DriftType.LINGUAGEM,
   async detect(input: DriftDetectionInput): Promise<DriftEvidence | null> {
-    // TODO(v3.1.1 migration): the schema collapsed core_immutable + operational_profile
-    // into a single `profile_body` JSONB. Read via legacy-shaped cast until the
-    // detector consumes the new identity/style/metadata structure.
-    const legacy = (input.profile_active as unknown) as { operational_profile?: OpProfile };
-    const op = (legacy.operational_profile ?? {}) as OpProfile;
+    // v3.1.1 contract (migration 061 + Codex review #163 round 4): the legacy
+    // operational_profile now lives at profile_body.operational_profile on a
+    // Drizzle-shaped row. Shared resolver handles read precedence.
+    const { operational_profile: op } = resolveLegacyPayload(input.profile_active);
     const agentMessages = input.recent_messages.filter((m) => m.from === 'agent');
     if (agentMessages.length === 0) return null;
 

@@ -19,12 +19,19 @@ export async function runCognitiveModule<TOut>(
   let fallback_triggered = false;
   let error_message: string | undefined;
 
+  // Issue #224: store the timeout handle and clear it once the race settles.
+  // Without this, every fn() that resolves (or rejects) before the timer fires
+  // leaves a pending setTimeout in the event loop — accumulating closures,
+  // delaying graceful shutdowns, and producing "open handles" warnings in
+  // tests. The same shape as the listener-cleanup fix landing in
+  // skill-runner.ts (sibling PR #221).
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
   try {
     output = await Promise.race([
       fn(),
-      new Promise<TOut>((_, reject) =>
-        setTimeout(() => reject(new Error('timeout')), timeoutMs),
-      ),
+      new Promise<TOut>((_, reject) => {
+        timeoutHandle = setTimeout(() => reject(new Error('timeout')), timeoutMs);
+      }),
     ]);
   } catch (err) {
     const e = err as Error;
@@ -38,6 +45,12 @@ export async function runCognitiveModule<TOut>(
     } else {
       output = null;
     }
+  } finally {
+    // Always clear the timeout — covers all exit paths:
+    //  - fn() resolved first (timeoutHandle still scheduled)
+    //  - fn() rejected first (timeoutHandle still scheduled)
+    //  - timeout fired first (clearTimeout on an already-fired handle is a no-op)
+    if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
   }
 
   const latency_ms = Date.now() - startTime;
@@ -45,20 +58,30 @@ export async function runCognitiveModule<TOut>(
   if (audit) {
     const ctx = tryGetCurrentContext();
     if (!ctx) {
-      // Tenant context missing → cognitive_module_log row would land on
-      // ('default','default') silently, diverging from cognitive_candidates
-      // (whose repo throws via applyTenantGuard when context is absent).
-      // Surface the gap loudly so callers can be fixed; do NOT throw — the
-      // primary module already ran and the user-facing path must not break.
+      // Tenant context missing → fail-closed on AUDIT only (the primary
+      // module already ran and the user-facing path must not break).
+      //
+      // Before PR #269: this branch wrote a `cognitive_module_log` row
+      // scoped to ('default','default'), polluting the audit table with a
+      // cross-tenant shared bucket and silencing the caller bug that forgot
+      // to wrap in `runWithTenantContext`. That violated the same invariant
+      // PR #232/#237/#241/#262 enforce on every other tenant-scoped store.
+      //
+      // After: we surface the gap loudly via logger.warn and **skip the
+      // audit write**. The cognitive_module_log row is lost, but the
+      // alternative (writing under a poisoned tenant id) is strictly
+      // worse — auditors would see ghost rows and cross-tenant
+      // cognitive_candidates correlation would break.
       logger.warn(
         { module: opts.name },
-        'runner.audit_missing_tenant_context_fallback_default',
+        'runner.audit_skipped_missing_tenant_context',
       );
+      return { output, status, fallback_triggered, latency_ms };
     }
     try {
       await cognitiveModuleLogRepo.record({
-        tenant_id: ctx?.tenant_id ?? 'default',
-        agent_id: ctx?.agent_id ?? 'default',
+        tenant_id: ctx.tenant_id,
+        agent_id: ctx.agent_id,
         conversa_id: opts.conversa_id ?? null,
         turno_id: opts.turno_id ?? null,
         module_name: opts.name,

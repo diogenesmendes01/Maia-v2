@@ -75,7 +75,9 @@ export class PolicySliceBuilder
       depth: req.depth,
       max_rules: req.max_rules ?? 20,
     });
-    return sliceCacheKey(base.tenant_id, 'policy', scope);
+    // Issue #235: agent_id flows in via sliceCacheKey's prefix so two agents
+    // on the same tenant don't collide on cached policy slices.
+    return sliceCacheKey(base.tenant_id, base.agent_id, 'policy', scope);
   }
 
   async build(

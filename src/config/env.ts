@@ -129,6 +129,14 @@ const envSchema = z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
+    // #227 — outbound delivery idempotency ledger. When on, dispatch routes
+    // record pre-send / mark-sent / mark-failed against `outbound_messages`,
+    // and the safeDispatchOutput boundary short-circuits already-attempted
+    // turns. Default off so the migration can deploy ahead of the wiring.
+    FEATURE_OUTBOUND_DEDUP: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
     // Feature flags do roadmap Maia v2
     FEATURE_P0_TENANT_GUARD_ENFORCED: z
       .string()

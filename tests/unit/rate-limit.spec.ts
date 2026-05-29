@@ -5,6 +5,16 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { Pessoa } from '../../src/db/schema.js';
+import { runWithTenantContext } from '../../src/db/tenant-context.js';
+
+// Post-issue #245: checkRateLimit now requires tenant context (getCurrentTenant /
+// getCurrentAgent throw MissingTenantContextError when absent). Every test
+// below wraps its call in runWithTenantContext. Cross-tenant isolation has
+// its own dedicated spec — `gateway/rate-limit-cross-tenant.spec.ts`.
+const TEST_TENANT = '00000000-0000-0000-0000-000000000001';
+const TEST_AGENT = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa1';
+const withCtx = <T>(fn: () => Promise<T>): Promise<T> =>
+  runWithTenantContext({ tenant_id: TEST_TENANT, agent_id: TEST_AGENT }, fn);
 
 type Entry = { value: string; expiresAt?: number };
 type ZEntry = { score: number; member: string };
@@ -135,24 +145,24 @@ describe('rate-limit decision', () => {
     const owner = pessoaFixture('dono');
     const { checkRateLimit } = await import('../../src/gateway/rate-limit.js');
     for (let i = 0; i < 10; i++) {
-      expect((await checkRateLimit(owner)).kind).toBe('allow');
+      expect((await withCtx(() => checkRateLimit(owner))).kind).toBe('allow');
     }
   });
 
   it('non-owner: allow up to threshold, then warn once, then silence', async () => {
     const stranger = pessoaFixture('funcionario');
     const { checkRateLimit } = await import('../../src/gateway/rate-limit.js');
-    expect((await checkRateLimit(stranger)).kind).toBe('allow');
-    expect((await checkRateLimit(stranger)).kind).toBe('allow');
-    expect((await checkRateLimit(stranger)).kind).toBe('allow');
-    const overage = await checkRateLimit(stranger);
+    expect((await withCtx(() => checkRateLimit(stranger))).kind).toBe('allow');
+    expect((await withCtx(() => checkRateLimit(stranger))).kind).toBe('allow');
+    expect((await withCtx(() => checkRateLimit(stranger))).kind).toBe('allow');
+    const overage = await withCtx(() => checkRateLimit(stranger));
     expect(overage.kind).toBe('warn');
     if (overage.kind === 'warn') {
       expect(overage.threshold).toBe(3);
       expect(overage.count).toBe(4);
     }
-    expect((await checkRateLimit(stranger)).kind).toBe('silence');
-    expect((await checkRateLimit(stranger)).kind).toBe('silence');
+    expect((await withCtx(() => checkRateLimit(stranger))).kind).toBe('silence');
+    expect((await withCtx(() => checkRateLimit(stranger))).kind).toBe('silence');
   });
 
   it('formatPoliteReply substitutes the threshold', async () => {
@@ -176,20 +186,20 @@ describe('rate-limit sliding window (fake timers)', () => {
     const { checkRateLimit } = await import('../../src/gateway/rate-limit.js');
 
     // 3 messages at 10:00 — fills the threshold exactly.
-    expect((await checkRateLimit(stranger)).kind).toBe('allow');
-    expect((await checkRateLimit(stranger)).kind).toBe('allow');
-    expect((await checkRateLimit(stranger)).kind).toBe('allow');
+    expect((await withCtx(() => checkRateLimit(stranger))).kind).toBe('allow');
+    expect((await withCtx(() => checkRateLimit(stranger))).kind).toBe('allow');
+    expect((await withCtx(() => checkRateLimit(stranger))).kind).toBe('allow');
 
     // Advance >1h. With a fixed window the counter would reset entirely AND
     // the warned key wouldn't exist; with a true sliding window, the original
     // 3 events leave the trailing-hour view, so the next 3 are also allowed.
     vi.setSystemTime(new Date('2026-01-01T11:00:01Z'));
 
-    expect((await checkRateLimit(stranger)).kind).toBe('allow');
-    expect((await checkRateLimit(stranger)).kind).toBe('allow');
-    expect((await checkRateLimit(stranger)).kind).toBe('allow');
+    expect((await withCtx(() => checkRateLimit(stranger))).kind).toBe('allow');
+    expect((await withCtx(() => checkRateLimit(stranger))).kind).toBe('allow');
+    expect((await withCtx(() => checkRateLimit(stranger))).kind).toBe('allow');
     // 4th in the new sliding hour → warn.
-    expect((await checkRateLimit(stranger)).kind).toBe('warn');
+    expect((await withCtx(() => checkRateLimit(stranger))).kind).toBe('warn');
   });
 
   it('silence expires after 60s but warned-flag persists, so re-overage stays silent', async () => {
@@ -197,14 +207,14 @@ describe('rate-limit sliding window (fake timers)', () => {
     const { checkRateLimit } = await import('../../src/gateway/rate-limit.js');
 
     // Saturate threshold (3 allowed) then trigger warn (4th).
-    for (let i = 0; i < 3; i++) await checkRateLimit(stranger);
-    expect((await checkRateLimit(stranger)).kind).toBe('warn');
-    expect((await checkRateLimit(stranger)).kind).toBe('silence');
+    for (let i = 0; i < 3; i++) await withCtx(() => checkRateLimit(stranger));
+    expect((await withCtx(() => checkRateLimit(stranger))).kind).toBe('warn');
+    expect((await withCtx(() => checkRateLimit(stranger))).kind).toBe('silence');
 
     // 61s later — silence key has expired, but warned key (1h TTL) survives.
     // Next over-threshold call must re-arm silence, not emit a second reply.
     vi.setSystemTime(Date.now() + 61_000);
-    const next = await checkRateLimit(stranger);
+    const next = await withCtx(() => checkRateLimit(stranger));
     expect(next.kind).toBe('silence');
   });
 });

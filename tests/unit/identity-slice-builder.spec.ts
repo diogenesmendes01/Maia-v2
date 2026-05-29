@@ -227,6 +227,82 @@ describe('identity-slice-builder (§5)', () => {
     expect(slice.priorities).toEqual(['valid', 'also_valid']);
   });
 
+  // Issue #192 — migration 061 leaves identity.priorities=[] intentionally;
+  // only the p8d slug migration may populate canonical priorities. The slice
+  // MUST NOT synthesize priorities from principles, otherwise the prompt
+  // renderer ends up surfacing human principles text in the priorities
+  // channel. principles remain reachable via slice.principles (depth=full).
+  it('Issue #192: priorities=[] + identity.principles → slice.priorities stays []', async () => {
+    getActiveMock.mockResolvedValue(
+      makeProfile({
+        identity: {
+          role_descriptor: 'atendimento_financeiro_pf',
+          voice: { tone: 'claro', formality: 'medium', verbosity: 'concise' },
+          cognitive_limits: {
+            max_inference_depth: 3,
+            max_speculation_in_response: 0.2,
+            confidence_floor_for_action: 0.7,
+          },
+          priorities: [],
+          principles: ['transparência radical', 'preservar a evidência'],
+          identity_block: '',
+          learned_voice_modifiers: [],
+        },
+      }),
+    );
+    const slice = await buildIdentitySlice({ depth: 'full' });
+    if (!slice) throw new Error('expected slice');
+    expect(slice.priorities).toEqual([]);
+    // principles still reachable through the dedicated channel.
+    expect(slice.principles).toEqual(['transparência radical', 'preservar a evidência']);
+  });
+
+  it('Issue #192: priorities=[] + core_immutable.principles → slice.priorities stays []', async () => {
+    const profile = makeProfile({
+      identity: {
+        role_descriptor: 'atendimento_financeiro_pf',
+        voice: { tone: 'claro', formality: 'medium', verbosity: 'concise' },
+        cognitive_limits: {
+          max_inference_depth: 3,
+          max_speculation_in_response: 0.2,
+          confidence_floor_for_action: 0.7,
+        },
+        priorities: [],
+        learned_voice_modifiers: [],
+      },
+    });
+    // Direct-embed legacy layer left by migration 061.
+    (profile.profile_body as unknown as Record<string, unknown>).core_immutable =
+      { principles: ['transparência radical', 'preservar a evidência'] };
+    getActiveMock.mockResolvedValue(profile);
+    const slice = await buildIdentitySlice({ depth: 'full' });
+    if (!slice) throw new Error('expected slice');
+    expect(slice.priorities).toEqual([]);
+  });
+
+  it('Issue #192: depth=minimal also keeps slice.priorities=[] when only principles exist', async () => {
+    getActiveMock.mockResolvedValue(
+      makeProfile({
+        identity: {
+          role_descriptor: 'atendimento_financeiro_pf',
+          voice: { tone: 'claro', formality: 'medium', verbosity: 'concise' },
+          cognitive_limits: {
+            max_inference_depth: 3,
+            max_speculation_in_response: 0.2,
+            confidence_floor_for_action: 0.7,
+          },
+          priorities: [],
+          principles: ['transparência radical'],
+          identity_block: '',
+          learned_voice_modifiers: [],
+        },
+      }),
+    );
+    const slice = await buildIdentitySlice({ depth: 'minimal' });
+    if (!slice) throw new Error('expected slice');
+    expect(slice.priorities).toEqual([]);
+  });
+
   it('uses defaults when cognitive_limits is missing', async () => {
     getActiveMock.mockResolvedValue(
       makeProfile({

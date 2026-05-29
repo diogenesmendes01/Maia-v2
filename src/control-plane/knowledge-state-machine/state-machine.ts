@@ -17,6 +17,8 @@
 
 import { runCognitiveModule } from '@/cognition/runner.js';
 import { logger } from '@/lib/logger.js';
+import { incCounter } from '@/lib/metrics.js';
+import { sleep } from '@/lib/utils.js';
 import { knowledgeRepos, KnowledgeConflictError } from './repos.js';
 import { KnowledgeRiskScorer } from './risk-scorer.js';
 import {
@@ -282,10 +284,69 @@ export class KnowledgeStateMachine {
    * terminal absolute. Calling revoke on an already-revoked row is
    * an idempotent no-op (returns a synthetic record marking the
    * existing state).
+   *
+   * Concurrency (issue #256 — revalidation of PR #243):
+   *   Under 3+ concurrent actors mutating the same row, the previous
+   *   single-shot retry could lose the race: writer A revokes, writer B
+   *   transitions back to active, writer C (our revoke) re-reads
+   *   `active`, then writer A revokes again before C's retry lands —
+   *   C's retry sees `revoked` again and throws KnowledgeConflictError
+   *   to the caller, breaking the idempotency contract.
+   *
+   *   Fix: bounded retry loop. Up to MAX_REVOKE_RETRIES attempts; on
+   *   each conflict we re-read the row, short-circuit if it's already
+   *   `revoked`, otherwise try again against the freshly observed
+   *   status. Small exponential backoff with jitter (≈10ms / ≈30ms
+   *   base × random∈[1,2)) absorbs the contention window without
+   *   unbounded waits — jitter spreads bursts of contending callers
+   *   instead of re-colliding them on the same schedule (PR #279 Codex
+   *   review — Blocker [1]). If MAX_REVOKE_RETRIES is exhausted
+   *   (continuous concurrent mutation), the final
+   *   KnowledgeConflictError surfaces to the caller — at that point the
+   *   row is being mutated so aggressively that the caller needs to
+   *   decide whether to give up or wrap in its own retry.
+   *
+   *   Cancellation: optional `args.signal` aborts the retry loop during
+   *   its backoff sleep (PR #279 Codex review — Blocker [2]). The
+   *   signal is pre-checked on entry, and the backoff sleep uses an
+   *   AbortSignal-aware helper that clears the timer on abort so no
+   *   stray timer survives a cancelled call.
+   *
+   *   Audit-emit semantics: we log at every terminal path of the call
+   *   — successful update, already_revoked early-exit (initial read or
+   *   concurrent re-read), and exhaustion. Idempotent returns were
+   *   previously silent, hiding at-least-once behaviour from telemetry
+   *   (PR #279 Codex review — Blocker [3]). Each log carries `attempts`
+   *   so operators can tell apart "landed on first try" from "needed
+   *   the retry budget".
+   *
+   *   Observability: every terminal path increments
+   *   `maia_ksm_revoke_total{kind, result}` where `result ∈
+   *   {success, already_revoked, already_revoked_concurrent,
+   *   exhausted, aborted}`. Exhaustion additionally increments
+   *   `maia_ksm_revoke_exhausted_total{kind}` so dashboards can alert
+   *   without parsing the generic counter (PR #279 Codex review —
+   *   Critical [exhaustion observability]).
    */
   static async revoke(
     args: KnowledgeRevokeInput,
   ): Promise<KnowledgeRevokeResult> {
+    const MAX_REVOKE_RETRIES = 3;
+
+    // Pre-check: short-circuit before any DB read/write if the caller
+    // has already aborted.
+    if (args.signal?.aborted) {
+      incCounter('maia_ksm_revoke_total', {
+        kind: args.kind,
+        result: 'aborted',
+      });
+      const err = new Error('knowledge_state_machine.revoke:aborted', {
+        cause: args.signal.reason,
+      });
+      err.name = 'AbortError';
+      throw err;
+    }
+
     const current = await knowledgeRepos.findById(args.kind, args.proposal_id);
     if (!current) {
       throw new Error(
@@ -294,6 +355,23 @@ export class KnowledgeStateMachine {
     }
 
     if (current.lifecycle_status === 'revoked') {
+      // Idempotent early-exit on the initial read. Previously silent —
+      // now logged + counted so at-least-once telemetry is visible
+      // (Blocker [3]).
+      logger.info(
+        {
+          proposal_id: args.proposal_id,
+          kind: args.kind,
+          reason: 'already_revoked',
+          decided_by: 'idempotent',
+          attempts: 0,
+        },
+        'knowledge_state_machine.revoked',
+      );
+      incCounter('maia_ksm_revoke_total', {
+        kind: args.kind,
+        result: 'already_revoked',
+      });
       return {
         from: 'revoked',
         to: 'revoked',
@@ -303,27 +381,48 @@ export class KnowledgeStateMachine {
       };
     }
 
-    const transition: KnowledgeTransitionRecord = {
-      from: current.lifecycle_status,
-      to: 'revoked',
-      at: new Date().toISOString(),
-      reason: args.reason,
-      decided_by: args.decided_by,
-    };
+    let observed = current;
+    let lastConflict: KnowledgeConflictError | undefined;
 
-    // Revoke wins on conflict: if another writer transitioned the row
-    // first, we re-read once. If the row is now revoked, treat as
-    // idempotent. Otherwise, re-attempt the revoke against the newly
-    // observed status — revoke is allowed from any non-terminal state,
-    // so the second try succeeds (or the row was already revoked).
-    try {
-      await knowledgeRepos.update(args.kind, args.proposal_id, {
-        lifecycle_status: 'revoked',
-        lifecycle_transitions: [...current.lifecycle_transitions, transition],
-        expected_previous_status: current.lifecycle_status,
-      });
-    } catch (err) {
-      if (err instanceof KnowledgeConflictError) {
+    for (let attempt = 0; attempt < MAX_REVOKE_RETRIES; attempt++) {
+      const transition: KnowledgeTransitionRecord = {
+        from: observed.lifecycle_status,
+        to: 'revoked',
+        at: new Date().toISOString(),
+        reason: args.reason,
+        decided_by: args.decided_by,
+      };
+
+      try {
+        await knowledgeRepos.update(args.kind, args.proposal_id, {
+          lifecycle_status: 'revoked',
+          lifecycle_transitions: [
+            ...observed.lifecycle_transitions,
+            transition,
+          ],
+          expected_previous_status: observed.lifecycle_status,
+        });
+        logger.warn(
+          {
+            proposal_id: args.proposal_id,
+            kind: args.kind,
+            from: observed.lifecycle_status,
+            reason: args.reason,
+            decided_by: args.decided_by,
+            attempts: attempt + 1,
+          },
+          'knowledge_state_machine.revoked',
+        );
+        incCounter('maia_ksm_revoke_total', {
+          kind: args.kind,
+          result: 'success',
+        });
+        return transition;
+      } catch (err) {
+        if (!(err instanceof KnowledgeConflictError)) throw err;
+        lastConflict = err;
+
+        // Re-read to see what the row actually became.
         const fresh = await knowledgeRepos.findById(
           args.kind,
           args.proposal_id,
@@ -335,7 +434,22 @@ export class KnowledgeStateMachine {
           );
         }
         if (fresh.lifecycle_status === 'revoked') {
-          // Concurrent revoke landed first — idempotent no-op.
+          // Concurrent revoke landed first — idempotent no-op. Log +
+          // count so the win is visible in telemetry (Blocker [3]).
+          logger.info(
+            {
+              proposal_id: args.proposal_id,
+              kind: args.kind,
+              reason: 'already_revoked_concurrent',
+              decided_by: 'idempotent',
+              attempts: attempt + 1,
+            },
+            'knowledge_state_machine.revoked',
+          );
+          incCounter('maia_ksm_revoke_total', {
+            kind: args.kind,
+            result: 'already_revoked_concurrent',
+          });
           return {
             from: 'revoked',
             to: 'revoked',
@@ -344,53 +458,60 @@ export class KnowledgeStateMachine {
             decided_by: 'idempotent',
           };
         }
-        // Retry against the new observed status. Revoke is allowed from
-        // every non-terminal state in ALLOWED_TRANSITIONS, so the
-        // second try will succeed unless another concurrent revoke
-        // beat us again — in which case the re-read above catches it.
-        const retryTransition: KnowledgeTransitionRecord = {
-          from: fresh.lifecycle_status,
-          to: 'revoked',
-          at: new Date().toISOString(),
-          reason: args.reason,
-          decided_by: args.decided_by,
-        };
-        await knowledgeRepos.update(args.kind, args.proposal_id, {
-          lifecycle_status: 'revoked',
-          lifecycle_transitions: [
-            ...fresh.lifecycle_transitions,
-            retryTransition,
-          ],
-          expected_previous_status: fresh.lifecycle_status,
-        });
-        logger.warn(
-          {
-            proposal_id: args.proposal_id,
-            kind: args.kind,
-            from: fresh.lifecycle_status,
-            reason: args.reason,
-            decided_by: args.decided_by,
-            retried: true,
-          },
-          'knowledge_state_machine.revoked',
-        );
-        return retryTransition;
+        observed = fresh;
+
+        // Small exponential backoff with jitter between attempts.
+        // Base grows 10ms → 30ms; jitter ∈ [0, base) spreads bursts
+        // so concurrent callers don't re-collide on identical
+        // schedules (Blocker [1]). No sleep after the last attempt —
+        // we'll throw lastConflict on the next loop exit.
+        if (attempt < MAX_REVOKE_RETRIES - 1) {
+          const base = 10 * 3 ** attempt;
+          const delayMs = base + Math.floor(Math.random() * base);
+          // sleep() is AbortSignal-aware: an abort clears the timer
+          // and rejects with an AbortError (Blocker [2]).
+          try {
+            await sleep(delayMs, args.signal);
+          } catch (sleepErr) {
+            // Cancellation surfaced from the sleep — surface to caller
+            // as AbortError without further DB I/O.
+            if (
+              sleepErr &&
+              typeof sleepErr === 'object' &&
+              (sleepErr as { name?: string }).name === 'AbortError'
+            ) {
+              incCounter('maia_ksm_revoke_total', {
+                kind: args.kind,
+                result: 'aborted',
+              });
+            }
+            throw sleepErr;
+          }
+        }
       }
-      throw err;
     }
 
+    // MAX_REVOKE_RETRIES exhausted under continuous concurrent mutation.
+    // Surface the last conflict so the caller can decide (e.g.
+    // incident-response operators may want to retry manually; workers
+    // typically skip and move on).
     logger.warn(
       {
         proposal_id: args.proposal_id,
         kind: args.kind,
-        from: current.lifecycle_status,
         reason: args.reason,
         decided_by: args.decided_by,
+        attempts: MAX_REVOKE_RETRIES,
+        last_observed_status: observed.lifecycle_status,
       },
-      'knowledge_state_machine.revoked',
+      'knowledge_state_machine.revoke_exhausted_retries',
     );
-
-    return transition;
+    incCounter('maia_ksm_revoke_total', {
+      kind: args.kind,
+      result: 'exhausted',
+    });
+    incCounter('maia_ksm_revoke_exhausted_total', { kind: args.kind });
+    throw lastConflict ?? new Error('knowledge_state_machine.revoke:unreachable');
   }
 }
 

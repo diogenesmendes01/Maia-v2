@@ -26,6 +26,9 @@ vi.mock('../../src/lib/logger.js', () => ({
 // We only need MEDIA_ROOT, which points at <SANDBOX>/media.
 vi.mock('../../src/gateway/baileys.js', () => ({
   MEDIA_ROOT: join(SANDBOX, 'media'),
+  // FIX 1: extrato/comparativo now call ensureMediaDirs() before writing.
+  // The test pre-creates the dirs in beforeAll, so a no-op stub is correct.
+  ensureMediaDirs: vi.fn(),
 }));
 
 const byScope = vi.fn();

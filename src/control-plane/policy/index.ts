@@ -30,6 +30,10 @@ export {
 export {
   policyRulesRepo,
   POLICY_LIFECYCLE_CHANNEL,
+  POLICY_LIFECYCLE_CHANNEL_PREFIX,
+  POLICY_LIFECYCLE_CHANNEL_PATTERN,
+  buildPolicyLifecycleChannel,
+  parsePolicyLifecycleChannel,
   isValidDualApprovalEvidence,
   type PolicyRulesRepo,
   type DualApprovalEvidence,

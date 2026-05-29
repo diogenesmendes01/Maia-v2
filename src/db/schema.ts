@@ -508,19 +508,75 @@ export const pending_questions = pgTable('pending_questions', {
   created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
-export const idempotency_keys = pgTable('idempotency_keys', {
-  key: text('key').primaryKey(),
-  tenant_id: text('tenant_id').notNull().default('default'),
-  agent_id: text('agent_id').notNull().default('default'),
-  tool_name: text('tool_name').notNull(),
-  operation_type: text('operation_type').notNull(),
-  pessoa_id: uuid('pessoa_id').notNull(),
-  entity_id: uuid('entity_id').notNull(),
-  payload_hash: text('payload_hash').notNull(),
-  file_sha256: text('file_sha256'),
-  resultado: jsonb('resultado').notNull(),
-  created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
-});
+// Issue #261: composite PK on (tenant_id, agent_id, key). Prior schema had
+// `key` as a singleton PRIMARY KEY, which allowed two tenants computing the
+// same idempotency_key to collide in the cache and leak tool output. The
+// hash input in `src/governance/idempotency.ts` ALSO folds tenant_id/agent_id
+// now, so a collision via the hash alone is no longer possible — but the
+// composite PK makes the storage layer reflect the true identity tuple and
+// guards against any future caller that bypasses `computeIdempotencyKey`.
+// See migration 063_p10_idempotency_keys_tenant_pk.
+export const idempotency_keys = pgTable(
+  'idempotency_keys',
+  {
+    key: text('key').notNull(),
+    tenant_id: text('tenant_id').notNull().default('default'),
+    agent_id: text('agent_id').notNull().default('default'),
+    tool_name: text('tool_name').notNull(),
+    operation_type: text('operation_type').notNull(),
+    pessoa_id: uuid('pessoa_id').notNull(),
+    entity_id: uuid('entity_id').notNull(),
+    payload_hash: text('payload_hash').notNull(),
+    file_sha256: text('file_sha256'),
+    resultado: jsonb('resultado').notNull(),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.tenant_id, t.agent_id, t.key] }),
+  }),
+);
+
+// Issue #227: outbound delivery idempotency ledger. One row per inbound turn
+// (any channel). Pre-send optimistic insert + status-aware guard closes the
+// "delivered-but-threw" window left open by #216 phase-tagging. Distinct from
+// outbox_messages (async worker queue) — this is the synchronous reply ledger.
+// See migrations/063_outbound_messages.sql for the full design + status
+// semantics (pending|sent|failed|unknown — 'unknown' is the no-re-send crux).
+export const outbound_messages = pgTable(
+  'outbound_messages',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull().default('default'),
+    agent_id: text('agent_id').notNull().default('default'),
+    // Turn-scoped: `${conversa_id}:${in_reply_to}`. Mirrors the
+    // outbound_dispatch_failed audit metadata.idempotency_key from #216.
+    // UNIQUE per (tenant_id, agent_id, idempotency_key) — see composite below.
+    idempotency_key: text('idempotency_key').notNull(),
+    conversa_id: uuid('conversa_id').notNull(),
+    in_reply_to: uuid('in_reply_to').notNull(),
+    channel: text('channel').notNull(),
+    provider_message_id: text('provider_message_id'),
+    status: text('status').notNull().default('pending'),
+    error: text('error'),
+    sent_at: timestamp('sent_at', { withTimezone: true }),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    byTenantCreated: index('idx_outbound_messages_tenant_created').on(
+      t.tenant_id,
+      t.created_at,
+    ),
+    // Multi-tenant invariant (#232/#237): tenant+agent scope the dedupe namespace.
+    // Two tenants (or two agents in one tenant) can share the same idempotency_key
+    // string without colliding; the advisory-lock in upsertPending hashes the same
+    // (tenant_id, agent_id, idempotency_key) tuple so lock partitioning matches.
+    byTenantAgentKey: unique('outbound_messages_tenant_agent_key').on(
+      t.tenant_id,
+      t.agent_id,
+      t.idempotency_key,
+    ),
+  }),
+);
 
 export const system_health_events = pgTable('system_health_events', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -551,19 +607,10 @@ export const dead_letter_jobs = pgTable('dead_letter_jobs', {
   created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
-export const dashboard_sessions = pgTable('dashboard_sessions', {
-  id: uuid('id').primaryKey().defaultRandom(),
-  tenant_id: text('tenant_id').notNull().default('default'),
-  agent_id: text('agent_id').notNull().default('default'),
-  pessoa_id: uuid('pessoa_id').notNull(),
-  token_hash: text('token_hash').notNull(),
-  expira_em: timestamp('expira_em', { withTimezone: true }).notNull(),
-  ip: text('ip'),
-  user_agent: text('user_agent'),
-  created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
-  used_at: timestamp('used_at', { withTimezone: true }),
-  revoked_at: timestamp('revoked_at', { withTimezone: true }),
-});
+// Note: `dashboard_sessions` was removed in migration 062 alongside the
+// legacy Fastify-served `/dashboard` (src/dashboard/index.ts). The admin-ui
+// (`src/admin-ui/`, NextAuth-based) is the canonical web UI; sign-in lives in
+// `app_users` + `app_sessions` (migration 045).
 
 export const import_runs = pgTable(
   'import_runs',
@@ -1632,6 +1679,20 @@ export const admin_audit_log = pgTable(
   }),
 );
 
+// 062 (issue #183, PR #188 Codex round 1, [high]): global_settings —
+// process-wide singleton settings (NOT scoped to tenant/agent by design).
+// Used by /setup/llm-settings to flip the runtime LLM model slug so the
+// change is visible to every tenant's next ReAct turn. Previous storage
+// in agent_facts (scoped by tenant_id+agent_id) silently meant the
+// founder UI only affected the founder's `default` agent — every other
+// agent/tenant kept calling the old/env model.
+export const global_settings = pgTable('global_settings', {
+  key: text('key').primaryKey(),
+  value: jsonb('value').notNull(),
+  updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  updated_by: text('updated_by'),
+});
+
 // 048: debug_snapshot_grants — TTL-bounded access to runtime_trace_bodies
 export const debug_snapshot_grants = pgTable(
   'debug_snapshot_grants',
@@ -1777,7 +1838,6 @@ export type SystemHealthEvent = typeof system_health_events.$inferSelect;
 export type DeadLetterJob = typeof dead_letter_jobs.$inferSelect;
 export type AuditEntry = typeof audit_log.$inferSelect;
 export type PermissionProfile = typeof permission_profiles.$inferSelect;
-export type DashboardSession = typeof dashboard_sessions.$inferSelect;
 export type ImportRun = typeof import_runs.$inferSelect;
 export type ImportEntry = typeof import_entries.$inferSelect;
 export type Tenant = typeof tenants.$inferSelect;

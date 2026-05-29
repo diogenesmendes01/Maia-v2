@@ -2,14 +2,42 @@
  * P9b — Action Decider.
  *
  * Spec §9.2: consolidates inputs from all upstream steps and chooses one of
- * 5 ActionModes:
+ * 6 ActionModes:
  *   - escalate              (require_dual_approval, require_human_review)
  *   - continue_workflow     (active procedure in continue mode)
- *   - ask_clarification     (missing skill OR low intent confidence)
- *   - call_tool             (skill is tool_mediated / decide)
- *   - respond               (default)
+ *   - execute_skill         (F1 Phase 1: FOUND + selected skill's execution_mode
+ *                            ∈ {prompt_only, evaluator} — terminal, side-effect
+ *                            free; core.ts runs it via runSkill)
+ *   - call_tool             (FOUND + skill is tool_mediated / decide category
+ *                            with a side-effecting execution_mode)
+ *   - respond               (default — incl. no selected skill = free-form chat)
+ *   - ask_clarification     (NOT a normal no-skill outcome — a no-skill turn
+ *                            routes to `respond`, see F1 Phase 0 below. The
+ *                            engine still emits ask_clarification from a few
+ *                            specific paths: this ActionDecider emits it when a
+ *                            selected tool skill can't be resolved
+ *                            (`skill_lookup_failed`) or a Mid PEP
+ *                            `reduce_tool_set` strips every tool from a
+ *                            tool-mediated skill; and DecisionEngine emits it on
+ *                            a non-escalating Mid PEP block and on the
+ *                            non-sensitive budget fallback
+ *                            (decision-engine.ts ~:302 / ~:397).)
  *
  * Spec §9.3 derives context_requirements + evaluation_plan from skill hints.
+ *
+ * F1 Phase 0 (skill-execution coexistence): the Decision Engine must be SAFE
+ * to enable. Two regressions are closed here:
+ *   1. A turn with NO selected skill used to fall into `ask_clarification`,
+ *      which `src/agent/core.ts` surfaces as a canned "Pode me dar mais
+ *      detalhes?" and skips the LLM — i.e. it broke ALL free-form chat the
+ *      moment the engine was switched on. It now routes to `respond` with
+ *      `skill: null`, a normal free-form turn.
+ *   2. The low-intent-confidence auto-`ask_clarification` was removed for the
+ *      same reason (a perfectly normal chat message often classifies below the
+ *      threshold and would have been hijacked into the canned reply).
+ * Anti-hijack on the selection side lives in SkillSelector: it only returns a
+ * `selected_skill_id` when the message clearly matches a skill, so the FOUND
+ * branches below are reached only for genuinely skill-relevant turns.
  *
  * Budget target: <30ms.
  */
@@ -31,8 +59,6 @@ import { DEFAULT_CONTEXT_REQUIREMENTS } from '../context-packet/types.js';
 export interface ActionDeciderDeps {
   skillsRepo: SkillsRepo;
 }
-
-const INTENT_CONFIDENCE_THRESHOLD = 0.6;
 
 const EMPTY_TOOL_PERMS: DecisionPacket['tool_permissions'] = {
   allowed_tools: [],
@@ -91,19 +117,31 @@ export class ActionDeciderImpl implements ActionDecider {
       };
     }
 
-    // 3. Skill missing or intent too ambiguous → ask_clarification.
-    if (
-      !input.skill.selected_skill_id ||
-      input.intent.confidence < INTENT_CONFIDENCE_THRESHOLD
-    ) {
+    // 3. No selected skill → normal free-form `respond` (F1 Phase 0).
+    //
+    // Previously this fell into `ask_clarification`, which core.ts surfaces as
+    // a canned "Pode me dar mais detalhes?" and skips the LLM — breaking ALL
+    // free-form chat the moment the engine was enabled. A turn with no skill
+    // (SkillSelector found nothing relevant — the anti-hijack guard) is a
+    // perfectly normal chat turn and MUST reach the LLM via `respond` with a
+    // null skill context. The low-intent-confidence auto-`ask_clarification`
+    // is gone for the same reason: a normal message frequently classifies
+    // below any threshold and would otherwise be hijacked into the canned
+    // reply. `ask_clarification` now only originates from a Mid PEP
+    // `reduce_tool_set` that empties a selected tool skill (below) — a state
+    // that cannot arise on a no-skill turn.
+    if (!input.skill.selected_skill_id) {
       return {
-        action_mode: 'ask_clarification',
+        action_mode: 'respond',
         tool_permissions: EMPTY_TOOL_PERMS,
-        context_requirements: DEFAULT_CONTEXT_REQUIREMENTS,
+        context_requirements: buildContextRequirements({
+          skill: null,
+          intent: input.intent,
+          risk: input.risk,
+          workflow: input.workflow,
+        }),
         evaluation_plan: DEFAULT_EVAL_PLAN,
-        rationale: !input.skill.selected_skill_id
-          ? 'skill_missing'
-          : `low_intent_confidence:${input.intent.confidence.toFixed(2)}`,
+        rationale: 'respond:no_skill',
       };
     }
 
@@ -147,6 +185,34 @@ export class ActionDeciderImpl implements ActionDecider {
         context_requirements: DEFAULT_CONTEXT_REQUIREMENTS,
         evaluation_plan: DEFAULT_EVAL_PLAN,
         rationale: `skill_lookup_failed:${input.skill.selected_skill_id}`,
+      };
+    }
+
+    // 4.5 F1 Phase 1 — direct skill execution, gated by execution_mode.
+    //
+    // Spec §4.1: emit `execute_skill` ONLY when the selected skill's
+    // execution_mode is terminal AND side-effect free (`prompt_only` |
+    // `evaluator`). This gate is on `execution_mode`, NOT `category` — they are
+    // independent (a `decide`-category skill can be `tool_mediated`, and a
+    // `respond`-category skill could in principle be `evaluator`). Side-effecting
+    // modes (`tool_mediated` / `procedure_adapter`) are EXCLUDED here and fall
+    // through to the category-based call_tool/respond branches below — they need
+    // the Phase 2 dispatcher bridge + a side-effect/terminality contract before
+    // they can be executed directly. The pinned identity (descriptor + version)
+    // is threaded onto the packet by the engine's skill step so the core.ts call
+    // site can assert the active row is still the one evaluated here.
+    if (isDirectlyExecutable(skill.execution_mode)) {
+      return {
+        action_mode: 'execute_skill',
+        tool_permissions: EMPTY_TOOL_PERMS,
+        context_requirements: buildContextRequirements({
+          skill,
+          intent: input.intent,
+          risk: input.risk,
+          workflow: input.workflow,
+        }),
+        evaluation_plan: DEFAULT_EVAL_PLAN,
+        rationale: `execute_skill:${skill.id}`,
       };
     }
 
@@ -201,6 +267,24 @@ export class ActionDeciderImpl implements ActionDecider {
       rationale: `respond:${skill.id}`,
     };
   }
+}
+
+/**
+ * F1 Phase 1 — execution_mode gate (spec §4.1). Returns true ONLY for the
+ * terminal, side-effect-free modes Phase 1 is allowed to execute directly.
+ * `tool_mediated` / `procedure_adapter` (side-effecting) are EXCLUDED — they
+ * are Phase 2. An absent/unknown execution_mode is NOT executable (fail-safe:
+ * legacy/stub skills route to respond/call_tool as before).
+ *
+ * `evaluator` stays in the gate (Codex #216 review item 4), but it is only
+ * user-TERMINAL when it produces an `output.reply`; its native
+ * `{ score, verdict, reasons }` are internal and never shown to the user. An
+ * evaluator that yields no reply falls through to the normal turn downstream
+ * (see `buildSkillReply` in execute-skill.ts) — so admitting it here is safe,
+ * never surfaces raw scores, and only "wins" the turn when it speaks to the user.
+ */
+function isDirectlyExecutable(execution_mode: Skill['execution_mode']): boolean {
+  return execution_mode === 'prompt_only' || execution_mode === 'evaluator';
 }
 
 function buildToolPerms(skill: Skill): DecisionPacket['tool_permissions'] {

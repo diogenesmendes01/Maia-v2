@@ -1,10 +1,52 @@
--- Reverse of 061: restore the four legacy JSONB columns from profile_body.
--- Only useful as a development/debug aid — production rollback should prefer
--- the regular rollback path and not run this down migration unless absolutely
--- necessary, since identity content under a v3.1.0 layout may no longer be
--- meaningful to the post-3.1.1 runtime.
-DO $$
+-- Reverse of 061: backfill legacy content columns from profile_body, then
+-- drop profile_body and restore an append-only guard for the legacy columns.
+--
+-- Why we backfill BEFORE dropping (Codex review #163 round 6, [high]):
+--   After 061 lands, every new row written by
+--   `operationalProfileVersionsRepo.create` carries data only inside
+--   `profile_body` (the legacy columns get the column default `'{}'::jsonb`).
+--   A naive `DROP COLUMN profile_body` would erase those rows' identity
+--   payload entirely — runtime renderer + drift detectors would see blank
+--   content for any profile version created post-061.
+--
+--   Strategy: before the DROP, copy the direct-embed legacy keys back into
+--   the four legacy columns. For canonical-only rows (no direct-embed but
+--   `profile_body.identity` populated), synthesize plausible legacy values
+--   from canonical identity.* — same lossy mapping the resolver uses in
+--   reverse, so at minimum identity_block, principles, voice_descriptor,
+--   and thresholds survive the rollback.
+--
+-- Why we install a legacy-only append-only trigger (Codex review #163
+-- round 5, [medium]):
+--   Without it, direct SQL could mutate core_immutable / operational_profile
+--   / episodic_temp / growth_backlog on the post-rollback schema, breaking
+--   the append-only invariant.
+--
+-- Why we archive identity.priorities into a sidecar JSONB column before
+-- the DROP (issue #203, follow-up to #194/#199):
+--   #199 removed the priorities→principles synthesis to stop VALORES
+--   contamination on rollback (#194). That's semantically correct but
+--   LOSSY for `identity.priorities`: admin-ui rows with priorities
+--   populated but no real principles see their priorities dropped along
+--   with `profile_body` and there's no recovery path. The previous
+--   pre-#199 fallback was equally lossy AND contaminated VALORES.
+--
+--   Fix (option (a) from #203): add a sidecar column
+--   `_rollback_archive_priorities` outside any VALORES-read path,
+--   populate it from `profile_body.identity.priorities` before the
+--   `DROP COLUMN profile_body`. The (re-)up migration (#061 up) reads
+--   the sidecar back into `profile_body.identity.priorities` and clears
+--   it so the column is ready for a future re-rollback. The sidecar
+--   never feeds `core_immutable.principles` — that would reintroduce
+--   the #194 contamination. Tenant isolation is row-local: the archive
+--   UPDATE is row-by-row, no JOIN, no cross-row subquery, so each
+--   row's priorities stay inside its own tenant_id/agent_id pair.
+--
+-- NOTE: no BEGIN/COMMIT — migrate.ts wraps in transaction.
+
+DO $outer$
 DECLARE
+  has_legacy boolean;
   has_profile_body boolean;
 BEGIN
   SELECT EXISTS (
@@ -14,26 +56,168 @@ BEGIN
        AND column_name = 'profile_body'
   ) INTO has_profile_body;
 
-  IF NOT has_profile_body THEN
-    RETURN;
-  END IF;
+  SELECT EXISTS (
+    SELECT 1
+      FROM information_schema.columns
+     WHERE table_name = 'agent_operational_profile_versions'
+       AND column_name = 'core_immutable'
+  ) INTO has_legacy;
 
   EXECUTE 'DROP TRIGGER IF EXISTS agent_op_profile_content_immutable_trg
              ON agent_operational_profile_versions';
 
+  -- (1) Backfill the legacy content columns from profile_body before the
+  -- DROP, so post-061 rows don't lose their identity payload on rollback.
+  IF has_profile_body AND has_legacy THEN
+    EXECUTE $sql$
+      UPDATE agent_operational_profile_versions
+         SET core_immutable = CASE
+               -- Prefer the direct-embed mirror that migration 061 + the
+               -- proposal-generator both write.
+               WHEN profile_body->'core_immutable' IS NOT NULL
+                AND profile_body->'core_immutable' <> '{}'::jsonb
+                 THEN profile_body->'core_immutable'
+               -- Fallback: synthesize from canonical identity.*. Lossy but
+               -- preserves identity_block + principles for the renderer.
+               WHEN profile_body->'identity' IS NOT NULL
+                 THEN jsonb_build_object(
+                   'identity_block', COALESCE(
+                     profile_body->'identity'->>'identity_block',
+                     profile_body->'identity'->>'role_descriptor',
+                     ''
+                   ),
+                   -- Issue #194: do NOT fall back to identity.priorities.
+                   -- Admin-ui rows post-061 commonly have priorities
+                   -- populated but true principles absent; copying
+                   -- priorities into legacy core_immutable.principles let
+                   -- the legacy VALORES drift detector audit operational
+                   -- labels as core value contracts and triggered the
+                   -- same false freeze/rollback path that #189/#191
+                   -- eliminated in the runtime resolver. Leave principles
+                   -- empty when none were configured.
+                   'principles', COALESCE(
+                     profile_body->'identity'->'principles',
+                     '[]'::jsonb
+                   )
+                 )
+               ELSE core_immutable
+             END,
+             operational_profile = CASE
+               WHEN profile_body->'operational_profile' IS NOT NULL
+                AND profile_body->'operational_profile' <> '{}'::jsonb
+                 THEN profile_body->'operational_profile'
+               WHEN profile_body->'identity'->'voice' IS NOT NULL
+                 THEN jsonb_build_object(
+                   'voice_descriptor', COALESCE(
+                     profile_body->'identity'->'voice'->>'tone',
+                     ''
+                   ),
+                   'thresholds', COALESCE(
+                     profile_body->'identity'->'cognitive_limits',
+                     '{}'::jsonb
+                   )
+                 )
+               ELSE operational_profile
+             END,
+             episodic_temp = CASE
+               WHEN profile_body->'episodic_temp' IS NOT NULL
+                AND profile_body->'episodic_temp' <> '{}'::jsonb
+                 THEN profile_body->'episodic_temp'
+               ELSE episodic_temp
+             END,
+             -- Codex review #163 round 7: the resolver/renderer accept
+             -- both supported growth_backlog shapes — an array of strings
+             -- OR `{ items: [...] }`. Restore both rather than only
+             -- non-empty arrays, otherwise an object-shaped backlog with
+             -- valid items[] would be dropped on rollback.
+             growth_backlog = CASE
+               WHEN profile_body->'growth_backlog' IS NOT NULL
+                AND jsonb_typeof(profile_body->'growth_backlog') = 'array'
+                AND jsonb_array_length(profile_body->'growth_backlog') > 0
+                 THEN profile_body->'growth_backlog'
+               WHEN profile_body->'growth_backlog' IS NOT NULL
+                AND jsonb_typeof(profile_body->'growth_backlog') = 'object'
+                AND jsonb_typeof(profile_body->'growth_backlog'->'items') = 'array'
+                AND jsonb_array_length(profile_body->'growth_backlog'->'items') > 0
+                 THEN profile_body->'growth_backlog'
+               ELSE growth_backlog
+             END
+       WHERE profile_body IS NOT NULL
+         AND profile_body <> '{}'::jsonb
+    $sql$;
+  END IF;
+
+  -- (1b) Archive identity.priorities into a sidecar column BEFORE the DROP
+  -- (issue #203). The sidecar lives outside any VALORES-read path: it is
+  -- not read by `resolveLegacyPayload` and not consulted by the VALORES
+  -- detector. The only consumer is the (re-)up migration, which restores
+  -- profile_body.identity.priorities and clears the sidecar. Idempotent:
+  -- ADD COLUMN IF NOT EXISTS so a repeated down on an already-rolled-back
+  -- schema does not error. The archive UPDATE is row-local — each row's
+  -- priorities are copied into its own sidecar, with no JOIN and no
+  -- cross-row subquery, preserving tenant isolation by construction.
   EXECUTE 'ALTER TABLE agent_operational_profile_versions
-             ADD COLUMN core_immutable      JSONB NOT NULL DEFAULT ''{}''::jsonb,
-             ADD COLUMN operational_profile JSONB NOT NULL DEFAULT ''{}''::jsonb,
-             ADD COLUMN episodic_temp       JSONB NOT NULL DEFAULT ''{}''::jsonb,
-             ADD COLUMN growth_backlog      JSONB NOT NULL DEFAULT ''{}''::jsonb';
+             ADD COLUMN IF NOT EXISTS _rollback_archive_priorities JSONB NOT NULL DEFAULT ''{}''::jsonb';
 
-  EXECUTE 'UPDATE agent_operational_profile_versions
-              SET core_immutable      = COALESCE(profile_body->''identity'', ''{}''::jsonb),
-                  operational_profile = jsonb_build_object(
-                    ''style'',    COALESCE(profile_body->''style'', ''{}''::jsonb),
-                    ''metadata'', COALESCE(profile_body->''metadata'', ''{}''::jsonb)
-                  )';
+  IF has_profile_body THEN
+    EXECUTE $sql$
+      UPDATE agent_operational_profile_versions
+         SET _rollback_archive_priorities = CASE
+               WHEN profile_body IS NOT NULL
+                AND jsonb_typeof(profile_body->'identity'->'priorities') = 'array'
+                AND jsonb_array_length(profile_body->'identity'->'priorities') > 0
+                 THEN jsonb_build_object(
+                   'priorities', profile_body->'identity'->'priorities'
+                 )
+               ELSE _rollback_archive_priorities
+             END
+       WHERE profile_body IS NOT NULL
+    $sql$;
+  END IF;
 
-  EXECUTE 'ALTER TABLE agent_operational_profile_versions DROP COLUMN profile_body';
+  -- (2) Drop the profile_body column.
+  EXECUTE 'ALTER TABLE agent_operational_profile_versions
+             DROP COLUMN IF EXISTS profile_body';
+
+  -- (3) Reinstall an append-only guard for the legacy columns so the
+  -- post-rollback table preserves the invariant.
+  IF has_legacy THEN
+    EXECUTE $fn$
+      CREATE OR REPLACE FUNCTION agent_op_profile_content_immutable()
+      RETURNS trigger AS $body$
+      BEGIN
+        IF NEW.core_immutable       IS DISTINCT FROM OLD.core_immutable       THEN
+          RAISE EXCEPTION 'agent_operational_profile_versions.core_immutable is append-only';
+        END IF;
+        IF NEW.operational_profile  IS DISTINCT FROM OLD.operational_profile  THEN
+          RAISE EXCEPTION 'agent_operational_profile_versions.operational_profile is append-only';
+        END IF;
+        IF NEW.episodic_temp        IS DISTINCT FROM OLD.episodic_temp        THEN
+          RAISE EXCEPTION 'agent_operational_profile_versions.episodic_temp is append-only';
+        END IF;
+        IF NEW.growth_backlog       IS DISTINCT FROM OLD.growth_backlog       THEN
+          RAISE EXCEPTION 'agent_operational_profile_versions.growth_backlog is append-only';
+        END IF;
+        IF NEW.version              IS DISTINCT FROM OLD.version              THEN
+          RAISE EXCEPTION 'agent_operational_profile_versions.version is immutable after insert';
+        END IF;
+        IF NEW.tenant_id            IS DISTINCT FROM OLD.tenant_id            THEN
+          RAISE EXCEPTION 'agent_operational_profile_versions.tenant_id is immutable after insert';
+        END IF;
+        IF NEW.agent_id             IS DISTINCT FROM OLD.agent_id             THEN
+          RAISE EXCEPTION 'agent_operational_profile_versions.agent_id is immutable after insert';
+        END IF;
+        RETURN NEW;
+      END;
+      $body$ LANGUAGE plpgsql;
+    $fn$;
+
+    EXECUTE 'CREATE TRIGGER agent_op_profile_content_immutable_trg
+               BEFORE UPDATE ON agent_operational_profile_versions
+               FOR EACH ROW
+               EXECUTE FUNCTION agent_op_profile_content_immutable()';
+  END IF;
+  -- If legacy columns are also absent (post-drop future), the table has
+  -- no content columns to guard; the trigger function is unused.
 END;
-$$;
+$outer$;

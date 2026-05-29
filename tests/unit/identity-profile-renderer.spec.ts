@@ -278,6 +278,220 @@ describe('renderOperationalProfile', () => {
     expect(result.system_prompt_block).toContain('## Voz operacional');
   });
 
+  // -------------------------------------------------------------------------
+  // Migration-061 / Codex review #163 coverage:
+  // After migration 061 added `profile_body` alongside the legacy columns,
+  // the renderer must still produce the same output for rows with ONLY
+  // legacy data (existing active profiles), AND it must derive a minimum
+  // render from rows that have ONLY profile_body (newly created via the
+  // admin-ui agent setup flow). Mixed rows prefer the explicit legacy
+  // columns because profile_body lacks the legacy-only fields (principles
+  // detail, thresholds, etc.).
+  // -------------------------------------------------------------------------
+
+  it('legacy-only row (pre-061 data) still renders the legacy blocks', () => {
+    const version = buildVersion({
+      core_immutable: {
+        identity_block: 'Você é a Maia.',
+        principles: ['Separação acima de tudo.'],
+      },
+      operational_profile: { voice_descriptor: 'Direta e profissional.' },
+    });
+    const result = renderOperationalProfile({ version });
+    expect(result.system_prompt_block).toContain('Você é a Maia.');
+    expect(result.system_prompt_block).toContain('## Princípios');
+    expect(result.system_prompt_block).toContain('- Separação acima de tudo.');
+    expect(result.system_prompt_block).toContain('## Voz operacional');
+    expect(result.system_prompt_block).toContain('Direta e profissional.');
+  });
+
+  it('profile_body-only row (post-admin-ui setup, only priorities) renders identity + voice WITHOUT "## Princípios"', () => {
+    // Issue #189 — admin-ui-created profiles that populate identity.priorities
+    // but NOT identity.principles / core_immutable.principles must NOT have
+    // priorities synthesized as principles in the rendered prompt. Doing so
+    // (a) misrepresents operational labels as core value contracts in the
+    // system prompt, and (b) wired the valoresDetector to treat them as
+    // contracts, enabling user-visible auto-freezes.
+    const version = buildVersion({
+      // Legacy columns are missing (or empty {} from the column DEFAULT after
+      // an old DB ran migration 061). The renderer falls back to profile_body.
+      profile_body: {
+        schema_version: 'v3.1.1-2026-05-15',
+        identity: {
+          role_descriptor: 'Você é a Acme Bot.',
+          voice: { tone: 'caloroso e direto', formality: 'medium', verbosity: 'concise' },
+          cognitive_limits: {
+            max_inference_depth: 3,
+            max_speculation_in_response: 0.2,
+            confidence_floor_for_action: 0.7,
+          },
+          priorities: ['precisao', 'clareza'],
+          learned_voice_modifiers: [],
+        },
+        style: { language: 'pt-BR', rhythm: {} },
+        metadata: { effective_from: '', created_by: 'system', previous_version_id: null },
+      },
+    });
+    const result = renderOperationalProfile({ version });
+    expect(result.system_prompt_block).toContain('Você é a Acme Bot.');
+    // No principles synthesized from priorities: section header is omitted
+    // entirely, and the priority labels do NOT appear in the prompt.
+    expect(result.system_prompt_block).not.toContain('## Princípios');
+    expect(result.system_prompt_block).not.toContain('- precisao');
+    expect(result.system_prompt_block).not.toContain('- clareza');
+    expect(result.system_prompt_block).toContain('## Voz operacional');
+    expect(result.system_prompt_block).toContain('caloroso e direto');
+  });
+
+  it('profile_body-only row with REAL identity.principles renders "## Princípios" (issue #189 positive)', () => {
+    // Mirror of the previous test: when identity.principles IS populated
+    // (i.e. the operator did configure real principles), the synthesized
+    // path lifts them into core_immutable.principles and the renderer
+    // produces the "## Princípios" section. This is the contract that
+    // distinguishes "true principles configured" from "only priorities".
+    const version = buildVersion({
+      profile_body: {
+        schema_version: 'v3.1.1-2026-05-15',
+        identity: {
+          role_descriptor: 'Você é a Acme Bot.',
+          voice: { tone: 'profissional', formality: 'medium', verbosity: 'concise' },
+          cognitive_limits: {
+            max_inference_depth: 3,
+            max_speculation_in_response: 0.2,
+            confidence_floor_for_action: 0.7,
+          },
+          priorities: ['precisao', 'clareza'],
+          principles: ['Honestidade acima de tudo.', 'Transparência sempre.'],
+          learned_voice_modifiers: [],
+        },
+        style: { language: 'pt-BR', rhythm: {} },
+        metadata: { effective_from: '', created_by: 'system', previous_version_id: null },
+      },
+    });
+    const result = renderOperationalProfile({ version });
+    expect(result.system_prompt_block).toContain('## Princípios');
+    expect(result.system_prompt_block).toContain('- Honestidade acima de tudo.');
+    expect(result.system_prompt_block).toContain('- Transparência sempre.');
+    // Priorities are NOT rendered as principles.
+    expect(result.system_prompt_block).not.toContain('- precisao');
+    expect(result.system_prompt_block).not.toContain('- clareza');
+  });
+
+  it('Drizzle-shaped row (legacy keys direct under profile_body) renders full legacy payload', () => {
+    // This is THE production case (Codex review #163 round 3):
+    // `seedInitialOperationalProfile` writes legacy keys (core_immutable,
+    // operational_profile, episodic_temp, growth_backlog) DIRECTLY under
+    // profile_body. Migration 061 backfills the same shape. The renderer
+    // MUST read from there.
+    const version = buildVersion({
+      // No top-level legacy fields — Drizzle returns ONLY profile_body.
+      profile_body: {
+        schema_version: 'v3.1.1-2026-05-15',
+        identity: {
+          // Canonical fields are present but should be ignored when the
+          // direct-embed legacy keys carry the authoritative payload.
+          role_descriptor: 'derived role (synthesized — should be ignored)',
+          voice: { tone: 'derived tone (synthesized — should be ignored)' },
+          priorities: ['derived (should be ignored)'],
+        },
+        // Direct-embed: how proposal-generator + migration 061 write it.
+        core_immutable: {
+          identity_block: 'Você é a Maia (do profile_body direct-embed).',
+          principles: ['Princípio A', 'Princípio B'],
+        },
+        operational_profile: {
+          voice_descriptor: 'Voz direct-embed.',
+          thresholds: { max_inference_depth: 4 },
+        },
+        episodic_temp: {
+          entries: [
+            { summary: 'evento direct', mention_allowed: true, proactive_use: true },
+          ],
+        },
+        growth_backlog: ['Hint direct'],
+      },
+    });
+    const result = renderOperationalProfile({ version });
+    expect(result.system_prompt_block).toContain('Você é a Maia (do profile_body direct-embed).');
+    expect(result.system_prompt_block).toContain('## Princípios');
+    expect(result.system_prompt_block).toContain('- Princípio A');
+    expect(result.system_prompt_block).toContain('- Princípio B');
+    expect(result.system_prompt_block).toContain('## Voz operacional');
+    expect(result.system_prompt_block).toContain('Voz direct-embed.');
+    expect(result.system_prompt_block).toContain('## Parâmetros calibrados');
+    expect(result.system_prompt_block).toContain('max_inference_depth');
+    expect(result.episodic_summary_block).toContain('evento direct');
+    expect(result.growth_hints_block).toContain('Hint direct');
+    // Canonical identity.* must NOT leak when the direct-embed is present.
+    expect(result.system_prompt_block).not.toContain('derived');
+  });
+
+  it('admin-ui-created row (canonical profile_body.identity only) renders cognitive_limits as thresholds', () => {
+    // Codex review #163 round 4 [medium]: admin-ui agents.create writes a
+    // ProfileBody with identity.cognitive_limits but no direct-embed legacy
+    // payload. The synthesized fallback must surface cognitive_limits as
+    // operational_profile.thresholds so the "## Parâmetros calibrados"
+    // section actually renders.
+    const version = buildVersion({
+      profile_body: {
+        schema_version: 'v3.1.1-2026-05-15',
+        identity: {
+          role_descriptor: 'Você é a Bot da Acme.',
+          voice: { tone: 'profissional', formality: 'medium', verbosity: 'concise' },
+          cognitive_limits: {
+            max_inference_depth: 4,
+            max_speculation_in_response: 0.15,
+            confidence_floor_for_action: 0.75,
+          },
+          priorities: ['precisao', 'clareza'],
+          learned_voice_modifiers: [],
+        },
+        style: { language: 'pt-BR', rhythm: {} },
+        metadata: { effective_from: '', created_by: 'system', previous_version_id: null },
+        // Intentionally no legacy direct-embed keys.
+      },
+    });
+    const result = renderOperationalProfile({ version });
+    expect(result.system_prompt_block).toContain('Você é a Bot da Acme.');
+    expect(result.system_prompt_block).toContain('## Voz operacional');
+    expect(result.system_prompt_block).toContain('profissional');
+    // Cognitive limits surfaced under thresholds:
+    expect(result.system_prompt_block).toContain('## Parâmetros calibrados');
+    expect(result.system_prompt_block).toContain('max_inference_depth');
+    expect(result.system_prompt_block).toContain('4');
+    expect(result.system_prompt_block).toContain('confidence_floor_for_action');
+  });
+
+  it('mixed row (legacy + profile_body) prefers legacy (keeps full payload)', () => {
+    // After migration 061 a row carries BOTH the legacy columns (untouched)
+    // and a backfilled profile_body. The renderer must keep using the legacy
+    // payload because profile_body's best-effort backfill loses things like
+    // operational_profile.thresholds that the legacy column still has.
+    const version = buildVersion({
+      core_immutable: {
+        identity_block: 'Você é a Maia (legacy).',
+        principles: ['Princípio legacy 1', 'Princípio legacy 2'],
+      },
+      operational_profile: {
+        voice_descriptor: 'Voz legacy explícita.',
+        thresholds: { max_inference_depth: 3 },
+      },
+      profile_body: {
+        identity: {
+          role_descriptor: 'Você é a Maia (do profile_body, deve ser ignorada).',
+          voice: { tone: 'tom do profile_body que deve ser ignorado' },
+          priorities: ['this-must-not-render'],
+        },
+      },
+    });
+    const result = renderOperationalProfile({ version });
+    expect(result.system_prompt_block).toContain('Você é a Maia (legacy).');
+    expect(result.system_prompt_block).toContain('Voz legacy explícita.');
+    expect(result.system_prompt_block).toContain('## Parâmetros calibrados');
+    expect(result.system_prompt_block).not.toContain('profile_body');
+    expect(result.system_prompt_block).not.toContain('this-must-not-render');
+  });
+
   it('bonus: null/undefined threshold values are skipped silently', () => {
     const version = buildVersion({
       core_immutable: { identity_block: 'id' },

@@ -165,6 +165,54 @@ export const REGISTRY: Record<string, AnyTool> = {
 };
 
 /**
+ * Tools whose presence in `REGISTRY` is gated by a CONFIG (env) flag via the
+ * conditional spreads above — when the flag is OFF the entry is absent from
+ * `REGISTRY` entirely, so `Object.values(REGISTRY)` would silently drop them.
+ *
+ * The Admin UI Tools Catalog must list EVERY tool (disabled-but-existing,
+ * naming the flag that turns it on), so `buildToolCatalog()` re-adds these
+ * from their direct definitions and computes `enabled` from the live config
+ * flag. Co-located with the `REGISTRY` spreads above so the two never drift:
+ * if you add/remove a config-gated tool there, update this list too.
+ *
+ * Note these are config-env flags, NOT `FeatureFlagName` enum members (unlike
+ * the calendar tools, which declare `feature_flag` on the tool itself, and the
+ * KSM `propose_*` tools, gated by `FeatureFlagName.KNOWLEDGE_STATE_MACHINE_V1`).
+ * The `flag` strings below are the env var names operators flip.
+ */
+const CONFIG_GATED_TOOLS: ReadonlyArray<{
+  tool: AnyTool;
+  flag: string;
+  enabled: boolean;
+}> = [
+  {
+    tool: scheduleReminderTool as unknown as AnyTool,
+    flag: 'FEATURE_SCHEDULING_V2',
+    enabled: config.FEATURE_SCHEDULING_V2,
+  },
+  {
+    tool: cancelReminderTool as unknown as AnyTool,
+    flag: 'FEATURE_SCHEDULING_V2',
+    enabled: config.FEATURE_SCHEDULING_V2,
+  },
+  {
+    tool: startRecurringOutreachTool as unknown as AnyTool,
+    flag: 'FEATURE_SCHEDULING_V2',
+    enabled: config.FEATURE_SCHEDULING_V2,
+  },
+  {
+    tool: startRecurringPaymentTool as unknown as AnyTool,
+    flag: 'FEATURE_SCHEDULING_V2',
+    enabled: config.FEATURE_SCHEDULING_V2,
+  },
+  {
+    tool: generateReportTool as unknown as AnyTool,
+    flag: 'FEATURE_PDF_REPORTS',
+    enabled: config.FEATURE_PDF_REPORTS,
+  },
+];
+
+/**
  * Runtime-flag check used by both the schema exposure path
  * (getToolSchemas) and the dispatcher (`dispatchTool`). When the flag is
  * off (or killed via kill switch), `propose_*` tools are reported as
@@ -212,4 +260,83 @@ function toolToSchema(t: AnyTool) {
     description: t.description,
     input_schema: { type: 'object' as const, additionalProperties: true },
   };
+}
+
+/**
+ * A catalog entry: a tool plus its accurate runtime gating. `enabled` reflects
+ * the live config/feature-flag state; `feature_flag` is the NAME of the flag
+ * that gates it (null when ungated).
+ */
+export interface CatalogEntry {
+  tool: AnyTool;
+  enabled: boolean;
+  /** The gating flag NAME (env var or FeatureFlagName value), or null. */
+  feature_flag: string | null;
+}
+
+/**
+ * Build the COMPLETE tool catalog for the Admin UI `/tools` screen.
+ *
+ * Unlike `Object.values(REGISTRY)`, this includes tools that are absent from
+ * `REGISTRY` because their CONFIG flag is off (scheduling tools, generate_report)
+ * — operators must see every tool that exists and which flag turns it on.
+ *
+ * Per entry it computes:
+ *   - `enabled`: the real gating (config flag for config-gated tools,
+ *     `isToolEnabled` — which honours declared `feature_flag` and the KSM
+ *     `propose_*` flag — for everything else).
+ *   - `feature_flag`: the NAME of the gating flag (env var name for
+ *     config-gated tools; `FeatureFlagName` value for declared-flag and KSM
+ *     tools), or null when the tool is ungated.
+ *
+ * Deduped by tool name (a config-gated tool present in `REGISTRY` because its
+ * flag is currently on is not added twice). Stable, sorted by name so the UI
+ * and tests don't depend on insertion order.
+ */
+export function buildToolCatalog(): CatalogEntry[] {
+  const byName = new Map<string, CatalogEntry>();
+
+  // 1. Everything currently in REGISTRY (flag-on tools + always-on tools).
+  for (const tool of Object.values(REGISTRY)) {
+    byName.set(tool.name, {
+      tool,
+      enabled: isToolEnabled(tool.name),
+      feature_flag: gatingFlagName(tool),
+    });
+  }
+
+  // 2. Config-gated tools that REGISTRY drops when their env flag is off.
+  //    (If the flag is on they're already in REGISTRY via step 1; don't
+  //    overwrite, but DO ensure the flag name is surfaced.)
+  for (const { tool, flag, enabled } of CONFIG_GATED_TOOLS) {
+    const existing = byName.get(tool.name);
+    if (existing) {
+      // Present because the flag is on — annotate the gating flag name so the
+      // UI can still show "turns on via <flag>" semantics if it wants.
+      existing.feature_flag = flag;
+      existing.enabled = enabled;
+    } else {
+      byName.set(tool.name, { tool, enabled, feature_flag: flag });
+    }
+  }
+
+  return Array.from(byName.values()).sort((a, b) =>
+    a.tool.name.localeCompare(b.tool.name),
+  );
+}
+
+/**
+ * The NAME of the flag gating a tool already present in `REGISTRY`:
+ *   - KSM `propose_*` tools → `FeatureFlagName.KNOWLEDGE_STATE_MACHINE_V1`.
+ *   - tools that declare `feature_flag` (calendar write tools) → that value.
+ *   - otherwise null (ungated, or config-gated tools handled separately).
+ */
+function gatingFlagName(tool: AnyTool): string | null {
+  if (KSM_PROPOSE_TOOLS.has(tool.name)) {
+    return FeatureFlagName.KNOWLEDGE_STATE_MACHINE_V1;
+  }
+  if (tool.feature_flag !== undefined) {
+    return tool.feature_flag;
+  }
+  return null;
 }

@@ -109,4 +109,88 @@ describe('promptOnlyMode', () => {
       expect.objectContaining({ system: 'You are a classifier.' }),
     );
   });
+
+  // ------------------------------------------------------------------------
+  // Issue #220 — AbortSignal propagation from ModeContext to callLLM.
+  // ------------------------------------------------------------------------
+
+  it('forwards ctx.signal to callLLM (issue #220)', async () => {
+    vi.mocked(callLLM).mockResolvedValue({
+      content: '{"ok":true}',
+      tool_uses: [],
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 0, output_tokens: 0 },
+      model: 'x',
+    });
+    const controller = new AbortController();
+    await promptOnlyMode({
+      skill: mockSkill,
+      input: {},
+      resolvedPolicies: [],
+      signal: controller.signal,
+    });
+    const call = vi.mocked(callLLM).mock.calls[0]?.[0];
+    expect(call?.signal).toBe(controller.signal);
+  });
+
+  it('signal received by callLLM fires when controller aborts (issue #220)', async () => {
+    let capturedSignal: AbortSignal | undefined;
+    vi.mocked(callLLM).mockImplementation(async (params: any) => {
+      capturedSignal = params.signal;
+      // Simulate a long-running call: resolve only after the signal aborts,
+      // mirroring how the SDK behaves when its request is cancelled.
+      return await new Promise<any>((_resolve, reject) => {
+        params.signal?.addEventListener(
+          'abort',
+          () => {
+            const err = new Error('AbortError');
+            (err as any).name = 'AbortError';
+            reject(err);
+          },
+          { once: true },
+        );
+      });
+    });
+    const controller = new AbortController();
+    const p = promptOnlyMode({
+      skill: mockSkill,
+      input: {},
+      resolvedPolicies: [],
+      signal: controller.signal,
+    });
+    // Caller cancels — e.g. SkillRunner timeout fired.
+    controller.abort('skill_runner_timeout');
+    await expect(p).rejects.toThrow();
+    expect(capturedSignal).toBeDefined();
+    expect(capturedSignal?.aborted).toBe(true);
+    // Reason is preserved through the chain (issue #220 requirement).
+    expect(capturedSignal?.reason).toBe('skill_runner_timeout');
+  });
+
+  it('throws "aborted" without calling LLM when signal is already aborted (issue #220)', async () => {
+    const controller = new AbortController();
+    controller.abort('caller_cancelled');
+    await expect(
+      promptOnlyMode({
+        skill: mockSkill,
+        input: {},
+        resolvedPolicies: [],
+        signal: controller.signal,
+      }),
+    ).rejects.toThrow('aborted');
+    expect(callLLM).not.toHaveBeenCalled();
+  });
+
+  it('does not pass signal when ctx.signal is undefined (back-compat)', async () => {
+    vi.mocked(callLLM).mockResolvedValue({
+      content: '{"ok":true}',
+      tool_uses: [],
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 0, output_tokens: 0 },
+      model: 'x',
+    });
+    await promptOnlyMode({ skill: mockSkill, input: {}, resolvedPolicies: [] });
+    const call = vi.mocked(callLLM).mock.calls[0]?.[0];
+    expect(call?.signal).toBeUndefined();
+  });
 });

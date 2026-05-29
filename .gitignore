@@ -53,7 +53,9 @@ logs/
 src/admin-ui/.next/
 src/admin-ui/node_modules/
 src/admin-ui/out/
-src/admin-ui/package-lock.json
+# NOTE: src/admin-ui/package-lock.json IS committed (was ignored pre-PR
+# #176; admins-ui Dockerfile builds need it for reproducible `npm install`
+# and Codex flagged the missing-lockfile COPY as a [P1] build hazard).
 
 # Plan/spec scratch files (P8.5)
 p8.5-plan.md

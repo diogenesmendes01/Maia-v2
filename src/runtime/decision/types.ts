@@ -108,11 +108,39 @@ export interface PolicyRulesRepo {
  */
 export interface Skill {
   id: string;
+  /**
+   * F1 Phase 1 (Codex HIGH/P2 — immutable identity): the stable Skill Contract
+   * descriptor (`skills.skill_descriptor`) + its version. `id`/`version` change
+   * across an activate/rollback; the descriptor is the stable handle `runSkill`
+   * resolves by. ActionDecider threads both onto `DecisionPacket.routing` so the
+   * execute_skill call site can re-resolve and assert the active row is still
+   * the exact one the engine evaluated. Optional for legacy/stub skills.
+   */
+  skill_descriptor?: string;
+  version?: number;
   category: 'respond' | 'tool_mediated' | 'decide' | 'plan' | string;
+  /**
+   * F1 Phase 1: the skill's execution mode (`skills.execution_mode`), distinct
+   * from `category` (master spec: they are independent — a `decide`-category
+   * skill can be `tool_mediated`). Phase 1 gates execute_skill on
+   * `execution_mode ∈ {prompt_only, evaluator}` (terminal, no side effects);
+   * `tool_mediated`/`procedure_adapter` are excluded (Phase 2). Optional for
+   * legacy/stub skills, in which case the skill is never directly executed.
+   */
+  execution_mode?: 'prompt_only' | 'evaluator' | 'tool_mediated' | 'procedure_adapter' | string;
   priority: number;
   status: 'active' | 'deprecated' | 'draft';
   applicable_to_intent?: string[];
   applicable_to_workflow?: string[];
+  /**
+   * F1 Phase 0: free-text "when to use this skill" guidance from the Skill
+   * Contract (`skills.when_to_use`). SkillSelector matches the classified
+   * intent against this text (plus `applicable_to_intent`) so a skill is only
+   * selected when the turn clearly relates to it — the anti-hijack guard. May
+   * be absent for legacy/stub skills, in which case matching falls back to
+   * `applicable_to_intent` / the descriptor.
+   */
+  when_to_use?: string;
   allowed_tools?: string[];
   blocked_tools?: string[];
   requires_confirmation_tools?: string[];

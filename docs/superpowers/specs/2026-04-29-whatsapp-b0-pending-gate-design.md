@@ -351,8 +351,6 @@ This script collapses each conversa's open-pending set to the single most-recent
 
 ## 13. References
 
-- Spec 06 — agent loop
-- Spec 09 — pending lifecycle, audit taxonomy
 - Sub-project A design — `docs/superpowers/specs/2026-04-29-whatsapp-ux-polish-design.md`
 - B1 paused design — `docs/superpowers/specs/2026-04-29-whatsapp-b1-one-tap-design.md` (resumes after B0 lands)
 - `src/workflows/pending-questions.ts` — `applyResolution`, `IntentResolution`

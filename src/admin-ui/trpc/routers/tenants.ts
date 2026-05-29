@@ -4,9 +4,12 @@
  * Procedures:
  *   - list         — list every tenant (founder-only, cross-tenant by design)
  *   - getById      — fetch a single tenant (founder, or the user's own tenant)
- *   - create       — provision a new tenant (founder-only); appends audit
+ *   - create       — provision a new tenant (founder-only); tenant insert +
+ *                    audit committed atomically in one DB transaction (see
+ *                    `tenantsRepo.createWithAuditAtomic`, issue #184)
  *   - updateStatus — change tenant status active|suspended (founder-only);
- *                    appends audit
+ *                    flip + audit committed atomically in one DB transaction
+ *                    (see `tenantsRepo.updateStatusAtomic`, issue #165)
  *
  * Notes:
  *   - tenantsRepo methods don't use applyTenantGuard (tenants table is the
@@ -61,75 +64,105 @@ export const tenantsRouter = router({
     return tenant;
   }),
 
+  /**
+   * Provision a new tenant.
+   *
+   * Codex Adversarial Review on PR #180 (issue #184) — delegates to
+   * `tenantsRepo.createWithAuditAtomic`, which wraps the tenant insert and
+   * the `admin_audit_log` append in a single DB transaction. If the audit
+   * insert fails (or the request is interrupted), the tenant insert rolls
+   * back together with it — preserving the append-only mutation-trail
+   * invariant for tenant provisioning. Pre-fix, an interrupted audit step
+   * left the tenant row committed with no forensic record, and a retry hit
+   * CONFLICT (primary-key violation) without ever re-attempting the audit.
+   *
+   * The pre-flight `findById` is gone: the atomic repo method handles the
+   * duplicate-id case via Postgres `23505` and returns a typed reason, so
+   * we map it to CONFLICT without an extra round trip and without a TOCTOU
+   * window between the existence check and the INSERT.
+   *
+   * Mirrors the pattern from `updateStatusAtomic` (issue #165 / PR #169)
+   * and `agentsRepo.createWithSeedAndAudit` (issue #166 / PR #171).
+   */
   create: founderProcedure.input(CreateInputSchema).mutation(async ({ input, ctx }) => {
-    const existing = await ctx.repos.tenantsRepo.findById(input.id);
-    if (existing) {
-      throw new TRPCError({
-        code: 'CONFLICT',
-        message: `Tenant '${input.id}' already exists`,
-      });
-    }
-
-    const created = await ctx.repos.tenantsRepo.create({
-      id: input.id,
-      nome: input.nome,
-      status: input.status ?? 'active',
-    });
-
-    await ctx.repos.adminAuditLogRepo.append({
-      tenant_id: ctx.tenantId,
-      actor_id: ctx.userId,
-      actor_role: ctx.userRole,
-      action: 'tenant_create',
-      resource_type: 'tenant',
-      resource_id: created.id,
-      change_summary: {
-        target_tenant_id: created.id,
-        nome: created.nome,
-        status: created.status,
+    const result = await ctx.repos.tenantsRepo.createWithAuditAtomic({
+      tenant: {
+        id: input.id,
+        nome: input.nome,
+        status: input.status ?? 'active',
       },
-    });
-
-    return created;
-  }),
-
-  updateStatus: founderProcedure
-    .input(UpdateStatusInputSchema)
-    .mutation(async ({ input, ctx }) => {
-      const before = await ctx.repos.tenantsRepo.findById(input.id);
-      if (!before) {
-        throw new TRPCError({ code: 'NOT_FOUND', message: 'Tenant not found' });
-      }
-      if (before.status === input.status) {
-        throw new TRPCError({
-          code: 'BAD_REQUEST',
-          message: `Tenant is already ${input.status}`,
-        });
-      }
-
-      const updated = await ctx.repos.tenantsRepo.updateStatus(input.id, input.status);
-      if (!updated) {
-        throw new TRPCError({
-          code: 'INTERNAL_SERVER_ERROR',
-          message: 'Update returned no row',
-        });
-      }
-
-      await ctx.repos.adminAuditLogRepo.append({
+      audit: {
         tenant_id: ctx.tenantId,
         actor_id: ctx.userId,
         actor_role: ctx.userRole,
-        action: 'tenant_update_status',
-        resource_type: 'tenant',
-        resource_id: updated.id,
-        change_summary: {
-          target_tenant_id: updated.id,
-          from_status: before.status,
-          to_status: updated.status,
-          reason: input.comment,
+      },
+    });
+
+    if (!result.ok) {
+      if (result.reason === 'duplicate_id') {
+        throw new TRPCError({
+          code: 'CONFLICT',
+          message: `Tenant '${input.id}' already exists`,
+        });
+      }
+      // Exhaustiveness check — any future reason must be handled above.
+      const _exhaustive: never = result.reason;
+      throw new TRPCError({
+        code: 'INTERNAL_SERVER_ERROR',
+        message: `createWithAuditAtomic failed: ${String(_exhaustive)}`,
+      });
+    }
+
+    return result.tenant;
+  }),
+
+  /**
+   * Change a tenant's status (active|suspended).
+   *
+   * Codex Adversarial Review round 3 on PR #163 (issue #165) — delegates to
+   * `tenantsRepo.updateStatusAtomic`, which wraps the status flip and the
+   * `admin_audit_log` append in a single DB transaction. If the audit insert
+   * fails (or the request is interrupted), the status change rolls back
+   * together with it, preserving the append-only mutation-trail invariant.
+   *
+   * The pre-flight `findById` is gone: the atomic repo method does its own
+   * locked re-read inside the tx and returns a discriminated union so we can
+   * map outcomes to TRPC codes without a TOCTOU window. (Two concurrent
+   * founders racing to suspend the same tenant now serialize on the
+   * SELECT FOR UPDATE — only one wins, the other returns `already_in_status`.)
+   */
+  updateStatus: founderProcedure
+    .input(UpdateStatusInputSchema)
+    .mutation(async ({ input, ctx }) => {
+      const result = await ctx.repos.tenantsRepo.updateStatusAtomic({
+        id: input.id,
+        status: input.status,
+        audit: {
+          tenant_id: ctx.tenantId,
+          actor_id: ctx.userId,
+          actor_role: ctx.userRole,
+          comment: input.comment,
         },
       });
 
-      return updated;
+      if (!result.ok) {
+        if (result.reason === 'not_found') {
+          throw new TRPCError({ code: 'NOT_FOUND', message: 'Tenant not found' });
+        }
+        if (result.reason === 'already_in_status') {
+          throw new TRPCError({
+            code: 'BAD_REQUEST',
+            message: `Tenant is already ${input.status}`,
+          });
+        }
+        // Exhaustiveness check — any future reason must be handled above.
+        const _exhaustive: never = result.reason;
+        throw new TRPCError({
+          code: 'INTERNAL_SERVER_ERROR',
+          message: `updateStatusAtomic failed: ${String(_exhaustive)}`,
+        });
+      }
+
+      return result.after;
     }),
 });
