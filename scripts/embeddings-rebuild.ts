@@ -116,10 +116,272 @@
 import { pathToFileURL } from 'node:url';
 import { db, pool } from '@/db/client.js';
 import { sql } from 'drizzle-orm';
-import { getEmbeddingProvider } from '@/lib/embeddings.js';
+import { getEmbeddingProvider, type EmbeddingProvider } from '@/lib/embeddings.js';
 import { config } from '@/config/env.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import { logger } from '@/lib/logger.js';
+import { audit } from '@/governance/audit.js';
+
+/**
+ * Thrown when the embedding provider returns a different number of vectors
+ * than texts requested (issue #289). This is a hard contract violation:
+ * aligning by index with `embs[i]` becomes meaningless, so the only safe
+ * action is to abort the batch and surface it to the operator. The
+ * pre-existing re-detection predicate
+ * (`embedding IS NULL OR vector_dims(...) != EXPECTED_DIM`) keeps the rows
+ * pending for the next run, so no progress is lost — and pgvector never
+ * sees a misaligned or `[]::vector` write.
+ */
+export class ProviderCardinalityError extends Error {
+  constructor(expected: number, got: number) {
+    super(`embedding_provider_cardinality_mismatch: expected ${expected}, got ${got}`);
+    this.name = 'ProviderCardinalityError';
+  }
+}
+
+/**
+ * Thrown when one or more returned vectors fail the dimension/validity check
+ * (issue #289 blocker, Codex review #295). Unlike a transient race (UPDATE
+ * matching zero rows — see the no-op skip path), an invalid vector is a
+ * batch-level contract violation: writing the survivors while dropping the
+ * bad row would be a PARTIAL, inconsistent write — the exact class #289
+ * targets. So validation runs as a PRE-SCAN over the whole batch BEFORE any
+ * UPDATE, and on any invalid vector we throw this to abort the entire batch.
+ * The surrounding `db.transaction(...)` in `rebuildEmbeddingsForTuple` rolls
+ * back, so NO row in the batch is written and every row stays pending for the
+ * next run's re-detection predicate (`embedding IS NULL OR vector_dims(...)
+ * != EXPECTED_DIM`). pgvector never sees a `[]::vector` or wrong-dim write.
+ *
+ * `invalid` carries the per-row context (id + tenant/agent + reason) so the
+ * operator can see exactly which rows tripped the guard without grepping the
+ * audit log.
+ */
+export interface InvalidVectorInfo {
+  id: string;
+  tenant_id: string;
+  agent_id: string;
+  reason: 'missing_vector' | 'wrong_dimension';
+  got_dim: number;
+}
+
+export class ProviderDimensionError extends Error {
+  readonly invalid: InvalidVectorInfo[];
+  constructor(expected: number, invalid: InvalidVectorInfo[]) {
+    super(
+      `embedding_provider_dimension_mismatch: expected ${expected}, ` +
+        `${invalid.length} invalid vector(s) in batch ` +
+        `(ids: ${invalid.map((v) => v.id).join(', ')})`,
+    );
+    this.name = 'ProviderDimensionError';
+    this.invalid = invalid;
+  }
+}
+
+/**
+ * Row shape consumed by `rebuildBatch`. Within a single
+ * `rebuildEmbeddingsForTuple` invocation all rows share the same
+ * (tenant_id, agent_id) tuple — the SELECT pins both predicates — but we
+ * carry them per row so audit events for skipped rows attribute under the
+ * row's own context (matches the #289 contract of "audit lands in the right
+ * tenant's audit log").
+ */
+export interface MemoryRow {
+  id: string;
+  tenant_id: string;
+  agent_id: string;
+  conteudo: string;
+}
+
+export interface RebuildBatchResult {
+  updated: number;
+  skipped: number;
+}
+
+/**
+ * Rebuilds embeddings for a single batch of rows (issue #289).
+ *
+ * VALIDATION FULLY PRECEDES MUTATION (Codex review #295 blocker). The function
+ * runs two distinct phases with NO interleaving:
+ *   1. PRE-SCAN: validate provider cardinality, then validate EVERY returned
+ *      vector (present, an array, and exactly `expectedDim` long) BEFORE any
+ *      UPDATE is issued. On ANY mismatch we throw (`ProviderCardinalityError`
+ *      for a count mismatch, `ProviderDimensionError` for invalid vectors) so
+ *      the WHOLE batch aborts — the surrounding `db.transaction(...)` in
+ *      `rebuildEmbeddingsForTuple` rolls back and NO row is written.
+ *   2. MUTATE: only once every vector in the batch is known-good do we run the
+ *      UPDATEs, as one atomic unit.
+ *
+ * Why abort-the-whole-batch instead of skip-and-continue: the previous code
+ * checked each vector's dimension INSIDE the same loop that ran the UPDATE, so
+ * a bad vector at index i was discovered only AFTER rows 0..i-1 had already
+ * been written in this transaction — a partial, inconsistent write, the exact
+ * class #289 targets. Pre-scanning and aborting closes that window entirely:
+ * the batch is all-or-nothing. Every aborted row stays pending and is retried
+ * on the next run via the re-detection predicate (`embedding IS NULL OR
+ * vector_dims(...) != EXPECTED_DIM`), so no progress is lost.
+ *
+ * Previously the per-row update used `embs[i] ?? []`, which silently wrote
+ * `[]::vector`. pgvector treats `[]` as a zero-vector, so semantic search
+ * returned similarity 0 for those rows until the next run's re-detection
+ * caught the wrong dimension — a corruption window invisible to ops.
+ *
+ * PROVIDER CONTRACT — POSITIONAL INDEX MATCHING: returned embeddings are
+ * matched to input rows strictly by position, i.e. `rows[i]` ↔ `embs[i]`. The
+ * provider MUST return exactly one vector per input text, in the same order.
+ * The cardinality check (`embs.length === texts.length`) is what makes this
+ * index alignment safe to rely on — if the counts differ, every index from
+ * there on is meaningless, so we abort rather than guess the alignment.
+ *
+ * UPDATE pins (id, tenant_id, agent_id) so the write cannot land outside
+ * the routed tuple even with a stale id. Uses `tx.execute` so it composes
+ * cleanly with the per-batch transaction in
+ * `rebuildEmbeddingsForTuple`. `RETURNING id` lets the caller verify the
+ * row really matched (race detection — see the no-op warn path; that path
+ * counts as `skipped` and does NOT abort the batch, since a transient worker
+ * tenant-flip is not a data-validity failure).
+ *
+ * Exported so unit tests can drive cardinality / dim cases without paying
+ * the cost of the full CLI + advisory-lock + transaction harness.
+ */
+export async function rebuildBatch(
+  provider: EmbeddingProvider,
+  rows: MemoryRow[],
+  expectedDim: number,
+  exec: (s: ReturnType<typeof sql>) => Promise<{ rows: Array<{ id: string }> }> = (
+    s,
+  ) => db.execute<{ id: string }>(s) as Promise<{ rows: Array<{ id: string }> }>,
+): Promise<RebuildBatchResult> {
+  if (rows.length === 0) return { updated: 0, skipped: 0 };
+
+  const texts = rows.map((r) => r.conteudo);
+  const embs = await provider.embed(texts);
+
+  // ─── PHASE 1: PRE-SCAN — validate the ENTIRE batch before any UPDATE ──────
+  // Validation must FULLY precede mutation (Codex review #295 blocker). If we
+  // validated inside the UPDATE loop, a bad vector at index i would only be
+  // caught AFTER rows 0..i-1 were written in this transaction → partial,
+  // inconsistent write (#289). So we scan everything first and abort the whole
+  // batch on any problem — nothing is written and the surrounding transaction
+  // rolls back, leaving every row pending for the next run.
+
+  // Cardinality check FIRST — if the provider returned a different number
+  // of vectors than texts, every index from here on is unreliable (the
+  // rows[i] ↔ embs[i] positional contract is broken). Abort the batch so we
+  // never write a misaligned vector. The outer caller surfaces this to the
+  // operator; pending rows remain pending.
+  if (embs.length !== texts.length) {
+    throw new ProviderCardinalityError(texts.length, embs.length);
+  }
+
+  // Per-vector validity check — defensive. The upstream DimensionGuard already
+  // throws on dim mismatch, but if it's ever bypassed (e.g. a future provider
+  // that skips the guard, or a mocked provider in tests), this catches the
+  // regression before we write `[]::vector` or a wrong-dim vector that
+  // pgvector would silently accept as zero-similarity. We collect EVERY
+  // invalid row (rather than throwing on the first) so the operator sees the
+  // full set in one error / one audit pass — then abort the batch as a unit.
+  const invalid: InvalidVectorInfo[] = [];
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i]!;
+    const vec = embs[i];
+    if (!vec || !Array.isArray(vec) || vec.length !== expectedDim) {
+      invalid.push({
+        id: row.id,
+        tenant_id: row.tenant_id,
+        agent_id: row.agent_id,
+        reason: !vec || !Array.isArray(vec) ? 'missing_vector' : 'wrong_dimension',
+        got_dim: Array.isArray(vec) ? vec.length : 0,
+      });
+    }
+  }
+
+  if (invalid.length > 0) {
+    // Audit each invalid row under its OWN tenant context so the event is
+    // attributed correctly (the outer caller is already inside
+    // runWithTenantContext, but we re-enter explicitly here to match the #289
+    // contract — and to keep this function correct if a future caller invokes
+    // it outside a tenant scope). Then throw to abort the whole batch: the
+    // transaction rolls back and NO row — valid or invalid — is written.
+    for (const info of invalid) {
+      logger.warn(
+        {
+          tenant_id: info.tenant_id,
+          agent_id: info.agent_id,
+          memory_id: info.id,
+          expected_dim: expectedDim,
+          got_dim: info.got_dim,
+          op: 'embeddings_rebuild_skip_invalid',
+        },
+        'embeddings-rebuild: invalid vector (missing or wrong dim) — aborting batch',
+      );
+      await runWithTenantContext(
+        { tenant_id: info.tenant_id, agent_id: info.agent_id },
+        () =>
+          audit({
+            acao: 'embeddings_rebuild_skip_invalid',
+            entidade_alvo: 'agent_memory',
+            alvo_id: info.id,
+            metadata: {
+              expected_dim: expectedDim,
+              got_dim: info.got_dim,
+              reason: info.reason,
+            },
+          }),
+      );
+    }
+    throw new ProviderDimensionError(expectedDim, invalid);
+  }
+
+  // ─── PHASE 2: MUTATE — every vector is now known-good, write them all ─────
+  // We only reach here when the entire batch validated. The UPDATEs run as one
+  // atomic unit inside the caller's transaction.
+  let updated = 0;
+  let skipped = 0;
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i]!;
+    // Safe: PHASE 1 guaranteed embs[i] is a present array of length
+    // expectedDim for every i, matched to rows[i] by positional index.
+    const vec = embs[i]!;
+
+    const literal = `[${vec.join(',')}]`;
+    // UPDATE pins (id, tenant_id, agent_id) — defense in depth against a
+    // stale id or wrong ALS context. RETURNING id lets the per-batch
+    // transaction's no-op detection (race with worker tenant flip) fire
+    // exactly as before.
+    const result = await exec(sql`
+      UPDATE agent_memories
+      SET embedding = ${literal}::vector
+      WHERE id = ${row.id}::uuid
+        AND tenant_id = ${row.tenant_id}
+        AND agent_id = ${row.agent_id}
+      RETURNING id::text
+    `);
+    if (result.rows.length === 1) {
+      updated++;
+    } else {
+      // Race detection — the caller's per-batch txn loop logs this as a
+      // warn but does NOT throw, so transient worker tenant-flips don't
+      // roll back the whole batch. We surface the no-op via skipped count
+      // here so the caller's batch counters stay consistent with the
+      // returning {updated, skipped} contract; the warn is logged by the
+      // caller against the row id when it sees batchNoOps populated.
+      skipped++;
+      logger.warn(
+        {
+          tenant_id: row.tenant_id,
+          agent_id: row.agent_id,
+          row_id: row.id,
+          affected: result.rows.length,
+          op: 'embeddings_rebuild_update_no_op',
+        },
+        'embeddings-rebuild: UPDATE matched zero rows (race with worker?)',
+      );
+    }
+  }
+
+  return { updated, skipped };
+}
 
 function arg(argv: string[], name: string): string | undefined {
   const flag = `--${name}=`;
@@ -326,6 +588,7 @@ export async function rebuildEmbeddingsForTuple(args: {
   log?: (msg: string) => void;
 }): Promise<{
   updated: number;
+  skipped: number;
   processed: number;
   totalInScope: number;
   pendingInScope: number;
@@ -421,7 +684,14 @@ export async function rebuildEmbeddingsForTuple(args: {
 
       if (dryRun) {
         log('dry-run: no provider calls, no UPDATEs');
-        return { updated: 0, processed: 0, totalInScope, pendingInScope, dryRun };
+        return {
+          updated: 0,
+          skipped: 0,
+          processed: 0,
+          totalInScope,
+          pendingInScope,
+          dryRun,
+        };
       }
 
       let processed = 0;
@@ -429,9 +699,16 @@ export async function rebuildEmbeddingsForTuple(args: {
       // Bound the loop independently of pendingInScope — the SELECT only
       // fetches rows whose embedding is null or has the wrong dimension. We
       // iterate until SELECT returns an empty page.
+      let skipped = 0;
       while (true) {
-        const rows = await db.execute<{ id: string; conteudo: string }>(sql`
-          SELECT id::text, conteudo
+        // SELECT now pulls tenant_id + agent_id alongside id + conteudo so
+        // the per-row audit in rebuildBatch can attribute under the row's
+        // own context (#289). Within this loop these values are identical
+        // to the outer scope (the WHERE pins them), but carrying them in
+        // the row keeps rebuildBatch tenant-agnostic and matches the #289
+        // contract.
+        const rows = await db.execute<MemoryRow>(sql`
+          SELECT id::text, tenant_id, agent_id, conteudo
           FROM agent_memories
           WHERE tenant_id = ${tenant_id}
             AND agent_id = ${agent_id}
@@ -442,17 +719,6 @@ export async function rebuildEmbeddingsForTuple(args: {
         if (rows.rows.length === 0) break;
         // Batch only contains text from THIS (tenant, agent) tuple — no cross-
         // tenant content mixing at the provider boundary.
-        const texts = rows.rows.map((r) => (r as { conteudo: string }).conteudo);
-        let embs: number[][];
-        try {
-          embs = await provider.embed(texts);
-        } catch (err) {
-          logger.error(
-            { tenant_id, agent_id, op: 'embeddings_rebuild_provider_failed', err },
-            'embeddings-rebuild: provider call failed mid-batch',
-          );
-          throw err;
-        }
 
         // ─── Per-batch transaction (Codex review #244, HIGH blocker) ────────
         // Wrap all UPDATEs in this batch in a single transaction so the batch
@@ -473,81 +739,97 @@ export async function rebuildEmbeddingsForTuple(args: {
         //     the lock is released in `finally` and `processed`/`updated` are
         //     NOT incremented for the rolled-back batch (counter integrity).
         //
-        // The race-detection / "RETURNING id matched zero rows" path (mid-batch
-        // worker tenant flip) still logs a warn but does NOT throw — we want
-        // the batch to commit the other N-1 rows that DID match. Only an
-        // exception from `tx.execute` (DB-level failure) rolls back the batch.
-        let batchUpdated = 0;
-        let batchNoOps: Array<{ id: string; affected: number }> = [];
+        // Issue #289 (cardinality + dim validation, Codex review #295): the
+        // provider call + FULL pre-scan validation moves INSIDE the txn body
+        // via rebuildBatch, and ALL validation runs BEFORE the first UPDATE.
+        //   - ProviderCardinalityError (count mismatch) and
+        //     ProviderDimensionError (one or more invalid vectors) are both
+        //     thrown by rebuildBatch's pre-scan BEFORE any UPDATE, so the txn
+        //     has written nothing and rolls back cleanly — no partial write.
+        //     This is exactly the safety contract #289 needs: a single bad
+        //     vector aborts the whole batch rather than committing the
+        //     survivors and silently dropping the bad row.
+        //   - Aborted rows stay pending and are retried on the next run via
+        //     the re-detection predicate, so no progress is permanently lost.
+        //
+        // The race-detection / "UPDATE matched zero rows" path (mid-batch
+        // worker tenant flip) is the ONLY per-row soft-skip left: it logs a
+        // warn but does NOT throw — it shows up in rebuildBatch's `skipped`
+        // count rather than as a committed update, because a transient tenant
+        // flip is not a data-validity failure. Only an exception from
+        // `tx.execute` (DB-level failure) or rebuildBatch (cardinality,
+        // dimension) rolls back the batch.
+        let batchResult: { updated: number; skipped: number } = {
+          updated: 0,
+          skipped: 0,
+        };
+        const batchRows = rows.rows.map((r) => r as MemoryRow);
         try {
           await db.transaction(async (tx) => {
             // Reset per-batch counters inside the txn so a retry of this
             // closure (drizzle/pg can retry on serialization failures) starts
             // from zero.
-            batchUpdated = 0;
-            batchNoOps = [];
-            for (let i = 0; i < rows.rows.length; i++) {
-              const r = rows.rows[i] as { id: string };
-              const v = `[${(embs[i] ?? []).join(',')}]`;
-              // UPDATE pins tenant_id AND agent_id alongside the id — a stale
-              // or mistyped id cannot mutate a row outside the routed tuple.
-              // RETURNING id lets us verify the row really matched the WHERE
-              // (covers the race case where worker changed tenant/agent
-              // between our SELECT and our UPDATE).
-              const result = await tx.execute<{ id: string }>(sql`
-                UPDATE agent_memories
-                SET embedding = ${v}::vector
-                WHERE id = ${r.id}::uuid
-                  AND tenant_id = ${tenant_id}
-                  AND agent_id = ${agent_id}
-                RETURNING id::text
-              `);
-              // Drivers expose row count either via .rowCount (pg) or via
-              // .rows.length (drizzle). Use the rows array as the source of
-              // truth — it's what we actually selected.
-              const affected = result.rows.length;
-              if (affected !== 1) {
-                batchNoOps.push({ id: r.id, affected });
-              } else {
-                batchUpdated++;
-              }
-            }
+            batchResult = await rebuildBatch(
+              provider,
+              batchRows,
+              config.EMBEDDING_DIMENSIONS,
+              (s) =>
+                tx.execute<{ id: string }>(s) as Promise<{
+                  rows: Array<{ id: string }>;
+                }>,
+            );
           });
         } catch (err) {
           // The whole batch rolled back — none of the N UPDATEs committed.
-          // Counters are NOT incremented (we discard batchUpdated/batchNoOps).
-          logger.error(
-            {
-              tenant_id,
-              agent_id,
-              batch_size: rows.rows.length,
-              op: 'embeddings_rebuild_batch_failed',
-              err,
-            },
-            'embeddings-rebuild: batch failed — transaction rolled back, no UPDATEs committed for this batch',
-          );
+          // Counters are NOT incremented (batchResult is reset below).
+          batchResult = { updated: 0, skipped: 0 };
+          if (err instanceof ProviderCardinalityError) {
+            logger.error(
+              {
+                tenant_id,
+                agent_id,
+                batch_size: batchRows.length,
+                op: 'embeddings_rebuild_cardinality_mismatch',
+                err,
+              },
+              'embeddings-rebuild: provider cardinality mismatch — batch rolled back, no UPDATEs committed',
+            );
+          } else if (err instanceof ProviderDimensionError) {
+            logger.error(
+              {
+                tenant_id,
+                agent_id,
+                batch_size: batchRows.length,
+                invalid_count: err.invalid.length,
+                invalid_ids: err.invalid.map((v) => v.id),
+                op: 'embeddings_rebuild_dimension_mismatch',
+                err,
+              },
+              'embeddings-rebuild: invalid vector dimension(s) — batch rolled back, no UPDATEs committed',
+            );
+          } else {
+            logger.error(
+              {
+                tenant_id,
+                agent_id,
+                batch_size: batchRows.length,
+                op: 'embeddings_rebuild_batch_failed',
+                err,
+              },
+              'embeddings-rebuild: batch failed — transaction rolled back, no UPDATEs committed for this batch',
+            );
+          }
           throw err;
         }
 
-        // Commit succeeded → flush warn logs for no-op rows (race detection)
-        // and absorb the batch counters into the run totals.
-        for (const noOp of batchNoOps) {
-          logger.warn(
-            {
-              tenant_id,
-              agent_id,
-              row_id: noOp.id,
-              affected: noOp.affected,
-              op: 'embeddings_rebuild_update_no_op',
-            },
-            'embeddings-rebuild: UPDATE matched zero rows (race with worker?)',
-          );
-        }
-        updated += batchUpdated;
+        updated += batchResult.updated;
+        skipped += batchResult.skipped;
         processed += rows.rows.length;
-        log(`  processed ${processed} (updated ${updated}, total in scope ${totalInScope})`);
+        log(
+          `  processed ${processed} (updated ${updated}, skipped ${skipped}, total in scope ${totalInScope})`,
+        );
       }
-      return { updated, processed, totalInScope, pendingInScope, dryRun };
+      return { updated, skipped, processed, totalInScope, pendingInScope, dryRun };
     } finally {
       // Release the lock on the SAME client / session that acquired it.
       // Skip if acquire failed (nothing to unlock). Swallow errors here so a
@@ -724,6 +1006,7 @@ async function main(): Promise<void> {
         operator,
         mode,
         updated: result.updated,
+        skipped: result.skipped,
         processed: result.processed,
         total_in_scope: result.totalInScope,
         pending_in_scope: result.pendingInScope,
@@ -739,6 +1022,7 @@ async function main(): Promise<void> {
       outcome: 'ok',
       metadata: {
         updated: result.updated,
+        skipped: result.skipped,
         processed: result.processed,
         total_in_scope: result.totalInScope,
         pending_in_scope: result.pendingInScope,
@@ -750,7 +1034,7 @@ async function main(): Promise<void> {
       );
     } else {
       console.log(
-        `done: ${result.updated} rows updated for tenant_id=${tenant_id} agent_id=${agent_id}`,
+        `done: ${result.updated} rows updated, ${result.skipped} skipped for tenant_id=${tenant_id} agent_id=${agent_id}`,
       );
     }
     process.exit(0);
