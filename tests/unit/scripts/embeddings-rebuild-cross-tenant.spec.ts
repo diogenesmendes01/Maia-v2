@@ -1710,7 +1710,14 @@ describe('Issue #289 — rebuildBatch cardinality + dimension validation', () =>
     conteudo: string;
   }
 
-  function makeProvider(returned: Array<number[] | undefined>): {
+  // The real provider contract is `number[][]`, but the pre-scan guard
+  // (`!vec || !Array.isArray(vec) || vec.length !== expectedDim`) defends
+  // against providers/mocks that violate it. To exercise every guard branch we
+  // must be able to feed holes (`undefined`), `null`, 0-length `[]`, wrong-dim
+  // arrays, AND non-array types (e.g. a `string`). So the param is widened to
+  // `unknown[]`; the value is cast through `unknown as number[][]` at the
+  // mock boundary so callers can pass any of these without TS fighting us.
+  function makeProvider(returned: unknown[]): {
     name: 'voyage';
     modelId: 'voyage-3';
     dimensions: number;
@@ -1721,8 +1728,8 @@ describe('Issue #289 — rebuildBatch cardinality + dimension validation', () =>
       modelId: 'voyage-3',
       dimensions: expectedDim,
       // Provider type is `number[][]`; we deliberately return holes/wrong-
-      // dim entries to simulate the bug path. Cast through unknown so TS
-      // doesn't fight us.
+      // dim/non-array entries to simulate the bug path. Cast through unknown
+      // so TS doesn't fight us.
       embed: vi.fn().mockResolvedValue(returned as unknown as number[][]),
     };
   }
@@ -1864,6 +1871,127 @@ describe('Issue #289 — rebuildBatch cardinality + dimension validation', () =>
     expect(auditCall.alvo_id).toBe('row-1');
     expect(auditCall.metadata.reason).toBe('wrong_dimension');
     expect(auditCall.metadata.got_dim).toBe(2);
+    expect(auditCall.metadata.expected_dim).toBe(expectedDim);
+  });
+
+  it('aborts the whole batch on a 0-length vector [] (never writes []::vector, no partial write)', async () => {
+    // Issue #289 guard branch: `vec.length !== expectedDim` with an EMPTY
+    // array. `[]` IS an array (so `!vec` and `!Array.isArray(vec)` are both
+    // false), but its length 0 != expectedDim — the classic `embs[i] ?? []`
+    // corruption that, pre-fix, would write a `[]::vector` literal pgvector
+    // silently accepts as a zero-similarity row. The empty vector sits at
+    // index 1, so this also proves the valid row-0 is NOT written: validation
+    // fully precedes mutation, the whole batch aborts, zero UPDATEs.
+    const { rebuildBatch, ProviderDimensionError } = await import(
+      '@/../scripts/embeddings-rebuild.ts'
+    );
+
+    const rows: DimRow[] = [
+      { id: 'row-0', tenant_id: 't', agent_id: 'a', conteudo: 'a' },
+      { id: 'row-1', tenant_id: 't', agent_id: 'a', conteudo: 'b' },
+    ];
+    // row-1 is a 0-length array — distinct from the short-but-nonempty vector
+    // covered above; this locks in the `length 0` edge specifically.
+    const validVec = Array(expectedDim).fill(0.1);
+    const emptyVec: number[] = [];
+    const provider = makeProvider([validVec, emptyVec]);
+
+    await expect(
+      rebuildBatch(provider as never, rows, expectedDim, execMock as never),
+    ).rejects.toBeInstanceOf(ProviderDimensionError);
+
+    // Zero UPDATEs — not even valid row-0 was written. No `[]` literal ever
+    // reaches pgvector.
+    expect(execMock).not.toHaveBeenCalled();
+
+    // The invalid row is audited so ops can see which row tripped the guard.
+    // `[]` is a real (empty) array, so the guard classifies it by dimension,
+    // not as a missing vector → reason 'wrong_dimension', got_dim 0.
+    expect(auditMock).toHaveBeenCalledTimes(1);
+    const auditCall = auditMock.mock.calls[0]![0] as {
+      alvo_id: string;
+      metadata: Record<string, unknown>;
+    };
+    expect(auditCall.alvo_id).toBe('row-1');
+    expect(auditCall.metadata.reason).toBe('wrong_dimension');
+    expect(auditCall.metadata.got_dim).toBe(0);
+    expect(auditCall.metadata.expected_dim).toBe(expectedDim);
+  });
+
+  it('aborts the whole batch on a null vector (no partial write)', async () => {
+    // Issue #289 guard branch: `!vec` catches a `null` returned for a row
+    // (e.g. a provider that emits null placeholders for failed inputs). The
+    // null sits at index 1, so the valid row-0 must NOT be written — the whole
+    // batch aborts in the pre-scan, zero UPDATEs.
+    const { rebuildBatch, ProviderDimensionError } = await import(
+      '@/../scripts/embeddings-rebuild.ts'
+    );
+
+    const rows: DimRow[] = [
+      { id: 'row-0', tenant_id: 't', agent_id: 'a', conteudo: 'a' },
+      { id: 'row-1', tenant_id: 't', agent_id: 'a', conteudo: 'b' },
+    ];
+    // row-1 is `null` — distinct from the `undefined` hole covered above;
+    // this locks in the `null` value specifically.
+    const validVec = Array(expectedDim).fill(0.1);
+    const provider = makeProvider([validVec, null]);
+
+    await expect(
+      rebuildBatch(provider as never, rows, expectedDim, execMock as never),
+    ).rejects.toBeInstanceOf(ProviderDimensionError);
+
+    // Zero UPDATEs — not even valid row-0 was written.
+    expect(execMock).not.toHaveBeenCalled();
+
+    // The invalid row is audited. `null` is falsy → `!vec` fires →
+    // reason 'missing_vector', got_dim 0 (not an array).
+    expect(auditMock).toHaveBeenCalledTimes(1);
+    const auditCall = auditMock.mock.calls[0]![0] as {
+      alvo_id: string;
+      metadata: Record<string, unknown>;
+    };
+    expect(auditCall.alvo_id).toBe('row-1');
+    expect(auditCall.metadata.reason).toBe('missing_vector');
+    expect(auditCall.metadata.got_dim).toBe(0);
+    expect(auditCall.metadata.expected_dim).toBe(expectedDim);
+  });
+
+  it('aborts the whole batch on a non-array vector type, e.g. a string (no partial write)', async () => {
+    // Issue #289 guard branch: `!Array.isArray(vec)` catches a returned value
+    // that is truthy but NOT an array (e.g. a provider that returns a stray
+    // string/object instead of a number[]). A non-empty string is truthy, so
+    // `!vec` is false — only the `!Array.isArray(vec)` clause fires. The bad
+    // value sits at index 1, so valid row-0 must NOT be written.
+    const { rebuildBatch, ProviderDimensionError } = await import(
+      '@/../scripts/embeddings-rebuild.ts'
+    );
+
+    const rows: DimRow[] = [
+      { id: 'row-0', tenant_id: 't', agent_id: 'a', conteudo: 'a' },
+      { id: 'row-1', tenant_id: 't', agent_id: 'a', conteudo: 'b' },
+    ];
+    // row-1 is a string — a non-array type. `makeProvider` accepts `unknown[]`
+    // precisely so we can feed this without casting at the call site.
+    const validVec = Array(expectedDim).fill(0.1);
+    const provider = makeProvider([validVec, 'not-a-vector']);
+
+    await expect(
+      rebuildBatch(provider as never, rows, expectedDim, execMock as never),
+    ).rejects.toBeInstanceOf(ProviderDimensionError);
+
+    // Zero UPDATEs — not even valid row-0 was written.
+    expect(execMock).not.toHaveBeenCalled();
+
+    // The invalid row is audited. A truthy non-array trips `!Array.isArray` →
+    // reason 'missing_vector', got_dim 0 (`Array.isArray(vec) ? … : 0`).
+    expect(auditMock).toHaveBeenCalledTimes(1);
+    const auditCall = auditMock.mock.calls[0]![0] as {
+      alvo_id: string;
+      metadata: Record<string, unknown>;
+    };
+    expect(auditCall.alvo_id).toBe('row-1');
+    expect(auditCall.metadata.reason).toBe('missing_vector');
+    expect(auditCall.metadata.got_dim).toBe(0);
     expect(auditCall.metadata.expected_dim).toBe(expectedDim);
   });
 
