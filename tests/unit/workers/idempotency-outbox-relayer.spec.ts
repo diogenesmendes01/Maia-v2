@@ -91,6 +91,11 @@ const repoMock = {
       .slice(0, limit)
       .map((r) => ({
         id: r.id,
+        // #327: the real claim SELECTs tenant_id + agent_id onto the row so the
+        // relayer derives the dedup key from PERSISTED row fields (not ALS).
+        // The mock mirrors that — tests assert the key is row-derived.
+        tenant_id: r.tenant_id,
+        agent_id: r.agent_id,
         idempotency_key: r.idempotency_key,
         effect_type: r.effect_type,
         effect_payload: r.effect_payload,
@@ -149,8 +154,15 @@ const repoMock = {
 
 vi.mock('@/db/repositories.js', () => ({ idempotencyOutboxRepo: repoMock }));
 
-// Gateway: configurable per test (default: succeeds with a provider id).
-const sendOutboundTextMock = vi.fn(async (_jid: string, _text: string) => 'wa-id-default');
+// Gateway: configurable per test (default: succeeds with a provider id). The
+// third arg (`opts`) carries the #327 provider-side dedup key (`messageId`).
+const sendOutboundTextMock = vi.fn(
+  async (
+    _jid: string,
+    _text: string,
+    _opts?: { quoted?: unknown; view_once?: boolean; messageId?: string },
+  ) => 'wa-id-default',
+);
 vi.mock('@/gateway/baileys.js', () => ({ sendOutboundText: sendOutboundTextMock }));
 
 // Pool advisory-lock mock (mirrors outbound-messages-sweeper.spec.ts).
@@ -259,9 +271,14 @@ describe('idempotency_outbox_relayer — exactly-once dispatch', () => {
     );
     await runIdempotencyOutboxRelayer();
 
-    // The gateway send fired EXACTLY once.
+    // The gateway send fired EXACTLY once, with the jid + text and a #327
+    // provider-side dedup key (`messageId`) derived from the row identity.
     expect(sendOutboundTextMock).toHaveBeenCalledTimes(1);
-    expect(sendOutboundTextMock).toHaveBeenCalledWith('5511999990000@s.whatsapp.net', 'olá');
+    expect(sendOutboundTextMock).toHaveBeenCalledWith(
+      '5511999990000@s.whatsapp.net',
+      'olá',
+      expect.objectContaining({ messageId: expect.stringMatching(/^3EB0[0-9A-F]{18}$/) }),
+    );
     // Marked sent with the provider id.
     expect(markSentCalls).toEqual([{ id: 'ob-1', provider_ref: 'wa-id-123' }]);
     expect(store[0]!.status).toBe('sent');
@@ -280,6 +297,167 @@ describe('idempotency_outbox_relayer — exactly-once dispatch', () => {
     // Second pass: the row is now 'sent', so it is not claimed again.
     await runIdempotencyOutboxRelayer();
     expect(sendOutboundTextMock).toHaveBeenCalledTimes(1); // still 1 — exactly once.
+  });
+});
+
+describe('idempotency_outbox_relayer — #327 provider-side dedup key', () => {
+  it('passes the deterministic dedup key derived from the row identity on the send', async () => {
+    const row = seed({ ...A_CTX });
+    const { deriveProviderDedupKey } = await import(
+      '@/governance/idempotency-effects.js'
+    );
+    const expectedKey = deriveProviderDedupKey(
+      { kind: 'whatsapp_text', jid: '5511999990000@s.whatsapp.net', text: 'olá', mensagem_id: 'm1' },
+      { tenant_id: row.tenant_id, agent_id: row.agent_id, idempotency_key: row.idempotency_key },
+    );
+    const { runIdempotencyOutboxRelayer } = await import(
+      '@/workers/idempotency-outbox-relayer.js'
+    );
+    await runIdempotencyOutboxRelayer();
+
+    expect(sendOutboundTextMock).toHaveBeenCalledTimes(1);
+    const [, , opts] = sendOutboundTextMock.mock.calls[0]!;
+    // The relayer passed EXACTLY the key the derivation produces for this
+    // row's identity — proving the wiring (identity → key → send) is correct.
+    expect(opts?.messageId).toBe(expectedKey);
+    // …and it is a valid WhatsApp message-id shape (3EB0 + 18 uppercase hex).
+    expect(opts?.messageId).toMatch(/^3EB0[0-9A-F]{18}$/);
+  });
+
+  it('derives the key from the ROW identity, NOT the ambient ALS context (key is ALS-independent)', async () => {
+    // BLOCKER (Codex #331): the dedup key must come from the PERSISTED row, never
+    // the async-local context. If the ambient ALS tenant/agent ever diverges from
+    // the row being dispatched (e.g. a crash-recovered re-dispatch under a stale
+    // context), an ALS-derived key would differ from the original send's key and
+    // the transport could not dedup → the whole exactly-once guarantee collapses.
+    //
+    // We force that divergence: the relayer runs under ALS context tenant-A
+    // (the enumerated tuple), but the CLAIMED ROW carries a DIFFERENT identity
+    // (tenant-ROW/agent-ROW). The dispatched messageId MUST equal the key for the
+    // ROW's identity — and MUST NOT equal the key the ALS context would produce.
+    seed({ ...A_CTX });
+    const ROW_IDENTITY = {
+      tenant_id: 'tenant-ROW',
+      agent_id: 'agent-ROW',
+      idempotency_key: 'ik-row-only',
+    };
+    repoMock.claimPendingEffects.mockImplementationOnce(async () => {
+      const ctx = tryGetCurrentContext();
+      if (!ctx) throw new Error('claimPendingEffects ran with NO tenant context');
+      claimContexts.push({ tenant_id: ctx.tenant_id, agent_id: ctx.agent_id });
+      // Row identity intentionally DIFFERS from the ambient ALS context (ctx is
+      // tenant-A/agent-A). Proves the key is computed off the row, not ctx.
+      return [
+        {
+          id: 'ob-divergent',
+          tenant_id: ROW_IDENTITY.tenant_id,
+          agent_id: ROW_IDENTITY.agent_id,
+          idempotency_key: ROW_IDENTITY.idempotency_key,
+          effect_type: 'whatsapp_text',
+          effect_payload: {
+            kind: 'whatsapp_text',
+            jid: '5511999990000@s.whatsapp.net',
+            text: 'olá',
+            mensagem_id: 'm1',
+          },
+          attempts: 0,
+          max_attempts: 5,
+        },
+      ];
+    });
+
+    const { deriveProviderDedupKey } = await import(
+      '@/governance/idempotency-effects.js'
+    );
+    const effect = {
+      kind: 'whatsapp_text' as const,
+      jid: '5511999990000@s.whatsapp.net',
+      text: 'olá',
+      mensagem_id: 'm1',
+    };
+    const keyFromRow = deriveProviderDedupKey(effect, ROW_IDENTITY);
+    const keyFromAls = deriveProviderDedupKey(effect, {
+      ...A_CTX,
+      idempotency_key: ROW_IDENTITY.idempotency_key,
+    });
+    // Sanity: the two identities genuinely produce DIFFERENT keys, so the assert
+    // below is meaningful (it can actually distinguish row-derived from ALS).
+    expect(keyFromRow).not.toBe(keyFromAls);
+
+    const { runIdempotencyOutboxRelayer } = await import(
+      '@/workers/idempotency-outbox-relayer.js'
+    );
+    await runIdempotencyOutboxRelayer();
+
+    expect(sendOutboundTextMock).toHaveBeenCalledTimes(1);
+    const [, , opts] = sendOutboundTextMock.mock.calls[0]!;
+    // The send carried the ROW-derived key — ALS did NOT influence it.
+    expect(opts?.messageId).toBe(keyFromRow);
+    expect(opts?.messageId).not.toBe(keyFromAls);
+  });
+
+  it('a CRASH-WINDOW re-dispatch sends with the SAME provider dedup key (deterministic)', async () => {
+    // Simulate the irreducible #316 crash window: the gateway send SUCCEEDS but
+    // the process crashes BEFORE markEffectSent persists. We model that by
+    // letting the FIRST pass send, then forcing markEffectSent to no-op (row
+    // stays 'pending'), so the SECOND pass re-claims and re-dispatches the SAME
+    // row. The #327 contract: both sends carry the IDENTICAL provider id, so a
+    // dedup-aware transport drops the duplicate (exactly-once end-to-end).
+    seed({ ...A_CTX });
+
+    // First pass: send succeeds, but markEffectSent "didn't persist" (crash).
+    repoMock.markEffectSent.mockImplementationOnce(async (input) => {
+      markSentCalls.push(input);
+      return false; // row remains 'pending' — as if the crash lost the write.
+    });
+
+    const { runIdempotencyOutboxRelayer } = await import(
+      '@/workers/idempotency-outbox-relayer.js'
+    );
+    await runIdempotencyOutboxRelayer();
+    // Row is still pending (the markEffectSent no-op'd).
+    expect(store[0]!.status).toBe('pending');
+
+    // Second pass (next tick): re-claims the still-pending row and re-dispatches.
+    await runIdempotencyOutboxRelayer();
+
+    // The SAME effect was dispatched twice (the at-least-once tail)…
+    expect(sendOutboundTextMock).toHaveBeenCalledTimes(2);
+    const firstKey = sendOutboundTextMock.mock.calls[0]![2]?.messageId;
+    const secondKey = sendOutboundTextMock.mock.calls[1]![2]?.messageId;
+    // …BUT both carry the IDENTICAL provider-side dedup key, so the transport
+    // dedups the second send → the user sees the message exactly once.
+    expect(firstKey).toBeDefined();
+    expect(firstKey).toBe(secondKey);
+  });
+
+  it('derives DIFFERENT keys for DIFFERENT tenants with the same idempotency_key (tenant isolation)', async () => {
+    // Tenant isolation is inviolable: the dedup key folds tenant_id+agent_id
+    // into the hash so two tenants computing the same idempotency_key get
+    // DIFFERENT provider ids — the key can never be a cross-tenant correlation
+    // handle, and one tenant's send can never dedup another's.
+    const { deriveProviderDedupKey } = await import(
+      '@/governance/idempotency-effects.js'
+    );
+    const effect = {
+      kind: 'whatsapp_text' as const,
+      jid: '5511999990000@s.whatsapp.net',
+      text: 'olá',
+      mensagem_id: 'm1',
+    };
+    const keyA = deriveProviderDedupKey(effect, {
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-A',
+      idempotency_key: 'same-key',
+    });
+    const keyB = deriveProviderDedupKey(effect, {
+      tenant_id: 'tenant-B',
+      agent_id: 'agent-B',
+      idempotency_key: 'same-key',
+    });
+    expect(keyA).not.toBe(keyB);
+    expect(keyA).toMatch(/^3EB0[0-9A-F]{18}$/);
+    expect(keyB).toMatch(/^3EB0[0-9A-F]{18}$/);
   });
 });
 

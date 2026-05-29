@@ -2217,9 +2217,20 @@ export const idempotencyRepo = {
 export type IdempotencyEffectOutboxRow = typeof idempotency_effect_outbox.$inferSelect;
 export type OutboxEffectStatus = 'pending' | 'sent' | 'failed';
 
-/** A pending row claimed by the relayer for dispatch. */
+/**
+ * A pending row claimed by the relayer for dispatch.
+ *
+ * #327 — `tenant_id` + `agent_id` are selected onto the row (not just used in
+ * the WHERE clause) so the relayer can build the provider-side dedup identity
+ * from PERSISTED row fields. The dedup key MUST be byte-identical across a
+ * re-dispatch (including a crash-recovered one); deriving tenant/agent from the
+ * ambient ALS context instead of the row would let a context mismatch produce a
+ * DIFFERENT key → the transport wouldn't dedup. The key depends only on the row.
+ */
 export type ClaimedOutboxEffect = {
   id: string;
+  tenant_id: string;
+  agent_id: string;
   idempotency_key: string;
   effect_type: string;
   effect_payload: unknown;
@@ -2357,8 +2368,11 @@ export const idempotencyOutboxRepo = {
   async claimPendingEffects(limit: number): Promise<ClaimedOutboxEffect[]> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
+    // #327: SELECT tenant_id + agent_id (not just filter on them) so the relayer
+    // derives the provider-side dedup key from the ROW's persisted identity, not
+    // the ambient ALS context — the key must be stable across a re-dispatch.
     const rows = await db.execute<ClaimedOutboxEffect>(sql`
-      SELECT id, idempotency_key, effect_type, effect_payload, attempts, max_attempts
+      SELECT id, tenant_id, agent_id, idempotency_key, effect_type, effect_payload, attempts, max_attempts
       FROM ${idempotency_effect_outbox}
       WHERE tenant_id = ${tenant_id}
         AND agent_id = ${agent_id}

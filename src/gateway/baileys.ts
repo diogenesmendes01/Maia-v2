@@ -786,10 +786,28 @@ async function extractContent(msg: proto.IWebMessageInfo): Promise<{
   return { type, content: caption, mediaPath, mediaMime: mime, mediaSha256 };
 }
 
+/**
+ * Send a plain WhatsApp text.
+ *
+ * `opts.messageId` (issue #327): a CLIENT-PROVIDED, deterministic WhatsApp
+ * message id. Baileys forwards it to `MiscMessageGenerationOptions.messageId`,
+ * which becomes the outgoing message's key id verbatim (see
+ * `generateWAMessageFromContent`: `id: options?.messageId || generateMessageIDV2()`).
+ * The WhatsApp protocol keys every message on `(remoteJid, fromMe, id)` — the
+ * SAME primitive this gateway already relies on for INBOUND dedup
+ * (`isDuplicate(whatsapp_id)`). Supplying a stable id therefore makes a
+ * re-dispatch of the same logical effect carry the SAME key, so the transport /
+ * recipient client treats the retry as the same message (provider-side dedup)
+ * instead of rendering a duplicate. The relayer derives this id from the outbox
+ * row's stable identity so a crash-induced re-send is idempotent end-to-end.
+ *
+ * When `messageId` is omitted, Baileys generates a fresh random id as before
+ * (unchanged behaviour for the interactive/non-outbox callers).
+ */
 export async function sendOutboundText(
   jid: string,
   text: string,
-  opts?: { quoted?: WAQuotedContext; view_once?: boolean },
+  opts?: { quoted?: WAQuotedContext; view_once?: boolean; messageId?: string },
 ): Promise<string | null> {
   if (!socket || !connected) {
     logger.warn('baileys.not_connected — cannot send');
@@ -797,9 +815,16 @@ export async function sendOutboundText(
   }
   const useViewOnce = !!opts?.view_once && config.FEATURE_VIEW_ONCE_SENSITIVE;
   const content = useViewOnce ? { text, viewOnce: true } : { text };
-  // Baileys' sendMessage accepts `quoted` as third-arg MiscMessageGenerationOptions.
-  // We always pass the third arg (undefined when no quote) so call arity is stable.
-  const miscOpts = opts?.quoted ? { quoted: opts.quoted } : undefined;
+  // Baileys' sendMessage accepts `quoted` + `messageId` on the third-arg
+  // MiscMessageGenerationOptions. We pass the third arg only when at least one
+  // option is present (undefined otherwise) so call arity stays stable.
+  const miscOpts =
+    opts?.quoted || opts?.messageId
+      ? {
+          ...(opts.quoted ? { quoted: opts.quoted } : {}),
+          ...(opts.messageId ? { messageId: opts.messageId } : {}),
+        }
+      : undefined;
   const result = await socket.sendMessage(jid, content, miscOpts);
   return result?.key.id ?? null;
 }
