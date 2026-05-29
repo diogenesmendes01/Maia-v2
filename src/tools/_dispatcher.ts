@@ -4,7 +4,7 @@ import { canAct } from '@/governance/permissions.js';
 import { constitutionalCheck } from '@/governance/rules.js';
 import { REGISTRY, isToolEnabled, type AnyTool } from './_registry.js';
 import { computeIdempotencyKey, computePayloadHash } from '@/governance/idempotency.js';
-import { idempotencyRepo } from '@/db/repositories.js';
+import { idempotencyRepo, idempotencyOutboxRepo } from '@/db/repositories.js';
 import { audit } from '@/governance/audit.js';
 import { isRedisConnected } from '@/lib/redis.js';
 import { logger } from '@/lib/logger.js';
@@ -376,22 +376,43 @@ export async function dispatchTool(input: {
     return { error: 'execution_failed', details: { cause: 'output_schema_violation' } };
   }
 
+  // #316: transactional outbox for NON-IDEMPOTENT external effects. A tool
+  // with such an effect does NOT fire it inline — its handler PLANS it and
+  // exposes it via `extractEffect`. When a plan is present, we complete the
+  // reservation AND enqueue the effect in ONE transaction (both fenced by
+  // `reservation_token`), so the effect is bound to the WINNING reservation,
+  // never to a preempted racer. The relayer
+  // (src/workers/idempotency-outbox-relayer.ts) then dispatches it EXACTLY
+  // ONCE. Tools without an external effect (or whose result plans none) take
+  // the plain markCompleted path unchanged.
+  //
   // #299/#298: payload_hash was already written to the reserved row by
   // tryReserve (the REAL fingerprint, not idempotency_key). markCompleted
   // only transitions in_progress→completed and persists the result; it
   // does not re-stamp identity columns. So no payload_hash here.
-  const completed = await idempotencyRepo.markCompleted({
-    key: idempotency_key,
-    resultado: out.data,
-    reservation_token,
-  });
+  const plannedEffect = tool.extractEffect?.(out.data) ?? null;
+  const completed = plannedEffect
+    ? await idempotencyOutboxRepo.markCompletedWithEffect({
+        key: idempotency_key,
+        resultado: out.data,
+        reservation_token,
+        effect: plannedEffect,
+      })
+    : await idempotencyRepo.markCompleted({
+        key: idempotency_key,
+        resultado: out.data,
+        reservation_token,
+      });
   if (!completed) {
     // Fenced out (B2): our lease expired and another worker reclaimed the
     // reservation while our handler was still running. We do NOT cache our
     // result under the new owner's reservation (that would clobber it).
-    // The handler's side effect already happened, but the new owner will
-    // produce the authoritative cached result; concurrent callers wait on
-    // IT. Surface a retry-friendly error rather than returning a result
+    // #316: for the external-effect path this is STRICTLY safe — the
+    // markCompletedWithEffect tx rolled back, so we ALSO did not enqueue an
+    // effect under the new owner's reservation (no double-fire). For the plain
+    // path, any inline side effect already happened, but the new owner will
+    // produce the authoritative cached result; concurrent callers wait on IT.
+    // Either way: surface a retry-friendly error rather than returning a result
     // that won't match the cache.
     logger.warn(
       { tool: tool.name, idempotency_key },

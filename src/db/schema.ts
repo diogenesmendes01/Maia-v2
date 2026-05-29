@@ -661,6 +661,81 @@ export const outbound_messages = pgTable(
   }),
 );
 
+// Issue #316: transactional outbox for exactly-once NON-IDEMPOTENT external
+// effects. #303/#298 converge the idempotency CACHE on one result (fencing
+// token), but a preempted owner can have ALREADY fired its side effect before
+// being fenced. For non-idempotent external calls (send WhatsApp, charge,
+// 3rd-party POST) that is a duplicate physical effect. The fix: the winning
+// reservation's completion writes the INTENDED effect into this outbox IN THE
+// SAME TRANSACTION as idempotency_keys → completed (so the effect is bound to
+// the winner, not the racer), and a single relayer
+// (src/workers/idempotency-outbox-relayer.ts) dispatches it EXACTLY ONCE with
+// retry/backoff. The tool handler no longer fires the effect inline — it only
+// PLANS it — so no effect escapes the atomic commit.
+//
+// Distinct from outbound_messages (synchronous reply ledger, #227/#233/#292)
+// and outbox_messages (async scheduling queue, Spec 18): this is the
+// effect-side of a tool dispatch's idempotency reservation, keyed back to the
+// (tenant, agent, idempotency_key) tuple that won the reservation. See
+// migrations/068_idempotency_effect_outbox.sql (table) +
+// 069_idempotency_effect_outbox_relayer_index.sql (CONCURRENTLY index).
+export const idempotency_effect_outbox = pgTable(
+  'idempotency_effect_outbox',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull().default('default'),
+    agent_id: text('agent_id').notNull().default('default'),
+    // The SAME key as the winning idempotency_keys row. UNIQUE per
+    // (tenant_id, agent_id, idempotency_key) makes the in-transaction INSERT
+    // idempotent: a fenced/duplicate completion can't enqueue a 2nd effect.
+    idempotency_key: text('idempotency_key').notNull(),
+    // Discriminator for the relayer dispatch switch (e.g. 'whatsapp_text').
+    effect_type: text('effect_type').notNull(),
+    // Opaque effect description (recipient, text, …). Validated by the relayer
+    // per effect_type before the physical dispatch.
+    effect_payload: jsonb('effect_payload').notNull(),
+    // pending = awaiting relay; sent = dispatched exactly once; failed =
+    // exhausted max_attempts (terminal, ops_alert). DB CHECK enforces the set.
+    status: text('status').notNull().default('pending'),
+    attempts: integer('attempts').notNull().default(0),
+    max_attempts: integer('max_attempts').notNull().default(5),
+    last_error: text('last_error'),
+    // Backoff gate: the relayer only claims a pending row when
+    // next_attempt_at <= now(). Pushed forward on each transient failure.
+    next_attempt_at: timestamp('next_attempt_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    // Provider message id / external ref on a successful dispatch (audit).
+    provider_ref: text('provider_ref'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    // Relayer sweep hot path: per (tenant, agent) claim pending rows whose
+    // backoff gate elapsed, oldest-first. Equality columns anchor the probe;
+    // next_attempt_at backs the range predicate + the LIMIT's ORDER BY.
+    // Created CONCURRENTLY by migration 069 (no-tx).
+    byTenantAgentStatusNext: index(
+      'idx_idempotency_effect_outbox_tenant_agent_status_next',
+    ).on(t.tenant_id, t.agent_id, t.status, t.next_attempt_at),
+    // One outbox row per winning reservation — the in-transaction INSERT is
+    // ON CONFLICT DO NOTHING against this key (fenced completion → no 2nd row).
+    byTenantAgentKey: unique('idempotency_effect_outbox_tenant_agent_key').on(
+      t.tenant_id,
+      t.agent_id,
+      t.idempotency_key,
+    ),
+    statusChk: check(
+      'idempotency_effect_outbox_status_chk',
+      sql`${t.status} IN ('pending', 'sent', 'failed')`,
+    ),
+    failedHasErrorChk: check(
+      'idempotency_effect_outbox_failed_has_error_chk',
+      sql`${t.status} <> 'failed' OR ${t.last_error} IS NOT NULL`,
+    ),
+  }),
+);
+
 export const system_health_events = pgTable('system_health_events', {
   id: uuid('id').primaryKey().defaultRandom(),
   tenant_id: text('tenant_id').notNull().default('default'),
@@ -1956,6 +2031,7 @@ export type Workflow = typeof workflows.$inferSelect;
 export type WorkflowStep = typeof workflow_steps.$inferSelect;
 export type PendingQuestion = typeof pending_questions.$inferSelect;
 export type IdempotencyKey = typeof idempotency_keys.$inferSelect;
+export type IdempotencyEffectOutboxRow = typeof idempotency_effect_outbox.$inferSelect;
 export type SystemHealthEvent = typeof system_health_events.$inferSelect;
 export type DeadLetterJob = typeof dead_letter_jobs.$inferSelect;
 export type AuditEntry = typeof audit_log.$inferSelect;

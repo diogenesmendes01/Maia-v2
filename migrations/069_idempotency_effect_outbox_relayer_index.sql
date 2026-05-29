@@ -1,0 +1,42 @@
+-- maia:no-transaction
+-- =====================================================================
+-- Maia — Migration 069 (Issue #316)
+-- Relayer hot-path covering index for idempotency_effect_outbox.
+--
+-- Why
+-- ---
+-- The relayer (src/workers/idempotency-outbox-relayer.ts) runs every minute
+-- and issues, per (tenant_id, agent_id):
+--
+--   claim pending rows whose backoff gate has elapsed, oldest-first:
+--     WHERE tenant_id = $1 AND agent_id = $2
+--       AND status = 'pending'
+--       AND next_attempt_at <= now()
+--     ORDER BY next_attempt_at ASC LIMIT <n> FOR UPDATE SKIP LOCKED
+--
+--   plus a per-tenant dispatcher enumeration:
+--     SELECT DISTINCT tenant_id, agent_id
+--     WHERE status = 'pending' AND next_attempt_at <= now()
+--
+-- The composite (tenant_id, agent_id, status, next_attempt_at) lets the three
+-- equality columns anchor the index probe while next_attempt_at backs BOTH the
+-- `next_attempt_at <= now()` range predicate and the `ORDER BY next_attempt_at
+-- ASC` that the per-tenant LIMIT walks — so the LIMIT can stop early instead of
+-- sorting the heap. It also serves the dispatcher enumeration's per-(tenant,
+-- agent) bucket. Same shape as migration 067 for outbound_messages.
+--
+-- Concurrency
+-- -----------
+-- CREATE INDEX CONCURRENTLY so the index builds against the live table without
+-- an ACCESS EXCLUSIVE lock (the outbox is on the tool-dispatch hot path). The
+-- `-- maia:no-transaction` marker tells the migration runner (scripts/migrate.ts)
+-- to apply this file OUTSIDE a BEGIN/COMMIT envelope — PostgreSQL rejects
+-- CONCURRENTLY inside a transaction block (error 25001). Single statement,
+-- one-per-`;`, IF NOT EXISTS for idempotent re-runs (see splitNoTxStatements).
+--
+-- WARNING — manual application: if running this file via `psql -f`, do NOT
+-- wrap it in BEGIN/COMMIT. The runner already handles the no-tx semantics.
+-- =====================================================================
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_idempotency_effect_outbox_tenant_agent_status_next
+  ON idempotency_effect_outbox (tenant_id, agent_id, status, next_attempt_at);

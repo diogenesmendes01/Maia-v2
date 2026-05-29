@@ -1,5 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
+// #316: send_proactive_message no longer fires the WhatsApp send inline. It
+// PLANS the effect (returned + extracted into the transactional outbox, atomic
+// with winning the idempotency reservation) and the single relayer dispatches
+// it exactly once. These tests assert the handler persists the outbound row
+// with whatsapp_id=null + pending_relay=true and returns the plan projection,
+// and that `extractEffect` produces the correct PlannedEffect — and crucially
+// that NO inline gateway send happens.
+
 const pessoasFindById = vi.fn();
 const conversasFindActive = vi.fn();
 const conversasCreate = vi.fn();
@@ -12,6 +20,8 @@ vi.mock('../../../src/db/repositories.js', () => ({
   mensagensRepo: { create: mensagensCreate },
 }));
 
+// The gateway is mocked so we can ASSERT it is never called from the handler
+// (the relayer is the only caller now).
 vi.mock('../../../src/gateway/baileys.js', () => ({
   sendOutboundText: sendOutboundTextMock,
 }));
@@ -43,13 +53,12 @@ const ctx = {
   idempotency_key: 'ik1',
 } as never;
 
-describe('send_proactive_message tool', () => {
-  it('happy path: sends WhatsApp text and persists outbound mensagem', async () => {
+describe('send_proactive_message tool (#316 transactional outbox)', () => {
+  it('happy path: persists outbound mensagem (pending relay) and returns the plan WITHOUT an inline send', async () => {
     pessoasFindById.mockResolvedValueOnce({
       id: TARGET_ID,
       telefone_whatsapp: '+5511999990000',
     });
-    sendOutboundTextMock.mockResolvedValueOnce('wa-id-xyz');
     conversasFindActive.mockResolvedValueOnce({ id: 'conv-existing' });
     mensagensCreate.mockResolvedValueOnce({ id: 'msg-uuid-1' });
 
@@ -64,22 +73,46 @@ describe('send_proactive_message tool', () => {
       } as never,
       ctx,
     );
-    expect(result).toEqual({ mensagem_id: 'msg-uuid-1', whatsapp_id: 'wa-id-xyz' });
-    // JID must strip the leading '+' and append '@s.whatsapp.net'.
-    expect(sendOutboundTextMock).toHaveBeenCalledWith(
-      '5511999990000@s.whatsapp.net',
-      'Lembrete: revisar fechamento.',
-    );
+    // whatsapp_id is null (deferred to relayer); jid + texto carried for the plan.
+    expect(result).toEqual({
+      mensagem_id: 'msg-uuid-1',
+      whatsapp_id: null,
+      jid: '5511999990000@s.whatsapp.net',
+      texto: 'Lembrete: revisar fechamento.',
+    });
+    // CRITICAL (#316): the handler does NOT fire the gateway send.
+    expect(sendOutboundTextMock).not.toHaveBeenCalled();
     expect(conversasCreate).not.toHaveBeenCalled(); // active conversa already existed
     const m = mensagensCreate.mock.calls[0]![0] as Record<string, unknown>;
     expect(m.conversa_id).toBe('conv-existing');
     expect(m.direcao).toBe('out');
     expect(m.tipo).toBe('texto');
     expect(m.conteudo).toBe('Lembrete: revisar fechamento.');
+    // whatsapp_id stays null until the relayer fills provider_ref; pending_relay
+    // flags the row so observability can distinguish queued from delivered.
     expect(m.metadata).toMatchObject({
-      whatsapp_id: 'wa-id-xyz',
+      whatsapp_id: null,
       proactive: true,
       reason: 'follow_up_balancete',
+      pending_relay: true,
+    });
+  });
+
+  it('extractEffect projects the result into a whatsapp_text PlannedEffect', async () => {
+    const { sendProactiveMessageTool } = await import(
+      '../../../src/tools/send-proactive-message.js'
+    );
+    const effect = sendProactiveMessageTool.extractEffect!({
+      mensagem_id: 'msg-uuid-1',
+      whatsapp_id: null,
+      jid: '5511999990000@s.whatsapp.net',
+      texto: 'Lembrete: revisar fechamento.',
+    } as never);
+    expect(effect).toEqual({
+      kind: 'whatsapp_text',
+      jid: '5511999990000@s.whatsapp.net',
+      text: 'Lembrete: revisar fechamento.',
+      mensagem_id: 'msg-uuid-1',
     });
   });
 
@@ -88,7 +121,6 @@ describe('send_proactive_message tool', () => {
       id: TARGET_ID,
       telefone_whatsapp: '+5511888887777',
     });
-    sendOutboundTextMock.mockResolvedValueOnce('wa-id-2');
     conversasFindActive.mockResolvedValueOnce(null);
     conversasCreate.mockResolvedValueOnce({ id: 'conv-new' });
     mensagensCreate.mockResolvedValueOnce({ id: 'msg-uuid-2' });
@@ -108,6 +140,7 @@ describe('send_proactive_message tool', () => {
       pessoa_id: TARGET_ID,
       escopo_entidades: [],
     });
+    expect(sendOutboundTextMock).not.toHaveBeenCalled();
     const m = mensagensCreate.mock.calls[0]![0] as Record<string, unknown>;
     expect(m.conversa_id).toBe('conv-new');
   });
@@ -125,7 +158,7 @@ describe('send_proactive_message tool', () => {
     expect(sendOutboundTextMock).not.toHaveBeenCalled();
   });
 
-  it('throws pessoa_destino_not_found when target does not exist (no WhatsApp send)', async () => {
+  it('throws pessoa_destino_not_found when target does not exist (no send, no persist)', async () => {
     pessoasFindById.mockResolvedValueOnce(null);
     const { sendProactiveMessageTool } = await import(
       '../../../src/tools/send-proactive-message.js'

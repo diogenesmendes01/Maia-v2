@@ -68,6 +68,25 @@ export type Tool<I extends z.ZodTypeAny, O extends z.ZodTypeAny> = {
   // signals "no new resource was created" (e.g. duplicate-suspected branch).
   extractAlvoId?: (result: z.infer<O>) => string | null;
   /**
+   * Issue #316 — transactional outbox hook. A tool with a NON-IDEMPOTENT
+   * external side effect (e.g. sending a WhatsApp message) does NOT fire the
+   * effect inline. Its handler PLANS the effect and returns it; this hook
+   * extracts the `PlannedEffect` from the handler result so the dispatcher can
+   * record it in `idempotency_effect_outbox` IN THE SAME TRANSACTION as the
+   * winning idempotency reservation completion. A single relayer
+   * (src/workers/idempotency-outbox-relayer.ts) then dispatches it EXACTLY
+   * ONCE — so a preempted-but-fenced owner can never double-fire the effect
+   * (it never fired it at all; only the committed outbox row drives dispatch).
+   *
+   * Returning null = no external effect to relay for this result (the
+   * dispatcher completes the reservation normally, without an outbox write).
+   * When set AND returning non-null, the dispatcher routes through the atomic
+   * markCompleted+enqueue path instead of plain markCompleted.
+   */
+  extractEffect?: (result: z.infer<O>) => import(
+    '@/governance/idempotency-effects.js'
+  ).PlannedEffect | null;
+  /**
    * When true, any turn that dispatches this tool flips the outbound text
    * reply into view-once (B3a). OR-logic across all tools in the turn.
    */
