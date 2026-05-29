@@ -7,9 +7,14 @@ vi.mock('../../src/lib/metrics.js', () => ({
 
 import {
   runWithTenantContext,
+  runWithSystemContext,
   getCurrentTenant,
   getCurrentAgent,
   tryGetCurrentContext,
+  isSystemContext,
+  SYSTEM_TENANT_ID,
+  SYSTEM_AGENT_ID,
+  SYSTEM_CONTEXT,
   MissingTenantContextError,
   DefaultLiteralRejectedError,
 } from '@/db/tenant-context.js';
@@ -431,6 +436,88 @@ describe('tenant-context', () => {
           getCurrentTenant();
         }),
       ).rejects.toThrow(DefaultLiteralRejectedError);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Issue #323 phase 1 — reserved 'system' maintenance sentinel.
+  //
+  // Purely-additive vocabulary for genuinely-global workers. The CRITICAL
+  // invariant locked in here: unlike 'default', the 'system' sentinel is NEVER
+  // rejected — not by the shape guards, and not by assertNotDefaultLiteral even
+  // with MAIA_REJECT_DEFAULT_LITERAL=true. This is the property that makes the
+  // eventual default-literal flip safe (global workers re-home to 'system';
+  // 'default' becomes a hard-fail signal of a misrouted path).
+  // -------------------------------------------------------------------------
+  describe('issue #323 — reserved "system" context sentinel', () => {
+    it('SYSTEM_CONTEXT exposes the reserved system/system tuple', () => {
+      expect(SYSTEM_TENANT_ID).toBe('system');
+      expect(SYSTEM_AGENT_ID).toBe('system');
+      expect(SYSTEM_CONTEXT).toEqual({ tenant_id: 'system', agent_id: 'system' });
+    });
+
+    it('SYSTEM_CONTEXT is frozen (callers cannot mutate the shared object)', () => {
+      expect(Object.isFrozen(SYSTEM_CONTEXT)).toBe(true);
+      expect(() => {
+        (SYSTEM_CONTEXT as { tenant_id: string }).tenant_id = 'hijack';
+      }).toThrow();
+      expect(SYSTEM_CONTEXT.tenant_id).toBe('system');
+    });
+
+    it('runWithSystemContext runs fn under system/system', async () => {
+      let captured = { t: '', a: '' };
+      await runWithSystemContext(async () => {
+        captured = { t: getCurrentTenant(), a: getCurrentAgent() };
+      });
+      expect(captured).toEqual({ t: 'system', a: 'system' });
+    });
+
+    it('runWithSystemContext propagates the fn return value', async () => {
+      const out = await runWithSystemContext(async () => 42);
+      expect(out).toBe(42);
+    });
+
+    it('isSystemContext is true only for the system/system tuple', () => {
+      expect(isSystemContext({ tenant_id: 'system', agent_id: 'system' })).toBe(true);
+      expect(isSystemContext(SYSTEM_CONTEXT)).toBe(true);
+      expect(isSystemContext({ tenant_id: 'system', agent_id: 'sofia' })).toBe(false);
+      expect(isSystemContext({ tenant_id: 'acme', agent_id: 'system' })).toBe(false);
+      expect(isSystemContext({ tenant_id: 'default', agent_id: 'default' })).toBe(false);
+      expect(isSystemContext({ tenant_id: 'acme', agent_id: 'sofia' })).toBe(false);
+    });
+
+    it('getCurrentTenant/getCurrentAgent accept system and never meter it (flag OFF)', async () => {
+      await runWithSystemContext(async () => {
+        expect(getCurrentTenant()).toBe('system');
+        expect(getCurrentAgent()).toBe('system');
+      });
+      expect(incCounterMock).not.toHaveBeenCalledWith(
+        'maia_tenant_id_default_literal_total',
+        expect.anything(),
+      );
+    });
+
+    it('CRITICAL: system is NOT rejected even with MAIA_REJECT_DEFAULT_LITERAL=true', async () => {
+      process.env.MAIA_REJECT_DEFAULT_LITERAL = 'true';
+      let observed = { t: '', a: '' };
+      await runWithSystemContext(async () => {
+        observed = { t: getCurrentTenant(), a: getCurrentAgent() };
+      });
+      expect(observed).toEqual({ t: 'system', a: 'system' });
+      // No default-literal metering for the system sentinel.
+      expect(incCounterMock).not.toHaveBeenCalledWith(
+        'maia_tenant_id_default_literal_total',
+        expect.anything(),
+      );
+    });
+
+    it('tryGetCurrentContext returns the system context (flag ON) — fail-open for global work', async () => {
+      process.env.MAIA_REJECT_DEFAULT_LITERAL = 'true';
+      let observed: ReturnType<typeof tryGetCurrentContext> | undefined;
+      await runWithSystemContext(async () => {
+        observed = tryGetCurrentContext();
+      });
+      expect(observed).toEqual({ tenant_id: 'system', agent_id: 'system' });
     });
   });
 });
