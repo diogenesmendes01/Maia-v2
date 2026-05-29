@@ -293,9 +293,17 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
         // wrapped throw in baileys.send_document. Without it, a readFile fail
         // would record 'unknown' and the boundary guard would block retry —
         // reviving the HIGH-1 silent-drop #216 closed for documents.
+        //
+        // Improvement (#238): when ambiguous (transport throw), the ledger now
+        // records 'unknown' AND the boundary guard blocks any re-send, so the
+        // outer signal should also be delivered:true (`sent_no_persist`). That
+        // turns `executeSelectedSkill` into `handled:true` and skips the
+        // wasted ReAct turn that would otherwise be blocked at its OWN
+        // boundary guard anyway. DOC_READ_FAILED (ambiguous=false) stays
+        // delivered:false — genuine pre-send, ReAct retry is safe.
         const ambiguous = classifyDocumentThrow(e);
         await recordLedgerFailed(c.id, inbound.id, (e as Error).message, ambiguous);
-        throw new OutboundDeliveryError(false, (e as Error).message);
+        throw new OutboundDeliveryError(ambiguous, (e as Error).message);
       }
       if (!wid) {
         // null ⇒ disconnected (not sent → ledger 'failed') OR sent-without-id
@@ -392,10 +400,15 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
         });
       } catch (e) {
         // Transport throw is ambiguous (could be delivered-but-threw) →
-        // ledger 'unknown' blocks any re-attempt; outer error still carries
-        // delivered:false for the safeDispatchOutput contract.
+        // ledger 'unknown' blocks any re-attempt.
+        //
+        // Improvement (#238): since the ledger records 'unknown' AND the
+        // boundary guard blocks any re-send, the outer signal is now
+        // delivered:true (`sent_no_persist`) — saves the wasted ReAct turn
+        // (whose own dispatch would be blocked by the boundary guard
+        // anyway). No double-send risk: the row is 'unknown'.
         await recordLedgerFailed(c.id, inbound.id, (e as Error).message, true);
-        throw new OutboundDeliveryError(false, (e as Error).message);
+        throw new OutboundDeliveryError(true, (e as Error).message);
       }
       // null ⇒ disconnected (not sent → ledger 'failed') OR sent-without-id
       // (→ ledger 'sent'); disambiguate by connection state so a sent voice
@@ -669,8 +682,14 @@ export async function sendOutbound(
   // failures by phase so callers can tell "nothing sent" from "sent but not
   // persisted" (Codex #216 HIGH-A). Ledger: a TRANSPORT throw is ambiguous —
   // could be delivered-but-threw — so record 'unknown' (ambiguous=true) and
-  // the boundary guard blocks the ReAct re-attempt. The outer error still
-  // carries delivered:false for the safeDispatchOutput phase contract.
+  // the boundary guard blocks the ReAct re-attempt.
+  //
+  // Improvement (#238): since the ledger records 'unknown' AND the boundary
+  // guard already blocks any re-send, the outer error now carries
+  // delivered:true (mapped to `sent_no_persist` by safeDispatchOutput → the
+  // skill caller returns `handled:true` and we skip the wasted ReAct turn
+  // whose own dispatch would be blocked by the boundary guard anyway). No
+  // double-send risk: the row is 'unknown'.
   let wid: string | null;
   try {
     wid = await sendOutboundText(
@@ -680,7 +699,7 @@ export async function sendOutbound(
     );
   } catch (e) {
     await recordLedgerFailed(conversa_id, in_reply_to, (e as Error).message, true);
-    throw new OutboundDeliveryError(false, (e as Error).message);
+    throw new OutboundDeliveryError(true, (e as Error).message);
   }
   // A null id means the gateway did NOT confirm a send. Disambiguate
   // disconnected (not sent → delivered:false, ledger 'failed' allowing retry)
@@ -755,11 +774,15 @@ export async function sendOutboundPoll(
   try {
     sent = await sendPoll(jid, text, pending.opcoes_validas);
   } catch (e) {
-    // The poll never left the channel → delivered:false. (The text fallback
-    // below only covers missing decryption secrets, not a hard send failure.)
     // Transport throw is ambiguous (could be delivered-but-threw) → 'unknown'.
+    //
+    // Improvement (#238): since the ledger records 'unknown' AND the boundary
+    // guard blocks any re-send, the outer error now carries delivered:true
+    // (`sent_no_persist` → caller `handled:true`) so we skip the wasted
+    // ReAct turn whose own dispatch would be blocked anyway. No double-send
+    // risk: the row is 'unknown'.
     await recordLedgerFailed(conversa_id, in_reply_to, (e as Error).message, true);
-    throw new OutboundDeliveryError(false, (e as Error).message);
+    throw new OutboundDeliveryError(true, (e as Error).message);
   }
   // Without all three (whatsapp_id, message_secret, creator_jid) the inbound
   // vote can't be decrypted (creator_jid feeds the HMAC in decryptPollVote),
