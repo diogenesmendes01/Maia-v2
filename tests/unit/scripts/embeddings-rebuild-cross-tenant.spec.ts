@@ -1308,19 +1308,20 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
       // production form here by asserting it produces a URL of the
       // correct shape (three slashes, drive letter preserved in path).
       const { pathToFileURL } = await import('node:url');
-      // Skip when pathToFileURL can't parse a literal Windows path
-      // (POSIX-only nodes refuse `C:\...`).
-      let winFileUrl: string | null;
-      try {
-        winFileUrl = pathToFileURL('C:\\x\\y.ts').href;
-      } catch {
-        winFileUrl = null;
-      }
-      if (winFileUrl !== null) {
+      // The Windows-drive serialisation `file:///C:/...` (three slashes,
+      // empty host, drive letter preserved) only arises when running ON
+      // Windows. On POSIX, `C:\x\y.ts` is a *relative* filename
+      // (backslashes are legal POSIX path chars), so pathToFileURL does NOT
+      // throw — it resolves the string against cwd and yields
+      // `file:///<cwd>/C:%5Cx%5Cy.ts`, which is irrelevant to this guard.
+      // Gate the Windows-specific shape assertion on the actual platform.
+      if (process.platform === 'win32') {
         // Correct shape for Windows: `file:///C:/...` — three slashes
         // (empty host), drive letter preserved with original case,
         // forward slashes throughout the path.
-        expect(winFileUrl).toMatch(/^file:\/\/\/[A-Za-z]:\//);
+        expect(pathToFileURL('C:\\x\\y.ts').href).toMatch(
+          /^file:\/\/\/[A-Za-z]:\//,
+        );
       }
       // Absolute path → file:///... (three slashes, empty host). The
       // exact path varies by host OS (on Windows it gets the current
