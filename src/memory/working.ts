@@ -139,6 +139,51 @@ type WorkingMemoryRedisOp = 'lrange' | 'get' | 'set';
 
 const MESSAGES_TTL_SECONDS = 60 * 60 * 24;
 
+/**
+ * Rolling buffer size: keep only the last N messages per conversation. Was an
+ * inline `-20` constant in the previous three-call write; promoted to a named
+ * constant so the same value feeds the atomic Lua script's `ltrim` (issue #333).
+ */
+const MESSAGES_BUFFER_SIZE = 20;
+
+/**
+ * Atomic data-write script for the message buffer (issue #333).
+ *
+ * PROBLEM (issue #333): the previous write issued three SEPARATE Redis round
+ * trips — `rpush` → `ltrim` → `expire`. If the process died (crash/OOM/timeout)
+ * AFTER the `rpush`/`ltrim` but BEFORE the `expire` landed, the list key was
+ * left in Redis WITHOUT a TTL — data that never expires. Worse, the TTL/collision
+ * marker `SET` runs only AFTER that block, so an empty read of such a key found
+ * `marker === null` and was charged to the natural/cold-expiry branch, NOT to
+ * `working_memory_ttl_miss_total`. The result was data with no expiration AND no
+ * observability — outside the #330/#317 TTL-miss alert window.
+ *
+ * FIX: collapse the three commands into ONE server-side EVAL. Redis executes a
+ * script atomically and in isolation — no other command interleaves, and there
+ * is no client-visible point between the `rpush` and the `expire`. The list key
+ * can therefore NEVER exist without its TTL: either the whole script commits
+ * (push + trim + expire) or, on an error mid-script (e.g. OOM under
+ * `noeviction`), Redis aborts it and the data write does not land at all. This
+ * is the STRONGLY-preferred Lua approach over MULTI/EXEC (a single round trip on
+ * a hot path, and truly atomic rather than merely pipelined).
+ *
+ * Contract:
+ *   KEYS[1] = data list key (tenant+agent scoped — isolation is inviolable)
+ *   ARGV[1] = JSON-encoded message entry to push
+ *   ARGV[2] = max buffer size (we keep the trailing N via `ltrim -N -1`)
+ *   ARGV[3] = TTL in seconds (applied with `expire` in the SAME script)
+ *   returns 1 (kept simple; the caller only needs success/throw semantics)
+ *
+ * Equivalent to the old `rpush(key, entry)` + `ltrim(key, -N, -1)` +
+ * `expire(key, ttl)` — same commands, same arguments, now indivisible.
+ */
+const APPEND_MESSAGE_LUA = `
+redis.call('rpush', KEYS[1], ARGV[1])
+redis.call('ltrim', KEYS[1], -tonumber(ARGV[2]), -1)
+redis.call('expire', KEYS[1], tonumber(ARGV[3]))
+return 1
+`;
+
 function workingMessagesKey(conversa_id: string): string {
   // `getCurrentTenant()` / `getCurrentAgent()` throw `MissingTenantContextError`
   // if the caller isn't wrapped in `runWithTenantContext` — see invariant block.
@@ -199,20 +244,36 @@ export async function pushMessage(
   const fingerprint = scopeFingerprint(conversa_id);
   if (!isRedisConnected()) return;
 
+  // Data write — ATOMIC via a single Lua EVAL (issue #333). `rpush` + `ltrim` +
+  // `expire` run server-side in one indivisible script, so the list key can
+  // NEVER be observed (or left, on a mid-write crash) WITHOUT its TTL. This
+  // closes the prior three-round-trip window where a death between `rpush` and
+  // `expire` left data with no expiration — and, because the marker `SET` below
+  // had not run yet, no TTL-miss observability either (see APPEND_MESSAGE_LUA).
+  //
   // OOM handling (#309): working memory is a CACHE — Postgres is the source of
   // truth (the buffer is rebuilt from persisted `mensagens` on the next turn;
   // see the file docblock and runbook §4.5). On a Redis OOM under `noeviction`
-  // we degrade FAIL-OPEN: skip the data write, emit the OOM metric + warning,
-  // and return WITHOUT writing the TTL/collision marker (the buffer never
-  // landed, so a marker would manufacture a false TTL miss on the next read).
-  // Fail-open is safe here: the key is already tenant+agent-scoped (no
-  // isolation risk in dropping a write) and the read path falls back to
-  // Postgres on the resulting cache miss. Any NON-OOM Redis error still
-  // propagates — we only absorb the capacity signal.
+  // the script's first `rpush` is rejected and Redis aborts the whole EVAL, so
+  // NOTHING is written (atomicity makes this strictly cleaner than the old
+  // multi-call path — there is no partial list to leave behind). ioredis
+  // surfaces the aborted script as a `ReplyError` whose message starts with
+  // `OOM`, so `isRedisOomError` classifies it exactly as before. We degrade
+  // FAIL-OPEN: emit the OOM metric + warning and return WITHOUT writing the
+  // TTL/collision marker (the buffer never landed, so a marker would manufacture
+  // a false TTL miss on the next read). Fail-open is safe here: the key is
+  // already tenant+agent-scoped (no isolation risk in dropping a write) and the
+  // read path falls back to Postgres on the resulting cache miss. Any NON-OOM
+  // Redis error still propagates — we only absorb the capacity signal.
   try {
-    await redis.rpush(key, JSON.stringify({ role, text, ts: Date.now() }));
-    await redis.ltrim(key, -20, -1);
-    await redis.expire(key, MESSAGES_TTL_SECONDS);
+    await redis.eval(
+      APPEND_MESSAGE_LUA,
+      1,
+      key,
+      JSON.stringify({ role, text, ts: Date.now() }),
+      String(MESSAGES_BUFFER_SIZE),
+      String(MESSAGES_TTL_SECONDS),
+    );
   } catch (err) {
     if (isRedisOomError(err)) {
       recordRedisOomDegraded('working_memory.push', {
@@ -347,10 +408,13 @@ export async function readRecent(
       logger.warn({ key_type: 'messages' }, 'working_memory.key_collision');
     } else if (items.length === 0) {
       // Our own marker is still alive (TTL not elapsed) yet the buffer read
-      // returned nothing — the entry vanished early (eviction, FLUSHDB, crash
-      // before EXPIRE commit, or a partial write). Surface as a defense metric.
-      // The marker is intentionally NOT deleted here so a later eviction after
-      // a hit is still observable until natural expiry/overwrite (#317 B3).
+      // returned nothing — the entry vanished early (eviction or FLUSHDB). Note
+      // that "crash before EXPIRE commit / partial write" is NO LONGER a cause
+      // since #333 made the data write a single atomic EVAL (the list can't
+      // exist without its TTL), so a live marker + empty list now points
+      // squarely at a Redis-side eviction. Surface as a defense metric. The
+      // marker is intentionally NOT deleted here so a later eviction after a
+      // hit is still observable until natural expiry/overwrite (#317 B3).
       incCounter('working_memory_ttl_miss_total', { key_type: 'messages' });
       logger.warn({ key_type: 'messages' }, 'working_memory.ttl_miss');
     }

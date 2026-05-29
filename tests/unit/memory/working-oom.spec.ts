@@ -35,23 +35,27 @@ const { stub, logWarn } = vi.hoisted(() => {
   const s = {
     lists,
     markers,
+    // Knob name kept for continuity: it models an OOM at the DATA write. After
+    // #333 the data write is a single atomic Lua EVAL whose FIRST command is
+    // `rpush`, so an OOM under `noeviction` aborts the whole script at that
+    // `rpush` — exactly what this flag now simulates by throwing from `eval`.
     setOomOnRpush(v: boolean) {
       oomOnRpush = v;
     },
     setOomOnMarkerSet(v: boolean) {
       oomOnMarkerSet = v;
     },
-    async rpush(key: string, value: string) {
-      if (oomOnRpush) throw oom();
+    // #333: atomic data write. Mirrors the production Lua (rpush + ltrim(-N,-1) +
+    // expire) against the in-memory list. An OOM at the first `rpush` aborts the
+    // ENTIRE script — nothing is appended, trimmed, or expired — which is the
+    // key atomicity property: the list can never be left without its TTL.
+    async eval(_script: string, _numKeys: number, key: string, value: string, maxLen: string) {
+      if (oomOnRpush) throw oom(); // script aborts before ANY write lands
       const arr = lists.get(key) ?? [];
       arr.push({ value });
+      const n = Number(maxLen);
+      if (arr.length > n) arr.splice(0, arr.length - n); // ltrim(-N, -1)
       lists.set(key, arr);
-      return arr.length;
-    },
-    async ltrim() {
-      return 'OK';
-    },
-    async expire() {
       return 1;
     },
     // #317 marker key write — used by pushMessage AFTER the data write.
@@ -176,14 +180,17 @@ describe('working memory — OOM degradation (#309)', () => {
     expect(out).not.toContain('working_memory_redis_error_total');
   });
 
-  it('a NON-OOM rpush error still propagates (we only absorb OOM)', async () => {
+  it('a NON-OOM data-write (EVAL) error still propagates (we only absorb OOM)', async () => {
+    // #333: the atomic data write is a Lua EVAL. A non-OOM script error (e.g. a
+    // WRONGTYPE surfaced by `redis.call` inside the script) must propagate to
+    // the caller unchanged — we only absorb the OOM capacity signal.
     const boom = Object.assign(new Error('WRONGTYPE'), { name: 'ReplyError' });
-    const original = stub.rpush;
-    (stub as { rpush: unknown }).rpush = async () => {
+    const original = stub.eval;
+    (stub as { eval: unknown }).eval = async () => {
       throw boom;
     };
     await expect(asTenantA(() => pushMessage('conv-x', 'user', 'hi'))).rejects.toBe(boom);
-    (stub as { rpush: unknown }).rpush = original;
+    (stub as { eval: unknown }).eval = original;
 
     const out = await renderPrometheus();
     expect(out).not.toContain('redis_oom_degraded_total');

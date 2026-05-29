@@ -27,16 +27,11 @@ type Call = { op: string; key: string; args: unknown[] };
 const calls: Call[] = [];
 
 const redisStub = {
-  rpush: vi.fn(async (key: string, ...args: unknown[]) => {
-    calls.push({ op: 'rpush', key, args });
-    return 1;
-  }),
-  ltrim: vi.fn(async (key: string, ...args: unknown[]) => {
-    calls.push({ op: 'ltrim', key, args });
-    return 'OK';
-  }),
-  expire: vi.fn(async (key: string, ...args: unknown[]) => {
-    calls.push({ op: 'expire', key, args });
+  // #333: the data write is a single atomic Lua EVAL. Redis is DOWN for this
+  // whole file, so it is never reached (the isRedisConnected()===false guard
+  // short-circuits first); recorded for shape parity with production.
+  eval: vi.fn(async (_script: string, _numKeys: number, key: string, ...argv: unknown[]) => {
+    calls.push({ op: 'eval', key, args: argv });
     return 1;
   }),
   lrange: vi.fn(async (key: string, ...args: unknown[]) => {
@@ -96,10 +91,9 @@ describe('issue #231 / #241 MAJOR #1 — fail-closed when Redis is down', () => 
       await expect(pushMessage(CONV, 'user', 'no ctx')).rejects.toThrow(
         MissingTenantContextError,
       );
-      // No Redis ops should have been attempted either way.
-      expect(redisStub.rpush).not.toHaveBeenCalled();
-      expect(redisStub.ltrim).not.toHaveBeenCalled();
-      expect(redisStub.expire).not.toHaveBeenCalled();
+      // No Redis ops should have been attempted either way (the atomic
+      // data-write EVAL must not fire, #333).
+      expect(redisStub.eval).not.toHaveBeenCalled();
     });
 
     it('returns silently when context IS present (Redis-down no-op preserved)', async () => {
@@ -113,7 +107,7 @@ describe('issue #231 / #241 MAJOR #1 — fail-closed when Redis is down', () => 
           ).resolves.toBeUndefined();
         },
       );
-      expect(redisStub.rpush).not.toHaveBeenCalled();
+      expect(redisStub.eval).not.toHaveBeenCalled();
     });
   });
 

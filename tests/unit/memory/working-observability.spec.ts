@@ -44,9 +44,21 @@ type RedisStub = {
   evictedMarkers: Set<string>;
   /** When a key is here, lrange THROWS — simulates a Redis read failure (#317 B1). */
   failLrange: Set<string>;
+  /**
+   * #333: the atomic data-write Lua EVAL (rpush + ltrim + expire in one script).
+   * Sets the data list AND its TTL together, mirroring the indivisible
+   * server-side operation — there is no longer an `expire` round trip the test
+   * can observe (or skip) independently.
+   */
+  eval(
+    script: string,
+    numKeys: number,
+    key: string,
+    value: string,
+    maxLen: string,
+    ttl: string,
+  ): Promise<number>;
   rpush(key: string, value: string): Promise<number>;
-  ltrim(key: string, start: number, stop: number): Promise<'OK'>;
-  expire(key: string, seconds: number): Promise<number>;
   lrange(key: string, start: number, stop: number): Promise<string[]>;
   set(key: string, value: string, ...args: unknown[]): Promise<'OK'>;
   get(key: string): Promise<string | null>;
@@ -71,18 +83,27 @@ const { stub } = vi.hoisted(() => {
     evictedKeys,
     evictedMarkers,
     failLrange,
+    // #333: atomic data write. Mirrors the production Lua (rpush + ltrim(-N,-1) +
+    // expire) in one shot: appends, trims to the trailing N, AND records the TTL
+    // — so the list is NEVER created without a TTL, the exact bug #333 fixes.
+    async eval(_script, _numKeys, key, value, maxLen, ttl) {
+      const arr = lists.get(key) ?? [];
+      arr.push({ value });
+      const n = Number(maxLen);
+      if (arr.length > n) arr.splice(0, arr.length - n);
+      lists.set(key, arr);
+      ttls.set(key, Date.now() + Number(ttl) * 1000);
+      return 1;
+    },
+    // Kept for tests that SEED a foreign/raw payload directly (e.g. the key
+    // collision cases). NOT used by production anymore — the real write path is
+    // the atomic `eval` above. A raw `rpush` here intentionally does NOT set a
+    // TTL, matching Redis semantics for a bare RPUSH.
     async rpush(key, value) {
       const arr = lists.get(key) ?? [];
       arr.push({ value });
       lists.set(key, arr);
       return arr.length;
-    },
-    async ltrim(_key, _start, _stop) {
-      return 'OK';
-    },
-    async expire(key, seconds) {
-      ttls.set(key, Date.now() + seconds * 1000);
-      return 1;
     },
     async lrange(key, _start, _stop) {
       if (failLrange.has(key)) {
