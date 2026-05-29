@@ -3,8 +3,8 @@
  * separação Agent/Channel/Role + Role Policy.
  *
  * Cobre 7 cenários:
- *   1. Flag OFF (MULTI_CHANNEL) → resolveChannel devolve default/default/null
- *      SEM consultar o repo (modo legacy preservado).
+ *   1. Flag OFF (MULTI_CHANNEL) → resolveChannel LANÇA TypedError fail-loud
+ *      SEM consultar o repo (issue #268 — fallback default/default removido).
  *   2. Policy=LOCKED → mesmo com candidate strong vindo dos suggesters,
  *      decisão é keep_current via policy_rule. Audit row criado.
  *   3. Policy=PREFER_HANDOFF + candidate diferente → action=handoff,
@@ -362,26 +362,26 @@ describe('P6 channel/role/policy — end-to-end', () => {
   });
 
   // ---------- Cenário 1 ----------
-  it('cenário 1: flag MULTI_CHANNEL OFF → resolveChannel devolve default/default/null SEM consultar repo', async () => {
+  it('cenário 1: flag MULTI_CHANNEL OFF → resolveChannel LANÇA TypedError fail-loud (issue #268)', async () => {
     const { featureFlags } = await import('@/config/feature-flags.js');
     featureFlags.override(FeatureFlagName.MULTI_CHANNEL, false);
 
     const { resolveChannel } = await import('@/gateway/channel-resolver.js');
-    const out = await resolveChannel({
+    const { TypedError } = await import('@/lib/utils.js');
+
+    const promise = resolveChannel({
       channel_type: 'whatsapp',
       external_id: '5511999999999',
     });
 
-    // Legacy preserved: default/default/null, NO repo lookup, NO warning.
-    expect(out).toEqual({
-      tenant_id: 'default',
-      agent_id: 'default',
-      channel_id: null,
+    // Issue #268 — fallback default/default removido. Resolver agora lança
+    // TypedError tipado em vez de colapsar tenants no bucket compartilhado.
+    await expect(promise).rejects.toBeInstanceOf(TypedError);
+    await expect(promise).rejects.toMatchObject({
+      code: 'channel_resolution_failed',
     });
+    // Short-circuit antes do lookup — nenhum side-effect downstream.
     expect(channelsFindByExternalCrossTenantMock).not.toHaveBeenCalled();
-    expect(loggerWarn).not.toHaveBeenCalled();
-    // No role selection should have been triggered downstream — but resolveChannel
-    // is what gates everything, so just verifying it short-circuited proves it.
     expect(recordDecisionMock).not.toHaveBeenCalled();
   });
 

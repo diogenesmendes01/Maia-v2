@@ -34,8 +34,12 @@ export async function buildKnowledgeSlice(input: {
     facts: input.max_facts,
     rules: input.max_rules,
   });
+  // Issue #235 (LOW, latent): chave de cache deve incluir agent_id porque o
+  // builder escopa facts/rules por boundary.agent_id (linhas 50-68). Sem isso,
+  // agents do mesmo tenant compartilhariam slices em cache.
   const cache_key = buildKnowledgeSliceCacheKey({
     tenant_id: input.tenant_id,
+    agent_id: boundary.agent_id,
     depth: input.depth,
     scope_hint: input.scope_hint,
     domain: input.domain,

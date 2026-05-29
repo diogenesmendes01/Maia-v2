@@ -32,8 +32,15 @@ export async function buildUserSlice(input: {
 
   const start = performance.now();
   const max_items = input.max_items ?? getUserMaxItems(input.depth);
+  // Issue #235 (HIGH, in-scope): cache key MUST include agent_id because the
+  // resolvers below (`memoryResolver.list`, `hintsResolver.list`) scope by
+  // `boundary.agent_id`. Without agent_id in the key, two agents on the same
+  // tenant looking at the same pessoa would collide and leak each other's
+  // memories. The boundary decision is the source of truth — it's already
+  // cross-checked against the AsyncLocalStorage tenant context.
   const cache_key = buildUserSliceCacheKey({
     tenant_id: input.tenant_id,
+    agent_id: boundary.agent_id,
     pessoa_id: input.pessoa_id,
     depth: input.depth,
     intent_label: input.intent_label,
