@@ -1,0 +1,513 @@
+/**
+ * Issue #290 — Baileys ingress runs `handleIncoming` inside the RESOLVED
+ * tenant context (NOT `default/default` synthetic) when MULTI_CHANNEL is ON.
+ *
+ * Coverage (in-process, mocked Baileys + mocked channelsRepo):
+ *
+ *   1. Two JIDs registered to two different tenants → each message lands
+ *      under its own tenant ALS (cross-tenant happy path).
+ *   2. Cross-tenant ADVERSARIAL: a JID resolved to tenant A must NEVER
+ *      enter tenant B's ALS — even when tenant B has a row in `channels`
+ *      with overlapping data. This is the defense the issue calls out as
+ *      the runtime guarantee the downstream PRs need.
+ *   3. Unknown JID → `handleIncoming` is NEVER invoked; audit emitted
+ *      with `channel_resolution_failed` (fail-closed; no default/default
+ *      fallback).
+ *   4. Legacy MULTI_CHANNEL=OFF → behaviour matches the pre-#290 single-
+ *      tenant path (default/default), no regression for the existing
+ *      single-tenant deployment.
+ *   5. @lid + senderPn → resolved via the real phone, runs under the
+ *      owning tenant's ALS.
+ *
+ * These tests exercise the full Baileys upsert pipeline at the boundary
+ * — they mock Baileys, the channels repo, and downstream sinks
+ * (createInbound, enqueueAgent, debouncer) so the assertions focus on the
+ * ALS context active when the downstream sinks fire.
+ */
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import type { Channel } from '@/db/schema.js';
+
+// --- Mocks (vi.hoisted so they're available at import time) ----------------
+
+const {
+  findByExternalCrossTenantMock,
+  createInboundMock,
+  enqueueAgentMock,
+  auditMock,
+  isDuplicateMock,
+  markSeenMock,
+  checkBotAndMaybeBlockMock,
+  fakeSocket,
+  handlerState,
+} = vi.hoisted(() => {
+  const state: {
+    upsertHandler:
+      | ((args: { messages: unknown[] }) => Promise<void>)
+      | null;
+  } = { upsertHandler: null };
+  return {
+    findByExternalCrossTenantMock: vi.fn<
+      [args: { channel_type: string; external_id: string }],
+      Promise<Channel | null>
+    >(),
+    createInboundMock: vi.fn(),
+    enqueueAgentMock: vi.fn().mockResolvedValue(undefined),
+    auditMock: vi.fn().mockResolvedValue(undefined),
+    isDuplicateMock: vi.fn().mockResolvedValue(false),
+    markSeenMock: vi.fn().mockResolvedValue(undefined),
+    checkBotAndMaybeBlockMock: vi.fn().mockResolvedValue(false),
+    handlerState: state,
+    fakeSocket: {
+      ev: {
+        on: (event: string, handler: (...args: unknown[]) => Promise<void>) => {
+          if (event === 'messages.upsert') {
+            state.upsertHandler = handler as typeof state.upsertHandler;
+          }
+        },
+      },
+      end: vi.fn(),
+      sendMessage: vi.fn(),
+    },
+  };
+});
+
+vi.mock('@whiskeysockets/baileys', () => ({
+  default: () => fakeSocket,
+  DisconnectReason: { loggedOut: 401 },
+  useMultiFileAuthState: vi.fn().mockResolvedValue({ state: {}, saveCreds: vi.fn() }),
+  fetchLatestBaileysVersion: vi
+    .fn()
+    .mockResolvedValue({ version: [2, 3000, 0], isLatest: true }),
+  downloadMediaMessage: vi.fn(),
+}));
+
+vi.mock('qrcode-terminal', () => ({ default: { generate: vi.fn() } }));
+
+vi.mock('@/config/env.js', () => ({
+  config: {
+    BAILEYS_AUTH_DIR: '/tmp/maia-issue-290-test',
+    FEATURE_MESSAGE_UPDATE: false,
+    FEATURE_ONE_TAP: false,
+    FEATURE_MESSAGE_DEBOUNCE: false,
+    FEATURE_PRESENCE: false,
+    FEATURE_VIEW_ONCE_SENSITIVE: false,
+  },
+}));
+
+vi.mock('@/lib/logger.js', () => ({
+  logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+}));
+
+vi.mock('@/db/repositories.js', () => ({
+  mensagensRepo: { createInbound: createInboundMock },
+  channelsRepo: { findByExternalCrossTenant: findByExternalCrossTenantMock },
+}));
+
+vi.mock('@/gateway/dedup.js', () => ({
+  isDuplicate: isDuplicateMock,
+  markSeen: markSeenMock,
+}));
+
+vi.mock('@/gateway/presence.js', () => ({ markRead: vi.fn() }));
+
+vi.mock('@/gateway/queue.js', () => ({ enqueueAgent: enqueueAgentMock }));
+
+vi.mock('@/gateway/debouncer.js', () => ({
+  scheduleDebouncedAgent: vi.fn(),
+}));
+
+vi.mock('@/gateway/bot-detection.js', () => ({
+  checkBotAndMaybeBlock: checkBotAndMaybeBlockMock,
+}));
+
+vi.mock('@/governance/audit.js', () => ({ audit: auditMock }));
+
+vi.mock('@/agent/one-tap.js', () => ({
+  dispatchReactionAsAnswer: vi.fn(),
+  dispatchPollVote: vi.fn(),
+}));
+
+vi.mock('@/agent/message-update.js', () => ({
+  routeMessageUpdate: vi.fn(),
+}));
+
+vi.mock('@/setup/state.js', () => ({
+  setupState: {
+    current: () => ({ phase: 'connected' }),
+    setQr: vi.fn(),
+    markPaired: vi.fn(),
+    markDisconnected: vi.fn(),
+  },
+}));
+
+vi.mock('@/setup/recovery.js', () => ({ triggerRecovery: vi.fn() }));
+
+vi.mock('node:fs', async () => {
+  const actual = await vi.importActual<typeof import('node:fs')>('node:fs');
+  return {
+    ...actual,
+    mkdirSync: vi.fn(),
+    existsSync: () => true,
+    writeFileSync: vi.fn(),
+  };
+});
+
+// --- Helpers ---------------------------------------------------------------
+
+function makeChannel(overrides: Partial<Channel>): Channel {
+  const now = new Date();
+  return {
+    id: 'ch-default',
+    tenant_id: 'tenant-default-test',
+    agent_id: 'agent-default-test',
+    external_id: '+5511000000000',
+    channel_type: 'whatsapp',
+    display_name: 'WA',
+    active: true,
+    metadata: {},
+    created_at: now,
+    updated_at: now,
+    ...overrides,
+  } as Channel;
+}
+
+function inbound(jid: string, id: string, extras: Record<string, unknown> = {}) {
+  return {
+    key: { fromMe: false, remoteJid: jid, id, ...extras },
+    messageTimestamp: Math.floor(Date.now() / 1000),
+    message: { conversation: 'olá' },
+    pushName: 'Cliente',
+  };
+}
+
+// --- Tests -----------------------------------------------------------------
+
+describe('baileys messages.upsert — runs handleIncoming inside RESOLVED tenant context (issue #290)', () => {
+  beforeEach(async () => {
+    findByExternalCrossTenantMock.mockReset();
+    createInboundMock.mockReset();
+    enqueueAgentMock.mockClear();
+    auditMock.mockClear();
+    isDuplicateMock.mockClear();
+    markSeenMock.mockClear();
+    checkBotAndMaybeBlockMock.mockReset();
+    checkBotAndMaybeBlockMock.mockResolvedValue(false);
+    handlerState.upsertHandler = null;
+    // Reset feature flags via dynamic import (so the in-process flag registry
+    // resets between test scenarios).
+    const { featureFlags } = await import('@/config/feature-flags.js');
+    featureFlags.reset();
+  });
+
+  it('two JIDs → each handleIncoming runs under its own resolved tenant (cross-tenant happy path)', async () => {
+    const { featureFlags } = await import('@/config/feature-flags.js');
+    const { FeatureFlagName } = await import('@/types/enums.js');
+    featureFlags.override(FeatureFlagName.MULTI_CHANNEL, true);
+
+    findByExternalCrossTenantMock.mockImplementation(async (args) => {
+      if (args.external_id === '+5511111111111') {
+        return makeChannel({
+          id: 'ch-A',
+          tenant_id: 'tenant-A',
+          agent_id: 'agent-A',
+          external_id: '+5511111111111',
+        });
+      }
+      if (args.external_id === '+5511222222222') {
+        return makeChannel({
+          id: 'ch-B',
+          tenant_id: 'tenant-B',
+          agent_id: 'agent-B',
+          external_id: '+5511222222222',
+        });
+      }
+      return null;
+    });
+
+    const observed: Array<{ tenant_id: string; agent_id: string }> = [];
+    createInboundMock.mockImplementation(async () => {
+      const { tryGetCurrentContext } = await import(
+        '@/db/tenant-context.js'
+      );
+      const ctx = tryGetCurrentContext();
+      if (!ctx) throw new Error('no ALS context');
+      observed.push({ tenant_id: ctx.tenant_id, agent_id: ctx.agent_id });
+      return {
+        row: {
+          id: `msg-${observed.length}`,
+          tenant_id: ctx.tenant_id,
+          agent_id: ctx.agent_id,
+        },
+        duplicate: false,
+      };
+    });
+
+    const { startBaileys } = await import('@/gateway/baileys.js');
+    await startBaileys();
+    expect(handlerState.upsertHandler).not.toBeNull();
+
+    await handlerState.upsertHandler!({
+      messages: [
+        inbound('5511111111111@s.whatsapp.net', 'WAID-A'),
+        inbound('5511222222222@s.whatsapp.net', 'WAID-B'),
+      ],
+    });
+
+    expect(observed).toHaveLength(2);
+    expect(observed[0]).toEqual({
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-A',
+    });
+    expect(observed[1]).toEqual({
+      tenant_id: 'tenant-B',
+      agent_id: 'agent-B',
+    });
+    // Neither message landed in default/default — the bug this PR closes.
+    expect(observed).not.toContainEqual({
+      tenant_id: 'default',
+      agent_id: 'default',
+    });
+  });
+
+  it('cross-tenant ADVERSARIAL: tenant A JID NEVER injects context into tenant B', async () => {
+    // Simulate the scenario the issue calls out: the resolver returns the
+    // ACTIVE owner for a given phone. Even when the same phone has historic
+    // rows in another tenant (inactive — recently switched providers), the
+    // active resolution wins and ONLY that tenant's ALS is entered.
+    const { featureFlags } = await import('@/config/feature-flags.js');
+    const { FeatureFlagName } = await import('@/types/enums.js');
+    featureFlags.override(FeatureFlagName.MULTI_CHANNEL, true);
+
+    findByExternalCrossTenantMock.mockResolvedValueOnce(
+      makeChannel({
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-A',
+        external_id: '+5511333333333',
+      }),
+    );
+
+    let observedTenant: string | null = null;
+    let observedAgent: string | null = null;
+    createInboundMock.mockImplementation(async () => {
+      const { getCurrentTenant, getCurrentAgent } = await import(
+        '@/db/tenant-context.js'
+      );
+      observedTenant = getCurrentTenant();
+      observedAgent = getCurrentAgent();
+      return {
+        row: {
+          id: 'msg-adv',
+          tenant_id: observedTenant,
+          agent_id: observedAgent,
+        },
+        duplicate: false,
+      };
+    });
+
+    const { startBaileys } = await import('@/gateway/baileys.js');
+    await startBaileys();
+
+    await handlerState.upsertHandler!({
+      messages: [inbound('5511333333333@s.whatsapp.net', 'WAID-ADV')],
+    });
+
+    expect(observedTenant).toBe('tenant-A');
+    expect(observedAgent).toBe('agent-A');
+    // Defensive: explicit non-match against any other tenant the test
+    // mentions, anchoring that no leak occurs even by accident.
+    expect(observedTenant).not.toBe('tenant-B');
+    expect(observedTenant).not.toBe('default');
+  });
+
+  it('unknown JID → handleIncoming NOT invoked; audit channel_resolution_failed emitted (fail-closed)', async () => {
+    const { featureFlags } = await import('@/config/feature-flags.js');
+    const { FeatureFlagName } = await import('@/types/enums.js');
+    featureFlags.override(FeatureFlagName.MULTI_CHANNEL, true);
+
+    findByExternalCrossTenantMock.mockResolvedValueOnce(null); // miss
+    createInboundMock.mockImplementation(async () => {
+      throw new Error('createInbound MUST NOT run for unknown JID');
+    });
+
+    const { startBaileys } = await import('@/gateway/baileys.js');
+    await startBaileys();
+
+    await handlerState.upsertHandler!({
+      messages: [inbound('5511999999999@s.whatsapp.net', 'WAID-UNKNOWN')],
+    });
+
+    // handleIncoming never reached createInbound.
+    expect(createInboundMock).not.toHaveBeenCalled();
+    expect(enqueueAgentMock).not.toHaveBeenCalled();
+
+    // Audit emitted with the resolution-failure action and resolver details.
+    const failedAudits = auditMock.mock.calls.filter(
+      (call) => (call[0] as { acao?: string })?.acao === 'channel_resolution_failed',
+    );
+    expect(failedAudits).toHaveLength(1);
+    const audited = failedAudits[0]![0] as {
+      acao: string;
+      metadata: Record<string, unknown>;
+    };
+    expect(audited.metadata.error_code).toBe('channel_resolution_failed');
+    expect(audited.metadata.raw_jid).toBe('5511999999999@s.whatsapp.net');
+    expect(audited.metadata.whatsapp_id).toBe('WAID-UNKNOWN');
+    expect(audited.metadata.emitter).toBe('baileys_ingress');
+    expect(
+      (audited.metadata.resolver_details as { resolver_path?: string })
+        ?.resolver_path,
+    ).toBe('unknown_or_inactive_channel');
+  });
+
+  it('malformed JID → audit + drop, NO repo lookup (jid_unparseable)', async () => {
+    const { featureFlags } = await import('@/config/feature-flags.js');
+    const { FeatureFlagName } = await import('@/types/enums.js');
+    featureFlags.override(FeatureFlagName.MULTI_CHANNEL, true);
+
+    const { startBaileys } = await import('@/gateway/baileys.js');
+    await startBaileys();
+
+    await handlerState.upsertHandler!({
+      messages: [inbound('not-a-jid', 'WAID-MALFORMED')],
+    });
+
+    expect(findByExternalCrossTenantMock).not.toHaveBeenCalled();
+    expect(createInboundMock).not.toHaveBeenCalled();
+    const failedAudits = auditMock.mock.calls.filter(
+      (call) => (call[0] as { acao?: string })?.acao === 'channel_resolution_failed',
+    );
+    expect(failedAudits).toHaveLength(1);
+    const md = (failedAudits[0]![0] as { metadata: Record<string, unknown> })
+      .metadata;
+    expect(
+      (md.resolver_details as { resolver_path?: string })?.resolver_path,
+    ).toBe('jid_unparseable');
+  });
+
+  it('group JID (@g.us) → audit + drop with resolver_path=jid_unparseable (defense in depth)', async () => {
+    const { featureFlags } = await import('@/config/feature-flags.js');
+    const { FeatureFlagName } = await import('@/types/enums.js');
+    featureFlags.override(FeatureFlagName.MULTI_CHANNEL, true);
+
+    const { startBaileys } = await import('@/gateway/baileys.js');
+    await startBaileys();
+
+    await handlerState.upsertHandler!({
+      messages: [inbound('120363025111111111@g.us', 'WAID-GROUP')],
+    });
+
+    expect(findByExternalCrossTenantMock).not.toHaveBeenCalled();
+    expect(createInboundMock).not.toHaveBeenCalled();
+  });
+
+  it('legacy MULTI_CHANNEL=OFF → preserves default/default (no regression for single-tenant prod)', async () => {
+    const { featureFlags } = await import('@/config/feature-flags.js');
+    const { FeatureFlagName } = await import('@/types/enums.js');
+    featureFlags.override(FeatureFlagName.MULTI_CHANNEL, false);
+
+    let observedTenant: string | null = null;
+    let observedAgent: string | null = null;
+    createInboundMock.mockImplementation(async () => {
+      const { getCurrentTenant, getCurrentAgent } = await import(
+        '@/db/tenant-context.js'
+      );
+      observedTenant = getCurrentTenant();
+      observedAgent = getCurrentAgent();
+      return {
+        row: { id: 'msg-legacy', tenant_id: 'default', agent_id: 'default' },
+        duplicate: false,
+      };
+    });
+
+    const { startBaileys } = await import('@/gateway/baileys.js');
+    await startBaileys();
+
+    await handlerState.upsertHandler!({
+      messages: [inbound('5511444444444@s.whatsapp.net', 'WAID-LEGACY')],
+    });
+
+    expect(observedTenant).toBe('default');
+    expect(observedAgent).toBe('default');
+    // Resolver was NOT invoked in legacy mode.
+    expect(findByExternalCrossTenantMock).not.toHaveBeenCalled();
+  });
+
+  it('@lid JID with senderPn → resolves via the real phone and runs under the owning tenant', async () => {
+    const { featureFlags } = await import('@/config/feature-flags.js');
+    const { FeatureFlagName } = await import('@/types/enums.js');
+    featureFlags.override(FeatureFlagName.MULTI_CHANNEL, true);
+
+    findByExternalCrossTenantMock.mockResolvedValueOnce(
+      makeChannel({
+        tenant_id: 'tenant-lid',
+        agent_id: 'agent-lid',
+        external_id: '+5511555555555',
+      }),
+    );
+
+    let observedTenant: string | null = null;
+    createInboundMock.mockImplementation(async () => {
+      const { getCurrentTenant } = await import('@/db/tenant-context.js');
+      observedTenant = getCurrentTenant();
+      return {
+        row: { id: 'msg-lid', tenant_id: observedTenant, agent_id: 'agent-lid' },
+        duplicate: false,
+      };
+    });
+
+    const { startBaileys } = await import('@/gateway/baileys.js');
+    await startBaileys();
+
+    await handlerState.upsertHandler!({
+      messages: [
+        inbound('99999@lid', 'WAID-LID', { senderPn: '5511555555555' }),
+      ],
+    });
+
+    expect(observedTenant).toBe('tenant-lid');
+    expect(findByExternalCrossTenantMock).toHaveBeenCalledWith({
+      channel_type: 'whatsapp',
+      external_id: '+5511555555555',
+    });
+  });
+
+  it('one failure does not poison the rest: unknown JID followed by known JID in the same batch', async () => {
+    const { featureFlags } = await import('@/config/feature-flags.js');
+    const { FeatureFlagName } = await import('@/types/enums.js');
+    featureFlags.override(FeatureFlagName.MULTI_CHANNEL, true);
+
+    findByExternalCrossTenantMock
+      .mockResolvedValueOnce(null) // first message: unknown
+      .mockResolvedValueOnce(
+        makeChannel({
+          tenant_id: 'tenant-known',
+          agent_id: 'agent-known',
+          external_id: '+5511666666666',
+        }),
+      );
+
+    const observed: string[] = [];
+    createInboundMock.mockImplementation(async () => {
+      const { getCurrentTenant } = await import('@/db/tenant-context.js');
+      observed.push(getCurrentTenant());
+      return { row: { id: 'msg', tenant_id: 'x', agent_id: 'x' }, duplicate: false };
+    });
+
+    const { startBaileys } = await import('@/gateway/baileys.js');
+    await startBaileys();
+
+    await handlerState.upsertHandler!({
+      messages: [
+        inbound('5510000000000@s.whatsapp.net', 'WAID-1'), // unknown
+        inbound('5511666666666@s.whatsapp.net', 'WAID-2'), // known
+      ],
+    });
+
+    expect(observed).toEqual(['tenant-known']);
+    // One audit for the failure path; none for the success path.
+    const failedAudits = auditMock.mock.calls.filter(
+      (call) => (call[0] as { acao?: string })?.acao === 'channel_resolution_failed',
+    );
+    expect(failedAudits).toHaveLength(1);
+  });
+});

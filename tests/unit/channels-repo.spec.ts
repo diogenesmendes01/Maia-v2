@@ -96,16 +96,33 @@ vi.mock('@/db/repositories.js', async () => {
           );
         },
       ),
+      // [Codex review #277] Mock reflects the post-review contract: iterate
+      // all matches, prefer active, throw ambiguous_active_channels when 2+
+      // active rows exist. Keeps behavioral parity with the real repo.
       findByExternalCrossTenant: vi.fn(
         async (args: { channel_type: string; external_id: string }) => {
-          // Explicitly bypasses tenant guard
-          return (
-            Object.values(channelsState).find(
-              (r) =>
-                r.channel_type === args.channel_type &&
-                r.external_id === args.external_id,
-            ) ?? null
+          const matches = Object.values(channelsState).filter(
+            (r) =>
+              r.channel_type === args.channel_type &&
+              r.external_id === args.external_id,
           );
+          if (matches.length === 0) return null;
+          const activeMatches = matches.filter((r) => r.active);
+          if (activeMatches.length === 0) return matches[0]!;
+          if (activeMatches.length > 1) {
+            const { TypedError } = await import('@/lib/utils.js');
+            throw new TypedError(
+              'channel_resolution_failed',
+              'channel ownership ambiguous: multiple active channels match (channel_type, external_id)',
+              {
+                channel_type: args.channel_type,
+                external_id: args.external_id,
+                resolver_path: 'ambiguous_active_channels',
+                conflicting_tenant_ids: activeMatches.map((r) => r.tenant_id),
+              },
+            );
+          }
+          return activeMatches[0]!;
         },
       ),
       listActive: vi.fn(async () => {
@@ -209,6 +226,125 @@ describe('channelsRepo', () => {
         });
         expect(found).not.toBeNull();
         expect(found!.tenant_id).toBe('tenant-a'); // não filtrou
+      },
+    );
+  });
+
+  // [Codex review #277] HIGH: lookup deterministicamente prefere ACTIVE quando
+  // dois tenants têm o mesmo (channel_type, external_id) — caso real é tenant
+  // antigo deactivated antes do tenant novo claim. Antes (limit(1) sem ordem)
+  // podia retornar o inactive → resolver rejeita mensagem do tenant ativo.
+  it('findByExternalCrossTenant prefere row active quando há 2 tenants com mesmo (channel_type, external_id) — um active, um inactive', async () => {
+    // tenant-a: cria, depois desativa o canal (tenant antigo).
+    await runWithTenantContext(
+      { tenant_id: 'tenant-a', agent_id: 'agent-a' },
+      async () => {
+        const { channelsRepo } = await import('@/db/repositories.js');
+        const row = await channelsRepo.create({
+          external_id: 'reclaimed-num',
+          channel_type: 'whatsapp',
+        });
+        await channelsRepo.deactivate(row.id);
+      },
+    );
+    // tenant-b: claim do mesmo external_id (tenant novo, active=true).
+    await runWithTenantContext(
+      { tenant_id: 'tenant-b', agent_id: 'agent-b' },
+      async () => {
+        const { channelsRepo } = await import('@/db/repositories.js');
+        await channelsRepo.create({
+          external_id: 'reclaimed-num',
+          channel_type: 'whatsapp',
+        });
+      },
+    );
+
+    // Resolver consulta: deve retornar tenant-b (active), não tenant-a (inactive).
+    await runWithTenantContext(
+      { tenant_id: 'tenant-c', agent_id: 'agent-c' },
+      async () => {
+        const { channelsRepo } = await import('@/db/repositories.js');
+        const found = await channelsRepo.findByExternalCrossTenant({
+          channel_type: 'whatsapp',
+          external_id: 'reclaimed-num',
+        });
+        expect(found).not.toBeNull();
+        expect(found!.tenant_id).toBe('tenant-b');
+        expect(found!.active).toBe(true);
+      },
+    );
+  });
+
+  // [Codex review #277] HIGH: 2+ active rows com mesmo (channel_type,
+  // external_id) é ambíguo → fail-loud. Operador deve desativar um lado.
+  it('findByExternalCrossTenant lança ambiguous_active_channels com 2 actives no mesmo (channel_type, external_id)', async () => {
+    await runWithTenantContext(
+      { tenant_id: 'tenant-a', agent_id: 'agent-a' },
+      async () => {
+        const { channelsRepo } = await import('@/db/repositories.js');
+        await channelsRepo.create({
+          external_id: 'ambiguous-num',
+          channel_type: 'whatsapp',
+        });
+      },
+    );
+    await runWithTenantContext(
+      { tenant_id: 'tenant-b', agent_id: 'agent-b' },
+      async () => {
+        const { channelsRepo } = await import('@/db/repositories.js');
+        await channelsRepo.create({
+          external_id: 'ambiguous-num',
+          channel_type: 'whatsapp',
+        });
+      },
+    );
+
+    await runWithTenantContext(
+      { tenant_id: 'tenant-c', agent_id: 'agent-c' },
+      async () => {
+        const { channelsRepo } = await import('@/db/repositories.js');
+        const { TypedError } = await import('@/lib/utils.js');
+        const promise = channelsRepo.findByExternalCrossTenant({
+          channel_type: 'whatsapp',
+          external_id: 'ambiguous-num',
+        });
+        await expect(promise).rejects.toBeInstanceOf(TypedError);
+        await expect(promise).rejects.toMatchObject({
+          code: 'channel_resolution_failed',
+          details: {
+            resolver_path: 'ambiguous_active_channels',
+            conflicting_tenant_ids: expect.arrayContaining(['tenant-a', 'tenant-b']),
+          },
+        });
+      },
+    );
+  });
+
+  // [Codex review #277] Quando nenhum match é active, retorna um inactive
+  // (preserva o signature found:true, active:false esperado pelo resolver).
+  it('findByExternalCrossTenant retorna row inactive quando nenhum match é active', async () => {
+    await runWithTenantContext(
+      { tenant_id: 'tenant-a', agent_id: 'agent-a' },
+      async () => {
+        const { channelsRepo } = await import('@/db/repositories.js');
+        const row = await channelsRepo.create({
+          external_id: 'all-inactive',
+          channel_type: 'whatsapp',
+        });
+        await channelsRepo.deactivate(row.id);
+      },
+    );
+
+    await runWithTenantContext(
+      { tenant_id: 'tenant-b', agent_id: 'agent-b' },
+      async () => {
+        const { channelsRepo } = await import('@/db/repositories.js');
+        const found = await channelsRepo.findByExternalCrossTenant({
+          channel_type: 'whatsapp',
+          external_id: 'all-inactive',
+        });
+        expect(found).not.toBeNull();
+        expect(found!.active).toBe(false);
       },
     );
   });

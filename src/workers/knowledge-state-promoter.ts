@@ -121,18 +121,90 @@ async function promote(args: {
         // mutators from PR #232). Without this wrapper the auto-
         // promoter would throw MissingTenantContextError on every
         // transition() against a rule. Same scope is used for non-rule
-        // kinds for consistency — the cognitive-module audit log path
-        // also benefits from a non-empty tenant context.
+        // kinds for consistency.
+        //
+        // Issue #255 — the per-row `runCognitiveModule` wrap ALSO lives
+        // inside the tenant-context. Audit-write paths
+        // (`cognitiveModuleLogRepo.record` and the runner's
+        // `tryGetCurrentContext`) require an ALS context to attribute the
+        // execution to the correct tenant/agent. Before this fix a single
+        // outer `runCognitiveModule` enclosed the whole batch loop, so its
+        // audit row landed under ('default','default') and an entire
+        // batch spanning N tenants was attributed to none of them. We now
+        // emit one `knowledge-state-machine.auto-promoter.row` audit per
+        // row, scoped to that row's tenant_id+agent_id. The cron tick
+        // still produces a single batch-level log line below
+        // ('knowledge_state_promoter.tick.done'), so operators retain a
+        // batch summary without the audit-attribution leak.
         await runWithTenantContext(
           { tenant_id: row.tenant_id, agent_id: row.agent_id },
-          () =>
-            KnowledgeStateMachine.transition({
-              kind,
-              proposal_id: row.id,
-              to: args.to,
-              reason: args.reason,
-              decided_by: args.decided_by,
-            }),
+          async () => {
+            // Issue #255 Codex review (MAJOR) — preserve error identity
+            // across the runCognitiveModule boundary. The runner catches
+            // the inner throw, classifies it as status='error'|'timeout',
+            // and DOES NOT re-throw — so by the time `rowResult.status`
+            // is observed the original Error object (e.g.
+            // `IllegalTransitionError` from a parallel-promote race) is
+            // unreachable. Without capturing it here, the outer catch's
+            // `err instanceof IllegalTransitionError` branch (used to
+            // mark benign races as debug-skip) becomes dead code and
+            // every race increments `stats.errors`.
+            //
+            // We close over `capturedError` inside the inner callback,
+            // assign the real thrown object there, and re-throw it after
+            // runCognitiveModule returns. Status='timeout' (no error
+            // ever thrown — the runner generated the 'timeout' message
+            // itself) falls back to a synthetic Error so audit
+            // attribution still lands and the outer catch logs it
+            // through the normal "transition_failed" path.
+            let capturedError: unknown = null;
+            const rowResult = await runCognitiveModule(
+              {
+                name: 'knowledge-state-machine.auto-promoter.row',
+                version: 'v1',
+                triggered_by: 'async_event',
+                // Per-row budget: each transition is a single
+                // findById+update round trip. 10s leaves comfortable
+                // headroom even on a contended DB while keeping the
+                // outer cron tick bounded (PER_TICK_LIMIT × KINDS ×
+                // promote steps × 10s would still finish well under the
+                // hourly cron interval).
+                timeoutMs: 10_000,
+                audit: true,
+              },
+              async () => {
+                try {
+                  return await KnowledgeStateMachine.transition({
+                    kind,
+                    proposal_id: row.id,
+                    to: args.to,
+                    reason: args.reason,
+                    decided_by: args.decided_by,
+                  });
+                } catch (err) {
+                  // Capture BEFORE the runner swallows the throw so the
+                  // outer catch can pattern-match on `IllegalTransitionError`
+                  // (parallel-promote race = benign) vs everything else.
+                  capturedError = err;
+                  throw err;
+                }
+              },
+            );
+            // Re-raise the original error if transition() threw — keeps
+            // IllegalTransitionError identity intact for the outer catch.
+            // Timeout case: runCognitiveModule synthesizes its own
+            // 'timeout' Error in the race; nothing was captured, so we
+            // surface a synthetic Error tagged with the timeout reason.
+            if (rowResult.status === 'error' || rowResult.status === 'timeout') {
+              if (capturedError !== null) {
+                throw capturedError;
+              }
+              throw new Error(
+                `auto_promoter_row_${rowResult.status}` +
+                  (rowResult.fallback_triggered ? ':fallback_triggered' : ''),
+              );
+            }
+          },
         );
         (args.stats[args.counterKey] as number)++;
       } catch (err) {
@@ -166,107 +238,116 @@ export async function runKnowledgeStatePromoter(): Promise<void> {
     return;
   }
 
-  const result = await runCognitiveModule(
-    {
-      name: 'knowledge-state-machine.auto-promoter',
-      version: 'v1',
-      triggered_by: 'async_event',
-      timeoutMs: 60_000,
-      audit: true,
-    },
-    async () => {
-      const stats: PromoteStats = {
-        ephemeral_to_observed: 0,
-        observed_to_reinforced: 0,
-        reinforced_to_verified: 0,
-        verified_to_active: 0,
-        ephemeral_to_deprecated: 0,
-        active_to_deprecated: 0,
-        errors: 0,
-      };
+  // Issue #255 — the outer `runCognitiveModule` wrap was removed: a
+  // single batch can span multiple tenants (listEligible returns rows
+  // from any tenant whose lifecycle_status matches), so there is no
+  // valid tenant_id/agent_id to attribute the batch-level cognitive log
+  // to. Before the fix, the outer wrap ran outside any
+  // `runWithTenantContext` and the audit row landed on
+  // ('default','default') — a metadata leak across tenants.
+  //
+  // The audit attribution now lives inside `promote()` per row, where
+  // the row's persisted tenant_id+agent_id are routed through ALS
+  // before `runCognitiveModule` calls `tryGetCurrentContext()`. The
+  // batch-level summary remains as a `logger.info` line below so
+  // operators still see "this tick did N things" without the leak.
+  const tickStart = Date.now();
+  const stats: PromoteStats = {
+    ephemeral_to_observed: 0,
+    observed_to_reinforced: 0,
+    reinforced_to_verified: 0,
+    verified_to_active: 0,
+    ephemeral_to_deprecated: 0,
+    active_to_deprecated: 0,
+    errors: 0,
+  };
 
-      const ageCutoff = (days: number) =>
-        new Date(Date.now() - days * ONE_DAY_MS);
+  const ageCutoff = (days: number) =>
+    new Date(Date.now() - days * ONE_DAY_MS);
 
-      // 1. ephemeral → observed (evidence_count >= 1 within last 24h)
-      await promote({
-        from: 'ephemeral',
-        to: 'observed',
-        filter: sql`evidence_count >= 1 AND updated_at >= ${ageCutoff(1)}`,
-        reason: 'evidence_threshold:1_in_24h',
-        decided_by: 'auto_promoter:evidence_threshold',
-        stats,
-        counterKey: 'ephemeral_to_observed',
-      });
+  try {
+    // 1. ephemeral → observed (evidence_count >= 1 within last 24h)
+    await promote({
+      from: 'ephemeral',
+      to: 'observed',
+      filter: sql`evidence_count >= 1 AND updated_at >= ${ageCutoff(1)}`,
+      reason: 'evidence_threshold:1_in_24h',
+      decided_by: 'auto_promoter:evidence_threshold',
+      stats,
+      counterKey: 'ephemeral_to_observed',
+    });
 
-      // 2. observed → reinforced (evidence_count >= 3 within 30d)
-      await promote({
-        from: 'observed',
-        to: 'reinforced',
-        filter: sql`evidence_count >= 3 AND updated_at >= ${ageCutoff(30)}`,
-        reason: 'evidence_threshold:3_in_30d',
-        decided_by: 'auto_promoter:evidence_threshold',
-        stats,
-        counterKey: 'observed_to_reinforced',
-      });
+    // 2. observed → reinforced (evidence_count >= 3 within 30d)
+    await promote({
+      from: 'observed',
+      to: 'reinforced',
+      filter: sql`evidence_count >= 3 AND updated_at >= ${ageCutoff(30)}`,
+      reason: 'evidence_threshold:3_in_30d',
+      decided_by: 'auto_promoter:evidence_threshold',
+      stats,
+      counterKey: 'observed_to_reinforced',
+    });
 
-      // 3. reinforced → verified (evidence_count >= 7 within 90d)
-      await promote({
-        from: 'reinforced',
-        to: 'verified',
-        filter: sql`evidence_count >= 7 AND updated_at >= ${ageCutoff(90)}`,
-        reason: 'evidence_threshold:7_in_90d',
-        decided_by: 'auto_promoter:evidence_threshold',
-        stats,
-        counterKey: 'reinforced_to_verified',
-      });
+    // 3. reinforced → verified (evidence_count >= 7 within 90d)
+    await promote({
+      from: 'reinforced',
+      to: 'verified',
+      filter: sql`evidence_count >= 7 AND updated_at >= ${ageCutoff(90)}`,
+      reason: 'evidence_threshold:7_in_90d',
+      decided_by: 'auto_promoter:evidence_threshold',
+      stats,
+      counterKey: 'reinforced_to_verified',
+    });
 
-      // 4. verified → active (conf>=0.9, evidence>=10 — conservative maturity)
-      //    Per-table predicate: facts/rules store confidence as
-      //    `confianca` (numeric(3,2)), memories/hints as `confidence`
-      //    (numeric(4,3)). Referencing both in a single COALESCE
-      //    raises "column does not exist" on PostgreSQL (review #104).
-      await promote({
-        from: 'verified',
-        to: 'active',
-        filter: (kind) => maturityFilter(kind, 0.9, 10),
-        reason: 'maturity_threshold:conf_0.9_evidence_10',
-        decided_by: 'auto_promoter:maturity_threshold',
-        stats,
-        counterKey: 'verified_to_active',
-      });
+    // 4. verified → active (conf>=0.9, evidence>=10 — conservative maturity)
+    //    Per-table predicate: facts/rules store confidence as
+    //    `confianca` (numeric(3,2)), memories/hints as `confidence`
+    //    (numeric(4,3)). Referencing both in a single COALESCE
+    //    raises "column does not exist" on PostgreSQL (review #104).
+    await promote({
+      from: 'verified',
+      to: 'active',
+      filter: (kind) => maturityFilter(kind, 0.9, 10),
+      reason: 'maturity_threshold:conf_0.9_evidence_10',
+      decided_by: 'auto_promoter:maturity_threshold',
+      stats,
+      counterKey: 'verified_to_active',
+    });
 
-      // 5. ephemeral → deprecated (TTL: 30d without updated_at refresh)
-      await promote({
-        from: 'ephemeral',
-        to: 'deprecated',
-        filter: sql`updated_at < ${ageCutoff(30)}`,
-        reason: 'ttl_expired:30d_no_update',
-        decided_by: 'auto_promoter:ttl_expired',
-        stats,
-        counterKey: 'ephemeral_to_deprecated',
-      });
+    // 5. ephemeral → deprecated (TTL: 30d without updated_at refresh)
+    await promote({
+      from: 'ephemeral',
+      to: 'deprecated',
+      filter: sql`updated_at < ${ageCutoff(30)}`,
+      reason: 'ttl_expired:30d_no_update',
+      decided_by: 'auto_promoter:ttl_expired',
+      stats,
+      counterKey: 'ephemeral_to_deprecated',
+    });
 
-      // 6. active → deprecated (90d no usage; uses last_recall_at, falls
-      //    back to updated_at when null — matches master §5.1).
-      await promote({
-        from: 'active',
-        to: 'deprecated',
-        filter: sql`COALESCE(last_recall_at, updated_at) < ${ageCutoff(90)}`,
-        reason: 'no_usage_90d',
-        decided_by: 'auto_promoter:no_usage_90d',
-        stats,
-        counterKey: 'active_to_deprecated',
-      });
+    // 6. active → deprecated (90d no usage; uses last_recall_at, falls
+    //    back to updated_at when null — matches master §5.1).
+    await promote({
+      from: 'active',
+      to: 'deprecated',
+      filter: sql`COALESCE(last_recall_at, updated_at) < ${ageCutoff(90)}`,
+      reason: 'no_usage_90d',
+      decided_by: 'auto_promoter:no_usage_90d',
+      stats,
+      counterKey: 'active_to_deprecated',
+    });
 
-      logger.info(stats, 'knowledge_state_promoter.tick.done');
-      return stats;
-    },
-  );
-
-  if (result.status === 'error' || result.status === 'timeout') {
-    logger.warn(
-      { status: result.status, latency_ms: result.latency_ms },
+    logger.info(
+      { ...stats, latency_ms: Date.now() - tickStart },
+      'knowledge_state_promoter.tick.done',
+    );
+  } catch (err) {
+    // Unexpected throw at the batch level — individual promote() calls
+    // already swallow per-row errors and increment stats.errors. Surface
+    // anything that escapes (e.g. listEligible at the outer promote()
+    // failing in an unexpected way) so the cron tick stays visible.
+    logger.error(
+      { err: (err as Error).message, ...stats, latency_ms: Date.now() - tickStart },
       'knowledge_state_promoter.tick.degraded',
     );
   }

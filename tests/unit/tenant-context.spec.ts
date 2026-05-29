@@ -1,12 +1,25 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+const { incCounterMock } = vi.hoisted(() => ({ incCounterMock: vi.fn() }));
+vi.mock('../../src/lib/metrics.js', () => ({
+  incCounter: incCounterMock,
+}));
+
 import {
   runWithTenantContext,
   getCurrentTenant,
   getCurrentAgent,
+  tryGetCurrentContext,
   MissingTenantContextError,
+  DefaultLiteralRejectedError,
 } from '@/db/tenant-context.js';
 
 describe('tenant-context', () => {
+  beforeEach(() => {
+    incCounterMock.mockReset();
+    delete process.env.MAIA_REJECT_DEFAULT_LITERAL;
+  });
+
   it('runWithTenantContext propaga tenant_id e agent_id', async () => {
     let captured = { t: '', a: '' };
     await runWithTenantContext({ tenant_id: 'acme', agent_id: 'sofia' }, async () => {
@@ -26,6 +39,252 @@ describe('tenant-context', () => {
         expect(getCurrentTenant()).toBe('inner');
       });
       expect(getCurrentTenant()).toBe('outer');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // PR #272 / #269 review (Codex reval): fail-closed when ALS carries
+  // malformed context — empty string, null, undefined, non-string.
+  // Previously the accessors returned the raw value, letting downstream
+  // queries scope by an empty tenant_id and (worst case) leak rows across
+  // tenants. Sem essa guarda, holidays-cache (#263) geraria keys malformadas
+  // (`holidays:v2:A::entidade:2026:standard`) que colidem silenciosamente
+  // entre contextos quebrados.
+  // -------------------------------------------------------------------------
+  describe('PR #272 / #269 — truthy validation of ctx.tenant_id / ctx.agent_id', () => {
+    it('getCurrentTenant lança quando tenant_id é string vazia', async () => {
+      await runWithTenantContext({ tenant_id: '', agent_id: 'sofia' }, async () => {
+        expect(() => getCurrentTenant()).toThrow(MissingTenantContextError);
+      });
+    });
+
+    it('getCurrentTenant lança quando tenant_id é null', async () => {
+      await runWithTenantContext(
+        { tenant_id: null as unknown as string, agent_id: 'sofia' },
+        async () => {
+          expect(() => getCurrentTenant()).toThrow(MissingTenantContextError);
+        },
+      );
+    });
+
+    it('getCurrentTenant lança quando tenant_id é undefined', async () => {
+      await runWithTenantContext(
+        { tenant_id: undefined as unknown as string, agent_id: 'sofia' },
+        async () => {
+          expect(() => getCurrentTenant()).toThrow(MissingTenantContextError);
+        },
+      );
+    });
+
+    it('getCurrentAgent lança quando agent_id é string vazia', async () => {
+      await runWithTenantContext({ tenant_id: 'acme', agent_id: '' }, async () => {
+        expect(() => getCurrentAgent()).toThrow(MissingTenantContextError);
+      });
+    });
+
+    it('getCurrentAgent lança quando agent_id é null', async () => {
+      await runWithTenantContext(
+        { tenant_id: 'acme', agent_id: null as unknown as string },
+        async () => {
+          expect(() => getCurrentAgent()).toThrow(MissingTenantContextError);
+        },
+      );
+    });
+
+    it('MissingTenantContextError preserva código estável e mensagem com razão', async () => {
+      await runWithTenantContext({ tenant_id: '', agent_id: 'sofia' }, async () => {
+        try {
+          getCurrentTenant();
+          throw new Error('expected throw');
+        } catch (err) {
+          expect(err).toBeInstanceOf(MissingTenantContextError);
+          expect((err as MissingTenantContextError).code).toBe('MISSING_TENANT_CONTEXT');
+          expect((err as Error).message).toMatch(/tenant_id is empty/);
+        }
+      });
+    });
+
+    it('tryGetCurrentContext retorna null quando ctx é malformado', async () => {
+      // Callers que escolheram a variante "try" também não devem receber
+      // contexto meio populado — força o mesmo code path que ALS ausente.
+      await runWithTenantContext({ tenant_id: '', agent_id: 'sofia' }, async () => {
+        expect(tryGetCurrentContext()).toBeNull();
+      });
+      await runWithTenantContext({ tenant_id: 'acme', agent_id: '' }, async () => {
+        expect(tryGetCurrentContext()).toBeNull();
+      });
+      await runWithTenantContext(
+        { tenant_id: null as unknown as string, agent_id: null as unknown as string },
+        async () => {
+          expect(tryGetCurrentContext()).toBeNull();
+        },
+      );
+    });
+
+    it('tryGetCurrentContext retorna ctx quando ambos os campos são truthy', async () => {
+      await runWithTenantContext({ tenant_id: 'acme', agent_id: 'sofia' }, async () => {
+        expect(tryGetCurrentContext()).toEqual({ tenant_id: 'acme', agent_id: 'sofia' });
+      });
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // PR #272 reval (Codex) — whitespace-only IDs convergente com issue #283.
+  // Strings tipo `'   '` ou `'\t'` passam o check truthy mas geram namespace
+  // anômalo determinístico — colisão silenciosa entre contextos malformados.
+  // Overlap consciente com PR #293 (fix central também rejeita whitespace).
+  // -------------------------------------------------------------------------
+  describe('PR #272 reval / #283 — whitespace-only tenant_id / agent_id', () => {
+    it('getCurrentTenant lança quando tenant_id é whitespace-only', async () => {
+      await runWithTenantContext({ tenant_id: '   ', agent_id: 'sofia' }, async () => {
+        expect(() => getCurrentTenant()).toThrow(MissingTenantContextError);
+      });
+    });
+
+    it('getCurrentTenant lança quando tenant_id é tab/newline only', async () => {
+      await runWithTenantContext({ tenant_id: '\t\n', agent_id: 'sofia' }, async () => {
+        expect(() => getCurrentTenant()).toThrow(MissingTenantContextError);
+      });
+    });
+
+    it('getCurrentAgent lança quando agent_id é whitespace-only', async () => {
+      await runWithTenantContext({ tenant_id: 'acme', agent_id: '   ' }, async () => {
+        expect(() => getCurrentAgent()).toThrow(MissingTenantContextError);
+      });
+    });
+
+    it('getCurrentAgent lança quando agent_id é tab/newline only', async () => {
+      await runWithTenantContext({ tenant_id: 'acme', agent_id: '\t\n' }, async () => {
+        expect(() => getCurrentAgent()).toThrow(MissingTenantContextError);
+      });
+    });
+
+    it('tryGetCurrentContext retorna null quando tenant_id é whitespace-only', async () => {
+      await runWithTenantContext({ tenant_id: '   ', agent_id: 'sofia' }, async () => {
+        expect(tryGetCurrentContext()).toBeNull();
+      });
+    });
+
+    it('tryGetCurrentContext retorna null quando agent_id é whitespace-only', async () => {
+      await runWithTenantContext({ tenant_id: 'acme', agent_id: '\t' }, async () => {
+        expect(tryGetCurrentContext()).toBeNull();
+      });
+    });
+
+    it('mensagem de erro distingue empty vs whitespace para debugging', async () => {
+      await runWithTenantContext({ tenant_id: '   ', agent_id: 'sofia' }, async () => {
+        try {
+          getCurrentTenant();
+          throw new Error('expected throw');
+        } catch (err) {
+          expect(err).toBeInstanceOf(MissingTenantContextError);
+          expect((err as Error).message).toMatch(/whitespace-only/);
+        }
+      });
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Issue #282 — literal 'default' rejection
+  //
+  // Layered defense against silent synthetic-context leak from the legacy
+  // sentinel `{tenant_id:'default', agent_id:'default'}`. Default mode meters
+  // (warn+counter); opt-in `MAIA_REJECT_DEFAULT_LITERAL=true` promotes to
+  // a hard throw once every legacy path is migrated.
+  // -------------------------------------------------------------------------
+  describe('issue #282 — literal "default" rejection', () => {
+    it('default mode: literal "default" tenant_id increments metric but does NOT throw', async () => {
+      let observed: string | null = null;
+      await runWithTenantContext({ tenant_id: 'default', agent_id: 'sofia' }, async () => {
+        observed = getCurrentTenant();
+      });
+      expect(observed).toBe('default');
+      expect(incCounterMock).toHaveBeenCalledWith(
+        'maia_tenant_id_default_literal_total',
+        expect.objectContaining({ field: 'tenant_id' }),
+      );
+    });
+
+    it('default mode: literal "default" agent_id increments metric but does NOT throw', async () => {
+      let observed: string | null = null;
+      await runWithTenantContext({ tenant_id: 'acme', agent_id: 'default' }, async () => {
+        observed = getCurrentAgent();
+      });
+      expect(observed).toBe('default');
+      expect(incCounterMock).toHaveBeenCalledWith(
+        'maia_tenant_id_default_literal_total',
+        expect.objectContaining({ field: 'agent_id' }),
+      );
+    });
+
+    it('opt-in mode (MAIA_REJECT_DEFAULT_LITERAL=true): tenant_id="default" throws DefaultLiteralRejectedError', async () => {
+      process.env.MAIA_REJECT_DEFAULT_LITERAL = 'true';
+      await expect(
+        runWithTenantContext({ tenant_id: 'default', agent_id: 'sofia' }, async () => {
+          getCurrentTenant();
+        }),
+      ).rejects.toThrow(DefaultLiteralRejectedError);
+    });
+
+    it('opt-in mode: agent_id="default" throws DefaultLiteralRejectedError', async () => {
+      process.env.MAIA_REJECT_DEFAULT_LITERAL = 'true';
+      await expect(
+        runWithTenantContext({ tenant_id: 'acme', agent_id: 'default' }, async () => {
+          getCurrentAgent();
+        }),
+      ).rejects.toThrow(DefaultLiteralRejectedError);
+    });
+
+    it('opt-in mode: thrown error has stable code TENANT_ID_DEFAULT_LITERAL_REJECTED', async () => {
+      process.env.MAIA_REJECT_DEFAULT_LITERAL = 'true';
+      try {
+        await runWithTenantContext({ tenant_id: 'default', agent_id: 'sofia' }, async () => {
+          getCurrentTenant();
+        });
+        throw new Error('should have thrown');
+      } catch (e) {
+        expect(e).toBeInstanceOf(DefaultLiteralRejectedError);
+        expect((e as DefaultLiteralRejectedError).code).toBe('TENANT_ID_DEFAULT_LITERAL_REJECTED');
+      }
+    });
+
+    it('opt-in mode: throw only fires on default literal, not other tenant_ids', async () => {
+      process.env.MAIA_REJECT_DEFAULT_LITERAL = 'true';
+      let observed: string | null = null;
+      await runWithTenantContext({ tenant_id: 'acme', agent_id: 'sofia' }, async () => {
+        observed = getCurrentTenant();
+      });
+      expect(observed).toBe('acme');
+      expect(incCounterMock).not.toHaveBeenCalled();
+    });
+
+    it('tryGetCurrentContext meters literal "default" but still returns the context', async () => {
+      let observed: ReturnType<typeof tryGetCurrentContext> | undefined;
+      await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+        observed = tryGetCurrentContext();
+      });
+      expect(observed).toEqual({ tenant_id: 'default', agent_id: 'default' });
+      // Both fields are 'default', so the counter should be incremented for both.
+      const calls = incCounterMock.mock.calls.filter(
+        (c) => c[0] === 'maia_tenant_id_default_literal_total',
+      );
+      expect(calls.length).toBeGreaterThanOrEqual(2);
+      expect(calls.every((c) => c[1]?.via === 'tryGetCurrentContext')).toBe(true);
+    });
+
+    it('flag is read at access time, not module-load time', async () => {
+      // Start without flag — must not throw.
+      delete process.env.MAIA_REJECT_DEFAULT_LITERAL;
+      await runWithTenantContext({ tenant_id: 'default', agent_id: 'sofia' }, async () => {
+        expect(getCurrentTenant()).toBe('default');
+      });
+      // Flip flag mid-process — must throw on next access.
+      process.env.MAIA_REJECT_DEFAULT_LITERAL = 'true';
+      await expect(
+        runWithTenantContext({ tenant_id: 'default', agent_id: 'sofia' }, async () => {
+          getCurrentTenant();
+        }),
+      ).rejects.toThrow(DefaultLiteralRejectedError);
     });
   });
 });

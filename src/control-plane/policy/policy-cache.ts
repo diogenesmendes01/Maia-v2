@@ -8,8 +8,45 @@
  *   - TTL (default 5min) via stored `expireAt` per entry
  *   - LRU eviction when size > max_entries (default 10_000)
  *   - Negative caching: `'unresolved'` stored to avoid repeated DB misses
- *   - Redis pub/sub subscription on POLICY_LIFECYCLE_CHANNEL invalidates
- *     entries matching {tenant_id, agent_id, descriptor}
+ *   - Redis pub/sub explicit per-tenant SUBSCRIBE on
+ *     `policy_rule_lifecycle:{tenant_id}` — see #249.
+ *
+ * Why explicit per-tenant SUBSCRIBE (NOT PSUBSCRIBE wildcard) — issue #249
+ * Codex round-2 verdict:
+ *   - `PSUBSCRIBE policy_rule_lifecycle:*` made every subscriber receive
+ *     events from every tenant. Even with a payload-tenant guard in the
+ *     handler, the BROKER was still delivering cross-tenant payloads —
+ *     defense-in-depth ≠ isolation. The CRITICAL bar for #249 is broker-
+ *     side routing isolation, not handler-level filtering.
+ *   - Fix: use explicit `SUBSCRIBE policy_rule_lifecycle:<tenantId>` for
+ *     each tenant this cache instance actually serves. Redis then ONLY
+ *     delivers messages for the tenants this process has subscribed to.
+ *
+ * Subscriber lifecycle — LAZY per-tenant subscribe:
+ *   - At process boot the subscriber connects to Redis but has NO active
+ *     subscriptions. The cache has no entries; nothing to invalidate.
+ *   - On the first cache write for a tenant (positive set() OR negative
+ *     setUnresolved()), `ensureTenantSubscribed(tenant_id)` issues a
+ *     `SUBSCRIBE policy_rule_lifecycle:<tenant_id>` exactly once per
+ *     (process, tenant_id). Subsequent writes are O(1) — a Set membership
+ *     check.
+ *   - Why lazy: tenants aren't declared at boot; a process serves any
+ *     tenant whose request lands on it. Boot-time enumeration would either
+ *     subscribe to ALL tenants (defeats isolation when the DB lists more
+ *     tenants than this process actually serves) or miss tenants
+ *     onboarded after boot. Lazy subscribe ties the subscription set
+ *     exactly to the cache's working set.
+ *   - Unsubscribe-on-eviction is deliberately NOT implemented: a tenant
+ *     evicted from the cache could be re-touched milliseconds later, and
+ *     SUBSCRIBE/UNSUBSCRIBE churn is more expensive than holding O(K)
+ *     idle subscriptions in steady state.
+ *
+ * Handler still cross-checks channel-tenant vs payload-tenant for
+ * defense-in-depth against (a) a publisher bug that built an event in
+ * tenant-A context but somehow published on tenant-B's channel, or (b) a
+ * Redis ACL misconfiguration. With explicit SUBSCRIBE the broker no
+ * longer delivers cross-tenant payloads on the happy path, so this guard
+ * is a safety net rather than the primary isolation mechanism.
  *
  * Failure mode: if Redis is down, TTL natural expiry bounds staleness to
  * `ttl_ms`. Strict read-after-write for hard_limit policies lives in P9d.
@@ -22,7 +59,11 @@ import type {
   ResolvedPolicy,
   PolicyLifecycleEvent,
 } from './types.js';
-import { POLICY_LIFECYCLE_CHANNEL } from './policy-rules-repo.js';
+import {
+  POLICY_LIFECYCLE_CHANNEL,
+  buildPolicyLifecycleChannel,
+  parsePolicyLifecycleChannel,
+} from './policy-rules-repo.js';
 
 export interface CacheKey {
   tenant_id: string;
@@ -106,10 +147,29 @@ function invalidationPrefix(
 export interface PolicyCacheConfig {
   ttl_ms: number;
   max_entries: number;
+  /**
+   * Issue #249: called the first time the cache writes an entry for a
+   * tenant_id this instance has not seen yet. The subscriber wiring uses
+   * this hook to fire `SUBSCRIBE policy_rule_lifecycle:<tenant_id>` so
+   * that the broker only delivers events for tenants this cache holds.
+   *
+   * Errors thrown by the hook are caught and logged — they MUST NOT
+   * propagate into the write path. A failed subscribe just means TTL
+   * natural expiry handles staleness for that tenant.
+   *
+   * Optional: tests can construct caches without the hook (no Redis).
+   */
+  onTenantTouched?: (tenant_id: string) => void;
 }
 
 export class PolicyResolverCacheImpl implements PolicyResolverCache {
   private readonly store = new Map<string, CacheEntry>();
+  /**
+   * Issue #249: tenants this cache has written at least one entry for.
+   * Drives lazy per-tenant SUBSCRIBE — see file header. Held in memory
+   * only; on process restart the next write re-triggers subscription.
+   */
+  private readonly subscribedTenants = new Set<string>();
   private head: string | null = null; // least-recent
   private tail: string | null = null; // most-recent
   private hits = 0;
@@ -140,10 +200,43 @@ export class PolicyResolverCacheImpl implements PolicyResolverCache {
 
   set(key: CacheKey, value: ResolvedPolicy): void {
     this.put(cacheKeyHash(key), value);
+    this.notifyTenantTouched(key.tenant_id);
   }
 
   setUnresolved(key: CacheKey): void {
     this.put(cacheKeyHash(key), 'unresolved');
+    this.notifyTenantTouched(key.tenant_id);
+  }
+
+  /**
+   * Issue #249: first-write hook into the lazy subscriber. Fires
+   * `onTenantTouched` exactly once per (cache instance, tenant_id) so the
+   * Redis subscriber can `SUBSCRIBE policy_rule_lifecycle:<tenant_id>`.
+   *
+   * Errors are swallowed — a failed subscribe just means TTL natural
+   * expiry handles staleness for that tenant. We do NOT want a Redis
+   * blip to take down the cache write path.
+   */
+  private notifyTenantTouched(tenant_id: string): void {
+    if (this.subscribedTenants.has(tenant_id)) return;
+    this.subscribedTenants.add(tenant_id);
+    const hook = this.cfg.onTenantTouched;
+    if (!hook) return;
+    try {
+      hook(tenant_id);
+    } catch (err) {
+      // Best-effort: log if a logger is available; never throw.
+      try {
+        // Lazy logger import would create a cycle here; we re-use the
+        // already-imported `logger`.
+        logger.warn(
+          { err: (err as Error).message, tenant_id },
+          'policy_cache.on_tenant_touched_hook_failed',
+        );
+      } catch {
+        // No-op: best-effort.
+      }
+    }
   }
 
   invalidate(args: {
@@ -280,13 +373,31 @@ export class PolicyResolverCacheImpl implements PolicyResolverCache {
  *
  * Tests should construct a fresh PolicyResolverCacheImpl directly
  * (no Redis) to avoid sharing state across specs.
+ *
+ * Issue #249: the singleton's `onTenantTouched` hook is wired by
+ * `startPolicyCacheInvalidationSubscriber()` once the Redis client is
+ * up. Until then writes still record the tenant locally; the subscribe
+ * call happens at startup time when the hook is wired, then again on
+ * each new tenant touched after startup.
  */
+let pendingSubscribe: ((tenant_id: string) => void) | null = null;
+
 export const policyResolverCache: PolicyResolverCache = new PolicyResolverCacheImpl({
   ttl_ms: config.POLICY_RESOLVER_CACHE_TTL_MS,
   max_entries: config.POLICY_RESOLVER_CACHE_MAX_ENTRIES,
+  onTenantTouched: (tenant_id: string) => {
+    // Delegate to whatever wire-up the subscriber installed. If the
+    // subscriber is not started yet (feature flag OFF, or pre-boot
+    // imports), this is a no-op — the cache still records the tenant
+    // so a later wire-up can replay if we choose.
+    pendingSubscribe?.(tenant_id);
+  },
 });
 
 let subscriberStarted = false;
+/** Tenants this process has SUBSCRIBED to. Mirrored from the cache for
+ * test inspection; production source of truth is the cache instance. */
+const subscribedTenantsForTest = new Set<string>();
 
 /**
  * Pure handler: parses a Redis pub/sub message and invalidates the given
@@ -298,26 +409,72 @@ let subscriberStarted = false;
  * that "Redis publish invalidates cache" was the publish branch, never
  * the subscribe branch. This indirection lets a unit test exercise the
  * full publish-payload → cache-invalidate path.
+ *
+ * Issue #249 (per-tenant channel): two NEW invariants enforced here.
+ *   1. Channel name MUST match the per-tenant shape
+ *      `policy_rule_lifecycle:{tenant_id}`. A message on the bare legacy
+ *      channel `policy_rule_lifecycle` (no `:tenant`) is dropped — only a
+ *      misconfigured publisher would emit it, and we'd rather miss an
+ *      invalidation (TTL kicks in) than process an event we cannot tenant-
+ *      attribute.
+ *   2. The channel-derived tenant_id MUST equal `payload.tenant_id`. A
+ *      mismatch means either (a) ALS leaked at publish time, or (b) a
+ *      bad actor tried to smuggle a foreign payload onto a tenant's
+ *      channel. Either way the message is dropped with a warn log.
+ *
+ * Backwards-compat: the legacy parameter name `channel` still accepts the
+ * Redis-delivered channel string. Explicit SUBSCRIBE callers fire
+ * `message` with `(channel, payload)` — see `startPolicyCacheInvalidationSubscriber`.
+ * The `pmessage` path used by the old PSUBSCRIBE wildcard is gone.
  */
 export function handlePolicyLifecycleMessage(
   channel: string,
   msg: string,
   cache: PolicyResolverCache = policyResolverCache,
 ): void {
-  if (channel !== POLICY_LIFECYCLE_CHANNEL) return;
+  const channelTenant = parsePolicyLifecycleChannel(channel);
+  if (channelTenant === null) {
+    // Either the legacy bare-name channel (`policy_rule_lifecycle` with
+    // no tenant suffix) or an unrelated channel. Drop silently for
+    // unrelated channels; warn for the legacy shape to surface stragglers.
+    if (channel === POLICY_LIFECYCLE_CHANNEL) {
+      logger.warn(
+        { channel },
+        'policy_cache.legacy_global_channel_ignored_issue_249',
+      );
+    }
+    return;
+  }
+  let evt: PolicyLifecycleEvent;
   try {
-    const evt = JSON.parse(msg) as PolicyLifecycleEvent;
-    cache.invalidate({
-      tenant_id: evt.tenant_id,
-      agent_id: evt.agent_id,
-      descriptor: evt.descriptor,
-    });
+    evt = JSON.parse(msg) as PolicyLifecycleEvent;
   } catch (err) {
     logger.warn(
-      { err: (err as Error).message, msg },
+      { err: (err as Error).message, msg, channel },
       'policy_cache.invalid_event_payload',
     );
+    return;
   }
+  if (!evt || typeof evt !== 'object' || typeof evt.tenant_id !== 'string') {
+    logger.warn({ msg, channel }, 'policy_cache.event_payload_missing_tenant');
+    return;
+  }
+  if (evt.tenant_id !== channelTenant) {
+    // Defense-in-depth: a publisher that built its event in tenant-A
+    // context but somehow published on tenant-B's channel is a bug
+    // worth surfacing — and we MUST NOT invalidate tenant-A entries
+    // based on the channel routing. Drop and log.
+    logger.warn(
+      { channel, channelTenant, payloadTenant: evt.tenant_id },
+      'policy_cache.channel_payload_tenant_mismatch_dropped',
+    );
+    return;
+  }
+  cache.invalidate({
+    tenant_id: evt.tenant_id,
+    agent_id: evt.agent_id,
+    descriptor: evt.descriptor,
+  });
 }
 
 /**
@@ -326,8 +483,24 @@ export function handlePolicyLifecycleMessage(
  * caches still expire naturally via TTL.
  *
  * Wired from src/index.ts startup when FEATURE_POLICY_RESOLVER_V1 is on.
+ *
+ * Issue #249 (Codex round-2 verdict): uses explicit
+ * `SUBSCRIBE policy_rule_lifecycle:<tenant_id>` per tenant this cache
+ * actually touches. The previous PSUBSCRIBE wildcard let the BROKER
+ * deliver events for every tenant to every subscriber, defeating the
+ * isolation goal — the handler's payload guard was defense-in-depth, not
+ * isolation. The cache's `onTenantTouched` hook fires the SUBSCRIBE call
+ * lazily on first write per (process, tenant) so the subscription set
+ * tracks the cache's actual working set.
+ *
+ * The broker delivers `message` events with `(channel, message)` for an
+ * explicit subscriber; we forward to `handlePolicyLifecycleMessage`
+ * which still cross-checks channel-tenant vs payload-tenant for
+ * defense-in-depth.
  */
-export function startPolicyCacheInvalidationSubscriber(): void {
+export function startPolicyCacheInvalidationSubscriber(
+  cache: PolicyResolverCache = policyResolverCache,
+): void {
   if (subscriberStarted) return;
   subscriberStarted = true;
   const sub = new IORedis(config.REDIS_URL, {
@@ -341,17 +514,41 @@ export function startPolicyCacheInvalidationSubscriber(): void {
   sub.connect().catch((err) => {
     logger.warn({ err: (err as Error).message }, 'policy_cache.subscribe_connect_failed');
   });
-  void sub.subscribe(POLICY_LIFECYCLE_CHANNEL, (err) => {
-    if (err) {
-      logger.warn(
-        { err: err.message },
-        'policy_cache.subscribe_failed_natural_ttl_only',
-      );
-    }
-  });
   sub.on('message', (channel, msg) => {
-    handlePolicyLifecycleMessage(channel, msg);
+    handlePolicyLifecycleMessage(channel, msg, cache);
   });
+
+  // Wire the lazy hook: on each new tenant touched by the cache, issue
+  // an explicit per-tenant SUBSCRIBE. Idempotency is enforced by the
+  // cache's `subscribedTenants` Set (the hook fires once per tenant).
+  pendingSubscribe = (tenant_id: string): void => {
+    let channel: string;
+    try {
+      channel = buildPolicyLifecycleChannel(tenant_id);
+    } catch (err) {
+      // Defensive: an empty/whitespace tenant_id reaching the cache is a
+      // programmer error elsewhere. Don't crash the cache write path.
+      logger.warn(
+        { err: (err as Error).message, tenant_id },
+        'policy_cache.subscribe_build_channel_failed',
+      );
+      return;
+    }
+    subscribedTenantsForTest.add(tenant_id);
+    void sub.subscribe(channel, (err, count) => {
+      if (err) {
+        logger.warn(
+          { err: err.message, channel, tenant_id },
+          'policy_cache.subscribe_failed_natural_ttl_only',
+        );
+        return;
+      }
+      logger.info(
+        { channel, tenant_id, active_subscriptions: count },
+        'policy_cache.tenant_channel_subscribed_issue_249',
+      );
+    });
+  };
 }
 
 /**
@@ -361,4 +558,16 @@ export function startPolicyCacheInvalidationSubscriber(): void {
  */
 export function _resetPolicyCacheSubscriberStartedFlag(): void {
   subscriberStarted = false;
+  pendingSubscribe = null;
+  subscribedTenantsForTest.clear();
+}
+
+/**
+ * Test-only: inspect the tenant_ids this process has SUBSCRIBED to via
+ * the lazy per-tenant subscribe (issue #249). Asserting on this Set is
+ * how unit tests prove the cache narrows subscriptions to exactly the
+ * tenants it touches, never wildcards.
+ */
+export function _getSubscribedTenantsForTest(): ReadonlySet<string> {
+  return subscribedTenantsForTest;
 }
