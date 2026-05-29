@@ -42,7 +42,10 @@ import {
   getMemoryUsedRatio,
   parseInfoField,
   startRedisMemoryCollector,
+  isMemorySnapshotFresh,
   CRITICAL_MEMORY_USED_RATIO,
+  SNAPSHOT_STALENESS_INTERVALS,
+  DEFAULT_COLLECT_INTERVAL_MS,
   _resetForTests,
 } from '../../../src/observability/redis-memory-collector.js';
 import { renderPrometheus, _resetForTests as _resetMetrics } from '../../../src/lib/metrics.js';
@@ -393,5 +396,113 @@ describe('redis-memory-collector — getMemoryUsedRatio (readiness gate input)',
     handle.stop();
     await collectOnce();
     expect(getMemoryUsedRatio()).toBeGreaterThan(CRITICAL_MEMORY_USED_RATIO);
+  });
+});
+
+describe('redis-memory-collector — isMemorySnapshotFresh (fail-closed gate input)', () => {
+  beforeEach(() => {
+    _resetMetrics();
+    _resetForTests();
+    infoMock.mockReset();
+    loggerWarnMock.mockReset();
+  });
+
+  afterEach(() => {
+    _resetMetrics();
+    _resetForTests();
+  });
+
+  it('is NOT fresh on cold start before any collect (zero-initialized snapshot)', () => {
+    // No collect has run; the snapshot is a zero placeholder, so the readiness
+    // gate must treat it as unknown and fail closed.
+    expect(isMemorySnapshotFresh()).toBe(false);
+  });
+
+  it('becomes fresh after a successful collect (bounded Redis)', async () => {
+    infoMock.mockImplementation((section: string) => {
+      if (section === 'memory') return Promise.resolve(SAMPLE_MEMORY_INFO);
+      if (section === 'stats') return Promise.resolve(SAMPLE_STATS_INFO);
+      return Promise.resolve('');
+    });
+    const handle = startRedisMemoryCollector(60_000);
+    handle.stop();
+    await collectOnce();
+    expect(isMemorySnapshotFresh()).toBe(true);
+  });
+
+  it('is fresh after a genuine unbounded (maxmemory=0) reading — stays ready', async () => {
+    // The whole point of the fail-closed/freshness split: a real maxmemory=0
+    // reading IS a fresh observation (ratio 0 → ready), distinct from the
+    // never-collected cold-start 0 (not fresh → fail closed).
+    const unbounded = ['# Memory', 'used_memory:1000000', 'maxmemory:0', ''].join('\r\n');
+    infoMock.mockImplementation((section: string) =>
+      Promise.resolve(section === 'memory' ? unbounded : SAMPLE_STATS_INFO),
+    );
+    const handle = startRedisMemoryCollector(60_000);
+    handle.stop();
+    await collectOnce();
+    expect(getMemoryUsedRatio()).toBe(0);
+    expect(isMemorySnapshotFresh()).toBe(true);
+  });
+
+  it('stays NOT fresh if a collect fails before any success (Redis down at boot)', async () => {
+    infoMock.mockRejectedValue(new Error('ECONNREFUSED'));
+    const handle = startRedisMemoryCollector(60_000);
+    handle.stop();
+    await collectOnce();
+    // The failed collect swallowed the error but never marked the snapshot
+    // fresh, so the gate keeps failing closed.
+    expect(isMemorySnapshotFresh()).toBe(false);
+  });
+
+  it('goes stale once the last successful collect ages past the staleness bound', async () => {
+    // Pin the clock so `lastCollectedAt` (set via Date.now() inside collectOnce)
+    // is exactly `collectAt` — otherwise the few-ms drift between capturing a
+    // timestamp and the internal Date.now() would make the bound assertions
+    // flaky.
+    vi.useFakeTimers();
+    try {
+      const collectAt = 1_000_000;
+      vi.setSystemTime(collectAt);
+      infoMock.mockImplementation((section: string) => {
+        if (section === 'memory') return Promise.resolve(SAMPLE_MEMORY_INFO);
+        if (section === 'stats') return Promise.resolve(SAMPLE_STATS_INFO);
+        return Promise.resolve('');
+      });
+      const intervalMs = 1000;
+      const handle = startRedisMemoryCollector(intervalMs);
+      handle.stop();
+      await collectOnce();
+
+      const maxAgeMs = SNAPSHOT_STALENESS_INTERVALS * intervalMs;
+      // At the exact bound it is still considered fresh (<=), just past it stale.
+      expect(isMemorySnapshotFresh(collectAt + maxAgeMs)).toBe(true);
+      expect(isMemorySnapshotFresh(collectAt + maxAgeMs + 1)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('derives the staleness bound from the configured collect interval', async () => {
+    vi.useFakeTimers();
+    try {
+      const collectAt = 2_000_000;
+      vi.setSystemTime(collectAt);
+      infoMock.mockImplementation((section: string) => {
+        if (section === 'memory') return Promise.resolve(SAMPLE_MEMORY_INFO);
+        if (section === 'stats') return Promise.resolve(SAMPLE_STATS_INFO);
+        return Promise.resolve('');
+      });
+      // Default interval (no arg) → bound is SNAPSHOT_STALENESS_INTERVALS × default.
+      const handle = startRedisMemoryCollector();
+      handle.stop();
+      await collectOnce();
+
+      const defaultBound = SNAPSHOT_STALENESS_INTERVALS * DEFAULT_COLLECT_INTERVAL_MS;
+      expect(isMemorySnapshotFresh(collectAt + defaultBound)).toBe(true);
+      expect(isMemorySnapshotFresh(collectAt + defaultBound + 1)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

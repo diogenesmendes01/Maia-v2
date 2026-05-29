@@ -6,6 +6,7 @@ import { healthRepo } from '@/db/repositories.js';
 import {
   CRITICAL_MEMORY_USED_RATIO,
   getMemoryUsedRatio,
+  isMemorySnapshotFresh,
 } from '@/observability/redis-memory-collector.js';
 
 export type HealthStatus = 'ok' | 'degraded' | 'down';
@@ -71,6 +72,12 @@ export type ReadinessReport = {
   checks: {
     redis_memory_used_ratio: number;
     redis_memory_critical_ratio: number;
+    /**
+     * Whether the collector has a recent successful Redis memory reading. When
+     * false the ratio above is a zero-initialized / stale placeholder and the
+     * gate fails closed (does not trust it).
+     */
+    redis_memory_snapshot_fresh: boolean;
   };
 };
 
@@ -85,15 +92,35 @@ export type ReadinessReport = {
  * so draining the instance ahead of that point lets the LB shed load before
  * the incident cascades into BullMQ/idempotency/working-memory write errors.
  *
+ * Fail-closed on an untrustworthy snapshot: the collector's cache is
+ * zero-initialized and its first collect is not awaited, so before any
+ * successful collect (cold start) — or after the collector has been failing
+ * long enough to go stale — `getMemoryUsedRatio()` returns a placeholder 0
+ * that does NOT mean "Redis is healthy/unbounded". A readiness gate meant to
+ * shed load under memory pressure must not serve traffic on that unknown, so
+ * we report NOT-ready until `isMemorySnapshotFresh()` confirms a recent real
+ * reading. A genuine fresh `maxmemory=0` (unbounded Redis) is still fresh →
+ * ratio 0 → ready; only the never-read / stale case drains.
+ *
  * The ratio comes from the cached collector snapshot (no Redis round-trip),
  * so the probe stays cheap even under aggressive LB poll intervals.
  */
 export async function checkReadiness(): Promise<ReadinessReport> {
   const ratio = getMemoryUsedRatio();
+  const fresh = isMemorySnapshotFresh();
   const checks = {
     redis_memory_used_ratio: ratio,
     redis_memory_critical_ratio: CRITICAL_MEMORY_USED_RATIO,
+    redis_memory_snapshot_fresh: fresh,
   };
+  if (!fresh) {
+    return {
+      ready: false,
+      reason:
+        'redis memory snapshot unavailable: no fresh collector reading yet (cold start or stale) — failing closed until memory pressure is known',
+      checks,
+    };
+  }
   if (ratio > CRITICAL_MEMORY_USED_RATIO) {
     return {
       ready: false,

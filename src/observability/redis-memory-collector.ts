@@ -33,6 +33,9 @@
  *    symptom, not the primary alert.
  *  - First successful collect populates the cache; until then, gauges report
  *    0 (matches the "no observation yet" semantics, distinct from "max=0").
+ *    That cold-start 0 is fine for a scraped gauge but NOT safe to gate
+ *    traffic on, so freshness is tracked separately (`isMemorySnapshotFresh`)
+ *    and the `/readyz` gate fails closed until a real collect lands.
  *
  * Alert thresholds (see `docs/runbooks/redis.md` §4 for full Prometheus
  * rules + runbook reaction):
@@ -69,6 +72,27 @@ const snapshot: MemorySnapshot = {
 let gaugesRegistered = false;
 
 /**
+ * Freshness tracking for the snapshot above. The snapshot is zero-initialized,
+ * so before the first SUCCESSFUL collect (cold start) — and whenever the
+ * collector has been failing long enough that the cached value is stale — the
+ * numbers are meaningless. The readiness gate (`isMemorySnapshotFresh`) must
+ * fail-closed in those windows rather than trust a zero ratio.
+ *
+ * `hasCollectedOnce` flips true only after a collect that actually parsed a
+ * value; `lastCollectedAt` is the epoch-ms of that collect. Both stay put when
+ * a collect throws (Redis down) so a long outage eventually reads as stale.
+ */
+let hasCollectedOnce = false;
+let lastCollectedAt = 0;
+
+/**
+ * The interval the live collector runs at, captured by
+ * `startRedisMemoryCollector`. Used to derive the staleness bound so it tracks
+ * whatever cadence production actually configured (defaults to the 15s base).
+ */
+let activeIntervalMs = DEFAULT_COLLECT_INTERVAL_MS;
+
+/**
  * Critical memory-pressure ratio. Above this, `noeviction` will start failing
  * writes (Redis returns OOM), so the readiness gate (`/readyz`, see
  * `healthcheck.ts`) takes the instance out of LB rotation. Kept in sync with
@@ -86,6 +110,38 @@ export const CRITICAL_MEMORY_USED_RATIO = 0.95;
 export function getMemoryUsedRatio(): number {
   if (snapshot.maxmemory <= 0) return 0;
   return snapshot.used_memory / snapshot.maxmemory;
+}
+
+/**
+ * How many collection intervals a snapshot may age before it counts as stale.
+ * One missed tick can happen under jitter; two consecutive misses means the
+ * collector has actually stopped producing fresh data, so the gate treats the
+ * cached ratio as untrustworthy and fails closed.
+ */
+export const SNAPSHOT_STALENESS_INTERVALS = 2;
+
+/**
+ * Whether the cached snapshot is trustworthy enough to gate traffic on.
+ *
+ * Returns `false` — i.e. "unknown, fail closed" — in exactly two cases:
+ *  1. Cold start: no successful collect has happened yet, so `getMemoryUsedRatio()`
+ *     would return a zero-initialized 0 that does NOT mean "Redis unbounded".
+ *  2. Stale: the last successful collect is older than
+ *     `SNAPSHOT_STALENESS_INTERVALS × activeIntervalMs` (collector wedged /
+ *     Redis down long enough that the cached ratio no longer reflects reality).
+ *
+ * Returns `true` once a real collect has run recently — including a genuine
+ * `maxmemory=0` reading (unbounded Redis), which is a fresh observation that
+ * legitimately maps to ratio 0 → ready. This is the distinction the readiness
+ * gate needs: "freshly read as 0 (unbounded)" must stay ready, while
+ * "stale/never-read 0" must drain.
+ *
+ * `now` is injectable for tests; production passes the default `Date.now()`.
+ */
+export function isMemorySnapshotFresh(now: number = Date.now()): boolean {
+  if (!hasCollectedOnce) return false;
+  const maxAgeMs = SNAPSHOT_STALENESS_INTERVALS * activeIntervalMs;
+  return now - lastCollectedAt <= maxAgeMs;
 }
 
 /**
@@ -156,6 +212,15 @@ export async function collectOnce(): Promise<void> {
     if (max !== undefined) snapshot.maxmemory = max;
     if (evicted !== undefined) snapshot.evicted_keys = evicted;
     if (rejected !== undefined) snapshot.rejected_connections = rejected;
+
+    // Mark the snapshot fresh only when INFO actually yielded the memory
+    // fields the readiness gate depends on. A reply that parsed neither
+    // `used_memory` nor `maxmemory` leaves freshness untouched, so the gate
+    // keeps failing closed rather than trusting a zero-initialized ratio.
+    if (used !== undefined || max !== undefined) {
+      hasCollectedOnce = true;
+      lastCollectedAt = Date.now();
+    }
   } catch (err) {
     // Redis down or transient error — keep the previous snapshot (stale but
     // not misleadingly zero). The `maia_redis_connected` gauge is the
@@ -186,6 +251,10 @@ export function startRedisMemoryCollector(
 ): CollectorHandle {
   registerGauges();
 
+  // Record the live cadence so `isMemorySnapshotFresh()` derives its staleness
+  // bound from the interval production actually runs at.
+  activeIntervalMs = intervalMs;
+
   // Kick off an initial collection — best-effort, so the first /metrics
   // scrape after boot reports real values instead of zeros. Catch any
   // rejection because we already log inside collectOnce.
@@ -213,4 +282,7 @@ export function _resetForTests(): void {
   snapshot.evicted_keys = 0;
   snapshot.rejected_connections = 0;
   gaugesRegistered = false;
+  hasCollectedOnce = false;
+  lastCollectedAt = 0;
+  activeIntervalMs = DEFAULT_COLLECT_INTERVAL_MS;
 }
