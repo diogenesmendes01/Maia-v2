@@ -84,6 +84,39 @@ function encodeSegment(s: string | number): string {
   return encodeURIComponent(String(s));
 }
 
+/**
+ * Version tag prepended to every `computePayloadHash` output (issue #318
+ * migration-window fix).
+ *
+ * WHY a version prefix?
+ *   #318 changed the hash ENCODING (per-segment `encodeURIComponent` before
+ *   the `'|'` join) to close a delimiter-aliasing collision. That changes the
+ *   bytes for any input containing a `'|'` — so a `payload_hash` computed AFTER
+ *   #318 deploys can differ from one stored BEFORE it. The repo's #299/#301
+ *   revalidation compares the freshly computed hash against the stored row's
+ *   `payload_hash`; a legacy (pre-#318) stored value would never match the new
+ *   format, turning a legit idempotent retry into a spurious `collision`
+ *   (fail-closed typed error) for the entry's remaining TTL.
+ *
+ *   The tag makes the format SELF-DESCRIBING: stored hashes written by this
+ *   build carry `PAYLOAD_HASH_VERSION_PREFIX`; legacy rows have no prefix. The
+ *   comparison sites in `src/db/repositories.ts` use that to special-case
+ *   legacy rows (skip the collision, fall back to pre-#318 hit/wait-resolve
+ *   behavior) while keeping STRICT revalidation for new-vs-new comparisons.
+ *   Bump this (`v2` → `v3` …) on any future change to the hashed byte layout.
+ */
+export const PAYLOAD_HASH_VERSION_PREFIX = 'v2:';
+
+/**
+ * True iff `hash` was produced by the CURRENT (versioned) `computePayloadHash`.
+ * A stored value WITHOUT this prefix is a legacy (pre-#318) hash that cannot be
+ * revalidated against the new encoding — callers must NOT treat a mismatch
+ * against it as a collision. See `PAYLOAD_HASH_VERSION_PREFIX`.
+ */
+export function isVersionedPayloadHash(hash: string): boolean {
+  return hash.startsWith(PAYLOAD_HASH_VERSION_PREFIX);
+}
+
 export function normalizePayload(p: unknown): string {
   const c = canonicalize(p) as Record<string, unknown>;
   const out: Record<string, unknown> = { ...c };
@@ -121,7 +154,13 @@ export function normalizePayload(p: unknown): string {
  *     dialect dependency. Collision probability negligible vs. the original
  *     concern of key collision.
  *
- * Issue #299.
+ * The returned string is `PAYLOAD_HASH_VERSION_PREFIX + <64-hex sha256>`
+ * (e.g. `v2:ab12…`). The prefix lets the repo's revalidation distinguish a
+ * current-format hash from a legacy pre-#318 stored value (issue #318
+ * migration-window fix). Callers treat the value as an opaque token — store
+ * it and compare it verbatim.
+ *
+ * Issue #299, #318.
  */
 export function computePayloadHash(input: {
   pessoa_id: string;
@@ -149,7 +188,13 @@ export function computePayloadHash(input: {
   // the same string and collide on SHA-256 — a FALSE payload-hash match,
   // which is exactly the integrity check this function exists to enforce
   // (issue #318, #301 follow-up).
-  return sha256(parts.map(encodeSegment).join('|'));
+  //
+  // Version prefix (issue #318 migration-window fix): the result is tagged
+  // with `PAYLOAD_HASH_VERSION_PREFIX` so the comparison sites in
+  // `src/db/repositories.ts` can distinguish a hash written by THIS build
+  // (revalidatable, strict) from a legacy pre-#318 stored hash (NOT
+  // revalidatable — a mismatch against it must NOT raise a collision).
+  return `${PAYLOAD_HASH_VERSION_PREFIX}${sha256(parts.map(encodeSegment).join('|'))}`;
 }
 
 export function computeIdempotencyKey(input: {

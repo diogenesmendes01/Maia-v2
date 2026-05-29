@@ -74,6 +74,7 @@ import { logger } from '@/lib/logger.js';
 import { incCounter } from '@/lib/metrics.js';
 import { applyTenantGuard } from './tenant-guard.js';
 import { getCurrentTenant, getCurrentAgent } from './tenant-context.js';
+import { isVersionedPayloadHash } from '@/governance/idempotency.js';
 import { deriveCapabilityRisk, deriveCapabilityLocks } from './capability-risk.js';
 import { LearnedVoiceModifierSchema } from '@/identity/learned-voice-modifier.js';
 import type {
@@ -1468,6 +1469,47 @@ export type ReservationResult =
     };
 
 /**
+ * #318 (migration-window fix): decide whether a stored vs. expected
+ * `payload_hash` mismatch is a REAL key collision that must fail closed.
+ *
+ * Background. #318 changed the BYTES `computePayloadHash` emits (per-segment
+ * `encodeURIComponent` before the `'|'` join) to defeat a delimiter-aliasing
+ * collision. Idempotency rows written BEFORE this build deploys store an
+ * OLD-format hash with NO version prefix. The #299/#301 revalidation compares
+ * the freshly computed (new-format) hash against the stored value; against a
+ * legacy row it would NEVER match, so a legit idempotent retry would be
+ * mis-reported as a `collision` (fail-closed typed error) for the row's whole
+ * remaining TTL — breaking real retries across the deploy window.
+ *
+ * Rule. `computePayloadHash` now tags its output with
+ * `PAYLOAD_HASH_VERSION_PREFIX` (`v2:`), so:
+ *   - STORED hash is versioned (`v2:`-prefixed) AND differs from the expected
+ *     (also versioned) hash → REAL collision. Strict #299/#301 revalidation
+ *     is preserved for all new-vs-new comparisons.
+ *   - STORED hash is LEGACY (no `v2:` prefix) → NOT a collision. A legacy hash
+ *     can't be revalidated against the new encoding; we fall back to pre-#318
+ *     behavior (return the cached result / wait-resolve normally). Legacy rows
+ *     expire shortly under the bucket-minute TTL + cleanup sweep, so the
+ *     window is bounded and there is no double-execution risk.
+ *
+ * Equality is exact-string. The expected hash is always current-format (it
+ * comes from `computePayloadHash`), so a versioned-stored == expected check is
+ * a strict same-format comparison. Tenant isolation is unaffected: the caller
+ * has already scoped the row by `(tenant_id, agent_id, key)` in its WHERE
+ * clause; this predicate only inspects the hash strings.
+ */
+function isRealPayloadHashCollision(
+  storedPayloadHash: string,
+  expectedPayloadHash: string,
+): boolean {
+  // Legacy stored hash (pre-#318, no version prefix) → cannot revalidate →
+  // never a collision (fall back to the pre-#318 hit/wait-resolve behavior).
+  if (!isVersionedPayloadHash(storedPayloadHash)) return false;
+  // Both current-format: strict #299/#301 revalidation.
+  return storedPayloadHash !== expectedPayloadHash;
+}
+
+/**
  * #299: emit the structured warn + collision metric and return the typed
  * `collision` reservation result. Shared by both `tryReserve` 'completed'
  * branches (initial SELECT + post-reclaim recheck) so the observability and
@@ -1566,7 +1608,11 @@ export const idempotencyRepo = {
       .limit(1);
     const row = rows[0];
     if (!row) return null;
-    if (row.payload_hash !== input.payload_hash) {
+    // #318: only a CURRENT-format (v2:-prefixed) stored hash that differs is a
+    // real collision. A legacy (pre-#318, unprefixed) stored hash can't be
+    // revalidated against the new encoding → treat as a hit (pre-#318
+    // behavior); it expires shortly under the bucket-minute TTL.
+    if (isRealPayloadHashCollision(row.payload_hash, input.payload_hash)) {
       // #299: collision detected within tenant scope. Log + metric so we
       // can detect drift. Treat as miss so caller re-executes.
       logger.warn(
@@ -1747,7 +1793,11 @@ export const idempotencyRepo = {
       // A 'completed' row whose stored payload_hash differs from ours is a
       // key collision (two distinct payloads mapped to the same key). Fail
       // closed — never expose the foreign result.
-      if (existing.payload_hash !== input.payload_hash) {
+      // #318: only enforce this when the STORED hash is current-format
+      // (v2:-prefixed). A legacy (pre-#318) stored hash can't be revalidated
+      // against the new encoding, so a mismatch there is NOT a collision —
+      // return the cached result (pre-#318 behavior); the row expires shortly.
+      if (isRealPayloadHashCollision(existing.payload_hash, input.payload_hash)) {
         return reportPayloadHashCollision(input, existing);
       }
       return {
@@ -1826,7 +1876,10 @@ export const idempotencyRepo = {
       const recheckRow = recheck[0];
       if (recheckRow?.state === 'completed') {
         // #299: same collision guard as the first 'completed' branch.
-        if (recheckRow.payload_hash !== input.payload_hash) {
+        // #318: legacy-aware — only a current-format (v2:) stored hash that
+        // differs is a real collision; a legacy stored hash is treated as a
+        // hit (pre-#318 behavior).
+        if (isRealPayloadHashCollision(recheckRow.payload_hash, input.payload_hash)) {
           return reportPayloadHashCollision(input, recheckRow);
         }
         return {
@@ -2023,9 +2076,15 @@ export const idempotencyRepo = {
       if (row.state === 'completed') {
         // #299: revalidate the owner's payload_hash before adopting their
         // result. A mismatch is a key collision — fail closed.
+        // #318: legacy-aware — only a current-format (v2:-prefixed) stored
+        // hash that differs is a real collision. A legacy (pre-#318) stored
+        // hash can't be revalidated against the new encoding, so the waiter
+        // adopts the owner's result (pre-#318 behavior); the row expires
+        // shortly. (`expected_payload_hash` may be omitted by non-dispatch
+        // callers — then we skip revalidation entirely, unchanged from #299.)
         if (
           expected_payload_hash !== undefined &&
-          row.payload_hash !== expected_payload_hash
+          isRealPayloadHashCollision(row.payload_hash, expected_payload_hash)
         ) {
           reportPayloadHashCollision(
             { key, payload_hash: expected_payload_hash },
