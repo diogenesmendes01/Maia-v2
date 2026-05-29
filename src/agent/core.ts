@@ -317,14 +317,71 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
     // the one DISCOVERING which tenant owns the row). Once adopted, all
     // downstream reads inside `runWithTenantContext` see the resolved triplet.
     //
-    // Idempotency: re-running with the same target tenant/agent is a no-op at
-    // the SQL level (UPDATE writing identical values). Safe for BullMQ retries.
+    // [Codex review #311 — CRITICAL P0 cross-tenant adoption race]
+    // Adoption is now a COMPARE-AND-SWAP: the repo UPDATE only matches a row
+    // still in `default/default`, and reports whether THIS call won the swap.
+    //   - won === true  → we moved the row out of default/default into the
+    //                     resolved triplet. Proceed.
+    //   - won === false → the row was NOT `default/default` when we tried.
+    //                     Either (a) WE already adopted it on a prior BullMQ
+    //                     retry (idempotent — owner == resolved), or (b) a
+    //                     CONCURRENT worker adopted it into a DIFFERENT tenant
+    //                     (the race this review closed). We re-check the owner
+    //                     cross-tenant and ONLY proceed when it matches the
+    //                     tenant we resolved. If it belongs to another tenant
+    //                     we abort + audit and do NOT run the turn under our
+    //                     context — processing it would be the exact
+    //                     cross-tenant leak the inviolable isolation contract
+    //                     forbids. (Throwing lets BullMQ apply retry/DLQ; the
+    //                     retry will simply re-observe the foreign owner and
+    //                     abort again — it never leaks.)
     if (resolved.tenant_id !== 'default' || resolved.agent_id !== 'default') {
-      await mensagensRepo.adoptToResolvedTenantCrossTenant({
+      const won = await mensagensRepo.adoptToResolvedTenantCrossTenant({
         id: mensagem_id,
         tenant_id: resolved.tenant_id,
         agent_id: resolved.agent_id,
       });
+      if (!won) {
+        const owner = await mensagensRepo.findOwnerByIdCrossTenant(mensagem_id);
+        const ownsResolved =
+          owner !== null &&
+          owner.tenant_id === resolved.tenant_id &&
+          owner.agent_id === resolved.agent_id;
+        if (!ownsResolved) {
+          // Cross-tenant adoption race (or vanished row). Fail-closed: audit
+          // under the synthetic system context (we hold no ALS yet) and
+          // re-throw so the worker does NOT process the row under a tenant it
+          // does not own. We deliberately do not surface the foreign owner's
+          // tenant/agent in logs beyond the audit row to keep the leak
+          // surface minimal.
+          await audit({
+            acao: 'channel_resolution_failed',
+            mensagem_id,
+            metadata: {
+              error_code: 'cross_tenant_adoption_conflict',
+              error_message:
+                'inbound row was not adopted into the resolved tenant (already owned by a different tenant or missing) — refusing to process cross-tenant',
+              resolved_tenant_id: resolved.tenant_id,
+              resolved_agent_id: resolved.agent_id,
+              owner_present: owner !== null,
+            },
+          });
+          logger.error(
+            { mensagem_id },
+            'agent.cross_tenant_adoption_conflict',
+          );
+          throw new TypedError(
+            'channel_resolution_failed',
+            'cross_tenant_adoption_conflict',
+            { mensagem_id, resolver_path: 'adoption_conflict' },
+          );
+        }
+        // owner == resolved → idempotent re-run (we adopted it earlier).
+        logger.debug(
+          { mensagem_id },
+          'agent.adoption_noop_already_owned',
+        );
+      }
     }
   }
 

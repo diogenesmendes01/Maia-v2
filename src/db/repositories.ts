@@ -568,15 +568,81 @@ export const mensagensRepo = {
   // and the turn would be silently dropped. This method atomically adopts
   // the row to the resolved triplet so the inner tenant-scoped read finds
   // it. Same sanctioned-bypass pattern as channelsRepo.findByExternalCrossTenant.
+  //
+  // [Codex review #311 — CRITICAL P0 cross-tenant adoption race]
+  // The UPDATE re-asserts `tenant_id='default' AND agent_id='default'` in its
+  // WHERE clause. This is the load-bearing safety property, not a cosmetic
+  // guard:
+  //   - The inbound row is first persisted by the gateway under the legacy
+  //     `default/default` context, then ADOPTED into the resolved tenant by
+  //     this method. Keying the UPDATE by `id` ALONE meant any caller holding
+  //     that id could rewrite `(tenant_id, agent_id)` to an ARBITRARY triplet
+  //     at any time — including AFTER the row had already been adopted into
+  //     tenant-A. A concurrent worker that re-resolved the same row to
+  //     tenant-B (stale resolver cache, mis-seeded channel, BullMQ retry
+  //     racing a fresh enqueue) would silently steal the row across the
+  //     tenant boundary — a direct violation of the inviolable isolation
+  //     contract.
+  //   - Re-asserting `default/default` in the WHERE makes adoption a
+  //     COMPARE-AND-SWAP: a row can be adopted out of `default/default`
+  //     exactly ONCE. Once it belongs to tenant-A, no later call (for any
+  //     other tenant, or a duplicate for the same one) can match the WHERE,
+  //     so the row can never be re-homed. The single UPDATE is atomic at the
+  //     Postgres level (row lock for the duration of the statement), so two
+  //     concurrent adoptions cannot both win — exactly one observes
+  //     rowCount=1, the loser observes rowCount=0.
+  //   - Idempotency for BullMQ retries is preserved: re-running adoption for
+  //     the SAME target tenant after the row already moved is simply a
+  //     rowCount=0 no-op (the row no longer matches `default/default`), which
+  //     the caller treats as "already adopted by me" — see the post-adoption
+  //     ownership re-check in agent/core.ts.
+  //
+  // Returns `true` when THIS call performed the adoption (row was still
+  // `default/default` and is now the resolved triplet), `false` when the row
+  // was already adopted (by a prior call / concurrent winner) or no longer
+  // exists. Callers MUST treat `false` as "I did not win — verify the row's
+  // current owner before proceeding" rather than assuming success.
   async adoptToResolvedTenantCrossTenant(args: {
     id: string;
     tenant_id: string;
     agent_id: string;
-  }): Promise<void> {
-    await db
+  }): Promise<boolean> {
+    const updated = await db
       .update(mensagens)
       .set({ tenant_id: args.tenant_id, agent_id: args.agent_id })
-      .where(eq(mensagens.id, args.id));
+      .where(
+        and(
+          eq(mensagens.id, args.id),
+          eq(mensagens.tenant_id, 'default'),
+          eq(mensagens.agent_id, 'default'),
+        ),
+      )
+      .returning({ id: mensagens.id });
+    return updated.length > 0;
+  },
+
+  // [Codex review #311 — CRITICAL P0] EXPLICITLY bypasses applyTenantGuard —
+  // same sanctioned-entry-point pattern as `adoptToResolvedTenantCrossTenant`.
+  // Returns ONLY the owning `(tenant_id, agent_id)` of a row by id, with NO
+  // tenant scoping. Sole consumer is the post-adoption ownership re-check in
+  // `runAgentForMensagem`: when the compare-and-swap adoption returns `false`
+  // (the row was NOT still `default/default`), the caller must learn WHO owns
+  // the row now before deciding whether it may proceed. If the row already
+  // belongs to the tenant we resolved, we won an earlier idempotent retry and
+  // proceed; if it belongs to a DIFFERENT tenant, a concurrent worker adopted
+  // it cross-tenant and we MUST abort rather than process it under our context
+  // (that would re-introduce the very cross-tenant leak this review closed).
+  // Projecting only the two scope columns keeps the leak surface minimal — the
+  // caller never sees another tenant's message body via this path.
+  async findOwnerByIdCrossTenant(
+    id: string,
+  ): Promise<{ tenant_id: string; agent_id: string } | null> {
+    const rows = await db
+      .select({ tenant_id: mensagens.tenant_id, agent_id: mensagens.agent_id })
+      .from(mensagens)
+      .where(eq(mensagens.id, id))
+      .limit(1);
+    return rows[0] ?? null;
   },
 
   // [Codex review #277 v2] EXPLICITLY bypasses applyTenantGuard — same
