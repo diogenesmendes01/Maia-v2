@@ -506,4 +506,81 @@ d('idempotencyRepo.tryReserve — race-safe under real Postgres ON CONFLICT', ()
     }
     await cleanupKey(key);
   });
+
+  it('#299 — completed row + DIFFERENT payload_hash → tryReserve returns collision (no stale result leak)', async () => {
+    // The crux of #299 in the #298 reservation world: a COMPLETED row under
+    // an exact (tenant, agent, key) whose stored payload_hash differs from
+    // the caller's is a key collision. tryReserve MUST fail closed
+    // (state='collision', resultado undefined) — NOT return the foreign
+    // cached result — so a colliding key never yields a wrong side effect.
+    const { idempotencyRepo } = await import('@/db/repositories.js');
+    const key = `collision-${Date.now()}-${Math.random()}`;
+
+    await runWithTenantContext(
+      { tenant_id: TENANT_A, agent_id: AGENT },
+      async () => {
+        // Reserve + complete with payload_hash 'HASH-X'.
+        const first = await idempotencyRepo.tryReserve({
+          key,
+          tool_name: 'register_transaction',
+          operation_type: 'create',
+          pessoa_id: PESSOA_ID,
+          entity_id: ENTIDADE_ID,
+          payload_hash: 'HASH-X',
+          ttl_seconds: 30,
+        });
+        expect(first.was_inserted).toBe(true);
+        const token = first.was_inserted ? first.reservation_token : '';
+        await idempotencyRepo.markCompleted({
+          key,
+          resultado: { computed_for: 'payload-X' },
+          reservation_token: token,
+        });
+
+        // A DISTINCT payload collides on the SAME key (payload_hash 'HASH-Y').
+        const collided = await idempotencyRepo.tryReserve({
+          key,
+          tool_name: 'register_transaction',
+          operation_type: 'create',
+          pessoa_id: PESSOA_ID,
+          entity_id: ENTIDADE_ID,
+          payload_hash: 'HASH-Y',
+          ttl_seconds: 30,
+        });
+        expect(collided.was_inserted).toBe(false);
+        expect(collided.state).toBe('collision');
+        expect(collided.resultado).toBeUndefined();
+
+        // The MATCHING payload still gets its legitimate cache hit.
+        const matched = await idempotencyRepo.tryReserve({
+          key,
+          tool_name: 'register_transaction',
+          operation_type: 'create',
+          pessoa_id: PESSOA_ID,
+          entity_id: ENTIDADE_ID,
+          payload_hash: 'HASH-X',
+          ttl_seconds: 30,
+        });
+        expect(matched.was_inserted).toBe(false);
+        expect(matched.state).toBe('completed');
+        expect(matched.resultado).toEqual({ computed_for: 'payload-X' });
+
+        // waitForCompletion with a mismatched expected hash also fails closed.
+        const waitedCollision = await idempotencyRepo.waitForCompletion(
+          key,
+          1000,
+          'HASH-Y',
+        );
+        expect(waitedCollision.status).toBe('collision');
+
+        // …and with the matching hash returns the legit result.
+        const waitedOk = await idempotencyRepo.waitForCompletion(key, 1000, 'HASH-X');
+        expect(waitedOk.status).toBe('completed');
+        if (waitedOk.status === 'completed') {
+          expect(waitedOk.resultado).toEqual({ computed_for: 'payload-X' });
+        }
+      },
+    );
+    await cleanupKey(key);
+  });
 });

@@ -70,6 +70,8 @@ import type {
   ProposalUnifiedStatus,
 } from './schema.js';
 import { TypedError } from '@/lib/utils.js';
+import { logger } from '@/lib/logger.js';
+import { incCounter } from '@/lib/metrics.js';
 import { applyTenantGuard } from './tenant-guard.js';
 import { getCurrentTenant, getCurrentAgent } from './tenant-context.js';
 import { deriveCapabilityRisk, deriveCapabilityLocks } from './capability-risk.js';
@@ -1399,7 +1401,9 @@ export const pendingQuestionsRepo = {
  *     `resultado` will be undefined.
  *   - `was_inserted=false`: someone else's row was already there. Inspect
  *     `state`:
- *       - 'completed': use `resultado` as the cached output (cache hit).
+ *       - 'completed': use `resultado` as the cached output (cache hit) —
+ *         ONLY returned when the stored row's `payload_hash` MATCHES the
+ *         caller's `input.payload_hash` (see 'collision' below).
  *       - 'in_progress': another worker is mid-execution. The caller MUST
  *         NOT execute the handler; it should poll for completion (see
  *         `waitForCompletion`).
@@ -1408,6 +1412,17 @@ export const pendingQuestionsRepo = {
  *         failed handler may have applied a partial side effect. The
  *         dispatcher surfaces a typed error so any retry is an explicit,
  *         higher-level decision.
+ *       - 'collision' (issue #299): a SETTLED ('completed') row exists for
+ *         this exact (tenant, agent, key) but its stored `payload_hash`
+ *         DIFFERS from the caller's. That means the idempotency key collided
+ *         for two distinct payloads (truncated hash, derivator regression,
+ *         or stale cache after a schema change). Returning the stored
+ *         `resultado` would hand back a result computed for a DIFFERENT
+ *         payload — a silent wrong side effect. We FAIL CLOSED: the caller
+ *         MUST NOT use `resultado` (it is undefined here) and MUST NOT
+ *         re-execute under the colliding key (that would clobber the other
+ *         payload's cached result). The dispatcher surfaces a typed error.
+ *         The collision is logged + metered inside `tryReserve`.
  *
  * Fencing token (issue #298 B2): on a winning reservation, `reservation_token`
  * is a freshly minted UUID. The owner MUST present it to `markCompleted` /
@@ -1442,34 +1457,98 @@ export type ReservationResult =
       state: 'failed';
       resultado: undefined;
       reservation_token: undefined;
+    }
+  | {
+      // #299: settled row's payload_hash differs from the caller's — key
+      // collision. Fail closed; never expose the foreign `resultado`.
+      was_inserted: false;
+      state: 'collision';
+      resultado: undefined;
+      reservation_token: undefined;
     };
+
+/**
+ * #299: emit the structured warn + collision metric and return the typed
+ * `collision` reservation result. Shared by both `tryReserve` 'completed'
+ * branches (initial SELECT + post-reclaim recheck) so the observability and
+ * fail-closed shape stay identical. Mirrors the same event name / metric the
+ * legacy `lookup` path uses, so dashboards see one signal regardless of which
+ * code path detected the collision.
+ */
+function reportPayloadHashCollision(
+  input: { key: string; payload_hash: string },
+  stored: { payload_hash: string },
+): ReservationResult {
+  logger.warn(
+    {
+      event: 'idempotency_key_collision_payload_mismatch',
+      key: input.key,
+      stored_payload_hash: stored.payload_hash,
+      expected_payload_hash: input.payload_hash,
+    },
+    'idempotency.payload_hash_mismatch',
+  );
+  incCounter('maia_idempotency_payload_hash_collision_total');
+  return {
+    was_inserted: false,
+    state: 'collision',
+    resultado: undefined,
+    reservation_token: undefined,
+  };
+}
 
 export const idempotencyRepo = {
   /**
-   * Legacy read-only lookup. Returns the cached result of a SETTLED row.
-   *
-   * State handling:
-   *   - 'completed' → returns `resultado` (the cache hit).
-   *   - 'in_progress' → EXCLUDED. An in-flight reservation has no result
-   *     yet; surfacing it would make the caller skip execution and return
-   *     undefined to the user (silent data loss).
-   *   - 'failed' / legacy rows → carry a NULL `resultado`, so the
-   *     `?? null` below already yields a miss without special-casing.
-   *
-   * We filter `state <> 'in_progress'` (rather than `state = 'completed'`)
-   * so that pre-#298 rows — written before the `state` column existed and
-   * thus indistinguishable from a completed cache entry — still hit, and so
-   * we never accidentally treat an in-flight reservation as a cache hit.
-   * This keeps the same-scope idempotency contract that pre-dates the
-   * atomic-reservation work (issue #261 regression fix).
+   * Legacy read-only lookup with payload-hash revalidation (#299), state
+   * filtering (#298) and tenant/agent scoping (#261).
    *
    * Use `tryReserve` for the atomic dispatcher path; this helper exists for
    * backward compat with non-dispatch callers (tests, one-off inspections).
+   * The dispatcher itself no longer calls `lookup` — but it carries the
+   * SAME three-layer defense so any non-dispatch caller is protected too.
+   *
+   * Three-layer defense against a wrong-result cache hit:
+   *
+   * 1. Tenant/agent scope (#261). The WHERE pins `tenant_id = <ctx> AND
+   *    agent_id = <ctx> AND key = <key>`. `getCurrentTenant`/`getCurrentAgent`
+   *    throw `MissingTenantContextError` if no ALS context — we refuse a
+   *    silent fall-through to the legacy `'default'` bucket. Defense in
+   *    depth on top of the hash-input change in `computeIdempotencyKey`
+   *    (src/governance/idempotency.ts).
+   *
+   * 2. State filtering (#298). We filter `state <> 'in_progress'` (rather
+   *    than `state = 'completed'`) so that:
+   *      - 'completed' → returns `resultado` (the cache hit).
+   *      - 'in_progress' → EXCLUDED. An in-flight reservation has no result
+   *        yet; surfacing it would make the caller skip execution and return
+   *        undefined to the user (silent data loss).
+   *      - 'failed' → carries a NULL `resultado`, so it yields a miss.
+   *      - pre-#298 rows (written before the `state` column existed) are
+   *        treated as settled and still hit, preserving the pre-existing
+   *        same-scope idempotency contract.
+   *
+   * 3. Payload-hash revalidation (#299). The cache key is
+   *    `computeIdempotencyKey(...)` — a fingerprint of the inputs PLUS a
+   *    bucket-minutes timestamp. If two distinct requests in the same scope
+   *    collide on that key (truncated hash, regression in the derivator that
+   *    drops a discriminant field, or stale cached payload after a schema
+   *    change), the older result would be returned for the NEW request and
+   *    the side effect would be silently wrong.
+   *
+   *    `payload_hash` is an independent SHA256 over (pessoa, entity, tool,
+   *    op, normalized_payload | file_sha256). On a hit we verify that the
+   *    STORED row's hash matches the EXPECTED hash; on mismatch we treat as
+   *    a miss, warn, and bump a metric so we can detect drift.
+   *
+   * Note on existing rows: rows stored before this fix have
+   * `payload_hash == key` (legacy `store` from _dispatcher.ts). Those rows
+   * fail revalidation against a real payload_hash and are treated as a miss.
+   * Acceptable: the bucket-minute TTL + cleanup worker drain stale rows.
    */
-  async lookup(key: string): Promise<unknown | null> {
+  async lookup(input: { key: string; payload_hash: string }): Promise<unknown | null> {
     // Resolve tenant/agent — `getCurrentTenant`/`getCurrentAgent` throw
     // `MissingTenantContextError` if no context. We refuse a silent
-    // fall-through to the legacy `'default'` bucket (see header).
+    // fall-through to the legacy `'default'` bucket (see header #261).
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
     const rows = await db
@@ -1479,12 +1558,31 @@ export const idempotencyRepo = {
         and(
           eq(idempotency_keys.tenant_id, tenant_id),
           eq(idempotency_keys.agent_id, agent_id),
-          eq(idempotency_keys.key, key),
+          eq(idempotency_keys.key, input.key),
+          // #298: never surface an in-flight reservation as a cache hit.
           ne(idempotency_keys.state, 'in_progress'),
         ),
       )
       .limit(1);
-    return rows[0]?.resultado ?? null;
+    const row = rows[0];
+    if (!row) return null;
+    if (row.payload_hash !== input.payload_hash) {
+      // #299: collision detected within tenant scope. Log + metric so we
+      // can detect drift. Treat as miss so caller re-executes.
+      logger.warn(
+        {
+          event: 'idempotency_key_collision_payload_mismatch',
+          key: input.key,
+          stored_payload_hash: row.payload_hash,
+          expected_payload_hash: input.payload_hash,
+          stored_tool_name: row.tool_name,
+        },
+        'idempotency.payload_hash_mismatch',
+      );
+      incCounter('maia_idempotency_payload_hash_collision_total');
+      return null;
+    }
+    return row.resultado;
   },
 
   /**
@@ -1591,6 +1689,8 @@ export const idempotencyRepo = {
         state: idempotency_keys.state,
         resultado: idempotency_keys.resultado,
         expires_at: idempotency_keys.expires_at,
+        // #299: needed to revalidate the cached payload on a 'completed' hit.
+        payload_hash: idempotency_keys.payload_hash,
       })
       .from(idempotency_keys)
       .where(
@@ -1643,6 +1743,13 @@ export const idempotencyRepo = {
     }
 
     if (existing.state === 'completed') {
+      // #299: revalidate the cached payload before returning it as a hit.
+      // A 'completed' row whose stored payload_hash differs from ours is a
+      // key collision (two distinct payloads mapped to the same key). Fail
+      // closed — never expose the foreign result.
+      if (existing.payload_hash !== input.payload_hash) {
+        return reportPayloadHashCollision(input, existing);
+      }
       return {
         was_inserted: false,
         state: 'completed',
@@ -1704,6 +1811,8 @@ export const idempotencyRepo = {
         .select({
           state: idempotency_keys.state,
           resultado: idempotency_keys.resultado,
+          // #299: revalidate the cached payload on a 'completed' recheck.
+          payload_hash: idempotency_keys.payload_hash,
         })
         .from(idempotency_keys)
         .where(
@@ -1716,6 +1825,10 @@ export const idempotencyRepo = {
         .limit(1);
       const recheckRow = recheck[0];
       if (recheckRow?.state === 'completed') {
+        // #299: same collision guard as the first 'completed' branch.
+        if (recheckRow.payload_hash !== input.payload_hash) {
+          return reportPayloadHashCollision(input, recheckRow);
+        }
         return {
           was_inserted: false,
           state: 'completed',
@@ -1843,6 +1956,12 @@ export const idempotencyRepo = {
    *
    * Terminal outcomes:
    *   - 'completed' → the owner finished; return the cached `resultado`.
+   *   - 'collision' (issue #299) → the owner's settled row carries a
+   *     payload_hash that DIFFERS from `expected_payload_hash`. The owner
+   *     reserved a colliding payload (same key, different inputs); adopting
+   *     its result would leak the wrong side effect across the collision.
+   *     Only emitted when `expected_payload_hash` is supplied. The caller
+   *     MUST NOT use the result; the dispatcher surfaces a typed error.
    *   - 'failed' → the owner terminally failed (issue #298 B3:
    *     releaseReservation now marks the row 'failed' rather than deleting
    *     it). The caller MUST NOT re-execute; the dispatcher surfaces a
@@ -1852,6 +1971,10 @@ export const idempotencyRepo = {
    *     from the caller's perspective — re-dispatch from scratch.
    *   - 'timeout' → the deadline elapsed with the owner still in_progress.
    *
+   * `expected_payload_hash` is OPTIONAL for backward compat with non-dispatch
+   * callers (and pre-#299 tests) that poll a key without a payload to verify.
+   * When omitted, the completed result is returned without revalidation.
+   *
    * Polling starts at 100ms and backs off exponentially (capped at 500ms)
    * so the loser of the race pays low latency on a fast handler while not
    * hammering the DB on a slow one. The deadline + sleep shape avoids both
@@ -1860,8 +1983,10 @@ export const idempotencyRepo = {
   async waitForCompletion(
     key: string,
     timeout_ms: number,
+    expected_payload_hash?: string,
   ): Promise<
     | { status: 'completed'; resultado: unknown }
+    | { status: 'collision' }
     | { status: 'timeout' }
     | { status: 'released' }
     | { status: 'failed' }
@@ -1877,6 +2002,8 @@ export const idempotencyRepo = {
         .select({
           state: idempotency_keys.state,
           resultado: idempotency_keys.resultado,
+          // #299: needed to revalidate the owner's payload on completion.
+          payload_hash: idempotency_keys.payload_hash,
         })
         .from(idempotency_keys)
         .where(
@@ -1894,6 +2021,18 @@ export const idempotencyRepo = {
         return { status: 'released' };
       }
       if (row.state === 'completed') {
+        // #299: revalidate the owner's payload_hash before adopting their
+        // result. A mismatch is a key collision — fail closed.
+        if (
+          expected_payload_hash !== undefined &&
+          row.payload_hash !== expected_payload_hash
+        ) {
+          reportPayloadHashCollision(
+            { key, payload_hash: expected_payload_hash },
+            row,
+          );
+          return { status: 'collision' };
+        }
         return { status: 'completed', resultado: row.resultado };
       }
       if (row.state === 'failed') {

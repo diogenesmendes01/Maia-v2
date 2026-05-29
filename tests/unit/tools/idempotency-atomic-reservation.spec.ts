@@ -47,13 +47,16 @@ const { recorder } = vi.hoisted(() => ({
       reservation_token: 'token-1',
     } as {
       was_inserted: boolean;
-      state: 'in_progress' | 'completed' | 'failed';
+      // #299: 'collision' is the fail-closed outcome when a settled row's
+      // payload_hash differs from the caller's.
+      state: 'in_progress' | 'completed' | 'failed' | 'collision';
       resultado: unknown;
       reservation_token: string | undefined;
     },
     waitForCompletionCalls: [] as Array<unknown>,
     waitForCompletionResult: { status: 'completed', resultado: { ok: true } } as
       | { status: 'completed'; resultado: unknown }
+      | { status: 'collision' }
       | { status: 'timeout' }
       | { status: 'released' }
       | { status: 'failed' },
@@ -80,10 +83,12 @@ vi.mock('@/db/repositories.js', () => ({
       recorder.tryReserveCalls.push(input);
       return recorder.tryReserveResult;
     }),
-    waitForCompletion: vi.fn(async (key: string, timeout: number) => {
-      recorder.waitForCompletionCalls.push({ key, timeout });
-      return recorder.waitForCompletionResult;
-    }),
+    waitForCompletion: vi.fn(
+      async (key: string, timeout: number, expected_payload_hash?: string) => {
+        recorder.waitForCompletionCalls.push({ key, timeout, expected_payload_hash });
+        return recorder.waitForCompletionResult;
+      },
+    ),
     markCompleted: vi.fn(
       async (input: { key: string; resultado: unknown; reservation_token: string }) => {
         recorder.markCompletedCalls.push(input);
@@ -118,6 +123,10 @@ vi.mock('@/lib/logger.js', () => ({
 }));
 vi.mock('@/governance/idempotency.js', () => ({
   computeIdempotencyKey: vi.fn(() => 'computed-key-1'),
+  // #299: the dispatcher now also computes an independent payload_hash and
+  // passes it to tryReserve / waitForCompletion. Return a fixed value so the
+  // input-shape assertions are deterministic.
+  computePayloadHash: vi.fn(() => 'payload-hash-1'),
 }));
 vi.mock('@/governance/permissions.js', async () => {
   const actual = await vi.importActual<typeof import('@/governance/permissions.js')>(
@@ -258,6 +267,70 @@ describe('dispatcher — cache-hit path: tryReserve returns completed', () => {
     expect(recorder.handlerCalls).toBe(0);
     expect(recorder.markCompletedCalls).toHaveLength(0);
     expect(result).toEqual({ cached: 'from_a_prior_dispatch' });
+  });
+});
+
+describe('dispatcher — payload-hash collision path: tryReserve returns collision (#299)', () => {
+  it('fails closed (typed error) and NEVER returns the stale cached result or re-executes', async () => {
+    // #299: a 'completed' row exists under this exact (tenant, agent, key)
+    // but its stored payload_hash differs from ours — a key collision. The
+    // repo signals state='collision'; the dispatcher MUST NOT return the
+    // foreign cached result AND MUST NOT re-execute the handler (which would
+    // clobber the other payload's cached entry). It surfaces a typed error.
+    recorder.tryReserveResult = {
+      was_inserted: false,
+      state: 'collision',
+      resultado: undefined,
+      reservation_token: undefined,
+    };
+    const result = (await dispatchTool({
+      tool: 'fake_tool',
+      args: {},
+      ctx: fakeCtx,
+    })) as { error?: string; details?: { tool?: string } };
+    expect(recorder.handlerCalls).toBe(0); // never re-executes
+    expect(recorder.markCompletedCalls).toHaveLength(0);
+    expect(result.error).toBe('idempotency_payload_hash_collision');
+    expect(result.details?.tool).toBe('fake_tool');
+  });
+
+  it('surfaces idempotency_payload_hash_collision when the OWNER (wait path) settled a colliding payload', async () => {
+    // The loser of a race waits on the owner. If the owner reserved a
+    // colliding payload, waitForCompletion returns status='collision' and
+    // the dispatcher must fail closed rather than adopt the foreign result.
+    recorder.tryReserveResult = {
+      was_inserted: false,
+      state: 'in_progress',
+      resultado: undefined,
+      reservation_token: undefined,
+    };
+    recorder.waitForCompletionResult = { status: 'collision' };
+    const result = (await dispatchTool({
+      tool: 'fake_tool',
+      args: {},
+      ctx: fakeCtx,
+    })) as { error?: string };
+    expect(recorder.handlerCalls).toBe(0);
+    expect(recorder.waitForCompletionCalls).toHaveLength(1);
+    expect(result.error).toBe('idempotency_payload_hash_collision');
+  });
+
+  it('forwards the computed payload_hash to waitForCompletion for revalidation', async () => {
+    recorder.tryReserveResult = {
+      was_inserted: false,
+      state: 'in_progress',
+      resultado: undefined,
+      reservation_token: undefined,
+    };
+    recorder.waitForCompletionResult = { status: 'completed', resultado: { ok: 1 } };
+    await dispatchTool({ tool: 'fake_tool', args: {}, ctx: fakeCtx });
+    expect(recorder.waitForCompletionCalls).toHaveLength(1);
+    const call = recorder.waitForCompletionCalls[0] as {
+      key: string;
+      expected_payload_hash?: string;
+    };
+    expect(call.key).toBe('computed-key-1');
+    expect(call.expected_payload_hash).toBe('payload-hash-1');
   });
 });
 
@@ -456,11 +529,15 @@ describe('dispatcher — tryReserve input shape', () => {
       entity_id: string;
       tool_name: string;
       operation_type: string;
+      payload_hash: string;
     };
     expect(call.key).toBe('computed-key-1');
     expect(call.pessoa_id).toBe('p1');
     expect(call.entity_id).toBe('e-1');
     expect(call.tool_name).toBe('fake_tool');
     expect(call.operation_type).toBe('create');
+    // #299: the dispatcher passes the REAL payload fingerprint (NOT the
+    // idempotency_key) so tryReserve can revalidate it on a cache hit.
+    expect(call.payload_hash).toBe('payload-hash-1');
   });
 });

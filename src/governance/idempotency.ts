@@ -100,6 +100,50 @@ export function normalizePayload(p: unknown): string {
   return sha256(JSON.stringify(out));
 }
 
+/**
+ * Compute a stable hash of the FULL request fingerprint, distinct from
+ * `computeIdempotencyKey`. Used by the repo as a defense-in-depth check
+ * on cache hits: if `(tenant_id, agent_id, key)` matches but `payload_hash`
+ * differs, the row is a key collision (truncated hash, derivator bug, or
+ * unflushed cache after a schema change) — return null and warn.
+ *
+ * Why a separate hash and not just the idempotency_key?
+ *   - `computeIdempotencyKey` bakes in a bucket-minutes timestamp (so the
+ *     same payload in different buckets is treated as a fresh action).
+ *   - On a hit, what we want to verify is "is the cached *payload* the same
+ *     payload I'm asking about?". Re-computing the full key would always
+ *     match (we used it to find the row in the first place), so we need an
+ *     independent fingerprint of the inputs that actually feed the side
+ *     effect: pessoa_id, entity_id, tool_name, operation_type, normalized
+ *     payload, file_sha256. We deliberately exclude the bucket so this is
+ *     bucket-independent.
+ *   - SHA256 of the canonicalized tuple — 256-bit, no truncation, no
+ *     dialect dependency. Collision probability negligible vs. the original
+ *     concern of key collision.
+ *
+ * Issue #299.
+ */
+export function computePayloadHash(input: {
+  pessoa_id: string;
+  entity_id: string;
+  tool_name: string;
+  operation_type: string;
+  payload: unknown;
+  file_sha256?: string;
+}): string {
+  const parts = [
+    input.pessoa_id,
+    input.entity_id,
+    input.tool_name,
+    input.operation_type,
+    input.file_sha256 ?? '',
+    // For file-based ops the payload itself is meaningless (file_sha256 is
+    // the fingerprint); for textual ops it's the normalized payload hash.
+    input.file_sha256 ? '' : normalizePayload(input.payload),
+  ];
+  return sha256(parts.join('|'));
+}
+
 export function computeIdempotencyKey(input: {
   pessoa_id: string;
   entity_id: string;

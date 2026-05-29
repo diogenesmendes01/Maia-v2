@@ -3,7 +3,7 @@ import type { ResolvedPermission } from '@/governance/permissions.js';
 import { canAct } from '@/governance/permissions.js';
 import { constitutionalCheck } from '@/governance/rules.js';
 import { REGISTRY, isToolEnabled, type AnyTool } from './_registry.js';
-import { computeIdempotencyKey } from '@/governance/idempotency.js';
+import { computeIdempotencyKey, computePayloadHash } from '@/governance/idempotency.js';
 import { idempotencyRepo } from '@/db/repositories.js';
 import { audit } from '@/governance/audit.js';
 import { isRedisConnected } from '@/lib/redis.js';
@@ -150,6 +150,22 @@ export async function dispatchTool(input: {
     payload: args,
     file_sha256,
   });
+  // #299: payload_hash is INDEPENDENT of idempotency_key (no bucket). On a
+  // cache hit `tryReserve` re-checks the stored row's payload_hash against
+  // this value — defends against key collision (truncated hash, derivator
+  // regression, or stale cache after a schema change) returning a wrong
+  // cached result for a DISTINCT payload. Note that before #298 the cache
+  // hit happened in `idempotencyRepo.lookup`; #298 moved the dispatcher onto
+  // the atomic `tryReserve` path, so the revalidation now lives there (and
+  // in `waitForCompletion` for the loser-of-the-race branch below).
+  const payload_hash = computePayloadHash({
+    pessoa_id: input.ctx.pessoa.id,
+    entity_id,
+    tool_name: tool.name,
+    operation_type: tool.operation_type,
+    payload: args,
+    file_sha256,
+  });
 
   // Issue #298: atomic reservation closes the check-then-act race.
   //
@@ -183,14 +199,39 @@ export async function dispatchTool(input: {
     operation_type: tool.operation_type,
     pessoa_id: input.ctx.pessoa.id,
     entity_id,
-    payload_hash: idempotency_key,
+    // #299: store/compare the REAL payload fingerprint (was incorrectly
+    // `idempotency_key` before, which made the collision check a tautology
+    // — the key always matches itself). `tryReserve` echoes this hash into
+    // the reserved row and revalidates it on a `completed` hit.
+    payload_hash,
     file_sha256,
     ttl_seconds: RESERVATION_TTL_SECONDS,
   });
 
+  if (!reservation.was_inserted && reservation.state === 'collision') {
+    // #299: an existing `completed` row under this exact (tenant, agent,
+    // key) carries a DIFFERENT payload_hash — a key collision. Returning
+    // its `resultado` would hand the caller a result computed for a
+    // different payload (silent wrong side effect). Fail closed: surface a
+    // typed error instead of the stale cache entry. We do NOT re-execute
+    // under the colliding key (that would clobber the other payload's
+    // cached result); a true collision signals a derivation bug / hash
+    // truncation that must be loud, not silently papered over. The
+    // collision is logged + metered inside `tryReserve`.
+    logger.warn(
+      { tool: tool.name, idempotency_key },
+      'tool.idempotency_payload_hash_collision',
+    );
+    return {
+      error: 'idempotency_payload_hash_collision',
+      details: { tool: tool.name, idempotency_key },
+    };
+  }
+
   if (!reservation.was_inserted && reservation.state === 'completed') {
-    // Cache hit — another worker already completed this exact call. Skip
-    // execution and return the cached output.
+    // Cache hit — another worker already completed this exact call with a
+    // MATCHING payload_hash (verified in tryReserve). Skip execution and
+    // return the cached output.
     logger.debug({ tool: tool.name, idempotency_key }, 'tool.idempotency_hit');
     return reservation.resultado;
   }
@@ -223,7 +264,25 @@ export async function dispatchTool(input: {
     const waited = await idempotencyRepo.waitForCompletion(
       idempotency_key,
       WAIT_TIMEOUT_MS,
+      // #299: revalidate the OWNER's stored payload_hash before adopting
+      // their result. If the winner reserved a colliding payload (same
+      // key, different inputs), the loser must not return that foreign
+      // result either — fail closed instead of leaking the wrong side
+      // effect across a key collision.
+      payload_hash,
     );
+    if (waited.status === 'collision') {
+      // The settled row carries a different payload_hash than ours.
+      // Surface the same typed collision error as the direct-hit path.
+      logger.warn(
+        { tool: tool.name, idempotency_key },
+        'tool.idempotency_payload_hash_collision',
+      );
+      return {
+        error: 'idempotency_payload_hash_collision',
+        details: { tool: tool.name, idempotency_key },
+      };
+    }
     if (waited.status === 'completed') {
       logger.debug(
         { tool: tool.name, idempotency_key },
@@ -317,6 +376,10 @@ export async function dispatchTool(input: {
     return { error: 'execution_failed', details: { cause: 'output_schema_violation' } };
   }
 
+  // #299/#298: payload_hash was already written to the reserved row by
+  // tryReserve (the REAL fingerprint, not idempotency_key). markCompleted
+  // only transitions in_progress→completed and persists the result; it
+  // does not re-stamp identity columns. So no payload_hash here.
   const completed = await idempotencyRepo.markCompleted({
     key: idempotency_key,
     resultado: out.data,
