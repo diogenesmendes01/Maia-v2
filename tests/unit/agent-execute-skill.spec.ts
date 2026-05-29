@@ -11,7 +11,7 @@
  *  - !ok ⇒ fall through to the normal turn.
  *  - no reply ⇒ fall through (never fabricate text).
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
 import {
   executeSelectedSkill,
   buildSkillInput,
@@ -19,6 +19,7 @@ import {
   type ExecuteSelectedSkillDeps,
   type PinnedSkillIdentity,
 } from '@/agent/execute-skill.js';
+import { config } from '@/config/env.js';
 import type { Pessoa, Conversa, Mensagem } from '@/db/schema.js';
 import type { SkillExecutionOutput } from '@/skills/types.js';
 
@@ -351,5 +352,136 @@ describe('F1 Phase 1 — executeSelectedSkill', () => {
     expect(outcome).toEqual({ handled: true });
     const ctx = (deps.safeDispatchOutput as ReturnType<typeof vi.fn>).mock.calls[0]![0];
     expect(ctx.text).toBe('Sua solicitação foi aprovada.');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #238 Improvement 2 — per-turn outbound ledger guard at the TOP of
+// executeSelectedSkill. When the ledger already records this turn as
+// 'sent' / 'unknown' / 'pending', short-circuit BEFORE running the skill
+// (saves an LLM call + tool dispatch — the boundary guard in
+// safeDispatchOutput already protects from double-send; this avoids the
+// now-pointless work).
+//
+// Gated by FEATURE_OUTBOUND_DEDUP. Fail-OPEN on lookup throws so a DB blip
+// doesn't block legitimate sends. 'failed' rows / no row → skill runs.
+// ---------------------------------------------------------------------------
+describe('#238 Improvement 2 — per-turn outbound ledger guard', () => {
+  const origFlag = config.FEATURE_OUTBOUND_DEDUP;
+  beforeAll(() => {
+    (config as { FEATURE_OUTBOUND_DEDUP: boolean }).FEATURE_OUTBOUND_DEDUP = true;
+  });
+  afterAll(() => {
+    (config as { FEATURE_OUTBOUND_DEDUP: boolean }).FEATURE_OUTBOUND_DEDUP =
+      origFlag;
+  });
+
+  function row(status: 'pending' | 'sent' | 'failed' | 'unknown') {
+    return {
+      id: 'ob_1',
+      tenant_id: 'tnt',
+      agent_id: 'ag_1',
+      idempotency_key: 'c_1:msg_1',
+      conversa_id: 'c_1',
+      in_reply_to: 'msg_1',
+      channel: 'text',
+      provider_message_id: status === 'sent' ? 'wid_prior' : null,
+      status,
+      error: null,
+      sent_at: status === 'sent' ? new Date() : null,
+      created_at: new Date(),
+    };
+  }
+
+  it('prior sent row ⇒ skill NOT run, handled:true (no LLM call wasted)', async () => {
+    const deps = mkDeps({
+      findOutboundLedgerForTurn: vi.fn().mockResolvedValue(row('sent')),
+    });
+    const outcome = await executeSelectedSkill(mkArgs(), deps);
+    expect(outcome).toEqual({ handled: true });
+    expect(deps.runSkill).not.toHaveBeenCalled();
+    expect(deps.resolveActiveSkill).not.toHaveBeenCalled();
+    expect(deps.safeDispatchOutput).not.toHaveBeenCalled();
+  });
+
+  it('prior unknown row ⇒ skill NOT run, handled:true', async () => {
+    const deps = mkDeps({
+      findOutboundLedgerForTurn: vi.fn().mockResolvedValue(row('unknown')),
+    });
+    const outcome = await executeSelectedSkill(mkArgs(), deps);
+    expect(outcome).toEqual({ handled: true });
+    expect(deps.runSkill).not.toHaveBeenCalled();
+  });
+
+  it('prior pending row (in-flight by another worker) ⇒ skill NOT run, handled:true', async () => {
+    const deps = mkDeps({
+      findOutboundLedgerForTurn: vi.fn().mockResolvedValue(row('pending')),
+    });
+    const outcome = await executeSelectedSkill(mkArgs(), deps);
+    expect(outcome).toEqual({ handled: true });
+    expect(deps.runSkill).not.toHaveBeenCalled();
+  });
+
+  it('prior failed row ⇒ skill RUNS (retry safe — nothing reached the user)', async () => {
+    const deps = mkDeps({
+      findOutboundLedgerForTurn: vi.fn().mockResolvedValue(row('failed')),
+    });
+    const outcome = await executeSelectedSkill(mkArgs(), deps);
+    expect(outcome).toEqual({ handled: true });
+    expect(deps.runSkill).toHaveBeenCalledOnce();
+    expect(deps.safeDispatchOutput).toHaveBeenCalledOnce();
+  });
+
+  it('no prior row ⇒ skill RUNS', async () => {
+    const deps = mkDeps({
+      findOutboundLedgerForTurn: vi.fn().mockResolvedValue(null),
+    });
+    const outcome = await executeSelectedSkill(mkArgs(), deps);
+    expect(outcome).toEqual({ handled: true });
+    expect(deps.runSkill).toHaveBeenCalledOnce();
+  });
+
+  it('ledger lookup THROWS ⇒ fail-OPEN: skill runs (DB hiccup MUST NOT silence the user)', async () => {
+    const warn = vi.fn();
+    const deps = mkDeps({
+      findOutboundLedgerForTurn: vi
+        .fn()
+        .mockRejectedValue(new Error('db_blip')),
+      logger: { info: vi.fn(), warn, error: vi.fn() },
+    });
+    const outcome = await executeSelectedSkill(mkArgs(), deps);
+    expect(outcome).toEqual({ handled: true });
+    expect(deps.runSkill).toHaveBeenCalledOnce();
+    // Lookup failure is logged at warn (NOT silently swallowed).
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ err: 'db_blip' }),
+      'skill.outbound_ledger_lookup_failed_proceeding',
+    );
+  });
+
+  it('FLAG OFF ⇒ guard is a NO-OP (skill runs unconditionally)', async () => {
+    (config as { FEATURE_OUTBOUND_DEDUP: boolean }).FEATURE_OUTBOUND_DEDUP =
+      false;
+    try {
+      const findOutboundLedgerForTurn = vi.fn().mockResolvedValue(row('sent'));
+      const deps = mkDeps({ findOutboundLedgerForTurn });
+      const outcome = await executeSelectedSkill(mkArgs(), deps);
+      // Skill ran AND dispatched — guard didn't fire because the flag was off.
+      expect(outcome).toEqual({ handled: true });
+      expect(findOutboundLedgerForTurn).not.toHaveBeenCalled();
+      expect(deps.runSkill).toHaveBeenCalledOnce();
+    } finally {
+      (config as { FEATURE_OUTBOUND_DEDUP: boolean }).FEATURE_OUTBOUND_DEDUP =
+        true;
+    }
+  });
+
+  it('findOutboundLedgerForTurn dep ABSENT ⇒ guard is a NO-OP (no crash on legacy callers)', async () => {
+    // Backwards compat: callers that haven't wired the new dep yet shouldn't
+    // crash — the guard simply doesn't apply.
+    const deps = mkDeps(); // no findOutboundLedgerForTurn override → undefined
+    const outcome = await executeSelectedSkill(mkArgs(), deps);
+    expect(outcome).toEqual({ handled: true });
+    expect(deps.runSkill).toHaveBeenCalledOnce();
   });
 });

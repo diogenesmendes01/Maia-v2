@@ -32,6 +32,8 @@ import type {
   SkillExecutionInput,
   SkillExecutionOutput,
 } from '@/skills/types.js';
+import { config } from '@/config/env.js';
+import type { OutboundMessageRow } from '@/db/repositories.js';
 import type { DispatchOutputCtx, DispatchOutcome } from './output-dispatch.js';
 
 /** Minimal active-skill identity needed for the pre-execution assert. */
@@ -68,6 +70,21 @@ export type ExecuteSkillOutcome =
         | 'no_reply';
     };
 
+/**
+ * Issue #227 per-turn guard (Improvement 2). Tenant+agent-scoped lookup of the
+ * outbound ledger row for `(conversa_id, in_reply_to)` — implemented as a thin
+ * wrapper over `outboundMessagesRepo.findByKey('${conversa_id}:${in_reply_to}')`
+ * (keys are turn-scoped by design — see migration 063 header).
+ *
+ * Fail-OPEN contract: this MUST be a `try/catch` swallow in the wiring caller —
+ * a DB hiccup here MUST NOT block a legitimate skill run (liveness > strict
+ * dedupe — same posture as `claimOutboundLedgerOrFailOpen`).
+ */
+export type FindOutboundLedgerForTurn = (args: {
+  conversa_id: string;
+  in_reply_to: string;
+}) => Promise<OutboundMessageRow | null>;
+
 export interface ExecuteSelectedSkillDeps {
   /** Re-resolve the currently-active skill (by descriptor, under routed agent). */
   resolveActiveSkill: (
@@ -82,6 +99,19 @@ export interface ExecuteSelectedSkillDeps {
    * the caller maps to fall-through vs. handled, instead of throwing.
    */
   safeDispatchOutput: (ctx: DispatchOutputCtx) => Promise<DispatchOutcome>;
+  /**
+   * Issue #227 per-turn guard. Tenant+agent-scoped lookup of the outbound
+   * ledger row for `(conversa_id, in_reply_to)`. When present and `status` is
+   * `sent` / `unknown` / `pending`, `executeSelectedSkill` short-circuits
+   * BEFORE running the skill — saving an LLM call + tool dispatch (the
+   * boundary guard in `safeDispatchOutput` already protects from double-send;
+   * this avoids the now-pointless work).
+   *
+   * Gated by `FEATURE_OUTBOUND_DEDUP`: when the flag is off this is unused.
+   * Fail-open: if the lookup throws, we run the skill (DB hiccup must not
+   * block a legitimate reply).
+   */
+  findOutboundLedgerForTurn?: FindOutboundLedgerForTurn;
   logger: {
     info: (obj: unknown, msg: string) => void;
     warn: (obj: unknown, msg: string) => void;
@@ -190,6 +220,67 @@ export async function executeSelectedSkill(
       'skill.execute_skipped_no_pinned_identity',
     );
     return { handled: false, reason: 'no_pinned_identity' };
+  }
+
+  // #227 per-turn guard (Improvement 2). When the outbound idempotency ledger
+  // already records this exact turn as 'sent' / 'unknown' / 'pending', a
+  // prior attempt either delivered, might have delivered, or is in-flight by
+  // another worker. The boundary guard in `safeDispatchOutput` already blocks
+  // a 2nd send, but by then we've already paid for the skill run (LLM call +
+  // tool dispatch). Short-circuit here to save that work.
+  //
+  // Gated by FEATURE_OUTBOUND_DEDUP: no-op when the flag is off (same posture
+  // as the ledger helpers in output-dispatch.ts). Fail-OPEN: a DB hiccup MUST
+  // NOT block the skill run — liveness > strict dedupe (mirrors
+  // `claimOutboundLedgerOrFailOpen`).
+  //
+  // `failed` rows (and no row) fall through — nothing reached the user, so
+  // running the skill is safe (the inner `claimOutboundLedger` will atomically
+  // reclaim the failed row).
+  if (config.FEATURE_OUTBOUND_DEDUP && deps.findOutboundLedgerForTurn) {
+    let prior: OutboundMessageRow | null = null;
+    try {
+      prior = await deps.findOutboundLedgerForTurn({
+        conversa_id: conversa.id,
+        in_reply_to: inbound.id,
+      });
+    } catch (e) {
+      // Fail-open: log + proceed as if there's no prior row. Same contract as
+      // `safeDispatchOutput`'s findByKey try/catch — a DB blip turning into
+      // user silence is a worse failure mode than a tiny extra-work window.
+      deps.logger.warn(
+        {
+          conversa_id: conversa.id,
+          turno_id: inbound.id,
+          err: (e as Error).message,
+        },
+        'skill.outbound_ledger_lookup_failed_proceeding',
+      );
+    }
+    if (
+      prior &&
+      (prior.status === 'sent' ||
+        prior.status === 'unknown' ||
+        prior.status === 'pending')
+    ) {
+      // BLOCK the skill run. `handled: true` signals core.ts that this turn
+      // is terminal (touch / markAllProcessed / clearDebounceState run, no
+      // LLM turn). No double-send risk — the prior attempt already produced
+      // the user-facing artefact (mensagens row for 'sent', breadcrumb for
+      // 'unknown'/'pending'). Saves the LLM call + skill tool dispatch.
+      deps.logger.warn(
+        {
+          conversa_id: conversa.id,
+          turno_id: inbound.id,
+          skill_descriptor: pinned.selected_skill_descriptor,
+          prior_status: prior.status,
+          prior_provider_message_id: prior.provider_message_id,
+          prior_idempotency_key: prior.idempotency_key,
+        },
+        'skill.outbound_ledger_blocked_pre_skill',
+      );
+      return { handled: true };
+    }
   }
 
   // Contract 1b: re-resolve the active skill by descriptor under the routed

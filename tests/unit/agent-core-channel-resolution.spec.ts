@@ -32,6 +32,7 @@ const {
   loggerMock,
   findMensagemMock,
   adoptToResolvedTenantMock,
+  findOwnerByIdCrossTenantMock,
   runWithTenantContextMock,
   buildPromptMock,
   runReActLoopMock,
@@ -48,7 +49,12 @@ const {
     error: vi.fn(),
   };
   const findMensagemMock = vi.fn();
-  const adoptToResolvedTenantMock = vi.fn().mockResolvedValue(undefined);
+  // [Codex review #311] adoption is now a compare-and-swap returning a boolean
+  // (`true` = this call won the swap out of default/default). Default the mock
+  // to `true` so existing happy-path specs keep exercising the "we adopted it"
+  // branch. The dedicated race specs override per-case.
+  const adoptToResolvedTenantMock = vi.fn().mockResolvedValue(true);
+  const findOwnerByIdCrossTenantMock = vi.fn();
   const runWithTenantContextMock = vi.fn(
     async (_ctx: unknown, fn: () => Promise<unknown>) => fn(),
   );
@@ -66,6 +72,7 @@ const {
     loggerMock,
     findMensagemMock,
     adoptToResolvedTenantMock,
+    findOwnerByIdCrossTenantMock,
     runWithTenantContextMock,
     buildPromptMock,
     runReActLoopMock,
@@ -126,6 +133,7 @@ vi.mock('@/db/repositories.js', () => ({
     setConversaIdMany: vi.fn().mockResolvedValue(undefined),
     listUnprocessedByTelefone: vi.fn().mockResolvedValue([]),
     adoptToResolvedTenantCrossTenant: adoptToResolvedTenantMock,
+    findOwnerByIdCrossTenant: findOwnerByIdCrossTenantMock,
   },
   conversasRepo: {
     touch: vi.fn().mockResolvedValue(undefined),
@@ -257,6 +265,10 @@ describe('runAgentForMensagem — channel resolution fail-loud (issue #268)', ()
     // Defaults: flag OFF, no packet, healthy mensagem
     isMultiChannelOn.value = false;
     isContextPacketV1EnabledMock.mockResolvedValue(false);
+    // [Codex review #311] Default adoption to "we won the swap" so the
+    // happy-path specs never reach the owner re-check. Race specs override.
+    adoptToResolvedTenantMock.mockResolvedValue(true);
+    findOwnerByIdCrossTenantMock.mockResolvedValue(null);
 
     findMensagemMock.mockResolvedValue({
       id: 'msg1',
@@ -333,6 +345,10 @@ describe('runAgentForMensagem — channel resolution fail-loud (issue #268)', ()
     const callOrder: string[] = [];
     adoptToResolvedTenantMock.mockImplementationOnce(async () => {
       callOrder.push('adopt');
+      // [Codex review #311] return true = THIS call won the compare-and-swap
+      // out of default/default. Without this the caller would treat the
+      // adoption as a lost race and reach the owner re-check.
+      return true;
     });
     runWithTenantContextMock.mockImplementationOnce(async (_ctx, fn) => {
       callOrder.push('runWithTenantContext');
@@ -364,6 +380,116 @@ describe('runAgentForMensagem — channel resolution fail-loud (issue #268)', ()
       tenant_id: 'tenant-acme',
       agent_id: 'agent-main',
     });
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // [Codex review #311 — CRITICAL P0] cross-tenant adoption race at the caller.
+  //
+  // adoptToResolvedTenantCrossTenant is a compare-and-swap: it returns `false`
+  // when the row was NOT still default/default. The caller must then re-check
+  // the owner and ONLY proceed when it matches the tenant WE resolved. A row
+  // owned by a DIFFERENT tenant must abort the turn (throw + audit) — never
+  // run under our resolved context (that is the cross-tenant leak this fix
+  // closes).
+  // ──────────────────────────────────────────────────────────────────────────
+  it('Flag ON + adoção retorna false + row pertence a OUTRO tenant → aborta (throw + audit), NÃO entra em runWithTenantContext', async () => {
+    isMultiChannelOn.value = true;
+    resolveChannelMock.mockResolvedValueOnce({
+      tenant_id: 'tenant-B',
+      agent_id: 'agent-B',
+      channel_id: 'ch-b',
+    });
+    // We tried to adopt into tenant-B but lost the swap: the row is no longer
+    // default/default.
+    adoptToResolvedTenantMock.mockResolvedValueOnce(false);
+    // Cross-tenant owner re-check: the row was already adopted by tenant-A.
+    findOwnerByIdCrossTenantMock.mockResolvedValueOnce({
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-A',
+    });
+
+    const { TypedError } = await import('@/lib/utils.js');
+    const { runAgentForMensagem } = await import('@/agent/core.js');
+
+    await expect(runAgentForMensagem('msg1')).rejects.toBeInstanceOf(TypedError);
+
+    expect(adoptToResolvedTenantMock).toHaveBeenCalledTimes(1);
+    expect(findOwnerByIdCrossTenantMock).toHaveBeenCalledWith('msg1');
+
+    // CRITICAL: the turn must NOT run under tenant-B (the tenant we resolved)
+    // because the row belongs to tenant-A. No runWithTenantContext at all.
+    expect(runWithTenantContextMock).not.toHaveBeenCalled();
+
+    // A conflict audit is emitted so operators can spot the race.
+    const conflictAudits = auditMock.mock.calls.filter(
+      (call) =>
+        call[0]?.metadata?.error_code === 'cross_tenant_adoption_conflict',
+    );
+    expect(conflictAudits).toHaveLength(1);
+    expect(conflictAudits[0]![0].mensagem_id).toBe('msg1');
+    // The audit must NOT carry the foreign owner's tenant/agent (minimal leak
+    // surface) — only that an owner was present.
+    expect(conflictAudits[0]![0].metadata.owner_present).toBe(true);
+    expect(conflictAudits[0]![0].metadata).not.toHaveProperty('owner_tenant_id');
+  });
+
+  it('Flag ON + adoção retorna false + row JÁ pertence ao tenant resolvido → idempotente, segue processando', async () => {
+    // BullMQ retry: a prior attempt already adopted the row into tenant-acme.
+    // The second attempt loses the swap (false) but the owner re-check confirms
+    // WE own it → safe to proceed under tenant-acme.
+    isMultiChannelOn.value = true;
+    resolveChannelMock.mockResolvedValueOnce({
+      tenant_id: 'tenant-acme',
+      agent_id: 'agent-main',
+      channel_id: 'ch-abc',
+    });
+    adoptToResolvedTenantMock.mockResolvedValueOnce(false);
+    findOwnerByIdCrossTenantMock.mockResolvedValueOnce({
+      tenant_id: 'tenant-acme',
+      agent_id: 'agent-main',
+    });
+
+    const { runAgentForMensagem } = await import('@/agent/core.js');
+    await runAgentForMensagem('msg1');
+
+    expect(findOwnerByIdCrossTenantMock).toHaveBeenCalledWith('msg1');
+    // No conflict audit — this is a benign idempotent re-run.
+    const conflictAudits = auditMock.mock.calls.filter(
+      (call) =>
+        call[0]?.metadata?.error_code === 'cross_tenant_adoption_conflict',
+    );
+    expect(conflictAudits).toHaveLength(0);
+    // Proceeds under the tenant we resolved (and that we confirmed we own).
+    expect(runWithTenantContextMock).toHaveBeenCalled();
+    expect(runWithTenantContextMock.mock.calls[0]![0]).toEqual({
+      tenant_id: 'tenant-acme',
+      agent_id: 'agent-main',
+    });
+  });
+
+  it('Flag ON + adoção retorna false + row sumiu (owner null) → aborta (throw + audit), NÃO processa', async () => {
+    // Defensive: the row vanished between persist and adoption (GC, manual
+    // delete). We must not fabricate a context — abort.
+    isMultiChannelOn.value = true;
+    resolveChannelMock.mockResolvedValueOnce({
+      tenant_id: 'tenant-acme',
+      agent_id: 'agent-main',
+      channel_id: 'ch-abc',
+    });
+    adoptToResolvedTenantMock.mockResolvedValueOnce(false);
+    findOwnerByIdCrossTenantMock.mockResolvedValueOnce(null);
+
+    const { TypedError } = await import('@/lib/utils.js');
+    const { runAgentForMensagem } = await import('@/agent/core.js');
+
+    await expect(runAgentForMensagem('msg1')).rejects.toBeInstanceOf(TypedError);
+    expect(runWithTenantContextMock).not.toHaveBeenCalled();
+    const conflictAudits = auditMock.mock.calls.filter(
+      (call) =>
+        call[0]?.metadata?.error_code === 'cross_tenant_adoption_conflict',
+    );
+    expect(conflictAudits).toHaveLength(1);
+    expect(conflictAudits[0]![0].metadata.owner_present).toBe(false);
   });
 
   it('Flag ON + resolveChannel devolve default/default (cenário degenerado) → adoção NÃO é chamada (no-op skip)', async () => {
