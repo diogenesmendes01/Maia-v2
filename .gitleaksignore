@@ -7,3 +7,13 @@
 # `--log-opts="origin/main..HEAD"`. Suppress by fingerprint so a NEW leak
 # elsewhere is still detected.
 d9a4afbefc0a8c911ec6628611e1f5889c913e75:tests/admin-ui/unit/auth-gating.spec.ts:generic-api-key:133
+
+# PR #326 (#316): generic-api-key tripped on a fake unit-test fixture at
+# idempotency-outbox-dispatcher.spec.ts:150 — a toMatchObject assertion on a
+# mock recorder's call args (the computed-idempotency-key string, low entropy
+# ~3.5, no resemblance to a real credential), NOT a secret. An inline
+# `gitleaks:allow` does NOT clear it: the action scans each commit's diff over
+# `--log-opts=origin/main..HEAD`, the value lives in the introducing commit's
+# diff, and a comment added in a later commit lands on a different line/commit.
+# Suppress by fingerprint so a NEW leak elsewhere is still detected.
+affab7a1e22c46a1d7369c0bcc238b6f7021af05:tests/unit/tools/idempotency-outbox-dispatcher.spec.ts:generic-api-key:150
