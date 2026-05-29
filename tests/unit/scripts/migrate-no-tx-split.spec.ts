@@ -35,20 +35,20 @@ function readMig(file: string): string {
 }
 
 describe('PR #310 — no-tx migration statement splitter', () => {
-  it('detects the maia:no-transaction marker on migration 066', () => {
-    const sql = readMig('066_ksm_composite_indexes_tenant_agent_id.sql');
+  it('detects the maia:no-transaction marker on migration 069', () => {
+    const sql = readMig('069_ksm_composite_indexes_tenant_agent_id.sql');
     expect(NO_TX_MARKER.test(sql)).toBe(true);
   });
 
   it('does NOT flag a normal transactional migration as no-tx', () => {
-    // 063 mentions the marker only inside a comment paragraph; it must
+    // 066 mentions the marker only inside a comment paragraph; it must
     // NOT match (the regex anchors on a line that *starts* with the marker).
-    const sql = readMig('063_p10_idempotency_keys_tenant_pk.sql');
+    const sql = readMig('066_p10_idempotency_keys_tenant_pk.sql');
     expect(NO_TX_MARKER.test(sql)).toBe(false);
   });
 
-  it('splits migration 066 into 8 separate CREATE INDEX statements', () => {
-    const sql = readMig('066_ksm_composite_indexes_tenant_agent_id.sql');
+  it('splits migration 069 into 8 separate CREATE INDEX statements', () => {
+    const sql = readMig('069_ksm_composite_indexes_tenant_agent_id.sql');
     const stmts = splitNoTxStatements(sql);
     expect(stmts).toHaveLength(8);
     for (const stmt of stmts) {
@@ -59,8 +59,8 @@ describe('PR #310 — no-tx migration statement splitter', () => {
     }
   });
 
-  it('splits the 066 down migration into 8 DROP INDEX statements', () => {
-    const sql = readMig('066_ksm_composite_indexes_tenant_agent_id_down.sql');
+  it('splits the 069 down migration into 8 DROP INDEX statements', () => {
+    const sql = readMig('069_ksm_composite_indexes_tenant_agent_id_down.sql');
     const stmts = splitNoTxStatements(sql);
     expect(stmts).toHaveLength(8);
     for (const stmt of stmts) {

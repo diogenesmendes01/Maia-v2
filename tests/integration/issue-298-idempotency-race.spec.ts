@@ -18,8 +18,8 @@
  * race.spec.ts` and the rest of `tests/integration/`.
  *
  * Migration prerequisites (manual checklist when running):
- *   1. The TEST_DB_URL database has migrations 001–064 applied.
- *      Specifically, migration 064_p10_idempotency_keys_atomic_reservation
+ *   1. The TEST_DB_URL database has migrations 001–067 applied.
+ *      Specifically, migration 067_p10_idempotency_keys_atomic_reservation
  *      adds the `state` and `expires_at` columns + the state/coherence
  *      CHECK constraints. Tests fail loudly if it hasn't been applied
  *      (the INSERT will reject state='in_progress' rows without it).

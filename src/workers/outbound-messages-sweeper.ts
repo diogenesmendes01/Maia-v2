@@ -30,7 +30,7 @@
  *     de cada turno via `pg_advisory_xact_lock(hashtext(${tenant}:${agent}:
  *     ${idempotency_key}))` — esse advisory lock É o marcador de in-flight do
  *     ledger (não há coluna locked_until; o status='pending' + o advisory lock
- *     do claim são o mecanismo, ver migrations/063_outbound_messages.sql e
+ *     do claim são o mecanismo, ver migrations/064_outbound_messages.sql e
  *     repositories.ts upsertPending). O sweeper adquire o MESMO lock por row
  *     com `pg_try_advisory_xact_lock` antes de promover: se um claim concorrente
  *     segura o lock, a row é PULADA neste pass. Combinado com `FOR UPDATE SKIP

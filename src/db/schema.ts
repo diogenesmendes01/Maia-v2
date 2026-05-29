@@ -560,7 +560,7 @@ export const pending_questions = pgTable('pending_questions', {
 // now, so a collision via the hash alone is no longer possible — but the
 // composite PK makes the storage layer reflect the true identity tuple and
 // guards against any future caller that bypasses `computeIdempotencyKey`.
-// See migration 063_p10_idempotency_keys_tenant_pk.
+// See migration 066_p10_idempotency_keys_tenant_pk.
 //
 // Issue #298: atomic reservation via INSERT ON CONFLICT.
 //   - `state` distinguishes a reservation in flight ('in_progress') from a
@@ -612,7 +612,7 @@ export const idempotency_keys = pgTable(
 // (any channel). Pre-send optimistic insert + status-aware guard closes the
 // "delivered-but-threw" window left open by #216 phase-tagging. Distinct from
 // outbox_messages (async worker queue) — this is the synchronous reply ledger.
-// See migrations/063_outbound_messages.sql for the full design + status
+// See migrations/064_outbound_messages.sql for the full design + status
 // semantics (pending|sent|failed|unknown — 'unknown' is the no-re-send crux).
 export const outbound_messages = pgTable(
   'outbound_messages',
