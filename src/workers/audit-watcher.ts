@@ -4,7 +4,7 @@ import { audit_log } from '@/db/schema.js';
 import type { AuditAction } from '@/governance/audit-actions.js';
 import { sendAlert } from '@/lib/alerts.js';
 import { logger } from '@/lib/logger.js';
-import { runWithTenantContext } from '@/db/tenant-context.js';
+import { runWithSystemContext } from '@/db/tenant-context.js';
 
 /**
  * Audit-driven anomaly watcher. Runs every minute via the worker registry
@@ -152,8 +152,12 @@ async function maybeAlert(rule: Rule, detail: string): Promise<void> {
 }
 
 export async function runAuditWatcher(): Promise<void> {
-  // P0: single-tenant default. P6 will fan-out per tenant.
-  await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+  // Genuinely-GLOBAL maintenance (issue #323 phase 2): every rule query
+  // aggregates `audit_log` filtered ONLY by `acao` + `created_at` (no
+  // tenant_id/agent_id predicate), so it is a cross-tenant anomaly watcher by
+  // design — the rows it reads are identical under any context. Re-homed from
+  // the legacy `default/default` literal to the reserved `system` sentinel.
+  await runWithSystemContext(async () => {
     for (const rule of RULES) {
       try {
         if (rule.kind === 'threshold') await checkThreshold(rule);

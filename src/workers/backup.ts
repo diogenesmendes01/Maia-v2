@@ -6,7 +6,7 @@ import { audit } from '@/governance/audit.js';
 import { sendAlert } from '@/lib/alerts.js';
 import { logger } from '@/lib/logger.js';
 import { isS3Configured, uploadBackup, pruneCloud } from './backup-s3.js';
-import { runWithTenantContext } from '@/db/tenant-context.js';
+import { runWithSystemContext } from '@/db/tenant-context.js';
 
 function tsName(): string {
   return `maia-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.dump`;
@@ -21,11 +21,11 @@ function tsName(): string {
  * is logged once per run instead of failing.
  */
 export async function runNightlyBackup(): Promise<void> {
-  // P0: single-tenant default. P6 will fan-out per tenant.
-  await runWithTenantContext(
-    { tenant_id: 'default', agent_id: 'default' },
-    runNightlyBackupInner,
-  );
+  // Genuinely-GLOBAL maintenance (issue #323 phase 2): `pg_dump` dumps the whole
+  // DB and the only DB writes are ownerless `backup_*` audit rows the watcher
+  // keys by `acao` — there is no per-tenant row to attribute to. Re-homed from
+  // the legacy `default/default` literal to the reserved `system` sentinel.
+  await runWithSystemContext(runNightlyBackupInner);
 }
 
 async function runNightlyBackupInner(): Promise<void> {
@@ -92,8 +92,11 @@ async function runNightlyBackupInner(): Promise<void> {
  * run fast and lets ops schedule it independently if needed.
  */
 export async function runCloudBackupRotation(): Promise<void> {
-  // P0: single-tenant default. P6 will fan-out per tenant.
-  await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+  // Genuinely-GLOBAL maintenance (issue #323 phase 2): `pruneCloud` only walks
+  // and deletes objects in the S3 backup bucket (no DB read at all) and the
+  // only DB writes are ownerless `backup_cloud_rotation_*` audit rows. Re-homed
+  // from the legacy `default/default` literal to the reserved `system` sentinel.
+  await runWithSystemContext(async () => {
     if (!isS3Configured()) {
       logger.debug('backup.rotation_skipped_no_s3');
       return;
