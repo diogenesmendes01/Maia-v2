@@ -2,6 +2,51 @@
 
 Projeto pessoal de Diógenes Mendes — uso interno por enquanto.
 
+## Toolchain (Node + npm fixos)
+
+O CI valida com `npm ci`, que falha se o `package-lock.json` não bater com o npm
+que o gerou. Em #312 um lockfile gerado localmente com npm 11 quebrou o CI (que
+rodava npm 10): a forma do bloco `esbuild` divergia. Para isso nunca mais
+acontecer, **a versão do Node e do npm é fixada e tem uma única fonte da
+verdade**:
+
+- **Node:** `.nvmrc` (`22`). O CI usa `node-version-file: '.nvmrc'`, então
+  local e CI nunca divergem.
+- **npm:** `npm@11.5.2`, declarado em `package.json` (`packageManager` +
+  `engines`: `node >=22.0.0`, `npm >=11.5.2 <12`). A versão ativa é fixada com
+  `npm install -g npm@11.5.2` — **exatamente o que o CI faz**. O `.npmrc`
+  (`engine-strict=true`) e o script `preinstall` recusam o install se o npm
+  ativo estiver fora dessa faixa, então o pin é obrigatório, não só sugestão.
+
+### Setup (uma vez)
+
+```bash
+nvm install            # lê .nvmrc → Node 22
+nvm use                # ativa Node 22
+npm install -g npm@11.5.2
+npm --version          # deve imprimir 11.5.2
+```
+
+> **Por que não `corepack enable`?** Tentamos, e o histórico de CI deste pin
+> (#314) provou que `corepack enable` **não** trocou o npm ativo no runner — ele
+> continuou usando o npm 10.x que vem com o Node. Por isso tanto o CI quanto este
+> guia usam `npm install -g npm@11.5.2`, que coloca a versão certa no PATH de
+> forma confiável.
+
+### Regra do lockfile
+
+> **Toda mudança em `package-lock.json` DEVE ser feita com o toolchain fixado
+> (Node 22 + npm 11.5.2).** Não regenere o lockfile com outra versão de npm — a
+> forma dos blocos de dependência muda entre majors de npm e o `npm ci` do CI
+> vai rejeitar. Confirme com `node --version` (v22.x) e `npm --version`
+> (11.5.2) antes de rodar `npm install` (o `preinstall` + `engine-strict` já
+> barram o npm errado, mas confira mesmo assim). Antes de commitar, valide do
+> zero:
+
+```bash
+rm -rf node_modules && npm ci   # tem de passar — é exatamente o que o CI roda
+```
+
 ## Convenções
 
 ### Commits
