@@ -226,7 +226,7 @@ class InsertBuilder {
 }
 
 // db.execute SQL dispatcher for the raw-SQL repo methods (markEffectRetry,
-// claimPendingEffects, listTenantsWithPendingEffects, cleanupTerminal). We
+// claimPendingEffects, listTenantsWithWork, markEffectFailed, cleanupTerminal). We
 // re-implement each by shape over the in-memory outbox store. The mocked `sql`
 // tag (above) captures the template text + ordered interpolated values, so we
 // introspect WITHOUT the real PgDialect (which can't serialize our mocks).
@@ -257,11 +257,40 @@ const dbExecuteMock = vi.fn(async (query: unknown) => {
     return { rows: [{ status: row.status }] };
   }
 
+  if (/UPDATE.+SET\s+status\s*=\s*'failed'/is.test(text)) {
+    // markEffectFailed (force-terminal) interpolation order: error, tenant,
+    // agent, id. CAS on status='pending'; attempts are NOT touched.
+    const error = params[0] as string;
+    const tenant_id = params[1] as string;
+    const agent_id = params[2] as string;
+    const id = params[3] as string;
+    const row = stores.idempotency_effect_outbox!.find(
+      (r) =>
+        r.id === id &&
+        r.tenant_id === tenant_id &&
+        r.agent_id === agent_id &&
+        r.status === 'pending',
+    );
+    if (!row) return { rows: [] };
+    row.status = 'failed';
+    row.last_error = error;
+    return { rows: [{ id: row.id }] };
+  }
+
   if (/SELECT\s+DISTINCT\s+tenant_id,\s*agent_id/i.test(text)) {
+    // listTenantsWithWork: param[0] = retentionDays. A tenant has work when it
+    // has a pending row OR a terminal row past the retention window. The unit
+    // store has no real timestamps, so we honor an explicit `__age_days` marker
+    // on terminal rows (default 0 = fresh, i.e. within retention).
+    const retentionDays = Number(params[0]);
     const seen = new Set<string>();
     const out: Array<{ tenant_id: string; agent_id: string }> = [];
     for (const r of stores.idempotency_effect_outbox!) {
-      if (r.status !== 'pending') continue;
+      const isPending = r.status === 'pending';
+      const isAgedTerminal =
+        (r.status === 'sent' || r.status === 'failed') &&
+        ((r.__age_days as number) ?? 0) > retentionDays;
+      if (!isPending && !isAgedTerminal) continue;
       const key = `${r.tenant_id}|${r.agent_id}`;
       if (seen.has(key)) continue;
       seen.add(key);
@@ -289,9 +318,28 @@ const dbExecuteMock = vi.fn(async (query: unknown) => {
     return { rows };
   }
 
-  if (/DELETE\s+FROM.+idempotency_effect_outbox/i.test(text)) {
-    // cleanupTerminal — for the unit test we just no-op (return empty).
-    return { rows: [] };
+  if (/DELETE\s+FROM/i.test(text)) {
+    // cleanupTerminal interpolation order (with the #326 note (a) outer scope):
+    // outer tenant, outer agent, inner tenant, inner agent, olderThanDays,
+    // batchSize. Delete tenant/agent-scoped aged terminal rows, capped by batch.
+    const tenant_id = params[0] as string;
+    const agent_id = params[1] as string;
+    const olderThanDays = Number(params[4]);
+    const batchSize = Number(params[5]);
+    const victims = stores
+      .idempotency_effect_outbox!.filter(
+        (r) =>
+          r.tenant_id === tenant_id &&
+          r.agent_id === agent_id &&
+          (r.status === 'sent' || r.status === 'failed') &&
+          ((r.__age_days as number) ?? 0) > olderThanDays,
+      )
+      .slice(0, batchSize);
+    for (const v of victims) {
+      const idx = stores.idempotency_effect_outbox!.indexOf(v);
+      if (idx >= 0) stores.idempotency_effect_outbox!.splice(idx, 1);
+    }
+    return { rows: victims.map((v) => ({ id: v.id })) };
   }
 
   return { rows: [] };
@@ -575,5 +623,158 @@ describe('idempotencyOutboxRepo.markEffectSent — CAS on pending', () => {
       idempotencyOutboxRepo.markEffectSent({ id: 'ob-10', provider_ref: 'dup' }),
     );
     expect(ok).toBe(false);
+  });
+});
+
+describe('idempotencyOutboxRepo.markEffectFailed — force-terminal (#326 note (b))', () => {
+  function seedPending(attempts = 0, maxAttempts = 5) {
+    stores.idempotency_effect_outbox!.push({
+      id: 'ob-ft',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-A',
+      idempotency_key: 'k',
+      effect_type: 'whatsapp_text',
+      effect_payload: EFFECT,
+      status: 'pending',
+      attempts,
+      max_attempts: maxAttempts,
+      last_error: null,
+    });
+  }
+
+  it('flips a pending row STRAIGHT to failed without touching attempts', async () => {
+    seedPending(0, 5);
+    const { idempotencyOutboxRepo } = await import('@/db/repositories.js');
+    const ok = await runWithTenantContext(A_CTX, () =>
+      idempotencyOutboxRepo.markEffectFailed({ id: 'ob-ft', error: 'invalid_effect_payload:x' }),
+    );
+    expect(ok).toBe(true);
+    const row = stores.idempotency_effect_outbox![0]!;
+    expect(row.status).toBe('failed');
+    expect(row.last_error).toBe('invalid_effect_payload:x');
+    // Retry budget UNTOUCHED — no pointless retries were consumed.
+    expect(row.attempts).toBe(0);
+  });
+
+  it('is a no-op (returns false) when the row is not pending', async () => {
+    stores.idempotency_effect_outbox!.push({
+      id: 'ob-ft2',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-A',
+      idempotency_key: 'k2',
+      effect_type: 'whatsapp_text',
+      effect_payload: EFFECT,
+      status: 'sent',
+      attempts: 0,
+      max_attempts: 5,
+      last_error: null,
+    });
+    const { idempotencyOutboxRepo } = await import('@/db/repositories.js');
+    const ok = await runWithTenantContext(A_CTX, () =>
+      idempotencyOutboxRepo.markEffectFailed({ id: 'ob-ft2', error: 'late' }),
+    );
+    expect(ok).toBe(false);
+    expect(stores.idempotency_effect_outbox![0]!.status).toBe('sent');
+  });
+
+  it('TENANT ISOLATION: tenant-B cannot fail a tenant-A row', async () => {
+    seedPending(0, 5);
+    const { idempotencyOutboxRepo } = await import('@/db/repositories.js');
+    const ok = await runWithTenantContext(B_CTX, () =>
+      idempotencyOutboxRepo.markEffectFailed({ id: 'ob-ft', error: 'cross-tenant' }),
+    );
+    expect(ok).toBe(false);
+    // tenant-A's row untouched (still pending).
+    expect(stores.idempotency_effect_outbox![0]!.status).toBe('pending');
+  });
+});
+
+describe('idempotencyOutboxRepo.listTenantsWithWork — retention reaches idle tenants (#326 blocker)', () => {
+  function seedRow(input: {
+    tenant_id: string;
+    agent_id: string;
+    status: 'pending' | 'sent' | 'failed';
+    age_days?: number;
+  }) {
+    stores.idempotency_effect_outbox!.push({
+      id: `ob-${stores.idempotency_effect_outbox!.length + 1}`,
+      tenant_id: input.tenant_id,
+      agent_id: input.agent_id,
+      idempotency_key: `k-${stores.idempotency_effect_outbox!.length + 1}`,
+      effect_type: 'whatsapp_text',
+      effect_payload: EFFECT,
+      status: input.status,
+      attempts: 0,
+      max_attempts: 5,
+      last_error: input.status === 'failed' ? 'boom' : null,
+      __age_days: input.age_days ?? 0,
+    });
+  }
+
+  it('enumerates a tenant whose ONLY rows are AGED terminal rows (no pending)', async () => {
+    seedRow({ tenant_id: 'tenant-idle', agent_id: 'agent-idle', status: 'sent', age_days: 90 });
+    const { idempotencyOutboxRepo } = await import('@/db/repositories.js');
+    const tenants = await idempotencyOutboxRepo.listTenantsWithWork(30);
+    expect(tenants).toEqual([{ tenant_id: 'tenant-idle', agent_id: 'agent-idle' }]);
+  });
+
+  it('does NOT enumerate a tenant whose terminal rows are within the retention window', async () => {
+    seedRow({ tenant_id: 'tenant-fresh', agent_id: 'agent-fresh', status: 'sent', age_days: 1 });
+    const { idempotencyOutboxRepo } = await import('@/db/repositories.js');
+    const tenants = await idempotencyOutboxRepo.listTenantsWithWork(30);
+    expect(tenants).toEqual([]);
+  });
+
+  it('enumerates a pending tenant AND an aged-terminal-only tenant together', async () => {
+    seedRow({ tenant_id: 'tenant-A', agent_id: 'agent-A', status: 'pending' });
+    seedRow({ tenant_id: 'tenant-B', agent_id: 'agent-B', status: 'failed', age_days: 60 });
+    const { idempotencyOutboxRepo } = await import('@/db/repositories.js');
+    const tenants = await idempotencyOutboxRepo.listTenantsWithWork(30);
+    const keys = new Set(tenants.map((t) => `${t.tenant_id}|${t.agent_id}`));
+    expect(keys).toEqual(new Set(['tenant-A|agent-A', 'tenant-B|agent-B']));
+  });
+});
+
+describe('idempotencyOutboxRepo.cleanupTerminal — bounded, tenant-scoped (#326 note (a))', () => {
+  function seedTerminal(tenant_id: string, agent_id: string, age_days: number) {
+    stores.idempotency_effect_outbox!.push({
+      id: `ob-${stores.idempotency_effect_outbox!.length + 1}`,
+      tenant_id,
+      agent_id,
+      idempotency_key: `k-${stores.idempotency_effect_outbox!.length + 1}`,
+      effect_type: 'whatsapp_text',
+      effect_payload: EFFECT,
+      status: 'sent',
+      attempts: 0,
+      max_attempts: 5,
+      last_error: null,
+      __age_days: age_days,
+    });
+  }
+
+  it('deletes ONLY the current tenant aged terminal rows; leaves other tenants intact', async () => {
+    seedTerminal('tenant-A', 'agent-A', 90); // aged → deleted under A
+    seedTerminal('tenant-A', 'agent-A', 0); // fresh → kept
+    seedTerminal('tenant-B', 'agent-B', 90); // aged but OTHER tenant → kept
+    const { idempotencyOutboxRepo } = await import('@/db/repositories.js');
+    const deleted = await runWithTenantContext(A_CTX, () =>
+      idempotencyOutboxRepo.cleanupTerminal({ olderThanDays: 30, batchSize: 1000 }),
+    );
+    expect(deleted).toBe(1);
+    // tenant-A fresh row + tenant-B aged row remain.
+    const remaining = stores.idempotency_effect_outbox!;
+    expect(remaining).toHaveLength(2);
+    expect(remaining.some((r) => r.tenant_id === 'tenant-B')).toBe(true);
+    expect(remaining.some((r) => r.tenant_id === 'tenant-A')).toBe(true);
+  });
+
+  it('honors the batchSize cap (bounded DELETE)', async () => {
+    for (let i = 0; i < 5; i++) seedTerminal('tenant-A', 'agent-A', 90);
+    const { idempotencyOutboxRepo } = await import('@/db/repositories.js');
+    const deleted = await runWithTenantContext(A_CTX, () =>
+      idempotencyOutboxRepo.cleanupTerminal({ olderThanDays: 30, batchSize: 2 }),
+    );
+    expect(deleted).toBe(2);
+    expect(stores.idempotency_effect_outbox!).toHaveLength(3);
   });
 });

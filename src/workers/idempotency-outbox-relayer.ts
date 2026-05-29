@@ -46,7 +46,11 @@
  *
  * RETENTION: terminal rows (sent/failed) older than OUTBOX_RELAYER_RETENTION_DAYS
  *   are deleted in the same pass via a bounded batched DELETE (mirrors #292
- *   blocker #1).
+ *   blocker #1). The dispatcher enumeration (`listTenantsWithWork`) includes a
+ *   tenant that has ONLY old terminal rows (no pending) so retention reaches an
+ *   IDLE tenant too — cleanup is NOT gated on the pending-dispatch path (Codex
+ *   #326 blocker). A terminal-only tenant claims 0 pending rows (no dispatch)
+ *   and its retention loop drains the aged rows.
  *
  * Wired into src/workers/index.ts as a phase-1 cron (every minute).
  */
@@ -197,12 +201,13 @@ async function relayInner(): Promise<RelayStats> {
     const effect = parseEffectPayload(row.effect_type, row.effect_payload);
     if (!effect) {
       invalid++;
-      // Drive attempts straight to max so the row goes terminal 'failed' now
-      // (a bad payload will never become valid by retrying).
-      const finalStatus = await idempotencyOutboxRepo.markEffectRetry({
+      // FORCE-TERMINAL (Codex #326 note (b)): a payload that does not
+      // parse/validate can NEVER be dispatched and will NEVER become valid by
+      // retrying. Flip it straight to terminal 'failed' (one step, retry budget
+      // untouched) instead of burning all max_attempts ticks on a doomed row.
+      const wasFailed = await idempotencyOutboxRepo.markEffectFailed({
         id: row.id,
         error: `invalid_effect_payload:${row.effect_type}`,
-        backoff_seconds: backoffSeconds(row.max_attempts),
       });
       logger.error(
         {
@@ -210,7 +215,9 @@ async function relayInner(): Promise<RelayStats> {
           agent_id,
           outbox_id: row.id,
           effect_type: row.effect_type,
-          final_status: finalStatus,
+          // 'failed' when this pass performed the transition; null when a
+          // concurrent settle already moved the row off 'pending' (CAS lost).
+          final_status: wasFailed ? 'failed' : null,
           ops_alert: true,
         },
         'idempotency_outbox_relayer.invalid_payload',
@@ -317,7 +324,13 @@ export async function runIdempotencyOutboxRelayer(): Promise<void> {
   }
 
   try {
-    const tenants = await idempotencyOutboxRepo.listTenantsWithPendingEffects();
+    // Enumerate tenants with ANY work: a dispatchable pending row OR a terminal
+    // row past the retention window. The terminal-row arm makes retention
+    // cleanup reach an IDLE tenant that has ONLY old terminal rows (Codex #326
+    // blocker) — cleanup is no longer gated on the pending-dispatch path.
+    const tenants = await idempotencyOutboxRepo.listTenantsWithWork(
+      config.OUTBOX_RELAYER_RETENTION_DAYS,
+    );
     if (tenants.length === 0) {
       logger.debug('idempotency_outbox_relayer.idle');
       return;

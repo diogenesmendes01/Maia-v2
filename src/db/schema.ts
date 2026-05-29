@@ -718,6 +718,17 @@ export const idempotency_effect_outbox = pgTable(
     byTenantAgentStatusNext: index(
       'idx_idempotency_effect_outbox_tenant_agent_status_next',
     ).on(t.tenant_id, t.agent_id, t.status, t.next_attempt_at),
+    // Retention-path PARTIAL index (PR #326 note (c)): backs the relayer's
+    // terminal-row dispatcher enumeration AND the bounded cleanupTerminal DELETE
+    // (status IN ('sent','failed') AND updated_at < cutoff, ORDER BY updated_at).
+    // updated_at backs both the range predicate and the ORDER BY the LIMIT
+    // walks. Partial (terminal-only) keeps it off the pending write hot path.
+    // Created CONCURRENTLY by migration 070 (no-tx).
+    byTenantAgentTerminalUpdated: index(
+      'idx_idempotency_effect_outbox_tenant_agent_terminal_updated',
+    )
+      .on(t.tenant_id, t.agent_id, t.updated_at)
+      .where(sql`status IN ('sent', 'failed')`),
     // One outbox row per winning reservation — the in-transaction INSERT is
     // ON CONFLICT DO NOTHING against this key (fenced completion → no 2nd row).
     byTenantAgentKey: unique('idempotency_effect_outbox_tenant_agent_key').on(

@@ -20,10 +20,12 @@
  * Skipped without TEST_DB_URL — same pattern as issue-298-idempotency-race.spec.ts.
  *
  * Migration prerequisites (manual checklist when running):
- *   The TEST_DB_URL database has migrations 001–069 applied. Specifically
- *   068_idempotency_effect_outbox (table + UNIQUE) and
- *   069_idempotency_effect_outbox_relayer_index (CONCURRENTLY index). The
- *   INSERTs fail loudly if 068 hasn't been applied.
+ *   The TEST_DB_URL database has migrations 001–070 applied. Specifically
+ *   068_idempotency_effect_outbox (table + UNIQUE),
+ *   069_idempotency_effect_outbox_relayer_index (CONCURRENTLY pending-claim
+ *   index) and 070_idempotency_effect_outbox_retention_index (CONCURRENTLY
+ *   terminal-retention partial index). The INSERTs fail loudly if 068 hasn't
+ *   been applied.
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import pg from 'pg';

@@ -35,6 +35,8 @@ type OutboxRow = {
   attempts: number;
   max_attempts: number;
   status: 'pending' | 'sent' | 'failed';
+  /** Age (days) of a terminal row; used by the retention mocks. 0 = fresh. */
+  terminal_age_days?: number;
 };
 
 const store: OutboxRow[] = [];
@@ -44,15 +46,30 @@ const claimContexts: Array<{ tenant_id: string; agent_id: string }> = [];
 
 const markSentCalls: Array<{ id: string; provider_ref: string | null }> = [];
 const markRetryCalls: Array<{ id: string; error: string; backoff_seconds: number }> = [];
+const markFailedCalls: Array<{ id: string; error: string }> = [];
 
 const BATCH_PER_TENANT = 100;
 
+// Terminal rows older than this many days are considered past the retention
+// window by the listTenantsWithWork / cleanupTerminal mocks. Rows carry an
+// optional `terminal_age_days` (default 0 = fresh) so a test can seed an
+// IDLE tenant whose ONLY rows are AGED terminal rows (the #326 blocker proof).
+const RETENTION_DAYS = 30;
+
 const repoMock = {
-  listTenantsWithPendingEffects: vi.fn(async () => {
+  // Mirrors the real listTenantsWithWork: a tenant is enumerated when it has
+  // EITHER a dispatchable pending row OR a terminal row past the retention
+  // window. The terminal-row arm is the #326 blocker fix — it makes retention
+  // reach an idle tenant that has ONLY aged terminal rows (no pending).
+  listTenantsWithWork: vi.fn(async (retentionDays: number) => {
     const seen = new Set<string>();
     const out: Array<{ tenant_id: string; agent_id: string }> = [];
     for (const r of store) {
-      if (r.status !== 'pending') continue;
+      const isPending = r.status === 'pending';
+      const isAgedTerminal =
+        (r.status === 'sent' || r.status === 'failed') &&
+        (r.terminal_age_days ?? 0) > retentionDays;
+      if (!isPending && !isAgedTerminal) continue;
       const key = `${r.tenant_id}|${r.agent_id}`;
       if (seen.has(key)) continue;
       seen.add(key);
@@ -98,7 +115,36 @@ const repoMock = {
       return row.status;
     },
   ),
-  cleanupTerminal: vi.fn(async () => 0),
+  // Force-terminal (#326 note (b)): flip a pending row straight to 'failed'
+  // WITHOUT touching the retry budget. CAS on status='pending'.
+  markEffectFailed: vi.fn(async (input: { id: string; error: string }) => {
+    markFailedCalls.push(input);
+    const row = store.find((r) => r.id === input.id && r.status === 'pending');
+    if (!row) return false;
+    row.status = 'failed';
+    return true;
+  }),
+  // Bounded retention DELETE for the CURRENT (tenant, agent): removes aged
+  // terminal rows in batches. Returns the count deleted this call so the
+  // relayer's batch loop terminates when a short batch drains the backlog.
+  cleanupTerminal: vi.fn(async (input: { olderThanDays: number; batchSize: number }) => {
+    const ctx = tryGetCurrentContext();
+    if (!ctx) throw new Error('cleanupTerminal ran with NO tenant context');
+    const victims = store
+      .filter(
+        (r) =>
+          r.tenant_id === ctx.tenant_id &&
+          r.agent_id === ctx.agent_id &&
+          (r.status === 'sent' || r.status === 'failed') &&
+          (r.terminal_age_days ?? 0) > input.olderThanDays,
+      )
+      .slice(0, input.batchSize);
+    for (const v of victims) {
+      const idx = store.indexOf(v);
+      if (idx >= 0) store.splice(idx, 1);
+    }
+    return victims.length;
+  }),
 };
 
 vi.mock('@/db/repositories.js', () => ({ idempotencyOutboxRepo: repoMock }));
@@ -163,6 +209,8 @@ function seed(input: {
   effect_payload?: unknown;
   attempts?: number;
   max_attempts?: number;
+  status?: 'pending' | 'sent' | 'failed';
+  terminal_age_days?: number;
 }): OutboxRow {
   const row: OutboxRow = {
     id: `ob-${nextId++}`,
@@ -175,7 +223,8 @@ function seed(input: {
       ({ kind: 'whatsapp_text', jid: '5511999990000@s.whatsapp.net', text: 'olá', mensagem_id: 'm1' } as unknown),
     attempts: input.attempts ?? 0,
     max_attempts: input.max_attempts ?? 5,
-    status: 'pending',
+    status: input.status ?? 'pending',
+    terminal_age_days: input.terminal_age_days,
   };
   store.push(row);
   return row;
@@ -186,6 +235,7 @@ beforeEach(() => {
   claimContexts.length = 0;
   markSentCalls.length = 0;
   markRetryCalls.length = 0;
+  markFailedCalls.length = 0;
   lockHeldByOther = false;
   poolStats.connects = 0;
   poolStats.releases = 0;
@@ -256,7 +306,7 @@ describe('idempotency_outbox_relayer — single-flight advisory lock', () => {
     await runIdempotencyOutboxRelayer();
     expect(poolStats.acquiredOk).toBe(0);
     // No tenant enumeration, no dispatch.
-    expect(repoMock.listTenantsWithPendingEffects).not.toHaveBeenCalled();
+    expect(repoMock.listTenantsWithWork).not.toHaveBeenCalled();
     expect(sendOutboundTextMock).not.toHaveBeenCalled();
     // Client returned to pool; no unlock (never held it).
     expect(poolStats.releases).toBe(1);
@@ -266,7 +316,7 @@ describe('idempotency_outbox_relayer — single-flight advisory lock', () => {
 
   it('releases the lock even when the dispatcher enumeration throws', async () => {
     seed({ ...A_CTX });
-    repoMock.listTenantsWithPendingEffects.mockRejectedValueOnce(new Error('synthetic'));
+    repoMock.listTenantsWithWork.mockRejectedValueOnce(new Error('synthetic'));
     const { runIdempotencyOutboxRelayer } = await import(
       '@/workers/idempotency-outbox-relayer.js'
     );
@@ -398,9 +448,12 @@ describe('idempotency_outbox_relayer — retry / failure', () => {
 });
 
 describe('idempotency_outbox_relayer — invalid payload', () => {
-  it('drives a corrupt-payload row terminal WITHOUT dispatching it', async () => {
+  it('FORCE-TERMINALS a corrupt-payload row in one step WITHOUT dispatching or burning retries', async () => {
     // effect_type says whatsapp_text but the payload is missing required fields.
-    seed({
+    // max_attempts=5 with attempts=0: under the OLD increment-only path the row
+    // would stay 'pending' for 4 more pointless ticks. The force-terminal path
+    // flips it to 'failed' immediately (markEffectFailed, NOT markEffectRetry).
+    const row = seed({
       ...A_CTX,
       effect_type: 'whatsapp_text',
       effect_payload: { kind: 'whatsapp_text' /* no jid/text */ },
@@ -416,14 +469,89 @@ describe('idempotency_outbox_relayer — invalid payload', () => {
     await runIdempotencyOutboxRelayer();
     // NEVER dispatched.
     expect(sendOutboundTextMock).not.toHaveBeenCalled();
-    // Driven terminal via markEffectRetry with a max-attempts backoff.
-    expect(markRetryCalls).toHaveLength(1);
-    expect(markRetryCalls[0]!.error).toContain('invalid_effect_payload');
+    // Driven terminal via markEffectFailed (one step) — NOT via the retry path,
+    // and NOT consuming the attempt budget.
+    expect(markRetryCalls).toHaveLength(0);
+    expect(markFailedCalls).toHaveLength(1);
+    expect(markFailedCalls[0]!.id).toBe(row.id);
+    expect(markFailedCalls[0]!.error).toContain('invalid_effect_payload');
+    // Row is terminal 'failed' with attempts UNTOUCHED (no wasted retries).
+    expect(row.status).toBe('failed');
+    expect(row.attempts).toBe(0);
     const invalidLogs = errorSpy.mock.calls.filter(
       (c) => c[1] === 'idempotency_outbox_relayer.invalid_payload',
     );
     expect(invalidLogs).toHaveLength(1);
-    expect(invalidLogs[0]![0]).toMatchObject({ ops_alert: true });
+    expect(invalidLogs[0]![0]).toMatchObject({ ops_alert: true, final_status: 'failed' });
+  });
+});
+
+describe('idempotency_outbox_relayer — retention reaches idle tenants (#326 blocker)', () => {
+  it('cleans up an IDLE tenant whose outbox has ONLY aged terminal rows (no pending)', async () => {
+    // tenant-A is IDLE: its only rows are aged terminal rows (no pending, no
+    // ready). Under the OLD pending-only enumeration this tenant was never
+    // visited → its terminal rows accumulated without bound. The fix enumerates
+    // it via the terminal-retention arm of listTenantsWithWork.
+    seed({ ...A_CTX, status: 'sent', terminal_age_days: 90 });
+    seed({ ...A_CTX, status: 'failed', terminal_age_days: 90 });
+
+    const { runIdempotencyOutboxRelayer } = await import(
+      '@/workers/idempotency-outbox-relayer.js'
+    );
+    await runIdempotencyOutboxRelayer();
+
+    // The tenant WAS enumerated (terminal-row arm), context opened, cleanup ran.
+    expect(repoMock.cleanupTerminal).toHaveBeenCalled();
+    const cleanupCtxKeys = new Set(claimContexts.map((c) => `${c.tenant_id}|${c.agent_id}`));
+    expect(cleanupCtxKeys.has('tenant-A|agent-A')).toBe(true);
+    // No dispatch happened (no pending rows).
+    expect(sendOutboundTextMock).not.toHaveBeenCalled();
+    // The aged terminal rows were deleted (retention reached the idle tenant).
+    expect(store.filter((r) => r.tenant_id === 'tenant-A')).toHaveLength(0);
+  });
+
+  it('enumerates a terminal-only tenant ALONGSIDE a pending tenant and drains both', async () => {
+    // tenant-A: idle (aged terminal only). tenant-B: an active pending row.
+    seed({ ...A_CTX, status: 'sent', terminal_age_days: 60 });
+    seed({ ...B_CTX });
+
+    const { runIdempotencyOutboxRelayer } = await import(
+      '@/workers/idempotency-outbox-relayer.js'
+    );
+    await runIdempotencyOutboxRelayer();
+
+    const ctxKeys = new Set(claimContexts.map((c) => `${c.tenant_id}|${c.agent_id}`));
+    // BOTH tenants enumerated — A for retention, B for dispatch.
+    expect(ctxKeys).toEqual(new Set(['tenant-A|agent-A', 'tenant-B|agent-B']));
+    // A's aged terminal row deleted; B's pending row dispatched.
+    expect(store.filter((r) => r.tenant_id === 'tenant-A')).toHaveLength(0);
+    const bRow = store.find((r) => r.tenant_id === 'tenant-B')!;
+    expect(bRow.status).toBe('sent');
+  });
+
+  it('does NOT enumerate a tenant whose terminal rows are still within retention', async () => {
+    // FRESH terminal rows (age 0) are NOT past the 30-day window → no work →
+    // the tenant is not enumerated (no wasted context / cleanup pass).
+    seed({ ...A_CTX, status: 'sent', terminal_age_days: 0 });
+
+    const { runIdempotencyOutboxRelayer } = await import(
+      '@/workers/idempotency-outbox-relayer.js'
+    );
+    await runIdempotencyOutboxRelayer();
+
+    expect(claimContexts).toHaveLength(0);
+    expect(repoMock.cleanupTerminal).not.toHaveBeenCalled();
+    // The fresh terminal row is retained.
+    expect(store.filter((r) => r.tenant_id === 'tenant-A')).toHaveLength(1);
+  });
+
+  it('passes the configured retention window to listTenantsWithWork', async () => {
+    seed({ ...A_CTX });
+    const { runIdempotencyOutboxRelayer } = await import(
+      '@/workers/idempotency-outbox-relayer.js'
+    );
+    await runIdempotencyOutboxRelayer();
+    expect(repoMock.listTenantsWithWork).toHaveBeenCalledWith(RETENTION_DAYS);
   });
 });
 

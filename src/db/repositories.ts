@@ -2312,12 +2312,21 @@ export const idempotencyOutboxRepo = {
 
   /**
    * Relayer dispatcher enumeration: DISTINCT (tenant_id, agent_id) tuples that
-   * have at least one dispatchable pending row (status='pending' AND backoff
-   * gate elapsed). Runs OUTSIDE tenant context — the relayer opens
-   * runWithTenantContext per tuple. Belt-and-suspenders NOT NULL predicate
-   * (schema already enforces) mirrors #251/#292.
+   * have ANY WORK to do this pass — EITHER a dispatchable pending row
+   * (status='pending' AND backoff gate elapsed) OR a terminal row
+   * (status IN ('sent','failed')) past the retention window. Runs OUTSIDE
+   * tenant context — the relayer opens runWithTenantContext per tuple.
+   *
+   * The terminal-row arm is LOAD-BEARING for retention (Codex #326 blocker):
+   * an IDLE tenant whose outbox holds ONLY old terminal rows and NO pending
+   * row would otherwise never be enumerated, so its terminal rows would
+   * accumulate without bound. Including it here makes the bounded retention
+   * cleanup in `relayInner` reach a terminal-only tenant — cleanup is no
+   * longer GATED on the pending-dispatch path. Same shape as the sibling
+   * outbound-messages-sweeper `listTenantsWithWork` (#292). Belt-and-suspenders
+   * NOT NULL predicate (schema already enforces) mirrors #251/#292.
    */
-  async listTenantsWithPendingEffects(): Promise<
+  async listTenantsWithWork(retentionDays: number): Promise<
     Array<{ tenant_id: string; agent_id: string }>
   > {
     const result = await db.execute<{ tenant_id: string; agent_id: string }>(sql`
@@ -2325,8 +2334,13 @@ export const idempotencyOutboxRepo = {
       FROM ${idempotency_effect_outbox}
       WHERE tenant_id IS NOT NULL
         AND agent_id IS NOT NULL
-        AND status = 'pending'
-        AND next_attempt_at <= now()
+        AND (
+          (status = 'pending' AND next_attempt_at <= now())
+          OR (
+            status IN ('sent', 'failed')
+            AND updated_at < now() - (${retentionDays} || ' days')::interval
+          )
+        )
     `);
     return Array.from(result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>);
   },
@@ -2423,9 +2437,43 @@ export const idempotencyOutboxRepo = {
   },
 
   /**
+   * FORCE-TERMINAL failure (Codex #326 note (b)): transition a pending row
+   * STRAIGHT to terminal 'failed' WITHOUT consuming the retry budget. Unlike
+   * `markEffectRetry` (which only increments `attempts` by one), this is for a
+   * permanently-unrecoverable row — e.g. an effect_payload that does not parse
+   * / validate. Retrying such a row is pointless: it will never become valid,
+   * so burning all `max_attempts` ticks on it just delays the ops_alert and
+   * wastes relayer passes. We flip to 'failed' immediately and store the error
+   * (the failed-has-error CHECK is satisfied because `error` is always set).
+   * CAS on status='pending' so a concurrent settle wins. Returns true when this
+   * call performed the transition.
+   */
+  async markEffectFailed(input: { id: string; error: string }): Promise<boolean> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const updated = await db.execute<{ id: string }>(sql`
+      UPDATE ${idempotency_effect_outbox}
+         SET status = 'failed',
+             last_error = ${input.error},
+             updated_at = now()
+       WHERE tenant_id = ${tenant_id}
+         AND agent_id = ${agent_id}
+         AND id = ${input.id}
+         AND status = 'pending'
+      RETURNING id
+    `);
+    return updated.rows.length > 0;
+  },
+
+  /**
    * Retention cleanup: delete terminal rows (sent/failed) older than N days, in
    * bounded batches (mirrors outbound-messages-sweeper #292 blocker #1). Scoped
    * per current (tenant, agent). Returns the count deleted this call.
+   *
+   * The OUTER `DELETE` repeats the explicit `tenant_id`/`agent_id` predicate
+   * (Codex #326 note (a)) so the row removal is tenant-scoped at the DELETE
+   * itself, not only inside the `id IN (...)` subquery — defense-in-depth
+   * against the (theoretical) reuse of an `id` value across tenants.
    */
   async cleanupTerminal(input: {
     olderThanDays: number;
@@ -2435,17 +2483,19 @@ export const idempotencyOutboxRepo = {
     const agent_id = getCurrentAgent();
     const deleted = await db.execute<{ id: string }>(sql`
       DELETE FROM ${idempotency_effect_outbox}
-      WHERE id IN (
-        SELECT id
-        FROM ${idempotency_effect_outbox}
-        WHERE tenant_id = ${tenant_id}
-          AND agent_id = ${agent_id}
-          AND status IN ('sent', 'failed')
-          AND updated_at < now() - (${input.olderThanDays} || ' days')::interval
-        ORDER BY updated_at ASC
-        LIMIT ${input.batchSize}
-        FOR UPDATE SKIP LOCKED
-      )
+      WHERE tenant_id = ${tenant_id}
+        AND agent_id = ${agent_id}
+        AND id IN (
+          SELECT id
+          FROM ${idempotency_effect_outbox}
+          WHERE tenant_id = ${tenant_id}
+            AND agent_id = ${agent_id}
+            AND status IN ('sent', 'failed')
+            AND updated_at < now() - (${input.olderThanDays} || ' days')::interval
+          ORDER BY updated_at ASC
+          LIMIT ${input.batchSize}
+          FOR UPDATE SKIP LOCKED
+        )
       RETURNING id
     `);
     return deleted.rows.length;
