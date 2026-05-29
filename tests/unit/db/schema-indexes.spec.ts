@@ -1,7 +1,7 @@
 /**
  * Issue #281 (redesigned in PR #310) — verifies the Drizzle schema
  * declares the KSM auto-promoter lifecycle PARTIAL indexes added by
- * migration 065 on all FOUR knowledge tables (agent_facts, memory_entry,
+ * migration 066 on all FOUR knowledge tables (agent_facts, memory_entry,
  * behavioral_hint, learned_rules).
  *
  * Why the redesign
@@ -25,7 +25,7 @@
  *     updated_at) WHERE lifecycle_status = 'active'
  *
  * This test pins the index *names*, *column tuples*, and *partiality* so
- * any drift from migration 065 breaks the build loudly (rather than
+ * any drift from migration 066 breaks the build loudly (rather than
  * silently regressing the promoter's read plan in production).
  */
 import { describe, it, expect } from 'vitest';

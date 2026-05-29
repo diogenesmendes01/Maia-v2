@@ -1,6 +1,6 @@
 -- maia:no-transaction
 -- =====================================================================
--- Maia — Migration 065 (Issue #281)
+-- Maia — Migration 066 (Issue #281)
 -- KSM lifecycle partial indexes for the auto-promoter hot path on all
 -- four knowledge tables: agent_facts, memory_entry, behavioral_hint,
 -- learned_rules.

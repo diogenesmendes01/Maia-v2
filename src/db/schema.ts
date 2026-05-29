@@ -308,7 +308,7 @@ export const agent_facts = pgTable(
     //   (2) the 'active' bulk swept by step 6 (active→deprecated).
     // The old (tenant_id, agent_id, id) index was dropped — it was
     // redundant with the PK on `id` for the findById/update path.
-    // Created via migration 065 CONCURRENTLY.
+    // Created via migration 066 CONCURRENTLY.
     lifecycleInflightIdx: index('idx_agent_facts_lifecycle_inflight')
       .on(t.lifecycle_status, t.updated_at)
       .where(
@@ -351,7 +351,7 @@ export const learned_rules = pgTable(
     // fourth KSM table previously omitted. The auto-promoter sweeps it
     // identically to the other three. Two partial lifecycle indexes back
     // `listEligible` (see agent_facts above for the full rationale).
-    // Created via migration 065 CONCURRENTLY.
+    // Created via migration 066 CONCURRENTLY.
     lifecycleInflightIdx: index('idx_learned_rules_lifecycle_inflight')
       .on(t.lifecycle_status, t.updated_at)
       .where(
@@ -896,7 +896,7 @@ export const memory_entry = pgTable(
     // `memory_entry_tenant_agent_idx` (which orders by created_at for
     // time-window scans). The old (tenant_id, agent_id, id) index was
     // dropped as redundant with the PK. See agent_facts for the full
-    // rationale. Created via migration 065 CONCURRENTLY.
+    // rationale. Created via migration 066 CONCURRENTLY.
     lifecycleInflightIdx: index('idx_memory_entry_lifecycle_inflight')
       .on(t.lifecycle_status, t.updated_at)
       .where(
@@ -950,7 +950,7 @@ export const behavioral_hint = pgTable(
     // Two partial lifecycle indexes back `listEligible`. The old
     // (tenant_id, agent_id, id) index was dropped as redundant with the
     // PK. See agent_facts for the full rationale. Created via migration
-    // 065 CONCURRENTLY.
+    // 066 CONCURRENTLY.
     lifecycleInflightIdx: index('idx_behavioral_hint_lifecycle_inflight')
       .on(t.lifecycle_status, t.updated_at)
       .where(

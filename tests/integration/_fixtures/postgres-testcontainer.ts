@@ -59,7 +59,7 @@ const NO_TX_MARKER = /^[ \t]*--[ \t]*maia:no-transaction\b/m;
  * Required because node-postgres' simple-query protocol wraps MULTIPLE
  * statements sent in one `client.query()` call in an implicit
  * transaction. A no-tx file with more than one `CREATE INDEX
- * CONCURRENTLY` (e.g. migration 065) therefore still trips
+ * CONCURRENTLY` (e.g. migration 066) therefore still trips
  * "CREATE INDEX CONCURRENTLY cannot run inside a transaction block"
  * unless each statement is executed on its own. We strip `--` line
  * comments and split on `;`.

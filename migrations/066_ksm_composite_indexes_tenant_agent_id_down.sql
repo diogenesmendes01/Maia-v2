@@ -1,5 +1,5 @@
 -- maia:no-transaction
--- Down migration for 065_ksm_composite_indexes_tenant_agent_id.sql
+-- Down migration for 066_ksm_composite_indexes_tenant_agent_id.sql
 -- WARNING: destructive — review before applying.
 -- =====================================================================
 -- Drops the eight KSM lifecycle partial indexes created by the forward

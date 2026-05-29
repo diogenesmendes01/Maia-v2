@@ -1,7 +1,7 @@
 /**
  * PR #310 — regression test for the no-transaction migration runner.
  *
- * Bug: migration 065 was the first `-- maia:no-transaction` file with
+ * Bug: migration 066 was the first `-- maia:no-transaction` file with
  * MULTIPLE statements. node-postgres' simple-query protocol wraps several
  * statements sent in a single `client.query()` call in an IMPLICIT
  * transaction, so even on the no-tx path the migration tripped
@@ -14,7 +14,7 @@
  * This test pins:
  *   - the marker detection (NO_TX_MARKER),
  *   - that the splitter yields one statement per CONCURRENTLY DDL,
- *   - that migration 065 specifically splits into its 8 CREATE INDEX
+ *   - that migration 066 specifically splits into its 8 CREATE INDEX
  *     statements (no statement still carries an embedded `;`),
  *   - that comments and blank lines are stripped,
  *   - importing the module does NOT run `main()` (entrypoint guard).
@@ -35,8 +35,8 @@ function readMig(file: string): string {
 }
 
 describe('PR #310 — no-tx migration statement splitter', () => {
-  it('detects the maia:no-transaction marker on migration 065', () => {
-    const sql = readMig('065_ksm_composite_indexes_tenant_agent_id.sql');
+  it('detects the maia:no-transaction marker on migration 066', () => {
+    const sql = readMig('066_ksm_composite_indexes_tenant_agent_id.sql');
     expect(NO_TX_MARKER.test(sql)).toBe(true);
   });
 
@@ -47,8 +47,8 @@ describe('PR #310 — no-tx migration statement splitter', () => {
     expect(NO_TX_MARKER.test(sql)).toBe(false);
   });
 
-  it('splits migration 065 into 8 separate CREATE INDEX statements', () => {
-    const sql = readMig('065_ksm_composite_indexes_tenant_agent_id.sql');
+  it('splits migration 066 into 8 separate CREATE INDEX statements', () => {
+    const sql = readMig('066_ksm_composite_indexes_tenant_agent_id.sql');
     const stmts = splitNoTxStatements(sql);
     expect(stmts).toHaveLength(8);
     for (const stmt of stmts) {
@@ -59,8 +59,8 @@ describe('PR #310 — no-tx migration statement splitter', () => {
     }
   });
 
-  it('splits the 065 down migration into 8 DROP INDEX statements', () => {
-    const sql = readMig('065_ksm_composite_indexes_tenant_agent_id_down.sql');
+  it('splits the 066 down migration into 8 DROP INDEX statements', () => {
+    const sql = readMig('066_ksm_composite_indexes_tenant_agent_id_down.sql');
     const stmts = splitNoTxStatements(sql);
     expect(stmts).toHaveLength(8);
     for (const stmt of stmts) {
