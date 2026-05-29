@@ -2025,13 +2025,16 @@ export const outboundMessagesRepo = {
    *      get skip=false: worker A INSERTed pending → worker B's ON CONFLICT
    *      hit the WHERE and also got skip=false → DOUBLE-SEND).
    *
-   * TODO(#227-sweeper): stale-pending recovery (markSent never landed because
-   * the worker crashed) is OUT OF SCOPE for this PR. Under normal flow each
-   * turn's idempotency_key is `${conversa_id}:${in_reply_to}` and `in_reply_to`
-   * is unique-per-inbound, so stale pending only blocks future RE-ATTEMPTS of
-   * the SAME turn — effectively never an issue in production. A background
-   * sweeper would mark sufficiently-old 'pending' rows 'failed' to allow
-   * a manual replay; tracked separately.
+   * Stale-pending recovery (issue #292, follow-up de #227): the
+   * `outbound_messages_sweeper` worker (src/workers/outbound-messages-sweeper.ts,
+   * runs every 5 minutes) promotes pending rows older than
+   * OUTBOUND_SWEEPER_STALE_PENDING_SEC (default 5min) to 'unknown' — the
+   * conservative terminal status that the boundary guard treats as
+   * sent_no_persist (NO re-send, trades silence risk for zero double-send).
+   * Under normal flow each turn's idempotency_key is unique per inbound, so
+   * stale pending rarely affects user-visible behaviour — the sweeper is
+   * defense-in-depth + housekeeping (it also runs retention cleanup on
+   * terminal rows older than OUTBOUND_SWEEPER_RETENTION_DAYS, default 30d).
    */
   async upsertPending(input: {
     idempotency_key: string;

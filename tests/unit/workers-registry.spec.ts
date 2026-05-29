@@ -37,6 +37,7 @@ const { noopAsync, noopWorkers, mockSchedule } = vi.hoisted(() => {
     runTraceBodyWriter: noopAsync,
     runTraceBodyRecoverer: noopAsync,
     runTraceMatviewRefresh: noopAsync,
+    runOutboundMessagesSweeper: noopAsync,
   };
   const mockSchedule = vi.fn(() => ({ stop: vi.fn(), start: vi.fn() }));
   return { noopAsync, noopWorkers, mockSchedule };
@@ -66,6 +67,7 @@ vi.mock('../../src/workers/briefings.js', () => noopWorkers);
 vi.mock('../../src/workers/trace-body-writer.js', () => noopWorkers);
 vi.mock('../../src/workers/trace-body-recoverer.js', () => noopWorkers);
 vi.mock('../../src/workers/trace-matview-refresh.js', () => noopWorkers);
+vi.mock('../../src/workers/outbound-messages-sweeper.js', () => noopWorkers);
 vi.mock('../../src/workflows/engine.js', () => ({ tickEngine: noopAsync }));
 
 // node-cron v4: ScheduledTask is an interface with stop() / start() / etc.
@@ -142,6 +144,22 @@ describe('workers registry', () => {
       // and featureFlag is the only gate — NOT phase.
       const traceJobsAtPhase1 = traceJobs.filter((j) => j.phase === 1);
       expect(traceJobsAtPhase1).toHaveLength(3); // all 3 are at phase 1
+    });
+  });
+
+  // Issue #292 — outbound_messages sweeper (#227/#233 follow-up).
+  describe('outbound_messages_sweeper (issue #292)', () => {
+    it('registered as phase-1 job with */5 * * * * cadence', async () => {
+      const { JOBS } = await import('../../src/workers/index.js');
+      const job = JOBS.find((j) => j.name === 'outbound_messages_sweeper');
+      expect(job).toBeDefined();
+      // 5-min cadence — stale_pending cutoff default is also 5min, so a single
+      // missed tick is the worst-case detection latency (~10min total).
+      expect(job!.cron).toBe('*/5 * * * *');
+      expect(job!.phase).toBe(1);
+      // No featureFlag — always on once merged (it's pure housekeeping +
+      // recovery; no UX-visible behaviour change).
+      expect(job!.featureFlag).toBeUndefined();
     });
   });
 });
