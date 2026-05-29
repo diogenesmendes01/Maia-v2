@@ -1727,8 +1727,15 @@ describe('Issue #289 — rebuildBatch cardinality + dimension validation', () =>
     };
   }
 
-  it('skips rows with undefined vector and audits each skip under the row tenant', async () => {
-    const { rebuildBatch } = await import('@/../scripts/embeddings-rebuild.ts');
+  it('aborts the whole batch (no UPDATE) when any vector is undefined, and audits the bad row under its tenant', async () => {
+    // Codex review #295 blocker: validation must FULLY precede mutation. A
+    // hole at index 1 must abort the WHOLE batch BEFORE any UPDATE — writing
+    // rows 0 and 2 while silently dropping row 1 would be the exact partial-
+    // write inconsistency #289 targets. So we expect a throw, zero UPDATEs,
+    // and the bad row audited under its own tenant.
+    const { rebuildBatch, ProviderDimensionError } = await import(
+      '@/../scripts/embeddings-rebuild.ts'
+    );
 
     const rows: DimRow[] = [
       { id: 'row-0', tenant_id: 'tenant-A', agent_id: 'agent-A', conteudo: 'a' },
@@ -1740,17 +1747,15 @@ describe('Issue #289 — rebuildBatch cardinality + dimension validation', () =>
     const validVec = Array(expectedDim).fill(0.1);
     const provider = makeProvider([validVec, undefined, validVec]);
 
-    const result = await rebuildBatch(
-      provider as never,
-      rows,
-      expectedDim,
-      execMock as never,
-    );
+    await expect(
+      rebuildBatch(provider as never, rows, expectedDim, execMock as never),
+    ).rejects.toBeInstanceOf(ProviderDimensionError);
 
-    expect(result).toEqual({ updated: 2, skipped: 1 });
-    expect(execMock).toHaveBeenCalledTimes(2);
+    // Zero UPDATEs — the bad vector was caught in the pre-scan, before the
+    // surviving rows could be written. The surrounding transaction rolls back.
+    expect(execMock).not.toHaveBeenCalled();
 
-    // Audited under the row's own context, with the expected metadata.
+    // The invalid row is still audited under its own context so ops sees it.
     expect(auditMock).toHaveBeenCalledTimes(1);
     const auditCall = auditMock.mock.calls[0]![0] as {
       acao: string;
@@ -1789,8 +1794,47 @@ describe('Issue #289 — rebuildBatch cardinality + dimension validation', () =>
     expect(auditMock).not.toHaveBeenCalled();
   });
 
-  it('skips vectors with wrong dimension (and never writes [] vector)', async () => {
-    const { rebuildBatch } = await import('@/../scripts/embeddings-rebuild.ts');
+  it('throws ProviderCardinalityError when provider returns MORE vectors than texts (extra-vector path)', async () => {
+    // Codex review #295 nice-to-have: the cardinality check (`embs.length !==
+    // texts.length`) rejects BOTH directions, but only the fewer-than path was
+    // covered above. This locks in the extra-vector direction: a provider that
+    // returns more embeddings than inputs (e.g. a duplicated/echoed vector, or
+    // a batching bug on the provider side) breaks the rows[i] ↔ embs[i]
+    // positional contract just as badly as a short response — every index is
+    // now suspect — so we must abort the batch before any UPDATE rather than
+    // silently using only the first N and discarding the extras.
+    const { rebuildBatch, ProviderCardinalityError } = await import(
+      '@/../scripts/embeddings-rebuild.ts'
+    );
+
+    const rows: DimRow[] = [
+      { id: 'row-0', tenant_id: 't', agent_id: 'a', conteudo: 'a' },
+      { id: 'row-1', tenant_id: 't', agent_id: 'a', conteudo: 'b' },
+    ];
+    // 2 texts → 3 vectors (one extra). All correct-dim, so this is purely a
+    // cardinality failure, not a dimension one — proving the count guard fires
+    // independently of per-vector validity.
+    const validVec = Array(expectedDim).fill(0.1);
+    const provider = makeProvider([validVec, validVec, validVec]);
+
+    await expect(
+      rebuildBatch(provider as never, rows, expectedDim, execMock as never),
+    ).rejects.toBeInstanceOf(ProviderCardinalityError);
+
+    // Zero UPDATEs — the batch never wrote anything.
+    expect(execMock).not.toHaveBeenCalled();
+    // No audit either — cardinality is a hard error, not a per-row skip.
+    expect(auditMock).not.toHaveBeenCalled();
+  });
+
+  it('aborts the whole batch on a wrong-dimension vector (never writes [] or a short literal, no partial write)', async () => {
+    // Codex review #295 blocker: a wrong-dim vector at index 1 must abort the
+    // WHOLE batch in the pre-scan, BEFORE row-0 (valid) is written. Otherwise
+    // row-0 commits while row-1 is dropped — the partial-write inconsistency
+    // #289 targets.
+    const { rebuildBatch, ProviderDimensionError } = await import(
+      '@/../scripts/embeddings-rebuild.ts'
+    );
 
     const rows: DimRow[] = [
       { id: 'row-0', tenant_id: 't', agent_id: 'a', conteudo: 'a' },
@@ -1803,23 +1847,21 @@ describe('Issue #289 — rebuildBatch cardinality + dimension validation', () =>
     const shortVec = [0.7, 0.8]; // length 2, definitely != expectedDim
     const provider = makeProvider([validVec, shortVec]);
 
-    const result = await rebuildBatch(
-      provider as never,
-      rows,
-      expectedDim,
-      execMock as never,
-    );
+    await expect(
+      rebuildBatch(provider as never, rows, expectedDim, execMock as never),
+    ).rejects.toBeInstanceOf(ProviderDimensionError);
 
-    expect(result).toEqual({ updated: 1, skipped: 1 });
-    expect(execMock).toHaveBeenCalledTimes(1);
-    // Critically — no UPDATE call carried the literal `[]`.
-    const calls = execMock.mock.calls.map((c) => JSON.stringify(c[0])).join('|');
-    expect(calls).not.toContain('"[]"');
+    // Zero UPDATEs — not even the valid row-0 was written, because validation
+    // fully precedes mutation. No short / `[]` literal ever reaches pgvector.
+    expect(execMock).not.toHaveBeenCalled();
 
+    // The invalid row is audited so ops can see which row tripped the guard.
     expect(auditMock).toHaveBeenCalledTimes(1);
     const auditCall = auditMock.mock.calls[0]![0] as {
+      alvo_id: string;
       metadata: Record<string, unknown>;
     };
+    expect(auditCall.alvo_id).toBe('row-1');
     expect(auditCall.metadata.reason).toBe('wrong_dimension');
     expect(auditCall.metadata.got_dim).toBe(2);
     expect(auditCall.metadata.expected_dim).toBe(expectedDim);
