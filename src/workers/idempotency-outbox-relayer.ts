@@ -35,14 +35,20 @@
  *   on top of the exactly-once ENQUEUE (the outbox row exists once; we retry
  *   DISPATCH until it succeeds or exhausts).
  *
- *   Crash window note: the gateway send and `markEffectSent` are two steps. If
- *   the process crashes AFTER the send but BEFORE markEffectSent, the row stays
- *   pending and a later tick re-dispatches → a possible duplicate. This is the
- *   irreducible at-least-once tail any outbox-without-provider-idempotency
- *   carries; it is STRICTLY BETTER than the #303 status quo (the effect is now
- *   tied to the winning reservation and driven by a single relayer, eliminating
- *   the lease-reclaim double-fire). Closing this last sliver requires a
- *   provider-side idempotency key and is tracked as a follow-up (see PR body).
+ *   Crash window note (CLOSED by #327): the gateway send and `markEffectSent`
+ *   are two steps. If the process crashes AFTER the send but BEFORE
+ *   markEffectSent, the row stays pending and a later tick re-dispatches. To
+ *   make that re-dispatch a NO-OP at the transport, `dispatchEffect` derives a
+ *   DETERMINISTIC provider-side dedup key from the row's stable identity
+ *   (tenant_id, agent_id, idempotency_key) and passes it on the send
+ *   (`deriveProviderDedupKey` → Baileys `messageId`). The same effect always
+ *   sends with the SAME WhatsApp message id, and WhatsApp keys messages on
+ *   `(remoteJid, fromMe, id)`, so the duplicate send is the same message →
+ *   provider/recipient dedups it. Combined with the exactly-once ENQUEUE
+ *   (#316), the effect is now exactly-once END-TO-END for `whatsapp_text`. The
+ *   derivation is per-effect-type (exhaustive switch): a future effect whose
+ *   transport CANNOT take a client-supplied id returns null and falls back to
+ *   the at-least-once tail (documented at the call site) — never a faked key.
  *
  * RETENTION: terminal rows (sent/failed) older than OUTBOX_RELAYER_RETENTION_DAYS
  *   are deleted in the same pass via a bounded batched DELETE (mirrors #292
@@ -57,7 +63,12 @@
 import type { PoolClient } from 'pg';
 import { pool } from '@/db/client.js';
 import { idempotencyOutboxRepo, type ClaimedOutboxEffect } from '@/db/repositories.js';
-import { parseEffectPayload, type PlannedEffect } from '@/governance/idempotency-effects.js';
+import {
+  parseEffectPayload,
+  deriveProviderDedupKey,
+  type PlannedEffect,
+  type OutboxRowIdentity,
+} from '@/governance/idempotency-effects.js';
 import { sendOutboundText } from '@/gateway/baileys.js';
 import { logger } from '@/lib/logger.js';
 import { config } from '@/config/env.js';
@@ -146,11 +157,33 @@ async function tryAcquireRelayerLock(): Promise<AcquiredLock | null> {
  * success; throws on a transient failure (the relayer records the retry).
  * A null return from the gateway (not connected) is treated as a transient
  * failure so the row is retried when connectivity returns.
+ *
+ * Issue #327 — PROVIDER-SIDE DEDUP. `identity` is the outbox row's STABLE
+ * identity (tenant_id, agent_id, idempotency_key). We derive a DETERMINISTIC
+ * provider-side dedup key from it (`deriveProviderDedupKey`) and pass it on the
+ * send so a crash-induced re-dispatch (send succeeded but `markEffectSent` did
+ * not persist before the crash) carries the SAME provider id → the transport
+ * dedups the duplicate. For `whatsapp_text` this is a genuine end-to-end
+ * exactly-once close: Baileys stamps the id as the message key id and WhatsApp
+ * keys messages on `(remoteJid, fromMe, id)`. The per-effect-type derivation
+ * keeps the switch exhaustive; a new effect type supplies its own key (or null
+ * when its transport has no client-id concept).
  */
-async function dispatchEffect(effect: PlannedEffect): Promise<string | null> {
+async function dispatchEffect(
+  effect: PlannedEffect,
+  identity: OutboxRowIdentity,
+): Promise<string | null> {
+  // Provider-side dedup key derived from the row's stable identity. null when
+  // this effect's transport cannot accept a client-supplied id (the send then
+  // proceeds without one — see deriveProviderDedupKey).
+  const dedupKey = deriveProviderDedupKey(effect, identity);
   switch (effect.kind) {
     case 'whatsapp_text': {
-      const providerRef = await sendOutboundText(effect.jid, effect.text);
+      // Pass the deterministic message id so a re-dispatch is the SAME WhatsApp
+      // message key → provider/recipient dedups instead of showing a duplicate.
+      const providerRef = await sendOutboundText(effect.jid, effect.text, {
+        ...(dedupKey ? { messageId: dedupKey } : {}),
+      });
       if (providerRef === null) {
         // Gateway not connected — transient. Throw so the row is retried.
         throw new Error('gateway_not_connected');
@@ -226,7 +259,15 @@ async function relayInner(): Promise<RelayStats> {
     }
 
     try {
-      const providerRef = await dispatchEffect(effect);
+      // #327: derive the provider-side dedup key from the row's STABLE identity
+      // (tenant_id+agent_id from the ALS context this pass runs under, plus the
+      // row's immutable idempotency_key). A later re-dispatch of THIS row
+      // recomputes the identical key → same provider message id → deduped.
+      const providerRef = await dispatchEffect(effect, {
+        tenant_id,
+        agent_id,
+        idempotency_key: row.idempotency_key,
+      });
       const marked = await idempotencyOutboxRepo.markEffectSent({
         id: row.id,
         provider_ref: providerRef,

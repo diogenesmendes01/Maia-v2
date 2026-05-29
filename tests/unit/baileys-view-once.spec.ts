@@ -111,3 +111,38 @@ describe('sendOutboundText — view_once envelope contract', () => {
     expect(sendMessage).not.toHaveBeenCalled();
   });
 });
+
+describe('sendOutboundText — #327 provider-side dedup key (messageId)', () => {
+  it('forwards opts.messageId to Baileys MiscMessageGenerationOptions', async () => {
+    const mod = await import('../../src/gateway/baileys.js');
+    mod._internal._setSocketForTests(fakeSocket as never, true);
+    await mod.sendOutboundText('5511999999999@s.whatsapp.net', 'olá', {
+      messageId: '3EB0ABCDEF0123456789',
+    });
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage).toHaveBeenCalledWith(
+      '5511999999999@s.whatsapp.net',
+      { text: 'olá' },
+      { messageId: '3EB0ABCDEF0123456789' },
+    );
+  });
+
+  it('forwards BOTH messageId and quoted when present', async () => {
+    const mod = await import('../../src/gateway/baileys.js');
+    mod._internal._setSocketForTests(fakeSocket as never, true);
+    const quoted = { key: { id: 'WAID-IN' } } as never;
+    await mod.sendOutboundText('jid', 'oi', { messageId: '3EB0DEADBEEF00112233', quoted });
+    expect(sendMessage).toHaveBeenCalledWith(
+      'jid',
+      { text: 'oi' },
+      { quoted, messageId: '3EB0DEADBEEF00112233' },
+    );
+  });
+
+  it('omits the third arg entirely when no opts are provided (call arity stable)', async () => {
+    const mod = await import('../../src/gateway/baileys.js');
+    mod._internal._setSocketForTests(fakeSocket as never, true);
+    await mod.sendOutboundText('jid', 'sem opts');
+    expect(sendMessage).toHaveBeenCalledWith('jid', { text: 'sem opts' }, undefined);
+  });
+});
