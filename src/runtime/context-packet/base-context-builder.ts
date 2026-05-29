@@ -64,7 +64,7 @@ export interface SensitiveMemoryCounterPort {
 
 export class BaseContextBuilder {
   constructor(
-    private readonly resolver: IdentityResolverPort = defaultResolver,
+    private readonly resolver: IdentityResolverPort = failLoudResolver,
     private readonly featureFlags: FeatureFlagsPort = defaultFeatureFlags,
     private readonly sensitiveCounter: SensitiveMemoryCounterPort = defaultSensitiveCounter,
   ) {}
@@ -145,20 +145,31 @@ export class BaseContextBuilder {
 }
 
 // ============================================================================
-// Default ports — safe fallbacks for tests / contexts without DI
+// Default ports — fail-loud for production, explicit fixture for tests
 // ============================================================================
 
 /**
- * Default resolver: passthrough that treats channel_id as both tenant+agent.
- * Tests inject the real resolver. Production react-loop calls
- * `resolveIdentity()` first and passes tenant_id/agent_id explicitly to
- * `build()`, so this default is rarely hit.
+ * Fail-loud default resolver: if production ever reaches this code path it
+ * means DI is mis-wired. Returning `{tenant_id:'default', agent_id:'default'}`
+ * (the previous behaviour) would silently create a synthetic context that
+ * violates the inviolable multi-tenant isolation invariant:
+ * "Maias de empresas diferentes NUNCA se comunicam, compartilham dados ou
+ * herdam aprendizado. Sem exceção." (project memory).
+ *
+ * Issue #282: removed the silent default. Tests that need a stand-in must
+ * either inject a real-shaped resolver or import `__testOnlyPassthroughResolver`
+ * from `./test-fixtures.js` (test-only path; production code MUST NOT import
+ * it). Production code that legitimately runs without a resolver (e.g. when
+ * `tenant_id`/`agent_id` are pre-resolved by the react-loop) never reaches
+ * the resolver — `build()` short-circuits when the caller supplies both.
  */
-const defaultResolver: IdentityResolverPort = {
-  async resolve(_channel_id: string) {
-    // Last-resort fallback so the builder doesn't crash when DI is missing.
-    // The real resolver lives in src/identity/resolver.ts.
-    return { tenant_id: 'default', agent_id: 'default' };
+const failLoudResolver: IdentityResolverPort = {
+  async resolve(channel_id: string): Promise<never> {
+    throw new Error(
+      `BaseContextBuilder: no IdentityResolverPort injected and no pre-resolved tenant/agent for channel ${channel_id}. ` +
+        `Production code must inject a resolver via DI; tests must inject __testOnlyPassthroughResolver from test-fixtures. ` +
+        `Silent default fallback was removed by issue #282 to preserve tenant-isolation invariant.`,
+    );
   },
 };
 

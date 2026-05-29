@@ -227,6 +227,7 @@ O shutdown handler em `src/index.ts` chama `stopWorkers()` + `shutdownPools()` +
 
 ## Apêndice — referências cruzadas
 
+- **`docs/runbooks/redis.md`** — política de memória multi-tenant, sizing, sinais de pressão. Leia ANTES de mexer em `maxmemory*` no compose ou no Redis gerenciado.
 - **`docs/runbooks/setup-nginx.md`** — IP whitelist, TLS, fail2ban (PR #23, ainda não mergeada na escrita deste runbook).
 - **`audit_watcher`** — regras automáticas de detecção de anomalia (PR #24, ainda não mergeada). Mencionado em §1, §3, §7.
 - **`scripts/restore-test.ts`** — drill de restore (já no main).

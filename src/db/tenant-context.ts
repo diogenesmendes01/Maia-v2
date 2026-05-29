@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'async_hooks';
+import { incCounter } from '@/lib/metrics.js';
 
 export class MissingTenantContextError extends Error {
   // Error code estável (não-traduzível) pra UI/dashboards que precisem
@@ -15,12 +16,45 @@ export class MissingTenantContextError extends Error {
   }
 }
 
+/**
+ * Distinct error for `'default'` literal rejection (issue #282).
+ *
+ * Surfaces a separate code so dashboards/alerts can distinguish "no ALS at
+ * all" (`MISSING_TENANT_CONTEXT`) from "ALS carries the legacy sentinel"
+ * (`TENANT_ID_DEFAULT_LITERAL_REJECTED`). The latter signals a path that
+ * SHOULD have been migrated to a real tenant/agent pair (per the inviolable
+ * isolation invariant) but wasn't.
+ *
+ * Throw behaviour is opt-in via `MAIA_REJECT_DEFAULT_LITERAL=true` so we can
+ * land the warning+metric observability first, watch the counter in
+ * production, and flip the throw on once every legacy path is migrated.
+ */
+export class DefaultLiteralRejectedError extends Error {
+  readonly code = 'TENANT_ID_DEFAULT_LITERAL_REJECTED';
+
+  constructor(field: 'tenant_id' | 'agent_id') {
+    super(
+      `Tenant context carries literal 'default' for ${field} — this sentinel was reachable from legacy paths and violates the inviolable multi-tenant isolation invariant. ` +
+        `Migrate the caller to a real ${field} or remove the synthetic context.`,
+    );
+    this.name = 'DefaultLiteralRejectedError';
+  }
+}
+
 type TenantContext = {
   tenant_id: string;
   agent_id: string;
 };
 
 const storage = new AsyncLocalStorage<TenantContext>();
+
+/**
+ * Read the opt-in flag at access time (NOT module-load time) so tests can
+ * flip it per-case without re-importing.
+ */
+function shouldThrowOnDefaultLiteral(): boolean {
+  return process.env.MAIA_REJECT_DEFAULT_LITERAL === 'true';
+}
 
 export async function runWithTenantContext<T>(
   ctx: TenantContext,
@@ -66,8 +100,17 @@ export async function runWithTenantContext<T>(
  * preservar contratos de teste (#269/#272 reval — regex `/tenant_id is empty/`
  * e `/whitespace-only/`).
  *
- * PRs #269 + #272 + #293 review (Codex reval) — fail-closed em truthy +
- * whitespace + surrounding whitespace.
+ * **Literal `'default'` rejection (issue #282 / PR #296):** o sentinel legado
+ * `{tenant_id:'default', agent_id:'default'}` era alcançável por vários paths
+ * (channel-resolver fallback, base-context-builder DI default, worker
+ * scaffolding) e cria um contexto compartilhado sintético que viola o
+ * isolamento de tenant. Esse guard é aplicado APÓS as checagens de
+ * truthy/whitespace, pelos getters (`getCurrentTenant`/`getCurrentAgent`)
+ * abaixo, emitindo warning + métrica até todos os paths legados migrarem;
+ * com `MAIA_REJECT_DEFAULT_LITERAL=true` vira throw duro.
+ *
+ * PRs #269 + #272 + #293 + #296 review (Codex reval) — fail-closed em truthy +
+ * whitespace + surrounding whitespace, e rejeição do literal `'default'`.
  */
 function assertTruthyContext(value: unknown, name: string): asserts value is string {
   if (typeof value !== 'string' || value.length === 0) {
@@ -81,10 +124,29 @@ function assertTruthyContext(value: unknown, name: string): asserts value is str
   }
 }
 
+/**
+ * Literal `'default'` rejection (issue #282 / PR #296), applied per field after
+ * the truthy/whitespace guard above. Meters every hit on
+ * `maia_tenant_id_default_literal_total` so operators can watch the counter,
+ * and — once `MAIA_REJECT_DEFAULT_LITERAL=true` — promotes to a hard throw.
+ * Kept as a distinct helper (instead of inline in `assertTruthyContext`) so the
+ * per-field strict-string assertion stays a pure shape check while preserving
+ * #296's observability + opt-in throw semantics.
+ */
+function assertNotDefaultLiteral(value: string, field: 'tenant_id' | 'agent_id'): void {
+  if (value === 'default') {
+    incCounter('maia_tenant_id_default_literal_total', { field });
+    if (shouldThrowOnDefaultLiteral()) {
+      throw new DefaultLiteralRejectedError(field);
+    }
+  }
+}
+
 export function getCurrentTenant(): string {
   const ctx = storage.getStore();
   if (!ctx) throw new MissingTenantContextError();
   assertTruthyContext(ctx.tenant_id, 'tenant_id');
+  assertNotDefaultLiteral(ctx.tenant_id, 'tenant_id');
   return ctx.tenant_id;
 }
 
@@ -92,6 +154,7 @@ export function getCurrentAgent(): string {
   const ctx = storage.getStore();
   if (!ctx) throw new MissingTenantContextError();
   assertTruthyContext(ctx.agent_id, 'agent_id');
+  assertNotDefaultLiteral(ctx.agent_id, 'agent_id');
   return ctx.agent_id;
 }
 
@@ -114,6 +177,21 @@ export function tryGetCurrentContext(): TenantContext | null {
     ctx.agent_id !== ctx.agent_id.trim()
   ) {
     return null;
+  }
+  // Mirror the literal-default observability of the strict getters: meter
+  // when callers receive a `default/default` context via the try variant so
+  // the counter captures every path, not just the strict ones.
+  if (ctx.tenant_id === 'default') {
+    incCounter('maia_tenant_id_default_literal_total', {
+      field: 'tenant_id',
+      via: 'tryGetCurrentContext',
+    });
+  }
+  if (ctx.agent_id === 'default') {
+    incCounter('maia_tenant_id_default_literal_total', {
+      field: 'agent_id',
+      via: 'tryGetCurrentContext',
+    });
   }
   return ctx;
 }
