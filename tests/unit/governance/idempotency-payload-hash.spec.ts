@@ -16,8 +16,17 @@
  * behavior, every lookup is wrapped in a fixed tenant context.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { computePayloadHash } from '@/governance/idempotency.js';
+import {
+  computePayloadHash,
+  PAYLOAD_HASH_VERSION_PREFIX,
+} from '@/governance/idempotency.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
+
+// #318 migration-window fix: computePayloadHash now tags its output with a
+// version prefix (`v2:`). Match `<prefix><64-hex>` rather than bare hex.
+const VERSIONED_HASH_RE = new RegExp(
+  `^${PAYLOAD_HASH_VERSION_PREFIX.replace(':', '\\:')}[a-f0-9]{64}$`,
+);
 
 const TEST_CTX = { tenant_id: 'test-tenant', agent_id: 'test-agent' };
 
@@ -236,7 +245,21 @@ describe('computePayloadHash — invariants (#299)', () => {
     const h1 = computePayloadHash(base);
     const h2 = computePayloadHash(base);
     expect(h1).toBe(h2);
-    expect(h1).toMatch(/^[a-f0-9]{64}$/);
+    expect(h1).toMatch(VERSIONED_HASH_RE);
+  });
+
+  it('tags every output with the version prefix (#318 migration-window fix)', () => {
+    // The prefix is what lets the repo distinguish a current-format hash from
+    // a legacy (pre-#318) stored value — see isRealPayloadHashCollision.
+    expect(computePayloadHash(base).startsWith(PAYLOAD_HASH_VERSION_PREFIX)).toBe(
+      true,
+    );
+    // file_sha256 path is prefixed too.
+    expect(
+      computePayloadHash({ ...base, file_sha256: 'aaa' }).startsWith(
+        PAYLOAD_HASH_VERSION_PREFIX,
+      ),
+    ).toBe(true);
   });
 
   it('insensitive to descricao case/accents (delegates to normalizePayload)', () => {
@@ -298,5 +321,56 @@ describe('computePayloadHash — invariants (#299)', () => {
       payload: { something: 'A' },
     });
     expect(h1).not.toBe(h3);
+  });
+
+  // #318 — delimiter safety. The fingerprint segments are joined with '|'.
+  // A naive `parts.join('|')` lets a literal '|' inside any free-form segment
+  // shift the field boundaries, so two DISTINCT input tuples can serialize to
+  // the identical string and collide on SHA-256 — a FALSE payload-hash match,
+  // defeating the very integrity check this hash provides. Per-segment
+  // encoding (mirroring computeIdempotencyKey) escapes '|' → '%7C' so the
+  // boundaries stay unambiguous.
+  it('delimiter-safe: a "|" migrating between adjacent segments does NOT collide (#318)', () => {
+    // Both tuples render to `...|a|b|c|...` under a naive join('|'):
+    //   A → pessoa_id='a', entity_id='b|c'
+    //   B → pessoa_id='a|b', entity_id='c'
+    const a = computePayloadHash({
+      ...base,
+      pessoa_id: 'a',
+      entity_id: 'b|c',
+    });
+    const b = computePayloadHash({
+      ...base,
+      pessoa_id: 'a|b',
+      entity_id: 'c',
+    });
+    expect(a).not.toBe(b);
+    expect(a).toMatch(VERSIONED_HASH_RE);
+    expect(b).toMatch(VERSIONED_HASH_RE);
+  });
+
+  it('delimiter-safe: a "|" migrating between tool_name and operation_type does NOT collide (#318)', () => {
+    // Both render to `...|create|x|y|...` under a naive join('|') (the
+    // remaining segments are identical, so the field count is preserved):
+    //   A → tool_name='create',   operation_type='x|y'
+    //   B → tool_name='create|x', operation_type='y'
+    const a = computePayloadHash({
+      ...base,
+      tool_name: 'create',
+      operation_type: 'x|y',
+    });
+    const b = computePayloadHash({
+      ...base,
+      tool_name: 'create|x',
+      operation_type: 'y',
+    });
+    expect(a).not.toBe(b);
+  });
+
+  it('still deterministic for segments that contain a "|" (#318)', () => {
+    // Encoding must not break stability: the same '|'-bearing input still
+    // hashes to itself across calls.
+    const input = { ...base, entity_id: 'b|c', tool_name: 'create|register' };
+    expect(computePayloadHash(input)).toBe(computePayloadHash(input));
   });
 });
