@@ -3,6 +3,10 @@ import { sql } from 'drizzle-orm';
 import { redis, isRedisConnected } from '@/lib/redis.js';
 import { isBaileysConnected, getLastDisconnectAt } from '@/gateway/baileys.js';
 import { healthRepo } from '@/db/repositories.js';
+import {
+  CRITICAL_MEMORY_USED_RATIO,
+  getMemoryUsedRatio,
+} from '@/observability/redis-memory-collector.js';
 
 export type HealthStatus = 'ok' | 'degraded' | 'down';
 export type HealthReport = {
@@ -58,6 +62,46 @@ export async function checkAll(): Promise<{ status: HealthStatus; components: He
     });
   }
   return { status: overall, components: reports };
+}
+
+export type ReadinessReport = {
+  ready: boolean;
+  /** Why the instance is not ready, when `ready === false`. */
+  reason?: string;
+  checks: {
+    redis_memory_used_ratio: number;
+    redis_memory_critical_ratio: number;
+  };
+};
+
+/**
+ * Readiness gate for the load balancer (`/readyz`). Distinct from the
+ * `/health/*` component probes: this answers "should the LB keep routing to
+ * this instance?".
+ *
+ * Returns NOT-ready when Redis memory pressure crosses the critical ratio
+ * (`> 0.95`). Under `maxmemory-policy noeviction` (see docs/runbooks/redis.md
+ * §1) crossing the cap turns memory pressure into write failures (Redis OOM),
+ * so draining the instance ahead of that point lets the LB shed load before
+ * the incident cascades into BullMQ/idempotency/working-memory write errors.
+ *
+ * The ratio comes from the cached collector snapshot (no Redis round-trip),
+ * so the probe stays cheap even under aggressive LB poll intervals.
+ */
+export async function checkReadiness(): Promise<ReadinessReport> {
+  const ratio = getMemoryUsedRatio();
+  const checks = {
+    redis_memory_used_ratio: ratio,
+    redis_memory_critical_ratio: CRITICAL_MEMORY_USED_RATIO,
+  };
+  if (ratio > CRITICAL_MEMORY_USED_RATIO) {
+    return {
+      ready: false,
+      reason: `redis memory pressure critical: used_ratio ${ratio.toFixed(4)} > ${CRITICAL_MEMORY_USED_RATIO} (noeviction → writes will fail)`,
+      checks,
+    };
+  }
+  return { ready: true, checks };
 }
 
 export async function shutdownPools(): Promise<void> {

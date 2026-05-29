@@ -1,7 +1,13 @@
 import Fastify from 'fastify';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
-import { checkAll, checkDb, checkRedis, checkWhatsApp } from '@/lib/healthcheck.js';
+import {
+  checkAll,
+  checkDb,
+  checkReadiness,
+  checkRedis,
+  checkWhatsApp,
+} from '@/lib/healthcheck.js';
 import { renderPrometheus, setGaugeProvider } from '@/lib/metrics.js';
 import { isRedisConnected } from '@/lib/redis.js';
 import { isBaileysConnected } from '@/gateway/baileys.js';
@@ -28,14 +34,30 @@ export async function buildServer() {
   // Issue #297 — Redis memory pressure gauges (used_memory / maxmemory /
   // ratio / evicted_keys / rejected_connections). Periodic INFO collection
   // populates a snapshot that the gauge providers read on each scrape.
-  // The timer self-`unref()`s so it never blocks process exit, matching
-  // `dbProbeTimer` above; no explicit shutdown hook is required.
-  startRedisMemoryCollector();
+  // The timer self-`unref()`s so it never blocks a clean process exit, but
+  // we still capture the handle and stop it on `onClose` so repeated
+  // buildServer()/app.close() cycles (tests, hot reload) don't leak untracked
+  // intervals — and `dbProbeTimer` is cleared there too for the same reason.
+  const redisMemoryCollector = startRedisMemoryCollector();
+  app.addHook('onClose', async () => {
+    clearInterval(dbProbeTimer);
+    redisMemoryCollector.stop();
+  });
 
   app.get('/health', async () => checkAll());
   app.get('/health/db', async () => checkDb());
   app.get('/health/redis', async () => checkRedis());
   app.get('/health/whatsapp', async () => checkWhatsApp());
+  // Issue #297 — readiness gate. Distinct from /health/* (liveness-ish
+  // component probes): /readyz tells a load balancer whether to keep this
+  // instance in rotation. Returns 503 when Redis memory pressure crosses the
+  // critical ratio so the LB drains the instance BEFORE `noeviction` turns
+  // pressure into write failures (see docs/runbooks/redis.md §4).
+  app.get('/readyz', async (_req, reply) => {
+    const report = await checkReadiness();
+    reply.code(report.ready ? 200 : 503);
+    return report;
+  });
   app.get('/metrics', async (_req, reply) => {
     reply.header('content-type', 'text/plain; version=0.0.4');
     return renderPrometheus();

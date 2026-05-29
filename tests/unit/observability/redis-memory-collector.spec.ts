@@ -39,8 +39,10 @@ vi.mock('../../../src/lib/logger.js', () => ({
 
 import {
   collectOnce,
+  getMemoryUsedRatio,
   parseInfoField,
   startRedisMemoryCollector,
+  CRITICAL_MEMORY_USED_RATIO,
   _resetForTests,
 } from '../../../src/observability/redis-memory-collector.js';
 import { renderPrometheus, _resetForTests as _resetMetrics } from '../../../src/lib/metrics.js';
@@ -313,5 +315,83 @@ describe('redis-memory-collector — startRedisMemoryCollector lifecycle', () =>
     const handle = startRedisMemoryCollector(60_000);
     expect(() => handle.stop()).not.toThrow();
     expect(() => handle.stop()).not.toThrow();
+  });
+
+  it('repeated start/stop cycles do not leak live intervals', async () => {
+    vi.useFakeTimers();
+    try {
+      infoMock.mockResolvedValue('');
+      // Simulate buildServer()/app.close() cycles (tests, hot reload): each
+      // start must be matched by stop() so no orphaned interval keeps firing.
+      for (let i = 0; i < 5; i++) {
+        const handle = startRedisMemoryCollector(1000);
+        handle.stop();
+      }
+      infoMock.mockClear();
+      // Advance well past several intervals — a leaked timer would fire here.
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(infoMock).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('redis-memory-collector — getMemoryUsedRatio (readiness gate input)', () => {
+  beforeEach(() => {
+    _resetMetrics();
+    _resetForTests();
+    infoMock.mockReset();
+    loggerWarnMock.mockReset();
+  });
+
+  afterEach(() => {
+    _resetMetrics();
+    _resetForTests();
+  });
+
+  it('returns used/max from the cached snapshot (no Redis round-trip)', async () => {
+    infoMock.mockImplementation((section: string) => {
+      if (section === 'memory') return Promise.resolve(SAMPLE_MEMORY_INFO);
+      if (section === 'stats') return Promise.resolve(SAMPLE_STATS_INFO);
+      return Promise.resolve('');
+    });
+    const handle = startRedisMemoryCollector(60_000);
+    handle.stop();
+    await collectOnce();
+
+    // 1.5GiB / 2GiB = 0.75. Crucially, reading the ratio does NOT call info()
+    // again (it reads the snapshot), so health checks stay cheap.
+    const callsBefore = infoMock.mock.calls.length;
+    expect(getMemoryUsedRatio()).toBeCloseTo(0.75, 5);
+    expect(infoMock.mock.calls.length).toBe(callsBefore);
+  });
+
+  it('returns 0 when maxmemory is 0 (unbounded — never reads as pressure)', async () => {
+    const unbounded = ['# Memory', 'used_memory:1000000', 'maxmemory:0', ''].join('\r\n');
+    infoMock.mockImplementation((section: string) =>
+      Promise.resolve(section === 'memory' ? unbounded : SAMPLE_STATS_INFO),
+    );
+    const handle = startRedisMemoryCollector(60_000);
+    handle.stop();
+    await collectOnce();
+    expect(getMemoryUsedRatio()).toBe(0);
+  });
+
+  it('crosses the critical threshold exactly at > 0.95', async () => {
+    // used/max = 0.96 → above critical; the readiness gate must drain on this.
+    const critical = [
+      '# Memory',
+      'used_memory:96',
+      'maxmemory:100',
+      '',
+    ].join('\r\n');
+    infoMock.mockImplementation((section: string) =>
+      Promise.resolve(section === 'memory' ? critical : SAMPLE_STATS_INFO),
+    );
+    const handle = startRedisMemoryCollector(60_000);
+    handle.stop();
+    await collectOnce();
+    expect(getMemoryUsedRatio()).toBeGreaterThan(CRITICAL_MEMORY_USED_RATIO);
   });
 });

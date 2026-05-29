@@ -69,6 +69,26 @@ const snapshot: MemorySnapshot = {
 let gaugesRegistered = false;
 
 /**
+ * Critical memory-pressure ratio. Above this, `noeviction` will start failing
+ * writes (Redis returns OOM), so the readiness gate (`/readyz`, see
+ * `healthcheck.ts`) takes the instance out of LB rotation. Kept in sync with
+ * the `RedisMemoryPressureCritical` Prometheus alert (`> 0.95`,
+ * monitoring/alerts/redis.rules.yml) and `docs/runbooks/redis.md` §4.
+ */
+export const CRITICAL_MEMORY_USED_RATIO = 0.95;
+
+/**
+ * Current `used_memory / maxmemory` ratio from the last successful collect.
+ * Returns 0 when Redis is unbounded (`maxmemory=0`) — matching the gauge,
+ * so a missing cap never reads as "critical pressure". Reads the cached
+ * snapshot (no Redis round-trip), so health checks stay cheap.
+ */
+export function getMemoryUsedRatio(): number {
+  if (snapshot.maxmemory <= 0) return 0;
+  return snapshot.used_memory / snapshot.maxmemory;
+}
+
+/**
  * Parse a numeric field from a Redis INFO section payload.
  * INFO lines look like `used_memory:1572864`. Returns `undefined` if the
  * field is absent or non-numeric — callers decide whether to skip the
@@ -96,14 +116,11 @@ function registerGauges(): void {
   if (gaugesRegistered) return;
   setGaugeProvider('redis_used_memory_bytes', () => snapshot.used_memory);
   setGaugeProvider('redis_maxmemory_bytes', () => snapshot.maxmemory);
-  setGaugeProvider('redis_memory_used_ratio', () => {
-    // maxmemory=0 means "unbounded" in Redis. Without a cap, the ratio is
-    // undefined — emit 0 so alerts based on `> 0.80` never fire spuriously.
-    // (The operator still sees `redis_maxmemory_bytes 0` which is the right
-    // primary signal for "no cap configured".)
-    if (snapshot.maxmemory <= 0) return 0;
-    return snapshot.used_memory / snapshot.maxmemory;
-  });
+  // maxmemory=0 means "unbounded" in Redis. Without a cap, the ratio is
+  // undefined — `getMemoryUsedRatio()` emits 0 so alerts based on `> 0.80`
+  // never fire spuriously. (The operator still sees `redis_maxmemory_bytes 0`
+  // which is the right primary signal for "no cap configured".)
+  setGaugeProvider('redis_memory_used_ratio', () => getMemoryUsedRatio());
   setGaugeProvider('redis_evicted_keys_total', () => snapshot.evicted_keys);
   setGaugeProvider(
     'redis_rejected_connections_total',
