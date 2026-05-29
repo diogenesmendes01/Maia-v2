@@ -12,12 +12,23 @@ sizing, sinais de pressão, e o que NÃO mexer.
 
 A Maia hospeda múltiplos tenants no mesmo Redis. O isolamento entre tenants
 é feito **por prefixo de chave** (`tenant_id+agent_id` em working memory,
-rate-limit, dedup, debouncer, vision cache, idempotency ledger, etc.). Esse
+rate-limit, dedup de mensagem, debouncer, vision cache, etc.). Esse
 scoping já está **merged em `main`** — cada caller crítico deriva o prefixo do
 `runWithTenantContext` e falha alto (`MissingTenantContextError`) se o
 contexto estiver ausente (PRs #245/#252/#253/#257/#258/#259/#264/#272, todas
 mergeadas). Isso resolve leitura/escrita cruzada mas **não** protege contra o
 evictor do Redis — daí esta política.
+
+> **Nota — idempotency é Postgres, não Redis.** O *ledger* de idempotência de
+> tool/outbound NÃO mora no Redis: a idempotência de tool fica na tabela
+> `idempotency_keys` (`idempotencyRepo` em `src/db/repositories.ts`) e o ledger
+> de entrega outbound na tabela `outbound_messages` (`outboundMessagesRepo`,
+> serializado por `pg_advisory_xact_lock` — issue #227). A única camada de
+> "já visto" no Redis é o **dedup de mensagem de gateway**
+> (`src/gateway/dedup.ts`, chaves `dedup:msg:…` com TTL de 24h e *fallback*
+> para Postgres via `mensagensRepo.findByWhatsappId`). Portanto a pressão de
+> memória / OOM do Redis **não** ameaça a idempotência — só o dedup de gateway,
+> que degrada para o fallback Postgres.
 
 Sob pressão de memória, a política `maxmemory-policy` decide o que fazer:
 
@@ -99,8 +110,11 @@ Estimativa atual (~todas chaves são prefixadas por tenant+agent):
 |---|---|
 | Working memory por conversa ativa | ~50-200 KB |
 | BullMQ jobs (queue + completed/failed buffers) | ~100 KB-1 MB total |
-| Idempotency ledger (1 dia, TTL aplicado) | ~10 KB por 100 outbound msgs |
+| Dedup de mensagem de gateway (`dedup:msg:…`, TTL 24h) | ~50 bytes por mensagem vista |
 | Rate-limit buckets | ~100 bytes por (tenant, agent, IP) |
+
+> O ledger de idempotência de tool/outbound **não** entra nesta conta — ele
+> é Postgres (`idempotency_keys` / `outbound_messages`), não Redis.
 
 Cenário ruim para 1 tenant ativo: ~50 conversas concorrentes × 200 KB = 10 MB.
 
@@ -203,8 +217,11 @@ controlada; o restante ainda propaga o erro até #309:
   #245/#258). OOM aqui silencia o usuário em vez de derrubar o job. ✅
 - **BullMQ enqueue** — falha vira erro determinístico → DLQ
   (ver `docs/runbooks/operational.md` §5). Sem retry-once dedicado até #309.
-- **Idempotency ledger** — write falha → outbound write é abortado (correto —
-  não enviar é melhor que duplicar).
+- **Dedup de mensagem de gateway** (`src/gateway/dedup.ts`) — a marcação
+  "já visto" no Redis falha, mas o dedup degrada para o *fallback* Postgres
+  (`mensagensRepo.findByWhatsappId`, tenant+agent-scoped): a duplicata ainda é
+  detectada, só sem a fast-path do cache. (A idempotência de tool/outbound NÃO
+  aparece aqui — é Postgres, fora do alcance do OOM do Redis; ver §1.)
 - **Working memory** — write falha; próxima leitura tem cache miss e o agente
   reconstrói o estado das mensagens persistidas em Postgres (degradação
   graciosa, com latência extra).
