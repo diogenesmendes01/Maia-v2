@@ -638,6 +638,17 @@ export const outbound_messages = pgTable(
       t.tenant_id,
       t.created_at,
     ),
+    // #292 — sweeper hot path (src/workers/outbound-messages-sweeper.ts). Both
+    // sweep ops filter `WHERE tenant_id = $ AND agent_id = $ AND status IN (...)
+    // AND created_at < cutoff` and ORDER BY created_at. The (tenant_id,
+    // created_at) index above lacks agent_id + status, so the planner would
+    // seq-scan + filter. This composite (tenant_id, agent_id, status,
+    // created_at) lets the equality columns anchor the scan and created_at back
+    // the range predicate + the LIMIT's ORDER BY. Created CONCURRENTLY by
+    // migration 067 (no-tx) since outbound_messages can be large in prod.
+    byTenantAgentStatusCreated: index(
+      'idx_outbound_messages_tenant_agent_status_created',
+    ).on(t.tenant_id, t.agent_id, t.status, t.created_at),
     // Multi-tenant invariant (#232/#237): tenant+agent scope the dedupe namespace.
     // Two tenants (or two agents in one tenant) can share the same idempotency_key
     // string without colliding; the advisory-lock in upsertPending hashes the same
