@@ -80,6 +80,33 @@ const AGENT_A = 'agent-A-issue-290';
 const TENANT_B = 'tenant-B-issue-290';
 const AGENT_B = 'agent-B-issue-290';
 
+// The "5 concurrent tenants" case adopts a row into these bespoke scopes.
+// Each is a distinct (tenant_id, agent_id) pair — seeded as FK parents below.
+const CONTENDERS = [
+  { t: 'tenant-c1-290', a: 'agent-c1' },
+  { t: 'tenant-c2-290', a: 'agent-c2' },
+  { t: 'tenant-c3-290', a: 'agent-c3' },
+  { t: 'tenant-c4-290', a: 'agent-c4' },
+  { t: 'tenant-c5-290', a: 'agent-c5' },
+] as const;
+
+// EVERY (tenant_id, agent_id) scope this spec adopts a `mensagens` row into.
+// `mensagens.tenant_id`/`mensagens.agent_id` are FOREIGN KEYS — migration
+// 009_p0_add_tenant_agent_columns.sql adds them as
+// `tenant_id TEXT ... REFERENCES tenants(id)` and
+// `agent_id  TEXT ... REFERENCES agents(id)`, and 012_p0_force_not_null.sql
+// makes both NOT NULL. The migration-seeded `default`/`default` pair (see
+// 007_p0_tenants_agents.sql) is the ONLY scope that exists out of the box;
+// adopting into any other tenant/agent therefore requires us to pre-seed the
+// parent rows first, or the UPDATE trips `mensagens_tenant_id_fkey` /
+// `mensagens_agent_id_fkey`. `default` is intentionally excluded here — it is
+// already seeded by migration 007 and re-inserting it would be redundant.
+const SCOPES: ReadonlyArray<{ tenant_id: string; agent_id: string }> = [
+  { tenant_id: TENANT_A, agent_id: AGENT_A },
+  { tenant_id: TENANT_B, agent_id: AGENT_B },
+  ...CONTENDERS.map((c) => ({ tenant_id: c.t, agent_id: c.a })),
+];
+
 // Deterministic UUIDs (the `mensagens.id` column is UUID PRIMARY KEY).
 // Final group is exactly 12 hex digits (8-4-4-4-12), distinct per row.
 const ROW_ID = '00000000-0000-0000-0000-000000000290';
@@ -101,6 +128,42 @@ async function insertDefaultDefaultRow(id: string, whatsappId: string): Promise<
   );
 }
 
+/**
+ * Pre-seed the `tenants` + `agents` FK parents for every scope this spec
+ * adopts into. Without this, `adoptToResolvedTenantCrossTenant` issues an
+ * UPDATE that re-homes the row to a tenant/agent that does not exist in the
+ * parent tables, violating `mensagens_tenant_id_fkey` /
+ * `mensagens_agent_id_fkey` (the FKs added by migration 009).
+ *
+ * Mirrors the seed INSERTs in `migrations/007_p0_tenants_agents.sql` exactly:
+ *   - tenants(id, nome, status)  — status defaults to 'active'; we pass it
+ *     explicitly to match the migration and satisfy the CHECK constraint.
+ *   - agents(id, tenant_id, nome, status) — agents.tenant_id is itself a FK to
+ *     tenants(id), so the tenant row MUST be inserted first. We insert the
+ *     tenant and its agent together, in that order.
+ *
+ * `ON CONFLICT (id) DO NOTHING` makes this idempotent: the parents are static
+ * fixtures (beforeEach only deletes `mensagens` rows, never the parents), and
+ * the migration-seeded `default` pair is excluded from SCOPES, so there is no
+ * collision with row 007. Idempotency keeps the helper safe even if a future
+ * refactor calls it more than once per container.
+ */
+async function seedScopeParents(): Promise<void> {
+  for (const { tenant_id, agent_id } of SCOPES) {
+    // Tenant first — agents.tenant_id REFERENCES tenants(id).
+    await pg.pool.query(
+      `INSERT INTO tenants (id, nome, status) VALUES ($1, $2, 'active')
+       ON CONFLICT (id) DO NOTHING`,
+      [tenant_id, `Tenant ${tenant_id} (issue #290 real-db test)`],
+    );
+    await pg.pool.query(
+      `INSERT INTO agents (id, tenant_id, nome, status) VALUES ($1, $2, $3, 'active')
+       ON CONFLICT (id) DO NOTHING`,
+      [agent_id, tenant_id, `Agent ${agent_id} (issue #290 real-db test)`],
+    );
+  }
+}
+
 /** Read the current (tenant_id, agent_id) of a row straight from the table. */
 async function ownerOf(id: string): Promise<{ tenant_id: string; agent_id: string } | null> {
   const res = await pg.pool.query<{ tenant_id: string; agent_id: string }>(
@@ -120,6 +183,10 @@ d('mensagensRepo.adoptToResolvedTenantCrossTenant — cross-tenant adoption race
     repositoriesMod = await import('@/db/repositories.js');
     tenantContextMod = await import('@/db/tenant-context.js');
     dbClientMod = await import('@/db/client.js');
+    // Seed the tenants/agents FK parents for every non-default scope the suite
+    // adopts into. MUST run before any test's adoption UPDATE, otherwise the
+    // re-homing trips mensagens_tenant_id_fkey / mensagens_agent_id_fkey.
+    await seedScopeParents();
   }, /* image pull on first run */ 180_000);
 
   afterAll(async () => {
@@ -233,13 +300,9 @@ d('mensagensRepo.adoptToResolvedTenantCrossTenant — cross-tenant adoption race
   it('many concurrent adoptions (5 distinct tenants) on one row: exactly one wins; others all miss', async () => {
     await insertDefaultDefaultRow(ROW_ID, 'WAID-RACE-N');
 
-    const contenders = [
-      { t: 'tenant-c1-290', a: 'agent-c1' },
-      { t: 'tenant-c2-290', a: 'agent-c2' },
-      { t: 'tenant-c3-290', a: 'agent-c3' },
-      { t: 'tenant-c4-290', a: 'agent-c4' },
-      { t: 'tenant-c5-290', a: 'agent-c5' },
-    ];
+    // Reuse the module-level CONTENDERS so the scopes we race over are exactly
+    // the ones seeded as FK parents in beforeAll (no drift between seed + use).
+    const contenders = CONTENDERS;
     const results = await Promise.all(contenders.map((c) => adopt(ROW_ID, c.t, c.a)));
 
     // Precisely one true across all contenders.
