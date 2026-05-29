@@ -67,7 +67,28 @@ vi.mock('@/db/client.js', () => ({
     };
     return fn(tx as any);
   }),
-  db: {},
+  // Issue #323 (Phase 3): the reaper now enumerates DISTINCT (tenant_id,
+  // agent_id) from procedure_executions with status='in_progress' via
+  // db.selectDistinct(...). Mirror that over the in-memory execState so the
+  // dispatcher yields the seeded tuple before opening per-tuple context.
+  db: {
+    selectDistinct: () => ({
+      from: () => ({
+        where: async () => {
+          const seen = new Set<string>();
+          const pairs: Array<{ tenant_id: string; agent_id: string }> = [];
+          for (const ex of Object.values(execState) as any[]) {
+            if (ex.status !== 'in_progress') continue;
+            const key = `${ex.tenant_id}|${ex.agent_id}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            pairs.push({ tenant_id: ex.tenant_id, agent_id: ex.agent_id });
+          }
+          return pairs;
+        },
+      }),
+    }),
+  },
 }));
 
 // ---------- repositories mock ----------
@@ -233,12 +254,15 @@ vi.mock('@/db/repositories.js', async () => {
         }
       }),
       listStaleInProgress: vi.fn(async (opts: { ttl_days: number; limit?: number }) => {
-        // Reaper sets tenant context per iteration; honour it.
-        const { getCurrentTenant } = await import('@/db/tenant-context.js');
+        // Reaper sets (tenant, agent) context per iteration; honour it.
+        // Issue #323 (Phase 3): the real query now filters by agent_id too.
+        const { getCurrentTenant, getCurrentAgent } = await import('@/db/tenant-context.js');
         const tenant_id = getCurrentTenant();
+        const agent_id = getCurrentAgent();
         const cutoff = Date.now() - opts.ttl_days * 86_400_000;
         const all = Object.values(execState).filter((ex: any) => {
           if (ex.tenant_id !== tenant_id) return false;
+          if (ex.agent_id !== agent_id) return false;
           if (ex.status !== 'in_progress') return false;
           const lastTs =
             ex.last_activity_at instanceof Date

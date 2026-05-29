@@ -4366,9 +4366,20 @@ export const procedureExecutionsRepo = {
       .where(eq(procedure_executions.id, id));
   },
 
-  // P3c Task 9 — reaper helper. Retorna execuções do tenant atual ainda em
-  // status='in_progress' cuja last_activity_at < now() - ttl_days. Workers
-  // chamam dentro de runWithTenantContext para isolar por tenant.
+  // P3c Task 9 — reaper helper. Retorna execuções do (tenant, agent) atual
+  // ainda em status='in_progress' cuja last_activity_at < now() - ttl_days.
+  // Workers chamam dentro de runWithTenantContext para isolar por par.
+  //
+  // Issue #323 (Phase 3): a query agora filtra por agent_id ADEMAIS de
+  // tenant_id. Antes só filtrava tenant_id — o reaper rodava sob o agent
+  // 'default' e varria as execuções de TODOS os agents do tenant numa única
+  // passada, gravando o event `auto_abandoned` com agent_id='default' (audit
+  // mis-attribution: o event de um agent real ficava carimbado como 'default').
+  // Com o worker agora iterando tuplas (tenant, agent) reais, esta query
+  // PRECISA escopar por agent — senão cada uma das N iterações por tenant
+  // reprocessaria o mesmo conjunto tenant-wide (N× trabalho + N× events).
+  // Usa o índice `procedure_exec_tenant_agent_status_idx
+  // (tenant_id, agent_id, status, last_activity_at)`.
   //
   // PR #85 fix P85-I6: cap result size with `limit` (default 1000) to keep
   // the per-tick cost bounded. After a long outage this prevents one cron
@@ -4381,6 +4392,7 @@ export const procedureExecutionsRepo = {
     limit?: number;
   }): Promise<ProcedureExecution[]> {
     const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const cutoff = new Date(Date.now() - opts.ttl_days * 86_400_000);
     const cap = opts.limit ?? 1000;
     return db
@@ -4389,6 +4401,7 @@ export const procedureExecutionsRepo = {
       .where(
         and(
           eq(procedure_executions.tenant_id, tenant_id),
+          eq(procedure_executions.agent_id, agent_id),
           eq(procedure_executions.status, 'in_progress'),
           lt(procedure_executions.last_activity_at, cutoff),
         ),

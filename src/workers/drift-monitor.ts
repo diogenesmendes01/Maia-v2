@@ -1,12 +1,32 @@
 /**
  * P4 Task 10 — `drift-monitor` worker (weekly).
  *
- * Roda 1x/semana (cron `0 3 * * 0` — domingo 03:00 BRT). Para cada tenant,
- * abre tenant context, busca o perfil operacional ativo, monta o input do
- * orchestrator (`runAllDriftDetectors` — Task 8), executa todos os 7
- * detectores e aplica decisões via `decideAndApply` (Task 9).
+ * Roda 1x/semana (cron `0 3 * * 0` — domingo 03:00 BRT). Para cada par
+ * (tenant_id, agent_id) que TEM um perfil operacional ativo, abre tenant
+ * context, busca esse perfil, monta o input do orchestrator
+ * (`runAllDriftDetectors` — Task 8), executa todos os 7 detectores e aplica
+ * decisões via `decideAndApply` (Task 9).
  *
- * Fluxo por tenant:
+ * Issue #323 (Phase 3) — per-agent fan-out, NÃO mais `agent_id:'default'`.
+ *
+ * BEFORE: o worker iterava `tenantsRepo.list()` e abria
+ * `runWithTenantContext({ tenant_id, agent_id:'default' })` fixo. Dois
+ * problemas: (1) no flip de `MAIA_REJECT_DEFAULT_LITERAL` o
+ * `getCurrentAgent()`/`assertNotDefaultLiteral` lançaria em todo tenant; e
+ * (2) só o agent 'default' de cada tenant era analisado — os OUTROS agents do
+ * tenant nunca passavam por detecção de drift (bug latente de cobertura
+ * per-agent). `tenantsRepo.list()` ainda incluía `system`+`default`, que sob o
+ * flip também lançariam.
+ *
+ * AFTER: enumera tuplas (tenant_id, agent_id) DISTINCT que têm um perfil
+ * ATIVO em `agent_operational_profile_versions` (work-table fan-out — mesmo
+ * padrão de `reflection-batch`/`outbound-messages-sweeper`, #240/#251/#292).
+ * Cada agent real com baseline ganha seu próprio pass; agents sem perfil ativo
+ * naturalmente não aparecem (o worker já os pulava). `system`/`default` não
+ * têm perfil ativo seeded, então caem fora da enumeração sem caso especial.
+ * Fail-isolated por tupla: erro em um (tenant, agent) não derruba os demais.
+ *
+ * Fluxo por (tenant, agent):
  *   1. `operationalProfileVersionsRepo.getActive()` — se null, skip (sem
  *      baseline para comparar).
  *   2. Monta `DriftDetectionInput` com best-effort fetch:
@@ -27,17 +47,17 @@
  * Todos os fetches são try/catch'ados — em falha, fallback para array vazio
  * (os detectores tratam input vazio defensivamente devolvendo null).
  */
-import { sql } from 'drizzle-orm';
+import { sql, eq } from 'drizzle-orm';
 import { logger } from '@/lib/logger.js';
 import { db } from '@/db/client.js';
 import {
   mensagens,
   procedure_definitions,
+  agent_operational_profile_versions,
   type AgentOperationalProfileVersion,
 } from '@/db/schema.js';
 import { runWithTenantContext, getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import {
-  tenantsRepo,
   operationalProfileVersionsRepo,
   capabilitiesSkillRepo,
 } from '@/db/repositories.js';
@@ -53,47 +73,106 @@ const RECENT_MSG_LIMIT = 200;
 const RECENT_PROCEDURES_DAYS = 30;
 
 type SeverityBreakdown = { baixo: number; medio: number; alto: number; critico: number };
+type TenantAgentRow = { tenant_id: string; agent_id: string };
+
+/**
+ * Issue #323 (Phase 3) — enumera tuplas (tenant_id, agent_id) DISTINCT que
+ * têm um perfil operacional ATIVO. Roda OUTSIDE de qualquer tenant context —
+ * é o dispatcher que decide em quais escopos rodar a detecção de drift.
+ *
+ * Work-table fan-out (mesmo padrão de reflection-batch #240/#251 e
+ * outbound-messages-sweeper #292): só tenants/agents com baseline ativo
+ * aparecem — exatamente os que o worker processaria (os demais já eram
+ * pulados via `no_active_profile_skip`). `system`/`default` não têm perfil
+ * ativo seeded, então não entram no loop sem caso especial.
+ *
+ * Espelha o idioma `selectDistinct` já usado por
+ * `cognitiveCandidatesRepo.listPendingTenantPairsForType` (P83-C2): query
+ * builder type-safe, sem RLS implícito — a iteração é parte do contrato do
+ * worker, que abre `runWithTenantContext` por tupla.
+ */
+async function listAgentsWithActiveProfile(): Promise<TenantAgentRow[]> {
+  return db
+    .selectDistinct({
+      tenant_id: agent_operational_profile_versions.tenant_id,
+      agent_id: agent_operational_profile_versions.agent_id,
+    })
+    .from(agent_operational_profile_versions)
+    .where(eq(agent_operational_profile_versions.status, 'active'));
+}
 
 export async function runDriftMonitor(): Promise<void> {
-  const tenants = await tenantsRepo.list();
+  const tuples = await listAgentsWithActiveProfile();
   let total_alerts = 0;
+  let agents_processed = 0;
+  let agents_failed = 0;
   const by_severity: SeverityBreakdown = { baixo: 0, medio: 0, alto: 0, critico: 0 };
 
-  for (const t of tenants) {
-    await runWithTenantContext({ tenant_id: t.id, agent_id: 'default' }, async () => {
-      const active = await operationalProfileVersionsRepo.getActive();
-      if (!active) {
-        logger.info({ tenant_id: t.id }, 'drift_monitor.no_active_profile_skip');
-        return;
-      }
-
-      const input = await assembleDriftInput(active);
-      const evidences = await runAllDriftDetectors(input);
-
-      if (evidences.length === 0) {
-        logger.info({ tenant_id: t.id }, 'drift_monitor.no_drift');
-        return;
-      }
-
-      const results = await decideAndApply({ evidences, active_profile_id: active.id });
-      total_alerts += results.length;
-      for (const r of results) {
-        const sev = r.severity as keyof SeverityBreakdown;
-        if (sev in by_severity) by_severity[sev]++;
-      }
-
-      logger.info(
-        {
-          tenant_id: t.id,
-          alerts: results.length,
-          by_severity_local: results.map((r) => r.severity),
-        },
-        'drift_monitor.tenant_done',
-      );
-    });
+  if (tuples.length === 0) {
+    logger.info({ total_alerts: 0, by_severity }, 'drift_monitor.done');
+    return;
   }
 
-  logger.info({ total_alerts, by_severity }, 'drift_monitor.done');
+  for (const { tenant_id, agent_id } of tuples) {
+    try {
+      await runWithTenantContext({ tenant_id, agent_id }, async () => {
+        // Defense-in-depth: even though the dispatcher only enumerated agents
+        // WITH an active profile, getActive() re-reads scoped to this exact
+        // (tenant, agent) via ALS — a concurrent rollback between enumeration
+        // and this read yields null and we skip cleanly.
+        const active = await operationalProfileVersionsRepo.getActive();
+        if (!active) {
+          logger.info({ tenant_id, agent_id }, 'drift_monitor.no_active_profile_skip');
+          return;
+        }
+
+        const input = await assembleDriftInput(active);
+        const evidences = await runAllDriftDetectors(input);
+
+        if (evidences.length === 0) {
+          logger.info({ tenant_id, agent_id }, 'drift_monitor.no_drift');
+          return;
+        }
+
+        const results = await decideAndApply({ evidences, active_profile_id: active.id });
+        total_alerts += results.length;
+        for (const r of results) {
+          const sev = r.severity as keyof SeverityBreakdown;
+          if (sev in by_severity) by_severity[sev]++;
+        }
+
+        logger.info(
+          {
+            tenant_id,
+            agent_id,
+            alerts: results.length,
+            by_severity_local: results.map((r) => r.severity),
+          },
+          'drift_monitor.tenant_done',
+        );
+      });
+      agents_processed++;
+    } catch (err) {
+      // Fail-isolated por (tenant, agent): erro de um agent não interrompe o
+      // loop — mirrors reflection-batch (#251) / outbound-messages-sweeper
+      // (#292). Telemetria distingue via agents_failed/agents_processed.
+      agents_failed++;
+      logger.warn(
+        {
+          tenant_id,
+          agent_id,
+          err: (err as Error).message,
+          stack: (err as Error).stack,
+        },
+        'drift_monitor.agent_failed',
+      );
+    }
+  }
+
+  logger.info(
+    { tuples: tuples.length, agents_processed, agents_failed, total_alerts, by_severity },
+    'drift_monitor.done',
+  );
 }
 
 async function assembleDriftInput(
