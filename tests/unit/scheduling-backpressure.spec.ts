@@ -69,7 +69,8 @@ describe('tryAcquireSendSlot — Requirement 2', () => {
       kind: 'deny',
       reason: 'per_second',
     });
-    expect(redisMock.del).toHaveBeenCalledWith('outbox:pace:a@s.whatsapp.net');
+    // Issue #287: jid is now URI-encoded inside the cache key so `@` → `%40`.
+    expect(redisMock.del).toHaveBeenCalledWith('outbox:pace:a%40s.whatsapp.net');
   });
 
   it('denies with reason per_hour when hour bucket exceeds limit', async () => {
