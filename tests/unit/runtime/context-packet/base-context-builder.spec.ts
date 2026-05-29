@@ -138,3 +138,101 @@ describe('BaseContextBuilder', () => {
     expect(b1.input.content_hmac).not.toBe(b2.input.content_hmac);
   });
 });
+
+/**
+ * Issue #282 regression guard: the previous `defaultResolver` returned
+ * `{tenant_id:'default', agent_id:'default'}` from the class-level default
+ * constructor parameter. If production ever reached it (DI mis-wired,
+ * accidental no-arg `new BaseContextBuilder()`), a synthetic shared context
+ * leaked into BaseContextPacket and broke tenant isolation.
+ *
+ * The fix replaces that default with a fail-loud resolver that throws.
+ * Tests that need a passthrough opt in explicitly via the test-fixtures
+ * module.
+ */
+describe('BaseContextBuilder — issue #282 fail-loud default resolver', () => {
+  it('default constructor (no resolver injected) throws when build() must resolve', async () => {
+    const noFlags: FeatureFlagsPort = {
+      async snapshot() {
+        return {};
+      },
+    };
+    const builder = new BaseContextBuilder(undefined, noFlags);
+    await expect(
+      builder.build({
+        raw_input: { type: 'text' },
+        channel_id: 'ch1',
+        received_at: new Date(),
+      }),
+    ).rejects.toThrow(/issue #282|fail-loud|no IdentityResolverPort injected/i);
+  });
+
+  it('default constructor never silently returns tenant_id/agent_id = "default"', async () => {
+    // Regression guard: this is the inviolable invariant. If the resolver is
+    // ever changed back to a silent default, this test must catch it.
+    const noFlags: FeatureFlagsPort = {
+      async snapshot() {
+        return {};
+      },
+    };
+    const builder = new BaseContextBuilder(undefined, noFlags);
+    let packet: { tenant_id: string; agent_id: string } | null = null;
+    try {
+      packet = await builder.build({
+        raw_input: { type: 'text' },
+        channel_id: 'ch1',
+        received_at: new Date(),
+      });
+    } catch {
+      // Throw is the expected path. Falling through means the resolver
+      // returned something — must not be the default sentinel.
+    }
+    if (packet) {
+      expect(packet.tenant_id).not.toBe('default');
+      expect(packet.agent_id).not.toBe('default');
+    }
+  });
+
+  it('pre-resolved tenant/agent path still works without an injected resolver', async () => {
+    // The fail-loud default is only reached when build() must call resolve().
+    // When the caller pre-resolves (the real production path via react-loop),
+    // resolve() is never invoked, so the fail-loud default is harmless.
+    const noFlags: FeatureFlagsPort = {
+      async snapshot() {
+        return {};
+      },
+    };
+    const builder = new BaseContextBuilder(undefined, noFlags);
+    const base = await builder.build({
+      raw_input: { type: 'text' },
+      channel_id: 'ch1',
+      received_at: new Date(),
+      tenant_id: 'real_tenant',
+      agent_id: 'real_agent',
+    });
+    expect(base.tenant_id).toBe('real_tenant');
+    expect(base.agent_id).toBe('real_agent');
+  });
+
+  it('__testOnlyPassthroughResolver is available for tests that need the legacy behaviour', async () => {
+    const { __testOnlyPassthroughResolver } = await import(
+      '@/runtime/context-packet/test-fixtures.js'
+    );
+    const noFlags: FeatureFlagsPort = {
+      async snapshot() {
+        return {};
+      },
+    };
+    const builder = new BaseContextBuilder(__testOnlyPassthroughResolver, noFlags);
+    const base = await builder.build({
+      raw_input: { type: 'text' },
+      channel_id: 'ch1',
+      received_at: new Date(),
+    });
+    // Confirms the fixture preserves the legacy `default/default` shape so
+    // tests that depended on it can opt in explicitly. assertTruthyContext
+    // in tenant-context.ts is the second line of defence at ALS read time.
+    expect(base.tenant_id).toBe('default');
+    expect(base.agent_id).toBe('default');
+  });
+});

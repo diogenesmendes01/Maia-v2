@@ -551,6 +551,30 @@ export const pending_questions = pgTable('pending_questions', {
 // composite PK makes the storage layer reflect the true identity tuple and
 // guards against any future caller that bypasses `computeIdempotencyKey`.
 // See migration 063_p10_idempotency_keys_tenant_pk.
+//
+// Issue #298: atomic reservation via INSERT ON CONFLICT.
+//   - `state` distinguishes a reservation in flight ('in_progress') from a
+//     completed handler ('completed'). Default 'completed' so the existing
+//     write-once-after-handler rows in main are classified correctly with
+//     no backfill (see migration 064).
+//   - `expires_at` is the wall-clock deadline for in-flight reservations;
+//     past it, a stale reservation can be reclaimed by the next caller and
+//     the cleanup worker. NULL for completed rows.
+//   - `resultado` is now nullable — only completed rows carry a result.
+//     A DB-side CHECK enforces (state, resultado, expires_at) coherence
+//     so a hand-crafted INSERT can't produce a malformed row.
+//
+// Issue #298 review (B2 + B3 — migration 065):
+//   - `state` now also admits the terminal 'failed' value: a handler that
+//     threw (or produced a malformed response) transitions in_progress→failed
+//     instead of deleting the row, so a subsequent same-key dispatch does NOT
+//     silently re-execute a partially-applied side effect.
+//   - `reservation_token` is a fencing token (UUID) stamped on every
+//     reservation (fresh INSERT or stale-lock reclaim). markCompleted /
+//     releaseReservation only mutate the row when the caller presents the
+//     token they received from tryReserve, so a slow/preempted owner whose
+//     lease was reclaimed cannot clobber the new owner's reservation
+//     (closes the double-execution window left by the fixed-TTL reclaim).
 export const idempotency_keys = pgTable(
   'idempotency_keys',
   {
@@ -563,7 +587,10 @@ export const idempotency_keys = pgTable(
     entity_id: uuid('entity_id').notNull(),
     payload_hash: text('payload_hash').notNull(),
     file_sha256: text('file_sha256'),
-    resultado: jsonb('resultado').notNull(),
+    resultado: jsonb('resultado'),
+    state: text('state').notNull().default('completed'),
+    expires_at: timestamp('expires_at', { withTimezone: true }),
+    reservation_token: text('reservation_token'),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
