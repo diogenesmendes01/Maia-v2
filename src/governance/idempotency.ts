@@ -141,7 +141,15 @@ export function computePayloadHash(input: {
     // the fingerprint); for textual ops it's the normalized payload hash.
     input.file_sha256 ? '' : normalizePayload(input.payload),
   ];
-  return sha256(parts.join('|'));
+  // Per-segment encode before joining — same delimiter-safety treatment
+  // `computeIdempotencyKey` applies (see file-level "DELIMITER SAFETY"
+  // docstring + `encodeSegment`). Without this, a raw `'|'` inside any
+  // free-form segment (pessoa_id, entity_id, tool_name, operation_type)
+  // could realign the boundaries so two distinct fingerprints serialize to
+  // the same string and collide on SHA-256 — a FALSE payload-hash match,
+  // which is exactly the integrity check this function exists to enforce
+  // (issue #318, #301 follow-up).
+  return sha256(parts.map(encodeSegment).join('|'));
 }
 
 export function computeIdempotencyKey(input: {

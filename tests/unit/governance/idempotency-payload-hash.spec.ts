@@ -299,4 +299,55 @@ describe('computePayloadHash — invariants (#299)', () => {
     });
     expect(h1).not.toBe(h3);
   });
+
+  // #318 — delimiter safety. The fingerprint segments are joined with '|'.
+  // A naive `parts.join('|')` lets a literal '|' inside any free-form segment
+  // shift the field boundaries, so two DISTINCT input tuples can serialize to
+  // the identical string and collide on SHA-256 — a FALSE payload-hash match,
+  // defeating the very integrity check this hash provides. Per-segment
+  // encoding (mirroring computeIdempotencyKey) escapes '|' → '%7C' so the
+  // boundaries stay unambiguous.
+  it('delimiter-safe: a "|" migrating between adjacent segments does NOT collide (#318)', () => {
+    // Both tuples render to `...|a|b|c|...` under a naive join('|'):
+    //   A → pessoa_id='a', entity_id='b|c'
+    //   B → pessoa_id='a|b', entity_id='c'
+    const a = computePayloadHash({
+      ...base,
+      pessoa_id: 'a',
+      entity_id: 'b|c',
+    });
+    const b = computePayloadHash({
+      ...base,
+      pessoa_id: 'a|b',
+      entity_id: 'c',
+    });
+    expect(a).not.toBe(b);
+    expect(a).toMatch(/^[a-f0-9]{64}$/);
+    expect(b).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  it('delimiter-safe: a "|" migrating between tool_name and operation_type does NOT collide (#318)', () => {
+    // Both render to `...|create|x|y|...` under a naive join('|') (the
+    // remaining segments are identical, so the field count is preserved):
+    //   A → tool_name='create',   operation_type='x|y'
+    //   B → tool_name='create|x', operation_type='y'
+    const a = computePayloadHash({
+      ...base,
+      tool_name: 'create',
+      operation_type: 'x|y',
+    });
+    const b = computePayloadHash({
+      ...base,
+      tool_name: 'create|x',
+      operation_type: 'y',
+    });
+    expect(a).not.toBe(b);
+  });
+
+  it('still deterministic for segments that contain a "|" (#318)', () => {
+    // Encoding must not break stability: the same '|'-bearing input still
+    // hashes to itself across calls.
+    const input = { ...base, entity_id: 'b|c', tool_name: 'create|register' };
+    expect(computePayloadHash(input)).toBe(computePayloadHash(input));
+  });
 });
