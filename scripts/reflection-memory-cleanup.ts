@@ -898,8 +898,12 @@ export async function undoCleanup(args: {
   //    (rare but possible if a process re-uses the UUID; we choose
   //    NOT to clobber to be safe).
   await db.execute(sql`BEGIN`);
-  let rowsRestored = 0;
-  let rowsSkippedConflict = 0;
+  // Assigned unconditionally inside the try (restore count + conflict math)
+  // before any read; the catch always rethrows, so reaching the code after
+  // the try/catch implies both were set. No initializer (would be a dead
+  // assignment flagged by no-useless-assignment).
+  let rowsRestored: number;
+  let rowsSkippedConflict: number;
   try {
     const restoreResult = await db.execute<{ id: string }>(sql`
       INSERT INTO agent_memories (
