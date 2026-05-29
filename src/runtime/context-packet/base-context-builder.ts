@@ -14,6 +14,7 @@ import crypto from 'node:crypto';
 import { randomUUID } from 'node:crypto';
 import type { BaseContextPacket } from './types.js';
 import { memoryResolver } from '@/user-layer/resolvers/memory-resolver.js';
+import { assertNotDefaultLiteral } from '@/db/tenant-context.js';
 
 export interface BaseContextBuilderInput {
   raw_input: Record<string, unknown>;
@@ -85,6 +86,19 @@ export class BaseContextBuilder {
         `BaseContextBuilder: failed to resolve tenant/agent from channel ${input.channel_id}`,
       );
     }
+
+    // Literal 'default' rejection (issue #315). Falsy checks above only catch
+    // empty/undefined; the legacy `{tenant_id:'default', agent_id:'default'}`
+    // sentinel slipped through and produced a synthetic cross-tenant scope,
+    // violating the inviolable isolation invariant. We reuse the SAME helper
+    // as the ALS read-time guard (`getCurrentTenant`/`getCurrentAgent`) so the
+    // two layers share one flag + counter + error type and cannot diverge:
+    //  - always meters `maia_tenant_id_default_literal_total` for observability;
+    //  - throws `DefaultLiteralRejectedError` only when
+    //    `MAIA_REJECT_DEFAULT_LITERAL=true` (opt-in until every legacy worker
+    //    /single-tenant path is migrated off the sentinel — see issue #315).
+    assertNotDefaultLiteral(tenant_id, 'tenant_id');
+    assertNotDefaultLiteral(agent_id, 'agent_id');
 
     // Tenant-scoped HMAC of raw input (16 chars). Deterministic for cache
     // dedup / idempotency keys when same body shows up twice.

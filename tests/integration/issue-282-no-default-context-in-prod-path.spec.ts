@@ -65,12 +65,13 @@ describe('issue #282 — no production path produces tenant_id === "default"', (
     ).rejects.toThrow();
   });
 
-  it('builder with a resolver that returns default/default does NOT silently leak — counter fires when context is read', async () => {
+  it('builder with a resolver that returns default/default does NOT silently leak — counter fires at build time and at ALS read', async () => {
     // Simulates a misconfigured upstream that returns the legacy sentinel.
-    // The builder accepts it (the assertion lives at ALS read time, not in
-    // the builder, because the inviolable invariant is on QUERY scope), but
-    // any downstream `getCurrentTenant()` will increment the counter and —
-    // if the opt-in flag is set — throw.
+    // Issue #315: the builder now ALSO meters the 'default' literal at build
+    // time (via the shared `assertNotDefaultLiteral` helper), in addition to
+    // the ALS read-time guard. In DEFAULT mode (flag off) it only meters and
+    // still produces the packet — the hard throw remains opt-in. This gives
+    // defense-in-depth without changing default behavior.
     const sentinelResolver: IdentityResolverPort = {
       async resolve() {
         return { tenant_id: 'default', agent_id: 'default' };
@@ -82,7 +83,7 @@ describe('issue #282 — no production path produces tenant_id === "default"', (
       channel_id: 'inbound-channel-A',
       received_at: new Date(),
     });
-    // Builder produced the packet; the guard now lives at ALS read time.
+    // Builder produced the packet (flag off → meter-only, no throw).
     expect(packet.tenant_id).toBe('default');
 
     // Simulate the production handler stage: wrap the rest of the turn in
@@ -96,14 +97,22 @@ describe('issue #282 — no production path produces tenant_id === "default"', (
       },
     );
 
-    // At least one increment for tenant_id and one for agent_id.
+    // Increments from BOTH layers: builder (tenant_id + agent_id at build) and
+    // ALS read (tenant_id + agent_id). At least one per field overall.
     const calls = incCounterMock.mock.calls.filter(
       (c) => c[0] === 'maia_tenant_id_default_literal_total',
     );
     expect(calls.length).toBeGreaterThanOrEqual(2);
+    expect(calls.some((c) => c[1]?.field === 'tenant_id')).toBe(true);
+    expect(calls.some((c) => c[1]?.field === 'agent_id')).toBe(true);
   });
 
-  it('with MAIA_REJECT_DEFAULT_LITERAL=true the production path throws hard', async () => {
+  it('with MAIA_REJECT_DEFAULT_LITERAL=true the builder rejects default/default at build time (issue #315)', async () => {
+    // Issue #315: with the opt-in flag on, the guard moves UPSTREAM — the
+    // builder itself throws `DefaultLiteralRejectedError` before ever emitting
+    // a synthetic packet, so a misconfigured resolver can't hand a default/
+    // default identity to the rest of the turn. (Previously the throw only
+    // fired later, at the first ALS read.)
     process.env.MAIA_REJECT_DEFAULT_LITERAL = 'true';
     const sentinelResolver: IdentityResolverPort = {
       async resolve() {
@@ -111,18 +120,28 @@ describe('issue #282 — no production path produces tenant_id === "default"', (
       },
     };
     const builder = new BaseContextBuilder(sentinelResolver, noFlags);
-    const packet = await builder.build({
-      raw_input: { type: 'text' },
-      channel_id: 'inbound-channel-A',
-      received_at: new Date(),
-    });
     await expect(
-      runWithTenantContext(
-        { tenant_id: packet.tenant_id, agent_id: packet.agent_id },
-        async () => {
-          getCurrentTenant();
-        },
-      ),
+      builder.build({
+        raw_input: { type: 'text' },
+        channel_id: 'inbound-channel-A',
+        received_at: new Date(),
+      }),
+    ).rejects.toThrow(DefaultLiteralRejectedError);
+  });
+
+  it('with the flag on, a pre-resolved default tenant_id is also rejected at build time', async () => {
+    // The guard runs regardless of whether tenant/agent came from the resolver
+    // or were pre-resolved by the caller (react-loop path).
+    process.env.MAIA_REJECT_DEFAULT_LITERAL = 'true';
+    const builder = new BaseContextBuilder(undefined, noFlags);
+    await expect(
+      builder.build({
+        raw_input: { type: 'text' },
+        channel_id: 'inbound-channel-A',
+        received_at: new Date(),
+        tenant_id: 'default',
+        agent_id: 'sofia_v1',
+      }),
     ).rejects.toThrow(DefaultLiteralRejectedError);
   });
 
