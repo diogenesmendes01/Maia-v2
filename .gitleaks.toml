@@ -1,0 +1,38 @@
+# gitleaks configuration
+#
+# Keep ALL of gitleaks' built-in rules active. We only ADD a narrow allowlist
+# below; we never disable a default rule, so real secrets are still detected.
+[extend]
+useDefault = true
+
+# ----------------------------------------------------------------------------
+# Squash-stable false-positive suppression (PR #326 / #316)
+# ----------------------------------------------------------------------------
+# The unit test tests/unit/tools/idempotency-outbox-dispatcher.spec.ts asserts,
+# via toMatchObject, the call args recorded for a MOCK recorder. One asserted
+# field is a deterministic, low-entropy fake fixture value ("computed-key-1")
+# produced by the test's stubbed key computation. It is NOT a credential, but
+# the generic-api-key rule trips on the assignment shape.
+#
+# Why a config allowlist instead of a .gitleaksignore fingerprint:
+#   The previous suppression lived in .gitleaksignore keyed by commit
+#   fingerprint. PR #326 was SQUASH-merged, which rewrote the commit SHA, so
+#   the fingerprint stopped matching and gitleaks re-detected the same fixture.
+#   Commit-fingerprint suppressions are not squash-stable. This allowlist is
+#   keyed by PATH + the exact fixture VALUE, so it survives squashes, rebases,
+#   and line-number shifts.
+#
+# Scope is intentionally minimal (condition = "AND"): it matches ONLY when the
+# finding is in that one spec file AND the extracted secret is exactly the fake
+# fixture value. Any other secret — in this file or anywhere else — is still
+# reported.
+[[allowlists]]
+description = "Fake unit-test fixture value in idempotency outbox dispatcher spec (PR #326 / #316) — not a real credential"
+condition = "AND"
+# Matches against the file path of the finding.
+paths = ['''tests/unit/tools/idempotency-outbox-dispatcher\.spec\.ts''']
+# regexTarget defaults to "secret": this matches the extracted secret group,
+# not the whole line, so it cannot accidentally allowlist a neighbouring value.
+# The bare fixture token is written here WITHOUT the key-assignment shape on
+# purpose, so this config does not itself trip the generic-api-key rule.
+regexes = ['''^computed-key-1$''']
