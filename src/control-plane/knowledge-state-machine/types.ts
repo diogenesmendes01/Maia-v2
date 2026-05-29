@@ -186,6 +186,14 @@ export interface KnowledgeRevokeInput {
     | 'incident_response'
     | 'drift_decision'
     | 'contraevidence';
+  /**
+   * Optional cancellation signal. When provided, an abort during the
+   * bounded retry loop's backoff sleep clears the timer and rejects with
+   * an AbortError instead of waiting the backoff out. Pre-checked on
+   * entry so an already-aborted caller never issues a DB write. Issue
+   * #256 (PR #279 Codex review — Blocker [2]).
+   */
+  signal?: AbortSignal;
 }
 
 export type KnowledgeRevokeResult = KnowledgeTransitionRecord;

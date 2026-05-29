@@ -157,7 +157,7 @@ describe('user-slice-builder', () => {
     expect(result.slice.meta.truncated).toBe(true);
   });
 
-  it('returns cache key with v1 prefix and latency_ms', async () => {
+  it('returns cache key with v2 prefix (Issue #235) and latency_ms', async () => {
     vi.spyOn(memoryResolverModule.memoryResolver, 'list').mockResolvedValue([]);
     vi.spyOn(hintsResolverModule.hintsResolver, 'list').mockResolvedValue([]);
 
@@ -170,9 +170,34 @@ describe('user-slice-builder', () => {
       trace_id: 'trace-1',
     });
 
-    expect(result.cache_key).toMatch(/^user_slice:v1:/);
+    // Issue #235: v2 layout is user_slice:v2:{tenant}:{agent}:{pessoa}:...
+    expect(result.cache_key).toMatch(/^user_slice:v2:tenant-1:agent-test:pessoa-1:/);
     expect(typeof result.latency_ms).toBe('number');
     expect(result.latency_ms).toBeGreaterThanOrEqual(0);
+  });
+
+  // ─── Issue #235 — cross-agent cache key isolation (HIGH, in-scope) ─────
+  // The boundary decision threads `agent_id` into resolver calls; the cache
+  // key MUST carry the SAME agent_id so different agents on the same tenant
+  // looking at the same pessoa don't collide.
+  it('Issue #235: cache_key encodes the boundary agent_id (not just tenant_id)', async () => {
+    vi.spyOn(memoryResolverModule.memoryResolver, 'list').mockResolvedValue([]);
+    vi.spyOn(hintsResolverModule.hintsResolver, 'list').mockResolvedValue([]);
+
+    const result = await buildUserSlice({
+      tenant_id: 'tenant-1',
+      pessoa_id: 'pessoa-1',
+      depth: 'relevant',
+      trace_id: 'trace-1',
+    });
+
+    // The mocked boundary above returns `agent_id: 'agent-test'` regardless of
+    // input.agent_id — that effective id MUST be in the cache key.
+    expect(result.cache_key).toContain(':agent-test:');
+    // And the pessoa MUST come after the agent in the layout.
+    const parts = result.cache_key.split(':');
+    expect(parts[3]).toBe('agent-test');
+    expect(parts[4]).toBe('pessoa-1');
   });
 
   it('includes profile (preferencias + modelo_mental) in slice', async () => {

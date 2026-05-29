@@ -568,15 +568,116 @@ export const mensagensRepo = {
   // and the turn would be silently dropped. This method atomically adopts
   // the row to the resolved triplet so the inner tenant-scoped read finds
   // it. Same sanctioned-bypass pattern as channelsRepo.findByExternalCrossTenant.
+  //
+  // [Codex review #311 — CRITICAL P0 cross-tenant adoption race]
+  // The UPDATE re-asserts `tenant_id='default' AND agent_id='default'` in its
+  // WHERE clause. This is the load-bearing safety property, not a cosmetic
+  // guard:
+  //   - The inbound row is first persisted by the gateway under the legacy
+  //     `default/default` context, then ADOPTED into the resolved tenant by
+  //     this method. Keying the UPDATE by `id` ALONE meant any caller holding
+  //     that id could rewrite `(tenant_id, agent_id)` to an ARBITRARY triplet
+  //     at any time — including AFTER the row had already been adopted into
+  //     tenant-A. A concurrent worker that re-resolved the same row to
+  //     tenant-B (stale resolver cache, mis-seeded channel, BullMQ retry
+  //     racing a fresh enqueue) would silently steal the row across the
+  //     tenant boundary — a direct violation of the inviolable isolation
+  //     contract.
+  //   - Re-asserting `default/default` in the WHERE makes adoption a
+  //     COMPARE-AND-SWAP: a row can be adopted out of `default/default`
+  //     exactly ONCE. Once it belongs to tenant-A, no later call (for any
+  //     other tenant, or a duplicate for the same one) can match the WHERE,
+  //     so the row can never be re-homed. The single UPDATE is atomic at the
+  //     Postgres level (row lock for the duration of the statement), so two
+  //     concurrent adoptions cannot both win — exactly one observes
+  //     rowCount=1, the loser observes rowCount=0.
+  //   - Idempotency for BullMQ retries is preserved: re-running adoption for
+  //     the SAME target tenant after the row already moved is simply a
+  //     rowCount=0 no-op (the row no longer matches `default/default`), which
+  //     the caller treats as "already adopted by me" — see the post-adoption
+  //     ownership re-check in agent/core.ts.
+  //
+  // Returns `true` when THIS call performed the adoption (row was still
+  // `default/default` and is now the resolved triplet), `false` when the row
+  // was already adopted (by a prior call / concurrent winner) or no longer
+  // exists. Callers MUST treat `false` as "I did not win — verify the row's
+  // current owner before proceeding" rather than assuming success.
   async adoptToResolvedTenantCrossTenant(args: {
     id: string;
     tenant_id: string;
     agent_id: string;
-  }): Promise<void> {
-    await db
+  }): Promise<boolean> {
+    const updated = await db
       .update(mensagens)
       .set({ tenant_id: args.tenant_id, agent_id: args.agent_id })
-      .where(eq(mensagens.id, args.id));
+      .where(
+        and(
+          eq(mensagens.id, args.id),
+          eq(mensagens.tenant_id, 'default'),
+          eq(mensagens.agent_id, 'default'),
+        ),
+      )
+      .returning({ id: mensagens.id });
+    return updated.length > 0;
+  },
+
+  // [Codex review #311 — CRITICAL P0] EXPLICITLY bypasses applyTenantGuard —
+  // same sanctioned-entry-point pattern as `adoptToResolvedTenantCrossTenant`.
+  // Returns ONLY the owning `(tenant_id, agent_id)` of a row by id, with NO
+  // tenant scoping. Sole consumer is the post-adoption ownership re-check in
+  // `runAgentForMensagem`: when the compare-and-swap adoption returns `false`
+  // (the row was NOT still `default/default`), the caller must learn WHO owns
+  // the row now before deciding whether it may proceed. If the row already
+  // belongs to the tenant we resolved, we won an earlier idempotent retry and
+  // proceed; if it belongs to a DIFFERENT tenant, a concurrent worker adopted
+  // it cross-tenant and we MUST abort rather than process it under our context
+  // (that would re-introduce the very cross-tenant leak this review closed).
+  // Projecting only the two scope columns keeps the leak surface minimal — the
+  // caller never sees another tenant's message body via this path.
+  async findOwnerByIdCrossTenant(
+    id: string,
+  ): Promise<{ tenant_id: string; agent_id: string } | null> {
+    const rows = await db
+      .select({ tenant_id: mensagens.tenant_id, agent_id: mensagens.agent_id })
+      .from(mensagens)
+      .where(eq(mensagens.id, id))
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  // [Codex review #277 v2] EXPLICITLY bypasses applyTenantGuard — same
+  // sanctioned-entry-point pattern as `adoptToResolvedTenantCrossTenant`
+  // and `channelsRepo.findByExternalCrossTenant`. Used by the Baileys
+  // `messages.update` listener (edits + revokes), which runs BEFORE any
+  // tenant context exists (Baileys is the inbound entry point — the
+  // tenant of the original message is exactly what we need to DISCOVER
+  // here so the dispatch can re-enter inside the correct ALS context).
+  //
+  // Necessity: `runAgentForMensagem` adopts inbound rows from
+  // (default, default) into the resolved tenant via
+  // `adoptToResolvedTenantCrossTenant`. A subsequent edit/revoke arrives
+  // via `messages.update` with NO tenant context — running the tenant-
+  // scoped `findByWhatsappId` under `default/default` would miss the
+  // (now-adopted) original and the edit/revoke would be silently dropped
+  // (Codex BLOQUEADO iteração 2: edit_unknown_original / revoke_unknown_original).
+  //
+  // Safety: `migrations/003_review_fixes.sql` declares
+  //   CREATE UNIQUE INDEX uniq_mensagens_whatsapp_id
+  //     ON mensagens ((metadata->>'whatsapp_id')) WHERE metadata ? 'whatsapp_id';
+  // So at most one row exists for a given whatsapp_id globally — no
+  // cross-tenant ambiguity. The caller (gateway/baileys.ts) re-enters
+  // `runWithTenantContext({tenant_id, agent_id})` of the resolved row
+  // before invoking `routeMessageUpdate`, restoring full tenant scoping
+  // for every downstream read/write.
+  async findByWhatsappIdCrossTenant(
+    whatsapp_id: string,
+  ): Promise<Mensagem | null> {
+    const rows = await db
+      .select()
+      .from(mensagens)
+      .where(sql`metadata->>'whatsapp_id' = ${whatsapp_id}`)
+      .limit(1);
+    return rows[0] ?? null;
   },
 };
 
@@ -1261,15 +1362,562 @@ export const pendingQuestionsRepo = {
   },
 };
 
+/**
+ * idempotencyRepo — tool idempotency cache (`idempotency_keys` table).
+ *
+ * TENANT/AGENT-ISOLATION (issue #261). The `idempotency_keys` table has
+ * `tenant_id` + `agent_id` columns (migrations 009/012). Before #261 both
+ * `lookup` and `store` ignored both columns — `lookup` filtered ONLY by
+ * `key`, and `store` relied on column defaults (`'default'`). That allowed
+ * two tenants invoking the same tool with the same params to collide in
+ * the cache and leak each other's tool output.
+ *
+ * After #261:
+ *   - `lookup` pins `tenant_id = <ctx> AND agent_id = <ctx> AND key = <key>`
+ *     in the WHERE. Defense in depth on top of the hash-input change in
+ *     `computeIdempotencyKey` (src/governance/idempotency.ts).
+ *   - `store` writes through `applyTenantGuard`, which stamps the routed
+ *     `tenant_id`/`agent_id` and throws on mismatch. `onConflictDoNothing`
+ *     now targets the new composite PK `(tenant_id, agent_id, key)` per
+ *     migration 063, so a same-key collision across tenants does NOT silent-
+ *     swallow the second insert.
+ *   - `cleanup` stays global on purpose: it's a maintenance sweep run by
+ *     `workers/idempotency-cleanup.ts` and intentionally crosses tenants.
+ *     It does NOT read or return tool output, so it cannot leak — it only
+ *     prunes by `created_at`. The cleanup worker bootstraps with the system
+ *     tenant context for audit; the SQL itself stays unscoped.
+ */
+
+/**
+ * Reservation outcome from `idempotencyRepo.tryReserve` (issue #298).
+ *
+ * Discriminated by `was_inserted`:
+ *   - `was_inserted=true`: this caller WON the reservation. They MUST run
+ *     the handler and then call `markCompleted` (success) or
+ *     `releaseReservation` (failure), ALWAYS passing back the
+ *     `reservation_token` returned here. `state` will be 'in_progress' and
+ *     `resultado` will be undefined.
+ *   - `was_inserted=false`: someone else's row was already there. Inspect
+ *     `state`:
+ *       - 'completed': use `resultado` as the cached output (cache hit).
+ *       - 'in_progress': another worker is mid-execution. The caller MUST
+ *         NOT execute the handler; it should poll for completion (see
+ *         `waitForCompletion`).
+ *       - 'failed': a prior attempt for this exact key terminally FAILED
+ *         (issue #298 B3). The caller MUST NOT silently re-execute — the
+ *         failed handler may have applied a partial side effect. The
+ *         dispatcher surfaces a typed error so any retry is an explicit,
+ *         higher-level decision.
+ *
+ * Fencing token (issue #298 B2): on a winning reservation, `reservation_token`
+ * is a freshly minted UUID. The owner MUST present it to `markCompleted` /
+ * `releaseReservation`; those calls only mutate the row when the token still
+ * matches. A slow owner whose lease expired and was reclaimed by a new owner
+ * holds a STALE token, so its late completion is a no-op and cannot clobber
+ * the new owner — closing the double-execution window of the fixed-TTL
+ * reclaim. `reservation_token` is `undefined` on the non-winning branches
+ * (the caller has nothing to complete).
+ */
+export type ReservationResult =
+  | {
+      was_inserted: true;
+      state: 'in_progress';
+      resultado: undefined;
+      reservation_token: string;
+    }
+  | {
+      was_inserted: false;
+      state: 'completed';
+      resultado: unknown;
+      reservation_token: undefined;
+    }
+  | {
+      was_inserted: false;
+      state: 'in_progress';
+      resultado: undefined;
+      reservation_token: undefined;
+    }
+  | {
+      was_inserted: false;
+      state: 'failed';
+      resultado: undefined;
+      reservation_token: undefined;
+    };
+
 export const idempotencyRepo = {
+  /**
+   * Legacy read-only lookup. Returns the cached result of a SETTLED row.
+   *
+   * State handling:
+   *   - 'completed' → returns `resultado` (the cache hit).
+   *   - 'in_progress' → EXCLUDED. An in-flight reservation has no result
+   *     yet; surfacing it would make the caller skip execution and return
+   *     undefined to the user (silent data loss).
+   *   - 'failed' / legacy rows → carry a NULL `resultado`, so the
+   *     `?? null` below already yields a miss without special-casing.
+   *
+   * We filter `state <> 'in_progress'` (rather than `state = 'completed'`)
+   * so that pre-#298 rows — written before the `state` column existed and
+   * thus indistinguishable from a completed cache entry — still hit, and so
+   * we never accidentally treat an in-flight reservation as a cache hit.
+   * This keeps the same-scope idempotency contract that pre-dates the
+   * atomic-reservation work (issue #261 regression fix).
+   *
+   * Use `tryReserve` for the atomic dispatcher path; this helper exists for
+   * backward compat with non-dispatch callers (tests, one-off inspections).
+   */
   async lookup(key: string): Promise<unknown | null> {
+    // Resolve tenant/agent — `getCurrentTenant`/`getCurrentAgent` throw
+    // `MissingTenantContextError` if no context. We refuse a silent
+    // fall-through to the legacy `'default'` bucket (see header).
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const rows = await db
       .select()
       .from(idempotency_keys)
-      .where(eq(idempotency_keys.key, key))
+      .where(
+        and(
+          eq(idempotency_keys.tenant_id, tenant_id),
+          eq(idempotency_keys.agent_id, agent_id),
+          eq(idempotency_keys.key, key),
+          ne(idempotency_keys.state, 'in_progress'),
+        ),
+      )
       .limit(1);
     return rows[0]?.resultado ?? null;
   },
+
+  /**
+   * Issue #298: atomic reservation. Replaces the racey check-then-act in
+   * the dispatcher.
+   *
+   * Single round-trip:
+   *   - INSERT a new row with state='in_progress', expires_at=now()+TTL,
+   *     resultado=NULL.
+   *   - ON CONFLICT (PK = `(tenant_id, agent_id, key)`) DO NOTHING. If a row already exists,
+   *     INSERT is a no-op; otherwise the row is created.
+   *   - RETURNING (xmax = 0) AS was_inserted, state, resultado. The xmax
+   *     trick: on a fresh insert, xmax=0; on a no-op caused by
+   *     ON CONFLICT DO NOTHING, xmax is the *current* transaction's xid
+   *     (non-zero). So `xmax = 0` is the canonical "I inserted vs row was
+   *     already there" probe.
+   *
+   * Stale-reservation reclaim: if an existing row is state='in_progress'
+   * AND expires_at < now(), it's an orphan (the previous worker crashed
+   * before completing). The reclaim path runs an UPDATE … WHERE
+   * state='in_progress' AND expires_at < now() — at most one caller wins
+   * the update (UPDATE … RETURNING is atomic). Winner re-acquires the
+   * reservation; losers see the winner's freshened row on next poll.
+   *
+   * The repository writes through `applyTenantGuard` (defense in depth:
+   * even before PR #273's composite PK lands, the tenant_id/agent_id
+   * columns are stamped from ALS context, so cross-tenant collisions are
+   * prevented at the application layer).
+   */
+  async tryReserve(input: {
+    key: string;
+    tool_name: string;
+    operation_type: string;
+    pessoa_id: string;
+    entity_id: string;
+    payload_hash: string;
+    file_sha256?: string;
+    ttl_seconds: number;
+  }): Promise<ReservationResult> {
+    // applyTenantGuard stamps tenant_id/agent_id from ALS context and
+    // rejects any explicit mismatch. Throws MissingTenantContextError if
+    // no context. The atomic-reservation path is dispatcher-driven and
+    // always runs inside runWithTenantContext (webhook routes, scheduler).
+    const guarded = applyTenantGuard({
+      key: input.key,
+      tool_name: input.tool_name,
+      operation_type: input.operation_type,
+      pessoa_id: input.pessoa_id,
+      entity_id: input.entity_id,
+      payload_hash: input.payload_hash,
+      file_sha256: input.file_sha256 ?? null,
+      state: 'in_progress' as const,
+    });
+
+    // Step 1: try INSERT … ON CONFLICT DO NOTHING. RETURNING captures
+    // both the "I inserted" probe and the existing-row state in the same
+    // round-trip — no separate SELECT needed in the common path.
+    // NOTE: `(xmax = 0)` is the Postgres ON CONFLICT DO NOTHING idiom for
+    // distinguishing inserted vs pre-existing rows. With RETURNING, the
+    // row body returned is the inserted-or-existing row in either case.
+    //
+    // Fencing token (B2): `gen_random_uuid()::text` mints a per-reservation
+    // token server-side, atomic with the INSERT. The winner gets it back in
+    // RETURNING and must echo it on markCompleted/releaseReservation; a
+    // preempted owner's stale token can never match the row after a reclaim.
+    const ttl = `${input.ttl_seconds} seconds`;
+    const inserted = await db.execute<{
+      was_inserted: boolean;
+      state: string;
+      resultado: unknown;
+      expires_at: string | null;
+      reservation_token: string | null;
+    }>(sql`
+      INSERT INTO idempotency_keys
+        (key, tenant_id, agent_id, tool_name, operation_type, pessoa_id,
+         entity_id, payload_hash, file_sha256, resultado, state, expires_at,
+         reservation_token)
+      VALUES
+        (${guarded.key}, ${guarded.tenant_id}, ${guarded.agent_id},
+         ${guarded.tool_name}, ${guarded.operation_type}, ${guarded.pessoa_id},
+         ${guarded.entity_id}, ${guarded.payload_hash}, ${guarded.file_sha256},
+         NULL, 'in_progress', now() + ${ttl}::interval, gen_random_uuid()::text)
+      ON CONFLICT (tenant_id, agent_id, key) DO NOTHING
+      RETURNING (xmax = 0) AS was_inserted, state, resultado, expires_at,
+                reservation_token
+    `);
+
+    const firstRow = inserted.rows[0];
+    if (firstRow && firstRow.was_inserted) {
+      return {
+        was_inserted: true,
+        state: 'in_progress',
+        resultado: undefined,
+        reservation_token: firstRow.reservation_token ?? '',
+      };
+    }
+
+    // Step 2: ON CONFLICT triggered (or RETURNING returned the
+    // existing-but-not-inserted row). SELECT the row to inspect state.
+    // We tenant-scope the read; if PR #273 merges (composite PK), this
+    // also matches the new PK shape.
+    const existingRows = await db
+      .select({
+        state: idempotency_keys.state,
+        resultado: idempotency_keys.resultado,
+        expires_at: idempotency_keys.expires_at,
+      })
+      .from(idempotency_keys)
+      .where(
+        and(
+          eq(idempotency_keys.tenant_id, guarded.tenant_id),
+          eq(idempotency_keys.agent_id, guarded.agent_id),
+          eq(idempotency_keys.key, input.key),
+        ),
+      )
+      .limit(1);
+
+    const existing = existingRows[0];
+    if (!existing) {
+      // Extremely narrow race: row was deleted between ON CONFLICT and
+      // SELECT (cleanup worker or down-migration). Treat as "couldn't
+      // reserve" — caller re-enters. We retry the insert once to recover
+      // cleanly without bubbling up a misleading error.
+      const retry = await db.execute<{
+        was_inserted: boolean;
+        reservation_token: string | null;
+      }>(sql`
+        INSERT INTO idempotency_keys
+          (key, tenant_id, agent_id, tool_name, operation_type, pessoa_id,
+           entity_id, payload_hash, file_sha256, resultado, state, expires_at,
+           reservation_token)
+        VALUES
+          (${guarded.key}, ${guarded.tenant_id}, ${guarded.agent_id},
+           ${guarded.tool_name}, ${guarded.operation_type}, ${guarded.pessoa_id},
+           ${guarded.entity_id}, ${guarded.payload_hash}, ${guarded.file_sha256},
+           NULL, 'in_progress', now() + ${ttl}::interval, gen_random_uuid()::text)
+        ON CONFLICT (tenant_id, agent_id, key) DO NOTHING
+        RETURNING (xmax = 0) AS was_inserted, reservation_token
+      `);
+      if (retry.rows[0]?.was_inserted) {
+        return {
+          was_inserted: true,
+          state: 'in_progress',
+          resultado: undefined,
+          reservation_token: retry.rows[0].reservation_token ?? '',
+        };
+      }
+      // Still lost — fall through to a "stale" view; caller will poll and
+      // either find a completed row or time out.
+      return {
+        was_inserted: false,
+        state: 'in_progress',
+        resultado: undefined,
+        reservation_token: undefined,
+      };
+    }
+
+    if (existing.state === 'completed') {
+      return {
+        was_inserted: false,
+        state: 'completed',
+        resultado: existing.resultado,
+        reservation_token: undefined,
+      };
+    }
+
+    if (existing.state === 'failed') {
+      // Terminal failure (B3). A prior attempt for this exact key failed;
+      // its handler may have applied a partial side effect. We do NOT
+      // reclaim or re-run here — the caller (dispatcher) surfaces a typed
+      // error so any retry is an explicit, higher-level decision. The
+      // failed row is pruned later by `cleanup`.
+      return {
+        was_inserted: false,
+        state: 'failed',
+        resultado: undefined,
+        reservation_token: undefined,
+      };
+    }
+
+    // state='in_progress'. Check if expired — if so, try to reclaim.
+    // Atomic UPDATE … WHERE state='in_progress' AND expires_at < now()
+    // ensures at most one caller wins the reclaim. The reclaim MINTS A
+    // FRESH reservation_token (B2): the previous (crashed or preempted)
+    // owner still holds the OLD token, so its late markCompleted/
+    // releaseReservation — gated on `reservation_token` — becomes a no-op
+    // and cannot resurrect or clobber the row the reclaimer now owns.
+    if (existing.expires_at && new Date(existing.expires_at) < new Date()) {
+      const reclaimed = await db.execute<{ reservation_token: string | null }>(sql`
+        UPDATE idempotency_keys
+           SET expires_at = now() + ${ttl}::interval,
+               reservation_token = gen_random_uuid()::text,
+               tool_name = ${guarded.tool_name},
+               operation_type = ${guarded.operation_type},
+               pessoa_id = ${guarded.pessoa_id},
+               entity_id = ${guarded.entity_id},
+               payload_hash = ${guarded.payload_hash},
+               file_sha256 = ${guarded.file_sha256}
+         WHERE tenant_id = ${guarded.tenant_id}
+           AND agent_id = ${guarded.agent_id}
+           AND key = ${input.key}
+           AND state = 'in_progress'
+           AND expires_at < now()
+         RETURNING reservation_token
+      `);
+      if (reclaimed.rows.length > 0) {
+        return {
+          was_inserted: true,
+          state: 'in_progress',
+          resultado: undefined,
+          reservation_token: reclaimed.rows[0]!.reservation_token ?? '',
+        };
+      }
+      // Reclaim lost (someone else got it, or row transitioned to
+      // completed/failed). Re-check current state.
+      const recheck = await db
+        .select({
+          state: idempotency_keys.state,
+          resultado: idempotency_keys.resultado,
+        })
+        .from(idempotency_keys)
+        .where(
+          and(
+            eq(idempotency_keys.tenant_id, guarded.tenant_id),
+            eq(idempotency_keys.agent_id, guarded.agent_id),
+            eq(idempotency_keys.key, input.key),
+          ),
+        )
+        .limit(1);
+      const recheckRow = recheck[0];
+      if (recheckRow?.state === 'completed') {
+        return {
+          was_inserted: false,
+          state: 'completed',
+          resultado: recheckRow.resultado,
+          reservation_token: undefined,
+        };
+      }
+      if (recheckRow?.state === 'failed') {
+        return {
+          was_inserted: false,
+          state: 'failed',
+          resultado: undefined,
+          reservation_token: undefined,
+        };
+      }
+      return {
+        was_inserted: false,
+        state: 'in_progress',
+        resultado: undefined,
+        reservation_token: undefined,
+      };
+    }
+
+    return {
+      was_inserted: false,
+      state: 'in_progress',
+      resultado: undefined,
+      reservation_token: undefined,
+    };
+  },
+
+  /**
+   * Transition an in_progress reservation to completed and persist the
+   * handler's result. Idempotent on the (tenant, agent, key) — if the
+   * row is already 'completed' (e.g., a duplicate completion attempt),
+   * we keep the existing resultado (the WHERE state='in_progress' makes
+   * it a no-op).
+   *
+   * Fencing (B2): `reservation_token` MUST be the token returned by the
+   * winning `tryReserve` for THIS reservation. The UPDATE is gated on
+   * `reservation_token = <token>`, so an owner whose lease expired and was
+   * reclaimed (the reclaim minted a NEW token) can no longer complete: its
+   * stale token doesn't match, the UPDATE touches 0 rows, and the new
+   * owner's reservation is preserved. Returns whether the row was actually
+   * transitioned (true) or the completion was fenced out / already settled
+   * (false) so the caller can detect a preemption.
+   */
+  async markCompleted(input: {
+    key: string;
+    resultado: unknown;
+    reservation_token: string;
+  }): Promise<boolean> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const updated = await db
+      .update(idempotency_keys)
+      .set({
+        resultado: input.resultado as object,
+        state: 'completed',
+        expires_at: null,
+      })
+      .where(
+        and(
+          eq(idempotency_keys.tenant_id, tenant_id),
+          eq(idempotency_keys.agent_id, agent_id),
+          eq(idempotency_keys.key, input.key),
+          eq(idempotency_keys.state, 'in_progress'),
+          eq(idempotency_keys.reservation_token, input.reservation_token),
+        ),
+      )
+      .returning({ key: idempotency_keys.key });
+    return updated.length > 0;
+  },
+
+  /**
+   * Mark a reservation as terminally FAILED (issue #298 B3).
+   *
+   * Previously this DELETEd the in_progress row so the next caller could
+   * re-claim with a fresh INSERT. That let the SAME idempotency key be
+   * silently re-executed after a failure — dangerous when the failed
+   * handler already applied a partial side effect (the caller would see a
+   * cache MISS and run the handler again). We now transition
+   * in_progress→'failed', a TERMINAL state: a subsequent same-key
+   * `tryReserve` reports the failure to the caller instead of re-running.
+   * The coherence CHECK requires (failed ⇒ resultado IS NULL AND
+   * expires_at IS NULL), so we clear expires_at in the same UPDATE — this
+   * also removes the row from the in_progress reaper's partial index; the
+   * row is pruned later by the aged-failed sweep in `cleanup`.
+   *
+   * Fencing (B2): gated on `reservation_token`. A preempted owner (whose
+   * lease expired and was reclaimed) holds a STALE token, so its release
+   * is a no-op (0 rows) and cannot mark the NEW owner's live reservation
+   * as failed. Returns whether the row was actually transitioned.
+   */
+  async releaseReservation(input: {
+    key: string;
+    reservation_token: string;
+  }): Promise<boolean> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const updated = await db
+      .update(idempotency_keys)
+      .set({
+        state: 'failed',
+        expires_at: null,
+      })
+      .where(
+        and(
+          eq(idempotency_keys.tenant_id, tenant_id),
+          eq(idempotency_keys.agent_id, agent_id),
+          eq(idempotency_keys.key, input.key),
+          eq(idempotency_keys.state, 'in_progress'),
+          eq(idempotency_keys.reservation_token, input.reservation_token),
+        ),
+      )
+      .returning({ key: idempotency_keys.key });
+    return updated.length > 0;
+  },
+
+  /**
+   * Poll for a competing worker's reservation to settle. Used by the
+   * dispatcher when `tryReserve` returns `was_inserted=false,
+   * state='in_progress'` — another worker owns the reservation and we
+   * want to return ITS result (not double-execute the side effect).
+   *
+   * Terminal outcomes:
+   *   - 'completed' → the owner finished; return the cached `resultado`.
+   *   - 'failed' → the owner terminally failed (issue #298 B3:
+   *     releaseReservation now marks the row 'failed' rather than deleting
+   *     it). The caller MUST NOT re-execute; the dispatcher surfaces a
+   *     typed error so any retry is a higher-level decision.
+   *   - 'released' → the row vanished entirely (narrow race: the cleanup
+   *     worker reaped it, or a down-migration ran). Treated like a failure
+   *     from the caller's perspective — re-dispatch from scratch.
+   *   - 'timeout' → the deadline elapsed with the owner still in_progress.
+   *
+   * Polling starts at 100ms and backs off exponentially (capped at 500ms)
+   * so the loser of the race pays low latency on a fast handler while not
+   * hammering the DB on a slow one. The deadline + sleep shape avoids both
+   * wall-clock drift and a busy-wait if `setTimeout` resolves early.
+   */
+  async waitForCompletion(
+    key: string,
+    timeout_ms: number,
+  ): Promise<
+    | { status: 'completed'; resultado: unknown }
+    | { status: 'timeout' }
+    | { status: 'released' }
+    | { status: 'failed' }
+  > {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const deadline = Date.now() + timeout_ms;
+    const INITIAL_POLL_MS = 100;
+    const MAX_POLL_MS = 500;
+    let pollIntervalMs = INITIAL_POLL_MS;
+    while (Date.now() < deadline) {
+      const rows = await db
+        .select({
+          state: idempotency_keys.state,
+          resultado: idempotency_keys.resultado,
+        })
+        .from(idempotency_keys)
+        .where(
+          and(
+            eq(idempotency_keys.tenant_id, tenant_id),
+            eq(idempotency_keys.agent_id, agent_id),
+            eq(idempotency_keys.key, key),
+          ),
+        )
+        .limit(1);
+      const row = rows[0];
+      if (!row) {
+        // Row vanished entirely (cleanup reap / down-migration) — caller
+        // should re-dispatch from scratch.
+        return { status: 'released' };
+      }
+      if (row.state === 'completed') {
+        return { status: 'completed', resultado: row.resultado };
+      }
+      if (row.state === 'failed') {
+        // Terminal failure (B3). Stop polling immediately — the result
+        // will never arrive, and we must not re-run the handler.
+        return { status: 'failed' };
+      }
+      // Still in progress; wait and retry with capped exponential backoff.
+      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+      pollIntervalMs = Math.min(pollIntervalMs * 2, MAX_POLL_MS);
+    }
+    return { status: 'timeout' };
+  },
+
+  /**
+   * Legacy write path. PRESERVED for backward compat with tests / call
+   * sites that haven't migrated to the tryReserve/markCompleted flow.
+   * Inserts a 'completed' row directly (matches the pre-#298 semantics:
+   * the row exists only after the handler returned, so it's correctly
+   * classified as completed).
+   *
+   * New code should use tryReserve + markCompleted instead — see
+   * src/tools/_dispatcher.ts for the canonical pattern.
+   */
   async store(input: {
     key: string;
     tool_name: string;
@@ -1280,26 +1928,70 @@ export const idempotencyRepo = {
     file_sha256?: string;
     resultado: unknown;
   }): Promise<void> {
-    await db
-      .insert(idempotency_keys)
-      .values({
-        key: input.key,
-        tool_name: input.tool_name,
-        operation_type: input.operation_type,
-        pessoa_id: input.pessoa_id,
-        entity_id: input.entity_id,
-        payload_hash: input.payload_hash,
-        file_sha256: input.file_sha256 ?? null,
-        resultado: input.resultado as object,
-      })
-      .onConflictDoNothing();
+    // applyTenantGuard stamps tenant_id/agent_id from ALS context and rejects
+    // any explicit mismatch in the input. Also throws if no context.
+    const guarded = applyTenantGuard({
+      key: input.key,
+      tool_name: input.tool_name,
+      operation_type: input.operation_type,
+      pessoa_id: input.pessoa_id,
+      entity_id: input.entity_id,
+      payload_hash: input.payload_hash,
+      file_sha256: input.file_sha256 ?? null,
+      resultado: input.resultado as object,
+      state: 'completed' as const,
+      expires_at: null,
+    });
+    await db.insert(idempotency_keys).values(guarded).onConflictDoNothing();
   },
   async cleanup(olderThanDays: number): Promise<number> {
-    const rows = await db
+    // Three-phase sweep:
+    //   (1) Reap stale in_progress reservations (crashed workers) so they
+    //       don't block re-claim forever. The partial index from
+    //       migration 064 (`idx_idempotency_keys_in_progress_expires`)
+    //       makes this O(stale rows) regardless of total table size.
+    //       Deleting an orphaned in_progress row is safe: a crashed owner
+    //       left no result, and the next dispatch re-INSERTs a fresh
+    //       reservation. (The fencing token in #298 B2 protects the
+    //       OTHER case — a slow-but-alive owner whose lease was reclaimed
+    //       via UPDATE — so its late completion can't clobber the row.)
+    //   (2) Age out long-completed rows past the cache retention window.
+    //   (3) Age out terminal 'failed' rows (issue #298 B3) on the same
+    //       retention window — they exist only to suppress silent
+    //       re-execution; once well past the window the side effect (if
+    //       any) is no longer a re-run risk. The partial index
+    //       `idx_idempotency_keys_failed_created` (migration 065) keeps
+    //       this O(aged-failed rows).
+    // All global on purpose: cleanup is a maintenance sweep, not a
+    // tenant-scoped read; it cannot leak (no row body returned).
+    const reaped = await db
       .delete(idempotency_keys)
-      .where(sql`created_at < now() - (${olderThanDays} || ' days')::interval`)
+      .where(
+        and(
+          eq(idempotency_keys.state, 'in_progress'),
+          sql`expires_at < now()`,
+        ),
+      )
       .returning({ key: idempotency_keys.key });
-    return rows.length;
+    const aged = await db
+      .delete(idempotency_keys)
+      .where(
+        and(
+          eq(idempotency_keys.state, 'completed'),
+          sql`created_at < now() - (${olderThanDays} || ' days')::interval`,
+        ),
+      )
+      .returning({ key: idempotency_keys.key });
+    const agedFailed = await db
+      .delete(idempotency_keys)
+      .where(
+        and(
+          eq(idempotency_keys.state, 'failed'),
+          sql`created_at < now() - (${olderThanDays} || ' days')::interval`,
+        ),
+      )
+      .returning({ key: idempotency_keys.key });
+    return reaped.length + aged.length + agedFailed.length;
   },
 };
 
@@ -5317,6 +6009,28 @@ export const channelsRepo = {
   // EXPLICITLY bypasses applyTenantGuard — used by resolver (entry point,
   // before context exists). The (channel_type, external_id) lookup discovers
   // which tenant/agent owns the inbound message.
+  //
+  // [Codex review #277] UNIQUE in `migrations/031_p6_channels.sql` is
+  // `(tenant_id, channel_type, external_id)` — same (channel_type, external_id)
+  // CAN coexist across distinct tenants (e.g., a number switching providers,
+  // or a tenant deactivating an old channel before another tenant claims it).
+  // A naive `limit(1)` would arbitrarily pick one row, and if the resolver
+  // landed on the inactive one it would reject a message belonging to the
+  // active tenant — silently dropping legitimate traffic.
+  //
+  // Strategy: fetch ALL matches, then collapse:
+  //   - 0 active rows → return any inactive (resolver will throw with
+  //     found:true, active:false → unknown_or_inactive_channel audit).
+  //   - 1 active row  → return it (the only sensible owner).
+  //   - 2+ active rows → cross-tenant ambiguity. Surface explicitly via
+  //     TypedError so the channel ownership conflict is visible in
+  //     audit/triage rather than being masked by a non-deterministic pick.
+  //     The PROPER fix is an operator deactivating one side; the resolver
+  //     refusing to choose is the fail-loud counterpart of the rate-limit
+  //     bucket collapse that issue #268 closed.
+  //
+  // Cardinality is bounded by `channels_external_idx` and in practice expected
+  // to be ≤ 2 (one prior, one current); fetching all rows is O(few).
   async findByExternalCrossTenant(args: {
     channel_type: string;
     external_id: string;
@@ -5329,9 +6043,30 @@ export const channelsRepo = {
           eq(channels.channel_type, args.channel_type),
           eq(channels.external_id, args.external_id),
         ),
-      )
-      .limit(1);
-    return rows[0] ?? null;
+      );
+    if (rows.length === 0) return null;
+
+    const activeRows = rows.filter((r) => r.active);
+    if (activeRows.length === 0) {
+      // No active owner — return any inactive to preserve the (found:true,
+      // active:false) audit signature the resolver expects.
+      return rows[0]!;
+    }
+    if (activeRows.length > 1) {
+      // Multiple active tenants claim the same external_id — refuse to choose.
+      // Caller (resolveChannel) wraps this in the standard fail-loud path.
+      throw new TypedError(
+        'channel_resolution_failed',
+        'channel ownership ambiguous: multiple active channels match (channel_type, external_id)',
+        {
+          channel_type: args.channel_type,
+          external_id: args.external_id,
+          resolver_path: 'ambiguous_active_channels',
+          conflicting_tenant_ids: activeRows.map((r) => r.tenant_id),
+        },
+      );
+    }
+    return activeRows[0]!;
   },
 
   async listActive(): Promise<Channel[]> {

@@ -323,13 +323,16 @@ export class SoulSliceBuilder
 
   cacheKey(base: BaseContextPacket, req: SoulRequirements): string {
     // Builders share the InMemorySliceCache; keep keys in
-    // `maia:context:{tenant}:soul:{scope_hash}` namespace.
+    // `maia:context:v2:{tenant}:{agent}:soul:{scope_hash}` namespace.
     const scope = [
       base.agent_id,
       req.depth,
       String(req.max_biases ?? 5),
     ].join(':');
-    return sliceCacheKey(base.tenant_id, 'soul', scope);
+    // Issue #235: pass agent_id into sliceCacheKey's prefix. agent_id remains
+    // in the scope hash too (redundant but harmless) since soul biases were
+    // already agent-scoped here.
+    return sliceCacheKey(base.tenant_id, base.agent_id, 'soul', scope);
   }
 
   async build(

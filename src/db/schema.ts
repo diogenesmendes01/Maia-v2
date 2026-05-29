@@ -300,33 +300,78 @@ export const agent_facts = pgTable(
       t.escopo,
       t.chave,
     ),
+    // Issue #281 (redesigned in PR #310) — KSM auto-promoter hot path.
+    // The promoter sweeps `WHERE lifecycle_status = X AND <updated_at /
+    // evidence filter> LIMIT 100` hourly (workers/knowledge-state-
+    // promoter.ts → repos.ts listEligible). Two partial indexes back it:
+    //   (1) in-flight states swept by promoter steps 1-5;
+    //   (2) the 'active' bulk swept by step 6 (active→deprecated).
+    // The old (tenant_id, agent_id, id) index was dropped — it was
+    // redundant with the PK on `id` for the findById/update path.
+    // Created via migration 066 CONCURRENTLY.
+    lifecycleInflightIdx: index('idx_agent_facts_lifecycle_inflight')
+      .on(t.lifecycle_status, t.updated_at)
+      .where(
+        sql`lifecycle_status IN ('ephemeral', 'observed', 'reinforced', 'verified')`,
+      ),
+    // Expression index on the coalesced value the promoter's active sweep
+    // ranges over (`COALESCE(last_recall_at, updated_at) < cutoff`). A
+    // btree over the two SEPARATE columns cannot back a range over the
+    // COALESCE(...) expression, so it must key on the expression itself
+    // (mirrors migration 066: `((COALESCE(last_recall_at, updated_at)))`).
+    lifecycleActiveIdx: index('idx_agent_facts_lifecycle_active')
+      .on(sql`COALESCE(last_recall_at, updated_at)`)
+      .where(sql`lifecycle_status = 'active'`),
   }),
 );
 
-export const learned_rules = pgTable('learned_rules', {
-  id: uuid('id').primaryKey().defaultRandom(),
-  tenant_id: text('tenant_id').notNull().default('default'),
-  agent_id: text('agent_id').notNull().default('default'),
-  tipo: text('tipo').notNull(),
-  contexto: text('contexto').notNull(),
-  acao: text('acao').notNull(),
-  contexto_jsonb: jsonb('contexto_jsonb').notNull().default(sql`'{}'::jsonb`),
-  acoes_jsonb: jsonb('acoes_jsonb').notNull().default(sql`'{}'::jsonb`),
-  confianca: numeric('confianca', { precision: 3, scale: 2 }).notNull().default('0.50'),
-  acertos: integer('acertos').notNull().default(0),
-  erros: integer('erros').notNull().default(0),
-  ativa: boolean('ativa').notNull().default(true),
-  exemplo_origem_id: uuid('exemplo_origem_id'),
-  // P8c + P10a — Knowledge State Machine lifecycle columns
-  // (P8c added lifecycle_status/evidence_count/lifecycle_transitions in
-  // migration 041; P10a added last_recall_at in migration 050.)
-  lifecycle_status: text('lifecycle_status').notNull().default('active'),
-  evidence_count: integer('evidence_count').notNull().default(1),
-  lifecycle_transitions: jsonb('lifecycle_transitions').notNull().default(sql`'[]'::jsonb`),
-  last_recall_at: timestamp('last_recall_at', { withTimezone: true }),
-  created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
-  updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
-});
+export const learned_rules = pgTable(
+  'learned_rules',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull().default('default'),
+    agent_id: text('agent_id').notNull().default('default'),
+    tipo: text('tipo').notNull(),
+    contexto: text('contexto').notNull(),
+    acao: text('acao').notNull(),
+    contexto_jsonb: jsonb('contexto_jsonb').notNull().default(sql`'{}'::jsonb`),
+    acoes_jsonb: jsonb('acoes_jsonb').notNull().default(sql`'{}'::jsonb`),
+    confianca: numeric('confianca', { precision: 3, scale: 2 }).notNull().default('0.50'),
+    acertos: integer('acertos').notNull().default(0),
+    erros: integer('erros').notNull().default(0),
+    ativa: boolean('ativa').notNull().default(true),
+    exemplo_origem_id: uuid('exemplo_origem_id'),
+    // P8c + P10a — Knowledge State Machine lifecycle columns
+    // (P8c added lifecycle_status/evidence_count/lifecycle_transitions in
+    // migration 041; P10a added last_recall_at in migration 050.)
+    lifecycle_status: text('lifecycle_status').notNull().default('active'),
+    evidence_count: integer('evidence_count').notNull().default(1),
+    lifecycle_transitions: jsonb('lifecycle_transitions').notNull().default(sql`'[]'::jsonb`),
+    last_recall_at: timestamp('last_recall_at', { withTimezone: true }),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    // Issue #281 (redesigned in PR #310, B3) — learned_rules was the
+    // fourth KSM table previously omitted. The auto-promoter sweeps it
+    // identically to the other three. Two partial lifecycle indexes back
+    // `listEligible` (see agent_facts above for the full rationale).
+    // Created via migration 066 CONCURRENTLY.
+    lifecycleInflightIdx: index('idx_learned_rules_lifecycle_inflight')
+      .on(t.lifecycle_status, t.updated_at)
+      .where(
+        sql`lifecycle_status IN ('ephemeral', 'observed', 'reinforced', 'verified')`,
+      ),
+    // Expression index on the coalesced value the promoter's active sweep
+    // ranges over (`COALESCE(last_recall_at, updated_at) < cutoff`). A
+    // btree over the two SEPARATE columns cannot back a range over the
+    // COALESCE(...) expression, so it must key on the expression itself
+    // (mirrors migration 066: `((COALESCE(last_recall_at, updated_at)))`).
+    lifecycleActiveIdx: index('idx_learned_rules_lifecycle_active')
+      .on(sql`COALESCE(last_recall_at, updated_at)`)
+      .where(sql`lifecycle_status = 'active'`),
+  }),
+);
 
 export const agent_memories = pgTable('agent_memories', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -508,19 +553,60 @@ export const pending_questions = pgTable('pending_questions', {
   created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
-export const idempotency_keys = pgTable('idempotency_keys', {
-  key: text('key').primaryKey(),
-  tenant_id: text('tenant_id').notNull().default('default'),
-  agent_id: text('agent_id').notNull().default('default'),
-  tool_name: text('tool_name').notNull(),
-  operation_type: text('operation_type').notNull(),
-  pessoa_id: uuid('pessoa_id').notNull(),
-  entity_id: uuid('entity_id').notNull(),
-  payload_hash: text('payload_hash').notNull(),
-  file_sha256: text('file_sha256'),
-  resultado: jsonb('resultado').notNull(),
-  created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
-});
+// Issue #261: composite PK on (tenant_id, agent_id, key). Prior schema had
+// `key` as a singleton PRIMARY KEY, which allowed two tenants computing the
+// same idempotency_key to collide in the cache and leak tool output. The
+// hash input in `src/governance/idempotency.ts` ALSO folds tenant_id/agent_id
+// now, so a collision via the hash alone is no longer possible — but the
+// composite PK makes the storage layer reflect the true identity tuple and
+// guards against any future caller that bypasses `computeIdempotencyKey`.
+// See migration 063_p10_idempotency_keys_tenant_pk.
+//
+// Issue #298: atomic reservation via INSERT ON CONFLICT.
+//   - `state` distinguishes a reservation in flight ('in_progress') from a
+//     completed handler ('completed'). Default 'completed' so the existing
+//     write-once-after-handler rows in main are classified correctly with
+//     no backfill (see migration 064).
+//   - `expires_at` is the wall-clock deadline for in-flight reservations;
+//     past it, a stale reservation can be reclaimed by the next caller and
+//     the cleanup worker. NULL for completed rows.
+//   - `resultado` is now nullable — only completed rows carry a result.
+//     A DB-side CHECK enforces (state, resultado, expires_at) coherence
+//     so a hand-crafted INSERT can't produce a malformed row.
+//
+// Issue #298 review (B2 + B3 — migration 065):
+//   - `state` now also admits the terminal 'failed' value: a handler that
+//     threw (or produced a malformed response) transitions in_progress→failed
+//     instead of deleting the row, so a subsequent same-key dispatch does NOT
+//     silently re-execute a partially-applied side effect.
+//   - `reservation_token` is a fencing token (UUID) stamped on every
+//     reservation (fresh INSERT or stale-lock reclaim). markCompleted /
+//     releaseReservation only mutate the row when the caller presents the
+//     token they received from tryReserve, so a slow/preempted owner whose
+//     lease was reclaimed cannot clobber the new owner's reservation
+//     (closes the double-execution window left by the fixed-TTL reclaim).
+export const idempotency_keys = pgTable(
+  'idempotency_keys',
+  {
+    key: text('key').notNull(),
+    tenant_id: text('tenant_id').notNull().default('default'),
+    agent_id: text('agent_id').notNull().default('default'),
+    tool_name: text('tool_name').notNull(),
+    operation_type: text('operation_type').notNull(),
+    pessoa_id: uuid('pessoa_id').notNull(),
+    entity_id: uuid('entity_id').notNull(),
+    payload_hash: text('payload_hash').notNull(),
+    file_sha256: text('file_sha256'),
+    resultado: jsonb('resultado'),
+    state: text('state').notNull().default('completed'),
+    expires_at: timestamp('expires_at', { withTimezone: true }),
+    reservation_token: text('reservation_token'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.tenant_id, t.agent_id, t.key] }),
+  }),
+);
 
 // Issue #227: outbound delivery idempotency ledger. One row per inbound turn
 // (any channel). Pre-send optimistic insert + status-aware guard closes the
@@ -815,6 +901,25 @@ export const memory_entry = pgTable(
     scopeIdx: index('memory_entry_scope_idx').on(t.scope_type, t.subject_id),
     needsReviewIdx: index('memory_entry_needs_review_idx').on(t.needs_review),
     expiresIdx: index('memory_entry_expires_idx').on(t.expires_at),
+    // Issue #281 (redesigned in PR #310) — KSM auto-promoter hot path.
+    // Two partial lifecycle indexes back `listEligible`; distinct from
+    // `memory_entry_tenant_agent_idx` (which orders by created_at for
+    // time-window scans). The old (tenant_id, agent_id, id) index was
+    // dropped as redundant with the PK. See agent_facts for the full
+    // rationale. Created via migration 066 CONCURRENTLY.
+    lifecycleInflightIdx: index('idx_memory_entry_lifecycle_inflight')
+      .on(t.lifecycle_status, t.updated_at)
+      .where(
+        sql`lifecycle_status IN ('ephemeral', 'observed', 'reinforced', 'verified')`,
+      ),
+    // Expression index on the coalesced value the promoter's active sweep
+    // ranges over (`COALESCE(last_recall_at, updated_at) < cutoff`). A
+    // btree over the two SEPARATE columns cannot back a range over the
+    // COALESCE(...) expression, so it must key on the expression itself
+    // (mirrors migration 066: `((COALESCE(last_recall_at, updated_at)))`).
+    lifecycleActiveIdx: index('idx_memory_entry_lifecycle_active')
+      .on(sql`COALESCE(last_recall_at, updated_at)`)
+      .where(sql`lifecycle_status = 'active'`),
   }),
 );
 
@@ -854,6 +959,26 @@ export const behavioral_hint = pgTable(
       t.subject_id,
     ),
     activeIdx: index('behavioral_hint_active_idx').on(t.revoked_at, t.expires_at),
+    // Issue #281 (redesigned in PR #310) — KSM auto-promoter hot path.
+    // The shared behavioral_hint table backs both `behavioral_hint` and
+    // `procedure_hint` kinds; the promoter sweeps both by lifecycle_status.
+    // Two partial lifecycle indexes back `listEligible`. The old
+    // (tenant_id, agent_id, id) index was dropped as redundant with the
+    // PK. See agent_facts for the full rationale. Created via migration
+    // 066 CONCURRENTLY.
+    lifecycleInflightIdx: index('idx_behavioral_hint_lifecycle_inflight')
+      .on(t.lifecycle_status, t.updated_at)
+      .where(
+        sql`lifecycle_status IN ('ephemeral', 'observed', 'reinforced', 'verified')`,
+      ),
+    // Expression index on the coalesced value the promoter's active sweep
+    // ranges over (`COALESCE(last_recall_at, updated_at) < cutoff`). A
+    // btree over the two SEPARATE columns cannot back a range over the
+    // COALESCE(...) expression, so it must key on the expression itself
+    // (mirrors migration 066: `((COALESCE(last_recall_at, updated_at)))`).
+    lifecycleActiveIdx: index('idx_behavioral_hint_lifecycle_active')
+      .on(sql`COALESCE(last_recall_at, updated_at)`)
+      .where(sql`lifecycle_status = 'active'`),
   }),
 );
 

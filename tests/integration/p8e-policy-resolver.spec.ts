@@ -20,6 +20,7 @@ import {
   handlePolicyLifecycleMessage,
   isValidDualApprovalEvidence,
   POLICY_LIFECYCLE_CHANNEL,
+  buildPolicyLifecycleChannel,
   type PolicyRule,
   type PolicyRuleBody,
   type PolicyRuleKind,
@@ -569,8 +570,9 @@ describe('p8e policy resolver — integration', () => {
           agent_id: 'agent-x',
           descriptor: desc,
         };
+        // Issue #249: per-tenant channel name.
         handlePolicyLifecycleMessage(
-          POLICY_LIFECYCLE_CHANNEL,
+          buildPolicyLifecycleChannel('default'),
           JSON.stringify(evt),
           cache,
         );
@@ -610,8 +612,9 @@ describe('p8e policy resolver — integration', () => {
         agent_id: null,
         descriptor: 'wide_event',
       };
+      // Issue #249: per-tenant channel name.
       handlePolicyLifecycleMessage(
-        POLICY_LIFECYCLE_CHANNEL,
+        buildPolicyLifecycleChannel('default'),
         JSON.stringify(evt),
         cache,
       );
@@ -655,11 +658,42 @@ describe('p8e policy resolver — integration', () => {
       ).toBeDefined();
     });
 
+    it('handlePolicyLifecycleMessage drops events on the LEGACY bare channel (issue #249)', () => {
+      // After the per-tenant channel rollout, the pre-#249 bare channel
+      // name `policy_rule_lifecycle` is no longer a valid delivery target.
+      // A stale publisher emitting on it MUST NOT invalidate cache —
+      // accepting it would re-open the global-routing hole.
+      const cache = new PolicyResolverCacheImpl({ ttl_ms: 60_000, max_entries: 100 });
+      cache.set(
+        { tenant_id: 't', agent_id: null, descriptor: 'd', scope: {} },
+        {
+          descriptor: 'd',
+          policy_id: 'p',
+          version: 1,
+          rule_kind: 'soft_guidance',
+        },
+      );
+      handlePolicyLifecycleMessage(
+        POLICY_LIFECYCLE_CHANNEL, // legacy bare name (no `:tenant` suffix)
+        JSON.stringify({
+          event: 'policy_rule_deprecated',
+          tenant_id: 't',
+          agent_id: null,
+          descriptor: 'd',
+        }),
+        cache,
+      );
+      // Entry survives — the bare channel is dropped (TTL fallback only).
+      expect(
+        cache.get({ tenant_id: 't', agent_id: null, descriptor: 'd', scope: {} }),
+      ).toBeDefined();
+    });
+
     it('handlePolicyLifecycleMessage swallows malformed JSON without throwing', () => {
       const cache = new PolicyResolverCacheImpl({ ttl_ms: 60_000, max_entries: 100 });
       expect(() => {
         handlePolicyLifecycleMessage(
-          POLICY_LIFECYCLE_CHANNEL,
+          buildPolicyLifecycleChannel('default'),
           'not-json',
           cache,
         );
@@ -676,8 +710,9 @@ describe('p8e policy resolver — integration', () => {
           event: 'policy_rule_deprecated',
           ...k,
         };
+        // Issue #249: per-tenant channel routing.
         handlePolicyLifecycleMessage(
-          POLICY_LIFECYCLE_CHANNEL,
+          buildPolicyLifecycleChannel(k.tenant_id),
           JSON.stringify(evt),
           cache,
         );

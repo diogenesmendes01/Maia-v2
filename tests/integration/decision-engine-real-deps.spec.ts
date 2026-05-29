@@ -47,7 +47,20 @@ vi.mock('@/control-plane/policy/policy-rules-repo.js', () => ({
     nextVersion: vi.fn(),
     POLICY_LIFECYCLE_CHANNEL: 'policy_rule_lifecycle',
   },
+  // Issue #249: per-tenant channel routing. Keep the legacy bare-name
+  // export here for back-compat with other consumers that import the
+  // prefix as a label; add the new builder + pattern + parser so any
+  // consumer of the production module that this mock replaces still
+  // resolves all symbols.
   POLICY_LIFECYCLE_CHANNEL: 'policy_rule_lifecycle',
+  POLICY_LIFECYCLE_CHANNEL_PREFIX: 'policy_rule_lifecycle',
+  POLICY_LIFECYCLE_CHANNEL_PATTERN: 'policy_rule_lifecycle:*',
+  buildPolicyLifecycleChannel: (tenant_id: string) =>
+    `policy_rule_lifecycle:${tenant_id}`,
+  parsePolicyLifecycleChannel: (channel: string) =>
+    channel.startsWith('policy_rule_lifecycle:')
+      ? channel.slice('policy_rule_lifecycle:'.length) || null
+      : null,
   isValidDualApprovalEvidence: vi.fn().mockReturnValue(false),
 }));
 

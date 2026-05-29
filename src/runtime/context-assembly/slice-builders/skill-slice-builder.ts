@@ -72,7 +72,8 @@ export class SkillSliceBuilder
     // selected_skill_id via the decision, which we hash here. The base
     // signature alone isn't enough to key, so we hash both pieces below in
     // build() before each cache lookup.
-    return sliceCacheKey(base.tenant_id, 'skill', 'placeholder');
+    // Issue #235: agent_id flows in via sliceCacheKey's prefix.
+    return sliceCacheKey(base.tenant_id, base.agent_id, 'skill', 'placeholder');
   }
 
   async build(
@@ -89,7 +90,7 @@ export class SkillSliceBuilder
       selected_skill_id: selected_skill_id ?? null,
       candidate_ids,
     });
-    const key = sliceCacheKey(input.base.tenant_id, 'skill', cacheScope);
+    const key = sliceCacheKey(input.base.tenant_id, input.base.agent_id, 'skill', cacheScope);
 
     const cached = await this.cache.get<SkillSlice>(key);
     if (cached) {
