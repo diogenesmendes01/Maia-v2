@@ -300,6 +300,15 @@ export const agent_facts = pgTable(
       t.escopo,
       t.chave,
     ),
+    // Issue #281 — composite index supporting KSM facade `findById`/
+    // `update` queries scoped by (tenant_id, agent_id, id). The PK on
+    // `id` alone forced a PK scan + filter step; this index enables an
+    // index-only scan. Created via migration 065 CONCURRENTLY.
+    tenantAgentIdIdx: index('idx_agent_facts_tenant_agent_id').on(
+      t.tenant_id,
+      t.agent_id,
+      t.id,
+    ),
   }),
 );
 
@@ -829,6 +838,15 @@ export const memory_entry = pgTable(
     scopeIdx: index('memory_entry_scope_idx').on(t.scope_type, t.subject_id),
     needsReviewIdx: index('memory_entry_needs_review_idx').on(t.needs_review),
     expiresIdx: index('memory_entry_expires_idx').on(t.expires_at),
+    // Issue #281 — composite index supporting KSM facade `findById`/
+    // `update` queries scoped by (tenant_id, agent_id, id). Distinct
+    // from `memory_entry_tenant_agent_idx` (which orders by created_at
+    // for time-window scans). Created via migration 065 CONCURRENTLY.
+    tenantAgentIdIdx: index('idx_memory_entry_tenant_agent_id').on(
+      t.tenant_id,
+      t.agent_id,
+      t.id,
+    ),
   }),
 );
 
@@ -868,6 +886,16 @@ export const behavioral_hint = pgTable(
       t.subject_id,
     ),
     activeIdx: index('behavioral_hint_active_idx').on(t.revoked_at, t.expires_at),
+    // Issue #281 — composite index supporting KSM facade `findById`/
+    // `update` queries scoped by (tenant_id, agent_id, id). The shared
+    // behavioral_hint table backs both `behavioral_hint` and
+    // `procedure_hint` kinds; both go through the same id-scoped lookup.
+    // Created via migration 065 CONCURRENTLY.
+    tenantAgentIdIdx: index('idx_behavioral_hint_tenant_agent_id').on(
+      t.tenant_id,
+      t.agent_id,
+      t.id,
+    ),
   }),
 );
 
