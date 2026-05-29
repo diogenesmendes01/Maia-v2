@@ -81,8 +81,9 @@ const TENANT_B = 'tenant-B-issue-290';
 const AGENT_B = 'agent-B-issue-290';
 
 // Deterministic UUIDs (the `mensagens.id` column is UUID PRIMARY KEY).
-const ROW_ID = '00000000-0000-0000-0000-0000000002901';
-const ROW_ID_2 = '00000000-0000-0000-0000-0000000002902';
+// Final group is exactly 12 hex digits (8-4-4-4-12), distinct per row.
+const ROW_ID = '00000000-0000-0000-0000-000000000290';
+const ROW_ID_2 = '00000000-0000-0000-0000-000000000291';
 
 /**
  * Insert an inbound `mensagens` row directly via raw SQL, starting in the
@@ -273,7 +274,7 @@ d('mensagensRepo.adoptToResolvedTenantCrossTenant — cross-tenant adoption race
 
   it('findOwnerByIdCrossTenant returns null for a non-existent id', async () => {
     const owner = await repositoriesMod.mensagensRepo.findOwnerByIdCrossTenant(
-      '00000000-0000-0000-0000-0000000009999',
+      '00000000-0000-0000-0000-000000009999',
     );
     expect(owner).toBeNull();
   });
