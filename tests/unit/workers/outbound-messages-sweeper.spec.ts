@@ -49,6 +49,21 @@ const _dialect = new PgDialect();
 // Capture tenant context active at each UPDATE/DELETE call site.
 const sweepCallTenants: Array<{ tenant_id: string; agent_id: string; op: 'update' | 'delete' }> = [];
 
+// Per-row advisory-lock fence (#292 blocker #4): set of
+// `${tenant}:${agent}:${idempotency_key}` strings whose advisory xact lock is
+// currently held by a (simulated) concurrent sender. The recovery CTE's
+// `pg_try_advisory_xact_lock(...)` is modeled as: lock acquired UNLESS the key
+// is in this set. Tests add to it to simulate an in-flight claim.
+const heldSenderLocks = new Set<string>();
+
+// Per-tenant fairness cap (#292 blocker #2). Mirrors the env mock below; the
+// recovery CTE LIMITs candidates to this many rows per tenant per pass.
+const RECOVERY_LIMIT_PER_TENANT = 500;
+// Retention batch size (#292 blocker #1). Mirrors the env mock; the bounded
+// DELETE loop deletes at most this many rows per statement and loops until a
+// pass returns fewer than this.
+const RETENTION_BATCH_SIZE = 1000;
+
 const dbExecuteMock = vi.fn(async (query: SQL) => {
   const rendered = _dialect.sqlToQuery(query);
   const sqlText = rendered.sql;
@@ -83,13 +98,19 @@ const dbExecuteMock = vi.fn(async (query: SQL) => {
     return { rows: pairs };
   }
 
-  // (B) Stale-pending UPDATE → 'unknown', RETURNING id metadata.
+  // (B) Stale-pending recovery CTE — `WITH candidates ... UPDATE ... SET
+  //     status='unknown' ... RETURNING`. Bounded (LIMIT recoveryLimit),
+  //     ordered oldest-first, fenced by pg_try_advisory_xact_lock on the
+  //     per-row sender key.
   if (/UPDATE.+SET\s+status\s*=\s*'unknown'/is.test(sqlText)) {
     const params = rendered.params as unknown[];
-    // Param order: $1=tenant_id, $2=agent_id, $3=stalePendingSec.
+    // Param order after the rewrite (#292 blockers #2 + #4):
+    //   $1=tenant_id (candidates), $2=agent_id, $3=stalePendingSec,
+    //   $4=recoveryLimitPerTenant, $5=tenant_id (fenced), $6=agent_id (fenced).
     const tenant_id = params[0] as string;
     const agent_id = params[1] as string;
     const stalePendingSec = Number(params[2]);
+    const recoveryLimit = Number(params[3]);
     const ctx = tryGetCurrentContext();
     if (!ctx || ctx.tenant_id !== tenant_id || ctx.agent_id !== agent_id) {
       throw new Error(
@@ -100,12 +121,25 @@ const dbExecuteMock = vi.fn(async (query: SQL) => {
     }
     sweepCallTenants.push({ tenant_id, agent_id, op: 'update' });
     const now = Date.now();
+    // Candidate selection: stale-pending for this (tenant, agent), oldest
+    // first, capped at recoveryLimit. Mirrors the CTE's
+    // `ORDER BY created_at ASC LIMIT $4 FOR UPDATE SKIP LOCKED`.
+    const candidates = store
+      .filter(
+        (r) =>
+          r.tenant_id === tenant_id &&
+          r.agent_id === agent_id &&
+          r.status === 'pending' &&
+          now - r.created_at.getTime() > stalePendingSec * 1000,
+      )
+      .sort((a, b) => a.created_at.getTime() - b.created_at.getTime())
+      .slice(0, recoveryLimit);
     const promoted: OutboundRow[] = [];
-    for (const r of store) {
-      if (r.tenant_id !== tenant_id || r.agent_id !== agent_id) continue;
-      if (r.status !== 'pending') continue;
-      const ageMs = now - r.created_at.getTime();
-      if (ageMs <= stalePendingSec * 1000) continue;
+    for (const r of candidates) {
+      // Sender fence: skip rows whose per-row advisory lock a concurrent
+      // claim holds (pg_try_advisory_xact_lock would return false).
+      const lockKey = `${tenant_id}:${agent_id}:${r.idempotency_key}`;
+      if (heldSenderLocks.has(lockKey)) continue;
       r.status = 'unknown';
       r.error = r.error ?? 'sweeper_promoted_stale_pending';
       promoted.push(r);
@@ -121,13 +155,18 @@ const dbExecuteMock = vi.fn(async (query: SQL) => {
     };
   }
 
-  // (C) Retention DELETE terminais antigos.
+  // (C) Retention DELETE terminais antigos — bounded batched loop
+  //     `DELETE FROM ... WHERE id IN (SELECT ... LIMIT $4 FOR UPDATE SKIP
+  //     LOCKED)`. Each call deletes at most RETENTION_BATCH_SIZE; the worker
+  //     loops until a pass returns fewer than the cap.
   if (/DELETE\s+FROM.+outbound_messages/i.test(sqlText)) {
     const params = rendered.params as unknown[];
-    // Param order: $1=tenant_id, $2=agent_id, $3=retentionDays.
+    // Param order after the rewrite (#292 blocker #1):
+    //   $1=tenant_id, $2=agent_id, $3=retentionDays, $4=retentionBatchSize.
     const tenant_id = params[0] as string;
     const agent_id = params[1] as string;
     const retentionDays = Number(params[2]);
+    const batchSize = Number(params[3]);
     const ctx = tryGetCurrentContext();
     if (!ctx || ctx.tenant_id !== tenant_id || ctx.agent_id !== agent_id) {
       throw new Error(
@@ -138,18 +177,25 @@ const dbExecuteMock = vi.fn(async (query: SQL) => {
     }
     sweepCallTenants.push({ tenant_id, agent_id, op: 'delete' });
     const now = Date.now();
-    const toDelete: number[] = [];
-    for (let i = 0; i < store.length; i++) {
-      const r = store[i]!;
-      if (r.tenant_id !== tenant_id || r.agent_id !== agent_id) continue;
-      if (r.status !== 'sent' && r.status !== 'failed' && r.status !== 'unknown') continue;
-      const ageMs = now - r.created_at.getTime();
-      if (ageMs <= retentionDays * 24 * 60 * 60 * 1000) continue;
-      toDelete.push(i);
-    }
+    // Eligible terminal rows, oldest first, capped at batchSize (mirrors the
+    // inner `SELECT ... ORDER BY created_at ASC LIMIT $4`).
+    const eligible = store
+      .map((r, i) => ({ r, i }))
+      .filter(
+        ({ r }) =>
+          r.tenant_id === tenant_id &&
+          r.agent_id === agent_id &&
+          (r.status === 'sent' || r.status === 'failed' || r.status === 'unknown') &&
+          now - r.created_at.getTime() > retentionDays * 24 * 60 * 60 * 1000,
+      )
+      .sort((a, b) => a.r.created_at.getTime() - b.r.created_at.getTime())
+      .slice(0, batchSize);
+    const deleteIds = new Set(eligible.map(({ r }) => r.id));
     const deleted: OutboundRow[] = [];
-    for (let i = toDelete.length - 1; i >= 0; i--) {
-      deleted.push(...store.splice(toDelete[i]!, 1));
+    for (let i = store.length - 1; i >= 0; i--) {
+      if (deleteIds.has(store[i]!.id)) {
+        deleted.push(...store.splice(i, 1));
+      }
     }
     return { rows: deleted.map((r) => ({ id: r.id })) };
   }
@@ -157,8 +203,54 @@ const dbExecuteMock = vi.fn(async (query: SQL) => {
   return { rows: [] };
 });
 
+// ---------------------------------------------------------------------------
+// pool mock — the single-flight advisory lock (#292 blocker #3) uses a
+// dedicated `pool.connect()` client and pg_try_advisory_lock on it. We model:
+//   - pool.connect() → a fake client tracking connect/release counts.
+//   - client.query('... pg_try_advisory_lock ...') → returns { locked }
+//     based on `sweepLockHeld` (simulates another instance holding the lock).
+//   - client.query('... pg_advisory_unlock ...') → frees it.
+// ---------------------------------------------------------------------------
+// When true, the FIRST acquire attempt sees the lock already held (returns
+// locked=false → the sweep is skipped). Tests flip this to assert contention.
+let sweepLockHeldByOther = false;
+const poolStats = {
+  connects: 0,
+  releases: 0,
+  acquires: 0, // pg_try_advisory_lock calls
+  unlocks: 0, // pg_advisory_unlock calls
+  acquiredOk: 0, // times the sweep actually got the lock
+};
+
+function makeFakeClient() {
+  return {
+    query: vi.fn(async (text: string, _params?: unknown[]) => {
+      if (/pg_try_advisory_lock/i.test(text)) {
+        poolStats.acquires++;
+        const locked = !sweepLockHeldByOther;
+        if (locked) poolStats.acquiredOk++;
+        return { rows: [{ locked }] };
+      }
+      if (/pg_advisory_unlock/i.test(text)) {
+        poolStats.unlocks++;
+        return { rows: [{ pg_advisory_unlock: true }] };
+      }
+      return { rows: [] };
+    }),
+    release: vi.fn(() => {
+      poolStats.releases++;
+    }),
+  };
+}
+
+const poolConnectMock = vi.fn(async () => {
+  poolStats.connects++;
+  return makeFakeClient();
+});
+
 vi.mock('@/db/client.js', () => ({
   db: { execute: dbExecuteMock },
+  pool: { connect: poolConnectMock },
 }));
 
 // Use a real logger spy so we can assert structured fields per call.
@@ -182,6 +274,8 @@ vi.mock('@/config/env.js', () => ({
   config: {
     OUTBOUND_SWEEPER_STALE_PENDING_SEC: TEST_STALE_PENDING_SEC,
     OUTBOUND_SWEEPER_RETENTION_DAYS: TEST_RETENTION_DAYS,
+    OUTBOUND_SWEEPER_RECOVERY_LIMIT_PER_TENANT: RECOVERY_LIMIT_PER_TENANT,
+    OUTBOUND_SWEEPER_RETENTION_BATCH_SIZE: RETENTION_BATCH_SIZE,
   },
 }));
 
@@ -225,8 +319,16 @@ beforeEach(() => {
   store.length = 0;
   renderedSqls.length = 0;
   sweepCallTenants.length = 0;
+  heldSenderLocks.clear();
+  sweepLockHeldByOther = false;
+  poolStats.connects = 0;
+  poolStats.releases = 0;
+  poolStats.acquires = 0;
+  poolStats.unlocks = 0;
+  poolStats.acquiredOk = 0;
   nextId = 1;
   dbExecuteMock.mockClear();
+  poolConnectMock.mockClear();
   _resetForTests();
 });
 
@@ -625,6 +727,286 @@ describe('outbound_messages_sweeper — fail-isolated', () => {
     expect(doneFields.tenants).toBe(2);
     expect(doneFields.tenants_processed).toBe(1);
     expect(doneFields.tenants_failed).toBe(1);
+  });
+});
+
+describe('outbound_messages_sweeper — sender fence (#292 blocker #4, no double-send)', () => {
+  it('does NOT promote a stale-pending row whose sender advisory lock is held (in-flight claim)', async () => {
+    // A stale-pending row that the NORMAL sender is actively claiming RIGHT
+    // NOW: the sender holds pg_advisory_xact_lock(hashtext(tenant:agent:key)).
+    // The sweeper's pg_try_advisory_xact_lock on the SAME key must fail →
+    // the row is left pending (no reclaim → zero double-send).
+    seed({
+      ...A_CTX,
+      status: 'pending',
+      age_seconds: 600,
+      idempotency_key: 'conv-inflight:msg-inflight',
+    });
+    heldSenderLocks.add('tenant-A:agent-A:conv-inflight:msg-inflight');
+
+    const { runOutboundMessagesSweeper } = await import(
+      '@/workers/outbound-messages-sweeper.js'
+    );
+    await runOutboundMessagesSweeper();
+
+    // Row stays pending — the sweeper fenced off the in-flight claim.
+    expect(store).toHaveLength(1);
+    expect(store[0]!.status).toBe('pending');
+    expect(store[0]!.error).toBeNull();
+  });
+
+  it('promotes only the genuinely-stuck row, fencing the concurrently-claimed sibling', async () => {
+    // Two stale-pending rows for the same tenant. One is being claimed by a
+    // live sender (lock held); the other is genuinely orphaned (no lock).
+    // Only the orphan is promoted.
+    seed({
+      ...A_CTX,
+      status: 'pending',
+      age_seconds: 600,
+      idempotency_key: 'conv-stuck:msg-stuck',
+    });
+    seed({
+      ...A_CTX,
+      status: 'pending',
+      age_seconds: 600,
+      idempotency_key: 'conv-live:msg-live',
+    });
+    heldSenderLocks.add('tenant-A:agent-A:conv-live:msg-live');
+
+    const { runOutboundMessagesSweeper } = await import(
+      '@/workers/outbound-messages-sweeper.js'
+    );
+    await runOutboundMessagesSweeper();
+
+    const stuck = store.find((r) => r.idempotency_key === 'conv-stuck:msg-stuck');
+    const live = store.find((r) => r.idempotency_key === 'conv-live:msg-live');
+    expect(stuck!.status).toBe('unknown');
+    expect(live!.status).toBe('pending'); // fenced — sender owns it
+  });
+
+  it('the recovery query carries pg_try_advisory_xact_lock on the per-row sender key', async () => {
+    seed({ ...A_CTX, status: 'pending', age_seconds: 600 });
+
+    const { runOutboundMessagesSweeper } = await import(
+      '@/workers/outbound-messages-sweeper.js'
+    );
+    await runOutboundMessagesSweeper();
+
+    const recoverySql = renderedSqls.find((s) =>
+      /UPDATE.+SET\s+status\s*=\s*'unknown'/is.test(s),
+    );
+    expect(recoverySql).toBeDefined();
+    // The fence: the SAME advisory-lock primitive the sender uses in
+    // upsertPending (repositories.ts), keyed on the per-row idempotency key.
+    expect(recoverySql!).toMatch(/pg_try_advisory_xact_lock/i);
+    expect(recoverySql!).toMatch(/hashtext/i);
+    expect(recoverySql!).toMatch(/idempotency_key/i);
+    // FOR UPDATE SKIP LOCKED also guards the markSent/markFailed row-lock window.
+    expect(recoverySql!).toMatch(/FOR\s+UPDATE\s+SKIP\s+LOCKED/i);
+  });
+});
+
+describe('outbound_messages_sweeper — bounded retention DELETE (#292 blocker #1)', () => {
+  it('the DELETE is LIMIT-bounded (DELETE ... WHERE id IN (SELECT ... LIMIT N))', async () => {
+    seed({ ...A_CTX, status: 'sent', age_days: 40 });
+
+    const { runOutboundMessagesSweeper } = await import(
+      '@/workers/outbound-messages-sweeper.js'
+    );
+    await runOutboundMessagesSweeper();
+
+    const deleteSql = renderedSqls.find((s) =>
+      /DELETE\s+FROM.+outbound_messages/i.test(s),
+    );
+    expect(deleteSql).toBeDefined();
+    // Bounded: a subquery with LIMIT, not an unbounded DELETE.
+    expect(deleteSql!).toMatch(/limit/i);
+    expect(deleteSql!).toMatch(/id\s+in\s*\(/i);
+    expect(deleteSql!).toMatch(/FOR\s+UPDATE\s+SKIP\s+LOCKED/i);
+  });
+
+  it('loops batches until the backlog is fully drained (more rows than one batch)', async () => {
+    // RETENTION_BATCH_SIZE is 1000 in the env mock. Seed more than that so the
+    // worker must issue at least two DELETE passes to fully drain.
+    const TOTAL = RETENTION_BATCH_SIZE + 250;
+    for (let i = 0; i < TOTAL; i++) {
+      seed({ ...A_CTX, status: 'sent', age_days: 40, idempotency_key: `k-${i}` });
+    }
+
+    const { runOutboundMessagesSweeper } = await import(
+      '@/workers/outbound-messages-sweeper.js'
+    );
+    await runOutboundMessagesSweeper();
+
+    // Every eligible row is gone...
+    expect(store).toHaveLength(0);
+    // ...and it took MORE THAN ONE DELETE statement to get there (bounded loop).
+    const deleteCalls = renderedSqls.filter((s) =>
+      /DELETE\s+FROM.+outbound_messages/i.test(s),
+    );
+    expect(deleteCalls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('a single sub-batch backlog drains in one pass (short batch terminates loop)', async () => {
+    // Fewer rows than the batch cap → exactly one DELETE pass.
+    for (let i = 0; i < 10; i++) {
+      seed({ ...A_CTX, status: 'failed', age_days: 40, idempotency_key: `s-${i}` });
+    }
+
+    const { runOutboundMessagesSweeper } = await import(
+      '@/workers/outbound-messages-sweeper.js'
+    );
+    await runOutboundMessagesSweeper();
+
+    expect(store).toHaveLength(0);
+    const deleteCalls = renderedSqls.filter((s) =>
+      /DELETE\s+FROM.+outbound_messages/i.test(s),
+    );
+    expect(deleteCalls).toHaveLength(1);
+  });
+});
+
+describe('outbound_messages_sweeper — per-tenant fairness (#292 blocker #2)', () => {
+  it('promotes AT MOST recoveryLimitPerTenant rows for a high-volume tenant in one pass', async () => {
+    // Seed MORE stale-pending rows than the per-tenant cap for tenant-A.
+    const OVER = RECOVERY_LIMIT_PER_TENANT + 100;
+    for (let i = 0; i < OVER; i++) {
+      seed({ ...A_CTX, status: 'pending', age_seconds: 600, idempotency_key: `a-${i}` });
+    }
+
+    const { runOutboundMessagesSweeper } = await import(
+      '@/workers/outbound-messages-sweeper.js'
+    );
+    await runOutboundMessagesSweeper();
+
+    const promoted = store.filter((r) => r.status === 'unknown');
+    const stillPending = store.filter((r) => r.status === 'pending');
+    // Capped at the per-tenant limit this pass; the remainder stays pending
+    // for the next tick (no starvation of other tenants).
+    expect(promoted).toHaveLength(RECOVERY_LIMIT_PER_TENANT);
+    expect(stillPending).toHaveLength(OVER - RECOVERY_LIMIT_PER_TENANT);
+  });
+
+  it('a high-volume tenant does NOT starve a co-scheduled low-volume tenant', async () => {
+    // tenant-A floods the window; tenant-B has a single stuck row. Both are
+    // processed in the same pass (the per-tenant LIMIT applies independently
+    // per (tenant, agent), so B is never crowded out).
+    const OVER = RECOVERY_LIMIT_PER_TENANT + 50;
+    for (let i = 0; i < OVER; i++) {
+      seed({ ...A_CTX, status: 'pending', age_seconds: 600, idempotency_key: `a-${i}` });
+    }
+    seed({ ...B_CTX, status: 'pending', age_seconds: 600, idempotency_key: 'b-only' });
+
+    const { runOutboundMessagesSweeper } = await import(
+      '@/workers/outbound-messages-sweeper.js'
+    );
+    await runOutboundMessagesSweeper();
+
+    // tenant-B's row WAS promoted despite tenant-A's flood.
+    const bRow = store.find((r) => r.idempotency_key === 'b-only');
+    expect(bRow!.status).toBe('unknown');
+    // tenant-A still capped.
+    const aPromoted = store.filter(
+      (r) => r.tenant_id === 'tenant-A' && r.status === 'unknown',
+    );
+    expect(aPromoted).toHaveLength(RECOVERY_LIMIT_PER_TENANT);
+  });
+
+  it('recovery query is ORDER BY created_at ASC + LIMIT (oldest-first fairness)', async () => {
+    seed({ ...A_CTX, status: 'pending', age_seconds: 600 });
+
+    const { runOutboundMessagesSweeper } = await import(
+      '@/workers/outbound-messages-sweeper.js'
+    );
+    await runOutboundMessagesSweeper();
+
+    const recoverySql = renderedSqls.find((s) =>
+      /UPDATE.+SET\s+status\s*=\s*'unknown'/is.test(s),
+    );
+    expect(recoverySql).toBeDefined();
+    expect(recoverySql!).toMatch(/order\s+by\s+created_at\s+asc/i);
+    expect(recoverySql!).toMatch(/limit/i);
+  });
+});
+
+describe('outbound_messages_sweeper — single-flight advisory lock (#292 blocker #3)', () => {
+  it('acquires a GLOBAL advisory lock at start and releases it on completion', async () => {
+    seed({ ...A_CTX, status: 'pending', age_seconds: 600 });
+
+    const { runOutboundMessagesSweeper } = await import(
+      '@/workers/outbound-messages-sweeper.js'
+    );
+    await runOutboundMessagesSweeper();
+
+    // pg_try_advisory_lock called exactly once (one acquire), released once.
+    expect(poolStats.acquires).toBe(1);
+    expect(poolStats.acquiredOk).toBe(1);
+    expect(poolStats.unlocks).toBe(1);
+    // The dedicated client was connected and returned to the pool.
+    expect(poolStats.connects).toBe(1);
+    expect(poolStats.releases).toBe(1);
+  });
+
+  it('SKIPS the whole pass when another instance already holds the lock (contention)', async () => {
+    seed({ ...A_CTX, status: 'pending', age_seconds: 600 });
+    // Simulate a concurrent worker instance holding the sweep lock.
+    sweepLockHeldByOther = true;
+
+    const { runOutboundMessagesSweeper } = await import(
+      '@/workers/outbound-messages-sweeper.js'
+    );
+    const loggerMod = await import('@/lib/logger.js');
+    const infoSpy = loggerMod.logger.info as ReturnType<typeof vi.fn>;
+    infoSpy.mockClear();
+
+    await runOutboundMessagesSweeper();
+
+    // Lock NOT acquired → no dispatcher SELECT, no UPDATE/DELETE fired.
+    expect(poolStats.acquiredOk).toBe(0);
+    expect(sweepCallTenants).toHaveLength(0);
+    const dispatcherSqls = renderedSqls.filter((s) =>
+      /SELECT\s+DISTINCT\s+tenant_id,\s*agent_id/i.test(s),
+    );
+    expect(dispatcherSqls).toHaveLength(0);
+    // The lock client is still released back to the pool (we connected to try).
+    expect(poolStats.releases).toBe(1);
+    // No unlock issued (we never held it).
+    expect(poolStats.unlocks).toBe(0);
+    // The pending row is untouched.
+    expect(store[0]!.status).toBe('pending');
+    // A skip log was emitted.
+    const skipLogs = infoSpy.mock.calls.filter(
+      (c) => c[1] === 'outbound_messages_sweeper.skipped_locked',
+    );
+    expect(skipLogs).toHaveLength(1);
+  });
+
+  it('releases the lock even when a tenant sweep throws (release in finally)', async () => {
+    seed({ ...A_CTX, status: 'pending', age_seconds: 600 });
+
+    // Make the dispatcher SELECT itself throw — the only db.execute before the
+    // try{} that wraps the lock-protected body is INSIDE the try, so the
+    // finally must still release the lock.
+    const origImpl = dbExecuteMock.getMockImplementation();
+    dbExecuteMock.mockImplementation(async (query: SQL) => {
+      const rendered = _dialect.sqlToQuery(query);
+      if (/SELECT\s+DISTINCT\s+tenant_id,\s*agent_id/i.test(rendered.sql)) {
+        throw new Error('synthetic dispatcher failure');
+      }
+      return origImpl!(query);
+    });
+
+    const { runOutboundMessagesSweeper } = await import(
+      '@/workers/outbound-messages-sweeper.js'
+    );
+    // The throw propagates (the dispatcher SELECT is not per-tenant fail-isolated),
+    // but the lock MUST be released regardless.
+    await expect(runOutboundMessagesSweeper()).rejects.toThrow(
+      'synthetic dispatcher failure',
+    );
+    expect(poolStats.acquiredOk).toBe(1);
+    expect(poolStats.unlocks).toBe(1); // released in finally
+    expect(poolStats.releases).toBe(1); // client returned to pool
   });
 });
 

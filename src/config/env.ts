@@ -145,6 +145,19 @@ const envSchema = z
     //   age > N dias são DELETADAS no mesmo sweeper pass. Default 30 dias.
     OUTBOUND_SWEEPER_STALE_PENDING_SEC: z.coerce.number().int().positive().default(300),
     OUTBOUND_SWEEPER_RETENTION_DAYS: z.coerce.number().int().positive().default(30),
+    // #292 Codex blocker #1 — retention DELETE batch size. The retention
+    //   cleanup deletes terminal rows in bounded chunks (DELETE ... WHERE id IN
+    //   (SELECT ... LIMIT N)) and loops until a pass returns 0 rows, so a large
+    //   backlog never holds a table-wide lock for a single unbounded DELETE.
+    //   Default 1000 — balances per-statement overhead vs WAL/replication lag.
+    OUTBOUND_SWEEPER_RETENTION_BATCH_SIZE: z.coerce.number().int().positive().default(1000),
+    // #292 Codex blocker #2 — per-tenant fairness cap on stale-pending
+    //   recovery. Each tenant promotes AT MOST this many stale-pending rows per
+    //   pass (oldest first), so a single high-volume tenant cannot consume the
+    //   whole sweep window and starve later tenants. Default 500 — the next
+    //   */5min tick drains any remainder. Promotion is expected to be 0/rare in
+    //   healthy operation (each promotion is an ops_alert).
+    OUTBOUND_SWEEPER_RECOVERY_LIMIT_PER_TENANT: z.coerce.number().int().positive().default(500),
     // Feature flags do roadmap Maia v2
     FEATURE_P0_TENANT_GUARD_ENFORCED: z
       .string()
