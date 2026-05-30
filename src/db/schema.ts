@@ -436,6 +436,8 @@ export const series = pgTable(
   'series',
   {
     id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull().default('default'),
+    agent_id: text('agent_id').notNull().default('default'),
     tipo: text('tipo').notNull(),
     status: text('status').notNull().default('active'),
     version: integer('version').notNull().default(1),
@@ -453,7 +455,12 @@ export const series = pgTable(
     cancelled_at: timestamp('cancelled_at', { withTimezone: true }),
   },
   (t) => ({
-    by_owner_active: index('idx_series_active').on(t.owner_pessoa_id),
+    // Tenant/agent-led partial index (migration 073, no-tx). Leads with
+    // (tenant_id, agent_id) so soon-to-be tenant-scoped active-series
+    // lookups probe by tenant before owner. Partial on status='active'.
+    by_owner_active: index('idx_series_active')
+      .on(t.tenant_id, t.agent_id, t.owner_pessoa_id)
+      .where(sql`status = 'active'`),
   }),
 );
 
@@ -461,6 +468,8 @@ export const occurrences = pgTable(
   'occurrences',
   {
     id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull().default('default'),
+    agent_id: text('agent_id').notNull().default('default'),
     series_id: uuid('series_id').notNull(),
     scheduled_for: timestamp('scheduled_for', { withTimezone: true }).notNull(),
     status: text('status').notNull().default('pending'),
@@ -476,8 +485,20 @@ export const occurrences = pgTable(
   },
   (t) => ({
     by_series_sched: unique('occurrences_series_scheduled_uniq').on(t.series_id, t.scheduled_for),
-    by_due: index('idx_occurrences_due').on(t.scheduled_for),
+    // Tenant/agent-led partial "due" sweep index (migration 073, no-tx).
+    // scheduled_for stays last so the dispatcher's LIMIT walks due rows
+    // in order within a (tenant, agent) bucket. Partial on pending/claimed.
+    by_due: index('idx_occurrences_due')
+      .on(t.tenant_id, t.agent_id, t.scheduled_for)
+      .where(sql`status IN ('pending', 'claimed')`),
     by_series_status: index('idx_occurrences_series_status').on(t.series_id, t.status),
+    // Tenant/agent-led correlation-token lookup (migration 073, no-tx).
+    // Partial on rows actively awaiting a correlated reply.
+    by_correlation: index('idx_occurrences_correlation')
+      .on(t.tenant_id, t.agent_id, t.correlation_token)
+      .where(
+        sql`correlation_token IS NOT NULL AND status IN ('awaiting_third_party', 'in_progress')`,
+      ),
   }),
 );
 
@@ -485,6 +506,8 @@ export const tasks = pgTable(
   'tasks',
   {
     id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull().default('default'),
+    agent_id: text('agent_id').notNull().default('default'),
     occurrence_id: uuid('occurrence_id').notNull(),
     ordem: integer('ordem').notNull(),
     kind: text('kind').notNull(),
@@ -502,6 +525,8 @@ export const outbox_messages = pgTable(
   'outbox_messages',
   {
     id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull().default('default'),
+    agent_id: text('agent_id').notNull().default('default'),
     occurrence_id: uuid('occurrence_id'),
     task_id: uuid('task_id'),
     kind: text('kind').notNull(),
@@ -518,7 +543,12 @@ export const outbox_messages = pgTable(
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
-    by_due: index('idx_outbox_due').on(t.next_attempt_at),
+    // Tenant/agent-led partial relay "due" sweep index (migration 073,
+    // no-tx). next_attempt_at last so the relayer's LIMIT walks due rows
+    // in order within a (tenant, agent) bucket. Partial on pending/claimed.
+    by_due: index('idx_outbox_due')
+      .on(t.tenant_id, t.agent_id, t.next_attempt_at)
+      .where(sql`status IN ('pending', 'claimed')`),
   }),
 );
 
