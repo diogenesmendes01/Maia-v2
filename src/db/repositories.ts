@@ -3717,38 +3717,162 @@ export const workflowStepsRepo = {
 };
 
 export const entityStatesRepo = {
+  // Flip-readiness (#323, H4 of #355) — READ half of a read-then-write PAIR.
+  // `entity_states` carries NOT NULL `tenant_id` + `agent_id` (schema). The PK
+  // is `entidade_id` ALONE, so an id-only WHERE returns whatever single row owns
+  // that id REGARDLESS of tenant — a cross-tenant read. Worse, `lockdown.ts`
+  // feeds this row's `flags` straight back into `upsert` (read-then-write): an
+  // unscoped read there would let one tenant's lockdown snapshot be merged onto
+  // and re-written over another tenant's row. Scope the WHERE by tenant+agent
+  // (bound from ALS) so the read returns the row ONLY when it belongs to the
+  // running tuple. Returns null (not throw) on no-match: a missing/foreign
+  // entity is a legitimate not-found for a READ, and the live caller
+  // (`prompt-builder.ts` entityStateBlocks loop) already `continue`s on null.
+  // Caller audit (both run inside the agent turn's
+  // `runWithTenantContext({tenant_id, agent_id})`, except lockdown — see below):
+  //   - `agent/prompt-builder.ts` (entityStateBlocks): tenant-scoped. SAFE.
+  //   - `governance/lockdown.ts` (activate/liftLockdown): legacy emergency
+  //     governance with NO live entrypoint (no tRPC/CLI/worker wiring; only doc
+  //     references). It runs UNSCOPED raw `db` queries throughout and iterates
+  //     ALL `entity_states` globally, i.e. it predates tenant context and does
+  //     NOT establish one. Per the H4 contract we do NOT change callers; this is
+  //     REPORTED. If that dead path is ever wired up it will now throw
+  //     `MissingTenantContextError` here — which is the CORRECT fail-loud
+  //     outcome, since a cross-tenant entity_states write is exactly the bug H4
+  //     closes.
   async byId(entidade_id: string): Promise<EntityState | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const rows = await db
       .select()
       .from(entity_states)
-      .where(eq(entity_states.entidade_id, entidade_id))
+      .where(
+        and(
+          eq(entity_states.entidade_id, entidade_id),
+          eq(entity_states.tenant_id, tenant_id),
+          eq(entity_states.agent_id, agent_id),
+        ),
+      )
       .limit(1);
     return rows[0] ?? null;
   },
+  // Flip-readiness (#323, H4 of #355) — WRITE half of the read-then-write PAIR.
+  // The conflict target is the `entidade_id` PK only, and the OLD SET
+  // (`{ ...input, updated_at }`) did NOT re-stamp tenant/agent NOR gate the
+  // conflict on ownership. So if tenant-B already owns the row for a colliding
+  // `entidade_id`, a tenant-A `upsert` would conflict on the PK and DO UPDATE
+  // would OVERWRITE tenant-B's `contexto`/`flags` — a cross-tenant write. (PK
+  // global-uniqueness makes the collision improbable, but the isolation
+  // invariant is STRUCTURAL, not probabilistic — cf. procedureExecutionsRepo.findById.)
+  // FIX (two parts):
+  //   (1) INSERT stamps tenant_id+agent_id from ALS via `applyTenantGuard`
+  //       (throws on a tenant-mismatched explicit input; both columns NOT NULL).
+  //   (2) `onConflictDoUpdate.where` gates the UPDATE on tenant+agent so a
+  //       conflicting row owned by ANOTHER tenant is left untouched — it can
+  //       never overwrite a foreign row. The SET stays tenant-agnostic on
+  //       purpose: the WHERE already pins ownership, and the row's identity
+  //       columns must not move.
+  // FAIL-LOUD on 0 returned rows: with the INSERT now stamped, a 0-row result
+  // can ONLY mean the conflict fired AND the ownership WHERE rejected it — i.e.
+  // the `entidade_id` is already owned by a different tenant/agent. That is a
+  // cross-tenant collision the caller MUST see, not a silent no-op that would
+  // make it believe the state was persisted.
+  // Caller audit: `prompt-builder.ts` does NOT call upsert (read-only there).
+  // `governance/lockdown.ts` is the only upsert caller — same legacy-no-context
+  // caveat as `byId` above (REPORTED; not changed).
   async upsert(input: Partial<EntityState> & { entidade_id: string }): Promise<EntityState> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const guarded = applyTenantGuard({
+      ...input,
+      contexto: input.contexto ?? {},
+    });
+    // The conflict-arm SET must NEVER move the row's identity columns
+    // (`tenant_id`/`agent_id`/`entidade_id`). `applyTenantGuard` already
+    // validates them for the INSERT path; here we strip them from the SET so a
+    // (future) caller that passes `tenant_id` in `input` cannot re-stamp the
+    // running tenant's own row onto another tenant via the UPDATE branch.
+    const { tenant_id: _t, agent_id: _a, entidade_id: _e, ...updatable } = input as Record<string, unknown>;
+    void _t;
+    void _a;
+    void _e;
     const rows = await db
       .insert(entity_states)
-      .values({ entidade_id: input.entidade_id, contexto: input.contexto ?? {} })
+      .values(guarded as typeof entity_states.$inferInsert)
       .onConflictDoUpdate({
         target: entity_states.entidade_id,
-        set: { ...input, updated_at: new Date() },
+        set: { ...updatable, updated_at: new Date() },
+        where: and(
+          eq(entity_states.tenant_id, tenant_id),
+          eq(entity_states.agent_id, agent_id),
+        ),
       })
       .returning();
+    if (rows.length !== 1) {
+      throw new Error(
+        `entityStatesRepo.upsert matched ${rows.length} rows for entidade ${input.entidade_id} ` +
+          `under ${tenant_id}/${agent_id} — expected 1 (the entidade_id is already owned by a ` +
+          `different tenant/agent; the upsert would have either overwritten a foreign tenant's ` +
+          `entity_state or been silently dropped while reported as persisted)`,
+      );
+    }
     return rows[0]!;
   },
 };
 
 export const selfStateRepo = {
+  // Flip-readiness (#323, H4 of #355) — READ half of a read-then-write PAIR, and
+  // the more dangerous one. `self_state` carries NOT NULL `tenant_id` +
+  // `agent_id` (schema). The OLD WHERE filtered on `ativa = true` ALONE and
+  // ordered by `versao desc` — so once a second tenant exists it returns
+  // WHICHEVER tenant has the highest active `versao`, i.e. ANY tenant's active
+  // self_state. That row's `id` then feeds `appendLearning`'s UPDATE-by-id, so
+  // an unscoped read here causes a cross-tenant WRITE: one tenant's reflection
+  // learning appended onto another tenant's self_state. Scope the WHERE by
+  // tenant+agent (bound from ALS) so it returns ONLY the running tuple's active
+  // row. Returns null (not throw) on no-match: a tenant with no active
+  // self_state yet is legitimate, and every caller already handles null
+  // (`prompt-builder.ts` falls back to defaults; `appendLearning` early-returns).
+  // Caller audit (all live callers run inside the agent turn's
+  // `runWithTenantContext({tenant_id, agent_id})`):
+  //   - `agent/prompt-builder.ts` ×2 (legacy self_state fallback): tenant-scoped. SAFE.
+  //   - `appendLearning` (below, same repo): tenant-scoped when reached. SAFE.
+  // (NB: the many `operationalProfileVersionsRepo.getActive()` call sites are a
+  // DIFFERENT repo and unaffected.)
   async getActive(): Promise<SelfState | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const rows = await db
       .select()
       .from(self_state)
-      .where(eq(self_state.ativa, true))
+      .where(
+        and(
+          eq(self_state.tenant_id, tenant_id),
+          eq(self_state.agent_id, agent_id),
+          eq(self_state.ativa, true),
+        ),
+      )
       .orderBy(desc(self_state.versao))
       .limit(1);
     return rows[0] ?? null;
   },
+  // Flip-readiness (#323, H4 of #355) — WRITE half of the read-then-write PAIR.
+  // `active` now comes from the tenant-scoped `getActive` above, so `active.id`
+  // provably belongs to the running (tenant_id, agent_id) tuple. We STILL add the
+  // tenant+agent predicate to the UPDATE WHERE as defense-in-depth (the row id is
+  // already tenant-bound by the read, but binding the write makes the mutation
+  // tenant-safe on its own and matches the H1–H3 convention).
+  // Predicate-only (no fail-loud throw): `appendLearning` runs on a best-effort,
+  // fire-and-forget path — its sole live caller (`agent/reflection.ts`
+  // `reflectOnWorkflowCompletion`) wraps the whole call in `.catch(() =>
+  // undefined)`. A 0-row UPDATE here cannot happen in practice (the row was just
+  // read under the SAME scope in this same async context), and even if a
+  // concurrent deactivation raced it, dropping a single learning append is a
+  // benign no-op (not a correctness/money bug). So scope the WHERE but do not
+  // escalate to a throw — unlike the financial/lifecycle single-row writes.
   async appendLearning(learning: string): Promise<void> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const active = await this.getActive();
     if (!active) return;
     const prev = active.resumo_aprendizados ?? '';
@@ -3758,7 +3882,13 @@ export const selfStateRepo = {
     await db
       .update(self_state)
       .set({ resumo_aprendizados: trimmed })
-      .where(eq(self_state.id, active.id));
+      .where(
+        and(
+          eq(self_state.id, active.id),
+          eq(self_state.tenant_id, tenant_id),
+          eq(self_state.agent_id, agent_id),
+        ),
+      );
   },
 };
 
@@ -4288,10 +4418,45 @@ export const cognitiveCandidatesRepo = {
   },
 
   async markConsumed(id: string, phase: string): Promise<void> {
-    await db
+    // Flip-readiness (#323, H4 of #355) — tenant+agent scope the WHERE (bound
+    // from ALS), mirroring the already-scoped `listPending`. Both columns are
+    // NOT NULL (schema `cognitive_candidates`). The sole live caller
+    // (`workers/procedure-candidate-consumer.ts`) marks the EXACT candidate it
+    // just read via the tenant+agent-scoped `listPending('procedimento', 50)`,
+    // and does so inside the SAME `runWithTenantContext({tenant_id, agent_id})`
+    // it opened for that tenant — so the row provably belongs to the running
+    // tuple and the predicate matches it.
+    //
+    // FAIL-LOUD (throw on !=1): this transitions one specific, known-present
+    // candidate from 'pending' to 'consumed' (the worker's idempotency hinge —
+    // a consumed candidate is never re-processed). The id-only WHERE always
+    // matched, so a 0-row result under the new predicate can ONLY be a
+    // tenant/agent mismatch (cross-tenant misroute), never a benign no-op. A
+    // silent miss would leave the candidate 'pending' forever (re-drafted every
+    // run → duplicate procedure drafts) while the worker logged success — so
+    // surface it loudly. Same `.returning({id})` + `.length` idiom as
+    // `mensagensRepo.markProcessed`.
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const updated = await db
       .update(cognitive_candidates)
       .set({ status: 'consumed', consumed_by_phase: phase, consumed_at: new Date() })
-      .where(eq(cognitive_candidates.id, id));
+      .where(
+        and(
+          eq(cognitive_candidates.id, id),
+          eq(cognitive_candidates.tenant_id, tenant_id),
+          eq(cognitive_candidates.agent_id, agent_id),
+        ),
+      )
+      .returning({ id: cognitive_candidates.id });
+    if (updated.length !== 1) {
+      throw new Error(
+        `cognitiveCandidatesRepo.markConsumed matched ${updated.length} rows for candidate ${id} ` +
+          `under ${tenant_id}/${agent_id} — expected 1 (tenant/agent context does not match the ` +
+          `target candidate; the consume would have been silently lost, leaving it pending and ` +
+          `re-processed every run while reported as consumed)`,
+      );
+    }
   },
 
   /**
@@ -4438,10 +4603,43 @@ export const memoryEntryRepo = {
       updates.ttl_days != null
         ? new Date(Date.now() + updates.ttl_days * 24 * 60 * 60 * 1000)
         : null;
-    await db
+    // Flip-readiness (#323, H4 of #355) — tenant+agent scope the WHERE (bound
+    // from ALS), mirroring the already-scoped `findRelevant` / `listNeedsReview`.
+    // Both columns are NOT NULL (schema `memory_entry`). The sole live caller
+    // (`workers/legacy-memory-reclassifier.ts`) updates the EXACT entry it just
+    // read via the tenant+agent-scoped `listNeedsReview(100)`, inside the SAME
+    // `runWithTenantContext({tenant_id, agent_id})` it opened for that tenant —
+    // so the row provably belongs to the running tuple and the predicate matches.
+    //
+    // FAIL-LOUD (throw on !=1): this promotes one specific, known-present entry
+    // OUT of `needs_review` (computing its `expires_at` so the TTL filter can
+    // evict it). The id-only WHERE always matched, so a 0-row result under the
+    // new predicate can ONLY be a tenant/agent mismatch (cross-tenant misroute),
+    // never a benign no-op. A silent miss would leave the memory stuck in
+    // needs_review=true (permanently hidden from the prompt) while the worker
+    // logged it reclassified — so surface it loudly. Same `.returning({id})` +
+    // `.length` idiom as `mensagensRepo.markProcessed`.
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const updated = await db
       .update(memory_entry)
       .set({ ...updates, expires_at, needs_review: false, updated_at: new Date() })
-      .where(eq(memory_entry.id, id));
+      .where(
+        and(
+          eq(memory_entry.id, id),
+          eq(memory_entry.tenant_id, tenant_id),
+          eq(memory_entry.agent_id, agent_id),
+        ),
+      )
+      .returning({ id: memory_entry.id });
+    if (updated.length !== 1) {
+      throw new Error(
+        `memoryEntryRepo.markReviewed matched ${updated.length} rows for memory ${id} ` +
+          `under ${tenant_id}/${agent_id} — expected 1 (tenant/agent context does not match the ` +
+          `target memory; the review would have been silently lost, leaving it stuck in ` +
+          `needs_review and hidden from the prompt while reported as reclassified)`,
+      );
+    }
   },
 
   async listNeedsReview(limit = 100): Promise<MemoryEntry[]> {
@@ -4521,10 +4719,43 @@ export const behavioralHintRepo = {
   },
 
   async revoke(id: string): Promise<void> {
-    await db
+    // Flip-readiness (#323, H4 of #355) — tenant+agent scope the WHERE (bound
+    // from ALS), mirroring the already-scoped `findActiveForScope`. Both columns
+    // are NOT NULL (schema `behavioral_hint`). This method has NO live caller in
+    // `src` today (it is part of the repo's governance surface for revoking a
+    // hint by id); because it now READS ALS, any FUTURE caller MUST run inside
+    // `runWithTenantContext` (an unwrapped caller throws MissingTenantContextError
+    // — the intended fail-closed contract for a tenant-owned write).
+    //
+    // FAIL-LOUD (throw on !=1): revoking a hint sets `revoked_at`, removing it
+    // from every LLM-facing read (`findActiveForScope` filters `revoked_at IS
+    // NULL`). A revoke targets one specific, operator-/caller-identified hint id;
+    // a 0-row result under the new predicate means that id is NOT owned by the
+    // running tenant/agent — a cross-tenant revoke attempt that must be surfaced,
+    // not silently swallowed (which would report a sensitive hint as revoked
+    // while it stayed live for its real owner). Same `.returning({id})` +
+    // `.length` idiom as `mensagensRepo.markProcessed`.
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const updated = await db
       .update(behavioral_hint)
       .set({ revoked_at: new Date() })
-      .where(eq(behavioral_hint.id, id));
+      .where(
+        and(
+          eq(behavioral_hint.id, id),
+          eq(behavioral_hint.tenant_id, tenant_id),
+          eq(behavioral_hint.agent_id, agent_id),
+        ),
+      )
+      .returning({ id: behavioral_hint.id });
+    if (updated.length !== 1) {
+      throw new Error(
+        `behavioralHintRepo.revoke matched ${updated.length} rows for hint ${id} ` +
+          `under ${tenant_id}/${agent_id} — expected 1 (tenant/agent context does not match the ` +
+          `target hint; the revoke would have been silently lost while the hint stayed live for ` +
+          `its real owner)`,
+      );
+    }
   },
 };
 
@@ -5117,10 +5348,43 @@ export const procedureAssignmentsRepo = {
   },
 
   async disable(id: string): Promise<void> {
-    await db
+    // Flip-readiness (#323, H4 of #355) — TENANT-ONLY scope. NOTE: the
+    // `procedure_assignments` table has a `tenant_id` column but NO `agent_id`
+    // column (schema) — assignments are tenant-scoped, not agent-scoped (the
+    // agent dimension lives on the referenced `procedure_definitions`, which
+    // `create` cross-checks). So this WHERE binds `tenant_id` ONLY, exactly
+    // matching the already-scoped `listForTarget` / `create` on this same table.
+    // `tenant_id` is NOT NULL. This method has NO live caller in `src` today
+    // (repo governance surface); because it now READS ALS, any FUTURE caller MUST
+    // run inside `runWithTenantContext` (an unwrapped caller throws
+    // MissingTenantContextError).
+    //
+    // FAIL-LOUD (throw on !=1): disabling sets `enabled=false` + `deactivated_at`
+    // on one specific assignment id, removing it from `listForTarget` (which
+    // filters `enabled=true`). A 0-row result under the tenant predicate means
+    // the id is NOT owned by the running tenant — a cross-tenant disable that
+    // must be surfaced, not silently swallowed (which would report the
+    // assignment as disabled while it stayed active for its real owner). Same
+    // `.returning({id})` + `.length` idiom as `mensagensRepo.markProcessed`.
+    const tenant_id = getCurrentTenant();
+    const updated = await db
       .update(procedure_assignments)
       .set({ enabled: false, deactivated_at: new Date() })
-      .where(eq(procedure_assignments.id, id));
+      .where(
+        and(
+          eq(procedure_assignments.id, id),
+          eq(procedure_assignments.tenant_id, tenant_id),
+        ),
+      )
+      .returning({ id: procedure_assignments.id });
+    if (updated.length !== 1) {
+      throw new Error(
+        `procedureAssignmentsRepo.disable matched ${updated.length} rows for assignment ${id} ` +
+          `under tenant ${tenant_id} — expected 1 (tenant context does not match the target ` +
+          `assignment; the disable would have been silently lost while the assignment stayed ` +
+          `active for its real owner)`,
+      );
+    }
   },
 };
 
@@ -5453,7 +5717,24 @@ export const procedureTestsRepo = {
     status: 'pass' | 'fail' | 'error' | 'skipped';
     details: unknown;
   }): Promise<void> {
-    await db
+    // Flip-readiness (#323, H4 of #355) — tenant+agent scope the WHERE (bound
+    // from ALS), mirroring the already-scoped `listByDefinition` / `allPassFor`.
+    // Both columns are NOT NULL (schema `procedure_tests`). The test id passed
+    // here is always one the caller obtained from a tenant+agent-scoped read
+    // (`create` / `listByDefinition`) within the same tenant context, so the row
+    // belongs to the running tuple and the predicate matches it.
+    //
+    // FAIL-LOUD (throw on !=1): `recordRun` stamps one specific test's
+    // last_run_status, which directly gates `allPassFor` (the proposed→active
+    // promotion gate). A 0-row result under the new predicate can ONLY be a
+    // tenant/agent mismatch (cross-tenant misroute), never a benign no-op. A
+    // silent miss would leave the test's status stale, corrupting the promotion
+    // gate (a procedure could be promoted on a never-updated 'pass', or blocked
+    // forever) while reporting the run as recorded — so surface it loudly. Same
+    // `.returning({id})` + `.length` idiom as `mensagensRepo.markProcessed`.
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const updated = await db
       .update(procedure_tests)
       .set({
         last_run_at: new Date(),
@@ -5461,7 +5742,22 @@ export const procedureTestsRepo = {
         last_run_details: args.details as object,
         updated_at: new Date(),
       })
-      .where(eq(procedure_tests.id, args.id));
+      .where(
+        and(
+          eq(procedure_tests.id, args.id),
+          eq(procedure_tests.tenant_id, tenant_id),
+          eq(procedure_tests.agent_id, agent_id),
+        ),
+      )
+      .returning({ id: procedure_tests.id });
+    if (updated.length !== 1) {
+      throw new Error(
+        `procedureTestsRepo.recordRun matched ${updated.length} rows for test ${args.id} ` +
+          `under ${tenant_id}/${agent_id} — expected 1 (tenant/agent context does not match the ` +
+          `target test; the run would have been silently lost, leaving last_run_status stale and ` +
+          `corrupting the proposed→active promotion gate while reported as recorded)`,
+      );
+    }
   },
 
   // True iff there's >=1 test AND ALL have last_run_status='pass'.
@@ -5482,7 +5778,39 @@ export const procedureTestsRepo = {
   },
 
   async delete(id: string): Promise<void> {
-    await db.delete(procedure_tests).where(eq(procedure_tests.id, id));
+    // Flip-readiness (#323, H4 of #355) — tenant+agent scope the WHERE (bound
+    // from ALS), mirroring the already-scoped `listByDefinition` / `allPassFor`.
+    // Both columns are NOT NULL (schema `procedure_tests`). The id passed here is
+    // always one the caller obtained from a tenant+agent-scoped read within the
+    // same tenant context, so the row belongs to the running tuple. This is a
+    // DELETE — without the predicate an id-only WHERE could remove ANOTHER
+    // tenant's test row entirely (irreversible cross-tenant data loss).
+    //
+    // FAIL-LOUD (throw on !=1): a delete targets one specific, known-present test
+    // id. A 0-row result under the new predicate can ONLY be a tenant/agent
+    // mismatch (cross-tenant misroute), never a benign no-op. A silent miss would
+    // report the test as deleted while it survived for its real owner — so
+    // surface it loudly. Same `.returning({id})` + `.length` idiom as
+    // `mensagensRepo.markProcessed`, applied to DELETE.
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const deleted = await db
+      .delete(procedure_tests)
+      .where(
+        and(
+          eq(procedure_tests.id, id),
+          eq(procedure_tests.tenant_id, tenant_id),
+          eq(procedure_tests.agent_id, agent_id),
+        ),
+      )
+      .returning({ id: procedure_tests.id });
+    if (deleted.length !== 1) {
+      throw new Error(
+        `procedureTestsRepo.delete matched ${deleted.length} rows for test ${id} ` +
+          `under ${tenant_id}/${agent_id} — expected 1 (tenant/agent context does not match the ` +
+          `target test; the delete would have been silently lost while reported as deleted)`,
+      );
+    }
   },
 };
 

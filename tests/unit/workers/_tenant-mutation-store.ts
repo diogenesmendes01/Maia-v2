@@ -318,6 +318,13 @@ export interface TenantScopedUpdateStore {
     update: (...args: unknown[]) => unknown;
     select: (...args: unknown[]) => unknown;
     execute: (...args: unknown[]) => unknown;
+    // Issue #355 (H4 of #323) — DELETE + INSERT…ON CONFLICT paths, added for the
+    // state/memory mutations whose single-row writes are a DELETE
+    // (`procedureTestsRepo.delete`) or a read-then-write upsert
+    // (`entityStatesRepo.upsert`). Additive: existing specs use only the three
+    // above and are unaffected.
+    delete: (...args: unknown[]) => unknown;
+    insert: (...args: unknown[]) => unknown;
   };
   /** Live rows (mutated in place by applied UPDATEs). */
   rows: StoreRow[];
@@ -327,6 +334,14 @@ export interface TenantScopedUpdateStore {
   lastSelectPredicate: () => unknown;
   /** The `Term[]` parsed from the most recent raw `execute(sql\`…\`)` UPDATE. */
   lastExecuteTerms: () => Term[] | undefined;
+  /** The drizzle predicate captured from the most recent DELETE `.where(...)`. */
+  lastDeletePredicate: () => unknown;
+  /**
+   * The drizzle predicate captured from the most recent
+   * `insert(...).onConflictDoUpdate({ where })` — i.e. the conflict-arm
+   * ownership gate (#355 H4 `entityStatesRepo.upsert`).
+   */
+  lastConflictWherePredicate: () => unknown;
   /** Reset rows + captured predicates. */
   reset: (rows: StoreRow[]) => void;
 }
@@ -348,6 +363,8 @@ export function makeTenantScopedUpdateStore(
   let captured: unknown = undefined;
   let capturedSelect: unknown = undefined;
   let capturedExecuteTerms: Term[] | undefined = undefined;
+  let capturedDelete: unknown = undefined;
+  let capturedConflictWhere: unknown = undefined;
 
   const applyUpdate = (patch: Record<string, unknown>, predicate: unknown): StoreRow[] => {
     captured = predicate;
@@ -437,22 +454,98 @@ export function makeTenantScopedUpdateStore(
     return { rows: matched.map((r) => ({ id: r.id })) };
   });
 
+  // DELETE path — `db.delete(table).where(pred).returning(selection)`. Used by
+  // `procedureTestsRepo.delete` (#355 H4). REMOVES only the rows matching the
+  // evaluated drizzle predicate — so a missing tenant/agent binding in the WHERE
+  // would delete other tenants' rows (irreversible cross-tenant data loss) and
+  // the isolation assertion would catch it, exactly as the UPDATE path does.
+  // Returns the deleted rows' `{ id }` for the repo's `.returning({id})` +
+  // `.length` fail-loud check.
+  const del = vi.fn((_table: unknown) => ({
+    where: (predicate: unknown) => {
+      capturedDelete = predicate;
+      const terms = parsePredicate(predicate);
+      const matched: StoreRow[] = [];
+      const survivors: StoreRow[] = [];
+      for (const row of rows) {
+        if (rowMatches(row, terms, now)) matched.push(row);
+        else survivors.push(row);
+      }
+      rows = survivors;
+      return {
+        returning: async (_selection?: unknown) => matched.map((r) => ({ id: r.id })),
+        then: (
+          resolve: (v: { rowCount: number }) => unknown,
+          reject?: (e: unknown) => unknown,
+        ) => Promise.resolve({ rowCount: matched.length }).then(resolve, reject),
+      };
+    },
+  }));
+
+  // INSERT … ON CONFLICT DO UPDATE path — `db.insert(table).values(v)
+  // .onConflictDoUpdate({ target, set, where }).returning()`. Used by
+  // `entityStatesRepo.upsert` (#355 H4 read-then-write pair). Models the
+  // `entidade_id` PK conflict precisely so the test proves the conflict arm
+  // cannot overwrite a FOREIGN tenant's row:
+  //   - no existing row with the same `entidade_id` → INSERT the new values;
+  //   - an existing row with that `entidade_id`:
+  //       * apply the SET ONLY when the captured `onConflictDoUpdate.where`
+  //         predicate matches the EXISTING row (the tenant+agent ownership gate);
+  //       * otherwise the conflict arm is rejected → 0 rows returned (the foreign
+  //         row is left byte-for-byte untouched), which the repo turns into its
+  //         FAIL-LOUD throw.
+  // The conflict key is the `entidade_id` field on the inserted values (the PK).
+  const insert = vi.fn((_table: unknown) => ({
+    values: (vals: Record<string, unknown>) => ({
+      onConflictDoUpdate: (cfg: {
+        target?: unknown;
+        set?: Record<string, unknown>;
+        where?: unknown;
+      }) => ({
+        returning: async (_selection?: unknown) => {
+          const key = vals.entidade_id;
+          const existing = rows.find((r) => r.entidade_id === key);
+          if (!existing) {
+            const inserted: StoreRow = { ...(vals as StoreRow) };
+            rows.push(inserted);
+            return [{ ...inserted }];
+          }
+          // Conflict: gate the SET on the ownership WHERE (if any).
+          capturedConflictWhere = cfg.where;
+          const gateOk =
+            cfg.where === undefined
+              ? true
+              : rowMatches(existing, parsePredicate(cfg.where), now);
+          if (!gateOk) return []; // foreign row — reject, leave untouched
+          Object.assign(existing, cfg.set ?? {});
+          return [{ ...existing }];
+        },
+      }),
+    }),
+  }));
+
   return {
-    db: { update, select, execute },
+    db: { update, select, execute, delete: del, insert },
     get rows() {
       return rows;
     },
     lastPredicate: () => captured,
     lastSelectPredicate: () => capturedSelect,
     lastExecuteTerms: () => capturedExecuteTerms,
+    lastDeletePredicate: () => capturedDelete,
+    lastConflictWherePredicate: () => capturedConflictWhere,
     reset: (next: StoreRow[]) => {
       rows = next.map((r) => ({ ...r }));
       captured = undefined;
       capturedSelect = undefined;
       capturedExecuteTerms = undefined;
+      capturedDelete = undefined;
+      capturedConflictWhere = undefined;
       update.mockClear();
       select.mockClear();
       execute.mockClear();
+      del.mockClear();
+      insert.mockClear();
     },
   };
 }
