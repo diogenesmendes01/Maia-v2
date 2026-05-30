@@ -1,10 +1,42 @@
 import { listOwners } from '@/governance/permissions.js';
-import { entidadesRepo, contasRepo, transacoesRepo } from '@/db/repositories.js';
+import { entidadesRepo, contasRepo, transacoesRepo, pessoasRepo } from '@/db/repositories.js';
 import { sendOutboundText } from '@/gateway/baileys.js';
 import { fmtBR } from '@/lib/brazilian.js';
 import { logger } from '@/lib/logger.js';
 import { fmtBRL, sumDecimal } from '@/lib/decimal.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
+
+/**
+ * Issue #345 (Phase 4 of #323) — per-tenant fan-out for the 3 briefing workers
+ * (`briefing_morning` / `briefing_evening` / `briefing_weekly`).
+ *
+ * BEFORE: each of `runMorningBriefing` / `runEveningBriefing` /
+ * `runWeeklyBriefing` opened a HARDCODED
+ * `runWithTenantContext({ tenant_id: 'default', agent_id: 'default' })` and ran
+ * its inner (build financial briefing + send to owners) ONCE. Under a
+ * multi-tenant deployment only the `default` agent's owners were ever briefed —
+ * every real tenant's owner silently got NO morning/evening/weekly briefing.
+ *
+ * AFTER: each worker is a DISPATCHER. It enumerates — OUTSIDE any tenant context
+ * — the DISTINCT (tenant_id, agent_id) tuples that own at least one ACTIVE owner
+ * pessoa (`pessoasRepo.listTenantAgentPairsWithActiveOwner`, whose predicate
+ * mirrors `listOwners()` exactly), then runs the period's inner ONCE PER tuple
+ * inside `runWithTenantContext`. Each inner's financial reads
+ * (`entidadesRepo.list`, `contasRepo.byEntity`, `transacoesRepo.byScope`) and its
+ * `sendToOwners()` recipient lookup (`listOwners` → `pessoasRepo.list`) are ALL
+ * scoped to the ALS (tenant_id, agent_id) of the running tuple, so a briefing
+ * built for tuple A reads ONLY tenant A's data and is sent ONLY to tenant A's
+ * owners — the inviolable cross-tenant isolation invariant. (A cross-tenant leak
+ * here would send one tenant's financial data to another tenant's owner.)
+ *
+ * Behavior-preserving in single-tenant mode: when the only active owner lives
+ * under `('default','default')`, the enumeration yields exactly that one tuple,
+ * so each briefing still runs once under default. Fail-isolated per tuple
+ * (mirrors conversation-summarizer #350 / pattern-detector #351): a throw under
+ * one tuple must not abort the others.
+ */
+
+type Pair = { tenant_id: string; agent_id: string };
 
 async function buildOwnerBriefing(): Promise<string> {
   const ents = await entidadesRepo.list();
@@ -58,6 +90,10 @@ async function buildWeeklyBriefing(): Promise<string> {
 }
 
 async function sendToOwners(text: string): Promise<void> {
+  // `listOwners()` → `pessoasRepo.list()` is scoped to the CURRENT ALS
+  // (tenant_id, agent_id), so under a per-tuple briefing run this resolves ONLY
+  // the running tuple's active owners — the briefing can never be addressed to
+  // another tenant's owner.
   const owners = await listOwners();
   for (const o of owners) {
     const jid = o.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
@@ -67,27 +103,79 @@ async function sendToOwners(text: string): Promise<void> {
   }
 }
 
+/**
+ * Shared dispatcher for the 3 periodic briefings. Enumerates the tuples with an
+ * active owner OUTSIDE any tenant context, then runs `inner` once per tuple
+ * under that tuple's context. `inner` builds the period's briefing (financial
+ * reads scoped to ALS) and sends it to that tuple's owners. Fail-isolated per
+ * tuple; the `period` label keys the per-period idle/done logs.
+ */
+async function dispatchBriefing(
+  period: 'morning' | 'evening' | 'weekly',
+  inner: () => Promise<void>,
+): Promise<void> {
+  const tuples: Pair[] = await pessoasRepo.listTenantAgentPairsWithActiveOwner();
+
+  if (tuples.length === 0) {
+    logger.debug(`briefing.${period}.idle`);
+    return;
+  }
+
+  let agents_processed = 0;
+  let agents_failed = 0;
+
+  for (const { tenant_id, agent_id } of tuples) {
+    try {
+      await runWithTenantContext({ tenant_id, agent_id }, inner);
+      agents_processed++;
+    } catch (err) {
+      // Fail-isolated per (tenant, agent): a throw under one tuple must not
+      // abort the briefing for the others.
+      agents_failed++;
+      logger.warn(
+        {
+          tenant_id,
+          agent_id,
+          err: (err as Error).message,
+          stack: (err as Error).stack,
+        },
+        `briefing.${period}.agent_failed`,
+      );
+    }
+  }
+
+  logger.info(
+    { tuples: tuples.length, agents_processed, agents_failed },
+    `briefing.${period}.done`,
+  );
+}
+
+async function runMorningBriefingInner(): Promise<void> {
+  const text = await buildOwnerBriefing();
+  await sendToOwners(text);
+  logger.info('briefing.morning.sent');
+}
+
+async function runEveningBriefingInner(): Promise<void> {
+  const text = await buildEveningBriefing();
+  await sendToOwners(text);
+  logger.info('briefing.evening.sent');
+}
+
+async function runWeeklyBriefingInner(): Promise<void> {
+  const text = await buildWeeklyBriefing();
+  await sendToOwners(text);
+  logger.info('briefing.weekly.sent');
+}
+
 export async function runMorningBriefing(): Promise<void> {
-  // P0: single-tenant default. P6 will fan-out per tenant.
-  await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
-    const text = await buildOwnerBriefing();
-    await sendToOwners(text);
-    logger.info('briefing.morning.sent');
-  });
+  await dispatchBriefing('morning', runMorningBriefingInner);
 }
 
 export async function runEveningBriefing(): Promise<void> {
-  await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
-    const text = await buildEveningBriefing();
-    await sendToOwners(text);
-    logger.info('briefing.evening.sent');
-  });
+  await dispatchBriefing('evening', runEveningBriefingInner);
 }
 
 export async function runWeeklyBriefing(): Promise<void> {
-  await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
-    const text = await buildWeeklyBriefing();
-    await sendToOwners(text);
-    logger.info('briefing.weekly.sent');
-  });
+  await dispatchBriefing('weekly', runWeeklyBriefingInner);
 }
