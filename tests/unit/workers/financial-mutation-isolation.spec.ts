@@ -72,6 +72,20 @@ function expectBoundTenantAgent(): void {
   expect(terms).toContainEqual({ kind: 'eq', column: 'agent_id', value: 'agent-A' });
 }
 
+/**
+ * #364 review blocker 1 — the FINANCIAL pre-write READ `contasRepo.byId` is now
+ * tenant+agent scoped too (an unscoped read would let a cross-tenant/misrouted
+ * account id load and pass the register-transaction pre-check, tripping the
+ * scoped `addToBalance` guard only AFTER the ledger row committed). This asserts
+ * the SELECT path bound BOTH tenant + agent (revert-check: dropping either term
+ * fails here even if a given seed happened to filter correctly).
+ */
+function expectSelectBoundTenantAgent(): void {
+  const terms = parsePredicateForTest(store.lastSelectPredicate());
+  expect(terms).toContainEqual({ kind: 'eq', column: 'tenant_id', value: 'tenant-A' });
+  expect(terms).toContainEqual({ kind: 'eq', column: 'agent_id', value: 'agent-A' });
+}
+
 // A `contas_bancarias` row. `saldo_atual` is a NUMBER sentinel so we can prove a
 // foreign row was untouched: the store's `Object.assign(row, patch)` overwrites a
 // MATCHED row's `saldo_atual` with the `sql\`saldo_atual + delta\`` node (not a
@@ -173,5 +187,43 @@ describe('#355 H3 — transacoesRepo.update() patches ONLY the current tenant/ag
     ).rejects.toThrow(/update matched 0 rows/);
     // tenant-B's transaction was NOT touched by the failed tenant-A call.
     expect(store.rows.find((r) => r.id === 'b-only')!.status).toBe('paga');
+  });
+});
+
+describe('#364 blocker 1 — contasRepo.byId() reads ONLY the current tenant/agent', () => {
+  it('returns null for a cross-tenant account id (no pre-write leak)', async () => {
+    // Only tenant-B owns the id. The register-transaction pre-check loads the
+    // conta via byId BEFORE the balance write; an id-only SELECT would return
+    // tenant-B's account here and let the flow proceed until the now-scoped
+    // addToBalance tripped — AFTER the ledger row committed. With byId scoped, a
+    // foreign account simply does not load → the tool returns conta_not_found and
+    // never creates the transaction.
+    store.reset([contaRow({ id: 'b-only', tenant_id: 'tenant-B', agent_id: 'agent-B', saldo_atual: 200 })]);
+    const { contasRepo } = await import('@/db/repositories.js');
+
+    const found = await runWithTenantContext(A, () => contasRepo.byId('b-only'));
+
+    expect(found).toBeNull(); // cross-tenant id does NOT leak through the read
+    expectSelectBoundTenantAgent();
+  });
+
+  it('returns the row for an id owned by the current tenant/agent', async () => {
+    // Same id present for three tuples; running under tenant-A must return ONLY
+    // tenant-A/agent-A's row (never tenant-B's or other-agent's), proving the
+    // (tenant_id, agent_id) tuple — not id alone — selects the account.
+    store.reset([
+      contaRow({ id: 'shared', tenant_id: 'tenant-A', agent_id: 'agent-A', saldo_atual: 100 }),
+      contaRow({ id: 'shared', tenant_id: 'tenant-B', agent_id: 'agent-B', saldo_atual: 200 }),
+      contaRow({ id: 'shared', tenant_id: 'tenant-A', agent_id: 'agent-Z', saldo_atual: 300 }),
+    ]);
+    const { contasRepo } = await import('@/db/repositories.js');
+
+    const found = await runWithTenantContext(A, () => contasRepo.byId('shared'));
+
+    expect(found).not.toBeNull();
+    expect(found!.tenant_id).toBe('tenant-A');
+    expect(found!.agent_id).toBe('agent-A');
+    expect(found!.saldo_atual).toBe(100); // tenant-A's row, not B's (200) or Z's (300)
+    expectSelectBoundTenantAgent();
   });
 });
