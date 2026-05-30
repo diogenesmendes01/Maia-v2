@@ -3200,6 +3200,33 @@ export const workflowsRepo = {
         sql`status IN ('pendente','em_andamento','aguardando_humano','aguardando_terceiro')`,
       ));
   },
+  /**
+   * Issue #345 (Phase 4 of #323) — enumeration source for the
+   * `workflow_engine_tick` dispatcher.
+   *
+   * Returns the DISTINCT (tenant_id, agent_id) tuples that own at least one
+   * workflow in a status `tickEngine()` would process. The status set MUST stay
+   * in lock-step with `listPending()` above (the engine's own "which workflows
+   * are due" filter) — otherwise the dispatcher would UNDER-enumerate and a
+   * tenant with due workflows would silently never get a tick. Read-only and
+   * runs OUTSIDE any tenant context (the dispatcher calls it before opening
+   * `runWithTenantContext` per tuple), so it cannot itself use the ALS getters;
+   * it partitions the table by its own (tenant_id, agent_id) columns instead.
+   */
+  async listTenantAgentPairsWithActiveWorkflows(): Promise<
+    Array<{ tenant_id: string; agent_id: string }>
+  > {
+    const result = await db.execute<{ tenant_id: string; agent_id: string }>(sql`
+      SELECT DISTINCT tenant_id, agent_id
+      FROM ${workflows}
+      WHERE tenant_id IS NOT NULL
+        AND agent_id IS NOT NULL
+        AND status IN ('pendente', 'em_andamento', 'aguardando_humano', 'aguardando_terceiro')
+    `);
+    return Array.from(
+      result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>,
+    );
+  },
 };
 
 export const workflowStepsRepo = {
@@ -3211,10 +3238,26 @@ export const workflowStepsRepo = {
     return db.insert(workflow_steps).values(guarded).returning();
   },
   async byWorkflow(workflow_id: string): Promise<WorkflowStep[]> {
+    // Issue #345 (Phase 4 of #323) inner-scoping audit: `workflow_steps` carries
+    // BOTH tenant_id and agent_id (schema.ts), and this SELECT is reached from
+    // the per-tenant `workflow_engine_tick` dispatcher via `tickEngine()`. Before
+    // this fix the WHERE clause filtered ONLY by `workflow_id`, relying on the
+    // caller having fetched the parent workflow within its own tenant. That is an
+    // implicit, ALS-passthrough scoping — exactly the gap Batches A/C found to be
+    // a real leak in sibling repos. Bind tenant_id + agent_id explicitly from the
+    // ALS so the steps read can NEVER surface another tenant's rows, even if the
+    // workflow_id were ever guessed/reused across tenants. TENANT ISOLATION IS
+    // THE INVIOLABLE INVARIANT.
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     return db
       .select()
       .from(workflow_steps)
-      .where(eq(workflow_steps.workflow_id, workflow_id))
+      .where(and(
+        eq(workflow_steps.tenant_id, tenant_id),
+        eq(workflow_steps.agent_id, agent_id),
+        eq(workflow_steps.workflow_id, workflow_id),
+      ))
       .orderBy(workflow_steps.ordem);
   },
 };
