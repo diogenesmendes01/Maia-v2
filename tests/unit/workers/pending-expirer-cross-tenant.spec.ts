@@ -25,11 +25,29 @@
  *   4. Behavior-preserving in single-tenant mode; empty enumeration → no-op;
  *      fail-isolated per tuple.
  *
- * Strategy: mock `@/db/repositories.js` for the enumeration and the two workflow
- * modules so each inner call captures the ACTIVE tenant context.
+ *   5. MUTATION ISOLATION (the test that would have caught the #345 review bug):
+ *      `pendingQuestionsRepo.expireDue()`'s UPDATE is scoped to the CURRENT
+ *      (tenant_id, agent_id). Running it under tenant-A's context expires ONLY
+ *      tenant-A's due pending_questions and leaves tenant-B's rows UNTOUCHED —
+ *      proved against an in-memory store keyed by tenant whose UPDATE is applied
+ *      via the REAL drizzle WHERE predicate (so the bound tenant/agent params
+ *      are exercised, not asserted away). Before the fix the predicate carried
+ *      no tenant binding, so tenant-B's due row would have been expired too.
+ *
+ * Strategy: the DISPATCH-routing block mocks `@/db/repositories.js` for the
+ * enumeration and the two workflow modules so each inner call captures the
+ * ACTIVE tenant context. The MUTATION-ISOLATION block instead drives the REAL
+ * `pendingQuestionsRepo.expireDue()` (kept via `importOriginal`; only the
+ * enumeration helper is overridden) against a store-backed `@/db/client.js`
+ * mock that evaluates the actual drizzle predicate.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { runWithTenantContext, tryGetCurrentContext } from '@/db/tenant-context.js';
+import {
+  makeTenantScopedUpdateStore,
+  parsePredicate as parsePredicateForTest,
+  type StoreRow,
+} from './_tenant-mutation-store.js';
 
 type Pair = { tenant_id: string; agent_id: string };
 
@@ -62,11 +80,29 @@ const expireDualMock = vi.fn(async (): Promise<number> => {
   return dualCountByTuple[key] ?? 0;
 });
 
-vi.mock('@/db/repositories.js', () => ({
-  pendingQuestionsRepo: {
-    listTenantAgentPairsWithDueExpirations: listDuePairsMock,
-  },
+// In-memory, tenant-keyed store standing in for `@/db/client.js`. The REAL
+// `pendingQuestionsRepo.expireDue()` runs its drizzle UPDATE against this in the
+// MUTATION-ISOLATION block; the DISPATCH-routing block never touches it (it
+// mocks `expireAll`), so the store stays dormant there.
+const mutationStore = makeTenantScopedUpdateStore();
+
+vi.mock('@/db/client.js', () => ({
+  db: mutationStore.db,
+  withTx: async (fn: (tx: unknown) => unknown) => fn(mutationStore.db),
 }));
+
+// Keep the REAL repo (so `expireDue`'s WHERE predicate is exercised) and
+// override ONLY the dispatcher-enumeration helper used by the routing tests.
+vi.mock('@/db/repositories.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/db/repositories.js')>();
+  return {
+    ...actual,
+    pendingQuestionsRepo: {
+      ...actual.pendingQuestionsRepo,
+      listTenantAgentPairsWithDueExpirations: listDuePairsMock,
+    },
+  };
+});
 
 vi.mock('@/workflows/pending-questions.js', () => ({
   expireAll: expireAllMock,
@@ -198,5 +234,78 @@ describe('Issue #345 — runPendingExpirer is per-tenant scoped (no default/defa
 
     expect(expireAllContexts).toEqual([B]);
     expect(expireDualContexts).toEqual([B]);
+  });
+});
+
+/**
+ * MUTATION ISOLATION — exercises the REAL `pendingQuestionsRepo.expireDue()`
+ * UPDATE against an in-memory store keyed by tenant. This is the regression
+ * lever for the #345 review finding: the worker now runs `expireDue` per
+ * enumerated tuple, so its WHERE clause MUST be scoped to the current
+ * (tenant_id, agent_id) or it would expire every tenant's due rows on the first
+ * pass. The store applies the UPDATE by evaluating the actual drizzle predicate,
+ * so a missing tenant binding is observable as tenant-B's rows being mutated.
+ */
+describe('Issue #345 — pendingQuestionsRepo.expireDue() expires ONLY the current tenant/agent', () => {
+  // A row helper: due (past `expira_em`) + `aberta` unless overridden.
+  const PAST = new Date(Date.now() - 60_000).toISOString();
+  const FUTURE = new Date(Date.now() + 3_600_000).toISOString();
+  const dueRow = (over: Partial<StoreRow>): StoreRow => ({
+    id: 'pq',
+    tenant_id: 'tenant-A',
+    agent_id: 'agent-A',
+    status: 'aberta',
+    expira_em: PAST,
+    ...over,
+  });
+
+  beforeEach(() => {
+    mutationStore.reset([
+      // Tenant A: one due+open question (SHOULD expire when running as A).
+      dueRow({ id: 'A-due', tenant_id: 'tenant-A', agent_id: 'agent-A' }),
+      // Tenant B: same shape, different tenant (MUST stay untouched).
+      dueRow({ id: 'B-due', tenant_id: 'tenant-B', agent_id: 'agent-B' }),
+      // Tenant A but a DIFFERENT agent (MUST stay untouched — scoping is by the
+      // full (tenant_id, agent_id) tuple the enumeration partitions on).
+      dueRow({ id: 'A-otherAgent', tenant_id: 'tenant-A', agent_id: 'agent-Z' }),
+    ]);
+  });
+
+  it('running expireDue() under tenant-A leaves tenant-B (and other-agent) rows UNTOUCHED', async () => {
+    const { pendingQuestionsRepo } = await import('@/db/repositories.js');
+
+    const expired = await runWithTenantContext(A, () => pendingQuestionsRepo.expireDue());
+
+    // Only tenant-A/agent-A's due row was expired.
+    expect(expired).toBe(1);
+    const byId = (id: string) => mutationStore.rows.find((r) => r.id === id)!;
+    expect(byId('A-due').status).toBe('expirada');
+    // Cross-tenant isolation: tenant-B's row is untouched …
+    expect(byId('B-due').status).toBe('aberta');
+    // … and so is tenant-A's OTHER agent.
+    expect(byId('A-otherAgent').status).toBe('aberta');
+
+    // The WHERE predicate actually bound tenant_id AND agent_id (defence against
+    // a future refactor that scopes by only one of them).
+    const terms = parsePredicateForTest(mutationStore.lastPredicate());
+    expect(terms).toContainEqual({ kind: 'eq', column: 'tenant_id', value: 'tenant-A' });
+    expect(terms).toContainEqual({ kind: 'eq', column: 'agent_id', value: 'agent-A' });
+  });
+
+  it('does NOT expire a row whose `expira_em` is still in the future (predicate honoured per tenant)', async () => {
+    mutationStore.reset([
+      dueRow({ id: 'A-future', tenant_id: 'tenant-A', agent_id: 'agent-A', expira_em: FUTURE }),
+      dueRow({ id: 'A-due', tenant_id: 'tenant-A', agent_id: 'agent-A' }),
+      dueRow({ id: 'B-due', tenant_id: 'tenant-B', agent_id: 'agent-B' }),
+    ]);
+    const { pendingQuestionsRepo } = await import('@/db/repositories.js');
+
+    const expired = await runWithTenantContext(A, () => pendingQuestionsRepo.expireDue());
+
+    expect(expired).toBe(1);
+    const byId = (id: string) => mutationStore.rows.find((r) => r.id === id)!;
+    expect(byId('A-due').status).toBe('expirada');
+    expect(byId('A-future').status).toBe('aberta'); // not yet due
+    expect(byId('B-due').status).toBe('aberta'); // other tenant
   });
 });

@@ -475,10 +475,25 @@ export const conversasRepo = {
       .where(eq(conversas.id, id));
   },
   async close(id: string, contexto_resumido: string): Promise<void> {
+    // Issue #345 (Phase 4 review): `conversation-summarizer` runs PER enumerated
+    // (tenant_id, agent_id) tuple and calls this to close stale conversations.
+    // Scope the UPDATE to the current (tenant_id, agent_id) — bound from ALS —
+    // as defense-in-depth so a per-tuple run can never close a conversation
+    // owned by another tenant even if a caller passed a foreign `id` (the
+    // inviolable cross-tenant isolation invariant). Both columns are NOT NULL
+    // and the enumeration partitions on the same pair.
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     await db
       .update(conversas)
       .set({ status: 'encerrada', contexto_resumido })
-      .where(eq(conversas.id, id));
+      .where(
+        and(
+          eq(conversas.id, id),
+          eq(conversas.tenant_id, tenant_id),
+          eq(conversas.agent_id, agent_id),
+        ),
+      );
   },
   async invalidateScopeForPessoa(pessoa_id: string): Promise<void> {
     await db
@@ -1383,10 +1398,27 @@ export const pendingQuestionsRepo = {
       .where(eq(pending_questions.id, id));
   },
   async expireDue(): Promise<number> {
+    // Issue #345 (Phase 4 review): the `pending-expirer` worker now runs this
+    // inner ONCE PER enumerated (tenant_id, agent_id) tuple
+    // (`listTenantAgentPairsWithDueExpirations` selects DISTINCT (tenant_id,
+    // agent_id)). Without an explicit tenant predicate the UPDATE would expire
+    // EVERY tenant's due pending_questions on the first tuple's pass —
+    // violating the inviolable cross-tenant isolation invariant. Bind the same
+    // (tenant_id, agent_id) the enumeration partitions on, so a per-tuple run
+    // only touches ITS OWN rows.
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const rows = await db
       .update(pending_questions)
       .set({ status: 'expirada' })
-      .where(and(eq(pending_questions.status, 'aberta'), sql`expira_em < now()`))
+      .where(
+        and(
+          eq(pending_questions.tenant_id, tenant_id),
+          eq(pending_questions.agent_id, agent_id),
+          eq(pending_questions.status, 'aberta'),
+          sql`expira_em < now()`,
+        ),
+      )
       .returning({ id: pending_questions.id });
     return rows.length;
   },

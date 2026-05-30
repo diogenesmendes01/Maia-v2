@@ -5,7 +5,7 @@ import { mensagensRepo, conversasRepo } from '@/db/repositories.js';
 import { callLLM } from '@/lib/claude.js';
 import { logger } from '@/lib/logger.js';
 import { config } from '@/config/env.js';
-import { runWithTenantContext } from '@/db/tenant-context.js';
+import { runWithTenantContext, getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import { reflect } from '@/cognition/reflector.js';
 import { classify } from '@/cognition/classifier.js';
 import { persistCandidate } from '@/cognition/persister.js';
@@ -72,11 +72,22 @@ export async function runConversationSummarizer(): Promise<void> {
 }
 
 async function runConversationSummarizerInner(): Promise<void> {
+  // Issue #345 (Phase 4 review): this inner runs ONCE PER enumerated
+  // (tenant_id, agent_id) tuple. The SELECT below is a RAW `db.select()` that
+  // does NOT pass through the tenant guard, so it must carry an EXPLICIT
+  // (tenant_id, agent_id) predicate — otherwise a per-tuple run would read
+  // EVERY tenant's stale conversations and then `conversasRepo.close()` rows
+  // belonging to other tenants, violating the inviolable cross-tenant
+  // isolation invariant. Bind the same pair the dispatcher partitions on.
+  const tenant_id = getCurrentTenant();
+  const agent_id = getCurrentAgent();
   const stale = await db
     .select()
     .from(conversas)
     .where(
       and(
+        eq(conversas.tenant_id, tenant_id),
+        eq(conversas.agent_id, agent_id),
         eq(conversas.status, 'ativa'),
         sql`${conversas.ultima_atividade_em} < now() - interval '7 days'`,
       ),
