@@ -32,8 +32,7 @@ import { runTraceMatviewRefresh } from './trace-matview-refresh.js';
 import { runKnowledgeStatePromoter } from './knowledge-state-promoter.js';
 import { runOutboundMessagesSweeper } from './outbound-messages-sweeper.js';
 import { runIdempotencyOutboxRelayer } from './idempotency-outbox-relayer.js';
-import { tickEngine } from '@/workflows/engine.js';
-import { runWithTenantContext } from '@/db/tenant-context.js';
+import { runWorkflowEngineTick } from './workflow-engine-tick.js';
 
 export type Job = {
   name: string;
@@ -63,18 +62,14 @@ export const JOBS: Job[] = [
   { name: 'scheduling_tick', cron: '* * * * *', fn: runScheduling, phase: 1 },
   { name: 'outbox_drain', cron: '* * * * *', fn: runOutboxDrainWorker, phase: 1 },
   { name: 'series_next_scheduler', cron: '*/10 * * * *', fn: runSeriesNextSchedulerWorker, phase: 1 },
-  {
-    name: 'workflow_engine_tick',
-    cron: '*/30 * * * * *',
-    fn: async () => {
-      // P0: single-tenant default. P6 will fan-out per tenant.
-      // tickEngine() acessa workflows/workflow_steps (tabelas tenant-aware).
-      await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
-        await tickEngine();
-      });
-    },
-    phase: 1,
-  },
+  // Issue #345 (Phase 4 of #323), Batch D — the inline body was EXTRACTED into
+  // `./workflow-engine-tick.ts` (`runWorkflowEngineTick`) and converted from the
+  // hardcoded `default/default` shim into a per-tenant dispatcher. The job SHAPE
+  // is unchanged (same name/cadence/phase) — only the handler implementation
+  // moved out. `runWorkflowEngineTick` enumerates the DISTINCT (tenant_id,
+  // agent_id) tuples with active workflows and runs `tickEngine()` once per
+  // tuple under `runWithTenantContext`, fail-isolated.
+  { name: 'workflow_engine_tick', cron: '*/30 * * * * *', fn: runWorkflowEngineTick, phase: 1 },
   { name: 'audit_mode_expirer', cron: '*/15 * * * *', fn: runAuditModeExpirer, phase: 1 },
   { name: 'idempotency_cleanup', cron: '0 4 * * *', fn: runIdempotencyCleanup, phase: 1 },
   // Issue #292 — outbound_messages sweeper (#227/#233 follow-up).

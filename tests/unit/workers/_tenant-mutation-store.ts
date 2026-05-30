@@ -175,9 +175,10 @@ export function rowMatches(row: StoreRow, terms: Term[], now: Date): boolean {
 }
 
 /**
- * Evaluate the two raw date fragments the repos/workers under test emit:
+ * Evaluate the raw fragments the repos/workers under test emit:
  *   - `expira_em < now()`                               (pending_questions)
  *   - `<col> < now() - interval 'N days'`               (conversas staleness)
+ *   - `status IN ('a','b',...)`                         (workflows listPending — #345 Batch D)
  * Throws on anything else so a future predicate change can't silently pass.
  */
 function rawFragmentSatisfied(text: string, row: StoreRow, now: Date): boolean {
@@ -192,6 +193,19 @@ function rawFragmentSatisfied(text: string, row: StoreRow, now: Date): boolean {
     const days = Number(stale[2]);
     const v = toDate(row[col] as unknown);
     return !!v && v.getTime() < now.getTime() - days * 86_400_000;
+  }
+  // `status IN ('pendente','em_andamento',...)` — drizzle renders the literal
+  // IN-list as a single StringChunk (no params/columns), so it reaches here as a
+  // raw fragment. Parse the quoted list and test membership against row.status.
+  const inList = /^(\w+)\s+IN\s*\((.+)\)$/i.exec(text);
+  if (inList) {
+    const col = inList[1]!;
+    const allowed = new Set(
+      inList[2]!
+        .split(',')
+        .map((s) => s.trim().replace(/^'(.*)'$/, '$1')),
+    );
+    return allowed.has(String(row[col]));
   }
   throw new Error(`tenant-mutation-store: unsupported raw fragment "${text}"`);
 }
@@ -259,22 +273,29 @@ export function makeTenantScopedUpdateStore(
     }),
   }));
 
-  // Read path: `db.select().from(table).where(pred).limit(n)`. Returns only the
-  // rows matching the evaluated drizzle predicate — so an unscoped SELECT would
-  // leak other tenants' rows into the result (and the worker would then mutate
-  // them), which is exactly what the isolation assertion catches.
+  // Read path. Returns only the rows matching the evaluated drizzle predicate —
+  // so an unscoped SELECT would leak other tenants' rows into the result (and the
+  // worker would then mutate them), which is exactly what the isolation assertion
+  // catches. Supports BOTH terminal shapes the repos under test use:
+  //   - `.where(pred).limit(n)`            (e.g. conversasRepo stale select)
+  //   - `.where(pred)` awaited directly    (e.g. workflowsRepo.listPending — #345)
+  //   - `.where(pred).orderBy(col)`        (e.g. workflowStepsRepo.byWorkflow — #345)
   const select = vi.fn(() => {
+    const run = (): StoreRow[] => {
+      const terms = parsePredicate(capturedSelect);
+      return rows.filter((row) => rowMatches(row, terms, now));
+    };
     const chain = {
       from: (_table: unknown) => chain,
       where: (predicate: unknown) => {
         capturedSelect = predicate;
         return chain;
       },
-      limit: async (n: number) => {
-        const terms = parsePredicate(capturedSelect);
-        const out = rows.filter((row) => rowMatches(row, terms, now));
-        return out.slice(0, n);
-      },
+      orderBy: () => chain,
+      limit: async (n: number) => run().slice(0, n),
+      // Make the chain awaitable directly on `.where()`/`.orderBy()` (no limit).
+      then: (resolve: (v: StoreRow[]) => unknown, reject?: (e: unknown) => unknown) =>
+        Promise.resolve(run()).then(resolve, reject),
     };
     return chain;
   });

@@ -39,6 +39,7 @@ const { noopAsync, noopWorkers, mockSchedule } = vi.hoisted(() => {
     runTraceMatviewRefresh: noopAsync,
     runOutboundMessagesSweeper: noopAsync,
     runIdempotencyOutboxRelayer: noopAsync,
+    runWorkflowEngineTick: noopAsync,
   };
   const mockSchedule = vi.fn(() => ({ stop: vi.fn(), start: vi.fn() }));
   return { noopAsync, noopWorkers, mockSchedule };
@@ -70,6 +71,10 @@ vi.mock('../../src/workers/trace-body-recoverer.js', () => noopWorkers);
 vi.mock('../../src/workers/trace-matview-refresh.js', () => noopWorkers);
 vi.mock('../../src/workers/outbound-messages-sweeper.js', () => noopWorkers);
 vi.mock('../../src/workers/idempotency-outbox-relayer.js', () => noopWorkers);
+// Issue #345 Batch D: `workflow_engine_tick` is now backed by the extracted
+// `workflow-engine-tick.ts` dispatcher (registered by reference in index.ts).
+// Stub it like every other worker — the registry test only asserts JOBS shape.
+vi.mock('../../src/workers/workflow-engine-tick.js', () => noopWorkers);
 vi.mock('../../src/workflows/engine.js', () => ({ tickEngine: noopAsync }));
 
 // node-cron v4: ScheduledTask is an interface with stop() / start() / etc.
@@ -162,6 +167,23 @@ describe('workers registry', () => {
       // No featureFlag — always on once merged (it's pure housekeeping +
       // recovery; no UX-visible behaviour change).
       expect(job!.featureFlag).toBeUndefined();
+    });
+  });
+
+  // Issue #345 Batch D — workflow_engine_tick extracted to a per-tenant
+  // dispatcher (job shape MUST be unchanged: same name/cadence/phase).
+  describe('workflow_engine_tick (issue #345 Batch D)', () => {
+    it('registered with unchanged shape: */30s sub-minute cadence, phase 1, no featureFlag', async () => {
+      const { JOBS } = await import('../../src/workers/index.js');
+      const job = JOBS.find((j) => j.name === 'workflow_engine_tick');
+      expect(job).toBeDefined();
+      // Sub-minute (6-field) cron — every 30 seconds — preserved from the inline job.
+      expect(job!.cron).toBe('*/30 * * * * *');
+      expect(job!.phase).toBe(1);
+      // Never gated — the extraction only changed the handler, not the schedule.
+      expect(job!.featureFlag).toBeUndefined();
+      // The handler is the extracted dispatcher function (registered by reference).
+      expect(typeof job!.fn).toBe('function');
     });
   });
 
