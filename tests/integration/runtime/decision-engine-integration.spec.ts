@@ -9,7 +9,10 @@
  * lockdown reader, channel policies). No DB hits.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { createDecisionEngine } from '@/runtime/decision/index.ts';
+import {
+  createDecisionEngine,
+  TurnRiskScorerAdapter,
+} from '@/runtime/decision/index.ts';
 import type {
   ChannelPoliciesReader,
   ContentResolver,
@@ -23,10 +26,12 @@ import type {
   PolicyRulesRepo,
   ProceduresRepo,
   ResolvedPolicy,
+  RiskScorer,
   Skill,
   SkillsRepo,
 } from '@/runtime/decision/types.js';
 import type { BaseContextPacket } from '@/runtime/context-packet/types.js';
+import type { LLMGate } from '@/shared/risk/types.js';
 import { LatePepImpl } from '@/runtime/guardrails/late-pep.ts';
 import type {
   AgentOutputCandidate,
@@ -53,6 +58,12 @@ interface Fixture {
   contentResolver: ContentResolver;
   haiku: HaikuClient;
   metrics: MetricsClient;
+  /**
+   * Deterministic risk scorer with a STUBBED Haiku gate. Must be injected —
+   * see `buildFixture` for why omitting it makes the engine perform a live
+   * Anthropic call on the hot path and flake under the 400ms budget.
+   */
+  riskScorer: RiskScorer;
   /** allow tests to mutate verdict per policy_id */
   setVerdict(policy_id: string, verdict: PolicyEvaluatorVerdict): void;
   setChannelLockdown(value: boolean): void;
@@ -247,6 +258,24 @@ function buildFixture(): Fixture {
     recordHistogram: vi.fn(),
   };
 
+  // The risk scorer's Haiku gate is an EXTERNAL LLM dependency and must be
+  // mocked here, exactly as `haiku` (above) mocks the intent classifier's LLM.
+  // Without an injected `riskScorer`, `createDecisionEngine` falls back to
+  // `new TurnRiskScorerAdapter()`, whose gate defaults to the live
+  // `haikuRiskGate` — a real `anthropic.messages.create()` round-trip (~230ms
+  // with the placeholder test key) on EVERY turn that reaches the risk step.
+  // That latency sits just under the engine's 400ms wall-clock budget, so any
+  // CI jitter pushes the `risk` step past its deadline; the engine then returns
+  // its budget-fallback packet (routing.agent_id ← base.agent_id), the skill
+  // step never runs, and Codex #103 Cenário 9's `agent_b` assertions fail
+  // intermittently (the documented main-only flake; `retry: 1` only halved it).
+  //
+  // Returning `null` reproduces CI's keyless-gate reality (401 → fail-closed in
+  // the scorer), so the resolved `risk_profile` is identical to a passing run —
+  // only now it is instant, deterministic, and free of network I/O.
+  const riskGate: LLMGate = async () => null;
+  const riskScorer: RiskScorer = new TurnRiskScorerAdapter({ gate: riskGate });
+
   return {
     tenant_id,
     agents,
@@ -263,6 +292,7 @@ function buildFixture(): Fixture {
     contentResolver,
     haiku,
     metrics,
+    riskScorer,
     setVerdict(id, v) {
       verdicts.set(id, v);
     },
