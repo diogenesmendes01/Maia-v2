@@ -56,9 +56,21 @@ Because the ledger key is the filename, a rename makes the runner treat
 the file as un-applied (it re-runs) and orphans the old `schema_migrations`
 row — corrupting the applied history for zero benefit. The accepted set
 is grandfathered in
-`tests/unit/scripts/migration-number-uniqueness.spec.ts`, which **fails
+`tests/unit/scripts/migration-number-uniqueness.spec.ts` and
+`tests/unit/migrations-no-new-duplicate-prefix.spec.ts`, which both **fail
 CI if a NEW duplicate number is introduced** (the actual fix: don't add
 new collisions — see "Adding a new migration" below).
+
+**Ordering caveat (read once).** `scripts/migrate.ts` orders forward
+migrations by a plain `Array.prototype.sort()` over the **full filename**
+— not by parsing the numeric prefix. So two migrations that share a number
+are ordered only by the **alphabetical** comparison of their full names
+(`062_drop_dashboard_sessions.sql` before `062_global_settings.sql`). This
+is a latent ordering caveat: it is fine today because colliding migrations
+touch disjoint objects, but it is precisely why **every new migration MUST
+use a unique numeric prefix** (now enforced by the guard tests above). Pick
+`NNN = max(existing) + 1`; never reuse a number to "slot in" next to a
+related migration.
 
 ## Applying migrations (up)
 
