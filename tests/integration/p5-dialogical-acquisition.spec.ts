@@ -32,7 +32,15 @@
  *   - featureFlags.override em beforeEach/afterEach.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { runWithTenantContext } from '@/db/tenant-context.js';
+// Issue #346: import the ALS getters statically (not via `await import`) so the
+// repo mocks can read the current (tenant, agent) SYNCHRONOUSLY. A dynamic
+// `await import` inside a mock would add microtask hops that desynchronise the
+// fire-and-forget proposer in cenário 1 from `flushMicrotasks()`.
+import {
+  runWithTenantContext,
+  getCurrentTenant,
+  getCurrentAgent,
+} from '@/db/tenant-context.js';
 import { FeatureFlagName, GapLevel } from '@/types/enums.js';
 // Runtime import (not type-only): the open-gap enumeration assertion below
 // checks the production query targets THIS exact table object. `@/db/schema.js`
@@ -46,11 +54,26 @@ import type {
   Tenant,
 } from '@/db/schema.js';
 
+// ---------- real (tenant, agent) under test (issue #346) ----------
+// These fixtures used to seed the legacy `'default'` sentinel for agent_id
+// (and tenant_id in several scenarios), so they never exercised the post-#323
+// per-agent fan-out path with a REAL agent. Migrate to a realistic tenant slug
+// + a concrete agent so every scenario proves the non-default `(tenant, agent)`
+// path end-to-end. `'default'` is the legacy bucket the tenant-context guard
+// meters/rejects — a regression that re-introduced it would now fail here.
+const TEST_TENANT_ID = 'acme';
+const TEST_AGENT_ID = 'test-agent-1';
+
 // ---------- in-memory state ----------
 const gapsState: Record<string, AgentCapabilityGap> = {};
 const proposalsState: Record<string, CapabilityProposal> = {};
 const testResultsState: Record<string, CapabilityTestResult> = {};
 const tenantsState: Tenant[] = [];
+// Issue #346: every (tenant_id, agent_id) the gap-escalation-monitor opens via
+// runWithTenantContext is captured here (read off the ALS inside the
+// capabilityGapsRepo.listByLevels mock, which the worker calls once per tuple).
+// Lets a scenario assert the worker ran under the REAL agent — never `'default'`.
+const monitorContextsSeen: Array<{ tenant_id: string; agent_id: string }> = [];
 
 // ---------- Hoisted mocks ----------
 const {
@@ -207,8 +230,8 @@ function makeGap(overrides: Partial<AgentCapabilityGap> = {}): AgentCapabilityGa
   const now = new Date();
   return {
     id: 'gap-1',
-    tenant_id: 'tenant-a',
-    agent_id: 'default',
+    tenant_id: TEST_TENANT_ID,
+    agent_id: TEST_AGENT_ID,
     capability_description: 'consultar status do pedido por id',
     tipo: 'tool',
     contexto: null,
@@ -227,8 +250,8 @@ function makeProposal(overrides: Partial<CapabilityProposal> = {}): CapabilityPr
   const now = new Date();
   return {
     id: 'prop-1',
-    tenant_id: 'default',
-    agent_id: 'default',
+    tenant_id: TEST_TENANT_ID,
+    agent_id: TEST_AGENT_ID,
     gap_id: 'gap-1',
     capability_type: 'tool',
     title: 'Rastreador de Pedidos',
@@ -316,9 +339,13 @@ function wireRepoImplementations() {
 
   // capabilityGapsRepo.listByLevels — filter from gapsState by current tenant.
   capabilityGapsListByLevels.mockImplementation(async (levels: GapLevel[]) => {
-    const { getCurrentTenant, getCurrentAgent } = await import('@/db/tenant-context.js');
     const tid = getCurrentTenant();
     const aid = getCurrentAgent();
+    // Issue #346: record the (tenant, agent) the monitor opened so a scenario
+    // can assert the worker ran under the REAL agent — never `'default'`.
+    // `getCurrentAgent()` rejects/meters the `'default'` sentinel, so the value
+    // it returned is the post-migration proof point.
+    monitorContextsSeen.push({ tenant_id: tid, agent_id: aid });
     return Object.values(gapsState).filter(
       (g) =>
         g.tenant_id === tid &&
@@ -347,12 +374,16 @@ function wireRepoImplementations() {
   // capabilityGapsRepo.create — insert a fresh gap row (used by revert path).
   capabilityGapsCreate.mockImplementation(
     async (input: { capability_description: string; tipo: string; contexto?: string }) => {
+      // Issue #346: the real repo stamps tenant_id/agent_id from the ALS via
+      // applyTenantGuard. Mirror that (synchronously — see static import note)
+      // so the created gap is scoped to the REAL (tenant, agent) the revert
+      // path runs under — never `'default'`.
       const id = `gap-${Math.random().toString(36).slice(2)}`;
       const now = new Date();
       const row: AgentCapabilityGap = {
         id,
-        tenant_id: 'default',
-        agent_id: 'default',
+        tenant_id: getCurrentTenant(),
+        agent_id: getCurrentAgent(),
         capability_description: input.capability_description,
         tipo: input.tipo,
         contexto: input.contexto ?? null,
@@ -371,7 +402,6 @@ function wireRepoImplementations() {
 
   // capabilityGapsRepo.listByLevel — single-level variant.
   capabilityGapsListByLevel.mockImplementation(async (level: string) => {
-    const { getCurrentTenant, getCurrentAgent } = await import('@/db/tenant-context.js');
     const tid = getCurrentTenant();
     const aid = getCurrentAgent();
     return Object.values(gapsState).filter(
@@ -394,12 +424,16 @@ function wireRepoImplementations() {
       expected_impact?: string;
       test_scenarios: unknown[];
     }) => {
+      // Issue #346: the real repo stamps tenant_id/agent_id from the ALS via
+      // applyTenantGuard. The proposer fires inside the worker's per-tuple
+      // context, so read the live ALS (synchronously — see static import note)
+      // to scope the draft to the REAL (tenant, agent) — never `'default'`.
       const id = `prop-${Math.random().toString(36).slice(2)}`;
       const now = new Date();
       const row: CapabilityProposal = {
         id,
-        tenant_id: 'default',
-        agent_id: 'default',
+        tenant_id: getCurrentTenant(),
+        agent_id: getCurrentAgent(),
         gap_id: input.gap_id ?? null,
         capability_type: input.capability_type,
         title: input.title,
@@ -488,12 +522,16 @@ function wireRepoImplementations() {
       triggered_revert?: boolean;
       technical_gap_id?: string;
     }) => {
+      // Issue #346: the real repo stamps tenant_id/agent_id from the ALS via
+      // applyTenantGuard. Mirror that (synchronously — see static import note)
+      // so the result row is scoped to the REAL (tenant, agent) the test loop
+      // runs under — never `'default'`.
       const id = `tres-${Math.random().toString(36).slice(2)}`;
       const now = new Date();
       const row: CapabilityTestResult = {
         id,
-        tenant_id: 'default',
-        agent_id: 'default',
+        tenant_id: getCurrentTenant(),
+        agent_id: getCurrentAgent(),
         proposal_id: input.proposal_id,
         gap_id: input.gap_id ?? null,
         outcome: input.outcome,
@@ -522,6 +560,7 @@ describe('P5 dialogical acquisition — end-to-end', () => {
     for (const k of Object.keys(proposalsState)) delete proposalsState[k];
     for (const k of Object.keys(testResultsState)) delete testResultsState[k];
     tenantsState.length = 0;
+    monitorContextsSeen.length = 0;
     vi.clearAllMocks();
     wireRepoImplementations();
 
@@ -543,8 +582,8 @@ describe('P5 dialogical acquisition — end-to-end', () => {
 
     const now = new Date();
     const tenant: Tenant = {
-      id: 'tenant-a',
-      nome: 'Tenant A',
+      id: TEST_TENANT_ID,
+      nome: 'Acme',
       status: 'active',
       metadata: {},
       created_at: now,
@@ -553,10 +592,14 @@ describe('P5 dialogical acquisition — end-to-end', () => {
     tenantsState.push(tenant);
 
     // Initial: silent gap, freq=1, sev=1 (below dashboard threshold of 3).
+    // Issue #346: owned by the REAL (tenant, agent) — 'acme' / 'test-agent-1'
+    // (agent_id comes from makeGap's updated default). The monitor enumerates
+    // this tuple off gapsState and opens per-tuple context with that exact
+    // agent, exercising the post-#323 per-agent fan-out (no `agent_id:'default'`).
     const gapId = 'gap-chain-1';
     gapsState[gapId] = makeGap({
       id: gapId,
-      tenant_id: 'tenant-a',
+      tenant_id: TEST_TENANT_ID,
       capability_description: 'rastrear pedido',
       current_level: GapLevel.SILENT,
       frequency_score: 1,
@@ -581,8 +624,21 @@ describe('P5 dialogical acquisition — end-to-end', () => {
     expect(step1Changed![0]).toMatchObject({
       from: GapLevel.SILENT,
       to: GapLevel.DASHBOARD,
-      tenant_id: 'tenant-a',
+      tenant_id: TEST_TENANT_ID,
+      agent_id: TEST_AGENT_ID,
     });
+
+    // Issue #346: the monitor opened context for the REAL (tenant, agent) and
+    // never the `'default'` literal. Captured off the ALS inside the
+    // listByLevels mock (called once per tuple inside the worker context).
+    expect(monitorContextsSeen).toContainEqual({
+      tenant_id: TEST_TENANT_ID,
+      agent_id: TEST_AGENT_ID,
+    });
+    for (const ctx of monitorContextsSeen) {
+      expect(ctx.tenant_id).not.toBe('default');
+      expect(ctx.agent_id).not.toBe('default');
+    }
 
     // Issue #323 review (NITPICK): the open-gap enumeration must target the
     // `agent_capability_gaps` table filtered by the open levels. Without these
@@ -651,6 +707,11 @@ describe('P5 dialogical acquisition — end-to-end', () => {
     expect(proposals[0]!.status).toBe('draft');
     expect(proposals[0]!.gap_id).toBe(gapId);
     expect(proposals[0]!.title).toBe('Rastreador de Pedidos');
+    // Issue #346: the proposal the fire-and-forget proposer created is scoped
+    // to the REAL (tenant, agent) the worker opened per tuple — never
+    // `'default'`. Proves the proposer inherited the post-migration context.
+    expect(proposals[0]!.tenant_id).toBe(TEST_TENANT_ID);
+    expect(proposals[0]!.agent_id).toBe(TEST_AGENT_ID);
 
     // proposal_created log emitted (after fire-and-forget resolves).
     const proposalLog = loggerInfo.mock.calls.find(
@@ -665,7 +726,7 @@ describe('P5 dialogical acquisition — end-to-end', () => {
   // ---------- Cenário 2 ----------
   it('cenário 2: owner aprova proposta (draft → submitted → approved → delivered); invalid transition rejected', async () => {
     await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
+      { tenant_id: TEST_TENANT_ID, agent_id: TEST_AGENT_ID },
       async () => {
         // Pre-seed a draft proposal in mocked state.
         const seeded = makeProposal({ id: 'prop-flow-1', status: 'draft' });
@@ -732,7 +793,7 @@ describe('P5 dialogical acquisition — end-to-end', () => {
   // ---------- Cenário 3 ----------
   it('cenário 3: test loop pass — 2 echo_test scenarios passam → outcome=pass, no revert', async () => {
     await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
+      { tenant_id: TEST_TENANT_ID, agent_id: TEST_AGENT_ID },
       async () => {
         // 2 scenarios where `when` contains `then` → echo_test passes.
         proposalsState['prop-pass'] = makeProposal({
@@ -785,6 +846,12 @@ describe('P5 dialogical acquisition — end-to-end', () => {
         expect(stored.outcome).toBe('pass');
         expect(stored.triggered_revert).toBe(false);
         expect(stored.technical_gap_id).toBeNull();
+        // Issue #346: the result row is scoped to the REAL (tenant, agent) the
+        // test loop ran under — never `'default'`.
+        expect(stored.tenant_id).toBe(TEST_TENANT_ID);
+        expect(stored.agent_id).toBe(TEST_AGENT_ID);
+        expect(stored.tenant_id).not.toBe('default');
+        expect(stored.agent_id).not.toBe('default');
       },
     );
   });
@@ -792,7 +859,7 @@ describe('P5 dialogical acquisition — end-to-end', () => {
   // ---------- Cenário 4 ----------
   it('cenário 4: test loop fail → revert path cria gap technical com prefixo [técnica]', async () => {
     await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
+      { tenant_id: TEST_TENANT_ID, agent_id: TEST_AGENT_ID },
       async () => {
         // 1 scenario where `when` does NOT contain `then` → fail.
         proposalsState['prop-fail'] = makeProposal({
@@ -850,6 +917,13 @@ describe('P5 dialogical acquisition — end-to-end', () => {
         expect(createdGap).toBeDefined();
         expect(createdGap!.tipo).toBe('technical');
         expect(createdGap!.capability_description.startsWith('[técnica]')).toBe(true);
+        // Issue #346: the revert-derived gap is owned by the REAL (tenant,
+        // agent) the test loop ran under — never `'default'`. The technical gap
+        // must stay scoped to the agent whose capability failed.
+        expect(createdGap!.tenant_id).toBe(TEST_TENANT_ID);
+        expect(createdGap!.agent_id).toBe(TEST_AGENT_ID);
+        expect(createdGap!.tenant_id).not.toBe('default');
+        expect(createdGap!.agent_id).not.toBe('default');
       },
     );
   });
@@ -883,10 +957,16 @@ describe('P5 dialogical acquisition — end-to-end', () => {
     const { featureFlags } = await import('@/config/feature-flags.js');
     featureFlags.override(FeatureFlagName.DIALOGICAL_ACQUISITION, false);
 
+    // Issue #346: a SECOND real (tenant, agent) — distinct from the suite-wide
+    // 'acme' / 'test-agent-1' — so this scenario also proves the per-#323
+    // fan-out enumerates whichever real tuple owns the open gap (not a single
+    // hard-coded pair, and never `'default'`).
+    const FLAG_OFF_TENANT_ID = 'globex';
+    const FLAG_OFF_AGENT_ID = 'test-agent-2';
     const now = new Date();
     const tenant: Tenant = {
-      id: 'tenant-flag-off',
-      nome: 'Flag OFF',
+      id: FLAG_OFF_TENANT_ID,
+      nome: 'Globex',
       status: 'active',
       metadata: {},
       created_at: now,
@@ -900,7 +980,8 @@ describe('P5 dialogical acquisition — end-to-end', () => {
     const gapId = 'gap-flag-off';
     gapsState[gapId] = makeGap({
       id: gapId,
-      tenant_id: 'tenant-flag-off',
+      tenant_id: FLAG_OFF_TENANT_ID,
+      agent_id: FLAG_OFF_AGENT_ID,
       current_level: GapLevel.MENTIONABLE,
       frequency_score: 5,
       severity_score: 5,
@@ -915,6 +996,17 @@ describe('P5 dialogical acquisition — end-to-end', () => {
 
     // Engine still promotes the gap (deterministic, doesn't depend on flag).
     expect(gapsState[gapId]!.current_level).toBe(GapLevel.PROPOSED);
+
+    // Issue #346: the monitor opened context for the REAL (tenant, agent) that
+    // owns the gap and never for the `'default'` literal.
+    expect(monitorContextsSeen).toContainEqual({
+      tenant_id: FLAG_OFF_TENANT_ID,
+      agent_id: FLAG_OFF_AGENT_ID,
+    });
+    for (const ctx of monitorContextsSeen) {
+      expect(ctx.tenant_id).not.toBe('default');
+      expect(ctx.agent_id).not.toBe('default');
+    }
 
     // BUT proposer short-circuits without calling Anthropic and without
     // creating a capability_proposal.

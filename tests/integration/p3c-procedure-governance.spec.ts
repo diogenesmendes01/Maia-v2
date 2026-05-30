@@ -21,12 +21,32 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 
+// ---------- real (tenant, agent) under test (issue #346) ----------
+// These fixtures used to seed the legacy `'default'` sentinel for both
+// tenant_id and agent_id, so they never exercised the post-#323 per-agent
+// fan-out path with a REAL agent. Migrate to a realistic tenant slug + a
+// concrete agent so every scenario proves the non-default `(tenant, agent)`
+// path end-to-end (and so a regression that re-introduced the `'default'`
+// path — which the tenant-context guard meters/rejects — would fail here).
+const TEST_TENANT_ID = 'acme';
+const TEST_AGENT_ID = 'test-agent-1';
+
 // ---------- in-memory state ----------
 const definitionsState: Record<string, any> = {};
 const testsState: Record<string, any> = {};
 const execState: Record<string, any> = {};
 const events: any[] = [];
 const tenantsState: Array<{ id: string; nome: string; status: string }> = [];
+// Issue #346: every (tenant_id, agent_id) the reaper opens via
+// runWithTenantContext is captured here (read off the ALS inside the
+// listStaleInProgress mock, which the worker calls per tuple). Lets a
+// scenario assert the worker ran under the REAL agent — never `'default'`.
+const reaperContextsSeen: Array<{ tenant_id: string; agent_id: string }> = [];
+// Issue #346: the (tenant_id, agent_id) the procedure-test flow actually runs
+// under, captured off the ALS inside the createOrFindActive mock (which the
+// test-runner calls from INSIDE the dedicated sandbox context it opens). Lets
+// cenário 4 assert the flow runs under a concrete, non-`'default'` agent.
+const procedureTestContextsSeen: Array<{ tenant_id: string; agent_id: string }> = [];
 
 // ---------- Anthropic SDK mock (cenário 4: llm_judge) ----------
 const { messagesCreateMock } = vi.hoisted(() => ({
@@ -204,8 +224,8 @@ vi.mock('@/db/repositories.js', async () => {
         const id = `test-${Math.random().toString(36).slice(2)}`;
         const row = {
           id,
-          tenant_id: 'default',
-          agent_id: 'default',
+          tenant_id: TEST_TENANT_ID,
+          agent_id: TEST_AGENT_ID,
           last_run_at: null,
           last_run_status: null,
           last_run_details: null,
@@ -257,10 +277,20 @@ vi.mock('@/db/repositories.js', async () => {
       }),
       // PR #84 introduced createOrFindActive returning { execution, created }.
       createOrFindActive: vi.fn(async (input: any) => {
+        // Issue #346: the test-runner opens its OWN dedicated sandbox context
+        // before calling here, so capturing the live ALS proves the flow runs
+        // under a concrete, non-`'default'` (tenant, agent). The real repo
+        // would stamp these via applyTenantGuard; mirror that by reading them.
+        const { getCurrentTenant, getCurrentAgent } = await import('@/db/tenant-context.js');
+        const tenant_id = getCurrentTenant();
+        const agent_id = getCurrentAgent();
+        procedureTestContextsSeen.push({ tenant_id, agent_id });
         const id = `exec-${Math.random().toString(36).slice(2)}`;
         execState[id] = {
           id,
           ...input,
+          tenant_id,
+          agent_id,
           status: input.status ?? 'in_progress',
           completed_steps: input.completed_steps ?? [],
           execution_state: input.execution_state ?? {},
@@ -294,6 +324,11 @@ vi.mock('@/db/repositories.js', async () => {
         const { getCurrentTenant, getCurrentAgent } = await import('@/db/tenant-context.js');
         const tenant_id = getCurrentTenant();
         const agent_id = getCurrentAgent();
+        // Issue #346: record the (tenant, agent) the reaper opened so a scenario
+        // can assert the worker ran under the REAL agent — never `'default'`.
+        // `getCurrentAgent()` itself rejects/meters the `'default'` sentinel, so
+        // capturing the value it returned is the post-migration proof point.
+        reaperContextsSeen.push({ tenant_id, agent_id });
         const cutoff = Date.now() - opts.ttl_days * 86_400_000;
         const all = Object.values(execState).filter((ex: any) => {
           if (ex.tenant_id !== tenant_id) return false;
@@ -418,13 +453,15 @@ describe('P3c procedure governance', () => {
     for (const k of Object.keys(execState)) delete execState[k];
     events.length = 0;
     tenantsState.length = 0;
+    reaperContextsSeen.length = 0;
+    procedureTestContextsSeen.length = 0;
     messagesCreateMock.mockReset();
     vi.clearAllMocks();
   });
 
   it('cenário 1: definition draft → proposed OK; proposed → active sem tests falha (tests_required)', async () => {
     await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
+      { tenant_id: TEST_TENANT_ID, agent_id: TEST_AGENT_ID },
       async () => {
         const def = await seedDraftDefinition('lifecycle-1');
 
@@ -459,7 +496,7 @@ describe('P3c procedure governance', () => {
 
   it('cenário 2: 1 test passing + 1 test failing → bloqueia com tests_not_passing e failing_tests populado', async () => {
     await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
+      { tenant_id: TEST_TENANT_ID, agent_id: TEST_AGENT_ID },
       async () => {
         const def = await seedProposedDefinition('lifecycle-2');
         await seedTest(def.id, 'pass');
@@ -486,7 +523,7 @@ describe('P3c procedure governance', () => {
 
   it('cenário 3: todos tests passing → promoção succeeds', async () => {
     await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
+      { tenant_id: TEST_TENANT_ID, agent_id: TEST_AGENT_ID },
       async () => {
         const def = await seedProposedDefinition('lifecycle-3');
         const t1 = await seedTest(def.id, 'fail');
@@ -569,7 +606,7 @@ describe('P3c procedure governance', () => {
     );
 
     await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
+      { tenant_id: TEST_TENANT_ID, agent_id: TEST_AGENT_ID },
       async () => {
         const result = await runProcedureTest({
           test_id: 'chain',
@@ -598,18 +635,40 @@ describe('P3c procedure governance', () => {
         expect(result.details.actual_outcome).toBe('success');
         expect(result.details.actual_step_path).toEqual(['A', 'B', 'C']);
         expect(result.details.diff).toEqual([]);
+
+        // Issue #346: prove the flow under test runs under a concrete,
+        // non-`'default'` (tenant, agent). `runProcedureTest` deliberately
+        // opens its OWN dedicated sandbox context ('sandbox-test' / 'sandbox')
+        // and ignores the caller's — so the execution rows are stamped with the
+        // sandbox tuple, NEVER the legacy `'default'` sentinel. Asserting the
+        // captured context here pins that isolation and catches any regression
+        // that let the flow fall back to the default path.
+        expect(procedureTestContextsSeen.length).toBeGreaterThan(0);
+        for (const ctx of procedureTestContextsSeen) {
+          expect(ctx.tenant_id).not.toBe('default');
+          expect(ctx.agent_id).not.toBe('default');
+          expect(ctx.tenant_id).toBe('sandbox-test');
+          expect(ctx.agent_id).toBe('sandbox');
+        }
       },
     );
   });
 
   it('cenário 5: reaper marca execução stale (8d in_progress) como abandoned/no_response com event auto_abandoned', async () => {
-    tenantsState.push({ id: 'tenant-a', nome: 'A', status: 'active' });
+    tenantsState.push({ id: TEST_TENANT_ID, nome: 'Acme', status: 'active' });
     // Seed direto na in-memory store — a fixture precisa ter last_activity_at
     // de 8 dias atrás para passar pelo cutoff (TTL default 7d).
+    //
+    // Issue #346: the stale execution is owned by a REAL (tenant, agent) —
+    // 'acme' / 'test-agent-1' — NOT the legacy `'default'` sentinel. The reaper
+    // enumerates the (tenant_id, agent_id) tuple off this row and opens
+    // per-tuple context with that exact agent, so this proves the post-#323
+    // per-agent fan-out path end-to-end (the worker no longer hard-codes
+    // `agent_id:'default'`).
     execState['exec-stale'] = {
       id: 'exec-stale',
-      tenant_id: 'tenant-a',
-      agent_id: 'default',
+      tenant_id: TEST_TENANT_ID,
+      agent_id: TEST_AGENT_ID,
       conversa_id: 'conv-stale',
       definition_id: 'def-stale',
       definition_version: 1,
@@ -625,6 +684,19 @@ describe('P3c procedure governance', () => {
     };
 
     await runProcedureExecutionReaper();
+
+    // 0. Issue #346: the reaper opened context for the REAL (tenant, agent) and
+    // never for the `'default'` literal. `getCurrentAgent()` (read inside the
+    // listStaleInProgress mock) rejects/meters `'default'`, so the captured
+    // value proves the worker took the post-migration per-agent path.
+    expect(reaperContextsSeen).toContainEqual({
+      tenant_id: TEST_TENANT_ID,
+      agent_id: TEST_AGENT_ID,
+    });
+    for (const ctx of reaperContextsSeen) {
+      expect(ctx.tenant_id).not.toBe('default');
+      expect(ctx.agent_id).not.toBe('default');
+    }
 
     // 1. event auto_abandoned gravado, com step_id e payload corretos.
     const reapedEvents = events.filter((e) => e.event_type === 'auto_abandoned');
