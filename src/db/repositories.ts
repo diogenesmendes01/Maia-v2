@@ -288,6 +288,53 @@ export const pessoasRepo = {
       result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>,
     );
   },
+
+  /**
+   * Issue #345 (Phase 4 of #323) — dispatcher enumeration for the briefing
+   * workers (`briefing_morning` / `briefing_evening` / `briefing_weekly`).
+   *
+   * Returns the DISTINCT (tenant_id, agent_id) tuples that own at least one
+   * ACTIVE owner pessoa — i.e. exactly the tuples whose briefing would have a
+   * recipient. The predicate mirrors `governance/permissions.listOwners()`
+   * EXACTLY (`tipo IN ('dono','co_dono') AND status = 'ativa'`), which is the
+   * function each briefing's `sendToOwners()` calls to pick recipients. A tuple
+   * is therefore enumerated iff `sendToOwners()` would send at least one message
+   * under it; a tuple with no active owner is correctly skipped (the old
+   * `default/default` run would also have sent nothing if `default` had no owner).
+   *
+   * This is the recipient-defining enumeration (NOT a financial-data one): a
+   * tuple with active owners but zero entities still gets a briefing run — the
+   * inner just produces an empty "Saldos por entidade" list, exactly as the old
+   * single-tenant path did. That matches `sendToOwners` semantics (briefings are
+   * addressed to owners, financial data merely fills the body), and avoids
+   * UNDER-enumeration (no owner who would have been briefed is missed).
+   *
+   * The 3 briefing periods share this one enumeration: all three address the same
+   * owner set; only the body window differs (today / 7-day), which is an inner
+   * concern, not a recipient concern.
+   *
+   * Runs OUTSIDE tenant context (it IS the dispatcher); no tenant guard
+   * (cross-tenant iteration is the worker's contract). Belt-and-suspenders
+   * `tenant_id/agent_id IS NOT NULL` mirrors #251/#292 (schema already enforces
+   * NOT NULL with a legacy 'default' default; this guards a future relaxation).
+   * Before this fix all three briefings ran under a hardcoded `default/default`
+   * context, so only the default agent's owners were ever briefed.
+   */
+  async listTenantAgentPairsWithActiveOwner(): Promise<
+    Array<{ tenant_id: string; agent_id: string }>
+  > {
+    const result = await db.execute<{ tenant_id: string; agent_id: string }>(sql`
+      SELECT DISTINCT tenant_id, agent_id
+      FROM ${pessoas}
+      WHERE tenant_id IS NOT NULL
+        AND agent_id IS NOT NULL
+        AND tipo IN ('dono', 'co_dono')
+        AND status = 'ativa'
+    `);
+    return Array.from(
+      result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>,
+    );
+  },
 };
 
 export const permissoesRepo = {
@@ -848,8 +895,26 @@ export const mensagensRepo = {
 };
 
 export const entidadesRepo = {
+  /**
+   * Issue #345 (Phase 4 of #323) — tenant-scope the entity list.
+   *
+   * `list()` feeds the briefing inners (morning/evening/weekly), which now run
+   * ONCE PER enumerated (tenant_id, agent_id) tuple. An UNSCOPED `select(entidades)`
+   * would return EVERY tenant's entities under each tuple's run, and the morning
+   * briefing's per-entity `contasRepo.byEntity()` + balance sum would then mix
+   * another tenant's accounts into the briefing sent to THIS tenant's owner — a
+   * severe cross-tenant financial leak (the inviolable isolation invariant). Bind
+   * the current ALS (tenant_id, agent_id) so the list is the running tuple's
+   * entities only. `entidades` carries both columns (schema NOT NULL), so the
+   * predicate is exact.
+   */
   async list(): Promise<Entidade[]> {
-    return db.select().from(entidades);
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(entidades)
+      .where(and(eq(entidades.tenant_id, tenant_id), eq(entidades.agent_id, agent_id)));
   },
   async byId(id: string): Promise<Entidade | null> {
     const rows = await db.select().from(entidades).where(eq(entidades.id, id)).limit(1);
@@ -867,8 +932,32 @@ export const entidadesRepo = {
 };
 
 export const contasRepo = {
+  /**
+   * Issue #345 (Phase 4 of #323) — tenant-scope the per-entity account read.
+   *
+   * `byEntity()` is called by the morning briefing inner (per entity, per tuple)
+   * and by read tools (`query-balance`, `compare-entities`). Filtering by
+   * `entidade_id` ALONE is not enough: `entidade_id` is a random UUID, but a
+   * per-tuple briefing run that already (pre-fix) saw another tenant's entities
+   * would then read that entity's accounts and sum their balances into THIS
+   * tenant's briefing. Add an EXPLICIT (tenant_id, agent_id) predicate bound from
+   * ALS so a row is returned iff it belongs to the running tuple — defense in
+   * depth alongside the now-scoped `entidadesRepo.list()`. `contas_bancarias`
+   * carries both columns (schema NOT NULL).
+   */
   async byEntity(entidade_id: string): Promise<Conta[]> {
-    return db.select().from(contas_bancarias).where(eq(contas_bancarias.entidade_id, entidade_id));
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(contas_bancarias)
+      .where(
+        and(
+          eq(contas_bancarias.tenant_id, tenant_id),
+          eq(contas_bancarias.agent_id, agent_id),
+          eq(contas_bancarias.entidade_id, entidade_id),
+        ),
+      );
   },
   async byId(id: string): Promise<Conta | null> {
     const rows = await db
