@@ -487,13 +487,52 @@ export const conversasRepo = {
     return rows[0]!;
   },
   async touch(id: string): Promise<void> {
+    // Flip-readiness (#323): scope the last-activity bump to the current
+    // (tenant_id, agent_id) — bound from ALS — mirroring the hardened `close`
+    // above. Both columns are NOT NULL; every caller runs inside
+    // `runWithTenantContext` with a real pair (the agent core's
+    // `runAgentForMensagemInner`, wrapped at core.ts via
+    // `runWithTenantContext({tenant_id, agent_id})`, plus `identity/resolver`
+    // which reaches `touch` only after the agent-scoped `findActive`/`create`
+    // resolved `c` under the SAME context — so `c.agent_id === getCurrentAgent()`).
+    // Deliberately NO row-count assertion: `touch` is a best-effort
+    // last-activity bump on the hot path; a 0-row no-op (e.g. a future legacy
+    // default/default path) must NEVER crash message processing. Predicate
+    // only — defense-in-depth without a hot-path failure mode.
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     await db
       .update(conversas)
       .set({ ultima_atividade_em: new Date() })
-      .where(eq(conversas.id, id));
+      .where(
+        and(
+          eq(conversas.id, id),
+          eq(conversas.tenant_id, tenant_id),
+          eq(conversas.agent_id, agent_id),
+        ),
+      );
   },
   async updateMetadata(id: string, metadata: Record<string, unknown>): Promise<void> {
-    await db.update(conversas).set({ metadata }).where(eq(conversas.id, id));
+    // Flip-readiness (#323): tenant+agent scope the WHERE (bound from ALS), as
+    // with the sibling metadata writers below. PREDICATE-ONLY (no row-count
+    // assertion): this full-object setter currently has NO live caller in
+    // `src/` (the lightweight-pending flow that used it was deprecated in favour
+    // of the atomic `mergeMetadata`/`unsetMetadataKey` jsonb variants), so there
+    // is no caller whose "row must exist" expectation we can confirm — per the
+    // brief's "if unsure, scope without the throw" guidance we add the predicate
+    // and stop short of fail-loud.
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    await db
+      .update(conversas)
+      .set({ metadata })
+      .where(
+        and(
+          eq(conversas.id, id),
+          eq(conversas.tenant_id, tenant_id),
+          eq(conversas.agent_id, agent_id),
+        ),
+      );
   },
   /**
    * Atomic partial merge into conversas.metadata via the jsonb `||`
@@ -502,10 +541,28 @@ export const conversasRepo = {
    * overwrite existing keys in metadata; everything else is preserved.
    */
   async mergeMetadata(id: string, patch: Record<string, unknown>): Promise<void> {
+    // Flip-readiness (#323): tenant+agent scope the WHERE (bound from ALS). The
+    // only LIVE caller is the agent core's post-turn scope-hash persist
+    // (core.ts), which runs inside `runWithTenantContext({tenant_id, agent_id})`
+    // on a conversa `c` it already resolved under the SAME context — so
+    // `c.agent_id === getCurrentAgent()` and the predicate matches. (The
+    // deprecated `setLightweightPending` path is dead code: no live caller.)
+    // PREDICATE-ONLY (no throw): that caller wraps this in try/catch and treats
+    // it as explicitly best-effort ("last-writer-wins ... is fine"); a 0-row
+    // no-op is benign there, so a fail-loud assertion would only ever degrade to
+    // a swallowed warning while risking the hot path. Predicate only.
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     await db
       .update(conversas)
       .set({ metadata: sql`${conversas.metadata} || ${JSON.stringify(patch)}::jsonb` })
-      .where(eq(conversas.id, id));
+      .where(
+        and(
+          eq(conversas.id, id),
+          eq(conversas.tenant_id, tenant_id),
+          eq(conversas.agent_id, agent_id),
+        ),
+      );
   },
   /**
    * Atomic key removal from conversas.metadata via the jsonb `-` operator.
@@ -516,10 +573,24 @@ export const conversasRepo = {
    * would silently drop concurrent keys.
    */
   async unsetMetadataKey(id: string, key: string): Promise<void> {
+    // Flip-readiness (#323): tenant+agent scope the WHERE (bound from ALS),
+    // mirroring `mergeMetadata`. PREDICATE-ONLY (no throw): this is reachable
+    // only through the deprecated lightweight-pending chain
+    // (`clearLightweightPending` ← `applyResolution`), which has NO live caller
+    // in `src/` — so there is no caller whose row-existence expectation we can
+    // confirm. Per "if unsure, scope without the throw", predicate only.
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     await db
       .update(conversas)
       .set({ metadata: sql`${conversas.metadata} - ${key}` })
-      .where(eq(conversas.id, id));
+      .where(
+        and(
+          eq(conversas.id, id),
+          eq(conversas.tenant_id, tenant_id),
+          eq(conversas.agent_id, agent_id),
+        ),
+      );
   },
   async close(id: string, contexto_resumido: string): Promise<void> {
     // Issue #345 (Phase 4 review): `conversation-summarizer` runs PER enumerated
@@ -543,10 +614,24 @@ export const conversasRepo = {
       );
   },
   async invalidateScopeForPessoa(pessoa_id: string): Promise<void> {
+    // Flip-readiness (#323): bulk UPDATE by pessoa_id — tenant+agent scope the
+    // WHERE (bound from ALS) so a pessoa shared across tenants can never have
+    // another tenant's conversa scope invalidated. NO row-count assertion: this
+    // is a bulk write (a pessoa may own 0..N conversas) where a variable/0 row
+    // count is legitimate. (Currently no live caller in `src/`; predicate added
+    // proactively for the flip per the audit.)
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     await db
       .update(conversas)
       .set({ escopo_entidades: [] })
-      .where(eq(conversas.pessoa_id, pessoa_id));
+      .where(
+        and(
+          eq(conversas.pessoa_id, pessoa_id),
+          eq(conversas.tenant_id, tenant_id),
+          eq(conversas.agent_id, agent_id),
+        ),
+      );
   },
 
   /**
@@ -752,7 +837,42 @@ export const mensagensRepo = {
     return rows;
   },
   async setConversaId(id: string, conversa_id: string): Promise<void> {
-    await db.update(mensagens).set({ conversa_id }).where(eq(mensagens.id, id));
+    // Flip-readiness (#323): tenant+agent scope the WHERE (bound from ALS),
+    // mirroring `mensagensRepo.findById` which gates on the same pair. Both
+    // columns are NOT NULL. The two live callers (agent core, core.ts) both run
+    // inside `runWithTenantContext({tenant_id, agent_id})` and act on the
+    // `inbound` row that `findById(mensagem_id)` ALREADY resolved under the SAME
+    // (tenant_id, agent_id) — so `inbound.agent_id === getCurrentAgent()` and
+    // the predicate matches the exact row.
+    // FAIL-LOUD (throw on !=1): this targets one specific, known-present row
+    // (the inbound just loaded by the agent-scoped findById) and is NOT a
+    // best-effort path — a 0-row no-op would silently fail to attach the message
+    // to its conversation, corrupting history/recovery linkage. The previous
+    // id-only WHERE always matched, so a silent miss under the new predicate
+    // would be a regression; turn it into a loud failure. Same
+    // `.returning({id})` + `.length` idiom as `updateStateTx` /
+    // `adoptToResolvedTenantCrossTenant`.
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const updated = await db
+      .update(mensagens)
+      .set({ conversa_id })
+      .where(
+        and(
+          eq(mensagens.id, id),
+          eq(mensagens.tenant_id, tenant_id),
+          eq(mensagens.agent_id, agent_id),
+        ),
+      )
+      .returning({ id: mensagens.id });
+    if (updated.length !== 1) {
+      throw new Error(
+        `mensagensRepo.setConversaId matched ${updated.length} rows for mensagem ` +
+          `${id} under ${tenant_id}/${agent_id} — expected 1 (tenant/agent ` +
+          `context does not match the target row; the conversa linkage would ` +
+          `have been silently lost)`,
+      );
+    }
   },
   /**
    * Bulk variant for the debounce aggregation path: adopts orphan
@@ -761,16 +881,71 @@ export const mensagensRepo = {
    */
   async setConversaIdMany(ids: string[], conversa_id: string): Promise<void> {
     if (ids.length === 0) return;
+    // Flip-readiness (#323): bulk UPDATE over `inArray(id, ids)` — tenant+agent
+    // scope the WHERE (bound from ALS) so the debounce-adoption pass can only
+    // re-home THIS tenant/agent's orphan inbound rows. The sole live caller
+    // (agent core, core.ts) runs inside `runWithTenantContext({tenant_id,
+    // agent_id})` and passes ids drawn from `aggregateUnprocessedTexts`, which
+    // selects via the agent-scoped `listUnprocessedByTelefone` — so every id
+    // already belongs to the running pair. NO row-count assertion: this is a
+    // bulk write whose matched count is intentionally variable (the method is a
+    // documented no-op for ids already attached to the conversa), so an exact-N
+    // assertion would be wrong; the caller also treats it as best-effort.
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     await db
       .update(mensagens)
       .set({ conversa_id })
-      .where(inArray(mensagens.id, ids));
+      .where(
+        and(
+          inArray(mensagens.id, ids),
+          eq(mensagens.tenant_id, tenant_id),
+          eq(mensagens.agent_id, agent_id),
+        ),
+      );
   },
   async markProcessed(id: string, tokens: number | null): Promise<void> {
-    await db
+    // Flip-readiness (#323): tenant+agent scope the WHERE (bound from ALS),
+    // mirroring `mensagensRepo.findById`. Both columns are NOT NULL. Every live
+    // caller is the agent core (core.ts), inside
+    // `runWithTenantContext({tenant_id, agent_id})`, marking either the `inbound`
+    // row that the agent-scoped `findById` resolved under the SAME pair, or its
+    // debounce siblings (selected via the agent-scoped
+    // `listUnprocessedByTelefone`) — so every targeted row carries the running
+    // (tenant_id, agent_id) and the predicate matches.
+    // FAIL-LOUD (throw on !=1): this stamps `processada_em` on one specific,
+    // known-present row to mark a turn done. A silent 0-row no-op would leave
+    // the row unprocessed and the recovery worker would requeue it forever
+    // (or, for the unknown/blocked/quarantined drop paths, re-deliver to the
+    // LLM) — a real bug, not a benign miss. The id-only WHERE always matched, so
+    // a silent miss under the new predicate is a regression worth surfacing
+    // loudly. (Where a caller treats marking as best-effort — the
+    // `markAllProcessed` per-row loop in core.ts — it already wraps this in
+    // try/catch, so the throw degrades to a logged warning there rather than
+    // crashing the turn; the strict paths (unknown/blocked/quarantined drops)
+    // get the loud failure.) Same `.returning({id})` + `.length` idiom as the
+    // sibling compare-and-swap writes.
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const updated = await db
       .update(mensagens)
       .set({ processada_em: new Date(), tokens_usados: tokens ?? null })
-      .where(eq(mensagens.id, id));
+      .where(
+        and(
+          eq(mensagens.id, id),
+          eq(mensagens.tenant_id, tenant_id),
+          eq(mensagens.agent_id, agent_id),
+        ),
+      )
+      .returning({ id: mensagens.id });
+    if (updated.length !== 1) {
+      throw new Error(
+        `mensagensRepo.markProcessed matched ${updated.length} rows for mensagem ` +
+          `${id} under ${tenant_id}/${agent_id} — expected 1 (tenant/agent ` +
+          `context does not match the target row; the message would have been ` +
+          `left unprocessed and requeued indefinitely)`,
+      );
+    }
   },
 
   // [P88-C1] EXPLICITLY bypasses applyTenantGuard — the channel resolver

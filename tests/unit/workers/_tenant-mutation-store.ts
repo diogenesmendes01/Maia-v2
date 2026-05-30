@@ -16,8 +16,9 @@
  * place the bound `tenant_id`/`agent_id` params scope the match to the running
  * tuple, leaving other tenants' rows untouched.
  *
- * The predicate evaluator understands exactly the two shapes these repos emit:
- *   - equality terms  `eq(col, value)`  → `row[col.name] === value`
+ * The predicate evaluator understands exactly the shapes these repos emit:
+ *   - equality terms  `eq(col, value)`     → `row[col.name] === value`
+ *   - membership terms `inArray(col, vals)` → `vals.includes(row[col.name])`
  *   - the raw fragment `sql\`expira_em < now()\`` → `row.expira_em < NOW`
  * combined with drizzle's `and(...)`. Anything else throws loudly so a future
  * predicate change can't silently pass.
@@ -68,9 +69,10 @@ function isStringChunk(o: unknown): o is { value: string[] } {
   return ctorName(o) === 'StringChunk' && Array.isArray((o as { value?: unknown }).value);
 }
 
-/** A parsed predicate term: an equality binding or a raw SQL fragment. */
+/** A parsed predicate term: an equality / membership binding or a raw fragment. */
 type Term =
   | { kind: 'eq'; column: string; value: unknown }
+  | { kind: 'in'; column: string; values: unknown[] }
   | { kind: 'raw'; text: string };
 
 /**
@@ -113,6 +115,28 @@ function asEqTerm(node: SqlNode): Term | null {
 }
 
 /**
+ * Recognise an `inArray(col, values)` SQL node. drizzle renders it as
+ * `[StringChunk(""), Column, StringChunk(" in "), <JS Array of Param nodes>,
+ * StringChunk("")]` — i.e. the value list is a plain JS array (NOT a single
+ * Param) whose elements are Param nodes. We extract `col.name` and unwrap each
+ * Param's `.value`. Empty IN-lists never occur here (`setConversaIdMany`
+ * early-returns on `ids.length === 0`).
+ */
+function asInArrayTerm(node: SqlNode): Term | null {
+  const chunks = node.queryChunks ?? [];
+  const col = chunks.find(isColumn) as ColumnNode | undefined;
+  const hasInOp = chunks.some(
+    (c) => isStringChunk(c) && (c as { value: string[] }).value.join('').includes(' in '),
+  );
+  const arr = chunks.find((c) => Array.isArray(c)) as unknown[] | undefined;
+  if (col?.name && hasInOp && Array.isArray(arr)) {
+    const values = arr.map((p) => (isParam(p) ? (p as ParamNode).value : p));
+    return { kind: 'in', column: col.name, values };
+  }
+  return null;
+}
+
+/**
  * Walk a drizzle predicate (the argument to `.where(...)`) into a flat list of
  * terms. Handles `and(...)` nesting transparently. Throws on any construct the
  * evaluator does not understand, so the harness can never give a false pass.
@@ -127,6 +151,12 @@ export function parsePredicate(predicate: unknown): Term[] {
     const eq = asEqTerm(node);
     if (eq) {
       terms.push(eq);
+      return;
+    }
+    // An inArray membership term?
+    const inTerm = asInArrayTerm(node);
+    if (inTerm) {
+      terms.push(inTerm);
       return;
     }
     // A raw fragment (e.g. `expira_em < now()`)?
@@ -167,6 +197,8 @@ export function rowMatches(row: StoreRow, terms: Term[], now: Date): boolean {
   for (const t of terms) {
     if (t.kind === 'eq') {
       if (row[t.column] !== t.value) return false;
+    } else if (t.kind === 'in') {
+      if (!t.values.includes(row[t.column])) return false;
     } else if (!rawFragmentSatisfied(t.text, row, now)) {
       return false;
     }
