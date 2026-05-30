@@ -212,4 +212,23 @@ describe('working memory — atomic data write (#333)', () => {
       expect(stub.ttls.get(dataKey)).toBe(TTL_SECONDS);
     }
   });
+
+  it('a large message round-trips intact and still lands with a TTL (no size guard today)', async () => {
+    // Characterization test (#339 review note): working memory has NO
+    // message-size guard. A large payload must still write atomically through
+    // the single EVAL — entry pushed, TTL applied — and read back byte-for-byte.
+    // This documents current behavior (large messages are accepted) so a future
+    // size cap is a deliberate, test-visible change rather than a silent one.
+    const big = 'x'.repeat(256 * 1024); // 256 KiB of text
+    await asTenantA(() => pushMessage('conv-big', 'user', big));
+
+    const key = workingKey('conv-big');
+    expect(stub.ttls.get(key)).toBe(TTL_SECONDS); // still atomic: data + TTL together
+    const stored = await stub.lrange(key);
+    expect(stored).toHaveLength(1);
+    const parsed = JSON.parse(stored[0]!) as { role: string; text: string };
+    expect(parsed.role).toBe('user');
+    expect(parsed.text).toBe(big); // payload preserved exactly, not truncated
+    expect(parsed.text).toHaveLength(big.length);
+  });
 });

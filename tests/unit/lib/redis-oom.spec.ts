@@ -72,6 +72,25 @@ describe('isRedisOomError (#309)', () => {
     expect(isRedisOomError(new Error(OOM_MESSAGE))).toBe(true);
   });
 
+  it('detects the WRAPPED Lua/EVAL OOM form (leading token is ERR, not OOM) — #333/#339', () => {
+    // An OOM raised INSIDE a server-side script (e.g. the atomic working-memory
+    // EVAL) is surfaced wrapped: the reply begins with `ERR Error running
+    // script …` and embeds the canonical OOM phrase further along. The leading
+    // token is `ERR`, so a prefix-anchored check would miss it — the substring
+    // branch must catch it (otherwise `pushMessage` rethrows instead of failing
+    // open, the exact PR #339 regression).
+    const wrapped =
+      "ERR Error running script (call to f_0123456789abcdef): @user_script:1: " +
+      OOM_MESSAGE;
+    // Sanity: it really does NOT start with the OOM token.
+    expect(/^\s*OOM\b/i.test(wrapped)).toBe(false);
+    expect(isRedisOomError(new ReplyError(wrapped))).toBe(true);
+    // Also via the genuine ReplyError shape with the name preserved.
+    expect(
+      isRedisOomError(Object.assign(new Error(wrapped), { name: 'ReplyError' })),
+    ).toBe(true);
+  });
+
   it('is case-insensitive on the OOM token', () => {
     const err = Object.assign(new Error("oom command not allowed"), { name: 'ReplyError' });
     expect(isRedisOomError(err)).toBe(true);

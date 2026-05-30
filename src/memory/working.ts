@@ -158,14 +158,24 @@ const MESSAGES_BUFFER_SIZE = 20;
  * `working_memory_ttl_miss_total`. The result was data with no expiration AND no
  * observability — outside the #330/#317 TTL-miss alert window.
  *
- * FIX: collapse the three commands into ONE server-side EVAL. Redis executes a
- * script atomically and in isolation — no other command interleaves, and there
- * is no client-visible point between the `rpush` and the `expire`. The list key
- * can therefore NEVER exist without its TTL: either the whole script commits
- * (push + trim + expire) or, on an error mid-script (e.g. OOM under
- * `noeviction`), Redis aborts it and the data write does not land at all. This
- * is the STRONGLY-preferred Lua approach over MULTI/EXEC (a single round trip on
- * a hot path, and truly atomic rather than merely pipelined).
+ * FIX: collapse the three commands into ONE server-side EVAL. Redis runs a
+ * script with ISOLATION — it executes as an indivisible unit with no other
+ * command interleaving, so there is no client-visible point between the `rpush`
+ * and the `expire`. Note this is isolation, NOT transactional rollback: if a
+ * command mid-script failed, Redis would NOT undo the commands that already ran
+ * (a partial effect would persist). What makes the "data never lacks a TTL"
+ * guarantee hold here is the COMMAND ORDER plus the fact the later commands
+ * cannot fail given the script reached them:
+ *   - If the FIRST command (`rpush`) is rejected — e.g. an OOM under
+ *     `noeviction` — the script aborts before any write lands, so NOTHING is
+ *     created (no list to leave without a TTL).
+ *   - If `rpush` succeeds, the list key now exists and the TTL is a positive
+ *     integer, so `ltrim` and `expire` cannot fail on valid args. The script
+ *     always reaches `expire`, so a created list ALWAYS ends with its TTL.
+ * The narrow remaining failure mode is an OOM on the `rpush` itself, which is
+ * the all-or-nothing case above. This is the STRONGLY-preferred Lua approach
+ * over MULTI/EXEC (a single round trip on a hot path, and truly atomic rather
+ * than merely pipelined).
  *
  * Contract:
  *   KEYS[1] = data list key (tenant+agent scoped — isolation is inviolable)
@@ -254,12 +264,15 @@ export async function pushMessage(
   // OOM handling (#309): working memory is a CACHE — Postgres is the source of
   // truth (the buffer is rebuilt from persisted `mensagens` on the next turn;
   // see the file docblock and runbook §4.5). On a Redis OOM under `noeviction`
-  // the script's first `rpush` is rejected and Redis aborts the whole EVAL, so
-  // NOTHING is written (atomicity makes this strictly cleaner than the old
-  // multi-call path — there is no partial list to leave behind). ioredis
-  // surfaces the aborted script as a `ReplyError` whose message starts with
-  // `OOM`, so `isRedisOomError` classifies it exactly as before. We degrade
-  // FAIL-OPEN: emit the OOM metric + warning and return WITHOUT writing the
+  // the script's first `rpush` is rejected, which aborts the EVAL before any
+  // command runs, so NOTHING is written (no partial list to leave behind — this
+  // is the "data never lacks a TTL" guarantee from APPEND_MESSAGE_LUA, resting
+  // on command ORDER, not on rollback: Redis isolates scripts but does not undo
+  // already-executed commands). ioredis surfaces the aborted script not as a
+  // bare `OOM …` reply but WRAPPED as `ReplyError: ERR Error running script …:
+  // … OOM command not allowed …`; `isRedisOomError` matches that wrapped form
+  // via its `OOM command not allowed` substring branch (#333/#339 review). We
+  // degrade FAIL-OPEN: emit the OOM metric + warning and return WITHOUT writing the
   // TTL/collision marker (the buffer never landed, so a marker would manufacture
   // a false TTL miss on the next read). Fail-open is safe here: the key is
   // already tenant+agent-scoped (no isolation risk in dropping a write) and the

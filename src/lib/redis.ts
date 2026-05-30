@@ -27,11 +27,28 @@ export const redis = new IORedis(config.REDIS_URL, {
  * (ioredis-mock, re-thrown errors) attach a string `.code`, so we accept a
  * `.code` of `'OOM'` too for defense-in-depth.
  *
- * Detection is intentionally narrow: it matches the `OOM` reply prefix
- * (case-insensitive, token-anchored) and NOT any message that merely
+ * WRAPPED (Lua/EVAL) form — issue #333 / PR #339 review. When the OOM is
+ * raised INSIDE a server-side script (e.g. the atomic `rpush`+`ltrim`+`expire`
+ * EVAL in `src/memory/working.ts`), Redis does NOT surface the bare `OOM …`
+ * reply. It wraps it in a script-runtime error whose reply text begins with
+ * `ERR` and embeds the original message further along:
+ *
+ *   ReplyError: ERR Error running script (call to f_<sha>): @user_script:1:
+ *   OOM command not allowed when used memory > 'maxmemory'.
+ *
+ * Here the leading token is `ERR`, not `OOM`, so the prefix-anchored checks
+ * below do NOT fire. We therefore ALSO accept any message that CONTAINS the
+ * substring `OOM command not allowed` anywhere in the reply. That exact phrase
+ * is Redis' canonical OOM rejection text and is specific to a genuine
+ * out-of-memory condition, so the substring match cannot false-positive on
+ * lookalike words ("zoom", "room") the way a bare "oom" substring would.
+ *
+ * Detection is otherwise intentionally narrow: it matches the `OOM` reply
+ * prefix (case-insensitive, token-anchored) and NOT any message that merely
  * contains the substring "oom" (e.g. "zoom", "room"). We anchor on the
- * leading token because Redis always emits the error code as the first
- * word of the reply.
+ * leading token because Redis emits the error code as the first word of a
+ * direct command reply; the substring branch above handles the wrapped
+ * script-error form where `ERR` leads instead.
  *
  * This is the SINGLE source of truth for "is this an OOM?" so every caller
  * degrades on the same condition (see callers in `src/memory/working.ts`,
@@ -58,7 +75,13 @@ export function isRedisOomError(err: unknown): boolean {
   // lose `.name` while preserving the message, so a message that begins with
   // the exact OOM reply text is also accepted.
   const hasOomReplyText = /^\s*OOM command not allowed/i.test(e.message);
-  return (isReplyError && startsWithOom) || hasOomReplyText;
+  // Wrapped/Lua form (#333/#339): an OOM raised inside an EVAL surfaces as
+  // `ERR Error running script …: … OOM command not allowed …`, where `OOM` is
+  // NOT the leading token. Match the canonical OOM phrase anywhere in the reply
+  // — it is specific to a genuine out-of-memory rejection, so this does not
+  // false-positive on "zoom"/"room".
+  const containsOomReplyText = /OOM command not allowed/i.test(e.message);
+  return (isReplyError && startsWithOom) || hasOomReplyText || containsOomReplyText;
 }
 
 /**

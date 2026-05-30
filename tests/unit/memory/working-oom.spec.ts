@@ -11,11 +11,20 @@
  *     - NO write-deadline is recorded, so the NEXT read does not mis-report a
  *       TTL miss for a write that never landed.
  *
- * Strategy: an in-memory redis stub whose `rpush` throws a genuine ioredis
- * `ReplyError`. `@/lib/redis.js` is fully mocked (the real module builds an
- * ioredis client at import); `recordRedisOomDegraded` in the mock is backed by
- * the REAL metrics counter + the mocked logger so the assertions are
- * end-to-end. The detector itself is unit-tested in `lib/redis-oom.spec.ts`.
+ * Strategy: an in-memory redis stub whose atomic `eval` (the #333 data write)
+ * throws a genuine ioredis `ReplyError`. CRUCIALLY the thrown message is the
+ * WRAPPED Lua/EVAL form Redis actually produces when an OOM is raised INSIDE a
+ * script — `ERR Error running script …: … OOM command not allowed …` — NOT the
+ * bare `OOM …` reply. That wrapped form does NOT start with `OOM`, so it only
+ * classifies as an OOM thanks to the substring branch added to the real
+ * `isRedisOomError` (#333/#339 review). The mock's `detectOom` mirrors that
+ * fixed production detector exactly (the real detector is the source of truth,
+ * unit-tested against the genuine error shape in `lib/redis-oom.spec.ts`),
+ * so this spec exercises the true fail-open control flow rather than a stale
+ * narrow copy that would falsely pass. `@/lib/redis.js` is fully mocked (the
+ * real module builds an ioredis client at import); `recordRedisOomDegraded` in
+ * the mock is backed by the REAL metrics counter + the mocked logger so the
+ * assertions are end-to-end.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { runWithTenantContext } from '@/db/tenant-context.js';
@@ -28,8 +37,17 @@ const { stub, logWarn } = vi.hoisted(() => {
   const markers = new Map<string, string>();
   let oomOnRpush = false;
   let oomOnMarkerSet = false;
+  // The Lua-WRAPPED OOM reply Redis emits when the OOM is raised inside an EVAL
+  // (issue #333/#339 review). Note the leading token is `ERR`, NOT `OOM`: the
+  // canonical OOM phrase is buried mid-message, so prefix-anchored detection
+  // would MISS it. Only the substring branch in the real `isRedisOomError`
+  // catches this. Using this form (not the bare `OOM …` reply) ensures the test
+  // exercises the production fail-open path instead of trivially passing.
+  const WRAPPED_OOM_MESSAGE =
+    "ERR Error running script (call to f_0123456789abcdef): @user_script:1: " +
+    "OOM command not allowed when used memory > 'maxmemory'.";
   const oom = () =>
-    Object.assign(new Error("OOM command not allowed when used memory > 'maxmemory'."), {
+    Object.assign(new Error(WRAPPED_OOM_MESSAGE), {
       name: 'ReplyError',
     });
   const s = {
@@ -75,12 +93,22 @@ const { stub, logWarn } = vi.hoisted(() => {
   return { stub: s, logWarn: vi.fn() };
 });
 
+// Mirror of the REAL `isRedisOomError` in `src/lib/redis.ts` (kept in lockstep;
+// the real one is the source of truth and is unit-tested in
+// `lib/redis-oom.spec.ts`). The final substring branch is what classifies the
+// WRAPPED Lua/EVAL OOM form (`ERR Error running script …: … OOM command not
+// allowed …`) thrown by this spec — without it the wrapped error would not be
+// recognised and `pushMessage` would (incorrectly) rethrow.
 function detectOom(err: unknown): boolean {
   if (typeof err !== 'object' || err === null) return false;
   const e = err as { name?: string; code?: string; message?: string };
   if (typeof e.code === 'string' && e.code.toUpperCase() === 'OOM') return true;
   const msg = String(e.message ?? '');
-  return (e.name === 'ReplyError' && /^\s*OOM\b/i.test(msg)) || /^\s*OOM command not allowed/i.test(msg);
+  return (
+    (e.name === 'ReplyError' && /^\s*OOM\b/i.test(msg)) ||
+    /^\s*OOM command not allowed/i.test(msg) ||
+    /OOM command not allowed/i.test(msg)
+  );
 }
 
 vi.mock('@/lib/logger.js', () => ({
@@ -120,8 +148,28 @@ beforeEach(() => {
 });
 
 describe('working memory — OOM degradation (#309)', () => {
-  it('does NOT throw to the caller when rpush hits an OOM ReplyError', async () => {
+  it('the simulated OOM is the WRAPPED Lua/EVAL form (regression guard for the prefix bug)', async () => {
+    // Meta-assertion: prove the stub throws the wrapped form and that a
+    // prefix-anchored detector would MISS it — i.e. this test genuinely
+    // exercises the substring branch, not the old narrow path. If someone
+    // reverts the stub to the bare `OOM …` reply this guard fails loudly.
+    let thrown: unknown;
     stub.setOomOnRpush(true);
+    try {
+      await stub.eval('script', 1, 'k', 'v', '20', '86400');
+    } catch (e) {
+      thrown = e;
+    }
+    const msg = String((thrown as { message?: string }).message ?? '');
+    expect(/^\s*OOM\b/i.test(msg)).toBe(false); // does NOT start with OOM (it starts with ERR)
+    expect(msg).toContain('OOM command not allowed'); // canonical phrase is buried mid-message
+    expect(detectOom(thrown)).toBe(true); // the (fixed) detector still classifies it as OOM
+  });
+
+  it('fails OPEN (does NOT throw) when the atomic EVAL hits a WRAPPED-Lua OOM ReplyError', async () => {
+    stub.setOomOnRpush(true);
+    // The wrapped OOM must be absorbed exactly like the bare reply was: the
+    // turn that pushes a message must not crash.
     await expect(asTenantA(() => pushMessage('conv-1', 'user', 'olá'))).resolves.toBeUndefined();
   });
 
