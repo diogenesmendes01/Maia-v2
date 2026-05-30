@@ -12,12 +12,21 @@
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
-const { enqueueAgentMock, listUnprocessedMock, logWarn, logInfo } = vi.hoisted(() => ({
-  enqueueAgentMock: vi.fn(async () => undefined),
-  listUnprocessedMock: vi.fn(),
-  logWarn: vi.fn(),
-  logInfo: vi.fn(),
-}));
+const { enqueueAgentMock, listUnprocessedMock, listPairsMock, logWarn, logInfo } = vi.hoisted(
+  () => ({
+    enqueueAgentMock: vi.fn(async () => undefined),
+    listUnprocessedMock: vi.fn(),
+    // Issue #345 (Phase 4): the worker is now a DISPATCHER — it first enumerates
+    // the (tenant_id, agent_id) tuples with stuck messages, then runs the inner
+    // once per tuple. `runWithTenantContext` is mocked pass-through below, so
+    // these OOM/error tests (which exercise the INNER sweep) just need the
+    // enumeration to yield exactly one real tuple — the inner then reads via
+    // `listUnprocessedOlderThan` exactly as before.
+    listPairsMock: vi.fn(async () => [{ tenant_id: 'tenant-A', agent_id: 'agent-A' }]),
+    logWarn: vi.fn(),
+    logInfo: vi.fn(),
+  }),
+);
 
 // Re-use the real typed error so `instanceof` in the worker matches.
 class QueueRedisUnavailableError extends Error {
@@ -35,7 +44,10 @@ vi.mock('@/gateway/queue.js', () => ({
   QueueRedisUnavailableError,
 }));
 vi.mock('@/db/repositories.js', () => ({
-  mensagensRepo: { listUnprocessedOlderThan: listUnprocessedMock },
+  mensagensRepo: {
+    listUnprocessedOlderThan: listUnprocessedMock,
+    listTenantAgentPairsWithUnprocessedOlderThan: listPairsMock,
+  },
 }));
 vi.mock('@/lib/logger.js', () => ({
   logger: { warn: logWarn, info: logInfo, error: vi.fn(), debug: vi.fn() },
@@ -53,6 +65,8 @@ beforeEach(() => {
   enqueueAgentMock.mockReset();
   enqueueAgentMock.mockResolvedValue(undefined);
   listUnprocessedMock.mockReset();
+  listPairsMock.mockClear();
+  listPairsMock.mockResolvedValue([{ tenant_id: 'tenant-A', agent_id: 'agent-A' }]);
   logWarn.mockClear();
   logInfo.mockClear();
 });

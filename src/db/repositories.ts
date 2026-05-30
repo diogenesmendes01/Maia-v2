@@ -581,6 +581,40 @@ export const mensagensRepo = {
       .orderBy(mensagens.created_at)
       .limit(limit);
   },
+  /**
+   * Issue #345 (Phase 4 of #323) — dispatcher enumeration for `message-recovery`.
+   *
+   * Returns the DISTINCT (tenant_id, agent_id) tuples that own at least one
+   * stuck inbound message — i.e. exactly the tuples whose `listUnprocessedOlderThan`
+   * inner has rows to re-enqueue. The predicate mirrors that inner's filter
+   * EXACTLY (`processada_em IS NULL AND direcao = 'in' AND created_at < cutoff`)
+   * so a tuple is enumerated iff the inner would find work for it. `ms` is the
+   * same `STUCK_AFTER_MS` the worker passes to the inner, applied here as the
+   * cutoff so the dispatcher and inner agree on staleness.
+   *
+   * Runs OUTSIDE tenant context (it IS the dispatcher); no tenant guard
+   * (cross-tenant iteration is the worker's contract). Belt-and-suspenders
+   * `tenant_id/agent_id IS NOT NULL` mirrors #251/#292. Before this fix the
+   * worker ran the inner under a hardcoded `default/default` context, so only
+   * the default agent's stranded messages were ever re-enqueued.
+   */
+  async listTenantAgentPairsWithUnprocessedOlderThan(
+    ms: number,
+  ): Promise<Array<{ tenant_id: string; agent_id: string }>> {
+    const cutoff = new Date(Date.now() - ms);
+    const result = await db.execute<{ tenant_id: string; agent_id: string }>(sql`
+      SELECT DISTINCT tenant_id, agent_id
+      FROM ${mensagens}
+      WHERE tenant_id IS NOT NULL
+        AND agent_id IS NOT NULL
+        AND processada_em IS NULL
+        AND direcao = 'in'
+        AND created_at < ${cutoff.toISOString()}
+    `);
+    return Array.from(
+      result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>,
+    );
+  },
   async findById(id: string): Promise<Mensagem | null> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
@@ -1465,6 +1499,55 @@ export const pendingQuestionsRepo = {
           AND status IN ('pendente', 'em_andamento', 'aguardando_humano', 'aguardando_terceiro')
           AND proxima_acao_em IS NOT NULL
           AND proxima_acao_em < now()
+    `);
+    return Array.from(
+      result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>,
+    );
+  },
+
+  /**
+   * Issue #345 (Phase 4 of #323) — dispatcher enumeration for `pending-reminder`.
+   *
+   * Returns the DISTINCT (tenant_id, agent_id) tuples that own at least one
+   * pending_question due for a reminder. The predicate mirrors EXACTLY the
+   * reminder-eligibility filter in `runPendingReminderInner`'s SELECT
+   * (`status='aberta' AND expira_em > now() AND tipo != 'edit_review' AND
+   * created_at < now() - interval '1 hour' AND reminder_count < MAX AND
+   * (last_reminder_at IS NULL OR last_reminder_at < now() - interval '1 hour')`)
+   * so a tuple is enumerated iff the inner would find at least one row to remind.
+   * `maxReminders` is the worker's `MAX_REMINDERS` constant, threaded through so
+   * the cap stays in lockstep with the inner.
+   *
+   * NOTE: this enumeration scans only `pending_questions` (it does NOT join
+   * `pessoas`/`mensagens`). The inner's JOIN to `mensagens` (for the quoted
+   * outbound parent) is an additional eligibility gate the inner applies
+   * per-row (a row whose outbound parent is missing is skipped+audited), so a
+   * tuple can be enumerated yet send no reminder — a cheap no-op, never a
+   * cross-tenant read (the inner SELECT is now tenant-scoped — see worker).
+   *
+   * Runs OUTSIDE tenant context (it IS the dispatcher); no tenant guard
+   * (cross-tenant iteration is the worker's contract). Belt-and-suspenders
+   * `tenant_id/agent_id IS NOT NULL` mirrors #251/#292. Before this fix the
+   * worker ran the inner under a hardcoded `default/default` context, so only
+   * the default agent's pending questions ever got reminders.
+   */
+  async listTenantAgentPairsWithRemindableQuestions(
+    maxReminders: number,
+  ): Promise<Array<{ tenant_id: string; agent_id: string }>> {
+    const result = await db.execute<{ tenant_id: string; agent_id: string }>(sql`
+      SELECT DISTINCT tenant_id, agent_id
+      FROM ${pending_questions}
+      WHERE tenant_id IS NOT NULL
+        AND agent_id IS NOT NULL
+        AND status = 'aberta'
+        AND expira_em > now()
+        AND tipo != 'edit_review'
+        AND created_at < now() - interval '1 hour'
+        AND COALESCE((metadata->>'reminder_count')::int, 0) < ${maxReminders}
+        AND (
+          metadata->>'last_reminder_at' IS NULL
+          OR (metadata->>'last_reminder_at')::timestamptz < now() - interval '1 hour'
+        )
     `);
     return Array.from(
       result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>,
@@ -2945,6 +3028,39 @@ export const auditRepo = {
           eq(audit_log.mensagem_id, mensagem_id),
         ),
       );
+  },
+  /**
+   * Issue #345 (Phase 4 of #323) — dispatcher enumeration for `pattern-detector`.
+   *
+   * Returns the DISTINCT (tenant_id, agent_id) tuples with at least one
+   * `audit_log` row in the SAME 24h window the inner scans. Each enumerated
+   * tuple owns the audit rows `runPatternDetector`'s inner aggregates; the inner
+   * then applies its own per-pattern `HAVING count(*) >= MIN_OCCURRENCES` filter
+   * (a tuple may be enumerated yet emit no event if no single pattern clears the
+   * threshold — that is a cheap no-op, not a correctness issue, and mirrors the
+   * conversation-summarizer enumeration which also bounds only "has any work").
+   *
+   * Runs OUTSIDE tenant context (it IS the dispatcher); no tenant guard
+   * (cross-tenant iteration is the worker's contract). Belt-and-suspenders
+   * `tenant_id/agent_id IS NOT NULL` predicate mirrors #251/#292 (schema already
+   * enforces NOT NULL with a legacy 'default' default; this guards against a
+   * future schema relaxation). Before this fix the inner ran under a hardcoded
+   * `tenant_id='default' AND agent_id='default'` literal, so real tenants' audit
+   * patterns were NEVER reflected on.
+   */
+  async listTenantAgentPairsWithRecentAudit(): Promise<
+    Array<{ tenant_id: string; agent_id: string }>
+  > {
+    const result = await db.execute<{ tenant_id: string; agent_id: string }>(sql`
+      SELECT DISTINCT tenant_id, agent_id
+      FROM ${audit_log}
+      WHERE tenant_id IS NOT NULL
+        AND agent_id IS NOT NULL
+        AND created_at >= now() - interval '24 hours'
+    `);
+    return Array.from(
+      result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>,
+    );
   },
 };
 

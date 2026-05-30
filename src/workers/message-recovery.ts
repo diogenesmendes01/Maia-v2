@@ -10,12 +10,68 @@ const MAX_PER_RUN = 200;
  * Re-enqueues inbound messages that were persisted but never picked up by the
  * agent worker (process killed between insert and enqueue, or BullMQ outage).
  * Idempotent: agent-core early-returns when processada_em is set.
+ *
+ * Issue #345 (Phase 4 of #323) — per-tenant fan-out.
+ *
+ * BEFORE: `runMessageRecovery` opened a HARDCODED
+ * `runWithTenantContext({ tenant_id: 'default', agent_id: 'default' })` and ran
+ * the inner once. `mensagensRepo.listUnprocessedOlderThan` resolves the ALS
+ * tenant/agent, so under multi-tenant ONLY the `default` agent's stranded
+ * inbound messages were ever re-enqueued — real tenants' stuck messages were
+ * never recovered.
+ *
+ * AFTER: the worker is a DISPATCHER. It enumerates — OUTSIDE any tenant context —
+ * the DISTINCT (tenant_id, agent_id) tuples that own at least one stuck inbound
+ * message (`mensagensRepo.listTenantAgentPairsWithUnprocessedOlderThan`, whose
+ * predicate mirrors the inner's filter EXACTLY), then runs the inner once PER
+ * tuple inside `runWithTenantContext`.
+ *
+ * Inner read/write scoping (audited per #345 "scope the inner" lesson):
+ *   - READ: `mensagensRepo.listUnprocessedOlderThan` already binds the ALS
+ *     `tenant_id` AND `agent_id` in its WHERE (see repositories.ts) — so each
+ *     pass reads ONLY the current tuple's stranded messages. No change needed.
+ *   - WRITE: there is none. `enqueueAgent({ mensagem_id })` only pushes the
+ *     message id onto the queue; the row is never mutated here (the worker has
+ *     no `marcarProcessada` capability — fail-closed for the next sweep).
+ *
+ * Behavior-preserving in single-tenant mode: when the only stuck data lives
+ * under `('default','default')`, the enumeration yields exactly that one tuple,
+ * so the inner still runs once under default. Fail-isolated per tuple.
  */
 export async function runMessageRecovery(): Promise<void> {
-  // P0: single-tenant default. P6 will fan-out per tenant.
-  await runWithTenantContext(
-    { tenant_id: 'default', agent_id: 'default' },
-    runMessageRecoveryInner,
+  const tuples = await mensagensRepo.listTenantAgentPairsWithUnprocessedOlderThan(STUCK_AFTER_MS);
+
+  if (tuples.length === 0) {
+    logger.debug('message_recovery.idle');
+    return;
+  }
+
+  let agents_processed = 0;
+  let agents_failed = 0;
+
+  for (const { tenant_id, agent_id } of tuples) {
+    try {
+      await runWithTenantContext({ tenant_id, agent_id }, runMessageRecoveryInner);
+      agents_processed++;
+    } catch (err) {
+      // Fail-isolated per (tenant, agent): a throw under one tuple must not
+      // abort recovery for the others.
+      agents_failed++;
+      logger.warn(
+        {
+          tenant_id,
+          agent_id,
+          err: (err as Error).message,
+          stack: (err as Error).stack,
+        },
+        'message_recovery.agent_failed',
+      );
+    }
+  }
+
+  logger.info(
+    { tuples: tuples.length, agents_processed, agents_failed },
+    'message_recovery.done',
   );
 }
 
