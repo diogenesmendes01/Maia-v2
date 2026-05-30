@@ -61,10 +61,15 @@ groups:
     interval: 30s
     rules:
       # TTL miss = wrote a key whose marker is still alive, yet the buffer read
-      # returned empty (eviction, FLUSHDB, crash before EXPIRE landed). A low
-      # background rate can be normal under memory pressure; a sustained
-      # elevated rate usually correlates with Redis eviction (cross-check
-      # redis.rules.yml's RedisEvictionRising / RedisMemoryPressure*).
+      # returned empty — a Redis-side eviction of the data list while the marker
+      # survives. A full FLUSHDB is NOT counted by this alert: it deletes the
+      # data AND the marker together, so the read sees `marker === null` and
+      # falls into the cold-expiry path (treated as natural expiry; FLUSHDB is
+      # also not an eviction, so RedisEvictionDetected does not fire either) —
+      # see docs/runbooks/redis.md §4.6. A low background rate can be normal
+      # under memory pressure; a sustained elevated rate usually correlates with
+      # Redis eviction (cross-check redis.rules.yml's RedisEvictionRising /
+      # RedisMemoryPressure*).
       #
       # Per-read counting (#317 B3/B4 vs #304's count-once, re-tuned in #322):
       # the TTL marker is intentionally NOT consumed on a miss, so a single
