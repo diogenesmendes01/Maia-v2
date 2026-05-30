@@ -413,10 +413,18 @@ não uma contagem bruta. Quase sempre correlaciona com eviction: cross-check
   também não dispara — `FLUSHDB` não é eviction). Detecte um flush por outros
   sinais: queda abrupta de `used_memory`, perda generalizada de cache, e o
   histórico de deploy / `audit_log`.
-- **Dados sem TTL por falha entre `rpush` e `expire`** — se o processo morrer
-  depois do `rpush` mas antes do `expire`, o buffer fica **sem TTL** (vaza até
-  intervenção). Isso é uma lacuna distinta, **rastreada separadamente na issue
-  #333** — não é o que `WorkingMemoryTtlMissRising` mede.
+- **Dados sem TTL por falha entre `rpush` e `expire`** — **lacuna FECHADA pela
+  PR #339** (issue #333). Antes, o write de dados eram três round trips
+  separados (`rpush` → `ltrim` → `expire`); se o processo morresse depois do
+  `rpush` mas antes do `expire`, o buffer ficava **sem TTL** (vazava até
+  intervenção). A #339 tornou esse write um **único `EVAL` Lua atômico**
+  (`rpush` + `ltrim` + `expire` no mesmo script — ver `APPEND_MESSAGE_LUA` em
+  `src/memory/working.ts`), então a chave de dados **não pode mais existir sem
+  TTL**: ou o `rpush` é rejeitado (OOM) e nada é criado, ou o script chega ao
+  `expire` e a lista sempre termina com seu TTL. Esse caso específico deixou de
+  ser uma lacuna — e nunca foi o que `WorkingMemoryTtlMissRising` mediu. (A
+  janela SEPARADA entre o write de dados e o `set` do marker continua aceita e
+  documentada acima — só o gap interno `rpush`→`expire` foi fechado.)
 
 ---
 

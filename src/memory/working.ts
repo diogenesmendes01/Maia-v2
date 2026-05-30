@@ -58,8 +58,12 @@
  *     (recorded ONLY after a SUCCESSFUL lrange — a Redis failure has no
  *     meaningful hit/miss outcome to attribute, see #317 B1).
  *   - working_memory_ttl_miss_total{key_type}        counter — wrote a key
- *     whose TTL marker is still present, yet the read returned empty
- *     (eviction, FLUSHDB, crash before EXPIRE landed). See #317 B3/B4.
+ *     whose TTL marker is still present, yet the read returned empty (a
+ *     Redis-side eviction of the data list while the marker survives). A full
+ *     FLUSHDB does NOT count here: it deletes the data AND the marker together,
+ *     so the read sees `marker === null` and falls into the cold-expiry path
+ *     (treated as natural expiry — see the `marker === null` branch in
+ *     `readRecent` and docs/runbooks/redis.md §4.6). See #317 B3/B4.
  *   - working_memory_key_collision_total{key_type}   counter — the read
  *     observed a TTL marker whose stored scope-fingerprint does NOT match the
  *     fingerprint recomputed from the CURRENT tenant context for the SAME
@@ -421,13 +425,17 @@ export async function readRecent(
       logger.warn({ key_type: 'messages' }, 'working_memory.key_collision');
     } else if (items.length === 0) {
       // Our own marker is still alive (TTL not elapsed) yet the buffer read
-      // returned nothing — the entry vanished early (eviction or FLUSHDB). Note
-      // that "crash before EXPIRE commit / partial write" is NO LONGER a cause
-      // since #333 made the data write a single atomic EVAL (the list can't
-      // exist without its TTL), so a live marker + empty list now points
-      // squarely at a Redis-side eviction. Surface as a defense metric. The
-      // marker is intentionally NOT deleted here so a later eviction after a
-      // hit is still observable until natural expiry/overwrite (#317 B3).
+      // returned nothing — the data list vanished early while the marker
+      // survived (a Redis-side eviction of the list key). A full FLUSHDB is NOT
+      // a cause of THIS branch: it wipes the data AND the marker together, so
+      // the read would see `marker === null` and take the cold-expiry path
+      // below, not here. "Crash before EXPIRE commit / partial write" is also
+      // NO LONGER a cause since #333 made the data write a single atomic EVAL
+      // (the list can't exist without its TTL), so a live marker + empty list
+      // now points squarely at a Redis-side eviction. Surface as a defense
+      // metric. The marker is intentionally NOT deleted here so a later
+      // eviction after a hit is still observable until natural expiry/overwrite
+      // (#317 B3).
       incCounter('working_memory_ttl_miss_total', { key_type: 'messages' });
       logger.warn({ key_type: 'messages' }, 'working_memory.ttl_miss');
     }
