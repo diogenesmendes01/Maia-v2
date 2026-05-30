@@ -17,7 +17,10 @@
  *     - procedureAssignmentsRepo.disable       (UPDATE enabled=false — TENANT-ONLY:
  *                                               the table has no agent_id column)
  *     - procedureTestsRepo.recordRun           (UPDATE last_run_status)
- *     - procedureTestsRepo.delete              (DELETE by id)
+ *     - procedureTestsRepo.delete              (DELETE by id — tenant+agent scoped
+ *                                               but IDEMPOTENT since #355 H5: a
+ *                                               0-row delete is a benign no-op,
+ *                                               not a throw)
  *
  *   Read-then-write PAIRS (BOTH the read AND the write are scoped):
  *     - selfStateRepo.getActive  (UNSCOPED read on `ativa=true` → returned ANY
@@ -45,8 +48,11 @@
  * Pre-fix revert-check: against the old id-only predicate the shared-id rows BOTH
  * match, so assertion (1) fails (tenant-B's row is mutated/read) and assertion (2)
  * fails (no tenant/agent term present); and the FAIL-LOUD specs flip from "throws"
- * to "silently no-ops". For the upsert, the old unscoped conflict arm OVERWRITES
- * tenant-B's row, which the dedicated test catches.
+ * to "silently no-ops". (`procedureTestsRepo.delete` is exempt from fail-loud as
+ * of #355 H5 — it is now idempotent — so its spec instead asserts the 0-row
+ * no-op resolves AND still leaves the foreign row intact.) For the upsert, the
+ * old unscoped conflict arm OVERWRITES tenant-B's row, which the dedicated test
+ * catches.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { runWithTenantContext } from '@/db/tenant-context.js';
@@ -316,15 +322,22 @@ describe('#355 H4 — procedureTestsRepo.delete() deletes ONLY the current tenan
     expectBoundTenantAgent(store.lastDeletePredicate());
   });
 
-  it('FAIL-LOUD — throws when no test matches the current tenant/agent (foreign row NOT deleted)', async () => {
+  it('IDEMPOTENT — a 0-row delete is a benign no-op (no throw) while the foreign row still survives', async () => {
+    // #355 H5 (H4 review follow-up): delete is now idempotent — a 0-row result
+    // resolves successfully instead of throwing. The tenant+agent predicate is
+    // still the load-bearing isolation guard, so a delete issued under tenant-A
+    // for an id owned only by tenant-B matches nothing and leaves tenant-B's row
+    // intact (the cross-tenant data-loss lever this test guards against).
     store.reset([row({ id: 'b-only', tenant_id: 'tenant-B', agent_id: 'agent-B' })]);
     const { procedureTestsRepo } = await import('@/db/repositories.js');
 
     await expect(
       runWithTenantContext(A, () => procedureTestsRepo.delete('b-only')),
-    ).rejects.toThrow(/delete matched 0 rows/);
+    ).resolves.toBeUndefined();
     // The cross-tenant DELETE removed nothing — tenant-B's row survives.
     expect(store.rows.find((r) => r.id === 'b-only')).toBeDefined();
+    // Revert-check: the executed WHERE still bound BOTH tenant_id AND agent_id.
+    expectBoundTenantAgent(store.lastDeletePredicate());
   });
 });
 
