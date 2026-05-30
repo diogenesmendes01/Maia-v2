@@ -1,7 +1,8 @@
 import { workflowsRepo, workflowStepsRepo } from '@/db/repositories.js';
 import { db } from '@/db/client.js';
 import { workflow_steps } from '@/db/schema.js';
-import { eq } from 'drizzle-orm';
+import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
+import { and, eq } from 'drizzle-orm';
 import { logger } from '@/lib/logger.js';
 import { audit } from '@/governance/audit.js';
 import { expireDueDualApprovals } from './dual-approval.js';
@@ -56,10 +57,25 @@ export async function rollbackWorkflow(workflow_id: string, reason: string): Pro
       continue;
     }
     if (step.status === 'pendente' || step.status === 'em_andamento') {
+      // Issue #345 (Phase 4, defense-in-depth): self-enforce tenant scope on the
+      // mutation. The step ids come from `workflowStepsRepo.byWorkflow()` for a
+      // workflow already verified against the current tenant+agent via
+      // `workflowsRepo.byId()`, so binding the ALS (tenant_id, agent_id) here is
+      // a no-op for legitimate calls — it cannot match a row the caller did not
+      // already own. But the project's inviolable cross-tenant isolation standard
+      // requires EVERY mutation to scope itself (consistent with `updateStateTx`
+      // #337, `conversasRepo.close`/`expireDue` #350), so an id-only WHERE is not
+      // acceptable even when the surrounding context makes it safe today.
       await db
         .update(workflow_steps)
         .set({ status: 'cancelada', concluido_em: new Date() })
-        .where(eq(workflow_steps.id, step.id));
+        .where(
+          and(
+            eq(workflow_steps.tenant_id, getCurrentTenant()),
+            eq(workflow_steps.agent_id, getCurrentAgent()),
+            eq(workflow_steps.id, step.id),
+          ),
+        );
     }
   }
   await workflowsRepo.setStatus(workflow_id, 'falhou');
