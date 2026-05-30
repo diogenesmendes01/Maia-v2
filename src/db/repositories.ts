@@ -1686,14 +1686,49 @@ export const pendingQuestionsRepo = {
     return rows[0] ?? null;
   },
   async resolve(id: string, resposta: unknown): Promise<void> {
-    await db
+    // Flip-readiness (#323, H2 of #355): tenant+agent scope the WHERE (bound
+    // from ALS), mirroring the already-hardened `expireDue` and
+    // `conversasRepo.close`. Both columns are NOT NULL. The two live callers
+    // (identity/quarantine.ts → `handleOwnerIdentityReply`) run inside
+    // `runWithTenantContext({tenant_id, agent_id})` (the agent core wraps the
+    // whole turn — agent/core.ts `runAgentForMensagem`), resolving the `open`
+    // row via `findOpenByPessoaAndType(owner.id, …)` under the SAME pair — and
+    // the owner pessoa + its pending_question were both created under that pair
+    // (`create` → `applyTenantGuard`), so the predicate matches the exact row.
+    // FAIL-LOUD (throw on !=1): this targets one specific, known-present row
+    // (the open identity_confirmation just resolved under this tenant/agent) to
+    // close out the owner's confirmation decision. The WHERE has NO status gate
+    // (it overwrites by id regardless of current status), so the ONLY way to
+    // match 0 rows under the new predicate is a tenant/agent mismatch — a real
+    // cross-tenant misroute, not a benign idempotent retry. A silent 0-row
+    // no-op would leave the confirmation `aberta` forever (the contact never
+    // gets unblocked/blocked and the owner's reply is lost). Same
+    // `.returning({id})` + `.length` idiom as `mensagensRepo.markProcessed`.
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const updated = await db
       .update(pending_questions)
       .set({
         status: 'respondida',
         resposta: resposta as object,
         resolvida_em: new Date(),
       })
-      .where(eq(pending_questions.id, id));
+      .where(
+        and(
+          eq(pending_questions.id, id),
+          eq(pending_questions.tenant_id, tenant_id),
+          eq(pending_questions.agent_id, agent_id),
+        ),
+      )
+      .returning({ id: pending_questions.id });
+    if (updated.length !== 1) {
+      throw new Error(
+        `pendingQuestionsRepo.resolve matched ${updated.length} rows for ` +
+          `pending_question ${id} under ${tenant_id}/${agent_id} — expected 1 ` +
+          `(tenant/agent context does not match the target row; the ` +
+          `confirmation would have been left unresolved)`,
+      );
+    }
   },
   async expireDue(): Promise<number> {
     // Issue #345 (Phase 4 review): the `pending-expirer` worker now runs this
@@ -1857,23 +1892,83 @@ export const pendingQuestionsRepo = {
   },
 
   async resolveTx(tx: typeof db, id: string, resposta: unknown): Promise<void> {
-    await tx
+    // Flip-readiness (#323, H2 of #355): tenant+agent scope the WHERE (bound
+    // from ALS), mirroring `expireDue`. Both columns are NOT NULL. The sole
+    // live caller (agent/pending-resolver.ts → `resolveAndDispatch`) runs
+    // inside `runWithTenantContext` (entered by the gate/one-tap ingress paths
+    // — pending-gate.ts, one-tap.ts via baileys `runWithTenantContext`) and
+    // calls this ONLY after `findActiveForUpdate(tx, conversa_id)` has
+    // SELECT…FOR UPDATE-locked the row AND verified `locked.id === id` in the
+    // SAME tx — so the targeted row is present, locked, and (post-flip) owned
+    // by the running pair (it was created under that pair via `createTx` →
+    // `applyTenantGuard`).
+    // FAIL-LOUD (throw on !=1): the row was just locked FOR UPDATE in this tx,
+    // so a 0-row UPDATE can only mean the tenant/agent predicate does not match
+    // the locked row — a cross-tenant misroute, never a benign race (the lock
+    // already serialized concurrent resolvers). A silent miss would commit the
+    // dispatch side-effects (tool execution) while leaving the question
+    // `aberta`, so the next inbound would re-resolve and double-dispatch. Same
+    // `.returning({id})` + `.length` idiom as `mensagensRepo.markProcessed`.
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const updated = await tx
       .update(pending_questions)
       .set({
         status: 'respondida',
         resposta: resposta as object,
         resolvida_em: new Date(),
       })
-      .where(eq(pending_questions.id, id));
+      .where(
+        and(
+          eq(pending_questions.id, id),
+          eq(pending_questions.tenant_id, tenant_id),
+          eq(pending_questions.agent_id, agent_id),
+        ),
+      )
+      .returning({ id: pending_questions.id });
+    if (updated.length !== 1) {
+      throw new Error(
+        `pendingQuestionsRepo.resolveTx matched ${updated.length} rows for ` +
+          `pending_question ${id} under ${tenant_id}/${agent_id} — expected 1 ` +
+          `(tenant/agent context does not match the FOR-UPDATE-locked row; the ` +
+          `dispatch would have committed while the question stayed open)`,
+      );
+    }
   },
 
   async cancelTx(tx: typeof db, id: string, reason: string): Promise<void> {
-    await tx.execute(sql`
+    // Flip-readiness (#323, H2 of #355): tenant+agent scope the WHERE (bound
+    // from ALS, parameterized into the raw SQL exactly like the existing `${id}`
+    // bind). Both columns are NOT NULL. The sole live caller
+    // (agent/pending-gate.ts → `applyTx`, topic-change/cancellation arm) runs
+    // inside `runWithTenantContext` (the gate ingress path) and calls this ONLY
+    // after `findActiveForUpdate(tx, conversa_id)` has FOR UPDATE-locked the row
+    // AND verified `locked.id === id` in the SAME tx — so the row is present,
+    // locked, and (post-flip) owned by the running pair.
+    // FAIL-LOUD (throw on !=1): the row was just locked FOR UPDATE in this tx, so
+    // a 0-row UPDATE can only mean the tenant/agent predicate does not match the
+    // locked row — a cross-tenant misroute, never a benign race. A silent miss
+    // would leave the question `aberta` while the gate reports it cancelled,
+    // stranding the user mid-flow.
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const res = await tx.execute<{ id: string }>(sql`
       UPDATE pending_questions
          SET status = 'cancelada',
              metadata = metadata || ${JSON.stringify({ cancel_reason: reason })}::jsonb
        WHERE id = ${id}
+         AND tenant_id = ${tenant_id}
+         AND agent_id = ${agent_id}
+       RETURNING id::text
     `);
+    if (res.rows.length !== 1) {
+      throw new Error(
+        `pendingQuestionsRepo.cancelTx matched ${res.rows.length} rows for ` +
+          `pending_question ${id} under ${tenant_id}/${agent_id} — expected 1 ` +
+          `(tenant/agent context does not match the FOR-UPDATE-locked row; the ` +
+          `question would have stayed open despite a reported cancellation)`,
+      );
+    }
   },
 
   async cancelOpenForConversaTx(
@@ -1881,11 +1976,31 @@ export const pendingQuestionsRepo = {
     conversa_id: string,
     reason: string,
   ): Promise<{ cancelled_ids: string[] }> {
+    // Flip-readiness (#323, H2 of #355): tenant+agent scope the WHERE (bound
+    // from ALS, parameterized into the raw SQL like the existing `${conversa_id}`
+    // bind). Both columns are NOT NULL. The two live callers
+    // (agent/message-update.ts → `createEditReviewPending`; tools/
+    // ask-pending-question.ts handler) both run inside `runWithTenantContext` —
+    // the edit/revoke listener wraps `routeMessageUpdate` in the resolved
+    // tenant context (baileys `messages.update`), and the tool handler runs
+    // inside the agent turn / `resolveAndDispatch`, both tenant-scoped. So a
+    // conversa shared by a foreign tenant can never have ITS open questions
+    // cancelled by another tenant's edit/substitution.
+    // PREDICATE-ONLY (NO row-count assertion): this is a BULK cancel that clears
+    // ALL open questions on the conversa (0..N), and a 0-row outcome is the
+    // documented common case (no question was open). Both callers branch on
+    // `cancelled_ids.length > 0` and treat an empty result as a no-op, so an
+    // exact-N throw would be wrong here — the tenant+agent predicate is the only
+    // change.
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const result = await tx.execute<{ id: string }>(sql`
       UPDATE pending_questions
          SET status = 'cancelada',
              metadata = metadata || ${JSON.stringify({ cancel_reason: reason })}::jsonb
        WHERE conversa_id = ${conversa_id}
+         AND tenant_id = ${tenant_id}
+         AND agent_id = ${agent_id}
          AND status = 'aberta'
        RETURNING id::text
     `);

@@ -48,6 +48,7 @@ d('pending-gate concurrency', () => {
       const { checkPendingFirst, setClassifierForTesting } = await import(
         '../../src/agent/pending-gate.js'
       );
+      const { runWithTenantContext } = await import('../../src/db/tenant-context.js');
       setClassifierForTesting(async () => ({
         resolves_pending: true,
         option_chosen: 'sim',
@@ -58,9 +59,20 @@ d('pending-gate concurrency', () => {
       const conversa = { id: conv.rows[0]!.id };
       const persona = { id: pessoa.rows[0]!.id };
 
+      // #355 H2 (flip-readiness): the resolve/cancel mutations under
+      // checkPendingFirst are now tenant-scoped (they read tenant_id/agent_id
+      // from ALS), so this gate path — like its production callers (baileys →
+      // runWithTenantContext) — must run inside a tenant context. The seeded
+      // pending_question carries the schema default (default/default), so wrap
+      // with the matching pair.
+      const DEFAULT_CTX = { tenant_id: 'default', agent_id: 'default' };
       const [a, b] = await Promise.all([
-        checkPendingFirst({ pessoa: persona as never, conversa: conversa as never, inbound: inbound as never }),
-        checkPendingFirst({ pessoa: persona as never, conversa: conversa as never, inbound: inbound as never }),
+        runWithTenantContext(DEFAULT_CTX, () =>
+          checkPendingFirst({ pessoa: persona as never, conversa: conversa as never, inbound: inbound as never }),
+        ),
+        runWithTenantContext(DEFAULT_CTX, () =>
+          checkPendingFirst({ pessoa: persona as never, conversa: conversa as never, inbound: inbound as never }),
+        ),
       ]);
 
       const resolvedCount = [a, b].filter((x) => x.kind === 'resolved').length;
