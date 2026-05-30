@@ -242,15 +242,91 @@ function rawFragmentSatisfied(text: string, row: StoreRow, now: Date): boolean {
   throw new Error(`tenant-mutation-store: unsupported raw fragment "${text}"`);
 }
 
+/**
+ * Issue #355 (H2 of #323) — parse a RAW `tx.execute(sql\`UPDATE … RETURNING\`)`
+ * statement into the same `Term[]` the drizzle-builder path produces, so the
+ * raw-SQL mutations (`pendingQuestionsRepo.cancelTx` /
+ * `cancelOpenForConversaTx`) are exercised against the in-memory store with
+ * their REAL WHERE clause — exactly mirroring how the builder path proves
+ * `expireDue`'s tenant binding.
+ *
+ * A `sql\`…${jsString}…\`` template interpolates a plain JS string as a *boxed*
+ * `String` chunk (NOT a drizzle `Param` node — that wrapping only happens for
+ * `eq(col, val)` builder terms). So the template's `queryChunks` alternate
+ * `StringChunk` (literal SQL) and `String`/primitive (interpolated value). We
+ * recover the predicate by:
+ *   - pairing each literal preamble ending in `<identifier> = ` with the value
+ *     chunk that immediately follows it → `eq(column, value)`, AND
+ *   - scanning every literal for an inline `<identifier> = '<literal>'`
+ *     comparison (e.g. the `status = 'aberta'` gate) → `eq(column, literal)`.
+ *
+ * The returned `Term[]` feeds the SAME `rowMatches` evaluator the builder path
+ * uses. Anything we cannot account for (a value chunk with no `<col> =`
+ * preamble) throws loudly, so a future raw-SQL change can't silently pass.
+ */
+export function parseRawUpdateTerms(node: SqlNode): Term[] {
+  const chunks = node.queryChunks ?? [];
+  const terms: Term[] = [];
+  // Trailing `<identifier> = ` (optionally newline/space-prefixed) — captures
+  // the column whose bound value is the NEXT chunk. Excludes the SET clause's
+  // `status = 'cancelada'` (that has a quoted literal, handled by the inline
+  // scan below, and its preamble does not end in bare `= `).
+  const eqPreamble = /(?:^|[\s(,])([a-z_][a-z0-9_]*)\s*=\s*$/i;
+  // Inline `<identifier> = '<literal>'` comparison anywhere in a literal chunk.
+  const inlineEqAll = /(?:^|[\s(,])([a-z_][a-z0-9_]*)\s*=\s*'([^']*)'/gi;
+
+  for (let i = 0; i < chunks.length; i++) {
+    const c = chunks[i];
+    if (isStringChunk(c)) {
+      const text = (c as { value: string[] }).value.join('');
+      // (a) inline quoted comparisons in this literal (e.g. status = 'aberta').
+      let m: RegExpExecArray | null;
+      inlineEqAll.lastIndex = 0;
+      while ((m = inlineEqAll.exec(text)) !== null) {
+        // Skip the SET assignment `status = 'cancelada'` / `'expirada'` — it is
+        // a write, not a WHERE filter. Heuristic: a SET target appears before
+        // the WHERE keyword. We only treat inline eqs that occur AFTER a WHERE
+        // (or in a later chunk) as predicate terms.
+        const beforeWhere = /\bset\b/i.test(text) && !/\bwhere\b/i.test(text.slice(0, m.index));
+        if (beforeWhere) continue;
+        terms.push({ kind: 'eq', column: m[1]!, value: m[2]! });
+      }
+      // (b) a bound-value preamble: the NEXT chunk is this column's value.
+      const pre = eqPreamble.exec(text);
+      if (pre) {
+        const next = chunks[i + 1];
+        if (next === undefined || isStringChunk(next)) {
+          throw new Error(
+            `tenant-mutation-store: raw "${pre[1]}=" has no bound value chunk`,
+          );
+        }
+        terms.push({ kind: 'eq', column: pre[1]!, value: String(next as unknown) });
+        i += 1; // consume the value chunk
+      }
+    }
+    // Non-StringChunk reached WITHOUT a preceding `<col> =` preamble would be an
+    // unbound value — the metadata-merge param (`metadata || ${json}::jsonb`) is
+    // the only such chunk and is a SET payload, not a predicate, so it is safely
+    // ignored here (its preamble does not match `eqPreamble`).
+  }
+  return terms;
+}
+
 export interface TenantScopedUpdateStore {
   /** The object to inject as `@/db/client.js`'s `db`. */
-  db: { update: (...args: unknown[]) => unknown; select: (...args: unknown[]) => unknown };
+  db: {
+    update: (...args: unknown[]) => unknown;
+    select: (...args: unknown[]) => unknown;
+    execute: (...args: unknown[]) => unknown;
+  };
   /** Live rows (mutated in place by applied UPDATEs). */
   rows: StoreRow[];
   /** The drizzle predicate captured from the most recent UPDATE `.where(...)`. */
   lastPredicate: () => unknown;
   /** The drizzle predicate captured from the most recent SELECT `.where(...)`. */
   lastSelectPredicate: () => unknown;
+  /** The `Term[]` parsed from the most recent raw `execute(sql\`…\`)` UPDATE. */
+  lastExecuteTerms: () => Term[] | undefined;
   /** Reset rows + captured predicates. */
   reset: (rows: StoreRow[]) => void;
 }
@@ -271,6 +347,7 @@ export function makeTenantScopedUpdateStore(
   let rows: StoreRow[] = initialRows.map((r) => ({ ...r }));
   let captured: unknown = undefined;
   let capturedSelect: unknown = undefined;
+  let capturedExecuteTerms: Term[] | undefined = undefined;
 
   const applyUpdate = (patch: Record<string, unknown>, predicate: unknown): StoreRow[] => {
     captured = predicate;
@@ -332,19 +409,50 @@ export function makeTenantScopedUpdateStore(
     return chain;
   });
 
+  // Raw-SQL write path — `tx.execute(sql\`UPDATE … RETURNING id::text\`)`. Used
+  // by `pendingQuestionsRepo.cancelTx` / `cancelOpenForConversaTx` (#355 H2).
+  // Parses the template into `Term[]` (via `parseRawUpdateTerms`) and applies
+  // the UPDATE to ONLY the matching rows — so a missing tenant/agent binding in
+  // the raw WHERE would match other tenants' rows and the isolation assertion
+  // would fail, exactly as in the builder path. The SET status is read from the
+  // statement's leading literal (`SET status = '<x>'`). Returns the postgres
+  // `{ rows }` shape the repo reads (`result.rows`).
+  const execute = vi.fn(async (node: unknown) => {
+    const terms = parseRawUpdateTerms(node as SqlNode);
+    capturedExecuteTerms = terms;
+    const chunks = (node as SqlNode).queryChunks ?? [];
+    const head = chunks.find(isStringChunk) as { value: string[] } | undefined;
+    const setMatch = head ? /set\s+status\s*=\s*'([^']*)'/i.exec(head.value.join('')) : null;
+    const newStatus = setMatch?.[1];
+    if (!newStatus) {
+      throw new Error('tenant-mutation-store: raw UPDATE without a SET status literal');
+    }
+    const matched: StoreRow[] = [];
+    for (const row of rows) {
+      if (rowMatches(row, terms, now)) {
+        row.status = newStatus;
+        matched.push(row);
+      }
+    }
+    return { rows: matched.map((r) => ({ id: r.id })) };
+  });
+
   return {
-    db: { update, select },
+    db: { update, select, execute },
     get rows() {
       return rows;
     },
     lastPredicate: () => captured,
     lastSelectPredicate: () => capturedSelect,
+    lastExecuteTerms: () => capturedExecuteTerms,
     reset: (next: StoreRow[]) => {
       rows = next.map((r) => ({ ...r }));
       captured = undefined;
       capturedSelect = undefined;
+      capturedExecuteTerms = undefined;
       update.mockClear();
       select.mockClear();
+      execute.mockClear();
     },
   };
 }
