@@ -248,6 +248,46 @@ export const pessoasRepo = {
       .from(pessoas)
       .where(and(eq(pessoas.tenant_id, tenant_id), eq(pessoas.agent_id, agent_id)));
   },
+
+  /**
+   * Issue #345 (Phase 4) — dispatcher enumeration for `audit-mode-expirer`.
+   *
+   * Returns the DISTINCT (tenant_id, agent_id) tuples that own at least one
+   * pessoa whose `preferencias->>'modo_auditoria_ate'` is set AND already past
+   * due (`<= now()`) — i.e. exactly the tuples whose `expireAuditModes()` inner
+   * has work to do. Runs OUTSIDE tenant context (it IS the dispatcher); the
+   * worker opens `runWithTenantContext` per tuple, and the inner re-derives the
+   * scope via `pessoasRepo.list()` (which filters by the ALS tenant/agent).
+   *
+   * Like the other fan-out enumerations in this file
+   * (`listPendingTenantPairsForType`, `listAgentsWithOpenGaps`,
+   * `outbound-messages-sweeper.listTenantsWithWork`), this method intentionally
+   * does NOT apply the tenant guard — iteration across tenants is the worker's
+   * contract. `system`/`default` only appear if they genuinely hold an expirable
+   * audit-mode pref, so there is no sentinel special-case. Belt-and-suspenders
+   * `tenant_id/agent_id IS NOT NULL` mirrors #251/#292 (schema already enforces
+   * NOT NULL; the predicate guards against a future schema relaxation).
+   *
+   * The `modo_auditoria_ate` timestamp is stored as an ISO-8601 string in the
+   * `preferencias` jsonb (see `governance/audit-mode.ts`), so the comparison
+   * casts it to `timestamptz` and only matches rows where the key is present
+   * and parses to a moment at or before now.
+   */
+  async listTenantAgentPairsWithExpiredAuditMode(): Promise<
+    Array<{ tenant_id: string; agent_id: string }>
+  > {
+    const result = await db.execute<{ tenant_id: string; agent_id: string }>(sql`
+      SELECT DISTINCT tenant_id, agent_id
+      FROM ${pessoas}
+      WHERE tenant_id IS NOT NULL
+        AND agent_id IS NOT NULL
+        AND (preferencias->>'modo_auditoria_ate') IS NOT NULL
+        AND (preferencias->>'modo_auditoria_ate')::timestamptz <= now()
+    `);
+    return Array.from(
+      result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>,
+    );
+  },
 };
 
 export const permissoesRepo = {
@@ -296,6 +336,46 @@ export const permissoesRepo = {
         eq(permissoes.tenant_id, tenant_id),
         eq(permissoes.agent_id, agent_id),
       ));
+  },
+
+  /**
+   * Issue #345 (Phase 4) — dispatcher enumeration for `inactivity-sweep`.
+   *
+   * Returns the DISTINCT (tenant_id, agent_id) tuples that могут have an
+   * inactive non-owner permission to suspend — i.e. the tuples whose
+   * `runInactivitySweepInner` UPDATE has anything to act on. The predicate
+   * mirrors the inner's candidate set (an active `permissoes` row owned by a
+   * non-owner pessoa, both in the same tenant/agent) but deliberately OMITS the
+   * expensive `NOT EXISTS (recent message)` sub-query: the enumeration only
+   * needs the tuple KEYS of agents that могут own inactive conversations; the
+   * inner re-applies the full 60-day inactivity filter (scoped to the routed
+   * tenant/agent) when it actually runs. Over-enumerating a tuple that turns out
+   * to have no due row is harmless — the inner UPDATE simply matches zero rows.
+   *
+   * Runs OUTSIDE tenant context (it IS the dispatcher). Like the sibling fan-out
+   * enumerations, it does NOT apply the tenant guard — cross-tenant iteration is
+   * the worker's contract — and joins `permissoes`↔`pessoas` ONLY on matching
+   * (tenant_id, agent_id) so the read never crosses a tenant boundary.
+   * Belt-and-suspenders NOT NULL predicate mirrors #251/#292.
+   */
+  async listTenantAgentPairsWithInactiveCandidates(): Promise<
+    Array<{ tenant_id: string; agent_id: string }>
+  > {
+    const result = await db.execute<{ tenant_id: string; agent_id: string }>(sql`
+      SELECT DISTINCT p.tenant_id, p.agent_id
+      FROM ${permissoes} p
+      JOIN ${pessoas} ps
+        ON p.pessoa_id = ps.id
+       AND ps.tenant_id = p.tenant_id
+       AND ps.agent_id = p.agent_id
+      WHERE p.tenant_id IS NOT NULL
+        AND p.agent_id IS NOT NULL
+        AND p.status = 'ativa'
+        AND ps.tipo NOT IN ('dono', 'co_dono')
+    `);
+    return Array.from(
+      result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>,
+    );
   },
 };
 
@@ -395,16 +475,63 @@ export const conversasRepo = {
       .where(eq(conversas.id, id));
   },
   async close(id: string, contexto_resumido: string): Promise<void> {
+    // Issue #345 (Phase 4 review): `conversation-summarizer` runs PER enumerated
+    // (tenant_id, agent_id) tuple and calls this to close stale conversations.
+    // Scope the UPDATE to the current (tenant_id, agent_id) — bound from ALS —
+    // as defense-in-depth so a per-tuple run can never close a conversation
+    // owned by another tenant even if a caller passed a foreign `id` (the
+    // inviolable cross-tenant isolation invariant). Both columns are NOT NULL
+    // and the enumeration partitions on the same pair.
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     await db
       .update(conversas)
       .set({ status: 'encerrada', contexto_resumido })
-      .where(eq(conversas.id, id));
+      .where(
+        and(
+          eq(conversas.id, id),
+          eq(conversas.tenant_id, tenant_id),
+          eq(conversas.agent_id, agent_id),
+        ),
+      );
   },
   async invalidateScopeForPessoa(pessoa_id: string): Promise<void> {
     await db
       .update(conversas)
       .set({ escopo_entidades: [] })
       .where(eq(conversas.pessoa_id, pessoa_id));
+  },
+
+  /**
+   * Issue #345 (Phase 4) — dispatcher enumeration for `conversation-summarizer`.
+   *
+   * Returns the DISTINCT (tenant_id, agent_id) tuples that own at least one
+   * stale conversation needing a summary — i.e. exactly the tuples whose
+   * `runConversationSummarizerInner` SELECT would return rows. The predicate
+   * mirrors the inner's filter EXACTLY (`status='ativa' AND ultima_atividade_em
+   * < now() - interval '7 days'`) so a tuple is enumerated iff the inner has at
+   * least one conversation to summarize. (The inner additionally caps at 10 rows
+   * per pass; that LIMIT only bounds work volume, not which tuples have work, so
+   * it is intentionally not part of the enumeration predicate.)
+   *
+   * Runs OUTSIDE tenant context (it IS the dispatcher); no tenant guard
+   * (cross-tenant iteration is the worker's contract). Belt-and-suspenders
+   * NOT NULL predicate mirrors #251/#292.
+   */
+  async listTenantAgentPairsWithStaleConversations(): Promise<
+    Array<{ tenant_id: string; agent_id: string }>
+  > {
+    const result = await db.execute<{ tenant_id: string; agent_id: string }>(sql`
+      SELECT DISTINCT tenant_id, agent_id
+      FROM ${conversas}
+      WHERE tenant_id IS NOT NULL
+        AND agent_id IS NOT NULL
+        AND status = 'ativa'
+        AND ${conversas.ultima_atividade_em} < now() - interval '7 days'
+    `);
+    return Array.from(
+      result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>,
+    );
   },
 };
 
@@ -1271,12 +1398,77 @@ export const pendingQuestionsRepo = {
       .where(eq(pending_questions.id, id));
   },
   async expireDue(): Promise<number> {
+    // Issue #345 (Phase 4 review): the `pending-expirer` worker now runs this
+    // inner ONCE PER enumerated (tenant_id, agent_id) tuple
+    // (`listTenantAgentPairsWithDueExpirations` selects DISTINCT (tenant_id,
+    // agent_id)). Without an explicit tenant predicate the UPDATE would expire
+    // EVERY tenant's due pending_questions on the first tuple's pass —
+    // violating the inviolable cross-tenant isolation invariant. Bind the same
+    // (tenant_id, agent_id) the enumeration partitions on, so a per-tuple run
+    // only touches ITS OWN rows.
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const rows = await db
       .update(pending_questions)
       .set({ status: 'expirada' })
-      .where(and(eq(pending_questions.status, 'aberta'), sql`expira_em < now()`))
+      .where(
+        and(
+          eq(pending_questions.tenant_id, tenant_id),
+          eq(pending_questions.agent_id, agent_id),
+          eq(pending_questions.status, 'aberta'),
+          sql`expira_em < now()`,
+        ),
+      )
       .returning({ id: pending_questions.id });
     return rows.length;
+  },
+
+  /**
+   * Issue #345 (Phase 4) — dispatcher enumeration for `pending-expirer`.
+   *
+   * The worker's inner does TWO things per tenant: expire due `pending_questions`
+   * (`expireAll()` → `expireDue()`) AND expire due dual-approval `workflows`
+   * (`expireDueDualApprovals()`). So the dispatcher must enumerate the UNION of
+   * the (tenant_id, agent_id) tuples that have EITHER kind of due work:
+   *
+   *   - a `pending_questions` row with `status='aberta' AND expira_em < now()`
+   *     (matches `expireDue`'s WHERE), OR
+   *   - a `workflows` row with `tipo='dual_approval'`, in a still-open status,
+   *     and `proxima_acao_em < now()` (matches `expireDueDualApprovals`'s
+   *     filter, which iterates `workflowsRepo.listPending()` — the open-status
+   *     set `pendente/em_andamento/aguardando_humano/aguardando_terceiro` — and
+   *     keeps only past-due `dual_approval` rows).
+   *
+   * Including the dual-approval arm is LOAD-BEARING: a tenant whose ONLY due
+   * work is an expired dual-approval (no due pending_question) must still be
+   * enumerated, otherwise its timed-out approval would never be cancelled.
+   * Same shape as the relayer's `listTenantsWithWork` two-arm union (#316).
+   *
+   * Runs OUTSIDE tenant context (it IS the dispatcher); no tenant guard
+   * (cross-tenant iteration is the worker's contract). Belt-and-suspenders
+   * NOT NULL predicate on both arms mirrors #251/#292.
+   */
+  async listTenantAgentPairsWithDueExpirations(): Promise<
+    Array<{ tenant_id: string; agent_id: string }>
+  > {
+    const result = await db.execute<{ tenant_id: string; agent_id: string }>(sql`
+      SELECT DISTINCT tenant_id, agent_id FROM ${pending_questions}
+        WHERE tenant_id IS NOT NULL
+          AND agent_id IS NOT NULL
+          AND status = 'aberta'
+          AND expira_em < now()
+      UNION
+      SELECT DISTINCT tenant_id, agent_id FROM ${workflows}
+        WHERE tenant_id IS NOT NULL
+          AND agent_id IS NOT NULL
+          AND tipo = 'dual_approval'
+          AND status IN ('pendente', 'em_andamento', 'aguardando_humano', 'aguardando_terceiro')
+          AND proxima_acao_em IS NOT NULL
+          AND proxima_acao_em < now()
+    `);
+    return Array.from(
+      result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>,
+    );
   },
 
   // === B0 tx-aware additions ===
