@@ -43,6 +43,45 @@ vi.mock('@anthropic-ai/sdk', () => {
 // After round-2 fix, transitionProcedureStatus inlines tx.update() and
 // tx.insert() on the tx handle for non-active transitions. The mock provides
 // a drizzle-like tx sentinel instead of a bare {} object.
+//
+// Issue #323 review iteration-2 (BLOCKING — fairness): the reaper's dispatcher
+// enumeration changed from `db.selectDistinct(...).from(...).where(...)` to
+// `db.select(... MIN(last_activity_at) AS oldest ...).from(...).where(...)
+// .groupBy(tenant_id, agent_id).orderBy(oldest ASC)` over STALE in_progress
+// rows. This faithful in-memory mirror filters execState by the SAME TTL cutoff
+// the worker uses (env PROCEDURE_TTL_DAYS, default 7), groups by (tenant_id,
+// agent_id), and orders by each tuple's oldest stale execution ascending — so
+// the order the worker iterates is exactly the order the real query yields.
+// Tuples whose executions are all fresh do NOT appear (TTL applied in the
+// enumeration). Mirrors tests/unit/procedure-execution-reaper.spec.ts.
+function enumerateStaleTuplesOrdered(): Array<{ tenant_id: string; agent_id: string }> {
+  const ttlDays = Number(process.env.PROCEDURE_TTL_DAYS ?? 7);
+  const cutoff = Date.now() - ttlDays * 86_400_000;
+  const lastActivityMs = (ex: any): number =>
+    ex.last_activity_at instanceof Date
+      ? ex.last_activity_at.getTime()
+      : new Date(ex.last_activity_at).getTime();
+  const oldestByTuple = new Map<
+    string,
+    { tenant_id: string; agent_id: string; oldest: number }
+  >();
+  for (const ex of Object.values(execState) as any[]) {
+    if (ex.status !== 'in_progress') continue;
+    if (lastActivityMs(ex) >= cutoff) continue; // fresh — not stale
+    const key = `${ex.tenant_id}|${ex.agent_id}`;
+    const ts = lastActivityMs(ex);
+    const cur = oldestByTuple.get(key);
+    if (!cur) {
+      oldestByTuple.set(key, { tenant_id: ex.tenant_id, agent_id: ex.agent_id, oldest: ts });
+    } else if (ts < cur.oldest) {
+      cur.oldest = ts;
+    }
+  }
+  return [...oldestByTuple.values()]
+    .sort((a, b) => a.oldest - b.oldest) // MIN(last_activity_at) ASC — oldest first
+    .map(({ tenant_id, agent_id }) => ({ tenant_id, agent_id }));
+}
+
 vi.mock('@/db/client.js', () => ({
   withTx: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => {
     const tx = {
@@ -67,7 +106,24 @@ vi.mock('@/db/client.js', () => ({
     };
     return fn(tx as any);
   }),
-  db: {},
+  // Issue #323 review iteration-2 (BLOCKING — fairness): the reaper now
+  // enumerates stale (tenant_id, agent_id) tuples via
+  // `db.select(...).from(...).where(...).groupBy(...).orderBy(...)` (oldest
+  // stale execution first), NOT the old `selectDistinct(...).from().where()`.
+  // Mirror the NEW chain over the in-memory execState so the dispatcher yields
+  // the seeded tuples (deduped, oldest-first) before opening per-tuple context.
+  // Matches tests/unit/procedure-execution-reaper.spec.ts.
+  db: {
+    select: () => ({
+      from: () => ({
+        where: () => ({
+          groupBy: () => ({
+            orderBy: async () => enumerateStaleTuplesOrdered(),
+          }),
+        }),
+      }),
+    }),
+  },
 }));
 
 // ---------- repositories mock ----------
@@ -233,12 +289,15 @@ vi.mock('@/db/repositories.js', async () => {
         }
       }),
       listStaleInProgress: vi.fn(async (opts: { ttl_days: number; limit?: number }) => {
-        // Reaper sets tenant context per iteration; honour it.
-        const { getCurrentTenant } = await import('@/db/tenant-context.js');
+        // Reaper sets (tenant, agent) context per iteration; honour it.
+        // Issue #323 (Phase 3): the real query now filters by agent_id too.
+        const { getCurrentTenant, getCurrentAgent } = await import('@/db/tenant-context.js');
         const tenant_id = getCurrentTenant();
+        const agent_id = getCurrentAgent();
         const cutoff = Date.now() - opts.ttl_days * 86_400_000;
         const all = Object.values(execState).filter((ex: any) => {
           if (ex.tenant_id !== tenant_id) return false;
+          if (ex.agent_id !== agent_id) return false;
           if (ex.status !== 'in_progress') return false;
           const lastTs =
             ex.last_activity_at instanceof Date

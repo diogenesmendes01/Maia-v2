@@ -4341,10 +4341,54 @@ export const procedureExecutionsRepo = {
       notes: string;
     }>,
   ): Promise<void> {
-    await tx
+    // Issue #323 review (BLOCKING): tenant- AND agent-scope the WHERE.
+    // Previously this write matched on `id` alone, relying solely on the
+    // caller's AsyncLocalStorage context for isolation. Tenant isolation is
+    // a structural (not probabilistic) invariant of this system, so it must
+    // be enforced defense-in-depth at the DB layer — mirroring the sibling
+    // reads `findById`/`findActiveForConversa`/`listStaleInProgress`, which
+    // all gate on (tenant_id, agent_id). agent_id is included because every
+    // caller of updateStateTx runs inside runWithTenantContext with a REAL
+    // agent: the reaper (procedure-execution-reaper.ts) enumerates real
+    // (tenant,agent) tuples from the work table, and the engine
+    // (advance/complete/abort) only acts on an execution it loaded via the
+    // agent-scoped findById/findActiveForConversa first. Uses the composite
+    // `procedure_exec_tenant_agent_status_idx`.
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    // Issue #323 review iteration-2 (BLOCKING): assert the write hit exactly
+    // one row. With the tenant+agent predicate above, an UPDATE issued under a
+    // context whose (tenant_id, agent_id) does NOT match the target row (a
+    // legacy default/default path with FEATURE_MULTI_CHANNEL off, or any other
+    // mismatch) matches 0 rows and would SILENTLY no-op — the state transition
+    // (complete/abort/advance/auto_abandon) would be LOST. The previous id-only
+    // WHERE always matched, so a silent miss here is a data-loss regression.
+    // Turn that into a loud, debuggable failure while preserving tenant
+    // isolation. We DELIBERATELY do NOT add `status` to the WHERE: that would
+    // break legitimate repeated/idempotent transitions and conflict with this
+    // exactly-one assertion. Uses the same `.returning({ id })` + `.length`
+    // idiom as the sibling compare-and-swap writes in this file (e.g.
+    // adoptToResolvedTenantCrossTenant / channelsRepo.deactivate) — `.length`
+    // is the portable row count (node-postgres `rowCount` is typed `number |
+    // null`). In legitimate single-tenant operation the row IS default/default,
+    // so the predicate matches and length === 1.
+    const updated = await tx
       .update(procedure_executions)
       .set({ ...updates, last_activity_at: new Date() } as any)
-      .where(eq(procedure_executions.id, id));
+      .where(and(
+        eq(procedure_executions.id, id),
+        eq(procedure_executions.tenant_id, tenant_id),
+        eq(procedure_executions.agent_id, agent_id),
+      ))
+      .returning({ id: procedure_executions.id });
+    if (updated.length !== 1) {
+      throw new Error(
+        `procedureExecutionsRepo.updateStateTx matched ${updated.length} rows ` +
+          `for execution ${id} under ${tenant_id}/${agent_id} — expected 1 ` +
+          `(tenant/agent context does not match the target row; the state ` +
+          `transition would have been silently lost)`,
+      );
+    }
   },
 
   async updateState(
@@ -4366,9 +4410,20 @@ export const procedureExecutionsRepo = {
       .where(eq(procedure_executions.id, id));
   },
 
-  // P3c Task 9 — reaper helper. Retorna execuções do tenant atual ainda em
-  // status='in_progress' cuja last_activity_at < now() - ttl_days. Workers
-  // chamam dentro de runWithTenantContext para isolar por tenant.
+  // P3c Task 9 — reaper helper. Retorna execuções do (tenant, agent) atual
+  // ainda em status='in_progress' cuja last_activity_at < now() - ttl_days.
+  // Workers chamam dentro de runWithTenantContext para isolar por par.
+  //
+  // Issue #323 (Phase 3): a query agora filtra por agent_id ADEMAIS de
+  // tenant_id. Antes só filtrava tenant_id — o reaper rodava sob o agent
+  // 'default' e varria as execuções de TODOS os agents do tenant numa única
+  // passada, gravando o event `auto_abandoned` com agent_id='default' (audit
+  // mis-attribution: o event de um agent real ficava carimbado como 'default').
+  // Com o worker agora iterando tuplas (tenant, agent) reais, esta query
+  // PRECISA escopar por agent — senão cada uma das N iterações por tenant
+  // reprocessaria o mesmo conjunto tenant-wide (N× trabalho + N× events).
+  // Usa o índice `procedure_exec_tenant_agent_status_idx
+  // (tenant_id, agent_id, status, last_activity_at)`.
   //
   // PR #85 fix P85-I6: cap result size with `limit` (default 1000) to keep
   // the per-tick cost bounded. After a long outage this prevents one cron
@@ -4381,6 +4436,7 @@ export const procedureExecutionsRepo = {
     limit?: number;
   }): Promise<ProcedureExecution[]> {
     const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const cutoff = new Date(Date.now() - opts.ttl_days * 86_400_000);
     const cap = opts.limit ?? 1000;
     return db
@@ -4389,6 +4445,7 @@ export const procedureExecutionsRepo = {
       .where(
         and(
           eq(procedure_executions.tenant_id, tenant_id),
+          eq(procedure_executions.agent_id, agent_id),
           eq(procedure_executions.status, 'in_progress'),
           lt(procedure_executions.last_activity_at, cutoff),
         ),

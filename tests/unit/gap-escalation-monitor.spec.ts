@@ -4,29 +4,34 @@
  * O worker orquestra (a cada 30 min) o engine determinístico (Task 6) e, na
  * transição para `proposed`, dispara o proposer (Task 7) em fire-and-forget.
  *
+ * Issue #323 (Phase 3) — per-agent fan-out: o worker enumera tuplas
+ * (tenant_id, agent_id) DISTINCT que têm gaps em nível aberto em
+ * `agent_capability_gaps` e abre `runWithTenantContext` por tupla REAL —
+ * nunca mais `agent_id:'default'`.
+ *
  * Cenários cobertos:
- *   1. Gap silent + freq=3 (threshold default) → escala para dashboard,
- *      logger.info emitido, proposer NÃO chamado.
- *   2. Gap mentionable + todas as condições satisfeitas → escala para
- *      proposed E proposer chamado (mock).
- *   3. Gap mentionable + cooldown ainda vigente → sem mudança, sem proposer.
- *   4. Lista vazia de gaps → sem ação, sem chamada ao proposer.
- *   5. Rules customizadas via `gapEscalationRulesRepo.getForCurrentAgent()`
- *      sobrescrevem defaults: tenant com freq_threshold=5; gap freq=4 permanece
- *      em silent.
- *   6. Multi-tenant: o worker itera tenants, abrindo o tenant_context próprio
- *      de cada um, e o proposer é disparado pela tenant que cumpriu condições.
+ *   1. Gap silent + freq=3 (threshold default) → escala para dashboard.
+ *   2. Gap mentionable + condições satisfeitas → escala para proposed +
+ *      proposer chamado.
+ *   3. Gap mentionable + cooldown vigente → sem mudança.
+ *   4. (sem tuplas) → no-op.
+ *   5. Rules customizadas via getForCurrentAgent() sobrescrevem defaults.
+ *   6. Multi-tupla: itera contextos REAIS isolados.
+ *   7. (regressão #323) DOIS agents no MESMO tenant → AMBOS processados; o
+ *      gap do agent não-default é escalado; nenhum contexto 'default' aberto.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { GapLevel } from '@/types/enums.js';
 import type { AgentCapabilityGap, GapEscalationRule } from '@/db/schema.js';
 
-// Estado por tenant: gaps a retornar em listByLevels + rule a retornar em
-// getForCurrentAgent + dias desde último proposed.
-const gapsByTenant = new Map<string, AgentCapabilityGap[]>();
-const rulesByTenant = new Map<string, GapEscalationRule | null>();
-const daysSinceProposedByTenant = new Map<string, number | null>();
-const tenantsState: Array<{ id: string; nome: string; status: string }> = [];
+// Estado por "tenant_id|agent_id": gaps + rule + dias desde último proposed.
+const gapsByTuple = new Map<string, AgentCapabilityGap[]>();
+const rulesByTuple = new Map<string, GapEscalationRule | null>();
+const daysSinceProposedByTuple = new Map<string, number | null>();
+// Tuplas (tenant_id, agent_id) que o dispatcher enumera (DISTINCT open gaps).
+const openTuples: Array<{ tenant_id: string; agent_id: string }> = [];
+// Contextos REAIS abertos pelo worker, na ordem de processamento.
+const contextsSeen: Array<{ tenant_id: string; agent_id: string }> = [];
 
 const {
   updateLevelMock,
@@ -51,37 +56,57 @@ vi.mock('@/lib/logger.js', () => ({
   },
 }));
 
+// db.selectDistinct → enumeração de tuplas com gaps abertos.
+vi.mock('@/db/client.js', () => ({
+  db: {
+    selectDistinct: () => ({
+      from: () => ({
+        where: async () => openTuples.slice(),
+      }),
+    }),
+  },
+  pool: {},
+  withTx: vi.fn(),
+  shutdownDb: vi.fn(),
+  isDbConnected: () => true,
+  probeDb: async () => true,
+}));
+
+async function currentKey(): Promise<string> {
+  const { getCurrentTenant, getCurrentAgent } = await import('@/db/tenant-context.js');
+  const tid = getCurrentTenant();
+  const aid = getCurrentAgent();
+  return `${tid}|${aid}`;
+}
+
 vi.mock('@/db/repositories.js', async () => {
   const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
     '@/db/repositories.js',
   );
   return {
     ...actual,
-    tenantsRepo: {
-      list: vi.fn(async () => tenantsState.slice()),
-      findById: vi.fn(async (id: string) => tenantsState.find((t) => t.id === id) ?? null),
-      create: vi.fn(),
-    },
     capabilityGapsRepo: {
       ...actual.capabilityGapsRepo,
       listByLevels: vi.fn(async () => {
-        const { getCurrentTenant } = await import('@/db/tenant-context.js');
+        const { getCurrentTenant, getCurrentAgent } = await import(
+          '@/db/tenant-context.js'
+        );
         const tid = getCurrentTenant();
-        return gapsByTenant.get(tid) ?? [];
+        const aid = getCurrentAgent();
+        contextsSeen.push({ tenant_id: tid, agent_id: aid });
+        return gapsByTuple.get(`${tid}|${aid}`) ?? [];
       }),
       daysSinceLastProposed: vi.fn(async () => {
-        const { getCurrentTenant } = await import('@/db/tenant-context.js');
-        const tid = getCurrentTenant();
-        return daysSinceProposedByTenant.get(tid) ?? null;
+        const key = await currentKey();
+        return daysSinceProposedByTuple.get(key) ?? null;
       }),
       updateLevel: updateLevelMock,
     },
     gapEscalationRulesRepo: {
       ...actual.gapEscalationRulesRepo,
       getForCurrentAgent: vi.fn(async () => {
-        const { getCurrentTenant } = await import('@/db/tenant-context.js');
-        const tid = getCurrentTenant();
-        return rulesByTenant.get(tid) ?? null;
+        const key = await currentKey();
+        return rulesByTuple.get(key) ?? null;
       }),
     },
   };
@@ -93,12 +118,28 @@ vi.mock('@/cognition/capability-proposer.js', () => ({
 
 import { runGapEscalationMonitor } from '@/workers/gap-escalation-monitor.js';
 
+function seedTuple(
+  tenant_id: string,
+  agent_id: string,
+  opts: {
+    gaps: AgentCapabilityGap[];
+    rules?: GapEscalationRule | null;
+    daysSinceProposed?: number | null;
+  },
+) {
+  openTuples.push({ tenant_id, agent_id });
+  const key = `${tenant_id}|${agent_id}`;
+  gapsByTuple.set(key, opts.gaps);
+  rulesByTuple.set(key, opts.rules ?? null);
+  daysSinceProposedByTuple.set(key, opts.daysSinceProposed ?? null);
+}
+
 function makeGap(overrides: Partial<AgentCapabilityGap> = {}): AgentCapabilityGap {
   const now = new Date();
   return {
     id: 'gap-1',
     tenant_id: 'tenant-a',
-    agent_id: 'default',
+    agent_id: 'agent-1',
     capability_description: 'test gap',
     tipo: 'tool',
     contexto: null,
@@ -118,7 +159,7 @@ function makeRules(overrides: Partial<GapEscalationRule> = {}): GapEscalationRul
   return {
     id: 'r-1',
     tenant_id: 'tenant-a',
-    agent_id: 'default',
+    agent_id: 'agent-1',
     dashboard_freq_threshold: 3,
     mentionable_severity_threshold: 5,
     proposed_combined_threshold: 8,
@@ -138,10 +179,11 @@ async function flushMicrotasks(): Promise<void> {
 
 describe('runGapEscalationMonitor', () => {
   beforeEach(() => {
-    tenantsState.length = 0;
-    gapsByTenant.clear();
-    rulesByTenant.clear();
-    daysSinceProposedByTenant.clear();
+    openTuples.length = 0;
+    contextsSeen.length = 0;
+    gapsByTuple.clear();
+    rulesByTuple.clear();
+    daysSinceProposedByTuple.clear();
     updateLevelMock.mockReset();
     proposeCapabilityForGapMock.mockReset();
     loggerInfoMock.mockReset();
@@ -150,12 +192,11 @@ describe('runGapEscalationMonitor', () => {
   });
 
   it('cenário 1: silent + freq=3 (threshold default) → escala para dashboard, log emitido, proposer NÃO chamado', async () => {
-    tenantsState.push({ id: 'tenant-a', nome: 'A', status: 'active' });
-    gapsByTenant.set('tenant-a', [
-      makeGap({ id: 'gap-1', current_level: GapLevel.SILENT, frequency_score: 3, severity_score: 1 }),
-    ]);
-    rulesByTenant.set('tenant-a', null); // usa defaults
-    daysSinceProposedByTenant.set('tenant-a', null);
+    seedTuple('tenant-a', 'agent-1', {
+      gaps: [
+        makeGap({ id: 'gap-1', current_level: GapLevel.SILENT, frequency_score: 3, severity_score: 1 }),
+      ],
+    });
 
     await runGapEscalationMonitor();
     await flushMicrotasks();
@@ -170,28 +211,32 @@ describe('runGapEscalationMonitor', () => {
     expect(payload.from).toBe(GapLevel.SILENT);
     expect(payload.to).toBe(GapLevel.DASHBOARD);
     expect(payload.tenant_id).toBe('tenant-a');
+    expect(payload.agent_id).toBe('agent-1');
+
+    // contexto aberto foi (tenant-a, agent-1) — nunca 'default'
+    expect(contextsSeen).toEqual([{ tenant_id: 'tenant-a', agent_id: 'agent-1' }]);
 
     const done = loggerInfoMock.mock.calls.find((c) => c[1] === 'gap_escalation_monitor.done');
     expect(done).toBeDefined();
     const donePayload = done![0] as Record<string, unknown>;
     expect(donePayload.total_changed).toBe(1);
     expect(donePayload.total_proposed_triggered).toBe(0);
+    expect(donePayload.agents_processed).toBe(1);
   });
 
   it('cenário 2: mentionable + todas condições satisfeitas → escala para proposed E proposer chamado', async () => {
-    tenantsState.push({ id: 'tenant-a', nome: 'A', status: 'active' });
-    gapsByTenant.set('tenant-a', [
-      // freq=4 + sev=5 = 9 >= 8 (combined); contexto presente → distinct=2 >= 2
-      makeGap({
-        id: 'gap-mention',
-        current_level: GapLevel.MENTIONABLE,
-        frequency_score: 4,
-        severity_score: 5,
-        contexto: 'ctx-A',
-      }),
-    ]);
-    rulesByTenant.set('tenant-a', null);
-    daysSinceProposedByTenant.set('tenant-a', null); // sem proposed prévio → cooldown ok
+    seedTuple('tenant-a', 'agent-1', {
+      gaps: [
+        // freq=4 + sev=5 = 9 >= 8 (combined); contexto presente → distinct=2 >= 2
+        makeGap({
+          id: 'gap-mention',
+          current_level: GapLevel.MENTIONABLE,
+          frequency_score: 4,
+          severity_score: 5,
+          contexto: 'ctx-A',
+        }),
+      ],
+    });
 
     proposeCapabilityForGapMock.mockResolvedValueOnce({
       ok: true,
@@ -206,7 +251,6 @@ describe('runGapEscalationMonitor', () => {
     expect(proposeCapabilityForGapMock).toHaveBeenCalledTimes(1);
     const arg = proposeCapabilityForGapMock.mock.calls[0]![0] as { gap: AgentCapabilityGap };
     expect(arg.gap.id).toBe('gap-mention');
-    // worker passa o gap com new_level aplicado
     expect(arg.gap.current_level).toBe(GapLevel.PROPOSED);
 
     const done = loggerInfoMock.mock.calls.find((c) => c[1] === 'gap_escalation_monitor.done');
@@ -221,18 +265,18 @@ describe('runGapEscalationMonitor', () => {
   });
 
   it('cenário 3: mentionable + cooldown vigente → sem mudança, sem proposer', async () => {
-    tenantsState.push({ id: 'tenant-a', nome: 'A', status: 'active' });
-    gapsByTenant.set('tenant-a', [
-      makeGap({
-        id: 'gap-cooldown',
-        current_level: GapLevel.MENTIONABLE,
-        frequency_score: 4,
-        severity_score: 5,
-        contexto: 'ctx',
-      }),
-    ]);
-    rulesByTenant.set('tenant-a', null);
-    daysSinceProposedByTenant.set('tenant-a', 3); // 3 < 14 → cooldown ativo
+    seedTuple('tenant-a', 'agent-1', {
+      gaps: [
+        makeGap({
+          id: 'gap-cooldown',
+          current_level: GapLevel.MENTIONABLE,
+          frequency_score: 4,
+          severity_score: 5,
+          contexto: 'ctx',
+        }),
+      ],
+      daysSinceProposed: 3, // 3 < 14 → cooldown ativo
+    });
 
     await runGapEscalationMonitor();
     await flushMicrotasks();
@@ -247,29 +291,27 @@ describe('runGapEscalationMonitor', () => {
     expect(payload.total_proposed_triggered).toBe(0);
   });
 
-  it('cenário 4: lista vazia → sem ação, sem proposer', async () => {
-    tenantsState.push({ id: 'tenant-a', nome: 'A', status: 'active' });
-    gapsByTenant.set('tenant-a', []);
-    rulesByTenant.set('tenant-a', null);
-
+  it('cenário 4: nenhuma tupla com gaps abertos → no-op, sem proposer, sem contexto', async () => {
     await runGapEscalationMonitor();
     await flushMicrotasks();
 
+    expect(contextsSeen).toHaveLength(0);
     expect(updateLevelMock).not.toHaveBeenCalled();
     expect(proposeCapabilityForGapMock).not.toHaveBeenCalled();
 
     const done = loggerInfoMock.mock.calls.find((c) => c[1] === 'gap_escalation_monitor.done');
     expect(done).toBeDefined();
     expect((done![0] as Record<string, unknown>).total_changed).toBe(0);
+    expect((done![0] as Record<string, unknown>).agents_processed).toBe(0);
   });
 
   it('cenário 5: rules customizadas sobrescrevem defaults — freq_threshold=5; gap freq=4 permanece em silent', async () => {
-    tenantsState.push({ id: 'tenant-a', nome: 'A', status: 'active' });
-    gapsByTenant.set('tenant-a', [
-      makeGap({ id: 'gap-5', current_level: GapLevel.SILENT, frequency_score: 4, severity_score: 1 }),
-    ]);
-    rulesByTenant.set('tenant-a', makeRules({ dashboard_freq_threshold: 5 }));
-    daysSinceProposedByTenant.set('tenant-a', null);
+    seedTuple('tenant-a', 'agent-1', {
+      gaps: [
+        makeGap({ id: 'gap-5', current_level: GapLevel.SILENT, frequency_score: 4, severity_score: 1 }),
+      ],
+      rules: makeRules({ dashboard_freq_threshold: 5 }),
+    });
 
     await runGapEscalationMonitor();
     await flushMicrotasks();
@@ -279,36 +321,34 @@ describe('runGapEscalationMonitor', () => {
     expect(proposeCapabilityForGapMock).not.toHaveBeenCalled();
   });
 
-  it('cenário 6: multi-tenant — itera tenants em contextos isolados; proposer disparado pela tenant elegível', async () => {
-    tenantsState.push({ id: 'tenant-a', nome: 'A', status: 'active' });
-    tenantsState.push({ id: 'tenant-b', nome: 'B', status: 'active' });
-
-    // tenant-a: gap mentionable totalmente elegível → vai para proposed + proposer
-    gapsByTenant.set('tenant-a', [
-      makeGap({
-        id: 'gap-a',
-        tenant_id: 'tenant-a',
-        current_level: GapLevel.MENTIONABLE,
-        frequency_score: 4,
-        severity_score: 5,
-        contexto: 'ctx-a',
-      }),
-    ]);
-    rulesByTenant.set('tenant-a', null);
-    daysSinceProposedByTenant.set('tenant-a', null);
-
-    // tenant-b: gap silent baixa frequência → no change
-    gapsByTenant.set('tenant-b', [
-      makeGap({
-        id: 'gap-b',
-        tenant_id: 'tenant-b',
-        current_level: GapLevel.SILENT,
-        frequency_score: 1,
-        severity_score: 1,
-      }),
-    ]);
-    rulesByTenant.set('tenant-b', null);
-    daysSinceProposedByTenant.set('tenant-b', null);
+  it('cenário 6: multi-tupla — itera contextos REAIS isolados; proposer disparado pela tupla elegível', async () => {
+    // tenant-a/agent-1: gap mentionable totalmente elegível → proposed + proposer
+    seedTuple('tenant-a', 'agent-1', {
+      gaps: [
+        makeGap({
+          id: 'gap-a',
+          tenant_id: 'tenant-a',
+          agent_id: 'agent-1',
+          current_level: GapLevel.MENTIONABLE,
+          frequency_score: 4,
+          severity_score: 5,
+          contexto: 'ctx-a',
+        }),
+      ],
+    });
+    // tenant-b/agent-7: gap silent baixa frequência → no change
+    seedTuple('tenant-b', 'agent-7', {
+      gaps: [
+        makeGap({
+          id: 'gap-b',
+          tenant_id: 'tenant-b',
+          agent_id: 'agent-7',
+          current_level: GapLevel.SILENT,
+          frequency_score: 1,
+          severity_score: 1,
+        }),
+      ],
+    });
 
     proposeCapabilityForGapMock.mockResolvedValueOnce({
       ok: true,
@@ -319,28 +359,82 @@ describe('runGapEscalationMonitor', () => {
     await runGapEscalationMonitor();
     await flushMicrotasks();
 
-    // só tenant-a sofreu updateLevel
     expect(updateLevelMock).toHaveBeenCalledTimes(1);
     expect(updateLevelMock).toHaveBeenCalledWith({ id: 'gap-a', new_level: GapLevel.PROPOSED });
 
-    // proposer só foi chamado para tenant-a
     expect(proposeCapabilityForGapMock).toHaveBeenCalledTimes(1);
     const arg = proposeCapabilityForGapMock.mock.calls[0]![0] as { gap: AgentCapabilityGap };
     expect(arg.gap.id).toBe('gap-a');
 
-    // log changed para tenant-a presente
+    // ambos contextos REAIS abertos
+    expect(contextsSeen).toEqual([
+      { tenant_id: 'tenant-a', agent_id: 'agent-1' },
+      { tenant_id: 'tenant-b', agent_id: 'agent-7' },
+    ]);
+
     const changedA = loggerInfoMock.mock.calls.find(
       (c) =>
         c[1] === 'gap_escalation.changed' &&
         (c[0] as Record<string, unknown>).tenant_id === 'tenant-a',
     );
     expect(changedA).toBeDefined();
+    expect((changedA![0] as Record<string, unknown>).agent_id).toBe('agent-1');
 
-    // log final agrega ambos
     const done = loggerInfoMock.mock.calls.find((c) => c[1] === 'gap_escalation_monitor.done');
     expect(done).toBeDefined();
     const payload = done![0] as Record<string, unknown>;
     expect(payload.total_changed).toBe(1);
     expect(payload.total_proposed_triggered).toBe(1);
+    expect(payload.agents_processed).toBe(2);
+  });
+
+  it('cenário 7 (regressão #323): DOIS agents no MESMO tenant → AMBOS escalados, nenhum sob "default"', async () => {
+    // Antes do fix, o worker abria {tenant, agent:'default'} e só os gaps do
+    // agent 'default' eram avaliados — o gap do segundo agent NUNCA escalava.
+    seedTuple('tenant-a', 'agent-1', {
+      gaps: [
+        makeGap({
+          id: 'gap-a1',
+          tenant_id: 'tenant-a',
+          agent_id: 'agent-1',
+          current_level: GapLevel.SILENT,
+          frequency_score: 3,
+          severity_score: 1,
+        }),
+      ],
+    });
+    seedTuple('tenant-a', 'agent-2', {
+      gaps: [
+        makeGap({
+          id: 'gap-a2',
+          tenant_id: 'tenant-a',
+          agent_id: 'agent-2',
+          current_level: GapLevel.SILENT,
+          frequency_score: 3,
+          severity_score: 1,
+        }),
+      ],
+    });
+
+    await runGapEscalationMonitor();
+    await flushMicrotasks();
+
+    // AMBOS os gaps (de agents distintos no mesmo tenant) escalaram.
+    expect(updateLevelMock).toHaveBeenCalledTimes(2);
+    const escalatedIds = updateLevelMock.mock.calls
+      .map((c) => (c[0] as { id: string }).id)
+      .sort();
+    expect(escalatedIds).toEqual(['gap-a1', 'gap-a2']);
+
+    // contextos: os DOIS agents reais — e NENHUM 'default'.
+    expect(contextsSeen).toEqual([
+      { tenant_id: 'tenant-a', agent_id: 'agent-1' },
+      { tenant_id: 'tenant-a', agent_id: 'agent-2' },
+    ]);
+    expect(contextsSeen.some((c) => c.agent_id === 'default')).toBe(false);
+
+    const done = loggerInfoMock.mock.calls.find((c) => c[1] === 'gap_escalation_monitor.done');
+    expect((done![0] as Record<string, unknown>).total_changed).toBe(2);
+    expect((done![0] as Record<string, unknown>).agents_processed).toBe(2);
   });
 });

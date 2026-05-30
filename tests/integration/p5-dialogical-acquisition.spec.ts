@@ -34,6 +34,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import { FeatureFlagName, GapLevel } from '@/types/enums.js';
+// Runtime import (not type-only): the open-gap enumeration assertion below
+// checks the production query targets THIS exact table object. `@/db/schema.js`
+// is not mocked, so this is the same reference gap-escalation-monitor uses.
+import { agent_capability_gaps } from '@/db/schema.js';
 import type {
   AgentCapabilityGap,
   CapabilityProposal,
@@ -68,6 +72,8 @@ const {
   loggerWarn,
   loggerError,
   loggerDebug,
+  selectDistinctFromSpy,
+  selectDistinctWhereSpy,
 } = vi.hoisted(() => ({
   anthropicCreateMock: vi.fn(),
   capabilityGapsListByLevels: vi.fn(),
@@ -87,6 +93,13 @@ const {
   loggerWarn: vi.fn(),
   loggerError: vi.fn(),
   loggerDebug: vi.fn(),
+  // Issue #323 review (NITPICK): capture the args the production
+  // enumeration passes to db.selectDistinct().from(...).where(...), so the
+  // mock can be asserted against the EXPECTED table + level filter — a future
+  // regression that queries the wrong table or breaks the open-level filter is
+  // caught instead of silently returning the fixed open-gap set.
+  selectDistinctFromSpy: vi.fn(),
+  selectDistinctWhereSpy: vi.fn(),
 }));
 
 vi.mock('@anthropic-ai/sdk', () => {
@@ -95,6 +108,53 @@ vi.mock('@anthropic-ai/sdk', () => {
   });
   return { default: Anthropic };
 });
+
+// ---------- db/client mock ----------
+// Issue #323 (Phase 3): runGapEscalationMonitor now enumerates DISTINCT
+// (tenant_id, agent_id) tuples with at least one OPEN-level gap
+// (silent/dashboard/mentionable) directly via `db.selectDistinct(...)` on the
+// `agent_capability_gaps` table (work-table fan-out, replacing the old
+// tenantsRepo.list() loop). That call bypasses the repositories mock below and
+// would otherwise hit the real pg pool (ECONNREFUSED in the no-DB unit lane).
+// Mirror the enumeration over the in-memory `gapsState` so the dispatcher
+// yields exactly the seeded open-gap tuples before opening per-tuple context —
+// same idiom as the sibling reaper integration spec (p3c) and the rewritten
+// unit spec (tests/unit/gap-escalation-monitor.spec.ts). The OPEN levels
+// (silent/dashboard/mentionable) are inlined to avoid any hoisting/TDZ
+// coupling with the vi.mock factory.
+vi.mock('@/db/client.js', () => ({
+  db: {
+    selectDistinct: () => ({
+      // Record the table passed to .from() and the predicate passed to
+      // .where() so a test can assert the enumeration targets
+      // `agent_capability_gaps` filtered by the open levels (see spies below).
+      from: (table: unknown) => {
+        selectDistinctFromSpy(table);
+        return {
+          where: async (predicate: unknown) => {
+            selectDistinctWhereSpy(predicate);
+            const openLevels = new Set<string>(['silent', 'dashboard', 'mentionable']);
+            const seen = new Set<string>();
+            const pairs: Array<{ tenant_id: string; agent_id: string }> = [];
+            for (const g of Object.values(gapsState)) {
+              if (!openLevels.has(g.current_level)) continue;
+              const key = `${g.tenant_id}|${g.agent_id}`;
+              if (seen.has(key)) continue;
+              seen.add(key);
+              pairs.push({ tenant_id: g.tenant_id, agent_id: g.agent_id });
+            }
+            return pairs;
+          },
+        };
+      },
+    }),
+  },
+  pool: {},
+  withTx: vi.fn(),
+  shutdownDb: vi.fn(),
+  isDbConnected: () => true,
+  probeDb: async () => true,
+}));
 
 vi.mock('@/db/repositories.js', () => ({
   tenantsRepo: {
@@ -215,6 +275,38 @@ async function flushMicrotasks(): Promise<void> {
   await Promise.resolve();
   await Promise.resolve();
   await Promise.resolve();
+}
+
+/**
+ * Issue #323 review (NITPICK) — introspect a drizzle `inArray(column, values)`
+ * SQL predicate (the one the open-gap enumeration builds) and return
+ * { column, values } in a way tolerant of drizzle internals: walk
+ * `queryChunks`, pull the column name from the column chunk and the literal
+ * values from the `Array` param chunk. Returns nulls if the shape is
+ * unexpected so the caller's assertion fails loudly rather than throwing.
+ */
+function introspectInArrayPredicate(predicate: unknown): {
+  column: string | null;
+  values: unknown[] | null;
+} {
+  const chunks = (predicate as { queryChunks?: unknown[] } | null)?.queryChunks;
+  if (!Array.isArray(chunks)) return { column: null, values: null };
+  let column: string | null = null;
+  let values: unknown[] | null = null;
+  for (const chunk of chunks) {
+    // Column chunk: a Column instance exposes a `.name`.
+    if (column === null && chunk && typeof (chunk as { name?: unknown }).name === 'string') {
+      column = (chunk as { name: string }).name;
+    }
+    // Value chunk: `inArray` inlines the list as a JS array of Param objects,
+    // each carrying the literal under `.value`.
+    if (values === null && Array.isArray(chunk)) {
+      values = (chunk as Array<{ value?: unknown }>).map((p) =>
+        p && typeof p === 'object' && 'value' in p ? (p as { value: unknown }).value : p,
+      );
+    }
+  }
+  return { column, values };
 }
 
 // Sets up in-memory implementations on the hoisted mocks for repos.
@@ -491,6 +583,24 @@ describe('P5 dialogical acquisition — end-to-end', () => {
       to: GapLevel.DASHBOARD,
       tenant_id: 'tenant-a',
     });
+
+    // Issue #323 review (NITPICK): the open-gap enumeration must target the
+    // `agent_capability_gaps` table filtered by the open levels. Without these
+    // assertions the db.selectDistinct mock returns the fixed open-gap set
+    // regardless of which table/predicate the production code passes, so a
+    // regression that queried the wrong table or broke the level filter would
+    // pass silently. Assert the exact table reference + the level filter shape.
+    expect(selectDistinctFromSpy).toHaveBeenCalledWith(agent_capability_gaps);
+    expect(selectDistinctWhereSpy).toHaveBeenCalled();
+    const wherePredicate =
+      selectDistinctWhereSpy.mock.calls[selectDistinctWhereSpy.mock.calls.length - 1]![0];
+    const { column: filterColumn, values: filterValues } =
+      introspectInArrayPredicate(wherePredicate);
+    expect(filterColumn).toBe('current_level');
+    expect(filterValues).not.toBeNull();
+    expect([...(filterValues as unknown[])].sort()).toEqual(
+      [GapLevel.SILENT, GapLevel.DASHBOARD, GapLevel.MENTIONABLE].sort(),
+    );
 
     // Step 2: bump sev to 6 → dashboard → mentionable.
     loggerInfo.mockClear();
