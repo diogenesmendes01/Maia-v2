@@ -4950,13 +4950,6 @@ export const capabilityGapsRepo = {
       );
   },
 
-  async escalateLevel(id: string, new_level: string): Promise<void> {
-    await db
-      .update(agent_capability_gaps)
-      .set({ current_level: new_level, last_level_change_at: new Date() })
-      .where(eq(agent_capability_gaps.id, id));
-  },
-
   // P5: extensions ------------------------------------------------------------
   // listByLevels: plural variant for the escalation engine that needs to load
   // every gap in a set of current levels (e.g. ['silent', 'dashboard']) in one
@@ -4977,9 +4970,9 @@ export const capabilityGapsRepo = {
       );
   },
 
-  // P5: updateLevel — typed args variant of escalateLevel, scoped by the
-  // current tenant/agent context (defense in depth: even with a leaked id
-  // from another tenant, the WHERE clause filters it out). Sets
+  // P5: updateLevel — typed-args level setter scoped by the current
+  // tenant/agent context (defense in depth: even with a leaked id from
+  // another tenant, the WHERE clause filters it out). Sets
   // last_level_change_at = now() which the cooldown logic depends on.
   async updateLevel(args: { id: string; new_level: GapLevel }): Promise<void> {
     const tenant_id = getCurrentTenant();
@@ -5549,25 +5542,6 @@ export const procedureExecutionsRepo = {
     }
   },
 
-  async updateState(
-    id: string,
-    updates: Partial<{
-      current_step_id: string | null;
-      execution_state: any;
-      completed_steps: any;
-      last_activity_at: Date;
-      status: string;
-      outcome: string;
-      ended_at: Date;
-      notes: string;
-    }>,
-  ): Promise<void> {
-    await db
-      .update(procedure_executions)
-      .set({ ...updates, last_activity_at: new Date() } as any)
-      .where(eq(procedure_executions.id, id));
-  },
-
   // P3c Task 9 — reaper helper. Retorna execuções do (tenant, agent) atual
   // ainda em status='in_progress' cuja last_activity_at < now() - ttl_days.
   // Workers chamam dentro de runWithTenantContext para isolar por par.
@@ -5784,17 +5758,20 @@ export const procedureTestsRepo = {
     // always one the caller obtained from a tenant+agent-scoped read within the
     // same tenant context, so the row belongs to the running tuple. This is a
     // DELETE — without the predicate an id-only WHERE could remove ANOTHER
-    // tenant's test row entirely (irreversible cross-tenant data loss).
+    // tenant's test row entirely (irreversible cross-tenant data loss), so the
+    // (tenant_id, agent_id, id) predicate is the load-bearing isolation guard
+    // and stays.
     //
-    // FAIL-LOUD (throw on !=1): a delete targets one specific, known-present test
-    // id. A 0-row result under the new predicate can ONLY be a tenant/agent
-    // mismatch (cross-tenant misroute), never a benign no-op. A silent miss would
-    // report the test as deleted while it survived for its real owner — so
-    // surface it loudly. Same `.returning({id})` + `.length` idiom as
-    // `mensagensRepo.markProcessed`, applied to DELETE.
+    // IDEMPOTENT (#355 H5, H4 review follow-up): a 0-row result is a benign
+    // no-op, NOT an error. The predicate already guarantees we can only ever
+    // touch this tuple's own row, so a 0-row delete means the row is simply
+    // already gone — e.g. a concurrent second delete of the same id. Throwing on
+    // !=1 turned that legitimate race into a spurious failure. DELETE is
+    // naturally idempotent (target end-state: "row absent"), so we drop the
+    // row-count assertion and let a missing row resolve to success.
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
-    const deleted = await db
+    await db
       .delete(procedure_tests)
       .where(
         and(
@@ -5802,15 +5779,7 @@ export const procedureTestsRepo = {
           eq(procedure_tests.tenant_id, tenant_id),
           eq(procedure_tests.agent_id, agent_id),
         ),
-      )
-      .returning({ id: procedure_tests.id });
-    if (deleted.length !== 1) {
-      throw new Error(
-        `procedureTestsRepo.delete matched ${deleted.length} rows for test ${id} ` +
-          `under ${tenant_id}/${agent_id} — expected 1 (tenant/agent context does not match the ` +
-          `target test; the delete would have been silently lost while reported as deleted)`,
       );
-    }
   },
 };
 

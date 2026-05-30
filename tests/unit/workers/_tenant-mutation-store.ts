@@ -454,13 +454,15 @@ export function makeTenantScopedUpdateStore(
     return { rows: matched.map((r) => ({ id: r.id })) };
   });
 
-  // DELETE path — `db.delete(table).where(pred).returning(selection)`. Used by
-  // `procedureTestsRepo.delete` (#355 H4). REMOVES only the rows matching the
-  // evaluated drizzle predicate — so a missing tenant/agent binding in the WHERE
-  // would delete other tenants' rows (irreversible cross-tenant data loss) and
-  // the isolation assertion would catch it, exactly as the UPDATE path does.
-  // Returns the deleted rows' `{ id }` for the repo's `.returning({id})` +
-  // `.length` fail-loud check.
+  // DELETE path — `db.delete(table).where(pred)` with or without a trailing
+  // `.returning(selection)`. Used by `procedureTestsRepo.delete` (#355 H4/H5),
+  // which now `await`s the builder directly (idempotent: no row-count check).
+  // REMOVES only the rows matching the evaluated drizzle predicate — so a missing
+  // tenant/agent binding in the WHERE would delete other tenants' rows
+  // (irreversible cross-tenant data loss) and the isolation assertion would catch
+  // it, exactly as the UPDATE path does. Exposes BOTH shapes: `.returning({id})`
+  // (the deleted rows' ids) AND a thenable resolving to `{ rowCount }`, so the
+  // bare-await delete and any `.returning()`-based caller both work.
   const del = vi.fn((_table: unknown) => ({
     where: (predicate: unknown) => {
       capturedDelete = predicate;
