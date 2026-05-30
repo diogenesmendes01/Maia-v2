@@ -21,8 +21,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // In-memory state mirroring the pattern used by other procedure spec files.
-// Tuplas (tenant_id, agent_id) que o dispatcher enumera (DISTINCT in_progress).
-const inProgressTuples: Array<{ tenant_id: string; agent_id: string }> = [];
 // Keyed por execution.id. listStaleInProgress filtra por (tenant_id, agent_id)
 // do contexto ATUAL + status/ttl — espelha a query real (agora agent-scoped).
 const executionsState: Record<string, any> = {};
@@ -30,12 +28,50 @@ const eventsLog: any[] = [];
 // Contextos REAIS abertos pelo worker (capturados em listStaleInProgress).
 const contextsSeen: Array<{ tenant_id: string; agent_id: string }> = [];
 
-// db.selectDistinct → enumeração de tuplas; withTx → passthrough.
+function lastActivityMs(ex: any): number {
+  return ex.last_activity_at instanceof Date
+    ? ex.last_activity_at.getTime()
+    : new Date(ex.last_activity_at).getTime();
+}
+
+// Issue #323 review iteration-2 (BLOCKING — fairness): the dispatcher
+// enumeration is now `db.select(... MIN(last_activity_at) AS oldest ...)` over
+// STALE in_progress rows, `GROUP BY (tenant_id, agent_id) ORDER BY oldest ASC`.
+// This faithful in-memory mirror filters by the SAME TTL cutoff the worker uses
+// (env PROCEDURE_TTL_DAYS, default 7), groups by tuple, and orders by each
+// tuple's oldest stale execution ascending — so the order the worker iterates
+// is exactly the order the real query would yield. Tuples whose executions are
+// all fresh do NOT appear (TTL applied in enumeration). withTx → passthrough.
+function enumerateStaleTuplesOrdered(): Array<{ tenant_id: string; agent_id: string }> {
+  const ttlDays = Number(process.env.PROCEDURE_TTL_DAYS ?? 7);
+  const cutoff = Date.now() - ttlDays * 86_400_000;
+  const oldestByTuple = new Map<string, { tenant_id: string; agent_id: string; oldest: number }>();
+  for (const ex of Object.values(executionsState) as any[]) {
+    if (ex.status !== 'in_progress') continue;
+    if (lastActivityMs(ex) >= cutoff) continue; // fresh — not stale
+    const key = `${ex.tenant_id}|${ex.agent_id}`;
+    const ts = lastActivityMs(ex);
+    const cur = oldestByTuple.get(key);
+    if (!cur) {
+      oldestByTuple.set(key, { tenant_id: ex.tenant_id, agent_id: ex.agent_id, oldest: ts });
+    } else if (ts < cur.oldest) {
+      cur.oldest = ts;
+    }
+  }
+  return [...oldestByTuple.values()]
+    .sort((a, b) => a.oldest - b.oldest) // MIN(last_activity_at) ASC — oldest first
+    .map(({ tenant_id, agent_id }) => ({ tenant_id, agent_id }));
+}
+
 vi.mock('@/db/client.js', () => ({
   db: {
-    selectDistinct: () => ({
+    select: () => ({
       from: () => ({
-        where: async () => inProgressTuples.slice(),
+        where: () => ({
+          groupBy: () => ({
+            orderBy: async () => enumerateStaleTuplesOrdered(),
+          }),
+        }),
       }),
     }),
   },
@@ -136,15 +172,9 @@ function seedExecution(overrides: Partial<any> & { id: string; tenant_id: string
     ...overrides,
   };
   executionsState[overrides.id] = row;
-  // Register the (tenant, agent) tuple for dispatcher enumeration (DISTINCT).
-  if (row.status === 'in_progress') {
-    const exists = inProgressTuples.some(
-      (t) => t.tenant_id === row.tenant_id && t.agent_id === row.agent_id,
-    );
-    if (!exists) {
-      inProgressTuples.push({ tenant_id: row.tenant_id, agent_id: row.agent_id });
-    }
-  }
+  // Dispatcher enumeration is now derived directly from executionsState by the
+  // db.select mock (stale in_progress rows, grouped + ordered oldest-first), so
+  // there is no separate tuple registry to maintain here.
   return row;
 }
 
@@ -154,12 +184,12 @@ function daysAgo(n: number): Date {
 
 describe('runProcedureExecutionReaper', () => {
   beforeEach(() => {
-    inProgressTuples.length = 0;
     contextsSeen.length = 0;
     for (const k of Object.keys(executionsState)) delete executionsState[k];
     eventsLog.length = 0;
     vi.clearAllMocks();
     delete process.env.PROCEDURE_TTL_DAYS;
+    delete process.env.REAPER_GLOBAL_BUDGET;
   });
 
   it('cenário 1: 1 stale in_progress execution → appends auto_abandoned event AND sets status=abandoned/no_response', async () => {
@@ -311,8 +341,13 @@ describe('runProcedureExecutionReaper', () => {
     expect(byExec['exec-agent2'].ctx_agent_id).toBe('agent-2');
     expect(eventsLog.some((e) => e.ctx_agent_id === 'default')).toBe(false);
 
-    // Ambos contextos REAIS abertos (um por agent).
-    expect(contextsSeen).toEqual([
+    // Ambos contextos REAIS abertos (um por agent). Ordem é irrelevante AQUI
+    // (a ordenação oldest-first é coberta pelo teste de fairness dedicado);
+    // este cenário só garante que CADA agent ganhou seu próprio contexto REAL.
+    const sortByAgent = (
+      arr: Array<{ tenant_id: string; agent_id: string }>,
+    ) => [...arr].sort((a, b) => a.agent_id.localeCompare(b.agent_id));
+    expect(sortByAgent(contextsSeen)).toEqual([
       { tenant_id: 'tenant-a', agent_id: 'agent-1' },
       { tenant_id: 'tenant-a', agent_id: 'agent-2' },
     ]);
@@ -338,5 +373,72 @@ describe('runProcedureExecutionReaper', () => {
 
     expect(eventsLog).toHaveLength(0);
     expect(executionsState['exec-8d'].status).toBe('in_progress');
+  });
+
+  it('cenário 7 (regressão #323 iter-2, fairness/no-starvation): processa tuplas oldest-first e, em 2 ticks com budget < trabalho total, ceifa TODAS sem starvation', async () => {
+    // BLOCKING 2: o budget global limita writes por tick, mas SEM ordenação a
+    // enumeração começava sempre pela cabeça e dava break no budget → as MESMAS
+    // tuplas no topo consumiam o orçamento todo tick e as demais passavam fome
+    // indefinidamente. FIX: enumerar por MIN(last_activity_at) ASC (oldest
+    // stale primeiro). Uma tupla não atendida só envelhece, então sobe ao topo
+    // no tick seguinte → progresso eventual garantido.
+    //
+    // REAPER_GLOBAL_BUDGET é lido no load do módulo; re-importa via
+    // resetModules p/ pegar o valor (mesmo padrão do cenário 6).
+    process.env.REAPER_GLOBAL_BUDGET = '2';
+    vi.resetModules();
+    const mod = await import('@/workers/procedure-execution-reaper.js');
+
+    // 4 tuplas (tenants distintos p/ isolar), 1 execução stale cada, idades
+    // decrescentes. Ordem oldest-first esperada: 20d, 15d, 12d, 9d.
+    const seeds: Array<[string, number]> = [
+      ['t-9d', 9],
+      ['t-20d', 20], // mais antiga — deve ser a 1ª a ser processada
+      ['t-12d', 12],
+      ['t-15d', 15],
+    ];
+    for (const [tenant, age] of seeds) {
+      seedExecution({
+        id: `exec-${tenant}`,
+        tenant_id: tenant,
+        agent_id: 'agent-1',
+        status: 'in_progress',
+        last_activity_at: daysAgo(age),
+      });
+    }
+
+    // ── Tick 1 ── budget=2 → só as DUAS mais antigas (20d, 15d) são ceifadas,
+    // nessa ordem; 12d e 9d ficam "famintas" neste tick.
+    contextsSeen.length = 0;
+    await mod.runProcedureExecutionReaper();
+
+    expect(contextsSeen).toEqual([
+      { tenant_id: 't-20d', agent_id: 'agent-1' },
+      { tenant_id: 't-15d', agent_id: 'agent-1' },
+    ]);
+    expect(executionsState['exec-t-20d'].status).toBe('abandoned');
+    expect(executionsState['exec-t-15d'].status).toBe('abandoned');
+    // As mais novas NÃO foram tocadas (budget esgotado antes de chegar nelas).
+    expect(executionsState['exec-t-12d'].status).toBe('in_progress');
+    expect(executionsState['exec-t-9d'].status).toBe('in_progress');
+    expect(eventsLog).toHaveLength(2);
+
+    // ── Tick 2 ── as 2 já ceifadas saem da enumeração (status=abandoned), então
+    // as antes famintas (12d, 9d) sobem ao topo e agora SÃO processadas, ainda
+    // oldest-first (12d antes de 9d). Nenhuma tupla ficou presa para sempre.
+    contextsSeen.length = 0;
+    await mod.runProcedureExecutionReaper();
+
+    expect(contextsSeen).toEqual([
+      { tenant_id: 't-12d', agent_id: 'agent-1' },
+      { tenant_id: 't-9d', agent_id: 'agent-1' },
+    ]);
+    expect(executionsState['exec-t-12d'].status).toBe('abandoned');
+    expect(executionsState['exec-t-9d'].status).toBe('abandoned');
+    // Todas as 4 ceifadas ao fim dos 2 ticks — eventual progress, sem starvation.
+    expect(eventsLog).toHaveLength(4);
+    expect(
+      Object.values(executionsState).every((ex: any) => ex.status === 'abandoned'),
+    ).toBe(true);
   });
 });

@@ -1,4 +1,4 @@
-import { eq } from 'drizzle-orm';
+import { and, eq, lt, sql } from 'drizzle-orm';
 import { logger } from '@/lib/logger.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import { db, withTx } from '@/db/client.js';
@@ -62,10 +62,24 @@ import {
  * P85-I6. Para reintroduzir um limite GLOBAL por tick, há um orçamento
  * cumulativo `REAPER_GLOBAL_BUDGET` (default 5000) através de TODAS as tuplas:
  * assim que o total de execuções ceifadas no tick atinge o orçamento, o loop
- * de tuplas para. Como o reaper é idempotente e os reads são ordenados pelo
- * mesmo índice a cada tick, o backlog remanescente (tuplas ainda não visitadas
- * + sobras dentro de uma tupla) drena nos ticks subsequentes. O orçamento é o
- * teto global; `REAPER_BATCH_SIZE` continua sendo o teto de read POR tupla.
+ * de tuplas para. O orçamento é o teto global; `REAPER_BATCH_SIZE` continua
+ * sendo o teto de read POR tupla.
+ *
+ * Issue #323 (Phase 3) review iteration-2 (BLOCKING — fairness/starvation): o
+ * orçamento global limita os writes por tick, mas a enumeração de tuplas
+ * precisa de uma ordem JUSTA — senão o loop sempre começa pela cabeça da lista
+ * e dá break quando o orçamento estoura, de modo que as MESMAS tuplas no topo
+ * consomem o orçamento todo tick e as de baixo passam fome indefinidamente.
+ * FIX (stateless, auto-corretivo): a enumeração agora ordena as tuplas pela
+ * execução stale MAIS ANTIGA de cada uma, ascendente — `(tenant_id, agent_id,
+ * MIN(last_activity_at) AS oldest)` sobre as rows stale `in_progress`
+ * (`last_activity_at < now() - ttl`), `GROUP BY tenant_id, agent_id ORDER BY
+ * oldest ASC`. Processa-se nessa ordem até o orçamento global esgotar. Como as
+ * execuções de uma tupla faminta só envelhecem, ela sobe para o topo nos ticks
+ * seguintes — garantindo progresso eventual de TODAS as tuplas (sem
+ * starvation). A enumeração também já aplica o cutoff de TTL, então tuplas com
+ * apenas execuções frescas nem aparecem (menos trabalho que o
+ * `selectDistinct` anterior, que enumerava qualquer tupla com in_progress).
  *
  * Spec line 594: "Worker reaper força status=abandoned após 7d de inatividade".
  */
@@ -80,28 +94,51 @@ const GLOBAL_BUDGET = Number(process.env.REAPER_GLOBAL_BUDGET ?? 5000);
 type TenantAgentRow = { tenant_id: string; agent_id: string };
 
 /**
- * Issue #323 (Phase 3) — enumera tuplas (tenant_id, agent_id) DISTINCT com
- * pelo menos uma execução `in_progress`. Roda OUTSIDE de qualquer tenant
- * context — é o dispatcher. Só agents com execuções in_progress aparecem
- * (candidatos a serem stale); o filtro de TTL é aplicado depois, por tupla,
- * em `listStaleInProgress`. `system`/`default` não têm execuções seeded.
+ * Issue #323 (Phase 3) review iteration-2 (BLOCKING — fairness) — enumera as
+ * tuplas (tenant_id, agent_id) que têm ao menos uma execução STALE
+ * `in_progress` (`last_activity_at < cutoff`), ordenadas pela execução stale
+ * MAIS ANTIGA de cada tupla, ascendente. Roda OUTSIDE de qualquer tenant
+ * context — é o dispatcher. `system`/`default` não têm execuções seeded.
  *
- * Espelha o idioma `selectDistinct` de
- * `cognitiveCandidatesRepo.listPendingTenantPairsForType` (P83-C2). Usa o
- * índice `procedure_exec_tenant_agent_status_idx`.
+ * A ordenação `MIN(last_activity_at) ASC` é a propriedade load-bearing: o
+ * orçamento global (`REAPER_GLOBAL_BUDGET`) faz o loop parar no meio da lista,
+ * então sem essa ordem as tuplas do topo consumiriam o orçamento todo tick e
+ * as de baixo passariam fome. Com oldest-first, uma tupla não atendida só
+ * envelhece e sobe ao topo no próximo tick → progresso eventual garantido.
+ *
+ * Aplica o cutoff de TTL na própria enumeração (antes era um `selectDistinct`
+ * sem TTL + filtro posterior em `listStaleInProgress`), então tuplas só com
+ * execuções frescas não aparecem. Usa o índice
+ * `procedure_exec_tenant_agent_status_idx (tenant_id, agent_id, status,
+ * last_activity_at)`. `MIN(last_activity_at)` é expresso via `sql` para servir
+ * como chave de ordenação (drizzle tipa o agregado de forma frouxa); só as
+ * colunas de escopo são projetadas — o `oldest` existe apenas para ordenar.
  */
-async function listAgentsWithInProgress(): Promise<TenantAgentRow[]> {
-  return db
-    .selectDistinct({
+async function listStaleTenantAgentTuples(cutoff: Date): Promise<TenantAgentRow[]> {
+  const rows = await db
+    .select({
       tenant_id: procedure_executions.tenant_id,
       agent_id: procedure_executions.agent_id,
+      oldest: sql<string>`min(${procedure_executions.last_activity_at})`.as('oldest'),
     })
     .from(procedure_executions)
-    .where(eq(procedure_executions.status, 'in_progress'));
+    .where(
+      and(
+        eq(procedure_executions.status, 'in_progress'),
+        lt(procedure_executions.last_activity_at, cutoff),
+      ),
+    )
+    .groupBy(procedure_executions.tenant_id, procedure_executions.agent_id)
+    .orderBy(sql`oldest asc`);
+  return rows.map((r) => ({ tenant_id: r.tenant_id, agent_id: r.agent_id }));
 }
 
 export async function runProcedureExecutionReaper(): Promise<void> {
-  const tuples = await listAgentsWithInProgress();
+  // Same staleness cutoff the per-tuple `listStaleInProgress` read applies, so
+  // the dispatcher only enumerates tuples that actually have work this tick and
+  // orders them by their oldest stale execution (fairness — see docstring).
+  const cutoff = new Date(Date.now() - TTL_DAYS * 86_400_000);
+  const tuples = await listStaleTenantAgentTuples(cutoff);
   let reaped = 0;
   let batch_capped = false;
   let budget_exhausted = false;
