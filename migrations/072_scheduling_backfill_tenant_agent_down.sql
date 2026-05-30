@@ -1,0 +1,14 @@
+-- Down migration for 072_scheduling_backfill_tenant_agent.sql
+--
+-- The backfill is an UPDATE that overwrites the 'default' floor (set by
+-- 071) with the REAL tenant/agent derived down the FK chain. Reversing
+-- it to 'default' would DESTROY the recovered tenant association without
+-- restoring any prior state — there is no prior state to restore (the
+-- columns did not exist before 071). So this down is a no-op by design:
+-- rolling back the column ADD (071_down) removes these values entirely,
+-- which makes any backfill rollback irrelevant.
+--
+-- This file exists only to satisfy the paired-migration contract
+-- (see docs/runbooks/migrations.md and the migration-number-uniqueness
+-- guard, which requires every _down.sql to have a forward sibling).
+SELECT 'no-op: backfill is a forward-only derivation; reset to ''default'' would lose the recovered tenant. Roll back 071 to drop the columns instead.' AS note;
