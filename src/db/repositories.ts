@@ -4341,10 +4341,29 @@ export const procedureExecutionsRepo = {
       notes: string;
     }>,
   ): Promise<void> {
+    // Issue #323 review (BLOCKING): tenant- AND agent-scope the WHERE.
+    // Previously this write matched on `id` alone, relying solely on the
+    // caller's AsyncLocalStorage context for isolation. Tenant isolation is
+    // a structural (not probabilistic) invariant of this system, so it must
+    // be enforced defense-in-depth at the DB layer — mirroring the sibling
+    // reads `findById`/`findActiveForConversa`/`listStaleInProgress`, which
+    // all gate on (tenant_id, agent_id). agent_id is included because every
+    // caller of updateStateTx runs inside runWithTenantContext with a REAL
+    // agent: the reaper (procedure-execution-reaper.ts) enumerates real
+    // (tenant,agent) tuples from the work table, and the engine
+    // (advance/complete/abort) only acts on an execution it loaded via the
+    // agent-scoped findById/findActiveForConversa first. Uses the composite
+    // `procedure_exec_tenant_agent_status_idx`.
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     await tx
       .update(procedure_executions)
       .set({ ...updates, last_activity_at: new Date() } as any)
-      .where(eq(procedure_executions.id, id));
+      .where(and(
+        eq(procedure_executions.id, id),
+        eq(procedure_executions.tenant_id, tenant_id),
+        eq(procedure_executions.agent_id, agent_id),
+      ));
   },
 
   async updateState(

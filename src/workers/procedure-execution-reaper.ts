@@ -56,10 +56,26 @@ import {
  * backlog residual drena em ticks subsequentes — apenas com um teto de
  * trabalho por iteração.
  *
+ * Issue #323 (Phase 3) review (NON-BLOCKING): com o fan-out per-agent, o cap
+ * `REAPER_BATCH_SIZE` passou a valer POR tupla (tenant, agent), então o custo
+ * por tick cresce com a contagem de tuplas — não mais um teto fixo como em
+ * P85-I6. Para reintroduzir um limite GLOBAL por tick, há um orçamento
+ * cumulativo `REAPER_GLOBAL_BUDGET` (default 5000) através de TODAS as tuplas:
+ * assim que o total de execuções ceifadas no tick atinge o orçamento, o loop
+ * de tuplas para. Como o reaper é idempotente e os reads são ordenados pelo
+ * mesmo índice a cada tick, o backlog remanescente (tuplas ainda não visitadas
+ * + sobras dentro de uma tupla) drena nos ticks subsequentes. O orçamento é o
+ * teto global; `REAPER_BATCH_SIZE` continua sendo o teto de read POR tupla.
+ *
  * Spec line 594: "Worker reaper força status=abandoned após 7d de inatividade".
  */
 const TTL_DAYS = Number(process.env.PROCEDURE_TTL_DAYS ?? 7);
 const BATCH_LIMIT = Number(process.env.REAPER_BATCH_SIZE ?? 1000);
+// Issue #323 (Phase 3): global per-tick budget across ALL (tenant, agent)
+// tuples, restoring the bounded per-tick cost P85-I6 provided before the
+// per-agent fan-out turned BATCH_LIMIT into a per-tuple cap. Idempotent —
+// leftover backlog drains on later ticks.
+const GLOBAL_BUDGET = Number(process.env.REAPER_GLOBAL_BUDGET ?? 5000);
 
 type TenantAgentRow = { tenant_id: string; agent_id: string };
 
@@ -88,10 +104,18 @@ export async function runProcedureExecutionReaper(): Promise<void> {
   const tuples = await listAgentsWithInProgress();
   let reaped = 0;
   let batch_capped = false;
+  let budget_exhausted = false;
   let agents_processed = 0;
   let agents_failed = 0;
 
   for (const { tenant_id, agent_id } of tuples) {
+    // Issue #323 (Phase 3): stop visiting further tuples once the global
+    // per-tick budget is spent. The remaining tuples drain on the next tick
+    // (the reaper is idempotent and re-enumerates from scratch each run).
+    if (reaped >= GLOBAL_BUDGET) {
+      budget_exhausted = true;
+      break;
+    }
     try {
       await runWithTenantContext({ tenant_id, agent_id }, async () => {
         const stale = await procedureExecutionsRepo.listStaleInProgress({
@@ -108,6 +132,14 @@ export async function runProcedureExecutionReaper(): Promise<void> {
         }
 
         for (const ex of stale) {
+          // Issue #323 (Phase 3): honor the global per-tick budget INSIDE the
+          // per-tuple loop too, so a single high-backlog tuple can't blow far
+          // past the global cap. The unreaped tail of this tuple is picked up
+          // on the next tick.
+          if (reaped >= GLOBAL_BUDGET) {
+            budget_exhausted = true;
+            break;
+          }
           // P85-I1: atomic pair — event INSERT + status UPDATE in a single
           // transaction. If either fails or the process crashes, neither
           // persists and the next reaper tick handles the row cleanly.
@@ -160,6 +192,8 @@ export async function runProcedureExecutionReaper(): Promise<void> {
       ttl_days: TTL_DAYS,
       batch_limit: BATCH_LIMIT,
       batch_capped,
+      global_budget: GLOBAL_BUDGET,
+      budget_exhausted,
     },
     'procedure_execution_reaper.done',
   );
