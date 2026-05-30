@@ -4831,25 +4831,6 @@ export const procedureExecutionsRepo = {
     }
   },
 
-  async updateState(
-    id: string,
-    updates: Partial<{
-      current_step_id: string | null;
-      execution_state: any;
-      completed_steps: any;
-      last_activity_at: Date;
-      status: string;
-      outcome: string;
-      ended_at: Date;
-      notes: string;
-    }>,
-  ): Promise<void> {
-    await db
-      .update(procedure_executions)
-      .set({ ...updates, last_activity_at: new Date() } as any)
-      .where(eq(procedure_executions.id, id));
-  },
-
   // P3c Task 9 — reaper helper. Retorna execuções do (tenant, agent) atual
   // ainda em status='in_progress' cuja last_activity_at < now() - ttl_days.
   // Workers chamam dentro de runWithTenantContext para isolar por par.

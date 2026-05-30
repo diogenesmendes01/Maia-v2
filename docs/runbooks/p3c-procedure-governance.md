@@ -226,17 +226,6 @@ INSERT INTO procedure_execution_events (tenant_id, agent_id, execution_id, event
 VALUES ('<tenant>', '<agent>', '<uuid>', 'manually_reopened', '{"reason":"reaper_false_positive"}'::jsonb);
 ```
 
-Ou via repo:
-
-```typescript
-await procedureExecutionsRepo.updateState({
-  id: '<uuid>',
-  status: 'in_progress',
-  outcome: null,
-  ended_at: null,
-});
-```
-
 4. Se padrão recorrente: aumentar `PROCEDURE_TTL_DAYS` ou rever fluxo.
 
 ### Step evaluator não avança step com `human_confirmed`
