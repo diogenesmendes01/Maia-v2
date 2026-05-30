@@ -400,7 +400,7 @@ natural.
 [`monitoring/alerts/working-memory.rules.yml`](../../monitoring/alerts/working-memory.rules.yml)
 (`rate(working_memory_ttl_miss_total[5m]) > 1` por 10m) dispara quando uma
 leitura encontra o marker ainda vivo porém o buffer voltou vazio — entrada
-sumiu antes da hora (eviction, crash entre `rpush` e `expire`). É por-LEITURA
+sumiu antes da hora (eviction). É por-LEITURA
 (o marker não é consumido no miss), então alertamos sobre a TAXA sustentada,
 não uma contagem bruta. Quase sempre correlaciona com eviction: cross-check
 `RedisEvictionRising` / `RedisMemoryPressureWarning`/`Critical` (§4.2).
