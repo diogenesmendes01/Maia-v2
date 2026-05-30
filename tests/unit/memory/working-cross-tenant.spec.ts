@@ -57,16 +57,17 @@ type Call = { op: string; key: string; args: unknown[] };
 const calls: Call[] = [];
 
 const redisStub = {
-  rpush: vi.fn(async (key: string, ...args: unknown[]) => {
-    calls.push({ op: 'rpush', key, args });
-    return 1;
-  }),
-  ltrim: vi.fn(async (key: string, ...args: unknown[]) => {
-    calls.push({ op: 'ltrim', key, args });
-    return 'OK';
-  }),
-  expire: vi.fn(async (key: string, ...args: unknown[]) => {
-    calls.push({ op: 'expire', key, args });
+  // #333: the data write is now a SINGLE atomic Lua EVAL (rpush+ltrim+expire in
+  // one script) rather than three separate calls. ioredis `eval(script,
+  // numKeys, key, ...argv)` passes the data key as the first key arg. We record
+  // the equivalent `rpush`/`ltrim`/`expire` ops against that key so the existing
+  // tenant-isolation assertions (which check the key string of each verb) still
+  // hold — the contract under test ("which key string did we use?") is
+  // unchanged; only the transport (one EVAL vs three round trips) differs.
+  eval: vi.fn(async (_script: string, _numKeys: number, key: string, ...argv: unknown[]) => {
+    calls.push({ op: 'rpush', key, args: argv });
+    calls.push({ op: 'ltrim', key, args: argv });
+    calls.push({ op: 'expire', key, args: argv });
     return 1;
   }),
   lrange: vi.fn(async (key: string, ...args: unknown[]) => {
@@ -114,9 +115,7 @@ function keysOf(op: string): string[] {
 describe('issue #231 — working memory Redis keys are tenant+agent scoped', () => {
   beforeEach(() => {
     calls.length = 0;
-    redisStub.rpush.mockClear();
-    redisStub.ltrim.mockClear();
-    redisStub.expire.mockClear();
+    redisStub.eval.mockClear();
     redisStub.lrange.mockClear();
     redisStub.set.mockClear();
     redisStub.get.mockClear();
@@ -234,10 +233,9 @@ describe('issue #231 — working memory Redis keys are tenant+agent scoped', () 
         MissingTenantContextError,
       );
 
-      // Nothing should have been written to Redis.
-      expect(redisStub.rpush).not.toHaveBeenCalled();
-      expect(redisStub.ltrim).not.toHaveBeenCalled();
-      expect(redisStub.expire).not.toHaveBeenCalled();
+      // Nothing should have been written to Redis — the atomic data-write EVAL
+      // must not fire when the tenant context is missing (#333).
+      expect(redisStub.eval).not.toHaveBeenCalled();
     });
   });
 
