@@ -13,6 +13,30 @@ vi.mock('../../src/db/client.js', () => ({
   },
 }));
 
+// Issue #345 (Phase 4): the worker is now a DISPATCHER. It first enumerates the
+// (tenant_id, agent_id) tuples with remindable questions, then runs the inner
+// once per tuple under `runWithTenantContext`. These tests exercise the INNER
+// reminder logic, so:
+//   - the enumeration helper yields exactly ONE real tuple,
+//   - `runWithTenantContext` is pass-through, and
+//   - `getCurrentTenant`/`getCurrentAgent` return that tuple's ids (the inner's
+//     scoped JOIN + scoped UPDATE bind them — see worker).
+// Net effect: `dbExecuteMock` is consumed ONCE by the inner JOIN exactly as
+// before this change (the enumeration uses the repo mock, not `db.execute`).
+const listRemindablePairsMock = vi.fn(async () => [
+  { tenant_id: 'tenant-A', agent_id: 'agent-A' },
+]);
+vi.mock('../../src/db/repositories.js', () => ({
+  pendingQuestionsRepo: {
+    listTenantAgentPairsWithRemindableQuestions: listRemindablePairsMock,
+  },
+}));
+vi.mock('../../src/db/tenant-context.js', () => ({
+  runWithTenantContext: <T>(_ctx: unknown, fn: () => Promise<T>) => fn(),
+  getCurrentTenant: () => 'tenant-A',
+  getCurrentAgent: () => 'agent-A',
+}));
+
 const sendOutboundTextMock = vi.fn().mockResolvedValue('WAID-REMINDER');
 vi.mock('../../src/gateway/baileys.js', () => ({
   sendOutboundText: sendOutboundTextMock,
@@ -40,6 +64,8 @@ beforeEach(() => {
   sendOutboundTextMock.mockReset();
   sendOutboundTextMock.mockResolvedValue('WAID-REMINDER');
   auditMock.mockReset();
+  listRemindablePairsMock.mockClear();
+  listRemindablePairsMock.mockResolvedValue([{ tenant_id: 'tenant-A', agent_id: 'agent-A' }]);
 });
 
 describe('pending-reminder worker', () => {
