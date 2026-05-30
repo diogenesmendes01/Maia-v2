@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { contasRepo, transacoesRepo, categoriasRepo } from '@/db/repositories.js';
+import { withTx } from '@/db/client.js';
 import type { Tool } from './_registry.js';
 import { trigramSim } from '@/lib/utils.js';
 import { TypedError } from '@/lib/utils.js';
@@ -94,42 +95,52 @@ export const registerTransactionTool: Tool<typeof inputSchema, typeof outputSche
       // Optionally lookup or fallback to text-only field; do not auto-create here (4-eyes).
     }
 
-    const t = await transacoesRepo.create({
-      entidade_id: args.entidade_id,
-      conta_id: args.conta_id,
-      categoria_id,
-      natureza: args.natureza,
-      valor: args.valor.toFixed(2),
-      data_competencia: args.data_competencia,
-      data_pagamento: args.data_pagamento ?? null,
-      status: args.status,
-      descricao: args.descricao,
-      contraparte: args.contraparte_nome ?? null,
-      contraparte_id,
-      origem: args.origem,
-      conversa_id: ctx.conversa.id,
-      mensagem_id: ctx.mensagem_id,
-      registrado_por: ctx.pessoa.id,
-      confianca_ia: null,
-      confirmada_em: null,
-      metadata: args.metadata ?? {},
+    // ATOMICITY (#323 H3 — PR #364 review blocker 2): the ledger INSERT and the
+    // paired balance credit MUST commit (or roll back) together. `addToBalanceTx`
+    // is fail-loud on a 0-row tenant/agent mismatch; running both writes through
+    // the SAME `withTx` handle means such a throw rolls back the just-created
+    // transaction too — no orphan ledger row without its balance credit
+    // (corrupted money). The happy path is unchanged: both writes commit.
+    //
+    // saldo_atual vem como string do pg. Aritmética intermediária (sign * valor,
+    // soma com saldo) seria perigosa em number — fazemos via Decimal. O update no
+    // DB usa SQL `saldo_atual + ${delta}` direto no banco (numeric exato), mas o
+    // saldo_apos retornado pelo tool precisa ser number (output_schema é z.number()).
+    const { transacao_id, saldo_apos } = await withTx(async (tx) => {
+      const t = await transacoesRepo.createTx(tx, {
+        entidade_id: args.entidade_id,
+        conta_id: args.conta_id,
+        categoria_id,
+        natureza: args.natureza,
+        valor: args.valor.toFixed(2),
+        data_competencia: args.data_competencia,
+        data_pagamento: args.data_pagamento ?? null,
+        status: args.status,
+        descricao: args.descricao,
+        contraparte: args.contraparte_nome ?? null,
+        contraparte_id,
+        origem: args.origem,
+        conversa_id: ctx.conversa.id,
+        mensagem_id: ctx.mensagem_id,
+        registrado_por: ctx.pessoa.id,
+        confianca_ia: null,
+        confirmada_em: null,
+        metadata: args.metadata ?? {},
+      });
+
+      let saldo_aposDec = toDecimal(conta.saldo_atual);
+      if (args.status === 'paga' || args.status === 'recebida') {
+        const sign = args.natureza === 'receita' ? 1 : args.natureza === 'despesa' ? -1 : 0;
+        const delta = toDecimal(args.valor).times(sign);
+        // addToBalanceTx aceita number; o banco faz a soma em numeric e retorna a
+        // linha atualizada, da qual lemos saldo_atual já calculado.
+        const updated = await contasRepo.addToBalanceTx(tx, conta.id, delta.toNumber());
+        saldo_aposDec = updated ? toDecimal(updated.saldo_atual) : saldo_aposDec;
+      }
+
+      return { transacao_id: t.id, saldo_apos: saldo_aposDec.toNumber() };
     });
 
-    // saldo_atual vem como string do pg. Aritmética intermediária (sign * valor,
-    // soma com saldo) seria perigosa em number — fazemos via Decimal.
-    // O update no DB usa SQL `saldo_atual + ${delta}` direto no banco
-    // (numeric exato), mas o saldo_apos retornado pelo tool precisa ser
-    // number (output_schema é z.number()).
-    let saldo_aposDec = toDecimal(conta.saldo_atual);
-    if (args.status === 'paga' || args.status === 'recebida') {
-      const sign = args.natureza === 'receita' ? 1 : args.natureza === 'despesa' ? -1 : 0;
-      const delta = toDecimal(args.valor).times(sign);
-      // addToBalance aceita number; o banco faz a soma em numeric e retorna a
-      // linha atualizada, da qual lemos saldo_atual já calculado.
-      const updated = await contasRepo.addToBalance(conta.id, delta.toNumber());
-      saldo_aposDec = updated ? toDecimal(updated.saldo_atual) : saldo_aposDec;
-    }
-
-    return { transacao_id: t.id, saldo_apos: saldo_aposDec.toNumber() };
+    return { transacao_id, saldo_apos };
   },
 };

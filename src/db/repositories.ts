@@ -1135,10 +1135,36 @@ export const contasRepo = {
       );
   },
   async byId(id: string): Promise<Conta | null> {
+    // Flip-readiness (#323, H3 of #355 — PR #364 review blocker 1) — FINANCIAL
+    // pre-write lookup: tenant+agent scope the WHERE (bound from ALS), mirroring
+    // the now-scoped `byEntity` read and the `addToBalance` write below. Both
+    // columns are NOT NULL (schema `contas_bancarias`). Both live callers run
+    // inside the agent turn's `runWithTenantContext({tenant_id, agent_id})`
+    // (agent/core.ts `runAgentForMensagem`):
+    //   - `tools/register-transaction.ts` pre-loads the conta here BEFORE the
+    //     balance write; an id-only WHERE would let a misrouted/cross-tenant
+    //     account id pass this pre-check and only trip the now-scoped
+    //     `addToBalance` 0-row guard AFTER the ledger row committed. Scoping the
+    //     read rejects the cross-tenant account EARLY (returns null →
+    //     `conta_not_found`), so the transaction is never created.
+    //   - `tools/query-balance.ts` already discards an out-of-scope conta via
+    //     `ctx.scope.entidades.includes(c.entidade_id)`; the predicate just makes
+    //     the read itself tenant-safe (defense in depth — a foreign conta no
+    //     longer even loads).
+    // Returns null (not throw) on no-match: a missing/foreign account is a
+    // legitimate not-found for a READ, and both callers already handle null.
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const rows = await db
       .select()
       .from(contas_bancarias)
-      .where(eq(contas_bancarias.id, id))
+      .where(
+        and(
+          eq(contas_bancarias.tenant_id, tenant_id),
+          eq(contas_bancarias.agent_id, agent_id),
+          eq(contas_bancarias.id, id),
+        ),
+      )
       .limit(1);
     return rows[0] ?? null;
   },
@@ -1155,17 +1181,88 @@ export const contasRepo = {
     return rows[0]!;
   },
   async addToBalance(id: string, delta: number): Promise<Conta | null> {
-    const rows = await db
-      .update(contas_bancarias)
-      .set({
-        saldo_atual: sql`saldo_atual + ${delta}`,
-        updated_at: new Date(),
-      })
-      .where(eq(contas_bancarias.id, id))
-      .returning();
-    return rows[0] ?? null;
+    // Non-tx entry point (kept for callers that don't need to bundle the credit
+    // with another write). Delegates to the shared scoped + fail-loud core on
+    // the pooled `db` handle. `register-transaction.ts` now uses `addToBalanceTx`
+    // so the credit is atomic with its ledger INSERT (see below).
+    return addToBalanceWith(db, id, delta);
+  },
+  /**
+   * Flip-readiness (#323, H3 of #355 — PR #364 review blocker 2) — tx-aware
+   * balance credit, identical scoping + fail-loud to `addToBalance` but issued
+   * on the caller's in-tx handle so it commits ATOMICALLY with a paired
+   * `transacoesRepo.createTx` ledger INSERT inside one `withTx`. A 0-row throw
+   * (cross-tenant misroute) then rolls the ledger row back too — closing the
+   * "committed transaction with no balance credit" inconsistency. Mirrors the
+   * `*Tx` convention (`pendingQuestionsRepo.resolveTx`). Caller MUST already be
+   * inside `withTx`.
+   */
+  async addToBalanceTx(tx: typeof db, id: string, delta: number): Promise<Conta | null> {
+    return addToBalanceWith(tx, id, delta);
   },
 };
+
+/**
+ * Shared scoped + FAIL-LOUD core for `contasRepo.addToBalance` /
+ * `addToBalanceTx`. Kept as ONE function so the tenant/agent predicate and the
+ * 0-row guard can never drift between the pooled-`db` and the in-`tx` paths.
+ *
+ * Flip-readiness (#323, H3 of #355) — FINANCIAL mutation: tenant+agent scope the
+ * WHERE (bound from ALS), mirroring the now-scoped `contasRepo.byEntity` /
+ * `byId`. Both columns are NOT NULL (schema `contas_bancarias`). The sole live
+ * caller (`tools/register-transaction.ts`) runs inside the agent turn's
+ * `runWithTenantContext({tenant_id, agent_id})` (agent/core.ts
+ * `runAgentForMensagem`) and only ever adjusts the `conta` it loaded via the
+ * now-scoped `contasRepo.byId(conta_id)` + asserted `conta.entidade_id ===
+ * args.entidade_id`, where `args.entidade_id` was authorized against the running
+ * tuple's entity scope by the dispatcher — so the conta belongs to the running
+ * (tenant_id, agent_id) and the predicate matches the exact row.
+ *
+ * FAIL-LOUD (throw on !=1): this UPDATEs one specific, known-present account's
+ * running balance by an exact numeric delta. The id-only WHERE always matched,
+ * so a 0-row result under the new predicate can ONLY mean a tenant/agent
+ * mismatch (a cross-tenant misroute) — NOT a benign no-op. Silently swallowing
+ * that miss would leave `saldo_atual` un-incremented while the matching
+ * `transacoes` row already exists: the balance and its ledger would diverge
+ * permanently — corrupted money. There is no legitimate 0-row path (the caller
+ * gates the call itself behind `status==='paga'|'recebida'`; when it does call,
+ * the target account is the one it just loaded), so we surface the miss loudly
+ * instead of returning `null`. Same `.returning()` + `.length` idiom as
+ * `mensagensRepo.markProcessed` / `pendingQuestionsRepo.resolve`. The thrown
+ * message keeps the `addToBalance matched N rows` token across both entry points
+ * so dashboards/tests match either path.
+ */
+async function addToBalanceWith(
+  executor: typeof db,
+  id: string,
+  delta: number,
+): Promise<Conta | null> {
+  const tenant_id = getCurrentTenant();
+  const agent_id = getCurrentAgent();
+  const rows = await executor
+    .update(contas_bancarias)
+    .set({
+      saldo_atual: sql`saldo_atual + ${delta}`,
+      updated_at: new Date(),
+    })
+    .where(
+      and(
+        eq(contas_bancarias.id, id),
+        eq(contas_bancarias.tenant_id, tenant_id),
+        eq(contas_bancarias.agent_id, agent_id),
+      ),
+    )
+    .returning();
+  if (rows.length !== 1) {
+    throw new Error(
+      `contasRepo.addToBalance matched ${rows.length} rows for conta ${id} ` +
+        `under ${tenant_id}/${agent_id} — expected 1 (tenant/agent context does ` +
+        `not match the target account; the balance update would have been ` +
+        `silently lost while its transaction already committed — corrupted money)`,
+    );
+  }
+  return rows[0] ?? null;
+}
 
 export const transacoesRepo = {
   async byScope(
@@ -1202,6 +1299,32 @@ export const transacoesRepo = {
   async create(input: Omit<Transacao, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>): Promise<Transacao> {
     const guarded = applyTenantGuard(input);
     const rows = await db.insert(transacoes).values(guarded).returning();
+    return rows[0]!;
+  },
+  /**
+   * Flip-readiness (#323, H3 of #355 — PR #364 review blocker 2) — tx-aware
+   * INSERT of the ledger row, so a caller can commit it ATOMICALLY with the
+   * paired `contasRepo.addToBalanceTx` balance credit inside one `withTx`.
+   *
+   * `register-transaction.ts` previously committed `create` (ledger row) and
+   * THEN called the now-fail-loud `addToBalance`; a 0-row throw there (a
+   * cross-tenant misroute the scoped predicate catches) left a committed
+   * transaction with NO matching balance credit — the ledger and `saldo_atual`
+   * diverge permanently (corrupted money). Running both writes through the SAME
+   * `tx` means the `addToBalanceTx` throw rolls the INSERT back too.
+   *
+   * Identical write to `create` (same `applyTenantGuard` → tenant/agent stamped
+   * from ALS) but issued on the caller's in-tx handle. Mirrors the `*Tx`
+   * convention used by `pendingQuestionsRepo.resolveTx` /
+   * `procedureExecutionsRepo.updateStateTx`. The caller MUST already be inside
+   * `withTx`.
+   */
+  async createTx(
+    tx: typeof db,
+    input: Omit<Transacao, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>,
+  ): Promise<Transacao> {
+    const guarded = applyTenantGuard(input);
+    const rows = await tx.insert(transacoes).values(guarded).returning();
     return rows[0]!;
   },
   async listRecent(limit = 50): Promise<Transacao[]> {
@@ -1255,7 +1378,48 @@ export const transacoesRepo = {
     return rows[0] ?? null;
   },
   async update(id: string, patch: Partial<Transacao>): Promise<void> {
-    await db.update(transacoes).set(patch).where(eq(transacoes.id, id));
+    // Flip-readiness (#323, H3 of #355) — FINANCIAL mutation: tenant+agent scope
+    // the WHERE (bound from ALS), mirroring the already-scoped `transacoesRepo.byId`
+    // / `byScope`. Both columns are NOT NULL (schema `transacoes`). The sole live
+    // caller (`tools/cancel-transaction.ts`) runs inside the agent turn's
+    // `runWithTenantContext({tenant_id, agent_id})` (agent/core.ts) and patches the
+    // exact `tx` it loaded via the ALREADY tenant+agent-scoped
+    // `transacoesRepo.byId(transacao_id)`, after asserting `tx.entidade_id ===
+    // args.entidade_id` AND `scope.entidades.includes(tx.entidade_id)` — so the row
+    // provably belongs to the running (tenant_id, agent_id) and the predicate
+    // matches it.
+    //
+    // FAIL-LOUD (throw on !=1): this stamps a single, known-present transaction's
+    // lifecycle (the cancel path sets `status='cancelada'`). The id-only WHERE
+    // always matched, so a 0-row result under the new predicate can ONLY be a
+    // tenant/agent mismatch (cross-tenant misroute) — never a benign no-op. The
+    // caller short-circuits the idempotent retry BEFORE reaching here (it returns
+    // early when `tx.status==='cancelada'`), so there is no legitimate 0-row path:
+    // a silent miss would report the cancel as succeeded while the transaction
+    // stayed active (and, if a balance reversal is ever added, would desync the
+    // ledger) — so surface it loudly. Same `.returning({id})` + `.length` idiom as
+    // `mensagensRepo.markProcessed` / `pendingQuestionsRepo.resolve`.
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const updated = await db
+      .update(transacoes)
+      .set(patch)
+      .where(
+        and(
+          eq(transacoes.id, id),
+          eq(transacoes.tenant_id, tenant_id),
+          eq(transacoes.agent_id, agent_id),
+        ),
+      )
+      .returning({ id: transacoes.id });
+    if (updated.length !== 1) {
+      throw new Error(
+        `transacoesRepo.update matched ${updated.length} rows for transacao ${id} ` +
+          `under ${tenant_id}/${agent_id} — expected 1 (tenant/agent context does ` +
+          `not match the target transaction; the update would have been silently ` +
+          `lost while reported as applied)`,
+      );
+    }
   },
 };
 
