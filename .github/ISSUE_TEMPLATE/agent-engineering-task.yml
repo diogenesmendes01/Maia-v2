@@ -1,0 +1,105 @@
+name: Agent Engineering Task
+description: Structured task intake for Claude Code, Codex, or similar engineering agents.
+title: "agent-task: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this for engineering-agent work on Maia's codebase, not for Maia product/runtime agents.
+
+        Before assigning implementation, align the task with:
+        - `docs/ai/task-spec-template.md`
+        - `docs/ai/coding-agent-playbook.md`
+        - `docs/ai/maia-invariants-checklist.md`
+
+  - type: textarea
+    id: objective
+    attributes:
+      label: Objective
+      description: What should the engineering agent accomplish?
+      placeholder: State the intended outcome in one or two concrete paragraphs.
+    validations:
+      required: true
+
+  - type: textarea
+    id: task-context
+    attributes:
+      label: Task context
+      description: Link related issues, ADRs, docs, conversations, or prior PRs.
+      placeholder: Include durable context the agent should read before editing.
+    validations:
+      required: true
+
+  - type: textarea
+    id: likely-files
+    attributes:
+      label: Likely files or modules
+      description: Name the expected areas of the repo, if known.
+      placeholder: "Example: docs/ai/, scripts/check-ai-docs.ts, .github/"
+    validations:
+      required: false
+
+  - type: textarea
+    id: out-of-scope
+    attributes:
+      label: Out of scope
+      description: What should the agent avoid changing?
+      placeholder: Name adjacent work, runtime behavior, or docs that must not be touched.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: maia-invariants
+    attributes:
+      label: Maia invariants to consider
+      description: Use docs/ai/maia-invariants-checklist.md before marking these.
+      options:
+        - label: Tenant/agent isolation
+        - label: Fail-closed behavior
+        - label: Backend decides, LLM proposes
+        - label: Audit/observability
+        - label: Idempotency and side effects
+        - label: Runtime trace or policy routing
+        - label: Not applicable; explain below
+
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation commands
+      description: List the checks the agent must run or explain if skipped.
+      value: |
+        - npm run docs:ai:check
+        - npm run typecheck
+        - npm run lint
+    validations:
+      required: true
+
+  - type: textarea
+    id: docs-impact
+    attributes:
+      label: Docs impact
+      description: Which repo docs, ADRs, or runbooks may need updates?
+      placeholder: State whether docs are required and why.
+    validations:
+      required: true
+
+  - type: textarea
+    id: risk-and-rollback
+    attributes:
+      label: Risk, residual risk, and rollback
+      description: Capture risk before implementation, including what remains after mitigation.
+      placeholder: |
+        Risk:
+        Residual risk:
+        Rollback:
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance criteria
+      description: What must be true before the PR can be merged?
+      placeholder: Use concrete, reviewable bullets.
+    validations:
+      required: true
