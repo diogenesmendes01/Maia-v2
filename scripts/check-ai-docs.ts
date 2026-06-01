@@ -94,6 +94,10 @@ function assertNoForbiddenReferences(): void {
     const content = readText(path);
 
     for (const forbidden of FORBIDDEN_ACTIVE_REFERENCES) {
+      if (path.includes(forbidden)) {
+        fail(`${path} reintroduces the removed/rival AI documentation strategy file: ${forbidden}`);
+      }
+
       if (content.includes(forbidden)) {
         fail(`${path} still references removed/rival AI documentation strategy: ${forbidden}`);
       }
