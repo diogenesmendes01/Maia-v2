@@ -6,6 +6,7 @@ import { dlqRepo } from '@/db/repositories.js';
 import { audit } from '@/governance/audit.js';
 import { sendAlert } from '@/lib/alerts.js';
 import { isRedisOomError, recordRedisOomDegraded } from '@/lib/redis.js';
+import { runWithSystemContext } from '@/db/tenant-context.js';
 import type { AgentJob } from './types.js';
 
 const connection = new IORedis(config.REDIS_URL, {
@@ -23,7 +24,20 @@ export function startAgentWorker(processor: (job: Job<AgentJob>) => Promise<void
     'agent',
     async (job) => {
       logger.debug({ job_id: job.id, mensagem_id: job.data.mensagem_id }, 'agent.job.start');
-      await processor(job);
+      // Issue #369: the worker callstack runs the channel resolver + cross-tenant
+      // adoption (`src/agent/core.ts`) BEFORE the real tenant tuple is known, so
+      // the job payload (`AgentJob = { mensagem_id }`) carries no tenant/agent to
+      // open `runWithTenantContext` with here. Wrap the whole handler in the
+      // sanctioned `system` ALS context so the pre-resolution window is NEVER
+      // contextless — closing the fail-closed blind spot (`tenant-context.ts`
+      // `MissingTenantContextError`) that blocked the #323 flip. Once the tenant
+      // is resolved, `core.ts` opens a NESTED `runWithTenantContext({tenant_id,
+      // agent_id})` that overrides this for the inner scope, so behaviour after
+      // resolution is unchanged. The cross-tenant adoption helpers bypass the
+      // tenant guard by design and the `'system'` sentinel is explicitly NOT
+      // rejected by `assertNotDefaultLiteral`, so the outer context is inert for
+      // them.
+      await runWithSystemContext(() => processor(job));
     },
     {
       connection,
