@@ -92,6 +92,17 @@ export type Tool<I extends z.ZodTypeAny, O extends z.ZodTypeAny> = {
    */
   sensitive?: boolean;
   /**
+   * Issue #366 — financial-mutation audit durability. When true, the tool's
+   * handler writes its OWN audit row TRANSACTIONALLY (via `auditTx(tx, …)`)
+   * inside the same `withTx` as the money-moving write — so ledger + balance +
+   * audit commit or roll back atomically and a failed audit insert is fail-loud
+   * (it aborts the whole tx, never leaving a balance change without its audit
+   * row). The dispatcher then SKIPS its post-commit best-effort `audit()` for
+   * this tool to avoid a duplicate audit row. Only money-moving tools that
+   * self-audit transactionally set this.
+   */
+  audits_in_tx?: boolean;
+  /**
    * Codex review #105 (medium): kill-switch em runtime. Quando setado, o
    * dispatcher checa o flag IMEDIATAMENTE antes de autorizar/executar — se
    * o flag estiver off (kill switch ativo), o tool é tratado como

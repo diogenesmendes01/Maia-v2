@@ -1,7 +1,8 @@
 import { z } from 'zod';
 import type { Tool } from './_registry.js';
 import { transacoesRepo } from '@/db/repositories.js';
-import { audit } from '@/governance/audit.js';
+import { withTx } from '@/db/client.js';
+import { auditTx } from '@/governance/audit.js';
 
 const inputSchema = z.object({
   // Required so the dispatcher routes the profile-permission check to the
@@ -29,6 +30,10 @@ export const cancelTransactionTool: Tool<typeof inputSchema, typeof outputSchema
   redis_required: false,
   operation_type: 'cancel',
   audit_action: 'transaction_cancelled',
+  // Issue #366 — cancelling a transaction is a FINANCIAL lifecycle mutation;
+  // its audit row is written TRANSACTIONALLY (auditTx inside the withTx below),
+  // so the dispatcher must NOT also fire its post-commit audit() (no duplicate).
+  audits_in_tx: true,
   extractAlvoId: (result) =>
     'transacao_id' in result && typeof result.transacao_id === 'string' ? result.transacao_id : null,
   handler: async (args, ctx) => {
@@ -43,18 +48,25 @@ export const cancelTransactionTool: Tool<typeof inputSchema, typeof outputSchema
     if (tx.status === 'cancelada') {
       return { ok: true as const, transacao_id: tx.id };
     }
-    await transacoesRepo.update(tx.id, {
-      status: 'cancelada',
-      updated_at: new Date(),
-    });
-    await audit({
-      acao: 'transaction_cancelled',
-      pessoa_id: ctx.pessoa.id,
-      conversa_id: ctx.conversa.id,
-      mensagem_id: ctx.mensagem_id,
-      entidade_alvo: tx.entidade_id,
-      alvo_id: tx.id,
-      metadata: { motivo: args.motivo ?? null },
+    // Issue #366 — DURABLE audit: the cancel UPDATE and its audit row commit (or
+    // roll back) together in ONE withTx. `auditTx` does NOT swallow errors, so a
+    // failed audit insert aborts the cancel — the transaction can never flip to
+    // 'cancelada' without its audit row. `audits_in_tx` suppresses the
+    // dispatcher's post-commit best-effort audit() (no duplicate audit row).
+    await withTx(async (txn) => {
+      await transacoesRepo.updateTx(txn, tx.id, {
+        status: 'cancelada',
+        updated_at: new Date(),
+      });
+      await auditTx(txn, {
+        acao: 'transaction_cancelled',
+        pessoa_id: ctx.pessoa.id,
+        conversa_id: ctx.conversa.id,
+        mensagem_id: ctx.mensagem_id,
+        entidade_alvo: tx.entidade_id,
+        alvo_id: tx.id,
+        metadata: { motivo: args.motivo ?? null },
+      });
     });
     return { ok: true as const, transacao_id: tx.id };
   },

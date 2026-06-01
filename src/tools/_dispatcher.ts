@@ -423,14 +423,20 @@ export async function dispatchTool(input: {
       details: { tool: tool.name, idempotency_key },
     };
   }
-  await audit({
-    acao: tool.audit_action,
-    pessoa_id: input.ctx.pessoa.id,
-    conversa_id: input.ctx.conversa.id,
-    mensagem_id: input.ctx.mensagem_id,
-    entidade_alvo: entity_id,
-    alvo_id: tool.extractAlvoId?.(out.data) ?? null,
-    metadata: { tool: tool.name },
-  });
+  // Issue #366 — money-moving tools that self-audit TRANSACTIONALLY (via
+  // `auditTx` inside their own `withTx`) set `audits_in_tx`. Their audit row is
+  // already committed atomically with the ledger/balance write, so this
+  // post-commit best-effort `audit()` is SKIPPED to avoid a duplicate row.
+  if (!tool.audits_in_tx) {
+    await audit({
+      acao: tool.audit_action,
+      pessoa_id: input.ctx.pessoa.id,
+      conversa_id: input.ctx.conversa.id,
+      mensagem_id: input.ctx.mensagem_id,
+      entidade_alvo: entity_id,
+      alvo_id: tool.extractAlvoId?.(out.data) ?? null,
+      metadata: { tool: tool.name },
+    });
+  }
   return out.data;
 }

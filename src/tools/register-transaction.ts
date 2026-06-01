@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { contasRepo, transacoesRepo, categoriasRepo } from '@/db/repositories.js';
 import { withTx } from '@/db/client.js';
+import { auditTx } from '@/governance/audit.js';
 import type { Tool } from './_registry.js';
 import { trigramSim } from '@/lib/utils.js';
 import { TypedError } from '@/lib/utils.js';
@@ -49,6 +50,10 @@ export const registerTransactionTool: Tool<typeof inputSchema, typeof outputSche
   redis_required: false,
   operation_type: 'create',
   audit_action: 'transaction_created',
+  // Issue #366 — this money-moving tool writes its audit row TRANSACTIONALLY
+  // (auditTx inside the withTx below), so the dispatcher must NOT also fire its
+  // post-commit best-effort audit() (would duplicate the audit row).
+  audits_in_tx: true,
   extractAlvoId: (result) =>
     'transacao_id' in result && typeof result.transacao_id === 'string' ? result.transacao_id : null,
   handler: async (args, ctx) => {
@@ -137,6 +142,22 @@ export const registerTransactionTool: Tool<typeof inputSchema, typeof outputSche
         const updated = await contasRepo.addToBalanceTx(tx, conta.id, delta.toNumber());
         saldo_aposDec = updated ? toDecimal(updated.saldo_atual) : saldo_aposDec;
       }
+
+      // Issue #366 — DURABLE audit: write the audit row inside the SAME tx as
+      // the ledger INSERT + balance credit. If this insert fails, the whole tx
+      // rolls back — money can never move without its audit row. `auditTx` does
+      // NOT swallow errors (unlike the dispatcher's post-commit best-effort
+      // `audit()`, which `audits_in_tx` suppresses to avoid a duplicate row).
+      // metadata mirrors what the dispatcher would have recorded ({ tool }).
+      await auditTx(tx, {
+        acao: 'transaction_created',
+        pessoa_id: ctx.pessoa.id,
+        conversa_id: ctx.conversa.id,
+        mensagem_id: ctx.mensagem_id,
+        entidade_alvo: args.entidade_id,
+        alvo_id: t.id,
+        metadata: { tool: 'register_transaction' },
+      });
 
       return { transacao_id: t.id, saldo_apos: saldo_aposDec.toNumber() };
     });
