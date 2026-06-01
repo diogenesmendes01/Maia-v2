@@ -92,6 +92,32 @@ export type Tool<I extends z.ZodTypeAny, O extends z.ZodTypeAny> = {
    */
   sensitive?: boolean;
   /**
+   * Issue #366 — financial-mutation audit durability. When true, the tool's
+   * handler writes its OWN audit row TRANSACTIONALLY (via `auditTx(tx, …)`)
+   * inside the same `withTx` as the money-moving write — so ledger + balance +
+   * audit commit or roll back atomically and a failed audit insert is fail-loud
+   * (it aborts the whole tx, never leaving a balance change without its audit
+   * row). The dispatcher then SKIPS its post-commit best-effort `audit()` for
+   * this tool to avoid a duplicate audit row — but ONLY when `auditedInTx`
+   * (below) confirms `auditTx` actually ran for THIS invocation. Only
+   * money-moving tools that self-audit transactionally set this.
+   */
+  audits_in_tx?: boolean;
+  /**
+   * Issue #366 (review #374) — PER-INVOCATION audit signal. `audits_in_tx` is
+   * a static tool-wide opt-in, but these tools have schema-valid EARLY-RETURN
+   * paths (register_transaction duplicate-suspected; cancel_transaction
+   * already-`cancelada`/not-found) that exit BEFORE any `auditTx` runs inside
+   * `withTx`. For those paths the dispatcher MUST still fire its post-commit
+   * `audit()` (the append-only mutation trail requires a row for EVERY
+   * invocation). This predicate inspects the tool's own result and returns
+   * true ONLY on the branch where `auditTx` was actually called in-tx — so the
+   * dispatcher skips its fallback audit() exclusively for self-audited
+   * invocations, and audits the early-return paths normally. Only consulted
+   * when `audits_in_tx` is set.
+   */
+  auditedInTx?: (result: z.infer<O>) => boolean;
+  /**
    * Codex review #105 (medium): kill-switch em runtime. Quando setado, o
    * dispatcher checa o flag IMEDIATAMENTE antes de autorizar/executar — se
    * o flag estiver off (kill switch ativo), o tool é tratado como

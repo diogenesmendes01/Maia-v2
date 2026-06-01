@@ -1408,50 +1408,75 @@ export const transacoesRepo = {
     return rows[0] ?? null;
   },
   async update(id: string, patch: Partial<Transacao>): Promise<void> {
-    // Flip-readiness (#323, H3 of #355) — FINANCIAL mutation: tenant+agent scope
-    // the WHERE (bound from ALS), mirroring the already-scoped `transacoesRepo.byId`
-    // / `byScope`. Both columns are NOT NULL (schema `transacoes`). The sole live
-    // caller (`tools/cancel-transaction.ts`) runs inside the agent turn's
-    // `runWithTenantContext({tenant_id, agent_id})` (agent/core.ts) and patches the
-    // exact `tx` it loaded via the ALREADY tenant+agent-scoped
-    // `transacoesRepo.byId(transacao_id)`, after asserting `tx.entidade_id ===
-    // args.entidade_id` AND `scope.entidades.includes(tx.entidade_id)` — so the row
-    // provably belongs to the running (tenant_id, agent_id) and the predicate
-    // matches it.
-    //
-    // FAIL-LOUD (throw on !=1): this stamps a single, known-present transaction's
-    // lifecycle (the cancel path sets `status='cancelada'`). The id-only WHERE
-    // always matched, so a 0-row result under the new predicate can ONLY be a
-    // tenant/agent mismatch (cross-tenant misroute) — never a benign no-op. The
-    // caller short-circuits the idempotent retry BEFORE reaching here (it returns
-    // early when `tx.status==='cancelada'`), so there is no legitimate 0-row path:
-    // a silent miss would report the cancel as succeeded while the transaction
-    // stayed active (and, if a balance reversal is ever added, would desync the
-    // ledger) — so surface it loudly. Same `.returning({id})` + `.length` idiom as
-    // `mensagensRepo.markProcessed` / `pendingQuestionsRepo.resolve`.
-    const tenant_id = getCurrentTenant();
-    const agent_id = getCurrentAgent();
-    const updated = await db
-      .update(transacoes)
-      .set(patch)
-      .where(
-        and(
-          eq(transacoes.id, id),
-          eq(transacoes.tenant_id, tenant_id),
-          eq(transacoes.agent_id, agent_id),
-        ),
-      )
-      .returning({ id: transacoes.id });
-    if (updated.length !== 1) {
-      throw new Error(
-        `transacoesRepo.update matched ${updated.length} rows for transacao ${id} ` +
-          `under ${tenant_id}/${agent_id} — expected 1 (tenant/agent context does ` +
-          `not match the target transaction; the update would have been silently ` +
-          `lost while reported as applied)`,
-      );
-    }
+    await updateTransacaoWith(db, id, patch);
+  },
+  /**
+   * Issue #366 — TRANSACTIONAL variant of `update`. Same scoped + FAIL-LOUD
+   * core (`updateTransacaoWith`) but on the passed `tx` handle, so the cancel
+   * UPDATE commits/rolls back together with its audit row (`auditTx`) inside
+   * one `withTx` (cancel-transaction). A failed audit insert aborts the cancel
+   * — the transaction can never flip to 'cancelada' without its audit row.
+   */
+  async updateTx(tx: typeof db, id: string, patch: Partial<Transacao>): Promise<void> {
+    await updateTransacaoWith(tx, id, patch);
   },
 };
+
+/**
+ * Shared scoped + FAIL-LOUD core for `transacoesRepo.update` / `updateTx`. Kept
+ * as ONE function so the tenant/agent predicate and the 0-row guard can never
+ * drift between the pooled-`db` and the in-`tx` paths — mirroring the
+ * `addToBalanceWith` precedent for the paired FINANCIAL balance write.
+ *
+ * Flip-readiness (#323, H3 of #355) — FINANCIAL mutation: tenant+agent scope
+ * the WHERE (bound from ALS), mirroring the already-scoped `transacoesRepo.byId`
+ * / `byScope`. Both columns are NOT NULL (schema `transacoes`). The sole live
+ * caller (`tools/cancel-transaction.ts`) runs inside the agent turn's
+ * `runWithTenantContext({tenant_id, agent_id})` (agent/core.ts) and patches the
+ * exact `tx` it loaded via the ALREADY tenant+agent-scoped
+ * `transacoesRepo.byId(transacao_id)`, after asserting `tx.entidade_id ===
+ * args.entidade_id` AND `scope.entidades.includes(tx.entidade_id)` — so the row
+ * provably belongs to the running (tenant_id, agent_id) and the predicate
+ * matches it.
+ *
+ * FAIL-LOUD (throw on !=1): this stamps a single, known-present transaction's
+ * lifecycle (the cancel path sets `status='cancelada'`). The id-only WHERE
+ * always matched, so a 0-row result under the new predicate can ONLY be a
+ * tenant/agent mismatch (cross-tenant misroute) — never a benign no-op. The
+ * caller short-circuits the idempotent retry BEFORE reaching here (it returns
+ * early when `tx.status==='cancelada'`), so there is no legitimate 0-row path:
+ * a silent miss would report the cancel as succeeded while the transaction
+ * stayed active (and, if a balance reversal is ever added, would desync the
+ * ledger) — so surface it loudly. Same `.returning({id})` + `.length` idiom as
+ * `mensagensRepo.markProcessed` / `pendingQuestionsRepo.resolve`.
+ */
+async function updateTransacaoWith(
+  executor: typeof db,
+  id: string,
+  patch: Partial<Transacao>,
+): Promise<void> {
+  const tenant_id = getCurrentTenant();
+  const agent_id = getCurrentAgent();
+  const updated = await executor
+    .update(transacoes)
+    .set(patch)
+    .where(
+      and(
+        eq(transacoes.id, id),
+        eq(transacoes.tenant_id, tenant_id),
+        eq(transacoes.agent_id, agent_id),
+      ),
+    )
+    .returning({ id: transacoes.id });
+  if (updated.length !== 1) {
+    throw new Error(
+      `transacoesRepo.update matched ${updated.length} rows for transacao ${id} ` +
+        `under ${tenant_id}/${agent_id} — expected 1 (tenant/agent context does ` +
+        `not match the target transaction; the update would have been silently ` +
+        `lost while reported as applied)`,
+    );
+  }
+}
 
 export const categoriasRepo = {
   async list(scope?: EntityScope): Promise<Categoria[]> {
@@ -3598,6 +3623,23 @@ export const auditRepo = {
   async write(input: Omit<AuditEntry, 'id' | 'tenant_id' | 'agent_id' | 'created_at'>): Promise<void> {
     const guarded = applyTenantGuard(input);
     await db.insert(audit_log).values(guarded);
+  },
+  /**
+   * Issue #366 — TRANSACTIONAL audit writer. Identical to `write` (same
+   * `applyTenantGuard` tenant/agent stamping) but runs the INSERT on the passed
+   * `tx` handle so the audit row commits (or rolls back) with the enclosing
+   * `withTx`. Used by money-moving tools (`auditTx` in `governance/audit.ts`)
+   * so a balance change can never commit without its audit row — and a failed
+   * audit insert is fail-loud (it aborts the whole transaction). Mirrors the
+   * `tenantsRepo.createWithAuditAtomic` precedent (admin_audit_log appended in
+   * the same tx as the tenant insert, "else the audit row was lost forever").
+   */
+  async writeTx(
+    tx: typeof db,
+    input: Omit<AuditEntry, 'id' | 'tenant_id' | 'agent_id' | 'created_at'>,
+  ): Promise<void> {
+    const guarded = applyTenantGuard(input);
+    await tx.insert(audit_log).values(guarded);
   },
   async listByPessoa(pessoa_id: string, n = 100): Promise<AuditEntry[]> {
     const tenant_id = getCurrentTenant();

@@ -1,17 +1,31 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const transacoesByIdMock = vi.fn();
-const updateMock = vi.fn();
+// Issue #366 — cancel now runs the lifecycle UPDATE + its audit row inside ONE
+// `withTx` via the tx-aware variants (`updateTx`, `auditTx`). We mock those (they
+// receive the fake `tx` handle as their first arg) and `withTx` itself, so the
+// unit test exercises the real atomic flow without a live Postgres.
+const updateTxMock = vi.fn();
+const auditTxMock = vi.fn();
+
+// Sentinel for the in-tx drizzle handle; asserted to be the SAME object threaded
+// into BOTH the cancel UPDATE and the audit write (proving one shared tx).
+const FAKE_TX = { __tx: true } as const;
 
 vi.mock('../../src/db/repositories.js', () => ({
   transacoesRepo: {
     byId: transacoesByIdMock,
-    update: updateMock,
+    updateTx: updateTxMock,
   },
 }));
 
-const auditMock = vi.fn();
-vi.mock('../../src/governance/audit.js', () => ({ audit: auditMock }));
+vi.mock('../../src/governance/audit.js', () => ({ auditTx: auditTxMock }));
+
+// withTx runs its callback with the fake tx handle and returns its result —
+// mirroring `@/db/client.js`'s real contract (BEGIN → fn(tx) → COMMIT; a throw
+// inside rolls back). A throw therefore propagates exactly as in production.
+const withTxMock = vi.fn(async (fn: (tx: unknown) => unknown) => fn(FAKE_TX));
+vi.mock('../../src/db/client.js', () => ({ withTx: withTxMock }));
 
 vi.mock('../../src/lib/logger.js', () => ({
   logger: { warn: vi.fn(), info: vi.fn(), debug: vi.fn(), error: vi.fn() },
@@ -19,8 +33,9 @@ vi.mock('../../src/lib/logger.js', () => ({
 
 beforeEach(() => {
   transacoesByIdMock.mockReset();
-  updateMock.mockReset();
-  auditMock.mockReset();
+  updateTxMock.mockReset();
+  auditTxMock.mockReset();
+  withTxMock.mockClear();
 });
 
 const ctx = {
@@ -39,18 +54,30 @@ describe('cancel_transaction tool', () => {
       entidade_id: 'e1',
       status: 'paga',
     });
-    updateMock.mockResolvedValueOnce(undefined);
+    updateTxMock.mockResolvedValueOnce(undefined);
+    auditTxMock.mockResolvedValueOnce(undefined);
     const { cancelTransactionTool } = await import('../../src/tools/cancel-transaction.js');
     const result = await cancelTransactionTool.handler(
       { entidade_id: 'e1', transacao_id: 'tx-1', motivo: 'edit_review' } as never,
       ctx,
     );
     expect(result).toEqual({ ok: true, transacao_id: 'tx-1' });
-    expect(updateMock).toHaveBeenCalledWith(
+    // Issue #366 — UPDATE + audit ran inside ONE withTx, both on the SAME tx
+    // handle (atomic, fail-loud audit). The dispatcher skips its post-commit
+    // audit() because the tool sets `audits_in_tx`.
+    expect(withTxMock).toHaveBeenCalledTimes(1);
+    expect(updateTxMock).toHaveBeenCalledWith(
+      FAKE_TX,
       'tx-1',
       expect.objectContaining({ status: 'cancelada' }),
     );
-    expect(auditMock.mock.calls.some((c) => c[0].acao === 'transaction_cancelled')).toBe(true);
+    expect(auditTxMock).toHaveBeenCalledTimes(1);
+    expect(auditTxMock.mock.calls[0]![0]).toBe(FAKE_TX);
+    expect(auditTxMock.mock.calls[0]![1]).toMatchObject({
+      acao: 'transaction_cancelled',
+      entidade_alvo: 'e1',
+      alvo_id: 'tx-1',
+    });
   });
 
   it('refuses out-of-scope transaction with forbidden', async () => {
@@ -68,8 +95,8 @@ describe('cancel_transaction tool', () => {
       ctx,
     );
     expect(result).toEqual({ error: 'forbidden' });
-    expect(updateMock).not.toHaveBeenCalled();
-    expect(auditMock).not.toHaveBeenCalled();
+    expect(updateTxMock).not.toHaveBeenCalled();
+    expect(auditTxMock).not.toHaveBeenCalled();
   });
 
   it('refuses when args.entidade_id does not match tx.entidade_id (cross-entity hijack)', async () => {
@@ -89,8 +116,8 @@ describe('cancel_transaction tool', () => {
       ctx,
     );
     expect(result).toEqual({ error: 'forbidden' });
-    expect(updateMock).not.toHaveBeenCalled();
-    expect(auditMock).not.toHaveBeenCalled();
+    expect(updateTxMock).not.toHaveBeenCalled();
+    expect(auditTxMock).not.toHaveBeenCalled();
   });
 
   it('returns error when transaction missing', async () => {
@@ -101,7 +128,7 @@ describe('cancel_transaction tool', () => {
       ctx,
     );
     expect(result).toEqual({ error: 'not_found' });
-    expect(updateMock).not.toHaveBeenCalled();
+    expect(updateTxMock).not.toHaveBeenCalled();
   });
 
   it('is idempotent on already-cancelada transaction (no-op success)', async () => {
@@ -115,8 +142,73 @@ describe('cancel_transaction tool', () => {
       { entidade_id: 'e1', transacao_id: 'tx-3' } as never,
       ctx,
     );
-    expect(result).toEqual({ ok: true, transacao_id: 'tx-3' });
-    expect(updateMock).not.toHaveBeenCalled();
-    expect(auditMock).not.toHaveBeenCalled();
+    // Review #374 — the no-op return carries `already_cancelled: true` so the
+    // dispatcher can tell it apart from a real cancel (same { ok, transacao_id }
+    // shape) and still fire its fallback audit() for this invocation.
+    expect(result).toEqual({ ok: true, transacao_id: 'tx-3', already_cancelled: true });
+    expect(updateTxMock).not.toHaveBeenCalled();
+    expect(auditTxMock).not.toHaveBeenCalled();
+  });
+
+  it('issue #366 — a failed audit insert INSIDE the tx propagates so the cancel UPDATE rolls back (no lifecycle change without audit)', async () => {
+    // The compliance invariant for the cancel path: a transaction can NEVER flip
+    // to 'cancelada' without its audit row. The UPDATE is staged in the tx, then
+    // the in-tx `auditTx` throws; because both run inside ONE withTx and auditTx
+    // does NOT swallow the error, the throw propagates out of withTx (which in
+    // production ROLLs the staged UPDATE back). We assert the throw surfaces AND
+    // that the UPDATE + audit shared the one tx handle (bound to the aborted tx).
+    transacoesByIdMock.mockResolvedValueOnce({
+      id: 'tx-doomed',
+      entidade_id: 'e1',
+      status: 'paga',
+    });
+    updateTxMock.mockResolvedValueOnce(undefined);
+    auditTxMock.mockRejectedValueOnce(new Error('audit insert failed'));
+    const { cancelTransactionTool } = await import('../../src/tools/cancel-transaction.js');
+    await expect(
+      cancelTransactionTool.handler(
+        { entidade_id: 'e1', transacao_id: 'tx-doomed' } as never,
+        ctx,
+      ),
+    ).rejects.toThrow(/audit insert failed/);
+    // Both the cancel UPDATE and the audit write were issued on the SAME tx
+    // handle — so the audit failure aborts the transaction the UPDATE is bound to.
+    expect(withTxMock).toHaveBeenCalledTimes(1);
+    expect(updateTxMock.mock.calls[0]![0]).toBe(FAKE_TX);
+    expect(auditTxMock.mock.calls[0]![0]).toBe(FAKE_TX);
+  });
+
+  it('declares audits_in_tx so the dispatcher does NOT also write a (duplicate) audit row', async () => {
+    const { cancelTransactionTool } = await import('../../src/tools/cancel-transaction.js');
+    expect(cancelTransactionTool.audits_in_tx).toBe(true);
+  });
+
+  it('review #374 — auditedInTx is TRUE for a real cancel (self-audited in-tx → dispatcher skips fallback)', async () => {
+    const { cancelTransactionTool } = await import('../../src/tools/cancel-transaction.js');
+    expect(cancelTransactionTool.auditedInTx).toBeDefined();
+    // Real cancel result: auditTx ran inside withTx → dispatcher must SKIP fallback.
+    expect(cancelTransactionTool.auditedInTx!({ ok: true, transacao_id: 'tx-1' } as never)).toBe(
+      true,
+    );
+  });
+
+  it('review #374 — auditedInTx is FALSE for the already-cancelada no-op (dispatcher must still fallback-audit)', async () => {
+    // The no-op path returns the same { ok, transacao_id } shape but did NOT run
+    // auditTx; the `already_cancelled` marker lets auditedInTx return false so
+    // the dispatcher's fallback audit() still records this invocation.
+    const { cancelTransactionTool } = await import('../../src/tools/cancel-transaction.js');
+    expect(
+      cancelTransactionTool.auditedInTx!({
+        ok: true,
+        transacao_id: 'tx-3',
+        already_cancelled: true,
+      } as never),
+    ).toBe(false);
+  });
+
+  it('review #374 — auditedInTx is FALSE for the { error } short-circuits (not_found / forbidden)', async () => {
+    const { cancelTransactionTool } = await import('../../src/tools/cancel-transaction.js');
+    expect(cancelTransactionTool.auditedInTx!({ error: 'not_found' } as never)).toBe(false);
+    expect(cancelTransactionTool.auditedInTx!({ error: 'forbidden' } as never)).toBe(false);
   });
 });
