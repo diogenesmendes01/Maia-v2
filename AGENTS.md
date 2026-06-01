@@ -6,9 +6,10 @@
 
 1. **This file** — conventions and commands
 2. [`ARCHITECTURE.md`](ARCHITECTURE.md) — mental model, pillars, invariants
-3. The **concern** doc most relevant to your task — [`docs/architecture/concerns/`](docs/architecture/concerns/)
-4. The **module** doc(s) for files you'll edit — [`docs/architecture/modules/`](docs/architecture/modules/)
-5. **Source code is the source of truth.** Docs guide; code decides.
+3. For non-trivial AI-assisted work, [`docs/ai/agent-operating-model.md`](docs/ai/agent-operating-model.md)
+4. The **concern** doc most relevant to your task — [`docs/architecture/concerns/`](docs/architecture/concerns/)
+5. The **module** doc(s) for files you'll edit — [`docs/architecture/modules/`](docs/architecture/modules/)
+6. **Source code is the source of truth.** Docs guide; code decides.
 
 ## 1. Instruction priority
 
@@ -61,6 +62,8 @@ If a project instruction conflicts with a skill, the project wins. If the user s
 | Operational runbooks (debug + rollback) | [`docs/runbooks/`](docs/runbooks/) |
 | Per-feature design specs | [`docs/superpowers/specs/`](docs/superpowers/specs/) |
 | Implementation plans | [`docs/superpowers/plans/`](docs/superpowers/plans/) |
+| AI engineering agent workflows | [`docs/ai/`](docs/ai/) |
+| Architecture decisions | [`docs/architecture/decisions/`](docs/architecture/decisions/) |
 | Versioned schema | [`migrations/`](migrations/) |
 | Current financial agent seed | [`src/identity/maia-prompt.md`](src/identity/maia-prompt.md) — not the platform identity |
 | Changelog | [`CHANGELOG.md`](CHANGELOG.md) |
