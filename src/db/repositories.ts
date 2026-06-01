@@ -1337,6 +1337,36 @@ export const transacoesRepo = {
       .orderBy(desc(transacoes.created_at))
       .limit(limit);
   },
+  /**
+   * Issue #363 — tenant-scoped read of PENDING (unconfirmed) transações for a
+   * set of entidades, for the `list_pending` LLM tool (whose result, incl.
+   * `descricao`/`valor`, is injected back into the prompt context). `entidade_id`
+   * is a GLOBAL uuid, so the tool's old inline `inArray(transacoes.entidade_id, …)`
+   * did NOT scope by tenant — another tenant's pending transação for a
+   * shared/guessed entidade would leak into the LLM context (R2 contamination).
+   * Bind tenant+agent from ALS (both NOT NULL) so the read returns ONLY the
+   * running tuple's rows. Same `status='pendente' AND confirmada_em IS NULL`
+   * filter the tool used.
+   */
+  async listPendingForEntidades(entidades: string[], limit: number): Promise<Transacao[]> {
+    if (entidades.length === 0) return [];
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(transacoes)
+      .where(
+        and(
+          eq(transacoes.tenant_id, tenant_id),
+          eq(transacoes.agent_id, agent_id),
+          inArray(transacoes.entidade_id, entidades),
+          eq(transacoes.status, 'pendente'),
+          isNull(transacoes.confirmada_em),
+        ),
+      )
+      .orderBy(desc(transacoes.data_competencia))
+      .limit(limit);
+  },
   async findRecentSimilar(params: {
     entidade_id: string;
     valor: string;
@@ -1848,6 +1878,33 @@ export const pendingQuestionsRepo = {
       .orderBy(desc(pending_questions.created_at))
       .limit(1);
     return rows[0] ?? null;
+  },
+  /**
+   * Issue #363 — tenant-scoped read of OPEN pending questions for one pessoa,
+   * for the `list_pending` LLM tool (whose result `q.pergunta` is injected back
+   * into the prompt context). `pessoa_id` is a GLOBAL uuid, so filtering by it
+   * alone (as the tool's old inline `db.select` did) does NOT scope by tenant —
+   * another tenant's open question for a shared/guessed pessoa_id would leak
+   * into the LLM context (R2 contamination, same class as #357). Bind tenant+agent
+   * from ALS (both columns NOT NULL) so the read returns ONLY the running tuple's
+   * rows. Read-only `list*` shape mirrors `transacoesRepo.listRecent`/`byScope`.
+   */
+  async listOpenForPessoa(pessoa_id: string, limit: number): Promise<PendingQuestion[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(pending_questions)
+      .where(
+        and(
+          eq(pending_questions.tenant_id, tenant_id),
+          eq(pending_questions.agent_id, agent_id),
+          eq(pending_questions.pessoa_id, pessoa_id),
+          eq(pending_questions.status, 'aberta'),
+        ),
+      )
+      .orderBy(desc(pending_questions.created_at))
+      .limit(limit);
   },
   async resolve(id: string, resposta: unknown): Promise<void> {
     // Flip-readiness (#323, H2 of #355): tenant+agent scope the WHERE (bound
@@ -3653,6 +3710,32 @@ export const workflowsRepo = {
         eq(workflows.agent_id, agent_id),
         sql`status IN ('pendente','em_andamento','aguardando_humano','aguardando_terceiro')`,
       ));
+  },
+  /**
+   * Issue #363 — tenant-scoped read of open workflows for a set of entidades,
+   * for the `list_pending` LLM tool (whose result, incl. workflow `tipo`/intent
+   * `tool`, is injected back into the prompt context). `entidade_id` is a GLOBAL
+   * uuid, so the tool's old inline `inArray(workflows.entidade_id, …)` did NOT
+   * scope by tenant — another tenant's workflow for a shared/guessed entidade
+   * would leak into the LLM context (R2 contamination). Bind tenant+agent from
+   * ALS (both NOT NULL) so the read returns ONLY the running tuple's rows. The
+   * open-status set is kept in lock-step with `listPending()` above.
+   */
+  async listPendingForEntidades(entidades: string[], limit: number): Promise<Workflow[]> {
+    if (entidades.length === 0) return [];
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(workflows)
+      .where(and(
+        eq(workflows.tenant_id, tenant_id),
+        eq(workflows.agent_id, agent_id),
+        inArray(workflows.entidade_id, entidades),
+        sql`status IN ('pendente','em_andamento','aguardando_humano','aguardando_terceiro')`,
+      ))
+      .orderBy(desc(workflows.iniciado_em))
+      .limit(limit);
   },
   /**
    * Issue #345 (Phase 4 of #323) — enumeration source for the
