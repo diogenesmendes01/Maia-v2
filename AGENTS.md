@@ -68,6 +68,16 @@ If a project instruction conflicts with a skill, the project wins. If the user s
 | Current financial agent seed | [`src/identity/maia-prompt.md`](src/identity/maia-prompt.md) — not the platform identity |
 | Changelog | [`CHANGELOG.md`](CHANGELOG.md) |
 
+### AI engineering workflows
+
+| Workflow | Doc |
+|---|---|
+| Operating model | [`docs/ai/agent-operating-model.md`](docs/ai/agent-operating-model.md) |
+| Coding agent playbook | [`docs/ai/coding-agent-playbook.md`](docs/ai/coding-agent-playbook.md) |
+| Review agent playbook | [`docs/ai/review-agent-playbook.md`](docs/ai/review-agent-playbook.md) |
+| Task spec template | [`docs/ai/task-spec-template.md`](docs/ai/task-spec-template.md) |
+| Maia invariant checklist | [`docs/ai/maia-invariants-checklist.md`](docs/ai/maia-invariants-checklist.md) |
+
 ## 4. Conventions agents MUST follow
 
 | # | Rule | Where enforced |
@@ -108,6 +118,7 @@ npm run test:e2e                  # e2e
 npm run test:leak                 # cross-tenant leak suite (critical, run before any tenant-related change)
 
 # Static checks (run before every commit)
+npm run docs:ai:check             # AI engineering docs governance
 npm run typecheck                 # tsc --noEmit
 npm run lint                      # eslint src tests scripts
 npm run format                    # prettier --write src

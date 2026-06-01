@@ -61,6 +61,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: AI docs governance
+        run: npm run docs:ai:check
+
       - name: Typecheck (tsc --noEmit)
         # Separated from build so failures point cleanly at type vs build.
         # `npx` instead of an npm script keeps CI independent of script renames.
