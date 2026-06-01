@@ -23,6 +23,7 @@
  * combined with drizzle's `and(...)`. Anything else throws loudly so a future
  * predicate change can't silently pass.
  */
+import { getTableName } from 'drizzle-orm';
 import { vi } from 'vitest';
 
 export interface StoreRow {
@@ -32,7 +33,25 @@ export interface StoreRow {
   status: string;
   /** ISO string or Date; only present on pending_questions rows. */
   expira_em?: string | Date | null;
+  /**
+   * Optional table tag (issue #363). When a single test seeds rows that would be
+   * read by SELECTs from DIFFERENT tables (e.g. `list_pending` reads
+   * pending_questions + workflows + transacoes against ONE store), set this to the
+   * drizzle table name so a row only matches a `select().from(thatTable)`. Rows
+   * WITHOUT a tag match any table — preserving every pre-existing single-table
+   * spec, which never sets it.
+   */
+  __table?: string;
   [k: string]: unknown;
+}
+
+/** Resolve a drizzle table object passed to `.from(...)` to its SQL name. */
+function tableNameOf(table: unknown): string | undefined {
+  try {
+    return getTableName(table as never);
+  } catch {
+    return undefined;
+  }
 }
 
 /** A drizzle SQL-ish node (only the bits we introspect). */
@@ -239,6 +258,14 @@ function rawFragmentSatisfied(text: string, row: StoreRow, now: Date): boolean {
     );
     return allowed.has(String(row[col]));
   }
+  // `<col> is null` — drizzle renders `isNull(col)` as a column interpolation
+  // followed by the literal " is null" (no Param), so `rawText` collapses it to
+  // `"<col> is null"` and it reaches here. Used by `transacoesRepo
+  // .listPendingForEntidades` (issue #363: `isNull(transacoes.confirmada_em)`).
+  const nullCheck = /^(\w+)\s+is\s+null$/i.exec(text);
+  if (nullCheck) {
+    return row[nullCheck[1]!] == null;
+  }
   throw new Error(`tenant-mutation-store: unsupported raw fragment "${text}"`);
 }
 
@@ -332,6 +359,13 @@ export interface TenantScopedUpdateStore {
   lastPredicate: () => unknown;
   /** The drizzle predicate captured from the most recent SELECT `.where(...)`. */
   lastSelectPredicate: () => unknown;
+  /**
+   * EVERY SELECT `.where(...)` predicate captured since the last `reset`, in call
+   * order. A single handler can issue several SELECTs (e.g. `list_pending` reads
+   * pending_questions + workflows + transacoes — issue #363); `lastSelectPredicate`
+   * only retains the final one, so use this to assert each read was tenant-scoped.
+   */
+  selectPredicates: () => unknown[];
   /** The `Term[]` parsed from the most recent raw `execute(sql\`…\`)` UPDATE. */
   lastExecuteTerms: () => Term[] | undefined;
   /** The drizzle predicate captured from the most recent DELETE `.where(...)`. */
@@ -362,6 +396,7 @@ export function makeTenantScopedUpdateStore(
   let rows: StoreRow[] = initialRows.map((r) => ({ ...r }));
   let captured: unknown = undefined;
   let capturedSelect: unknown = undefined;
+  const capturedSelects: unknown[] = [];
   let capturedExecuteTerms: Term[] | undefined = undefined;
   let capturedDelete: unknown = undefined;
   let capturedConflictWhere: unknown = undefined;
@@ -407,14 +442,25 @@ export function makeTenantScopedUpdateStore(
   //   - `.where(pred)` awaited directly    (e.g. workflowsRepo.listPending — #345)
   //   - `.where(pred).orderBy(col)`        (e.g. workflowStepsRepo.byWorkflow — #345)
   const select = vi.fn(() => {
+    let fromTable: string | undefined;
     const run = (): StoreRow[] => {
       const terms = parsePredicate(capturedSelect);
-      return rows.filter((row) => rowMatches(row, terms, now));
+      return rows.filter(
+        (row) =>
+          // A tagged row only matches a SELECT from its own table (issue #363);
+          // untagged rows match any table (back-compat with single-table specs).
+          (row.__table === undefined || fromTable === undefined || row.__table === fromTable) &&
+          rowMatches(row, terms, now),
+      );
     };
     const chain = {
-      from: (_table: unknown) => chain,
+      from: (table: unknown) => {
+        fromTable = tableNameOf(table);
+        return chain;
+      },
       where: (predicate: unknown) => {
         capturedSelect = predicate;
+        capturedSelects.push(predicate);
         return chain;
       },
       orderBy: () => chain,
@@ -533,6 +579,7 @@ export function makeTenantScopedUpdateStore(
     },
     lastPredicate: () => captured,
     lastSelectPredicate: () => capturedSelect,
+    selectPredicates: () => [...capturedSelects],
     lastExecuteTerms: () => capturedExecuteTerms,
     lastDeletePredicate: () => capturedDelete,
     lastConflictWherePredicate: () => capturedConflictWhere,
@@ -540,6 +587,7 @@ export function makeTenantScopedUpdateStore(
       rows = next.map((r) => ({ ...r }));
       captured = undefined;
       capturedSelect = undefined;
+      capturedSelects.length = 0;
       capturedExecuteTerms = undefined;
       capturedDelete = undefined;
       capturedConflictWhere = undefined;

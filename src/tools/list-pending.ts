@@ -1,7 +1,5 @@
 import { z } from 'zod';
-import { db } from '@/db/client.js';
-import { pending_questions, workflows, transacoes } from '@/db/schema.js';
-import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { pendingQuestionsRepo, workflowsRepo, transacoesRepo } from '@/db/repositories.js';
 import type { Tool } from './_registry.js';
 
 const inputSchema = z.object({
@@ -45,12 +43,15 @@ export const listPendingTool: Tool<typeof inputSchema, typeof outputSchema> = {
 
     const itens: z.infer<typeof itemSchema>[] = [];
 
-    const pq = await db
-      .select()
-      .from(pending_questions)
-      .where(and(eq(pending_questions.pessoa_id, ctx.pessoa.id), eq(pending_questions.status, 'aberta')))
-      .orderBy(desc(pending_questions.created_at))
-      .limit(limit);
+    // Issue #363: all three reads MUST be tenant+agent scoped — this tool is
+    // registered for the LLM tool registry and its result (q.pergunta, workflow
+    // intent, transação descrições) is injected back into the prompt context.
+    // pessoa_id/entidade_id are GLOBAL uuids, so filtering by them alone (the
+    // prior inline `db.select`) did NOT scope by tenant. The repo methods bind
+    // tenant_id+agent_id from ALS (the handler runs inside the agent turn's
+    // runWithTenantContext), so a foreign tenant's pending content can never
+    // contaminate this Maia's context. (R2 LLM-context-contamination, cf. #357.)
+    const pq = await pendingQuestionsRepo.listOpenForPessoa(ctx.pessoa.id, limit);
     for (const q of pq) {
       itens.push({
         kind: 'pergunta',
@@ -62,17 +63,7 @@ export const listPendingTool: Tool<typeof inputSchema, typeof outputSchema> = {
       });
     }
 
-    const wfs = await db
-      .select()
-      .from(workflows)
-      .where(
-        and(
-          inArray(workflows.entidade_id, ents),
-          sql`status IN ('pendente','em_andamento','aguardando_humano','aguardando_terceiro')`,
-        ),
-      )
-      .orderBy(desc(workflows.iniciado_em))
-      .limit(limit);
+    const wfs = await workflowsRepo.listPendingForEntidades(ents, limit);
     for (const w of wfs) {
       const ctxObj = (w.contexto ?? {}) as Record<string, unknown>;
       const tool = (ctxObj.intent as { tool?: string } | undefined)?.tool;
@@ -86,18 +77,7 @@ export const listPendingTool: Tool<typeof inputSchema, typeof outputSchema> = {
       });
     }
 
-    const tx = await db
-      .select()
-      .from(transacoes)
-      .where(
-        and(
-          inArray(transacoes.entidade_id, ents),
-          eq(transacoes.status, 'pendente'),
-          isNull(transacoes.confirmada_em),
-        ),
-      )
-      .orderBy(desc(transacoes.data_competencia))
-      .limit(limit);
+    const tx = await transacoesRepo.listPendingForEntidades(ents, limit);
     for (const t of tx) {
       itens.push({
         kind: 'transacao_pendente',
