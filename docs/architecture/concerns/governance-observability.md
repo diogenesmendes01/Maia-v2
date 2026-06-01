@@ -15,7 +15,7 @@ Concretely:
 
 ## 2. Why it matters
 
-In a financial agent, *"the model decided"* is not a defensible audit trail. Regulators, owners, and downstream tooling all need to know which rule, applied to which payload, by which agent, on whose behalf, produced which side-effect.
+In a configurable agent platform, *"the model decided"* is not a defensible audit trail. Owners, auditors, and downstream tooling all need to know which rule, applied to which payload, by which agent, on whose behalf, produced which side-effect.
 
 Observability with tenant attribution is the operational corollary: a dashboard that shows "rate-limit overage went up" without per-tenant attribution can't tell whether one tenant is misbehaving or all of them are. The metrics labels turn aggregate noise into actionable diagnosis.
 

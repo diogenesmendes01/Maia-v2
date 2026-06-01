@@ -62,7 +62,7 @@ If a project instruction conflicts with a skill, the project wins. If the user s
 | Per-feature design specs | [`docs/superpowers/specs/`](docs/superpowers/specs/) |
 | Implementation plans | [`docs/superpowers/plans/`](docs/superpowers/plans/) |
 | Versioned schema | [`migrations/`](migrations/) |
-| System prompt-base for agents | [`src/identity/maia-prompt.md`](src/identity/maia-prompt.md) |
+| Current financial agent seed | [`src/identity/maia-prompt.md`](src/identity/maia-prompt.md) — not the platform identity |
 | Changelog | [`CHANGELOG.md`](CHANGELOG.md) |
 
 ## 4. Conventions agents MUST follow

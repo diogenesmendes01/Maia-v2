@@ -15,7 +15,7 @@ Every side-effect in the system passes through this layer. There is no shortcut.
 
 ## 2. Why it matters
 
-This is what makes the system **auditable in a financial context**. *"The model decided"* is never a defensible audit trail; *"the rule in `governance/rules.ts:42` was applied to typed payload X by skill Y under policy Z"* is. The action layer turns LLM nondeterminism into governed, replayable, typed execution.
+This is what makes the system **auditable across operational roles**. *"The model decided"* is never a defensible audit trail; *"the rule in `governance/rules.ts:42` was applied to typed payload X by skill Y under policy Z"* is. The action layer turns LLM nondeterminism into governed, replayable, typed execution whether the agent is handling finance, sales, support, backoffice, or another tenant-defined role.
 
 It is also where idempotency lives. Tools carry idempotency keys; the engine deduplicates by key before executing. A network retry, a worker re-delivery, or an LLM hallucinating the same tool call twice all converge to one execution.
 
