@@ -92,7 +92,15 @@ function isStringChunk(o: unknown): o is { value: string[] } {
 type Term =
   | { kind: 'eq'; column: string; value: unknown }
   | { kind: 'in'; column: string; values: unknown[] }
-  | { kind: 'raw'; text: string };
+  | { kind: 'raw'; text: string }
+  // Issue #362 — the pending-reminder CAS adds two builder comparisons whose
+  // operands are nested `sql` fragments (not Params), so they don't fit the
+  // eq/in/raw shapes above:
+  //   - `gt(<timestamp col>, sql\`now()\`)`  → `row[col] > now`
+  | { kind: 'gt_now'; column: string }
+  //   - `lt(sql\`COALESCE((<jsonb col>->>'<key>')::int, 0)\`, <number>)`
+  //       → `(row[col]?.[key] ?? 0) < value`
+  | { kind: 'json_int_lt'; column: string; key: string; value: number };
 
 /**
  * Flatten a raw-comparison SQL node to its literal text, rendering StringChunks
@@ -155,6 +163,66 @@ function asInArrayTerm(node: SqlNode): Term | null {
   return null;
 }
 
+/** Render a nested `sql` fragment's literal text (StringChunks + Column names). */
+function nestedSqlText(node: SqlNode): string | null {
+  const chunks = node.queryChunks ?? [];
+  // A pure literal/column fragment — must NOT contain Params or further nesting.
+  if (chunks.some((c) => isSql(c) || isParam(c))) return null;
+  const parts: string[] = [];
+  for (const c of chunks) {
+    if (isStringChunk(c)) parts.push((c as { value: string[] }).value.join(''));
+    else if (isColumn(c)) parts.push((c as ColumnNode).name!);
+    else return null;
+  }
+  return parts.join('');
+}
+
+/**
+ * Issue #362 — recognise `gt(<column>, sql\`now()\`)`, which drizzle emits as
+ * `[StringChunk(""), Column, StringChunk(" > "), SQL("now()"), StringChunk("")]`.
+ * The right operand is a nested `now()` SQL fragment (no Param), so this never
+ * collides with `asEqTerm` (which requires a Param). Only `> now()` is modelled
+ * — anything else returns null so `parsePredicate` falls through / throws.
+ */
+function asGtNowTerm(node: SqlNode): Term | null {
+  const chunks = node.queryChunks ?? [];
+  const col = chunks.find(isColumn) as ColumnNode | undefined;
+  const nested = chunks.find(isSql) as SqlNode | undefined;
+  const hasGtOp = chunks.some(
+    (c) => isStringChunk(c) && (c as { value: string[] }).value.join('').includes('>'),
+  );
+  if (col?.name && nested && hasGtOp && nestedSqlText(nested)?.trim().toLowerCase() === 'now()') {
+    return { kind: 'gt_now', column: col.name };
+  }
+  return null;
+}
+
+/**
+ * Issue #362 — recognise the reminder-cap CAS term
+ * `lt(sql\`COALESCE((<jsonb col>->>'<key>')::int, 0)\`, <number>)`, emitted as
+ * `[StringChunk(""), SQL(COALESCE…), StringChunk(" < "), Number, StringChunk("")]`.
+ * The left operand is a nested COALESCE-over-JSON fragment (a Column inside a
+ * nested SQL); the right is a bare numeric chunk (NOT a Param). We pull the jsonb
+ * column name + the `->>'<key>'` accessor out of the nested fragment.
+ */
+function asJsonIntLtTerm(node: SqlNode): Term | null {
+  const chunks = node.queryChunks ?? [];
+  const nested = chunks.find(isSql) as SqlNode | undefined;
+  const num = chunks.find((c) => typeof c === 'number') as number | undefined;
+  const hasLtOp = chunks.some(
+    (c) => isStringChunk(c) && (c as { value: string[] }).value.join('').includes('<'),
+  );
+  if (!nested || num === undefined || !hasLtOp) return null;
+  // Render the nested fragment with its Column interpolated, e.g.
+  // "COALESCE((metadata->>'reminder_count')::int, 0)".
+  const col = (nested.queryChunks ?? []).find(isColumn) as ColumnNode | undefined;
+  const text = nestedSqlText(nested);
+  if (!col?.name || !text) return null;
+  const m = /->>'([^']+)'/.exec(text);
+  if (!m) return null;
+  return { kind: 'json_int_lt', column: col.name, key: m[1]!, value: num };
+}
+
 /**
  * Walk a drizzle predicate (the argument to `.where(...)`) into a flat list of
  * terms. Handles `and(...)` nesting transparently. Throws on any construct the
@@ -176,6 +244,20 @@ export function parsePredicate(predicate: unknown): Term[] {
     const inTerm = asInArrayTerm(node);
     if (inTerm) {
       terms.push(inTerm);
+      return;
+    }
+    // Issue #362 — the pending-reminder CAS builder comparisons. Checked BEFORE
+    // `rawText`/composite recursion: both carry a nested SQL operand, so the
+    // recursion would otherwise descend into `now()`/`COALESCE(...)` and trip on
+    // the column-at-composite-level guard.
+    const gtNow = asGtNowTerm(node);
+    if (gtNow) {
+      terms.push(gtNow);
+      return;
+    }
+    const jsonLt = asJsonIntLtTerm(node);
+    if (jsonLt) {
+      terms.push(jsonLt);
       return;
     }
     // A raw fragment (e.g. `expira_em < now()`)?
@@ -218,6 +300,16 @@ export function rowMatches(row: StoreRow, terms: Term[], now: Date): boolean {
       if (row[t.column] !== t.value) return false;
     } else if (t.kind === 'in') {
       if (!t.values.includes(row[t.column])) return false;
+    } else if (t.kind === 'gt_now') {
+      // Issue #362 — `expira_em > now()`: a row with no/null timestamp, or one
+      // whose timestamp is at/before `now`, is NOT eligible (the CAS skips it).
+      const v = toDate(row[t.column] as unknown);
+      if (!v || v.getTime() <= now.getTime()) return false;
+    } else if (t.kind === 'json_int_lt') {
+      // Issue #362 — `COALESCE((metadata->>'<key>')::int, 0) < value`.
+      const json = row[t.column] as Record<string, unknown> | null | undefined;
+      const current = Number((json?.[t.key] as number | undefined) ?? 0);
+      if (!(current < t.value)) return false;
     } else if (!rawFragmentSatisfied(t.text, row, now)) {
       return false;
     }

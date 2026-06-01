@@ -87,6 +87,7 @@ export const AUDIT_ACTIONS = [
   'pending_reminder_sent',
   'pending_reminder_skipped_no_outbound',
   'pending_reminder_skipped_already_marked',
+  'pending_reminder_skipped_stale',
   'outbound_sent_view_once',
   'outbound_view_once_skipped_by_preference',
   'outbound_sent_document',
