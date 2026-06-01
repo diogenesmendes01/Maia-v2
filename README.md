@@ -234,7 +234,7 @@ CI roda esses testes automaticamente em job dedicado (`integration` em
 - [`docs/superpowers/specs/`](docs/superpowers/specs/) — design specs por feature
 - [`docs/superpowers/plans/`](docs/superpowers/plans/) — planos de implementação faseados
 - [`migrations/`](migrations/) — schema versionado
-- [`src/identity/maia-prompt.md`](src/identity/maia-prompt.md) — system prompt-base de agentes
+- [`src/identity/maia-prompt.md`](src/identity/maia-prompt.md) — seed operacional do agente financeiro atual; não é a identidade da plataforma
 
 ---
 
