@@ -1,5 +1,5 @@
 import { sql } from 'drizzle-orm';
-import { eq, and } from 'drizzle-orm';
+import { eq, and, gt, lt } from 'drizzle-orm';
 import { db } from '@/db/client.js';
 import { pending_questions } from '@/db/schema.js';
 import { pendingQuestionsRepo } from '@/db/repositories.js';
@@ -198,7 +198,15 @@ async function processOne(row: Row): Promise<void> {
   // enumeration + scoped SELECT already guarantee `row` belongs to this tuple.
   const tenant_id = getCurrentTenant();
   const agent_id = getCurrentAgent();
-  await db
+  // Issue #362: compare-and-swap. `pending_expirer` runs every 1min while this
+  // reminder pass runs every 30min, so a row that was `aberta`/non-expired at
+  // SELECT time can be flipped to `expirada` BEFORE this UPDATE lands. Re-assert
+  // the eligibility invariants the SELECT used (status='aberta', expira_em >
+  // now(), reminder_count < MAX_REMINDERS) directly in the WHERE so the
+  // bookkeeping bump only ever applies to a STILL-VALID row. `.returning` lets us
+  // detect a LOST RACE (0 rows) and skip the send instead of notifying the owner
+  // about an already-expired question and corrupting `reminder_count`.
+  const updated = await db
     .update(pending_questions)
     .set({ metadata: newMeta })
     .where(
@@ -206,8 +214,28 @@ async function processOne(row: Row): Promise<void> {
         eq(pending_questions.tenant_id, tenant_id),
         eq(pending_questions.agent_id, agent_id),
         eq(pending_questions.id, row.id),
+        eq(pending_questions.status, 'aberta'),
+        gt(pending_questions.expira_em, sql`now()`),
+        lt(
+          sql`COALESCE((${pending_questions.metadata}->>'reminder_count')::int, 0)`,
+          MAX_REMINDERS,
+        ),
       ),
-    );
+    )
+    .returning({ id: pending_questions.id });
+
+  // LOST RACE: the row was expired (or hit the reminder cap) by a concurrent
+  // `pending_expirer` between the SELECT and this UPDATE. NOT an error — log,
+  // audit, and skip the send. The send below is CONDITIONAL on the CAS winning.
+  if (updated.length === 0) {
+    logger.debug({ pq_id: row.id }, 'pending_reminder.lost_race');
+    await audit({
+      acao: 'pending_reminder_skipped_stale',
+      alvo_id: row.id,
+      metadata: { tipo: row.tipo, reason: 'expired_or_capped_between_select_and_update' },
+    });
+    return;
+  }
 
   const jid = quoted.key.remoteJid;
   try {

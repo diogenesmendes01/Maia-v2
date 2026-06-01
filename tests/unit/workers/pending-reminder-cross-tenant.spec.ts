@@ -267,11 +267,31 @@ describe('Issue #345 — pending-reminder UPDATE mutates ONLY the current tenant
     ...over,
   });
 
+  // Issue #362: the reminder UPDATE is now CAS-guarded (status='aberta' AND
+  // expira_em > now() AND reminder_count < MAX). The persisted rows must be
+  // STILL-VALID so the CAS matches — otherwise nothing updates and the isolation
+  // assertion can't observe which row the (scoped) UPDATE touched. `expira_em` is
+  // set well into the future relative to the store's fixed `now`.
+  const FUTURE = new Date(Date.now() + 86_400_000).toISOString();
   beforeEach(() => {
     // Store holds the persisted rows the UPDATE targets, keyed by tenant.
     mutationStore.reset([
-      { id: 'A-pq', tenant_id: 'tenant-A', agent_id: 'agent-A', status: 'aberta', metadata: {} },
-      { id: 'B-pq', tenant_id: 'tenant-B', agent_id: 'agent-B', status: 'aberta', metadata: {} },
+      {
+        id: 'A-pq',
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-A',
+        status: 'aberta',
+        expira_em: FUTURE,
+        metadata: {},
+      },
+      {
+        id: 'B-pq',
+        tenant_id: 'tenant-B',
+        agent_id: 'agent-B',
+        status: 'aberta',
+        expira_em: FUTURE,
+        metadata: {},
+      },
     ] as StoreRow[]);
   });
 

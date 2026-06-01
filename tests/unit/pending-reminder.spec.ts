@@ -1,9 +1,16 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const dbExecuteMock = vi.fn();
+// Issue #362: the reminder UPDATE is now a compare-and-swap that ends in
+// `.returning({ id })` and skips the send when 0 rows came back (lost race vs
+// `pending_expirer`). The mock chain therefore terminates in `returning`, which
+// each test seeds: `[{ id }]` = CAS won, `[]` = CAS lost (row expired between
+// SELECT and UPDATE).
+const dbUpdateReturningMock = vi.fn().mockResolvedValue([{ id: 'pq-1' }]);
 const dbUpdateChain = {
   set: vi.fn().mockReturnThis(),
-  where: vi.fn().mockResolvedValue(undefined),
+  where: vi.fn().mockReturnThis(),
+  returning: dbUpdateReturningMock,
 };
 const dbUpdateMock = vi.fn().mockReturnValue(dbUpdateChain);
 vi.mock('../../src/db/client.js', () => ({
@@ -60,7 +67,9 @@ beforeEach(() => {
   dbUpdateChain.set.mockClear();
   dbUpdateChain.set.mockReturnThis();
   dbUpdateChain.where.mockClear();
-  dbUpdateChain.where.mockResolvedValue(undefined);
+  dbUpdateChain.where.mockReturnThis();
+  dbUpdateReturningMock.mockClear();
+  dbUpdateReturningMock.mockResolvedValue([{ id: 'pq-1' }]); // CAS won by default
   sendOutboundTextMock.mockReset();
   sendOutboundTextMock.mockResolvedValue('WAID-REMINDER');
   auditMock.mockReset();
@@ -159,5 +168,74 @@ describe('pending-reminder worker', () => {
     await runPendingReminder();
     expect(dbUpdateChain.set).toHaveBeenCalled();
     // Send was attempted but failed; the worker did not throw.
+  });
+
+  // Issue #362: race between `pending_expirer` (every 1min) and `pending_reminder`
+  // (every 30min). The SELECT picks an open/non-expired row, but if `pending_expirer`
+  // flips it to `expirada` BEFORE the bookkeeping UPDATE lands, the CAS-guarded
+  // UPDATE (status='aberta' AND expira_em > now() AND reminder_count < MAX) matches
+  // 0 rows. The worker MUST skip the send and NOT advance reminder_count.
+  it('LOST RACE — row concurrently expired between SELECT and UPDATE (CAS matches 0): no send, count not advanced', async () => {
+    dbExecuteMock.mockResolvedValueOnce({
+      rows: [
+        {
+          id: 'pq-stale',
+          tipo: 'gate',
+          pergunta: 'Confirma?',
+          telefone_whatsapp: '+5511988888888',
+          outbound_metadata: {
+            whatsapp_id: 'WAID-Q',
+            remote_jid: '5511988888888@s.whatsapp.net',
+          },
+          metadata: {},
+        },
+      ],
+    });
+    // CAS loses: the row was expired by `pending_expirer` between SELECT and UPDATE,
+    // so the guarded UPDATE returns 0 rows.
+    dbUpdateReturningMock.mockResolvedValueOnce([]);
+
+    const { runPendingReminder } = await import('../../src/workers/pending-reminder.js');
+    await runPendingReminder();
+
+    // The send is CONDITIONAL on the CAS winning — a 0-row UPDATE must skip it.
+    expect(sendOutboundTextMock).not.toHaveBeenCalled();
+    // No stale `pending_reminder_sent` audit, and reminder_count was NOT bumped
+    // (the UPDATE that would have set it matched no still-valid row).
+    const sent = auditMock.mock.calls.filter((c) => c[0].acao === 'pending_reminder_sent');
+    expect(sent).toHaveLength(0);
+    const skipped = auditMock.mock.calls.filter(
+      (c) => c[0].acao === 'pending_reminder_skipped_stale',
+    );
+    expect(skipped).toHaveLength(1);
+  });
+
+  it('CAS WON — UPDATE matches the still-valid row (1 row): reminder IS sent and count advances', async () => {
+    dbExecuteMock.mockResolvedValueOnce({
+      rows: [
+        {
+          id: 'pq-live',
+          tipo: 'gate',
+          pergunta: 'Confirma?',
+          telefone_whatsapp: '+5511988888888',
+          outbound_metadata: {
+            whatsapp_id: 'WAID-Q',
+            remote_jid: '5511988888888@s.whatsapp.net',
+          },
+          metadata: { reminder_count: 0 },
+        },
+      ],
+    });
+    // CAS wins: the row is still open/non-expired, so the guarded UPDATE returns it.
+    dbUpdateReturningMock.mockResolvedValueOnce([{ id: 'pq-live' }]);
+
+    const { runPendingReminder } = await import('../../src/workers/pending-reminder.js');
+    await runPendingReminder();
+
+    expect(sendOutboundTextMock).toHaveBeenCalledTimes(1);
+    const sent = auditMock.mock.calls.filter((c) => c[0].acao === 'pending_reminder_sent');
+    expect(sent).toHaveLength(1);
+    // reminder_count advanced from 0 → 1 (the metadata the UPDATE persisted).
+    expect(sent[0][0].metadata.reminder_count).toBe(1);
   });
 });
