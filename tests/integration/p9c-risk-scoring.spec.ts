@@ -9,7 +9,24 @@
  *
  * Padrão do projeto: integration tests gated em TEST_DB_URL.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+
+// Anthropic SDK mock (mesmo shape de tests/unit/risk-llm-gate.spec.ts e
+// tests/integration/p3c-procedure-governance.spec.ts). tests/setup.ts:14
+// semeia uma ANTHROPIC_API_KEY placeholder não-vazia, então sem este mock o
+// `haikuRiskGate` real construiria o cliente e bateria em api.anthropic.com
+// (401 após retry/backoff) — flake + custo. messages.create rejeita para
+// forçar o caminho fallback=null do runCognitiveModule sem nenhum I/O de rede.
+const { messagesCreateMock } = vi.hoisted(() => ({
+  messagesCreateMock: vi.fn(),
+}));
+vi.mock('@anthropic-ai/sdk', () => {
+  const Anthropic = vi.fn(function (this: unknown) {
+    return { messages: { create: messagesCreateMock } };
+  });
+  return { default: Anthropic };
+});
+
 import { db } from '@/db/client.js';
 import { cognitive_module_log } from '@/db/schema.js';
 import { eq } from 'drizzle-orm';
@@ -32,8 +49,10 @@ async function cleanup() {
 d('P9c — risk scorer telemetry', () => {
   it('haikuRiskGate audita em cognitive_module_log mesmo quando gate falha (Anthropic missing)', async () => {
     await cleanup();
-    // Sem ANTHROPIC_API_KEY → SDK throw → runCognitiveModule fallback=null.
-    // Audit row deve existir mesmo assim com status='error'.
+    // ANTHROPIC_API_KEY É semeada (tests/setup.ts:14), mas o SDK está mockado:
+    // messages.create rejeita → runCognitiveModule status='error', fallback=null.
+    // Audit row deve existir mesmo assim. Zero I/O de rede.
+    messagesCreateMock.mockRejectedValueOnce(new Error('boom'));
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
       const r = await haikuRiskGate({
         current_level: RiskLevel.LOW,
