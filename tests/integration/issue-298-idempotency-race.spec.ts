@@ -53,6 +53,13 @@ async function seedFixtures(): Promise<void> {
         ON CONFLICT (id) DO NOTHING`,
       [TENANT_A, TENANT_B],
     );
+    // idempotency_keys.agent_id FKs agents(id); seed the shared agent so the
+    // reservation rows can be inserted under it.
+    await c.query(
+      `INSERT INTO agents(id, tenant_id, nome) VALUES ($1, $2, 'Issue 298 Agent')
+        ON CONFLICT (id) DO NOTHING`,
+      [AGENT, TENANT_A],
+    );
     // The pessoas/entidades schemas in main don't have tenant_id columns
     // wired into FKs yet (FK from idempotency_keys is by id only). Insert
     // ONE shared pessoa+entidade so both tenant scenarios can reuse them
@@ -66,7 +73,7 @@ async function seedFixtures(): Promise<void> {
     );
     await c.query(
       `INSERT INTO entidades(id, nome, tipo)
-       VALUES ($1, 'issue298-entidade', 'empresa')
+       VALUES ($1, 'issue298-entidade', 'pj')
        ON CONFLICT (id) DO NOTHING`,
       [ENTIDADE_ID],
     );
@@ -93,6 +100,7 @@ async function dropFixtures(): Promise<void> {
     );
     await c.query(`DELETE FROM entidades WHERE id = $1`, [ENTIDADE_ID]);
     await c.query(`DELETE FROM pessoas WHERE id = $1`, [PESSOA_ID]);
+    await c.query(`DELETE FROM agents WHERE id = $1`, [AGENT]);
     await c.query(`DELETE FROM tenants WHERE id IN ($1, $2)`, [TENANT_A, TENANT_B]);
   } finally {
     c.release();
@@ -513,20 +521,28 @@ d('idempotencyRepo.tryReserve — race-safe under real Postgres ON CONFLICT', ()
     // the caller's is a key collision. tryReserve MUST fail closed
     // (state='collision', resultado undefined) — NOT return the foreign
     // cached result — so a colliding key never yields a wrong side effect.
+    //
+    // #318: collision detection only fires when the STORED hash is
+    // current-format (v2:-prefixed) — a legacy unprefixed hash can't be
+    // revalidated against the new encoding and is treated as a hit. Production
+    // payload hashes always come from `computePayloadHash`, which v2:-prefixes
+    // its output, so the test uses v2:-prefixed literals to match that contract.
     const { idempotencyRepo } = await import('@/db/repositories.js');
     const key = `collision-${Date.now()}-${Math.random()}`;
+    const HASH_X = 'v2:HASH-X';
+    const HASH_Y = 'v2:HASH-Y';
 
     await runWithTenantContext(
       { tenant_id: TENANT_A, agent_id: AGENT },
       async () => {
-        // Reserve + complete with payload_hash 'HASH-X'.
+        // Reserve + complete with payload_hash HASH_X.
         const first = await idempotencyRepo.tryReserve({
           key,
           tool_name: 'register_transaction',
           operation_type: 'create',
           pessoa_id: PESSOA_ID,
           entity_id: ENTIDADE_ID,
-          payload_hash: 'HASH-X',
+          payload_hash: HASH_X,
           ttl_seconds: 30,
         });
         expect(first.was_inserted).toBe(true);
@@ -537,14 +553,14 @@ d('idempotencyRepo.tryReserve — race-safe under real Postgres ON CONFLICT', ()
           reservation_token: token,
         });
 
-        // A DISTINCT payload collides on the SAME key (payload_hash 'HASH-Y').
+        // A DISTINCT payload collides on the SAME key (payload_hash HASH_Y).
         const collided = await idempotencyRepo.tryReserve({
           key,
           tool_name: 'register_transaction',
           operation_type: 'create',
           pessoa_id: PESSOA_ID,
           entity_id: ENTIDADE_ID,
-          payload_hash: 'HASH-Y',
+          payload_hash: HASH_Y,
           ttl_seconds: 30,
         });
         expect(collided.was_inserted).toBe(false);
@@ -558,7 +574,7 @@ d('idempotencyRepo.tryReserve — race-safe under real Postgres ON CONFLICT', ()
           operation_type: 'create',
           pessoa_id: PESSOA_ID,
           entity_id: ENTIDADE_ID,
-          payload_hash: 'HASH-X',
+          payload_hash: HASH_X,
           ttl_seconds: 30,
         });
         expect(matched.was_inserted).toBe(false);
@@ -569,12 +585,12 @@ d('idempotencyRepo.tryReserve — race-safe under real Postgres ON CONFLICT', ()
         const waitedCollision = await idempotencyRepo.waitForCompletion(
           key,
           1000,
-          'HASH-Y',
+          HASH_Y,
         );
         expect(waitedCollision.status).toBe('collision');
 
         // …and with the matching hash returns the legit result.
-        const waitedOk = await idempotencyRepo.waitForCompletion(key, 1000, 'HASH-X');
+        const waitedOk = await idempotencyRepo.waitForCompletion(key, 1000, HASH_X);
         expect(waitedOk.status).toBe('completed');
         if (waitedOk.status === 'completed') {
           expect(waitedOk.resultado).toEqual({ computed_for: 'payload-X' });

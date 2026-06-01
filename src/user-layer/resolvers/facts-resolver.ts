@@ -1,4 +1,4 @@
-import { sql } from 'drizzle-orm';
+import { Param, sql } from 'drizzle-orm';
 import { db } from '../../db/client.js';
 import { VISIBLE_LIFECYCLE_STATES } from '../internal/visibility.js';
 import type { KnowledgeLifecycleStatus } from '../types.js';
@@ -55,13 +55,18 @@ export const factsResolver = {
     // value source is the literal allowlist below — never from user input.
     const visibleStates = VISIBLE_LIFECYCLE_STATES as readonly string[];
 
+    // Drizzle expands a bare JS array interpolated into a `sql` template into
+    // a parenthesized scalar list `($1, $2, …)`, which PG rejects on the right
+    // of `ANY` (`op ANY/ALL (array) requires array on right side`, 42809).
+    // Wrap each array in `new Param(...)` so it binds as ONE `$n` param that
+    // node-postgres serializes to a real PG array literal.
     const scopeFilter =
       input.scope && input.scope.length > 0
-        ? sql`AND af.escopo = ANY(${input.scope})`
+        ? sql`AND af.escopo = ANY(${new Param(input.scope)})`
         : sql``;
     const keysFilter =
       input.keys && input.keys.length > 0
-        ? sql`AND af.chave = ANY(${input.keys})`
+        ? sql`AND af.chave = ANY(${new Param(input.keys)})`
         : sql``;
     // PR #94 round-2 high: enforce agent isolation when agent_id supplied.
     const agentFilter = input.agent_id
@@ -83,7 +88,7 @@ export const factsResolver = {
       SELECT af.*
       FROM agent_facts af
       WHERE af.tenant_id = ${input.tenant_id}
-        AND af.lifecycle_status = ANY(${visibleStates})
+        AND af.lifecycle_status = ANY(${new Param(visibleStates)})
         ${agentFilter}
         ${scopeFilter}
         ${keysFilter}

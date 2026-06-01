@@ -79,6 +79,13 @@ async function seedFixtures(): Promise<void> {
         ON CONFLICT (id) DO NOTHING`,
       [TENANT_A, TENANT_B],
     );
+    // idempotency_keys.agent_id FKs agents(id); seed the shared agent so the
+    // reservation rows can be inserted under it.
+    await c.query(
+      `INSERT INTO agents(id, tenant_id, nome) VALUES ($1, $2, 'Issue 316 Agent')
+        ON CONFLICT (id) DO NOTHING`,
+      [AGENT, TENANT_A],
+    );
     await c.query(
       `INSERT INTO pessoas(id, nome, telefone_whatsapp, tipo)
        VALUES ($1, 'issue316-pessoa', '+5511000000316', 'funcionario')
@@ -87,7 +94,7 @@ async function seedFixtures(): Promise<void> {
     );
     await c.query(
       `INSERT INTO entidades(id, nome, tipo)
-       VALUES ($1, 'issue316-entidade', 'empresa')
+       VALUES ($1, 'issue316-entidade', 'pj')
        ON CONFLICT (id) DO NOTHING`,
       [ENTIDADE_ID],
     );
@@ -118,6 +125,7 @@ async function dropFixtures(): Promise<void> {
     await wipe();
     await c.query(`DELETE FROM entidades WHERE id = $1`, [ENTIDADE_ID]);
     await c.query(`DELETE FROM pessoas WHERE id = $1`, [PESSOA_ID]);
+    await c.query(`DELETE FROM agents WHERE id = $1`, [AGENT]);
     await c.query(`DELETE FROM tenants WHERE id IN ($1, $2)`, [TENANT_A, TENANT_B]);
   } finally {
     c.release();
@@ -248,10 +256,18 @@ d('issue #316 — markCompletedWithEffect atomic enqueue under real Postgres', (
     );
     // Force the reservation back to in_progress and complete again with the
     // same token — the outbox UNIQUE dedupes the enqueue.
+    // `resultado` MUST be nulled too: the state-coherence CHECK
+    // (migrations 064/065) requires `in_progress ⇒ resultado IS NULL`
+    // (and `expires_at IS NOT NULL`), so leaving the completed `resultado`
+    // in place would violate idempotency_keys_state_coherence_check.
     const c = await pool.connect();
     try {
       await c.query(
-        `UPDATE idempotency_keys SET state = 'in_progress', expires_at = now() + interval '30 seconds' WHERE key = $1`,
+        `UPDATE idempotency_keys
+            SET state = 'in_progress',
+                resultado = NULL,
+                expires_at = now() + interval '30 seconds'
+          WHERE key = $1`,
         [key],
       );
     } finally {

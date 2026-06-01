@@ -16,7 +16,7 @@
  * auto-activation.
  */
 import { and, asc, desc, eq, sql } from 'drizzle-orm';
-import { db } from '@/db/client.js';
+import { db, pgErrorCode } from '@/db/client.js';
 import { policy_rules } from '@/db/schema.js';
 import type { PolicyRuleRow } from '@/db/schema.js';
 import { applyTenantGuard } from '@/db/tenant-guard.js';
@@ -567,10 +567,11 @@ export const policyRulesRepo: PolicyRulesRepo = {
       });
       return { ok: true, updated: domain };
     } catch (err) {
-      const e = err as Error & { code?: string };
       // 23505 = unique_violation. Our partial unique 'one active' triggers
       // when a concurrent activate for the same descriptor already won.
-      if (e.code === '23505') {
+      // pgErrorCode unwraps Drizzle's DrizzleQueryError so the underlying pg
+      // SQLSTATE (on `.cause`) is read, not the wrapper's undefined code.
+      if (pgErrorCode(err) === '23505') {
         return { ok: false, reason: 'already_has_active' };
       }
       throw err;

@@ -73,6 +73,29 @@ export async function withTx<T>(fn: (tx: typeof db) => Promise<T>): Promise<T> {
   }
 }
 
+/**
+ * Extract a PostgreSQL `SQLSTATE` error code (e.g. `'23505'` for a unique
+ * violation) from an error, walking the `cause` chain.
+ *
+ * Drizzle (>=0.44) wraps every driver error in a `DrizzleQueryError` whose own
+ * `.code` is `undefined`; the underlying `pg` error (which carries `.code`)
+ * sits on `.cause`. Callers that switch on pg SQLSTATE codes (e.g. mapping a
+ * `23505` to a typed `duplicate_id` result instead of letting it surface as a
+ * 500) MUST go through here rather than reading `err.code` directly, or the
+ * wrapper hides the real code and the mapping silently never fires.
+ *
+ * A small depth bound guards against pathological/cyclic cause chains.
+ */
+export function pgErrorCode(err: unknown): string | undefined {
+  let current: unknown = err;
+  for (let depth = 0; current != null && depth < 8; depth++) {
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === 'string' && code.length > 0) return code;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
 export async function shutdownDb(): Promise<void> {
   await pool.end();
 }

@@ -21,7 +21,7 @@
  * NÃO usa `runCognitiveModule` — este é repo determinístico, sem LLM.
  */
 import { eq, and, desc, max as drizzleMax } from 'drizzle-orm';
-import { db, withTx } from '@/db/client.js';
+import { db, withTx, pgErrorCode } from '@/db/client.js';
 import {
   soul_biases,
   type SoulBias,
@@ -296,8 +296,9 @@ export const soulBiasesRepo = {
       if (err instanceof LineageError) {
         return { ok: false, reason: 'no_lineage_to_replace_active' };
       }
-      const e = err as { code?: string };
-      if (e?.code === '23505') {
+      // pgErrorCode unwraps Drizzle's DrizzleQueryError so the underlying pg
+      // SQLSTATE (on `.cause`) is read, not the wrapper's undefined code.
+      if (pgErrorCode(err) === '23505') {
         return { ok: false, reason: 'one_active_constraint_violation' };
       }
       throw err;
