@@ -63,11 +63,15 @@ Out of scope:
 
 Risk:
 
-- 
+-
+
+Residual risk:
+
+-
 
 Rollback:
 
-- 
+-
 
 ## Reviewer Notes
 

@@ -42,6 +42,8 @@ const REQUIRED_PR_TEMPLATE_SECTIONS = [
   '## Reviewer Notes',
 ] as const;
 
+const REQUIRED_PR_TEMPLATE_FIELDS = ['Residual risk:'] as const;
+
 const FORBIDDEN_ACTIVE_REFERENCES = [
   '2026-05-28-architecture-docs-design',
   'Architecture Documentation Suite for Maia v3',
@@ -107,6 +109,12 @@ function assertPrTemplate(): void {
   for (const section of REQUIRED_PR_TEMPLATE_SECTIONS) {
     if (!template.includes(section)) {
       fail(`pull request template must include section: ${section}`);
+    }
+  }
+
+  for (const field of REQUIRED_PR_TEMPLATE_FIELDS) {
+    if (!template.includes(field)) {
+      fail(`pull request template must include field: ${field}`);
     }
   }
 
