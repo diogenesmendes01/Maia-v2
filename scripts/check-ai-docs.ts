@@ -5,6 +5,7 @@ const ROOT = process.cwd();
 
 const REQUIRED_FILES = [
   'AGENTS.md',
+  '.github/pull_request_template.md',
   'docs/ai/agent-operating-model.md',
   'docs/ai/coding-agent-playbook.md',
   'docs/ai/review-agent-playbook.md',
@@ -21,6 +22,24 @@ const REQUIRED_AGENTS_REFERENCES = [
   'docs/ai/task-spec-template.md',
   'docs/ai/maia-invariants-checklist.md',
   'docs/architecture/decisions/',
+] as const;
+
+const REQUIRED_PR_TEMPLATE_REFERENCES = [
+  'docs/ai/maia-invariants-checklist.md',
+  'npm run docs:ai:check',
+  'npm run typecheck',
+  'npm run lint',
+] as const;
+
+const REQUIRED_PR_TEMPLATE_SECTIONS = [
+  '## Summary',
+  '## Task Context',
+  '## Scope',
+  '## Maia Invariants',
+  '## Validation',
+  '## Docs Impact',
+  '## Risk and Rollback',
+  '## Reviewer Notes',
 ] as const;
 
 const FORBIDDEN_ACTIVE_REFERENCES = [
@@ -82,6 +101,22 @@ function assertAgentsPointers(): void {
   }
 }
 
+function assertPrTemplate(): void {
+  const template = readText('.github/pull_request_template.md');
+
+  for (const section of REQUIRED_PR_TEMPLATE_SECTIONS) {
+    if (!template.includes(section)) {
+      fail(`pull request template must include section: ${section}`);
+    }
+  }
+
+  for (const reference of REQUIRED_PR_TEMPLATE_REFERENCES) {
+    if (!template.includes(reference)) {
+      fail(`pull request template must reference ${reference}`);
+    }
+  }
+}
+
 function assertNoForbiddenReferences(): void {
   const docsToScan = [
     'AGENTS.md',
@@ -122,6 +157,7 @@ function assertSuperpowerSpecsAreFeatureSpecs(): void {
 function main(): void {
   assertRequiredFiles();
   assertAgentsPointers();
+  assertPrTemplate();
   assertNoForbiddenReferences();
   assertSuperpowerSpecsAreFeatureSpecs();
 
