@@ -5,6 +5,7 @@ const ROOT = process.cwd();
 
 const REQUIRED_FILES = [
   'AGENTS.md',
+  '.github/ISSUE_TEMPLATE/agent-engineering-task.yml',
   '.github/pull_request_template.md',
   'docs/ai/agent-operating-model.md',
   'docs/ai/coding-agent-playbook.md',
@@ -43,6 +44,30 @@ const REQUIRED_PR_TEMPLATE_SECTIONS = [
 ] as const;
 
 const REQUIRED_PR_TEMPLATE_FIELDS = ['Residual risk:'] as const;
+
+const REQUIRED_ISSUE_FORM_REFERENCES = [
+  'docs/ai/task-spec-template.md',
+  'docs/ai/coding-agent-playbook.md',
+  'docs/ai/maia-invariants-checklist.md',
+  'npm run docs:ai:check',
+  'npm run typecheck',
+  'npm run lint',
+] as const;
+
+const REQUIRED_ISSUE_FORM_FIELDS = [
+  'Agent Engineering Task',
+  'engineering-agent work on Maia',
+  'Objective',
+  'Task context',
+  'Likely files or modules',
+  'Out of scope',
+  'Maia invariants to consider',
+  'Validation commands',
+  'Docs impact',
+  'Risk, residual risk, and rollback',
+  'Residual risk:',
+  'Acceptance criteria',
+] as const;
 
 const FORBIDDEN_ACTIVE_REFERENCES = [
   '2026-05-28-architecture-docs-design',
@@ -125,6 +150,22 @@ function assertPrTemplate(): void {
   }
 }
 
+function assertIssueForm(): void {
+  const issueForm = readText('.github/ISSUE_TEMPLATE/agent-engineering-task.yml');
+
+  for (const field of REQUIRED_ISSUE_FORM_FIELDS) {
+    if (!issueForm.includes(field)) {
+      fail(`agent engineering issue form must include field: ${field}`);
+    }
+  }
+
+  for (const reference of REQUIRED_ISSUE_FORM_REFERENCES) {
+    if (!issueForm.includes(reference)) {
+      fail(`agent engineering issue form must reference ${reference}`);
+    }
+  }
+}
+
 function assertNoForbiddenReferences(): void {
   const docsToScan = [
     'AGENTS.md',
@@ -166,6 +207,7 @@ function main(): void {
   assertRequiredFiles();
   assertAgentsPointers();
   assertPrTemplate();
+  assertIssueForm();
   assertNoForbiddenReferences();
   assertSuperpowerSpecsAreFeatureSpecs();
 
