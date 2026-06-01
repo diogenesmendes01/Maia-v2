@@ -18,6 +18,7 @@ import { MidPepImpl } from './mid-pep.js';
 import { PepAudit } from './pep-audit.js';
 import { SkillSelectorImpl } from './skill-selector.js';
 import { WorkflowSelectorImpl } from './workflow-selector.js';
+import { RiskScorerStubImpl } from './risk-scorer.js';
 import { scoreTurn } from './turn-risk-scorer.js';
 import type {
   DecisionPacket,
@@ -202,10 +203,15 @@ export function createDecisionEngine(
   };
   if (env.metrics) intentClassifierDeps.metrics = env.metrics;
   const intentClassifier = new IntentClassifierImpl(intentClassifierDeps);
-  // Use the injected riskScorer if provided (production uses RiskScorerProdAdapter
-  // via createProductionDecisionEngineEnv); fall back to TurnRiskScorerAdapter
-  // (the real P9c adapter already wired in main) for backward compatibility.
-  const riskScorer = env.riskScorer ?? new TurnRiskScorerAdapter();
+  // Use the injected riskScorer if provided (production injects
+  // RiskScorerProdAdapter via createProductionDecisionEngineEnv, which delegates
+  // to the real P9c scoreTurn + Haiku gate). When OMITTED — only test harnesses
+  // that build their own env — fall back to the deterministic `RiskScorerStubImpl`
+  // (no LLM, no network I/O). This is fail-safe by default: the omitted-default
+  // never reaches the live `haikuRiskGate`, which was the #358 flake root cause
+  // (#360). A harness that genuinely wants the live gate must inject it explicitly
+  // (e.g. `new TurnRiskScorerAdapter({ gate })`).
+  const riskScorer = env.riskScorer ?? new RiskScorerStubImpl();
   const workflowSelector = new WorkflowSelectorImpl({
     proceduresRepo: env.proceduresRepo,
   });

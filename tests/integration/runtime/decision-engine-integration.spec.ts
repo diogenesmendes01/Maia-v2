@@ -258,17 +258,22 @@ function buildFixture(): Fixture {
     recordHistogram: vi.fn(),
   };
 
-  // The risk scorer's Haiku gate is an EXTERNAL LLM dependency and must be
-  // mocked here, exactly as `haiku` (above) mocks the intent classifier's LLM.
-  // Without an injected `riskScorer`, `createDecisionEngine` falls back to
-  // `new TurnRiskScorerAdapter()`, whose gate defaults to the live
-  // `haikuRiskGate` — a real `anthropic.messages.create()` round-trip (~230ms
-  // with the placeholder test key) on EVERY turn that reaches the risk step.
-  // That latency sits just under the engine's 400ms wall-clock budget, so any
-  // CI jitter pushes the `risk` step past its deadline; the engine then returns
-  // its budget-fallback packet (routing.agent_id ← base.agent_id), the skill
-  // step never runs, and Codex #103 Cenário 9's `agent_b` assertions fail
-  // intermittently (the documented main-only flake; `retry: 1` only halved it).
+  // This fixture deliberately exercises the REAL P9c adapter
+  // (`TurnRiskScorerAdapter`) — the production-shaped risk path — rather than
+  // the composition-root default. Its Haiku gate is an EXTERNAL LLM dependency
+  // and is stubbed here, exactly as `haiku` (above) mocks the intent
+  // classifier's LLM.
+  //
+  // (Since #360, omitting `riskScorer` falls back to the deterministic
+  // `RiskScorerStubImpl` instead — no LLM, no network. We still inject the
+  // adapter explicitly so these scenarios assert the adapter's mapping, not the
+  // stub's. A live `haikuRiskGate` here would be a real
+  // `anthropic.messages.create()` round-trip (~230ms with the placeholder test
+  // key) on EVERY turn reaching the risk step — latency just under the engine's
+  // 400ms budget, so CI jitter would push the `risk` step past its deadline, the
+  // engine would emit its budget-fallback packet (routing.agent_id ←
+  // base.agent_id), the skill step would not run, and Codex #103 Cenário 9's
+  // `agent_b` assertions would flake. That was the #358 root cause.)
   //
   // Returning `null` reproduces CI's keyless-gate reality (401 → fail-closed in
   // the scorer), so the resolved `risk_profile` is identical to a passing run —
