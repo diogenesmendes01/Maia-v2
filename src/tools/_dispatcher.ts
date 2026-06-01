@@ -427,7 +427,18 @@ export async function dispatchTool(input: {
   // `auditTx` inside their own `withTx`) set `audits_in_tx`. Their audit row is
   // already committed atomically with the ledger/balance write, so this
   // post-commit best-effort `audit()` is SKIPPED to avoid a duplicate row.
-  if (!tool.audits_in_tx) {
+  //
+  // Review #374 (medium): `audits_in_tx` is tool-WIDE, but these tools have
+  // schema-valid EARLY-RETURN paths (register_transaction duplicate-suspected;
+  // cancel_transaction already-`cancelada`/not-found) that exit BEFORE any
+  // `auditTx` runs. A static per-tool skip would drop the audit row entirely
+  // for those invocations — a regression vs the prior unconditional post-commit
+  // audit(). So the skip is CONDITIONAL on the PER-INVOCATION `auditedInTx`
+  // predicate: skip the fallback only when the tool actually self-audited in-tx
+  // on THIS result; otherwise run the normal best-effort audit() so every
+  // invocation still appends to the mutation trail.
+  const selfAuditedInTx = tool.audits_in_tx === true && tool.auditedInTx?.(out.data) === true;
+  if (!selfAuditedInTx) {
     await audit({
       acao: tool.audit_action,
       pessoa_id: input.ctx.pessoa.id,

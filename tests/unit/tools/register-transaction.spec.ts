@@ -158,6 +158,34 @@ describe('register_transaction tool', () => {
     expect(registerTransactionTool.audits_in_tx).toBe(true);
   });
 
+  it('review #374 — auditedInTx is TRUE for the mutating result (self-audited in-tx → dispatcher skips fallback)', async () => {
+    const { registerTransactionTool } = await import('../../../src/tools/register-transaction.js');
+    expect(registerTransactionTool.auditedInTx).toBeDefined();
+    // Happy-path result: auditTx ran inside withTx → dispatcher must SKIP fallback.
+    expect(
+      registerTransactionTool.auditedInTx!({ transacao_id: 'tx-1', saldo_apos: 1500 } as never),
+    ).toBe(true);
+  });
+
+  it('review #374 — auditedInTx is FALSE for the duplicate-suspected early return (dispatcher must still fallback-audit)', async () => {
+    // The duplicate-suspected path exits BEFORE any withTx/auditTx. The
+    // dispatcher's static `audits_in_tx` skip would otherwise drop the audit
+    // row entirely for this invocation — `auditedInTx` returning false keeps
+    // the fallback audit() firing (append-only trail per invocation).
+    const { registerTransactionTool } = await import('../../../src/tools/register-transaction.js');
+    expect(
+      registerTransactionTool.auditedInTx!({
+        duplicate_suspected: true,
+        existing: {
+          transacao_id: 'tx-existing',
+          data_competencia: '2026-05-01',
+          valor: 500,
+          descricao: 'Venda X',
+        },
+      } as never),
+    ).toBe(false);
+  });
+
   it('atomicity: a fail-loud addToBalanceTx throw aborts the tx so NO ledger row is committed', async () => {
     // #364 blocker 2 — drive the real handler flow: createTx succeeds (its
     // INSERT is buffered in the tx), then the fail-loud addToBalanceTx throws on

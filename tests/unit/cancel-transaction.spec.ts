@@ -142,7 +142,10 @@ describe('cancel_transaction tool', () => {
       { entidade_id: 'e1', transacao_id: 'tx-3' } as never,
       ctx,
     );
-    expect(result).toEqual({ ok: true, transacao_id: 'tx-3' });
+    // Review #374 — the no-op return carries `already_cancelled: true` so the
+    // dispatcher can tell it apart from a real cancel (same { ok, transacao_id }
+    // shape) and still fire its fallback audit() for this invocation.
+    expect(result).toEqual({ ok: true, transacao_id: 'tx-3', already_cancelled: true });
     expect(updateTxMock).not.toHaveBeenCalled();
     expect(auditTxMock).not.toHaveBeenCalled();
   });
@@ -178,5 +181,34 @@ describe('cancel_transaction tool', () => {
   it('declares audits_in_tx so the dispatcher does NOT also write a (duplicate) audit row', async () => {
     const { cancelTransactionTool } = await import('../../src/tools/cancel-transaction.js');
     expect(cancelTransactionTool.audits_in_tx).toBe(true);
+  });
+
+  it('review #374 — auditedInTx is TRUE for a real cancel (self-audited in-tx → dispatcher skips fallback)', async () => {
+    const { cancelTransactionTool } = await import('../../src/tools/cancel-transaction.js');
+    expect(cancelTransactionTool.auditedInTx).toBeDefined();
+    // Real cancel result: auditTx ran inside withTx → dispatcher must SKIP fallback.
+    expect(cancelTransactionTool.auditedInTx!({ ok: true, transacao_id: 'tx-1' } as never)).toBe(
+      true,
+    );
+  });
+
+  it('review #374 — auditedInTx is FALSE for the already-cancelada no-op (dispatcher must still fallback-audit)', async () => {
+    // The no-op path returns the same { ok, transacao_id } shape but did NOT run
+    // auditTx; the `already_cancelled` marker lets auditedInTx return false so
+    // the dispatcher's fallback audit() still records this invocation.
+    const { cancelTransactionTool } = await import('../../src/tools/cancel-transaction.js');
+    expect(
+      cancelTransactionTool.auditedInTx!({
+        ok: true,
+        transacao_id: 'tx-3',
+        already_cancelled: true,
+      } as never),
+    ).toBe(false);
+  });
+
+  it('review #374 — auditedInTx is FALSE for the { error } short-circuits (not_found / forbidden)', async () => {
+    const { cancelTransactionTool } = await import('../../src/tools/cancel-transaction.js');
+    expect(cancelTransactionTool.auditedInTx!({ error: 'not_found' } as never)).toBe(false);
+    expect(cancelTransactionTool.auditedInTx!({ error: 'forbidden' } as never)).toBe(false);
   });
 });

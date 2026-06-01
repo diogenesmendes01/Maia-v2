@@ -54,6 +54,12 @@ export const registerTransactionTool: Tool<typeof inputSchema, typeof outputSche
   // (auditTx inside the withTx below), so the dispatcher must NOT also fire its
   // post-commit best-effort audit() (would duplicate the audit row).
   audits_in_tx: true,
+  // Review #374 — PER-INVOCATION signal. `auditTx` runs ONLY on the mutating
+  // branch (the `withTx` that returns `{ transacao_id, saldo_apos }`). The
+  // duplicate-suspected EARLY RETURN exits before any tx, so it self-audited
+  // nothing — the dispatcher must still fire its fallback audit() there.
+  auditedInTx: (result) =>
+    'transacao_id' in result && typeof result.transacao_id === 'string',
   extractAlvoId: (result) =>
     'transacao_id' in result && typeof result.transacao_id === 'string' ? result.transacao_id : null,
   handler: async (args, ctx) => {

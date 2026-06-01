@@ -15,7 +15,17 @@ const inputSchema = z.object({
 });
 
 const outputSchema = z.union([
-  z.object({ ok: z.literal(true), transacao_id: z.string() }),
+  z.object({
+    ok: z.literal(true),
+    transacao_id: z.string(),
+    // Review #374 — PER-INVOCATION audit discriminator. The already-`cancelada`
+    // no-op path returns the SAME { ok, transacao_id } shape as a real cancel,
+    // so result shape alone can't tell the dispatcher whether `auditTx` ran.
+    // This optional marker (set ONLY on the no-op early return) survives zod
+    // parsing so `auditedInTx` can return false there → the dispatcher fires
+    // its fallback audit() and the no-op invocation still appends a trail row.
+    already_cancelled: z.literal(true).optional(),
+  }),
   z.object({ error: z.string() }),
 ]);
 
@@ -34,6 +44,14 @@ export const cancelTransactionTool: Tool<typeof inputSchema, typeof outputSchema
   // its audit row is written TRANSACTIONALLY (auditTx inside the withTx below),
   // so the dispatcher must NOT also fire its post-commit audit() (no duplicate).
   audits_in_tx: true,
+  // Review #374 — PER-INVOCATION signal. `auditTx` runs ONLY on the mutating
+  // path (the `withTx` that flips status → 'cancelada'). The already-`cancelada`
+  // no-op and the `{ error }` short-circuits (not_found / forbidden) exit
+  // BEFORE any tx, so they self-audited nothing — the dispatcher must still fire
+  // its fallback audit() there. The no-op path is distinguished from a real
+  // cancel by the `already_cancelled` marker (both return { ok, transacao_id }).
+  auditedInTx: (result) =>
+    'ok' in result && result.ok === true && result.already_cancelled !== true,
   extractAlvoId: (result) =>
     'transacao_id' in result && typeof result.transacao_id === 'string' ? result.transacao_id : null,
   handler: async (args, ctx) => {
@@ -46,7 +64,10 @@ export const cancelTransactionTool: Tool<typeof inputSchema, typeof outputSchema
     if (tx.entidade_id !== args.entidade_id) return { error: 'forbidden' };
     if (!ctx.scope.entidades.includes(tx.entidade_id)) return { error: 'forbidden' };
     if (tx.status === 'cancelada') {
-      return { ok: true as const, transacao_id: tx.id };
+      // No-op early return: nothing mutated and no `auditTx` ran. Flag it so the
+      // dispatcher's `auditedInTx` returns false and its fallback audit() still
+      // records this invocation (append-only mutation trail per invocation).
+      return { ok: true as const, transacao_id: tx.id, already_cancelled: true as const };
     }
     // Issue #366 — DURABLE audit: the cancel UPDATE and its audit row commit (or
     // roll back) together in ONE withTx. `auditTx` does NOT swallow errors, so a
