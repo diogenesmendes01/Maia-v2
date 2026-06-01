@@ -410,7 +410,11 @@ d('issue #73 — anchoring fix: scope-change sentinel + persisted events block',
     const built = await buildPrompt({ pessoa, conversa, scope, inbound });
 
     // The fix: prompt explicitly invalidates the contradictory old claim.
-    expect(built.system).toMatch(/Conflito detectado/i);
+    // `renderContradictionOverlay` emits the header "## ⚠ Contradições do
+    // backend (autoritativo)" — match it the same way the unit suite does
+    // (tests/unit/prompt-builder.spec.ts), not the never-emitted literal
+    // "Conflito detectado".
+    expect(built.system).toMatch(/Contradi[çc][õo]es do backend|Conflito detectado/i);
     expect(built.system).toMatch(/trate.*invalid|descarte|obsolet/i);
     expect(built.system).toContain('schedule_reminder');
   });

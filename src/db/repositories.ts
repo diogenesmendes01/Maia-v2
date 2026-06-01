@@ -1,5 +1,5 @@
-import { eq, and, inArray, desc, isNull, sql, or, gt, lt, ne } from 'drizzle-orm';
-import { db, withTx } from './client.js';
+import { eq, and, inArray, desc, isNull, sql, or, gt, lt, ne, Param } from 'drizzle-orm';
+import { db, withTx, pgErrorCode } from './client.js';
 import { procedure_status_events } from './schema.js';
 import {
   pessoas,
@@ -687,7 +687,9 @@ export const mensagensRepo = {
       return { row: rows[0]!, duplicate: false };
     } catch (err) {
       // Unique-violation race: re-fetch and treat as duplicate.
-      if (typeof wid === 'string' && (err as { code?: string }).code === '23505') {
+      // pgErrorCode unwraps Drizzle's DrizzleQueryError so the underlying pg
+      // SQLSTATE (on `.cause`) is read, not the wrapper's undefined code.
+      if (typeof wid === 'string' && pgErrorCode(err) === '23505') {
         const existing = await this.findByWhatsappId(wid);
         if (existing) return { row: existing, duplicate: true };
       }
@@ -1641,12 +1643,16 @@ export const factsRepo = {
     // on every read that the LLM can see. pending_review / deprecated /
     // revoked rows MUST NOT reach the prompt — they live behind the
     // Admin UI Proposal Inbox until a human acts on them.
+    //
+    // escopos is wrapped in new Param(...) so it binds as one $n (a real PG
+    // array). A bare interpolated JS array expands to a parenthesized scalar
+    // list ($1, $2, ...), which PG rejects on the right of ANY (42809).
     const result = await db.execute<AgentFact>(sql`
       SELECT af.*
       FROM agent_facts af
       WHERE af.tenant_id = ${tenant_id}
         AND af.agent_id = ${agent_id}
-        AND af.escopo = ANY(${escopos})
+        AND af.escopo = ANY(${new Param(escopos)})
         AND af.lifecycle_status IN ('ephemeral', 'observed', 'reinforced', 'verified', 'active')
         AND NOT EXISTS (
           SELECT 1 FROM memory_entry me
@@ -4195,7 +4201,9 @@ export const tenantsRepo = {
       // pg error code. Concurrent racers (two founders trying to create the
       // same id at once) BOTH see this branch — one wins the INSERT, the
       // other's tx aborts with 23505 and rolls back as expected.
-      if ((err as { code?: string })?.code === '23505') {
+      // pgErrorCode unwraps Drizzle's DrizzleQueryError so the underlying
+      // pg SQLSTATE (on `.cause`) is read, not the wrapper's undefined code.
+      if (pgErrorCode(err) === '23505') {
         return { ok: false as const, reason: 'duplicate_id' as const };
       }
       throw err;
@@ -4480,7 +4488,9 @@ export const agentsRepo = {
       // step (1) is the agents PK; step (2) PK collision is unreachable for
       // a row whose agent_id was just inserted in the same tx; step (3)
       // admin_audit_log has no unique index that could collide.
-      if ((err as { code?: string })?.code === '23505') {
+      // pgErrorCode unwraps Drizzle's DrizzleQueryError so the underlying
+      // pg SQLSTATE (on `.cause`) is read, not the wrapper's undefined code.
+      if (pgErrorCode(err) === '23505') {
         return {
           ok: false as const,
           reason: 'duplicate_id' as const,

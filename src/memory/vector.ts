@@ -33,7 +33,7 @@
  * an embedding closer to the query than tenant-A's).
  */
 import { db } from '@/db/client.js';
-import { sql } from 'drizzle-orm';
+import { Param, sql } from 'drizzle-orm';
 import { getEmbeddingProvider } from '@/lib/embeddings.js';
 import { logger } from '@/lib/logger.js';
 import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
@@ -83,14 +83,18 @@ export async function recall(input: {
   if (!emb) return [];
   const vec = `[${emb.join(',')}]`;
   const limit = input.k ?? 5;
-  const tiposFilter = input.tipos && input.tipos.length > 0 ? sql`AND tipo = ANY(${input.tipos})` : sql``;
+  // Wrap array params in `new Param(...)` so Drizzle binds each as ONE `$n`
+  // (a real PG array) instead of expanding it into a parenthesized scalar list
+  // `($1, $2, …)`, which PG rejects on the right of `ANY` (42809).
+  const tiposFilter =
+    input.tipos && input.tipos.length > 0 ? sql`AND tipo = ANY(${new Param(input.tipos)})` : sql``;
   try {
     const result = await db.execute<{ conteudo: string; tipo: string; escopo: string; score: string }>(sql`
       SELECT conteudo, tipo, escopo, 1 - (embedding <=> ${vec}::vector) AS score
       FROM agent_memories
       WHERE tenant_id = ${tenant_id}
         AND agent_id = ${agent_id}
-        AND escopo = ANY(${input.escopo}) ${tiposFilter}
+        AND escopo = ANY(${new Param(input.escopo)}) ${tiposFilter}
       ORDER BY embedding <=> ${vec}::vector
       LIMIT ${limit}
     `);

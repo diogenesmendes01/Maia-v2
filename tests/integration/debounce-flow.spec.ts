@@ -196,7 +196,7 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
       const id2 = await insertInbound(c, { conversa_id: null, telefone, conteudo: 'b', created_at: t1 });
 
       const { mensagensRepo } = await import('../../src/db/repositories.js');
-      await mensagensRepo.setConversaIdMany([id1, id2], conversa_id);
+      await withDefaultTenant(() => mensagensRepo.setConversaIdMany([id1, id2], conversa_id));
 
       const r = await c.query<{ id: string; conversa_id: string | null }>(
         `SELECT id, conversa_id FROM mensagens WHERE id = ANY($1)`,
@@ -218,7 +218,7 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
       const id2 = await insertInbound(c, { conversa_id: null, telefone, conteudo: 'b' });
 
       const { mensagensRepo } = await import('../../src/db/repositories.js');
-      await mensagensRepo.markProcessed(id1, 42);
+      await withDefaultTenant(() => mensagensRepo.markProcessed(id1, 42));
 
       const target = await c.query<{ processada_em: Date | null; tokens_usados: number | null }>(
         `SELECT processada_em, tokens_usados FROM mensagens WHERE id = $1`,
@@ -268,7 +268,7 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
 
       // Process id2 to simulate a partial run; the next aggregator call
       // should drop it from the merge.
-      await mensagensRepo.markProcessed(id2, 0);
+      await withDefaultTenant(() => mensagensRepo.markProcessed(id2, 0));
       const after = await withDefaultTenant(() => _internal.aggregateUnprocessedTexts(target!));
       expect(after.text).toBe('Oi,\na finança?');
       expect(after.merged_ids).toEqual([id1]);
@@ -286,10 +286,12 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
       const id3 = await insertInbound(c, { conversa_id: null, telefone, conteudo: 'c' });
 
       const { mensagensRepo } = await import('../../src/db/repositories.js');
-      await mensagensRepo.setConversaIdMany([id1, id2], conversa_id);
-      await mensagensRepo.markProcessed(id1, 10);
-      await mensagensRepo.markProcessed(id2, 0);
-      await mensagensRepo.markProcessed(id3, 20);
+      await withDefaultTenant(async () => {
+        await mensagensRepo.setConversaIdMany([id1, id2], conversa_id);
+        await mensagensRepo.markProcessed(id1, 10);
+        await mensagensRepo.markProcessed(id2, 0);
+        await mensagensRepo.markProcessed(id3, 20);
+      });
 
       // The "idempotency" we care about is: even if a recovery worker
       // hits an already-processed row again, the row stays excluded from
@@ -299,7 +301,7 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
       // acceptable because the safety property is on the QUERY, not the
       // row. Assert both: the row is still excluded, and tokens_usados
       // does get overwritten (so the test reflects real behaviour).
-      await mensagensRepo.markProcessed(id1, 999);
+      await withDefaultTenant(() => mensagensRepo.markProcessed(id1, 999));
 
       const r = await c.query<{ id: string; processada_em: Date | null; tokens_usados: number | null; conversa_id: string | null }>(
         `SELECT id, processada_em, tokens_usados, conversa_id FROM mensagens WHERE id = ANY($1)`,

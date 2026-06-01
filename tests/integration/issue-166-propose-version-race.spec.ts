@@ -219,14 +219,16 @@ d('operationalProfileVersionsRepo.approveAndActivateAtomic (predecessor conflict
       v1Id = r1.rows[0]!.id;
 
       // Bob proposes v2 with predecessor=v1.
+      // (proposed_by is the literal 'bob' here, so v1Id is $3 — passing an
+      // unused $3 left PG unable to infer its type: 42P18.)
       const r2 = await c.query<{ id: string }>(
         `INSERT INTO agent_operational_profile_versions
            (tenant_id, agent_id, version, status, profile_body, proposed_by, proposed_reason)
          VALUES ($1, $2, 2, 'proposed',
-                 jsonb_build_object('metadata', jsonb_build_object('previous_version_id', $4::text)),
+                 jsonb_build_object('metadata', jsonb_build_object('previous_version_id', $3::text)),
                  'bob', 'bob update')
          RETURNING id`,
-        [T, A, ACTOR, v1Id],
+        [T, A, v1Id],
       );
       v2Id = r2.rows[0]!.id;
 
@@ -235,10 +237,10 @@ d('operationalProfileVersionsRepo.approveAndActivateAtomic (predecessor conflict
         `INSERT INTO agent_operational_profile_versions
            (tenant_id, agent_id, version, status, profile_body, proposed_by, proposed_reason)
          VALUES ($1, $2, 3, 'proposed',
-                 jsonb_build_object('metadata', jsonb_build_object('previous_version_id', $4::text)),
+                 jsonb_build_object('metadata', jsonb_build_object('previous_version_id', $3::text)),
                  'alice', 'alice update')
          RETURNING id`,
-        [T, A, ACTOR, v1Id],
+        [T, A, v1Id],
       );
       v3Id = r3.rows[0]!.id;
     } finally {
@@ -485,10 +487,10 @@ d('cross-allocator concurrency: seedNewActiveAtomic + approveAndActivateAtomic',
         `INSERT INTO agent_operational_profile_versions
            (tenant_id, agent_id, version, status, profile_body, proposed_by, proposed_reason)
          VALUES ($1, $2, 2, 'proposed',
-                 jsonb_build_object('metadata', jsonb_build_object('previous_version_id', $4::text)),
+                 jsonb_build_object('metadata', jsonb_build_object('previous_version_id', $3::text)),
                  'admin', 'admin update')
          RETURNING id`,
-        [T, A, ACTOR, v1Id],
+        [T, A, v1Id],
       );
       v2Id = r2.rows[0]!.id;
     } finally {

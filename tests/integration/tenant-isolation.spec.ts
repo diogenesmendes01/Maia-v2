@@ -13,6 +13,7 @@ import {
   runWithTenantContext,
   getCurrentTenant,
   getCurrentAgent,
+  MissingTenantContextError,
 } from '@/db/tenant-context.js';
 import { like, inArray } from 'drizzle-orm';
 
@@ -43,6 +44,9 @@ d('Tenant isolation (P0)', () => {
       .delete(contas_bancarias)
       .where(like(contas_bancarias.apelido, 'Conta-test-%'));
     await db.delete(entidades).where(like(entidades.nome, 'TestEnt-%'));
+    // findByPhone test seeds a pessoa under agent-a; drop it before agents to
+    // satisfy pessoas_agent_id_fkey.
+    await db.delete(pessoas).where(inArray(pessoas.tenant_id, tenantIds));
     await db.delete(agents).where(inArray(agents.tenant_id, tenantIds));
     await db.delete(tenants).where(inArray(tenants.id, tenantIds));
   });
@@ -127,6 +131,7 @@ d('Tenant isolation (P0)', () => {
         await pessoasRepo.create({
           nome: 'Pessoa A',
           telefone_whatsapp: sharedPhone,
+          tipo: 'funcionario',
           email: null,
           cpf: null,
           status: 'ativa',
