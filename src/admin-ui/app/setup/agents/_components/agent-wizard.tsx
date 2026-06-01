@@ -1,7 +1,7 @@
-'use client';
+"use client";
 
-import * as React from 'react';
-import { trpc } from '../../../../trpc/client.js';
+import * as React from "react";
+import { trpc } from "../../../../trpc/client.js";
 
 interface Props {
   tenantId: string;
@@ -14,12 +14,12 @@ interface WizardState {
   // Step 1
   id: string;
   nome: string;
-  status: 'active' | 'suspended';
+  status: "active" | "suspended";
   // Step 2 (identity)
   role_descriptor: string;
   tone: string;
-  formality: 'low' | 'medium' | 'high';
-  verbosity: 'concise' | 'medium' | 'detailed';
+  formality: "low" | "medium" | "high";
+  verbosity: "concise" | "medium" | "detailed";
   priorities: string;
   // Issue #193 — principles is a DISTINCT field from priorities. Empty
   // string default keeps it opt-in: leaving the field blank reproduces the
@@ -34,24 +34,24 @@ interface WizardState {
 }
 
 const INITIAL: WizardState = {
-  id: '',
-  nome: '',
-  status: 'active',
-  role_descriptor: '',
-  tone: 'profissional e cordial',
-  formality: 'medium',
-  verbosity: 'medium',
-  priorities: 'precisao\nclareza\nrespeito',
+  id: "",
+  nome: "",
+  status: "active",
+  role_descriptor: "",
+  tone: "profissional e cordial",
+  formality: "medium",
+  verbosity: "medium",
+  priorities: "precisao\nclareza\nrespeito",
   // Issue #193 — empty by default. We deliberately DO NOT pre-fill the
   // priorities text here: principles are core value contracts (violations
   // freeze the agent), not operational labels. Forcing the operator to
   // type them explicitly is the whole point of separating the two inputs.
-  principles: '',
-  language: 'pt-BR',
+  principles: "",
+  language: "pt-BR",
   max_inference_depth: 3,
   max_speculation_in_response: 0.2,
   confidence_floor_for_action: 0.7,
-  proposed_reason: '',
+  proposed_reason: "",
 };
 
 export default function AgentWizard({ tenantId, onClose }: Props) {
@@ -65,38 +65,39 @@ export default function AgentWizard({ tenantId, onClose }: Props) {
   };
 
   const validateStep1 = (): string | null => {
-    if (!ID_REGEX.test(state.id)) return 'ID must be lowercase alnum/_/-';
-    if (state.id.length > 64) return 'ID must be at most 64 chars';
-    if (state.nome.trim().length === 0) return 'Nome is required';
+    if (!ID_REGEX.test(state.id)) return "ID must be lowercase alnum/_/-";
+    if (state.id.length > 64) return "ID must be at most 64 chars";
+    if (state.nome.trim().length === 0) return "Nome is required";
     return null;
   };
   const validateStep2 = (): string | null => {
     if (state.role_descriptor.trim().length === 0)
-      return 'role_descriptor is required';
-    if (state.tone.trim().length === 0) return 'tone is required';
+      return "role_descriptor is required";
+    if (state.tone.trim().length === 0) return "tone is required";
     return null;
   };
   const validateStep3 = (): string | null => {
     if (state.proposed_reason.trim().length < 10)
-      return 'proposed_reason must be at least 10 chars';
+      return "proposed_reason must be at least 10 chars";
     if (state.max_inference_depth < 0 || state.max_inference_depth > 10)
-      return 'max_inference_depth ∈ [0,10]';
+      return "max_inference_depth ∈ [0,10]";
     if (
       state.max_speculation_in_response < 0 ||
       state.max_speculation_in_response > 1
     )
-      return 'max_speculation_in_response ∈ [0,1]';
+      return "max_speculation_in_response ∈ [0,1]";
     if (
       state.confidence_floor_for_action < 0 ||
       state.confidence_floor_for_action > 1
     )
-      return 'confidence_floor_for_action ∈ [0,1]';
+      return "confidence_floor_for_action ∈ [0,1]";
     return null;
   };
 
   const next = () => {
     setError(null);
-    const err = step === 1 ? validateStep1() : step === 2 ? validateStep2() : null;
+    const err =
+      step === 1 ? validateStep1() : step === 2 ? validateStep2() : null;
     if (err) {
       setError(err);
       return;
@@ -113,7 +114,7 @@ export default function AgentWizard({ tenantId, onClose }: Props) {
     }
     try {
       const priorities = state.priorities
-        .split('\n')
+        .split("\n")
         .map((p) => p.trim())
         .filter((p) => p.length > 0);
       // Issue #193 — `principles` is a distinct collection from `priorities`.
@@ -122,7 +123,7 @@ export default function AgentWizard({ tenantId, onClose }: Props) {
       // returns no principles and valoresDetector skips silently (the
       // intentional post-#189 behavior). NEVER auto-promote priorities here.
       const principlesParsed = state.principles
-        .split('\n')
+        .split("\n")
         .map((p) => p.trim())
         .filter((p) => p.length > 0);
       const principles =
@@ -171,7 +172,7 @@ export default function AgentWizard({ tenantId, onClose }: Props) {
               <span
                 key={s}
                 className={`w-8 h-1 rounded ${
-                  s <= step ? 'bg-blue-600' : 'bg-gray-300'
+                  s <= step ? "bg-blue-600" : "bg-gray-300"
                 }`}
               />
             ))}
@@ -185,7 +186,7 @@ export default function AgentWizard({ tenantId, onClose }: Props) {
               <span className="text-sm font-medium">ID (slug)</span>
               <input
                 value={state.id}
-                onChange={(e) => set('id', e.target.value)}
+                onChange={(e) => set("id", e.target.value)}
                 placeholder="acme-bot"
                 className="w-full p-2 border rounded mt-1 font-mono text-sm"
               />
@@ -197,7 +198,7 @@ export default function AgentWizard({ tenantId, onClose }: Props) {
               <span className="text-sm font-medium">Nome</span>
               <input
                 value={state.nome}
-                onChange={(e) => set('nome', e.target.value)}
+                onChange={(e) => set("nome", e.target.value)}
                 placeholder="Acme Bot"
                 className="w-full p-2 border rounded mt-1 text-sm"
               />
@@ -206,7 +207,9 @@ export default function AgentWizard({ tenantId, onClose }: Props) {
               <span className="text-sm font-medium">Status</span>
               <select
                 value={state.status}
-                onChange={(e) => set('status', e.target.value as 'active' | 'suspended')}
+                onChange={(e) =>
+                  set("status", e.target.value as "active" | "suspended")
+                }
                 className="w-full p-2 border rounded mt-1 text-sm"
               >
                 <option value="active">active</option>
@@ -228,8 +231,8 @@ export default function AgentWizard({ tenantId, onClose }: Props) {
               <span className="text-sm font-medium">role_descriptor</span>
               <input
                 value={state.role_descriptor}
-                onChange={(e) => set('role_descriptor', e.target.value)}
-                placeholder="Assistente financeira da empresa X"
+                onChange={(e) => set("role_descriptor", e.target.value)}
+                placeholder="Sales operator for inbound WhatsApp leads"
                 className="w-full p-2 border rounded mt-1 text-sm"
               />
             </label>
@@ -237,7 +240,7 @@ export default function AgentWizard({ tenantId, onClose }: Props) {
               <span className="text-sm font-medium">voice.tone</span>
               <input
                 value={state.tone}
-                onChange={(e) => set('tone', e.target.value)}
+                onChange={(e) => set("tone", e.target.value)}
                 className="w-full p-2 border rounded mt-1 text-sm"
               />
             </label>
@@ -247,7 +250,10 @@ export default function AgentWizard({ tenantId, onClose }: Props) {
                 <select
                   value={state.formality}
                   onChange={(e) =>
-                    set('formality', e.target.value as 'low' | 'medium' | 'high')
+                    set(
+                      "formality",
+                      e.target.value as "low" | "medium" | "high",
+                    )
                   }
                   className="w-full p-2 border rounded mt-1 text-sm"
                 >
@@ -262,8 +268,8 @@ export default function AgentWizard({ tenantId, onClose }: Props) {
                   value={state.verbosity}
                   onChange={(e) =>
                     set(
-                      'verbosity',
-                      e.target.value as 'concise' | 'medium' | 'detailed',
+                      "verbosity",
+                      e.target.value as "concise" | "medium" | "detailed",
                     )
                   }
                   className="w-full p-2 border rounded mt-1 text-sm"
@@ -275,16 +281,18 @@ export default function AgentWizard({ tenantId, onClose }: Props) {
               </label>
             </div>
             <label className="block">
-              <span className="text-sm font-medium">priorities (one per line)</span>
+              <span className="text-sm font-medium">
+                priorities (one per line)
+              </span>
               <textarea
                 value={state.priorities}
-                onChange={(e) => set('priorities', e.target.value)}
+                onChange={(e) => set("priorities", e.target.value)}
                 rows={4}
                 className="w-full p-2 border rounded mt-1 text-sm font-mono"
               />
               <span className="text-xs text-gray-500">
                 Operational labels — what the agent weights when deciding what
-                to focus on. Audited softly by <code>papelDriftDetector</code>{' '}
+                to focus on. Audited softly by <code>papelDriftDetector</code>{" "}
                 (no auto-freeze).
               </span>
             </label>
@@ -303,21 +311,21 @@ export default function AgentWizard({ tenantId, onClose }: Props) {
               </span>
               <textarea
                 value={state.principles}
-                onChange={(e) => set('principles', e.target.value)}
+                onChange={(e) => set("principles", e.target.value)}
                 rows={4}
                 placeholder={
-                  'Ex.: Separação acima de tudo. PF é PF.\n' +
-                  'Ex.: Confirme antes de agir em coisas relevantes.'
+                  "Ex.: Never promise terms outside the approved playbook.\n" +
+                  "Ex.: Confirm before taking irreversible actions."
                 }
                 className="w-full p-2 border rounded mt-1 text-sm font-mono"
               />
               <span className="text-xs text-gray-500">
                 <strong>Core values</strong> — inviolable behavioral guardrails
                 audited by <code>valoresDetector</code>. Violations may
-                auto-freeze the profile. Different from priorities: do{' '}
-                <strong>not</strong> repeat operational labels here. Leave
-                empty if you don&apos;t want to declare value guardrails yet
-                (VALORES check stays disabled until principles are declared).
+                auto-freeze the profile. Different from priorities: do{" "}
+                <strong>not</strong> repeat operational labels here. Leave empty
+                if you don&apos;t want to declare value guardrails yet (VALORES
+                check stays disabled until principles are declared).
               </span>
             </label>
           </div>
@@ -332,22 +340,20 @@ export default function AgentWizard({ tenantId, onClose }: Props) {
               <span className="text-sm font-medium">style.language</span>
               <input
                 value={state.language}
-                onChange={(e) => set('language', e.target.value)}
+                onChange={(e) => set("language", e.target.value)}
                 className="w-full p-2 border rounded mt-1 text-sm"
               />
             </label>
             <div className="grid grid-cols-3 gap-3">
               <label className="block">
-                <span className="text-xs font-medium">
-                  max_inference_depth
-                </span>
+                <span className="text-xs font-medium">max_inference_depth</span>
                 <input
                   type="number"
                   min={0}
                   max={10}
                   value={state.max_inference_depth}
                   onChange={(e) =>
-                    set('max_inference_depth', Number(e.target.value))
+                    set("max_inference_depth", Number(e.target.value))
                   }
                   className="w-full p-2 border rounded mt-1 text-sm"
                 />
@@ -362,7 +368,7 @@ export default function AgentWizard({ tenantId, onClose }: Props) {
                   step={0.05}
                   value={state.max_speculation_in_response}
                   onChange={(e) =>
-                    set('max_speculation_in_response', Number(e.target.value))
+                    set("max_speculation_in_response", Number(e.target.value))
                   }
                   className="w-full p-2 border rounded mt-1 text-sm"
                 />
@@ -377,7 +383,7 @@ export default function AgentWizard({ tenantId, onClose }: Props) {
                   step={0.05}
                   value={state.confidence_floor_for_action}
                   onChange={(e) =>
-                    set('confidence_floor_for_action', Number(e.target.value))
+                    set("confidence_floor_for_action", Number(e.target.value))
                   }
                   className="w-full p-2 border rounded mt-1 text-sm"
                 />
@@ -390,7 +396,7 @@ export default function AgentWizard({ tenantId, onClose }: Props) {
               </span>
               <textarea
                 value={state.proposed_reason}
-                onChange={(e) => set('proposed_reason', e.target.value)}
+                onChange={(e) => set("proposed_reason", e.target.value)}
                 rows={3}
                 className="w-full p-2 border rounded mt-1 text-sm"
                 placeholder="Initial agent seed for the X division."
@@ -399,7 +405,7 @@ export default function AgentWizard({ tenantId, onClose }: Props) {
             <p className="text-xs text-gray-500">
               Profile v1 will be created with status=<code>proposed</code>.
               Activate it from the <strong>Identities</strong> screen — there
-              you'll see an "Approve &amp; activate" action for any{' '}
+              you'll see an "Approve &amp; activate" action for any{" "}
               <code>proposed</code> row (owner or founder).
             </p>
           </div>
@@ -438,7 +444,7 @@ export default function AgentWizard({ tenantId, onClose }: Props) {
                 disabled={mutation.isPending}
                 className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
               >
-                {mutation.isPending ? 'Creating...' : 'Create agent'}
+                {mutation.isPending ? "Creating..." : "Create agent"}
               </button>
             )}
           </div>

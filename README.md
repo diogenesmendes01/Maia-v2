@@ -1,16 +1,17 @@
 # Maia
 
 > **Plataforma multi-agente governada via WhatsApp.**
-> Agentes que aprendem habilidades e ferramentas — para pessoas e empresas —
-> dentro de governança, escopo e evidência.
+> Agentes configuráveis, cada um com papel, ferramentas e procedimentos
+> aprovados para assumir uma função operacional humana — com governança,
+> escopo e evidência.
 
 [![Node](https://img.shields.io/badge/node-20%2B-green)]()
 [![TypeScript](https://img.shields.io/badge/typescript-5%2B-blue)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 > 🧭 **Frase-mãe**
-> *"Agentes na Maia aprendem com a experiência, mas só evoluem
->  dentro de governança, escopo e evidência."*
+> _"Agentes na Maia aprendem com a experiência, mas só evoluem
+> dentro de governança, escopo e evidência."_
 
 > ⚠️ **Status do produto.** Plataforma em construção. O schema é multi-tenant + multi-agente, mas o runtime opera hoje com `tenant_id='default'` e `agent-selector` no-op (`MULTI_AGENT_SELECTOR_V2` reservado pro futuro). Pilares marcados 🔴 têm gap conhecido (issues abertas). Detalhes em [Estado atual & gaps conhecidos](#estado-atual--gaps-conhecidos).
 
@@ -23,8 +24,9 @@
 - **Maia é o projeto / a plataforma.** Os agentes têm nome próprio, definido pelo tenant.
 - **Multi-tenant por design, single-tenant em produção hoje** — schema, índices e tenant-guard nas queries principais; runtime ainda opera com `tenant_id='default'`. Isolamento é o **objetivo** com 2 gaps rastreados ([#229](https://github.com/diogenesmendes01/Maia-v2/issues/229), [#230](https://github.com/diogenesmendes01/Maia-v2/issues/230)).
 - **Multi-agente por design** — `Agent ≠ Channel ≠ Role`; `channel_policies` define qual agente atende qual canal. Hoje: 1 agente por canal via policy (`agent-selector` é no-op). Seleção dinâmica reservada pra `MULTI_AGENT_SELECTOR_V2`.
-- **Agentes aprendem habilidades e ferramentas** — `capability-proposer` / `skill-proposer` em produção; owner aprova via admin-ui.
-- **Pessoal e corporativo** — vertical único hoje (finanças PF + PJ do owner); arquitetura genérica.
+- **Agentes aprendem habilidades e ferramentas** — `capability-proposer` / `skill-proposer` em produção; owner aprova via admin-ui antes de qualquer evolução.
+- **Papéis substituem funções humanas específicas** — cada agente nasce com um `role_descriptor`, ferramentas autorizadas e procedimentos versionados para operar como assistente financeiro, vendedor, consultor, suporte, backoffice ou outro papel configurado pelo tenant.
+- **Pessoal e corporativo** — o primeiro pacote de ferramentas em produção cobre finanças PF + PJ do owner; isso é um vertical inicial, não o posicionamento do produto.
 - **WhatsApp como canal habilitado, multi-canal por design** — texto, áudio e foto via Baileys; tabelas `channels` / `channel_policies` / `roles` no schema, gateways adicionais não implementados ainda.
 
 ---
@@ -33,17 +35,17 @@
 
 > **Legenda:** ✅ implementado e em produção · 🚧 parcial / em iteração · 🔴 implementado **com gap conhecido** (issue aberta) · ⏳ roadmap.
 
-| # | Pilar | O que faz | Status |
-|---|---|---|---|
-| 1 | **Agentes que aprendem** | `capability-proposer`, `skill-proposer`, aquisição dialógica em 4 níveis (silent → dashboard → mentionable → proposed). A plataforma propõe; owner decide. | ✅ |
-| 2 | **Governança versionada** | Identidade operacional em 4 camadas (núcleo imutável / perfil aprendido / episódica / backlog). Toda evolução tem aprovação e versão. | ✅ |
-| 3 | **Isolamento como objetivo (com gaps)** | `tenant_id`/`agent_id` NOT NULL nas tabelas centrais, tenant-guard middleware no caminho principal de queries. **Gaps em vector memory ([#229](https://github.com/diogenesmendes01/Maia-v2/issues/229)) e procedural memory ([#230](https://github.com/diogenesmendes01/Maia-v2/issues/230))** — recall/mutações sem escopo. Runtime opera single-tenant via `'default'`. | 🔴 |
-| 4 | **Cognitive graph** | Orquestração como grafo leve: pre-turn + post-turn, com `runWhen`/`timeout`/`fallback`/`model`/`version` por node. P7 refactor total ainda parcial. | 🚧 |
-| 5 | **Self-model + reflexão tipada** | Modelo de si em 3 camadas (domínio/skill/gap), confiança determinística sobre evidência. Toda reflexão vira candidato classificado em fato / regra / procedimento / lacuna / tool-request / descarte. | ✅ |
-| 6 | **Skills + Procedures executáveis** | O que um agente aprende vira artefato versionado, event-sourced, com success criteria tipados e métricas derivadas. P3a/b em produção; P3c (test runner completo, view materializada) parcial. | 🚧 |
-| 7 | **Memória escopada (com gaps)** | 6 controles por memória (`type` / `scope` / `sensitivity` / `proactive_use` / `mention_allowed` / `ttl_days`). Memória sensível influencia cuidado, nunca é verbalizada. **Vector e procedural sem guard runtime** ([#229](https://github.com/diogenesmendes01/Maia-v2/issues/229), [#230](https://github.com/diogenesmendes01/Maia-v2/issues/230)); working memory (Redis) **é** namespaced por `tenant:agent:conversa` (ver [runbook Redis](docs/runbooks/redis.md)). | 🔴 |
-| 8 | **WhatsApp como canal (multi-canal por design)** | Gateway Baileys com texto, áudio (Whisper) e imagem (Claude Vision). Separação por interlocutor; auditoria por mensagem. Tabelas `channels` / `channel_policies` / `roles` no schema; gateways adicionais não implementados. | 🚧 |
-| 9 | **Primeiro vertical: finanças PF + PJ** | Caso de uso concreto: lançamentos, classificação, fluxo de caixa, briefing, conversas separadas com contadores e funcionários. É a **prova** do produto — não a definição dele. | ✅ |
+| #   | Pilar                                            | O que faz                                                                                                                                                                                                                                                                                                                                                                                            | Status |
+| --- | ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ |
+| 1   | **Agentes que aprendem**                         | `capability-proposer`, `skill-proposer`, aquisição dialógica em 4 níveis (silent → dashboard → mentionable → proposed). A plataforma propõe; owner decide.                                                                                                                                                                                                                                           | ✅     |
+| 2   | **Governança versionada**                        | Identidade operacional em 4 camadas (núcleo imutável / perfil aprendido / episódica / backlog). Toda evolução tem aprovação e versão.                                                                                                                                                                                                                                                                | ✅     |
+| 3   | **Isolamento como objetivo (com gaps)**          | `tenant_id`/`agent_id` NOT NULL nas tabelas centrais, tenant-guard middleware no caminho principal de queries. **Gaps em vector memory ([#229](https://github.com/diogenesmendes01/Maia-v2/issues/229)) e procedural memory ([#230](https://github.com/diogenesmendes01/Maia-v2/issues/230))** — recall/mutações sem escopo. Runtime opera single-tenant via `'default'`.                            | 🔴     |
+| 4   | **Cognitive graph**                              | Orquestração como grafo leve: pre-turn + post-turn, com `runWhen`/`timeout`/`fallback`/`model`/`version` por node. P7 refactor total ainda parcial.                                                                                                                                                                                                                                                  | 🚧     |
+| 5   | **Self-model + reflexão tipada**                 | Modelo de si em 3 camadas (domínio/skill/gap), confiança determinística sobre evidência. Toda reflexão vira candidato classificado em fato / regra / procedimento / lacuna / tool-request / descarte.                                                                                                                                                                                                | ✅     |
+| 6   | **Skills + Procedures executáveis**              | O que um agente aprende vira artefato versionado, event-sourced, com success criteria tipados e métricas derivadas. P3a/b em produção; P3c (test runner completo, view materializada) parcial.                                                                                                                                                                                                       | 🚧     |
+| 7   | **Memória escopada (com gaps)**                  | 6 controles por memória (`type` / `scope` / `sensitivity` / `proactive_use` / `mention_allowed` / `ttl_days`). Memória sensível influencia cuidado, nunca é verbalizada. **Vector e procedural sem guard runtime** ([#229](https://github.com/diogenesmendes01/Maia-v2/issues/229), [#230](https://github.com/diogenesmendes01/Maia-v2/issues/230)); working memory (Redis) **é** namespaced por `tenant:agent:conversa` (ver [runbook Redis](docs/runbooks/redis.md)). | 🔴     |
+| 8   | **WhatsApp como canal (multi-canal por design)** | Gateway Baileys com texto, áudio (Whisper) e imagem (Claude Vision). Separação por interlocutor; auditoria por mensagem. Tabelas `channels` / `channel_policies` / `roles` no schema; gateways adicionais não implementados.                                                                                                                                                                         | 🚧     |
+| 9   | **Primeiro vertical: finanças PF + PJ**          | Caso de uso concreto com ferramentas pré-configuradas: lançamentos, classificação, fluxo de caixa, briefing, conversas separadas com contadores e funcionários. É a **prova** de que um agente pode assumir uma função operacional — não a definição do produto.                                                                                                                                     | ✅     |
 
 ---
 
@@ -183,15 +185,15 @@ npm run dev          # → http://localhost:4000
 
 É o **plano de governança** da plataforma — onde o owner aprova evolução, audita comportamento e administra a operação.
 
-| Área | O que faz | Router tRPC |
-|---|---|---|
-| **Aprovações** | Capability proposals, identity proposals, dual-approval flow | `proposals`, `capabilities` |
-| **Drift & incidents** | Alertas de deriva (7 tipos × 4 severidades), resolução, histórico | `drift` |
-| **Trace explorer** | Runtime traces, cognitive module logs, audit por turno | `traces`, `audit` |
-| **Versions** | Diff + rollback de identity profiles (via `react-diff-viewer-continued`) | `versions` |
-| **Gestão** | Tenants, agentes, skills, procedures, tools-catalog, channel policies, LLM settings | `tenants`, `agents`, `skills`, `procedures`, `tools-catalog`, `channelPolicies`, `llmSettings` |
-| **Inbox & knowledge** | Propostas pendentes, base de conhecimento por tenant | `inbox`, `knowledge` |
-| **Dashboard** | KPIs por tenant/agente — execuções, drift, custo | `dashboard` |
+| Área                  | O que faz                                                                           | Router tRPC                                                                                    |
+| --------------------- | ----------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| **Aprovações**        | Capability proposals, identity proposals, dual-approval flow                        | `proposals`, `capabilities`                                                                    |
+| **Drift & incidents** | Alertas de deriva (7 tipos × 4 severidades), resolução, histórico                   | `drift`                                                                                        |
+| **Trace explorer**    | Runtime traces, cognitive module logs, audit por turno                              | `traces`, `audit`                                                                              |
+| **Versions**          | Diff + rollback de identity profiles (via `react-diff-viewer-continued`)            | `versions`                                                                                     |
+| **Gestão**            | Tenants, agentes, skills, procedures, tools-catalog, channel policies, LLM settings | `tenants`, `agents`, `skills`, `procedures`, `tools-catalog`, `channelPolicies`, `llmSettings` |
+| **Inbox & knowledge** | Propostas pendentes, base de conhecimento por tenant                                | `inbox`, `knowledge`                                                                           |
+| **Dashboard**         | KPIs por tenant/agente — execuções, drift, custo                                    | `dashboard`                                                                                    |
 
 Lista completa de routers: [`src/admin-ui/trpc/routers/`](src/admin-ui/trpc/routers/).
 
@@ -242,29 +244,29 @@ CI roda esses testes automaticamente em job dedicado (`integration` em
 
 > **Legenda:** ✅ em código (migrations e módulos presentes) · 🚧 parcial / em iteração · ⏳ planejado.
 
-| Fase | Entrega | Estimativa original | Status |
-|------|---------|---------------------|--------|
-| **P0** | **Foundation** — `tenant_id`/`agent_id` NOT NULL forçado, tenant-guard middleware, índices, tabelas dormentes (migrations `007_p0`–`015_p0`) | 2 sem | ✅ |
-| **P1** | **Reflexão expandida + Classificador + Cognitive Wrapper** — `cognition/reflector.ts`, `classifier.ts`, `runCognitiveModule({timeout, fallback, audit})`, novos triggers (conversation_closed, success_explicit, pattern_detected, internal_gap) | 2–3 sem | ✅ |
-| **P2** | **Memory scoping + Self-model** — tabela `memory_entry` com 6 controles, migração conservadora (legacy → `unknown`/`restricted`/`needs_review`), `agent_capabilities_*`, confiança determinística | 3–4 sem | ✅ |
-| **P3a** | **Procedures: definição** — `procedure_definitions`, `procedure_assignments`, modo ENSINO funcional (owner ensina, agente armazena) | 2 sem | ✅ |
-| **P3b** | **Procedures: execução runtime** — `procedure_executions`, `procedure_execution_events`, `selector_decisions`, `procedure-selector`, `step-evaluator` (machine_check + tool_result), engine stateful | 2–3 sem | ✅ |
-| **P3c** | **Procedures: governança operacional** — `procedure_metrics` (view materializada), `procedure_tests` + test runner, TTL pra execuções zumbis, `step-evaluator` completo (llm_judge, user_signal, human_confirmed) | 2 sem | 🚧 |
-| **P4** | **Identidade operacional versionada** — `agent_operational_profile_versions`, `agent_drift_alerts`, detector (7 tipos × 4 severidades), proposal generator semanal, paralelo ao legado com feature flag | 3 sem | ✅ |
-| **P5** | **Aquisição dialógica de capacidades** — `gap_escalation_rules`, `capability_proposals`, `capability_test_results`, 4 níveis de escalada, dashboard de gaps + propostas, loop de teste pós-aquisição | 3 sem | ✅ |
-| **P6** | **Channel / Role / Policy** — tabelas de canais, roles, policies; `role-selector` (sugere) + `role-engine` (decide via policy); multi-channel Baileys; migração: estado atual = 1 agent / 1 channel / 1 role default | 5–7 sem | 🚧 |
-| **P7** | **Grafo cognitivo completo** — DAG topológico, paralelização, `runWhen` condicional; refactor de todos os módulos pro formato node. Sem mudança user-facing — só governança formal. | 2–3 sem | 🚧 |
-| **P8+** | **Iterações posteriores** — admin-ui (P8.5), unified trace events matview (P10b), calendar/holidays, profile body consolidation, e demais refinamentos pós-MVP da plataforma | — | ✅ |
+| Fase    | Entrega                                                                                                                                                                                                                                          | Estimativa original | Status |
+| ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------- | ------ |
+| **P0**  | **Foundation** — `tenant_id`/`agent_id` NOT NULL forçado, tenant-guard middleware, índices, tabelas dormentes (migrations `007_p0`–`015_p0`)                                                                                                     | 2 sem               | ✅     |
+| **P1**  | **Reflexão expandida + Classificador + Cognitive Wrapper** — `cognition/reflector.ts`, `classifier.ts`, `runCognitiveModule({timeout, fallback, audit})`, novos triggers (conversation_closed, success_explicit, pattern_detected, internal_gap) | 2–3 sem             | ✅     |
+| **P2**  | **Memory scoping + Self-model** — tabela `memory_entry` com 6 controles, migração conservadora (legacy → `unknown`/`restricted`/`needs_review`), `agent_capabilities_*`, confiança determinística                                                | 3–4 sem             | ✅     |
+| **P3a** | **Procedures: definição** — `procedure_definitions`, `procedure_assignments`, modo ENSINO funcional (owner ensina, agente armazena)                                                                                                              | 2 sem               | ✅     |
+| **P3b** | **Procedures: execução runtime** — `procedure_executions`, `procedure_execution_events`, `selector_decisions`, `procedure-selector`, `step-evaluator` (machine_check + tool_result), engine stateful                                             | 2–3 sem             | ✅     |
+| **P3c** | **Procedures: governança operacional** — `procedure_metrics` (view materializada), `procedure_tests` + test runner, TTL pra execuções zumbis, `step-evaluator` completo (llm_judge, user_signal, human_confirmed)                                | 2 sem               | 🚧     |
+| **P4**  | **Identidade operacional versionada** — `agent_operational_profile_versions`, `agent_drift_alerts`, detector (7 tipos × 4 severidades), proposal generator semanal, paralelo ao legado com feature flag                                          | 3 sem               | ✅     |
+| **P5**  | **Aquisição dialógica de capacidades** — `gap_escalation_rules`, `capability_proposals`, `capability_test_results`, 4 níveis de escalada, dashboard de gaps + propostas, loop de teste pós-aquisição                                             | 3 sem               | ✅     |
+| **P6**  | **Channel / Role / Policy** — tabelas de canais, roles, policies; `role-selector` (sugere) + `role-engine` (decide via policy); multi-channel Baileys; migração: estado atual = 1 agent / 1 channel / 1 role default                             | 5–7 sem             | 🚧     |
+| **P7**  | **Grafo cognitivo completo** — DAG topológico, paralelização, `runWhen` condicional; refactor de todos os módulos pro formato node. Sem mudança user-facing — só governança formal.                                                              | 2–3 sem             | 🚧     |
+| **P8+** | **Iterações posteriores** — admin-ui (P8.5), unified trace events matview (P10b), calendar/holidays, profile body consolidation, e demais refinamentos pós-MVP da plataforma                                                                     | —                   | ✅     |
 
 **Sequência de valor:**
 
-| Etapa | Fases | Valor |
-|---|---|---|
-| Quick wins | P0–P2 | Reflexão expandida, sem alucinação de confiança, memória segura |
-| Salto qualitativo | P3a–P3c | Procedures funcionando = "agentes aprendem qualquer profissão" |
-| Segurança operacional | P4, P5 | Identidade governada + evolui via diálogo |
-| Expansão | P6 | Multi-channel / multi-role |
-| Governança | P7 | Orquestração formal |
+| Etapa                 | Fases   | Valor                                                           |
+| --------------------- | ------- | --------------------------------------------------------------- |
+| Quick wins            | P0–P2   | Reflexão expandida, sem alucinação de confiança, memória segura |
+| Salto qualitativo     | P3a–P3c | Procedures funcionando = "agentes aprendem qualquer profissão"  |
+| Segurança operacional | P4, P5  | Identidade governada + evolui via diálogo                       |
+| Expansão              | P6      | Multi-channel / multi-role                                      |
+| Governança            | P7      | Orquestração formal                                             |
 
 ---
 

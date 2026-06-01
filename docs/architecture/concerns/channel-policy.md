@@ -15,7 +15,7 @@ Concretely:
 
 ## 2. Why it matters
 
-In a multi-agent platform, "which agent answers" is the most consequential routing decision the system makes. If it's wrong, a user thinks they're talking to their finance assistant but reaches their customer-service agent — and every audit row, every memory, every learned skill from that turn is attributed to the wrong identity.
+In a multi-agent platform, "which agent answers" is the most consequential routing decision the system makes. If it's wrong, a user thinks they're talking to a finance agent, salesperson, consultant, or support operator, but reaches a different operational identity — and every audit row, every memory, every learned skill from that turn is attributed to the wrong identity.
 
 Channel/role/policy is also where the platform becomes **multi-channel by design without yet being multi-channel in production**. The schema and resolver chain are channel-agnostic; adding a second channel (SMS, Telegram, web chat) is wiring a gateway adapter, not refactoring the cognitive stack.
 
@@ -23,42 +23,42 @@ Channel/role/policy is also where the platform becomes **multi-channel by design
 
 ### Gateway (`src/gateway/`)
 
-| File | Role |
-|---|---|
-| `src/gateway/baileys.ts` | WhatsApp ingress / egress via Baileys; pairing, reconnect, session state |
+| File                              | Role                                                                                             |
+| --------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `src/gateway/baileys.ts`          | WhatsApp ingress / egress via Baileys; pairing, reconnect, session state                         |
 | `src/gateway/channel-resolver.ts` | Resolves `(channel_id, agent_id, role)` from inbound metadata. Fails loud on unresolved channel. |
-| `src/gateway/rate-limit.ts` | Per-channel rate-limit (Redis, tenant-prefixed keys) |
-| `src/gateway/dedup.ts` | Inbound message dedup (Redis, tenant-keyed) |
-| `src/gateway/debouncer.ts` | Phone-keyed debounce window with tenant prefix |
-| `src/gateway/bot-detection.ts` | Heuristic bot detection (Redis, tenant-keyed) |
-| `src/gateway/queue.ts` | Inbound queue producer (BullMQ) |
-| `src/gateway/presence.ts` | Presence / typing indicator handling |
-| `src/gateway/types.ts` | Shared gateway types |
+| `src/gateway/rate-limit.ts`       | Per-channel rate-limit (Redis, tenant-prefixed keys)                                             |
+| `src/gateway/dedup.ts`            | Inbound message dedup (Redis, tenant-keyed)                                                      |
+| `src/gateway/debouncer.ts`        | Phone-keyed debounce window with tenant prefix                                                   |
+| `src/gateway/bot-detection.ts`    | Heuristic bot detection (Redis, tenant-keyed)                                                    |
+| `src/gateway/queue.ts`            | Inbound queue producer (BullMQ)                                                                  |
+| `src/gateway/presence.ts`         | Presence / typing indicator handling                                                             |
+| `src/gateway/types.ts`            | Shared gateway types                                                                             |
 
 ### Channel/role/policy (schema + runtime)
 
-| File | Role |
-|---|---|
-| `migrations/*p6*` | Schema for `channels`, `channel_policies`, `roles` |
-| `src/runtime/decision/agent-selector.ts` | Selects agent for the turn (current: no-op returning policy's `default_agent_id`; `MULTI_AGENT_SELECTOR_V2` flag reserved for dynamic selection) |
-| `src/cognition/role-selector/engine.ts` | Role selection entry — LLM suggests, policy decides |
-| `src/cognition/role-selector/llm-suggester.ts` | LLM suggestion phase |
-| `src/cognition/role-selector/deterministic-classifier.ts` | Deterministic scoring of the suggestion |
-| `src/cognition/role-selector/policy-decider.ts` | Policy gate over the suggestion |
-| `src/cognition/role-selector/oscillation-tracker.ts` | Anti-oscillation: rejects rapid role switches in `by_context` mode |
-| `src/control-plane/policy/policy-rules-repo.ts` | Persistent storage of policy rules |
-| `src/control-plane/policy/policy-cache.ts` | In-process policy cache with per-tenant Redis pubsub invalidation |
-| `src/control-plane/policy/policy-descriptor-resolver.ts` | String descriptor → active policy ID resolution |
+| File                                                      | Role                                                                                                                                             |
+| --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `migrations/*p6*`                                         | Schema for `channels`, `channel_policies`, `roles`                                                                                               |
+| `src/runtime/decision/agent-selector.ts`                  | Selects agent for the turn (current: no-op returning policy's `default_agent_id`; `MULTI_AGENT_SELECTOR_V2` flag reserved for dynamic selection) |
+| `src/cognition/role-selector/engine.ts`                   | Role selection entry — LLM suggests, policy decides                                                                                              |
+| `src/cognition/role-selector/llm-suggester.ts`            | LLM suggestion phase                                                                                                                             |
+| `src/cognition/role-selector/deterministic-classifier.ts` | Deterministic scoring of the suggestion                                                                                                          |
+| `src/cognition/role-selector/policy-decider.ts`           | Policy gate over the suggestion                                                                                                                  |
+| `src/cognition/role-selector/oscillation-tracker.ts`      | Anti-oscillation: rejects rapid role switches in `by_context` mode                                                                               |
+| `src/control-plane/policy/policy-rules-repo.ts`           | Persistent storage of policy rules                                                                                                               |
+| `src/control-plane/policy/policy-cache.ts`                | In-process policy cache with per-tenant Redis pubsub invalidation                                                                                |
+| `src/control-plane/policy/policy-descriptor-resolver.ts`  | String descriptor → active policy ID resolution                                                                                                  |
 
 ### Identity (post-channel, pre-cognition)
 
-| File | Role |
-|---|---|
-| `src/identity/resolver.ts` | Resolves `pessoa_id` from the channel-side handle (e.g., WhatsApp JID) |
-| `src/identity/quarantine.ts` | Quarantines new/unknown identities until governance approves |
-| `src/identity/voice-modifier.ts` | Adjusts voice/tone per resolved interlocutor |
+| File                                 | Role                                                                    |
+| ------------------------------------ | ----------------------------------------------------------------------- |
+| `src/identity/resolver.ts`           | Resolves `pessoa_id` from the channel-side handle (e.g., WhatsApp JID)  |
+| `src/identity/quarantine.ts`         | Quarantines new/unknown identities until governance approves            |
+| `src/identity/voice-modifier.ts`     | Adjusts voice/tone per resolved interlocutor                            |
 | `src/identity/proposal-generator.ts` | Generates identity proposals (e.g., role membership) for owner approval |
-| `src/identity/profile-renderer.ts` | Renders the operational profile slice for context packet |
+| `src/identity/profile-renderer.ts`   | Renders the operational profile slice for context packet                |
 
 ## 4. Patterns
 
@@ -68,7 +68,7 @@ The inbound pipeline (`src/gateway/baileys.ts` → `src/gateway/dedup.ts` → `s
 
 ### 4.2 Policy is a string descriptor, resolved to active policy at use
 
-`policy-descriptor-resolver.ts` maps string descriptors (e.g., `"finance_role_policy"`) to active policy IDs. This lets call sites carry stable string names while the underlying policy versions can roll forward. Combined with per-tenant pubsub invalidation in `policy-cache.ts`, a policy change propagates to in-flight workers without restart.
+`policy-descriptor-resolver.ts` maps string descriptors (e.g., `"sales_role_policy"`, `"finance_role_policy"`) to active policy IDs. This lets call sites carry stable string names while the underlying policy versions can roll forward. Combined with per-tenant pubsub invalidation in `policy-cache.ts`, a policy change propagates to in-flight workers without restart.
 
 ### 4.3 Role selection: LLM suggests, policy decides, oscillation tracker guards
 
@@ -95,26 +95,26 @@ The current runtime is single-agent: `agent-selector.ts` returns `channel_policy
 
 ## 5. Anti-patterns
 
-| Pattern | Why it's wrong |
-|---|---|
-| Reading channel state from `gateway/` outside `channel-resolver.ts` | Channel resolution is centralized; bypassing it skips policy gates. |
-| Hard-coded `agent_id` in a worker | Tomorrow there are N agents per tenant; hardcoded paths leak across them. Resolve via `channel_policy`. |
-| Role decided inside the agent's prompt | The agent does not pick its own role. The role-selector chain does. |
-| Inbound message accepted without rate-limit / dedup / debounce | These three are non-negotiable for any new channel. Reusing the gateway pipeline is the only supported path. |
-| Adding a new channel by extending `baileys.ts` | New channel = new file under `src/gateway/`. `baileys.ts` is WhatsApp-specific. |
-| Direct write to `channel_policies` from runtime code | Channel/role/policy state is owner-controlled (via admin-ui). Runtime reads; doesn't write. |
+| Pattern                                                             | Why it's wrong                                                                                               |
+| ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| Reading channel state from `gateway/` outside `channel-resolver.ts` | Channel resolution is centralized; bypassing it skips policy gates.                                          |
+| Hard-coded `agent_id` in a worker                                   | Tomorrow there are N agents per tenant; hardcoded paths leak across them. Resolve via `channel_policy`.      |
+| Role decided inside the agent's prompt                              | The agent does not pick its own role. The role-selector chain does.                                          |
+| Inbound message accepted without rate-limit / dedup / debounce      | These three are non-negotiable for any new channel. Reusing the gateway pipeline is the only supported path. |
+| Adding a new channel by extending `baileys.ts`                      | New channel = new file under `src/gateway/`. `baileys.ts` is WhatsApp-specific.                              |
+| Direct write to `channel_policies` from runtime code                | Channel/role/policy state is owner-controlled (via admin-ui). Runtime reads; doesn't write.                  |
 
 ## 6. Tests
 
-| Test path | What it proves |
-|---|---|
-| `tests/unit/gateway/channel-resolver-fail-loud.spec.ts` (or similar) | Resolver rejects unresolved channels |
-| `tests/unit/gateway/rate-limit-tenant-scope.spec.ts` | Rate-limit keys carry tenant |
-| `tests/unit/gateway/dedup-tenant-scope.spec.ts` | Dedup keys carry tenant |
-| `tests/unit/gateway/debouncer-tenant-scope.spec.ts` | Debounce keys carry tenant |
-| `tests/unit/role-selector/` | Role selector chain: suggester / classifier / decider / oscillation |
-| `tests/unit/identity/resolver.spec.ts` | Identity resolution |
-| `tests/integration/p6-channel-role-policy.spec.ts` (if present) | End-to-end channel/role/policy routing |
+| Test path                                                            | What it proves                                                      |
+| -------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| `tests/unit/gateway/channel-resolver-fail-loud.spec.ts` (or similar) | Resolver rejects unresolved channels                                |
+| `tests/unit/gateway/rate-limit-tenant-scope.spec.ts`                 | Rate-limit keys carry tenant                                        |
+| `tests/unit/gateway/dedup-tenant-scope.spec.ts`                      | Dedup keys carry tenant                                             |
+| `tests/unit/gateway/debouncer-tenant-scope.spec.ts`                  | Debounce keys carry tenant                                          |
+| `tests/unit/role-selector/`                                          | Role selector chain: suggester / classifier / decider / oscillation |
+| `tests/unit/identity/resolver.spec.ts`                               | Identity resolution                                                 |
+| `tests/integration/p6-channel-role-policy.spec.ts` (if present)      | End-to-end channel/role/policy routing                              |
 
 ## 7. Known gaps
 
@@ -160,8 +160,8 @@ Verify with `gh pr list --state open --search "channel OR role OR policy OR gate
 
 ---
 
-| | |
-|---|---|
-| Last verified | 2026-05-28 |
-| Against `main` HEAD | `c49c3855` |
-| Re-verify when | Older than 30 days; OR a new channel adapter lands in `src/gateway/`; OR `MULTI_AGENT_SELECTOR_V2` flips on; OR the role-selector chain in `src/cognition/role-selector/` changes its links |
+|                     |                                                                                                                                                                                             |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Last verified       | 2026-05-28                                                                                                                                                                                  |
+| Against `main` HEAD | `c49c3855`                                                                                                                                                                                  |
+| Re-verify when      | Older than 30 days; OR a new channel adapter lands in `src/gateway/`; OR `MULTI_AGENT_SELECTOR_V2` flips on; OR the role-selector chain in `src/cognition/role-selector/` changes its links |
