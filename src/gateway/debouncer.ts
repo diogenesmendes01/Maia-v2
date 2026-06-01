@@ -411,6 +411,12 @@ export async function scheduleDebouncedAgent(params: {
       attempts: 3,
       backoff: { type: 'exponential', delay: 2000 },
       removeOnComplete: { age: 86_400 },
+      // Bound failed-job retention so they age out instead of piling in Redis
+      // indefinitely (#349). Working-memory keys carry a TTL but BullMQ jobs
+      // did not — `removeOnComplete` was set while `removeOnFail` was not. The
+      // bound is generous (1000 jobs / 7d) so the DLQ inspection path keeps
+      // enough recent history; see docs/runbooks/redis.md §3.
+      removeOnFail: { count: 1000, age: 7 * 24 * 3600 },
     });
 
     // Preserve first_enqueued_at across resets so heldMs grows toward the

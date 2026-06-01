@@ -52,13 +52,20 @@ não o tenant.
 
 **Por que `noeviction` em vez de `volatile-lru`?**
 
-Hoje nem todas as chaves Redis carregam TTL — o BullMQ guarda jobs sem TTL.
-(As chaves de working memory **carregam** TTL: tanto a chave de dados quanto a
-de marker expiram em `MESSAGES_TTL_SECONDS`; ver §4.6.) Em `volatile-lru` sob
-pressão, o Redis evicta só o subset com TTL e ainda falha o write quando esgota
-esse subset — o pior dos dois mundos para o caller, sem o sinal claro de OOM.
-`noeviction` falha cedo e ruidosamente, deixando o operador decidir entre
-aumentar `maxmemory`, baixar TTL, ou shardar Redis por tenant.
+Hoje nem todas as chaves Redis carregam TTL **no nível de chave** (`EXPIRE`) —
+as chaves do BullMQ não carregam. A retenção de jobs do BullMQ é **limitada por
+contagem/idade na camada da aplicação** (`removeOnComplete` / `removeOnFail`),
+não por um `EXPIRE` no Redis — então essas chaves continuam invisíveis para o
+evictor `volatile-*` (que olha só TTL de chave). Failed jobs ganharam um limite
+generoso (`{ count: 1000, age: 7 * 24 * 3600 }`) em `removeOnFail` (#349) para
+não acumularem indefinidamente, mas isso é poda da própria BullMQ, **não** TTL
+de chave. (As chaves de working memory **carregam** TTL de chave: tanto a chave
+de dados quanto a de marker expiram em `MESSAGES_TTL_SECONDS`; ver §4.6.) Em
+`volatile-lru` sob pressão, o Redis evicta só o subset com TTL de chave e ainda
+falha o write quando esgota esse subset — o pior dos dois mundos para o caller,
+sem o sinal claro de OOM. `noeviction` falha cedo e ruidosamente, deixando o
+operador decidir entre aumentar `maxmemory`, baixar TTL, ou shardar Redis por
+tenant.
 
 `volatile-lru` é aceitável **se** auditar que todas as chaves com vida útil
 > 1h carregam TTL apropriado — manter a documentação aqui se mudar.
