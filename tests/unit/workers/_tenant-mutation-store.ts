@@ -523,6 +523,17 @@ export function makeTenantScopedUpdateStore(
           return [{ ...existing }];
         },
       }),
+      // Issue #370 — plain `insert(table).values(v).returning()` (no conflict
+      // clause). Used by the INSERT branch of MANUAL read-then-write upserts such
+      // as `capabilityGapsRepo.upsert` (whose de-dup happens via a prior SELECT,
+      // not a Postgres ON CONFLICT). Appends the row verbatim — the caller has
+      // already tenant-stamped `vals` — and returns it the way `.returning()`
+      // does. Additive: the `onConflictDoUpdate` shape above is unaffected.
+      returning: async (_selection?: unknown) => {
+        const inserted: StoreRow = { ...(vals as StoreRow) };
+        rows.push(inserted);
+        return [{ ...inserted }];
+      },
     }),
   }));
 

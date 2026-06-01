@@ -4911,13 +4911,23 @@ export const capabilityGapsRepo = {
       .limit(1);
 
     if (existing[0]) {
+      // Defense in depth (#370): scope the UPDATE by tenant + agent, not by id
+      // alone — mirroring updateLevel below. The id matched the tenant-scoped
+      // SELECT above, but a colliding/stale id across tenants must never let this
+      // bump another tenant's row ("id is not an isolation boundary"; #367/#368).
       await db
         .update(agent_capability_gaps)
         .set({
           frequency_score: existing[0].frequency_score + 1,
           last_observed: new Date(),
         })
-        .where(eq(agent_capability_gaps.id, existing[0].id));
+        .where(
+          and(
+            eq(agent_capability_gaps.id, existing[0].id),
+            eq(agent_capability_gaps.tenant_id, tenant_id),
+            eq(agent_capability_gaps.agent_id, agent_id),
+          ),
+        );
       return existing[0];
     }
 
