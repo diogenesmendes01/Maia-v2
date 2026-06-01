@@ -29,7 +29,12 @@ export function startAgentWorker(processor: (job: Job<AgentJob>) => Promise<void
       connection,
       concurrency: 1,
       removeOnComplete: { age: 86_400 },
-      // Failed jobs are kept by default — operator inspects via DLQ.
+      // Bound failed-job retention for symmetry with `removeOnComplete` (#349).
+      // Failed jobs were previously kept unbounded, so a DLQ pile could grow in
+      // Redis until manual cleanup (and be mistaken for a working-memory leak in
+      // an incident). The bound is generous (1000 jobs / 7d) so the operator
+      // still has plenty of recent failed jobs to inspect via the DLQ.
+      removeOnFail: { count: 1000, age: 7 * 24 * 3600 },
     },
   );
   worker.on('failed', async (job, err) => {

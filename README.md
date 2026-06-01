@@ -114,6 +114,8 @@ maia/
 
 > **Nota sobre memória.** As 5 camadas (`episodic`, `semantic`, `procedural`, `working`, `vector`) são fachadas finas sobre Postgres+pgvector e Redis. Eviction, TTL e ranking ficam delegados ao banco/Redis, não à camada de memória. Expansão (LRU em `working`, ranking ponderado em `semantic`) fica como evolução futura.
 
+> **Nota sobre TTL no Redis (assimetria).** Nem toda chave Redis da Maia carrega TTL — não assuma "tudo no Redis expira". A **working memory ✅ carrega TTL** (dados + marker, `MESSAGES_TTL_SECONDS`). Os **jobs do BullMQ ⚠️ historicamente NÃO tinham TTL** (acumulavam até intervenção manual); hoje a retenção é **limitada via defaults `removeOnComplete` / `removeOnFail`** nos produtores/consumidor (`src/gateway/debouncer.ts`, `src/gateway/queue.ts`), não por TTL de chave. Detalhes e implicações operacionais (DLQ pile × cache leak) no [runbook Redis](docs/runbooks/redis.md).
+
 > **Estado do código.** 152 migrations · 33 workers · 16 tRPC routers no admin-ui · 392 test/spec files · pgvector + Redis + BullMQ + Baileys em produção.
 
 ---
