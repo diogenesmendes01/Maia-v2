@@ -1,6 +1,5 @@
 import cron, { type ScheduledTask } from 'node-cron';
 import { logger } from '@/lib/logger.js';
-import { config } from '@/config/env.js';
 import { runHealthMonitor } from './health-monitor.js';
 import { runPendingExpirer } from './pending-expirer.js';
 import { runIdempotencyCleanup } from './idempotency-cleanup.js';
@@ -39,8 +38,6 @@ export type Job = {
   cron: string;
   fn: () => Promise<void>;
   phase: number;
-  /** When set, job is only scheduled if the feature flag is true at startup. */
-  featureFlag?: boolean;
 };
 
 export const JOBS: Job[] = [
@@ -119,15 +116,13 @@ export const JOBS: Job[] = [
   { name: 'knowledge_state_promoter', cron: '0 * * * *', fn: runKnowledgeStatePromoter, phase: 2 },
   // P10b — runtime trace: 3 workers (body writer, body recoverer, matview refresh).
   // Registered at phase 1 so they are included in the production startup call
-  // `startWorkers(1)`. Gated on FEATURE_RUNTIME_TRACE_V1 so they are a no-op
-  // when the flag is off. Prior phase: 6 (round-2 finding #1 fix).
+  // `startWorkers(1)`. Prior phase: 6 (round-2 finding #1 fix).
   // body_writer drains the in-process enqueue (every minute).
   {
     name: 'trace_body_writer',
     cron: '* * * * *',
     fn: runTraceBodyWriter,
     phase: 1,
-    featureFlag: config.FEATURE_RUNTIME_TRACE_V1,
   },
   // body_recoverer flips persisted/orphans pending envelopes (every 5 min).
   {
@@ -135,7 +130,6 @@ export const JOBS: Job[] = [
     cron: '*/5 * * * *',
     fn: runTraceBodyRecoverer,
     phase: 1,
-    featureFlag: config.FEATURE_RUNTIME_TRACE_V1,
   },
   // matview refresh — unified_trace_events (every 5 min, CONCURRENTLY).
   {
@@ -143,7 +137,6 @@ export const JOBS: Job[] = [
     cron: '*/5 * * * *',
     fn: runTraceMatviewRefresh,
     phase: 1,
-    featureFlag: config.FEATURE_RUNTIME_TRACE_V1,
   },
 ];
 
@@ -152,8 +145,6 @@ const tasks: ScheduledTask[] = [];
 export function startWorkers(currentPhase: number = 1): void {
   for (const job of JOBS) {
     if (job.phase > currentPhase) continue;
-    // Skip feature-flagged jobs whose flag is off.
-    if (job.featureFlag === false) continue;
     const t = cron.schedule(
       job.cron,
       () => {
@@ -163,7 +154,7 @@ export function startWorkers(currentPhase: number = 1): void {
     );
     tasks.push(t);
     logger.info(
-      { job: job.name, cron: job.cron, phase: job.phase, featureFlag: job.featureFlag },
+      { job: job.name, cron: job.cron, phase: job.phase },
       'worker.scheduled',
     );
   }

@@ -13,7 +13,7 @@
  * Bônus: validamos precedência (roleSection vem ANTES de procedureSection
  * quando ambos presentes) — defesa da invariant §10.7.
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { Role } from '../../src/db/schema.js';
 
 const selfStateGetActive = vi.fn();
@@ -126,41 +126,10 @@ beforeEach(async () => {
   procedureExecutionsFindActiveForConversa.mockResolvedValue(null);
   procedureDefinitionsFindById.mockResolvedValue(null);
 
-  const { featureFlags } = await import('../../src/config/feature-flags.js');
-  featureFlags.reset();
-});
-
-afterEach(async () => {
-  const { featureFlags } = await import('../../src/config/feature-flags.js');
-  const { FeatureFlagName } = await import('../../src/types/enums.js');
-  featureFlags.override(FeatureFlagName.MULTI_CHANNEL, false);
-  featureFlags.reset();
 });
 
 describe('buildPrompt — injeção de "Modo operacional" (P6 Task 9)', () => {
-  it('1. Flag MULTI_CHANNEL OFF + activeRole presente → seção AUSENTE', async () => {
-    const { featureFlags } = await import('../../src/config/feature-flags.js');
-    const { FeatureFlagName } = await import('../../src/types/enums.js');
-    featureFlags.override(FeatureFlagName.MULTI_CHANNEL, false);
-
-    const role = makeRole({
-      display_name: 'Suporte',
-      description: 'modo suporte técnico',
-      prompt_addendum: 'seja paciente e técnico',
-    });
-
-    const { buildPrompt } = await import('../../src/agent/prompt-builder.js');
-    const { system } = await buildPrompt(makeCtx(role));
-
-    expect(system).not.toContain('## Modo operacional');
-    expect(system).not.toContain('Suporte');
-  });
-
-  it('2. Flag ON + activeRole null/undefined → seção AUSENTE', async () => {
-    const { featureFlags } = await import('../../src/config/feature-flags.js');
-    const { FeatureFlagName } = await import('../../src/types/enums.js');
-    featureFlags.override(FeatureFlagName.MULTI_CHANNEL, true);
-
+  it('activeRole null/undefined → seção AUSENTE', async () => {
     const { buildPrompt } = await import('../../src/agent/prompt-builder.js');
 
     const { system: systemNull } = await buildPrompt(makeCtx(null));
@@ -171,10 +140,6 @@ describe('buildPrompt — injeção de "Modo operacional" (P6 Task 9)', () => {
   });
 
   it('3. Flag ON + role com description + prompt_addendum → seção PRESENTE com ambos', async () => {
-    const { featureFlags } = await import('../../src/config/feature-flags.js');
-    const { FeatureFlagName } = await import('../../src/types/enums.js');
-    featureFlags.override(FeatureFlagName.MULTI_CHANNEL, true);
-
     const role = makeRole({
       display_name: 'Comercial',
       description: 'modo vendas consultivas',
@@ -191,10 +156,6 @@ describe('buildPrompt — injeção de "Modo operacional" (P6 Task 9)', () => {
   });
 
   it('4. Flag ON + role só com description (sem addendum) → seção PRESENTE com display_name + description', async () => {
-    const { featureFlags } = await import('../../src/config/feature-flags.js');
-    const { FeatureFlagName } = await import('../../src/types/enums.js');
-    featureFlags.override(FeatureFlagName.MULTI_CHANNEL, true);
-
     const role = makeRole({
       display_name: 'Onboarding',
       description: 'modo onboarding de novos clientes',
@@ -210,10 +171,6 @@ describe('buildPrompt — injeção de "Modo operacional" (P6 Task 9)', () => {
   });
 
   it('5. Flag ON + role sem description e sem prompt_addendum → seção AUSENTE', async () => {
-    const { featureFlags } = await import('../../src/config/feature-flags.js');
-    const { FeatureFlagName } = await import('../../src/types/enums.js');
-    featureFlags.override(FeatureFlagName.MULTI_CHANNEL, true);
-
     const role = makeRole({
       display_name: 'Default',
       description: null,
@@ -229,10 +186,6 @@ describe('buildPrompt — injeção de "Modo operacional" (P6 Task 9)', () => {
   });
 
   it('bonus: roleSection precede procedureSection no system prompt (spec §10.7)', async () => {
-    const { featureFlags } = await import('../../src/config/feature-flags.js');
-    const { FeatureFlagName } = await import('../../src/types/enums.js');
-    featureFlags.override(FeatureFlagName.MULTI_CHANNEL, true);
-
     // Mock a procedure execution active so procedureSection renders too.
     procedureExecutionsFindActiveForConversa.mockResolvedValue({
       id: 'exec-1',

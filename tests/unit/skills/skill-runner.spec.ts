@@ -129,21 +129,6 @@ describe('SkillRunner — 7-gate flow', () => {
     vi.mocked(promptOnlyMode).mockResolvedValue({ classification: 'ok' });
   });
 
-  it('Gate 1: returns flag_off when feature flag disabled', async () => {
-    vi.mocked(featureFlags.isEnabled).mockReturnValue(false);
-    const result = await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () =>
-        runSkill({
-          skill_descriptor: 'x',
-          input: {},
-          triggered_by: 'user_message',
-        }),
-    );
-    expect(result.ok).toBe(false);
-    expect(result.reason).toBe('flag_off');
-  });
-
   it('Gate 2: returns skill_not_found when skillsRepo returns null', async () => {
     vi.mocked(skillsRepo.findActive).mockResolvedValue(null);
     const result = await runWithTenantContext(

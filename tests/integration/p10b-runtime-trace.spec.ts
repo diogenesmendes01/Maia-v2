@@ -207,13 +207,4 @@ describe('P10b runtime trace — integration (6 scenarios)', () => {
     expect(_peekQueueSize()).toBe(0);
   });
 
-  it('6. flag OFF: no-op envelope, no DB writes', async () => {
-    isEnabledMock.mockReturnValue(false);
-    const env = await trace(baseInput());
-    expect(env.envelope_hmac).toBe('');
-    expect(dbInsertValuesMock).not.toHaveBeenCalled();
-    expect(dbTransactionMock).not.toHaveBeenCalled();
-    expect(dbExecuteMock).not.toHaveBeenCalled();
-    expect(_peekQueueSize()).toBe(0);
-  });
 });

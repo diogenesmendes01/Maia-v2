@@ -1,5 +1,4 @@
 import { config } from '@/config/env.js';
-import { featureFlags } from '@/config/feature-flags.js';
 import {
   selfStateRepo,
   factsRepo,
@@ -21,7 +20,7 @@ import { renderOperationalProfile, type RenderedProfile } from '@/identity/profi
 import { fmtBR } from '@/lib/brazilian.js';
 import type { LLMMessage } from '@/lib/claude.js';
 import { logger } from '@/lib/logger.js';
-import { FeatureFlagName, GapLevel } from '@/types/enums.js';
+import { GapLevel } from '@/types/enums.js';
 import { sanitizeBlock } from './sanitize.js';
 import { hashScope } from './scope-hash.js';
 import {
@@ -538,7 +537,6 @@ function renderContradictionOverlay({ fresh, stale }: ContradictionBuckets): str
  * a precedência da spec §10.7: CHANNEL POLICY (role) precede PROCEDURE.
  *
  * Gates:
- *   - Flag MULTI_CHANNEL OFF                        → null (seção ausente).
  *   - `role` null/undefined                         → null (sem role ativa).
  *   - role sem description E sem prompt_addendum    → null (nada a injetar).
  *
@@ -547,7 +545,6 @@ function renderContradictionOverlay({ fresh, stale }: ContradictionBuckets): str
  *   - description e prompt_addendum entram apenas se presentes (não vazios).
  */
 async function buildRoleSection(role: Role | null | undefined): Promise<string | null> {
-  if (!featureFlags.isEnabled(FeatureFlagName.MULTI_CHANNEL)) return null;
   if (!role) return null;
   if (!role.prompt_addendum && !role.description) return null;
   const parts: string[] = ['## Modo operacional'];
@@ -563,7 +560,6 @@ async function buildRoleSection(role: Role | null | undefined): Promise<string |
  * quando o usuário tocar nos temas.
  *
  * Regras:
- * - Flag `DIALOGICAL_ACQUISITION` desliga totalmente a seção.
  * - Gaps em nível `silent`/`dashboard` NUNCA entram aqui — silent é invisível
  *   por design (gate #7) e dashboard fica restrito ao painel do owner.
  * - Limita a 5 gaps para evitar token bloat; gaps `proposed` recebem sufixo
@@ -571,7 +567,6 @@ async function buildRoleSection(role: Role | null | undefined): Promise<string |
  * - Retorna null quando não há nada a injetar (chamador omite a seção).
  */
 async function buildGapMentionSection(): Promise<string | null> {
-  if (!featureFlags.isEnabled(FeatureFlagName.DIALOGICAL_ACQUISITION)) return null;
   const gaps =
     (await capabilityGapsRepo?.listByLevels?.([GapLevel.MENTIONABLE, GapLevel.PROPOSED])) ?? [];
   if (gaps.length === 0) return null;
@@ -584,40 +579,30 @@ async function buildGapMentionSection(): Promise<string | null> {
 }
 
 export async function buildPrompt(ctx: PromptContext): Promise<{ system: string; messages: LLMMessage[] }> {
-  // P4 Task 7: dual-read.
-  // - Flag OFF                              → comportamento legado (self_state).
-  // - Flag ON + profile com status==='active' → usa renderOperationalProfile.
-  // - Flag ON + profile inválido (proposed/frozen/rolled_back) → fallback
-  //   para self_state + log de warning (defesa em runtime: nunca expor
-  //   `proposed` mesmo se a invariant da DB falhar).
-  // - Flag ON + sem profile (null)          → fallback silencioso a self_state.
+  // P4: operational profile v2. An active profile renders via
+  // renderOperationalProfile; a missing or non-'active' profile falls back to
+  // self_state (runtime defense — never expose a `proposed`/`frozen` profile
+  // even if the DB invariant slips).
   let renderedV2: RenderedProfile | null;
   let selfVersionLabel: string;
   let systemPromptBody: string;
   let resumoAprendizadosBody: string;
 
-  if (featureFlags.isEnabled(FeatureFlagName.OPERATIONAL_PROFILE_V2)) {
-    const profile = await operationalProfileVersionsRepo.getActive();
-    if (profile && profile.status === 'active') {
-      renderedV2 = renderOperationalProfile({ version: profile });
-      systemPromptBody = renderedV2.system_prompt_block;
-      selfVersionLabel = `op_profile_v${profile.version}`;
-      resumoAprendizadosBody = '(perfil v2 ativo)';
-    } else {
-      if (profile) {
-        // Profile carregado mas status !== 'active' — defesa em runtime, NUNCA
-        // deve acontecer se a invariant da DB segurar. Log + fallback.
-        logger.warn(
-          { has_profile: true, status: profile.status },
-          'identity.profile_v2_invalid_fallback_to_legacy',
-        );
-      }
-      const self = await selfStateRepo.getActive();
-      systemPromptBody = self?.system_prompt ?? 'Você é a Maia.';
-      selfVersionLabel = `self_state_v${self?.versao ?? 0}`;
-      resumoAprendizadosBody = self?.resumo_aprendizados ?? '(vazio)';
-    }
+  const profile = await operationalProfileVersionsRepo.getActive();
+  if (profile && profile.status === 'active') {
+    renderedV2 = renderOperationalProfile({ version: profile });
+    systemPromptBody = renderedV2.system_prompt_block;
+    selfVersionLabel = `op_profile_v${profile.version}`;
+    resumoAprendizadosBody = '(perfil v2 ativo)';
   } else {
+    if (profile) {
+      // Profile loaded but status !== 'active' — runtime defense, should never
+      // happen if the DB invariant holds. Log + fall back to self_state.
+      logger.warn(
+        { has_profile: true, status: profile.status },
+        'identity.profile_v2_invalid_fallback_to_self_state',
+      );
+    }
     const self = await selfStateRepo.getActive();
     systemPromptBody = self?.system_prompt ?? 'Você é a Maia.';
     selfVersionLabel = `self_state_v${self?.versao ?? 0}`;

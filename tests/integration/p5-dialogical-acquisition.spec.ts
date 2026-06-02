@@ -50,7 +50,6 @@ import type {
   AgentCapabilityGap,
   CapabilityProposal,
   CapabilityTestResult,
-  GapEscalationRule,
   Tenant,
 } from '@/db/schema.js';
 
@@ -952,75 +951,4 @@ describe('P5 dialogical acquisition — end-to-end', () => {
     expect(queuedLog).toBeUndefined();
   });
 
-  // ---------- Cenário 6 ----------
-  it('cenário 6: flag OFF gates proposer (no Sonnet spend) mas engine determinístico ainda escala', async () => {
-    const { featureFlags } = await import('@/config/feature-flags.js');
-    featureFlags.override(FeatureFlagName.DIALOGICAL_ACQUISITION, false);
-
-    // Issue #346: a SECOND real (tenant, agent) — distinct from the suite-wide
-    // 'acme' / 'test-agent-1' — so this scenario also proves the per-#323
-    // fan-out enumerates whichever real tuple owns the open gap (not a single
-    // hard-coded pair, and never `'default'`).
-    const FLAG_OFF_TENANT_ID = 'globex';
-    const FLAG_OFF_AGENT_ID = 'test-agent-2';
-    const now = new Date();
-    const tenant: Tenant = {
-      id: FLAG_OFF_TENANT_ID,
-      nome: 'Globex',
-      status: 'active',
-      metadata: {},
-      created_at: now,
-      updated_at: now,
-    } as Tenant;
-    tenantsState.push(tenant);
-
-    // Pre-seed a mentionable gap that satisfies ALL proposed thresholds:
-    // freq=5 + sev=5 (combined=10 >= 8), contexto present (distinct=2 >= 2),
-    // no cooldown. Engine would promote silent path → proposed regardless of flag.
-    const gapId = 'gap-flag-off';
-    gapsState[gapId] = makeGap({
-      id: gapId,
-      tenant_id: FLAG_OFF_TENANT_ID,
-      agent_id: FLAG_OFF_AGENT_ID,
-      current_level: GapLevel.MENTIONABLE,
-      frequency_score: 5,
-      severity_score: 5,
-      contexto: 'contexto recorrente',
-    });
-
-    const { runGapEscalationMonitor } = await import(
-      '@/workers/gap-escalation-monitor.js'
-    );
-    await runGapEscalationMonitor();
-    await flushMicrotasks();
-
-    // Engine still promotes the gap (deterministic, doesn't depend on flag).
-    expect(gapsState[gapId]!.current_level).toBe(GapLevel.PROPOSED);
-
-    // Issue #346: the monitor opened context for the REAL (tenant, agent) that
-    // owns the gap and never for the `'default'` literal.
-    expect(monitorContextsSeen).toContainEqual({
-      tenant_id: FLAG_OFF_TENANT_ID,
-      agent_id: FLAG_OFF_AGENT_ID,
-    });
-    for (const ctx of monitorContextsSeen) {
-      expect(ctx.tenant_id).not.toBe('default');
-      expect(ctx.agent_id).not.toBe('default');
-    }
-
-    // BUT proposer short-circuits without calling Anthropic and without
-    // creating a capability_proposal.
-    expect(anthropicCreateMock).not.toHaveBeenCalled();
-    expect(capabilityProposalsCreate).not.toHaveBeenCalled();
-
-    // proposer_failed log emitted with reason llm_unavailable (from worker
-    // .then handler since proposer returns ok:false).
-    const failedLog = loggerWarn.mock.calls.find(
-      (c) => c[1] === 'gap_escalation.proposal_failed',
-    );
-    expect(failedLog).toBeDefined();
-    const failedMeta = failedLog![0] as Record<string, unknown>;
-    expect(failedMeta.gap_id).toBe(gapId);
-    expect(failedMeta.reason).toBe('llm_unavailable');
-  });
 });

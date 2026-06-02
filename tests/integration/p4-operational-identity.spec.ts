@@ -28,10 +28,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import { FeatureFlagName, DriftType, DriftSeverity, DriftDecision } from '@/types/enums.js';
-import type {
-  AgentOperationalProfileVersion,
-  SelfState,
-} from '@/db/schema.js';
+import type { AgentOperationalProfileVersion } from '@/db/schema.js';
 import type { DriftEvidence } from '@/cognition/drift/types.js';
 
 // ---------- in-memory state for seed scenarios ----------
@@ -430,35 +427,6 @@ describe('P4 operational identity — end-to-end', () => {
   });
 
   // ---------- Cenário 2 ----------
-  it('cenário 2: prompt-builder com flag OFF lê self_state legado e ignora profile v2', async () => {
-    const { featureFlags } = await import('@/config/feature-flags.js');
-    featureFlags.override(FeatureFlagName.OPERATIONAL_PROFILE_V2, false);
-
-    // Ambos disponíveis — mas o flag OFF deve ignorar o profile.
-    operationalProfileVersionsGetActive.mockResolvedValue(
-      buildVersion({
-        status: 'active',
-        core_immutable: {
-          identity_block: 'V2_PROFILE_BODY_SHOULD_NOT_APPEAR',
-          principles: ['princípio ignorado'],
-        },
-      }),
-    );
-
-    const { buildPrompt } = await import('@/agent/prompt-builder.js');
-    const { system } = await buildPrompt(ctx);
-
-    expect(system).toContain('LEGACY_SYSTEM_PROMPT_BODY');
-    expect(system).toContain('self_state_v7');
-    expect(system).toContain('LEGACY_RESUMO');
-    expect(system).not.toContain('V2_PROFILE_BODY_SHOULD_NOT_APPEAR');
-    expect(system).not.toContain('op_profile_v');
-    // Flag OFF: o repo do profile v2 não é tocado.
-    expect(operationalProfileVersionsGetActive).not.toHaveBeenCalled();
-    expect(selfStateGetActive).toHaveBeenCalledTimes(1);
-    expect(loggerWarn).not.toHaveBeenCalled();
-  });
-
   // ---------- Cenário 3 ----------
   it('cenário 3: prompt-builder com flag ON + active válido renderiza profile e NÃO usa self_state', async () => {
     const { featureFlags } = await import('@/config/feature-flags.js');
@@ -523,7 +491,7 @@ describe('P4 operational identity — end-to-end', () => {
     expect(loggerWarn).toHaveBeenCalledTimes(1);
     const [meta, msg] = loggerWarn.mock.calls[0]!;
     expect(meta).toEqual({ has_profile: true, status: 'proposed' });
-    expect(msg).toBe('identity.profile_v2_invalid_fallback_to_legacy');
+    expect(msg).toBe('identity.profile_v2_invalid_fallback_to_self_state');
     expect(selfStateGetActive).toHaveBeenCalledTimes(1);
   });
 
@@ -593,44 +561,4 @@ describe('P4 operational identity — end-to-end', () => {
     });
   });
 
-  // ---------- Cenário 6 ----------
-  it('cenário 6: killSwitch derruba profile v2 em runtime sem restart (<1min)', async () => {
-    const { featureFlags } = await import('@/config/feature-flags.js');
-
-    // Setup: flag ON com profile active válido.
-    featureFlags.override(FeatureFlagName.OPERATIONAL_PROFILE_V2, true);
-    operationalProfileVersionsGetActive.mockResolvedValue(
-      buildVersion({
-        status: 'active',
-        core_immutable: {
-          identity_block: 'V2_KILLSWITCH_TEST_BLOCK',
-          principles: ['princípio rollback'],
-        },
-        operational_profile: {
-          voice_descriptor: 'voz rollback test',
-        },
-      }),
-    );
-
-    const { buildPrompt } = await import('@/agent/prompt-builder.js');
-
-    // 1ª chamada: profile v2 é usado.
-    const { system: systemBefore } = await buildPrompt(ctx);
-    expect(systemBefore).toContain('V2_KILLSWITCH_TEST_BLOCK');
-    expect(systemBefore).toContain('op_profile_v');
-    expect(systemBefore).not.toContain('LEGACY_SYSTEM_PROMPT_BODY');
-
-    // killSwitch flip — NO restart.
-    featureFlags.killSwitch(FeatureFlagName.OPERATIONAL_PROFILE_V2);
-    expect(featureFlags.isEnabled(FeatureFlagName.OPERATIONAL_PROFILE_V2)).toBe(false);
-
-    // 2ª chamada: fallback para self_state legado.
-    const { system: systemAfter } = await buildPrompt(ctx);
-    expect(systemAfter).toContain('LEGACY_SYSTEM_PROMPT_BODY');
-    expect(systemAfter).toContain('self_state_v7');
-    expect(systemAfter).not.toContain('V2_KILLSWITCH_TEST_BLOCK');
-
-    // Cleanup: tira killSwitch (defesa em depth — afterEach também faz).
-    featureFlags.unkillSwitch(FeatureFlagName.OPERATIONAL_PROFILE_V2);
-  });
 });

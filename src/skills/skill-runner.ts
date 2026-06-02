@@ -25,8 +25,7 @@
 import { runCognitiveModule } from '@/cognition/runner.js';
 import { skillsRepo } from '@/db/repositories.js';
 import { policyDescriptorResolver } from '@/control-plane/policy/policy-descriptor-resolver.js';
-import { featureFlags } from '@/config/feature-flags.js';
-import { FeatureFlagName, SkillExecutionMode } from '@/types/enums.js';
+import { SkillExecutionMode } from '@/types/enums.js';
 import { promptOnlyMode } from './modes/prompt-only.js';
 import { procedureAdapterMode } from './modes/procedure-adapter.js';
 import { toolMediatedMode } from './modes/tool-mediated.js';
@@ -121,18 +120,7 @@ function assertAgentScope(args: {
 export async function runSkill(input: SkillExecutionInput): Promise<SkillExecutionOutput> {
   const startTime = Date.now();
 
-  // Gate 1: feature flag
-  if (!featureFlags.isEnabled(FeatureFlagName.SKILL_REGISTRY_V1)) {
-    return {
-      ok: false,
-      reason: 'flag_off',
-      latency_ms: Date.now() - startTime,
-      resolved_policies: [],
-      trace: EMPTY_TRACE,
-    };
-  }
-
-  // Gate 1.5: tenant + agent context required (review #99 finding 1).
+  // Gate 1: tenant + agent context required (review #99 finding 1).
   // runSkill cannot execute outside runWithTenantContext. We probe early
   // so we return a structured failure instead of letting findActive throw.
   const ctx = tryGetCurrentContext();

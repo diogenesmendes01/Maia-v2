@@ -671,35 +671,4 @@ describe('P6 channel/role/policy — end-to-end', () => {
     ).rejects.toThrow('decided_by_cannot_be_llm_classifier');
   });
 
-  // ---------- Cenário 7 ----------
-  it('cenário 7: flag OFF → prompt-builder NÃO injeta "## Modo operacional" (legacy preservado)', async () => {
-    const { featureFlags } = await import('@/config/feature-flags.js');
-    featureFlags.override(FeatureFlagName.MULTI_CHANNEL, false);
-
-    // activeRole COM description+addendum, MAS flag OFF → seção ausente.
-    const role = makeRole('alternative', 'role-alt', {
-      display_name: 'Alternative',
-      description: 'modo alternativo de operação',
-      prompt_addendum: 'use linguagem alternativa',
-    });
-
-    const pessoa = { id: 'p1', nome: 'Mendes', tipo: 'dono', apelido: null } as never;
-    const conversa = { id: 'c1' } as never;
-    const inbound = { id: 'm-1', conteudo: 'oi', direcao: 'in' } as never;
-
-    const { buildPrompt } = await import('@/agent/prompt-builder.js');
-    const { system } = await buildPrompt({
-      pessoa,
-      conversa,
-      scope: { entidades: [], byEntity: new Map() },
-      inbound,
-      activeRole: role,
-    } as never);
-
-    // Spec criterion #5: legacy preservado quando flag está OFF.
-    expect(system).not.toContain('## Modo operacional');
-    expect(system).not.toContain('Você está operando como **Alternative**');
-    // Sanity: prompt ainda foi montado (não quebrou).
-    expect(system).toContain('Sobre você');
-  });
 });

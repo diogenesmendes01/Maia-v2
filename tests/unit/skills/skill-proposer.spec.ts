@@ -84,14 +84,6 @@ describe('detectAndProposeSkill', () => {
     ]);
   });
 
-  it('returns zero counts when feature flag disabled', async () => {
-    vi.mocked(featureFlags.isEnabled).mockReturnValue(false);
-    const result = await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => detectAndProposeSkill({ window_days: 7 }),
-    );
-    expect(result).toEqual({ proposed: 0, skipped: 0, patterns_found: 0 });
-  });
 
   it('proposes skills for patterns above threshold and not already active', async () => {
     const result = await runWithTenantContext(
