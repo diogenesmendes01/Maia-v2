@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
-import { join, relative } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 
 const ROOT = process.cwd();
 
@@ -185,6 +185,60 @@ function getWorkflowStepBlocks(workflow: string): string[] {
   return blocks;
 }
 
+function isExternalLink(target: string): boolean {
+  return /^(\/\/|[a-z][a-z0-9+.-]*:)/i.test(target);
+}
+
+function getLocalMarkdownLinkTarget(target: string): string | null {
+  if (isExternalLink(target) || target.startsWith('#')) {
+    return null;
+  }
+
+  const [path] = target.split('#');
+
+  if (!path) {
+    return null;
+  }
+
+  return decodeURIComponent(path.replace(/^<|>$/g, ''));
+}
+
+function getMarkdownLinkTargets(markdown: string): string[] {
+  const targets: string[] = [];
+  const inlineLinkPattern = /!?\[[^\]]+\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g;
+  const referenceDefinitionPattern = /^[ \t]*\[[^\]]+\]:[ \t]*(\S+)/gm;
+
+  for (const match of markdown.matchAll(inlineLinkPattern)) {
+    targets.push(match[1]);
+  }
+
+  for (const match of markdown.matchAll(referenceDefinitionPattern)) {
+    targets.push(match[1]);
+  }
+
+  return targets;
+}
+
+function assertLocalMarkdownLinksExist(path: string): void {
+  const content = readText(path);
+
+  for (const linkTarget of getMarkdownLinkTargets(content)) {
+    const target = getLocalMarkdownLinkTarget(linkTarget);
+
+    if (!target) {
+      continue;
+    }
+
+    const absoluteTarget = target.startsWith('/')
+      ? join(ROOT, target.slice(1))
+      : join(ROOT, dirname(path), target);
+
+    if (!existsSync(absoluteTarget)) {
+      fail(`${path} links to missing local target: ${linkTarget}`);
+    }
+  }
+}
+
 function hasExpectedPrBodyGovernanceStep(workflow: string): boolean {
   return getWorkflowStepBlocks(workflow).some((block) => {
     const expected = REQUIRED_PR_BODY_GOVERNANCE_WIRING.ciStep;
@@ -268,6 +322,18 @@ function assertPrBodyGovernanceWiring(): void {
   }
 }
 
+function assertAiDocLinks(): void {
+  const docsToScan = [
+    'AGENTS.md',
+    ...walkMarkdownFiles('docs/ai'),
+    'docs/architecture/decisions/0001-ai-engineering-operating-model.md',
+  ];
+
+  for (const path of docsToScan) {
+    assertLocalMarkdownLinksExist(path);
+  }
+}
+
 function assertNoForbiddenReferences(): void {
   const docsToScan = [
     'AGENTS.md',
@@ -311,6 +377,7 @@ function main(): void {
   assertPrTemplate();
   assertIssueForm();
   assertPrBodyGovernanceWiring();
+  assertAiDocLinks();
   assertNoForbiddenReferences();
   assertSuperpowerSpecsAreFeatureSpecs();
 
