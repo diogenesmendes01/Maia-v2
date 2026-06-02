@@ -186,7 +186,7 @@ function getWorkflowStepBlocks(workflow: string): string[] {
 }
 
 function isExternalLink(target: string): boolean {
-  return /^(https?:|mailto:)/.test(target);
+  return /^(\/\/|[a-z][a-z0-9+.-]*:)/i.test(target);
 }
 
 function getLocalMarkdownLinkTarget(target: string): string | null {
@@ -200,15 +200,30 @@ function getLocalMarkdownLinkTarget(target: string): string | null {
     return null;
   }
 
-  return decodeURIComponent(path);
+  return decodeURIComponent(path.replace(/^<|>$/g, ''));
+}
+
+function getMarkdownLinkTargets(markdown: string): string[] {
+  const targets: string[] = [];
+  const inlineLinkPattern = /!?\[[^\]]+\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g;
+  const referenceDefinitionPattern = /^[ \t]*\[[^\]]+\]:[ \t]*(\S+)/gm;
+
+  for (const match of markdown.matchAll(inlineLinkPattern)) {
+    targets.push(match[1]);
+  }
+
+  for (const match of markdown.matchAll(referenceDefinitionPattern)) {
+    targets.push(match[1]);
+  }
+
+  return targets;
 }
 
 function assertLocalMarkdownLinksExist(path: string): void {
   const content = readText(path);
-  const markdownLinkPattern = /!?\[[^\]]+\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g;
 
-  for (const match of content.matchAll(markdownLinkPattern)) {
-    const target = getLocalMarkdownLinkTarget(match[1]);
+  for (const linkTarget of getMarkdownLinkTargets(content)) {
+    const target = getLocalMarkdownLinkTarget(linkTarget);
 
     if (!target) {
       continue;
@@ -219,7 +234,7 @@ function assertLocalMarkdownLinksExist(path: string): void {
       : join(ROOT, dirname(path), target);
 
     if (!existsSync(absoluteTarget)) {
-      fail(`${path} links to missing local target: ${match[1]}`);
+      fail(`${path} links to missing local target: ${linkTarget}`);
     }
   }
 }
