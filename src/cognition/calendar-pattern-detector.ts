@@ -10,8 +10,6 @@
  */
 import Anthropic from '@anthropic-ai/sdk';
 import { runCognitiveModule } from './runner.js';
-import { featureFlags } from '@/config/feature-flags.js';
-import { FeatureFlagName } from '@/types/enums.js';
 import {
   buildHolidayDescriptor,
   type HolidayProposalType,
@@ -41,10 +39,6 @@ const DETECTOR_TIMEOUT_MS = 15000;
 export async function detectHolidayPattern(
   input: CalendarDetectorInput,
 ): Promise<CalendarDetectorOutput | null> {
-  if (!featureFlags.isEnabled(FeatureFlagName.CALENDAR_V2)) {
-    return null;
-  }
-
   const result = await runCognitiveModule<CalendarDetectorOutput | null>(
     {
       name: 'calendar_pattern_detector',

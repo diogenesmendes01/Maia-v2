@@ -76,40 +76,45 @@ describe('buildToolCatalog — feature-gated tools listed as disabled (FIX 2)', 
     expect(entry!.feature_flag).toBe('FEATURE_PDF_REPORTS');
   });
 
-  it('includes scheduling tools (scheduling flag off) disabled w/ flag name', async () => {
+  it('includes scheduling tools (always-on) enabled and ungated', async () => {
     vi.resetModules();
     vi.doMock('../../src/config/env.js', configAllFlagsOff);
 
     const { REGISTRY, buildToolCatalog } = await import('../../src/tools/_registry.js');
-    expect(REGISTRY.schedule_reminder).toBeUndefined();
+    // SCHEDULING_V2 collapsed to always-on: the tools are unconditionally in
+    // the registry, no longer gated by the config flag.
+    expect(REGISTRY.schedule_reminder).toBeDefined();
 
     const catalog = buildToolCatalog();
     const names = ['schedule_reminder', 'cancel_reminder', 'start_recurring_outreach', 'start_recurring_payment'];
     for (const name of names) {
       const entry = catalog.find((e) => e.tool.name === name);
       expect(entry, `${name} missing from catalog`).toBeDefined();
-      expect(entry!.enabled, `${name} should be disabled`).toBe(false);
-      expect(entry!.feature_flag, `${name} flag name`).toBe('FEATURE_SCHEDULING_V2');
+      expect(entry!.enabled, `${name} should be enabled`).toBe(true);
+      expect(entry!.feature_flag, `${name} flag name`).toBeNull();
     }
   });
 
-  it('names FEATURE_KNOWLEDGE_STATE_MACHINE_V1 for a propose_* tool when off', async () => {
+  it('propose_* tools are always-enabled (KSM collapsed), catalog still names the flag', async () => {
     vi.resetModules();
     vi.doMock('../../src/config/env.js', configAllFlagsOff);
 
     const { buildToolCatalog } = await import('../../src/tools/_registry.js');
     const catalog = buildToolCatalog();
 
+    // KSM collapsed to always-on: propose_* are enabled regardless of config.
+    // The catalog still annotates the (now dead) gating flag NAME so the Admin
+    // UI artifact stays stable until the admin-ui teardown wave.
     const propose = catalog.find((e) => e.tool.name === 'propose_fact');
     expect(propose).toBeDefined();
-    expect(propose!.enabled).toBe(false);
+    expect(propose!.enabled).toBe(true);
     expect(propose!.feature_flag).toBe('KNOWLEDGE_STATE_MACHINE_V1');
 
     // The other propose_* tools behave identically.
     for (const name of ['propose_rule', 'propose_memory', 'propose_hint']) {
       const e = catalog.find((x) => x.tool.name === name);
       expect(e!.feature_flag).toBe('KNOWLEDGE_STATE_MACHINE_V1');
-      expect(e!.enabled).toBe(false);
+      expect(e!.enabled).toBe(true);
     }
   });
 

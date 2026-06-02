@@ -157,19 +157,12 @@ export const REGISTRY: Record<string, AnyTool> = {
   parse_receipt: parseReceiptTool as unknown as AnyTool,
   parse_image: parseImageTool as unknown as AnyTool,
   transcribe_audio: transcribeAudioTool as unknown as AnyTool,
-  // Spec 18 — Scheduling V2 tools. Gated by FEATURE_SCHEDULING_V2 so the
-  // LLM doesn't expose tools whose backing workers aren't running.
-  // Blockers 5 + 6: without this gate, schedule_reminder would create
-  // series rows that never fire (no worker), and start_recurring_* would
-  // accept commitments the engine can't honour.
-  ...(config.FEATURE_SCHEDULING_V2
-    ? {
-        schedule_reminder: scheduleReminderTool as unknown as AnyTool,
-        cancel_reminder: cancelReminderTool as unknown as AnyTool,
-        start_recurring_outreach: startRecurringOutreachTool as unknown as AnyTool,
-        start_recurring_payment: startRecurringPaymentTool as unknown as AnyTool,
-      }
-    : {}),
+  // Spec 18 — Scheduling V2 tools (always enabled; backing workers run
+  // unconditionally).
+  schedule_reminder: scheduleReminderTool as unknown as AnyTool,
+  cancel_reminder: cancelReminderTool as unknown as AnyTool,
+  start_recurring_outreach: startRecurringOutreachTool as unknown as AnyTool,
+  start_recurring_payment: startRecurringPaymentTool as unknown as AnyTool,
   send_proactive_message: sendProactiveMessageTool as unknown as AnyTool,
   compare_entities: compareEntitiesTool as unknown as AnyTool,
   recall_memory: recallMemoryTool as unknown as AnyTool,
@@ -231,26 +224,6 @@ const CONFIG_GATED_TOOLS: ReadonlyArray<{
   enabled: boolean;
 }> = [
   {
-    tool: scheduleReminderTool as unknown as AnyTool,
-    flag: 'FEATURE_SCHEDULING_V2',
-    enabled: config.FEATURE_SCHEDULING_V2,
-  },
-  {
-    tool: cancelReminderTool as unknown as AnyTool,
-    flag: 'FEATURE_SCHEDULING_V2',
-    enabled: config.FEATURE_SCHEDULING_V2,
-  },
-  {
-    tool: startRecurringOutreachTool as unknown as AnyTool,
-    flag: 'FEATURE_SCHEDULING_V2',
-    enabled: config.FEATURE_SCHEDULING_V2,
-  },
-  {
-    tool: startRecurringPaymentTool as unknown as AnyTool,
-    flag: 'FEATURE_SCHEDULING_V2',
-    enabled: config.FEATURE_SCHEDULING_V2,
-  },
-  {
     tool: generateReportTool as unknown as AnyTool,
     flag: 'FEATURE_PDF_REPORTS',
     enabled: config.FEATURE_PDF_REPORTS,
@@ -259,18 +232,12 @@ const CONFIG_GATED_TOOLS: ReadonlyArray<{
 
 /**
  * Runtime-flag check used by both the schema exposure path
- * (getToolSchemas) and the dispatcher (`dispatchTool`). When the flag is
- * off (or killed via kill switch), `propose_*` tools are reported as
- * disabled and the dispatcher will reject the call before the handler
- * runs. The check honours the live FeatureFlags singleton so kill
- * switches don't need a redeploy to take effect.
+ * (getToolSchemas) and the dispatcher (`dispatchTool`). Tools may still
+ * declare a `feature_flag` kill switch on their definition; when set, the
+ * live FeatureFlags singleton decides exposure/dispatch without a
+ * redeploy. Tools without a declared flag are always enabled.
  */
 export function isToolEnabled(name: string): boolean {
-  if (KSM_PROPOSE_TOOLS.has(name)) {
-    return featureFlags.isEnabled(FeatureFlagName.KNOWLEDGE_STATE_MACHINE_V1);
-  }
-  // Calendar v2 + outras tools opcionais — honra `feature_flag` declarado
-  // na definição do tool (kill switch em runtime sem redeploy).
   const tool = REGISTRY[name];
   if (tool?.feature_flag !== undefined) {
     return featureFlags.isEnabled(tool.feature_flag);

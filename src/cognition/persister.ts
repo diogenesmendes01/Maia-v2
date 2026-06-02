@@ -12,8 +12,6 @@ import { classifyMemory } from './memory-classifier.js';
 import { deriveBehavioralHint } from './behavioral-hint-deriver.js';
 import { validateBehavioralHint } from '@/workers/behavioral-hint-validator.js';
 import { initialFactConfidence, initialRuleConfidence } from './confidence.js';
-import { featureFlags } from '@/config/feature-flags.js';
-import { FeatureFlagName } from '@/types/enums.js';
 import { KnowledgeStateMachine } from '@/control-plane/knowledge-state-machine/index.js';
 import {
   getCurrentTenant,
@@ -58,29 +56,24 @@ export type PersistOrigin = 'llm' | 'worker' | 'user' | 'admin';
  * Novos paths P2 (memory_entry / behavioral_hint / capability_gaps) são
  * aditivos e try/catch wrapped — falha neles NUNCA derruba o path legado.
  *
- * Codex round-2 finding 1: when the KSM feature flag is enabled and
- * `origin` is `'llm'` or `'worker'`, fato/regra writes are routed
- * through `KnowledgeStateMachine.propose()` so they're risk-scored and
- * land in `pending_review`/`ephemeral` instead of bypassing review with
- * the DB's `lifecycle_status='active'` default. `origin` defaults to
- * `'llm'` because every existing caller is a reflection path.
+ * Codex round-2 finding 1: when `origin` is `'llm'` or `'worker'`,
+ * fato/regra writes are routed through `KnowledgeStateMachine.propose()`
+ * so they're risk-scored and land in `pending_review`/`ephemeral`
+ * instead of bypassing review with the DB's `lifecycle_status='active'`
+ * default. `origin` defaults to `'llm'` because every existing caller is
+ * a reflection path.
  */
 export async function persistCandidate(
   candidate: ClassifiedCandidate,
   event: CognitiveEvent,
   origin: PersistOrigin = 'llm',
 ): Promise<{ persisted_to: string; id?: string }> {
-  const ksmEnabled = featureFlags.isEnabled(
-    FeatureFlagName.KNOWLEDGE_STATE_MACHINE_V1,
-  );
-
   // Codex round-2 finding 1: LLM/worker writes that reach legacy repos
   // (which insert with `lifecycle_status='active'` by DB default) are
-  // exactly the silent-corruption path the review flagged. When the
-  // flag is enabled, route fact/rule proposals through the state
-  // machine so risk scoring + pending_review apply.
+  // exactly the silent-corruption path the review flagged. Route
+  // fact/rule proposals through the state machine so risk scoring +
+  // pending_review apply.
   if (
-    ksmEnabled &&
     (origin === 'llm' || origin === 'worker') &&
     (candidate.type === 'fato' || candidate.type === 'regra')
   ) {

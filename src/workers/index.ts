@@ -110,9 +110,7 @@ export const JOBS: Job[] = [
   { name: 'gap_escalation_monitor', cron: '*/30 * * * *', fn: runGapEscalationMonitor, phase: 5 },
   // P10a — knowledge state auto-promoter (hourly; matures ephemeral→observed→
   // reinforced→verified→active by evidence_count + age, and expires stale
-  // rows to deprecated). Worker is gated by FEATURE_KNOWLEDGE_STATE_MACHINE_V1
-  // — when off it early-returns immediately, so leaving the cron entry on is
-  // safe.
+  // rows to deprecated).
   { name: 'knowledge_state_promoter', cron: '0 * * * *', fn: runKnowledgeStatePromoter, phase: 2 },
   // P10b — runtime trace: 3 workers (body writer, body recoverer, matview refresh).
   // Registered at phase 1 so they are included in the production startup call

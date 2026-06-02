@@ -10,41 +10,16 @@
  * `lifecycle_status DEFAULT 'active'`, so LLM-derived rows were born
  * active and surfaced to the prompt without any risk-score review.
  *
- * This file pins the fixed behaviour: when KSM flag is on and
- * origin is 'llm' or 'worker', the persister routes through
- * KnowledgeStateMachine.propose() — never through factsRepo.upsert
- * with the default-active lifecycle.
+ * This file pins the fixed behaviour: for origin 'llm' or 'worker', the
+ * persister routes fact/rule writes through KnowledgeStateMachine.propose()
+ * — never through factsRepo.upsert with the default-active lifecycle.
+ * (KSM is always-on; the former feature-flag gate was removed.)
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { FeatureFlagName } from '@/types/enums.js';
 
-const flagState = { ksmEnabled: true };
 type Captured = { lifecycle_status: string };
 const ksmStore = new Map<string, Captured>();
-
-vi.mock('@/config/feature-flags.js', async () => {
-  const actual = await vi.importActual<
-    typeof import('@/config/feature-flags.js')
-  >('@/config/feature-flags.js');
-  return {
-    ...actual,
-    FEATURE_KNOWLEDGE_STATE_MACHINE_V1: true,
-    featureFlags: {
-      ...actual.featureFlags,
-      isEnabled: (
-        name: typeof FeatureFlagName[keyof typeof FeatureFlagName],
-      ) =>
-        name === FeatureFlagName.KNOWLEDGE_STATE_MACHINE_V1
-          ? flagState.ksmEnabled
-          : true,
-      override: () => undefined,
-      killSwitch: () => undefined,
-      unkillSwitch: () => undefined,
-      reset: () => undefined,
-    },
-  };
-});
 
 vi.mock('@/control-plane/knowledge-state-machine/repos.js', () => {
   class KnowledgeConflictError extends Error {}
@@ -81,8 +56,8 @@ vi.mock('@/db/tenant-context.js', () => ({
   MissingTenantContextError: class extends Error {},
 }));
 
-// Legacy repos stubbed so the OFF-flag branch returns cleanly. The
-// ON-flag tests assert that we DIDN'T touch factsRepo.upsert at all.
+// Legacy repos stubbed so the non-KSM candidate branches return cleanly.
+// The fact/rule tests assert that we DIDN'T touch factsRepo.upsert at all.
 const factsUpsert = vi.fn().mockResolvedValue({ id: 'legacy-fact-id' });
 const rulesCreate = vi.fn().mockResolvedValue({ id: 'legacy-rule-id' });
 vi.mock('@/db/repositories.js', async () => {
@@ -117,7 +92,6 @@ vi.mock('@/lib/logger.js', () => ({
 }));
 
 beforeEach(() => {
-  flagState.ksmEnabled = true;
   ksmStore.clear();
   factsUpsert.mockClear();
   rulesCreate.mockClear();
@@ -220,33 +194,5 @@ describe('Finding 1 — persistCandidate routes LLM/worker through KSM when flag
     const row = ksmStore.get(result.id!)!;
     expect(row.lifecycle_status).not.toBe('active');
     expect(factsUpsert).not.toHaveBeenCalled();
-  });
-
-  it('KSM flag off → legacy factsRepo.upsert path is used', async () => {
-    flagState.ksmEnabled = false;
-    const { persistCandidate } = await import('@/cognition/persister.js');
-    const { CandidateType, CognitiveEventType } = await import(
-      '@/types/enums.js'
-    );
-
-    const result = await persistCandidate(
-      {
-        type: CandidateType.FATO,
-        content: 'legacy fact',
-        scope: 'agent',
-      },
-      {
-        type: CognitiveEventType.USER_CORRECTION,
-        conversa_id: 'conv-1',
-        inbound_mensagem_id: 'msg-1',
-        previous_assistant_mensagem_id: 'msg-0',
-        correction_text: 'não',
-        previous_response_text: 'foo',
-      },
-      'llm',
-    );
-
-    expect(result.persisted_to).not.toMatch(/^ksm:/);
-    expect(factsUpsert).toHaveBeenCalled();
   });
 });

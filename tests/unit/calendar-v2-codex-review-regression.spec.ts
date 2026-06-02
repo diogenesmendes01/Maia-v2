@@ -5,16 +5,14 @@
  *    and entidades without manage_calendar permission.
  * 2. [high] approve_capability_proposal materializes BEFORE transitioning,
  *    so a failed dispatch leaves the proposal retryable in 'submitted'.
- * 3. [medium] Runtime kill-switch on FEATURE_CALENDAR_V2 blocks dispatch
- *    of register_custom_holiday / approve_capability_proposal even after
- *    the registry has been loaded with the flag on.
- * 4. [medium] start_recurring_payment + start_recurring_outreach honour
+ * 3. [medium] start_recurring_payment + start_recurring_outreach honour
  *    business-day RRULE extensions (BYNTHWORKDAY / BYWORKDAY=true) end
  *    to end — parser + computeNext go through the extended engine.
+ *
+ * (The former CALENDAR_V2 runtime kill-switch checks were removed when the
+ * flag was collapsed to always-on.)
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { featureFlags } from '@/config/feature-flags.js';
-import { FeatureFlagName } from '@/types/enums.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 
 // --- Hoisted mock fns ------------------------------------------------------
@@ -120,7 +118,6 @@ beforeEach(() => {
   proposalsTransition.mockReset();
   createWithFirstOccurrence.mockReset();
   auditMock.mockReset();
-  featureFlags.override(FeatureFlagName.CALENDAR_V2, true);
 
   // Default: holiday create succeeds, no prior holiday by proposal.
   holidaysCreate.mockResolvedValue({ id: 42 });
@@ -139,7 +136,6 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  featureFlags.reset();
   vi.clearAllMocks();
 });
 
@@ -477,69 +473,6 @@ describe('approve_capability_proposal — atomic materialization (Codex #105 hig
       expect(out.holiday_id).toBeNull();
     });
     expect(proposalsTransition).toHaveBeenCalledTimes(1);
-  });
-});
-
-// --- Codex finding #3: runtime kill-switch ---------------------------------
-
-describe('Tool dispatch respects runtime feature flag (Codex #105 medium)', () => {
-  it('register_custom_holiday: kill switch on CALENDAR_V2 blocks dispatch even after registry load', async () => {
-    const { dispatchTool } = await import('@/tools/_dispatcher.js');
-    // Flag was ON in registry load, but kill at dispatch time.
-    featureFlags.killSwitch(FeatureFlagName.CALENDAR_V2);
-    let result: { error: string; details?: unknown } | unknown;
-    await runWithTenantContext(TENANT_CTX, async () => {
-      result = await dispatchTool({
-        tool: 'register_custom_holiday',
-        args: {
-          name: 'X',
-          month: 1,
-          day: 1,
-          type: 'entity_custom',
-          entidade_ids: [E_IN],
-        },
-        ctx: makeCtx([E_IN]),
-      });
-    });
-    const r = result as { error: string; details: { tool: string; feature_flag: string } };
-    expect(r.error).toBe('feature_disabled');
-    expect(r.details.tool).toBe('register_custom_holiday');
-    expect(r.details.feature_flag).toBe('calendar_v2');
-    expect(holidaysCreate).not.toHaveBeenCalled();
-  });
-
-  it('approve_capability_proposal: kill switch blocks dispatch', async () => {
-    const { dispatchTool } = await import('@/tools/_dispatcher.js');
-    featureFlags.killSwitch(FeatureFlagName.CALENDAR_V2);
-    let result: unknown;
-    await runWithTenantContext(TENANT_CTX, async () => {
-      result = await dispatchTool({
-        tool: 'approve_capability_proposal',
-        args: { proposal_id: '11111111-1111-1111-1111-111111111111' },
-        ctx: makeCtx([E_IN]),
-      });
-    });
-    const r = result as { error: string };
-    expect(r.error).toBe('feature_disabled');
-    expect(proposalsTransition).not.toHaveBeenCalled();
-  });
-
-  it('schema exposed to LLM: kill switch hides calendar_v2 write tools', async () => {
-    const { getToolSchemas } = await import('@/tools/_registry.js');
-    const ctxScope = makeCtx([E_IN], ['*']);
-    // Flag ON → tool exposed.
-    const onSchemas = getToolSchemas(ctxScope.scope.byEntity as never);
-    const onNames = onSchemas.map((s) => s.name);
-    expect(onNames).toContain('register_custom_holiday');
-    expect(onNames).toContain('approve_capability_proposal');
-    // Kill switch → tool hidden.
-    featureFlags.killSwitch(FeatureFlagName.CALENDAR_V2);
-    const offSchemas = getToolSchemas(ctxScope.scope.byEntity as never);
-    const offNames = offSchemas.map((s) => s.name);
-    expect(offNames).not.toContain('register_custom_holiday');
-    expect(offNames).not.toContain('approve_capability_proposal');
-    // Read-only calendar_* tools (no feature_flag) should remain visible.
-    expect(offNames).toContain('calendar_is_business_day');
   });
 });
 

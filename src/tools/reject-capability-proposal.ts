@@ -14,7 +14,6 @@ import { z } from 'zod';
 import type { Tool } from './_registry.js';
 import { capabilityProposalsRepo } from '@/db/repositories.js';
 import { canAct } from '@/governance/permissions.js';
-import { FeatureFlagName } from '@/types/enums.js';
 import type { HolidayDescriptorPayload } from '@/cognition/holiday-descriptor.js';
 
 const inputSchema = z.object({
@@ -37,7 +36,6 @@ export const rejectCapabilityProposalTool: Tool<typeof inputSchema, typeof outpu
   redis_required: false,
   operation_type: 'update_meta',
   audit_action: 'capability_proposal_rejected',
-  feature_flag: FeatureFlagName.CALENDAR_V2,
   handler: async (args, ctx) => {
     const proposal = await capabilityProposalsRepo.getById(args.proposal_id);
     if (!proposal) throw new Error(`proposal not found: ${args.proposal_id}`);

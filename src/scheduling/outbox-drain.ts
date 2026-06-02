@@ -52,10 +52,6 @@ export async function runOutboxDrain(): Promise<{
   failed: number;
   rate_limited: number;
 }> {
-  if (!config.FEATURE_SCHEDULING_V2) {
-    return { reclaimed: 0, drained: 0, sent: 0, failed: 0, rate_limited: 0 };
-  }
-
   // Reclaim leases from crashed workers — these go back to `pending` so
   // the regular `claimDue` below picks them up in this same tick.
   // Blocker 2: the previous version returned reclaimed rows but never
