@@ -3864,13 +3864,14 @@ export const entityStatesRepo = {
   //   - `agent/prompt-builder.ts` (entityStateBlocks): tenant-scoped. SAFE.
   //   - `governance/lockdown.ts` (activate/liftLockdown): legacy emergency
   //     governance with NO live entrypoint (no tRPC/CLI/worker wiring; only doc
-  //     references). It runs UNSCOPED raw `db` queries throughout and iterates
-  //     ALL `entity_states` globally, i.e. it predates tenant context and does
-  //     NOT establish one. Per the H4 contract we do NOT change callers; this is
-  //     REPORTED. If that dead path is ever wired up it will now throw
-  //     `MissingTenantContextError` here — which is the CORRECT fail-loud
-  //     outcome, since a cross-tenant entity_states write is exactly the bug H4
-  //     closes.
+  //     references). It ORIGINALLY ran UNSCOPED raw `db` queries over ALL
+  //     `entity_states` (a latent cross-tenant sweep). Rescoped per-tenant in
+  //     #355: it now binds `tenant_id`/`agent_id` from ALS and scopes every
+  //     query/mutation to the running tuple, failing loud (rejecting the
+  //     `'default'` literal under the flag) instead of sweeping all tenants. So
+  //     the dead path is now both flip-safe and correct if ever wired up — a
+  //     cross-tenant `entity_states` write (the bug H4 closes) is no longer
+  //     reachable from it.
   async byId(entidade_id: string): Promise<EntityState | null> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();

@@ -10,7 +10,9 @@
  * tick once per tuple under `runWithTenantContext`, fail-isolated (one tenant's
  * error never aborts the loop). Mirrors the reflection-batch (#240/#251) /
  * outbound-messages-sweeper (#292) idiom. NO `'default'` sentinel — a tuple
- * appears only if it genuinely has work.
+ * appears only if it genuinely has work. Unlike reflection-batch, this
+ * dispatcher takes no advisory lock and needs none: the repos' `FOR UPDATE
+ * SKIP LOCKED` claim CTEs already stop two instances from double-claiming.
  *
  * Gated by FEATURE_SCHEDULING_V2 (default OFF): when off we skip the enumeration
  * entirely (and `runSchedulingTick` also early-returns), so the worker is a

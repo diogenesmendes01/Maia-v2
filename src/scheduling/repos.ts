@@ -649,9 +649,11 @@ export const occurrencesRepo = {
 
   /**
    * Reclaim leases that expired without completing — another worker crashed
-   * mid-advance. Resets the row to `pending` so the next `claimDue` pass
-   * picks it up normally (and also stamps it claimed_by=<new worker> so
-   * subsequent reaper passes within the same tick don't double-handle).
+   * mid-advance. Resets the row to `pending` and clears `claimed_by`/`claimed_at`
+   * so the next `claimDue` pass picks it up normally; the `FOR UPDATE SKIP LOCKED`
+   * + status flip already prevents double-handling within a tick. (`_worker_id`
+   * is accepted for call-site symmetry with `claimDue` but unused — reclaim
+   * releases the lease rather than reassigning it.)
    *
    * Returns the IDs so the caller can audit the recovery, but the caller
    * should NOT process them directly — they're back in the pending queue.

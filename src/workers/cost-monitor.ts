@@ -2,7 +2,7 @@ import { config } from '@/config/env.js';
 import { readDailyLLMUsd } from '@/lib/cost-ledger.js';
 import { sendAlert } from '@/lib/alerts.js';
 import { logger } from '@/lib/logger.js';
-import { runWithSystemContext } from '@/db/tenant-context.js';
+import { runWithTenantContext } from '@/db/tenant-context.js';
 
 /**
  * Daily LLM cost guard. Reads yesterday's accumulated cost (records are keyed
@@ -11,27 +11,19 @@ import { runWithSystemContext } from '@/db/tenant-context.js';
  * subject is unique per day.
  */
 export async function runCostMonitor(): Promise<void> {
-  // Flip-readiness (#345 / #323): re-homed off the legacy `default/default`
-  // literal to the reserved `system` sentinel (`runWithSystemContext`), mirroring
-  // the sibling global maintenance workers (health-monitor / idempotency-cleanup
-  // / dlq-monitor). The daily LLM cost guard is a GLOBAL maintenance sweep with
-  // no owning tenant, and parking it on the raw `'default'` literal would make it
-  // throw `DefaultLiteralRejectedError` (via `factsRepo.getByKey` →
-  // `getCurrentTenant()`) once `MAIA_REJECT_DEFAULT_LITERAL` flips on. `system`
-  // is explicitly NOT rejected by `assertNotDefaultLiteral`, so the worker stays
-  // up after the flip.
-  //
-  // KNOWN DATA-PLANE CAVEAT (tracked deferral — see commit body): the cost ledger
-  // is read tenant-scoped — `readDailyLLMUsd` → `factsRepo.getByKey('global', …)`
-  // filters `agent_facts` by the ALS `tenant_id`/`agent_id`, and the matching
-  // aggregate row is WRITTEN by `recordLLMCost` (src/lib/claude.ts) under whatever
-  // context the agent turn runs in, which today (FEATURE_MULTI_CHANNEL=off) is
-  // `default/default`. Reading under `system` therefore looks up a
-  // `(system, system, 'global', …)` row that no writer produces today → $0 until
-  // the WRITER side (cost-ledger / claude.ts, OUT OF SCOPE here) is re-homed to
-  // `system` or fanned out per-tenant. This is the safe-to-flip step (no throw,
-  // no crash); restoring the non-zero reading is a follow-up on the writer path.
-  await runWithSystemContext(async () => {
+  // NOT migrated to `system` in issue #323 phase 2 (intentionally held): unlike
+  // the other "global" maintenance workers, this one is tenant-SCOPED via the
+  // data plane. `readDailyLLMUsd` → `factsRepo.getByKey('global', …)` filters
+  // `agent_facts` by `getCurrentTenant()`/`getCurrentAgent()`, and the matching
+  // ledger row is WRITTEN by `recordLLMCost` during agent turns — which today
+  // (FEATURE_MULTI_CHANNEL=off) run under `default/default`. Swapping the reader
+  // to `system/system` would read a non-existent `(system, system, global, …)`
+  // row → silently $0 every day → the threshold alert never fires. This is a
+  // data-plane change, NOT data-plane neutral, so it does not belong in the
+  // pure-swap phase. It must be fanned out / re-homed in a later phase together
+  // with the per-tenant cost ledger (mirrors the plan's "revisit if cost
+  // becomes per-tenant" caveat). Left on the legacy literal until then.
+  await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
     const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
     const usd = await readDailyLLMUsd(yesterday);
     const threshold = config.DAILY_LLM_USD_THRESHOLD;

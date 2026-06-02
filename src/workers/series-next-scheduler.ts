@@ -6,7 +6,9 @@
  * This worker enumerates the DISTINCT `(tenant_id, agent_id)` tuples that own
  * an active rrule-driven series and runs the backfill once per tuple under
  * `runWithTenantContext`, fail-isolated. Mirrors reflection-batch (#240/#251).
- * NO `'default'` sentinel.
+ * NO `'default'` sentinel. Takes no advisory lock (unlike reflection-batch):
+ * concurrency safety lives in the scheduling repos (claim CTEs / occurrence
+ * dedup), not in this dispatcher.
  *
  * Gated by FEATURE_SCHEDULING_V2 (default OFF): skipped entirely when off.
  */

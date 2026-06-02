@@ -31,6 +31,15 @@ SQL is the expensive thing you write _after_ your prefix is reserved. The
 append-only single-file shape is what makes concurrent reservations of the
 same prefix collide deterministically.
 
+> **Conflict scope.** Because every entry appends to the same tail, *any* two
+> concurrent migration PRs will conflict on `RESERVATIONS.md` — even when their
+> prefixes differ (`074` vs `075`). That is intended friction, not a bug: when
+> the prefixes do **not** collide, resolve by simply keeping both lines (only
+> renumber if two PRs actually picked the **same** prefix). The
+> `check-migration-reservations.ts` guard is the authoritative duplicate-prefix
+> backstop — it fails CI if a real collision ever slips through a mis-resolved
+> merge.
+
 The `scripts/check-migration-reservations.ts` guard (run by
 `tests/unit/scripts/migration-reservations.spec.ts` and, on `pull_request`,
 by `.github/workflows/migration-prefix-guard.yml`) additionally verifies

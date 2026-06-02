@@ -17,7 +17,9 @@ import { runWithTenantContext } from '@/db/tenant-context.js';
  * `(tenant_id, agent_id)` tuples with sendable/reclaimable outbox rows and runs
  * the pass-loop once per tuple under `runWithTenantContext`, fail-isolated
  * (one tenant's error doesn't abort the others). Mirrors reflection-batch
- * (#240/#251). NO `'default'` sentinel.
+ * (#240/#251). NO `'default'` sentinel. Takes no advisory lock (unlike
+ * reflection-batch): the outbox `claimDue` `FOR UPDATE SKIP LOCKED` CTE already
+ * prevents two instances from claiming the same message.
  *
  * Per-tenant loop semantics (unchanged from the original single-context loop):
  *   - Run `runOutboxDrain()` once.
