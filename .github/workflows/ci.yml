@@ -16,6 +16,16 @@ jobs:
     name: typecheck + test + lint + build
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
       # Hermetic placeholders — tests/setup.ts overrides these too, but
       # config validation runs at module load before vitest's setup file.
@@ -79,10 +89,9 @@ jobs:
         run: npm run build && test -f dist/index.js
 
       - name: Run unit tests
-        # Integration tests skip when TEST_DB_URL is unset — the unit lane is
-        # always green without infrastructure. Full integration coverage runs in
-        # the dedicated `integration` job below with postgres + redis service
-        # containers.
+        # Integration tests skip when TEST_DB_URL is unset. Redis is still
+        # present because several unit-regression paths load runtime modules
+        # that initialize Redis-backed queues/caches from REDIS_URL.
         run: npx vitest run
 
       - name: Lint
