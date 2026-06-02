@@ -14,6 +14,7 @@
 
 import { sql, eq, and, inArray, desc } from 'drizzle-orm';
 import { db, withTx } from '@/db/client.js';
+import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import {
   series as seriesTable,
   occurrences as occurrencesTable,
@@ -36,6 +37,69 @@ import type {
 
 type Tx = typeof db;
 
+/**
+ * Issue #355 — tenant scoping for the Spec-18 scheduling tables.
+ *
+ * Migrations 071/072/073 added `tenant_id`/`agent_id` (both `TEXT NOT NULL
+ * DEFAULT 'default'`, FK to tenants/agents) to series / occurrences / tasks /
+ * outbox_messages and re-led the hot partial indexes with (tenant_id, agent_id).
+ * The columns existed but NO query read them. This module now scopes every
+ * read/write to the ALS tenant context, mirroring the house pattern in
+ * `src/db/repositories.ts` (`getCurrentTenant`/`getCurrentAgent` +
+ * `applyTenantGuard`-style injection).
+ *
+ * Contract: EVERY repo method here resolves `(tenant_id, agent_id)` from the
+ * active ALS context. Callers MUST run inside `runWithTenantContext`:
+ *   - tool handlers (start-recurring-*, schedule-reminder, cancel-reminder) and
+ *     the agent-core / pending-resolver paths already run inside a request
+ *     context, so they inherit the caller's tenant/agent;
+ *   - the scheduling workers (scheduling_tick / outbox_drain /
+ *     series_next_scheduler) enumerate real `(tenant_id, agent_id)` tuples from
+ *     the work tables and open `runWithTenantContext` per tuple (the
+ *     reflection-batch / outbound-messages-sweeper idiom). See the
+ *     `enumerate*Tenants` helpers below.
+ *
+ * Reads filter by tenant+agent; INSERTs stamp them from context; UPDATE/DELETE
+ * include them in the WHERE. Where a 0-row mutation outcome would be a real bug
+ * (status transitions, claims, sends) we FAIL LOUD, mirroring the H1–H5
+ * mutation-hardening style already merged for the other repos.
+ */
+
+/**
+ * Raw-SQL tenant/agent predicate fragment for the `FOR UPDATE SKIP LOCKED`
+ * claim/reclaim CTEs (which can't use the Drizzle query builder). Inlined into
+ * the CTE's WHERE so the claim only ever locks rows for the routed
+ * `(tenant_id, agent_id)`.
+ */
+function tenantFilter(tenant_id: string, agent_id: string) {
+  return sql`tenant_id = ${tenant_id} AND agent_id = ${agent_id}`;
+}
+
+/**
+ * Fail-loud guard for tenant-scoped mutations whose 0-row outcome is a real
+ * bug (the row exists — the caller just read it under the SAME context — so a
+ * miss means the WHERE tenant/agent predicate failed to match, i.e. a
+ * cross-tenant routing error or a lost ALS context). Mirrors the merged H1–H5
+ * mutation-hardening assertions on the other repos
+ * (cf. `procedureExecutionsRepo.updateStateTx` in `src/db/repositories.ts`):
+ * the `.returning({ id }).length` idiom is the PORTABLE row count (node-postgres
+ * `rowCount` is typed `number | null`). NOT used for genuinely conditional
+ * mutations (cancel races, lease reclaim, ON CONFLICT, status-gated releases)
+ * where 0 rows is an expected, benign outcome.
+ */
+function assertMutated(
+  matched: number,
+  op: string,
+  ctx: { id: string; tenant_id: string; agent_id: string },
+): void {
+  if (matched === 0) {
+    throw new Error(
+      `scheduling.${op} matched 0 rows for id=${ctx.id} under tenant=${ctx.tenant_id} agent=${ctx.agent_id} — ` +
+        `row missing or cross-tenant (tenant/agent predicate did not match the row the caller just read)`,
+    );
+  }
+}
+
 export type CreateSeriesInput = Omit<SeriesInsert, 'id' | 'created_at' | 'updated_at' | 'version'> & {
   initial_occurrence: {
     scheduled_for: Date;
@@ -47,7 +111,19 @@ export type CreateSeriesInput = Omit<SeriesInsert, 'id' | 'created_at' | 'update
 
 export const seriesRepo = {
   async findById(id: string): Promise<Series | null> {
-    const rows = await db.select().from(seriesTable).where(eq(seriesTable.id, id)).limit(1);
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(seriesTable)
+      .where(
+        and(
+          eq(seriesTable.id, id),
+          eq(seriesTable.tenant_id, tenant_id),
+          eq(seriesTable.agent_id, agent_id),
+        ),
+      )
+      .limit(1);
     return rows[0] ?? null;
   },
 
@@ -62,10 +138,18 @@ export const seriesRepo = {
     occurrence: Occurrence;
     tasks: Task[];
   }> {
+    // Stamp tenant/agent from the active ALS context on EVERY row in the
+    // series → occurrence → tasks chain so the whole tree is owned by the
+    // caller's tenant. (Throws MissingTenantContextError outside ALS, before
+    // any write — same fail-closed contract as `applyTenantGuard`.)
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     return withTx(async (tx) => {
       const seriesRows = await tx
         .insert(seriesTable)
         .values({
+          tenant_id,
+          agent_id,
           tipo: input.tipo,
           status: input.status ?? 'active',
           rrule: input.rrule ?? null,
@@ -84,6 +168,8 @@ export const seriesRepo = {
       const occRows = await tx
         .insert(occurrencesTable)
         .values({
+          tenant_id,
+          agent_id,
           series_id: s.id,
           scheduled_for: input.initial_occurrence.scheduled_for,
           status: 'pending',
@@ -97,6 +183,8 @@ export const seriesRepo = {
         .insert(tasksTable)
         .values(
           input.initial_occurrence.tasks.map((t) => ({
+            tenant_id,
+            agent_id,
             occurrence_id: occ.id,
             ordem: t.ordem,
             kind: t.kind,
@@ -118,6 +206,14 @@ export const seriesRepo = {
     series_id: string,
     actor_pessoa_id: string,
   ): Promise<{ series: Series | null; cancelled_occurrence_ids: string[] }> {
+    // Scope BOTH the cancel UPDATE and the not-found probe to the caller's
+    // tenant/agent: a series owned by another tenant must be invisible here
+    // (the UPDATE matches 0 rows AND the probe returns null → `not_found`),
+    // never silently cancellable cross-tenant. The 0-row UPDATE outcome is a
+    // legitimate race (already cancelled) so it is NOT fail-loud — we
+    // distinguish not-found from already-cancelled via the scoped probe.
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     return withTx(async (tx) => {
       const updated = await tx
         .update(seriesTable)
@@ -127,13 +223,26 @@ export const seriesRepo = {
           version: sql`${seriesTable.version} + 1`,
           updated_at: new Date(),
         })
-        .where(and(eq(seriesTable.id, series_id), eq(seriesTable.status, 'active')))
+        .where(
+          and(
+            eq(seriesTable.id, series_id),
+            eq(seriesTable.tenant_id, tenant_id),
+            eq(seriesTable.agent_id, agent_id),
+            eq(seriesTable.status, 'active'),
+          ),
+        )
         .returning();
       if (updated.length === 0) {
         const existing = await tx
           .select()
           .from(seriesTable)
-          .where(eq(seriesTable.id, series_id))
+          .where(
+            and(
+              eq(seriesTable.id, series_id),
+              eq(seriesTable.tenant_id, tenant_id),
+              eq(seriesTable.agent_id, agent_id),
+            ),
+          )
           .limit(1);
         return { series: existing[0] ?? null, cancelled_occurrence_ids: [] };
       }
@@ -144,6 +253,8 @@ export const seriesRepo = {
         .where(
           and(
             eq(occurrencesTable.series_id, series_id),
+            eq(occurrencesTable.tenant_id, tenant_id),
+            eq(occurrencesTable.agent_id, agent_id),
             inArray(occurrencesTable.status, ['pending', 'claimed']),
           ),
         )
@@ -159,14 +270,24 @@ export const seriesRepo = {
    * scheduler in spec §10).
    */
   async listActiveWithoutPendingOccurrence(limit: number): Promise<Series[]> {
+    // Per-tenant: the backfill scheduler worker opens a context per enumerated
+    // tuple, so this read is scoped to the current tenant/agent. The NOT EXISTS
+    // sub-query also joins occurrences only within the same tenant/agent so a
+    // sibling tenant's open occurrence can never mask a real orphan here.
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const rows = await db.execute<Record<string, unknown>>(sql`
       SELECT s.*
         FROM series s
        WHERE s.status = 'active'
          AND s.rrule IS NOT NULL
+         AND s.tenant_id = ${tenant_id}
+         AND s.agent_id = ${agent_id}
          AND NOT EXISTS (
            SELECT 1 FROM occurrences o
             WHERE o.series_id = s.id
+              AND o.tenant_id = ${tenant_id}
+              AND o.agent_id = ${agent_id}
               AND o.status IN ('pending','claimed','in_progress','awaiting_third_party','awaiting_owner')
          )
        ORDER BY s.updated_at ASC
@@ -190,6 +311,13 @@ export const seriesRepo = {
     correlation_token?: string;
     tasks: Array<{ ordem: number; kind: TaskKind }>;
   }): Promise<{ occurrence: Occurrence | null; tasks: Task[] }> {
+    // Stamp tenant/agent on the new occurrence + tasks from the active context
+    // (the engine/backfill caller runs inside the series' tenant), and scope
+    // the active+version guard SELECT to that tenant so a sibling tenant's
+    // series can never satisfy the guard. 0-row guard is a benign
+    // cancellation/version race → return null (NOT fail-loud).
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     return withTx(async (tx) => {
       // Strongest defence: gate the insert on (status=active, version match)
       // via a sub-select-rejected-if-empty trick.
@@ -199,6 +327,8 @@ export const seriesRepo = {
         .where(
           and(
             eq(seriesTable.id, input.series_id),
+            eq(seriesTable.tenant_id, tenant_id),
+            eq(seriesTable.agent_id, agent_id),
             eq(seriesTable.status, 'active'),
             eq(seriesTable.version, input.expected_version),
           ),
@@ -210,6 +340,8 @@ export const seriesRepo = {
         const occRows = await tx
           .insert(occurrencesTable)
           .values({
+            tenant_id,
+            agent_id,
             series_id: input.series_id,
             scheduled_for: input.scheduled_for,
             status: 'pending',
@@ -222,6 +354,8 @@ export const seriesRepo = {
           .insert(tasksTable)
           .values(
             input.tasks.map((t) => ({
+              tenant_id,
+              agent_id,
               occurrence_id: occ.id,
               ordem: t.ordem,
               kind: t.kind,
@@ -239,6 +373,86 @@ export const seriesRepo = {
         throw err;
       }
     });
+  },
+};
+
+export type TenantAgentRow = { tenant_id: string; agent_id: string };
+
+/**
+ * Issue #355 — dispatcher enumerations for the scheduling workers.
+ *
+ * Each method returns the DISTINCT `(tenant_id, agent_id)` tuples that have
+ * work for one worker, so the worker can open `runWithTenantContext` per tuple
+ * (the reflection-batch / outbound-messages-sweeper idiom). These run OUTSIDE
+ * tenant context — enumerating across tenants is the worker's contract — so
+ * they deliberately do NOT apply a tenant guard. No `'default'` sentinel is
+ * assumed: a tuple appears here iff it genuinely has a due/claimable/orphaned
+ * row, and the per-tenant inner re-scopes by the routed `(tenant_id, agent_id)`
+ * (defense-in-depth against a dispatcher bug). The belt-and-suspenders
+ * `tenant_id/agent_id IS NOT NULL` predicate mirrors #251/#292 (schema already
+ * enforces NOT NULL; this guards a future relaxation).
+ */
+export const schedulingDispatch = {
+  /**
+   * Tuples with at least one occurrence the engine tick could act on this pass:
+   * a due `pending` row, a `claimed` row that may need lease-reaping, an
+   * `in_progress` recurring_outreach row eligible for advance, or an
+   * `awaiting_third_party` row that may have timed out. Over-enumerating a tuple
+   * whose rows turn out non-actionable is harmless — the per-tenant tick simply
+   * claims/advances nothing.
+   */
+  async enumerateTickTenants(): Promise<TenantAgentRow[]> {
+    const result = await db.execute<TenantAgentRow>(sql`
+      SELECT DISTINCT o.tenant_id, o.agent_id
+        FROM occurrences o
+       WHERE o.tenant_id IS NOT NULL
+         AND o.agent_id IS NOT NULL
+         AND (
+           (o.status = 'pending' AND o.scheduled_for <= now())
+           OR o.status = 'claimed'
+           OR o.status = 'in_progress'
+           OR o.status = 'awaiting_third_party'
+         )
+    `);
+    return Array.from(result.rows as unknown as TenantAgentRow[]);
+  },
+
+  /**
+   * Tuples with at least one active rrule-driven series — the candidate set the
+   * backfill scheduler may need to top up with a next occurrence. The inner
+   * (`listActiveWithoutPendingOccurrence`) re-applies the full NOT-EXISTS orphan
+   * filter scoped to the routed tenant/agent, so over-enumeration here is
+   * harmless.
+   */
+  async enumerateActiveSeriesTenants(): Promise<TenantAgentRow[]> {
+    const result = await db.execute<TenantAgentRow>(sql`
+      SELECT DISTINCT s.tenant_id, s.agent_id
+        FROM series s
+       WHERE s.tenant_id IS NOT NULL
+         AND s.agent_id IS NOT NULL
+         AND s.status = 'active'
+         AND s.rrule IS NOT NULL
+    `);
+    return Array.from(result.rows as unknown as TenantAgentRow[]);
+  },
+
+  /**
+   * Tuples with at least one outbox row the drain worker could send or reclaim
+   * this pass: a due `pending` row OR a `claimed` row (a crashed worker's lease
+   * the drain reclaims). Mirrors the `idx_outbox_due` partial index predicate.
+   */
+  async enumerateOutboxTenants(): Promise<TenantAgentRow[]> {
+    const result = await db.execute<TenantAgentRow>(sql`
+      SELECT DISTINCT tenant_id, agent_id
+        FROM outbox_messages
+       WHERE tenant_id IS NOT NULL
+         AND agent_id IS NOT NULL
+         AND (
+           (status = 'pending' AND next_attempt_at <= now())
+           OR status = 'claimed'
+         )
+    `);
+    return Array.from(result.rows as unknown as TenantAgentRow[]);
   },
 };
 
@@ -277,6 +491,11 @@ export type TxScopedRepos = {
 };
 
 function txRepos(tx: Tx): TxScopedRepos {
+  // The transactional repos run inside the engine's per-occurrence advance,
+  // which is itself inside the routed tenant context. Resolve the scope once
+  // for the whole transaction; every write below carries it.
+  const tenant_id = getCurrentTenant();
+  const agent_id = getCurrentAgent();
   return {
     occurrences: {
       async setStatus(id, status, extra): Promise<void> {
@@ -301,7 +520,21 @@ function txRepos(tx: Tx): TxScopedRepos {
         if (extra?.metadata_patch) {
           update.metadata = sql`COALESCE(metadata,'{}'::jsonb) || ${JSON.stringify(extra.metadata_patch)}::jsonb`;
         }
-        await tx.update(occurrencesTable).set(update).where(eq(occurrencesTable.id, id));
+        // Fail-loud: the engine holds a claim on this occurrence under THIS
+        // tenant, so a 0-row update means the tenant/agent predicate didn't
+        // match the claimed row — a routing/context bug, not a benign race.
+        const res = await tx
+          .update(occurrencesTable)
+          .set(update)
+          .where(
+            and(
+              eq(occurrencesTable.id, id),
+              eq(occurrencesTable.tenant_id, tenant_id),
+              eq(occurrencesTable.agent_id, agent_id),
+            ),
+          )
+          .returning({ id: occurrencesTable.id });
+        assertMutated(res.length, 'tx.occurrences.setStatus', { id, tenant_id, agent_id });
       },
     },
     tasks: {
@@ -314,7 +547,18 @@ function txRepos(tx: Tx): TxScopedRepos {
         if (result_patch) {
           update.result = sql`COALESCE(result,'{}'::jsonb) || ${JSON.stringify(result_patch)}::jsonb`;
         }
-        await tx.update(tasksTable).set(update).where(eq(tasksTable.id, id));
+        const res = await tx
+          .update(tasksTable)
+          .set(update)
+          .where(
+            and(
+              eq(tasksTable.id, id),
+              eq(tasksTable.tenant_id, tenant_id),
+              eq(tasksTable.agent_id, agent_id),
+            ),
+          )
+          .returning({ id: tasksTable.id });
+        assertMutated(res.length, 'tx.tasks.setStatus', { id, tenant_id, agent_id });
       },
     },
     outbox: {
@@ -323,6 +567,8 @@ function txRepos(tx: Tx): TxScopedRepos {
           const rows = await tx
             .insert(outboxTable)
             .values({
+              tenant_id,
+              agent_id,
               occurrence_id: input.occurrence_id ?? null,
               task_id: input.task_id ?? null,
               kind: input.kind,
@@ -343,7 +589,19 @@ function txRepos(tx: Tx): TxScopedRepos {
 
 export const occurrencesRepo = {
   async byId(id: string): Promise<Occurrence | null> {
-    const rows = await db.select().from(occurrencesTable).where(eq(occurrencesTable.id, id)).limit(1);
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(occurrencesTable)
+      .where(
+        and(
+          eq(occurrencesTable.id, id),
+          eq(occurrencesTable.tenant_id, tenant_id),
+          eq(occurrencesTable.agent_id, agent_id),
+        ),
+      )
+      .limit(1);
     return rows[0] ?? null;
   },
 
@@ -351,12 +609,20 @@ export const occurrencesRepo = {
    * Claim up to `limit` due occurrences in one transaction using
    * `FOR UPDATE SKIP LOCKED`. Returns the claimed rows already stamped
    * with the worker_id and claimed_at.
+   *
+   * Scoped to the routed tenant/agent: the engine tick runs per-tenant, so a
+   * tick for tenant A must never claim tenant B's due occurrences. The re-fetch
+   * also carries the tenant/agent predicate (belt-and-suspenders — the ids
+   * already came from the scoped CTE).
    */
   async claimDue(worker_id: string, limit: number): Promise<Occurrence[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const rows = await db.execute<{ id: string }>(sql`
       WITH due AS (
         SELECT id FROM occurrences
          WHERE status = 'pending' AND scheduled_for <= now()
+           AND ${tenantFilter(tenant_id, agent_id)}
          ORDER BY scheduled_for ASC
          FOR UPDATE SKIP LOCKED
          LIMIT ${limit}
@@ -369,7 +635,16 @@ export const occurrencesRepo = {
     `);
     const ids = rows.rows.map((r) => r.id);
     if (ids.length === 0) return [];
-    return db.select().from(occurrencesTable).where(inArray(occurrencesTable.id, ids));
+    return db
+      .select()
+      .from(occurrencesTable)
+      .where(
+        and(
+          inArray(occurrencesTable.id, ids),
+          eq(occurrencesTable.tenant_id, tenant_id),
+          eq(occurrencesTable.agent_id, agent_id),
+        ),
+      );
   },
 
   /**
@@ -382,11 +657,14 @@ export const occurrencesRepo = {
    * should NOT process them directly — they're back in the pending queue.
    */
   async reclaimExpiredLeases(_worker_id: string, ttl_seconds: number, limit: number): Promise<string[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const rows = await db.execute<{ id: string }>(sql`
       WITH expired AS (
         SELECT id FROM occurrences
          WHERE status = 'claimed'
            AND claimed_at < now() - (${ttl_seconds} || ' seconds')::interval
+           AND ${tenantFilter(tenant_id, agent_id)}
          ORDER BY claimed_at ASC
          FOR UPDATE SKIP LOCKED
          LIMIT ${limit}
@@ -407,6 +685,8 @@ export const occurrencesRepo = {
     status: OccurrenceStatus,
     extra?: { outcome?: string; metadata_patch?: Record<string, unknown> },
   ): Promise<void> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const update: Record<string, unknown> = { status };
     // Anchor `started_at` whenever we transition into any "started"
     // state. `awaiting_third_party` and `awaiting_owner` mean the work
@@ -433,7 +713,20 @@ export const occurrencesRepo = {
     if (extra?.metadata_patch) {
       update.metadata = sql`COALESCE(metadata,'{}'::jsonb) || ${JSON.stringify(extra.metadata_patch)}::jsonb`;
     }
-    await db.update(occurrencesTable).set(update).where(eq(occurrencesTable.id, id));
+    // Fail-loud on 0 rows: every caller transitions an occurrence it just read
+    // under THIS tenant context, so a miss is a cross-tenant/lost-context bug.
+    const res = await db
+      .update(occurrencesTable)
+      .set(update)
+      .where(
+        and(
+          eq(occurrencesTable.id, id),
+          eq(occurrencesTable.tenant_id, tenant_id),
+          eq(occurrencesTable.agent_id, agent_id),
+        ),
+      )
+      .returning({ id: occurrencesTable.id });
+    assertMutated(res.length, 'occurrences.setStatus', { id, tenant_id, agent_id });
   },
 
   /**
@@ -442,7 +735,9 @@ export const occurrencesRepo = {
    * runtime gate (exclusive_per_destinatario collision, missing conversa).
    */
   async releaseClaim(id: string, defer_seconds = 60): Promise<void> {
-    await db
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const res = await db
       .update(occurrencesTable)
       .set({
         status: 'pending',
@@ -450,7 +745,15 @@ export const occurrencesRepo = {
         claimed_at: null,
         scheduled_for: sql`GREATEST(scheduled_for, now() + (${defer_seconds} || ' seconds')::interval)`,
       })
-      .where(eq(occurrencesTable.id, id));
+      .where(
+        and(
+          eq(occurrencesTable.id, id),
+          eq(occurrencesTable.tenant_id, tenant_id),
+          eq(occurrencesTable.agent_id, agent_id),
+        ),
+      )
+      .returning({ id: occurrencesTable.id });
+    assertMutated(res.length, 'occurrences.releaseClaim', { id, tenant_id, agent_id });
   },
 
   /**
@@ -465,6 +768,11 @@ export const occurrencesRepo = {
    * `claimed_at IS NULL OR claimed_at < now() - 30s` predicate.
    */
   async releaseLeaseOnly(id: string): Promise<void> {
+    // Scoped to tenant/agent. NOT fail-loud: the `status='in_progress'`
+    // predicate makes a 0-row outcome a legitimate concurrent-transition race
+    // (the occurrence already moved off in_progress), not a tenant miss.
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     await db
       .update(occurrencesTable)
       .set({
@@ -472,7 +780,12 @@ export const occurrencesRepo = {
         claimed_at: null,
       })
       .where(
-        and(eq(occurrencesTable.id, id), eq(occurrencesTable.status, 'in_progress')),
+        and(
+          eq(occurrencesTable.id, id),
+          eq(occurrencesTable.tenant_id, tenant_id),
+          eq(occurrencesTable.agent_id, agent_id),
+          eq(occurrencesTable.status, 'in_progress'),
+        ),
       );
   },
 
@@ -495,13 +808,23 @@ export const occurrencesRepo = {
    * through `onMessageDead` after exhausting retries.
    */
   async claimInProgressForAdvance(worker_id: string, limit: number): Promise<Occurrence[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    // Scope BOTH sides of the join: the occurrence AND its series must belong
+    // to the routed tenant/agent (the join is additionally fenced on matching
+    // tenant/agent so a cross-tenant series_id collision can't leak a row).
     const rows = await db.execute<{ id: string }>(sql`
       WITH eligible AS (
         SELECT o.id
           FROM occurrences o
-          JOIN series s ON s.id = o.series_id
+          JOIN series s
+            ON s.id = o.series_id
+           AND s.tenant_id = o.tenant_id
+           AND s.agent_id = o.agent_id
          WHERE o.status = 'in_progress'
            AND s.tipo = 'recurring_outreach'
+           AND o.tenant_id = ${tenant_id}
+           AND o.agent_id = ${agent_id}
            AND (o.claimed_at IS NULL OR o.claimed_at < now() - interval '30 seconds')
          ORDER BY o.created_at ASC
          FOR UPDATE SKIP LOCKED
@@ -515,7 +838,16 @@ export const occurrencesRepo = {
     `);
     const ids = rows.rows.map((r) => r.id);
     if (ids.length === 0) return [];
-    return db.select().from(occurrencesTable).where(inArray(occurrencesTable.id, ids));
+    return db
+      .select()
+      .from(occurrencesTable)
+      .where(
+        and(
+          inArray(occurrencesTable.id, ids),
+          eq(occurrencesTable.tenant_id, tenant_id),
+          eq(occurrencesTable.agent_id, agent_id),
+        ),
+      );
   },
 
   /**
@@ -523,11 +855,15 @@ export const occurrencesRepo = {
    * wait window expired so the engine can escalate to the owner.
    */
   async listAwaitingTimedOut(limit: number): Promise<Occurrence[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     return db
       .select()
       .from(occurrencesTable)
       .where(
         and(
+          eq(occurrencesTable.tenant_id, tenant_id),
+          eq(occurrencesTable.agent_id, agent_id),
           eq(occurrencesTable.status, 'awaiting_third_party'),
           sql`(contexto_snapshot->>'wait_response_hours') IS NOT NULL`,
           sql`started_at IS NOT NULL`,
@@ -538,12 +874,16 @@ export const occurrencesRepo = {
   },
 
   async listOverdueForSeries(series_id: string, threshold_at: Date): Promise<Occurrence[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     return db
       .select()
       .from(occurrencesTable)
       .where(
         and(
           eq(occurrencesTable.series_id, series_id),
+          eq(occurrencesTable.tenant_id, tenant_id),
+          eq(occurrencesTable.agent_id, agent_id),
           eq(occurrencesTable.status, 'pending'),
           sql`scheduled_for < ${threshold_at}`,
         ),
@@ -552,11 +892,15 @@ export const occurrencesRepo = {
   },
 
   async findActiveByCorrelation(token: string): Promise<Occurrence | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const rows = await db
       .select()
       .from(occurrencesTable)
       .where(
         and(
+          eq(occurrencesTable.tenant_id, tenant_id),
+          eq(occurrencesTable.agent_id, agent_id),
           eq(occurrencesTable.correlation_token, token),
           inArray(occurrencesTable.status, ['awaiting_third_party', 'in_progress']),
         ),
@@ -566,11 +910,15 @@ export const occurrencesRepo = {
   },
 
   async listAwaitingForDestinatario(destinatario_pessoa_id: string): Promise<Occurrence[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     return db
       .select()
       .from(occurrencesTable)
       .where(
         and(
+          eq(occurrencesTable.tenant_id, tenant_id),
+          eq(occurrencesTable.agent_id, agent_id),
           eq(occurrencesTable.status, 'awaiting_third_party'),
           sql`(contexto_snapshot->>'destinatario_pessoa_id') = ${destinatario_pessoa_id}`,
         ),
@@ -579,11 +927,15 @@ export const occurrencesRepo = {
   },
 
   async hasOpenForDestinatario(series_id: string, destinatario_pessoa_id: string): Promise<boolean> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const rows = await db
       .select({ id: occurrencesTable.id })
       .from(occurrencesTable)
       .where(
         and(
+          eq(occurrencesTable.tenant_id, tenant_id),
+          eq(occurrencesTable.agent_id, agent_id),
           eq(occurrencesTable.series_id, series_id),
           inArray(occurrencesTable.status, [
             'pending',
@@ -605,11 +957,15 @@ export const occurrencesRepo = {
     destinatario_pessoa_id: string,
     exclude_occurrence_id: string,
   ): Promise<boolean> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const rows = await db
       .select({ id: occurrencesTable.id })
       .from(occurrencesTable)
       .where(
         and(
+          eq(occurrencesTable.tenant_id, tenant_id),
+          eq(occurrencesTable.agent_id, agent_id),
           eq(occurrencesTable.series_id, series_id),
           sql`id <> ${exclude_occurrence_id}`,
           inArray(occurrencesTable.status, ['in_progress', 'awaiting_third_party']),
@@ -621,20 +977,36 @@ export const occurrencesRepo = {
   },
 
   async listByStatus(statuses: OccurrenceStatus[], limit = 100): Promise<Occurrence[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     return db
       .select()
       .from(occurrencesTable)
-      .where(inArray(occurrencesTable.status, statuses))
+      .where(
+        and(
+          eq(occurrencesTable.tenant_id, tenant_id),
+          eq(occurrencesTable.agent_id, agent_id),
+          inArray(occurrencesTable.status, statuses),
+        ),
+      )
       .limit(limit);
   },
 };
 
 export const tasksRepo = {
   async byOccurrence(occurrence_id: string): Promise<Task[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     return db
       .select()
       .from(tasksTable)
-      .where(eq(tasksTable.occurrence_id, occurrence_id))
+      .where(
+        and(
+          eq(tasksTable.occurrence_id, occurrence_id),
+          eq(tasksTable.tenant_id, tenant_id),
+          eq(tasksTable.agent_id, agent_id),
+        ),
+      )
       .orderBy(tasksTable.ordem);
   },
 
@@ -643,6 +1015,8 @@ export const tasksRepo = {
     status: TaskStatus,
     result_patch?: Record<string, unknown>,
   ): Promise<void> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const update: Record<string, unknown> = { status };
     if (status === 'in_progress') update.started_at = new Date();
     if (
@@ -655,16 +1029,33 @@ export const tasksRepo = {
     if (result_patch) {
       update.result = sql`COALESCE(result,'{}'::jsonb) || ${JSON.stringify(result_patch)}::jsonb`;
     }
-    await db.update(tasksTable).set(update).where(eq(tasksTable.id, id));
+    // Fail-loud on 0 rows: the caller (engine / outbox-drain) just read this
+    // task under the SAME context, so a miss is a cross-tenant/lost-context bug.
+    const res = await db
+      .update(tasksTable)
+      .set(update)
+      .where(
+        and(
+          eq(tasksTable.id, id),
+          eq(tasksTable.tenant_id, tenant_id),
+          eq(tasksTable.agent_id, agent_id),
+        ),
+      )
+      .returning({ id: tasksTable.id });
+    assertMutated(res.length, 'tasks.setStatus', { id, tenant_id, agent_id });
   },
 };
 
 export const outboxRepo = {
   async enqueue(input: Omit<OutboxMessageInsert, 'id' | 'created_at' | 'status' | 'attempts' | 'next_attempt_at'>): Promise<OutboxMessage | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     try {
       const rows = await db
         .insert(outboxTable)
         .values({
+          tenant_id,
+          agent_id,
           occurrence_id: input.occurrence_id ?? null,
           task_id: input.task_id ?? null,
           kind: input.kind,
@@ -682,10 +1073,13 @@ export const outboxRepo = {
   },
 
   async claimDue(worker_id: string, limit: number): Promise<OutboxMessage[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const rows = await db.execute<{ id: string }>(sql`
       WITH due AS (
         SELECT id FROM outbox_messages
          WHERE status = 'pending' AND next_attempt_at <= now()
+           AND ${tenantFilter(tenant_id, agent_id)}
          ORDER BY next_attempt_at ASC
          FOR UPDATE SKIP LOCKED
          LIMIT ${limit}
@@ -698,15 +1092,27 @@ export const outboxRepo = {
     `);
     const ids = rows.rows.map((r) => r.id);
     if (ids.length === 0) return [];
-    return db.select().from(outboxTable).where(inArray(outboxTable.id, ids));
+    return db
+      .select()
+      .from(outboxTable)
+      .where(
+        and(
+          inArray(outboxTable.id, ids),
+          eq(outboxTable.tenant_id, tenant_id),
+          eq(outboxTable.agent_id, agent_id),
+        ),
+      );
   },
 
   async reclaimExpiredLeases(_worker_id: string, ttl_seconds: number, limit: number): Promise<string[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
     const rows = await db.execute<{ id: string }>(sql`
       WITH expired AS (
         SELECT id FROM outbox_messages
          WHERE status = 'claimed'
            AND claimed_at < now() - (${ttl_seconds} || ' seconds')::interval
+           AND ${tenantFilter(tenant_id, agent_id)}
          ORDER BY claimed_at ASC
          FOR UPDATE SKIP LOCKED
          LIMIT ${limit}
@@ -723,14 +1129,28 @@ export const outboxRepo = {
   },
 
   async markSent(id: string): Promise<void> {
-    await db
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const res = await db
       .update(outboxTable)
       .set({ status: 'sent', sent_at: new Date(), last_error: null })
-      .where(eq(outboxTable.id, id));
+      .where(
+        and(
+          eq(outboxTable.id, id),
+          eq(outboxTable.tenant_id, tenant_id),
+          eq(outboxTable.agent_id, agent_id),
+        ),
+      )
+      .returning({ id: outboxTable.id });
+    // Fail-loud: the drain worker just claimed this row under THIS context; a
+    // 0-row markSent means the tenant/agent predicate missed the claimed row.
+    assertMutated(res.length, 'outbox.markSent', { id, tenant_id, agent_id });
   },
 
   async markFailedRetryable(id: string, error: string, backoff_seconds: number): Promise<void> {
-    await db
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const res = await db
       .update(outboxTable)
       .set({
         status: 'pending',
@@ -740,29 +1160,69 @@ export const outboxRepo = {
         claimed_by: null,
         claimed_at: null,
       })
-      .where(eq(outboxTable.id, id));
+      .where(
+        and(
+          eq(outboxTable.id, id),
+          eq(outboxTable.tenant_id, tenant_id),
+          eq(outboxTable.agent_id, agent_id),
+        ),
+      )
+      .returning({ id: outboxTable.id });
+    assertMutated(res.length, 'outbox.markFailedRetryable', { id, tenant_id, agent_id });
   },
 
   async markDead(id: string, error: string): Promise<void> {
-    await db
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const res = await db
       .update(outboxTable)
       .set({
         status: 'dead',
         last_error: error,
         attempts: sql`${outboxTable.attempts} + 1`,
       })
-      .where(eq(outboxTable.id, id));
+      .where(
+        and(
+          eq(outboxTable.id, id),
+          eq(outboxTable.tenant_id, tenant_id),
+          eq(outboxTable.agent_id, agent_id),
+        ),
+      )
+      .returning({ id: outboxTable.id });
+    assertMutated(res.length, 'outbox.markDead', { id, tenant_id, agent_id });
   },
 
   async returnToPending(id: string): Promise<void> {
-    await db
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const res = await db
       .update(outboxTable)
       .set({ status: 'pending', claimed_by: null, claimed_at: null })
-      .where(eq(outboxTable.id, id));
+      .where(
+        and(
+          eq(outboxTable.id, id),
+          eq(outboxTable.tenant_id, tenant_id),
+          eq(outboxTable.agent_id, agent_id),
+        ),
+      )
+      .returning({ id: outboxTable.id });
+    assertMutated(res.length, 'outbox.returnToPending', { id, tenant_id, agent_id });
   },
 
   async byStatus(status: OutboxStatus, limit = 100): Promise<OutboxMessage[]> {
-    return db.select().from(outboxTable).where(eq(outboxTable.status, status)).limit(limit);
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(outboxTable)
+      .where(
+        and(
+          eq(outboxTable.tenant_id, tenant_id),
+          eq(outboxTable.agent_id, agent_id),
+          eq(outboxTable.status, status),
+        ),
+      )
+      .limit(limit);
   },
 };
 
