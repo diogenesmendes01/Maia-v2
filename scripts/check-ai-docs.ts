@@ -46,6 +46,14 @@ const REQUIRED_PR_TEMPLATE_SECTIONS = [
 
 const REQUIRED_PR_TEMPLATE_FIELDS = ['Residual risk:'] as const;
 
+const REQUIRED_PR_TEMPLATE_OUTPUT_FIELDS = [
+  'Context read:',
+  'Files changed:',
+  'Validation run:',
+  'Validation not run:',
+  'Skipped checks and reason:',
+] as const;
+
 const REQUIRED_ISSUE_FORM_REFERENCES = [
   'docs/ai/task-spec-template.md',
   'docs/ai/coding-agent-playbook.md',
@@ -128,8 +136,8 @@ function normalizeLineEndings(value: string): string {
   return value.replace(/\r\n?/g, '\n');
 }
 
-function getMarkdownHeadings(markdown: string): Set<string> {
-  const headings = new Set<string>();
+function getVisibleMarkdownLines(markdown: string): string[] {
+  const lines: string[] = [];
   let inFence = false;
   let inHtmlComment = false;
 
@@ -151,12 +159,20 @@ function getMarkdownHeadings(markdown: string): Set<string> {
       continue;
     }
 
-    if (!inFence && trimmed.startsWith('## ')) {
-      headings.add(trimmed);
+    if (!inFence && trimmed) {
+      lines.push(trimmed);
     }
   }
 
-  return headings;
+  return lines;
+}
+
+function getMarkdownHeadings(markdown: string): Set<string> {
+  return new Set(getVisibleMarkdownLines(markdown).filter((line) => line.startsWith('## ')));
+}
+
+function hasStructuredTemplateField(lines: string[], field: string): boolean {
+  return lines.includes(field) || lines.includes(`- ${field}`);
 }
 
 function getWorkflowStepBlocks(workflow: string): string[] {
@@ -273,6 +289,7 @@ function assertAgentsPointers(): void {
 function assertPrTemplate(): void {
   const template = readText('.github/pull_request_template.md');
   const headings = getMarkdownHeadings(template);
+  const visibleLines = getVisibleMarkdownLines(template);
 
   for (const section of REQUIRED_PR_TEMPLATE_SECTIONS) {
     if (!headings.has(section)) {
@@ -281,8 +298,14 @@ function assertPrTemplate(): void {
   }
 
   for (const field of REQUIRED_PR_TEMPLATE_FIELDS) {
-    if (!template.includes(field)) {
+    if (!hasStructuredTemplateField(visibleLines, field)) {
       fail(`pull request template must include field: ${field}`);
+    }
+  }
+
+  for (const field of REQUIRED_PR_TEMPLATE_OUTPUT_FIELDS) {
+    if (!hasStructuredTemplateField(visibleLines, field)) {
+      fail(`pull request template must include output field: ${field}`);
     }
   }
 

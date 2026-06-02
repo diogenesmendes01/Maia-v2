@@ -12,10 +12,15 @@ Closes #
 - Related issue:
 - Related ADR/docs:
 - Agent role:
+- Context read:
 
 ## Scope
 
 <!-- State what is intentionally included and excluded. -->
+
+Files changed:
+
+-
 
 In scope:
 
@@ -41,12 +46,14 @@ Out of scope:
 
 <!-- Include command output summary, not just "tested". Explain skipped checks. -->
 
+- Validation run:
 - [ ] `npm run docs:ai:check`
 - [ ] `npm run typecheck`
 - [ ] `npm run lint`
 - [ ] `npm test`
 - [ ] Targeted tests:
-- [ ] Skipped checks and reason:
+- Validation not run:
+- Skipped checks and reason:
 
 ## Docs Impact
 
