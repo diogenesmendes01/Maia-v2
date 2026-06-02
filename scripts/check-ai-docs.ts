@@ -7,6 +7,7 @@ const REQUIRED_FILES = [
   'AGENTS.md',
   '.github/ISSUE_TEMPLATE/agent-engineering-task.yml',
   '.github/pull_request_template.md',
+  'scripts/check-pr-body.ts',
   'docs/ai/agent-operating-model.md',
   'docs/ai/coding-agent-playbook.md',
   'docs/ai/review-agent-playbook.md',
@@ -68,6 +69,11 @@ const REQUIRED_ISSUE_FORM_FIELDS = [
   'Residual risk:',
   'Acceptance criteria',
 ] as const;
+
+const REQUIRED_PR_BODY_GOVERNANCE_WIRING = {
+  packageJson: ['"pr:body:check": "tsx scripts/check-pr-body.ts"'],
+  ci: ['PR body governance', "github.event_name == 'pull_request'", 'npm run pr:body:check'],
+} as const;
 
 const FORBIDDEN_ACTIVE_REFERENCES = [
   '2026-05-28-architecture-docs-design',
@@ -166,6 +172,23 @@ function assertIssueForm(): void {
   }
 }
 
+function assertPrBodyGovernanceWiring(): void {
+  const packageJson = readText('package.json');
+  const ci = readText('.github/workflows/ci.yml');
+
+  for (const reference of REQUIRED_PR_BODY_GOVERNANCE_WIRING.packageJson) {
+    if (!packageJson.includes(reference)) {
+      fail(`package.json must wire PR body governance with ${reference}`);
+    }
+  }
+
+  for (const reference of REQUIRED_PR_BODY_GOVERNANCE_WIRING.ci) {
+    if (!ci.includes(reference)) {
+      fail(`CI must wire PR body governance with ${reference}`);
+    }
+  }
+}
+
 function assertNoForbiddenReferences(): void {
   const docsToScan = [
     'AGENTS.md',
@@ -208,6 +231,7 @@ function main(): void {
   assertAgentsPointers();
   assertPrTemplate();
   assertIssueForm();
+  assertPrBodyGovernanceWiring();
   assertNoForbiddenReferences();
   assertSuperpowerSpecsAreFeatureSpecs();
 

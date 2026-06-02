@@ -64,6 +64,10 @@ jobs:
       - name: AI docs governance
         run: npm run docs:ai:check
 
+      - name: PR body governance
+        if: github.event_name == 'pull_request'
+        run: npm run pr:body:check
+
       - name: Typecheck (tsc --noEmit)
         # Separated from build so failures point cleanly at type vs build.
         # `npx` instead of an npm script keeps CI independent of script renames.
