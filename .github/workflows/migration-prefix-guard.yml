@@ -1,0 +1,50 @@
+name: Migration prefix guard
+
+# Issue #340 — surface migration-prefix collisions EARLY.
+#
+# The append-only ledger (migrations/RESERVATIONS.md) already makes two
+# concurrent PRs that reserve the SAME prefix collide as a git MERGE CONFLICT
+# on the second merge (see the ledger header). This workflow is the matching
+# CI gate: on every pull_request it re-checks that the ledger and the
+# migrations on disk are in sync (every migration reserved exactly once, no
+# stale entries, no NEW duplicate prefix, all entries well-formed). It is a
+# lightweight, dependency-light job — it runs ONLY the reservation guard via
+# tsx, with no database, so it is fast and independent of the heavier CI lane
+# in ci.yml.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'migrations/**'
+      - 'scripts/check-migration-reservations.ts'
+      - 'scripts/migrate-reserve.ts'
+      - '.github/workflows/migration-prefix-guard.yml'
+
+# Cancel superseded runs on the same PR branch.
+concurrency:
+  group: migration-prefix-guard-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  reservations:
+    name: reservation ledger guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Pin npm to 11.5.2
+        # Match package.json's packageManager + the lockfile generator (see
+        # ci.yml for the full rationale). Must run BEFORE npm ci.
+        run: npm install -g npm@11.5.2
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check migration reservation ledger
+        run: npm run migrate:reservations:check
