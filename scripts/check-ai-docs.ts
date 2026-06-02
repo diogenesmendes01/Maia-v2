@@ -191,6 +191,16 @@ function stripYamlScalar(value: string): string {
   return trimmed.replace(/^['"]|['"]$/g, '');
 }
 
+function getTopLevelYamlScalarValues(yaml: string, key: string): string[] {
+  return normalizeLineEndings(yaml)
+    .split('\n')
+    .flatMap((line) => {
+      const scalarMatch = line.match(new RegExp(`^${key}:\\s*(.+?)\\s*$`));
+
+      return scalarMatch ? [stripYamlScalar(scalarMatch[1])] : [];
+    });
+}
+
 function getYamlScalarValues(yaml: string, key: string): string[] {
   const values: string[] = [];
   let blockScalarParentIndent: number | null = null;
@@ -229,6 +239,28 @@ function getYamlScalarValues(yaml: string, key: string): string[] {
   return values;
 }
 
+function collectYamlBlockScalar(lines: string[], startIndex: number, parentIndent: number): string {
+  const blockLines: string[] = [];
+
+  for (let index = startIndex + 1; index < lines.length; index += 1) {
+    const blockLine = lines[index];
+    const trimmed = blockLine.trim();
+
+    if (!trimmed) {
+      blockLines.push('');
+      continue;
+    }
+
+    if (getIndent(blockLine) <= parentIndent) {
+      break;
+    }
+
+    blockLines.push(blockLine.slice(parentIndent + 2));
+  }
+
+  return blockLines.join('\n').trim();
+}
+
 function getYamlBlockScalarValues(yaml: string, key: string): string[] {
   const values: string[] = [];
   const lines = normalizeLineEndings(yaml).split('\n');
@@ -242,29 +274,54 @@ function getYamlBlockScalarValues(yaml: string, key: string): string[] {
     }
 
     const parentIndent = blockScalarMatch[1].length;
-    const blockLines: string[] = [];
-
-    for (index += 1; index < lines.length; index += 1) {
-      const blockLine = lines[index];
-      const trimmed = blockLine.trim();
-
-      if (!trimmed) {
-        blockLines.push('');
-        continue;
-      }
-
-      if (getIndent(blockLine) <= parentIndent) {
-        index -= 1;
-        break;
-      }
-
-      blockLines.push(blockLine.slice(parentIndent + 2));
-    }
-
-    values.push(blockLines.join('\n').trim());
+    values.push(collectYamlBlockScalar(lines, index, parentIndent));
   }
 
   return values;
+}
+
+function getYamlIssueFormFieldBlockScalar(yaml: string, id: string, key: string): string | null {
+  const lines = normalizeLineEndings(yaml).split('\n');
+  const idIndex = lines.findIndex((line) => line.trim() === `id: ${id}`);
+
+  if (idIndex === -1) {
+    return null;
+  }
+
+  const fieldIndent = getIndent(lines[idIndex]);
+
+  for (let index = idIndex + 1; index < lines.length; index += 1) {
+    const line = lines[index];
+    const trimmed = line.trim();
+
+    if (trimmed && getIndent(line) <= fieldIndent && trimmed.startsWith('- type:')) {
+      break;
+    }
+
+    const blockScalarMatch = line.match(new RegExp(`^(\\s*)${key}:\\s*[|>]`));
+
+    if (blockScalarMatch) {
+      return collectYamlBlockScalar(lines, index, blockScalarMatch[1].length);
+    }
+  }
+
+  return null;
+}
+
+function getVisibleYamlIssueFormText(yaml: string): string {
+  const scalarValues = [
+    ...getTopLevelYamlScalarValues(yaml, 'name'),
+    ...getTopLevelYamlScalarValues(yaml, 'description'),
+    ...getTopLevelYamlScalarValues(yaml, 'title'),
+    ...getYamlScalarValues(yaml, 'label'),
+    ...getYamlScalarValues(yaml, 'description'),
+    ...getYamlScalarValues(yaml, 'placeholder'),
+  ];
+  const visibleBlockValues = getYamlBlockScalarValues(yaml, 'value')
+    .concat(getYamlBlockScalarValues(yaml, 'placeholder'))
+    .map((value) => getVisibleMarkdownLines(value).join('\n'));
+
+  return [...scalarValues, ...visibleBlockValues].join('\n');
 }
 
 function getWorkflowStepBlocks(workflow: string): string[] {
@@ -410,13 +467,12 @@ function assertPrTemplate(): void {
 
 function assertIssueForm(): void {
   const issueForm = readText('.github/ISSUE_TEMPLATE/agent-engineering-task.yml');
-  const topLevelNames = getYamlScalarValues(issueForm, 'name');
-  const topLevelDescriptions = getYamlScalarValues(issueForm, 'description');
+  const topLevelNames = getTopLevelYamlScalarValues(issueForm, 'name');
+  const topLevelDescriptions = getTopLevelYamlScalarValues(issueForm, 'description');
   const labels = new Set(getYamlScalarValues(issueForm, 'label'));
-  const blockScalars = [
-    ...getYamlBlockScalarValues(issueForm, 'value'),
-    ...getYamlBlockScalarValues(issueForm, 'placeholder'),
-  ];
+  const valueBlockScalars = getYamlBlockScalarValues(issueForm, 'value');
+  const riskPlaceholder = getYamlIssueFormFieldBlockScalar(issueForm, 'risk-and-rollback', 'placeholder');
+  const visibleIssueFormText = getVisibleYamlIssueFormText(issueForm);
 
   if (!topLevelNames.includes(REQUIRED_ISSUE_FORM_TOP_LEVEL.name)) {
     fail(`agent engineering issue form must include top-level name: ${REQUIRED_ISSUE_FORM_TOP_LEVEL.name}`);
@@ -429,7 +485,7 @@ function assertIssueForm(): void {
   }
 
   for (const intro of REQUIRED_ISSUE_FORM_INTRO) {
-    if (!blockScalars.some((value) => value.includes(intro))) {
+    if (!valueBlockScalars.some((value) => value.includes(intro))) {
       fail(`agent engineering issue form must include intro text: ${intro}`);
     }
   }
@@ -441,13 +497,13 @@ function assertIssueForm(): void {
   }
 
   for (const placeholder of REQUIRED_ISSUE_FORM_PLACEHOLDERS) {
-    if (!blockScalars.some((value) => value.includes(placeholder))) {
+    if (!riskPlaceholder?.includes(placeholder)) {
       fail(`agent engineering issue form must include placeholder text: ${placeholder}`);
     }
   }
 
   for (const reference of REQUIRED_ISSUE_FORM_REFERENCES) {
-    if (!issueForm.includes(reference)) {
+    if (!visibleIssueFormText.includes(reference)) {
       fail(`agent engineering issue form must reference ${reference}`);
     }
   }
