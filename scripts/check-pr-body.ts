@@ -32,35 +32,65 @@ function normalizeLineEndings(value: string): string {
   return value.replace(/\r\n?/g, '\n');
 }
 
-function getMarkdownHeadings(markdown: string): Set<string> {
-  const headings = new Set<string>();
+function stripHtmlComments(line: string, inHtmlComment: boolean): { line: string; inHtmlComment: boolean } {
+  let visible = line;
+
+  if (inHtmlComment) {
+    const closeIndex = visible.indexOf('-->');
+
+    if (closeIndex === -1) {
+      return { line: '', inHtmlComment: true };
+    }
+
+    visible = visible.slice(closeIndex + '-->'.length);
+  }
+
+  while (true) {
+    const openIndex = visible.indexOf('<!--');
+
+    if (openIndex === -1) {
+      return { line: visible, inHtmlComment: false };
+    }
+
+    const closeIndex = visible.indexOf('-->', openIndex + '<!--'.length);
+
+    if (closeIndex === -1) {
+      return { line: visible.slice(0, openIndex), inHtmlComment: true };
+    }
+
+    visible = `${visible.slice(0, openIndex)}${visible.slice(closeIndex + '-->'.length)}`;
+  }
+}
+
+function getVisibleMarkdownLines(markdown: string): string[] {
+  const lines: string[] = [];
   let inFence = false;
   let inHtmlComment = false;
 
   for (const line of normalizeLineEndings(markdown).split('\n')) {
-    const trimmed = line.trim();
-
-    if (inHtmlComment) {
-      inHtmlComment = !trimmed.includes('-->');
-      continue;
-    }
-
-    if (trimmed.startsWith('<!--')) {
-      inHtmlComment = !trimmed.includes('-->');
-      continue;
-    }
+    const htmlStripped = stripHtmlComments(line, inHtmlComment);
+    inHtmlComment = htmlStripped.inHtmlComment;
+    const trimmed = htmlStripped.line.trim();
 
     if (trimmed.startsWith('```') || trimmed.startsWith('~~~')) {
       inFence = !inFence;
       continue;
     }
 
-    if (!inFence && trimmed.startsWith('## ')) {
-      headings.add(trimmed);
+    if (!inFence && trimmed) {
+      lines.push(trimmed);
     }
   }
 
-  return headings;
+  return lines;
+}
+
+function getMarkdownHeadings(lines: string[]): Set<string> {
+  return new Set(lines.filter((line) => line.startsWith('## ')));
+}
+
+function hasStructuredPrBodyField(lines: string[], field: string): boolean {
+  return lines.some((line) => line.startsWith(field) || line.startsWith(`- ${field}`));
 }
 
 function main(): void {
@@ -93,7 +123,8 @@ function main(): void {
     fail('pull request body is empty; keep the agent-aware PR template sections');
   }
 
-  const headings = getMarkdownHeadings(body);
+  const visibleLines = getVisibleMarkdownLines(body);
+  const headings = getMarkdownHeadings(visibleLines);
 
   for (const section of REQUIRED_PR_BODY_SECTIONS) {
     if (!headings.has(section)) {
@@ -102,7 +133,7 @@ function main(): void {
   }
 
   for (const field of REQUIRED_PR_BODY_FIELDS) {
-    if (!body.includes(field)) {
+    if (!hasStructuredPrBodyField(visibleLines, field)) {
       fail(`pull request body must include field: ${field}`);
     }
   }

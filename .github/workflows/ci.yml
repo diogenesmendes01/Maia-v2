@@ -22,12 +22,22 @@ jobs:
         # Exercise BOTH ends of the supported Node range:
         #  - 22 = engines.node floor in package.json (and the canonical dev
         #    toolchain pinned in .nvmrc; see CONTRIBUTING.md → Toolchain).
-        #  - 25 = the Node major of the production runtime (Dockerfile
-        #    `FROM node:25-alpine`). Without this leg, prod-only Node-major
+        #  - 26 = the Node major of the production runtime (Dockerfile
+        #    `FROM node:26-alpine`). Without this leg, prod-only Node-major
         #    incompatibilities were never caught in CI (#396).
         # Keep these in sync: bump the second entry whenever the Dockerfile
         # base image major changes.
-        node: [22, 25]
+        node: [22, 26]
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
       # Hermetic placeholders — tests/setup.ts overrides these too, but
       # config validation runs at module load before vitest's setup file.
@@ -50,7 +60,7 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           # Matrixed across the engines floor (.nvmrc, Node 22) and the prod
-          # image major (Node 25, Dockerfile) — see this job's strategy.matrix.
+          # image major (Node 26, Dockerfile) — see this job's strategy.matrix.
           # .nvmrc stays the single source of truth for the *local* dev
           # toolchain + lockfile rule (CONTRIBUTING.md → Toolchain); CI fans out
           # to also cover the production runtime major.
@@ -94,10 +104,9 @@ jobs:
         run: npm run build && test -f dist/index.js
 
       - name: Run unit tests
-        # Integration tests skip when TEST_DB_URL is unset — the unit lane is
-        # always green without infrastructure. Full integration coverage runs in
-        # the dedicated `integration` job below with postgres + redis service
-        # containers.
+        # Integration tests skip when TEST_DB_URL is unset. Redis is still
+        # present because several unit-regression paths load runtime modules
+        # that initialize Redis-backed queues/caches from REDIS_URL.
         run: npx vitest run
 
       - name: Lint
@@ -113,7 +122,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@v2
+      - uses: gitleaks/gitleaks-action@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -130,9 +139,9 @@ jobs:
       fail-fast: false
       matrix:
         # Same rationale as the `validate` job: cover the engines floor (22,
-        # the .nvmrc dev pin) and the production image major (25, Dockerfile
-        # `FROM node:25-alpine`). See #396. Keep in sync with the Dockerfile.
-        node: [22, 25]
+        # the .nvmrc dev pin) and the production image major (26, Dockerfile
+        # `FROM node:26-alpine`). See #396. Keep in sync with the Dockerfile.
+        node: [22, 26]
     services:
       postgres:
         # pgvector/pgvector:pg16 ships pgvector preinstalled. The image is
@@ -183,7 +192,7 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           # Matrixed across the engines floor (.nvmrc, Node 22) and the prod
-          # image major (Node 25, Dockerfile) — see this job's strategy.matrix.
+          # image major (Node 26, Dockerfile) — see this job's strategy.matrix.
           # .nvmrc remains the single source of truth for the local dev
           # toolchain + lockfile rule (CONTRIBUTING.md → Toolchain).
           node-version: ${{ matrix.node }}

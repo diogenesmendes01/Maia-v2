@@ -63,9 +63,14 @@ const REQUIRED_ISSUE_FORM_REFERENCES = [
   'npm run lint',
 ] as const;
 
-const REQUIRED_ISSUE_FORM_FIELDS = [
-  'Agent Engineering Task',
-  'engineering-agent work on Maia',
+const REQUIRED_ISSUE_FORM_TOP_LEVEL = {
+  name: 'Agent Engineering Task',
+  description: 'Structured task intake for Claude Code, Codex, or similar engineering agents.',
+} as const;
+
+const REQUIRED_ISSUE_FORM_INTRO = ['engineering-agent work on Maia'] as const;
+
+const REQUIRED_ISSUE_FORM_LABELS = [
   'Objective',
   'Task context',
   'Likely files or modules',
@@ -74,9 +79,10 @@ const REQUIRED_ISSUE_FORM_FIELDS = [
   'Validation commands',
   'Docs impact',
   'Risk, residual risk, and rollback',
-  'Residual risk:',
   'Acceptance criteria',
 ] as const;
+
+const REQUIRED_ISSUE_FORM_PLACEHOLDERS = ['Residual risk:'] as const;
 
 const REQUIRED_PR_BODY_GOVERNANCE_WIRING = {
   script: 'tsx scripts/check-pr-body.ts',
@@ -173,6 +179,149 @@ function getMarkdownHeadings(markdown: string): Set<string> {
 
 function hasStructuredTemplateField(lines: string[], field: string): boolean {
   return lines.includes(field) || lines.includes(`- ${field}`);
+}
+
+function getIndent(line: string): number {
+  return line.search(/\S/);
+}
+
+function stripYamlScalar(value: string): string {
+  const trimmed = value.trim();
+
+  return trimmed.replace(/^['"]|['"]$/g, '');
+}
+
+function getTopLevelYamlScalarValues(yaml: string, key: string): string[] {
+  return normalizeLineEndings(yaml)
+    .split('\n')
+    .flatMap((line) => {
+      const scalarMatch = line.match(new RegExp(`^${key}:\\s*(.+?)\\s*$`));
+
+      return scalarMatch ? [stripYamlScalar(scalarMatch[1])] : [];
+    });
+}
+
+function getYamlScalarValues(yaml: string, key: string): string[] {
+  const values: string[] = [];
+  let blockScalarParentIndent: number | null = null;
+
+  for (const line of normalizeLineEndings(yaml).split('\n')) {
+    const trimmed = line.trim();
+
+    if (!trimmed || trimmed.startsWith('#')) {
+      continue;
+    }
+
+    const indent = getIndent(line);
+
+    if (blockScalarParentIndent !== null) {
+      if (indent > blockScalarParentIndent) {
+        continue;
+      }
+
+      blockScalarParentIndent = null;
+    }
+
+    const blockScalarMatch = line.match(/^(\s*)[\w-]+:\s*[|>]/);
+
+    if (blockScalarMatch) {
+      blockScalarParentIndent = blockScalarMatch[1].length;
+      continue;
+    }
+
+    const scalarMatch = line.match(new RegExp(`^\\s*${key}:\\s*(.+?)\\s*$`));
+
+    if (scalarMatch) {
+      values.push(stripYamlScalar(scalarMatch[1]));
+    }
+  }
+
+  return values;
+}
+
+function collectYamlBlockScalar(lines: string[], startIndex: number, parentIndent: number): string {
+  const blockLines: string[] = [];
+
+  for (let index = startIndex + 1; index < lines.length; index += 1) {
+    const blockLine = lines[index];
+    const trimmed = blockLine.trim();
+
+    if (!trimmed) {
+      blockLines.push('');
+      continue;
+    }
+
+    if (getIndent(blockLine) <= parentIndent) {
+      break;
+    }
+
+    blockLines.push(blockLine.slice(parentIndent + 2));
+  }
+
+  return blockLines.join('\n').trim();
+}
+
+function getYamlBlockScalarValues(yaml: string, key: string): string[] {
+  const values: string[] = [];
+  const lines = normalizeLineEndings(yaml).split('\n');
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const blockScalarMatch = line.match(new RegExp(`^(\\s*)${key}:\\s*[|>]`));
+
+    if (!blockScalarMatch) {
+      continue;
+    }
+
+    const parentIndent = blockScalarMatch[1].length;
+    values.push(collectYamlBlockScalar(lines, index, parentIndent));
+  }
+
+  return values;
+}
+
+function getYamlIssueFormFieldBlockScalar(yaml: string, id: string, key: string): string | null {
+  const lines = normalizeLineEndings(yaml).split('\n');
+  const idIndex = lines.findIndex((line) => line.trim() === `id: ${id}`);
+
+  if (idIndex === -1) {
+    return null;
+  }
+
+  const fieldIndent = getIndent(lines[idIndex]);
+
+  for (let index = idIndex + 1; index < lines.length; index += 1) {
+    const line = lines[index];
+    const trimmed = line.trim();
+
+    if (trimmed && getIndent(line) <= fieldIndent && trimmed.startsWith('- type:')) {
+      break;
+    }
+
+    const blockScalarMatch = line.match(new RegExp(`^(\\s*)${key}:\\s*[|>]`));
+
+    if (blockScalarMatch) {
+      return collectYamlBlockScalar(lines, index, blockScalarMatch[1].length);
+    }
+  }
+
+  return null;
+}
+
+function getVisibleYamlIssueFormText(yaml: string): string {
+  const scalarValues = [
+    ...getTopLevelYamlScalarValues(yaml, 'name'),
+    ...getTopLevelYamlScalarValues(yaml, 'description'),
+    ...getTopLevelYamlScalarValues(yaml, 'title'),
+    ...getYamlScalarValues(yaml, 'label'),
+    ...getYamlScalarValues(yaml, 'description'),
+    ...getYamlScalarValues(yaml, 'placeholder'),
+  ];
+  const visibleBlockValues = getYamlBlockScalarValues(yaml, 'value')
+    .concat(getYamlBlockScalarValues(yaml, 'placeholder'))
+    .map((value) => getVisibleMarkdownLines(value).join('\n'));
+
+  return [...scalarValues, ...visibleBlockValues].join('\n');
 }
 
 function getWorkflowStepBlocks(workflow: string): string[] {
@@ -318,15 +467,43 @@ function assertPrTemplate(): void {
 
 function assertIssueForm(): void {
   const issueForm = readText('.github/ISSUE_TEMPLATE/agent-engineering-task.yml');
+  const topLevelNames = getTopLevelYamlScalarValues(issueForm, 'name');
+  const topLevelDescriptions = getTopLevelYamlScalarValues(issueForm, 'description');
+  const labels = new Set(getYamlScalarValues(issueForm, 'label'));
+  const valueBlockScalars = getYamlBlockScalarValues(issueForm, 'value');
+  const riskPlaceholder = getYamlIssueFormFieldBlockScalar(issueForm, 'risk-and-rollback', 'placeholder');
+  const visibleIssueFormText = getVisibleYamlIssueFormText(issueForm);
 
-  for (const field of REQUIRED_ISSUE_FORM_FIELDS) {
-    if (!issueForm.includes(field)) {
-      fail(`agent engineering issue form must include field: ${field}`);
+  if (!topLevelNames.includes(REQUIRED_ISSUE_FORM_TOP_LEVEL.name)) {
+    fail(`agent engineering issue form must include top-level name: ${REQUIRED_ISSUE_FORM_TOP_LEVEL.name}`);
+  }
+
+  if (!topLevelDescriptions.includes(REQUIRED_ISSUE_FORM_TOP_LEVEL.description)) {
+    fail(
+      `agent engineering issue form must include top-level description: ${REQUIRED_ISSUE_FORM_TOP_LEVEL.description}`,
+    );
+  }
+
+  for (const intro of REQUIRED_ISSUE_FORM_INTRO) {
+    if (!valueBlockScalars.some((value) => value.includes(intro))) {
+      fail(`agent engineering issue form must include intro text: ${intro}`);
+    }
+  }
+
+  for (const label of REQUIRED_ISSUE_FORM_LABELS) {
+    if (!labels.has(label)) {
+      fail(`agent engineering issue form must include label: ${label}`);
+    }
+  }
+
+  for (const placeholder of REQUIRED_ISSUE_FORM_PLACEHOLDERS) {
+    if (!riskPlaceholder?.includes(placeholder)) {
+      fail(`agent engineering issue form must include placeholder text: ${placeholder}`);
     }
   }
 
   for (const reference of REQUIRED_ISSUE_FORM_REFERENCES) {
-    if (!issueForm.includes(reference)) {
+    if (!visibleIssueFormText.includes(reference)) {
       fail(`agent engineering issue form must reference ${reference}`);
     }
   }
