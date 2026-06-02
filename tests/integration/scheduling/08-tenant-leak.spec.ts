@@ -100,9 +100,11 @@ async function seedRows(c: pg.PoolClient): Promise<void> {
   );
   // series — recurring_outreach so claimInProgressForAdvance's tipo gate matches.
   await c.query(
-    `INSERT INTO series(id, tenant_id, agent_id, tipo, status, owner_pessoa_id)
-       VALUES ($1,$2,$3,'recurring_outreach','active',$4),
-              ($5,$6,$7,'recurring_outreach','active',$8)
+    // recurring series must satisfy series_schedule_kind_check: tipo <> 'one_shot_reminder'
+    // requires rrule IS NOT NULL AND one_shot_at IS NULL (one_shot_at defaults to NULL here).
+    `INSERT INTO series(id, tenant_id, agent_id, tipo, status, owner_pessoa_id, rrule)
+       VALUES ($1,$2,$3,'recurring_outreach','active',$4,'FREQ=DAILY'),
+              ($5,$6,$7,'recurring_outreach','active',$8,'FREQ=DAILY')
        ON CONFLICT (id) DO NOTHING`,
     [SERIES_A, TENANT_A, AGENT_A, PESSOA_A, SERIES_B, TENANT_B, AGENT_B, PESSOA_B],
   );
