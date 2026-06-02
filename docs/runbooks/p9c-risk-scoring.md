@@ -21,24 +21,43 @@ de cada turno e de cada registro de conhecimento da Maia.
 llm_attempted_downgrade, triggers, decided_by }` — carrega o diagnóstico
 completo para audit sem precisar reprocessar a entrada.
 
-**Status de wiring: ambos os wrappers implementados, NENHUM conectado ao
-caminho crítico ainda.**
+**Status de wiring: turno conectado em produção; conhecimento ainda no stub
+P10a.**
 
-- `TurnRiskScorer` (`src/runtime/decision/turn-risk-scorer.ts`) existe e está
-  testado, mas `createDecisionEngine` (`src/runtime/decision/index.ts`) ainda
-  instancia `RiskScorerStubImpl` (P9b) — ver TODO(P9c #97) em
-  `risk-scorer.ts:12`.
+- `TurnRiskScorer` (`src/runtime/decision/turn-risk-scorer.ts`) está
+  **conectado ao caminho crítico em produção**. A composição de produção
+  `createProductionDecisionEngineEnv` (`src/runtime/decision/prod-env.ts:881`)
+  injeta `riskScorer: riskScorerProdAdapter` (`prod-env.ts:896`), um
+  `RiskScorerProdAdapter` (`prod-env.ts:808`) que faz a ponte da interface
+  `RiskScorer` do Decision Engine para o `scoreTurn` do P9c
+  (`prod-env.ts:827`). O `scoreTurn` (`turn-risk-scorer.ts:30`) delega para
+  `scoreTurnRisk` com `haikuRiskGate` como gate padrão
+  (`turn-risk-scorer.ts:34-35`) — ou seja, o gate Haiku **está ativo** no
+  caminho de turno em produção.
+- `RiskScorerStubImpl` (P9b) **só** é usado como fallback do composition root
+  `createDecisionEngine` (`src/runtime/decision/index.ts:214`,
+  `env.riskScorer ?? new RiskScorerStubImpl()`) **quando `riskScorer` é
+  omitido** — isto é, em test-harnesses que montam o próprio env. Produção
+  nunca cai nesse fallback porque sempre fornece o `RiskScorerProdAdapter`.
+  Esse default determinístico (sem LLM, sem I/O de rede) foi introduzido em
+  PR #377 / issue #360 para evitar que o gate Haiku ao vivo (`haikuRiskGate`)
+  fosse alcançado por harnesses, causa-raiz do flake #358 — ver comentário em
+  `index.ts:206-213`. Um harness que realmente queira o gate ao vivo precisa
+  injetá-lo explicitamente (ex.: `new TurnRiskScorerAdapter({ gate })`).
 - `KnowledgeRiskScorer` (`src/control-plane/knowledge-state-machine/knowledge-risk-scorer.ts`)
-  existe e está testado, mas o KSM (`state-machine.ts:22`) importa e usa
+  existe e está testado, mas o KSM (`state-machine.ts:22`) ainda importa e usa
   `KnowledgeRiskScorer` de `./risk-scorer.js` — que é o **stub P10a**
   (`source: 'stub:p10a'`), NÃO o wrapper P9c. O stub usa heurística
   determinística simples (kind=rule → high, confidence≥0.6 → low) sem gate LLM.
   Cutover pendente em PR dedicado.
 
-**Risk Scoring de turno (via stub P9b):** está ligado e roda a cada turno,
-mas usa a heurística determinística sem gate LLM. A pontuação HIGH/CRITICAL
-via LLM (`ambiguous=true` → Haiku) **não está ativa** no caminho de turno
-até o cutover de `TurnRiskScorer`.
+**Risk Scoring de turno (via `RiskScorerProdAdapter`):** ativo em produção e
+roda a cada turno. O `RiskScorerProdAdapter` chama `scoreTurn`, que aplica a
+heurística determinística e, quando `ambiguous=true AND nível < HIGH`, consulta
+o gate Haiku. Ou seja, a pontuação HIGH/CRITICAL via LLM
+(`ambiguous=true` → Haiku) **está ativa** no caminho de turno em produção.
+(O `RiskScorerStubImpl` determinístico sem LLM continua sendo o default apenas
+do test-harness quando `riskScorer` é omitido — ver acima.)
 
 **Risk Scoring de conhecimento (via stub P10a):** o KSM usa
 `KnowledgeRiskScorer` de `./risk-scorer.js` (stub), não o wrapper P9c. O gate
@@ -57,6 +76,16 @@ Haiku **não está ativo** no caminho de conhecimento até o cutover de
   `ScoredRisk`, `RiskTrigger`, interface `LLMGate`
 - `src/shared/risk/level.ts` — `maxRiskLevel`, `compareRiskLevel`,
   `isRiskLevel`, `InvalidRiskLevelError`
+- `src/runtime/decision/turn-risk-scorer.ts` — `scoreTurn` (wrapper P9c de
+  turno; default do gate = `haikuRiskGate`)
+- `src/runtime/decision/prod-env.ts` — `RiskScorerProdAdapter` (ponte
+  interface `RiskScorer` ↔ `scoreTurn`) e `createProductionDecisionEngineEnv`
+  (injeta o adapter de produção)
+- `src/runtime/decision/index.ts` — `createDecisionEngine` (composition root;
+  fallback para `RiskScorerStubImpl` só quando `riskScorer` é omitido) e
+  `TurnRiskScorerAdapter`
+- `src/runtime/decision/risk-scorer.ts` — `RiskScorerStubImpl` (P9b),
+  default determinístico do test-harness
 - `tests/unit/risk-heuristic.spec.ts` — 81 testes (tabelas, coerção)
 - `tests/unit/risk-scorer.spec.ts` — 88 testes (orquestração, no-downgrade)
 - `tests/unit/risk-llm-gate.spec.ts` — 35 testes (Zod, fail-closed)
@@ -238,39 +267,48 @@ sempre retornarão `{}`.
 | Componente | Estado |
 |---|---|
 | `src/shared/risk/` (heurística + scorer + gate) | Implementado e testado |
-| `TurnRiskScorer` (P9c wrapper, turno) | **Implementado, NÃO conectado ao hot path** |
+| `TurnRiskScorer` (P9c wrapper, turno) | **Em produção** — `createProductionDecisionEngineEnv` injeta `RiskScorerProdAdapter` (`prod-env.ts:896`), que chama `scoreTurn` com gate Haiku ativo |
 | `KnowledgeRiskScorer` (P9c wrapper, conhecimento) | **Implementado, NÃO conectado ao KSM** |
-| `RiskScorerStubImpl` (P9b) | **Em produção** — usado por `createDecisionEngine` |
+| `RiskScorerProdAdapter` (P9c, turno) | **Em produção** — injetado por `createProductionDecisionEngineEnv` (`prod-env.ts:881`) |
+| `RiskScorerStubImpl` (P9b) | **Default apenas do test-harness** — usado por `createDecisionEngine` (`index.ts:214`) somente quando `riskScorer` é omitido (PR #377 / #360) |
 | `KnowledgeRiskScorer` stub em `./risk-scorer.js` | **Em produção** — usado pelo KSM (`state-machine.ts:22`), `source: 'stub:p10a'` |
 
-> **Nota de verificação (round-1 incorreto):** a revisão round-1 afirmou que
-> `KnowledgeRiskScorer` de P9c estava "conectado ao KSM e funcionando
-> normalmente". Isso estava errado. O KSM importa `KnowledgeRiskScorer` de
-> `./risk-scorer.js` (stub P10a, `src/control-plane/knowledge-state-machine/risk-scorer.ts`),
-> não do wrapper P9c (`knowledge-risk-scorer.ts`). O stub retorna
+> **Nota de verificação:** o caminho de **turno** já fez cutover — produção
+> injeta `RiskScorerProdAdapter` (`prod-env.ts:896`), que delega ao `scoreTurn`
+> do P9c com gate Haiku ativo. O `RiskScorerStubImpl` (P9b) permanece apenas
+> como default do test-harness em `createDecisionEngine` (`index.ts:214`) quando
+> `riskScorer` é omitido (PR #377 / #360). O caminho de **conhecimento** ainda
+> NÃO fez cutover: o KSM importa `KnowledgeRiskScorer` de `./risk-scorer.js`
+> (stub P10a, `src/control-plane/knowledge-state-machine/risk-scorer.ts`), não
+> do wrapper P9c (`knowledge-risk-scorer.ts`). O stub retorna
 > `source: 'stub:p10a'` e não consulta o gate Haiku.
 
-### Cutover pendente
+### Cutover
 
-Dois cutovers são necessários, cada um em PR dedicado:
+- **TurnRiskScorer — CONCLUÍDO em produção.** `createProductionDecisionEngineEnv`
+  injeta `RiskScorerProdAdapter` (`prod-env.ts:896`), que faz a ponte para o
+  `scoreTurn` do P9c. O fallback `RiskScorerStubImpl` em `createDecisionEngine`
+  (`index.ts:214`) só é usado quando `riskScorer` é omitido (test-harnesses).
+- **KnowledgeRiskScorer P9c — PENDENTE**, em PR dedicado. Substituirá o stub em
+  `src/control-plane/knowledge-state-machine/state-machine.ts:22` — a linha
+  `import { KnowledgeRiskScorer } from './risk-scorer.js'` passará a importar
+  de `./knowledge-risk-scorer.js`.
 
-1. **TurnRiskScorer** substituirá `RiskScorerStubImpl` em `createDecisionEngine`
-   (ver `src/runtime/decision/index.ts:105` e TODO em `risk-scorer.ts:12`).
-2. **KnowledgeRiskScorer P9c** substituirá o stub em
-   `src/control-plane/knowledge-state-machine/state-machine.ts:22` — a linha
-   `import { KnowledgeRiskScorer } from './risk-scorer.js'` passará a importar
-   de `./knowledge-risk-scorer.js`.
-
-Nenhum desses cutovers faz parte deste PR.
-
-Até os cutovers:
-- Turnos são pontuados pela heurística do P9b stub (determinística, sem LLM).
-- `HIGH`/`CRITICAL` via gate Haiku **não está ativo** para risco de turno.
+O cutover de conhecimento não faz parte deste PR. Até ele:
 - Conhecimento é pontuado pelo stub P10a (heurística simples, sem gate Haiku).
+
+Em produção, no caminho de turno:
+- Turnos são pontuados pelo `RiskScorerProdAdapter` → `scoreTurn` (heurística
+  determinística + gate Haiku quando `ambiguous=true AND nível < HIGH`).
+- `HIGH`/`CRITICAL` via gate Haiku **está ativo** para risco de turno.
 
 ### Pós-cutover
 
-Sem flag — o cutover é feito trocando a instância em `createDecisionEngine`.
+Sem flag. No caminho de turno o cutover já está feito por injeção: a fábrica
+de produção `createProductionDecisionEngineEnv` injeta `riskScorer:
+riskScorerProdAdapter` (`prod-env.ts:896`), e o composition root usa o adapter
+injetado em vez do `RiskScorerStubImpl` (`index.ts:214`). O cutover de
+conhecimento (pendente) será feito trocando o import em `state-machine.ts:22`.
 Adicionar um novo topic após o cutover: editar `TOPIC_RISK` em `heuristic.ts`;
 turnos em andamento não são re-scored retroativamente.
 
