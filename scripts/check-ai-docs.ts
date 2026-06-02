@@ -46,6 +46,14 @@ const REQUIRED_PR_TEMPLATE_SECTIONS = [
 
 const REQUIRED_PR_TEMPLATE_FIELDS = ['Residual risk:'] as const;
 
+const REQUIRED_PR_TEMPLATE_OUTPUT_FIELDS = [
+  'Context read:',
+  'Files changed:',
+  'Validation run:',
+  'Validation not run:',
+  'Skipped checks and reason:',
+] as const;
+
 const REQUIRED_ISSUE_FORM_REFERENCES = [
   'docs/ai/task-spec-template.md',
   'docs/ai/coding-agent-playbook.md',
@@ -283,6 +291,12 @@ function assertPrTemplate(): void {
   for (const field of REQUIRED_PR_TEMPLATE_FIELDS) {
     if (!template.includes(field)) {
       fail(`pull request template must include field: ${field}`);
+    }
+  }
+
+  for (const field of REQUIRED_PR_TEMPLATE_OUTPUT_FIELDS) {
+    if (!template.includes(field)) {
+      fail(`pull request template must include output field: ${field}`);
     }
   }
 
