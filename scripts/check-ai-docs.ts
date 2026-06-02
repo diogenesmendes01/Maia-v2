@@ -71,8 +71,12 @@ const REQUIRED_ISSUE_FORM_FIELDS = [
 ] as const;
 
 const REQUIRED_PR_BODY_GOVERNANCE_WIRING = {
-  packageJson: ['"pr:body:check": "tsx scripts/check-pr-body.ts"'],
-  ci: ['PR body governance', "github.event_name == 'pull_request'", 'npm run pr:body:check'],
+  script: 'tsx scripts/check-pr-body.ts',
+  ciStep: {
+    name: 'PR body governance',
+    if: "github.event_name == 'pull_request'",
+    run: 'npm run pr:body:check',
+  },
 } as const;
 
 const FORBIDDEN_ACTIVE_REFERENCES = [
@@ -86,6 +90,10 @@ const FORBIDDEN_STRATEGY_PHRASES_IN_SUPERPOWER_SPECS = [
   'agent-primary documentation',
   'Claude Code, Codex, or similar',
 ] as const;
+
+type PackageJson = {
+  scripts?: Record<string, string>;
+};
 
 function readText(path: string): string {
   return readFileSync(join(ROOT, path), 'utf8');
@@ -116,6 +124,80 @@ function fail(message: string): never {
   process.exit(1);
 }
 
+function normalizeLineEndings(value: string): string {
+  return value.replace(/\r\n?/g, '\n');
+}
+
+function getMarkdownHeadings(markdown: string): Set<string> {
+  const headings = new Set<string>();
+  let inFence = false;
+  let inHtmlComment = false;
+
+  for (const line of normalizeLineEndings(markdown).split('\n')) {
+    const trimmed = line.trim();
+
+    if (inHtmlComment) {
+      inHtmlComment = !trimmed.includes('-->');
+      continue;
+    }
+
+    if (trimmed.startsWith('<!--')) {
+      inHtmlComment = !trimmed.includes('-->');
+      continue;
+    }
+
+    if (trimmed.startsWith('```') || trimmed.startsWith('~~~')) {
+      inFence = !inFence;
+      continue;
+    }
+
+    if (!inFence && trimmed.startsWith('## ')) {
+      headings.add(trimmed);
+    }
+  }
+
+  return headings;
+}
+
+function getWorkflowStepBlocks(workflow: string): string[] {
+  const blocks: string[] = [];
+  let current: string[] = [];
+
+  for (const line of normalizeLineEndings(workflow).split('\n')) {
+    if (/^\s{6}-\s+name:\s+/.test(line)) {
+      if (current.length > 0) {
+        blocks.push(current.join('\n'));
+      }
+
+      current = [line];
+      continue;
+    }
+
+    if (current.length > 0) {
+      current.push(line);
+    }
+  }
+
+  if (current.length > 0) {
+    blocks.push(current.join('\n'));
+  }
+
+  return blocks;
+}
+
+function hasExpectedPrBodyGovernanceStep(workflow: string): boolean {
+  return getWorkflowStepBlocks(workflow).some((block) => {
+    const expected = REQUIRED_PR_BODY_GOVERNANCE_WIRING.ciStep;
+    const lines = block.split('\n').map((line) => line.trim());
+
+    return (
+      lines.includes(`- name: ${expected.name}`) &&
+      lines.includes(`if: ${expected.if}`) &&
+      lines.includes(`run: ${expected.run}`)
+    );
+  });
+}
+
 function assertRequiredFiles(): void {
   for (const path of REQUIRED_FILES) {
     if (!existsSync(join(ROOT, path))) {
@@ -136,9 +218,10 @@ function assertAgentsPointers(): void {
 
 function assertPrTemplate(): void {
   const template = readText('.github/pull_request_template.md');
+  const headings = getMarkdownHeadings(template);
 
   for (const section of REQUIRED_PR_TEMPLATE_SECTIONS) {
-    if (!template.includes(section)) {
+    if (!headings.has(section)) {
       fail(`pull request template must include section: ${section}`);
     }
   }
@@ -173,19 +256,15 @@ function assertIssueForm(): void {
 }
 
 function assertPrBodyGovernanceWiring(): void {
-  const packageJson = readText('package.json');
+  const packageJson = JSON.parse(readText('package.json')) as PackageJson;
   const ci = readText('.github/workflows/ci.yml');
 
-  for (const reference of REQUIRED_PR_BODY_GOVERNANCE_WIRING.packageJson) {
-    if (!packageJson.includes(reference)) {
-      fail(`package.json must wire PR body governance with ${reference}`);
-    }
+  if (packageJson.scripts?.['pr:body:check'] !== REQUIRED_PR_BODY_GOVERNANCE_WIRING.script) {
+    fail('package.json must wire PR body governance with pr:body:check');
   }
 
-  for (const reference of REQUIRED_PR_BODY_GOVERNANCE_WIRING.ci) {
-    if (!ci.includes(reference)) {
-      fail(`CI must wire PR body governance with ${reference}`);
-    }
+  if (!hasExpectedPrBodyGovernanceStep(ci)) {
+    fail('CI must wire PR body governance in one pull_request-only step');
   }
 }
 

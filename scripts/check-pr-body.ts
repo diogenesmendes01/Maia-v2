@@ -28,6 +28,41 @@ function fail(message: string): never {
   process.exit(1);
 }
 
+function normalizeLineEndings(value: string): string {
+  return value.replace(/\r\n?/g, '\n');
+}
+
+function getMarkdownHeadings(markdown: string): Set<string> {
+  const headings = new Set<string>();
+  let inFence = false;
+  let inHtmlComment = false;
+
+  for (const line of normalizeLineEndings(markdown).split('\n')) {
+    const trimmed = line.trim();
+
+    if (inHtmlComment) {
+      inHtmlComment = !trimmed.includes('-->');
+      continue;
+    }
+
+    if (trimmed.startsWith('<!--')) {
+      inHtmlComment = !trimmed.includes('-->');
+      continue;
+    }
+
+    if (trimmed.startsWith('```') || trimmed.startsWith('~~~')) {
+      inFence = !inFence;
+      continue;
+    }
+
+    if (!inFence && trimmed.startsWith('## ')) {
+      headings.add(trimmed);
+    }
+  }
+
+  return headings;
+}
+
 function main(): void {
   const eventPath = process.env.GITHUB_EVENT_PATH;
 
@@ -52,14 +87,16 @@ function main(): void {
     return;
   }
 
-  const body = pullRequest.body ?? '';
+  const body = normalizeLineEndings(pullRequest.body ?? '');
 
   if (!body.trim()) {
     fail('pull request body is empty; keep the agent-aware PR template sections');
   }
 
+  const headings = getMarkdownHeadings(body);
+
   for (const section of REQUIRED_PR_BODY_SECTIONS) {
-    if (!body.includes(section)) {
+    if (!headings.has(section)) {
       fail(`pull request body must include section: ${section}`);
     }
   }
