@@ -423,3 +423,115 @@ describe('scheduling tenant isolation — dispatcher enumerations', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// RAW-CTE CLAIM/RECLAIM PATHS — the `db.execute(sql`…`)` hot paths (#355 Gap A)
+// ---------------------------------------------------------------------------
+//
+// The behavioural store-mock above renders Drizzle query-builder `.where(...)`
+// fragments and so catches a dropped tenant predicate on every builder-based
+// read/write. But the FOR UPDATE SKIP LOCKED claim/reclaim CTEs do NOT go
+// through the builder — they are hand-written `db.execute(sql`…`)` strings, and
+// the store-mock returns `{ rows: [] }` for `db.execute` WITHOUT ever inspecting
+// the SQL. A future edit dropping `${tenantFilter(...)}` from a CTE (or the
+// tenant-fenced occurrence↔series join) would therefore pass every other test
+// in this file silently — a cross-tenant claim leak.
+//
+// These tests close that hole: they capture the literal SQL text each of the 5
+// claim/reclaim methods hands to `db.execute`, render it via the same PgDialect
+// the repo uses, and assert the rendered predicate carries BOTH the `tenant_id`
+// and `agent_id` filter (params `$N`, since `tenantFilter` interpolates the ALS
+// values as bind params). Removing a tenant predicate from any CTE makes the
+// corresponding assertion FAIL — the executable backstop the mock alone lacks.
+//
+// `db.execute` returns `{ rows: [] }`, so each method's `ids.length === 0`
+// early-return skips the (separately-covered, builder-based) re-fetch SELECT;
+// the single captured statement per call is the claim/reclaim CTE itself.
+describe('scheduling tenant isolation — raw-CTE claim/reclaim predicates (Gap A)', () => {
+  /** Capture every SQL string `db.execute` receives, rendered to text. */
+  async function captureSql(fn: () => Promise<unknown>): Promise<string[]> {
+    const captured: string[] = [];
+    executeMock.mockImplementation(async (q: unknown) => {
+      captured.push(_dialect.sqlToQuery(q as SQL).sql);
+      return { rows: [] as unknown[] };
+    });
+    await runWithTenantContext(A, fn);
+    return captured;
+  }
+
+  // The exact tenant-predicate substrings asserted below (whitespace-tolerant).
+  // `tenantFilter(t, a)` => `tenant_id = $N AND agent_id = $M`.
+  const TENANT_EQ = /tenant_id\s*=\s*\$\d+/i;
+  const AGENT_EQ = /agent_id\s*=\s*\$\d+/i;
+
+  it('occurrencesRepo.claimDue CTE is fenced to tenant_id + agent_id', async () => {
+    const [cte, ...rest] = await captureSql(() => occurrencesRepo.claimDue('w-A', 10));
+    expect(rest).toHaveLength(0); // ids empty → no re-fetch SELECT executed
+    expect(cte).toMatch(/FOR UPDATE SKIP LOCKED/i); // sanity: this is the claim CTE
+    // Proof: the lock-and-update set is scoped to the routed tenant/agent, so a
+    // tick for tenant A can never claim tenant B's due occurrences.
+    expect(cte).toMatch(TENANT_EQ);
+    expect(cte).toMatch(AGENT_EQ);
+  });
+
+  it('occurrencesRepo.reclaimExpiredLeases CTE is fenced to tenant_id + agent_id', async () => {
+    const [cte] = await captureSql(() => occurrencesRepo.reclaimExpiredLeases('w-A', 300, 10));
+    expect(cte).toMatch(/FOR UPDATE SKIP LOCKED/i);
+    // Proof: a lease-reaper pass for tenant A never resets tenant B's expired
+    // claims back to pending.
+    expect(cte).toMatch(TENANT_EQ);
+    expect(cte).toMatch(AGENT_EQ);
+  });
+
+  it('occurrencesRepo.claimInProgressForAdvance scopes the occurrence AND tenant-fences the series join', async () => {
+    const [cte, ...rest] = await captureSql(() =>
+      occurrencesRepo.claimInProgressForAdvance('w-A', 10),
+    );
+    expect(rest).toHaveLength(0); // ids empty → no re-fetch SELECT executed
+    expect(cte).toMatch(/FOR UPDATE SKIP LOCKED/i);
+    // Proof (occurrence side): the claim only locks tenant A's in_progress rows.
+    expect(cte).toMatch(/o\.tenant_id\s*=\s*\$\d+/i);
+    expect(cte).toMatch(/o\.agent_id\s*=\s*\$\d+/i);
+    // Proof (join fence): the occurrence↔series JOIN additionally requires
+    // matching tenant/agent on BOTH sides, so a cross-tenant series_id
+    // collision can't smuggle in a foreign row via the join.
+    expect(cte).toMatch(/s\.tenant_id\s*=\s*o\.tenant_id/i);
+    expect(cte).toMatch(/s\.agent_id\s*=\s*o\.agent_id/i);
+  });
+
+  it('outboxRepo.claimDue CTE is fenced to tenant_id + agent_id', async () => {
+    const [cte, ...rest] = await captureSql(() => outboxRepo.claimDue('w-A', 10));
+    expect(rest).toHaveLength(0); // ids empty → no re-fetch SELECT executed
+    expect(cte).toMatch(/FOR UPDATE SKIP LOCKED/i);
+    // Proof: the outbox relayer for tenant A never claims tenant B's due rows.
+    expect(cte).toMatch(TENANT_EQ);
+    expect(cte).toMatch(AGENT_EQ);
+  });
+
+  it('outboxRepo.reclaimExpiredLeases CTE is fenced to tenant_id + agent_id', async () => {
+    const [cte] = await captureSql(() => outboxRepo.reclaimExpiredLeases('w-A', 300, 10));
+    expect(cte).toMatch(/FOR UPDATE SKIP LOCKED/i);
+    // Proof: a relayer lease-reaper for tenant A never returns tenant B's
+    // expired outbox claims to pending.
+    expect(cte).toMatch(TENANT_EQ);
+    expect(cte).toMatch(AGENT_EQ);
+  });
+
+  // Belt-and-suspenders: a single guard that ALL five raw CTEs carry a tenant
+  // AND an agent predicate. This is the test that goes red the instant ANY
+  // claim/reclaim CTE loses its `${tenantFilter(...)}` (or the join fence).
+  it('every raw claim/reclaim CTE carries a tenant_id AND agent_id predicate', async () => {
+    const ctes = [
+      ...(await captureSql(() => occurrencesRepo.claimDue('w-A', 10))),
+      ...(await captureSql(() => occurrencesRepo.reclaimExpiredLeases('w-A', 300, 10))),
+      ...(await captureSql(() => occurrencesRepo.claimInProgressForAdvance('w-A', 10))),
+      ...(await captureSql(() => outboxRepo.claimDue('w-A', 10))),
+      ...(await captureSql(() => outboxRepo.reclaimExpiredLeases('w-A', 300, 10))),
+    ];
+    expect(ctes).toHaveLength(5); // exactly one statement per claim/reclaim call
+    for (const cte of ctes) {
+      expect(cte).toMatch(TENANT_EQ);
+      expect(cte).toMatch(AGENT_EQ);
+    }
+  });
+});
