@@ -32,8 +32,8 @@ function normalizeLineEndings(value: string): string {
   return value.replace(/\r\n?/g, '\n');
 }
 
-function getMarkdownHeadings(markdown: string): Set<string> {
-  const headings = new Set<string>();
+function getVisibleMarkdownLines(markdown: string): string[] {
+  const lines: string[] = [];
   let inFence = false;
   let inHtmlComment = false;
 
@@ -55,12 +55,20 @@ function getMarkdownHeadings(markdown: string): Set<string> {
       continue;
     }
 
-    if (!inFence && trimmed.startsWith('## ')) {
-      headings.add(trimmed);
+    if (!inFence && trimmed) {
+      lines.push(trimmed);
     }
   }
 
-  return headings;
+  return lines;
+}
+
+function getMarkdownHeadings(lines: string[]): Set<string> {
+  return new Set(lines.filter((line) => line.startsWith('## ')));
+}
+
+function hasStructuredPrBodyField(lines: string[], field: string): boolean {
+  return lines.includes(field) || lines.includes(`- ${field}`);
 }
 
 function main(): void {
@@ -93,7 +101,8 @@ function main(): void {
     fail('pull request body is empty; keep the agent-aware PR template sections');
   }
 
-  const headings = getMarkdownHeadings(body);
+  const visibleLines = getVisibleMarkdownLines(body);
+  const headings = getMarkdownHeadings(visibleLines);
 
   for (const section of REQUIRED_PR_BODY_SECTIONS) {
     if (!headings.has(section)) {
@@ -102,7 +111,7 @@ function main(): void {
   }
 
   for (const field of REQUIRED_PR_BODY_FIELDS) {
-    if (!body.includes(field)) {
+    if (!hasStructuredPrBodyField(visibleLines, field)) {
       fail(`pull request body must include field: ${field}`);
     }
   }
