@@ -884,9 +884,9 @@ async function runAgentForMensagemInner(
 
   let tools = getToolSchemas(scope.byEntity);
 
-  // P9b — Decision Engine gate: runs BEFORE the LLM call.
-  // Flag OFF (default) → zero behaviour change.
-  // Flag ON → engine gates the turn; tool_reductions applied to toolSet.
+  // P11 — Decision Engine gate: always runs BEFORE the LLM call. The engine
+  // gates the turn (block/escalate short-circuit) and tool_reductions are
+  // applied to the toolSet; an engine error fails closed (see catch below).
   try {
     const baseCtx = buildBaseContextPacketFromTurn({
       inbound,
@@ -1043,8 +1043,8 @@ async function runAgentForMensagemInner(
     }
   } catch (err) {
     if (err instanceof DecisionEngineFailClosedError) {
-      // fail-closed: engine errored and FEATURE_DECISION_ENGINE_ERROR_FALLBACK='fail-closed'
-      // → block the turn, reply to user, skip LLM
+      // fail-closed: the always-on engine errored → block the turn, reply to
+      // user, skip LLM (there is no legacy fallback path anymore)
       const failMsg = 'Sistema indisponível temporariamente. Tente novamente em alguns instantes.';
       await sendOutbound(pessoa.id, c.id, failMsg, inbound.id).catch((e) =>
         logger.warn({ err: (e as Error).message }, 'agent.decision_engine.fail_closed_reply_failed'),

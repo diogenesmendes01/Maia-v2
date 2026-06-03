@@ -40,23 +40,10 @@ export class FeatureFlags {
 import { config } from './env.js';
 
 export const featureFlags = new FeatureFlags({
-  [FeatureFlagName.P0_TENANT_GUARD_ENFORCED]: config.FEATURE_P0_TENANT_GUARD_ENFORCED,
-  [FeatureFlagName.OPERATIONAL_PROFILE_V2]: config.FEATURE_OPERATIONAL_PROFILE_V2,
-  [FeatureFlagName.DIALOGICAL_ACQUISITION]: config.FEATURE_DIALOGICAL_ACQUISITION,
+  // P6 — separação Agent/Channel/Role + Role Policy. Gates channel resolution
+  // (channel-resolver / baileys jid resolver); removing it breaks prod.
   [FeatureFlagName.MULTI_CHANNEL]: config.FEATURE_MULTI_CHANNEL,
+  // P7 — grafo cognitivo formal (partial). Gates the cognitive-graph path in
+  // agent/core.ts; removing it breaks prod.
   [FeatureFlagName.COGNITIVE_GRAPH]: config.FEATURE_COGNITIVE_GRAPH,
-  [FeatureFlagName.CALENDAR_V2]: config.FEATURE_CALENDAR_V2,
-  [FeatureFlagName.P8C_USER_LAYER_NAMESPACE_V1]: config.FEATURE_P8C_USER_LAYER_NAMESPACE_V1,
-  [FeatureFlagName.FEATURE_SOUL_LAYER_V1]: config.FEATURE_SOUL_LAYER_V1,
-  [FeatureFlagName.POLICY_RESOLVER_V1]: config.FEATURE_POLICY_RESOLVER_V1,
-  [FeatureFlagName.SKILL_REGISTRY_V1]: config.FEATURE_SKILL_REGISTRY_V1,
-  [FeatureFlagName.KNOWLEDGE_STATE_MACHINE_V1]: config.FEATURE_KNOWLEDGE_STATE_MACHINE_V1,
-  [FeatureFlagName.RUNTIME_TRACE_V1]: config.FEATURE_RUNTIME_TRACE_V1,
 });
-
-/**
- * P10a — Knowledge State Machine feature flag, exposed as named constant
- * for module-level early-returns (workers, tool registration).
- */
-export const FEATURE_KNOWLEDGE_STATE_MACHINE_V1 =
-  config.FEATURE_KNOWLEDGE_STATE_MACHINE_V1;

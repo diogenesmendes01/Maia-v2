@@ -339,13 +339,19 @@ export function buildToolCatalog(): CatalogEntry[] {
 
 /**
  * The NAME of the flag gating a tool already present in `REGISTRY`:
- *   - KSM `propose_*` tools → `FeatureFlagName.KNOWLEDGE_STATE_MACHINE_V1`.
+ *   - KSM `propose_*` tools → 'KNOWLEDGE_STATE_MACHINE_V1'.
  *   - tools that declare `feature_flag` (calendar write tools) → that value.
  *   - otherwise null (ungated, or config-gated tools handled separately).
+ *
+ * P11: KSM behavior collapsed to always-on and the FeatureFlagName enum entry
+ * was removed, but the catalog still surfaces this flag NAME so the generated
+ * admin-ui artifact stays stable until the admin-ui teardown wave. The
+ * admin-ui maps the literal 'KNOWLEDGE_STATE_MACHINE_V1' to
+ * config.FEATURE_KNOWLEDGE_STATE_MACHINE_V1.
  */
 function gatingFlagName(tool: AnyTool): string | null {
   if (KSM_PROPOSE_TOOLS.has(tool.name)) {
-    return FeatureFlagName.KNOWLEDGE_STATE_MACHINE_V1;
+    return 'KNOWLEDGE_STATE_MACHINE_V1';
   }
   if (tool.feature_flag !== undefined) {
     return tool.feature_flag;

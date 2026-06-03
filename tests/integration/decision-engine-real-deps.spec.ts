@@ -168,17 +168,11 @@ vi.mock('@/lib/metrics.js', () => ({
   observeHistogram: vi.fn(),
 }));
 
-// Mock: feature flag
-vi.mock('@/runtime/feature-flags/decision-engine-flag.js', () => ({
-  isDecisionEngineV1Enabled: vi.fn(),
-}));
-
 // Import AFTER mocks are registered
 import { policyDescriptorResolver as mockResolver } from '@/control-plane/policy/policy-descriptor-resolver.js';
 import { policyRulesRepo as mockPolicyRepo } from '@/control-plane/policy/policy-rules-repo.js';
 import { evaluate as mockEvaluate } from '@/governance/policy-dsl/evaluator.js';
 import { skillsRepo as mockSkillsRepo } from '@/control-plane/skill-registry/skills-repo.js';
-import { isDecisionEngineV1Enabled } from '@/runtime/feature-flags/decision-engine-flag.js';
 import {
   runDecisionEngineIfEnabled,
   _resetDecisionEngineSingleton,
@@ -244,11 +238,9 @@ describe('Decision Engine — real adapter wiring (mocked DB)', () => {
   });
 
   // -------------------------------------------------------------------------
-  // T1: Flag ON + blocking policy → decision_class='blocked'
+  // T1: blocking policy → decision_class='blocked'
   // -------------------------------------------------------------------------
-  it('T1: flag ON + blocking policy rule → packet action_mode reflects block (not ask_clarification default)', async () => {
-    vi.mocked(isDecisionEngineV1Enabled).mockResolvedValue(true);
-
+  it('T1: blocking policy rule → packet action_mode reflects block (not ask_clarification default)', async () => {
     // Resolver returns one active rule for the wildcard descriptor.
     // Return P8e-shaped output: {resolved, unresolved, failures}.
     const resolvedPolicy: ResolvedPolicy = {
@@ -337,11 +329,9 @@ describe('Decision Engine — real adapter wiring (mocked DB)', () => {
   });
 
   // -------------------------------------------------------------------------
-  // T2: Flag ON + skill descriptor active → tool_reductions in packet
+  // T2: skill descriptor active → tool_reductions in packet
   // -------------------------------------------------------------------------
-  it('T2: flag ON + active skill in registry → tool_reductions reflect real skill state', async () => {
-    vi.mocked(isDecisionEngineV1Enabled).mockResolvedValue(true);
-
+  it('T2: active skill in registry → tool_reductions reflect real skill state', async () => {
     // Resolver returns an empty list (no blocking policies).
     vi.mocked(mockResolver.resolveDescriptors).mockResolvedValue(
       { resolved: [], unresolved: [], failures: [] } as unknown as PolicyDescriptorResolverOutput,
@@ -402,22 +392,4 @@ describe('Decision Engine — real adapter wiring (mocked DB)', () => {
     );
   });
 
-  // -------------------------------------------------------------------------
-  // T3: Flag OFF → no engine call, no adapter invocations
-  // -------------------------------------------------------------------------
-  it('T3: flag OFF → engine not called, no DB queries to policy_rules', async () => {
-    vi.mocked(isDecisionEngineV1Enabled).mockResolvedValue(false);
-
-    const r = await runDecisionEngineIfEnabled(mkBase());
-
-    expect(r.engine_ran).toBe(false);
-    expect(r.skip_reason).toBe('flag_off');
-    expect(r.result).toBeUndefined();
-
-    // No adapter methods should have been called.
-    expect(mockResolver.resolveDescriptors).not.toHaveBeenCalled();
-    expect(mockPolicyRepo.getById).not.toHaveBeenCalled();
-    expect(mockEvaluate).not.toHaveBeenCalled();
-    expect(mockSkillsRepo.listByCategory).not.toHaveBeenCalled();
-  });
 });

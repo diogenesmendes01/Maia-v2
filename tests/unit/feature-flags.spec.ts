@@ -7,28 +7,28 @@ describe('FeatureFlags', () => {
 
   beforeEach(() => {
     flags = new FeatureFlags({
-      [FeatureFlagName.P0_TENANT_GUARD_ENFORCED]: false,
+      [FeatureFlagName.MULTI_CHANNEL]: false,
     });
   });
 
   it('retorna valor da configuração inicial', () => {
-    expect(flags.isEnabled(FeatureFlagName.P0_TENANT_GUARD_ENFORCED)).toBe(false);
+    expect(flags.isEnabled(FeatureFlagName.MULTI_CHANNEL)).toBe(false);
   });
 
   it('permite override em runtime', () => {
-    flags.override(FeatureFlagName.P0_TENANT_GUARD_ENFORCED, true);
-    expect(flags.isEnabled(FeatureFlagName.P0_TENANT_GUARD_ENFORCED)).toBe(true);
+    flags.override(FeatureFlagName.MULTI_CHANNEL, true);
+    expect(flags.isEnabled(FeatureFlagName.MULTI_CHANNEL)).toBe(true);
   });
 
   it('kill switch desliga flag mesmo se override true', () => {
-    flags.override(FeatureFlagName.P0_TENANT_GUARD_ENFORCED, true);
-    flags.killSwitch(FeatureFlagName.P0_TENANT_GUARD_ENFORCED);
-    expect(flags.isEnabled(FeatureFlagName.P0_TENANT_GUARD_ENFORCED)).toBe(false);
+    flags.override(FeatureFlagName.MULTI_CHANNEL, true);
+    flags.killSwitch(FeatureFlagName.MULTI_CHANNEL);
+    expect(flags.isEnabled(FeatureFlagName.MULTI_CHANNEL)).toBe(false);
   });
 
   it('reset limpa overrides e kill switches', () => {
-    flags.override(FeatureFlagName.P0_TENANT_GUARD_ENFORCED, true);
+    flags.override(FeatureFlagName.MULTI_CHANNEL, true);
     flags.reset();
-    expect(flags.isEnabled(FeatureFlagName.P0_TENANT_GUARD_ENFORCED)).toBe(false);
+    expect(flags.isEnabled(FeatureFlagName.MULTI_CHANNEL)).toBe(false);
   });
 });

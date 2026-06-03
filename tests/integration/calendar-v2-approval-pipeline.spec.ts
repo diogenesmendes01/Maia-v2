@@ -7,7 +7,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import { featureFlags } from '@/config/feature-flags.js';
-import { FeatureFlagName } from '@/types/enums.js';
 import {
   _internal_cache,
   cacheKey,
@@ -140,7 +139,6 @@ describe('Calendar v2 — approval pipeline (holiday)', () => {
     nextHolidayId = 1;
     for (const k of Object.keys(proposalsState)) delete proposalsState[k];
     _internal_cache.clear();
-    featureFlags.override(FeatureFlagName.CALENDAR_V2, true);
 
     holidaysCreate.mockImplementation(async (args: Record<string, unknown>) => {
       const row = {
@@ -255,7 +253,6 @@ describe('Calendar v2 — cross-tenant isolation (Cenário 5)', () => {
     holidaysState.length = 0;
     nextHolidayId = 1;
     _internal_cache.clear();
-    featureFlags.override(FeatureFlagName.CALENDAR_V2, true);
 
     holidaysCreate.mockImplementation(async (args: Record<string, unknown>) => {
       // capture current tenant via custom field

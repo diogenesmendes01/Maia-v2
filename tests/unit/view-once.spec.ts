@@ -29,6 +29,13 @@ vi.mock('../../src/gateway/baileys.js', () => ({
   sendOutboundText,
   isBaileysConnected: () => true,
 }));
+// P11: the Decision Engine is always-on and would otherwise hit real prod
+// adapters (DB/Redis) here. Mock it to a no-op pass-through (engine_ran:false →
+// agent/core.ts proceeds straight to the LLM path).
+vi.mock('../../src/runtime/decision/integration.js', () => ({
+  runDecisionEngineForTurn: vi.fn().mockResolvedValue({ engine_ran: false }),
+  DecisionEngineFailClosedError: class DecisionEngineFailClosedError extends Error {},
+}));
 vi.mock('../../src/db/repositories.js', () => ({
   pessoasRepo: { findById },
   mensagensRepo: {

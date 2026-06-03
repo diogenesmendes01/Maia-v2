@@ -45,14 +45,23 @@ import { featureFlags } from '@/config/feature-flags.js';
 import { FeatureFlagName } from '@/types/enums.js';
 
 /**
- * Env-var-name flags that gate a tool's PRESENCE in `REGISTRY` (conditional
- * spreads) rather than via the runtime `featureFlags` singleton. These are NOT
- * `FeatureFlagName` members, so they are resolved against the static config
- * boolean — mirroring how the registry/dispatcher gate them.
+ * Flag names resolved against the static config boolean rather than the runtime
+ * `featureFlags` singleton:
+ *   - Env-var-name flags (`FEATURE_SCHEDULING_V2`, `FEATURE_PDF_REPORTS`) gate a
+ *     tool's PRESENCE in `REGISTRY` via conditional spreads — never were
+ *     `FeatureFlagName` members.
+ *   - P11: `calendar_v2` / `KNOWLEDGE_STATE_MACHINE_V1` / `SKILL_REGISTRY_V1`
+ *     lost their `FeatureFlagName` enum entry when their behaviour was collapsed
+ *     to always-on, but the generated catalog still carries these gating flag
+ *     NAMES. Their env field is retained (until Wave E), so resolve them against
+ *     `config.FEATURE_*` here — matching `tools-catalog.ts`'s `FLAG_TO_CONFIG`.
  */
 const ENV_FLAG_TO_CONFIG: Readonly<Record<string, boolean>> = {
   FEATURE_SCHEDULING_V2: config.FEATURE_SCHEDULING_V2,
   FEATURE_PDF_REPORTS: config.FEATURE_PDF_REPORTS,
+  calendar_v2: config.FEATURE_CALENDAR_V2,
+  KNOWLEDGE_STATE_MACHINE_V1: config.FEATURE_KNOWLEDGE_STATE_MACHINE_V1,
+  SKILL_REGISTRY_V1: config.FEATURE_SKILL_REGISTRY_V1,
 };
 
 /** The set of valid `FeatureFlagName` VALUES, for the runtime-vs-env decision. */

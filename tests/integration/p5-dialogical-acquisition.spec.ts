@@ -41,7 +41,7 @@ import {
   getCurrentTenant,
   getCurrentAgent,
 } from '@/db/tenant-context.js';
-import { FeatureFlagName, GapLevel } from '@/types/enums.js';
+import { GapLevel } from '@/types/enums.js';
 // Runtime import (not type-only): the open-gap enumeration assertion below
 // checks the production query targets THIS exact table object. `@/db/schema.js`
 // is not mocked, so this is the same reference gap-escalation-monitor uses.
@@ -569,16 +569,11 @@ describe('P5 dialogical acquisition — end-to-end', () => {
 
   afterEach(async () => {
     const { featureFlags } = await import('@/config/feature-flags.js');
-    featureFlags.override(FeatureFlagName.DIALOGICAL_ACQUISITION, false);
-    featureFlags.unkillSwitch(FeatureFlagName.DIALOGICAL_ACQUISITION);
     featureFlags.reset();
   });
 
   // ---------- Cenário 1 ----------
   it('cenário 1: gap escalation chain (silent → dashboard → mentionable → proposed + proposer)', async () => {
-    const { featureFlags } = await import('@/config/feature-flags.js');
-    featureFlags.override(FeatureFlagName.DIALOGICAL_ACQUISITION, true);
-
     const now = new Date();
     const tenant: Tenant = {
       id: TEST_TENANT_ID,

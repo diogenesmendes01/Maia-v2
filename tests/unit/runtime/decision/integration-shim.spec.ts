@@ -83,42 +83,15 @@ function mkEnv(overrides?: Partial<CreateDecisionEngineEnv>): CreateDecisionEngi
   };
 }
 
-describe('P9b — runDecisionEngineIfEnabled shim', () => {
-  it('returns engine_ran=false when flag is OFF', async () => {
-    const prev = process.env.FEATURE_DECISION_ENGINE_V1;
-    delete process.env.FEATURE_DECISION_ENGINE_V1;
-    const metrics: MetricsClient = {
-      increment: vi.fn(),
-      recordHistogram: vi.fn(),
-    };
-    try {
-      const r = await runDecisionEngineIfEnabled(mkBase(), mkEnv(), metrics);
-      expect(r.engine_ran).toBe(false);
-      expect(r.skip_reason).toBe('flag_off');
-      expect(r.result).toBeUndefined();
-      expect(metrics.increment).toHaveBeenCalledWith('decision_engine.flag_off');
-    } finally {
-      if (prev !== undefined) process.env.FEATURE_DECISION_ENGINE_V1 = prev;
-    }
-  });
-
-  it('returns engine_ran=true with packet when flag is ON', async () => {
-    const prev = process.env.FEATURE_DECISION_ENGINE_V1;
-    process.env.FEATURE_DECISION_ENGINE_V1 = 'true';
-    try {
-      const r = await runDecisionEngineIfEnabled(mkBase(), mkEnv());
-      expect(r.engine_ran).toBe(true);
-      expect(r.result?.packet).toBeDefined();
-      expect(r.result?.packet.trace_id).toBe('t_shim_1');
-    } finally {
-      if (prev === undefined) delete process.env.FEATURE_DECISION_ENGINE_V1;
-      else process.env.FEATURE_DECISION_ENGINE_V1 = prev;
-    }
+describe('P11 — runDecisionEngineIfEnabled shim (always-on)', () => {
+  it('returns engine_ran=true with packet (engine always runs)', async () => {
+    const r = await runDecisionEngineIfEnabled(mkBase(), mkEnv());
+    expect(r.engine_ran).toBe(true);
+    expect(r.result?.packet).toBeDefined();
+    expect(r.result?.packet.trace_id).toBe('t_shim_1');
   });
 
   it('returns engine_ran=false with engine_error when engine throws', async () => {
-    const prev = process.env.FEATURE_DECISION_ENGINE_V1;
-    process.env.FEATURE_DECISION_ENGINE_V1 = 'true';
     const failingResolver: PolicyDescriptorResolver = {
       resolveDescriptors: vi.fn().mockRejectedValue(new Error('resolver crashed')),
     };
@@ -126,38 +99,15 @@ describe('P9b — runDecisionEngineIfEnabled shim', () => {
       increment: vi.fn(),
       recordHistogram: vi.fn(),
     };
-    try {
-      const r = await runDecisionEngineIfEnabled(
-        mkBase(),
-        mkEnv({ resolver: failingResolver }),
-        metrics,
-      );
-      expect(r.engine_ran).toBe(false);
-      expect(r.skip_reason).toBe('engine_error');
-      expect(metrics.increment).toHaveBeenCalledWith(
-        'decision_engine.error_fallback',
-      );
-    } finally {
-      if (prev === undefined) delete process.env.FEATURE_DECISION_ENGINE_V1;
-      else process.env.FEATURE_DECISION_ENGINE_V1 = prev;
-    }
-  });
-
-  it('kill switch beats flag ON', async () => {
-    const prev = process.env.FEATURE_DECISION_ENGINE_V1;
-    const prevKill = process.env.FEATURE_DECISION_ENGINE_V1_KILL_SWITCH;
-    process.env.FEATURE_DECISION_ENGINE_V1 = 'true';
-    process.env.FEATURE_DECISION_ENGINE_V1_KILL_SWITCH = 'true';
-    try {
-      const r = await runDecisionEngineIfEnabled(mkBase(), mkEnv());
-      expect(r.engine_ran).toBe(false);
-      expect(r.skip_reason).toBe('flag_off');
-    } finally {
-      if (prev === undefined) delete process.env.FEATURE_DECISION_ENGINE_V1;
-      else process.env.FEATURE_DECISION_ENGINE_V1 = prev;
-      if (prevKill === undefined)
-        delete process.env.FEATURE_DECISION_ENGINE_V1_KILL_SWITCH;
-      else process.env.FEATURE_DECISION_ENGINE_V1_KILL_SWITCH = prevKill;
-    }
+    const r = await runDecisionEngineIfEnabled(
+      mkBase(),
+      mkEnv({ resolver: failingResolver }),
+      metrics,
+    );
+    expect(r.engine_ran).toBe(false);
+    expect(r.skip_reason).toBe('engine_error');
+    expect(metrics.increment).toHaveBeenCalledWith(
+      'decision_engine.error_fallback',
+    );
   });
 });

@@ -27,7 +27,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { runWithTenantContext } from '@/db/tenant-context.js';
-import { FeatureFlagName, DriftType, DriftSeverity, DriftDecision } from '@/types/enums.js';
+import { DriftType, DriftSeverity, DriftDecision } from '@/types/enums.js';
 import type { AgentOperationalProfileVersion } from '@/db/schema.js';
 import type { DriftEvidence } from '@/cognition/drift/types.js';
 
@@ -363,8 +363,6 @@ describe('P4 operational identity — end-to-end', () => {
   afterEach(async () => {
     // Defensive — ensure no test leaks ON state to the next.
     const { featureFlags } = await import('@/config/feature-flags.js');
-    featureFlags.override(FeatureFlagName.OPERATIONAL_PROFILE_V2, false);
-    featureFlags.unkillSwitch(FeatureFlagName.OPERATIONAL_PROFILE_V2);
     featureFlags.reset();
   });
 
@@ -428,10 +426,7 @@ describe('P4 operational identity — end-to-end', () => {
 
   // ---------- Cenário 2 ----------
   // ---------- Cenário 3 ----------
-  it('cenário 3: prompt-builder com flag ON + active válido renderiza profile e NÃO usa self_state', async () => {
-    const { featureFlags } = await import('@/config/feature-flags.js');
-    featureFlags.override(FeatureFlagName.OPERATIONAL_PROFILE_V2, true);
-
+  it('cenário 3: prompt-builder com active válido renderiza profile e NÃO usa self_state', async () => {
     operationalProfileVersionsGetActive.mockResolvedValue(
       buildVersion({
         status: 'active',
@@ -466,10 +461,7 @@ describe('P4 operational identity — end-to-end', () => {
   });
 
   // ---------- Cenário 4 ----------
-  it('cenário 4: prompt-builder com flag ON + status=proposed faz fallback ao self_state + loga warning', async () => {
-    const { featureFlags } = await import('@/config/feature-flags.js');
-    featureFlags.override(FeatureFlagName.OPERATIONAL_PROFILE_V2, true);
-
+  it('cenário 4: prompt-builder com status=proposed faz fallback ao self_state + loga warning', async () => {
     operationalProfileVersionsGetActive.mockResolvedValue(
       buildVersion({
         status: 'proposed',

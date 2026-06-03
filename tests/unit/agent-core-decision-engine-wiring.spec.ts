@@ -1,13 +1,15 @@
 /**
- * P9b — Agent core × Decision Engine wiring: 8 tests per spec §12 + task brief.
+ * P11 — Agent core × Decision Engine wiring.
  *
  * Tests cover `runDecisionEngineForTurn` (production hot-path wrapper),
  * `applyToolReductions`, and `buildBaseContextPacketFromTurn` — the three
  * components wired into agent/core.ts's hot path.
  *
+ * The Decision Engine is now always-on (no flag/kill-switch/legacy fallback):
+ * it runs every turn and fails closed on engine error.
+ *
  * Strategy: no DB, no network. Engine singleton injected via
- * `_overrideDecisionEngineSingleton`; config flags mutated inline and
- * restored in afterEach.
+ * `_overrideDecisionEngineSingleton`.
  */
 import {
   afterEach,
@@ -27,47 +29,9 @@ import {
   applyToolReductions,
   buildBaseContextPacketFromTurn,
 } from '@/runtime/decision/build-base-context.js';
-import { config } from '@/config/env.js';
 import type { BaseContextPacket, DecisionPacket } from '@/runtime/context-packet/types.js';
 import { DEFAULT_CONTEXT_REQUIREMENTS } from '@/runtime/context-packet/types.js';
 import type { DecisionEngineResult } from '@/runtime/decision/decision-engine.js';
-
-// ─── Config flag helpers ──────────────────────────────────────────────────────
-
-type ConfigMutated = {
-  FEATURE_DECISION_ENGINE_V1: boolean;
-  FEATURE_DECISION_ENGINE_V1_KILL_SWITCH: boolean;
-  FEATURE_DECISION_ENGINE_ERROR_FALLBACK: 'fail-closed' | 'legacy';
-};
-
-/** Save + override config flags; returns a restore fn. */
-function patchConfig(overrides: Partial<ConfigMutated>): () => void {
-  const saved = {
-    FEATURE_DECISION_ENGINE_V1: config.FEATURE_DECISION_ENGINE_V1,
-    FEATURE_DECISION_ENGINE_V1_KILL_SWITCH: config.FEATURE_DECISION_ENGINE_V1_KILL_SWITCH,
-    FEATURE_DECISION_ENGINE_ERROR_FALLBACK: config.FEATURE_DECISION_ENGINE_ERROR_FALLBACK,
-  };
-  if ('FEATURE_DECISION_ENGINE_V1' in overrides) {
-    // @ts-expect-error — test override of parsed config
-    config.FEATURE_DECISION_ENGINE_V1 = overrides.FEATURE_DECISION_ENGINE_V1;
-  }
-  if ('FEATURE_DECISION_ENGINE_V1_KILL_SWITCH' in overrides) {
-    // @ts-expect-error — test override of parsed config
-    config.FEATURE_DECISION_ENGINE_V1_KILL_SWITCH = overrides.FEATURE_DECISION_ENGINE_V1_KILL_SWITCH;
-  }
-  if ('FEATURE_DECISION_ENGINE_ERROR_FALLBACK' in overrides) {
-    // @ts-expect-error — test override of parsed config
-    config.FEATURE_DECISION_ENGINE_ERROR_FALLBACK = overrides.FEATURE_DECISION_ENGINE_ERROR_FALLBACK;
-  }
-  return () => {
-    // @ts-expect-error — restore original parsed config
-    config.FEATURE_DECISION_ENGINE_V1 = saved.FEATURE_DECISION_ENGINE_V1;
-    // @ts-expect-error — restore original parsed config
-    config.FEATURE_DECISION_ENGINE_V1_KILL_SWITCH = saved.FEATURE_DECISION_ENGINE_V1_KILL_SWITCH;
-    // @ts-expect-error — restore original parsed config
-    config.FEATURE_DECISION_ENGINE_ERROR_FALLBACK = saved.FEATURE_DECISION_ENGINE_ERROR_FALLBACK;
-  };
-}
 
 // ─── BaseContextPacket factory ────────────────────────────────────────────────
 
@@ -134,7 +98,7 @@ function injectThrowingEngine(err: Error) {
 
 // ─── Suite ────────────────────────────────────────────────────────────────────
 
-describe('P9b — agent/core.ts × Decision Engine wiring (8 tests)', () => {
+describe('P11 — agent/core.ts × Decision Engine wiring (always-on)', () => {
   beforeEach(() => {
     _resetDecisionEngineSingleton();
   });
@@ -145,66 +109,20 @@ describe('P9b — agent/core.ts × Decision Engine wiring (8 tests)', () => {
   });
 
   // --------------------------------------------------------------------------
-  // T1 — flag OFF: engine skipped, skip_reason='flag_off'
+  // T3 — allow: engine returns action_mode='respond' → engine_ran=true
   // --------------------------------------------------------------------------
-  it('T1 (flag off): FEATURE_DECISION_ENGINE_V1=false → engine_ran=false, skip_reason=flag_off', async () => {
-    const restore = patchConfig({
-      FEATURE_DECISION_ENGINE_V1: false,
-      FEATURE_DECISION_ENGINE_V1_KILL_SWITCH: false,
-    });
-    try {
-      const result = await runDecisionEngineForTurn(mkBase());
-      expect(result.engine_ran).toBe(false);
-      expect(result.skip_reason).toBe('flag_off');
-    } finally {
-      restore();
-    }
-  });
-
-  // --------------------------------------------------------------------------
-  // T2 — kill switch: always returns skip_reason='kill_switch' regardless of flag
-  // --------------------------------------------------------------------------
-  it('T2 (kill switch): FEATURE_DECISION_ENGINE_V1_KILL_SWITCH=true → engine_ran=false, skip_reason=kill_switch', async () => {
-    const restore = patchConfig({
-      FEATURE_DECISION_ENGINE_V1_KILL_SWITCH: true,
-      FEATURE_DECISION_ENGINE_V1: true,
-    });
-    try {
-      const result = await runDecisionEngineForTurn(mkBase());
-      expect(result.engine_ran).toBe(false);
-      expect(result.skip_reason).toBe('kill_switch');
-    } finally {
-      restore();
-    }
-  });
-
-  // --------------------------------------------------------------------------
-  // T3 — allow: flag on + engine returns action_mode='respond' → engine_ran=true
-  // --------------------------------------------------------------------------
-  it('T3 (allow): flag on + engine returns action_mode=respond → engine_ran=true, packet returned', async () => {
-    const restore = patchConfig({
-      FEATURE_DECISION_ENGINE_V1_KILL_SWITCH: false,
-      FEATURE_DECISION_ENGINE_V1: true,
-    });
+  it('T3 (allow): engine returns action_mode=respond → engine_ran=true, packet returned', async () => {
     const fakeEngine = injectEngine({ packet: mkPacket({ action_mode: 'respond' }) });
-    try {
-      const result = await runDecisionEngineForTurn(mkBase());
-      expect(result.engine_ran).toBe(true);
-      expect(result.result?.packet.action_mode).toBe('respond');
-      expect(fakeEngine.run).toHaveBeenCalledOnce();
-    } finally {
-      restore();
-    }
+    const result = await runDecisionEngineForTurn(mkBase());
+    expect(result.engine_ran).toBe(true);
+    expect(result.result?.packet.action_mode).toBe('respond');
+    expect(fakeEngine.run).toHaveBeenCalledOnce();
   });
 
   // --------------------------------------------------------------------------
   // T4 — blocked: engine returns block → engine_ran=true, result.block populated
   // --------------------------------------------------------------------------
   it('T4 (blocked): engine returns block decision → engine_ran=true, result.block populated', async () => {
-    const restore = patchConfig({
-      FEATURE_DECISION_ENGINE_V1_KILL_SWITCH: false,
-      FEATURE_DECISION_ENGINE_V1: true,
-    });
     const blockDecision = {
       pep: 'early' as const,
       policy_id: 'p_lock',
@@ -217,24 +135,16 @@ describe('P9b — agent/core.ts × Decision Engine wiring (8 tests)', () => {
       packet: mkPacket({ action_mode: 'escalate' }),
       block: blockDecision,
     });
-    try {
-      const result = await runDecisionEngineForTurn(mkBase());
-      expect(result.engine_ran).toBe(true);
-      expect(result.result?.block).toBeDefined();
-      expect(result.result?.block?.decision).toBe('block');
-    } finally {
-      restore();
-    }
+    const result = await runDecisionEngineForTurn(mkBase());
+    expect(result.engine_ran).toBe(true);
+    expect(result.result?.block).toBeDefined();
+    expect(result.result?.block?.decision).toBe('block');
   });
 
   // --------------------------------------------------------------------------
   // T5 — requires_approval: action_mode='escalate' without hard block (dual-approval)
   // --------------------------------------------------------------------------
   it('T5 (requires_approval): engine returns action_mode=escalate without hard block → engine_ran=true', async () => {
-    const restore = patchConfig({
-      FEATURE_DECISION_ENGINE_V1_KILL_SWITCH: false,
-      FEATURE_DECISION_ENGINE_V1: true,
-    });
     injectEngine({
       packet: mkPacket({
         action_mode: 'escalate',
@@ -242,14 +152,10 @@ describe('P9b — agent/core.ts × Decision Engine wiring (8 tests)', () => {
       }),
       // no block: undefined
     });
-    try {
-      const result = await runDecisionEngineForTurn(mkBase());
-      expect(result.engine_ran).toBe(true);
-      expect(result.result?.packet.action_mode).toBe('escalate');
-      expect(result.result?.block).toBeUndefined();
-    } finally {
-      restore();
-    }
+    const result = await runDecisionEngineForTurn(mkBase());
+    expect(result.engine_ran).toBe(true);
+    expect(result.result?.packet.action_mode).toBe('escalate');
+    expect(result.result?.block).toBeUndefined();
   });
 
   // --------------------------------------------------------------------------
@@ -277,44 +183,16 @@ describe('P9b — agent/core.ts × Decision Engine wiring (8 tests)', () => {
   });
 
   // --------------------------------------------------------------------------
-  // T7 — engine_error fail-closed (default): throws DecisionEngineFailClosedError
+  // T7 — engine_error fail-closed: throws DecisionEngineFailClosedError
   // --------------------------------------------------------------------------
-  it('T7 (engine_error fail-closed): engine throws + fallback=fail-closed → throws DecisionEngineFailClosedError', async () => {
-    const restore = patchConfig({
-      FEATURE_DECISION_ENGINE_V1_KILL_SWITCH: false,
-      FEATURE_DECISION_ENGINE_V1: true,
-      FEATURE_DECISION_ENGINE_ERROR_FALLBACK: 'fail-closed',
-    });
+  it('T7 (engine_error fail-closed): engine throws → throws DecisionEngineFailClosedError', async () => {
     injectThrowingEngine(new Error('engine crashed hard'));
-    try {
-      await expect(runDecisionEngineForTurn(mkBase())).rejects.toThrow(DecisionEngineFailClosedError);
-    } finally {
-      restore();
-    }
-  });
-
-  // --------------------------------------------------------------------------
-  // T8 — engine_error legacy fallback: engine throws + fallback=legacy → skip
-  // --------------------------------------------------------------------------
-  it('T8 (engine_error legacy fallback): engine throws + fallback=legacy → engine_ran=false, skip_reason=engine_error', async () => {
-    const restore = patchConfig({
-      FEATURE_DECISION_ENGINE_V1_KILL_SWITCH: false,
-      FEATURE_DECISION_ENGINE_V1: true,
-      FEATURE_DECISION_ENGINE_ERROR_FALLBACK: 'legacy',
-    });
-    injectThrowingEngine(new Error('engine crashed'));
-    try {
-      const result = await runDecisionEngineForTurn(mkBase());
-      expect(result.engine_ran).toBe(false);
-      expect(result.skip_reason).toBe('engine_error');
-    } finally {
-      restore();
-    }
+    await expect(runDecisionEngineForTurn(mkBase())).rejects.toThrow(DecisionEngineFailClosedError);
   });
 
   // --------------------------------------------------------------------------
   // Bonus — buildBaseContextPacketFromTurn: field mapping sanity check
-  // (Not one of the named 8 but guards the helper contract)
+  // (guards the helper contract)
   // --------------------------------------------------------------------------
   it('buildBaseContextPacketFromTurn: maps turn state to BaseContextPacket correctly', () => {
     const inbound = {

@@ -37,20 +37,15 @@ function configAllFlagsOff() {
     config: {
       FEATURE_PDF_REPORTS: false,
       FEATURE_SCHEDULING_V2: false,
+      // P11: only the env fields still present in the trimmed config remain.
+      // KNOWLEDGE_STATE_MACHINE_V1 / CALENDAR_V2 / SKILL_REGISTRY_V1 keep their
+      // env field (retained for the admin-ui catalog); MULTI_CHANNEL /
+      // COGNITIVE_GRAPH survive as enum flags too.
       FEATURE_KNOWLEDGE_STATE_MACHINE_V1: false,
       FEATURE_CALENDAR_V2: false,
-      // Remaining FeatureFlagName-backing keys default to false in the
-      // singleton when undefined; spelled out where read for clarity.
-      FEATURE_P0_TENANT_GUARD_ENFORCED: false,
-      FEATURE_OPERATIONAL_PROFILE_V2: false,
-      FEATURE_DIALOGICAL_ACQUISITION: false,
+      FEATURE_SKILL_REGISTRY_V1: false,
       FEATURE_MULTI_CHANNEL: false,
       FEATURE_COGNITIVE_GRAPH: false,
-      FEATURE_P8C_USER_LAYER_NAMESPACE_V1: false,
-      FEATURE_SOUL_LAYER_V1: false,
-      FEATURE_POLICY_RESOLVER_V1: false,
-      FEATURE_SKILL_REGISTRY_V1: false,
-      FEATURE_RUNTIME_TRACE_V1: false,
     },
   };
 }

@@ -182,20 +182,6 @@ const envSchema = z
     //   (mirrors OUTBOUND_SWEEPER_RETENTION_BATCH_SIZE). Default 1000.
     OUTBOX_RELAYER_RETENTION_BATCH_SIZE: z.coerce.number().int().positive().default(1000),
     // Feature flags do roadmap Maia v2
-    FEATURE_P0_TENANT_GUARD_ENFORCED: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
-    // P4 — identidade operacional v2 (perfil versionado + drift detector)
-    FEATURE_OPERATIONAL_PROFILE_V2: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
-    // P5 — aquisição dialógica de capacidades (lacunas -> propostas -> testes)
-    FEATURE_DIALOGICAL_ACQUISITION: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
     // P6 — separação Agent/Channel/Role + Role Policy (multi-canal)
     FEATURE_MULTI_CHANNEL: z
       .string()
@@ -206,22 +192,11 @@ const envSchema = z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
-    // Calendar v2 — feriados nacionais/regionais + business-day calendar + rrule extension
+    // Calendar v2 — feriados nacionais/regionais + business-day calendar + rrule extension.
+    // P11: FeatureFlagName enum entry removed (behavior collapsed); env field
+    // retained because the admin-ui Tools Catalog still reads config.FEATURE_CALENDAR_V2
+    // to display the calendar write tools' gate. Drop after Wave E.
     FEATURE_CALENDAR_V2: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
-    // P8b — Soul Layer (biases comportamentais persistentes que modulam, nunca bloqueiam).
-    // Kill switch: set FEATURE_SOUL_LAYER_V1=false para desativar todo o soul pipeline
-    // (detector de drift, slice injection, activator worker) sem alterar DB.
-    FEATURE_SOUL_LAYER_V1: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
-    // P8e — PolicyDescriptorResolver + policy_rules (Source of Truth versionada).
-    // Off by default; only flips on when slice builder (P8d), PEPs (P9b/d),
-    // and Admin UI (P8.5) are in place to consume the resolver.
-    FEATURE_POLICY_RESOLVER_V1: z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
@@ -229,18 +204,18 @@ const envSchema = z
     POLICY_RESOLVER_CACHE_TTL_MS: z.coerce.number().int().positive().default(300_000),
     /** LRU cap for PolicyResolverCache. Default 10_000 entries. */
     POLICY_RESOLVER_CACHE_MAX_ENTRIES: z.coerce.number().int().positive().default(10_000),
-    // P9a — Skill Registry v1 (skills table + SkillRunner + 4 modes)
+    // P9a — Skill Registry v1 (skills table + SkillRunner + 4 modes).
+    // P11: FeatureFlagName enum entry removed (behavior collapsed); env field
+    // retained for the admin-ui Tools Catalog until Wave E.
     FEATURE_SKILL_REGISTRY_V1: z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
-    // P10a — Knowledge State Machine (9 estados + auto-promoter + propose_* tools)
+    // P10a — Knowledge State Machine (9 estados + auto-promoter + propose_* tools).
+    // P11: FeatureFlagName enum entry removed (behavior collapsed); env field
+    // retained because the admin-ui Tools Catalog reads config.FEATURE_KNOWLEDGE_STATE_MACHINE_V1
+    // to display the KSM propose_* tools' gate. Drop after Wave E.
     FEATURE_KNOWLEDGE_STATE_MACHINE_V1: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
-    // P10b — runtime trace (sync envelope + async body, HMAC + redaction)
-    FEATURE_RUNTIME_TRACE_V1: z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
@@ -328,34 +303,6 @@ const envSchema = z
     // the file-backed token. Discouraged in prod (env vars leak more than
     // file mode 0o600). Useful for dev / scripted deploys / E2E tests.
     SETUP_TOKEN_OVERRIDE: z.string().optional(),
-
-    // P8c — User Layer namespace (depth-scoped slice builders + facade resolvers)
-    FEATURE_P8C_USER_LAYER_NAMESPACE_V1: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
-    // P9b — Decision Engine V1 hot-path wiring.
-    // FEATURE_DECISION_ENGINE_V1: gates whether the Decision Engine produces
-    //   the DecisionPacket before each LLM call. Default OFF so no behaviour
-    //   change in production until explicitly enabled per tenant or globally.
-    // FEATURE_DECISION_ENGINE_V1_KILL_SWITCH: highest-precedence off-ramp.
-    //   Set to 'true' to hard-disable the engine across ALL tenants immediately
-    //   (no redeploy needed). Kill switch beats the flag.
-    // FEATURE_DECISION_ENGINE_ERROR_FALLBACK: controls what happens when the
-    //   engine throws unexpectedly (not budget-fallback, which is internal).
-    //   'fail-closed' (default): blocks the turn — caller sees blockedResponse.
-    //   'legacy': swallows the error and falls through to the pre-P9b path.
-    FEATURE_DECISION_ENGINE_V1: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
-    FEATURE_DECISION_ENGINE_V1_KILL_SWITCH: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
-    FEATURE_DECISION_ENGINE_ERROR_FALLBACK: z
-      .enum(['fail-closed', 'legacy'])
-      .default('fail-closed'),
   })
   .superRefine((cfg, ctx) => {
     if (cfg.LLM_PROVIDER === 'anthropic' && !cfg.ANTHROPIC_API_KEY) {
@@ -410,18 +357,18 @@ const envSchema = z
       });
     }
     // P10b (Codex review #102 — issue 2): fail-closed on missing HMAC secret.
-    // When runtime trace is on in production, the master secret MUST be set
-    // (KMS-backed). Test/dev can override via _setTestMasterSecretForTests().
+    // P11: runtime trace is always-on (flag removed), so in production the
+    // master secret MUST be set (KMS-backed) unconditionally. Test/dev can
+    // override via _setTestMasterSecretForTests().
     if (
       cfg.NODE_ENV === 'production' &&
-      cfg.FEATURE_RUNTIME_TRACE_V1 &&
       !cfg.RUNTIME_TRACE_HMAC_MASTER_SECRET
     ) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['RUNTIME_TRACE_HMAC_MASTER_SECRET'],
         message:
-          'RUNTIME_TRACE_HMAC_MASTER_SECRET is required in production when FEATURE_RUNTIME_TRACE_V1 is enabled — audit HMACs would be forgeable without it',
+          'RUNTIME_TRACE_HMAC_MASTER_SECRET is required in production — audit HMACs would be forgeable without it',
       });
     }
     try {
