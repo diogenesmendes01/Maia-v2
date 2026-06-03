@@ -343,7 +343,8 @@ export type RiskLevel = typeof RiskLevel[keyof typeof RiskLevel];
 export const FeatureFlagName = {
   // P6 — separação Agent/Channel/Role + Role Policy (multi-canal).
   // SURVIVES P11 cleanup: gates channel resolution (only seeded external_ids
-  // match, not real senders), removing it breaks prod. Removed by #411.
+  // match, not real senders), removing it breaks prod. Tracked by #411 —
+  // survives until #411 lands.
   MULTI_CHANNEL: 'MULTI_CHANNEL',
   // P7 (COGNITIVE_GRAPH) was removed in issue #412: parity between the
   // declarative cognitive-graph path and the imperative legacy path was
