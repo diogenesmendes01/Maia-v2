@@ -48,8 +48,9 @@ This is the **single canonical pipeline**. Other docs and issues (notably [#415]
       ∩ write / risk policy                              [new #416]
       ∩ feature flag                                    [current]  → Tool.feature_flag (_registry.ts)
 8. Dispatcher guard (final, server-side)               [current]  → src/tools/_dispatcher.ts:47
-        re-validates feature flag (:62), constitutionalCheck (:96),
-        dual-approval (:116), canAct permission (:122), idempotency, audit
+        re-validates feature flag (:62), constitutionalCheck (:96)
+        — incl. the dual-approval requirement, surfaced as requires_dual_approval (:116) —
+        canAct permission (:122), idempotency, audit
 
 = effective behavior + visible/executable tools for the turn
 ```
@@ -67,7 +68,7 @@ Each decision has exactly one owning layer. The common failure mode is a lower l
 | Which skill matches the intent | `skill-selector` + `skill-match` (strict `>` threshold) | — |
 | Whether a skill is allowed for *this* audience/channel | `SkillUsagePolicy` (**new** [#409](https://github.com/diogenesmendes01/Maia-v2/issues/409)) | the skill body |
 | Which tools are visible to the LLM | grants ∩ packs ∩ skill scope ∩ permission ∩ policy ∩ flag (step 7) | coincidental wiring/imports |
-| Whether a write executes / needs confirmation / blocks / escalates | policy ([#409](https://github.com/diogenesmendes01/Maia-v2/issues/409)/[#416](https://github.com/diogenesmendes01/Maia-v2/issues/416)) **composed with** `constitutionalCheck` + dual-approval + dispatcher | the skill, the role, the LLM |
+| Whether a write executes / needs confirmation / blocks / escalates | policy ([#409](https://github.com/diogenesmendes01/Maia-v2/issues/409)/[#416](https://github.com/diogenesmendes01/Maia-v2/issues/416)) **composed with** `constitutionalCheck` (which encodes dual-approval) + the dispatcher guard | the skill, the role, the LLM |
 | Final execution authority | **dispatcher guard** (`src/tools/_dispatcher.ts`) | the LLM |
 
 > **The load-bearing rule:** a skill never decides confirmation or write authorization. It declares *intent and scope*; **policy + the dispatcher decide execution.** This is why skills must not hardcode `requires_confirmation`-style branches (see §6, §7).
@@ -123,15 +124,15 @@ The platform already has a write-governance spine. New write and risk policies *
 
 | Existing guard | Where | What it does |
 |---|---|---|
-| `constitutionalCheck` | `src/governance/rules.ts:14` (called at `_dispatcher.ts:96`) | Non-negotiable rules over typed intents (scope, cross-entity, limits). |
-| `requiresDualApproval` | `src/governance/dual-approval.ts:38` (enforced at `_dispatcher.ts:116`) | Gates irreversible actions; the state machine lives in `src/workflows/dual-approval.ts`. |
-| Dispatcher guard | `dispatchTool` `src/tools/_dispatcher.ts:47` | Final re-validation: feature flag → constitutional → dual-approval → `canAct` (`:122`) → idempotency → audit. |
+| `constitutionalCheck` | `src/governance/rules.ts:14` (called at `_dispatcher.ts:96`) | The dispatcher's non-negotiable rules over typed intents — scope, cross-entity, limits, **and dual-approval requirements** (e.g. `rules.ts:35`, `:68`). When it requires dual approval and `dual_approval_granted` is absent, the dispatcher short-circuits with `requires_dual_approval` (`_dispatcher.ts:116`). |
+| `requiresDualApproval` | `src/governance/dual-approval.ts:38` | A separate predicate cataloguing critical actions that need a second approver (high-value `register_transaction`, account/permission changes, proactive sends). **The dispatcher does not call it** — its dual-approval gate is `constitutionalCheck` (above); the approval state machine lives under `src/workflows/dual-approval.ts`. |
+| Dispatcher guard | `dispatchTool` `src/tools/_dispatcher.ts:47` | Final re-validation: feature flag (`:62`) → constitutional, incl. dual-approval (`:96`) → `canAct` (`:122`) → idempotency → audit. |
 
 Rules for anything that writes:
 
 - A write/risk policy ([#416](https://github.com/diogenesmendes01/Maia-v2/issues/416)'s `confirm_before_write_policy`, `human_confirmation_policy`, etc.) **decides** (allow / confirm / block / escalate) and then **delegates execution through the dispatcher**. It does not execute writes itself.
 - **Confirmation is a policy decision surfaced to the user and enforced by the dispatcher** — never an `if (needsConfirmation)` inside a skill.
-- Write tools (`boleto_cancel`, `company_campaign_remove`, `refund_create`) are marked `side_effect: 'write'` and pass through the guard like every other write. The guard is the safety net even if step 7 wrongly exposes one.
+- The write tools [#416](https://github.com/diogenesmendes01/Maia-v2/issues/416) will add (`boleto_cancel`, `company_campaign_remove`, `refund_create`) **do not exist in the registry yet**. When added, each must be marked `side_effect: 'write'` and pass through the guard like the write tools that exist today (`register_transaction`, `cancel_transaction`, `start_recurring_payment`, …). The guard is the safety net even if step 7 wrongly exposes one.
 - **Document/receipt validation reuses the existing parsers.** Build `receipt_validate` on `parse_receipt` (`src/tools/parse-receipt.ts`, registered `_registry.ts:157`) and `parse_image` (`src/tools/parse-image.ts`, `_registry.ts:158`). Do not introduce new OCR/vision tools that duplicate them.
 
 ## 7. Anti-patterns
