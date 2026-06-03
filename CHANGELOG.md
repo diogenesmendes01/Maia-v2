@@ -4,6 +4,9 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### Added — docs
+- **Design spec: runtime audience · tool grants · skill usage policy · agent baseline** ([#413](https://github.com/diogenesmendes01/Maia-v2/pull/413)): cross-cutting tech-lead refinement connecting issues [#407](https://github.com/diogenesmendes01/Maia-v2/issues/407) → [#410](https://github.com/diogenesmendes01/Maia-v2/issues/410) → [#408](https://github.com/diogenesmendes01/Maia-v2/issues/408) → [#409](https://github.com/diogenesmendes01/Maia-v2/issues/409). Documents the unified audience/trust/data-scope vocabulary, the tool-visibility composition pipeline (agent grant ∩ skill scope ∩ interlocutor permission ∩ audience policy ∩ feature flag, with the dispatcher as final guard), the incremental migration strategy for the global `pessoas.telefone_whatsapp` unique, new audit actions / failure reasons, invariant compliance, and PR sequencing. No runtime change. `docs/superpowers/specs/2026-06-03-runtime-audience-tools-skills-baseline-design.md`.
+
 ## [3.1.0] - 2026-05-20 — "Hot-path wiring + governance functional"
 
 This release closes the build-then-wire gap from v3.0.0: components that
