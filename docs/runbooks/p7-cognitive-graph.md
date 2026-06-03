@@ -1,6 +1,8 @@
 # Runbook — P7 Grafo Cognitivo Formal
 
-> Como operar, debugar e dar rollback rapido na camada de orquestracao via grafo cognitivo declarativo. P7 formaliza modulos cognitivos como descriptors (runWhen, timeoutMs, fallback, model, version), fecha a lacuna de cobertura de auditoria (todo modulo cognitivo emite row em `cognitive_module_log` — ver "Escopo de 100% audit coverage" em Limitacoes) e instrumenta p95 do sync path.
+> Como operar e debugar a camada de orquestracao via grafo cognitivo declarativo. P7 formaliza modulos cognitivos como descriptors (runWhen, timeoutMs, fallback, model, version), fecha a lacuna de cobertura de auditoria (todo modulo cognitivo emite row em `cognitive_module_log` — ver "Escopo de 100% audit coverage" em Limitacoes) e instrumenta p95 do sync path.
+
+> **ATUALIZACAO (#412): a flag `FEATURE_COGNITIVE_GRAPH` foi REMOVIDA — o grafo e agora o unico caminho turn-time.** Nao ha mais dual-path, kill switch de flag, nem rollback "flag OFF". As secoes "Feature flag", "Rollout", "Kill switch" e "Rollback" abaixo descrevem o estado HISTORICO (pre-#412) e estao marcadas como obsoletas; o rollback hoje e por revert de commit. As secoes de **diagnostico** (queries `cognitive_module_log`, p95) e **invariantes** permanecem validas.
 
 ## O que e P7
 
@@ -212,17 +214,14 @@ Gate fala qual arquivo falhou (lista offenders).
 - **Gate 6 skip-friendly** — sem baseline pre-P7 medido, gate passa. Recomendacao: medir baseline antes do flip global (`SYNC_LATENCY_P95_BASELINE_MS` no `.env` da CI).
 - **Sem migration nova** — P7 reusa `cognitive_module_log` (migration 008 do P0). Nao ha rollback de schema; rollback eh apenas flag OFF + revert do branch.
 - **Escopo de "100% audit coverage"** — significa "todo modulo cognitivo (catalogo §8.1) emite >= 1 row por execucao". Modulos compostos (drift detectors) auditam no nivel do **orchestrator** (`drift_detector_<type>`), nao na chamada LLM interna — auditoria nested. Infra nao-cognitiva (image OCR em `src/lib/vision.ts`, embeddings, tokenizers) NAO emite row em `cognitive_module_log` por design. Grep gate cobre apenas o helper `callLLM`; chamadas SDK diretas em modulos ja envelopados em nivel superior nao sao bypass.
-- **Shift de cobertura de success-reflection com flag ON** — no path legacy, success-reflection roda **antes** do rate-limit/pending-gate, entao mesmo turns que terminam em warn/resolved geram reflexao. No path do grafo (postturn), o trigger so dispara apos a resposta — turns bloqueados por rate-limit ou resolvidos no pending-gate **nao geram success-reflection**. Trade-off aceitavel (reflexao nao e user-facing), mas operadores que monitoram volume de reflection devem esperar uma queda observavel apos o flip. Para restaurar paridade exata, mover o trigger legacy para dentro dos branches de early-return em PR de follow-up.
+- **Shift de cobertura de success-reflection (PERMANENTE pos-#412)** — historicamente, no path legacy, success-reflection rodava **antes** do rate-limit/pending-gate, entao mesmo turns que terminavam em warn/resolved geravam reflexao. No grafo (postturn, agora o unico caminho), o trigger so dispara apos a resposta — turns bloqueados por rate-limit ou resolvidos no pending-gate **nao geram success-reflection**. Este e o comportamento definitivo (#412 removeu o trigger legacy). Trade-off aceitavel: reflexao nao e user-facing e e fire-and-forget; o trigger pre-turn era best-effort e nunca bloqueava resposta. Operadores que monitoram volume de reflection devem usar este post-turn como baseline.
 
 ## Rollback
 
-P7 nao introduz schema. Rollback = `featureFlags.killSwitch` (volatil, ~10s) ou revert do branch (persistente, ~5min com redeploy).
+> **OBSOLETO pos-#412.** A flag `FEATURE_COGNITIVE_GRAPH` foi removida e o path imperativo legacy foi deletado de `src/agent/core.ts` — nao existe mais rollback "flag OFF" nem kill switch de flag. P7 nao introduz schema, entao rollback hoje e **apenas por codigo**:
 
-Para rollback persistente:
-
-1. `FEATURE_COGNITIVE_GRAPH=false` no `.env`.
-2. Restart processo (`pm2 restart all`, ~30s).
-3. Se quiser remover codigo cognitive-graph completamente: `git revert <p7-merge-commit>` + redeploy.
+1. `git revert <commit-do-#412>` (restaura flag + path legacy) + redeploy. **Atencao:** o commit #412 tambem corrigiu paridade de auditoria do node `step-evaluator-trigger`; um revert reintroduz a divergencia (graph mode perde `tool_called`/`criterion_checked`/`step_failed`/`branch_taken`).
+2. Mitigacao cirurgica sem revert total: desabilitar um node especifico via `runWhen: () => false` no descriptor (`preturn-graph.ts` / `postturn-graph.ts`) + redeploy.
 
 Audit log (`cognitive_module_log`) permanece intacto — defesa para forensics.
 

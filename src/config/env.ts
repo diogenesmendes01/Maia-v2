@@ -187,11 +187,10 @@ const envSchema = z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
-    // P7 — grafo cognitivo formal (orquestração declarativa de módulos)
-    FEATURE_COGNITIVE_GRAPH: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
+    // P7 — grafo cognitivo formal. FEATURE_COGNITIVE_GRAPH was removed in #412:
+    // the cognitive graph now runs unconditionally (parity with the imperative
+    // path proven), so there is no env toggle. The SYNC_LATENCY_P95_* budget
+    // vars below remain — they gate p95 latency, not the graph itself.
     /** Cache TTL (ms) for PolicyResolverCache. Default 5min = 300_000ms. */
     POLICY_RESOLVER_CACHE_TTL_MS: z.coerce.number().int().positive().default(300_000),
     /** LRU cap for PolicyResolverCache. Default 10_000 entries. */

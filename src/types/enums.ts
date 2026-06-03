@@ -343,10 +343,11 @@ export type RiskLevel = typeof RiskLevel[keyof typeof RiskLevel];
 export const FeatureFlagName = {
   // P6 — separação Agent/Channel/Role + Role Policy (multi-canal).
   // SURVIVES P11 cleanup: gates channel resolution (only seeded external_ids
-  // match, not real senders), removing it breaks prod.
+  // match, not real senders), removing it breaks prod. Removed by #411.
   MULTI_CHANNEL: 'MULTI_CHANNEL',
-  // P7 — grafo cognitivo formal (orquestração declarativa de módulos).
-  // SURVIVES P11 cleanup: P7 is partial, removing it breaks prod.
-  COGNITIVE_GRAPH: 'cognitive_graph',
+  // P7 (COGNITIVE_GRAPH) was removed in issue #412: parity between the
+  // declarative cognitive-graph path and the imperative legacy path was
+  // proven + completed, so the graph runs unconditionally and the toggle is
+  // gone. The FeatureFlags class + enum survive for MULTI_CHANNEL until #411.
 } as const;
 export type FeatureFlagName = typeof FeatureFlagName[keyof typeof FeatureFlagName];

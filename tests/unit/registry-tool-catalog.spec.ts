@@ -38,11 +38,10 @@ function configAllFlagsOff() {
       // PR #406 completed the teardown: the only config-gated tool flag left is
       // the PRODUCT flag FEATURE_PDF_REPORTS. KSM / CALENDAR_V2 / SCHEDULING_V2 /
       // SKILL_REGISTRY_V1 env fields were REMOVED (those tools are now
-      // unconditionally enabled). MULTI_CHANNEL / COGNITIVE_GRAPH survive as
-      // enum flags (read by the feature-flags singleton).
+      // unconditionally enabled). MULTI_CHANNEL survives as an enum flag (read
+      // by the feature-flags singleton); COGNITIVE_GRAPH was removed in #412.
       FEATURE_PDF_REPORTS: false,
       FEATURE_MULTI_CHANNEL: false,
-      FEATURE_COGNITIVE_GRAPH: false,
     },
   };
 }

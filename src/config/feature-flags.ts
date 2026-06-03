@@ -42,8 +42,7 @@ import { config } from './env.js';
 export const featureFlags = new FeatureFlags({
   // P6 — separação Agent/Channel/Role + Role Policy. Gates channel resolution
   // (channel-resolver / baileys jid resolver); removing it breaks prod.
+  // P7 (COGNITIVE_GRAPH) was removed in #412 — the cognitive graph now runs
+  // unconditionally, so it no longer needs a flag entry here.
   [FeatureFlagName.MULTI_CHANNEL]: config.FEATURE_MULTI_CHANNEL,
-  // P7 — grafo cognitivo formal (partial). Gates the cognitive-graph path in
-  // agent/core.ts; removing it breaks prod.
-  [FeatureFlagName.COGNITIVE_GRAPH]: config.FEATURE_COGNITIVE_GRAPH,
 });

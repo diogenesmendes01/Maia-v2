@@ -64,7 +64,86 @@ export function buildPostturnNodes(): ModuleDescriptor<PostturnContext, unknown>
             user_message: ctx.inbound.conteudo ?? '',
           },
         });
+
+        // P7 parity (issue #412): the legacy imperative post-turn IIFE in
+        // agent/core.ts emitted the FULL procedure_execution_events audit set
+        // around the advance/complete decision. This node must emit the
+        // identical events or graph mode silently drops audit rows that the
+        // imperative path wrote (criterion #d — no module silently dropped).
+        // Order mirrors core.ts legacy byte-for-byte: recordToolCalled →
+        // recordCriterionChecked → step_failed (stall) → branch_taken →
+        // advance/complete.
+
+        // P84-C4: emit a `tool_called` event for every tool the ReAct loop
+        // invoked this turn (unconditional — lets the audit trail answer
+        // "what tools did this procedure trigger?" without joining criteria).
+        for (const tc of ctx.tools_called ?? []) {
+          await procedureEngine
+            .recordToolCalled({
+              execution_id: exec.id,
+              step_id: exec.current_step_id,
+              tool_name: tc.name,
+              result: tc.result,
+            })
+            .catch(() => undefined);
+        }
+
+        // P84-C4: emit `criterion_checked` for each criterion the evaluator
+        // scored. Best-effort — failures must not block advance/complete.
+        for (const cr of evalResult.criterion_results) {
+          await procedureEngine
+            .recordCriterionChecked({
+              execution_id: exec.id,
+              step_id: exec.current_step_id ?? '',
+              criterion_id: cr.id,
+              criterion_type: cr.type,
+              passed: cr.passed,
+              evidence: cr.evidence,
+            })
+            .catch(() => undefined);
+        }
+
+        // P84-C3: stall handling. Record `step_failed` when the evaluator
+        // reports a stall reason so the P3c reaper can sweep. We do NOT abort
+        // here (operators may still advance manually; kill switch covers the
+        // worst case).
+        if (evalResult.stall_reason) {
+          await procedureEngine
+            .recordEvent({
+              execution_id: exec.id,
+              step_id: exec.current_step_id,
+              event_type: 'step_failed',
+              payload: {
+                reason: evalResult.stall_reason,
+                step_id: exec.current_step_id,
+              },
+              confidence: null,
+            })
+            .catch(() => undefined);
+        }
+
         if (!evalResult.step_completed) return evalResult;
+
+        // P84-C3: when the DAG-aware picker linearized parallel branches,
+        // record a `branch_taken` event with the chosen step + alternates so
+        // P3c can drive proper branch resolution. The pick is deterministic
+        // (array order); the event makes the choice auditable.
+        if (evalResult.branch_alternates.length > 0 && evalResult.next_step_id) {
+          await procedureEngine
+            .recordEvent({
+              execution_id: exec.id,
+              step_id: evalResult.next_step_id,
+              event_type: 'branch_taken',
+              payload: {
+                chosen_step_id: evalResult.next_step_id,
+                alternates: evalResult.branch_alternates,
+                picker: 'deterministic_array_order',
+              },
+              confidence: null,
+            })
+            .catch(() => undefined);
+        }
+
         if (evalResult.next_step_id) {
           await procedureEngine.advanceStep({
             execution_id: exec.id,

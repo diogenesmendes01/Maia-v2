@@ -76,12 +76,25 @@ else
   FAILED=$((FAILED + 1))
 fi
 
-echo "=== Gate 5/7: COGNITIVE_GRAPH flag registered in singleton ==="
-if grep -q "FeatureFlagName.COGNITIVE_GRAPH.*config.FEATURE_COGNITIVE_GRAPH" src/config/feature-flags.ts; then
-  echo "[GATE 5/7] COGNITIVE_GRAPH flag registered ... PASS"
+echo "=== Gate 5/7: COGNITIVE_GRAPH toggle fully removed (#412) ==="
+# Issue #412 collapsed the flag: the cognitive graph runs unconditionally.
+# The gate now asserts the toggle is GONE everywhere — enum member, env field,
+# singleton entry, and any isEnabled(COGNITIVE_GRAPH) branch in core.ts.
+# (Comments mentioning the removal are allowed; live code references are not.)
+FLAG_OFFENDERS=$(
+  grep -rnE 'FeatureFlagName\.COGNITIVE_GRAPH|FEATURE_COGNITIVE_GRAPH[^_a-zA-Z]' \
+    src/config/feature-flags.ts src/config/env.ts src/types/enums.ts src/agent/core.ts 2>/dev/null \
+  | grep -vE '^\s*[^:]+:[0-9]+:\s*(//|\*)' \
+  | grep -viE 'removed in #412|removed with FEATURE_COGNITIVE_GRAPH|was removed|no longer' \
+  || true
+)
+if [ -z "$FLAG_OFFENDERS" ]; then
+  echo "[GATE 5/7] COGNITIVE_GRAPH toggle removed ... PASS"
   PASSED=$((PASSED + 1))
 else
-  echo "[GATE 5/7] COGNITIVE_GRAPH flag registered ... FAIL"
+  echo "[GATE 5/7] COGNITIVE_GRAPH toggle removed ... FAIL"
+  echo "  live references still present:"
+  echo "$FLAG_OFFENDERS" | sed 's/^/    /'
   FAILED=$((FAILED + 1))
 fi
 
@@ -109,16 +122,14 @@ else
 fi
 
 echo "=== Gate 7/7: canary — cognitive-graph executou ≥ 1 turn (manual post-deploy) ==="
-# Em prod real, esperar:
+# Issue #412: the cognitive graph now runs unconditionally (no toggle). In prod
+# real, esperar SEMPRE > 0 após qualquer turno cognitivo:
 #   SELECT count(*) FROM cognitive_module_log
-#   WHERE module_name='reasoner' AND ended_at > now() - interval '1 hour';
-# > 0 quando FEATURE_COGNITIVE_GRAPH=true.
-if [ "${FEATURE_COGNITIVE_GRAPH:-false}" = "true" ]; then
-  echo "[GATE 7/7] canary check (flag ON, manual SQL verification post-deploy) ... PASS"
-  PASSED=$((PASSED + 1))
-else
-  echo "[GATE 7/7] canary check ... SKIPPED (FEATURE_COGNITIVE_GRAPH=false — path legacy)"
-fi
+#   WHERE module_name IN ('procedure-selector','step-evaluator-trigger',
+#                         'correction-reflection','success-reflection')
+#     AND ended_at > now() - interval '1 hour';
+echo "[GATE 7/7] canary check (graph unconditional — manual SQL verification post-deploy) ... PASS"
+PASSED=$((PASSED + 1))
 
 echo ""
 echo "gates passed: $PASSED — failed: $FAILED"
