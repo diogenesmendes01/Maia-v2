@@ -73,8 +73,6 @@ import type {
 } from './types.js';
 import { writeEnvelope } from './envelope-writer.js';
 import { enqueueBody } from '@/workers/trace-body-writer.js';
-import { featureFlags } from '@/config/feature-flags.js';
-import { FeatureFlagName } from '@/types/enums.js';
 
 export interface TraceInput {
   trace_id: string;
@@ -90,24 +88,10 @@ export interface TraceInput {
 /**
  * One-shot trace: write envelope + body outbox row sync (one transaction),
  * also enqueue in-memory as an accelerator. Returns the envelope record.
- * If the flag is OFF, returns a no-op envelope (does NOT touch the DB).
  *
  * Throws if envelope write fails — caller MUST abort the side effect.
  */
 export async function trace(input: TraceInput): Promise<TraceEnvelopeWritten> {
-  if (!featureFlags.isEnabled(FeatureFlagName.RUNTIME_TRACE_V1)) {
-    return {
-      trace_id: input.trace_id,
-      envelope_hmac: '',
-      hmac_key_version: 0,
-      side_effect_level: input.decision.side_effect_level,
-      decision: input.decision.decision,
-      policy_id: input.decision.policy_id ?? null,
-      redaction_class: input.redaction_class ?? 'standard',
-      sync_latency_ms: 0,
-    };
-  }
-
   const envelopeInput: TraceEnvelopeInput = {
     trace_id: input.trace_id,
     tenant_id: input.tenant_id,

@@ -10,7 +10,7 @@
  *   4. Flag ON + 1 gap proposed → seção presente com sufixo "(proposta de melhoria já enviada)".
  *   5. Flag ON + apenas silent/dashboard → seção ausente.
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { AgentCapabilityGap } from '../../src/db/schema.js';
 
 const selfStateGetActive = vi.fn();
@@ -123,41 +123,10 @@ beforeEach(async () => {
   capabilityGapsListByLevels.mockResolvedValue([]);
   procedureExecutionsFindActiveForConversa.mockResolvedValue(null);
   procedureDefinitionsFindById.mockResolvedValue(null);
-
-  const { featureFlags } = await import('../../src/config/feature-flags.js');
-  featureFlags.reset();
-});
-
-afterEach(async () => {
-  const { featureFlags } = await import('../../src/config/feature-flags.js');
-  const { FeatureFlagName } = await import('../../src/types/enums.js');
-  featureFlags.override(FeatureFlagName.DIALOGICAL_ACQUISITION, false);
-  featureFlags.reset();
 });
 
 describe('buildPrompt — injeção de "Limitações conhecidas" (P5 Task 10)', () => {
-  it('1. Flag OFF → seção ausente; listByLevels NÃO é consultado', async () => {
-    const { featureFlags } = await import('../../src/config/feature-flags.js');
-    const { FeatureFlagName } = await import('../../src/types/enums.js');
-    featureFlags.override(FeatureFlagName.DIALOGICAL_ACQUISITION, false);
-
-    // Mesmo com gaps presentes no repo, a flag OFF deve impedir a leitura.
-    capabilityGapsListByLevels.mockResolvedValue([
-      makeGap('mentionable', 'enviar boletos por email'),
-    ]);
-
-    const { buildPrompt } = await import('../../src/agent/prompt-builder.js');
-    const { system } = await buildPrompt(ctx);
-
-    expect(system).not.toContain('## Limitações conhecidas');
-    expect(capabilityGapsListByLevels).not.toHaveBeenCalled();
-  });
-
-  it('2. Flag ON + zero gaps mentionable/proposed → seção ausente', async () => {
-    const { featureFlags } = await import('../../src/config/feature-flags.js');
-    const { FeatureFlagName } = await import('../../src/types/enums.js');
-    featureFlags.override(FeatureFlagName.DIALOGICAL_ACQUISITION, true);
-
+  it('zero gaps mentionable/proposed → seção ausente', async () => {
     capabilityGapsListByLevels.mockResolvedValue([]);
 
     const { buildPrompt } = await import('../../src/agent/prompt-builder.js');
@@ -168,10 +137,6 @@ describe('buildPrompt — injeção de "Limitações conhecidas" (P5 Task 10)', 
   });
 
   it('3. Flag ON + 2 gaps mentionable → seção com ambas as linhas, sem sufixo de proposta', async () => {
-    const { featureFlags } = await import('../../src/config/feature-flags.js');
-    const { FeatureFlagName } = await import('../../src/types/enums.js');
-    featureFlags.override(FeatureFlagName.DIALOGICAL_ACQUISITION, true);
-
     capabilityGapsListByLevels.mockResolvedValue([
       makeGap('mentionable', 'gerar relatório fiscal trimestral'),
       makeGap('mentionable', 'fazer cobrança automática de inadimplentes'),
@@ -192,10 +157,6 @@ describe('buildPrompt — injeção de "Limitações conhecidas" (P5 Task 10)', 
   });
 
   it('4. Flag ON + 1 gap proposed → seção com sufixo "(proposta de melhoria já enviada)"', async () => {
-    const { featureFlags } = await import('../../src/config/feature-flags.js');
-    const { FeatureFlagName } = await import('../../src/types/enums.js');
-    featureFlags.override(FeatureFlagName.DIALOGICAL_ACQUISITION, true);
-
     capabilityGapsListByLevels.mockResolvedValue([
       makeGap('proposed', 'pagamento recorrente via PIX'),
     ]);
@@ -210,10 +171,6 @@ describe('buildPrompt — injeção de "Limitações conhecidas" (P5 Task 10)', 
   });
 
   it('5. Flag ON + apenas silent/dashboard → seção ausente (listByLevels retorna [])', async () => {
-    const { featureFlags } = await import('../../src/config/feature-flags.js');
-    const { FeatureFlagName } = await import('../../src/types/enums.js');
-    featureFlags.override(FeatureFlagName.DIALOGICAL_ACQUISITION, true);
-
     // O contrato do repo: listByLevels(['mentionable','proposed']) filtra esses
     // níveis. Gaps em silent/dashboard nem chegam aqui — simulamos retorno [].
     capabilityGapsListByLevels.mockResolvedValue([]);

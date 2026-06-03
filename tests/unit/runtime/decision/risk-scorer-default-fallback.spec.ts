@@ -17,7 +17,7 @@
  * or called when `riskScorer` is omitted, and that the resolved `risk_profile`
  * matches the stub's deterministic output.
  */
-import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Spy on the Anthropic SDK exactly as `risk-llm-gate.spec.ts` does. If the
 // composition root ever falls back to the live gate, `anthropicCreateMock`
@@ -137,18 +137,10 @@ function mkEnvOmittingRiskScorer(): CreateDecisionEngineEnv {
 }
 
 describe('#360 — createDecisionEngine default riskScorer fallback', () => {
-  const prevFlag = process.env.FEATURE_DECISION_ENGINE_V1;
-
   beforeEach(() => {
     anthropicCreateMock.mockReset();
     anthropicCtorMock.mockReset();
     recordMock.mockClear();
-    process.env.FEATURE_DECISION_ENGINE_V1 = 'true';
-  });
-
-  afterAll(() => {
-    if (prevFlag === undefined) delete process.env.FEATURE_DECISION_ENGINE_V1;
-    else process.env.FEATURE_DECISION_ENGINE_V1 = prevFlag;
   });
 
   it('does NOT invoke any LLM gate when riskScorer is omitted (high-risk intent)', async () => {

@@ -341,36 +341,12 @@ export type RiskLevel = typeof RiskLevel[keyof typeof RiskLevel];
  * Nomes de feature flags conhecidas. Cresce conforme fases ativam.
  */
 export const FeatureFlagName = {
-  // P0 — flag de smoke test (validador do framework de feature flags).
-  // TODO(P1+): `P0_TENANT_GUARD_ENFORCED` é só um smoke flag — ela existe
-  // pra validar que o framework funciona ponta-a-ponta (env → singleton →
-  // isEnabled). NÃO é consultada em runtime; o `applyTenantGuard` é sempre
-  // aplicado. Quando a primeira flag real entrar (ex.: P1 reflection toggle),
-  // remover este comentário. Se este flag continuar sem caller até P2,
-  // considerar removê-lo e reescrever os testes de feature-flags.spec.ts
-  // contra a nova flag real.
-  P0_TENANT_GUARD_ENFORCED: 'P0_TENANT_GUARD_ENFORCED',
-  // P4 — identidade operacional v2 (perfil versionado + drift)
-  OPERATIONAL_PROFILE_V2: 'OPERATIONAL_PROFILE_V2',
-  // P5 — aquisição dialógica de capacidades (lacunas -> propostas)
-  DIALOGICAL_ACQUISITION: 'DIALOGICAL_ACQUISITION',
-  // P6 — separação Agent/Channel/Role + Role Policy (multi-canal)
+  // P6 — separação Agent/Channel/Role + Role Policy (multi-canal).
+  // SURVIVES P11 cleanup: gates channel resolution (only seeded external_ids
+  // match, not real senders), removing it breaks prod.
   MULTI_CHANNEL: 'MULTI_CHANNEL',
-  // P7 — grafo cognitivo formal (orquestração declarativa de módulos)
+  // P7 — grafo cognitivo formal (orquestração declarativa de módulos).
+  // SURVIVES P11 cleanup: P7 is partial, removing it breaks prod.
   COGNITIVE_GRAPH: 'cognitive_graph',
-  // Calendar v2 — feriados nacionais/regionais + business-day calendar + rrule extension
-  CALENDAR_V2: 'calendar_v2',
-  // P8c — User Layer namespace (depth-scoped slice builders + facade resolvers)
-  P8C_USER_LAYER_NAMESPACE_V1: 'P8C_USER_LAYER_NAMESPACE_V1',
-  // P8b — Soul Layer (persistent behavioral biases que modulam, nunca bloqueiam)
-  FEATURE_SOUL_LAYER_V1: 'FEATURE_SOUL_LAYER_V1',
-  // P8e — PolicyDescriptorResolver + policy_rules (Source of Truth versionada)
-  POLICY_RESOLVER_V1: 'POLICY_RESOLVER_V1',
-  // P9a — Skill Registry v1 (skills table + SkillRunner + 4 execution modes).
-  SKILL_REGISTRY_V1: 'SKILL_REGISTRY_V1',
-  // P10a — Knowledge State Machine (9 estados + auto-promoter + propose_* tools)
-  KNOWLEDGE_STATE_MACHINE_V1: 'KNOWLEDGE_STATE_MACHINE_V1',
-  // P10b — runtime trace (envelope sync + body async, HMAC + redaction)
-  RUNTIME_TRACE_V1: 'runtime_trace_v1',
 } as const;
 export type FeatureFlagName = typeof FeatureFlagName[keyof typeof FeatureFlagName];

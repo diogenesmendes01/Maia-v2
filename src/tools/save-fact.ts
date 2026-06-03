@@ -9,9 +9,6 @@
 import { z } from 'zod';
 import type { Tool } from './_registry.js';
 import { logger } from '@/lib/logger.js';
-import { featureFlags } from '@/config/feature-flags.js';
-import { FeatureFlagName } from '@/types/enums.js';
-import { saveFact as saveFactInMemory } from '@/memory/semantic.js';
 import { proposeFactTool } from './propose-fact.js';
 
 const inputSchema = z.object({
@@ -51,8 +48,7 @@ export const saveFactTool: Tool<typeof inputSchema, typeof outputSchema> = {
       'deprecation_warning_save_fact',
     );
 
-    // Backend enforces escopo against caller's scope — preserved from legacy
-    // implementation so behavior is identical even when KSM flag is off.
+    // Backend enforces escopo against caller's scope.
     if (args.escopo.startsWith('entidade:')) {
       const eid = args.escopo.split(':')[1] ?? '';
       if (!ctx.scope.entidades.includes(eid)) {
@@ -66,21 +62,8 @@ export const saveFactTool: Tool<typeof inputSchema, typeof outputSchema> = {
       }
     }
 
-    // Flag off → preserve legacy behaviour bit-for-bit. Runtime
-    // singleton picks up kill switches without a redeploy (review #104).
-    if (!featureFlags.isEnabled(FeatureFlagName.KNOWLEDGE_STATE_MACHINE_V1)) {
-      const f = await saveFactInMemory({
-        escopo: args.escopo,
-        chave: args.chave,
-        valor: args.valor,
-        fonte: args.fonte,
-        ...(args.confianca !== undefined ? { confianca: args.confianca } : {}),
-      });
-      return { fact_id: f.id };
-    }
-
-    // Flag on → route through KSM. The proposal_id is the new fact_id
-    // surface (it's the same UUID — agent_facts.id).
+    // Route through KSM. The proposal_id is the new fact_id surface
+    // (it's the same UUID — agent_facts.id).
     const result = await proposeFactTool.handler(
       {
         escopo: args.escopo,

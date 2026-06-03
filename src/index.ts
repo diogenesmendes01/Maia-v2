@@ -32,20 +32,14 @@ async function main() {
     );
   }
 
-  // P8e: cross-instance policy cache invalidation. Subscriber is idempotent
-  // and gated on the feature flag — when OFF, the cache is unused so we
-  // skip the subscriber to avoid an unnecessary Redis connection.
+  // P8e: cross-instance policy cache invalidation. Subscriber is idempotent.
   // Codex review #93: previously this was defined but never called,
   // leaving stale positive/negative cache entries until natural TTL.
-  const { featureFlags } = await import('@/config/feature-flags.js');
-  const { FeatureFlagName } = await import('@/types/enums.js');
-  if (featureFlags.isEnabled(FeatureFlagName.POLICY_RESOLVER_V1)) {
-    const { startPolicyCacheInvalidationSubscriber } = await import(
-      '@/control-plane/policy/index.js'
-    );
-    startPolicyCacheInvalidationSubscriber();
-    logger.info('policy_resolver.cache_invalidation_subscriber_started');
-  }
+  const { startPolicyCacheInvalidationSubscriber } = await import(
+    '@/control-plane/policy/index.js'
+  );
+  startPolicyCacheInvalidationSubscriber();
+  logger.info('policy_resolver.cache_invalidation_subscriber_started');
 
   const app = await startServer();
   startAgentWorker(async (job) => {

@@ -56,6 +56,10 @@ function stubEnv(): void {
     OPENROUTER_API_KEY: 'sk-or-gen',
     VOYAGE_API_KEY: 'voyage-gen',
     ALERT_CHANNELS: 'log',
+    // NODE_ENV=production (above) makes the audit-HMAC master secret REQUIRED.
+    // This generator only reads tool metadata (no audit rows), so a dummy is
+    // fine — it never leaves the build-time process.
+    RUNTIME_TRACE_HMAC_MASTER_SECRET: 'gen-build-time-only-not-a-real-secret',
   };
   for (const [k, v] of Object.entries(defaults)) {
     if (process.env[k] === undefined || process.env[k] === '') process.env[k] = v;

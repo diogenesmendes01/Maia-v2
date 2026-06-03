@@ -102,9 +102,6 @@ export async function runSchedulingTick(): Promise<{
   timed_out: number;
   in_progress_advanced: number;
 }> {
-  if (!config.FEATURE_SCHEDULING_V2)
-    return { reclaimed: 0, claimed: 0, advanced: 0, skipped: 0, timed_out: 0, in_progress_advanced: 0 };
-
   // Step 1: reclaim expired leases — these go back to `pending`.
   const reclaimedIds = await occurrencesRepo
     .reclaimExpiredLeases(WORKER_ID, config.OCCURRENCE_LEASE_TTL_SECONDS, CLAIM_LIMIT_PER_TICK)
@@ -861,7 +858,6 @@ async function scheduleNextRecurring(
  * `scheduleNextRecurring`).
  */
 export async function runSeriesNextScheduler(): Promise<{ scheduled: number }> {
-  if (!config.FEATURE_SCHEDULING_V2) return { scheduled: 0 };
   const orphaned = await seriesRepo.listActiveWithoutPendingOccurrence(50);
   let scheduled = 0;
   for (const s of orphaned) {

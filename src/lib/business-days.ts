@@ -1,19 +1,13 @@
 /**
- * Business-day calendar API — async, tenant-aware, FEATURE_CALENDAR_V2-gated.
+ * Business-day calendar API — async, tenant-aware.
  *
- * Flag OFF (default): fast-path legacy — apenas nacionais hard-coded (mantém
- * comportamento pré-PR; rollback instantâneo via flag flip).
- *
- * Flag ON: lookup completo via holidaysRepo, com cache LRU tenant-aware.
+ * Lookup completo via holidaysRepo, com cache LRU tenant-aware.
  *
  * kind:
  *   - standard: sáb/dom não-úteis (negócios em geral, agendamentos B2B)
  *   - clt: sábado é útil (jurídico CLT, ex.: prazos trabalhistas)
  */
-import { featureFlags } from '../config/feature-flags.js';
-import { FeatureFlagName } from '../types/enums.js';
 import { getApplicableHolidaysSet, type BusinessDayKind } from './holidays-cache.js';
-import { nationalMovingHolidays, NATIONAL_FIXED } from './national-holidays.js';
 import { holidaysRepo } from '../db/repositories/holidays-repo.js';
 
 export type { BusinessDayKind };
@@ -24,33 +18,10 @@ export interface BusinessDayOptions {
   tz?: string;
 }
 
-/**
- * Legacy fallback — hard-coded apenas nacionais. Mantém o comportamento
- * pré-PR quando flag OFF (rollback instantâneo).
- */
-function isBusinessDayBR_legacy(date: Date): boolean {
-  const dow = date.getUTCDay();
-  if (dow === 0 || dow === 6) return false;
-  const year = date.getUTCFullYear();
-  const month = date.getUTCMonth() + 1;
-  const day = date.getUTCDate();
-  for (const f of NATIONAL_FIXED) {
-    if (f.month === month && f.day === day) return false;
-  }
-  for (const m of nationalMovingHolidays(year)) {
-    if (m.date.getUTCMonth() + 1 === month && m.date.getUTCDate() === day) return false;
-  }
-  return true;
-}
-
 export async function isBusinessDayBR(
   date: Date,
   options?: BusinessDayOptions,
 ): Promise<boolean> {
-  if (!featureFlags.isEnabled(FeatureFlagName.CALENDAR_V2)) {
-    return isBusinessDayBR_legacy(date);
-  }
-
   const kind: BusinessDayKind = options?.kind ?? 'standard';
   const dow = date.getUTCDay();
   if (dow === 0) return false;
@@ -168,29 +139,6 @@ export async function getHolidaysInRange(args: {
   end: Date;
   entidadeId?: string;
 }): Promise<HolidayInRange[]> {
-  if (!featureFlags.isEnabled(FeatureFlagName.CALENDAR_V2)) {
-    // fallback legacy: apenas nacionais (fixos + móveis) do(s) ano(s) no range.
-    const out: HolidayInRange[] = [];
-    const startYear = args.start.getUTCFullYear();
-    const endYear = args.end.getUTCFullYear();
-    for (let y = startYear; y <= endYear; y++) {
-      for (const f of NATIONAL_FIXED) {
-        const d = new Date(Date.UTC(y, f.month - 1, f.day));
-        if (d >= args.start && d <= args.end) {
-          out.push({ date: d, name: f.name, type: 'national' });
-        }
-      }
-      for (const m of nationalMovingHolidays(y)) {
-        if (m.date >= args.start && m.date <= args.end) {
-          out.push({ date: m.date, name: m.name, type: 'national' });
-        }
-      }
-    }
-    out.sort((a, b) => a.date.getTime() - b.date.getTime());
-    return out;
-  }
-
-  // Flag ON: usa holidaysRepo
   const startYear = args.start.getUTCFullYear();
   const endYear = args.end.getUTCFullYear();
   const out: HolidayInRange[] = [];

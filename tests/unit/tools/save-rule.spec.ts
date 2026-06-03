@@ -1,11 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-const rulesCreateMock = vi.fn();
+// save_rule is now an unconditional wrapper over propose_rule (KSM always-on);
+// rules always land in pending_review. Mock the proposer so this unit test
+// stays focused on save_rule's own behaviour: delegation + status surface.
+const proposeRuleHandlerMock = vi.fn();
 
-vi.mock('../../../src/db/repositories.js', () => ({
-  rulesRepo: {
-    create: rulesCreateMock,
-  },
+vi.mock('../../../src/tools/propose-rule.js', () => ({
+  proposeRuleTool: { handler: proposeRuleHandlerMock },
 }));
 
 vi.mock('../../../src/lib/logger.js', () => ({
@@ -13,7 +14,7 @@ vi.mock('../../../src/lib/logger.js', () => ({
 }));
 
 beforeEach(() => {
-  rulesCreateMock.mockReset();
+  proposeRuleHandlerMock.mockReset();
 });
 
 const ctx = {
@@ -26,8 +27,8 @@ const ctx = {
 } as never;
 
 describe('save_rule tool', () => {
-  it('happy path: creates a learned rule in probatory state with default confidence/counters', async () => {
-    rulesCreateMock.mockResolvedValueOnce({ id: 'rule-uuid-1' });
+  it('happy path: routes through propose_rule (KSM) and reports pending_review', async () => {
+    proposeRuleHandlerMock.mockResolvedValueOnce({ proposal_id: 'rule-uuid-1' });
     const { saveRuleTool } = await import('../../../src/tools/save-rule.js');
     const result = await saveRuleTool.handler(
       {
@@ -39,18 +40,12 @@ describe('save_rule tool', () => {
       } as never,
       ctx,
     );
-    expect(result).toEqual({ rule_id: 'rule-uuid-1', status: 'probatoria' });
-    expect(rulesCreateMock).toHaveBeenCalledTimes(1);
-    const arg = rulesCreateMock.mock.calls[0]![0] as Record<string, unknown>;
+    expect(result).toEqual({ rule_id: 'rule-uuid-1', status: 'pending_review' });
+    expect(proposeRuleHandlerMock).toHaveBeenCalledTimes(1);
+    const arg = proposeRuleHandlerMock.mock.calls[0]![0] as Record<string, unknown>;
     expect(arg.tipo).toBe('classificacao');
     expect(arg.contexto).toBe('descricao contem "uber"');
     expect(arg.acao).toBe('categoria=transporte');
-    // Probatory state: never trusted; reflexão promotes later.
-    expect(arg.confianca).toBe('0.50');
-    expect(arg.acertos).toBe(0);
-    expect(arg.erros).toBe(0);
-    expect(arg.ativa).toBe(true);
-    expect(arg.exemplo_origem_id).toBeNull();
   });
 
   it('schema invalid: rejects unknown tipo', async () => {
@@ -61,11 +56,11 @@ describe('save_rule tool', () => {
       acao: 'y',
     });
     expect(parsed.success).toBe(false);
-    expect(rulesCreateMock).not.toHaveBeenCalled();
+    expect(proposeRuleHandlerMock).not.toHaveBeenCalled();
   });
 
   it('fills default jsonb objects when omitted', async () => {
-    rulesCreateMock.mockResolvedValueOnce({ id: 'rule-uuid-2' });
+    proposeRuleHandlerMock.mockResolvedValueOnce({ proposal_id: 'rule-uuid-2' });
     const { saveRuleTool } = await import('../../../src/tools/save-rule.js');
     const parsed = saveRuleTool.input_schema.parse({
       tipo: 'tom_resposta',
@@ -73,7 +68,7 @@ describe('save_rule tool', () => {
       acao: 'tom=formal',
     });
     await saveRuleTool.handler(parsed as never, ctx);
-    const arg = rulesCreateMock.mock.calls[0]![0] as Record<string, unknown>;
+    const arg = proposeRuleHandlerMock.mock.calls[0]![0] as Record<string, unknown>;
     expect(arg.contexto_jsonb).toEqual({});
     expect(arg.acoes_jsonb).toEqual({});
   });

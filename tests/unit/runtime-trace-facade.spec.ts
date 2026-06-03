@@ -90,17 +90,6 @@ describe('trace() facade', () => {
     _setTestMasterSecretForTests('p10b-facade-unit-secret');
   });
 
-  it('flag OFF: no-op envelope returned, no DB write, no enqueue', async () => {
-    isEnabledMock.mockReturnValue(false);
-    const out = await trace(baseInput);
-    expect(out.envelope_hmac).toBe('');
-    expect(out.hmac_key_version).toBe(0);
-    expect(out.decision).toBe('allow');
-    expect(dbInsertMock).not.toHaveBeenCalled();
-    expect(dbTransactionMock).not.toHaveBeenCalled();
-    expect(enqueueMock).not.toHaveBeenCalled();
-  });
-
   it('flag ON: envelope + outbox row written in ONE transaction (durable), body enqueued in-memory', async () => {
     isEnabledMock.mockReturnValue(true);
     const out = await trace(baseInput);

@@ -1,9 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-const saveFactInMemoryMock = vi.fn();
+// save_fact is now an unconditional wrapper over propose_fact (KSM always-on).
+// Mock the proposer so this unit test stays focused on save_fact's own
+// behaviour: scope enforcement + delegation + fact_id surface mapping.
+const proposeFactHandlerMock = vi.fn();
 
-vi.mock('../../../src/memory/semantic.js', () => ({
-  saveFact: saveFactInMemoryMock,
+vi.mock('../../../src/tools/propose-fact.js', () => ({
+  proposeFactTool: { handler: proposeFactHandlerMock },
 }));
 
 vi.mock('../../../src/lib/logger.js', () => ({
@@ -11,7 +14,7 @@ vi.mock('../../../src/lib/logger.js', () => ({
 }));
 
 beforeEach(() => {
-  saveFactInMemoryMock.mockReset();
+  proposeFactHandlerMock.mockReset();
 });
 
 const PESSOA_ID = '11111111-1111-1111-1111-111111111111';
@@ -28,8 +31,8 @@ const ctx = {
 } as never;
 
 describe('save_fact tool', () => {
-  it('happy path: persists a fact under entidade scope and returns fact_id', async () => {
-    saveFactInMemoryMock.mockResolvedValueOnce({ id: 'fact-uuid-1' });
+  it('happy path: routes through propose_fact (KSM) and returns proposal_id as fact_id', async () => {
+    proposeFactHandlerMock.mockResolvedValueOnce({ proposal_id: 'fact-uuid-1' });
     const { saveFactTool } = await import('../../../src/tools/save-fact.js');
     const result = await saveFactTool.handler(
       {
@@ -42,7 +45,9 @@ describe('save_fact tool', () => {
       ctx,
     );
     expect(result).toEqual({ fact_id: 'fact-uuid-1' });
-    expect(saveFactInMemoryMock).toHaveBeenCalledWith({
+    expect(proposeFactHandlerMock).toHaveBeenCalledTimes(1);
+    const [arg] = proposeFactHandlerMock.mock.calls[0]!;
+    expect(arg).toMatchObject({
       escopo: `entidade:${E1}`,
       chave: 'preferencia.fornecedor',
       valor: { nome: 'ACME' },
@@ -74,7 +79,7 @@ describe('save_fact tool', () => {
         ctx,
       ),
     ).rejects.toThrow('escopo_outside_scope');
-    expect(saveFactInMemoryMock).not.toHaveBeenCalled();
+    expect(proposeFactHandlerMock).not.toHaveBeenCalled();
   });
 
   it('rejects pessoa scope when pessoa_id does not match caller', async () => {
@@ -90,6 +95,6 @@ describe('save_fact tool', () => {
         ctx,
       ),
     ).rejects.toThrow('escopo_outside_scope');
-    expect(saveFactInMemoryMock).not.toHaveBeenCalled();
+    expect(proposeFactHandlerMock).not.toHaveBeenCalled();
   });
 });

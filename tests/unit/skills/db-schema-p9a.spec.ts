@@ -11,7 +11,6 @@ import {
   SkillStatus,
   SkillExecutionMode,
   SkillCategory,
-  FeatureFlagName,
 } from '@/types/enums.js';
 
 describe('P9a schema — skills table', () => {
@@ -85,7 +84,4 @@ describe('P9a enums', () => {
     expect(SkillCategory.EVALUATOR).toBe('evaluator');
   });
 
-  it('FeatureFlagName.SKILL_REGISTRY_V1 registered', () => {
-    expect(FeatureFlagName.SKILL_REGISTRY_V1).toBe('SKILL_REGISTRY_V1');
-  });
 });

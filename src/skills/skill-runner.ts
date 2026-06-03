@@ -2,7 +2,8 @@
  * P9a — SkillRunner (executor estável de Skill Contracts).
  *
  * Fluxo 7-gate (master spec v3.1.1 §2.4 + §3.4):
- *  Gate 1. Feature flag (FEATURE_SKILL_REGISTRY_V1)
+ *  Gate 1. (removed) PR #406: the Skill Registry is now UNCONDITIONALLY enabled
+ *          — FEATURE_SKILL_REGISTRY_V1 was removed, so there is no flag gate.
  *  Gate 1.5. Tenant + agent guard (review #99 finding 1) — assertAgentScope.
  *  Gate 2. Lookup skill ativo (skillsRepo.findActive). Tenant + agent-scoped.
  *  Gate 3. Validação do input contra `skill.input_schema`
@@ -25,8 +26,7 @@
 import { runCognitiveModule } from '@/cognition/runner.js';
 import { skillsRepo } from '@/db/repositories.js';
 import { policyDescriptorResolver } from '@/control-plane/policy/policy-descriptor-resolver.js';
-import { featureFlags } from '@/config/feature-flags.js';
-import { FeatureFlagName, SkillExecutionMode } from '@/types/enums.js';
+import { SkillExecutionMode } from '@/types/enums.js';
 import { promptOnlyMode } from './modes/prompt-only.js';
 import { procedureAdapterMode } from './modes/procedure-adapter.js';
 import { toolMediatedMode } from './modes/tool-mediated.js';
@@ -121,18 +121,7 @@ function assertAgentScope(args: {
 export async function runSkill(input: SkillExecutionInput): Promise<SkillExecutionOutput> {
   const startTime = Date.now();
 
-  // Gate 1: feature flag
-  if (!featureFlags.isEnabled(FeatureFlagName.SKILL_REGISTRY_V1)) {
-    return {
-      ok: false,
-      reason: 'flag_off',
-      latency_ms: Date.now() - startTime,
-      resolved_policies: [],
-      trace: EMPTY_TRACE,
-    };
-  }
-
-  // Gate 1.5: tenant + agent context required (review #99 finding 1).
+  // Gate 1: tenant + agent context required (review #99 finding 1).
   // runSkill cannot execute outside runWithTenantContext. We probe early
   // so we return a structured failure instead of letting findActive throw.
   const ctx = tryGetCurrentContext();

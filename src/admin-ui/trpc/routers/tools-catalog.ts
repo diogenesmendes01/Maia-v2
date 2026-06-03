@@ -42,22 +42,19 @@ import { TOOL_CATALOG } from '../../generated/tool-catalog.js';
 /**
  * Map a tool's gating `feature_flag` NAME to its live config boolean.
  *
- * The artifact's `feature_flag` strings are EITHER an env-var name (for
- * config-gated tools: scheduling, PDF reports) OR a `FeatureFlagName` value
- * (for declared-flag calendar write tools + the KSM `propose_*` tools). We map
- * both forms to the corresponding `config.FEATURE_*` boolean WITHOUT importing
- * the registry, the feature-flags singleton, or any handler. Must cover EVERY
- * flag name that can appear in the generated catalog — see the generator.
+ * The artifact's `feature_flag` strings are env-var names for the config-gated
+ * tools. We map them to the corresponding `config.FEATURE_*` boolean WITHOUT
+ * importing the registry, the feature-flags singleton, or any handler. Must
+ * cover EVERY flag name that can appear in the generated catalog — see the
+ * generator.
+ *
+ * PR #406: the KSM `propose_*`, calendar and scheduling tools collapsed to
+ * UNCONDITIONALLY enabled and lost their gating flags, so the regenerated
+ * catalog carries `feature_flag: null` for them (→ enabled). `FEATURE_PDF_REPORTS`
+ * (the PRODUCT-gated PDF tool) is the only flag NAME that still appears.
  */
 const FLAG_TO_CONFIG: Readonly<Record<string, boolean>> = {
-  // Config-gated tools (env-var names; conditional REGISTRY spreads).
-  FEATURE_SCHEDULING_V2: config.FEATURE_SCHEDULING_V2,
   FEATURE_PDF_REPORTS: config.FEATURE_PDF_REPORTS,
-  // Declared `feature_flag` on the tool — `FeatureFlagName` values.
-  // Calendar v2 write tools (`FeatureFlagName.CALENDAR_V2` === 'calendar_v2').
-  calendar_v2: config.FEATURE_CALENDAR_V2,
-  // KSM `propose_*` tools (`FeatureFlagName.KNOWLEDGE_STATE_MACHINE_V1`).
-  KNOWLEDGE_STATE_MACHINE_V1: config.FEATURE_KNOWLEDGE_STATE_MACHINE_V1,
 };
 
 /**

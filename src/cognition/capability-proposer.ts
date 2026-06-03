@@ -23,8 +23,6 @@ import Anthropic from '@anthropic-ai/sdk';
 import { runCognitiveModule } from './runner.js';
 import { capabilityProposalsRepo } from '@/db/repositories.js';
 import type { CapabilityProposalType } from '@/db/repositories.js';
-import { featureFlags } from '@/config/feature-flags.js';
-import { FeatureFlagName } from '@/types/enums.js';
 import type { AgentCapabilityGap, ActivationContext } from '@/db/schema.js';
 import type { SoulScope } from '@/types/enums.js';
 
@@ -91,11 +89,6 @@ export async function proposeCapabilityForGap(args: {
   gap: AgentCapabilityGap;
   recent_evidence?: Array<{ context: string; created_at: Date }>;
 }): Promise<ProposeResult> {
-  // Flag gate — no Sonnet spend without governance active
-  if (!featureFlags.isEnabled(FeatureFlagName.DIALOGICAL_ACQUISITION)) {
-    return { ok: false, reason: 'llm_unavailable', message: 'flag_off' };
-  }
-
   const draft = await runCognitiveModule<ProposalDraft | null>(
     {
       name: 'capability_proposer',

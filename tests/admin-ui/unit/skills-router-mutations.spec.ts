@@ -18,12 +18,10 @@
  * the mock repo reads getCurrentTenant/getCurrentAgent and we can assert what
  * context the call ran under.
  */
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { TRPCError } from '@trpc/server';
 import { skillsRouter } from '@/admin-ui/trpc/routers/skills.js';
 import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
-import { featureFlags } from '@/config/feature-flags.js';
-import { FeatureFlagName } from '@/types/enums.js';
 
 // A complete, valid propose payload for a NON-evaluator skill. Tests tweak it.
 function validProposeInput(overrides: Record<string, unknown> = {}) {
@@ -461,52 +459,6 @@ describe('skillsRouter.propose — disabled/unknown tool rejection (FIX 3)', () 
     );
     expect(res.item).toBeDefined();
     expect(capture.proposeArg?.allowed_tools).toEqual(['register_transaction']);
-  });
-});
-
-// PR #213 round-2 FIX B: the enabled-set MUST be resolved through the runtime
-// `featureFlags.isEnabled()` path (kill switches / overrides) — the SAME gate
-// the dispatcher uses — NOT static `config.FEATURE_*`. `register_custom_holiday`
-// is gated by the `calendar_v2` FeatureFlagName flag. In the test env the
-// CONFIG default for FEATURE_CALENDAR_V2 is false; we drive the runtime
-// singleton directly to prove `propose` tracks it (and not a frozen config
-// snapshot). afterEach resets the shared singleton so other tests are clean.
-describe('skillsRouter.propose — runtime feature-flag gate (FIX B)', () => {
-  afterEach(() => {
-    featureFlags.reset();
-  });
-
-  it('ACCEPTS a FeatureFlagName-gated tool when a runtime OVERRIDE turns it on (config default is off)', async () => {
-    const capture = freshCapture();
-    const repos = makeRepos(capture);
-    // Runtime override ON — even though config.FEATURE_CALENDAR_V2 defaults
-    // false. A static-config gate would still reject; the runtime gate lets
-    // it through, matching the dispatcher.
-    featureFlags.override(FeatureFlagName.CALENDAR_V2, true);
-    const res = await caller('founder', 'tenant-A', repos).propose(
-      validProposeInput({ allowed_tools: ['register_custom_holiday'] }),
-    );
-    expect(res.item).toBeDefined();
-    expect(capture.proposeArg?.allowed_tools).toEqual(['register_custom_holiday']);
-  });
-
-  it('REJECTS a runtime-KILLED FeatureFlagName-gated tool with BAD_REQUEST even though static config has the flag ON', async () => {
-    const capture = freshCapture();
-    const repos = makeRepos(capture);
-    // Simulate "config says on" via a runtime override=true, then flip the
-    // kill switch (max precedence). isEnabled() now returns false, so propose
-    // must reject — proving it reads the runtime path, not the override/config
-    // value. A static-config gate would have ACCEPTED here (the FIX B bug).
-    featureFlags.override(FeatureFlagName.CALENDAR_V2, true);
-    featureFlags.killSwitch(FeatureFlagName.CALENDAR_V2);
-    await expect(
-      caller('founder', 'tenant-A', repos).propose(
-        validProposeInput({ allowed_tools: ['register_custom_holiday'] }),
-      ),
-    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
-    // Rejected BEFORE the repo runs — no skill row, no audit row.
-    expect(capture.proposeArg).toBeUndefined();
-    expect(capture.auditCalls).toHaveLength(0);
   });
 });
 

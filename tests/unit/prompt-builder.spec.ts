@@ -30,6 +30,7 @@ const h = vi.hoisted(() => ({
 
 vi.mock('../../src/db/repositories.js', () => ({
   selfStateRepo: { getActive: h.selfStateGetActive },
+  operationalProfileVersionsRepo: { getActive: vi.fn(async () => null) },
   mensagensRepo: { recentInConversation: h.recentInConversation },
   entidadesRepo: { byIds: h.entidadesByIds },
   factsRepo: { listMentionableForScopes: h.factsListMentionableForScopes },

@@ -12,7 +12,7 @@
  * entram no system prompt mesmo se a invariant da DB (unique index parcial
  * `agent_op_profile_unique_active_idx`) for violada.
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { AgentOperationalProfileVersion } from '../../src/db/schema.js';
 
 const selfStateGetActive = vi.fn();
@@ -159,44 +159,10 @@ beforeEach(async () => {
   capabilityGapsListByLevel.mockResolvedValue([]);
   procedureExecutionsFindActiveForConversa.mockResolvedValue(null);
   procedureDefinitionsFindById.mockResolvedValue(null);
-
-  // Reset feature flags singleton state between tests.
-  const { featureFlags } = await import('../../src/config/feature-flags.js');
-  featureFlags.reset();
 });
 
-afterEach(async () => {
-  // Defensive — ensure no test leaks ON state to the next.
-  const { featureFlags } = await import('../../src/config/feature-flags.js');
-  const { FeatureFlagName } = await import('../../src/types/enums.js');
-  featureFlags.override(FeatureFlagName.OPERATIONAL_PROFILE_V2, false);
-  featureFlags.reset();
-});
-
-describe('buildPrompt — dual-read sob FEATURE_OPERATIONAL_PROFILE_V2', () => {
-  it('1. Flag OFF → usa self_state legado (operationalProfileVersionsRepo NÃO é consultado)', async () => {
-    const { featureFlags } = await import('../../src/config/feature-flags.js');
-    const { FeatureFlagName } = await import('../../src/types/enums.js');
-    featureFlags.override(FeatureFlagName.OPERATIONAL_PROFILE_V2, false);
-
-    const { buildPrompt } = await import('../../src/agent/prompt-builder.js');
-    const { system } = await buildPrompt(ctx);
-
-    expect(system).toContain('LEGACY_SYSTEM_PROMPT_BODY');
-    expect(system).toContain('self_state_v7');
-    expect(system).toContain('LEGACY_RESUMO');
-    expect(system).not.toContain('V2_IDENTITY_BLOCK');
-    // Flag OFF: o repo do profile v2 não é tocado.
-    expect(operationalProfileVersionsGetActive).not.toHaveBeenCalled();
-    expect(selfStateGetActive).toHaveBeenCalledTimes(1);
-    expect(loggerWarn).not.toHaveBeenCalled();
-  });
-
-  it('2. Flag ON + profile.status === active → injeta renderOperationalProfile e NÃO usa self_state', async () => {
-    const { featureFlags } = await import('../../src/config/feature-flags.js');
-    const { FeatureFlagName } = await import('../../src/types/enums.js');
-    featureFlags.override(FeatureFlagName.OPERATIONAL_PROFILE_V2, true);
-
+describe('buildPrompt — operational profile v2 (com fallback a self_state)', () => {
+  it('profile.status === active → injeta renderOperationalProfile e NÃO usa self_state', async () => {
     operationalProfileVersionsGetActive.mockResolvedValue(
       buildVersion({
         status: 'active',
@@ -247,10 +213,6 @@ describe('buildPrompt — dual-read sob FEATURE_OPERATIONAL_PROFILE_V2', () => {
   });
 
   it('3. Flag ON + profile.status === proposed → loga warning e cai pro self_state legado', async () => {
-    const { featureFlags } = await import('../../src/config/feature-flags.js');
-    const { FeatureFlagName } = await import('../../src/types/enums.js');
-    featureFlags.override(FeatureFlagName.OPERATIONAL_PROFILE_V2, true);
-
     operationalProfileVersionsGetActive.mockResolvedValue(
       buildVersion({
         status: 'proposed',
@@ -271,16 +233,12 @@ describe('buildPrompt — dual-read sob FEATURE_OPERATIONAL_PROFILE_V2', () => {
     expect(loggerWarn).toHaveBeenCalledTimes(1);
     const [meta, msg] = loggerWarn.mock.calls[0]!;
     expect(meta).toEqual({ has_profile: true, status: 'proposed' });
-    expect(msg).toBe('identity.profile_v2_invalid_fallback_to_legacy');
+    expect(msg).toBe('identity.profile_v2_invalid_fallback_to_self_state');
     // self_state foi consultado depois da falha do v2.
     expect(selfStateGetActive).toHaveBeenCalledTimes(1);
   });
 
   it('4. Flag ON + profile.status === frozen → loga warning e cai pro self_state legado', async () => {
-    const { featureFlags } = await import('../../src/config/feature-flags.js');
-    const { FeatureFlagName } = await import('../../src/types/enums.js');
-    featureFlags.override(FeatureFlagName.OPERATIONAL_PROFILE_V2, true);
-
     operationalProfileVersionsGetActive.mockResolvedValue(
       buildVersion({
         status: 'frozen',
@@ -299,15 +257,11 @@ describe('buildPrompt — dual-read sob FEATURE_OPERATIONAL_PROFILE_V2', () => {
     expect(loggerWarn).toHaveBeenCalledTimes(1);
     const [meta, msg] = loggerWarn.mock.calls[0]!;
     expect(meta).toEqual({ has_profile: true, status: 'frozen' });
-    expect(msg).toBe('identity.profile_v2_invalid_fallback_to_legacy');
+    expect(msg).toBe('identity.profile_v2_invalid_fallback_to_self_state');
     expect(selfStateGetActive).toHaveBeenCalledTimes(1);
   });
 
   it('5. Flag ON + profile === null → fallback silencioso a self_state (sem warning)', async () => {
-    const { featureFlags } = await import('../../src/config/feature-flags.js');
-    const { FeatureFlagName } = await import('../../src/types/enums.js');
-    featureFlags.override(FeatureFlagName.OPERATIONAL_PROFILE_V2, true);
-
     operationalProfileVersionsGetActive.mockResolvedValue(null);
 
     const { buildPrompt } = await import('../../src/agent/prompt-builder.js');

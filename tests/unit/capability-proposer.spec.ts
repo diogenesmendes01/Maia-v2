@@ -13,7 +13,7 @@
  *  5. Repo throws → repo_failed (com message)
  *  6. Feature flag OFF → llm_unavailable com message=flag_off, sem chamar Anthropic
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const { anthropicCreateMock, createProposalMock } = vi.hoisted(() => ({
   anthropicCreateMock: vi.fn(),
@@ -42,17 +42,10 @@ vi.mock('@/db/repositories.js', async () => {
 });
 
 import { proposeCapabilityForGap } from '@/cognition/capability-proposer.js';
-import { featureFlags } from '@/config/feature-flags.js';
-import { FeatureFlagName } from '@/types/enums.js';
 
 beforeEach(() => {
   anthropicCreateMock.mockReset();
   createProposalMock.mockReset();
-  featureFlags.override(FeatureFlagName.DIALOGICAL_ACQUISITION, true);
-});
-
-afterEach(() => {
-  featureFlags.reset();
 });
 
 function makeFakeGap() {
@@ -161,20 +154,6 @@ describe('proposeCapabilityForGap', () => {
       expect(r.reason).toBe('repo_failed');
       expect(r.message).toContain('db down');
     }
-  });
-
-  it('feature flag OFF → llm_unavailable com message=flag_off, sem chamar Anthropic', async () => {
-    featureFlags.override(FeatureFlagName.DIALOGICAL_ACQUISITION, false);
-
-    const r = await proposeCapabilityForGap({ gap: makeFakeGap() });
-
-    expect(r.ok).toBe(false);
-    if (!r.ok) {
-      expect(r.reason).toBe('llm_unavailable');
-      expect(r.message).toBe('flag_off');
-    }
-    expect(anthropicCreateMock).not.toHaveBeenCalled();
-    expect(createProposalMock).not.toHaveBeenCalled();
   });
 
   it('inclui evidências recentes no user prompt quando fornecidas (limita a 5)', async () => {
