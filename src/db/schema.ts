@@ -293,6 +293,48 @@ export const agent_audience_profiles = pgTable(
   }),
 );
 
+/**
+ * agent_tool_grants — the per-agent tool grant (issue #408).
+ *
+ * Answers "what tools does THIS AGENT have installed?" — a DIFFERENT axis from
+ * "what can the PERSON do" (`permissoes`). The two compose by AND at runtime
+ * (the Runtime Tool Filter). A grant lists:
+ *   - `granted_packs`  — pack ids from `src/tools/packs.ts` (product packs),
+ *   - `granted_tools`  — individual tool names granted outside a pack,
+ *   - `denied_tools`   — HARD deny: never visible to the LLM AND refused by the
+ *                        dispatcher, even if also in a granted pack/tool.
+ * `baseline.core` is ALWAYS unioned in at runtime (the conservative floor), so
+ * the default grant is `granted_packs=['baseline.core']`.
+ *
+ * Tenant isolation (invariant #1): tenant_id + agent_id NOT NULL; the row is
+ * UNIQUE per (tenant_id, agent_id) — one effective grant per agent. Every
+ * read/write through `agentToolGrantsRepo` is scoped via the ALS context.
+ * See migration 076 for FK + the partial-creation default-grant seed.
+ */
+export const agent_tool_grants = pgTable(
+  'agent_tool_grants',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull().default('default'),
+    agent_id: text('agent_id').notNull().default('default'),
+    granted_packs: text('granted_packs')
+      .array()
+      .notNull()
+      .default(sql`'{baseline.core}'::text[]`),
+    granted_tools: text('granted_tools').array().notNull().default(sql`'{}'::text[]`),
+    denied_tools: text('denied_tools').array().notNull().default(sql`'{}'::text[]`),
+    granted_by: text('granted_by'),
+    reason: text('reason'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    // One effective grant per agent (invariant #1 — tenant-scoped uniqueness).
+    agentUniq: unique('agent_tool_grants_tenant_agent_key').on(t.tenant_id, t.agent_id),
+    lookupIdx: index('agent_tool_grants_tenant_agent_idx').on(t.tenant_id, t.agent_id),
+  }),
+);
+
 export const permission_profiles = pgTable('permission_profiles', {
   id: text('id').primaryKey(),
   tenant_id: text('tenant_id').notNull().default('default'),
@@ -2155,6 +2197,11 @@ export type AgentAudienceProfile = Omit<
   status: AudienceStatus;
 };
 export type NewAgentAudienceProfile = typeof agent_audience_profiles.$inferInsert;
+// Issue #408 — per-agent tool grant (granted_packs / granted_tools /
+// denied_tools). Composed by AND with human permissions in the Runtime Tool
+// Filter; `denied_tools` is HARD (invisible + dispatcher-refused).
+export type AgentToolGrantRow = typeof agent_tool_grants.$inferSelect;
+export type NewAgentToolGrant = typeof agent_tool_grants.$inferInsert;
 export type Permissao = typeof permissoes.$inferSelect;
 export type Conversa = typeof conversas.$inferSelect;
 export type Mensagem = typeof mensagens.$inferSelect;
