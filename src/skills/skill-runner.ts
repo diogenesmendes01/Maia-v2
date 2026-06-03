@@ -2,7 +2,8 @@
  * P9a — SkillRunner (executor estável de Skill Contracts).
  *
  * Fluxo 7-gate (master spec v3.1.1 §2.4 + §3.4):
- *  Gate 1. Feature flag (FEATURE_SKILL_REGISTRY_V1)
+ *  Gate 1. (removed) PR #406: the Skill Registry is now UNCONDITIONALLY enabled
+ *          — FEATURE_SKILL_REGISTRY_V1 was removed, so there is no flag gate.
  *  Gate 1.5. Tenant + agent guard (review #99 finding 1) — assertAgentScope.
  *  Gate 2. Lookup skill ativo (skillsRepo.findActive). Tenant + agent-scoped.
  *  Gate 3. Validação do input contra `skill.input_schema`

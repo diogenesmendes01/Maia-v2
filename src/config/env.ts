@@ -192,33 +192,10 @@ const envSchema = z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
-    // Calendar v2 — feriados nacionais/regionais + business-day calendar + rrule extension.
-    // P11: FeatureFlagName enum entry removed (behavior collapsed); env field
-    // retained because the admin-ui Tools Catalog still reads config.FEATURE_CALENDAR_V2
-    // to display the calendar write tools' gate. Drop after Wave E.
-    FEATURE_CALENDAR_V2: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
     /** Cache TTL (ms) for PolicyResolverCache. Default 5min = 300_000ms. */
     POLICY_RESOLVER_CACHE_TTL_MS: z.coerce.number().int().positive().default(300_000),
     /** LRU cap for PolicyResolverCache. Default 10_000 entries. */
     POLICY_RESOLVER_CACHE_MAX_ENTRIES: z.coerce.number().int().positive().default(10_000),
-    // P9a — Skill Registry v1 (skills table + SkillRunner + 4 modes).
-    // P11: FeatureFlagName enum entry removed (behavior collapsed); env field
-    // retained for the admin-ui Tools Catalog until Wave E.
-    FEATURE_SKILL_REGISTRY_V1: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
-    // P10a — Knowledge State Machine (9 estados + auto-promoter + propose_* tools).
-    // P11: FeatureFlagName enum entry removed (behavior collapsed); env field
-    // retained because the admin-ui Tools Catalog reads config.FEATURE_KNOWLEDGE_STATE_MACHINE_V1
-    // to display the KSM propose_* tools' gate. Drop after Wave E.
-    FEATURE_KNOWLEDGE_STATE_MACHINE_V1: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
     /** HMAC key version currently in use (rotates every 90d). */
     RUNTIME_TRACE_HMAC_KEY_VERSION: z.coerce.number().int().positive().default(1),
     /** Master secret material (test only — prod fetches from KMS). */
@@ -277,14 +254,6 @@ const envSchema = z
       .default(0.6),
     MESSAGE_DEBOUNCE_MS: z.coerce.number().int().positive().default(5000),
     MESSAGE_DEBOUNCE_MAX_MS: z.coerce.number().int().positive().default(30000),
-    // Scheduling v2: feature flag for the new occurrence/outbox engine.
-    // Off by default; flip on per-tenant via env once the worker fleet is
-    // ready. Any code path that depends on the new tables is no-op when
-    // this flag is false.
-    FEATURE_SCHEDULING_V2: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
     // Outbox backpressure caps (per agent instance). Defaults are
     // conservative; tune per provider rate-limits.
     OUTBOX_MAX_PER_SECOND: z.coerce.number().int().positive().default(2),
@@ -369,6 +338,26 @@ const envSchema = z
         path: ['RUNTIME_TRACE_HMAC_MASTER_SECRET'],
         message:
           'RUNTIME_TRACE_HMAC_MASTER_SECRET is required in production — audit HMACs would be forgeable without it',
+      });
+    }
+    // PR #406 — fail-closed on the REMOVED context-packet flag. The
+    // FEATURE_CONTEXT_PACKET_V1 hot-path was deleted (the agent loop always
+    // uses buildPrompt), but a stale deployment could still carry the flag (or
+    // its kill switch) in its env. Setting it now is a no-op that would
+    // SILENTLY mislead operators into thinking the path is live, so boot fails
+    // loudly instead. Read process.env directly: these are no longer schema
+    // fields, so cfg does not carry them.
+    if (
+      process.env.FEATURE_CONTEXT_PACKET_V1 === 'true' ||
+      process.env.FEATURE_CONTEXT_PACKET_V1_KILL_SWITCH === 'true'
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['FEATURE_CONTEXT_PACKET_V1'],
+        message:
+          'FEATURE_CONTEXT_PACKET_V1 (and its kill switch) was REMOVED in PR #406 — ' +
+          'the context-packet path no longer exists. Unset FEATURE_CONTEXT_PACKET_V1 / ' +
+          'FEATURE_CONTEXT_PACKET_V1_KILL_SWITCH in this environment.',
       });
     }
     try {

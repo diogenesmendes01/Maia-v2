@@ -579,7 +579,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     "side_effect": "write",
     "operation_type": "create",
     "sensitive": false,
-    "feature_flag": "KNOWLEDGE_STATE_MACHINE_V1",
+    "feature_flag": null,
     "required_actions": [
       "read_balance"
     ],
@@ -627,7 +627,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     "side_effect": "write",
     "operation_type": "create",
     "sensitive": false,
-    "feature_flag": "KNOWLEDGE_STATE_MACHINE_V1",
+    "feature_flag": null,
     "required_actions": [
       "read_balance"
     ],
@@ -680,7 +680,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     "side_effect": "write",
     "operation_type": "create",
     "sensitive": false,
-    "feature_flag": "KNOWLEDGE_STATE_MACHINE_V1",
+    "feature_flag": null,
     "required_actions": [
       "read_balance"
     ],
@@ -728,7 +728,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     "side_effect": "write",
     "operation_type": "create",
     "sensitive": false,
-    "feature_flag": "KNOWLEDGE_STATE_MACHINE_V1",
+    "feature_flag": null,
     "required_actions": [
       "read_balance"
     ],

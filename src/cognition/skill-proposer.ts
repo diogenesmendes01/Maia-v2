@@ -6,7 +6,8 @@
  * `capability_proposals` (capability_type='skill'). Roda em batch async.
  *
  * Fluxo:
- *  1. Flag gate (FEATURE_SKILL_REGISTRY_V1)
+ *  1. (removido) PR #406: Skill Registry sempre habilitado — flag
+ *     FEATURE_SKILL_REGISTRY_V1 removida, sem gate de feature flag.
  *  2. Determinístico — query agrupando registros por (module_name, status,
  *     output_summary_hash) nos últimos N dias. Pattern: ≥3 ocorrências do
  *     mesmo módulo + status=success + sem skill ativa correspondente.

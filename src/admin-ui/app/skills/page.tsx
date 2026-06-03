@@ -147,8 +147,6 @@ export default function SkillsPage() {
     { enabled: tenantId !== '' },
   );
 
-  const flagQuery = trpc.skills.runtimeFlag.useQuery();
-
   const listQuery = trpc.skills.list.useQuery(
     { tenantId, agentId, status: tab },
     { enabled: tenantId !== '' && agentId !== '' },
@@ -160,10 +158,6 @@ export default function SkillsPage() {
   // FIX A (review PR #209): the list is capped at 200; surface truncation
   // explicitly instead of letting >200 skills silently vanish.
   const listTruncated = listQuery.data?.hasMore === true;
-  // FIX 1 (review PR #209): this only reflects THIS admin-ui's own config.
-  const adminUiFlagOff = flagQuery.data
-    ? flagQuery.data.adminUiSkillRegistryEnabled === false
-    : false;
 
   // Reset agent + selection whenever the founder switches tenant — agents and
   // skills are tenant-scoped, so a stale agentId/selectedId would be wrong.
@@ -197,17 +191,6 @@ export default function SkillsPage() {
           phase.
         </p>
       </header>
-
-      {adminUiFlagOff && (
-        <div className="border border-amber-300 bg-amber-50 text-amber-900 rounded p-3 text-sm">
-          This admin-ui sees{' '}
-          <code className="font-medium">FEATURE_SKILL_REGISTRY_V1</code> ={' '}
-          <strong>off</strong>. Skills are managed here, but execution depends on{' '}
-          <strong>maia-app</strong>&apos;s own config (a separate container) —
-          verify the flag there. This banner reflects only this admin-ui&apos;s
-          environment, not maia-app&apos;s runtime state.
-        </div>
-      )}
 
       <div className="flex flex-wrap items-center gap-3 text-sm">
         <span className="font-medium">Tenant:</span>

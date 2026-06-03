@@ -131,21 +131,6 @@ export type Tool<I extends z.ZodTypeAny, O extends z.ZodTypeAny> = {
 
 export type AnyTool = Tool<z.ZodTypeAny, z.ZodTypeAny>;
 
-/**
- * P10a (review #104): `propose_*` tool names are kept here so we can
- * filter the registry view (`getToolSchemas`) and the dispatcher path
- * (`isToolEnabled`) by the runtime feature flag. The registry itself
- * holds all entries so the kill switch can be flipped on/off without a
- * redeploy; the runtime check decides whether the tool is exposed and
- * dispatched.
- */
-const KSM_PROPOSE_TOOLS: ReadonlySet<string> = new Set([
-  'propose_fact',
-  'propose_rule',
-  'propose_memory',
-  'propose_hint',
-]);
-
 export const REGISTRY: Record<string, AnyTool> = {
   register_transaction: registerTransactionTool as unknown as AnyTool,
   cancel_transaction: cancelTransactionTool as unknown as AnyTool,
@@ -170,10 +155,9 @@ export const REGISTRY: Record<string, AnyTool> = {
   save_rule: saveRuleTool as unknown as AnyTool,
   // P10a — Knowledge State Machine `propose_*` tools. The harness
   // decides the initial lifecycle state (ephemeral / pending_review);
-  // the LLM never writes directly to `active`.
-  // Runtime feature-flag check in getToolSchemas + isToolEnabled keeps
-  // them invisible/blocked when KNOWLEDGE_STATE_MACHINE_V1 is off (review
-  // #104), so kill switches take effect without a redeploy.
+  // the LLM never writes directly to `active`. PR #406: KSM collapsed to
+  // always-on — the KNOWLEDGE_STATE_MACHINE_V1 flag was removed, so these are
+  // UNCONDITIONALLY exposed and dispatched (ungated in the catalog).
   propose_fact: proposeFactTool as unknown as AnyTool,
   propose_rule: proposeRuleTool as unknown as AnyTool,
   propose_memory: proposeMemoryTool as unknown as AnyTool,
@@ -192,10 +176,9 @@ export const REGISTRY: Record<string, AnyTool> = {
   calendar_list_holidays: calendarListHolidaysTool as unknown as AnyTool,
   calendar_business_days_between: calendarBusinessDaysBetweenTool as unknown as AnyTool,
   calendar_add_business_days: calendarAddBusinessDaysTool as unknown as AnyTool,
-  // Calendar v2 — write tools. Cada uma declara `feature_flag` para que o
-  // gate seja avaliado em runtime (kill-switch funciona em processos já
-  // carregados, schema exposto ao LLM sincroniza com o flag). Codex review
-  // #105 medium.
+  // Calendar v2 — write tools. PR #406: CALENDAR_V2 collapsed to always-on
+  // (the FeatureFlagName enum entry + env field were removed), so these no
+  // longer declare a `feature_flag` and are UNCONDITIONALLY enabled.
   register_custom_holiday: registerCustomHolidayTool as unknown as AnyTool,
   approve_capability_proposal: approveCapabilityProposalTool as unknown as AnyTool,
   reject_capability_proposal: rejectCapabilityProposalTool as unknown as AnyTool,
@@ -213,10 +196,10 @@ export const REGISTRY: Record<string, AnyTool> = {
  * flag. Co-located with the `REGISTRY` spreads above so the two never drift:
  * if you add/remove a config-gated tool there, update this list too.
  *
- * Note these are config-env flags, NOT `FeatureFlagName` enum members (unlike
- * the calendar tools, which declare `feature_flag` on the tool itself, and the
- * KSM `propose_*` tools, gated by `FeatureFlagName.KNOWLEDGE_STATE_MACHINE_V1`).
- * The `flag` strings below are the env var names operators flip.
+ * These are config-env flag NAMES (the env vars operators flip), NOT
+ * `FeatureFlagName` enum members. PR #406 collapsed the last `FeatureFlagName`-
+ * gated tools (calendar / KSM `propose_*`) to always-on, so `generate_report`
+ * (the PRODUCT-gated PDF tool) is the only config-gated entry that remains.
  */
 const CONFIG_GATED_TOOLS: ReadonlyArray<{
   tool: AnyTool;
@@ -255,10 +238,9 @@ export function getToolSchemas(byEntity: Map<string, ResolvedPermission>) {
     }
     for (const a of rp.profile.acoes) allowed.add(a);
   }
-  // Codex review #105 (medium) + KSM: além do filtro de permissão, oculta tools
-  // cujo feature_flag esteja desligado em runtime. Mantém schema exposto
-  // ao LLM sincronizado com o gate do dispatcher. `isToolEnabled` honra
-  // tanto KSM propose_* tools quanto o `feature_flag` declarado por tool.
+  // Codex review #105 (medium): além do filtro de permissão, oculta tools
+  // cujo `feature_flag` declarado esteja desligado em runtime. Mantém o schema
+  // exposto ao LLM sincronizado com o gate do dispatcher.
   const tools = Object.values(REGISTRY).filter((t) => isToolEnabled(t.name));
   if (isOwner) return tools.map(toolToSchema);
   return tools
@@ -290,16 +272,17 @@ export interface CatalogEntry {
  * Build the COMPLETE tool catalog for the Admin UI `/tools` screen.
  *
  * Unlike `Object.values(REGISTRY)`, this includes tools that are absent from
- * `REGISTRY` because their CONFIG flag is off (scheduling tools, generate_report)
- * — operators must see every tool that exists and which flag turns it on.
+ * `REGISTRY` because their CONFIG flag is off (currently only `generate_report`,
+ * gated by `FEATURE_PDF_REPORTS`) — operators must see every tool that exists
+ * and which flag turns it on.
  *
  * Per entry it computes:
  *   - `enabled`: the real gating (config flag for config-gated tools,
- *     `isToolEnabled` — which honours declared `feature_flag` and the KSM
- *     `propose_*` flag — for everything else).
+ *     `isToolEnabled` — which honours a declared `feature_flag` kill switch —
+ *     for everything else).
  *   - `feature_flag`: the NAME of the gating flag (env var name for
- *     config-gated tools; `FeatureFlagName` value for declared-flag and KSM
- *     tools), or null when the tool is ungated.
+ *     config-gated tools; the declared `feature_flag` value otherwise), or null
+ *     when the tool is ungated (PR #406 left KSM/calendar/scheduling ungated).
  *
  * Deduped by tool name (a config-gated tool present in `REGISTRY` because its
  * flag is currently on is not added twice). Stable, sorted by name so the UI
@@ -339,20 +322,19 @@ export function buildToolCatalog(): CatalogEntry[] {
 
 /**
  * The NAME of the flag gating a tool already present in `REGISTRY`:
- *   - KSM `propose_*` tools → 'KNOWLEDGE_STATE_MACHINE_V1'.
- *   - tools that declare `feature_flag` (calendar write tools) → that value.
+ *   - tools that declare a `feature_flag` kill switch → that value.
  *   - otherwise null (ungated, or config-gated tools handled separately).
  *
- * P11: KSM behavior collapsed to always-on and the FeatureFlagName enum entry
- * was removed, but the catalog still surfaces this flag NAME so the generated
- * admin-ui artifact stays stable until the admin-ui teardown wave. The
- * admin-ui maps the literal 'KNOWLEDGE_STATE_MACHINE_V1' to
- * config.FEATURE_KNOWLEDGE_STATE_MACHINE_V1.
+ * PR #406 — admin-ui teardown completion: the KSM `propose_*`, calendar and
+ * scheduling tools collapsed to UNCONDITIONALLY enabled. Their `FeatureFlagName`
+ * enum entries (and the orphan `FEATURE_*` env fields) were removed, so the
+ * catalog must report them as UNGATED (`feature_flag: null`) — surfacing a dead
+ * flag NAME made the admin-ui treat live tools as disabled and reject them as
+ * `disabled_tools_not_allowed` in skill authoring. The only tool still reporting
+ * a gating flag here is the PRODUCT-gated `generate_report`
+ * (→ 'FEATURE_PDF_REPORTS'), handled via `CONFIG_GATED_TOOLS`.
  */
 function gatingFlagName(tool: AnyTool): string | null {
-  if (KSM_PROPOSE_TOOLS.has(tool.name)) {
-    return 'KNOWLEDGE_STATE_MACHINE_V1';
-  }
   if (tool.feature_flag !== undefined) {
     return tool.feature_flag;
   }

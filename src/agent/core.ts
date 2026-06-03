@@ -590,7 +590,8 @@ async function runAgentForMensagemInner(
   //  - disambiguation_requested: owner was prompted; we still let the LLM
   //    answer the sender so they don't get silence.
   //  - no_match: no scheduling state cares about this inbound; continue.
-  if (config.FEATURE_SCHEDULING_V2 && inbound.tipo === 'texto' && inbound.conteudo) {
+  // PR #406: Scheduling V2 collapsed to always-on (FEATURE_SCHEDULING_V2 removed).
+  if (inbound.tipo === 'texto' && inbound.conteudo) {
     try {
       const { captureInboundForOutreach } = await import('@/scheduling/disambiguation.js');
       const ownerId = config.OWNER_TELEFONE_WHATSAPP;

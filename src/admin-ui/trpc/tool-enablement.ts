@@ -5,19 +5,21 @@
  * plain string, or null) is resolved to a live boolean using the SAME gate the
  * runtime DISPATCHER uses (`src/tools/_dispatcher.ts` → `_registry.isToolEnabled`):
  *
- *   - Declared `FeatureFlagName` flags (e.g. `calendar_v2`,
- *     `KNOWLEDGE_STATE_MACHINE_V1`) are read through the runtime
+ *   - Declared `FeatureFlagName` flags are read through the runtime
  *     `featureFlags.isEnabled()` singleton, so KILL SWITCHES and runtime
  *     OVERRIDES are honoured — exactly like the dispatcher. Reading static
- *     `config.FEATURE_*` here (the previous behaviour) would DIVERGE from the
- *     dispatcher: a flag killed at runtime stays "on" in config, so `propose`
- *     would accept a tool the dispatcher refuses to run.
- *   - Env-var-name flags (`FEATURE_SCHEDULING_V2`, `FEATURE_PDF_REPORTS`) gate
- *     the tool's *presence in `REGISTRY`* via conditional spreads at module
- *     load — they are NOT members of `FeatureFlagName` and have no runtime
- *     override path, so the dispatcher itself only sees them via `config`.
- *     We mirror that by reading `config.FEATURE_*` for these.
- *   - No gating flag (null) → always enabled.
+ *     `config.FEATURE_*` here would DIVERGE from the dispatcher: a flag killed
+ *     at runtime stays "on" in config, so `propose` would accept a tool the
+ *     dispatcher refuses to run.
+ *   - Env-var-name flags (`FEATURE_PDF_REPORTS`) gate the tool's *presence in
+ *     `REGISTRY`* via a conditional spread at module load — they are NOT members
+ *     of `FeatureFlagName` and have no runtime override path, so the dispatcher
+ *     itself only sees them via `config`. We mirror that by reading
+ *     `config.FEATURE_*` for these.
+ *   - No gating flag (null) → always enabled. PR #406 collapsed the KSM
+ *     `propose_*`, calendar and scheduling tools to UNCONDITIONALLY enabled and
+ *     removed their gating flags, so the generated catalog now carries
+ *     `feature_flag: null` for them and they resolve to ENABLED here.
  *   - An unknown flag name conservatively reads as DISABLED (a generator/router
  *     drift bug, surfaced by treating the tool as off rather than silently on).
  *
@@ -45,23 +47,19 @@ import { featureFlags } from '@/config/feature-flags.js';
 import { FeatureFlagName } from '@/types/enums.js';
 
 /**
- * Flag names resolved against the static config boolean rather than the runtime
- * `featureFlags` singleton:
- *   - Env-var-name flags (`FEATURE_SCHEDULING_V2`, `FEATURE_PDF_REPORTS`) gate a
- *     tool's PRESENCE in `REGISTRY` via conditional spreads — never were
- *     `FeatureFlagName` members.
- *   - P11: `calendar_v2` / `KNOWLEDGE_STATE_MACHINE_V1` / `SKILL_REGISTRY_V1`
- *     lost their `FeatureFlagName` enum entry when their behaviour was collapsed
- *     to always-on, but the generated catalog still carries these gating flag
- *     NAMES. Their env field is retained (until Wave E), so resolve them against
- *     `config.FEATURE_*` here — matching `tools-catalog.ts`'s `FLAG_TO_CONFIG`.
+ * Env-var-name flags resolved against the static config boolean rather than the
+ * runtime `featureFlags` singleton: they gate a tool's PRESENCE in `REGISTRY`
+ * via a conditional spread (never were `FeatureFlagName` members).
+ *
+ * PR #406: `calendar_v2` / `KNOWLEDGE_STATE_MACHINE_V1` / `SKILL_REGISTRY_V1` /
+ * `FEATURE_SCHEDULING_V2` were removed when those behaviours collapsed to
+ * always-on; the regenerated catalog no longer carries them (their entries are
+ * `feature_flag: null` ⇒ enabled). `FEATURE_PDF_REPORTS` (the PRODUCT-gated PDF
+ * tool) is the only env-var-name flag that remains. Mirrors `tools-catalog.ts`'s
+ * `FLAG_TO_CONFIG`.
  */
 const ENV_FLAG_TO_CONFIG: Readonly<Record<string, boolean>> = {
-  FEATURE_SCHEDULING_V2: config.FEATURE_SCHEDULING_V2,
   FEATURE_PDF_REPORTS: config.FEATURE_PDF_REPORTS,
-  calendar_v2: config.FEATURE_CALENDAR_V2,
-  KNOWLEDGE_STATE_MACHINE_V1: config.FEATURE_KNOWLEDGE_STATE_MACHINE_V1,
-  SKILL_REGISTRY_V1: config.FEATURE_SKILL_REGISTRY_V1,
 };
 
 /** The set of valid `FeatureFlagName` VALUES, for the runtime-vs-env decision. */
