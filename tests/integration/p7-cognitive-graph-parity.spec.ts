@@ -115,19 +115,34 @@ vi.mock('@/cognition/capability-tracker.js', () => ({
   recordFailure: vi.fn(async () => {}),
 }));
 
+// procedure-selector — mock so the preturn `procedure-selector` node returns a
+// deterministic SelectorDecision without an LLM. Drives the `selector_decisions`
+// parity scenario: the node output is persisted via
+// `procedureSelectorDecisionsRepo.record` exactly as agent/core.ts does.
+const selectProcedureMock = vi.fn();
+vi.mock('@/cognition/procedure-selector.js', () => ({
+  selectProcedure: (...args: unknown[]) => selectProcedureMock(...args),
+}));
+
 import * as engine from '@/procedures/engine.js';
 import { buildPostturnNodes } from '@/cognitive-graph/postturn-graph.js';
+import { buildPreturnNodes } from '@/cognitive-graph/preturn-graph.js';
 import { runNodes } from '@/cognitive-graph/orchestrator.js';
+import { procedureSelectorDecisionsRepo } from '@/db/repositories.js';
 
 /**
- * Reference: the event_type set the LEGACY imperative post-turn IIFE in
- * agent/core.ts emitted for a single-step completion that called a tool and
- * had one passing criterion. (Setup `startExecution` contributes
- * `execution_started`; the evaluator-completion contributes the rest.)
+ * Reference: the EXACT ordered event_type sequence the LEGACY imperative
+ * post-turn IIFE in agent/core.ts emitted for a single-step completion that
+ * called one tool and had one passing criterion, then advanced one step.
  *
- * advanceStep itself emits step_completed + step_started + state_updated
- * (see procedures/engine.ts:advanceStep), so the full ordered set for a
- * tool+criterion turn that advances one step is below.
+ * Order is byte-for-byte the engine's emission order (see procedures/engine.ts):
+ *   - setup `startExecution`     → execution_started
+ *   - recordToolCalled (per tool)→ tool_called
+ *   - recordCriterionChecked     → criterion_checked
+ *   - advanceStep                → step_completed, step_started, state_updated
+ *
+ * The test asserts this sequence EXACTLY (ordered + exact count) — not mere
+ * membership — so a dropped, reordered, or duplicated event fails the gate.
  */
 const LEGACY_ADVANCE_EVENT_TYPES = [
   'execution_started', // from startExecution (turn setup)
@@ -136,6 +151,33 @@ const LEGACY_ADVANCE_EVENT_TYPES = [
   'step_completed', // advanceStep
   'step_started', // advanceStep (next step)
   'state_updated', // advanceStep
+] as const;
+
+/**
+ * Branch scenario: when the completed step has ≥2 eligible downstream steps,
+ * the DAG-aware picker linearizes them and the node emits `branch_taken`
+ * (chosen + alternates) BEFORE the advance trio. Exact ordered sequence:
+ */
+const LEGACY_BRANCH_EVENT_TYPES = [
+  'execution_started',
+  'tool_called',
+  'criterion_checked',
+  'branch_taken', // recordEvent — DAG linearized, alternates reported
+  'step_completed',
+  'step_started',
+  'state_updated',
+] as const;
+
+/**
+ * Terminal-completion scenario: last step passes, no eligible next step, so
+ * the node calls `completeExecution` (NOT advanceStep). Exact sequence:
+ */
+const LEGACY_COMPLETE_EVENT_TYPES = [
+  'execution_started',
+  'tool_called',
+  'criterion_checked',
+  'execution_completed', // completeExecution
+  'state_updated', // completeExecution (status flip)
 ] as const;
 
 function seedAdvanceableDefinition(defId: string) {
@@ -150,6 +192,47 @@ function seedAdvanceableDefinition(defId: string) {
       { id: 'step-1', intencao: 'X', como: 'Y', sucesso_criteria_ref: 'crit-1' },
       { id: 'step-2', intencao: 'Z', como: 'W', depends_on: ['step-1'] },
     ],
+    success_criteria: [{ id: 'crit-1', type: 'machine_check', expression: 'confirmado' }],
+  };
+}
+
+/**
+ * A DAG with a real branch: `step-1` completes and BOTH `step-2a` and
+ * `step-2b` become eligible (both depend only on `step-1`, neither completed).
+ * The deterministic picker chooses `step-2a` (array order) and reports
+ * `step-2b` as an alternate → exercises `branch_taken`.
+ */
+function seedBranchingDefinition(defId: string) {
+  definitions[defId] = {
+    id: defId,
+    nome: 'branch-proc',
+    version_number: 1,
+    status: 'active',
+    intencao: 'test',
+    when_apply: {},
+    steps: [
+      { id: 'step-1', intencao: 'X', como: 'Y', sucesso_criteria_ref: 'crit-1' },
+      { id: 'step-2a', intencao: 'A', como: 'A', depends_on: ['step-1'] },
+      { id: 'step-2b', intencao: 'B', como: 'B', depends_on: ['step-1'] },
+    ],
+    success_criteria: [{ id: 'crit-1', type: 'machine_check', expression: 'confirmado' }],
+  };
+}
+
+/**
+ * A single-step definition: `step-1` passes and there is NO downstream step,
+ * so the evaluator returns `next_step_id=null` and the node terminates the
+ * execution via `completeExecution`.
+ */
+function seedTerminalDefinition(defId: string) {
+  definitions[defId] = {
+    id: defId,
+    nome: 'terminal-proc',
+    version_number: 1,
+    status: 'active',
+    intencao: 'test',
+    when_apply: {},
+    steps: [{ id: 'step-1', intencao: 'X', como: 'Y', sucesso_criteria_ref: 'crit-1' }],
     success_criteria: [{ id: 'crit-1', type: 'machine_check', expression: 'confirmado' }],
   };
 }
@@ -197,10 +280,9 @@ describe('P7 — cognitive graph DB side-effect parity (#412)', () => {
 
       const types = events.map((e) => e.event_type);
 
-      // Parity: every legacy event_type is present, in the same relative order.
-      for (const t of LEGACY_ADVANCE_EVENT_TYPES) {
-        expect(types).toContain(t);
-      }
+      // STRICT parity: the EXACT ordered sequence + exact count — not mere
+      // membership. Dropping, reordering, or duplicating any event fails here.
+      expect(types).toEqual([...LEGACY_ADVANCE_EVENT_TYPES]);
 
       // The audit rows the original graph node DROPPED (pre-#412): tool_called
       // and criterion_checked. Assert their payloads carry the right shape.
@@ -211,9 +293,113 @@ describe('P7 — cognitive graph DB side-effect parity (#412)', () => {
       expect(critEvt?.payload?.criterion_id).toBe('crit-1');
       expect(critEvt?.payload?.passed).toBe(true);
 
+      // advanceStep payload parity: step_completed carries completed+next ids.
+      const stepCompleted = events.find((e) => e.event_type === 'step_completed');
+      expect(stepCompleted?.payload).toMatchObject({
+        completed_step_id: 'step-1',
+        next_step_id: 'step-2',
+      });
+      const stateUpdated = events.find((e) => e.event_type === 'state_updated');
+      expect(stateUpdated?.payload).toMatchObject({
+        current_step_id: 'step-2',
+        completed_steps: ['step-1'],
+      });
+
+      // Single-step advance emits NO branch_taken (only one eligible next step).
+      expect(types).not.toContain('branch_taken');
+
       // And the step actually advanced (state mutation parity).
       expect(execState[exec.id].current_step_id).toBe('step-2');
       expect(execState[exec.id].completed_steps).toContain('step-1');
+    });
+  });
+
+  it('branch-alternate scenario: a step with ≥2 eligible next steps emits branch_taken (chosen + alternates) in the exact ordered sequence before the advance trio', async () => {
+    const defId = 'def-branch';
+    seedBranchingDefinition(defId);
+
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { execution: exec } = await engine.startExecution({
+        definition_id: defId,
+        definition_version: 1,
+        conversa_id: 'c-branch',
+        first_step_id: 'step-1',
+      });
+
+      await runNodes(buildPostturnNodes(), {
+        conversa_id: 'c-branch',
+        turno_id: 't-branch',
+        pessoa: { id: 'p1' },
+        conversa: { id: 'c-branch' },
+        inbound: { id: 't-branch', conteudo: 'confirmado pelo cliente' },
+        response_text: 'confirmado pelo cliente',
+        tools_called: [{ name: 'lancar_transacao', result: { ok: true } }],
+        active_execution_id: exec.id,
+      } as never);
+      await new Promise((r) => setTimeout(r, 50));
+
+      const types = events.map((e) => e.event_type);
+
+      // STRICT parity: exact ordered sequence WITH branch_taken interleaved
+      // between criterion_checked and the advance trio.
+      expect(types).toEqual([...LEGACY_BRANCH_EVENT_TYPES]);
+
+      // branch_taken payload: deterministic array-order pick → step-2a chosen,
+      // step-2b reported as the linearized alternate.
+      const branchEvt = events.find((e) => e.event_type === 'branch_taken');
+      expect(branchEvt?.step_id).toBe('step-2a');
+      expect(branchEvt?.payload).toMatchObject({
+        chosen_step_id: 'step-2a',
+        alternates: ['step-2b'],
+        picker: 'deterministic_array_order',
+      });
+
+      // Advanced into the chosen branch (state mutation parity).
+      expect(execState[exec.id].current_step_id).toBe('step-2a');
+      expect(execState[exec.id].completed_steps).toContain('step-1');
+    });
+  });
+
+  it('terminal-completion scenario: the last step passing (no next step) emits execution_completed + state_updated with success outcome — NOT advanceStep', async () => {
+    const defId = 'def-terminal';
+    seedTerminalDefinition(defId);
+
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { execution: exec } = await engine.startExecution({
+        definition_id: defId,
+        definition_version: 1,
+        conversa_id: 'c-terminal',
+        first_step_id: 'step-1',
+      });
+
+      await runNodes(buildPostturnNodes(), {
+        conversa_id: 'c-terminal',
+        turno_id: 't-terminal',
+        pessoa: { id: 'p1' },
+        conversa: { id: 'c-terminal' },
+        inbound: { id: 't-terminal', conteudo: 'confirmado pelo cliente' },
+        response_text: 'confirmado pelo cliente',
+        tools_called: [{ name: 'lancar_transacao', result: { ok: true } }],
+        active_execution_id: exec.id,
+      } as never);
+      await new Promise((r) => setTimeout(r, 50));
+
+      const types = events.map((e) => e.event_type);
+
+      // STRICT parity: exact ordered terminal sequence. Completion path emits
+      // execution_completed + state_updated and NEVER the advance trio.
+      expect(types).toEqual([...LEGACY_COMPLETE_EVENT_TYPES]);
+      expect(types).not.toContain('step_started');
+
+      const completedEvt = events.find((e) => e.event_type === 'execution_completed');
+      expect(completedEvt?.payload).toMatchObject({ outcome: 'success' });
+
+      const stateEvt = events.find((e) => e.event_type === 'state_updated');
+      expect(stateEvt?.payload).toMatchObject({ status: 'completed', outcome: 'success' });
+
+      // Execution terminal in the mirror (status flipped, outcome recorded).
+      expect(execState[exec.id].status).toBe('completed');
+      expect(execState[exec.id].outcome).toBe('success');
     });
   });
 
@@ -280,6 +466,59 @@ describe('P7 — cognitive graph DB side-effect parity (#412)', () => {
       expect(persistedCandidates[0].event.type).toBe('success_explicit');
       expect(persistedCandidates[0].event.conversa_id).toBe('c-success');
       expect(successesRecorded).toEqual([{ domain: 'general' }]);
+    });
+  });
+
+  it('selector_decisions parity: the procedure-selector node output is persisted to procedureSelectorDecisionsRepo.record with the legacy field mapping', async () => {
+    // The `procedure-selector` node returns a SelectorDecision; the persist
+    // into `selector_decisions` is a post-graph side-effect in agent/core.ts
+    // (consuming `result.nodes['procedure-selector'].output`). This scenario
+    // drives the REAL preturn node via runNodes, then persists its output with
+    // the SAME field mapping core.ts uses, proving the `selector_decisions`
+    // side-effect lands in the mirror — the parity the doc claims.
+    const selectorDecision = {
+      decision: 'start' as const,
+      selected_procedure_id: 'proc-onboarding',
+      candidates: [{ procedure_id: 'proc-onboarding', confidence: 0.91, reason: 'top' }],
+      conflicts: [],
+      reason: 'top candidate 0.91 > threshold 0.70',
+    };
+    selectProcedureMock.mockResolvedValue(selectorDecision);
+
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const result = await runNodes(buildPreturnNodes({ multi_channel_on: false }), {
+        conversa_id: 'c-selector',
+        turno_id: 't-selector',
+        inbound_text: 'quero abrir uma conta nova',
+        current_execution: null,
+      } as never);
+
+      const selectorOutput = result.nodes['procedure-selector']?.output as
+        | typeof selectorDecision
+        | null;
+      expect(selectorOutput).toEqual(selectorDecision);
+
+      // Mirror agent/core.ts's post-graph persist of the selector decision.
+      await procedureSelectorDecisionsRepo.record({
+        conversa_id: 'c-selector',
+        turno_id: 't-selector',
+        current_execution_id: null,
+        candidates: selectorOutput!.candidates,
+        conflicts: selectorOutput!.conflicts,
+        decision: selectorOutput!.decision,
+        selected_procedure_id: selectorOutput!.selected_procedure_id ?? null,
+        decided_by: 'selector_llm',
+        reason: selectorOutput!.reason,
+      } as never);
+
+      expect(decisions.length).toBe(1);
+      expect(decisions[0]).toMatchObject({
+        conversa_id: 'c-selector',
+        turno_id: 't-selector',
+        decision: 'start',
+        selected_procedure_id: 'proc-onboarding',
+        decided_by: 'selector_llm',
+      });
     });
   });
 
