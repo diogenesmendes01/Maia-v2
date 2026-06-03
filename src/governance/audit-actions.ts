@@ -156,6 +156,26 @@ export const AUDIT_ACTIONS = [
   'audience_blocked_no_profile',
   'audience_ambiguous',
   'audience_quarantined',
+  // Issue #410 — baseline.core tools. Conservative capabilities every runtime
+  // agent gets by default (no domain side effects). Each baseline tool audits
+  // its own action label so the decision trail (invariant #4) records that the
+  // agent understood context / asked / escalated / remembered a safe fact —
+  // exactly the behaviours the baseline contract promises.
+  // `turn_context_read`: read_turn_context inspected the current turn/scope.
+  // `safe_fact_remembered`: remember_safe_fact persisted a policy-permitted
+  // safe fact (side_effect=write, but only within the caller's own scope).
+  // `confirmation_requested`: request_confirmation asked the human to confirm
+  // (it never acts — LLM proposes, backend disposes, invariant #2).
+  // `owner_handoff_requested`: handoff_to_owner raised an INTERNAL escalation
+  // to the owner (NOT an arbitrary external send).
+  // `decision_audited`: audit_decision recorded an explicit decision rationale.
+  // `limitation_explained`: explain_limitation told the user what it cannot do.
+  'turn_context_read',
+  'safe_fact_remembered',
+  'confirmation_requested',
+  'owner_handoff_requested',
+  'decision_audited',
+  'limitation_explained',
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];
@@ -193,6 +213,18 @@ export const ACTION_KEYS = [
   // que `manage_calendar` em uma entidade NÃO autorize aprovação de
   // proposals tenant-level ou de entidades fora do escopo.
   'manage_capabilities',
+  // Issue #410 — baseline.core action keys for the two baseline tools that
+  // have a side effect beyond `none`/`read`.
+  // `save_safe_fact`: granular permission for `remember_safe_fact` (write).
+  //   Deliberately distinct from `create_transaction` / financial writes — a
+  //   baseline agent may persist a SAFE fact about the conversation WITHOUT
+  //   carrying any domain mutation grant.
+  // `escalate_to_owner`: granular permission for `handoff_to_owner`
+  //   (communication). This is an INTERNAL escalation to the agent's owner,
+  //   NOT `send_proactive_message` (arbitrary external send) — kept separate so
+  //   the baseline can grant escalation without granting external messaging.
+  'save_safe_fact',
+  'escalate_to_owner',
 ] as const;
 
 export type ActionKey = (typeof ACTION_KEYS)[number];

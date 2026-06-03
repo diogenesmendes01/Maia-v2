@@ -42,6 +42,14 @@ import { registerCustomHolidayTool } from './register-custom-holiday.js';
 import { approveCapabilityProposalTool } from './approve-capability-proposal.js';
 import { rejectCapabilityProposalTool } from './reject-capability-proposal.js';
 import { listPendingProposalsTool } from './list-pending-proposals.js';
+// Issue #410 — baseline.core tools. Conservative, no-domain-side-effect
+// capabilities every runtime agent gets by default (see src/tools/packs.ts).
+import { readTurnContextTool } from './read-turn-context.js';
+import { rememberSafeFactTool } from './remember-safe-fact.js';
+import { requestConfirmationTool } from './request-confirmation.js';
+import { handoffToOwnerTool } from './handoff-to-owner.js';
+import { auditDecisionTool } from './audit-decision.js';
+import { explainLimitationTool } from './explain-limitation.js';
 
 export type ToolHandlerCtx = {
   pessoa: import('@/db/schema.js').Pessoa;
@@ -183,6 +191,16 @@ export const REGISTRY: Record<string, AnyTool> = {
   approve_capability_proposal: approveCapabilityProposalTool as unknown as AnyTool,
   reject_capability_proposal: rejectCapabilityProposalTool as unknown as AnyTool,
   list_pending_proposals: listPendingProposalsTool as unknown as AnyTool,
+  // Issue #410 — baseline.core tools. Always registered (no feature flag): they
+  // are the minimal, conservative capability floor for every runtime agent.
+  // `recall_memory` (above) is also part of baseline.core — reused, not
+  // re-added. The pack ↔ registry contract lives in src/tools/packs.ts.
+  read_turn_context: readTurnContextTool as unknown as AnyTool,
+  remember_safe_fact: rememberSafeFactTool as unknown as AnyTool,
+  request_confirmation: requestConfirmationTool as unknown as AnyTool,
+  handoff_to_owner: handoffToOwnerTool as unknown as AnyTool,
+  audit_decision: auditDecisionTool as unknown as AnyTool,
+  explain_limitation: explainLimitationTool as unknown as AnyTool,
 };
 
 /**

@@ -109,6 +109,27 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     ]
   },
   {
+    "name": "audit_decision",
+    "description": "Registra explicitamente uma decisão e seu racional na trilha de auditoria. Sem efeito de negócio — apenas observabilidade.",
+    "side_effect": "none",
+    "operation_type": "read",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [],
+    "inputs": [
+      {
+        "name": "decision",
+        "type": "string",
+        "optional": false
+      },
+      {
+        "name": "rationale",
+        "type": "string",
+        "optional": false
+      }
+    ]
+  },
+  {
     "name": "calendar_add_business_days",
     "description": "Soma N dias úteis a uma data (N pode ser negativo para retroceder). Ex.: prazo D+5 para algum SLA.",
     "side_effect": "read",
@@ -356,6 +377,32 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     ]
   },
   {
+    "name": "explain_limitation",
+    "description": "Explica de forma honesta que o agente não pode realizar algo (e por quê), em vez de inventar uma ação sem permissão. Apenas texto, sem efeito colateral.",
+    "side_effect": "none",
+    "operation_type": "read",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [],
+    "inputs": [
+      {
+        "name": "requested",
+        "type": "string",
+        "optional": false
+      },
+      {
+        "name": "reason",
+        "type": "string",
+        "optional": false
+      },
+      {
+        "name": "suggestion",
+        "type": "string",
+        "optional": true
+      }
+    ]
+  },
+  {
     "name": "generate_report",
     "description": "Gera um relatório financeiro em PDF e o envia como anexo no WhatsApp. Use quando o owner pedir \"extrato\", \"relatório\", \"manda em PDF\", \"comparativo\", ou quando a resposta seria uma tabela longa (>20 linhas). Caption do envio é o texto que você devolver depois do tool result. Não use para saldo (responder em texto direto).",
     "side_effect": "read",
@@ -395,6 +442,34 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
       {
         "name": "entidade_ids",
         "type": "string[] (variant)",
+        "optional": true
+      }
+    ]
+  },
+  {
+    "name": "handoff_to_owner",
+    "description": "Escala a conversa para o dono do agente (hand-off INTERNO). Não envia mensagem externa arbitrária — apenas sinaliza que o dono deve assumir/revisar.",
+    "side_effect": "communication",
+    "operation_type": "communicate",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [
+      "escalate_to_owner"
+    ],
+    "inputs": [
+      {
+        "name": "reason",
+        "type": "string",
+        "optional": false
+      },
+      {
+        "name": "summary",
+        "type": "string",
+        "optional": false
+      },
+      {
+        "name": "urgency",
+        "type": "enum(low|normal|high)",
         "optional": true
       }
     ]
@@ -794,6 +869,22 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     ]
   },
   {
+    "name": "read_turn_context",
+    "description": "Lê o contexto do turno atual: as mensagens recentes desta conversa, dentro do escopo do agente. Apenas leitura, sem efeito colateral.",
+    "side_effect": "none",
+    "operation_type": "read",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [],
+    "inputs": [
+      {
+        "name": "limit",
+        "type": "number",
+        "optional": true
+      }
+    ]
+  },
+  {
     "name": "recall_memory",
     "description": "Busca memórias passadas por similaridade semântica dentro do escopo do interlocutor.",
     "side_effect": "read",
@@ -960,6 +1051,50 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
       },
       {
         "name": "reason",
+        "type": "string",
+        "optional": false
+      }
+    ]
+  },
+  {
+    "name": "remember_safe_fact",
+    "description": "Registra um fato SEGURO sobre o interlocutor atual (ex.: preferência de tratamento, idioma). Escopo é sempre a própria pessoa da conversa — não escreve memória global nem de domínio.",
+    "side_effect": "write",
+    "operation_type": "create",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [
+      "save_safe_fact"
+    ],
+    "inputs": [
+      {
+        "name": "chave",
+        "type": "string",
+        "optional": false
+      },
+      {
+        "name": "valor",
+        "type": "string",
+        "optional": false
+      }
+    ]
+  },
+  {
+    "name": "request_confirmation",
+    "description": "Pede confirmação ao interlocutor antes de uma ação. Apenas pergunta — não executa nada. Use quando precisar de um \"sim\" explícito antes de agir.",
+    "side_effect": "none",
+    "operation_type": "read",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [],
+    "inputs": [
+      {
+        "name": "action_summary",
+        "type": "string",
+        "optional": false
+      },
+      {
+        "name": "question",
         "type": "string",
         "optional": false
       }
