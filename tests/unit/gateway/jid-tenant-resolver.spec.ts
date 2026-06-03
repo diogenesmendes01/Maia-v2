@@ -19,8 +19,6 @@
  *     test in baileys-tenant-resolution.spec.ts that wires the full chain).
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { FeatureFlagName } from '@/types/enums.js';
-import { featureFlags } from '@/config/feature-flags.js';
 import { TypedError } from '@/lib/utils.js';
 import type { Channel } from '@/db/schema.js';
 
@@ -28,9 +26,11 @@ const findByExternalCrossTenantMock = vi.fn<
   [args: { channel_type: string; external_id: string }],
   Promise<Channel | null>
 >();
+const findDefaultCatchAllChannelMock = vi.fn();
 vi.mock('@/db/repositories.js', () => ({
   channelsRepo: {
     findByExternalCrossTenant: findByExternalCrossTenantMock,
+    findDefaultCatchAllChannel: findDefaultCatchAllChannelMock,
   },
 }));
 
@@ -189,8 +189,11 @@ describe('extractPhoneFromJid — pure JID parser', () => {
 describe('resolveScopeForJid — JID + channel delegation', () => {
   beforeEach(() => {
     findByExternalCrossTenantMock.mockReset();
-    featureFlags.reset();
-    featureFlags.override(FeatureFlagName.MULTI_CHANNEL, true);
+    findDefaultCatchAllChannelMock.mockReset();
+    // Default to a MULTI-TENANT deployment so a channel miss is fail-loud
+    // (the cross-tenant contract this resolver protects). The single-tenant
+    // catch-all is exercised by its own dedicated test below.
+    findDefaultCatchAllChannelMock.mockResolvedValue({ multi_tenant: true, channel: null });
   });
 
   it('happy path: known JID → returns correct {tenant_id, agent_id, channel_id}', async () => {
@@ -364,17 +367,27 @@ describe('resolveScopeForJid — JID + channel delegation', () => {
     ).rejects.toThrow('connection refused');
   });
 
-  it('MULTI_CHANNEL flag OFF → resolveChannel itself throws (defense in depth — caller normally skips)', async () => {
-    featureFlags.override(FeatureFlagName.MULTI_CHANNEL, false);
+  it('#411 single-tenant: unknown JID (no real tenant) → resolves to (default, default) via catch-all (NOT a throw)', async () => {
+    // Exact-match misses (the sender phone is not a registered bot line) but no
+    // real tenant exists → catch-all maps it to the seeded default channel.
+    findByExternalCrossTenantMock.mockResolvedValueOnce(null);
+    findDefaultCatchAllChannelMock.mockResolvedValueOnce({
+      multi_tenant: false,
+      channel: makeChannel({
+        id: 'default-channel-uuid',
+        tenant_id: 'default',
+        agent_id: 'default',
+        external_id: 'default-channel',
+      }),
+    });
     const { resolveScopeForJid } = await import(
       '@/gateway/jid-tenant-resolver.js'
     );
-    await expect(
-      resolveScopeForJid('5511999999999@s.whatsapp.net'),
-    ).rejects.toMatchObject({
-      code: 'channel_resolution_failed',
-      details: { resolver_path: 'legacy_flag_off' },
+    const { scope } = await resolveScopeForJid('5511999999999@s.whatsapp.net');
+    expect(scope).toEqual({
+      tenant_id: 'default',
+      agent_id: 'default',
+      channel_id: 'default-channel-uuid',
     });
-    expect(findByExternalCrossTenantMock).not.toHaveBeenCalled();
   });
 });

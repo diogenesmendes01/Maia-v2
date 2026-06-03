@@ -9,7 +9,8 @@ export type PreturnContext = GraphContext & {
   turno_id: string;
   inbound_text: string;
   current_execution: { id: string; definition_id: string; status: string } | null;
-  /** Quando undefined ou multi_channel off, o node role-selector é omitido. */
+  /** Quando undefined (ou o node role-selector não foi montado), o role-selector
+   *  é omitido. Ver buildPreturnNodes. */
   role_inputs?: {
     current_role: Role;
     available_roles: Role[];
@@ -46,7 +47,11 @@ export function buildPreturnNodes(args: { multi_channel_on: boolean }): ModuleDe
     },
   });
 
-  // Node: role-selector (só quando MULTI_CHANNEL on e role_inputs presente)
+  // Node: role-selector. `multi_channel_on` decide se o node é montado; o
+  // `runWhen` abaixo então só dispara quando há `role_inputs` (channel + policy
+  // resolvidos). Os callers em produção passam sempre `true` (MULTI_CHANNEL
+  // removido / sempre on após #411); o parâmetro permanece para construção do
+  // grafo e cobertura de testes.
   if (args.multi_channel_on) {
     nodes.push({
       name: 'role-selector',

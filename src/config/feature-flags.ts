@@ -40,9 +40,13 @@ export class FeatureFlags {
 import { config } from './env.js';
 
 export const featureFlags = new FeatureFlags({
-  // P6 — separação Agent/Channel/Role + Role Policy. Gates channel resolution
-  // (channel-resolver / baileys jid resolver); removing it breaks prod.
-  // P7 (COGNITIVE_GRAPH) was removed in #412 — the cognitive graph now runs
-  // unconditionally, so it no longer needs a flag entry here.
-  [FeatureFlagName.MULTI_CHANNEL]: config.FEATURE_MULTI_CHANNEL,
+  // No active feature flags. Both former entries are gone:
+  //   - P7 COGNITIVE_GRAPH removed in #412 (the cognitive graph runs
+  //     unconditionally — parity with the imperative path was proven).
+  //   - P6 MULTI_CHANNEL removed in #411 (channel resolution now resolves any
+  //     inbound sender to (default, default) via the single-tenant catch-all in
+  //     src/gateway/channel-resolver.ts, so the toggle is always-on / gone).
+  // The FeatureFlags class + (now-empty) FeatureFlagName enum survive as the
+  // registration point for the next phase's flag; deleting them is a separate
+  // follow-up.
 });

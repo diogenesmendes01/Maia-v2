@@ -15,8 +15,8 @@ export async function runCostMonitor(): Promise<void> {
   // the other "global" maintenance workers, this one is tenant-SCOPED via the
   // data plane. `readDailyLLMUsd` → `factsRepo.getByKey('global', …)` filters
   // `agent_facts` by `getCurrentTenant()`/`getCurrentAgent()`, and the matching
-  // ledger row is WRITTEN by `recordLLMCost` during agent turns — which today
-  // (FEATURE_MULTI_CHANNEL=off) run under `default/default`. Swapping the reader
+  // ledger row is WRITTEN by `recordLLMCost` during agent turns — which in the
+  // current single-tenant runtime run under `default/default`. Swapping the reader
   // to `system/system` would read a non-existent `(system, system, global, …)`
   // row → silently $0 every day → the threshold alert never fires. This is a
   // data-plane change, NOT data-plane neutral, so it does not belong in the

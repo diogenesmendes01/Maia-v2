@@ -341,14 +341,13 @@ export type RiskLevel = typeof RiskLevel[keyof typeof RiskLevel];
  * Nomes de feature flags conhecidas. Cresce conforme fases ativam.
  */
 export const FeatureFlagName = {
-  // P6 — separação Agent/Channel/Role + Role Policy (multi-canal).
-  // SURVIVES P11 cleanup: gates channel resolution (only seeded external_ids
-  // match, not real senders), removing it breaks prod. Tracked by #411 —
-  // survives until #411 lands.
-  MULTI_CHANNEL: 'MULTI_CHANNEL',
-  // P7 (COGNITIVE_GRAPH) was removed in issue #412: parity between the
-  // declarative cognitive-graph path and the imperative legacy path was
-  // proven + completed, so the graph runs unconditionally and the toggle is
-  // gone. The FeatureFlags class + enum survive for MULTI_CHANNEL until #411.
+  // No active feature flags. Both former entries are gone:
+  //   - P7 COGNITIVE_GRAPH removed in #412 (the cognitive graph runs
+  //     unconditionally — parity with the imperative path was proven).
+  //   - P6 MULTI_CHANNEL removed in #411 (channel resolution now resolves any
+  //     inbound sender to (default, default) via the single-tenant catch-all in
+  //     src/gateway/channel-resolver.ts, so the toggle is always-on / gone).
+  // This enum (and the FeatureFlags class) survive empty as the registration
+  // point for the next phase's flag; deleting them is a separate follow-up.
 } as const;
 export type FeatureFlagName = typeof FeatureFlagName[keyof typeof FeatureFlagName];

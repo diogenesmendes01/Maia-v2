@@ -182,15 +182,13 @@ const envSchema = z
     //   (mirrors OUTBOUND_SWEEPER_RETENTION_BATCH_SIZE). Default 1000.
     OUTBOX_RELAYER_RETENTION_BATCH_SIZE: z.coerce.number().int().positive().default(1000),
     // Feature flags do roadmap Maia v2
-    // P6 — separação Agent/Channel/Role + Role Policy (multi-canal)
-    FEATURE_MULTI_CHANNEL: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
-    // P7 — grafo cognitivo formal. FEATURE_COGNITIVE_GRAPH was removed in #412:
-    // the cognitive graph now runs unconditionally (parity with the imperative
-    // path proven), so there is no env toggle. The SYNC_LATENCY_P95_* budget
-    // vars below remain — they gate p95 latency, not the graph itself.
+    // P6 — FEATURE_MULTI_CHANNEL removed in #411: channel resolution now has a
+    //   single-tenant catch-all (resolves any sender to default/default), so the
+    //   toggle is always-on / gone.
+    // P7 — FEATURE_COGNITIVE_GRAPH removed in #412: the cognitive graph runs
+    //   unconditionally (parity with the imperative path proven), so there is no
+    //   env toggle. The SYNC_LATENCY_P95_* budget vars below remain — they gate
+    //   p95 latency, not the graph itself.
     /** Cache TTL (ms) for PolicyResolverCache. Default 5min = 300_000ms. */
     POLICY_RESOLVER_CACHE_TTL_MS: z.coerce.number().int().positive().default(300_000),
     /** LRU cap for PolicyResolverCache. Default 10_000 entries. */

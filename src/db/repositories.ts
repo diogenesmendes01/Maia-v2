@@ -5656,8 +5656,8 @@ export const procedureExecutionsRepo = {
     // Issue #323 review iteration-2 (BLOCKING): assert the write hit exactly
     // one row. With the tenant+agent predicate above, an UPDATE issued under a
     // context whose (tenant_id, agent_id) does NOT match the target row (a
-    // legacy default/default path with FEATURE_MULTI_CHANNEL off, or any other
-    // mismatch) matches 0 rows and would SILENTLY no-op — the state transition
+    // single-tenant default/default path, or any other mismatch) matches 0 rows
+    // and would SILENTLY no-op — the state transition
     // (complete/abort/advance/auto_abandon) would be LOST. The previous id-only
     // WHERE always matched, so a silent miss here is a data-loss regression.
     // Turn that into a loud, debuggable failure while preserving tenant
@@ -7995,6 +7995,52 @@ export const channelsRepo = {
       );
     }
     return activeRows[0]!;
+  },
+
+  // [Issue #411] Single-tenant catch-all for the channel resolver. EXPLICITLY
+  // bypasses applyTenantGuard for the same sanctioned reason as
+  // `findByExternalCrossTenant` — the entry point runs BEFORE a tenant context
+  // exists.
+  //
+  // Contract: given a channel_type whose `(channel_type, external_id)` exact
+  // lookup missed, decide whether the deployment is a genuine single-tenant
+  // runtime (one tenant: the seeded `default/default`) or a real multi-tenant
+  // config. The discriminator is the presence of an ACTIVE channel owned by a
+  // tenant OTHER than the seeded `'default'`:
+  //   - none exists  → single-tenant runtime. Return the seeded active
+  //     `default/default` catch-all channel (if present) so the resolver can
+  //     map ANY inbound sender to (default, default). This is what makes the
+  //     bot answer arbitrary senders without dropping messages.
+  //   - one+ exists  → real multi-tenant deployment. Return `multi_tenant:true`
+  //     with NO channel, so the resolver throws `channel_resolution_failed`
+  //     (issue #268 fail-loud preserved — an unknown sender in a multi-tenant
+  //     config must NOT collapse onto the shared `default/default` bucket).
+  //
+  // Cardinality: the `channels` table is small (one row per registered line);
+  // a full type-scoped scan is O(few).
+  async findDefaultCatchAllChannel(args: {
+    channel_type: string;
+  }): Promise<
+    | { multi_tenant: true; channel: null }
+    | { multi_tenant: false; channel: Channel | null }
+  > {
+    const rows = await db
+      .select()
+      .from(channels)
+      .where(eq(channels.channel_type, args.channel_type));
+
+    // Any ACTIVE channel owned by a non-`default` tenant ⇒ real multi-tenant
+    // deployment. Fail-closed: do NOT hand back the default catch-all.
+    const hasRealTenant = rows.some((r) => r.active && r.tenant_id !== 'default');
+    if (hasRealTenant) return { multi_tenant: true, channel: null };
+
+    // Single-tenant runtime: surface the seeded active `default/default`
+    // catch-all channel (migrations/035_p6_seed_default_channel_role_policy.sql).
+    const fallback =
+      rows.find(
+        (r) => r.active && r.tenant_id === 'default' && r.agent_id === 'default',
+      ) ?? null;
+    return { multi_tenant: false, channel: fallback };
   },
 
   async listActive(): Promise<Channel[]> {

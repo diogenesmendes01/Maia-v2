@@ -2,9 +2,11 @@
  * P6 Task 10 — Integration test end-to-end para a cadeia completa de
  * separação Agent/Channel/Role + Role Policy.
  *
- * Cobre 7 cenários:
- *   1. Flag OFF (MULTI_CHANNEL) → resolveChannel LANÇA TypedError fail-loud
- *      SEM consultar o repo (issue #268 — fallback default/default removido).
+ * Cobre 6 cenários:
+ *   1. #411 single-tenant catch-all — remetente arbitrário (telefone que NÃO
+ *      casa com o canal semeado) resolve para (default, default, <default
+ *      channel id>) E o caso multi-tenant (canal de outro tenant existe) volta
+ *      a ser fail-loud (issue #268 preservado).
  *   2. Policy=LOCKED → mesmo com candidate strong vindo dos suggesters,
  *      decisão é keep_current via policy_rule. Audit row criado.
  *   3. Policy=PREFER_HANDOFF + candidate diferente → action=handoff,
@@ -15,21 +17,17 @@
  *      decided_role mantém current, reason contém "max_switches_per_conversation".
  *   6. INVARIANTE — decided_by JAMAIS é llm_classifier em NENHUM caminho;
  *      guard runtime rejeita tentativa direta no repo com erro tipado.
- *   7. Maia atual (flag OFF) — prompt-builder NÃO injeta "## Modo operacional".
- *      Prova spec criterion #5: legacy preservado quando flag está desabilitada.
  *
  * Pattern segue tests/integration/p5-dialogical-acquisition.spec.ts:
  *   - vi.hoisted para mocks compartilhados entre factory e testes.
  *   - vi.mock('@/db/repositories.js', ...) com state in-memory.
  *   - vi.mock('@anthropic-ai/sdk', ...) com classe que devolve mock.
  *   - vi.mock('@/lib/logger.js', ...) silent logger.
- *   - featureFlags.override em beforeEach/afterEach.
  *
  * Não modifica código de produção — somente exercita a integração da cadeia.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
-  FeatureFlagName,
   SwitchBehavior,
   SuggestedBy,
   DecidedBy,
@@ -57,6 +55,7 @@ const recordedPayloads: DecisionPayload[] = [];
 const {
   // Repos
   channelsFindByExternalCrossTenantMock,
+  channelsFindDefaultCatchAllChannelMock,
   recordDecisionMock,
   countSwitchesMock,
   listByConversationMock,
@@ -87,6 +86,7 @@ const {
   procedureDefinitionsFindById,
 } = vi.hoisted(() => ({
   channelsFindByExternalCrossTenantMock: vi.fn(),
+  channelsFindDefaultCatchAllChannelMock: vi.fn(),
   recordDecisionMock: vi.fn(),
   countSwitchesMock: vi.fn(),
   listByConversationMock: vi.fn(),
@@ -124,6 +124,7 @@ vi.mock('@/db/repositories.js', () => ({
   // Channels — only findByExternalCrossTenant matters for resolveChannel.
   channelsRepo: {
     findByExternalCrossTenant: channelsFindByExternalCrossTenantMock,
+    findDefaultCatchAllChannel: channelsFindDefaultCatchAllChannelMock,
     create: vi.fn(),
     getById: vi.fn(),
     findByExternal: vi.fn(),
@@ -356,40 +357,63 @@ describe('P6 channel/role/policy — end-to-end', () => {
 
   afterEach(async () => {
     const { featureFlags } = await import('@/config/feature-flags.js');
-    featureFlags.override(FeatureFlagName.MULTI_CHANNEL, false);
-    featureFlags.unkillSwitch(FeatureFlagName.MULTI_CHANNEL);
     featureFlags.reset();
   });
 
   // ---------- Cenário 1 ----------
-  it('cenário 1: flag MULTI_CHANNEL OFF → resolveChannel LANÇA TypedError fail-loud (issue #268)', async () => {
-    const { featureFlags } = await import('@/config/feature-flags.js');
-    featureFlags.override(FeatureFlagName.MULTI_CHANNEL, false);
-
+  it('cenário 1: #411 — remetente arbitrário resolve para (default, default) via catch-all; multi-tenant volta a ser fail-loud (#268)', async () => {
     const { resolveChannel } = await import('@/gateway/channel-resolver.js');
     const { TypedError } = await import('@/lib/utils.js');
 
-    const promise = resolveChannel({
-      channel_type: 'whatsapp',
-      external_id: '5511999999999',
+    // (a) SINGLE-TENANT: o telefone do remetente NÃO casa com o canal semeado
+    // `default-channel` (exact-match miss). O catch-all confirma que não há
+    // canal de outro tenant e resolve para o canal default semeado.
+    channelsFindByExternalCrossTenantMock.mockResolvedValueOnce(null);
+    channelsFindDefaultCatchAllChannelMock.mockResolvedValueOnce({
+      multi_tenant: false,
+      channel: makeChannel({
+        id: 'default-channel-uuid',
+        tenant_id: 'default',
+        agent_id: 'default',
+        external_id: 'default-channel',
+      }),
     });
 
-    // Issue #268 — fallback default/default removido. Resolver agora lança
-    // TypedError tipado em vez de colapsar tenants no bucket compartilhado.
+    const single = await resolveChannel({
+      channel_type: 'whatsapp',
+      external_id: '+5511988887777', // telefone do REMETENTE
+    });
+    expect(single).toEqual({
+      tenant_id: 'default',
+      agent_id: 'default',
+      channel_id: 'default-channel-uuid',
+    });
+
+    // (b) MULTI-TENANT: existe um canal ativo de outro tenant → o catch-all
+    // reporta multi_tenant:true e o resolver volta a ser fail-loud (issue #268
+    // — sem colapso no bucket compartilhado `default/default`).
+    channelsFindByExternalCrossTenantMock.mockResolvedValueOnce(null);
+    channelsFindDefaultCatchAllChannelMock.mockResolvedValueOnce({
+      multi_tenant: true,
+      channel: null,
+    });
+
+    const promise = resolveChannel({
+      channel_type: 'whatsapp',
+      external_id: '+5511988887777',
+    });
     await expect(promise).rejects.toBeInstanceOf(TypedError);
     await expect(promise).rejects.toMatchObject({
       code: 'channel_resolution_failed',
+      details: { resolver_path: 'unknown_or_inactive_channel' },
     });
-    // Short-circuit antes do lookup — nenhum side-effect downstream.
-    expect(channelsFindByExternalCrossTenantMock).not.toHaveBeenCalled();
+
+    // Nenhuma decisão de role foi gravada — resolução é independente disso.
     expect(recordDecisionMock).not.toHaveBeenCalled();
   });
 
   // ---------- Cenário 2 ----------
   it('cenário 2: policy=LOCKED + candidate strong → keep_current via policy_rule, audit registrado', async () => {
-    const { featureFlags } = await import('@/config/feature-flags.js');
-    featureFlags.override(FeatureFlagName.MULTI_CHANNEL, true);
-
     // Setup: 1 channel, 1 default role, 1 alternative role, policy LOCKED.
     channelsFindByExternalCrossTenantMock.mockResolvedValueOnce(makeChannel());
 
@@ -441,9 +465,6 @@ describe('P6 channel/role/policy — end-to-end', () => {
 
   // ---------- Cenário 3 ----------
   it('cenário 3: policy=PREFER_HANDOFF + candidate diferente → handoff via policy_rule, suggested != decided', async () => {
-    const { featureFlags } = await import('@/config/feature-flags.js');
-    featureFlags.override(FeatureFlagName.MULTI_CHANNEL, true);
-
     channelsFindByExternalCrossTenantMock.mockResolvedValueOnce(makeChannel());
 
     // Det suggester retorna alternative; LLM null.
@@ -486,9 +507,6 @@ describe('P6 channel/role/policy — end-to-end', () => {
 
   // ---------- Cenário 4 ----------
   it('cenário 4: policy=FREE_WITH_TRIGGER + strong → switch, decided_role=alternative, switch_count 0 → 1', async () => {
-    const { featureFlags } = await import('@/config/feature-flags.js');
-    featureFlags.override(FeatureFlagName.MULTI_CHANNEL, true);
-
     channelsFindByExternalCrossTenantMock.mockResolvedValueOnce(makeChannel());
 
     detSuggestMock.mockResolvedValueOnce(
@@ -532,9 +550,6 @@ describe('P6 channel/role/policy — end-to-end', () => {
 
   // ---------- Cenário 5 ----------
   it('cenário 5: policy=BY_CONTEXT + cap atingido (3 switches) → fallback via fallback_rule', async () => {
-    const { featureFlags } = await import('@/config/feature-flags.js');
-    featureFlags.override(FeatureFlagName.MULTI_CHANNEL, true);
-
     channelsFindByExternalCrossTenantMock.mockResolvedValueOnce(makeChannel());
 
     detSuggestMock.mockResolvedValueOnce(
@@ -581,9 +596,6 @@ describe('P6 channel/role/policy — end-to-end', () => {
 
   // ---------- Cenário 6 ----------
   it('cenário 6: INVARIANTE — decided_by NUNCA é llm_classifier (todos cenários + repo guard)', async () => {
-    const { featureFlags } = await import('@/config/feature-flags.js');
-    featureFlags.override(FeatureFlagName.MULTI_CHANNEL, true);
-
     const { selectRole } = await import('@/cognition/role-selector/engine.js');
 
     // Roda os 4 switch_behaviors em sequência e valida que cada audit row

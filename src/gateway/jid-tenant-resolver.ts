@@ -25,12 +25,14 @@
  *   Reuse the sanctioned cross-tenant resolver `resolveChannel` (the same
  *   one `agent/core.ts` uses for the post-persist adoption flow — see
  *   `probeMessageForChannel`). That resolver already:
- *     - enforces the MULTI_CHANNEL feature flag,
  *     - calls `channelsRepo.findByExternalCrossTenant` (the one method
  *       authorized to bypass `applyTenantGuard`, because the entry point
  *       legitimately operates WITHOUT a tenant context — it IS the one
  *       discovering which tenant owns the inbound),
- *     - throws `TypedError('channel_resolution_failed')` fail-loud on miss/
+ *     - in a single-tenant runtime, resolves any sender to (default, default)
+ *       via the catch-all (issue #411),
+ *     - in a multi-tenant deployment, throws
+ *       `TypedError('channel_resolution_failed')` fail-loud on miss/
  *       inactive/ambiguous (issue #268 fail-loud contract),
  *     - canonicalizes the (channel_type, external_id) → (tenant_id,
  *       agent_id, channel_id) mapping.
@@ -170,10 +172,10 @@ export function extractPhoneFromJid(
  * THROWS `TypedError('channel_resolution_failed')` when:
  *   - JID cannot be parsed (malformed, group, unknown domain, `@lid` w/o
  *     senderPn) — `details.resolver_path = 'jid_unparseable'`.
- *   - The MULTI_CHANNEL flag is OFF — `details.resolver_path =
- *     'legacy_flag_off'` (propagated as-is from `resolveChannel`).
- *   - No channel is registered for the resolved phone — `details.resolver_path =
- *     'unknown_or_inactive_channel'` (from `resolveChannel`).
+ *   - In a MULTI-TENANT deployment, no channel is registered for the resolved
+ *     phone — `details.resolver_path = 'unknown_or_inactive_channel'` (from
+ *     `resolveChannel`). In a single-tenant runtime this case resolves to
+ *     (default, default) via the #411 catch-all instead of throwing.
  *   - The phone matches multiple active channels across distinct tenants —
  *     `details.resolver_path = 'ambiguous_active_channels'` (from
  *     `channelsRepo.findByExternalCrossTenant` via `resolveChannel`).
