@@ -225,6 +225,15 @@ vi.mock('@/agent/output-dispatch.js', () => ({
 vi.mock('@/agent/execute-skill.js', () => ({ executeSelectedSkill: vi.fn() }));
 vi.mock('@/skills/index.js', () => ({ runSkill: vi.fn() }));
 vi.mock('@/tools/_registry.js', () => ({ getToolSchemas: vi.fn(() => []) }));
+// Issue #408 — core.ts computes the LLM-visible set via the Runtime Tool
+// Filter. This channel-resolution test doesn't assert on tools; stub it.
+vi.mock('@/tools/runtime-filter.js', () => ({
+  computeRuntimeVisibleTools: vi.fn(async () => ({
+    tools: [],
+    requires_confirmation: [],
+    grant: { granted_packs: ['baseline.core'], granted_tools: [], denied_tools: [] },
+  })),
+}));
 vi.mock('@/lib/claude.js', () => ({ callLLM: vi.fn() }));
 vi.mock('@/cognition/procedure-selector.js', () => ({
   selectProcedure: vi.fn().mockResolvedValue({

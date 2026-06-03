@@ -266,6 +266,57 @@ export function getToolSchemas(byEntity: Map<string, ResolvedPermission>) {
     .map(toolToSchema);
 }
 
+/**
+ * Issue #408 — the AGENT-grant-aware sibling of `getToolSchemas`.
+ *
+ * `getToolSchemas` filters the registry by the HUMAN permission + feature flag
+ * only. `getAgentToolSchemas` ADDS the AGENT-grant ∩ skill-scope filter BEFORE
+ * those — it is the Runtime Tool Filter projected onto the registry view.
+ *
+ * `visibleToolNames` is the precomputed agent-grant ∩ skill-scope set
+ * (`computeAgentVisibleTools(...).visible` from `src/tools/packs.ts`). It is
+ * passed in (NOT imported) so this module stays free of the `packs.ts` import
+ * — `packs.ts` imports `_registry.ts`, so importing it back would cycle.
+ *
+ * Filter order (all ADDITIVE — none replaces the existing guards):
+ *   1. agent grant ∩ skill scope  — the tool name must be in `visibleToolNames`.
+ *   2. feature flag               — `isToolEnabled` (kill switch).
+ *   3. human permission           — owner sees all; else `required_actions ⊆ allowed`.
+ * The dispatcher's `tool_not_granted` + `canAct` guards revalidate (1) and (3)
+ * server-side, so a leaked tool still cannot execute (invariant #5).
+ *
+ * Fail-closed: a tool not in `visibleToolNames` is invisible. An empty set
+ * yields zero tools (the caller is responsible for unioning in `baseline.core`
+ * via `computeAgentVisibleTools`, which always does).
+ */
+export function getAgentToolSchemas(
+  visibleToolNames: ReadonlySet<string> | readonly string[],
+  byEntity: Map<string, ResolvedPermission>,
+) {
+  const visible =
+    visibleToolNames instanceof Set
+      ? visibleToolNames
+      : new Set(visibleToolNames as readonly string[]);
+
+  const allowed = new Set<string>();
+  let isOwner = false;
+  for (const rp of byEntity.values()) {
+    if (rp.profile.acoes.includes('*')) {
+      isOwner = true;
+      break;
+    }
+    for (const a of rp.profile.acoes) allowed.add(a);
+  }
+
+  const tools = Object.values(REGISTRY).filter(
+    (t) => visible.has(t.name) && isToolEnabled(t.name),
+  );
+  if (isOwner) return tools.map(toolToSchema);
+  return tools
+    .filter((t) => t.required_actions.every((a) => allowed.has(a)))
+    .map(toolToSchema);
+}
+
 function toolToSchema(t: AnyTool) {
   return {
     name: t.name,

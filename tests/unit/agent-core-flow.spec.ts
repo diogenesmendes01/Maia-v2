@@ -111,6 +111,16 @@ vi.mock('../../src/tools/_registry.js', () => ({
   },
   getToolSchemas: () => [],
 }));
+// Issue #408 — core.ts now computes the LLM-visible tool set via the Runtime
+// Tool Filter. These flow tests don't assert on tool visibility, so we stub it
+// to an empty set (the same shape getToolSchemas previously returned).
+vi.mock('../../src/tools/runtime-filter.js', () => ({
+  computeRuntimeVisibleTools: vi.fn(async () => ({
+    tools: [],
+    requires_confirmation: [],
+    grant: { granted_packs: ['baseline.core'], granted_tools: [], denied_tools: [] },
+  })),
+}));
 vi.mock('../../src/lib/claude.js', () => ({ callLLM }));
 vi.mock('../../src/agent/prompt-builder.js', () => ({
   buildPrompt, PROMPT_TOKEN_BUDGET_INPUT: 11000, PROMPT_TOKEN_BUDGET_OUTPUT: 1024,

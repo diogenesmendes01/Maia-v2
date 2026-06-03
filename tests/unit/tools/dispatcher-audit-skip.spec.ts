@@ -43,6 +43,16 @@ vi.mock('@/db/repositories.js', () => ({
   idempotencyOutboxRepo: {
     markCompletedWithEffect: vi.fn(async () => true),
   },
+  // Issue #408 — the dispatcher's `tool_not_granted` guard resolves the agent
+  // grant. Grant the synthetic test tool explicitly so the guard passes and the
+  // test exercises the AUDIT path it targets (not the grant refusal).
+  agentToolGrantsRepo: {
+    findForCurrentAgent: vi.fn(async () => ({
+      granted_packs: [],
+      granted_tools: ['fake_money_tool'],
+      denied_tools: [],
+    })),
+  },
 }));
 
 vi.mock('@/governance/audit.js', () => ({ audit: auditMock }));

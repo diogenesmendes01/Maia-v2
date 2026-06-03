@@ -67,6 +67,16 @@ vi.mock('@/db/repositories.js', () => ({
       },
     ),
   },
+  // Issue #408 — the dispatcher's `tool_not_granted` guard resolves the agent
+  // grant. Grant the synthetic test tools so the guard passes and these tests
+  // exercise the outbox-wiring flow they target.
+  agentToolGrantsRepo: {
+    findForCurrentAgent: vi.fn(async () => ({
+      granted_packs: [],
+      granted_tools: ['effect_tool', 'plain_tool'],
+      denied_tools: [],
+    })),
+  },
 }));
 
 vi.mock('@/governance/audit.js', () => ({ audit: vi.fn(async () => undefined) }));

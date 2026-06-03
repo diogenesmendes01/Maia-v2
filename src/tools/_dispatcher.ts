@@ -3,8 +3,9 @@ import type { ResolvedPermission } from '@/governance/permissions.js';
 import { canAct } from '@/governance/permissions.js';
 import { constitutionalCheck } from '@/governance/rules.js';
 import { REGISTRY, isToolEnabled, type AnyTool } from './_registry.js';
+import { resolveGrantedToolNames, type AgentToolGrant } from './grant-math.js';
 import { computeIdempotencyKey, computePayloadHash } from '@/governance/idempotency.js';
-import { idempotencyRepo, idempotencyOutboxRepo } from '@/db/repositories.js';
+import { idempotencyRepo, idempotencyOutboxRepo, agentToolGrantsRepo } from '@/db/repositories.js';
 import { audit } from '@/governance/audit.js';
 import { isRedisConnected } from '@/lib/redis.js';
 import { logger } from '@/lib/logger.js';
@@ -76,6 +77,66 @@ export async function dispatchTool(input: {
       error: 'tool_disabled',
       details: { tool: input.tool, reason: 'feature_flag_off' },
     };
+  }
+
+  // Issue #408 — `tool_not_granted` guard. The AGENT-grant filter, revalidated
+  // SERVER-SIDE before the permission/`canAct` guard. The Runtime Tool Filter
+  // already hides un-granted tools from the LLM (`getAgentToolSchemas`), but
+  // this is the fail-closed defense (invariant #5): even if the LLM tries a
+  // tool it should never have seen — a hallucinated name, a denied tool, or a
+  // tool granted to a DIFFERENT agent — the dispatcher refuses it here.
+  //
+  // The effective grant is the AGENT axis (`baseline.core ∪ packs ∪ tools −
+  // denied`), resolved ALS-scoped from `agent_tool_grants`. We do NOT apply the
+  // per-turn SKILL scope here: the skill narrows VISIBILITY, but a tool the
+  // agent genuinely has installed and the person is authorised for must still
+  // be dispatchable (e.g. a follow-up turn without that skill selected). The
+  // skill scope is enforced at visibility time; the agent grant + `denied_tools`
+  // is the hard server-side floor. `denied_tools` is HARD — a denied tool is
+  // refused here even though it might be in a granted pack.
+  //
+  // Fail-closed sourcing: `findForCurrentAgent` returns null for an agent with
+  // no grant row (un-backfilled / brand-new). `resolveGrantedToolNames` always
+  // unions in `baseline.core`, so a missing row degrades to the conservative
+  // baseline floor — never to "all tools" and never to a thrown error in the
+  // hot path. Baseline orchestration tools (read_turn_context, audit_decision,
+  // …) are therefore always dispatchable.
+  // try/catch (not just `.catch`) so a SYNCHRONOUS throw (missing ALS context,
+  // mis-wired repo) degrades to the baseline floor rather than crashing the
+  // dispatch — fail-closed in the SAFE direction (a non-baseline tool is then
+  // refused, never silently allowed).
+  let grantRow: {
+    granted_packs: string[];
+    granted_tools: string[];
+    denied_tools: string[];
+  } | null = null;
+  try {
+    grantRow = await agentToolGrantsRepo.findForCurrentAgent();
+  } catch (err) {
+    logger.warn(
+      { err: (err as Error).message, tool: tool.name },
+      'tool.grant_lookup_failed_fallback_baseline',
+    );
+  }
+  const effectiveGrant: AgentToolGrant = {
+    granted_packs: grantRow?.granted_packs ?? [],
+    granted_tools: grantRow?.granted_tools ?? [],
+    denied_tools: grantRow?.denied_tools ?? [],
+  };
+  const grantedNames = resolveGrantedToolNames(effectiveGrant);
+  if (!grantedNames.has(tool.name)) {
+    await audit({
+      acao: 'tool_not_granted',
+      pessoa_id: input.ctx.pessoa.id,
+      conversa_id: input.ctx.conversa.id,
+      mensagem_id: input.ctx.mensagem_id,
+      metadata: {
+        tool: tool.name,
+        granted_packs: effectiveGrant.granted_packs,
+        denied_tools: effectiveGrant.denied_tools,
+      },
+    });
+    return { error: 'tool_not_granted', details: { tool: tool.name } };
   }
 
   const parsed = tool.input_schema.safeParse(input.args);
