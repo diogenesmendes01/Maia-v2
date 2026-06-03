@@ -33,10 +33,31 @@
 -- =====================================================================
 
 -- 1+2. Relax the global phone-unique → composite (tenant, agent, phone).
---      The inline `UNIQUE` from migration 001 was auto-named
---      `pessoas_telefone_whatsapp_key` by Postgres. Drop it defensively
---      (IF EXISTS) so re-runs and divergent environments don't fail.
-ALTER TABLE pessoas DROP CONSTRAINT IF EXISTS pessoas_telefone_whatsapp_key;
+--      Migration 001 created the unique inline (`telefone_whatsapp TEXT NOT
+--      NULL UNIQUE`), which Postgres auto-names `pessoas_telefone_whatsapp_key`.
+--      Do NOT trust that name: a wrong name + `IF EXISTS` would SILENTLY leave
+--      the global unique in place and defeat this migration. Instead find the
+--      single-column UNIQUE on `telefone_whatsapp` by its column set (name-
+--      independent) and drop it. Idempotent: a no-op once already relaxed.
+DO $$
+DECLARE
+  cname text;
+BEGIN
+  SELECT c.conname INTO cname
+  FROM pg_constraint c
+  JOIN pg_class rel ON rel.oid = c.conrelid
+  WHERE rel.relname = 'pessoas'
+    AND c.contype = 'u'
+    AND c.conkey = ARRAY[(
+      SELECT a.attnum FROM pg_attribute a
+      WHERE a.attrelid = rel.oid
+        AND a.attname = 'telefone_whatsapp'
+        AND NOT a.attisdropped
+    )]::smallint[];
+  IF cname IS NOT NULL THEN
+    EXECUTE format('ALTER TABLE pessoas DROP CONSTRAINT %I', cname);
+  END IF;
+END $$;
 
 ALTER TABLE pessoas
   ADD CONSTRAINT pessoas_tenant_agent_telefone_key
@@ -66,9 +87,13 @@ CREATE TABLE IF NOT EXISTS agent_audience_profiles (
   metadata               JSONB NOT NULL DEFAULT '{}'::jsonb,
   created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
-  -- 1:1 with pessoas (for now) AND tenant-scoped uniqueness (invariant #1).
+  -- Tenant-scoped uniqueness (invariant #1) + lookup parity.
   CONSTRAINT agent_audience_profiles_tenant_agent_pessoa_key
-    UNIQUE (tenant_id, agent_id, pessoa_id)
+    UNIQUE (tenant_id, agent_id, pessoa_id),
+  -- Hard 1:1 with pessoas: a pessoa (already scoped to one tenant+agent) gets
+  -- at most one audience profile. Stronger than the composite above, which
+  -- alone would let the same pessoa_id pair with a different (tenant, agent).
+  CONSTRAINT agent_audience_profiles_pessoa_key UNIQUE (pessoa_id)
 );
 
 -- Lookup index for the runtime resolver hot path: given a pessoa row
@@ -121,5 +146,5 @@ SELECT
     ELSE 'active'
   END AS status
 FROM pessoas p
-ON CONFLICT ON CONSTRAINT agent_audience_profiles_tenant_agent_pessoa_key
+ON CONFLICT ON CONSTRAINT agent_audience_profiles_pessoa_key
   DO NOTHING;

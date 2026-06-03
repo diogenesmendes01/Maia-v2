@@ -44,9 +44,13 @@ function profile(over: Partial<AgentAudienceProfile> = {}): AgentAudienceProfile
 }
 
 function mkPort(over: Partial<AudienceRepoPort> = {}): AudienceRepoPort {
+  // Stable profile instance: the cache key now encodes `updated_at`, so the
+  // port must return the SAME row across calls for an unchanged profile to be a
+  // cache hit (a fresh `new Date()` per call would look like a mutation).
+  const stableProfile = profile();
   return {
     getPessoa: async () => pessoa,
-    getProfile: async () => profile(),
+    getProfile: async () => stableProfile,
     getAllowedEntityIds: async () => ['ent-1'],
     ...over,
   };
@@ -85,6 +89,15 @@ describe('AudienceSliceBuilder (#407)', () => {
       actor: { user_id: null, pessoa_id: 'contact-1', role: 'x', is_authenticated: true },
     });
     expect(b.cacheKey(base3, { depth: 'minimal' })).not.toBe(key);
+
+    // Different tenant, same agent + contact → different key (per-tenant
+    // isolation; tenant_id is in the key prefix).
+    const base4 = mkBaseContextPacket({
+      tenant_id: 'tB',
+      agent_id: 'aX',
+      actor: { user_id: null, pessoa_id: 'contact-1', role: 'x', is_authenticated: true },
+    });
+    expect(b.cacheKey(base4, { depth: 'minimal' })).not.toBe(key);
   });
 
   it('builds an AudienceContext slice on the happy path', async () => {
@@ -119,6 +132,35 @@ describe('AudienceSliceBuilder (#407)', () => {
     const second = await b.build({ base, requirements: req, decision: mockDecision(), signal });
     expect(second.cache_hit).toBe(true);
     expect(second.slice.audience?.audience_type).toBe('customer');
+  });
+
+  it('does not serve a stale active audience after an in-place deactivation (#5)', async () => {
+    const active = profile({
+      id: 'aud-1',
+      status: 'active',
+      updated_at: new Date('2026-01-01T00:00:00Z'),
+    });
+    const deactivated = profile({
+      id: 'aud-1',
+      status: 'inactive',
+      updated_at: new Date('2026-02-01T00:00:00Z'),
+    });
+    let current: AgentAudienceProfile = active;
+    const b = new AudienceSliceBuilder(mkPort({ getProfile: async () => current }), cache);
+    const base = mkBaseContextPacket({
+      actor: { user_id: null, pessoa_id: 'p1', role: 'x', is_authenticated: true },
+    });
+    const req = { depth: 'minimal' as const };
+
+    const first = await b.build({ base, requirements: req, decision: mockDecision(), signal });
+    expect(first.slice.audience?.status).toBe('active');
+
+    // Same profile id, deactivated in place (status flip + updated_at bump):
+    // must re-derive (cache miss) and fail closed — never serve the stale active.
+    current = deactivated;
+    const second = await b.build({ base, requirements: req, decision: mockDecision(), signal });
+    expect(second.cache_hit).toBe(false);
+    expect(second.slice.audience).toBeNull();
   });
 
   it('fails closed (null audience) when there is no contact on the turn', async () => {

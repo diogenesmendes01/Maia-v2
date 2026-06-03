@@ -21,6 +21,7 @@ import {
 } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 import type { AudienceType, TrustLevel } from '@/shared/audience.js';
+import { AUDIENCE_TYPES, TRUST_LEVELS } from '@/shared/audience.js';
 
 export const entidades = pgTable('entidades', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -265,10 +266,29 @@ export const agent_audience_profiles = pgTable(
       t.agent_id,
       t.pessoa_id,
     ),
+    // Hard 1:1 with pessoas (mirrors migration 074's UNIQUE(pessoa_id)): a
+    // pessoa already belongs to one (tenant, agent), so it gets one profile.
+    pessoaOnlyUniq: unique('agent_audience_profiles_pessoa_key').on(t.pessoa_id),
     lookupIdx: index('agent_audience_profiles_tenant_agent_pessoa_idx').on(
       t.tenant_id,
       t.agent_id,
       t.pessoa_id,
+    ),
+    // CHECK constraints mirror migration 074. audience_type/trust_level draw
+    // their legal values from the canonical enums in src/shared/audience.ts
+    // (referenced here so the Drizzle schema and the SQL never drift); status
+    // uses the resolver's fail-closed vocabulary.
+    audienceTypeChk: check(
+      'agent_audience_profiles_audience_type_chk',
+      sql`${t.audience_type} IN (${sql.raw(AUDIENCE_TYPES.map((v) => `'${v}'`).join(', '))})`,
+    ),
+    trustLevelChk: check(
+      'agent_audience_profiles_trust_level_chk',
+      sql`${t.trust_level} IN (${sql.raw(TRUST_LEVELS.map((v) => `'${v}'`).join(', '))})`,
+    ),
+    statusChk: check(
+      'agent_audience_profiles_status_chk',
+      sql`${t.status} IN ('active', 'inactive', 'quarantined', 'blocked')`,
     ),
   }),
 );

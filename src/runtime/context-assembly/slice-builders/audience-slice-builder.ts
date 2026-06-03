@@ -94,14 +94,24 @@ export class AudienceSliceBuilder
   private versionedCacheKey(
     base: BaseContextPacket,
     req: AudienceRequirements,
-    activeProfileId: string | null,
+    profile: AgentAudienceProfile | null,
   ): string {
     const scope = hashShort({
       agent_id: base.agent_id,
       contact_id: base.actor.pessoa_id ?? '__no_contact__',
       depth: req.depth,
       schema_version: 'v1-issue407',
-      audience_profile_id: activeProfileId ?? '__no_active__',
+      audience_profile_id: profile?.id ?? '__no_active__',
+      // Mutable version stamp (review #5): any in-place edit bumps `updated_at`
+      // via the DB trigger → a fresh key, so a deactivated/reassigned profile
+      // never serves its prior (active) AudienceContext stale until the TTL.
+      // `status` is encoded too so a status flip cannot collide with the active
+      // entry within the same updated_at granularity.
+      audience_status: profile?.status ?? '__none__',
+      audience_version:
+        profile?.updated_at != null
+          ? new Date(profile.updated_at).toISOString()
+          : '__none__',
     });
     return sliceCacheKey(base.tenant_id, base.agent_id, 'audience', scope);
   }
@@ -121,21 +131,26 @@ export class AudienceSliceBuilder
       return { slice: EMPTY_AUDIENCE, cache_hit: false, duration_ms: performance.now() - start };
     }
 
-    // Read the profile BEFORE the cache lookup so the key can encode its id —
-    // converts "stale-until-TTL" into a self-healing miss on any profile change.
+    // Read the profile BEFORE the cache lookup so the key can encode its id +
+    // status + updated_at — converts "stale-until-TTL" into a self-healing miss
+    // on any profile change (review #5).
     const profile = await this.repo.getProfile(contactId);
     throwIfAborted(input.signal);
 
-    const key = this.versionedCacheKey(input.base, input.requirements, profile?.id ?? null);
+    const key = this.versionedCacheKey(input.base, input.requirements, profile);
+
+    // Fail-closed FIRST (invariant #5): a missing or non-active profile yields a
+    // null audience and must NEVER return a cached *active* slice. Checked
+    // before the cache read so an in-place deactivation can't be masked by a hit
+    // on a stale active entry.
+    if (!profile || profile.status !== 'active') {
+      await this.cache.set(key, EMPTY_AUDIENCE, 60);
+      return { slice: EMPTY_AUDIENCE, cache_hit: false, duration_ms: performance.now() - start };
+    }
+
     const cached = await this.cache.get<AudienceSlice>(key);
     if (cached) {
       return { slice: cached, cache_hit: true, duration_ms: performance.now() - start };
-    }
-
-    if (!profile || profile.status !== 'active') {
-      // Fail-closed projection: no active relationship → null audience.
-      await this.cache.set(key, EMPTY_AUDIENCE, 60);
-      return { slice: EMPTY_AUDIENCE, cache_hit: false, duration_ms: performance.now() - start };
     }
 
     const pessoa = await this.repo.getPessoa(contactId);

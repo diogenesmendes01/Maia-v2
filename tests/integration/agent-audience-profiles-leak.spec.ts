@@ -261,4 +261,117 @@ dRepo('agentAudienceProfilesRepo — ALS-scoped reads (#407)', () => {
       c.release();
     }
   });
+
+  it('list returns only the current agent profiles (cross-agent invisible) (#7)', async () => {
+    const c = await pool.connect();
+    const created: { pessoas: string[]; profiles: string[] } = { pessoas: [], profiles: [] };
+    try {
+      await ensureTenantAgent(c, 'default', 'agentL1');
+      await ensureTenantAgent(c, 'default', 'agentL2');
+      const p1 = await mkPessoaRow(c, { tenant: 'default', agent: 'agentL1', phone: '+5511900888101' });
+      const p2 = await mkPessoaRow(c, { tenant: 'default', agent: 'agentL2', phone: '+5511900888102' });
+      created.pessoas.push(p1, p2);
+      const a1 = await mkProfileRow(c, {
+        tenant: 'default',
+        agent: 'agentL1',
+        pessoa_id: p1,
+        audience_type: 'owner',
+      });
+      const a2 = await mkProfileRow(c, {
+        tenant: 'default',
+        agent: 'agentL2',
+        pessoa_id: p2,
+        audience_type: 'customer',
+      });
+      created.profiles.push(a1, a2);
+
+      const { agentAudienceProfilesRepo } = await loadRepos();
+      const fromL1 = await runWithTenantContext(
+        { tenant_id: 'default', agent_id: 'agentL1' },
+        () => agentAudienceProfilesRepo.list(),
+      );
+      // Every returned row is the current agent's; the other agent's is invisible.
+      expect(fromL1.every((p) => p.agent_id === 'agentL1' && p.tenant_id === 'default')).toBe(true);
+      const ids = fromL1.map((p) => p.id);
+      expect(ids).toContain(a1);
+      expect(ids).not.toContain(a2);
+    } finally {
+      if (created.profiles.length)
+        await c
+          .query(`DELETE FROM agent_audience_profiles WHERE id = ANY($1)`, [created.profiles])
+          .catch(() => undefined);
+      if (created.pessoas.length)
+        await c
+          .query(`DELETE FROM pessoas WHERE id = ANY($1)`, [created.pessoas])
+          .catch(() => undefined);
+      c.release();
+    }
+  });
+
+  it('resolveIdentity carries the per-agent audience and fails closed without a profile (#7)', async () => {
+    const c = await pool.connect();
+    const created: { pessoas: string[]; profiles: string[] } = { pessoas: [], profiles: [] };
+    try {
+      await ensureTenantAgent(c, 'default', 'agentRI');
+      const withProfile = await mkPessoaRow(c, {
+        tenant: 'default',
+        agent: 'agentRI',
+        phone: '+5511900888201',
+      });
+      const noProfile = await mkPessoaRow(c, {
+        tenant: 'default',
+        agent: 'agentRI',
+        phone: '+5511900888202',
+      });
+      created.pessoas.push(withProfile, noProfile);
+      created.profiles.push(
+        await mkProfileRow(c, {
+          tenant: 'default',
+          agent: 'agentRI',
+          pessoa_id: withProfile,
+          audience_type: 'employee',
+          trust_level: 'trusted_internal',
+        }),
+      );
+
+      const { resolveIdentity } = await import('../../src/identity/resolver.js');
+
+      const resolved = await runWithTenantContext(
+        { tenant_id: 'default', agent_id: 'agentRI' },
+        () => resolveIdentity({ telefone_whatsapp: '+5511900888201' }),
+      );
+      expect(resolved.kind).toBe('resolved');
+      if (resolved.kind === 'resolved') {
+        expect(resolved.audience.audience_type).toBe('employee');
+        expect(resolved.audience.trust_level).toBe('trusted_internal');
+        expect(resolved.audience.agent_id).toBe('agentRI');
+      }
+
+      // Known pessoa, NO active audience profile → fail-closed quarantine.
+      const blocked = await runWithTenantContext(
+        { tenant_id: 'default', agent_id: 'agentRI' },
+        () => resolveIdentity({ telefone_whatsapp: '+5511900888202' }),
+      );
+      expect(blocked.kind).toBe('quarantined');
+    } finally {
+      // resolveIdentity creates a conversa + audit rows — clean those too.
+      if (created.pessoas.length) {
+        await c
+          .query(`DELETE FROM conversas WHERE pessoa_id = ANY($1)`, [created.pessoas])
+          .catch(() => undefined);
+        await c
+          .query(`DELETE FROM audit_log WHERE pessoa_id = ANY($1)`, [created.pessoas])
+          .catch(() => undefined);
+      }
+      if (created.profiles.length)
+        await c
+          .query(`DELETE FROM agent_audience_profiles WHERE id = ANY($1)`, [created.profiles])
+          .catch(() => undefined);
+      if (created.pessoas.length)
+        await c
+          .query(`DELETE FROM pessoas WHERE id = ANY($1)`, [created.pessoas])
+          .catch(() => undefined);
+      c.release();
+    }
+  });
 });
