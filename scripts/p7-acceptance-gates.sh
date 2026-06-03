@@ -37,7 +37,8 @@ if npx vitest run \
   tests/unit/preturn-graph.spec.ts \
   tests/unit/postturn-graph.spec.ts \
   tests/integration/p7-audit-coverage.spec.ts \
-  tests/integration/p7-cognitive-graph.spec.ts; then
+  tests/integration/p7-cognitive-graph.spec.ts \
+  tests/integration/p7-cognitive-graph-parity.spec.ts; then
   echo "[GATE 2/7] vitest runs clean ... PASS"
   PASSED=$((PASSED + 1))
 else
