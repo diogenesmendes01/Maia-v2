@@ -1,8 +1,16 @@
-import { pessoasRepo, conversasRepo } from '@/db/repositories.js';
+import {
+  pessoasRepo,
+  conversasRepo,
+  agentAudienceProfilesRepo,
+} from '@/db/repositories.js';
 import { resolveScope, type ResolvedPermission } from '@/governance/permissions.js';
 import type { Pessoa, Conversa } from '@/db/schema.js';
 import { audit } from '@/governance/audit.js';
 import { logger } from '@/lib/logger.js';
+import {
+  buildAudienceContext,
+  type AudienceContext,
+} from '@/identity/audience-context.js';
 
 export type ResolvedIdentity = {
   kind: 'resolved';
@@ -10,6 +18,13 @@ export type ResolvedIdentity = {
   scope: { entidades: string[]; byEntity: Map<string, ResolvedPermission> };
   conversa: Conversa;
   is_quarantined: boolean;
+  /**
+   * Issue #407: who this pessoa is FOR THIS AGENT, derived per-turn from the
+   * `agent_audience_profiles` relation + resolved scope. Always present on the
+   * `resolved` path — a pessoa with no ACTIVE audience profile never reaches
+   * here (it is failed closed to `{ kind: 'quarantined' }`).
+   */
+  audience: AudienceContext;
 };
 
 export type ResolveResult =
@@ -30,7 +45,72 @@ export async function resolveIdentity(input: { telefone_whatsapp: string }): Pro
   if (pessoa.status === 'quarentena') {
     return { kind: 'quarantined', pessoa };
   }
+
+  // Issue #407 — fail-closed audience resolution (invariant #5). A known
+  // pessoa must have an ACTIVE per-agent audience profile to be served. The
+  // profile is looked up scoped to the current (tenant_id, agent_id), so the
+  // SAME phone can be `customer` for one agent and `employee` for another.
+  const profile = await agentAudienceProfilesRepo.findByPessoa(pessoa.id);
+  if (!profile) {
+    // Known pessoa, but NO relation with this agent → block (audited).
+    await audit({
+      acao: 'audience_blocked_no_profile',
+      pessoa_id: pessoa.id,
+      metadata: { tenant_id: pessoa.tenant_id, agent_id: pessoa.agent_id },
+    });
+    return { kind: 'quarantined', pessoa };
+  }
+  if (profile.status !== 'active') {
+    // Relation exists but is inactive/quarantined/blocked → fail closed.
+    await audit({
+      acao: 'audience_quarantined',
+      pessoa_id: pessoa.id,
+      metadata: {
+        tenant_id: pessoa.tenant_id,
+        agent_id: pessoa.agent_id,
+        audience_profile_id: profile.id,
+        profile_status: profile.status,
+      },
+    });
+    return { kind: 'quarantined', pessoa };
+  }
+
   const scope = await resolveScope(pessoa);
+
+  const audience = buildAudienceContext({
+    pessoa,
+    profile,
+    allowed_entity_ids: scope.entidades,
+  });
+  if (!audience) {
+    // Defensive: buildAudienceContext only returns null for a missing/inactive
+    // profile, both already handled above. Treat any residual null as a
+    // fail-closed quarantine rather than serving without an AudienceContext.
+    await audit({
+      acao: 'audience_quarantined',
+      pessoa_id: pessoa.id,
+      metadata: {
+        tenant_id: pessoa.tenant_id,
+        agent_id: pessoa.agent_id,
+        audience_profile_id: profile.id,
+        reason: 'build_returned_null',
+      },
+    });
+    return { kind: 'quarantined', pessoa };
+  }
+
+  await audit({
+    acao: 'audience_resolved',
+    pessoa_id: pessoa.id,
+    metadata: {
+      tenant_id: pessoa.tenant_id,
+      agent_id: pessoa.agent_id,
+      audience_profile_id: audience.audience_profile_id,
+      audience_type: audience.audience_type,
+      trust_level: audience.trust_level,
+    },
+  });
+
   let conversa = await conversasRepo.findActive(pessoa.id);
 
   // Spec 05 §11.2: idle conversation rotation. New activity after >7d closes
@@ -56,5 +136,5 @@ export async function resolveIdentity(input: { telefone_whatsapp: string }): Pro
   } else {
     await conversasRepo.touch(conversa.id);
   }
-  return { kind: 'resolved', pessoa, scope, conversa, is_quarantined: false };
+  return { kind: 'resolved', pessoa, scope, conversa, is_quarantined: false, audience };
 }

@@ -40,9 +40,19 @@ import {
 } from '../context-assembly/slice-builders/policy-slice-builder.js';
 import { SkillSliceBuilder } from '../context-assembly/slice-builders/skill-slice-builder.js';
 import { ToolPermissionSliceBuilder } from '../context-assembly/slice-builders/tool-slice-builder.js';
+import {
+  AudienceSliceBuilder,
+  type AudienceRepoPort,
+} from '../context-assembly/slice-builders/audience-slice-builder.js';
 import { InMemorySliceCache } from './cache/slice-cache.js';
 import type { SliceBuilderSet } from './build-context-packet.js';
-import { operationalProfileVersionsRepo } from '@/db/repositories.js';
+import {
+  operationalProfileVersionsRepo,
+  pessoasRepo,
+  agentAudienceProfilesRepo,
+} from '@/db/repositories.js';
+import { resolveScope } from '@/governance/permissions.js';
+import type { Pessoa } from '@/db/schema.js';
 
 // ─── Real Identity port (Issue #206) ──────────────────────────────────────────
 
@@ -123,14 +133,43 @@ const stubToolRegistry = {
   },
 };
 
+/**
+ * Real audience port (issue #407) backed by `pessoasRepo` +
+ * `agentAudienceProfilesRepo` + `resolveScope`. Tenant isolation: all three
+ * resolve (tenant_id, agent_id) from AsyncLocalStorage; the port ignores any
+ * caller-supplied scope, so a confused caller cannot read another agent's
+ * audience.
+ */
+const realAudiencePort: AudienceRepoPort = {
+  async getPessoa(contact_id: string) {
+    return pessoasRepo.findById(contact_id);
+  },
+  async getProfile(contact_id: string) {
+    return agentAudienceProfilesRepo.findByPessoa(contact_id);
+  },
+  async getAllowedEntityIds(pessoa: Pessoa) {
+    const scope = await resolveScope(pessoa);
+    return scope.entidades;
+  },
+};
+
 // ─── Singleton ────────────────────────────────────────────────────────────────
 
-let _singleton: { builders: SliceBuilderSet; cache: InMemorySliceCache } | null = null;
-
-export function getProductionBuilderSet(): {
+/**
+ * The 7 P8a slices assembled by `buildContextPacket` PLUS the #407 audience
+ * builder. `audience` is NOT part of `SliceBuilderSet` (the orchestrator does
+ * not yet assemble it — that is #410); it is exposed here so #410 and tests can
+ * obtain the production-wired builder + shared cache from one place.
+ */
+export interface ProductionBuilderSet {
   builders: SliceBuilderSet;
+  audience: AudienceSliceBuilder;
   cache: InMemorySliceCache;
-} {
+}
+
+let _singleton: ProductionBuilderSet | null = null;
+
+export function getProductionBuilderSet(): ProductionBuilderSet {
   if (_singleton) return _singleton;
 
   const cache = new InMemorySliceCache();
@@ -166,6 +205,8 @@ export function getProductionBuilderSet(): {
     ) as unknown as SliceBuilderSet['tool'],
   };
 
-  _singleton = { builders, cache };
+  const audience = new AudienceSliceBuilder(realAudiencePort, cache);
+
+  _singleton = { builders, audience, cache };
   return _singleton;
 }

@@ -11,6 +11,8 @@
  * Camada 3 (Context Assembly) → ExecutionContextPacket (7 slices + history + assembly_meta)
  */
 
+import type { AudienceType, TrustLevel } from '@/shared/audience.js';
+
 // ============================================================================
 // BaseContextPacket — Camada 1
 // ============================================================================
@@ -31,6 +33,16 @@ export interface BaseContextPacket {
     pessoa_id: string | null;
     role: string;
     is_authenticated: boolean;
+    /**
+     * Issue #407: per-agent audience attribution, derived from the resolver's
+     * `AudienceContext` (`agent_audience_profiles` relation). Governance-derived
+     * (invariant #3) — never declared by the LLM. Optional + nullable so the
+     * many existing `actor` construction sites keep compiling; the runtime
+     * wiring that threads `AudienceContext` into the packet lands downstream
+     * (#410). `null` = not yet resolved / no active audience profile.
+     */
+    audience_type?: AudienceType | null;
+    trust_level?: TrustLevel | null;
   };
   input: {
     kind: 'text' | 'audio' | 'image' | 'pdf' | 'tool_result';
@@ -346,7 +358,12 @@ export type SliceName =
   | 'policy'
   | 'skill'
   | 'tool'
-  | 'history';
+  | 'history'
+  // Issue #407: per-agent audience slice. Cache-scoped by
+  // (tenant_id, agent_id, contact_id). Not yet assembled into the
+  // ExecutionContextPacket (that wiring is #410); registered here so the
+  // slice cache key + TTL + invalidation machinery treat it uniformly.
+  | 'audience';
 
 export interface AssemblyMeta {
   started_at_ms: number;

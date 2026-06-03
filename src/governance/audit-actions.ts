@@ -144,6 +144,18 @@ export const AUDIT_ACTIONS = [
   // predicate keeps the row pending for the next execution, and the audit
   // event makes the silent corruption visible to ops.
   'embeddings_rebuild_skip_invalid',
+  // Issue #407 — per-agent AudienceContext resolution. `audience_resolved`:
+  // a known pessoa with an ACTIVE per-agent audience profile → AudienceContext
+  // built. `audience_blocked_no_profile`: known pessoa but NO audience profile
+  // row for this agent → fail-closed (treated as quarantined).
+  // `audience_quarantined`: pessoa HAS a profile but it is not `active`
+  // (inactive/quarantined/blocked) → fail-closed. `audience_ambiguous`:
+  // reserved for the multi-profile case (a #410+ concern; never emitted today
+  // because the 1:1 unique guarantees at most one profile).
+  'audience_resolved',
+  'audience_blocked_no_profile',
+  'audience_ambiguous',
+  'audience_quarantined',
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];

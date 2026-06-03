@@ -20,6 +20,7 @@ import {
   primaryKey,
 } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
+import type { AudienceType, TrustLevel } from '@/shared/audience.js';
 
 export const entidades = pgTable('entidades', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -193,22 +194,84 @@ export const contrapartes = pgTable('contrapartes', {
   updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
-export const pessoas = pgTable('pessoas', {
-  id: uuid('id').primaryKey().defaultRandom(),
-  tenant_id: text('tenant_id').notNull().default('default'),
-  agent_id: text('agent_id').notNull().default('default'),
-  nome: text('nome').notNull(),
-  apelido: text('apelido'),
-  telefone_whatsapp: text('telefone_whatsapp').notNull().unique(),
-  tipo: text('tipo').notNull(),
-  email: text('email'),
-  observacoes: text('observacoes'),
-  preferencias: jsonb('preferencias').notNull().default(sql`'{}'::jsonb`),
-  modelo_mental: jsonb('modelo_mental').notNull().default(sql`'{}'::jsonb`),
-  status: text('status').notNull().default('ativa'),
-  created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
-  updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
-});
+export const pessoas = pgTable(
+  'pessoas',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull().default('default'),
+    agent_id: text('agent_id').notNull().default('default'),
+    nome: text('nome').notNull(),
+    apelido: text('apelido'),
+    // Issue #407: the global unique on telefone_whatsapp (migration 001) is
+    // relaxed to a COMPOSITE unique (tenant_id, agent_id, telefone_whatsapp)
+    // in migration 074 so the same phone can exist for two agents with
+    // distinct audience roles. The column itself is no longer `.unique()`.
+    telefone_whatsapp: text('telefone_whatsapp').notNull(),
+    tipo: text('tipo').notNull(),
+    email: text('email'),
+    observacoes: text('observacoes'),
+    preferencias: jsonb('preferencias').notNull().default(sql`'{}'::jsonb`),
+    modelo_mental: jsonb('modelo_mental').notNull().default(sql`'{}'::jsonb`),
+    status: text('status').notNull().default('ativa'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    telefoneUniq: unique('pessoas_tenant_agent_telefone_key').on(
+      t.tenant_id,
+      t.agent_id,
+      t.telefone_whatsapp,
+    ),
+  }),
+);
+
+/**
+ * agent_audience_profiles — per-agent audience relation (issue #407).
+ *
+ * The relation that answers "who is this pessoa FOR THIS AGENT?". 1:1 with
+ * `pessoas` for now (UNIQUE on tenant_id+agent_id+pessoa_id). `audience_type`
+ * and `trust_level` are GOVERNANCE-DERIVED (invariant #3 — never declared by
+ * the LLM); their legal values are the canonical enums in
+ * `src/shared/audience.ts`. `status` mirrors the resolver's fail-closed
+ * vocabulary: a row that is not `active` makes the audience resolution
+ * fail-closed (treated as quarantined).
+ *
+ * Tenant isolation (invariant #1): tenant_id + agent_id NOT NULL; every
+ * read/write through `agentAudienceProfilesRepo` is scoped via the ALS
+ * context. See migration 074 for FK + CHECK constraints.
+ */
+export const agent_audience_profiles = pgTable(
+  'agent_audience_profiles',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull().default('default'),
+    agent_id: text('agent_id').notNull().default('default'),
+    pessoa_id: uuid('pessoa_id').notNull(),
+    audience_type: text('audience_type').notNull().default('unknown'),
+    trust_level: text('trust_level').notNull().default('unverified'),
+    status: text('status').notNull().default('active'),
+    permission_profile_ids: text('permission_profile_ids')
+      .array()
+      .notNull()
+      .default(sql`'{}'::text[]`),
+    labels: text('labels').array().notNull().default(sql`'{}'::text[]`),
+    metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    pessoaUniq: unique('agent_audience_profiles_tenant_agent_pessoa_key').on(
+      t.tenant_id,
+      t.agent_id,
+      t.pessoa_id,
+    ),
+    lookupIdx: index('agent_audience_profiles_tenant_agent_pessoa_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.pessoa_id,
+    ),
+  }),
+);
 
 export const permission_profiles = pgTable('permission_profiles', {
   id: text('id').primaryKey(),
@@ -2056,6 +2119,22 @@ export const runtime_trace_body_outbox = pgTable(
 
 export type Entidade = typeof entidades.$inferSelect;
 export type Pessoa = typeof pessoas.$inferSelect;
+// Issue #407: per-agent audience relation. `audience_type` / `trust_level` /
+// `status` are stored as `text` (CHECK-constrained in migration 074); we
+// narrow them here to the canonical unions from `src/shared/audience.ts` plus
+// the audience-status vocabulary so call sites get exhaustive typing without a
+// second source of truth for the enum values.
+export type AgentAudienceProfileRow = typeof agent_audience_profiles.$inferSelect;
+export type AudienceStatus = 'active' | 'inactive' | 'quarantined' | 'blocked';
+export type AgentAudienceProfile = Omit<
+  AgentAudienceProfileRow,
+  'audience_type' | 'trust_level' | 'status'
+> & {
+  audience_type: AudienceType;
+  trust_level: TrustLevel;
+  status: AudienceStatus;
+};
+export type NewAgentAudienceProfile = typeof agent_audience_profiles.$inferInsert;
 export type Permissao = typeof permissoes.$inferSelect;
 export type Conversa = typeof conversas.$inferSelect;
 export type Mensagem = typeof mensagens.$inferSelect;
