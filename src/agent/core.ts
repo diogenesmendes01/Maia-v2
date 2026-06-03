@@ -642,45 +642,61 @@ async function runAgentForMensagemInner(
           ),
         );
 
-      if (
-        selectorOutput.decision === 'start' &&
-        selectorOutput.selected_procedure_id
-      ) {
-        const def = await procedureDefinitionsRepo.findById(
-          selectorOutput.selected_procedure_id,
-        );
-        if (def) {
-          const steps = def.steps as unknown as Array<{ id: string }>;
-          const { execution: started } = await procedureEngine.startExecution({
-            definition_id: def.id,
-            definition_version: def.version_number,
-            conversa_id: c.id,
-            first_step_id: steps[0]?.id ?? null,
+      // P7 parity (issue #412): the procedure start/switch side-effects get
+      // their OWN try/catch so a procedureEngine failure (startExecution /
+      // abortExecution throw) does NOT skip the role-selector block below.
+      // The legacy imperative path (pre-#412) isolated these: procedure
+      // side-effects ran in a `try` that logged `procedure.preturn.failed`,
+      // and role resolution ran in a SEPARATE `try` afterwards. Collapsing
+      // them into the single outer `try` regressed that isolation — a
+      // procedure-engine throw dropped activeRole + roleAnnouncement
+      // (user-facing). Restore the boundary here.
+      try {
+        if (
+          selectorOutput.decision === 'start' &&
+          selectorOutput.selected_procedure_id
+        ) {
+          const def = await procedureDefinitionsRepo.findById(
+            selectorOutput.selected_procedure_id,
+          );
+          if (def) {
+            const steps = def.steps as unknown as Array<{ id: string }>;
+            const { execution: started } = await procedureEngine.startExecution({
+              definition_id: def.id,
+              definition_version: def.version_number,
+              conversa_id: c.id,
+              first_step_id: steps[0]?.id ?? null,
+            });
+            activeExecution = started;
+          }
+        } else if (
+          selectorOutput.decision === 'switch' &&
+          selectorOutput.selected_procedure_id &&
+          activeExecution
+        ) {
+          await procedureEngine.abortExecution({
+            execution_id: activeExecution.id,
+            reason: 'switched_by_selector',
           });
-          activeExecution = started;
+          const def = await procedureDefinitionsRepo.findById(
+            selectorOutput.selected_procedure_id,
+          );
+          if (def) {
+            const steps = def.steps as unknown as Array<{ id: string }>;
+            const { execution: started } = await procedureEngine.startExecution({
+              definition_id: def.id,
+              definition_version: def.version_number,
+              conversa_id: c.id,
+              first_step_id: steps[0]?.id ?? null,
+            });
+            activeExecution = started;
+          }
         }
-      } else if (
-        selectorOutput.decision === 'switch' &&
-        selectorOutput.selected_procedure_id &&
-        activeExecution
-      ) {
-        await procedureEngine.abortExecution({
-          execution_id: activeExecution.id,
-          reason: 'switched_by_selector',
-        });
-        const def = await procedureDefinitionsRepo.findById(
-          selectorOutput.selected_procedure_id,
+      } catch (err) {
+        logger.warn(
+          { err: (err as Error).message, conversa_id: c.id },
+          'procedure.start_failed',
         );
-        if (def) {
-          const steps = def.steps as unknown as Array<{ id: string }>;
-          const { execution: started } = await procedureEngine.startExecution({
-            definition_id: def.id,
-            definition_version: def.version_number,
-            conversa_id: c.id,
-            first_step_id: steps[0]?.id ?? null,
-          });
-          activeExecution = started;
-        }
       }
     }
 
@@ -981,7 +997,9 @@ async function runAgentForMensagemInner(
     inbound,
     response_text: reactOutboundText,
     tools_called: reactToolsCalled,
-    // Nodes derive `user_message` from `inbound.conteudo` themselves; we pass
+    // P7 parity (issue #412): the step-evaluator node passes only
+    // { response_text, tools_called } to evaluateCurrentStep — matching the
+    // legacy imperative IIFE exactly (it never passed `user_message`). We pass
     // active_execution_id so the step-evaluator runs only when there's
     // something to advance.
     active_execution_id: activeExecution?.id ?? null,

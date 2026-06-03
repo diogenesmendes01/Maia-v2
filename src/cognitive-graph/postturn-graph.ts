@@ -58,10 +58,16 @@ export function buildPostturnNodes(): ModuleDescriptor<PostturnContext, unknown>
         const evalResult = await evaluateCurrentStep({
           execution: exec,
           definition: def,
+          // P7 parity (issue #412): the legacy imperative post-turn IIFE
+          // (core.ts pre-#412) built `response_context = { response_text,
+          // tools_called }` only — it never passed `user_message`. Strict
+          // parity requires we match that exactly: `user_signal` criteria
+          // therefore default `user_message` to '' in the step-evaluator
+          // (step-evaluator.ts ~L174), identical to legacy. Do NOT add
+          // `user_message` here without a deliberate behavior-change decision.
           response_context: {
             response_text: ctx.response_text,
             tools_called: ctx.tools_called,
-            user_message: ctx.inbound.conteudo ?? '',
           },
         });
 
