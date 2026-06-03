@@ -53,6 +53,18 @@ vi.mock("@/governance/audit.js", () => ({
   auditTx: vi.fn(async () => undefined),
 }));
 
+// The scheduling engine + worker no-op when FEATURE_SCHEDULING_V2 is off
+// (engine.ts:105, scheduling-tick.ts:28). Enable it for the worker-path tests
+// while preserving every other real config value (DATABASE_URL, lease TTLs,
+// limits) — mirrors the sibling scheduling integration specs (01/02/07).
+vi.mock("@/config/env.js", async (importActual) => {
+  const actual = await importActual<typeof import("@/config/env.js")>();
+  return {
+    ...actual,
+    config: { ...actual.config, FEATURE_SCHEDULING_V2: true },
+  };
+});
+
 // Same gate as repos-leak.spec.ts / issue-316: the global `db` pool (bound to
 // DATABASE_URL) and the raw seeding pool (TEST_DB_URL) must be the SAME database.
 const SHOULD_RUN =
@@ -151,13 +163,16 @@ async function seedRows(c: pg.PoolClient): Promise<void> {
   // occurrences: due-pending (claimDue), expired-claimed (reclaimExpiredLeases),
   // in_progress with a stale claim (claimInProgressForAdvance). The expired and
   // in_progress rows are stamped claimed_at far in the past so both reapers fire.
+  // Distinct scheduled_for per row: the (series_id, scheduled_for) UNIQUE index
+  // forbids two occurrences of the same series at the same instant, and now() is
+  // transaction-stable, so the three rows must use different offsets.
   await c.query(
     `INSERT INTO occurrences
         (id, tenant_id, agent_id, series_id, scheduled_for, status, claimed_by, claimed_at)
       VALUES
         ($1,$2,$3,$4, now() - interval '5 minutes', 'pending',     NULL,        NULL),
-        ($5,$2,$3,$4, now() - interval '5 minutes', 'claimed',     'stale-w-a', now() - interval '1 hour'),
-        ($6,$2,$3,$4, now() - interval '5 minutes', 'in_progress', 'stale-w-a', now() - interval '1 hour')
+        ($5,$2,$3,$4, now() - interval '6 minutes', 'claimed',     'stale-w-a', now() - interval '1 hour'),
+        ($6,$2,$3,$4, now() - interval '7 minutes', 'in_progress', 'stale-w-a', now() - interval '1 hour')
       ON CONFLICT (id) DO NOTHING`,
     [OCC_DUE_A, TENANT_A, AGENT_A, SERIES_A, OCC_EXPIRED_A, OCC_INPROG_A],
   );
@@ -166,8 +181,8 @@ async function seedRows(c: pg.PoolClient): Promise<void> {
         (id, tenant_id, agent_id, series_id, scheduled_for, status, claimed_by, claimed_at)
       VALUES
         ($1,$2,$3,$4, now() - interval '5 minutes', 'pending',     NULL,        NULL),
-        ($5,$2,$3,$4, now() - interval '5 minutes', 'claimed',     'stale-w-b', now() - interval '1 hour'),
-        ($6,$2,$3,$4, now() - interval '5 minutes', 'in_progress', 'stale-w-b', now() - interval '1 hour')
+        ($5,$2,$3,$4, now() - interval '6 minutes', 'claimed',     'stale-w-b', now() - interval '1 hour'),
+        ($6,$2,$3,$4, now() - interval '7 minutes', 'in_progress', 'stale-w-b', now() - interval '1 hour')
       ON CONFLICT (id) DO NOTHING`,
     [OCC_DUE_B, TENANT_B, AGENT_B, SERIES_B, OCC_EXPIRED_B, OCC_INPROG_B],
   );
