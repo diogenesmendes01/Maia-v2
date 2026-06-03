@@ -26,6 +26,20 @@ vi.mock('@/db/repositories.js', async () => {
   };
 });
 
+// KSM is always-on: fato/regra candidates from llm/worker route through the
+// Knowledge State Machine. Mock its repo so propose() runs in-memory.
+vi.mock('@/control-plane/knowledge-state-machine/repos.js', () => {
+  class KnowledgeConflictError extends Error {}
+  return {
+    KnowledgeConflictError,
+    knowledgeRepos: {
+      create: vi.fn(async () => '00000000-0000-0000-0000-0000000000ab'),
+      findById: vi.fn(async () => null),
+      update: vi.fn(async () => {}),
+    },
+  };
+});
+
 import { callLLM } from '@/lib/claude.js';
 import { reflect } from '@/cognition/reflector.js';
 import { classify } from '@/cognition/classifier.js';
@@ -34,7 +48,7 @@ import { persistCandidate } from '@/cognition/persister.js';
 describe('P1 reflection expansion — 4 triggers integration', () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it('SUCCESS_EXPLICIT → fato → factsRepo.upsert', async () => {
+  it('SUCCESS_EXPLICIT → fato → routes through KSM (always-on)', async () => {
     (callLLM as any)
       .mockResolvedValueOnce({ content: 'cliente prefere comunicação direta' }) // reflector
       .mockResolvedValueOnce({ content: JSON.stringify({ type: 'fato', content: 'X', scope: 'agent' }) }); // classifier
@@ -52,10 +66,10 @@ describe('P1 reflection expansion — 4 triggers integration', () => {
       const classified = await classify(reflected!.insight);
       expect(classified?.type).toBe('fato');
       const result = await persistCandidate(classified!, event);
-      // P2: persister classifies + writes to memory_entry alongside agent_facts.
-      // Accept either return value depending on whether classifier produced an
-      // entry (the legacy 'agent_facts' path stays valid for classifier no-ops).
-      expect(['agent_facts', 'agent_facts+memory_entry']).toContain(result.persisted_to);
+      // KSM always-on: an llm-origin fato is risk-scored via the state
+      // machine (pending_review/ephemeral), never the default-active legacy
+      // agent_facts upsert.
+      expect(result.persisted_to).toMatch(/^ksm:/);
     });
   });
 

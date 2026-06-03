@@ -6,7 +6,8 @@
  * `capability_proposals` (capability_type='skill'). Roda em batch async.
  *
  * Fluxo:
- *  1. Flag gate (FEATURE_SKILL_REGISTRY_V1)
+ *  1. (removido) PR #406: Skill Registry sempre habilitado — flag
+ *     FEATURE_SKILL_REGISTRY_V1 removida, sem gate de feature flag.
  *  2. Determinístico — query agrupando registros por (module_name, status,
  *     output_summary_hash) nos últimos N dias. Pattern: ≥3 ocorrências do
  *     mesmo módulo + status=success + sem skill ativa correspondente.
@@ -23,8 +24,6 @@ import { capabilityProposalsRepo, skillsRepo } from '@/db/repositories.js';
 import { db } from '@/db/client.js';
 import { cognitive_module_log } from '@/db/schema.js';
 import { sql, and, eq, gte } from 'drizzle-orm';
-import { featureFlags } from '@/config/feature-flags.js';
-import { FeatureFlagName } from '@/types/enums.js';
 import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import { logger } from '@/lib/logger.js';
 
@@ -46,10 +45,6 @@ const MIN_PATTERN_OCCURRENCES = 3;
 export async function detectAndProposeSkill(args: {
   window_days?: number;
 }): Promise<SkillProposerResult> {
-  if (!featureFlags.isEnabled(FeatureFlagName.SKILL_REGISTRY_V1)) {
-    return { proposed: 0, skipped: 0, patterns_found: 0 };
-  }
-
   const result = await runCognitiveModule<SkillProposerResult>(
     {
       name: 'skill_proposer_detector',

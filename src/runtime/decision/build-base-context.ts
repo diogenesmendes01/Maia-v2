@@ -13,7 +13,6 @@
 
 import type { BaseContextPacket } from '../context-packet/types.js';
 import type { Mensagem, Conversa, Pessoa } from '@/db/schema.js';
-import { config } from '@/config/env.js';
 
 export interface BuildBaseContextInput {
   inbound: Mensagem;
@@ -40,12 +39,11 @@ export function buildBaseContextPacketFromTurn(
   const channelId = channel_id ?? 'default';
   const receivedAt = inbound.created_at?.toISOString() ?? new Date().toISOString();
 
-  // Minimal feature flag snapshot: only P9b-relevant flags to avoid
-  // synchronous lookups into a dynamic flag store. Full async snapshot
-  // arrives in P9c when the flag store is unified.
+  // Minimal feature flag snapshot. P11: the Decision Engine is always-on, so
+  // the snapshot records it as such (the gating flag + kill switch were
+  // removed). Full async snapshot arrives in P9c when the flag store is unified.
   const feature_flags_snapshot: Record<string, boolean> = {
-    FEATURE_DECISION_ENGINE_V1: config.FEATURE_DECISION_ENGINE_V1,
-    FEATURE_DECISION_ENGINE_V1_KILL_SWITCH: config.FEATURE_DECISION_ENGINE_V1_KILL_SWITCH,
+    FEATURE_DECISION_ENGINE_V1: true,
   };
 
   return {

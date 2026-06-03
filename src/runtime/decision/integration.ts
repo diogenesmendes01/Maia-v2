@@ -1,9 +1,9 @@
 /**
  * P9b (Camada 2) — Integration shim for Decision Engine in the runtime hot path.
  *
- * Spec §12.2 + master invariante 14: the FEATURE_DECISION_ENGINE_V1 flag
- * controls only whether the Decision Engine V1 produces the DecisionPacket.
- * PEPs themselves run in BOTH paths (legacy wrapper + engine).
+ * P11: the Decision Engine is now ALWAYS ON — it runs on every turn and
+ * produces the DecisionPacket before the LLM call. There is no legacy path to
+ * fall back to anymore, so engine errors are always FAIL-CLOSED.
  *
  * Two exported entry points:
  *
@@ -12,58 +12,47 @@
  *     their own deps. Engine error → skip_reason: 'engine_error' (no throw).
  *
  *  2. `runDecisionEngineForTurn(base)` — production hot-path wrapper used by
- *     agent/core.ts. Reads env vars from config singleton, instantiates a
- *     shared engine singleton wired with REAL production adapters
- *     (P8e/P9a/P9d/P9c), and enforces fail-closed semantics:
- *       • kill switch ON  → { engine_ran: false, skip_reason: 'kill_switch' }
- *       • flag OFF        → { engine_ran: false, skip_reason: 'flag_off' }
- *       • engine throws   →
- *           FEATURE_DECISION_ENGINE_ERROR_FALLBACK='legacy'
- *             → { engine_ran: false, skip_reason: 'engine_error' }
- *           FEATURE_DECISION_ENGINE_ERROR_FALLBACK='fail-closed' (default)
- *             → throws DecisionEngineFailClosedError (caller blocks the turn)
+ *     agent/core.ts. Instantiates a shared engine singleton wired with REAL
+ *     production adapters (P8e/P9a/P9d/P9c) and enforces fail-closed semantics:
+ *       • engine throws → throws DecisionEngineFailClosedError (caller blocks the turn)
  *
  * `getDecisionEngine()` returns the process-lifetime singleton wired with
- * REAL production adapters (P8e/P9a/P9d/P9c). With FEATURE_DECISION_ENGINE_V1=true
- * this performs real policy + skill + DSL evaluation per spec §12.
- *
- * TODO(P8a #96): update `src/agent/react-loop.ts` to:
- *   1. build BaseContextPacket from incoming Mensagem + Pessoa + Conversa
- *   2. call `runDecisionEngineIfEnabled(base)`  (no env arg needed — uses singleton)
- *   3. if `result.block` present → handle blocked turn (escalate / template)
- *   4. otherwise pass `result.packet` to existing prompt/response pipeline
+ * REAL production adapters (P8e/P9a/P9d/P9c). This performs real policy +
+ * skill + DSL evaluation per spec §12.
  */
 import {
   createDecisionEngine,
   type CreateDecisionEngineEnv,
   type DecisionEngineResult,
 } from './index.js';
-import { isDecisionEngineV1Enabled } from '../feature-flags/decision-engine-flag.js';
 import type { BaseContextPacket } from '../context-packet/types.js';
 import type { MetricsClient } from './types.js';
 import { createProductionDecisionEngineEnv } from './prod-env.js';
 import { logger } from '@/lib/logger.js';
-import { config } from '@/config/env.js';
 
 // ============================================================================
 // Shared types
 // ============================================================================
 
 export interface RunDecisionEngineResult {
-  /** True if the Decision Engine ran (flag ON + no error). */
+  /** True if the Decision Engine ran (no error). */
   engine_ran: boolean;
   /** The DecisionEngineResult if the engine ran, otherwise undefined. */
   result?: DecisionEngineResult;
-  /** Reason the engine did not run, when applicable. */
-  skip_reason?: 'flag_off' | 'kill_switch' | 'engine_error';
+  /**
+   * Reason the engine did not run, when applicable. Only the DI-friendly
+   * `runDecisionEngineIfEnabled` returns this (`engine_error`) so callers that
+   * wire their own deps can degrade silently; the production wrapper
+   * `runDecisionEngineForTurn` is fail-closed and throws instead.
+   */
+  skip_reason?: 'engine_error';
 }
 
 /**
- * Thrown by `runDecisionEngineForTurn` when the engine errors and
- * FEATURE_DECISION_ENGINE_ERROR_FALLBACK is 'fail-closed' (default).
- *
- * Callers in agent/core.ts catch this and return a blocked response to the
- * user instead of proceeding to the LLM.
+ * Thrown by `runDecisionEngineForTurn` when the engine errors. The engine is
+ * always-on with no legacy fallback, so an engine error fails closed: callers
+ * in agent/core.ts catch this and return a blocked response to the user
+ * instead of proceeding to the LLM.
  */
 export class DecisionEngineFailClosedError extends Error {
   constructor(
@@ -83,14 +72,12 @@ export class DecisionEngineFailClosedError extends Error {
 // ============================================================================
 
 /**
- * Wraps the engine in flag check + error-fallback per spec §12.3.
+ * Runs the engine and reports the outcome (DI-friendly).
  *
- * - Kill switch ON → returns `{ engine_ran: false, skip_reason: 'flag_off' }`.
- * - Flag OFF → returns `{ engine_ran: false, skip_reason: 'flag_off' }`.
- * - Flag ON, engine succeeds → returns `{ engine_ran: true, result }`.
- * - Flag ON, engine throws unexpectedly → records metric, returns
- *   `{ engine_ran: false, skip_reason: 'engine_error' }` so caller can
- *   fall through to legacy path (which still runs PEPs via wrapper).
+ * - Engine succeeds → returns `{ engine_ran: true, result }`.
+ * - Engine throws unexpectedly → records metric, returns
+ *   `{ engine_ran: false, skip_reason: 'engine_error' }` so callers that wire
+ *   their own deps can degrade silently without surfacing the error.
  *
  * Note: budget exhaustion is NOT an unexpected error — the engine returns
  * a `fallback_applied` packet and `engine_ran: true`.
@@ -105,12 +92,6 @@ export async function runDecisionEngineIfEnabled(
   env?: CreateDecisionEngineEnv,
   metrics?: MetricsClient,
 ): Promise<RunDecisionEngineResult> {
-  const enabled = await isDecisionEngineV1Enabled(base.tenant_id);
-  if (!enabled) {
-    metrics?.increment('decision_engine.flag_off');
-    return { engine_ran: false, skip_reason: 'flag_off' };
-  }
-
   try {
     // Use the real production singleton when no override env is supplied.
     const engine = env ? createDecisionEngine(env) : getDecisionEngine();
@@ -119,7 +100,7 @@ export async function runDecisionEngineIfEnabled(
   } catch (err) {
     metrics?.increment('decision_engine.error_fallback');
     // We log via the env.metrics if available; otherwise swallow silently
-    // so the caller can fall back to legacy without surfacing the error.
+    // so the caller can degrade without surfacing the error.
     void err;
     return { engine_ran: false, skip_reason: 'engine_error' };
   }
@@ -171,32 +152,18 @@ export function _overrideDecisionEngineSingleton(
 // ============================================================================
 
 /**
- * Gate a turn through the Decision Engine before the LLM call.
+ * Run a turn through the Decision Engine before the LLM call.
  *
- * Reads FEATURE_DECISION_ENGINE_V1_KILL_SWITCH, FEATURE_DECISION_ENGINE_V1,
- * and FEATURE_DECISION_ENGINE_ERROR_FALLBACK from the config singleton (env.ts).
+ * P11: the engine is always-on with no legacy fallback. It runs on every turn;
+ * an engine error fails closed.
  *
  * Semantics:
- *  - kill_switch ON → skip (engine_ran: false, skip_reason: 'kill_switch')
- *  - flag OFF       → skip (engine_ran: false, skip_reason: 'flag_off')
- *  - engine OK      → { engine_ran: true, result }
- *  - engine error + fallback='legacy' → skip (engine_ran: false, skip_reason: 'engine_error')
- *  - engine error + fallback='fail-closed' → throws DecisionEngineFailClosedError
+ *  - engine OK    → { engine_ran: true, result }
+ *  - engine error → throws DecisionEngineFailClosedError (caller blocks the turn)
  */
 export async function runDecisionEngineForTurn(
   base: BaseContextPacket,
 ): Promise<RunDecisionEngineResult> {
-  // 1. Kill switch — highest precedence
-  if (config.FEATURE_DECISION_ENGINE_V1_KILL_SWITCH) {
-    return { engine_ran: false, skip_reason: 'kill_switch' };
-  }
-
-  // 2. Feature flag
-  if (!config.FEATURE_DECISION_ENGINE_V1) {
-    return { engine_ran: false, skip_reason: 'flag_off' };
-  }
-
-  // 3. Run the engine
   try {
     const engine = getDecisionEngine();
     const result = await engine.run({ base });
@@ -207,12 +174,7 @@ export async function runDecisionEngineForTurn(
       'decision-engine error',
     );
 
-    if (config.FEATURE_DECISION_ENGINE_ERROR_FALLBACK === 'legacy') {
-      // Degrade silently: caller proceeds to legacy LLM path without engine output
-      return { engine_ran: false, skip_reason: 'engine_error' };
-    }
-
-    // fail-closed (default): caller MUST handle as block
+    // fail-closed: caller MUST handle as block
     throw new DecisionEngineFailClosedError(err, base.tenant_id, base.trace_id);
   }
 }

@@ -35,22 +35,14 @@ vi.mock('../../src/gateway/baileys.js', () => ({
 function configAllFlagsOff() {
   return {
     config: {
+      // PR #406 completed the teardown: the only config-gated tool flag left is
+      // the PRODUCT flag FEATURE_PDF_REPORTS. KSM / CALENDAR_V2 / SCHEDULING_V2 /
+      // SKILL_REGISTRY_V1 env fields were REMOVED (those tools are now
+      // unconditionally enabled). MULTI_CHANNEL / COGNITIVE_GRAPH survive as
+      // enum flags (read by the feature-flags singleton).
       FEATURE_PDF_REPORTS: false,
-      FEATURE_SCHEDULING_V2: false,
-      FEATURE_KNOWLEDGE_STATE_MACHINE_V1: false,
-      FEATURE_CALENDAR_V2: false,
-      // Remaining FeatureFlagName-backing keys default to false in the
-      // singleton when undefined; spelled out where read for clarity.
-      FEATURE_P0_TENANT_GUARD_ENFORCED: false,
-      FEATURE_OPERATIONAL_PROFILE_V2: false,
-      FEATURE_DIALOGICAL_ACQUISITION: false,
       FEATURE_MULTI_CHANNEL: false,
       FEATURE_COGNITIVE_GRAPH: false,
-      FEATURE_P8C_USER_LAYER_NAMESPACE_V1: false,
-      FEATURE_SOUL_LAYER_V1: false,
-      FEATURE_POLICY_RESOLVER_V1: false,
-      FEATURE_SKILL_REGISTRY_V1: false,
-      FEATURE_RUNTIME_TRACE_V1: false,
     },
   };
 }
@@ -76,40 +68,46 @@ describe('buildToolCatalog — feature-gated tools listed as disabled (FIX 2)', 
     expect(entry!.feature_flag).toBe('FEATURE_PDF_REPORTS');
   });
 
-  it('includes scheduling tools (scheduling flag off) disabled w/ flag name', async () => {
+  it('includes scheduling tools (always-on) enabled and ungated', async () => {
     vi.resetModules();
     vi.doMock('../../src/config/env.js', configAllFlagsOff);
 
     const { REGISTRY, buildToolCatalog } = await import('../../src/tools/_registry.js');
-    expect(REGISTRY.schedule_reminder).toBeUndefined();
+    // SCHEDULING_V2 collapsed to always-on: the tools are unconditionally in
+    // the registry, no longer gated by the config flag.
+    expect(REGISTRY.schedule_reminder).toBeDefined();
 
     const catalog = buildToolCatalog();
     const names = ['schedule_reminder', 'cancel_reminder', 'start_recurring_outreach', 'start_recurring_payment'];
     for (const name of names) {
       const entry = catalog.find((e) => e.tool.name === name);
       expect(entry, `${name} missing from catalog`).toBeDefined();
-      expect(entry!.enabled, `${name} should be disabled`).toBe(false);
-      expect(entry!.feature_flag, `${name} flag name`).toBe('FEATURE_SCHEDULING_V2');
+      expect(entry!.enabled, `${name} should be enabled`).toBe(true);
+      expect(entry!.feature_flag, `${name} flag name`).toBeNull();
     }
   });
 
-  it('names FEATURE_KNOWLEDGE_STATE_MACHINE_V1 for a propose_* tool when off', async () => {
+  it('propose_* tools are always-enabled AND ungated (KSM teardown, PR #406)', async () => {
     vi.resetModules();
     vi.doMock('../../src/config/env.js', configAllFlagsOff);
 
     const { buildToolCatalog } = await import('../../src/tools/_registry.js');
     const catalog = buildToolCatalog();
 
+    // PR #406 completed the admin-ui teardown: KSM is unconditionally enabled
+    // and its gating flag was REMOVED, so the catalog must report propose_* as
+    // UNGATED (feature_flag: null) — surfacing a dead flag NAME made the
+    // admin-ui reject these live tools as disabled_tools_not_allowed.
     const propose = catalog.find((e) => e.tool.name === 'propose_fact');
     expect(propose).toBeDefined();
-    expect(propose!.enabled).toBe(false);
-    expect(propose!.feature_flag).toBe('KNOWLEDGE_STATE_MACHINE_V1');
+    expect(propose!.enabled).toBe(true);
+    expect(propose!.feature_flag).toBeNull();
 
     // The other propose_* tools behave identically.
     for (const name of ['propose_rule', 'propose_memory', 'propose_hint']) {
       const e = catalog.find((x) => x.tool.name === name);
-      expect(e!.feature_flag).toBe('KNOWLEDGE_STATE_MACHINE_V1');
-      expect(e!.enabled).toBe(false);
+      expect(e!.feature_flag).toBeNull();
+      expect(e!.enabled).toBe(true);
     }
   });
 
@@ -124,10 +122,10 @@ describe('buildToolCatalog — feature-gated tools listed as disabled (FIX 2)', 
     expect(entry!.feature_flag).toBeNull();
   });
 
-  it('enables generate_report + scheduling tools when their flags are on', async () => {
+  it('enables generate_report when its flag is on; scheduling stays always-on', async () => {
     vi.resetModules();
     vi.doMock('../../src/config/env.js', () => ({
-      config: { ...configAllFlagsOff().config, FEATURE_PDF_REPORTS: true, FEATURE_SCHEDULING_V2: true },
+      config: { ...configAllFlagsOff().config, FEATURE_PDF_REPORTS: true },
     }));
 
     const { buildToolCatalog } = await import('../../src/tools/_registry.js');
@@ -137,8 +135,10 @@ describe('buildToolCatalog — feature-gated tools listed as disabled (FIX 2)', 
     expect(report!.enabled).toBe(true);
     expect(report!.feature_flag).toBe('FEATURE_PDF_REPORTS');
 
+    // Scheduling collapsed to always-on (PR #406): enabled regardless of config.
     const sched = catalog.find((e) => e.tool.name === 'schedule_reminder');
     expect(sched!.enabled).toBe(true);
+    expect(sched!.feature_flag).toBeNull();
 
     // No duplicate entries even though generate_report is both in REGISTRY and
     // in CONFIG_GATED_TOOLS.

@@ -4,9 +4,7 @@ import {
   DriftSeverity,
   ProfileStatus,
   DriftDecision,
-  FeatureFlagName,
 } from '@/types/enums.js';
-import { featureFlags } from '@/config/feature-flags.js';
 
 describe('P4 enums', () => {
   // P4 baseline: 7 detectores (tom, valores, confianca, vies, escopo, linguagem, procedimento).
@@ -27,11 +25,5 @@ describe('P4 enums', () => {
   });
   it('DriftDecision has 4 values', () => {
     expect(Object.values(DriftDecision)).toHaveLength(4);
-  });
-  it('FeatureFlagName.OPERATIONAL_PROFILE_V2 defined', () => {
-    expect(FeatureFlagName.OPERATIONAL_PROFILE_V2).toBe('OPERATIONAL_PROFILE_V2');
-  });
-  it('featureFlags singleton respects FEATURE_OPERATIONAL_PROFILE_V2 default off', () => {
-    expect(featureFlags.isEnabled(FeatureFlagName.OPERATIONAL_PROFILE_V2)).toBe(false);
   });
 });

@@ -26,8 +26,6 @@
 import { sql } from 'drizzle-orm';
 import { runCognitiveModule } from '@/cognition/runner.js';
 import { logger } from '@/lib/logger.js';
-import { featureFlags } from '@/config/feature-flags.js';
-import { FeatureFlagName } from '@/types/enums.js';
 import { KnowledgeStateMachine } from '@/control-plane/knowledge-state-machine/state-machine.js';
 import { knowledgeRepos } from '@/control-plane/knowledge-state-machine/repos.js';
 import { IllegalTransitionError } from '@/control-plane/knowledge-state-machine/transitions.js';
@@ -228,16 +226,6 @@ async function promote(args: {
 }
 
 export async function runKnowledgeStatePromoter(): Promise<void> {
-  // P10a (review #104 high): use the runtime feature-flag singleton
-  // so a kill switch takes effect on the next tick without a redeploy.
-  // The previous code path read the module-level constant
-  // FEATURE_KNOWLEDGE_STATE_MACHINE_V1 at import time, which froze the
-  // value at startup.
-  if (!featureFlags.isEnabled(FeatureFlagName.KNOWLEDGE_STATE_MACHINE_V1)) {
-    logger.debug({}, 'knowledge_state_promoter.skipped_disabled');
-    return;
-  }
-
   // Issue #255 — the outer `runCognitiveModule` wrap was removed: a
   // single batch can span multiple tenants (listEligible returns rows
   // from any tenant whose lifecycle_status matches), so there is no

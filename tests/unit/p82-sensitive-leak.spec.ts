@@ -30,6 +30,7 @@ const capabilityGapsListByLevel = vi.fn();
 
 vi.mock('../../src/db/repositories.js', () => ({
   selfStateRepo: { getActive: selfStateGetActive },
+  operationalProfileVersionsRepo: { getActive: vi.fn(async () => null) },
   mensagensRepo: { recentInConversation: mensagensRecent },
   entidadesRepo: { byIds: entidadesByIds },
   factsRepo: { listMentionableForScopes: factsListMentionableForScopes },

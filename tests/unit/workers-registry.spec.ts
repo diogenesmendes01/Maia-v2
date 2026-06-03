@@ -125,11 +125,8 @@ describe('workers registry', () => {
     });
 
     it('boot test: all 3 trace jobs are at phase 1 so startWorkers(1) can reach them', async () => {
-      // Round-2 finding #1: trace jobs were at phase 6; production calls startWorkers(1).
-      // Fix: jobs are now phase 1, gated by featureFlag = config.FEATURE_RUNTIME_TRACE_V1.
-      // This test verifies the static registry contract: jobs are at phase 1 and
-      // carry the featureFlag property. The gate logic (skip when === false) is
-      // tested independently here without needing to run startWorkers().
+      // Round-2 finding #1: trace jobs were at phase 6; production calls
+      // startWorkers(1). Fix: jobs are now phase 1 and run unconditionally.
       const { JOBS } = await import('../../src/workers/index.js');
       const traceJobs = JOBS.filter((j) =>
         ['trace_body_writer', 'trace_body_recoverer', 'trace_matview_refresh'].includes(j.name),
@@ -139,18 +136,7 @@ describe('workers registry', () => {
       expect(traceJobs).toHaveLength(3);
       for (const j of traceJobs) {
         expect(j.phase).toBe(1);
-        // featureFlag property must exist — this is the new field that gates the jobs.
-        expect('featureFlag' in j).toBe(true);
       }
-
-      // Gate logic contract: startWorkers skips a job when featureFlag === false.
-      // When FEATURE_RUNTIME_TRACE_V1 env var is absent/false (test default),
-      // featureFlag evaluates to false → jobs are in JOBS but skipped by startWorkers.
-      // When FEATURE_RUNTIME_TRACE_V1=true in prod, featureFlag=true → scheduled.
-      // We verify: a job with featureFlag=false IS in JOBS (phase 1, reachable),
-      // and featureFlag is the only gate — NOT phase.
-      const traceJobsAtPhase1 = traceJobs.filter((j) => j.phase === 1);
-      expect(traceJobsAtPhase1).toHaveLength(3); // all 3 are at phase 1
     });
   });
 

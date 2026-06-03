@@ -15,7 +15,6 @@ import { holidayEntidadesRepo } from '@/db/repositories/holiday-entidades-repo.j
 import { invalidateCacheForHolidayChange } from '@/lib/holidays-cache.js';
 import { getCurrentTenant } from '@/db/tenant-context.js';
 import { canAct } from '@/governance/permissions.js';
-import { FeatureFlagName } from '@/types/enums.js';
 
 const inputSchema = z.object({
   name: z.string().min(1).max(120),
@@ -42,7 +41,6 @@ export const registerCustomHolidayTool: Tool<typeof inputSchema, typeof outputSc
   redis_required: false,
   operation_type: 'create',
   audit_action: 'manage_calendar',
-  feature_flag: FeatureFlagName.CALENDAR_V2,
   handler: async (args, ctx) => {
     const tenant_id = getCurrentTenant();
 

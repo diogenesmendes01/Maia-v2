@@ -10,11 +10,10 @@
  *   - listVersions — every version of a descriptor in an EXACT scope (newest
  *                    first); the caller passes the selected row's agent_id
  *                    (nullable = tenant-wide) so scopes never mix
- *   - runtimeFlag  — what value of FEATURE_SKILL_REGISTRY_V1 THIS admin-ui
- *                    process sees (drives the "managed here but verify on
- *                    maia-app" banner). NOTE: admin-ui and maia-app are
- *                    separate containers, so this only reflects admin-ui's own
- *                    env — it is NOT maia-app's runtime state.
+ *   - runtimeFlag  — PR #406: the Skill Registry is now UNCONDITIONALLY enabled
+ *                    (FEATURE_SKILL_REGISTRY_V1 removed), so this returns a
+ *                    constant `true`; kept for tRPC-contract stability (the page
+ *                    no longer shows the "verify on maia-app" banner).
  *
  * Phase 3 — lifecycle MUTATIONS (this commit):
  *   - propose      — author a new skill version (status='proposed') directly via
@@ -45,7 +44,6 @@
  */
 import { z } from 'zod';
 import { TRPCError } from '@trpc/server';
-import { config } from '@/config/env.js';
 import { router, protectedProcedure } from '../server.js';
 import { resolveTenantId } from '../tenant-resolver.js';
 import { runWithTenantContext } from '../../../db/tenant-context.js';
@@ -323,17 +321,15 @@ export const skillsRouter = router({
   /**
    * runtimeFlag — review PR #209 finding 1.
    *
-   * Returns the value of FEATURE_SKILL_REGISTRY_V1 as seen by THIS admin-ui
-   * process's own env config. admin-ui and maia-app run in separate containers
-   * with independent env, so this CANNOT report maia-app's runtime state — it
-   * only tells operators what this admin-ui is configured with. The flag gates
-   * skill *execution* on maia-app (SkillRunner gate 1), not data management
-   * here; the page banner makes the "verify on maia-app" caveat explicit.
-   *
-   * `adminUiSkillRegistryEnabled` is the honest, source-scoped field name.
+   * PR #406: the Skill Registry collapsed to UNCONDITIONALLY enabled and
+   * FEATURE_SKILL_REGISTRY_V1 was removed, so this now reports a constant
+   * `true`. The endpoint is retained for tRPC-contract stability (the /skills
+   * page still queries it to decide whether to show the "verify on maia-app"
+   * banner — now never, since the registry is always on). `adminUiSkillRegistryEnabled`
+   * keeps its honest, source-scoped field name.
    */
   runtimeFlag: protectedProcedure.query(() => {
-    return { adminUiSkillRegistryEnabled: config.FEATURE_SKILL_REGISTRY_V1 };
+    return { adminUiSkillRegistryEnabled: true as const };
   }),
 
   /**

@@ -109,9 +109,9 @@ export class BaseContextBuilder {
       .digest('hex')
       .substring(0, 16);
 
-    // Snapshot feature flags. FEATURE_CONTEXT_PACKET_V1 is the marquee one
-    // for P8a, but the snapshot is open-ended — the FeatureFlagsPort decides
-    // which flags to expose.
+    // Snapshot feature flags at entry time. The snapshot is open-ended — the
+    // injected FeatureFlagsPort decides which flags to expose (the default port
+    // returns {}; the production hot path injects its own snapshot).
     const featureFlagsSnapshot = await this.featureFlags.snapshot(tenant_id);
 
     const conversationId =
@@ -188,16 +188,15 @@ const failLoudResolver: IdentityResolverPort = {
 };
 
 /**
- * Default feature flags snapshot: exposes FEATURE_CONTEXT_PACKET_V1 from env
- * for P8a. Tests can inject a mock with different shape.
+ * Default feature flags snapshot. PR #406: the FEATURE_CONTEXT_PACKET_V1 flag
+ * was removed (the context-packet hot-path no longer exists; boot now throws if
+ * it is set — see src/config/env.ts), so the default snapshot is empty. The
+ * port/structure is retained — the real hot path (build-base-context.ts) injects
+ * its own snapshot, and tests inject a mock with whatever shape they need.
  */
 const defaultFeatureFlags: FeatureFlagsPort = {
-  async snapshot(_tenant_id: string) {
-    const killSwitch = process.env.FEATURE_CONTEXT_PACKET_V1_KILL_SWITCH === 'true';
-    const enabled = !killSwitch && process.env.FEATURE_CONTEXT_PACKET_V1 === 'true';
-    return {
-      FEATURE_CONTEXT_PACKET_V1: enabled,
-    };
+  async snapshot(_tenant_id: string): Promise<Record<string, boolean>> {
+    return {};
   },
 };
 

@@ -55,7 +55,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     "side_effect": "write",
     "operation_type": "update_meta",
     "sensitive": false,
-    "feature_flag": "calendar_v2",
+    "feature_flag": null,
     "required_actions": [
       "manage_capabilities"
     ],
@@ -249,7 +249,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     "side_effect": "write",
     "operation_type": "cancel",
     "sensitive": false,
-    "feature_flag": "FEATURE_SCHEDULING_V2",
+    "feature_flag": null,
     "required_actions": [
       "schedule_reminder"
     ],
@@ -446,7 +446,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     "side_effect": "read",
     "operation_type": "read",
     "sensitive": false,
-    "feature_flag": "calendar_v2",
+    "feature_flag": null,
     "required_actions": [],
     "inputs": [
       {
@@ -579,7 +579,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     "side_effect": "write",
     "operation_type": "create",
     "sensitive": false,
-    "feature_flag": "KNOWLEDGE_STATE_MACHINE_V1",
+    "feature_flag": null,
     "required_actions": [
       "read_balance"
     ],
@@ -627,7 +627,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     "side_effect": "write",
     "operation_type": "create",
     "sensitive": false,
-    "feature_flag": "KNOWLEDGE_STATE_MACHINE_V1",
+    "feature_flag": null,
     "required_actions": [
       "read_balance"
     ],
@@ -680,7 +680,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     "side_effect": "write",
     "operation_type": "create",
     "sensitive": false,
-    "feature_flag": "KNOWLEDGE_STATE_MACHINE_V1",
+    "feature_flag": null,
     "required_actions": [
       "read_balance"
     ],
@@ -728,7 +728,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     "side_effect": "write",
     "operation_type": "create",
     "sensitive": false,
-    "feature_flag": "KNOWLEDGE_STATE_MACHINE_V1",
+    "feature_flag": null,
     "required_actions": [
       "read_balance"
     ],
@@ -827,7 +827,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     "side_effect": "write",
     "operation_type": "create",
     "sensitive": false,
-    "feature_flag": "calendar_v2",
+    "feature_flag": null,
     "required_actions": [
       "manage_calendar"
     ],
@@ -948,7 +948,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     "side_effect": "write",
     "operation_type": "update_meta",
     "sensitive": false,
-    "feature_flag": "calendar_v2",
+    "feature_flag": null,
     "required_actions": [
       "manage_capabilities"
     ],
@@ -1052,7 +1052,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     "side_effect": "write",
     "operation_type": "create",
     "sensitive": false,
-    "feature_flag": "FEATURE_SCHEDULING_V2",
+    "feature_flag": null,
     "required_actions": [
       "schedule_reminder"
     ],
@@ -1113,7 +1113,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     "side_effect": "communication",
     "operation_type": "create",
     "sensitive": false,
-    "feature_flag": "FEATURE_SCHEDULING_V2",
+    "feature_flag": null,
     "required_actions": [
       "send_proactive_message"
     ],
@@ -1186,7 +1186,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     "side_effect": "write",
     "operation_type": "create",
     "sensitive": false,
-    "feature_flag": "FEATURE_SCHEDULING_V2",
+    "feature_flag": null,
     "required_actions": [
       "create_transaction"
     ],

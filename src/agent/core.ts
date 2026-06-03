@@ -52,13 +52,6 @@ import { eq } from 'drizzle-orm';
 import { runNodes } from '@/cognitive-graph/orchestrator.js';
 import { buildPreturnNodes, type PreturnContext } from '@/cognitive-graph/preturn-graph.js';
 import { buildPostturnNodes } from '@/cognitive-graph/postturn-graph.js';
-// P8a context-packet dual-path (FEATURE_CONTEXT_PACKET_V1)
-import { isContextPacketV1Enabled } from '@/runtime/feature-flags/context-packet-flag.js';
-import { buildContextPacket } from '@/runtime/context-packet/build-context-packet.js';
-import { buildPromptFromPacket } from '@/runtime/prompt/build-prompt-from-packet.js';
-import { createDecisionPacketStub } from '@/runtime/context-packet/decision-packet-stub.js';
-import { getProductionBuilderSet } from '@/runtime/context-packet/production-builder-set.js';
-import type { BaseContextPacket } from '@/runtime/context-packet/types.js';
 // P9b — Decision Engine hot-path wiring
 import {
   runDecisionEngineForTurn,
@@ -597,7 +590,8 @@ async function runAgentForMensagemInner(
   //  - disambiguation_requested: owner was prompted; we still let the LLM
   //    answer the sender so they don't get silence.
   //  - no_match: no scheduling state cares about this inbound; continue.
-  if (config.FEATURE_SCHEDULING_V2 && inbound.tipo === 'texto' && inbound.conteudo) {
+  // PR #406: Scheduling V2 collapsed to always-on (FEATURE_SCHEDULING_V2 removed).
+  if (inbound.tipo === 'texto' && inbound.conteudo) {
     try {
       const { captureInboundForOutreach } = await import('@/scheduling/disambiguation.js');
       const ownerId = config.OWNER_TELEFONE_WHATSAPP;
@@ -875,92 +869,25 @@ async function runAgentForMensagemInner(
     }
   }
 
-  // P8a dual-path — FEATURE_CONTEXT_PACKET_V1 routes here when enabled.
-  // When disabled (default) or when the packet path throws, falls back to
-  // the legacy buildPrompt. This makes the flag operational in production
-  // so the runbook kill-switch actually controls which builder fires.
-  let system: string;
-  let messages: import('@/lib/claude.js').LLMMessage[];
-
+  // Prompt assembly via the prompt-builder. The FEATURE_CONTEXT_PACKET_V1
+  // "context packet" path was an unwired stub — its history loader returned
+  // zero turns, which would have dropped ALL conversation history — so the hot
+  // path always uses buildPrompt.
   const tenantId = getCurrentTenant();
-  const usePacketPath = await isContextPacketV1Enabled(tenantId).catch(() => false);
-
-  if (usePacketPath) {
-    try {
-      const agentId = getCurrentAgent();
-      const base: BaseContextPacket = {
-        trace_id: inbound.id,
-        tenant_id: tenantId,
-        agent_id: agentId,
-        session_id: c.id,
-        conversation_id: c.id,
-        channel: {
-          id: channel_id ?? 'default',
-          kind: 'whatsapp',
-          is_locked_down: false,
-        },
-        actor: {
-          user_id: null,
-          pessoa_id: pessoa.id,
-          role: 'end_user',
-          is_authenticated: true,
-        },
-        input: {
-          kind: 'text',
-          content_ref: inbound.id,
-          content_hmac: '',
-          received_at: inbound.created_at?.toISOString() ?? new Date().toISOString(),
-        },
-        active_procedure_execution_id: activeExecution?.id ?? null,
-        feature_flags_snapshot: { FEATURE_CONTEXT_PACKET_V1: true },
-        entered_at_ms: Date.now(),
-        // P9c: sensitive-memory risk floor. The legacy hot-path here doesn't
-        // have async DB access at this point — the real BaseContextBuilder
-        // (used by the packet path) populates this via countActiveSensitive.
-        // Conservative default: 0 (no false floor in this legacy branch).
-        active_sensitive_memory_count: 0,
-      };
-      const decision = createDecisionPacketStub(base);
-      const { builders, cache } = getProductionBuilderSet();
-      // P8a stub history loader — no DB call yet; history surfaced via legacy
-      // messages array.  Real loader wired when P9b integrates context packet.
-      const historyLoader = async (): Promise<import('@/runtime/context-packet/types.js').HistorySlice> => ({
-        turns: [],
-        truncated: false,
-      });
-      const packet = await buildContextPacket({ base, decision }, { builders, cache, historyLoader });
-      const rendered = buildPromptFromPacket(packet);
-      system = rendered.system;
-      messages = rendered.messages as import('@/lib/claude.js').LLMMessage[];
-      logger.debug(
-        {
-          tenant_id: tenantId,
-          duration_ms: packet.assembly_meta.duration_ms,
-          fallbacks: Object.keys(packet.assembly_meta.fallback_depths_applied),
-        },
-        'agent.context_packet_path',
-      );
-    } catch (err) {
-      // Packet path failed — degrade to legacy builder so the turn succeeds.
-      logger.warn(
-        { tenant_id: tenantId, err: (err as Error).message },
-        'agent.context_packet_path_failed_fallback_legacy',
-      );
-      const legacy = await buildPrompt({ pessoa, conversa: c, scope, inbound, activeRole, activeExecution });
-      system = legacy.system;
-      messages = legacy.messages;
-    }
-  } else {
-    const legacy = await buildPrompt({ pessoa, conversa: c, scope, inbound, activeRole, activeExecution });
-    system = legacy.system;
-    messages = legacy.messages;
-  }
+  const { system, messages } = await buildPrompt({
+    pessoa,
+    conversa: c,
+    scope,
+    inbound,
+    activeRole,
+    activeExecution,
+  });
 
   let tools = getToolSchemas(scope.byEntity);
 
-  // P9b — Decision Engine gate: runs BEFORE the LLM call.
-  // Flag OFF (default) → zero behaviour change.
-  // Flag ON → engine gates the turn; tool_reductions applied to toolSet.
+  // P11 — Decision Engine gate: always runs BEFORE the LLM call. The engine
+  // gates the turn (block/escalate short-circuit) and tool_reductions are
+  // applied to the toolSet; an engine error fails closed (see catch below).
   try {
     const baseCtx = buildBaseContextPacketFromTurn({
       inbound,
@@ -1117,8 +1044,8 @@ async function runAgentForMensagemInner(
     }
   } catch (err) {
     if (err instanceof DecisionEngineFailClosedError) {
-      // fail-closed: engine errored and FEATURE_DECISION_ENGINE_ERROR_FALLBACK='fail-closed'
-      // → block the turn, reply to user, skip LLM
+      // fail-closed: the always-on engine errored → block the turn, reply to
+      // user, skip LLM (there is no legacy fallback path anymore)
       const failMsg = 'Sistema indisponível temporariamente. Tente novamente em alguns instantes.';
       await sendOutbound(pessoa.id, c.id, failMsg, inbound.id).catch((e) =>
         logger.warn({ err: (e as Error).message }, 'agent.decision_engine.fail_closed_reply_failed'),
