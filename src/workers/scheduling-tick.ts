@@ -14,19 +14,15 @@
  * dispatcher takes no advisory lock and needs none: the repos' `FOR UPDATE
  * SKIP LOCKED` claim CTEs already stop two instances from double-claiming.
  *
- * Gated by FEATURE_SCHEDULING_V2 (default OFF): when off we skip the enumeration
- * entirely (and `runSchedulingTick` also early-returns), so the worker is a
- * no-op until the flag is flipped.
+ * Scheduling V2 is 100% cutover (#406 removed FEATURE_SCHEDULING_V2), so this
+ * worker always runs; an idle tick is a clean no-op when no tenant has work.
  */
 import { runSchedulingTick } from '@/scheduling/engine.js';
 import { schedulingDispatch } from '@/scheduling/repos.js';
-import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 
 export async function runScheduling(): Promise<void> {
-  if (!config.FEATURE_SCHEDULING_V2) return;
-
   const tenants = await schedulingDispatch.enumerateTickTenants();
   if (tenants.length === 0) {
     logger.debug('scheduling_tick.idle');

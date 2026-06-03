@@ -10,17 +10,15 @@
  * concurrency safety lives in the scheduling repos (claim CTEs / occurrence
  * dedup), not in this dispatcher.
  *
- * Gated by FEATURE_SCHEDULING_V2 (default OFF): skipped entirely when off.
+ * Scheduling V2 is 100% cutover (#406 removed FEATURE_SCHEDULING_V2), so this
+ * worker always runs; it cleanly no-ops when no tenant has an active series.
  */
 import { runSeriesNextScheduler } from '@/scheduling/engine.js';
 import { schedulingDispatch } from '@/scheduling/repos.js';
-import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 
 export async function runSeriesNextSchedulerWorker(): Promise<void> {
-  if (!config.FEATURE_SCHEDULING_V2) return;
-
   const tenants = await schedulingDispatch.enumerateActiveSeriesTenants();
   if (tenants.length === 0) {
     logger.debug('series_next_scheduler.idle');

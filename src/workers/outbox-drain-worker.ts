@@ -29,8 +29,8 @@ import { runWithTenantContext } from '@/db/tenant-context.js';
  *   - Cap iterations at `OUTBOX_DRAIN_LOOP_PASSES` so we don't run past
  *     the next cron firing.
  *
- * Gated by FEATURE_SCHEDULING_V2 (default OFF): skipped entirely when off
- * (and `runOutboxDrain` also early-returns).
+ * Scheduling V2 is 100% cutover (#406 removed FEATURE_SCHEDULING_V2), so this
+ * worker always runs; it cleanly no-ops when no tenant has outbox work.
  */
 async function drainTenant(maxPasses: number, sleepMs: number): Promise<void> {
   for (let pass = 0; pass < maxPasses; pass++) {
@@ -51,8 +51,6 @@ async function drainTenant(maxPasses: number, sleepMs: number): Promise<void> {
 }
 
 export async function runOutboxDrainWorker(): Promise<void> {
-  if (!config.FEATURE_SCHEDULING_V2) return;
-
   const maxPasses = Math.max(1, config.OUTBOX_DRAIN_LOOP_PASSES);
   const sleepMs = Math.max(0, config.OUTBOX_DRAIN_LOOP_SLEEP_MS);
 

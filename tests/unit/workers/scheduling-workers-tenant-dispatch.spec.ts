@@ -11,8 +11,7 @@
  *      under default/default.
  *   3. Empty enumeration → clean no-op (inner never invoked).
  *   4. Fail-isolated: a throw under tenant-A does not block tenant-B.
- *   5. FEATURE_SCHEDULING_V2 OFF → no enumeration, no inner (worker is a no-op).
- *   6. Not coupled to caller context: an ambient tenant-A does not override the
+ *   5. Not coupled to caller context: an ambient tenant-A does not override the
  *      enumerated tenant-B.
  *
  * Mirrors `tests/unit/workers/audit-mode-expirer-cross-tenant.spec.ts`: mock the
@@ -83,9 +82,9 @@ vi.mock('@/lib/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
 }));
 
-// FEATURE_SCHEDULING_V2 is toggled per-test via the mutable object below.
+// Only the outbox drain-loop knobs are read from config now (scheduling V2 is
+// 100% cutover — #406 removed FEATURE_SCHEDULING_V2).
 const cfg = {
-  FEATURE_SCHEDULING_V2: true,
   OUTBOX_DRAIN_LOOP_PASSES: 5,
   OUTBOX_DRAIN_LOOP_SLEEP_MS: 0,
 };
@@ -102,7 +101,6 @@ beforeEach(() => {
   tickTuples = [];
   seriesTuples = [];
   outboxTuples = [];
-  cfg.FEATURE_SCHEDULING_V2 = true;
   runSchedulingTickMock.mockClear();
   runSeriesNextSchedulerMock.mockClear();
   runOutboxDrainMock.mockClear();
@@ -149,15 +147,6 @@ describe('scheduling_tick worker — per-tenant dispatcher (#355)', () => {
     expect(tickContexts.some((c) => c.tenant_id === 'tenant-B')).toBe(true);
   });
 
-  it('FEATURE_SCHEDULING_V2 OFF → no enumeration, no engine', async () => {
-    cfg.FEATURE_SCHEDULING_V2 = false;
-    tickTuples = [A];
-    const { runScheduling } = await import('@/workers/scheduling-tick.js');
-    await runScheduling();
-    expect(enumerateTickMock).not.toHaveBeenCalled();
-    expect(runSchedulingTickMock).not.toHaveBeenCalled();
-  });
-
   it('not coupled to caller context: ambient tenant-A does not override enumerated tenant-B', async () => {
     tickTuples = [B];
     const { runScheduling } = await import('@/workers/scheduling-tick.js');
@@ -191,15 +180,6 @@ describe('series_next_scheduler worker — per-tenant dispatcher (#355)', () => 
     const { runSeriesNextSchedulerWorker } = await import('@/workers/series-next-scheduler.js');
     await expect(runSeriesNextSchedulerWorker()).resolves.toBeUndefined();
     expect(runSeriesNextSchedulerMock).toHaveBeenCalledTimes(2);
-  });
-
-  it('FEATURE_SCHEDULING_V2 OFF → no-op', async () => {
-    cfg.FEATURE_SCHEDULING_V2 = false;
-    seriesTuples = [A];
-    const { runSeriesNextSchedulerWorker } = await import('@/workers/series-next-scheduler.js');
-    await runSeriesNextSchedulerWorker();
-    expect(enumerateActiveSeriesMock).not.toHaveBeenCalled();
-    expect(runSeriesNextSchedulerMock).not.toHaveBeenCalled();
   });
 });
 
@@ -239,15 +219,6 @@ describe('outbox_drain worker — per-tenant dispatcher (#355)', () => {
     const { runOutboxDrainWorker } = await import('@/workers/outbox-drain-worker.js');
     await expect(runOutboxDrainWorker()).resolves.toBeUndefined();
     expect(drainContexts.some((c) => c.tenant_id === 'tenant-B')).toBe(true);
-  });
-
-  it('FEATURE_SCHEDULING_V2 OFF → no-op', async () => {
-    cfg.FEATURE_SCHEDULING_V2 = false;
-    outboxTuples = [A];
-    const { runOutboxDrainWorker } = await import('@/workers/outbox-drain-worker.js');
-    await runOutboxDrainWorker();
-    expect(enumerateOutboxMock).not.toHaveBeenCalled();
-    expect(runOutboxDrainMock).not.toHaveBeenCalled();
   });
 
   it('not coupled to caller context: ambient tenant-A does not override enumerated tenant-B', async () => {

@@ -53,18 +53,6 @@ vi.mock("@/governance/audit.js", () => ({
   auditTx: vi.fn(async () => undefined),
 }));
 
-// The scheduling engine + worker no-op when FEATURE_SCHEDULING_V2 is off
-// (engine.ts:105, scheduling-tick.ts:28). Enable it for the worker-path tests
-// while preserving every other real config value (DATABASE_URL, lease TTLs,
-// limits) — mirrors the sibling scheduling integration specs (01/02/07).
-vi.mock("@/config/env.js", async (importActual) => {
-  const actual = await importActual<typeof import("@/config/env.js")>();
-  return {
-    ...actual,
-    config: { ...actual.config, FEATURE_SCHEDULING_V2: true },
-  };
-});
-
 // Same gate as repos-leak.spec.ts / issue-316: the global `db` pool (bound to
 // DATABASE_URL) and the raw seeding pool (TEST_DB_URL) must be the SAME database.
 const SHOULD_RUN =
