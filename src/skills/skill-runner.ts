@@ -37,6 +37,14 @@ import {
   getCurrentAgent,
 } from '@/db/tenant-context.js';
 import { logger } from '@/lib/logger.js';
+import { audit } from '@/governance/audit.js';
+import type { AuditAction } from '@/governance/audit-actions.js';
+import {
+  evaluateUsagePolicy,
+  resolveEffectiveUsagePolicy,
+  type UsagePolicyBlockReason,
+} from './usage-policy.js';
+import type { SkillFailureReason } from './types.js';
 import type {
   SkillExecutionInput,
   SkillExecutionOutput,
@@ -326,6 +334,29 @@ export async function runSkill(input: SkillExecutionInput): Promise<SkillExecuti
     };
   }
 
+  // Gate 4.6 (issue #409): re-evaluate the native SkillUsagePolicy against the
+  // resolved audience — the LATE, fail-closed enforcement that closes the TOCTOU
+  // window between the SkillSelector candidate filter (early) and execution. An
+  // activate/rollback OR an audience change in that window would otherwise run a
+  // skill the audience may no longer use. Only runs when the caller supplied an
+  // `audience` (the production execute-skill path does); absent ⇒ skipped (the
+  // early candidate filter remains the primary gate). Audits the decision
+  // (invariant #4) at this enforcement point.
+  if (input.audience) {
+    const gate46 = evaluateUsagePolicyGate(skill, input.audience);
+    await auditUsagePolicyGate(gate46.acao, skill, input, gate46.detail);
+    if (!gate46.allowed) {
+      return {
+        ok: false,
+        reason: gate46.reason,
+        message: gate46.detail,
+        latency_ms: Date.now() - startTime,
+        resolved_policies: resolvedPolicyIds,
+        trace: skillTrace,
+      };
+    }
+  }
+
   // Gate 6: wrap em runCognitiveModule (P1 invariant — audit obrigatório).
   // AbortSignal: propagated from caller OR created locally so we can
   // signal cancellation when the runner timeout fires. Modes are required
@@ -456,6 +487,95 @@ export async function runSkill(input: SkillExecutionInput): Promise<SkillExecuti
     if (callerAbortHandler && input.signal) {
       input.signal.removeEventListener('abort', callerAbortHandler);
     }
+  }
+}
+
+/** Issue #409 — usage-policy block reason → SkillFailureReason (1:1). */
+const GATE46_REASON: Record<UsagePolicyBlockReason, SkillFailureReason> = {
+  audience_blocked: 'audience_blocked',
+  channel_blocked: 'channel_blocked',
+  data_scope_blocked: 'data_scope_blocked',
+  auth_level_insufficient: 'auth_level_insufficient',
+  risk_blocked: 'risk_blocked',
+};
+
+/** Issue #409 — usage-policy block reason → AUDIT_ACTIONS label (1:1). */
+const GATE46_AUDIT: Record<UsagePolicyBlockReason, AuditAction> = {
+  audience_blocked: 'skill_blocked_by_audience',
+  channel_blocked: 'skill_blocked_by_channel',
+  data_scope_blocked: 'skill_blocked_by_data_scope',
+  auth_level_insufficient: 'skill_blocked_by_auth_level',
+  risk_blocked: 'skill_blocked_by_risk',
+};
+
+/**
+ * Issue #409 gate 4.6 — re-evaluate the skill's `usage_policy` against the
+ * resolved audience. Fail-closed: a malformed policy is treated as an audience
+ * block. Returns the audit action + (on block) the typed failure reason.
+ */
+function evaluateUsagePolicyGate(
+  skill: SkillRow,
+  audience: NonNullable<SkillExecutionInput['audience']>,
+):
+  | { allowed: true; acao: AuditAction; detail?: undefined }
+  | { allowed: false; acao: AuditAction; reason: SkillFailureReason; detail: string } {
+  const resolved = resolveEffectiveUsagePolicy(
+    (skill as unknown as { usage_policy?: unknown }).usage_policy ?? null,
+  );
+  if (!resolved.ok) {
+    return {
+      allowed: false,
+      acao: 'skill_blocked_by_audience',
+      reason: 'audience_blocked',
+      detail: `malformed_usage_policy: ${resolved.error}`,
+    };
+  }
+  const decision = evaluateUsagePolicy(resolved.policy, {
+    audience_type: audience.audience_type,
+    trust_level: audience.trust_level,
+    channel_type: audience.channel_type,
+    ...(audience.allowed_data_scope !== undefined
+      ? { allowed_data_scope: audience.allowed_data_scope }
+      : {}),
+    ...(audience.risk_level !== undefined ? { risk_level: audience.risk_level } : {}),
+  });
+  if (decision.allowed) {
+    return { allowed: true, acao: 'skill_allowed' };
+  }
+  return {
+    allowed: false,
+    acao: GATE46_AUDIT[decision.reason],
+    reason: GATE46_REASON[decision.reason],
+    detail: decision.detail,
+  };
+}
+
+/** Best-effort audit of the gate-4.6 decision (invariant #4). Never throws. */
+async function auditUsagePolicyGate(
+  acao: AuditAction,
+  skill: SkillRow,
+  input: SkillExecutionInput,
+  detail?: string,
+): Promise<void> {
+  try {
+    await audit({
+      acao,
+      conversa_id: input.conversa_id ?? null,
+      metadata: {
+        enforcement_point: 'skill_runner_gate_4_6',
+        skill_id: skill.id,
+        skill_descriptor: skill.skill_descriptor,
+        audience_type: input.audience?.audience_type ?? null,
+        trust_level: input.audience?.trust_level ?? null,
+        channel_type: input.audience?.channel_type ?? null,
+        ...(detail !== undefined ? { detail } : {}),
+      },
+    });
+  } catch (err) {
+    logger.warn(
+      { err: (err as Error).message, acao, skill_id: skill.id },
+      'skills.usage_policy.gate46_audit_failed',
+    );
   }
 }
 

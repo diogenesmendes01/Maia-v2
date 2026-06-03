@@ -6,8 +6,12 @@ import {
   procedureSelectorDecisionsRepo,
   channelPoliciesRepo,
   rolesRepo,
+  agentAudienceProfilesRepo,
 } from '@/db/repositories.js';
 import { resolveScope } from '@/governance/permissions.js';
+import { buildAudienceContext } from '@/identity/audience-context.js';
+import { allowedDataScopesForAudience } from '@/skills/usage-policy.js';
+import type { AudienceContext } from '@/identity/audience-context.js';
 import { checkPendingFirst } from '@/agent/pending-gate.js';
 import { checkRateLimit, formatPoliteReply } from '@/gateway/rate-limit.js';
 import { resolveIdentity } from '@/identity/resolver.js';
@@ -603,6 +607,29 @@ async function runAgentForMensagemInner(
 
   const scope = await resolveScope(pessoa);
 
+  // Issue #407/#409 — resolve the per-agent AudienceContext for this turn so the
+  // SkillUsagePolicy gates (SkillSelector candidate filter + SkillRunner gate
+  // 4.6) can admit/remove skills by audience. Governance-derived (invariant #3),
+  // never LLM-declared. Best-effort: a lookup failure leaves `audienceContext`
+  // null — the early filter is then skipped (no audience to admit against) and
+  // the runner gate 4.6 (also audience-gated) is skipped too, so the turn is NOT
+  // broken by a transient audience-store hiccup; the conservative defaults still
+  // apply once an audience is present.
+  let audienceContext: AudienceContext | null = null;
+  try {
+    const audienceProfile = await agentAudienceProfilesRepo.findByPessoa(pessoa.id);
+    audienceContext = buildAudienceContext({
+      pessoa,
+      profile: audienceProfile,
+      allowed_entity_ids: scope.entidades ?? [],
+    });
+  } catch (err) {
+    logger.warn(
+      { err: (err as Error).message, pessoa_id: pessoa.id },
+      'agent.audience_resolution_failed_proceeding',
+    );
+  }
+
   // P3b Task 9 / P6 Task 9 / P7 Task 8 — PRE-TURN cognitive modules:
   // resolve procedure-selector + role-selector (role-selector runs whenever a
   // channel_id is present — MULTI_CHANNEL removed / always on after #411).
@@ -802,6 +829,16 @@ async function runAgentForMensagemInner(
       agent_id: getCurrentAgent(),
       channel_id,
       active_procedure_execution_id: activeExecution?.id ?? null,
+      // Issue #409 — feed the resolved audience so the Decision Engine's
+      // SkillSelector candidate filter admits/removes skills by audience.
+      ...(audienceContext
+        ? {
+            audience: {
+              audience_type: audienceContext.audience_type,
+              trust_level: audienceContext.trust_level,
+            },
+          }
+        : {}),
     });
     const deResult = await runDecisionEngineForTurn(baseCtx);
     if (deResult.engine_ran && deResult.result) {
@@ -882,6 +919,24 @@ async function runAgentForMensagemInner(
             inbound,
             jid: replyJid,
             aggregatedText: inbound.conteudo ?? '',
+            // Issue #409 — forward the resolved audience + channel + scored risk
+            // so the SkillRunner gate 4.6 re-evaluates the skill's usage_policy
+            // at execution time (fail-closed TOCTOU re-check). Built from the
+            // SAME AudienceContext the early candidate filter used.
+            ...(audienceContext
+              ? {
+                  audience: {
+                    audience_type: audienceContext.audience_type,
+                    trust_level: audienceContext.trust_level,
+                    channel_type: baseCtx.channel.kind,
+                    allowed_data_scope: allowedDataScopesForAudience(
+                      audienceContext.audience_type,
+                      audienceContext.trust_level,
+                    ),
+                    risk_level: packet.risk_profile.level,
+                  },
+                }
+              : {}),
           },
           {
             resolveActiveSkill: async (descriptor, agent_id) => {

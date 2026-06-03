@@ -1,11 +1,29 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+// Issue #409 — the candidate filter audits each admit/remove decision. Mock the
+// audit writer so we can assert the reasons without a DB. (Existing anti-hijack
+// tests never supply an `audience`, so they never trigger the filter / audit.)
+const { auditMock } = vi.hoisted(() => ({ auditMock: vi.fn(async () => undefined) }));
+vi.mock('@/governance/audit.js', () => ({ audit: auditMock }));
+vi.mock('@/lib/logger.js', () => ({
+  logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+}));
+
 import {
   SkillSelectorImpl,
   type SkillSelectorDeps,
 } from '@/runtime/decision/skill-selector.ts';
 import { SKILL_MATCH_THRESHOLD } from '@/runtime/decision/skill-match.ts';
-import type { SkillsRepo, Skill } from '@/runtime/decision/types.js';
+import type {
+  SkillsRepo,
+  Skill,
+  SkillSelectorAudience,
+} from '@/runtime/decision/types.js';
 import type { BaseContextPacket } from '@/runtime/context-packet/types.js';
+import {
+  allowedDataScopesForAudience,
+  type SkillUsagePolicy,
+} from '@/skills/usage-policy.js';
 
 function mkBase(overrides?: Partial<BaseContextPacket>): BaseContextPacket {
   return {
@@ -476,5 +494,239 @@ describe('P9b — SkillSelector', () => {
     expect(
       r.candidate_skill_ids.filter((id) => id === 's_top'),
     ).toHaveLength(1);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Issue #409 — usage-policy candidate filter (audience/channel/data_scope)
+  // ---------------------------------------------------------------------------
+
+  const DAILY_BUSINESS_SUMMARY: SkillUsagePolicy = {
+    allowed_audience: ['owner', 'manager'],
+    blocked_audience: ['customer', 'lead', 'vendor'],
+    data_scope: ['financial_summary', 'operations_summary'],
+    exposure_policy: 'internal_only',
+    requires_auth_level: 'trusted_internal',
+    requires_confirmation: false,
+  };
+
+  const ownerAudience: SkillSelectorAudience = {
+    audience_type: 'owner',
+    trust_level: 'trusted_internal',
+    channel_type: 'whatsapp',
+    allowed_data_scope: allowedDataScopesForAudience('owner', 'trusted_internal'),
+  };
+  const customerAudience: SkillSelectorAudience = {
+    audience_type: 'customer',
+    trust_level: 'known_external',
+    channel_type: 'whatsapp',
+    allowed_data_scope: allowedDataScopesForAudience('customer', 'known_external'),
+  };
+
+  beforeEach(() => auditMock.mockClear());
+
+  it('#409 — daily_business_summary is SELECTED for owner', async () => {
+    const deps = mkDeps([
+      mkSkill({
+        id: 'daily_business_summary',
+        category: 'tool_mediated',
+        priority: 5,
+        applicable_to_intent: ['daily_summary'],
+        when_to_use: 'When the owner asks how the business day went.',
+        usage_policy: DAILY_BUSINESS_SUMMARY as unknown as Record<string, unknown>,
+      }),
+    ]);
+    const selector = new SkillSelectorImpl(deps);
+    const r = await selector.select(
+      mkBase(),
+      { label: 'daily_summary', confidence: 0.9 },
+      { audience: ownerAudience },
+    );
+    expect(r.selected_skill_id).toBe('daily_business_summary');
+    expect(r.candidate_skill_ids).toEqual(['daily_business_summary']);
+    // Audited as allowed.
+    const allowed = auditMock.mock.calls.find((c) => c[0].acao === 'skill_allowed');
+    expect(allowed).toBeTruthy();
+    expect(allowed?.[0].metadata.skill_id).toBe('daily_business_summary');
+  });
+
+  it('#409 — daily_business_summary is BLOCKED for customer (removed + audited)', async () => {
+    const deps = mkDeps([
+      mkSkill({
+        id: 'daily_business_summary',
+        category: 'tool_mediated',
+        priority: 5,
+        applicable_to_intent: ['daily_summary'],
+        when_to_use: 'When the owner asks how the business day went.',
+        usage_policy: DAILY_BUSINESS_SUMMARY as unknown as Record<string, unknown>,
+      }),
+    ]);
+    const selector = new SkillSelectorImpl(deps);
+    const r = await selector.select(
+      mkBase(),
+      { label: 'daily_summary', confidence: 0.9 },
+      { audience: customerAudience },
+    );
+    // No safe skill → empty selection (fail-closed) → ActionDecider responds.
+    expect(r.selected_skill_id).toBeUndefined();
+    expect(r.candidate_skill_ids).toEqual([]);
+    const blocked = auditMock.mock.calls.find(
+      (c) => c[0].acao === 'skill_blocked_by_audience',
+    );
+    expect(blocked).toBeTruthy();
+    expect(blocked?.[0].metadata.skill_id).toBe('daily_business_summary');
+    expect(blocked?.[0].metadata.audience_type).toBe('customer');
+  });
+
+  it('#409 — an unknown audience is blocked from a policy-less skill (conservative default)', async () => {
+    const deps = mkDeps([
+      mkSkill({
+        id: 's_no_policy',
+        category: 'tool_mediated',
+        priority: 5,
+        applicable_to_intent: ['daily_summary'],
+        when_to_use: 'When the owner asks how the business day went.',
+        // No usage_policy → conservative internal-only default applies.
+      }),
+    ]);
+    const selector = new SkillSelectorImpl(deps);
+    const unknownAudience: SkillSelectorAudience = {
+      audience_type: 'unknown',
+      trust_level: 'unknown',
+      channel_type: 'whatsapp',
+      allowed_data_scope: allowedDataScopesForAudience('unknown', 'unknown'),
+    };
+    const r = await selector.select(
+      mkBase(),
+      { label: 'daily_summary', confidence: 0.9 },
+      { audience: unknownAudience },
+    );
+    expect(r.selected_skill_id).toBeUndefined();
+    expect(r.candidate_skill_ids).toEqual([]);
+    // Conservative default blocks an unknown audience (not in internal allow-list).
+    expect(
+      auditMock.mock.calls.some((c) => c[0].acao === 'skill_blocked_by_audience'),
+    ).toBe(true);
+  });
+
+  it('#409 — an unauthorized channel removes the candidate (channel_blocked)', async () => {
+    const channelScoped: SkillUsagePolicy = {
+      allowed_audience: ['owner'],
+      allowed_channels: ['whatsapp'],
+      data_scope: ['internal_business_summary'],
+      exposure_policy: 'internal_only',
+      requires_auth_level: 'trusted_internal',
+      requires_confirmation: false,
+    };
+    const deps = mkDeps([
+      mkSkill({
+        id: 's_channel',
+        category: 'tool_mediated',
+        priority: 5,
+        applicable_to_intent: ['daily_summary'],
+        when_to_use: 'When the owner asks how the business day went.',
+        usage_policy: channelScoped as unknown as Record<string, unknown>,
+      }),
+    ]);
+    const selector = new SkillSelectorImpl(deps);
+    const r = await selector.select(
+      mkBase(),
+      { label: 'daily_summary', confidence: 0.9 },
+      {
+        audience: {
+          audience_type: 'owner',
+          trust_level: 'trusted_internal',
+          channel_type: 'web', // NOT whatsapp
+          allowed_data_scope: allowedDataScopesForAudience('owner', 'trusted_internal'),
+        },
+      },
+    );
+    expect(r.selected_skill_id).toBeUndefined();
+    expect(
+      auditMock.mock.calls.some((c) => c[0].acao === 'skill_blocked_by_channel'),
+    ).toBe(true);
+  });
+
+  it('#409 — keeps the SAFE candidate and drops the unsafe one for a customer', async () => {
+    const customerSkill: SkillUsagePolicy = {
+      allowed_audience: ['customer'],
+      data_scope: ['own_customer_data_only'],
+      exposure_policy: 'subject_only',
+      requires_auth_level: 'known_external',
+      requires_confirmation: false,
+    };
+    const deps = mkDeps([
+      mkSkill({
+        id: 'daily_business_summary',
+        category: 'tool_mediated',
+        priority: 100, // ranks first, but is blocked for customer
+        applicable_to_intent: ['my_orders'],
+        when_to_use: 'Show my recent orders and account status.',
+        usage_policy: DAILY_BUSINESS_SUMMARY as unknown as Record<string, unknown>,
+      }),
+      mkSkill({
+        id: 'my_account',
+        category: 'tool_mediated',
+        priority: 1,
+        applicable_to_intent: ['my_orders'],
+        when_to_use: 'Show my recent orders and account status.',
+        usage_policy: customerSkill as unknown as Record<string, unknown>,
+      }),
+    ]);
+    const selector = new SkillSelectorImpl(deps);
+    const r = await selector.select(
+      mkBase(),
+      { label: 'my_orders', confidence: 0.9 },
+      { audience: customerAudience },
+    );
+    // The high-priority internal skill is removed; the safe customer skill wins.
+    expect(r.candidate_skill_ids).toEqual(['my_account']);
+    expect(r.selected_skill_id).toBe('my_account');
+  });
+
+  it('#409 — a MALFORMED usage_policy fails closed (skill removed)', async () => {
+    const deps = mkDeps([
+      mkSkill({
+        id: 's_malformed',
+        category: 'tool_mediated',
+        priority: 5,
+        applicable_to_intent: ['daily_summary'],
+        when_to_use: 'When the owner asks how the business day went.',
+        usage_policy: { allowed_audience: [] }, // invalid (≥1 required)
+      }),
+    ]);
+    const selector = new SkillSelectorImpl(deps);
+    const r = await selector.select(
+      mkBase(),
+      { label: 'daily_summary', confidence: 0.9 },
+      { audience: ownerAudience },
+    );
+    expect(r.selected_skill_id).toBeUndefined();
+    expect(r.candidate_skill_ids).toEqual([]);
+  });
+
+  it('#409 — when NO audience is supplied the filter is skipped (legacy contract)', async () => {
+    const deps = mkDeps([
+      mkSkill({
+        id: 'daily_business_summary',
+        category: 'tool_mediated',
+        priority: 5,
+        applicable_to_intent: ['daily_summary'],
+        when_to_use: 'When the owner asks how the business day went.',
+        usage_policy: DAILY_BUSINESS_SUMMARY as unknown as Record<string, unknown>,
+      }),
+    ]);
+    const selector = new SkillSelectorImpl(deps);
+    const r = await selector.select(mkBase(), {
+      label: 'daily_summary',
+      confidence: 0.9,
+    });
+    // No audience → no early filter → selection proceeds (runner gate 4.6 is the
+    // fail-closed backstop). No usage-policy audit emitted.
+    expect(r.selected_skill_id).toBe('daily_business_summary');
+    expect(
+      auditMock.mock.calls.some((c) =>
+        String(c[0].acao).startsWith('skill_'),
+      ),
+    ).toBe(false);
   });
 });

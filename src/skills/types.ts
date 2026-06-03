@@ -8,6 +8,7 @@
  */
 import type { SkillRow, SkillRuntimeHints } from '@/db/schema.js';
 import type { SkillExecutionMode } from '@/types/enums.js';
+import type { AudienceType, DataScope, TrustLevel } from '@/shared/audience.js';
 
 /**
  * Triggered_by alinha com o vocabulário de `RunModuleOptions.triggered_by`
@@ -56,6 +57,29 @@ export interface SkillExecutionInput {
    */
   expected_skill_id?: string;
   expected_skill_version?: number;
+  /**
+   * Issue #409 — the resolved audience/channel/data_scope/risk this turn is
+   * served to. When set, the runner's gate ~4.6 RE-EVALUATES the skill's
+   * `usage_policy` against it (fail-closed), closing the TOCTOU between
+   * candidate selection and execution. Absent ⇒ gate 4.6 is skipped (legacy
+   * callers / non-audience contexts); the early candidate filter remains the
+   * primary enforcement and this gate is the defense-in-depth re-check.
+   */
+  audience?: SkillRunnerAudience;
+}
+
+/**
+ * Issue #409 — narrow projection of the resolved AudienceContext (#407) + the
+ * turn channel + data-scope + risk, fed to the SkillRunner gate 4.6 to
+ * re-evaluate a skill's `usage_policy`. Structurally identical to
+ * `UsagePolicyEvalContext` in `src/skills/usage-policy.ts`.
+ */
+export interface SkillRunnerAudience {
+  audience_type: AudienceType;
+  trust_level: TrustLevel;
+  channel_type: string;
+  allowed_data_scope?: readonly DataScope[];
+  risk_level?: 'low' | 'medium' | 'high' | 'critical';
 }
 
 export type SkillFailureReason =
@@ -70,7 +94,17 @@ export type SkillFailureReason =
   | 'invalid_output'
   | 'executor_error'
   | 'identity_mismatch'
-  | 'timeout';
+  | 'timeout'
+  // Issue #409 — SkillUsagePolicy execution gate (skill-runner gate ~4.6).
+  // Fail-closed reasons emitted when the LATE re-evaluation of the skill's
+  // usage policy against the resolved audience refuses execution (closing the
+  // TOCTOU window between selection and execution). 1:1 with the
+  // `skill_blocked_by_*` AUDIT_ACTIONS.
+  | 'audience_blocked'
+  | 'channel_blocked'
+  | 'data_scope_blocked'
+  | 'auth_level_insufficient'
+  | 'risk_blocked';
 
 export interface SkillExecutionTrace {
   mode: SkillExecutionMode | null;

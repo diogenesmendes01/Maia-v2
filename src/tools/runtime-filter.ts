@@ -35,12 +35,34 @@ import {
 import { agentToolGrantsRepo } from '@/db/repositories.js';
 import { audit } from '@/governance/audit.js';
 import { logger } from '@/lib/logger.js';
+import {
+  evaluateUsagePolicy,
+  resolveEffectiveUsagePolicy,
+  type UsagePolicyEvalContext,
+} from '@/skills/usage-policy.js';
 
 export interface RuntimeToolFilterInput {
   /** Per-entity resolved permissions (the HUMAN axis), as in `getToolSchemas`. */
   byEntity: Map<string, ResolvedPermission>;
   /** Optional skill scope (the SKILL axis) when a skill is selected this turn. */
   skillScope?: SkillToolScope | null;
+  /**
+   * Issue #409 — the #408-documented hook. When a `skillScope` is supplied for a
+   * selected skill AND this audience is supplied, the filter re-checks the
+   * skill's `usage_policy` against the audience. If the skill is NOT admitted,
+   * its scope is DROPPED — the blocked skill contributes NO tool narrowing and,
+   * more importantly, the dropped scope means the LLM never sees tools that were
+   * only there because of a skill it may not use. (In the engine path a blocked
+   * skill is never selected, so its scope never reaches here; this is the
+   * defense-in-depth re-check at the visibility boundary.)
+   */
+  audience?: UsagePolicyEvalContext | null;
+  /**
+   * The selected skill's raw `usage_policy` JSONB (paired with `audience`). When
+   * absent the conservative default is evaluated (so a policy-less skill scope
+   * is only applied for internal/trusted audiences).
+   */
+  skillUsagePolicy?: Record<string, unknown> | null;
   /** Audit correlation — emitted on the `tool_visibility_resolved` row. */
   audit_context?: {
     pessoa_id?: string;
@@ -93,7 +115,28 @@ export async function computeRuntimeVisibleTools(
   input: RuntimeToolFilterInput,
 ): Promise<RuntimeToolFilterResult> {
   const grant = await resolveEffectiveGrant();
-  const composed = computeAgentVisibleTools(grant, input.skillScope ?? null);
+
+  // Issue #409 hook: when a skill scope is present AND an audience is supplied,
+  // re-check the skill's usage_policy. A skill NOT admitted for this audience
+  // contributes NO scope (dropped) — its tools never reach the LLM via a skill
+  // the audience may not use. Fail-closed: a malformed policy drops the scope.
+  let effectiveSkillScope = input.skillScope ?? null;
+  let skillBlockedReason: string | null = null;
+  if (effectiveSkillScope && input.audience) {
+    const resolved = resolveEffectiveUsagePolicy(input.skillUsagePolicy ?? null);
+    if (!resolved.ok) {
+      skillBlockedReason = `malformed_usage_policy: ${resolved.error}`;
+      effectiveSkillScope = null;
+    } else {
+      const decision = evaluateUsagePolicy(resolved.policy, input.audience);
+      if (!decision.allowed) {
+        skillBlockedReason = `${decision.reason}: ${decision.detail}`;
+        effectiveSkillScope = null;
+      }
+    }
+  }
+
+  const composed = computeAgentVisibleTools(grant, effectiveSkillScope);
 
   // Apply the HUMAN-permission + feature-flag filters over the agent ∩ skill
   // visible set (the registry projection).
@@ -117,6 +160,10 @@ export async function computeRuntimeVisibleTools(
         visible_tools: [...finalNames],
         ...composed.provenance,
         requires_confirmation,
+        // Issue #409 — record when a skill scope was DROPPED because the skill's
+        // usage_policy did not admit the audience (defense-in-depth at the
+        // visibility boundary). null when no skill scope was dropped.
+        skill_scope_dropped_reason: skillBlockedReason,
       },
     });
   } catch (err) {

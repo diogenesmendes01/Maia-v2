@@ -129,6 +129,14 @@ export interface ExecuteSelectedSkillArgs {
   /** Aggregated inbound text for this (possibly debounced) turn. */
   aggregatedText: string;
   signal?: AbortSignal;
+  /**
+   * Issue #409 — the resolved audience/channel/data_scope/risk for this turn.
+   * Forwarded to `runSkill` so the SkillRunner gate 4.6 RE-EVALUATES the skill's
+   * `usage_policy` against it (fail-closed, closing the TOCTOU between selection
+   * and execution). Optional: absent ⇒ gate 4.6 is skipped (the early candidate
+   * filter remains the primary enforcement).
+   */
+  audience?: SkillExecutionInput['audience'];
 }
 
 /**
@@ -339,6 +347,9 @@ export async function executeSelectedSkill(
     expected_skill_id: pinned.selected_skill_id,
     expected_skill_version: pinned.selected_skill_version,
     ...(args.signal ? { signal: args.signal } : {}),
+    // Issue #409 — forward the resolved audience so gate 4.6 re-evaluates the
+    // skill's usage_policy at execution time (fail-closed TOCTOU re-check).
+    ...(args.audience ? { audience: args.audience } : {}),
   };
 
   // Contract 3 (item 1, Codex #216 review): runSkill must never throw past

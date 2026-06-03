@@ -2359,6 +2359,13 @@ export const skills = pgTable(
 
     runtime_hints: jsonb('runtime_hints').notNull().default(sql`'{}'::jsonb`),
 
+    // Issue #409 — native, typed SkillUsagePolicy (Zod-validated in
+    // src/skills/usage-policy.ts). NULLABLE: NULL/`{}` = the conservative
+    // internal-only default (resolved in code), so an operator must OPT IN to
+    // expose a skill to external audiences. COMPLEMENTS (never replaces)
+    // `constraints` / `policy_descriptors` above.
+    usage_policy: jsonb('usage_policy'),
+
     status: text('status').notNull().default('proposed'),
     version: integer('version').notNull(),
     proposed_by: text('proposed_by').notNull(),
@@ -2441,6 +2448,14 @@ export interface SkillContract {
   success_criteria?: Array<Record<string, unknown>>;
   failure_modes?: Array<Record<string, unknown>>;
   runtime_hints?: SkillRuntimeHints;
+  /**
+   * Issue #409 — native SkillUsagePolicy (audience/channel/data_scope/exposure/
+   * auth/confirmation/risk). Typed structurally here (a `Record`) to keep this
+   * foundational module import-cycle-free; the canonical Zod contract +
+   * `SkillUsagePolicy` type live in `src/skills/usage-policy.ts`. Absent ⇒
+   * conservative internal-only default at runtime.
+   */
+  usage_policy?: Record<string, unknown> | null;
 }
 
 // =====================================================================
