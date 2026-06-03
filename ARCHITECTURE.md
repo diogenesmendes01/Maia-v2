@@ -143,6 +143,7 @@ Every `src/` subdirectory has a one-line role here and a deep-dive module doc.
 | **Action layer** | How decisions become side-effects; spans `skills` + `tools` + `procedures` + `runtime/decision-engine` | [action-layer.md](docs/architecture/concerns/action-layer.md) |
 | **Channel / Role / Policy** | How messages enter and reach the right agent; spans `gateway` + `channel_policies` + `roles` | [channel-policy.md](docs/architecture/concerns/channel-policy.md) |
 | **Governance + Observability** | Rules, audit, metrics, trace, drift; spans `governance` + `control-plane` + `admin-ui` | [governance-observability.md](docs/architecture/concerns/governance-observability.md) |
+| **Capability taxonomy** | How baseline, channel behavior, role, skill, tool, pack/grant, and policy compose into the effective behavior + visible/executable tools for a turn; spans `roles` + `skills` + `tools` + `governance` + `runtime/decision` | [capability-taxonomy.md](docs/architecture/concerns/capability-taxonomy.md) |
 
 **Rule of thumb when concerns overlap:** the doc that describes how something is **produced** lives in one concern (e.g., drift detection is computed in `cognitive-stack`). The doc that describes how it is **gated, approved, or audited** lives in `governance-observability`. Drift alerts that surface in admin-ui are governance; the detector that emits them is cognitive.
 
