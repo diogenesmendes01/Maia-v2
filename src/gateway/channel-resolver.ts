@@ -89,9 +89,24 @@ export async function resolveChannel(args: {
   //    telefone do REMETENTE — então o exact match sempre falha. Em vez de
   //    derrubar a mensagem (o bug #411), resolvemos para o canal catch-all
   //    `default/default` SE — e somente se — o deployment é comprovadamente
-  //    single-tenant. `findDefaultCatchAllChannel` retorna `multi_tenant:true`
-  //    assim que existe QUALQUER canal ativo de outro tenant; nesse caso
-  //    caímos no fail-loud do #268 (throw), preservando o isolamento.
+  //    single-tenant.
+  //
+  //    [🔴 CRITICAL fix #417] O discriminador "é multi-tenant?" é GLOBAL —
+  //    olha QUALQUER canal ativo de tenant != 'default' em TODOS os
+  //    channel_types (antes filtrava por channel_type, escondendo um tenant
+  //    real cujo canal era de outro tipo → vazamento cross-tenant). Assim que
+  //    existe um tenant real, `findDefaultCatchAllChannel` retorna
+  //    `multi_tenant:true` e caímos no fail-loud do #268 (throw), preservando
+  //    o isolamento.
+  //
+  //    [🟠 HIGH fix #417 — TOCTOU] O discriminador GLOBAL e a busca do
+  //    catch-all rodam dentro de UMA transação (`withTx`) no repo, num snapshot
+  //    consistente: um tenant que ative seu primeiro canal entre as duas
+  //    leituras não escapa mais pela janela. O exact-match (passo 1) é uma
+  //    leitura anterior separada, mas a direção é segura — uma ativação entre o
+  //    passo 1 e este passo só torna o resultado MAIS fail-closed (o
+  //    discriminador passa a ver o tenant real e lança). Risco residual
+  //    documentado em `findDefaultCatchAllChannel`.
   const catchAll = await channelsRepo.findDefaultCatchAllChannel({
     channel_type: args.channel_type,
   });

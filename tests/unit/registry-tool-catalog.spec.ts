@@ -35,13 +35,12 @@ vi.mock('../../src/gateway/baileys.js', () => ({
 function configAllFlagsOff() {
   return {
     config: {
-      // PR #406 completed the teardown: the only config-gated tool flag left is
-      // the PRODUCT flag FEATURE_PDF_REPORTS. KSM / CALENDAR_V2 / SCHEDULING_V2 /
-      // SKILL_REGISTRY_V1 env fields were REMOVED (those tools are now
-      // unconditionally enabled). MULTI_CHANNEL survives as an enum flag (read
-      // by the feature-flags singleton); COGNITIVE_GRAPH was removed in #412.
+      // unconditionally enabled). Both former enum flags are gone too:
+      // MULTI_CHANNEL was removed in #411 (single-tenant catch-all) and
+      // COGNITIVE_GRAPH in #412 (graph always-on), so neither is read by the
+      // tool registry anymore — only the PRODUCT flag FEATURE_PDF_REPORTS gates
+      // a tool here.
       FEATURE_PDF_REPORTS: false,
-      FEATURE_MULTI_CHANNEL: false,
     },
   };
 }

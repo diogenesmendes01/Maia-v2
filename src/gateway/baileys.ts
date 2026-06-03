@@ -434,7 +434,9 @@ async function resolveTenantCtxForUpsert(
       logger.debug(
         {
           raw_jid: jid_context.raw_jid,
-          whatsapp_id: msg.key.id ?? null,
+          // [🟠 MEDIUM fix #417] optional-chain `msg.key` — a malformed/no-key
+          // envelope must not throw a raw TypeError here.
+          whatsapp_id: msg.key?.id ?? null,
         },
         'baileys.lid_fallback_resolved',
       );
@@ -455,7 +457,12 @@ async function resolveTenantCtxForUpsert(
         // mensagem_id intentionally null — the inbound was NOT persisted
         // (we audit BEFORE createInbound runs). whatsapp_id is the only
         // stable handle the operator has for triage.
-        whatsapp_id: msg.key.id ?? null,
+        // [🟠 MEDIUM fix #417] optional-chain `msg.key`: a malformed/no-key
+        // envelope reaches this catch (resolveScopeForJid(null) fails closed);
+        // a raw `msg.key.id` deref here would throw a TypeError that escapes as
+        // an opaque `baileys.handle_failed`, BYPASSING this intended
+        // `channel_resolution_failed` audit.
+        whatsapp_id: msg.key?.id ?? null,
         raw_jid: jid,
         error_code: isResolutionFailure
           ? 'channel_resolution_failed'
@@ -472,7 +479,8 @@ async function resolveTenantCtxForUpsert(
       {
         err: (err as Error).message,
         err_code: typed?.code,
-        whatsapp_id: msg.key.id ?? null,
+        // [🟠 MEDIUM fix #417] optional-chain `msg.key` (see audit above).
+        whatsapp_id: msg.key?.id ?? null,
         raw_jid: jid,
       },
       'baileys.channel_resolution_failed_drop',

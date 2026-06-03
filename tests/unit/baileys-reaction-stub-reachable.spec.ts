@@ -86,7 +86,9 @@ vi.mock('../../src/config/env.js', () => ({
 }));
 
 vi.mock('../../src/config/feature-flags.js', () => ({
-  // COGNITIVE_GRAPH off (the only flag still read); MULTI_CHANNEL removed (#411).
+  // Both toggles are gone (MULTI_CHANNEL #411, COGNITIVE_GRAPH #412) — the enum
+  // is empty and no production code reads a flag here. `isEnabled` defaults to
+  // false, mirroring the empty singleton.
   featureFlags: { isEnabled: vi.fn(() => false) },
 }));
 

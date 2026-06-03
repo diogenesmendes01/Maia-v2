@@ -78,10 +78,12 @@ vi.mock('@/gateway/channel-resolver.js', () => ({
   resolveChannel: resolveChannelMock,
 }));
 
-// MULTI_CHANNEL removed (#411). The only flag core.ts still reads is
-// COGNITIVE_GRAPH; keep it OFF so these specs exercise the legacy (non-graph)
-// pre-turn path — the resolver/adoption behavior under test is identical
-// either way.
+// Both toggles are gone (MULTI_CHANNEL #411, COGNITIVE_GRAPH #412): core.ts no
+// longer reads any feature flag and the cognitive graph always runs. This mock
+// of the (now-empty) singleton is retained only because core.ts's module graph
+// still resolves it transitively; the resolver/adoption behavior under test is
+// independent of it. The pre-turn graph is mocked separately below (runNodes /
+// buildPreturnNodes), so these specs focus purely on channel resolution.
 vi.mock('@/config/feature-flags.js', () => ({
   featureFlags: {
     isEnabled: vi.fn(() => false),
@@ -591,6 +593,68 @@ describe('runAgentForMensagem — channel resolution (#268 fail-loud + #411 catc
     expect(runWithTenantContextMock.mock.calls[0]![0]).toEqual({
       tenant_id: 'default',
       agent_id: 'default',
+    });
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // [🔴 HIGH fix #417] probe DB read FAILURE must fail-closed (NOT collapse to
+  // default/default). Before the fix, `probeMessageForChannel`'s blanket
+  // `catch { return null }` mapped a transient DB error to the SAME null used
+  // for "no telefone". Since the resolver only runs when the probe is truthy, a
+  // DB error skipped resolver + adoption and routed a possibly-multi-tenant
+  // message straight to the `default/default` bucket — a silent #268 violation.
+  //
+  // This negative spec drives the probe's `db.select()...limit()` to REJECT and
+  // asserts: (a) we do NOT silently process under default/default; (b) the
+  // error propagates (BullMQ retry/DLQ); (c) a `channel_resolution_failed`
+  // audit is emitted with the distinguishable `channel_probe_failed` code; and
+  // (d) the resolver is never consulted (no tenant was resolved).
+  // ──────────────────────────────────────────────────────────────────────────
+  it('#417 HIGH: probe com ERRO DE DB → fail-closed (propaga, audita channel_probe_failed, NÃO cai em default/default)', async () => {
+    // The probe's metadata read is the FIRST (and here only) `.limit()` call —
+    // make it reject (DB blip). Persisted (not Once) so a single invocation
+    // can't accidentally fall through to a stale default.
+    probeQueryMock.mockReset();
+    const dbErr = new Error('connection terminated unexpectedly');
+    probeQueryMock.mockRejectedValue(dbErr);
+
+    const { TypedError } = await import('@/lib/utils.js');
+    const { runAgentForMensagem } = await import('@/agent/core.js');
+
+    // (b) the error propagates — the worker fails the job (retry/DLQ), it does
+    //     NOT swallow the failure and continue. Capture it once and assert both
+    //     the type and the distinguishable code.
+    let caught: unknown;
+    try {
+      await runAgentForMensagem('msg1');
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(TypedError);
+    expect((caught as { code?: string }).code).toBe('channel_probe_failed');
+
+    // (d) the resolver was never reached — a DB error must not be confused with
+    //     "no telefone" (which would skip the resolver legitimately).
+    expect(resolveChannelMock).not.toHaveBeenCalled();
+
+    // (a) fail-closed: we never entered a tenant context (no silent
+    //     default/default routing) and never adopted anything.
+    expect(runWithTenantContextMock).not.toHaveBeenCalled();
+    expect(adoptToResolvedTenantMock).not.toHaveBeenCalled();
+
+    // (c) a fail-closed audit is emitted, distinguishable from a resolver miss
+    //     by the `channel_probe_failed` error_code.
+    const failedAudits = auditMock.mock.calls.filter(
+      (call) => call[0]?.acao === 'channel_resolution_failed',
+    );
+    expect(failedAudits.length).toBeGreaterThanOrEqual(1);
+    const auditPayload = failedAudits[0]![0];
+    expect(auditPayload.mensagem_id).toBe('msg1');
+    expect(auditPayload.metadata.error_code).toBe('channel_probe_failed');
+    // The probe never produced a telefone, so probe context is null.
+    expect(auditPayload.metadata.probe_external_id).toBeNull();
+    expect(auditPayload.metadata.resolver_details).toMatchObject({
+      resolver_path: 'probe_db_error',
     });
   });
 });

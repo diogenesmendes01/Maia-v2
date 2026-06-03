@@ -380,6 +380,46 @@ describe('baileys messages.upsert — runs handleIncoming inside RESOLVED tenant
     ).toBe('jid_unparseable');
   });
 
+  it('🟠 MEDIUM (#417): malformed envelope with NO key → fail-closed audit (channel_resolution_failed), NOT an opaque handle_failed crash', async () => {
+    // A content envelope that is missing `msg.key` entirely. The upsert loop
+    // does NOT skip it (it has `message` content), so it reaches
+    // resolveTenantCtxForUpsert. There `jid = msg.key?.remoteJid ?? null` → null
+    // → resolveScopeForJid(null) fails closed → the catch builds the audit. The
+    // bug this guards: the audit/log path dereferenced `msg.key.id` directly, so
+    // a no-key envelope threw a TypeError that escaped as `baileys.handle_failed`
+    // — BYPASSING the intended channel_resolution_failed audit. With
+    // `msg.key?.id` the audit is emitted cleanly with whatsapp_id: null.
+    const { startBaileys } = await import('@/gateway/baileys.js');
+    await startBaileys();
+
+    // No `key` property at all — only content.
+    const noKeyMsg = {
+      messageTimestamp: Math.floor(Date.now() / 1000),
+      message: { conversation: 'olá sem key' },
+      pushName: 'Cliente',
+    };
+
+    // Must NOT throw out of the handler (the deref bug would crash the audit).
+    await expect(
+      handlerState.upsertHandler!({ messages: [noKeyMsg] }),
+    ).resolves.toBeUndefined();
+
+    // No tenant resolution, no inbound persisted.
+    expect(findByExternalCrossTenantMock).not.toHaveBeenCalled();
+    expect(createInboundMock).not.toHaveBeenCalled();
+
+    // The intended fail-closed audit IS emitted (it was bypassed before the fix).
+    const failedAudits = auditMock.mock.calls.filter(
+      (call) => (call[0] as { acao?: string })?.acao === 'channel_resolution_failed',
+    );
+    expect(failedAudits).toHaveLength(1);
+    const md = (failedAudits[0]![0] as { metadata: Record<string, unknown> }).metadata;
+    // whatsapp_id safely null (no key) instead of throwing a TypeError.
+    expect(md.whatsapp_id).toBeNull();
+    expect(md.raw_jid).toBeNull();
+    expect(md.emitter).toBe('baileys_ingress');
+  });
+
   it('group JID (@g.us) → audit + drop with resolver_path=jid_unparseable (defense in depth)', async () => {
     const { startBaileys } = await import('@/gateway/baileys.js');
     await startBaileys();

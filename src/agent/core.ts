@@ -166,27 +166,53 @@ export const _internal = { scheduleTypingDebounce, sendOutbound, aggregateUnproc
  * `channelsRepo.findByExternalCrossTenant` — entry point precisa descobrir
  * qual tenant antes de poder operar dentro dele).
  *
- * Retorna apenas o suficiente para chamar `resolveChannel`. Qualquer falha
- * (mensagem ausente, sem `metadata.telefone`, erro de DB) devolve null —
- * o caller cai em legacy default/default.
+ * Retorna apenas o suficiente para chamar `resolveChannel`.
+ *
+ * ── [🔴 HIGH fix #417] distinguir "sem telefone" de "erro de DB" ───────────
+ * `null` significa EXCLUSIVAMENTE "não há telefone para resolver" (linha
+ * ausente ou `metadata.telefone` vazio). Esse é o ÚNICO caso que legitimamente
+ * preserva o legacy `default/default` (o inner retorna cedo para mensagens sem
+ * telefone, sem nunca resolver tenant nenhum).
+ *
+ * Um ERRO DE DB no probe NÃO pode colapsar para `null` — antes deste fix, o
+ * blanket `catch { return null }` mapeava uma falha transitória de leitura para
+ * o mesmo `null` de "sem telefone". Como o caller só roda o resolver quando o
+ * probe é truthy, uma falha de DB pulava resolver+adoção e roteava uma mensagem
+ * POSSIVELMENTE multi-tenant para o bucket `default/default` — silenciosamente
+ * violando o fail-closed (#268). Agora um erro de DB é re-lançado como
+ * `TypedError('channel_probe_failed')`: o caller audita `channel_resolution_failed`
+ * e re-lança → BullMQ aplica retry/DLQ (fail-closed).
  */
 async function probeMessageForChannel(
   mensagem_id: string,
 ): Promise<{ channel_type: 'whatsapp'; external_id: string } | null> {
+  let rows: Array<{ metadata: unknown }>;
   try {
-    const rows = await db
+    rows = await db
       .select({ metadata: mensagens.metadata })
       .from(mensagens)
       .where(eq(mensagens.id, mensagem_id))
       .limit(1);
-    if (rows.length === 0) return null;
-    const md = (rows[0]!.metadata ?? {}) as Record<string, unknown>;
-    const tel = typeof md['telefone'] === 'string' ? (md['telefone'] as string) : null;
-    if (!tel) return null;
-    return { channel_type: 'whatsapp', external_id: tel };
-  } catch {
-    return null;
+  } catch (err) {
+    // DB read failure — fail-closed. Do NOT collapse to the "no telefone" null;
+    // that would route a possibly-multi-tenant message to default/default.
+    throw new TypedError(
+      'channel_probe_failed',
+      'failed to read mensagens.metadata for channel probe (DB error) — failing closed',
+      {
+        mensagem_id,
+        resolver_path: 'probe_db_error',
+        cause: (err as Error).message,
+      },
+    );
   }
+  // Below this point: a successful read. `null` now means strictly "no telefone
+  // to resolve" → caller keeps legacy default/default (inner returns early).
+  if (rows.length === 0) return null;
+  const md = (rows[0]!.metadata ?? {}) as Record<string, unknown>;
+  const tel = typeof md['telefone'] === 'string' ? (md['telefone'] as string) : null;
+  if (!tel) return null;
+  return { channel_type: 'whatsapp', external_id: tel };
 }
 
 /**
@@ -241,6 +267,12 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
   //     seguimos: o inner (`runAgentForMensagemInner`) já trata o caso "sem
   //     telefone" retornando cedo. Mesmo comportamento do path legacy
   //     single-tenant pré-#411 para mensagens sem telefone.
+  //   - probe LANÇA (erro de DB → `TypedError('channel_probe_failed')`)
+  //     [🔴 HIGH fix #417]: NÃO colapsa para default/default. Cai no catch
+  //     abaixo → audita `channel_resolution_failed` (error_code:
+  //     channel_probe_failed) → re-lança → BullMQ retry/DLQ (fail-closed). Antes
+  //     deste fix uma falha transitória de DB no probe virava `null` e roteava
+  //     uma mensagem possivelmente multi-tenant para o bucket default/default.
   let resolved: { tenant_id: string; agent_id: string; channel_id: string | null } = {
     tenant_id: 'default',
     agent_id: 'default',
