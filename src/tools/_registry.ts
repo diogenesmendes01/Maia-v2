@@ -50,6 +50,29 @@ import { requestConfirmationTool } from './request-confirmation.js';
 import { handoffToOwnerTool } from './handoff-to-owner.js';
 import { auditDecisionTool } from './audit-decision.js';
 import { explainLimitationTool } from './explain-limitation.js';
+// Issue #416 — boleto proposal vertical tools (catalog entries; grouped into
+// packs in src/tools/grant-math.ts, governed by write/risk policies in
+// migration 078). The three write tools (boleto_cancel, company_campaign_remove,
+// refund_create) are side_effect:'write' and flow through the dispatcher guard.
+import { companyIdentityResolverTool } from './company-identity-resolver.js';
+import { companySearchTool } from './company-search.js';
+import { companyHistoryLookupTool } from './company-history-lookup.js';
+import { companyBlacklistCheckTool } from './company-blacklist-check.js';
+import { boletoSearchTool } from './boleto-search.js';
+import { boletoCancelTool } from './boleto-cancel.js';
+import { ddaLookupTool } from './dda-lookup.js';
+import { paymentVerificationTool } from './payment-verification.js';
+import { campaignStatusLookupTool } from './campaign-status-lookup.js';
+import { companyCampaignRemoveTool } from './company-campaign-remove.js';
+import { conversationAttachmentLookupTool } from './conversation-attachment-lookup.js';
+import { receiptValidateTool } from './receipt-validate.js';
+import { bankAccountValidateTool } from './bank-account-validate.js';
+import { refundCreateTool } from './refund-create.js';
+import { refundLookupTool } from './refund-lookup.js';
+import { conversationSummaryGenerateTool } from './conversation-summary-generate.js';
+import { legalIntentDetectTool } from './legal-intent-detect.js';
+import { caseRiskClassifyTool } from './case-risk-classify.js';
+import { operationalTicketCreateTool } from './operational-ticket-create.js';
 
 export type ToolHandlerCtx = {
   pessoa: import('@/db/schema.js').Pessoa;
@@ -201,6 +224,29 @@ export const REGISTRY: Record<string, AnyTool> = {
   handoff_to_owner: handoffToOwnerTool as unknown as AnyTool,
   audit_decision: auditDecisionTool as unknown as AnyTool,
   explain_limitation: explainLimitationTool as unknown as AnyTool,
+  // Issue #416 — boleto proposal vertical. Always registered (no feature flag);
+  // visibility is governed by the #408 pack/grant chain + the #416 write/risk
+  // policies, NOT by presence in the registry. The three write tools pass the
+  // existing dispatcher guard + constitutionalCheck like any other write.
+  company_identity_resolver: companyIdentityResolverTool as unknown as AnyTool,
+  company_search: companySearchTool as unknown as AnyTool,
+  company_history_lookup: companyHistoryLookupTool as unknown as AnyTool,
+  company_blacklist_check: companyBlacklistCheckTool as unknown as AnyTool,
+  boleto_search: boletoSearchTool as unknown as AnyTool,
+  boleto_cancel: boletoCancelTool as unknown as AnyTool,
+  dda_lookup: ddaLookupTool as unknown as AnyTool,
+  payment_verification: paymentVerificationTool as unknown as AnyTool,
+  campaign_status_lookup: campaignStatusLookupTool as unknown as AnyTool,
+  company_campaign_remove: companyCampaignRemoveTool as unknown as AnyTool,
+  conversation_attachment_lookup: conversationAttachmentLookupTool as unknown as AnyTool,
+  receipt_validate: receiptValidateTool as unknown as AnyTool,
+  bank_account_validate: bankAccountValidateTool as unknown as AnyTool,
+  refund_create: refundCreateTool as unknown as AnyTool,
+  refund_lookup: refundLookupTool as unknown as AnyTool,
+  conversation_summary_generate: conversationSummaryGenerateTool as unknown as AnyTool,
+  legal_intent_detect: legalIntentDetectTool as unknown as AnyTool,
+  case_risk_classify: caseRiskClassifyTool as unknown as AnyTool,
+  operational_ticket_create: operationalTicketCreateTool as unknown as AnyTool,
 };
 
 /**

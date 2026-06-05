@@ -206,6 +206,34 @@ export const AUDIT_ACTIONS = [
   'skill_blocked_by_data_scope',
   'skill_blocked_by_risk',
   'skill_blocked_by_auth_level',
+  // Issue #416 — boleto proposal vertical tools. Each domain tool audits its
+  // own action label so the decision trail (invariant #4) records the read /
+  // write / analysis the agent performed for the WhatsApp boleto-proposta role.
+  // The three WRITE tools (boleto_cancelled / company_campaign_removed /
+  // refund_created) flow through the dispatcher guard + `constitutionalCheck`
+  // and are governed by `confirm_before_write_policy` (migration 078) — they do
+  // NOT decide confirmation themselves (taxonomy §3/§6). The read/analysis tools
+  // are conservative (no real external integration in this issue — handlers are
+  // contract-honouring stubs per the "out of scope: real integrations" note).
+  'company_identity_resolved',
+  'company_searched',
+  'company_history_looked_up',
+  'company_blacklist_checked',
+  'boleto_searched',
+  'boleto_cancelled',
+  'dda_looked_up',
+  'payment_verified',
+  'campaign_status_looked_up',
+  'company_campaign_removed',
+  'conversation_attachment_looked_up',
+  'receipt_validated',
+  'bank_account_validated',
+  'refund_created',
+  'refund_looked_up',
+  'conversation_summary_generated',
+  'legal_intent_detected',
+  'case_risk_classified',
+  'operational_ticket_created',
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];
@@ -255,6 +283,23 @@ export const ACTION_KEYS = [
   //   the baseline can grant escalation without granting external messaging.
   'save_safe_fact',
   'escalate_to_owner',
+  // Issue #416 — boleto proposal vertical action keys. The three sensitive
+  // WRITE tools each carry a GRANULAR permission key (distinct from the finance
+  // `create_transaction` / `cancel_transaction` keys) so the boleto-proposta
+  // role can be authorised for boleto/campaign/refund writes WITHOUT inheriting
+  // generic financial-transaction grants. `canAct` checks these in the
+  // dispatcher; `confirm_before_write_policy` (migration 078) composes on top.
+  // Read/analysis boleto tools require no action key (universal reads, like the
+  // baseline reads) — visibility is governed by pack grant + skill scope.
+  'cancel_boleto',
+  'remove_company_campaign',
+  'create_refund',
+  // `create_ticket`: granular permission for `operational_ticket_create`, an
+  // INTERNAL escalation (side_effect 'communication', like handoff_to_owner — it
+  // persists a ticket / hands off to a human queue). Kept distinct from the three
+  // customer-facing writes so the role can open escalation tickets, and so it is
+  // NOT captured by `confirm_before_write_policy` (scoped by tool name).
+  'create_ticket',
 ] as const;
 
 export type ActionKey = (typeof ACTION_KEYS)[number];
