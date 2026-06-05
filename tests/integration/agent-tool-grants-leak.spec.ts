@@ -105,7 +105,9 @@ dRaw('agent_tool_grants — raw SQL leak + uniqueness (#408)', () => {
 
 dRepo('agentToolGrantsRepo — ALS-scoped reads + default grant (#408)', () => {
   beforeAll(async () => {
-    pool = pool ?? new pg.Pool({ connectionString: process.env.TEST_DB_URL });
+    // Own pool. The dRaw block's afterAll already called pool.end(), so reusing
+    // it (`pool ?? …`) would hand back an ENDED pool and every connect() throws.
+    pool = new pg.Pool({ connectionString: process.env.TEST_DB_URL });
   });
   afterAll(async () => {
     await pool.end().catch(() => undefined);
