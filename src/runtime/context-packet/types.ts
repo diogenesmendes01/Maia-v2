@@ -51,6 +51,18 @@ export interface BaseContextPacket {
     received_at: string;
   };
   active_procedure_execution_id: string | null;
+  /**
+   * Issue #415/#416 — the turn's ACTIVE operational role key, resolved by the
+   * role-selector chain (`src/cognition/role-selector/`; LLM suggests, policy
+   * decides — taxonomy §3). This is NOT `actor.role` (which describes WHO is
+   * speaking); it is the agent's operational MODE for this turn. The Decision
+   * Engine threads it into the SkillSelector as `active_role_key` so the role →
+   * skill scope (`applicable_to_role`, taxonomy §2 step 5) admits a role-bound
+   * skill only on a matching role. Absent/undefined ⇒ role-agnostic turn (or the
+   * role-selector did not run): role-bound skills are not selected (fail-closed);
+   * skills with an empty `applicable_to_role` remain universal.
+   */
+  active_role_key?: string;
   feature_flags_snapshot: Record<string, boolean>;
   entered_at_ms: number;
   /**
