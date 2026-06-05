@@ -180,3 +180,4 @@ NEW shared prefixes — pick `max(existing)+1`.
 074 | 074_agent_audience_profiles.sql | agent audience profiles per-agent identity (issue 407)
 075 | 075_baseline_skills_seed.sql | baseline skills seed for runtime agents (issue 410)
 076 | 076_agent_tool_grants.sql | agent tool grants packs and denied tools (issue 408)
+077 | 077_skills_usage_policy.sql | skills usage policy by audience channel data scope risk (issue 409)

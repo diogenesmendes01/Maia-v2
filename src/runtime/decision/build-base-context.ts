@@ -13,6 +13,7 @@
 
 import type { BaseContextPacket } from '../context-packet/types.js';
 import type { Mensagem, Conversa, Pessoa } from '@/db/schema.js';
+import type { AudienceType, TrustLevel } from '@/shared/audience.js';
 
 export interface BuildBaseContextInput {
   inbound: Mensagem;
@@ -24,6 +25,15 @@ export interface BuildBaseContextInput {
   channel_id: string | null;
   /** Active procedure execution id, if any. */
   active_procedure_execution_id: string | null;
+  /**
+   * Issue #407/#409 — the resolved per-agent audience attribution
+   * (governance-derived, invariant #3). When provided, it populates
+   * `actor.audience_type` / `actor.trust_level` so the Decision Engine's
+   * SkillSelector candidate filter (#409) can admit/remove skills by audience.
+   * Absent ⇒ left undefined (the early filter is skipped; the runner gate 4.6
+   * remains the fail-closed backstop).
+   */
+  audience?: { audience_type: AudienceType; trust_level: TrustLevel } | null;
 }
 
 /**
@@ -33,8 +43,16 @@ export interface BuildBaseContextInput {
 export function buildBaseContextPacketFromTurn(
   input: BuildBaseContextInput,
 ): BaseContextPacket {
-  const { inbound, conversa, pessoa, tenant_id, agent_id, channel_id, active_procedure_execution_id } =
-    input;
+  const {
+    inbound,
+    conversa,
+    pessoa,
+    tenant_id,
+    agent_id,
+    channel_id,
+    active_procedure_execution_id,
+    audience,
+  } = input;
 
   const channelId = channel_id ?? 'default';
   const receivedAt = inbound.created_at?.toISOString() ?? new Date().toISOString();
@@ -62,6 +80,11 @@ export function buildBaseContextPacketFromTurn(
       pessoa_id: pessoa.id,
       role: 'end_user',
       is_authenticated: true,
+      // Issue #407/#409 — governance-derived audience attribution (invariant
+      // #3, never LLM-declared). Drives the SkillSelector usage-policy filter.
+      ...(audience
+        ? { audience_type: audience.audience_type, trust_level: audience.trust_level }
+        : {}),
     },
     input: {
       kind: inbound.tipo === 'texto' ? 'text'

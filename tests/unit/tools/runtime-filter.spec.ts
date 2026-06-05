@@ -123,4 +123,96 @@ describe('computeRuntimeVisibleTools — Runtime Tool Filter (#408)', () => {
     // The grant returned reflects the baseline fallback.
     expect(res.grant.granted_packs).toEqual(['baseline.core']);
   });
+
+  // ---------------------------------------------------------------------------
+  // Issue #409 — the #408-documented audience hook: a skill BLOCKED by its
+  // usage_policy for the audience contributes NO scope, so its tools never reach
+  // the LLM via a skill the audience may not use.
+  // ---------------------------------------------------------------------------
+
+  const ownerAudience = {
+    audience_type: 'owner' as const,
+    trust_level: 'trusted_internal' as const,
+    channel_type: 'whatsapp',
+    allowed_data_scope: ['financial_summary', 'public_info'] as const,
+  };
+  const customerAudience = {
+    audience_type: 'customer' as const,
+    trust_level: 'known_external' as const,
+    channel_type: 'whatsapp',
+    allowed_data_scope: ['own_customer_data_only', 'public_info'] as const,
+  };
+  const financeSkillPolicy = {
+    allowed_audience: ['owner', 'manager'],
+    blocked_audience: ['customer'],
+    data_scope: ['financial_summary'],
+    exposure_policy: 'internal_only',
+    requires_auth_level: 'trusted_internal',
+    requires_confirmation: false,
+  };
+
+  it('(#409) skill scope APPLIED when the audience is admitted → narrowed set', async () => {
+    grantState.grant = {
+      granted_packs: ['baseline.core', 'domain.finance'],
+      granted_tools: [],
+      denied_tools: [],
+    };
+    const res = await computeRuntimeVisibleTools({
+      byEntity: ownerByEntity,
+      skillScope: { skill_id: 'daily_business_summary', allowed_tools: ['query_balance'] },
+      audience: ownerAudience,
+      skillUsagePolicy: financeSkillPolicy,
+    });
+    // Owner is admitted → the skill allow-list narrows to query_balance.
+    expect(res.tools.map((t) => t.name)).toEqual(['query_balance']);
+  });
+
+  it('(#409) skill scope DROPPED when the audience is blocked → blocked-skill tools NOT exposed', async () => {
+    grantState.grant = {
+      granted_packs: ['baseline.core', 'domain.finance'],
+      granted_tools: [],
+      denied_tools: [],
+    };
+    const res = await computeRuntimeVisibleTools({
+      byEntity: ownerByEntity,
+      skillScope: { skill_id: 'daily_business_summary', allowed_tools: ['query_balance'] },
+      audience: customerAudience, // blocked_audience includes customer
+      skillUsagePolicy: financeSkillPolicy,
+      audit_context: { pessoa_id: 'p1', conversa_id: 'c1', mensagem_id: 'm1' },
+    });
+    const names = res.tools.map((t) => t.name);
+    // The skill scope was dropped (customer not admitted). The narrowing the
+    // skill would have imposed (allowed_tools=['query_balance']) is NOT applied,
+    // but critically the skill never FORCES query_balance into view because the
+    // dispatcher + grant still gate it. The provenance records the drop.
+    const row = auditMock.mock.calls.find(
+      (c) => (c[0] as { acao: string }).acao === 'tool_visibility_resolved',
+    );
+    expect(row).toBeTruthy();
+    const meta = (row![0] as { metadata: Record<string, unknown> }).metadata;
+    expect(typeof meta.skill_scope_dropped_reason).toBe('string');
+    expect(String(meta.skill_scope_dropped_reason)).toContain('audience_blocked');
+    // skill_id provenance is null because the scope was dropped before composing.
+    expect(meta.skill_id).toBeNull();
+    // The narrowed allow-list is gone, so the agent's full granted finance set is
+    // visible again (the skill no longer constrains it) — proving the blocked
+    // skill imposed NO scope.
+    expect(names).toContain('register_transaction');
+  });
+
+  it('(#409) a MALFORMED usage_policy drops the skill scope (fail-closed)', async () => {
+    grantState.grant = {
+      granted_packs: ['baseline.core', 'domain.finance'],
+      granted_tools: [],
+      denied_tools: [],
+    };
+    const res = await computeRuntimeVisibleTools({
+      byEntity: ownerByEntity,
+      skillScope: { skill_id: 's', allowed_tools: ['query_balance'] },
+      audience: ownerAudience,
+      skillUsagePolicy: { allowed_audience: [] }, // invalid
+    });
+    // Scope dropped → no narrowing applied.
+    expect(res.tools.map((t) => t.name)).toContain('register_transaction');
+  });
 });

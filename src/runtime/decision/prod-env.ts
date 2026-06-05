@@ -288,6 +288,7 @@ function skillRowToSkill(row: {
   allowed_tools: string[] | unknown;
   policy_descriptors: string[] | unknown;
   runtime_hints: Record<string, unknown> | unknown;
+  usage_policy?: Record<string, unknown> | null | unknown;
   version: number;
 }): Skill {
   const allowed_tools = Array.isArray(row.allowed_tools) ? (row.allowed_tools as string[]) : [];
@@ -295,6 +296,14 @@ function skillRowToSkill(row: {
     ? (row.runtime_hints as Record<string, unknown>)
     : {};
   const when_to_use = typeof row.when_to_use === 'string' ? row.when_to_use : '';
+  // Issue #409 — carry the native usage_policy JSONB through so the
+  // SkillSelector candidate filter can admit/remove by audience before any tool
+  // reaches the LLM. Validation/parse happens in the filter (usage-policy.ts);
+  // here we only forward the raw object (or null).
+  const usage_policy =
+    typeof row.usage_policy === 'object' && row.usage_policy !== null
+      ? (row.usage_policy as Record<string, unknown>)
+      : null;
   return {
     id: row.id,
     // F1 Phase 1 (immutable identity): carry the stable descriptor + version
@@ -327,6 +336,9 @@ function skillRowToSkill(row: {
     output_schema_ref: typeof hints['output_schema_ref'] === 'string'
       ? hints['output_schema_ref']
       : undefined,
+    // Issue #409 — native SkillUsagePolicy (raw JSONB; null = conservative
+    // default at filter time).
+    usage_policy,
   };
 }
 

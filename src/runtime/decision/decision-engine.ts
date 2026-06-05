@@ -38,6 +38,7 @@ import {
   type RiskScorer,
   type Skill,
   type SkillSelector,
+  type SkillSelectorAudience,
   type SubBudgetName,
   type WorkflowSelector,
 } from './types.js';
@@ -46,6 +47,7 @@ import type {
   DecisionPacket,
 } from '../context-packet/types.js';
 import { DEFAULT_CONTEXT_REQUIREMENTS } from '../context-packet/types.js';
+import { allowedDataScopesForAudience } from '@/skills/usage-policy.js';
 
 const TOTAL_BUDGET_MS = 400;
 
@@ -255,6 +257,16 @@ export class DecisionEngine {
       > = { agent_id_override: agent.agent_id, signal };
       if (workflow.workflow_id !== undefined) {
         skillOptions.workflow_id = workflow.workflow_id;
+      }
+      // Issue #409 — thread the resolved AudienceContext (#407) + channel +
+      // scored risk into the selector so its candidate filter removes skills
+      // whose `usage_policy` does not admit this audience BEFORE any tool is
+      // exposed to the LLM. Only built when the audience was actually resolved
+      // (actor.audience_type/trust_level present); otherwise the early filter is
+      // skipped and the runner's fail-closed gate 4.6 is the backstop.
+      const audience = buildSelectorAudience(input.base, risk);
+      if (audience) {
+        skillOptions.audience = audience;
       }
       const skill = await runStep('skill', () =>
         this.deps.skillSelector.select(input.base, intent, skillOptions),
@@ -499,4 +511,28 @@ export class DecisionEngine {
       decision,
     });
   }
+}
+
+/**
+ * Issue #409 — build the `SkillSelectorAudience` from the resolved
+ * AudienceContext attribution on the BaseContextPacket (#407) + the turn
+ * channel + the scored risk. Returns `null` when the audience was NOT resolved
+ * (no `audience_type`/`trust_level` on the actor) so the selector skips its
+ * early filter and the runner's fail-closed gate 4.6 remains the backstop —
+ * we never fabricate an audience the resolver did not produce (invariant #3).
+ */
+function buildSelectorAudience(
+  base: BaseContextPacket,
+  risk: DecisionPacket['risk_profile'],
+): SkillSelectorAudience | null {
+  const audience_type = base.actor.audience_type;
+  const trust_level = base.actor.trust_level;
+  if (!audience_type || !trust_level) return null;
+  return {
+    audience_type,
+    trust_level,
+    channel_type: base.channel.kind,
+    allowed_data_scope: allowedDataScopesForAudience(audience_type, trust_level),
+    risk_level: risk.level,
+  };
 }

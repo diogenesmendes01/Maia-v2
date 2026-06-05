@@ -189,6 +189,23 @@ export const AUDIT_ACTIONS = [
   // human-permission/constitutional refusal) so the audit trail tells "the
   // agent never had this tool" apart from "the person can't do this".
   'tool_not_granted',
+  // Issue #409 — SkillUsagePolicy admission decisions (the FIRST runtime audit
+  // of a skill DECISION, aligned with invariant #4 — audit every decision).
+  // Emitted at BOTH enforcement points: the candidate filter (skill-selector,
+  // early) and the execution gate (skill-runner gate 4.6, late). `skill_allowed`
+  // records that a skill's usage policy admitted the resolved AudienceContext;
+  // the `skill_blocked_by_*` actions record WHY a skill was removed/refused —
+  // by audience, channel, data_scope, risk ceiling, or insufficient auth level.
+  // These let the audit trail explain "the agent never offered this skill to
+  // this audience" with the exact governing reason (the daily_business_summary
+  // → customer block, the customer skill limited to own_customer_data_only, an
+  // unauthorized channel, etc.).
+  'skill_allowed',
+  'skill_blocked_by_audience',
+  'skill_blocked_by_channel',
+  'skill_blocked_by_data_scope',
+  'skill_blocked_by_risk',
+  'skill_blocked_by_auth_level',
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];

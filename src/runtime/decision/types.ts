@@ -12,6 +12,7 @@ import type {
   PepKind,
   RiskLevel,
 } from '../context-packet/types.js';
+import type { AudienceType, DataScope, TrustLevel } from '@/shared/audience.js';
 
 export type { ActionMode, ContextRequirements, PepKind, PolicyDecision, RiskLevel };
 
@@ -148,6 +149,15 @@ export interface Skill {
     allow_deep_context?: boolean;
   };
   output_schema_ref?: string;
+  /**
+   * Issue #409 — the native SkillUsagePolicy JSONB (audience/channel/data_scope/
+   * exposure/auth/confirmation/risk), carried through from `skills.usage_policy`
+   * so the SkillSelector candidate filter can admit/remove this skill against
+   * the resolved AudienceContext BEFORE any tool reaches the LLM. Raw record
+   * (parsed/validated by `src/skills/usage-policy.ts`); absent/`null` ⇒ the
+   * conservative internal-only default.
+   */
+  usage_policy?: Record<string, unknown> | null;
 }
 
 /**
@@ -481,6 +491,37 @@ export interface SkillSelectorOptions {
   workflow_id?: string;
   /** Round-2 finding 4: abort signal from Decision Engine deadline. */
   signal?: AbortSignal;
+  /**
+   * Issue #409 — the resolved audience/channel/risk facts the candidate filter
+   * evaluates each skill's `usage_policy` against. Optional + nullable so the
+   * many existing call sites (and the legacy stub env) keep compiling; when
+   * ABSENT the selector applies the conservative usage-policy default to every
+   * candidate (fail-closed). The Decision Engine populates this from the
+   * BaseContextPacket's audience attribution (#407) + the turn channel + the
+   * scored risk level.
+   */
+  audience?: SkillSelectorAudience | null;
+}
+
+/**
+ * Issue #409 — narrow projection of the resolved AudienceContext (#407) + the
+ * turn channel + scored risk, used by the SkillSelector candidate filter to
+ * admit/remove a skill by its `usage_policy`. Mirrors
+ * `UsagePolicyEvalContext` in `src/skills/usage-policy.ts` but is declared here
+ * to keep the decision module's port interfaces self-contained.
+ */
+export interface SkillSelectorAudience {
+  audience_type: AudienceType;
+  trust_level: TrustLevel;
+  /** Channel the turn arrived on (e.g. `whatsapp`). */
+  channel_type: string;
+  /**
+   * Data classes the audience may receive this turn (when known). A skill whose
+   * declared `data_scope` is not a subset is removed (`data_scope_blocked`).
+   */
+  allowed_data_scope?: readonly DataScope[];
+  /** Scored pre-execution turn risk (RiskScorer), when known. */
+  risk_level?: 'low' | 'medium' | 'high' | 'critical';
 }
 
 export interface SkillSelector {
