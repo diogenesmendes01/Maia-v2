@@ -377,6 +377,60 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     ]
   },
   {
+    "name": "conversation_state_update",
+    "description": "Atualiza um estado LEVE e não-gate da conversa atual (ex.: tag de tópico, preferência do thread), fazendo merge atômico no metadata. Sempre escopado à própria conversa; estado de pendência/confirmação NÃO passa por aqui (use ask_pending_question).",
+    "side_effect": "write",
+    "operation_type": "update_meta",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [
+      "update_conversation_state"
+    ],
+    "inputs": [
+      {
+        "name": "patch",
+        "type": "record",
+        "optional": false
+      },
+      {
+        "name": "conversation_id",
+        "type": "string",
+        "optional": true
+      }
+    ]
+  },
+  {
+    "name": "conversation_summary_compose",
+    "description": "Compõe um resumo estruturado da conversa atual (resumo, perguntas em aberto, decisões e pendências), usando o histórico fornecido ou as mensagens recentes desta conversa. Apenas leitura — não persiste nem encerra a conversa.",
+    "side_effect": "none",
+    "operation_type": "parse_only",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [],
+    "inputs": [
+      {
+        "name": "history",
+        "type": "object[]",
+        "optional": true
+      },
+      {
+        "name": "limit",
+        "type": "number",
+        "optional": true
+      },
+      {
+        "name": "purpose",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "max_chars",
+        "type": "number",
+        "optional": true
+      }
+    ]
+  },
+  {
     "name": "explain_limitation",
     "description": "Explica de forma honesta que o agente não pode realizar algo (e por quê), em vez de inventar uma ação sem permissão. Apenas texto, sem efeito colateral.",
     "side_effect": "none",
@@ -1097,6 +1151,52 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
         "name": "question",
         "type": "string",
         "optional": false
+      }
+    ]
+  },
+  {
+    "name": "risk_signal_classify",
+    "description": "Classifica o risco do turno atual (low/medium/high/critical) e recomenda a próxima ação (allow/clarify/confirm/handoff). Determinístico — o nível vem do scorer compartilhado; sem efeito colateral.",
+    "side_effect": "none",
+    "operation_type": "parse_only",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [],
+    "inputs": [
+      {
+        "name": "text",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "topic",
+        "type": "enum(casual|operational_simple|financial|legal|health|critical_decision|unknown)",
+        "optional": true
+      },
+      {
+        "name": "tool_kinds",
+        "type": "enum(read_local|read_external|write_local|write_external|transfer|irreversible|communication)[]",
+        "optional": true
+      },
+      {
+        "name": "skill_confidence",
+        "type": "number",
+        "optional": true
+      },
+      {
+        "name": "skill_threshold",
+        "type": "number",
+        "optional": true
+      },
+      {
+        "name": "active_sensitive_memory_count",
+        "type": "number",
+        "optional": true
+      },
+      {
+        "name": "active_procedure_has_critical_step",
+        "type": "boolean",
+        "optional": true
       }
     ]
   },

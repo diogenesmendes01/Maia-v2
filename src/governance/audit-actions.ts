@@ -206,6 +206,19 @@ export const AUDIT_ACTIONS = [
   'skill_blocked_by_data_scope',
   'skill_blocked_by_risk',
   'skill_blocked_by_auth_level',
+  // Issue #433 — baseline.core gap tools. Append-only. Each is auto-audited by
+  // the dispatcher from the tool's `audit_action` (no hand-rolled audit()).
+  // `risk_signal_classified`: risk_signal_classify scored the turn's risk
+  //   (level + recommended action) via the shared scorer — a decision the trail
+  //   should record (invariant #4), even though it is side-effect-free.
+  // `conversation_summary_composed`: conversation_summary_compose produced a
+  //   structured recap of the conversation (read-only).
+  // `conversation_state_updated`: conversation_state_update merged a lightweight,
+  //   self-scoped, non-gate patch into the conversation metadata (the one
+  //   baseline write beyond remember_safe_fact).
+  'risk_signal_classified',
+  'conversation_summary_composed',
+  'conversation_state_updated',
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];
@@ -255,6 +268,12 @@ export const ACTION_KEYS = [
   //   the baseline can grant escalation without granting external messaging.
   'save_safe_fact',
   'escalate_to_owner',
+  // Issue #433 — granular action key for `conversation_state_update` (write).
+  // Deliberately distinct from financial/cadastro writes: a baseline agent may
+  // update its OWN conversation's lightweight state WITHOUT any domain-mutation
+  // grant. Gate state (pending/confirmation) is NOT covered — it routes through
+  // `ask_pending_question`.
+  'update_conversation_state',
 ] as const;
 
 export type ActionKey = (typeof ACTION_KEYS)[number];

@@ -94,12 +94,20 @@ const FORBIDDEN_IN_BASELINE: ReadonlySet<string> = new Set([
 /**
  * Side effects a baseline tool may declare. The baseline floor permits:
  *   - 'none' / 'read'      — always safe.
- *   - 'write'              — ONLY the granular, self-scoped `remember_safe_fact`.
+ *   - 'write'              — ONLY the granular, self-scoped baseline writes:
+ *       `remember_safe_fact` (a SAFE per-pessoa fact) and, since #433,
+ *       `conversation_state_update` (a lightweight, non-gate, self-scoped
+ *       conversation-metadata merge). Both are scoped to the caller's own
+ *       pessoa/conversation and gated by a granular action key — never a
+ *       financial/domain write.
  *   - 'communication'      — ONLY the INTERNAL `handoff_to_owner` escalation.
  * Any OTHER write/communication tool is a domain capability and must be granted
  * via a domain pack (#408), never the baseline.
  */
-const BASELINE_WRITE_ALLOWLIST: ReadonlySet<string> = new Set(['remember_safe_fact']);
+const BASELINE_WRITE_ALLOWLIST: ReadonlySet<string> = new Set([
+  'remember_safe_fact',
+  'conversation_state_update',
+]);
 const BASELINE_COMMUNICATION_ALLOWLIST: ReadonlySet<string> = new Set(['handoff_to_owner']);
 
 /**

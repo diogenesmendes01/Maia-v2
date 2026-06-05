@@ -2,14 +2,13 @@ import { db } from '@/db/client.js';
 import { conversas } from '@/db/schema.js';
 import { eq, and, sql } from 'drizzle-orm';
 import { mensagensRepo, conversasRepo } from '@/db/repositories.js';
-import { callLLM } from '@/lib/claude.js';
+import { summarizeTranscript, renderTranscript } from '@/shared/summary/summarize-transcript.js';
 import { logger } from '@/lib/logger.js';
 import { config } from '@/config/env.js';
 import { runWithTenantContext, getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import { reflect } from '@/cognition/reflector.js';
 import { classify } from '@/cognition/classifier.js';
 import { persistCandidate } from '@/cognition/persister.js';
-import { runCognitiveModule } from '@/cognition/runner.js';
 import { CognitiveEventType } from '@/types/enums.js';
 
 /**
@@ -120,36 +119,25 @@ async function runConversationSummarizerInner(): Promise<void> {
       }
       continue;
     }
-    const transcript = [...msgs]
-      .reverse()
-      .map((m) => `${m.direcao === 'in' ? 'Usuário' : 'Maia'}: ${m.conteudo ?? '[mídia]'}`)
-      .join('\n');
+    // Issue #433: transcript formatting + the LLM summarization were extracted
+    // into the shared `summarizeTranscript` helper (so the `conversation_summary_*`
+    // tools reuse the SAME prompt/shape — no drift). The worker is behavior-
+    // preserving: it still summarizes the chronological transcript and closes the
+    // conversa with the (≤500-char) prose `summary`. `renderTranscript` is the
+    // SAME `Usuário:`/`Maia:` rendering used inline before — reused here so the
+    // reflection event's transcript and the summarizer input never diverge.
+    const chronological = [...msgs].reverse();
+    const transcript = renderTranscript(chronological);
     try {
-      const summarizerResult = await runCognitiveModule(
-        {
-          name: 'conversation-summarizer',
-          triggered_by: 'async_event',
-          timeoutMs: 30000,
-          conversa_id: c.id,
-        },
-        () =>
-          callLLM({
-            system:
-              'Você é a Maia. Resuma a conversa abaixo em até 500 caracteres em português, focando em decisões, fatos e pendências. Não invente.',
-            messages: [{ role: 'user', content: transcript }],
-            max_tokens: 500,
-            temperature: 0.0,
-          }),
-      );
-      const res = summarizerResult.output;
-      if (!res) {
-        logger.warn(
-          { conversa_id: c.id, status: summarizerResult.status },
-          'summarizer.llm_failed_skipping',
-        );
+      const summarized = await summarizeTranscript(chronological, {
+        module: { name: 'conversation-summarizer', triggered_by: 'async_event', timeoutMs: 30000, conversa_id: c.id },
+        maxChars: 500,
+      });
+      const summary = summarized.summary;
+      if (summary.length === 0) {
+        logger.warn({ conversa_id: c.id }, 'summarizer.llm_failed_skipping');
         continue;
       }
-      const summary = (res.content ?? '').slice(0, 500);
       await conversasRepo.close(c.id, summary);
       logger.info({ conversa_id: c.id, len: summary.length }, 'conversation_summarized');
       try {
