@@ -3,6 +3,7 @@ import { db, withTx, pgErrorCode } from './client.js';
 import { procedure_status_events } from './schema.js';
 import {
   pessoas,
+  agent_audience_profiles,
   permissoes,
   permission_profiles,
   conversas,
@@ -95,6 +96,8 @@ import type {
 } from '@/types/enums.js';
 import type {
   Pessoa,
+  AgentAudienceProfile,
+  NewAgentAudienceProfile,
   Permissao,
   Conversa,
   Mensagem,
@@ -334,6 +337,81 @@ export const pessoasRepo = {
     return Array.from(
       result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>,
     );
+  },
+};
+
+/**
+ * agentAudienceProfilesRepo — per-agent audience relation (issue #407).
+ *
+ * Every read/write is scoped to the current (tenant_id, agent_id) via the ALS
+ * context, exactly like `pessoasRepo`. A profile belonging to another
+ * (tenant, agent) is invisible — this is the per-agent isolation that lets the
+ * same phone be `customer` for Agent X and `employee` for Agent Y.
+ *
+ * `audience_type` / `trust_level` / `status` are returned narrowed to the
+ * canonical unions (the DB stores `text` with CHECK constraints from
+ * migration 074). The cast at the read boundary is safe because the CHECK
+ * constraints guarantee the stored value is one of the legal literals.
+ */
+export const agentAudienceProfilesRepo = {
+  /**
+   * Tenant+agent-scoped lookup of the audience profile for a pessoa. The
+   * 1:1 (tenant, agent, pessoa) unique guarantees at most one row. A row from
+   * another (tenant, agent) is invisible.
+   */
+  async findByPessoa(pessoa_id: string): Promise<AgentAudienceProfile | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(agent_audience_profiles)
+      .where(
+        and(
+          eq(agent_audience_profiles.tenant_id, tenant_id),
+          eq(agent_audience_profiles.agent_id, agent_id),
+          eq(agent_audience_profiles.pessoa_id, pessoa_id),
+        ),
+      )
+      .limit(1);
+    return (rows[0] ?? null) as AgentAudienceProfile | null;
+  },
+  async create(
+    input: Omit<
+      NewAgentAudienceProfile,
+      'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'
+    >,
+  ): Promise<AgentAudienceProfile> {
+    const guarded = applyTenantGuard(input);
+    const rows = await db.insert(agent_audience_profiles).values(guarded).returning();
+    return rows[0]! as AgentAudienceProfile;
+  },
+  async updateStatus(id: string, status: AgentAudienceProfile['status']): Promise<void> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    await db
+      .update(agent_audience_profiles)
+      .set({ status, updated_at: new Date() })
+      .where(
+        and(
+          eq(agent_audience_profiles.id, id),
+          eq(agent_audience_profiles.tenant_id, tenant_id),
+          eq(agent_audience_profiles.agent_id, agent_id),
+        ),
+      );
+  },
+  async list(): Promise<AgentAudienceProfile[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(agent_audience_profiles)
+      .where(
+        and(
+          eq(agent_audience_profiles.tenant_id, tenant_id),
+          eq(agent_audience_profiles.agent_id, agent_id),
+        ),
+      );
+    return rows as AgentAudienceProfile[];
   },
 };
 

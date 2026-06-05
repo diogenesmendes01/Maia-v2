@@ -27,6 +27,12 @@ const TTL_TABLE: Record<SliceName, number> = {
   tool: 900,
   // History: per-turn, never cached at slice level
   history: 5,
+  // Audience (#407): the per-agent audience profile changes slowly (governance
+  // edits), but a change must be reflected promptly because it gates trust.
+  // Mirror identity's 5min — the profile-id is encoded in the cache scope hash,
+  // so a profile change self-heals via a fresh key (same strategy as
+  // IdentitySliceBuilder) rather than waiting out the TTL.
+  audience: 300,
 };
 
 const MIN_TTL = 5;
