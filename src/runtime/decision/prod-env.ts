@@ -287,11 +287,18 @@ function skillRowToSkill(row: {
   when_to_use?: string | unknown;
   allowed_tools: string[] | unknown;
   policy_descriptors: string[] | unknown;
+  applicable_to_role?: string[] | unknown;
   runtime_hints: Record<string, unknown> | unknown;
   usage_policy?: Record<string, unknown> | null | unknown;
   version: number;
 }): Skill {
   const allowed_tools = Array.isArray(row.allowed_tools) ? (row.allowed_tools as string[]) : [];
+  // Issue #415 — carry the role → skill scope through so the SkillSelector can
+  // apply `applicable_to_role` against the turn's active role (taxonomy §2 step
+  // 5). EMPTY/absent ⇒ universal (applies regardless of role).
+  const applicable_to_role = Array.isArray(row.applicable_to_role)
+    ? (row.applicable_to_role as string[])
+    : [];
   const hints = (typeof row.runtime_hints === 'object' && row.runtime_hints !== null)
     ? (row.runtime_hints as Record<string, unknown>)
     : {};
@@ -327,6 +334,9 @@ function skillRowToSkill(row: {
     // anti-hijack matcher tokenises this against the classified intent so a
     // skill is only selected when the turn clearly relates to it.
     when_to_use,
+    // Issue #415 — role → skill scope, forwarded for the SkillSelector's
+    // `applicable_to_role` filter (taxonomy §2 step 5).
+    applicable_to_role,
     allowed_tools,
     blocked_tools: [], // P9a does not store blocked_tools separately
     requires_confirmation_tools: [], // P9a does not store this
@@ -430,6 +440,12 @@ const skillsRepoAdapter: SkillsRepo = {
         // SkillSelector match by applicable_to_intent (derived from the
         // descriptor) + when_to_use + category/priority.
         void query.applicable_to_intent; // acknowledged; matched downstream
+        // Issue #415 — the role → skill scope (`applicable_to_role`) IS a stored
+        // column, but we do NOT pre-filter it in SQL here: the SkillSelector
+        // applies it uniformly (against the turn's active role) right after
+        // ranking, so the role-scope decision lives in one place. Acknowledged;
+        // filtered downstream by `filterByApplicableRole`.
+        void query.applicable_to_role; // acknowledged; filtered downstream
         return allSkills;
       },
     );

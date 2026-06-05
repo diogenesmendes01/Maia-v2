@@ -81,6 +81,9 @@ export class SkillSelectorImpl implements SkillSelector {
     if (options?.workflow_id !== undefined) {
       query.applicable_to_workflow = options.workflow_id;
     }
+    if (options?.active_role_key !== undefined) {
+      query.applicable_to_role = options.active_role_key;
+    }
 
     const findOpts: { signal?: AbortSignal } = {};
     if (options?.signal) findOpts.signal = options.signal;
@@ -91,6 +94,23 @@ export class SkillSelectorImpl implements SkillSelector {
     }
 
     let ranked = [...candidates].sort(rankByCategoryAndPriority);
+
+    // Issue #415 — role → skill scope (`applicable_to_role`, capability-taxonomy
+    // §2 step 5: `selector(intent) ∩ applicable_to_role`). Keep a candidate when
+    // EITHER it declares no role scope (empty `applicable_to_role` ⇒ universal,
+    // the baseline behaviour) OR the turn's active role is one of its declared
+    // roles. This is a SCOPING filter, not an authorization: it can only ever
+    // REMOVE a candidate (a role-specific skill on the wrong turn), never make
+    // one executable — execution is still gated by usage-policy, write/risk
+    // policy, and the dispatcher (taxonomy §3, §6). When no active role is
+    // supplied (role-agnostic / legacy callers) the filter is skipped and only
+    // the universal scoping (empty list) applies, so existing skills are
+    // unaffected. The production adapter does not pre-filter by role in SQL, so
+    // this is the authoritative role-scope point.
+    ranked = filterByApplicableRole(ranked, options?.active_role_key);
+    if (ranked.length === 0) {
+      return { candidate_skill_ids: [] };
+    }
 
     // Issue #409 — usage-policy candidate filter (EARLY, conservative). Remove
     // every ranked candidate whose `usage_policy` does not admit the resolved
@@ -270,4 +290,31 @@ function rankByCategoryAndPriority(a: Skill, b: Skill): number {
   const aScore = (a.category === 'respond' ? 2 : 1) * (a.priority ?? 0);
   const bScore = (b.category === 'respond' ? 2 : 1) * (b.priority ?? 0);
   return bScore - aScore; // descending
+}
+
+/**
+ * Issue #415 — role → skill scope filter (`applicable_to_role`).
+ *
+ * A skill is KEPT when EITHER:
+ *   - it declares no role scope (`applicable_to_role` empty/absent) ⇒ universal,
+ *     applies regardless of the active role (baseline / existing behaviour); OR
+ *   - the turn's `activeRoleKey` is one of its declared `applicable_to_role`.
+ *
+ * A skill that declares a non-empty `applicable_to_role` and whose list does NOT
+ * include the active role is REMOVED — it is out of scope for this role's turn.
+ *
+ * When `activeRoleKey` is undefined (no role resolved / role-agnostic caller),
+ * role-specific skills cannot be confirmed in-scope, so a *non-empty*
+ * `applicable_to_role` removes the candidate (fail-closed: a role-bound skill is
+ * never selected outside its role). Universal skills (empty list) always pass.
+ */
+export function filterByApplicableRole(
+  ranked: Skill[],
+  activeRoleKey: string | undefined,
+): Skill[] {
+  return ranked.filter((skill) => {
+    const roles = skill.applicable_to_role ?? [];
+    if (roles.length === 0) return true; // universal — applies to any role
+    return activeRoleKey !== undefined && roles.includes(activeRoleKey);
+  });
 }

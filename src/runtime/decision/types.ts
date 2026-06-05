@@ -142,6 +142,16 @@ export interface Skill {
    * `applicable_to_intent` / the descriptor.
    */
   when_to_use?: string;
+  /**
+   * Issue #415 — role → skill axis (`applicable_to_role`, capability-taxonomy.md
+   * §5). The role keys for which this skill is in scope, carried through from
+   * `skills.applicable_to_role`. EMPTY/absent = applies regardless of active
+   * role (baseline behaviour). When non-empty, the SkillSelector keeps this
+   * candidate ONLY when the turn's active role is one of these keys
+   * (`selector(intent) ∩ applicable_to_role`, taxonomy §2 step 5) — a scoping
+   * filter that can only REMOVE a candidate, never authorize one.
+   */
+  applicable_to_role?: string[];
   allowed_tools?: string[];
   blocked_tools?: string[];
   requires_confirmation_tools?: string[];
@@ -182,6 +192,14 @@ export interface SkillsRepo {
       agent_id: string;
       applicable_to_intent?: string;
       applicable_to_workflow?: string;
+      /**
+       * Issue #415 — the turn's ACTIVE role key (from the role-selector). When
+       * supplied, the candidate set excludes any skill whose non-empty
+       * `applicable_to_role` does not contain this key (taxonomy §2 step 5). The
+       * production adapter returns all active scoped skills and lets the
+       * SkillSelector apply the role filter; absent ⇒ no role scoping.
+       */
+      applicable_to_role?: string;
     },
     options?: { signal?: AbortSignal },
   ): Promise<Skill[]>;
@@ -489,6 +507,16 @@ export interface SkillSelectorOptions {
    */
   agent_id_override?: string;
   workflow_id?: string;
+  /**
+   * Issue #415 — the turn's ACTIVE role key (resolved by the role-selector
+   * chain; LLM suggests, policy decides — taxonomy §3). When present, the
+   * SkillSelector applies the role → skill scope (`applicable_to_role`): a skill
+   * that declares a non-empty `applicable_to_role` is a candidate ONLY when this
+   * key is one of them (`selector(intent) ∩ applicable_to_role`, taxonomy §2
+   * step 5). Absent ⇒ no role scoping (legacy callers / role-agnostic turns);
+   * skills with an empty `applicable_to_role` are always in scope regardless.
+   */
+  active_role_key?: string;
   /** Round-2 finding 4: abort signal from Decision Engine deadline. */
   signal?: AbortSignal;
   /**

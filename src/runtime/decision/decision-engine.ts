@@ -268,6 +268,17 @@ export class DecisionEngine {
       if (audience) {
         skillOptions.audience = audience;
       }
+      // Issue #415 — role → skill scope (`applicable_to_role`, capability-taxonomy
+      // §2 step 5). The SkillSelector applies the role filter when an
+      // `active_role_key` is supplied (a skill that declares a non-empty
+      // `applicable_to_role` is a candidate only when this turn's active role is
+      // one of them). The active operational role is resolved by the role-selector
+      // chain (`src/cognition/role-selector/`), which runs in the agent flow and
+      // does NOT currently surface the resolved role key into the
+      // BaseContextPacket. Threading it through to here is the remaining
+      // integration step for this axis (see #415 / #416); until then the option is
+      // left unset and role-bound skills are simply not selected via this path
+      // (fail-closed). Wire it as: `skillOptions.active_role_key = <resolved role>`.
       const skill = await runStep('skill', () =>
         this.deps.skillSelector.select(input.base, intent, skillOptions),
       );
