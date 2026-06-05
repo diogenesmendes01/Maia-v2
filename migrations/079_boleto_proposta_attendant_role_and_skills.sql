@@ -169,16 +169,23 @@ SELECT
   -- gate is now active: the decision engine threads `active_role_key` (#436), so
   -- role-bound skills are selected for the active role; this seed must therefore
   -- admit the intended external audience.) Profiles:
-  --   A = own-customer data (read/write of the company's OWN billing), subject_only,
-  --       blocks at/above high risk (→ escalation);
+  --   A = own-customer data (company's OWN billing), subject_only; READS block at/
+  --       above HIGH risk, the two WRITES (cancel_proposal_billing, refund_intake)
+  --       block at/above MEDIUM risk — financial writes are stricter (review r2 #2).
+  --       (Auth stays known_external: a customer acts on their OWN billing; the
+  --       extra write authority is enforced by the write-policy gate, not by
+  --       raising the skill's required trust above the target audience — #437.)
   --   B = public/process info (identification + Q&A; admits leads), public_safe;
-  --   C = internal escalation (ticket/handoff), internal_only.
+  --   C = internal escalation (ticket/handoff): a customer/lead may TRIGGER the
+  --       evaluation, but the risk/legal verdict is internal_only — never exposed
+  --       to them; it feeds the human handoff/confirmation policy. internal_only is
+  --       deliberate here (subject_only would leak the verdict) — review r2 #3.
   -- All require known_external trust and never self-confirm (confirmation is the
   -- write/risk policy's job, never the skill's).
   CASE v.skill_descriptor
     WHEN 'inspect_customer_billing_context' THEN '{"allowed_audience":["customer"],"data_scope":["own_customer_data_only"],"exposure_policy":"subject_only","requires_auth_level":"known_external","requires_confirmation":false,"blocked_when_risk_at_or_above":"high"}'
-    WHEN 'cancel_proposal_billing' THEN '{"allowed_audience":["customer"],"data_scope":["own_customer_data_only"],"exposure_policy":"subject_only","requires_auth_level":"known_external","requires_confirmation":false,"blocked_when_risk_at_or_above":"high"}'
-    WHEN 'refund_intake' THEN '{"allowed_audience":["customer"],"data_scope":["own_customer_data_only"],"exposure_policy":"subject_only","requires_auth_level":"known_external","requires_confirmation":false,"blocked_when_risk_at_or_above":"high"}'
+    WHEN 'cancel_proposal_billing' THEN '{"allowed_audience":["customer"],"data_scope":["own_customer_data_only"],"exposure_policy":"subject_only","requires_auth_level":"known_external","requires_confirmation":false,"blocked_when_risk_at_or_above":"medium"}'
+    WHEN 'refund_intake' THEN '{"allowed_audience":["customer"],"data_scope":["own_customer_data_only"],"exposure_policy":"subject_only","requires_auth_level":"known_external","requires_confirmation":false,"blocked_when_risk_at_or_above":"medium"}'
     WHEN 'refund_followup' THEN '{"allowed_audience":["customer"],"data_scope":["own_customer_data_only"],"exposure_policy":"subject_only","requires_auth_level":"known_external","requires_confirmation":false,"blocked_when_risk_at_or_above":"high"}'
     WHEN 'analyze_customer_documents' THEN '{"allowed_audience":["customer"],"data_scope":["own_customer_data_only"],"exposure_policy":"subject_only","requires_auth_level":"known_external","requires_confirmation":false,"blocked_when_risk_at_or_above":"high"}'
     WHEN 'identify_company_customer' THEN '{"allowed_audience":["customer","lead"],"data_scope":["public_info"],"exposure_policy":"public_safe","requires_auth_level":"known_external","requires_confirmation":false}'
