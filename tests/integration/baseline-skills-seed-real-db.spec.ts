@@ -102,12 +102,16 @@ d('baseline skills seed (migration 075) — real DB', () => {
       execution_mode: string;
       allowed_tools: string[];
     }>(
+      // Scope to the known baseline descriptors: issue #415 also seeds role
+      // skills tenant-wide with proposed_by='system', so a bare proposed_by
+      // filter would now return more than the 8 baseline rows.
       `SELECT skill_descriptor, agent_id, status, proposed_by, approved_by,
               version, execution_mode, allowed_tools
          FROM skills
         WHERE tenant_id = $1 AND proposed_by = 'system'
+          AND skill_descriptor = ANY($2)
         ORDER BY skill_descriptor`,
-      [TENANT],
+      [TENANT, [...BASELINE_DESCRIPTORS]],
     );
 
     expect(rows.map((r) => r.skill_descriptor).sort()).toEqual(
@@ -139,8 +143,9 @@ d('baseline skills seed (migration 075) — real DB', () => {
     const { rows } = await pg.pool.query<{ count: string }>(
       `SELECT COUNT(*)::text AS count
          FROM skills
-        WHERE tenant_id = $1 AND proposed_by = 'system'`,
-      [TENANT],
+        WHERE tenant_id = $1 AND proposed_by = 'system'
+          AND skill_descriptor = ANY($2)`,
+      [TENANT, [...BASELINE_DESCRIPTORS]],
     );
     expect(Number(rows[0]!.count)).toBe(BASELINE_DESCRIPTORS.length);
   });

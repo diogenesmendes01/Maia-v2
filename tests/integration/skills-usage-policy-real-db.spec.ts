@@ -92,11 +92,15 @@ d('skills.usage_policy (migration 077) — real DB', () => {
       skill_descriptor: string;
       usage_policy: Record<string, unknown> | null;
     }>(
+      // Scope to the known baseline descriptors: issue #415 also seeds role
+      // skills tenant-wide with proposed_by='system' (without a backfilled
+      // usage_policy), so a bare proposed_by filter would now over-match.
       `SELECT skill_descriptor, usage_policy
          FROM skills
         WHERE tenant_id = $1 AND proposed_by = 'system'
+          AND skill_descriptor = ANY($2)
         ORDER BY skill_descriptor`,
-      [TENANT],
+      [TENANT, [...BASELINE_DESCRIPTORS]],
     );
     expect(rows.map((r) => r.skill_descriptor).sort()).toEqual(
       [...BASELINE_DESCRIPTORS].sort(),
