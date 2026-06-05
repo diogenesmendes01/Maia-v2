@@ -28,8 +28,7 @@
  * `@/db/repositories.js` e `@/lib/claude.js`; nenhum tcp/5432 envolvido.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { featureFlags } from '@/config/feature-flags.js';
-import { FeatureFlagName, CognitiveLayer } from '@/types/enums.js';
+import { CognitiveLayer } from '@/types/enums.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 
 // ---- Mock pesado: LLM determinístico. -------------------------------------
@@ -87,28 +86,14 @@ const GRAPH_NODE_NAMES = new Set([
   'success-reflection',
 ]);
 
-describe('P7 — golden regression (flag on vs off + audit invariant)', () => {
+describe('P7 — golden regression (graph path audit invariant)', () => {
+  // The FEATURE_COGNITIVE_GRAPH flag-flip / kill-switch tests were removed in
+  // issue #412 — the cognitive graph now runs unconditionally (parity proven),
+  // so there is no toggle to exercise. The audit-invariant, composition and
+  // runWhen-gating tests below remain: they assert the (now sole) graph path
+  // emits audit rows and gates work correctly.
   beforeEach(() => {
     recordSpy.mockClear();
-    featureFlags.reset();
-  });
-
-  // ----- 1. flag flip semantics ---------------------------------------------
-
-  it('smoke — flag OFF: featureFlags reporta cognitive_graph desabilitado', () => {
-    featureFlags.override(FeatureFlagName.COGNITIVE_GRAPH, false);
-    expect(featureFlags.isEnabled(FeatureFlagName.COGNITIVE_GRAPH)).toBe(false);
-  });
-
-  it('smoke — flag ON: featureFlags reporta cognitive_graph habilitado', () => {
-    featureFlags.override(FeatureFlagName.COGNITIVE_GRAPH, true);
-    expect(featureFlags.isEnabled(FeatureFlagName.COGNITIVE_GRAPH)).toBe(true);
-  });
-
-  it('kill switch tem precedência sobre override (defesa P7 §10)', () => {
-    featureFlags.override(FeatureFlagName.COGNITIVE_GRAPH, true);
-    featureFlags.killSwitch(FeatureFlagName.COGNITIVE_GRAPH);
-    expect(featureFlags.isEnabled(FeatureFlagName.COGNITIVE_GRAPH)).toBe(false);
   });
 
   // ----- 2. callLLM determinístico ------------------------------------------

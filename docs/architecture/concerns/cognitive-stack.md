@@ -149,12 +149,13 @@ gh issue list --label "cognition"
 gh pr list --state open --search "ksm OR cognition OR drift"
 ```
 
-At last verification, the cognitive graph refactor (P7) was partial — the orchestrator exists, but not all cognitive modules are wired as descriptors yet. See `README.md` § Estado atual for the runtime status.
+The turn-time cognitive graph (P7) is the **sole** orchestration path as of issue #412: every turn-time module the imperative legacy path ran is wired as a graph node, parity of DB side-effects (`selector_decisions`, the full `procedure_execution_events` set, reflection rows) was proven by `tests/integration/p7-cognitive-graph-parity.spec.ts`, and the `FEATURE_COGNITIVE_GRAPH` toggle plus the imperative blocks in `src/agent/core.ts` were removed. (Broader-graph items — full DAG topology / arbitrary parallelization beyond the current sync_conditional batch — remain roadmap, but they are not gated by a flag.) See `README.md` § Estado atual for the runtime status.
 
 ## 8. In-flight changes
 
 At last verification (2026-05-28):
 
+- P7 cognitive-graph parity + flag removal (#412) — graph is now the sole turn-time orchestration path; `FEATURE_COGNITIVE_GRAPH` removed; post-turn `step-evaluator-trigger` node brought to full audit parity (now emits `tool_called`/`criterion_checked`/`step_failed`/`branch_taken`)
 - KSM scoping fixes: per-row context for promoter (#280), bounded retry loop for revoke under optimistic-conflict (#279)
 - KSM fact/memory/hint scope by `tenant_id+agent_id` (#254, #267 — merged)
 - Reflection memory cleanup for pre-fix pollution (#276)

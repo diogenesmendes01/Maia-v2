@@ -32,19 +32,23 @@
 
 | Consumed by | What |
 |---|---|
-| `src/agent/core.ts` | Invokes pre-turn and post-turn graphs around the LLM call |
+| `src/agent/core.ts` | Invokes pre-turn and post-turn graphs around the LLM call — **unconditionally** since #412 (the `FEATURE_COGNITIVE_GRAPH` toggle and the imperative legacy path were removed) |
 
 ## Tests
 
 | Test path | What it covers |
 |---|---|
-| `tests/unit/cognitive-graph/` | Layer partitioning, timeout/fallback, runWhen skip |
+| `tests/unit/cognitive-graph-orchestrator.spec.ts` | Layer partitioning, timeout/fallback, runWhen skip |
+| `tests/unit/preturn-graph.spec.ts` / `tests/unit/postturn-graph.spec.ts` | Node composition + layers + runWhen gating |
+| `tests/unit/cognitive-graph-latency-budget.spec.ts` | p95 + budget math |
+| `tests/integration/p7-cognitive-graph.spec.ts` | Audit-invariant: every node invocation writes `cognitive_module_log` |
+| `tests/integration/p7-cognitive-graph-parity.spec.ts` | DB side-effect parity (#412): step-evaluator emits the full `procedure_execution_events` set; reflection nodes persist candidates |
 
 ## In-flight changes
 
 At last verification (2026-05-28):
 
-- Cognitive graph refactor (P7) is partial — orchestrator + descriptor pattern landed; not every cognitive module is wired through the graph yet (see `README.md` § Estado atual)
+- P7 cognitive-graph parity + flag removal (#412) — the graph is now the **sole** turn-time orchestration path. Every imperative side-effect has a node equivalent; the post-turn `step-evaluator-trigger` node was brought to full audit parity (`tool_called` / `criterion_checked` / `step_failed` / `branch_taken`); `FEATURE_COGNITIVE_GRAPH` (enum + env + singleton) and the imperative blocks in `src/agent/core.ts` were deleted. Broader-graph items (full DAG topology / arbitrary parallelization) remain roadmap but are not flag-gated.
 
 Verify: `gh pr list --state open --search "cognitive-graph OR P7"`.
 

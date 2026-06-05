@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { CognitiveLayer, FeatureFlagName } from '@/types/enums.js';
+import { CognitiveLayer } from '@/types/enums.js';
 
 describe('P7 enums', () => {
   it('CognitiveLayer tem exatamente 3 valores conforme spec §4.8', () => {
@@ -9,7 +9,6 @@ describe('P7 enums', () => {
     expect(Object.values(CognitiveLayer).length).toBe(3);
   });
 
-  it('FeatureFlagName.COGNITIVE_GRAPH existe', () => {
-    expect(FeatureFlagName.COGNITIVE_GRAPH).toBe('cognitive_graph');
-  });
+  // The FeatureFlagName.COGNITIVE_GRAPH toggle was removed in issue #412 — the
+  // cognitive graph now runs unconditionally, so there is no flag to assert.
 });

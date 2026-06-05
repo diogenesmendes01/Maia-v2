@@ -8,16 +8,11 @@ describe('FeatureFlags', () => {
   beforeEach(() => {
     flags = new FeatureFlags({
       [FeatureFlagName.MULTI_CHANNEL]: false,
-      [FeatureFlagName.COGNITIVE_GRAPH]: true,
     });
   });
 
   it('retorna valor da configuração inicial', () => {
     expect(flags.isEnabled(FeatureFlagName.MULTI_CHANNEL)).toBe(false);
-  });
-
-  it('retorna valor da configuração inicial (COGNITIVE_GRAPH, o outro survivor)', () => {
-    expect(flags.isEnabled(FeatureFlagName.COGNITIVE_GRAPH)).toBe(true);
   });
 
   it('permite override em runtime', () => {
