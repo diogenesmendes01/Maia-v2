@@ -130,6 +130,131 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     ]
   },
   {
+    "name": "bank_account_validate",
+    "description": "Verifica se os dados bancários para reembolso estão completos e consistentes (PIX ou banco/agência/conta + titular). Retorna valid/invalid, campos faltantes, alertas e dados normalizados. Apenas leitura — não persiste nada.",
+    "side_effect": "read",
+    "operation_type": "read",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [],
+    "inputs": [
+      {
+        "name": "pix_key",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "bank",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "branch",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "account",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "account_type",
+        "type": "enum(corrente|poupanca|pagamento)",
+        "optional": true
+      },
+      {
+        "name": "holder_name",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "holder_document",
+        "type": "string",
+        "optional": true
+      }
+    ]
+  },
+  {
+    "name": "boleto_cancel",
+    "description": "Executa a baixa/cancelamento operacional de um boleto. Operação de ESCRITA: declara intenção e efeito; a confirmação é decidida por policy + dispatcher, nunca pelo próprio tool. Requer motivo e a entidade dona do boleto.",
+    "side_effect": "write",
+    "operation_type": "cancel",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [
+      "cancel_boleto"
+    ],
+    "inputs": [
+      {
+        "name": "entidade_id",
+        "type": "string",
+        "optional": false
+      },
+      {
+        "name": "boleto_id",
+        "type": "string",
+        "optional": false
+      },
+      {
+        "name": "cnpj",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "company_id",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "reason",
+        "type": "string",
+        "optional": false
+      },
+      {
+        "name": "dual_approval_granted",
+        "type": "boolean",
+        "optional": true
+      }
+    ]
+  },
+  {
+    "name": "boleto_search",
+    "description": "Localiza boletos de uma empresa (por CNPJ/id, número/id do boleto ou valor) e retorna status, datas e valores. Apenas leitura.",
+    "side_effect": "read",
+    "operation_type": "read",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [],
+    "inputs": [
+      {
+        "name": "cnpj",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "company_id",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "boleto_number",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "boleto_id",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "amount",
+        "type": "number",
+        "optional": true
+      }
+    ]
+  },
+  {
     "name": "calendar_add_business_days",
     "description": "Soma N dias úteis a uma data (N pode ser negativo para retroceder). Ex.: prazo D+5 para algum SLA.",
     "side_effect": "read",
@@ -265,6 +390,27 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     ]
   },
   {
+    "name": "campaign_status_lookup",
+    "description": "Verifica se uma empresa está ativa/elegível para campanhas de proposta e retorna o status e metadados relevantes da campanha. Apenas leitura.",
+    "side_effect": "read",
+    "operation_type": "read",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [],
+    "inputs": [
+      {
+        "name": "cnpj",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "company_id",
+        "type": "string",
+        "optional": true
+      }
+    ]
+  },
+  {
     "name": "cancel_reminder",
     "description": "Cancela uma série agendada (lembrete único, outreach recorrente, payment_due). Encerra a série e todas as ocorrências pendentes/em execução numa transação só. Use quando o usuário pede para esquecer/cancelar algo agendado.",
     "side_effect": "write",
@@ -316,6 +462,47 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     ]
   },
   {
+    "name": "case_risk_classify",
+    "description": "Classifica o nível de risco operacional do caso (baixo/médio/alto) a partir da mensagem, histórico e contexto da empresa/pagamento/reembolso/documento. Retorna motivos e ação de policy recomendada. Apenas análise — não bloqueia nem escala por si.",
+    "side_effect": "none",
+    "operation_type": "read",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [],
+    "inputs": [
+      {
+        "name": "customer_message",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "history",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "company_context",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "payment_context",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "refund_context",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "document_context",
+        "type": "string",
+        "optional": true
+      }
+    ]
+  },
+  {
     "name": "classify_transaction",
     "description": "Sugere uma categoria para uma transação dada sua descrição. Considera regras aprendidas e similaridade com categorias existentes.",
     "side_effect": "read",
@@ -349,6 +536,168 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     ]
   },
   {
+    "name": "company_blacklist_check",
+    "description": "Verifica se uma empresa tem bloqueios ou observações operacionais especiais. Apenas leitura — não bloqueia nem escala execução (isso é decisão de policy).",
+    "side_effect": "read",
+    "operation_type": "read",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [],
+    "inputs": [
+      {
+        "name": "cnpj",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "company_id",
+        "type": "string",
+        "optional": true
+      }
+    ]
+  },
+  {
+    "name": "company_campaign_remove",
+    "description": "Remove ou bloqueia uma empresa de campanhas de proposta futuras. Operação de ESCRITA: a confirmação é decidida por policy + dispatcher, nunca pelo próprio tool. Requer motivo e a entidade alvo.",
+    "side_effect": "write",
+    "operation_type": "update_meta",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [
+      "remove_company_campaign"
+    ],
+    "inputs": [
+      {
+        "name": "entidade_id",
+        "type": "string",
+        "optional": false
+      },
+      {
+        "name": "cnpj",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "company_id",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "reason",
+        "type": "string",
+        "optional": false
+      },
+      {
+        "name": "dual_approval_granted",
+        "type": "boolean",
+        "optional": true
+      }
+    ]
+  },
+  {
+    "name": "company_history_lookup",
+    "description": "Lê o histórico de relacionamento de uma empresa: atendimentos anteriores, reclamações, reembolsos e notas operacionais. Apenas leitura.",
+    "side_effect": "read",
+    "operation_type": "read",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [],
+    "inputs": [
+      {
+        "name": "cnpj",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "company_id",
+        "type": "string",
+        "optional": true
+      }
+    ]
+  },
+  {
+    "name": "company_identity_resolver",
+    "description": "Resolve uma identidade de empresa incompleta/informal (nome fantasia, apelido, nome de sócio, texto livre do cliente) em um candidato concreto ANTES da busca formal. Distinta de company_search: desambigua e decide se precisa confirmação. Apenas leitura.",
+    "side_effect": "read",
+    "operation_type": "read",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [],
+    "inputs": [
+      {
+        "name": "partial_company_name",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "trade_name",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "partial_legal_name",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "partner_name",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "customer_message",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "phone",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "conversation_context",
+        "type": "string",
+        "optional": true
+      }
+    ]
+  },
+  {
+    "name": "company_search",
+    "description": "Localiza uma empresa por identificador resolvido (CNPJ, id, razão social, nome fantasia ou sócio) e retorna dados cadastrais, status e identificadores internos. Apenas leitura.",
+    "side_effect": "read",
+    "operation_type": "read",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [],
+    "inputs": [
+      {
+        "name": "cnpj",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "company_id",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "legal_name",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "trade_name",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "partner_name",
+        "type": "string",
+        "optional": true
+      }
+    ]
+  },
+  {
     "name": "compare_entities",
     "description": "Comparativo financeiro entre entidades em um período (receitas, despesas, lucro, caixa final).",
     "side_effect": "read",
@@ -373,6 +722,89 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
         "name": "date_to",
         "type": "string",
         "optional": false
+      }
+    ]
+  },
+  {
+    "name": "conversation_attachment_lookup",
+    "description": "Recupera arquivos enviados durante o atendimento (por conversa, protocolo ou dica/tipo de anexo) e retorna a lista de anexos com metadados e referências recuperáveis. Apenas leitura.",
+    "side_effect": "read",
+    "operation_type": "read",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [],
+    "inputs": [
+      {
+        "name": "conversation_id",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "protocol",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "attachment_type",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "attachment_hint",
+        "type": "string",
+        "optional": true
+      }
+    ]
+  },
+  {
+    "name": "conversation_summary_generate",
+    "description": "Gera um resumo operacional curto do atendimento: resumo estruturado, principais ações, pendências e motivo de escalação quando aplicável. Apenas análise do contexto fornecido, sem efeito colateral.",
+    "side_effect": "none",
+    "operation_type": "read",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [],
+    "inputs": [
+      {
+        "name": "conversation_history",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "selected_context",
+        "type": "string",
+        "optional": true
+      }
+    ]
+  },
+  {
+    "name": "dda_lookup",
+    "description": "Consulta o status de um boleto no fluxo DDA: situação atual, status de sincronização e informações de baixa. Apenas leitura.",
+    "side_effect": "read",
+    "operation_type": "read",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [],
+    "inputs": [
+      {
+        "name": "cnpj",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "company_id",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "boleto_id",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "boleto_metadata",
+        "type": "record",
+        "optional": true
       }
     ]
   },
@@ -493,6 +925,27 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     ]
   },
   {
+    "name": "legal_intent_detect",
+    "description": "Detecta ameaças jurídicas, pedidos legais formais ou solicitações do departamento jurídico na mensagem e no contexto. Apenas análise — reporta o sinal; bloqueio/escalação é decisão de policy.",
+    "side_effect": "none",
+    "operation_type": "read",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [],
+    "inputs": [
+      {
+        "name": "customer_message",
+        "type": "string",
+        "optional": false
+      },
+      {
+        "name": "conversation_context",
+        "type": "string",
+        "optional": true
+      }
+    ]
+  },
+  {
     "name": "list_pending",
     "description": "Lista o que está pendente para o interlocutor: perguntas abertas, workflows em andamento, aprovações 4-olhos aguardando, e transações com status pendente. Use quando o usuário pergunta \"o que tá pendente\", \"tem algo aberto?\", etc.",
     "side_effect": "read",
@@ -580,6 +1033,49 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     ]
   },
   {
+    "name": "operational_ticket_create",
+    "description": "Cria um ticket para análise humana (motivo, resumo, conversa, contexto de empresa/cliente e fila desejada). Escalação interna — não move dinheiro nem altera cadastro/CRM nem envia mensagem externa.",
+    "side_effect": "communication",
+    "operation_type": "communicate",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [
+      "create_ticket"
+    ],
+    "inputs": [
+      {
+        "name": "reason",
+        "type": "string",
+        "optional": false
+      },
+      {
+        "name": "summary",
+        "type": "string",
+        "optional": false
+      },
+      {
+        "name": "conversation",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "company_context",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "customer_context",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "desired_queue",
+        "type": "string",
+        "optional": true
+      }
+    ]
+  },
+  {
     "name": "parse_boleto",
     "description": "Extrai dados estruturados de uma imagem de boleto: linha digitável, valor, vencimento, beneficiário, banco emissor.",
     "side_effect": "read",
@@ -645,6 +1141,37 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
         "name": "file_sha256",
         "type": "string",
         "optional": false
+      }
+    ]
+  },
+  {
+    "name": "payment_verification",
+    "description": "Confirma se um boleto foi pago: pago/não pago, data e valor do pagamento e status de conciliação quando disponível. Apenas leitura.",
+    "side_effect": "read",
+    "operation_type": "read",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [],
+    "inputs": [
+      {
+        "name": "cnpj",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "company_id",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "boleto_id",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "boleto_metadata",
+        "type": "record",
+        "optional": true
       }
     ]
   },
@@ -908,6 +1435,123 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
       {
         "name": "k",
         "type": "number",
+        "optional": true
+      }
+    ]
+  },
+  {
+    "name": "receipt_validate",
+    "description": "Analisa um comprovante enviado pelo cliente (valor, data, pagador/recebedor) e faz validação básica de autenticidade. REUTILIZA os parsers parse_receipt/parse_image — não é um novo OCR. Apenas leitura.",
+    "side_effect": "read",
+    "operation_type": "parse_only",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [
+      "read_balance"
+    ],
+    "inputs": [
+      {
+        "name": "media_local_path",
+        "type": "string",
+        "optional": false
+      },
+      {
+        "name": "file_sha256",
+        "type": "string",
+        "optional": false
+      },
+      {
+        "name": "attachment_kind",
+        "type": "enum(image|pdf|attachment_ref)",
+        "optional": true
+      }
+    ]
+  },
+  {
+    "name": "refund_create",
+    "description": "Cria uma solicitação oficial de reembolso. Operação de ESCRITA: a confirmação é decidida por policy + dispatcher, nunca pelo próprio tool. Requer motivo e a entidade alvo; comprovante e dados bancários quando aplicável.",
+    "side_effect": "write",
+    "operation_type": "create",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [
+      "create_refund"
+    ],
+    "inputs": [
+      {
+        "name": "entidade_id",
+        "type": "string",
+        "optional": false
+      },
+      {
+        "name": "cnpj",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "company_id",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "valor",
+        "type": "number",
+        "optional": false
+      },
+      {
+        "name": "related_payment_id",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "related_boleto_id",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "receipt_reference",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "payment_data",
+        "type": "record",
+        "optional": true
+      },
+      {
+        "name": "reason",
+        "type": "string",
+        "optional": false
+      },
+      {
+        "name": "dual_approval_granted",
+        "type": "boolean",
+        "optional": true
+      }
+    ]
+  },
+  {
+    "name": "refund_lookup",
+    "description": "Consulta o status de um reembolso: status atual, data prevista, histórico, pendências e comprovante final quando disponível. Apenas leitura.",
+    "side_effect": "read",
+    "operation_type": "read",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [],
+    "inputs": [
+      {
+        "name": "protocol",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "cnpj",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "company_id",
+        "type": "string",
         "optional": true
       }
     ]
