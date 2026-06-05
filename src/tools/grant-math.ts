@@ -79,25 +79,33 @@ export interface ToolPack {
 /**
  * `baseline.core` — the conservative capability floor for EVERY runtime agent.
  *
- * Contents (issue #410 §"Tools básicas"):
- *   - read_turn_context   (none)          — understand the current turn
- *   - recall_memory       (read, reused)  — read authorised memory in scope
- *   - remember_safe_fact  (write)         — persist a SAFE per-pessoa fact only
- *   - request_confirmation(none)          — ask before acting (never acts)
- *   - handoff_to_owner    (communication) — INTERNAL escalation to the owner
- *   - audit_decision      (none)          — record a decision rationale
- *   - explain_limitation  (none)          — honest "I can't do that (yet)"
+ * Contents (issue #410 §"Tools básicas" + issue #433 gap tools):
+ *   - read_turn_context           (none)          — understand the current turn
+ *   - recall_memory               (read, reused)  — read authorised memory in scope
+ *   - remember_safe_fact          (write)         — persist a SAFE per-pessoa fact only
+ *   - request_confirmation        (none)          — ask before acting (never acts)
+ *   - handoff_to_owner            (communication) — INTERNAL escalation to the owner
+ *   - audit_decision              (none)          — record a decision rationale
+ *   - explain_limitation          (none)          — honest "I can't do that (yet)"
+ *   - risk_signal_classify        (none)          — score turn risk (#433, shared scorer)
+ *   - conversation_summary_compose(none)          — structured recap (#433, shared summarizer)
+ *   - conversation_state_update   (write)         — self-scoped, non-gate metadata merge (#433)
  *
- * Everything here is conservative: at most ONE granular `write` (scoped to the
- * caller's own pessoa) and ONE INTERNAL `communication` (escalation, not an
- * external send). NO financial/CRM/cadastro/proactive-external tool is present
- * — that is the "fora do baseline" contract, enforced by `assertConservative`.
+ * Everything here is conservative: at most TWO granular `write`s (BOTH scoped to
+ * the caller's own pessoa/conversation — `remember_safe_fact` and
+ * `conversation_state_update`) and ONE INTERNAL `communication` (escalation, not
+ * an external send). NO financial/CRM/cadastro/proactive-external tool is present
+ * — that is the "fora do baseline" contract, enforced by `assertConservative`
+ * (which allowlists exactly those two baseline writes; see `packs.ts`).
  */
 export const BASELINE_CORE_PACK: ToolPack = {
   id: 'baseline.core',
-  version: 1,
+  // v2 (#433): added the 3 genuine gap tools (risk_signal_classify,
+  // conversation_summary_compose, conversation_state_update). v1 (#410) shipped
+  // the original 7. Bump whenever `tools` changes.
+  version: 2,
   description:
-    'Capacidades mínimas de todo agente runtime: entender contexto, responder, pedir confirmação, registrar memória/auditoria e escalar — sem executar ações sensíveis de domínio.',
+    'Capacidades mínimas de todo agente runtime: entender contexto, responder, pedir confirmação, registrar memória/auditoria, avaliar risco do turno, resumir a conversa, atualizar estado leve e escalar — sem executar ações sensíveis de domínio.',
   tools: [
     'read_turn_context',
     'recall_memory',
@@ -106,6 +114,9 @@ export const BASELINE_CORE_PACK: ToolPack = {
     'handoff_to_owner',
     'audit_decision',
     'explain_limitation',
+    'risk_signal_classify',
+    'conversation_summary_compose',
+    'conversation_state_update',
   ],
 } as const;
 

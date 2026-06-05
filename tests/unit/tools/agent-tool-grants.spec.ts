@@ -31,9 +31,15 @@ describe('Runtime Tool Filter — agent grant ∩ skill scope (#408)', () => {
     const grant: AgentToolGrant = { granted_packs: ['baseline.core'], granted_tools: [], denied_tools: [] };
     const res = computeAgentVisibleTools(grant);
     expect([...res.visible].sort()).toEqual(BASELINE);
-    // No financial tool leaks in.
+    // #433 — the 3 new gap tools ARE part of the baseline floor…
+    expect(res.visible).toContain('risk_signal_classify');
+    expect(res.visible).toContain('conversation_summary_compose');
+    expect(res.visible).toContain('conversation_state_update');
+    // …but NO domain/sensitive tool leaks in (negative-visibility invariant #5).
     expect(res.visible).not.toContain('register_transaction');
     expect(res.visible).not.toContain('query_balance');
+    expect(res.visible).not.toContain('send_proactive_message');
+    expect(res.visible).not.toContain('start_workflow');
   });
 
   it('defaultAgentGrant() == baseline.core only (parity with DEFAULT_AGENT_PACKS)', () => {

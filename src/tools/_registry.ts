@@ -73,6 +73,12 @@ import { conversationSummaryGenerateTool } from './conversation-summary-generate
 import { legalIntentDetectTool } from './legal-intent-detect.js';
 import { caseRiskClassifyTool } from './case-risk-classify.js';
 import { operationalTicketCreateTool } from './operational-ticket-create.js';
+// Issue #433 — baseline.core gap tools (the 3 genuine gaps; the 7 above already
+// existed). Reuse the shared risk scorer + the extracted summarizeTranscript
+// helper; no parallel risk/summary/state engines.
+import { riskSignalClassifyTool } from './risk-signal-classify.js';
+import { conversationSummaryComposeTool } from './conversation-summary-compose.js';
+import { conversationStateUpdateTool } from './conversation-state-update.js';
 
 export type ToolHandlerCtx = {
   pessoa: import('@/db/schema.js').Pessoa;
@@ -247,6 +253,13 @@ export const REGISTRY: Record<string, AnyTool> = {
   legal_intent_detect: legalIntentDetectTool as unknown as AnyTool,
   case_risk_classify: caseRiskClassifyTool as unknown as AnyTool,
   operational_ticket_create: operationalTicketCreateTool as unknown as AnyTool,
+  // Issue #433 — the 3 baseline.core gap tools. `risk_signal_classify` +
+  // `conversation_summary_compose` are parse_only (side_effect none);
+  // `conversation_state_update` is the second baseline write (allowlisted in
+  // packs.ts).
+  risk_signal_classify: riskSignalClassifyTool as unknown as AnyTool,
+  conversation_summary_compose: conversationSummaryComposeTool as unknown as AnyTool,
+  conversation_state_update: conversationStateUpdateTool as unknown as AnyTool,
 };
 
 /**
