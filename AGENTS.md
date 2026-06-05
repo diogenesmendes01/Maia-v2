@@ -50,6 +50,7 @@ If a project instruction conflicts with a skill, the project wins. If the user s
 | Action layer (decide / execute) | [`concerns/action-layer.md`](docs/architecture/concerns/action-layer.md) |
 | Channels, roles, policies | [`concerns/channel-policy.md`](docs/architecture/concerns/channel-policy.md) |
 | Governance, audit, observability | [`concerns/governance-observability.md`](docs/architecture/concerns/governance-observability.md) |
+| Capability taxonomy (roles · skills · tools · packs · policies) | [`concerns/capability-taxonomy.md`](docs/architecture/concerns/capability-taxonomy.md) |
 
 ### Subsystems (one module doc per `src/` subdir)
 
