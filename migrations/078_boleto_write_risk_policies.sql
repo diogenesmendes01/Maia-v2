@@ -25,13 +25,19 @@
 -- ({rule_id, predicate, effect}) from src/governance/policy-dsl/types.ts, so the
 -- rows are parseable + validatable by `validatePolicyRuleBody` and the evaluator:
 --   - predicate is a kind-tagged boolean tree (kind: 'leaf' | 'and' | 'or');
---   - the three writes are matched by `tool_call.name` (NOT a side_effect_level
---     literal — that field's domain is none|low|medium|high, not 'write');
+--   - predicates reference ONLY fields the Mid PEP fact actually provides
+--     (`src/runtime/decision/mid-pep.ts`): the three writes via membership in
+--     `skill.selected.allowed_tools`, and risk via `risk.level`. This avoids the
+--     silent-allow trap — a predicate on a MISSING field yields `not_applicable`,
+--     which the adapter maps to ALLOW (`prod-env.ts`). A confirm/risk policy keyed
+--     on a non-existent field (`tool_call.name`, `risk_profile.level`,
+--     `legal_intent.*`, ...) would silently permit everything once evaluation is
+--     wired. Richer signals (legal intent, receipt suspicion, formal dispute, ...)
+--     are listed under `effect.metadata.intended_signals_pending_437` and will be
+--     folded into the risk profile / context by #437.
 --   - effect.action is from the DSL vocabulary (allow | block |
 --     require_dual_approval | warn | log). "confirm before write" and "escalate
---     to human" both map to `require_dual_approval` (the governed human-approval
---     gate); the finer intent (user confirmation vs escalation) is carried in
---     effect.metadata.intent.
+--     to human" both map to `require_dual_approval`; finer intent is in metadata.intent.
 --
 -- IMPORTANT — RUNTIME EVALUATION IS A FOLLOW-UP, NOT THIS ISSUE: the descriptor
 -- resolver (policy-descriptor-resolver.ts) does NOT yet evaluate this DSL for
@@ -70,7 +76,7 @@ FROM (VALUES
   (
     'dual_approval',
     'confirm_before_write_policy',
-    '{"rule_id":"confirm_before_write_policy","predicate":{"kind":"leaf","field":"tool_call.name","op":"in","value":["boleto_cancel","company_campaign_remove","refund_create"]},"effect":{"action":"require_dual_approval","message":"Operação sensível: requer empresa identificada e confirmação explícita antes de executar; bloqueia se a identidade estiver ambígua ou se a política de risco exigir escalação.","metadata":{"severity":"high","intent":"confirm_before_write","requires":{"company_identified":true,"user_confirmation":true,"audit_before_and_after":true},"blocks_when":{"identity_ambiguous":true,"risk_requires_escalation":true},"applies_to_peps":["mid","late"]}}}',
+    '{"rule_id":"confirm_before_write_policy","predicate":{"kind":"or","predicates":[{"kind":"leaf","field":"skill.selected.allowed_tools","op":"contains","value":"boleto_cancel"},{"kind":"leaf","field":"skill.selected.allowed_tools","op":"contains","value":"company_campaign_remove"},{"kind":"leaf","field":"skill.selected.allowed_tools","op":"contains","value":"refund_create"}]},"effect":{"action":"require_dual_approval","message":"Operação sensível: requer empresa identificada e confirmação explícita antes de executar; bloqueia se a identidade estiver ambígua ou se a política de risco exigir escalação.","metadata":{"severity":"high","intent":"confirm_before_write","governed_tools":["boleto_cancel","company_campaign_remove","refund_create"],"requires":{"company_identified":true,"user_confirmation":true,"audit_before_and_after":true},"intended_signals_pending_437":["company_identity.ambiguous","risk_requires_escalation"],"applies_to_peps":["mid","late"]}}}',
     '{}',
     'founder_explicit',
     'active',
@@ -81,7 +87,7 @@ FROM (VALUES
   (
     'soft_guidance',
     'small_risk_write_policy',
-    '{"rule_id":"small_risk_write_policy","predicate":{"kind":"and","predicates":[{"kind":"leaf","field":"tool_call.name","op":"in","value":["boleto_cancel","company_campaign_remove","refund_create"]},{"kind":"leaf","field":"company_identity.confidence","op":"eq","value":"high"},{"kind":"leaf","field":"risk_profile.level","op":"eq","value":"low"},{"kind":"leaf","field":"action.reversible","op":"eq","value":true},{"kind":"leaf","field":"legal_intent.detected","op":"eq","value":false},{"kind":"leaf","field":"payment_data.consistent","op":"eq","value":true},{"kind":"leaf","field":"audience.allows_execution","op":"eq","value":true}]},"effect":{"action":"allow","message":"Variante futura: pode permitir escrita automática em casos de baixo risco. NÃO habilitada por padrão em #416.","metadata":{"severity":"low","intent":"small_risk_auto_write","applies_to_peps":["mid","late"]}}}',
+    '{"rule_id":"small_risk_write_policy","predicate":{"kind":"and","predicates":[{"kind":"or","predicates":[{"kind":"leaf","field":"skill.selected.allowed_tools","op":"contains","value":"boleto_cancel"},{"kind":"leaf","field":"skill.selected.allowed_tools","op":"contains","value":"company_campaign_remove"},{"kind":"leaf","field":"skill.selected.allowed_tools","op":"contains","value":"refund_create"}]},{"kind":"leaf","field":"risk.level","op":"eq","value":"low"}]},"effect":{"action":"allow","message":"Variante futura: pode permitir escrita automática em casos de baixo risco. NÃO habilitada por padrão em #416.","metadata":{"severity":"low","intent":"small_risk_auto_write","intended_signals_pending_437":["company_identity.confidence=high","action.reversible","legal_intent.detected=false","payment_data.consistent","audience.allows_execution"],"applies_to_peps":["mid","late"]}}}',
     '{}',
     'founder_explicit',
     'proposed',
@@ -93,7 +99,7 @@ FROM (VALUES
   (
     'dual_approval',
     'human_confirmation_policy',
-    '{"rule_id":"human_confirmation_policy","predicate":{"kind":"or","predicates":[{"kind":"leaf","field":"risk_profile.level","op":"in","value":["medium","high"]},{"kind":"leaf","field":"legal_intent.detected","op":"eq","value":true},{"kind":"leaf","field":"case.formal_complaint","op":"eq","value":true},{"kind":"leaf","field":"company_identity.ambiguous","op":"eq","value":true},{"kind":"leaf","field":"receipt.suspicious","op":"eq","value":true},{"kind":"leaf","field":"case.value_over_threshold","op":"eq","value":true},{"kind":"leaf","field":"case.formal_dispute","op":"eq","value":true}]},"effect":{"action":"require_dual_approval","message":"Caso requer confirmação/handoff humano antes de prosseguir (risco médio/alto, ameaça jurídica, reclamação formal, identidade ambígua, comprovante suspeito, valor acima do limite ou disputa formal).","metadata":{"severity":"high","intent":"escalate_to_human","applies_to_peps":["early","mid","late"]}}}',
+    '{"rule_id":"human_confirmation_policy","predicate":{"kind":"leaf","field":"risk.level","op":"in","value":["medium","high","critical"]},"effect":{"action":"require_dual_approval","message":"Caso requer confirmação/handoff humano antes de prosseguir (risco médio/alto, ameaça jurídica, reclamação formal, identidade ambígua, comprovante suspeito, valor acima do limite ou disputa formal).","metadata":{"severity":"high","intent":"escalate_to_human","intended_signals_pending_437":["legal_intent.detected","case.formal_complaint","company_identity.ambiguous","receipt.suspicious","case.value_over_threshold","case.formal_dispute"],"applies_to_peps":["early","mid","late"]}}}',
     '{}',
     'founder_explicit',
     'active',

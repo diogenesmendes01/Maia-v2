@@ -70,22 +70,31 @@ describe('migration 078 — write/risk policy seed (issue #416)', () => {
     }
   });
 
-  it('confirm_before_write_policy predicate targets EXACTLY the three write tools', () => {
-    // The seed predicate matches tool_call.name in [the three writes].
-    expect(up).toContain('"boleto_cancel","company_campaign_remove","refund_create"');
-    // ...via a kind-tagged DSL leaf on tool_call.name. It must NOT key on a
-    // `side_effect_level` literal (that field's domain is none|low|medium|high,
-    // so "write" there would never evaluate).
-    expect(up).toContain('"field":"tool_call.name"');
+  it('confirm_before_write_policy keys on fields the Mid PEP fact ACTUALLY provides', () => {
+    // The three writes are matched via membership in skill.selected.allowed_tools
+    // (a real Mid PEP fact field — mid-pep.ts), NOT a non-existent tool_call.name.
+    // A predicate on a missing field yields not_applicable → ALLOW (silent fail-
+    // open), so the round-2 finding requires keying on real fields.
+    expect(up).toContain('"field":"skill.selected.allowed_tools"');
+    expect(up).toContain('"value":"boleto_cancel"');
+    expect(up).toContain('"value":"company_campaign_remove"');
+    expect(up).toContain('"value":"refund_create"');
+    // Must NOT reference fields the PEP fact does not provide.
+    expect(up).not.toContain('"field":"tool_call.name"');
     expect(up).not.toContain('"tool_call.side_effect_level"');
+    expect(up).not.toContain('"field":"risk_profile.level"');
   });
 
-  it('confirm_before_write_policy requires confirmation + identity + audit, and blocks ambiguity', () => {
+  it('confirm_before_write_policy requires confirmation + identity + audit, and notes ambiguity/escalation', () => {
     expect(up).toContain('"user_confirmation":true');
     expect(up).toContain('"company_identified":true');
     expect(up).toContain('"audit_before_and_after":true');
-    expect(up).toContain('"identity_ambiguous":true');
-    expect(up).toContain('"risk_requires_escalation":true');
+    // Ambiguity/escalation gating is recorded as a pending #437 signal: the Mid
+    // PEP fact does not yet carry company_identity.ambiguous / a risk-escalation
+    // flag, so they live under intended_signals_pending_437 rather than as active
+    // predicate fields (which would otherwise be a silent-allow no-op).
+    expect(up).toContain('company_identity.ambiguous');
+    expect(up).toContain('risk_requires_escalation');
   });
 
   it('small_risk_write_policy is seeded as proposed (NOT active) — auto-write stays OFF', () => {
@@ -95,12 +104,14 @@ describe('migration 078 — write/risk policy seed (issue #416)', () => {
     expect(up).toContain("'proposed'");
   });
 
-  it('human_confirmation_policy escalates on risk/legal/dispute signals', () => {
+  it('human_confirmation_policy escalates on the real risk.level field', () => {
     expect(up).toContain('human_confirmation_policy');
-    expect(up).toContain('"legal_intent.detected"');
-    // The DSL action vocabulary has no 'escalate'; escalation maps to the
-    // human-approval gate and the escalate intent lives in metadata.
+    // Predicate keys on risk.level (a real Mid PEP fact field); the DSL action
+    // vocabulary has no 'escalate', so it maps to require_dual_approval with the
+    // escalate intent in metadata. Richer signals are pending #437.
+    expect(up).toContain('"field":"risk.level"');
     expect(up).toContain('"intent":"escalate_to_human"');
+    expect(up).toContain('intended_signals_pending_437');
   });
 
   it('seed is idempotent (NOT EXISTS guard per descriptor)', () => {
@@ -132,6 +143,24 @@ describe('migration 078 — write/risk policy seed (issue #416)', () => {
         VALID_ACTIONS.has(body.effect?.action),
         `${body.rule_id} effect.action=${body.effect?.action}`,
       ).toBe(true);
+    }
+  });
+
+  it('predicates reference ONLY fields the Mid PEP fact provides (no silent-allow)', () => {
+    // The evaluator fact built in src/runtime/decision/mid-pep.ts exposes
+    // skill.selected.allowed_tools and risk.level (among others). A predicate on
+    // a field the fact does NOT carry resolves to not_applicable, which the
+    // adapter maps to ALLOW — turning a confirm/risk policy into silent fail-open
+    // the day evaluation is wired. Lock the seeded predicate fields to the set
+    // the PEP actually provides. (Richer signals live in metadata, not in
+    // "field" leaves, so they are not matched by this regex.)
+    const ALLOWED_FIELDS = new Set(['skill.selected.allowed_tools', 'risk.level']);
+    const fields = [...up.matchAll(/"field":"([^"]+)"/g)].map((m) => m[1]!);
+    expect(fields.length).toBeGreaterThan(0);
+    for (const f of fields) {
+      expect(ALLOWED_FIELDS.has(f), `predicate field '${f}' must exist in the Mid PEP fact`).toBe(
+        true,
+      );
     }
   });
 

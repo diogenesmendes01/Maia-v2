@@ -28,10 +28,11 @@ const inputSchema = z.object({
   // Required so the dispatcher routes the profile-permission check to the entity
   // that owns the boleto (mirrors cancel_transaction's entidade_id discipline).
   entidade_id: z.string().uuid(),
-  boleto_id: z.string().min(1).max(64),
-  cnpj: z.string().max(20).optional(),
-  company_id: z.string().max(64).optional(),
-  reason: z.string().min(1).max(500),
+  // .trim() so a blank boleto_id / target cannot pass as a real value.
+  boleto_id: z.string().trim().min(1).max(64),
+  cnpj: z.string().trim().min(1).max(20).optional(),
+  company_id: z.string().trim().min(1).max(64).optional(),
+  reason: z.string().trim().min(1).max(500),
   // The dispatcher reads this when a governing policy / constitutional rule
   // requires a second approver; the tool itself does not branch on it.
   dual_approval_granted: z.boolean().optional(),

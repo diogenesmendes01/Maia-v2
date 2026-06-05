@@ -20,9 +20,10 @@ import type { Tool } from './_registry.js';
 const inputSchema = z
   .object({
     entidade_id: z.string().uuid(),
-    cnpj: z.string().max(20).optional(),
-    company_id: z.string().max(64).optional(),
-    reason: z.string().min(1).max(500),
+    // .trim().min(1) so a blank " " cannot satisfy the cnpj/company_id refine.
+    cnpj: z.string().trim().min(1).max(20).optional(),
+    company_id: z.string().trim().min(1).max(64).optional(),
+    reason: z.string().trim().min(1).max(500),
     dual_approval_granted: z.boolean().optional(),
   })
   // Target must be unambiguous: require at least one company identifier. The

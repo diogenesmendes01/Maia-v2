@@ -26,13 +26,15 @@ const inputSchema = z
     // The refund amount. Required so the dispatcher limit check + canAct can gate
     // the value — a refund with no ceiling must never be accepted by the schema.
     valor: z.number().positive(),
-    related_payment_id: z.string().max(64).optional(),
-    related_boleto_id: z.string().max(64).optional(),
+    // Evidence refs are .trim().min(1) so whitespace (" ") cannot satisfy the
+    // refine below — an empty/blank string is rejected by the schema.
+    related_payment_id: z.string().trim().min(1).max(64).optional(),
+    related_boleto_id: z.string().trim().min(1).max(64).optional(),
     // A reference to the validated receipt (see `receipt_validate`).
-    receipt_reference: z.string().max(200).optional(),
+    receipt_reference: z.string().trim().min(1).max(200).optional(),
     // Normalised PIX or bank data (see `bank_account_validate.normalized`).
     payment_data: z.record(z.string(), z.unknown()).optional(),
-    reason: z.string().min(1).max(500),
+    reason: z.string().trim().min(1).max(500),
     dual_approval_granted: z.boolean().optional(),
   })
   // A refund must carry evidence: at least one of a related payment/boleto or a
