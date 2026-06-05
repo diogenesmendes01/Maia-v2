@@ -34,8 +34,12 @@
 
 CREATE TABLE IF NOT EXISTS agent_tool_grants (
   id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  tenant_id      TEXT NOT NULL DEFAULT 'default' REFERENCES tenants(id),
-  agent_id       TEXT NOT NULL DEFAULT 'default' REFERENCES agents(id),
+  -- ON DELETE CASCADE: a grant is owned by its agent/tenant — deleting the
+  -- agent (or tenant) removes its grants. Without this, deleting an agent that
+  -- has a default grant (every agent gets one via createWithSeedAndAudit) fails
+  -- the FK, breaking any caller that deletes agents (e.g. test cleanup).
+  tenant_id      TEXT NOT NULL DEFAULT 'default' REFERENCES tenants(id) ON DELETE CASCADE,
+  agent_id       TEXT NOT NULL DEFAULT 'default' REFERENCES agents(id) ON DELETE CASCADE,
   granted_packs  TEXT[] NOT NULL DEFAULT '{baseline.core}'::text[],
   granted_tools  TEXT[] NOT NULL DEFAULT '{}'::text[],
   denied_tools   TEXT[] NOT NULL DEFAULT '{}'::text[],
