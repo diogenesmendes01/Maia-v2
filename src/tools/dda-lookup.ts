@@ -34,7 +34,7 @@ export const ddaLookupTool: Tool<typeof inputSchema, typeof outputSchema> = {
     'Consulta a situação de um boleto no fluxo de DDA (débito direto autorizado). STUB: ainda não há integração de DDA — retorna found=false, source=stub.',
   input_schema: inputSchema,
   output_schema: outputSchema,
-  required_actions: ['read_balance'],
+  required_actions: ['read_billing'],
   side_effect: 'read',
   redis_required: false,
   operation_type: 'read',

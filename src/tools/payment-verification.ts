@@ -40,7 +40,7 @@ export const paymentVerificationTool: Tool<typeof inputSchema, typeof outputSche
     'Verifica se um boleto/pagamento foi efetivamente pago. STUB: ainda não há reconciliação de pagamentos — retorna paid=null (NUNCA false, para não afirmar falsamente que NÃO foi pago) com source=stub.',
   input_schema: inputSchema,
   output_schema: outputSchema,
-  required_actions: ['read_balance'],
+  required_actions: ['read_billing'],
   side_effect: 'read',
   redis_required: false,
   operation_type: 'read',

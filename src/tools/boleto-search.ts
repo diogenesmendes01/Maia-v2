@@ -47,7 +47,7 @@ export const boletoSearchTool: Tool<typeof inputSchema, typeof outputSchema> = {
     'Busca registros operacionais de boletos relacionados a uma empresa (por company_id/CNPJ/número/id/valor). NÃO é o parse_boleto (que faz OCR de imagem). STUB: ainda não há repositório/integração de boletos — retorna matched_boletos vazio com source=stub.',
   input_schema: inputSchema,
   output_schema: outputSchema,
-  required_actions: ['read_balance'],
+  required_actions: ['read_billing'],
   side_effect: 'read',
   redis_required: false,
   operation_type: 'read',

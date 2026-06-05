@@ -35,7 +35,7 @@ export const refundLookupTool: Tool<typeof inputSchema, typeof outputSchema> = {
     'Consulta o status de uma solicitação de reembolso (por protocolo ou empresa). STUB: ainda não há repositório/integração de reembolsos — retorna found=false, source=stub.',
   input_schema: inputSchema,
   output_schema: outputSchema,
-  required_actions: ['read_balance'],
+  required_actions: ['read_billing'],
   side_effect: 'read',
   redis_required: false,
   operation_type: 'read',

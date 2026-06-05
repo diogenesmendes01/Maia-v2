@@ -36,7 +36,7 @@ export const companyBlacklistCheckTool: Tool<typeof inputSchema, typeof outputSc
     'Verifica se uma empresa tem bloqueios ou notas operacionais especiais. STUB: ainda não há base de bloqueios/convenção em contrapartes — retorna status=unknown, blocked=false, source=stub (não afirma que a empresa está liberada).',
   input_schema: inputSchema,
   output_schema: outputSchema,
-  required_actions: ['read_balance'],
+  required_actions: ['read_company'],
   side_effect: 'read',
   redis_required: false,
   operation_type: 'read',

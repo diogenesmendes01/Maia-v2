@@ -35,7 +35,7 @@ export const campaignStatusLookupTool: Tool<typeof inputSchema, typeof outputSch
     'Verifica se uma empresa está ativa/elegível para campanhas de proposta. STUB: ainda não há base de campanhas/convenção em contrapartes — retorna found=false, source=stub.',
   input_schema: inputSchema,
   output_schema: outputSchema,
-  required_actions: ['read_balance'],
+  required_actions: ['read_company'],
   side_effect: 'read',
   redis_required: false,
   operation_type: 'read',

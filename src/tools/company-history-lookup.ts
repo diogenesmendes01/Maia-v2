@@ -37,7 +37,7 @@ export const companyHistoryLookupTool: Tool<typeof inputSchema, typeof outputSch
     'Lê o histórico de relacionamento de uma empresa (atendimentos anteriores, reclamações, reembolsos, notas operacionais). STUB: ainda não há tabela/integração de histórico — retorna listas vazias com source=stub.',
   input_schema: inputSchema,
   output_schema: outputSchema,
-  required_actions: ['read_balance'],
+  required_actions: ['read_company'],
   side_effect: 'read',
   redis_required: false,
   operation_type: 'read',
