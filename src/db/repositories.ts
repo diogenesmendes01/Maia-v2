@@ -4462,6 +4462,20 @@ export const agentsRepo = {
    * return `{ ok: false, reason: 'duplicate_id' }` — the tx aborts naturally
    * (no orphaned seed_profile or audit row), and the router maps to CONFLICT.
    * Mirrors `tenantsRepo.createWithAuditAtomic` (PR #187).
+   *
+   * Issue #410 — BASELINE vs DOMAIN differentiation at agent creation. Every
+   * runtime agent is INTENDED to receive the `DEFAULT_AGENT_PACKS`
+   * (`['baseline.core']`, defined in `src/tools/packs.ts`) tool grant — the
+   * conservative capability floor (read context, recall/remember safe memory,
+   * ask confirmation, audit, escalate). Domain packs are NEVER default; they
+   * are granted explicitly. We record the intended default pack set in the
+   * audit `change_summary` (`default_tool_packs`) so the creation trail shows
+   * the baseline differentiation. The `agent_tool_grants` TABLE and the runtime
+   * enforcement (dispatcher `tool_not_granted` guard) are #408's scope and are
+   * deliberately NOT wired here — this helper only references the intended
+   * default. The baseline SKILLS half is seeded tenant-wide
+   * (`proposed_by='system'`, active) by migration `075_*` (governed/auditable,
+   * not a self-approval — invariant #6).
    */
   async createWithSeedAndAudit(args: {
     agent: {
@@ -4549,6 +4563,12 @@ export const agentsRepo = {
             seed_profile_version: seedProfile.version,
             seed_profile_status: seedProfile.status,
             proposed_reason: args.seed_profile.proposed_reason,
+            // Issue #410 — the intended default tool-pack grant for this agent.
+            // Literal (not imported from src/tools/packs.ts) so this hot-path
+            // repo module stays free of the tools-registry/gateway import chain.
+            // Kept in sync with `DEFAULT_AGENT_PACKS`; #408 persists the actual
+            // grant + enforcement.
+            default_tool_packs: ['baseline.core'],
           },
         });
 
