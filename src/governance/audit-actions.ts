@@ -176,6 +176,19 @@ export const AUDIT_ACTIONS = [
   'owner_handoff_requested',
   'decision_audited',
   'limitation_explained',
+  // Issue #408 — Runtime Tool Filter provenance. Emitted once per turn when the
+  // backend computes the LLM-visible tool set, recording WHICH grant packs /
+  // granted tools / denied tools / skill scope produced the visible set
+  // (criterion: "auditoria registra quais grants/packs/skills produziram o
+  // conjunto visível"). This is the visibility decision; the dispatcher still
+  // audits an actual refused execution via `unauthorized_access_attempt`.
+  'tool_visibility_resolved',
+  // Issue #408 — dispatcher fail-closed defense. Emitted when the dispatcher
+  // refuses a tool that is NOT in the agent's effective grant (a tool the LLM
+  // should never have seen). Distinct from `unauthorized_access_attempt` (the
+  // human-permission/constitutional refusal) so the audit trail tells "the
+  // agent never had this tool" apart from "the person can't do this".
+  'tool_not_granted',
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];

@@ -4,6 +4,7 @@ import { procedure_status_events } from './schema.js';
 import {
   pessoas,
   agent_audience_profiles,
+  agent_tool_grants,
   permissoes,
   permission_profiles,
   conversas,
@@ -98,6 +99,8 @@ import type {
   Pessoa,
   AgentAudienceProfile,
   NewAgentAudienceProfile,
+  AgentToolGrantRow,
+  NewAgentToolGrant,
   Permissao,
   Conversa,
   Mensagem,
@@ -412,6 +415,82 @@ export const agentAudienceProfilesRepo = {
         ),
       );
     return rows as AgentAudienceProfile[];
+  },
+};
+
+/**
+ * agentToolGrantsRepo — the per-agent TOOL GRANT (issue #408).
+ *
+ * Answers "what tools does THIS AGENT have installed?" — the AGENT half of the
+ * Runtime Tool Filter (the HUMAN half is `permissoesRepo`/`canAct`). Every
+ * read/write is scoped to the current (tenant_id, agent_id) via the ALS
+ * context, exactly like `agentAudienceProfilesRepo`. A grant belonging to
+ * another (tenant, agent) is invisible (invariant #1).
+ *
+ * `forCurrentAgent()` is the runtime hot-path accessor used by the tool-slice
+ * builder / dispatcher to compute the visible set. It fails CLOSED: if no row
+ * exists, it returns the in-code default grant (baseline.core) so a brand-new
+ * or un-backfilled agent still gets the conservative floor rather than zero
+ * tools (or a thrown error in the hot path).
+ */
+export const agentToolGrantsRepo = {
+  /**
+   * Tenant+agent-scoped lookup of the effective grant. The (tenant, agent)
+   * unique guarantees at most one row. A row from another (tenant, agent) is
+   * invisible. Returns null when no grant row exists yet.
+   */
+  async findForCurrentAgent(): Promise<AgentToolGrantRow | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(agent_tool_grants)
+      .where(
+        and(
+          eq(agent_tool_grants.tenant_id, tenant_id),
+          eq(agent_tool_grants.agent_id, agent_id),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+  /**
+   * Insert a grant for the current (tenant, agent). `tenant_id`/`agent_id` are
+   * stamped from the ALS context by `applyTenantGuard`.
+   */
+  async create(
+    input: Omit<NewAgentToolGrant, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>,
+  ): Promise<AgentToolGrantRow> {
+    const guarded = applyTenantGuard(input);
+    const rows = await db.insert(agent_tool_grants).values(guarded).returning();
+    return rows[0]!;
+  },
+  /**
+   * Upsert the effective grant for the current (tenant, agent). One grant per
+   * agent, so we conflict on the (tenant_id, agent_id) unique and overwrite the
+   * grant arrays + provenance. Bumps updated_at.
+   */
+  async upsertForCurrentAgent(
+    input: Pick<NewAgentToolGrant, 'granted_packs' | 'granted_tools' | 'denied_tools'> &
+      Partial<Pick<NewAgentToolGrant, 'granted_by' | 'reason'>>,
+  ): Promise<AgentToolGrantRow> {
+    const guarded = applyTenantGuard(input);
+    const rows = await db
+      .insert(agent_tool_grants)
+      .values(guarded)
+      .onConflictDoUpdate({
+        target: [agent_tool_grants.tenant_id, agent_tool_grants.agent_id],
+        set: {
+          granted_packs: guarded.granted_packs,
+          granted_tools: guarded.granted_tools,
+          denied_tools: guarded.denied_tools,
+          ...(guarded.granted_by !== undefined ? { granted_by: guarded.granted_by } : {}),
+          ...(guarded.reason !== undefined ? { reason: guarded.reason } : {}),
+          updated_at: new Date(),
+        },
+      })
+      .returning();
+    return rows[0]!;
   },
 };
 
@@ -4463,17 +4542,22 @@ export const agentsRepo = {
    * (no orphaned seed_profile or audit row), and the router maps to CONFLICT.
    * Mirrors `tenantsRepo.createWithAuditAtomic` (PR #187).
    *
-   * Issue #410 — BASELINE vs DOMAIN differentiation at agent creation. Every
-   * runtime agent is INTENDED to receive the `DEFAULT_AGENT_PACKS`
-   * (`['baseline.core']`, defined in `src/tools/packs.ts`) tool grant — the
-   * conservative capability floor (read context, recall/remember safe memory,
-   * ask confirmation, audit, escalate). Domain packs are NEVER default; they
-   * are granted explicitly. We record the intended default pack set in the
-   * audit `change_summary` (`default_tool_packs`) so the creation trail shows
-   * the baseline differentiation. The `agent_tool_grants` TABLE and the runtime
-   * enforcement (dispatcher `tool_not_granted` guard) are #408's scope and are
-   * deliberately NOT wired here — this helper only references the intended
-   * default. The baseline SKILLS half is seeded tenant-wide
+   * Issue #410/#408 — BASELINE vs DOMAIN differentiation at agent creation.
+   * Every runtime agent receives the `DEFAULT_AGENT_PACKS` (`['baseline.core']`,
+   * defined in `src/tools/packs.ts`) tool grant — the conservative capability
+   * floor (read context, recall/remember safe memory, ask confirmation, audit,
+   * escalate). Domain packs are NEVER default; they are granted explicitly.
+   *
+   * #408 PERSISTS that default grant: step (3) below inserts the agent's
+   * `agent_tool_grants` row (`granted_packs=['baseline.core']`) IN THE SAME TX
+   * as the agent + seed profile, so an agent never exists without a grant (a
+   * grant-less agent would fail-closed to zero tools at runtime — a silent
+   * regression). The pack-id list is a literal (not imported from
+   * src/tools/packs.ts) so this hot-path repo module stays free of the
+   * tools-registry/gateway import chain; it is kept in sync with
+   * `DEFAULT_AGENT_PACKS`/`defaultAgentGrant()` (a unit test pins the parity).
+   * The runtime enforcement (filter + dispatcher `tool_not_granted` guard) lives
+   * in the tools module. The baseline SKILLS half is seeded tenant-wide
    * (`proposed_by='system'`, active) by migration `075_*` (governed/auditable,
    * not a self-approval — invariant #6).
    */
@@ -4547,8 +4631,25 @@ export const agentsRepo = {
           throw new Error('create_with_seed_atomic_profile_insert_failed: returning() empty');
         }
 
-        // (3) Audit in the SAME tx. If this insert fails, EVERYTHING rolls back
-        //     and the agent + seed profile DO NOT persist — no orphaned setup.
+        // (3) Issue #408 — persist the DEFAULT tool grant in the SAME tx. Every
+        //     agent gets `granted_packs=['baseline.core']` (the conservative
+        //     floor); domain packs are NEVER default. Without this, the agent
+        //     would have no grant row and the runtime filter would fail-closed
+        //     to zero tools. Literal pack id kept in sync with
+        //     `DEFAULT_AGENT_PACKS` (parity pinned by a unit test). No
+        //     applyTenantGuard: tenant_id/agent_id are explicit and match the
+        //     agent row just inserted.
+        await tx.insert(agent_tool_grants).values({
+          tenant_id: args.agent.tenant_id,
+          agent_id: createdAgent.id,
+          granted_packs: ['baseline.core'],
+          granted_by: args.audit.actor_id,
+          reason: 'baseline.core default grant (agent creation, issue #408)',
+        });
+
+        // (4) Audit in the SAME tx. If this insert fails, EVERYTHING rolls back
+        //     and the agent + seed profile + grant DO NOT persist — no orphaned
+        //     setup.
         await tx.insert(admin_audit_log).values({
           tenant_id: args.agent.tenant_id,
           actor_id: args.audit.actor_id,
@@ -4563,11 +4664,11 @@ export const agentsRepo = {
             seed_profile_version: seedProfile.version,
             seed_profile_status: seedProfile.status,
             proposed_reason: args.seed_profile.proposed_reason,
-            // Issue #410 — the intended default tool-pack grant for this agent.
-            // Literal (not imported from src/tools/packs.ts) so this hot-path
-            // repo module stays free of the tools-registry/gateway import chain.
-            // Kept in sync with `DEFAULT_AGENT_PACKS`; #408 persists the actual
-            // grant + enforcement.
+            // Issue #410/#408 — the default tool-pack grant for this agent,
+            // now PERSISTED to `agent_tool_grants` in step (3) above. Literal
+            // (not imported from src/tools/packs.ts) so this hot-path repo
+            // module stays free of the tools-registry/gateway import chain. Kept
+            // in sync with `DEFAULT_AGENT_PACKS`/`defaultAgentGrant()`.
             default_tool_packs: ['baseline.core'],
           },
         });
@@ -4585,8 +4686,11 @@ export const agentsRepo = {
       //
       // We do NOT distinguish by constraint name here: the only 23505 in
       // step (1) is the agents PK; step (2) PK collision is unreachable for
-      // a row whose agent_id was just inserted in the same tx; step (3)
-      // admin_audit_log has no unique index that could collide.
+      // a row whose agent_id was just inserted in the same tx; step (3) the
+      // agent_tool_grants (tenant_id, agent_id) unique is likewise unreachable
+      // for a brand-new agent id (the agents INSERT in step (1) would have
+      // thrown first on a duplicate id); step (4) admin_audit_log has no unique
+      // index that could collide.
       // pgErrorCode unwraps Drizzle's DrizzleQueryError so the underlying
       // pg SQLSTATE (on `.cause`) is read, not the wrapper's undefined code.
       if (pgErrorCode(err) === '23505') {

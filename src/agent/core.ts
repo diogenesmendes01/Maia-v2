@@ -21,7 +21,7 @@ import { TypedError } from '@/lib/utils.js';
 import type { Mensagem, ProcedureExecution, Role } from '@/db/schema.js';
 import { resolveChannel } from '@/gateway/channel-resolver.js';
 import { audit } from '@/governance/audit.js';
-import { getToolSchemas } from '@/tools/_registry.js';
+import { computeRuntimeVisibleTools } from '@/tools/runtime-filter.js';
 import { startTyping } from '@/gateway/presence.js';
 // NOTE (issue #412): procedure-selector / role-selector / step-evaluator and
 // the reflection helpers (detectSuccess/detectCorrection/reflect/classify/
@@ -777,7 +777,18 @@ async function runAgentForMensagemInner(
     activeExecution,
   });
 
-  let tools = getToolSchemas(scope.byEntity);
+  // Issue #408 — Runtime Tool Filter. Composes the AGENT grant
+  // (agent_tool_grants: baseline.core ∪ packs ∪ tools − denied) with the HUMAN
+  // permission view + feature flags, and audits the provenance
+  // (`tool_visibility_resolved`). An agent without a domain pack sees only the
+  // baseline floor; a denied tool is invisible (and the dispatcher refuses it).
+  // The SKILL scope is applied below via the decision packet's tool_permissions
+  // (`applyToolReductions`); the audience/data_scope/risk layer is #409.
+  const visibility = await computeRuntimeVisibleTools({
+    byEntity: scope.byEntity,
+    audit_context: { pessoa_id: pessoa.id, conversa_id: c.id, mensagem_id: inbound.id },
+  });
+  let tools = visibility.tools;
 
   // P11 — Decision Engine gate: always runs BEFORE the LLM call. The engine
   // gates the turn (block/escalate short-circuit) and tool_reductions are

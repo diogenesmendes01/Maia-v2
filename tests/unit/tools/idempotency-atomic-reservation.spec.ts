@@ -107,6 +107,16 @@ vi.mock('@/db/repositories.js', () => ({
     store: vi.fn(async () => undefined),
     cleanup: vi.fn(async () => 0),
   },
+  // Issue #408 — the dispatcher's `tool_not_granted` guard resolves the agent
+  // grant. Grant the synthetic test tool so the guard passes and these tests
+  // exercise the idempotency-reservation flow they target.
+  agentToolGrantsRepo: {
+    findForCurrentAgent: vi.fn(async () => ({
+      granted_packs: [],
+      granted_tools: ['fake_tool'],
+      denied_tools: [],
+    })),
+  },
 }));
 
 // Stub the dispatcher's collateral deps so the test focuses on the

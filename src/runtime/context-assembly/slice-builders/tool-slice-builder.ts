@@ -56,6 +56,14 @@ export class ToolPermissionSliceBuilder
     // computed at build-time. See cacheScope inside build().
     // Issue #235: agent_id flows in via sliceCacheKey's prefix so two
     // agents in the same tenant with different tool grants never collide.
+    //
+    // Issue #408 — the AGENT-grant ∩ HUMAN-permission Runtime Tool Filter is
+    // computed in `src/tools/runtime-filter.ts` (`computeRuntimeVisibleTools`)
+    // on the live `core.ts` path; this slice hydrates metadata for the tools the
+    // decision already allowed (`decision.tool_permissions.allowed_tools`, which
+    // carries the SKILL scope). Because allowed/blocked are already scoped per
+    // (tenant, agent) by the decision packet, the agent grant is reflected in
+    // the cacheScope below without a second source of truth here.
     return sliceCacheKey(base.tenant_id, base.agent_id, 'tool', 'placeholder');
   }
 

@@ -34,6 +34,7 @@ import {
   MissingTenantContextError,
 } from '@/db/tenant-context.js';
 import type { ModeContext } from '../types.js';
+import { resolveSkillToolScope } from '@/tools/grant-math.js';
 
 /**
  * Deterministic hash of arbitrary args for idempotency key derivation.
@@ -147,7 +148,14 @@ export async function toolMediatedMode(
 ): Promise<Record<string, unknown>> {
   const procedure = (ctx.skill.procedure ?? {}) as ProcedureSpec;
   const hints = (ctx.skill.runtime_hints ?? {}) as Record<string, unknown>;
-  const allowedTools = (ctx.skill.allowed_tools ?? []) as string[];
+  // Issue #408 — SkillToolScope. `allowed_tools` is the existing allowlist;
+  // `denied_tools` (from `blocked_tools` / `runtime_hints.denied_tools`) is a
+  // HARD deny applied here at the executor (defense in depth alongside the
+  // visibility filter). `requires_confirmation_for` is carried by the decision
+  // packet, not enforced as a visibility filter here.
+  const skillScope = resolveSkillToolScope(ctx.skill);
+  const allowedTools = [...(skillScope.allowed_tools ?? [])];
+  const deniedTools = new Set(skillScope.denied_tools ?? []);
 
   const system = procedure.system_prompt ?? procedure.template ?? '';
   const max_tokens = typeof hints.max_output_tokens === 'number' ? hints.max_output_tokens : 2048;
@@ -161,9 +169,10 @@ export async function toolMediatedMode(
       ? hints.max_prompt_tokens + max_tokens * (maxToolCalls + 1)
       : Number.POSITIVE_INFINITY;
 
-  // Filter tool schemas to only those declared in allowed_tools (defense in depth).
-  const tools: ToolSchema[] = (procedure.tool_schemas ?? []).filter((t) =>
-    allowedTools.includes(t.name),
+  // Filter tool schemas to only those declared in allowed_tools and NOT in
+  // denied_tools (defense in depth — #408 SkillToolScope HARD deny).
+  const tools: ToolSchema[] = (procedure.tool_schemas ?? []).filter(
+    (t) => allowedTools.includes(t.name) && !deniedTools.has(t.name),
   );
 
   const messages: LLMMessage[] = [{ role: 'user', content: JSON.stringify(ctx.input) }];
@@ -340,7 +349,7 @@ export async function toolMediatedMode(
       if (ctx.signal?.aborted) {
         throw new Error('aborted');
       }
-      if (!allowedTools.includes(tu.tool)) {
+      if (!allowedTools.includes(tu.tool) || deniedTools.has(tu.tool)) {
         toolResults.push({
           type: 'tool_result',
           tool_use_id: tu.id,

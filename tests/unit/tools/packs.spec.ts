@@ -119,3 +119,62 @@ describe('baseline.core tool pack (issue #410)', () => {
     expect(TOOL_PACKS['baseline.core']!.id).toBe('baseline.core');
   });
 });
+
+describe('domain.* tool packs (issue #408)', () => {
+  it('TOOL_PACKS exposes the 5 domain packs by id, each with name/domain/risk_level', async () => {
+    const { TOOL_PACKS } = await import('../../../src/tools/packs.js');
+    const ids = ['domain.finance', 'domain.sales', 'domain.support', 'domain.calendar', 'domain.operations'];
+    for (const id of ids) {
+      const pack = TOOL_PACKS[id];
+      expect(pack, `${id} must be registered`).toBeDefined();
+      expect(pack!.id).toBe(id);
+      expect(typeof pack!.name).toBe('string');
+      expect(typeof pack!.domain).toBe('string');
+      expect(['low', 'medium', 'high']).toContain(pack!.risk_level);
+      expect(pack!.tools.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('domain.finance is high-risk and lists the authorised finance tools', async () => {
+    const { DOMAIN_FINANCE_PACK } = await import('../../../src/tools/packs.js');
+    expect(DOMAIN_FINANCE_PACK.id).toBe('domain.finance');
+    expect(DOMAIN_FINANCE_PACK.risk_level).toBe('high');
+    expect([...DOMAIN_FINANCE_PACK.tools].sort()).toEqual(
+      [
+        'register_transaction',
+        'cancel_transaction',
+        'query_balance',
+        'list_transactions',
+        'classify_transaction',
+        'compare_entities',
+        'generate_report',
+        'start_recurring_payment',
+        'identify_entity',
+      ].sort(),
+    );
+  });
+
+  it('domain packs do NOT leak into DEFAULT_AGENT_PACKS (domain is never default)', async () => {
+    const { DEFAULT_AGENT_PACKS } = await import('../../../src/tools/packs.js');
+    expect([...DEFAULT_AGENT_PACKS]).toEqual(['baseline.core']);
+    expect(DEFAULT_AGENT_PACKS).not.toContain('domain.finance');
+  });
+
+  it('every domain-pack tool is KNOWN to the platform (catalog incl. flag-gated)', async () => {
+    const { DOMAIN_PACKS } = await import('../../../src/tools/packs.js');
+    const { buildToolCatalog } = await import('../../../src/tools/_registry.js');
+    const known = new Set(buildToolCatalog().map((e) => e.tool.name));
+    for (const pack of DOMAIN_PACKS) {
+      for (const t of pack.tools) {
+        expect(known.has(t), `pack ${pack.id} tool ${t} must be a known tool`).toBe(true);
+      }
+    }
+  });
+
+  it('resolvePackTools(domain.finance) returns the finance tool union', async () => {
+    const { resolvePackTools, DOMAIN_FINANCE_PACK } = await import('../../../src/tools/packs.js');
+    expect(resolvePackTools(['domain.finance']).sort()).toEqual(
+      [...DOMAIN_FINANCE_PACK.tools].sort(),
+    );
+  });
+});
