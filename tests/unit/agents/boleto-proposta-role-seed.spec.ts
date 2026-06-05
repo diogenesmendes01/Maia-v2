@@ -11,6 +11,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { SkillUsagePolicySchema } from '@/skills/usage-policy.js';
 
 const MIGRATION = readFileSync(
   fileURLToPath(new URL('../../../migrations/079_boleto_proposta_attendant_role_and_skills.sql', import.meta.url)),
@@ -325,5 +326,43 @@ describe('Issue #415 — migration shape', () => {
     expect(MIGRATION_DOWN).toMatch(/DROP COLUMN IF EXISTS applicable_to_role/);
     expect(MIGRATION_DOWN).toMatch(/DROP COLUMN IF EXISTS granted_packs/);
     expect(MIGRATION_DOWN).toContain(ROLE_KEY);
+  });
+});
+
+describe('Issue #415 — usage_policy admits the external WhatsApp audience (review #430)', () => {
+  // Extract the `WHEN '<skill>' THEN '<json>'` arms of the usage_policy CASE.
+  const policyBySkill = new Map<string, unknown>();
+  for (const m of MIGRATION.matchAll(/WHEN '([a-z_]+)' THEN '(\{[^']*\})'/g)) {
+    policyBySkill.set(m[1]!, JSON.parse(m[2]!));
+  }
+
+  it('seeds a usage_policy for every one of the 8 skills (not the conservative NULL default)', () => {
+    for (const key of SKILL_KEYS) {
+      expect(policyBySkill.has(key), `${key} must carry a seeded usage_policy`).toBe(true);
+    }
+  });
+
+  it('every seeded usage_policy is a VALID SkillUsagePolicy (#409 schema)', () => {
+    for (const key of SKILL_KEYS) {
+      const parsed = SkillUsagePolicySchema.safeParse(policyBySkill.get(key));
+      expect(
+        parsed.success,
+        `${key} usage_policy invalid: ${parsed.success ? '' : JSON.stringify(parsed.error.issues)}`,
+      ).toBe(true);
+    }
+  });
+
+  it('every usage_policy ADMITS the external customer audience (the #430 fix)', () => {
+    for (const key of SKILL_KEYS) {
+      const p = policyBySkill.get(key) as { allowed_audience: string[] };
+      expect(p.allowed_audience, `${key} must admit 'customer'`).toContain('customer');
+    }
+  });
+
+  it('write-intent skills do NOT self-confirm (confirmation stays a policy decision)', () => {
+    for (const key of SKILL_KEYS) {
+      const p = policyBySkill.get(key) as { requires_confirmation: boolean };
+      expect(p.requires_confirmation, `${key} usage_policy must not self-confirm`).toBe(false);
+    }
   });
 });

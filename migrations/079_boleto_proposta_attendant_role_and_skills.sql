@@ -151,7 +151,7 @@ INSERT INTO skills (
   tenant_id, agent_id, skill_descriptor, category, execution_mode,
   goal, when_to_use, procedure, constraints,
   input_schema, output_schema,
-  allowed_tools, policy_descriptors, applicable_to_role,
+  allowed_tools, policy_descriptors, applicable_to_role, usage_policy,
   success_criteria, failure_modes, runtime_hints,
   status, version, proposed_by, proposed_reason,
   approved_by, approved_at, activated_at
@@ -162,6 +162,28 @@ SELECT
   '{"type":"object"}'::jsonb, '{"type":"object"}'::jsonb,
   v.allowed_tools::text[], v.policy_descriptors::text[],
   ARRAY['whatsapp_boleto_proposta_attendant']::text[],
+  -- usage_policy (#409): EXPLICIT per-skill admission so the EXTERNAL WhatsApp
+  -- audience (company customers / leads) is ADMITTED. Without it the skills fall
+  -- to the conservative NULL default (internal-only), which the #409 gate uses to
+  -- block customer/lead — exactly this role's target audience. (The gate does not
+  -- run for role-bound skills until `active_role_key` is wired — see the PR's
+  -- "runtime is a follow-up" note — but the seed must be correct now.) Profiles:
+  --   A = own-customer data (read/write of the company's OWN billing), subject_only,
+  --       blocks at/above high risk (→ escalation);
+  --   B = public/process info (identification + Q&A; admits leads), public_safe;
+  --   C = internal escalation (ticket/handoff), internal_only.
+  -- All require known_external trust and never self-confirm (confirmation is the
+  -- write/risk policy's job, never the skill's).
+  CASE v.skill_descriptor
+    WHEN 'inspect_customer_billing_context' THEN '{"allowed_audience":["customer"],"data_scope":["own_customer_data_only"],"exposure_policy":"subject_only","requires_auth_level":"known_external","requires_confirmation":false,"blocked_when_risk_at_or_above":"high"}'
+    WHEN 'cancel_proposal_billing' THEN '{"allowed_audience":["customer"],"data_scope":["own_customer_data_only"],"exposure_policy":"subject_only","requires_auth_level":"known_external","requires_confirmation":false,"blocked_when_risk_at_or_above":"high"}'
+    WHEN 'refund_intake' THEN '{"allowed_audience":["customer"],"data_scope":["own_customer_data_only"],"exposure_policy":"subject_only","requires_auth_level":"known_external","requires_confirmation":false,"blocked_when_risk_at_or_above":"high"}'
+    WHEN 'refund_followup' THEN '{"allowed_audience":["customer"],"data_scope":["own_customer_data_only"],"exposure_policy":"subject_only","requires_auth_level":"known_external","requires_confirmation":false,"blocked_when_risk_at_or_above":"high"}'
+    WHEN 'analyze_customer_documents' THEN '{"allowed_audience":["customer"],"data_scope":["own_customer_data_only"],"exposure_policy":"subject_only","requires_auth_level":"known_external","requires_confirmation":false,"blocked_when_risk_at_or_above":"high"}'
+    WHEN 'identify_company_customer' THEN '{"allowed_audience":["customer","lead"],"data_scope":["public_info"],"exposure_policy":"public_safe","requires_auth_level":"known_external","requires_confirmation":false}'
+    WHEN 'answer_boleto_proposal_questions' THEN '{"allowed_audience":["customer","lead"],"data_scope":["public_info"],"exposure_policy":"public_safe","requires_auth_level":"known_external","requires_confirmation":false}'
+    WHEN 'evaluate_escalation_need' THEN '{"allowed_audience":["customer","lead"],"data_scope":["own_customer_data_only","public_info"],"exposure_policy":"internal_only","requires_auth_level":"known_external","requires_confirmation":false}'
+  END::jsonb,
   '[]'::jsonb, '[]'::jsonb, '{}'::jsonb,
   'active', 1, 'system', 'boleto proposta attendant role-specific skill (issue #415)',
   'system', NOW(), NOW()
