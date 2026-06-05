@@ -16,6 +16,12 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { runWithTenantContext } from '../../../src/db/tenant-context.js';
+
+// Issue #355: seriesRepo methods resolve tenant/agent from the ALS context.
+// All flows here run inside a single tenant (the cancel-race contract is
+// within one tenant; cross-tenant isolation is covered separately).
+const TENANT = { tenant_id: 'tenant-A', agent_id: 'agent-A' };
 
 // State machine for the series. We simulate two workers operating on it.
 type State = {
@@ -120,56 +126,62 @@ describe('Requirement 5 — cancel-race', () => {
   it('cancel commits BEFORE next-occurrence insert: insert is dropped', async () => {
     const { seriesRepo } = await import('../../../src/scheduling/repos.js');
 
-    // Step 1: cancel commits (status=cancelled, version=2).
-    const cancelResult = await seriesRepo.cancelAtomic(state.series_id, 'owner-id');
-    expect(cancelResult.series?.status).toBe('cancelled');
-    expect(state.status).toBe('cancelled');
-    expect(state.occurrences.find((o) => o.id === 'occ-existing')?.status).toBe('cancelled');
+    await runWithTenantContext(TENANT, async () => {
+      // Step 1: cancel commits (status=cancelled, version=2).
+      const cancelResult = await seriesRepo.cancelAtomic(state.series_id, 'owner-id');
+      expect(cancelResult.series?.status).toBe('cancelled');
+      expect(state.status).toBe('cancelled');
+      expect(state.occurrences.find((o) => o.id === 'occ-existing')?.status).toBe('cancelled');
 
-    // Step 2: engine (with stale version=1 it read earlier) attempts to
-    // insert the next occurrence. Guard rejects (0 rows match status=active
-    // AND version=1).
-    const insertResult = await seriesRepo.insertNextOccurrenceIfActive({
-      series_id: state.series_id,
-      expected_version: 1,
-      scheduled_for: new Date('2026-06-05T12:00:00Z'),
-      contexto_snapshot: { texto: 'X', canal: 'whatsapp' } as never,
-      tasks: [{ ordem: 1, kind: 'fire_reminder' }],
+      // Step 2: engine (with stale version=1 it read earlier) attempts to
+      // insert the next occurrence. Guard rejects (0 rows match status=active
+      // AND version=1).
+      const insertResult = await seriesRepo.insertNextOccurrenceIfActive({
+        series_id: state.series_id,
+        expected_version: 1,
+        scheduled_for: new Date('2026-06-05T12:00:00Z'),
+        contexto_snapshot: { texto: 'X', canal: 'whatsapp' } as never,
+        tasks: [{ ordem: 1, kind: 'fire_reminder' }],
+      });
+      expect(insertResult.occurrence).toBeNull();
+      // No new "occ-new-*" was added.
+      expect(state.occurrences.some((o) => o.id.startsWith('occ-new'))).toBe(false);
     });
-    expect(insertResult.occurrence).toBeNull();
-    // No new "occ-new-*" was added.
-    expect(state.occurrences.some((o) => o.id.startsWith('occ-new'))).toBe(false);
   });
 
   it('insert raced and won (cancel arrives a moment later): cancel still flips the new occurrence to cancelled', async () => {
     const { seriesRepo } = await import('../../../src/scheduling/repos.js');
 
-    // Step 1: engine inserts the next occurrence while series is still
-    // active and version matches.
-    const ins = await seriesRepo.insertNextOccurrenceIfActive({
-      series_id: state.series_id,
-      expected_version: 1,
-      scheduled_for: new Date('2026-06-05T12:00:00Z'),
-      contexto_snapshot: { texto: 'X', canal: 'whatsapp' } as never,
-      tasks: [{ ordem: 1, kind: 'fire_reminder' }],
-    });
-    expect(ins.occurrence).not.toBeNull();
-    expect(state.occurrences.filter((o) => o.id.startsWith('occ-new')).length).toBe(1);
+    await runWithTenantContext(TENANT, async () => {
+      // Step 1: engine inserts the next occurrence while series is still
+      // active and version matches.
+      const ins = await seriesRepo.insertNextOccurrenceIfActive({
+        series_id: state.series_id,
+        expected_version: 1,
+        scheduled_for: new Date('2026-06-05T12:00:00Z'),
+        contexto_snapshot: { texto: 'X', canal: 'whatsapp' } as never,
+        tasks: [{ ordem: 1, kind: 'fire_reminder' }],
+      });
+      expect(ins.occurrence).not.toBeNull();
+      expect(state.occurrences.filter((o) => o.id.startsWith('occ-new')).length).toBe(1);
 
-    // Step 2: cancel atomic — flips status to cancelled AND moves all
-    // pending occurrences (including the new one) to cancelled.
-    const cancel = await seriesRepo.cancelAtomic(state.series_id, 'owner-id');
-    expect(cancel.series?.status).toBe('cancelled');
-    expect(state.occurrences.every((o) => o.status === 'cancelled')).toBe(true);
+      // Step 2: cancel atomic — flips status to cancelled AND moves all
+      // pending occurrences (including the new one) to cancelled.
+      const cancel = await seriesRepo.cancelAtomic(state.series_id, 'owner-id');
+      expect(cancel.series?.status).toBe('cancelled');
+      expect(state.occurrences.every((o) => o.status === 'cancelled')).toBe(true);
+    });
   });
 
   it('cancel is idempotent: re-cancel is a no-op (no version bump, no error)', async () => {
     const { seriesRepo } = await import('../../../src/scheduling/repos.js');
-    const r1 = await seriesRepo.cancelAtomic(state.series_id, 'owner-id');
-    expect(r1.series?.status).toBe('cancelled');
-    expect(state.version).toBe(2);
-    const r2 = await seriesRepo.cancelAtomic(state.series_id, 'owner-id');
-    expect(r2.cancelled_occurrence_ids).toEqual([]);
-    expect(state.version).toBe(2); // no double-bump
+    await runWithTenantContext(TENANT, async () => {
+      const r1 = await seriesRepo.cancelAtomic(state.series_id, 'owner-id');
+      expect(r1.series?.status).toBe('cancelled');
+      expect(state.version).toBe(2);
+      const r2 = await seriesRepo.cancelAtomic(state.series_id, 'owner-id');
+      expect(r2.cancelled_occurrence_ids).toEqual([]);
+      expect(state.version).toBe(2); // no double-bump
+    });
   });
 });

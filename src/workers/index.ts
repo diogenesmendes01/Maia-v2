@@ -54,8 +54,14 @@ export const JOBS: Job[] = [
   //  - series_next_scheduler: every 10 min, backfills missing next-cycle
   //    occurrences for any active series whose chain was broken by a
   //    failure between completion and re-schedule.
-  // Scheduling tables (series/occurrences/tasks/outbox_messages) ainda não
-  // têm tenant_id em P0 — workers rodam fora de tenant context.
+  // Issue #355: scheduling tables (series/occurrences/tasks/outbox_messages)
+  // carry tenant_id/agent_id (migrations 071/072/073) and every scheduling
+  // query scopes by the ALS tenant context. Each of these three workers is now
+  // a per-tenant DISPATCHER — it enumerates DISTINCT (tenant_id, agent_id)
+  // tuples with work and opens runWithTenantContext per tuple, fail-isolated
+  // (espelha reflection-batch #240/#251). Scheduling V2 is 100% cutover (#406
+  // removed FEATURE_SCHEDULING_V2), so these run every tick and cleanly no-op
+  // when no tenant has work.
   { name: 'scheduling_tick', cron: '* * * * *', fn: runScheduling, phase: 1 },
   { name: 'outbox_drain', cron: '* * * * *', fn: runOutboxDrainWorker, phase: 1 },
   { name: 'series_next_scheduler', cron: '*/10 * * * *', fn: runSeriesNextSchedulerWorker, phase: 1 },

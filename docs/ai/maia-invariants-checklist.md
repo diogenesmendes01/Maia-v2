@@ -33,9 +33,14 @@
 
 ## Deterministic Confidence
 
-- [ ] Confidence is computed from evidence, counters, or deterministic scoring.
-- [ ] The LLM does not declare its own confidence for downstream decisions.
-- [ ] Any scoring change has tests or a clear validation plan.
+Two distinct kinds of "confidence" live in Maia; keep them separate:
+
+- **(a) Self-model / governance confidence** (drift, capability/skill maturity, gap escalation, KSM promotion) is **computed deterministically** from evidence counts, counters, or scoring formulas. The **LLM never declares it**. This is the inviolable invariant.
+- **(b) Decision-engine routing confidence** (intent classification, pending-question resolution, procedure selection) **may be proposed by the LLM**, but the backend **always gates it against a deterministic threshold** before acting — "LLM proposes, backend decides." It is never acted on as a self-asserted authority.
+
+- [ ] Self-model / governance confidence is computed from evidence, counters, or deterministic scoring — never declared by the LLM.
+- [ ] LLM-proposed routing confidence (if any) is consumed only behind a backend threshold, not trusted directly.
+- [ ] Any scoring or threshold change has tests or a clear validation plan.
 
 ## Governed Identity and Learning
 

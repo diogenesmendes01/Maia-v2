@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { runWithTenantContext } from '../../src/db/tenant-context.js';
 
 /**
  * Requirement 5: cancellation must prevent NEW occurrences even with a
@@ -9,7 +10,11 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
  * underlying drizzle transaction's `select` to return the post-cancel
  * series state and asserting the function reports `occurrence: null`
  * without ever calling `insert`.
+ *
+ * Issue #355: these repo methods now resolve tenant/agent from the ALS
+ * context, so every call runs inside `runWithTenantContext`.
  */
+const TENANT = { tenant_id: 'tenant-A', agent_id: 'agent-A' };
 
 const txSelectChain = {
   from: vi.fn().mockReturnThis(),
@@ -59,13 +64,15 @@ describe('seriesRepo.insertNextOccurrenceIfActive — Requirement 5', () => {
     // Engine read version=1 earlier; cancel fired in between and bumped to v=2.
     txSelectChain.limit.mockResolvedValue([]); // guard returns 0 rows.
     const { seriesRepo } = await import('../../src/scheduling/repos.js');
-    const result = await seriesRepo.insertNextOccurrenceIfActive({
-      series_id: 'series-1',
-      expected_version: 1,
-      scheduled_for: new Date('2026-06-05T12:00:00Z'),
-      contexto_snapshot: { texto: 'x', canal: 'whatsapp' } as never,
-      tasks: [{ ordem: 1, kind: 'fire_reminder' }],
-    });
+    const result = await runWithTenantContext(TENANT, () =>
+      seriesRepo.insertNextOccurrenceIfActive({
+        series_id: 'series-1',
+        expected_version: 1,
+        scheduled_for: new Date('2026-06-05T12:00:00Z'),
+        contexto_snapshot: { texto: 'x', canal: 'whatsapp' } as never,
+        tasks: [{ ordem: 1, kind: 'fire_reminder' }],
+      }),
+    );
     expect(result).toEqual({ occurrence: null, tasks: [] });
     expect(txMock.insert).not.toHaveBeenCalled();
   });
@@ -74,13 +81,15 @@ describe('seriesRepo.insertNextOccurrenceIfActive — Requirement 5', () => {
     // Series still active but at version=3 now; engine had v=1.
     txSelectChain.limit.mockResolvedValue([]); // guard fails — no row with v=1+active
     const { seriesRepo } = await import('../../src/scheduling/repos.js');
-    const result = await seriesRepo.insertNextOccurrenceIfActive({
-      series_id: 'series-1',
-      expected_version: 1,
-      scheduled_for: new Date('2026-06-05T12:00:00Z'),
-      contexto_snapshot: { texto: 'x', canal: 'whatsapp' } as never,
-      tasks: [{ ordem: 1, kind: 'fire_reminder' }],
-    });
+    const result = await runWithTenantContext(TENANT, () =>
+      seriesRepo.insertNextOccurrenceIfActive({
+        series_id: 'series-1',
+        expected_version: 1,
+        scheduled_for: new Date('2026-06-05T12:00:00Z'),
+        contexto_snapshot: { texto: 'x', canal: 'whatsapp' } as never,
+        tasks: [{ ordem: 1, kind: 'fire_reminder' }],
+      }),
+    );
     expect(result).toEqual({ occurrence: null, tasks: [] });
     expect(txMock.insert).not.toHaveBeenCalled();
   });
@@ -91,13 +100,15 @@ describe('seriesRepo.insertNextOccurrenceIfActive — Requirement 5', () => {
       .mockResolvedValueOnce([{ id: 'occ-new', scheduled_for: new Date() }])
       .mockResolvedValueOnce([{ id: 'task-new', ordem: 1, kind: 'fire_reminder' }]);
     const { seriesRepo } = await import('../../src/scheduling/repos.js');
-    const result = await seriesRepo.insertNextOccurrenceIfActive({
-      series_id: 'series-1',
-      expected_version: 1,
-      scheduled_for: new Date('2026-06-05T12:00:00Z'),
-      contexto_snapshot: { texto: 'x', canal: 'whatsapp' } as never,
-      tasks: [{ ordem: 1, kind: 'fire_reminder' }],
-    });
+    const result = await runWithTenantContext(TENANT, () =>
+      seriesRepo.insertNextOccurrenceIfActive({
+        series_id: 'series-1',
+        expected_version: 1,
+        scheduled_for: new Date('2026-06-05T12:00:00Z'),
+        contexto_snapshot: { texto: 'x', canal: 'whatsapp' } as never,
+        tasks: [{ ordem: 1, kind: 'fire_reminder' }],
+      }),
+    );
     expect(result.occurrence).not.toBeNull();
     expect(txInsertChain.values).toHaveBeenCalledTimes(2); // occurrence + tasks
   });
@@ -108,13 +119,15 @@ describe('seriesRepo.insertNextOccurrenceIfActive — Requirement 5', () => {
       new Error('duplicate key value violates unique constraint'),
     );
     const { seriesRepo } = await import('../../src/scheduling/repos.js');
-    const result = await seriesRepo.insertNextOccurrenceIfActive({
-      series_id: 'series-1',
-      expected_version: 1,
-      scheduled_for: new Date('2026-06-05T12:00:00Z'),
-      contexto_snapshot: { texto: 'x', canal: 'whatsapp' } as never,
-      tasks: [{ ordem: 1, kind: 'fire_reminder' }],
-    });
+    const result = await runWithTenantContext(TENANT, () =>
+      seriesRepo.insertNextOccurrenceIfActive({
+        series_id: 'series-1',
+        expected_version: 1,
+        scheduled_for: new Date('2026-06-05T12:00:00Z'),
+        contexto_snapshot: { texto: 'x', canal: 'whatsapp' } as never,
+        tasks: [{ ordem: 1, kind: 'fire_reminder' }],
+      }),
+    );
     expect(result).toEqual({ occurrence: null, tasks: [] });
   });
 });
@@ -125,7 +138,9 @@ describe('seriesRepo.cancelAtomic — Requirement 5', () => {
       .mockResolvedValueOnce([{ id: 'series-1', status: 'cancelled', version: 2 }]) // series update
       .mockResolvedValueOnce([{ id: 'occ-1' }, { id: 'occ-2' }]); // occurrences update
     const { seriesRepo } = await import('../../src/scheduling/repos.js');
-    const result = await seriesRepo.cancelAtomic('series-1', 'owner-id');
+    const result = await runWithTenantContext(TENANT, () =>
+      seriesRepo.cancelAtomic('series-1', 'owner-id'),
+    );
     expect(result.series?.status).toBe('cancelled');
     expect(result.cancelled_occurrence_ids.sort()).toEqual(['occ-1', 'occ-2']);
     expect(withTxMock).toHaveBeenCalledTimes(1);
@@ -137,7 +152,9 @@ describe('seriesRepo.cancelAtomic — Requirement 5', () => {
       { id: 'series-1', status: 'cancelled', version: 5 },
     ]);
     const { seriesRepo } = await import('../../src/scheduling/repos.js');
-    const result = await seriesRepo.cancelAtomic('series-1', 'owner-id');
+    const result = await runWithTenantContext(TENANT, () =>
+      seriesRepo.cancelAtomic('series-1', 'owner-id'),
+    );
     expect(result.series?.status).toBe('cancelled');
     expect(result.cancelled_occurrence_ids).toEqual([]);
   });

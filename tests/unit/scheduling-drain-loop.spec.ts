@@ -2,6 +2,11 @@
  * Review 2 — Blocker 4: the outbox-drain worker must LOOP within one
  * cron firing to honour the per-second rate cadence. Without the loop,
  * a per-minute cron + per-second rate gate yields ~1 msg/minute.
+ *
+ * Issue #355: the worker is now a per-tenant dispatcher. We mock the
+ * enumeration to return a SINGLE tenant so the loop semantics (the original
+ * Blocker-4 contract) are tested in isolation; the per-tenant fan-out itself is
+ * covered separately in `tests/unit/scheduling-tenant-isolation.spec.ts`.
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -21,17 +26,33 @@ vi.mock('../../src/scheduling/outbox-drain.js', () => ({
   runOutboxDrain: runOutboxDrainMock,
 }));
 
+// Dispatcher enumeration: a single tenant tuple so the pass-loop runs once
+// (the original Blocker-4 contract is per-tenant now).
+const enumerateOutboxTenantsMock = vi
+  .fn()
+  .mockResolvedValue([{ tenant_id: 'tenant-A', agent_id: 'agent-A' }]);
+vi.mock('../../src/scheduling/repos.js', () => ({
+  schedulingDispatch: { enumerateOutboxTenants: enumerateOutboxTenantsMock },
+}));
+
 vi.mock('../../src/lib/logger.js', () => ({
   logger: { warn: vi.fn(), info: vi.fn(), debug: vi.fn(), error: vi.fn() },
 }));
 
 vi.mock('../../src/config/env.js', () => ({
-  config: { OUTBOX_DRAIN_LOOP_PASSES: 5, OUTBOX_DRAIN_LOOP_SLEEP_MS: 0 },
+  config: {
+    FEATURE_SCHEDULING_V2: true,
+    OUTBOX_DRAIN_LOOP_PASSES: 5,
+    OUTBOX_DRAIN_LOOP_SLEEP_MS: 0,
+  },
 }));
 
 beforeEach(() => {
   drainResults.length = 0;
   runOutboxDrainMock.mockClear();
+  enumerateOutboxTenantsMock
+    .mockClear()
+    .mockResolvedValue([{ tenant_id: 'tenant-A', agent_id: 'agent-A' }]);
 });
 
 describe('outbox-drain worker loop — Blocker 4 (review 2)', () => {
