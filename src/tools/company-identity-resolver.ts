@@ -111,7 +111,7 @@ export const companyIdentityResolverTool: Tool<typeof inputSchema, typeof output
     'Resolve a identidade informal/ambígua de uma empresa (contraparte) a partir de nome parcial, nome fantasia, razão social, sócio, CNPJ ou texto livre, antes da busca formal. CNPJ exato tem prioridade sobre nome; resultado ambíguo pede confirmação. Apenas leitura, escopo tenant/agente.',
   input_schema: inputSchema,
   output_schema: outputSchema,
-  required_actions: ['read_balance'],
+  required_actions: ['read_company'],
   side_effect: 'read',
   redis_required: false,
   operation_type: 'read',

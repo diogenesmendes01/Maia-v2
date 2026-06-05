@@ -108,7 +108,7 @@ export const receiptValidateTool: Tool<typeof inputSchema, typeof outputSchema> 
     'Valida um comprovante de pagamento enviado pelo cliente e normaliza sinais operacionais (valor, data, beneficiário, autenticidade) para fluxos de pagamento/reembolso. Delega o OCR para parse_receipt (reuso de cache de visão) — não chama o modelo de visão diretamente e nunca aprova reembolso.',
   input_schema: inputSchema,
   output_schema: outputSchema,
-  required_actions: ['read_balance'],
+  required_actions: ['read_billing'],
   side_effect: 'read',
   redis_required: false,
   operation_type: 'parse_only',

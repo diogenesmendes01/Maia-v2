@@ -302,6 +302,17 @@ export const ACTION_KEYS = [
   // grant. Gate state (pending/confirmation) is NOT covered — it routes through
   // `ask_pending_question`.
   'update_conversation_state',
+  // Issue #431 — dedicated read action keys for the boleto-proposal domain
+  // adapters (and the #432 stubs), so company/billing reads are NOT gated on the
+  // financial `read_balance` permission. Least-privilege per the capability
+  // taxonomy (#418): an agent may be allowed to look up a company / billing
+  // record WITHOUT carrying balance-read.
+  //   `read_company`: contraparte registration / relationship / history /
+  //     blacklist / campaign-status reads.
+  //   `read_billing`: boleto / payment / DDA / refund record reads, and receipt
+  //     validation (which surfaces payment signals from a receipt).
+  'read_company',
+  'read_billing',
 ] as const;
 
 export type ActionKey = (typeof ACTION_KEYS)[number];

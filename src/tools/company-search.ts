@@ -92,7 +92,7 @@ export const companySearchTool: Tool<typeof inputSchema, typeof outputSchema> = 
     'Busca formal de empresa (contraparte) por company_id, CNPJ, razão social, nome fantasia ou sócio. Prioriza company_id e CNPJ exatos antes de busca textual. Apenas leitura, escopo tenant/agente.',
   input_schema: inputSchema,
   output_schema: outputSchema,
-  required_actions: ['read_balance'],
+  required_actions: ['read_company'],
   side_effect: 'read',
   redis_required: false,
   operation_type: 'read',
