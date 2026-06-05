@@ -52,7 +52,11 @@ export const receiptValidateTool: Tool<typeof inputSchema, typeof outputSchema> 
     'Analisa um comprovante enviado pelo cliente (valor, data, pagador/recebedor) e faz validação básica de autenticidade. REUTILIZA os parsers parse_receipt/parse_image — não é um novo OCR. Apenas leitura.',
   input_schema: inputSchema,
   output_schema: outputSchema,
-  required_actions: [],
+  // Inherits the reused parsers' permission: the handler calls parse_image /
+  // parse_receipt directly, both of which require `read_balance`. Declaring it
+  // here ensures canAct gates receipt_validate with the same permission instead
+  // of silently bypassing the parsers' authorization.
+  required_actions: ['read_balance'],
   side_effect: 'read',
   redis_required: false,
   operation_type: 'parse_only',

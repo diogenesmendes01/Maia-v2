@@ -17,13 +17,21 @@
 import { z } from 'zod';
 import type { Tool } from './_registry.js';
 
-const inputSchema = z.object({
-  entidade_id: z.string().uuid(),
-  cnpj: z.string().max(20).optional(),
-  company_id: z.string().max(64).optional(),
-  reason: z.string().min(1).max(500),
-  dual_approval_granted: z.boolean().optional(),
-});
+const inputSchema = z
+  .object({
+    entidade_id: z.string().uuid(),
+    cnpj: z.string().max(20).optional(),
+    company_id: z.string().max(64).optional(),
+    reason: z.string().min(1).max(500),
+    dual_approval_granted: z.boolean().optional(),
+  })
+  // Target must be unambiguous: require at least one company identifier. The
+  // policy declares `company_identified`, but the schema itself must reject a
+  // write request that names neither cnpj nor company_id.
+  .refine((v) => Boolean(v.cnpj ?? v.company_id), {
+    message: 'company_campaign_remove requires cnpj or company_id',
+    path: ['company_id'],
+  });
 
 const outputSchema = z.union([
   z.object({

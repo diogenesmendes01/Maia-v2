@@ -28,7 +28,7 @@ const inputSchema = z.object({
   // Required so the dispatcher routes the profile-permission check to the entity
   // that owns the boleto (mirrors cancel_transaction's entidade_id discipline).
   entidade_id: z.string().uuid(),
-  boleto_id: z.string().max(64),
+  boleto_id: z.string().min(1).max(64),
   cnpj: z.string().max(20).optional(),
   company_id: z.string().max(64).optional(),
   reason: z.string().min(1).max(500),

@@ -18,19 +18,33 @@
 import { z } from 'zod';
 import type { Tool } from './_registry.js';
 
-const inputSchema = z.object({
-  entidade_id: z.string().uuid(),
-  cnpj: z.string().max(20).optional(),
-  company_id: z.string().max(64).optional(),
-  related_payment_id: z.string().max(64).optional(),
-  related_boleto_id: z.string().max(64).optional(),
-  // A reference to the validated receipt (see `receipt_validate`).
-  receipt_reference: z.string().max(200).optional(),
-  // Normalised PIX or bank data (see `bank_account_validate.normalized`).
-  payment_data: z.record(z.string(), z.unknown()).optional(),
-  reason: z.string().min(1).max(500),
-  dual_approval_granted: z.boolean().optional(),
-});
+const inputSchema = z
+  .object({
+    entidade_id: z.string().uuid(),
+    cnpj: z.string().max(20).optional(),
+    company_id: z.string().max(64).optional(),
+    // The refund amount. Required so the dispatcher limit check + canAct can gate
+    // the value — a refund with no ceiling must never be accepted by the schema.
+    valor: z.number().positive(),
+    related_payment_id: z.string().max(64).optional(),
+    related_boleto_id: z.string().max(64).optional(),
+    // A reference to the validated receipt (see `receipt_validate`).
+    receipt_reference: z.string().max(200).optional(),
+    // Normalised PIX or bank data (see `bank_account_validate.normalized`).
+    payment_data: z.record(z.string(), z.unknown()).optional(),
+    reason: z.string().min(1).max(500),
+    dual_approval_granted: z.boolean().optional(),
+  })
+  // A refund must carry evidence: at least one of a related payment/boleto or a
+  // validated receipt reference. Prevents opening a refund with no traceability.
+  .refine(
+    (v) => Boolean(v.related_payment_id ?? v.related_boleto_id ?? v.receipt_reference),
+    {
+      message:
+        'refund_create requires evidence: related_payment_id, related_boleto_id, or receipt_reference',
+      path: ['receipt_reference'],
+    },
+  );
 
 const outputSchema = z.union([
   z.object({

@@ -294,6 +294,12 @@ export const ACTION_KEYS = [
   'cancel_boleto',
   'remove_company_campaign',
   'create_refund',
+  // `create_ticket`: granular permission for `operational_ticket_create`, an
+  // INTERNAL escalation (side_effect 'communication', like handoff_to_owner — it
+  // persists a ticket / hands off to a human queue). Kept distinct from the three
+  // customer-facing writes so the role can open escalation tickets, and so it is
+  // NOT captured by `confirm_before_write_policy` (scoped by tool name).
+  'create_ticket',
 ] as const;
 
 export type ActionKey = (typeof ACTION_KEYS)[number];

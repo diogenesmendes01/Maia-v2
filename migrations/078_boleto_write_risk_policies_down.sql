@@ -12,6 +12,10 @@ WHERE tenant_id = 'default'
   AND agent_id IS NULL
   AND version = 1
   AND proposed_by = 'issue_416_seed'
+  -- Match the seed's approver too (037 posture): the two ACTIVE rows were
+  -- approved by 'issue_416_seed'; the PROPOSED variant has no approver (NULL).
+  -- A row later re-approved by a human (different approved_by) is NOT removed.
+  AND (approved_by = 'issue_416_seed' OR approved_by IS NULL)
   AND rule_descriptor IN (
     'confirm_before_write_policy',
     'small_risk_write_policy',

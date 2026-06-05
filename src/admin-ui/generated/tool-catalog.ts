@@ -1035,11 +1035,13 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   {
     "name": "operational_ticket_create",
     "description": "Cria um ticket para análise humana (motivo, resumo, conversa, contexto de empresa/cliente e fila desejada). Escalação interna — não move dinheiro nem altera cadastro/CRM nem envia mensagem externa.",
-    "side_effect": "read",
-    "operation_type": "create",
+    "side_effect": "communication",
+    "operation_type": "communicate",
     "sensitive": false,
     "feature_flag": null,
-    "required_actions": [],
+    "required_actions": [
+      "create_ticket"
+    ],
     "inputs": [
       {
         "name": "reason",
@@ -1444,7 +1446,9 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     "operation_type": "parse_only",
     "sensitive": false,
     "feature_flag": null,
-    "required_actions": [],
+    "required_actions": [
+      "read_balance"
+    ],
     "inputs": [
       {
         "name": "media_local_path",
@@ -1488,6 +1492,11 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
         "name": "company_id",
         "type": "string",
         "optional": true
+      },
+      {
+        "name": "valor",
+        "type": "number",
+        "optional": false
       },
       {
         "name": "related_payment_id",

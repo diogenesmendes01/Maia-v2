@@ -73,8 +73,11 @@ describe('migration 078 — write/risk policy seed (issue #416)', () => {
   it('confirm_before_write_policy predicate targets EXACTLY the three write tools', () => {
     // The seed predicate matches tool_call.name in [the three writes].
     expect(up).toContain('"boleto_cancel","company_campaign_remove","refund_create"');
-    // ...and it keys on the write side-effect level (compose with the dispatcher).
-    expect(up).toContain('"tool_call.side_effect_level"');
+    // ...via a kind-tagged DSL leaf on tool_call.name. It must NOT key on a
+    // `side_effect_level` literal (that field's domain is none|low|medium|high,
+    // so "write" there would never evaluate).
+    expect(up).toContain('"field":"tool_call.name"');
+    expect(up).not.toContain('"tool_call.side_effect_level"');
   });
 
   it('confirm_before_write_policy requires confirmation + identity + audit, and blocks ambiguity', () => {
@@ -95,12 +98,41 @@ describe('migration 078 — write/risk policy seed (issue #416)', () => {
   it('human_confirmation_policy escalates on risk/legal/dispute signals', () => {
     expect(up).toContain('human_confirmation_policy');
     expect(up).toContain('"legal_intent.detected"');
-    expect(up).toContain('"escalate"');
+    // The DSL action vocabulary has no 'escalate'; escalation maps to the
+    // human-approval gate and the escalate intent lives in metadata.
+    expect(up).toContain('"intent":"escalate_to_human"');
   });
 
   it('seed is idempotent (NOT EXISTS guard per descriptor)', () => {
     expect(up).toContain('WHERE NOT EXISTS');
     expect(up).toContain('pr.rule_descriptor = v.rule_descriptor');
+  });
+
+  it('each seeded rule_body is a DSL-shaped PolicyRuleBody (kind-tagged predicate + valid DSL action)', () => {
+    // The rows must be parseable by the P9b DSL the day runtime evaluation is
+    // wired (no data migration needed). Extract the single-quoted rule_body JSON
+    // literals (they start with {"rule_id") and assert the DSL shape.
+    const VALID_ACTIONS = new Set(['allow', 'block', 'require_dual_approval', 'warn', 'log']);
+    const VALID_KINDS = new Set(['leaf', 'and', 'or', 'not']);
+    const bodies = [...up.matchAll(/'(\{"rule_id":[^']*)'/g)].map(
+      (m) =>
+        JSON.parse(m[1]!) as {
+          rule_id: string;
+          predicate: { kind: string };
+          effect: { action: string };
+        },
+    );
+    expect(bodies.length).toBe(3);
+    for (const body of bodies) {
+      expect(
+        VALID_KINDS.has(body.predicate?.kind),
+        `${body.rule_id} predicate.kind=${body.predicate?.kind}`,
+      ).toBe(true);
+      expect(
+        VALID_ACTIONS.has(body.effect?.action),
+        `${body.rule_id} effect.action=${body.effect?.action}`,
+      ).toBe(true);
+    }
   });
 
   it('down migration removes ONLY the seeded bootstrap rows (proposed_by guard)', () => {

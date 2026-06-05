@@ -21,14 +21,26 @@
 --      identity, suspicious receipt, value above threshold, formal dispute).
 --      dual_approval kind.
 --
--- rule_body is OPAQUE JSONB here (the DB CHECK in 036 only enforces
--- jsonb_typeof='object'); the shape mirrors the 037 hard-limit seed
--- ({predicate, effect, applies_to_peps}) so the descriptor resolver
--- (src/control-plane/policy/policy-descriptor-resolver.ts) and the existing
--- governance machinery treat these like any other policy_rules row. The write
--- tools still pass constitutionalCheck + the dispatcher guard regardless (the
--- "compose, don't bypass" rule) — these descriptors add the confirm/escalate
--- decision on top, they do NOT open a parallel write path.
+-- rule_body uses the canonical P9b DSL shape `PolicyRuleBody`
+-- ({rule_id, predicate, effect}) from src/governance/policy-dsl/types.ts, so the
+-- rows are parseable + validatable by `validatePolicyRuleBody` and the evaluator:
+--   - predicate is a kind-tagged boolean tree (kind: 'leaf' | 'and' | 'or');
+--   - the three writes are matched by `tool_call.name` (NOT a side_effect_level
+--     literal — that field's domain is none|low|medium|high, not 'write');
+--   - effect.action is from the DSL vocabulary (allow | block |
+--     require_dual_approval | warn | log). "confirm before write" and "escalate
+--     to human" both map to `require_dual_approval` (the governed human-approval
+--     gate); the finer intent (user confirmation vs escalation) is carried in
+--     effect.metadata.intent.
+--
+-- IMPORTANT — RUNTIME EVALUATION IS A FOLLOW-UP, NOT THIS ISSUE: the descriptor
+-- resolver (policy-descriptor-resolver.ts) does NOT yet evaluate this DSL for
+-- these descriptors, and constitutionalCheck does not yet branch on the three
+-- boleto writes. Today the rows are well-formed but DECLARATIVE — the writes are
+-- still gated by the grant guard + canAct + constitutionalCheck (compose, don't
+-- bypass), but the confirm/escalate DECISION is not enforced until the runtime
+-- wiring lands (tracked as a follow-up). The seed is DSL-correct now so that
+-- wiring needs no data migration.
 --
 -- Idempotent (NOT EXISTS per descriptor). 'active' direct in the seed for
 -- confirm_before_write_policy + human_confirmation_policy is the controlled
@@ -58,7 +70,7 @@ FROM (VALUES
   (
     'dual_approval',
     'confirm_before_write_policy',
-    '{"predicate":{"all":[{"field":"tool_call.side_effect_level","op":"eq","value":"write"},{"field":"tool_call.name","op":"in","value":["boleto_cancel","company_campaign_remove","refund_create"]}]},"effect":{"action":"require_confirmation","severity":"high","message_template":"Operação sensível: requer empresa identificada e confirmação explícita do usuário antes de executar. Bloqueia se a identidade estiver ambígua ou se a política de risco exigir escalação."},"requires":{"company_identified":true,"user_confirmation":true,"audit_before_and_after":true},"blocks_when":{"identity_ambiguous":true,"risk_requires_escalation":true},"applies_to_peps":["mid","late"]}',
+    '{"rule_id":"confirm_before_write_policy","predicate":{"kind":"leaf","field":"tool_call.name","op":"in","value":["boleto_cancel","company_campaign_remove","refund_create"]},"effect":{"action":"require_dual_approval","message":"Operação sensível: requer empresa identificada e confirmação explícita antes de executar; bloqueia se a identidade estiver ambígua ou se a política de risco exigir escalação.","metadata":{"severity":"high","intent":"confirm_before_write","requires":{"company_identified":true,"user_confirmation":true,"audit_before_and_after":true},"blocks_when":{"identity_ambiguous":true,"risk_requires_escalation":true},"applies_to_peps":["mid","late"]}}}',
     '{}',
     'founder_explicit',
     'active',
@@ -69,7 +81,7 @@ FROM (VALUES
   (
     'soft_guidance',
     'small_risk_write_policy',
-    '{"predicate":{"all":[{"field":"tool_call.side_effect_level","op":"eq","value":"write"},{"field":"company_identity.confidence","op":"eq","value":"high"},{"field":"risk_profile.level","op":"eq","value":"low"},{"field":"action.reversible","op":"eq","value":true},{"field":"legal_intent.detected","op":"eq","value":false},{"field":"payment_data.consistent","op":"eq","value":true},{"field":"audience.allows_execution","op":"eq","value":true}]},"effect":{"action":"allow","severity":"low","message_template":"Variante futura: pode permitir escrita automática em casos de baixo risco. NÃO habilitada por padrão em #416."},"applies_to_peps":["mid","late"]}',
+    '{"rule_id":"small_risk_write_policy","predicate":{"kind":"and","predicates":[{"kind":"leaf","field":"tool_call.name","op":"in","value":["boleto_cancel","company_campaign_remove","refund_create"]},{"kind":"leaf","field":"company_identity.confidence","op":"eq","value":"high"},{"kind":"leaf","field":"risk_profile.level","op":"eq","value":"low"},{"kind":"leaf","field":"action.reversible","op":"eq","value":true},{"kind":"leaf","field":"legal_intent.detected","op":"eq","value":false},{"kind":"leaf","field":"payment_data.consistent","op":"eq","value":true},{"kind":"leaf","field":"audience.allows_execution","op":"eq","value":true}]},"effect":{"action":"allow","message":"Variante futura: pode permitir escrita automática em casos de baixo risco. NÃO habilitada por padrão em #416.","metadata":{"severity":"low","intent":"small_risk_auto_write","applies_to_peps":["mid","late"]}}}',
     '{}',
     'founder_explicit',
     'proposed',
@@ -81,7 +93,7 @@ FROM (VALUES
   (
     'dual_approval',
     'human_confirmation_policy',
-    '{"predicate":{"any":[{"field":"risk_profile.level","op":"in","value":["medium","high"]},{"field":"legal_intent.detected","op":"eq","value":true},{"field":"case.formal_complaint","op":"eq","value":true},{"field":"company_identity.ambiguous","op":"eq","value":true},{"field":"receipt.suspicious","op":"eq","value":true},{"field":"case.value_over_threshold","op":"eq","value":true},{"field":"case.formal_dispute","op":"eq","value":true}]},"effect":{"action":"escalate","severity":"high","message_template":"Caso requer confirmação/handoff humano antes de prosseguir (risco médio/alto, ameaça jurídica, reclamação formal, identidade ambígua, comprovante suspeito, valor acima do limite ou disputa formal)."},"applies_to_peps":["early","mid","late"]}',
+    '{"rule_id":"human_confirmation_policy","predicate":{"kind":"or","predicates":[{"kind":"leaf","field":"risk_profile.level","op":"in","value":["medium","high"]},{"kind":"leaf","field":"legal_intent.detected","op":"eq","value":true},{"kind":"leaf","field":"case.formal_complaint","op":"eq","value":true},{"kind":"leaf","field":"company_identity.ambiguous","op":"eq","value":true},{"kind":"leaf","field":"receipt.suspicious","op":"eq","value":true},{"kind":"leaf","field":"case.value_over_threshold","op":"eq","value":true},{"kind":"leaf","field":"case.formal_dispute","op":"eq","value":true}]},"effect":{"action":"require_dual_approval","message":"Caso requer confirmação/handoff humano antes de prosseguir (risco médio/alto, ameaça jurídica, reclamação formal, identidade ambígua, comprovante suspeito, valor acima do limite ou disputa formal).","metadata":{"severity":"high","intent":"escalate_to_human","applies_to_peps":["early","mid","late"]}}}',
     '{}',
     'founder_explicit',
     'active',

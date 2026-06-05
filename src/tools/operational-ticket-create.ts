@@ -5,17 +5,18 @@
  * customer context, desired queue). This is the escalation sink of the
  * `risk_escalation_pack`.
  *
- * Side-effect classification (deliberate, taxonomy §3/§4/§6): this is modelled
- * as an INTERNAL escalation — analogous to the baseline `handoff_to_owner` — and
- * is NOT one of the three sensitive customer-facing WRITE tools the issue
- * governs with `confirm_before_write_policy` (`boleto_cancel`,
- * `company_campaign_remove`, `refund_create`). It does NOT move money, mutate a
- * customer/CRM record, or send an external proactive message. To keep
- * `confirm_before_write_policy` scoped to EXACTLY those three (acceptance
- * criterion) it is classified `side_effect: 'read'` here; visibility is still
- * fully gated by the explicit `risk_escalation_pack` grant + the dispatcher
- * guard (it can never be baseline). A future iteration may reclassify it and
- * attach a dedicated escalation policy — but that is out of scope for #416.
+ * Side-effect classification (taxonomy §3/§4/§6): this is an INTERNAL escalation
+ * sink — directly analogous to the baseline `handoff_to_owner` — so it is a
+ * `side_effect: 'communication'` with `operation_type: 'communicate'` and a
+ * granular `create_ticket` permission. Classifying it as 'read' would be wrong
+ * (it persists a ticket / hands off to a human queue); classifying it as 'write'
+ * would wrongly make it a 4th governed CUSTOMER write. 'communication' is the
+ * honest, gated classification: it can never be baseline and is gated by the
+ * explicit `risk_escalation_pack` grant + the dispatcher guard (canAct on
+ * `create_ticket`). It is deliberately NOT one of the three customer-facing
+ * writes governed by `confirm_before_write_policy` (`boleto_cancel`,
+ * `company_campaign_remove`, `refund_create`) — an internal escalation ticket
+ * must not require end-user confirmation.
  *
  * Out of scope (#416): a real ticketing integration — contract-honouring stub.
  */
@@ -43,10 +44,10 @@ export const operationalTicketCreateTool: Tool<typeof inputSchema, typeof output
     'Cria um ticket para análise humana (motivo, resumo, conversa, contexto de empresa/cliente e fila desejada). Escalação interna — não move dinheiro nem altera cadastro/CRM nem envia mensagem externa.',
   input_schema: inputSchema,
   output_schema: outputSchema,
-  required_actions: [],
-  side_effect: 'read',
+  required_actions: ['create_ticket'],
+  side_effect: 'communication',
   redis_required: false,
-  operation_type: 'create',
+  operation_type: 'communicate',
   audit_action: 'operational_ticket_created',
   handler: async (args) => {
     // Stub: no live ticketing integration in #416.
