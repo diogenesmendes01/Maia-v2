@@ -79,7 +79,8 @@
     "zod": "^3.23.8"
   },
   "overrides": {
-    "protobufjs": "^7.5.5"
+    "protobufjs": "^7.5.5",
+    "ioredis": "$ioredis"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
