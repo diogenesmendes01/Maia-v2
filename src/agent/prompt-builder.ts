@@ -193,7 +193,7 @@ export type PromptContext = {
   inbound: Mensagem;
   // P6 Task 9 — Active role for this turn (CHANNEL POLICY level in spec §10.7
   // precedence). Optional/nullable preserva legacy behavior: quando ausente
-  // (flag MULTI_CHANNEL OFF ou resolver não resolveu canal), prompt-builder
+  // (resolver não resolveu canal) ou quando o role é o default, prompt-builder
   // omite a seção "Modo operacional" e tudo se comporta como P0..P5.
   activeRole?: Role | null;
   // PR #82 review (Superpowers Critical #4): role/channel ids plumbed
@@ -536,16 +536,23 @@ function renderContradictionOverlay({ fresh, stale }: ContradictionBuckets): str
  * Posicionada ENTRE selfAwarenessSection e procedureSection para respeitar
  * a precedência da spec §10.7: CHANNEL POLICY (role) precede PROCEDURE.
  *
- * Gates:
+ * Gates (MULTI_CHANNEL removido / sempre on após #411):
  *   - `role` null/undefined                         → null (sem role ativa).
+ *   - role `is_default` (modo baseline)             → null. O role default é o
+ *     "sem modo operacional especial" do runtime single-tenant; após o #411 o
+ *     role-selector passa a rodar também no single-tenant (o canal catch-all
+ *     resolve um channel_id) e devolve o role default. Injetar
+ *     "## Modo operacional: Default" só adiciona ruído — esta guarda preserva
+ *     o prompt legacy byte-a-byte quando o agente opera no role default.
  *   - role sem description E sem prompt_addendum    → null (nada a injetar).
  *
- * Quando renderiza:
+ * Quando renderiza (role NÃO-default com conteúdo):
  *   - Sempre inclui `display_name` (mínimo identificador do modo).
  *   - description e prompt_addendum entram apenas se presentes (não vazios).
  */
 async function buildRoleSection(role: Role | null | undefined): Promise<string | null> {
   if (!role) return null;
+  if (role.is_default) return null;
   if (!role.prompt_addendum && !role.description) return null;
   const parts: string[] = ['## Modo operacional'];
   parts.push(`Você está operando como **${role.display_name}**.`);
@@ -776,7 +783,8 @@ export async function buildPrompt(ctx: PromptContext): Promise<{ system: string;
 
   // P6 Task 9: injeta "## Modo operacional" entre selfAwareness e procedure
   // para respeitar a precedência da spec §10.7 (CHANNEL POLICY > PROCEDURE).
-  // Flag-gated (MULTI_CHANNEL) e tolerante a ausência de role.
+  // Tolerante a ausência de role e omitido para o role default (ver
+  // buildRoleSection — MULTI_CHANNEL removido / sempre on após #411).
   try {
     const section = await buildRoleSection(ctx.activeRole);
     if (section) roleSection = '\n' + section;

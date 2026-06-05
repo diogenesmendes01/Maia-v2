@@ -97,6 +97,22 @@ vi.mock('../../src/db/repositories.js', () => ({
     createInbound: createInboundMock,
     findByWhatsappIdCrossTenant: findByWhatsappIdCrossTenantMock,
   },
+  // #411: the resolver always runs at ingress. Single-tenant catch-all → the
+  // seeded default/default channel for any sender (exact-match always misses).
+  channelsRepo: {
+    findByExternalCrossTenant: vi.fn().mockResolvedValue(null),
+    findDefaultCatchAllChannel: vi.fn().mockResolvedValue({
+      multi_tenant: false,
+      channel: {
+        id: 'default-channel-uuid',
+        tenant_id: 'default',
+        agent_id: 'default',
+        external_id: 'default-channel',
+        channel_type: 'whatsapp',
+        active: true,
+      },
+    }),
+  },
 }));
 
 vi.mock('../../src/gateway/dedup.js', () => ({

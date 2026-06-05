@@ -85,9 +85,18 @@ inbound turn
 
 The LLM never declares the final role. If policy says no, the turn proceeds in the previously-active role.
 
-### 4.4 Fail-loud on unresolved channel, no fallback to default
+### 4.4 Channel resolution: single-tenant catch-all + cross-tenant fail-loud (#411, #268)
 
-`channel-resolver.ts` rejects messages where `(channel_id, tenant_id)` cannot be resolved to an active `channel_policy`. There is no "default channel" fallback in production — the literal `'default'` is only valid at bootstrap (see [`tenant-isolation.md`](tenant-isolation.md) §4.4). Channels not in the policy table are not served.
+A WhatsApp channel represents the **bot's line** (the number messages arrive *on*), not the sender. In the current single-tenant runtime, the gateway probes the **sender's** phone as `external_id`, which never matches the single seeded channel (`external_id = 'default-channel'`). `channel-resolver.ts` therefore resolves in two stages:
+
+1. **Exact match** on `(channel_type, external_id)` via `channelsRepo.findByExternalCrossTenant` — when an active channel matches, the real `(tenant_id, agent_id, channel_id)` is returned.
+2. **Miss / inactive** → `channelsRepo.findDefaultCatchAllChannel` decides:
+   - **single-tenant runtime** (no active channel owned by a tenant other than `'default'`) → resolve to the seeded `default/default` channel. This **catch-all** (issue #411) is what lets the bot answer *arbitrary senders* without dropping messages.
+   - **multi-tenant deployment** (an active channel for some non-`'default'` tenant exists) → **throw** `TypedError('channel_resolution_failed')`. This is the issue #268 fail-loud contract: an unknown sender must NOT collapse onto the shared `maia:ratelimit:default:default:*` bucket. Ambiguous matches (2+ active channels across distinct tenants) also throw.
+
+So the resolver is **never silently `'default'`** in a genuine multi-tenant config — the literal `'default'` is reachable only when the deployment is provably single-tenant (or at bootstrap; see [`tenant-isolation.md`](tenant-isolation.md) §4.4). The `FEATURE_MULTI_CHANNEL` flag was removed in #411 — channel resolution is now unconditional.
+
+**Design decision (issue #411): option (b) — single-tenant catch-all.** Chosen over option (a) (keying the channel by the receiving line and threading the bot's JID through the gateway) because it is the smaller, lower-risk change: it makes the single-tenant default resolve correctly while keeping the #268 throw-on-miss for real multi-tenant configs, and it requires no schema/seed migration (it reuses the existing `migrations/035` default-channel seed).
 
 ### 4.5 Single agent per channel today; multi via `MULTI_AGENT_SELECTOR_V2`
 
@@ -138,7 +147,8 @@ See `README.md` § Estado atual for runtime feature-flag state.
 
 At last verification (2026-05-28):
 
-- Channel-resolver fail-loud on unresolved channel, drop `default/default` fallback (#268 → #277 — open)
+- Channel-resolver single-tenant catch-all + `FEATURE_MULTI_CHANNEL` removal (#411 — this change); builds on the #268/#277 fail-loud-on-miss for multi-tenant configs
+- Channel-resolver fail-loud on unresolved channel, drop `default/default` fallback (#268 → #277 — merged)
 - Policy pubsub per-tenant channel (#249 → #264 — open)
 - Gateway debouncer tenant scope (#248 → #259 — open)
 - Gateway rate-limit Redis key prefix (#245 → #258 — open)
@@ -153,7 +163,7 @@ Verify with `gh pr list --state open --search "channel OR role OR policy OR gate
 ## 9. Key decisions
 
 - **Channel resolution is centralized in `channel-resolver.ts`** — every inbound message goes through it. No side-door.
-- **Fail-loud on unresolved channel** — no `'default'` fallback in production paths.
+- **Single-tenant catch-all + cross-tenant fail-loud (#411/#268)** — an arbitrary sender resolves to `(default, default)` only when the deployment is provably single-tenant; a miss in a real multi-tenant config throws. `FEATURE_MULTI_CHANNEL` removed (always-on). See §4.4.
 - **Role-selector chain over single-step decision** — LLM suggests, deterministic classifier scores, policy decides, oscillation tracker guards. Each link has a narrow contract.
 - **Policy via string descriptor + per-tenant pubsub invalidation** — allows policy versions to roll forward without rewriting call sites.
 - **`MULTI_AGENT_SELECTOR_V2` as the gate for dynamic agent selection** — current runtime is single-agent-per-channel via policy. Dynamic selection lives behind a flag until validated.

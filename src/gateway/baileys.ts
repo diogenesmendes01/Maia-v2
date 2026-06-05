@@ -29,25 +29,6 @@ import type { WhatsAppInbound, WAQuotedContext } from './types.js';
 import { setupState } from '@/setup/state.js';
 import { triggerRecovery } from '@/setup/recovery.js';
 import { resolveScopeForJid } from './jid-tenant-resolver.js';
-import { featureFlags } from '@/config/feature-flags.js';
-import { FeatureFlagName } from '@/types/enums.js';
-
-/**
- * Legacy default tenant context for the WhatsApp gateway. Only used when
- * the MULTI_CHANNEL feature flag is OFF (single-tenant operation). When the
- * flag is ON, `messages.upsert` resolves the real (tenant_id, agent_id)
- * from the inbound JID via `resolveScopeForJid` BEFORE invoking
- * `handleIncoming` — see issue #290 for the runtime tenant-isolation
- * contract this closes.
- *
- * Lives at module scope so the legacy fallback is a single named constant
- * (no `'default'/'default'` string literal scattered through the dispatch
- * path), making it grep-friendly in audits.
- */
-const BAILEYS_LEGACY_DEFAULT_CTX = {
-  tenant_id: 'default',
-  agent_id: 'default',
-} as const;
 
 let socket: WASocket | null = null;
 let connected = false;
@@ -250,18 +231,17 @@ export async function startBaileys(): Promise<void> {
   // Tests passed because the adversarial fixtures inject ALS manually;
   // production never resolved the real tenant at the entry point.
   //
-  // POST-FIX (this block):
-  //   - Flag MULTI_CHANNEL OFF (legacy single-tenant prod) → preserve the
-  //     historical `default/default` wrap. No regression for the single-
-  //     tenant deployment that has run on this path since P0.
-  //   - Flag MULTI_CHANNEL ON → call `resolveScopeForJid` BEFORE
-  //     `handleIncoming`. The resolver reuses the same
-  //     `channelsRepo.findByExternalCrossTenant` policy as agent/core.ts
-  //     (single source of truth for channel ownership and the issue #268
-  //     fail-loud contract). On success, every downstream layer sees the
-  //     REAL (tenant_id, agent_id) via the ALS.
-  //   - Fail-closed on resolution failure (unknown JID, inactive channel,
-  //     ambiguous, malformed JID, DB error): emit
+  // POST-FIX (this block) — MULTI_CHANNEL removed / always on after #411:
+  //   - Always call `resolveScopeForJid` BEFORE `handleIncoming`. The resolver
+  //     reuses the same `channelsRepo.findByExternalCrossTenant` policy as
+  //     agent/core.ts (single source of truth for channel ownership + the
+  //     issue #268 fail-loud contract). On success, every downstream layer
+  //     sees the REAL (tenant_id, agent_id) via the ALS.
+  //   - SINGLE-TENANT runtime: the resolver's catch-all (#411) maps any
+  //     parseable sender JID to the seeded `default/default` channel, so the
+  //     bot keeps answering everyone without a per-sender channel row.
+  //   - Fail-closed on resolution failure (unknown JID in a MULTI-TENANT
+  //     config, inactive/ambiguous channel, malformed JID, DB error): emit
   //     `channel_resolution_failed` audit (system bucket — `audit()`
   //     auto-wraps when no ALS context is active) and DROP the message.
   //     We do NOT fall back to `default/default` — that is exactly the
@@ -269,11 +249,9 @@ export async function startBaileys(): Promise<void> {
   //     would re-collapse all unknown traffic on a different code path.
   //
   // The agent worker's adoption step (`adoptToResolvedTenantCrossTenant`
-  // in `runAgentForMensagem`) becomes a true no-op once this fix is live —
-  // the inbound row is already persisted under the resolved tenant.
-  // That noop is idempotent (UPDATE writing identical values), so the
-  // worker's adoption code remains safe defense-in-depth for BullMQ
-  // retries and for the legacy MULTI_CHANNEL=OFF code path.
+  // in `runAgentForMensagem`) is a true no-op in single-tenant (resolved
+  // tenant IS default/default) and an idempotent UPDATE for multi-tenant
+  // retries — safe defense-in-depth either way.
   socket.ev.on('messages.upsert', async ({ messages }) => {
     for (const msg of messages) {
       // [Codex review #311 — B3] Reaction stubs arrive with
@@ -399,23 +377,25 @@ function extractMessageUpdateTargetId(update: {
  *     MUST NOT process this message. The audit has already been written
  *     (system bucket) and the message is dropped fail-closed.
  *
- * FLAG MULTI_CHANNEL OFF (legacy single-tenant prod):
- *   Returns `{ scope: BAILEYS_LEGACY_DEFAULT_CTX, channel_id: null }`
- *   without invoking the resolver. The single-tenant deployment that has
- *   run on this path since P0 sees no behavior change.
+ * Always calls `resolveScopeForJid` (MULTI_CHANNEL removed / always on after
+ * issue #411). The resolver canonicalizes JID parsing (`@s.whatsapp.net` /
+ * `@c.us` / `@lid` w/ senderPn) and delegates to the shared `resolveChannel`
+ * (the same one `agent/core.ts` uses for the post-persist adoption — single
+ * source of truth for ownership policy).
  *
- * FLAG MULTI_CHANNEL ON (multi-tenant prod — the path this issue fixes):
- *   Calls `resolveScopeForJid` which canonicalizes JID parsing
- *   (`@s.whatsapp.net` / `@c.us` / `@lid` w/ senderPn) and delegates to
- *   the shared `resolveChannel` (the same one `agent/core.ts` uses for the
- *   post-persist adoption — single source of truth for ownership policy).
+ *   - SINGLE-TENANT runtime: `resolveChannel`'s catch-all (issue #411) maps
+ *     ANY parseable sender JID to the seeded `default/default` channel, so
+ *     every real inbound resolves and the bot answers everyone. The worker's
+ *     adoption step stays a no-op (resolved tenant IS default/default).
+ *   - MULTI-TENANT deployment: exact-match scopes the inbound to its real
+ *     owner; an unknown/inactive/ambiguous sender throws
+ *     `TypedError('channel_resolution_failed')` (issue #268 fail-loud) — we
+ *     emit the `channel_resolution_failed` audit and return null. We DO NOT
+ *     fall back to `default/default`; that bypass is exactly what #240/#268
+ *     closed.
  *
- *   On `TypedError('channel_resolution_failed')` (unknown phone, inactive,
- *   ambiguous, malformed JID, MULTI_CHANNEL OFF surface-as-defense): emit
- *   `channel_resolution_failed` audit with the resolver details + JID
- *   parsing context, and return null. The audit() helper wraps writes in
- *   the synthetic `system` tenant when no ALS is active — we have none here
- *   yet, by definition. We DO NOT fall back to `default/default`.
+ *   A `TypedError('channel_resolution_failed')` also covers an unparseable
+ *   JID (malformed, group, `@lid` w/o senderPn) — audited + dropped.
  *
  * Errors that are NOT TypedError (e.g. a sudden DB outage) are also
  * audited and dropped here so a single transient failure does not crash
@@ -428,28 +408,6 @@ async function resolveTenantCtxForUpsert(
   scope: { tenant_id: string; agent_id: string };
   channel_id: string | null;
 } | null> {
-  // Legacy single-tenant path — keep `default/default` exactly as P0..P5.
-  //
-  // [Codex review #311 — B1] MULTI_CHANNEL defaults to OFF, so this branch is
-  // the default deploy path. That is SAFE for a genuine single-tenant
-  // deployment: only one tenant (`default/default`) ever exists, so there is
-  // no other tenant for a row to leak to, and the worker's adoption step is
-  // skipped entirely (agent/core.ts only adopts when the resolved tenant is
-  // NOT default/default). Multi-tenant deployments MUST set MULTI_CHANNEL=ON
-  // so the JID→tenant resolver runs and every inbound is scoped to its real
-  // owner; the cross-tenant adoption that path enables is now a guarded
-  // compare-and-swap (see `mensagensRepo.adoptToResolvedTenantCrossTenant`),
-  // so isolation holds regardless of which path persisted the row.
-  if (!featureFlags.isEnabled(FeatureFlagName.MULTI_CHANNEL)) {
-    return {
-      scope: {
-        tenant_id: BAILEYS_LEGACY_DEFAULT_CTX.tenant_id,
-        agent_id: BAILEYS_LEGACY_DEFAULT_CTX.agent_id,
-      },
-      channel_id: null,
-    };
-  }
-
   // [Codex review #311 — minor] `msg.key` can be absent on malformed
   // envelopes; optional-chain so a missing key resolves to a null JID
   // (→ fail-closed in resolveScopeForJid) instead of a raw TypeError that
@@ -476,7 +434,9 @@ async function resolveTenantCtxForUpsert(
       logger.debug(
         {
           raw_jid: jid_context.raw_jid,
-          whatsapp_id: msg.key.id ?? null,
+          // [🟠 MEDIUM fix #417] optional-chain `msg.key` — a malformed/no-key
+          // envelope must not throw a raw TypeError here.
+          whatsapp_id: msg.key?.id ?? null,
         },
         'baileys.lid_fallback_resolved',
       );
@@ -497,7 +457,12 @@ async function resolveTenantCtxForUpsert(
         // mensagem_id intentionally null — the inbound was NOT persisted
         // (we audit BEFORE createInbound runs). whatsapp_id is the only
         // stable handle the operator has for triage.
-        whatsapp_id: msg.key.id ?? null,
+        // [🟠 MEDIUM fix #417] optional-chain `msg.key`: a malformed/no-key
+        // envelope reaches this catch (resolveScopeForJid(null) fails closed);
+        // a raw `msg.key.id` deref here would throw a TypeError that escapes as
+        // an opaque `baileys.handle_failed`, BYPASSING this intended
+        // `channel_resolution_failed` audit.
+        whatsapp_id: msg.key?.id ?? null,
         raw_jid: jid,
         error_code: isResolutionFailure
           ? 'channel_resolution_failed'
@@ -514,7 +479,8 @@ async function resolveTenantCtxForUpsert(
       {
         err: (err as Error).message,
         err_code: typed?.code,
-        whatsapp_id: msg.key.id ?? null,
+        // [🟠 MEDIUM fix #417] optional-chain `msg.key` (see audit above).
+        whatsapp_id: msg.key?.id ?? null,
         raw_jid: jid,
       },
       'baileys.channel_resolution_failed_drop',
@@ -526,10 +492,9 @@ async function resolveTenantCtxForUpsert(
 async function handleIncoming(
   msg: proto.IWebMessageInfo,
   // [Issue #290] Optional channel_id resolved at the upsert listener. Kept
-  // optional so legacy single-tenant callers (MULTI_CHANNEL flag OFF) and
-  // existing unit tests that drive `handleIncoming` directly continue to
-  // work unchanged. The metadata is recorded on the inbound row when
-  // present so downstream agent logic can short-circuit the resolver
+  // optional so existing unit tests that drive `handleIncoming` directly
+  // continue to work unchanged. The metadata is recorded on the inbound row
+  // when present so downstream agent logic can short-circuit the resolver
   // probe (defense-in-depth; the worker's probe still functions as fallback).
   opts?: { channel_id?: string | null },
 ): Promise<void> {
@@ -617,11 +582,11 @@ async function handleIncoming(
       timestamp_ms: Number(msg.messageTimestamp ?? 0) * 1000,
       media_mime: mediaMime,
       media_sha256: mediaSha256,
-      // [Issue #290] Channel resolved at the ingress (MULTI_CHANNEL ON).
-      // Null in legacy single-tenant mode or when the resolver path didn't
-      // surface a channel_id (e.g., tests driving handleIncoming directly).
-      // Persisted for triage and as defense-in-depth — the worker's
-      // adoption probe is unaffected by this field's presence/absence.
+      // [Issue #290] Channel resolved at the ingress. In single-tenant this is
+      // the seeded default channel id (#411 catch-all); null only when the
+      // resolver path didn't surface a channel_id (e.g., tests driving
+      // handleIncoming directly). Persisted for triage and as defense-in-depth
+      // — the worker's adoption probe is unaffected by this field.
       ingress_channel_id: _resolvedChannelId,
     },
     processada_em: null,

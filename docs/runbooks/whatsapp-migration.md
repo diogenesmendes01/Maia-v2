@@ -57,6 +57,9 @@ Visão de alto nível. Detalhamento na PR de implementação.
 ### 3.1 Gateway
 
 - `src/gateway/baileys.ts` → `src/gateway/whatsapp-cloud.ts`. Mantém a mesma interface pública (`onMessage`, `sendText`, `sendMedia`, `sendVoice`) para não tocar `agent/core.ts` nem tools.
+
+> **Resolução de canal (issue #411).** Um canal WhatsApp representa a **linha do bot** (o número em que as mensagens chegam), não o remetente. No runtime single-tenant atual o gateway usa o telefone do **remetente** como `external_id`, então o `channel-resolver.ts` cai num **catch-all single-tenant** que mapeia qualquer remetente para o canal semeado `default/default` — preservando o fail-loud cross-tenant do #268 para deployments multi-tenant. `FEATURE_MULTI_CHANNEL` foi removida (sempre on). Optou-se pelo catch-all (opção b) em vez de keyar o canal pela linha receptora (opção a) por ser a mudança menor e sem migração (reusa o seed `migrations/035`). **Quando a migração para a Cloud API acontecer, considerar a opção (a):** o payload do webhook expõe explicitamente o `phone-number-id` / número que recebeu a mensagem, o que torna o modelo "canal = linha do bot" natural — basta registrar a linha como um canal real e passar esse identificador como `external_id`, dispensando o catch-all.
+
 - Conexão muda de WebSocket persistente para **HTTP request/response stateless**:
   - **Saída:** `POST https://graph.facebook.com/v{N}/{phone-number-id}/messages` com bearer token.
   - **Entrada:** webhook HTTPS recebido em endpoint público da Maia (ex.: `POST /webhook/whatsapp`).

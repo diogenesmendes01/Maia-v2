@@ -5734,8 +5734,8 @@ export const procedureExecutionsRepo = {
     // Issue #323 review iteration-2 (BLOCKING): assert the write hit exactly
     // one row. With the tenant+agent predicate above, an UPDATE issued under a
     // context whose (tenant_id, agent_id) does NOT match the target row (a
-    // legacy default/default path with FEATURE_MULTI_CHANNEL off, or any other
-    // mismatch) matches 0 rows and would SILENTLY no-op — the state transition
+    // single-tenant default/default path, or any other mismatch) matches 0 rows
+    // and would SILENTLY no-op — the state transition
     // (complete/abort/advance/auto_abandon) would be LOST. The previous id-only
     // WHERE always matched, so a silent miss here is a data-loss regression.
     // Turn that into a loud, debuggable failure while preserving tenant
@@ -8073,6 +8073,93 @@ export const channelsRepo = {
       );
     }
     return activeRows[0]!;
+  },
+
+  // [Issue #411] Single-tenant catch-all for the channel resolver. EXPLICITLY
+  // bypasses applyTenantGuard for the same sanctioned reason as
+  // `findByExternalCrossTenant` — the entry point runs BEFORE a tenant context
+  // exists.
+  //
+  // Contract: given a channel_type whose `(channel_type, external_id)` exact
+  // lookup missed, decide whether the deployment is a genuine single-tenant
+  // runtime (one tenant: the seeded `default/default`) or a real multi-tenant
+  // config, and (when single-tenant) hand back the seeded `default/default`
+  // catch-all channel so the resolver can map ANY inbound sender to
+  // (default, default). This is what makes the bot answer arbitrary senders
+  // without dropping messages.
+  //
+  // ── [🔴 CRITICAL fix — PR #417 review] cross-`channel_type` isolation leak ──
+  // The discriminator "is this deployment multi-tenant?" MUST be GLOBAL — it
+  // looks at EVERY active channel owned by a non-`default` tenant, regardless
+  // of `channel_type`. The previous implementation scoped the discriminator to
+  // the inbound's `channel_type`, so a real tenant whose only channel was a
+  // DIFFERENT type (e.g. a `telegram` tenant while the inbound is `whatsapp`)
+  // was invisible → `hasRealTenant` stayed false → the resolver handed
+  // `default/default` to a deployment that HAS a real tenant. That collapses
+  // distinct tenants onto the shared `maia:ratelimit:default:default:*` bucket
+  // — the exact cross-tenant leak issue #268 closed. The fix splits the logic:
+  //   1. GLOBAL discriminator (NO channel_type filter): ANY active channel with
+  //      tenant_id != 'default' ⇒ real multi-tenant deployment → fail-closed
+  //      (`multi_tenant:true`, NO channel) so the resolver throws
+  //      `channel_resolution_failed`.
+  //   2. ONLY IF none exists: use `channel_type` to locate the seeded active
+  //      `default/default` catch-all channel
+  //      (migrations/035_p6_seed_default_channel_role_policy.sql).
+  //
+  // ── [🟠 HIGH fix — PR #417 review] TOCTOU vs a concurrent activation ──
+  // Both reads run inside ONE transaction (`withTx` → a single `BEGIN…COMMIT`
+  // on one pooled connection) so the discriminator and the catch-all fetch
+  // observe a CONSISTENT snapshot. A tenant activating its first channel
+  // between the two reads can no longer slip through the window and let an
+  // in-flight message hit `default/default` after the deployment became
+  // multi-tenant. Residual risk: a concurrent activation that COMMITS before
+  // this transaction's snapshot is taken is (correctly) not yet visible — the
+  // in-flight message races the activation, which is inherent and bounded; the
+  // very next inbound observes the new tenant and fails closed. Eliminating
+  // even that would require locking the whole `channels` table on every inbound
+  // (rejected: it serialises the hot path for no isolation gain — the next
+  // message already fails closed).
+  //
+  // Cardinality: the `channels` table is small (one row per registered line);
+  // the discriminator is a `LIMIT 1` existence probe and the catch-all fetch is
+  // a single-row lookup, both O(1)-ish.
+  async findDefaultCatchAllChannel(args: {
+    channel_type: string;
+  }): Promise<
+    | { multi_tenant: true; channel: null }
+    | { multi_tenant: false; channel: Channel | null }
+  > {
+    return withTx(async (tx) => {
+      // 1. GLOBAL discriminator — any ACTIVE channel owned by a non-`default`
+      //    tenant, across ALL channel_types. Its mere existence proves a real
+      //    multi-tenant deployment. Fail-closed: do NOT hand back the default
+      //    catch-all. `LIMIT 1` — we only need existence, not the rows.
+      const realTenantProbe = await tx
+        .select({ one: sql<number>`1` })
+        .from(channels)
+        .where(and(eq(channels.active, true), ne(channels.tenant_id, 'default')))
+        .limit(1);
+      if (realTenantProbe.length > 0) {
+        return { multi_tenant: true, channel: null };
+      }
+
+      // 2. Single-tenant runtime: surface the seeded active `default/default`
+      //    catch-all channel for this channel_type (if present). Scoped by
+      //    channel_type so e.g. a whatsapp inbound gets the whatsapp catch-all.
+      const fallbackRows = await tx
+        .select()
+        .from(channels)
+        .where(
+          and(
+            eq(channels.channel_type, args.channel_type),
+            eq(channels.active, true),
+            eq(channels.tenant_id, 'default'),
+            eq(channels.agent_id, 'default'),
+          ),
+        )
+        .limit(1);
+      return { multi_tenant: false, channel: fallbackRows[0] ?? null };
+    });
   },
 
   async listActive(): Promise<Channel[]> {

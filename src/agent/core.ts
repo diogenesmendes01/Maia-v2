@@ -13,8 +13,6 @@ import { checkRateLimit, formatPoliteReply } from '@/gateway/rate-limit.js';
 import { resolveIdentity } from '@/identity/resolver.js';
 import { handleQuarantineFirstContact, handleOwnerIdentityReply } from '@/identity/quarantine.js';
 import { config } from '@/config/env.js';
-import { featureFlags } from '@/config/feature-flags.js';
-import { FeatureFlagName } from '@/types/enums.js';
 import { clearDebounceState as clearDebounceStateRaw } from '@/gateway/debouncer.js';
 import { buildPrompt } from './prompt-builder.js';
 import { hashScope } from './scope-hash.js';
@@ -168,27 +166,53 @@ export const _internal = { scheduleTypingDebounce, sendOutbound, aggregateUnproc
  * `channelsRepo.findByExternalCrossTenant` — entry point precisa descobrir
  * qual tenant antes de poder operar dentro dele).
  *
- * Retorna apenas o suficiente para chamar `resolveChannel`. Qualquer falha
- * (mensagem ausente, sem `metadata.telefone`, erro de DB) devolve null —
- * o caller cai em legacy default/default.
+ * Retorna apenas o suficiente para chamar `resolveChannel`.
+ *
+ * ── [🔴 HIGH fix #417] distinguir "sem telefone" de "erro de DB" ───────────
+ * `null` significa EXCLUSIVAMENTE "não há telefone para resolver" (linha
+ * ausente ou `metadata.telefone` vazio). Esse é o ÚNICO caso que legitimamente
+ * preserva o legacy `default/default` (o inner retorna cedo para mensagens sem
+ * telefone, sem nunca resolver tenant nenhum).
+ *
+ * Um ERRO DE DB no probe NÃO pode colapsar para `null` — antes deste fix, o
+ * blanket `catch { return null }` mapeava uma falha transitória de leitura para
+ * o mesmo `null` de "sem telefone". Como o caller só roda o resolver quando o
+ * probe é truthy, uma falha de DB pulava resolver+adoção e roteava uma mensagem
+ * POSSIVELMENTE multi-tenant para o bucket `default/default` — silenciosamente
+ * violando o fail-closed (#268). Agora um erro de DB é re-lançado como
+ * `TypedError('channel_probe_failed')`: o caller audita `channel_resolution_failed`
+ * e re-lança → BullMQ aplica retry/DLQ (fail-closed).
  */
 async function probeMessageForChannel(
   mensagem_id: string,
 ): Promise<{ channel_type: 'whatsapp'; external_id: string } | null> {
+  let rows: Array<{ metadata: unknown }>;
   try {
-    const rows = await db
+    rows = await db
       .select({ metadata: mensagens.metadata })
       .from(mensagens)
       .where(eq(mensagens.id, mensagem_id))
       .limit(1);
-    if (rows.length === 0) return null;
-    const md = (rows[0]!.metadata ?? {}) as Record<string, unknown>;
-    const tel = typeof md['telefone'] === 'string' ? (md['telefone'] as string) : null;
-    if (!tel) return null;
-    return { channel_type: 'whatsapp', external_id: tel };
-  } catch {
-    return null;
+  } catch (err) {
+    // DB read failure — fail-closed. Do NOT collapse to the "no telefone" null;
+    // that would route a possibly-multi-tenant message to default/default.
+    throw new TypedError(
+      'channel_probe_failed',
+      'failed to read mensagens.metadata for channel probe (DB error) — failing closed',
+      {
+        mensagem_id,
+        resolver_path: 'probe_db_error',
+        cause: (err as Error).message,
+      },
+    );
   }
+  // Below this point: a successful read. `null` now means strictly "no telefone
+  // to resolve" → caller keeps legacy default/default (inner returns early).
+  if (rows.length === 0) return null;
+  const md = (rows[0]!.metadata ?? {}) as Record<string, unknown>;
+  const tel = typeof md['telefone'] === 'string' ? (md['telefone'] as string) : null;
+  if (!tel) return null;
+  return { channel_type: 'whatsapp', external_id: tel };
 }
 
 /**
@@ -225,41 +249,48 @@ async function clearDebounceState(phone: string): Promise<void> {
 }
 
 export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
-  // P6 Task 9 + issue #268 (fail-loud): roteamento via channel resolver.
+  // P6 Task 9 + issue #268 (fail-loud) + issue #411 (single-tenant catch-all):
+  // roteamento via channel resolver. O resolver SEMPRE roda (MULTI_CHANNEL
+  // removido — sempre ON após #411).
   //
-  // Quando MULTI_CHANNEL está OFF, opera direto em `default/default` (modo
-  // legacy single-tenant — preservado de P0..P5). O resolver NÃO é chamado
-  // nesse caminho.
-  //
-  // Quando MULTI_CHANNEL está ON, qualquer falha de resolução (probe sem
-  // telefone, canal não registrado, canal inativo) AGORA é fatal: o resolver
-  // levanta TypedError, este caller emite um audit `channel_resolution_failed`
-  // (com contexto suficiente pra triagem) e re-lança. BullMQ trata como job
-  // failure → retry policy → DLQ. Isso elimina o bypass do issue #268, em que
-  // tenants distintos colapsavam no bucket compartilhado
-  // `maia:ratelimit:default:default:*`.
+  // Probe lê `metadata.telefone` (o remetente). Dois desfechos:
+  //   - probe OK → `resolveChannel`:
+  //       · single-tenant (nenhum canal de outro tenant) → o resolver mapeia
+  //         qualquer remetente para o canal catch-all `default/default` semeado
+  //         (issue #411 — o bot volta a responder a TODOS).
+  //       · multi-tenant: exact-match casa → tenant/agent reais; miss/inativo/
+  //         ambíguo → o resolver LANÇA TypedError. Auditamos
+  //         `channel_resolution_failed` e re-lançamos. BullMQ trata como job
+  //         failure → retry → DLQ. Preserva o #268 (sem colapso no bucket
+  //         compartilhado `maia:ratelimit:default:default:*`).
+  //   - probe null (mensagem sem telefone) → mantemos `default/default` e
+  //     seguimos: o inner (`runAgentForMensagemInner`) já trata o caso "sem
+  //     telefone" retornando cedo. Mesmo comportamento do path legacy
+  //     single-tenant pré-#411 para mensagens sem telefone.
+  //   - probe LANÇA (erro de DB → `TypedError('channel_probe_failed')`)
+  //     [🔴 HIGH fix #417]: NÃO colapsa para default/default. Cai no catch
+  //     abaixo → audita `channel_resolution_failed` (error_code:
+  //     channel_probe_failed) → re-lança → BullMQ retry/DLQ (fail-closed). Antes
+  //     deste fix uma falha transitória de DB no probe virava `null` e roteava
+  //     uma mensagem possivelmente multi-tenant para o bucket default/default.
   let resolved: { tenant_id: string; agent_id: string; channel_id: string | null } = {
     tenant_id: 'default',
     agent_id: 'default',
     channel_id: null,
   };
 
-  if (featureFlags.isEnabled(FeatureFlagName.MULTI_CHANNEL)) {
+  {
     let probe: { channel_type: 'whatsapp'; external_id: string } | null = null;
     try {
       probe = await probeMessageForChannel(mensagem_id);
-      if (!probe) {
-        // Probe missing/incomplete metadata is also a resolution failure when
-        // MULTI_CHANNEL is ON — without (channel_type, external_id) we can't
-        // identify the tenant, and falling back to default/default would
-        // collapse buckets cross-tenant.
-        throw new TypedError(
-          'channel_resolution_failed',
-          'probe returned null — missing telefone metadata on inbound mensagem',
-          { mensagem_id, resolver_path: 'probe_missing_metadata' },
-        );
+      // probe null → no telefone metadata. Keep default/default and let the
+      // inner function handle the missing-telefone case (it returns early).
+      // This matches the legacy single-tenant behavior for telefone-less rows
+      // and never reaches the resolver, so it cannot collapse cross-tenant
+      // buckets (no tenant was resolved).
+      if (probe) {
+        resolved = await resolveChannel(probe);
       }
-      resolved = await resolveChannel(probe);
     } catch (err) {
       const typed = err as { code?: string; details?: unknown };
       // Audit emitted at the caller level so the row carries `mensagem_id` +
@@ -283,7 +314,8 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
       );
       // Propagate: the agent worker (BullMQ) will mark the job failed and
       // apply the configured retry/DLQ policy. We do NOT fall back to
-      // default/default — that's exactly the bypass issue #268 closed.
+      // default/default — that's exactly the bypass issue #268 closed (and the
+      // resolver only throws here in a genuine multi-tenant deployment).
       throw err;
     }
 
@@ -572,13 +604,14 @@ async function runAgentForMensagemInner(
   const scope = await resolveScope(pessoa);
 
   // P3b Task 9 / P6 Task 9 / P7 Task 8 — PRE-TURN cognitive modules:
-  // resolve procedure-selector + role-selector (when MULTI_CHANNEL on).
+  // resolve procedure-selector + role-selector (role-selector runs whenever a
+  // channel_id is present — MULTI_CHANNEL removed / always on after #411).
   //
-  // Dual-path: quando FEATURE_COGNITIVE_GRAPH ON, orquestração é declarativa
-  // via `runNodes(buildPreturnNodes(...))`; OFF mantém path legacy intacto
-  // (try/catch ad-hoc por módulo). Side effects de DB (record decision,
-  // start/abort execution, etc.) acontecem APÓS o grafo retornar, lendo
-  // `result.nodes[name].output` — mantém paridade byte-por-byte com legacy.
+  // Orquestração SEMPRE declarativa via `runNodes(buildPreturnNodes(...))`
+  // (FEATURE_COGNITIVE_GRAPH removida em #412 — o grafo é o único caminho).
+  // Side effects de DB (record decision, start/abort execution, etc.) acontecem
+  // APÓS o grafo retornar, lendo `result.nodes[name].output` — mantém paridade
+  // byte-por-byte com o path imperativo legacy pré-#412.
   //
   // Procedure runtime nunca pode derrubar o baseline ReAct turn. Failures
   // só deixam `activeExecution=null` / `activeRole=null`.
@@ -590,19 +623,15 @@ async function runAgentForMensagemInner(
   // partir do output do node role-selector (só roda sob MULTI_CHANNEL).
   let roleAnnouncement: string | null = null;
 
-  // P7 (issue #412) — orquestração SEMPRE via grafo declarativo. O dual-path
-  // gated por FEATURE_COGNITIVE_GRAPH foi colapsado: o grafo é o único caminho.
-  // `multi_channel_on` continua sendo passado a `buildPreturnNodes` (pertence ao
-  // #411 / MULTI_CHANNEL — fora deste escopo). Side effects de DB (record
-  // decision, start/abort execution) acontecem APÓS o grafo retornar, lendo
-  // `result.nodes[name].output`. Procedure runtime nunca derruba o ReAct turn:
-  // falhas só deixam `activeExecution=null` / `activeRole=null`.
+  // #411 (MULTI_CHANNEL removed / always on): `multi_channel_on` é passado como
+  // `true`; o node role-selector é gated downstream por `ctx.role_inputs !==
+  // undefined` (que por sua vez exige channel_id resolvido + policy), então
+  // passar true aqui apenas mantém o node disponível e deixa `buildRoleInputs`
+  // decidir por turno.
   try {
     activeExecution = await procedureExecutionsRepo.findActiveForConversa(c.id);
     const role_inputs = await buildRoleInputs(channel_id);
-    const nodes = buildPreturnNodes({
-      multi_channel_on: featureFlags.isEnabled(FeatureFlagName.MULTI_CHANNEL),
-    });
+    const nodes = buildPreturnNodes({ multi_channel_on: true });
     const ctx: PreturnContext = {
       conversa_id: c.id,
       turno_id: inbound.id,
@@ -1009,16 +1038,14 @@ async function runAgentForMensagemInner(
  * P7 Task 8 — helper file-local para montar `role_inputs` do PreturnContext.
  *
  * Mirror do bloco legacy de role-selection: só retorna inputs quando
- * MULTI_CHANNEL on E channel_id presente E policy + roles disponíveis.
- * Caso contrário retorna undefined, e o node role-selector é omitido do
- * grafo (`buildPreturnNodes(multi_channel_on: false)`) ou skipado via
- * `runWhen=ctx.role_inputs !== undefined`.
+ * channel_id presente E policy + roles disponíveis (MULTI_CHANNEL removido /
+ * sempre on após #411). Caso contrário retorna undefined, e o node
+ * role-selector é skipado via `runWhen=ctx.role_inputs !== undefined`.
  */
 async function buildRoleInputs(
   channel_id: string | null,
 ): Promise<PreturnContext['role_inputs']> {
   if (!channel_id) return undefined;
-  if (!featureFlags.isEnabled(FeatureFlagName.MULTI_CHANNEL)) return undefined;
   try {
     const policy = await channelPoliciesRepo.getByChannelId(channel_id);
     if (!policy) return undefined;

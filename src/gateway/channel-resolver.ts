@@ -7,24 +7,32 @@
  * applyTenantGuard. Esse é o único momento legítimo de bypass — a partir
  * daqui, o resto do pipeline opera dentro de (tenant, agent).
  *
- * Política de resolução (issue #268 — fail-loud):
- *   - Flag MULTI_CHANNEL OFF                 -> throw TypedError('channel_resolution_failed').
- *   - Channel não encontrado OU inativo      -> throw TypedError('channel_resolution_failed').
- *   - Channel encontrado e ativo             -> tenant_id/agent_id/channel.id reais.
+ * Política de resolução (issue #268 fail-loud + issue #411 single-tenant
+ * catch-all):
+ *   - Channel encontrado e ativo (exact match)  -> tenant_id/agent_id/channel.id reais.
+ *   - Miss/inativo NUM runtime single-tenant     -> (default, default, <default channel id>).
+ *   - Miss/inativo NUM deployment multi-tenant   -> throw TypedError('channel_resolution_failed').
+ *   - 2+ canais ativos cross-tenant (ambíguo)    -> throw TypedError('channel_resolution_failed').
  *
- * Antes (legacy): qualquer miss caía em `default/default/null`. Isso colapsava
- * buckets de rate-limit entre tenants distintos (cross-tenant DoS — issue #268).
- * Agora o resolver levanta erro tipado; o caller registra audit e deixa o erro
- * propagar (BullMQ retry/DLQ), preservando o invariante "Maias de empresas
- * diferentes jamais se misturam".
+ * ── Por que o catch-all (issue #411) ──────────────────────────────────────
+ * Um canal WhatsApp representa a LINHA DO BOT (o número em que as mensagens
+ * chegam), não o remetente. No runtime single-tenant atual, `core.ts` /
+ * `baileys.ts` passam o telefone do REMETENTE como `external_id`, que nunca
+ * casa com o único canal semeado (`external_id = 'default-channel'`). Antes do
+ * #411 esse miss levantava `channel_resolution_failed` → DLQ → o bot parava de
+ * responder a TODOS. O catch-all resolve qualquer remetente desconhecido para
+ * o canal `default/default` semeado QUANDO o deployment é comprovadamente
+ * single-tenant (nenhum canal ativo pertence a um tenant != 'default').
  *
- * Para o modo legacy single-tenant, o caller (agent/core.ts) checa a flag
- * MULTI_CHANNEL ANTES de invocar resolveChannel; quando OFF, opera direto
- * em `default/default` sem passar pelo resolver. O throw aqui é uma defesa
- * em profundidade contra callers que pulem essa checagem.
+ * ── Por que isso NÃO regride o #268 ───────────────────────────────────────
+ * O fallback default/default só é entregue quando `findDefaultCatchAllChannel`
+ * confirma que NÃO existe canal ativo de outro tenant. Assim que UM deployment
+ * multi-tenant registra um canal real, qualquer miss volta a ser fail-loud
+ * (throw), preservando o invariante "Maias de empresas diferentes jamais se
+ * misturam" — buckets de rate-limit cross-tenant nunca colapsam no
+ * `maia:ratelimit:default:default:*` compartilhado. A ambiguidade (2+ ativos
+ * cross-tenant) continua sendo throw, propagado do repo.
  */
-import { featureFlags } from '@/config/feature-flags.js';
-import { FeatureFlagName } from '@/types/enums.js';
 import { channelsRepo } from '@/db/repositories.js';
 import { logger } from '@/lib/logger.js';
 import { TypedError } from '@/lib/utils.js';
@@ -40,7 +48,6 @@ export type ChannelResolutionFailureContext = {
   external_id: string;
   /** Which fallback branch tripped — useful for audit/triage. */
   resolver_path:
-    | 'legacy_flag_off'
     | 'unknown_or_inactive_channel'
     | 'ambiguous_active_channels';
   /** When `unknown_or_inactive_channel`: did we find a row at all? */
@@ -55,30 +62,11 @@ export async function resolveChannel(args: {
   channel_type: 'whatsapp' | 'telegram' | 'email' | 'sms' | 'web' | 'api' | 'other';
   external_id: string;
 }): Promise<ChannelResolution> {
-  // 1. Flag OFF: previously returned default/default/null (legacy mode).
-  //    Issue #268: throw instead. Callers in multi-tenant prod MUST check the
-  //    flag before invoking resolveChannel; reaching this branch with the flag
-  //    OFF is a programmer error / misconfiguration. Surfacing it loudly
-  //    prevents accidental fallback to a shared bucket.
-  if (!featureFlags.isEnabled(FeatureFlagName.MULTI_CHANNEL)) {
-    const details: ChannelResolutionFailureContext = {
-      channel_type: args.channel_type,
-      external_id: args.external_id,
-      resolver_path: 'legacy_flag_off',
-    };
-    logger.warn(details, 'channel_resolver.legacy_flag_off_throw');
-    throw new TypedError(
-      'channel_resolution_failed',
-      'channel resolver invoked with MULTI_CHANNEL flag OFF',
-      details,
-    );
-  }
-
-  // 2. Lookup cross-tenant (único método autorizado a bypassar tenant guard,
+  // 1. Lookup cross-tenant (único método autorizado a bypassar tenant guard,
   //    pois aqui ainda não há contexto — estamos justamente descobrindo qual).
   //
-  //    [Codex review #277] O repo agora itera matches preferindo `active=true`
-  //    e lança `channel_resolution_failed` (resolver_path: ambiguous_active_channels)
+  //    [Codex review #277] O repo itera matches preferindo `active=true` e
+  //    lança `channel_resolution_failed` (resolver_path: ambiguous_active_channels)
   //    se houver 2+ canais ativos em tenants distintos para o mesmo
   //    (channel_type, external_id). Não capturamos aqui — o try/catch do caller
   //    em `agent/core.ts` já emite o audit padrão.
@@ -87,30 +75,76 @@ export async function resolveChannel(args: {
     external_id: args.external_id,
   });
 
-  // 3. Miss ou canal desativado: throw em vez de retornar default. Issue #268
-  //    eliminou esse fallback porque ele colapsava buckets de rate-limit entre
-  //    tenants distintos (todos os "miss" caíam na mesma key
-  //    `maia:ratelimit:default:default:*` — cross-tenant DoS).
-  if (!channel || !channel.active) {
-    const details: ChannelResolutionFailureContext = {
-      channel_type: args.channel_type,
-      external_id: args.external_id,
-      resolver_path: 'unknown_or_inactive_channel',
-      found: !!channel,
-      active: channel?.active ?? false,
+  // 2. Exact match ativo → emite o triplete real para o downstream.
+  if (channel && channel.active) {
+    return {
+      tenant_id: channel.tenant_id,
+      agent_id: channel.agent_id,
+      channel_id: channel.id,
     };
-    logger.warn(details, 'channel_resolver.unknown_or_inactive_channel_throw');
-    throw new TypedError(
-      'channel_resolution_failed',
-      'channel not found or inactive',
-      details,
-    );
   }
 
-  // 4. Resolução bem-sucedida — emite o triplete real para o downstream.
-  return {
-    tenant_id: channel.tenant_id,
-    agent_id: channel.agent_id,
-    channel_id: channel.id,
+  // 3. Miss ou canal desativado. Issue #411: no runtime single-tenant a linha
+  //    do bot é semeada como `default/default` e o `external_id` do lookup é o
+  //    telefone do REMETENTE — então o exact match sempre falha. Em vez de
+  //    derrubar a mensagem (o bug #411), resolvemos para o canal catch-all
+  //    `default/default` SE — e somente se — o deployment é comprovadamente
+  //    single-tenant.
+  //
+  //    [🔴 CRITICAL fix #417] O discriminador "é multi-tenant?" é GLOBAL —
+  //    olha QUALQUER canal ativo de tenant != 'default' em TODOS os
+  //    channel_types (antes filtrava por channel_type, escondendo um tenant
+  //    real cujo canal era de outro tipo → vazamento cross-tenant). Assim que
+  //    existe um tenant real, `findDefaultCatchAllChannel` retorna
+  //    `multi_tenant:true` e caímos no fail-loud do #268 (throw), preservando
+  //    o isolamento.
+  //
+  //    [🟠 HIGH fix #417 — TOCTOU] O discriminador GLOBAL e a busca do
+  //    catch-all rodam dentro de UMA transação (`withTx`) no repo, num snapshot
+  //    consistente: um tenant que ative seu primeiro canal entre as duas
+  //    leituras não escapa mais pela janela. O exact-match (passo 1) é uma
+  //    leitura anterior separada, mas a direção é segura — uma ativação entre o
+  //    passo 1 e este passo só torna o resultado MAIS fail-closed (o
+  //    discriminador passa a ver o tenant real e lança). Risco residual
+  //    documentado em `findDefaultCatchAllChannel`.
+  const catchAll = await channelsRepo.findDefaultCatchAllChannel({
+    channel_type: args.channel_type,
+  });
+
+  if (!catchAll.multi_tenant && catchAll.channel) {
+    logger.debug(
+      {
+        channel_type: args.channel_type,
+        resolved_channel_id: catchAll.channel.id,
+      },
+      'channel_resolver.single_tenant_catch_all',
+    );
+    return {
+      tenant_id: catchAll.channel.tenant_id,
+      agent_id: catchAll.channel.agent_id,
+      channel_id: catchAll.channel.id,
+    };
+  }
+
+  // 4. Fail-loud (issue #268). Either a real multi-tenant deployment (an
+  //    unknown sender must NOT collapse onto the shared default/default
+  //    bucket) or a misconfigured single-tenant runtime where the default
+  //    channel seed (migration 035) is missing/inactive. Throw a typed error;
+  //    the caller in `agent/core.ts` audits `channel_resolution_failed` and
+  //    re-throws (BullMQ retry/DLQ).
+  const details: ChannelResolutionFailureContext = {
+    channel_type: args.channel_type,
+    external_id: args.external_id,
+    resolver_path: 'unknown_or_inactive_channel',
+    found: !!channel,
+    active: channel?.active ?? false,
   };
+  logger.warn(details, 'channel_resolver.unknown_or_inactive_channel_throw');
+  throw new TypedError(
+    'channel_resolution_failed',
+    catchAll.multi_tenant
+      ? 'channel not found or inactive (multi-tenant deployment — refusing default fallback)'
+      : 'channel not found or inactive (single-tenant default channel seed missing)',
+    details,
+  );
 }

@@ -67,9 +67,14 @@ vi.mock('../../src/db/client.js', () => {
     withTx: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})),
   };
 });
+// `mensagens` is needed by the channel-resolution probe in runAgentForMensagem
+// (it reads `mensagens.metadata` before the resolver). Without it the probe
+// deref throws and, post-#417 fail-closed, that propagates instead of being
+// silently swallowed.
 vi.mock('../../src/db/schema.js', () => ({
   conversas: {} as unknown,
   pessoas: {} as unknown,
+  mensagens: { metadata: {}, id: {} } as unknown,
 }));
 vi.mock('drizzle-orm', () => ({
   eq: () => ({}),

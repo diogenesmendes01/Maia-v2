@@ -1,6 +1,8 @@
 /**
  * Issue #290 — Baileys ingress runs `handleIncoming` inside the RESOLVED
- * tenant context (NOT `default/default` synthetic) when MULTI_CHANNEL is ON.
+ * tenant context (NOT `default/default` synthetic). Issue #411 — MULTI_CHANNEL
+ * removed: the resolver ALWAYS runs and, in a single-tenant runtime, maps any
+ * sender to (default, default) via the catch-all.
  *
  * Coverage (in-process, mocked Baileys + mocked channelsRepo):
  *
@@ -10,14 +12,17 @@
  *      enter tenant B's ALS — even when tenant B has a row in `channels`
  *      with overlapping data. This is the defense the issue calls out as
  *      the runtime guarantee the downstream PRs need.
- *   3. Unknown JID → `handleIncoming` is NEVER invoked; audit emitted
- *      with `channel_resolution_failed` (fail-closed; no default/default
- *      fallback).
- *   4. Legacy MULTI_CHANNEL=OFF → behaviour matches the pre-#290 single-
- *      tenant path (default/default), no regression for the existing
- *      single-tenant deployment.
+ *   3. Unknown JID in a MULTI-TENANT deployment → `handleIncoming` is NEVER
+ *      invoked; audit emitted with `channel_resolution_failed` (fail-closed;
+ *      no default/default fallback).
+ *   4. #411 single-tenant → unknown sender resolves to default/default via the
+ *      catch-all and IS processed (the bot keeps answering everyone).
  *   5. @lid + senderPn → resolved via the real phone, runs under the
  *      owning tenant's ALS.
+ *
+ * The default `findDefaultCatchAllChannel` mock returns `multi_tenant:true` so
+ * a miss is fail-loud (the cross-tenant contract). The single-tenant scenario
+ * overrides it.
  *
  * These tests exercise the full Baileys upsert pipeline at the boundary
  * — they mock Baileys, the channels repo, and downstream sinks
@@ -31,6 +36,7 @@ import type { Channel } from '@/db/schema.js';
 
 const {
   findByExternalCrossTenantMock,
+  findDefaultCatchAllChannelMock,
   createInboundMock,
   enqueueAgentMock,
   auditMock,
@@ -50,6 +56,7 @@ const {
       [args: { channel_type: string; external_id: string }],
       Promise<Channel | null>
     >(),
+    findDefaultCatchAllChannelMock: vi.fn(),
     createInboundMock: vi.fn(),
     enqueueAgentMock: vi.fn().mockResolvedValue(undefined),
     auditMock: vi.fn().mockResolvedValue(undefined),
@@ -100,7 +107,10 @@ vi.mock('@/lib/logger.js', () => ({
 
 vi.mock('@/db/repositories.js', () => ({
   mensagensRepo: { createInbound: createInboundMock },
-  channelsRepo: { findByExternalCrossTenant: findByExternalCrossTenantMock },
+  channelsRepo: {
+    findByExternalCrossTenant: findByExternalCrossTenantMock,
+    findDefaultCatchAllChannel: findDefaultCatchAllChannelMock,
+  },
 }));
 
 vi.mock('@/gateway/dedup.js', () => ({
@@ -185,6 +195,10 @@ function inbound(jid: string, id: string, extras: Record<string, unknown> = {}) 
 describe('baileys messages.upsert — runs handleIncoming inside RESOLVED tenant context (issue #290)', () => {
   beforeEach(async () => {
     findByExternalCrossTenantMock.mockReset();
+    findDefaultCatchAllChannelMock.mockReset();
+    // Default: MULTI-TENANT deployment → a channel miss is fail-loud (the
+    // cross-tenant contract). The single-tenant scenario overrides this.
+    findDefaultCatchAllChannelMock.mockResolvedValue({ multi_tenant: true, channel: null });
     createInboundMock.mockReset();
     enqueueAgentMock.mockClear();
     auditMock.mockClear();
@@ -193,17 +207,11 @@ describe('baileys messages.upsert — runs handleIncoming inside RESOLVED tenant
     checkBotAndMaybeBlockMock.mockReset();
     checkBotAndMaybeBlockMock.mockResolvedValue(false);
     handlerState.upsertHandler = null;
-    // Reset feature flags via dynamic import (so the in-process flag registry
-    // resets between test scenarios).
     const { featureFlags } = await import('@/config/feature-flags.js');
     featureFlags.reset();
   });
 
   it('two JIDs → each handleIncoming runs under its own resolved tenant (cross-tenant happy path)', async () => {
-    const { featureFlags } = await import('@/config/feature-flags.js');
-    const { FeatureFlagName } = await import('@/types/enums.js');
-    featureFlags.override(FeatureFlagName.MULTI_CHANNEL, true);
-
     findByExternalCrossTenantMock.mockImplementation(async (args) => {
       if (args.external_id === '+5511111111111') {
         return makeChannel({
@@ -274,10 +282,6 @@ describe('baileys messages.upsert — runs handleIncoming inside RESOLVED tenant
     // ACTIVE owner for a given phone. Even when the same phone has historic
     // rows in another tenant (inactive — recently switched providers), the
     // active resolution wins and ONLY that tenant's ALS is entered.
-    const { featureFlags } = await import('@/config/feature-flags.js');
-    const { FeatureFlagName } = await import('@/types/enums.js');
-    featureFlags.override(FeatureFlagName.MULTI_CHANNEL, true);
-
     findByExternalCrossTenantMock.mockResolvedValueOnce(
       makeChannel({
         tenant_id: 'tenant-A',
@@ -320,10 +324,6 @@ describe('baileys messages.upsert — runs handleIncoming inside RESOLVED tenant
   });
 
   it('unknown JID → handleIncoming NOT invoked; audit channel_resolution_failed emitted (fail-closed)', async () => {
-    const { featureFlags } = await import('@/config/feature-flags.js');
-    const { FeatureFlagName } = await import('@/types/enums.js');
-    featureFlags.override(FeatureFlagName.MULTI_CHANNEL, true);
-
     findByExternalCrossTenantMock.mockResolvedValueOnce(null); // miss
     createInboundMock.mockImplementation(async () => {
       throw new Error('createInbound MUST NOT run for unknown JID');
@@ -360,10 +360,6 @@ describe('baileys messages.upsert — runs handleIncoming inside RESOLVED tenant
   });
 
   it('malformed JID → audit + drop, NO repo lookup (jid_unparseable)', async () => {
-    const { featureFlags } = await import('@/config/feature-flags.js');
-    const { FeatureFlagName } = await import('@/types/enums.js');
-    featureFlags.override(FeatureFlagName.MULTI_CHANNEL, true);
-
     const { startBaileys } = await import('@/gateway/baileys.js');
     await startBaileys();
 
@@ -384,11 +380,47 @@ describe('baileys messages.upsert — runs handleIncoming inside RESOLVED tenant
     ).toBe('jid_unparseable');
   });
 
-  it('group JID (@g.us) → audit + drop with resolver_path=jid_unparseable (defense in depth)', async () => {
-    const { featureFlags } = await import('@/config/feature-flags.js');
-    const { FeatureFlagName } = await import('@/types/enums.js');
-    featureFlags.override(FeatureFlagName.MULTI_CHANNEL, true);
+  it('🟠 MEDIUM (#417): malformed envelope with NO key → fail-closed audit (channel_resolution_failed), NOT an opaque handle_failed crash', async () => {
+    // A content envelope that is missing `msg.key` entirely. The upsert loop
+    // does NOT skip it (it has `message` content), so it reaches
+    // resolveTenantCtxForUpsert. There `jid = msg.key?.remoteJid ?? null` → null
+    // → resolveScopeForJid(null) fails closed → the catch builds the audit. The
+    // bug this guards: the audit/log path dereferenced `msg.key.id` directly, so
+    // a no-key envelope threw a TypeError that escaped as `baileys.handle_failed`
+    // — BYPASSING the intended channel_resolution_failed audit. With
+    // `msg.key?.id` the audit is emitted cleanly with whatsapp_id: null.
+    const { startBaileys } = await import('@/gateway/baileys.js');
+    await startBaileys();
 
+    // No `key` property at all — only content.
+    const noKeyMsg = {
+      messageTimestamp: Math.floor(Date.now() / 1000),
+      message: { conversation: 'olá sem key' },
+      pushName: 'Cliente',
+    };
+
+    // Must NOT throw out of the handler (the deref bug would crash the audit).
+    await expect(
+      handlerState.upsertHandler!({ messages: [noKeyMsg] }),
+    ).resolves.toBeUndefined();
+
+    // No tenant resolution, no inbound persisted.
+    expect(findByExternalCrossTenantMock).not.toHaveBeenCalled();
+    expect(createInboundMock).not.toHaveBeenCalled();
+
+    // The intended fail-closed audit IS emitted (it was bypassed before the fix).
+    const failedAudits = auditMock.mock.calls.filter(
+      (call) => (call[0] as { acao?: string })?.acao === 'channel_resolution_failed',
+    );
+    expect(failedAudits).toHaveLength(1);
+    const md = (failedAudits[0]![0] as { metadata: Record<string, unknown> }).metadata;
+    // whatsapp_id safely null (no key) instead of throwing a TypeError.
+    expect(md.whatsapp_id).toBeNull();
+    expect(md.raw_jid).toBeNull();
+    expect(md.emitter).toBe('baileys_ingress');
+  });
+
+  it('group JID (@g.us) → audit + drop with resolver_path=jid_unparseable (defense in depth)', async () => {
     const { startBaileys } = await import('@/gateway/baileys.js');
     await startBaileys();
 
@@ -400,10 +432,19 @@ describe('baileys messages.upsert — runs handleIncoming inside RESOLVED tenant
     expect(createInboundMock).not.toHaveBeenCalled();
   });
 
-  it('legacy MULTI_CHANNEL=OFF → preserves default/default (no regression for single-tenant prod)', async () => {
-    const { featureFlags } = await import('@/config/feature-flags.js');
-    const { FeatureFlagName } = await import('@/types/enums.js');
-    featureFlags.override(FeatureFlagName.MULTI_CHANNEL, false);
+  it('#411 single-tenant → arbitrary sender resolves to default/default via catch-all and IS processed', async () => {
+    // Exact-match misses (the sender phone is not a registered bot line), and
+    // no real tenant exists → catch-all maps it to the seeded default channel.
+    findByExternalCrossTenantMock.mockResolvedValueOnce(null);
+    findDefaultCatchAllChannelMock.mockResolvedValueOnce({
+      multi_tenant: false,
+      channel: makeChannel({
+        id: 'default-channel-uuid',
+        tenant_id: 'default',
+        agent_id: 'default',
+        external_id: 'default-channel',
+      }),
+    });
 
     let observedTenant: string | null = null;
     let observedAgent: string | null = null;
@@ -414,7 +455,7 @@ describe('baileys messages.upsert — runs handleIncoming inside RESOLVED tenant
       observedTenant = getCurrentTenant();
       observedAgent = getCurrentAgent();
       return {
-        row: { id: 'msg-legacy', tenant_id: 'default', agent_id: 'default' },
+        row: { id: 'msg-single', tenant_id: 'default', agent_id: 'default' },
         duplicate: false,
       };
     });
@@ -423,20 +464,21 @@ describe('baileys messages.upsert — runs handleIncoming inside RESOLVED tenant
     await startBaileys();
 
     await handlerState.upsertHandler!({
-      messages: [inbound('5511444444444@s.whatsapp.net', 'WAID-LEGACY')],
+      messages: [inbound('5511444444444@s.whatsapp.net', 'WAID-SINGLE')],
     });
 
+    // The message IS processed (the bug #411 fixed: no DLQ drop).
+    expect(createInboundMock).toHaveBeenCalled();
     expect(observedTenant).toBe('default');
     expect(observedAgent).toBe('default');
-    // Resolver was NOT invoked in legacy mode.
-    expect(findByExternalCrossTenantMock).not.toHaveBeenCalled();
+    // No fail-loud audit — the catch-all resolved it.
+    const failedAudits = auditMock.mock.calls.filter(
+      (call) => (call[0] as { acao?: string })?.acao === 'channel_resolution_failed',
+    );
+    expect(failedAudits).toHaveLength(0);
   });
 
   it('@lid JID with senderPn → resolves via the real phone and runs under the owning tenant', async () => {
-    const { featureFlags } = await import('@/config/feature-flags.js');
-    const { FeatureFlagName } = await import('@/types/enums.js');
-    featureFlags.override(FeatureFlagName.MULTI_CHANNEL, true);
-
     findByExternalCrossTenantMock.mockResolvedValueOnce(
       makeChannel({
         tenant_id: 'tenant-lid',
@@ -472,10 +514,6 @@ describe('baileys messages.upsert — runs handleIncoming inside RESOLVED tenant
   });
 
   it('one failure does not poison the rest: unknown JID followed by known JID in the same batch', async () => {
-    const { featureFlags } = await import('@/config/feature-flags.js');
-    const { FeatureFlagName } = await import('@/types/enums.js');
-    featureFlags.override(FeatureFlagName.MULTI_CHANNEL, true);
-
     findByExternalCrossTenantMock
       .mockResolvedValueOnce(null) // first message: unknown
       .mockResolvedValueOnce(

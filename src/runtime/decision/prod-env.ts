@@ -599,10 +599,11 @@ const lockdownReaderAdapter = new LockdownReaderProdAdapter();
  * channel_policies.agent_id is the owning/default agent for the channel.  No
  * JOIN to roles or agents is needed because agent_id is a direct column.
  */
-// `channel_policies.channel_id` is a `uuid` column. The single-channel hot
-// path (FEATURE_MULTI_CHANNEL off) feeds the sentinel string 'default' as the
-// channel id (see build-base-context.ts: `channel_id ?? 'default'`), which is
-// not a uuid. Querying the uuid column with it makes Postgres throw
+// `channel_policies.channel_id` is a `uuid` column. When the channel resolver
+// did not surface a channel_id (e.g. an inbound with no telefone metadata), the
+// hot path feeds the sentinel string 'default' as the channel id (see
+// build-base-context.ts: `channel_id ?? 'default'`), which is not a uuid.
+// Querying the uuid column with it makes Postgres throw
 // `invalid input syntax for type uuid: "default"`, which propagates up and
 // fail-closes the entire Decision Engine turn. A non-uuid channel id can never
 // match a stored policy row anyway, so short-circuit to the context agent —

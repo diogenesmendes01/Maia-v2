@@ -1,32 +1,27 @@
 /**
- * Issue #268 — agent/core.ts caller behavior for channel resolution.
+ * Issue #268 + Issue #411 — agent/core.ts caller behavior for channel
+ * resolution. MULTI_CHANNEL removed: o resolver SEMPRE roda.
  *
  * Antes (legacy): falhas de resolução eram silenciadas via try/catch e o agente
  * seguia processando como `default/default`. Isso colapsava buckets de
  * rate-limit entre tenants.
  *
- * Agora:
- *   - Flag OFF (MULTI_CHANNEL=false)         → não chama resolveChannel, segue
- *                                              em modo legacy default/default
- *                                              (preservado de P0..P5).
- *   - Flag ON + resolveChannel sucesso       → passa pelo runWithTenantContext
- *                                              com tenant/agent reais, sem
- *                                              audit de falha.
- *   - Flag ON + resolveChannel throw         → emite audit
- *                                              `channel_resolution_failed` e
- *                                              propaga o erro (BullMQ
- *                                              retry/DLQ).
- *   - Flag ON + probe sem tel                → emite audit + propaga
- *                                              `channel_resolution_failed`
- *                                              com resolver_path:
- *                                              "probe_missing_metadata".
+ * Agora (sempre roda o resolver):
+ *   - probe com telefone + resolveChannel sucesso (single-tenant) → resolve
+ *     para (default, default, <default channel id>); adoção é skipada (resolved
+ *     == default/default).
+ *   - probe com telefone + resolveChannel sucesso (multi-tenant) → adoção CAS
+ *     move a row → runWithTenantContext com tenant/agent reais.
+ *   - probe com telefone + resolveChannel throw (multi-tenant miss) → emite
+ *     audit `channel_resolution_failed` e propaga o erro (BullMQ retry/DLQ).
+ *   - probe sem telefone → mantém default/default e SEGUE processando (o inner
+ *     trata o caso "sem telefone"); NÃO emite audit de falha.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ─── Hoisted shared state ──────────────────────────────────────────────────────
 const {
   resolveChannelMock,
-  isMultiChannelOn,
   isContextPacketV1EnabledMock,
   auditMock,
   loggerMock,
@@ -39,7 +34,6 @@ const {
   probeQueryMock,
 } = vi.hoisted(() => {
   const resolveChannelMock = vi.fn();
-  const isMultiChannelOn = { value: false };
   const isContextPacketV1EnabledMock = vi.fn();
   const auditMock = vi.fn().mockResolvedValue(undefined);
   const loggerMock = {
@@ -66,7 +60,6 @@ const {
   const probeQueryMock = vi.fn();
   return {
     resolveChannelMock,
-    isMultiChannelOn,
     isContextPacketV1EnabledMock,
     auditMock,
     loggerMock,
@@ -85,9 +78,15 @@ vi.mock('@/gateway/channel-resolver.js', () => ({
   resolveChannel: resolveChannelMock,
 }));
 
+// Both toggles are gone (MULTI_CHANNEL #411, COGNITIVE_GRAPH #412): core.ts no
+// longer reads any feature flag and the cognitive graph always runs. This mock
+// of the (now-empty) singleton is retained only because core.ts's module graph
+// still resolves it transitively; the resolver/adoption behavior under test is
+// independent of it. The pre-turn graph is mocked separately below (runNodes /
+// buildPreturnNodes), so these specs focus purely on channel resolution.
 vi.mock('@/config/feature-flags.js', () => ({
   featureFlags: {
-    isEnabled: vi.fn(() => isMultiChannelOn.value),
+    isEnabled: vi.fn(() => false),
   },
 }));
 
@@ -258,12 +257,11 @@ vi.mock('@/cognitive-graph/preturn-graph.js', () => ({ buildPreturnNodes: vi.fn(
 vi.mock('@/cognitive-graph/postturn-graph.js', () => ({ buildPostturnNodes: vi.fn(() => []) }));
 
 // ─── Tests ─────────────────────────────────────────────────────────────────────
-describe('runAgentForMensagem — channel resolution fail-loud (issue #268)', () => {
+describe('runAgentForMensagem — channel resolution (#268 fail-loud + #411 catch-all)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
 
-    // Defaults: flag OFF, no packet, healthy mensagem
-    isMultiChannelOn.value = false;
+    // Defaults: no packet, healthy mensagem
     isContextPacketV1EnabledMock.mockResolvedValue(false);
     // [Codex review #311] Default adoption to "we won the swap" so the
     // happy-path specs never reach the owner re-check. Race specs override.
@@ -311,18 +309,30 @@ describe('runAgentForMensagem — channel resolution fail-loud (issue #268)', ()
     });
   });
 
-  it('Flag OFF → não chama resolveChannel, não emite audit de falha, segue legacy default/default', async () => {
-    isMultiChannelOn.value = false;
+  it('#411 single-tenant: resolveChannel devolve default/default → adoção skipada, segue em default/default sem audit de falha', async () => {
+    // O catch-all do resolver mapeia o remetente para o canal default semeado.
+    resolveChannelMock.mockResolvedValueOnce({
+      tenant_id: 'default',
+      agent_id: 'default',
+      channel_id: 'default-channel-uuid',
+    });
 
     const { runAgentForMensagem } = await import('@/agent/core.js');
     await runAgentForMensagem('msg1');
 
-    expect(resolveChannelMock).not.toHaveBeenCalled();
-    // O audit `channel_resolution_failed` NUNCA deve ser emitido em modo legacy.
+    // O resolver SEMPRE roda agora (com telefone na metadata).
+    expect(resolveChannelMock).toHaveBeenCalledTimes(1);
+    expect(resolveChannelMock).toHaveBeenCalledWith({
+      channel_type: 'whatsapp',
+      external_id: '+5511888888888',
+    });
+    // Nenhum audit de falha — resolução bem-sucedida.
     const auditCalls = auditMock.mock.calls.filter(
       (call) => call[0]?.acao === 'channel_resolution_failed',
     );
     expect(auditCalls).toHaveLength(0);
+    // resolved == default/default → adoção é skipada (sem UPDATE no-op).
+    expect(adoptToResolvedTenantMock).not.toHaveBeenCalled();
     // Inner path executou via runWithTenantContext em default/default.
     expect(runWithTenantContextMock).toHaveBeenCalled();
     expect(runWithTenantContextMock.mock.calls[0]![0]).toEqual({
@@ -331,8 +341,7 @@ describe('runAgentForMensagem — channel resolution fail-loud (issue #268)', ()
     });
   });
 
-  it('Flag ON + resolveChannel sucesso → tenant/agent reais, sem audit de falha, adoção chamada ANTES do runWithTenantContext', async () => {
-    isMultiChannelOn.value = true;
+  it('multi-tenant: resolveChannel sucesso → tenant/agent reais, sem audit de falha, adoção chamada ANTES do runWithTenantContext', async () => {
     resolveChannelMock.mockResolvedValueOnce({
       tenant_id: 'tenant-acme',
       agent_id: 'agent-main',
@@ -393,7 +402,6 @@ describe('runAgentForMensagem — channel resolution fail-loud (issue #268)', ()
   // closes).
   // ──────────────────────────────────────────────────────────────────────────
   it('Flag ON + adoção retorna false + row pertence a OUTRO tenant → aborta (throw + audit), NÃO entra em runWithTenantContext', async () => {
-    isMultiChannelOn.value = true;
     resolveChannelMock.mockResolvedValueOnce({
       tenant_id: 'tenant-B',
       agent_id: 'agent-B',
@@ -437,7 +445,6 @@ describe('runAgentForMensagem — channel resolution fail-loud (issue #268)', ()
     // BullMQ retry: a prior attempt already adopted the row into tenant-acme.
     // The second attempt loses the swap (false) but the owner re-check confirms
     // WE own it → safe to proceed under tenant-acme.
-    isMultiChannelOn.value = true;
     resolveChannelMock.mockResolvedValueOnce({
       tenant_id: 'tenant-acme',
       agent_id: 'agent-main',
@@ -470,7 +477,6 @@ describe('runAgentForMensagem — channel resolution fail-loud (issue #268)', ()
   it('Flag ON + adoção retorna false + row sumiu (owner null) → aborta (throw + audit), NÃO processa', async () => {
     // Defensive: the row vanished between persist and adoption (GC, manual
     // delete). We must not fabricate a context — abort.
-    isMultiChannelOn.value = true;
     resolveChannelMock.mockResolvedValueOnce({
       tenant_id: 'tenant-acme',
       agent_id: 'agent-main',
@@ -492,12 +498,10 @@ describe('runAgentForMensagem — channel resolution fail-loud (issue #268)', ()
     expect(conflictAudits[0]![0].metadata.owner_present).toBe(false);
   });
 
-  it('Flag ON + resolveChannel devolve default/default (cenário degenerado) → adoção NÃO é chamada (no-op skip)', async () => {
-    // Defensive: a resolução de um canal legítimo NUNCA deveria retornar
-    // 'default'/'default' (channels seedados sempre têm tenant/agent reais).
-    // Mas se algum dia retornar, queremos garantir que NÃO chamamos adopção —
-    // seria um UPDATE no-op que mascara o real estado e poluiria logs.
-    isMultiChannelOn.value = true;
+  it('#411 single-tenant: resolveChannel devolve default/default → adoção NÃO é chamada (no-op skip)', async () => {
+    // O catch-all do resolver (#411) devolve o canal default semeado para
+    // qualquer remetente em runtime single-tenant. Como resolved == default/
+    // default, NÃO chamamos adoção (seria um UPDATE no-op que polui logs).
     resolveChannelMock.mockResolvedValueOnce({
       tenant_id: 'default',
       agent_id: 'default',
@@ -516,8 +520,7 @@ describe('runAgentForMensagem — channel resolution fail-loud (issue #268)', ()
     });
   });
 
-  it('Flag ON + resolveChannel throw → adoção NÃO é chamada (não há tenant resolvido)', async () => {
-    isMultiChannelOn.value = true;
+  it('multi-tenant: resolveChannel throw → adoção NÃO é chamada (não há tenant resolvido)', async () => {
     const { TypedError } = await import('@/lib/utils.js');
     resolveChannelMock.mockRejectedValueOnce(
       new TypedError(
@@ -533,8 +536,7 @@ describe('runAgentForMensagem — channel resolution fail-loud (issue #268)', ()
     expect(adoptToResolvedTenantMock).not.toHaveBeenCalled();
   });
 
-  it('Flag ON + resolveChannel throw → emite audit channel_resolution_failed e propaga o erro', async () => {
-    isMultiChannelOn.value = true;
+  it('multi-tenant: resolveChannel throw → emite audit channel_resolution_failed e propaga o erro', async () => {
     const { TypedError } = await import('@/lib/utils.js');
     const resolverErr = new TypedError(
       'channel_resolution_failed',
@@ -566,31 +568,93 @@ describe('runAgentForMensagem — channel resolution fail-loud (issue #268)', ()
     expect(runWithTenantContextMock).not.toHaveBeenCalled();
   });
 
-  it('Flag ON + probe sem tel → audit channel_resolution_failed com resolver_path "probe_missing_metadata" + propaga erro', async () => {
-    isMultiChannelOn.value = true;
-
+  it('#411: probe sem telefone → NÃO chama resolveChannel, NÃO emite audit de falha, segue em default/default', async () => {
     // Override probe: primeiro call (probeMessageForChannel) retorna mensagem
-    // sem telefone na metadata.
+    // sem telefone na metadata → probe null.
     probeQueryMock.mockResolvedValueOnce([{ metadata: {} }]);
+
+    const { runAgentForMensagem } = await import('@/agent/core.js');
+    // NÃO propaga erro — probe-null é tratado como turno legacy default/default.
+    await runAgentForMensagem('msg1');
+
+    // resolveChannel jamais foi chamado — probe null nunca alcança o resolver
+    // (e portanto nunca colapsa buckets cross-tenant: nenhum tenant foi resolvido).
+    expect(resolveChannelMock).not.toHaveBeenCalled();
+
+    // Nenhum audit de falha — não é mais um erro.
+    const failedAudits = auditMock.mock.calls.filter(
+      (call) => call[0]?.acao === 'channel_resolution_failed',
+    );
+    expect(failedAudits).toHaveLength(0);
+
+    // adoção skipada (resolved == default/default) e o inner roda em default/default.
+    expect(adoptToResolvedTenantMock).not.toHaveBeenCalled();
+    expect(runWithTenantContextMock).toHaveBeenCalled();
+    expect(runWithTenantContextMock.mock.calls[0]![0]).toEqual({
+      tenant_id: 'default',
+      agent_id: 'default',
+    });
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // [🔴 HIGH fix #417] probe DB read FAILURE must fail-closed (NOT collapse to
+  // default/default). Before the fix, `probeMessageForChannel`'s blanket
+  // `catch { return null }` mapped a transient DB error to the SAME null used
+  // for "no telefone". Since the resolver only runs when the probe is truthy, a
+  // DB error skipped resolver + adoption and routed a possibly-multi-tenant
+  // message straight to the `default/default` bucket — a silent #268 violation.
+  //
+  // This negative spec drives the probe's `db.select()...limit()` to REJECT and
+  // asserts: (a) we do NOT silently process under default/default; (b) the
+  // error propagates (BullMQ retry/DLQ); (c) a `channel_resolution_failed`
+  // audit is emitted with the distinguishable `channel_probe_failed` code; and
+  // (d) the resolver is never consulted (no tenant was resolved).
+  // ──────────────────────────────────────────────────────────────────────────
+  it('#417 HIGH: probe com ERRO DE DB → fail-closed (propaga, audita channel_probe_failed, NÃO cai em default/default)', async () => {
+    // The probe's metadata read is the FIRST (and here only) `.limit()` call —
+    // make it reject (DB blip). Persisted (not Once) so a single invocation
+    // can't accidentally fall through to a stale default.
+    probeQueryMock.mockReset();
+    const dbErr = new Error('connection terminated unexpectedly');
+    probeQueryMock.mockRejectedValue(dbErr);
 
     const { TypedError } = await import('@/lib/utils.js');
     const { runAgentForMensagem } = await import('@/agent/core.js');
 
-    await expect(runAgentForMensagem('msg1')).rejects.toBeInstanceOf(TypedError);
+    // (b) the error propagates — the worker fails the job (retry/DLQ), it does
+    //     NOT swallow the failure and continue. Capture it once and assert both
+    //     the type and the distinguishable code.
+    let caught: unknown;
+    try {
+      await runAgentForMensagem('msg1');
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(TypedError);
+    expect((caught as { code?: string }).code).toBe('channel_probe_failed');
 
-    // resolveChannel jamais foi chamado — falhou antes (probe null).
+    // (d) the resolver was never reached — a DB error must not be confused with
+    //     "no telefone" (which would skip the resolver legitimately).
     expect(resolveChannelMock).not.toHaveBeenCalled();
 
+    // (a) fail-closed: we never entered a tenant context (no silent
+    //     default/default routing) and never adopted anything.
+    expect(runWithTenantContextMock).not.toHaveBeenCalled();
+    expect(adoptToResolvedTenantMock).not.toHaveBeenCalled();
+
+    // (c) a fail-closed audit is emitted, distinguishable from a resolver miss
+    //     by the `channel_probe_failed` error_code.
     const failedAudits = auditMock.mock.calls.filter(
       (call) => call[0]?.acao === 'channel_resolution_failed',
     );
-    expect(failedAudits).toHaveLength(1);
+    expect(failedAudits.length).toBeGreaterThanOrEqual(1);
     const auditPayload = failedAudits[0]![0];
-    expect(auditPayload.metadata.error_code).toBe('channel_resolution_failed');
-    expect(auditPayload.metadata.resolver_details).toMatchObject({
-      resolver_path: 'probe_missing_metadata',
-    });
-    // probe_external_id é null porque probe falhou ANTES de obter o tel.
+    expect(auditPayload.mensagem_id).toBe('msg1');
+    expect(auditPayload.metadata.error_code).toBe('channel_probe_failed');
+    // The probe never produced a telefone, so probe context is null.
     expect(auditPayload.metadata.probe_external_id).toBeNull();
+    expect(auditPayload.metadata.resolver_details).toMatchObject({
+      resolver_path: 'probe_db_error',
+    });
   });
 });

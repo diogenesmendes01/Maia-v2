@@ -69,10 +69,11 @@ vi.mock('@whiskeysockets/baileys', () => ({
 vi.mock('qrcode-terminal', () => ({ default: { generate: vi.fn() } }));
 
 // FEATURE_ONE_TAP must be ON so the reaction-stub branch routes to the
-// dispatcher (rather than absorbing the reaction silently). MULTI_CHANNEL stays
-// OFF — the reachability fix is orthogonal to channel resolution, and the
-// legacy default/default context is enough to prove the stub now reaches the
-// dispatcher inside a tenant context.
+// dispatcher (rather than absorbing the reaction silently). The reachability
+// fix is orthogonal to channel resolution; after #411 the resolver ALWAYS runs
+// and the single-tenant catch-all maps the stub's sender JID to the seeded
+// default/default channel — enough to prove the stub reaches the dispatcher
+// inside a tenant context.
 vi.mock('../../src/config/env.js', () => ({
   config: {
     BAILEYS_AUTH_DIR: '/tmp/maia-reaction-stub-test',
@@ -85,7 +86,10 @@ vi.mock('../../src/config/env.js', () => ({
 }));
 
 vi.mock('../../src/config/feature-flags.js', () => ({
-  featureFlags: { isEnabled: vi.fn(() => false) }, // MULTI_CHANNEL OFF
+  // Both toggles are gone (MULTI_CHANNEL #411, COGNITIVE_GRAPH #412) — the enum
+  // is empty and no production code reads a flag here. `isEnabled` defaults to
+  // false, mirroring the empty singleton.
+  featureFlags: { isEnabled: vi.fn(() => false) },
 }));
 
 vi.mock('../../src/lib/logger.js', () => ({
@@ -96,6 +100,22 @@ vi.mock('../../src/db/repositories.js', () => ({
   mensagensRepo: {
     createInbound: createInboundMock,
     findByWhatsappIdCrossTenant: vi.fn().mockResolvedValue(null),
+  },
+  // #411: the resolver now always runs. Single-tenant catch-all → the seeded
+  // default/default channel for any sender (exact-match always misses).
+  channelsRepo: {
+    findByExternalCrossTenant: vi.fn().mockResolvedValue(null),
+    findDefaultCatchAllChannel: vi.fn().mockResolvedValue({
+      multi_tenant: false,
+      channel: {
+        id: 'default-channel-uuid',
+        tenant_id: 'default',
+        agent_id: 'default',
+        external_id: 'default-channel',
+        channel_type: 'whatsapp',
+        active: true,
+      },
+    }),
   },
 }));
 
