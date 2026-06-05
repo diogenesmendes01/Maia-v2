@@ -243,13 +243,157 @@ export const DOMAIN_OPERATIONS_PACK: ToolPack = {
   tools: ['start_workflow', 'schedule_reminder', 'cancel_reminder', 'list_pending'],
 } as const;
 
-/** The `domain.*` packs introduced by #408 (validated in `packs.ts`). */
+// ───────────────────────────────────────────────────────────────────────────
+// Issue #416 — BOLETO PROPOSAL vertical packs.
+//
+// Six packs that group the #416 boleto-proposta tools by job. They are
+// `domain.*` packs in every structural sense (granted explicitly, NEVER in
+// `DEFAULT_AGENT_PACKS`, validated against the catalog by `packs.ts`), so the
+// `whatsapp_boleto_proposta_attendant` role (#415) can be granted them. They are
+// NOT auto-granted to any agent — visibility comes from an explicit grant ∩
+// skill scope, and the three write tools additionally pass the dispatcher guard
+// + the #416 write/risk policies (migration 078).
+//
+// Pack ↔ tool mapping is taken verbatim from issue #416 §"Tool packs".
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * `boleto_proposal_read_pack` — read-only identification + billing context.
+ * `low` risk: every tool is `side_effect: 'read'` (no money movement, no write).
+ */
+export const BOLETO_PROPOSAL_READ_PACK: ToolPack = {
+  id: 'boleto_proposal_read_pack',
+  name: 'Boleto Proposta — Leitura',
+  domain: 'boleto_proposal',
+  version: 1,
+  risk_level: 'low',
+  description:
+    'Tools de leitura para identificação e contexto de cobrança (resolução/busca de empresa, histórico, blacklist, busca de boleto, DDA, verificação de pagamento, status de campanha). Apenas leitura.',
+  tools: [
+    'company_identity_resolver',
+    'company_search',
+    'company_history_lookup',
+    'company_blacklist_check',
+    'boleto_search',
+    'dda_lookup',
+    'payment_verification',
+    'campaign_status_lookup',
+  ],
+} as const;
+
+/**
+ * `boleto_proposal_write_pack` — the sensitive write tools (cancellation +
+ * campaign removal). `high` risk. These pass the dispatcher guard +
+ * `confirm_before_write_policy` (migration 078). `refund_create` is NOT here —
+ * it belongs to the refund intake flow (`refund_intake_pack`).
+ */
+export const BOLETO_PROPOSAL_WRITE_PACK: ToolPack = {
+  id: 'boleto_proposal_write_pack',
+  name: 'Boleto Proposta — Escrita',
+  domain: 'boleto_proposal',
+  version: 1,
+  risk_level: 'high',
+  description:
+    'Tools de ESCRITA para baixa de boleto e remoção de campanha. Operações sensíveis — só visíveis com grant explícito e governadas por confirm_before_write_policy + dispatcher guard.',
+  tools: ['boleto_cancel', 'company_campaign_remove'],
+} as const;
+
+/**
+ * `refund_intake_pack` — everything needed to CREATE a refund request. `high`
+ * risk: it contains the `refund_create` write (governed by
+ * `confirm_before_write_policy`). The read/validation tools prepare the request.
+ */
+export const REFUND_INTAKE_PACK: ToolPack = {
+  id: 'refund_intake_pack',
+  name: 'Reembolso — Abertura',
+  domain: 'boleto_proposal',
+  version: 1,
+  risk_level: 'high',
+  description:
+    'Tools para abrir uma solicitação de reembolso: verificar pagamento, validar comprovante e dados bancários, recuperar anexos e criar o reembolso (escrita governada por policy).',
+  tools: [
+    'payment_verification',
+    'receipt_validate',
+    'bank_account_validate',
+    'refund_create',
+    'conversation_attachment_lookup',
+  ],
+} as const;
+
+/**
+ * `refund_followup_pack` — consult an EXISTING refund request. `low` risk:
+ * read-only (status lookup, attachments, operational summary).
+ */
+export const REFUND_FOLLOWUP_PACK: ToolPack = {
+  id: 'refund_followup_pack',
+  name: 'Reembolso — Acompanhamento',
+  domain: 'boleto_proposal',
+  version: 1,
+  risk_level: 'low',
+  description:
+    'Tools para consultar um reembolso existente: status do reembolso, anexos da conversa e resumo operacional. Apenas leitura/análise.',
+  tools: ['refund_lookup', 'conversation_attachment_lookup', 'conversation_summary_generate'],
+} as const;
+
+/**
+ * `document_analysis_pack` — read/interpret customer attachments. `low` risk:
+ * read-only. `receipt_validate` reuses the existing parsers (no new OCR).
+ */
+export const DOCUMENT_ANALYSIS_PACK: ToolPack = {
+  id: 'document_analysis_pack',
+  name: 'Análise de Documentos',
+  domain: 'boleto_proposal',
+  version: 1,
+  risk_level: 'low',
+  description:
+    'Tools para ler e interpretar anexos do cliente: recuperar anexos e validar comprovantes (reutilizando parse_receipt/parse_image). Apenas leitura.',
+  tools: ['conversation_attachment_lookup', 'receipt_validate'],
+} as const;
+
+/**
+ * `risk_escalation_pack` — risk detection + human escalation. `medium` risk:
+ * the detection/classification tools are pure analysis (`side_effect: 'none'`)
+ * and the ticket creation is an internal escalation sink — no customer-facing
+ * write, so it is not governed by `confirm_before_write_policy`.
+ */
+export const RISK_ESCALATION_PACK: ToolPack = {
+  id: 'risk_escalation_pack',
+  name: 'Risco e Escalação',
+  domain: 'boleto_proposal',
+  version: 1,
+  risk_level: 'medium',
+  description:
+    'Tools para detecção de risco e escalação humana: detectar intenção jurídica, classificar risco do caso, abrir ticket operacional e gerar resumo. Análise + escalação interna.',
+  tools: [
+    'legal_intent_detect',
+    'case_risk_classify',
+    'operational_ticket_create',
+    'conversation_summary_generate',
+  ],
+} as const;
+
+/** The six #416 boleto proposal packs (validated in `packs.ts`). */
+export const BOLETO_PROPOSAL_PACKS: readonly ToolPack[] = [
+  BOLETO_PROPOSAL_READ_PACK,
+  BOLETO_PROPOSAL_WRITE_PACK,
+  REFUND_INTAKE_PACK,
+  REFUND_FOLLOWUP_PACK,
+  DOCUMENT_ANALYSIS_PACK,
+  RISK_ESCALATION_PACK,
+] as const;
+
+/**
+ * The `domain.*` packs introduced by #408 PLUS the #416 boleto proposal packs.
+ * All are validated against the catalog by `assertDomainPackToolsKnown` and
+ * exposed in `TOOL_PACKS` (so they are grantable), but NEVER auto-granted.
+ */
 export const DOMAIN_PACKS: readonly ToolPack[] = [
   DOMAIN_FINANCE_PACK,
   DOMAIN_SALES_PACK,
   DOMAIN_SUPPORT_PACK,
   DOMAIN_CALENDAR_PACK,
   DOMAIN_OPERATIONS_PACK,
+  ...BOLETO_PROPOSAL_PACKS,
 ] as const;
 
 /**
