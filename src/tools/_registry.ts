@@ -56,6 +56,18 @@ import { explainLimitationTool } from './explain-limitation.js';
 import { riskSignalClassifyTool } from './risk-signal-classify.js';
 import { conversationSummaryComposeTool } from './conversation-summary-compose.js';
 import { conversationStateUpdateTool } from './conversation-state-update.js';
+// Issue #431 — boleto proposal domain adapters. Thin domain wrappers that REUSE
+// existing capabilities (contrapartes search, parse_receipt/vision cache, the
+// shared summarizeTranscript + risk scorer) instead of duplicating them. Not
+// part of any pack (packs are owned by #416).
+import { companyIdentityResolverTool } from './company-identity-resolver.js';
+import { companySearchTool } from './company-search.js';
+import { receiptValidateTool } from './receipt-validate.js';
+import { conversationAttachmentLookupTool } from './conversation-attachment-lookup.js';
+import { conversationSummaryGenerateTool } from './conversation-summary-generate.js';
+import { caseRiskClassifyTool } from './case-risk-classify.js';
+import { legalIntentDetectTool } from './legal-intent-detect.js';
+import { bankAccountValidateTool } from './bank-account-validate.js';
 
 export type ToolHandlerCtx = {
   pessoa: import('@/db/schema.js').Pessoa;
@@ -214,6 +226,18 @@ export const REGISTRY: Record<string, AnyTool> = {
   risk_signal_classify: riskSignalClassifyTool as unknown as AnyTool,
   conversation_summary_compose: conversationSummaryComposeTool as unknown as AnyTool,
   conversation_state_update: conversationStateUpdateTool as unknown as AnyTool,
+  // Issue #431 — boleto proposal domain adapters. Always registered (no feature
+  // flag); NOT added to any pack here (pack membership is owned by #416). Each
+  // is a thin adapter over an existing capability — see each tool's header for
+  // the reuse boundary.
+  company_identity_resolver: companyIdentityResolverTool as unknown as AnyTool,
+  company_search: companySearchTool as unknown as AnyTool,
+  receipt_validate: receiptValidateTool as unknown as AnyTool,
+  conversation_attachment_lookup: conversationAttachmentLookupTool as unknown as AnyTool,
+  conversation_summary_generate: conversationSummaryGenerateTool as unknown as AnyTool,
+  case_risk_classify: caseRiskClassifyTool as unknown as AnyTool,
+  legal_intent_detect: legalIntentDetectTool as unknown as AnyTool,
+  bank_account_validate: bankAccountValidateTool as unknown as AnyTool,
 };
 
 /**

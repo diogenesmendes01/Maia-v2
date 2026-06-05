@@ -219,6 +219,34 @@ export const AUDIT_ACTIONS = [
   'risk_signal_classified',
   'conversation_summary_composed',
   'conversation_state_updated',
+  // Issue #431 — boleto proposal domain adapters. Append-only. Each tool is
+  // auto-audited by the dispatcher from its `audit_action` (no hand-rolled
+  // audit()). All are read-only / classification-only (no business mutation),
+  // but each is a DECISION the trail should record (invariant #4):
+  // `company_identity_resolved`: company_identity_resolver matched (or asked to
+  //   confirm) a counterparty identity.
+  // `company_searched`: company_search returned a formal counterparty record
+  //   (or alternatives).
+  // `receipt_validated`: receipt_validate validated a payment receipt (via the
+  //   parse_receipt path; never approves a refund).
+  // `conversation_attachment_lookup_completed`: conversation_attachment_lookup
+  //   listed media already in the conversation (no re-download).
+  // `conversation_summary_generated`: conversation_summary_generate produced an
+  //   operational recap (read-only; reuses the shared summarizer).
+  // `case_risk_classified`: case_risk_classify scored the case risk via the
+  //   shared scorer and suggested a policy action (does not decide policy).
+  // `legal_intent_detected`: legal_intent_detect flagged legal-intent signals
+  //   (signal only; no escalation, no legal advice).
+  // `bank_account_validated`: bank_account_validate ran a local/structural check
+  //   of refund banking data.
+  'company_identity_resolved',
+  'company_searched',
+  'receipt_validated',
+  'conversation_attachment_lookup_completed',
+  'conversation_summary_generated',
+  'case_risk_classified',
+  'legal_intent_detected',
+  'bank_account_validated',
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];

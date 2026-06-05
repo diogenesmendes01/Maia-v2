@@ -1682,6 +1682,90 @@ export const contrapartesRepo = {
     const rows = await db.insert(contrapartes).values(guarded).returning();
     return rows[0]!;
   },
+  // ----------------------------------------------------------------------
+  // Issue #431 — search surface for the boleto proposal adapters
+  // (`company_search` / `company_identity_resolver`). These methods did not
+  // exist; the pre-existing read path is NOT tenant-pinned (`byId` filters by
+  // `id` only; `byScope` by `entidade_id` only). SECURITY (invariant #1): a
+  // CNPJ/name lookup over a non-unique `documento`/`nome` MUST add explicit
+  // `tenant_id + agent_id` predicates (from the ALS context) on top of the
+  // entidade scope, or it would read across tenants. Mirrors the
+  // `mensagensRepo`/`pessoasRepo` ALS-pinning pattern. Covered by a DB-free
+  // WHERE-clause leak assertion (tests/unit/contrapartes-repo-scope.spec.ts).
+  // ----------------------------------------------------------------------
+  /**
+   * Exact-document lookup, scoped. `documento` has no unique index, so an
+   * unscoped `eq(documento, …)` could return another tenant's counterparty;
+   * we pin `tenant_id + agent_id` (ALS) AND the caller's entidade scope.
+   * `documento` is compared on its normalized (digits-only) form so a stored
+   * `12.345.678/0001-90` matches a `12345678000190` query and vice-versa.
+   */
+  async byDocumento(scope: EntityScope, documento: string): Promise<Contraparte[]> {
+    if (scope.entidades.length === 0) throw new EmptyScopeError();
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const digits = documento.replace(/\D/g, '');
+    if (digits.length === 0) return [];
+    return db
+      .select()
+      .from(contrapartes)
+      .where(
+        and(
+          eq(contrapartes.tenant_id, tenant_id),
+          eq(contrapartes.agent_id, agent_id),
+          inArray(contrapartes.entidade_id, scope.entidades),
+          sql`regexp_replace(coalesce(${contrapartes.documento}, ''), '\\D', '', 'g') = ${digits}`,
+        ),
+      );
+  },
+  /**
+   * All counterparties visible to the caller, scoped — the candidate set the
+   * tool layer fuzzy-ranks by name (the trigram scoring lives in
+   * `fuzzyMatchByName`, not in SQL, to share the ambiguity gate with
+   * `identify_entity`). Same tenant+agent+entidade pinning as `byDocumento`.
+   * `limit` bounds the candidate pull so a large book can't be dragged into
+   * memory; default 200.
+   */
+  async searchByName(scope: EntityScope, opts: { limit?: number } = {}): Promise<Contraparte[]> {
+    if (scope.entidades.length === 0) throw new EmptyScopeError();
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(contrapartes)
+      .where(
+        and(
+          eq(contrapartes.tenant_id, tenant_id),
+          eq(contrapartes.agent_id, agent_id),
+          inArray(contrapartes.entidade_id, scope.entidades),
+        ),
+      )
+      .limit(opts.limit ?? 200);
+  },
+  /**
+   * Single-row fetch by id, but tenant+agent+entidade pinned (unlike the
+   * unscoped `byId` above, kept for back-compat with existing callers). The
+   * boleto adapters resolve a `company_id` through THIS method so a guessed/
+   * leaked id from another tenant or out-of-scope entidade returns null.
+   */
+  async byIdScoped(scope: EntityScope, id: string): Promise<Contraparte | null> {
+    if (scope.entidades.length === 0) throw new EmptyScopeError();
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(contrapartes)
+      .where(
+        and(
+          eq(contrapartes.id, id),
+          eq(contrapartes.tenant_id, tenant_id),
+          eq(contrapartes.agent_id, agent_id),
+          inArray(contrapartes.entidade_id, scope.entidades),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
 };
 
 export const factsRepo = {
