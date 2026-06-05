@@ -170,8 +170,83 @@ CI runs these automatically in `.github/workflows/ci.yml` with service container
 | **Never push without ask** | Owner authorizes each push explicitly |
 | **Schema changes need `_up` + `_down`** | Migrations are reversible by default |
 | **Tests stay green** | typecheck + lint + unit + integration must pass before requesting review |
+| **PR body sections** | Non-bot PR bodies MUST carry the 8 `##` sections + the `Residual risk:` field — see [PR body](#pr-body) below. Enforced in CI by [`scripts/check-pr-body.ts`](scripts/check-pr-body.ts) (blocking). |
 | **Co-author trailer** | End commits with `Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>` |
 | **PR body trailer** | End PR descriptions with `🤖 Generated with [Claude Code](https://claude.com/claude-code)` |
+
+### PR body
+
+The CI step **PR body governance** ([`scripts/check-pr-body.ts`](scripts/check-pr-body.ts), wired as `npm run pr:body:check`) runs inside the blocking `typecheck + test + lint + build` job, *before* the typecheck step. If a non-bot PR body is missing any required heading or field, the **whole job fails** — typecheck, build, and tests never run. [`scripts/check-pr-body.ts`](scripts/check-pr-body.ts) is the source of truth; the list below mirrors it.
+
+**Required headings** (exact text, level-2 `##`):
+
+`## Summary` · `## Task Context` · `## Scope` · `## Maia Invariants` · `## Validation` · `## Docs Impact` · `## Risk and Rollback` · `## Reviewer Notes`
+
+**Required field:** a visible line starting with `Residual risk:` (or `- Residual risk:`), conventionally placed under `## Risk and Rollback`.
+
+How the checker reads the body:
+
+- Headings inside fenced code blocks and `<!-- … -->` comments are ignored — only visible level-2 headings count, so the template's helper comments are fine.
+- **Bot-authored PRs are skipped** (`user.type === "Bot"` or login ending in `[bot]`). PRs opened under a human account are checked — always include every section.
+- `gh pr create --body "…"` does **not** apply the GitHub template, so build the body yourself from the skeleton below. The GitHub web UI pre-fills the same sections from [`.github/pull_request_template.md`](.github/pull_request_template.md) — the full annotated version, with the invariant and validation checklists.
+
+Copyable skeleton — the minimum that passes the check; fill each section in (use [`.github/pull_request_template.md`](.github/pull_request_template.md) for the full checklists):
+
+```markdown
+## Summary
+
+What changed and why, in 1–3 lines.
+
+## Task Context
+
+- Task spec / issue:
+- Agent role:
+- Context read:
+
+## Scope
+
+Files changed:
+-
+
+In scope / Out of scope:
+-
+
+## Maia Invariants
+
+- [ ] Tenant/agent isolation considered
+- [ ] Fail-closed behavior considered
+- [ ] Backend decides, LLM proposes
+- [ ] Audit/observability impact considered
+- [ ] Not applicable; why:
+
+## Validation
+
+- [ ] `npm run typecheck`
+- [ ] `npm run lint`
+- [ ] `npm test`
+- Skipped checks and reason:
+
+## Docs Impact
+
+- [ ] Docs not needed; reason:
+
+## Risk and Rollback
+
+Risk:
+-
+
+Residual risk:
+-
+
+Rollback:
+-
+
+## Reviewer Notes
+
+-
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+```
 
 ## 9. Out-of-scope for this file
 
