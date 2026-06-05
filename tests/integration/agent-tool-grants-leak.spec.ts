@@ -30,23 +30,16 @@ async function loadRepos(): Promise<typeof import('../../src/db/repositories.js'
 }
 
 async function ensureTenantAgent(c: pg.PoolClient, tenant: string, agent: string): Promise<void> {
-  await c
-    .query(`INSERT INTO tenants(id, nome) VALUES ($1, $1) ON CONFLICT (id) DO NOTHING`, [tenant])
-    .catch(async () => {
-      await c
-        .query(`INSERT INTO tenants(id) VALUES ($1) ON CONFLICT (id) DO NOTHING`, [tenant])
-        .catch(() => undefined);
-    });
-  await c
-    .query(`INSERT INTO agents(id, tenant_id) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING`, [
-      agent,
-      tenant,
-    ])
-    .catch(async () => {
-      await c
-        .query(`INSERT INTO agents(id) VALUES ($1) ON CONFLICT (id) DO NOTHING`, [agent])
-        .catch(() => undefined);
-    });
+  // tenants.nome and agents.nome are NOT NULL — insert them (matches the other
+  // integration specs). No .catch() fallback: inside a BEGIN block a swallowed
+  // insert error still ABORTS the transaction (Postgres 25P02) and cascades.
+  await c.query(`INSERT INTO tenants(id, nome) VALUES ($1, $1) ON CONFLICT (id) DO NOTHING`, [
+    tenant,
+  ]);
+  await c.query(
+    `INSERT INTO agents(id, tenant_id, nome) VALUES ($1, $2, $1) ON CONFLICT (id) DO NOTHING`,
+    [agent, tenant],
+  );
 }
 
 async function mkGrant(
