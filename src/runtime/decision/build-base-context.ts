@@ -14,7 +14,6 @@
 import type { BaseContextPacket } from '../context-packet/types.js';
 import type { Mensagem, Conversa, Pessoa } from '@/db/schema.js';
 import type { AudienceType, TrustLevel } from '@/shared/audience.js';
-import { config } from '@/config/env.js';
 
 export interface BuildBaseContextInput {
   inbound: Mensagem;
