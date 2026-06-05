@@ -177,3 +177,4 @@ NEW shared prefixes — pick `max(existing)+1`.
 071 | 071_scheduling_add_tenant_agent.sql | scheduling add tenant agent
 072 | 072_scheduling_backfill_tenant_agent.sql | scheduling backfill tenant agent
 073 | 073_scheduling_tenant_indexes.sql | scheduling tenant indexes
+074 | 074_agent_audience_profiles.sql | agent audience profiles per-agent identity (issue 407)
