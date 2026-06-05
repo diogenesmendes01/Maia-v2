@@ -68,6 +68,26 @@ import { conversationSummaryGenerateTool } from './conversation-summary-generate
 import { caseRiskClassifyTool } from './case-risk-classify.js';
 import { legalIntentDetectTool } from './legal-intent-detect.js';
 import { bankAccountValidateTool } from './bank-account-validate.js';
+// Issue #432 — missing boleto proposal tool contracts (typed stubs). These 11
+// domain capabilities have NO backing table/repo/integration yet (validated in
+// the #432 audit), so each is a typed contract with a deterministic placeholder
+// handler: reads return empty/unknown/not-found with `source: 'stub'`; writes
+// return an explicit non-executed status (`stub_not_executed`/`stub_not_created`)
+// — never a fake success or protocol/ticket number. No tool defines
+// `extractEffect` (no real external effect at stub stage); the dispatcher
+// computes the idempotency key + auto-audits from each tool's `audit_action`.
+// NOT part of any pack (pack/policy membership is owned by #416).
+import { companyHistoryLookupTool } from './company-history-lookup.js';
+import { companyBlacklistCheckTool } from './company-blacklist-check.js';
+import { boletoSearchTool } from './boleto-search.js';
+import { boletoCancelTool } from './boleto-cancel.js';
+import { ddaLookupTool } from './dda-lookup.js';
+import { paymentVerificationTool } from './payment-verification.js';
+import { campaignStatusLookupTool } from './campaign-status-lookup.js';
+import { companyCampaignRemoveTool } from './company-campaign-remove.js';
+import { refundCreateTool } from './refund-create.js';
+import { refundLookupTool } from './refund-lookup.js';
+import { operationalTicketCreateTool } from './operational-ticket-create.js';
 
 export type ToolHandlerCtx = {
   pessoa: import('@/db/schema.js').Pessoa;
@@ -238,6 +258,24 @@ export const REGISTRY: Record<string, AnyTool> = {
   case_risk_classify: caseRiskClassifyTool as unknown as AnyTool,
   legal_intent_detect: legalIntentDetectTool as unknown as AnyTool,
   bank_account_validate: bankAccountValidateTool as unknown as AnyTool,
+  // Issue #432 — missing boleto proposal tool contracts (typed stubs). Always
+  // registered (no feature flag); NOT added to any pack here (pack membership is
+  // owned by #416). Read stubs return structured empty/unknown/not-found with
+  // `source: 'stub'`; the 4 write stubs (boleto_cancel / company_campaign_remove
+  // / refund_create / operational_ticket_create) declare `side_effect: 'write'`
+  // + the correct `operation_type` and return an explicit non-executed status —
+  // no fake success, no fabricated protocol/ticket numbers, no `extractEffect`.
+  company_history_lookup: companyHistoryLookupTool as unknown as AnyTool,
+  company_blacklist_check: companyBlacklistCheckTool as unknown as AnyTool,
+  boleto_search: boletoSearchTool as unknown as AnyTool,
+  boleto_cancel: boletoCancelTool as unknown as AnyTool,
+  dda_lookup: ddaLookupTool as unknown as AnyTool,
+  payment_verification: paymentVerificationTool as unknown as AnyTool,
+  campaign_status_lookup: campaignStatusLookupTool as unknown as AnyTool,
+  company_campaign_remove: companyCampaignRemoveTool as unknown as AnyTool,
+  refund_create: refundCreateTool as unknown as AnyTool,
+  refund_lookup: refundLookupTool as unknown as AnyTool,
+  operational_ticket_create: operationalTicketCreateTool as unknown as AnyTool,
 };
 
 /**

@@ -247,6 +247,37 @@ export const AUDIT_ACTIONS = [
   'case_risk_classified',
   'legal_intent_detected',
   'bank_account_validated',
+  // Issue #432 — missing boleto proposal tool contracts (typed stubs).
+  // Append-only. Each tool is auto-audited by the dispatcher from its
+  // `audit_action` (no hand-rolled audit()), so even a stub WRITE
+  // (`operational_ticket_create`, etc.) records a decision/mutation-trail row
+  // (invariants #4). The *_requested labels make explicit that the action was
+  // requested but NOT executed at the stub stage (executed=false /
+  // created=false), distinguishing the request from a real effect a future
+  // integration will perform.
+  // `company_history_lookup_completed`: read relationship history (stub → empty).
+  // `company_blacklist_checked`: checked blocks/notes (stub → status=unknown).
+  // `boleto_searched`: queried operational boleto records (stub → no matches).
+  // `boleto_cancel_requested`: requested a boleto cancel/baixa (stub → not run).
+  // `dda_lookup_completed`: checked a boleto in the DDA flow (stub → found=false).
+  // `payment_verified`: verified payment (stub → paid=null, never false).
+  // `campaign_status_lookup_completed`: checked campaign eligibility (stub).
+  // `company_campaign_remove_requested`: requested campaign removal (stub → not run).
+  // `refund_create_requested`: requested an official refund (stub → not created).
+  // `refund_lookup_completed`: consulted refund status (stub → found=false).
+  // `operational_ticket_create_requested`: requested a human-analysis ticket
+  //   (stub → not created; audited+idempotent even as a stub).
+  'company_history_lookup_completed',
+  'company_blacklist_checked',
+  'boleto_searched',
+  'boleto_cancel_requested',
+  'dda_lookup_completed',
+  'payment_verified',
+  'campaign_status_lookup_completed',
+  'company_campaign_remove_requested',
+  'refund_create_requested',
+  'refund_lookup_completed',
+  'operational_ticket_create_requested',
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];
@@ -313,6 +344,18 @@ export const ACTION_KEYS = [
   //     validation (which surfaces payment signals from a receipt).
   'read_company',
   'read_billing',
+  // Issue #432 — granular action keys for the 4 boleto proposal WRITE stubs.
+  // Append-only. Deliberately distinct from financial/cadastro writes
+  // (`create_transaction`, etc.): granting a boleto-proposal role the ability to
+  // request a boleto cancel / campaign removal / refund / operational ticket
+  // does NOT carry any money-moving or cadastral-mutation grant. The read stubs
+  // use the dedicated `read_company` / `read_billing` keys above (#431).
+  // Enforcement of these keys against agent grants is the #416 policy slice; the
+  // stubs only DECLARE them. NOT wired to any pack here.
+  'cancel_boleto',
+  'remove_campaign',
+  'create_refund',
+  'create_ticket',
 ] as const;
 
 export type ActionKey = (typeof ACTION_KEYS)[number];

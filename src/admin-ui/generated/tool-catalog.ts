@@ -191,6 +191,92 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     ]
   },
   {
+    "name": "boleto_cancel",
+    "description": "Solicita o cancelamento/baixa operacional de um boleto. STUB: ainda não há integração com o provedor de boletos — NÃO executa cancelamento, retorna executed=false, status=stub_not_executed (sem protocolo falso). Write governado por política (#416).",
+    "side_effect": "write",
+    "operation_type": "cancel",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [
+      "cancel_boleto"
+    ],
+    "inputs": [
+      {
+        "name": "boleto_id",
+        "type": "string",
+        "optional": false
+      },
+      {
+        "name": "company_id",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "cnpj",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "reason",
+        "type": "string",
+        "optional": false
+      },
+      {
+        "name": "actor_context",
+        "type": "unknown",
+        "optional": true
+      },
+      {
+        "name": "confirmation_id",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "dual_approval_granted",
+        "type": "boolean",
+        "optional": true
+      }
+    ]
+  },
+  {
+    "name": "boleto_search",
+    "description": "Busca registros operacionais de boletos relacionados a uma empresa (por company_id/CNPJ/número/id/valor). NÃO é o parse_boleto (que faz OCR de imagem). STUB: ainda não há repositório/integração de boletos — retorna matched_boletos vazio com source=stub.",
+    "side_effect": "read",
+    "operation_type": "read",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [
+      "read_balance"
+    ],
+    "inputs": [
+      {
+        "name": "company_id",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "cnpj",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "boleto_number",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "boleto_id",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "amount",
+        "type": "number",
+        "optional": true
+      }
+    ]
+  },
+  {
     "name": "calendar_add_business_days",
     "description": "Soma N dias úteis a uma data (N pode ser negativo para retroceder). Ex.: prazo D+5 para algum SLA.",
     "side_effect": "read",
@@ -326,6 +412,29 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     ]
   },
   {
+    "name": "campaign_status_lookup",
+    "description": "Verifica se uma empresa está ativa/elegível para campanhas de proposta. STUB: ainda não há base de campanhas/convenção em contrapartes — retorna found=false, source=stub.",
+    "side_effect": "read",
+    "operation_type": "read",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [
+      "read_balance"
+    ],
+    "inputs": [
+      {
+        "name": "company_id",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "cnpj",
+        "type": "string",
+        "optional": true
+      }
+    ]
+  },
+  {
     "name": "cancel_reminder",
     "description": "Cancela uma série agendada (lembrete único, outreach recorrente, payment_due). Encerra a série e todas as ocorrências pendentes/em execução numa transação só. Use quando o usuário pede para esquecer/cancelar algo agendado.",
     "side_effect": "write",
@@ -451,6 +560,95 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
       {
         "name": "natureza",
         "type": "enum(receita|despesa|movimentacao)",
+        "optional": true
+      }
+    ]
+  },
+  {
+    "name": "company_blacklist_check",
+    "description": "Verifica se uma empresa tem bloqueios ou notas operacionais especiais. STUB: ainda não há base de bloqueios/convenção em contrapartes — retorna status=unknown, blocked=false, source=stub (não afirma que a empresa está liberada).",
+    "side_effect": "read",
+    "operation_type": "read",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [
+      "read_balance"
+    ],
+    "inputs": [
+      {
+        "name": "company_id",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "cnpj",
+        "type": "string",
+        "optional": true
+      }
+    ]
+  },
+  {
+    "name": "company_campaign_remove",
+    "description": "Remove ou bloqueia uma empresa de futuras campanhas de proposta. STUB: ainda não há base de campanhas — NÃO altera estado, retorna executed=false, status=stub_not_executed (sem protocolo falso). Write governado por política (#416).",
+    "side_effect": "write",
+    "operation_type": "update_meta",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [
+      "remove_campaign"
+    ],
+    "inputs": [
+      {
+        "name": "company_id",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "cnpj",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "reason",
+        "type": "string",
+        "optional": false
+      },
+      {
+        "name": "actor_context",
+        "type": "unknown",
+        "optional": true
+      },
+      {
+        "name": "confirmation_id",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "dual_approval_granted",
+        "type": "boolean",
+        "optional": true
+      }
+    ]
+  },
+  {
+    "name": "company_history_lookup",
+    "description": "Lê o histórico de relacionamento de uma empresa (atendimentos anteriores, reclamações, reembolsos, notas operacionais). STUB: ainda não há tabela/integração de histórico — retorna listas vazias com source=stub.",
+    "side_effect": "read",
+    "operation_type": "read",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [
+      "read_balance"
+    ],
+    "inputs": [
+      {
+        "name": "company_id",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "cnpj",
+        "type": "string",
         "optional": true
       }
     ]
@@ -706,6 +904,39 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     ]
   },
   {
+    "name": "dda_lookup",
+    "description": "Consulta a situação de um boleto no fluxo de DDA (débito direto autorizado). STUB: ainda não há integração de DDA — retorna found=false, source=stub.",
+    "side_effect": "read",
+    "operation_type": "read",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [
+      "read_balance"
+    ],
+    "inputs": [
+      {
+        "name": "company_id",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "cnpj",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "boleto_id",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "boleto_metadata",
+        "type": "unknown",
+        "optional": true
+      }
+    ]
+  },
+  {
     "name": "explain_limitation",
     "description": "Explica de forma honesta que o agente não pode realizar algo (e por quê), em vez de inventar uma ação sem permissão. Apenas texto, sem efeito colateral.",
     "side_effect": "none",
@@ -930,6 +1161,54 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     ]
   },
   {
+    "name": "operational_ticket_create",
+    "description": "Cria um chamado para análise humana (fila operacional). STUB: ainda não há backend de tickets — NÃO cria chamado, retorna created=false, status=stub_not_created (sem número falso). Auditado e idempotente mesmo como stub.",
+    "side_effect": "write",
+    "operation_type": "create",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [
+      "create_ticket"
+    ],
+    "inputs": [
+      {
+        "name": "reason",
+        "type": "string",
+        "optional": false
+      },
+      {
+        "name": "summary",
+        "type": "string",
+        "optional": false
+      },
+      {
+        "name": "conversation_id",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "company_context",
+        "type": "unknown",
+        "optional": true
+      },
+      {
+        "name": "customer_context",
+        "type": "unknown",
+        "optional": true
+      },
+      {
+        "name": "desired_queue",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "actor_context",
+        "type": "unknown",
+        "optional": true
+      }
+    ]
+  },
+  {
     "name": "parse_boleto",
     "description": "Extrai dados estruturados de uma imagem de boleto: linha digitável, valor, vencimento, beneficiário, banco emissor.",
     "side_effect": "read",
@@ -995,6 +1274,44 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
         "name": "file_sha256",
         "type": "string",
         "optional": false
+      }
+    ]
+  },
+  {
+    "name": "payment_verification",
+    "description": "Verifica se um boleto/pagamento foi efetivamente pago. STUB: ainda não há reconciliação de pagamentos — retorna paid=null (NUNCA false, para não afirmar falsamente que NÃO foi pago) com source=stub.",
+    "side_effect": "read",
+    "operation_type": "read",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [
+      "read_balance"
+    ],
+    "inputs": [
+      {
+        "name": "company_id",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "cnpj",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "boleto_id",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "payment_reference",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "amount",
+        "type": "number",
+        "optional": true
       }
     ]
   },
@@ -1295,6 +1612,97 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
       },
       {
         "name": "attachment_hint",
+        "type": "string",
+        "optional": true
+      }
+    ]
+  },
+  {
+    "name": "refund_create",
+    "description": "Cria uma solicitação oficial de reembolso. STUB: ainda não há repositório/integração de reembolsos — NÃO cria reembolso, retorna executed=false, status=stub_not_executed (sem protocolo falso). Write governado por política (#416).",
+    "side_effect": "write",
+    "operation_type": "create",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [
+      "create_refund"
+    ],
+    "inputs": [
+      {
+        "name": "company_id",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "cnpj",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "related_payment",
+        "type": "unknown",
+        "optional": true
+      },
+      {
+        "name": "related_boleto",
+        "type": "unknown",
+        "optional": true
+      },
+      {
+        "name": "receipt",
+        "type": "unknown",
+        "optional": true
+      },
+      {
+        "name": "pix_or_bank_data",
+        "type": "unknown",
+        "optional": true
+      },
+      {
+        "name": "reason",
+        "type": "string",
+        "optional": false
+      },
+      {
+        "name": "actor_context",
+        "type": "unknown",
+        "optional": true
+      },
+      {
+        "name": "confirmation_id",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "dual_approval_granted",
+        "type": "boolean",
+        "optional": true
+      }
+    ]
+  },
+  {
+    "name": "refund_lookup",
+    "description": "Consulta o status de uma solicitação de reembolso (por protocolo ou empresa). STUB: ainda não há repositório/integração de reembolsos — retorna found=false, source=stub.",
+    "side_effect": "read",
+    "operation_type": "read",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [
+      "read_balance"
+    ],
+    "inputs": [
+      {
+        "name": "protocol",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "company_id",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "cnpj",
         "type": "string",
         "optional": true
       }
