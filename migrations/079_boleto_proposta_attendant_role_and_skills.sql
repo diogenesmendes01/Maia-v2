@@ -165,9 +165,10 @@ SELECT
   -- usage_policy (#409): EXPLICIT per-skill admission so the EXTERNAL WhatsApp
   -- audience (company customers / leads) is ADMITTED. Without it the skills fall
   -- to the conservative NULL default (internal-only), which the #409 gate uses to
-  -- block customer/lead — exactly this role's target audience. (The gate does not
-  -- run for role-bound skills until `active_role_key` is wired — see the PR's
-  -- "runtime is a follow-up" note — but the seed must be correct now.) Profiles:
+  -- block customer/lead — exactly this role's target audience. (The role→skill
+  -- gate is now active: the decision engine threads `active_role_key` (#436), so
+  -- role-bound skills are selected for the active role; this seed must therefore
+  -- admit the intended external audience.) Profiles:
   --   A = own-customer data (read/write of the company's OWN billing), subject_only,
   --       blocks at/above high risk (→ escalation);
   --   B = public/process info (identification + Q&A; admits leads), public_safe;
