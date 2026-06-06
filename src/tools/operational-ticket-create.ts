@@ -1,5 +1,5 @@
 /**
- * Issue #416 — `operational_ticket_create` (boleto proposal vertical).
+ * Issue #416/#432 — `operational_ticket_create` (boleto proposal vertical).
  *
  * Create a ticket for HUMAN analysis (reason, summary, conversation, company/
  * customer context, desired queue). This is the escalation sink of the
@@ -18,7 +18,12 @@
  * `company_campaign_remove`, `refund_create`) — an internal escalation ticket
  * must not require end-user confirmation.
  *
- * Out of scope (#416): a real ticketing integration — contract-honouring stub.
+ * HONEST STUB (issue #432): there is NO ticketing backend, so the handler creates
+ * NO ticket. It returns `created: false`, `status: 'stub_not_created'` and NO
+ * fabricated `ticket_number` / `responsible_queue` — it must NEVER fake a created
+ * ticket (invariant #2: fail-closed). The classification above is unchanged: it
+ * stays `side_effect: 'communication'` + `operation_type: 'communicate'` and the
+ * dispatcher auto-audits (`operational_ticket_created`).
  */
 import { z } from 'zod';
 import type { Tool } from './_registry.js';
@@ -33,15 +38,19 @@ const inputSchema = z.object({
 });
 
 const outputSchema = z.object({
-  ticket_created: z.boolean(),
+  // `created` is the honesty flag: a stub NEVER reports a real ticket.
+  created: z.boolean(),
+  // Set ONLY when a real backend opened the ticket — the stub fabricates neither.
   ticket_number: z.string().optional(),
   responsible_queue: z.string().optional(),
+  status: z.enum(['stub_not_created', 'created', 'failed']),
+  message: z.string().optional(),
 });
 
 export const operationalTicketCreateTool: Tool<typeof inputSchema, typeof outputSchema> = {
   name: 'operational_ticket_create',
   description:
-    'Cria um ticket para análise humana (motivo, resumo, conversa, contexto de empresa/cliente e fila desejada). Escalação interna — não move dinheiro nem altera cadastro/CRM nem envia mensagem externa.',
+    'Abre um chamado para análise humana (escalação interna — não move dinheiro nem altera cadastro/CRM nem envia mensagem externa). STUB (#432): ainda não há backend de tickets — NÃO cria chamado, retorna created=false, status=stub_not_created (sem número falso). Auditado e idempotente mesmo como stub.',
   input_schema: inputSchema,
   output_schema: outputSchema,
   required_actions: ['create_ticket'],
@@ -49,12 +58,14 @@ export const operationalTicketCreateTool: Tool<typeof inputSchema, typeof output
   redis_required: false,
   operation_type: 'communicate',
   audit_action: 'operational_ticket_created',
-  handler: async (args) => {
-    // Stub: no live ticketing integration in #416.
+  handler: async () => {
+    // Honest stub (#432): no ticketing backend. Create NO ticket and report it
+    // explicitly — never fabricate a ticket number.
     return {
-      ticket_created: true,
-      ticket_number: `stub-ticket-${Date.now()}`,
-      responsible_queue: args.desired_queue ?? 'default',
+      created: false,
+      status: 'stub_not_created' as const,
+      message:
+        'Criação de chamado ainda não implementada (stub): nenhum chamado foi criado.',
     };
   },
 };
