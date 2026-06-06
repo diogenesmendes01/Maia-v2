@@ -1,5 +1,5 @@
 /**
- * Issue #416 — `refund_create` (boleto proposal vertical, WRITE).
+ * Issue #416/#432 — `refund_create` (boleto proposal vertical, WRITE).
  *
  * Create an official refund request. The THIRD sensitive write tool of the
  * vertical. Same governance contract as `boleto_cancel` /
@@ -13,7 +13,12 @@
  *   - required_actions: ['create_refund'] — granular permission key.
  *   - The dispatcher audits (`refund_created`) after execution.
  *
- * Out of scope (#416): a real refund API call — contract-honouring stub.
+ * HONEST STUB (issue #432): there is NO refund repository/integration, so the
+ * handler creates NO refund. It returns `executed: false`, `status:
+ * 'stub_not_executed'` and NO fabricated `refund_protocol` / `created_at` — it
+ * must NEVER fake a created refund (invariant #2: fail-closed). It keeps
+ * `side_effect: 'write'` + `operation_type: 'create'` so the dispatcher keys
+ * idempotency and auto-audits.
  */
 import { z } from 'zod';
 import type { Tool } from './_registry.js';
@@ -48,20 +53,25 @@ const inputSchema = z
     },
   );
 
-const outputSchema = z.union([
-  z.object({
-    ok: z.literal(true),
-    protocol: z.string(),
-    status: z.string(),
-    created_at: z.string(),
-  }),
-  z.object({ error: z.string() }),
-]);
+const outputSchema = z.object({
+  executed: z.boolean(),
+  status: z.enum([
+    'stub_not_executed',
+    'created',
+    'requires_confirmation',
+    'blocked',
+    'failed',
+  ]),
+  // Set ONLY by a real integration; the stub fabricates neither.
+  refund_protocol: z.string().optional(),
+  created_at: z.string().optional(),
+  message: z.string().optional(),
+});
 
 export const refundCreateTool: Tool<typeof inputSchema, typeof outputSchema> = {
   name: 'refund_create',
   description:
-    'Cria uma solicitação oficial de reembolso. Operação de ESCRITA: a confirmação é decidida por policy + dispatcher, nunca pelo próprio tool. Requer motivo e a entidade alvo; comprovante e dados bancários quando aplicável.',
+    'Cria uma solicitação oficial de reembolso. Operação de ESCRITA (confirmação decidida por policy + dispatcher). STUB (#432): ainda não há repositório/integração de reembolsos — NÃO cria reembolso, retorna executed=false, status=stub_not_executed (sem protocolo falso).',
   input_schema: inputSchema,
   output_schema: outputSchema,
   required_actions: ['create_refund'],
@@ -69,15 +79,17 @@ export const refundCreateTool: Tool<typeof inputSchema, typeof outputSchema> = {
   redis_required: false,
   operation_type: 'create',
   audit_action: 'refund_created',
-  extractAlvoId: (result) =>
-    'protocol' in result && typeof result.protocol === 'string' ? result.protocol : null,
+  // No `extractAlvoId`: the stub creates no refund, so there is no real alvo_id
+  // (a fabricated protocol would be dishonest). A real integration can map the
+  // refund protocol here.
   handler: async () => {
-    // Stub: no live refund API in #416. Guard chain already authorised here.
+    // Honest stub (#432): no refund repository/integration. Create NO refund and
+    // report it explicitly — never fake a created refund.
     return {
-      ok: true as const,
-      protocol: `stub-refund-${Date.now()}`,
-      status: 'created',
-      created_at: new Date().toISOString(),
+      executed: false,
+      status: 'stub_not_executed' as const,
+      message:
+        'Criação de reembolso ainda não implementada (stub): nenhum reembolso foi criado.',
     };
   },
 };

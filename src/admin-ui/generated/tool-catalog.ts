@@ -177,7 +177,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   },
   {
     "name": "boleto_cancel",
-    "description": "Executa a baixa/cancelamento operacional de um boleto. Operação de ESCRITA: declara intenção e efeito; a confirmação é decidida por policy + dispatcher, nunca pelo próprio tool. Requer motivo e a entidade dona do boleto.",
+    "description": "Solicita a baixa/cancelamento operacional de um boleto. Operação de ESCRITA (confirmação decidida por policy + dispatcher, nunca pelo tool). STUB (#432): ainda não há integração com o provedor — NÃO executa cancelamento, retorna executed=false, status=stub_not_executed (sem protocolo falso).",
     "side_effect": "write",
     "operation_type": "cancel",
     "sensitive": false,
@@ -537,7 +537,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   },
   {
     "name": "company_blacklist_check",
-    "description": "Verifica se uma empresa tem bloqueios ou observações operacionais especiais. Apenas leitura — não bloqueia nem escala execução (isso é decisão de policy).",
+    "description": "Verifica se uma empresa tem bloqueios ou observações operacionais especiais. Apenas leitura — não bloqueia nem escala execução (isso é decisão de policy). STUB (#432): ainda não há blocklist — retorna status=unknown (NUNCA clear sem checagem real).",
     "side_effect": "read",
     "operation_type": "read",
     "sensitive": false,
@@ -558,7 +558,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   },
   {
     "name": "company_campaign_remove",
-    "description": "Remove ou bloqueia uma empresa de campanhas de proposta futuras. Operação de ESCRITA: a confirmação é decidida por policy + dispatcher, nunca pelo próprio tool. Requer motivo e a entidade alvo.",
+    "description": "Remove ou bloqueia uma empresa de campanhas de proposta futuras. Operação de ESCRITA (confirmação decidida por policy + dispatcher). STUB (#432): ainda não há base de campanhas — NÃO altera estado, retorna executed=false, status=stub_not_executed (sem protocolo falso).",
     "side_effect": "write",
     "operation_type": "update_meta",
     "sensitive": false,
@@ -1086,7 +1086,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   },
   {
     "name": "operational_ticket_create",
-    "description": "Cria um ticket para análise humana (motivo, resumo, conversa, contexto de empresa/cliente e fila desejada). Escalação interna — não move dinheiro nem altera cadastro/CRM nem envia mensagem externa.",
+    "description": "Abre um chamado para análise humana (escalação interna — não move dinheiro nem altera cadastro/CRM nem envia mensagem externa). STUB (#432): ainda não há backend de tickets — NÃO cria chamado, retorna created=false, status=stub_not_created (sem número falso). Auditado e idempotente mesmo como stub.",
     "side_effect": "communication",
     "operation_type": "communicate",
     "sensitive": false,
@@ -1198,7 +1198,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   },
   {
     "name": "payment_verification",
-    "description": "Confirma se um boleto foi pago: pago/não pago, data e valor do pagamento e status de conciliação quando disponível. Apenas leitura.",
+    "description": "Verifica se um boleto foi efetivamente pago. STUB (#432): ainda não há reconciliação de pagamentos — retorna paid=null (NUNCA false, para não afirmar sem evidência que NÃO foi pago) com source=stub. Apenas leitura.",
     "side_effect": "read",
     "operation_type": "read",
     "sensitive": false,
@@ -1521,7 +1521,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   },
   {
     "name": "refund_create",
-    "description": "Cria uma solicitação oficial de reembolso. Operação de ESCRITA: a confirmação é decidida por policy + dispatcher, nunca pelo próprio tool. Requer motivo e a entidade alvo; comprovante e dados bancários quando aplicável.",
+    "description": "Cria uma solicitação oficial de reembolso. Operação de ESCRITA (confirmação decidida por policy + dispatcher). STUB (#432): ainda não há repositório/integração de reembolsos — NÃO cria reembolso, retorna executed=false, status=stub_not_executed (sem protocolo falso).",
     "side_effect": "write",
     "operation_type": "create",
     "sensitive": false,

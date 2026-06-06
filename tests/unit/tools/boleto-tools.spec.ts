@@ -216,16 +216,18 @@ describe('boleto read/analysis tools — callable with conservative defaults', (
     expect(out.has_legal_intent).toBe(false);
   });
 
-  it('operational_ticket_create returns a ticket and is NOT a governed write', async () => {
+  it('operational_ticket_create is an honest stub (created=false) and NOT a governed write', async () => {
     const { REGISTRY } = await import('../../../src/tools/_registry.js');
     const { operationalTicketCreateTool } = await import('../../../src/tools/operational-ticket-create.js');
     // It is an internal escalation sink, not one of the three customer writes.
     expect(REGISTRY['operational_ticket_create']!.side_effect).not.toBe('write');
+    // Honest stub (#432): no ticketing backend → it must NOT fabricate a ticket.
     const out = await operationalTicketCreateTool.handler(
       { reason: 'fraude', summary: 'caso suspeito' } as never,
       ctx,
     );
-    expect(out.ticket_created).toBe(true);
-    expect(typeof out.ticket_number).toBe('string');
+    expect(out.created).toBe(false);
+    expect(out.status).toBe('stub_not_created');
+    expect(out.ticket_number).toBeUndefined();
   });
 });

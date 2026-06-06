@@ -130,10 +130,12 @@ describe('dispatcher — boleto write tools compose with the guard (issue #416)'
       granted_tools: [],
       denied_tools: [],
     };
+    // Honest stub (#432): the write is DISPATCHABLE (handler runs through the
+    // guard) but reports it executed NOTHING — no faked `ok: true`.
     const a = await dispatchTool({ tool: 'boleto_cancel', args: cancelArgs, ctx: fakeCtx });
-    expect(a).toMatchObject({ ok: true });
+    expect(a).toMatchObject({ executed: false, status: 'stub_not_executed' });
     const b = await dispatchTool({ tool: 'company_campaign_remove', args: removeArgs, ctx: fakeCtx });
-    expect(b).toMatchObject({ ok: true });
+    expect(b).toMatchObject({ executed: false, status: 'stub_not_executed' });
     // The dispatcher consulted canAct (the real granular action keys gate exec).
     expect(canActMock).toHaveBeenCalled();
     // refund_create is NOT in the write pack → still refused (handler never runs).
@@ -148,7 +150,7 @@ describe('dispatcher — boleto write tools compose with the guard (issue #416)'
       denied_tools: [],
     };
     const out = await dispatchTool({ tool: 'refund_create', args: refundArgs, ctx: fakeCtx });
-    expect(out).toMatchObject({ ok: true });
+    expect(out).toMatchObject({ executed: false, status: 'stub_not_executed' });
   });
 
   it("(4) constitutionalCheck is consulted for the write (compose, don't bypass)", async () => {
