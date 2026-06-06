@@ -3,7 +3,11 @@
  * skills seed (migration 079). DB-free: parses the migration SQL and asserts the
  * acceptance criteria are encoded, so a future edit that drops a pack, a tool, a
  * policy descriptor, or hardcodes confirmation fails here without needing
- * Postgres. The end-to-end seed-on-real-DB behaviour is covered by
+ * Postgres. It ALSO cross-checks the seeded tool names, pack ids, and policy
+ * descriptors against the live #416 CODE registries (REGISTRY / DOMAIN_PACKS /
+ * the boleto write-policy descriptors) so a name that drifts from the platform —
+ * on EITHER side — fails here instead of becoming a silent phantom capability
+ * (review r2 #5). The end-to-end seed-on-real-DB behaviour is covered by
  * tests/integration/boleto-proposta-role-seed-real-db.spec.ts (Docker-gated).
  *
  * Canonical spec: docs/architecture/concerns/capability-taxonomy.md.
@@ -12,6 +16,9 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { SkillUsagePolicySchema } from '@/skills/usage-policy.js';
+import { REGISTRY } from '@/tools/_registry.js';
+import { DOMAIN_PACKS } from '@/tools/packs.js';
+import { BOLETO_WRITE_RISK_POLICY_DESCRIPTORS } from '@/control-plane/policy/boleto-write-policies.js';
 
 const MIGRATION = readFileSync(
   fileURLToPath(new URL('../../../migrations/079_boleto_proposta_attendant_role_and_skills.sql', import.meta.url)),
@@ -364,5 +371,88 @@ describe('Issue #415 — usage_policy admits the external WhatsApp audience (rev
       const p = policyBySkill.get(key) as { requires_confirmation: boolean };
       expect(p.requires_confirmation, `${key} usage_policy must not self-confirm`).toBe(false);
     }
+  });
+});
+
+/**
+ * Review #430 (round 2, finding r2 #5) — cross-check the 079 seed against the
+ * #416 CODE registries (merged into main + onto this branch).
+ *
+ * The blocks above assert the seed strings against HARDCODED local contracts
+ * (`TOOL_NAMES` / `TOOL_PACKS` / `POLICY_DESCRIPTORS`). Those catch a seed that
+ * drops a known name, but NOT a seed that names a tool/pack/descriptor the
+ * platform never actually registers — that becomes a silent phantom capability
+ * (a skill granting a tool no agent can ever dispatch, or a role granting a pack
+ * that resolves to nothing). This block closes the gap by validating the ACTUAL
+ * seeded names against the live code:
+ *   - every allowed_tools entry  → a key of REGISTRY            (src/tools/_registry.ts)
+ *   - every granted_packs entry  → a DOMAIN_PACKS pack id        (src/tools/packs.ts)
+ *   - every policy_descriptor    → a #416 write/risk descriptor  (boleto-write-policies.ts)
+ * DB-free: the migration is read via fs (above) and the registries are plain
+ * module imports. A typo/drift on EITHER side fails here.
+ */
+describe('Issue #415 — seed cross-checked against #416 code registries (review r2 #5)', () => {
+  // The role's granted_packs as ACTUALLY seeded — parsed from the role INSERT
+  // (not the local TOOL_PACKS contract) so a pack added/renamed in the seed is
+  // still validated. Anchored to the role INSERT region so the skills'
+  // applicable_to_role ARRAY (later in the file) is never matched by mistake.
+  const grantedPacks = (() => {
+    const start = MIGRATION.indexOf('INSERT INTO roles');
+    const end = MIGRATION.indexOf('ON CONFLICT (tenant_id, agent_id, role_key)', start);
+    expect(start, 'INSERT INTO roles present').toBeGreaterThan(-1);
+    expect(end, 'role ON CONFLICT present').toBeGreaterThan(start);
+    const roleInsert = MIGRATION.slice(start, end);
+    const arr = roleInsert.match(/ARRAY\[([^\]]*)\]::text\[\]/);
+    expect(arr, 'granted_packs ARRAY[...] present in role INSERT').not.toBeNull();
+    return (arr![1].match(/'([^']+)'/g) ?? []).map((s) => s.replace(/'/g, ''));
+  })();
+
+  it('every allowed_tools entry is a real key of REGISTRY (no phantom tool)', () => {
+    const registryKeys = new Set(Object.keys(REGISTRY));
+    let refs = 0;
+    for (const key of SKILL_KEYS) {
+      const { allowed } = tupleArrayLiterals(key);
+      for (const tool of allowed) {
+        refs += 1;
+        expect(
+          registryKeys.has(tool),
+          `${key}: allowed_tools '${tool}' must be a key of REGISTRY (src/tools/_registry.ts)`,
+        ).toBe(true);
+      }
+    }
+    // Guard against a parse regression that silently validates nothing.
+    expect(refs, 'parsed at least one allowed_tools entry').toBeGreaterThan(0);
+  });
+
+  it('every granted pack on the role is a known DOMAIN_PACKS pack id (no phantom pack)', () => {
+    const knownPackIds = new Set(DOMAIN_PACKS.map((p) => p.id));
+    // Sanity: the parser found exactly the 6 boleto packs the role declares
+    // (ties the parse to this file's local contract; the real check is below).
+    expect(new Set(grantedPacks), 'parsed granted_packs match the declared set').toEqual(
+      new Set<string>(TOOL_PACKS),
+    );
+    for (const pack of grantedPacks) {
+      expect(
+        knownPackIds.has(pack),
+        `granted pack '${pack}' must be a known DOMAIN_PACKS id (src/tools/packs.ts)`,
+      ).toBe(true);
+    }
+  });
+
+  it('every policy_descriptor referenced by a skill is a registered #416 descriptor', () => {
+    const knownDescriptors = new Set<string>(BOLETO_WRITE_RISK_POLICY_DESCRIPTORS);
+    let refs = 0;
+    for (const key of SKILL_KEYS) {
+      const { policies } = tupleArrayLiterals(key);
+      for (const d of policies) {
+        refs += 1;
+        expect(
+          knownDescriptors.has(d),
+          `${key}: policy_descriptor '${d}' must be a registered #416 descriptor (src/control-plane/policy/boleto-write-policies.ts)`,
+        ).toBe(true);
+      }
+    }
+    // The two write-intent skills carry descriptors — guard the parse.
+    expect(refs, 'parsed at least one policy_descriptor entry').toBeGreaterThan(0);
   });
 });
