@@ -101,6 +101,7 @@ import {
 import {
   policyRulesRepo as p8ePolicyRulesRepo,
 } from '@/control-plane/policy/policy-rules-repo.js';
+import { RUNTIME_ENFORCED_WRITE_RISK_DESCRIPTORS } from '@/control-plane/policy/boleto-write-policies.js';
 import { evaluate as p9dEvaluate } from '@/governance/policy-dsl/evaluator.js';
 import { skillsRepo as p9aSkillsRepo } from '@/control-plane/skill-registry/skills-repo.js';
 import { procedureExecutionsRepo, procedureDefinitionsRepo } from '@/db/repositories.js';
@@ -139,11 +140,25 @@ import type { CreateDecisionEngineEnv } from './index.js';
 
 const policyDescriptorResolverAdapter: PolicyDescriptorResolver = {
   async resolveDescriptors(query, _options) {
+    // Issue #437 — wildcard expansion. The Decision Engine asks for "all
+    // applicable policies" via the sentinel descriptor `'*'`, but the P8e
+    // resolver matches `rule_descriptor` literally (no wildcard) and the P9d
+    // evaluator can only evaluate DSL-shaped (`PolicyRuleBody`) bodies. Expand
+    // `'*'` to the curated set of ACTIVE, DSL-evaluable descriptors
+    // (`confirm_before_write_policy`, `human_confirmation_policy`) so the boleto
+    // write/risk policies actually reach the Early/Mid PEPs. Resolving every
+    // active policy indiscriminately would feed the legacy non-DSL hard-limit
+    // rows (migration 037) to the evaluator → `evaluation_error` → BLOCK every
+    // turn; the curated list avoids that landmine until 037 is migrated. Any
+    // non-wildcard descriptor set is passed through unchanged.
+    const descriptors = query.descriptors.includes('*')
+      ? [...RUNTIME_ENFORCED_WRITE_RISK_DESCRIPTORS]
+      : query.descriptors;
     // P8e resolver does not accept AbortSignal; deadline wrapping happens in DE.
     const output = await p8eResolver.resolveDescriptors({
       tenant_id: query.tenant_id,
       agent_id: query.agent_id,
-      descriptors: query.descriptors,
+      descriptors,
       scope: query.scope?.channel
         ? { channel: query.scope.channel }
         : query.scope?.domain
@@ -209,20 +224,44 @@ const policyDSLEvaluatorAdapter: PolicyEvaluator = {
     switch (decision.outcome) {
       case 'matched': {
         // Use the effect action if it's a valid DE verdict action.
-        const effectAction = (decision.effect as { action?: string } | undefined)?.action;
-        const deAction = mapEffectAction(effectAction);
+        const effect = decision.effect as
+          | { action?: string; message?: string; metadata?: Record<string, unknown> }
+          | undefined;
+        const deAction = mapEffectAction(effect?.action);
         const verdict: PolicyEvaluatorVerdict = {
           action: deAction,
-          reason: bodyAsRecord['descriptor'] as string ?? 'policy_matched',
+          reason:
+            (bodyAsRecord['descriptor'] as string | undefined) ??
+            (bodyAsRecord['rule_id'] as string | undefined) ??
+            'policy_matched',
         };
-        // Forward severity if present in rule body
-        const severity = bodyAsRecord['severity'] as string | undefined;
+        if (typeof effect?.message === 'string') {
+          verdict.message = effect.message;
+        }
+        // Issue #437 — the DSL convention (migration 078) carries severity +
+        // intent + approval params in `effect.metadata`, NOT at the rule-body top
+        // level. Read from there first (legacy top-level as a fallback) so the
+        // Mid PEP can disambiguate `confirm_before_write` from
+        // `escalate_to_human` and forward a severity. Forwarding the whole
+        // metadata bag as `parameters` lets PEPs read `intent` / `approval_class`
+        // / any future signal without another mapping layer.
+        const meta =
+          effect?.metadata && typeof effect.metadata === 'object'
+            ? effect.metadata
+            : {};
+        const severity =
+          (meta['severity'] as string | undefined) ??
+          (bodyAsRecord['severity'] as string | undefined);
         if (severity && isValidSeverity(severity)) {
           verdict.severity = severity;
         }
-        // Forward parameters (used by dual_approval, reduce_tool_set)
-        const params = bodyAsRecord['parameters'] as Record<string, unknown> | undefined;
-        if (params) verdict.parameters = params;
+        const topLevelParams = bodyAsRecord['parameters'] as
+          | Record<string, unknown>
+          | undefined;
+        const params: Record<string, unknown> = { ...meta, ...(topLevelParams ?? {}) };
+        if (Object.keys(params).length > 0) {
+          verdict.parameters = params;
+        }
         return verdict;
       }
       case 'not_matched':

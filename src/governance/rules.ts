@@ -83,5 +83,39 @@ export function constitutionalCheck(input: {
     }
   }
 
+  // C-009 (issue #437): the boleto-proposta sensitive WRITES
+  // (boleto_cancel, company_campaign_remove, refund_create) require explicit
+  // confirmation / dual approval before execution. This is the synchronous,
+  // constitutional FLOOR at the dispatcher (capability-taxonomy §3/§6: "a skill
+  // never decides confirmation — policy + the dispatcher decide"). It COMPOSES
+  // with `confirm_before_write_policy` (migration 078), which DECIDES the same
+  // outcome via the P9d DSL at the Mid PEP, and with the dispatcher grant guard.
+  // Fail-closed: without a granted approval the write is refused here even if
+  // every other gate (skill scope, canAct) would allow it. The `confirm before
+  // write` intent maps to the existing dual_approval signal the three tools
+  // already accept (`dual_approval_granted` in their input schema), so no DSL
+  // vocabulary change is needed.
+  if (SENSITIVE_BOLETO_WRITE_TOOLS.has(intent.tool) && !input.dual_approval_granted) {
+    return {
+      kind: 'limit_exceeded',
+      required_action: 'dual_approval',
+      reason: 'escrita sensível do vertical boleto requer confirmação explícita antes de executar',
+    };
+  }
+
   return null;
 }
+
+/**
+ * Issue #437 — the three sensitive WRITE tools of the boleto-proposta vertical
+ * governed by `confirm_before_write_policy` (migration 078). Kept in sync with
+ * `CONFIRM_BEFORE_WRITE_GOVERNED_TOOLS`
+ * (`src/control-plane/policy/boleto-write-policies.ts`); duplicated here as a
+ * literal so this module stays free of a control-plane import (the dispatcher
+ * guard is in the action layer and must not pull the policy resolver in).
+ */
+const SENSITIVE_BOLETO_WRITE_TOOLS: ReadonlySet<string> = new Set([
+  'boleto_cancel',
+  'company_campaign_remove',
+  'refund_create',
+]);
