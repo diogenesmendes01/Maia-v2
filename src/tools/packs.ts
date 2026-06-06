@@ -102,12 +102,22 @@ const FORBIDDEN_IN_BASELINE: ReadonlySet<string> = new Set([
 /**
  * Side effects a baseline tool may declare. The baseline floor permits:
  *   - 'none' / 'read'      — always safe.
- *   - 'write'              — ONLY the granular, self-scoped `remember_safe_fact`.
+ *   - 'write'              — ONLY the self-scoped baseline writes:
+ *       `remember_safe_fact` (a SAFE per-pessoa fact, gated by the granular
+ *       `save_safe_fact` action key) and, since #433, `conversation_state_update`
+ *       (a lightweight, self-scoped merge under `metadata.agent_state.*`). The
+ *       latter is agent-INTERNAL bookkeeping over the caller's OWN ALS-scoped
+ *       conversation, so it is gated by SCOPE (tenant_id+agent_id+conversa), not
+ *       a permission action key (`required_actions: []`, like `read_turn_context`)
+ *       — never a financial/domain write.
  *   - 'communication'      — ONLY the INTERNAL `handoff_to_owner` escalation.
  * Any OTHER write/communication tool is a domain capability and must be granted
  * via a domain pack (#408), never the baseline.
  */
-const BASELINE_WRITE_ALLOWLIST: ReadonlySet<string> = new Set(['remember_safe_fact']);
+const BASELINE_WRITE_ALLOWLIST: ReadonlySet<string> = new Set([
+  'remember_safe_fact',
+  'conversation_state_update',
+]);
 const BASELINE_COMMUNICATION_ALLOWLIST: ReadonlySet<string> = new Set(['handoff_to_owner']);
 
 /**

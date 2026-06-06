@@ -757,6 +757,58 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     ]
   },
   {
+    "name": "conversation_state_update",
+    "description": "Atualiza um estado LEVE da conversa atual (ex.: tag de tópico, preferência do thread), fazendo merge atômico sob metadata.agent_state. Bookkeeping interno do agente, sempre escopado à própria conversa; estado de pendência/confirmação NÃO passa por aqui (use ask_pending_question). Retorna updated=false se a conversa não existir mais.",
+    "side_effect": "write",
+    "operation_type": "update_meta",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [],
+    "inputs": [
+      {
+        "name": "patch",
+        "type": "record",
+        "optional": false
+      },
+      {
+        "name": "conversation_id",
+        "type": "string",
+        "optional": true
+      }
+    ]
+  },
+  {
+    "name": "conversation_summary_compose",
+    "description": "Compõe um resumo estruturado da conversa atual (resumo, perguntas em aberto, decisões e pendências), usando o histórico fornecido ou as mensagens recentes desta conversa. Apenas leitura — não persiste nem encerra a conversa.",
+    "side_effect": "none",
+    "operation_type": "parse_only",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [],
+    "inputs": [
+      {
+        "name": "history",
+        "type": "object[]",
+        "optional": true
+      },
+      {
+        "name": "limit",
+        "type": "number",
+        "optional": true
+      },
+      {
+        "name": "purpose",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "max_chars",
+        "type": "number",
+        "optional": true
+      }
+    ]
+  },
+  {
     "name": "conversation_summary_generate",
     "description": "Gera um resumo operacional curto do atendimento: resumo estruturado, principais ações, pendências e motivo de escalação quando aplicável. Apenas análise do contexto fornecido, sem efeito colateral.",
     "side_effect": "none",
@@ -1741,6 +1793,52 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
         "name": "question",
         "type": "string",
         "optional": false
+      }
+    ]
+  },
+  {
+    "name": "risk_signal_classify",
+    "description": "Classificação determinística e heurística do risco do turno atual (low/medium/high/critical) sobre o scorer compartilhado, SEM nenhuma chamada externa de LLM. Retorna o nível, a próxima ação recomendada (allow/clarify/confirm/handoff) e a origem (source=heuristic). Sem efeito colateral.",
+    "side_effect": "none",
+    "operation_type": "parse_only",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [],
+    "inputs": [
+      {
+        "name": "text",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "topic",
+        "type": "enum(casual|operational_simple|financial|legal|health|critical_decision|unknown)",
+        "optional": true
+      },
+      {
+        "name": "tool_kinds",
+        "type": "enum(read_local|read_external|write_local|write_external|transfer|irreversible|communication)[]",
+        "optional": true
+      },
+      {
+        "name": "skill_confidence",
+        "type": "number",
+        "optional": true
+      },
+      {
+        "name": "skill_threshold",
+        "type": "number",
+        "optional": true
+      },
+      {
+        "name": "active_sensitive_memory_count",
+        "type": "number",
+        "optional": true
+      },
+      {
+        "name": "active_procedure_has_critical_step",
+        "type": "boolean",
+        "optional": true
       }
     ]
   },

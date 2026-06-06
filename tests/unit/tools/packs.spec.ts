@@ -31,12 +31,14 @@ describe('baseline.core tool pack (issue #410)', () => {
     expect([...DEFAULT_AGENT_PACKS]).toEqual(['baseline.core']);
   });
 
-  it('baseline.core is versioned and lists exactly the 7 baseline tools', async () => {
+  it('baseline.core is versioned (v2 after #433) and lists exactly the 10 baseline tools', async () => {
     const { BASELINE_CORE_PACK } = await import('../../../src/tools/packs.js');
     expect(BASELINE_CORE_PACK.id).toBe('baseline.core');
-    expect(BASELINE_CORE_PACK.version).toBeGreaterThanOrEqual(1);
+    // #433 bumped the pack version 1 → 2 when it added the 3 gap tools.
+    expect(BASELINE_CORE_PACK.version).toBeGreaterThanOrEqual(2);
     expect([...BASELINE_CORE_PACK.tools].sort()).toEqual(
       [
+        // #410 — the original 7.
         'audit_decision',
         'explain_limitation',
         'handoff_to_owner',
@@ -44,6 +46,10 @@ describe('baseline.core tool pack (issue #410)', () => {
         'recall_memory',
         'remember_safe_fact',
         'request_confirmation',
+        // #433 — the 3 gap tools.
+        'risk_signal_classify',
+        'conversation_summary_compose',
+        'conversation_state_update',
       ].sort(),
     );
   });
@@ -87,7 +93,7 @@ describe('baseline.core tool pack (issue #410)', () => {
     }
   });
 
-  it('CONSERVATIVE side effects: only one self-scoped write + one internal escalation', async () => {
+  it('CONSERVATIVE side effects: only the two self-scoped writes + one internal escalation', async () => {
     const { BASELINE_CORE_PACK } = await import('../../../src/tools/packs.js');
     const { REGISTRY } = await import('../../../src/tools/_registry.js');
 
@@ -97,8 +103,11 @@ describe('baseline.core tool pack (issue #410)', () => {
     const comms = BASELINE_CORE_PACK.tools.filter(
       (n) => REGISTRY[n]!.side_effect === 'communication',
     );
-    // The ONLY baseline write is remember_safe_fact (scoped to own pessoa).
-    expect(writes).toEqual(['remember_safe_fact']);
+    // The ONLY baseline writes are the two self-scoped ones: remember_safe_fact
+    // (own pessoa) and conversation_state_update (own conversation, #433).
+    expect([...writes].sort()).toEqual(
+      ['conversation_state_update', 'remember_safe_fact'].sort(),
+    );
     // The ONLY baseline communication is handoff_to_owner (internal escalation,
     // NOT send_proactive_message).
     expect(comms).toEqual(['handoff_to_owner']);

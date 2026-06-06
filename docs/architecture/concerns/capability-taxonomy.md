@@ -102,6 +102,25 @@ Two corollaries:
 - **Baseline is universal — do not duplicate it per role.** A role lists only what it *adds* on top of baseline. A role that re-declares `safe_conversation` or `request_confirmation` is a smell.
 - **Domain capability is opt-in.** An agent with no domain pack granted sees only baseline tools. A finance pack, a sales pack, or the boleto packs of [#416](https://github.com/diogenesmendes01/Maia-v2/issues/416) are granted explicitly, never inherited by default.
 
+### 4.1 Baseline skill → tool coverage matrix ([#410](https://github.com/diogenesmendes01/Maia-v2/issues/410) → [#433](https://github.com/diogenesmendes01/Maia-v2/issues/433))
+
+Every baseline capability the #410 contract promises maps to a tool in `BASELINE_CORE_PACK` (`src/tools/grant-math.ts`). A live audit at #433 found **~70% already shipped** under different names; #433 filled only the **3 genuine gaps** (rows marked **gap → wrap**). "Grant" = reuse the existing tool as-is; "Wrap" = a thin tool over an existing shared engine/repo (never a second engine). All 10 tools are auto-audited by the dispatcher from their `audit_action` — no tool hand-rolls `audit()`.
+
+| Baseline capability (#410) | Tool | side_effect / operation_type | Grant vs wrap | Notes |
+|---|---|---|---|---|
+| Understand the current turn | `read_turn_context` | none / read | **grant** (existed) | `mensagensRepo.recentInConversation`, ALS-scoped to the caller's conversa. |
+| Read authorized memory in scope | `recall_memory` | read / read | **grant** (existed) | Reused; not re-added to the registry. |
+| Persist a SAFE per-pessoa fact | `remember_safe_fact` | write / create | **grant** (existed) | Scope FORCED to `pessoa:<self>`; gated by `save_safe_fact`. One of the two allowlisted baseline writes. |
+| Ask before acting (never acts) | `request_confirmation` | none / read | **grant** (existed) | Pure speech act. The *persisted* gate is `ask_pending_question` (a domain tool) — not conflated. |
+| Escalate to the owner (internal) | `handoff_to_owner` | communication / communicate | **grant** (existed) | INTERNAL escalation signal; the only allowlisted baseline communication. No external send, no handoff store. |
+| Record a decision rationale | `audit_decision` | none / read | **grant** (existed) | Thin wrapper over `audit()` with a FIXED action label. |
+| Honest "I can't do that (yet)" | `explain_limitation` | none / read | **grant** (existed) | Pure speech act; performs no escalation itself. |
+| Assess the risk of the turn | `risk_signal_classify` | none / parse_only | **gap → wrap** | Wraps the shared two-stage scorer via `classifyTurnRisk` (`src/shared/risk/turn-risk-adapter.ts`). No second risk enum; the level is the deterministic scorer's (LLM may only elevate). Adapter is shared with [#431](https://github.com/diogenesmendes01/Maia-v2/issues/431) `case_risk_classify`. |
+| Summarize the conversation | `conversation_summary_compose` | none / parse_only | **gap → wrap** | Wraps the extracted `summarizeTranscript` (`src/shared/summary/summarize-transcript.ts`), the SAME helper the `conversation-summarizer` worker now calls (no duplicated prompt). Read-only — does not close the conversation. Shared with #431. |
+| Update lightweight conversation state | `conversation_state_update` | write / update_meta | **gap → wrap** | Thin tool over `conversasRepo.mergeMetadata` (atomic, ALS-scoped jsonb merge). Self-scoped to `ctx.conversa.id`; rejects a divergent `conversation_id`; refuses reserved gate keys (pending/clarification/confirmation, scope hash) — those route through `ask_pending_question`. The second allowlisted baseline write. |
+
+Tools deliberately **NOT** built (the audit's other findings): no second confirmation store (`request_confirmation` speech act + `ask_pending_question` persisted gate already cover it), no handoff record store (overlaps `operational_ticket_create` in [#432](https://github.com/diogenesmendes01/Maia-v2/issues/432)), no new memory writer (the `propose_*` KSM family + `remember_safe_fact` cover safe writes).
+
 ## 5. New axes vs current behavior
 
 Several relationships this taxonomy describes **do not exist in the schema or code yet**. Treat them as design axes, not as infrastructure you can call today. Each is independently verifiable with a grep against `src/db/schema.ts`.
