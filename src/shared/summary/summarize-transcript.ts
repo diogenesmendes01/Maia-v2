@@ -15,6 +15,15 @@
  *   - `conversation_summary_compose` (baseline.core tool, this issue) — wraps it.
  *   - `conversation_summary_generate` (sibling #431) will wrap it too.
  *
+ * NOT prompt-identical, but behavior-preserving at the worker's CONTRACT: the
+ * extraction switched the prompt to ask for STRICT JSON (and `max_tokens: 700`,
+ * up from the worker's prior prose call) so the tools get structured fields. The
+ * worker still consumes ONLY `.summary` — a ≤500-char prose string used to close
+ * the conversa — and the JSON→prose fallback in `parseSummaryResponse` keeps that
+ * summary populated even when the model returns prose. So the observable output
+ * the worker stores is preserved; the underlying prompt/token budget is not
+ * byte-for-byte the previous inline call.
+ *
  * Domain-neutral by contract: it takes a minimal `{ direcao, conteudo }` message
  * shape (NOT a full `Mensagem`/DB row), no `ctx`, no repos — so any caller can
  * satisfy it. The cognitive-module instrumentation params are passed through so

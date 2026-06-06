@@ -697,20 +697,24 @@ export const conversasRepo = {
    * when two workers race to write metadata. Existing keys in `patch`
    * overwrite existing keys in metadata; everything else is preserved.
    */
-  async mergeMetadata(id: string, patch: Record<string, unknown>): Promise<void> {
-    // Flip-readiness (#323): tenant+agent scope the WHERE (bound from ALS). The
-    // only LIVE caller is the agent core's post-turn scope-hash persist
-    // (core.ts), which runs inside `runWithTenantContext({tenant_id, agent_id})`
-    // on a conversa `c` it already resolved under the SAME context — so
-    // `c.agent_id === getCurrentAgent()` and the predicate matches. (The
-    // deprecated `setLightweightPending` path is dead code: no live caller.)
-    // PREDICATE-ONLY (no throw): that caller wraps this in try/catch and treats
-    // it as explicitly best-effort ("last-writer-wins ... is fine"); a 0-row
-    // no-op is benign there, so a fail-loud assertion would only ever degrade to
-    // a swallowed warning while risking the hot path. Predicate only.
+  async mergeMetadata(id: string, patch: Record<string, unknown>): Promise<boolean> {
+    // Flip-readiness (#323): tenant+agent scope the WHERE (bound from ALS). One
+    // LIVE caller is the agent core's post-turn scope-hash persist (core.ts),
+    // which runs inside `runWithTenantContext({tenant_id, agent_id})` on a
+    // conversa `c` it already resolved under the SAME context — so
+    // `c.agent_id === getCurrentAgent()` and the predicate matches.
+    // PREDICATE-ONLY (no throw): the best-effort callers (core.ts scope-hash,
+    // pending-questions) wrap this and treat a 0-row no-op as benign
+    // ("last-writer-wins ... is fine"), so a fail-loud assertion would only ever
+    // degrade to a swallowed warning while risking the hot path.
+    //
+    // Review fix (MÉDIO): the `conversation_state_update` tool MUST be able to
+    // tell a real write apart from a silent no-op (stale/divergent conversa), so
+    // it doesn't audit a fake success. We add `RETURNING id` and report whether a
+    // row actually matched. The best-effort callers simply ignore the boolean.
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
-    await db
+    const updated = await db
       .update(conversas)
       .set({ metadata: sql`${conversas.metadata} || ${JSON.stringify(patch)}::jsonb` })
       .where(
@@ -719,7 +723,55 @@ export const conversasRepo = {
           eq(conversas.tenant_id, tenant_id),
           eq(conversas.agent_id, agent_id),
         ),
-      );
+      )
+      .returning({ id: conversas.id });
+    return updated.length > 0;
+  },
+  /**
+   * Atomic, namespaced partial merge: deep-merge `patch` into the single nested
+   * object `metadata.<namespace>` (one level), leaving every OTHER top-level
+   * metadata key untouched. Implemented with `jsonb_set(... , COALESCE(existing,
+   * '{}') || patch, true)` so:
+   *   - sibling top-level keys (pending_question, last_scope_hash, telefone, …)
+   *     are NEVER touched — only `metadata.<namespace>.*` changes;
+   *   - keys ALREADY inside the namespace are preserved (last-writer-wins per
+   *     key), like the top-level `mergeMetadata`.
+   *
+   * Issue #433 review fix (MÉDIO): the `conversation_state_update` tool writes
+   * the agent's lightweight state under a dedicated `agent_state` namespace
+   * instead of a reserved-key denylist, so a baseline write can never clobber a
+   * governed top-level metadata key (current OR future). Returns whether a row
+   * matched (same ALS-scoped predicate + RETURNING as `mergeMetadata`).
+   */
+  async mergeMetadataNamespace(
+    id: string,
+    namespace: string,
+    patch: Record<string, unknown>,
+  ): Promise<boolean> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const updated = await db
+      .update(conversas)
+      .set({
+        // `namespace` is a BOUND parameter (ARRAY[...]::text[] path + `->`
+        // operand), never string-interpolated SQL — no injection surface even if
+        // a future caller passes a non-constant namespace.
+        metadata: sql`jsonb_set(
+          ${conversas.metadata},
+          ARRAY[${namespace}]::text[],
+          COALESCE(${conversas.metadata} -> ${namespace}, '{}'::jsonb) || ${JSON.stringify(patch)}::jsonb,
+          true
+        )`,
+      })
+      .where(
+        and(
+          eq(conversas.id, id),
+          eq(conversas.tenant_id, tenant_id),
+          eq(conversas.agent_id, agent_id),
+        ),
+      )
+      .returning({ id: conversas.id });
+    return updated.length > 0;
   },
   /**
    * Atomic key removal from conversas.metadata via the jsonb `-` operator.

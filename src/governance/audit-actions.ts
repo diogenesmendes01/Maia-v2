@@ -313,12 +313,6 @@ export const ACTION_KEYS = [
   // customer-facing writes so the role can open escalation tickets, and so it is
   // NOT captured by `confirm_before_write_policy` (scoped by tool name).
   'create_ticket',
-  // Issue #433 — granular action key for `conversation_state_update` (write).
-  // Deliberately distinct from financial/cadastro writes: a baseline agent may
-  // update its OWN conversation's lightweight state WITHOUT any domain-mutation
-  // grant. Gate state (pending/confirmation) is NOT covered — it routes through
-  // `ask_pending_question`.
-  'update_conversation_state',
 ] as const;
 
 export type ActionKey = (typeof ACTION_KEYS)[number];

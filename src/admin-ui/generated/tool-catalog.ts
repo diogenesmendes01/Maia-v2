@@ -758,14 +758,12 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   },
   {
     "name": "conversation_state_update",
-    "description": "Atualiza um estado LEVE e não-gate da conversa atual (ex.: tag de tópico, preferência do thread), fazendo merge atômico no metadata. Sempre escopado à própria conversa; estado de pendência/confirmação NÃO passa por aqui (use ask_pending_question).",
+    "description": "Atualiza um estado LEVE da conversa atual (ex.: tag de tópico, preferência do thread), fazendo merge atômico sob metadata.agent_state. Bookkeeping interno do agente, sempre escopado à própria conversa; estado de pendência/confirmação NÃO passa por aqui (use ask_pending_question). Retorna updated=false se a conversa não existir mais.",
     "side_effect": "write",
     "operation_type": "update_meta",
     "sensitive": false,
     "feature_flag": null,
-    "required_actions": [
-      "update_conversation_state"
-    ],
+    "required_actions": [],
     "inputs": [
       {
         "name": "patch",
@@ -1800,7 +1798,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   },
   {
     "name": "risk_signal_classify",
-    "description": "Classifica o risco do turno atual (low/medium/high/critical) e recomenda a próxima ação (allow/clarify/confirm/handoff). Determinístico — o nível vem do scorer compartilhado; sem efeito colateral.",
+    "description": "Classificação determinística e heurística do risco do turno atual (low/medium/high/critical) sobre o scorer compartilhado, SEM nenhuma chamada externa de LLM. Retorna o nível, a próxima ação recomendada (allow/clarify/confirm/handoff) e a origem (source=heuristic). Sem efeito colateral.",
     "side_effect": "none",
     "operation_type": "parse_only",
     "sensitive": false,
