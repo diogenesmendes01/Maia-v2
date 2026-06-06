@@ -363,4 +363,82 @@ describe('P9b — Mid PEP', () => {
     );
     expect(deps.evaluator.evaluate).not.toHaveBeenCalled();
   });
+
+  // Issue #437 — `require_dual_approval` + `effect.metadata.intent` disambiguation.
+  it('#437 — require_dual_approval + intent=escalate_to_human → escalate (human handoff)', async () => {
+    const deps = mkDeps({
+      policyRepo: {
+        getBody: vi.fn().mockResolvedValue({
+          policy_id: 'human_confirmation_policy',
+          descriptor: 'human_confirmation_policy',
+          applies_to_peps: ['mid'],
+        }),
+        getBodySync: vi.fn().mockReturnValue(null),
+      },
+      evaluator: {
+        evaluate: vi.fn().mockResolvedValue({
+          action: 'require_dual_approval',
+          reason: 'human_confirmation_policy',
+          severity: 'high',
+          message: 'Caso requer handoff humano.',
+          parameters: { intent: 'escalate_to_human', severity: 'high' },
+        }),
+      },
+    });
+    const pep = new MidPepImpl(deps);
+    const r = await pep.evaluate(
+      mkInput({
+        resolved_policies: [
+          {
+            policy_id: 'human_confirmation_policy',
+            descriptor: 'human_confirmation_policy',
+            applies_to_peps: ['mid'],
+          },
+        ],
+      }),
+    );
+    const block = r as BlockDecision;
+    expect(block.decision).toBe('escalate');
+    expect(block.policy_id).toBe('human_confirmation_policy');
+    expect(block.user_facing_message).toBe('Caso requer handoff humano.');
+    // It is NOT a dual-approval decision.
+    expect((r as RequireDualApprovalDecision).approval_class).toBeUndefined();
+  });
+
+  it('#437 — require_dual_approval + intent=confirm_before_write → require_dual_approval', async () => {
+    const deps = mkDeps({
+      policyRepo: {
+        getBody: vi.fn().mockResolvedValue({
+          policy_id: 'confirm_before_write_policy',
+          descriptor: 'confirm_before_write_policy',
+          applies_to_peps: ['mid'],
+        }),
+        getBodySync: vi.fn().mockReturnValue(null),
+      },
+      evaluator: {
+        evaluate: vi.fn().mockResolvedValue({
+          action: 'require_dual_approval',
+          reason: 'confirm_before_write_policy',
+          parameters: { intent: 'confirm_before_write' },
+        }),
+      },
+    });
+    const pep = new MidPepImpl(deps);
+    const r = await pep.evaluate(
+      mkInput({
+        resolved_policies: [
+          {
+            policy_id: 'confirm_before_write_policy',
+            descriptor: 'confirm_before_write_policy',
+            applies_to_peps: ['mid'],
+          },
+        ],
+      }),
+    );
+    const approval = r as RequireDualApprovalDecision;
+    expect(approval.decision).toBe('require_dual_approval');
+    expect(approval.policy_id).toBe('confirm_before_write_policy');
+    // No explicit approval_class in the policy → safe default.
+    expect(approval.approval_class).toBe('owner_plus_technical');
+  });
 });

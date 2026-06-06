@@ -83,4 +83,47 @@ describe('constitutional rules', () => {
     });
     expect(r).toBe(null);
   });
+
+  // C-009 (issue #437) — the boleto sensitive writes require confirmation /
+  // dual approval before execution. Composes with confirm_before_write_policy
+  // (the DSL decider at the Mid PEP) + the dispatcher guard.
+  it.each(['boleto_cancel', 'company_campaign_remove', 'refund_create'])(
+    'C-009 — bloqueia %s sem confirmação (dual approval)',
+    (tool) => {
+      const r = constitutionalCheck({
+        intent: { tool, args: { entidade_id: 'e1', valor: 10 } },
+        pessoa,
+        resolved: null,
+        scope: { entidades: ['e1'] },
+      });
+      expect(r?.kind).toBe('limit_exceeded');
+      if (r?.kind === 'limit_exceeded') {
+        expect(r.required_action).toBe('dual_approval');
+      }
+    },
+  );
+
+  it.each(['boleto_cancel', 'company_campaign_remove', 'refund_create'])(
+    'C-009 — permite %s com confirmação (dual_approval_granted)',
+    (tool) => {
+      const r = constitutionalCheck({
+        intent: { tool, args: { entidade_id: 'e1', valor: 10 } },
+        pessoa,
+        resolved: null,
+        scope: { entidades: ['e1'] },
+        dual_approval_granted: true,
+      });
+      expect(r).toBe(null);
+    },
+  );
+
+  it('C-009 — não afeta tools de leitura do vertical boleto', () => {
+    const r = constitutionalCheck({
+      intent: { tool: 'boleto_search', args: { entidade_id: 'e1' } },
+      pessoa,
+      resolved: null,
+      scope: { entidades: ['e1'] },
+    });
+    expect(r).toBe(null);
+  });
 });

@@ -102,6 +102,29 @@ export class MidPepImpl implements MidPep {
       }
 
       if (verdict.action === 'require_dual_approval') {
+        // Issue #437 — the boleto write/risk policies (migration 078) BOTH encode
+        // the DSL `require_dual_approval` effect; `effect.metadata.intent`
+        // (forwarded by the evaluator adapter as `parameters.intent`)
+        // disambiguates the PEP outcome WITHOUT extending the DSL vocabulary
+        // (decision: option b):
+        //   - 'escalate_to_human'  → hand off to a human (escalate).
+        //   - 'confirm_before_write' (or unset) → require explicit confirmation /
+        //     dual approval before the sensitive write.
+        const intent = verdict.parameters?.['intent'];
+        if (intent === 'escalate_to_human') {
+          const block: BlockDecision = {
+            pep: 'mid',
+            policy_id: policy.policy_id,
+            rule_descriptor: policy.descriptor,
+            decision: 'escalate',
+            reason: verdict.reason,
+            severity: verdict.severity ?? 'high',
+          };
+          if (verdict.message !== undefined) {
+            block.user_facing_message = verdict.message;
+          }
+          return block;
+        }
         const approval: RequireDualApprovalDecision = {
           pep: 'mid',
           policy_id: policy.policy_id,

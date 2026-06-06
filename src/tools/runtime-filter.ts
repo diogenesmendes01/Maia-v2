@@ -30,9 +30,10 @@ import { getAgentToolSchemas } from './_registry.js';
 import {
   computeAgentVisibleTools,
   type AgentToolGrant,
+  type RoleToolScope,
   type SkillToolScope,
 } from './grant-math.js';
-import { agentToolGrantsRepo } from '@/db/repositories.js';
+import { agentToolGrantsRepo, rolesRepo } from '@/db/repositories.js';
 import { audit } from '@/governance/audit.js';
 import { logger } from '@/lib/logger.js';
 import {
@@ -63,6 +64,16 @@ export interface RuntimeToolFilterInput {
    * is only applied for internal/trusted audiences).
    */
   skillUsagePolicy?: Record<string, unknown> | null;
+  /**
+   * Issue #437 — the turn's ACTIVE operational role key (resolved by the
+   * role-selector chain and carried on the BaseContextPacket as
+   * `active_role_key`). When supplied, the role's `granted_packs`
+   * (`roles.granted_packs`) narrow the visible set to its packs ∪ baseline — the
+   * "active-role packs" factor of the capability-taxonomy §2 step 7 intersection
+   * (`agent grant ∩ active-role packs ∩ skill scope`). Absent ⇒ no role
+   * narrowing (legacy / role-agnostic turn).
+   */
+  activeRoleKey?: string;
   /** Audit correlation — emitted on the `tool_visibility_resolved` row. */
   audit_context?: {
     pessoa_id?: string;
@@ -108,6 +119,33 @@ export async function resolveEffectiveGrant(): Promise<AgentToolGrant> {
 }
 
 /**
+ * Issue #437 — resolve the ACTIVE role's tool-pack scope (`roles.granted_packs`).
+ * Reads the role for (tenant, agent, role_key) via `rolesRepo.getByKey` (scoped
+ * to the ALS tenant+agent — NEVER cross-tenant). Fail-SAFE: an empty key, a
+ * missing role, or a lookup error yields `null` (NO role restriction) rather than
+ * blocking the turn. This is fail-CLOSED in the sense that matters — the role
+ * axis can only NARROW, never authorize, so failing to narrow never grants
+ * anything new; the agent grant + dispatcher `tool_not_granted` guard remain the
+ * hard server-side floor. Logged for observability.
+ */
+export async function resolveActiveRoleScope(
+  activeRoleKey?: string,
+): Promise<RoleToolScope | null> {
+  if (!activeRoleKey) return null;
+  try {
+    const role = await rolesRepo.getByKey(activeRoleKey);
+    if (!role) return null;
+    return { role_key: role.role_key, granted_packs: role.granted_packs ?? [] };
+  } catch (err) {
+    logger.warn(
+      { err: (err as Error).message, active_role_key: activeRoleKey },
+      'tools.runtime_filter.role_lookup_failed_no_role_restriction',
+    );
+    return null;
+  }
+}
+
+/**
  * Compute the LLM-visible tool schemas for the current turn and audit the
  * provenance. See the module header for the full intersection.
  */
@@ -115,6 +153,9 @@ export async function computeRuntimeVisibleTools(
   input: RuntimeToolFilterInput,
 ): Promise<RuntimeToolFilterResult> {
   const grant = await resolveEffectiveGrant();
+  // Issue #437 — the ACTIVE-role pack axis. Loaded once per turn; fail-safe to
+  // null (no role narrowing) so the role axis can only ever REMOVE tools.
+  const roleScope = await resolveActiveRoleScope(input.activeRoleKey);
 
   // Issue #409 hook: when a skill scope is present AND an audience is supplied,
   // re-check the skill's usage_policy. A skill NOT admitted for this audience
@@ -136,7 +177,7 @@ export async function computeRuntimeVisibleTools(
     }
   }
 
-  const composed = computeAgentVisibleTools(grant, effectiveSkillScope);
+  const composed = computeAgentVisibleTools(grant, effectiveSkillScope, roleScope);
 
   // Apply the HUMAN-permission + feature-flag filters over the agent ∩ skill
   // visible set (the registry projection).
