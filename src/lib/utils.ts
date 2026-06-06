@@ -98,6 +98,79 @@ export function trigramSim(a: string, b: string): number {
   return union === 0 ? 0 : intersect / union;
 }
 
+/**
+ * Issue #431 — generic fuzzy-name matcher extracted so both `identify_entity`
+ * (over `entidades`) and the boleto adapters' `company_identity_resolver` /
+ * `company_search` (over `contrapartes`) share ONE scoring + ambiguity rule
+ * instead of copying `identify_entity`'s inline composition.
+ *
+ * Domain-neutral: it scores an arbitrary candidate list by trigram similarity of
+ * `query` against each candidate's `name`, applies the SAME ambiguity gate the
+ * repo's existing entity matcher uses (`top.score < 0.4 || top - second < 0.1`),
+ * and returns the ranked candidates + the gate verdict. No `ctx`, no repos, no
+ * DB type — the caller passes already-fetched, already-scoped rows.
+ *
+ * The candidate `id`/`name` are generic strings; callers map their own row type
+ * in and read `id` back out. `extra` is an opaque passthrough so a caller can
+ * thread row-specific fields (e.g. a CNPJ) onto each scored result without this
+ * helper knowing the domain shape.
+ */
+export interface FuzzyCandidate<T = undefined> {
+  id: string;
+  name: string;
+  extra?: T;
+}
+
+export interface FuzzyScored<T = undefined> {
+  id: string;
+  name: string;
+  score: number;
+  extra?: T;
+}
+
+export interface FuzzyMatchResult<T = undefined> {
+  /** All candidates ranked by descending score. */
+  ranked: FuzzyScored<T>[];
+  /** The highest-scoring candidate, or null when the list was empty. */
+  top: FuzzyScored<T> | null;
+  /**
+   * True when no candidate is a confident, unambiguous winner — either the best
+   * score is below the floor (0.4) or it ties too closely with the runner-up
+   * (within 0.1). Mirrors the gate in `identify_entity`.
+   */
+  ambiguous: boolean;
+}
+
+/** Floor below which even the best match is considered too weak to resolve. */
+export const FUZZY_SCORE_FLOOR = 0.4;
+/** Minimum gap between #1 and #2 for the top match to be unambiguous. */
+export const FUZZY_AMBIGUITY_GAP = 0.1;
+
+export function fuzzyMatchByName<T = undefined>(
+  query: string,
+  candidates: ReadonlyArray<FuzzyCandidate<T>>,
+): FuzzyMatchResult<T> {
+  const q = stripDiacritics(query.toLowerCase());
+  const ranked = candidates
+    .map((c) => ({
+      id: c.id,
+      name: c.name,
+      score: trigramSim(q, stripDiacritics(c.name.toLowerCase())),
+      extra: c.extra,
+    }))
+    .sort((a, b) => b.score - a.score);
+
+  if (ranked.length === 0) {
+    return { ranked, top: null, ambiguous: true };
+  }
+  const top = ranked[0]!;
+  const second = ranked[1];
+  const ambiguous =
+    top.score < FUZZY_SCORE_FLOOR ||
+    (second !== undefined && top.score - second.score < FUZZY_AMBIGUITY_GAP);
+  return { ranked, top, ambiguous };
+}
+
 export class TypedError extends Error {
   constructor(
     public code: string,

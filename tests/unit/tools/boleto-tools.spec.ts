@@ -112,101 +112,87 @@ describe('boleto proposal tools — write side-effects (issue #416)', () => {
   });
 });
 
-describe('receipt_validate — reuses existing parsers (issue #416 / taxonomy §6)', () => {
-  it('delegates to parse_image and maps its receipt output (no new OCR)', async () => {
-    // Spy on the parse-image tool's handler to prove delegation.
-    const parseImageMod = await import('../../../src/tools/parse-image.js');
-    const spy = vi
-      .spyOn(parseImageMod.parseImageTool, 'handler')
-      .mockResolvedValue({
-        kind: 'receipt',
-        receipt: { valor: 150.5, data: '2026-06-01', beneficiario_nome: '<ocr>ACME</ocr>', banco_origem: '<ocr>Banco X</ocr>' },
-        confianca: 0.85,
-      } as never);
-
+describe('receipt_validate — reuses parse_receipt + FAIL-CLOSED (issue #416/#431)', () => {
+  // #431 replaced the #416 stub-era delegation (parse_image-first, fail-open)
+  // with a parse_receipt-cache delegation that is FAIL-CLOSED. The exhaustive
+  // vision-cache / conversation-resolution behavior now lives in
+  // `boleto-adapters.spec.ts`; here we keep the registry-contract metadata + a
+  // smoke proof of the delegation and the fail-closed verdict.
+  it('declares the reuse contract metadata (read / parse_only / receipt_validated)', async () => {
     const { receiptValidateTool } = await import('../../../src/tools/receipt-validate.js');
     expect(receiptValidateTool.side_effect).toBe('read');
     expect(receiptValidateTool.operation_type).toBe('parse_only');
     expect(receiptValidateTool.audit_action).toBe('receipt_validated');
+  });
 
+  it('delegates to parse_receipt and is valid for an authentic, complete receipt', async () => {
+    const parseReceiptMod = await import('../../../src/tools/parse-receipt.js');
+    const spy = vi
+      .spyOn(parseReceiptMod.parseReceiptTool, 'handler')
+      .mockResolvedValue({
+        tipo: 'pix',
+        valor: 150.5,
+        data: '2026-06-01',
+        beneficiario_nome: '<ocr>ACME</ocr>',
+        confianca: 0.85,
+      } as never);
+
+    const { receiptValidateTool } = await import('../../../src/tools/receipt-validate.js');
     const out = await receiptValidateTool.handler(
       { media_local_path: '/tmp/x.jpg', file_sha256: 'abc' } as never,
       ctx,
     );
-    expect(spy).toHaveBeenCalledWith(
-      { media_local_path: '/tmp/x.jpg', file_sha256: 'abc' },
-      ctx,
-    );
-    expect(out.amount).toBe(150.5);
-    expect(out.date).toBe('2026-06-01');
-    expect(out.recipient_signal).toBe('<ocr>ACME</ocr>');
-    expect(out.confidence).toBe(0.85);
+    expect(spy).toHaveBeenCalledWith({ media_local_path: '/tmp/x.jpg', file_sha256: 'abc' }, ctx);
+    expect(out.identified_amount).toBe(150.5);
+    expect(out.identified_date).toBe('2026-06-01');
+    expect(out.authenticity).toBe('plausible');
     expect(out.valid).toBe(true);
+    expect(out.source_parser).toBe('parse_receipt');
     spy.mockRestore();
   });
 
-  it('falls back to parse_receipt when parse_image does not route a receipt', async () => {
-    const parseImageMod = await import('../../../src/tools/parse-image.js');
+  it('is FAIL-CLOSED: a parse with missing amount/recipient is invalid with reasons', async () => {
     const parseReceiptMod = await import('../../../src/tools/parse-receipt.js');
-    const imgSpy = vi
-      .spyOn(parseImageMod.parseImageTool, 'handler')
-      .mockResolvedValue({ kind: 'unknown', confianca: 0 } as never);
-    const rcptSpy = vi
-      .spyOn(parseReceiptMod.parseReceiptTool, 'handler')
-      .mockResolvedValue({ valor: 99, data: '2026-06-02', beneficiario_nome: '<ocr>Y</ocr>', confianca: 0.6 } as never);
-
-    const { receiptValidateTool } = await import('../../../src/tools/receipt-validate.js');
-    const out = await receiptValidateTool.handler(
-      { media_local_path: '/tmp/y.jpg', file_sha256: 'def' } as never,
-      ctx,
-    );
-    expect(imgSpy).toHaveBeenCalled();
-    expect(rcptSpy).toHaveBeenCalled();
-    expect(out.amount).toBe(99);
-    expect(out.confidence).toBe(0.6);
-    imgSpy.mockRestore();
-    rcptSpy.mockRestore();
-  });
-
-  it('warns and marks invalid when amount/recipient are missing', async () => {
-    const parseImageMod = await import('../../../src/tools/parse-image.js');
     const spy = vi
-      .spyOn(parseImageMod.parseImageTool, 'handler')
-      .mockResolvedValue({ kind: 'receipt', receipt: {}, confianca: 0 } as never);
+      .spyOn(parseReceiptMod.parseReceiptTool, 'handler')
+      .mockResolvedValue({ tipo: 'pix', confianca: 0 } as never);
     const { receiptValidateTool } = await import('../../../src/tools/receipt-validate.js');
     const out = await receiptValidateTool.handler(
       { media_local_path: '/tmp/z.jpg', file_sha256: 'ghi' } as never,
       ctx,
     );
     expect(out.valid).toBe(false);
-    expect(out.warnings).toContain('amount_not_identified');
-    expect(out.warnings).toContain('authenticity_unverified');
+    expect(out.reasons).toContain('missing_amount');
+    expect(out.reasons).toContain('missing_recipient_identification');
+    expect(out.authenticity).not.toBe('plausible');
     spy.mockRestore();
   });
 });
 
 describe('boleto read/analysis tools — callable with conservative defaults', () => {
-  it('bank_account_validate flags missing fields and normalizes a valid PIX', async () => {
+  it('bank_account_validate flags missing fields and validates a complete PIX', async () => {
     const { bankAccountValidateTool } = await import('../../../src/tools/bank-account-validate.js');
     expect(bankAccountValidateTool.side_effect).toBe('read');
-    const invalid = await bankAccountValidateTool.handler({} as never, ctx);
+    const invalid = await bankAccountValidateTool.handler({ method: 'bank_transfer' } as never, ctx);
     expect(invalid.valid).toBe(false);
     expect(invalid.missing_fields.length).toBeGreaterThan(0);
 
     const valid = await bankAccountValidateTool.handler(
-      { pix_key: 'a@b.com', holder_name: 'ACME' } as never,
+      { method: 'pix', pix_key: 'a@b.com' } as never,
       ctx,
     );
     expect(valid.valid).toBe(true);
-    expect(valid.normalized?.method).toBe('pix');
+    expect(valid.method).toBe('pix');
   });
 
-  it('case_risk_classify defaults to low/allow (never fabricates risk)', async () => {
+  it('case_risk_classify declares a classification-only contract (no fabricated enum)', async () => {
+    // The composed scoring behavior (delegates to classifyTurnRisk, never
+    // downgrades) is covered deterministically in boleto-adapters.spec.ts, where
+    // the risk gate is stubbed. Here we only assert the registry contract so this
+    // spec stays free of LLM collateral.
     const { caseRiskClassifyTool } = await import('../../../src/tools/case-risk-classify.js');
     expect(caseRiskClassifyTool.side_effect).toBe('none');
-    const out = await caseRiskClassifyTool.handler({} as never, ctx);
-    expect(out.risk_level).toBe('low');
-    expect(out.recommended_policy_action).toBe('allow');
+    expect(caseRiskClassifyTool.operation_type).toBe('read');
   });
 
   it('legal_intent_detect defaults to no legal intent', async () => {
