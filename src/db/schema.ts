@@ -1829,6 +1829,17 @@ export const roles = pgTable(
     display_name: text('display_name').notNull(),
     description: text('description'),
     prompt_addendum: text('prompt_addendum'),
+    // Issue #415 — role → tool-pack axis (capability-taxonomy.md §5). A role
+    // GRANTS domain tool packs on top of the universal baseline; it still owns
+    // nothing executable. These are pack ids (strings) from `src/tools/packs.ts`
+    // (#408), referenced BY STRING exactly like `agent_tool_grants.granted_packs`
+    // — the same union model. `baseline.core` is ALWAYS unioned in at runtime, so
+    // a role lists only what it ADDS (a role does NOT re-declare baseline). The
+    // effective visible tools are `agent grant ∩ active-role packs ∩ skill scope
+    // ∩ …` (taxonomy §2 step 7); this column supplies the "active-role packs"
+    // factor. The pack ids referenced here are DEFINED by #416 — they may not
+    // resolve to a real pack until that lands; the reference is a string contract.
+    granted_packs: text('granted_packs').array().notNull().default(sql`'{}'::text[]`),
     active: boolean('active').notNull().default(true),
     is_default: boolean('is_default').notNull().default(false),
     metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
@@ -2354,6 +2365,17 @@ export const skills = pgTable(
     allowed_tools: text('allowed_tools').array().notNull().default(sql`'{}'::text[]`),
     policy_descriptors: text('policy_descriptors').array().notNull().default(sql`'{}'::text[]`),
 
+    // Issue #415 — role → skill axis (`applicable_to_role`, capability-taxonomy.md
+    // §5). The role keys (from `roles.role_key`) for which this skill is in scope.
+    // EMPTY = applies regardless of active role (the existing/baseline behaviour —
+    // a baseline skill is universal). When non-empty, the SkillSelector keeps this
+    // candidate ONLY when the turn's active role is one of these keys
+    // (`selector(intent) ∩ applicable_to_role`, taxonomy §2 step 5). This is a
+    // SCOPING declaration, NOT an authorization: it can only ever REMOVE a
+    // candidate, never grant one — execution is still gated by policy + the
+    // dispatcher. A skill never owns confirmation/write rules (taxonomy §3, §7).
+    applicable_to_role: text('applicable_to_role').array().notNull().default(sql`'{}'::text[]`),
+
     success_criteria: jsonb('success_criteria').notNull().default(sql`'[]'::jsonb`),
     failure_modes: jsonb('failure_modes').notNull().default(sql`'[]'::jsonb`),
 
@@ -2445,6 +2467,12 @@ export interface SkillContract {
   output_schema: Record<string, unknown>;
   allowed_tools?: string[];
   policy_descriptors?: string[];
+  /**
+   * Issue #415 — role → skill axis (`applicable_to_role`). Role keys for which
+   * this skill is in scope; EMPTY = applies regardless of active role. A
+   * SCOPING declaration only (taxonomy §5) — never an authorization.
+   */
+  applicable_to_role?: string[];
   success_criteria?: Array<Record<string, unknown>>;
   failure_modes?: Array<Record<string, unknown>>;
   runtime_hints?: SkillRuntimeHints;

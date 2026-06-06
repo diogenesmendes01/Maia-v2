@@ -829,6 +829,12 @@ async function runAgentForMensagemInner(
       agent_id: getCurrentAgent(),
       channel_id,
       active_procedure_execution_id: activeExecution?.id ?? null,
+      // Issue #415/#416 — thread the resolved active operational role key
+      // (`decided_role.role_key`, set above from the role-selector chain) so the
+      // Decision Engine's SkillSelector applies the role → skill scope
+      // (`applicable_to_role`). No role resolved ⇒ omitted (role-agnostic turn;
+      // role-bound skills are not selected — fail-closed).
+      ...(activeRole ? { active_role_key: activeRole.role_key } : {}),
       // Issue #409 — feed the resolved audience so the Decision Engine's
       // SkillSelector candidate filter admits/removes skills by audience.
       ...(audienceContext

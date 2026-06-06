@@ -34,6 +34,14 @@ export interface BuildBaseContextInput {
    * remains the fail-closed backstop).
    */
   audience?: { audience_type: AudienceType; trust_level: TrustLevel } | null;
+  /**
+   * Issue #415/#416 — the turn's resolved active operational role key
+   * (`decided_role.role_key` from the role-selector chain). When provided it is
+   * carried onto `base.active_role_key` so the Decision Engine can apply the
+   * role → skill scope (`applicable_to_role`). Absent ⇒ role-agnostic turn;
+   * role-bound skills are not selected downstream (fail-closed).
+   */
+  active_role_key?: string;
 }
 
 /**
@@ -52,6 +60,7 @@ export function buildBaseContextPacketFromTurn(
     channel_id,
     active_procedure_execution_id,
     audience,
+    active_role_key,
   } = input;
 
   const channelId = channel_id ?? 'default';
@@ -97,6 +106,9 @@ export function buildBaseContextPacketFromTurn(
       received_at: receivedAt,
     },
     active_procedure_execution_id,
+    // Issue #415/#416 — only set when a role was resolved; absent keeps the
+    // packet role-agnostic (fail-closed: role-bound skills not selected).
+    ...(active_role_key !== undefined ? { active_role_key } : {}),
     feature_flags_snapshot,
     entered_at_ms: Date.now(),
     // Fail-open default: 0 sensitive memories. The real count is provided by

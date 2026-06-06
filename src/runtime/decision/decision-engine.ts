@@ -268,6 +268,18 @@ export class DecisionEngine {
       if (audience) {
         skillOptions.audience = audience;
       }
+      // Issue #415/#416 — role → skill scope (`applicable_to_role`,
+      // capability-taxonomy §2 step 5). Thread the turn's active operational role
+      // (resolved by the role-selector chain in `src/cognition/role-selector/` and
+      // carried on the BaseContextPacket as `active_role_key`) into the
+      // SkillSelector: a skill that declares a non-empty `applicable_to_role` is a
+      // candidate ONLY when this key is one of them. Absent (role-agnostic / legacy
+      // turn) ⇒ the option is left unset and role-bound skills are not selected via
+      // this path (fail-closed); the selector's `filterByApplicableRole` is the
+      // authoritative scope point.
+      if (input.base.active_role_key !== undefined) {
+        skillOptions.active_role_key = input.base.active_role_key;
+      }
       const skill = await runStep('skill', () =>
         this.deps.skillSelector.select(input.base, intent, skillOptions),
       );
