@@ -131,7 +131,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   },
   {
     "name": "bank_account_validate",
-    "description": "Verifica se os dados bancários para reembolso estão completos e consistentes (PIX ou banco/agência/conta + titular). Retorna valid/invalid, campos faltantes, alertas e dados normalizados. Apenas leitura — não persiste nada.",
+    "description": "Valida localmente se os dados bancários de reembolso estão completos e consistentes (campos obrigatórios para PIX vs transferência, checksum de CPF/CNPJ via lib compartilhada). Apenas validação estrutural — sem integração bancária externa e sem executar nada.",
     "side_effect": "read",
     "operation_type": "read",
     "sensitive": false,
@@ -139,28 +139,43 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     "required_actions": [],
     "inputs": [
       {
+        "name": "method",
+        "type": "enum(pix|bank_transfer)",
+        "optional": false
+      },
+      {
         "name": "pix_key",
         "type": "string",
         "optional": true
       },
       {
-        "name": "bank",
+        "name": "pix_key_type",
+        "type": "enum(cpf|cnpj|email|phone|evp|unknown)",
+        "optional": true
+      },
+      {
+        "name": "bank_code",
         "type": "string",
         "optional": true
       },
       {
-        "name": "branch",
+        "name": "bank_name",
         "type": "string",
         "optional": true
       },
       {
-        "name": "account",
+        "name": "agency",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "account_number",
         "type": "string",
         "optional": true
       },
       {
         "name": "account_type",
-        "type": "enum(corrente|poupanca|pagamento)",
+        "type": "string",
         "optional": true
       },
       {
@@ -463,7 +478,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   },
   {
     "name": "case_risk_classify",
-    "description": "Classifica o nível de risco operacional do caso (baixo/médio/alto) a partir da mensagem, histórico e contexto da empresa/pagamento/reembolso/documento. Retorna motivos e ação de policy recomendada. Apenas análise — não bloqueia nem escala por si.",
+    "description": "Classifica o risco operacional de um caso de proposta de boleto (low/medium/high/critical) compondo o scorer de risco compartilhado, e recomenda uma ação de política (allow/confirm/block/escalate). Apenas classifica — não decide nem sobrepõe política.",
     "side_effect": "none",
     "operation_type": "read",
     "sensitive": false,
@@ -482,22 +497,27 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
       },
       {
         "name": "company_context",
-        "type": "string",
+        "type": "unknown",
         "optional": true
       },
       {
         "name": "payment_context",
-        "type": "string",
+        "type": "unknown",
         "optional": true
       },
       {
         "name": "refund_context",
-        "type": "string",
+        "type": "unknown",
         "optional": true
       },
       {
         "name": "document_context",
-        "type": "string",
+        "type": "unknown",
+        "optional": true
+      },
+      {
+        "name": "legal_intent",
+        "type": "boolean",
         "optional": true
       }
     ]
@@ -617,7 +637,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   },
   {
     "name": "company_identity_resolver",
-    "description": "Resolve uma identidade de empresa incompleta/informal (nome fantasia, apelido, nome de sócio, texto livre do cliente) em um candidato concreto ANTES da busca formal. Distinta de company_search: desambigua e decide se precisa confirmação. Apenas leitura.",
+    "description": "Resolve a identidade informal/ambígua de uma empresa (contraparte) a partir de nome parcial, nome fantasia, razão social, sócio, CNPJ ou texto livre, antes da busca formal. CNPJ exato tem prioridade sobre nome; resultado ambíguo pede confirmação. Apenas leitura, escopo tenant/agente.",
     "side_effect": "read",
     "operation_type": "read",
     "sensitive": false,
@@ -635,12 +655,12 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
         "optional": true
       },
       {
-        "name": "partial_legal_name",
+        "name": "legal_name",
         "type": "string",
         "optional": true
       },
       {
-        "name": "partner_name",
+        "name": "partner_or_owner_name",
         "type": "string",
         "optional": true
       },
@@ -655,7 +675,17 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
         "optional": true
       },
       {
-        "name": "conversation_context",
+        "name": "conversation_id",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "previous_context",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "cnpj",
         "type": "string",
         "optional": true
       }
@@ -663,7 +693,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   },
   {
     "name": "company_search",
-    "description": "Localiza uma empresa por identificador resolvido (CNPJ, id, razão social, nome fantasia ou sócio) e retorna dados cadastrais, status e identificadores internos. Apenas leitura.",
+    "description": "Busca formal de empresa (contraparte) por company_id, CNPJ, razão social, nome fantasia ou sócio. Prioriza company_id e CNPJ exatos antes de busca textual. Apenas leitura, escopo tenant/agente.",
     "side_effect": "read",
     "operation_type": "read",
     "sensitive": false,
@@ -671,12 +701,12 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     "required_actions": [],
     "inputs": [
       {
-        "name": "cnpj",
+        "name": "company_id",
         "type": "string",
         "optional": true
       },
       {
-        "name": "company_id",
+        "name": "cnpj",
         "type": "string",
         "optional": true
       },
@@ -691,7 +721,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
         "optional": true
       },
       {
-        "name": "partner_name",
+        "name": "partner_or_owner_name",
         "type": "string",
         "optional": true
       }
@@ -727,7 +757,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   },
   {
     "name": "conversation_attachment_lookup",
-    "description": "Recupera arquivos enviados durante o atendimento (por conversa, protocolo ou dica/tipo de anexo) e retorna a lista de anexos com metadados e referências recuperáveis. Apenas leitura.",
+    "description": "Lista os arquivos (imagens, PDFs, áudios, documentos) já enviados nesta conversa, lendo os metadados de mídia das mensagens. Não baixa nem rebaixa mídia do WhatsApp. Apenas leitura, escopo tenant/agente/conversa.",
     "side_effect": "read",
     "operation_type": "read",
     "sensitive": false,
@@ -745,13 +775,18 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
         "optional": true
       },
       {
-        "name": "attachment_type",
-        "type": "string",
+        "name": "attachment_hints",
+        "type": "string[]",
         "optional": true
       },
       {
-        "name": "attachment_hint",
-        "type": "string",
+        "name": "attachment_type",
+        "type": "enum(image|pdf|audio|document|unknown)",
+        "optional": true
+      },
+      {
+        "name": "limit",
+        "type": "number",
         "optional": true
       }
     ]
@@ -810,7 +845,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   },
   {
     "name": "conversation_summary_generate",
-    "description": "Gera um resumo operacional curto do atendimento: resumo estruturado, principais ações, pendências e motivo de escalação quando aplicável. Apenas análise do contexto fornecido, sem efeito colateral.",
+    "description": "Gera um resumo operacional curto do atendimento (resumo, ações principais e pendências), reaproveitando o sumarizador compartilhado. Apenas leitura — não persiste nem encerra a conversa.",
     "side_effect": "none",
     "operation_type": "read",
     "sensitive": false,
@@ -818,13 +853,28 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     "required_actions": [],
     "inputs": [
       {
-        "name": "conversation_history",
+        "name": "conversation_id",
         "type": "string",
         "optional": true
       },
       {
+        "name": "history",
+        "type": "object[]",
+        "optional": true
+      },
+      {
         "name": "selected_context",
-        "type": "string",
+        "type": "unknown",
+        "optional": true
+      },
+      {
+        "name": "max_chars",
+        "type": "number",
+        "optional": true
+      },
+      {
+        "name": "limit",
+        "type": "number",
         "optional": true
       }
     ]
@@ -978,7 +1028,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   },
   {
     "name": "legal_intent_detect",
-    "description": "Detecta ameaças jurídicas, pedidos legais formais ou solicitações do departamento jurídico na mensagem e no contexto. Apenas análise — reporta o sinal; bloqueio/escalação é decisão de policy.",
+    "description": "Detecta intenção jurídica em mensagens do cliente (advogado, departamento jurídico, processo, ação judicial, reclamação formal, Procon/CDC, notificação) por regras léxicas determinísticas. Apenas sinaliza para risco/política — não dá orientação jurídica nem escala sozinho.",
     "side_effect": "none",
     "operation_type": "read",
     "sensitive": false,
@@ -991,7 +1041,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
         "optional": false
       },
       {
-        "name": "conversation_context",
+        "name": "recent_context",
         "type": "string",
         "optional": true
       }
@@ -1493,7 +1543,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   },
   {
     "name": "receipt_validate",
-    "description": "Analisa um comprovante enviado pelo cliente (valor, data, pagador/recebedor) e faz validação básica de autenticidade. REUTILIZA os parsers parse_receipt/parse_image — não é um novo OCR. Apenas leitura.",
+    "description": "Valida um comprovante de pagamento enviado pelo cliente e normaliza sinais operacionais (valor, data, beneficiário, autenticidade) para fluxos de pagamento/reembolso. Delega o OCR para parse_receipt (reuso de cache de visão) — não chama o modelo de visão diretamente. FAIL-CLOSED: só é válido com autenticidade positiva e campos essenciais; nunca aprova reembolso.",
     "side_effect": "read",
     "operation_type": "parse_only",
     "sensitive": false,
@@ -1505,16 +1555,26 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
       {
         "name": "media_local_path",
         "type": "string",
-        "optional": false
+        "optional": true
       },
       {
         "name": "file_sha256",
         "type": "string",
-        "optional": false
+        "optional": true
       },
       {
-        "name": "attachment_kind",
-        "type": "enum(image|pdf|attachment_ref)",
+        "name": "conversation_id",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "attachment_ref",
+        "type": "string",
+        "optional": true
+      },
+      {
+        "name": "attachment_hint",
+        "type": "string",
         "optional": true
       }
     ]
