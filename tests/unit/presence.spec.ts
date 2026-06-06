@@ -1,26 +1,72 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-const readMessages = vi.fn().mockResolvedValue(undefined);
-const sendPresenceUpdate = vi.fn().mockResolvedValue(undefined);
-const sendMessage = vi.fn().mockResolvedValue(undefined);
+// presence.ts pulls in three collaborators: the env config (FEATURE_PRESENCE /
+// FEATURE_ONE_TAP), the logger, and the Baileys gateway (isBaileysConnected /
+// getSocket). They are mocked ONCE here, at the top level, and their behaviour
+// is driven by the mutable `state` object below.
+//
+// This file used to toggle behaviour per test with `vi.resetModules()` +
+// `vi.doMock(...)`. That pattern is order- and timing-dependent: `vi.doMock`
+// registrations and the module cache leak across tests, so (a) a test that does
+// NOT re-mock can reuse a polluted cached module and (b) two competing
+// `doMock`s for the same path (one in a `beforeEach`, one in the test body) do
+// not deterministically override which one a later `await import()` resolves.
+// The shared spy then flaked: the "Baileys disconnected" startTyping test
+// intermittently resolved the *connected* mock and emitted composing/paused
+// (the CI failure on node 26), and under shuffled ordering the markRead test
+// resolved a disabled mock and skipped its call. The calls are synchronous, so
+// this was never a late-timer race — it was nondeterministic mock resolution.
+//
+// A single stable mock whose functions read the live `state` at call time makes
+// every test deterministic regardless of test order or Node version. We keep
+// `vi.resetModules()` in `beforeEach` purely for a fresh `handles` map per test;
+// the top-level mocks survive `resetModules`, so dependency resolution stays
+// fixed.
+const { readMessages, sendPresenceUpdate, sendMessage, socket, state } = vi.hoisted(() => {
+  const readMessages = vi.fn();
+  const sendPresenceUpdate = vi.fn();
+  const sendMessage = vi.fn();
+  return {
+    readMessages,
+    sendPresenceUpdate,
+    sendMessage,
+    socket: { readMessages, sendPresenceUpdate, sendMessage },
+    state: { featurePresence: true, featureOneTap: true, connected: true },
+  };
+});
 
-vi.mock('../../src/gateway/baileys.js', () => ({
-  isBaileysConnected: () => true,
-  getSocket: () => ({ readMessages, sendPresenceUpdate, sendMessage }),
+vi.mock('../../src/config/env.js', () => ({
+  config: {
+    get FEATURE_PRESENCE() {
+      return state.featurePresence;
+    },
+    get FEATURE_ONE_TAP() {
+      return state.featureOneTap;
+    },
+  },
 }));
 
 vi.mock('../../src/lib/logger.js', () => ({
   logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-vi.mock('../../src/config/env.js', () => ({
-  config: { FEATURE_PRESENCE: true },
+vi.mock('../../src/gateway/baileys.js', () => ({
+  isBaileysConnected: () => state.connected,
+  getSocket: () => (state.connected ? socket : null),
 }));
 
 beforeEach(() => {
+  // The socket calls in presence.ts chain `.catch(...)`, so the spies must
+  // return a thenable.
   readMessages.mockReset().mockResolvedValue(undefined);
   sendPresenceUpdate.mockReset().mockResolvedValue(undefined);
   sendMessage.mockReset().mockResolvedValue(undefined);
+  state.featurePresence = true;
+  state.featureOneTap = true;
+  state.connected = true;
+  // Fresh module instance per test ⇒ a clean `handles` map and no typing
+  // intervals left over from a prior test.
+  vi.resetModules();
 });
 
 describe('presence — markRead', () => {
@@ -34,15 +80,7 @@ describe('presence — markRead', () => {
   });
 
   it('is a no-op when FEATURE_PRESENCE is false', async () => {
-    vi.resetModules();
-    vi.doMock('../../src/config/env.js', () => ({ config: { FEATURE_PRESENCE: false } }));
-    vi.doMock('../../src/lib/logger.js', () => ({
-      logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() },
-    }));
-    vi.doMock('../../src/gateway/baileys.js', () => ({
-      isBaileysConnected: () => true,
-      getSocket: () => ({ readMessages, sendPresenceUpdate, sendMessage }),
-    }));
+    state.featurePresence = false;
     const { markRead } = await import('../../src/gateway/presence.js');
     markRead('jid', 'id');
     await new Promise((r) => setImmediate(r));
@@ -50,15 +88,7 @@ describe('presence — markRead', () => {
   });
 
   it('is a no-op when Baileys is disconnected', async () => {
-    vi.resetModules();
-    vi.doMock('../../src/config/env.js', () => ({ config: { FEATURE_PRESENCE: true } }));
-    vi.doMock('../../src/lib/logger.js', () => ({
-      logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() },
-    }));
-    vi.doMock('../../src/gateway/baileys.js', () => ({
-      isBaileysConnected: () => false,
-      getSocket: () => null,
-    }));
+    state.connected = false;
     const { markRead } = await import('../../src/gateway/presence.js');
     markRead('jid', 'id');
     await new Promise((r) => setImmediate(r));
@@ -67,18 +97,6 @@ describe('presence — markRead', () => {
 });
 
 describe('presence — startTyping', () => {
-  beforeEach(() => {
-    vi.resetModules();
-    vi.doMock('../../src/config/env.js', () => ({ config: { FEATURE_PRESENCE: true } }));
-    vi.doMock('../../src/lib/logger.js', () => ({
-      logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() },
-    }));
-    vi.doMock('../../src/gateway/baileys.js', () => ({
-      isBaileysConnected: () => true,
-      getSocket: () => ({ readMessages, sendPresenceUpdate, sendMessage }),
-    }));
-  });
-
   it('emits "composing" once on start and "paused" on stop', async () => {
     const { startTyping } = await import('../../src/gateway/presence.js');
     const jid = '5511999998881@s.whatsapp.net';
@@ -110,15 +128,7 @@ describe('presence — startTyping', () => {
   });
 
   it('returns no-op handle when FEATURE_PRESENCE is false', async () => {
-    vi.resetModules();
-    vi.doMock('../../src/config/env.js', () => ({ config: { FEATURE_PRESENCE: false } }));
-    vi.doMock('../../src/lib/logger.js', () => ({
-      logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() },
-    }));
-    vi.doMock('../../src/gateway/baileys.js', () => ({
-      isBaileysConnected: () => true,
-      getSocket: () => ({ readMessages, sendPresenceUpdate, sendMessage }),
-    }));
+    state.featurePresence = false;
     const { startTyping } = await import('../../src/gateway/presence.js');
     const handle = startTyping('jid', 'm1');
     handle.stop();
@@ -126,15 +136,7 @@ describe('presence — startTyping', () => {
   });
 
   it('returns no-op handle when Baileys is disconnected', async () => {
-    vi.resetModules();
-    vi.doMock('../../src/config/env.js', () => ({ config: { FEATURE_PRESENCE: true } }));
-    vi.doMock('../../src/lib/logger.js', () => ({
-      logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() },
-    }));
-    vi.doMock('../../src/gateway/baileys.js', () => ({
-      isBaileysConnected: () => false,
-      getSocket: () => null,
-    }));
+    state.connected = false;
     const { startTyping } = await import('../../src/gateway/presence.js');
     const handle = startTyping('5511999@s.whatsapp.net', 'inbound-disconnected');
     handle.stop();
@@ -144,18 +146,6 @@ describe('presence — startTyping', () => {
 });
 
 describe('presence — JID validation', () => {
-  beforeEach(() => {
-    vi.resetModules();
-    vi.doMock('../../src/config/env.js', () => ({ config: { FEATURE_PRESENCE: true } }));
-    vi.doMock('../../src/lib/logger.js', () => ({
-      logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() },
-    }));
-    vi.doMock('../../src/gateway/baileys.js', () => ({
-      isBaileysConnected: () => true,
-      getSocket: () => ({ readMessages, sendPresenceUpdate, sendMessage }),
-    }));
-  });
-
   it('validJid accepts canonical individual and group JIDs', async () => {
     const { _internal } = await import('../../src/gateway/presence.js');
     expect(_internal.validJid('5511999998888@s.whatsapp.net')).toBe(true);
@@ -202,15 +192,6 @@ describe('presence — JID validation', () => {
 describe('presence — leak safety', () => {
   beforeEach(() => {
     vi.useFakeTimers();
-    vi.resetModules();
-    vi.doMock('../../src/config/env.js', () => ({ config: { FEATURE_PRESENCE: true } }));
-    vi.doMock('../../src/lib/logger.js', () => ({
-      logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() },
-    }));
-    vi.doMock('../../src/gateway/baileys.js', () => ({
-      isBaileysConnected: () => true,
-      getSocket: () => ({ readMessages, sendPresenceUpdate, sendMessage }),
-    }));
   });
   afterEach(() => vi.useRealTimers());
 
@@ -226,18 +207,6 @@ describe('presence — leak safety', () => {
 });
 
 describe('presence — sendReaction', () => {
-  beforeEach(() => {
-    vi.resetModules();
-    vi.doMock('../../src/config/env.js', () => ({ config: { FEATURE_PRESENCE: true } }));
-    vi.doMock('../../src/lib/logger.js', () => ({
-      logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() },
-    }));
-    vi.doMock('../../src/gateway/baileys.js', () => ({
-      isBaileysConnected: () => true,
-      getSocket: () => ({ readMessages, sendPresenceUpdate, sendMessage }),
-    }));
-  });
-
   it('sends a react payload anchored to (remote_jid, whatsapp_id)', async () => {
     const { sendReaction } = await import('../../src/gateway/presence.js');
     const jid = '5511999998885@s.whatsapp.net';
@@ -249,15 +218,7 @@ describe('presence — sendReaction', () => {
   });
 
   it('no-op when disconnected', async () => {
-    vi.resetModules();
-    vi.doMock('../../src/config/env.js', () => ({ config: { FEATURE_PRESENCE: true } }));
-    vi.doMock('../../src/lib/logger.js', () => ({
-      logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() },
-    }));
-    vi.doMock('../../src/gateway/baileys.js', () => ({
-      isBaileysConnected: () => false,
-      getSocket: () => null,
-    }));
+    state.connected = false;
     const { sendReaction } = await import('../../src/gateway/presence.js');
     sendReaction('jid', 'id', '✅');
     await new Promise((r) => setImmediate(r));
