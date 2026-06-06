@@ -486,6 +486,29 @@ export interface SkillToolScope {
 }
 
 /**
+ * `RoleToolScope` (issue #437 / capability-taxonomy §5) — the ACTIVE operational
+ * role's tool-pack grant (`roles.granted_packs`). A role GRANTS domain packs on
+ * top of the universal baseline; it owns nothing executable. This is the
+ * "active-role packs" factor of the visibility intersection (taxonomy §2 step 7:
+ * `agent grant ∩ active-role packs ∩ skill scope`), supplied alongside the agent
+ * grant + skill scope to `computeAgentVisibleTools`.
+ *
+ *   - `granted_packs`: pack ids (same union model as `agent_tool_grants`). When
+ *     NON-EMPTY, the visible set is intersected with the tools those packs grant
+ *     (∪ `baseline.core`, which a role never re-declares and must never lose).
+ *   - EMPTY/absent `granted_packs` ⇒ the role does NOT narrow (a role that adds
+ *     no packs imposes no restriction — most roles default to `'{}'`). Only a
+ *     role that actually grants packs limits the set.
+ *
+ * Like every other axis here, it can only REMOVE a tool from the agent-visible
+ * set, never authorize one (it is intersected with the agent grant).
+ */
+export interface RoleToolScope {
+  role_key?: string;
+  granted_packs?: readonly string[];
+}
+
+/**
  * Resolve the AGENT-granted tool set: `baseline.core ∪ packs ∪ tools − denied`.
  * `denied_tools` wins over everything (HARD). `baseline.core` is always
  * included. Unknown packs contribute nothing (`resolvePackTools` skips them).
@@ -531,12 +554,22 @@ export interface AgentVisibleToolsResult {
     denied_by_skill: string[];
     /** Tools dropped purely because a skill `allowed_tools` narrowed the set. */
     dropped_by_skill_allowlist: string[];
+    /**
+     * Issue #437 — the active role key whose `granted_packs` narrowed the set
+     * (null when no role was active or the role granted no packs).
+     */
+    active_role_key: string | null;
+    /** Pack ids the active role granted (empty when no role restriction). */
+    role_granted_packs: string[];
+    /** Tools dropped purely because the active role's packs narrowed the set. */
+    dropped_by_role: string[];
   };
 }
 
 export function computeAgentVisibleTools(
   grant: AgentToolGrant,
   skillScope?: SkillToolScope | null,
+  roleScope?: RoleToolScope | null,
 ): AgentVisibleToolsResult {
   const grantedSet = resolveGrantedToolNames(grant);
 
@@ -544,7 +577,24 @@ export function computeAgentVisibleTools(
   const skillDenied = new Set(skillScope?.denied_tools ?? []);
   const skillConfirm = skillScope?.requires_confirmation_for ?? [];
 
+  // Issue #437 — the ROLE axis (capability-taxonomy §2 step 7). The active role's
+  // `granted_packs` RESTRICT the visible set to the tools those packs grant ∪ the
+  // universal `baseline.core` floor (a role never re-declares baseline and must
+  // never lose it). Fail-closed posture (and the only safe one given roles
+  // default to an empty `granted_packs`):
+  //   - no active role (roleScope absent/null) → no role restriction;
+  //   - a role with EMPTY `granted_packs` → no role restriction (a role that adds
+  //     no packs does not narrow — otherwise every default-role agent would be
+  //     stripped to baseline);
+  //   - a role WITH packs → limit the set to its packs ∪ baseline.
+  const rolePacks = roleScope?.granted_packs ?? [];
+  const roleRestricts = rolePacks.length > 0;
+  const roleAllowed = roleRestricts
+    ? new Set<string>([...resolvePackTools(rolePacks), ...BASELINE_CORE_PACK.tools])
+    : null;
+
   const droppedByAllowlist: string[] = [];
+  const droppedByRole: string[] = [];
   const visible: string[] = [];
   for (const name of grantedSet) {
     // Skill HARD deny — never visible.
@@ -552,6 +602,13 @@ export function computeAgentVisibleTools(
     // Skill allowlist (when present) narrows the set.
     if (skillAllowed.length > 0 && !skillAllowed.includes(name)) {
       droppedByAllowlist.push(name);
+      continue;
+    }
+    // Role pack axis (when the active role grants packs) narrows the set to the
+    // role's packs ∪ baseline. A tool the agent holds but the active role's packs
+    // do not grant is hidden while this role is active.
+    if (roleAllowed && !roleAllowed.has(name)) {
+      droppedByRole.push(name);
       continue;
     }
     visible.push(name);
@@ -571,6 +628,9 @@ export function computeAgentVisibleTools(
       skill_allowed_tools: [...skillAllowed],
       denied_by_skill: [...(skillScope?.denied_tools ?? [])],
       dropped_by_skill_allowlist: droppedByAllowlist,
+      active_role_key: roleRestricts ? roleScope?.role_key ?? null : null,
+      role_granted_packs: [...rolePacks],
+      dropped_by_role: droppedByRole,
     },
   };
 }

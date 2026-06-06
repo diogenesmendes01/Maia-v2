@@ -813,6 +813,11 @@ async function runAgentForMensagemInner(
   // (`applyToolReductions`); the audience/data_scope/risk layer is #409.
   const visibility = await computeRuntimeVisibleTools({
     byEntity: scope.byEntity,
+    // Issue #437 — thread the resolved active operational role so its
+    // `granted_packs` (roles.granted_packs) narrow the LLM-visible tool set
+    // (capability-taxonomy §2 step 7: agent grant ∩ active-role packs ∩ skill
+    // scope). Absent ⇒ no role narrowing (role-agnostic / legacy turn).
+    ...(activeRole ? { activeRoleKey: activeRole.role_key } : {}),
     audit_context: { pessoa_id: pessoa.id, conversa_id: c.id, mensagem_id: inbound.id },
   });
   let tools = visibility.tools;
