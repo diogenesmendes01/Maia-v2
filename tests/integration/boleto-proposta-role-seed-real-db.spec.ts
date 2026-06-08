@@ -9,8 +9,8 @@
  *     `status='active'`, `proposed_by='system'`, v1), each scoped to the role via
  *     `applicable_to_role` (role → skill axis);
  *   - the seed is IDEMPOTENT (re-running 079 creates no duplicates);
- *   - tenant isolation: the seed is scoped to tenant 'default' and the skills
- *     repo never surfaces these skills for a DIFFERENT tenant.
+ *   - tenant isolation: the seed (re-homed to 'primary' by issue #323's migration
+ *     081) never surfaces these skills for a DIFFERENT tenant.
  *
  * ---------------------------------------------------------------------------
  * RUNTIME REQUIREMENT — DOCKER DAEMON. Mirrors
@@ -42,8 +42,14 @@ let previousDatabaseUrl: string | undefined;
 const SHOULD_RUN = await isDockerAvailable();
 const d = SHOULD_RUN ? describe : describe.skip;
 
-const TENANT = 'default';
-const AGENT = 'default';
+// Migration 079 seeds the role + role-specific skills under the bootstrap tenant
+// 'default'; issue #323 re-homes both (role tenant_id+agent_id, skills tenant_id;
+// the skills are tenant-wide so their agent_id stays NULL) to the reserved
+// single-tenant home 'primary' via migration 081, then 083 deletes the legacy
+// 'default' tenant/agent. So the end-state rows this spec asserts on live under
+// 'primary'.
+const TENANT = 'primary';
+const AGENT = 'primary';
 const ROLE_KEY = 'whatsapp_boleto_proposta_attendant';
 const DISPLAY_NAME = 'Atendente de Boleto Proposta - WhatsApp';
 
@@ -177,10 +183,17 @@ d('boleto proposta role + skills seed (migration 079) — real DB', () => {
   });
 
   it('re-running migration 079 is IDEMPOTENT (no duplicate role or skill rows)', async () => {
-    const sql = await readFile(
+    const raw = await readFile(
       new URL('../../migrations/079_boleto_proposta_attendant_role_and_skills.sql', import.meta.url),
       'utf8',
     );
+    // Re-apply the forward body re-targeted to the live single-tenant home
+    // 'primary'. The verbatim body seeds tenant 'default', which 083 deleted —
+    // and `roles.tenant_id` FK-references tenants(id), so a verbatim re-run would
+    // FK-violate. The only quoted 'default' literals in 079 are the role's
+    // tenant_id/agent_id and the skills' tenant_id; rewriting them to 'primary'
+    // exercises the ON CONFLICT DO NOTHING idempotency against the rehomed rows.
+    const sql = raw.replaceAll("'default'", "'primary'");
     await pg.pool.query(sql);
 
     const role = await pg.pool.query<{ count: string }>(
@@ -196,7 +209,7 @@ d('boleto proposta role + skills seed (migration 079) — real DB', () => {
     expect(Number(skillsCount.rows[0]!.count)).toBe(SKILL_KEYS.length);
   });
 
-  it('the role-specific skills are VISIBLE to the selector for the default agent', async () => {
+  it('the role-specific skills are VISIBLE to the selector for the primary agent', async () => {
     await tenantContextMod.runWithTenantContext(
       { tenant_id: TENANT, agent_id: AGENT },
       async () => {

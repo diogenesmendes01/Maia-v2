@@ -184,4 +184,8 @@ NEW shared prefixes — pick `max(existing)+1`.
 078 | 078_boleto_write_risk_policies.sql | boleto proposal tools packs and write policies (issue 416)
 079 | 079_boleto_proposta_attendant_role_and_skills.sql | whatsapp boleto proposta attendant role and skills (issue 415)
 080 | 080_baseline_skills_v2.sql | baseline skills v2 tool_mediated conversions and 3 new skills (issue 448)
-081 | 081_calendar_default_pack.sql | calendar as default pack — backfill existing grants
+081 | 081_seed_primary_tenant.sql | seed reserved primary tenant/agent single-tenant home (issue 323)
+082 | 082_rehome_default_to_primary.sql | rehome runtime data default to primary (issue 323)
+083 | 083_drop_default_column_default.sql | drop DEFAULT default column-default fail-closed (issue 323)
+084 | 084_delete_default_tenant.sql | delete legacy default tenant and agent (issue 323)
+085 | 085_calendar_default_pack.sql | calendar as default pack — backfill existing grants

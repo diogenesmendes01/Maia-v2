@@ -51,7 +51,8 @@ const noFlags: FeatureFlagsPort = {
 describe('issue #282 — no production path produces tenant_id === "default"', () => {
   beforeEach(() => {
     incCounterMock.mockReset();
-    delete process.env.MAIA_REJECT_DEFAULT_LITERAL;
+    // Test baseline OFF (issue #323 opt-out); the ON cases below set ='true'.
+    process.env.MAIA_REJECT_DEFAULT_LITERAL = 'false';
   });
 
   it('builder with no DI throws — does NOT silently emit default/default', async () => {

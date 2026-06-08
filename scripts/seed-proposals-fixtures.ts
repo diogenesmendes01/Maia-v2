@@ -71,7 +71,9 @@ async function main() {
       .values({
         id: p.id,
         tenant_id: tenantId,
-        agent_id: 'default',
+        // issue #323: the 'default' agent was eliminated; reference the reserved
+        // 'primary' agent (the only seeded agent post-migration).
+        agent_id: 'primary',
         capability_type: p.capability_type,
         title: p.title,
         description: p.description,

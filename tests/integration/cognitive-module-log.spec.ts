@@ -13,10 +13,10 @@ const d = SHOULD_RUN ? describe : describe.skip;
 
 d('cognitive_module_log smoke', () => {
   it('aceita insert de evento de reflection', async () => {
-    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+    await runWithTenantContext({ tenant_id: 'primary', agent_id: 'primary' }, async () => {
       await cognitiveModuleLogRepo.record({
-        tenant_id: 'default',
-        agent_id: 'default',
+        tenant_id: 'primary',
+        agent_id: 'primary',
         conversa_id: null,
         turno_id: null,
         module_name: 'reflection.test',

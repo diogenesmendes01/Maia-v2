@@ -72,7 +72,7 @@ vi.mock('qrcode-terminal', () => ({ default: { generate: vi.fn() } }));
 // dispatcher (rather than absorbing the reaction silently). The reachability
 // fix is orthogonal to channel resolution; after #411 the resolver ALWAYS runs
 // and the single-tenant catch-all maps the stub's sender JID to the seeded
-// default/default channel — enough to prove the stub reaches the dispatcher
+// primary/primary channel — enough to prove the stub reaches the dispatcher
 // inside a tenant context.
 vi.mock('../../src/config/env.js', () => ({
   config: {
@@ -102,15 +102,15 @@ vi.mock('../../src/db/repositories.js', () => ({
     findByWhatsappIdCrossTenant: vi.fn().mockResolvedValue(null),
   },
   // #411: the resolver now always runs. Single-tenant catch-all → the seeded
-  // default/default channel for any sender (exact-match always misses).
+  // primary/primary channel for any sender (exact-match always misses).
   channelsRepo: {
     findByExternalCrossTenant: vi.fn().mockResolvedValue(null),
-    findDefaultCatchAllChannel: vi.fn().mockResolvedValue({
+    findPrimaryCatchAllChannel: vi.fn().mockResolvedValue({
       multi_tenant: false,
       channel: {
-        id: 'default-channel-uuid',
-        tenant_id: 'default',
-        agent_id: 'default',
+        id: 'primary-channel-uuid',
+        tenant_id: 'primary',
+        agent_id: 'primary',
         external_id: 'default-channel',
         channel_type: 'whatsapp',
         active: true,
@@ -194,9 +194,9 @@ describe('baileys messages.upsert — reaction stubs are reachable (PR #311 B3)'
     // Pre-fix: this dispatcher was dead code (the !msg.message guard dropped
     // the stub). Post-fix it MUST be invoked.
     expect(dispatchReactionAsAnswerMock).toHaveBeenCalledTimes(1);
-    // And it ran inside a tenant context (legacy default/default here).
-    expect(contextProbe.tenant_id).toBe('default');
-    expect(contextProbe.agent_id).toBe('default');
+    // And it ran inside a tenant context (single-tenant primary/primary here).
+    expect(contextProbe.tenant_id).toBe('primary');
+    expect(contextProbe.agent_id).toBe('primary');
     // A reaction stub is never persisted as an inbound message.
     expect(createInboundMock).not.toHaveBeenCalled();
   });

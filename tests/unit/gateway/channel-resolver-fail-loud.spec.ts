@@ -9,11 +9,11 @@
  *
  * Contrato atual (resolver puro):
  *   - Exact match ativo                       → retorna {tenant_id, agent_id, channel_id} reais.
- *   - Miss/inativo NUM runtime single-tenant   → (default, default, <default channel id>) via catch-all (#411).
+ *   - Miss/inativo NUM runtime single-tenant   → (primary, primary, <primary channel id>) via catch-all (#411).
  *   - Miss/inativo NUM deployment multi-tenant → throw TypedError('channel_resolution_failed') (#268).
  *   - Ambíguo (2+ ativos cross-tenant)         → throw (propagado do repo).
  *
- * INVARIANTE CRÍTICO PRESERVADO (#268): o fallback default/default só é
+ * INVARIANTE CRÍTICO PRESERVADO (#268): o fallback primary/primary só é
  * entregue quando o catch-all confirma que NÃO existe canal ativo de outro
  * tenant (`multi_tenant:false`). Num deployment com tenants reais
  * (`multi_tenant:true`) o resolver SEMPRE lança — jamais colapsa buckets
@@ -31,11 +31,11 @@ const findByExternalCrossTenantMock = vi.fn<
   [args: { channel_type: string; external_id: string }],
   Promise<Channel | null>
 >();
-const findDefaultCatchAllChannelMock = vi.fn();
+const findPrimaryCatchAllChannelMock = vi.fn();
 vi.mock('@/db/repositories.js', () => ({
   channelsRepo: {
     findByExternalCrossTenant: findByExternalCrossTenantMock,
-    findDefaultCatchAllChannel: findDefaultCatchAllChannelMock,
+    findPrimaryCatchAllChannel: findPrimaryCatchAllChannelMock,
   },
 }));
 
@@ -67,11 +67,11 @@ function makeChannel(overrides: Partial<Channel> = {}): Channel {
   } as Channel;
 }
 
-function makeDefaultChannel(overrides: Partial<Channel> = {}): Channel {
+function makePrimaryChannel(overrides: Partial<Channel> = {}): Channel {
   return makeChannel({
-    id: 'default-channel-uuid',
-    tenant_id: 'default',
-    agent_id: 'default',
+    id: 'primary-channel-uuid',
+    tenant_id: 'primary',
+    agent_id: 'primary',
     external_id: 'default-channel',
     ...overrides,
   });
@@ -80,7 +80,7 @@ function makeDefaultChannel(overrides: Partial<Channel> = {}): Channel {
 describe('resolveChannel — fail-loud (issue #268) + single-tenant catch-all (#411)', () => {
   beforeEach(() => {
     findByExternalCrossTenantMock.mockReset();
-    findDefaultCatchAllChannelMock.mockReset();
+    findPrimaryCatchAllChannelMock.mockReset();
     loggerWarnMock.mockReset();
   });
 
@@ -110,17 +110,17 @@ describe('resolveChannel — fail-loud (issue #268) + single-tenant catch-all (#
         channel_type: 'whatsapp',
         external_id: '5511999999999',
       });
-      expect(findDefaultCatchAllChannelMock).not.toHaveBeenCalled();
+      expect(findPrimaryCatchAllChannelMock).not.toHaveBeenCalled();
       expect(loggerWarnMock).not.toHaveBeenCalled();
     });
   });
 
   describe('single-tenant catch-all (#411)', () => {
-    it('miss + nenhum tenant real → resolve para (default, default, <default channel id>) sem warning', async () => {
+    it('miss + nenhum tenant real → resolve para (primary, primary, <primary channel id>) sem warning', async () => {
       findByExternalCrossTenantMock.mockResolvedValueOnce(null);
-      findDefaultCatchAllChannelMock.mockResolvedValueOnce({
+      findPrimaryCatchAllChannelMock.mockResolvedValueOnce({
         multi_tenant: false,
-        channel: makeDefaultChannel(),
+        channel: makePrimaryChannel(),
       });
 
       const { resolveChannel } = await import('@/gateway/channel-resolver.js');
@@ -130,11 +130,11 @@ describe('resolveChannel — fail-loud (issue #268) + single-tenant catch-all (#
       });
 
       expect(out).toEqual({
-        tenant_id: 'default',
-        agent_id: 'default',
-        channel_id: 'default-channel-uuid',
+        tenant_id: 'primary',
+        agent_id: 'primary',
+        channel_id: 'primary-channel-uuid',
       });
-      expect(findDefaultCatchAllChannelMock).toHaveBeenCalledWith({
+      expect(findPrimaryCatchAllChannelMock).toHaveBeenCalledWith({
         channel_type: 'whatsapp',
       });
       // Catch-all single-tenant NÃO é fail-loud.
@@ -144,9 +144,9 @@ describe('resolveChannel — fail-loud (issue #268) + single-tenant catch-all (#
     it('canal inativo + nenhum tenant real → ainda resolve via catch-all (mensagem não cai em DLQ)', async () => {
       // Mesmo com um canal default INATIVO no exact-match, o catch-all decide.
       findByExternalCrossTenantMock.mockResolvedValueOnce(makeChannel({ active: false }));
-      findDefaultCatchAllChannelMock.mockResolvedValueOnce({
+      findPrimaryCatchAllChannelMock.mockResolvedValueOnce({
         multi_tenant: false,
-        channel: makeDefaultChannel(),
+        channel: makePrimaryChannel(),
       });
 
       const { resolveChannel } = await import('@/gateway/channel-resolver.js');
@@ -156,9 +156,9 @@ describe('resolveChannel — fail-loud (issue #268) + single-tenant catch-all (#
       });
 
       expect(out).toEqual({
-        tenant_id: 'default',
-        agent_id: 'default',
-        channel_id: 'default-channel-uuid',
+        tenant_id: 'primary',
+        agent_id: 'primary',
+        channel_id: 'primary-channel-uuid',
       });
     });
   });
@@ -166,7 +166,7 @@ describe('resolveChannel — fail-loud (issue #268) + single-tenant catch-all (#
   describe('fail-loud — multi-tenant miss / inativo (issue #268)', () => {
     it('miss NUM deployment multi-tenant → throw com resolver_path="unknown_or_inactive_channel" + found:false', async () => {
       findByExternalCrossTenantMock.mockResolvedValueOnce(null);
-      findDefaultCatchAllChannelMock.mockResolvedValueOnce({ multi_tenant: true, channel: null });
+      findPrimaryCatchAllChannelMock.mockResolvedValueOnce({ multi_tenant: true, channel: null });
 
       const { resolveChannel } = await import('@/gateway/channel-resolver.js');
 
@@ -194,7 +194,7 @@ describe('resolveChannel — fail-loud (issue #268) + single-tenant catch-all (#
 
     it('canal INATIVO NUM deployment multi-tenant → throw com found:true, active:false', async () => {
       findByExternalCrossTenantMock.mockResolvedValueOnce(makeChannel({ active: false }));
-      findDefaultCatchAllChannelMock.mockResolvedValueOnce({ multi_tenant: true, channel: null });
+      findPrimaryCatchAllChannelMock.mockResolvedValueOnce({ multi_tenant: true, channel: null });
 
       const { resolveChannel } = await import('@/gateway/channel-resolver.js');
 
@@ -219,7 +219,7 @@ describe('resolveChannel — fail-loud (issue #268) + single-tenant catch-all (#
 
     it('miss multi-tenant → NÃO retorna default/default/null (regression guard contra o bypass do #268)', async () => {
       findByExternalCrossTenantMock.mockResolvedValueOnce(null);
-      findDefaultCatchAllChannelMock.mockResolvedValueOnce({ multi_tenant: true, channel: null });
+      findPrimaryCatchAllChannelMock.mockResolvedValueOnce({ multi_tenant: true, channel: null });
 
       const { resolveChannel } = await import('@/gateway/channel-resolver.js');
 
@@ -269,7 +269,7 @@ describe('resolveChannel — fail-loud (issue #268) + single-tenant catch-all (#
         },
       });
       // Ambiguidade aborta ANTES do catch-all — nunca colapsa em default.
-      expect(findDefaultCatchAllChannelMock).not.toHaveBeenCalled();
+      expect(findPrimaryCatchAllChannelMock).not.toHaveBeenCalled();
     });
   });
 
@@ -289,10 +289,10 @@ describe('resolveChannel — fail-loud (issue #268) + single-tenant catch-all (#
 
       for (const s of scenarios) {
         findByExternalCrossTenantMock.mockReset();
-        findDefaultCatchAllChannelMock.mockReset();
+        findPrimaryCatchAllChannelMock.mockReset();
         loggerWarnMock.mockReset();
         findByExternalCrossTenantMock.mockResolvedValueOnce(s.mockReturn);
-        findDefaultCatchAllChannelMock.mockResolvedValueOnce({ multi_tenant: true, channel: null });
+        findPrimaryCatchAllChannelMock.mockResolvedValueOnce({ multi_tenant: true, channel: null });
 
         let result: unknown = null;
         let typedErr: TypedError | null = null;

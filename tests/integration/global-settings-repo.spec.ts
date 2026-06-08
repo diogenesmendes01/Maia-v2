@@ -847,8 +847,8 @@ d('migration 062 down: backfill into agent_facts before DROP', () => {
       // Purge any pre-existing legacy rows so the test is deterministic.
       await c.query(
         `DELETE FROM agent_facts
-         WHERE tenant_id = 'default'
-           AND agent_id = 'default'
+         WHERE tenant_id = 'primary'
+           AND agent_id = 'primary'
            AND escopo = 'global'
            AND chave IN ('llm.model.main', 'llm.model.fast')`,
       );
@@ -860,7 +860,7 @@ d('migration 062 down: backfill into agent_facts before DROP', () => {
           tenant_id, agent_id, escopo, chave, valor, confianca, fonte, updated_at
         )
         SELECT
-          'default','default','global','llm.model.main',
+          'primary','primary','global','llm.model.main',
           jsonb_build_object('model', value->>'model'),
           1.00,'configurado',updated_at
         FROM global_settings
@@ -875,7 +875,7 @@ d('migration 062 down: backfill into agent_facts before DROP', () => {
           tenant_id, agent_id, escopo, chave, valor, confianca, fonte, updated_at
         )
         SELECT
-          'default','default','global','llm.model.fast',
+          'primary','primary','global','llm.model.fast',
           jsonb_build_object('model', value->>'model'),
           1.00,'configurado',updated_at
         FROM global_settings
@@ -888,14 +888,14 @@ d('migration 062 down: backfill into agent_facts before DROP', () => {
 
       const mainRow = await c.query<{ valor: { model: string } }>(
         `SELECT valor FROM agent_facts
-         WHERE tenant_id='default' AND agent_id='default'
+         WHERE tenant_id='primary' AND agent_id='primary'
            AND escopo='global' AND chave='llm.model.main'`,
       );
       expect(mainRow.rows[0]!.valor).toEqual({ model: 'claude-sonnet-4-6' });
 
       const fastRow = await c.query<{ valor: { model: string } }>(
         `SELECT valor FROM agent_facts
-         WHERE tenant_id='default' AND agent_id='default'
+         WHERE tenant_id='primary' AND agent_id='primary'
            AND escopo='global' AND chave='llm.model.fast'`,
       );
       expect(fastRow.rows[0]!.valor).toEqual({
@@ -905,8 +905,8 @@ d('migration 062 down: backfill into agent_facts before DROP', () => {
       // Cleanup our seeded legacy rows so other tests aren't affected.
       await c.query(
         `DELETE FROM agent_facts
-         WHERE tenant_id = 'default'
-           AND agent_id = 'default'
+         WHERE tenant_id = 'primary'
+           AND agent_id = 'primary'
            AND escopo = 'global'
            AND chave IN ('llm.model.main', 'llm.model.fast')`,
       );

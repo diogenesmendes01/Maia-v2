@@ -26,7 +26,7 @@ psql "$DATABASE_URL" -c "
 INSERT INTO cognitive_candidates
   (tenant_id, agent_id, source_event_type, candidate_type, payload)
 VALUES
-  ('default', 'default', 'test', 'lacuna', '{\"test\": true}');
+  ('primary', 'primary', 'test', 'lacuna', '{\"test\": true}');
 SELECT count(*) FROM cognitive_candidates WHERE source_event_type = 'test';
 DELETE FROM cognitive_candidates WHERE source_event_type = 'test';
 "

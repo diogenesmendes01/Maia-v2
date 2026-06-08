@@ -51,9 +51,9 @@ Para a feature funcionar para agentes **novos**, todos os sites de floor da §2 
 - **Column default** (`schema.ts:323`): atualizado para `'{baseline.core,domain.calendar}'` via a **mesma migration** do backfill (não dá pra referenciar a constante TS no SQL — é o único site que fica como literal SQL, coberto por teste).
 - **`resolveGrantedToolNames` fica como está** (`grant-math.ts:~518`): ela une `BASELINE_CORE_PACK.tools` incondicionalmente como floor. O calendar entra via o **grant row / fallbacks** (acima), NÃO via essa união — assim `denied_tools` e o split do `domain.calendar.admin` continuam funcionando. Não é site de repoint.
 
-### 3.3 Backfill dos existentes (migration `081_calendar_default_pack`)
-- Dois arquivos (convenção do repo): `081_*.sql` (`_up`) + `081_*_down.sql`.
-- **Reservar o prefixo `081`** em `migrations/RESERVATIONS.md` (via `npm run migrate:reserve`) — o CI guard `migration-prefix-guard.yml` reprova migration sem reserva.
+### 3.3 Backfill dos existentes (migration `085_calendar_default_pack`)
+- Dois arquivos (convenção do repo): `085_*.sql` (`_up`) + `085_*_down.sql`.
+- **Reservar o prefixo `085`** em `migrations/RESERVATIONS.md` (via `npm run migrate:reserve`) — o CI guard `migration-prefix-guard.yml` reprova migration sem reserva.
 - `_up`: (a) para cada linha de `agent_tool_grants` cujo `granted_packs` **não** contém `domain.calendar`, adiciona o pack (idempotente, respeita `denied_tools`); (b) altera o column DEFAULT de `granted_packs` para incluir `domain.calendar`.
 - `_down`: remove `domain.calendar` dos grants e reverte o column DEFAULT (conservador/reversível).
 

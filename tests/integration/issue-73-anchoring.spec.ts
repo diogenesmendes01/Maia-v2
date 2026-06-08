@@ -21,13 +21,15 @@
 import { describe, it as itRaw, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 
-// Wrap every test body in the default tenant context — every repo call in this
-// file uses applyTenantGuard, which reads getCurrentTenant() from
-// AsyncLocalStorage. Without this wrapper the first repo call throws
-// MissingTenantContextError before any assertion can run.
+// Wrap every test body in the 'primary' tenant context (issue #323 retired the
+// legacy 'default' tenant) — every repo call in this file uses applyTenantGuard,
+// which reads getCurrentTenant() from AsyncLocalStorage. Without this wrapper the
+// first repo call throws MissingTenantContextError before any assertion can run.
+// The raw-SQL fixtures below also stamp tenant_id/agent_id 'primary' explicitly,
+// since migration 082 dropped the legacy 'default' column-default.
 const it: typeof itRaw = ((name: string, fn: () => Promise<void>) =>
   itRaw(name, async () =>
-    runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, fn),
+    runWithTenantContext({ tenant_id: 'primary', agent_id: 'primary' }, fn),
   )) as unknown as typeof itRaw;
 import pg from 'pg';
 import { randomInt, randomUUID } from 'node:crypto';
@@ -77,8 +79,8 @@ const cleanupTracking = {
 async function createOwnerProfile(c: pg.PoolClient): Promise<string> {
   const profile_id = 'test-owner-' + randomInt(0, 1e9).toString(36);
   await c.query(
-    `INSERT INTO permission_profiles(id, nome, acoes, limite_default)
-     VALUES ($1, 'test owner', ARRAY['*']::text[], 1000)`,
+    `INSERT INTO permission_profiles(tenant_id, agent_id, id, nome, acoes, limite_default)
+     VALUES ('primary', 'primary', $1, 'test owner', ARRAY['*']::text[], 1000)`,
     [profile_id],
   );
   cleanupTracking.profiles.push(profile_id);
@@ -90,8 +92,8 @@ async function grantPermission(
   args: { pessoa_id: string; entidade_id: string; profile_id: string },
 ): Promise<string> {
   const r = await c.query<{ id: string }>(
-    `INSERT INTO permissoes(pessoa_id, entidade_id, papel, profile_id, status)
-     VALUES ($1, $2, 'dono', $3, 'ativa')
+    `INSERT INTO permissoes(tenant_id, agent_id, pessoa_id, entidade_id, papel, profile_id, status)
+     VALUES ('primary', 'primary', $1, $2, 'dono', $3, 'ativa')
      RETURNING id`,
     [args.pessoa_id, args.entidade_id, args.profile_id],
   );
@@ -107,9 +109,9 @@ async function insertInbound(
   const created = args.created_at?.toISOString() ?? null;
   const r = await c.query<{ id: string }>(
     `INSERT INTO mensagens(
-       conversa_id, direcao, tipo, conteudo, metadata${created ? ', created_at' : ''}
+       tenant_id, agent_id, conversa_id, direcao, tipo, conteudo, metadata${created ? ', created_at' : ''}
      )
-     VALUES ($1, 'in', 'texto', $2, jsonb_build_object('telefone', $3::text, 'whatsapp_id', $4::text)${
+     VALUES ('primary', 'primary', $1, 'in', 'texto', $2, jsonb_build_object('telefone', $3::text, 'whatsapp_id', $4::text)${
        created ? ', $5::timestamptz' : ''
      })
      RETURNING id`,
@@ -132,9 +134,9 @@ async function insertAssistantMsg(
   const created = args.created_at?.toISOString() ?? new Date().toISOString();
   const r = await c.query<{ id: string }>(
     `INSERT INTO mensagens(
-       conversa_id, direcao, tipo, conteudo, processada_em, ferramentas_chamadas, created_at
+       tenant_id, agent_id, conversa_id, direcao, tipo, conteudo, processada_em, ferramentas_chamadas, created_at
      )
-     VALUES ($1, 'out', 'texto', $2, NOW(), $3::jsonb, $4::timestamptz)
+     VALUES ('primary', 'primary', $1, 'out', 'texto', $2, NOW(), $3::jsonb, $4::timestamptz)
      RETURNING id`,
     [
       args.conversa_id,
@@ -161,20 +163,20 @@ d('issue #73 — anchoring fix: scope-change sentinel + persisted events block',
     try {
       telefone = `+551199${randomInt(0, 10_000_000).toString().padStart(7, '0')}`;
       const p = await c.query<{ id: string }>(
-        `INSERT INTO pessoas(nome, telefone_whatsapp, tipo, status)
-         VALUES ('repro-73', $1, 'dono', 'ativa')
+        `INSERT INTO pessoas(tenant_id, agent_id, nome, telefone_whatsapp, tipo, status)
+         VALUES ('primary', 'primary', 'repro-73', $1, 'dono', 'ativa')
          RETURNING id`,
         [telefone],
       );
       pessoa_id = p.rows[0]!.id;
       const conv = await c.query<{ id: string }>(
-        `INSERT INTO conversas(pessoa_id, escopo_entidades) VALUES ($1, '{}')
+        `INSERT INTO conversas(tenant_id, agent_id, pessoa_id, escopo_entidades) VALUES ('primary', 'primary', $1, '{}')
          RETURNING id`,
         [pessoa_id],
       );
       conversa_id = conv.rows[0]!.id;
       const ent = await c.query<{ id: string }>(
-        `INSERT INTO entidades(nome, tipo, status) VALUES ('PF-repro-73', 'pf', 'ativa')
+        `INSERT INTO entidades(tenant_id, agent_id, nome, tipo, status) VALUES ('primary', 'primary', 'PF-repro-73', 'pf', 'ativa')
          RETURNING id`,
       );
       entidade_id = ent.rows[0]!.id;

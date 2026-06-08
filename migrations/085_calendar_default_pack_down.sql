@@ -1,4 +1,4 @@
--- Down migration for 081_calendar_default_pack.sql
+-- Down migration for 085_calendar_default_pack.sql
 --
 -- Reverses the forward migration:
 --
@@ -22,7 +22,8 @@ UPDATE agent_tool_grants
 SET granted_packs = array_remove(granted_packs, 'domain.calendar')
 WHERE 'domain.calendar' = ANY(granted_packs);
 
--- Step 2 reversal: restore the column default to the pre-081 value
--- ({baseline.core} only, as set by migration 076).
+-- Step 2 reversal: restore the column default to the pre-085 value
+-- ({baseline.core} only, as set by migration 076; migration 083 drops only the
+-- literal 'default' tenant_id/agent_id column-defaults, never granted_packs).
 ALTER TABLE agent_tool_grants
   ALTER COLUMN granted_packs SET DEFAULT '{baseline.core}'::text[];

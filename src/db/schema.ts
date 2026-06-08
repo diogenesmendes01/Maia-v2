@@ -25,8 +25,8 @@ import { AUDIENCE_TYPES, TRUST_LEVELS } from '@/shared/audience.js';
 
 export const entidades = pgTable('entidades', {
   id: uuid('id').primaryKey().defaultRandom(),
-  tenant_id: text('tenant_id').notNull().default('default'),
-  agent_id: text('agent_id').notNull().default('default'),
+  tenant_id: text('tenant_id').notNull(),
+  agent_id: text('agent_id').notNull(),
   nome: text('nome').notNull(),
   tipo: text('tipo').notNull(),
   documento: text('documento'),
@@ -95,8 +95,8 @@ export type NewHolidayEntidade = typeof holiday_entidades.$inferInsert;
 
 export const contas_bancarias = pgTable('contas_bancarias', {
   id: uuid('id').primaryKey().defaultRandom(),
-  tenant_id: text('tenant_id').notNull().default('default'),
-  agent_id: text('agent_id').notNull().default('default'),
+  tenant_id: text('tenant_id').notNull(),
+  agent_id: text('agent_id').notNull(),
   entidade_id: uuid('entidade_id').notNull(),
   banco: text('banco').notNull(),
   agencia: text('agencia'),
@@ -112,8 +112,8 @@ export const contas_bancarias = pgTable('contas_bancarias', {
 
 export const categorias = pgTable('categorias', {
   id: uuid('id').primaryKey().defaultRandom(),
-  tenant_id: text('tenant_id').notNull().default('default'),
-  agent_id: text('agent_id').notNull().default('default'),
+  tenant_id: text('tenant_id').notNull(),
+  agent_id: text('agent_id').notNull(),
   entidade_id: uuid('entidade_id'),
   parent_id: uuid('parent_id'),
   nome: text('nome').notNull(),
@@ -125,8 +125,8 @@ export const categorias = pgTable('categorias', {
 
 export const transacoes = pgTable('transacoes', {
   id: uuid('id').primaryKey().defaultRandom(),
-  tenant_id: text('tenant_id').notNull().default('default'),
-  agent_id: text('agent_id').notNull().default('default'),
+  tenant_id: text('tenant_id').notNull(),
+  agent_id: text('agent_id').notNull(),
   entidade_id: uuid('entidade_id').notNull(),
   conta_id: uuid('conta_id').notNull(),
   categoria_id: uuid('categoria_id'),
@@ -151,8 +151,8 @@ export const transacoes = pgTable('transacoes', {
 
 export const transferencias_internas = pgTable('transferencias_internas', {
   id: uuid('id').primaryKey().defaultRandom(),
-  tenant_id: text('tenant_id').notNull().default('default'),
-  agent_id: text('agent_id').notNull().default('default'),
+  tenant_id: text('tenant_id').notNull(),
+  agent_id: text('agent_id').notNull(),
   transacao_origem_id: uuid('transacao_origem_id').notNull(),
   transacao_destino_id: uuid('transacao_destino_id').notNull(),
   tipo: text('tipo').notNull(),
@@ -162,8 +162,8 @@ export const transferencias_internas = pgTable('transferencias_internas', {
 
 export const recorrencias = pgTable('recorrencias', {
   id: uuid('id').primaryKey().defaultRandom(),
-  tenant_id: text('tenant_id').notNull().default('default'),
-  agent_id: text('agent_id').notNull().default('default'),
+  tenant_id: text('tenant_id').notNull(),
+  agent_id: text('agent_id').notNull(),
   entidade_id: uuid('entidade_id').notNull(),
   conta_id: uuid('conta_id').notNull(),
   categoria_id: uuid('categoria_id'),
@@ -180,8 +180,8 @@ export const recorrencias = pgTable('recorrencias', {
 
 export const contrapartes = pgTable('contrapartes', {
   id: uuid('id').primaryKey().defaultRandom(),
-  tenant_id: text('tenant_id').notNull().default('default'),
-  agent_id: text('agent_id').notNull().default('default'),
+  tenant_id: text('tenant_id').notNull(),
+  agent_id: text('agent_id').notNull(),
   entidade_id: uuid('entidade_id').notNull(),
   nome: text('nome').notNull(),
   tipo: text('tipo').notNull(),
@@ -199,8 +199,8 @@ export const pessoas = pgTable(
   'pessoas',
   {
     id: uuid('id').primaryKey().defaultRandom(),
-    tenant_id: text('tenant_id').notNull().default('default'),
-    agent_id: text('agent_id').notNull().default('default'),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
     nome: text('nome').notNull(),
     apelido: text('apelido'),
     // Issue #407: the global unique on telefone_whatsapp (migration 001) is
@@ -245,8 +245,8 @@ export const agent_audience_profiles = pgTable(
   'agent_audience_profiles',
   {
     id: uuid('id').primaryKey().defaultRandom(),
-    tenant_id: text('tenant_id').notNull().default('default'),
-    agent_id: text('agent_id').notNull().default('default'),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
     pessoa_id: uuid('pessoa_id').notNull(),
     audience_type: text('audience_type').notNull().default('unknown'),
     trust_level: text('trust_level').notNull().default('unverified'),
@@ -305,7 +305,7 @@ export const agent_audience_profiles = pgTable(
  *                        dispatcher, even if also in a granted pack/tool.
  * `baseline.core` is ALWAYS unioned in at runtime (the conservative floor), so
  * the default grant is `granted_packs=['baseline.core','domain.calendar']`
- * (migration 081 backfilled existing grants and updated the column default).
+ * (migration 085 backfilled existing grants and updated the column default).
  *
  * Tenant isolation (invariant #1): tenant_id + agent_id NOT NULL; the row is
  * UNIQUE per (tenant_id, agent_id) — one effective grant per agent. Every
@@ -316,8 +316,8 @@ export const agent_tool_grants = pgTable(
   'agent_tool_grants',
   {
     id: uuid('id').primaryKey().defaultRandom(),
-    tenant_id: text('tenant_id').notNull().default('default'),
-    agent_id: text('agent_id').notNull().default('default'),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
     granted_packs: text('granted_packs')
       .array()
       .notNull()
@@ -338,8 +338,8 @@ export const agent_tool_grants = pgTable(
 
 export const permission_profiles = pgTable('permission_profiles', {
   id: text('id').primaryKey(),
-  tenant_id: text('tenant_id').notNull().default('default'),
-  agent_id: text('agent_id').notNull().default('default'),
+  tenant_id: text('tenant_id').notNull(),
+  agent_id: text('agent_id').notNull(),
   nome: text('nome').notNull(),
   acoes: text('acoes').array().notNull(),
   limite_default: numeric('limite_default', { precision: 15, scale: 2 }).notNull().default('0'),
@@ -351,8 +351,8 @@ export const permissoes = pgTable(
   'permissoes',
   {
     id: uuid('id').primaryKey().defaultRandom(),
-    tenant_id: text('tenant_id').notNull().default('default'),
-    agent_id: text('agent_id').notNull().default('default'),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
     pessoa_id: uuid('pessoa_id').notNull(),
     entidade_id: uuid('entidade_id'),
     papel: text('papel').notNull(),
@@ -369,8 +369,8 @@ export const permissoes = pgTable(
 
 export const conversas = pgTable('conversas', {
   id: uuid('id').primaryKey().defaultRandom(),
-  tenant_id: text('tenant_id').notNull().default('default'),
-  agent_id: text('agent_id').notNull().default('default'),
+  tenant_id: text('tenant_id').notNull(),
+  agent_id: text('agent_id').notNull(),
   pessoa_id: uuid('pessoa_id').notNull(),
   escopo_entidades: uuid('escopo_entidades').array().notNull().default(sql`'{}'::uuid[]`),
   status: text('status').notNull().default('ativa'),
@@ -382,8 +382,8 @@ export const conversas = pgTable('conversas', {
 
 export const mensagens = pgTable('mensagens', {
   id: uuid('id').primaryKey().defaultRandom(),
-  tenant_id: text('tenant_id').notNull().default('default'),
-  agent_id: text('agent_id').notNull().default('default'),
+  tenant_id: text('tenant_id').notNull(),
+  agent_id: text('agent_id').notNull(),
   conversa_id: uuid('conversa_id'),
   direcao: text('direcao').notNull(),
   tipo: text('tipo').notNull(),
@@ -400,8 +400,8 @@ export const agent_facts = pgTable(
   'agent_facts',
   {
     id: uuid('id').primaryKey().defaultRandom(),
-    tenant_id: text('tenant_id').notNull().default('default'),
-    agent_id: text('agent_id').notNull().default('default'),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
     escopo: text('escopo').notNull(),
     chave: text('chave').notNull(),
     valor: jsonb('valor').notNull(),
@@ -455,8 +455,8 @@ export const learned_rules = pgTable(
   'learned_rules',
   {
     id: uuid('id').primaryKey().defaultRandom(),
-    tenant_id: text('tenant_id').notNull().default('default'),
-    agent_id: text('agent_id').notNull().default('default'),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
     tipo: text('tipo').notNull(),
     contexto: text('contexto').notNull(),
     acao: text('acao').notNull(),
@@ -501,8 +501,8 @@ export const learned_rules = pgTable(
 
 export const agent_memories = pgTable('agent_memories', {
   id: uuid('id').primaryKey().defaultRandom(),
-  tenant_id: text('tenant_id').notNull().default('default'),
-  agent_id: text('agent_id').notNull().default('default'),
+  tenant_id: text('tenant_id').notNull(),
+  agent_id: text('agent_id').notNull(),
   conteudo: text('conteudo').notNull(),
   embedding: text('embedding'),
   tipo: text('tipo').notNull(),
@@ -515,8 +515,8 @@ export const agent_memories = pgTable('agent_memories', {
 
 export const self_state = pgTable('self_state', {
   id: uuid('id').primaryKey().defaultRandom(),
-  tenant_id: text('tenant_id').notNull().default('default'),
-  agent_id: text('agent_id').notNull().default('default'),
+  tenant_id: text('tenant_id').notNull(),
+  agent_id: text('agent_id').notNull(),
   versao: integer('versao').notNull(),
   system_prompt: text('system_prompt').notNull(),
   resumo_aprendizados: text('resumo_aprendizados'),
@@ -526,8 +526,8 @@ export const self_state = pgTable('self_state', {
 
 export const entity_states = pgTable('entity_states', {
   entidade_id: uuid('entidade_id').primaryKey(),
-  tenant_id: text('tenant_id').notNull().default('default'),
-  agent_id: text('agent_id').notNull().default('default'),
+  tenant_id: text('tenant_id').notNull(),
+  agent_id: text('agent_id').notNull(),
   workflow_atual: uuid('workflow_atual'),
   contexto: jsonb('contexto').notNull().default(sql`'{}'::jsonb`),
   ultima_reconciliacao: timestamp('ultima_reconciliacao', { withTimezone: true }),
@@ -541,8 +541,8 @@ export const entity_states = pgTable('entity_states', {
 
 export const workflows = pgTable('workflows', {
   id: uuid('id').primaryKey().defaultRandom(),
-  tenant_id: text('tenant_id').notNull().default('default'),
-  agent_id: text('agent_id').notNull().default('default'),
+  tenant_id: text('tenant_id').notNull(),
+  agent_id: text('agent_id').notNull(),
   tipo: text('tipo').notNull(),
   status: text('status').notNull().default('pendente'),
   contexto: jsonb('contexto').notNull().default(sql`'{}'::jsonb`),
@@ -562,8 +562,8 @@ export const series = pgTable(
   'series',
   {
     id: uuid('id').primaryKey().defaultRandom(),
-    tenant_id: text('tenant_id').notNull().default('default'),
-    agent_id: text('agent_id').notNull().default('default'),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
     tipo: text('tipo').notNull(),
     status: text('status').notNull().default('active'),
     version: integer('version').notNull().default(1),
@@ -594,8 +594,8 @@ export const occurrences = pgTable(
   'occurrences',
   {
     id: uuid('id').primaryKey().defaultRandom(),
-    tenant_id: text('tenant_id').notNull().default('default'),
-    agent_id: text('agent_id').notNull().default('default'),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
     series_id: uuid('series_id').notNull(),
     scheduled_for: timestamp('scheduled_for', { withTimezone: true }).notNull(),
     status: text('status').notNull().default('pending'),
@@ -632,8 +632,8 @@ export const tasks = pgTable(
   'tasks',
   {
     id: uuid('id').primaryKey().defaultRandom(),
-    tenant_id: text('tenant_id').notNull().default('default'),
-    agent_id: text('agent_id').notNull().default('default'),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
     occurrence_id: uuid('occurrence_id').notNull(),
     ordem: integer('ordem').notNull(),
     kind: text('kind').notNull(),
@@ -651,8 +651,8 @@ export const outbox_messages = pgTable(
   'outbox_messages',
   {
     id: uuid('id').primaryKey().defaultRandom(),
-    tenant_id: text('tenant_id').notNull().default('default'),
-    agent_id: text('agent_id').notNull().default('default'),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
     occurrence_id: uuid('occurrence_id'),
     task_id: uuid('task_id'),
     kind: text('kind').notNull(),
@@ -680,8 +680,8 @@ export const outbox_messages = pgTable(
 
 export const workflow_steps = pgTable('workflow_steps', {
   id: uuid('id').primaryKey().defaultRandom(),
-  tenant_id: text('tenant_id').notNull().default('default'),
-  agent_id: text('agent_id').notNull().default('default'),
+  tenant_id: text('tenant_id').notNull(),
+  agent_id: text('agent_id').notNull(),
   workflow_id: uuid('workflow_id').notNull(),
   ordem: integer('ordem').notNull(),
   descricao: text('descricao').notNull(),
@@ -693,8 +693,8 @@ export const workflow_steps = pgTable('workflow_steps', {
 
 export const pending_questions = pgTable('pending_questions', {
   id: uuid('id').primaryKey().defaultRandom(),
-  tenant_id: text('tenant_id').notNull().default('default'),
-  agent_id: text('agent_id').notNull().default('default'),
+  tenant_id: text('tenant_id').notNull(),
+  agent_id: text('agent_id').notNull(),
   conversa_id: uuid('conversa_id'),
   pessoa_id: uuid('pessoa_id'),
   tipo: text('tipo').notNull(),
@@ -745,8 +745,8 @@ export const idempotency_keys = pgTable(
   'idempotency_keys',
   {
     key: text('key').notNull(),
-    tenant_id: text('tenant_id').notNull().default('default'),
-    agent_id: text('agent_id').notNull().default('default'),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
     tool_name: text('tool_name').notNull(),
     operation_type: text('operation_type').notNull(),
     pessoa_id: uuid('pessoa_id').notNull(),
@@ -774,8 +774,8 @@ export const outbound_messages = pgTable(
   'outbound_messages',
   {
     id: uuid('id').primaryKey().defaultRandom(),
-    tenant_id: text('tenant_id').notNull().default('default'),
-    agent_id: text('agent_id').notNull().default('default'),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
     // Turn-scoped: `${conversa_id}:${in_reply_to}`. Mirrors the
     // outbound_dispatch_failed audit metadata.idempotency_key from #216.
     // UNIQUE per (tenant_id, agent_id, idempotency_key) — see composite below.
@@ -839,8 +839,8 @@ export const idempotency_effect_outbox = pgTable(
   'idempotency_effect_outbox',
   {
     id: uuid('id').primaryKey().defaultRandom(),
-    tenant_id: text('tenant_id').notNull().default('default'),
-    agent_id: text('agent_id').notNull().default('default'),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
     // The SAME key as the winning idempotency_keys row. UNIQUE per
     // (tenant_id, agent_id, idempotency_key) makes the in-transaction INSERT
     // idempotent: a fenced/duplicate completion can't enqueue a 2nd effect.
@@ -905,8 +905,8 @@ export const idempotency_effect_outbox = pgTable(
 
 export const system_health_events = pgTable('system_health_events', {
   id: uuid('id').primaryKey().defaultRandom(),
-  tenant_id: text('tenant_id').notNull().default('default'),
-  agent_id: text('agent_id').notNull().default('default'),
+  tenant_id: text('tenant_id').notNull(),
+  agent_id: text('agent_id').notNull(),
   component: text('component').notNull(),
   status: text('status').notNull(),
   duration_ms: integer('duration_ms'),
@@ -917,8 +917,8 @@ export const system_health_events = pgTable('system_health_events', {
 
 export const dead_letter_jobs = pgTable('dead_letter_jobs', {
   id: uuid('id').primaryKey().defaultRandom(),
-  tenant_id: text('tenant_id').notNull().default('default'),
-  agent_id: text('agent_id').notNull().default('default'),
+  tenant_id: text('tenant_id').notNull(),
+  agent_id: text('agent_id').notNull(),
   queue_name: text('queue_name').notNull(),
   job_id: text('job_id').notNull(),
   payload: jsonb('payload').notNull(),
@@ -941,8 +941,8 @@ export const import_runs = pgTable(
   'import_runs',
   {
     id: uuid('id').primaryKey().defaultRandom(),
-    tenant_id: text('tenant_id').notNull().default('default'),
-    agent_id: text('agent_id').notNull().default('default'),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
     pessoa_id: uuid('pessoa_id').notNull(),
     entidade_id: uuid('entidade_id').notNull(),
     conta_id: uuid('conta_id').notNull(),
@@ -971,8 +971,8 @@ export const import_entries = pgTable(
   'import_entries',
   {
     id: uuid('id').primaryKey().defaultRandom(),
-    tenant_id: text('tenant_id').notNull().default('default'),
-    agent_id: text('agent_id').notNull().default('default'),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
     import_run_id: uuid('import_run_id').notNull(),
     ordem: integer('ordem').notNull(),
     tipo_oper: text('tipo_oper').notNull(),
@@ -1001,8 +1001,8 @@ export const import_entries = pgTable(
 
 export const audit_log = pgTable('audit_log', {
   id: uuid('id').primaryKey().defaultRandom(),
-  tenant_id: text('tenant_id').notNull().default('default'),
-  agent_id: text('agent_id').notNull().default('default'),
+  tenant_id: text('tenant_id').notNull(),
+  agent_id: text('agent_id').notNull(),
   pessoa_id: uuid('pessoa_id'),
   acao: text('acao').notNull(),
   entidade_alvo: text('entidade_alvo'),
@@ -1054,8 +1054,8 @@ export const cognitive_module_log = pgTable(
   'cognitive_module_log',
   {
     id: uuid('id').primaryKey().defaultRandom(),
-    tenant_id: text('tenant_id').notNull().default('default'),
-    agent_id: text('agent_id').notNull().default('default'),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
     conversa_id: uuid('conversa_id'),
     turno_id: uuid('turno_id'),
     module_name: text('module_name').notNull(),

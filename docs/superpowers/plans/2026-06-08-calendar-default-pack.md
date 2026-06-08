@@ -21,8 +21,8 @@
 | `src/tools/runtime-filter.ts` | Repoint do fallback (`resolveEffectiveGrant`) | Modificar |
 | `src/tools/_dispatcher.ts` | Repoint do fallback | Modificar |
 | `src/db/schema.ts` | Column DEFAULT de `agent_tool_grants.granted_packs` | Modificar |
-| `migrations/081_calendar_default_pack.sql` + `_down.sql` | Backfill dos grants existentes + ALTER column default | **Criar** |
-| `migrations/RESERVATIONS.md` | Reservar prefixo `081` | Modificar |
+| `migrations/085_calendar_default_pack.sql` + `_down.sql` | Backfill dos grants existentes + ALTER column default | **Criar** |
+| `migrations/RESERVATIONS.md` | Reservar prefixo `085` | Modificar |
 | `tests/unit/tools/agent-tool-grants.spec.ts` | Atualizar casos de parity | Modificar |
 | `tests/unit/tools/calendar-default-pack.spec.ts` | Novos testes (packs, seed, fallback, visibilidade) | **Criar** |
 
@@ -187,21 +187,21 @@ git commit -m "feat(tools): floor = BASE_AGENT_PACKS at seed/grant/fallback site
 
 ---
 
-## Task 3: Column default + migration 081 (backfill)
+## Task 3: Column default + migration 085 (backfill)
 
 **Files:**
 - Modify: `migrations/RESERVATIONS.md`
-- Create: `migrations/081_calendar_default_pack.sql`, `migrations/081_calendar_default_pack_down.sql`
+- Create: `migrations/085_calendar_default_pack.sql`, `migrations/085_calendar_default_pack_down.sql`
 - Modify: `src/db/schema.ts` (~323, column default)
 
 - [ ] **Step 1: Reservar o prefixo**
 
-Run: `npm run migrate:reserve` (ou adicionar a linha `081` em `migrations/RESERVATIONS.md` conforme o formato existente). Confirma o guard: `npx tsx scripts/check-migration-reservations.ts` (ou `npm run` equivalente).
+Run: `npm run migrate:reserve` (ou adicionar a linha `085` em `migrations/RESERVATIONS.md` conforme o formato existente). Confirma o guard: `npx tsx scripts/check-migration-reservations.ts` (ou `npm run` equivalente).
 
-- [ ] **Step 2: Escrever `migrations/081_calendar_default_pack.sql`** (idempotente, respeita denies):
+- [ ] **Step 2: Escrever `migrations/085_calendar_default_pack.sql`** (idempotente, respeita denies):
 
 ```sql
--- 081: calendar como capacidade base — backfill dos grants existentes + column default.
+-- 085: calendar como capacidade base — backfill dos grants existentes + column default.
 -- Adiciona 'domain.calendar' a quem ainda não tem; NÃO mexe em denied_tools.
 UPDATE agent_tool_grants
 SET granted_packs = array_append(granted_packs, 'domain.calendar')
@@ -211,7 +211,7 @@ ALTER TABLE agent_tool_grants
   ALTER COLUMN granted_packs SET DEFAULT '{baseline.core,domain.calendar}'::text[];
 ```
 
-- [ ] **Step 3: Escrever `migrations/081_calendar_default_pack_down.sql`:**
+- [ ] **Step 3: Escrever `migrations/085_calendar_default_pack_down.sql`:**
 
 ```sql
 -- Seguro: nada concedia 'domain.calendar' antes desta feature (spec §2/§7),
@@ -234,8 +234,8 @@ Expected: PASS. (Se Postgres indisponível no ambiente local, validar o SQL manu
 - [ ] **Step 6: Commit**
 
 ```bash
-git add migrations/081_calendar_default_pack.sql migrations/081_calendar_default_pack_down.sql migrations/RESERVATIONS.md src/db/schema.ts tests/integration/
-git commit -m "feat(db): migration 081 — backfill calendar pack into existing agent grants"
+git add migrations/085_calendar_default_pack.sql migrations/085_calendar_default_pack_down.sql migrations/RESERVATIONS.md src/db/schema.ts tests/integration/
+git commit -m "feat(db): migration 085 — backfill calendar pack into existing agent grants"
 ```
 
 ---

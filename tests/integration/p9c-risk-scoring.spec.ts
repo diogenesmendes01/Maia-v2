@@ -53,7 +53,7 @@ d('P9c — risk scorer telemetry', () => {
     // messages.create rejeita → runCognitiveModule status='error', fallback=null.
     // Audit row deve existir mesmo assim. Zero I/O de rede.
     messagesCreateMock.mockRejectedValueOnce(new Error('boom'));
-    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+    await runWithTenantContext({ tenant_id: 'primary', agent_id: 'primary' }, async () => {
       const r = await haikuRiskGate({
         current_level: RiskLevel.LOW,
         context_text: 'test telemetry',
@@ -79,7 +79,7 @@ d('P9c — risk scorer telemetry', () => {
       suggested_level: RiskLevel.HIGH,
       reason: 'jamais',
     });
-    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+    await runWithTenantContext({ tenant_id: 'primary', agent_id: 'primary' }, async () => {
       const r = await scoreTurn(
         { topic: 'casual', tool_kinds: [] },
         { gate, contextText: '' },
@@ -100,7 +100,7 @@ d('P9c — risk scorer telemetry', () => {
       suggested_level: RiskLevel.LOW,
       reason: 'tentando rebaixar',
     });
-    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+    await runWithTenantContext({ tenant_id: 'primary', agent_id: 'primary' }, async () => {
       const r = await scoreKnowledge(
         {
           knowledge_type: 'procedimento',

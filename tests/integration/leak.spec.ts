@@ -100,8 +100,8 @@ d('entity-leak suite — raw SQL', () => {
       const ca = await mkConta(c, a.id);
       const cb = await mkConta(c, b.id);
       await c.query(
-        `INSERT INTO recorrencias(entidade_id, conta_id, natureza, descricao, valor_aprox)
-         VALUES ($1, $2, 'despesa', 'recA', 100), ($3, $4, 'despesa', 'recB', 200)`,
+        `INSERT INTO recorrencias(tenant_id, agent_id, entidade_id, conta_id, natureza, descricao, valor_aprox)
+         VALUES ('primary', 'primary', $1, $2, 'despesa', 'recA', 100), ('primary', 'primary', $3, $4, 'despesa', 'recB', 200)`,
         [a.id, ca.id, b.id, cb.id],
       );
       const r = await c.query<{ entidade_id: string }>(
@@ -122,8 +122,8 @@ d('entity-leak suite — raw SQL', () => {
       const a = await mkEntidade(c);
       const b = await mkEntidade(c);
       await c.query(
-        `INSERT INTO entity_states(entidade_id, contexto, saldo_consolidado)
-         VALUES ($1, '{}'::jsonb, 100), ($2, '{}'::jsonb, 200)`,
+        `INSERT INTO entity_states(tenant_id, agent_id, entidade_id, contexto, saldo_consolidado)
+         VALUES ('primary', 'primary', $1, '{}'::jsonb, 100), ('primary', 'primary', $2, '{}'::jsonb, 200)`,
         [a.id, b.id],
       );
       const r = await c.query<{ entidade_id: string; saldo_consolidado: string }>(
@@ -146,9 +146,9 @@ d('entity-leak suite — raw SQL', () => {
       const a = await mkEntidade(c);
       const b = await mkEntidade(c);
       await c.query(
-        `INSERT INTO audit_log(acao, alvo_id, metadata) VALUES
-           ('transaction_created', $1, '{"entidade":"A"}'::jsonb),
-           ('transaction_created', $2, '{"entidade":"B"}'::jsonb)`,
+        `INSERT INTO audit_log(tenant_id, agent_id, acao, alvo_id, metadata) VALUES
+           ('primary', 'primary', 'transaction_created', $1, '{"entidade":"A"}'::jsonb),
+           ('primary', 'primary', 'transaction_created', $2, '{"entidade":"B"}'::jsonb)`,
         [a.id, b.id],
       );
       const r = await c.query<{ alvo_id: string }>(

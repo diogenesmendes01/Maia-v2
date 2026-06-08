@@ -1,5 +1,5 @@
 -- =====================================================================
--- Maia — Migration 081
+-- Maia — Migration 085
 -- calendar como capacidade base — backfill dos grants existentes + column default.
 --
 -- WHY: Tasks 1-2 (branch claude/calendar-default-pack) made
@@ -27,7 +27,7 @@
 --
 -- NOTE: no BEGIN/COMMIT — scripts/migrate.ts wraps each forward migration
 -- in a transaction (no `-- maia:no-transaction` marker here).
--- Mirrors 076/077/078/079/080.
+-- Mirrors 076-084 (same no-transaction convention).
 -- =====================================================================
 
 -- Step 1: Backfill — add 'domain.calendar' to every existing grant that

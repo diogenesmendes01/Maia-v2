@@ -2,7 +2,7 @@ import { config } from '@/config/env.js';
 import { readDailyLLMUsd } from '@/lib/cost-ledger.js';
 import { sendAlert } from '@/lib/alerts.js';
 import { logger } from '@/lib/logger.js';
-import { runWithTenantContext } from '@/db/tenant-context.js';
+import { runWithTenantContext, PRIMARY_CONTEXT } from '@/db/tenant-context.js';
 
 /**
  * Daily LLM cost guard. Reads yesterday's accumulated cost (records are keyed
@@ -11,19 +11,15 @@ import { runWithTenantContext } from '@/db/tenant-context.js';
  * subject is unique per day.
  */
 export async function runCostMonitor(): Promise<void> {
-  // NOT migrated to `system` in issue #323 phase 2 (intentionally held): unlike
-  // the other "global" maintenance workers, this one is tenant-SCOPED via the
-  // data plane. `readDailyLLMUsd` → `factsRepo.getByKey('global', …)` filters
-  // `agent_facts` by `getCurrentTenant()`/`getCurrentAgent()`, and the matching
-  // ledger row is WRITTEN by `recordLLMCost` during agent turns — which in the
-  // current single-tenant runtime run under `default/default`. Swapping the reader
-  // to `system/system` would read a non-existent `(system, system, global, …)`
-  // row → silently $0 every day → the threshold alert never fires. This is a
-  // data-plane change, NOT data-plane neutral, so it does not belong in the
-  // pure-swap phase. It must be fanned out / re-homed in a later phase together
-  // with the per-tenant cost ledger (mirrors the plan's "revisit if cost
-  // becomes per-tenant" caveat). Left on the legacy literal until then.
-  await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+  // issue #323: the daily LLM cost ledger is tenant-SCOPED via the data plane —
+  // `readDailyLLMUsd` → `factsRepo.getByKey('global', …)` filters `agent_facts`
+  // by `getCurrentTenant()`/`getCurrentAgent()`, and the matching row is WRITTEN
+  // by `recordLLMCost` during agent turns. Those turns now run under
+  // `primary/primary` (the single-tenant home), so the monitor reads under the
+  // SAME scope — NOT `system` (which would read a non-existent ledger row → $0 →
+  // the alert never fires). A future multi-tenant deployment fans this out with
+  // a per-tenant cost ledger.
+  await runWithTenantContext(PRIMARY_CONTEXT, async () => {
     const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
     const usd = await readDailyLLMUsd(yesterday);
     const threshold = config.DAILY_LLM_USD_THRESHOLD;

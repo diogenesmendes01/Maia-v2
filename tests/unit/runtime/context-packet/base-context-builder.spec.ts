@@ -155,7 +155,7 @@ describe('BaseContextBuilder — issue #282 fail-loud default resolver', () => {
   // The passthrough-resolver case below depends on the flag being OFF (meter-
   // only). Guard against env leakage from other tests/files (issue #315).
   beforeEach(() => {
-    delete process.env.MAIA_REJECT_DEFAULT_LITERAL;
+    process.env.MAIA_REJECT_DEFAULT_LITERAL = 'false';
   });
 
   it('default constructor (no resolver injected) throws when build() must resolve', async () => {
@@ -268,10 +268,10 @@ describe("BaseContextBuilder — issue #315 'default' literal rejection", () => 
   };
 
   beforeEach(() => {
-    delete process.env.MAIA_REJECT_DEFAULT_LITERAL;
+    process.env.MAIA_REJECT_DEFAULT_LITERAL = 'false';
   });
   afterEach(() => {
-    delete process.env.MAIA_REJECT_DEFAULT_LITERAL;
+    process.env.MAIA_REJECT_DEFAULT_LITERAL = 'false';
   });
 
   it('default mode (flag off): meters but does NOT throw on default/default', async () => {

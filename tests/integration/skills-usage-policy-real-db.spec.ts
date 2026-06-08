@@ -46,7 +46,14 @@ let previousDatabaseUrl: string | undefined;
 const SHOULD_RUN = await isDockerAvailable();
 const d = SHOULD_RUN ? describe : describe.skip;
 
-const TENANT = 'default';
+// Migration 077 backfills usage_policy on the baseline skills while they live
+// under the bootstrap tenant 'default'; issue #323's migration 081 then re-homes
+// those rows (policy included) to the reserved single-tenant home 'primary', and
+// 083 deletes the legacy 'default' registry. So the end-state rows live under
+// 'primary'. (Re-running 077's body targets 'default' / NULL-policy rows, of
+// which there are none under 'primary' post-rehome, so the idempotency assertion
+// holds.)
+const TENANT = 'primary';
 const BASELINE_DESCRIPTORS = [
   'safe_conversation',
   'ask_clarification',

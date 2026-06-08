@@ -6,7 +6,7 @@
 
 **Maia is a multi-agent platform governed via WhatsApp.** Three core concepts:
 
-- **Tenant** — an isolated context. Today the platform runs single-tenant (`tenant_id='default'`); the schema and tenant-guard middleware support multiple. Adding a tenant must not risk leaking data into another.
+- **Tenant** — an isolated context. Today the platform runs single-tenant under the reserved `tenant_id='primary'` (the legacy `'default'` bucket was eliminated in #323 and is now rejected fail-closed); the schema and tenant-guard middleware support multiple. Adding a tenant must not risk leaking data into another.
 - **Agent** — a named, versioned operational identity owned by a tenant. An agent has its own system prompt, learned skills, learned procedures, and memory. A tenant can own multiple agents.
 - **Channel** — how messages reach an agent. WhatsApp is the only enabled channel today; the schema (`channels`, `channel_policies`, `roles`) is multi-channel by design. A `channel_policy` decides which agent answers which channel.
 
@@ -170,7 +170,7 @@ Every `src/` subdirectory has a one-line role here and a deep-dive module doc.
 | **Outbox** | Transactional outbound queue — protects against double-send |
 | **KSM** | Knowledge State Machine (P10a) — `learned_rules` lifecycle |
 | **Soul layer** | Append-only behavioral biases per agent (P8b) |
-| **`'default'`** | Literal seeded `tenant_id`/`agent_id` for current single-tenant runtime. Production code paths reject this literal when it appears in dynamic resolvers — only the bootstrap seed uses it. |
+| **`'primary'`** | Reserved `tenant_id`/`agent_id` for the single-tenant runtime home (issue #323). The legacy `'default'` literal was eliminated — it carries no data and is rejected fail-closed (`MAIA_REJECT_DEFAULT_LITERAL` default-ON). `'system'` remains the sanctioned bucket for genuinely-global maintenance. |
 
 ## 8. Where to look for current status
 
