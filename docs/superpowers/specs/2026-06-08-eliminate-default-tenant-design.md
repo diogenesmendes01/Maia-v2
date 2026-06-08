@@ -119,7 +119,7 @@ This carries the typed seeds (catch-all channel, role/policy, biases, baseline s
 
 > Verified holes the union closes: `procedure_definitions.owner_agent_id` is the only non-standard agents-FK column; `outbound_messages` (063) and `idempotency_effect_outbox` (068) carry `tenant_id` with NO FK.
 >
-> **Assumption (assert in test #1):** the only agent under tenant `default` is the `default` agent itself (true for the single-tenant runtime). If a future state parked a real agent under tenant `default`, §3.4's `DELETE tenants WHERE id='default'` would block — the rehome test must assert zero residual `default` rows before the delete runs.
+> **Assumption (assert in test #1):** the only agent under tenant `default` is the `default` agent itself (true for the single-tenant runtime). If a future state parked a real agent under tenant `default`, §3.4's `DELETE tenants WHERE id='default'` would block — the rehome test must assert zero residual `default` rows in **child/data tables** (the `default` tenant/agent *registry* rows legitimately persist until §3.4; test #1 checks this post-migration).
 
 > **Note on the catch-all channel:** the row's `external_id='default-channel'` is an inert placeholder (the resolver finds the catch-all by `channel_type` + tenant, not by this string). The rehome only changes `tenant_id`/`agent_id`; `external_id` need not change. The resolver discriminator change (§4.1) is what re-points "which tenant is the catch-all".
 
@@ -199,6 +199,7 @@ Per the impact audit, three buckets:
 2. **Fail-closed INSERT** (real-DB): an INSERT omitting `tenant_id` on a default-bearing table now raises NOT NULL (was silently `default`) — assert for a 009 table AND a no-FK one (`outbound_messages`/`idempotency_effect_outbox`).
 3. **Resolver single-tenant** (unit): unknown sender → `primary/primary`; with a second tenant's channel present → fail-loud.
 4. **Flip safety** (integration): with **no env var set** (the new default-ON), a synthetic `default` context throws `DefaultLiteralRejectedError` and a full inbound turn under `primary` succeeds end-to-end; with `MAIA_REJECT_DEFAULT_LITERAL=false`, the `default` context is tolerated (validates opt-out rollback). **Do not test by setting `=true`** — that would pass even if the default were silently OFF (the bug Issue 1 guards against).
+5. **Migration symmetry (hardening)** (migration test): snapshot the columns the §3.3 forward step discovers and assert equality with the `_down` hardcoded list, so a future default-bearing table can't silently drift the up/down sets apart.
 
 **Plan task (first-class):** sweep every code path that writes to a default-bearing table *without* an active ALS context (relied on the column-default) and make each stamp `primary`/a real tenant explicitly — at minimum `setup.ts`, the baileys pre-resolver persistence in `src/gateway/baileys.ts`, and any writer to 008/063/068/071/074/076. After §3.3 a missed FK-table site fails NOT NULL; a missed no-FK site (063/068) silently re-pollutes `default`.
 
@@ -236,7 +237,7 @@ Gate before requesting review: `npm run typecheck` + `npm run lint` + `npm test`
 | Coordinated deploy window | Single process → migrate-then-restart; emergency rollback = `MAIA_REJECT_DEFAULT_LITERAL=false` (no redeploy) + migration `_down`. |
 | FK RESTRICT blocks `default` delete | Delete ordered after rehome (children re-pointed first); typed-seed deletes are defensive no-ops. |
 
-**Rollback:** set `MAIA_REJECT_DEFAULT_LITERAL=false` (instant, env-only). For a full revert, run the migration `_down` chain (re-seed `default`, rehome `primary`→`default`, restore column-defaults) and redeploy the prior code.
+**Rollback:** set `MAIA_REJECT_DEFAULT_LITERAL=false` (instant, env-only). For a full revert, run the migration `_down` chain and redeploy the prior code. `migrate.ts` drives `_down` files in strict reverse-numeric order (delete → drop-default → rehome → seed, each reversed); the net effect — re-seed `default`, rehome `primary`→`default`, restore column-defaults — is order-independent for correctness (default-restore only affects future inserts).
 
 ---
 
