@@ -385,6 +385,18 @@ function toolToSchema(t: AnyTool) {
 }
 
 /**
+ * Resolves tool schemas from the registry by name, skipping unknowns and
+ * feature-flag-disabled tools. Used by the `tool_mediated` executor to build
+ * the tools list from `skill.allowed_tools` without duplicating schemas in SQL.
+ */
+export function getToolSchemasByName(names: readonly string[]) {
+  return names
+    .map((name) => REGISTRY[name])
+    .filter((t): t is AnyTool => t !== undefined && isToolEnabled(t.name))
+    .map(toolToSchema);
+}
+
+/**
  * A catalog entry: a tool plus its accurate runtime gating. `enabled` reflects
  * the live config/feature-flag state; `feature_flag` is the NAME of the flag
  * that gates it (null when ungated).

@@ -60,10 +60,10 @@ Eleven baseline skills total: eight original (5 upgraded to v2, 3 unchanged at v
 
 `tool_mediated` means the runtime wires explicit tool calls so that:
 
-- **Auditability is enforced at the framework level.** The dispatcher sees each tool call as a typed event; no skill can silently skip an audit step.
+- **Auditability is structured at the framework level.** The dispatcher sees each tool call as a typed event; a skill that calls `audit_decision` produces a traceable record that `prompt_only` mode cannot generate.
 - **Observability.** The runtime can log which tool produced which piece of context (deterministic attribution, invariant #4).
 - **Deterministic risk scoring.** `risk_signal_classify` returns a deterministic level from the shared scorer — not an LLM guess. Wiring it as a tool call rather than embedding the logic in a prompt keeps that guarantee intact.
-- **Write governance.** `remember_safe_fact` and `conversation_state_update` carry `side_effect: write` and must pass through the dispatcher's constitutional check and idempotency gate. A `prompt_only` skill cannot provide that guarantee; a `tool_mediated` call does.
+- **Write governance.** `remember_safe_fact` and `conversation_state_update` carry `side_effect: write` and must pass through the dispatcher's constitutional check and idempotency gate. A `prompt_only` skill cannot produce that path reliably; `tool_mediated` makes it the natural path the LLM follows.
 
 Per-skill rationale for the five conversions:
 
@@ -73,7 +73,7 @@ Per-skill rationale for the five conversions:
 | `retrieve_context` | Makes context reads structurally explicit so the runtime can log which source returned what — critical for the audit trail (invariant #4). |
 | `handoff_to_owner` | Composes a structured summary before escalating (`conversation_summary_compose`) so the owner receives typed context, not a raw text dump. `audit_decision` records the escalation rationale. |
 | `remember_safe_fact` | Pairs the write with an `audit_decision` call so every memory write is traceable. A `prompt_only` skill cannot enforce that pairing. |
-| `audit_decision` | Enforces that the `audit_decision` tool is always called (the runtime guarantees the tool is invoked, not assumed by a prompt instruction). |
+| `audit_decision` | Makes `audit_decision` the natural tool the LLM calls — the runtime offers it and the system prompt instructs its use; the LLM drives the invocation, not a hidden side-effect. |
 
 ### 4.2 Why three skills stay `prompt_only`
 
