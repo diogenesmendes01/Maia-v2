@@ -183,3 +183,4 @@ NEW shared prefixes — pick `max(existing)+1`.
 077 | 077_skills_usage_policy.sql | skills usage policy by audience channel data scope risk (issue 409)
 078 | 078_boleto_write_risk_policies.sql | boleto proposal tools packs and write policies (issue 416)
 079 | 079_boleto_proposta_attendant_role_and_skills.sql | whatsapp boleto proposta attendant role and skills (issue 415)
+080 | 080_baseline_skills_v2.sql | baseline skills v2 tool_mediated conversions and 3 new skills (issue 448)

@@ -92,13 +92,13 @@ d('skills.usage_policy (migration 077) — real DB', () => {
       skill_descriptor: string;
       usage_policy: Record<string, unknown> | null;
     }>(
-      // Scope to the known baseline descriptors: issue #415 also seeds role
-      // skills tenant-wide with proposed_by='system' (without a backfilled
-      // usage_policy), so a bare proposed_by filter would now over-match.
+      // Scope to version=1: migration 080 adds v2 rows for 5 of these descriptors;
+      // without the version filter the query returns 13 rows instead of 8.
       `SELECT skill_descriptor, usage_policy
          FROM skills
         WHERE tenant_id = $1 AND proposed_by = 'system'
           AND skill_descriptor = ANY($2)
+          AND version = 1
         ORDER BY skill_descriptor`,
       [TENANT, [...BASELINE_DESCRIPTORS]],
     );
