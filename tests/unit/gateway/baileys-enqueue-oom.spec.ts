@@ -98,15 +98,15 @@ vi.mock('@/db/repositories.js', () => ({
     findByWhatsappIdCrossTenant: vi.fn().mockResolvedValue(null),
   },
   // #411: the resolver always runs at ingress. Single-tenant catch-all → the
-  // seeded default/default channel for any sender (exact-match always misses).
+  // seeded primary/primary channel for any sender (exact-match always misses).
   channelsRepo: {
     findByExternalCrossTenant: vi.fn().mockResolvedValue(null),
-    findDefaultCatchAllChannel: vi.fn().mockResolvedValue({
+    findPrimaryCatchAllChannel: vi.fn().mockResolvedValue({
       multi_tenant: false,
       channel: {
-        id: 'default-channel-uuid',
-        tenant_id: 'default',
-        agent_id: 'default',
+        id: 'primary-channel-uuid',
+        tenant_id: 'primary',
+        agent_id: 'primary',
         external_id: 'default-channel',
         channel_type: 'whatsapp',
         active: true,
@@ -170,7 +170,7 @@ const fakeTextMsg = () => ({
 beforeEach(() => {
   createInboundMock.mockReset();
   createInboundMock.mockResolvedValue({
-    row: { id: 'msg-uuid-1', tenant_id: 'default', agent_id: 'default' },
+    row: { id: 'msg-uuid-1', tenant_id: 'primary', agent_id: 'primary' },
     duplicate: false,
   });
   enqueueAgentMock.mockReset();

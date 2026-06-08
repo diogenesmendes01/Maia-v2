@@ -183,3 +183,7 @@ NEW shared prefixes — pick `max(existing)+1`.
 077 | 077_skills_usage_policy.sql | skills usage policy by audience channel data scope risk (issue 409)
 078 | 078_boleto_write_risk_policies.sql | boleto proposal tools packs and write policies (issue 416)
 079 | 079_boleto_proposta_attendant_role_and_skills.sql | whatsapp boleto proposta attendant role and skills (issue 415)
+080 | 080_seed_primary_tenant.sql | seed reserved primary tenant/agent single-tenant home (issue 323)
+081 | 081_rehome_default_to_primary.sql | rehome runtime data default to primary (issue 323)
+082 | 082_drop_default_column_default.sql | drop DEFAULT default column-default fail-closed (issue 323)
+083 | 083_delete_default_tenant.sql | delete legacy default tenant and agent (issue 323)

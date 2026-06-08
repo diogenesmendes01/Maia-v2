@@ -1,8 +1,8 @@
 /**
  * Issue #290 — Baileys ingress runs `handleIncoming` inside the RESOLVED
- * tenant context (NOT `default/default` synthetic). Issue #411 — MULTI_CHANNEL
+ * tenant context (NOT `primary/primary` synthetic). Issue #411 — MULTI_CHANNEL
  * removed: the resolver ALWAYS runs and, in a single-tenant runtime, maps any
- * sender to (default, default) via the catch-all.
+ * sender to (primary, primary) via the catch-all.
  *
  * Coverage (in-process, mocked Baileys + mocked channelsRepo):
  *
@@ -14,13 +14,13 @@
  *      the runtime guarantee the downstream PRs need.
  *   3. Unknown JID in a MULTI-TENANT deployment → `handleIncoming` is NEVER
  *      invoked; audit emitted with `channel_resolution_failed` (fail-closed;
- *      no default/default fallback).
- *   4. #411 single-tenant → unknown sender resolves to default/default via the
+ *      no primary/primary fallback).
+ *   4. #411 single-tenant → unknown sender resolves to primary/primary via the
  *      catch-all and IS processed (the bot keeps answering everyone).
  *   5. @lid + senderPn → resolved via the real phone, runs under the
  *      owning tenant's ALS.
  *
- * The default `findDefaultCatchAllChannel` mock returns `multi_tenant:true` so
+ * The default `findPrimaryCatchAllChannel` mock returns `multi_tenant:true` so
  * a miss is fail-loud (the cross-tenant contract). The single-tenant scenario
  * overrides it.
  *
@@ -36,7 +36,7 @@ import type { Channel } from '@/db/schema.js';
 
 const {
   findByExternalCrossTenantMock,
-  findDefaultCatchAllChannelMock,
+  findPrimaryCatchAllChannelMock,
   createInboundMock,
   enqueueAgentMock,
   auditMock,
@@ -56,7 +56,7 @@ const {
       [args: { channel_type: string; external_id: string }],
       Promise<Channel | null>
     >(),
-    findDefaultCatchAllChannelMock: vi.fn(),
+    findPrimaryCatchAllChannelMock: vi.fn(),
     createInboundMock: vi.fn(),
     enqueueAgentMock: vi.fn().mockResolvedValue(undefined),
     auditMock: vi.fn().mockResolvedValue(undefined),
@@ -109,7 +109,7 @@ vi.mock('@/db/repositories.js', () => ({
   mensagensRepo: { createInbound: createInboundMock },
   channelsRepo: {
     findByExternalCrossTenant: findByExternalCrossTenantMock,
-    findDefaultCatchAllChannel: findDefaultCatchAllChannelMock,
+    findPrimaryCatchAllChannel: findPrimaryCatchAllChannelMock,
   },
 }));
 
@@ -195,10 +195,10 @@ function inbound(jid: string, id: string, extras: Record<string, unknown> = {}) 
 describe('baileys messages.upsert — runs handleIncoming inside RESOLVED tenant context (issue #290)', () => {
   beforeEach(async () => {
     findByExternalCrossTenantMock.mockReset();
-    findDefaultCatchAllChannelMock.mockReset();
+    findPrimaryCatchAllChannelMock.mockReset();
     // Default: MULTI-TENANT deployment → a channel miss is fail-loud (the
     // cross-tenant contract). The single-tenant scenario overrides this.
-    findDefaultCatchAllChannelMock.mockResolvedValue({ multi_tenant: true, channel: null });
+    findPrimaryCatchAllChannelMock.mockResolvedValue({ multi_tenant: true, channel: null });
     createInboundMock.mockReset();
     enqueueAgentMock.mockClear();
     auditMock.mockClear();
@@ -270,10 +270,10 @@ describe('baileys messages.upsert — runs handleIncoming inside RESOLVED tenant
       tenant_id: 'tenant-B',
       agent_id: 'agent-B',
     });
-    // Neither message landed in default/default — the bug this PR closes.
+    // Neither message landed in primary/primary — the bug this PR closes.
     expect(observed).not.toContainEqual({
-      tenant_id: 'default',
-      agent_id: 'default',
+      tenant_id: 'primary',
+      agent_id: 'primary',
     });
   });
 
@@ -320,7 +320,7 @@ describe('baileys messages.upsert — runs handleIncoming inside RESOLVED tenant
     // Defensive: explicit non-match against any other tenant the test
     // mentions, anchoring that no leak occurs even by accident.
     expect(observedTenant).not.toBe('tenant-B');
-    expect(observedTenant).not.toBe('default');
+    expect(observedTenant).not.toBe('primary');
   });
 
   it('unknown JID → handleIncoming NOT invoked; audit channel_resolution_failed emitted (fail-closed)', async () => {
@@ -432,16 +432,16 @@ describe('baileys messages.upsert — runs handleIncoming inside RESOLVED tenant
     expect(createInboundMock).not.toHaveBeenCalled();
   });
 
-  it('#411 single-tenant → arbitrary sender resolves to default/default via catch-all and IS processed', async () => {
+  it('#411 single-tenant → arbitrary sender resolves to primary/primary via catch-all and IS processed', async () => {
     // Exact-match misses (the sender phone is not a registered bot line), and
-    // no real tenant exists → catch-all maps it to the seeded default channel.
+    // no real tenant exists → catch-all maps it to the seeded primary channel.
     findByExternalCrossTenantMock.mockResolvedValueOnce(null);
-    findDefaultCatchAllChannelMock.mockResolvedValueOnce({
+    findPrimaryCatchAllChannelMock.mockResolvedValueOnce({
       multi_tenant: false,
       channel: makeChannel({
-        id: 'default-channel-uuid',
-        tenant_id: 'default',
-        agent_id: 'default',
+        id: 'primary-channel-uuid',
+        tenant_id: 'primary',
+        agent_id: 'primary',
         external_id: 'default-channel',
       }),
     });
@@ -455,7 +455,7 @@ describe('baileys messages.upsert — runs handleIncoming inside RESOLVED tenant
       observedTenant = getCurrentTenant();
       observedAgent = getCurrentAgent();
       return {
-        row: { id: 'msg-single', tenant_id: 'default', agent_id: 'default' },
+        row: { id: 'msg-single', tenant_id: 'primary', agent_id: 'primary' },
         duplicate: false,
       };
     });
@@ -469,8 +469,8 @@ describe('baileys messages.upsert — runs handleIncoming inside RESOLVED tenant
 
     // The message IS processed (the bug #411 fixed: no DLQ drop).
     expect(createInboundMock).toHaveBeenCalled();
-    expect(observedTenant).toBe('default');
-    expect(observedAgent).toBe('default');
+    expect(observedTenant).toBe('primary');
+    expect(observedAgent).toBe('primary');
     // No fail-loud audit — the catch-all resolved it.
     const failedAudits = auditMock.mock.calls.filter(
       (call) => (call[0] as { acao?: string })?.acao === 'channel_resolution_failed',

@@ -98,7 +98,7 @@ beforeEach(() => {
   // throw (flag off — the project default). Pin it so ambient env can't flip
   // the assertion. getCurrentTenant/Agent only throw on 'default' when
   // MAIA_REJECT_DEFAULT_LITERAL === 'true'.
-  delete process.env.MAIA_REJECT_DEFAULT_LITERAL;
+  process.env.MAIA_REJECT_DEFAULT_LITERAL = 'false';
 });
 
 describe('procedureExecutionsRepo.updateStateTx — exactly-one-row assertion (#323 BLOCKING 1)', () => {

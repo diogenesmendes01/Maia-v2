@@ -26,7 +26,8 @@ import {
 describe('tenant-context', () => {
   beforeEach(() => {
     incCounterMock.mockReset();
-    delete process.env.MAIA_REJECT_DEFAULT_LITERAL;
+    // Test baseline OFF (see tests/setup.ts). ON-cases set ='true' per test.
+    process.env.MAIA_REJECT_DEFAULT_LITERAL = 'false';
   });
 
   it('runWithTenantContext propaga tenant_id e agent_id', async () => {
@@ -443,13 +444,14 @@ describe('tenant-context', () => {
     });
 
     it('flag is read at access time, not module-load time', async () => {
-      // Start without flag — must not throw.
-      delete process.env.MAIA_REJECT_DEFAULT_LITERAL;
+      // Start with flag explicitly OFF (opt-out, issue #323) — must not throw.
+      process.env.MAIA_REJECT_DEFAULT_LITERAL = 'false';
       await runWithTenantContext({ tenant_id: 'default', agent_id: 'sofia' }, async () => {
         expect(getCurrentTenant()).toBe('default');
       });
-      // Flip flag mid-process — must throw on next access.
-      process.env.MAIA_REJECT_DEFAULT_LITERAL = 'true';
+      // Flip to the production default mid-process (unset → default-ON) — must
+      // throw on next access. This also pins the opt-out flip: absent var = ON.
+      delete process.env.MAIA_REJECT_DEFAULT_LITERAL;
       await expect(
         runWithTenantContext({ tenant_id: 'default', agent_id: 'sofia' }, async () => {
           getCurrentTenant();

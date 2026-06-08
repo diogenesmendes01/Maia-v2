@@ -3,18 +3,18 @@
  * resolution. MULTI_CHANNEL removed: o resolver SEMPRE roda.
  *
  * Antes (legacy): falhas de resolução eram silenciadas via try/catch e o agente
- * seguia processando como `default/default`. Isso colapsava buckets de
+ * seguia processando como `primary/primary`. Isso colapsava buckets de
  * rate-limit entre tenants.
  *
  * Agora (sempre roda o resolver):
  *   - probe com telefone + resolveChannel sucesso (single-tenant) → resolve
- *     para (default, default, <default channel id>); adoção é skipada (resolved
- *     == default/default).
+ *     para (primary, primary, <primary channel id>); adoção é skipada (resolved
+ *     == primary/primary).
  *   - probe com telefone + resolveChannel sucesso (multi-tenant) → adoção CAS
  *     move a row → runWithTenantContext com tenant/agent reais.
  *   - probe com telefone + resolveChannel throw (multi-tenant miss) → emite
  *     audit `channel_resolution_failed` e propaga o erro (BullMQ retry/DLQ).
- *   - probe sem telefone → mantém default/default e SEGUE processando (o inner
+ *   - probe sem telefone → mantém primary/primary e SEGUE processando (o inner
  *     trata o caso "sem telefone"); NÃO emite audit de falha.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -44,7 +44,7 @@ const {
   };
   const findMensagemMock = vi.fn();
   // [Codex review #311] adoption is now a compare-and-swap returning a boolean
-  // (`true` = this call won the swap out of default/default). Default the mock
+  // (`true` = this call won the swap out of primary/primary). Default the mock
   // to `true` so existing happy-path specs keep exercising the "we adopted it"
   // branch. The dedicated race specs override per-case.
   const adoptToResolvedTenantMock = vi.fn().mockResolvedValue(true);
@@ -95,8 +95,12 @@ vi.mock('@/lib/logger.js', () => ({ logger: loggerMock }));
 
 vi.mock('@/db/tenant-context.js', () => ({
   runWithTenantContext: runWithTenantContextMock,
-  getCurrentTenant: vi.fn(() => 'default'),
-  getCurrentAgent: vi.fn(() => 'default'),
+  getCurrentTenant: vi.fn(() => 'primary'),
+  getCurrentAgent: vi.fn(() => 'primary'),
+  PRIMARY_TENANT_ID: 'primary',
+  PRIMARY_AGENT_ID: 'primary',
+  isPrimaryContext: (ctx: { tenant_id: string; agent_id: string }) =>
+    ctx.tenant_id === 'primary' && ctx.agent_id === 'primary',
 }));
 
 vi.mock('@/agent/prompt-builder.js', () => ({
@@ -318,12 +322,12 @@ describe('runAgentForMensagem — channel resolution (#268 fail-loud + #411 catc
     });
   });
 
-  it('#411 single-tenant: resolveChannel devolve default/default → adoção skipada, segue em default/default sem audit de falha', async () => {
-    // O catch-all do resolver mapeia o remetente para o canal default semeado.
+  it('#411 single-tenant: resolveChannel devolve primary/primary → adoção skipada, segue em primary/primary sem audit de falha', async () => {
+    // O catch-all do resolver mapeia o remetente para o canal primary semeado.
     resolveChannelMock.mockResolvedValueOnce({
-      tenant_id: 'default',
-      agent_id: 'default',
-      channel_id: 'default-channel-uuid',
+      tenant_id: 'primary',
+      agent_id: 'primary',
+      channel_id: 'primary-channel-uuid',
     });
 
     const { runAgentForMensagem } = await import('@/agent/core.js');
@@ -340,13 +344,13 @@ describe('runAgentForMensagem — channel resolution (#268 fail-loud + #411 catc
       (call) => call[0]?.acao === 'channel_resolution_failed',
     );
     expect(auditCalls).toHaveLength(0);
-    // resolved == default/default → adoção é skipada (sem UPDATE no-op).
+    // resolved == primary/primary → adoção é skipada (sem UPDATE no-op).
     expect(adoptToResolvedTenantMock).not.toHaveBeenCalled();
-    // Inner path executou via runWithTenantContext em default/default.
+    // Inner path executou via runWithTenantContext em primary/primary.
     expect(runWithTenantContextMock).toHaveBeenCalled();
     expect(runWithTenantContextMock.mock.calls[0]![0]).toEqual({
-      tenant_id: 'default',
-      agent_id: 'default',
+      tenant_id: 'primary',
+      agent_id: 'primary',
     });
   });
 
@@ -359,12 +363,12 @@ describe('runAgentForMensagem — channel resolution (#268 fail-loud + #411 catc
 
     // Track ordem de chamadas: a adoção tem que rodar ANTES do
     // runWithTenantContext, senão o findById tenant-scoped lá dentro
-    // veria a row ainda em default/default e retornaria null.
+    // veria a row ainda em primary/primary e retornaria null.
     const callOrder: string[] = [];
     adoptToResolvedTenantMock.mockImplementationOnce(async () => {
       callOrder.push('adopt');
       // [Codex review #311] return true = THIS call won the compare-and-swap
-      // out of default/default. Without this the caller would treat the
+      // out of primary/primary. Without this the caller would treat the
       // adoption as a lost race and reach the owner re-check.
       return true;
     });
@@ -382,9 +386,9 @@ describe('runAgentForMensagem — channel resolution (#268 fail-loud + #411 catc
     );
     expect(failedAudits).toHaveLength(0);
 
-    // [Codex review #277] Adoção: move row de default/default → tenant resolvido
+    // [Codex review #277] Adoção: move row de primary/primary → tenant resolvido
     // ANTES de entrar no contexto tenant-scoped (caso contrário findById retorna
-    // null porque baileys persistiu o inbound em default/default).
+    // null porque baileys persistiu o inbound em primary/primary).
     expect(adoptToResolvedTenantMock).toHaveBeenCalledTimes(1);
     expect(adoptToResolvedTenantMock).toHaveBeenCalledWith({
       id: 'msg1',
@@ -404,7 +408,7 @@ describe('runAgentForMensagem — channel resolution (#268 fail-loud + #411 catc
   // [Codex review #311 — CRITICAL P0] cross-tenant adoption race at the caller.
   //
   // adoptToResolvedTenantCrossTenant is a compare-and-swap: it returns `false`
-  // when the row was NOT still default/default. The caller must then re-check
+  // when the row was NOT still primary/primary. The caller must then re-check
   // the owner and ONLY proceed when it matches the tenant WE resolved. A row
   // owned by a DIFFERENT tenant must abort the turn (throw + audit) — never
   // run under our resolved context (that is the cross-tenant leak this fix
@@ -417,7 +421,7 @@ describe('runAgentForMensagem — channel resolution (#268 fail-loud + #411 catc
       channel_id: 'ch-b',
     });
     // We tried to adopt into tenant-B but lost the swap: the row is no longer
-    // default/default.
+    // primary/primary.
     adoptToResolvedTenantMock.mockResolvedValueOnce(false);
     // Cross-tenant owner re-check: the row was already adopted by tenant-A.
     findOwnerByIdCrossTenantMock.mockResolvedValueOnce({
@@ -507,13 +511,13 @@ describe('runAgentForMensagem — channel resolution (#268 fail-loud + #411 catc
     expect(conflictAudits[0]![0].metadata.owner_present).toBe(false);
   });
 
-  it('#411 single-tenant: resolveChannel devolve default/default → adoção NÃO é chamada (no-op skip)', async () => {
-    // O catch-all do resolver (#411) devolve o canal default semeado para
-    // qualquer remetente em runtime single-tenant. Como resolved == default/
-    // default, NÃO chamamos adoção (seria um UPDATE no-op que polui logs).
+  it('#411 single-tenant: resolveChannel devolve primary/primary → adoção NÃO é chamada (no-op skip)', async () => {
+    // O catch-all do resolver (#411) devolve o canal primary semeado para
+    // qualquer remetente em runtime single-tenant. Como resolved == primary/
+    // primary, NÃO chamamos adoção (seria um UPDATE no-op que polui logs).
     resolveChannelMock.mockResolvedValueOnce({
-      tenant_id: 'default',
-      agent_id: 'default',
+      tenant_id: 'primary',
+      agent_id: 'primary',
       channel_id: 'ch-degenerate',
     });
 
@@ -524,8 +528,8 @@ describe('runAgentForMensagem — channel resolution (#268 fail-loud + #411 catc
     expect(adoptToResolvedTenantMock).not.toHaveBeenCalled();
     expect(runWithTenantContextMock).toHaveBeenCalled();
     expect(runWithTenantContextMock.mock.calls[0]![0]).toEqual({
-      tenant_id: 'default',
-      agent_id: 'default',
+      tenant_id: 'primary',
+      agent_id: 'primary',
     });
   });
 
@@ -577,13 +581,13 @@ describe('runAgentForMensagem — channel resolution (#268 fail-loud + #411 catc
     expect(runWithTenantContextMock).not.toHaveBeenCalled();
   });
 
-  it('#411: probe sem telefone → NÃO chama resolveChannel, NÃO emite audit de falha, segue em default/default', async () => {
+  it('#411: probe sem telefone → NÃO chama resolveChannel, NÃO emite audit de falha, segue em primary/primary', async () => {
     // Override probe: primeiro call (probeMessageForChannel) retorna mensagem
     // sem telefone na metadata → probe null.
     probeQueryMock.mockResolvedValueOnce([{ metadata: {} }]);
 
     const { runAgentForMensagem } = await import('@/agent/core.js');
-    // NÃO propaga erro — probe-null é tratado como turno legacy default/default.
+    // NÃO propaga erro — probe-null é tratado como turno single-tenant primary/primary.
     await runAgentForMensagem('msg1');
 
     // resolveChannel jamais foi chamado — probe null nunca alcança o resolver
@@ -596,30 +600,30 @@ describe('runAgentForMensagem — channel resolution (#268 fail-loud + #411 catc
     );
     expect(failedAudits).toHaveLength(0);
 
-    // adoção skipada (resolved == default/default) e o inner roda em default/default.
+    // adoção skipada (resolved == primary/primary) e o inner roda em primary/primary.
     expect(adoptToResolvedTenantMock).not.toHaveBeenCalled();
     expect(runWithTenantContextMock).toHaveBeenCalled();
     expect(runWithTenantContextMock.mock.calls[0]![0]).toEqual({
-      tenant_id: 'default',
-      agent_id: 'default',
+      tenant_id: 'primary',
+      agent_id: 'primary',
     });
   });
 
   // ──────────────────────────────────────────────────────────────────────────
   // [🔴 HIGH fix #417] probe DB read FAILURE must fail-closed (NOT collapse to
-  // default/default). Before the fix, `probeMessageForChannel`'s blanket
+  // primary/primary). Before the fix, `probeMessageForChannel`'s blanket
   // `catch { return null }` mapped a transient DB error to the SAME null used
   // for "no telefone". Since the resolver only runs when the probe is truthy, a
   // DB error skipped resolver + adoption and routed a possibly-multi-tenant
-  // message straight to the `default/default` bucket — a silent #268 violation.
+  // message straight to the `primary/primary` bucket — a silent #268 violation.
   //
   // This negative spec drives the probe's `db.select()...limit()` to REJECT and
-  // asserts: (a) we do NOT silently process under default/default; (b) the
+  // asserts: (a) we do NOT silently process under primary/primary; (b) the
   // error propagates (BullMQ retry/DLQ); (c) a `channel_resolution_failed`
   // audit is emitted with the distinguishable `channel_probe_failed` code; and
   // (d) the resolver is never consulted (no tenant was resolved).
   // ──────────────────────────────────────────────────────────────────────────
-  it('#417 HIGH: probe com ERRO DE DB → fail-closed (propaga, audita channel_probe_failed, NÃO cai em default/default)', async () => {
+  it('#417 HIGH: probe com ERRO DE DB → fail-closed (propaga, audita channel_probe_failed, NÃO cai em primary/primary)', async () => {
     // The probe's metadata read is the FIRST (and here only) `.limit()` call —
     // make it reject (DB blip). Persisted (not Once) so a single invocation
     // can't accidentally fall through to a stale default.
@@ -647,7 +651,7 @@ describe('runAgentForMensagem — channel resolution (#268 fail-loud + #411 catc
     expect(resolveChannelMock).not.toHaveBeenCalled();
 
     // (a) fail-closed: we never entered a tenant context (no silent
-    //     default/default routing) and never adopted anything.
+    //     primary/primary routing) and never adopted anything.
     expect(runWithTenantContextMock).not.toHaveBeenCalled();
     expect(adoptToResolvedTenantMock).not.toHaveBeenCalled();
 
