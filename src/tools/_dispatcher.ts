@@ -97,11 +97,11 @@ export async function dispatchTool(input: {
   // refused here even though it might be in a granted pack.
   //
   // Fail-closed sourcing: `findForCurrentAgent` returns null for an agent with
-  // no grant row (un-backfilled / brand-new). `resolveGrantedToolNames` always
-  // unions in `baseline.core`, so a missing row degrades to the conservative
-  // baseline floor — never to "all tools" and never to a thrown error in the
-  // hot path. Baseline orchestration tools (read_turn_context, audit_decision,
-  // …) are therefore always dispatchable.
+  // no grant row (un-backfilled / brand-new). The fallback degrades to
+  // `BASE_AGENT_PACKS` (baseline.core + domain.calendar), and
+  // `resolveGrantedToolNames` always unions in `baseline.core` — never "all
+  // tools" and never a thrown error in the hot path. Baseline orchestration
+  // tools (read_turn_context, audit_decision, …) are therefore always dispatchable.
   // try/catch (not just `.catch`) so a SYNCHRONOUS throw (missing ALS context,
   // mis-wired repo) degrades to the baseline floor rather than crashing the
   // dispatch — fail-closed in the SAFE direction (a non-baseline tool is then
