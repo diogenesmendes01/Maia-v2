@@ -125,17 +125,19 @@ export function isPrimaryContext(ctx: { tenant_id: string; agent_id: string }): 
 
 ---
 
-## Task 5: Baileys ingress stamps `primary`
+## Task 5: Baileys ingress tests → `primary` (test-only)
+
+**Reality check (corrects a stale `core.ts:328` comment):** baileys does NOT persist under `default/default` before resolving. `baileys.ts:273-277` resolves the scope FIRST (`resolveTenantCtxForUpsert` → `jid-tenant-resolver` → the catch-all repo) and persists INSIDE `runWithTenantContext(ctx.scope, …)`; `createInbound` (`repositories.ts:885`, input type omits tenant/agent) stamps from the ALS. So once **Task 3** re-points the catch-all to `primary`, ingress stamps `primary` automatically — **no production change in this task.**
 
 **Files:**
-- Modify: `src/gateway/baileys.ts` (pre-resolver persistence) + `src/gateway/jid-tenant-resolver.ts` — stamp `primary` explicitly (the dropped column-default no longer backstops omitted tenant).
-- Test (unit): `tests/unit/baileys-tenant-context.spec.ts`, `tests/unit/gateway/jid-tenant-resolver.spec.ts`.
+- Test (unit): `tests/unit/baileys-tenant-context.spec.ts`, `tests/unit/gateway/jid-tenant-resolver.spec.ts` (+ family if they assert the triplet: `baileys-tenant-resolution`, `baileys-enqueue-oom`, `baileys-reaction-stub-reachable`).
+- Verify-only (no edit expected): `src/gateway/baileys.ts`, `src/gateway/jid-tenant-resolver.ts`.
 
-- [ ] **Step 1:** Verify where ingress persists the inbound row and confirm it stamps a tenant; update test expectations `default`→`primary` → red.
-- [ ] **Step 2:** Run → FAIL.
-- [ ] **Step 3:** Implement: stamp `PRIMARY_*` (or wrap in `runWithTenantContext(PRIMARY_CONTEXT)`).
-- [ ] **Step 4:** Run → PASS + typecheck + lint.
-- [ ] **Step 5: Commit** — `feat(gateway): baileys ingress stamps primary explicitly (#323)`
+- [ ] **Step 1: Verify** `jid-tenant-resolver` resolves via the (now `primary`) catch-all repo and carries NO independent `'default'` literal in production logic. Only if it does → fix that literal; otherwise no production edit.
+- [ ] **Step 2:** Update unit-test expectations: single-tenant ingress scope `{default,default}` → `{primary,primary}` → red; run → FAIL.
+- [ ] **Step 3:** No production change for the upsert path. Run specs → PASS (with Task 3 in). ⚠️ **Do NOT** wrap the upsert handler in `runWithTenantContext(PRIMARY_CONTEXT)` — that clobbers the resolved per-tenant `ctx.scope` and forces a future tenant-B inbound under `primary` (isolation violation).
+- [ ] **Step 4:** `npm run typecheck` + `npm run lint`.
+- [ ] **Step 5: Commit** — `test(gateway): baileys/jid ingress specs expect primary catch-all (#323)`
 
 ---
 
@@ -155,7 +157,7 @@ function shouldThrowOnDefaultLiteral(): boolean {
 }
 ```
 
-- [ ] **Step 4:** Run → PASS. Then run the **full local unit suite** (`npm test`) to catch any spec that implicitly relied on default-OFF — fix stragglers (they should already be on `primary`/bespoke after Tasks 3-5 + Task 8).
+- [ ] **Step 4:** Run → PASS. Then run the **full local unit suite** (`npm test`) to catch any spec that implicitly relied on default-OFF — fix stragglers (unit specs should already be on `primary`/bespoke after Tasks 3-5; real-db specs are Task 8, CI-only).
 - [ ] **Step 5: Commit** — `feat(tenant): flip MAIA_REJECT_DEFAULT_LITERAL to default-ON opt-out (#323)`
 
 > ⚠️ This is the Phase-6 flip. It only becomes "live in prod" on deploy + **owner sign-off** (spec §6). Landing the code default-ON is fine; the deploy decision is the owner's.
@@ -165,11 +167,13 @@ function shouldThrowOnDefaultLiteral(): boolean {
 ## Task 7 (parallelizable): Periphery → `primary`
 
 **Files (disjoint):**
-- Modify: `src/workers/cost-monitor.ts:26` → `runWithTenantContext(PRIMARY_CONTEXT, …)`; test `tests/unit/...cost-monitor...` if present.
-- Modify: `scripts/p8e-seed-policies.ts:225` → `primary/primary`.
-- Modify: `scripts/setup.ts` → wrap seed writes in `runWithTenantContext(PRIMARY_CONTEXT, …)` (else they fail NOT NULL after Task 2).
+- Modify: `src/workers/cost-monitor.ts:26` → `runWithTenantContext(PRIMARY_CONTEXT, …)`; ALSO update the now-stale comment (`cost-monitor.ts:14-25`, "NOT migrated… left on the legacy literal") since reader+writer both move to `primary`.
+- Modify: `scripts/p8e-seed-policies.ts:225` → `PRIMARY_CONTEXT`.
+- Modify: `scripts/setup.ts` — TWO distinct fixes:
+  - Wrap the **guarded repo** writes in `main()` (`pessoasRepo.create`, `entidadesRepo.create`, `permissoesRepo.create`, `contasRepo.create`, co-owner block) in `runWithTenantContext(PRIMARY_CONTEXT, …)` — they read tenant from the ALS.
+  - The **raw** `db.insert(self_state)` at `setup.ts:26` bypasses the ALS guard, so wrapping does NOT help it — add explicit `tenant_id: PRIMARY_TENANT_ID, agent_id: PRIMARY_AGENT_ID` to its `.values()` (after Task 2 drops the column-default, an omitted tenant here fails NOT NULL). Grep `setup.ts` for any other raw `db.insert` and give each explicit ids.
 
-- [ ] **Step 1:** Apply the three edits (each imports `PRIMARY_*`/`PRIMARY_CONTEXT`).
+- [ ] **Step 1:** Apply the edits (import `PRIMARY_*`/`PRIMARY_CONTEXT`). For setup.ts, distinguish guarded-repo writes (wrap) from raw inserts (explicit ids).
 - [ ] **Step 2:** `npm run typecheck` + `npm run lint` + any touched unit test.
 - [ ] **Step 3: Commit** — `feat(workers,scripts): move cost-monitor + seed scripts to primary (#323)`
 
