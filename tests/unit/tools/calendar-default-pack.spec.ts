@@ -6,6 +6,8 @@ import {
   DOMAIN_CALENDAR_PACK,
   DOMAIN_CALENDAR_ADMIN_PACK,
   defaultAgentGrant,
+  resolveGrantedToolNames,
+  type AgentToolGrant,
 } from '@/tools/grant-math.js';
 
 // ---------------------------------------------------------------------------
@@ -151,5 +153,34 @@ describe('calendar default pack — seed row', () => {
     const changeSummary = auditInsert!['change_summary'] as Record<string, unknown>;
     expect(changeSummary['default_tool_packs']).toEqual([...BASE_AGENT_PACKS]);
     expect((changeSummary['default_tool_packs'] as string[])).toContain('domain.calendar');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 4 — Visibility: prove the resolver surfaces calendar tools when the
+// calendar pack is granted, and gates register_custom_holiday behind the
+// admin pack. Uses the REAL `resolveGrantedToolNames` (no mocks).
+// ---------------------------------------------------------------------------
+describe('calendar default pack — visibility', () => {
+  it('domain.calendar grant → schedule_reminder e cancel_reminder visíveis; register_custom_holiday NÃO', () => {
+    const grant: AgentToolGrant = {
+      granted_packs: ['baseline.core', 'domain.calendar'],
+      granted_tools: [],
+      denied_tools: [],
+    };
+    const resolved = resolveGrantedToolNames(grant);
+    expect(resolved).toContain('schedule_reminder');
+    expect(resolved).toContain('cancel_reminder');
+    expect(resolved).not.toContain('register_custom_holiday');
+  });
+
+  it('domain.calendar.admin grant → register_custom_holiday visível', () => {
+    const grant: AgentToolGrant = {
+      granted_packs: ['baseline.core', 'domain.calendar', 'domain.calendar.admin'],
+      granted_tools: [],
+      denied_tools: [],
+    };
+    const resolved = resolveGrantedToolNames(grant);
+    expect(resolved).toContain('register_custom_holiday');
   });
 });
