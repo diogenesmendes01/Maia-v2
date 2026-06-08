@@ -9,20 +9,23 @@
 --   risk_signal_classify, conversation_summary_compose,
 --   conversation_state_update
 -- With those tools now available in the pack, five existing baseline
--- skills should be upgraded to `tool_mediated` (version=2) so the
--- runtime actually invokes the tools they declare. Three entirely new
--- baseline skills are also added at version=1 to cover the new tools:
+-- skills are upgraded to `tool_mediated` (version=2) so the runtime
+-- actually invokes the tools they declare. Three entirely new baseline
+-- skills are added at version=1 to cover the new tools:
 --   escalate_on_risk, summarization, manage_conversation_state.
 --
 -- WHAT THIS MIGRATION DOES
---   1. Inserts v2 (tool_mediated) rows for 5 converted skills:
+--   1. DEPRECATEs the v1 `prompt_only` rows for the 5 converted skills
+--      (sets status='deprecated', deprecated_at=NOW()) so the one-active
+--      invariant (idx_skills_one_active_uq) is satisfied before the INSERT.
+--   2. Inserts v2 `tool_mediated` rows for the 5 converted skills:
 --        safe_conversation, retrieve_context, handoff_to_owner,
 --        remember_safe_fact, audit_decision
---      The v1 prompt_only rows (migration 075) are LEFT INTACT —
---      version pinning lets legacy skill-selectors keep using v1 until
---      the runtime is updated to select the latest active version.
---   2. Inserts v1 (tool_mediated) rows for 3 new skills:
+--   3. Inserts v1 `tool_mediated` rows for 3 new skills:
 --        escalate_on_risk, summarization, manage_conversation_state
+--   4. Backfills a safe, permissive usage_policy for all 8 new/upgraded
+--      rows (mirrors migration 077's permissive backfill; idempotent via
+--      usage_policy IS NULL guard).
 --
 -- SKILLS THAT REMAIN prompt_only (NO v2 rows):
 --   ask_clarification  — pure language composition from current input;
@@ -31,10 +34,10 @@
 --                          itself has no side effects that need wiring here.
 --   explain_limitation  — pure language composition; no runtime writes.
 --
--- respect_privacy is NOT seeded as a separate skill. It is covered by:
+-- respect_privacy is NOT seeded as a separate skill. Covered by:
 --   safe_conversation (reads context safely), explain_limitation
---   (honest refusal), audit_decision (audit-trail). See docs/architecture/
---   concerns/capability-taxonomy.md for rationale.
+--   (honest refusal), audit_decision (audit-trail). See
+--   docs/architecture/concerns/baseline-skills-v2.md for rationale.
 --
 -- BASELINE_CORE_PACK v2 tools (the ONLY tools baseline skills may
 -- reference):
@@ -50,20 +53,57 @@
 --   Mirrors the controlled-exception pattern of migrations 037, 039,
 --   and 075 which seed `active` rows directly for governed bootstrap.
 --
--- IDEMPOTENT: `ON CONFLICT DO NOTHING` on the version-unique index
--- (idx_skills_version_uq = tenant_id, COALESCE(agent_id,'tenant_wide'),
--- skill_descriptor, version). Re-runs are safe; an operator-edited row
--- is never overwritten.
+-- ONE-ACTIVE INVARIANT (idx_skills_one_active_uq): only ONE active row
+--   may exist per (tenant_id, COALESCE(agent_id,'tenant_wide'),
+--   skill_descriptor). Steps 1 and 2 are ordered so the old active row is
+--   deprecated before the new one is inserted. The INSERT is idempotent via
+--   ON CONFLICT DO NOTHING on the version-unique index; the preceding UPDATE
+--   is also idempotent (AND status = 'active' guard prevents re-deprecation).
+--
+-- IDEMPOTENT: the deprecation UPDATE is guarded by `AND status = 'active'`
+--   (no-op if already deprecated); the INSERT uses `ON CONFLICT DO NOTHING`
+--   on idx_skills_version_uq (tenant_id, COALESCE(agent_id,'tenant_wide'),
+--   skill_descriptor, version). Re-runs are safe; an operator-edited row
+--   is never overwritten.
 --
 -- TENANT (invariant #1): seeded under the bootstrap tenant 'default'
 -- (same as 037/039/075). Multi-tenant rollout seeds per tenant via the
--- same idempotent INSERT; nothing here is cross-tenant.
+-- same idempotent steps; nothing here is cross-tenant.
 --
 -- NOTE: no BEGIN/COMMIT — scripts/migrate.ts wraps each forward
 -- migration in a transaction (no `-- maia:no-transaction` marker here).
 -- Mirrors 075/076/079.
 -- =====================================================================
 
+-- ---------------------------------------------------------------------
+-- Step 1: Deprecate v1 prompt_only rows for the 5 converted skills.
+-- The one-active invariant (idx_skills_one_active_uq) requires there is
+-- at most ONE active row per descriptor. We deprecate v1 BEFORE inserting
+-- v2 so the INSERT never sees a conflicting active row.
+-- Idempotent: AND status = 'active' is a no-op on already-deprecated rows.
+-- ---------------------------------------------------------------------
+UPDATE skills
+SET
+  status = 'deprecated',
+  deprecated_at = NOW(),
+  deprecated_reason = 'superseded by tool_mediated v2 (issue #448)'
+WHERE tenant_id = 'default'
+  AND agent_id IS NULL
+  AND proposed_by = 'system'
+  AND status = 'active'
+  AND skill_descriptor IN (
+    'safe_conversation',
+    'retrieve_context',
+    'handoff_to_owner',
+    'remember_safe_fact',
+    'audit_decision'
+  )
+  AND version = 1;
+
+-- ---------------------------------------------------------------------
+-- Step 2: Insert v2 (tool_mediated) rows for the 5 converted skills and
+-- v1 (tool_mediated) rows for the 3 new skills.
+-- ---------------------------------------------------------------------
 INSERT INTO skills (
   tenant_id, agent_id, skill_descriptor, category, execution_mode,
   goal, when_to_use, procedure, constraints,
@@ -89,7 +129,7 @@ FROM (VALUES
   -- classifies risk before responding. risk_signal_classify is wired so
   -- the agent detects potential risk on every turn, not just on escalate.
   (
-    'safe_conversation', 'tool_mediated', 'tool_mediated',
+    'safe_conversation', 'compose', 'tool_mediated',
     'Conversar de forma segura e contextual, lendo o turno e memória autorizada, sem inventar fatos ou exceder o escopo.',
     'Sempre que precisar responder em linguagem natural dentro do escopo do interlocutor.',
     '{"system_prompt":"Responda de forma segura e contextual. Use read_turn_context para entender o turno, recall_memory para recuperar contexto autorizado, e risk_signal_classify para avaliar o risco antes de responder."}',
@@ -100,7 +140,7 @@ FROM (VALUES
   -- tool_mediated mode allows the runtime to log which tool produced
   -- which piece of context (auditability, invariant #4).
   (
-    'retrieve_context', 'tool_mediated', 'tool_mediated',
+    'retrieve_context', 'compose', 'tool_mediated',
     'Recuperar contexto autorizado (memória e histórico do turno) dentro do escopo.',
     'Quando responder bem exige relembrar memória ou o histórico recente da conversa.',
     '{"system_prompt":"Recupere contexto usando read_turn_context e recall_memory. Retorne somente o contexto autorizado no escopo do interlocutor."}',
@@ -110,7 +150,7 @@ FROM (VALUES
   -- handoff_to_owner v2 — now composes a summary before escalating so
   -- the owner receives structured context, not just a raw dump.
   (
-    'handoff_to_owner', 'tool_mediated', 'tool_mediated',
+    'handoff_to_owner', 'decide', 'tool_mediated',
     'Escalar a conversa para o dono do agente com contexto resumido e decisão auditada.',
     'Quando a situação excede o que o agente pode/deve resolver e precisa do dono.',
     '{"system_prompt":"Resuma a conversa com conversation_summary_compose, registre a decisão com audit_decision e escale com handoff_to_owner."}',
@@ -120,7 +160,7 @@ FROM (VALUES
   -- remember_safe_fact v2 — pairs the write (remember_safe_fact) with
   -- an audit record (audit_decision) so every memory write is traceable.
   (
-    'remember_safe_fact', 'tool_mediated', 'tool_mediated',
+    'remember_safe_fact', 'compose', 'tool_mediated',
     'Registrar um fato seguro sobre o interlocutor e auditar o registro.',
     'Quando o interlocutor revela uma preferência segura que ajuda atendimentos futuros.',
     '{"system_prompt":"Use remember_safe_fact para persistir o fato seguro e audit_decision para registrar a decisão de armazenar."}',
@@ -130,7 +170,7 @@ FROM (VALUES
   -- audit_decision v2 — now explicitly tool_mediated so the runtime can
   -- enforce that the audit_decision tool is always called (not bypassed).
   (
-    'audit_decision', 'tool_mediated', 'tool_mediated',
+    'audit_decision', 'decide', 'tool_mediated',
     'Registrar explicitamente uma decisão e seu racional na trilha de auditoria via tool.',
     'Quando uma decisão relevante deve ficar rastreável (invariante #4).',
     '{"system_prompt":"Use audit_decision para registrar a decisão e o racional na trilha de auditoria."}',
@@ -179,3 +219,35 @@ FROM (VALUES
 ) AS v(skill_descriptor, category, execution_mode, goal, when_to_use, procedure, allowed_tools, version)
 ON CONFLICT (tenant_id, COALESCE(agent_id, 'tenant_wide'), skill_descriptor, version)
   DO NOTHING;
+
+-- ---------------------------------------------------------------------
+-- Step 3: Backfill a safe, permissive usage_policy for all new/upgraded
+-- baseline skill rows. Mirrors migration 077's permissive backfill for
+-- the original 8 baseline skills. Idempotent: only rows whose
+-- usage_policy is still NULL are touched.
+-- ---------------------------------------------------------------------
+UPDATE skills
+SET usage_policy = jsonb_build_object(
+  'allowed_audience', jsonb_build_array(
+    'owner', 'manager', 'employee', 'accountant',
+    'customer', 'vendor', 'lead', 'system_user'
+  ),
+  'data_scope', jsonb_build_array('public_info'),
+  'exposure_policy', 'public_safe',
+  'requires_auth_level', 'known_external',
+  'requires_confirmation', false
+)
+WHERE tenant_id = 'default'
+  AND agent_id IS NULL
+  AND proposed_by = 'system'
+  AND usage_policy IS NULL
+  AND skill_descriptor IN (
+    'safe_conversation',
+    'retrieve_context',
+    'handoff_to_owner',
+    'remember_safe_fact',
+    'audit_decision',
+    'escalate_on_risk',
+    'summarization',
+    'manage_conversation_state'
+  );
