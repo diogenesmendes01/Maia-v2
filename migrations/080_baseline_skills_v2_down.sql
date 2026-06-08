@@ -10,9 +10,9 @@
 --
 -- Step 1 reversal (SECOND): re-activate the v1 prompt_only rows that
 --   were deprecated by the forward migration (status='active', clear
---   deprecated_at/deprecated_reason). Safe because the conflicting v2
---   active rows were deleted in the step above. Idempotent: the
---   deprecated_reason guard prevents re-activating unrelated rows.
+--   deprecated_at). Safe because the conflicting v2 active rows were
+--   deleted in the step above. Idempotent: the version=1 AND
+--   status='deprecated' guard prevents re-activating unrelated rows.
 --
 -- Step 3 reversal: no explicit reversal needed for usage_policy. The
 --   policy is permissive; after Step 2 deletes the rows there is nothing
@@ -51,13 +51,11 @@ WHERE tenant_id = 'default'
 UPDATE skills
 SET
   status = 'active',
-  deprecated_at = NULL,
-  deprecated_reason = NULL
+  deprecated_at = NULL
 WHERE tenant_id = 'default'
   AND agent_id IS NULL
   AND proposed_by = 'system'
   AND status = 'deprecated'
-  AND deprecated_reason = 'superseded by tool_mediated v2 (issue #448)'
   AND skill_descriptor IN (
     'safe_conversation',
     'retrieve_context',

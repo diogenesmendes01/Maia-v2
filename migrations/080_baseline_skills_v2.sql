@@ -85,8 +85,7 @@
 UPDATE skills
 SET
   status = 'deprecated',
-  deprecated_at = NOW(),
-  deprecated_reason = 'superseded by tool_mediated v2 (issue #448)'
+  deprecated_at = NOW()
 WHERE tenant_id = 'default'
   AND agent_id IS NULL
   AND proposed_by = 'system'
