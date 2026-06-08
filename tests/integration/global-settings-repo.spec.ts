@@ -888,14 +888,14 @@ d('migration 062 down: backfill into agent_facts before DROP', () => {
 
       const mainRow = await c.query<{ valor: { model: string } }>(
         `SELECT valor FROM agent_facts
-         WHERE tenant_id='default' AND agent_id='default'
+         WHERE tenant_id='primary' AND agent_id='primary'
            AND escopo='global' AND chave='llm.model.main'`,
       );
       expect(mainRow.rows[0]!.valor).toEqual({ model: 'claude-sonnet-4-6' });
 
       const fastRow = await c.query<{ valor: { model: string } }>(
         `SELECT valor FROM agent_facts
-         WHERE tenant_id='default' AND agent_id='default'
+         WHERE tenant_id='primary' AND agent_id='primary'
            AND escopo='global' AND chave='llm.model.fast'`,
       );
       expect(fastRow.rows[0]!.valor).toEqual({

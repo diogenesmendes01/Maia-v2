@@ -60,22 +60,21 @@ async function seedFixtures(): Promise<void> {
         ON CONFLICT (id) DO NOTHING`,
       [AGENT, TENANT_A],
     );
-    // The pessoas/entidades schemas in main don't have tenant_id columns
-    // wired into FKs yet (FK from idempotency_keys is by id only). Insert
-    // ONE shared pessoa+entidade so both tenant scenarios can reuse them
-    // — the idempotency_keys row's own (tenant_id, agent_id) columns
-    // provide the isolation we're verifying.
+    // Seed ONE shared pessoa+entidade (stamped TENANT_A/AGENT — issue #323
+    // dropped the 'default' column-default, so tenant_id/agent_id are required)
+    // that both tenant scenarios reuse; the idempotency_keys row's own
+    // (tenant_id, agent_id) columns provide the isolation we're verifying.
     await c.query(
-      `INSERT INTO pessoas(id, nome, telefone_whatsapp, tipo)
-       VALUES ($1, 'issue298-pessoa', '+5511000000298', 'funcionario')
+      `INSERT INTO pessoas(id, nome, telefone_whatsapp, tipo, tenant_id, agent_id)
+       VALUES ($1, 'issue298-pessoa', '+5511000000298', 'funcionario', $2, $3)
        ON CONFLICT (id) DO NOTHING`,
-      [PESSOA_ID],
+      [PESSOA_ID, TENANT_A, AGENT],
     );
     await c.query(
-      `INSERT INTO entidades(id, nome, tipo)
-       VALUES ($1, 'issue298-entidade', 'pj')
+      `INSERT INTO entidades(id, nome, tipo, tenant_id, agent_id)
+       VALUES ($1, 'issue298-entidade', 'pj', $2, $3)
        ON CONFLICT (id) DO NOTHING`,
-      [ENTIDADE_ID],
+      [ENTIDADE_ID, TENANT_A, AGENT],
     );
   } finally {
     c.release();
