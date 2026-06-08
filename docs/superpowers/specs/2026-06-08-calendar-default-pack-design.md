@@ -28,8 +28,9 @@ Restrições que moldam o design:
   - `src/tools/grant-math.ts:~643` — `defaultAgentGrant()`.
   - `src/db/repositories.ts:~4778-4784` — `createWithSeedAndAudit` insere `granted_packs: ['baseline.core']` (literal).
   - `src/db/repositories.ts:~4808` — payload de audit `default_tool_packs: ['baseline.core']`.
-  - `src/db/repositories.ts:~432` — `agentToolGrantsRepo.findForCurrentAgent` fallback (sem row → baseline).
-  - `src/tools/runtime-filter.ts:115` e `src/tools/_dispatcher.ts:100` — fallback (sem row → baseline).
+  - `src/tools/runtime-filter.ts:115` — `resolveEffectiveGrant` fallback `?? ['baseline.core']` (literal).
+  - `src/tools/_dispatcher.ts:~122` — fallback `?? []` (array vazio; o piso vem de `resolveGrantedToolNames`).
+  - `src/db/repositories.ts:~442` — `findForCurrentAgent` retorna `rows[0] ?? null` (SEM literal; o `baseline.core` no comentário ~432 é prosa). Fallback efetivo é do chamador.
   - `src/db/schema.ts:323` — column DEFAULT `'{baseline.core}'::text[]`.
 
 Verificado: **nada hoje concede `domain.calendar` nem usa `register_custom_holiday`** fora da própria tool e do catálogo gerado — então redefinir/separar os packs é seguro.
@@ -45,7 +46,7 @@ Verificado: **nada hoje concede `domain.calendar` nem usa `register_custom_holid
 Para a feature funcionar para agentes **novos**, todos os sites de floor da §2 precisam passar a conceder `baseline.core ∪ domain.calendar` — e sem o drift que 6 literais separados causariam.
 
 - **Extrair `BASE_AGENT_PACKS`** para um módulo leve e sem dependências pesadas (ex.: `src/tools/base-agent-packs.ts`, contendo SOMENTE `export const BASE_AGENT_PACKS = ['baseline.core', 'domain.calendar'] as const`). Zero imports de registry/gateway → seguro para `repositories.ts` importar sem violar a separação que o comentário `4691-4694` protege. (O plano valida ausência de ciclo de import.)
-- **Reapontar para `BASE_AGENT_PACKS`** todos os sites de literal: `defaultAgentGrant()`, o seed `createWithSeedAndAudit` (`granted_packs` + o payload de audit), e os 3 fallbacks (`repositories.ts:432`, `runtime-filter.ts:115`, `_dispatcher.ts:100`). Assim o "floor" é consistente quer o agente tenha grant row, quer caia no fallback.
+- **Reapontar para `BASE_AGENT_PACKS`**: `defaultAgentGrant()`, o seed `createWithSeedAndAudit` (`granted_packs` + payload de audit), e os fallbacks que resolvem `granted_packs` sem row — `runtime-filter.ts:115` (`?? ['baseline.core']`) e `_dispatcher.ts:~122` (`?? []`). **Não** são repoint: `findForCurrentAgent` (`repositories.ts:~442`, retorna `rows[0] ?? null` — o fallback é do chamador) nem `resolveGrantedToolNames` (já expande os packs do grant + une o piso baseline). Assim o floor fica consistente quer o agente tenha row, quer caia no fallback de grant.
 - `DEFAULT_AGENT_PACKS` (= `['baseline.core']`) e `PLATFORM_DEFAULT_DOMAIN_PACKS` (= `['domain.calendar']`) permanecem como a decomposição semântica; `BASE_AGENT_PACKS = [...DEFAULT_AGENT_PACKS, ...PLATFORM_DEFAULT_DOMAIN_PACKS]` (com um teste pinando essa igualdade).
 - **Column default** (`schema.ts:323`): atualizado para `'{baseline.core,domain.calendar}'` via a **mesma migration** do backfill (não dá pra referenciar a constante TS no SQL — é o único site que fica como literal SQL, coberto por teste).
 - **`resolveGrantedToolNames` fica como está** (`grant-math.ts:~518`): ela une `BASELINE_CORE_PACK.tools` incondicionalmente como floor. O calendar entra via o **grant row / fallbacks** (acima), NÃO via essa união — assim `denied_tools` e o split do `domain.calendar.admin` continuam funcionando. Não é site de repoint.

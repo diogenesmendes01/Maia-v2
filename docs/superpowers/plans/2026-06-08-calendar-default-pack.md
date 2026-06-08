@@ -113,7 +113,7 @@ export const BASE_AGENT_PACKS = ['baseline.core', 'domain.calendar'] as const;
   - Adicionar `DOMAIN_CALENDAR_ADMIN_PACK` ao array `DOMAIN_PACKS` (~400-408).
   - Adicionar `export const PLATFORM_DEFAULT_DOMAIN_PACKS: readonly string[] = ['domain.calendar'] as const;` perto de `DEFAULT_AGENT_PACKS` (~130). Manter `DEFAULT_AGENT_PACKS = ['baseline.core']`.
 
-- [ ] **Step 6: Editar `src/tools/packs.ts`** — adicionar `DOMAIN_CALENDAR_ADMIN_PACK` e `PLATFORM_DEFAULT_DOMAIN_PACKS` à lista de re-exports (~41-66). Os guards (`assertDomainPackToolsKnown`, `assertPackToolsExist`) rodam no load e devem passar (register_custom_holiday segue conhecido).
+- [ ] **Step 6: Editar `src/tools/packs.ts`** — adicionar `DOMAIN_CALENDAR_ADMIN_PACK` e `PLATFORM_DEFAULT_DOMAIN_PACKS` à lista de re-exports (~41-66). Guards no load: `assertDomainPackToolsKnown`/`assertPackToolsExist` passam (register_custom_holiday segue conhecido). **`assertConservative` NÃO é afetado** — o `FORBIDDEN_IN_BASELINE` (packs.ts:79-99) lista `schedule_reminder`/`cancel_reminder`/`register_custom_holiday`, mas como NADA entra no `baseline.core` (as tools ficam em `domain.calendar`/`.admin`), o guard segue verde. Não confundir com erro.
 
 - [ ] **Step 7: Rodar o teste (passa)**
 
@@ -158,14 +158,18 @@ describe('calendar default pack — floor', () => {
 Run: `npx vitest run tests/unit/tools/calendar-default-pack.spec.ts -t floor`
 Expected: FAIL (`defaultAgentGrant` ainda retorna só baseline.core).
 
-- [ ] **Step 3: Repoint** — em cada site, trocar o literal `['baseline.core']` por `[...BASE_AGENT_PACKS]` (importando de `@/tools/base-agent-packs.js`):
-  - `grant-math.ts` `defaultAgentGrant()` → `granted_packs: [...BASE_AGENT_PACKS]`.
-  - `repositories.ts` `createWithSeedAndAudit` (~4778) → o INSERT de `granted_packs`.
-  - `repositories.ts` audit payload `default_tool_packs` (~4808).
-  - `repositories.ts` `findForCurrentAgent` fallback (~432/444-456) → o `granted_packs ?? [...]`.
-  - `runtime-filter.ts` `resolveEffectiveGrant` fallback (~115).
-  - `_dispatcher.ts` fallback (~100/114).
-  > NÃO tocar `resolveGrantedToolNames` (mantém a união de `BASELINE_CORE_PACK.tools` como floor independente). Confirmar que `base-agent-packs.ts` não cria ciclo de import (`npx tsc --noEmit` na Step 5).
+- [ ] **Step 3: Repoint** (importando `BASE_AGENT_PACKS` de `@/tools/base-agent-packs.js`). ⚠️ Os sites NÃO são todos o literal `['baseline.core']` — confirme cada um antes de editar:
+  - **Grant efetivo concedido** (substituem o array literal):
+    - `grant-math.ts` `defaultAgentGrant()` (~643) → `granted_packs: [...BASE_AGENT_PACKS]`.
+    - `repositories.ts` `createWithSeedAndAudit` (~4781) → o INSERT `granted_packs: [...BASE_AGENT_PACKS]`.
+    - `repositories.ts` audit payload `default_tool_packs` (~4808) → `[...BASE_AGENT_PACKS]`.
+  - **Fallbacks sem grant row** (alinhar ao mesmo floor):
+    - `runtime-filter.ts` `resolveEffectiveGrant` (~115): hoje `?? ['baseline.core']` → `?? [...BASE_AGENT_PACKS]`.
+    - `_dispatcher.ts` (~122): hoje `?? []` (array **vazio**, NÃO `['baseline.core']`) → `?? [...BASE_AGENT_PACKS]`.
+  - **NÃO são sites de repoint** (deixar como estão):
+    - `repositories.ts` `findForCurrentAgent` (~442-456): retorna `rows[0] ?? null` — sem literal de packs (o "baseline.core" no comentário ~432 é só prosa). O fallback é do chamador (`resolveEffectiveGrant`, acima).
+    - `resolveGrantedToolNames` (`grant-math.ts:~518`): NÃO tocar. Ele já EXPANDE os packs presentes no grant (um fallback com `domain.calendar` rende as calendar tools) e une `BASELINE_CORE_PACK.tools` como piso independente.
+  > Confirmar ausência de ciclo de import com `npx tsc --noEmit` (Step 5).
 
 - [ ] **Step 4: Escrever o teste do seed semeado (falha → passa)** — pina o LITERAL do repo, não só `defaultAgentGrant()`. Em `tests/unit/...` mocando o insert do `agentsRepo.createWithSeedAndAudit`, asserir que o `granted_packs` semeado contém `domain.calendar`. (Se o seed for difícil de unit-testar isolado, cobrir via integration em `tests/integration/*-real-db` — marcar como tal; specs real-db rodam no CI com Postgres.)
 
@@ -210,6 +214,8 @@ ALTER TABLE agent_tool_grants
 - [ ] **Step 3: Escrever `migrations/081_calendar_default_pack_down.sql`:**
 
 ```sql
+-- Seguro: nada concedia 'domain.calendar' antes desta feature (spec §2/§7),
+-- então não há grant explícito pré-existente a ser indevidamente removido.
 UPDATE agent_tool_grants
 SET granted_packs = array_remove(granted_packs, 'domain.calendar')
 WHERE 'domain.calendar' = ANY(granted_packs);
@@ -263,7 +269,10 @@ git commit -m "test(tools): calendar tools visible via grant, admin tool gated"
 - Modify: `tests/unit/tools/agent-tool-grants.spec.ts`
 - Possivelmente: `src/admin-ui/generated/tool-catalog.ts` (regenerado)
 
-- [ ] **Step 1: Atualizar `tests/unit/tools/agent-tool-grants.spec.ts`** — os casos que assertam sobre `defaultAgentGrant()` (`:45-52`) passam a esperar `baseline.core + domain.calendar`. Os casos que testam um grant explicitamente SEM domain pack (ex.: `:30-43`) permanecem `== BASELINE`. Distinguir os dois.
+- [ ] **Step 1: Atualizar `tests/unit/tools/agent-tool-grants.spec.ts`** — o caso de `defaultAgentGrant()` (`:45-52`) tem **DUAS** assertions, ambas mudam:
+  - (a) `defaultAgentGrant().granted_packs` → `[...BASE_AGENT_PACKS]` (era só `DEFAULT_AGENT_PACKS`).
+  - (b) `resolveGrantedToolNames(defaultAgentGrant())` → BASELINE **+ as 7 tools do `domain.calendar`** (não mais só BASELINE). Expandir o conjunto esperado, senão essa assertion fica vermelha.
+  Os casos que testam um grant explicitamente SEM domain pack (ex.: `:30-43`) permanecem `== BASELINE` — não mexer.
 
 - [ ] **Step 2: Regenerar o catálogo (se mudou)**
 
