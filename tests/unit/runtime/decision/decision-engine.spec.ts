@@ -103,6 +103,10 @@ function mkDeps(overrides: Partial<DecisionEngineDeps> = {}): DecisionEngineDeps
     lockdownReader,
     metrics,
     clock: () => Date.now(),
+    // Tests assume the original 400ms budget for deterministic exhaustion;
+    // pin it here so the raised DECISION_ENGINE_BUDGET_MS default doesn't make
+    // the +500ms-clock / hung-dependency cases stop firing. Override per-test.
+    budget_ms: 400,
     ...overrides,
   };
 }
@@ -298,6 +302,28 @@ describe('P9b — DecisionEngine orchestrator', () => {
     const r = await engine.run({ base: mkBase() });
     expect(r.packet.action_mode).toBe('escalate');
     expect(r.fallback_applied).toBeNull();
+  });
+
+  it('does NOT budget-fallback when the intent hop fits a raised budget (regression: canned-reply bug)', async () => {
+    // Repro of the prod incident: a ~390ms Haiku intent hop exhausted the old
+    // hard-coded 400ms budget on EVERY heuristic-miss, forcing the canned
+    // `ask_clarification` reply (main LLM skipped). With the budget raised
+    // above the hop, the engine stays on its normal path.
+    let now = 0;
+    const deps = mkDeps({
+      clock: () => now,
+      budget_ms: 2500,
+      intentClassifier: {
+        classify: vi.fn().mockImplementation(async () => {
+          now += 390;
+          return { label: 'greet', confidence: 0.9 };
+        }),
+      },
+    });
+    const engine = new DecisionEngine(deps);
+    const r = await engine.run({ base: mkBase() });
+    expect(r.fallback_applied).toBeFalsy();
+    expect(r.packet.action_mode).not.toBe('ask_clarification');
   });
 
   it('preserves trace_id from base context in packet', async () => {

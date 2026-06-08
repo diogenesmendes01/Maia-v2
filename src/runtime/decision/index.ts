@@ -166,6 +166,12 @@ export interface CreateDecisionEngineEnv {
   metrics?: MetricsClient;
   clock?: () => number;
   /**
+   * Optional total wall-clock budget (ms) override, forwarded to the
+   * DecisionEngine. Defaults to `config.DECISION_ENGINE_BUDGET_MS`. Tests
+   * inject a small value to force the budget-exhaustion fallback.
+   */
+  budget_ms?: number;
+  /**
    * Optional RiskScorer override. When not provided, the composition root
    * falls back to `RiskScorerStubImpl` for backward compatibility with
    * test harnesses that build their own env.
@@ -235,5 +241,6 @@ export function createDecisionEngine(
   };
   if (env.metrics) deps.metrics = env.metrics;
   if (env.clock) deps.clock = env.clock;
+  if (env.budget_ms !== undefined) deps.budget_ms = env.budget_ms;
   return new DecisionEngine(deps);
 }
