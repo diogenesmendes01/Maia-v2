@@ -33,8 +33,8 @@ async function loadRepos(): Promise<typeof import('../../src/db/repositories.js'
 
 /**
  * Ensure a (tenant_id, agent_id) pair exists so FK references resolve. The
- * 'default' tenant + agent are seeded by migration 007/009; for non-default
- * pairs we insert idempotently.
+ * reserved 'primary' tenant + agent are seeded by migration 080 (issue #323
+ * retired the legacy default bucket); for any other pair we insert idempotently.
  */
 async function ensureTenantAgent(c: pg.PoolClient, tenant: string, agent: string): Promise<void> {
   // tenants.nome and agents.nome are NOT NULL — insert them (matches the other
@@ -201,27 +201,27 @@ dRepo('agentAudienceProfilesRepo — ALS-scoped reads (#407)', () => {
     const c = await pool.connect();
     const created: { pessoas: string[]; profiles: string[] } = { pessoas: [], profiles: [] };
     try {
-      await ensureTenantAgent(c, 'default', 'agentR1');
-      await ensureTenantAgent(c, 'default', 'agentR2');
+      await ensureTenantAgent(c, 'primary', 'agentR1');
+      await ensureTenantAgent(c, 'primary', 'agentR2');
       const p1 = await mkPessoaRow(c, {
-        tenant: 'default',
+        tenant: 'primary',
         agent: 'agentR1',
         phone: '+5511900777001',
       });
       const p2 = await mkPessoaRow(c, {
-        tenant: 'default',
+        tenant: 'primary',
         agent: 'agentR2',
         phone: '+5511900777001',
       });
       created.pessoas.push(p1, p2);
       const a1 = await mkProfileRow(c, {
-        tenant: 'default',
+        tenant: 'primary',
         agent: 'agentR1',
         pessoa_id: p1,
         audience_type: 'owner',
       });
       const a2 = await mkProfileRow(c, {
-        tenant: 'default',
+        tenant: 'primary',
         agent: 'agentR2',
         pessoa_id: p2,
         audience_type: 'customer',
@@ -231,14 +231,14 @@ dRepo('agentAudienceProfilesRepo — ALS-scoped reads (#407)', () => {
       const { agentAudienceProfilesRepo } = await loadRepos();
 
       const fromR1 = await runWithTenantContext(
-        { tenant_id: 'default', agent_id: 'agentR1' },
+        { tenant_id: 'primary', agent_id: 'agentR1' },
         () => agentAudienceProfilesRepo.findByPessoa(p1),
       );
       expect(fromR1?.audience_type).toBe('owner');
 
       // Agent R1 must NOT see agent R2's pessoa/profile.
       const crossAgent = await runWithTenantContext(
-        { tenant_id: 'default', agent_id: 'agentR1' },
+        { tenant_id: 'primary', agent_id: 'agentR1' },
         () => agentAudienceProfilesRepo.findByPessoa(p2),
       );
       expect(crossAgent).toBeNull();
@@ -261,19 +261,19 @@ dRepo('agentAudienceProfilesRepo — ALS-scoped reads (#407)', () => {
     const c = await pool.connect();
     const created: { pessoas: string[]; profiles: string[] } = { pessoas: [], profiles: [] };
     try {
-      await ensureTenantAgent(c, 'default', 'agentL1');
-      await ensureTenantAgent(c, 'default', 'agentL2');
-      const p1 = await mkPessoaRow(c, { tenant: 'default', agent: 'agentL1', phone: '+5511900888101' });
-      const p2 = await mkPessoaRow(c, { tenant: 'default', agent: 'agentL2', phone: '+5511900888102' });
+      await ensureTenantAgent(c, 'primary', 'agentL1');
+      await ensureTenantAgent(c, 'primary', 'agentL2');
+      const p1 = await mkPessoaRow(c, { tenant: 'primary', agent: 'agentL1', phone: '+5511900888101' });
+      const p2 = await mkPessoaRow(c, { tenant: 'primary', agent: 'agentL2', phone: '+5511900888102' });
       created.pessoas.push(p1, p2);
       const a1 = await mkProfileRow(c, {
-        tenant: 'default',
+        tenant: 'primary',
         agent: 'agentL1',
         pessoa_id: p1,
         audience_type: 'owner',
       });
       const a2 = await mkProfileRow(c, {
-        tenant: 'default',
+        tenant: 'primary',
         agent: 'agentL2',
         pessoa_id: p2,
         audience_type: 'customer',
@@ -282,11 +282,11 @@ dRepo('agentAudienceProfilesRepo — ALS-scoped reads (#407)', () => {
 
       const { agentAudienceProfilesRepo } = await loadRepos();
       const fromL1 = await runWithTenantContext(
-        { tenant_id: 'default', agent_id: 'agentL1' },
+        { tenant_id: 'primary', agent_id: 'agentL1' },
         () => agentAudienceProfilesRepo.list(),
       );
       // Every returned row is the current agent's; the other agent's is invisible.
-      expect(fromL1.every((p) => p.agent_id === 'agentL1' && p.tenant_id === 'default')).toBe(true);
+      expect(fromL1.every((p) => p.agent_id === 'agentL1' && p.tenant_id === 'primary')).toBe(true);
       const ids = fromL1.map((p) => p.id);
       expect(ids).toContain(a1);
       expect(ids).not.toContain(a2);
@@ -307,21 +307,21 @@ dRepo('agentAudienceProfilesRepo — ALS-scoped reads (#407)', () => {
     const c = await pool.connect();
     const created: { pessoas: string[]; profiles: string[] } = { pessoas: [], profiles: [] };
     try {
-      await ensureTenantAgent(c, 'default', 'agentRI');
+      await ensureTenantAgent(c, 'primary', 'agentRI');
       const withProfile = await mkPessoaRow(c, {
-        tenant: 'default',
+        tenant: 'primary',
         agent: 'agentRI',
         phone: '+5511900888201',
       });
       const noProfile = await mkPessoaRow(c, {
-        tenant: 'default',
+        tenant: 'primary',
         agent: 'agentRI',
         phone: '+5511900888202',
       });
       created.pessoas.push(withProfile, noProfile);
       created.profiles.push(
         await mkProfileRow(c, {
-          tenant: 'default',
+          tenant: 'primary',
           agent: 'agentRI',
           pessoa_id: withProfile,
           audience_type: 'employee',
@@ -332,7 +332,7 @@ dRepo('agentAudienceProfilesRepo — ALS-scoped reads (#407)', () => {
       const { resolveIdentity } = await import('../../src/identity/resolver.js');
 
       const resolved = await runWithTenantContext(
-        { tenant_id: 'default', agent_id: 'agentRI' },
+        { tenant_id: 'primary', agent_id: 'agentRI' },
         () => resolveIdentity({ telefone_whatsapp: '+5511900888201' }),
       );
       expect(resolved.kind).toBe('resolved');
@@ -344,7 +344,7 @@ dRepo('agentAudienceProfilesRepo — ALS-scoped reads (#407)', () => {
 
       // Known pessoa, NO active audience profile → fail-closed quarantine.
       const blocked = await runWithTenantContext(
-        { tenant_id: 'default', agent_id: 'agentRI' },
+        { tenant_id: 'primary', agent_id: 'agentRI' },
         () => resolveIdentity({ telefone_whatsapp: '+5511900888202' }),
       );
       expect(blocked.kind).toBe('quarantined');

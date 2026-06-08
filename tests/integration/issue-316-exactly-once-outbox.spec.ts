@@ -87,16 +87,16 @@ async function seedFixtures(): Promise<void> {
       [AGENT, TENANT_A],
     );
     await c.query(
-      `INSERT INTO pessoas(id, nome, telefone_whatsapp, tipo)
-       VALUES ($1, 'issue316-pessoa', '+5511000000316', 'funcionario')
+      `INSERT INTO pessoas(id, nome, telefone_whatsapp, tipo, tenant_id, agent_id)
+       VALUES ($1, 'issue316-pessoa', '+5511000000316', 'funcionario', $2, $3)
        ON CONFLICT (id) DO NOTHING`,
-      [PESSOA_ID],
+      [PESSOA_ID, TENANT_A, AGENT],
     );
     await c.query(
-      `INSERT INTO entidades(id, nome, tipo)
-       VALUES ($1, 'issue316-entidade', 'pj')
+      `INSERT INTO entidades(id, nome, tipo, tenant_id, agent_id)
+       VALUES ($1, 'issue316-entidade', 'pj', $2, $3)
        ON CONFLICT (id) DO NOTHING`,
-      [ENTIDADE_ID],
+      [ENTIDADE_ID, TENANT_A, AGENT],
     );
   } finally {
     c.release();

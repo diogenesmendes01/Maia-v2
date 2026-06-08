@@ -4,9 +4,10 @@
  * The Codex consolidated review of PR #311 flagged `adoptToResolvedTenantCrossTenant`
  * (src/db/repositories.ts) as a P0 cross-tenant leak:
  *
- *   The Baileys gateway persists every inbound under the legacy
- *   `default/default` context, then the agent worker ADOPTS the row into the
- *   tenant the channel resolver discovered. The original UPDATE was keyed by
+ *   The Baileys gateway persists every inbound under the single-tenant ingest
+ *   baseline — `primary/primary` since issue #323 re-homed it off the legacy
+ *   `default/default` — then the agent worker ADOPTS the row into the tenant
+ *   the channel resolver discovered. The original UPDATE was keyed by
  *   `id` ALONE:
  *       UPDATE mensagens SET tenant_id=$t, agent_id=$a WHERE id=$1
  *   so ANY caller holding the id could rewrite the row's tenant/agent to an
@@ -17,23 +18,23 @@
  *   boundary, violating the inviolable isolation contract.
  *
  * THE FIX (compare-and-swap):
- *   The UPDATE now re-asserts the row is still `default/default` in its WHERE
+ *   The UPDATE now re-asserts the row is still `primary/primary` in its WHERE
  *   clause and `.returning()`s the id, so the repo can report whether THIS
  *   call won the swap:
  *       UPDATE mensagens SET tenant_id=$t, agent_id=$a
- *        WHERE id=$1 AND tenant_id='default' AND agent_id='default'
+ *        WHERE id=$1 AND tenant_id='primary' AND agent_id='primary'
  *       RETURNING id
- *   A row can therefore be adopted out of `default/default` EXACTLY ONCE.
+ *   A row can therefore be adopted out of `primary/primary` EXACTLY ONCE.
  *
  * WHY A REAL-POSTGRES TEST (not the in-memory drizzle fake):
  *   The whole safety property lives in the SQL WHERE clause and Postgres'
  *   single-statement row-lock atomicity. An in-memory fake that models
  *   `.where(eq(id))` could trivially "pass" while the production predicate
- *   silently dropped the `tenant_id='default'` guard — exactly the regression
+ *   silently dropped the `tenant_id='primary'` guard — exactly the regression
  *   we must catch. Only a real database proves:
  *     (a) the second adoption into a DIFFERENT tenant is rejected (rowCount 0)
  *         and the row's owner is UNCHANGED — no leak;
- *     (b) two CONCURRENT adoptions on the same default/default row cannot both
+ *     (b) two CONCURRENT adoptions on the same primary/primary row cannot both
  *         win — exactly one observes rowCount 1, and the final owner is the
  *         winner's tenant, never a blend.
  *
@@ -95,12 +96,13 @@ const CONTENDERS = [
 // 009_p0_add_tenant_agent_columns.sql adds them as
 // `tenant_id TEXT ... REFERENCES tenants(id)` and
 // `agent_id  TEXT ... REFERENCES agents(id)`, and 012_p0_force_not_null.sql
-// makes both NOT NULL. The migration-seeded `default`/`default` pair (see
-// 007_p0_tenants_agents.sql) is the ONLY scope that exists out of the box;
+// makes both NOT NULL. The migration-seeded `primary`/`primary` pair (see
+// 080_seed_primary_tenant.sql) is the ONLY scope that exists out of the box
+// (issue #323 deleted the legacy `default`/`default` registry rows in 083);
 // adopting into any other tenant/agent therefore requires us to pre-seed the
 // parent rows first, or the UPDATE trips `mensagens_tenant_id_fkey` /
-// `mensagens_agent_id_fkey`. `default` is intentionally excluded here — it is
-// already seeded by migration 007 and re-inserting it would be redundant.
+// `mensagens_agent_id_fkey`. `primary` is intentionally excluded here — it is
+// already seeded by migration 080 and re-inserting it would be redundant.
 const SCOPES: ReadonlyArray<{ tenant_id: string; agent_id: string }> = [
   { tenant_id: TENANT_A, agent_id: AGENT_A },
   { tenant_id: TENANT_B, agent_id: AGENT_B },
@@ -114,15 +116,18 @@ const ROW_ID_2 = '00000000-0000-0000-0000-000000000291';
 
 /**
  * Insert an inbound `mensagens` row directly via raw SQL, starting in the
- * legacy `default/default` context (exactly how the Baileys gateway persists
- * it at ingress, before the worker adopts it). Only the NOT NULL columns and
- * the two scope columns are set; the rest fall back to schema defaults.
+ * `primary/primary` context (exactly how the Baileys gateway persists it at
+ * ingress, before the worker adopts it — issue #323 re-homed the single-tenant
+ * ingest baseline from the legacy `default/default` to `primary/primary`). Both
+ * scope columns are set explicitly: migration 082 dropped the `DEFAULT
+ * 'default'` column-default, so an omitted tenant_id/agent_id would now fail
+ * NOT NULL rather than bucket into `default`.
  */
-async function insertDefaultDefaultRow(id: string, whatsappId: string): Promise<void> {
+async function insertPrimaryPrimaryRow(id: string, whatsappId: string): Promise<void> {
   await pg.pool.query(
     `
     INSERT INTO mensagens (id, tenant_id, agent_id, direcao, tipo, conteudo, metadata)
-    VALUES ($1::uuid, 'default', 'default', 'in', 'texto', 'oi maia', $2::jsonb)
+    VALUES ($1::uuid, 'primary', 'primary', 'in', 'texto', 'oi maia', $2::jsonb)
     `,
     [id, JSON.stringify({ whatsapp_id: whatsappId, telefone: '+5511999990001' })],
   );
@@ -222,7 +227,7 @@ d('mensagensRepo.adoptToResolvedTenantCrossTenant — cross-tenant adoption race
   // 1. Happy path — a default/default row is adopted into tenant-A exactly once.
   // -------------------------------------------------------------------------
   it('adopts a default/default row into tenant-A (returns true; row now owned by tenant-A)', async () => {
-    await insertDefaultDefaultRow(ROW_ID, 'WAID-A-1');
+    await insertPrimaryPrimaryRow(ROW_ID, 'WAID-A-1');
 
     const won = await adopt(ROW_ID, TENANT_A, AGENT_A);
     expect(won).toBe(true);
@@ -234,7 +239,7 @@ d('mensagensRepo.adoptToResolvedTenantCrossTenant — cross-tenant adoption race
   // 2. THE P0: a row already adopted by tenant-A is NOT re-adoptable by tenant-B.
   // -------------------------------------------------------------------------
   it('rejects re-adoption into tenant-B once owned by tenant-A (returns false; owner UNCHANGED — no leak)', async () => {
-    await insertDefaultDefaultRow(ROW_ID, 'WAID-A-2');
+    await insertPrimaryPrimaryRow(ROW_ID, 'WAID-A-2');
 
     // tenant-A wins the (only) swap out of default/default.
     expect(await adopt(ROW_ID, TENANT_A, AGENT_A)).toBe(true);
@@ -257,7 +262,7 @@ d('mensagensRepo.adoptToResolvedTenantCrossTenant — cross-tenant adoption race
   //    rowCount=0 no-op (compare-and-swap miss), NOT a silent success.
   // -------------------------------------------------------------------------
   it('re-adopting into the same tenant after the row moved returns false (idempotent no-op, owner unchanged)', async () => {
-    await insertDefaultDefaultRow(ROW_ID, 'WAID-A-3');
+    await insertPrimaryPrimaryRow(ROW_ID, 'WAID-A-3');
 
     expect(await adopt(ROW_ID, TENANT_A, AGENT_A)).toBe(true);
     // BullMQ retry: same target tenant. Row is no longer default/default → miss.
@@ -272,7 +277,7 @@ d('mensagensRepo.adoptToResolvedTenantCrossTenant — cross-tenant adoption race
   //    Exactly one wins; the final owner is the winner's tenant, never a blend.
   // -------------------------------------------------------------------------
   it('concurrent adoption by tenant-A and tenant-B: exactly one wins, the row never leaks to the loser', async () => {
-    await insertDefaultDefaultRow(ROW_ID, 'WAID-RACE-1');
+    await insertPrimaryPrimaryRow(ROW_ID, 'WAID-RACE-1');
 
     // Fire both adoptions concurrently against the SAME row. Postgres serialises
     // the two UPDATEs via the row lock; the compare-and-swap guarantees only the
@@ -294,11 +299,11 @@ d('mensagensRepo.adoptToResolvedTenantCrossTenant — cross-tenant adoption race
     }
     // Whichever lost, the owner is a SINGLE coherent tenant triplet — there is
     // no interleaving that leaves the row half-owned or owned by the loser.
-    expect(owner).not.toEqual({ tenant_id: 'default', agent_id: 'default' });
+    expect(owner).not.toEqual({ tenant_id: 'primary', agent_id: 'primary' });
   });
 
   it('many concurrent adoptions (5 distinct tenants) on one row: exactly one wins; others all miss', async () => {
-    await insertDefaultDefaultRow(ROW_ID, 'WAID-RACE-N');
+    await insertPrimaryPrimaryRow(ROW_ID, 'WAID-RACE-N');
 
     // Reuse the module-level CONTENDERS so the scopes we race over are exactly
     // the ones seeded as FK parents in beforeAll (no drift between seed + use).
@@ -323,7 +328,7 @@ d('mensagensRepo.adoptToResolvedTenantCrossTenant — cross-tenant adoption race
   //    owns it). It MUST ignore the ambient tenant context.
   // -------------------------------------------------------------------------
   it('findOwnerByIdCrossTenant returns the real owner even when called under a DIFFERENT tenant context', async () => {
-    await insertDefaultDefaultRow(ROW_ID_2, 'WAID-OWNER-1');
+    await insertPrimaryPrimaryRow(ROW_ID_2, 'WAID-OWNER-1');
     expect(await adopt(ROW_ID_2, TENANT_A, AGENT_A)).toBe(true);
 
     // Call the owner lookup while the ALS says tenant-B. A tenant-scoped read

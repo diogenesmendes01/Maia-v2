@@ -26,16 +26,16 @@ d('pending-gate concurrency', () => {
     const c = await pool.connect();
     try {
       const pessoa = await c.query<{ id: string }>(
-        `INSERT INTO pessoas(nome, telefone_whatsapp, tipo)
-         VALUES ('test-b0', '+5511900000099', 'funcionario') RETURNING id`,
+        `INSERT INTO pessoas(tenant_id, agent_id, nome, telefone_whatsapp, tipo)
+         VALUES ('primary', 'primary', 'test-b0', '+5511900000099', 'funcionario') RETURNING id`,
       );
       const conv = await c.query<{ id: string }>(
-        `INSERT INTO conversas(pessoa_id, escopo_entidades) VALUES ($1, '{}') RETURNING id`,
+        `INSERT INTO conversas(tenant_id, agent_id, pessoa_id, escopo_entidades) VALUES ('primary', 'primary', $1, '{}') RETURNING id`,
         [pessoa.rows[0]!.id],
       );
       await c.query(
-        `INSERT INTO pending_questions(conversa_id, pessoa_id, tipo, pergunta, opcoes_validas, acao_proposta, expira_em, status, metadata)
-         VALUES ($1, $2, 'gate', 'Confirma?', $3::jsonb, $4::jsonb, now() + interval '10 min', 'aberta', '{}'::jsonb)`,
+        `INSERT INTO pending_questions(tenant_id, agent_id, conversa_id, pessoa_id, tipo, pergunta, opcoes_validas, acao_proposta, expira_em, status, metadata)
+         VALUES ('primary', 'primary', $1, $2, 'gate', 'Confirma?', $3::jsonb, $4::jsonb, now() + interval '10 min', 'aberta', '{}'::jsonb)`,
         [
           conv.rows[0]!.id,
           pessoa.rows[0]!.id,
@@ -63,14 +63,14 @@ d('pending-gate concurrency', () => {
       // checkPendingFirst are now tenant-scoped (they read tenant_id/agent_id
       // from ALS), so this gate path — like its production callers (baileys →
       // runWithTenantContext) — must run inside a tenant context. The seeded
-      // pending_question carries the schema default (default/default), so wrap
-      // with the matching pair.
-      const DEFAULT_CTX = { tenant_id: 'default', agent_id: 'default' };
+      // pending_question is stamped 'primary'/'primary' above (issue #323 retired
+      // the legacy 'default'), so wrap with the matching pair.
+      const PRIMARY_CTX = { tenant_id: 'primary', agent_id: 'primary' };
       const [a, b] = await Promise.all([
-        runWithTenantContext(DEFAULT_CTX, () =>
+        runWithTenantContext(PRIMARY_CTX, () =>
           checkPendingFirst({ pessoa: persona as never, conversa: conversa as never, inbound: inbound as never }),
         ),
-        runWithTenantContext(DEFAULT_CTX, () =>
+        runWithTenantContext(PRIMARY_CTX, () =>
           checkPendingFirst({ pessoa: persona as never, conversa: conversa as never, inbound: inbound as never }),
         ),
       ]);

@@ -2,6 +2,13 @@
  * Light-weight DB factories for the integration suites. Returns the freshly
  * inserted row so tests can assert on ids. Does not own its own connection —
  * caller passes a pg client (typically inside a transaction).
+ *
+ * tenant/agent: every insert stamps the reserved single-tenant home
+ * 'primary'/'primary' explicitly. Issue #323 dropped the legacy
+ * `DEFAULT 'default'` column-default (migration 082) and deleted the 'default'
+ * tenant (083), so an omitted tenant_id/agent_id would now fail NOT NULL. The
+ * sole consumers (leak.spec / repos-leak.spec) are single-tenant entity-scope
+ * tests, so a fixed 'primary' is correct.
  */
 import { randomInt } from 'node:crypto';
 import type pg from 'pg';
@@ -26,7 +33,7 @@ export async function mkEntidade(
   const nome = overrides.nome ?? `E-${randomInt(0, 1e9).toString(36)}`;
   const tipo = overrides.tipo ?? 'pj';
   const r = await client.query<Ent>(
-    `INSERT INTO entidades(nome, tipo) VALUES ($1, $2) RETURNING id, nome, tipo`,
+    `INSERT INTO entidades(tenant_id, agent_id, nome, tipo) VALUES ('primary', 'primary', $1, $2) RETURNING id, nome, tipo`,
     [nome, tipo],
   );
   return r.rows[0]!;
@@ -41,8 +48,8 @@ export async function mkConta(
   const banco = overrides.banco ?? 'X';
   const tipo = overrides.tipo ?? 'cc';
   const r = await client.query<Cta>(
-    `INSERT INTO contas_bancarias(entidade_id, banco, apelido, tipo)
-     VALUES ($1, $2, $3, $4) RETURNING id, entidade_id, apelido`,
+    `INSERT INTO contas_bancarias(tenant_id, agent_id, entidade_id, banco, apelido, tipo)
+     VALUES ('primary', 'primary', $1, $2, $3, $4) RETURNING id, entidade_id, apelido`,
     [entidade_id, banco, apelido, tipo],
   );
   return r.rows[0]!;
@@ -57,8 +64,8 @@ export async function mkPessoa(
   // collide under parallel test execution.
   const phone = `+551199${randomInt(0, 10_000_000).toString().padStart(7, '0')}`;
   const r = await client.query<Pes>(
-    `INSERT INTO pessoas(nome, telefone_whatsapp, tipo, status)
-     VALUES ($1, $2, $3, $4) RETURNING id, telefone_whatsapp, tipo`,
+    `INSERT INTO pessoas(tenant_id, agent_id, nome, telefone_whatsapp, tipo, status)
+     VALUES ('primary', 'primary', $1, $2, $3, $4) RETURNING id, telefone_whatsapp, tipo`,
     [
       overrides.nome ?? `Pessoa ${randomInt(0, 1e9).toString(36)}`,
       phone,
@@ -82,9 +89,9 @@ export async function mkTransacao(
   }> = {},
 ): Promise<Tx> {
   const r = await client.query<Tx>(
-    `INSERT INTO transacoes(entidade_id, conta_id, natureza, valor, data_competencia,
+    `INSERT INTO transacoes(tenant_id, agent_id, entidade_id, conta_id, natureza, valor, data_competencia,
        status, descricao, origem)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, 'manual')
+     VALUES ('primary', 'primary', $1, $2, $3, $4, $5, $6, $7, 'manual')
      RETURNING id, entidade_id, conta_id, natureza, valor, descricao`,
     [
       entidade_id,
@@ -105,8 +112,8 @@ export async function mkContraparte(
   overrides: Partial<{ nome: string; tipo: string }> = {},
 ): Promise<Cp> {
   const r = await client.query<Cp>(
-    `INSERT INTO contrapartes(entidade_id, nome, tipo)
-     VALUES ($1, $2, $3) RETURNING id, entidade_id, nome`,
+    `INSERT INTO contrapartes(tenant_id, agent_id, entidade_id, nome, tipo)
+     VALUES ('primary', 'primary', $1, $2, $3) RETURNING id, entidade_id, nome`,
     [entidade_id, overrides.nome ?? 'cp', overrides.tipo ?? 'outro'],
   );
   return r.rows[0]!;

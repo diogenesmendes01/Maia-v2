@@ -11,13 +11,13 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
  *
  * Fix: the `messages.upsert` and `messages.update` listeners wrap each
  * dispatch in `runWithTenantContext`. For `messages.upsert` the wrap uses
- * `default/default` (adoption to the real tenant happens later inside
+ * `primary/primary` (adoption to the real tenant happens later inside
  * `runAgentForMensagem`, after the channel resolver). For `messages.update`
  * (PR #277 v2 BLOQUEADO fix) the wrap uses the (tenant_id, agent_id) of
  * the ORIGINAL message — looked up via the sanctioned cross-tenant helper
  * `mensagensRepo.findByWhatsappIdCrossTenant` — because the original may
- * have been adopted away from default/default by the agent worker, and
- * running the dispatch under default/default would silently drop the
+ * have been adopted away from primary/primary by the agent worker, and
+ * running the dispatch under primary/primary would silently drop the
  * edit/revoke (edit_unknown_original / revoke_unknown_original).
  */
 
@@ -98,15 +98,15 @@ vi.mock('../../src/db/repositories.js', () => ({
     findByWhatsappIdCrossTenant: findByWhatsappIdCrossTenantMock,
   },
   // #411: the resolver always runs at ingress. Single-tenant catch-all → the
-  // seeded default/default channel for any sender (exact-match always misses).
+  // seeded primary/primary channel for any sender (exact-match always misses).
   channelsRepo: {
     findByExternalCrossTenant: vi.fn().mockResolvedValue(null),
-    findDefaultCatchAllChannel: vi.fn().mockResolvedValue({
+    findPrimaryCatchAllChannel: vi.fn().mockResolvedValue({
       multi_tenant: false,
       channel: {
-        id: 'default-channel-uuid',
-        tenant_id: 'default',
-        agent_id: 'default',
+        id: 'primary-channel-uuid',
+        tenant_id: 'primary',
+        agent_id: 'primary',
         external_id: 'default-channel',
         channel_type: 'whatsapp',
         active: true,
@@ -180,7 +180,7 @@ describe('baileys handleIncoming — runs inside tenant context (PR #75 #C1)', (
     handlerState.updateHandler = null;
   });
 
-  it('createInbound is called inside runWithTenantContext (tenant=default, agent=default)', async () => {
+  it('createInbound is called inside runWithTenantContext (tenant=primary, agent=primary)', async () => {
     let capturedTenant: string | null = null;
     let capturedAgent: string | null = null;
     createInboundMock.mockImplementation(async () => {
@@ -213,12 +213,12 @@ describe('baileys handleIncoming — runs inside tenant context (PR #75 #C1)', (
     await handlerState.upsertHandler!({ messages: [fakeMsg] });
 
     expect(createInboundMock).toHaveBeenCalledTimes(1);
-    // messages.upsert wraps in default/default — adoption to the real
+    // messages.upsert wraps in primary/primary — adoption to the real
     // (tenant_id, agent_id) is the agent worker's responsibility (after the
-    // channel resolver runs in `runAgentForMensagem`). Asserting default
+    // channel resolver runs in `runAgentForMensagem`). Asserting primary
     // here pins the contract: the gateway itself is single-context.
-    expect(capturedTenant).toBe('default');
-    expect(capturedAgent).toBe('default');
+    expect(capturedTenant).toBe('primary');
+    expect(capturedAgent).toBe('primary');
     expect(enqueueAgentMock).toHaveBeenCalledWith({ mensagem_id: 'msg-uuid-1' });
   });
 });
@@ -233,11 +233,11 @@ describe('baileys messages.update — runs inside RESOLVED tenant context (PR #2
     handlerState.updateHandler = null;
   });
 
-  it('edit: routeMessageUpdate runs inside tenant context of the ADOPTED original (NOT default/default)', async () => {
+  it('edit: routeMessageUpdate runs inside tenant context of the ADOPTED original (NOT primary/primary)', async () => {
     // Repro: an inbound is adopted by runAgentForMensagem from
-    // (default, default) → (tenant-acme, agent-main). A subsequent edit
+    // (primary, primary) → (tenant-acme, agent-main). A subsequent edit
     // arrives via messages.update. Pre-fix: routeMessageUpdate ran under
-    // default/default, mensagensRepo.findByWhatsappId returned null, the
+    // primary/primary, mensagensRepo.findByWhatsappId returned null, the
     // edit was silently dropped. Post-fix: the listener resolves the
     // owning tenant via findByWhatsappIdCrossTenant and runs the dispatch
     // inside ALS of that tenant.
@@ -319,9 +319,9 @@ describe('baileys messages.update — runs inside RESOLVED tenant context (PR #2
     expect(capturedAgent).toBe('agent-zeta-main');
   });
 
-  it('unknown whatsapp_id: skips routeMessageUpdate (no spurious default/default dispatch)', async () => {
+  it('unknown whatsapp_id: skips routeMessageUpdate (no spurious primary/primary dispatch)', async () => {
     // Genuine miss: no inbound row exists with this id (never seen, or GC'd).
-    // The pre-fix behavior was to dispatch under default/default and emit
+    // The pre-fix behavior was to dispatch under primary/primary and emit
     // edit_unknown_original; the new behavior short-circuits at the listener
     // — fail-soft, but observable via the cross_tenant_lookup_miss debug log.
     findByWhatsappIdCrossTenantMock.mockResolvedValueOnce(null);
@@ -363,9 +363,9 @@ describe('baileys messages.update — runs inside RESOLVED tenant context (PR #2
     expect(routeMessageUpdateMock).not.toHaveBeenCalled();
   });
 
-  it('does NOT enter runWithTenantContext({default, default}) when original is in a real tenant (regression guard)', async () => {
+  it('does NOT enter runWithTenantContext({primary, primary}) when original is in a real tenant (regression guard)', async () => {
     // Cristaliza o bug do Codex v2: pré-fix, qualquer messages.update entrava
-    // em default/default. Garante que isso jamais acontece para mensagens
+    // em primary/primary. Garante que isso jamais acontece para mensagens
     // adotadas em tenant real.
     findByWhatsappIdCrossTenantMock.mockResolvedValueOnce({
       id: 'orig-msg',
@@ -388,6 +388,6 @@ describe('baileys messages.update — runs inside RESOLVED tenant context (PR #2
 
     expect(observed).toHaveLength(1);
     expect(observed[0]).toEqual({ tenant_id: 'tenant-real', agent_id: 'agent-real' });
-    expect(observed[0]).not.toEqual({ tenant_id: 'default', agent_id: 'default' });
+    expect(observed[0]).not.toEqual({ tenant_id: 'primary', agent_id: 'primary' });
   });
 });

@@ -40,7 +40,14 @@ import { executeSelectedSkill } from './execute-skill.js';
 import { runSkill } from '@/skills/index.js';
 import { skillsRepo, outboundMessagesRepo } from '@/db/repositories.js';
 import { runReActLoop } from './react-loop.js';
-import { runWithTenantContext, getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
+import {
+  runWithTenantContext,
+  getCurrentTenant,
+  getCurrentAgent,
+  PRIMARY_TENANT_ID,
+  PRIMARY_AGENT_ID,
+  isPrimaryContext,
+} from '@/db/tenant-context.js';
 import { db } from '@/db/client.js';
 import { mensagens } from '@/db/schema.js';
 import { eq } from 'drizzle-orm';
@@ -278,8 +285,8 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
   //     deste fix uma falha transitória de DB no probe virava `null` e roteava
   //     uma mensagem possivelmente multi-tenant para o bucket default/default.
   let resolved: { tenant_id: string; agent_id: string; channel_id: string | null } = {
-    tenant_id: 'default',
-    agent_id: 'default',
+    tenant_id: PRIMARY_TENANT_ID,
+    agent_id: PRIMARY_AGENT_ID,
     channel_id: null,
   };
 
@@ -325,13 +332,12 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
 
     // [Codex review #277] Adoption helper — bridge the baileys/resolver gap.
     //
-    // Baileys ingress persists every inbound under (default, default) — it has
-    // no tenant context to use (the resolver only runs HERE, after persistence).
-    // Without adoption, the inner findById (tenant-scoped) would return null
-    // because the row still carries (default, default), not the resolved
-    // (tenant_id, agent_id). Every successfully-resolved message would then
-    // bounce off `agent.message_not_found` and the turn would silently drop —
-    // functionally identical to the bug issue #268 closed.
+    // The gateway persists each inbound under the RESOLVED scope; in the
+    // single-tenant runtime that is the `primary/primary` baseline (issue #323).
+    // If a row is still under that unclaimed baseline while a REAL tenant was
+    // resolved here, the inner findById (tenant-scoped) would return null and
+    // the turn would silently drop — functionally identical to the bug issue
+    // #268 closed. Adoption re-homes the row to the resolved triplet first.
     //
     // Adoption bypasses the tenant guard via `adoptToResolvedTenantCrossTenant`
     // — same sanctioned pattern as `channelsRepo.findByExternalCrossTenant`:
@@ -340,11 +346,11 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
     // downstream reads inside `runWithTenantContext` see the resolved triplet.
     //
     // [Codex review #311 — CRITICAL P0 cross-tenant adoption race]
-    // Adoption is now a COMPARE-AND-SWAP: the repo UPDATE only matches a row
-    // still in `default/default`, and reports whether THIS call won the swap.
-    //   - won === true  → we moved the row out of default/default into the
+    // Adoption is a COMPARE-AND-SWAP: the repo UPDATE only matches a row still
+    // in the `primary/primary` baseline, and reports whether THIS call won.
+    //   - won === true  → we moved the row out of primary/primary into the
     //                     resolved triplet. Proceed.
-    //   - won === false → the row was NOT `default/default` when we tried.
+    //   - won === false → the row was NOT `primary/primary` when we tried.
     //                     Either (a) WE already adopted it on a prior BullMQ
     //                     retry (idempotent — owner == resolved), or (b) a
     //                     CONCURRENT worker adopted it into a DIFFERENT tenant
@@ -357,7 +363,7 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
     //                     forbids. (Throwing lets BullMQ apply retry/DLQ; the
     //                     retry will simply re-observe the foreign owner and
     //                     abort again — it never leaks.)
-    if (resolved.tenant_id !== 'default' || resolved.agent_id !== 'default') {
+    if (!isPrimaryContext(resolved)) {
       const won = await mensagensRepo.adoptToResolvedTenantCrossTenant({
         id: mensagem_id,
         tenant_id: resolved.tenant_id,

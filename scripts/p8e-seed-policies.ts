@@ -18,7 +18,7 @@
  * In CI / prod, prefer the SQL migration (037). This script exists so
  * engineers can re-seed a dev DB without re-running migrations.
  */
-import { runWithTenantContext } from '@/db/tenant-context.js';
+import { runWithTenantContext, PRIMARY_CONTEXT } from '@/db/tenant-context.js';
 import { policyRulesRepo } from '@/control-plane/policy/index.js';
 import type {
   PolicyRuleBody,
@@ -222,7 +222,7 @@ async function seedDefaultPolicies(): Promise<{
 
 async function main(): Promise<void> {
   await runWithTenantContext(
-    { tenant_id: 'default', agent_id: 'default' },
+    PRIMARY_CONTEXT,
     async () => {
       const { created, skipped } = await seedDefaultPolicies();
       logger.info(

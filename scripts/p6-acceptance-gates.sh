@@ -73,9 +73,9 @@ fi
 echo "=== Gate 5/8: #411 — MULTI_CHANNEL flag removed + single-tenant catch-all wired ==="
 # Issue #411: FEATURE_MULTI_CHANNEL was removed (channel resolution is always-on).
 # The flag enum member must be GONE from the singleton, and the resolver must
-# call the single-tenant catch-all (findDefaultCatchAllChannel).
+# call the single-tenant catch-all (findPrimaryCatchAllChannel).
 if ! grep -q "FeatureFlagName.MULTI_CHANNEL" src/config/feature-flags.ts \
-  && grep -q "findDefaultCatchAllChannel" src/gateway/channel-resolver.ts; then
+  && grep -q "findPrimaryCatchAllChannel" src/gateway/channel-resolver.ts; then
   echo "[GATE 5/8] MULTI_CHANNEL removed + catch-all wired ... PASS"
   PASSED=$((PASSED + 1))
 else
