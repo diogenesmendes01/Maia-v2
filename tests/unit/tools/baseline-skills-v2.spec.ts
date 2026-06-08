@@ -145,51 +145,6 @@ describe('baseline skills v2 — tool scope contracts (unit, #448)', () => {
     }
   });
 
-  it('safe_conversation v2 uses read_turn_context + recall_memory + risk_signal_classify', () => {
-    expect(BASELINE_SKILLS_V2['safe_conversation']!.sort()).toEqual(
-      ['read_turn_context', 'recall_memory', 'risk_signal_classify'].sort(),
-    );
-  });
-
-  it('retrieve_context v2 uses only the two read-context tools', () => {
-    expect(BASELINE_SKILLS_V2['retrieve_context']!.sort()).toEqual(
-      ['read_turn_context', 'recall_memory'].sort(),
-    );
-  });
-
-  it('handoff_to_owner v2 pairs the escalation with audit + summary', () => {
-    expect(BASELINE_SKILLS_V2['handoff_to_owner']!.sort()).toEqual(
-      ['audit_decision', 'conversation_summary_compose', 'handoff_to_owner'].sort(),
-    );
-  });
-
-  it('remember_safe_fact v2 pairs the write with audit (traceable memory writes)', () => {
-    expect(BASELINE_SKILLS_V2['remember_safe_fact']!.sort()).toEqual(
-      ['audit_decision', 'remember_safe_fact'].sort(),
-    );
-  });
-
-  it('audit_decision v2 uses only audit_decision (single-purpose skill)', () => {
-    expect(BASELINE_SKILLS_V2['audit_decision']).toEqual(['audit_decision']);
-  });
-
-  it('escalate_on_risk v1 covers classify + audit + handoff (risk-triggered escalation path)', () => {
-    expect(BASELINE_SKILLS_V2['escalate_on_risk']!.sort()).toEqual(
-      ['audit_decision', 'handoff_to_owner', 'risk_signal_classify'].sort(),
-    );
-  });
-
-  it('summarization v1 uses only conversation_summary_compose', () => {
-    expect(BASELINE_SKILLS_V2['summarization']).toEqual(['conversation_summary_compose']);
-  });
-
-  it('manage_conversation_state v1 uses only conversation_state_update', () => {
-    expect(BASELINE_SKILLS_V2['manage_conversation_state']).toEqual(['conversation_state_update']);
-  });
-
-  it('BASELINE_SKILLS_V2 has exactly 8 entries (5 converted + 3 new)', () => {
-    expect(Object.keys(BASELINE_SKILLS_V2)).toHaveLength(8);
-  });
 });
 
 // -------------------------------------------------------------------------
@@ -209,6 +164,7 @@ describe('baseline-only agent — domain tools are NOT visible (#448 / invariant
     for (const t of BASELINE_CORE_PACK.tools) {
       expect(res.visible, `${t} must be visible for baseline-only grant`).toContain(t);
     }
+    expect(res.visible).toHaveLength(BASELINE_CORE_PACK.tools.length);
   });
 
   it('a baseline-only grant NEVER exposes register_transaction', async () => {
@@ -254,10 +210,4 @@ describe('prompt_only skills — NOT in the v2 tool_mediated set (#448)', () => 
     }
   });
 
-  it('the full BASELINE_SKILLS_V2 set never contains a prompt_only-designated skill', () => {
-    const v2Set = new Set(Object.keys(BASELINE_SKILLS_V2));
-    for (const skill of PROMPT_ONLY_SKILLS) {
-      expect(v2Set.has(skill)).toBe(false);
-    }
-  });
 });

@@ -153,6 +153,7 @@ d('baseline skills v2 seed (migration 080) — real DB', () => {
     );
 
     expect(rows).toHaveLength(V2_DESCRIPTORS.length);
+    expect(rows.map((r) => r.skill_descriptor).sort()).toEqual([...V2_DESCRIPTORS].sort());
     for (const r of rows) {
       expect(r.status, `${r.skill_descriptor} v1 must be deprecated`).toBe('deprecated');
       expect(
@@ -166,17 +167,29 @@ d('baseline skills v2 seed (migration 080) — real DB', () => {
   // Test 2 — 8 new/upgraded rows are seeded active, tenant-wide, tool_mediated
   // -----------------------------------------------------------------------
   it('8 new/upgraded baseline skills are active, tenant-wide, tool_mediated, proposed_by=system', async () => {
+    const EXPECTED_CATEGORIES: Record<string, string> = {
+      safe_conversation: 'compose',
+      retrieve_context: 'compose',
+      handoff_to_owner: 'decide',
+      remember_safe_fact: 'compose',
+      audit_decision: 'decide',
+      escalate_on_risk: 'decide',
+      summarization: 'compose',
+      manage_conversation_state: 'decide',
+    };
+
     const { rows } = await pg.pool.query<{
       skill_descriptor: string;
       agent_id: string | null;
       status: string;
+      category: string;
       execution_mode: string;
       proposed_by: string;
       approved_by: string | null;
       version: number;
       allowed_tools: string[];
     }>(
-      `SELECT skill_descriptor, agent_id, status, execution_mode,
+      `SELECT skill_descriptor, agent_id, status, category, execution_mode,
               proposed_by, approved_by, version, allowed_tools
          FROM skills
         WHERE tenant_id = $1
@@ -195,6 +208,9 @@ d('baseline skills v2 seed (migration 080) — real DB', () => {
     for (const r of rows) {
       expect(r.agent_id, `${r.skill_descriptor} must be tenant-wide`).toBeNull();
       expect(r.status, `${r.skill_descriptor} must be active`).toBe('active');
+      expect(r.category, `${r.skill_descriptor} category mismatch`).toBe(
+        EXPECTED_CATEGORIES[r.skill_descriptor],
+      );
       expect(r.execution_mode, `${r.skill_descriptor} must be tool_mediated`).toBe(
         'tool_mediated',
       );
@@ -350,6 +366,22 @@ d('baseline skills v2 seed (migration 080) — real DB', () => {
           expect(row!.status).toBe('active');
           expect(row!.execution_mode).toBe('tool_mediated');
         }
+      },
+    );
+  });
+
+  // -----------------------------------------------------------------------
+  // Test 9 — tenant-wide visibility for a non-default agent
+  // -----------------------------------------------------------------------
+  it('tenant-wide baseline skills are findable by a non-default agent', async () => {
+    await tenantContextMod.runWithTenantContext(
+      { tenant_id: TENANT, agent_id: 'other-agent' },
+      async () => {
+        const row = await skillsRepoMod.skillsRepo.findActive('escalate_on_risk');
+        expect(row, 'findActive(escalate_on_risk) must not be null for other-agent').not.toBeNull();
+        expect(row!.agent_id).toBeNull();
+        expect(row!.status).toBe('active');
+        expect(row!.execution_mode).toBe('tool_mediated');
       },
     );
   });
