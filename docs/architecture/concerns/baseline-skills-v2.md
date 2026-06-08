@@ -4,7 +4,7 @@
 
 ## 1. Background
 
-Migration 075 seeded eight baseline skills — the minimal operational set that every runtime agent carries regardless of domain — all as `prompt_only`. Since then, three new tools were added to `BASELINE_CORE_PACK` in `src/tools/packs.ts`:
+Migration 075 seeded eight baseline skills — the minimal operational set that every runtime agent carries regardless of domain — all as `prompt_only`. Since then, three new tools were added to `BASELINE_CORE_PACK` (defined in `src/tools/grant-math.ts`, re-exported with load-time drift guards via `src/tools/packs.ts`):
 
 - `risk_signal_classify` — deterministic two-stage turn-risk scorer ([#433](https://github.com/diogenesmendes01/Maia-v2/issues/433))
 - `conversation_summary_compose` — shared structured-summary wrapper ([#433](https://github.com/diogenesmendes01/Maia-v2/issues/433))
@@ -105,7 +105,7 @@ Adding a `respect_privacy` skill on top of these would duplicate enforcement pat
 - Step 1: DEPRECATEs v1 `prompt_only` rows for the 5 converted skills (satisfies the one-active invariant `idx_skills_one_active_uq` before the INSERT).
 - Step 2: INSERTs v2 `tool_mediated` rows for the 5 converted skills and v1 `tool_mediated` rows for the 3 new skills.
 - Step 3: Backfills a permissive `usage_policy` for all 8 new/upgraded rows (mirrors migration 077's backfill; idempotent via `usage_policy IS NULL` guard).
-- Fully idempotent: the UPDATE is guarded by `AND status = 'active'`; the INSERT uses `ON CONFLICT DO NOTHING` on `idx_skills_version_uq`.
+- Fully idempotent: the UPDATE is guarded by `AND status = 'active'`; the INSERT uses `ON CONFLICT DO NOTHING` on `idx_skills_version_uq`. The one-active constraint `idx_skills_one_active_uq` is a **partial** unique index (`WHERE status = 'active'`), so deprecated v1 rows coexist safely alongside active v2 rows.
 
 **Rollback migration:** `migrations/080_baseline_skills_v2_down.sql` — deletes v2/new-v1 rows first, then re-activates the v1 `prompt_only` rows. Applied manually via `psql -f` per `docs/runbooks/migrations.md`.
 
@@ -124,4 +124,4 @@ Adding a `respect_privacy` skill on top of these would duplicate enforcement pat
 |---|---|
 | Last verified | 2026-06-08 |
 | Against `main` HEAD | `30733a7b` |
-| Re-verify when | Older than 30 days; OR migration 080 is rolled back; OR #433 / #448 / #409 changes the tool pack or usage policy; OR `src/tools/packs.ts` (`BASELINE_CORE_PACK`) is modified; OR a new baseline skill is proposed. |
+| Re-verify when | Older than 30 days; OR migration 080 is rolled back; OR #433 / #448 / #409 changes the tool pack or usage policy; OR `src/tools/grant-math.ts` (`BASELINE_CORE_PACK`) is modified; OR a new baseline skill is proposed. |
