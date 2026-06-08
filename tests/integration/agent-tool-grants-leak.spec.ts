@@ -8,8 +8,9 @@
  *  2. The (tenant, agent) unique rejects a second grant for the same agent.
  *  3. agentToolGrantsRepo.findForCurrentAgent is scoped via the ALS context
  *     (another agent's grant is invisible).
- *  4. createWithSeedAndAudit persists the DEFAULT ['baseline.core'] grant in the
- *     same tx as the agent (no agent without a grant).
+ *  4. createWithSeedAndAudit persists the DEFAULT BASE_AGENT_PACKS grant
+ *     (baseline.core + domain.calendar) in the same tx as the agent (no agent
+ *     without a grant).
  *
  * Skipped without TEST_DB_URL so unit-only CI lanes pass without Postgres.
  * Cleanup: raw-SQL block ROLLBACKs; repo block tracks + deletes ids in finally.
@@ -138,7 +139,7 @@ dRepo('agentToolGrantsRepo — ALS-scoped reads + default grant (#408)', () => {
     }
   });
 
-  it('createWithSeedAndAudit persists the default baseline.core grant in-tx', async () => {
+  it('createWithSeedAndAudit persists the default BASE_AGENT_PACKS grant in-tx', async () => {
     const c = await pool.connect();
     const agentId = `agent-grant-create-${Date.now()}`;
     try {
@@ -161,13 +162,14 @@ dRepo('agentToolGrantsRepo — ALS-scoped reads + default grant (#408)', () => {
       );
       expect(res.ok).toBe(true);
 
-      // The grant row must exist for the new agent, with baseline.core.
+      // The grant row must exist for the new agent, seeded with the
+      // BASE_AGENT_PACKS floor (baseline.core + domain.calendar).
       const grant = await runWithTenantContext(
         { tenant_id: 'primary', agent_id: agentId },
         () => agentToolGrantsRepo.findForCurrentAgent(),
       );
       expect(grant).not.toBeNull();
-      expect(grant!.granted_packs).toEqual(['baseline.core']);
+      expect(grant!.granted_packs).toEqual(['baseline.core', 'domain.calendar']);
     } finally {
       await c.query(`DELETE FROM agent_tool_grants WHERE agent_id = $1`, [agentId]).catch(() => undefined);
       await c
