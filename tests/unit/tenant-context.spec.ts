@@ -15,6 +15,10 @@ import {
   SYSTEM_TENANT_ID,
   SYSTEM_AGENT_ID,
   SYSTEM_CONTEXT,
+  PRIMARY_TENANT_ID,
+  PRIMARY_AGENT_ID,
+  PRIMARY_CONTEXT,
+  isPrimaryContext,
   MissingTenantContextError,
   DefaultLiteralRejectedError,
 } from '@/db/tenant-context.js';
@@ -31,6 +35,21 @@ describe('tenant-context', () => {
       captured = { t: getCurrentTenant(), a: getCurrentAgent() };
     });
     expect(captured).toEqual({ t: 'acme', a: 'sofia' });
+  });
+
+  it('primary é tenant reservado COMUM: passa no guard mesmo com flag ON', async () => {
+    expect(PRIMARY_TENANT_ID).toBe('primary');
+    expect(PRIMARY_AGENT_ID).toBe('primary');
+    expect(isPrimaryContext(PRIMARY_CONTEXT)).toBe(true);
+    expect(isPrimaryContext({ tenant_id: 'default', agent_id: 'default' })).toBe(false);
+    expect(isSystemContext(PRIMARY_CONTEXT)).toBe(false);
+    // Com a flag de rejeição ON, 'primary' NÃO é rejeitado (só 'default' é).
+    process.env.MAIA_REJECT_DEFAULT_LITERAL = 'true';
+    let captured = { t: '', a: '' };
+    await runWithTenantContext(PRIMARY_CONTEXT, async () => {
+      captured = { t: getCurrentTenant(), a: getCurrentAgent() };
+    });
+    expect(captured).toEqual({ t: 'primary', a: 'primary' });
   });
 
   it('getCurrentTenant fora de contexto lança MissingTenantContextError', () => {

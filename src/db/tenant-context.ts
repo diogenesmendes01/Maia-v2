@@ -86,6 +86,42 @@ export const SYSTEM_CONTEXT: TenantContext = Object.freeze({
   agent_id: SYSTEM_AGENT_ID,
 });
 
+/**
+ * Reserved tenant/agent for the SINGLE-TENANT runtime home (issue #323).
+ *
+ * Unlike `system` (sanctioned for genuinely-global, no-owner maintenance and
+ * exempt from the `'default'` rejection), `primary` is an ORDINARY tenant: it
+ * passes `assertTruthyContext`/`assertNotDefaultLiteral` with no special-casing
+ * (the reject-set stays `{'default'}`, the permit-exception stays `{'system'}`).
+ *
+ * It replaces the legacy `'default'` bucket as the home of the single-tenant
+ * deployment, so `'default'` can be rejected fail-closed everywhere once
+ * `MAIA_REJECT_DEFAULT_LITERAL` defaults ON. When a real second tenant is
+ * onboarded, `primary` is simply one tenant among many — the single-tenant
+ * catch-all (`channelsRepo.findPrimaryCatchAllChannel`) auto-disables the moment
+ * a channel of any other tenant exists.
+ */
+export const PRIMARY_TENANT_ID = 'primary' as const;
+export const PRIMARY_AGENT_ID = 'primary' as const;
+
+/**
+ * Canonical single-tenant runtime context. Frozen like `SYSTEM_CONTEXT` so
+ * callers can't mutate the shared object.
+ */
+export const PRIMARY_CONTEXT: TenantContext = Object.freeze({
+  tenant_id: PRIMARY_TENANT_ID,
+  agent_id: PRIMARY_AGENT_ID,
+});
+
+/**
+ * True when both ids equal the reserved `primary` sentinel. Lets callers/tests
+ * distinguish the single-tenant home from a real onboarded tenant without
+ * string-matching the literal at multiple sites (mirrors `isSystemContext`).
+ */
+export function isPrimaryContext(ctx: { tenant_id: string; agent_id: string }): boolean {
+  return ctx.tenant_id === PRIMARY_TENANT_ID && ctx.agent_id === PRIMARY_AGENT_ID;
+}
+
 const storage = new AsyncLocalStorage<TenantContext>();
 
 /**
