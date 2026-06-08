@@ -118,6 +118,8 @@ Name-only discovery misses `owner_agent_id` → the §3.4 delete then fails on F
 This carries the typed seeds (catch-all channel, role/policy, biases, baseline skills) along, since they live in these tables. `_down`: same discovery, `primary` → `default`.
 
 > Verified holes the union closes: `procedure_definitions.owner_agent_id` is the only non-standard agents-FK column; `outbound_messages` (063) and `idempotency_effect_outbox` (068) carry `tenant_id` with NO FK.
+>
+> **Assumption (assert in test #1):** the only agent under tenant `default` is the `default` agent itself (true for the single-tenant runtime). If a future state parked a real agent under tenant `default`, §3.4's `DELETE tenants WHERE id='default'` would block — the rehome test must assert zero residual `default` rows before the delete runs.
 
 > **Note on the catch-all channel:** the row's `external_id='default-channel'` is an inert placeholder (the resolver finds the catch-all by `channel_type` + tenant, not by this string). The rehome only changes `tenant_id`/`agent_id`; `external_id` need not change. The resolver discriminator change (§4.1) is what re-points "which tenant is the catch-all".
 
@@ -128,10 +130,10 @@ Discover **every column whose default is the literal `'default'`** (not just 009
 ALTER TABLE %I ALTER COLUMN %I DROP DEFAULT;
 ```
 Beyond 009's 27 tables, this MUST also cover later default-bearing tables — otherwise the end state contradicts §0.3:
-- **FK-bearing** — `cognitive_module_log` (008), 4 scheduling tables (071), `agent_audience_profiles` (074), `agent_tool_grants` (076): a residual `DEFAULT 'default'` after §3.4 points at a deleted FK target → omitted-tenant insert FK-violates (latent landmine).
+- **FK-bearing** — `cognitive_module_log` (008), 4 scheduling tables (071), `agent_audience_profiles` (074), `agent_tool_grants` (076): a residual `DEFAULT 'default'` after §3.4 points at a deleted FK target → omitted-tenant insert FK-violates (latent landmine). (076's FK is `ON DELETE CASCADE`, not RESTRICT — irrelevant here since §3.2 rehomes it regardless, noted only to avoid a double-take.)
 - **No FK to tenants/agents** — `outbound_messages` (063), `idempotency_effect_outbox` (068): a residual `DEFAULT 'default'` means omitted-tenant inserts silently re-write `tenant_id='default'` — the exact #282 silent fall-through this spec exists to close. **Most important to include.**
 
-`_down`: `SET DEFAULT 'default'` on the same discovered set (restores prior behaviour).
+`_down` (**must NOT re-discover**): post-drop, `column_default ~ '''default'''` returns nothing (defaults already gone), and discovery-by-name would over-restore columns that were always strict (e.g. `channels.tenant_id` — NOT NULL, never had a default). So `_down` restores `SET DEFAULT 'default'` on an **explicit hardcoded `(table, column)` list** captured at authoring time — 009's 27 *minus* `dashboard_sessions` (dropped by 062) *plus* 008/063/068/071×4/074/076, for both `tenant_id` and `agent_id` — each guarded by a column-existence check (no-op if the table was since dropped). This matches the codebase precedent (`009_..._down.sql` hardcodes its list). The asymmetry (dynamic `_up`, explicit `_down`) is intentional: once dropped, the live schema cannot distinguish "had the default" from "always strict".
 
 ### 3.4 Delete `default` rows (step 4)
 After a **complete** rehome (§3.2, incl. `owner_agent_id` and the no-FK `tenant_id` tables), no child rows reference `default` (FK RESTRICT now permits deletion). Delete the typed seeds first, then agent, then tenant:
