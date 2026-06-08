@@ -239,6 +239,7 @@ SET usage_policy = jsonb_build_object(
 WHERE tenant_id = 'default'
   AND agent_id IS NULL
   AND proposed_by = 'system'
+  AND status = 'active'
   AND usage_policy IS NULL
   AND skill_descriptor IN (
     'safe_conversation',
