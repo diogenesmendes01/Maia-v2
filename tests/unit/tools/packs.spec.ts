@@ -130,9 +130,9 @@ describe('baseline.core tool pack (issue #410)', () => {
 });
 
 describe('domain.* tool packs (issue #408)', () => {
-  it('TOOL_PACKS exposes the 5 domain packs by id, each with name/domain/risk_level', async () => {
+  it('TOOL_PACKS exposes the 6 domain packs by id, each with name/domain/risk_level', async () => {
     const { TOOL_PACKS } = await import('../../../src/tools/packs.js');
-    const ids = ['domain.finance', 'domain.sales', 'domain.support', 'domain.calendar', 'domain.operations'];
+    const ids = ['domain.finance', 'domain.sales', 'domain.support', 'domain.calendar', 'domain.calendar.admin', 'domain.operations'];
     for (const id of ids) {
       const pack = TOOL_PACKS[id];
       expect(pack, `${id} must be registered`).toBeDefined();
