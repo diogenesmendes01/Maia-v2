@@ -863,10 +863,9 @@ async function runAgentForMensagemInner(
 
       // Honor decision outcome: block and approval flows short-circuit the turn.
       if (block) {
-        // 'block' or 'escalate' from a PEP → reply to user and skip LLM
-        const blockMsg =
-          block.user_facing_message ??
-          'Esta ação não está disponível no momento. Em caso de dúvidas, entre em contato.';
+        // 'block' or 'escalate' from a PEP → reply to user and skip LLM.
+        // Never expose internal policy text (effect.message) to the user.
+        const blockMsg = 'Esta ação requer aprovação adicional antes de prosseguir.';
         await sendOutbound(pessoa.id, c.id, blockMsg, inbound.id).catch((err) =>
           logger.warn({ err: (err as Error).message }, 'agent.decision_engine.blocked_reply_failed'),
         );
