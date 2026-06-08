@@ -54,7 +54,7 @@ Give the single-tenant runtime a **real reserved tenant** so `'default'` disappe
 | `scripts/setup.ts` | Modify | Wrap seed writes in `runWithTenantContext(PRIMARY_CONTEXT, …)`. |
 | `src/workers/cost-monitor.ts` | Modify | `runWithTenantContext({…'default'})` → `PRIMARY_CONTEXT`. |
 | `scripts/p8e-seed-policies.ts` | Modify | `default/default` → `primary/primary`. |
-| `src/config/env.ts` | Modify | Add `MAIA_REJECT_DEFAULT_LITERAL` to the schema, default **`true`** (Phase 6 flip). |
+| `src/db/tenant-context.ts` (flip) | Modify | `shouldThrowOnDefaultLiteral()` → **default-ON opt-out**: `process.env.MAIA_REJECT_DEFAULT_LITERAL !== 'false'`, read at access time. Do NOT route through cached `config`/zod (breaks live rollback). See §4.6. |
 | `migrations/035_*`, `037_*`, `039_*`, `075_*`, `077_*`, `079_*` | **NOT edited** | Append-only — the typed seeds stay as written; the rehome+delete migrations supersede them. New deployments seed `primary` via the new migrations (see §3.4). |
 | `tests/**` (~28 files) | Modify | See §5. |
 
@@ -99,39 +99,42 @@ INSERT INTO agents (id, tenant_id, nome, status)
 `_down`: delete the `primary` agent then tenant (only safe before any rehome; see overall rollback §8).
 
 ### 3.2 Rehome data `default` → `primary` (step 2)
-Dynamic loop over every table that has a `tenant_id` column FK-referencing `tenants` (≈71 tables), excluding `tenants`/`agents` themselves:
+Dynamic loop over the **union** of two discovery methods, so every holder of a tenant/agent id is covered:
+- **(a) by name** — every column named `tenant_id`/`agent_id` (catches no-FK holders like `outbound_messages`/`idempotency_effect_outbox`).
+- **(b) by FK** — every column that FK-references `tenants(id)`/`agents(id)` (catches non-standard FK columns like `procedure_definitions.owner_agent_id`, migration 018).
+
+Name-only discovery misses `owner_agent_id` → the §3.4 delete then fails on FK RESTRICT. FK-only discovery misses the no-FK `tenant_id` tables → leaves their data under `default`. The union covers both.
+
 ```sql
-DO $$
-DECLARE t TEXT;
-BEGIN
-  FOR t IN
-    SELECT table_name FROM information_schema.columns
-    WHERE column_name = 'tenant_id' AND table_schema = 'public'
-      AND table_name NOT IN ('tenants','agents')
-  LOOP
-    EXECUTE format('UPDATE %I SET tenant_id=''primary'' WHERE tenant_id=''default''', t);
-    -- agent_id only where the column exists
-    IF EXISTS (SELECT 1 FROM information_schema.columns
-               WHERE table_name=t AND column_name='agent_id' AND table_schema='public') THEN
-      EXECUTE format('UPDATE %I SET agent_id=''primary'' WHERE agent_id=''default''', t);
-    END IF;
-  END LOOP;
-END $$;
+-- DO block, conceptually:
+--   cols := (SELECT table_name, column_name FROM information_schema.columns
+--            WHERE column_name IN ('tenant_id','agent_id') AND table_schema='public')
+--           UNION
+--           (FK columns whose target is tenants(id)/agents(id), via pg_constraint
+--            contype='f' joined to pg_attribute, confrelid IN ('tenants','agents'::regclass))
+--   minus tenants/agents themselves
+--   FOR each (t,c): EXECUTE format('UPDATE %I SET %I=''primary'' WHERE %I=''default''', t,c,c)
 ```
-This carries the typed seeds (catch-all channel, role/policy, biases, baseline skills) along, since they live in these tenant-scoped tables. `_down`: same loop, `primary` → `default`.
+This carries the typed seeds (catch-all channel, role/policy, biases, baseline skills) along, since they live in these tables. `_down`: same discovery, `primary` → `default`.
+
+> Verified holes the union closes: `procedure_definitions.owner_agent_id` is the only non-standard agents-FK column; `outbound_messages` (063) and `idempotency_effect_outbox` (068) carry `tenant_id` with NO FK.
 
 > **Note on the catch-all channel:** the row's `external_id='default-channel'` is an inert placeholder (the resolver finds the catch-all by `channel_type` + tenant, not by this string). The rehome only changes `tenant_id`/`agent_id`; `external_id` need not change. The resolver discriminator change (§4.1) is what re-points "which tenant is the catch-all".
 
 ### 3.3 Drop the column-default (step 3)
-On the 27 tables from migration 009 (`entidades, contas_bancarias, categorias, transacoes, transferencias_internas, recorrencias, contrapartes, pessoas, permission_profiles, permissoes, conversas, mensagens, agent_facts, learned_rules, agent_memories, self_state, entity_states, workflows, workflow_steps, pending_questions, idempotency_keys, system_health_events, dead_letter_jobs, dashboard_sessions, import_runs, import_entries, audit_log`):
+Discover **every column whose default is the literal `'default'`** (not just 009's 27) and drop it — discovery via `information_schema.columns` where `column_default ~ '''default'''`:
 ```sql
-ALTER TABLE %I ALTER COLUMN tenant_id DROP DEFAULT;
-ALTER TABLE %I ALTER COLUMN agent_id  DROP DEFAULT;
+-- FOR each (t,c) with column_default matching 'default'::
+ALTER TABLE %I ALTER COLUMN %I DROP DEFAULT;
 ```
-`_down`: `SET DEFAULT 'default'` (restores 009's behaviour).
+Beyond 009's 27 tables, this MUST also cover later default-bearing tables — otherwise the end state contradicts §0.3:
+- **FK-bearing** — `cognitive_module_log` (008), 4 scheduling tables (071), `agent_audience_profiles` (074), `agent_tool_grants` (076): a residual `DEFAULT 'default'` after §3.4 points at a deleted FK target → omitted-tenant insert FK-violates (latent landmine).
+- **No FK to tenants/agents** — `outbound_messages` (063), `idempotency_effect_outbox` (068): a residual `DEFAULT 'default'` means omitted-tenant inserts silently re-write `tenant_id='default'` — the exact #282 silent fall-through this spec exists to close. **Most important to include.**
+
+`_down`: `SET DEFAULT 'default'` on the same discovered set (restores prior behaviour).
 
 ### 3.4 Delete `default` rows (step 4)
-After rehome, no child rows reference `default` (FK RESTRICT now permits deletion). Delete the typed seeds first, then agent, then tenant:
+After a **complete** rehome (§3.2, incl. `owner_agent_id` and the no-FK `tenant_id` tables), no child rows reference `default` (FK RESTRICT now permits deletion). Delete the typed seeds first, then agent, then tenant:
 ```sql
 -- typed seeds under default (channels, role_policies, soul_biases, …) are already
 -- rehomed by 3.2, so 'default' owns zero rows here; these deletes are defensive no-ops
@@ -166,8 +169,16 @@ Both run their seed writes under `runWithTenantContext(PRIMARY_CONTEXT, …)` in
 ### 4.5 Baileys ingress
 The gateway persists inbound rows before the resolver runs. Today it stamps `default/default` (via the column-default / explicit literal). After §3.3 the column-default is gone, so the ingress write MUST stamp `primary` explicitly (or `runWithTenantContext(PRIMARY_CONTEXT)`), matching the adoption baseline in §4.2. Verify `src/gateway/baileys.ts` + `jid-tenant-resolver.ts` stamp `primary`.
 
-### 4.6 The flip (`env.ts`)
-Add `MAIA_REJECT_DEFAULT_LITERAL` to the zod env schema, default `true`. Keep `shouldThrowOnDefaultLiteral()` reading the same name so an operator can set `=false` for an emergency rollback without a redeploy.
+### 4.6 The flip (`tenant-context.ts`)
+Change `shouldThrowOnDefaultLiteral()` from opt-in to **default-ON opt-out**:
+```ts
+function shouldThrowOnDefaultLiteral(): boolean {
+  return process.env.MAIA_REJECT_DEFAULT_LITERAL !== 'false';
+}
+```
+Read at **access time** from `process.env` (not the boot-cached `config`): default-ON needs no env var set, and an emergency rollback is `MAIA_REJECT_DEFAULT_LITERAL=false` (instant, env-only, no redeploy).
+
+**Why not the zod schema / `config`:** `loadConfig()` parses `process.env` once at boot and never writes a zod default back to `process.env`. If the reader stayed on `process.env === 'true'` while the "default" lived in zod, an operator who sets nothing would leave `process.env` undefined → flag silently **OFF**, defeating Phase 6. And routing the reader through cached `config` would break the live env-only rollback. The two desired properties (default-ON with nothing set + instant env rollback) are only compatible by reading `process.env` at access time with `!== 'false'` semantics. The zod schema MAY list the var as optional purely for documentation/validation, but it is NOT the source of truth for the flip.
 
 ---
 
@@ -182,10 +193,12 @@ Per the impact audit, three buckets:
 | **Real-DB** tests depending on the `default` seed / column-default | ~15 | Migrate to `primary` or bespoke tenants. Testcontainer specs (`channel-catch-all-cross-tenant-real-db`, `mensagens-adopt-cross-tenant-real-db`, `baseline-skills-seed-real-db`, `skills-usage-policy-real-db`, `boleto-proposta-role-seed-real-db`) + `TEST_DB_URL` specs (`leak`, `repos-leak`, `debounce-flow`, `issue-73-anchoring`, `pending-gate-concurrency`, `p84-create-or-find-active`, `cognitive-module-log`, `p9c-risk-scoring`, `agent-tool-grants-leak`, `agent-audience-profiles-leak`). |
 
 **New tests (write first, red → green):**
-1. **Rehome correctness** (real-DB or migration test): a row seeded under `default` lands under `primary`; zero rows remain under `default` post-migration.
-2. **Fail-closed INSERT** (real-DB): an INSERT omitting `tenant_id` on a 009 table now raises NOT NULL (was silently `default`).
+1. **Rehome correctness** (real-DB or migration test): a row seeded under `default` lands under `primary`; **zero rows remain under `default` for `tenant_id`, `agent_id`, AND `owner_agent_id`** across all FK/name-scoped tables post-migration (this is what catches a missed rehome column).
+2. **Fail-closed INSERT** (real-DB): an INSERT omitting `tenant_id` on a default-bearing table now raises NOT NULL (was silently `default`) — assert for a 009 table AND a no-FK one (`outbound_messages`/`idempotency_effect_outbox`).
 3. **Resolver single-tenant** (unit): unknown sender → `primary/primary`; with a second tenant's channel present → fail-loud.
-4. **Flip safety** (integration, `MAIA_REJECT_DEFAULT_LITERAL=true`): a full inbound turn under `primary` succeeds end-to-end; a synthetic `default` context throws `DefaultLiteralRejectedError`.
+4. **Flip safety** (integration): with **no env var set** (the new default-ON), a synthetic `default` context throws `DefaultLiteralRejectedError` and a full inbound turn under `primary` succeeds end-to-end; with `MAIA_REJECT_DEFAULT_LITERAL=false`, the `default` context is tolerated (validates opt-out rollback). **Do not test by setting `=true`** — that would pass even if the default were silently OFF (the bug Issue 1 guards against).
+
+**Plan task (first-class):** sweep every code path that writes to a default-bearing table *without* an active ALS context (relied on the column-default) and make each stamp `primary`/a real tenant explicitly — at minimum `setup.ts`, the baileys pre-resolver persistence in `src/gateway/baileys.ts`, and any writer to 008/063/068/071/074/076. After §3.3 a missed FK-table site fails NOT NULL; a missed no-FK site (063/068) silently re-pollutes `default`.
 
 Gate before requesting review: `npm run typecheck` + `npm run lint` + `npm test` + `npm run test:leak` (and integration where Docker/`TEST_DB_URL` available).
 
@@ -195,7 +208,7 @@ Gate before requesting review: `npm run typecheck` + `npm run lint` + `npm test`
 
 1. Land migrations §3 + code §4 + tests §5 **in one coordinated deploy** (migration runs, then the app restarts on the new code). Single-tenant runtime = one process, so the migrate→restart window is a normal deploy restart, not a live mixed-version window.
 2. Run full suite + `test:leak` green in CI.
-3. **Owner sign-off**, then confirm `MAIA_REJECT_DEFAULT_LITERAL` default-ON is in effect (Phase 6). Watch `maia_tenant_id_default_literal_total` — it must stay flat at 0.
+3. **Owner sign-off** (Phase 6). The default-ON behaviour is verified by **test #4** (synthetic `default` throws with no env var set), NOT by the counter: post-migration nothing emits `default`, so `maia_tenant_id_default_literal_total` reads 0 whether the flag is on or off. Keep the counter as a **straggler alarm** — any non-zero value flags a missed path.
 
 > If a live mixed-version window is a concern later (multi-instance), an expand/contract variant (code tolerates both `default` and `primary` first, migrate, then remove `default` tolerance) is the fallback — out of scope for the current single-process runtime.
 
