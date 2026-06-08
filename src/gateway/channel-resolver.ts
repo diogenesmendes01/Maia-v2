@@ -21,11 +21,11 @@
  * casa com o único canal semeado (`external_id = 'default-channel'`). Antes do
  * #411 esse miss levantava `channel_resolution_failed` → DLQ → o bot parava de
  * responder a TODOS. O catch-all resolve qualquer remetente desconhecido para
- * o canal `default/default` semeado QUANDO o deployment é comprovadamente
- * single-tenant (nenhum canal ativo pertence a um tenant != 'default').
+ * o canal `primary/primary` semeado QUANDO o deployment é comprovadamente
+ * single-tenant (nenhum canal ativo pertence a um tenant != 'primary').
  *
  * ── Por que isso NÃO regride o #268 ───────────────────────────────────────
- * O fallback default/default só é entregue quando `findDefaultCatchAllChannel`
+ * O fallback primary/primary só é entregue quando `findPrimaryCatchAllChannel`
  * confirma que NÃO existe canal ativo de outro tenant. Assim que UM deployment
  * multi-tenant registra um canal real, qualquer miss volta a ser fail-loud
  * (throw), preservando o invariante "Maias de empresas diferentes jamais se
