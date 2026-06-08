@@ -304,7 +304,8 @@ export const agent_audience_profiles = pgTable(
  *   - `denied_tools`   — HARD deny: never visible to the LLM AND refused by the
  *                        dispatcher, even if also in a granted pack/tool.
  * `baseline.core` is ALWAYS unioned in at runtime (the conservative floor), so
- * the default grant is `granted_packs=['baseline.core']`.
+ * the default grant is `granted_packs=['baseline.core','domain.calendar']`
+ * (migration 081 backfilled existing grants and updated the column default).
  *
  * Tenant isolation (invariant #1): tenant_id + agent_id NOT NULL; the row is
  * UNIQUE per (tenant_id, agent_id) — one effective grant per agent. Every
@@ -320,7 +321,7 @@ export const agent_tool_grants = pgTable(
     granted_packs: text('granted_packs')
       .array()
       .notNull()
-      .default(sql`'{baseline.core}'::text[]`),
+      .default(sql`'{baseline.core,domain.calendar}'::text[]`),
     granted_tools: text('granted_tools').array().notNull().default(sql`'{}'::text[]`),
     denied_tools: text('denied_tools').array().notNull().default(sql`'{}'::text[]`),
     granted_by: text('granted_by'),
