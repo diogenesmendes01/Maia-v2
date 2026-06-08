@@ -100,7 +100,7 @@ function assertMutated(
   }
 }
 
-export type CreateSeriesInput = Omit<SeriesInsert, 'id' | 'created_at' | 'updated_at' | 'version'> & {
+export type CreateSeriesInput = Omit<SeriesInsert, 'id' | 'created_at' | 'updated_at' | 'version' | 'tenant_id' | 'agent_id'> & {
   initial_occurrence: {
     scheduled_for: Date;
     contexto_snapshot: SeriesContexto;
@@ -484,7 +484,7 @@ export type TxScopedRepos = {
     enqueue: (
       input: Omit<
         OutboxMessageInsert,
-        'id' | 'created_at' | 'status' | 'attempts' | 'next_attempt_at'
+        'id' | 'created_at' | 'status' | 'attempts' | 'next_attempt_at' | 'tenant_id' | 'agent_id'
       >,
     ) => Promise<OutboxMessage | null>;
   };
@@ -1049,7 +1049,7 @@ export const tasksRepo = {
 };
 
 export const outboxRepo = {
-  async enqueue(input: Omit<OutboxMessageInsert, 'id' | 'created_at' | 'status' | 'attempts' | 'next_attempt_at'>): Promise<OutboxMessage | null> {
+  async enqueue(input: Omit<OutboxMessageInsert, 'id' | 'created_at' | 'status' | 'attempts' | 'next_attempt_at' | 'tenant_id' | 'agent_id'>): Promise<OutboxMessage | null> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
     try {

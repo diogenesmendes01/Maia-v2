@@ -76,7 +76,14 @@ import { TypedError } from '@/lib/utils.js';
 import { logger } from '@/lib/logger.js';
 import { incCounter } from '@/lib/metrics.js';
 import { applyTenantGuard } from './tenant-guard.js';
-import { getCurrentTenant, getCurrentAgent, PRIMARY_TENANT_ID, PRIMARY_AGENT_ID } from './tenant-context.js';
+import {
+  getCurrentTenant,
+  getCurrentAgent,
+  PRIMARY_TENANT_ID,
+  PRIMARY_AGENT_ID,
+  SYSTEM_TENANT_ID,
+  SYSTEM_AGENT_ID,
+} from './tenant-context.js';
 import type { PlannedEffect } from '@/governance/idempotency-effects.js';
 import { isVersionedPayloadHash } from '@/governance/idempotency.js';
 import { deriveCapabilityRisk, deriveCapabilityLocks } from './capability-risk.js';
@@ -4326,6 +4333,13 @@ export const healthRepo = {
     metadata?: Record<string, unknown>;
   }): Promise<void> {
     await db.insert(system_health_events).values({
+      // issue #323: health events are GLOBAL maintenance. Write under the
+      // sanctioned 'system' bucket (the 'default' column-default they relied on
+      // was dropped by migration 083). Callers may run without an ALS tenant
+      // (HTTP healthcheck, boot), so stamp 'system' explicitly rather than via
+      // getCurrentTenant() (which would throw outside a context).
+      tenant_id: SYSTEM_TENANT_ID,
+      agent_id: SYSTEM_AGENT_ID,
       component: input.component,
       status: input.status,
       duration_ms: input.duration_ms ?? null,
@@ -4356,6 +4370,11 @@ export const dlqRepo = {
     const rows = await db
       .insert(dead_letter_jobs)
       .values({
+        // issue #323: the DLQ is global ops maintenance — write under the
+        // sanctioned 'system' bucket (the dropped 'default' column-default). The
+        // BullMQ failure-handler caller has no tenant ALS, so stamp explicitly.
+        tenant_id: SYSTEM_TENANT_ID,
+        agent_id: SYSTEM_AGENT_ID,
         queue_name: input.queue_name,
         job_id: input.job_id,
         payload: input.payload as object,
