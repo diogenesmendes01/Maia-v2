@@ -41,10 +41,11 @@ let previousDatabaseUrl: string | undefined;
 const SHOULD_RUN = await isDockerAvailable();
 const d = SHOULD_RUN ? describe : describe.skip;
 
-// Migration 080 operates under the bootstrap tenant 'default' (migration 007
-// seeds the tenant + the legacy 'default' agent, migration 075 seeds v1 skills).
-const TENANT = 'default';
-const AGENT = 'default';
+// Migration 080 seeds under the bootstrap tenant, but issue #323 then re-homes
+// all data 'default' → 'primary' (migration 082) and deletes 'default' (084), so
+// post-migration the baseline-skills-v2 rows live under the reserved 'primary'.
+const TENANT = 'primary';
+const AGENT = 'primary';
 
 // -------------------------------------------------------------------------
 // Expected row sets — mirrors the VALUES clause in 080_baseline_skills_v2.sql
