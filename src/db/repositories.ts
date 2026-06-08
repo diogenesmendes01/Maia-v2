@@ -72,6 +72,7 @@ import type {
   RiskLevelId,
   ProposalUnifiedStatus,
 } from './schema.js';
+import { BASE_AGENT_PACKS } from '@/tools/base-agent-packs.js';
 import { TypedError } from '@/lib/utils.js';
 import { logger } from '@/lib/logger.js';
 import { incCounter } from '@/lib/metrics.js';
@@ -4778,9 +4779,9 @@ export const agentsRepo = {
         await tx.insert(agent_tool_grants).values({
           tenant_id: args.agent.tenant_id,
           agent_id: createdAgent.id,
-          granted_packs: ['baseline.core'],
+          granted_packs: [...BASE_AGENT_PACKS],
           granted_by: args.audit.actor_id,
-          reason: 'baseline.core default grant (agent creation, issue #408)',
+          reason: 'BASE_AGENT_PACKS default grant (agent creation, issue #408)',
         });
 
         // (4) Audit in the SAME tx. If this insert fails, EVERYTHING rolls back
@@ -4801,11 +4802,11 @@ export const agentsRepo = {
             seed_profile_status: seedProfile.status,
             proposed_reason: args.seed_profile.proposed_reason,
             // Issue #410/#408 — the default tool-pack grant for this agent,
-            // now PERSISTED to `agent_tool_grants` in step (3) above. Literal
-            // (not imported from src/tools/packs.ts) so this hot-path repo
-            // module stays free of the tools-registry/gateway import chain. Kept
-            // in sync with `DEFAULT_AGENT_PACKS`/`defaultAgentGrant()`.
-            default_tool_packs: ['baseline.core'],
+            // now PERSISTED to `agent_tool_grants` in step (3) above. Sourced
+            // from BASE_AGENT_PACKS (base-agent-packs.ts — import-free leaf)
+            // so this repo module stays free of the tools-registry/gateway
+            // import chain. In sync with `defaultAgentGrant()`.
+            default_tool_packs: [...BASE_AGENT_PACKS],
           },
         });
 

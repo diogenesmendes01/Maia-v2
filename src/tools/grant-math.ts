@@ -1,3 +1,5 @@
+import { BASE_AGENT_PACKS } from './base-agent-packs.js';
+
 /**
  * Issue #410 + #408 — Tool Pack DEFINITIONS and the pure grant MATH.
  *
@@ -656,12 +658,12 @@ export function computeAgentVisibleTools(
 }
 
 /**
- * The grant every newly-created agent receives: ONLY `baseline.core`, no domain
- * tools, no denies. Mirrors `DEFAULT_AGENT_PACKS`; consumed by the repo when it
- * seeds the default `agent_tool_grants` row at agent creation.
+ * The grant every newly-created agent receives: `BASE_AGENT_PACKS` (baseline.core
+ * + platform-default domain packs, e.g. domain.calendar). Consumed by the repo
+ * when it seeds the default `agent_tool_grants` row at agent creation.
  */
 export function defaultAgentGrant(): AgentToolGrant {
-  return { granted_packs: [...DEFAULT_AGENT_PACKS], granted_tools: [], denied_tools: [] };
+  return { granted_packs: [...BASE_AGENT_PACKS], granted_tools: [], denied_tools: [] };
 }
 
 /**

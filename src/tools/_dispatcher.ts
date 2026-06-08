@@ -4,6 +4,7 @@ import { canAct } from '@/governance/permissions.js';
 import { constitutionalCheck } from '@/governance/rules.js';
 import { REGISTRY, isToolEnabled, type AnyTool } from './_registry.js';
 import { resolveGrantedToolNames, type AgentToolGrant } from './grant-math.js';
+import { BASE_AGENT_PACKS } from './base-agent-packs.js';
 import { computeIdempotencyKey, computePayloadHash } from '@/governance/idempotency.js';
 import { idempotencyRepo, idempotencyOutboxRepo, agentToolGrantsRepo } from '@/db/repositories.js';
 import { audit } from '@/governance/audit.js';
@@ -119,7 +120,7 @@ export async function dispatchTool(input: {
     );
   }
   const effectiveGrant: AgentToolGrant = {
-    granted_packs: grantRow?.granted_packs ?? [],
+    granted_packs: grantRow?.granted_packs ?? [...BASE_AGENT_PACKS],
     granted_tools: grantRow?.granted_tools ?? [],
     denied_tools: grantRow?.denied_tools ?? [],
   };

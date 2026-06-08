@@ -26,6 +26,7 @@
  * the agent ∩ skill ∩ human ∩ flag intersection.
  */
 import type { ResolvedPermission } from '@/governance/permissions.js';
+import { BASE_AGENT_PACKS } from './base-agent-packs.js';
 import { getAgentToolSchemas } from './_registry.js';
 import {
   computeAgentVisibleTools,
@@ -112,7 +113,7 @@ export async function resolveEffectiveGrant(): Promise<AgentToolGrant> {
     );
   }
   return {
-    granted_packs: row?.granted_packs ?? ['baseline.core'],
+    granted_packs: row?.granted_packs ?? [...BASE_AGENT_PACKS],
     granted_tools: row?.granted_tools ?? [],
     denied_tools: row?.denied_tools ?? [],
   };
