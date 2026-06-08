@@ -171,7 +171,7 @@ Expected: FAIL (`defaultAgentGrant` ainda retorna só baseline.core).
     - `resolveGrantedToolNames` (`grant-math.ts:~518`): NÃO tocar. Ele já EXPANDE os packs presentes no grant (um fallback com `domain.calendar` rende as calendar tools) e une `BASELINE_CORE_PACK.tools` como piso independente.
   > Confirmar ausência de ciclo de import com `npx tsc --noEmit` (Step 5).
 
-- [ ] **Step 4: Escrever o teste do seed semeado (falha → passa)** — pina o LITERAL do repo, não só `defaultAgentGrant()`. Em `tests/unit/...` mocando o insert do `agentsRepo.createWithSeedAndAudit`, asserir que o `granted_packs` semeado contém `domain.calendar`. (Se o seed for difícil de unit-testar isolado, cobrir via integration em `tests/integration/*-real-db` — marcar como tal; specs real-db rodam no CI com Postgres.)
+- [ ] **Step 4: Escrever o teste do seed semeado (falha → passa)** — pina o LITERAL do repo, não só `defaultAgentGrant()`. **Tentar primeiro um teste unit** mocando o insert do `agentsRepo.createWithSeedAndAudit` e asserir que o `granted_packs` semeado contém `domain.calendar` (ao menos UMA guarda verde localmente em `vitest run tests/unit`). Só se o seed for genuinamente impossível de unit-testar isolado, cobrir via integration `tests/integration/*-real-db` (rodam no CI com Postgres; NÃO tratar um real-db skipado localmente como "feito").
 
 - [ ] **Step 5: Validar tipos + rodar testes**
 
@@ -274,9 +274,9 @@ git commit -m "test(tools): calendar tools visible via grant, admin tool gated"
   - (b) `resolveGrantedToolNames(defaultAgentGrant())` → BASELINE **+ as 7 tools do `domain.calendar`** (não mais só BASELINE). Expandir o conjunto esperado, senão essa assertion fica vermelha.
   Os casos que testam um grant explicitamente SEM domain pack (ex.: `:30-43`) permanecem `== BASELINE` — não mexer.
 
-- [ ] **Step 2: Regenerar o catálogo (se mudou)**
+- [ ] **Step 2: Regenerar o catálogo e commitar**
 
-Run: `npm run gen:tool-catalog` então `git status`. Se `src/admin-ui/generated/tool-catalog.ts` mudou (ex.: pack de cada tool), incluir no commit.
+Run: `npm run gen:tool-catalog` então `git status`. O split do calendar pack muda a associação de pack de cada calendar tool, então `src/admin-ui/generated/tool-catalog.ts` **provavelmente muda** — sempre incluir no commit (um CI drift check reprova se ficar dessincronizado).
 
 - [ ] **Step 3: Validação completa**
 
