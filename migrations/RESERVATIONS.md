@@ -188,3 +188,4 @@ NEW shared prefixes — pick `max(existing)+1`.
 082 | 082_rehome_default_to_primary.sql | rehome runtime data default to primary (issue 323)
 083 | 083_drop_default_column_default.sql | drop DEFAULT default column-default fail-closed (issue 323)
 084 | 084_delete_default_tenant.sql | delete legacy default tenant and agent (issue 323)
+085 | 085_calendar_default_pack.sql | calendar as default pack — backfill existing grants

@@ -18,11 +18,12 @@ import {
   computeAgentVisibleTools,
   resolveGrantedToolNames,
   defaultAgentGrant,
-  DEFAULT_AGENT_PACKS,
   BASELINE_CORE_PACK,
   DOMAIN_FINANCE_PACK,
+  DOMAIN_CALENDAR_PACK,
   type AgentToolGrant,
 } from '../../../src/tools/grant-math.js';
+import { BASE_AGENT_PACKS } from '../../../src/tools/base-agent-packs.js';
 
 const BASELINE = [...BASELINE_CORE_PACK.tools].sort();
 
@@ -42,13 +43,16 @@ describe('Runtime Tool Filter — agent grant ∩ skill scope (#408)', () => {
     expect(res.visible).not.toContain('start_workflow');
   });
 
-  it('defaultAgentGrant() == baseline.core only (parity with DEFAULT_AGENT_PACKS)', () => {
+  it('defaultAgentGrant() == BASE_AGENT_PACKS (baseline.core + domain.calendar)', () => {
     expect(defaultAgentGrant()).toEqual({
-      granted_packs: [...DEFAULT_AGENT_PACKS],
+      granted_packs: [...BASE_AGENT_PACKS],
       granted_tools: [],
       denied_tools: [],
     });
-    expect([...resolveGrantedToolNames(defaultAgentGrant())].sort()).toEqual(BASELINE);
+    // resolveGrantedToolNames must include both baseline AND calendar tools.
+    const granted = [...resolveGrantedToolNames(defaultAgentGrant())].sort();
+    const expected = [...BASELINE_CORE_PACK.tools, ...DOMAIN_CALENDAR_PACK.tools].sort();
+    expect(granted).toEqual(expected);
   });
 
   it('(b) an agent with domain.finance sees baseline ∪ the finance tools', () => {

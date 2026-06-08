@@ -1,3 +1,5 @@
+import { BASE_AGENT_PACKS } from './base-agent-packs.js';
+
 /**
  * Issue #410 + #408 — Tool Pack DEFINITIONS and the pure grant MATH.
  *
@@ -129,6 +131,13 @@ export const BASELINE_CORE_PACK: ToolPack = {
  */
 export const DEFAULT_AGENT_PACKS: readonly string[] = ['baseline.core'] as const;
 
+/**
+ * Domain packs auto-granted to EVERY newly-created agent (the platform floor
+ * above `baseline.core`). Together with `DEFAULT_AGENT_PACKS` these form the
+ * `BASE_AGENT_PACKS` constant in `src/tools/base-agent-packs.ts`.
+ */
+export const PLATFORM_DEFAULT_DOMAIN_PACKS: readonly string[] = ['domain.calendar'] as const;
+
 // ───────────────────────────────────────────────────────────────────────────
 // Issue #408 — DOMAIN packs.
 //
@@ -213,8 +222,9 @@ export const DOMAIN_SUPPORT_PACK: ToolPack = {
 
 /**
  * `domain.calendar` — agenda/feriados. `medium` risk: read-only calendar tools
- * are safe, but the pack also grants the write tools (schedule/cancel reminder,
- * register custom holiday) that create real series/effects.
+ * are safe, but the pack also grants the write tools (schedule/cancel reminder)
+ * that create real series/effects. `register_custom_holiday` was split into
+ * `domain.calendar.admin` (owner-only, explicit grant — not auto-granted).
  */
 export const DOMAIN_CALENDAR_PACK: ToolPack = {
   id: 'domain.calendar',
@@ -224,7 +234,7 @@ export const DOMAIN_CALENDAR_PACK: ToolPack = {
   risk_level: 'medium',
   default_for_agent_type: ['operacoes', 'agenda'],
   description:
-    'Capacidades de agenda: consultas de dias úteis/feriados (read-only) e gestão de lembretes/feriados customizados (write, com efeito real).',
+    'Capacidades de agenda: consultas de dias úteis/feriados (read-only) e gestão de lembretes (write, com efeito real).',
   tools: [
     'calendar_is_business_day',
     'calendar_next_holiday',
@@ -233,8 +243,19 @@ export const DOMAIN_CALENDAR_PACK: ToolPack = {
     'calendar_add_business_days',
     'schedule_reminder',
     'cancel_reminder',
-    'register_custom_holiday',
   ],
+} as const;
+
+export const DOMAIN_CALENDAR_ADMIN_PACK: ToolPack = {
+  id: 'domain.calendar.admin',
+  name: 'Agenda (admin)',
+  domain: 'calendar',
+  version: 1,
+  risk_level: 'high',
+  default_for_agent_type: [],
+  description:
+    'Gestão de feriados customizados do tenant (write). Concessão explícita — não auto-concedido.',
+  tools: ['register_custom_holiday'],
 } as const;
 
 /**
@@ -403,6 +424,7 @@ export const DOMAIN_PACKS: readonly ToolPack[] = [
   DOMAIN_SALES_PACK,
   DOMAIN_SUPPORT_PACK,
   DOMAIN_CALENDAR_PACK,
+  DOMAIN_CALENDAR_ADMIN_PACK,
   DOMAIN_OPERATIONS_PACK,
   ...BOLETO_PROPOSAL_PACKS,
 ] as const;
@@ -636,12 +658,12 @@ export function computeAgentVisibleTools(
 }
 
 /**
- * The grant every newly-created agent receives: ONLY `baseline.core`, no domain
- * tools, no denies. Mirrors `DEFAULT_AGENT_PACKS`; consumed by the repo when it
- * seeds the default `agent_tool_grants` row at agent creation.
+ * The grant every newly-created agent receives: `BASE_AGENT_PACKS` (baseline.core
+ * + platform-default domain packs, e.g. domain.calendar). Consumed by the repo
+ * when it seeds the default `agent_tool_grants` row at agent creation.
  */
 export function defaultAgentGrant(): AgentToolGrant {
-  return { granted_packs: [...DEFAULT_AGENT_PACKS], granted_tools: [], denied_tools: [] };
+  return { granted_packs: [...BASE_AGENT_PACKS], granted_tools: [], denied_tools: [] };
 }
 
 /**

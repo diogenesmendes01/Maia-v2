@@ -26,6 +26,7 @@
  * the agent ∩ skill ∩ human ∩ flag intersection.
  */
 import type { ResolvedPermission } from '@/governance/permissions.js';
+import { BASE_AGENT_PACKS } from './base-agent-packs.js';
 import { getAgentToolSchemas } from './_registry.js';
 import {
   computeAgentVisibleTools,
@@ -93,9 +94,9 @@ export interface RuntimeToolFilterResult {
 
 /**
  * Resolve the effective AGENT grant from the current (tenant, agent) ALS
- * context. Fail-closed: a missing row degrades to the in-code baseline floor
- * (`resolveGrantedToolNames` always unions `baseline.core`), never to "all
- * tools" and never to a thrown error in the hot path.
+ * context. Fail-closed: a missing row degrades to the in-code `BASE_AGENT_PACKS`
+ * floor (baseline.core + domain.calendar; `resolveGrantedToolNames` also unions
+ * `baseline.core`), never to "all tools" and never to a thrown error in the hot path.
  */
 export async function resolveEffectiveGrant(): Promise<AgentToolGrant> {
   // try/catch (not just `.catch`) so a SYNCHRONOUS throw (missing ALS context,
@@ -112,7 +113,7 @@ export async function resolveEffectiveGrant(): Promise<AgentToolGrant> {
     );
   }
   return {
-    granted_packs: row?.granted_packs ?? ['baseline.core'],
+    granted_packs: row?.granted_packs ?? [...BASE_AGENT_PACKS],
     granted_tools: row?.granted_tools ?? [],
     denied_tools: row?.denied_tools ?? [],
   };

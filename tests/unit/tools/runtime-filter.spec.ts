@@ -114,14 +114,15 @@ describe('computeRuntimeVisibleTools — Runtime Tool Filter (#408)', () => {
     expect(row.metadata.visible_tools).toEqual(['query_balance']);
   });
 
-  it('(5) a missing grant row degrades to the baseline floor (fail-closed)', async () => {
+  it('(5) a missing grant row degrades to the BASE_AGENT_PACKS floor (fail-closed, includes calendar)', async () => {
     grantState.grant = null;
     const res = await computeRuntimeVisibleTools({ byEntity: ownerByEntity });
     const names = res.tools.map((t) => t.name);
     expect(names).toContain('audit_decision');
     expect(names).not.toContain('register_transaction');
-    // The grant returned reflects the baseline fallback.
-    expect(res.grant.granted_packs).toEqual(['baseline.core']);
+    // The grant returned reflects the BASE_AGENT_PACKS fallback (baseline.core + domain.calendar).
+    expect(res.grant.granted_packs).toContain('baseline.core');
+    expect(res.grant.granted_packs).toContain('domain.calendar');
   });
 
   // ---------------------------------------------------------------------------
