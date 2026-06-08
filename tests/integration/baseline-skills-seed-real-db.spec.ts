@@ -106,14 +106,15 @@ d('baseline skills seed (migration 075) — real DB', () => {
       execution_mode: string;
       allowed_tools: string[];
     }>(
-      // Scope to the known baseline descriptors: issue #415 also seeds role
-      // skills tenant-wide with proposed_by='system', so a bare proposed_by
-      // filter would now return more than the 8 baseline rows.
+      // Scope to the known baseline descriptors AND version=1: migration 080
+      // adds v2 rows for 5 of these descriptors; without the version filter the
+      // query returns 13 rows (v1 + v2) instead of 8.
       `SELECT skill_descriptor, agent_id, status, proposed_by, approved_by,
               version, execution_mode, allowed_tools
          FROM skills
         WHERE tenant_id = $1 AND proposed_by = 'system'
           AND skill_descriptor = ANY($2)
+          AND version = 1
         ORDER BY skill_descriptor`,
       [TENANT, [...BASELINE_DESCRIPTORS]],
     );
@@ -123,7 +124,9 @@ d('baseline skills seed (migration 075) — real DB', () => {
     );
     for (const r of rows) {
       expect(r.agent_id, `${r.skill_descriptor} must be tenant-wide`).toBeNull();
-      expect(r.status).toBe('active');
+      // Migration 080 deprecates the 5 converted skills (they become tool_mediated v2);
+      // the 3 prompt_only skills that were not converted stay active.
+      expect(['active', 'deprecated']).toContain(r.status);
       expect(r.proposed_by).toBe('system');
       expect(r.approved_by).toBe('system');
       expect(r.version).toBe(1);
@@ -149,10 +152,13 @@ d('baseline skills seed (migration 075) — real DB', () => {
     await pg.pool.query(sql);
 
     const { rows } = await pg.pool.query<{ count: string }>(
+      // Count only version=1 rows: migration 080 adds v2 rows for 5 of these
+      // descriptors; without this filter the count exceeds 8.
       `SELECT COUNT(*)::text AS count
          FROM skills
         WHERE tenant_id = $1 AND proposed_by = 'system'
-          AND skill_descriptor = ANY($2)`,
+          AND skill_descriptor = ANY($2)
+          AND version = 1`,
       [TENANT, [...BASELINE_DESCRIPTORS]],
     );
     expect(Number(rows[0]!.count)).toBe(BASELINE_DESCRIPTORS.length);

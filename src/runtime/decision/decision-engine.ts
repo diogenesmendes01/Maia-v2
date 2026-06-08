@@ -9,14 +9,17 @@
  * Architecture lock (spec §1): PolicyDescriptorResolver is consumed via DI;
  * Decision Engine NEVER imports the resolver implementation directly.
  *
- * Budget: <400ms baseline. Spec §6.2 fallback behaviour: if budget is
- * exhausted, returns a minimal packet with `action_mode='ask_clarification'`
- * (or `'escalate'` if the tenant has sensitive context).
+ * Budget: configurable via `DECISION_ENGINE_BUDGET_MS` (default raised above
+ * the original "<400ms baseline" target — see the const below for why). Spec
+ * §6.2 fallback behaviour: if budget is exhausted, returns a minimal packet
+ * with `action_mode='ask_clarification'` (or `'escalate'` if the tenant has
+ * sensitive context). The fallback stays fail-closed (it does NOT run the
+ * main LLM without governance).
  *
  * Codex review #103: deadline enforcement is no longer "best effort". Every
  * awaited dependency is wrapped in a budget-derived deadline AND receives a
  * shared `AbortSignal`. A slow/hung resolver, classifier, repo, or PEP
- * evaluator can no longer pin the hot path past 400ms.
+ * evaluator can no longer pin the hot path past the configured budget.
  */
 import { BudgetTracker } from './budget-tracker.js';
 import { PepAudit } from './pep-audit.js';
@@ -48,8 +51,19 @@ import type {
 } from '../context-packet/types.js';
 import { DEFAULT_CONTEXT_REQUIREMENTS } from '../context-packet/types.js';
 import { allowedDataScopesForAudience } from '@/skills/usage-policy.js';
+import { config } from '@/config/env.js';
 
-const TOTAL_BUDGET_MS = 400;
+// Total wall-clock budget for the hot path. The original value was 400ms (the
+// spec "<400ms baseline" target), but the intent classifier's Haiku hop alone
+// measures ~390ms in production — so the 400ms budget was exhausted on the
+// `intent` step for EVERY message that missed the deterministic heuristic
+// (e.g. real questions like "quem é você?"). The engine then returned its
+// budget-fallback packet (`ask_clarification` → canned reply, main LLM
+// skipped) instead of answering. Raising the default so the classifier hop
+// fits keeps the engine on its normal path; configurable via
+// DECISION_ENGINE_BUDGET_MS and overridable per-instance (tests) via
+// DecisionEngineDeps.budget_ms.
+const TOTAL_BUDGET_MS = config.DECISION_ENGINE_BUDGET_MS;
 
 export interface DecisionEngineInput {
   base: BaseContextPacket;
@@ -79,6 +93,12 @@ export interface DecisionEngineDeps {
   lockdownReader: LockdownReader;
   metrics?: MetricsClient;
   clock?: () => number;
+  /**
+   * Override the total wall-clock budget (ms) for this engine instance.
+   * Defaults to `config.DECISION_ENGINE_BUDGET_MS`. Tests inject a small
+   * value to force the budget-exhaustion fallback deterministically.
+   */
+  budget_ms?: number;
 }
 
 const EMPTY_TOOL_PERMS: DecisionPacket['tool_permissions'] = {
@@ -153,7 +173,7 @@ export class DecisionEngine {
 
   async run(input: DecisionEngineInput): Promise<DecisionEngineResult> {
     const clock = this.deps.clock ?? (() => Date.now());
-    const tracker = new BudgetTracker(TOTAL_BUDGET_MS, clock);
+    const tracker = new BudgetTracker(this.deps.budget_ms ?? TOTAL_BUDGET_MS, clock);
     const audit = new PepAudit();
 
     // Engine-wide abort controller. We abort it on budget exhaustion so

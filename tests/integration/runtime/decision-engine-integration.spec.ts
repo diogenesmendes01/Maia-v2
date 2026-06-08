@@ -516,9 +516,10 @@ describe('P9b — Decision Engine integration (7 cenários, spec §10.2)', () =>
     const env = {
       ...fixture,
       clock: () => now,
+      budget_ms: 400, // pin so the +500ms jump exhausts it regardless of the raised default
       contentResolver: {
         text: async () => {
-          now += 500; // exceeds 400ms total
+          now += 500; // exceeds the 400ms budget pinned above
           return 'preciso de algo';
         },
       },
@@ -601,7 +602,7 @@ describe('P9b — Decision Engine integration (7 cenários, spec §10.2)', () =>
         .fn()
         .mockImplementation(() => new Promise<ResolvedPolicy[]>(() => {})),
     };
-    const engine = createDecisionEngine({ ...fixture, resolver: hangResolver });
+    const engine = createDecisionEngine({ ...fixture, resolver: hangResolver, budget_ms: 400 });
 
     const t0 = Date.now();
     const r = await engine.run({ base: mkBase(fixture) });

@@ -1,4 +1,4 @@
--- Reverse 082: restore `DEFAULT 'default'` on the EXPLICIT set of columns that
+-- Reverse 083: restore `DEFAULT 'default'` on the EXPLICIT set of columns that
 -- carried it.
 --
 -- Why an explicit hardcoded list (not re-discovery): post-drop, a

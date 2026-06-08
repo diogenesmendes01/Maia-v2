@@ -5,7 +5,7 @@
 -- passes the `'default'`-literal guard with no special-casing, so once the
 -- runtime moves off `default` we can reject `default` fail-closed everywhere.
 --
--- Must run BEFORE 081 (rehome) — the rehome re-points FK columns at `primary`,
+-- Must run BEFORE 082 (rehome) — the rehome re-points FK columns at `primary`,
 -- so the FK targets must already exist. ON CONFLICT for idempotency.
 -- NOTE: no BEGIN/COMMIT — migrate.ts already wraps each migration in a tx.
 

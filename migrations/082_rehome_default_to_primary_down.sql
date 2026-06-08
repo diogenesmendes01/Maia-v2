@@ -1,10 +1,10 @@
--- Reverse 081: move data back from `primary` to `default`, same discovery union.
+-- Reverse 082: move data back from `primary` to `default`, same discovery union.
 --
--- In the full down chain this runs AFTER 083_down (which re-seeds the `default`
--- tenant/agent rows), so the FK targets exist, and BEFORE 080_down (which
+-- In the full down chain this runs AFTER 084_down (which re-seeds the `default`
+-- tenant/agent rows), so the FK targets exist, and BEFORE 081_down (which
 -- deletes `primary`). Only the `primary` agent/tenant registry rows themselves
 -- remain on `primary` afterwards (the agents/tenants tables are excluded), and
--- 080_down removes those.
+-- 081_down removes those.
 
 DO $$
 DECLARE r RECORD;

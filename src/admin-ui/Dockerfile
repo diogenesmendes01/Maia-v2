@@ -65,6 +65,15 @@ ENV ANTHROPIC_API_KEY=sk-ant-build
 ENV OPENROUTER_API_KEY=sk-or-build
 ENV VOYAGE_API_KEY=voyage-build
 ENV ALERT_CHANNELS=log
+# config/env.ts fail-closes in production when RUNTIME_TRACE_HMAC_MASTER_SECRET
+# is unset (its superRefine: audit HMACs would be forgeable without it, added in
+# P10b / made unconditional in P11). The admin-ui transitively imports that
+# validator via @/db/client.ts during `next build`'s page-data collection pass,
+# so the BUILD needs a stub too — otherwise `next build` crashes on
+# "Failed to collect page data for /api/auth/[...nextauth]". The REAL KMS-backed
+# secret is injected by Coolify at container START (same value as the main app —
+# see docs/admin-ui-deploy.md "Inherited env vars"). This stub never ships.
+ENV RUNTIME_TRACE_HMAC_MASTER_SECRET=build-time-only-hmac-not-shipped-min-32-chars-1234567890
 
 COPY --from=root-deps  /app/node_modules ./node_modules
 COPY --from=admin-deps /app/node_modules ./src/admin-ui/node_modules

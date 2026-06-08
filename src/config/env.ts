@@ -56,6 +56,12 @@ const envSchema = z
     CLAUDE_MAX_RETRIES: z.coerce.number().int().nonnegative().default(3),
     CLAUDE_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),
     WHATSAPP_RECONNECT_ALERT_MIN: z.coerce.number().int().positive().default(5),
+    // Decision Engine total wall-clock budget (ms). Raised from the original
+    // 400ms baseline: the intent classifier's Haiku hop (~390ms) alone blew the
+    // 400ms budget on every heuristic-miss, forcing the canned
+    // `ask_clarification` fallback (main LLM skipped). See
+    // src/runtime/decision/decision-engine.ts.
+    DECISION_ENGINE_BUDGET_MS: z.coerce.number().int().positive().default(2500),
 
     ALERT_CHANNELS: z
       .string()

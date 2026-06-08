@@ -1,6 +1,6 @@
 -- issue #323 — delete the legacy `default` tenant/agent registry rows.
 --
--- After 081 re-homed every child row to `primary` and 080 seeded `primary`,
+-- After 082 re-homed every child row to `primary` and 081 seeded `primary`,
 -- nothing references `default` anymore (assumption verified for the
 -- single-tenant runtime: the only agent under tenant `default` was the
 -- `default` agent itself). FK RESTRICT now permits the delete. Delete the agent

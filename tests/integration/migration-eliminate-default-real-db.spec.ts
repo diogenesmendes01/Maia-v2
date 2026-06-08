@@ -4,15 +4,15 @@
  *
  * The four new migrations together move the single-tenant runtime off `'default'`
  * and onto the reserved `'primary'` home:
- *   080 — seed the reserved `primary` tenant/agent.
- *   081 — rehome every runtime row from `default` → `primary` (UNION of
+ *   081 — seed the reserved `primary` tenant/agent.
+ *   082 — rehome every runtime row from `default` → `primary` (UNION of
  *         tenant_id/agent_id name-columns + FK-to-tenants/agents columns, so it
  *         also catches `procedure_definitions.owner_agent_id` and the no-FK
  *         `outbound_messages`/`idempotency_effect_outbox`).
- *   082 — drop the `DEFAULT 'default'` column-default everywhere it existed, so a
+ *   083 — drop the `DEFAULT 'default'` column-default everywhere it existed, so a
  *         tenant-less INSERT fails NOT NULL instead of silently bucketing into
  *         `default` (closes the #282 silent fall-through).
- *   083 — delete the now-orphaned `default` tenant/agent registry rows.
+ *   084 — delete the now-orphaned `default` tenant/agent registry rows.
  *
  * WHY A REAL-POSTGRES TEST (not the in-memory drizzle fake): the whole point is
  * the DB end-state — the dynamic rehome loop, the dropped column-default's NOT
@@ -83,7 +83,7 @@ d('migration: eliminate the default tenant (#323) — real DB', () => {
 
   // -------------------------------------------------------------------------
   // 1. REHOME COMPLETENESS — no residual `default` anywhere a tenant/agent id
-  //    can live. Discovers the SAME union migration 081 rehomes over, so a
+  //    can live. Discovers the SAME union migration 082 rehomes over, so a
   //    missed rehome column (the failure this guards) surfaces as an offender.
   // -------------------------------------------------------------------------
   it('rehome leaves ZERO residual default rows across all tenant/agent-scoped columns', async () => {
@@ -92,7 +92,7 @@ d('migration: eliminate the default tenant (#323) — real DB', () => {
     // (b) columns FK-referencing tenants(id)/agents(id) (catches the
     //     non-standard procedure_definitions.owner_agent_id). Excludes the
     //     tenants/agents registry tables themselves (their `default` rows are
-    //     deleted by 083, asserted separately below).
+    //     deleted by 084, asserted separately below).
     const { rows: cols } = await pg.pool.query<{ table_name: string; column_name: string }>(`
       SELECT DISTINCT t.table_name, t.column_name FROM (
         SELECT c.table_name, c.column_name
@@ -143,7 +143,7 @@ d('migration: eliminate the default tenant (#323) — real DB', () => {
   });
 
   // -------------------------------------------------------------------------
-  // 2. FAIL-CLOSED INSERT — the dropped column-default (082) turns a tenant-less
+  // 2. FAIL-CLOSED INSERT — the dropped column-default (083) turns a tenant-less
   //    INSERT into a loud NOT NULL violation instead of a silent `default`
   //    bucketing. Proven for a 009 FK-bearing table (pessoas) AND the no-FK
   //    ledger (outbound_messages) — the latter is the #282 silent fall-through
@@ -200,7 +200,7 @@ d('migration: eliminate the default tenant (#323) — real DB', () => {
   });
 
   // -------------------------------------------------------------------------
-  // 3. REGISTRY — 083 deleted the `default` tenant/agent; 080 seeded `primary`.
+  // 3. REGISTRY — 084 deleted the `default` tenant/agent; 081 seeded `primary`.
   // -------------------------------------------------------------------------
   it('the default tenant/agent rows are deleted and primary exists', async () => {
     const PRIMARY = tenantContextMod.PRIMARY_TENANT_ID; // 'primary'

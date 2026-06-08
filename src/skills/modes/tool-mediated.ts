@@ -26,6 +26,7 @@
  *  - Streaming de tool_use (assumimos modo síncrono)
  */
 import { callLLM, type LLMMessage, type ToolSchema } from '@/lib/claude.js';
+import { getToolSchemasByName } from '@/tools/_registry.js';
 import { logger } from '@/lib/logger.js';
 import { incCounter } from '@/lib/metrics.js';
 import {
@@ -169,11 +170,12 @@ export async function toolMediatedMode(
       ? hints.max_prompt_tokens + max_tokens * (maxToolCalls + 1)
       : Number.POSITIVE_INFINITY;
 
-  // Filter tool schemas to only those declared in allowed_tools and NOT in
-  // denied_tools (defense in depth — #408 SkillToolScope HARD deny).
-  const tools: ToolSchema[] = (procedure.tool_schemas ?? []).filter(
-    (t) => allowedTools.includes(t.name) && !deniedTools.has(t.name),
-  );
+  // Resolve tool schemas from the registry for tools declared in allowed_tools
+  // and NOT in denied_tools (defense in depth — #408 SkillToolScope HARD deny).
+  // Schemas are NOT stored in procedure.tool_schemas to avoid drift between the
+  // registry and seed SQL; they are always derived from the live registry.
+  const visibleNames = allowedTools.filter((t) => !deniedTools.has(t));
+  const tools: ToolSchema[] = getToolSchemasByName(visibleNames);
 
   const messages: LLMMessage[] = [{ role: 'user', content: JSON.stringify(ctx.input) }];
   const toolsCalled: string[] = [];

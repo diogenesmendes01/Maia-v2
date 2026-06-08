@@ -6,11 +6,11 @@
 --       (outbound_messages, idempotency_effect_outbox), and
 --   (b) columns FK-referencing tenants(id) / agents(id) — catches non-standard
 --       FK names (procedure_definitions.owner_agent_id).
--- Name-only discovery would miss owner_agent_id (breaking the 083 delete via FK
+-- Name-only discovery would miss owner_agent_id (breaking the 084 delete via FK
 -- RESTRICT); FK-only discovery would miss the no-FK tenant_id tables.
 --
 -- Carries the typed seeds (catch-all channel, role/policy, biases, baseline
--- skills) along, since they live in these scoped tables. Requires 080 (primary
+-- skills) along, since they live in these scoped tables. Requires 081 (primary
 -- must exist for the FK targets). NOTE: no BEGIN/COMMIT — migrate.ts wraps in tx.
 
 DO $$
