@@ -46,14 +46,18 @@ d('procedureExecutionsRepo.createOrFindActive (real DB)', () => {
         [T, A],
       );
       definition_id = def.rows[0]!.id;
+      // Stamp the bespoke (T, A) explicitly: migration 082 dropped the legacy
+      // `DEFAULT 'default'` column-default, so omitting tenant_id/agent_id now
+      // fails NOT NULL. These fixtures belong to this test's own tenant.
       const pess = await c.query<{ id: string }>(
-        `INSERT INTO pessoas(nome, telefone_whatsapp, tipo)
-         VALUES ('p84-test', '+5511900000084', 'funcionario') RETURNING id`,
+        `INSERT INTO pessoas(tenant_id, agent_id, nome, telefone_whatsapp, tipo)
+         VALUES ($1, $2, 'p84-test', '+5511900000084', 'funcionario') RETURNING id`,
+        [T, A],
       );
       pessoa_id = pess.rows[0]!.id;
       const conv = await c.query<{ id: string }>(
-        `INSERT INTO conversas(pessoa_id, escopo_entidades) VALUES ($1, '{}') RETURNING id`,
-        [pessoa_id],
+        `INSERT INTO conversas(tenant_id, agent_id, pessoa_id, escopo_entidades) VALUES ($1, $2, $3, '{}') RETURNING id`,
+        [T, A, pessoa_id],
       );
       conversa_id = conv.rows[0]!.id;
     } finally {

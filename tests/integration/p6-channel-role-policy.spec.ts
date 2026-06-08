@@ -4,7 +4,7 @@
  *
  * Cobre 6 cenários:
  *   1. #411 single-tenant catch-all — remetente arbitrário (telefone que NÃO
- *      casa com o canal semeado) resolve para (default, default, <default
+ *      casa com o canal semeado) resolve para (primary, primary, <primary
  *      channel id>) E o caso multi-tenant (canal de outro tenant existe) volta
  *      a ser fail-loud (issue #268 preservado).
  *   2. Policy=LOCKED → mesmo com candidate strong vindo dos suggesters,
@@ -55,7 +55,7 @@ const recordedPayloads: DecisionPayload[] = [];
 const {
   // Repos
   channelsFindByExternalCrossTenantMock,
-  channelsFindDefaultCatchAllChannelMock,
+  channelsFindPrimaryCatchAllChannelMock,
   recordDecisionMock,
   countSwitchesMock,
   listByConversationMock,
@@ -86,7 +86,7 @@ const {
   procedureDefinitionsFindById,
 } = vi.hoisted(() => ({
   channelsFindByExternalCrossTenantMock: vi.fn(),
-  channelsFindDefaultCatchAllChannelMock: vi.fn(),
+  channelsFindPrimaryCatchAllChannelMock: vi.fn(),
   recordDecisionMock: vi.fn(),
   countSwitchesMock: vi.fn(),
   listByConversationMock: vi.fn(),
@@ -124,7 +124,7 @@ vi.mock('@/db/repositories.js', () => ({
   // Channels — only findByExternalCrossTenant matters for resolveChannel.
   channelsRepo: {
     findByExternalCrossTenant: channelsFindByExternalCrossTenantMock,
-    findDefaultCatchAllChannel: channelsFindDefaultCatchAllChannelMock,
+    findPrimaryCatchAllChannel: channelsFindPrimaryCatchAllChannelMock,
     create: vi.fn(),
     getById: vi.fn(),
     findByExternal: vi.fn(),
@@ -361,20 +361,20 @@ describe('P6 channel/role/policy — end-to-end', () => {
   });
 
   // ---------- Cenário 1 ----------
-  it('cenário 1: #411 — remetente arbitrário resolve para (default, default) via catch-all; multi-tenant volta a ser fail-loud (#268)', async () => {
+  it('cenário 1: #411 — remetente arbitrário resolve para (primary, primary) via catch-all; multi-tenant volta a ser fail-loud (#268)', async () => {
     const { resolveChannel } = await import('@/gateway/channel-resolver.js');
     const { TypedError } = await import('@/lib/utils.js');
 
     // (a) SINGLE-TENANT: o telefone do remetente NÃO casa com o canal semeado
     // `default-channel` (exact-match miss). O catch-all confirma que não há
-    // canal de outro tenant e resolve para o canal default semeado.
+    // canal de outro tenant e resolve para o canal primary semeado.
     channelsFindByExternalCrossTenantMock.mockResolvedValueOnce(null);
-    channelsFindDefaultCatchAllChannelMock.mockResolvedValueOnce({
+    channelsFindPrimaryCatchAllChannelMock.mockResolvedValueOnce({
       multi_tenant: false,
       channel: makeChannel({
-        id: 'default-channel-uuid',
-        tenant_id: 'default',
-        agent_id: 'default',
+        id: 'primary-channel-uuid',
+        tenant_id: 'primary',
+        agent_id: 'primary',
         external_id: 'default-channel',
       }),
     });
@@ -384,16 +384,16 @@ describe('P6 channel/role/policy — end-to-end', () => {
       external_id: '+5511988887777', // telefone do REMETENTE
     });
     expect(single).toEqual({
-      tenant_id: 'default',
-      agent_id: 'default',
-      channel_id: 'default-channel-uuid',
+      tenant_id: 'primary',
+      agent_id: 'primary',
+      channel_id: 'primary-channel-uuid',
     });
 
     // (b) MULTI-TENANT: existe um canal ativo de outro tenant → o catch-all
     // reporta multi_tenant:true e o resolver volta a ser fail-loud (issue #268
-    // — sem colapso no bucket compartilhado `default/default`).
+    // — sem colapso no bucket compartilhado `primary/primary`).
     channelsFindByExternalCrossTenantMock.mockResolvedValueOnce(null);
-    channelsFindDefaultCatchAllChannelMock.mockResolvedValueOnce({
+    channelsFindPrimaryCatchAllChannelMock.mockResolvedValueOnce({
       multi_tenant: true,
       channel: null,
     });

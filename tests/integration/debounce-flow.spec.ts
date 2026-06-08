@@ -66,12 +66,13 @@ const SHOULD_RUN =
 const d = SHOULD_RUN ? describe : describe.skip;
 
 // P0 adicionou `getCurrentTenant()` em listUnprocessedByTelefone e
-// derivados. Os fixtures abaixo criam rows via raw SQL (default tenant
-// pelo schema), então wrappar as chamadas de repo no contexto 'default'
-// é suficiente.
+// derivados. issue #323 eliminou o tenant legacy 'default' (083 apaga as rows;
+// 082 derruba o column-default 'default'), então os fixtures abaixo gravam
+// tenant_id/agent_id 'primary' EXPLICITAMENTE nos raw inserts (omiti-los agora
+// viola NOT NULL) e wrappamos as chamadas de repo no contexto 'primary'.
 import { runWithTenantContext } from '@/db/tenant-context.js';
-const withDefaultTenant = <T>(fn: () => Promise<T>): Promise<T> =>
-  runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, fn);
+const withPrimaryTenant = <T>(fn: () => Promise<T>): Promise<T> =>
+  runWithTenantContext({ tenant_id: 'primary', agent_id: 'primary' }, fn);
 
 let pool: pg.Pool;
 let pessoa_id: string;
@@ -92,9 +93,9 @@ async function insertInbound(
   const created = args.created_at?.toISOString() ?? null;
   const r = await client.query<{ id: string }>(
     `INSERT INTO mensagens(
-       conversa_id, direcao, tipo, conteudo, metadata${created ? ', created_at' : ''}
+       tenant_id, agent_id, conversa_id, direcao, tipo, conteudo, metadata${created ? ', created_at' : ''}
      )
-     VALUES ($1, 'in', 'texto', $2, jsonb_build_object('telefone', $3::text, 'whatsapp_id', $4::text)${
+     VALUES ('primary', 'primary', $1, 'in', 'texto', $2, jsonb_build_object('telefone', $3::text, 'whatsapp_id', $4::text)${
        created ? ', $5::timestamptz' : ''
      })
      RETURNING id`,
@@ -120,14 +121,14 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
     try {
       telefone = `+551199${randomInt(0, 10_000_000).toString().padStart(7, '0')}`;
       const p = await c.query<{ id: string }>(
-        `INSERT INTO pessoas(nome, telefone_whatsapp, tipo, status)
-         VALUES ('debounce-fixture', $1, 'funcionario', 'ativa')
+        `INSERT INTO pessoas(tenant_id, agent_id, nome, telefone_whatsapp, tipo, status)
+         VALUES ('primary', 'primary', 'debounce-fixture', $1, 'funcionario', 'ativa')
          RETURNING id`,
         [telefone],
       );
       pessoa_id = p.rows[0]!.id;
       const conv = await c.query<{ id: string }>(
-        `INSERT INTO conversas(pessoa_id, escopo_entidades) VALUES ($1, '{}')
+        `INSERT INTO conversas(tenant_id, agent_id, pessoa_id, escopo_entidades) VALUES ('primary', 'primary', $1, '{}')
          RETURNING id`,
         [pessoa_id],
       );
@@ -165,7 +166,7 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
       const id3 = await insertInbound(c, { conversa_id: null, telefone, conteudo: 'a finança?', created_at: t2 });
 
       const { mensagensRepo } = await import('../../src/db/repositories.js');
-      const rows = await withDefaultTenant(() =>
+      const rows = await withPrimaryTenant(() =>
         mensagensRepo.listUnprocessedByTelefone(telefone, { excludeId: id3 }),
       );
       const ids = rows.map((r) => r.id);
@@ -196,7 +197,7 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
       const id2 = await insertInbound(c, { conversa_id: null, telefone, conteudo: 'b', created_at: t1 });
 
       const { mensagensRepo } = await import('../../src/db/repositories.js');
-      await withDefaultTenant(() => mensagensRepo.setConversaIdMany([id1, id2], conversa_id));
+      await withPrimaryTenant(() => mensagensRepo.setConversaIdMany([id1, id2], conversa_id));
 
       const r = await c.query<{ id: string; conversa_id: string | null }>(
         `SELECT id, conversa_id FROM mensagens WHERE id = ANY($1)`,
@@ -218,7 +219,7 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
       const id2 = await insertInbound(c, { conversa_id: null, telefone, conteudo: 'b' });
 
       const { mensagensRepo } = await import('../../src/db/repositories.js');
-      await withDefaultTenant(() => mensagensRepo.markProcessed(id1, 42));
+      await withPrimaryTenant(() => mensagensRepo.markProcessed(id1, 42));
 
       const target = await c.query<{ processada_em: Date | null; tokens_usados: number | null }>(
         `SELECT processada_em, tokens_usados FROM mensagens WHERE id = $1`,
@@ -252,7 +253,7 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
       const id3 = await insertInbound(c, { conversa_id: null, telefone, conteudo: 'a finança?', created_at: t2 });
 
       const { mensagensRepo } = await import('../../src/db/repositories.js');
-      const target = await withDefaultTenant(() => mensagensRepo.findById(id3));
+      const target = await withPrimaryTenant(() => mensagensRepo.findById(id3));
       expect(target).not.toBeNull();
 
       // Import the real aggregator (queue/baileys are stubbed at module
@@ -261,15 +262,15 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
       // catches regressions in feature flag, conversa guard, separator,
       // and merged_ids that a re-implementation would not.
       const { _internal } = await import('../../src/agent/core.js');
-      const out = await withDefaultTenant(() => _internal.aggregateUnprocessedTexts(target!));
+      const out = await withPrimaryTenant(() => _internal.aggregateUnprocessedTexts(target!));
       expect(out.text).toBe('Oi,\ncomo vai\na finança?');
       expect(out.merged_ids).toEqual(expect.arrayContaining([id1, id2]));
       expect(out.merged_ids).not.toContain(id3); // target is excluded
 
       // Process id2 to simulate a partial run; the next aggregator call
       // should drop it from the merge.
-      await withDefaultTenant(() => mensagensRepo.markProcessed(id2, 0));
-      const after = await withDefaultTenant(() => _internal.aggregateUnprocessedTexts(target!));
+      await withPrimaryTenant(() => mensagensRepo.markProcessed(id2, 0));
+      const after = await withPrimaryTenant(() => _internal.aggregateUnprocessedTexts(target!));
       expect(after.text).toBe('Oi,\na finança?');
       expect(after.merged_ids).toEqual([id1]);
     } finally {
@@ -286,7 +287,7 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
       const id3 = await insertInbound(c, { conversa_id: null, telefone, conteudo: 'c' });
 
       const { mensagensRepo } = await import('../../src/db/repositories.js');
-      await withDefaultTenant(async () => {
+      await withPrimaryTenant(async () => {
         await mensagensRepo.setConversaIdMany([id1, id2], conversa_id);
         await mensagensRepo.markProcessed(id1, 10);
         await mensagensRepo.markProcessed(id2, 0);
@@ -301,7 +302,7 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
       // acceptable because the safety property is on the QUERY, not the
       // row. Assert both: the row is still excluded, and tokens_usados
       // does get overwritten (so the test reflects real behaviour).
-      await withDefaultTenant(() => mensagensRepo.markProcessed(id1, 999));
+      await withPrimaryTenant(() => mensagensRepo.markProcessed(id1, 999));
 
       const r = await c.query<{ id: string; processada_em: Date | null; tokens_usados: number | null; conversa_id: string | null }>(
         `SELECT id, processada_em, tokens_usados, conversa_id FROM mensagens WHERE id = ANY($1)`,
@@ -320,7 +321,7 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
 
       // The query-side safety: an unprocessed-only fetch must NOT return
       // any of the three rows.
-      const stillUnprocessed = await withDefaultTenant(() =>
+      const stillUnprocessed = await withPrimaryTenant(() =>
         mensagensRepo.listUnprocessedByTelefone(telefone),
       );
       expect(stillUnprocessed.find((m) => m.id === id1)).toBeUndefined();

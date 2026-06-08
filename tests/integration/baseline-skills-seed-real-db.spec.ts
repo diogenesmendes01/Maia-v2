@@ -41,10 +41,14 @@ let previousDatabaseUrl: string | undefined;
 const SHOULD_RUN = await isDockerAvailable();
 const d = SHOULD_RUN ? describe : describe.skip;
 
-// Migration 075 seeds under the bootstrap tenant 'default' (migration 007 seeds
-// the tenant + the legacy 'default' agent).
-const TENANT = 'default';
-const AGENT = 'default';
+// Migration 075 seeds the baseline skills under the bootstrap tenant 'default';
+// issue #323 then re-homes them to the reserved single-tenant home 'primary'
+// (migration 081) and deletes the legacy 'default' tenant/agent (083). So the
+// end-state rows this spec asserts on live under 'primary'. The idempotency test
+// below re-applies the 075 body REWRITTEN to target 'primary' (the live home) —
+// the verbatim body targets the now-deleted 'default' bucket.
+const TENANT = 'primary';
+const AGENT = 'primary';
 // An arbitrary OTHER agent in the same tenant — proves tenant-wide visibility
 // (agent_id IS NULL skills must surface for it too).
 const OTHER_AGENT = 'some-other-agent';
@@ -133,11 +137,15 @@ d('baseline skills seed (migration 075) — real DB', () => {
   });
 
   it('re-running migration 075 is IDEMPOTENT (no duplicate rows)', async () => {
-    const sql = await readFile(
+    const raw = await readFile(
       new URL('../../migrations/075_baseline_skills_seed.sql', import.meta.url),
       'utf8',
     );
-    // Apply the forward migration body a second time.
+    // Re-apply the forward migration body a second time, re-targeted to the live
+    // single-tenant home 'primary' (the verbatim body seeds 'default', which 083
+    // deleted). The only quoted 'default' literal in 075 is the tenant_id, so this
+    // exercises the ON CONFLICT DO NOTHING idempotency against the rehomed rows.
+    const sql = raw.replaceAll("'default'", "'primary'");
     await pg.pool.query(sql);
 
     const { rows } = await pg.pool.query<{ count: string }>(
@@ -150,13 +158,13 @@ d('baseline skills seed (migration 075) — real DB', () => {
     expect(Number(rows[0]!.count)).toBe(BASELINE_DESCRIPTORS.length);
   });
 
-  it('baseline skills are VISIBLE to the selector for the default agent (findActive)', async () => {
+  it('baseline skills are VISIBLE to the selector for the primary agent (findActive)', async () => {
     await tenantContextMod.runWithTenantContext(
       { tenant_id: TENANT, agent_id: AGENT },
       async () => {
         for (const descr of BASELINE_DESCRIPTORS) {
           const row = await skillsRepoMod.skillsRepo.findActive(descr);
-          expect(row, `findActive(${descr}) under default agent`).not.toBeNull();
+          expect(row, `findActive(${descr}) under primary agent`).not.toBeNull();
           expect(row!.agent_id).toBeNull(); // resolved the tenant-wide row
           expect(row!.status).toBe('active');
         }

@@ -1,20 +1,21 @@
 /**
  * [🔴 CRITICAL — PR #417 review] cross-`channel_type` isolation leak in
- * `channelsRepo.findDefaultCatchAllChannel`, proven on REAL Postgres.
+ * `channelsRepo.findPrimaryCatchAllChannel`, proven on REAL Postgres.
  *
  * The consolidated review flagged the single-tenant catch-all discriminator as
  * a cross-tenant leak: the "is this deployment multi-tenant?" probe was scoped
  * to the inbound's `channel_type`, so a real tenant whose ACTIVE channel was a
  * DIFFERENT type (e.g. telegram) was invisible to a whatsapp inbound →
- * `multi_tenant` stayed false → the resolver handed `default/default` to a
+ * `multi_tenant` stayed false → the resolver handed `primary/primary` to a
  * deployment that HAS a real tenant. That collapses distinct tenants onto the
- * shared `maia:ratelimit:default:default:*` bucket — the exact cross-tenant
- * leak issue #268 closed.
+ * shared `maia:ratelimit:primary:primary:*` bucket — the exact cross-tenant
+ * leak issue #268 closed. (issue #323: the single-tenant home is now `primary`,
+ * re-homed from the legacy `default/default` by migration 081.)
  *
  * THE FIX (src/db/repositories.ts):
  *   1. GLOBAL discriminator (NO channel_type filter): any ACTIVE channel with
- *      tenant_id != 'default' ⇒ { multi_tenant: true } (fail-closed).
- *   2. ONLY IF none exists: fetch the active default/default catch-all scoped by
+ *      tenant_id != 'primary' ⇒ { multi_tenant: true } (fail-closed).
+ *   2. ONLY IF none exists: fetch the active primary/primary catch-all scoped by
  *      channel_type.
  *   Both reads run inside ONE `withTx` transaction (TOCTOU mitigation).
  *
@@ -57,7 +58,7 @@ let previousDatabaseUrl: string | undefined;
 const SHOULD_RUN = await isDockerAvailable();
 const d = SHOULD_RUN ? describe : describe.skip;
 
-// A real tenant, distinct from the migration-seeded 'default' and any sibling
+// A real tenant, distinct from the migration-seeded 'primary' and any sibling
 // real-db spec's slugs.
 const REAL_TENANT = 'tenant-417-catchall';
 const REAL_AGENT = 'agent-417-catchall';
@@ -96,12 +97,12 @@ async function insertRealTenantChannel(args: {
   );
 }
 
-/** Remove only the real tenant's channels (keep the migration-seeded default). */
+/** Remove only the real tenant's channels (keep the migration-seeded primary). */
 async function clearRealTenantChannels(): Promise<void> {
   await pg.pool.query('DELETE FROM channels WHERE tenant_id = $1', [REAL_TENANT]);
 }
 
-d('channelsRepo.findDefaultCatchAllChannel — cross-channel_type isolation on REAL Postgres (PR #417 🔴 CRITICAL)', () => {
+d('channelsRepo.findPrimaryCatchAllChannel — cross-channel_type isolation on REAL Postgres (PR #417 🔴 CRITICAL)', () => {
   beforeAll(async () => {
     pg = await startPostgresContainer();
     previousDatabaseUrl = process.env.DATABASE_URL;
@@ -122,14 +123,16 @@ d('channelsRepo.findDefaultCatchAllChannel — cross-channel_type isolation on R
     await clearRealTenantChannels();
   });
 
-  it('baseline (only the migration-seeded default/default whatsapp channel) → single-tenant, returns the catch-all', async () => {
-    const out = await repositoriesMod.channelsRepo.findDefaultCatchAllChannel({
+  it('baseline (only the migration-seeded primary/primary whatsapp channel) → single-tenant, returns the catch-all', async () => {
+    const out = await repositoriesMod.channelsRepo.findPrimaryCatchAllChannel({
       channel_type: 'whatsapp',
     });
     expect(out.multi_tenant).toBe(false);
     expect(out.channel).not.toBeNull();
-    expect(out.channel!.tenant_id).toBe('default');
-    expect(out.channel!.agent_id).toBe('default');
+    expect(out.channel!.tenant_id).toBe('primary');
+    expect(out.channel!.agent_id).toBe('primary');
+    // external_id is unchanged by the rehome (081 only re-points tenant/agent);
+    // the seeded catch-all keeps its inert placeholder id from migration 035.
     expect(out.channel!.external_id).toBe('default-channel');
   });
 
@@ -141,7 +144,7 @@ d('channelsRepo.findDefaultCatchAllChannel — cross-channel_type isolation on R
       active: true,
     });
 
-    const out = await repositoriesMod.channelsRepo.findDefaultCatchAllChannel({
+    const out = await repositoriesMod.channelsRepo.findPrimaryCatchAllChannel({
       channel_type: 'whatsapp', // DIFFERENT type than the real tenant's channel
     });
 
@@ -159,7 +162,7 @@ d('channelsRepo.findDefaultCatchAllChannel — cross-channel_type isolation on R
       active: true,
     });
 
-    const out = await repositoriesMod.channelsRepo.findDefaultCatchAllChannel({
+    const out = await repositoriesMod.channelsRepo.findPrimaryCatchAllChannel({
       channel_type: 'whatsapp',
     });
     expect(out.multi_tenant).toBe(true);
@@ -173,18 +176,18 @@ d('channelsRepo.findDefaultCatchAllChannel — cross-channel_type isolation on R
       active: false, // offboarded tenant — must not strand the single-tenant bot
     });
 
-    const out = await repositoriesMod.channelsRepo.findDefaultCatchAllChannel({
+    const out = await repositoriesMod.channelsRepo.findPrimaryCatchAllChannel({
       channel_type: 'whatsapp',
     });
     expect(out.multi_tenant).toBe(false);
     expect(out.channel).not.toBeNull();
-    expect(out.channel!.tenant_id).toBe('default');
+    expect(out.channel!.tenant_id).toBe('primary');
   });
 
   it('catch-all is channel_type-scoped: a telegram probe with no telegram default returns no channel (seed missing), still single-tenant', async () => {
     // Only the whatsapp default exists (migration 035 seeds whatsapp only); a
     // telegram inbound finds no telegram catch-all but is still single-tenant.
-    const out = await repositoriesMod.channelsRepo.findDefaultCatchAllChannel({
+    const out = await repositoriesMod.channelsRepo.findPrimaryCatchAllChannel({
       channel_type: 'telegram',
     });
     expect(out.multi_tenant).toBe(false);

@@ -117,14 +117,14 @@ dRepo('agentToolGrantsRepo — ALS-scoped reads + default grant (#408)', () => {
     const c = await pool.connect();
     const created: string[] = [];
     try {
-      await ensureTenantAgent(c, 'default', 'agentG1');
-      await ensureTenantAgent(c, 'default', 'agentG2');
-      created.push(await mkGrant(c, { tenant: 'default', agent: 'agentG1', packs: ['baseline.core', 'domain.finance'] }));
-      created.push(await mkGrant(c, { tenant: 'default', agent: 'agentG2', packs: ['baseline.core'] }));
+      await ensureTenantAgent(c, 'primary', 'agentG1');
+      await ensureTenantAgent(c, 'primary', 'agentG2');
+      created.push(await mkGrant(c, { tenant: 'primary', agent: 'agentG1', packs: ['baseline.core', 'domain.finance'] }));
+      created.push(await mkGrant(c, { tenant: 'primary', agent: 'agentG2', packs: ['baseline.core'] }));
 
       const { agentToolGrantsRepo } = await loadRepos();
       const fromG1 = await runWithTenantContext(
-        { tenant_id: 'default', agent_id: 'agentG1' },
+        { tenant_id: 'primary', agent_id: 'agentG1' },
         () => agentToolGrantsRepo.findForCurrentAgent(),
       );
       expect(fromG1?.granted_packs).toContain('domain.finance');
@@ -143,9 +143,9 @@ dRepo('agentToolGrantsRepo — ALS-scoped reads + default grant (#408)', () => {
     const agentId = `agent-grant-create-${Date.now()}`;
     try {
       const { agentsRepo, agentToolGrantsRepo } = await loadRepos();
-      const res = await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, () =>
+      const res = await runWithTenantContext({ tenant_id: 'primary', agent_id: 'primary' }, () =>
         agentsRepo.createWithSeedAndAudit({
-          agent: { id: agentId, tenant_id: 'default', nome: 'Grant Test Agent' },
+          agent: { id: agentId, tenant_id: 'primary', nome: 'Grant Test Agent' },
           seed_profile: {
             profile_body: {
               identity: { role: 'assistant', mission: 'test', tone: 'neutral' },
@@ -163,7 +163,7 @@ dRepo('agentToolGrantsRepo — ALS-scoped reads + default grant (#408)', () => {
 
       // The grant row must exist for the new agent, with baseline.core.
       const grant = await runWithTenantContext(
-        { tenant_id: 'default', agent_id: agentId },
+        { tenant_id: 'primary', agent_id: agentId },
         () => agentToolGrantsRepo.findForCurrentAgent(),
       );
       expect(grant).not.toBeNull();
