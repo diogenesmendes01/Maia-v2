@@ -13,6 +13,12 @@ import { self_state } from '@/db/schema.js';
 import { sql } from 'drizzle-orm';
 import { readFile } from 'node:fs/promises';
 import { normalizePhoneBR } from '@/lib/brazilian.js';
+import {
+  runWithTenantContext,
+  PRIMARY_CONTEXT,
+  PRIMARY_TENANT_ID,
+  PRIMARY_AGENT_ID,
+} from '@/db/tenant-context.js';
 
 const rl = readline.createInterface({ input, output });
 const ask = (q: string) => rl.question(q + ' ');
@@ -23,7 +29,15 @@ async function ensureSelfState() {
   // Load v0 prompt from file
   const promptPath = 'src/identity/maia-prompt.md';
   const text = await readFile(promptPath, 'utf8').catch(() => 'Você é a Maia.');
-  await db.insert(self_state).values({ versao: 1, system_prompt: text, ativa: true });
+  // Raw insert (bypasses applyTenantGuard) → stamp the primary tenant explicitly
+  // (issue #323: the column-default 'default' was dropped, so this is required).
+  await db.insert(self_state).values({
+    versao: 1,
+    system_prompt: text,
+    ativa: true,
+    tenant_id: PRIMARY_TENANT_ID,
+    agent_id: PRIMARY_AGENT_ID,
+  });
   console.log('  + self_state v1 created');
 }
 
@@ -113,54 +127,60 @@ async function main() {
   await db.execute(sql`SELECT 1`);
   console.log('  ok db');
 
-  await ensureSelfState();
-  const owner = await ensureOwner();
+  // issue #323: the single-tenant runtime home is `primary`. All seed writes run
+  // under that ALS context so the tenant-scoped repos stamp `primary` (the
+  // column-default `'default'` was dropped by migration 082 — a tenant-less write
+  // now fails NOT NULL instead of silently bucketing into `default`).
+  await runWithTenantContext(PRIMARY_CONTEXT, async () => {
+    await ensureSelfState();
+    const owner = await ensureOwner();
 
-  const fromFile = (await ask('Importar entidades de arquivo? (caminho ou enter para pular)')).trim();
-  await importEntities(fromFile || null, owner.id);
+    const fromFile = (await ask('Importar entidades de arquivo? (caminho ou enter para pular)')).trim();
+    await importEntities(fromFile || null, owner.id);
 
-  // Co-owner (optional)
-  const wantCo = (await ask('Cadastrar co-dona/co-dono agora? (s/N)')).trim().toLowerCase();
-  if (wantCo === 's' || wantCo === 'sim' || wantCo === 'y') {
-    const nome = (await ask('Nome:')).trim();
-    const telRaw = (await ask('Telefone (com DDI):')).trim();
-    const tel = normalizePhoneBR(telRaw);
-    if (!tel) {
-      console.log('  ! telefone inválido — pulando');
-    } else if (tel === config.OWNER_TELEFONE_WHATSAPP) {
-      console.log('  ! telefone igual ao do owner — pulando');
-    } else {
-      const exists = await pessoasRepo.findByPhone(tel);
-      if (exists) {
-        console.log(`  = já cadastrada: ${exists.nome}`);
+    // Co-owner (optional)
+    const wantCo = (await ask('Cadastrar co-dona/co-dono agora? (s/N)')).trim().toLowerCase();
+    if (wantCo === 's' || wantCo === 'sim' || wantCo === 'y') {
+      const nome = (await ask('Nome:')).trim();
+      const telRaw = (await ask('Telefone (com DDI):')).trim();
+      const tel = normalizePhoneBR(telRaw);
+      if (!tel) {
+        console.log('  ! telefone inválido — pulando');
+      } else if (tel === config.OWNER_TELEFONE_WHATSAPP) {
+        console.log('  ! telefone igual ao do owner — pulando');
       } else {
-        const co = await pessoasRepo.create({
-          nome,
-          apelido: null,
-          telefone_whatsapp: tel,
-          tipo: 'co_dono',
-          email: null,
-          observacoes: null,
-          preferencias: {},
-          modelo_mental: {},
-          status: 'quarentena',
-        });
-        const ents = await entidadesRepo.list();
-        for (const e of ents) {
-          await permissoesRepo.create({
-            pessoa_id: co.id,
-            entidade_id: e.id,
-            papel: 'admin',
-            profile_id: 'co_dono',
-            acoes_permitidas: ['*'],
-            limites: {},
-            status: 'ativa',
+        const exists = await pessoasRepo.findByPhone(tel);
+        if (exists) {
+          console.log(`  = já cadastrada: ${exists.nome}`);
+        } else {
+          const co = await pessoasRepo.create({
+            nome,
+            apelido: null,
+            telefone_whatsapp: tel,
+            tipo: 'co_dono',
+            email: null,
+            observacoes: null,
+            preferencias: {},
+            modelo_mental: {},
+            status: 'quarentena',
           });
+          const ents = await entidadesRepo.list();
+          for (const e of ents) {
+            await permissoesRepo.create({
+              pessoa_id: co.id,
+              entidade_id: e.id,
+              papel: 'admin',
+              profile_id: 'co_dono',
+              acoes_permitidas: ['*'],
+              limites: {},
+              status: 'ativa',
+            });
+          }
+          console.log(`  + co-dona ${co.nome} cadastrada (em quarentena até primeira mensagem)`);
         }
-        console.log(`  + co-dona ${co.nome} cadastrada (em quarentena até primeira mensagem)`);
       }
     }
-  }
+  });
 
   rl.close();
   console.log('done — agora rode: npm run dev');

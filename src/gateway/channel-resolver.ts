@@ -84,18 +84,18 @@ export async function resolveChannel(args: {
     };
   }
 
-  // 3. Miss ou canal desativado. Issue #411: no runtime single-tenant a linha
-  //    do bot é semeada como `default/default` e o `external_id` do lookup é o
-  //    telefone do REMETENTE — então o exact match sempre falha. Em vez de
+  // 3. Miss ou canal desativado. Issue #411 + #323: no runtime single-tenant a
+  //    linha do bot é semeada como `primary/primary` e o `external_id` do lookup
+  //    é o telefone do REMETENTE — então o exact match sempre falha. Em vez de
   //    derrubar a mensagem (o bug #411), resolvemos para o canal catch-all
-  //    `default/default` SE — e somente se — o deployment é comprovadamente
+  //    `primary/primary` SE — e somente se — o deployment é comprovadamente
   //    single-tenant.
   //
   //    [🔴 CRITICAL fix #417] O discriminador "é multi-tenant?" é GLOBAL —
-  //    olha QUALQUER canal ativo de tenant != 'default' em TODOS os
+  //    olha QUALQUER canal ativo de tenant != 'primary' em TODOS os
   //    channel_types (antes filtrava por channel_type, escondendo um tenant
   //    real cujo canal era de outro tipo → vazamento cross-tenant). Assim que
-  //    existe um tenant real, `findDefaultCatchAllChannel` retorna
+  //    existe um tenant real, `findPrimaryCatchAllChannel` retorna
   //    `multi_tenant:true` e caímos no fail-loud do #268 (throw), preservando
   //    o isolamento.
   //
@@ -106,8 +106,8 @@ export async function resolveChannel(args: {
   //    leitura anterior separada, mas a direção é segura — uma ativação entre o
   //    passo 1 e este passo só torna o resultado MAIS fail-closed (o
   //    discriminador passa a ver o tenant real e lança). Risco residual
-  //    documentado em `findDefaultCatchAllChannel`.
-  const catchAll = await channelsRepo.findDefaultCatchAllChannel({
+  //    documentado em `findPrimaryCatchAllChannel`.
+  const catchAll = await channelsRepo.findPrimaryCatchAllChannel({
     channel_type: args.channel_type,
   });
 

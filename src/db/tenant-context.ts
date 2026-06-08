@@ -125,11 +125,15 @@ export function isPrimaryContext(ctx: { tenant_id: string; agent_id: string }): 
 const storage = new AsyncLocalStorage<TenantContext>();
 
 /**
- * Read the opt-in flag at access time (NOT module-load time) so tests can
- * flip it per-case without re-importing.
+ * Reject the `'default'` literal by DEFAULT (issue #323, Phase 6): opt-OUT, not
+ * opt-in. Read at access time from `process.env` (NOT the boot-cached config) so:
+ *   - default-ON needs no env var set (`undefined !== 'false'` → true), and
+ *   - an emergency rollback is env-only with no redeploy
+ *     (`MAIA_REJECT_DEFAULT_LITERAL=false`).
+ * Tests can still flip it per-case without re-importing.
  */
 function shouldThrowOnDefaultLiteral(): boolean {
-  return process.env.MAIA_REJECT_DEFAULT_LITERAL === 'true';
+  return process.env.MAIA_REJECT_DEFAULT_LITERAL !== 'false';
 }
 
 export async function runWithTenantContext<T>(

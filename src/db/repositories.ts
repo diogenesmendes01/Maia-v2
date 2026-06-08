@@ -76,7 +76,7 @@ import { TypedError } from '@/lib/utils.js';
 import { logger } from '@/lib/logger.js';
 import { incCounter } from '@/lib/metrics.js';
 import { applyTenantGuard } from './tenant-guard.js';
-import { getCurrentTenant, getCurrentAgent } from './tenant-context.js';
+import { getCurrentTenant, getCurrentAgent, PRIMARY_TENANT_ID, PRIMARY_AGENT_ID } from './tenant-context.js';
 import type { PlannedEffect } from '@/governance/idempotency-effects.js';
 import { isVersionedPayloadHash } from '@/governance/idempotency.js';
 import { deriveCapabilityRisk, deriveCapabilityLocks } from './capability-risk.js';
@@ -1212,8 +1212,8 @@ export const mensagensRepo = {
       .where(
         and(
           eq(mensagens.id, args.id),
-          eq(mensagens.tenant_id, 'default'),
-          eq(mensagens.agent_id, 'default'),
+          eq(mensagens.tenant_id, PRIMARY_TENANT_ID),
+          eq(mensagens.agent_id, PRIMARY_AGENT_ID),
         ),
       )
       .returning({ id: mensagens.id });
@@ -8359,12 +8359,12 @@ export const channelsRepo = {
   // distinct tenants onto the shared `maia:ratelimit:default:default:*` bucket
   // — the exact cross-tenant leak issue #268 closed. The fix splits the logic:
   //   1. GLOBAL discriminator (NO channel_type filter): ANY active channel with
-  //      tenant_id != 'default' ⇒ real multi-tenant deployment → fail-closed
+  //      tenant_id != 'primary' ⇒ real multi-tenant deployment → fail-closed
   //      (`multi_tenant:true`, NO channel) so the resolver throws
   //      `channel_resolution_failed`.
   //   2. ONLY IF none exists: use `channel_type` to locate the seeded active
-  //      `default/default` catch-all channel
-  //      (migrations/035_p6_seed_default_channel_role_policy.sql).
+  //      `primary/primary` catch-all channel (issue #323: the single-tenant home
+  //      is now `primary`, re-homed from the legacy `default/default` by 081).
   //
   // ── [🟠 HIGH fix — PR #417 review] TOCTOU vs a concurrent activation ──
   // Both reads run inside ONE transaction (`withTx` → a single `BEGIN…COMMIT`
@@ -8383,27 +8383,27 @@ export const channelsRepo = {
   // Cardinality: the `channels` table is small (one row per registered line);
   // the discriminator is a `LIMIT 1` existence probe and the catch-all fetch is
   // a single-row lookup, both O(1)-ish.
-  async findDefaultCatchAllChannel(args: {
+  async findPrimaryCatchAllChannel(args: {
     channel_type: string;
   }): Promise<
     | { multi_tenant: true; channel: null }
     | { multi_tenant: false; channel: Channel | null }
   > {
     return withTx(async (tx) => {
-      // 1. GLOBAL discriminator — any ACTIVE channel owned by a non-`default`
-      //    tenant, across ALL channel_types. Its mere existence proves a real
-      //    multi-tenant deployment. Fail-closed: do NOT hand back the default
-      //    catch-all. `LIMIT 1` — we only need existence, not the rows.
+      // 1. GLOBAL discriminator — any ACTIVE channel owned by a tenant OTHER
+      //    than the single-tenant home (`primary`), across ALL channel_types.
+      //    Its mere existence proves a real multi-tenant deployment. Fail-closed:
+      //    do NOT hand back the catch-all. `LIMIT 1` — existence only.
       const realTenantProbe = await tx
         .select({ one: sql<number>`1` })
         .from(channels)
-        .where(and(eq(channels.active, true), ne(channels.tenant_id, 'default')))
+        .where(and(eq(channels.active, true), ne(channels.tenant_id, PRIMARY_TENANT_ID)))
         .limit(1);
       if (realTenantProbe.length > 0) {
         return { multi_tenant: true, channel: null };
       }
 
-      // 2. Single-tenant runtime: surface the seeded active `default/default`
+      // 2. Single-tenant runtime: surface the seeded active `primary/primary`
       //    catch-all channel for this channel_type (if present). Scoped by
       //    channel_type so e.g. a whatsapp inbound gets the whatsapp catch-all.
       const fallbackRows = await tx
@@ -8413,8 +8413,8 @@ export const channelsRepo = {
           and(
             eq(channels.channel_type, args.channel_type),
             eq(channels.active, true),
-            eq(channels.tenant_id, 'default'),
-            eq(channels.agent_id, 'default'),
+            eq(channels.tenant_id, PRIMARY_TENANT_ID),
+            eq(channels.agent_id, PRIMARY_AGENT_ID),
           ),
         )
         .limit(1);
