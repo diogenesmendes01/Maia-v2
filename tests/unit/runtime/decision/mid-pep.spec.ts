@@ -400,7 +400,8 @@ describe('P9b — Mid PEP', () => {
     const block = r as BlockDecision;
     expect(block.decision).toBe('escalate');
     expect(block.policy_id).toBe('human_confirmation_policy');
-    expect(block.user_facing_message).toBe('Caso requer handoff humano.');
+    // issue #446: effect.message must NOT leak to user_facing_message.
+    expect(block.user_facing_message).toBe('Esta ação requer aprovação adicional antes de prosseguir.');
     // It is NOT a dual-approval decision.
     expect((r as RequireDualApprovalDecision).approval_class).toBeUndefined();
   });

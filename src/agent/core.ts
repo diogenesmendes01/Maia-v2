@@ -888,18 +888,9 @@ async function runAgentForMensagemInner(
         return;
       }
 
-      // action_mode='ask_clarification' → surface as user-facing message and skip LLM
-      // This covers budget-fallback and skill-not-found paths.
-      if (packet.action_mode === 'ask_clarification') {
-        const clarifyMsg = 'Pode me dar mais detalhes sobre o que você precisa?';
-        await sendOutbound(pessoa.id, c.id, clarifyMsg, inbound.id).catch((err) =>
-          logger.warn({ err: (err as Error).message }, 'agent.decision_engine.clarify_reply_failed'),
-        );
-        await markAllProcessed(0);
-        await conversasRepo.touch(c.id);
-        await clearDebounceState(pessoa.telefone_whatsapp);
-        return;
-      }
+      // action_mode='ask_clarification' → fall through to the LLM so casual
+      // conversation is not hijacked by a canned reply. The LLM produces the
+      // clarifying question (or a free-form answer) from the full prompt context.
 
       // action_mode='execute_skill' (F1 Phase 1) → run the selected
       // prompt_only/evaluator skill via runSkill and deliver its reply through
