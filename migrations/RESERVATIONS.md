@@ -189,3 +189,4 @@ NEW shared prefixes — pick `max(existing)+1`.
 083 | 083_drop_default_column_default.sql | drop DEFAULT default column-default fail-closed (issue 323)
 084 | 084_delete_default_tenant.sql | delete legacy default tenant and agent (issue 323)
 085 | 085_calendar_default_pack.sql | calendar as default pack — backfill existing grants
+086 | 086_fix_human_confirmation_policy_scope.sql | fix human_confirmation_policy scope and predicate — restrict to boleto role, high/critical only (issue 446)
