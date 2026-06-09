@@ -119,10 +119,8 @@ export class MidPepImpl implements MidPep {
             decision: 'escalate',
             reason: verdict.reason,
             severity: verdict.severity ?? 'high',
+            user_facing_message: 'Esta ação requer aprovação adicional antes de prosseguir.',
           };
-          if (verdict.message !== undefined) {
-            block.user_facing_message = verdict.message;
-          }
           return block;
         }
         const approval: RequireDualApprovalDecision = {
