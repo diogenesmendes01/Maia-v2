@@ -23,7 +23,8 @@ export interface NavItem {
     | 'message'
     | 'users'
     | 'settings'
-    | 'sparkles';
+    | 'sparkles'
+    | 'shield';
   founderOnly?: boolean;
   /** When set, the item is active for any path under this prefix. */
   activePrefix?: string;
@@ -50,6 +51,7 @@ export const NAV_SECTIONS: NavSection[] = [
       { href: '/versions', label: 'Versões', icon: 'gitBranch' },
       { href: '/drift', label: 'Drift', icon: 'alertTriangle' },
       { href: '/traces', label: 'Traces', icon: 'search', activePrefix: '/traces' },
+      { href: '/audit', label: 'Auditoria', icon: 'shield' },
     ],
   },
   {

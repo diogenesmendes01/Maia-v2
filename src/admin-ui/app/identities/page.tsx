@@ -13,7 +13,9 @@ import {
   LoadingState,
   ErrorState,
   EmptyState,
+  Alert,
 } from '../../components/ui/states.js';
+import { ProfileDiff } from '../agents/_components/profile-diff.js';
 import {
   TableShell,
   Table,
@@ -57,6 +59,15 @@ export default function IdentitiesPage() {
     { enabled: tenantId !== '' },
   );
   const approveMutation = trpc.agents.approveProfile.useMutation();
+
+  // Issue #461 — corpo das versões do agente-alvo para o diff de aprovação.
+  const targetProfileQuery = trpc.agents.getProfileVersions.useQuery(
+    { tenantId, id: target?.agentId ?? '' },
+    { enabled: tenantId !== '' && target !== null },
+  );
+  const targetProposedBody = targetProfileQuery.data?.proposed.find(
+    (p) => p.id === target?.versionId,
+  )?.profile_body;
 
   const approve = async () => {
     if (!target) return;
@@ -174,6 +185,7 @@ export default function IdentitiesPage() {
       <Modal
         open={target !== null}
         onClose={() => setTarget(null)}
+        size="lg"
         title={`Aprovar e ativar v${target?.version ?? ''} — ${target?.agentId ?? ''}`}
         description="A versão ativa atual (se houver) é congelada na mesma transação. A decisão é auditada."
         footer={
@@ -191,19 +203,34 @@ export default function IdentitiesPage() {
           </>
         }
       >
-        <Field
-          label="Comentário (auditado)"
-          required
-          hint="Mínimo de 10 caracteres."
-          error={error}
-        >
-          <Textarea
-            value={comment}
-            onChange={(e) => setComment(e.target.value)}
-            rows={3}
-            placeholder="Ex.: Revisei papel, princípios e limites — aprovado para operação."
-          />
-        </Field>
+        <div className="space-y-4">
+          {targetProfileQuery.isLoading ? (
+            <LoadingState label="Carregando conteúdo da proposta…" />
+          ) : targetProposedBody !== undefined ? (
+            <ProfileDiff
+              activeBody={targetProfileQuery.data?.active?.profile_body ?? null}
+              proposedBody={targetProposedBody}
+            />
+          ) : (
+            <Alert tone="warning" title="Conteúdo da proposta indisponível">
+              Não foi possível carregar o corpo desta versão para comparação.
+              Recarregue a página antes de aprovar.
+            </Alert>
+          )}
+          <Field
+            label="Comentário (auditado)"
+            required
+            hint="Mínimo de 10 caracteres."
+            error={error}
+          >
+            <Textarea
+              value={comment}
+              onChange={(e) => setComment(e.target.value)}
+              rows={3}
+              placeholder="Ex.: Revisei papel, princípios e limites — aprovado para operação."
+            />
+          </Field>
+        </div>
       </Modal>
     </div>
   );

@@ -36,8 +36,10 @@ import {
   validateBehavior,
   type ProfileFormValue,
 } from '../_components/profile-form.js';
+import { ProfileDiff } from '../_components/profile-diff.js';
+import ActivityTab from './_components/activity-tab.js';
 
-type TabId = 'overview' | 'profile' | 'versions';
+type TabId = 'overview' | 'profile' | 'versions' | 'activity';
 
 export default function AgentDetailPage() {
   const params = useParams<{ agentId: string }>();
@@ -145,6 +147,7 @@ export default function AgentDetailPage() {
                 <Badge tone="warning">{proposed.length}</Badge>
               ) : undefined,
           },
+          { id: 'activity', label: 'Atividade' },
         ]}
       />
 
@@ -173,9 +176,14 @@ export default function AgentDetailPage() {
           tenantId={tenantId}
           agentId={agent.id}
           canApprove={canManage}
+          activeBody={active?.profile_body ?? null}
+          proposedBodies={Object.fromEntries(
+            proposed.map((p) => [p.id, p.profile_body]),
+          )}
           onChanged={() => void profileQuery.refetch()}
         />
       )}
+      {tab === 'activity' && <ActivityTab tenantId={tenantId} agentId={agent.id} />}
     </div>
   );
 }
@@ -391,11 +399,17 @@ function VersionsTab({
   tenantId,
   agentId,
   canApprove,
+  activeBody,
+  proposedBodies,
   onChanged,
 }: {
   tenantId: string;
   agentId: string;
   canApprove: boolean;
+  /** profile_body ativo (null quando não há) — base do diff de aprovação. */
+  activeBody: unknown | null;
+  /** profile_body por id de versão proposta — alvo do diff. */
+  proposedBodies: Record<string, unknown>;
   onChanged: () => void;
 }) {
   const versionsQuery = trpc.versions.listVersions.useQuery(
@@ -500,6 +514,7 @@ function VersionsTab({
       <Modal
         open={target !== null}
         onClose={() => setTarget(null)}
+        size="lg"
         title={`Aprovar e ativar v${target?.version ?? ''}`}
         description="A versão ativa atual (se houver) é congelada na mesma transação. A decisão é auditada."
         footer={
@@ -517,19 +532,34 @@ function VersionsTab({
           </>
         }
       >
-        <Field
-          label="Comentário (auditado)"
-          required
-          hint="Mínimo de 10 caracteres."
-          error={error}
-        >
-          <Textarea
-            value={comment}
-            onChange={(e) => setComment(e.target.value)}
-            rows={3}
-            placeholder="Ex.: Revisei papel, princípios e limites — aprovado para operação."
-          />
-        </Field>
+        <div className="space-y-4">
+          {target && proposedBodies[target.id] !== undefined ? (
+            <ProfileDiff
+              activeBody={activeBody}
+              proposedBody={proposedBodies[target.id]}
+            />
+          ) : (
+            target && (
+              <Alert tone="warning" title="Conteúdo da proposta indisponível">
+                Não foi possível carregar o corpo desta versão para comparação.
+                Recarregue a página antes de aprovar.
+              </Alert>
+            )
+          )}
+          <Field
+            label="Comentário (auditado)"
+            required
+            hint="Mínimo de 10 caracteres."
+            error={error}
+          >
+            <Textarea
+              value={comment}
+              onChange={(e) => setComment(e.target.value)}
+              rows={3}
+              placeholder="Ex.: Revisei papel, princípios e limites — aprovado para operação."
+            />
+          </Field>
+        </div>
       </Modal>
     </>
   );

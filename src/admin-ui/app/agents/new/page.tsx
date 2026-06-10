@@ -12,7 +12,15 @@ import { Card, CardHeader, CardBody } from '../../../components/ui/card.js';
 import { Field, Input, Select, Textarea } from '../../../components/ui/field.js';
 import { Alert, ErrorState } from '../../../components/ui/states.js';
 import { Badge } from '../../../components/ui/badge.js';
-import { IconArrowLeft } from '../../../components/ui/icons.js';
+import {
+  IconArrowLeft,
+  IconZap,
+  IconMessage,
+  IconActivity,
+  IconBot,
+  IconSparkles,
+} from '../../../components/ui/icons.js';
+import { ARCHETYPES, type Archetype } from '../_components/archetypes.js';
 import {
   DEFAULT_PROFILE,
   IdentitySection,
@@ -24,7 +32,15 @@ import {
 } from '../_components/profile-form.js';
 
 const ID_REGEX = /^[a-z0-9][a-z0-9_-]*$/;
-const STEPS = ['Identificação', 'Personalidade', 'Comportamento', 'Revisão'];
+const STEPS = ['Função', 'Identificação', 'Personalidade', 'Comportamento', 'Revisão'];
+
+const ARCHETYPE_ICON: Record<Archetype['icon'], React.ComponentType<{ size?: number; className?: string }>> = {
+  zap: IconZap,
+  message: IconMessage,
+  activity: IconActivity,
+  bot: IconBot,
+  sparkles: IconSparkles,
+};
 
 /** Suggest a slug from the display name (operator can always override). */
 function slugify(nome: string): string {
@@ -46,6 +62,7 @@ export default function NewAgentPage() {
   const [step, setStep] = React.useState(0);
   const [error, setError] = React.useState<string | null>(null);
 
+  const [archetypeId, setArchetypeId] = React.useState<string | null>(null);
   const [tenantId, setTenantId] = React.useState('');
   const effectiveTenant = tenantId || sessionTenant;
   const [id, setId] = React.useState('');
@@ -67,8 +84,25 @@ export default function NewAgentPage() {
     );
   }
 
+  /**
+   * Applies the archetype preset to the profile. Only fires when the operator
+   * picks a DIFFERENT archetype — re-clicking the current one (or navigating
+   * back and forth) never clobbers edits made on later steps.
+   */
+  const selectArchetype = (arch: Archetype) => {
+    if (arch.id === archetypeId) return;
+    setArchetypeId(arch.id);
+    setProfile({ ...DEFAULT_PROFILE, ...arch.profile });
+  };
+
+  const selectedArchetype = ARCHETYPES.find((a) => a.id === archetypeId) ?? null;
+
   const validateStep = (s: number): string | null => {
     if (s === 0) {
+      if (!archetypeId) return 'Escolha a função do agente para continuar.';
+      return null;
+    }
+    if (s === 1) {
       if (!effectiveTenant) return 'Selecione o tenant.';
       if (nome.trim().length === 0) return 'Dê um nome ao agente.';
       if (!ID_REGEX.test(id))
@@ -76,9 +110,9 @@ export default function NewAgentPage() {
       if (id.length > 64) return 'O identificador deve ter no máximo 64 caracteres.';
       return null;
     }
-    if (s === 1) return validateIdentity(profile);
-    if (s === 2) return validateBehavior(profile);
-    if (s === 3) {
+    if (s === 2) return validateIdentity(profile);
+    if (s === 3) return validateBehavior(profile);
+    if (s === 4) {
       if (reason.trim().length < 10)
         return 'Explique o motivo da criação (mínimo 10 caracteres) — isso entra na trilha de auditoria.';
       return null;
@@ -93,7 +127,7 @@ export default function NewAgentPage() {
   };
 
   const submit = async () => {
-    const err = validateStep(3);
+    const err = validateStep(4);
     setError(err);
     if (err) return;
     try {
@@ -131,6 +165,44 @@ export default function NewAgentPage() {
       </div>
 
       {step === 0 && (
+        <Card>
+          <CardHeader
+            title="Função"
+            description="O que este agente faz? A escolha pré-preenche o perfil como ponto de partida — tudo continua editável nos próximos passos."
+          />
+          <CardBody>
+            <div className="grid gap-3 sm:grid-cols-2">
+              {ARCHETYPES.map((arch) => {
+                const Icon = ARCHETYPE_ICON[arch.icon];
+                const selected = arch.id === archetypeId;
+                return (
+                  <button
+                    key={arch.id}
+                    type="button"
+                    onClick={() => selectArchetype(arch)}
+                    aria-pressed={selected}
+                    className={`rounded-lg border p-4 text-left transition-colors hover:border-zinc-400 ${
+                      selected
+                        ? 'border-brand-500 ring-2 ring-brand-500/20'
+                        : 'border-zinc-200'
+                    }`}
+                  >
+                    <span className="flex items-center gap-2 text-sm font-medium text-zinc-900">
+                      <Icon size={16} className="text-zinc-500" />
+                      {arch.label}
+                    </span>
+                    <span className="mt-1.5 block text-xs leading-relaxed text-zinc-500">
+                      {arch.description}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </CardBody>
+        </Card>
+      )}
+
+      {step === 1 && (
         <Card>
           <CardHeader
             title="Identificação"
@@ -192,15 +264,21 @@ export default function NewAgentPage() {
         </Card>
       )}
 
-      {step === 1 && <IdentitySection value={profile} onChange={setProfile} />}
-      {step === 2 && <BehaviorSection value={profile} onChange={setProfile} />}
+      {step === 2 && <IdentitySection value={profile} onChange={setProfile} />}
+      {step === 3 && <BehaviorSection value={profile} onChange={setProfile} />}
 
-      {step === 3 && (
+      {step === 4 && (
         <div className="space-y-4">
           <Card>
             <CardHeader title="Revisão" description="Confira antes de criar." />
             <CardBody>
               <dl className="grid gap-x-6 gap-y-3 text-sm sm:grid-cols-2">
+                <div className="sm:col-span-2">
+                  <dt className="text-xs font-medium text-zinc-500">Função</dt>
+                  <dd className="mt-0.5 text-zinc-900">
+                    {selectedArchetype?.label ?? '—'}
+                  </dd>
+                </div>
                 <div>
                   <dt className="text-xs font-medium text-zinc-500">Agente</dt>
                   <dd className="mt-0.5 text-zinc-900">
@@ -268,6 +346,16 @@ export default function NewAgentPage() {
               />
             </CardBody>
           </Card>
+
+          {selectedArchetype && selectedArchetype.suggestedNextSteps.length > 0 && (
+            <Alert tone="info" title="Próximos passos sugeridos">
+              <ul className="list-disc space-y-1 pl-4">
+                {selectedArchetype.suggestedNextSteps.map((s) => (
+                  <li key={s}>{s}</li>
+                ))}
+              </ul>
+            </Alert>
+          )}
 
           <Alert tone="info">
             Ao criar, o perfil v1 fica com status <strong>proposto</strong>. Aprove-o

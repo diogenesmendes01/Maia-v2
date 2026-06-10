@@ -57,7 +57,10 @@ const RollbackInputSchema = z.object({
  * incident recovery signals.
  */
 const ROLLBACK_IMPLEMENTED: Record<string, boolean> = {
-  agent_operational_profile_versions: false, // P4 repo doesn't expose admin-ui rollback yet
+  // Issue #468 — wired via operationalProfileVersionsRepo.adminRollbackAtomic
+  // (demote active → rolled_back + re-activate frozen target + completion
+  // audit, all in one tx under the parent-agent lock).
+  agent_operational_profile_versions: true,
   policy_rules: false,
   soul_biases: false,
   skills: false,
@@ -199,6 +202,63 @@ export const versionsRouter = router({
       //   1. Mutate the active-pointer in a transaction.
       //   2. Verify the active version actually changed (SELECT after UPDATE).
       //   3. Re-audit with action='version_rollback_completed' inside the same tx.
+      if (input.sotKind === 'agent_operational_profile_versions') {
+        // sotId carries the agent_id for this SoT (mirrors listVersions,
+        // where sot_id := agent_id). The repo method validates existence,
+        // current-active match, and target status under the parent-agent
+        // lock — all checks here are translations, not decisions.
+        const result = await ctx.repos.operationalProfileVersionsRepo.adminRollbackAtomic({
+          tenant_id: tenantId,
+          agent_id: input.sotId,
+          from_version: input.fromVersion,
+          to_version: input.toVersion,
+          actor_id: ctx.userId,
+          actor_role: ctx.userRole,
+          reason: input.reason,
+        });
+
+        if (!result.ok) {
+          if (result.reason === 'agent_missing') {
+            throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent not found' });
+          }
+          if (result.reason === 'active_mismatch') {
+            throw new TRPCError({
+              code: 'CONFLICT',
+              message:
+                `Active version changed since you loaded this screen ` +
+                `(expected v${input.fromVersion}, current ` +
+                `${result.actual_active_version === null ? 'none' : `v${result.actual_active_version}`}). ` +
+                `Refresh and retry.`,
+            });
+          }
+          if (result.reason === 'target_not_found') {
+            throw new TRPCError({
+              code: 'NOT_FOUND',
+              message: `Version v${input.toVersion} not found for this agent`,
+            });
+          }
+          if (result.reason === 'target_invalid_status') {
+            throw new TRPCError({
+              code: 'PRECONDITION_FAILED',
+              message:
+                `Version v${input.toVersion} is '${result.actual_status}' — only ` +
+                `'frozen' versions can be re-activated (proposed was never ` +
+                `approved; rolled_back is terminal).`,
+            });
+          }
+          throw new TRPCError({
+            code: 'INTERNAL_SERVER_ERROR',
+            message: `Rollback transition failed: ${result.reason}`,
+          });
+        }
+
+        return {
+          status: 'rolled_back' as const,
+          activated: result.activated,
+          rolled_back: result.rolled_back,
+        };
+      }
+
       throw new TRPCError({
         code: 'INTERNAL_SERVER_ERROR',
         message: `BUG: ROLLBACK_IMPLEMENTED says ${input.sotKind} is wired but no branch handles it`,
