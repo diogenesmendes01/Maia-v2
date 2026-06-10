@@ -40,7 +40,9 @@ export class FeatureFlags {
 import { config } from './env.js';
 
 export const featureFlags = new FeatureFlags({
-  // No active feature flags. Both former entries are gone:
+  // MCP externo v1 (issue #478) — fail-closed por default.
+  MCP_TOOLS: config.FEATURE_MCP_TOOLS,
+  // Former entries gone:
   //   - P7 COGNITIVE_GRAPH removed in #412 (the cognitive graph runs
   //     unconditionally — parity with the imperative path was proven).
   //   - P6 MULTI_CHANNEL removed in #411 (channel resolution now resolves any

@@ -247,6 +247,15 @@ export const AUDIT_ACTIONS = [
   'risk_signal_classified',
   'conversation_summary_composed',
   'conversation_state_updated',
+  // MCP externo (issue #478): registro/estado de servers, sync de tools,
+  //   decisão por tool, concessão de pack por agente e cada chamada — todo o
+  //   ciclo de vida de uma tool externa fica na trilha (invariante #4).
+  'mcp_server_registered',
+  'mcp_server_status_changed',
+  'mcp_tools_synced',
+  'mcp_tool_decided',
+  'mcp_pack_grant_changed',
+  'mcp_tool_call',
   // `objective_task_executed`: work-loop task processed by the
   //   objective_execute worker (issue #469) — records kind + transition so
   //   the trail shows every autonomous work unit (invariant #4).

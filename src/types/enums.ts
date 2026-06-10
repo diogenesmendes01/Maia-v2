@@ -341,7 +341,10 @@ export type RiskLevel = typeof RiskLevel[keyof typeof RiskLevel];
  * Nomes de feature flags conhecidas. Cresce conforme fases ativam.
  */
 export const FeatureFlagName = {
-  // No active feature flags. Both former entries are gone:
+  // MCP externo v1 (issue #478) — visibilidade + execução de tools MCP
+  // aprovadas. Default OFF (fail-closed): habilitar via FEATURE_MCP_TOOLS=true.
+  MCP_TOOLS: 'MCP_TOOLS',
+  // Former entries gone:
   //   - P7 COGNITIVE_GRAPH removed in #412 (the cognitive graph runs
   //     unconditionally — parity with the imperative path was proven).
   //   - P6 MULTI_CHANNEL removed in #411 (channel resolution now resolves any

@@ -20,6 +20,7 @@ import { toolsCatalogRouter } from './tools-catalog.js';
 import { skillsRouter } from './skills.js';
 import { playgroundRouter } from './playground.js';
 import { objectivesRouter } from './objectives.js';
+import { mcpRouter } from './mcp.js';
 
 export const appRouter = router({
   inbox: inboxRouter,
@@ -40,6 +41,7 @@ export const appRouter = router({
   skills: skillsRouter,
   playground: playgroundRouter,
   objectives: objectivesRouter,
+  mcp: mcpRouter,
 });
 
 export type AppRouter = typeof appRouter;

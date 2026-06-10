@@ -91,6 +91,10 @@ const envSchema = z
     DAILY_LLM_USD_THRESHOLD: z.coerce.number().positive().default(5),
     DLQ_ALERT_THRESHOLD: z.coerce.number().int().positive().default(10),
 
+    FEATURE_MCP_TOOLS: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
     FEATURE_PROACTIVE_MESSAGES: z
       .string()
       .default('false')

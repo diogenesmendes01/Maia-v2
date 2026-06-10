@@ -3,6 +3,7 @@ import type { ResolvedPermission } from '@/governance/permissions.js';
 import { canAct } from '@/governance/permissions.js';
 import { constitutionalCheck } from '@/governance/rules.js';
 import { REGISTRY, isToolEnabled, type AnyTool } from './_registry.js';
+import { isMcpToolName, dispatchMcpTool } from './mcp-bridge.js';
 import { resolveGrantedToolNames, type AgentToolGrant } from './grant-math.js';
 import { BASE_AGENT_PACKS } from './base-agent-packs.js';
 import { computeIdempotencyKey, computePayloadHash } from '@/governance/idempotency.js';
@@ -51,6 +52,18 @@ export async function dispatchTool(input: {
   args: unknown;
   ctx: ToolContext;
 }): Promise<DispatchResult> {
+  // Issue #478 — tools MCP (`mcp:<server>:<tool>`) são dinâmicas (DB), não
+  // vivem no REGISTRY. O bridge revalida TODAS as guardas server-side (flag,
+  // pack no grant, tool aprovada+read-only, server ativo) e audita cada
+  // chamada — mesmo desenho fail-closed do guard `tool_not_granted` abaixo.
+  if (isMcpToolName(input.tool)) {
+    return dispatchMcpTool({
+      tool: input.tool,
+      args: input.args,
+      request_id: input.ctx.request_id,
+    });
+  }
+
   const tool = REGISTRY[input.tool] as AnyTool | undefined;
   if (!tool) return { error: 'unknown_tool', details: { tool: input.tool } };
 

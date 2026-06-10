@@ -26,6 +26,7 @@ import type { Mensagem, ProcedureExecution, Role } from '@/db/schema.js';
 import { resolveChannel } from '@/gateway/channel-resolver.js';
 import { audit } from '@/governance/audit.js';
 import { computeRuntimeVisibleTools } from '@/tools/runtime-filter.js';
+import { mcpVisibleToolSchemas } from '@/tools/mcp-bridge.js';
 import { startTyping } from '@/gateway/presence.js';
 // NOTE (issue #412): procedure-selector / role-selector / step-evaluator and
 // the reflection helpers (detectSuccess/detectCorrection/reflect/classify/
@@ -827,6 +828,12 @@ async function runAgentForMensagemInner(
     audit_context: { pessoa_id: pessoa.id, conversa_id: c.id, mensagem_id: inbound.id },
   });
   let tools = visibility.tools;
+
+  // Issue #478 — anexa tools MCP aprovadas+concedidas (flag MCP_TOOLS,
+  // default OFF). Fail-soft: erro na visibilidade MCP nunca derruba o turno
+  // (o helper retorna [] e loga). O dispatcher revalida tudo na execução.
+  const mcpTools = await mcpVisibleToolSchemas();
+  if (mcpTools.length > 0) tools = [...tools, ...mcpTools];
 
   // P11 — Decision Engine gate: always runs BEFORE the LLM call. The engine
   // gates the turn (block/escalate short-circuit) and tool_reductions are
