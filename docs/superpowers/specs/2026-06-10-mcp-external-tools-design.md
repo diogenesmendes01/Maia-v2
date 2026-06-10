@@ -34,7 +34,14 @@ Registrar server (owner/founder, auditado)
 3. **Descoberta → proposta**: worker/ação de console "sincronizar tools" cria `capability_proposals` (tipo novo `mcp_tool`) para tools ainda não aprovadas; mudança de schema em tool já aprovada gera NOVA proposta (re-aprovação) e suspende a tool até decisão — fail-closed.
 4. **Bridge no registry**: tool aprovada vira entrada dinâmica `mcp:<server>:<tool>`; input validado contra o JSON Schema do server (ajv ou conversão p/ Zod); writes exigem `idempotency_key` (ver §3). `sandbox_behavior: 'deny'` sempre (playground nunca executa MCP).
 5. **Execução**: branch MCP no `dispatchTool` — mesmas guardas de `tool_not_granted`, policies e audit (`action='mcp_tool_call'` com server, tool, duração, bytes); resultado truncado a um cap (32KB) e marcado como conteúdo externo no prompt.
-6. **Console**: tela "Conexões MCP" em Plataforma — registrar server, testar conexão, lista de tools com status (proposta/aprovada/suspensa) e link para a proposta; concessão por agente continua via packs.
+6. **Estado por tool** (tabela `mcp_server_tools`): `tenant_id`, `server_id`, `tool_name`, `schema` jsonb + `schema_hash`, `status` (`discovered → proposed → approved | suspended | rejected`), `risk_class`, `proposal_id`. É a fonte do console ("ver") e do fail-closed: sync que detecta hash diferente em tool aprovada ⇒ `suspended` + nova proposta.
+7. **Ponte admin-ui→runtime**: o admin-ui é Postgres-only (mesma restrição do playground) — "testar conexão" e "sincronizar tools" são operações ENFILEIRADAS (Postgres-as-queue) que o runtime executa e grava o resultado; o console faz poll.
+8. **Console (3 superfícies)**:
+   - **Conectar** — `/setup/mcp` "Conexões MCP" (Plataforma): lista de servers (status, última sync, contagem de tools por estado), registrar (nome, URL, secret REF), testar conexão, sincronizar.
+   - **Ver** — detalhe do server: tabela de tools (nome, risco, status, schema resumido, link à proposta), ação "enviar para aprovação" → aprovação no Inbox existente (proposta `mcp_tool` com diff de schema).
+   - **Regular por agente** — card "Capacidades da função" (#474) lista packs `mcp.<server>` com conceder/revogar. DECISÃO: esta é a primeira superfície de EDIÇÃO de grant (hoje grants só nascem na criação); owner/founder, audit direto (padrão channel policies), v1 sem dual-approval — revisitar quando writes chegarem (v2).
+   - **Observar** — chamadas em `/audit` (`mcp_tool_call`) e na aba Atividade do agente.
+9. **Seam no grant-math**: packs hoje são estáticos em código (`TOOL_PACKS`); o pack `mcp.<server>` é DINÂMICO (resolvido das rows `approved` de `mcp_server_tools`). O resolver de visibilidade/dispatcher ganha um provider de packs dinâmicos — mantendo fail-closed (server `disabled` ⇒ pack resolve vazio).
 
 ## 3. Lado ERP (servidor) — contrato que o owner constrói
 
@@ -77,4 +84,4 @@ Guia para o server MCP do ERP encaixar limpo na governança:
 
 ## 7. Estimativa
 
-v1: ~1,5–2 semanas (cliente+bridge 4d, governança/propostas 3d, console 2d, testes 3d). Server do ERP: do lado do owner, com o contrato §3 como guia.
+v1: ~2 semanas (cliente+bridge+pack dinâmico 5d, governança/propostas/sync 3d, console 3 telas 3d, testes 3d). Server do ERP: do lado do owner, com o contrato §3 como guia.
