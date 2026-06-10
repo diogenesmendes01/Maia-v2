@@ -19,6 +19,7 @@ export * from './repositories/channel-repos.js';
 export * from './repositories/admin-repos.js';
 export * from './repositories/playground-repos.js';
 export * from './repositories/objective-repos.js';
+export * from './repositories/mcp-repos.js';
 
 // Calendar v2 — re-export of holidaysRepo + holidayEntidadesRepo from dedicated modules.
 export { holidaysRepo } from './repositories/holidays-repo.js';

@@ -2676,3 +2676,75 @@ export type AgentObjective = typeof agent_objectives.$inferSelect;
 export type NewAgentObjective = typeof agent_objectives.$inferInsert;
 export type ObjectiveTask = typeof objective_tasks.$inferSelect;
 export type NewObjectiveTask = typeof objective_tasks.$inferInsert;
+
+// ---------------------------------------------------------------------------
+// MCP externo v1 (issue #478 — migração 089)
+//
+// mcp_servers: conexões first-party (credencial via secret REF; flags de
+// teste/sync = ponte admin-ui→runtime). mcp_server_tools: estado de
+// governança por tool — schema_hash diferente em tool aprovada ⇒ suspended
+// (fail-closed). Spec: docs/superpowers/specs/2026-06-10-mcp-external-tools-design.md.
+// ---------------------------------------------------------------------------
+
+export type McpServerStatus = 'active' | 'disabled';
+export type McpToolStatus = 'discovered' | 'approved' | 'suspended' | 'rejected';
+
+export const mcp_servers = pgTable(
+  'mcp_servers',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    name: text('name').notNull(),
+    url: text('url').notNull(),
+    transport: text('transport').notNull().default('streamable_http'),
+    auth_secret_ref: text('auth_secret_ref'),
+    status: text('status').notNull().default('active'), // McpServerStatus
+    created_by: text('created_by').notNull(),
+    test_requested_at: timestamp('test_requested_at', { withTimezone: true }),
+    last_test_at: timestamp('last_test_at', { withTimezone: true }),
+    last_test_result: jsonb('last_test_result'),
+    sync_requested_at: timestamp('sync_requested_at', { withTimezone: true }),
+    last_sync_at: timestamp('last_sync_at', { withTimezone: true }),
+    last_sync_result: jsonb('last_sync_result'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    tenantIdx: index('mcp_servers_tenant_idx').on(t.tenant_id, t.status),
+    tenantNameUq: uniqueIndex('mcp_servers_tenant_name_uq').on(t.tenant_id, t.name),
+  }),
+);
+
+export const mcp_server_tools = pgTable(
+  'mcp_server_tools',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    server_id: uuid('server_id')
+      .notNull()
+      .references(() => mcp_servers.id, { onDelete: 'cascade' }),
+    tenant_id: text('tenant_id').notNull(),
+    tool_name: text('tool_name').notNull(),
+    description: text('description'),
+    input_schema: jsonb('input_schema').notNull().default({}),
+    schema_hash: text('schema_hash').notNull(),
+    is_read_only: boolean('is_read_only').notNull().default(false),
+    status: text('status').notNull().default('discovered'), // McpToolStatus
+    risk_class: text('risk_class').notNull().default('critical'),
+    approved_by: text('approved_by'),
+    approved_at: timestamp('approved_at', { withTimezone: true }),
+    decision_comment: text('decision_comment'),
+    first_seen_at: timestamp('first_seen_at', { withTimezone: true }).notNull().defaultNow(),
+    last_seen_at: timestamp('last_seen_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    tenantIdx: index('mcp_server_tools_tenant_idx').on(t.tenant_id, t.status),
+    serverIdx: index('mcp_server_tools_server_idx').on(t.server_id, t.status),
+    serverToolUq: uniqueIndex('mcp_server_tools_server_tool_uq').on(t.server_id, t.tool_name),
+  }),
+);
+
+export type McpServer = typeof mcp_servers.$inferSelect;
+export type NewMcpServer = typeof mcp_servers.$inferInsert;
+export type McpServerTool = typeof mcp_server_tools.$inferSelect;
+export type NewMcpServerTool = typeof mcp_server_tools.$inferInsert;

@@ -192,3 +192,4 @@ NEW shared prefixes — pick `max(existing)+1`.
 086 | 086_fix_human_confirmation_policy_scope.sql | fix human_confirmation_policy scope and predicate — restrict to boleto role, high/critical only (issue 446)
 087 | 087_playground_sessions.sql | playground sandbox sessions and turns (issue 464)
 088 | 088_agent_objectives.sql | work loop: agent objectives and tasks (issue 469)
+089 | 089_mcp_servers.sql | mcp external tools: servers and per-tool governance state (issue 478)

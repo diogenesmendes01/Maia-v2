@@ -68,6 +68,7 @@ export const NAV_SECTIONS: NavSection[] = [
     label: 'Plataforma',
     items: [
       { href: '/setup/channels', label: 'Canais', icon: 'message' },
+      { href: '/setup/mcp', label: 'Conexões MCP', icon: 'wrench' },
       { href: '/setup/tenants', label: 'Tenants', icon: 'users', founderOnly: true },
       {
         href: '/setup/llm-settings',

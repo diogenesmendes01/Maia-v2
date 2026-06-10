@@ -32,7 +32,9 @@ describe('P6 enums', () => {
     // FeatureFlags singleton still instantiates and defaults absent flags to
     // false (kept as the registration point for the next phase's flag).
     expect((FeatureFlagName as Record<string, string>)['COGNITIVE_GRAPH']).toBeUndefined();
-    expect(Object.keys(FeatureFlagName)).toHaveLength(0);
+    // #478 registered the next phase's flag (MCP_TOOLS, default OFF) — the
+    // enum is no longer empty; the removed legacy flags stay removed.
+    expect(Object.keys(FeatureFlagName)).toEqual(['MCP_TOOLS']);
     expect(
       featureFlags.isEnabled('ANY_ABSENT_FLAG' as unknown as never),
     ).toBe(false);

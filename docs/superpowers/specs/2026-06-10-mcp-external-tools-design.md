@@ -1,7 +1,7 @@
 # Maia — Tools Externas via MCP (ERP First-Party) — Design Spec
 
 **Date:** 2026-06-10
-**Status:** Draft — aprovado em direção pelo owner ("braços antes das profissões"); implementação v1 em sessão dedicada
+**Status:** v1 implementada (2026-06-10) — migração 089 (`mcp_servers` + `mcp_server_tools`), `src/lib/mcp-client.ts` (SDK, conexões efêmeras, timeout 15s, secret via env ref), `src/tools/mcp-bridge.ts` (visibilidade + execução com todas as guardas, cap 32KB, audit `mcp_tool_call`), costuras no hot path (append em `core.ts`, branch pré-REGISTRY no dispatcher) atrás da flag `FEATURE_MCP_TOOLS` (default OFF), worker `mcp_sync` (test/sync por flags), router `mcp` e tela `/setup/mcp` (conectar/ver/decidir/regular por agente). Validação de input v1 é estrutural (required top-level) — ajv completo, writes (`confirm_before_write_policy`) e integração com o Inbox unificado são v2.
 **Master refs:** visão `2026-06-10-learnable-workforce-vision.md` §2.3 (Braços); `docs/architecture/concerns/capability-taxonomy.md`; `docs/architecture/concerns/action-layer.md`; sistema de grants/packs (#408/#474)
 **Architecture Locks:** todos os 6 invariantes. **MCP é um TRANSPORTE novo de tools — nunca um atalho em volta da governança.** Nenhuma tool MCP executa fora do dispatcher.
 
