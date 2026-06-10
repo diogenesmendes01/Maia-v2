@@ -3,14 +3,16 @@
  *
  * Spec §7.2 + master §0.4 principle 5 (no-downgrade invariant).
  *
- * This is the **stub** shipped with P9b. The real implementation (P9c) will
- * add LLM-based enrichment that can ELEVATE risk but NEVER DOWNGRADE — see
- * TurnRiskScorer in P9c (PR #97).
+ * This is the **stub** shipped with P9b. P9c (#97) shipped the real
+ * implementation — `scoreTurn` in `turn-risk-scorer.ts`, with LLM-based
+ * enrichment that can ELEVATE risk but NEVER DOWNGRADE — and production wires
+ * it via `riskScorerProdAdapter` in `prod-env.ts` (#153).
  *
- * Budget target: <40ms (stub is sync-equivalent; P9c will use Haiku in medium).
+ * `RiskScorerStubImpl` is intentionally retained as the deterministic default
+ * for test harnesses when `env.riskScorer` is omitted (#377 — keeps the live
+ * Haiku risk gate out of harnesses; prod never hits it).
  *
- * TODO(P9c #97): Replace `RiskScorerStubImpl` with `TurnRiskScorer` from
- * P9c. Interface remains the same (no breaking change).
+ * Budget target: <40ms (stub is sync-equivalent).
  */
 import type { RiskScorer } from './types.js';
 import type {

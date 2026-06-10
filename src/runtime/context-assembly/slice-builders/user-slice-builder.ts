@@ -12,7 +12,9 @@
  *  2. Truncation honours max_items from requirements.
  *  3. Depth 'none' returns an empty slice.
  *
- * TODO(P8c): replace stub port bindings with real user-layer facade.
+ * P8c (#94) shipped the real user-layer facade (`src/user-layer/`);
+ * production-builder-set still binds the stub port, so wiring the facade in
+ * is unblocked but pending.
  */
 import { createHash } from 'node:crypto';
 import type { BaseContextPacket, UserSlice } from '../../context-packet/types.js';
@@ -55,7 +57,7 @@ export interface BehavioralHintRecord {
 
 /**
  * Port covering pessoa + memory + hints lookup. Real impl backed by the P2
- * memory_entry repo and the future P8c user-layer namespace.
+ * memory_entry repo and the P8c user-layer namespace (`src/user-layer/`).
  */
 export interface UserLayerPort {
   getPessoa(

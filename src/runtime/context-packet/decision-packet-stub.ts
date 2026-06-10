@@ -1,12 +1,10 @@
 /**
- * @stub P8a production stub for DecisionPacket producer.
- * Replaced by real Decision Engine in P9b (intent classifier, risk scorer,
- * policy evaluator early PEP).
+ * @stub P8a stub for DecisionPacket producer.
  *
- * P8a entrega apenas o TYPE + este stub para permitir testes end-to-end do
- * orchestrator/slice builders sem depender de P9b.
- *
- * TODO(P9b): replace with real Decision Engine.
+ * P9b shipped the real Decision Engine (`src/runtime/decision/`, wired to the
+ * hot path in #152), so production no longer consumes this stub — it survives
+ * only as a fixture for orchestrator/slice-builder tests
+ * (tests/unit/runtime/context-packet/).
  */
 
 import type { BaseContextPacket, DecisionPacket } from './types.js';

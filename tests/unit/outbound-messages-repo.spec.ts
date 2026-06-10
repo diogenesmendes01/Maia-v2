@@ -12,8 +12,10 @@
  *
  * Strategy: mock `@/db/client.js`'s `withTx` to run the callback with a fake
  * `tx` that records execute() / insert() / update() / select() calls, so we can
- * assert the exact SQL composition without a real PG. A real-DB integration
- * test for the advisory lock is a follow-up TODO (#227-sweeper PR).
+ * assert the exact SQL composition without a real PG. The sweeper PR has since
+ * shipped (#292/#306) with unit-level advisory-lock modeling
+ * (tests/unit/workers/outbound-messages-sweeper.spec.ts); a real-DB
+ * integration test for the advisory lock is still a follow-up TODO.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { runWithTenantContext } from '@/db/tenant-context.js';

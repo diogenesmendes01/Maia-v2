@@ -7,7 +7,10 @@
  *
  * Spec §3.7 / Plan Task 9.
  *
- * TODO(P8e): replace stub resolver binding with real PolicyDescriptorResolver.
+ * P8e (#93) shipped the real PolicyDescriptorResolver
+ * (`src/control-plane/policy/policy-descriptor-resolver.ts`);
+ * production-builder-set still binds the stub below, so swapping in the real
+ * resolver is unblocked but pending.
  */
 import { createHash } from 'node:crypto';
 import type {
@@ -50,8 +53,8 @@ export interface PolicyDescriptorResolverPort {
 }
 
 /**
- * Stub resolver returning empty. Real impl in P8e.
- * TODO(P8e): replace when P8e lands.
+ * Stub resolver returning empty. P8e (#93) has landed with the real impl;
+ * replacing this binding is unblocked (see file header).
  */
 export const stubPolicyDescriptorResolver: PolicyDescriptorResolverPort = {
   async resolveDescriptors() {

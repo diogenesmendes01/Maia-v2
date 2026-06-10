@@ -19,7 +19,10 @@ export type { ActionMode, ContextRequirements, PepKind, PolicyDecision, RiskLeve
 /**
  * Resolved policy as returned by PolicyDescriptorResolver (P8e).
  *
- * TODO(P8e #93): Replace with full ResolvedPolicy type once P8e merges.
+ * P8e (#93) has merged: the full ResolvedPolicy type lives in
+ * `src/control-plane/policy/types.ts` and is mapped onto this narrow port
+ * shape by the PolicyDescriptorResolverAdapter in `prod-env.ts`. Collapsing
+ * the two types is now unblocked if the indirection ever becomes unwanted.
  */
 export interface ResolvedPolicy {
   policy_id: string;
@@ -34,8 +37,9 @@ export interface ResolvedPolicy {
 /**
  * Policy rule body — minimal subset of fields read by PEPs in P9b.
  *
- * TODO(P9d #98): Replace with full PolicyRuleBody type once P9d Policy DSL
- * Evaluator merges.
+ * P9d (#98) Policy DSL Evaluator has merged: the full rule-body type lives in
+ * `src/governance/policy-dsl/types.ts`. PEPs keep this minimal subset as the
+ * port shape; unifying with the P9d type is now unblocked.
  */
 export interface PolicyRuleBody {
   policy_id: string;
@@ -51,7 +55,9 @@ export interface PolicyRuleBody {
 /**
  * Verdict returned by PolicyEvaluator when checking a single rule.
  *
- * TODO(P9d #98): Replace with full PolicyEvaluatorVerdict from P9d once merged.
+ * P9d (#98) has merged: its PolicyDecision outcome is translated into this
+ * verdict shape by the PolicyDSLEvaluatorAdapter in `prod-env.ts`. Unifying
+ * the two shapes is now unblocked.
  */
 export interface PolicyEvaluatorVerdict {
   action:
@@ -68,11 +74,12 @@ export interface PolicyEvaluatorVerdict {
 }
 
 /**
- * Policy evaluator interface (P9d stub in P9b).
+ * Policy evaluator interface (DI port).
  *
- * TODO(P9d #98): Replace with concrete PolicyEvaluator class from P9d.
- * P9b ships a default `AllowAllPolicyEvaluator` that always returns
- * `allow`, plus a `FixturePolicyEvaluator` for testing.
+ * P9d (#98) shipped the concrete evaluator as a pure function
+ * (`src/governance/policy-dsl/evaluator.ts`), bridged onto this interface by
+ * the PolicyDSLEvaluatorAdapter in `prod-env.ts`. The P9b-era
+ * `AllowAllPolicyEvaluator` / `FixturePolicyEvaluator` remain for tests only.
  *
  * Round-2 finding 4: `signal` lets the Decision Engine cancel a slow
  * evaluator when the hot-path budget fires.
@@ -88,7 +95,10 @@ export interface PolicyEvaluator {
 /**
  * Repository for fetching policy rule bodies by ID.
  *
- * TODO(P8e #93): Replace with PolicyRulesRepo from P8e.
+ * P8e (#93) has merged: the concrete repo is
+ * `src/control-plane/policy/policy-rules-repo.ts`, bridged onto this port by
+ * the PolicyRulesRepoAdapter in `prod-env.ts` (getBodySync stays null there —
+ * P8e has no sync path, and PEPs fall back to async getBody).
  *
  * Round-2 finding 4: `signal` lets the Decision Engine cancel a slow repo
  * lookup when the hot-path budget fires.
@@ -103,9 +113,12 @@ export interface PolicyRulesRepo {
 }
 
 /**
- * Skill type (P9a stub).
+ * Skill type (Decision Engine port shape).
  *
- * TODO(P9a #99): Replace with full Skill type from P9a Skill Abstraction.
+ * P9a (#99) Skill Abstraction has merged: the canonical SkillRow lives in the
+ * skill registry (`src/control-plane/skill-registry/`), and the
+ * SkillsRepoAdapter in `prod-env.ts` maps SkillRow → this shape. Unifying the
+ * two types is now unblocked.
  */
 export interface Skill {
   id: string;
@@ -171,9 +184,12 @@ export interface Skill {
 }
 
 /**
- * Skills repository (P9a stub).
+ * Skills repository (Decision Engine port).
  *
- * TODO(P9a #99): Replace with SkillsRepo from P9a.
+ * P9a (#99) has merged: the concrete repo is
+ * `src/control-plane/skill-registry/skills-repo.ts`, bridged onto this port
+ * by the SkillsRepoAdapter in `prod-env.ts` (which pins lookups to the routed
+ * tenant/agent — see adapter 4 notes there).
  *
  * Codex round-2 finding 3: `find` MUST be scoped by tenant_id + agent_id.
  * The legacy unscoped `find(skill_id)` would silently return a skill from a
@@ -215,10 +231,11 @@ export interface SkillsRepo {
 }
 
 /**
- * Channel policy (P0 already in prod).
+ * Channel policy (port shape).
  *
- * TODO(P0 review): align with channel_policies table shape once P0 owners
- * confirm the exact column names. Currently inferred from spec.
+ * Table shape confirmed: `channel_policies` (migration 033) carries
+ * `agent_id` directly, which the ChannelPoliciesReaderAdapter in
+ * `prod-env.ts` (#157) returns as `default_agent_id`. No alignment work left.
  */
 export interface ChannelPolicy {
   channel_id: string;
@@ -261,8 +278,9 @@ export interface LockdownReader {
 /**
  * Procedure execution data read by workflow-selector.
  *
- * TODO(P3b): replace with concrete row type once procedureExecutionsRepo
- * exposes a typed read method.
+ * P3b shipped `procedureExecutionsRepo` with a typed `findById`; the
+ * ProceduresRepoAdapter in `prod-env.ts` maps that row onto this narrow
+ * shape. Replacing this port type with the concrete row is now unblocked.
  */
 export interface ProcedureExecution {
   execution_id: string;
@@ -289,8 +307,9 @@ export interface ContentResolver {
 /**
  * Haiku LLM client (intent classifier fallback).
  *
- * TODO: Replace with concrete HaikuClient from lib/claude.ts once a stable
- * narrow interface is exposed. Spec §7.1 calls `haiku.classify(...)`.
+ * Production wiring exists: the HaikuClientAdapter in `prod-env.ts` wraps
+ * `lib/claude.ts#callLLM` onto this interface. Spec §7.1 calls
+ * `haiku.classify(...)`.
  *
  * Round-2 finding 4: `signal` lets the Decision Engine cancel a slow Haiku
  * call when the hot-path budget fires. The Anthropic SDK accepts an
@@ -329,10 +348,11 @@ export interface ResolveDescriptorsQuery {
 /**
  * P8e PolicyDescriptorResolver interface (consumed via DI per spec §3.4).
  *
- * TODO(P8e #93): Replace with concrete `PolicyDescriptorResolver` class from
- * `src/control-plane/policy/policy-descriptor-resolver.ts`. Per spec
- * Architecture Lock, Decision Engine must NEVER import the resolver
- * directly.
+ * P8e (#93) has merged: the concrete class lives in
+ * `src/control-plane/policy/policy-descriptor-resolver.ts` and reaches the
+ * engine via the PolicyDescriptorResolverAdapter in `prod-env.ts`. This port
+ * stays by design — per spec Architecture Lock, Decision Engine must NEVER
+ * import the resolver directly.
  *
  * Round-2 finding 4: `signal` lets the Decision Engine cancel a slow
  * resolver call when the hot-path budget fires.

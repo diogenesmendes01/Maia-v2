@@ -1,10 +1,14 @@
 /**
  * P8a — Production SliceBuilderSet factory.
  *
- * Wires the seven P8a slice builders with stub adapters for sub-phases that are
- * not yet shipped (P8c User facade, P8e Policy resolver, P9a Skill catalog,
- * P11 Tool registry).
- * Real adapters will replace the stubs in those phases.
+ * Wires the seven P8a slice builders. user/knowledge/policy/skill/tool still
+ * bind STUB adapters even though their backing phases have since shipped
+ * (P8c user-layer facade — `src/user-layer/`, P8e policy resolver —
+ * `src/control-plane/policy/`, P9a skill registry —
+ * `src/control-plane/skill-registry/`); wiring the real implementations here
+ * is unblocked but was never done — PR #406 removed the
+ * FEATURE_CONTEXT_PACKET_V1 hot path, leaving this assembly path unwired from
+ * the agent loop (slated for the plumbing-teardown wave).
  *
  * Exported as a lazy singleton (created once on first call) so the builders
  * share the same InMemorySliceCache instance across turns in the process.
@@ -14,10 +18,6 @@
  * operationalProfileVersionsRepo). Tenant/agent resolve via AsyncLocalStorage
  * inside the repo — the port adapter passes no tenant argument so the
  * tenant-isolation invariant cannot be violated by a confused caller.
- * TODO(P8c): replace stub user repo with real user-layer facade.
- * TODO(P8e): replace stubPolicyDescriptorResolver with real resolver.
- * TODO(P9a): replace stubSkillRepo with real skill catalog facade.
- * TODO(P11): replace stubToolRegistry with real tool registry binding.
  */
 
 import { IdentitySliceBuilder } from '../context-assembly/slice-builders/identity-slice-builder.js';
