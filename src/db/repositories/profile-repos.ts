@@ -1015,6 +1015,168 @@ export const operationalProfileVersionsRepo = {
     });
   },
 
+  /**
+   * Operator-initiated rollback (Admin UI `/versions`, issue #468): demote the
+   * current active version to `rolled_back` and re-activate an earlier
+   * `frozen` version — both transitions + the completion audit in ONE
+   * transaction under the parent-agent lock (same serialization protocol as
+   * `approveAndActivateAtomic` / `escalateRollbackIfStillFrozen`).
+   *
+   * Both edges are legal in the state machine (`active → rolled_back`,
+   * `frozen → active`). The `from_version` argument is a stale guard: the
+   * operator decided looking at a specific active version; if a concurrent
+   * approve/seed changed the slot, we refuse with the post-lock truth instead
+   * of rolling back the wrong row.
+   *
+   * Only `frozen` rows are valid targets — `proposed` was never approved
+   * (re-activating it would bypass the approval invariant) and `rolled_back`
+   * is terminal.
+   */
+  async adminRollbackAtomic(args: {
+    tenant_id: string;
+    agent_id: string;
+    /** Active version the operator believes is current (stale guard). */
+    from_version: number;
+    /** Earlier frozen version to re-activate. */
+    to_version: number;
+    actor_id: string;
+    actor_role: string;
+    reason: string;
+  }): Promise<
+    | {
+        ok: true;
+        activated: { id: string; version: number };
+        rolled_back: { id: string; version: number };
+      }
+    | { ok: false; reason: 'agent_missing' }
+    | { ok: false; reason: 'active_mismatch'; actual_active_version: number | null }
+    | { ok: false; reason: 'target_not_found' }
+    | { ok: false; reason: 'target_invalid_status'; actual_status: ProfileStatus }
+    | { ok: false; reason: 'transition_failed' }
+  > {
+    return await withTx(async (tx) => {
+      // (0) Parent-agent lock — serializes against every other writer of
+      // this (tenant, agent)'s profile state.
+      const agentLocked = await lockParentAgent(tx, args.tenant_id, args.agent_id);
+      if (!agentLocked) {
+        return { ok: false as const, reason: 'agent_missing' as const };
+      }
+
+      // (1) Lock the current active row and verify it is the version the
+      // operator decided on. Post-lock mismatch (including "no active row")
+      // → refuse with the actual state so the UI can refresh.
+      const activeRows = await tx
+        .select()
+        .from(agent_operational_profile_versions)
+        .where(
+          and(
+            eq(agent_operational_profile_versions.tenant_id, args.tenant_id),
+            eq(agent_operational_profile_versions.agent_id, args.agent_id),
+            eq(agent_operational_profile_versions.status, 'active'),
+          ),
+        )
+        .for('update')
+        .limit(1);
+      const active = activeRows[0] ?? null;
+      if (!active || active.version !== args.from_version) {
+        return {
+          ok: false as const,
+          reason: 'active_mismatch' as const,
+          actual_active_version: active?.version ?? null,
+        };
+      }
+
+      // (2) Lock the target row by version. Must exist and be `frozen`.
+      const targetRows = await tx
+        .select()
+        .from(agent_operational_profile_versions)
+        .where(
+          and(
+            eq(agent_operational_profile_versions.tenant_id, args.tenant_id),
+            eq(agent_operational_profile_versions.agent_id, args.agent_id),
+            eq(agent_operational_profile_versions.version, args.to_version),
+          ),
+        )
+        .for('update')
+        .limit(1);
+      const target = targetRows[0];
+      if (!target) {
+        return { ok: false as const, reason: 'target_not_found' as const };
+      }
+      if (target.status !== 'frozen') {
+        return {
+          ok: false as const,
+          reason: 'target_invalid_status' as const,
+          actual_status: target.status as ProfileStatus,
+        };
+      }
+
+      const now = new Date();
+
+      // (3) Demote the active row. Status predicate is belt-and-suspenders —
+      // we hold both the parent lock and the row lock.
+      const demoted = await tx
+        .update(agent_operational_profile_versions)
+        .set({
+          status: 'rolled_back',
+          rolled_back_at: now,
+          rollback_reason: args.reason,
+        })
+        .where(
+          and(
+            eq(agent_operational_profile_versions.id, active.id),
+            eq(agent_operational_profile_versions.status, 'active'),
+          ),
+        )
+        .returning({ id: agent_operational_profile_versions.id });
+      if (demoted.length === 0) {
+        return { ok: false as const, reason: 'transition_failed' as const };
+      }
+
+      // (4) Re-activate the frozen target. Demote committed first inside the
+      // same tx, so the partial unique index on (tenant, agent)
+      // WHERE status='active' never sees two active rows.
+      const activated = await tx
+        .update(agent_operational_profile_versions)
+        .set({ status: 'active', activated_at: now })
+        .where(
+          and(
+            eq(agent_operational_profile_versions.id, target.id),
+            eq(agent_operational_profile_versions.status, 'frozen'),
+          ),
+        )
+        .returning({ id: agent_operational_profile_versions.id });
+      if (activated.length === 0) {
+        return { ok: false as const, reason: 'transition_failed' as const };
+      }
+
+      // (5) Completion audit in the SAME tx — a rollback that isn't audited
+      // doesn't happen (everything above rolls back with it).
+      await tx.insert(admin_audit_log).values({
+        tenant_id: args.tenant_id,
+        actor_id: args.actor_id,
+        actor_role: args.actor_role,
+        action: 'version_rollback_completed',
+        resource_type: 'agent_operational_profile_version',
+        resource_id: target.id,
+        change_summary: {
+          agent_id: args.agent_id,
+          rolled_back_id: active.id,
+          rolled_back_version: active.version,
+          activated_id: target.id,
+          activated_version: target.version,
+          reason: args.reason,
+        },
+      });
+
+      return {
+        ok: true as const,
+        activated: { id: target.id, version: target.version },
+        rolled_back: { id: active.id, version: active.version },
+      };
+    });
+  },
+
   // Próxima version sequencial para (tenant_id, agent_id) corrente.
   // MAX(version) + 1, ou 1 quando não existe versão ainda.
   async nextVersion(): Promise<number> {

@@ -31,8 +31,16 @@ type ProfileVersion = {
   created_at: Date;
 };
 
-function makeCtx(role: string, opts?: { agents?: string[]; versions?: ProfileVersion[] }) {
+function makeCtx(
+  role: string,
+  opts?: {
+    agents?: string[];
+    versions?: ProfileVersion[];
+    rollbackResult?: unknown;
+  },
+) {
   const audit: AuditRow[] = [];
+  const rollbackCalls: Array<Record<string, unknown>> = [];
   const agentList = (opts?.agents ?? []).map((id) => ({
     id,
     tenant_id: 'tenant-A',
@@ -79,36 +87,116 @@ function makeCtx(role: string, opts?: { agents?: string[]; versions?: ProfileVer
           async getActive() {
             return opts?.versions?.find((v) => v.status === 'active') ?? null;
           },
+          async adminRollbackAtomic(args: Record<string, unknown>) {
+            rollbackCalls.push(args);
+            return (
+              opts?.rollbackResult ?? {
+                ok: true,
+                activated: { id: 'pv-target', version: args.to_version },
+                rolled_back: { id: 'pv-active', version: args.from_version },
+              }
+            );
+          },
         },
       } as unknown as typeof import('@/db/repositories.js'),
       assertTenant: () => {},
       assertRole: () => {},
     },
     audit,
+    rollbackCalls,
   };
 }
 
 describe('versionsRouter.rollback — fail loud, not silent', () => {
-  it('throws NOT_IMPLEMENTED for agent_operational_profile_versions', async () => {
-    const { ctx, audit } = makeCtx('owner');
+  it('agent_operational_profile_versions: executes adminRollbackAtomic and returns the transition', async () => {
+    const { ctx, audit, rollbackCalls } = makeCtx('owner');
+    const caller = versionsRouter.createCaller(ctx);
+    const result = await caller.rollback({
+      sotKind: 'agent_operational_profile_versions',
+      sotId: 'agent-a',
+      fromVersion: 5,
+      toVersion: 3,
+      reason: 'incident-2026-06-10-revert',
+    });
+    expect(result.status).toBe('rolled_back');
+    expect(result.activated).toEqual({ id: 'pv-target', version: 3 });
+    expect(result.rolled_back).toEqual({ id: 'pv-active', version: 5 });
+    // The repo receives the agent id (sotId) + actor context for the
+    // in-tx completion audit.
+    expect(rollbackCalls).toHaveLength(1);
+    expect(rollbackCalls[0]).toMatchObject({
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-a',
+      from_version: 5,
+      to_version: 3,
+      actor_id: 'user-1',
+      actor_role: 'owner',
+      reason: 'incident-2026-06-10-revert',
+    });
+    // Attempt audit (pre-tx) still recorded, now with implemented: true.
+    expect(audit.length).toBe(1);
+    expect(audit[0]?.action).toBe('version_rollback_attempt');
+    expect(audit[0]?.change_summary?.implemented).toBe(true);
+  });
+
+  it('maps active_mismatch to CONFLICT (stale screen)', async () => {
+    const { ctx } = makeCtx('owner', {
+      rollbackResult: { ok: false, reason: 'active_mismatch', actual_active_version: 6 },
+    });
     const caller = versionsRouter.createCaller(ctx);
     let thrown: unknown;
     try {
       await caller.rollback({
         sotKind: 'agent_operational_profile_versions',
-        sotId: 'profile-1',
+        sotId: 'agent-a',
         fromVersion: 5,
         toVersion: 3,
-        reason: 'incident-2026-05-01-revert',
+        reason: 'stale operator decision',
       });
     } catch (e) {
       thrown = e;
     }
     expect(thrown).toBeInstanceOf(TRPCError);
-    expect((thrown as TRPCError).code).toBe('NOT_IMPLEMENTED');
-    // Audit was still recorded — operators can see who tried.
-    expect(audit.length).toBe(1);
-    expect(audit[0]?.action).toBe('version_rollback_attempt');
+    expect((thrown as TRPCError).code).toBe('CONFLICT');
+    expect((thrown as TRPCError).message).toMatch(/v6/);
+  });
+
+  it('maps target_invalid_status to PRECONDITION_FAILED (cannot re-activate proposed/rolled_back)', async () => {
+    const { ctx } = makeCtx('founder', {
+      rollbackResult: { ok: false, reason: 'target_invalid_status', actual_status: 'rolled_back' },
+    });
+    const caller = versionsRouter.createCaller(ctx);
+    let thrown: unknown;
+    try {
+      await caller.rollback({
+        sotKind: 'agent_operational_profile_versions',
+        sotId: 'agent-a',
+        fromVersion: 5,
+        toVersion: 2,
+        reason: 'rollback to terminal row',
+      });
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeInstanceOf(TRPCError);
+    expect((thrown as TRPCError).code).toBe('PRECONDITION_FAILED');
+    expect((thrown as TRPCError).message).toMatch(/rolled_back/);
+  });
+
+  it('maps agent_missing to NOT_FOUND', async () => {
+    const { ctx } = makeCtx('owner', {
+      rollbackResult: { ok: false, reason: 'agent_missing' },
+    });
+    const caller = versionsRouter.createCaller(ctx);
+    await expect(
+      caller.rollback({
+        sotKind: 'agent_operational_profile_versions',
+        sotId: 'ghost-agent',
+        fromVersion: 5,
+        toVersion: 3,
+        reason: 'agent deleted concurrently',
+      }),
+    ).rejects.toThrowError(/Agent not found/);
   });
 
   it('throws NOT_IMPLEMENTED for policy_rules', async () => {
