@@ -121,17 +121,18 @@ Princípio de menor privilégio aplicado a agentes: o agente nasce com o **míni
 
 | Tela | O quê | Status |
 |---|---|---|
-| Wizard passo "Função" | arquétipo com preview do preset | 🔨 nesta iteração |
-| Aba "Atividade" no agente | traces, drift, skills, canais do agente (#462) | 🔨 nesta iteração |
-| Diff antes de aprovar | perfil ativo vs. proposto lado a lado (#461) | 🔨 nesta iteração |
-| `/audit` | trilha de auditoria visível (#463) | 🔨 nesta iteração |
-| Checklist de ativação | dashboard guia tenant→agente→perfil→canal (#465) | 🔨 nesta iteração |
-| Console responsivo | aprovar do celular (#466) | 🔨 nesta iteração |
-| Playground "Testar" | chat sandbox com versão proposta (#464) | spec própria |
+| Wizard passo "Função" | arquétipo com preset + packs de capacidade (#470) | ✅ #467/#474 |
+| Aba "Atividade" no agente | traces, drift, skills, canais do agente (#462) | ✅ #467 |
+| Diff antes de aprovar | perfil ativo vs. proposto lado a lado (#461) | ✅ #467 |
+| `/audit` | trilha de auditoria visível (#463) | ✅ #467 |
+| Checklist de ativação | dashboard guia tenant→agente→perfil→canal (#465) | ✅ #467 |
+| Console responsivo | aprovar do celular (#466) | ✅ #467 |
+| Playground "Testar" | chat sandbox com versão proposta (#464) | ✅ #473 (v1; v1.1 = mock de tools) |
+| Aba "Objetivos" + fila de exceções | metas + tarefas do work loop (#469) | ✅ #475 (v1; v2 = cobrança) |
+| Pedidos de ferramenta | backlog gerado pelo agente (#471) | ✅ #476 (v1; v2 = aceite via API) |
+| Card "Capacidades da função" | packs/tools efetivos do agente | ✅ #474 |
 | Procedure Studio | fluxo visual de procedures ensinadas | fase 3 |
-| Aba "Objetivos" | metas + tarefas do work loop | fase 2 |
 | Painel ROI | custo vs. resultado por função | fase 2/3 |
-| Fila de exceções | trabalho travado esperando humano | fase 2 |
 
 ## 4. Roadmap
 
@@ -150,15 +151,15 @@ Princípio de menor privilégio aplicado a agentes: o agente nasce com o **míni
 
 ## 6. Issues derivadas
 
-| Issue | Bloco | Fase |
+Status em 2026-06-10 (fim da primeira rodada de implementação):
+
+| Issue | Bloco | Estado |
 |---|---|---|
-| #461 diff antes de aprovar | Governança | 1 — nesta iteração |
-| #462 aba Atividade | Console/Arquétipos | 1 — nesta iteração |
-| #463 página /audit | Governança | 1 — nesta iteração |
-| #464 playground | Governança/Sandbox | spec nesta iteração; implementação fase 2 |
-| #465 checklist de ativação | Console | 1 — nesta iteração |
-| #466 console responsivo | Console | 1 — nesta iteração |
-| (a abrir) packs de arquétipo no backend | Arquétipos | 3 |
-| (a abrir) entidade Objetivo + work loop | Work loop | 2 |
-| (a abrir) pedido de ferramenta | Ensino | 3 |
-| (a abrir) rollback real de profile versions | Governança | 1 |
+| #461–#466 (frontend fase 1) | Governança/Console | ✅ entregues (#467) |
+| #468 rollback real de profile versions | Governança | ✅ entregue (#467) |
+| #464 playground sandbox | Governança/Sandbox | ✅ v1 entregue (#473); v1.1 = `sandbox_behavior` por tool |
+| #470 packs de arquétipo no backend | Arquétipos | ✅ entregue (#474) |
+| #469 work loop | Work loop | ✅ v1 entregue (#475); v2 = kind `inadimplencia` (cobrança em R$); v3 = 2º domínio + ROI |
+| #471 pedido de ferramenta | Ensino | ✅ v1 entregue (#476); v2 = aceite via API + fechamento do gap |
+| #472 e2e no CI + sonda sintética | Confiabilidade | 📋 aberto |
+| Fase 4 (multi-tenant runtime, aprovação via WhatsApp, templates, browser-use) | Plataforma | 📋 roadmap |
