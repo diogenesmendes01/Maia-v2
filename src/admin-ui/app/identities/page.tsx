@@ -1,20 +1,45 @@
 'use client';
 
 import * as React from 'react';
+import Link from 'next/link';
 import { useSession } from 'next-auth/react';
 import { trpc } from '../../trpc/client.js';
-import ProfileApproveModal from './_components/profile-approve-modal.js';
+import { PageHeader } from '../../components/ui/page-header.js';
+import { StatusBadge } from '../../components/ui/badge.js';
+import { Button } from '../../components/ui/button.js';
+import { Field, Select, Textarea } from '../../components/ui/field.js';
+import { Modal } from '../../components/ui/modal.js';
+import {
+  LoadingState,
+  ErrorState,
+  EmptyState,
+} from '../../components/ui/states.js';
+import {
+  TableShell,
+  Table,
+  THead,
+  Th,
+  Tr,
+  Td,
+} from '../../components/ui/table.js';
 
+/**
+ * Cross-agent view of operational profile versions. The active row is what
+ * each agent is running; proposed rows can be approved here (the previous
+ * active version is frozen in the same transaction).
+ */
 export default function IdentitiesPage() {
   const { data: session, status } = useSession();
   const role = session?.user?.role ?? '';
   const tenantId = session?.user?.tenant_id ?? '';
-  const [agentId, setAgentId] = React.useState<string>('');
-  const [approveTarget, setApproveTarget] = React.useState<{
+  const [agentId, setAgentId] = React.useState('');
+  const [target, setTarget] = React.useState<{
     versionId: string;
     agentId: string;
     version: number;
   } | null>(null);
+  const [comment, setComment] = React.useState('');
+  const [error, setError] = React.useState<string | null>(null);
 
   const canApprove = role === 'owner' || role === 'founder';
 
@@ -22,7 +47,6 @@ export default function IdentitiesPage() {
     { tenantId },
     { enabled: tenantId !== '' },
   );
-
   const versionsQuery = trpc.versions.listVersions.useQuery(
     {
       tenantId,
@@ -32,119 +56,155 @@ export default function IdentitiesPage() {
     },
     { enabled: tenantId !== '' },
   );
+  const approveMutation = trpc.agents.approveProfile.useMutation();
 
-  if (status === 'loading') return <p>Loading session...</p>;
+  const approve = async () => {
+    if (!target) return;
+    if (comment.trim().length < 10) {
+      setError('O comentário de aprovação precisa de ao menos 10 caracteres.');
+      return;
+    }
+    try {
+      await approveMutation.mutateAsync({
+        tenantId,
+        agentId: target.agentId,
+        versionId: target.versionId,
+        comment: comment.trim(),
+      });
+      setTarget(null);
+      setComment('');
+      setError(null);
+      void versionsQuery.refetch();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  if (status === 'loading') return <LoadingState label="Carregando sessão…" />;
+
+  const items = versionsQuery.data?.items ?? [];
 
   return (
-    <div className="space-y-6">
-      <header>
-        <h1 className="text-2xl font-bold">Identities</h1>
-        <p className="text-sm text-gray-600">
-          Operational profile versions per agent (
-          <code>agent_operational_profile_versions</code>). The <em>active</em>{' '}
-          row is what the agent is currently running. <em>proposed</em> rows
-          can be approved here — the previous active version is automatically
-          frozen in the same transaction.
-        </p>
-      </header>
+    <div>
+      <PageHeader
+        title="Identidades"
+        description="Versões de perfil operacional por agente. A linha ativa é o que o agente executa hoje; propostas podem ser aprovadas aqui — a versão anterior é congelada na mesma transação."
+      />
 
-      <div className="flex items-center gap-2 text-sm">
-        <span className="font-medium">Filter by agent:</span>
-        <select
-          value={agentId}
-          onChange={(e) => setAgentId(e.target.value)}
-          className="border rounded p-1"
-        >
-          <option value="">All</option>
-          {(agentsQuery.data?.items ?? []).map((a) => (
-            <option key={a.id} value={a.id}>
-              {a.id}
-            </option>
-          ))}
-        </select>
+      <div className="mb-5 max-w-xs">
+        <Field label="Filtrar por agente">
+          <Select value={agentId} onChange={(e) => setAgentId(e.target.value)}>
+            <option value="">Todos</option>
+            {(agentsQuery.data?.items ?? []).map((a) => (
+              <option key={a.id} value={a.id}>
+                {a.nome} ({a.id})
+              </option>
+            ))}
+          </Select>
+        </Field>
       </div>
 
       {versionsQuery.isLoading ? (
-        <p>Loading versions...</p>
+        <LoadingState label="Carregando versões…" />
       ) : versionsQuery.error ? (
-        <p className="text-red-600">Error: {versionsQuery.error.message}</p>
+        <ErrorState
+          message={versionsQuery.error.message}
+          onRetry={() => void versionsQuery.refetch()}
+        />
+      ) : items.length === 0 ? (
+        <EmptyState
+          title="Nenhuma versão de perfil"
+          description="Crie um agente para gerar a primeira versão de identidade."
+        />
       ) : (
-        <table className="w-full text-sm border-collapse">
-          <thead>
-            <tr className="bg-gray-100">
-              <th className="text-left p-2 border-b">Agent</th>
-              <th className="text-left p-2 border-b">Version</th>
-              <th className="text-left p-2 border-b">Status</th>
-              <th className="text-left p-2 border-b">ID</th>
-              <th className="text-left p-2 border-b">Created</th>
-              <th className="text-left p-2 border-b">Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {(versionsQuery.data?.items ?? []).map((v) => (
-              <tr key={v.id} className="border-b hover:bg-gray-50">
-                <td className="p-2 font-mono">{v.sot_id}</td>
-                <td className="p-2">v{v.version}</td>
-                <td className="p-2">
-                  <span
-                    className={
-                      v.status === 'active'
-                        ? 'px-2 py-0.5 bg-green-100 text-green-800 rounded text-xs'
-                        : v.status === 'proposed'
-                          ? 'px-2 py-0.5 bg-yellow-100 text-yellow-800 rounded text-xs'
-                          : v.status === 'frozen'
-                            ? 'px-2 py-0.5 bg-blue-100 text-blue-800 rounded text-xs'
-                            : 'px-2 py-0.5 bg-gray-100 text-gray-800 rounded text-xs'
-                    }
-                  >
-                    {v.status}
-                  </span>
-                </td>
-                <td className="p-2 font-mono text-xs">{v.id}</td>
-                <td className="p-2 text-gray-600">
-                  {new Date(v.created_at).toLocaleString()}
-                </td>
-                <td className="p-2">
-                  {v.status === 'proposed' && canApprove ? (
-                    <button
-                      onClick={() =>
-                        setApproveTarget({
-                          versionId: v.id,
-                          agentId: v.sot_id,
-                          version: v.version,
-                        })
-                      }
-                      className="text-blue-600 hover:underline"
+        <TableShell>
+          <Table>
+            <THead>
+              <Th>Agente</Th>
+              <Th>Versão</Th>
+              <Th>Status</Th>
+              <Th>Criada em</Th>
+              <Th className="text-right">Ações</Th>
+            </THead>
+            <tbody>
+              {items.map((v) => (
+                <Tr key={v.id}>
+                  <Td>
+                    <Link
+                      href={`/agents/${encodeURIComponent(v.sot_id)}`}
+                      className="font-mono text-xs font-medium text-brand-600 hover:underline"
                     >
-                      Approve & activate
-                    </button>
-                  ) : (
-                    <span className="text-gray-400">—</span>
-                  )}
-                </td>
-              </tr>
-            ))}
-            {(versionsQuery.data?.items ?? []).length === 0 && (
-              <tr>
-                <td colSpan={6} className="p-4 text-center text-gray-500">
-                  No operational profile versions yet.
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
+                      {v.sot_id}
+                    </Link>
+                  </Td>
+                  <Td className="font-medium">v{v.version}</Td>
+                  <Td>
+                    <StatusBadge status={v.status} />
+                  </Td>
+                  <Td className="text-zinc-600">
+                    {new Date(v.created_at).toLocaleString('pt-BR')}
+                  </Td>
+                  <Td className="text-right">
+                    {v.status === 'proposed' && canApprove ? (
+                      <Button
+                        size="sm"
+                        variant="success"
+                        onClick={() => {
+                          setError(null);
+                          setTarget({
+                            versionId: v.id,
+                            agentId: v.sot_id,
+                            version: v.version,
+                          });
+                        }}
+                      >
+                        Aprovar e ativar
+                      </Button>
+                    ) : (
+                      <span className="text-xs text-zinc-400">—</span>
+                    )}
+                  </Td>
+                </Tr>
+              ))}
+            </tbody>
+          </Table>
+        </TableShell>
       )}
 
-      {approveTarget && (
-        <ProfileApproveModal
-          tenantId={tenantId}
-          target={approveTarget}
-          onClose={(approved) => {
-            setApproveTarget(null);
-            if (approved) void versionsQuery.refetch();
-          }}
-        />
-      )}
+      <Modal
+        open={target !== null}
+        onClose={() => setTarget(null)}
+        title={`Aprovar e ativar v${target?.version ?? ''} — ${target?.agentId ?? ''}`}
+        description="A versão ativa atual (se houver) é congelada na mesma transação. A decisão é auditada."
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setTarget(null)}>
+              Cancelar
+            </Button>
+            <Button
+              variant="success"
+              onClick={() => void approve()}
+              loading={approveMutation.isPending}
+            >
+              Aprovar e ativar
+            </Button>
+          </>
+        }
+      >
+        <Field
+          label="Comentário (auditado)"
+          required
+          hint="Mínimo de 10 caracteres."
+          error={error}
+        >
+          <Textarea
+            value={comment}
+            onChange={(e) => setComment(e.target.value)}
+            rows={3}
+            placeholder="Ex.: Revisei papel, princípios e limites — aprovado para operação."
+          />
+        </Field>
+      </Modal>
     </div>
   );
 }

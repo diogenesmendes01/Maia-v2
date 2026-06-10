@@ -1,32 +1,42 @@
 'use client';
 
 /**
- * Admin UI — Tools Catalog screen (read-only).
+ * Admin UI — catálogo de Ferramentas (somente leitura).
  *
- * Surfaces every tool the LLM can call: description, side-effect, whether it's
- * currently enabled (and which feature flag gates it when off), whether it's
- * `sensitive` (view-once outputs like balances), and its input fields. Answers
- * the operator question "what can Maia do, and how?".
+ * Exibe toda ferramenta que o LLM pode chamar: descrição, efeito colateral,
+ * se está habilitada (e qual feature flag a controla quando desligada), se é
+ * `sensitive` (saídas de visualização única, ex. saldos) e seus campos de
+ * entrada. Responde a pergunta do operador: "o que a Maia pode fazer, e como?".
  *
- * Server-only boundary (spec §1.2): this page imports NOTHING from
- * `@/tools/*`. It consumes the serialized JSON from
- * `trpc.toolsCatalog.listCatalog` only — the tool handlers (and their DB / LLM
- * imports) stay on the server. Do not add a direct registry import here.
+ * Fronteira server-only (spec §1.2): esta página NÃO importa nada de
+ * `@/tools/*`. Consome apenas o JSON serializado de
+ * `trpc.toolsCatalog.listCatalog` — os handlers (e seus imports de DB / LLM)
+ * ficam no servidor. Não adicione import direto do registry aqui.
  */
 
 import * as React from 'react';
 import { trpc } from '../../trpc/client.js';
+import { PageHeader } from '../../components/ui/page-header.js';
+import { Badge } from '../../components/ui/badge.js';
+import { Card, CardBody } from '../../components/ui/card.js';
+import { Field, Input, Select } from '../../components/ui/field.js';
+import {
+  LoadingState,
+  ErrorState,
+  EmptyState,
+} from '../../components/ui/states.js';
+import { IconWrench } from '../../components/ui/icons.js';
 
 type SideEffect = 'read' | 'write' | 'communication' | 'none';
 
-// Read-heavy at the top (spec §1.4): read → write → communication → none.
+// Leitura primeiro (spec §1.4): read → write → communication → none.
 const SIDE_EFFECT_ORDER: SideEffect[] = ['read', 'write', 'communication', 'none'];
 
 const SIDE_EFFECT_LABEL: Record<SideEffect, string> = {
-  read: 'Read',
-  write: 'Write',
-  communication: 'Communication',
-  none: 'No side effect',
+  read: 'Leitura',
+  write: 'Escrita',
+  communication: 'Comunicação',
+  none: 'Sem efeito colateral',
 };
 
 type CatalogTool = {
@@ -65,7 +75,8 @@ export default function ToolsCatalogPage() {
     });
   }, [tools, search, sideEffectFilter, enabledOnly, sensitiveOnly]);
 
-  // Group the filtered tools by side_effect, preserving the read-heavy order.
+  // Agrupa as ferramentas filtradas por side_effect, preservando a ordem
+  // "leitura primeiro".
   const groups = React.useMemo(() => {
     const byEffect = new Map<string, CatalogTool[]>();
     for (const t of filtered) {
@@ -81,7 +92,7 @@ export default function ToolsCatalogPage() {
         byEffect.delete(key);
       }
     }
-    // Any side_effect value not in the known set (defensive) gets appended.
+    // Qualquer side_effect fora do conjunto conhecido (defensivo) vai ao final.
     for (const [key, items] of byEffect.entries()) {
       ordered.push({ key, label: key, items });
     }
@@ -89,81 +100,93 @@ export default function ToolsCatalogPage() {
   }, [filtered]);
 
   return (
-    <div className="space-y-6">
-      <header>
-        <h1 className="text-2xl font-bold">Tools</h1>
-        <p className="text-sm text-gray-600">
-          Read-only catalog of every tool the agent can call. Tools are defined
-          in code and are global (not tenant-scoped). A tool gated by a disabled
-          feature flag is shown as <span className="font-medium">disabled</span>{' '}
-          with the flag that turns it on.
-        </p>
-      </header>
+    <div>
+      <PageHeader
+        title="Ferramentas"
+        description={
+          <>
+            Catálogo somente leitura de toda ferramenta que o agente pode chamar.
+            Ferramentas são definidas em código e globais (não escopadas por
+            tenant). Uma ferramenta controlada por feature flag desligada aparece
+            como <span className="font-medium">desabilitada</span>, com a flag que
+            a liga.
+          </>
+        }
+      />
 
       {q.isLoading ? (
-        <p>Loading tools...</p>
+        <LoadingState label="Carregando ferramentas…" />
       ) : q.error ? (
-        <p className="text-red-600">Error: {q.error.message}</p>
+        <ErrorState message={q.error.message} onRetry={() => void q.refetch()} />
       ) : tools.length === 0 ? (
-        <p className="text-gray-500 text-sm">No tools registered.</p>
+        <EmptyState
+          icon={<IconWrench size={36} />}
+          title="Nenhuma ferramenta registrada"
+        />
       ) : (
-        <>
-          <div className="flex flex-wrap items-center gap-4 text-sm">
-            <input
-              type="search"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search name or description…"
-              aria-label="Search tools"
-              className="border rounded p-2 w-64"
-            />
-            <label className="flex items-center gap-1">
-              <span className="font-medium">Side effect:</span>
-              <select
-                value={sideEffectFilter}
-                onChange={(e) =>
-                  setSideEffectFilter(e.target.value as 'all' | SideEffect)
-                }
-                className="border rounded p-1"
-              >
-                <option value="all">All</option>
-                {SIDE_EFFECT_ORDER.map((s) => (
-                  <option key={s} value={s}>
-                    {SIDE_EFFECT_LABEL[s]}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="flex items-center gap-1">
-              <input
-                type="checkbox"
-                checked={enabledOnly}
-                onChange={(e) => setEnabledOnly(e.target.checked)}
-              />
-              Enabled only
-            </label>
-            <label className="flex items-center gap-1">
-              <input
-                type="checkbox"
-                checked={sensitiveOnly}
-                onChange={(e) => setSensitiveOnly(e.target.checked)}
-              />
-              Sensitive only
-            </label>
-            <span className="text-gray-500">
-              {filtered.length} of {tools.length} tool(s)
-            </span>
-          </div>
+        <div className="space-y-6">
+          <Card>
+            <CardBody className="flex flex-wrap items-end gap-4">
+              <Field label="Buscar" className="w-64">
+                <Input
+                  type="search"
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  placeholder="Nome ou descrição…"
+                  aria-label="Buscar ferramentas"
+                />
+              </Field>
+              <Field label="Efeito colateral" className="w-52">
+                <Select
+                  value={sideEffectFilter}
+                  onChange={(e) =>
+                    setSideEffectFilter(e.target.value as 'all' | SideEffect)
+                  }
+                >
+                  <option value="all">Todos</option>
+                  {SIDE_EFFECT_ORDER.map((s) => (
+                    <option key={s} value={s}>
+                      {SIDE_EFFECT_LABEL[s]}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+              <label className="flex h-9 items-center gap-2 text-sm text-zinc-700">
+                <input
+                  type="checkbox"
+                  checked={enabledOnly}
+                  onChange={(e) => setEnabledOnly(e.target.checked)}
+                  className="h-4 w-4 rounded border-zinc-300 text-brand-600 focus:ring-brand-500"
+                />
+                Somente habilitadas
+              </label>
+              <label className="flex h-9 items-center gap-2 text-sm text-zinc-700">
+                <input
+                  type="checkbox"
+                  checked={sensitiveOnly}
+                  onChange={(e) => setSensitiveOnly(e.target.checked)}
+                  className="h-4 w-4 rounded border-zinc-300 text-brand-600 focus:ring-brand-500"
+                />
+                Somente sensíveis
+              </label>
+              <span className="flex h-9 items-center text-xs text-zinc-500">
+                {filtered.length} de {tools.length} ferramenta(s)
+              </span>
+            </CardBody>
+          </Card>
 
           {filtered.length === 0 ? (
-            <p className="text-gray-500 text-sm">No tools match the filters.</p>
+            <EmptyState
+              icon={<IconWrench size={36} />}
+              title="Nenhuma ferramenta corresponde aos filtros"
+            />
           ) : (
             <div className="space-y-8">
               {groups.map((group) => (
                 <section key={group.key} className="space-y-3">
-                  <h2 className="text-lg font-semibold border-b pb-1">
-                    {group.label}{' '}
-                    <span className="text-sm font-normal text-gray-500">
+                  <h2 className="flex items-baseline gap-2 border-b border-zinc-200 pb-2 text-base font-semibold text-zinc-900">
+                    {group.label}
+                    <span className="text-xs font-normal text-zinc-500">
                       ({group.items.length})
                     </span>
                   </h2>
@@ -176,76 +199,62 @@ export default function ToolsCatalogPage() {
               ))}
             </div>
           )}
-        </>
+        </div>
       )}
     </div>
   );
 }
 
-function Badge({
-  label,
-  className,
-}: {
-  label: string;
-  className: string;
-}) {
-  return (
-    <span className={`px-2 py-0.5 rounded text-xs font-medium ${className}`}>
-      {label}
-    </span>
-  );
-}
-
 function ToolCard({ tool }: { tool: CatalogTool }) {
   return (
-    <div className="border rounded p-4 space-y-2">
-      <div className="flex flex-wrap items-center gap-2">
-        <code className="font-semibold text-sm">{tool.name}</code>
-        <Badge
-          label={tool.side_effect}
-          className="bg-gray-100 text-gray-700"
-        />
-        {tool.enabled ? (
-          <Badge label="enabled" className="bg-green-100 text-green-800" />
-        ) : (
-          <Badge
-            label={
-              tool.feature_flag
-                ? `disabled — ${tool.feature_flag}`
-                : 'disabled'
-            }
-            className="bg-gray-200 text-gray-600"
-          />
-        )}
-        {tool.sensitive && (
-          <Badge label="sensitive" className="bg-amber-100 text-amber-800" />
-        )}
-      </div>
+    <Card>
+      <CardBody className="space-y-2.5">
+        <div className="flex flex-wrap items-center gap-2">
+          <code className="font-mono text-sm font-semibold text-zinc-900">
+            {tool.name}
+          </code>
+          <Badge tone="neutral">{tool.side_effect}</Badge>
+          {tool.enabled ? (
+            <Badge tone="success">habilitada</Badge>
+          ) : (
+            <Badge tone="neutral">
+              {tool.feature_flag
+                ? `desabilitada — ${tool.feature_flag}`
+                : 'desabilitada'}
+            </Badge>
+          )}
+          {tool.sensitive && <Badge tone="warning">sensível</Badge>}
+        </div>
 
-      <p className="text-sm text-gray-700">{tool.description}</p>
+        <p className="text-sm leading-relaxed text-zinc-700">{tool.description}</p>
 
-      <details className="text-sm">
-        <summary className="cursor-pointer text-gray-600">
-          Inputs ({tool.inputs.length})
-        </summary>
-        {tool.inputs.length === 0 ? (
-          <p className="mt-2 pl-4 text-xs text-gray-500">No input fields.</p>
-        ) : (
-          <ul className="mt-2 pl-4 border-l-2 border-gray-200 space-y-1">
-            {tool.inputs.map((field) => (
-              <li key={field.name} className="text-xs">
-                <code className="font-medium">{field.name}</code>{' '}
-                <span className="text-gray-500">· {field.type}</span>
-                {field.optional ? (
-                  <span className="text-gray-400"> · optional</span>
-                ) : (
-                  <span className="text-gray-600"> · required</span>
-                )}
-              </li>
-            ))}
-          </ul>
-        )}
-      </details>
-    </div>
+        <details className="text-sm">
+          <summary className="cursor-pointer text-xs font-medium text-zinc-500 hover:text-zinc-700">
+            Entradas ({tool.inputs.length})
+          </summary>
+          {tool.inputs.length === 0 ? (
+            <p className="mt-2 pl-4 text-xs text-zinc-500">
+              Nenhum campo de entrada.
+            </p>
+          ) : (
+            <ul className="mt-2 space-y-1 border-l-2 border-zinc-200 pl-4">
+              {tool.inputs.map((field) => (
+                <li key={field.name} className="text-xs">
+                  <code className="font-mono font-medium text-zinc-800">
+                    {field.name}
+                  </code>{' '}
+                  <span className="text-zinc-500">· {field.type}</span>
+                  {field.optional ? (
+                    <span className="text-zinc-400"> · opcional</span>
+                  ) : (
+                    <span className="text-zinc-600"> · obrigatório</span>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+        </details>
+      </CardBody>
+    </Card>
   );
 }

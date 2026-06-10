@@ -8,9 +8,15 @@
 
 | Path | Role |
 |---|---|
-| `src/admin-ui/src/server/routers/` | 16 tRPC routers (governance surface) |
-| `src/admin-ui/src/pages/` or `app/` | Next.js routes |
-| `src/admin-ui/next.config.js` | Build configuration |
+| `src/admin-ui/trpc/routers/` | 16 tRPC routers (governance surface) |
+| `src/admin-ui/app/` | Next.js App Router pages (pt-BR, agent-first IA) |
+| `src/admin-ui/components/ui/` | Design-system primitives (Button, Card, Field, Table, Modal, …) |
+| `src/admin-ui/components/layout/` | App shell: dark sidebar + nav config (`nav.ts` is the IA source of truth) |
+| `src/admin-ui/next.config.mjs` | Build configuration |
+
+### UI architecture (2026-06 redesign)
+
+The visual layer was rebuilt agent-first: `/agents` is the hub (cards), `/agents/new` is a 4-step wizard, and `/agents/[agentId]` concentrates configuration (overview / profile editor / version approval) per agent. All pages compose the primitives in `components/ui/` — no page hand-rolls form controls, tables, or modals. The tRPC routers were preserved as the data layer; the only router addition was the read-only `agents.getProfileVersions` (active + proposed profile bodies for the prefilled editor). Legacy `/setup/agents` redirects to `/agents`.
 
 ### tRPC routers
 

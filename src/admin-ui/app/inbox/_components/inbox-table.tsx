@@ -1,31 +1,36 @@
 'use client';
 
 import * as React from 'react';
-import Link from 'next/link';
-import {
-  useReactTable,
-  getCoreRowModel,
-  flexRender,
-  type ColumnDef,
-} from '@tanstack/react-table';
+import { useRouter } from 'next/navigation';
 import type { ProposalRow } from '../../../trpc/types.js';
 import { formatRelativeAge } from '../../../lib/format.js';
-import { getDisplayName } from '../../../lib/proposal-type-registry.js';
+import { TableShell, Table, THead, Th, Tr, Td } from '../../../components/ui/table.js';
+import { StatusBadge } from '../../../components/ui/badge.js';
+import { EmptyState } from '../../../components/ui/states.js';
+import { IconInbox, IconChevronRight } from '../../../components/ui/icons.js';
+import { TYPE_LABELS } from './labels.js';
 
 interface Props {
   proposals: ProposalRow[];
+  /** Whether the current role may bulk-reject (shows the checkbox column). */
+  selectable: boolean;
   selectedIds: string[];
   onSelectionChange: (ids: string[]) => void;
 }
 
-const RISK_CLASS: Record<ProposalRow['risk'], string> = {
-  low: 'bg-green-100 text-green-800',
-  medium: 'bg-yellow-100 text-yellow-800',
-  high: 'bg-orange-100 text-orange-800',
-  critical: 'bg-red-100 text-red-800',
-};
+/**
+ * Fila de propostas pendentes. Clique na linha abre o detalhe; o checkbox
+ * (apenas para papéis com permissão de rejeição em massa) seleciona para a
+ * barra de ação em lote.
+ */
+export default function InboxTable({
+  proposals,
+  selectable,
+  selectedIds,
+  onSelectionChange,
+}: Props) {
+  const router = useRouter();
 
-export default function InboxTable({ proposals, selectedIds, onSelectionChange }: Props) {
   const allSelected = proposals.length > 0 && selectedIds.length === proposals.length;
   const toggleAll = () => {
     onSelectionChange(allSelected ? [] : proposals.map((p) => p.id));
@@ -38,99 +43,85 @@ export default function InboxTable({ proposals, selectedIds, onSelectionChange }
     }
   };
 
-  const columns = React.useMemo<ColumnDef<ProposalRow>[]>(
-    () => [
-      {
-        id: 'select',
-        header: () => (
-          <input type="checkbox" checked={allSelected} onChange={toggleAll} aria-label="Select all" />
-        ),
-        cell: ({ row }) => (
-          <input
-            type="checkbox"
-            checked={selectedIds.includes(row.original.id)}
-            onChange={() => toggleOne(row.original.id)}
-            aria-label={`Select ${row.original.descriptor}`}
-          />
-        ),
-      },
-      {
-        accessorKey: 'type',
-        header: 'Type',
-        cell: ({ getValue }) => (
-          <span className="font-medium">{getDisplayName(getValue<ProposalRow['type']>())}</span>
-        ),
-      },
-      {
-        accessorKey: 'descriptor',
-        header: 'Descriptor',
-        cell: ({ row }) => (
-          <Link
-            href={`/proposals/${row.original.id}`}
-            className="text-blue-700 hover:underline"
-          >
-            {row.original.descriptor}
-          </Link>
-        ),
-      },
-      {
-        accessorKey: 'risk',
-        header: 'Risk',
-        cell: ({ getValue }) => {
-          const r = getValue<ProposalRow['risk']>();
-          return (
-            <span className={`px-2 py-0.5 rounded text-xs font-medium ${RISK_CLASS[r]}`}>{r}</span>
-          );
-        },
-      },
-      { accessorKey: 'source', header: 'Source' },
-      {
-        accessorKey: 'proposed_at',
-        header: 'Age',
-        cell: ({ getValue }) => formatRelativeAge(getValue<Date>()),
-      },
-    ],
-    [selectedIds, allSelected, proposals.length],
-  );
-
-  const table = useReactTable({
-    data: proposals,
-    columns,
-    getCoreRowModel: getCoreRowModel(),
-  });
-
   if (proposals.length === 0) {
     return (
-      <div className="border-2 border-dashed border-gray-300 p-8 text-center text-gray-500 rounded">
-        No pending proposals. Inbox zero.
-      </div>
+      <EmptyState
+        icon={<IconInbox size={36} />}
+        title="Nenhuma proposta pendente"
+        description="Caixa de entrada zerada. Novas propostas dos agentes aparecem aqui assim que forem submetidas para revisão."
+      />
     );
   }
 
   return (
-    <table className="w-full border-collapse text-sm">
-      <thead>
-        {table.getHeaderGroups().map((hg) => (
-          <tr key={hg.id} className="border-b-2 border-gray-300 bg-gray-50">
-            {hg.headers.map((h) => (
-              <th key={h.id} className="p-2 text-left font-semibold">
-                {h.isPlaceholder ? null : flexRender(h.column.columnDef.header, h.getContext())}
-              </th>
-            ))}
-          </tr>
-        ))}
-      </thead>
-      <tbody>
-        {table.getRowModel().rows.map((row) => (
-          <tr key={row.id} className="border-b hover:bg-gray-50">
-            {row.getVisibleCells().map((cell) => (
-              <td key={cell.id} className="p-2">
-                {flexRender(cell.column.columnDef.cell, cell.getContext())}
-              </td>
-            ))}
-          </tr>
-        ))}
-      </tbody>
-    </table>
+    <TableShell>
+      <Table>
+        <THead>
+          {selectable && (
+            <Th className="w-10">
+              <input
+                type="checkbox"
+                checked={allSelected}
+                onChange={toggleAll}
+                aria-label="Selecionar todas"
+                className="h-4 w-4 rounded border-zinc-300 text-brand-600 focus:ring-brand-500"
+              />
+            </Th>
+          )}
+          <Th>Proposta</Th>
+          <Th>Tipo</Th>
+          <Th>Risco</Th>
+          <Th>Agente</Th>
+          <Th>Origem</Th>
+          <Th>Idade</Th>
+          <Th>Status</Th>
+          <Th className="w-8" aria-label="Abrir" />
+        </THead>
+        <tbody>
+          {proposals.map((p) => (
+            <Tr
+              key={p.id}
+              onClick={() => router.push(`/proposals/${p.id}`)}
+              className="cursor-pointer"
+            >
+              {selectable && (
+                <Td onClick={(e) => e.stopPropagation()} className="w-10">
+                  <input
+                    type="checkbox"
+                    checked={selectedIds.includes(p.id)}
+                    onChange={() => toggleOne(p.id)}
+                    aria-label={`Selecionar ${p.descriptor}`}
+                    className="h-4 w-4 rounded border-zinc-300 text-brand-600 focus:ring-brand-500"
+                  />
+                </Td>
+              )}
+              <Td className="max-w-xs">
+                <span className="block truncate font-medium text-zinc-900">
+                  {p.descriptor}
+                </span>
+              </Td>
+              <Td className="text-zinc-600">{TYPE_LABELS[p.type]}</Td>
+              <Td>
+                <StatusBadge status={p.risk} />
+              </Td>
+              <Td className="font-mono text-xs text-zinc-600">{p.proposed_by}</Td>
+              <Td className="font-mono text-xs text-zinc-600">{p.source}</Td>
+              <Td
+                className="whitespace-nowrap text-zinc-500"
+                title={new Date(p.proposed_at).toLocaleString('pt-BR')}
+              >
+                {formatRelativeAge(p.proposed_at)}
+              </Td>
+              <Td>
+                <StatusBadge status={p.status} />
+              </Td>
+              <Td className="w-8 text-zinc-300">
+                <IconChevronRight size={14} />
+              </Td>
+            </Tr>
+          ))}
+        </tbody>
+      </Table>
+    </TableShell>
   );
 }

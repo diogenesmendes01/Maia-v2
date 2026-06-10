@@ -3,8 +3,33 @@
 import * as React from 'react';
 import { useSession } from 'next-auth/react';
 import { trpc } from '../../trpc/client.js';
+import { PageHeader } from '../../components/ui/page-header.js';
+import { Field, Select } from '../../components/ui/field.js';
+import { StatusBadge } from '../../components/ui/badge.js';
+import {
+  TableShell,
+  Table,
+  THead,
+  Th,
+  Tr,
+  Td,
+} from '../../components/ui/table.js';
+import {
+  LoadingState,
+  ErrorState,
+  EmptyState,
+} from '../../components/ui/states.js';
+import { IconLayers } from '../../components/ui/icons.js';
 
 type ProcStatus = 'draft' | 'proposed' | 'active' | 'frozen' | 'rolled_back';
+
+const STATUS_OPTIONS: ProcStatus[] = [
+  'active',
+  'proposed',
+  'frozen',
+  'rolled_back',
+  'draft',
+];
 
 export default function ProceduresPage() {
   const { data: session, status } = useSession();
@@ -23,82 +48,91 @@ export default function ProceduresPage() {
     { enabled: tenantId !== '' && agentId !== '' },
   );
 
-  if (status === 'loading') return <p>Loading session...</p>;
+  if (status === 'loading') return <LoadingState label="Carregando sessão…" />;
+
+  const items = defsQuery.data?.items ?? [];
 
   return (
-    <div className="space-y-6">
-      <header>
-        <h1 className="text-2xl font-bold">Procedures</h1>
-        <p className="text-sm text-gray-600">
-          Procedure definitions per agent (
-          <code>procedure_definitions</code>), filtered by lifecycle status.
-        </p>
-      </header>
+    <div>
+      <PageHeader
+        title="Procedures"
+        description={
+          <>
+            Definições de procedures por agente (
+            <code className="font-mono text-xs">procedure_definitions</code>),
+            filtradas por status de ciclo de vida.
+          </>
+        }
+      />
 
-      <div className="flex items-center gap-3 text-sm">
-        <span className="font-medium">Agent:</span>
-        <select
-          value={agentId}
-          onChange={(e) => setAgentId(e.target.value)}
-          className="border rounded p-1"
-        >
-          <option value="">Select…</option>
-          {(agentsQuery.data?.items ?? []).map((a) => (
-            <option key={a.id} value={a.id}>
-              {a.id}
-            </option>
-          ))}
-        </select>
-        <span className="font-medium ml-3">Status:</span>
-        <select
-          value={procStatus}
-          onChange={(e) => setProcStatus(e.target.value as ProcStatus)}
-          className="border rounded p-1"
-        >
-          <option value="active">active</option>
-          <option value="proposed">proposed</option>
-          <option value="frozen">frozen</option>
-          <option value="rolled_back">rolled_back</option>
-          <option value="draft">draft</option>
-        </select>
+      <div className="mb-4 flex flex-wrap gap-3">
+        <Field label="Agente" className="w-64">
+          <Select value={agentId} onChange={(e) => setAgentId(e.target.value)}>
+            <option value="">Selecione…</option>
+            {(agentsQuery.data?.items ?? []).map((a) => (
+              <option key={a.id} value={a.id}>
+                {a.nome} ({a.id})
+              </option>
+            ))}
+          </Select>
+        </Field>
+        <Field label="Status" className="w-44">
+          <Select
+            value={procStatus}
+            onChange={(e) => setProcStatus(e.target.value as ProcStatus)}
+          >
+            {STATUS_OPTIONS.map((s) => (
+              <option key={s} value={s}>
+                {s}
+              </option>
+            ))}
+          </Select>
+        </Field>
       </div>
 
       {!agentId ? (
-        <p className="text-gray-500 text-sm">Pick an agent.</p>
+        <EmptyState
+          icon={<IconLayers size={28} />}
+          title="Selecione um agente"
+          description="Escolha um agente acima para listar suas procedures."
+        />
       ) : defsQuery.isLoading ? (
-        <p>Loading procedures...</p>
+        <LoadingState label="Carregando procedures…" />
       ) : defsQuery.error ? (
-        <p className="text-red-600">Error: {defsQuery.error.message}</p>
+        <ErrorState
+          message={defsQuery.error.message}
+          onRetry={() => void defsQuery.refetch()}
+        />
+      ) : items.length === 0 ? (
+        <EmptyState
+          icon={<IconLayers size={28} />}
+          title="Nenhuma procedure neste status"
+        />
       ) : (
-        <table className="w-full text-sm border-collapse">
-          <thead>
-            <tr className="bg-gray-100">
-              <th className="text-left p-2 border-b">Name</th>
-              <th className="text-left p-2 border-b">Version</th>
-              <th className="text-left p-2 border-b">Status</th>
-              <th className="text-left p-2 border-b">Created</th>
-            </tr>
-          </thead>
-          <tbody>
-            {(defsQuery.data?.items ?? []).map((p) => (
-              <tr key={p.id} className="border-b hover:bg-gray-50">
-                <td className="p-2 font-mono">{p.nome}</td>
-                <td className="p-2">v{p.version_number}</td>
-                <td className="p-2">{p.status}</td>
-                <td className="p-2 text-gray-600">
-                  {new Date(p.created_at).toLocaleString()}
-                </td>
-              </tr>
-            ))}
-            {(defsQuery.data?.items ?? []).length === 0 && (
-              <tr>
-                <td colSpan={4} className="p-4 text-center text-gray-500">
-                  No procedures in this status.
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
+        <TableShell>
+          <Table>
+            <THead>
+              <Th>Nome</Th>
+              <Th>Versão</Th>
+              <Th>Status</Th>
+              <Th>Criada em</Th>
+            </THead>
+            <tbody>
+              {items.map((p) => (
+                <Tr key={p.id}>
+                  <Td className="font-mono text-xs text-zinc-700">{p.nome}</Td>
+                  <Td className="tabular-nums">v{p.version_number}</Td>
+                  <Td>
+                    <StatusBadge status={p.status} />
+                  </Td>
+                  <Td className="text-zinc-600">
+                    {new Date(p.created_at).toLocaleString('pt-BR')}
+                  </Td>
+                </Tr>
+              ))}
+            </tbody>
+          </Table>
+        </TableShell>
       )}
     </div>
   );

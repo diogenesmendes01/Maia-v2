@@ -2,14 +2,24 @@
 
 import * as React from 'react';
 import { trpc } from '../../../trpc/client.js';
+import { Modal } from '../../../components/ui/modal.js';
+import { Button } from '../../../components/ui/button.js';
+import { Field, Textarea } from '../../../components/ui/field.js';
+import { Alert } from '../../../components/ui/states.js';
 
 interface Props {
+  open: boolean;
   tenantId: string;
   ids: string[];
   onClose: () => void;
 }
 
-export default function BulkRejectModal({ tenantId, ids, onClose }: Props) {
+/**
+ * Rejeição em massa. O servidor só rejeita propostas elegíveis
+ * (risco baixo + sem trava de arquitetura); as demais são puladas e
+ * reportadas em `skipped_ids`.
+ */
+export default function BulkRejectModal({ open, tenantId, ids, onClose }: Props) {
   const [comment, setComment] = React.useState('');
   const [error, setError] = React.useState<string | null>(null);
   const mutation = trpc.inbox.bulkReject.useMutation();
@@ -17,17 +27,16 @@ export default function BulkRejectModal({ tenantId, ids, onClose }: Props) {
   const handleSubmit = async () => {
     setError(null);
     if (comment.trim().length < 10) {
-      setError('Comment must be at least 10 characters.');
+      setError('O comentário deve ter pelo menos 10 caracteres.');
       return;
     }
     try {
       const result = await mutation.mutateAsync({ tenantId, ids, comment });
-      // Surface skipped ids if any
+      // Surface skipped ids if any, then auto-close.
       if (result.skipped_ids.length > 0) {
         setError(
-          `${result.rejected_count} rejected. ${result.skipped_ids.length} skipped (risk too high or locked).`,
+          `${result.rejected_count} rejeitada(s). ${result.skipped_ids.length} pulada(s) (risco alto demais ou com trava de arquitetura).`,
         );
-        // Auto-close after 2.5s
         setTimeout(onClose, 2500);
       } else {
         onClose();
@@ -38,38 +47,41 @@ export default function BulkRejectModal({ tenantId, ids, onClose }: Props) {
   };
 
   return (
-    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-      <div className="bg-white p-6 rounded shadow-lg w-[480px] max-w-full">
-        <h2 className="text-lg font-bold mb-2">Bulk reject {ids.length} proposals?</h2>
-        <p className="text-sm text-gray-600 mb-3">
-          Only risk=low + non-locked proposals will be rejected. Comment is required (min 10 chars)
-          and recorded in the audit log.
-        </p>
-        <textarea
-          value={comment}
-          onChange={(e) => setComment(e.target.value)}
-          placeholder="Why reject these proposals?"
-          rows={4}
-          className="w-full p-2 border rounded mb-2 text-sm"
-        />
-        {error && <p className="text-sm text-red-600 mb-2">{error}</p>}
-        <div className="flex gap-2 justify-end">
-          <button
-            onClick={onClose}
-            disabled={mutation.isPending}
-            className="px-4 py-2 bg-gray-200 rounded hover:bg-gray-300 disabled:opacity-50"
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={`Rejeitar ${ids.length} proposta(s) em massa?`}
+      description="Apenas propostas de risco baixo e sem trava de arquitetura serão rejeitadas; as demais são puladas."
+      footer={
+        <>
+          <Button variant="secondary" onClick={onClose} disabled={mutation.isPending}>
+            Cancelar
+          </Button>
+          <Button
+            variant="danger"
+            onClick={() => void handleSubmit()}
+            loading={mutation.isPending}
           >
-            Cancel
-          </button>
-          <button
-            onClick={handleSubmit}
-            disabled={mutation.isPending}
-            className="px-4 py-2 bg-red-600 text-white rounded hover:bg-red-700 disabled:opacity-50"
-          >
-            {mutation.isPending ? 'Rejecting...' : 'Confirm reject'}
-          </button>
-        </div>
+            Confirmar rejeição
+          </Button>
+        </>
+      }
+    >
+      <div className="space-y-3">
+        <Field
+          label="Motivo da rejeição"
+          required
+          hint="Mínimo de 10 caracteres. O comentário fica registrado na trilha de auditoria."
+        >
+          <Textarea
+            value={comment}
+            onChange={(e) => setComment(e.target.value)}
+            placeholder="Por que rejeitar estas propostas?"
+            rows={4}
+          />
+        </Field>
+        {error && <Alert tone="warning">{error}</Alert>}
       </div>
-    </div>
+    </Modal>
   );
 }

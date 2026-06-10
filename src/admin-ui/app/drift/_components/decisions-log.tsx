@@ -1,61 +1,61 @@
 'use client';
 
 import * as React from 'react';
-import { formatDate } from '../../../lib/format.js';
+import { StatusBadge } from '../../../components/ui/badge.js';
+import {
+  TableShell,
+  Table,
+  THead,
+  Th,
+  Tr,
+  Td,
+} from '../../../components/ui/table.js';
+import { EmptyState } from '../../../components/ui/states.js';
+import { IconAlertTriangle } from '../../../components/ui/icons.js';
 
 interface DriftItem {
   id: string;
   drift_type: string;
   severity: string;
   decision: string | null;
-  // tRPC over HTTP serializes Dates as ISO strings; accept both shapes so
-  // server-side handlers and JSON responses both type-check cleanly.
+  // tRPC sobre HTTP serializa Date como string ISO — aceitar ambas as formas.
   detected_at: Date | string;
 }
-
-const SEVERITY_CLASS: Record<string, string> = {
-  low: 'bg-green-100 text-green-800',
-  medium: 'bg-yellow-100 text-yellow-800',
-  high: 'bg-orange-100 text-orange-800',
-  critical: 'bg-red-100 text-red-800',
-};
 
 export default function DecisionsLog({ items }: { items: DriftItem[] }) {
   if (items.length === 0) {
     return (
-      <div className="border-2 border-dashed border-gray-300 p-6 text-center text-gray-500 rounded">
-        No drift alerts. Detector quiescent.
-      </div>
+      <EmptyState
+        icon={<IconAlertTriangle size={28} />}
+        title="Nenhum alerta de drift"
+        description="Detector quiescente — nenhum desvio de comportamento registrado."
+      />
     );
   }
   return (
-    <table className="w-full border-collapse text-sm">
-      <thead>
-        <tr className="border-b-2 border-gray-300 bg-gray-50">
-          <th className="p-2 text-left">Drift type</th>
-          <th className="p-2 text-left">Severity</th>
-          <th className="p-2 text-left">Decision</th>
-          <th className="p-2 text-left">Detected</th>
-        </tr>
-      </thead>
-      <tbody>
-        {items.map((d) => (
-          <tr key={d.id} className="border-b">
-            <td className="p-2"><code>{d.drift_type}</code></td>
-            <td className="p-2">
-              <span
-                className={`px-2 py-0.5 rounded text-xs ${
-                  SEVERITY_CLASS[d.severity] ?? 'bg-gray-100'
-                }`}
-              >
-                {d.severity}
-              </span>
-            </td>
-            <td className="p-2 capitalize">{d.decision ?? 'pending'}</td>
-            <td className="p-2">{formatDate(d.detected_at)}</td>
-          </tr>
-        ))}
-      </tbody>
-    </table>
+    <TableShell>
+      <Table>
+        <THead>
+          <Th>Tipo de drift</Th>
+          <Th>Severidade</Th>
+          <Th>Decisão</Th>
+          <Th>Detectado em</Th>
+        </THead>
+        <tbody>
+          {items.map((d) => (
+            <Tr key={d.id}>
+              <Td className="font-mono text-xs text-zinc-700">{d.drift_type}</Td>
+              <Td>
+                <StatusBadge status={d.severity} />
+              </Td>
+              <Td className="capitalize">{d.decision ?? 'pendente'}</Td>
+              <Td className="text-zinc-600">
+                {new Date(d.detected_at).toLocaleString('pt-BR')}
+              </Td>
+            </Tr>
+          ))}
+        </tbody>
+      </Table>
+    </TableShell>
   );
 }

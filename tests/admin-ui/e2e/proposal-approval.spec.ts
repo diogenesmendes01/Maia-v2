@@ -11,17 +11,17 @@ test.describe('Proposal Approval — single role', () => {
 
   test('approve flow shows modal + records audit', async ({ page }) => {
     await page.goto('http://localhost:4000/proposals/test-id');
-    await page.click('text=Approve');
+    await page.getByRole('button', { name: 'Aprovar', exact: true }).click();
     await page.fill('textarea', 'Approved after review of all impacted artifacts.');
-    await page.click('text=Confirm approve');
-    await expect(page.locator('text=Approve proposal?')).not.toBeVisible();
+    await page.click('text=Confirmar aprovação');
+    await expect(page.locator('text=Aprovar proposta?')).not.toBeVisible();
   });
 
   test('reject requires comment ≥ 10 chars', async ({ page }) => {
     await page.goto('http://localhost:4000/proposals/test-id');
-    await page.click('text=Reject');
+    await page.getByRole('button', { name: 'Rejeitar', exact: true }).click();
     await page.fill('textarea', 'no');
-    await page.click('text=Confirm reject');
-    await expect(page.locator('text=at least 10 characters')).toBeVisible();
+    await page.click('text=Confirmar rejeição');
+    await expect(page.locator('text=pelo menos 10 caracteres')).toBeVisible();
   });
 });

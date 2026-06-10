@@ -187,6 +187,8 @@ npm run dev          # → http://localhost:4000
 
 É o **plano de governança** da plataforma — onde o owner aprova evolução, audita comportamento e administra a operação.
 
+> **Redesign 2026-06 (PR #460):** UI reconstruída com design system próprio (`src/admin-ui/components/ui/`), navegação agent-first em pt-BR e a experiência central em `/agents` → `/agents/new` (wizard) → `/agents/[agentId]` (perfil editável + aprovação de versões). Routers tRPC inalterados.
+
 | Área                  | O que faz                                                                           | Router tRPC                                                                                    |
 | --------------------- | ----------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
 | **Aprovações**        | Capability proposals, identity proposals, dual-approval flow                        | `proposals`, `capabilities`                                                                    |

@@ -4,7 +4,22 @@ import * as React from 'react';
 import Link from 'next/link';
 import { useSession } from 'next-auth/react';
 import { trpc } from '../../trpc/client.js';
-import { formatDate } from '../../lib/format.js';
+import { PageHeader } from '../../components/ui/page-header.js';
+import { Badge, StatusBadge } from '../../components/ui/badge.js';
+import {
+  TableShell,
+  Table,
+  THead,
+  Th,
+  Tr,
+  Td,
+} from '../../components/ui/table.js';
+import {
+  LoadingState,
+  ErrorState,
+  EmptyState,
+} from '../../components/ui/states.js';
+import { IconActivity } from '../../components/ui/icons.js';
 
 export default function TracesPage() {
   const { data: session } = useSession();
@@ -15,52 +30,74 @@ export default function TracesPage() {
     { enabled: tenantId !== '' },
   );
 
-  if (!tenantId) return <p>Loading session...</p>;
+  if (!tenantId) return <LoadingState label="Carregando sessão…" />;
+
+  const items = tracesQuery.data?.items ?? [];
 
   return (
-    <div className="space-y-6">
-      <header>
-        <h1 className="text-2xl font-bold">Audit &amp; Trace Explorer</h1>
-        <p className="text-sm text-gray-600">
-          Browse runtime traces. Full bodies redacted; request snapshot grant for unredacted view.
-        </p>
-      </header>
+    <div>
+      <PageHeader
+        title="Traces"
+        description="Explore os traces de execução. Corpos completos são redigidos; solicite um snapshot para a visão sem redação."
+      />
 
       {tracesQuery.isLoading ? (
-        <p>Loading traces...</p>
-      ) : tracesQuery.data?.items.length === 0 ? (
-        <div className="border-2 border-dashed border-gray-300 p-8 text-center text-gray-500 rounded">
-          No traces yet. Runtime trace store (P10b) not yet populated.
-        </div>
+        <LoadingState label="Carregando traces…" />
+      ) : tracesQuery.error ? (
+        <ErrorState
+          message={tracesQuery.error.message}
+          onRetry={() => void tracesQuery.refetch()}
+        />
+      ) : items.length === 0 ? (
+        <EmptyState
+          icon={<IconActivity size={28} />}
+          title="Nenhum trace ainda"
+          description="O armazenamento de traces de runtime (P10b) ainda não foi populado."
+        />
       ) : (
-        <table className="w-full border-collapse text-sm">
-          <thead>
-            <tr className="border-b-2 border-gray-300 bg-gray-50">
-              <th className="p-2 text-left">Trace ID</th>
-              <th className="p-2 text-left">Agent</th>
-              <th className="p-2 text-left">Conversation</th>
-              <th className="p-2 text-left">Started</th>
-              <th className="p-2 text-left">Duration</th>
-              <th className="p-2 text-left">Outcome</th>
-            </tr>
-          </thead>
-          <tbody>
-            {tracesQuery.data?.items.map((t) => (
-              <tr key={t.id} className="border-b hover:bg-gray-50">
-                <td className="p-2">
-                  <Link href={`/traces/${t.id}`} className="text-blue-700 hover:underline font-mono text-xs">
-                    {t.id.slice(0, 8)}
-                  </Link>
-                </td>
-                <td className="p-2">{t.agent_id}</td>
-                <td className="p-2 font-mono text-xs">{t.conversa_id ?? '-'}</td>
-                <td className="p-2">{formatDate(t.started_at)}</td>
-                <td className="p-2">{t.duration_ms ? `${t.duration_ms}ms` : '-'}</td>
-                <td className="p-2 capitalize">{t.outcome ?? 'pending'}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        <TableShell>
+          <Table>
+            <THead>
+              <Th>Trace ID</Th>
+              <Th>Agente</Th>
+              <Th>Conversa</Th>
+              <Th>Início</Th>
+              <Th>Duração</Th>
+              <Th>Resultado</Th>
+            </THead>
+            <tbody>
+              {items.map((t) => (
+                <Tr key={t.id}>
+                  <Td>
+                    <Link
+                      href={`/traces/${t.id}`}
+                      className="font-mono text-xs font-medium text-brand-600 hover:text-brand-700 hover:underline"
+                    >
+                      {t.id.slice(0, 8)}
+                    </Link>
+                  </Td>
+                  <Td>{t.agent_id}</Td>
+                  <Td className="font-mono text-xs text-zinc-700">
+                    {t.conversa_id ?? '—'}
+                  </Td>
+                  <Td className="text-zinc-600">
+                    {new Date(t.started_at).toLocaleString('pt-BR')}
+                  </Td>
+                  <Td className="tabular-nums text-zinc-600">
+                    {t.duration_ms != null ? `${t.duration_ms} ms` : '—'}
+                  </Td>
+                  <Td>
+                    {t.outcome ? (
+                      <StatusBadge status={t.outcome} />
+                    ) : (
+                      <Badge tone="neutral">pendente</Badge>
+                    )}
+                  </Td>
+                </Tr>
+              ))}
+            </tbody>
+          </Table>
+        </TableShell>
       )}
     </div>
   );

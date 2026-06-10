@@ -13,14 +13,14 @@ import { test, expect } from '@playwright/test';
 test.describe('Proposal Approval — DUAL', () => {
   test('shows dual-required banner for hard_limit class', async ({ page }) => {
     await page.goto('http://localhost:4000/proposals/hard-limit-test');
-    await expect(page.locator('text=Dual approval required')).toBeVisible();
+    await expect(page.locator('text=Aprovação dupla obrigatória')).toBeVisible();
   });
 
   test('first approval marks state as partial; needs second', async ({ page }) => {
     await page.goto('http://localhost:4000/proposals/hard-limit-test');
-    await page.click('text=Approve');
+    await page.getByRole('button', { name: 'Aprovar', exact: true }).click();
     await page.fill('textarea', 'Owner approves; awaiting compliance officer.');
-    await page.click('text=Confirm approve');
-    await expect(page.locator('text=1 of 2 approvals recorded')).toBeVisible();
+    await page.click('text=Confirmar aprovação');
+    await expect(page.locator('text=1 de 2 aprovações')).toBeVisible();
   });
 });
