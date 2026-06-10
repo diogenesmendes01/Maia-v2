@@ -17,6 +17,7 @@ export * from './repositories/procedure-repos.js';
 export * from './repositories/profile-repos.js';
 export * from './repositories/channel-repos.js';
 export * from './repositories/admin-repos.js';
+export * from './repositories/playground-repos.js';
 
 // Calendar v2 — re-export of holidaysRepo + holidayEntidadesRepo from dedicated modules.
 export { holidaysRepo } from './repositories/holidays-repo.js';

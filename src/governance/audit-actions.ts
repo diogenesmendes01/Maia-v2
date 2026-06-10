@@ -247,6 +247,11 @@ export const AUDIT_ACTIONS = [
   'risk_signal_classified',
   'conversation_summary_composed',
   'conversation_state_updated',
+  // `playground_turn`: sandbox turn executed from the admin console
+  //   (issue #464). Side-effect-free by contract (no outbox, no memory,
+  //   no learning), but every sandbox interaction stays on the audit trail
+  //   (invariant #4) — marked so forensics can separate test traffic.
+  'playground_turn',
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];
