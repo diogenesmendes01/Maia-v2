@@ -122,6 +122,7 @@ Every `src/` subdirectory has a one-line role here and a deep-dive module doc.
 | `src/import/` | OFX / CSV importers, reconciliation flow | [import.md](docs/architecture/modules/import.md) |
 | `src/lib/` | Wrappers: Anthropic, Whisper, Redis, alerts, holidays, decimal | [lib.md](docs/architecture/modules/lib.md) |
 | `src/memory/` | 5 layers (working / episodic / semantic / procedural / vector) over Postgres + Redis | [memory.md](docs/architecture/modules/memory.md) |
+| `src/objectives/` | Work loop: registry de kinds (perceptores/executores) de objetivos | [objectives.md](docs/architecture/modules/objectives.md) |
 | `src/procedures/` | Engine, test runner, event-sourced execution | [procedures.md](docs/architecture/modules/procedures.md) |
 | `src/runtime/` | Decision engine, action-decider, agent-selector, channel-resolver, builders, context | [runtime.md](docs/architecture/modules/runtime.md) |
 | `src/scheduling/` | Series → occurrences → tasks → outbox, recurring workflows | [scheduling.md](docs/architecture/modules/scheduling.md) |
