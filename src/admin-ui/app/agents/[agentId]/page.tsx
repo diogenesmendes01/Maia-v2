@@ -39,8 +39,15 @@ import {
 import { ProfileDiff } from '../_components/profile-diff.js';
 import ActivityTab from './_components/activity-tab.js';
 import PlaygroundTab from './_components/playground-tab.js';
+import ObjectivesTab from './_components/objectives-tab.js';
 
-type TabId = 'overview' | 'profile' | 'versions' | 'activity' | 'playground';
+type TabId =
+  | 'overview'
+  | 'profile'
+  | 'versions'
+  | 'activity'
+  | 'playground'
+  | 'objectives';
 
 export default function AgentDetailPage() {
   const params = useParams<{ agentId: string }>();
@@ -153,6 +160,7 @@ export default function AgentDetailPage() {
               ) : undefined,
           },
           { id: 'activity', label: 'Atividade' },
+          { id: 'objectives', label: 'Objetivos' },
           { id: 'playground', label: 'Testar' },
         ]}
       />
@@ -191,6 +199,9 @@ export default function AgentDetailPage() {
         />
       )}
       {tab === 'activity' && <ActivityTab tenantId={tenantId} agentId={agent.id} />}
+      {tab === 'objectives' && (
+        <ObjectivesTab tenantId={tenantId} agentId={agent.id} canManage={canManage} />
+      )}
       {tab === 'playground' && (
         <PlaygroundTab
           tenantId={tenantId}

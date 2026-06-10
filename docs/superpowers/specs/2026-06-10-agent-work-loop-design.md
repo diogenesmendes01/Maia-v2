@@ -1,7 +1,7 @@
 # Maia — Work Loop: Objetivos e Trabalho Autônomo — Design Spec
 
 **Date:** 2026-06-10
-**Status:** Draft — spec exigida pela issue #469 antes de implementação
+**Status:** v1 implementada (2026-06-10) — entrega conforme §8 v1: migração 088 (`agent_objectives` + `objective_tasks`), `src/db/repositories/objective-repos.ts` (claim SKIP LOCKED, upsert idempotente por natural_key, cancelamento de tarefas órfãs no claim), registry tipado `src/objectives/kinds.ts` (kind `manual` com flows auto/exception), workers `objective_perceive` (5min) e `objective_execute` (drain 1min) com audit `objective_task_executed`, router `objectives` (criação/pausa auditadas, resolução humana de exceções) e aba "Objetivos" em `/agents/[agentId]`. v2 (kind `inadimplencia` + vínculo a procedures via `startExecution`) e v3 seguem o roadmap abaixo.
 **Master refs:** visão em `2026-06-10-learnable-workforce-vision.md` §2.3; `ARCHITECTURE.md` invariantes 1–5; `docs/architecture/modules/scheduling.md`, `docs/architecture/modules/procedures.md`, `docs/architecture/concerns/action-layer.md`
 **Architecture Locks:** tenant isolation, LLM-propõe/backend-decide, audit total, fail-closed — inalterados. O work loop NUNCA executa side-effects fora do caminho tools/procedures existente.
 

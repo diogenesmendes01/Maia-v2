@@ -247,6 +247,10 @@ export const AUDIT_ACTIONS = [
   'risk_signal_classified',
   'conversation_summary_composed',
   'conversation_state_updated',
+  // `objective_task_executed`: work-loop task processed by the
+  //   objective_execute worker (issue #469) — records kind + transition so
+  //   the trail shows every autonomous work unit (invariant #4).
+  'objective_task_executed',
   // `playground_turn`: sandbox turn executed from the admin console
   //   (issue #464). Side-effect-free by contract (no outbox, no memory,
   //   no learning), but every sandbox interaction stays on the audit trail

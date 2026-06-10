@@ -19,6 +19,7 @@ import { llmSettingsRouter } from './llmSettings.js';
 import { toolsCatalogRouter } from './tools-catalog.js';
 import { skillsRouter } from './skills.js';
 import { playgroundRouter } from './playground.js';
+import { objectivesRouter } from './objectives.js';
 
 export const appRouter = router({
   inbox: inboxRouter,
@@ -38,6 +39,7 @@ export const appRouter = router({
   toolsCatalog: toolsCatalogRouter,
   skills: skillsRouter,
   playground: playgroundRouter,
+  objectives: objectivesRouter,
 });
 
 export type AppRouter = typeof appRouter;

@@ -33,6 +33,7 @@ import { runOutboundMessagesSweeper } from './outbound-messages-sweeper.js';
 import { runIdempotencyOutboxRelayer } from './idempotency-outbox-relayer.js';
 import { runWorkflowEngineTick } from './workflow-engine-tick.js';
 import { runPlaygroundTurnWorker } from './playground-turn-worker.js';
+import { runObjectiveExecuteWorker, runObjectivePerceiveWorker } from './objective-execute-worker.js';
 
 export type Job = {
   name: string;
@@ -69,6 +70,10 @@ export const JOBS: Job[] = [
   // (Postgres-as-queue) inside the tick for ~50s, so effective chat latency
   // is seconds despite the 1-min cron. Non-critical surface → phase 2.
   { name: 'playground_turn_drain', cron: '* * * * *', fn: runPlaygroundTurnWorker, phase: 2 },
+  // Issue #469 — work loop: percebe trabalho (perceptores por kind, 5min)
+  // e executa tarefas pendentes (drain ~50s/tick). Fase 2: não-crítico.
+  { name: 'objective_perceive', cron: '*/5 * * * *', fn: runObjectivePerceiveWorker, phase: 2 },
+  { name: 'objective_execute', cron: '* * * * *', fn: runObjectiveExecuteWorker, phase: 2 },
   { name: 'series_next_scheduler', cron: '*/10 * * * *', fn: runSeriesNextSchedulerWorker, phase: 1 },
   // Issue #345 (Phase 4 of #323), Batch D — the inline body was EXTRACTED into
   // `./workflow-engine-tick.ts` (`runWorkflowEngineTick`) and converted from the
