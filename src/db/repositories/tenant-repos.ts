@@ -417,6 +417,16 @@ export const agentsRepo = {
       actor_id: string;
       actor_role: string;
     };
+    /**
+     * Issue #470 — archetype wiring. Extra domain packs composed on top of
+     * BASE_AGENT_PACKS at creation (deduped). The CALLER resolves archetype →
+     * packs (src/tools/archetype-packs.ts); this repo stays free of that
+     * vocabulary and only persists what it is told, atomically.
+     */
+    grant?: {
+      extra_packs: string[];
+      archetype: string | null;
+    };
   }): Promise<
     | { ok: true; agent: Agent; seed_profile: AgentOperationalProfileVersion }
     | { ok: false; reason: 'duplicate_id'; agent_id: string }
@@ -478,12 +488,17 @@ export const agentsRepo = {
         //     `DEFAULT_AGENT_PACKS` (parity pinned by a unit test). No
         //     applyTenantGuard: tenant_id/agent_id are explicit and match the
         //     agent row just inserted.
+        const grantedPacks = [
+          ...new Set([...BASE_AGENT_PACKS, ...(args.grant?.extra_packs ?? [])]),
+        ];
         await tx.insert(agent_tool_grants).values({
           tenant_id: args.agent.tenant_id,
           agent_id: createdAgent.id,
-          granted_packs: [...BASE_AGENT_PACKS],
+          granted_packs: grantedPacks,
           granted_by: args.audit.actor_id,
-          reason: 'BASE_AGENT_PACKS default grant (agent creation, issue #408)',
+          reason: args.grant?.archetype
+            ? `arquétipo '${args.grant.archetype}' + BASE_AGENT_PACKS (agent creation, issues #408/#470)`
+            : 'BASE_AGENT_PACKS default grant (agent creation, issue #408)',
         });
 
         // (4) Audit in the SAME tx. If this insert fails, EVERYTHING rolls back
@@ -503,12 +518,13 @@ export const agentsRepo = {
             seed_profile_version: seedProfile.version,
             seed_profile_status: seedProfile.status,
             proposed_reason: args.seed_profile.proposed_reason,
-            // Issue #410/#408 — the default tool-pack grant for this agent,
-            // now PERSISTED to `agent_tool_grants` in step (3) above. Sourced
-            // from BASE_AGENT_PACKS (base-agent-packs.ts — import-free leaf)
-            // so this repo module stays free of the tools-registry/gateway
-            // import chain. In sync with `defaultAgentGrant()`.
-            default_tool_packs: [...BASE_AGENT_PACKS],
+            // Issue #410/#408/#470 — the tool-pack grant PERSISTED in step (3):
+            // BASE_AGENT_PACKS + archetype extras (deduped). Sourced from
+            // import-free leaves (base-agent-packs.ts, archetype-packs.ts via
+            // the caller) so this repo module stays free of the
+            // tools-registry/gateway import chain.
+            granted_packs: grantedPacks,
+            archetype: args.grant?.archetype ?? null,
           },
         });
 
