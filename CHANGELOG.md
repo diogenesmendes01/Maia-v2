@@ -4,6 +4,12 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### Changed — Admin UI
+- **Redesign visual completo da console** ([#460](https://github.com/diogenesmendes01/Maia-v2/pull/460)): camada visual reconstruída do zero sobre design system próprio (`src/admin-ui/components/ui/`) com navegação agent-first em pt-BR (sidebar + badge de aprovações pendentes). Nova experiência de agentes: hub `/agents` em cards, wizard de criação em 4 passos (`/agents/new`) e detalhe por agente com edição de perfil pré-preenchida e aprovação de versões (`/agents/[agentId]`); `/setup/agents` virou redirect. Tela de versões passou a expor o fluxo de rollback (auditado; `NOT_IMPLEMENTED` sinalizado na UI). Routers tRPC preservados como camada de dados.
+
+### Added — Admin UI
+- **`agents.getProfileVersions`** ([#460](https://github.com/diogenesmendes01/Maia-v2/pull/460)): procedure read-only que expõe a versão ativa + propostas do perfil operacional (com `profile_body`) para pré-preencher o editor de perfil.
+
 ## [3.1.0] - 2026-05-20 — "Hot-path wiring + governance functional"
 
 This release closes the build-then-wire gap from v3.0.0: components that
