@@ -213,11 +213,12 @@ export default function ProposalDetailPage({ params }: { params: { id: string } 
           </CardBody>
         </Card>
 
-        <div className="sticky bottom-4 z-10 flex flex-wrap items-center gap-3 rounded-xl border border-zinc-200 bg-white px-5 py-3 shadow-overlay">
+        <div className="sticky bottom-4 z-10 flex flex-wrap items-center gap-2 rounded-xl border border-zinc-200 bg-white px-4 py-3 shadow-overlay sm:gap-3 sm:px-5">
           <Button
             variant="success"
             onClick={() => setShowApprovalModal('approve')}
             disabled={!canApprove}
+            className="w-full sm:w-auto"
           >
             Aprovar
           </Button>
@@ -225,6 +226,7 @@ export default function ProposalDetailPage({ params }: { params: { id: string } 
             variant="danger"
             onClick={() => setShowApprovalModal('reject')}
             disabled={!canApprove}
+            className="w-full sm:w-auto"
           >
             Rejeitar
           </Button>

@@ -29,6 +29,12 @@ export default function DashboardPage() {
     { enabled: tenantId !== '', refetchInterval: 60_000 },
   );
 
+  // Issue #465 — passo "perfil ativo" do checklist de ativação.
+  const profileVersionsQuery = trpc.versions.listVersions.useQuery(
+    { tenantId, sotKind: 'agent_operational_profile_versions', limit: 100 },
+    { enabled: tenantId !== '' },
+  );
+
   if (status === 'loading') return <LoadingState label="Carregando sessão…" />;
   if (summaryQuery.isLoading) return <LoadingState label="Carregando visão geral…" />;
   if (summaryQuery.error)
@@ -43,6 +49,36 @@ export default function DashboardPage() {
   if (!data) return null;
 
   const byType = Object.entries(data.proposals.by_type ?? {});
+
+  // Checklist de ativação (#465): tenant → agente → perfil ativo → canal.
+  // Some quando tudo estiver completo; cada pendência aponta para a tela certa.
+  const hasAgent = data.agents.total > 0;
+  const hasActiveProfile = (profileVersionsQuery.data?.items ?? []).some(
+    (v) => v.status === 'active',
+  );
+  const hasChannel = data.channels.active > 0;
+  const activationSteps: Array<{
+    label: string;
+    done: boolean;
+    href: string;
+    cta: string;
+  }> = [
+    { label: 'Criar o primeiro agente', done: hasAgent, href: '/agents/new', cta: 'Criar agente' },
+    {
+      label: 'Aprovar o perfil do agente (sem perfil ativo, o agente não opera)',
+      done: hasActiveProfile,
+      href: '/identities',
+      cta: 'Aprovar perfil',
+    },
+    {
+      label: 'Vincular um canal de WhatsApp ao agente',
+      done: hasChannel,
+      href: '/setup/channels',
+      cta: 'Configurar canal',
+    },
+  ];
+  const activationPending =
+    !profileVersionsQuery.isLoading && activationSteps.some((s) => !s.done);
 
   return (
     <div>
@@ -62,6 +98,50 @@ export default function DashboardPage() {
           </Link>
         }
       />
+
+      {activationPending && (
+        <div className="mb-6">
+          <Card>
+            <CardHeader
+              title="Ativação da plataforma"
+              description="Complete estes passos para colocar seu primeiro agente em operação. Este bloco some sozinho quando tudo estiver pronto."
+            />
+            <CardBody className="p-0">
+              <ul className="divide-y divide-zinc-100">
+                {activationSteps.map((s) => (
+                  <li
+                    key={s.label}
+                    className="flex flex-wrap items-center justify-between gap-3 px-5 py-3"
+                  >
+                    <span className="flex items-center gap-2.5 text-sm">
+                      <span
+                        aria-hidden
+                        className={
+                          s.done
+                            ? 'flex h-5 w-5 items-center justify-center rounded-full bg-emerald-100 text-emerald-700'
+                            : 'flex h-5 w-5 items-center justify-center rounded-full bg-amber-100 text-amber-700'
+                        }
+                      >
+                        {s.done ? '✓' : '•'}
+                      </span>
+                      <span className={s.done ? 'text-zinc-400 line-through' : 'text-zinc-800'}>
+                        {s.label}
+                      </span>
+                    </span>
+                    {!s.done && (
+                      <Link href={s.href}>
+                        <Button size="sm" variant="secondary">
+                          {s.cta}
+                        </Button>
+                      </Link>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </CardBody>
+          </Card>
+        </div>
+      )}
 
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <StatCard
