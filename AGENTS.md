@@ -159,7 +159,7 @@ npm run test:integration          # vitest run tests/integration --no-coverage
 npm run test:integration:teardown # docker compose down -v
 ```
 
-CI runs these automatically in `.github/workflows/ci.yml` with service containers. Integration tests with `continue-on-error: true` do not block merge but should still pass locally.
+CI runs these automatically in `.github/workflows/ci.yml` with service containers. The integration job is blocking: integration + e2e failures fail the run.
 
 ## 8. PR rules
 
