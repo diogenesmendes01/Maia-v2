@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import { buildCacheKey } from '../../lib/cache-key.js';
 
 /**
  * Invalid scope error — thrown by key builders when `tenant_id` or `agent_id`
@@ -50,6 +51,13 @@ export function assertValidScope(tenant_id: unknown, agent_id: unknown): void {
  * written without `agent_id` in the key. Pre-fix entries are unreachable;
  * the next lookup misses and the slice is rebuilt with the correct
  * agent-scoped key.
+ *
+ * Issue #287: segments are routed through the centralized `buildCacheKey`
+ * so a `:` inside a free-form id can no longer alias across slots.
+ * Key-compatibility: production tenant/agent slugs, UUID pessoa_ids, depth
+ * enums, and the 8-hex-char intent/scope hashes all encode to themselves,
+ * so every realizable key is byte-identical to the previous raw
+ * interpolation — `v2` stays, no bump needed.
  */
 export function buildUserSliceCacheKey(args: {
   tenant_id: string;
@@ -62,7 +70,15 @@ export function buildUserSliceCacheKey(args: {
   assertValidScope(args.tenant_id, args.agent_id);
   const scopeHash = args.scope_hint ? crypto.createHash('sha256').update(JSON.stringify(args.scope_hint)).digest('hex').slice(0, 8) : 'default';
   const intentHash = args.intent_label ? crypto.createHash('sha256').update(args.intent_label).digest('hex').slice(0, 8) : 'none';
-  return `user_slice:v2:${args.tenant_id}:${args.agent_id}:${args.pessoa_id}:${args.depth}:${intentHash}:${scopeHash}`;
+  return buildCacheKey(
+    'user_slice:v2:',
+    args.tenant_id,
+    args.agent_id,
+    args.pessoa_id,
+    args.depth,
+    intentHash,
+    scopeHash,
+  );
 }
 
 /**
@@ -79,6 +95,11 @@ export function buildUserSliceCacheKey(args: {
  * that were written without `agent_id` in the key. Pre-fix entries become
  * unreachable; the next lookup misses and the slice is rebuilt with the
  * correct agent-scoped key.
+ *
+ * Issue #287: routed through the centralized `buildCacheKey` — same
+ * key-compatibility reasoning as `buildUserSliceCacheKey` above (`domain`
+ * is free-form but defaults to `global`; encoding it closes the same
+ * `:`-aliasing hole). `v2` stays, no bump needed.
  */
 export function buildKnowledgeSliceCacheKey(args: {
   tenant_id: string;
@@ -92,5 +113,13 @@ export function buildKnowledgeSliceCacheKey(args: {
   const scopeHash = args.scope_hint ? crypto.createHash('sha256').update(JSON.stringify(args.scope_hint)).digest('hex').slice(0, 8) : 'default';
   const intentHash = args.intent_label ? crypto.createHash('sha256').update(args.intent_label).digest('hex').slice(0, 8) : 'none';
   const domain = args.domain ?? 'global';
-  return `knowledge_slice:v2:${args.tenant_id}:${args.agent_id}:${args.depth}:${scopeHash}:${domain}:${intentHash}`;
+  return buildCacheKey(
+    'knowledge_slice:v2:',
+    args.tenant_id,
+    args.agent_id,
+    args.depth,
+    scopeHash,
+    domain,
+    intentHash,
+  );
 }

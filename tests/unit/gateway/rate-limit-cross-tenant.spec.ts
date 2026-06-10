@@ -39,6 +39,7 @@
  *     the loud-failure path.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { buildCacheKey } from '@/lib/cache-key.js';
 import {
   runWithTenantContext,
   MissingTenantContextError,
@@ -513,6 +514,28 @@ describe('issue #245 — gateway rate-limit Redis keys are tenant+agent scoped',
       );
       const key = calls.find((c) => c.op === 'zadd')?.key;
       expect(key).toBe(`maia:ratelimit:${TENANT_A}:${AGENT_A}:hour:weird%3Aid`);
+    });
+
+    // -------------------------------------------------------------------------
+    // Issue #287 — keys are built via the centralized `buildCacheKey`, which
+    // (beyond per-segment URI encoding) neutralizes Redis glob metachars
+    // (`* ? [ ] !`) that raw `encodeURIComponent` leaves intact.
+    // -------------------------------------------------------------------------
+    it('issue #287: key equals the buildCacheKey composition and neutralizes glob metachars', async () => {
+      const GLOB_TENANT = 'acme*';
+      const pessoa = pessoaFixture(PESSOA_SHARED);
+      await runWithTenantContext(
+        { tenant_id: GLOB_TENANT, agent_id: AGENT_A },
+        async () => {
+          await checkRateLimit(pessoa);
+        },
+      );
+      const key = calls.find((c) => c.op === 'zadd')?.key;
+      expect(key).toBe(
+        buildCacheKey('maia:ratelimit:', GLOB_TENANT, AGENT_A, 'hour', PESSOA_SHARED),
+      );
+      expect(key).toContain('acme%2A');
+      expect(/[*?[\]!]/.test(key!)).toBe(false);
     });
   });
 

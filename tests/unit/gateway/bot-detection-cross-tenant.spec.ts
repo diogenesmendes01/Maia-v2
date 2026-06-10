@@ -51,6 +51,7 @@ import {
   runWithTenantContext,
   MissingTenantContextError,
 } from '@/db/tenant-context.js';
+import { buildCacheKey } from '@/lib/cache-key.js';
 
 // ---------------------------------------------------------------------------
 // Redis call recorder + minimal counter semantics. We need `incr` to behave
@@ -218,6 +219,35 @@ describe('issue #246 — bot-detection Redis key is tenant+agent scoped', () => 
     // somewhere upstream) would re-emit identically — but `acme:dev`
     // (raw) would encode to the SAME string. The encoding round-trips
     // through encodeURIComponent so this can't happen.
+    // -----------------------------------------------------------------------
+    // Issue #287 — the key is built via the centralized `buildCacheKey`, which
+    // (beyond per-segment URI encoding) neutralizes Redis glob metachars
+    // (`* ? [ ] !`) that a raw `encodeURIComponent` concat leaves intact. A
+    // tenant slug containing `*` could otherwise act as a wildcard in any
+    // KEYS/SCAN MATCH pattern derived from the segment.
+    // -----------------------------------------------------------------------
+    it('issue #287: key equals the buildCacheKey composition and neutralizes glob metachars', async () => {
+      const GLOB_TENANT = 'acme*dev';
+      const GLOB_AGENT = 'router!';
+      await runWithTenantContext(
+        { tenant_id: GLOB_TENANT, agent_id: GLOB_AGENT },
+        async () => {
+          await checkBotAndMaybeBlock(PHONE_SHARED);
+        },
+      );
+      const key = keysOf('incr')[0]!;
+      // Parity with the central helper — proves the call site routes through
+      // buildCacheKey rather than reimplementing the encoding locally.
+      expect(key).toBe(
+        buildCacheKey('maia:botdet:', GLOB_TENANT, GLOB_AGENT, PHONE_SHARED),
+      );
+      // Glob metachars are percent-encoded (encodeURIComponent alone leaves
+      // `*` and `!` raw — this is the #287 upgrade).
+      expect(key).toContain('acme%2Adev');
+      expect(key).toContain('router%21');
+      expect(/[*?[\]!]/.test(key)).toBe(false);
+    });
+
     it('percent characters in a segment are themselves encoded', async () => {
       const TENANT_WITH_PERCENT = 'acme%3Adev'; // looks pre-encoded
       await runWithTenantContext(
