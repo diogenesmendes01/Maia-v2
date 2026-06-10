@@ -21,8 +21,9 @@ import {
   EmptyState,
 } from '../../components/ui/states.js';
 import { IconLayers } from '../../components/ui/icons.js';
+import ToolRequests from './_components/tool-requests.js';
 
-type Tab = 'domains' | 'skills' | 'gaps' | 'proposals';
+type Tab = 'domains' | 'skills' | 'gaps' | 'proposals' | 'tool_requests';
 
 export default function CapabilitiesPage() {
   const { data: session, status } = useSession();
@@ -79,6 +80,7 @@ export default function CapabilitiesPage() {
         className="mb-4"
         tabs={[
           { id: 'proposals', label: 'Propostas' },
+          { id: 'tool_requests', label: 'Pedidos de ferramenta' },
           { id: 'gaps', label: 'Lacunas' },
           { id: 'skills', label: 'Skills' },
           { id: 'domains', label: 'Domínios' },
@@ -93,6 +95,8 @@ export default function CapabilitiesPage() {
           title="Selecione um agente"
           description="Escolha um agente acima para ver suas capacidades."
         />
+      ) : tab === 'tool_requests' ? (
+        <ToolRequests tenantId={tenantId} agentId={agentId} />
       ) : tab === 'proposals' ? (
         <DataTable
           query={proposalsQuery}
