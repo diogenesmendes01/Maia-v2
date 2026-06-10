@@ -2600,3 +2600,79 @@ export type PlaygroundSession = typeof playground_sessions.$inferSelect;
 export type NewPlaygroundSession = typeof playground_sessions.$inferInsert;
 export type PlaygroundTurn = typeof playground_turns.$inferSelect;
 export type NewPlaygroundTurn = typeof playground_turns.$inferInsert;
+
+// ---------------------------------------------------------------------------
+// Work loop v1 (issue #469 — migration 088)
+//
+// agent_objectives: responsabilidades declarativas, owner-aprovadas.
+// objective_tasks: unidades de trabalho idempotentes (natural_key única
+// enquanto viva), executadas pelo worker objective_execute; 'waiting_human'
+// é a fila de exceções. Spec: docs/superpowers/specs/2026-06-10-agent-work-loop-design.md.
+// ---------------------------------------------------------------------------
+
+export type ObjectiveStatus = 'active' | 'paused' | 'archived';
+export type ObjectiveTaskStatus =
+  | 'pending'
+  | 'running'
+  | 'waiting_human'
+  | 'done'
+  | 'failed'
+  | 'cancelled';
+
+export const agent_objectives = pgTable(
+  'agent_objectives',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    kind: text('kind').notNull(),
+    title: text('title').notNull(),
+    params: jsonb('params').notNull().default({}),
+    status: text('status').notNull().default('active'), // ObjectiveStatus
+    created_by: text('created_by').notNull(),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    tenantAgentIdx: index('agent_objectives_tenant_agent_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.status,
+    ),
+  }),
+);
+
+export const objective_tasks = pgTable(
+  'objective_tasks',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    objective_id: uuid('objective_id')
+      .notNull()
+      .references(() => agent_objectives.id, { onDelete: 'cascade' }),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    natural_key: text('natural_key').notNull(),
+    title: text('title').notNull(),
+    payload: jsonb('payload').notNull().default({}),
+    status: text('status').notNull().default('pending'), // ObjectiveTaskStatus
+    procedure_execution_id: uuid('procedure_execution_id'),
+    pending_question_id: uuid('pending_question_id'),
+    outcome: jsonb('outcome'),
+    error_detail: text('error_detail'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    completed_at: timestamp('completed_at', { withTimezone: true }),
+  },
+  (t) => ({
+    objectiveIdx: index('objective_tasks_objective_idx').on(t.objective_id, t.created_at),
+    tenantAgentStatusIdx: index('objective_tasks_tenant_agent_status_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.status,
+    ),
+  }),
+);
+
+export type AgentObjective = typeof agent_objectives.$inferSelect;
+export type NewAgentObjective = typeof agent_objectives.$inferInsert;
+export type ObjectiveTask = typeof objective_tasks.$inferSelect;
+export type NewObjectiveTask = typeof objective_tasks.$inferInsert;
