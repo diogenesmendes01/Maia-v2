@@ -21,6 +21,7 @@ import {
   IconSparkles,
 } from '../../../components/ui/icons.js';
 import { ARCHETYPES, type Archetype } from '../_components/archetypes.js';
+import { isArchetypeId } from '../../../../tools/archetype-packs.js';
 import {
   DEFAULT_PROFILE,
   IdentitySection,
@@ -138,6 +139,10 @@ export default function NewAgentPage() {
         status: agentStatus,
         profile_body: formToProfileBodyInput(profile),
         proposed_reason: reason.trim(),
+        // Issue #470 — a função escolhida vira packs de capacidade no grant
+        // inicial (vendedor não vê ferramentas financeiras).
+        archetype:
+          archetypeId && isArchetypeId(archetypeId) ? archetypeId : 'custom',
       });
       router.push(`/agents/${encodeURIComponent(id)}?created=1`);
     } catch (e) {

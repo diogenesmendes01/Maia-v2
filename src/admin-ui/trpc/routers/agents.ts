@@ -32,6 +32,9 @@ import { router, protectedProcedure } from '../server.js';
 import { resolveTenantId } from '../tenant-resolver.js';
 import { runWithTenantContext } from '../../../db/tenant-context.js';
 import { PROFILE_BODY_SCHEMA_VERSION, type ProfileBody } from '../../../db/schema.js';
+import { ARCHETYPE_IDS, ARCHETYPE_PACK_MAP } from '../../../tools/archetype-packs.js';
+import { BASE_AGENT_PACKS } from '../../../tools/base-agent-packs.js';
+import { TOOL_PACKS, resolvePackTools } from '../../../tools/grant-math.js';
 
 const AgentIdSchema = z
   .string()
@@ -179,6 +182,10 @@ const CreateInputSchema = z.object({
   status: AgentStatusSchema.optional(),
   profile_body: ProfileBodyInputSchema,
   proposed_reason: z.string().min(10).max(2000),
+  // Issue #470 — função escolhida no wizard. Resolve para packs de domínio
+  // (ARCHETYPE_PACK_MAP) compostos sobre BASE_AGENT_PACKS no grant inicial.
+  // Opcional para compat: omitido ⇒ só o floor da plataforma (= 'custom').
+  archetype: z.enum(ARCHETYPE_IDS).optional(),
 });
 
 const UpdateProfileInputSchema = z.object({
@@ -337,6 +344,56 @@ export const agentsRouter = router({
       };
     }),
 
+  /**
+   * Issue #470 — capacidades efetivas do agente para exibição no console:
+   * grant row (packs/tools/denied) + resolução pack→tools via o registry
+   * (grant-math, fail-closed). Read-only; edição de grants continua fora do
+   * escopo desta superfície (mudança de capacidade passa por proposta).
+   */
+  getCapabilities: protectedProcedure
+    .input(GetByIdInputSchema)
+    .query(async ({ input, ctx }) => {
+      const tenantId = resolveTenantId(ctx, input.tenantId);
+      const agent = await ctx.repos.agentsRepo.findById(input.id);
+      if (!agent || agent.tenant_id !== tenantId) {
+        throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent not found' });
+      }
+      const grant = await runWithTenantContext(
+        { tenant_id: tenantId, agent_id: agent.id },
+        async () => ctx.repos.agentToolGrantsRepo.findForCurrentAgent(),
+      );
+      // Mesmo contrato fail-closed do runtime: sem row ⇒ floor da plataforma.
+      const grantedPacks = grant
+        ? [...new Set([...BASE_AGENT_PACKS, ...grant.granted_packs])]
+        : [...BASE_AGENT_PACKS];
+      const deniedTools = grant?.denied_tools ?? [];
+      const deniedSet = new Set(deniedTools);
+      const packs = grantedPacks.map((id) => {
+        const def = TOOL_PACKS[id];
+        return {
+          id,
+          name: def?.name ?? id,
+          risk_level: def?.risk_level ?? null,
+          tools: def ? [...def.tools] : [],
+          known: def !== undefined,
+        };
+      });
+      const effectiveTools = [
+        ...new Set([
+          ...resolvePackTools(grantedPacks),
+          ...(grant?.granted_tools ?? []),
+        ]),
+      ].filter((t) => !deniedSet.has(t));
+      return {
+        packs,
+        granted_tools: grant?.granted_tools ?? [],
+        denied_tools: deniedTools,
+        effective_tool_count: effectiveTools.length,
+        effective_tools: effectiveTools,
+        reason: grant?.reason ?? null,
+      };
+    }),
+
   create: protectedProcedure.input(CreateInputSchema).mutation(async ({ input, ctx }) => {
     ctx.assertRole('owner', 'founder');
     const tenantId = resolveTenantId(ctx, input.tenantId);
@@ -361,6 +418,10 @@ export const agentsRouter = router({
     // the existence check and one ended up bubbling a pg unique violation as
     // a 500 instead of the documented CONFLICT.
     const profileBody = buildProfileBody(input.profile_body, ctx.userId, null);
+    // Issue #470 — função → packs de domínio. Sem arquétipo (clientes
+    // antigos) ou 'custom', o agente nasce só com o floor da plataforma.
+    const archetype = input.archetype ?? 'custom';
+    const extraPacks = [...(ARCHETYPE_PACK_MAP[archetype] ?? [])];
     const result = await ctx.repos.agentsRepo.createWithSeedAndAudit({
       agent: {
         id: input.id,
@@ -376,6 +437,10 @@ export const agentsRouter = router({
       audit: {
         actor_id: ctx.userId,
         actor_role: ctx.userRole,
+      },
+      grant: {
+        extra_packs: extraPacks,
+        archetype: input.archetype ?? null,
       },
     });
 

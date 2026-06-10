@@ -147,12 +147,15 @@ describe('calendar default pack — seed row', () => {
     expect(grantInsert!['granted_packs']).toEqual([...BASE_AGENT_PACKS]);
     expect((grantInsert!['granted_packs'] as string[])).toContain('domain.calendar');
 
-    // capturedInserts[3] = the admin_audit_log INSERT — also asserts change_summary.default_tool_packs
+    // capturedInserts[3] = the admin_audit_log INSERT — also asserts the
+    // change_summary grant keys (renamed default_tool_packs → granted_packs
+    // when archetype extras landed, issue #470; no archetype here ⇒ floor only).
     const auditInsert = capturedInserts[3] as Record<string, unknown> | undefined;
     expect(auditInsert).toBeDefined();
     const changeSummary = auditInsert!['change_summary'] as Record<string, unknown>;
-    expect(changeSummary['default_tool_packs']).toEqual([...BASE_AGENT_PACKS]);
-    expect((changeSummary['default_tool_packs'] as string[])).toContain('domain.calendar');
+    expect(changeSummary['granted_packs']).toEqual([...BASE_AGENT_PACKS]);
+    expect((changeSummary['granted_packs'] as string[])).toContain('domain.calendar');
+    expect(changeSummary['archetype']).toBeNull();
   });
 });
 

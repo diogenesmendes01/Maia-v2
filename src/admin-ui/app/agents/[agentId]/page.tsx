@@ -62,6 +62,10 @@ export default function AgentDetailPage() {
     { tenantId, id: agentId },
     { enabled: tenantId !== '' },
   );
+  const capabilitiesQuery = trpc.agents.getCapabilities.useQuery(
+    { tenantId, id: agentId },
+    { enabled: tenantId !== '' },
+  );
 
   if (status === 'loading' || agentQuery.isLoading)
     return <LoadingState label="Carregando agente…" />;
@@ -159,6 +163,7 @@ export default function AgentDetailPage() {
           activeVersion={active?.version ?? null}
           onEdit={() => setTab('profile')}
           canManage={canManage}
+          capabilities={capabilitiesQuery.data ?? null}
         />
       )}
       {tab === 'profile' && (
@@ -213,23 +218,85 @@ function ReadonlyList({ items, tone }: { items: string[]; tone?: 'danger' }) {
   );
 }
 
+type Capabilities = {
+  packs: Array<{
+    id: string;
+    name: string;
+    risk_level: string | null;
+    tools: string[];
+    known: boolean;
+  }>;
+  granted_tools: string[];
+  denied_tools: string[];
+  effective_tool_count: number;
+};
+
 function OverviewTab({
   activeBody,
   activeVersion,
   onEdit,
   canManage,
+  capabilities,
 }: {
   activeBody: unknown;
   activeVersion: number | null;
   onEdit: () => void;
   canManage: boolean;
+  capabilities: Capabilities | null;
 }) {
+  // Issue #470 — packs/tools efetivos da função, mesmo contrato fail-closed
+  // do runtime (sem grant row ⇒ floor da plataforma).
+  const capabilitiesCard = capabilities && (
+    <Card>
+      <CardHeader
+        title="Capacidades da função"
+        description={`${capabilities.effective_tool_count} ferramentas visíveis ao agente — princípio do menor privilégio: ele nasce com o mínimo da função e aprende o resto sob aprovação.`}
+      />
+      <CardBody className="space-y-3">
+        {capabilities.packs.map((pack) => (
+          <div
+            key={pack.id}
+            className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-zinc-100 bg-zinc-50/60 px-3 py-2"
+          >
+            <span className="flex items-center gap-2 text-sm text-zinc-800">
+              <span className="font-medium">{pack.name}</span>
+              <code className="font-mono text-2xs text-zinc-400">{pack.id}</code>
+            </span>
+            <span className="flex items-center gap-1.5">
+              {pack.risk_level && <StatusBadge status={pack.risk_level} />}
+              <Badge tone="neutral">
+                {pack.tools.length} ferramenta{pack.tools.length === 1 ? '' : 's'}
+              </Badge>
+            </span>
+          </div>
+        ))}
+        {capabilities.denied_tools.length > 0 && (
+          <div>
+            <p className="mb-1 text-xs font-medium text-zinc-500">
+              Negadas explicitamente (hard deny)
+            </p>
+            <div className="flex flex-wrap gap-1">
+              {capabilities.denied_tools.map((t) => (
+                <Badge key={t} tone="danger" className="font-mono">
+                  {t}
+                </Badge>
+              ))}
+            </div>
+          </div>
+        )}
+      </CardBody>
+    </Card>
+  );
+
   if (!activeBody) {
     return (
-      <EmptyState
-        title="Nenhum perfil em operação"
-        description="Este agente ainda não tem uma versão de perfil ativa. Aprove a proposta pendente na aba Versões — sem perfil ativo o agente não opera."
-      />
+      <div className="space-y-4">
+        <EmptyState
+          title="Nenhum perfil em operação"
+          description="Este agente ainda não tem uma versão de perfil ativa. Aprove a proposta pendente na aba Versões — sem perfil ativo o agente não opera."
+        />
+        {capabilitiesCard}
+      </div>
     );
   }
   const v = profileBodyToForm(activeBody);
@@ -307,6 +374,8 @@ function OverviewTab({
           <ReadonlyList items={v.principles} tone="danger" />
         </CardBody>
       </Card>
+
+      <div className="lg:col-span-2">{capabilitiesCard}</div>
     </div>
   );
 }
