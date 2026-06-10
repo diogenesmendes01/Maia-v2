@@ -300,6 +300,43 @@ export const agentsRouter = router({
     return agent;
   }),
 
+  /**
+   * Read-only profile snapshot for the agent detail screen: the active
+   * operational profile version (if any) plus pending `proposed` versions.
+   * Exposes `profile_body` so the UI can prefill the edit form with the
+   * currently-running identity instead of forcing the operator to retype it.
+   */
+  getProfileVersions: protectedProcedure
+    .input(GetByIdInputSchema)
+    .query(async ({ input, ctx }) => {
+      const tenantId = resolveTenantId(ctx, input.tenantId);
+      const agent = await ctx.repos.agentsRepo.findById(input.id);
+      if (!agent || agent.tenant_id !== tenantId) {
+        throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent not found' });
+      }
+      const [active, proposed] = await runWithTenantContext(
+        { tenant_id: tenantId, agent_id: agent.id },
+        async () =>
+          Promise.all([
+            ctx.repos.operationalProfileVersionsRepo.getActive(),
+            ctx.repos.operationalProfileVersionsRepo.listByStatus('proposed'),
+          ]),
+      );
+      const pick = (v: NonNullable<typeof active>) => ({
+        id: v.id,
+        version: v.version,
+        status: v.status,
+        profile_body: v.profile_body,
+        proposed_by: v.proposed_by,
+        proposed_reason: v.proposed_reason,
+        created_at: v.created_at,
+      });
+      return {
+        active: active ? pick(active) : null,
+        proposed: proposed.map(pick),
+      };
+    }),
+
   create: protectedProcedure.input(CreateInputSchema).mutation(async ({ input, ctx }) => {
     ctx.assertRole('owner', 'founder');
     const tenantId = resolveTenantId(ctx, input.tenantId);

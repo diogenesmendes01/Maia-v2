@@ -11,17 +11,17 @@ import { test, expect } from '@playwright/test';
 test.describe('Inbox — Tela 1', () => {
   test('loads page and shows header', async ({ page }) => {
     await page.goto('http://localhost:4000/inbox');
-    await expect(page.locator('h1')).toContainText('Proposal Inbox');
+    await expect(page.locator('h1')).toContainText('Aprovações');
   });
 
   test('shows badge counters', async ({ page }) => {
     await page.goto('http://localhost:4000/inbox');
-    await expect(page.locator('text=pending across')).toBeVisible();
+    await expect(page.locator('text=pendente')).toBeVisible();
   });
 
   test('filter by type updates table', async ({ page }) => {
     await page.goto('http://localhost:4000/inbox');
-    await page.click('text=policy_rule');
+    await page.click('text=Regra de política');
     await expect(page.locator('table tbody tr')).toBeVisible();
   });
 
@@ -34,6 +34,6 @@ test.describe('Inbox — Tela 1', () => {
 
   test('bulk reject button disabled when nothing selected', async ({ page }) => {
     await page.goto('http://localhost:4000/inbox');
-    await expect(page.locator('text=Bulk reject')).not.toBeVisible();
+    await expect(page.locator('text=Rejeitar em massa')).not.toBeVisible();
   });
 });

@@ -1,48 +1,94 @@
 'use client';
 
 import * as React from 'react';
-import { formatDate } from '../../../lib/format.js';
+import { Button } from '../../../components/ui/button.js';
+import { StatusBadge } from '../../../components/ui/badge.js';
+import {
+  TableShell,
+  Table,
+  THead,
+  Th,
+  Tr,
+  Td,
+} from '../../../components/ui/table.js';
+import {
+  isSupportedSotKind,
+  validateRollbackTarget,
+} from '../../../lib/rollback-targets.js';
 
-interface VersionItem {
+export interface VersionItem {
   id: string;
   sot_kind: string;
   sot_id: string;
   version: number;
   status: string;
-  // tRPC over HTTP serializes Dates as ISO strings.
+  // tRPC sobre HTTP serializa Date como string ISO — aceitar ambas as formas.
   created_at: Date | string;
 }
 
-export default function VersionsTable({ versions }: { versions: VersionItem[] }) {
-  if (versions.length === 0) {
-    return (
-      <div className="border-2 border-dashed border-gray-300 p-8 text-center text-gray-500 rounded">
-        No versions to display. Once P8a-e and P4 versioned objects exist, they appear here.
-      </div>
-    );
-  }
+export default function VersionsTable({
+  versions,
+  canRollback,
+  activeVersionFor,
+  onRollback,
+}: {
+  versions: VersionItem[];
+  canRollback: boolean;
+  /** Versão ativa da mesma fonte (origem da reversão), se houver. */
+  activeVersionFor: (v: VersionItem) => number | undefined;
+  onRollback: (item: VersionItem, fromVersion: number) => void;
+}) {
   return (
-    <table className="w-full border-collapse text-sm">
-      <thead>
-        <tr className="border-b-2 border-gray-300 bg-gray-50">
-          <th className="p-2 text-left">SoT</th>
-          <th className="p-2 text-left">SoT ID</th>
-          <th className="p-2 text-left">Version</th>
-          <th className="p-2 text-left">Status</th>
-          <th className="p-2 text-left">Created</th>
-        </tr>
-      </thead>
-      <tbody>
-        {versions.map((v) => (
-          <tr key={v.id} className="border-b">
-            <td className="p-2"><code>{v.sot_kind}</code></td>
-            <td className="p-2 font-mono text-xs">{v.sot_id}</td>
-            <td className="p-2">v{v.version}</td>
-            <td className="p-2 capitalize">{v.status}</td>
-            <td className="p-2">{formatDate(v.created_at)}</td>
-          </tr>
-        ))}
-      </tbody>
-    </table>
+    <TableShell>
+      <Table>
+        <THead>
+          <Th>SoT</Th>
+          <Th>ID do SoT</Th>
+          <Th>Versão</Th>
+          <Th>Status</Th>
+          <Th>Criada em</Th>
+          {canRollback && <Th className="text-right">Ações</Th>}
+        </THead>
+        <tbody>
+          {versions.map((v) => {
+            const fromVersion = activeVersionFor(v);
+            // Alvo válido: existe versão ativa, o alvo é anterior a ela e não
+            // é, ele próprio, uma versão revertida (regra de negócio P8.5).
+            const rollbackable =
+              canRollback &&
+              fromVersion !== undefined &&
+              v.status !== 'rolled_back' &&
+              isSupportedSotKind(v.sot_kind) &&
+              validateRollbackTarget(v.sot_kind, fromVersion, v.version);
+            return (
+              <Tr key={v.id}>
+                <Td className="font-mono text-xs text-zinc-700">{v.sot_kind}</Td>
+                <Td className="font-mono text-xs text-zinc-700">{v.sot_id}</Td>
+                <Td className="tabular-nums">v{v.version}</Td>
+                <Td>
+                  <StatusBadge status={v.status} />
+                </Td>
+                <Td className="text-zinc-600">
+                  {new Date(v.created_at).toLocaleString('pt-BR')}
+                </Td>
+                {canRollback && (
+                  <Td className="text-right">
+                    {rollbackable && fromVersion !== undefined && (
+                      <Button
+                        variant="danger"
+                        size="sm"
+                        onClick={() => onRollback(v, fromVersion)}
+                      >
+                        Reverter
+                      </Button>
+                    )}
+                  </Td>
+                )}
+              </Tr>
+            );
+          })}
+        </tbody>
+      </Table>
+    </TableShell>
   );
 }

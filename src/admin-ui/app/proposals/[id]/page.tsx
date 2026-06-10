@@ -1,17 +1,26 @@
 'use client';
 
 import * as React from 'react';
+import Link from 'next/link';
 import { useSession } from 'next-auth/react';
 import { trpc } from '../../../trpc/client.js';
-import ProposalHeader from './_components/proposal-header.js';
+import { PageHeader } from '../../../components/ui/page-header.js';
+import { Card, CardHeader, CardBody } from '../../../components/ui/card.js';
+import { Badge, StatusBadge } from '../../../components/ui/badge.js';
+import { Button } from '../../../components/ui/button.js';
+import { LoadingState, ErrorState, EmptyState, Alert } from '../../../components/ui/states.js';
+import { IconArrowLeft, IconShield } from '../../../components/ui/icons.js';
 import DiffRenderer from './_components/diff-renderer.js';
 import ApprovalModal from './_components/approval-modal.js';
-import ArchitectureLockBanner from './_components/architecture-lock-banner.js';
-import RationalePanel from './_components/rationale-panel.js';
-import ImpactedArtifactsList from './_components/impacted-artifacts-list.js';
+import { TYPE_LABELS } from '../../inbox/_components/labels.js';
 
+/**
+ * Tela 2 — diff e decisão de uma proposta. Mostra o cabeçalho de governança
+ * (tipo, risco, origem, status, progresso de aprovação dupla), travas de
+ * arquitetura, o diff por tipo e a trilha de decisões anteriores.
+ */
 export default function ProposalDetailPage({ params }: { params: { id: string } }) {
-  const { data: session } = useSession();
+  const { data: session, status } = useSession();
   const tenantId = session?.user?.tenant_id ?? '';
   const userRole = session?.user?.role ?? 'viewer';
 
@@ -24,10 +33,17 @@ export default function ProposalDetailPage({ params }: { params: { id: string } 
     { enabled: tenantId !== '' },
   );
 
-  if (!tenantId) return <p>Loading session...</p>;
-  if (proposalQuery.isLoading) return <p>Loading proposal...</p>;
-  if (proposalQuery.error) return <p className="text-red-600">{proposalQuery.error.message}</p>;
-  if (!proposalQuery.data) return <p>Proposal not found.</p>;
+  if (status === 'loading' || !tenantId) return <LoadingState label="Carregando sessão…" />;
+  if (proposalQuery.isLoading) return <LoadingState label="Carregando proposta…" />;
+  if (proposalQuery.error)
+    return (
+      <ErrorState
+        message={proposalQuery.error.message}
+        onRetry={() => void proposalQuery.refetch()}
+      />
+    );
+  if (!proposalQuery.data)
+    return <EmptyState title="Proposta não encontrada" />;
 
   const proposal = proposalQuery.data;
   const lockBlocked = proposal.locks.length > 0 && userRole !== 'founder';
@@ -36,51 +52,190 @@ export default function ProposalDetailPage({ params }: { params: { id: string } 
   const canApprove =
     !lockBlocked && (userRole === 'founder' || proposal.required_roles.includes(userRole));
 
+  const approvedRoles = new Set(
+    proposal.approvals.filter((a) => a.decision === 'approved').map((a) => a.approver_role),
+  );
+
   return (
-    <div className="space-y-6">
-      <ProposalHeader proposal={proposal} />
+    <div>
+      <Link
+        href="/inbox"
+        className="mb-4 inline-flex items-center gap-1.5 text-xs font-medium text-zinc-500 transition-colors hover:text-brand-600"
+      >
+        <IconArrowLeft size={14} />
+        Voltar para Aprovações
+      </Link>
 
-      {proposal.locks.length > 0 && (
-        <ArchitectureLockBanner locks={proposal.locks} canBypass={userRole === 'founder'} />
-      )}
+      <PageHeader
+        title={proposal.descriptor}
+        description={
+          <>
+            {TYPE_LABELS[proposal.type]} · proposta{' '}
+            <code className="font-mono text-xs">{proposal.id.slice(0, 8)}</code> · classe de
+            aprovação <code className="font-mono text-xs">{proposal.approval_class}</code>
+          </>
+        }
+        actions={
+          <span className="flex items-center gap-2">
+            <StatusBadge status={proposal.risk} />
+            <StatusBadge status={proposal.status} />
+          </span>
+        }
+      />
 
-      {proposal.requires_dual && (
-        <div className="bg-blue-50 border border-blue-300 p-3 rounded text-sm">
-          <strong>Dual approval required:</strong> {proposal.required_roles.join(' + ')}.{' '}
-          {proposal.approvals.length > 0 && (
-            <span>
-              {proposal.approvals.length} of {proposal.required_roles.length} approvals recorded.
+      <div className="space-y-5">
+        <Card>
+          <CardBody>
+            <dl className="grid grid-cols-2 gap-x-6 gap-y-4 text-sm sm:grid-cols-3 lg:grid-cols-6">
+              {[
+                { label: 'Tipo', value: TYPE_LABELS[proposal.type] },
+                { label: 'Risco', value: <StatusBadge status={proposal.risk} /> },
+                {
+                  label: 'Origem',
+                  value: <span className="font-mono text-xs">{proposal.source}</span>,
+                },
+                {
+                  label: 'Proposto em',
+                  value: new Date(proposal.proposed_at).toLocaleString('pt-BR'),
+                },
+                {
+                  label: 'Proposto por',
+                  value: <span className="font-mono text-xs">{proposal.proposed_by}</span>,
+                },
+                { label: 'Status', value: <StatusBadge status={proposal.status} /> },
+              ].map((item) => (
+                <div key={item.label}>
+                  <dt className="text-2xs font-semibold uppercase tracking-wide text-zinc-500">
+                    {item.label}
+                  </dt>
+                  <dd className="mt-1 text-zinc-800">{item.value}</dd>
+                </div>
+              ))}
+            </dl>
+          </CardBody>
+        </Card>
+
+        {proposal.locks.length > 0 && (
+          <Alert
+            tone={userRole === 'founder' ? 'warning' : 'danger'}
+            title={
+              <span className="inline-flex items-center gap-1.5">
+                <IconShield size={15} />
+                {userRole === 'founder'
+                  ? 'Trava de arquitetura — prossiga com autoridade de founder'
+                  : 'Trava de arquitetura — aprovação de founder obrigatória'}
+              </span>
+            }
+          >
+            <p>Esta proposta toca {proposal.locks.length} trava(s) de arquitetura:</p>
+            <ul className="mt-1 list-inside list-disc">
+              {proposal.locks.map((lock) => (
+                <li key={lock}>
+                  <code className="rounded bg-white/70 px-1 font-mono">{lock}</code>
+                </li>
+              ))}
+            </ul>
+            {userRole !== 'founder' && (
+              <p className="mt-2 font-medium">
+                Botões de aprovar/rejeitar desabilitados. Escale para um usuário com papel
+                founder.
+              </p>
+            )}
+          </Alert>
+        )}
+
+        {proposal.requires_dual && (
+          <Alert tone="info" title="Aprovação dupla obrigatória">
+            <p>
+              Papéis exigidos: {proposal.required_roles.join(' + ')}.{' '}
+              {proposal.approvals.length > 0 && (
+                <>
+                  {proposal.approvals.length} de {proposal.required_roles.length} aprovações
+                  registradas.
+                </>
+              )}
+            </p>
+            <span className="mt-2 flex flex-wrap items-center gap-1.5">
+              {proposal.required_roles.map((r) => (
+                <Badge key={r} tone={approvedRoles.has(r) ? 'success' : 'neutral'}>
+                  {r}: {approvedRoles.has(r) ? 'aprovado' : 'pendente'}
+                </Badge>
+              ))}
+            </span>
+          </Alert>
+        )}
+
+        <DiffRenderer type={proposal.type} body={proposal.body} />
+
+        <Card>
+          <CardHeader
+            title="Justificativas e trilha de auditoria"
+            description="Decisões já registradas para esta proposta."
+          />
+          <CardBody>
+            {proposal.approvals.length > 0 ? (
+              <ul className="space-y-3">
+                {proposal.approvals.map((a) => (
+                  <li key={a.id} className="border-l-2 border-brand-200 pl-3 text-sm">
+                    <span className="flex flex-wrap items-center gap-2">
+                      <StatusBadge status={a.decision} />
+                      <code className="rounded bg-zinc-100 px-1 font-mono text-xs">
+                        {a.approver_role}
+                      </code>
+                      <span className="text-xs text-zinc-500">
+                        em {new Date(a.decided_at).toLocaleString('pt-BR')}
+                      </span>
+                    </span>
+                    {a.comment && <p className="mt-1 text-zinc-700">{a.comment}</p>}
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="text-sm text-zinc-500">
+                Nenhuma decisão anterior nesta proposta.
+              </p>
+            )}
+          </CardBody>
+        </Card>
+
+        <Card>
+          <CardHeader
+            title="Artefatos impactados"
+            description="Grafo de impacto completo chega no P8.5 v1.1."
+          />
+          <CardBody>
+            <p className="text-sm text-zinc-500">
+              Classe de aprovação:{' '}
+              <code className="rounded bg-zinc-100 px-1 font-mono text-xs">
+                {proposal.approval_class}
+              </code>
+            </p>
+          </CardBody>
+        </Card>
+
+        <div className="sticky bottom-4 z-10 flex flex-wrap items-center gap-3 rounded-xl border border-zinc-200 bg-white px-5 py-3 shadow-overlay">
+          <Button
+            variant="success"
+            onClick={() => setShowApprovalModal('approve')}
+            disabled={!canApprove}
+          >
+            Aprovar
+          </Button>
+          <Button
+            variant="danger"
+            onClick={() => setShowApprovalModal('reject')}
+            disabled={!canApprove}
+          >
+            Rejeitar
+          </Button>
+          {!canApprove && (
+            <span className="text-xs text-zinc-500">
+              {lockBlocked
+                ? 'Propostas com trava de arquitetura exigem o papel founder.'
+                : `Seu papel (${userRole}) não pode decidir esta classe de aprovação.`}
             </span>
           )}
         </div>
-      )}
-
-      <DiffRenderer proposal={proposal} />
-      <RationalePanel proposal={proposal} />
-      <ImpactedArtifactsList proposal={proposal} />
-
-      <div className="flex gap-3 sticky bottom-4">
-        <button
-          onClick={() => setShowApprovalModal('approve')}
-          disabled={!canApprove}
-          className="bg-green-600 text-white px-6 py-2 rounded hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed"
-        >
-          Approve
-        </button>
-        <button
-          onClick={() => setShowApprovalModal('reject')}
-          disabled={!canApprove}
-          className="bg-red-600 text-white px-6 py-2 rounded hover:bg-red-700 disabled:opacity-50"
-        >
-          Reject
-        </button>
-        {!canApprove && (
-          <span className="text-sm text-gray-600 self-center">
-            {lockBlocked
-              ? 'Locked proposals require founder role.'
-              : `Your role (${userRole}) cannot decide this approval class.`}
-          </span>
-        )}
       </div>
 
       {showApprovalModal && (

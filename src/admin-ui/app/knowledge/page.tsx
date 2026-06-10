@@ -3,6 +3,23 @@
 import * as React from 'react';
 import { useSession } from 'next-auth/react';
 import { trpc } from '../../trpc/client.js';
+import { PageHeader } from '../../components/ui/page-header.js';
+import { Field, Select } from '../../components/ui/field.js';
+import { Tabs } from '../../components/ui/tabs.js';
+import {
+  TableShell,
+  Table,
+  THead,
+  Th,
+  Tr,
+  Td,
+} from '../../components/ui/table.js';
+import {
+  LoadingState,
+  ErrorState,
+  EmptyState,
+} from '../../components/ui/states.js';
+import { IconBrain } from '../../components/ui/icons.js';
 
 type Tab = 'memory_review' | 'facts' | 'rules';
 
@@ -31,158 +48,158 @@ export default function KnowledgePage() {
     { enabled: tenantId !== '' && agentId !== '' && tab === 'rules' },
   );
 
-  if (status === 'loading') return <p>Loading session...</p>;
+  if (status === 'loading') return <LoadingState label="Carregando sessão…" />;
 
-  const TabButton = ({ id, label }: { id: Tab; label: string }) => (
-    <button
-      onClick={() => setTab(id)}
-      className={`px-3 py-1 text-sm rounded ${
-        tab === id
-          ? 'bg-blue-600 text-white'
-          : 'bg-gray-100 hover:bg-gray-200 text-gray-700'
-      }`}
-    >
-      {label}
-    </button>
-  );
+  const memoryItems = memoryQuery.data?.items ?? [];
+  const factItems = factsQuery.data?.items ?? [];
+  const ruleItems = rulesQuery.data?.items ?? [];
 
   return (
-    <div className="space-y-6">
-      <header>
-        <h1 className="text-2xl font-bold">Knowledge</h1>
-        <p className="text-sm text-gray-600">
-          What the agent has learned: pending memory review, declarative facts,
-          and behavioral rules.
-        </p>
-      </header>
+    <div>
+      <PageHeader
+        title="Conhecimento"
+        description="O que o agente aprendeu: memória pendente de revisão, fatos declarativos e regras de comportamento."
+      />
 
-      <div className="flex items-center gap-3 text-sm">
-        <span className="font-medium">Agent:</span>
-        <select
-          value={agentId}
-          onChange={(e) => setAgentId(e.target.value)}
-          className="border rounded p-1"
-        >
-          <option value="">Select…</option>
-          {(agentsQuery.data?.items ?? []).map((a) => (
-            <option key={a.id} value={a.id}>
-              {a.id}
-            </option>
-          ))}
-        </select>
-        <div className="flex gap-2 ml-3">
-          <TabButton id="memory_review" label="Memory (needs review)" />
-          <TabButton id="facts" label="Facts" />
-          <TabButton id="rules" label="Behavior rules" />
-        </div>
+      <div className="mb-4 max-w-xs">
+        <Field label="Agente">
+          <Select value={agentId} onChange={(e) => setAgentId(e.target.value)}>
+            <option value="">Selecione…</option>
+            {(agentsQuery.data?.items ?? []).map((a) => (
+              <option key={a.id} value={a.id}>
+                {a.nome} ({a.id})
+              </option>
+            ))}
+          </Select>
+        </Field>
       </div>
 
+      <Tabs
+        className="mb-4"
+        tabs={[
+          { id: 'memory_review', label: 'Memória (revisão pendente)' },
+          { id: 'facts', label: 'Fatos' },
+          { id: 'rules', label: 'Regras de comportamento' },
+        ]}
+        value={tab}
+        onChange={(id) => setTab(id as Tab)}
+      />
+
       {!agentId ? (
-        <p className="text-gray-500 text-sm">Pick an agent.</p>
+        <EmptyState
+          icon={<IconBrain size={28} />}
+          title="Selecione um agente"
+          description="Escolha um agente acima para visualizar o que ele aprendeu."
+        />
       ) : tab === 'memory_review' ? (
         memoryQuery.isLoading ? (
-          <p>Loading...</p>
+          <LoadingState />
         ) : memoryQuery.error ? (
-          <p className="text-red-600">Error: {memoryQuery.error.message}</p>
+          <ErrorState
+            message={memoryQuery.error.message}
+            onRetry={() => void memoryQuery.refetch()}
+          />
+        ) : memoryItems.length === 0 ? (
+          <EmptyState
+            icon={<IconBrain size={28} />}
+            title="Nenhuma entrada de memória pendente de revisão"
+          />
         ) : (
-          <table className="w-full text-sm border-collapse">
-            <thead>
-              <tr className="bg-gray-100">
-                <th className="text-left p-2 border-b">Content</th>
-                <th className="text-left p-2 border-b">Type</th>
-                <th className="text-left p-2 border-b">Scope</th>
-                <th className="text-left p-2 border-b">Sensitivity</th>
-              </tr>
-            </thead>
-            <tbody>
-              {(memoryQuery.data?.items ?? []).map((m) => (
-                <tr key={m.id} className="border-b hover:bg-gray-50">
-                  <td className="p-2 max-w-md truncate" title={m.content}>
-                    {m.content}
-                  </td>
-                  <td className="p-2">{m.memory_type}</td>
-                  <td className="p-2">{m.scope_type}</td>
-                  <td className="p-2">{m.sensitivity}</td>
-                </tr>
-              ))}
-              {(memoryQuery.data?.items ?? []).length === 0 && (
-                <tr>
-                  <td colSpan={4} className="p-4 text-center text-gray-500">
-                    No memory entries pending review.
-                  </td>
-                </tr>
-              )}
-            </tbody>
-          </table>
+          <TableShell>
+            <Table>
+              <THead>
+                <Th>Conteúdo</Th>
+                <Th>Tipo</Th>
+                <Th>Escopo</Th>
+                <Th>Sensibilidade</Th>
+              </THead>
+              <tbody>
+                {memoryItems.map((m) => (
+                  <Tr key={m.id}>
+                    <Td className="max-w-md truncate" title={m.content}>
+                      {m.content}
+                    </Td>
+                    <Td>{m.memory_type}</Td>
+                    <Td>{m.scope_type}</Td>
+                    <Td>{m.sensitivity}</Td>
+                  </Tr>
+                ))}
+              </tbody>
+            </Table>
+          </TableShell>
         )
       ) : tab === 'facts' ? (
         factsQuery.isLoading ? (
-          <p>Loading...</p>
+          <LoadingState />
         ) : factsQuery.error ? (
-          <p className="text-red-600">Error: {factsQuery.error.message}</p>
+          <ErrorState
+            message={factsQuery.error.message}
+            onRetry={() => void factsQuery.refetch()}
+          />
+        ) : factItems.length === 0 ? (
+          <EmptyState
+            icon={<IconBrain size={28} />}
+            title="Nenhum fato neste escopo"
+          />
         ) : (
-          <table className="w-full text-sm border-collapse">
-            <thead>
-              <tr className="bg-gray-100">
-                <th className="text-left p-2 border-b">Scope</th>
-                <th className="text-left p-2 border-b">Key</th>
-                <th className="text-left p-2 border-b">Source</th>
-                <th className="text-left p-2 border-b">Confidence</th>
-              </tr>
-            </thead>
-            <tbody>
-              {(factsQuery.data?.items ?? []).map((f) => (
-                <tr key={f.id} className="border-b hover:bg-gray-50">
-                  <td className="p-2">{f.escopo}</td>
-                  <td className="p-2 font-mono">{f.chave}</td>
-                  <td className="p-2">{f.fonte}</td>
-                  <td className="p-2">{String(f.confianca)}</td>
-                </tr>
-              ))}
-              {(factsQuery.data?.items ?? []).length === 0 && (
-                <tr>
-                  <td colSpan={4} className="p-4 text-center text-gray-500">
-                    No facts in this scope.
-                  </td>
-                </tr>
-              )}
-            </tbody>
-          </table>
+          <TableShell>
+            <Table>
+              <THead>
+                <Th>Escopo</Th>
+                <Th>Chave</Th>
+                <Th>Fonte</Th>
+                <Th>Confiança</Th>
+              </THead>
+              <tbody>
+                {factItems.map((f) => (
+                  <Tr key={f.id}>
+                    <Td>{f.escopo}</Td>
+                    <Td className="font-mono text-xs text-zinc-700">{f.chave}</Td>
+                    <Td>{f.fonte}</Td>
+                    <Td className="tabular-nums">{String(f.confianca)}</Td>
+                  </Tr>
+                ))}
+              </tbody>
+            </Table>
+          </TableShell>
         )
       ) : rulesQuery.isLoading ? (
-        <p>Loading...</p>
+        <LoadingState />
       ) : rulesQuery.error ? (
-        <p className="text-red-600">Error: {rulesQuery.error.message}</p>
+        <ErrorState
+          message={rulesQuery.error.message}
+          onRetry={() => void rulesQuery.refetch()}
+        />
+      ) : ruleItems.length === 0 ? (
+        <EmptyState
+          icon={<IconBrain size={28} />}
+          title="Nenhuma regra ativa"
+        />
       ) : (
-        <table className="w-full text-sm border-collapse">
-          <thead>
-            <tr className="bg-gray-100">
-              <th className="text-left p-2 border-b">Tipo</th>
-              <th className="text-left p-2 border-b">Context</th>
-              <th className="text-left p-2 border-b">Confidence</th>
-              <th className="text-left p-2 border-b">Hits/Errs</th>
-            </tr>
-          </thead>
-          <tbody>
-            {(rulesQuery.data?.items ?? []).map((r) => (
-              <tr key={r.id} className="border-b hover:bg-gray-50">
-                <td className="p-2">{r.tipo}</td>
-                <td className="p-2 max-w-md truncate">{r.contexto}</td>
-                <td className="p-2">{String(r.confianca)}</td>
-                <td className="p-2">
-                  {r.acertos}/{r.erros}
-                </td>
-              </tr>
-            ))}
-            {(rulesQuery.data?.items ?? []).length === 0 && (
-              <tr>
-                <td colSpan={4} className="p-4 text-center text-gray-500">
-                  No active rules.
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
+        <TableShell>
+          <Table>
+            <THead>
+              <Th>Tipo</Th>
+              <Th>Contexto</Th>
+              <Th>Confiança</Th>
+              <Th>Acertos/Erros</Th>
+            </THead>
+            <tbody>
+              {ruleItems.map((r) => (
+                <Tr key={r.id}>
+                  <Td>{r.tipo}</Td>
+                  <Td className="max-w-md truncate" title={r.contexto}>
+                    {r.contexto}
+                  </Td>
+                  <Td className="tabular-nums">{String(r.confianca)}</Td>
+                  <Td className="tabular-nums">
+                    {r.acertos}/{r.erros}
+                  </Td>
+                </Tr>
+              ))}
+            </tbody>
+          </Table>
+        </TableShell>
       )}
     </div>
   );

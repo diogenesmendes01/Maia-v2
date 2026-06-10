@@ -3,6 +3,24 @@
 import * as React from 'react';
 import { useSession } from 'next-auth/react';
 import { trpc } from '../../trpc/client.js';
+import { PageHeader } from '../../components/ui/page-header.js';
+import { Field, Select } from '../../components/ui/field.js';
+import { Tabs } from '../../components/ui/tabs.js';
+import { StatusBadge } from '../../components/ui/badge.js';
+import {
+  TableShell,
+  Table,
+  THead,
+  Th,
+  Tr,
+  Td,
+} from '../../components/ui/table.js';
+import {
+  LoadingState,
+  ErrorState,
+  EmptyState,
+} from '../../components/ui/states.js';
+import { IconLayers } from '../../components/ui/icons.js';
 
 type Tab = 'domains' | 'skills' | 'gaps' | 'proposals';
 
@@ -35,98 +53,89 @@ export default function CapabilitiesPage() {
     { enabled: tenantId !== '' && agentId !== '' && tab === 'proposals' },
   );
 
-  if (status === 'loading') return <p>Loading session...</p>;
-
-  const TabButton = ({ id, label }: { id: Tab; label: string }) => (
-    <button
-      onClick={() => setTab(id)}
-      className={`px-3 py-1 text-sm rounded ${
-        tab === id
-          ? 'bg-blue-600 text-white'
-          : 'bg-gray-100 hover:bg-gray-200 text-gray-700'
-      }`}
-    >
-      {label}
-    </button>
-  );
+  if (status === 'loading') return <LoadingState label="Carregando sessão…" />;
 
   return (
-    <div className="space-y-6">
-      <header>
-        <h1 className="text-2xl font-bold">Capabilities</h1>
-        <p className="text-sm text-gray-600">
-          Domain → skill catalog, gaps the agent has surfaced, and pending
-          capability proposals (P5 — dialogical capability acquisition).
-        </p>
-      </header>
+    <div>
+      <PageHeader
+        title="Capacidades"
+        description="Catálogo de domínios e skills, lacunas detectadas pelo agente e propostas de capacidade pendentes (P5 — aquisição dialógica de capacidades)."
+      />
 
-      <div className="flex items-center gap-3 text-sm">
-        <span className="font-medium">Agent:</span>
-        <select
-          value={agentId}
-          onChange={(e) => setAgentId(e.target.value)}
-          className="border rounded p-1"
-        >
-          <option value="">Select…</option>
-          {(agentsQuery.data?.items ?? []).map((a) => (
-            <option key={a.id} value={a.id}>
-              {a.id}
-            </option>
-          ))}
-        </select>
-        <div className="flex gap-2 ml-4">
-          <TabButton id="proposals" label="Proposals" />
-          <TabButton id="gaps" label="Gaps" />
-          <TabButton id="skills" label="Skills" />
-          <TabButton id="domains" label="Domains" />
-        </div>
+      <div className="mb-4 max-w-xs">
+        <Field label="Agente">
+          <Select value={agentId} onChange={(e) => setAgentId(e.target.value)}>
+            <option value="">Selecione…</option>
+            {(agentsQuery.data?.items ?? []).map((a) => (
+              <option key={a.id} value={a.id}>
+                {a.nome} ({a.id})
+              </option>
+            ))}
+          </Select>
+        </Field>
       </div>
 
+      <Tabs
+        className="mb-4"
+        tabs={[
+          { id: 'proposals', label: 'Propostas' },
+          { id: 'gaps', label: 'Lacunas' },
+          { id: 'skills', label: 'Skills' },
+          { id: 'domains', label: 'Domínios' },
+        ]}
+        value={tab}
+        onChange={(id) => setTab(id as Tab)}
+      />
+
       {!agentId ? (
-        <p className="text-gray-500 text-sm">Pick an agent to see capabilities.</p>
+        <EmptyState
+          icon={<IconLayers size={28} />}
+          title="Selecione um agente"
+          description="Escolha um agente acima para ver suas capacidades."
+        />
       ) : tab === 'proposals' ? (
-        <SimpleTable
+        <DataTable
           query={proposalsQuery}
           columns={[
-            { key: 'title', label: 'Title' },
-            { key: 'capability_type', label: 'Type' },
-            { key: 'status', label: 'Status' },
-            { key: 'submitted_at', label: 'Submitted', date: true },
+            { key: 'title', label: 'Título' },
+            { key: 'capability_type', label: 'Tipo', kind: 'mono' },
+            { key: 'status', label: 'Status', kind: 'status' },
+            { key: 'submitted_at', label: 'Enviada em', kind: 'date' },
           ]}
-          emptyLabel="No pending capability proposals."
+          emptyLabel="Nenhuma proposta de capacidade pendente."
         />
       ) : tab === 'gaps' ? (
-        <SimpleTable
+        <DataTable
           query={gapsQuery}
           columns={[
-            { key: 'capability_description', label: 'Capability' },
-            { key: 'current_level', label: 'Level' },
-            { key: 'tipo', label: 'Type' },
-            { key: 'last_observed', label: 'Last observed', date: true },
+            { key: 'capability_description', label: 'Capacidade' },
+            { key: 'current_level', label: 'Nível' },
+            { key: 'tipo', label: 'Tipo' },
+            { key: 'last_observed', label: 'Última observação', kind: 'date' },
           ]}
-          emptyLabel="No capability gaps recorded."
+          emptyLabel="Nenhuma lacuna de capacidade registrada."
         />
       ) : tab === 'skills' ? (
-        <SimpleTable
+        <DataTable
           query={skillsQuery}
           columns={[
-            { key: 'domain', label: 'Domain' },
+            { key: 'domain', label: 'Domínio' },
             { key: 'skill_name', label: 'Skill' },
-            { key: 'confidence', label: 'Confidence' },
-            { key: 'evidence_count', label: 'Evidences' },
+            { key: 'confidence', label: 'Confiança' },
+            { key: 'evidence_count', label: 'Evidências' },
           ]}
-          emptyLabel="No skills cataloged yet."
+          emptyLabel="Nenhuma skill catalogada ainda."
         />
       ) : (
-        <SimpleTable
+        <DataTable
           query={domainsQuery}
           columns={[
-            { key: 'domain', label: 'Domain' },
-            { key: 'confidence', label: 'Confidence' },
-            { key: 'evidence_count', label: 'Evidences' },
-            { key: 'updated_at', label: 'Updated', date: true },
+            { key: 'domain', label: 'Domínio' },
+            { key: 'confidence', label: 'Confiança' },
+            { key: 'evidence_count', label: 'Evidências' },
+            { key: 'updated_at', label: 'Atualizado em', kind: 'date' },
           ]}
-          emptyLabel="No domains cataloged yet."
+          emptyLabel="Nenhum domínio catalogado ainda."
         />
       )}
     </div>
@@ -136,16 +145,29 @@ export default function CapabilitiesPage() {
 interface Col {
   key: string;
   label: string;
-  date?: boolean;
+  kind?: 'date' | 'status' | 'mono';
 }
 
 type QueryShape = {
   data?: { items: unknown[] };
   isLoading: boolean;
   error: { message: string } | null;
+  refetch: () => unknown;
 };
 
-function SimpleTable({
+function renderCell(value: unknown, col: Col): React.ReactNode {
+  if (value == null) return '—';
+  if (col.kind === 'date' && (typeof value === 'string' || value instanceof Date)) {
+    return new Date(value).toLocaleString('pt-BR');
+  }
+  if (col.kind === 'status') return <StatusBadge status={String(value)} />;
+  if (col.kind === 'mono') {
+    return <span className="font-mono text-xs text-zinc-700">{String(value)}</span>;
+  }
+  return String(value);
+}
+
+function DataTable({
   query,
   columns,
   emptyLabel,
@@ -154,45 +176,34 @@ function SimpleTable({
   columns: Col[];
   emptyLabel: string;
 }) {
-  if (query.isLoading) return <p>Loading...</p>;
-  if (query.error) return <p className="text-red-600">Error: {query.error.message}</p>;
+  if (query.isLoading) return <LoadingState />;
+  if (query.error) {
+    return (
+      <ErrorState message={query.error.message} onRetry={() => void query.refetch()} />
+    );
+  }
   const items = (query.data?.items ?? []) as Array<Record<string, unknown>>;
+  if (items.length === 0) {
+    return <EmptyState icon={<IconLayers size={28} />} title={emptyLabel} />;
+  }
   return (
-    <table className="w-full text-sm border-collapse">
-      <thead>
-        <tr className="bg-gray-100">
+    <TableShell>
+      <Table>
+        <THead>
           {columns.map((c) => (
-            <th key={c.key} className="text-left p-2 border-b">
-              {c.label}
-            </th>
+            <Th key={c.key}>{c.label}</Th>
           ))}
-        </tr>
-      </thead>
-      <tbody>
-        {items.map((row, i) => (
-          <tr key={(row.id as string) ?? i} className="border-b hover:bg-gray-50">
-            {columns.map((c) => {
-              const v = row[c.key];
-              return (
-                <td key={c.key} className="p-2">
-                  {v == null
-                    ? '—'
-                    : c.date && (typeof v === 'string' || v instanceof Date)
-                      ? new Date(v as string | Date).toLocaleString()
-                      : String(v)}
-                </td>
-              );
-            })}
-          </tr>
-        ))}
-        {items.length === 0 && (
-          <tr>
-            <td colSpan={columns.length} className="p-4 text-center text-gray-500">
-              {emptyLabel}
-            </td>
-          </tr>
-        )}
-      </tbody>
-    </table>
+        </THead>
+        <tbody>
+          {items.map((row, i) => (
+            <Tr key={typeof row.id === 'string' ? row.id : i}>
+              {columns.map((c) => (
+                <Td key={c.key}>{renderCell(row[c.key], c)}</Td>
+              ))}
+            </Tr>
+          ))}
+        </tbody>
+      </Table>
+    </TableShell>
   );
 }

@@ -11,9 +11,9 @@ import { test } from '@playwright/test';
 test.describe('Audit Log', () => {
   test('approval writes single audit entry', async ({ page }) => {
     await page.goto('http://localhost:4000/proposals/audit-test');
-    await page.click('text=Approve');
+    await page.getByRole('button', { name: 'Aprovar', exact: true }).click();
     await page.fill('textarea', 'Audit trail integration test approval.');
-    await page.click('text=Confirm approve');
+    await page.click('text=Confirmar aprovação');
     // Verify via API: audit count incremented by 1
   });
 

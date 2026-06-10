@@ -1,34 +1,71 @@
 'use client';
 
 import * as React from 'react';
-import DiffPolicyRule from './diff-policy-rule.js';
-import DiffSoulBias from './diff-soul-bias.js';
-import DiffSkill from './diff-skill.js';
-import DiffCapability from './diff-capability.js';
-import DiffKnowledge from './diff-knowledge.js';
+import type { ProposalTypeId } from '../../../../trpc/types.js';
+import { Card, CardHeader, CardBody } from '../../../../components/ui/card.js';
+import { Alert } from '../../../../components/ui/states.js';
 
 /**
- * Diff renderer dispatcher. Each proposal type has its own diff component
- * (see proposal-type-registry.ts).
+ * Renderizador de diff por tipo de proposta (ver proposal-type-registry.ts).
+ * A lógica por tipo permanece a do P8.5 v1.0: corpo bruto em JSON formatado;
+ * o diff JSON detalhado chega no P8.5 v1.1 (react-diff-viewer-continued já
+ * está disponível para essa evolução).
  */
-export default function DiffRenderer({ proposal }: { proposal: any }) {
-  switch (proposal.type) {
-    case 'policy_rule':
-      return <DiffPolicyRule body={proposal.body} />;
-    case 'soul_bias':
-      return <DiffSoulBias body={proposal.body} />;
-    case 'skill':
-      return <DiffSkill body={proposal.body} />;
-    case 'capability_proposal':
-      return <DiffCapability body={proposal.body} />;
-    case 'knowledge_proposal':
-      return <DiffKnowledge body={proposal.body} />;
-    default:
-      return (
-        <div className="bg-yellow-50 border border-yellow-300 p-4 rounded">
-          <p className="font-medium">Unknown proposal type: {String(proposal.type)}</p>
-          <pre className="text-xs mt-2 overflow-auto">{JSON.stringify(proposal.body, null, 2)}</pre>
-        </div>
-      );
+const SECTIONS: Record<ProposalTypeId, { title: string; description: string }> = {
+  policy_rule: {
+    title: 'Diff da regra de política',
+    description: 'Renderização detalhada de diff JSON (P8.5 v1.1). Por enquanto: corpo bruto.',
+  },
+  soul_bias: {
+    title: 'Diff do viés de identidade',
+    description: 'Mudanças nas dimensões de viés da identidade (soul bias).',
+  },
+  skill: {
+    title: 'Diff da skill',
+    description: 'Mudanças de escopo e competência da skill.',
+  },
+  capability_proposal: {
+    title: 'Especificação da capacidade',
+    description:
+      'Capacidade de ferramenta proposta pelo agente (capability_proposals.proposed_spec).',
+  },
+  knowledge_proposal: {
+    title: 'Proposta de conhecimento',
+    description: 'Entrada de conhecimento proposta para ativação.',
+  },
+};
+
+function BodyPre({ body }: { body: unknown }) {
+  return (
+    <pre className="scroll-thin max-h-96 overflow-auto rounded-lg bg-zinc-50 p-4 font-mono text-xs leading-relaxed text-zinc-800">
+      {JSON.stringify(body, null, 2)}
+    </pre>
+  );
+}
+
+export default function DiffRenderer({
+  type,
+  body,
+}: {
+  type: ProposalTypeId;
+  body: unknown;
+}) {
+  const section = SECTIONS[type] as { title: string; description: string } | undefined;
+
+  if (!section) {
+    return (
+      <Alert tone="warning" title={`Tipo de proposta desconhecido: ${String(type)}`}>
+        <BodyPre body={body} />
+      </Alert>
+    );
   }
+
+  return (
+    <Card>
+      <CardHeader title={section.title} description={section.description} />
+      <CardBody>
+        <BodyPre body={body} />
+      </CardBody>
+    </Card>
+  );
 }
