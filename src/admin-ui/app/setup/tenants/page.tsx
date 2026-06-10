@@ -5,7 +5,29 @@ import { useSession } from 'next-auth/react';
 import { trpc } from '../../../trpc/client.js';
 import TenantCreateModal from './_components/tenant-create-modal.js';
 import TenantStatusModal from './_components/tenant-status-modal.js';
+import { PageHeader } from '../../../components/ui/page-header.js';
+import { Button } from '../../../components/ui/button.js';
+import { StatusBadge } from '../../../components/ui/badge.js';
+import {
+  TableShell,
+  Table,
+  THead,
+  Th,
+  Tr,
+  Td,
+} from '../../../components/ui/table.js';
+import {
+  LoadingState,
+  ErrorState,
+  EmptyState,
+  Alert,
+} from '../../../components/ui/states.js';
+import { IconUsers, IconPlus } from '../../../components/ui/icons.js';
 
+/**
+ * Setup → Tenants (somente founder). Provisiona novos tenants e alterna o
+ * status; toda mudança é auditada em `admin_audit_log`.
+ */
 export default function TenantsSetupPage() {
   const { data: session, status } = useSession();
   const role = session?.user?.role ?? '';
@@ -20,93 +42,96 @@ export default function TenantsSetupPage() {
 
   const listQuery = trpc.tenants.list.useQuery(undefined, { enabled: isFounder });
 
-  if (status === 'loading') return <p>Loading session...</p>;
+  if (status === 'loading') return <LoadingState label="Carregando sessão…" />;
 
   if (!isFounder) {
     return (
-      <div className="space-y-2">
-        <h1 className="text-2xl font-bold">Tenants</h1>
-        <p className="text-sm text-red-700">
-          Tenant management requires the <code>founder</code> role. Your current
-          role is <code>{role || '(none)'}</code>.
-        </p>
+      <div>
+        <PageHeader title="Tenants" />
+        <Alert tone="danger" title="Acesso restrito">
+          A gestão de tenants exige o papel{' '}
+          <code className="font-mono">founder</code>. Seu papel atual é{' '}
+          <code className="font-mono">{role || '(nenhum)'}</code>.
+        </Alert>
       </div>
     );
   }
 
+  const tenants = listQuery.data?.items ?? [];
+
   return (
-    <div className="space-y-6">
-      <header className="flex justify-between items-start">
-        <div>
-          <h1 className="text-2xl font-bold">Tenants</h1>
-          <p className="text-sm text-gray-600">
-            Provision new tenants and toggle status. Every change is audited in{' '}
-            <code>admin_audit_log</code>.
-          </p>
-        </div>
-        <button
-          onClick={() => setShowCreate(true)}
-          className="bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700"
-        >
-          New tenant
-        </button>
-      </header>
+    <div>
+      <PageHeader
+        title="Tenants"
+        description={
+          <>
+            Provisione novos tenants e alterne o status. Toda mudança é
+            auditada em <code className="font-mono">admin_audit_log</code>.
+          </>
+        }
+        actions={
+          <Button onClick={() => setShowCreate(true)}>
+            <IconPlus size={15} />
+            Novo tenant
+          </Button>
+        }
+      />
 
       {listQuery.isLoading ? (
-        <p>Loading tenants...</p>
+        <LoadingState label="Carregando tenants…" />
       ) : listQuery.error ? (
-        <p className="text-red-600">Error: {listQuery.error.message}</p>
+        <ErrorState
+          message={listQuery.error.message}
+          onRetry={() => void listQuery.refetch()}
+        />
+      ) : tenants.length === 0 ? (
+        <EmptyState
+          icon={<IconUsers size={36} />}
+          title="Nenhum tenant ainda"
+          action={
+            <Button onClick={() => setShowCreate(true)}>
+              <IconPlus size={15} />
+              Criar o primeiro tenant
+            </Button>
+          }
+        />
       ) : (
-        <table className="w-full text-sm border-collapse">
-          <thead>
-            <tr className="bg-gray-100">
-              <th className="text-left p-2 border-b">ID</th>
-              <th className="text-left p-2 border-b">Nome</th>
-              <th className="text-left p-2 border-b">Status</th>
-              <th className="text-left p-2 border-b">Created</th>
-              <th className="text-left p-2 border-b">Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {(listQuery.data?.items ?? []).map((t) => (
-              <tr key={t.id} className="border-b hover:bg-gray-50">
-                <td className="p-2 font-mono">{t.id}</td>
-                <td className="p-2">{t.nome}</td>
-                <td className="p-2">
-                  <span
-                    className={
-                      t.status === 'active'
-                        ? 'px-2 py-0.5 bg-green-100 text-green-800 rounded text-xs'
-                        : 'px-2 py-0.5 bg-yellow-100 text-yellow-800 rounded text-xs'
-                    }
-                  >
-                    {t.status}
-                  </span>
-                </td>
-                <td className="p-2 text-gray-600">
-                  {new Date(t.created_at).toLocaleString()}
-                </td>
-                <td className="p-2">
-                  <button
-                    onClick={() =>
-                      setStatusTarget({ id: t.id, nome: t.nome, status: t.status })
-                    }
-                    className="text-blue-600 hover:underline"
-                  >
-                    Toggle status
-                  </button>
-                </td>
-              </tr>
-            ))}
-            {(listQuery.data?.items ?? []).length === 0 && (
-              <tr>
-                <td colSpan={5} className="p-4 text-center text-gray-500">
-                  No tenants yet.
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
+        <TableShell>
+          <Table>
+            <THead>
+              <Th>ID</Th>
+              <Th>Nome</Th>
+              <Th>Status</Th>
+              <Th>Criado em</Th>
+              <Th>Ações</Th>
+            </THead>
+            <tbody>
+              {tenants.map((t) => (
+                <Tr key={t.id}>
+                  <Td className="font-mono text-xs">{t.id}</Td>
+                  <Td>{t.nome}</Td>
+                  <Td>
+                    <StatusBadge status={t.status} />
+                  </Td>
+                  <Td className="text-xs text-zinc-500">
+                    {new Date(t.created_at).toLocaleString('pt-BR')}
+                  </Td>
+                  <Td>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() =>
+                        setStatusTarget({ id: t.id, nome: t.nome, status: t.status })
+                      }
+                    >
+                      Alterar status
+                    </Button>
+                  </Td>
+                </Tr>
+              ))}
+            </tbody>
+          </Table>
+        </TableShell>
       )}
 
       {showCreate && (

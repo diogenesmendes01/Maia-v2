@@ -2,6 +2,10 @@
 
 import * as React from 'react';
 import { trpc } from '../../../../trpc/client.js';
+import { Modal } from '../../../../components/ui/modal.js';
+import { Button } from '../../../../components/ui/button.js';
+import { Field, Select, Textarea } from '../../../../components/ui/field.js';
+import { Alert, LoadingState } from '../../../../components/ui/states.js';
 
 interface Props {
   tenantId: string;
@@ -42,7 +46,8 @@ export default function ChannelPolicyModal({
   const [comment, setComment] = React.useState('');
   const [error, setError] = React.useState<string | null>(null);
 
-  // Hydrate form once when the existing-policy query resolves.
+  // Hidrata o formulário uma única vez quando a query da política existente
+  // resolve.
   const hydratedRef = React.useRef(false);
   React.useEffect(() => {
     if (hydratedRef.current) return;
@@ -59,11 +64,11 @@ export default function ChannelPolicyModal({
   const handleSubmit = async () => {
     setError(null);
     if (!defaultRoleId) {
-      setError('Pick a default role.');
+      setError('Escolha um papel padrão.');
       return;
     }
     if (comment.trim().length < 10) {
-      setError('Comment must be at least 10 chars.');
+      setError('O comentário deve ter pelo menos 10 caracteres.');
       return;
     }
     try {
@@ -90,104 +95,89 @@ export default function ChannelPolicyModal({
   const isUpdate = existingQuery.data !== null && existingQuery.data !== undefined;
 
   return (
-    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-      <div className="bg-white p-6 rounded shadow-lg w-[520px] max-w-full">
-        <h2 className="text-lg font-bold mb-1">
-          {isUpdate ? 'Edit' : 'Create'} channel policy
-        </h2>
-        <p className="text-xs text-gray-600 mb-3">
-          Channel: <code>{channelLabel}</code>
-        </p>
-
-        {existingQuery.isLoading || rolesQuery.isLoading ? (
-          <p>Loading…</p>
-        ) : (
-          <div className="space-y-3">
-            <label className="block">
-              <span className="text-sm font-medium">Default role</span>
-              <select
-                value={defaultRoleId}
-                onChange={(e) => setDefaultRoleId(e.target.value)}
-                className="w-full p-2 border rounded mt-1 text-sm"
-              >
-                <option value="">Pick role…</option>
-                {(rolesQuery.data?.items ?? []).map((r) => (
-                  <option key={r.id} value={r.id}>
-                    {r.role_key} — {r.display_name}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="block">
-              <span className="text-sm font-medium">Switch behavior</span>
-              <select
-                value={switchBehavior}
-                onChange={(e) =>
-                  setSwitchBehavior(e.target.value as SwitchBehavior)
-                }
-                className="w-full p-2 border rounded mt-1 text-sm"
-              >
-                <option value="locked">locked — role never switches</option>
-                <option value="prefer_handoff">
-                  prefer_handoff — handoff over switching
-                </option>
-                <option value="free_with_trigger">
-                  free_with_trigger — switch on explicit trigger
-                </option>
-                <option value="by_context">
-                  by_context — switch when context strongly suggests
-                </option>
-              </select>
-            </label>
-            <label className="block">
-              <span className="text-sm font-medium">Announce mode</span>
-              <select
-                value={announceMode}
-                onChange={(e) => setAnnounceMode(e.target.value as AnnounceMode)}
-                className="w-full p-2 border rounded mt-1 text-sm"
-              >
-                <option value="always">always</option>
-                <option value="affects_user">affects_user</option>
-                <option value="never">never</option>
-              </select>
-            </label>
-            <label className="block">
-              <span className="text-sm font-medium">
-                Reason (audited; min 10 chars)
-              </span>
-              <textarea
-                value={comment}
-                onChange={(e) => setComment(e.target.value)}
-                rows={3}
-                className="w-full p-2 border rounded mt-1 text-sm"
-              />
-            </label>
-          </div>
-        )}
-
-        {error && <p className="text-sm text-red-600 mt-3">{error}</p>}
-
-        <div className="flex gap-2 justify-end mt-4">
-          <button
-            onClick={onClose}
-            disabled={mutation.isPending}
-            className="px-4 py-2 bg-gray-200 rounded hover:bg-gray-300 disabled:opacity-50"
+    <Modal
+      open
+      onClose={onClose}
+      title={isUpdate ? 'Editar política do canal' : 'Criar política do canal'}
+      description={
+        <>
+          Canal: <code className="font-mono">{channelLabel}</code>
+        </>
+      }
+      footer={
+        <>
+          <Button variant="secondary" onClick={onClose} disabled={mutation.isPending}>
+            Cancelar
+          </Button>
+          <Button
+            onClick={() => void handleSubmit()}
+            loading={mutation.isPending}
+            disabled={existingQuery.isLoading}
           >
-            Cancel
-          </button>
-          <button
-            onClick={handleSubmit}
-            disabled={mutation.isPending || existingQuery.isLoading}
-            className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
-          >
-            {mutation.isPending
-              ? 'Saving...'
-              : isUpdate
-                ? 'Update policy'
-                : 'Create policy'}
-          </button>
+            {isUpdate ? 'Atualizar política' : 'Criar política'}
+          </Button>
+        </>
+      }
+    >
+      {existingQuery.isLoading || rolesQuery.isLoading ? (
+        <LoadingState label="Carregando…" />
+      ) : (
+        <div className="space-y-4">
+          <Field label="Papel padrão" required>
+            <Select
+              value={defaultRoleId}
+              onChange={(e) => setDefaultRoleId(e.target.value)}
+            >
+              <option value="">Escolha o papel…</option>
+              {(rolesQuery.data?.items ?? []).map((r) => (
+                <option key={r.id} value={r.id}>
+                  {r.role_key} — {r.display_name}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          <Field label="Comportamento de troca">
+            <Select
+              value={switchBehavior}
+              onChange={(e) => setSwitchBehavior(e.target.value as SwitchBehavior)}
+            >
+              <option value="locked">locked — o papel nunca troca</option>
+              <option value="prefer_handoff">
+                prefer_handoff — handoff em vez de troca
+              </option>
+              <option value="free_with_trigger">
+                free_with_trigger — troca sob gatilho explícito
+              </option>
+              <option value="by_context">
+                by_context — troca quando o contexto sugere fortemente
+              </option>
+            </Select>
+          </Field>
+          <Field label="Modo de anúncio">
+            <Select
+              value={announceMode}
+              onChange={(e) => setAnnounceMode(e.target.value as AnnounceMode)}
+            >
+              <option value="always">always</option>
+              <option value="affects_user">affects_user</option>
+              <option value="never">never</option>
+            </Select>
+          </Field>
+          <Field label="Motivo (auditado, mín. 10 caracteres)" required>
+            <Textarea
+              value={comment}
+              onChange={(e) => setComment(e.target.value)}
+              rows={3}
+            />
+          </Field>
         </div>
-      </div>
-    </div>
+      )}
+
+      {error && (
+        <div className="mt-3">
+          <Alert tone="danger">{error}</Alert>
+        </div>
+      )}
+    </Modal>
   );
 }

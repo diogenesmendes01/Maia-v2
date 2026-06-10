@@ -4,7 +4,29 @@ import * as React from 'react';
 import { useSession } from 'next-auth/react';
 import { trpc } from '../../../trpc/client.js';
 import ChannelPolicyModal from './_components/channel-policy-modal.js';
+import { PageHeader } from '../../../components/ui/page-header.js';
+import { Button } from '../../../components/ui/button.js';
+import { Field, Select } from '../../../components/ui/field.js';
+import {
+  TableShell,
+  Table,
+  THead,
+  Th,
+  Tr,
+  Td,
+} from '../../../components/ui/table.js';
+import {
+  LoadingState,
+  ErrorState,
+  EmptyState,
+  Alert,
+} from '../../../components/ui/states.js';
+import { IconMessage } from '../../../components/ui/icons.js';
 
+/**
+ * Setup → Canais (founder/owner). Configura a política (papel padrão +
+ * comportamento de troca) por canal; toda mudança é auditada.
+ */
 export default function ChannelsSetupPage() {
   const { data: session, status } = useSession();
   const role = session?.user?.role ?? '';
@@ -36,123 +58,127 @@ export default function ChannelsSetupPage() {
     { enabled: allowed && tenantId !== '' && agentId !== '' },
   );
 
-  if (status === 'loading') return <p>Loading session...</p>;
+  if (status === 'loading') return <LoadingState label="Carregando sessão…" />;
 
   if (!allowed) {
     return (
-      <div className="space-y-2">
-        <h1 className="text-2xl font-bold">Channels</h1>
-        <p className="text-sm text-red-700">
-          Channel policy editing requires the <code>founder</code> or{' '}
-          <code>owner</code> role. Your current role is{' '}
-          <code>{role || '(none)'}</code>.
-        </p>
+      <div>
+        <PageHeader title="Canais" />
+        <Alert tone="danger" title="Acesso restrito">
+          Editar políticas de canal exige o papel{' '}
+          <code className="font-mono">founder</code> ou{' '}
+          <code className="font-mono">owner</code>. Seu papel atual é{' '}
+          <code className="font-mono">{role || '(nenhum)'}</code>.
+        </Alert>
       </div>
     );
   }
 
-  return (
-    <div className="space-y-6">
-      <header>
-        <h1 className="text-2xl font-bold">Channels</h1>
-        <p className="text-sm text-gray-600">
-          Configure the policy (default role + switch behavior) per channel.
-          Every change is audited.
-        </p>
-      </header>
+  const channels = channelsQuery.data?.items ?? [];
 
-      <div className="flex items-center gap-4 text-sm">
-        <label className="flex items-center gap-2">
-          <span className="font-medium">Tenant:</span>
-          {role === 'founder' ? (
-            <select
+  return (
+    <div>
+      <PageHeader
+        title="Canais"
+        description="Configure a política (papel padrão + comportamento de troca) por canal. Toda mudança é auditada."
+      />
+
+      <div className="mb-5 flex flex-wrap items-end gap-4">
+        {role === 'founder' ? (
+          <Field label="Tenant" className="w-56">
+            <Select
               value={tenantId}
               onChange={(e) => {
                 setTenantId(e.target.value);
                 setAgentId('');
               }}
-              className="border rounded p-1"
             >
-              <option value="">Select…</option>
+              <option value="">Selecione…</option>
               {(tenantsQuery.data?.items ?? []).map((t) => (
                 <option key={t.id} value={t.id}>
                   {t.id}
                 </option>
               ))}
-            </select>
-          ) : (
-            <code className="px-2 py-0.5 bg-gray-100 rounded">{sessionTenant}</code>
-          )}
-        </label>
+            </Select>
+          </Field>
+        ) : (
+          <Field label="Tenant" className="w-56">
+            <span className="flex h-9 items-center rounded-lg bg-zinc-100 px-3 font-mono text-sm text-zinc-700">
+              {sessionTenant}
+            </span>
+          </Field>
+        )}
 
-        <label className="flex items-center gap-2">
-          <span className="font-medium">Agent:</span>
-          <select
+        <Field label="Agente" className="w-56">
+          <Select
             value={agentId}
             onChange={(e) => setAgentId(e.target.value)}
-            className="border rounded p-1"
             disabled={!tenantId}
           >
-            <option value="">Select…</option>
+            <option value="">Selecione…</option>
             {(agentsQuery.data?.items ?? []).map((a) => (
               <option key={a.id} value={a.id}>
                 {a.id}
               </option>
             ))}
-          </select>
-        </label>
+          </Select>
+        </Field>
       </div>
 
       {!agentId ? (
-        <p className="text-gray-500 text-sm">
-          Pick a tenant + agent to see their channels.
-        </p>
+        <EmptyState
+          icon={<IconMessage size={36} />}
+          title="Escolha um tenant e um agente"
+          description="Selecione um tenant e um agente para ver os canais deles."
+        />
       ) : channelsQuery.isLoading ? (
-        <p>Loading channels...</p>
+        <LoadingState label="Carregando canais…" />
       ) : channelsQuery.error ? (
-        <p className="text-red-600">Error: {channelsQuery.error.message}</p>
+        <ErrorState
+          message={channelsQuery.error.message}
+          onRetry={() => void channelsQuery.refetch()}
+        />
+      ) : channels.length === 0 ? (
+        <EmptyState
+          icon={<IconMessage size={36} />}
+          title="Nenhum canal ainda para este agente"
+        />
       ) : (
-        <table className="w-full text-sm border-collapse">
-          <thead>
-            <tr className="bg-gray-100">
-              <th className="text-left p-2 border-b">Type</th>
-              <th className="text-left p-2 border-b">External ID</th>
-              <th className="text-left p-2 border-b">Display name</th>
-              <th className="text-left p-2 border-b">Channel ID</th>
-              <th className="text-left p-2 border-b">Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {(channelsQuery.data?.items ?? []).map((c) => (
-              <tr key={c.id} className="border-b hover:bg-gray-50">
-                <td className="p-2">{c.channel_type}</td>
-                <td className="p-2 font-mono text-xs">{c.external_id}</td>
-                <td className="p-2">{c.display_name ?? '—'}</td>
-                <td className="p-2 font-mono text-xs">{c.id}</td>
-                <td className="p-2">
-                  <button
-                    onClick={() =>
-                      setPolicyTarget({
-                        channelId: c.id,
-                        channelLabel: `${c.channel_type}/${c.external_id}`,
-                      })
-                    }
-                    className="text-blue-600 hover:underline"
-                  >
-                    Edit policy
-                  </button>
-                </td>
-              </tr>
-            ))}
-            {(channelsQuery.data?.items ?? []).length === 0 && (
-              <tr>
-                <td colSpan={5} className="p-4 text-center text-gray-500">
-                  No channels yet for this agent.
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
+        <TableShell>
+          <Table>
+            <THead>
+              <Th>Tipo</Th>
+              <Th>ID externo</Th>
+              <Th>Nome de exibição</Th>
+              <Th>ID do canal</Th>
+              <Th>Ações</Th>
+            </THead>
+            <tbody>
+              {channels.map((c) => (
+                <Tr key={c.id}>
+                  <Td>{c.channel_type}</Td>
+                  <Td className="font-mono text-xs">{c.external_id}</Td>
+                  <Td>{c.display_name ?? '—'}</Td>
+                  <Td className="font-mono text-xs">{c.id}</Td>
+                  <Td>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() =>
+                        setPolicyTarget({
+                          channelId: c.id,
+                          channelLabel: `${c.channel_type}/${c.external_id}`,
+                        })
+                      }
+                    >
+                      Editar política
+                    </Button>
+                  </Td>
+                </Tr>
+              ))}
+            </tbody>
+          </Table>
+        </TableShell>
       )}
 
       {policyTarget && tenantId && agentId && (

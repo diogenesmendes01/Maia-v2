@@ -1,23 +1,24 @@
 /**
- * Admin UI — sign-in page.
+ * Admin UI — página de entrada.
  *
- * Two paths are exposed based on what the server-side auth config registered:
- *   - SSO button: visible when the OIDC provider is configured (any env where
- *     OIDC_ISSUER + OIDC_CLIENT_ID + OIDC_CLIENT_SECRET are set).
- *   - Magic-link form: visible when the dev-only CredentialsProvider is
- *     enabled (non-prod + FEATURE_ADMIN_UI_V1 + ALLOW_DEV_AUTH +
+ * Dois caminhos, conforme o que a configuração de auth do servidor registrou:
+ *   - Botão SSO: visível quando o provider OIDC está configurado (qualquer
+ *     ambiente com OIDC_ISSUER + OIDC_CLIENT_ID + OIDC_CLIENT_SECRET).
+ *   - Formulário magic-link: visível quando o CredentialsProvider dev-only
+ *     está habilitado (não-prod + FEATURE_ADMIN_UI_V1 + ALLOW_DEV_AUTH +
  *     ADMIN_UI_DEV_LOGIN_TOKEN).
  *
- * The discovery happens at request time via NextAuth's `getProviders()`, so
- * the UI matches what the server is actually willing to accept.
- *
- * Post-Codex-review #101: the email-only stub was removed. The dev login token
- * is now a required field.
+ * A descoberta acontece em tempo de request via `getProviders()` do NextAuth,
+ * então a UI reflete o que o servidor de fato aceita.
  */
 'use client';
 
 import * as React from 'react';
 import { signIn, getProviders } from 'next-auth/react';
+import { Card, CardBody } from '../../../components/ui/card.js';
+import { Button } from '../../../components/ui/button.js';
+import { Field, Input } from '../../../components/ui/field.js';
+import { Alert } from '../../../components/ui/states.js';
 
 interface ProviderInfo {
   id: string;
@@ -51,11 +52,15 @@ export default function SignInPage() {
         token,
       });
       if (result?.error) {
-        setError('Sign-in failed. Verify email, tenant, and dev token with your operator.');
+        setError(
+          'Falha na entrada. Verifique e-mail, tenant e token dev com seu operador.',
+        );
       } else if (result?.ok) {
         window.location.href = '/dashboard';
       } else {
-        setError('Sign-in not available. Magic-link provider is disabled in this environment.');
+        setError(
+          'Entrada indisponível. O provider magic-link está desabilitado neste ambiente.',
+        );
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -74,91 +79,102 @@ export default function SignInPage() {
   const hasAnyProvider = hasMagicLink || hasOidc;
 
   return (
-    <div className="flex items-center justify-center min-h-screen bg-gray-100">
-      <div className="bg-white p-8 rounded shadow w-96 space-y-4">
-        <h1 className="text-2xl font-bold">Maia Admin</h1>
+    <Card className="w-full max-w-sm">
+      <CardBody className="space-y-4 px-6 py-6">
+        <div className="flex items-center gap-3">
+          <span className="flex h-10 w-10 items-center justify-center rounded-lg bg-brand-600 text-white font-bold">
+            M
+          </span>
+          <div>
+            <p className="text-sm font-semibold text-zinc-900">Maia Console</p>
+            <p className="text-xs text-zinc-500">Governança de agentes</p>
+          </div>
+        </div>
+
+        <h1 className="text-lg font-semibold tracking-tight text-zinc-900">
+          Entrar no Maia Console
+        </h1>
 
         {!providers ? (
-          <p className="text-sm text-gray-600">Loading available sign-in options...</p>
-        ) : !hasAnyProvider ? (
-          <p className="text-sm text-red-700">
-            No sign-in providers are configured on this server. Production
-            requires OIDC (set <code>OIDC_ISSUER</code>,{' '}
-            <code>OIDC_CLIENT_ID</code>, <code>OIDC_CLIENT_SECRET</code>,{' '}
-            <code>OIDC_TENANT_SLUGS</code>). Development can enable magic-link
-            via <code>ALLOW_DEV_AUTH=true</code>.
+          <p className="text-sm text-zinc-500">
+            Carregando opções de entrada…
           </p>
+        ) : !hasAnyProvider ? (
+          <Alert tone="danger" title="Nenhum provider configurado">
+            Nenhum provider de entrada está configurado neste servidor.
+            Produção exige OIDC (defina{' '}
+            <code className="font-mono">OIDC_ISSUER</code>,{' '}
+            <code className="font-mono">OIDC_CLIENT_ID</code>,{' '}
+            <code className="font-mono">OIDC_CLIENT_SECRET</code>,{' '}
+            <code className="font-mono">OIDC_TENANT_SLUGS</code>).
+            Desenvolvimento pode habilitar magic-link via{' '}
+            <code className="font-mono">ALLOW_DEV_AUTH=true</code>.
+          </Alert>
         ) : (
           <>
             {hasOidc && (
-              <button
-                onClick={handleSso}
-                className="w-full bg-blue-600 text-white p-2 rounded hover:bg-blue-700"
-              >
-                Sign in with SSO
-              </button>
+              <Button className="w-full" onClick={() => void handleSso()}>
+                Entrar com SSO
+              </Button>
             )}
 
             {hasOidc && hasMagicLink && (
-              <div className="flex items-center gap-2 text-xs text-gray-500">
-                <span className="flex-1 border-t" />
-                <span>or dev only</span>
-                <span className="flex-1 border-t" />
+              <div className="flex items-center gap-2 text-xs text-zinc-400">
+                <span className="flex-1 border-t border-zinc-200" />
+                <span>ou somente dev</span>
+                <span className="flex-1 border-t border-zinc-200" />
               </div>
             )}
 
             {hasMagicLink && (
               <form onSubmit={handleMagicLink} className="space-y-3">
-                <p className="text-xs text-gray-600">
-                  Dev sign-in. Requires email + tenant + dev token.
+                <p className="text-xs text-zinc-500">
+                  Entrada de desenvolvimento. Exige e-mail + tenant + token dev.
                 </p>
-                <label className="block">
-                  <span className="text-sm font-medium">Email</span>
-                  <input
+                <Field label="E-mail">
+                  <Input
                     type="email"
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
                     required
                     autoComplete="email"
-                    className="w-full p-2 border rounded mt-1"
                   />
-                </label>
-                <label className="block">
-                  <span className="text-sm font-medium">Tenant ID</span>
-                  <input
+                </Field>
+                <Field label="Tenant ID">
+                  <Input
                     type="text"
                     value={tenantId}
                     onChange={(e) => setTenantId(e.target.value)}
                     required
                     autoComplete="off"
-                    className="w-full p-2 border rounded mt-1"
+                    className="font-mono"
                   />
-                </label>
-                <label className="block">
-                  <span className="text-sm font-medium">Dev token</span>
-                  <input
+                </Field>
+                <Field label="Token dev">
+                  <Input
                     type="password"
                     value={token}
                     onChange={(e) => setToken(e.target.value)}
                     required
                     autoComplete="current-password"
                     placeholder="ADMIN_UI_DEV_LOGIN_TOKEN"
-                    className="w-full p-2 border rounded mt-1"
+                    className="font-mono"
                   />
-                </label>
-                <button
+                </Field>
+                <Button
                   type="submit"
-                  disabled={loading}
-                  className="w-full bg-gray-700 text-white p-2 rounded hover:bg-gray-800 disabled:opacity-50"
+                  variant="secondary"
+                  className="w-full"
+                  loading={loading}
                 >
-                  {loading ? 'Signing in...' : 'Sign in (dev)'}
-                </button>
+                  Entrar (dev)
+                </Button>
               </form>
             )}
           </>
         )}
-        {error && <p className="text-sm text-red-600">{error}</p>}
-      </div>
-    </div>
+        {error && <Alert tone="danger">{error}</Alert>}
+      </CardBody>
+    </Card>
   );
 }
