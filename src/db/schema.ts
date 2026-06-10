@@ -2533,3 +2533,70 @@ export type ApprovalClassId =
   | 'procedure_update';
 
 export type ProposalUnifiedStatus = 'proposed' | 'pending_review' | 'rejected' | 'activated';
+
+// ---------------------------------------------------------------------------
+// Playground sandbox (issue #464 — migration 087)
+//
+// Sessions/turns for the admin-console "Testar agente" chat. The `status`
+// column on turns doubles as the work queue (Postgres-as-queue): the runtime
+// worker polls status='queued' rows, runs the sandboxed turn, and writes the
+// agent reply back. Sandbox contract: no outbox, no memory writes, no
+// learning, side-effect tools never executed (proposals recorded in
+// decision_meta). See docs/superpowers/specs/2026-06-10-agent-playground-design.md.
+// ---------------------------------------------------------------------------
+
+export const playground_sessions = pgTable(
+  'playground_sessions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    // NULL = active profile; otherwise the proposed version under test.
+    profile_version_id: uuid('profile_version_id').references(
+      () => agent_operational_profile_versions.id,
+      { onDelete: 'set null' },
+    ),
+    created_by: text('created_by').notNull(),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    expires_at: timestamp('expires_at', { withTimezone: true })
+      .notNull()
+      .default(sql`now() + interval '24 hours'`),
+  },
+  (t) => ({
+    tenantAgentIdx: index('playground_sessions_tenant_agent_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.created_at,
+    ),
+    expiryIdx: index('playground_sessions_expiry_idx').on(t.expires_at),
+  }),
+);
+
+export type PlaygroundTurnStatus = 'queued' | 'running' | 'done' | 'error';
+
+export const playground_turns = pgTable(
+  'playground_turns',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    session_id: uuid('session_id')
+      .notNull()
+      .references(() => playground_sessions.id, { onDelete: 'cascade' }),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    role: text('role').notNull(), // 'user' | 'agent' (CHECK in migration 087)
+    content: text('content').notNull(),
+    decision_meta: jsonb('decision_meta'),
+    status: text('status').notNull().default('queued'), // PlaygroundTurnStatus
+    error_detail: text('error_detail'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    completed_at: timestamp('completed_at', { withTimezone: true }),
+  },
+  (t) => ({
+    sessionIdx: index('playground_turns_session_idx').on(t.session_id, t.created_at),
+  }),
+);
+
+export type PlaygroundSession = typeof playground_sessions.$inferSelect;
+export type NewPlaygroundSession = typeof playground_sessions.$inferInsert;
+export type PlaygroundTurn = typeof playground_turns.$inferSelect;
+export type NewPlaygroundTurn = typeof playground_turns.$inferInsert;

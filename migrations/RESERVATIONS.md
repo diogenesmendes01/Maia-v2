@@ -190,3 +190,4 @@ NEW shared prefixes — pick `max(existing)+1`.
 084 | 084_delete_default_tenant.sql | delete legacy default tenant and agent (issue 323)
 085 | 085_calendar_default_pack.sql | calendar as default pack — backfill existing grants
 086 | 086_fix_human_confirmation_policy_scope.sql | fix human_confirmation_policy scope and predicate — restrict to boleto role, high/critical only (issue 446)
+087 | 087_playground_sessions.sql | playground sandbox sessions and turns (issue 464)

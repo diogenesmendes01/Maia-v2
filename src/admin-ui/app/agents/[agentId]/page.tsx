@@ -38,8 +38,9 @@ import {
 } from '../_components/profile-form.js';
 import { ProfileDiff } from '../_components/profile-diff.js';
 import ActivityTab from './_components/activity-tab.js';
+import PlaygroundTab from './_components/playground-tab.js';
 
-type TabId = 'overview' | 'profile' | 'versions' | 'activity';
+type TabId = 'overview' | 'profile' | 'versions' | 'activity' | 'playground';
 
 export default function AgentDetailPage() {
   const params = useParams<{ agentId: string }>();
@@ -148,6 +149,7 @@ export default function AgentDetailPage() {
               ) : undefined,
           },
           { id: 'activity', label: 'Atividade' },
+          { id: 'playground', label: 'Testar' },
         ]}
       />
 
@@ -184,6 +186,14 @@ export default function AgentDetailPage() {
         />
       )}
       {tab === 'activity' && <ActivityTab tenantId={tenantId} agentId={agent.id} />}
+      {tab === 'playground' && (
+        <PlaygroundTab
+          tenantId={tenantId}
+          agentId={agent.id}
+          hasActiveProfile={active !== null}
+          proposedVersions={proposed.map((p) => ({ id: p.id, version: p.version }))}
+        />
+      )}
     </div>
   );
 }

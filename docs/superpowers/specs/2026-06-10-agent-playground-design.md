@@ -1,7 +1,7 @@
 # Maia — Playground de Conversa (Testar Agente no Console) — Design Spec
 
 **Date:** 2026-06-10
-**Status:** Draft — spec exigida pela issue #464 antes de implementação
+**Status:** v1 implementada (2026-06-10) — escopo conservador: tools NÃO são vinculadas à chamada LLM (deny-all estrito; o agente descreve a ação que tomaria). O contrato `sandbox_behavior: 'mock'|'deny'` por tool (§2) é a v1.1 planejada. Implementação: migração 087, `src/db/repositories/playground-repos.ts` (Postgres-as-queue, SKIP LOCKED), `src/agent/playground-turn.ts` (executor + audit `playground_turn`), `src/workers/playground-turn-worker.ts` (drain ~50s/tick), router `playground` no admin-ui e aba "Testar" em `/agents/[agentId]`. Decisão de transporte: Postgres-as-queue em vez de BullMQ — o admin-ui não tem cliente Redis; o padrão espelha `message-recovery`/`outbox_drain`.
 **Master refs:** visão em `2026-06-10-learnable-workforce-vision.md` § 2.4; `ARCHITECTURE.md` invariantes 1–5; `docs/architecture/concerns/action-layer.md`
 **Architecture Locks:** tenant isolation, fail-closed, LLM-propõe/backend-decide, audit total — inalterados.
 
