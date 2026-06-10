@@ -28,6 +28,7 @@
  * do tenant). Otimização específica entra quando cache miss rate medido >5%.
  */
 import { getCurrentAgent, getCurrentTenant } from '../db/tenant-context.js';
+import { buildCacheKey } from './cache-key.js';
 
 export type BusinessDayKind = 'standard' | 'clt';
 export type CacheKey = string;
@@ -52,15 +53,16 @@ export const _internal_cache = {
 };
 
 /**
- * Build the (tenant, agent, entidade)-scoped cache key. Each free-form
- * segment (tenant_id, agent_id, entidadeId) is URI-encoded so the `:`
- * delimiter is unambiguous: a tenant slug like `acme:dev` becomes
- * `acme%3Adev`, which can never collide with a tuple where the tenant is
- * `acme` and another segment starts with `dev:`. `year` and `kind` are
- * controlled values (number / enum) and don't need encoding.
+ * Build the (tenant, agent, entidade)-scoped cache key via the centralized
+ * `buildCacheKey` helper (issue #287 consolidation). Each segment is
+ * URI-encoded so the `:` delimiter is unambiguous, and Redis glob
+ * metacharacters (`* ? [ ] !`) are neutralized. `year` and `kind` are
+ * controlled values (number / enum) whose encoding is the identity.
  *
- * Mirrors `buildKey()` from `src/tools/_vision-cache.ts` (#257) and
- * `src/lib/embedding-cache.ts` (#258) — canonical cache key contract.
+ * Key-compatibility note (#287): this is a process-local LRU (no Redis
+ * persistence), so the consolidation carries zero invalidation risk — and
+ * for segments without `*`/`!` the output is byte-identical to the previous
+ * inline `encodeURIComponent` concat anyway. `v3` prefix unchanged.
  */
 function buildKey(
   tenant_id: string,
@@ -69,13 +71,13 @@ function buildKey(
   year: number,
   kind: BusinessDayKind,
 ): CacheKey {
-  return (
-    `${KEY_PREFIX}:` +
-    `${encodeURIComponent(tenant_id)}:` +
-    `${encodeURIComponent(agent_id)}:` +
-    `${encodeURIComponent(entidadeId ?? 'global')}:` +
-    `${year}:` +
-    `${kind}`
+  return buildCacheKey(
+    `${KEY_PREFIX}:`,
+    tenant_id,
+    agent_id,
+    entidadeId ?? 'global',
+    year,
+    kind,
   );
 }
 
@@ -137,11 +139,13 @@ export function invalidateCacheForHolidayChange(
   // Wildcard no agent_id: limpa TODOS os agents do tenant — porque holidays
   // tenant-wide mudam dados de qualquer agent_id no mesmo tenant.
   //
-  // **Prefix encoding (#272 reval):** o tenant_id no prefix passa pelo mesmo
-  // `encodeURIComponent` usado em `buildKey()`. Sem isso, `tenant="acme"`
-  // limparia também `tenant="acme:dev"` (cross-tenant invalidation) e
-  // vice-versa um `tenant="acme%3Adev"` literal mal-encodado escaparia.
-  const prefix = `${KEY_PREFIX}:${encodeURIComponent(ref.tenant_id)}:`;
+  // **Prefix encoding (#272 reval, #287):** o tenant_id no prefix passa pelo
+  // MESMO encoder de `buildKey()` — `buildCacheKey` com um único segmento —
+  // para que o prefixo case byte-a-byte com as chaves escritas. Sem isso,
+  // `tenant="acme"` limparia também `tenant="acme:dev"` (cross-tenant
+  // invalidation) e vice-versa um `tenant="acme%3Adev"` literal mal-encodado
+  // escaparia.
+  const prefix = `${buildCacheKey(`${KEY_PREFIX}:`, ref.tenant_id)}:`;
   for (const k of Array.from(_cache.keys())) {
     if (k.startsWith(prefix)) _cache.delete(k);
   }

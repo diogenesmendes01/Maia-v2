@@ -20,7 +20,9 @@ import { readFileSync } from 'fs';
 import { resolve } from 'path';
 import { describe, expect, it } from 'vitest';
 
-const REPOSITORIES_PATH = resolve(__dirname, '../../src/db/repositories.ts');
+// rulesRepo lives in the cognitive domain module since the repositories.ts
+// barrel split (src/db/repositories/cognitive-repos.ts).
+const REPOSITORIES_PATH = resolve(__dirname, '../../src/db/repositories/cognitive-repos.ts');
 
 function extractFunctionSource(source: string, marker: string): string {
   // Find the function definition by its declaration line, then walk

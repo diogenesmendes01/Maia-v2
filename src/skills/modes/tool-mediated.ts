@@ -20,9 +20,11 @@
  * Master spec §2.4 + §3.4 (skill agent harness). Cada tool resolvida é
  * registrada em `tools_called` (passado para o trace pelo SkillRunner).
  *
- * Out-of-scope para P9a (TODOs anotados):
+ * Fora do escopo deste modo (decisão do P9a, ainda em aberto):
  *  - Resolução por-tool de policy_descriptors (cada tool pode ter sua
- *    própria política aplicada — P9d/P10 fará isso)
+ *    própria política aplicada). P9d/P10 já entregaram o Policy DSL e os
+ *    PEPs, mas a resolução por-tool DENTRO deste loop nunca foi feita —
+ *    segue em aberto, agora desbloqueada.
  *  - Streaming de tool_use (assumimos modo síncrono)
  */
 import { callLLM, type LLMMessage, type ToolSchema } from '@/lib/claude.js';

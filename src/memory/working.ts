@@ -117,6 +117,7 @@ import {
   recordRedisOomDegraded,
 } from '@/lib/redis.js';
 import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
+import { buildCacheKey } from '@/lib/cache-key.js';
 import { incCounter, observeHistogram } from '@/lib/metrics.js';
 import { logger } from '@/lib/logger.js';
 import { sha256 } from '@/lib/utils.js';
@@ -203,7 +204,14 @@ function workingMessagesKey(conversa_id: string): string {
   // if the caller isn't wrapped in `runWithTenantContext` — see invariant block.
   const tenant_id = getCurrentTenant();
   const agent_id = getCurrentAgent();
-  return `working:${tenant_id}:${agent_id}:conv:${conversa_id}:messages`;
+  // Issue #287: build through the centralized `buildCacheKey` so each dynamic
+  // segment is URI-encoded and glob-neutralized. The `conv` / `messages`
+  // literals are encoding-invariant, and production tenant/agent slugs
+  // (`[a-z0-9][a-z0-9_-]*`, admin-UI enforced) and UUID conversa_ids encode
+  // to themselves — so every realizable key is byte-identical to the previous
+  // raw interpolation. No version bump needed; a pathological ID's old key
+  // simply ages out via the 24h TTL.
+  return buildCacheKey('working:', tenant_id, agent_id, 'conv', conversa_id, 'messages');
 }
 
 /**
@@ -218,7 +226,9 @@ function workingMessagesKey(conversa_id: string): string {
 function workingMarkerKey(conversa_id: string): string {
   const tenant_id = getCurrentTenant();
   const agent_id = getCurrentAgent();
-  return `nx_ttl:${tenant_id}:${agent_id}:conv:${conversa_id}:messages`;
+  // Issue #287: same `buildCacheKey` routing (and same key-compatibility
+  // reasoning) as `workingMessagesKey` above.
+  return buildCacheKey('nx_ttl:', tenant_id, agent_id, 'conv', conversa_id, 'messages');
 }
 
 /**
@@ -231,6 +241,13 @@ function workingMarkerKey(conversa_id: string): string {
  * URI-encoded before joining so a `:` inside any id (not possible with the
  * admin-UI slug charset, but defense-in-depth — mirrors `idempotency.ts`)
  * cannot let `(a, b)` alias into `(a:b)`.
+ *
+ * #287 NOTE: deliberately NOT routed through `buildCacheKey`. This is a
+ * sha256 HASH INPUT (joined with `|`), not a Redis key — and its output is
+ * compared against fingerprint values already stored in live `nx_ttl:*`
+ * markers (24h TTL). Changing the joined bytes would make every existing
+ * marker mismatch and fire spurious `working_memory_key_collision_total`
+ * alerts for a full TTL window after deploy.
  */
 function scopeFingerprint(conversa_id: string): string {
   const tenant_id = getCurrentTenant();

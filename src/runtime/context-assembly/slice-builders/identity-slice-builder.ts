@@ -46,9 +46,9 @@ export interface IdentityRequirements {
 /**
  * Repo port — what the builder needs from the operational profile repo.
  * The real implementation reads agent_operational_profile_versions where
- * status='active'. P4 ships the concrete repo; P8a only needs this shape.
- *
- * TODO(P4): replace with concrete operationalProfileVersionsRepo binding.
+ * status='active'. P4 shipped the concrete repo
+ * (operationalProfileVersionsRepo), and production-builder-set binds it via
+ * `realIdentityPort` (#206); this port shape remains for DI and tests.
  */
 export interface OperationalProfilePort {
   getActive(

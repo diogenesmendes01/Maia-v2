@@ -7,6 +7,7 @@ import {
 } from '@/lib/redis.js';
 import { logger } from '@/lib/logger.js';
 import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
+import { buildCacheKey } from '@/lib/cache-key.js';
 
 const TTL_SECONDS = 3600;
 // Versioned prefix. `v2` was used by the previous iteration of this PR (only
@@ -80,11 +81,17 @@ const KEY_PREFIX = 'maia:vision:v3:';
  */
 
 /**
- * Build the (tenant, agent)-scoped Redis key. Each segment is URI-encoded so
- * the `:` delimiter is unambiguous: a tenant slug like `acme:dev` becomes
- * `acme%3Adev`, which can never collide with a tuple where the tenant is
- * `acme` and another segment starts with `dev:`. Exported via the module's
- * two public functions only — not part of the API surface.
+ * Build the (tenant, agent)-scoped Redis key via the centralized
+ * `buildCacheKey` helper (issue #287 consolidation). Each segment is
+ * URI-encoded so the `:` delimiter is unambiguous, and Redis glob
+ * metacharacters (`* ? [ ] !`) are neutralized so a segment can never act
+ * as a wildcard in a `KEYS`/`SCAN` pattern. Exported via the module's two
+ * public functions only — not part of the API surface.
+ *
+ * Key-compatibility note (#287): for segments without `*`/`!` the helper
+ * emits byte-identical keys to the previous inline `encodeURIComponent`
+ * concat (sha256 hex and tool names are encoding-invariant), so the `v3`
+ * prefix is unchanged — no bump needed.
  */
 function buildKey(
   tenant_id: string,
@@ -92,13 +99,7 @@ function buildKey(
   tool: string,
   file_sha256: string,
 ): string {
-  return (
-    `${KEY_PREFIX}` +
-    `${encodeURIComponent(tenant_id)}:` +
-    `${encodeURIComponent(agent_id)}:` +
-    `${encodeURIComponent(tool)}:` +
-    `${encodeURIComponent(file_sha256)}`
-  );
+  return buildCacheKey(KEY_PREFIX, tenant_id, agent_id, tool, file_sha256);
 }
 
 export async function getCachedVision<T>(tool: string, file_sha256: string): Promise<T | null> {

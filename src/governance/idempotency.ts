@@ -55,10 +55,18 @@
  *     - We want consistency with PR #252 (`src/gateway/bot-detection.ts:102-111`)
  *       and PR #257 (`src/tools/_vision-cache.ts:62`) — both URI-encode
  *       per segment when concatenating tenant-scoped cache keys.
- *     - The centralization effort lives in issue #287
- *       ("standardize Redis key encoding URI-safe vs raw ':'") which will
- *       introduce a shared `buildCacheKey` helper. Until #287 lands we
- *       apply the encoding inline here.
+ *     - The #287 consolidation (shared `buildCacheKey` in
+ *       `src/lib/cache-key.ts`) deliberately does NOT cover this module:
+ *       these are sha256 HASH INPUTS joined with `'|'`, not Redis keys.
+ *       Re-joining them via `buildCacheKey` (which joins with `':'`) would
+ *       change the hashed bytes, so every idempotency key/payload hash
+ *       computed after deploy would differ from rows already stored in
+ *       Postgres — re-opening the exact #318 migration window (a legit
+ *       retry of an ALREADY-EXECUTED financial side effect would miss the
+ *       cache and EXECUTE AGAIN for the row's remaining TTL). That is not
+ *       a transient blip, so the inline per-segment encoding stays. Any
+ *       future byte-layout change must ride a PAYLOAD_HASH_VERSION_PREFIX
+ *       bump plus a repositories.ts legacy-comparison path, as #318 did.
  *   Note: applying `encodeURIComponent` AFTER the `tenant_id`/`agent_id`
  *   normalization re-encodes the existing valid chars too, which is fine
  *   because the encoding is deterministic and only the hash matters

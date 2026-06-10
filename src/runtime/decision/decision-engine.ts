@@ -251,7 +251,8 @@ export class DecisionEngine {
         this.deps.intentClassifier.classify(input.base, { signal }),
       );
 
-      // --- Step 3: risk scorer (stub in P9b; TODO P9c). ---
+      // --- Step 3: risk scorer (prod: P9c TurnRiskScorer via prod-env
+      // adapter; deterministic stub only as test-harness default, #377). ---
       const risk = await runStep('risk', () =>
         this.deps.riskScorer.score({ intent, base: input.base }, { signal }),
       );

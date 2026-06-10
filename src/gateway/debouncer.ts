@@ -12,6 +12,7 @@ import {
   getCurrentAgent,
   MissingTenantContextError,
 } from '@/db/tenant-context.js';
+import { buildCacheKey } from '@/lib/cache-key.js';
 import type { AgentJob } from './types.js';
 
 /**
@@ -210,20 +211,21 @@ function assertScopeSegment(value: unknown, name: string): asserts value is stri
 }
 
 /**
- * Build the tenant-scoped Redis/jobId suffix. Each segment is URI-encoded
- * so the `:` delimiter is unambiguous: a tenant slug like `acme:dev`
- * becomes `acme%3Adev`, which can never collide with a tuple where the
- * tenant is `acme` and the agent starts with `dev:`. Mirrors the
- * `buildKey` pattern adopted by PRs #257 (`_vision-cache.ts`) / #258
- * (`bot-detection.ts`) / #267 (`rate-limit.ts`).
+ * Build the tenant-scoped Redis/jobId suffix via the centralized
+ * `buildCacheKey` helper (issue #287 consolidation; empty prefix because
+ * the namespace markers — `agent-debounce:` / `debounce:` — are prepended
+ * by `STATE_KEY` / `debounceJobId`). Each segment is URI-encoded so the
+ * `:` delimiter is unambiguous, and Redis glob metacharacters
+ * (`* ? [ ] !`) are neutralized so a free-form WhatsApp lid can never act
+ * as a wildcard in a `KEYS`/`SCAN` pattern.
  *
- * Phone is rarely problematic in production (E.164 format), but encoding
- * it too keeps the rule "every segment is encoded" uniform — a caller
- * passing a free-form WhatsApp lid (`12345@s.whatsapp.net`) can't
- * inadvertently introduce a `:` either.
+ * Key-compatibility note (#287): for segments without `*`/`!` the helper
+ * emits byte-identical suffixes to the previous inline
+ * `encodeURIComponent` concat — no version bump needed. Pathological keys
+ * age out via STATE_TTL_S (10 min) / the BullMQ job lifecycle.
  */
 function buildKey(tenant_id: string, agent_id: string, phone: string): string {
-  return `${encodeURIComponent(tenant_id)}:${encodeURIComponent(agent_id)}:${encodeURIComponent(phone)}`;
+  return buildCacheKey('', tenant_id, agent_id, phone);
 }
 
 /**

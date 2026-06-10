@@ -127,14 +127,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   integration:
-    name: integration + e2e (node ${{ matrix.node }}, continue-on-error)
+    name: integration + e2e (node ${{ matrix.node }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # First-iteration safety net: the integration suite has never run on CI
-    # before (TEST_DB_URL was always unset, so the tests skipped). Allow this
-    # job to fail without blocking PRs while we stabilise it.
-    # TODO: remover quando integration estiver verde de forma consistente.
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:

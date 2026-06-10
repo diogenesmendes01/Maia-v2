@@ -108,19 +108,27 @@ import { pessoasRepo } from '@/db/repositories.js';
 import { audit } from '@/governance/audit.js';
 import { logger } from '@/lib/logger.js';
 import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
+import { buildCacheKey } from '@/lib/cache-key.js';
 
 const KEY_PREFIX = 'maia:botdet:';
 
 /**
- * Build the tenant-scoped Redis key. Each segment is URI-encoded so the `:`
- * delimiter is unambiguous: a tenant slug like `acme:dev` becomes
- * `acme%3Adev`, which can never collide with a tuple where the tenant is
- * `acme` and the agent starts with `dev:`. See the invariant block at the
- * top of the file for the full rationale. Not exported — the public surface
- * is `checkBotAndMaybeBlock`.
+ * Build the tenant-scoped Redis key via the centralized `buildCacheKey`
+ * helper (issue #287 consolidation). Each segment is URI-encoded so the `:`
+ * delimiter is unambiguous (a tenant slug like `acme:dev` becomes
+ * `acme%3Adev`) AND Redis glob metacharacters (`* ? [ ] !`) are neutralized
+ * so a segment can never act as a wildcard in a `KEYS`/`SCAN` pattern.
+ *
+ * Key-compatibility note (#287): for every segment value that does NOT
+ * contain `*` or `!`, `buildCacheKey` emits byte-identical keys to the
+ * previous inline `encodeURIComponent` concat — no version bump needed.
+ * Pathological segments containing `*`/`!` change shape, and any such
+ * pre-existing entry simply ages out via the 60s TTL.
+ *
+ * Not exported — the public surface is `checkBotAndMaybeBlock`.
  */
 function buildKey(tenant_id: string, agent_id: string, phone: string): string {
-  return `${KEY_PREFIX}${encodeURIComponent(tenant_id)}:${encodeURIComponent(agent_id)}:${encodeURIComponent(phone)}`;
+  return buildCacheKey(KEY_PREFIX, tenant_id, agent_id, phone);
 }
 
 const WINDOW_SECONDS = 60;

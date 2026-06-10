@@ -106,6 +106,7 @@ vi.mock('@/lib/logger.js', () => ({
 
 // We import these AFTER `vi.mock` registrations.
 import { runWithTenantContext, MissingTenantContextError } from '@/db/tenant-context.js';
+import { buildCacheKey } from '@/lib/cache-key.js';
 
 const A_CTX = { tenant_id: 'tenant-A', agent_id: 'agent-A' };
 const B_CTX = { tenant_id: 'tenant-B', agent_id: 'agent-B' };
@@ -132,6 +133,32 @@ describe('Issue #250 — vision cache is (tenant, agent)-scoped (v3)', () => {
       expect(writes).toHaveLength(1);
       expect(writes[0]!.key).toBe('maia:vision:v3:tenant-A:agent-A:parse_image:sha-X');
       expect(writes[0]!.ttl).toBe(3600);
+    });
+
+    // -----------------------------------------------------------------------
+    // Issue #287 — the key is built via the centralized `buildCacheKey`,
+    // which (beyond per-segment URI encoding) neutralizes Redis glob
+    // metachars (`* ? [ ] !`) that raw `encodeURIComponent` leaves intact.
+    // The exact-string assertions in this block double as the
+    // key-compatibility proof: for the production charset the v3 keys are
+    // byte-identical to the pre-#287 inline concat — no v4 bump needed.
+    // -----------------------------------------------------------------------
+    it('issue #287: key equals the buildCacheKey composition and neutralizes glob metachars', async () => {
+      const { setCachedVision } = await import('@/tools/_vision-cache.js');
+      await runWithTenantContext(
+        { tenant_id: 'acme*', agent_id: 'agent!x' },
+        async () => {
+          await setCachedVision('parse_image', 'sha-X', { kind: 'boleto' });
+        },
+      );
+      const writes = ops.filter((o) => o.op === 'setex');
+      expect(writes).toHaveLength(1);
+      expect(writes[0]!.key).toBe(
+        buildCacheKey('maia:vision:v3:', 'acme*', 'agent!x', 'parse_image', 'sha-X'),
+      );
+      expect(writes[0]!.key).toContain('acme%2A');
+      expect(writes[0]!.key).toContain('agent%21x');
+      expect(/[*?[\]!]/.test(writes[0]!.key)).toBe(false);
     });
 
     it('setCachedVision under tenant-B uses tenant-B + agent-B in the key (SYMMETRY)', async () => {
