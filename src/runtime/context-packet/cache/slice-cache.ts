@@ -17,6 +17,7 @@
 
 import { jitteredTTL } from './ttl-policy.js';
 import { assertValidScope } from '../../../user-layer/internal/cache-keys.js';
+import { buildCacheKey } from '../../../lib/cache-key.js';
 
 export interface SliceCache {
   get<T>(key: string): Promise<T | null>;
@@ -39,6 +40,15 @@ export interface SliceCache {
  * empty agent_id would produce a key like `maia:context:v2:tenant::slice:hash`
  * — a tenant-wide degenerate scope that re-introduces the cross-agent leak the
  * v1→v2 bump was meant to close. Throw instead.
+ *
+ * Issue #287: segments are routed through the centralized `buildCacheKey`
+ * so a `:` inside a free-form id can no longer alias across slots, and glob
+ * metacharacters are neutralized — which keeps the `invalidate()` MATCH
+ * patterns below literal-safe. Key-compatibility: production tenant/agent
+ * slugs (`[a-z0-9][a-z0-9_-]*`), slice names (closed code set), and hex
+ * scope hashes all encode to themselves, so every realizable key is
+ * byte-identical to the previous raw interpolation — the `v2` version tag
+ * is unchanged, no bump needed.
  */
 export function sliceCacheKey(
   tenant_id: string,
@@ -47,7 +57,7 @@ export function sliceCacheKey(
   scope_hash: string,
 ): string {
   assertValidScope(tenant_id, agent_id);
-  return `maia:context:v2:${tenant_id}:${agent_id}:${slice}:${scope_hash}`;
+  return buildCacheKey('maia:context:v2:', tenant_id, agent_id, slice, scope_hash);
 }
 
 // ============================================================================
@@ -101,7 +111,7 @@ export class InMemorySliceCache implements SliceCache {
     // invalidates all agents' slices under that tenant. A future
     // `invalidateSliceForAgent(tenant_id, agent_id, slice)` can narrow the
     // wildcard when invalidation events carry agent_id.
-    return this.invalidate(`maia:context:v2:${tenant_id}:*:${slice}:*`);
+    return this.invalidate(invalidationPatternForTenant(tenant_id, slice));
   }
 
   /** Test helper: total entries currently in cache (alive or expired). */
@@ -156,13 +166,28 @@ export class RedisSliceCache implements SliceCache {
   ): Promise<number> {
     // Issue #235: key format is `maia:context:v2:{tenant}:{agent}:{slice}:*`.
     // Wildcard the agent_id position; see InMemorySliceCache comment.
-    return this.invalidate(`maia:context:v2:${tenant_id}:*:${slice}:*`);
+    return this.invalidate(invalidationPatternForTenant(tenant_id, slice));
   }
 }
 
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/**
+ * Build the tenant-wide invalidation MATCH pattern. The `tenant_id` and
+ * `slice` segments are encoded with the SAME `buildCacheKey` encoder used by
+ * `sliceCacheKey` so the pattern matches written keys byte-for-byte (#287) —
+ * and so a tenant slug containing `:` or a glob metachar can neither bleed
+ * into a neighbouring slot nor widen the wildcard (e.g. `tenant="acme"` must
+ * NOT clear `tenant="acme:dev"` entries and vice-versa). The `*` wildcards
+ * for the agent and scope-hash positions are appended raw on purpose.
+ */
+function invalidationPatternForTenant(tenant_id: string, slice: string): string {
+  const tenantSeg = buildCacheKey('', tenant_id);
+  const sliceSeg = buildCacheKey('', slice);
+  return `maia:context:v2:${tenantSeg}:*:${sliceSeg}:*`;
+}
 
 function patternToRegex(pattern: string): RegExp {
   // Convert redis-style glob (`*`, `?`) to JS regex. Escape every other

@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { callLLM } from '@/lib/claude.js';
+import { safeExtractAndParseJson } from '@/lib/json-safe.js';
 import { runCognitiveModule } from './runner.js';
 
 const ClassificationSchema = z.object({
@@ -38,23 +39,17 @@ export async function classifyMemory(content: string): Promise<ClassifierOutput 
         temperature: 0.0,
       });
       const text = (res.content ?? '').trim();
-      const match = text.match(/\{[\s\S]*\}/);
-      if (!match) return null;
-      try {
-        const parsed = ClassificationSchema.safeParse(JSON.parse(match[0]));
-        if (!parsed.success) return null;
-        const defaults = DEFAULTS_BY_TYPE[parsed.data.memory_type];
-        return {
-          memory_type: parsed.data.memory_type,
-          scope_type: parsed.data.scope_type ?? defaults.scope_type,
-          sensitivity: parsed.data.sensitivity ?? defaults.sensitivity,
-          proactive_use: defaults.proactive_use,
-          mention_allowed: defaults.mention_allowed,
-          ttl_days: parsed.data.ttl_days !== undefined ? parsed.data.ttl_days : defaults.ttl_days,
-        };
-      } catch {
-        return null;
-      }
+      const parsed = safeExtractAndParseJson(text, ClassificationSchema);
+      if (!parsed) return null;
+      const defaults = DEFAULTS_BY_TYPE[parsed.memory_type];
+      return {
+        memory_type: parsed.memory_type,
+        scope_type: parsed.scope_type ?? defaults.scope_type,
+        sensitivity: parsed.sensitivity ?? defaults.sensitivity,
+        proactive_use: defaults.proactive_use,
+        mention_allowed: defaults.mention_allowed,
+        ttl_days: parsed.ttl_days !== undefined ? parsed.ttl_days : defaults.ttl_days,
+      };
     },
   );
 

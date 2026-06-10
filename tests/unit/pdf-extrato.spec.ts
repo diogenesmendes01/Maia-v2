@@ -42,13 +42,10 @@ afterAll(async () => {
   await rm(SANDBOX, { recursive: true, force: true });
 });
 
-// TODO(production-regression): src/lib/pdf/_helpers.ts uses `mod.default` to
-// get the PdfPrinter constructor from pdfmake, but pdfmake/js/index.js exports
-// an *instance* (not a class) so `new PdfPrinter()` throws "is not a constructor".
-// Fix: update _helpers.ts to import from 'pdfmake/js/printer.js' (exports the class
-// via mod.default), or use `const PdfPrinter = (await import('pdfmake/js/printer.js')).default`.
-// Tracked separately; these tests are skipped until the production code is fixed.
-// requires docker-compose: no (pure Node PDF gen, but blocked by production bug)
+// The old pdfmake "PdfPrinter is not a constructor" regression was fixed in
+// #148 (closes #138): _helpers.ts now uses the pdfmake instance API. These
+// tests run unskipped.
+// requires docker-compose: no (pure Node PDF gen)
 describe('generateExtratoPdf', () => {
   it('produces a valid PDF (magic bytes %PDF) at <MEDIA_ROOT>/tmp/*.pdf', async () => {
     const { generateExtratoPdf } = await import('../../src/lib/pdf/extrato.js');

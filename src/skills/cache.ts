@@ -8,6 +8,8 @@
  * (skill_activated/rolled_back) já garante consistência.
  */
 
+import { buildCacheKey } from '@/lib/cache-key.js';
+
 interface CacheEntry<T> {
   value: T;
   expires_at: number;
@@ -51,7 +53,14 @@ export const sliceCache = new InMemorySliceCache();
 /**
  * Invalida todas as entradas de slice para um tenant. Chamado quando uma
  * skill ativa/rola para trás (mantém cache consistente sem esperar TTL).
+ *
+ * Issue #287: o segmento tenant_id passa pelo MESMO encoder usado por
+ * `skillSliceCacheKey` (`buildCacheKey` com um único segmento) para que o
+ * prefixo case byte-a-byte com as chaves escritas. Sem isso, invalidar
+ * `tenant="acme"` também limparia entradas de `tenant="acme:dev"` (o
+ * prefixo cru `skill_slice:acme:` casa com `skill_slice:acme:dev:…`) —
+ * cross-tenant invalidation por aliasing de delimitador.
  */
 export async function invalidateSkillSliceCacheForTenant(tenant_id: string): Promise<void> {
-  await sliceCache.invalidate(`skill_slice:${tenant_id}:`);
+  await sliceCache.invalidate(`${buildCacheKey('skill_slice:', tenant_id)}:`);
 }

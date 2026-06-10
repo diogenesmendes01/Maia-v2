@@ -18,6 +18,7 @@ import type { SkillSlice, SkillSummary } from './types.js';
 import type { SkillRow } from '@/db/schema.js';
 import type { SkillExecutionMode } from '@/types/enums.js';
 import { logger } from '@/lib/logger.js';
+import { buildCacheKey } from '@/lib/cache-key.js';
 
 const SLICE_TTL_SECONDS = 600; // 10min — middle of the 5-10min range
 const MAX_CANDIDATES = 5;
@@ -38,7 +39,7 @@ export interface BuildSliceCtx {
 
 export async function buildSkillSlice(ctx: BuildSliceCtx): Promise<SkillSlice> {
   const routing = ctx.decision.routing ?? {};
-  const cacheKey = buildCacheKey({
+  const cacheKey = skillSliceCacheKey({
     tenant_id: ctx.tenant_id,
     agent_id: ctx.agent_id ?? null,
     selected: routing.selected_skill_id ?? null,
@@ -103,7 +104,17 @@ export async function buildSkillSlice(ctx: BuildSliceCtx): Promise<SkillSlice> {
   return slice;
 }
 
-function buildCacheKey(args: {
+/**
+ * Issue #287: renamed from a local `buildCacheKey` (which shadowed the
+ * centralized helper) and routed through `@/lib/cache-key.js` so the
+ * tenant/agent/skill-id segments are URI-encoded and glob-neutralized.
+ *
+ * Key-compatibility: this cache is process-local (`./cache.js` is an
+ * in-memory Map — nothing survives a deploy), so the format change in the
+ * candidates segment (`,` now encodes to `%2C`) carries zero invalidation
+ * risk. Exported for the unit spec only.
+ */
+export function skillSliceCacheKey(args: {
   tenant_id: string;
   agent_id: string | null;
   selected: string | null;
@@ -112,7 +123,7 @@ function buildCacheKey(args: {
   const agentPart = args.agent_id ?? 'tenant_wide';
   const selPart = args.selected ?? 'none';
   const candPart = [...args.candidates].sort().join(',');
-  return `skill_slice:${args.tenant_id}:${agentPart}:${selPart}:${candPart}`;
+  return buildCacheKey('skill_slice:', args.tenant_id, agentPart, selPart, candPart);
 }
 
 function toSummary(row: SkillRow): SkillSummary {

@@ -80,6 +80,7 @@ import {
   getCurrentAgent,
   MissingTenantContextError,
 } from '@/db/tenant-context.js';
+import { buildCacheKey } from '@/lib/cache-key.js';
 
 const KEY_PREFIX = 'dedup:msg:';
 const TTL_SECONDS = 60 * 60 * 24;
@@ -147,14 +148,19 @@ function assertWhatsappId(value: unknown): asserts value is string {
 }
 
 /**
- * Build the tenant+agent+wid-scoped Redis key. Every segment is
- * `encodeURIComponent`-encoded so the `:` delimiter is unambiguous — a
- * tenant slug containing `:` (e.g. `acme:dev`) cannot collide with a
- * tuple where the colon is part of `agent_id` or `whatsapp_id`. See the
- * module-level comment "Aliasing-safe encoding" for rationale.
+ * Build the tenant+agent+wid-scoped Redis key via the centralized
+ * `buildCacheKey` helper (issue #287 consolidation). Every segment is
+ * URI-encoded so the `:` delimiter is unambiguous — a tenant slug
+ * containing `:` (e.g. `acme:dev`) cannot collide with a tuple where the
+ * colon is part of `agent_id` or `whatsapp_id` — and Redis glob
+ * metacharacters (`* ? [ ] !`) are neutralized so an external-system
+ * `whatsapp_id` can never act as a wildcard in a `KEYS`/`SCAN` pattern.
  *
- * `whatsapp_id` is also encoded: it's an external-system value and we
- * cannot assume it never contains `:` or `%`.
+ * Key-compatibility note (#287): for segments without `*`/`!` the helper
+ * emits byte-identical keys to the previous inline `encodeURIComponent`
+ * concat — no version bump needed. A pathological key changes shape and
+ * ages out via the 24h TTL; the tenant+agent-scoped DB fallback
+ * (`findByWhatsappId`) still catches any real duplicate in the window.
  */
 function buildKey(
   tenant_id: string,
@@ -164,14 +170,7 @@ function buildKey(
   assertTenantSegment(tenant_id, 'tenant_id');
   assertTenantSegment(agent_id, 'agent_id');
   assertWhatsappId(whatsapp_id);
-  return (
-    KEY_PREFIX +
-    encodeURIComponent(tenant_id) +
-    ':' +
-    encodeURIComponent(agent_id) +
-    ':' +
-    encodeURIComponent(whatsapp_id)
-  );
+  return buildCacheKey(KEY_PREFIX, tenant_id, agent_id, whatsapp_id);
 }
 
 /**

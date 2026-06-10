@@ -109,10 +109,8 @@ describe('generate_report — extrato handler', () => {
     expect(out).toEqual(expect.objectContaining({ error: 'forbidden' }));
   });
 
-  // TODO(production-regression): pdfmake import in _helpers.ts uses mod.default
-  // which is undefined at runtime (pdfmake/js/index.js exports an instance, not
-  // a class). Handler silently returns { error: 'pdf_generation_failed' } so
-  // mimetype is undefined. Skipped until _helpers.ts is fixed.
+  // The old pdfmake constructor regression in _helpers.ts was fixed in #148
+  // (closes #138); this test runs unskipped.
   it('produces a valid PDF with summary on happy path', async () => {
     const eUuid = '00000000-0000-0000-0000-00000000000e';
     const ctxWithE = { ...ctx, scope: { entidades: [eUuid], byEntity: new Map() } };
@@ -167,8 +165,8 @@ describe('generate_report — comparativo handler', () => {
     expect(out).toEqual(expect.objectContaining({ error: 'comparativo_needs_two' }));
   });
 
-  // TODO(production-regression): same pdfmake constructor issue as above.
-  // Skipped until src/lib/pdf/_helpers.ts is fixed.
+  // The old pdfmake constructor regression was fixed in #148 (closes #138);
+  // this test runs unskipped.
   it('happy path: 2 entidades produces valid PDF', async () => {
     entidadesByIds.mockResolvedValue([
       { id: 'e1', nome: 'A' }, { id: 'e2', nome: 'B' },

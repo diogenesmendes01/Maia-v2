@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { callLLM } from '@/lib/claude.js';
+import { safeExtractAndParseJson } from '@/lib/json-safe.js';
 import { runCognitiveModule } from './runner.js';
 import { procedureAssignmentsRepo, procedureDefinitionsRepo } from '@/db/repositories.js';
 import { getCurrentAgent } from '@/db/tenant-context.js';
@@ -64,14 +65,7 @@ export async function selectProcedure(input: {
           temperature: 0.0,
         });
         const text = (res.content ?? '').trim();
-        const match = text.match(/\{[\s\S]*\}/);
-        if (!match) return null;
-        try {
-          const parsed = MatchResponseSchema.safeParse(JSON.parse(match[0]));
-          return parsed.success ? parsed.data : null;
-        } catch {
-          return null;
-        }
+        return safeExtractAndParseJson(text, MatchResponseSchema);
       },
     );
 

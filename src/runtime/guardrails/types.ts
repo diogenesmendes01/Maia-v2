@@ -30,8 +30,9 @@ export interface AgentOutputCandidate {
 /**
  * Execution context packet (Layer 3 assembly output).
  *
- * TODO(P8a #96): Replace with full ExecutionContextPacket from P8a. P9b
- * uses a minimal subset sufficient for Late PEP.
+ * P8a (#96) has merged: the full ExecutionContextPacket lives in
+ * `src/runtime/context-packet/types.ts`. Late PEP keeps this minimal subset;
+ * swapping it for the full type is now unblocked.
  */
 export interface ExecutionContextPacket {
   trace_id: string;

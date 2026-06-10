@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { callLLM } from '@/lib/claude.js';
+import { safeExtractAndParseJson } from '@/lib/json-safe.js';
 import { runCognitiveModule } from '@/cognition/runner.js';
 
 const ValidationSchema = z.object({
@@ -26,14 +27,7 @@ export async function validateBehavioralHint(
         temperature: 0.0,
       });
       const text = (res.content ?? '').trim();
-      const match = text.match(/\{[\s\S]*\}/);
-      if (!match) return null;
-      try {
-        const parsed = ValidationSchema.safeParse(JSON.parse(match[0]));
-        return parsed.success ? parsed.data : null;
-      } catch {
-        return null;
-      }
+      return safeExtractAndParseJson(text, ValidationSchema);
     },
   );
 

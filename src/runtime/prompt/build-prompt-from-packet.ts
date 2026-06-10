@@ -2,14 +2,13 @@
  * P8a — buildPromptFromPacket().
  *
  * Renders an ExecutionContextPacket into a system+messages prompt structure
- * for the LLM. This is the "Context Packet path" of the dual-path described
- * in plan Task 14. When FEATURE_CONTEXT_PACKET_V1 is enabled and a packet is
- * present, the react-loop calls this function instead of the legacy
- * `src/agent/prompt-builder.ts#buildPrompt`.
+ * for the LLM. This was the "Context Packet path" of the dual-path described
+ * in plan Task 14, gated by FEATURE_CONTEXT_PACKET_V1.
  *
- * TODO(prompt-builder integration): wire this into src/agent/react-loop.ts
- * once the legacy prompt-builder is repaired (it has pre-existing syntax
- * errors on main). For P8a this function is self-contained and unit-tested.
+ * PR #406 removed that flag and its hot path (the agent loop always uses the
+ * legacy `src/agent/prompt-builder.ts#buildPrompt`), so this module is
+ * currently UNWIRED from production — self-contained and unit-tested only,
+ * slated for the plumbing-teardown wave per the #406 commit notes.
  */
 import type {
   ExecutionContextPacket,

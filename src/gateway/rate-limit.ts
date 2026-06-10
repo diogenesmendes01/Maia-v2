@@ -92,19 +92,25 @@ import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 import type { Pessoa } from '@/db/schema.js';
 import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
+import { buildCacheKey } from '@/lib/cache-key.js';
 
 const KEY_PREFIX = 'maia:ratelimit:';
 
 /**
- * Build a tenant+agent-scoped Redis key. Each segment is URI-encoded so the
- * `:` delimiter is unambiguous: a tenant slug like `acme:dev` becomes
- * `acme%3Adev`, which can never collide with a tuple where the tenant is
- * `acme` and the agent starts with `dev:`. Mirrors the `buildKey` pattern
- * adopted by PR #257 (`src/tools/_vision-cache.ts`).
+ * Build a tenant+agent-scoped Redis key via the centralized `buildCacheKey`
+ * helper (issue #287 consolidation). Each segment is URI-encoded so the `:`
+ * delimiter is unambiguous, and Redis glob metacharacters (`* ? [ ] !`) are
+ * neutralized so a segment can never act as a wildcard in a `KEYS`/`SCAN`
+ * pattern.
  *
- * `flavor` is one of `hour`, `warned`, `silence` and is a fixed code-path
- * constant (never user-controlled), so it is intentionally NOT encoded —
- * if it ever becomes dynamic, encode it too.
+ * `flavor` is one of `hour`, `warned`, `silence` — a fixed code-path constant
+ * whose encoding is the identity, so routing it through `buildCacheKey`
+ * keeps the "every segment is encoded" rule uniform without changing bytes.
+ *
+ * Key-compatibility note (#287): for segments without `*`/`!` the helper
+ * emits byte-identical keys to the previous inline `encodeURIComponent`
+ * concat — no version bump needed. Pathological keys age out via the
+ * existing TTLs (1h zset/warned, 60s silence).
  */
 function buildKey(
   tenant_id: string,
@@ -112,16 +118,7 @@ function buildKey(
   flavor: 'hour' | 'warned' | 'silence',
   pessoa_id: string,
 ): string {
-  return (
-    KEY_PREFIX +
-    encodeURIComponent(tenant_id) +
-    ':' +
-    encodeURIComponent(agent_id) +
-    ':' +
-    flavor +
-    ':' +
-    encodeURIComponent(pessoa_id)
-  );
+  return buildCacheKey(KEY_PREFIX, tenant_id, agent_id, flavor, pessoa_id);
 }
 
 const HOUR_MS = 3600 * 1000;

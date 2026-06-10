@@ -41,11 +41,10 @@ afterAll(async () => {
   await rm(SANDBOX, { recursive: true, force: true });
 });
 
-// TODO(production-regression): same root cause as pdf-extrato.spec.ts —
-// src/lib/pdf/_helpers.ts uses mod.default from pdfmake, which exports an
-// instance, not a class. "PdfPrinter is not a constructor" until _helpers.ts
-// is updated to import from 'pdfmake/js/printer.js'. Skipped pending fix.
-// requires docker-compose: no (blocked by production bug, not infra)
+// The old pdfmake constructor regression (same root cause as
+// pdf-extrato.spec.ts) was fixed in #148 (closes #138): _helpers.ts now uses
+// the pdfmake instance API. These tests run unskipped.
+// requires docker-compose: no
 describe('generateComparativoPdf', () => {
   it('produces valid PDF with rows per entidade and a consolidado row in summary', async () => {
     const { generateComparativoPdf } = await import('../../src/lib/pdf/comparativo.js');

@@ -44,6 +44,7 @@ import {
   runWithTenantContext,
   MissingTenantContextError,
 } from '@/db/tenant-context.js';
+import { buildCacheKey } from '@/lib/cache-key.js';
 
 // ---------------------------------------------------------------------------
 // Redis call recorder. Captures (op, key, args) so we can assert on the
@@ -139,6 +140,36 @@ describe('issue #231 — working memory Redis keys are tenant+agent scoped', () 
       expect(keysOf('rpush')).toEqual([expected]);
       expect(keysOf('ltrim')).toEqual([expected]);
       expect(keysOf('expire')).toEqual([expected]);
+    });
+
+    // -------------------------------------------------------------------------
+    // Issue #287 — both the data key and the TTL marker key route through the
+    // centralized `buildCacheKey`. Two properties:
+    //   1. PARITY: the emitted keys are exactly the buildCacheKey composition.
+    //   2. KEY COMPATIBILITY: for UUID/slug segments the output is
+    //      byte-identical to the historical raw interpolation (the
+    //      exact-string assertions above prove it), so no version bump was
+    //      needed — and a `:`-bearing id can no longer alias across slots.
+    // -------------------------------------------------------------------------
+    it('issue #287: keys equal the buildCacheKey composition; `:` in tenant_id cannot alias', async () => {
+      await runWithTenantContext(
+        { tenant_id: 'acme:dev', agent_id: 'prod' },
+        async () => {
+          await pushMessage(CONV_SHARED, 'user', 'hello');
+        },
+      );
+      const dataKey = keysOf('rpush')[0]!;
+      const markerKey = keysOf('set')[0]!;
+      expect(dataKey).toBe(
+        buildCacheKey('working:', 'acme:dev', 'prod', 'conv', CONV_SHARED, 'messages'),
+      );
+      expect(markerKey).toBe(
+        buildCacheKey('nx_ttl:', 'acme:dev', 'prod', 'conv', CONV_SHARED, 'messages'),
+      );
+      // The `:` inside the tenant slug is encoded — `(acme:dev, prod)` can
+      // never collide with `(acme, dev:prod)` on the same conversa.
+      expect(dataKey).toContain('acme%3Adev');
+      expect(markerKey).toContain('acme%3Adev');
     });
 
     it('the TTL/collision marker key is ALSO tenant+agent scoped (#317 B4)', async () => {

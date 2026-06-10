@@ -45,6 +45,7 @@ import {
   runWithTenantContext,
   MissingTenantContextError,
 } from '@/db/tenant-context.js';
+import { buildCacheKey } from '@/lib/cache-key.js';
 
 // ---------------------------------------------------------------------------
 // Redis call recorder. Production `debouncer.ts` calls only get/set/del
@@ -507,6 +508,21 @@ describe('issue #248 — debouncer keys are tenant+agent scoped', () => {
         async () => _internal.scopedKey(SHARED_PHONE),
       );
       expect(scoped).toBe(`${enc(TENANT_A)}:${enc(AGENT_A)}:${enc(SHARED_PHONE)}`);
+    });
+
+    // -------------------------------------------------------------------------
+    // Issue #287 — buildKey routes through the centralized `buildCacheKey`
+    // (empty prefix; namespace markers are prepended by STATE_KEY /
+    // debounceJobId). Beyond per-segment URI encoding, glob metachars
+    // (`* ? [ ] !`) are neutralized — raw `encodeURIComponent` leaves `*`
+    // and `!` intact, which could act as wildcards in KEYS/SCAN patterns.
+    // -------------------------------------------------------------------------
+    it('issue #287: buildKey equals the buildCacheKey composition and neutralizes glob metachars', () => {
+      const suffix = _internal.buildKey('acme*', 'router!', '+5511999999999');
+      expect(suffix).toBe(buildCacheKey('', 'acme*', 'router!', '+5511999999999'));
+      expect(suffix).toContain('acme%2A');
+      expect(suffix).toContain('router%21');
+      expect(/[*?[\]!]/.test(suffix)).toBe(false);
     });
   });
 

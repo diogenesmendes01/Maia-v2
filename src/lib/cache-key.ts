@@ -34,13 +34,28 @@
  *   const key = buildCacheKey('maia:botdet:', tenant_id, agent_id, phone);
  *   // → "maia:botdet:<tenant>:<agent>:<phone>" with each component encoded
  *
- * Migration status: this helper is the destination for issue #287's
- * consolidation. 11+ call sites still use ad-hoc local builders / inline
- * `encodeURIComponent` (`bot-detection.ts`, `rate-limit.ts`, `debouncer.ts`,
- * `dedup.ts`, `holidays-cache.ts`, `_vision-cache.ts`, `memory/working.ts`,
- * `slice-cache.ts`, `user-layer/internal/cache-keys.ts`,
- * `governance/idempotency.ts`, ...). They are migrated in follow-up work
- * tracked by issue #287 to avoid massive rebase conflicts.
+ * Migration status (#287): consolidation COMPLETE. Every Redis/in-memory
+ * cache-key builder routes through this helper: `gateway/bot-detection.ts`,
+ * `gateway/rate-limit.ts`, `gateway/dedup.ts`, `gateway/debouncer.ts`,
+ * `memory/working.ts`, `tools/_vision-cache.ts`, `lib/holidays-cache.ts`,
+ * `runtime/context-packet/cache/slice-cache.ts`,
+ * `user-layer/internal/cache-keys.ts`, `skills/skill-slice-builder.ts` (+
+ * `skills/cache.ts` invalidation prefix), `scheduling/backpressure.ts`.
+ *
+ * Deliberately OUT of scope (each documented at the call site):
+ *   - `governance/idempotency.ts` — sha256 hash inputs joined with `'|'`
+ *     and compared against Postgres-stored values; changing the bytes
+ *     re-opens the #318 migration window (duplicate financial side
+ *     effects), which is more than a transient blip.
+ *   - `memory/working.ts` `scopeFingerprint` — hash input compared against
+ *     live `nx_ttl:*` marker values; changing it fires spurious
+ *     key-collision alerts for a 24h TTL window.
+ *   - pg advisory-lock strings (`db/repositories.ts` `upsertPending`,
+ *     `workers/reflection-batch.ts`) — Postgres locks, not Redis keys; the
+ *     JS-side string must keep matching the SQL-side `hashtext` input.
+ *   - `control-plane/policy/policy-rules-repo.ts` — Redis pub/sub CHANNEL
+ *     name with a `parse` round-trip contract, not a cache key.
+ *   - `workers/dlq-monitor.ts` — static constant key, no dynamic segments.
  */
 
 /**

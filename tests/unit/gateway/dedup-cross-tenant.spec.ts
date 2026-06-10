@@ -70,6 +70,7 @@ import {
   runWithTenantContext,
   MissingTenantContextError,
 } from '@/db/tenant-context.js';
+import { buildCacheKey } from '@/lib/cache-key.js';
 
 // ---------------------------------------------------------------------------
 // Redis call recorder. Captures (op, key, args) so we can assert on the
@@ -505,6 +506,27 @@ describe('issue #247 — gateway dedup Redis keys are tenant+agent-scoped', () =
       );
       // Sanity: the raw `:` and `%` from the wid are NOT present in the key.
       expect(setKeys[0]).not.toContain(':weird%');
+    });
+
+    // -------------------------------------------------------------------------
+    // Issue #287 — the key is built via the centralized `buildCacheKey`,
+    // which (beyond per-segment URI encoding) neutralizes Redis glob
+    // metachars (`* ? [ ] !`) that raw `encodeURIComponent` leaves intact.
+    // An external whatsapp_id containing `*` could otherwise act as a
+    // wildcard in any KEYS/SCAN MATCH pattern derived from the segment.
+    // -------------------------------------------------------------------------
+    it('issue #287: key equals the buildCacheKey composition and neutralizes glob metachars', async () => {
+      await runWithTenantContext(
+        { tenant_id: 'acme*', agent_id: AGENT_A },
+        async () => {
+          await markSeen('WID!glob');
+        },
+      );
+      const key = keysOf('set')[0]!;
+      expect(key).toBe(buildCacheKey('dedup:msg:', 'acme*', AGENT_A, 'WID!glob'));
+      expect(key).toContain('acme%2A');
+      expect(key).toContain('WID%21glob');
+      expect(/[*?[\]!]/.test(key)).toBe(false);
     });
   });
 
