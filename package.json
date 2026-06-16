@@ -55,7 +55,7 @@
     "@anthropic-ai/sdk": "^0.104.1",
     "@aws-sdk/client-s3": "^3.1045.0",
     "@fastify/cookie": "^11.0.2",
-    "@fastify/rate-limit": "^10.3.0",
+    "@fastify/rate-limit": "^11.0.0",
     "@hapi/boom": "^10.0.1",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@whiskeysockets/baileys": "^6.7.23",
