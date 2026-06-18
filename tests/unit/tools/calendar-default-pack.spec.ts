@@ -91,10 +91,13 @@ describe('calendar default pack — estrutura', () => {
     expect(BASE_AGENT_PACKS).toContain('domain.calendar');
   });
 
-  it('domain.calendar tem as 7 tools universais, SEM register_custom_holiday', () => {
-    expect(DOMAIN_CALENDAR_PACK.tools).toHaveLength(7);
+  it('domain.calendar tem as 8 tools universais, SEM register_custom_holiday', () => {
+    expect(DOMAIN_CALENDAR_PACK.tools).toHaveLength(8);
     expect(DOMAIN_CALENDAR_PACK.tools).toContain('schedule_reminder');
     expect(DOMAIN_CALENDAR_PACK.tools).toContain('cancel_reminder');
+    // v2: timezone capture travels with scheduling so reminders fire at the
+    // interlocutor's correct wall-clock time.
+    expect(DOMAIN_CALENDAR_PACK.tools).toContain('set_interlocutor_timezone');
     expect(DOMAIN_CALENDAR_PACK.tools).not.toContain('register_custom_holiday');
   });
 

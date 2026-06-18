@@ -13,6 +13,7 @@ import { parseImageTool } from './parse-image.js';
 import { transcribeAudioTool } from './transcribe-audio.js';
 import { scheduleReminderTool } from './schedule-reminder.js';
 import { cancelReminderTool } from './cancel-reminder.js';
+import { setInterlocutorTimezoneTool } from './set-interlocutor-timezone.js';
 import { startRecurringOutreachTool } from './start-recurring-outreach.js';
 import { startRecurringPaymentTool } from './start-recurring-payment.js';
 import { sendProactiveMessageTool } from './send-proactive-message.js';
@@ -183,6 +184,7 @@ export const REGISTRY: Record<string, AnyTool> = {
   // unconditionally).
   schedule_reminder: scheduleReminderTool as unknown as AnyTool,
   cancel_reminder: cancelReminderTool as unknown as AnyTool,
+  set_interlocutor_timezone: setInterlocutorTimezoneTool as unknown as AnyTool,
   start_recurring_outreach: startRecurringOutreachTool as unknown as AnyTool,
   start_recurring_payment: startRecurringPaymentTool as unknown as AnyTool,
   send_proactive_message: sendProactiveMessageTool as unknown as AnyTool,

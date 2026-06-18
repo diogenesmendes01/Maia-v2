@@ -18,6 +18,7 @@ import type { Pessoa, Conversa, Mensagem, BehavioralHint, Role, ProcedureExecuti
 import type { ResolvedPermission } from '@/governance/permissions.js';
 import { renderOperationalProfile, type RenderedProfile } from '@/identity/profile-renderer.js';
 import { fmtBR } from '@/lib/brazilian.js';
+import { resolveInterlocutorTz } from '@/lib/timezone.js';
 import type { LLMMessage } from '@/lib/claude.js';
 import { logger } from '@/lib/logger.js';
 import { GapLevel } from '@/types/enums.js';
@@ -898,12 +899,18 @@ ${stateJson}`;
     systemSections.push(scopeSentinelBlock, '');
   }
 
+  const interlocutorTz = resolveInterlocutorTz(ctx.pessoa);
+
   systemSections.push(
     '## Escopo desta conversa',
     profileBlock || '  (sem entidades acessíveis)',
     '',
     '## Estado atual',
-    `- Hoje: ${fmtBR(new Date())}`,
+    // Inclui data, hora local E offset de fuso (ex.: "18/06/2026 22:10:00 -03:00").
+    // Sem a hora-do-dia o agente não consegue confirmar se um horário pedido ainda
+    // está no futuro nem montar o ISO 8601 correto para `schedule_reminder`. O fuso
+    // é o do interlocutor (preferencias.timezone) com fallback para config.TZ.
+    `- Agora: ${fmtBR(new Date(), 'dd/MM/yyyy HH:mm:ss xxx', interlocutorTz)} (fuso ${interlocutorTz})`,
     entityStateBlocks.join('\n') || '  (sem estados ativos)',
     '',
   );
