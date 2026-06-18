@@ -12,8 +12,12 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 - **Pedidos de ferramenta** ([#476](https://github.com/diogenesmendes01/Maia-v2/pull/476), #471 v1): lacunas `tipo='tool'` viram backlog com geração de issue pré-preenchida.
 - **MCP externo v1** ([#480](https://github.com/diogenesmendes01/Maia-v2/pull/480), #478): servers MCP first-party (ERP) com governança completa — migração 089, cliente SDK, bridge no dispatcher, worker `mcp_sync`, tela `/setup/mcp`, flag `FEATURE_MCP_TOOLS` (default OFF).
 
+### Fixed
+- **Roteamento de canal para JID `@lid`**: eventos do WhatsApp que chegam como `XXX@lid` sem `senderPn`/`participantPn` deixavam de resolver e eram descartados como `channel_resolution_failed` (risco de perda de mensagem conforme o WhatsApp migra o endereçamento para LID). Agora `resolveScopeForJid` aceita um resolvedor LID→telefone injetado (a *signal LID mapping store* do Baileys, via `socket.signalRepository.lidMapping.getPNForLID`, com *feature-detection*) como terceiro fallback; o telefone recuperado também passa a alimentar a identidade (`tel`) em `handleIncoming`, mantendo roteamento e identidade consistentes. Quando nada resolve, o drop continua *fail-closed* mas é auditado como a ação dedicada `channel_resolution_skipped_lid_unmapped` (separando ruído de sync do WhatsApp de falhas reais de posse cross-tenant). Ver `src/gateway/jid-tenant-resolver.ts` e `src/gateway/baileys.ts`.
+
 ### Docs
 - Specs versionadas: visão "funcionários digitais", playground, work loop e MCP (`docs/superpowers/specs/2026-06-10-*`); novo doc de módulo `objectives.md`.
+- `docs/architecture/modules/gateway.md`: lista `jid-tenant-resolver.ts` e documenta a ordem de recuperação de `@lid`.
 
 ### Changed — Admin UI
 - **Redesign visual completo da console** ([#460](https://github.com/diogenesmendes01/Maia-v2/pull/460)): camada visual reconstruída do zero sobre design system próprio (`src/admin-ui/components/ui/`) com navegação agent-first em pt-BR (sidebar + badge de aprovações pendentes). Nova experiência de agentes: hub `/agents` em cards, wizard de criação em 4 passos (`/agents/new`) e detalhe por agente com edição de perfil pré-preenchida e aprovação de versões (`/agents/[agentId]`); `/setup/agents` virou redirect. Tela de versões passou a expor o fluxo de rollback (auditado; `NOT_IMPLEMENTED` sinalizado na UI). Routers tRPC preservados como camada de dados.

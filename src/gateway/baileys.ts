@@ -99,6 +99,32 @@ export function getSocket(): WASocket | null {
   return socket;
 }
 
+/**
+ * Last-resort LID→phone resolver backed by Baileys' signal LID mapping store
+ * (`socket.signalRepository.lidMapping.getPNForLID`). Feature-detected: a
+ * Baileys build that does not expose the store (older/forked) yields a no-op
+ * (returns null), preserving the previous fail-closed behaviour. Wrapped in a
+ * try/catch so a store-internal throw never escapes into the ingress loop.
+ *
+ * This is the second half of the `@lid` fix: `msg.key.senderPn`/`participantPn`
+ * is the cheap path (handled in `extractPhoneFromJid`); when those hints are
+ * absent (sync/peer events, pre-mapping window) we ask the store, which often
+ * knows the phone. Only when BOTH miss do we drop fail-closed as
+ * `channel_resolution_skipped_lid_unmapped`.
+ */
+async function resolvePhoneFromLidStore(lid: string): Promise<string | null> {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const store = (socket as any)?.signalRepository?.lidMapping;
+  if (!store || typeof store.getPNForLID !== 'function') return null;
+  try {
+    const pn = await store.getPNForLID(lid);
+    return typeof pn === 'string' && pn.length > 0 ? pn : null;
+  } catch (err) {
+    logger.debug({ err: (err as Error).message }, 'baileys.lid_store_lookup_failed');
+    return null;
+  }
+}
+
 type StubLike = { messageStubType?: number | null | undefined };
 
 /**
@@ -273,7 +299,10 @@ export async function startBaileys(): Promise<void> {
         const ctx = await resolveTenantCtxForUpsert(msg);
         if (!ctx) continue; // resolution failed → audit emitted + drop
         await runWithTenantContext(ctx.scope, () =>
-          handleIncoming(msg, { channel_id: ctx.channel_id }),
+          handleIncoming(msg, {
+            channel_id: ctx.channel_id,
+            resolved_tel: ctx.resolved_tel,
+          }),
         );
       } catch (err) {
         logger.error({ err }, 'baileys.handle_failed');
@@ -407,6 +436,12 @@ async function resolveTenantCtxForUpsert(
 ): Promise<{
   scope: { tenant_id: string; agent_id: string };
   channel_id: string | null;
+  /** The E.164 phone (`+digits`) the resolver actually used as `external_id`.
+   *  For a `@lid` recovered via the LID mapping store this is the REAL phone,
+   *  not the synthetic LID local-part — `handleIncoming` uses it so identity
+   *  (pessoa lookup) stays consistent with routing. Null when the resolver did
+   *  not surface a phone. */
+  resolved_tel: string | null;
 } | null> {
   // [Codex review #311 — minor] `msg.key` can be absent on malformed
   // envelopes; optional-chain so a missing key resolves to a null JID
@@ -424,7 +459,12 @@ async function resolveTenantCtxForUpsert(
   };
 
   try {
-    const { scope, jid_context } = await resolveScopeForJid(jid, keyHints);
+    const { scope, jid_context } = await resolveScopeForJid(jid, keyHints, {
+      // Inject the socket-backed LID→PN store lookup so a `@lid` event whose
+      // key hints weren't populated can still recover its real phone instead of
+      // being dropped (the message-loss risk this fix closes).
+      lidPhoneResolver: resolvePhoneFromLidStore,
+    });
     // jid_context is observability metadata (LID fallback, raw_jid,
     // resolved phone) — propagated via logs, not via handleIncoming.
     // handleIncoming derives `tel` from msg.key directly, mirroring its
@@ -434,6 +474,11 @@ async function resolveTenantCtxForUpsert(
       logger.debug(
         {
           raw_jid: jid_context.raw_jid,
+          // Where the phone came from: 'key_hint' (senderPn/participantPn) or
+          // 'lid_store' (recovered from the signal LID mapping after the hints
+          // were absent). 'lid_store' hits are the ones this fix saved from a
+          // fail-closed drop.
+          lid_recovery_source: jid_context.lid_recovery_source,
           // [🟠 MEDIUM fix #417] optional-chain `msg.key` — a malformed/no-key
           // envelope must not throw a raw TypeError here.
           whatsapp_id: msg.key?.id ?? null,
@@ -444,15 +489,31 @@ async function resolveTenantCtxForUpsert(
     return {
       scope: { tenant_id: scope.tenant_id, agent_id: scope.agent_id },
       channel_id: scope.channel_id,
+      resolved_tel: jid_context.resolved_phone_e164,
     };
   } catch (err) {
     // Typed resolution failure → fail-closed audit + drop. Audit writer
     // wraps in synthetic `system` ALS when none is active (which is the
     // case here — we ARE the entry point).
-    const typed = err as { code?: string; details?: unknown };
+    const typed = err as {
+      code?: string;
+      details?: { resolver_path?: string } | unknown;
+    };
     const isResolutionFailure = typed?.code === 'channel_resolution_failed';
+    // A `@lid` we could not map to a phone (key hints absent AND the LID store
+    // missed) is split onto its own audit action so the operator alert for
+    // genuine `channel_resolution_failed` (cross-tenant ownership miss / garbage
+    // JID) is not polluted by benign WhatsApp sync/peer noise — while STILL
+    // dropping fail-closed and staying visible as the message-loss canary.
+    const resolverPath =
+      typeof typed?.details === 'object' && typed.details !== null
+        ? (typed.details as { resolver_path?: string }).resolver_path
+        : undefined;
+    const isLidUnmapped = isResolutionFailure && resolverPath === 'lid_unmapped';
     await audit({
-      acao: 'channel_resolution_failed',
+      acao: isLidUnmapped
+        ? 'channel_resolution_skipped_lid_unmapped'
+        : 'channel_resolution_failed',
       metadata: {
         // mensagem_id intentionally null — the inbound was NOT persisted
         // (we audit BEFORE createInbound runs). whatsapp_id is the only
@@ -479,11 +540,14 @@ async function resolveTenantCtxForUpsert(
       {
         err: (err as Error).message,
         err_code: typed?.code,
+        resolver_path: resolverPath ?? null,
         // [🟠 MEDIUM fix #417] optional-chain `msg.key` (see audit above).
         whatsapp_id: msg.key?.id ?? null,
         raw_jid: jid,
       },
-      'baileys.channel_resolution_failed_drop',
+      isLidUnmapped
+        ? 'baileys.channel_resolution_skipped_lid_unmapped'
+        : 'baileys.channel_resolution_failed_drop',
     );
     return null;
   }
@@ -496,7 +560,7 @@ async function handleIncoming(
   // continue to work unchanged. The metadata is recorded on the inbound row
   // when present so downstream agent logic can short-circuit the resolver
   // probe (defense-in-depth; the worker's probe still functions as fallback).
-  opts?: { channel_id?: string | null },
+  opts?: { channel_id?: string | null; resolved_tel?: string | null },
 ): Promise<void> {
   if (msg.key.fromMe) return;
   const _resolvedChannelId = opts?.channel_id ?? null;
@@ -552,9 +616,22 @@ async function handleIncoming(
       : typeof k?.participantPn === 'string'
         ? k.participantPn
         : undefined;
-  const rawPhone = isLid && realPn ? realPn.split('@')[0]! : remote_jid.split('@')[0]!;
-  const tel = '+' + rawPhone;
-  if (isLid && !realPn) {
+  // Identity (`tel`) precedence — must stay consistent with how the ingress
+  // resolved the TENANT (resolveScopeForJid), or a `@lid` recovered via the LID
+  // mapping store would be routed under the real owner but have its pessoa
+  // created under the synthetic LID number:
+  //   1. senderPn/participantPn from the key (the cheap, in-envelope hint),
+  //   2. `opts.resolved_tel` — the E.164 phone the resolver actually used
+  //      (covers the LID-store recovery, where the key hints were absent),
+  //   3. the raw JID local-part (standard `@s.whatsapp.net`; or a last-resort
+  //      synthetic value for an unmapped LID that still slipped through).
+  const tel =
+    isLid && realPn
+      ? '+' + realPn.split('@')[0]!
+      : opts?.resolved_tel && opts.resolved_tel.length > 0
+        ? opts.resolved_tel
+        : '+' + remote_jid.split('@')[0]!;
+  if (isLid && !realPn && !(opts?.resolved_tel && opts.resolved_tel.length > 0)) {
     logger.warn(
       { remote_jid, whatsapp_id },
       'baileys.lid_without_real_phone',

@@ -98,9 +98,15 @@ type JidContext = {
    *  Null when the JID parse failed BEFORE we found a usable phone (e.g. raw
    *  `@lid` with no `senderPn`, group JID, malformed JID). */
   resolved_phone_e164: string | null;
-  /** Did we have to pull the phone from `senderPn`/`participantPn` because
-   *  the JID was `@lid`? Useful in audit triage. */
+  /** Did we have to pull the phone from `senderPn`/`participantPn` (or the LID
+   *  mapping store) because the JID was `@lid`? Useful in audit triage. */
   via_lid_fallback: boolean;
+  /** WHERE the `@lid` phone came from when `via_lid_fallback` is true:
+   *   - `'key_hint'`  → `msg.key.senderPn` / `participantPn` (the cheap path).
+   *   - `'lid_store'` → recovered from the injected LID→PN resolver (Baileys'
+   *     signal LID mapping store) AFTER the key hints were absent.
+   *  Null when no LID fallback was needed (standard `@s.whatsapp.net`/`@c.us`). */
+  lid_recovery_source: 'key_hint' | 'lid_store' | null;
 };
 
 /**
@@ -115,6 +121,22 @@ type JidContext = {
  * under (otherwise active channels in `whatsapp_channels` would silently
  * miss for any `@lid` contact).
  */
+/**
+ * Normalize a phone candidate (a bare `5511…` local-part OR a JID-shaped
+ * `5511…@s.whatsapp.net`) into the `+<digits>` E.164 convention. Returns null
+ * when the candidate is empty or its local-part is not digits-only — we never
+ * invent a phone from a value we can't trust. Shared by the `@lid` senderPn
+ * fallback (`extractPhoneFromJid`) and the LID-mapping-store recovery in
+ * `resolveScopeForJid`, so both apply the SAME validation.
+ */
+function phoneFromCandidate(candidate: string | null | undefined): string | null {
+  if (typeof candidate !== 'string' || candidate.length === 0) return null;
+  const at = candidate.indexOf('@');
+  const local = at > 0 ? candidate.slice(0, at) : candidate;
+  if (!/^\d+$/.test(local)) return null;
+  return '+' + local;
+}
+
 export function extractPhoneFromJid(
   jid: string | null | undefined,
   key?: {
@@ -150,12 +172,10 @@ export function extractPhoneFromJid(
         : typeof key?.participantPn === 'string' && key.participantPn.length > 0
           ? key.participantPn
           : null;
-    if (!candidate) return null;
     // candidate may be `5511…@s.whatsapp.net` or bare `5511…`
-    const candAt = candidate.indexOf('@');
-    const candLocal = candAt > 0 ? candidate.slice(0, candAt) : candidate;
-    if (!/^\d+$/.test(candLocal)) return null;
-    return { phone_e164: '+' + candLocal, via_lid_fallback: true };
+    const phone = phoneFromCandidate(candidate);
+    if (!phone) return null;
+    return { phone_e164: phone, via_lid_fallback: true };
   }
 
   // Standard JID — local part MUST be digits-only (Baileys' contract). If
@@ -170,8 +190,15 @@ export function extractPhoneFromJid(
  * Returns the `ResolvedScope` plus a `JidContext` for observability.
  *
  * THROWS `TypedError('channel_resolution_failed')` when:
- *   - JID cannot be parsed (malformed, group, unknown domain, `@lid` w/o
- *     senderPn) — `details.resolver_path = 'jid_unparseable'`.
+ *   - JID cannot be parsed (malformed, group, unknown domain) —
+ *     `details.resolver_path = 'jid_unparseable'`.
+ *   - JID is `@lid` but no real phone is recoverable (senderPn/participantPn
+ *     absent AND the injected `lidPhoneResolver` missed) —
+ *     `details.resolver_path = 'lid_unmapped'`. Split from `jid_unparseable`
+ *     because a `@lid` we can't map is the canary for real `@lid` message loss
+ *     (the WhatsApp LID migration), and operators must alert on it separately
+ *     from a genuinely foreign/garbage JID. The caller maps it to the dedicated
+ *     `channel_resolution_skipped_lid_unmapped` audit action.
  *   - In a MULTI-TENANT deployment, no channel is registered for the resolved
  *     phone — `details.resolver_path = 'unknown_or_inactive_channel'` (from
  *     `resolveChannel`). In a single-tenant runtime this case resolves to
@@ -191,11 +218,55 @@ export async function resolveScopeForJid(
     senderPn?: string | null | undefined;
     participantPn?: string | null | undefined;
   },
+  opts?: {
+    /**
+     * Last-resort LID→phone resolver, injected by the Baileys caller from the
+     * socket's signal LID mapping store. Consulted ONLY when the JID is `@lid`
+     * and `senderPn`/`participantPn` were absent — it recovers the real phone
+     * for `@lid` events whose key hints weren't populated (initial sync / peer
+     * events, or once the LID↔PN mapping has synced). Injected (not imported)
+     * so this resolver stays pure and unit-testable without a live socket; a
+     * deployment whose Baileys build lacks the store simply passes nothing and
+     * keeps the previous fail-closed behaviour.
+     */
+    lidPhoneResolver?: (lid: string) => string | null | Promise<string | null>;
+  },
 ): Promise<{ scope: ResolvedScope; jid_context: JidContext }> {
   const raw_jid = typeof jid === 'string' ? jid : '';
+  const isLid = typeof jid === 'string' && jid.endsWith('@lid');
 
-  const parsed = extractPhoneFromJid(jid, key);
+  let parsed = extractPhoneFromJid(jid, key);
+  let lid_recovery_source: 'key_hint' | 'lid_store' | null = parsed?.via_lid_fallback
+    ? 'key_hint'
+    : null;
+
+  // `@lid` with no usable senderPn/participantPn hint: before failing closed,
+  // try the injected LID→PN resolver (Baileys' signal LID mapping store). This
+  // is what prevents real `@lid` message loss as WhatsApp migrates addressing
+  // to LID — the key hints are not always populated, but the mapping store
+  // often knows the phone.
+  if (!parsed && isLid && opts?.lidPhoneResolver) {
+    const recovered = phoneFromCandidate(await opts.lidPhoneResolver(jid as string));
+    if (recovered) {
+      parsed = { phone_e164: recovered, via_lid_fallback: true };
+      lid_recovery_source = 'lid_store';
+    }
+  }
+
   if (!parsed) {
+    // Split the audit signal: a `@lid` we couldn't map (benign sync noise
+    // today, the message-loss canary tomorrow) is NOT the same operational
+    // event as a foreign/garbage JID. See the THROWS contract above.
+    if (isLid) {
+      throw new TypedError(
+        'channel_resolution_failed',
+        'lid jid without a recoverable phone number (senderPn/participantPn absent and LID mapping miss)',
+        {
+          resolver_path: 'lid_unmapped',
+          raw_jid,
+        },
+      );
+    }
     throw new TypedError(
       'channel_resolution_failed',
       'jid unparseable for tenant routing',
@@ -223,6 +294,7 @@ export async function resolveScopeForJid(
       raw_jid,
       resolved_phone_e164: parsed.phone_e164,
       via_lid_fallback: parsed.via_lid_fallback,
+      lid_recovery_source,
     },
   };
 }

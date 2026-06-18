@@ -9,6 +9,7 @@
 | File | Role |
 |---|---|
 | `src/gateway/baileys.ts` | WhatsApp connection lifecycle + in/out via Baileys |
+| `src/gateway/jid-tenant-resolver.ts` | Parses the inbound WhatsApp JID (`@s.whatsapp.net`/`@c.us`/`@lid`) → E.164 phone, then delegates to `channel-resolver`. `@lid` recovery order: `senderPn`/`participantPn` key hints → injected LID→PN mapping-store lookup → fail-closed `lid_unmapped` (dropped, audited as `channel_resolution_skipped_lid_unmapped`, distinct from a real `channel_resolution_failed`) |
 | `src/gateway/channel-resolver.ts` | Resolves `(channel_id, agent_id, role)` from inbound metadata; fails loud |
 | `src/gateway/rate-limit.ts` | Per-channel rate-limit (Redis, tenant-prefixed keys) |
 | `src/gateway/dedup.ts` | Inbound message dedup (Redis, tenant-keyed) |
