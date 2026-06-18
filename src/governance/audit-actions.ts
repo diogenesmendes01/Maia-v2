@@ -103,6 +103,10 @@ export const AUDIT_ACTIONS = [
   'setup_unauthorized_access',
   'setup_csrf_mismatch',
   'llm_model_changed',
+  // `interlocutor_timezone_set`: set_interlocutor_timezone persisted the
+  // person's IANA zone into `pessoas.preferencias.timezone` (used by the prompt
+  // temporal block + schedule_reminder). Self-scoped per-pessoa write.
+  'interlocutor_timezone_set',
   // Spec 18 — Scheduling V2 (series → occurrence → task → outbox)
   'series_created',
   'series_cancelled',

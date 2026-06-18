@@ -2045,6 +2045,24 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     ]
   },
   {
+    "name": "set_interlocutor_timezone",
+    "description": "Registra o fuso horário (nome IANA, ex.: America/Sao_Paulo, Europe/Lisbon) do interlocutor atual, para agendar lembretes e mostrar o horário no fuso correto dele. Use quando o usuário disser onde está ou qual o fuso dele.",
+    "side_effect": "write",
+    "operation_type": "update_meta",
+    "sensitive": false,
+    "feature_flag": null,
+    "required_actions": [
+      "schedule_reminder"
+    ],
+    "inputs": [
+      {
+        "name": "timezone",
+        "type": "string",
+        "optional": false
+      }
+    ]
+  },
+  {
     "name": "start_recurring_outreach",
     "description": "Agenda uma série recorrente de mensagens para um terceiro (ex: pedir relatório mensal). Cada ciclo envia o template para o destinatário, espera resposta (ou expira em wait_response_hours), e se forward_template estiver setado, encaminha para uma segunda pessoa. Requer aprovação dupla (dual_approval_granted=true).",
     "side_effect": "communication",

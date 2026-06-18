@@ -1133,4 +1133,19 @@ describe('prompt-builder — temporal context (current time)', () => {
     expect(block).toMatch(/[+-]\d{2}:\d{2}/);
     expect(block).toContain('America/Sao_Paulo');
   });
+
+  it('renders "now" in the interlocutor\'s own timezone when preferencias.timezone is set', async () => {
+    const pessoa = mkPessoa({ preferencias: { timezone: 'Europe/Lisbon' } });
+    const { system } = await build({ pessoa });
+    const block = system.slice(system.indexOf('## Estado atual'));
+    expect(block).toContain('Europe/Lisbon');
+    expect(block).not.toContain('America/Sao_Paulo');
+  });
+
+  it('falls back to the default timezone when preferencias.timezone is invalid', async () => {
+    const pessoa = mkPessoa({ preferencias: { timezone: 'Not/AZone' } });
+    const { system } = await build({ pessoa });
+    const block = system.slice(system.indexOf('## Estado atual'));
+    expect(block).toContain('America/Sao_Paulo');
+  });
 });
