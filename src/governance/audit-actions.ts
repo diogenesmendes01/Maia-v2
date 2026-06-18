@@ -138,6 +138,15 @@ export const AUDIT_ACTIONS = [
   // fails (legacy fallback removed). Surfaces previously-masked failures and
   // prevents cross-tenant rate-limit bucket collapse via default/default.
   'channel_resolution_failed',
+  // `@lid` ingress fix — emitted by the Baileys ingress when a WhatsApp `@lid`
+  // (Linked ID) event cannot be mapped to a real phone: `senderPn`/
+  // `participantPn` were absent AND the signal LID mapping store missed. Split
+  // from `channel_resolution_failed` so operators can alert on real cross-tenant
+  // ownership misses / garbage JIDs WITHOUT the benign WhatsApp sync/peer noise
+  // that arrives as unmapped `@lid`. The message is still DROPPED fail-closed —
+  // this action is the canary for real `@lid` message loss as WhatsApp migrates
+  // its addressing to LID. Triage detail lives in `metadata.resolver_details`.
+  'channel_resolution_skipped_lid_unmapped',
   // Issue #289 — emitted by scripts/embeddings-rebuild.ts when the embedding
   // provider returns a vector with the wrong dimension (or no vector at all)
   // for a row. We skip the UPDATE so the previous run's re-detection
