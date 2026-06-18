@@ -903,7 +903,10 @@ ${stateJson}`;
     profileBlock || '  (sem entidades acessíveis)',
     '',
     '## Estado atual',
-    `- Hoje: ${fmtBR(new Date())}`,
+    // Inclui data, hora local E offset de fuso (ex.: "18/06/2026 22:10:00 -03:00").
+    // Sem a hora-do-dia o agente não consegue confirmar se um horário pedido ainda
+    // está no futuro nem montar o ISO 8601 correto para `schedule_reminder`.
+    `- Agora: ${fmtBR(new Date(), 'dd/MM/yyyy HH:mm:ss xxx', config.TZ)} (fuso ${config.TZ})`,
     entityStateBlocks.join('\n') || '  (sem estados ativos)',
     '',
   );
