@@ -38,9 +38,12 @@ export default function GoLiveChecklist({
   const rolesCount = overview?.roles_count ?? 0;
 
   const hasChannel = channels.length > 0;
-  const allChannelsHavePolicy =
-    hasChannel && channels.every((c) => c.has_policy);
-  const policyDone = rolesCount > 0 && allChannelsHavePolicy;
+  // policy_ready = política existe E o papel padrão está ativo — has_policy
+  // sozinho deixaria o checklist sumir com um papel padrão desativado
+  // (review do PR #491, medium).
+  const allChannelsReady = hasChannel && channels.every((c) => c.policy_ready);
+  const policyDone = rolesCount > 0 && allChannelsReady;
+  const hasStalePolicy = channels.some((c) => c.has_policy && !c.policy_ready);
 
   // Tudo pronto — o checklist já cumpriu o papel; não polui a visão geral.
   if (hasActiveProfile && hasChannel && policyDone) return null;
@@ -87,10 +90,12 @@ export default function GoLiveChecklist({
       done: policyDone,
       label: 'Papel padrão e política do canal',
       detail: policyDone
-        ? 'Todos os canais têm política com papel padrão.'
+        ? 'Todos os canais têm política com papel padrão ativo.'
         : rolesCount === 0
           ? 'Crie um papel para o agente — a política de canal exige um papel padrão.'
-          : 'Há canal sem política configurada.',
+          : hasStalePolicy
+            ? 'Há política apontando para papel inativo — atualize o papel padrão do canal.'
+            : 'Há canal sem política configurada.',
       action: !policyDone && (
         <Link href={channelsHref}>
           <Button size="sm" variant="secondary">

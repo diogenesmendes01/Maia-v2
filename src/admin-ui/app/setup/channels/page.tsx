@@ -201,10 +201,12 @@ export default function ChannelsSetupPage() {
                           <Td className="font-mono text-xs">{c.external_id}</Td>
                           <Td>{c.display_name ?? '—'}</Td>
                           <Td>
-                            {c.has_policy ? (
+                            {c.policy_ready ? (
                               <Badge tone="success">
-                                papel padrão: {c.default_role_key ?? '?'}
+                                papel padrão: {c.default_role_key}
                               </Badge>
+                            ) : c.has_policy ? (
+                              <Badge tone="danger">papel padrão inativo</Badge>
                             ) : (
                               <Badge tone="warning">sem política</Badge>
                             )}

@@ -30,7 +30,6 @@ import { TRPCError } from '@trpc/server';
 import { router, protectedProcedure } from '../server.js';
 import { resolveTenantId } from '../tenant-resolver.js';
 import { runWithTenantContext } from '../../../db/tenant-context.js';
-import { pgErrorCode } from '../../../db/client.js';
 
 // Mirrors src/types/enums.ts SwitchBehavior + AnnounceMode (single source of
 // truth lives there; we declare a Zod equivalent here for input validation).
@@ -162,15 +161,22 @@ export const channelPoliciesRouter = router({
           const withPolicy = await Promise.all(
             channels.map(async (c) => {
               const policy = await ctx.repos.channelPoliciesRepo.getByChannelId(c.id);
+              // roleKeyById only holds ACTIVE roles, so a policy whose
+              // default role was deactivated resolves to null — the channel
+              // has a policy but is NOT ready to operate. Consumers (go-live
+              // checklist, policy badge) must gate on policy_ready, not
+              // has_policy (PR #491 review, medium).
+              const defaultRoleKey = policy
+                ? (roleKeyById.get(policy.default_role_id) ?? null)
+                : null;
               return {
                 id: c.id,
                 channel_type: c.channel_type,
                 external_id: c.external_id,
                 display_name: c.display_name,
                 has_policy: policy !== null,
-                default_role_key: policy
-                  ? (roleKeyById.get(policy.default_role_id) ?? null)
-                  : null,
+                default_role_key: defaultRoleKey,
+                policy_ready: policy !== null && defaultRoleKey !== null,
               };
             }),
           );
@@ -297,44 +303,32 @@ export const channelPoliciesRouter = router({
         throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent not found' });
       }
 
-      let channel;
-      try {
-        channel = await runWithTenantContext(
-          { tenant_id: tenantId, agent_id: input.agentId },
-          async () =>
-            ctx.repos.channelsRepo.create({
-              channel_type: input.channel_type,
-              external_id: input.external_id,
-              display_name: input.display_name,
-            }),
-        );
-      } catch (err) {
-        if (pgErrorCode(err) === '23505') {
-          throw new TRPCError({
-            code: 'CONFLICT',
-            message: `Channel '${input.channel_type}/${input.external_id}' already exists in this tenant`,
-          });
-        }
-        throw err;
-      }
-
-      await ctx.repos.adminAuditLogRepo.append({
+      // PR #491 review (high) — create + audit run in ONE tx inside the repo
+      // ("audit every decision": a failed audit insert rolls the channel
+      // back). The helper takes explicit tenant/agent and maps 23505 to a
+      // typed reason, same contract as agentsRepo.createWithSeedAndAudit.
+      const result = await ctx.repos.channelsRepo.createWithAudit({
         tenant_id: tenantId,
-        actor_id: ctx.userId,
-        actor_role: ctx.userRole,
-        action: 'channel_create',
-        resource_type: 'channel',
-        resource_id: channel.id,
-        change_summary: {
-          agent_id: input.agentId,
+        agent_id: input.agentId,
+        channel: {
           channel_type: input.channel_type,
           external_id: input.external_id,
-          display_name: input.display_name ?? null,
+          display_name: input.display_name,
+        },
+        audit: {
+          actor_id: ctx.userId,
+          actor_role: ctx.userRole,
           reason: input.comment,
         },
       });
+      if (!result.ok) {
+        throw new TRPCError({
+          code: 'CONFLICT',
+          message: `Channel '${input.channel_type}/${input.external_id}' already exists in this tenant`,
+        });
+      }
 
-      return { channel };
+      return { channel: result.channel };
     }),
 
   /**
@@ -357,50 +351,34 @@ export const channelPoliciesRouter = router({
         throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent not found' });
       }
 
-      let role;
-      try {
-        role = await runWithTenantContext(
-          { tenant_id: tenantId, agent_id: input.agentId },
-          async () => {
-            const isDefault =
-              input.is_default ?? (await ctx.repos.rolesRepo.listActive()).length === 0;
-            return ctx.repos.rolesRepo.create({
-              role_key: input.role_key,
-              display_name: input.display_name,
-              description: input.description,
-              prompt_addendum: input.prompt_addendum,
-              is_default: isDefault,
-            });
-          },
-        );
-      } catch (err) {
-        if (pgErrorCode(err) === '23505') {
-          throw new TRPCError({
-            code: 'CONFLICT',
-            message:
-              `Role '${input.role_key}' already exists for this agent, ` +
-              `or another role is already the default`,
-          });
-        }
-        throw err;
-      }
-
-      await ctx.repos.adminAuditLogRepo.append({
+      // PR #491 review (high) — create + audit in ONE tx; `is_default`
+      // omitted is resolved INSIDE the tx (first active role becomes the
+      // default; the partial unique index breaks concurrent-create ties).
+      const result = await ctx.repos.rolesRepo.createWithAudit({
         tenant_id: tenantId,
-        actor_id: ctx.userId,
-        actor_role: ctx.userRole,
-        action: 'role_create',
-        resource_type: 'role',
-        resource_id: role.id,
-        change_summary: {
-          agent_id: input.agentId,
+        agent_id: input.agentId,
+        role: {
           role_key: input.role_key,
           display_name: input.display_name,
-          is_default: role.is_default,
+          description: input.description,
+          prompt_addendum: input.prompt_addendum,
+          is_default: input.is_default,
+        },
+        audit: {
+          actor_id: ctx.userId,
+          actor_role: ctx.userRole,
           reason: input.comment,
         },
       });
+      if (!result.ok) {
+        throw new TRPCError({
+          code: 'CONFLICT',
+          message:
+            `Role '${input.role_key}' already exists for this agent, ` +
+            `or another role is already the default`,
+        });
+      }
 
-      return { role };
+      return { role: result.role };
     }),
 });

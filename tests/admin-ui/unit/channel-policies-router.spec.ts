@@ -56,12 +56,6 @@ type AuditRow = {
 
 type Agent = { id: string; tenant_id: string; nome: string; status: string };
 
-/** Mimics the pg driver's unique-violation error so pgErrorCode() maps it. */
-function uniqueViolation(constraint: string): Error & { code: string } {
-  const err = new Error(`duplicate key value violates unique constraint "${constraint}"`);
-  return Object.assign(err, { code: '23505' });
-}
-
 function makeRepos(opts: {
   channels?: Channel[];
   roles?: Role[];
@@ -90,31 +84,44 @@ function makeRepos(opts: {
         // channels and trust the test to seed only relevant rows.
         return channels.filter((c) => c.active);
       },
-      async create(input: {
-        external_id: string;
-        channel_type: string;
-        display_name?: string;
+      // Mirrors the real atomic helper's contract: create + audit land
+      // together (the mock pushes both), duplicate returns a typed reason
+      // and leaves NOTHING behind.
+      async createWithAudit(args: {
+        tenant_id: string;
+        agent_id: string;
+        channel: { external_id: string; channel_type: string; display_name?: string };
+        audit: { actor_id: string; actor_role: string; reason: string };
       }) {
         if (
           channels.some(
             (c) =>
-              c.channel_type === input.channel_type &&
-              c.external_id === input.external_id,
+              c.channel_type === args.channel.channel_type &&
+              c.external_id === args.channel.external_id,
           )
         ) {
-          throw uniqueViolation('channels_tenant_type_external_uq');
+          return { ok: false as const, reason: 'duplicate' as const };
         }
         const row: Channel = {
           id: `channel-${channels.length + 1}`,
-          tenant_id: 'tenant-A',
-          agent_id: 'agent-1',
-          external_id: input.external_id,
-          channel_type: input.channel_type,
-          display_name: input.display_name ?? null,
+          tenant_id: args.tenant_id,
+          agent_id: args.agent_id,
+          external_id: args.channel.external_id,
+          channel_type: args.channel.channel_type,
+          display_name: args.channel.display_name ?? null,
           active: true,
         };
         channels.push(row);
-        return row;
+        audit.push({
+          tenant_id: args.tenant_id,
+          actor_id: args.audit.actor_id,
+          actor_role: args.audit.actor_role,
+          action: 'channel_create',
+          resource_type: 'channel',
+          resource_id: row.id,
+          change_summary: { agent_id: args.agent_id, reason: args.audit.reason },
+        });
+        return { ok: true as const, channel: row };
       },
     },
     rolesRepo: {
@@ -124,30 +131,56 @@ function makeRepos(opts: {
       async listActive() {
         return roles.filter((r) => r.active);
       },
-      async create(input: {
-        role_key: string;
-        display_name: string;
-        description?: string;
-        prompt_addendum?: string;
-        is_default?: boolean;
+      // Same atomic contract as channelsRepo.createWithAudit; `is_default`
+      // omitted resolves to "first active role becomes default", like the
+      // real helper does inside its tx.
+      async createWithAudit(args: {
+        tenant_id: string;
+        agent_id: string;
+        role: {
+          role_key: string;
+          display_name: string;
+          description?: string;
+          prompt_addendum?: string;
+          is_default?: boolean;
+        };
+        audit: { actor_id: string; actor_role: string; reason: string };
       }) {
-        if (roles.some((r) => r.role_key === input.role_key)) {
-          throw uniqueViolation('roles_tenant_agent_key_uq');
+        if (roles.some((r) => r.role_key === args.role.role_key)) {
+          return { ok: false as const, reason: 'duplicate' as const };
         }
-        if (input.is_default && roles.some((r) => (r as Role & { is_default?: boolean }).is_default)) {
-          throw uniqueViolation('roles_tenant_agent_default_uq');
+        const isDefault =
+          args.role.is_default ?? roles.filter((r) => r.active).length === 0;
+        if (
+          isDefault &&
+          roles.some((r) => (r as Role & { is_default?: boolean }).is_default)
+        ) {
+          return { ok: false as const, reason: 'duplicate' as const };
         }
         const row = {
           id: `role-${roles.length + 1}`,
-          tenant_id: 'tenant-A',
-          agent_id: 'agent-1',
-          role_key: input.role_key,
-          display_name: input.display_name,
+          tenant_id: args.tenant_id,
+          agent_id: args.agent_id,
+          role_key: args.role.role_key,
+          display_name: args.role.display_name,
           active: true,
-          is_default: input.is_default ?? false,
+          is_default: isDefault,
         } as Role & { is_default: boolean };
         roles.push(row);
-        return row;
+        audit.push({
+          tenant_id: args.tenant_id,
+          actor_id: args.audit.actor_id,
+          actor_role: args.audit.actor_role,
+          action: 'role_create',
+          resource_type: 'role',
+          resource_id: row.id,
+          change_summary: {
+            agent_id: args.agent_id,
+            is_default: isDefault,
+            reason: args.audit.reason,
+          },
+        });
+        return { ok: true as const, role: row };
       },
     },
     channelPoliciesRepo: {
@@ -541,8 +574,43 @@ describe('channelPoliciesRouter.channelsOverview', () => {
     expect(res.roles_count).toBe(2);
     const byId = Object.fromEntries(res.channels.map((c) => [c.id, c]));
     expect(byId[channel1.id]!.has_policy).toBe(true);
+    expect(byId[channel1.id]!.policy_ready).toBe(true);
     expect(byId[channel1.id]!.default_role_key).toBe(role1.role_key);
     expect(byId[channel2.id]!.has_policy).toBe(false);
+    expect(byId[channel2.id]!.policy_ready).toBe(false);
     expect(byId[channel2.id]!.default_role_key).toBeNull();
+  });
+
+  it('policy pointing at an INACTIVE default role is has_policy but NOT policy_ready', async () => {
+    const inactiveRole: Role = {
+      ...role1,
+      id: '00000000-0000-4000-8000-0000000000b1',
+      role_key: 'legacy',
+      active: false,
+    };
+    const policy: Policy = {
+      id: 'policy-stale',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-1',
+      channel_id: channel1.id,
+      default_role_id: inactiveRole.id,
+      switch_behavior: 'locked',
+      announce_mode: 'affects_user',
+      by_context_guards: {},
+      allowed_role_ids: [],
+    };
+    const repos = makeRepos({
+      agents: [agent1],
+      channels: [channel1],
+      roles: [inactiveRole, role2],
+      policies: [policy],
+    });
+    const res = await caller('owner', 'tenant-A', 'u1', repos).channelsOverview({
+      agentId: 'agent-1',
+    });
+    const c = res.channels[0]!;
+    expect(c.has_policy).toBe(true);
+    expect(c.policy_ready).toBe(false);
+    expect(c.default_role_key).toBeNull();
   });
 });

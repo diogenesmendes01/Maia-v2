@@ -1,6 +1,12 @@
 import { eq, and, ne, desc, sql } from 'drizzle-orm';
-import { db, withTx } from '../client.js';
-import { channels, roles, channel_policies, role_selector_decisions } from '../schema.js';
+import { db, withTx, pgErrorCode } from '../client.js';
+import {
+  channels,
+  roles,
+  channel_policies,
+  role_selector_decisions,
+  admin_audit_log,
+} from '../schema.js';
 import { TypedError } from '@/lib/utils.js';
 import { applyTenantGuard } from '../tenant-guard.js';
 import {
@@ -251,6 +257,66 @@ export const channelsRepo = {
       );
   },
 
+  /**
+   * Create a channel AND append its admin_audit_log row in ONE transaction.
+   * "Audit every decision" — a failed audit insert rolls the channel back,
+   * so a governance change can never land without its trail. Mirrors
+   * `agentsRepo.createWithSeedAndAudit`: explicit tenant/agent args (no ALS),
+   * and the UNIQUE (tenant_id, channel_type, external_id) 23505 is caught
+   * inside and surfaced as a typed reason instead of a raw pg error.
+   */
+  async createWithAudit(args: {
+    tenant_id: string;
+    agent_id: string;
+    channel: {
+      external_id: string;
+      channel_type: 'whatsapp' | 'telegram' | 'email' | 'sms' | 'web' | 'api' | 'other';
+      display_name?: string;
+      metadata?: unknown;
+    };
+    audit: { actor_id: string; actor_role: string; reason: string };
+  }): Promise<{ ok: true; channel: Channel } | { ok: false; reason: 'duplicate' }> {
+    try {
+      return await withTx(async (tx) => {
+        const [row] = await tx
+          .insert(channels)
+          .values({
+            tenant_id: args.tenant_id,
+            agent_id: args.agent_id,
+            external_id: args.channel.external_id,
+            channel_type: args.channel.channel_type,
+            display_name: args.channel.display_name ?? null,
+            metadata: (args.channel.metadata as object) ?? {},
+          })
+          .returning();
+        if (!row) {
+          throw new Error('channel_create_with_audit_insert_failed: returning() empty');
+        }
+        await tx.insert(admin_audit_log).values({
+          tenant_id: args.tenant_id,
+          actor_id: args.audit.actor_id,
+          actor_role: args.audit.actor_role,
+          action: 'channel_create',
+          resource_type: 'channel',
+          resource_id: row.id,
+          change_summary: {
+            agent_id: args.agent_id,
+            channel_type: row.channel_type,
+            external_id: row.external_id,
+            display_name: row.display_name,
+            reason: args.audit.reason,
+          },
+        });
+        return { ok: true as const, channel: row };
+      });
+    } catch (err) {
+      if (pgErrorCode(err) === '23505') {
+        return { ok: false, reason: 'duplicate' };
+      }
+      throw err;
+    }
+  },
+
   // [P88-C3] Tenant-scoped: write paths MUST enforce isolation. Without
   // tenant/agent predicates, any caller with another tenant's channel UUID
   // could disable that channel (cross-tenant DoS). Read-side filters here
@@ -361,6 +427,85 @@ export const rolesRepo = {
           eq(roles.active, true),
         ),
       );
+  },
+
+  /**
+   * Create a role AND append its admin_audit_log row in ONE transaction —
+   * same contract as `channelsRepo.createWithAudit` (audit failure rolls the
+   * role back; 23505 → typed 'duplicate').
+   *
+   * `is_default` omitted ⇒ resolved INSIDE the tx: the agent's first active
+   * role becomes the default. Two concurrent "first role" creates can both
+   * see zero rows, but the partial unique index (one default per
+   * tenant/agent) breaks the tie — the loser lands on 23505 → 'duplicate'.
+   */
+  async createWithAudit(args: {
+    tenant_id: string;
+    agent_id: string;
+    role: {
+      role_key: string;
+      display_name: string;
+      description?: string;
+      prompt_addendum?: string;
+      is_default?: boolean;
+    };
+    audit: { actor_id: string; actor_role: string; reason: string };
+  }): Promise<{ ok: true; role: Role } | { ok: false; reason: 'duplicate' }> {
+    try {
+      return await withTx(async (tx) => {
+        let isDefault = args.role.is_default;
+        if (isDefault === undefined) {
+          const existing = await tx
+            .select({ one: sql<number>`1` })
+            .from(roles)
+            .where(
+              and(
+                eq(roles.tenant_id, args.tenant_id),
+                eq(roles.agent_id, args.agent_id),
+                eq(roles.active, true),
+              ),
+            )
+            .limit(1);
+          isDefault = existing.length === 0;
+        }
+        const [row] = await tx
+          .insert(roles)
+          .values({
+            tenant_id: args.tenant_id,
+            agent_id: args.agent_id,
+            role_key: args.role.role_key,
+            display_name: args.role.display_name,
+            description: args.role.description ?? null,
+            prompt_addendum: args.role.prompt_addendum ?? null,
+            is_default: isDefault,
+          })
+          .returning();
+        if (!row) {
+          throw new Error('role_create_with_audit_insert_failed: returning() empty');
+        }
+        await tx.insert(admin_audit_log).values({
+          tenant_id: args.tenant_id,
+          actor_id: args.audit.actor_id,
+          actor_role: args.audit.actor_role,
+          action: 'role_create',
+          resource_type: 'role',
+          resource_id: row.id,
+          change_summary: {
+            agent_id: args.agent_id,
+            role_key: row.role_key,
+            display_name: row.display_name,
+            is_default: row.is_default,
+            reason: args.audit.reason,
+          },
+        });
+        return { ok: true as const, role: row };
+      });
+    } catch (err) {
+      if (pgErrorCode(err) === '23505') {
+        return { ok: false, reason: 'duplicate' };
+      }
+      throw err;
+    }
   },
 
   // [P88-C3] Tenant-scoped: same justification as channelsRepo.deactivate.
