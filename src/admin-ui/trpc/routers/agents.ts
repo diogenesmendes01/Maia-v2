@@ -23,7 +23,9 @@
  *   - We deliberately do NOT auto-activate the seeded profile. P8.5 invariant
  *     is "no profile activates without an approval"; admin-ui setup respects
  *     this — a freshly-created agent has no active profile until owner/founder
- *     approves the seed via the Proposal Inbox.
+ *     approves the seed via `approveProfile` (agent detail → Versões tab, or
+ *     the Identidades screen). Operational profile versions intentionally do
+ *     NOT flow through the Proposal Inbox — see the approveProfile jsdoc.
  *   - role gate: founder or owner. analyst/viewer cannot create agents.
  */
 import { z } from 'zod';
