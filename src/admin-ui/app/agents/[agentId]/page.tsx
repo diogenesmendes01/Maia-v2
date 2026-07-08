@@ -40,6 +40,7 @@ import { ProfileDiff } from '../_components/profile-diff.js';
 import ActivityTab from './_components/activity-tab.js';
 import PlaygroundTab from './_components/playground-tab.js';
 import ObjectivesTab from './_components/objectives-tab.js';
+import GoLiveChecklist from './_components/go-live-checklist.js';
 
 type TabId =
   | 'overview'
@@ -166,13 +167,21 @@ export default function AgentDetailPage() {
       />
 
       {tab === 'overview' && (
-        <OverviewTab
-          activeBody={active?.profile_body ?? null}
-          activeVersion={active?.version ?? null}
-          onEdit={() => setTab('profile')}
-          canManage={canManage}
-          capabilities={capabilitiesQuery.data ?? null}
-        />
+        <div className="space-y-4">
+          <GoLiveChecklist
+            tenantId={tenantId}
+            agentId={agent.id}
+            hasActiveProfile={active !== null}
+            onGoToVersions={() => setTab('versions')}
+          />
+          <OverviewTab
+            activeBody={active?.profile_body ?? null}
+            activeVersion={active?.version ?? null}
+            onEdit={() => setTab('profile')}
+            canManage={canManage}
+            capabilities={capabilitiesQuery.data ?? null}
+          />
+        </div>
       )}
       {tab === 'profile' && (
         <ProfileTab
