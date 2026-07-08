@@ -36,6 +36,11 @@ import {
 export default function IdentitiesPage() {
   const { data: session, status } = useSession();
   const tenantId = session?.user?.tenant_id ?? '';
+  const role = session?.user?.role ?? '';
+  // Review do PR #492 (low): só owner/founder podem aprovar (gate real em
+  // agents.approveProfile) — os demais papéis veem uma CTA de navegação,
+  // não de aprovação, para não aterrissarem numa ação que não podem fazer.
+  const canApprove = role === 'owner' || role === 'founder';
   const [agentId, setAgentId] = React.useState('');
 
   const agentsQuery = trpc.agents.list.useQuery(
@@ -70,8 +75,8 @@ export default function IdentitiesPage() {
             {pendingCount === 1
               ? 'Há 1 versão proposta aguardando aprovação.'
               : `Há ${pendingCount} versões propostas aguardando aprovação.`}{' '}
-            Use o botão da linha para revisar o diff e aprovar na página do
-            agente.
+            As propostas são revisadas e aprovadas na página do agente (aba
+            Versões), por owner ou founder.
           </Alert>
         </div>
       )}
@@ -134,8 +139,13 @@ export default function IdentitiesPage() {
                       <Link
                         href={`/agents/${encodeURIComponent(v.sot_id)}?tab=versions`}
                       >
-                        <Button size="sm" variant="success">
-                          Revisar e aprovar no agente
+                        <Button
+                          size="sm"
+                          variant={canApprove ? 'success' : 'secondary'}
+                        >
+                          {canApprove
+                            ? 'Revisar e aprovar no agente'
+                            : 'Ver no agente'}
                         </Button>
                       </Link>
                     ) : (

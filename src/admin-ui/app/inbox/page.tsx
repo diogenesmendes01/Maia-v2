@@ -78,7 +78,13 @@ export default function InboxPage() {
   }
 
   const counters = countersQuery.data;
-  const total = counters ? Object.values(counters).reduce((a, b) => a + b, 0) : null;
+  // Review do PR #492 (medium): o total do header inclui os perfis de agente
+  // pendentes — sem isso a tela mostraria "0 pendentes" no topo com perfis
+  // aguardando aprovação listados logo abaixo.
+  const profilesTotal = pendingProfilesQuery.data?.total ?? 0;
+  const total = counters
+    ? Object.values(counters).reduce((a, b) => a + b, 0) + profilesTotal
+    : null;
 
   return (
     <div>
