@@ -7,15 +7,13 @@ import { trpc } from '../../trpc/client.js';
 import { PageHeader } from '../../components/ui/page-header.js';
 import { StatusBadge } from '../../components/ui/badge.js';
 import { Button } from '../../components/ui/button.js';
-import { Field, Select, Textarea } from '../../components/ui/field.js';
-import { Modal } from '../../components/ui/modal.js';
+import { Field, Select } from '../../components/ui/field.js';
 import {
   LoadingState,
   ErrorState,
   EmptyState,
   Alert,
 } from '../../components/ui/states.js';
-import { ProfileDiff } from '../agents/_components/profile-diff.js';
 import {
   TableShell,
   Table,
@@ -26,24 +24,24 @@ import {
 } from '../../components/ui/table.js';
 
 /**
- * Cross-agent view of operational profile versions. The active row is what
- * each agent is running; proposed rows can be approved here (the previous
- * active version is frozen in the same transaction).
+ * Cross-agent view of operational profile versions — READ-ONLY overview.
+ *
+ * A aprovação de perfil tem UMA superfície: a aba Versões da página do
+ * agente (`/agents/[id]?tab=versions`), onde o operador vê o diff completo
+ * contra a versão ativa antes de decidir. Esta tela já duplicou esse fluxo
+ * (mesma mutation `agents.approveProfile`, mesmo modal) — a redundância foi
+ * removida na fase 2 do relatório de complexidade: aqui se OBSERVA o parque
+ * de identidades; aprova-se no agente.
  */
 export default function IdentitiesPage() {
   const { data: session, status } = useSession();
-  const role = session?.user?.role ?? '';
   const tenantId = session?.user?.tenant_id ?? '';
-  const [agentId, setAgentId] = React.useState('');
-  const [target, setTarget] = React.useState<{
-    versionId: string;
-    agentId: string;
-    version: number;
-  } | null>(null);
-  const [comment, setComment] = React.useState('');
-  const [error, setError] = React.useState<string | null>(null);
-
+  const role = session?.user?.role ?? '';
+  // Review do PR #492 (low): só owner/founder podem aprovar (gate real em
+  // agents.approveProfile) — os demais papéis veem uma CTA de navegação,
+  // não de aprovação, para não aterrissarem numa ação que não podem fazer.
   const canApprove = role === 'owner' || role === 'founder';
+  const [agentId, setAgentId] = React.useState('');
 
   const agentsQuery = trpc.agents.list.useQuery(
     { tenantId },
@@ -58,49 +56,30 @@ export default function IdentitiesPage() {
     },
     { enabled: tenantId !== '' },
   );
-  const approveMutation = trpc.agents.approveProfile.useMutation();
-
-  // Issue #461 — corpo das versões do agente-alvo para o diff de aprovação.
-  const targetProfileQuery = trpc.agents.getProfileVersions.useQuery(
-    { tenantId, id: target?.agentId ?? '' },
-    { enabled: tenantId !== '' && target !== null },
-  );
-  const targetProposedBody = targetProfileQuery.data?.proposed.find(
-    (p) => p.id === target?.versionId,
-  )?.profile_body;
-
-  const approve = async () => {
-    if (!target) return;
-    if (comment.trim().length < 10) {
-      setError('O comentário de aprovação precisa de ao menos 10 caracteres.');
-      return;
-    }
-    try {
-      await approveMutation.mutateAsync({
-        tenantId,
-        agentId: target.agentId,
-        versionId: target.versionId,
-        comment: comment.trim(),
-      });
-      setTarget(null);
-      setComment('');
-      setError(null);
-      void versionsQuery.refetch();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    }
-  };
 
   if (status === 'loading') return <LoadingState label="Carregando sessão…" />;
 
   const items = versionsQuery.data?.items ?? [];
+  const pendingCount = items.filter((v) => v.status === 'proposed').length;
 
   return (
     <div>
       <PageHeader
         title="Identidades"
-        description="Versões de perfil operacional por agente. A linha ativa é o que o agente executa hoje; propostas podem ser aprovadas aqui — a versão anterior é congelada na mesma transação."
+        description="Visão geral das versões de perfil operacional por agente. A linha ativa é o que o agente executa hoje; propostas são aprovadas na aba Versões do agente."
       />
+
+      {pendingCount > 0 && (
+        <div className="mb-4">
+          <Alert tone="warning" title="Aprovações pendentes">
+            {pendingCount === 1
+              ? 'Há 1 versão proposta aguardando aprovação.'
+              : `Há ${pendingCount} versões propostas aguardando aprovação.`}{' '}
+            As propostas são revisadas e aprovadas na página do agente (aba
+            Versões), por owner ou founder.
+          </Alert>
+        </div>
+      )}
 
       <div className="mb-5 max-w-xs">
         <Field label="Filtrar por agente">
@@ -156,21 +135,19 @@ export default function IdentitiesPage() {
                     {new Date(v.created_at).toLocaleString('pt-BR')}
                   </Td>
                   <Td className="text-right">
-                    {v.status === 'proposed' && canApprove ? (
-                      <Button
-                        size="sm"
-                        variant="success"
-                        onClick={() => {
-                          setError(null);
-                          setTarget({
-                            versionId: v.id,
-                            agentId: v.sot_id,
-                            version: v.version,
-                          });
-                        }}
+                    {v.status === 'proposed' ? (
+                      <Link
+                        href={`/agents/${encodeURIComponent(v.sot_id)}?tab=versions`}
                       >
-                        Aprovar e ativar
-                      </Button>
+                        <Button
+                          size="sm"
+                          variant={canApprove ? 'success' : 'secondary'}
+                        >
+                          {canApprove
+                            ? 'Revisar e aprovar no agente'
+                            : 'Ver no agente'}
+                        </Button>
+                      </Link>
                     ) : (
                       <span className="text-xs text-zinc-400">—</span>
                     )}
@@ -181,57 +158,6 @@ export default function IdentitiesPage() {
           </Table>
         </TableShell>
       )}
-
-      <Modal
-        open={target !== null}
-        onClose={() => setTarget(null)}
-        size="lg"
-        title={`Aprovar e ativar v${target?.version ?? ''} — ${target?.agentId ?? ''}`}
-        description="A versão ativa atual (se houver) é congelada na mesma transação. A decisão é auditada."
-        footer={
-          <>
-            <Button variant="secondary" onClick={() => setTarget(null)}>
-              Cancelar
-            </Button>
-            <Button
-              variant="success"
-              onClick={() => void approve()}
-              loading={approveMutation.isPending}
-            >
-              Aprovar e ativar
-            </Button>
-          </>
-        }
-      >
-        <div className="space-y-4">
-          {targetProfileQuery.isLoading ? (
-            <LoadingState label="Carregando conteúdo da proposta…" />
-          ) : targetProposedBody !== undefined ? (
-            <ProfileDiff
-              activeBody={targetProfileQuery.data?.active?.profile_body ?? null}
-              proposedBody={targetProposedBody}
-            />
-          ) : (
-            <Alert tone="warning" title="Conteúdo da proposta indisponível">
-              Não foi possível carregar o corpo desta versão para comparação.
-              Recarregue a página antes de aprovar.
-            </Alert>
-          )}
-          <Field
-            label="Comentário (auditado)"
-            required
-            hint="Mínimo de 10 caracteres."
-            error={error}
-          >
-            <Textarea
-              value={comment}
-              onChange={(e) => setComment(e.target.value)}
-              rows={3}
-              placeholder="Ex.: Revisei papel, princípios e limites — aprovado para operação."
-            />
-          </Field>
-        </div>
-      </Modal>
     </div>
   );
 }

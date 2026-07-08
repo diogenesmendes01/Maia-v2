@@ -347,6 +347,50 @@ export const agentsRouter = router({
     }),
 
   /**
+   * Perfis propostos aguardando aprovação, agregados por agente — alimenta o
+   * card "Perfis de agente" na tela Aprovações (/inbox). O perfil operacional
+   * NÃO flui pelo Proposal Inbox (ver nota em approveProfile); este agregado
+   * existe para que a fila "Aprovações" ao menos APONTE para onde a aprovação
+   * acontece (aba Versões do agente), em vez de omitir perfis pendentes.
+   * Cardinalidade: nº de agentes do tenant — pequeno; espelha o fan-out de
+   * versions.listVersions.
+   */
+  pendingProfileApprovals: protectedProcedure
+    .input(ListInputSchema)
+    .query(async ({ input, ctx }) => {
+      const tenantId = resolveTenantId(ctx, input.tenantId);
+      const agents = await ctx.repos.agentsRepo.listByTenant(tenantId);
+      const items: Array<{
+        agent_id: string;
+        agent_nome: string;
+        pending_count: number;
+        oldest_created_at: Date;
+      }> = [];
+      for (const agent of agents) {
+        const proposed = await runWithTenantContext(
+          { tenant_id: tenantId, agent_id: agent.id },
+          async () => ctx.repos.operationalProfileVersionsRepo.listByStatus('proposed'),
+        );
+        if (proposed.length === 0) continue;
+        items.push({
+          agent_id: agent.id,
+          agent_nome: agent.nome,
+          pending_count: proposed.length,
+          oldest_created_at: proposed.reduce(
+            (min, p) => (p.created_at < min ? p.created_at : min),
+            proposed[0]!.created_at,
+          ),
+        });
+      }
+      // Mais antigo primeiro — é o que está esperando há mais tempo.
+      items.sort((a, b) => a.oldest_created_at.getTime() - b.oldest_created_at.getTime());
+      return {
+        items,
+        total: items.reduce((sum, i) => sum + i.pending_count, 0),
+      };
+    }),
+
+  /**
    * Issue #470 — capacidades efetivas do agente para exibição no console:
    * grant row (packs/tools/denied) + resolução pack→tools via o registry
    * (grant-math, fail-closed). Read-only; edição de grants continua fora do

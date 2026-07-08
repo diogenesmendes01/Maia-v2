@@ -50,6 +50,19 @@ type TabId =
   | 'playground'
   | 'objectives';
 
+const TAB_IDS: readonly TabId[] = [
+  'overview',
+  'profile',
+  'versions',
+  'activity',
+  'playground',
+  'objectives',
+];
+
+function isTabId(v: string | null): v is TabId {
+  return v !== null && (TAB_IDS as readonly string[]).includes(v);
+}
+
 export default function AgentDetailPage() {
   const params = useParams<{ agentId: string }>();
   const search = useSearchParams();
@@ -60,7 +73,12 @@ export default function AgentDetailPage() {
   const canManage = role === 'founder' || role === 'owner';
   const justCreated = search.get('created') === '1';
 
-  const [tab, setTab] = React.useState<TabId>('overview');
+  // ?tab=versions etc. — permite que Identidades e a fila Aprovações
+  // aterrissem direto na aba certa (a aprovação de perfil vive aqui).
+  const requestedTab = search.get('tab');
+  const [tab, setTab] = React.useState<TabId>(
+    isTabId(requestedTab) ? requestedTab : 'overview',
+  );
 
   const agentQuery = trpc.agents.getById.useQuery(
     { tenantId, id: agentId },
