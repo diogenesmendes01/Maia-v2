@@ -43,6 +43,8 @@ type Profile = {
   profile_body: unknown;
   proposed_by: string;
   proposed_reason: string | null;
+  /** Optional in fixtures; listByStatus fills a fallback when absent. */
+  created_at?: Date;
 };
 type AuditRow = {
   tenant_id: string;
@@ -251,6 +253,25 @@ function makeRepos(
         // from the profiles list. This is sufficient for the assertions made.
         const active = profiles.find((p) => p.status === 'active');
         return active ?? null;
+      },
+      // Unlike getActive above, this one DOES read the real AsyncLocalStorage:
+      // the router wraps the call in runWithTenantContext, so the store is
+      // populated by the time the mock runs. pendingProfileApprovals fans out
+      // per agent and would double-count without the (tenant, agent) scope.
+      async listByStatus(status: string) {
+        const { getCurrentTenant, getCurrentAgent } = await import(
+          '@/db/tenant-context.js'
+        );
+        const tenant_id = getCurrentTenant();
+        const agent_id = getCurrentAgent();
+        return profiles
+          .filter(
+            (p) =>
+              p.status === status &&
+              p.tenant_id === tenant_id &&
+              p.agent_id === agent_id,
+          )
+          .map((p) => ({ ...p, created_at: p.created_at ?? new Date() }));
       },
       // Atomic propose+audit. Mock emulates `withTx` rollback: if the audit
       // insert throws, the profile_version row inserted earlier is removed.
@@ -2121,5 +2142,93 @@ describe('agentsRouter.updateProfile — principles omission preserves active (#
       identity?: { principles?: unknown[] };
     };
     expect(persisted.identity?.principles ?? []).toEqual([]);
+  });
+});
+
+describe('agentsRouter.pendingProfileApprovals', () => {
+  const agentA: Agent = {
+    id: 'agent-1',
+    tenant_id: 'tenant-A',
+    nome: 'Agente Um',
+    status: 'active',
+    metadata: {},
+    created_at: new Date('2024-01-01T00:00:00Z'),
+    updated_at: new Date('2024-01-01T00:00:00Z'),
+  };
+  const agentB: Agent = { ...agentA, id: 'agent-2', nome: 'Agente Dois' };
+  const agentC: Agent = { ...agentA, id: 'agent-3', nome: 'Agente Três' };
+
+  it('aggregates proposed versions per agent, oldest-waiting first, skipping agents with none', async () => {
+    const repos = makeRepos({
+      agents: [agentA, agentB, agentC],
+      profiles: [
+        // agent-1: two proposed (oldest 2024-01-01) + one active (ignored)
+        {
+          id: 'p1',
+          tenant_id: 'tenant-A',
+          agent_id: 'agent-1',
+          version: 2,
+          status: 'proposed',
+          profile_body: {},
+          proposed_by: 'u1',
+          proposed_reason: 'r',
+          created_at: new Date('2024-01-02T00:00:00Z'),
+        },
+        {
+          id: 'p2',
+          tenant_id: 'tenant-A',
+          agent_id: 'agent-1',
+          version: 3,
+          status: 'proposed',
+          profile_body: {},
+          proposed_by: 'u1',
+          proposed_reason: 'r',
+          created_at: new Date('2024-01-01T00:00:00Z'),
+        },
+        {
+          id: 'p3',
+          tenant_id: 'tenant-A',
+          agent_id: 'agent-1',
+          version: 1,
+          status: 'active',
+          profile_body: {},
+          proposed_by: 'u1',
+          proposed_reason: 'r',
+          created_at: new Date('2023-12-01T00:00:00Z'),
+        },
+        // agent-2: one proposed, newer than agent-1's oldest
+        {
+          id: 'p4',
+          tenant_id: 'tenant-A',
+          agent_id: 'agent-2',
+          version: 1,
+          status: 'proposed',
+          profile_body: {},
+          proposed_by: 'u1',
+          proposed_reason: 'r',
+          created_at: new Date('2024-03-01T00:00:00Z'),
+        },
+        // agent-3: nothing proposed
+      ],
+    });
+
+    const res = await caller('owner', 'tenant-A', 'u1', repos).pendingProfileApprovals({});
+
+    expect(res.total).toBe(3);
+    expect(res.items.map((i) => i.agent_id)).toEqual(['agent-1', 'agent-2']);
+    expect(res.items[0]).toMatchObject({
+      agent_id: 'agent-1',
+      agent_nome: 'Agente Um',
+      pending_count: 2,
+    });
+    expect(res.items[0]!.oldest_created_at).toEqual(new Date('2024-01-01T00:00:00Z'));
+    expect(res.items[1]).toMatchObject({ agent_id: 'agent-2', pending_count: 1 });
+  });
+
+  it('returns empty when no agent has proposed versions', async () => {
+    const repos = makeRepos({ agents: [agentA] });
+    const res = await caller('owner', 'tenant-A', 'u1', repos).pendingProfileApprovals({});
+    expect(res.items).toEqual([]);
+    expect(res.total).toBe(0);
   });
 });

@@ -1,11 +1,13 @@
 'use client';
 
 import * as React from 'react';
+import Link from 'next/link';
 import { useSession } from 'next-auth/react';
 import { trpc } from '../../trpc/client.js';
 import { PageHeader } from '../../components/ui/page-header.js';
 import { Button } from '../../components/ui/button.js';
 import { Badge } from '../../components/ui/badge.js';
+import { Card, CardHeader, CardBody } from '../../components/ui/card.js';
 import { LoadingState, ErrorState } from '../../components/ui/states.js';
 import InboxTable from './_components/inbox-table.js';
 import BulkRejectModal from './_components/bulk-reject-modal.js';
@@ -46,6 +48,15 @@ export default function InboxPage() {
   );
 
   const countersQuery = trpc.inbox.counters.useQuery(
+    { tenantId },
+    { enabled: tenantId !== '', refetchInterval: 30_000 },
+  );
+
+  // Perfis operacionais propostos NÃO passam por esta fila (são aprovados na
+  // aba Versões do agente, com diff contra a versão ativa). Este agregado
+  // garante que a tela "Aprovações" ao menos aponte para eles em vez de
+  // omiti-los — fase 2 do relatório de complexidade.
+  const pendingProfilesQuery = trpc.agents.pendingProfileApprovals.useQuery(
     { tenantId },
     { enabled: tenantId !== '', refetchInterval: 30_000 },
   );
@@ -115,6 +126,53 @@ export default function InboxPage() {
           );
         })}
       </div>
+
+      {/* Perfis de agente pendentes — aprovados na página do agente, não
+          nesta fila; o card existe para a fila não esconder essa pendência. */}
+      {(pendingProfilesQuery.data?.items.length ?? 0) > 0 && (
+        <div className="mt-4">
+          <Card>
+            <CardHeader
+              title="Perfis de agente aguardando aprovação"
+              description="Versões de perfil operacional propostas. A aprovação acontece na aba Versões de cada agente, com o diff contra a versão ativa."
+              actions={
+                <Badge tone="warning">
+                  {pendingProfilesQuery.data!.total} pendente
+                  {pendingProfilesQuery.data!.total === 1 ? '' : 's'}
+                </Badge>
+              }
+            />
+            <CardBody>
+              <ul className="divide-y divide-zinc-100">
+                {pendingProfilesQuery.data!.items.map((p) => (
+                  <li
+                    key={p.agent_id}
+                    className="flex flex-wrap items-center justify-between gap-2 py-2 first:pt-0 last:pb-0"
+                  >
+                    <span className="min-w-0 text-sm text-zinc-800">
+                      <span className="font-medium">{p.agent_nome}</span>{' '}
+                      <code className="font-mono text-2xs text-zinc-400">
+                        {p.agent_id}
+                      </code>
+                      <span className="ml-2 text-xs text-zinc-500">
+                        {p.pending_count === 1
+                          ? '1 versão proposta'
+                          : `${p.pending_count} versões propostas`}{' '}
+                        · desde {new Date(p.oldest_created_at).toLocaleString('pt-BR')}
+                      </span>
+                    </span>
+                    <Link href={`/agents/${encodeURIComponent(p.agent_id)}?tab=versions`}>
+                      <Button size="sm" variant="secondary">
+                        Revisar e aprovar
+                      </Button>
+                    </Link>
+                  </li>
+                ))}
+              </ul>
+            </CardBody>
+          </Card>
+        </div>
+      )}
 
       {/* Filtro por risco + limpar. */}
       <div className="mt-4 flex flex-wrap items-center gap-2">

@@ -2,6 +2,8 @@
 
 import * as React from 'react';
 import { Card, CardHeader, CardBody } from '../../../components/ui/card.js';
+import { Badge } from '../../../components/ui/badge.js';
+import { Button } from '../../../components/ui/button.js';
 import { Field, Input, Select } from '../../../components/ui/field.js';
 import { ListEditor } from '../../../components/ui/list-editor.js';
 import { SliderField } from '../../../components/ui/slider-field.js';
@@ -124,6 +126,54 @@ export function validateBehavior(v: ProfileFormValue): string | null {
   return null;
 }
 
+/**
+ * Card avançado colapsado por padrão — progressive disclosure (fase 3 do
+ * relatório de complexidade): os presets da função cobrem a maioria dos
+ * casos, então o operador só encara estes campos se pedir. Colapsado, mostra
+ * um resumo dos valores atuais (nada fica invisível — só fora do caminho).
+ * `forceOpen` mantém aberto sem botão de ocultar (usado quando há um
+ * conflito de validação que o operador precisa resolver).
+ */
+function AdvancedCard({
+  title,
+  description,
+  collapsedSummary,
+  forceOpen = false,
+  children,
+}: {
+  title: string;
+  description: string;
+  collapsedSummary: React.ReactNode;
+  forceOpen?: boolean;
+  children: React.ReactNode;
+}) {
+  const [open, setOpen] = React.useState(false);
+  const isOpen = open || forceOpen;
+  return (
+    <Card>
+      <CardHeader
+        title={
+          <span className="flex items-center gap-2">
+            {title}
+            <Badge tone="neutral">avançado</Badge>
+          </span>
+        }
+        description={description}
+        actions={
+          !forceOpen && (
+            <Button size="sm" variant="ghost" onClick={() => setOpen(!open)}>
+              {isOpen ? 'Ocultar' : 'Editar'}
+            </Button>
+          )
+        }
+      />
+      <CardBody className={isOpen ? undefined : 'py-3'}>
+        {isOpen ? children : collapsedSummary}
+      </CardBody>
+    </Card>
+  );
+}
+
 const FORMALITY_LABEL: Record<ProfileFormValue['formality'], string> = {
   low: 'Informal',
   medium: 'Equilibrado',
@@ -216,12 +266,28 @@ export function IdentitySection({
         </CardBody>
       </Card>
 
-      <Card>
-        <CardHeader
-          title="Princípios (contratos de valor)"
-          description="Limites invioláveis de comportamento, auditados pelo detector de valores. Violações podem congelar o perfil automaticamente. Não repita prioridades aqui — são coisas diferentes."
-        />
-        <CardBody className="space-y-3">
+      <AdvancedCard
+        title="Princípios (contratos de valor)"
+        description="Limites invioláveis de comportamento, auditados pelo detector de valores — violações podem congelar o perfil automaticamente. A função escolhida já define um bom padrão."
+        forceOpen={overlap !== null}
+        collapsedSummary={
+          value.principles.length > 0 ? (
+            <div className="flex flex-wrap gap-1">
+              {value.principles.map((p) => (
+                <Badge key={p} tone="danger">
+                  {p}
+                </Badge>
+              ))}
+            </div>
+          ) : (
+            <p className="text-xs text-zinc-500">
+              Sem princípios declarados — a guarda de valores fica desativada
+              para este perfil. Você pode declará-los agora ou depois.
+            </p>
+          )
+        }
+      >
+        <div className="space-y-3">
           <ListEditor
             items={value.principles}
             onChange={(items) => set('principles', items)}
@@ -240,8 +306,12 @@ export function IdentitySection({
               perfil — você pode declará-los depois.
             </p>
           )}
-        </CardBody>
-      </Card>
+          <p className="text-xs text-zinc-500">
+            Não repita prioridades aqui — são coisas diferentes (prioridades
+            são pesos operacionais brandos; princípios são contratos duros).
+          </p>
+        </div>
+      </AdvancedCard>
     </div>
   );
 }
@@ -272,12 +342,25 @@ export function BehaviorSection({
         </CardBody>
       </Card>
 
-      <Card>
-        <CardHeader
-          title="Limites cognitivos"
-          description="Travas determinísticas de comportamento — o backend decide, o LLM propõe."
-        />
-        <CardBody className="space-y-5">
+      <AdvancedCard
+        title="Limites cognitivos"
+        description="Travas determinísticas de comportamento — o backend decide, o LLM propõe. Os padrões da função servem para a maioria dos casos."
+        collapsedSummary={
+          <p className="text-xs text-zinc-600">
+            Profundidade de inferência{' '}
+            <strong className="font-semibold">{value.max_inference_depth}</strong> ·
+            teto de especulação{' '}
+            <strong className="font-semibold">
+              {Math.round(value.max_speculation_in_response * 100)}%
+            </strong>{' '}
+            · piso de confiança para agir{' '}
+            <strong className="font-semibold">
+              {Math.round(value.confidence_floor_for_action * 100)}%
+            </strong>
+          </p>
+        }
+      >
+        <div className="space-y-5">
           <SliderField
             label="Profundidade máxima de inferência"
             value={value.max_inference_depth}
@@ -307,8 +390,8 @@ export function BehaviorSection({
             format={(v) => `${Math.round(v * 100)}%`}
             hint="Abaixo deste piso o agente pergunta em vez de executar uma ação."
           />
-        </CardBody>
-      </Card>
+        </div>
+      </AdvancedCard>
     </div>
   );
 }
