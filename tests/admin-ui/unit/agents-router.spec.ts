@@ -55,6 +55,16 @@ type AuditRow = {
   resource_id: string | null;
   change_summary: Record<string, unknown> | null;
 };
+type GrantRow = {
+  id: string;
+  tenant_id: string;
+  agent_id: string;
+  granted_packs: string[];
+  granted_tools: string[];
+  denied_tools: string[];
+  granted_by: string | null;
+  reason: string | null;
+};
 
 /**
  * Options for makeRepos:
@@ -77,6 +87,7 @@ function makeRepos(
     tenants?: string[];
     agents?: Agent[];
     profiles?: Profile[];
+    grants?: GrantRow[];
     failAuditOnAction?: 'agent_create' | 'agent_profile_propose';
     simulateAgentPkConflict?: boolean;
   } = {},
@@ -85,6 +96,7 @@ function makeRepos(
   const agentsMap: Record<string, Agent> = {};
   for (const a of opts.agents ?? []) agentsMap[a.id] = { ...a };
   const profiles: Profile[] = [...(opts.profiles ?? [])];
+  const grants: GrantRow[] = [...(opts.grants ?? [])];
   const audit: AuditRow[] = [];
 
   return {
@@ -461,6 +473,73 @@ function makeRepos(
         };
       },
     },
+    agentToolGrantsRepo: {
+      // ALS-aware like listByStatus above — the router wraps this call in
+      // runWithTenantContext, so the store is populated.
+      async findForCurrentAgent() {
+        const { getCurrentTenant, getCurrentAgent } = await import(
+          '@/db/tenant-context.js'
+        );
+        const tenant_id = getCurrentTenant();
+        const agent_id = getCurrentAgent();
+        return (
+          grants.find((g) => g.tenant_id === tenant_id && g.agent_id === agent_id) ??
+          null
+        );
+      },
+      // Mirrors the real atomic helper: upsert + audit land together.
+      async updateWithAudit(args: {
+        tenant_id: string;
+        agent_id: string;
+        grant: {
+          granted_packs: string[];
+          granted_tools: string[];
+          denied_tools: string[];
+          granted_by: string;
+          reason: string;
+        };
+        audit: {
+          actor_id: string;
+          actor_role: string;
+          action: string;
+          previous: Record<string, unknown> | null;
+        };
+      }) {
+        const idx = grants.findIndex(
+          (g) => g.tenant_id === args.tenant_id && g.agent_id === args.agent_id,
+        );
+        const row: GrantRow = {
+          id: idx >= 0 ? grants[idx]!.id : `grant-${grants.length + 1}`,
+          tenant_id: args.tenant_id,
+          agent_id: args.agent_id,
+          granted_packs: args.grant.granted_packs,
+          granted_tools: args.grant.granted_tools,
+          denied_tools: args.grant.denied_tools,
+          granted_by: args.grant.granted_by,
+          reason: args.grant.reason,
+        };
+        if (idx >= 0) grants[idx] = row;
+        else grants.push(row);
+        audit.push({
+          tenant_id: args.tenant_id,
+          actor_id: args.audit.actor_id,
+          actor_role: args.audit.actor_role,
+          action: args.audit.action,
+          resource_type: 'agent_tool_grant',
+          resource_id: args.agent_id,
+          change_summary: {
+            previous: args.audit.previous,
+            next: {
+              granted_packs: args.grant.granted_packs,
+              granted_tools: args.grant.granted_tools,
+              denied_tools: args.grant.denied_tools,
+            },
+            reason: args.grant.reason,
+          },
+        });
+        return row;
+      },
+    },
     adminAuditLogRepo: {
       async append(entry: AuditRow) {
         audit.push(entry);
@@ -470,7 +549,7 @@ function makeRepos(
         };
       },
     },
-    _inspect: { agentsMap, profiles, audit },
+    _inspect: { agentsMap, profiles, grants, audit },
   };
 }
 
@@ -2230,5 +2309,152 @@ describe('agentsRouter.pendingProfileApprovals', () => {
     const res = await caller('owner', 'tenant-A', 'u1', repos).pendingProfileApprovals({});
     expect(res.items).toEqual([]);
     expect(res.total).toBe(0);
+  });
+});
+
+// grant-math is registry-free (importing has no side effects) — safe to load
+// at module top level for the updateCapabilities fixtures below.
+const { TOOL_PACKS } = await import('@/tools/grant-math.js');
+const financeTool = TOOL_PACKS['domain.finance']!.tools[0]!;
+
+describe('agentsRouter.updateCapabilities', () => {
+  const agent: Agent = {
+    id: 'agent-cap',
+    tenant_id: 'tenant-A',
+    nome: 'Agente Capacidades',
+    status: 'active',
+    metadata: {},
+    created_at: new Date('2024-01-01T00:00:00Z'),
+    updated_at: new Date('2024-01-01T00:00:00Z'),
+  };
+  const baseGrant: GrantRow = {
+    id: 'grant-1',
+    tenant_id: 'tenant-A',
+    agent_id: 'agent-cap',
+    granted_packs: ['baseline.core', 'domain.calendar', 'mcp.acme'],
+    granted_tools: [],
+    denied_tools: [],
+    granted_by: 'seed',
+    reason: 'seed',
+  };
+
+  it.each(['analyst', 'viewer', 'compliance_officer'])(
+    '%s gets FORBIDDEN',
+    async (role) => {
+      const repos = makeRepos({ agents: [agent], grants: [baseGrant] });
+      await expect(
+        caller(role, 'tenant-A', 'u1', repos).updateCapabilities({
+          agentId: 'agent-cap',
+          granted_packs: ['domain.finance'],
+          denied_tools: [],
+          comment: 'attempt without permission',
+        }),
+      ).rejects.toThrow(TRPCError);
+    },
+  );
+
+  it('NOT_FOUND when the agent does not exist in this tenant', async () => {
+    const repos = makeRepos({ agents: [] });
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).updateCapabilities({
+        agentId: 'agent-cap',
+        granted_packs: [],
+        denied_tools: [],
+        comment: 'agent is missing here',
+      }),
+    ).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  });
+
+  it('BAD_REQUEST on unknown pack (fail-closed, not ignored)', async () => {
+    const repos = makeRepos({ agents: [agent], grants: [baseGrant] });
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).updateCapabilities({
+        agentId: 'agent-cap',
+        granted_packs: ['domain.nao-existe'],
+        denied_tools: [],
+        comment: 'unknown pack must be rejected',
+      }),
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+    expect(repos._inspect.audit.length).toBe(0);
+  });
+
+  it('grants/revokes catalog packs, preserves mcp.* and re-inserts the baseline floor', async () => {
+    const repos = makeRepos({ agents: [agent], grants: [baseGrant] });
+    // Operator checked only domain.finance — calendar is revoked, mcp.acme
+    // (managed on the MCP screen) must survive, baseline.core is forced.
+    const res = await caller('owner', 'tenant-A', 'u1', repos).updateCapabilities({
+      agentId: 'agent-cap',
+      granted_packs: ['domain.finance'],
+      denied_tools: [],
+      comment: 'agente comercial vira financeiro',
+    });
+    expect(res.granted_packs).toContain('baseline.core');
+    expect(res.granted_packs).toContain('domain.finance');
+    expect(res.granted_packs).toContain('mcp.acme');
+    expect(res.granted_packs).not.toContain('domain.calendar');
+    expect(repos._inspect.audit[0]!.action).toBe('agent_capabilities_update');
+    expect(repos._inspect.audit[0]!.resource_type).toBe('agent_tool_grant');
+    const summary = repos._inspect.audit[0]!.change_summary as {
+      previous: { granted_packs: string[] } | null;
+    };
+    expect(summary.previous?.granted_packs).toEqual(baseGrant.granted_packs);
+  });
+
+  it('accepts a hard deny for an effective tool of the NEW pack set', async () => {
+    const repos = makeRepos({ agents: [agent], grants: [baseGrant] });
+    const res = await caller('owner', 'tenant-A', 'u1', repos).updateCapabilities({
+      agentId: 'agent-cap',
+      granted_packs: ['domain.finance'],
+      denied_tools: [financeTool],
+      comment: 'nega ferramenta financeira específica',
+    });
+    expect(res.denied_tools).toEqual([financeTool]);
+  });
+
+  it('BAD_REQUEST when denying a tool that is not visible nor already denied', async () => {
+    const repos = makeRepos({ agents: [agent], grants: [baseGrant] });
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).updateCapabilities({
+        agentId: 'agent-cap',
+        granted_packs: ['domain.calendar'],
+        denied_tools: ['tool_que_nao_existe'],
+        comment: 'deny inválido deve falhar',
+      }),
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+    expect(repos._inspect.audit.length).toBe(0);
+  });
+
+  it('keeps a pre-existing deny even if the tool left visibility', async () => {
+    const grantWithDeny: GrantRow = {
+      ...baseGrant,
+      granted_packs: ['baseline.core', 'domain.finance'],
+      denied_tools: [financeTool],
+    };
+    const repos = makeRepos({ agents: [agent], grants: [grantWithDeny] });
+    // Revoke finance but keep the historical deny — defense in depth.
+    const res = await caller('owner', 'tenant-A', 'u1', repos).updateCapabilities({
+      agentId: 'agent-cap',
+      granted_packs: [],
+      denied_tools: [financeTool],
+      comment: 'mantém deny histórico após revogar o pack',
+    });
+    expect(res.granted_packs).toEqual(['baseline.core']);
+    expect(res.denied_tools).toEqual([financeTool]);
+  });
+
+  it('works for an agent with no grant row yet (previous=null in audit)', async () => {
+    const repos = makeRepos({ agents: [agent] });
+    const res = await caller('owner', 'tenant-A', 'u1', repos).updateCapabilities({
+      agentId: 'agent-cap',
+      granted_packs: ['domain.support'],
+      denied_tools: [],
+      comment: 'primeiro grant explícito do agente',
+    });
+    expect(res.granted_packs).toContain('baseline.core');
+    expect(res.granted_packs).toContain('domain.support');
+    const summary = repos._inspect.audit[0]!.change_summary as {
+      previous: unknown;
+    };
+    expect(summary.previous).toBeNull();
   });
 });

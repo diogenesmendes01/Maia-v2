@@ -190,6 +190,21 @@ const CreateInputSchema = z.object({
   archetype: z.enum(ARCHETYPE_IDS).optional(),
 });
 
+const UpdateCapabilitiesInputSchema = z.object({
+  tenantId: z.string().optional(),
+  agentId: AgentIdSchema,
+  // Packs de PRODUTO desejados (catálogo TOOL_PACKS). Packs fora do catálogo
+  // presentes no grant atual (ex.: mcp.<server>, geridos em /setup/mcp) são
+  // PRESERVADOS — esta superfície não os gerencia. Pack desconhecido no input
+  // é rejeitado (fail-closed), não ignorado.
+  granted_packs: z.array(z.string().min(1).max(100)).max(50),
+  // HARD deny — substitui a lista atual. Cada entrada deve ser uma tool
+  // efetiva do novo conjunto (ou já estar negada hoje, para permitir manter
+  // denies históricos de tools que saíram de visibilidade).
+  denied_tools: z.array(z.string().min(1).max(200)).max(100),
+  comment: z.string().min(10).max(1000),
+});
+
 const UpdateProfileInputSchema = z.object({
   tenantId: z.string().optional(),
   agentId: AgentIdSchema,
@@ -393,8 +408,8 @@ export const agentsRouter = router({
   /**
    * Issue #470 — capacidades efetivas do agente para exibição no console:
    * grant row (packs/tools/denied) + resolução pack→tools via o registry
-   * (grant-math, fail-closed). Read-only; edição de grants continua fora do
-   * escopo desta superfície (mudança de capacidade passa por proposta).
+   * (grant-math, fail-closed). Edição de packs/denies: updateCapabilities
+   * (fase 4); aquisição de tools NOVAS continua via propostas.
    */
   getCapabilities: protectedProcedure
     .input(GetByIdInputSchema)
@@ -408,9 +423,13 @@ export const agentsRouter = router({
         { tenant_id: tenantId, agent_id: agent.id },
         async () => ctx.repos.agentToolGrantsRepo.findForCurrentAgent(),
       );
-      // Mesmo contrato fail-closed do runtime: sem row ⇒ floor da plataforma.
+      // Mesmo contrato do runtime (resolveGrantedToolNames): com row, o único
+      // piso inamovível é baseline.core — domain.calendar é padrão de CRIAÇÃO
+      // (BASE_AGENT_PACKS/coluna default), mas revogável via updateCapabilities;
+      // unir BASE_AGENT_PACKS aqui exibiria calendar como concedido após uma
+      // revogação. Sem row ⇒ floor da plataforma (o que uma row nova teria).
       const grantedPacks = grant
-        ? [...new Set([...BASE_AGENT_PACKS, ...grant.granted_packs])]
+        ? [...new Set(['baseline.core', ...grant.granted_packs])]
         : [...BASE_AGENT_PACKS];
       const deniedTools = grant?.denied_tools ?? [];
       const deniedSet = new Set(deniedTools);
@@ -437,6 +456,102 @@ export const agentsRouter = router({
         effective_tool_count: effectiveTools.length,
         effective_tools: effectiveTools,
         reason: grant?.reason ?? null,
+      };
+    }),
+
+  /**
+   * Edição de grants de packs de domínio + hard denies do agente — fase 4 do
+   * relatório de complexidade. Segue a decisão da spec §2.8 inaugurada por
+   * mcp.setAgentPack ("primeira superfície de EDIÇÃO de grants"): owner/founder,
+   * audit direto — aqui com upsert+audit ATÔMICOS (updateWithAudit, mesma
+   * classe de invariante do review do PR #491). Aquisição de tools NOVAS
+   * continua no fluxo de propostas (capability_proposals); esta superfície só
+   * compõe packs já existentes no catálogo e denies.
+   *
+   * Regras fail-closed:
+   *   - pack desconhecido no input ⇒ BAD_REQUEST (não é ignorado);
+   *   - `baseline.core` é sempre reinserido (piso de runtime — ver
+   *     resolveGrantedToolNames); packs fora do catálogo (mcp.*) do grant
+   *     atual são preservados;
+   *   - denied_tools: cada entrada precisa ser tool efetiva do NOVO conjunto,
+   *     tool avulsa concedida, ou já estar negada hoje.
+   */
+  updateCapabilities: protectedProcedure
+    .input(UpdateCapabilitiesInputSchema)
+    .mutation(async ({ input, ctx }) => {
+      ctx.assertRole('owner', 'founder');
+      const tenantId = resolveTenantId(ctx, input.tenantId);
+
+      const agent = await ctx.repos.agentsRepo.findById(input.agentId);
+      if (!agent || agent.tenant_id !== tenantId) {
+        throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent not found' });
+      }
+
+      const unknownPacks = input.granted_packs.filter((p) => TOOL_PACKS[p] === undefined);
+      if (unknownPacks.length > 0) {
+        throw new TRPCError({
+          code: 'BAD_REQUEST',
+          message: `Unknown pack(s): ${unknownPacks.join(', ')} — only catalog packs can be granted here`,
+        });
+      }
+
+      const current = await runWithTenantContext(
+        { tenant_id: tenantId, agent_id: agent.id },
+        async () => ctx.repos.agentToolGrantsRepo.findForCurrentAgent(),
+      );
+
+      // Preserva packs não-gerenciados por esta superfície (fora do catálogo,
+      // ex.: mcp.<server> — geridos em /setup/mcp). Sem isso, um save aqui
+      // revogaria silenciosamente o acesso MCP concedido em outra tela.
+      const unmanagedPacks = (current?.granted_packs ?? []).filter(
+        (p) => TOOL_PACKS[p] === undefined,
+      );
+      const nextPacks = [
+        ...new Set(['baseline.core', ...input.granted_packs, ...unmanagedPacks]),
+      ];
+
+      const grantedTools = current?.granted_tools ?? [];
+      const nextEffective = new Set([...resolvePackTools(nextPacks), ...grantedTools]);
+      const currentDenied = new Set(current?.denied_tools ?? []);
+      const invalidDenies = input.denied_tools.filter(
+        (t) => !nextEffective.has(t) && !currentDenied.has(t),
+      );
+      if (invalidDenies.length > 0) {
+        throw new TRPCError({
+          code: 'BAD_REQUEST',
+          message:
+            `denied_tools contains name(s) not visible to this agent: ` +
+            `${invalidDenies.join(', ')} — a hard deny targets an effective tool`,
+        });
+      }
+
+      const updated = await ctx.repos.agentToolGrantsRepo.updateWithAudit({
+        tenant_id: tenantId,
+        agent_id: agent.id,
+        grant: {
+          granted_packs: nextPacks,
+          granted_tools: grantedTools,
+          denied_tools: [...new Set(input.denied_tools)],
+          granted_by: ctx.userId,
+          reason: input.comment,
+        },
+        audit: {
+          actor_id: ctx.userId,
+          actor_role: ctx.userRole,
+          action: 'agent_capabilities_update',
+          previous: current
+            ? {
+                granted_packs: current.granted_packs,
+                granted_tools: current.granted_tools,
+                denied_tools: current.denied_tools,
+              }
+            : null,
+        },
+      });
+
+      return {
+        granted_packs: updated.granted_packs,
+        denied_tools: updated.denied_tools,
       };
     }),
 

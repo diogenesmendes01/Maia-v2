@@ -1,11 +1,12 @@
 import { eq, and, sql } from 'drizzle-orm';
-import { db } from '../client.js';
+import { db, withTx } from '../client.js';
 import {
   pessoas,
   agent_audience_profiles,
   agent_tool_grants,
   permissoes,
   permission_profiles,
+  admin_audit_log,
 } from '../schema.js';
 import { applyTenantGuard } from '../tenant-guard.js';
 import { getCurrentTenant, getCurrentAgent } from '../tenant-context.js';
@@ -330,6 +331,83 @@ export const agentToolGrantsRepo = {
       })
       .returning();
     return rows[0]!;
+  },
+
+  /**
+   * Upsert the grant AND append its admin_audit_log row in ONE transaction —
+   * "audit every decision": a failed audit insert rolls the grant back. Same
+   * contract as channelsRepo.createWithAudit (PR #491 review): explicit
+   * tenant/agent args (no ALS) so the atomic helper is self-contained.
+   * change_summary carries the before/after arrays for forensics.
+   */
+  async updateWithAudit(args: {
+    tenant_id: string;
+    agent_id: string;
+    grant: {
+      granted_packs: string[];
+      granted_tools: string[];
+      denied_tools: string[];
+      granted_by: string;
+      reason: string;
+    };
+    audit: {
+      actor_id: string;
+      actor_role: string;
+      action: string;
+      previous: {
+        granted_packs: string[];
+        granted_tools: string[];
+        denied_tools: string[];
+      } | null;
+    };
+  }): Promise<AgentToolGrantRow> {
+    return withTx(async (tx) => {
+      const [row] = await tx
+        .insert(agent_tool_grants)
+        .values({
+          tenant_id: args.tenant_id,
+          agent_id: args.agent_id,
+          granted_packs: args.grant.granted_packs,
+          granted_tools: args.grant.granted_tools,
+          denied_tools: args.grant.denied_tools,
+          granted_by: args.grant.granted_by,
+          reason: args.grant.reason,
+        })
+        .onConflictDoUpdate({
+          target: [agent_tool_grants.tenant_id, agent_tool_grants.agent_id],
+          set: {
+            granted_packs: args.grant.granted_packs,
+            granted_tools: args.grant.granted_tools,
+            denied_tools: args.grant.denied_tools,
+            granted_by: args.grant.granted_by,
+            reason: args.grant.reason,
+            updated_at: new Date(),
+          },
+        })
+        .returning();
+      if (!row) {
+        throw new Error('grant_update_with_audit_upsert_failed: returning() empty');
+      }
+      await tx.insert(admin_audit_log).values({
+        tenant_id: args.tenant_id,
+        actor_id: args.audit.actor_id,
+        actor_role: args.audit.actor_role,
+        action: args.audit.action,
+        resource_type: 'agent_tool_grant',
+        resource_id: args.agent_id,
+        change_summary: {
+          agent_id: args.agent_id,
+          previous: args.audit.previous,
+          next: {
+            granted_packs: args.grant.granted_packs,
+            granted_tools: args.grant.granted_tools,
+            denied_tools: args.grant.denied_tools,
+          },
+          reason: args.grant.reason,
+        },
+      });
+      return row;
+    });
   },
 };
 

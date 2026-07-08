@@ -41,6 +41,7 @@ import ActivityTab from './_components/activity-tab.js';
 import PlaygroundTab from './_components/playground-tab.js';
 import ObjectivesTab from './_components/objectives-tab.js';
 import GoLiveChecklist from './_components/go-live-checklist.js';
+import CapabilitiesModal from './_components/capabilities-modal.js';
 
 type TabId =
   | 'overview'
@@ -193,11 +194,14 @@ export default function AgentDetailPage() {
             onGoToVersions={() => setTab('versions')}
           />
           <OverviewTab
+            tenantId={tenantId}
+            agentId={agent.id}
             activeBody={active?.profile_body ?? null}
             activeVersion={active?.version ?? null}
             onEdit={() => setTab('profile')}
             canManage={canManage}
             capabilities={capabilitiesQuery.data ?? null}
+            onCapabilitiesChanged={() => void capabilitiesQuery.refetch()}
           />
         </div>
       )}
@@ -270,25 +274,45 @@ type Capabilities = {
 };
 
 function OverviewTab({
+  tenantId,
+  agentId,
   activeBody,
   activeVersion,
   onEdit,
   canManage,
   capabilities,
+  onCapabilitiesChanged,
 }: {
+  tenantId: string;
+  agentId: string;
   activeBody: unknown;
   activeVersion: number | null;
   onEdit: () => void;
   canManage: boolean;
   capabilities: Capabilities | null;
+  onCapabilitiesChanged: () => void;
 }) {
+  const [showCapabilitiesModal, setShowCapabilitiesModal] = React.useState(false);
+
   // Issue #470 — packs/tools efetivos da função, mesmo contrato fail-closed
-  // do runtime (sem grant row ⇒ floor da plataforma).
+  // do runtime (sem grant row ⇒ floor da plataforma). Edição (packs de
+  // domínio + hard denies): fase 4 — owner/founder, auditada.
   const capabilitiesCard = capabilities && (
     <Card>
       <CardHeader
         title="Capacidades da função"
         description={`${capabilities.effective_tool_count} ferramentas visíveis ao agente — princípio do menor privilégio: ele nasce com o mínimo da função e aprende o resto sob aprovação.`}
+        actions={
+          canManage && (
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => setShowCapabilitiesModal(true)}
+            >
+              Gerenciar
+            </Button>
+          )
+        }
       />
       <CardBody className="space-y-3">
         {capabilities.packs.map((pack) => (
@@ -326,6 +350,17 @@ function OverviewTab({
     </Card>
   );
 
+  const capabilitiesModal = showCapabilitiesModal && capabilities && (
+    <CapabilitiesModal
+      tenantId={tenantId}
+      agentId={agentId}
+      currentPackIds={capabilities.packs.map((p) => p.id)}
+      currentDeniedTools={capabilities.denied_tools}
+      onClose={() => setShowCapabilitiesModal(false)}
+      onSaved={onCapabilitiesChanged}
+    />
+  );
+
   if (!activeBody) {
     return (
       <div className="space-y-4">
@@ -334,6 +369,7 @@ function OverviewTab({
           description="Este agente ainda não tem uma versão de perfil ativa. Aprove a proposta pendente na aba Versões — sem perfil ativo o agente não opera."
         />
         {capabilitiesCard}
+        {capabilitiesModal}
       </div>
     );
   }
@@ -414,6 +450,7 @@ function OverviewTab({
       </Card>
 
       <div className="lg:col-span-2">{capabilitiesCard}</div>
+      {capabilitiesModal}
     </div>
   );
 }
