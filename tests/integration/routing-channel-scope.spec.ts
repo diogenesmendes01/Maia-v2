@@ -106,7 +106,7 @@ d('fase 0 — escopo por canal no DB (constraints 090)', () => {
     await expect(
       q(
         `INSERT INTO conversas (tenant_id, agent_id, pessoa_id, status, escopo_entidades, channel_id)
-         VALUES ($1, $2, $3, 'ativa', '[]'::jsonb, $4)`,
+         VALUES ($1, $2, $3, 'ativa', '{}'::uuid[], $4)`,
         [T, A, pessoa, chB1],
       ),
     ).rejects.toMatchObject({ code: '23503' });
