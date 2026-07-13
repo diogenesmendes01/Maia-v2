@@ -23,7 +23,8 @@
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 import { audit } from '@/governance/audit.js';
-import { sendOutboundText, isBaileysConnected } from '@/gateway/baileys.js';
+import { isBaileysConnected } from '@/gateway/baileys.js';
+import { forCurrentAgentChannel } from '@/gateway/line-output.js';
 import { sendAlert } from '@/lib/alerts.js';
 import { outboxRepo, occurrencesRepo, tasksRepo } from './repos.js';
 import { tryAcquireSendSlot, releasePaceKey } from './backpressure.js';
@@ -262,7 +263,15 @@ function pickChannel(msg: OutboxMessage): Channel | null {
         kind: 'whatsapp',
         requiresBaileys: true,
         jid: p.jid,
-        send: () => sendOutboundText(p.jid, p.text),
+        // Fase 0 (spec roteamento v4 §1.6): o drain roda sob o ALS do tuple e
+        // envia pela fronteira única, no canal da PRÓPRIA row (o CHECK de 090
+        // garante channel_id em rows pending/claimed novas; NULL legado
+        // resolve o canal único do agente). Falha de resolução lança dentro
+        // de `send()` → cai na máquina de retry/DLQ existente.
+        send: async () => {
+          const line = await forCurrentAgentChannel(msg.channel_id ?? null);
+          return line.sendText(p.jid, p.text);
+        },
       };
     }
     case 'whatsapp_pending_question': {

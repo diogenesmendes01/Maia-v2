@@ -53,6 +53,30 @@ const VITEST_GLOBALS = {
   vi: 'readonly',
 };
 
+// Fase 0 do roteamento multi-linha (spec 2026-07-09 §1.6) — LINT GATE da
+// fronteira única de saída: fora de src/gateway/, NINGUÉM importa as
+// primitivas físicas de envio de baileys.ts/presence.ts. Todo envio passa por
+// `LineOutput` (src/gateway/line-output.ts), que valida o triplete
+// (tenant, agent, channel) fail-closed. Imports não-restritos (MEDIA_ROOT,
+// isBaileysConnected, quotedReplyContext, tipos) continuam livres.
+// NOTA flat-config: o ÚLTIMO bloco que configura uma regra para um arquivo
+// VENCE (não há merge) — por isso os paths abaixo são repetidos no bloco
+// P8e (agent/cognition), que também configura no-restricted-imports.
+const RESTRICTED_SEND_IMPORT_PATHS = [
+  {
+    name: '@/gateway/baileys.js',
+    importNames: ['sendOutboundText', 'sendOutboundDocument', 'sendOutboundVoice'],
+    message:
+      'Fronteira única de saída (spec roteamento §1.6): use LineOutput via forChannel/forCurrentAgentChannel (@/gateway/line-output.js) — nunca as primitivas físicas.',
+  },
+  {
+    name: '@/gateway/presence.js',
+    importNames: ['sendPoll', 'sendReaction', 'startTyping', 'markRead'],
+    message:
+      'Fronteira única de saída (spec roteamento §1.6): use LineOutput via forChannel/forCurrentAgentChannel (@/gateway/line-output.js) — nunca as primitivas físicas.',
+  },
+];
+
 const TS_RULES = {
   ...tsPlugin.configs.recommended.rules,
 
@@ -157,6 +181,9 @@ export default [
       'no-restricted-imports': [
         'error',
         {
+          // Fase 0 lint gate — repetido aqui porque este bloco SOBRESCREVE a
+          // config da regra para agent/cognition (flat config não faz merge).
+          paths: RESTRICTED_SEND_IMPORT_PATHS,
           patterns: [
             {
               group: ['@/control-plane/policy', '@/control-plane/policy/*'],
@@ -174,6 +201,18 @@ export default [
           ],
         },
       ],
+    },
+  },
+
+  // Fase 0 do roteamento multi-linha — lint gate da fronteira única de saída
+  // (ver RESTRICTED_SEND_IMPORT_PATHS no topo). src/gateway/ é o ÚNICO lugar
+  // autorizado a tocar as primitivas físicas; agent/cognition recebem os
+  // mesmos paths via o bloco P8e acima (flat config não faz merge de regra).
+  {
+    files: ['src/**/*.ts'],
+    ignores: ['src/gateway/**', 'src/agent/**', 'src/cognition/**'],
+    rules: {
+      'no-restricted-imports': ['error', { paths: RESTRICTED_SEND_IMPORT_PATHS }],
     },
   },
 

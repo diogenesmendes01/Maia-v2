@@ -10,7 +10,7 @@ import {
 import { withTx } from '@/db/client.js';
 import { audit } from '@/governance/audit.js';
 import { config } from '@/config/env.js';
-import { sendOutboundText } from '@/gateway/baileys.js';
+import { forCurrentAgentChannel } from '@/gateway/line-output.js';
 
 const SIDE_EFFECT_ACTIONS = new Set([
   'transaction_created',
@@ -204,6 +204,7 @@ async function createEditReviewPending(input: {
   await notifyOwnerOfEditReview({
     owner: { telefone_whatsapp: owner.telefone_whatsapp },
     ownerConversaId: ownerConversa.id,
+    ownerChannelId: ownerConversa.channel_id,
     pendingId: created.id,
     pergunta,
   });
@@ -212,14 +213,18 @@ async function createEditReviewPending(input: {
 async function notifyOwnerOfEditReview(input: {
   owner: { telefone_whatsapp: string };
   ownerConversaId: string;
+  /** Fase 0 (spec roteamento v4 §1.6): canal da conversa do dono (NULL legado). */
+  ownerChannelId: string | null;
   pendingId: string;
   pergunta: string;
 }): Promise<void> {
   const jid = input.owner.telefone_whatsapp.replace(/^\+/, '') + '@s.whatsapp.net';
   try {
-    const wid = await sendOutboundText(jid, input.pergunta);
+    const line = await forCurrentAgentChannel(input.ownerChannelId);
+    const wid = await line.sendText(jid, input.pergunta);
     await mensagensRepo.create({
       conversa_id: input.ownerConversaId,
+      channel_id: line.scope.channel_id,
       direcao: 'out',
       tipo: 'texto',
       conteudo: input.pergunta,

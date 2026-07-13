@@ -32,6 +32,23 @@ vi.mock('../../src/gateway/baileys.js', () => ({
   isBaileysConnected: () => isBaileysConnectedMock(),
 }));
 
+// Fase 0 (spec roteamento v4 §1.6): whatsapp sends now go through the single
+// egress boundary — `forCurrentAgentChannel(msg.channel_id ?? null)` →
+// `LineOutput.sendText`. The mock delegates to the same send spy so every
+// existing send assertion still observes the physical send.
+const forCurrentAgentChannelMock = vi.fn(async (channel_id: string | null) => ({
+  scope: {
+    tenant_id: 'tenant-test',
+    agent_id: 'agent-test',
+    channel_id: channel_id ?? 'chan-sole-1',
+  },
+  sendText: (jid: string, text: string) => sendOutboundTextMock(jid, text),
+  isConnected: () => isBaileysConnectedMock() as boolean,
+}));
+vi.mock('../../src/gateway/line-output.js', () => ({
+  forCurrentAgentChannel: forCurrentAgentChannelMock,
+}));
+
 const tryAcquireMock = vi.fn();
 const releasePaceMock = vi.fn().mockResolvedValue(undefined);
 vi.mock('../../src/scheduling/backpressure.js', () => ({
@@ -62,6 +79,7 @@ const okMsg = (id: string, attempts = 0, max = 5) => ({
   task_id: 't1',
   occurrence_id: 'o1',
   kind: 'whatsapp_text',
+  channel_id: null,
   payload: { jid: 'mariana@s.whatsapp.net', text: 'Oi' },
   status: 'claimed',
   attempts,
@@ -88,6 +106,7 @@ beforeEach(() => {
   occByIdMock.mockReset();
   occSetStatusMock.mockReset().mockResolvedValue(undefined);
   sendOutboundTextMock.mockReset();
+  forCurrentAgentChannelMock.mockClear();
   isBaileysConnectedMock.mockReset().mockReturnValue(true);
   tryAcquireMock.mockReset();
   releasePaceMock.mockReset().mockResolvedValue(undefined);
@@ -106,6 +125,9 @@ describe('runOutboxDrain — Requirement 1 (no message loss) + Requirement 7 (au
     const r = await runOutboxDrain();
 
     expect(r.sent).toBe(1);
+    // Fase 0: the send resolved the LineOutput for the ROW's channel (null
+    // here → sole-active-channel resolution inside the boundary).
+    expect(forCurrentAgentChannelMock).toHaveBeenCalledWith(null);
     expect(outboxMarkSentMock).toHaveBeenCalledWith('m1');
     expect(auditMock.mock.calls.some((c) => (c[0] as { acao: string }).acao === 'outbox_sent')).toBe(true);
     expect(

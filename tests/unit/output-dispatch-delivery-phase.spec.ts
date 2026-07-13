@@ -41,11 +41,22 @@ const { cfg, m } = vi.hoisted(() => ({
   },
 }));
 
-vi.mock('@/gateway/baileys.js', () => ({
-  sendOutboundText: m.sendOutboundText,
-  sendOutboundVoice: m.sendOutboundVoice,
-  sendOutboundDocument: m.sendOutboundDocument,
-  isBaileysConnected: m.isBaileysConnected,
+// Fase 0 do roteamento multi-linha (spec 2026-07-09 §1.6): dispatchOutput /
+// sendOutbound agora enviam pela FRONTEIRA ÚNICA LineOutput em vez das
+// primitivas de baileys/presence. A linha mockada roteia para os MESMOS spies
+// de antes, então todas as asserções de fase de entrega continuam idênticas.
+vi.mock('@/gateway/line-output.js', () => ({
+  forCurrentAgentChannel: vi.fn(async () => ({
+    scope: { tenant_id: 't', agent_id: 'a', channel_id: 'ch-1' },
+    sendText: m.sendOutboundText,
+    sendDocument: m.sendOutboundDocument,
+    sendVoice: m.sendOutboundVoice,
+    sendPoll: m.sendPoll,
+    sendReaction: vi.fn(),
+    startTyping: vi.fn(() => ({ stop: vi.fn() })),
+    markRead: vi.fn(),
+    isConnected: m.isBaileysConnected,
+  })),
 }));
 vi.mock('@/db/repositories.js', () => ({
   mensagensRepo: { create: m.createMensagem, findById: vi.fn().mockResolvedValue(null) },
@@ -67,9 +78,11 @@ vi.mock('@/lib/tts.js', () => ({
   synthesizeSpeech: m.synthesizeSpeech,
   OUTBOUND_VOICE_MAX_CHARS: 300,
 }));
+// Só quotedReplyContext ainda é importado de presence pelo output-dispatch;
+// sendPoll agora sai exclusivamente pela LineOutput (mock acima) — mantê-lo
+// aqui mascararia uma regressão de volta à primitiva antiga.
 vi.mock('@/gateway/presence.js', () => ({
   quotedReplyContext: () => undefined,
-  sendPoll: m.sendPoll,
 }));
 vi.mock('@/agent/reflection.js', () => ({ detectCorrection: () => false }));
 vi.mock('@/agent/pdf-cleanup.js', () => ({ cleanupPDF: vi.fn() }));
@@ -81,7 +94,7 @@ import {
 } from '@/agent/output-dispatch.js';
 
 const pessoa = { id: 'p_1', telefone_whatsapp: '+5511999999999', preferencias: null } as unknown as Pessoa;
-const conversa = { id: 'c_1' } as Conversa;
+const conversa = { id: 'c_1', channel_id: null } as Conversa;
 
 function mkCtx(overrides?: Partial<Parameters<typeof dispatchOutput>[0]>) {
   return {

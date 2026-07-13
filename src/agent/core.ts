@@ -27,7 +27,8 @@ import { resolveChannel } from '@/gateway/channel-resolver.js';
 import { audit } from '@/governance/audit.js';
 import { computeRuntimeVisibleTools } from '@/tools/runtime-filter.js';
 import { mcpVisibleToolSchemas } from '@/tools/mcp-bridge.js';
-import { startTyping } from '@/gateway/presence.js';
+import { forCurrentAgentChannel } from '@/gateway/line-output.js';
+import type { TypingHandle } from '@/gateway/presence.js';
 // NOTE (issue #412): procedure-selector / role-selector / step-evaluator and
 // the reflection helpers (detectSuccess/detectCorrection/reflect/classify/
 // persistCandidate/recordSuccess/reflectOnCorrection/findPreviousAssistantMessage)
@@ -156,13 +157,31 @@ async function aggregateUnprocessedTexts(target: Mensagem): Promise<{
 /**
  * Returns a stopper. The stopper either cancels the pending start (if called
  * within TYPING_DEBOUNCE_MS) or calls handle.stop() (if typing already started).
+ *
+ * Fase 0 (spec roteamento v4 §1.6): o typing (efêmero) sai pela fronteira
+ * `LineOutput` do canal da conversa. A resolução é assíncrona dentro do timer
+ * (ALS propaga por setTimeout); falha de resolução só suprime o typing —
+ * nunca derruba o turno (best-effort, como sempre foi).
  */
-function scheduleTypingDebounce(jid: string, mensagem_id: string): () => void {
-  let handle: ReturnType<typeof startTyping> | null = null;
+function scheduleTypingDebounce(
+  jid: string,
+  mensagem_id: string,
+  channel_id: string | null = null,
+): () => void {
+  let handle: TypingHandle | null = null;
+  let stopped = false;
   const timer = setTimeout(() => {
-    handle = startTyping(jid, mensagem_id);
+    forCurrentAgentChannel(channel_id)
+      .then((line) => {
+        if (stopped) return;
+        handle = line.startTyping(jid, mensagem_id);
+      })
+      .catch((err) =>
+        logger.debug({ err: (err as Error).message }, 'agent.typing_line_unresolved'),
+      );
   }, TYPING_DEBOUNCE_MS);
   return () => {
+    stopped = true;
     clearTimeout(timer);
     handle?.stop();
   };
@@ -197,7 +216,11 @@ export const _internal = { scheduleTypingDebounce, sendOutbound, aggregateUnproc
  */
 async function probeMessageForChannel(
   mensagem_id: string,
-): Promise<{ channel_type: 'whatsapp'; external_id: string } | null> {
+): Promise<{
+  channel_type: 'whatsapp';
+  external_id: string;
+  bot_line_external_id: string | null;
+} | null> {
   let rows: Array<{ metadata: unknown }>;
   try {
     rows = await db
@@ -224,7 +247,13 @@ async function probeMessageForChannel(
   const md = (rows[0]!.metadata ?? {}) as Record<string, unknown>;
   const tel = typeof md['telefone'] === 'string' ? (md['telefone'] as string) : null;
   if (!tel) return null;
-  return { channel_type: 'whatsapp', external_id: tel };
+  // §1.1 (spec roteamento v4) — a LINHA que recebeu (carimbada pelo ingress).
+  // Rows antigas não a têm ⇒ null ⇒ resolução legada (shadow sem comparação).
+  const botLine =
+    typeof md['bot_line_external_id'] === 'string'
+      ? (md['bot_line_external_id'] as string)
+      : null;
+  return { channel_type: 'whatsapp', external_id: tel, bot_line_external_id: botLine };
 }
 
 /**
@@ -292,7 +321,11 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
   };
 
   {
-    let probe: { channel_type: 'whatsapp'; external_id: string } | null = null;
+    let probe: {
+      channel_type: 'whatsapp';
+      external_id: string;
+      bot_line_external_id: string | null;
+    } | null = null;
     try {
       probe = await probeMessageForChannel(mensagem_id);
       // probe null → no telefone metadata. Keep default/default and let the
@@ -369,6 +402,7 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
         id: mensagem_id,
         tenant_id: resolved.tenant_id,
         agent_id: resolved.agent_id,
+        channel_id: resolved.channel_id,
       });
       if (!won) {
         const owner = await mensagensRepo.findOwnerByIdCrossTenant(mensagem_id);
@@ -436,7 +470,9 @@ async function runAgentForMensagemInner(
   if (!inbound.conversa_id) {
     const tel = (inbound.metadata as Record<string, unknown>)?.['telefone'] as string | undefined;
     if (!tel) return;
-    const resolved = await resolveIdentity({ telefone_whatsapp: tel });
+    // Fase 0 (spec roteamento v4 §1.6): a identidade da conversa inclui o
+    // canal — o resolver casa/cria a conversa DO canal que recebeu o inbound.
+    const resolved = await resolveIdentity({ telefone_whatsapp: tel, channel_id });
     if (resolved.kind === 'unknown') {
       // Mark processed so the recovery worker doesn't requeue forever.
       await mensagensRepo.markProcessed(inbound.id, 0);
@@ -560,7 +596,9 @@ async function runAgentForMensagemInner(
         metadata: { count: decision.count, threshold: decision.threshold },
       });
       const reply = formatPoliteReply(decision.threshold);
-      await sendOutbound(pessoa.id, c.id, reply, inbound.id).catch((err) =>
+      await sendOutbound(pessoa.id, c.id, reply, inbound.id, {
+        channel_id: c.channel_id,
+      }).catch((err) =>
         logger.warn({ err: (err as Error).message }, 'agent.rate_limit_reply_failed'),
       );
     }
@@ -873,7 +911,9 @@ async function runAgentForMensagemInner(
         // 'block' or 'escalate' from a PEP → reply to user and skip LLM.
         // Never expose internal policy text (effect.message) to the user.
         const blockMsg = 'Esta ação requer aprovação adicional antes de prosseguir.';
-        await sendOutbound(pessoa.id, c.id, blockMsg, inbound.id).catch((err) =>
+        await sendOutbound(pessoa.id, c.id, blockMsg, inbound.id, {
+          channel_id: c.channel_id,
+        }).catch((err) =>
           logger.warn({ err: (err as Error).message }, 'agent.decision_engine.blocked_reply_failed'),
         );
         await markAllProcessed(0);
@@ -886,7 +926,9 @@ async function runAgentForMensagemInner(
       if (packet.action_mode === 'escalate') {
         const escalateMsg =
           'Esta ação requer aprovação adicional. O responsável será notificado.';
-        await sendOutbound(pessoa.id, c.id, escalateMsg, inbound.id).catch((err) =>
+        await sendOutbound(pessoa.id, c.id, escalateMsg, inbound.id, {
+          channel_id: c.channel_id,
+        }).catch((err) =>
           logger.warn({ err: (err as Error).message }, 'agent.decision_engine.escalate_reply_failed'),
         );
         await markAllProcessed(0);
@@ -1021,7 +1063,9 @@ async function runAgentForMensagemInner(
       // fail-closed: the always-on engine errored → block the turn, reply to
       // user, skip LLM (there is no legacy fallback path anymore)
       const failMsg = 'Sistema indisponível temporariamente. Tente novamente em alguns instantes.';
-      await sendOutbound(pessoa.id, c.id, failMsg, inbound.id).catch((e) =>
+      await sendOutbound(pessoa.id, c.id, failMsg, inbound.id, {
+        channel_id: c.channel_id,
+      }).catch((e) =>
         logger.warn({ err: (e as Error).message }, 'agent.decision_engine.fail_closed_reply_failed'),
       );
       await markAllProcessed(0);
@@ -1044,7 +1088,7 @@ async function runAgentForMensagemInner(
     typeof inboundRemoteJid === 'string' && inboundRemoteJid.length > 0
       ? inboundRemoteJid
       : pessoa.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
-  const stopTyping = scheduleTypingDebounce(jid, inbound.id);
+  const stopTyping = scheduleTypingDebounce(jid, inbound.id, c.channel_id);
   let totalTokens: number;
   let reactOutboundText: string;
   let reactToolsCalled: Array<{ name: string; result: unknown }>;

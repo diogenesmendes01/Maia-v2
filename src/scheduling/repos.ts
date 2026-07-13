@@ -34,8 +34,37 @@ import type {
   TaskKind,
   TaskStatus,
 } from './types.js';
+import { channelsRepo } from '@/db/repositories/channel-repos.js';
+import { TypedError } from '@/lib/utils.js';
 
 type Tx = typeof db;
+
+/**
+ * Fase 0 (spec roteamento v4 §1.6) — rows novas whatsapp do outbox nascem COM
+ * canal (o CHECK de 090 exige `channel_id` para kind whatsapp% em status
+ * pending/claimed; kinds sem linha — email — ficam NULL). Enqueue sem canal
+ * explícito resolve o canal ÚNICO ativo do agente corrente; zero/2+ é
+ * fail-closed (o chamador proativo passa a ter que especificar) — NUNCA
+ * escolhemos "o primário" entre vários.
+ */
+async function resolveOutboxChannelId(
+  kind: string,
+  explicit: string | null | undefined,
+): Promise<string | null> {
+  if (explicit) return explicit;
+  if (!kind.startsWith('whatsapp')) return null;
+  const sole = await channelsRepo.findSoleActiveForCurrentAgent();
+  if (sole.kind !== 'one') {
+    throw new TypedError(
+      'channel_ambiguous',
+      sole.kind === 'none'
+        ? 'outbox enqueue: agent has no active channel'
+        : 'outbox enqueue: agent has multiple active channels — caller must pass channel_id',
+      { resolution: sole.kind, kind },
+    );
+  }
+  return sole.id;
+}
 
 /**
  * Issue #355 — tenant scoping for the Spec-18 scheduling tables.
@@ -569,6 +598,7 @@ function txRepos(tx: Tx): TxScopedRepos {
             .values({
               tenant_id,
               agent_id,
+              channel_id: await resolveOutboxChannelId(input.kind, input.channel_id),
               occurrence_id: input.occurrence_id ?? null,
               task_id: input.task_id ?? null,
               kind: input.kind,
@@ -1058,6 +1088,7 @@ export const outboxRepo = {
         .values({
           tenant_id,
           agent_id,
+          channel_id: await resolveOutboxChannelId(input.kind, input.channel_id),
           occurrence_id: input.occurrence_id ?? null,
           task_id: input.task_id ?? null,
           kind: input.kind,

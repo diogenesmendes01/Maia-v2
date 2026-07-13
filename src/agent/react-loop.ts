@@ -6,7 +6,7 @@ import { callLLM, type LLMMessage, type ToolSchema } from '@/lib/claude.js';
 import { logger } from '@/lib/logger.js';
 import { dispatchTool } from '@/tools/_dispatcher.js';
 import { REGISTRY } from '@/tools/_registry.js';
-import { sendReaction } from '@/gateway/presence.js';
+import { forCurrentAgentChannel } from '@/gateway/line-output.js';
 import { uuid } from '@/lib/utils.js';
 import { safeDispatchOutput, type LatestPending, type LatestReportPdf } from './output-dispatch.js';
 import { detectGap } from './gap-detector.js';
@@ -348,13 +348,25 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
       if (isSideEffect) {
         const wid = (inbound.metadata as Record<string, unknown> | null)?.['whatsapp_id'];
         if (typeof wid === 'string') {
-          if (!isError) {
-            sendReaction(jid, wid, '✅');
-          } else {
-            const errKind = (out as { error: string }).error;
-            if (errKind === 'forbidden' || errKind === 'requires_dual_approval') {
-              sendReaction(jid, wid, '❌');
-            }
+          // Fase 0 (spec roteamento v4 §1.6): reação (efêmera) sai pela
+          // fronteira LineOutput do canal da conversa. Best-effort — falha de
+          // resolução só suprime a reação, nunca o turno.
+          const emoji: '✅' | '❌' | null = !isError
+            ? '✅'
+            : ['forbidden', 'requires_dual_approval'].includes(
+                  (out as { error: string }).error,
+                )
+              ? '❌'
+              : null;
+          if (emoji) {
+            await forCurrentAgentChannel(c.channel_id)
+              .then((line) => line.sendReaction(jid, wid, emoji))
+              .catch((err) =>
+                logger.debug(
+                  { err: (err as Error).message },
+                  'react_loop.reaction_line_unresolved',
+                ),
+              );
           }
         }
       }
