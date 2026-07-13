@@ -1,5 +1,5 @@
 import { eq, and, sql } from 'drizzle-orm';
-import { db, withTx } from '../client.js';
+import { db, withTx, pgErrorCode } from '../client.js';
 import {
   pessoas,
   agent_audience_profiles,
@@ -334,80 +334,144 @@ export const agentToolGrantsRepo = {
   },
 
   /**
-   * Upsert the grant AND append its admin_audit_log row in ONE transaction —
-   * "audit every decision": a failed audit insert rolls the grant back. Same
-   * contract as channelsRepo.createWithAudit (PR #491 review): explicit
-   * tenant/agent args (no ALS) so the atomic helper is self-contained.
-   * change_summary carries the before/after arrays for forensics.
+   * Read-modify-write the grant AND append its admin_audit_log row in ONE
+   * transaction — "audit every decision": a failed audit insert rolls the
+   * grant back. Same contract family as channelsRepo.createWithAudit
+   * (PR #491 review): explicit tenant/agent args (no ALS).
+   *
+   * PR #494 review [medium] — the CURRENT row is read INSIDE the tx under
+   * `SELECT ... FOR UPDATE`, and the caller supplies a PURE `compute`
+   * function instead of a precomputed grant. Without the lock, two writers
+   * (e.g. /setup/mcp toggling a pack while the capabilities modal saves)
+   * could read the same snapshot and the last full-array upsert would clobber
+   * the other's change — and the audit `previous` would record the stale
+   * snapshot rather than the value actually replaced.
+   *
+   * `compute` MUST be synchronous and side-effect free. Returning
+   * `{ ok: false, reject }` aborts with rollback (nothing written) and the
+   * opaque `reject` payload is surfaced to the caller for error mapping.
+   *
+   * First-write race (no row to lock yet): two concurrent inserts collide on
+   * the (tenant, agent) UNIQUE — the loser retries the whole tx once, now
+   * serialized by the winner's row.
    */
   async updateWithAudit(args: {
     tenant_id: string;
     agent_id: string;
-    grant: {
-      granted_packs: string[];
-      granted_tools: string[];
-      denied_tools: string[];
-      granted_by: string;
-      reason: string;
-    };
+    compute: (current: AgentToolGrantRow | null) =>
+      | {
+          ok: true;
+          granted_packs: string[];
+          granted_tools: string[];
+          denied_tools: string[];
+        }
+      | { ok: false; reject: unknown };
+    granted_by: string;
+    reason: string;
     audit: {
       actor_id: string;
       actor_role: string;
       action: string;
-      previous: {
-        granted_packs: string[];
-        granted_tools: string[];
-        denied_tools: string[];
-      } | null;
     };
-  }): Promise<AgentToolGrantRow> {
-    return withTx(async (tx) => {
-      const [row] = await tx
-        .insert(agent_tool_grants)
-        .values({
+  }): Promise<
+    | { ok: true; grant: AgentToolGrantRow }
+    | { ok: false; reject: unknown }
+  > {
+    const attempt = () =>
+      withTx(async (tx) => {
+        const currentRows = await tx
+          .select()
+          .from(agent_tool_grants)
+          .where(
+            and(
+              eq(agent_tool_grants.tenant_id, args.tenant_id),
+              eq(agent_tool_grants.agent_id, args.agent_id),
+            ),
+          )
+          .limit(1)
+          .for('update');
+        const current = currentRows[0] ?? null;
+
+        const next = args.compute(current);
+        if (!next.ok) return next;
+
+        // Deliberately NOT an upsert: with the row locked, an existing grant
+        // takes the UPDATE path; a missing grant takes a PLAIN insert so a
+        // concurrent first-writer collides on the (tenant, agent) UNIQUE and
+        // hits the 23505 retry below. An ON CONFLICT DO UPDATE here would
+        // let the loser silently overwrite the winner with a compute(null)
+        // result — the exact lost-update this helper exists to prevent.
+        const [row] = current
+          ? await tx
+              .update(agent_tool_grants)
+              .set({
+                granted_packs: next.granted_packs,
+                granted_tools: next.granted_tools,
+                denied_tools: next.denied_tools,
+                granted_by: args.granted_by,
+                reason: args.reason,
+                updated_at: new Date(),
+              })
+              .where(
+                and(
+                  eq(agent_tool_grants.tenant_id, args.tenant_id),
+                  eq(agent_tool_grants.agent_id, args.agent_id),
+                ),
+              )
+              .returning()
+          : await tx
+              .insert(agent_tool_grants)
+              .values({
+                tenant_id: args.tenant_id,
+                agent_id: args.agent_id,
+                granted_packs: next.granted_packs,
+                granted_tools: next.granted_tools,
+                denied_tools: next.denied_tools,
+                granted_by: args.granted_by,
+                reason: args.reason,
+              })
+              .returning();
+        if (!row) {
+          throw new Error('grant_update_with_audit_upsert_failed: returning() empty');
+        }
+        await tx.insert(admin_audit_log).values({
           tenant_id: args.tenant_id,
-          agent_id: args.agent_id,
-          granted_packs: args.grant.granted_packs,
-          granted_tools: args.grant.granted_tools,
-          denied_tools: args.grant.denied_tools,
-          granted_by: args.grant.granted_by,
-          reason: args.grant.reason,
-        })
-        .onConflictDoUpdate({
-          target: [agent_tool_grants.tenant_id, agent_tool_grants.agent_id],
-          set: {
-            granted_packs: args.grant.granted_packs,
-            granted_tools: args.grant.granted_tools,
-            denied_tools: args.grant.denied_tools,
-            granted_by: args.grant.granted_by,
-            reason: args.grant.reason,
-            updated_at: new Date(),
+          actor_id: args.audit.actor_id,
+          actor_role: args.audit.actor_role,
+          action: args.audit.action,
+          resource_type: 'agent_tool_grant',
+          resource_id: args.agent_id,
+          change_summary: {
+            agent_id: args.agent_id,
+            previous: current
+              ? {
+                  granted_packs: current.granted_packs,
+                  granted_tools: current.granted_tools,
+                  denied_tools: current.denied_tools,
+                }
+              : null,
+            next: {
+              granted_packs: next.granted_packs,
+              granted_tools: next.granted_tools,
+              denied_tools: next.denied_tools,
+            },
+            reason: args.reason,
           },
-        })
-        .returning();
-      if (!row) {
-        throw new Error('grant_update_with_audit_upsert_failed: returning() empty');
-      }
-      await tx.insert(admin_audit_log).values({
-        tenant_id: args.tenant_id,
-        actor_id: args.audit.actor_id,
-        actor_role: args.audit.actor_role,
-        action: args.audit.action,
-        resource_type: 'agent_tool_grant',
-        resource_id: args.agent_id,
-        change_summary: {
-          agent_id: args.agent_id,
-          previous: args.audit.previous,
-          next: {
-            granted_packs: args.grant.granted_packs,
-            granted_tools: args.grant.granted_tools,
-            denied_tools: args.grant.denied_tools,
-          },
-          reason: args.grant.reason,
-        },
+        });
+        return { ok: true as const, grant: row };
       });
-      return row;
-    });
+
+    try {
+      return await attempt();
+    } catch (err) {
+      // Concurrent FIRST write: both saw no row (nothing to lock), the loser
+      // hits the (tenant, agent) UNIQUE. One retry is now serialized by the
+      // winner's committed row.
+      if (pgErrorCode(err) === '23505') {
+        return attempt();
+      }
+      throw err;
+    }
   },
 };
 
