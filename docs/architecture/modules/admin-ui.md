@@ -8,7 +8,7 @@
 
 | Path | Role |
 |---|---|
-| `src/admin-ui/trpc/routers/` | 16 tRPC routers (governance surface) |
+| `src/admin-ui/trpc/routers/` | 19 tRPC routers (governance surface) |
 | `src/admin-ui/app/` | Next.js App Router pages (pt-BR, agent-first IA) |
 | `src/admin-ui/components/ui/` | Design-system primitives (Button, Card, Field, Table, Modal, …) |
 | `src/admin-ui/components/layout/` | App shell: dark sidebar + nav config (`nav.ts` is the IA source of truth) |
@@ -16,27 +16,40 @@
 
 ### UI architecture (2026-06 redesign)
 
-The visual layer was rebuilt agent-first: `/agents` is the hub (cards), `/agents/new` is a 4-step wizard, and `/agents/[agentId]` concentrates configuration (overview / profile editor / version approval) per agent. All pages compose the primitives in `components/ui/` — no page hand-rolls form controls, tables, or modals. The tRPC routers were preserved as the data layer; the only router addition was the read-only `agents.getProfileVersions` (active + proposed profile bodies for the prefilled editor). Legacy `/setup/agents` redirects to `/agents`.
+The visual layer was rebuilt agent-first: `/agents` is the hub (cards), `/agents/new` is a 5-step wizard (função/arquétipo → identificação → personalidade → comportamento → revisão), and `/agents/[agentId]` concentrates configuration (overview / profile editor / version approval) per agent. All pages compose the primitives in `components/ui/` — no page hand-rolls form controls, tables, or modals. Legacy `/setup/agents` redirects to `/agents`.
+
+### Configuration journey (2026-07, PRs #491–#493)
+
+The "new agent → answers on a channel" journey closes entirely in the UI:
+
+- **Channels + roles CRUD** (`/setup/channels`) — previously seed/SQL-only; channel policies show per-channel readiness (`policy_ready` = policy exists AND its default role is active).
+- **Go-live checklist** on the agent overview: profile active → channel registered → role+policy ready, each linking to the screen that resolves it; disappears when complete.
+- **Single approval surface** for operational profiles: the agent's Versões tab (with diff). `/identities` is a read-only cross-agent view linking into it (`?tab=` deep-link); `/inbox` surfaces pending profiles via `agents.pendingProfileApprovals` (profiles do NOT flow through the Proposal Inbox engine — see `approveProfile` jsdoc).
+- **Progressive disclosure** in the shared profile form: princípios and limites cognitivos are collapsed "avançado" cards with always-visible summaries.
+- **Capabilities editing** on the agent overview: domain packs + hard denies via `agents.updateCapabilities` (owner/founder; atomic grant+audit via `agentToolGrantsRepo.updateWithAudit`; `mcp.*` packs preserved — managed in `/setup/mcp`). New-tool acquisition stays in the `capability_proposals` flow.
 
 ### tRPC routers
 
 | Router | What it serves |
 |---|---|
-| `agents` | Agent provisioning + listing |
+| `agents` | Agent provisioning, profile versions + approval, capabilities (view/edit), pending-profile aggregate |
 | `audit` | Audit log explorer |
 | `capabilities` | Capability proposals + approvals |
-| `channelPolicies` | Channel policy CRUD |
+| `channelPolicies` | Channels + roles creation, channel policy CRUD, channels overview (policy readiness) |
 | `drift` | Drift alert triage |
-| `inbox` | Operator inbox |
+| `inbox` | Operator inbox (unified proposal queue) |
 | `knowledge` | Knowledge state machine explorer |
 | `llmSettings` | LLM model + cost configuration |
+| `mcp` | MCP server registry + per-agent `mcp.*` pack grants |
+| `objectives` | Agent objectives + tasks (work loop) |
+| `playground` | Sandbox chat against the runtime (no side effects) |
 | `procedures` | Procedure definitions + executions |
-| `proposals` | Proposal aggregation across types |
+| `proposals` | Proposal detail + approve/reject (unified engine) |
 | `skills` | Skill catalog + lifecycle |
 | `tenants` | Tenant provisioning |
 | `tools-catalog` | Tool registry view |
 | `traces` | Runtime trace explorer |
-| `versions` | Identity version history |
+| `versions` | Identity version history + rollback |
 | `dashboard` | KPI summary |
 
 ## Patterns it follows
@@ -66,15 +79,16 @@ The admin-ui consumes the main app's DB schema + repositories directly (shared `
 
 ## In-flight changes
 
-At last verification (2026-05-28):
+At last verification (2026-07-09):
 
-- Skills mutations + editor in admin-ui Phase 3 (#213 — merged); related lifecycle / TOCTOU fixes follow-up
+- Fases 1–4 do relatório de complexidade de configuração mescladas (#491, #492, #493)
+- Próximos (specs em `docs/superpowers/specs/`): roteamento multi-agente no gateway (substituir o catch-all `primary/primary`, issue #411) e perfil operacional como source do Proposal Inbox (dual-approval)
 
-Verify: `gh pr list --state open --search "admin-ui OR skills"`.
+Verify: `gh pr list --state open --search "admin-ui"`.
 
 ---
 
 | | |
 |---|---|
-| Last verified | 2026-05-28 |
-| Against `main` HEAD | `c49c3855` |
+| Last verified | 2026-07-09 |
+| Against `main` HEAD | `2afe7aa` |

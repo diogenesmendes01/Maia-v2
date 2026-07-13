@@ -209,31 +209,41 @@ export const mcpRouter = router({
     }
 
     const pack = mcpPackId(server.name);
-    const updated = await runWithTenantContext(
+    const current = await runWithTenantContext(
       { tenant_id: tenantId, agent_id: agent.id },
-      async () => {
-        const current = await ctx.repos.agentToolGrantsRepo.findForCurrentAgent();
-        const packs = new Set(current?.granted_packs ?? [...BASE_AGENT_PACKS]);
-        if (input.granted) packs.add(pack);
-        else packs.delete(pack);
-        return ctx.repos.agentToolGrantsRepo.upsertForCurrentAgent({
-          granted_packs: [...packs],
-          granted_tools: current?.granted_tools ?? [],
-          denied_tools: current?.denied_tools ?? [],
-          granted_by: ctx.userId,
-          reason: `pack ${pack} ${input.granted ? 'concedido' : 'revogado'} via console MCP (issue #478)`,
-        });
-      },
+      async () => ctx.repos.agentToolGrantsRepo.findForCurrentAgent(),
     );
+    const packs = new Set(current?.granted_packs ?? [...BASE_AGENT_PACKS]);
+    if (input.granted) packs.add(pack);
+    else packs.delete(pack);
 
-    await ctx.repos.adminAuditLogRepo.append({
+    // Follow-up do PR #493: upsert + auditoria na MESMA transação via
+    // updateWithAudit ("audit every decision" — falha na auditoria reverte o
+    // grant). Antes o append de audit rodava fora da tx do upsert; o
+    // change_summary agora carrega before/after em vez de {pack, granted}
+    // (o pack alterado fica legível no reason e no diff previous→next).
+    const updated = await ctx.repos.agentToolGrantsRepo.updateWithAudit({
       tenant_id: tenantId,
-      actor_id: ctx.userId,
-      actor_role: ctx.userRole,
-      action: 'mcp_pack_grant_changed',
-      resource_type: 'agent_tool_grant',
-      resource_id: agent.id,
-      change_summary: { agent_id: agent.id, pack, granted: input.granted },
+      agent_id: agent.id,
+      grant: {
+        granted_packs: [...packs],
+        granted_tools: current?.granted_tools ?? [],
+        denied_tools: current?.denied_tools ?? [],
+        granted_by: ctx.userId,
+        reason: `pack ${pack} ${input.granted ? 'concedido' : 'revogado'} via console MCP (issue #478)`,
+      },
+      audit: {
+        actor_id: ctx.userId,
+        actor_role: ctx.userRole,
+        action: 'mcp_pack_grant_changed',
+        previous: current
+          ? {
+              granted_packs: current.granted_packs,
+              granted_tools: current.granted_tools,
+              denied_tools: current.denied_tools,
+            }
+          : null,
+      },
     });
     return { granted_packs: updated.granted_packs };
   }),

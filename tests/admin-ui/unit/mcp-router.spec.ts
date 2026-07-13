@@ -88,9 +88,44 @@ function makeCtx(
               }
             : opts.grant;
         },
-        async upsertForCurrentAgent(input: Record<string, unknown>) {
-          upserts.push(input);
-          return { granted_packs: input.granted_packs };
+        // Mirrors the real atomic helper (PR #493 follow-up): grant upsert +
+        // audit land together; the mock pushes both.
+        async updateWithAudit(args: {
+          tenant_id: string;
+          agent_id: string;
+          grant: {
+            granted_packs: string[];
+            granted_tools: string[];
+            denied_tools: string[];
+            granted_by: string;
+            reason: string;
+          };
+          audit: {
+            actor_id: string;
+            actor_role: string;
+            action: string;
+            previous: Record<string, unknown> | null;
+          };
+        }) {
+          upserts.push(args.grant as unknown as Record<string, unknown>);
+          audit.push({
+            tenant_id: args.tenant_id,
+            actor_id: args.audit.actor_id,
+            actor_role: args.audit.actor_role,
+            action: args.audit.action,
+            resource_type: 'agent_tool_grant',
+            resource_id: args.agent_id,
+            change_summary: {
+              previous: args.audit.previous,
+              next: {
+                granted_packs: args.grant.granted_packs,
+                granted_tools: args.grant.granted_tools,
+                denied_tools: args.grant.denied_tools,
+              },
+              reason: args.grant.reason,
+            },
+          });
+          return { granted_packs: args.grant.granted_packs };
         },
       },
     } as unknown as typeof import('@/db/repositories.js'),
@@ -191,10 +226,15 @@ describe('mcp.setAgentPack', () => {
       granted_tools: ['extra_tool'],
       denied_tools: ['blocked_tool'],
     });
-    expect(audit[0]).toMatchObject({
-      action: 'mcp_pack_grant_changed',
-      change_summary: { pack: 'mcp.erp', granted: true },
-    });
+    expect(audit[0]).toMatchObject({ action: 'mcp_pack_grant_changed' });
+    const summary = audit[0]!.change_summary as {
+      previous: { granted_packs: string[] };
+      next: { granted_packs: string[] };
+      reason: string;
+    };
+    expect(summary.next.granted_packs).toContain('mcp.erp');
+    expect(summary.previous.granted_packs).not.toContain('mcp.erp');
+    expect(summary.reason).toContain('mcp.erp');
   });
 
   it('revokes the pack', async () => {
