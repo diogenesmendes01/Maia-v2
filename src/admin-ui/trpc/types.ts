@@ -30,6 +30,7 @@ export const ProposalTypeSchema = z.enum([
   'skill',
   'capability_proposal',
   'knowledge_proposal',
+  'operational_profile',
 ]) satisfies z.ZodType<ProposalTypeId>;
 
 export const RiskLevelSchema = z.enum(['low', 'medium', 'high', 'critical']) satisfies z.ZodType<RiskLevelId>;
@@ -49,6 +50,8 @@ export const ApprovalClassSchema = z.enum([
   'knowledge_deprecated',
   'identity_drift_correction',
   'procedure_update',
+  'operational_profile_change',
+  'operational_profile_change_high',
 ]) satisfies z.ZodType<ApprovalClassId>;
 
 export const AdminUserRoleSchema = z.enum([

@@ -10,13 +10,14 @@ import {
 } from '@/admin-ui/lib/proposal-type-registry.js';
 
 describe('proposalTypeRegistry', () => {
-  it('covers all 5 proposal types', () => {
+  it('covers all 6 proposal types', () => {
     expect(Object.keys(proposalTypeRegistry)).toEqual([
       'policy_rule',
       'soul_bias',
       'skill',
       'capability_proposal',
       'knowledge_proposal',
+      'operational_profile',
     ]);
   });
 
@@ -45,5 +46,13 @@ describe('helpers', () => {
   it('isValidRiskFor rejects "critical" for skill (not in supported levels)', () => {
     expect(isValidRiskFor('skill', 'critical')).toBe(false);
     expect(isValidRiskFor('skill', 'high')).toBe(true);
+  });
+
+  // Spec perfil-inbox v4 §1.1 — entrada do perfil operacional.
+  it('operational_profile: diff exaustivo próprio + riscos low/medium/high', () => {
+    expect(getDiffComponent('operational_profile')).toBe('DiffOperationalProfile');
+    expect(getDisplayName('operational_profile')).toBe('Perfil operacional');
+    expect(isValidRiskFor('operational_profile', 'high')).toBe(true);
+    expect(isValidRiskFor('operational_profile', 'critical')).toBe(false);
   });
 });
