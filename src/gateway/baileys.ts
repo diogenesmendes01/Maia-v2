@@ -550,12 +550,12 @@ export type LineIngressCtx = {
 export async function ingressUpsertMessage(
   msg: proto.IWebMessageInfo,
   line?: LineIngressCtx,
-): Promise<void> {
+): Promise<'handled' | 'dropped' | 'skipped'> {
   const reactionStub = isReactionStub(msg);
-  if (!msg.message && !reactionStub) return;
+  if (!msg.message && !reactionStub) return 'skipped';
   try {
     const ctx = await resolveTenantCtxForUpsert(msg, line);
-    if (!ctx) return; // resolution failed → audit emitted + drop
+    if (!ctx) return 'dropped'; // resolution failed → audit emitted + drop/staging
     await runWithTenantContext(ctx.scope, () =>
       handleIncoming(msg, {
         channel_id: ctx.channel_id,
@@ -564,8 +564,10 @@ export async function ingressUpsertMessage(
         read: line?.markRead,
       }),
     );
+    return 'handled';
   } catch (err) {
     logger.error({ err }, 'baileys.handle_failed');
+    return 'dropped';
   }
 }
 
@@ -653,6 +655,24 @@ async function resolveTenantCtxForUpsert(
         ? (typed.details as { resolver_path?: string }).resolver_path
         : undefined;
     const isLidUnmapped = isResolutionFailure && resolverPath === 'lid_unmapped';
+    // §1.4 (spec roteamento v4) — modo strict: um miss pela LINHA não é
+    // descartado, é ESTAGIADO cifrado (envelope AES-GCM + job de replay com
+    // jobId estável). Só quando a linha é conhecida (strict_line_miss) — sem
+    // linha não há chave de staging. O audit de falha abaixo ainda roda
+    // (trilha completa: falhou a rota E foi estagiado).
+    let staged = false;
+    if (
+      isResolutionFailure &&
+      resolverPath === 'strict_line_miss' &&
+      msg.key?.id &&
+      (line ? line.botLineE164 : currentLineE164)
+    ) {
+      const { stageUnroutedInbound } = await import('./unrouted-staging.js');
+      staged = await stageUnroutedInbound(
+        msg,
+        (line ? line.botLineE164 : currentLineE164)!,
+      );
+    }
     await audit({
       acao: isLidUnmapped
         ? 'channel_resolution_skipped_lid_unmapped'
@@ -677,6 +697,8 @@ async function resolveTenantCtxForUpsert(
         // distinguish gateway-entry failures from worker-level ones
         // (agent/core.ts emits the same action name).
         emitter: 'baileys_ingress',
+        // §1.4: true quando o strict estagiou o inbound em vez de perdê-lo.
+        staged,
       },
     });
     logger.warn(
