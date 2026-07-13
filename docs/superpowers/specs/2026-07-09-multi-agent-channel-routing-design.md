@@ -1,111 +1,109 @@
 # Multi-Agent Channel Routing — Design Spec
 
-**Date:** 2026-07-09 (revisado 2026-07-13)
-**Status:** Draft v2 — incorpora o review de design de 2026-07-13 (2 bloqueantes + 2 altos). Mudanças vs. v1: §1.5 gerenciador multi-sessão + outbound por linha (bloqueante 1), §2 ownership verificado no pareamento + unicidade global parcial (bloqueante 2), modo tri-state `shadow | exact_first | strict` (alto 1), staging durável de inbound como pré-condição do strict (alto 2).
-**Scope:** Substituir o catch-all `primary/primary` do resolver de canal (issue #411) por resolução exata pela **linha do bot**, E habilitar operação real com múltiplas linhas (gerenciador multi-sessão + outbound pela linha correta), permitindo que agentes não-primary criados pela UI recebam e respondam tráfego real de WhatsApp.
+**Date:** 2026-07-09 (v2: 2026-07-13 · v3: 2026-07-13)
+**Status:** Draft v3 — incorpora a 2ª rodada do review de design. Mudanças vs. v2: §1.6 fronteira única de saída + `channel_id` obrigatório em toda API de envio + backfill fail-closed (bloqueante), §2.5 sessão de pareamento dedicada (alta — circularidade), §1.4 staging com cifragem explícita AES-GCM + idempotência pré-resolução (2 altas), §1.5 auth dir por UUID do canal + validação E.164 (alta — path traversal).
+**Scope:** Substituir o catch-all `primary/primary` do resolver de canal (issue #411) por resolução exata pela **linha do bot**, E habilitar operação real com múltiplas linhas (gerenciador multi-sessão, fronteira única de saída, outbound pela linha correta).
 
 **Referências:**
-- `src/gateway/channel-resolver.ts` — política de resolução atual (exact match → catch-all single-tenant → fail-loud) e os fixes #268 (fail-loud), #411 (catch-all) e #417 (discriminador global + TOCTOU).
-- `src/gateway/baileys.ts` — socket ÚNICO global, `BAILEYS_AUTH_DIR` único, outbound via socket global, e o catch da falha de resolução que audita e DESCARTA o inbound (review v2: linhas ~33/~208/~494/~849).
-- `src/db/repositories/channel-repos.ts` — `findByExternalCrossTenant` (retorna ambiguidade cross-tenant como erro em runtime) e `findPrimaryCatchAllChannel`.
-- `migrations/031_p6_channels.sql` — UNIQUE atual é `(tenant_id, channel_type, external_id)` — **por tenant**, não global.
-- `docs/architecture/concerns/tenant-isolation.md`; PR #491 (CRUD de canais na UI).
+- `src/gateway/channel-resolver.ts` — resolução atual e fixes #268/#411/#417.
+- `src/gateway/baileys.ts` — socket único global, catch que descarta inbound não-resolvido (~494), dedup PÓS-resolução (~600).
+- `src/agent/output-dispatch.ts` (~695) e `src/gateway/presence.ts` (~26) — **envios que NÃO passam pelo outbox hoje** (resposta principal, documentos, voz, polls, reactions, typing, read receipts). Base do bloqueante v3.
+- `src/lib/redis.ts` — cliente abre `REDIS_URL` sem cifragem de payload (base da alta v3 sobre o staging).
+- `src/admin-ui/trpc/routers/channelPolicies.ts` — `external_id` aceita string livre ≤200 chars (base da alta v3 de path traversal).
+- `migrations/031_p6_channels.sql`; `docs/architecture/concerns/tenant-isolation.md`; PR #491.
 
-**Architecture Locks tocados:** nenhum diretamente, mas o caminho é o **entry point de tenant-resolution** — toda mudança exige `npm run test:leak` verde e revisão adversarial (histórico: um fix CRITICAL e um HIGH no PR #417).
+**Architecture Locks tocados:** nenhum diretamente; entry point de tenant-resolution — `npm run test:leak` obrigatório em todo PR da série.
 
-**Depends on:** #491 (UI de canais — mesclado). **Blocks:** operação multi-agente e multi-tenant real por WhatsApp.
+**Depends on:** #491 (mesclado). **Blocks:** operação multi-agente/multi-tenant real por WhatsApp.
 
 ---
 
 ## §0. Purpose
 
-O problema em uma frase: **um canal WhatsApp representa a LINHA DO BOT, mas o gateway passa o telefone do REMETENTE como `external_id`** — o exact match nunca casa e todo inbound cai no catch-all `primary/primary` (#411). E, como o review v1→v2 apontou, corrigir só o lookup não basta: **o runtime é mono-linha por construção** (um socket, um auth dir, outbound global), então "multi-agente = múltiplas linhas" exige também o plano de operação multi-sessão.
+(V1→v2 recap.) O lookup usa a identidade errada (telefone do remetente em vez da linha do bot) e o runtime é mono-linha por construção. A v2 adicionou o gerenciador multi-sessão; a v3 fecha os furos operacionais apontados na 2ª rodada: **a saída não tem fronteira única hoje**, o pareamento era circular, o staging alegava cifragem inexistente e sem idempotência, e o auth dir por número permitia path traversal.
 
-Este spec entrega as duas metades:
-
-1. **Resolução** — o `external_id` do lookup passa a ser a linha em que a mensagem chegou (§1.1–1.4).
-2. **Operação** — um gerenciador de sessões torna possível manter N linhas conectadas e responder cada conversa pela linha correta (§1.5).
-
-Não-objetivo (mantido da v1): rotear múltiplos agentes numa MESMA linha — isso é seleção de papel (`channel_policies`/role selector) DEPOIS do triplete resolvido.
+Não-objetivo (mantido): rotear múltiplos agentes numa MESMA linha (isso é role selection pós-triplete).
 
 ## §1. Design
 
 ### §1.1 Contrato do inbound
 
-`baileys.ts` / `agent/core.ts` — o inbound passa a carregar dois identificadores distintos:
-- `bot_line_external_id`: número E.164 da linha conectada (derivado de `sock.user.id` DA SESSÃO que recebeu o evento, normalizado pelo caminho do PR #489). Argumento de `resolveChannel`.
-- `sender_external_id`: telefone do remetente — continua alimentando identidade/pessoa; deixa de ser usado para resolução de canal.
+(Inalterado da v2.) `bot_line_external_id` (da SESSÃO que recebeu, normalizado via caminho do #489) para resolução; `sender_external_id` para identidade/pessoa.
 
-### §1.2 Modos de resolução (tri-state — review v2, alto 1)
+### §1.2 Modos de resolução (tri-state)
 
-`MAIA_CHANNEL_ROUTING_MODE = 'shadow' | 'exact_first' | 'strict'` (default `shadow`). Um único enum — a v1 usava uma flag booleana que não distinguia shadow de exact-first (as fases 1 e 2 tinham a MESMA configuração, logo shadow não garantia "zero mudança de comportamento").
-
-- **`shadow`**: a resolução EFETIVA é o caminho legado atual (exact match que nunca casa → catch-all). Em paralelo, o resolver COMPUTA o exact match pela linha e loga `channel_resolver.shadow_divergence` quando o resultado difere do efetivo. Zero mudança de comportamento, por construção.
-- **`exact_first`**: exact match pela linha é o caminho primário; miss cai no catch-all legado (com o discriminador global do #417 intacto). Linhas registradas roteiam certo; o resto se comporta como hoje.
-- **`strict`**: miss ⇒ inbound vai para o staging durável (§1.4) e a resolução falha tipada. Catch-all desligado.
+(Inalterado da v2.) `MAIA_CHANNEL_ROUTING_MODE = 'shadow' | 'exact_first' | 'strict'` (default `shadow`); shadow computa exact em paralelo e só loga `shadow_divergence`.
 
 ### §1.3 Ambiguidade
 
-2+ canais ativos cross-tenant para a mesma linha continuam `throw` — mas com a unicidade global do §2 isso se torna estado impossível de CRIAR, restando apenas como defesa contra dados legados.
+(Inalterado da v2.) `throw` mantido como defesa; com a unicidade global (§2) vira estado impossível de criar.
 
-### §1.4 Destino do miss em strict (review v2, alto 2)
+### §1.4 Staging de inbound não-roteado (strict) — cifragem e idempotência (review v3, 2 altas)
 
-Estado atual documentado: a resolução acontece ANTES de qualquer persistência; `baileys.ts` captura a falha, audita `channel_resolution_failed` e **descarta o inbound** — não há DLQ nesse ponto (o retry/DLQ do BullMQ só existe depois que a mensagem entra na fila, o que requer o triplete). Um strict mal configurado perderia mensagens de forma irrecuperável.
+Estado atual: resolução acontece antes de qualquer persistência; miss em strict perderia a mensagem; o dedup existente só roda DEPOIS do tenant resolvido (`baileys.ts` ~600), então retries do evento Baileys/worker duplicariam.
 
-Decisão: **strict só liga depois do staging durável de inbound**. Novo passo no `baileys.ts`: o envelope bruto (linha, remetente, payload, timestamps) é gravado numa fila BullMQ `inbound:unrouted` ANTES do throw quando a resolução falha em strict. Worker `unrouted-inbound-drain` re-tenta a resolução (ex.: o operador acabou de registrar/parear a linha) com backoff; esgotado ⇒ DLQ padrão com alerta. Trade-off aceito: o staging guarda payload de mensagem fora do escopo de um tenant resolvido — o registro é cifrado em repouso pelo mesmo mecanismo do Redis atual e tem TTL curto (72h), documentado em `governance-observability`.
+- **Armazenamento**: tabela Postgres `inbound_unrouted` (não payload no Redis): `id uuid`, `line_external_id`, `whatsapp_message_id`, `ciphertext BYTEA`, `enc_key_id`, `received_at`, `expires_at` (TTL 72h, sweeper). O job BullMQ carrega SÓ o id da row.
+- **Cifragem EXPLÍCITA** (a v2 alegava "mesmo mecanismo do Redis", que não existe — `redis.ts` não cifra nada): envelope cifrado em aplicação com **AES-256-GCM**, chave em `MAIA_STAGING_ENC_KEY` (32 bytes, base64), `enc_key_id` gravado por registro; rotação = nova env + suporte de decrypt à chave anterior por 1 release. Sem a env configurada, strict recusa ligar (fail-closed).
+- **Idempotência pré-resolução**:
+  - UNIQUE `(line_external_id, whatsapp_message_id)` na tabela; insert `ON CONFLICT DO NOTHING` — retries do evento Baileys não duplicam o staging.
+  - jobId BullMQ estável: `unrouted:<line>:<whatsapp_message_id>` — retries do enqueue não duplicam o job.
+  - **Handoff idempotente**: quando a linha é registrada e o worker re-resolve, a entrega na pipeline normal usa a MESMA chave de dedup que o caminho vivo usa pós-resolução (contrato documentado no código do dedup atual) — se o caminho vivo e o replay correrem, um dos dois é descartado pelo dedup normal, nunca entrega dupla.
+- Exceção consciente (payload fora de tenant resolvido) documentada em `governance-observability` com TTL + cifragem + acesso restrito ao worker.
 
-Nos modos `shadow`/`exact_first` nada muda: o catch-all absorve o miss como hoje.
+### §1.5 Gerenciador multi-sessão (review v3: auth dir por UUID + E.164)
 
-### §1.5 Gerenciador multi-sessão e outbound por linha (review v2, bloqueante 1)
+- **`LineSessionManager`**: mapa `channel_id → BaileysSession` (sessões de ROTEAMENTO sobem só para canais ativos+verificados; pareamento em §2.5). Recovery per-sessão; isolamento de falha; métricas por linha.
+- **Auth dir por UUID do canal, nunca pelo número**: `BAILEYS_AUTH_DIR/lines/<channel_id-uuid>/`. A v2 propunha `<line_external_id>` no path — com `external_id` aceitando string livre (`channelPolicies.ts`), um valor como `../x` escaparia da raiz. UUID é gerado pelo DB (não-atacável); defesa em profundidade: o manager ainda valida `path.resolve` dentro da raiz.
+- **Validação E.164 na borda e no repo**: para `channel_type='whatsapp'`, `external_id` DEVE ser E.164 normalizado (`^\+?[1-9][0-9]{6,14}$` + normalização canônica sem `+`), validado no Zod do tRPC E no `channelsRepo.create*` (defesa dupla — a UI não é trust boundary). Migração de dados: rows whatsapp existentes fora do formato são reportadas por query de auditoria (runbook decide corrigir/desativar).
+- **Topologia**: in-process v1; corte limpo para processo-por-linha (inalterado da v2).
 
-O runtime hoje: UM socket Baileys global, UM `BAILEYS_AUTH_DIR`, outbound global. Para operar N linhas:
+### §1.6 Fronteira ÚNICA de saída + `channel_id` obrigatório (review v3, bloqueante)
 
-- **`LineSessionManager`** (`src/gateway/line-session-manager.ts`): mapa `line_external_id → BaileysSession`, onde cada sessão encapsula socket + auth state + reconexão/recovery (o `recovery.ts` atual vira per-sessão). Auth state por linha em `BAILEYS_AUTH_DIR/<line_external_id>/` (a migração move o diretório atual para o subdiretório da linha primária no primeiro boot — reversível).
-- **Origem das sessões**: o manager sobe uma sessão para cada canal `whatsapp` ATIVO e VERIFICADO (§2). Pareamento de linha nova acontece pela superfície `/setup` atual, parametrizada por linha (a tela lista linhas registradas e o estado de cada sessão: unpaired/pairing/connected/recovering).
-- **Inbound**: cada sessão injeta `bot_line_external_id` próprio (§1.1) — nenhuma afinidade extra é necessária na entrada.
-- **Outbound pela linha correta**: o outbox já é a fronteira transacional de saída; a linha é derivável do canal da conversa (triplete resolvido na entrada carrega `channel_id`). Mudança: o registro de outbox passa a carregar `channel_id` (migração append-only; backfill = canal primário), e o drain worker resolve `channel_id → line → sessão` no manager. Sessão da linha indisponível ⇒ o job espera/retry (semântica atual de outbox), NUNCA sai por outra linha (fail-closed: responder pela linha errada vaza contexto entre linhas).
-- **Isolamento de falha**: queda de uma sessão não derruba as outras; métricas e alertas por linha (`gateway.line.<line>.state`).
-- **Topologia**: v1 do manager é in-process (single node, N sockets). Processo-por-linha fica explicitamente como evolução se o número de linhas ou o isolamento operacional exigirem — a interface do manager (resolver sessão por linha) é o ponto de corte para essa mudança não vazar para o resto do código.
+A v2 assumia "o outbox já é a fronteira transacional de saída" — **falso hoje**: a resposta principal chama Baileys direto (`output-dispatch.ts` ~695) e documentos/voz/polls/reactions/typing/read-receipts também escapam (`presence.ts` ~26). Adicionar `channel_id` só no outbox permitiria resposta pela sessão errada por qualquer um desses caminhos. Design v3:
 
-## §2. Ownership da linha: declarado vs. verificado (review v2, bloqueante 2)
+- **API única de envio**: `LineSessionManager.forChannel(channel_id): LineOutput` é o ÚNICO objeto com métodos de envio (`sendText`, `sendMedia`, `sendPoll`, `sendReaction`, `setPresence`, `sendReadReceipt`, …). `channel_id` é obrigatório **na assinatura** — não existe método de envio sem canal (imposição em compile-time). O socket Baileys deixa de ser exportado; acesso direto a `sock.*` fora do manager vira erro de lint (regra `no-restricted-imports`/`no-restricted-properties` no CI) — o grep de migração enumera e converte TODOS os call sites atuais (output-dispatch, presence, mídia, voz, polls, reactions, receipts, setup/pairing).
+- **Durável vs. efêmero**: envios de CONTEÚDO (texto, mídia, voz, docs, polls) continuam passando pelo outbox (transacional, retry) — o registro de outbox ganha `channel_id NOT NULL` para rows novas e o drain resolve `channel_id → sessão` via manager. Sinais EFÊMEROS (typing, read receipt, reaction?) não precisam de durabilidade e vão direto pela `LineOutput` da sessão do canal — reactions são promovidas a durável se a auditoria exigir (decisão na implementação, default: efêmero).
+- **`conversas.channel_id`**: migração append-only adiciona `channel_id` a `conversas` (NULL para legado), preenchido na resolução do inbound. Toda resposta a uma conversa deriva o canal DELA; mensagens proativas (sem conversa) exigem `channel_id` explícito do chamador (scheduling/objectives passam a carregar o canal).
+- **Backfill fail-closed** (a v2 dizia "backfill = canal primário" — inseguro para proativas/sem conversa): a migração deriva `channel_id` apenas quando é UNÍVOCO (o agente tem exatamente 1 canal ativo do tipo). Caso contrário a row fica `channel_id NULL` + `status='blocked_channel_unresolved'`, listada em runbook/admin para resolução manual. **Nunca escolher silenciosamente.** O drain não envia row bloqueada.
 
-Dois buracos na v1: (a) o UNIQUE de canais é POR TENANT — dois tenants podiam manter a mesma linha ativa, e a ambiguidade só aparecia em runtime derrubando tráfego; (b) a UI do #491 permite declarar qualquer número sem prova de controle.
+## §2. Ownership da linha: declarado vs. verificado
 
-Modelo novo — **canal declarado ≠ canal verificado**:
+### §2.1–2.4 (inalterados da v2)
 
-1. **Criar canal pela UI** (`createChannel`) registra a linha como **declarada**: `active=false`, `metadata.verification='declared'`. Canal declarado não roteia nem sobe sessão.
-2. **Pareamento verifica ownership**: ao conectar a sessão da linha (QR/código na superfície `/setup` da linha), o gateway compara o número REAL do `sock.user.id` com o `external_id` declarado; casou ⇒ `active=true`, `metadata.verification='paired'` (+ timestamp e auditoria). É a prova de posse: só quem controla o aparelho/linha completa o pareamento.
-3. **Unicidade GLOBAL de linha ativa** — migração append-only:
-   `CREATE UNIQUE INDEX channels_active_line_uq ON channels(channel_type, external_id) WHERE active;`
-   Dois tenants não conseguem mais ATIVAR a mesma linha — o conflito vira 23505 no momento da verificação (mapeado para erro de pareamento "linha já pertence a outro workspace"), não um drop de tráfego em runtime. Pré-migração: query de auditoria detecta duplicatas ativas existentes; runbook decide qual desativar ANTES de aplicar o índice (a migração falha se houver duplicata — fail-closed, não escolhe sozinha).
-4. `findByExternalCrossTenant` mantém a defesa de ambiguidade como invariante de runtime (dados legados/anômalos), mas com o índice ela se torna inatingível por escrita nova.
+Canal da UI nasce `active=false` (`verification='declared'`); pareamento compara `sock.user.id` com o declarado e ativa (`verification='paired'`, auditado); índice único parcial GLOBAL `channels_active_line_uq ON channels(channel_type, external_id) WHERE active` (migração falha se houver duplicata ativa — runbook antes); defesa de ambiguidade em runtime mantida.
 
-Impacto no #491 (já mesclado): `createChannel` passa a criar `active=false` para `channel_type='whatsapp'`; o badge da tela de canais ganha o estado "aguardando pareamento". Tipos não-WhatsApp (sem sessão) mantêm o comportamento atual até terem verificação própria.
+### §2.5 Sessão de pareamento dedicada (review v3, alta — quebra a circularidade)
+
+A v2 era circular: o manager só sobe sessão para canal ativo+verificado, mas o canal só ativa depois de pareado — e parear exige sessão. Design:
+
+- **`PairingSession(channel_id)`**: tipo de sessão distinto, iniciado SOB DEMANDA pela superfície `/setup` para um canal **declarado** (inativo). Auth dir isolado `BAILEYS_AUTH_DIR/pairing/<channel_id-uuid>/`, TTL curto (15 min sem conclusão ⇒ encerra e limpa).
+- Ao conectar: compara o número real com o declarado — casou ⇒ ativa o canal (23505 do índice global ⇒ erro "linha pertence a outro workspace"), **promove o auth state** para `lines/<channel_id>/` (rename atômico) e o manager sobe a sessão de ROTEAMENTO; não casou ⇒ recusa com o número real na mensagem, auth de pairing descartado.
+- Sessões de pareamento **nunca roteiam**: inbound recebido durante o pareamento é ignorado com audit (`pairing_session_inbound_dropped`).
 
 ## §3. Invariantes (stop conditions)
 
-1. **Zero regressão do #268/#417**: discriminador global multi-tenant e fail-loud permanecem; `npm run test:leak` é gate obrigatório em todo PR da série.
-2. **Fail-closed**: linha desconhecida em `strict` ⇒ staging + falha tipada, nunca fallback; outbound NUNCA sai por linha diferente da do canal da conversa.
-3. **Ownership verificado**: nenhum canal WhatsApp roteia sem pareamento confirmado; unicidade global de linha ativa garantida no DB, não em runtime.
-4. **Auditoria**: `shadow_divergence`, `legacy_catch_all` (em exact_first), verificação de pareamento e cada transição de estado de sessão são logados/auditados.
+1. Zero regressão #268/#417; `test:leak` obrigatório.
+2. Fail-closed: miss em strict ⇒ staging + falha tipada; **nenhum envio sem `channel_id`** (compile-time + lint); outbound nunca sai por linha diferente da do canal; backfill nunca escolhe canal sozinho.
+3. Ownership verificado por pareamento; unicidade global no DB.
+4. Auditoria: divergências de shadow, catch-all em exact_first, pareamento (sucesso/recusa/drop de inbound), transições de sessão, rows bloqueadas de backfill.
 
 ## §4. Rollout
 
-0. **Multi-sessão atrás de flag** (`MAIA_MULTI_LINE=false` default): manager entra no código com a linha primária como única sessão — paridade comportamental total; migrações de outbox (`channel_id`) e do índice global aplicadas (com runbook de duplicatas antes).
-1. **`shadow`** (default): coleta `shadow_divergence` por ≥1 semana; zero mudança de comportamento por construção (§1.2).
-2. **`exact_first`**: linhas verificadas roteiam exato; catch-all cobre o resto. `MAIA_MULTI_LINE=true` habilita parear linhas adicionais.
-3. **`strict`**: pré-condições: staging `inbound:unrouted` operante + 7 dias sem `legacy_catch_all`. Catch-all e canal `default-channel` desativados.
+0. **Fronteira de saída** (pré-requisito novo, antes de qualquer multi-linha): `LineOutput` + migração de TODOS os call sites + lint gate + `conversas.channel_id` + `outbox.channel_id` com backfill fail-closed. Comportamento idêntico (uma linha só).
+1. **Multi-sessão atrás de flag** (`MAIA_MULTI_LINE=false`): manager com a linha primária; migrações de índice global (runbook de duplicatas antes) + E.164.
+2. **`shadow`** (default): ≥1 semana de `shadow_divergence`.
+3. **`exact_first`** + `MAIA_MULTI_LINE=true`: pareamento de linhas novas via PairingSession.
+4. **`strict`**: pré-condições: staging `inbound_unrouted` operante (com `MAIA_STAGING_ENC_KEY` configurada) + 7 dias sem `legacy_catch_all`.
 
 ## §5. Testes
 
-- Unit: resolver nos 3 modos; divergência de shadow; ambiguidade; normalização da linha (`@lid`).
-- Integração: pareamento verifica ownership (número real ≠ declarado ⇒ recusa); índice global rejeita segunda ativação cross-tenant (23505 → erro tipado); outbox drena pela sessão da linha do canal; leak suite.
-- Integração (staging): miss em strict grava `inbound:unrouted`; drain re-resolve após registro da linha.
-- E2E gateway: dois eventos sintéticos em linhas distintas → agentes distintos, respostas pelas linhas de origem.
+- Unit: resolver nos 3 modos; normalização/validação E.164 (incluindo tentativas de traversal rejeitadas na borda E no repo); `LineOutput` recusa uso sem canal (tipo); classificação durável/efêmero.
+- Integração: pareamento (match/mismatch/duplicata global/TTL/drop de inbound com audit); promoção de auth state; outbox drena pela sessão do canal e BLOQUEIA row sem canal; staging (dedup por UNIQUE, jobId estável, handoff idempotente contra corrida com o caminho vivo, decrypt com rotação de chave); leak suite.
+- E2E gateway: duas linhas → dois agentes, respostas e presence pela linha de origem.
 
 ## §6. Riscos e alternativas descartadas
 
-- **Risco:** N sockets num processo (memória/CPU por sessão Baileys) — mitigado pelo corte limpo do manager (§1.5 topologia) que permite migrar para processo-por-linha sem tocar resolução/outbox.
-- **Risco:** staging de inbound não-resolvido guarda payload fora de tenant — TTL 72h + cifragem + acesso restrito ao worker; documentado como exceção consciente em `governance-observability`.
-- **Descartado — rotear pelo remetente** e **agent-selector no inbound** (v1, mantidos): cardinalidade explosiva / custo LLM no hot path e não resolvem isolamento.
-- **Descartado — upsert de canal automático no pareamento sem declaração prévia**: manteria a UI fora do loop e criaria canais "fantasma" sem intenção do operador; o modelo declarado→verificado mantém a intenção (UI) e a prova (pareamento) separadas e auditáveis.
+- **Risco:** migração de call sites de envio é ampla (dispatch, presence, mídia, voz, polls, reactions, receipts) — mitigada por ser mecânica, com lint gate impedindo regressão e fase 0 dedicada sem mudança de comportamento.
+- **Risco:** N sockets in-process — corte limpo para processo-por-linha (inalterado).
+- **Descartados (mantidos):** rotear pelo remetente; agent-selector no inbound; upsert automático de canal no pareamento sem declaração prévia.
+- **Descartado (v3) — payload do staging no Redis:** sem cifragem nativa e com TTL/observabilidade piores que uma tabela dedicada; Redis guarda só o job, Postgres guarda o envelope cifrado.
