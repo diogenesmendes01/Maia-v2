@@ -487,36 +487,39 @@ function makeRepos(
           null
         );
       },
-      // Mirrors the real atomic helper: upsert + audit land together.
+      // Mirrors the real atomic helper (PR #494 review): the CURRENT row is
+      // read inside the "tx" and handed to the caller's pure compute; a
+      // reject aborts with nothing written.
       async updateWithAudit(args: {
         tenant_id: string;
         agent_id: string;
-        grant: {
-          granted_packs: string[];
-          granted_tools: string[];
-          denied_tools: string[];
-          granted_by: string;
-          reason: string;
-        };
-        audit: {
-          actor_id: string;
-          actor_role: string;
-          action: string;
-          previous: Record<string, unknown> | null;
-        };
+        compute: (current: GrantRow | null) =>
+          | {
+              ok: true;
+              granted_packs: string[];
+              granted_tools: string[];
+              denied_tools: string[];
+            }
+          | { ok: false; reject: unknown };
+        granted_by: string;
+        reason: string;
+        audit: { actor_id: string; actor_role: string; action: string };
       }) {
         const idx = grants.findIndex(
           (g) => g.tenant_id === args.tenant_id && g.agent_id === args.agent_id,
         );
+        const current = idx >= 0 ? grants[idx]! : null;
+        const next = args.compute(current);
+        if (!next.ok) return next;
         const row: GrantRow = {
-          id: idx >= 0 ? grants[idx]!.id : `grant-${grants.length + 1}`,
+          id: current ? current.id : `grant-${grants.length + 1}`,
           tenant_id: args.tenant_id,
           agent_id: args.agent_id,
-          granted_packs: args.grant.granted_packs,
-          granted_tools: args.grant.granted_tools,
-          denied_tools: args.grant.denied_tools,
-          granted_by: args.grant.granted_by,
-          reason: args.grant.reason,
+          granted_packs: next.granted_packs,
+          granted_tools: next.granted_tools,
+          denied_tools: next.denied_tools,
+          granted_by: args.granted_by,
+          reason: args.reason,
         };
         if (idx >= 0) grants[idx] = row;
         else grants.push(row);
@@ -528,16 +531,22 @@ function makeRepos(
           resource_type: 'agent_tool_grant',
           resource_id: args.agent_id,
           change_summary: {
-            previous: args.audit.previous,
+            previous: current
+              ? {
+                  granted_packs: current.granted_packs,
+                  granted_tools: current.granted_tools,
+                  denied_tools: current.denied_tools,
+                }
+              : null,
             next: {
-              granted_packs: args.grant.granted_packs,
-              granted_tools: args.grant.granted_tools,
-              denied_tools: args.grant.denied_tools,
+              granted_packs: next.granted_packs,
+              granted_tools: next.granted_tools,
+              denied_tools: next.denied_tools,
             },
-            reason: args.grant.reason,
+            reason: args.reason,
           },
         });
-        return row;
+        return { ok: true as const, grant: row };
       },
     },
     adminAuditLogRepo: {

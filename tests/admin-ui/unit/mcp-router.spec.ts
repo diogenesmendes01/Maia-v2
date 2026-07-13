@@ -88,26 +88,35 @@ function makeCtx(
               }
             : opts.grant;
         },
-        // Mirrors the real atomic helper (PR #493 follow-up): grant upsert +
-        // audit land together; the mock pushes both.
+        // Mirrors the real atomic helper (PR #493 follow-up + PR #494 review):
+        // the CURRENT row is read inside the "tx" and handed to the caller's
+        // pure compute; upsert + audit land together.
         async updateWithAudit(args: {
           tenant_id: string;
           agent_id: string;
-          grant: {
-            granted_packs: string[];
-            granted_tools: string[];
-            denied_tools: string[];
-            granted_by: string;
-            reason: string;
-          };
-          audit: {
-            actor_id: string;
-            actor_role: string;
-            action: string;
-            previous: Record<string, unknown> | null;
-          };
+          compute: (current: Record<string, unknown> | null) =>
+            | {
+                ok: true;
+                granted_packs: string[];
+                granted_tools: string[];
+                denied_tools: string[];
+              }
+            | { ok: false; reject: unknown };
+          granted_by: string;
+          reason: string;
+          audit: { actor_id: string; actor_role: string; action: string };
         }) {
-          upserts.push(args.grant as unknown as Record<string, unknown>);
+          const current =
+            opts?.grant === undefined
+              ? {
+                  granted_packs: ['baseline.core', 'domain.calendar'],
+                  granted_tools: ['extra_tool'],
+                  denied_tools: ['blocked_tool'],
+                }
+              : opts.grant;
+          const next = args.compute(current as Record<string, unknown> | null);
+          if (!next.ok) return next;
+          upserts.push(next as unknown as Record<string, unknown>);
           audit.push({
             tenant_id: args.tenant_id,
             actor_id: args.audit.actor_id,
@@ -116,16 +125,16 @@ function makeCtx(
             resource_type: 'agent_tool_grant',
             resource_id: args.agent_id,
             change_summary: {
-              previous: args.audit.previous,
+              previous: current,
               next: {
-                granted_packs: args.grant.granted_packs,
-                granted_tools: args.grant.granted_tools,
-                denied_tools: args.grant.denied_tools,
+                granted_packs: next.granted_packs,
+                granted_tools: next.granted_tools,
+                denied_tools: next.denied_tools,
               },
-              reason: args.grant.reason,
+              reason: args.reason,
             },
           });
-          return { granted_packs: args.grant.granted_packs };
+          return { ok: true as const, grant: { granted_packs: next.granted_packs } };
         },
       },
     } as unknown as typeof import('@/db/repositories.js'),

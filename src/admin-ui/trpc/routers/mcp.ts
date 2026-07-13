@@ -209,43 +209,42 @@ export const mcpRouter = router({
     }
 
     const pack = mcpPackId(server.name);
-    const current = await runWithTenantContext(
-      { tenant_id: tenantId, agent_id: agent.id },
-      async () => ctx.repos.agentToolGrantsRepo.findForCurrentAgent(),
-    );
-    const packs = new Set(current?.granted_packs ?? [...BASE_AGENT_PACKS]);
-    if (input.granted) packs.add(pack);
-    else packs.delete(pack);
 
-    // Follow-up do PR #493: upsert + auditoria na MESMA transação via
-    // updateWithAudit ("audit every decision" — falha na auditoria reverte o
-    // grant). Antes o append de audit rodava fora da tx do upsert; o
-    // change_summary agora carrega before/after em vez de {pack, granted}
-    // (o pack alterado fica legível no reason e no diff previous→next).
-    const updated = await ctx.repos.agentToolGrantsRepo.updateWithAudit({
+    // Follow-up do PR #493 + review do PR #494 [medium]: o read-modify-write
+    // inteiro roda DENTRO da transação do helper (SELECT ... FOR UPDATE) —
+    // dois writers concorrentes (outro toggle MCP, save da tela de
+    // capacidades) são serializados em vez de o último sobrescrever o array
+    // do outro; o `previous` da auditoria é o valor realmente substituído.
+    const result = await ctx.repos.agentToolGrantsRepo.updateWithAudit({
       tenant_id: tenantId,
       agent_id: agent.id,
-      grant: {
-        granted_packs: [...packs],
-        granted_tools: current?.granted_tools ?? [],
-        denied_tools: current?.denied_tools ?? [],
-        granted_by: ctx.userId,
-        reason: `pack ${pack} ${input.granted ? 'concedido' : 'revogado'} via console MCP (issue #478)`,
+      compute: (current) => {
+        const packs = new Set(current?.granted_packs ?? [...BASE_AGENT_PACKS]);
+        if (input.granted) packs.add(pack);
+        else packs.delete(pack);
+        return {
+          ok: true,
+          granted_packs: [...packs],
+          granted_tools: current?.granted_tools ?? [],
+          denied_tools: current?.denied_tools ?? [],
+        };
       },
+      granted_by: ctx.userId,
+      reason: `pack ${pack} ${input.granted ? 'concedido' : 'revogado'} via console MCP (issue #478)`,
       audit: {
         actor_id: ctx.userId,
         actor_role: ctx.userRole,
         action: 'mcp_pack_grant_changed',
-        previous: current
-          ? {
-              granted_packs: current.granted_packs,
-              granted_tools: current.granted_tools,
-              denied_tools: current.denied_tools,
-            }
-          : null,
       },
     });
-    return { granted_packs: updated.granted_packs };
+    if (!result.ok) {
+      // compute acima nunca rejeita — exhaustividade defensiva.
+      throw new TRPCError({
+        code: 'INTERNAL_SERVER_ERROR',
+        message: 'setAgentPack compute rejected unexpectedly',
+      });
+    }
+    return { granted_packs: result.grant.granted_packs };
   }),
 
   /** Agentes do tenant com o estado do pack deste server (para a tela). */

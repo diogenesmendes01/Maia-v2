@@ -483,63 +483,66 @@ export const agentsRouter = router({
         });
       }
 
-      const current = await runWithTenantContext(
-        { tenant_id: tenantId, agent_id: agent.id },
-        async () => ctx.repos.agentToolGrantsRepo.findForCurrentAgent(),
-      );
-
-      // Preserva packs não-gerenciados por esta superfície (fora do catálogo,
-      // ex.: mcp.<server> — geridos em /setup/mcp). Sem isso, um save aqui
-      // revogaria silenciosamente o acesso MCP concedido em outra tela.
-      const unmanagedPacks = (current?.granted_packs ?? []).filter(
-        (p) => TOOL_PACKS[p] === undefined,
-      );
-      const nextPacks = [
-        ...new Set(['baseline.core', ...input.granted_packs, ...unmanagedPacks]),
-      ];
-
-      const grantedTools = current?.granted_tools ?? [];
-      const nextEffective = new Set([...resolvePackTools(nextPacks), ...grantedTools]);
-      const currentDenied = new Set(current?.denied_tools ?? []);
-      const invalidDenies = input.denied_tools.filter(
-        (t) => !nextEffective.has(t) && !currentDenied.has(t),
-      );
-      if (invalidDenies.length > 0) {
-        throw new TRPCError({
-          code: 'BAD_REQUEST',
-          message:
-            `denied_tools contains name(s) not visible to this agent: ` +
-            `${invalidDenies.join(', ')} — a hard deny targets an effective tool`,
-        });
-      }
-
-      const updated = await ctx.repos.agentToolGrantsRepo.updateWithAudit({
+      // Review do PR #494 [medium]: todo o read-modify-write roda dentro da
+      // transação do helper, com o grant atual lido sob FOR UPDATE — a
+      // preservação de packs não-gerenciados e a validação de denies são
+      // computadas contra o estado SERIALIZADO, não contra um snapshot que
+      // outro writer (ex.: toggle MCP em /setup/mcp) pode ter invalidado.
+      const result = await ctx.repos.agentToolGrantsRepo.updateWithAudit({
         tenant_id: tenantId,
         agent_id: agent.id,
-        grant: {
-          granted_packs: nextPacks,
-          granted_tools: grantedTools,
-          denied_tools: [...new Set(input.denied_tools)],
-          granted_by: ctx.userId,
-          reason: input.comment,
+        compute: (current) => {
+          // Preserva packs não-gerenciados por esta superfície (fora do
+          // catálogo, ex.: mcp.<server> — geridos em /setup/mcp). Sem isso,
+          // um save aqui revogaria silenciosamente o acesso MCP concedido
+          // em outra tela.
+          const unmanagedPacks = (current?.granted_packs ?? []).filter(
+            (p) => TOOL_PACKS[p] === undefined,
+          );
+          const nextPacks = [
+            ...new Set(['baseline.core', ...input.granted_packs, ...unmanagedPacks]),
+          ];
+          const grantedTools = current?.granted_tools ?? [];
+          const nextEffective = new Set([
+            ...resolvePackTools(nextPacks),
+            ...grantedTools,
+          ]);
+          const currentDenied = new Set(current?.denied_tools ?? []);
+          const invalidDenies = input.denied_tools.filter(
+            (t) => !nextEffective.has(t) && !currentDenied.has(t),
+          );
+          if (invalidDenies.length > 0) {
+            return { ok: false, reject: { invalid_denies: invalidDenies } };
+          }
+          return {
+            ok: true,
+            granted_packs: nextPacks,
+            granted_tools: grantedTools,
+            denied_tools: [...new Set(input.denied_tools)],
+          };
         },
+        granted_by: ctx.userId,
+        reason: input.comment,
         audit: {
           actor_id: ctx.userId,
           actor_role: ctx.userRole,
           action: 'agent_capabilities_update',
-          previous: current
-            ? {
-                granted_packs: current.granted_packs,
-                granted_tools: current.granted_tools,
-                denied_tools: current.denied_tools,
-              }
-            : null,
         },
       });
 
+      if (!result.ok) {
+        const reject = result.reject as { invalid_denies?: string[] };
+        throw new TRPCError({
+          code: 'BAD_REQUEST',
+          message:
+            `denied_tools contains name(s) not visible to this agent: ` +
+            `${(reject.invalid_denies ?? []).join(', ')} — a hard deny targets an effective tool`,
+        });
+      }
+
       return {
-        granted_packs: updated.granted_packs,
-        denied_tools: updated.denied_tools,
+        granted_packs: result.grant.granted_packs,
+        denied_tools: result.grant.denied_tools,
       };
     }),
 
