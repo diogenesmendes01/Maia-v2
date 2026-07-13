@@ -18,6 +18,7 @@ import {
   bigint,
   smallint,
   primaryKey,
+  customType,
 } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 import type { AudienceType, TrustLevel } from '@/shared/audience.js';
@@ -372,6 +373,11 @@ export const conversas = pgTable('conversas', {
   tenant_id: text('tenant_id').notNull(),
   agent_id: text('agent_id').notNull(),
   pessoa_id: uuid('pessoa_id').notNull(),
+  // 090 (fase 0 roteamento multi-linha) — identidade da conversa inclui o
+  // canal: mesma pessoa em duas linhas = duas conversas; a resposta sai pela
+  // linha da conversa. NULL = legado (casa qualquer canal do agente até
+  // encerrar). FK composta (tenant, agent, channel) na migração.
+  channel_id: uuid('channel_id'),
   escopo_entidades: uuid('escopo_entidades').array().notNull().default(sql`'{}'::uuid[]`),
   status: text('status').notNull().default('ativa'),
   contexto_resumido: text('contexto_resumido'),
@@ -385,6 +391,10 @@ export const mensagens = pgTable('mensagens', {
   tenant_id: text('tenant_id').notNull(),
   agent_id: text('agent_id').notNull(),
   conversa_id: uuid('conversa_id'),
+  // 090 — canal (linha) que entregou/enviará a mensagem. O dedup de
+  // whatsapp_id é POR CANAL para rows novas (a unique global de 003 colidiria
+  // IDs entre linhas/tenants — spec roteamento v4 §1.7). NULL = legado.
+  channel_id: uuid('channel_id'),
   direcao: text('direcao').notNull(),
   tipo: text('tipo').notNull(),
   conteudo: text('conteudo'),
@@ -655,6 +665,11 @@ export const outbox_messages = pgTable(
     agent_id: text('agent_id').notNull(),
     occurrence_id: uuid('occurrence_id'),
     task_id: uuid('task_id'),
+    // 090 — linha pela qual a mensagem DEVE sair. Rows enviáveis
+    // (pending/claimed) exigem canal (CHECK outbox_sendable_requires_channel);
+    // não-deriváveis no backfill ficam status='blocked_channel_unresolved'
+    // e o drain as ignora (fail-closed — nunca escolher linha sozinho).
+    channel_id: uuid('channel_id'),
     kind: text('kind').notNull(),
     payload: jsonb('payload').notNull(),
     status: text('status').notNull().default('pending'),
@@ -1911,6 +1926,43 @@ export const role_selector_decisions = pgTable(
   }),
 );
 
+// 092 — staging de inbound não-roteado (spec roteamento v4 §1.4, modo
+// strict). Envelope AES-256-GCM (staging-crypto.ts); TTL 72h; UNIQUE
+// (line, whatsapp_id) = idempotência pré-resolução. O job BullMQ carrega só
+// o id (jobId estável `unrouted:<line>:<whatsapp_id>`).
+export const inbound_unrouted = pgTable(
+  'inbound_unrouted',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    line_external_id: text('line_external_id').notNull(),
+    whatsapp_message_id: text('whatsapp_message_id').notNull(),
+    envelope: customType<{ data: Buffer }>({
+      dataType() {
+        return 'bytea';
+      },
+    })('envelope').notNull(),
+    enc_key_id: text('enc_key_id').notNull(),
+    status: text('status').notNull().default('pending'),
+    attempts: integer('attempts').notNull().default(0),
+    received_at: timestamp('received_at', { withTimezone: true }).notNull().defaultNow(),
+    expires_at: timestamp('expires_at', { withTimezone: true }).notNull(),
+    handed_off_at: timestamp('handed_off_at', { withTimezone: true }),
+  },
+  (t) => ({
+    lineMsgUq: uniqueIndex('inbound_unrouted_line_msg_uq').on(
+      t.line_external_id,
+      t.whatsapp_message_id,
+    ),
+    pendingIdx: index('idx_inbound_unrouted_pending')
+      .on(t.received_at)
+      .where(sql`status = 'pending'`),
+    expiryIdx: index('idx_inbound_unrouted_expiry')
+      .on(t.expires_at)
+      .where(sql`status = 'pending'`),
+  }),
+);
+export type InboundUnroutedRow = typeof inbound_unrouted.$inferSelect;
+
 export type SoulBias = typeof soul_biases.$inferSelect;
 export type NewSoulBias = typeof soul_biases.$inferInsert;
 
@@ -2001,12 +2053,23 @@ export const app_sessions = pgTable(
   }),
 );
 
-// 046: proposal_approvals — tracks dual-approval state
+// 046 + 093: proposal_approvals — tracks dual-approval state.
+// 093 (spec perfil-inbox v4 §1.6): escopo tenant/agent/source. A unicidade
+// GLOBAL (proposal, approver, decision) foi substituída por partial uniques:
+//   - rows novas: (tenant, agent, source, proposal, approver, decision)
+//     WHERE agent_id IS NOT NULL AND proposal_source IS NOT NULL;
+//   - rows legadas: a semântica antiga, WHERE proposal_source IS NULL.
+// CHECK (agent_id IS NULL) = (proposal_source IS NULL) — NULLs são distintos
+// em Postgres; sem o pareamento, source preenchido + agent ausente duplicaria.
+// Vocabulário de proposal_source fechado por CHECK (espelha a registry TS).
 export const proposal_approvals = pgTable(
   'proposal_approvals',
   {
     id: uuid('id').primaryKey().defaultRandom(),
     tenant_id: text('tenant_id').notNull(),
+    // 093 — nulos APENAS em rows legadas (pré-escopo), aos pares.
+    agent_id: text('agent_id'),
+    proposal_source: text('proposal_source'),
     proposal_id: uuid('proposal_id').notNull(),
     approval_class: text('approval_class').notNull(),
     approver_user_id: text('approver_user_id').notNull(),
@@ -2017,14 +2080,16 @@ export const proposal_approvals = pgTable(
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
-    // Post-Codex-review #101: dropped (proposal_id, approver_role, decision)
-    // — see migration 049 — because it blocked dual-founder approval flows.
-    // Distinct-user invariant is still enforced; distinct-role invariant
-    // (for owner+compliance dual classes) is enforced at the app layer.
-    proposalUserDecisionUq: unique('proposal_approvals_proposal_user_decision_uq').on(
+    scopedUq: uniqueIndex('proposal_approvals_scoped_uq')
+      .on(t.tenant_id, t.agent_id, t.proposal_source, t.proposal_id, t.approver_user_id, t.decision)
+      .where(sql`agent_id IS NOT NULL AND proposal_source IS NOT NULL`),
+    legacyUq: uniqueIndex('proposal_approvals_legacy_uq')
+      .on(t.proposal_id, t.approver_user_id, t.decision)
+      .where(sql`proposal_source IS NULL`),
+    scopeReadIdx: index('proposal_approvals_scope_read_idx').on(
+      t.tenant_id,
+      t.proposal_source,
       t.proposal_id,
-      t.approver_user_id,
-      t.decision,
     ),
     proposalIdx: index('proposal_approvals_proposal_id_idx').on(t.proposal_id),
     classIdx: index('proposal_approvals_approval_class_idx').on(t.approval_class),
