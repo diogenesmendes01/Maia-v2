@@ -2346,13 +2346,46 @@ export type AgentOperationalProfileVersion = typeof agent_operational_profile_ve
 export type NewAgentOperationalProfileVersion = typeof agent_operational_profile_versions.$inferInsert;
 
 // Single source of truth for the ProfileBody schema version literal.
-// Bump this constant when introducing a new ProfileBody shape (e.g., v3.1.2).
-export const PROFILE_BODY_SCHEMA_VERSION = 'v3.1.1-2026-05-15' as const;
+// Bump this constant when introducing a new ProfileBody shape (e.g., v3.1.3).
+// v3.1.2: formaliza `identity.principles` no tipo canônico (spec perfil-inbox
+// v4 §1.2 — antes persistido por cast em agents.ts, um campo high-risk fora
+// do tipo). Mudança aditiva: nenhuma migração de dados.
+export const PROFILE_BODY_SCHEMA_VERSION = 'v3.1.2-2026-07-13' as const;
 export type ProfileBodySchemaVersion = typeof PROFILE_BODY_SCHEMA_VERSION;
 
-// Tipo estrutural do JSONB `profile_body` (v3.1.1)
+// Versões conhecidas do ProfileBody (spec perfil-inbox v4 §1.2). A validação
+// de corpo aceita QUALQUER versão conhecida — não apenas o literal corrente,
+// que faria o predecessor legado falhar na validação ANTES de chegar ao mapa
+// de compatibilidade. Versão desconhecida ⇒ `null` (o chamador trata como
+// risco alto, fail-up — nunca erro de parse).
+export type KnownProfileSchemaVersion = 'v3.1.1-2026-05-15' | 'v3.1.2-2026-07-13';
+
+export const KNOWN_PROFILE_SCHEMA_VERSIONS: readonly KnownProfileSchemaVersion[] = [
+  'v3.1.1-2026-05-15',
+  'v3.1.2-2026-07-13',
+];
+
+export function parseKnownProfileSchemaVersion(v: unknown): KnownProfileSchemaVersion | null {
+  if (typeof v !== 'string') return null;
+  return (KNOWN_PROFILE_SCHEMA_VERSIONS as readonly string[]).includes(v)
+    ? (v as KnownProfileSchemaVersion)
+    : null;
+}
+
+// Mapa de compatibilidade ADITIVA entre versões persistidas (spec §1.2):
+// `{ versão_proposta: [predecessores aceitos] }`, usando os literais REAIS
+// gravados nas rows. Par presente ⇒ a diferença de versão em si não pesa no
+// risco (só os campos alterados); par ausente e não-idêntico ⇒ risco alto.
+// Atualizar a cada bump de PROFILE_BODY_SCHEMA_VERSION.
+export const PROFILE_SCHEMA_COMPAT: Record<string, string[]> = {
+  'v3.1.2-2026-07-13': ['v3.1.1-2026-05-15'],
+};
+
+// Tipo estrutural do JSONB `profile_body` (v3.1.2). `schema_version` admite
+// qualquer versão conhecida — rows legadas (v3.1.1) continuam satisfazendo o
+// tipo sem migração.
 export interface ProfileBody {
-  schema_version: ProfileBodySchemaVersion;
+  schema_version: KnownProfileSchemaVersion;
   identity: {
     role_descriptor: string;
     voice: {
@@ -2366,6 +2399,9 @@ export interface ProfileBody {
       confidence_floor_for_action: number;
     };
     priorities: string[];
+    // Contratos de valor invioláveis (valoresDetector — high-risk). Opcional:
+    // ausência ⇒ guardrail desativado por decisão do operador (#189/#193).
+    principles?: string[];
     learned_voice_modifiers: unknown[];
   };
   style: {
@@ -2577,7 +2613,8 @@ export type ProposalTypeId =
   | 'soul_bias'
   | 'skill'
   | 'capability_proposal'
-  | 'knowledge_proposal';
+  | 'knowledge_proposal'
+  | 'operational_profile';
 
 export type RiskLevelId = 'low' | 'medium' | 'high' | 'critical';
 
@@ -2595,7 +2632,9 @@ export type ApprovalClassId =
   | 'knowledge_guidance'
   | 'knowledge_deprecated'
   | 'identity_drift_correction'
-  | 'procedure_update';
+  | 'procedure_update'
+  | 'operational_profile_change'
+  | 'operational_profile_change_high';
 
 export type ProposalUnifiedStatus = 'proposed' | 'pending_review' | 'rejected' | 'activated';
 

@@ -41,6 +41,20 @@ BEGIN
   END IF;
 END $$;
 
+-- Backfill BEST-EFFORT (§1.6): onde o source permite derivar o par completo.
+-- Hoje o único source com rows de approval em produção é capability_proposals
+-- (tem agent_id); o join deriva o par (agent_id, source) respeitando o CHECK
+-- de pareamento. O que não casar permanece NULL como legado somente-leitura —
+-- nenhum predicate novo depende dessas rows (risco aceito na spec §5).
+UPDATE proposal_approvals pa
+   SET agent_id = cp.agent_id,
+       proposal_source = 'capability_proposal'
+  FROM capability_proposals cp
+ WHERE pa.proposal_id = cp.id
+   AND pa.tenant_id = cp.tenant_id
+   AND pa.agent_id IS NULL
+   AND pa.proposal_source IS NULL;
+
 -- Substituição da unicidade global pelas parciais escopadas.
 ALTER TABLE proposal_approvals
   DROP CONSTRAINT IF EXISTS proposal_approvals_proposal_user_decision_uq;
