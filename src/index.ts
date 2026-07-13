@@ -48,6 +48,13 @@ async function main() {
   startWorkers(1);
   await startBaileys();
 
+  // Fase 3 do roteamento multi-linha: sobe as sessões das linhas adicionais
+  // (canais whatsapp ativos com auth pareado). No-op com MAIA_MULTI_LINE=false.
+  const { startAdditionalLineSessions } = await import('@/gateway/line-sessions.js');
+  await startAdditionalLineSessions().catch((err) =>
+    logger.error({ err: (err as Error).message }, 'line_sessions.boot_failed'),
+  );
+
   // Close over `app` so shutdown() can run Fastify's `onClose` hooks, which
   // stop the Redis memory-pressure collector + DB probe timers (server.ts).
   const shutdown = () => void gracefulShutdown(app);
@@ -58,6 +65,8 @@ async function main() {
 async function gracefulShutdown(app: FastifyInstance) {
   logger.info('maia.shutting_down');
   stopWorkers();
+  const { shutdownLineSessions } = await import('@/gateway/line-sessions.js');
+  await shutdownLineSessions().catch(() => undefined);
   // Closing the Fastify app fires its `onClose` hooks (collector/timer
   // cleanup) before we tear down the shared Redis/Postgres pools.
   await app.close().catch((err) => logger.warn({ err }, 'maia.app_close_failed'));

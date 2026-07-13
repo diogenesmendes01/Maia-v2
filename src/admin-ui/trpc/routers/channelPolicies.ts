@@ -322,6 +322,16 @@ export const channelPoliciesRouter = router({
         },
       });
       if (!result.ok) {
+        // §1.5/§2 (spec roteamento): linha whatsapp deve ser E.164 com `+`;
+        // duplicata continua CONFLICT. Um canal whatsapp criado aqui volta
+        // INATIVO ('declarado') — a posse só vem do pareamento (§2.5).
+        if (result.reason === 'invalid_line') {
+          throw new TRPCError({
+            code: 'BAD_REQUEST',
+            message:
+              'WhatsApp channel external_id must be an E.164 line with "+" (e.g. +5511999999999)',
+          });
+        }
         throw new TRPCError({
           code: 'CONFLICT',
           message: `Channel '${input.channel_type}/${input.external_id}' already exists in this tenant`,

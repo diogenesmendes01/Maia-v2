@@ -230,6 +230,12 @@ export async function resolveScopeForJid(
      * keeps the previous fail-closed behaviour.
      */
     lidPhoneResolver?: (lid: string) => string | null | Promise<string | null>;
+    /**
+     * §1.1 (spec roteamento v4) — a LINHA DO BOT (número da sessão que
+     * recebeu, E.164 com `+`). Habilita o exact-match correto nos modos
+     * shadow/exact_first/strict; ausente ⇒ resolução legada (fase 0).
+     */
+    botLineE164?: string | null;
   },
 ): Promise<{ scope: ResolvedScope; jid_context: JidContext }> {
   const raw_jid = typeof jid === 'string' ? jid : '';
@@ -278,10 +284,12 @@ export async function resolveScopeForJid(
   }
 
   // Reuse the canonical resolver (single source of truth for
-  // (channel_type, external_id) → tenant ownership policy).
+  // (channel_type, external_id) → tenant ownership policy). A linha do bot
+  // (quando conhecida) habilita o exact-match por LINHA nos modos §1.2.
   const resolved = await resolveChannel({
     channel_type: 'whatsapp',
     external_id: parsed.phone_e164,
+    bot_line_external_id: opts?.botLineE164 ?? null,
   });
 
   return {
