@@ -249,59 +249,97 @@ d('fase 0 — escopo por canal no DB (constraints 090)', () => {
   });
 
   it('rollback data-aware (review #496 alto 7): downs 091+090 aplicam com dados pós-rollout, sem perda', async () => {
-    // Roda os scripts REAIS de down dentro de uma transação e dá ROLLBACK no
-    // final — o schema volta ao estado migrado para o resto da suíte. Fica
-    // NESTE arquivo de propósito: os outros casos daqui são os únicos que
-    // criam wids duplicados entre canais, e testes do mesmo arquivo rodam em
-    // série (o CREATE UNIQUE INDEX do down não pode ver duplicata alheia).
-    const { readFile } = await import('node:fs/promises');
-    const down091 = await readFile(
-      new URL('../../migrations/091_line_ownership_down.sql', import.meta.url),
-      'utf8',
-    );
-    const down090 = await readFile(
-      new URL('../../migrations/090_channel_scoped_egress_down.sql', import.meta.url),
-      'utf8',
-    );
+    // DATABASE PRIVADO descartável. O down de 090 toma ACCESS EXCLUSIVE em
+    // tabelas quentes (mensagens/conversas/outbox) — rodá-lo no DB
+    // compartilhado deadlocka com o cleanup de qualquer spec em paralelo
+    // (visto no CI: o `DELETE FROM tenants` de outro arquivo virou vítima
+    // do deadlock detector). Num database só deste teste, os locks não
+    // tocam ninguém e os downs REAIS rodam contra um schema 100% migrado.
+    const { readFile, readdir } = await import('node:fs/promises');
+    const { NO_TX_MARKER, splitNoTxStatements } = await import('../../scripts/migrate.ts');
+    const migrationsDir = new URL('../../migrations/', import.meta.url);
+    const RB_DB = 'maia_rollback_090_test';
 
-    const c = await pool.connect();
+    const adminUrl = process.env.TEST_DB_URL!;
+    const admin = new pg.Client({ connectionString: adminUrl });
+    await admin.connect();
+    await admin.query(`DROP DATABASE IF EXISTS ${RB_DB} WITH (FORCE)`);
+    await admin.query(`CREATE DATABASE ${RB_DB}`);
+    await admin.end();
+
+    const rbUrl = new URL(adminUrl);
+    rbUrl.pathname = `/${RB_DB}`;
+    const c = new pg.Client({ connectionString: rbUrl.toString() });
+    await c.connect();
     try {
-      await c.query('BEGIN');
-      await c.query(`SET LOCAL lock_timeout = '15s'`);
+      // Forward completo, com as MESMAS regras do scripts/migrate.ts
+      // (ordem lexicográfica; arquivos `-- maia:no-transaction` vão
+      // statement a statement por causa do CONCURRENTLY).
+      const files = (await readdir(migrationsDir))
+        .filter((f) => f.endsWith('.sql') && !f.endsWith('_down.sql'))
+        .sort();
+      for (const f of files) {
+        const sqlText = await readFile(new URL(f, migrationsDir), 'utf8');
+        if (NO_TX_MARKER.test(sqlText)) {
+          for (const stmt of splitNoTxStatements(sqlText)) await c.query(stmt);
+        } else {
+          await c.query(sqlText);
+        }
+      }
 
       // Dados pós-rollout: o MESMO wid em dois canais (dedup por canal) — o
       // cenário que abortava o down antigo na recriação da unique global.
       await c.query(
+        `INSERT INTO tenants (id, nome) VALUES ('rb-tenant', 'rb-tenant')`,
+      );
+      await c.query(
+        `INSERT INTO agents (id, tenant_id, nome) VALUES ('rb-agent', 'rb-tenant', 'rb-agent')`,
+      );
+      const mk = async (line: string, active: boolean): Promise<string> => {
+        const r = await c.query<{ id: string }>(
+          `INSERT INTO channels (tenant_id, agent_id, external_id, channel_type, display_name, active)
+           VALUES ('rb-tenant', 'rb-agent', $1, 'whatsapp', 'rb', $2) RETURNING id`,
+          [line, active],
+        );
+        return r.rows[0]!.id;
+      };
+      const chR1 = await mk('+5511900010001', true);
+      const chR2 = await mk('+5511900010002', false);
+      await c.query(
         `INSERT INTO mensagens (tenant_id, agent_id, direcao, tipo, conteudo, metadata, channel_id, created_at)
-         VALUES ($1, $2, 'in', 'texto', 'linha 1', '{"whatsapp_id":"WID-RB-1"}'::jsonb, $3, now() - interval '1 minute'),
-                ($1, $2, 'in', 'texto', 'linha 2', '{"whatsapp_id":"WID-RB-1"}'::jsonb, $4, now())`,
-        [T, A, chA1, chA2],
+         VALUES ('rb-tenant', 'rb-agent', 'in', 'texto', 'linha 1', '{"whatsapp_id":"WID-RB-1"}'::jsonb, $1, now() - interval '1 minute'),
+                ('rb-tenant', 'rb-agent', 'in', 'texto', 'linha 2', '{"whatsapp_id":"WID-RB-1"}'::jsonb, $2, now())`,
+        [chR1, chR2],
       );
 
       // Canal cujo forward de 091 normalizou (simulado via o registro de
-      // backup) e um canal que SEMPRE foi E.164 (chA1 — fora do backup).
-      const rb = await c.query<{ id: string }>(
-        `INSERT INTO channels (tenant_id, agent_id, external_id, channel_type, display_name, active)
-         VALUES ($1, $2, '+5511900019999', 'whatsapp', 'rollback-test', false)
-         RETURNING id`,
-        [T, A],
-      );
+      // backup); chR1 fica FORA do backup (sempre foi E.164).
+      const rbCh = await mk('+5511900019999', false);
       await c.query(
         `INSERT INTO channels_line_normalization_091_backup (channel_id, original_external_id)
          VALUES ($1, '5511900019999')`,
-        [rb.rows[0]!.id],
+        [rbCh],
+      );
+
+      const down091 = await readFile(
+        new URL('091_line_ownership_down.sql', migrationsDir),
+        'utf8',
+      );
+      const down090 = await readFile(
+        new URL('090_channel_scoped_egress_down.sql', migrationsDir),
+        'utf8',
       );
 
       // ── 091 down: restaura SÓ o que o forward mudou ──────────────────
       await c.query(down091);
       const restored = await c.query<{ external_id: string }>(
         `SELECT external_id FROM channels WHERE id = $1`,
-        [rb.rows[0]!.id],
+        [rbCh],
       );
       expect(restored.rows[0]!.external_id).toBe('5511900019999');
       const untouched = await c.query<{ external_id: string }>(
         `SELECT external_id FROM channels WHERE id = $1`,
-        [chA1],
+        [chR1],
       );
       expect(untouched.rows[0]!.external_id).toBe('+5511900010001'); // NÃO desnormalizado
       const backupGone = await c.query(
@@ -330,8 +368,13 @@ d('fase 0 — escopo por canal no DB (constraints 090)', () => {
       );
       expect(col.rows).toHaveLength(0);
     } finally {
-      await c.query('ROLLBACK').catch(() => undefined);
-      c.release();
+      await c.end().catch(() => undefined);
+      const cleanup = new pg.Client({ connectionString: adminUrl });
+      await cleanup.connect();
+      await cleanup
+        .query(`DROP DATABASE IF EXISTS ${RB_DB} WITH (FORCE)`)
+        .catch(() => undefined);
+      await cleanup.end();
     }
-  });
+  }, 120_000);
 });
