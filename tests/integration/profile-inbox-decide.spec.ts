@@ -332,11 +332,13 @@ d('proposalsUnifiedRepo.decideAtomically — operational_profile (real DB)', () 
       // >= limit capabilities pendentes (e o cursor era ignorado — página 2
       // repetia a 1).
       const at = (min: number) => `now() - interval '${min} minutes'`;
+      // capability_type: vocabulário FECHADO do CHECK (migração 058 é a
+      // redefinição vigente — 'skill' foi removido dela; 'procedure' vale).
       const cap = async (title: string, minAgo: number) => {
         await c.query(
           `INSERT INTO capability_proposals
              (tenant_id, agent_id, capability_type, title, description, motivation, status, created_at)
-           VALUES ($1, $2, 'skill', $3, 'd', 'm', 'submitted', ${at(minAgo)})`,
+           VALUES ($1, $2, 'procedure', $3, 'd', 'm', 'submitted', ${at(minAgo)})`,
           [T, A, title],
         );
       };
