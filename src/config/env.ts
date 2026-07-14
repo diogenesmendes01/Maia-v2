@@ -134,12 +134,6 @@ const envSchema = z
     // sem keyring válido (fail-closed).
     MAIA_STAGING_KEYRING: z.string().optional(),
     MAIA_STAGING_ACTIVE_KEY_ID: z.string().optional(),
-    // Motor unificado de propostas — source operational_profile (spec
-    // 2026-07-09-profile-inbox-source Draft v4 §3): fase A/B atrás de flag.
-    FEATURE_PROFILE_INBOX_SOURCE: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
     FEATURE_ONE_TAP: z
       .string()
       .default('false')

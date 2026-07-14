@@ -577,12 +577,18 @@ function VersionsTab({
     },
     { enabled: tenantId !== '' },
   );
-  const approveMutation = trpc.agents.approveProfile.useMutation();
+  // Spec perfil-inbox v4 fase C — a aba Versões decide pelo MESMO endpoint
+  // unificado do /inbox (`proposals.approve`; o id da versão É o id da
+  // proposta). O shim `agents.approveProfile` foi removido: uma superfície de
+  // decisão, uma trilha de auditoria, mesmas classes por risco computado
+  // (dual para high — a segunda assinatura pode vir daqui ou do /inbox).
+  const approveMutation = trpc.proposals.approve.useMutation();
   const [target, setTarget] = React.useState<{ id: string; version: number } | null>(
     null,
   );
   const [comment, setComment] = React.useState('');
   const [error, setError] = React.useState<string | null>(null);
+  const [notice, setNotice] = React.useState<string | null>(null);
 
   const approve = async () => {
     if (!target) return;
@@ -591,12 +597,16 @@ function VersionsTab({
       return;
     }
     try {
-      await approveMutation.mutateAsync({
+      const decided = await approveMutation.mutateAsync({
         tenantId,
-        agentId,
-        versionId: target.id,
+        id: target.id,
         comment: comment.trim(),
       });
+      setNotice(
+        decided.status === 'pending_dual_approval'
+          ? `Primeira assinatura registrada para v${target.version}. Mudanças de risco alto exigem uma segunda aprovação (papel distinto) — conclua no Inbox ou peça a outro aprovador.`
+          : null,
+      );
       setTarget(null);
       setComment('');
       setError(null);
@@ -620,6 +630,13 @@ function VersionsTab({
 
   return (
     <>
+      {notice ? (
+        <div className="mb-3">
+          <Alert tone="info" title="Aprovação parcial registrada">
+            {notice}
+          </Alert>
+        </div>
+      ) : null}
       {items.length === 0 ? (
         <EmptyState
           title="Nenhuma versão de perfil"
