@@ -18,13 +18,7 @@ import { sha256 } from '@/lib/utils.js';
 import { mensagensRepo } from '@/db/repositories.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import { isDuplicate, markSeen } from './dedup.js';
-import {
-  markRead,
-  startTyping as presenceStartTyping,
-  sendReaction as presenceSendReaction,
-  sendPoll as presenceSendPoll,
-} from './presence.js';
-import type { LineTransport } from './line-session-manager.js';
+import { markRead } from './presence.js';
 import { enqueueAgent, QueueRedisUnavailableError } from './queue.js';
 import { scheduleDebouncedAgent } from './debouncer.js';
 import { checkBotAndMaybeBlock } from './bot-detection.js';
@@ -35,95 +29,10 @@ import type { WhatsAppInbound, WAQuotedContext } from './types.js';
 import { setupState } from '@/setup/state.js';
 import { triggerRecovery } from '@/setup/recovery.js';
 import { resolveScopeForJid } from './jid-tenant-resolver.js';
-import { normalizeLineE164 } from './channel-resolver.js';
-import { getLineSessionManager } from './line-session-manager.js';
-import { channelsRepo } from '@/db/repositories/channel-repos.js';
 
 let socket: WASocket | null = null;
 let connected = false;
 let lastDisconnectAt: Date | null = null;
-
-/**
- * §1.1 (spec roteamento v4) — a LINHA desta sessão (E.164 com `+`), capturada
- * no `connection: 'open'` a partir de `socket.user.id`. É o
- * `bot_line_external_id` do contrato de inbound: a identidade CORRETA do
- * canal (a linha em que a mensagem CHEGOU), em oposição ao telefone do
- * remetente que o caminho legado usa. Null até a primeira conexão.
- */
-let currentLineE164: string | null = null;
-
-export function getCurrentLineE164(): string | null {
-  return currentLineE164;
-}
-
-/** Canal (se algum) sob o qual a sessão primária está registrada no manager. */
-let primaryChannelId: string | null = null;
-
-/**
- * Transporte da linha PRIMÁRIA (fase 1, spec roteamento v4 §1.5): adapta as
- * primitivas globais deste módulo à interface por-linha do
- * LineSessionManager. Com `MAIA_MULTI_LINE=false` nada muda no envio (a
- * LineOutput usa as globais direto); com o manager ligado, o canal primário
- * resolve para ESTE transporte — mesmos bytes, agora sob posse explícita.
- */
-function buildPrimaryLineTransport(): LineTransport {
-  return {
-    sendText: (jid, text, opts) => sendOutboundText(jid, text, opts),
-    sendDocument: (jid, path, opts) => sendOutboundDocument(jid, path, opts),
-    sendVoice: (jid, buf, opts) => sendOutboundVoice(jid, buf, opts),
-    sendPoll: (jid, question, options) => presenceSendPoll(jid, question, options),
-    sendReaction: (jid, wid, emoji) => presenceSendReaction(jid, wid, emoji),
-    startTyping: (jid, mid) => presenceStartTyping(jid, mid),
-    markRead: (jid, wid) => markRead(jid, wid),
-    isConnected: () => connected,
-  };
-}
-
-/**
- * Registra a sessão primária no LineSessionManager quando a linha capturada
- * casa um canal whatsapp ativo (observabilidade nas fases 1–2; transporte do
- * canal primário na fase 3). Best-effort: falha aqui NUNCA derruba a
- * conexão — sem registro, `MAIA_MULTI_LINE=false` segue com paridade total e
- * o modo shadow segue reportando a divergência da linha.
- */
-async function registerPrimaryLineSession(): Promise<void> {
-  if (!currentLineE164) {
-    logger.debug('line_session.primary_line_unknown_skip_register');
-    return;
-  }
-  try {
-    const channel = await channelsRepo.findByExternalCrossTenant({
-      channel_type: 'whatsapp',
-      external_id: currentLineE164,
-    });
-    if (!channel || !channel.active) {
-      logger.info(
-        { line: currentLineE164, found: !!channel },
-        'line_session.primary_channel_unmatched',
-      );
-      return;
-    }
-    primaryChannelId = channel.id;
-    getLineSessionManager().register(channel.id, buildPrimaryLineTransport(), {
-      line_external_id: currentLineE164,
-      is_primary: true,
-    });
-    await audit({
-      acao: 'line_session_transition',
-      metadata: {
-        channel_id: channel.id,
-        line_external_id: currentLineE164,
-        state: 'connected',
-        is_primary: true,
-      },
-    });
-  } catch (err) {
-    logger.warn(
-      { err: (err as Error).message },
-      'line_session.primary_register_failed',
-    );
-  }
-}
 
 /**
  * Exponential backoff for transient reconnects. Each `connection: 'close'`
@@ -249,12 +158,7 @@ async function handleConnectionUpdate(update: ConnectionUpdate): Promise<void> {
   if (conn === 'open') {
     connected = true;
     reconnectAttempts = 0;
-    // §1.1 — captura a LINHA desta sessão (identidade do canal) e registra a
-    // sessão primária no manager (observabilidade fase 1–2; transporte do
-    // canal primário na fase 3). Best-effort — nunca bloqueia a conexão.
-    currentLineE164 = normalizeLineE164(socket?.user?.id ?? null);
-    void registerPrimaryLineSession();
-    logger.info({ line: currentLineE164 }, 'baileys.connected');
+    logger.info('baileys.connected');
     await audit({ acao: 'whatsapp_connected' });
     // pairing_completed is one-shot per successful pair (spec §4.7(b)). Skip
     // when the previous phase was already 'connected' — that path is a
@@ -269,23 +173,6 @@ async function handleConnectionUpdate(update: ConnectionUpdate): Promise<void> {
     lastDisconnectAt = new Date();
     const reason = (lastDisconnect?.error as Boom)?.output?.statusCode;
     logger.warn({ reason }, 'baileys.connection_closed');
-    // Espelha a transição no manager (invariante 6): loggedOut encerra a
-    // posse da linha; qualquer outro close é recuperável (reconnect loop).
-    if (primaryChannelId) {
-      const nextState =
-        reason === DisconnectReason.loggedOut ? ('closed' as const) : ('recovering' as const);
-      getLineSessionManager().markState(primaryChannelId, nextState);
-      await audit({
-        acao: 'line_session_transition',
-        metadata: {
-          channel_id: primaryChannelId,
-          state: nextState,
-          is_primary: true,
-          reason,
-        },
-      });
-      if (nextState === 'closed') primaryChannelId = null;
-    }
     await audit({ acao: 'whatsapp_disconnected', metadata: { reason } });
     if (reason === DisconnectReason.loggedOut) {
       await audit({ acao: 'pairing_logged_out', metadata: { reason } });
@@ -393,87 +280,91 @@ export async function startBaileys(): Promise<void> {
   // retries — safe defense-in-depth either way.
   socket.ev.on('messages.upsert', async ({ messages }) => {
     for (const msg of messages) {
-      await ingressUpsertMessage(msg);
-    }
-  });
-
-  // Fase 0/3 (review PR #496 CRÍTICO 1): o handler é COMPARTILHADO com as
-  // sessões de linha adicionais (line-sessions.ts) e escopado pelo canal da
-  // sessão que entregou o evento — a primária passa o canal registrado no
-  // manager (null na janela legada mono-linha ⇒ comportamento anterior).
-  socket.ev.on('messages.update', (updates) => {
-    void handleMessagesUpdate(updates, primaryChannelId);
-  });
-}
-
-/**
- * Handler de `messages.update` (edits/revokes) compartilhado entre a sessão
- * primária e as sessões de linha adicionais.
- *
- * [Codex review #277 v2 BLOQUEADO fix] Resolve o whatsapp_id alvo cross-
- * tenant ANTES de entrar no ALS e roda `routeMessageUpdate` no contexto do
- * tenant dono da row (adopt-then-runWithTenantContext, mesmo ordering do
- * `runAgentForMensagem`).
- *
- * [Review PR #496 CRÍTICO 1] O lookup cross-tenant é escopado pelo CANAL da
- * sessão que recebeu o evento: com N linhas o mesmo whatsapp_id pode existir
- * em canais/tenants diferentes (dedup por canal, §1.7) e um lookup global
- * escolheria a row mais recente — edit/revoke auditado no tenant ERRADO.
- * `channel_id` informado casa a row do canal OU a legada (channel NULL);
- * null (sessão primária sem canal registrado — janela mono-linha) preserva o
- * comportamento anterior. O mesmo canal é repassado ao routeMessageUpdate,
- * que escopa os lookups internos (já sob o ALS do dono).
- */
-export async function handleMessagesUpdate(
-  updates: ReadonlyArray<{
-    key?: { id?: string | null } | null;
-    update?: { message?: proto.IMessage | null | undefined } | null;
-  }>,
-  channel_id: string | null,
-): Promise<void> {
-  if (!config.FEATURE_MESSAGE_UPDATE) return;
-  for (const update of updates) {
-    try {
-      // Baileys 6.7.0 delivers `update` as `{ key, update: Partial<WAMessageInfo> }`.
-      // We synthesise an IWebMessageInfo whose `message` is the `update.message`
-      // payload so routeMessageUpdate can branch on editedMessage / protocolMessage.
-      // The `as never` cast is intentional — runtime structure is what matters.
-      const target_whatsapp_id = extractMessageUpdateTargetId(update);
-      if (!target_whatsapp_id) {
-        // Read receipts / status updates / unsupported envelope shapes —
-        // routeMessageUpdate would no-op anyway. Skip without touching DB.
-        continue;
-      }
-      const original = await mensagensRepo.findByWhatsappIdCrossTenant(
-        target_whatsapp_id,
-        channel_id ?? undefined,
-      );
-      if (!original) {
-        // Genuinely unknown message (never inbound through us, or already
-        // GC'd). Preserve the existing fail-soft contract — routeMessageUpdate
-        // also returns silently on null `findByWhatsappId`. Log so triage
-        // can spot a pattern (e.g., a real bug producing stranded edits).
-        logger.debug(
-          { whatsapp_id: target_whatsapp_id, channel_id },
-          'message_update.cross_tenant_lookup_miss',
+      // [Codex review #311 — B3] Reaction stubs arrive with
+      // `msg.message === undefined` (the payload is a `messageStubType`, not a
+      // content envelope). The previous `if (!msg.message) continue` ran BEFORE
+      // `handleIncoming`, so the `isReactionStub` branch inside it was DEAD
+      // CODE — reactions never reached the one-tap dispatcher. We must let
+      // reaction stubs through, but they still need a tenant context:
+      // `dispatchReactionAsAnswer` calls tenant-scoped repos
+      // (`mensagensRepo.findByWhatsappId`, `pessoasRepo`, …) that throw without
+      // an ALS. Both reaction stubs AND content messages carry `msg.key`
+      // (remoteJid), which is all the JID→tenant resolver needs — so we resolve
+      // FIRST, then route inside `runWithTenantContext`. Any other envelope
+      // that has neither content nor a reaction stub (pure receipts) is skipped
+      // to avoid a pointless resolver round-trip.
+      const reactionStub = isReactionStub(msg);
+      if (!msg.message && !reactionStub) continue;
+      try {
+        const ctx = await resolveTenantCtxForUpsert(msg);
+        if (!ctx) continue; // resolution failed → audit emitted + drop
+        await runWithTenantContext(ctx.scope, () =>
+          handleIncoming(msg, {
+            channel_id: ctx.channel_id,
+            resolved_tel: ctx.resolved_tel,
+          }),
         );
-        continue;
+      } catch (err) {
+        logger.error({ err }, 'baileys.handle_failed');
       }
-      await runWithTenantContext(
-        { tenant_id: original.tenant_id, agent_id: original.agent_id },
-        () =>
-          routeMessageUpdate(
-            {
-              key: update.key,
-              message: update.update?.message,
-            } as never,
-            channel_id,
-          ),
-      );
-    } catch (err) {
-      logger.error({ err: (err as Error).message }, 'message_update.dispatch_failed');
     }
-  }
+  });
+
+  socket.ev.on('messages.update', async (updates) => {
+    if (!config.FEATURE_MESSAGE_UPDATE) return;
+    for (const update of updates) {
+      try {
+        // Baileys 6.7.0 delivers `update` as `{ key, update: Partial<WAMessageInfo> }`.
+        // We synthesise an IWebMessageInfo whose `message` is the `update.message`
+        // payload so routeMessageUpdate can branch on editedMessage / protocolMessage.
+        // The `as never` cast is intentional — runtime structure is what matters.
+        //
+        // [Codex review #277 v2 BLOQUEADO fix] Resolve target whatsapp_id
+        // cross-tenant BEFORE entering ALS, then run routeMessageUpdate in
+        // the resolved tenant context. Rationale: `runAgentForMensagem`
+        // adopts inbound rows from (default, default) into the real
+        // (tenant_id, agent_id) when the resolver succeeds. A subsequent
+        // edit/revoke arriving via this listener has no tenant context;
+        // running `routeMessageUpdate` under `default/default` would
+        // cause `mensagensRepo.findByWhatsappId` to miss the (now-adopted)
+        // original and the edit/revoke would be silently dropped
+        // (edit_unknown_original / revoke_unknown_original). The fix
+        // mirrors `runAgentForMensagem`'s adopt-then-runWithTenantContext
+        // ordering: discover the owning tenant via the sanctioned cross-
+        // tenant lookup, then operate fully scoped from that point on.
+        const target_whatsapp_id = extractMessageUpdateTargetId(update);
+        if (!target_whatsapp_id) {
+          // Read receipts / status updates / unsupported envelope shapes —
+          // routeMessageUpdate would no-op anyway. Skip without touching DB.
+          continue;
+        }
+        const original = await mensagensRepo.findByWhatsappIdCrossTenant(
+          target_whatsapp_id,
+        );
+        if (!original) {
+          // Genuinely unknown message (never inbound through us, or already
+          // GC'd). Preserve the existing fail-soft contract — routeMessageUpdate
+          // also returns silently on null `findByWhatsappId`. Log so triage
+          // can spot a pattern (e.g., a real bug producing stranded edits).
+          logger.debug(
+            { whatsapp_id: target_whatsapp_id },
+            'message_update.cross_tenant_lookup_miss',
+          );
+          continue;
+        }
+        await runWithTenantContext(
+          { tenant_id: original.tenant_id, agent_id: original.agent_id },
+          () =>
+            routeMessageUpdate({
+              key: update.key,
+              message: update.update.message,
+            } as never),
+        );
+      } catch (err) {
+        logger.error({ err: (err as Error).message }, 'message_update.dispatch_failed');
+      }
+    }
+  });
 }
 
 /**
@@ -540,62 +431,8 @@ function extractMessageUpdateTargetId(update: {
  * the upsert listener — the per-message `for` loop continues with the
  * next message.
  */
-/**
- * Contexto por-LINHA para o ingresso (fase 3, spec roteamento v4 §1.5): cada
- * sessão adicional processa seus upserts com a PRÓPRIA linha (exact-match) e
- * o próprio LID-store/markRead. Ausente ⇒ sessão global (primária).
- */
-export type LineIngressCtx = {
-  botLineE164: string | null;
-  lidPhoneResolver?: (lid: string) => string | null | Promise<string | null>;
-  markRead?: (jid: string, whatsapp_id: string) => void;
-};
-
-/**
- * Entrada ÚNICA do upsert (compartilhada entre a sessão global e as sessões
- * de linha da fase 3).
- *
- * [Codex review #311 — B3] Reaction stubs arrive with
- * `msg.message === undefined` (the payload is a `messageStubType`, not a
- * content envelope). The previous `if (!msg.message) continue` ran BEFORE
- * `handleIncoming`, so the `isReactionStub` branch inside it was DEAD
- * CODE — reactions never reached the one-tap dispatcher. We must let
- * reaction stubs through, but they still need a tenant context:
- * `dispatchReactionAsAnswer` calls tenant-scoped repos
- * (`mensagensRepo.findByWhatsappId`, `pessoasRepo`, …) that throw without
- * an ALS. Both reaction stubs AND content messages carry `msg.key`
- * (remoteJid), which is all the JID→tenant resolver needs — so we resolve
- * FIRST, then route inside `runWithTenantContext`. Any other envelope
- * that has neither content nor a reaction stub (pure receipts) is skipped
- * to avoid a pointless resolver round-trip.
- */
-export async function ingressUpsertMessage(
-  msg: proto.IWebMessageInfo,
-  line?: LineIngressCtx,
-): Promise<'handled' | 'dropped' | 'skipped'> {
-  const reactionStub = isReactionStub(msg);
-  if (!msg.message && !reactionStub) return 'skipped';
-  try {
-    const ctx = await resolveTenantCtxForUpsert(msg, line);
-    if (!ctx) return 'dropped'; // resolution failed → audit emitted + drop/staging
-    await runWithTenantContext(ctx.scope, () =>
-      handleIncoming(msg, {
-        channel_id: ctx.channel_id,
-        resolved_tel: ctx.resolved_tel,
-        bot_line_external_id: line ? line.botLineE164 : undefined,
-        read: line?.markRead,
-      }),
-    );
-    return 'handled';
-  } catch (err) {
-    logger.error({ err }, 'baileys.handle_failed');
-    return 'dropped';
-  }
-}
-
 async function resolveTenantCtxForUpsert(
   msg: proto.IWebMessageInfo,
-  line?: LineIngressCtx,
 ): Promise<{
   scope: { tenant_id: string; agent_id: string };
   channel_id: string | null;
@@ -625,12 +462,8 @@ async function resolveTenantCtxForUpsert(
     const { scope, jid_context } = await resolveScopeForJid(jid, keyHints, {
       // Inject the socket-backed LID→PN store lookup so a `@lid` event whose
       // key hints weren't populated can still recover its real phone instead of
-      // being dropped (the message-loss risk this fix closes). Sessões de
-      // linha (fase 3) injetam o resolver do PRÓPRIO socket.
-      lidPhoneResolver: line?.lidPhoneResolver ?? resolvePhoneFromLidStore,
-      // §1.1 — a linha DESTA sessão habilita o exact-match por linha nos
-      // modos shadow/exact_first/strict (fase 0: shadow só observa).
-      botLineE164: line ? line.botLineE164 : currentLineE164,
+      // being dropped (the message-loss risk this fix closes).
+      lidPhoneResolver: resolvePhoneFromLidStore,
     });
     // jid_context is observability metadata (LID fallback, raw_jid,
     // resolved phone) — propagated via logs, not via handleIncoming.
@@ -677,24 +510,6 @@ async function resolveTenantCtxForUpsert(
         ? (typed.details as { resolver_path?: string }).resolver_path
         : undefined;
     const isLidUnmapped = isResolutionFailure && resolverPath === 'lid_unmapped';
-    // §1.4 (spec roteamento v4) — modo strict: um miss pela LINHA não é
-    // descartado, é ESTAGIADO cifrado (envelope AES-GCM + job de replay com
-    // jobId estável). Só quando a linha é conhecida (strict_line_miss) — sem
-    // linha não há chave de staging. O audit de falha abaixo ainda roda
-    // (trilha completa: falhou a rota E foi estagiado).
-    let staged = false;
-    if (
-      isResolutionFailure &&
-      resolverPath === 'strict_line_miss' &&
-      msg.key?.id &&
-      (line ? line.botLineE164 : currentLineE164)
-    ) {
-      const { stageUnroutedInbound } = await import('./unrouted-staging.js');
-      staged = await stageUnroutedInbound(
-        msg,
-        (line ? line.botLineE164 : currentLineE164)!,
-      );
-    }
     await audit({
       acao: isLidUnmapped
         ? 'channel_resolution_skipped_lid_unmapped'
@@ -719,8 +534,6 @@ async function resolveTenantCtxForUpsert(
         // distinguish gateway-entry failures from worker-level ones
         // (agent/core.ts emits the same action name).
         emitter: 'baileys_ingress',
-        // §1.4: true quando o strict estagiou o inbound em vez de perdê-lo.
-        staged,
       },
     });
     logger.warn(
@@ -747,21 +560,10 @@ async function handleIncoming(
   // continue to work unchanged. The metadata is recorded on the inbound row
   // when present so downstream agent logic can short-circuit the resolver
   // probe (defense-in-depth; the worker's probe still functions as fallback).
-  //
-  // Fase 3 (spec roteamento v4 §1.5): `bot_line_external_id` e `read` chegam
-  // da SESSÃO DE LINHA que recebeu o evento — a linha carimba a identidade e
-  // o read receipt sai pela própria sessão. Ausentes ⇒ sessão global.
-  opts?: {
-    channel_id?: string | null;
-    resolved_tel?: string | null;
-    bot_line_external_id?: string | null;
-    read?: (jid: string, whatsapp_id: string) => void;
-  },
+  opts?: { channel_id?: string | null; resolved_tel?: string | null },
 ): Promise<void> {
   if (msg.key.fromMe) return;
   const _resolvedChannelId = opts?.channel_id ?? null;
-  const _botLine =
-    opts?.bot_line_external_id !== undefined ? opts.bot_line_external_id : currentLineE164;
 
   // B1: poll vote arrives as a pollUpdateMessage. When FEATURE_ONE_TAP is on,
   // route to the one-tap dispatcher and drop. When off, fall through to the
@@ -845,12 +647,6 @@ async function handleIncoming(
 
   const { row: stored, duplicate } = await mensagensRepo.createInbound({
     conversa_id: null,
-    // 090 (spec roteamento v4 §1.7): canal resolvido NO ingresso, carimbado na
-    // PERSISTÊNCIA — o dedup de rows novas é por (channel_id, whatsapp_id), de
-    // modo que o mesmo whatsapp_id em duas linhas persiste DUAS vezes e um
-    // retry na MESMA linha persiste UMA. Null (testes/entradas sem resolução)
-    // cai na partial unique legada por (tenant, agent, whatsapp_id).
-    channel_id: _resolvedChannelId,
     direcao: 'in',
     tipo: type,
     conteudo: content,
@@ -869,10 +665,6 @@ async function handleIncoming(
       // handleIncoming directly). Persisted for triage and as defense-in-depth
       // — the worker's adoption probe is unaffected by this field.
       ingress_channel_id: _resolvedChannelId,
-      // §1.1 (spec roteamento v4) — a LINHA que RECEBEU esta mensagem. O
-      // probe do worker (`probeMessageForChannel`) repassa ao resolver para o
-      // exact-match por linha nos modos shadow/exact_first/strict.
-      bot_line_external_id: _botLine,
     },
     processada_em: null,
     ferramentas_chamadas: [],
@@ -880,9 +672,7 @@ async function handleIncoming(
   });
 
   await markSeen(whatsapp_id);
-  // Fase 3: o read receipt sai pela sessão da LINHA que recebeu (quando
-  // fornecida); fase 0/global: sessão primária, comportamento inalterado.
-  (opts?.read ?? markRead)(remote_jid, whatsapp_id);
+  markRead(remote_jid, whatsapp_id);
   if (duplicate) {
     await audit({ acao: 'duplicate_message_dropped', metadata: { whatsapp_id, source: 'db_unique' } });
     return;
@@ -1065,20 +855,6 @@ export async function sendOutboundText(
     logger.warn('baileys.not_connected — cannot send');
     return null;
   }
-  return sendOutboundTextVia(socket, jid, text, opts);
-}
-
-/**
- * Variante parametrizada por socket (fase 3, spec roteamento v4 §1.5): o
- * transporte de cada LINHA adicional envia pela SUA sessão com exatamente a
- * mesma semântica de conteúdo/opções da global. A global delega aqui.
- */
-export async function sendOutboundTextVia(
-  sock: WASocket,
-  jid: string,
-  text: string,
-  opts?: { quoted?: WAQuotedContext; view_once?: boolean; messageId?: string },
-): Promise<string | null> {
   const useViewOnce = !!opts?.view_once && config.FEATURE_VIEW_ONCE_SENSITIVE;
   const content = useViewOnce ? { text, viewOnce: true } : { text };
   // Baileys' sendMessage accepts `quoted` + `messageId` on the third-arg
@@ -1091,7 +867,7 @@ export async function sendOutboundTextVia(
           ...(opts.messageId ? { messageId: opts.messageId } : {}),
         }
       : undefined;
-  const result = await sock.sendMessage(jid, content, miscOpts);
+  const result = await socket.sendMessage(jid, content, miscOpts);
   return result?.key.id ?? null;
 }
 
@@ -1115,21 +891,6 @@ export async function sendOutboundDocument(
     logger.warn('baileys.not_connected — cannot send document');
     return null;
   }
-  return sendOutboundDocumentVia(socket, jid, path, opts);
-}
-
-/** Variante por socket — ver `sendOutboundTextVia`. */
-export async function sendOutboundDocumentVia(
-  sock: WASocket,
-  jid: string,
-  path: string,
-  opts: {
-    mimetype: string;
-    fileName: string;
-    caption?: string;
-    quoted?: WAQuotedContext;
-  },
-): Promise<string | null> {
   let buf: Buffer;
   try {
     buf = await readFile(path);
@@ -1153,7 +914,7 @@ export async function sendOutboundDocumentVia(
     wrapped.code = 'DOC_READ_FAILED';
     throw wrapped;
   }
-  const result = await sock.sendMessage(
+  const result = await socket.sendMessage(
     jid,
     {
       document: buf,
@@ -1183,17 +944,7 @@ export async function sendOutboundVoice(
     logger.warn('baileys.not_connected — cannot send voice');
     return null;
   }
-  return sendOutboundVoiceVia(socket, jid, buf, opts);
-}
-
-/** Variante por socket — ver `sendOutboundTextVia`. */
-export async function sendOutboundVoiceVia(
-  sock: WASocket,
-  jid: string,
-  buf: Buffer,
-  opts?: { quoted?: WAQuotedContext },
-): Promise<string | null> {
-  const result = await sock.sendMessage(
+  const result = await socket.sendMessage(
     jid,
     { audio: buf, mimetype: 'audio/ogg; codecs=opus', ptt: true },
     opts?.quoted ? { quoted: opts.quoted } : undefined,

@@ -38,15 +38,6 @@ vi.mock('@/lib/logger.js', () => ({
   },
 }));
 
-// Modos §1.2 (spec roteamento v4): config mutável por teste + audit espiado
-// (shadow_divergence / legacy_catch_all são os gates do rollout).
-const configMock = vi.hoisted(() => ({
-  MAIA_CHANNEL_ROUTING_MODE: 'shadow' as 'shadow' | 'exact_first' | 'strict',
-}));
-vi.mock('@/config/env.js', () => ({ config: configMock }));
-const auditMock = vi.hoisted(() => vi.fn(async () => undefined));
-vi.mock('@/governance/audit.js', () => ({ audit: auditMock }));
-
 function makeChannel(overrides: Partial<Channel> = {}): Channel {
   const now = new Date();
   return {
@@ -79,8 +70,6 @@ describe('resolveChannel — cross-tenant lookup + single-tenant catch-all (issu
     findByExternalCrossTenantMock.mockReset();
     findPrimaryCatchAllChannelMock.mockReset();
     loggerWarnMock.mockReset();
-    auditMock.mockClear();
-    configMock.MAIA_CHANNEL_ROUTING_MODE = 'shadow';
   });
 
   it('exact match ativo → retorna {tenant_id, agent_id, channel_id} sem warning, sem catch-all', async () => {
@@ -99,7 +88,6 @@ describe('resolveChannel — cross-tenant lookup + single-tenant catch-all (issu
       tenant_id: 'tenant-acme',
       agent_id: 'agent-main',
       channel_id: 'ch-abc-123',
-      resolved_via: 'legacy',
     });
     expect(findByExternalCrossTenantMock).toHaveBeenCalledTimes(1);
     expect(findByExternalCrossTenantMock).toHaveBeenCalledWith({
@@ -127,7 +115,6 @@ describe('resolveChannel — cross-tenant lookup + single-tenant catch-all (issu
       tenant_id: 'primary',
       agent_id: 'primary',
       channel_id: 'primary-channel-uuid',
-      resolved_via: 'legacy',
     });
     expect(findPrimaryCatchAllChannelMock).toHaveBeenCalledWith({ channel_type: 'whatsapp' });
     // Single-tenant catch-all NÃO é fail-loud → nenhum warning.
@@ -190,180 +177,5 @@ describe('resolveChannel — cross-tenant lookup + single-tenant catch-all (issu
       details: { resolver_path: 'unknown_or_inactive_channel', found: false },
     });
     expect(loggerWarnMock).toHaveBeenCalledTimes(1);
-  });
-});
-
-/**
- * §1.2 (spec roteamento v4) — modos tri-state. O exact-match usa a LINHA DO
- * BOT (`bot_line_external_id`), não o remetente; shadow só observa,
- * exact_first usa com fallback auditado, strict exige.
- */
-describe('resolveChannel — modos shadow / exact_first / strict (§1.2)', () => {
-  const LINE = '+5511900001111';
-  const lineChannel = makeChannel({
-    id: 'ch-line-1',
-    tenant_id: 'tenant-line',
-    agent_id: 'agent-line',
-    external_id: LINE,
-  });
-
-  beforeEach(() => {
-    findByExternalCrossTenantMock.mockReset();
-    findPrimaryCatchAllChannelMock.mockReset();
-    loggerWarnMock.mockReset();
-    auditMock.mockClear();
-  });
-
-  it('shadow: resultado é o LEGADO; divergência do exact pela linha é auditada', async () => {
-    configMock.MAIA_CHANNEL_ROUTING_MODE = 'shadow';
-    // 1º lookup: exact pela LINHA → canal da linha; 2º: legado pelo remetente → miss.
-    findByExternalCrossTenantMock
-      .mockResolvedValueOnce(lineChannel)
-      .mockResolvedValueOnce(null);
-    findPrimaryCatchAllChannelMock.mockResolvedValueOnce({
-      multi_tenant: false,
-      channel: makePrimaryChannel(),
-    });
-
-    const { resolveChannel } = await import('@/gateway/channel-resolver.js');
-    const out = await resolveChannel({
-      channel_type: 'whatsapp',
-      external_id: '+5511988887777',
-      bot_line_external_id: LINE,
-    });
-
-    // Comportamento INALTERADO (fase 2): devolve o legado…
-    expect(out).toMatchObject({ channel_id: 'primary-channel-uuid', resolved_via: 'legacy' });
-    // …mas a divergência (exact ch-line-1 ≠ legado primary-channel-uuid) foi auditada.
-    expect(auditMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        acao: 'shadow_divergence',
-        metadata: expect.objectContaining({
-          exact_channel_id: 'ch-line-1',
-          legacy_channel_id: 'primary-channel-uuid',
-        }),
-      }),
-    );
-  });
-
-  it('shadow: exact e legado convergem → nenhuma divergência auditada', async () => {
-    configMock.MAIA_CHANNEL_ROUTING_MODE = 'shadow';
-    findByExternalCrossTenantMock
-      .mockResolvedValueOnce(lineChannel) // exact pela linha
-      .mockResolvedValueOnce(lineChannel); // legado casa o mesmo canal
-    const { resolveChannel } = await import('@/gateway/channel-resolver.js');
-    const out = await resolveChannel({
-      channel_type: 'whatsapp',
-      external_id: LINE,
-      bot_line_external_id: LINE,
-    });
-    expect(out.channel_id).toBe('ch-line-1');
-    expect(auditMock).not.toHaveBeenCalled();
-  });
-
-  it('shadow sem bot line (chamador legado) → caminho legado puro, sem comparação', async () => {
-    configMock.MAIA_CHANNEL_ROUTING_MODE = 'shadow';
-    findByExternalCrossTenantMock.mockResolvedValueOnce(makeChannel({ id: 'ch-x' }));
-    const { resolveChannel } = await import('@/gateway/channel-resolver.js');
-    const out = await resolveChannel({ channel_type: 'whatsapp', external_id: '+551188' });
-    expect(out.channel_id).toBe('ch-x');
-    expect(findByExternalCrossTenantMock).toHaveBeenCalledTimes(1);
-    expect(auditMock).not.toHaveBeenCalled();
-  });
-
-  it('exact_first: hit pela linha → triplete do canal da LINHA, sem catch-all, sem audit', async () => {
-    configMock.MAIA_CHANNEL_ROUTING_MODE = 'exact_first';
-    findByExternalCrossTenantMock.mockResolvedValueOnce(lineChannel);
-    const { resolveChannel } = await import('@/gateway/channel-resolver.js');
-    const out = await resolveChannel({
-      channel_type: 'whatsapp',
-      external_id: '+5511988887777',
-      bot_line_external_id: LINE,
-    });
-    expect(out).toEqual({
-      tenant_id: 'tenant-line',
-      agent_id: 'agent-line',
-      channel_id: 'ch-line-1',
-      resolved_via: 'exact_line',
-    });
-    expect(findPrimaryCatchAllChannelMock).not.toHaveBeenCalled();
-    expect(auditMock).not.toHaveBeenCalled();
-  });
-
-  it('exact_first: miss pela linha → legado + audit legacy_catch_all (gate fase 4)', async () => {
-    configMock.MAIA_CHANNEL_ROUTING_MODE = 'exact_first';
-    findByExternalCrossTenantMock
-      .mockResolvedValueOnce(null) // exact pela linha: miss
-      .mockResolvedValueOnce(null); // legado pelo remetente: miss → catch-all
-    findPrimaryCatchAllChannelMock.mockResolvedValueOnce({
-      multi_tenant: false,
-      channel: makePrimaryChannel(),
-    });
-    const { resolveChannel } = await import('@/gateway/channel-resolver.js');
-    const out = await resolveChannel({
-      channel_type: 'whatsapp',
-      external_id: '+5511988887777',
-      bot_line_external_id: LINE,
-    });
-    expect(out.channel_id).toBe('primary-channel-uuid');
-    expect(auditMock).toHaveBeenCalledWith(
-      expect.objectContaining({ acao: 'legacy_catch_all' }),
-    );
-  });
-
-  it('strict: hit pela linha → triplete exato', async () => {
-    configMock.MAIA_CHANNEL_ROUTING_MODE = 'strict';
-    findByExternalCrossTenantMock.mockResolvedValueOnce(lineChannel);
-    const { resolveChannel } = await import('@/gateway/channel-resolver.js');
-    const out = await resolveChannel({
-      channel_type: 'whatsapp',
-      external_id: '+5511988887777',
-      bot_line_external_id: LINE,
-    });
-    expect(out.resolved_via).toBe('exact_line');
-    expect(out.channel_id).toBe('ch-line-1');
-  });
-
-  it('strict: miss pela linha → throw (o ingress estagia — R5), NUNCA catch-all', async () => {
-    configMock.MAIA_CHANNEL_ROUTING_MODE = 'strict';
-    findByExternalCrossTenantMock.mockResolvedValueOnce(null);
-    const { resolveChannel } = await import('@/gateway/channel-resolver.js');
-    await expect(
-      resolveChannel({
-        channel_type: 'whatsapp',
-        external_id: '+5511988887777',
-        bot_line_external_id: LINE,
-      }),
-    ).rejects.toMatchObject({
-      code: 'channel_resolution_failed',
-      details: { resolver_path: 'strict_line_miss' },
-    });
-    expect(findPrimaryCatchAllChannelMock).not.toHaveBeenCalled();
-  });
-
-  it('strict sem bot line → throw strict_no_bot_line (fail-closed)', async () => {
-    configMock.MAIA_CHANNEL_ROUTING_MODE = 'strict';
-    const { resolveChannel } = await import('@/gateway/channel-resolver.js');
-    await expect(
-      resolveChannel({ channel_type: 'whatsapp', external_id: '+5511988887777' }),
-    ).rejects.toMatchObject({
-      code: 'channel_resolution_failed',
-      details: { resolver_path: 'strict_no_bot_line' },
-    });
-    expect(findByExternalCrossTenantMock).not.toHaveBeenCalled();
-  });
-});
-
-describe('normalizeLineE164 — E.164 canônico COM + (§1.5)', () => {
-  it('normaliza variantes e rejeita lixo', async () => {
-    const { normalizeLineE164 } = await import('@/gateway/channel-resolver.js');
-    expect(normalizeLineE164('+5511999999999')).toBe('+5511999999999');
-    expect(normalizeLineE164('5511999999999')).toBe('+5511999999999');
-    expect(normalizeLineE164('5511999999999:12@s.whatsapp.net')).toBe('+5511999999999');
-    expect(normalizeLineE164('0123')).toBeNull(); // começa com 0
-    expect(normalizeLineE164('abc')).toBeNull();
-    expect(normalizeLineE164('')).toBeNull();
-    expect(normalizeLineE164(null)).toBeNull();
-    expect(normalizeLineE164('../etc/passwd')).toBeNull(); // traversal rejeitado
   });
 });

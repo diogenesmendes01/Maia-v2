@@ -193,7 +193,3 @@ NEW shared prefixes — pick `max(existing)+1`.
 087 | 087_playground_sessions.sql | playground sandbox sessions and turns (issue 464)
 088 | 088_agent_objectives.sql | work loop: agent objectives and tasks (issue 469)
 089 | 089_mcp_servers.sql | mcp external tools: servers and per-tool governance state (issue 478)
-090 | 090_channel_scoped_egress.sql | fase 0 roteamento multi-linha: channel_id em conversas/outbox/mensagens, FKs compostas, dedup por canal (spec 2026-07-09)
-091 | 091_line_ownership.sql | unicidade global de linha whatsapp ativa + normalizacao E.164 com + (spec roteamento v4)
-092 | 092_inbound_unrouted.sql | staging cifrado de inbound nao-roteado para modo strict (spec roteamento v4)
-093 | 093_proposal_approvals_scope.sql | escopo tenant/agent/source em proposal_approvals + partial uniques (spec perfil-inbox v4)

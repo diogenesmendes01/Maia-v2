@@ -32,23 +32,6 @@ vi.mock('../../src/gateway/baileys.js', () => ({
   isBaileysConnected: () => isBaileysConnectedMock(),
 }));
 
-// Fase 0 (spec roteamento v4 §1.6): whatsapp sends now go through the single
-// egress boundary — `forCurrentAgentChannel(msg.channel_id ?? null)` →
-// `LineOutput.sendText`. The mock delegates to the same send spy so every
-// existing send assertion still observes the physical send.
-const forCurrentAgentChannelMock = vi.fn(async (channel_id: string | null) => ({
-  scope: {
-    tenant_id: 'tenant-test',
-    agent_id: 'agent-test',
-    channel_id: channel_id ?? 'chan-sole-1',
-  },
-  sendText: (jid: string, text: string) => sendOutboundTextMock(jid, text),
-  isConnected: () => isBaileysConnectedMock() as boolean,
-}));
-vi.mock('../../src/gateway/line-output.js', () => ({
-  forCurrentAgentChannel: forCurrentAgentChannelMock,
-}));
-
 const tryAcquireMock = vi.fn();
 const releasePaceMock = vi.fn().mockResolvedValue(undefined);
 vi.mock('../../src/scheduling/backpressure.js', () => ({
@@ -79,7 +62,6 @@ const okMsg = (id: string, attempts = 0, max = 5) => ({
   task_id: 't1',
   occurrence_id: 'o1',
   kind: 'whatsapp_text',
-  channel_id: null,
   payload: { jid: 'mariana@s.whatsapp.net', text: 'Oi' },
   status: 'claimed',
   attempts,
@@ -106,7 +88,6 @@ beforeEach(() => {
   occByIdMock.mockReset();
   occSetStatusMock.mockReset().mockResolvedValue(undefined);
   sendOutboundTextMock.mockReset();
-  forCurrentAgentChannelMock.mockClear();
   isBaileysConnectedMock.mockReset().mockReturnValue(true);
   tryAcquireMock.mockReset();
   releasePaceMock.mockReset().mockResolvedValue(undefined);
@@ -125,9 +106,6 @@ describe('runOutboxDrain — Requirement 1 (no message loss) + Requirement 7 (au
     const r = await runOutboxDrain();
 
     expect(r.sent).toBe(1);
-    // Fase 0: the send resolved the LineOutput for the ROW's channel (null
-    // here → sole-active-channel resolution inside the boundary).
-    expect(forCurrentAgentChannelMock).toHaveBeenCalledWith(null);
     expect(outboxMarkSentMock).toHaveBeenCalledWith('m1');
     expect(auditMock.mock.calls.some((c) => (c[0] as { acao: string }).acao === 'outbox_sent')).toBe(true);
     expect(
@@ -162,44 +140,6 @@ describe('runOutboxDrain — Requirement 1 (no message loss) + Requirement 7 (au
     expect(outboxReturnToPendingMock).toHaveBeenCalledWith('m3');
     expect(outboxMarkFailedRetryableMock).not.toHaveBeenCalled();
     expect(outboxMarkSentMock).not.toHaveBeenCalled();
-  });
-
-  it('send devolve NULL (linha caiu entre gate e send) → falha RETRYABLE, nunca markSent (review #496 alto 4)', async () => {
-    // Repro do achado: LineTransport devolve null quando a sessão da linha
-    // não está viva; o drain antigo ignorava o retorno e marcava sent —
-    // mensagem "enviada" que nunca saiu.
-    outboxClaimDueMock.mockResolvedValue([okMsg('m3b')]);
-    tryAcquireMock.mockResolvedValue({ kind: 'allow' });
-    sendOutboundTextMock.mockResolvedValue(null);
-
-    const { runOutboxDrain } = await import('../../src/scheduling/outbox-drain.js');
-    await runOutboxDrain();
-
-    expect(outboxMarkSentMock).not.toHaveBeenCalled();
-    expect(outboxMarkFailedRetryableMock).toHaveBeenCalledTimes(1);
-    expect(
-      (outboxMarkFailedRetryableMock.mock.calls[0]![1] as string),
-    ).toContain('whatsapp_send_returned_null');
-    // O slot de pacing adquirido é devolvido na falha.
-    expect(releasePaceMock).toHaveBeenCalledWith('mariana@s.whatsapp.net');
-  });
-
-  it('falha de RESOLUÇÃO da linha (channel_ambiguous) → mesma máquina de retry/DLQ, sem returnToPending infinito', async () => {
-    outboxClaimDueMock.mockResolvedValue([okMsg('m3c')]);
-    forCurrentAgentChannelMock.mockRejectedValueOnce(
-      Object.assign(new Error('agent has multiple active channels'), {
-        code: 'channel_ambiguous',
-      }),
-    );
-
-    const { runOutboxDrain } = await import('../../src/scheduling/outbox-drain.js');
-    await runOutboxDrain();
-
-    expect(sendOutboundTextMock).not.toHaveBeenCalled();
-    expect(outboxMarkSentMock).not.toHaveBeenCalled();
-    expect(outboxMarkFailedRetryableMock).toHaveBeenCalledTimes(1);
-    // Resolução falhou ANTES do slot — nada a devolver.
-    expect(releasePaceMock).not.toHaveBeenCalled();
   });
 
   it('rate gate denies: deferred with backoff, no send attempted', async () => {

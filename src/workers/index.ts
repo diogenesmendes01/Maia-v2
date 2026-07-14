@@ -12,7 +12,6 @@ import { runMessageRecovery } from './message-recovery.js';
 import { runPendingReminder } from './pending-reminder.js';
 import { runScheduling } from './scheduling-tick.js';
 import { runOutboxDrainWorker } from './outbox-drain-worker.js';
-import { runUnroutedRecovery } from './unrouted-recovery.js';
 import { runSeriesNextSchedulerWorker } from './series-next-scheduler.js';
 import { runNightlyBackup, runCloudBackupRotation } from './backup.js';
 import { runCostMonitor } from './cost-monitor.js';
@@ -68,10 +67,6 @@ export const JOBS: Job[] = [
   // when no tenant has work.
   { name: 'scheduling_tick', cron: '* * * * *', fn: runScheduling, phase: 1 },
   { name: 'outbox_drain', cron: '* * * * *', fn: runOutboxDrainWorker, phase: 1 },
-  // Spec roteamento v4 §1.4 — recovery sweep do staging de inbound
-  // não-roteado (modo strict): expira TTL, re-arma jobs órfãos (jobId
-  // estável ⇒ idempotente) e vigia o keyring. No-op barato sem rows.
-  { name: 'unrouted_recovery', cron: '* * * * *', fn: runUnroutedRecovery, phase: 1 },
   // Issue #464 — admin-console sandbox chat: drains playground_turns
   // (Postgres-as-queue) inside the tick for ~50s, so effective chat latency
   // is seconds despite the 1-min cron. Non-critical surface → phase 2.

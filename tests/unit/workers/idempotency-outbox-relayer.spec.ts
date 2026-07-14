@@ -156,9 +156,6 @@ vi.mock('@/db/repositories.js', () => ({ idempotencyOutboxRepo: repoMock }));
 
 // Gateway: configurable per test (default: succeeds with a provider id). The
 // third arg (`opts`) carries the #327 provider-side dedup key (`messageId`).
-// Fase 0 (spec roteamento §1.6): o relayer envia pela fronteira LineOutput —
-// o mock cobre `forCurrentAgentChannel(null)` devolvendo uma line cujo
-// sendText é o spy (mesmas asserções de antes, agora na fronteira).
 const sendOutboundTextMock = vi.fn(
   async (
     _jid: string,
@@ -166,13 +163,7 @@ const sendOutboundTextMock = vi.fn(
     _opts?: { quoted?: unknown; view_once?: boolean; messageId?: string },
   ) => 'wa-id-default',
 );
-vi.mock('@/gateway/line-output.js', () => ({
-  forCurrentAgentChannel: vi.fn(async () => ({
-    scope: { tenant_id: 't', agent_id: 'a', channel_id: 'ch-1' },
-    sendText: sendOutboundTextMock,
-    isConnected: () => true,
-  })),
-}));
+vi.mock('@/gateway/baileys.js', () => ({ sendOutboundText: sendOutboundTextMock }));
 
 // Pool advisory-lock mock (mirrors outbound-messages-sweeper.spec.ts).
 let lockHeldByOther = false;

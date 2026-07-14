@@ -33,16 +33,7 @@ export type ResolveResult =
   | { kind: 'blocked'; pessoa: Pessoa; reason: string }
   | { kind: 'quarantined'; pessoa: Pessoa };
 
-export async function resolveIdentity(input: {
-  telefone_whatsapp: string;
-  /**
-   * Fase 0 (spec roteamento v4 §1.6): canal (linha) que recebeu o inbound. A
-   * identidade da conversa inclui o canal — com um agente em N linhas, a
-   * MESMA pessoa em duas linhas são DUAS conversas. NULL cobre o caminho
-   * legado (probe sem canal): comporta-se como antes.
-   */
-  channel_id?: string | null;
-}): Promise<ResolveResult> {
+export async function resolveIdentity(input: { telefone_whatsapp: string }): Promise<ResolveResult> {
   const pessoa = await pessoasRepo.findByPhone(input.telefone_whatsapp);
   if (!pessoa) {
     await audit({ acao: 'unknown_number_message_received', metadata: { telefone: input.telefone_whatsapp } });
@@ -120,7 +111,7 @@ export async function resolveIdentity(input: {
     },
   });
 
-  let conversa = await conversasRepo.findActive(pessoa.id, input.channel_id ?? undefined);
+  let conversa = await conversasRepo.findActive(pessoa.id);
 
   // Spec 05 §11.2: idle conversation rotation. New activity after >7d closes
   // the prior conversa (background summarizer fills contexto_resumido later)
@@ -137,43 +128,12 @@ export async function resolveIdentity(input: {
   }
 
   if (!conversa) {
-    // 090: conversas novas do caminho resolvido nascem COM canal (spec §1.6).
     conversa = await conversasRepo.create({
       pessoa_id: pessoa.id,
       escopo_entidades: scope.entidades,
-      channel_id: input.channel_id ?? null,
     });
     logger.info({ pessoa_id: pessoa.id, conversa_id: conversa.id }, 'conversa.created');
   } else {
-    // Review PR #496 (alto 6): conversa LEGADA (channel NULL) reencontrada
-    // por um inbound RESOLVIDO é vinculada ao canal na hora — sem isso, com
-    // 2+ linhas ativas a resposta lançaria `channel_ambiguous` e a conversa
-    // ficaria muda até encerrar. CAS no repo: na corrida entre linhas a
-    // primeira vence; a perdedora reencontra/cria a conversa da própria
-    // linha (mesma semântica do miss normal).
-    if (input.channel_id && conversa.channel_id === null) {
-      const bound = await conversasRepo.bindChannelIfNull(conversa.id, input.channel_id);
-      if (bound) {
-        conversa = { ...conversa, channel_id: input.channel_id };
-        logger.info(
-          { conversa_id: conversa.id, channel_id: input.channel_id },
-          'conversa.legacy_bound_to_channel',
-        );
-      } else {
-        conversa = await conversasRepo.findActive(pessoa.id, input.channel_id);
-        if (!conversa) {
-          conversa = await conversasRepo.create({
-            pessoa_id: pessoa.id,
-            escopo_entidades: scope.entidades,
-            channel_id: input.channel_id,
-          });
-          logger.info(
-            { pessoa_id: pessoa.id, conversa_id: conversa.id },
-            'conversa.created',
-          );
-        }
-      }
-    }
     await conversasRepo.touch(conversa.id);
   }
   return { kind: 'resolved', pessoa, scope, conversa, is_quarantined: false, audience };

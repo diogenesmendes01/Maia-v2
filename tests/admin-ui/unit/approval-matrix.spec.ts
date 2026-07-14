@@ -1,5 +1,5 @@
 /**
- * P8.5 — approval matrix unit tests. Verifies all 16 classes are defined,
+ * P8.5 — approval matrix unit tests. Verifies all 14 classes are defined,
  * dual-approval flags + architecture locks are correctly attached, and the
  * type+risk → class mapping is exhaustive.
  */
@@ -14,8 +14,8 @@ import {
 import type { ProposalTypeId, RiskLevelId } from '@/db/schema.js';
 
 describe('approval matrix', () => {
-  it('has exactly 16 approval classes', () => {
-    expect(Object.keys(approvalMatrix)).toHaveLength(16);
+  it('has exactly 14 approval classes', () => {
+    expect(Object.keys(approvalMatrix)).toHaveLength(14);
   });
 
   it('every class has required fields', () => {
@@ -57,19 +57,6 @@ describe('approval matrix', () => {
     expect(approvalMatrix.soul_bias_peripheral.requiresDistinctApprovers).toBe(false);
     expect(approvalMatrix.knowledge_guidance.requiresDistinctApprovers).toBe(false);
   });
-
-  // Spec perfil-inbox v4 §1.3 — duas classes selecionadas por risco.
-  it('operational_profile_change: owner OU founder, sem dual (paridade com hoje)', () => {
-    const def = approvalMatrix.operational_profile_change;
-    expect(def.requiredRoles).toEqual(['owner', 'founder']);
-    expect(def.requiresDistinctApprovers).toBe(false);
-  });
-
-  it('operational_profile_change_high: dual owner + founder com aprovadores distintos', () => {
-    const def = approvalMatrix.operational_profile_change_high;
-    expect(def.requiredRoles).toEqual(['owner', 'founder']);
-    expect(def.requiresDistinctApprovers).toBe(true);
-  });
 });
 
 describe('getApprovalClassFor', () => {
@@ -87,10 +74,6 @@ describe('getApprovalClassFor', () => {
     ['capability_proposal', 'medium', 'capability_safe_tool'],
     ['knowledge_proposal', 'high', 'knowledge_rule'],
     ['knowledge_proposal', 'low', 'knowledge_guidance'],
-    // Spec perfil-inbox v4 §1.3: low/medium ⇒ classe simples; high ⇒ dual.
-    ['operational_profile', 'low', 'operational_profile_change'],
-    ['operational_profile', 'medium', 'operational_profile_change'],
-    ['operational_profile', 'high', 'operational_profile_change_high'],
   ];
 
   it.each(cases)('%s + %s → %s', (type, risk, expected) => {

@@ -115,31 +115,6 @@ const envSchema = z
       .string()
       .default('false')
       .transform((s) => s === 'true' || s === '1'),
-    // Roteamento multi-linha (spec 2026-07-09 Draft v4):
-    //  - MAIA_MULTI_LINE: liga o LineSessionManager como dono do transporte
-    //    por canal (fase 3). Default off = paridade mono-linha (fase 0/1).
-    //  - MAIA_CHANNEL_ROUTING_MODE (§1.2, tri-state — review v2): shadow
-    //    computa o exact-match pela linha em paralelo e SÓ loga divergência;
-    //    exact_first usa exact-match com fallback no catch-all legado;
-    //    strict exige staging operante e falha tipado no miss.
-    MAIA_MULTI_LINE: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
-    MAIA_CHANNEL_ROUTING_MODE: z
-      .enum(['shadow', 'exact_first', 'strict'])
-      .default('shadow'),
-    // Staging cifrado de inbound não-roteado (§1.4, modo strict): keyring
-    // JSON { key_id: base64(32B) } + id da chave ativa. Strict recusa ligar
-    // sem keyring válido (fail-closed).
-    MAIA_STAGING_KEYRING: z.string().optional(),
-    MAIA_STAGING_ACTIVE_KEY_ID: z.string().optional(),
-    // Motor unificado de propostas — source operational_profile (spec
-    // 2026-07-09-profile-inbox-source Draft v4 §3): fase A/B atrás de flag.
-    FEATURE_PROFILE_INBOX_SOURCE: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
     FEATURE_ONE_TAP: z
       .string()
       .default('false')

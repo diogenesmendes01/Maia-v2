@@ -76,17 +76,15 @@ if (SHOULD_RUN) {
 }
 
 d('channelsRepo.createWithAudit (real DB)', () => {
-  it('creates the channel and its audit row atomically (whatsapp nasce DECLARADO/inativo)', async () => {
+  it('creates the channel and its audit row atomically', async () => {
     const { channelsRepo } = await import('../../src/db/repositories.js');
 
-    // Spec roteamento v4 §1.5/§2: linha whatsapp é E.164 com '+' e o canal
-    // novo nasce INATIVO ('declarado') — ativação só via pareamento.
     const result = await channelsRepo.createWithAudit({
       tenant_id: T,
       agent_id: A,
       channel: {
         channel_type: 'whatsapp',
-        external_id: '+5511900014911',
+        external_id: 'pr491-line-1',
         display_name: 'Linha 1',
       },
       audit: { actor_id: ACTOR, actor_role: 'owner', reason: 'integration happy path' },
@@ -94,8 +92,6 @@ d('channelsRepo.createWithAudit (real DB)', () => {
 
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    expect(result.channel.external_id).toBe('+5511900014911');
-    expect(result.channel.active).toBe(false);
     const audit = await pool.query(
       `SELECT action, resource_type, resource_id FROM admin_audit_log WHERE tenant_id = $1`,
       [T],
@@ -105,32 +101,13 @@ d('channelsRepo.createWithAudit (real DB)', () => {
     ]);
   });
 
-  it('whatsapp com external_id que não é linha E.164 → typed invalid_line, nada persiste', async () => {
-    const { channelsRepo } = await import('../../src/db/repositories.js');
-
-    const result = await channelsRepo.createWithAudit({
-      tenant_id: T,
-      agent_id: A,
-      channel: { channel_type: 'whatsapp', external_id: 'pr491-line-1' },
-      audit: { actor_id: ACTOR, actor_role: 'owner', reason: 'invalid line' },
-    });
-    expect(result).toEqual({ ok: false, reason: 'invalid_line' });
-
-    const [channels, audit] = await Promise.all([
-      pool.query(`SELECT id FROM channels WHERE tenant_id = $1`, [T]),
-      pool.query(`SELECT id FROM admin_audit_log WHERE tenant_id = $1`, [T]),
-    ]);
-    expect(channels.rows.length).toBe(0);
-    expect(audit.rows.length).toBe(0);
-  });
-
   it('duplicate (channel_type, external_id) → typed duplicate, tx rolled back, no audit row', async () => {
     const { channelsRepo } = await import('../../src/db/repositories.js');
 
     const args = {
       tenant_id: T,
       agent_id: A,
-      channel: { channel_type: 'whatsapp' as const, external_id: '+5511900014912' },
+      channel: { channel_type: 'whatsapp' as const, external_id: 'pr491-line-dup' },
       audit: { actor_id: ACTOR, actor_role: 'owner', reason: 'integration duplicate' },
     };
     const first = await channelsRepo.createWithAudit(args);

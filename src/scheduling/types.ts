@@ -63,17 +63,7 @@ export type OutboxKind =
   | 'whatsapp_alert'
   | 'email_alert';
 
-// 090 (fase 0 roteamento) — 'blocked_channel_unresolved': o backfill não
-// conseguiu derivar o canal de forma unívoca; o drain ignora e o operador
-// resolve manualmente (runbook outbox-blocked-channel). Nunca escolher
-// uma linha silenciosamente.
-export type OutboxStatus =
-  | 'pending'
-  | 'claimed'
-  | 'sent'
-  | 'failed'
-  | 'dead'
-  | 'blocked_channel_unresolved';
+export type OutboxStatus = 'pending' | 'claimed' | 'sent' | 'failed' | 'dead';
 
 export interface OneShotReminderContexto {
   texto: string;

@@ -191,23 +191,6 @@ vi.mock('@/gateway/presence.js', () => ({
   quotedReplyContext: vi.fn(),
   sendPoll: vi.fn(),
 }));
-// Fase 0 do roteamento multi-linha (spec 2026-07-09 §1.6): core.ts resolve a
-// fronteira única de saída via forCurrentAgentChannel (typing debounce). O
-// módulo real puxa baileys/line-session-manager — mock com uma line inerte;
-// estes specs cobrem resolução de canal, não o envio físico.
-vi.mock('@/gateway/line-output.js', () => ({
-  forCurrentAgentChannel: vi.fn(async () => ({
-    scope: { tenant_id: 'primary', agent_id: 'primary', channel_id: 'ch-primary' },
-    sendText: vi.fn(async () => 'WAID'),
-    sendDocument: vi.fn(async () => 'WAID'),
-    sendVoice: vi.fn(async () => 'WAID'),
-    sendPoll: vi.fn(),
-    sendReaction: vi.fn(),
-    startTyping: vi.fn(() => ({ stop: vi.fn() })),
-    markRead: vi.fn(),
-    isConnected: vi.fn(() => true),
-  })),
-}));
 vi.mock('@/gateway/debouncer.js', () => ({
   clearDebounceState: vi.fn().mockResolvedValue(undefined),
 }));
@@ -355,7 +338,6 @@ describe('runAgentForMensagem — channel resolution (#268 fail-loud + #411 catc
     expect(resolveChannelMock).toHaveBeenCalledWith({
       channel_type: 'whatsapp',
       external_id: '+5511888888888',
-      bot_line_external_id: null,
     });
     // Nenhum audit de falha — resolução bem-sucedida.
     const auditCalls = auditMock.mock.calls.filter(
@@ -412,9 +394,6 @@ describe('runAgentForMensagem — channel resolution (#268 fail-loud + #411 catc
       id: 'msg1',
       tenant_id: 'tenant-acme',
       agent_id: 'agent-main',
-      // Fase 0 §1.6: a adoção agora carimba o canal resolvido na row para o
-      // egress downstream sair pela linha correta.
-      channel_id: 'ch-abc',
     });
     expect(callOrder).toEqual(['adopt', 'runWithTenantContext']);
 

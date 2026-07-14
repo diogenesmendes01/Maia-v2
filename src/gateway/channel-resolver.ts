@@ -34,8 +34,6 @@
  * cross-tenant) continua sendo throw, propagado do repo.
  */
 import { channelsRepo } from '@/db/repositories.js';
-import { config } from '@/config/env.js';
-import { audit } from '@/governance/audit.js';
 import { logger } from '@/lib/logger.js';
 import { TypedError } from '@/lib/utils.js';
 
@@ -43,21 +41,7 @@ export type ChannelResolution = {
   tenant_id: string;
   agent_id: string;
   channel_id: string | null;
-  /** Como o triplete foi obtido — observabilidade dos modos (§1.2). */
-  resolved_via?: 'exact_line' | 'legacy';
 };
-
-/**
- * E.164 canônico COM `+` (spec v4 §1.5 — idêntico ao resolver de JID):
- * aceita `+5511…`, `5511…`, ou o `sock.user.id` cru (`5511…:12@s.whatsapp.net`)
- * e devolve `+<dígitos>`; null quando não há dígitos confiáveis.
- */
-export function normalizeLineE164(raw: string | null | undefined): string | null {
-  if (typeof raw !== 'string' || raw.length === 0) return null;
-  const local = raw.split('@')[0]!.split(':')[0]!.replace(/^\+/, '');
-  if (!/^[1-9][0-9]{6,14}$/.test(local)) return null;
-  return '+' + local;
-}
 
 export type ChannelResolutionFailureContext = {
   channel_type: string;
@@ -75,117 +59,6 @@ export type ChannelResolutionFailureContext = {
 };
 
 export async function resolveChannel(args: {
-  channel_type: 'whatsapp' | 'telegram' | 'email' | 'sms' | 'web' | 'api' | 'other';
-  external_id: string;
-  /**
-   * §1.1 (spec roteamento v4) — a LINHA DO BOT: o número da SESSÃO que
-   * recebeu a mensagem (normalizado E.164 com `+`). É a identidade correta
-   * do canal (o canal representa a linha, não o remetente). Opcional durante
-   * a transição: chamadores legados (probe por telefone do remetente) não a
-   * têm; nesses casos os modos `shadow`/`exact_first` degradam para o caminho
-   * legado e `strict` falha fechado.
-   */
-  bot_line_external_id?: string | null;
-}): Promise<ChannelResolution> {
-  const mode = config.MAIA_CHANNEL_ROUTING_MODE;
-  const botLine = normalizeLineE164(args.bot_line_external_id);
-
-  // §1.2 — exact-match pela LINHA (a resolução correta). Cross-tenant, mesmo
-  // método sancionado do caminho legado; o índice global (091) torna a
-  // ambiguidade whatsapp incriável, e o repo ainda lança nela por defesa.
-  const exactByLine = botLine
-    ? await channelsRepo.findByExternalCrossTenant({
-        channel_type: args.channel_type,
-        external_id: botLine,
-      })
-    : null;
-  const exactActive = exactByLine && exactByLine.active ? exactByLine : null;
-
-  if (mode === 'strict') {
-    // strict: SÓ o exact-match pela linha resolve. Miss ⇒ erro tipado — o
-    // ingress (R5) intercepta e ESTAGIA o inbound cifrado em vez de perder.
-    if (exactActive) {
-      return {
-        tenant_id: exactActive.tenant_id,
-        agent_id: exactActive.agent_id,
-        channel_id: exactActive.id,
-        resolved_via: 'exact_line',
-      };
-    }
-    throw new TypedError(
-      'channel_resolution_failed',
-      botLine
-        ? 'strict routing: no active channel owns this bot line'
-        : 'strict routing: caller did not provide the bot line — cannot resolve',
-      {
-        resolver_path: botLine ? 'strict_line_miss' : 'strict_no_bot_line',
-        channel_type: args.channel_type,
-        bot_line_external_id: botLine,
-      },
-    );
-  }
-
-  if (mode === 'exact_first' && exactActive) {
-    return {
-      tenant_id: exactActive.tenant_id,
-      agent_id: exactActive.agent_id,
-      channel_id: exactActive.id,
-      resolved_via: 'exact_line',
-    };
-  }
-
-  // Caminho LEGADO (shadow: sempre; exact_first: só no miss do exact).
-  const legacy = await resolveLegacy(args);
-
-  if (mode === 'exact_first') {
-    // Gate da fase 3→4 do rollout (§4): 7 dias sem `legacy_catch_all`.
-    await audit({
-      acao: 'legacy_catch_all',
-      metadata: {
-        channel_type: args.channel_type,
-        bot_line_external_id: botLine,
-        legacy_tenant_id: legacy.tenant_id,
-        legacy_agent_id: legacy.agent_id,
-        legacy_channel_id: legacy.channel_id,
-      },
-    });
-  } else if (botLine) {
-    // shadow: computa a divergência SEM mudar o resultado (§1.2). Divergente
-    // quando o exact pela linha aponta outro canal — ou não existe canal para
-    // a linha enquanto o legado resolveu.
-    const divergent = exactActive
-      ? exactActive.id !== legacy.channel_id
-      : true;
-    if (divergent) {
-      logger.warn(
-        {
-          bot_line_external_id: botLine,
-          exact_channel_id: exactActive?.id ?? null,
-          exact_tenant_id: exactActive?.tenant_id ?? null,
-          legacy_channel_id: legacy.channel_id,
-          legacy_tenant_id: legacy.tenant_id,
-        },
-        'channel_resolver.shadow_divergence',
-      );
-      await audit({
-        acao: 'shadow_divergence',
-        metadata: {
-          channel_type: args.channel_type,
-          bot_line_external_id: botLine,
-          exact_channel_id: exactActive?.id ?? null,
-          exact_tenant_id: exactActive?.tenant_id ?? null,
-          exact_agent_id: exactActive?.agent_id ?? null,
-          legacy_channel_id: legacy.channel_id,
-          legacy_tenant_id: legacy.tenant_id,
-          legacy_agent_id: legacy.agent_id,
-        },
-      });
-    }
-  }
-  return legacy;
-}
-
-async function resolveLegacy(args: {
   channel_type: 'whatsapp' | 'telegram' | 'email' | 'sms' | 'web' | 'api' | 'other';
   external_id: string;
 }): Promise<ChannelResolution> {
@@ -208,7 +81,6 @@ async function resolveLegacy(args: {
       tenant_id: channel.tenant_id,
       agent_id: channel.agent_id,
       channel_id: channel.id,
-      resolved_via: 'legacy',
     };
   }
 
@@ -251,7 +123,6 @@ async function resolveLegacy(args: {
       tenant_id: catchAll.channel.tenant_id,
       agent_id: catchAll.channel.agent_id,
       channel_id: catchAll.channel.id,
-      resolved_via: 'legacy',
     };
   }
 

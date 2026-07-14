@@ -27,62 +27,6 @@ import {
   requiredRolesFor,
   architectureLocksFor,
 } from '../../lib/approval-matrix.js';
-import type { ProfileTransitionFailure } from '../../../db/repositories/profile-repos.js';
-
-/**
- * Spec perfil-inbox v4 §1.4 — tradução das falhas de guard do perfil para as
- * MESMAS mensagens de CONFLICT/PRECONDITION_FAILED do caminho legado
- * (`agents.approveProfile`), agora vindas do motor unificado. O rollback já
- * desfez approval + audit — o retry do operador nunca é bloqueado como
- * duplicado (invariante 1b).
- */
-function profileTransitionToTrpcError(detail: ProfileTransitionFailure): TRPCError {
-  switch (detail.reason) {
-    case 'not_found':
-      return new TRPCError({ code: 'NOT_FOUND', message: 'Version not found' });
-    case 'agent_missing':
-      return new TRPCError({ code: 'NOT_FOUND', message: 'Agent not found' });
-    case 'invalid_source_status':
-      return new TRPCError({
-        code: 'CONFLICT',
-        message: 'Version is not in proposed state; refresh and retry',
-      });
-    case 'predecessor_conflict':
-      return new TRPCError({
-        code: 'CONFLICT',
-        message:
-          `Active profile changed since this proposal was authored ` +
-          `(expected predecessor ${String(detail.expected)}, current ${String(detail.current)}). ` +
-          `Refresh and re-propose against the current active version.`,
-      });
-    case 'migrated_legacy_proposal':
-      return new TRPCError({
-        code: 'CONFLICT',
-        message:
-          `This proposal was created by the v3.1.1 legacy backfill and has ` +
-          `no known predecessor lineage. Re-propose the change against the ` +
-          `current active version before approving.`,
-      });
-    case 'missing_predecessor':
-      return new TRPCError({
-        code: 'PRECONDITION_FAILED',
-        message:
-          `Proposal v${detail.proposed_version} has no predecessor lineage ` +
-          `(metadata.previous_version_id is null), but it is not a v1 intentional seed. ` +
-          (detail.current_predecessor === null
-            ? `There is no active version to chain from — if this agent has ` +
-              `frozen or rolled_back versions, re-propose the change against ` +
-              `the last known version explicitly.`
-            : `Current active version is ${String(detail.current_predecessor)} — ` +
-              `re-propose the change against it.`),
-      });
-    default:
-      return new TRPCError({
-        code: 'INTERNAL_SERVER_ERROR',
-        message: `Profile transition failed: ${(detail as { reason: string }).reason}`,
-      });
-  }
-}
 
 const GetInputSchema = z.object({
   id: z.string().uuid(),
@@ -111,7 +55,7 @@ export const proposalsRouter = router({
       if (!proposal) {
         throw new TRPCError({ code: 'NOT_FOUND', message: 'Proposal not found' });
       }
-      const approvals = await ctx.repos.proposalApprovalsRepo.listByProposal(input.id, tenantId);
+      const approvals = await ctx.repos.proposalApprovalsRepo.listByProposal(input.id);
       const approvalClass = getApprovalClassFor(proposal.type, proposal.risk);
       return {
         ...proposal,
@@ -166,7 +110,7 @@ export const proposalsRouter = router({
       // locking the source row. The pre-flight dup checks below are kept as a
       // fast-fail UX shortcut (avoids acquiring the DB lock for obvious
       // duplicates) but the authoritative check is transactional.
-      const existingFastCheck = await ctx.repos.proposalApprovalsRepo.listByProposal(input.id, tenantId);
+      const existingFastCheck = await ctx.repos.proposalApprovalsRepo.listByProposal(input.id);
 
       // Fast-fail: same user cannot record two approval rows.
       if (existingFastCheck.some((a) => a.approver_user_id === ctx.userId && a.decision === 'approved')) {
@@ -241,9 +185,6 @@ export const proposalsRouter = router({
             code: 'NOT_IMPLEMENTED',
             message: 'Approval for this proposal source is not implemented yet',
           });
-        }
-        if (result.reason === 'profile_transition_failed') {
-          throw profileTransitionToTrpcError(result.detail);
         }
         // round-2: transactional dup-check inside decideAtomically.
         if (result.reason === 'already_approved_by_user') {
@@ -333,9 +274,6 @@ export const proposalsRouter = router({
             code: 'NOT_IMPLEMENTED',
             message: 'Rejection for this proposal source is not implemented yet',
           });
-        }
-        if (result.reason === 'profile_transition_failed') {
-          throw profileTransitionToTrpcError(result.detail);
         }
         throw new TRPCError({
           code: 'INTERNAL_SERVER_ERROR',

@@ -19,7 +19,6 @@ type OutboxRow = {
   payload: { jid: string; text: string };
   occurrence_id: string | null;
   task_id: string | null;
-  channel_id: string | null;
   dedup_key: string | null;
   kind: 'whatsapp_text';
   sent_at: Date | null;
@@ -89,23 +88,6 @@ vi.mock('../../../src/gateway/baileys.js', () => ({
   isBaileysConnected: () => true,
 }));
 
-// Fase 0 (spec roteamento v4 §1.6): the drain sends via the single egress
-// boundary (`forCurrentAgentChannel(msg.channel_id ?? null)` → LineOutput).
-// Delegate sendText to the same spy so the backpressure counts still measure
-// real send attempts.
-const forCurrentAgentChannelMock = vi.fn(async (channel_id: string | null) => ({
-  scope: {
-    tenant_id: 'tenant-test',
-    agent_id: 'agent-test',
-    channel_id: channel_id ?? 'chan-sole-1',
-  },
-  sendText: (jid: string, text: string) => sendOutboundTextMock(jid, text),
-  isConnected: () => true,
-}));
-vi.mock('../../../src/gateway/line-output.js', () => ({
-  forCurrentAgentChannel: forCurrentAgentChannelMock,
-}));
-
 // Backpressure stub: token bucket sized to OUTBOX_MAX_PER_SECOND.
 const RATE_LIMIT = 2;
 let bucket = RATE_LIMIT;
@@ -153,7 +135,6 @@ describe('Requirement 2 — 10k backlog drains under backpressure', () => {
         payload: { jid: `j${i}@s.whatsapp.net`, text: 'x' },
         occurrence_id: null,
         task_id: null,
-        channel_id: null,
         dedup_key: null,
         kind: 'whatsapp_text',
         sent_at: null,
@@ -195,7 +176,6 @@ describe('Requirement 2 — 10k backlog drains under backpressure', () => {
       payload: { jid: 'j1@s.whatsapp.net', text: 'x' },
       occurrence_id: null,
       task_id: null,
-      channel_id: null,
       dedup_key: null,
       kind: 'whatsapp_text',
       sent_at: null,
@@ -213,7 +193,6 @@ describe('Requirement 2 — 10k backlog drains under backpressure', () => {
       payload: { jid: 'j2@s.whatsapp.net', text: 'y' },
       occurrence_id: null,
       task_id: null,
-      channel_id: null,
       dedup_key: null,
       kind: 'whatsapp_text',
       sent_at: null,
@@ -231,7 +210,6 @@ describe('Requirement 2 — 10k backlog drains under backpressure', () => {
       payload: { jid: 'j3@s.whatsapp.net', text: 'z' },
       occurrence_id: null,
       task_id: null,
-      channel_id: null,
       dedup_key: null,
       kind: 'whatsapp_text',
       sent_at: null,

@@ -95,12 +95,6 @@ const OB_EXPIRED_A = "3550aaaa-0000-0000-0000-00000000a031";
 const OB_DUE_B = "3550bbbb-0000-0000-0000-00000000b030";
 const OB_EXPIRED_B = "3550bbbb-0000-0000-0000-00000000b031";
 
-// Migration 090 (roteamento multi-linha, fase 0): rows whatsapp ENVIÁVEIS do
-// outbox exigem channel_id (CHECK outbox_sendable_requires_channel + FK
-// composta) — cada tenant ganha um canal fixo para os seeds abaixo.
-const CH_A = "3550aaaa-0000-0000-0000-00000000a040";
-const CH_B = "3550bbbb-0000-0000-0000-00000000b040";
-
 const ALL_OCC = [
   OCC_DUE_A,
   OCC_EXPIRED_A,
@@ -126,15 +120,6 @@ async function seedRows(c: pg.PoolClient): Promise<void> {
        VALUES ($1,$2,'Sched Leak Agent A'), ($3,$4,'Sched Leak Agent B')
        ON CONFLICT (id) DO NOTHING`,
     [AGENT_A, TENANT_A, AGENT_B, TENANT_B],
-  );
-  // channels (090): FK composta (tenant, agent, channel) para as rows
-  // whatsapp do outbox. Linhas E.164 distintas por tenant (índice global 091).
-  await c.query(
-    `INSERT INTO channels(id, tenant_id, agent_id, external_id, channel_type, display_name, active)
-       VALUES ($1,$2,$3,'+5511900035501','whatsapp','Sched Leak A', true),
-              ($4,$5,$6,'+5511900035502','whatsapp','Sched Leak B', true)
-       ON CONFLICT (id) DO NOTHING`,
-    [CH_A, TENANT_A, AGENT_A, CH_B, TENANT_B, AGENT_B],
   );
   // pessoas (series.owner_pessoa_id FK). Unique phone per pessoa.
   await c.query(
@@ -207,24 +192,23 @@ async function seedRows(c: pg.PoolClient): Promise<void> {
     ],
   );
   // outbox_messages: due-pending (claimDue) + expired-claimed (reclaimExpiredLeases).
-  // channel_id obrigatório em rows whatsapp enviáveis (CHECK 090).
   await c.query(
     `INSERT INTO outbox_messages
-        (id, tenant_id, agent_id, channel_id, kind, payload, status, claimed_by, claimed_at, next_attempt_at)
+        (id, tenant_id, agent_id, kind, payload, status, claimed_by, claimed_at, next_attempt_at)
       VALUES
-        ($1,$2,$3,$5,'whatsapp_text','{"jid":"x","text":"a"}'::jsonb,'pending', NULL,        NULL,                       now() - interval '1 minute'),
-        ($4,$2,$3,$5,'whatsapp_text','{"jid":"x","text":"a"}'::jsonb,'claimed', 'stale-w-a', now() - interval '1 hour', now() - interval '1 minute')
+        ($1,$2,$3,'whatsapp_text','{"jid":"x","text":"a"}'::jsonb,'pending', NULL,        NULL,                       now() - interval '1 minute'),
+        ($4,$2,$3,'whatsapp_text','{"jid":"x","text":"a"}'::jsonb,'claimed', 'stale-w-a', now() - interval '1 hour', now() - interval '1 minute')
       ON CONFLICT (id) DO NOTHING`,
-    [OB_DUE_A, TENANT_A, AGENT_A, OB_EXPIRED_A, CH_A],
+    [OB_DUE_A, TENANT_A, AGENT_A, OB_EXPIRED_A],
   );
   await c.query(
     `INSERT INTO outbox_messages
-        (id, tenant_id, agent_id, channel_id, kind, payload, status, claimed_by, claimed_at, next_attempt_at)
+        (id, tenant_id, agent_id, kind, payload, status, claimed_by, claimed_at, next_attempt_at)
       VALUES
-        ($1,$2,$3,$5,'whatsapp_text','{"jid":"x","text":"b"}'::jsonb,'pending', NULL,        NULL,                       now() - interval '1 minute'),
-        ($4,$2,$3,$5,'whatsapp_text','{"jid":"x","text":"b"}'::jsonb,'claimed', 'stale-w-b', now() - interval '1 hour', now() - interval '1 minute')
+        ($1,$2,$3,'whatsapp_text','{"jid":"x","text":"b"}'::jsonb,'pending', NULL,        NULL,                       now() - interval '1 minute'),
+        ($4,$2,$3,'whatsapp_text','{"jid":"x","text":"b"}'::jsonb,'claimed', 'stale-w-b', now() - interval '1 hour', now() - interval '1 minute')
       ON CONFLICT (id) DO NOTHING`,
-    [OB_DUE_B, TENANT_B, AGENT_B, OB_EXPIRED_B, CH_B],
+    [OB_DUE_B, TENANT_B, AGENT_B, OB_EXPIRED_B],
   );
 }
 
@@ -240,7 +224,6 @@ async function wipeRows(c: pg.PoolClient): Promise<void> {
 
 async function dropFixtures(c: pg.PoolClient): Promise<void> {
   await wipeRows(c);
-  await c.query(`DELETE FROM channels WHERE id = ANY($1)`, [[CH_A, CH_B]]);
   await c.query(`DELETE FROM pessoas WHERE id = ANY($1)`, [
     [PESSOA_A, PESSOA_B],
   ]);

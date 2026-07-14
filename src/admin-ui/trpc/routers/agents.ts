@@ -34,12 +34,6 @@ import { router, protectedProcedure } from '../server.js';
 import { resolveTenantId } from '../tenant-resolver.js';
 import { runWithTenantContext } from '../../../db/tenant-context.js';
 import { PROFILE_BODY_SCHEMA_VERSION, type ProfileBody } from '../../../db/schema.js';
-import { config } from '../../../config/env.js';
-import {
-  getApprovalClassFor,
-  requiresDualApproval,
-  requiredRolesFor,
-} from '../../lib/approval-matrix.js';
 import { ARCHETYPE_IDS, ARCHETYPE_PACK_MAP } from '../../../tools/archetype-packs.js';
 import { BASE_AGENT_PACKS } from '../../../tools/base-agent-packs.js';
 import { TOOL_PACKS, resolvePackTools } from '../../../tools/grant-math.js';
@@ -263,11 +257,9 @@ function buildProfileBody(
       voice: input.identity.voice,
       cognitive_limits: input.identity.cognitive_limits,
       priorities: input.identity.priorities,
-      // `principles` é campo canônico desde v3.1.2 (spec perfil-inbox §1.2) —
-      // sem cast: o tipo ProfileBody admite o campo diretamente.
       principles,
       learned_voice_modifiers: [],
-    },
+    } as ProfileBody['identity'] & { principles: string[] },
     style: {
       language: input.style.language,
       rhythm: input.style.rhythm,
@@ -370,12 +362,6 @@ export const agentsRouter = router({
     .input(ListInputSchema)
     .query(async ({ input, ctx }) => {
       const tenantId = resolveTenantId(ctx, input.tenantId);
-      // Spec perfil-inbox v4 §1.5/§3 fase B — com o source unificado ligado,
-      // os contadores/tabela NATIVOS do inbox assumem esta superfície; o card
-      // bespoke se esvazia para não contar a MESMA pendência duas vezes.
-      if (config.FEATURE_PROFILE_INBOX_SOURCE) {
-        return { items: [], total: 0 };
-      }
       const agents = await ctx.repos.agentsRepo.listByTenant(tenantId);
       const items: Array<{
         agent_id: string;
@@ -723,11 +709,10 @@ export const agentsRouter = router({
    * mutated without an audit row, AND so subsequent updateProfile approvals
    * don't get stuck on `already_has_active`.
    *
-   * Spec perfil-inbox v4 §1.5/§3 fase B — SHIM DEPRECADO (1 release): com
-   * `FEATURE_PROFILE_INBOX_SOURCE` ligada, a decisão passa pelo MOTOR
-   * UNIFICADO (`decideAtomically` + classes por risco computado, dual para
-   * high) — a aba Versões e o /inbox convergem no mesmo caminho, uma trilha
-   * por decisão. Com a flag desligada, mantém o wrapper legado byte-a-byte.
+   * Architecture-lock semantics are NOT applied here — operational profile is
+   * per-agent state, not part of the immutable identity_immutable_core. If we
+   * later decide it warrants dual approval, switch this to a Proposal Inbox
+   * source.
    */
   approveProfile: protectedProcedure
     .input(ApproveProfileInputSchema)
@@ -738,77 +723,6 @@ export const agentsRouter = router({
       const agent = await ctx.repos.agentsRepo.findById(input.agentId);
       if (!agent || agent.tenant_id !== tenantId) {
         throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent not found' });
-      }
-
-      if (config.FEATURE_PROFILE_INBOX_SOURCE) {
-        const proposal = await ctx.repos.proposalsUnifiedRepo.getOne(tenantId, input.versionId);
-        if (!proposal || proposal.type !== 'operational_profile') {
-          throw new TRPCError({ code: 'NOT_FOUND', message: 'Version not found' });
-        }
-        // Review PR #496 (alto 5): a versão precisa pertencer ao AGENTE do
-        // endpoint — sem este vínculo, agente A + versionId do agente B
-        // aprovaria B por aqui (mesmo tenant, escopo tenant+agent violado).
-        // O caminho legado impõe isso dentro do approveAndActivateAtomic
-        // (recebe agent_id); o motor unificado é keyed por (tenant, id),
-        // então o vínculo é imposto AQUI. NOT_FOUND, não FORBIDDEN: para
-        // este endpoint a versão de outro agente não existe.
-        if (proposal.agent_id !== agent.id) {
-          throw new TRPCError({ code: 'NOT_FOUND', message: 'Version not found' });
-        }
-        const approvalClass = getApprovalClassFor('operational_profile', proposal.risk);
-        const requiredRoles = requiredRolesFor(approvalClass);
-        const dualRequired = requiresDualApproval(approvalClass);
-        const decided = await ctx.repos.proposalsUnifiedRepo.decideAtomically({
-          tenantId,
-          proposalId: input.versionId,
-          type: 'operational_profile',
-          approvalClass,
-          actorId: ctx.userId,
-          actorRole: ctx.userRole,
-          decision: 'approved',
-          comment: input.comment,
-          dualComplete: !dualRequired,
-          gateParams: { dualRequired, requiredRoles, allLocks: [] },
-        });
-        if (!decided.ok) {
-          if (decided.reason === 'profile_transition_failed') {
-            // As mesmas traduções do caminho legado vivem no router de
-            // proposals; aqui replicamos os dois casos que o shim expõe e
-            // delegamos o resto ao INTERNAL (mesma superfície de erro).
-            const d = decided.detail;
-            if (d.reason === 'not_found' || d.reason === 'agent_missing') {
-              throw new TRPCError({ code: 'NOT_FOUND', message: 'Version not found' });
-            }
-            throw new TRPCError({
-              code:
-                d.reason === 'missing_predecessor' ? 'PRECONDITION_FAILED' : 'CONFLICT',
-              message: `Profile transition failed: ${d.reason}`,
-            });
-          }
-          if (decided.reason === 'not_found') {
-            throw new TRPCError({ code: 'NOT_FOUND', message: 'Version not found' });
-          }
-          if (decided.reason === 'invalid_source_status') {
-            throw new TRPCError({
-              code: 'CONFLICT',
-              message: 'Version is not in proposed state; refresh and retry',
-            });
-          }
-          throw new TRPCError({
-            code: 'CONFLICT',
-            message: `Approval failed: ${decided.reason}`,
-          });
-        }
-        // Dual pendente (high): nada transicionou — a segunda assinatura
-        // acontece no /inbox. O shape legado ganha os campos de dual para a
-        // aba Versões renderizar o estado.
-        return {
-          activated: decided.profile?.activated ?? null,
-          frozen_previous: decided.profile?.frozen_previous ?? null,
-          dual_required: dualRequired,
-          dual_complete: decided.dualComplete,
-          source_transitioned: decided.sourceTransitioned,
-        };
       }
 
       const result = await ctx.repos.operationalProfileVersionsRepo.approveAndActivateAtomic({
@@ -901,10 +815,6 @@ export const agentsRouter = router({
       return {
         activated: result.activated,
         frozen_previous: result.frozen_previous,
-        // Shape estável com o caminho do motor unificado (shim acima).
-        dual_required: false,
-        dual_complete: true,
-        source_transitioned: true,
       };
     }),
 });

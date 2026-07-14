@@ -1,4 +1,4 @@
-import { jidNormalizedUser, type WASocket } from '@whiskeysockets/baileys';
+import { jidNormalizedUser } from '@whiskeysockets/baileys';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 import { isBaileysConnected, getSocket } from './baileys.js';
@@ -24,22 +24,14 @@ function validJid(jid: string): boolean {
 }
 
 export function markRead(remote_jid: string, whatsapp_id: string): void {
-  if (!isBaileysConnected()) return;
-  const sock = getSocket();
-  if (!sock) return;
-  markReadVia(sock, remote_jid, whatsapp_id);
-}
-
-/**
- * Variante por socket (fase 3, spec roteamento v4 §1.5): os efêmeros da
- * sessão de cada LINHA saem pela própria sessão. A global delega aqui.
- */
-export function markReadVia(sock: WASocket, remote_jid: string, whatsapp_id: string): void {
   if (!config.FEATURE_PRESENCE) return;
+  if (!isBaileysConnected()) return;
   if (!validJid(remote_jid) || !whatsapp_id) {
     logger.warn({ remote_jid: '[REDACTED]' }, 'presence.invalid_jid_mark_read');
     return;
   }
+  const sock = getSocket();
+  if (!sock) return;
   sock
     .readMessages([{ remoteJid: remote_jid, id: whatsapp_id, fromMe: false }])
     .catch((err: Error) => logger.warn({ err: err.message }, 'presence.mark_read_failed'));
@@ -57,25 +49,17 @@ type Entry = {
 const handles = new Map<string, Entry>();
 
 export function startTyping(remote_jid: string, mensagem_id: string): TypingHandle {
-  if (!isBaileysConnected()) return NOOP_HANDLE;
-  const sock = getSocket();
-  if (!sock) return NOOP_HANDLE;
-  return startTypingVia(sock, remote_jid, mensagem_id);
-}
-
-/** Variante por socket — o mapa de handles é compartilhado (chave: mensagem). */
-export function startTypingVia(
-  sock: WASocket,
-  remote_jid: string,
-  mensagem_id: string,
-): TypingHandle {
   if (!config.FEATURE_PRESENCE) return NOOP_HANDLE;
+  if (!isBaileysConnected()) return NOOP_HANDLE;
   if (!validJid(remote_jid)) {
     logger.warn({ remote_jid: '[REDACTED]' }, 'presence.invalid_jid_typing');
     return NOOP_HANDLE;
   }
   const existing = handles.get(mensagem_id);
   if (existing) return existing.handle;
+
+  const sock = getSocket();
+  if (!sock) return NOOP_HANDLE;
 
   const send = (): Promise<void> =>
     sock
@@ -105,24 +89,14 @@ export function sendReaction(
   whatsapp_id: string,
   emoji: '✅' | '❌',
 ): void {
-  if (!isBaileysConnected()) return;
-  const sock = getSocket();
-  if (!sock) return;
-  sendReactionVia(sock, remote_jid, whatsapp_id, emoji);
-}
-
-/** Variante por socket — ver `markReadVia`. */
-export function sendReactionVia(
-  sock: WASocket,
-  remote_jid: string,
-  whatsapp_id: string,
-  emoji: '✅' | '❌',
-): void {
   if (!config.FEATURE_PRESENCE) return;
+  if (!isBaileysConnected()) return;
   if (!validJid(remote_jid) || !whatsapp_id) {
     logger.warn({ remote_jid: '[REDACTED]' }, 'presence.invalid_jid_reaction');
     return;
   }
+  const sock = getSocket();
+  if (!sock) return;
   sock
     .sendMessage(remote_jid, {
       react: { text: emoji, key: { remoteJid: remote_jid, id: whatsapp_id, fromMe: false } },
@@ -156,25 +130,14 @@ export async function sendPoll(
   options: ReadonlyArray<{ key: string; label: string }>,
 ): Promise<SendPollResult> {
   const empty: SendPollResult = { whatsapp_id: null, message_secret: null, creator_jid: null };
-  if (!isBaileysConnected()) return empty;
-  const sock = getSocket();
-  if (!sock) return empty;
-  return sendPollVia(sock, remote_jid, question, options);
-}
-
-/** Variante por socket — ver `markReadVia`. */
-export async function sendPollVia(
-  sock: WASocket,
-  remote_jid: string,
-  question: string,
-  options: ReadonlyArray<{ key: string; label: string }>,
-): Promise<SendPollResult> {
-  const empty: SendPollResult = { whatsapp_id: null, message_secret: null, creator_jid: null };
   if (!config.FEATURE_ONE_TAP) return empty;
+  if (!isBaileysConnected()) return empty;
   if (!validJid(remote_jid)) {
     logger.warn({ remote_jid: '[REDACTED]' }, 'presence.invalid_jid_send_poll');
     return empty;
   }
+  const sock = getSocket();
+  if (!sock) return empty;
   try {
     const result = await sock.sendMessage(remote_jid, {
       poll: {

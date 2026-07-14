@@ -36,9 +36,7 @@ import {
   validateBehavior,
   type ProfileFormValue,
 } from '../_components/profile-form.js';
-// Diff exaustivo compartilhado com o Inbox (spec perfil-inbox v4 §1.2 — um
-// único diff nas duas superfícies; deriva do walker de profile-risk.ts).
-import { DiffOperationalProfile } from '../../proposals/[id]/_components/diff-operational-profile.js';
+import { ProfileDiff } from '../_components/profile-diff.js';
 import ActivityTab from './_components/activity-tab.js';
 import PlaygroundTab from './_components/playground-tab.js';
 import ObjectivesTab from './_components/objectives-tab.js';
@@ -690,8 +688,8 @@ function VersionsTab({
       >
         <div className="space-y-4">
           {target && proposedBodies[target.id] !== undefined ? (
-            <DiffOperationalProfile
-              predecessorBody={activeBody}
+            <ProfileDiff
+              activeBody={activeBody}
               proposedBody={proposedBodies[target.id]}
             />
           ) : (

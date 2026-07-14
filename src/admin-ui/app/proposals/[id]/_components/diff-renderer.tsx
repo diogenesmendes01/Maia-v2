@@ -33,12 +33,6 @@ const SECTIONS: Record<ProposalTypeId, { title: string; description: string }> =
     title: 'Proposta de conhecimento',
     description: 'Entrada de conhecimento proposta para ativação.',
   },
-  operational_profile: {
-    title: 'Diff do perfil operacional',
-    description:
-      'Mudanças campo a campo vs. o predecessor declarado (DiffOperationalProfile — ' +
-      'ligado na fase A da integração do perfil ao Inbox).',
-  },
 };
 
 function BodyPre({ body }: { body: unknown }) {
