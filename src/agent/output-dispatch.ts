@@ -10,7 +10,7 @@ import type { Pessoa, Conversa, Mensagem } from '@/db/schema.js';
 import { audit } from '@/governance/audit.js';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
-import { sendOutboundText, sendOutboundDocument, sendOutboundVoice, isBaileysConnected } from '@/gateway/baileys.js';
+import { forCurrentAgentChannel, type LineOutput } from '@/gateway/line-output.js';
 import { synthesizeSpeech, OUTBOUND_VOICE_MAX_CHARS } from '@/lib/tts.js';
 import { quotedReplyContext } from '@/gateway/presence.js';
 import type { WAQuotedContext } from '@/gateway/presence.js';
@@ -247,8 +247,16 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
   // NOTHING reached the user. Tag it delivered:false (Codex #216 HIGH-1) so the
   // skill-execution caller falls through to ReAct (never silence) with no
   // double-send risk (nothing was dispatched).
+  //
+  // Fase 0 (spec roteamento v4 §1.6): a saída física passa pela fronteira
+  // única `LineOutput`, resolvida pelo canal da CONVERSA (rows legadas com
+  // channel_id NULL resolvem o canal único ativo do agente — ambíguo é
+  // fail-closed aqui mesmo, como pre-send). O transporte subjacente continua
+  // a sessão global (paridade byte-a-byte).
   let quotedContext: WAQuotedContext | undefined;
+  let line: LineOutput;
   try {
+    line = await forCurrentAgentChannel(c.channel_id);
     const shouldQuote =
       !!(inbound.conteudo && detectCorrection(inbound.conteudo)) ||
       (await pendingQuestionsRepo.findActiveSnapshot(c.id)) !== null;
@@ -279,7 +287,7 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
       const captionText = text.slice(0, 1024);
       let wid: string | null;
       try {
-        wid = await sendOutboundDocument(jid, pdf.path, {
+        wid = await line.sendDocument(jid, pdf.path, {
           mimetype: pdf.mimetype,
           fileName: pdf.fileName,
           caption: captionText,
@@ -310,7 +318,7 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
         // (→ ledger 'sent'); disambiguate by connection state (Codex #216
         // HIGH-1 + round-3 item 3). The tmp PDF is still removed by the
         // `finally` below either way.
-        if (isBaileysConnected()) {
+        if (line.isConnected()) {
           await recordLedgerSent(c.id, inbound.id, null);
           throw new OutboundDeliveryError(true, 'document_channel_sent_without_id');
         }
@@ -343,6 +351,7 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
         });
         await mensagensRepo.create({
           conversa_id: c.id,
+          channel_id: line.scope.channel_id,
           direcao: 'out',
           tipo: 'documento',
           conteudo: captionText,
@@ -395,7 +404,7 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
       if (ledger.skip) return; // already attempted; do NOT re-send
       let wid: string | null;
       try {
-        wid = await sendOutboundVoice(jid, voiceBuf, {
+        wid = await line.sendVoice(jid, voiceBuf, {
           quoted: quotedContext,
         });
       } catch (e) {
@@ -414,7 +423,7 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
       // (→ ledger 'sent'); disambiguate by connection state so a sent voice
       // note is never re-sent (Codex #216 HIGH-1 + round-3 item 3).
       if (!wid) {
-        if (isBaileysConnected()) {
+        if (line.isConnected()) {
           await recordLedgerSent(c.id, inbound.id, null);
           throw new OutboundDeliveryError(true, 'voice_channel_sent_without_id');
         }
@@ -438,6 +447,7 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
         });
         await mensagensRepo.create({
           conversa_id: c.id,
+          channel_id: line.scope.channel_id,
           direcao: 'out',
           tipo: 'audio',
           conteudo: text,
@@ -462,6 +472,7 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
         pending_question_id: latestPending?.id ?? null,
         quoted: quotedContext,
         tool_summaries: toolSummaries,
+        channel_id: c.channel_id,
       });
     }
     return;
@@ -475,6 +486,7 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
   if (usePoll && latestPending) {
     await sendOutboundPoll(pessoa.id, c.id, text, inbound.id, latestPending, {
       tool_summaries: toolSummaries,
+      channel_id: c.channel_id,
     });
     return;
   }
@@ -498,6 +510,7 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
     quoted: quotedContext,
     view_once,
     tool_summaries: toolSummaries,
+    channel_id: c.channel_id,
   });
   if (wid && view_once) {
     await audit({
@@ -644,6 +657,12 @@ export async function sendOutbound(
      * "## Eventos confirmados pelo backend" block.
      */
     tool_summaries?: ToolExecutionSummary[];
+    /**
+     * Fase 0 (spec roteamento v4 §1.6): canal da conversa. NULL/ausente cobre
+     * o legado — resolve o canal único ativo do agente (fail-closed em
+     * ambiguidade, tratado como pre-send).
+     */
+    channel_id?: string | null;
   },
 ): Promise<string | null> {
   // #227: claim the turn in the ledger BEFORE any work. If a prior attempt
@@ -654,13 +673,15 @@ export async function sendOutbound(
   const ledger = await claimOutboundLedgerOrFailOpen(conversa_id, in_reply_to, 'text');
   if (ledger.skip) return ledger.existing_provider_message_id;
 
-  // PRE-SEND (recipient + JID resolution). If any of this throws, or there's no
-  // recipient to resolve a JID for, NOTHING reached the user → tag
-  // delivered:false so callers recover (fall through / retry) without a
-  // double-send. Ledger: 'failed' (ambiguous=false) — definitely not sent yet,
-  // so a later attempt may retry.
+  // PRE-SEND (recipient + JID resolution + line da fronteira única). If any of
+  // this throws, or there's no recipient to resolve a JID for, NOTHING reached
+  // the user → tag delivered:false so callers recover (fall through / retry)
+  // without a double-send. Ledger: 'failed' (ambiguous=false) — definitely not
+  // sent yet, so a later attempt may retry.
   let jid: string;
+  let line: LineOutput;
   try {
+    line = await forCurrentAgentChannel(opts?.channel_id ?? null);
     const pessoa = await pessoasRepo.findById(pessoa_id);
     if (!pessoa) throw new OutboundDeliveryError(false, 'pessoa_not_found');
     // Reply to whatever JID the inbound used (handles `@lid` privacy IDs that
@@ -692,7 +713,7 @@ export async function sendOutbound(
   // double-send risk: the row is 'unknown'.
   let wid: string | null;
   try {
-    wid = await sendOutboundText(
+    wid = await line.sendText(
       jid,
       text,
       Object.keys(sendOpts).length ? sendOpts : undefined,
@@ -707,7 +728,7 @@ export async function sendOutbound(
   // so we don't drop silently NOR risk a double-send, and never persist a
   // phantom whatsapp_id:null row (Codex #216 HIGH-1 + round-3 item 3).
   if (wid === null) {
-    if (isBaileysConnected()) {
+    if (line.isConnected()) {
       await recordLedgerSent(conversa_id, in_reply_to, null);
       throw new OutboundDeliveryError(true, 'channel_sent_without_id');
     }
@@ -723,6 +744,7 @@ export async function sendOutbound(
   try {
     await mensagensRepo.create({
       conversa_id,
+      channel_id: line.scope.channel_id,
       direcao: 'out',
       tipo: 'texto',
       conteudo: text,
@@ -745,7 +767,7 @@ export async function sendOutboundPoll(
   text: string,
   in_reply_to: string,
   pending: { id: string; opcoes_validas: Array<{ key: string; label: string }> },
-  opts?: { tool_summaries?: ToolExecutionSummary[] },
+  opts?: { tool_summaries?: ToolExecutionSummary[]; channel_id?: string | null },
 ): Promise<{ fell_back: boolean }> {
   // #227: claim the turn before any work (no-op when flag off, fail-open on
   // DB throws). The same-row reclaim during a poll→text fallback (below) is
@@ -753,11 +775,14 @@ export async function sendOutboundPoll(
   const ledger = await claimOutboundLedgerOrFailOpen(conversa_id, in_reply_to, 'poll');
   if (ledger.skip) return { fell_back: false };
 
-  // PRE-SEND (recipient + JID): a throw or missing recipient means nothing was
-  // sent → delivered:false so the caller can recover (Codex #216 round-3).
-  // Ledger: 'failed' (ambiguous=false) — definitely not sent, retry allowed.
+  // PRE-SEND (recipient + JID + line): a throw or missing recipient means
+  // nothing was sent → delivered:false so the caller can recover (Codex #216
+  // round-3). Ledger: 'failed' (ambiguous=false) — definitely not sent, retry
+  // allowed.
   let jid: string;
+  let line: LineOutput;
   try {
+    line = await forCurrentAgentChannel(opts?.channel_id ?? null);
     const pessoa = await pessoasRepo.findById(pessoa_id);
     if (!pessoa) throw new OutboundDeliveryError(false, 'pessoa_not_found');
     jid = await resolveOutboundJid(pessoa, in_reply_to);
@@ -769,10 +794,9 @@ export async function sendOutboundPoll(
     await recordLedgerFailed(conversa_id, in_reply_to, err.message, false);
     throw err;
   }
-  const { sendPoll } = await import('@/gateway/presence.js');
-  let sent: Awaited<ReturnType<typeof sendPoll>>;
+  let sent: Awaited<ReturnType<LineOutput['sendPoll']>>;
   try {
-    sent = await sendPoll(jid, text, pending.opcoes_validas);
+    sent = await line.sendPoll(jid, text, pending.opcoes_validas);
   } catch (e) {
     // Transport throw is ambiguous (could be delivered-but-threw) → 'unknown'.
     //
@@ -805,6 +829,7 @@ export async function sendOutboundPoll(
     await sendOutbound(pessoa_id, conversa_id, `${text}\n\n${numbered}`, in_reply_to, {
       pending_question_id: pending.id,
       tool_summaries: opts?.tool_summaries,
+      channel_id: opts?.channel_id,
     });
     return { fell_back: true };
   }
@@ -814,6 +839,7 @@ export async function sendOutboundPoll(
   try {
     await mensagensRepo.create({
       conversa_id,
+      channel_id: line.scope.channel_id,
       direcao: 'out',
       tipo: 'texto',
       conteudo: text,

@@ -151,6 +151,31 @@ export const AUDIT_ACTIONS = [
   // this action is the canary for real `@lid` message loss as WhatsApp migrates
   // its addressing to LID. Triage detail lives in `metadata.resolver_details`.
   'channel_resolution_skipped_lid_unmapped',
+  // Roteamento multi-linha (spec 2026-07-09 Draft v4 §1.2/§1.6/§2.5/§3.6):
+  //  - shadow_divergence: modo shadow — o exact-match pela LINHA do bot
+  //    divergiu do resultado legado (gate da fase 2→3 do rollout).
+  //  - legacy_catch_all: modo exact_first — miss no exact e a resolução caiu
+  //    no caminho legado (gate da fase 3→4: 7 dias sem esta ação).
+  //  - channel_scope_mismatch: `forChannel` recusou um triplete inconsistente
+  //    (canal não pertence ao tenant/agent ou inativo) — invariante 2.
+  //  - line_session_transition: sessão de linha mudou de estado (connected/
+  //    recovering/closed) — invariante 6.
+  //  - pairing_session_*: ciclo §2.5 (declarado→verificado); `verified` ativa
+  //    o canal; `failed` cobre mismatch de número, TTL e 23505 do índice
+  //    global (linha já pertence a outro workspace).
+  'shadow_divergence',
+  'legacy_catch_all',
+  'channel_scope_mismatch',
+  'line_session_transition',
+  'pairing_session_started',
+  'pairing_session_verified',
+  'pairing_session_failed',
+  // Staging de inbound não-roteado (§1.4, modo strict): staged na chegada sem
+  // rota; handed_off quando o replay entrega na pipeline normal (dedup por
+  // canal); expired no TTL de 72h (sweeper).
+  'inbound_staged',
+  'inbound_unrouted_handed_off',
+  'inbound_unrouted_expired',
   // Issue #289 — emitted by scripts/embeddings-rebuild.ts when the embedding
   // provider returns a vector with the wrong dimension (or no vector at all)
   // for a row. We skip the UPDATE so the previous run's re-detection

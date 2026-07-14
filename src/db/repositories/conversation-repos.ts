@@ -17,7 +17,15 @@ import {
 import type { Conversa, Mensagem, PendingQuestion } from '../schema.js';
 
 export const conversasRepo = {
-  async findActive(pessoa_id: string): Promise<Conversa | null> {
+  /**
+   * 090 (spec roteamento v4 §1.6) — a identidade da conversa inclui o CANAL:
+   * com um agente em N linhas, a mesma pessoa em duas linhas são DUAS
+   * conversas (sem isso a resposta sairia pela linha da conversa anterior).
+   * `channel_id` informado ⇒ casa a conversa daquele canal OU uma legada
+   * (channel_id NULL — janela de transição; preferência para o match exato).
+   * `channel_id` omitido ⇒ comportamento legado (chamadores proativos).
+   */
+  async findActive(pessoa_id: string, channel_id?: string | null): Promise<Conversa | null> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
     const rows = await db
@@ -29,9 +37,15 @@ export const conversasRepo = {
           eq(conversas.agent_id, agent_id),
           eq(conversas.pessoa_id, pessoa_id),
           eq(conversas.status, 'ativa'),
+          ...(channel_id
+            ? [sql`(${conversas.channel_id} = ${channel_id} OR ${conversas.channel_id} IS NULL)`]
+            : []),
         ),
       )
-      .orderBy(desc(conversas.ultima_atividade_em))
+      .orderBy(
+        ...(channel_id ? [desc(sql`${conversas.channel_id} IS NOT NULL`)] : []),
+        desc(conversas.ultima_atividade_em),
+      )
       .limit(1);
     return rows[0] ?? null;
   },
@@ -54,13 +68,46 @@ export const conversasRepo = {
   async create(input: {
     pessoa_id: string;
     escopo_entidades: string[];
+    /** 090 — conversas novas do caminho resolvido nascem COM canal. */
+    channel_id?: string | null;
   }): Promise<Conversa> {
     const guarded = applyTenantGuard({
       pessoa_id: input.pessoa_id,
       escopo_entidades: input.escopo_entidades,
+      channel_id: input.channel_id ?? null,
     });
     const rows = await db.insert(conversas).values(guarded).returning();
     return rows[0]!;
+  },
+  /**
+   * Review PR #496 (alto 6) — vincula ATOMICAMENTE uma conversa LEGADA
+   * (channel_id NULL) ao primeiro canal resolvido que a reencontra. Sem o
+   * vínculo, a conversa legada casa qualquer linha no `findActive` mas a
+   * saída (`forCurrentAgentChannel(null)`) exige canal único do agente —
+   * com 2+ linhas ativas toda resposta lançaria `channel_ambiguous` e a
+   * conversa ficaria MUDA até encerrar.
+   *
+   * O predicado `channel_id IS NULL` faz do UPDATE um CAS: na corrida entre
+   * duas linhas, a primeira vence e a segunda recebe `false` (o caller
+   * reencontra/cria a conversa da própria linha). Nunca sobrescreve um
+   * vínculo existente.
+   */
+  async bindChannelIfNull(id: string, channel_id: string): Promise<boolean> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .update(conversas)
+      .set({ channel_id })
+      .where(
+        and(
+          eq(conversas.tenant_id, tenant_id),
+          eq(conversas.agent_id, agent_id),
+          eq(conversas.id, id),
+          isNull(conversas.channel_id),
+        ),
+      )
+      .returning({ id: conversas.id });
+    return rows.length > 0;
   },
   async touch(id: string): Promise<void> {
     // Flip-readiness (#323): scope the last-activity bump to the current
@@ -295,22 +342,37 @@ export const conversasRepo = {
   },
 };
 
+// 090 — `channel_id` (linha) é opcional na escrita: rows novas do caminho
+// resolvido DEVEM passá-lo (dedup por canal); legado/proativo sem canal grava
+// NULL (coberto pela partial unique legada por tenant+agent).
+type MensagemInsertInput = Omit<
+  Mensagem,
+  'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'channel_id'
+> & { channel_id?: string | null };
+
 export const mensagensRepo = {
-  async create(input: Omit<Mensagem, 'id' | 'tenant_id' | 'agent_id' | 'created_at'>): Promise<Mensagem> {
-    const guarded = applyTenantGuard(input);
+  async create(input: MensagemInsertInput): Promise<Mensagem> {
+    const guarded = applyTenantGuard({ ...input, channel_id: input.channel_id ?? null });
     const rows = await db.insert(mensagens).values(guarded).returning();
     return rows[0]!;
   },
   async createInbound(
-    input: Omit<Mensagem, 'id' | 'tenant_id' | 'agent_id' | 'created_at'>,
+    input: MensagemInsertInput,
   ): Promise<{ row: Mensagem; duplicate: boolean }> {
     const wid = (input.metadata as Record<string, unknown> | null)?.['whatsapp_id'];
-    if (typeof wid === 'string' && wid.length > 0) {
-      const existing = await this.findByWhatsappId(wid);
-      if (existing) return { row: existing, duplicate: true };
-    }
+    // 090 (spec roteamento v4 §1.7) — o pre-check espelha as partial uniques:
+    // com canal conhecido, um retry NA MESMA linha (ou de uma row legada sem
+    // canal, janela de transição) é duplicata; o MESMO whatsapp_id vindo de
+    // OUTRA linha do agente NÃO é (invariante 3 — nunca descartar por colisão
+    // cross-linha). Sem canal (legado), comportamento anterior por tenant.
+    const findExisting = async (): Promise<Mensagem | null> => {
+      if (typeof wid !== 'string' || wid.length === 0) return null;
+      return this.findByWhatsappId(wid, input.channel_id ?? undefined);
+    };
+    const preExisting = await findExisting();
+    if (preExisting) return { row: preExisting, duplicate: true };
     try {
-      const guarded = applyTenantGuard(input);
+      const guarded = applyTenantGuard({ ...input, channel_id: input.channel_id ?? null });
       const rows = await db.insert(mensagens).values(guarded).returning();
       return { row: rows[0]!, duplicate: false };
     } catch (err) {
@@ -318,7 +380,7 @@ export const mensagensRepo = {
       // pgErrorCode unwraps Drizzle's DrizzleQueryError so the underlying pg
       // SQLSTATE (on `.cause`) is read, not the wrapper's undefined code.
       if (typeof wid === 'string' && pgErrorCode(err) === '23505') {
-        const existing = await this.findByWhatsappId(wid);
+        const existing = await findExisting();
         if (existing) return { row: existing, duplicate: true };
       }
       throw err;
@@ -393,7 +455,16 @@ export const mensagensRepo = {
       .limit(1);
     return rows[0] ?? null;
   },
-  async findByWhatsappId(whatsapp_id: string): Promise<Mensagem | null> {
+  /**
+   * 090 (spec roteamento v4 §1.7) — `channel_id` opcional escopa o lookup à
+   * LINHA: match do canal OU row legada (channel NULL, janela de transição).
+   * Omitido ⇒ comportamento anterior (qualquer canal do tenant/agent), usado
+   * pelos consumidores que não conhecem a linha (edits/gap-detector).
+   */
+  async findByWhatsappId(
+    whatsapp_id: string,
+    channel_id?: string | null,
+  ): Promise<Mensagem | null> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
     const rows = await db
@@ -404,8 +475,12 @@ export const mensagensRepo = {
           eq(mensagens.tenant_id, tenant_id),
           eq(mensagens.agent_id, agent_id),
           sql`metadata->>'whatsapp_id' = ${whatsapp_id}`,
+          ...(channel_id
+            ? [sql`(${mensagens.channel_id} = ${channel_id} OR ${mensagens.channel_id} IS NULL)`]
+            : []),
         ),
       )
+      .orderBy(...(channel_id ? [desc(sql`${mensagens.channel_id} IS NOT NULL`)] : []))
       .limit(1);
     return rows[0] ?? null;
   },
@@ -624,10 +699,26 @@ export const mensagensRepo = {
     id: string;
     tenant_id: string;
     agent_id: string;
+    /**
+     * 090 (spec roteamento v4 §1.7) — canal resolvido para o inbound. Na fase
+     * 0 a sessão global não conhece o canal na PERSISTÊNCIA (o resolver roda
+     * depois), então o carimbo acontece aqui, na adoção — a FK composta
+     * (tenant, agent, channel) é satisfeita por construção: o canal veio de
+     * `resolveChannel` sob o MESMO (tenant, agent) que este UPDATE grava.
+     * Nas fases 1+ (multi-linha) o `createInbound` da sessão da linha carimba
+     * direto e este parâmetro vira redundância inofensiva (COALESCE mantém).
+     */
+    channel_id?: string | null;
   }): Promise<boolean> {
     const updated = await db
       .update(mensagens)
-      .set({ tenant_id: args.tenant_id, agent_id: args.agent_id })
+      .set({
+        tenant_id: args.tenant_id,
+        agent_id: args.agent_id,
+        ...(args.channel_id
+          ? { channel_id: sql`COALESCE(${mensagens.channel_id}, ${args.channel_id})` }
+          : {}),
+      })
       .where(
         and(
           eq(mensagens.id, args.id),
@@ -679,21 +770,33 @@ export const mensagensRepo = {
   // (now-adopted) original and the edit/revoke would be silently dropped
   // (Codex BLOQUEADO iteração 2: edit_unknown_original / revoke_unknown_original).
   //
-  // Safety: `migrations/003_review_fixes.sql` declares
-  //   CREATE UNIQUE INDEX uniq_mensagens_whatsapp_id
-  //     ON mensagens ((metadata->>'whatsapp_id')) WHERE metadata ? 'whatsapp_id';
-  // So at most one row exists for a given whatsapp_id globally — no
-  // cross-tenant ambiguity. The caller (gateway/baileys.ts) re-enters
-  // `runWithTenantContext({tenant_id, agent_id})` of the resolved row
-  // before invoking `routeMessageUpdate`, restoring full tenant scoping
-  // for every downstream read/write.
+  // Safety (ATUALIZADO em 090 — spec roteamento v4 §1.7): a unicidade de
+  // whatsapp_id deixou de ser GLOBAL (colidiria entre linhas/tenants com
+  // N sessões). Rows novas dedupam por (channel_id, whatsapp_id); legadas por
+  // (tenant, agent, whatsapp_id). Por isso este lookup passa a receber o
+  // CANAL da sessão que entregou o evento (review v4, bloqueante 1) e resolve
+  // DENTRO desse escopo: `channel_id` informado ⇒ match do canal OU row
+  // legada (channel NULL, no máximo uma por unique legada); omitido (sessão
+  // sem canal registrado — janela mono-linha) ⇒ comportamento anterior, mas
+  // preferindo a row mais recente para desempate determinístico.
+  // O caller (gateway/baileys.ts) re-entra `runWithTenantContext` do dono da
+  // row antes de rotear, restaurando o escopo pleno.
   async findByWhatsappIdCrossTenant(
     whatsapp_id: string,
+    channel_id?: string | null,
   ): Promise<Mensagem | null> {
     const rows = await db
       .select()
       .from(mensagens)
-      .where(sql`metadata->>'whatsapp_id' = ${whatsapp_id}`)
+      .where(
+        and(
+          sql`metadata->>'whatsapp_id' = ${whatsapp_id}`,
+          ...(channel_id
+            ? [sql`(${mensagens.channel_id} = ${channel_id} OR ${mensagens.channel_id} IS NULL)`]
+            : []),
+        ),
+      )
+      .orderBy(desc(sql`${mensagens.channel_id} IS NOT NULL`), desc(mensagens.created_at))
       .limit(1);
     return rows[0] ?? null;
   },

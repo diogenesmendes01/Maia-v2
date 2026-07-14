@@ -274,4 +274,55 @@ export async function registerSetupRoutes(app: FastifyInstance): Promise<void> {
     applyHeaders(reply);
     return reply.type('text/html').send(renderDone());
   });
+
+  // ── §2.5 (spec roteamento v4) — pareamento de LINHAS ADICIONAIS ──────────
+  // Canais whatsapp DECLARADOS (inativos, criados no admin-ui) provam a posse
+  // da linha aqui: POST inicia a PairingSession (QR ou código de 8 dígitos),
+  // GET status entrega qr/código + fase, POST abort encerra. Auth: o mesmo
+  // token de operador do /setup (a autenticação é o token na query — não há
+  // cookie de sessão, então CSRF não se aplica a estes endpoints JSON).
+  // API JSON: o fluxo interativo é consumido pelo admin-ui/curl do operador.
+  const linePairing = await import('./line-pairing.js');
+
+  app.post('/setup/channels/:channelId/pair', async (req, reply) => {
+    if (!(await authGate(req, reply))) return;
+    const { channelId } = req.params as { channelId: string };
+    const body = (req.body ?? {}) as { method?: 'qr' | 'code' };
+    const method = body.method === 'code' ? ('code' as const) : ('qr' as const);
+    const result = await linePairing.startChannelPairing({
+      channel_id: channelId,
+      method,
+    });
+    if (!result.ok) {
+      const code =
+        result.error === 'channel_not_found'
+          ? 404
+          : result.error === 'pairing_in_progress' || result.error === 'already_active'
+            ? 409
+            : 400;
+      return reply.code(code).type('application/json').send({ ok: false, error: result.error });
+    }
+    return reply.type('application/json').send({ ok: true });
+  });
+
+  app.get(
+    '/setup/channels/:channelId/pair/status',
+    { config: { rateLimit: false } },
+    async (req, reply) => {
+      if (!(await authGate(req, reply))) return;
+      const { channelId } = req.params as { channelId: string };
+      const st = linePairing.channelPairingStatus(channelId);
+      // O QR cru é entregue aqui (JSON de operador autenticado) — diferente do
+      // /setup primário, esta superfície não tem página HTML própria; o
+      // consumidor renderiza o QR localmente.
+      return reply.type('application/json').send(st);
+    },
+  );
+
+  app.post('/setup/channels/:channelId/pair/abort', async (req, reply) => {
+    if (!(await authGate(req, reply))) return;
+    const { channelId } = req.params as { channelId: string };
+    await linePairing.abortChannelPairing(channelId);
+    return reply.type('application/json').send({ ok: true });
+  });
 }

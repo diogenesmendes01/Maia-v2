@@ -387,6 +387,7 @@ describe('P6 channel/role/policy — end-to-end', () => {
       tenant_id: 'primary',
       agent_id: 'primary',
       channel_id: 'primary-channel-uuid',
+      resolved_via: 'legacy',
     });
 
     // (b) MULTI-TENANT: existe um canal ativo de outro tenant → o catch-all

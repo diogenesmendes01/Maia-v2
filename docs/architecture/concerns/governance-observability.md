@@ -161,6 +161,27 @@ At last verification:
 - Runtime-trace P10b — implemented; admin-ui trace exploration still maturing.
 - Capability dialogical-acquisition 4-level escalation — in production; loop closure post-acquisition still being tuned.
 
+## 7.5 Documented exception — staging de inbound não-roteado (`inbound_unrouted`)
+
+Spec `2026-07-09-multi-agent-channel-routing-design` §1.4 (modo `strict`): um
+inbound cuja LINHA não resolve para nenhum canal ativo não é descartado — é
+**estagiado fora de qualquer tenant** (não há tenant a atribuir; descobrir o
+dono é exatamente o que falhou). Esta é uma exceção CONSCIENTE ao invariante
+de escopo por tenant, mitigada por:
+
+- **Cifragem**: payload selado em envelope AES-256-GCM versionado
+  (`src/gateway/staging-crypto.ts`), keyring via `MAIA_STAGING_KEYRING` +
+  `MAIA_STAGING_ACTIVE_KEY_ID`; uma chave só sai do keyring quando nenhuma
+  row `pending` a referencia (canário no worker `unrouted_recovery`).
+- **TTL**: 72h — rows `pending` vencidas viram `expired` (auditadas como
+  `inbound_unrouted_expired`), nunca acumulam indefinidamente.
+- **Acesso restrito**: só `inboundUnroutedRepo` + o worker de replay tocam a
+  tabela; nenhum caminho de leitura de produto a expõe.
+- **Trilha completa**: `inbound_staged` → `inbound_unrouted_handed_off` /
+  `inbound_unrouted_expired` no audit; o handoff entrega pela pipeline normal
+  sob o tenant RESOLVIDO (o dedup por canal de `mensagens` impede entrega
+  dupla na corrida com o caminho vivo).
+
 ## 8. In-flight changes
 
 At last verification (2026-05-28):

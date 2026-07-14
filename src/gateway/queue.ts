@@ -1,4 +1,5 @@
 import { Queue, Worker, type Job } from 'bullmq';
+import { createHash } from 'node:crypto';
 import IORedis from 'ioredis';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
@@ -139,8 +140,88 @@ export async function enqueueAgent(data: AgentJob): Promise<void> {
   }
 }
 
+// ─── §1.4 (spec roteamento v4) — replay de inbound NÃO-ROTEADO (strict) ────
+//
+// O job carrega SÓ o id da row (payload cifrado fica no Postgres). O jobId é
+// ESTÁVEL (`unroutedReplayJobId(line, wid)`) para que commit + re-arm +
+// recovery sweep sejam idempotentes — nunca dois jobs vivos para a mesma row.
+//
+// Política de retenção deliberada: `removeOnFail` imediato — a ROW pending é
+// o registro durável (TTL 72h); um job que esgotou tentativas é removido para
+// que o recovery sweep possa re-armar com o MESMO jobId no próximo tick
+// (um failed retido bloquearia o re-add até a expiração da retenção).
+export type UnroutedReplayJob = { unrouted_id: string };
+
+export const unroutedQueue = new Queue<UnroutedReplayJob>('unrouted-replay', { connection });
+
+let unroutedWorker: Worker<UnroutedReplayJob> | null = null;
+
+export function startUnroutedReplayWorker(
+  processor: (job: Job<UnroutedReplayJob>) => Promise<void>,
+): Worker<UnroutedReplayJob> {
+  if (unroutedWorker) return unroutedWorker;
+  unroutedWorker = new Worker<UnroutedReplayJob>(
+    'unrouted-replay',
+    async (job) => {
+      // Mesmo racional do agent worker (#369): a janela pré-resolução nunca
+      // roda sem contexto — o replay resolve o tenant por dentro.
+      await runWithSystemContext(() => processor(job));
+    },
+    {
+      connection,
+      concurrency: 1,
+      removeOnComplete: { age: 86_400 },
+      removeOnFail: { count: 0 },
+    },
+  );
+  unroutedWorker.on('failed', (job, err) => {
+    logger.warn(
+      { job_id: job?.id, err: err?.message },
+      'unrouted_replay.job_failed_will_be_rearmed_by_sweep',
+    );
+  });
+  return unroutedWorker;
+}
+
+/**
+ * jobId ESTÁVEL e determinístico por (linha, wid) — a chave natural do
+ * staging. BullMQ reserva ':' em custom ids (separador de keys no Redis;
+ * hoje só uma exceção de compat deprecada deixa 3 segmentos passarem —
+ * review PR #496 alto 2), então a identidade vira um digest: mesmo par ⇒
+ * mesmo id, sem caractere reservado, sem depender do formato da linha/wid.
+ */
+export function unroutedReplayJobId(line_external_id: string, whatsapp_message_id: string): string {
+  const digest = createHash('sha256')
+    .update(`${line_external_id}:${whatsapp_message_id}`)
+    .digest('hex');
+  return `unrouted-${digest.slice(0, 40)}`;
+}
+
+/**
+ * Arma (ou re-arma) o job de replay. Idempotente: BullMQ ignora o add quando
+ * já existe job com o mesmo jobId — exatamente o contrato do §1.4 (conflito
+ * no insert re-arma; sweep re-arma; nunca duplica).
+ */
+export async function enqueueUnroutedReplay(args: {
+  unrouted_id: string;
+  line_external_id: string;
+  whatsapp_message_id: string;
+}): Promise<void> {
+  await unroutedQueue.add(
+    'replay',
+    { unrouted_id: args.unrouted_id },
+    {
+      jobId: unroutedReplayJobId(args.line_external_id, args.whatsapp_message_id),
+      attempts: 5,
+      backoff: { type: 'exponential', delay: 30_000 },
+    },
+  );
+}
+
 export async function shutdownQueue(): Promise<void> {
   await worker?.close();
+  await unroutedWorker?.close();
   await agentQueue.close();
+  await unroutedQueue.close();
   await connection.quit();
 }

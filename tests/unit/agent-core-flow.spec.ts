@@ -44,6 +44,23 @@ vi.mock('../../src/gateway/baileys.js', () => ({
   sendOutboundText, sendOutboundDocument, sendOutboundVoice,
   isBaileysConnected: () => true,
 }));
+// Fase 0 do roteamento multi-linha (spec 2026-07-09 §1.6): todo envio físico
+// passa pela fronteira única `LineOutput` resolvida via forCurrentAgentChannel.
+// Wire the line's methods to the SAME spies the assertions below observe so
+// the routing contract (text/PDF/voice/poll) keeps being verified end-to-end.
+vi.mock('../../src/gateway/line-output.js', () => ({
+  forCurrentAgentChannel: vi.fn(async () => ({
+    scope: { tenant_id: 'primary', agent_id: 'primary', channel_id: 'ch-primary' },
+    sendText: sendOutboundText,
+    sendDocument: sendOutboundDocument,
+    sendVoice: sendOutboundVoice,
+    sendPoll,
+    sendReaction: vi.fn(),
+    startTyping: vi.fn(() => ({ stop: vi.fn() })),
+    markRead: vi.fn(),
+    isConnected: () => true,
+  })),
+}));
 // P11: the Decision Engine is always-on and would otherwise hit real prod
 // adapters (DB/Redis) here. Mock it to a no-op pass-through (engine_ran:false →
 // agent/core.ts proceeds straight to the LLM path, the behaviour these output-

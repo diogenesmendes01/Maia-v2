@@ -78,12 +78,33 @@ vi.mock('@/gateway/presence.js', () => ({
 }));
 vi.mock('@/agent/reflection.js', () => ({ detectCorrection: () => false }));
 vi.mock('@/agent/pdf-cleanup.js', () => ({ cleanupPDF }));
+// Fase 0 do roteamento multi-linha (spec 2026-07-09 §1.6): dispatchOutput agora
+// envia pela fronteira única LineOutput. A linha é mockada APENAS na resolução
+// de canal (DB/ALS) — os sends roteiam para as primitivas REAIS de baileys.ts,
+// preservando o objetivo do teste: o readFile REAL falhando DENTRO do
+// sendOutboundDocument REAL chega tagueado como delivered:false.
+vi.mock('@/gateway/line-output.js', () => ({
+  forCurrentAgentChannel: vi.fn(async () => {
+    const baileys = await import('@/gateway/baileys.js');
+    return {
+      scope: { tenant_id: 't', agent_id: 'a', channel_id: 'ch-1' },
+      sendText: baileys.sendOutboundText,
+      sendDocument: baileys.sendOutboundDocument,
+      sendVoice: baileys.sendOutboundVoice,
+      sendPoll: vi.fn(),
+      sendReaction: vi.fn(),
+      startTyping: vi.fn(() => ({ stop: vi.fn() })),
+      markRead: vi.fn(),
+      isConnected: baileys.isBaileysConnected,
+    };
+  }),
+}));
 
 import { dispatchOutput, safeDispatchOutput, OutboundDeliveryError } from '@/agent/output-dispatch.js';
 import * as baileys from '@/gateway/baileys.js';
 
 const pessoa = { id: 'p_1', telefone_whatsapp: '+5511999999999', preferencias: null } as unknown as Pessoa;
-const conversa = { id: 'c_1' } as Conversa;
+const conversa = { id: 'c_1', channel_id: null } as Conversa;
 const inbound = { id: 'msg_1', conteudo: 'manda o extrato', metadata: null, tipo: 'texto' } as unknown as Mensagem;
 
 // Fresh ctx each call with a NEW random missing path so the real readFile is the
