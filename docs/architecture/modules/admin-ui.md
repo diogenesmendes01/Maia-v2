@@ -79,10 +79,10 @@ The admin-ui consumes the main app's DB schema + repositories directly (shared `
 
 ## In-flight changes
 
-At last verification (2026-07-09):
+At last verification (2026-07-14):
 
 - Fases 1–4 do relatório de complexidade de configuração mescladas (#491, #492, #493)
-- Próximos (specs em `docs/superpowers/specs/`): roteamento multi-agente no gateway (substituir o catch-all `primary/primary`, issue #411) e perfil operacional como source do Proposal Inbox (dual-approval)
+- Roteamento multi-agente no gateway e perfil operacional como source do Proposal Inbox (dual-approval) IMPLEMENTADOS (#496 — fases A/B atrás de flag); a fase C (este módulo: decisão só no motor unificado, sem shim/card/flag) está no PR #499
 
 Verify: `gh pr list --state open --search "admin-ui"`.
 
@@ -90,5 +90,5 @@ Verify: `gh pr list --state open --search "admin-ui"`.
 
 | | |
 |---|---|
-| Last verified | 2026-07-09 |
-| Against `main` HEAD | `2afe7aa` |
+| Last verified | 2026-07-14 |
+| Against `main` HEAD | `dc835ef` |
