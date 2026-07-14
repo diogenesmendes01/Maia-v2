@@ -17,6 +17,7 @@ import { rm } from 'node:fs/promises';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 import { audit } from '@/governance/audit.js';
+import { runWithTenantContext } from '@/db/tenant-context.js';
 import { channelsRepo, normalizeWhatsappLine } from '@/db/repositories/channel-repos.js';
 import {
   getLineSessionManager,
@@ -47,20 +48,32 @@ export function channelPairingStatus(channel_id: string): ChannelPairingState {
   return pairings.get(channel_id) ?? IDLE;
 }
 
+/**
+ * Audita o ciclo de pareamento sob o ALS do (tenant, agent) DONO do canal
+ * (review #498 alto 2): sem o wrap, `audit()` caía no bucket `system` —
+ * tenant/agente só em metadata não corrige colunas nem labels de métricas.
+ */
+function auditScoped(
+  channel: { tenant_id: string; agent_id: string },
+  input: Parameters<typeof audit>[0],
+): Promise<void> {
+  return runWithTenantContext(
+    { tenant_id: channel.tenant_id, agent_id: channel.agent_id },
+    () => audit(input),
+  );
+}
+
 export async function startChannelPairing(args: {
   channel_id: string;
   method: 'qr' | 'code';
 }): Promise<{ ok: true } | { ok: false; error: string }> {
-  const current = pairings.get(args.channel_id);
-  if (current?.phase === 'pairing') return { ok: false, error: 'pairing_in_progress' };
+  const previous = pairings.get(args.channel_id);
+  if (previous?.phase === 'pairing') return { ok: false, error: 'pairing_in_progress' };
 
-  const channel = await channelsRepo.getByIdCrossTenant(args.channel_id);
-  if (!channel) return { ok: false, error: 'channel_not_found' };
-  if (channel.channel_type !== 'whatsapp') return { ok: false, error: 'not_whatsapp' };
-  if (channel.active) return { ok: false, error: 'already_active' };
-  const declared = normalizeWhatsappLine(channel.external_id);
-  if (!declared) return { ok: false, error: 'invalid_line' };
-
+  // Reserva SÍNCRONA do slot ANTES de qualquer await (review #498 alto 4):
+  // com o acesso ao DB entre o teste acima e o set, duas requisições
+  // concorrentes passavam ambas e subiam duas PairingSessions para o mesmo
+  // canal. Se a validação abaixo falhar, o slot anterior é restaurado.
   const state: ChannelPairingState = {
     phase: 'pairing',
     method: args.method,
@@ -69,8 +82,25 @@ export async function startChannelPairing(args: {
     error: null,
     actual_line: null,
   };
-  pairings.set(channel.id, state);
-  await audit({
+  pairings.set(args.channel_id, state);
+  const releaseReservation = (error: string): { ok: false; error: string } => {
+    if (previous) pairings.set(args.channel_id, previous);
+    else pairings.delete(args.channel_id);
+    return { ok: false, error };
+  };
+  // Só substitui o estado visível se o slot ainda for DESTA tentativa — um
+  // abort do operador (reset para IDLE) ou um pairing novo não podem ser
+  // sobrescritos por callbacks atrasados desta sessão.
+  const stillCurrent = (): boolean => pairings.get(args.channel_id) === state;
+
+  const channel = await channelsRepo.getByIdCrossTenant(args.channel_id);
+  if (!channel) return releaseReservation('channel_not_found');
+  if (channel.channel_type !== 'whatsapp') return releaseReservation('not_whatsapp');
+  if (channel.active) return releaseReservation('already_active');
+  const declared = normalizeWhatsappLine(channel.external_id);
+  if (!declared) return releaseReservation('invalid_line');
+
+  await auditScoped(channel, {
     acao: 'pairing_session_started',
     metadata: {
       channel_id: channel.id,
@@ -96,13 +126,15 @@ export async function startChannelPairing(args: {
     .then(async (result) => {
       if (!result.matched) {
         const reason = result.actual_line ? 'line_mismatch' : 'ttl_expired_or_aborted';
-        pairings.set(channel.id, {
-          ...IDLE,
-          phase: 'failed',
-          error: reason,
-          actual_line: result.actual_line,
-        });
-        await audit({
+        if (stillCurrent()) {
+          pairings.set(channel.id, {
+            ...IDLE,
+            phase: 'failed',
+            error: reason,
+            actual_line: result.actual_line,
+          });
+        }
+        await auditScoped(channel, {
           acao: 'pairing_session_failed',
           metadata: {
             channel_id: channel.id,
@@ -122,18 +154,20 @@ export async function startChannelPairing(args: {
         channel_id: channel.id,
       });
       if (!act.ok) {
-        pairings.set(channel.id, { ...IDLE, phase: 'failed', error: act.reason });
+        if (stillCurrent()) {
+          pairings.set(channel.id, { ...IDLE, phase: 'failed', error: act.reason });
+        }
         await rm(lineAuthDir(channel.id), { recursive: true, force: true }).catch(
           () => undefined,
         );
-        await audit({
+        await auditScoped(channel, {
           acao: 'pairing_session_failed',
           metadata: { channel_id: channel.id, declared_line: declared, reason: act.reason },
         });
         return;
       }
-      pairings.set(channel.id, { ...IDLE, phase: 'verified' });
-      await audit({
+      if (stillCurrent()) pairings.set(channel.id, { ...IDLE, phase: 'verified' });
+      await auditScoped(channel, {
         acao: 'pairing_session_verified',
         metadata: {
           channel_id: channel.id,
@@ -162,12 +196,17 @@ export async function startChannelPairing(args: {
       }
     })
     .catch(async (err) => {
-      pairings.set(channel.id, {
-        ...IDLE,
-        phase: 'failed',
-        error: (err as Error).message,
-      });
-      await audit({
+      // Review #498 (alto 4): falhas de filesystem (rm/rename da promoção)
+      // agora REJEITAM a promise da PairingSession — este catch encerra o
+      // pareamento com `failed` em vez de deixá-lo preso em `pairing`.
+      if (stillCurrent()) {
+        pairings.set(channel.id, {
+          ...IDLE,
+          phase: 'failed',
+          error: (err as Error).message,
+        });
+      }
+      await auditScoped(channel, {
         acao: 'pairing_session_failed',
         metadata: {
           channel_id: channel.id,
@@ -181,9 +220,13 @@ export async function startChannelPairing(args: {
 }
 
 export async function abortChannelPairing(channel_id: string): Promise<void> {
-  await getLineSessionManager().abortPairing(channel_id, 'operator_abort');
+  // Reset ANTES do abort no manager: abortPairing agora RESOLVE a promise
+  // pendente da PairingSession (review #498 alto 4) e o guard de identidade
+  // do fluxo acima só preserva o slot se ele já não for mais da tentativa
+  // abortada — a UI volta a `idle`, não a `failed`.
   const current = pairings.get(channel_id);
   if (current?.phase === 'pairing') pairings.set(channel_id, { ...IDLE });
+  await getLineSessionManager().abortPairing(channel_id, 'operator_abort');
 }
 
 /** Test-only. */

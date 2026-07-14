@@ -163,6 +163,10 @@ export const AUDIT_ACTIONS = [
   //  - pairing_session_*: ciclo §2.5 (declarado→verificado); `verified` ativa
   //    o canal; `failed` cobre mismatch de número, TTL e 23505 do índice
   //    global (linha já pertence a outro workspace).
+  //  - message_update_channel_unresolved: em MAIA_MULTI_LINE, um
+  //    messages.update chegou por uma sessão SEM canal resolvido (registro
+  //    da primária pendente/falho) — o lote é DESCARTADO fail-closed em vez
+  //    de cair no lookup global cross-tenant (review #498 crítico 1).
   'shadow_divergence',
   'legacy_catch_all',
   'channel_scope_mismatch',
@@ -170,6 +174,7 @@ export const AUDIT_ACTIONS = [
   'pairing_session_started',
   'pairing_session_verified',
   'pairing_session_failed',
+  'message_update_channel_unresolved',
   // Staging de inbound não-roteado (§1.4, modo strict): staged na chegada sem
   // rota; handed_off quando o replay entrega na pipeline normal (dedup por
   // canal); expired no TTL de 72h (sweeper).

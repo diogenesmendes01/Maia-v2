@@ -29,6 +29,7 @@ import { existsSync } from 'node:fs';
 import { config } from '../config/env.js';
 import { logger } from '../lib/logger.js';
 import { audit } from '../governance/audit.js';
+import { runWithTenantContext } from '../db/tenant-context.js';
 import { channelsRepo } from '../db/repositories/channel-repos.js';
 import {
   ingressUpsertMessage,
@@ -66,9 +67,30 @@ type LineSessionState = {
   connected: boolean;
   reconnectAttempts: number;
   stopped: boolean;
+  /**
+   * Timer de reconexão PENDENTE (review #498 alto 3): rastreado para que
+   * `shutdownLineSessions` cancele — sem isso o callback sobrevivia ao
+   * shutdown e reabria o socket com um estado novo (`stopped=false`).
+   */
+  reconnectTimer: NodeJS.Timeout | null;
 };
 
 const sessions = new Map<string, LineSessionState>();
+
+/**
+ * Audita transições da sessão sob o ALS do (tenant, agent) DONO do canal
+ * (review #498 alto 2): sem o wrap, `audit()` caía no bucket `system` —
+ * metadata não corrige colunas nem labels de métricas.
+ */
+function auditLineTransition(
+  channel: LineChannel,
+  metadata: Record<string, unknown>,
+): Promise<void> {
+  return runWithTenantContext(
+    { tenant_id: channel.tenant_id, agent_id: channel.agent_id },
+    () => audit({ acao: 'line_session_transition', metadata }),
+  );
+}
 
 function buildTransport(state: LineSessionState): LineTransport {
   const live = (): WASocket | null => (state.connected && state.sock ? state.sock : null);
@@ -145,6 +167,7 @@ async function startLineSession(channel: LineChannel): Promise<void> {
     connected: false,
     reconnectAttempts: 0,
     stopped: false,
+    reconnectTimer: null,
   };
   sessions.set(channel.id, state);
 
@@ -192,9 +215,10 @@ async function startLineSession(channel: LineChannel): Promise<void> {
         { channel_id: channel.id, line: channel.external_id },
         'line_session.connected',
       );
-      void audit({
-        acao: 'line_session_transition',
-        metadata: { channel_id: channel.id, state: 'connected', is_primary: false },
+      void auditLineTransition(channel, {
+        channel_id: channel.id,
+        state: 'connected',
+        is_primary: false,
       });
       return;
     }
@@ -208,9 +232,11 @@ async function startLineSession(channel: LineChannel): Promise<void> {
         { channel_id: channel.id, reason, state: nextState },
         'line_session.closed',
       );
-      void audit({
-        acao: 'line_session_transition',
-        metadata: { channel_id: channel.id, state: nextState, is_primary: false, reason },
+      void auditLineTransition(channel, {
+        channel_id: channel.id,
+        state: nextState,
+        is_primary: false,
+        reason,
       });
       if (loggedOut || state.stopped) return;
       state.reconnectAttempts += 1;
@@ -226,7 +252,11 @@ async function startLineSession(channel: LineChannel): Promise<void> {
         state.reconnectAttempts * LINE_RECONNECT_BASE_MS,
         LINE_RECONNECT_MAX_MS,
       );
-      setTimeout(() => {
+      state.reconnectTimer = setTimeout(() => {
+        state.reconnectTimer = null;
+        // Review #498 (alto 3): o shutdown pode ter marcado o estado entre o
+        // agendamento e o disparo — re-checa antes de reabrir o socket.
+        if (state.stopped) return;
         startLineSession(channel).catch((err) =>
           logger.error(
             { channel_id: channel.id, err: (err as Error).message },
@@ -260,10 +290,19 @@ export async function startAdditionalLineSessions(): Promise<void> {
   }
 }
 
-/** Encerra todas as sessões de linha (shutdown ordenado). */
+/**
+ * Encerra todas as sessões de linha (shutdown ordenado). Cancela os timers
+ * de reconexão pendentes (review #498 alto 3) — sem isso um callback
+ * agendado antes do shutdown recriava o estado (`stopped=false`) e reabria
+ * o socket durante o desligamento.
+ */
 export async function shutdownLineSessions(): Promise<void> {
   for (const [channelId, state] of sessions) {
     state.stopped = true;
+    if (state.reconnectTimer) {
+      clearTimeout(state.reconnectTimer);
+      state.reconnectTimer = null;
+    }
     try {
       state.sock?.end(undefined);
     } catch {
