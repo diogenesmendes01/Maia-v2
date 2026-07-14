@@ -36,6 +36,7 @@ async function reset(): Promise<void> {
     await c.query(`DELETE FROM proposal_approvals WHERE tenant_id = $1`, [T]);
     await c.query(`DELETE FROM admin_audit_log WHERE tenant_id = $1`, [T]);
     await c.query(`DELETE FROM agent_operational_profile_versions WHERE tenant_id = $1`, [T]);
+    await c.query(`DELETE FROM capability_proposals WHERE tenant_id = $1`, [T]);
   } finally {
     c.release();
   }
@@ -316,6 +317,83 @@ d('proposalsUnifiedRepo.decideAtomically — operational_profile (real DB)', () 
           [T, OWNER],
         ),
       ).rejects.toMatchObject({ code: '23514' });
+    } finally {
+      c.release();
+    }
+  });
+
+  it('list: sources INTERCALAM por recência e o cursor composto pagina até o fim (review #496 médio 8)', async () => {
+    const { proposalsUnifiedRepo } = await import('../../src/db/repositories.js');
+    const c = await pool.connect();
+    try {
+      // Timeline (desc): cap-3 > prof-2 > cap-2 > prof-1 > cap-1. Antes do
+      // fix, capabilities entravam primeiro no array: com limit=2 a página 1
+      // seria [cap-3, cap-2] e NENHUM perfil apareceria enquanto houvesse
+      // >= limit capabilities pendentes (e o cursor era ignorado — página 2
+      // repetia a 1).
+      const at = (min: number) => `now() - interval '${min} minutes'`;
+      const cap = async (title: string, minAgo: number) => {
+        await c.query(
+          `INSERT INTO capability_proposals
+             (tenant_id, agent_id, capability_type, title, description, motivation, status, created_at)
+           VALUES ($1, $2, 'skill', $3, 'd', 'm', 'submitted', ${at(minAgo)})`,
+          [T, A, title],
+        );
+      };
+      const prof = async (version: number, minAgo: number) => {
+        await c.query(
+          `INSERT INTO agent_operational_profile_versions
+             (tenant_id, agent_id, version, status, profile_body, proposed_by, created_at)
+           VALUES ($1, $2, $3, 'proposed', '{"metadata":{"previous_version_id":null}}'::jsonb, $4, ${at(minAgo)})`,
+          [T, A, version, OWNER],
+        );
+      };
+      await cap('cap-1', 50);
+      await prof(1, 40);
+      await cap('cap-2', 30);
+      await prof(2, 20);
+      await cap('cap-3', 10);
+
+      const page1 = await proposalsUnifiedRepo.list({ tenantId: T, limit: 2 });
+      expect(page1.items.map((i) => i.type)).toEqual([
+        'capability_proposal',
+        'operational_profile',
+      ]);
+      expect(page1.items[0]!.descriptor).toBe('cap-3');
+      expect(page1.hasMore).toBe(true);
+      expect(page1.nextCursor).not.toBeNull();
+
+      const page2 = await proposalsUnifiedRepo.list({
+        tenantId: T,
+        limit: 2,
+        cursor: page1.nextCursor,
+      });
+      expect(page2.items.map((i) => i.descriptor)).toEqual([
+        'cap-2',
+        expect.stringContaining('Perfil operacional v1'),
+      ]);
+      expect(page2.hasMore).toBe(true);
+
+      const page3 = await proposalsUnifiedRepo.list({
+        tenantId: T,
+        limit: 2,
+        cursor: page2.nextCursor,
+      });
+      expect(page3.items.map((i) => i.descriptor)).toEqual(['cap-1']);
+      expect(page3.hasMore).toBe(false);
+      expect(page3.nextCursor).toBeNull();
+
+      // Nenhum item repetido/perdido entre páginas.
+      const all = [...page1.items, ...page2.items, ...page3.items].map((i) => i.id);
+      expect(new Set(all).size).toBe(5);
+
+      // Cursor ilegível ⇒ primeira página (nunca lança).
+      const garbage = await proposalsUnifiedRepo.list({
+        tenantId: T,
+        limit: 2,
+        cursor: '###not-base64###',
+      });
+      expect(garbage.items).toHaveLength(2);
     } finally {
       c.release();
     }

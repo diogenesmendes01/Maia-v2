@@ -1929,7 +1929,7 @@ export const role_selector_decisions = pgTable(
 // 092 — staging de inbound não-roteado (spec roteamento v4 §1.4, modo
 // strict). Envelope AES-256-GCM (staging-crypto.ts); TTL 72h; UNIQUE
 // (line, whatsapp_id) = idempotência pré-resolução. O job BullMQ carrega só
-// o id (jobId estável `unrouted:<line>:<whatsapp_id>`).
+// o id (jobId estável — digest de (line, whatsapp_id), ver unroutedReplayJobId).
 export const inbound_unrouted = pgTable(
   'inbound_unrouted',
   {

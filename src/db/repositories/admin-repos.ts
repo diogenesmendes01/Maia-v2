@@ -66,6 +66,36 @@ export const appUsersRepo = {
 };
 
 /**
+ * Cursor opaco da fila unificada (review PR #496 médio 8): base64url de
+ * {ts, id} do último item devolvido. Composto porque `created_at` empata
+ * (batches) — o id desempata na MESMA ordem do keyset por source.
+ * Cursor ilegível/estranho ⇒ null (primeira página) — nunca lança.
+ */
+export function encodeListCursor(item: { proposed_at: Date; id: string }): string {
+  return Buffer.from(
+    JSON.stringify({ ts: item.proposed_at.toISOString(), id: item.id }),
+  ).toString('base64url');
+}
+
+export function decodeListCursor(
+  cursor: string | null | undefined,
+): { ts: Date; id: string } | null {
+  if (!cursor) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as {
+      ts?: unknown;
+      id?: unknown;
+    };
+    if (typeof parsed.ts !== 'string' || typeof parsed.id !== 'string') return null;
+    const ts = new Date(parsed.ts);
+    if (Number.isNaN(ts.getTime())) return null;
+    return { ts, id: parsed.id };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * proposalsUnified — virtual UNION view aggregating all proposal sources.
  *
  * Targets (post-merge of #93–#96):
@@ -99,6 +129,15 @@ export const proposalsUnifiedRepo = {
     return result.rows.map((r) => r.table_name);
   },
 
+  /**
+   * Review PR #496 (médio 8) — a fila unificada é paginada com KEYSET GLOBAL:
+   * cada source recebe o predicado composto `(created_at, id) < cursor` e o
+   * merge final ordena por `proposed_at DESC, id DESC` antes do slice — sem
+   * isso, capabilities entravam primeiro no array e `limit` capabilities
+   * pendentes escondiam TODOS os perfis indefinidamente (e o cursor aceito
+   * nunca era aplicado). O cursor é opaco: base64url de {ts, id} do último
+   * item devolvido.
+   */
   async list(input: {
     tenantId: string;
     types?: ProposalTypeId[];
@@ -124,6 +163,7 @@ export const proposalsUnifiedRepo = {
   }> {
     const available = await this._availableTables();
     const status = input.status ?? 'proposed';
+    const cursor = decodeListCursor(input.cursor);
 
     // capability_proposals is the only table guaranteed to exist on main.
     if (!available.includes('capability_proposals')) {
@@ -163,9 +203,15 @@ export const proposalsUnifiedRepo = {
           and(
             eq(capability_proposals.tenant_id, input.tenantId),
             eq(capability_proposals.status, dbStatus),
+            ...(cursor
+              ? [
+                  sql`(${capability_proposals.created_at}, ${capability_proposals.id})
+                      < (${cursor.ts}, ${cursor.id}::uuid)`,
+                ]
+              : []),
           ),
         )
-        .orderBy(desc(capability_proposals.created_at))
+        .orderBy(desc(capability_proposals.created_at), desc(capability_proposals.id))
         .limit(input.limit + 1);
       for (const r of rows) {
         // Post-Codex-review #101: risk is DERIVED from capability_type +
@@ -202,9 +248,18 @@ export const proposalsUnifiedRepo = {
           and(
             eq(agent_operational_profile_versions.tenant_id, input.tenantId),
             eq(agent_operational_profile_versions.status, profStatusMap[status]),
+            ...(cursor
+              ? [
+                  sql`(${agent_operational_profile_versions.created_at}, ${agent_operational_profile_versions.id})
+                      < (${cursor.ts}, ${cursor.id}::uuid)`,
+                ]
+              : []),
           ),
         )
-        .orderBy(desc(agent_operational_profile_versions.created_at))
+        .orderBy(
+          desc(agent_operational_profile_versions.created_at),
+          desc(agent_operational_profile_versions.id),
+        )
         .limit(input.limit + 1);
       for (const r of rows) {
         const { risk } = await this._classifyProfileRow(r);
@@ -225,7 +280,10 @@ export const proposalsUnifiedRepo = {
     // are wired up here once their schemas land in main; the available[] check
     // gates each block independently to avoid runtime errors before merge.
 
-    // Simple in-memory filter on optional facets (UI-side filters)
+    // Simple in-memory filter on optional facets (UI-side filters). Nota:
+    // facetas podem sub-preencher uma página (limitação pré-existente); a
+    // paginação por cursor continua correta porque o nextCursor é sempre o
+    // ÚLTIMO item devolvido, na mesma ordem do keyset.
     const filtered = items.filter((it) => {
       if (input.types && !input.types.includes(it.type)) return false;
       if (input.risks && !input.risks.includes(it.risk)) return false;
@@ -233,11 +291,19 @@ export const proposalsUnifiedRepo = {
       return true;
     });
 
+    // Merge global: mesma ordem do keyset de cada source (created_at DESC,
+    // id DESC — uuid canônico compara igual em texto e no pg), para que
+    // sources se INTERCALEM por recência em vez de concatenar por tipo.
+    filtered.sort((a, b) => {
+      const d = b.proposed_at.getTime() - a.proposed_at.getTime();
+      if (d !== 0) return d;
+      return a.id < b.id ? 1 : a.id > b.id ? -1 : 0;
+    });
+
     const hasMore = filtered.length > input.limit;
     const trimmed = filtered.slice(0, input.limit);
-    const nextCursor = hasMore && trimmed[trimmed.length - 1]
-      ? trimmed[trimmed.length - 1]!.id
-      : null;
+    const last = trimmed[trimmed.length - 1];
+    const nextCursor = hasMore && last ? encodeListCursor(last) : null;
     return { items: trimmed, hasMore, nextCursor };
   },
 
@@ -317,6 +383,13 @@ export const proposalsUnifiedRepo = {
   ): Promise<{
     id: string;
     type: ProposalTypeId;
+    /**
+     * Agente DONO da proposta (review PR #496 alto 5): chamadores que
+     * recebem um agent_id do cliente (ex.: shim `agents.approveProfile`)
+     * DEVEM conferir este campo antes de decidir — sem isso uma versão do
+     * agente B é aprovável pelo endpoint do agente A dentro do mesmo tenant.
+     */
+    agent_id: string;
     descriptor: string;
     risk: RiskLevelId;
     source: string;
@@ -347,6 +420,7 @@ export const proposalsUnifiedRepo = {
         return {
           id: r.id,
           type: 'capability_proposal',
+          agent_id: r.agent_id,
           descriptor: r.title,
           risk: deriveCapabilityRisk(r.capability_type, r.proposed_spec),
           source: r.capability_type,
@@ -401,6 +475,7 @@ export const proposalsUnifiedRepo = {
         return {
           id: r.id,
           type: 'operational_profile',
+          agent_id: r.agent_id,
           descriptor: `Perfil operacional v${r.version} — ${r.agent_id}`,
           risk: classified.risk,
           source: 'operational_profile',

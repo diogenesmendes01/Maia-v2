@@ -50,6 +50,8 @@ vi.mock('../../src/gateway/baileys.js', () => ({ ingressUpsertMessage: ingressMo
 import {
   stageUnroutedInbound,
   processUnroutedReplay,
+  encodeStagedMessage,
+  decodeStagedMessage,
 } from '../../src/gateway/unrouted-staging.js';
 import { parseKeyring, sealEnvelope } from '../../src/gateway/staging-crypto.js';
 
@@ -111,7 +113,7 @@ describe('processUnroutedReplay — handoff idempotente', () => {
       id: 'u-1',
       line_external_id: '+5511900001111',
       whatsapp_message_id: 'WID-1',
-      envelope: sealEnvelope(Buffer.from(JSON.stringify(MSG), 'utf8'), keyring),
+      envelope: sealEnvelope(encodeStagedMessage(MSG), keyring),
       enc_key_id: 'k1',
       status: 'pending',
       attempts: 0,
@@ -159,5 +161,52 @@ describe('processUnroutedReplay — handoff idempotente', () => {
     );
     await processUnroutedReplay('u-1');
     expect(ingressMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('encode/decodeStagedMessage — codec protobuf preserva mídia (review #496 alto 3)', () => {
+  it('roundtrip de imagem/áudio/documento mantém os campos binários byte a byte', () => {
+    const mediaKey = Uint8Array.from({ length: 32 }, (_, i) => i + 1);
+    const fileSha256 = Uint8Array.from({ length: 32 }, (_, i) => 255 - i);
+    const fileEncSha256 = Uint8Array.from({ length: 32 }, (_, i) => (i * 7) % 256);
+    const jpegThumbnail = Uint8Array.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]);
+    const media = {
+      key: { id: 'WID-MEDIA', remoteJid: '5511977776666@s.whatsapp.net' },
+      messageTimestamp: 1751234567,
+      message: {
+        imageMessage: {
+          url: 'https://mmg.whatsapp.net/x',
+          mimetype: 'image/jpeg',
+          mediaKey,
+          fileSha256,
+          fileEncSha256,
+          fileLength: 12345,
+          jpegThumbnail,
+        },
+      },
+    };
+    const decoded = decodeStagedMessage(encodeStagedMessage(media as never));
+
+    const img = decoded.message!.imageMessage!;
+    // JSON.stringify degradava estes campos em `{0: .., 1: ..}` — o codec
+    // proto devolve Uint8Array com os MESMOS bytes (chaves de decrypt e
+    // hashes de validação chegariam inválidos à pipeline de mídia).
+    expect(Buffer.from(img.mediaKey!)).toEqual(Buffer.from(mediaKey));
+    expect(Buffer.from(img.fileSha256!)).toEqual(Buffer.from(fileSha256));
+    expect(Buffer.from(img.fileEncSha256!)).toEqual(Buffer.from(fileEncSha256));
+    expect(Buffer.from(img.jpegThumbnail!)).toEqual(Buffer.from(jpegThumbnail));
+    expect(decoded.key!.id).toBe('WID-MEDIA');
+    expect(Number(decoded.messageTimestamp)).toBe(1751234567);
+  });
+
+  it('aceita tanto instância proto viva quanto objeto estrutural', async () => {
+    const { proto } = await import('@whiskeysockets/baileys');
+    const live = proto.WebMessageInfo.fromObject({
+      key: { id: 'WID-LIVE' },
+      message: { conversation: 'oi' },
+    });
+    const decoded = decodeStagedMessage(encodeStagedMessage(live));
+    expect(decoded.key!.id).toBe('WID-LIVE');
+    expect(decoded.message!.conversation).toBe('oi');
   });
 });

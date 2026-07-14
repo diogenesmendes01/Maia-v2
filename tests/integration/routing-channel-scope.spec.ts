@@ -149,6 +149,16 @@ d('fase 0 — escopo por canal no DB (constraints 090)', () => {
       });
       expect((await conversasRepo.findActive(pessoa, chA1))?.id).toBe(legacy.id);
       expect((await conversasRepo.findActive(pessoa, chA2))?.id).toBe(legacy.id);
+
+      // Review #496 (alto 6): o primeiro inbound RESOLVIDO vincula a legada
+      // ao canal (CAS em channel_id IS NULL) — ela deixa de casar as outras
+      // linhas e nunca é re-vinculada.
+      expect(await conversasRepo.bindChannelIfNull(legacy.id, chA1)).toBe(true);
+      expect((await conversasRepo.findActive(pessoa, chA1))?.id).toBe(legacy.id);
+      expect(await conversasRepo.findActive(pessoa, chA2)).toBeNull();
+      // Segunda tentativa (corrida da linha 2) perde o CAS.
+      expect(await conversasRepo.bindChannelIfNull(legacy.id, chA2)).toBe(false);
+      expect((await conversasRepo.findActive(pessoa, chA1))?.id).toBe(legacy.id);
     });
   });
 
@@ -184,6 +194,41 @@ d('fase 0 — escopo por canal no DB (constraints 090)', () => {
     });
   });
 
+  it('messages.update: lookup cross-tenant escopado por CANAL resolve o wid colidido para o tenant certo (review #496 crítico 1)', async () => {
+    const { mensagensRepo } = await import('../../src/db/repositories.js');
+    const { runWithTenantContext } = await import('../../src/db/tenant-context.js');
+
+    const base = {
+      conversa_id: null,
+      direcao: 'in' as const,
+      tipo: 'texto' as const,
+      conteudo: 'colisão cross-tenant',
+      midia_url: null,
+      metadata: { whatsapp_id: 'WID-XTENANT-1' },
+      processada_em: null,
+      ferramentas_chamadas: [],
+      tokens_usados: null,
+    };
+    // O MESMO wid inbound em duas linhas de TENANTS diferentes (dedup por
+    // canal permite — invariante 3). A row do tenant B é a mais RECENTE de
+    // propósito: um lookup global (sem canal) escolheria ela para um edit
+    // que chegou pela linha do tenant A — auditoria no tenant errado.
+    await runWithTenantContext({ tenant_id: T, agent_id: A }, async () => {
+      await mensagensRepo.createInbound({ ...base, channel_id: chA1 });
+    });
+    await runWithTenantContext({ tenant_id: T2, agent_id: A2 }, async () => {
+      await mensagensRepo.createInbound({ ...base, channel_id: chB1 });
+    });
+
+    const viaLineA = await mensagensRepo.findByWhatsappIdCrossTenant('WID-XTENANT-1', chA1);
+    expect(viaLineA?.tenant_id).toBe(T);
+    expect(viaLineA?.channel_id).toBe(chA1);
+
+    const viaLineB = await mensagensRepo.findByWhatsappIdCrossTenant('WID-XTENANT-1', chB1);
+    expect(viaLineB?.tenant_id).toBe(T2);
+    expect(viaLineB?.channel_id).toBe(chB1);
+  });
+
   it('CHECK do outbox: row whatsapp enviável sem canal é rejeitada (23514); email_alert passa', async () => {
     await expect(
       q(
@@ -201,5 +246,92 @@ d('fase 0 — escopo por canal no DB (constraints 090)', () => {
       [T, A],
     );
     expect(ok.rows).toHaveLength(1);
+  });
+
+  it('rollback data-aware (review #496 alto 7): downs 091+090 aplicam com dados pós-rollout, sem perda', async () => {
+    // Roda os scripts REAIS de down dentro de uma transação e dá ROLLBACK no
+    // final — o schema volta ao estado migrado para o resto da suíte. Fica
+    // NESTE arquivo de propósito: os outros casos daqui são os únicos que
+    // criam wids duplicados entre canais, e testes do mesmo arquivo rodam em
+    // série (o CREATE UNIQUE INDEX do down não pode ver duplicata alheia).
+    const { readFile } = await import('node:fs/promises');
+    const down091 = await readFile(
+      new URL('../../migrations/091_line_ownership_down.sql', import.meta.url),
+      'utf8',
+    );
+    const down090 = await readFile(
+      new URL('../../migrations/090_channel_scoped_egress_down.sql', import.meta.url),
+      'utf8',
+    );
+
+    const c = await pool.connect();
+    try {
+      await c.query('BEGIN');
+      await c.query(`SET LOCAL lock_timeout = '15s'`);
+
+      // Dados pós-rollout: o MESMO wid em dois canais (dedup por canal) — o
+      // cenário que abortava o down antigo na recriação da unique global.
+      await c.query(
+        `INSERT INTO mensagens (tenant_id, agent_id, direcao, tipo, conteudo, metadata, channel_id, created_at)
+         VALUES ($1, $2, 'in', 'texto', 'linha 1', '{"whatsapp_id":"WID-RB-1"}'::jsonb, $3, now() - interval '1 minute'),
+                ($1, $2, 'in', 'texto', 'linha 2', '{"whatsapp_id":"WID-RB-1"}'::jsonb, $4, now())`,
+        [T, A, chA1, chA2],
+      );
+
+      // Canal cujo forward de 091 normalizou (simulado via o registro de
+      // backup) e um canal que SEMPRE foi E.164 (chA1 — fora do backup).
+      const rb = await c.query<{ id: string }>(
+        `INSERT INTO channels (tenant_id, agent_id, external_id, channel_type, display_name, active)
+         VALUES ($1, $2, '+5511900019999', 'whatsapp', 'rollback-test', false)
+         RETURNING id`,
+        [T, A],
+      );
+      await c.query(
+        `INSERT INTO channels_line_normalization_091_backup (channel_id, original_external_id)
+         VALUES ($1, '5511900019999')`,
+        [rb.rows[0]!.id],
+      );
+
+      // ── 091 down: restaura SÓ o que o forward mudou ──────────────────
+      await c.query(down091);
+      const restored = await c.query<{ external_id: string }>(
+        `SELECT external_id FROM channels WHERE id = $1`,
+        [rb.rows[0]!.id],
+      );
+      expect(restored.rows[0]!.external_id).toBe('5511900019999');
+      const untouched = await c.query<{ external_id: string }>(
+        `SELECT external_id FROM channels WHERE id = $1`,
+        [chA1],
+      );
+      expect(untouched.rows[0]!.external_id).toBe('+5511900010001'); // NÃO desnormalizado
+      const backupGone = await c.query(
+        `SELECT to_regclass('channels_line_normalization_091_backup') AS t`,
+      );
+      expect(backupGone.rows[0]!.t).toBeNull();
+
+      // ── 090 down: unique global volta com duplicatas PARKED, sem apagar ─
+      await c.query(down090);
+      const idx = await c.query(`SELECT to_regclass('uniq_mensagens_whatsapp_id') AS t`);
+      expect(idx.rows[0]!.t).not.toBeNull();
+      const live = await c.query<{ conteudo: string }>(
+        `SELECT conteudo FROM mensagens WHERE metadata->>'whatsapp_id' = 'WID-RB-1'`,
+      );
+      // A MAIS ANTIGA mantém a chave viva (semântica legada de dedup)…
+      expect(live.rows.map((r) => r.conteudo)).toEqual(['linha 1']);
+      // …e a outra fica auditável sob a chave renomeada — nenhuma row some.
+      const parked = await c.query<{ conteudo: string }>(
+        `SELECT conteudo FROM mensagens
+          WHERE metadata->>'whatsapp_id_pre_090_rollback' = 'WID-RB-1'`,
+      );
+      expect(parked.rows.map((r) => r.conteudo)).toEqual(['linha 2']);
+      const col = await c.query(
+        `SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'mensagens' AND column_name = 'channel_id'`,
+      );
+      expect(col.rows).toHaveLength(0);
+    } finally {
+      await c.query('ROLLBACK').catch(() => undefined);
+      c.release();
+    }
   });
 });

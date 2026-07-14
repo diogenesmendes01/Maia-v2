@@ -745,6 +745,16 @@ export const agentsRouter = router({
         if (!proposal || proposal.type !== 'operational_profile') {
           throw new TRPCError({ code: 'NOT_FOUND', message: 'Version not found' });
         }
+        // Review PR #496 (alto 5): a versão precisa pertencer ao AGENTE do
+        // endpoint — sem este vínculo, agente A + versionId do agente B
+        // aprovaria B por aqui (mesmo tenant, escopo tenant+agent violado).
+        // O caminho legado impõe isso dentro do approveAndActivateAtomic
+        // (recebe agent_id); o motor unificado é keyed por (tenant, id),
+        // então o vínculo é imposto AQUI. NOT_FOUND, não FORBIDDEN: para
+        // este endpoint a versão de outro agente não existe.
+        if (proposal.agent_id !== agent.id) {
+          throw new TRPCError({ code: 'NOT_FOUND', message: 'Version not found' });
+        }
         const approvalClass = getApprovalClassFor('operational_profile', proposal.risk);
         const requiredRoles = requiredRolesFor(approvalClass);
         const dualRequired = requiresDualApproval(approvalClass);

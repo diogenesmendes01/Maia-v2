@@ -32,6 +32,7 @@ import { audit } from '../governance/audit.js';
 import { channelsRepo } from '../db/repositories/channel-repos.js';
 import {
   ingressUpsertMessage,
+  handleMessagesUpdate,
   getCurrentLineE164,
   sendOutboundTextVia,
   sendOutboundDocumentVia,
@@ -170,6 +171,13 @@ async function startLineSession(channel: LineChannel): Promise<void> {
     for (const msg of messages) {
       await ingressUpsertMessage(msg, lineCtx);
     }
+  });
+
+  // Review PR #496 (crítico 1): edits/revokes chegam por CADA sessão — sem
+  // este listener as linhas adicionais silenciariam messages.update; o
+  // handler compartilhado escopa o lookup pelo canal DESTA sessão.
+  sock.ev.on('messages.update', (updates) => {
+    void handleMessagesUpdate(updates, channel.id);
   });
 
   sock.ev.on('connection.update', (u) => {

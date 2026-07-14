@@ -1,4 +1,5 @@
 import { Queue, Worker, type Job } from 'bullmq';
+import { createHash } from 'node:crypto';
 import IORedis from 'ioredis';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
@@ -142,7 +143,7 @@ export async function enqueueAgent(data: AgentJob): Promise<void> {
 // ─── §1.4 (spec roteamento v4) — replay de inbound NÃO-ROTEADO (strict) ────
 //
 // O job carrega SÓ o id da row (payload cifrado fica no Postgres). O jobId é
-// ESTÁVEL (`unrouted:<line>:<whatsapp_id>`) para que commit + re-arm +
+// ESTÁVEL (`unroutedReplayJobId(line, wid)`) para que commit + re-arm +
 // recovery sweep sejam idempotentes — nunca dois jobs vivos para a mesma row.
 //
 // Política de retenção deliberada: `removeOnFail` imediato — a ROW pending é
@@ -183,6 +184,20 @@ export function startUnroutedReplayWorker(
 }
 
 /**
+ * jobId ESTÁVEL e determinístico por (linha, wid) — a chave natural do
+ * staging. BullMQ reserva ':' em custom ids (separador de keys no Redis;
+ * hoje só uma exceção de compat deprecada deixa 3 segmentos passarem —
+ * review PR #496 alto 2), então a identidade vira um digest: mesmo par ⇒
+ * mesmo id, sem caractere reservado, sem depender do formato da linha/wid.
+ */
+export function unroutedReplayJobId(line_external_id: string, whatsapp_message_id: string): string {
+  const digest = createHash('sha256')
+    .update(`${line_external_id}:${whatsapp_message_id}`)
+    .digest('hex');
+  return `unrouted-${digest.slice(0, 40)}`;
+}
+
+/**
  * Arma (ou re-arma) o job de replay. Idempotente: BullMQ ignora o add quando
  * já existe job com o mesmo jobId — exatamente o contrato do §1.4 (conflito
  * no insert re-arma; sweep re-arma; nunca duplica).
@@ -196,7 +211,7 @@ export async function enqueueUnroutedReplay(args: {
     'replay',
     { unrouted_id: args.unrouted_id },
     {
-      jobId: `unrouted:${args.line_external_id}:${args.whatsapp_message_id}`,
+      jobId: unroutedReplayJobId(args.line_external_id, args.whatsapp_message_id),
       attempts: 5,
       backoff: { type: 'exponential', delay: 30_000 },
     },

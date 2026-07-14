@@ -12,7 +12,7 @@
  * original — o dedup POR CANAL (§1.7) resolve a corrida com o caminho vivo
  * no UNIQUE, nunca em entrega dupla. Row entregue ⇒ status='handed_off'.
  */
-import type { proto } from '@whiskeysockets/baileys';
+import { proto } from '@whiskeysockets/baileys';
 import { logger } from '../lib/logger.js';
 import { audit } from '../governance/audit.js';
 import { inboundUnroutedRepo } from '../db/repositories/inbound-unrouted-repos.js';
@@ -21,23 +21,24 @@ import { enqueueUnroutedReplay } from './queue.js';
 import { ingressUpsertMessage } from './baileys.js';
 
 /**
- * JSON.stringify seguro para o envelope proto: timestamps do Baileys chegam
- * como Long (`{low, high, unsigned}` com .toNumber) ou bigint — serializados
- * como número para que o replay reconstrua um envelope que a pipeline lê
- * (`Number(msg.messageTimestamp)`).
+ * Serialização do envelope: PROTOBUF BINÁRIO (o codec canônico do próprio
+ * WebMessageInfo), nunca JSON — `JSON.stringify` degrada `Uint8Array`/`Buffer`
+ * (mediaKey, fileSha256, fileEncSha256, jpegThumbnail…) em objetos comuns que
+ * o parse não reidrata, corrompendo replay de mídia (review PR #496 alto 3).
+ * `fromObject` aceita tanto a instância proto viva do Baileys quanto objetos
+ * estruturais (testes); `decode` devolve exatamente a mesma forma que a
+ * pipeline recebe do socket (Longs inclusive) — replay ≡ tráfego vivo.
  */
-function protoReplacer(_key: string, value: unknown): unknown {
-  if (typeof value === 'bigint') return Number(value);
-  if (
-    value !== null &&
-    typeof value === 'object' &&
-    typeof (value as { toNumber?: unknown }).toNumber === 'function' &&
-    'low' in (value as object) &&
-    'high' in (value as object)
-  ) {
-    return (value as { toNumber(): number }).toNumber();
-  }
-  return value;
+export function encodeStagedMessage(msg: proto.IWebMessageInfo): Buffer {
+  const normalized =
+    msg instanceof proto.WebMessageInfo
+      ? msg
+      : proto.WebMessageInfo.fromObject(msg as unknown as Record<string, unknown>);
+  return Buffer.from(proto.WebMessageInfo.encode(normalized).finish());
+}
+
+export function decodeStagedMessage(buf: Buffer): proto.WebMessageInfo {
+  return proto.WebMessageInfo.decode(buf);
 }
 
 /**
@@ -56,7 +57,7 @@ export async function stageUnroutedInbound(
     // Keyring inválido/ausente lança — strict não deveria estar ligado sem
     // ele (guard no boot); este throw é a última linha de defesa.
     const keyring = parseKeyring();
-    const plaintext = Buffer.from(JSON.stringify(msg, protoReplacer), 'utf8');
+    const plaintext = encodeStagedMessage(msg);
     const envelope = sealEnvelope(plaintext, keyring);
     const staged = await inboundUnroutedRepo.stage({
       line_external_id,
@@ -108,9 +109,7 @@ export async function processUnroutedReplay(unrouted_id: string): Promise<void> 
   if (row.expires_at.getTime() <= Date.now()) return; // sweeper expira + audita
 
   const keyring = parseKeyring();
-  const msg = JSON.parse(
-    openEnvelope(row.envelope, keyring).toString('utf8'),
-  ) as proto.IWebMessageInfo;
+  const msg = decodeStagedMessage(openEnvelope(row.envelope, keyring));
 
   await inboundUnroutedRepo.bumpAttempts(row.id);
   const outcome = await ingressUpsertMessage(msg, {

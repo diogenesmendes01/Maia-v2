@@ -1,7 +1,20 @@
 -- 091 down — remove a unicidade global de linha ativa e desfaz a
--- normalização '+' (volta a dígitos puros para as rows normalizadas).
+-- normalização '+' APENAS nas rows que o forward efetivamente mudou
+-- (registro em channels_line_normalization_091_backup — review PR #496
+-- alto 7). Rows que sempre foram E.164 (ou nasceram normalizadas depois de
+-- 091) ficam INTACTAS: sob o schema 089 external_id é texto livre, então
+-- manter o '+' é seguro; era o strip indiscriminado que quebrava.
 DROP INDEX IF EXISTS channels_active_line_uq;
-UPDATE channels
-   SET external_id = substr(external_id, 2)
- WHERE channel_type = 'whatsapp'
-   AND external_id ~ '^\+[1-9][0-9]{6,14}$';
+
+DO $$
+BEGIN
+  -- Ambientes que aplicaram a versão PRÉ-FIX do forward não têm o backup:
+  -- nesse caso o down não toca dados (fail-safe > desnormalizar às cegas).
+  IF to_regclass('channels_line_normalization_091_backup') IS NOT NULL THEN
+    UPDATE channels c
+       SET external_id = b.original_external_id
+      FROM channels_line_normalization_091_backup b
+     WHERE c.id = b.channel_id;
+    DROP TABLE channels_line_normalization_091_backup;
+  END IF;
+END $$;

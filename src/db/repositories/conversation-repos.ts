@@ -79,6 +79,36 @@ export const conversasRepo = {
     const rows = await db.insert(conversas).values(guarded).returning();
     return rows[0]!;
   },
+  /**
+   * Review PR #496 (alto 6) — vincula ATOMICAMENTE uma conversa LEGADA
+   * (channel_id NULL) ao primeiro canal resolvido que a reencontra. Sem o
+   * vínculo, a conversa legada casa qualquer linha no `findActive` mas a
+   * saída (`forCurrentAgentChannel(null)`) exige canal único do agente —
+   * com 2+ linhas ativas toda resposta lançaria `channel_ambiguous` e a
+   * conversa ficaria MUDA até encerrar.
+   *
+   * O predicado `channel_id IS NULL` faz do UPDATE um CAS: na corrida entre
+   * duas linhas, a primeira vence e a segunda recebe `false` (o caller
+   * reencontra/cria a conversa da própria linha). Nunca sobrescreve um
+   * vínculo existente.
+   */
+  async bindChannelIfNull(id: string, channel_id: string): Promise<boolean> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .update(conversas)
+      .set({ channel_id })
+      .where(
+        and(
+          eq(conversas.tenant_id, tenant_id),
+          eq(conversas.agent_id, agent_id),
+          eq(conversas.id, id),
+          isNull(conversas.channel_id),
+        ),
+      )
+      .returning({ id: conversas.id });
+    return rows.length > 0;
+  },
   async touch(id: string): Promise<void> {
     // Flip-readiness (#323): scope the last-activity bump to the current
     // (tenant_id, agent_id) — bound from ALS — mirroring the hardened `close`

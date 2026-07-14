@@ -145,6 +145,35 @@ export async function resolveIdentity(input: {
     });
     logger.info({ pessoa_id: pessoa.id, conversa_id: conversa.id }, 'conversa.created');
   } else {
+    // Review PR #496 (alto 6): conversa LEGADA (channel NULL) reencontrada
+    // por um inbound RESOLVIDO é vinculada ao canal na hora — sem isso, com
+    // 2+ linhas ativas a resposta lançaria `channel_ambiguous` e a conversa
+    // ficaria muda até encerrar. CAS no repo: na corrida entre linhas a
+    // primeira vence; a perdedora reencontra/cria a conversa da própria
+    // linha (mesma semântica do miss normal).
+    if (input.channel_id && conversa.channel_id === null) {
+      const bound = await conversasRepo.bindChannelIfNull(conversa.id, input.channel_id);
+      if (bound) {
+        conversa = { ...conversa, channel_id: input.channel_id };
+        logger.info(
+          { conversa_id: conversa.id, channel_id: input.channel_id },
+          'conversa.legacy_bound_to_channel',
+        );
+      } else {
+        conversa = await conversasRepo.findActive(pessoa.id, input.channel_id);
+        if (!conversa) {
+          conversa = await conversasRepo.create({
+            pessoa_id: pessoa.id,
+            escopo_entidades: scope.entidades,
+            channel_id: input.channel_id,
+          });
+          logger.info(
+            { pessoa_id: pessoa.id, conversa_id: conversa.id },
+            'conversa.created',
+          );
+        }
+      }
+    }
     await conversasRepo.touch(conversa.id);
   }
   return { kind: 'resolved', pessoa, scope, conversa, is_quarantined: false, audience };

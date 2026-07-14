@@ -397,61 +397,83 @@ export async function startBaileys(): Promise<void> {
     }
   });
 
-  socket.ev.on('messages.update', async (updates) => {
-    if (!config.FEATURE_MESSAGE_UPDATE) return;
-    for (const update of updates) {
-      try {
-        // Baileys 6.7.0 delivers `update` as `{ key, update: Partial<WAMessageInfo> }`.
-        // We synthesise an IWebMessageInfo whose `message` is the `update.message`
-        // payload so routeMessageUpdate can branch on editedMessage / protocolMessage.
-        // The `as never` cast is intentional — runtime structure is what matters.
-        //
-        // [Codex review #277 v2 BLOQUEADO fix] Resolve target whatsapp_id
-        // cross-tenant BEFORE entering ALS, then run routeMessageUpdate in
-        // the resolved tenant context. Rationale: `runAgentForMensagem`
-        // adopts inbound rows from (default, default) into the real
-        // (tenant_id, agent_id) when the resolver succeeds. A subsequent
-        // edit/revoke arriving via this listener has no tenant context;
-        // running `routeMessageUpdate` under `default/default` would
-        // cause `mensagensRepo.findByWhatsappId` to miss the (now-adopted)
-        // original and the edit/revoke would be silently dropped
-        // (edit_unknown_original / revoke_unknown_original). The fix
-        // mirrors `runAgentForMensagem`'s adopt-then-runWithTenantContext
-        // ordering: discover the owning tenant via the sanctioned cross-
-        // tenant lookup, then operate fully scoped from that point on.
-        const target_whatsapp_id = extractMessageUpdateTargetId(update);
-        if (!target_whatsapp_id) {
-          // Read receipts / status updates / unsupported envelope shapes —
-          // routeMessageUpdate would no-op anyway. Skip without touching DB.
-          continue;
-        }
-        const original = await mensagensRepo.findByWhatsappIdCrossTenant(
-          target_whatsapp_id,
-        );
-        if (!original) {
-          // Genuinely unknown message (never inbound through us, or already
-          // GC'd). Preserve the existing fail-soft contract — routeMessageUpdate
-          // also returns silently on null `findByWhatsappId`. Log so triage
-          // can spot a pattern (e.g., a real bug producing stranded edits).
-          logger.debug(
-            { whatsapp_id: target_whatsapp_id },
-            'message_update.cross_tenant_lookup_miss',
-          );
-          continue;
-        }
-        await runWithTenantContext(
-          { tenant_id: original.tenant_id, agent_id: original.agent_id },
-          () =>
-            routeMessageUpdate({
-              key: update.key,
-              message: update.update.message,
-            } as never),
-        );
-      } catch (err) {
-        logger.error({ err: (err as Error).message }, 'message_update.dispatch_failed');
-      }
-    }
+  // Fase 0/3 (review PR #496 CRÍTICO 1): o handler é COMPARTILHADO com as
+  // sessões de linha adicionais (line-sessions.ts) e escopado pelo canal da
+  // sessão que entregou o evento — a primária passa o canal registrado no
+  // manager (null na janela legada mono-linha ⇒ comportamento anterior).
+  socket.ev.on('messages.update', (updates) => {
+    void handleMessagesUpdate(updates, primaryChannelId);
   });
+}
+
+/**
+ * Handler de `messages.update` (edits/revokes) compartilhado entre a sessão
+ * primária e as sessões de linha adicionais.
+ *
+ * [Codex review #277 v2 BLOQUEADO fix] Resolve o whatsapp_id alvo cross-
+ * tenant ANTES de entrar no ALS e roda `routeMessageUpdate` no contexto do
+ * tenant dono da row (adopt-then-runWithTenantContext, mesmo ordering do
+ * `runAgentForMensagem`).
+ *
+ * [Review PR #496 CRÍTICO 1] O lookup cross-tenant é escopado pelo CANAL da
+ * sessão que recebeu o evento: com N linhas o mesmo whatsapp_id pode existir
+ * em canais/tenants diferentes (dedup por canal, §1.7) e um lookup global
+ * escolheria a row mais recente — edit/revoke auditado no tenant ERRADO.
+ * `channel_id` informado casa a row do canal OU a legada (channel NULL);
+ * null (sessão primária sem canal registrado — janela mono-linha) preserva o
+ * comportamento anterior. O mesmo canal é repassado ao routeMessageUpdate,
+ * que escopa os lookups internos (já sob o ALS do dono).
+ */
+export async function handleMessagesUpdate(
+  updates: ReadonlyArray<{
+    key?: { id?: string | null } | null;
+    update?: { message?: proto.IMessage | null | undefined } | null;
+  }>,
+  channel_id: string | null,
+): Promise<void> {
+  if (!config.FEATURE_MESSAGE_UPDATE) return;
+  for (const update of updates) {
+    try {
+      // Baileys 6.7.0 delivers `update` as `{ key, update: Partial<WAMessageInfo> }`.
+      // We synthesise an IWebMessageInfo whose `message` is the `update.message`
+      // payload so routeMessageUpdate can branch on editedMessage / protocolMessage.
+      // The `as never` cast is intentional — runtime structure is what matters.
+      const target_whatsapp_id = extractMessageUpdateTargetId(update);
+      if (!target_whatsapp_id) {
+        // Read receipts / status updates / unsupported envelope shapes —
+        // routeMessageUpdate would no-op anyway. Skip without touching DB.
+        continue;
+      }
+      const original = await mensagensRepo.findByWhatsappIdCrossTenant(
+        target_whatsapp_id,
+        channel_id ?? undefined,
+      );
+      if (!original) {
+        // Genuinely unknown message (never inbound through us, or already
+        // GC'd). Preserve the existing fail-soft contract — routeMessageUpdate
+        // also returns silently on null `findByWhatsappId`. Log so triage
+        // can spot a pattern (e.g., a real bug producing stranded edits).
+        logger.debug(
+          { whatsapp_id: target_whatsapp_id, channel_id },
+          'message_update.cross_tenant_lookup_miss',
+        );
+        continue;
+      }
+      await runWithTenantContext(
+        { tenant_id: original.tenant_id, agent_id: original.agent_id },
+        () =>
+          routeMessageUpdate(
+            {
+              key: update.key,
+              message: update.update?.message,
+            } as never,
+            channel_id,
+          ),
+      );
+    } catch (err) {
+      logger.error({ err: (err as Error).message }, 'message_update.dispatch_failed');
+    }
+  }
 }
 
 /**

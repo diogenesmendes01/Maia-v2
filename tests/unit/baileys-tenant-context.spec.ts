@@ -271,7 +271,7 @@ describe('baileys messages.update — runs inside RESOLVED tenant context (PR #2
 
     await handlerState.updateHandler!([fakeUpdate]);
 
-    expect(findByWhatsappIdCrossTenantMock).toHaveBeenCalledWith('WAID-EDIT-1');
+    expect(findByWhatsappIdCrossTenantMock).toHaveBeenCalledWith('WAID-EDIT-1', undefined);
     expect(routeMessageUpdateMock).toHaveBeenCalledTimes(1);
     expect(capturedTenant).toBe('tenant-acme');
     expect(capturedAgent).toBe('agent-main');
@@ -314,7 +314,7 @@ describe('baileys messages.update — runs inside RESOLVED tenant context (PR #2
     await handlerState.updateHandler!([fakeUpdate]);
 
     // Critical: lookup uses the revoked target's id, not the envelope's.
-    expect(findByWhatsappIdCrossTenantMock).toHaveBeenCalledWith('WAID-REVOKE-TARGET');
+    expect(findByWhatsappIdCrossTenantMock).toHaveBeenCalledWith('WAID-REVOKE-TARGET', undefined);
     expect(capturedTenant).toBe('tenant-zeta');
     expect(capturedAgent).toBe('agent-zeta-main');
   });
@@ -338,8 +338,44 @@ describe('baileys messages.update — runs inside RESOLVED tenant context (PR #2
 
     await handlerState.updateHandler!([fakeUpdate]);
 
-    expect(findByWhatsappIdCrossTenantMock).toHaveBeenCalledWith('WAID-UNKNOWN');
+    expect(findByWhatsappIdCrossTenantMock).toHaveBeenCalledWith('WAID-UNKNOWN', undefined);
     expect(routeMessageUpdateMock).not.toHaveBeenCalled();
+  });
+
+  it('handler compartilhado com CANAL: lookup e dispatch escopados pelo canal da sessão (review #496 crítico 1)', async () => {
+    // Repro do achado: o MESMO whatsapp_id existe em dois canais (dedup por
+    // canal, §1.7). Um lookup global escolheria a row mais recente — o edit
+    // seria auditado no tenant errado. Com o canal da sessão que entregou o
+    // evento, a row do canal certo é resolvida e o routeMessageUpdate recebe
+    // o mesmo canal para escopar os lookups internos.
+    const { handleMessagesUpdate } = await import('../../src/gateway/baileys.js');
+    findByWhatsappIdCrossTenantMock.mockResolvedValueOnce({
+      id: 'orig-line2-uuid',
+      tenant_id: 'tenant-line2',
+      agent_id: 'agent-line2',
+      metadata: { whatsapp_id: 'WAID-COLIDE' },
+    });
+
+    let capturedTenant: string | null = null;
+    routeMessageUpdateMock.mockImplementation(async () => {
+      capturedTenant = getCurrentTenant();
+    });
+
+    await handleMessagesUpdate(
+      [
+        {
+          key: { remoteJid: 'jid', id: 'WAID-COLIDE' },
+          update: {
+            message: { editedMessage: { message: { conversation: 'edit na linha 2' } } },
+          },
+        } as never,
+      ],
+      'channel-line-2',
+    );
+
+    expect(findByWhatsappIdCrossTenantMock).toHaveBeenCalledWith('WAID-COLIDE', 'channel-line-2');
+    expect(routeMessageUpdateMock).toHaveBeenCalledWith(expect.anything(), 'channel-line-2');
+    expect(capturedTenant).toBe('tenant-line2');
   });
 
   it('non-edit/non-revoke update (read receipt): no cross-tenant lookup, no dispatch', async () => {
