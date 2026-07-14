@@ -24,7 +24,7 @@ The "new agent → answers on a channel" journey closes entirely in the UI:
 
 - **Channels + roles CRUD** (`/setup/channels`) — previously seed/SQL-only; channel policies show per-channel readiness (`policy_ready` = policy exists AND its default role is active).
 - **Go-live checklist** on the agent overview: profile active → channel registered → role+policy ready, each linking to the screen that resolves it; disappears when complete.
-- **Single approval surface** for operational profiles: the agent's Versões tab (with diff). `/identities` is a read-only cross-agent view linking into it (`?tab=` deep-link); `/inbox` surfaces pending profiles via `agents.pendingProfileApprovals` (profiles do NOT flow through the Proposal Inbox engine — see `approveProfile` jsdoc).
+- **Single approval surface** for operational profiles (spec perfil-inbox v4, fase C): profiles are a NATIVE source of the unified proposal engine. `/inbox` lists them with computed risk + exhaustive diff and decides via `proposals.approve`/`reject`; the agent's Versões tab calls the SAME endpoint (the version id IS the proposal id), so dual-approval (`high` risk) can collect its second signature on either surface. `/identities` is a read-only cross-agent view linking into the agent (`?tab=` deep-link). The legacy `agents.approveProfile` shim and the bespoke `agents.pendingProfileApprovals` card were removed with the `FEATURE_PROFILE_INBOX_SOURCE` flag.
 - **Progressive disclosure** in the shared profile form: princípios and limites cognitivos are collapsed "avançado" cards with always-visible summaries.
 - **Capabilities editing** on the agent overview: domain packs + hard denies via `agents.updateCapabilities` (owner/founder; atomic grant+audit via `agentToolGrantsRepo.updateWithAudit`; `mcp.*` packs preserved — managed in `/setup/mcp`). New-tool acquisition stays in the `capability_proposals` flow.
 
@@ -32,7 +32,7 @@ The "new agent → answers on a channel" journey closes entirely in the UI:
 
 | Router | What it serves |
 |---|---|
-| `agents` | Agent provisioning, profile versions + approval, capabilities (view/edit), pending-profile aggregate |
+| `agents` | Agent provisioning, profile version proposals (create/updateProfile), capabilities (view/edit) — profile DECISIONS live in `proposals` |
 | `audit` | Audit log explorer |
 | `capabilities` | Capability proposals + approvals |
 | `channelPolicies` | Channels + roles creation, channel policy CRUD, channels overview (policy readiness) |
