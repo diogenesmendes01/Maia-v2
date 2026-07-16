@@ -26,20 +26,22 @@ import {
 /**
  * Cross-agent view of operational profile versions — READ-ONLY overview.
  *
- * A aprovação de perfil tem UMA superfície: a aba Versões da página do
- * agente (`/agents/[id]?tab=versions`), onde o operador vê o diff completo
- * contra a versão ativa antes de decidir. Esta tela já duplicou esse fluxo
- * (mesma mutation `agents.approveProfile`, mesmo modal) — a redundância foi
- * removida na fase 2 do relatório de complexidade: aqui se OBSERVA o parque
- * de identidades; aprova-se no agente.
+ * A aprovação de perfil tem UM motor: `proposals.approve` (o mesmo do
+ * /inbox — spec perfil-inbox v4 fase C), acionável pela aba Versões da
+ * página do agente (`/agents/[id]?tab=versions`), onde o operador vê o diff
+ * completo contra a versão ativa antes de decidir. Esta tela já duplicou
+ * esse fluxo — a redundância foi removida na fase 2 do relatório de
+ * complexidade: aqui se OBSERVA o parque de identidades; decide-se no
+ * agente ou no /inbox.
  */
 export default function IdentitiesPage() {
   const { data: session, status } = useSession();
   const tenantId = session?.user?.tenant_id ?? '';
   const role = session?.user?.role ?? '';
-  // Review do PR #492 (low): só owner/founder podem aprovar (gate real em
-  // agents.approveProfile) — os demais papéis veem uma CTA de navegação,
-  // não de aprovação, para não aterrissarem numa ação que não podem fazer.
+  // Review do PR #492 (low): só owner/founder podem aprovar (gate real na
+  // matriz de aprovação de proposals.approve) — os demais papéis veem uma
+  // CTA de navegação, não de aprovação, para não aterrissarem numa ação que
+  // não podem fazer.
   const canApprove = role === 'owner' || role === 'founder';
   const [agentId, setAgentId] = React.useState('');
 

@@ -13,10 +13,6 @@
  *
  * Skipped without TEST_DB_URL (matches sibling profile concurrency specs).
  */
-// A flag precisa estar no env ANTES do primeiro import de config/env.js
-// (parse eager) — os repos são importados dinamicamente dentro dos testes.
-process.env.FEATURE_PROFILE_INBOX_SOURCE = 'true';
-
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import pg from 'pg';
 

@@ -624,8 +624,8 @@ export const operationalProfileVersionsRepo = {
    * router can call it without `runWithTenantContext`. The previous active
    * id is captured by the caller (router) BEFORE this call because the
    * read is part of the same logical operation but doesn't need tx
-   * isolation — concurrent updateProfile + approveProfile races are guarded
-   * by `approveAndActivateAtomic`'s FOR UPDATE on the active row.
+   * isolation — concurrent updateProfile + approval races are guarded by
+   * the FOR UPDATE on the active row inside `approveAndActivateInTx`.
    *
    * Returns `null` if the agent was deleted between the caller's
    * `findById` check and this call — the router translates that into
@@ -800,10 +800,17 @@ export const operationalProfileVersionsRepo = {
    *
    * Spec perfil-inbox v4 §1.4 — o CORPO vive em `approveAndActivateInTx`
    * (extração mecânica; locks/guards/transições idênticos) para compor com a
-   * tx do motor unificado (`decideAtomically`). Este wrapper legado abre a
-   * própria tx, chama o InTx, escreve o audit DENTRO da mesma tx e traduz o
-   * throw tipado de volta para o resultado tipado histórico — comportamento
+   * tx do motor unificado (`decideAtomically`). Este wrapper abre a própria
+   * tx, chama o InTx, escreve o audit DENTRO da mesma tx e traduz o throw
+   * tipado de volta para o resultado tipado histórico — comportamento
    * byte-a-byte, verificado por teste de caracterização.
+   *
+   * FASE C (spec §3): o shim `agents.approveProfile` foi removido — este
+   * wrapper NÃO tem mais caller de produção. É mantido como o primitivo
+   * atômico caracterizado do repo: as suites de concorrência issue-166/
+   * issue-177 e o contrato InTx (`profile-approve-intx-contract`) exercitam
+   * os guards de predecessor contra DB real ATRAVÉS dele. Remover só quando
+   * essas suites forem migradas para dirigir `decideAtomically` diretamente.
    */
   async approveAndActivateAtomic(args: {
     tenant_id: string;

@@ -10,10 +10,8 @@ export const TYPE_LABELS: Record<ProposalTypeId, string> = {
   operational_profile: 'Perfil operacional',
 };
 
-// Spec perfil-inbox v4 §3 fases A/B — o source operational_profile é listado
-// pelo motor unificado atrás de FEATURE_PROFILE_INBOX_SOURCE (server-side).
-// Com a flag desligada o contador fica em 0 e nenhuma row aparece; o card
-// bespoke legado (agents.pendingProfileApprovals) cobre a pendência até lá.
+// Spec perfil-inbox v4 §3 (fase C) — operational_profile é um source NATIVO
+// do motor unificado: contador, tabela, diff e decisão vivem nesta fila.
 export const ALL_TYPES: ProposalTypeId[] = [
   'policy_rule',
   'soul_bias',

@@ -24,7 +24,7 @@ The "new agent → answers on a channel" journey closes entirely in the UI:
 
 - **Channels + roles CRUD** (`/setup/channels`) — previously seed/SQL-only; channel policies show per-channel readiness (`policy_ready` = policy exists AND its default role is active).
 - **Go-live checklist** on the agent overview: profile active → channel registered → role+policy ready, each linking to the screen that resolves it; disappears when complete.
-- **Single approval surface** for operational profiles: the agent's Versões tab (with diff). `/identities` is a read-only cross-agent view linking into it (`?tab=` deep-link); `/inbox` surfaces pending profiles via `agents.pendingProfileApprovals` (profiles do NOT flow through the Proposal Inbox engine — see `approveProfile` jsdoc).
+- **Single approval surface** for operational profiles (spec perfil-inbox v4, fase C): profiles are a NATIVE source of the unified proposal engine. `/inbox` lists them with computed risk + exhaustive diff and decides via `proposals.approve`/`reject`; the agent's Versões tab calls the SAME endpoint (the version id IS the proposal id), so dual-approval (`high` risk) can collect its second signature on either surface. `/identities` is a read-only cross-agent view linking into the agent (`?tab=` deep-link). The legacy `agents.approveProfile` shim and the bespoke `agents.pendingProfileApprovals` card were removed with the `FEATURE_PROFILE_INBOX_SOURCE` flag.
 - **Progressive disclosure** in the shared profile form: princípios and limites cognitivos are collapsed "avançado" cards with always-visible summaries.
 - **Capabilities editing** on the agent overview: domain packs + hard denies via `agents.updateCapabilities` (owner/founder; atomic grant+audit via `agentToolGrantsRepo.updateWithAudit`; `mcp.*` packs preserved — managed in `/setup/mcp`). New-tool acquisition stays in the `capability_proposals` flow.
 
@@ -32,7 +32,7 @@ The "new agent → answers on a channel" journey closes entirely in the UI:
 
 | Router | What it serves |
 |---|---|
-| `agents` | Agent provisioning, profile versions + approval, capabilities (view/edit), pending-profile aggregate |
+| `agents` | Agent provisioning, profile version proposals (create/updateProfile), capabilities (view/edit) — profile DECISIONS live in `proposals` |
 | `audit` | Audit log explorer |
 | `capabilities` | Capability proposals + approvals |
 | `channelPolicies` | Channels + roles creation, channel policy CRUD, channels overview (policy readiness) |
@@ -79,10 +79,10 @@ The admin-ui consumes the main app's DB schema + repositories directly (shared `
 
 ## In-flight changes
 
-At last verification (2026-07-09):
+At last verification (2026-07-14):
 
 - Fases 1–4 do relatório de complexidade de configuração mescladas (#491, #492, #493)
-- Próximos (specs em `docs/superpowers/specs/`): roteamento multi-agente no gateway (substituir o catch-all `primary/primary`, issue #411) e perfil operacional como source do Proposal Inbox (dual-approval)
+- Roteamento multi-agente no gateway e perfil operacional como source do Proposal Inbox (dual-approval) IMPLEMENTADOS (#496 — fases A/B atrás de flag); a fase C (este módulo: decisão só no motor unificado, sem shim/card/flag) está no PR #499
 
 Verify: `gh pr list --state open --search "admin-ui"`.
 
@@ -90,5 +90,5 @@ Verify: `gh pr list --state open --search "admin-ui"`.
 
 | | |
 |---|---|
-| Last verified | 2026-07-09 |
-| Against `main` HEAD | `2afe7aa` |
+| Last verified | 2026-07-14 |
+| Against `main` HEAD | `dc835ef` |

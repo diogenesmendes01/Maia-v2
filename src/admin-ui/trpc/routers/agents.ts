@@ -14,18 +14,19 @@
  *                      approved through the standard proposal-inbox flow.
  *
  * Notes:
- *   - All three mutations (create / updateProfile / approveProfile) now go
- *     through repo-level "atomic" methods that take explicit tenant_id/agent_id
- *     and wrap their writes in `withTx`. Codex review of PR #162 round 3
- *     (issue #166) closed the multi-write atomicity gap.
+ *   - Both mutations (create / updateProfile) go through repo-level "atomic"
+ *     methods that take explicit tenant_id/agent_id and wrap their writes in
+ *     `withTx`. Codex review of PR #162 round 3 (issue #166) closed the
+ *     multi-write atomicity gap.
  *   - The tenant_id ALWAYS comes from the resolved ctx tenant (no body
  *     override for owner — only founder can supply a body tenantId).
  *   - We deliberately do NOT auto-activate the seeded profile. P8.5 invariant
  *     is "no profile activates without an approval"; admin-ui setup respects
- *     this — a freshly-created agent has no active profile until owner/founder
- *     approves the seed via `approveProfile` (agent detail → Versões tab, or
- *     the Identidades screen). Operational profile versions intentionally do
- *     NOT flow through the Proposal Inbox — see the approveProfile jsdoc.
+ *     this — a freshly-created agent has no active profile until the seed is
+ *     approved. Spec perfil-inbox v4 fase C: a DECISÃO de perfis vive só no
+ *     motor unificado (`proposals.approve`/`reject` — /inbox e aba Versões
+ *     chamam o mesmo endpoint); o shim `approveProfile` e o card bespoke
+ *     `pendingProfileApprovals` foram removidos junto com a flag.
  *   - role gate: founder or owner. analyst/viewer cannot create agents.
  */
 import { z } from 'zod';
@@ -34,12 +35,6 @@ import { router, protectedProcedure } from '../server.js';
 import { resolveTenantId } from '../tenant-resolver.js';
 import { runWithTenantContext } from '../../../db/tenant-context.js';
 import { PROFILE_BODY_SCHEMA_VERSION, type ProfileBody } from '../../../db/schema.js';
-import { config } from '../../../config/env.js';
-import {
-  getApprovalClassFor,
-  requiresDualApproval,
-  requiredRolesFor,
-} from '../../lib/approval-matrix.js';
 import { ARCHETYPE_IDS, ARCHETYPE_PACK_MAP } from '../../../tools/archetype-packs.js';
 import { BASE_AGENT_PACKS } from '../../../tools/base-agent-packs.js';
 import { TOOL_PACKS, resolvePackTools } from '../../../tools/grant-math.js';
@@ -206,13 +201,6 @@ const UpdateProfileInputSchema = z.object({
   proposed_reason: z.string().min(10).max(2000),
 });
 
-const ApproveProfileInputSchema = z.object({
-  tenantId: z.string().optional(),
-  agentId: AgentIdSchema,
-  versionId: z.string().uuid(),
-  comment: z.string().min(10).max(2000),
-});
-
 /**
  * Build a full ProfileBody from the user-supplied subset. `previous_version_id`
  * is null for the seed; for `updateProfile` we pass the current active id (if
@@ -354,56 +342,6 @@ export const agentsRouter = router({
       return {
         active: active ? pick(active) : null,
         proposed: proposed.map(pick),
-      };
-    }),
-
-  /**
-   * Perfis propostos aguardando aprovação, agregados por agente — alimenta o
-   * card "Perfis de agente" na tela Aprovações (/inbox). O perfil operacional
-   * NÃO flui pelo Proposal Inbox (ver nota em approveProfile); este agregado
-   * existe para que a fila "Aprovações" ao menos APONTE para onde a aprovação
-   * acontece (aba Versões do agente), em vez de omitir perfis pendentes.
-   * Cardinalidade: nº de agentes do tenant — pequeno; espelha o fan-out de
-   * versions.listVersions.
-   */
-  pendingProfileApprovals: protectedProcedure
-    .input(ListInputSchema)
-    .query(async ({ input, ctx }) => {
-      const tenantId = resolveTenantId(ctx, input.tenantId);
-      // Spec perfil-inbox v4 §1.5/§3 fase B — com o source unificado ligado,
-      // os contadores/tabela NATIVOS do inbox assumem esta superfície; o card
-      // bespoke se esvazia para não contar a MESMA pendência duas vezes.
-      if (config.FEATURE_PROFILE_INBOX_SOURCE) {
-        return { items: [], total: 0 };
-      }
-      const agents = await ctx.repos.agentsRepo.listByTenant(tenantId);
-      const items: Array<{
-        agent_id: string;
-        agent_nome: string;
-        pending_count: number;
-        oldest_created_at: Date;
-      }> = [];
-      for (const agent of agents) {
-        const proposed = await runWithTenantContext(
-          { tenant_id: tenantId, agent_id: agent.id },
-          async () => ctx.repos.operationalProfileVersionsRepo.listByStatus('proposed'),
-        );
-        if (proposed.length === 0) continue;
-        items.push({
-          agent_id: agent.id,
-          agent_nome: agent.nome,
-          pending_count: proposed.length,
-          oldest_created_at: proposed.reduce(
-            (min, p) => (p.created_at < min ? p.created_at : min),
-            proposed[0]!.created_at,
-          ),
-        });
-      }
-      // Mais antigo primeiro — é o que está esperando há mais tempo.
-      items.sort((a, b) => a.oldest_created_at.getTime() - b.oldest_created_at.getTime());
-      return {
-        items,
-        total: items.reduce((sum, i) => sum + i.pending_count, 0),
       };
     }),
 
@@ -648,8 +586,8 @@ export const agentsRouter = router({
 
       // Read current active version OUTSIDE the tx — it's only used to chain
       // previous_version_id into the profile_body metadata. Concurrent
-      // approveProfile races are guarded inside `approveAndActivateAtomic`
-      // via FOR UPDATE on the active row, so a stale read here is bounded
+      // approval races are guarded inside `approveAndActivateInTx` (motor
+      // unificado) via FOR UPDATE on the active row, so a stale read here is bounded
       // (worst case: previous_version_id chains to a now-frozen row, which
       // is still a valid lineage marker).
       const activeVersion = await runWithTenantContext(
@@ -709,202 +647,4 @@ export const agentsRouter = router({
       };
     }),
 
-  /**
-   * Approve a `proposed` agent_operational_profile_versions row, transitioning
-   * it to `active` and atomically freezing the previous active version (if any).
-   *
-   * Codex review #162 round 2 ([high] x2) — uses
-   * `operationalProfileVersionsRepo.approveAndActivateAtomic`, which wraps:
-   *   - lock proposed row
-   *   - lock incumbent active (if any) and freeze it
-   *   - activate proposed
-   *   - append admin_audit_log
-   * in a single transaction so partial commits cannot leave runtime state
-   * mutated without an audit row, AND so subsequent updateProfile approvals
-   * don't get stuck on `already_has_active`.
-   *
-   * Spec perfil-inbox v4 §1.5/§3 fase B — SHIM DEPRECADO (1 release): com
-   * `FEATURE_PROFILE_INBOX_SOURCE` ligada, a decisão passa pelo MOTOR
-   * UNIFICADO (`decideAtomically` + classes por risco computado, dual para
-   * high) — a aba Versões e o /inbox convergem no mesmo caminho, uma trilha
-   * por decisão. Com a flag desligada, mantém o wrapper legado byte-a-byte.
-   */
-  approveProfile: protectedProcedure
-    .input(ApproveProfileInputSchema)
-    .mutation(async ({ input, ctx }) => {
-      ctx.assertRole('owner', 'founder');
-      const tenantId = resolveTenantId(ctx, input.tenantId);
-
-      const agent = await ctx.repos.agentsRepo.findById(input.agentId);
-      if (!agent || agent.tenant_id !== tenantId) {
-        throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent not found' });
-      }
-
-      if (config.FEATURE_PROFILE_INBOX_SOURCE) {
-        const proposal = await ctx.repos.proposalsUnifiedRepo.getOne(tenantId, input.versionId);
-        if (!proposal || proposal.type !== 'operational_profile') {
-          throw new TRPCError({ code: 'NOT_FOUND', message: 'Version not found' });
-        }
-        // Review PR #496 (alto 5): a versão precisa pertencer ao AGENTE do
-        // endpoint — sem este vínculo, agente A + versionId do agente B
-        // aprovaria B por aqui (mesmo tenant, escopo tenant+agent violado).
-        // O caminho legado impõe isso dentro do approveAndActivateAtomic
-        // (recebe agent_id); o motor unificado é keyed por (tenant, id),
-        // então o vínculo é imposto AQUI. NOT_FOUND, não FORBIDDEN: para
-        // este endpoint a versão de outro agente não existe.
-        if (proposal.agent_id !== agent.id) {
-          throw new TRPCError({ code: 'NOT_FOUND', message: 'Version not found' });
-        }
-        const approvalClass = getApprovalClassFor('operational_profile', proposal.risk);
-        const requiredRoles = requiredRolesFor(approvalClass);
-        const dualRequired = requiresDualApproval(approvalClass);
-        const decided = await ctx.repos.proposalsUnifiedRepo.decideAtomically({
-          tenantId,
-          proposalId: input.versionId,
-          type: 'operational_profile',
-          approvalClass,
-          actorId: ctx.userId,
-          actorRole: ctx.userRole,
-          decision: 'approved',
-          comment: input.comment,
-          dualComplete: !dualRequired,
-          gateParams: { dualRequired, requiredRoles, allLocks: [] },
-        });
-        if (!decided.ok) {
-          if (decided.reason === 'profile_transition_failed') {
-            // As mesmas traduções do caminho legado vivem no router de
-            // proposals; aqui replicamos os dois casos que o shim expõe e
-            // delegamos o resto ao INTERNAL (mesma superfície de erro).
-            const d = decided.detail;
-            if (d.reason === 'not_found' || d.reason === 'agent_missing') {
-              throw new TRPCError({ code: 'NOT_FOUND', message: 'Version not found' });
-            }
-            throw new TRPCError({
-              code:
-                d.reason === 'missing_predecessor' ? 'PRECONDITION_FAILED' : 'CONFLICT',
-              message: `Profile transition failed: ${d.reason}`,
-            });
-          }
-          if (decided.reason === 'not_found') {
-            throw new TRPCError({ code: 'NOT_FOUND', message: 'Version not found' });
-          }
-          if (decided.reason === 'invalid_source_status') {
-            throw new TRPCError({
-              code: 'CONFLICT',
-              message: 'Version is not in proposed state; refresh and retry',
-            });
-          }
-          throw new TRPCError({
-            code: 'CONFLICT',
-            message: `Approval failed: ${decided.reason}`,
-          });
-        }
-        // Dual pendente (high): nada transicionou — a segunda assinatura
-        // acontece no /inbox. O shape legado ganha os campos de dual para a
-        // aba Versões renderizar o estado.
-        return {
-          activated: decided.profile?.activated ?? null,
-          frozen_previous: decided.profile?.frozen_previous ?? null,
-          dual_required: dualRequired,
-          dual_complete: decided.dualComplete,
-          source_transitioned: decided.sourceTransitioned,
-        };
-      }
-
-      const result = await ctx.repos.operationalProfileVersionsRepo.approveAndActivateAtomic({
-        tenant_id: tenantId,
-        agent_id: agent.id,
-        id: input.versionId,
-        actor_id: ctx.userId,
-        actor_role: ctx.userRole,
-        comment: input.comment,
-      });
-
-      if (!result.ok) {
-        if (result.reason === 'not_found') {
-          throw new TRPCError({ code: 'NOT_FOUND', message: 'Version not found' });
-        }
-        if (result.reason === 'agent_missing') {
-          // Codex Adversarial Review of PR #171 round 3 — the agent was
-          // deleted between findById above and the parent-agent FOR UPDATE
-          // lock inside the tx. Same outcome as the upfront NOT_FOUND.
-          throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent not found' });
-        }
-        if (result.reason === 'invalid_source_status') {
-          throw new TRPCError({
-            code: 'CONFLICT',
-            message: 'Version is not in proposed state; refresh and retry',
-          });
-        }
-        // Codex Adversarial Review of PR #171 round 2 — predecessor mismatch.
-        // The active profile changed between the time this proposal was
-        // authored and now. Approving would silently overwrite the newer
-        // approved version with stale content. Surface a CONFLICT with the
-        // diff so the client can refresh + re-propose against the current
-        // incumbent.
-        if (result.reason === 'predecessor_conflict') {
-          throw new TRPCError({
-            code: 'CONFLICT',
-            message:
-              `Active profile changed since this proposal was authored ` +
-              `(expected predecessor ${String(result.expected)}, current ${String(result.current)}). ` +
-              `Refresh and re-propose against the current active version.`,
-          });
-        }
-        // Codex Adversarial Review of PR #171 round 3 (#173) — migration 061
-        // backfilled `metadata.previous_version_id = null` + `migrated_from_legacy: true`
-        // for every legacy row. Without distinguishing migrated proposals
-        // from intentional seeds, an explicit-null predecessor on a
-        // migrated row would silently activate against an empty active
-        // slot. Surface a distinct CONFLICT so the operator re-proposes
-        // under the post-migration flow with a real predecessor link.
-        if (result.reason === 'migrated_legacy_proposal') {
-          throw new TRPCError({
-            code: 'CONFLICT',
-            message:
-              `This proposal was created by the v3.1.1 legacy backfill and has ` +
-              `no known predecessor lineage. Re-propose the change against the ` +
-              `current active version before approving.`,
-          });
-        }
-        // Codex Adversarial Review of PR #182 round 3 (#186) — explicit
-        // `null` predecessor on a non-seed proposal. Rejected because
-        // approving would create a v2+ active row with no lineage anchor
-        // (bypassing the stale-predecessor guard). The most common case is
-        // a recovery window — agent has frozen/rolled_back versions but no
-        // active row — and the operator tried to use the normal approve
-        // path instead of re-proposing against the last known version.
-        // PRECONDITION_FAILED communicates "the request is structurally
-        // wrong for the current state" better than CONFLICT (which implies
-        // someone else changed the state under you).
-        if (result.reason === 'missing_predecessor') {
-          throw new TRPCError({
-            code: 'PRECONDITION_FAILED',
-            message:
-              `Proposal v${result.proposed_version} has no predecessor lineage ` +
-              `(metadata.previous_version_id is null), but it is not a ` +
-              `v1 intentional seed. ` +
-              (result.current_predecessor === null
-                ? `There is no active version to chain from — if this agent has ` +
-                  `frozen or rolled_back versions, re-propose the change against ` +
-                  `the last known version explicitly.`
-                : `Current active version is ${String(result.current_predecessor)} — ` +
-                  `re-propose the change against it.`),
-          });
-        }
-        throw new TRPCError({
-          code: 'INTERNAL_SERVER_ERROR',
-          message: `Approval transition failed: ${result.reason}`,
-        });
-      }
-
-      return {
-        activated: result.activated,
-        frozen_previous: result.frozen_previous,
-        // Shape estável com o caminho do motor unificado (shim acima).
-        dual_required: false,
-        dual_complete: true,
-        source_transitioned: true,
-      };
-    }),
 });

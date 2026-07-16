@@ -23,7 +23,6 @@ import type {
   ProposalUnifiedStatus,
 } from '../schema.js';
 import { TypedError } from '@/lib/utils.js';
-import { config } from '@/config/env.js';
 import { deriveCapabilityRisk, deriveCapabilityLocks } from '../capability-risk.js';
 import {
   classifyProfileChangeRisk,
@@ -230,11 +229,11 @@ export const proposalsUnifiedRepo = {
       }
     }
 
-    // Spec perfil-inbox v4 §3 fase A — perfis operacionais PROPOSTOS entram
-    // na fila unificada atrás de FEATURE_PROFILE_INBOX_SOURCE. Risco é
-    // COMPUTADO (nunca LLM) contra o predecessor DECLARADO da proposta
-    // (classifyProfileChangeRisk, fail-UP).
-    if (config.FEATURE_PROFILE_INBOX_SOURCE) {
+    // Spec perfil-inbox v4 §3 (fase C: incondicional) — perfis operacionais
+    // PROPOSTOS entram na fila unificada. Risco é COMPUTADO (nunca LLM)
+    // contra o predecessor DECLARADO da proposta (classifyProfileChangeRisk,
+    // fail-UP).
+    {
       const profStatusMap: Record<ProposalUnifiedStatus, string> = {
         proposed: 'proposed',
         pending_review: 'proposed',
@@ -327,9 +326,9 @@ export const proposalsUnifiedRepo = {
       const raw = result.rows[0]?.count ?? 0;
       counts.capability_proposal = typeof raw === 'string' ? Number(raw) : raw;
     }
-    // Spec perfil-inbox v4 — contadores nativos substituem o card bespoke
-    // `pendingProfileApprovals` (#492) quando a flag liga (fase B/C).
-    if (config.FEATURE_PROFILE_INBOX_SOURCE) {
+    // Spec perfil-inbox v4 (fase C) — contadores nativos; o card bespoke
+    // `pendingProfileApprovals` (#492) foi removido junto com a flag.
+    {
       const result = await db.execute<{ count: number | string }>(sql`
         SELECT COUNT(*)::int AS count
           FROM agent_operational_profile_versions
@@ -385,9 +384,9 @@ export const proposalsUnifiedRepo = {
     type: ProposalTypeId;
     /**
      * Agente DONO da proposta (review PR #496 alto 5): chamadores que
-     * recebem um agent_id do cliente (ex.: shim `agents.approveProfile`)
-     * DEVEM conferir este campo antes de decidir — sem isso uma versão do
-     * agente B é aprovável pelo endpoint do agente A dentro do mesmo tenant.
+     * recebem um agent_id do cliente DEVEM conferir este campo antes de
+     * decidir — sem isso uma versão do agente B seria aprovável por um
+     * endpoint invocado para o agente A dentro do mesmo tenant.
      */
     agent_id: string;
     descriptor: string;
@@ -436,7 +435,7 @@ export const proposalsUnifiedRepo = {
     // Spec perfil-inbox v4 — detalhe do perfil proposto: o body carrega o
     // corpo proposto + o do predecessor DECLARADO + as entradas do walker
     // (mesma fonte do classificador) para o DiffOperationalProfile.
-    if (config.FEATURE_PROFILE_INBOX_SOURCE) {
+    {
       const rows = await db
         .select()
         .from(agent_operational_profile_versions)
@@ -589,10 +588,8 @@ export const proposalsUnifiedRepo = {
     // Spec perfil-inbox v4 — source operational_profile tem caminho próprio:
     // a transição delega aos primitivos InTx do repo de perfis (guards de
     // predecessor intactos) e o contrato de falha é THROW→rollback→catch.
+    // Fase C: caminho ÚNICO — a flag e o shim legado foram removidos.
     if (input.type === 'operational_profile') {
-      if (!config.FEATURE_PROFILE_INBOX_SOURCE) {
-        return { ok: false, reason: 'source_not_supported' as const };
-      }
       return this._decideProfileAtomically(input);
     }
 
@@ -825,7 +822,7 @@ export const proposalsUnifiedRepo = {
         approval: ProposalApproval;
         finalStatus: ProposalUnifiedStatus;
         dualComplete: boolean;
-        /** Detalhe da ativação para o shim legado (`agents.approveProfile`). */
+        /** Detalhe da ativação de perfil (só para type=operational_profile). */
         profile?: {
           activated: { id: string; version: number } | null;
           frozen_previous: { id: string; version: number } | null;
