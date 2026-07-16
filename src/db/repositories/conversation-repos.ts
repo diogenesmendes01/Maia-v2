@@ -776,9 +776,12 @@ export const mensagensRepo = {
   // (tenant, agent, whatsapp_id). Por isso este lookup passa a receber o
   // CANAL da sessão que entregou o evento (review v4, bloqueante 1) e resolve
   // DENTRO desse escopo: `channel_id` informado ⇒ match do canal OU row
-  // legada (channel NULL, no máximo uma por unique legada); omitido (sessão
-  // sem canal registrado — janela mono-linha) ⇒ comportamento anterior, mas
-  // preferindo a row mais recente para desempate determinístico.
+  // legada (channel NULL) que pertença ao MESMO (tenant, agent) DONO do
+  // canal — review #498 crítico 1: sem essa exigência, uma row legada de
+  // OUTRO tenant com o mesmo whatsapp_id era elegível e o edit/revoke
+  // atravessava tenants. Omitido (sessão sem canal registrado — janela
+  // mono-linha) ⇒ comportamento anterior, preferindo a row mais recente
+  // para desempate determinístico.
   // O caller (gateway/baileys.ts) re-entra `runWithTenantContext` do dono da
   // row antes de rotear, restaurando o escopo pleno.
   async findByWhatsappIdCrossTenant(
@@ -792,7 +795,14 @@ export const mensagensRepo = {
         and(
           sql`metadata->>'whatsapp_id' = ${whatsapp_id}`,
           ...(channel_id
-            ? [sql`(${mensagens.channel_id} = ${channel_id} OR ${mensagens.channel_id} IS NULL)`]
+            ? [
+                sql`(${mensagens.channel_id} = ${channel_id} OR (${mensagens.channel_id} IS NULL AND EXISTS (
+                  SELECT 1 FROM channels c
+                   WHERE c.id = ${channel_id}
+                     AND c.tenant_id = ${mensagens.tenant_id}
+                     AND c.agent_id = ${mensagens.agent_id}
+                )))`,
+              ]
             : []),
         ),
       )

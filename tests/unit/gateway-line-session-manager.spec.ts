@@ -7,6 +7,7 @@
  *   - isLineConnected reflete registro + estado + transporte.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import nodePath, { win32, posix } from 'node:path';
 
 vi.mock('../../src/config/env.js', () => ({
   config: { BAILEYS_AUTH_DIR: '/tmp/maia-test-auth', MAIA_MULTI_LINE: false },
@@ -19,6 +20,7 @@ import {
   getLineSessionManager,
   lineAuthDir,
   pairingAuthDir,
+  resolveScopedAuthDir,
   type LineTransport,
 } from '../../src/gateway/line-session-manager.js';
 
@@ -105,13 +107,13 @@ describe('LineSessionManager — posse fail-closed das sessões por linha', () =
 });
 
 describe('auth dirs — UUID do canal, traversal rejeitado (review v3)', () => {
-  it('deriva lines/<channel_id> e pairing/<channel_id> sob a raiz', () => {
-    expect(lineAuthDir('0b0e8a1c-1111-4222-8333-444455556666')).toBe(
-      '/tmp/maia-test-auth/lines/0b0e8a1c-1111-4222-8333-444455556666',
-    );
-    expect(pairingAuthDir('0b0e8a1c-1111-4222-8333-444455556666')).toBe(
-      '/tmp/maia-test-auth/pairing/0b0e8a1c-1111-4222-8333-444455556666',
-    );
+  const UUID = '0b0e8a1c-1111-4222-8333-444455556666';
+
+  it('deriva lines/<channel_id> e pairing/<channel_id> sob a raiz (agnóstico de plataforma)', () => {
+    // path.resolve da PLATAFORMA corrente — no Windows o separador é '\'
+    // (review #498 médio 5: a comparação por prefixo '/' rejeitava tudo lá).
+    expect(lineAuthDir(UUID)).toBe(nodePath.resolve('/tmp/maia-test-auth', 'lines', UUID));
+    expect(pairingAuthDir(UUID)).toBe(nodePath.resolve('/tmp/maia-test-auth', 'pairing', UUID));
   });
 
   it('rejeita channelId com traversal (../) — defesa em profundidade', () => {
@@ -121,5 +123,49 @@ describe('auth dirs — UUID do canal, traversal rejeitado (review v3)', () => {
     expect(() => pairingAuthDir('..')).toThrowError(
       expect.objectContaining({ code: 'auth_dir_escape' }),
     );
+  });
+
+  describe('resolveScopedAuthDir — semânticas POSIX e win32 na mesma plataforma (review #498 médio 5)', () => {
+    it('POSIX: UUID válido resolve como filho direto da raiz', () => {
+      expect(resolveScopedAuthDir('/var/maia/auth', 'lines', UUID, posix)).toBe(
+        `/var/maia/auth/lines/${UUID}`,
+      );
+    });
+
+    it('win32: UUID válido resolve como filho direto da raiz (separador \\)', () => {
+      expect(resolveScopedAuthDir('C:\\maia\\auth', 'lines', UUID, win32)).toBe(
+        `C:\\maia\\auth\\lines\\${UUID}`,
+      );
+    });
+
+    it.each([
+      ['traversal relativo', '../../etc/passwd'],
+      ['parent puro', '..'],
+      ['self (vazio após resolve)', '.'],
+      ['descida além de um nível', 'a/b'],
+    ])('POSIX rejeita %s', (_label, channelId) => {
+      expect(() => resolveScopedAuthDir('/var/maia/auth', 'lines', channelId, posix)).toThrowError(
+        expect.objectContaining({ code: 'auth_dir_escape' }),
+      );
+    });
+
+    it('POSIX rejeita path absoluto como channelId', () => {
+      expect(() => resolveScopedAuthDir('/var/maia/auth', 'lines', '/etc/passwd', posix)).toThrowError(
+        expect.objectContaining({ code: 'auth_dir_escape' }),
+      );
+    });
+
+    it.each([
+      ['traversal relativo', '..\\..\\windows\\system32'],
+      ['traversal com slash (win32 aceita ambos separadores)', '../../windows'],
+      ['parent puro', '..'],
+      ['descida além de um nível', 'a\\b'],
+      ['absoluto com drive', 'C:\\evil'],
+      ['absoluto de outra raiz', 'D:\\evil'],
+    ])('win32 rejeita %s', (_label, channelId) => {
+      expect(() => resolveScopedAuthDir('C:\\maia\\auth', 'lines', channelId, win32)).toThrowError(
+        expect.objectContaining({ code: 'auth_dir_escape' }),
+      );
+    });
   });
 });

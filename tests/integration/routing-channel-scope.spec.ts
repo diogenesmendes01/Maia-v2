@@ -229,6 +229,40 @@ d('fase 0 — escopo por canal no DB (constraints 090)', () => {
     expect(viaLineB?.channel_id).toBe(chB1);
   });
 
+  it('fallback legado exige o MESMO tenant/agent do canal: row legada do tenant A NUNCA resolve para a linha do tenant B (review #498 crítico 1)', async () => {
+    const { mensagensRepo } = await import('../../src/db/repositories.js');
+
+    // Row LEGADA (channel_id NULL) do tenant A com um wid conhecido. Antes
+    // do fix, o fallback `channel_id IS NULL` aceitava esta row para um
+    // update chegando pela linha do tenant B — edit/revoke processado (e
+    // auditado) no tenant errado.
+    await q(
+      `INSERT INTO mensagens (tenant_id, agent_id, direcao, tipo, conteudo, metadata, channel_id)
+       VALUES ($1, $2, 'in', 'texto', 'legada do tenant A', '{"whatsapp_id":"WID-LEGACY-XT"}'::jsonb, NULL)`,
+      [T, A],
+    );
+
+    // Linha do tenant B ⇒ a legada do A NÃO é elegível: fail-closed (null).
+    expect(await mensagensRepo.findByWhatsappIdCrossTenant('WID-LEGACY-XT', chB1)).toBeNull();
+
+    // Linha do PRÓPRIO tenant A ⇒ o fallback legado segue funcionando.
+    const own = await mensagensRepo.findByWhatsappIdCrossTenant('WID-LEGACY-XT', chA1);
+    expect(own?.tenant_id).toBe(T);
+    expect(own?.agent_id).toBe(A);
+    expect(own?.channel_id).toBeNull();
+
+    // Com match EXATO de canal disponível, ele vence a legada (desempate
+    // `channel_id IS NOT NULL` primeiro — comportamento preservado).
+    const exact = await q<{ id: string }>(
+      `INSERT INTO mensagens (tenant_id, agent_id, direcao, tipo, conteudo, metadata, channel_id)
+       VALUES ($1, $2, 'in', 'texto', 'exata na linha 1', '{"whatsapp_id":"WID-LEGACY-XT"}'::jsonb, $3)
+       RETURNING id`,
+      [T, A, chA1],
+    );
+    const preferExact = await mensagensRepo.findByWhatsappIdCrossTenant('WID-LEGACY-XT', chA1);
+    expect(preferExact?.id).toBe(exact.rows[0]!.id);
+  });
+
   it('CHECK do outbox: row whatsapp enviável sem canal é rejeitada (23514); email_alert passa', async () => {
     await expect(
       q(

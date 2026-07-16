@@ -29,7 +29,7 @@ import {
 } from '@whiskeysockets/baileys';
 import { mkdirSync, existsSync } from 'node:fs';
 import { rename, rm } from 'node:fs/promises';
-import { join, resolve as pathResolve } from 'node:path';
+import nodePath, { resolve as pathResolve } from 'node:path';
 import { config } from '../config/env.js';
 import { logger } from '../lib/logger.js';
 import { TypedError } from '../lib/utils.js';
@@ -67,26 +67,41 @@ export interface LineSessionInfo {
   is_primary: boolean;
 }
 
-export function lineAuthDir(channelId: string): string {
-  // UUID do canal, nunca o número (review v3 — path traversal). Defesa em
-  // profundidade: valida que o resolvido continua sob a raiz.
-  const root = pathResolve(config.BAILEYS_AUTH_DIR, 'lines');
-  const dir = pathResolve(root, channelId);
-  if (!dir.startsWith(root + '/')) {
-    throw new TypedError('auth_dir_escape', 'resolved auth dir escapes lines root', {
+/** Subconjunto de `node:path` usado na validação — injetável para testar
+ * as semânticas win32 E posix na mesma plataforma (review #498 médio 5). */
+type PathImpl = Pick<typeof nodePath, 'resolve' | 'relative' | 'isAbsolute' | 'sep'>;
+
+/**
+ * Resolve `<base>/<bucket>/<channelId>` garantindo que o resultado é um
+ * FILHO DIRETO da raiz do bucket (UUID do canal, nunca o número — review v3,
+ * path traversal). Review #498 (médio 5): a comparação por prefixo
+ * `startsWith(root + '/')` rejeitava TODO path válido no Windows (o
+ * separador de `path.resolve` lá é `\`) — `path.relative` + `path.sep` são
+ * portáveis: escape ⇒ `..`/absoluto; descida além de um nível ⇒ contém sep.
+ */
+export function resolveScopedAuthDir(
+  baseDir: string,
+  bucket: 'lines' | 'pairing',
+  channelId: string,
+  p: PathImpl = nodePath,
+): string {
+  const root = p.resolve(baseDir, bucket);
+  const dir = p.resolve(root, channelId);
+  const rel = p.relative(root, dir);
+  if (rel === '' || rel.startsWith('..') || p.isAbsolute(rel) || rel.includes(p.sep)) {
+    throw new TypedError('auth_dir_escape', `resolved auth dir escapes ${bucket} root`, {
       channelId,
     });
   }
   return dir;
 }
 
+export function lineAuthDir(channelId: string): string {
+  return resolveScopedAuthDir(config.BAILEYS_AUTH_DIR, 'lines', channelId);
+}
+
 export function pairingAuthDir(channelId: string): string {
-  const root = pathResolve(config.BAILEYS_AUTH_DIR, 'pairing');
-  const dir = pathResolve(root, channelId);
-  if (!dir.startsWith(root + '/')) {
-    throw new TypedError('auth_dir_escape', 'resolved pairing dir escapes root', { channelId });
-  }
-  return dir;
+  return resolveScopedAuthDir(config.BAILEYS_AUTH_DIR, 'pairing', channelId);
 }
 
 const PAIRING_TTL_MS = 15 * 60_000;
@@ -97,10 +112,23 @@ export interface PairingResult {
   actual_line: string | null;
 }
 
+/**
+ * Entrada de UMA PairingSession em curso. Criada SINCRONAMENTE na entrada de
+ * `startPairingSession` (review #498 alto 4 — a reserva antes de qualquer
+ * await impede duas sessões concorrentes de compartilharem o auth dir), por
+ * isso `sock`/`timer` são preenchidos depois. `settle` resolve a promise
+ * externa exatamente uma vez — o abort também a resolve (nunca fica pendente).
+ */
+type PairingEntry = {
+  sock: WASocket | null;
+  timer: NodeJS.Timeout | null;
+  settle: ((r: PairingResult) => void) | null;
+};
+
 class LineSessionManager {
   private transports = new Map<string, LineTransport>();
   private info = new Map<string, LineSessionInfo>();
-  private pairingSockets = new Map<string, { sock: WASocket; timer: NodeJS.Timeout }>();
+  private pairingSockets = new Map<string, PairingEntry>();
 
   isEnabled(): boolean {
     return config.MAIA_MULTI_LINE;
@@ -178,28 +206,77 @@ class LineSessionManager {
     onUpdate?: (u: { qr?: string; pairing_code?: string; state: string }) => void;
     requestPairingCodeFor?: string;
   }): Promise<PairingResult> {
-    const dir = pairingAuthDir(args.channel_id);
-    mkdirSync(dir, { recursive: true });
-    const { state, saveCreds } = await useMultiFileAuthState(dir);
-    let version: [number, number, number] | undefined;
-    try {
-      version = (await fetchLatestBaileysVersion()).version;
-    } catch {
-      /* fallback para a versão da lib */
+    // Review #498 (alto 4): UMA PairingSession por canal, mesmo sob chamadas
+    // concorrentes — a reserva é síncrona (antes de qualquer await); sem ela,
+    // duas sessões compartilhavam o mesmo auth dir.
+    if (this.pairingSockets.has(args.channel_id)) {
+      throw new TypedError(
+        'pairing_in_progress',
+        'a pairing session is already running for this channel',
+        { channel_id: args.channel_id },
+      );
     }
-    const sock = makeWASocket({ auth: state, version, printQRInTerminal: false });
-    sock.ev.on('creds.update', saveCreds);
+    const entry: PairingEntry = { sock: null, timer: null, settle: null };
+    this.pairingSockets.set(args.channel_id, entry);
 
-    return new Promise<PairingResult>((resolvePromise) => {
-      const timer = setTimeout(() => {
+    let dir: string;
+    let sock: WASocket;
+    try {
+      dir = pairingAuthDir(args.channel_id);
+      mkdirSync(dir, { recursive: true });
+      const { state, saveCreds } = await useMultiFileAuthState(dir);
+      let version: [number, number, number] | undefined;
+      try {
+        version = (await fetchLatestBaileysVersion()).version;
+      } catch {
+        /* fallback para a versão da lib */
+      }
+      sock = makeWASocket({ auth: state, version, printQRInTerminal: false });
+      sock.ev.on('creds.update', saveCreds);
+    } catch (err) {
+      // Setup falhou antes do socket existir — libera a reserva e propaga
+      // (o chamador encerra o pairing com `failed`; nada fica pendente).
+      this.pairingSockets.delete(args.channel_id);
+      throw err;
+    }
+    // O operador pode ter abortado DURANTE o setup assíncrono acima — a
+    // reserva já não é nossa: encerra o socket órfão e falha explicitamente
+    // (nunca deixa uma sessão fantasma sem entrada no mapa).
+    if (this.pairingSockets.get(args.channel_id) !== entry) {
+      try {
+        sock.end(undefined);
+      } catch {
+        /* já fechado */
+      }
+      throw new TypedError('pairing_aborted', 'pairing aborted during session setup', {
+        channel_id: args.channel_id,
+      });
+    }
+    entry.sock = sock;
+
+    return new Promise<PairingResult>((resolvePromise, rejectPromise) => {
+      // Settle EXATAMENTE uma vez — cobre open vs TTL vs abort (o segundo
+      // `open` de um socket zumbi não pode re-executar a promoção: o rm +
+      // rename repetidos destruiriam o auth state recém-promovido).
+      let settled = false;
+      entry.settle = (r) => {
+        if (settled) return;
+        settled = true;
+        resolvePromise(r);
+      };
+      entry.timer = setTimeout(() => {
+        // abortPairing resolve a promise via entry.settle (matched: false).
         void this.abortPairing(args.channel_id, 'ttl_expired');
-        resolvePromise({ matched: false, actual_line: null });
       }, PAIRING_TTL_MS);
-      this.pairingSockets.set(args.channel_id, { sock, timer });
 
       sock.ev.on('connection.update', (u) => {
         if (u.qr) args.onUpdate?.({ qr: u.qr, state: 'pairing_qr' });
         if (u.connection === 'open') {
+          if (settled) return;
+          // Marca SINCRONAMENTE: um segundo `open` (socket zumbi) durante a
+          // promoção assíncrona repetiria rm+rename e destruiria o auth
+          // state recém-promovido.
+          settled = true;
           const rawJid = sock.user?.id ?? '';
           const digits = rawJid.split(':')[0]?.split('@')[0] ?? '';
           const actual = digits ? `+${digits.replace(/^\+/, '')}` : null;
@@ -208,21 +285,30 @@ class LineSessionManager {
             { channel_id: args.channel_id, actual, declared: args.declared_line, matched },
             'pairing_session.connected',
           );
-          clearTimeout(timer);
+          if (entry.timer) clearTimeout(entry.timer);
           this.pairingSockets.delete(args.channel_id);
           // Encerra o socket de pareamento SEMPRE — a sessão de roteamento
           // (se casou) sobe do dir promovido, nunca deste socket.
           sock.end(undefined);
           void (async () => {
-            if (matched) {
-              const target = lineAuthDir(args.channel_id);
-              mkdirSync(pathResolve(config.BAILEYS_AUTH_DIR, 'lines'), { recursive: true });
-              if (existsSync(target)) await rm(target, { recursive: true, force: true });
-              await rename(dir, target);
-            } else {
-              await rm(dir, { recursive: true, force: true });
+            try {
+              if (matched) {
+                const target = lineAuthDir(args.channel_id);
+                mkdirSync(pathResolve(config.BAILEYS_AUTH_DIR, 'lines'), { recursive: true });
+                if (existsSync(target)) await rm(target, { recursive: true, force: true });
+                await rename(dir, target);
+              } else {
+                await rm(dir, { recursive: true, force: true });
+              }
+              resolvePromise({ matched, actual_line: actual });
+            } catch (err) {
+              // Review #498 (alto 4): falha de filesystem REJEITA a promise
+              // externa — antes ela ficava pendente e o pairing preso em
+              // `pairing`. Auth dir de pareamento destruído best-effort
+              // (fail-closed: sem promoção não há posse).
+              await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+              rejectPromise(err as Error);
             }
-            resolvePromise({ matched, actual_line: actual });
           })();
         }
       });
@@ -242,14 +328,17 @@ class LineSessionManager {
   async abortPairing(channelId: string, reason: string): Promise<void> {
     const entry = this.pairingSockets.get(channelId);
     if (!entry) return;
-    clearTimeout(entry.timer);
+    if (entry.timer) clearTimeout(entry.timer);
     this.pairingSockets.delete(channelId);
     try {
-      entry.sock.end(undefined);
+      entry.sock?.end(undefined);
     } catch {
       /* já fechado */
     }
     await rm(pairingAuthDir(channelId), { recursive: true, force: true });
+    // Resolve a promise pendente (matched: false) — review #498 alto 4:
+    // o abort deixava a promise da PairingSession pendente para sempre.
+    entry.settle?.({ matched: false, actual_line: null });
     logger.info({ channel_id: channelId, reason }, 'pairing_session.aborted');
   }
 

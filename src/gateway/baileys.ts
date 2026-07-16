@@ -56,8 +56,13 @@ export function getCurrentLineE164(): string | null {
   return currentLineE164;
 }
 
-/** Canal (se algum) sob o qual a sessão primária está registrada no manager. */
-let primaryChannelId: string | null = null;
+/**
+ * Canal (se algum) sob o qual a sessão primária está registrada no manager.
+ * Triplete completo (review #498 alto 2): as transições de sessão da
+ * primária são auditadas sob o ALS do (tenant, agent) DONO do canal — só o
+ * id não permitiria escopar colunas nem labels de métricas.
+ */
+let primaryChannel: { id: string; tenant_id: string; agent_id: string } | null = null;
 
 /**
  * Transporte da linha PRIMÁRIA (fase 1, spec roteamento v4 §1.5): adapta as
@@ -103,20 +108,30 @@ async function registerPrimaryLineSession(): Promise<void> {
       );
       return;
     }
-    primaryChannelId = channel.id;
+    primaryChannel = {
+      id: channel.id,
+      tenant_id: channel.tenant_id,
+      agent_id: channel.agent_id,
+    };
     getLineSessionManager().register(channel.id, buildPrimaryLineTransport(), {
       line_external_id: currentLineE164,
       is_primary: true,
     });
-    await audit({
-      acao: 'line_session_transition',
-      metadata: {
-        channel_id: channel.id,
-        line_external_id: currentLineE164,
-        state: 'connected',
-        is_primary: true,
-      },
-    });
+    // Review #498 (alto 2): audita sob o ALS do dono do canal — sem o wrap,
+    // audit() cai no bucket `system` (colunas e labels de métricas erradas).
+    await runWithTenantContext(
+      { tenant_id: channel.tenant_id, agent_id: channel.agent_id },
+      () =>
+        audit({
+          acao: 'line_session_transition',
+          metadata: {
+            channel_id: channel.id,
+            line_external_id: currentLineE164,
+            state: 'connected',
+            is_primary: true,
+          },
+        }),
+    );
   } catch (err) {
     logger.warn(
       { err: (err as Error).message },
@@ -271,20 +286,24 @@ async function handleConnectionUpdate(update: ConnectionUpdate): Promise<void> {
     logger.warn({ reason }, 'baileys.connection_closed');
     // Espelha a transição no manager (invariante 6): loggedOut encerra a
     // posse da linha; qualquer outro close é recuperável (reconnect loop).
-    if (primaryChannelId) {
+    if (primaryChannel) {
+      const { id, tenant_id, agent_id } = primaryChannel;
       const nextState =
         reason === DisconnectReason.loggedOut ? ('closed' as const) : ('recovering' as const);
-      getLineSessionManager().markState(primaryChannelId, nextState);
-      await audit({
-        acao: 'line_session_transition',
-        metadata: {
-          channel_id: primaryChannelId,
-          state: nextState,
-          is_primary: true,
-          reason,
-        },
-      });
-      if (nextState === 'closed') primaryChannelId = null;
+      getLineSessionManager().markState(id, nextState);
+      // Review #498 (alto 2): transição auditada sob o ALS do dono do canal.
+      await runWithTenantContext({ tenant_id, agent_id }, () =>
+        audit({
+          acao: 'line_session_transition',
+          metadata: {
+            channel_id: id,
+            state: nextState,
+            is_primary: true,
+            reason,
+          },
+        }),
+      );
+      if (nextState === 'closed') primaryChannel = null;
     }
     await audit({ acao: 'whatsapp_disconnected', metadata: { reason } });
     if (reason === DisconnectReason.loggedOut) {
@@ -400,9 +419,10 @@ export async function startBaileys(): Promise<void> {
   // Fase 0/3 (review PR #496 CRÍTICO 1): o handler é COMPARTILHADO com as
   // sessões de linha adicionais (line-sessions.ts) e escopado pelo canal da
   // sessão que entregou o evento — a primária passa o canal registrado no
-  // manager (null na janela legada mono-linha ⇒ comportamento anterior).
+  // manager (null na janela legada mono-linha ⇒ comportamento anterior; em
+  // MAIA_MULTI_LINE o handler falha FECHADO sem canal — review #498).
   socket.ev.on('messages.update', (updates) => {
-    void handleMessagesUpdate(updates, primaryChannelId);
+    void handleMessagesUpdate(updates, primaryChannel?.id ?? null);
   });
 }
 
@@ -419,10 +439,16 @@ export async function startBaileys(): Promise<void> {
  * sessão que recebeu o evento: com N linhas o mesmo whatsapp_id pode existir
  * em canais/tenants diferentes (dedup por canal, §1.7) e um lookup global
  * escolheria a row mais recente — edit/revoke auditado no tenant ERRADO.
- * `channel_id` informado casa a row do canal OU a legada (channel NULL);
- * null (sessão primária sem canal registrado — janela mono-linha) preserva o
- * comportamento anterior. O mesmo canal é repassado ao routeMessageUpdate,
- * que escopa os lookups internos (já sob o ALS do dono).
+ * `channel_id` informado casa a row do canal OU a legada (channel NULL,
+ * desde que pertença ao MESMO tenant/agent do canal — review #498).
+ *
+ * [Review #498 CRÍTICO 1] Em `MAIA_MULTI_LINE`, `channel_id === null`
+ * (registro da primária ainda pendente, ou permanentemente falho) NÃO cai
+ * mais no lookup global: o lote é descartado fail-closed e auditado
+ * (`message_update_channel_unresolved`) — a janela residual permitia
+ * resolver a row de OUTRO tenant. Mono-linha (`MAIA_MULTI_LINE=false`)
+ * preserva o comportamento anterior: uma única sessão ⇒ lookup global sem
+ * ambiguidade entre linhas.
  */
 export async function handleMessagesUpdate(
   updates: ReadonlyArray<{
@@ -432,6 +458,17 @@ export async function handleMessagesUpdate(
   channel_id: string | null,
 ): Promise<void> {
   if (!config.FEATURE_MESSAGE_UPDATE) return;
+  if (!channel_id && config.MAIA_MULTI_LINE) {
+    logger.warn(
+      { updates: updates.length },
+      'message_update.channel_unresolved_dropped',
+    );
+    await audit({
+      acao: 'message_update_channel_unresolved',
+      metadata: { dropped_updates: updates.length },
+    });
+    return;
+  }
   for (const update of updates) {
     try {
       // Baileys 6.7.0 delivers `update` as `{ key, update: Partial<WAMessageInfo> }`.
