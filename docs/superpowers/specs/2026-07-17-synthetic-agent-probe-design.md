@@ -1,134 +1,153 @@
 # Synthetic Agent Probe — Teste real de interação, automatizado — Design Spec
 
-**Date:** 2026-07-17
-**Status:** Draft v1 — para review de design.
+**Date:** 2026-07-17 (v2: 2026-07-18)
+**Status:** Draft v2 — incorpora o review de design do owner (PR #501). Mudanças vs. v1: **[Crítico] §1.2/§4** o catch-all NÃO resolve o tráfego da sonda em `shadow` e um canal de sonda ATIVO degrada o ingresso REAL (flip de `findPrimaryCatchAllChannel` para `multi_tenant:true`) mesmo com a flag off → `exact_first`/`strict` validado vira pré-requisito e o canal da sonda nasce/permanece INATIVO até lá; **[Alta] §1.1** worker phase 2 NUNCA é agendado (`startWorkers(1)` ignora `phase>1`) → registrar em phase 1 atrás da flag default-off; **[Alta] §1.3** sink escopado só por `tenant_id` silencia todo o outbound de um tenant real se mal configurado → marcador sintético IMUTÁVEL + triplete completo + validação fail-fast no boot; **[Média] §1.4** enumerar todos os fixtures do cenário de tool (entidade, conta, permission profile, permissão da pessoa, grant `domain.finance`); **[Média] §1.4/§1.5** cenário fixado em `status: 'pendente'` (sem mutação de `contas.saldo_atual`), correlação por `mensagem_id`, cleanup só após estado terminal/TTL, audit/trace preservados; **[Média] §1.6** `sendAlert` engole falhas (allSettled) → sinal primário no gauge + estado `alert_pending` com retry; **[Média] §1.5** estado durável em Postgres (`synthetic_probe_runs`/`_state`) para `last_ok`/K-falhas/transição/single-flight/dedup sobreviverem a restart.
 **Scope:** Uma **sonda sintética** que exercita o agente de ponta a ponta pelo **caminho de produção real** (ingresso → resolução de tenant → fila de agente → LLM → tools → persistência → fronteira de saída), continuamente e sem intervenção humana, e falha ALTO quando a Maia para de responder ou responde errado. Fecha a parte B da issue #472 (fase 1 do blueprint `2026-06-10-learnable-workforce-vision.md` §4) e a lacuna de "E2E do agente" que as duas specs de 2026-07-09 deixaram como não-automatizável no sandbox.
 
-**Referências:**
-- `src/gateway/baileys.ts` — `ingressUpsertMessage(msg, line?)` (`:572`): ponto de ingresso ÚNICO onde um evento Baileys entra no pipeline (resolve tenant → `handleIncoming` sob `runWithTenantContext` → enfileira em `agentQueue`). Retorna `'handled' | 'dropped' | 'skipped'`.
-- `src/agent/core.ts` — `runAgentForMensagem(mensagem_id)` (`:292`): callstack do worker; resolve o tuple e roda o agente real (resolver, adoção, decision engine, tools, memória).
-- `src/gateway/line-output.ts` — `forChannel({tenant_id, agent_id, channel_id})` / `buildOutput`: a **fronteira única de saída** (#496). É AQUI que a sonda intercepta o envio físico (sink), reusando o corte que já existe.
-- `src/agent/playground-turn.ts` — o playground roda DE PROPÓSITO fora do pipeline (sem pessoa/conversa/gateway/outbox, tools deny-all): prova que o LLM responde em personagem, **não** que a tool persistiu. A sonda é o oposto: caminho real, efeito colateral real, escopado a um tenant de teste.
-- `src/workers/index.ts` — registro de workers cron `{ name, cron, fn, phase }` (phase 1 = crítico, phase 2 = não-crítico).
-- `src/lib/alerts.ts` — `sendAlert({ subject, body })`. `src/lib/metrics.ts` — `incCounter(name, labels?, by?)`, `observeHistogram(name, value, labels?)`, `setGaugeProvider(name, provider)`.
-- `src/config/env.ts` — convenção `MAIA_*` (zod, default seguro).
+**Referências (verificadas no runtime do base da PR):**
+- `src/gateway/baileys.ts` — `ingressUpsertMessage(msg, line?)` (`:572`): ponto de ingresso ÚNICO (resolve tenant → `handleIncoming` sob `runWithTenantContext` → enfileira em `agentQueue`). Retorna `'handled' | 'dropped' | 'skipped'`.
+- `src/gateway/channel-resolver.ts` (`:137-185`) — em `shadow` (default de `MAIA_CHANNEL_ROUTING_MODE`) `resolveChannel` computa o exact-match mas RETORNA `resolveLegacy` (catch-all). Só `exact_first`/`strict` usam o exact-match como resultado.
+- `src/db/repositories/channel-repos.ts` — `findPrimaryCatchAllChannel` (`:239-250`): a **mera existência** de QUALQUER canal ativo de tenant ≠ `PRIMARY_TENANT_ID` retorna `{ multi_tenant: true, channel: null }` (fail-closed) — e o miss pelo telefone lança `channel_resolution_failed`.
+- `src/index.ts` (`:66`) `startWorkers(1)` + `src/workers/index.ts` `startWorkers`: `if (job.phase > currentPhase) continue` — **phase 2 nunca é agendado** hoje.
+- `src/gateway/line-output.ts` — `buildOutput`: a **fronteira única de saída** (#496); ponto do sink da sonda.
+- `src/tools/register-transaction.ts` — inputs obrigatórios `entidade_id` (uuid, deve estar em `ctx.scope.entidades`), `conta_id` (uuid), `natureza`, `valor`, `data_competencia`, `status ∈ {pendente,agendada,paga,recebida}`; tool no pack `domain.finance` (visível só com grant). `status ∈ {paga,recebida}` muta `contas.saldo_atual` (`:149`); `pendente`/`agendada` não.
+- `src/agent/playground-turn.ts` — o playground roda DE PROPÓSITO fora do pipeline (tools deny-all, sem persistência de negócio): prova que o LLM responde em personagem, **não** que a tool persistiu.
+- `src/lib/alerts.ts` — `sendAlert({subject, body})` usa `Promise.allSettled` e cada canal engole a própria falha (o caller não sabe se entregou). `src/lib/metrics.ts` — `incCounter`/`observeHistogram`/`setGaugeProvider` (in-memory, não sobrevivem a restart).
 
-**Architecture Locks tocados:** nenhum. A sonda não altera o pipeline; ela o EXERCITA por um tenant isolado. O único ponto de acoplamento no código de produção é um guard na fronteira `LineOutput` (sink do outbound da sonda) — aditivo e fail-safe.
+**Architecture Locks tocados:** nenhum. A sonda não altera o pipeline; o único acoplamento no código de produção é um guard aditivo e fail-safe no topo de `buildOutput` (sink por triplete sintético). O guard de `channel-resolver`/`findPrimaryCatchAllChannel` **não** é alterado — a sonda se ADAPTA a ele (canal inativo até `exact_first`/`strict`).
 
-**Depends on:** #496 (fronteira única `LineOutput` — mesclado), a fila `agentQueue` e o worker cron runner (existentes). **Blocks:** desligar a dependência de "cliente reclamando" como detector de outage; cobertura de regressão E2E do agente no CI (via Nível 1/cassetes, spec futura).
+**Depends on:** #496 (fronteira única `LineOutput`), `agentQueue` + worker cron runner. **Blocks:** desligar "cliente reclamando" como detector de outage; ponto de extensão para o Nível 1 (cassetes VCR no CI).
 
 ---
 
 ## §0. Purpose & problema
 
-Hoje **nada** prova, de forma automática e contínua, que "uma mensagem entra e a Maia responde certo". Os testes unit/integração exercitam pedaços (resolver, dedup, output boundary) com o LLM mockado; o playground exercita o LLM sem o pipeline. O detector de "a Maia parou" em produção é o cliente reclamando — e uma regressão de fiação (as que #496/#500 corrigiram) só apareceria quando um humano notasse silêncio.
+Hoje **nada** prova, de forma automática e contínua, que "uma mensagem entra e a Maia responde certo". Unit/integração exercitam pedaços com o LLM mockado; o playground exercita o LLM sem o pipeline. O detector de "a Maia parou" é o cliente reclamando — e uma regressão de fiação (as de #496/#500) só apareceria quando um humano notasse silêncio.
 
-A parte **difícil** de automatizar isso não é injetar a mensagem — é **assertar** sobre uma resposta que o LLM gera de forma não-determinística. O design inteiro gira em torno de asserção por **efeito colateral verificável**, não por igualdade de string.
+A parte **difícil** não é injetar a mensagem — é **assertar** sobre uma resposta que o LLM gera de forma não-determinística. O design gira em torno de asserção por **efeito colateral verificável**, não por igualdade de string.
 
-**Não-objetivos** (explícitos):
-- **Não** é o transporte WhatsApp literal (segundo número, cliente Baileys "cliente"). Isso é o "Nível 3" — smoke noturno futuro, fora desta spec.
-- **Não** é regressão determinística no CI (o "Nível 1" com cassetes VCR do LLM) — spec própria depois; a sonda e os cassetes compartilham o harness de injeção, então esta spec deixa o ponto de extensão pronto.
-- **Não** substitui `test:leak`/integração; complementa com um sinal de produção viva.
+**Não-objetivos** (explícitos): transporte WhatsApp literal (segundo número — "Nível 3", smoke noturno futuro); regressão determinística no CI com cassetes VCR do LLM ("Nível 1", spec própria — o harness deixa o ponto de extensão pronto); substituir `test:leak`/integração.
 
 ---
 
 ## §1. Design
 
-### §1.1 O que a sonda faz (loop, a cada tick)
+### §1.1 O loop, a cada tick — e a fase do worker
 
-Worker cron `synthetic_probe`, **phase 2** (não-crítico — nunca pode afetar tráfego real), cadência default `*/10 * * * *`, atrás de flag `MAIA_SYNTHETIC_PROBE` (default `false`). Por tick:
+Worker cron `synthetic_probe`, **phase 1** (correção do review: `startWorkers(1)` ignora `phase>1`, logo phase 2 nunca roda), **inerte enquanto `MAIA_SYNTHETIC_PROBE=false`** (default). A flag — não a fase — é o gate de comportamento; registrar em phase 1 é seguro porque o worker é no-op com a flag off. Cadência default `*/10 * * * *`. Por tick:
 
-1. **Guard de entrada.** Flag off, ou config incompleta (tenant/agente/canal de sonda não resolvíveis), ou um run anterior ainda em voo (lock de execução único) ⇒ no-op silencioso.
-2. **Escolhe um cenário** da tabela de cenários (§1.4), determinística por tick (round-robin por índice derivado do minuto — sem `Date.now()` no meio da lógica testável; o worker recebe `now` do runner).
-3. **Injeta** um inbound sintético do "cliente de teste" para a "linha de teste" chamando `ingressUpsertMessage(synthMsg, probeLineCtx)` — **exatamente** a função que o gateway chama. Isso exercita resolver + dedup + tenant-ctx + `handleIncoming` + enfileiramento na `agentQueue` REAL.
-4. **Espera pelo efeito** (poll com deadline = SLO, default 30 s): o agente real processa pela fila, chama o LLM real, executa a(s) tool(s), persiste. A sonda faz polling da(s) condição(ões) de sucesso do cenário (§1.4) — row de efeito colateral + row de resposta `mensagens direcao='out'`.
-5. **Classifica o desfecho**: `ok` (todas as asserções em ≤ SLO), `slow` (asserções ok mas > SLO_warn), `wrong` (respondeu mas efeito colateral ausente/errado), `silent` (nenhuma resposta em SLO), `error` (exceção no harness).
-6. **Emite sinal** (§1.6): métricas sempre; alerta só na **transição** saudável→degradado (dedup — nunca spam por tick).
-7. **Limpa** as rows que o run criou no tenant de sonda (idempotente; um sweep de TTL cobre runs mortos — §1.5).
+1. **Guards de entrada.** Flag off, ou pré-requisitos de roteamento não satisfeitos (§1.2), ou config inválida (validação de boot §1.3), ou um run em voo (lease de single-flight, §1.5) ⇒ no-op silencioso.
+2. **Escolhe um cenário** (§1.4), determinístico por tick (índice derivado do `now` que o runner injeta — sem `Date.now()` na lógica testável).
+3. **Injeta** um inbound sintético via `ingressUpsertMessage(synthMsg, probeLineCtx)` — o caminho real (resolver + dedup + tenant-ctx + `handleIncoming` + `agentQueue`).
+4. **Espera pelo efeito** (poll com deadline = SLO, default 30 s), correlacionando por `mensagem_id` estável do run: a(s) row(s) de efeito colateral do cenário + a `mensagens direcao='out'`.
+5. **Classifica**: `ok` | `slow` (asserção ok mas > SLO_warn) | `wrong` (respondeu, efeito ausente/errado) | `silent` (sem resposta em SLO) | `error`.
+6. **Persiste o desfecho** em `synthetic_probe_runs`/`_state` (§1.5) e **emite sinal** (§1.6): métricas sempre; alerta só na transição, com estado durável.
+7. **Cleanup** só após estado terminal do run ou TTL (§1.5) — nunca no meio de um job em voo.
 
-O passo 4 medir a latência ponta-a-ponta REAL (incluindo espera de fila) é o próprio SLO que se quer observar.
+### §1.2 Injeção pelo caminho real + **pré-requisito de roteamento** (correção crítica)
 
-### §1.2 Injeção pelo caminho real (fidelidade máxima)
+A sonda injeta em `ingressUpsertMessage` (não `enqueueAgent`) para exercitar resolver + dedup — o que regrediu em #496/#500. Mas o modo de roteamento importa e o v1 estava errado:
 
-A sonda injeta em `ingressUpsertMessage`, **não** em `enqueueAgent` — de propósito: queremos exercitar o resolver de tenant/canal e o dedup, que foram exatamente o que quebrou em #496 e #500. O `synthMsg` é um `proto.IWebMessageInfo` mínimo bem-formado (key com `remoteJid` do cliente de teste, `message.conversation` com o texto do cenário, `messageTimestamp` vindo do `now` do runner, `id` estável por run para idempotência). O `probeLineCtx: LineIngressCtx` carrega `botLineE164` = a linha do canal de sonda, para o exact-match resolver ao canal certo nos modos `exact_first`/`strict` (e o catch-all resolvê-lo em `shadow`/mono-linha).
+- Em **`shadow`** (default) o resultado é sempre o `resolveLegacy`/catch-all. Pior: um canal de sonda **ATIVO** (tenant `__probe__` ≠ `primary`) faz `findPrimaryCatchAllChannel` retornar `multi_tenant:true` para TODO o runtime — e aí o inbound REAL de qualquer telefone desconhecido passa a lançar `channel_resolution_failed`. **Isto derruba o ingresso de produção mesmo com `MAIA_SYNTHETIC_PROBE=false`**, só pela existência do canal ativo.
+- **Correção:** `MAIA_CHANNEL_ROUTING_MODE ∈ {exact_first, strict}`, validado e operante, é **pré-requisito duro** da sonda. Enquanto o runtime estiver em `shadow`, o canal da sonda permanece **INATIVO** (a migração o cria inativo; ele só é ativado no pareamento, quando o exact-match já resolve o tráfego da sonda pelo canal certo sem tocar o catch-all). Com a flag da sonda on e o modo em `shadow`, o worker **falha fechado** (no-op + audit `synthetic_probe_prereq_unmet`), nunca ativa o canal.
+- **Invariante novo (§1.7.7):** a existência/estado do canal da sonda **nunca** degrada o ingresso real — garantido por manter o canal inativo fora de `exact_first`/`strict`.
 
-**Fila real, não inline.** O inbound segue pela `agentQueue` e é processado por `runAgentForMensagem` como qualquer mensagem. A sonda **não** chama o agente inline — rodar pela fila é o que dá o número de latência honesto e prova que o worker de agente está vivo. A sonda apenas faz polling do resultado persistido.
+O `synthMsg` é um `IWebMessageInfo` mínimo (key.remoteJid = cliente de teste, `message.conversation` = texto do cenário, `messageTimestamp` do `now`, `id` estável por run). O `probeLineCtx.botLineE164` = a linha do canal de sonda (exact-match).
 
-### §1.3 Neutralização do outbound — **fail-safe, na fronteira única** (crítico)
+**Fila real, não inline:** o inbound segue pela `agentQueue` e roda em `runAgentForMensagem` — é o que prova que o worker de agente está vivo e dá a latência honesta. A sonda só faz polling do resultado.
 
-Risco real: no default **mono-linha** (`MAIA_MULTI_LINE=false`), `LineOutput` envia pela sessão Baileys **global** independentemente do canal — um reply da sonda sairia pela linha de produção para o `telefone` do cliente de teste. **Inaceitável.**
+### §1.3 Neutralização do outbound — **triplete + marcador imutável + fail-fast** (correção alta)
 
-Solução, reusando o corte do #496: em `line-output.ts`, `buildOutput(scope)` passa a checar `scope.tenant_id === PROBE_TENANT_ID` (constante derivada da config da sonda) e, se for, retorna um **sink `LineOutput`**: registra o texto/mídia que sairia (para latência e para uma asserção opcional de liveness), devolve um id sintético, e **não faz nenhum envio físico**. Assim, por construção, **é impossível** uma mensagem da sonda chegar ao WhatsApp real — mesmo com flag mal configurada, número real plantado por engano, ou modo de roteamento qualquer. O guard é aditivo (uma ramificação no topo do `buildOutput`) e não toca o caminho de produção de nenhum outro tenant.
+Risco (v1): no default mono-linha, `LineOutput` envia pela sessão global — um reply da sonda sairia pela linha real. E o sink escopado só por `tenant_id` tinha blast radius: se `MAIA_PROBE_TENANT_ID` apontasse por engano para `primary`/um tenant real, **todo** o outbound daquele tenant seria silenciado.
 
-Consequência de design: a **prova de resposta** da sonda é a **row persistida** `mensagens direcao='out'` (o agente registra a saída antes/independclui do transporte), não a entrega física. Entrega física é o Nível 3.
+**Correção — sink estreito e fail-safe:**
+- O canal da sonda carrega um **marcador sintético IMUTÁVEL** (coluna `is_synthetic boolean not null default false`, setada no seed por migração, nunca por config de runtime).
+- Em `buildOutput(scope)`, o sink ativa **só** quando o **triplete completo** (`tenant_id + agent_id + channel_id`) casa a sonda **E** o canal carrega `is_synthetic=true`. Nunca por `tenant_id` sozinho — o blast radius fica no canal exato, coerente com o invariante `tenant_id + agent_id` (aqui, + `channel_id`).
+- **Validação fail-fast no boot** (`src/index.ts`, quando `MAIA_SYNTHETIC_PROBE=true`): o `(tenant, agent, channel)` configurado DEVE existir, ser exclusivamente sintético (`is_synthetic=true`, tenant ≠ `PRIMARY_TENANT_ID`, agente/canal dedicados) — senão o boot **falha** (nunca sobe silenciando um tenant real).
+- Assim, por construção, é impossível a sonda (a) enviar ao WhatsApp real ou (b) silenciar outbound de um recurso não-sintético.
 
-### §1.4 Cenários e asserção por efeito colateral
+**Prova de resposta** = a row `mensagens direcao='out'` persistida (não a entrega física, que é o Nível 3).
 
-Um cenário é um objeto puro: `{ id, prompt, assert(ctx): Promise<AssertResult>, cleanup(ctx) }`. A asserção é **por efeito colateral verificável**, do mais robusto ao mais frouxo:
+### §1.4 Cenários, fixtures completos e asserção por efeito colateral
 
-- **(a) Efeito colateral de tool (primário).** Ex.: cenário `registrar_despesa` — prompt "registre R$ 50 de almoço hoje" ⇒ `assert` = existe uma `transacoes` row no tenant de sonda com `valor=50`, `tipo` de saída, criada neste run. Prova resolver + agente + decision engine + tool + persistência, de forma determinística mesmo com LLM não-determinístico.
-- **(b) Liveness (sempre).** Existe uma `mensagens direcao='out'` para a conversa do run (o agente respondeu algo). Isola "silêncio" de "respondeu errado".
-- **(c) LLM-as-judge (opcional, atrás de sub-flag).** Um modelo barato dá nota "a resposta satisfez a intenção do cenário?" contra uma rubrica curta. Bom para cenários semânticos (ex.: `saudacao` sem efeito colateral de tool). Custa uma chamada extra e adiciona ruído — **off por default**; usado só nos cenários sem efeito colateral determinístico.
+Cenário = `{ id, prompt, assert(ctx), terminalWhen(ctx) }`. Asserção do mais robusto ao mais frouxo:
 
-O conjunto v1 é pequeno e fixo (1–3 cenários) para custo/estabilidade previsíveis: um cenário de tool `(a)`, um de conversa pura `(b)`/`(c)`. O perfil do agente de sonda é **pinado numa versão fixa** para que o comportamento não derive por baixo dos pés da asserção.
+- **(a) Efeito colateral de tool (primário).** Cenário `register_transaction_pendente` — prompt "registre uma despesa de R$ 50 de almoço hoje". **Fixtures obrigatórios** (correção média — sem eles a tool é negada ou faltam UUIDs): tenant/agente de sonda; **entidade** de sonda; **conta** de sonda (`conta_id`); **permission profile/audience** ativo da pessoa de teste expondo a entidade em `ctx.scope.entidades`; **grant do pack `domain.finance`** no agente (senão a tool nem é visível); role/policy/channel default conforme o go-live checklist. O `assert` = existe `transacoes` com `entidade_id`/`conta_id` de sonda, `valor=50`, `natureza='despesa'`, **`status='pendente'`**, correlacionada ao `mensagem_id` do run.
+  - **Fixado em `status='pendente'`** (correção média): `pendente`/`agendada` NÃO mutam `contas.saldo_atual` — o cleanup vira um simples delete idempotente, sem compensação de saldo.
+- **(b) Liveness (sempre).** Existe `mensagens direcao='out'` para a conversa do run.
+- **(c) LLM-as-judge (opcional, sub-flag `MAIA_PROBE_LLM_JUDGE=false`).** Nota de um modelo barato "a resposta satisfez a intenção?" para cenários sem efeito determinístico. Off por default (custo/ruído).
 
-### §1.5 Isolamento, tenant de sonda e limpeza
+v1: 1 cenário de tool `(a)` + liveness `(b)`. Perfil do agente de sonda **pinado numa versão fixa** (asserção estável).
 
-- **Tenant/agente/canal dedicados** (`__probe__` ou config `MAIA_PROBE_TENANT_ID`/`_AGENT_ID`/`_CHANNEL_ID`), semeados por migração `_up`/`_down` (canal whatsapp E.164, agente com perfil ativo pinado, pessoa "cliente de teste"). Isolamento por `tenant_id + agent_id` já é o invariante da plataforma — a sonda não abre exceção, só adiciona um tenant.
-- **Cleanup por run** (idempotente) + **sweep de TTL** para rows órfãs de runs que morreram no meio (o mesmo padrão do `unrouted-recovery`). Nada de sonda sobrevive além do necessário para a asserção.
-- **Fora das métricas de negócio.** O tenant de sonda é filtrado de dashboards/analytics/relatórios (namespacing explícito), para não poluir números reais. `test:leak` ganha uma asserção de que nenhum dado da sonda vaza para tenants reais e vice-versa (aceite §3).
-- **Custo limitado.** 1 cenário por tick, `MAX_OUTPUT_TOKENS` baixo, cadência configurável, kill-switch por flag. Guard de orçamento: se a sonda observar N falhas consecutivas de LLM por custo/limite, ela se auto-silencia e alerta (não fica queimando tokens).
+### §1.5 Estado durável, isolamento e limpeza
 
-### §1.6 Métrica, alerta e observabilidade
+- **Estado em Postgres** (correção média — os contadores/gauges são in-memory e as rows do run são limpas; um restart esqueceria o outage ou duplicaria runs):
+  - `synthetic_probe_runs` (`id`, `tenant_id`, `agent_id`, `mensagem_id`, `scenario`, `started_at`, `outcome`, `latency_ms`, `terminal_at`) — histórico correlacionável.
+  - `synthetic_probe_state` (escopado por `tenant_id + agent_id`: `last_ok_at`, `consecutive_failures`, `health ∈ {healthy,degraded}`, `alert_pending`, `lease_until` para single-flight) — sobrevive a restart; `lease_until` impede runs concorrentes.
+- **Tenant/agente/canal de sonda dedicados**, semeados por migração `_up`/`_down` (canal whatsapp E.164 **inativo** com `is_synthetic=true`, agente com perfil ativo pinado, pessoa "cliente de teste", entidade+conta+permissão+grant do §1.4). Isolamento por `tenant_id + agent_id` é o invariante da plataforma — a sonda só adiciona um tenant.
+- **Cleanup só após terminal/TTL** (correção média): um job BullMQ que estourou o SLO pode persistir DEPOIS; então o cleanup espera `terminalWhen` (estado terminal do run) ou o TTL, e é correlacionado por `mensagem_id`/`run.id`. **Audit e trace do run são PRESERVADOS** (mesmo tráfego de teste deixa trilha). Sweep de TTL recolhe órfãos (padrão do `unrouted-recovery`).
+- **Fora das métricas de negócio:** tenant de sonda namespaced e filtrado de dashboards/analytics. `test:leak` ganha asserção de zero vazamento nos dois sentidos (aceite §3).
+- **Custo limitado:** 1 cenário/tick, output bounded, cadência configurável, kill-switch por flag, auto-silêncio por N falhas de custo consecutivas.
 
-- `incCounter('synthetic_probe_runs_total', { outcome })` a cada run (`outcome ∈ ok|slow|wrong|silent|error`).
-- `observeHistogram('synthetic_probe_latency_ms', dt, { scenario })` — a latência ponta-a-ponta real (o SLO que importa).
-- `setGaugeProvider('synthetic_probe_seconds_since_last_ok', …)` — idade do último sucesso; um gauge que cresce sem parar É o outage.
-- **Alerta com dedup por transição:** `sendAlert` dispara quando o estado passa de saudável→degradado (K falhas/slows consecutivos, K configurável), e um "recuperado" quando volta. Nunca um alerta por tick. O assunto carrega cenário + outcome + latência; o corpo, o link do trace.
+### §1.6 Métrica e alerta — **sinal durável, não fire-and-forget** (correção média)
+
+- `incCounter('synthetic_probe_runs_total', {outcome})`, `observeHistogram('synthetic_probe_latency_ms', dt, {scenario})`, `setGaugeProvider('synthetic_probe_seconds_since_last_ok', …)` lido de `synthetic_probe_state.last_ok_at` (durável, não in-memory).
+- **Sinal primário = o gauge `seconds_since_last_ok`** (alertável externamente pela stack de métricas): não depende de uma única entrega de `sendAlert`. Um gauge que cresce É o outage, sobrevive a restart.
+- **`sendAlert` é secundário e best-effort com retry durável:** como `sendAlert` usa `allSettled` e engole falhas de canal, a transição saudável→degradado grava `alert_pending=true` em `synthetic_probe_state`; um retry com backoff (no próprio worker) tenta reentregar até confirmar, e só então zera `alert_pending`. Sem isso, uma falha de entrega + dedup por transição suprimiria o alerta até uma nova recuperação+degradação.
+- **Contrato "log only"** (rollout §4): emite log estruturado + métrica, NÃO chama `sendAlert` — explícito, para o baseline em staging.
 
 ### §1.7 Invariantes (stop conditions)
 
-1. **A sonda NUNCA envia ao WhatsApp real.** Garantido por construção na fronteira `LineOutput` (sink por tenant), não por convenção.
-2. **A sonda NUNCA afeta tráfego real.** Worker phase 2, exceção contida, sem locks compartilhados, sem consumir capacidade desproporcional da `agentQueue` (1 msg/tick, cadência baixa).
-3. **Zero vazamento cross-tenant** entre sonda e tenants reais (both ways) — coberto por `test:leak`.
-4. **Toda execução auditada** (o run já passa pelo `audit` do pipeline; a decisão de outcome também audita).
-5. **Fail-closed de custo/erro:** falha repetida se auto-silencia e alerta, nunca queima tokens em loop.
-6. **Determinismo da asserção:** primário por efeito colateral; perfil do agente de sonda pinado; LLM-judge é secundário e opt-in.
+1. **A sonda NUNCA envia ao WhatsApp real** — sink por triplete + marcador imutável, na fronteira `LineOutput`.
+2. **A sonda NUNCA silencia outbound de recurso não-sintético** — o sink exige `is_synthetic=true` + triplete completo; boot fail-fast valida exclusividade.
+3. **A sonda NUNCA afeta tráfego real** — worker phase 1 mas inerte por flag; exceção contida; sem locks compartilhados; 1 msg/tick.
+4. **Zero vazamento cross-tenant** (both ways) — `test:leak`.
+5. **Fail-closed de pré-requisito** — sob `shadow`, canal inativo e worker no-op+audit; nunca degrada o ingresso real.
+6. **Toda execução auditada e correlacionável** (`mensagem_id`/`run.id`); audit/trace preservados no cleanup.
+7. **A existência do canal da sonda nunca degrada o ingresso real** (§1.2).
+8. **Sinal de outage sobrevive a restart** — estado durável em Postgres; gauge como sinal primário.
+9. **Determinismo da asserção** — primário por efeito colateral (`status='pendente'`, sem mutação de saldo); perfil pinado; LLM-judge secundário/opt-in.
 
 ---
 
 ## §2. Alternativas descartadas
 
-- **Injeção via `enqueueAgent` (pular o resolver):** mais simples, mas não exercitaria resolução de tenant/canal e dedup — exatamente o que regrediu em #496/#500. Descartado: perde a fidelidade que justifica a sonda.
-- **Rodar o agente inline (síncrono) em vez de pela fila:** asserção mais fácil, mas não prova que o worker de agente está vivo nem mede a latência de fila real. Descartado: o número honesto exige a fila.
-- **Reusar o playground:** ele é sem-efeitos-colaterais por design (tools deny-all, sem persistência de negócio) — não prova a cadeia real. Serve para liveness do LLM, não para a sonda. (Continua útil como Nível 1.5.)
-- **Segundo número WhatsApp real (bot-contra-bot) já nesta fase:** fidelidade máxima, mas flaky, com custo de sessão/ToS e não-determinístico — vira smoke noturno separado (Nível 3), não o canário contínuo.
-- **Asserção por igualdade de string da resposta:** frágil contra o LLM. Substituída por efeito colateral + liveness + judge opcional.
-- **Payload/estado da sonda no Redis:** o estado durável é Postgres (rows do tenant de sonda), consistente com o resto da plataforma.
+- **Injeção via `enqueueAgent`:** pula resolver/dedup — o que regrediu em #496/#500. Descartado.
+- **Rodar o agente inline:** não prova o worker vivo nem mede latência de fila. Descartado.
+- **Reusar o playground:** sem-efeitos por design; não prova a cadeia real. (Útil como Nível 1.5.)
+- **Ativar o canal da sonda em `shadow`:** derruba o catch-all real (`multi_tenant:true`). Descartado — canal inativo até `exact_first`/`strict`.
+- **Sink por `tenant_id`:** blast radius sobre um tenant real inteiro. Substituído por triplete + marcador imutável + fail-fast.
+- **Cenário `paga`/`recebida`:** muta `contas.saldo_atual`, exigindo compensação. Substituído por `pendente`.
+- **Alerta só via `sendAlert`:** engole falhas (allSettled). Substituído por gauge durável primário + `alert_pending` com retry.
+- **Estado só in-memory:** esquece o outage num restart. Substituído por `synthetic_probe_runs`/`_state`.
+- **Segundo número WhatsApp real já nesta fase:** flaky/ToS/custo — vira Nível 3.
+- **Asserção por string:** frágil. Substituída por efeito colateral + liveness + judge opcional.
 
 ---
 
 ## §3. Aceite (stop conditions verificáveis)
 
-- Unit: harness de injeção monta um `IWebMessageInfo` válido e chama `ingressUpsertMessage` (mockado) com o `probeLineCtx` certo; sink do `LineOutput` intercepta o outbound quando `tenant_id === PROBE_TENANT` e NÃO chama nenhuma primitiva de envio; classificação de outcome (ok/slow/wrong/silent/error) por combinação de (efeito presente?, resposta presente?, dt vs SLO); alerta dispara só na transição e o "recuperado" na volta; guard de auto-silêncio por N falhas.
-- Integração (DB-gated, Postgres real): um run completo do cenário de tool cria a `transacoes` row esperada no tenant de sonda e a `mensagens direcao='out'`, dentro do SLO; cleanup remove tudo; o sweep de TTL recolhe uma row órfã plantada.
-- `test:leak`: nenhuma row da sonda visível a um tenant real e nenhuma row real visível ao tenant de sonda.
-- Métrica/alerta: contador e histograma emitidos; `seconds_since_last_ok` cresce quando forçamos silêncio e zera no próximo ok.
-- Segurança: teste explícito de que, com `MAIA_MULTI_LINE=false` e um `telefone` real plantado no cliente de sonda, **nenhuma** primitiva de envio físico é chamada (o sink pega).
+- Unit: harness monta `IWebMessageInfo` válido e chama `ingressUpsertMessage` (mockado) com `probeLineCtx`; **boot fail-fast** rejeita config apontando para tenant/canal não-sintético ou `primary`; sink intercepta o outbound SÓ quando triplete casa + `is_synthetic=true` e NÃO chama nenhuma primitiva de envio; guard de pré-requisito no-op+audit sob `shadow`; classificação de outcome; transição de health com `alert_pending` + retry; single-flight via lease; auto-silêncio por N falhas.
+- Integração (DB-gated): run completo do cenário cria a `transacoes` `status='pendente'` esperada (entidade/conta de sonda, correlacionada por `mensagem_id`) e a `mensagens direcao='out'` em ≤ SLO; cleanup só após terminal remove as rows do run mas **preserva audit/trace**; sweep de TTL recolhe um órfão; `synthetic_probe_state` reflete `last_ok`/`consecutive_failures`/transição e sobrevive a "restart" (releitura).
+- `test:leak`: zero vazamento sonda↔real (both ways).
+- Segurança: com `MAIA_MULTI_LINE=false` e um `telefone` real plantado, **nenhuma** primitiva de envio físico é chamada (sink pega); com canal de sonda ATIVO sob `shadow`, o teste prova que o worker recusa (fail-closed) — e o rollout garante que a migração o cria inativo.
+- Regressão do ingresso real: teste de que a existência do canal de sonda **inativo** não altera `findPrimaryCatchAllChannel` (`multi_tenant` permanece `false` num runtime single-tenant).
 
 ---
 
 ## §4. Rollout
 
-0. **Migração** do tenant/agente/canal/pessoa de sonda (`_up`/`_down`) + flag `MAIA_SYNTHETIC_PROBE=false` + sink na fronteira `LineOutput` (aditivo, inerte enquanto não houver tráfego de sonda).
-1. **Harness + worker atrás de flag** (default off): registra `synthetic_probe` em `workers/index.ts` (phase 2), com 1 cenário de tool. Métricas ligadas, alerta em modo "log only".
-2. **Observação em staging:** ligar a flag em staging, medir latência baseline, calibrar SLO/SLO_warn e o K do dedup de alerta.
-3. **Produção, alerta ligado:** flag on em produção com o cenário de tool + liveness; alerta real com dedup por transição.
-4. **Expansão opcional:** cenário semântico com LLM-judge (sub-flag); mais cenários conforme necessidade. Ponto de extensão para o Nível 1 (cassetes VCR no CI) fica pronto no harness.
+0. **Migração** (`_up`/`_down`): tenant/agente/canal (**inativo**, `is_synthetic=true`)/pessoa/entidade/conta/permissão/grant `domain.finance` de sonda; coluna `channels.is_synthetic`; tabelas `synthetic_probe_runs`/`_state`. Flag `MAIA_SYNTHETIC_PROBE=false`. Sink aditivo em `buildOutput` + validação fail-fast no boot (inertes enquanto a flag off).
+1. **Worker em phase 1 atrás da flag** (default off): registra `synthetic_probe` com 1 cenário de tool; guard de pré-requisito (`exact_first`/`strict`); métricas ligadas; alerta em **log-only**.
+2. **Pré-requisito de roteamento:** só ligar a sonda em ambiente já em `exact_first`/`strict` validado (o rollout do roteamento multi-linha, spec 2026-07-09 §4). Pareamento ATIVA o canal da sonda; a partir daí o exact-match resolve o tráfego da sonda sem tocar o catch-all.
+3. **Staging:** flag on, medir latência baseline, calibrar SLO/SLO_warn e o K do dedup.
+4. **Produção, alerta real:** flag on com cenário de tool + liveness; gauge como sinal primário + `sendAlert` com `alert_pending`/retro.
+5. **Expansão opcional:** cenário semântico com LLM-judge (sub-flag); ponto de extensão para o Nível 1 (cassetes VCR no CI).
 
 ## §5. Riscos
 
-- **Custo de LLM contínuo:** mitigado por cadência baixa, 1 cenário/tick, output bounded, kill-switch e auto-silêncio por falha de custo.
-- **Falso-positivo por lentidão do provedor de LLM:** o outcome `slow` separa "degradado" de "quebrado"; o alerta exige K consecutivos.
-- **Poluição de métricas/dados:** tenant de sonda namespaced e filtrado de analytics; `test:leak` como guard-rail.
-- **Deriva de comportamento do agente de sonda:** perfil pinado numa versão fixa; asserção primária por efeito colateral, robusta a variação de fraseado.
+- **Custo de LLM contínuo:** cadência baixa, 1 cenário/tick, output bounded, kill-switch, auto-silêncio.
+- **Falso-positivo por lentidão do provedor:** outcome `slow` separa "degradado" de "quebrado"; alerta exige K consecutivos.
+- **Acoplamento ao rollout do roteamento:** a sonda depende de `exact_first`/`strict` — é um pré-requisito, não uma limitação (documentado no §4.2).
+- **Poluição de métricas/dados:** tenant namespaced e filtrado; `test:leak` como guard-rail.
+- **Deriva do agente de sonda:** perfil pinado; asserção primária por efeito colateral.
