@@ -39,6 +39,8 @@ import {
 } from './presence.js';
 import type { WAQuotedContext } from './types.js';
 import { getLineSessionManager } from './line-session-manager.js';
+import { randomUUID } from 'node:crypto';
+import { isSyntheticChannel } from '../probe/sink-guard.js';
 
 export interface ChannelScope {
   tenant_id: string;
@@ -133,7 +135,56 @@ export function _clearScopeCacheForTests(): void {
  * atual); com o manager ligado, a sessão vem do LineSessionManager e envio
  * por linha sem sessão viva falha fechado — NUNCA sai por outra linha.
  */
+/**
+ * Sonda sintética (spec §1.3) — SINK de outbound. Fisicamente inerte: NUNCA
+ * chama uma primitiva de envio (baileys/presence/manager), logo é impossível
+ * um reply da sonda sair pela linha real de WhatsApp. Mas o pipeline segue
+ * idêntico até a persistência da `mensagens direcao='out'` — a "prova de
+ * resposta" do §1.3 é essa row, não a entrega física (que é o Nível 3). Por
+ * isso os `send*` devolvem um whatsapp_id SINTÉTICO não-nulo (a row de saída é
+ * gravada normalmente, satisfazendo a asserção de liveness §1.4b) e
+ * `isConnected()` é true (sem retry/backoff espúrio).
+ */
+function buildSyntheticSink(scope: ChannelScope): LineOutput {
+  const wid = (): string => `synthetic-${randomUUID()}`;
+  return {
+    scope,
+    async sendText() {
+      return wid();
+    },
+    async sendDocument() {
+      return wid();
+    },
+    async sendVoice() {
+      return wid();
+    },
+    async sendPoll() {
+      return { whatsapp_id: wid(), message_secret: null, creator_jid: null };
+    },
+    sendReaction() {
+      /* inerte */
+    },
+    startTyping() {
+      return { stop: () => undefined };
+    },
+    markRead() {
+      /* inerte */
+    },
+    isConnected() {
+      return true;
+    },
+  };
+}
+
 function buildOutput(scope: ChannelScope): LineOutput {
+  // §1.3 / review P1-C — o sink intercepta QUALQUER envio a um canal
+  // `is_synthetic` (conjunto carregado no boot), INDEPENDENTE da flag da sonda.
+  // Assim a impossibilidade de envio físico sobrevive ao kill-switch/restart e
+  // a um job antigo na fila. Keying por channel_id (portador do marcador
+  // imutável) não tem blast radius — só o canal sintético exato é neutralizado.
+  if (isSyntheticChannel(scope.channel_id)) {
+    return buildSyntheticSink(scope);
+  }
   const manager = getLineSessionManager();
   const viaManager = manager.isEnabled();
   return {
@@ -177,6 +228,11 @@ function buildOutput(scope: ChannelScope): LineOutput {
       return isBaileysConnected();
     },
   };
+}
+
+/** Test-only: exercita o roteamento de `buildOutput` (inclui o sink de sonda). */
+export function _buildOutputForTests(scope: ChannelScope): LineOutput {
+  return buildOutput(scope);
 }
 
 /** API única de envio — triplete completo, validado fail-closed no DB. */

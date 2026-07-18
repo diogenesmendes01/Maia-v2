@@ -181,6 +181,15 @@ export const AUDIT_ACTIONS = [
   'inbound_staged',
   'inbound_unrouted_handed_off',
   'inbound_unrouted_expired',
+  // Sonda sintética (spec 2026-07-17 §1.2): emitido quando o worker roda com a
+  // flag on mas o modo de roteamento é `shadow` — o exact-match por linha não
+  // resolve o canal da sonda, então o worker FALHA FECHADO (no-op) e NUNCA
+  // ativa o canal (um canal ativo derrubaria o ingresso real).
+  'synthetic_probe_prereq_unmet',
+  // Ativação/desativação do canal de sonda (review P1-B): TODA mudança de
+  // estado de roteamento/governança audita (metadata.active). Escrita sob o
+  // contexto do tenant/agente da sonda.
+  'synthetic_probe_channel_activation',
   // Issue #289 — emitted by scripts/embeddings-rebuild.ts when the embedding
   // provider returns a vector with the wrong dimension (or no vector at all)
   // for a row. We skip the UPDATE so the previous run's re-detection

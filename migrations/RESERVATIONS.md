@@ -197,3 +197,4 @@ NEW shared prefixes — pick `max(existing)+1`.
 091 | 091_line_ownership.sql | unicidade global de linha whatsapp ativa + normalizacao E.164 com + (spec roteamento v4)
 092 | 092_inbound_unrouted.sql | staging cifrado de inbound nao-roteado para modo strict (spec roteamento v4)
 093 | 093_proposal_approvals_scope.sql | escopo tenant/agent/source em proposal_approvals + partial uniques (spec perfil-inbox v4)
+094 | 094_synthetic_probe.sql | sonda sintetica: teste real de interacao do agente automatizado — is_synthetic + synthetic_probe_runs/state + seed do recurso de sonda (spec 2026-07-17)

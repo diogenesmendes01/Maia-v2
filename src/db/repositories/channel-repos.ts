@@ -241,10 +241,22 @@ export const channelsRepo = {
       //    than the single-tenant home (`primary`), across ALL channel_types.
       //    Its mere existence proves a real multi-tenant deployment. Fail-closed:
       //    do NOT hand back the catch-all. `LIMIT 1` — existence only.
+      // Canais SINTÉTICOS (sonda) NÃO contam como "tenant real" (review P1):
+      // um canal is_synthetic é neutralizado no sink e não representa um tenant
+      // de verdade. Excluí-lo aqui torna a ATIVAÇÃO do canal de sonda segura em
+      // QUALQUER modo — um canal de sonda ativo nunca derruba o catch-all real
+      // (findPrimaryCatchAllChannel), fechando o risco de quebrar o ingresso de
+      // remetentes desconhecidos.
       const realTenantProbe = await tx
         .select({ one: sql<number>`1` })
         .from(channels)
-        .where(and(eq(channels.active, true), ne(channels.tenant_id, PRIMARY_TENANT_ID)))
+        .where(
+          and(
+            eq(channels.active, true),
+            ne(channels.tenant_id, PRIMARY_TENANT_ID),
+            eq(channels.is_synthetic, false),
+          ),
+        )
         .limit(1);
       if (realTenantProbe.length > 0) {
         return { multi_tenant: true, channel: null };
@@ -452,6 +464,11 @@ export const channelsRepo = {
         and(
           eq(channels.channel_type, 'whatsapp'),
           eq(channels.active, true),
+          // Canais SINTÉTICOS (sonda) nunca sobem uma sessão real: o inbound é
+          // injetado sinteticamente e o outbound é interceptado pelo sink. A
+          // linha placeholder (+999...) não tem auth pareado e não deve gerar
+          // QR nem warn de "pair first" no boot (correção do review — alta).
+          eq(channels.is_synthetic, false),
           sql`${channels.external_id} ~ '^\\+[1-9][0-9]{6,14}$'`,
         ),
       );

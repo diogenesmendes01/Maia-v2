@@ -1,4 +1,5 @@
 import cron, { type ScheduledTask } from 'node-cron';
+import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 import { runHealthMonitor } from './health-monitor.js';
 import { runPendingExpirer } from './pending-expirer.js';
@@ -36,6 +37,7 @@ import { runWorkflowEngineTick } from './workflow-engine-tick.js';
 import { runPlaygroundTurnWorker } from './playground-turn-worker.js';
 import { runObjectiveExecuteWorker, runObjectivePerceiveWorker } from './objective-execute-worker.js';
 import { runMcpSyncWorker } from './mcp-sync-worker.js';
+import { runSyntheticProbe } from './synthetic-probe.js';
 
 export type Job = {
   name: string;
@@ -84,6 +86,13 @@ export const JOBS: Job[] = [
   // Postgres-as-queue por flags; só o runtime tem rede para os servers).
   { name: 'mcp_sync', cron: '* * * * *', fn: runMcpSyncWorker, phase: 2 },
   { name: 'series_next_scheduler', cron: '*/10 * * * *', fn: runSeriesNextSchedulerWorker, phase: 1 },
+  // Sonda sintética (spec 2026-07-17 §1.1). PHASE 1 de propósito: startWorkers(1)
+  // ignora phase>1, então phase 2 NUNCA seria agendado (correção do review). É
+  // seguro em phase 1 porque o worker é NO-OP com MAIA_SYNTHETIC_PROBE=false
+  // (default) — a flag, não a fase, é o gate. Cadência configurável (default
+  // */10). Sob shadow o worker falha fechado (no-op + audit); só age em
+  // exact_first/strict com o canal de sonda pareado (§1.2).
+  { name: 'synthetic_probe', cron: config.MAIA_PROBE_CRON, fn: runSyntheticProbe, phase: 1 },
   // Issue #345 (Phase 4 of #323), Batch D — the inline body was EXTRACTED into
   // `./workflow-engine-tick.ts` (`runWorkflowEngineTick`) and converted from the
   // hardcoded `default/default` shim into a per-tenant dispatcher. The job SHAPE
