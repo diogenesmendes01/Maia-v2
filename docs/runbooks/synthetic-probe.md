@@ -37,30 +37,37 @@ Roda num **tenant/agente dedicados** (`__probe__`), isolados dos dados reais.
   (inbound injetado + outbound no sink). Ative pelo script dedicado:
 
   ```
-  MAIA_CHANNEL_ROUTING_MODE=exact_first npm run probe:activate
-  # desativar:  npm run probe:activate -- --deactivate
+  npm run probe:activate            # ativa
+  npm run probe:activate -- --deactivate
   ```
 
-  O script recusa ativar se o canal não for exclusivamente sintético ou se o
-  modo for `shadow`. ⚠️ Num deployment que DEPENDE do catch-all (mono-linha,
-  `primary/primary` respondendo desconhecidos), ativar o canal faz
-  `findPrimaryCatchAllChannel` retornar `multi_tenant:true` — desconhecidos
-  passam a falhar fechado. Só ative em ambiente de roteamento por exact-match
-  (spec §1.2/§5). O canal sintético NÃO sobe sessão de linha no boot
-  (`listActiveWhatsappLinesCrossTenant` exclui `is_synthetic`).
+  A ativação é **atômica e auditada**: o UPDATE exige `is_synthetic=true` no
+  predicado (nunca liga um canal real, nem por engano), valida o `RETURNING` e
+  grava `synthetic_probe_channel_activation` sob o contexto do tenant da sonda.
+  **É segura em qualquer modo de roteamento:** `findPrimaryCatchAllChannel`
+  **ignora** canais `is_synthetic` — um canal de sonda ativo NUNCA derruba o
+  catch-all real (não quebra o ingresso de remetentes desconhecidos). O canal
+  sintético também não sobe sessão de linha no boot
+  (`listActiveWhatsappLinesCrossTenant` exclui `is_synthetic`). O worker ainda só
+  **injeta** sob `exact_first`/`strict` (guard próprio no runtime).
 
 ## Boot fail-fast (§1.3)
 
-Com `MAIA_SYNTHETIC_PROBE=true`, o boot valida no DB que o triplete de sonda
-(`tenant+agent+channel`, constantes em `src/probe/constants.ts`) é
-**exclusivamente sintético** (`is_synthetic=true`, tenant ≠ `primary`). Se não
-for, o **boot FALHA** — nunca sobe com o sink armado apontando para um recurso
-real. Só após a prova o sink de outbound é armado.
+No boot, o runtime **sempre** carrega o conjunto dos `channels.id`
+`is_synthetic=true` no gate do sink (antes do worker de agente) — a
+neutralização do outbound de um canal sintético vale **independente da flag** e
+sobrevive ao kill-switch/restart (cobre um job antigo ainda na fila que chegue a
+`buildOutput`). Adicionalmente, com `MAIA_SYNTHETIC_PROBE=true`, o boot valida no
+DB que o triplete de sonda (`tenant+agent+channel`, constantes em
+`src/probe/constants.ts`) é **exclusivamente sintético** (`is_synthetic=true`,
+tenant ≠ `primary`); se não for, o **boot FALHA**.
 
 O **sink** (em `buildOutput`, `src/gateway/line-output.ts`) intercepta o envio
-físico SÓ quando (sink armado) E (o escopo casa o triplete completo da sonda).
-Devolve um `whatsapp_id` sintético — a `mensagens direcao='out'` é gravada
-(prova de liveness), mas **nenhuma** primitiva de envio real é chamada. É
+físico para **qualquer canal `is_synthetic`** (do conjunto carregado no boot),
+independente da flag. Devolve um `whatsapp_id` sintético — a
+`mensagens direcao='out'` é gravada (prova de liveness), mas **nenhuma**
+primitiva de envio real é chamada. Keying por `channel_id` (portador do marcador
+imutável) não tem blast radius: só o canal sintético exato é neutralizado. É
 impossível, por construção, um reply da sonda sair pela linha real.
 
 ## Sinais e alertas
@@ -127,5 +134,10 @@ impossível, por construção, um reply da sonda sair pela linha real.
 ## Rollback
 
 `git revert` do PR. Em runtime: `MAIA_SYNTHETIC_PROBE=false` (kill-switch
-imediato, sem redeploy). A migração `094_synthetic_probe_down.sql` remove o seed
-+ tabelas + coluna (aplicada manualmente via psql, como todo `_down`).
+imediato, sem redeploy). A migração `094_synthetic_probe_down.sql` é
+**estrutural-only** e SEMPRE aplicável (inclusive após a sonda rodar o agente
+real): desativa o canal, dropa as tabelas de estado + a coluna `is_synthetic`, e
+**preserva** o tenant `__probe__` e seus dados (isolados/namespaced — deletá-los
+esbarraria em FKs `NO ACTION` de tabelas de runtime como `cognitive_module_log`).
+Um expurgo completo do tenant `__probe__`, se desejado, é um passo operacional à
+parte.

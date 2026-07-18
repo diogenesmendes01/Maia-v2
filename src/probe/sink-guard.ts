@@ -1,32 +1,38 @@
 /**
- * Sonda sintética (spec §1.3) — GATE de armamento do sink de outbound.
+ * Sonda sintética (spec §1.3 / review P1-C) — GATE do sink de outbound.
  *
- * O sink na fronteira `LineOutput` (buildOutput) só intercepta quando (a) este
- * gate está ARMADO e (b) o escopo casa o triplete de sonda (isProbeScope). O
- * gate é armado UMA vez, no boot (src/index.ts), e SÓ depois da validação
- * fail-fast provar no DB que o canal configurado é exclusivamente sintético
- * (is_synthetic=true, tenant ≠ primary, dedicado). Ou seja: o marcador
- * is_synthetic é verificado no arm-time — um triplet match em runtime já
- * implica canal sintético, sem custo de uma leitura por envio.
+ * A impossibilidade de envio físico para um canal `is_synthetic` precisa valer
+ * INDEPENDENTE da flag `MAIA_SYNTHETIC_PROBE` e sobreviver ao kill-switch/
+ * restart: com a flag off, um job antigo ainda na fila (BullMQ) pode chegar a
+ * `buildOutput` e, sem o gate, cair no transporte Baileys real do canal de
+ * sonda. Por isso o gate NÃO depende da flag.
  *
- * Com a flag off (ou boot sem validar) o gate NUNCA arma, então o sink é
- * inerte e nenhum outbound real é afetado. Um escopo que casa o triplete mas
- * cujo canal NÃO é sintético jamais chega aqui: o boot teria FALHADO antes de
- * armar (fail-fast), e sem arm o sink não intercepta.
+ * O gate carrega, no BOOT (sempre, antes do worker de agente), o conjunto dos
+ * `channels.id` marcados `is_synthetic=true`. `buildOutput` intercepta QUALQUER
+ * envio cujo `channel_id` esteja nesse conjunto. Keying por `channel_id` (o
+ * portador do marcador imutável) é preciso e sem blast radius — só o canal
+ * sintético exato é neutralizado, nunca um canal real. O conjunto é imutável em
+ * runtime (is_synthetic só é setado no seed da migração) e recarregado a cada
+ * boot.
  */
 
-let armed = false;
+let syntheticChannelIds: ReadonlySet<string> = new Set();
 
-/** Arma o sink. Chamado só pelo boot APÓS a validação fail-fast (§1.3). */
-export function armProbeSink(): void {
-  armed = true;
+/** Carrega o conjunto de canais sintéticos (chamado no boot, sempre). */
+export function loadSyntheticChannelIds(ids: Iterable<string>): void {
+  syntheticChannelIds = new Set(ids);
 }
 
-export function isProbeSinkArmed(): boolean {
-  return armed;
+/** O canal é sintético? (lookup O(1), sem flag, sem DB por envio). */
+export function isSyntheticChannel(channel_id: string): boolean {
+  return syntheticChannelIds.has(channel_id);
 }
 
-/** Test-only: controla o estado de armamento entre casos. */
-export function _setProbeSinkArmedForTests(value: boolean): void {
-  armed = value;
+export function syntheticChannelCount(): number {
+  return syntheticChannelIds.size;
+}
+
+/** Test-only: define o conjunto entre casos. */
+export function _setSyntheticChannelIdsForTests(ids: Iterable<string>): void {
+  syntheticChannelIds = new Set(ids);
 }

@@ -33,8 +33,8 @@ vi.mock('@/gateway/line-session-manager.js', () => ({
 }));
 
 import { buildSyntheticMessage, classifyOutcome, runProbeTick, type ProbeTickDeps } from '@/probe/probe.js';
-import { PROBE_SCOPE, PROBE_CLIENT_TEL, isProbeScope } from '@/probe/constants.js';
-import { _setProbeSinkArmedForTests } from '@/probe/sink-guard.js';
+import { PROBE_SCOPE, PROBE_CHANNEL_ID, PROBE_CLIENT_TEL } from '@/probe/constants.js';
+import { _setSyntheticChannelIdsForTests, isSyntheticChannel } from '@/probe/sink-guard.js';
 import { _buildOutputForTests } from '@/gateway/line-output.js';
 
 describe('buildSyntheticMessage', () => {
@@ -66,20 +66,15 @@ describe('classifyOutcome', () => {
   });
 });
 
-describe('outbound sink (buildOutput)', () => {
+describe('outbound sink (buildOutput) — flag-independente (P1-C)', () => {
   beforeEach(() => {
     h.sendOutboundText.mockClear();
-    _setProbeSinkArmedForTests(false);
+    _setSyntheticChannelIdsForTests([]);
   });
 
-  it('isProbeScope casa só o triplete completo', () => {
-    expect(isProbeScope(PROBE_SCOPE)).toBe(true);
-    expect(isProbeScope({ ...PROBE_SCOPE, channel_id: 'outro' })).toBe(false);
-    expect(isProbeScope({ ...PROBE_SCOPE, tenant_id: 'primary' })).toBe(false);
-  });
-
-  it('ARMADO + triplete de sonda ⇒ sink: wid sintético, NENHUMA primitiva chamada', async () => {
-    _setProbeSinkArmedForTests(true);
+  it('canal is_synthetic (no conjunto) ⇒ sink: wid sintético, NENHUMA primitiva', async () => {
+    _setSyntheticChannelIdsForTests([PROBE_CHANNEL_ID]);
+    expect(isSyntheticChannel(PROBE_CHANNEL_ID)).toBe(true);
     const out = _buildOutputForTests({ ...PROBE_SCOPE });
     const wid = await out.sendText('jid', 'oi');
     expect(wid).toMatch(/^synthetic-/);
@@ -87,16 +82,16 @@ describe('outbound sink (buildOutput)', () => {
     expect(h.sendOutboundText).not.toHaveBeenCalled();
   });
 
-  it('ARMADO + escopo NÃO-sonda ⇒ caminho normal (primitiva chamada)', async () => {
-    _setProbeSinkArmedForTests(true);
+  it('canal NÃO-sintético ⇒ caminho normal (primitiva chamada)', async () => {
+    _setSyntheticChannelIdsForTests([PROBE_CHANNEL_ID]);
     const out = _buildOutputForTests({ tenant_id: 'primary', agent_id: 'primary', channel_id: 'c-real' });
     const wid = await out.sendText('jid', 'oi');
     expect(wid).toBe('real-text-wid');
     expect(h.sendOutboundText).toHaveBeenCalledOnce();
   });
 
-  it('DESARMADO + triplete de sonda ⇒ caminho normal (sink inerte)', async () => {
-    _setProbeSinkArmedForTests(false);
+  it('conjunto vazio (sink não carregado) ⇒ mesmo o canal de sonda vai ao caminho normal', async () => {
+    _setSyntheticChannelIdsForTests([]);
     const out = _buildOutputForTests({ ...PROBE_SCOPE });
     const wid = await out.sendText('jid', 'oi');
     expect(wid).toBe('real-text-wid');

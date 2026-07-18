@@ -40,8 +40,7 @@ import {
 import type { WAQuotedContext } from './types.js';
 import { getLineSessionManager } from './line-session-manager.js';
 import { randomUUID } from 'node:crypto';
-import { isProbeSinkArmed } from '../probe/sink-guard.js';
-import { isProbeScope } from '../probe/constants.js';
+import { isSyntheticChannel } from '../probe/sink-guard.js';
 
 export interface ChannelScope {
   tenant_id: string;
@@ -178,12 +177,12 @@ function buildSyntheticSink(scope: ChannelScope): LineOutput {
 }
 
 function buildOutput(scope: ChannelScope): LineOutput {
-  // §1.3 — o sink só arma quando o gate foi armado no boot (após a validação
-  // fail-fast provar que o canal é exclusivamente sintético) E o escopo casa o
-  // TRIPLETE COMPLETO de sonda. Nunca por tenant_id sozinho: o blast radius
-  // fica no canal exato. Um triplete de sonda cujo canal não fosse sintético
-  // nunca teria armado o gate (o boot falharia antes).
-  if (isProbeSinkArmed() && isProbeScope(scope)) {
+  // §1.3 / review P1-C — o sink intercepta QUALQUER envio a um canal
+  // `is_synthetic` (conjunto carregado no boot), INDEPENDENTE da flag da sonda.
+  // Assim a impossibilidade de envio físico sobrevive ao kill-switch/restart e
+  // a um job antigo na fila. Keying por channel_id (portador do marcador
+  // imutável) não tem blast radius — só o canal sintético exato é neutralizado.
+  if (isSyntheticChannel(scope.channel_id)) {
     return buildSyntheticSink(scope);
   }
   const manager = getLineSessionManager();

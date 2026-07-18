@@ -98,6 +98,46 @@ export const syntheticProbeRepo = {
     return { ok: true };
   },
 
+  /**
+   * Todos os `channels.id` marcados `is_synthetic=true` — carregado no boot
+   * (sempre, review P1-C) para o gate do sink neutralizar o outbound desses
+   * canais INDEPENDENTE da flag. Cross-tenant (sem ALS): roda no boot.
+   */
+  async listSyntheticChannelIds(): Promise<string[]> {
+    const rows = await db
+      .select({ id: channels.id })
+      .from(channels)
+      .where(eq(channels.is_synthetic, true));
+    return rows.map((r) => r.id);
+  },
+
+  /**
+   * Ativa/desativa o canal de sonda ATOMICAMENTE (review P1-B): o predicado do
+   * UPDATE EXIGE `is_synthetic=true` + tenant ≠ primary (proteção não é uma
+   * pré-checagem separada) e o RETURNING valida que a row foi de fato mexida.
+   * Devolve o novo estado ou `null` se nada casou (não-sintético / inexistente).
+   */
+  async setChannelActive(
+    scope: { tenant_id: string; agent_id: string; channel_id: string },
+    active: boolean,
+  ): Promise<{ active: boolean } | null> {
+    const rows = await db
+      .update(channels)
+      .set({ active, updated_at: new Date() })
+      .where(
+        and(
+          eq(channels.id, scope.channel_id),
+          eq(channels.tenant_id, scope.tenant_id),
+          eq(channels.agent_id, scope.agent_id),
+          // is_synthetic no PREDICADO (atômico) — nunca ativa um canal real,
+          // mesmo que o scope aponte por engano para um tenant/canal comum.
+          eq(channels.is_synthetic, true),
+        ),
+      )
+      .returning({ active: channels.active });
+    return rows[0] ?? null;
+  },
+
   // ── runs ─────────────────────────────────────────────────────────────────
 
   async createRun(input: {
@@ -321,9 +361,20 @@ export const syntheticProbeRepo = {
     agent_id: string;
     alert_after_k: number;
   }): Promise<{ consecutive_failures: number; transitioned_to_degraded: boolean }> {
+    // Correção P2 (K=1): a PRIMEIRA falha (INSERT) precisa derivar health/
+    // alert_pending de K — com K=1, a 1ª falha JÁ é a transição saudável→
+    // degradado. Antes o INSERT fixava 'healthy' e K=1 nunca alertava. A
+    // transição é sinalizada quando `consecutive_failures = K` e health é
+    // 'degraded' (vale tanto no INSERT com K=1 quanto no UPDATE ao cruzar K).
     const res = await db.execute<{ consecutive_failures: number; transitioned: boolean }>(sql`
-      INSERT INTO synthetic_probe_state (tenant_id, agent_id, first_attempt_at, consecutive_failures, health, updated_at)
-      VALUES (${input.tenant_id}, ${input.agent_id}, now(), 1, 'healthy', now())
+      INSERT INTO synthetic_probe_state (tenant_id, agent_id, first_attempt_at, consecutive_failures, health, alert_pending, alert_pending_since, updated_at)
+      VALUES (
+        ${input.tenant_id}, ${input.agent_id}, now(), 1,
+        CASE WHEN 1 >= ${input.alert_after_k} THEN 'degraded' ELSE 'healthy' END,
+        CASE WHEN 1 >= ${input.alert_after_k} THEN true ELSE false END,
+        CASE WHEN 1 >= ${input.alert_after_k} THEN now() ELSE NULL END,
+        now()
+      )
       ON CONFLICT (tenant_id, agent_id) DO UPDATE
         SET first_attempt_at = COALESCE(synthetic_probe_state.first_attempt_at, now()),
             consecutive_failures = synthetic_probe_state.consecutive_failures + 1,

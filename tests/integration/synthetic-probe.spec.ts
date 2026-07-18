@@ -84,6 +84,8 @@ async function cleanProbeRuntime(): Promise<void> {
   // pelo teste de vazamento (cross-tenant).
   await q(`DELETE FROM mensagens WHERE tenant_id=$1 OR metadata->>'whatsapp_id' LIKE 'probe-%'`, [PROBE_TENANT_ID]);
   await q(`DELETE FROM conversas WHERE tenant_id=$1`, [PROBE_TENANT_ID]);
+  // restaura o canal ao estado semeado (inativo) — testes de ativação podem tê-lo ligado.
+  await q(`UPDATE channels SET active=false WHERE tenant_id=$1`, [PROBE_TENANT_ID]);
 }
 
 if (SHOULD_RUN) {
@@ -134,6 +136,15 @@ d('synthetic probe — state machine (durável)', () => {
     const secs = await syntheticProbeRepo.secondsSinceLastOk(PROBE_TENANT_ID, PROBE_AGENT_ID);
     expect(secs).toBeGreaterThanOrEqual(0);
     expect(secs).toBeLessThan(5);
+  });
+
+  it('K=1: a PRIMEIRA falha já transiciona para degradado + alerta (P2-E)', async () => {
+    const r = await syntheticProbeRepo.recordFailure({ tenant_id: PROBE_TENANT_ID, agent_id: PROBE_AGENT_ID, alert_after_k: 1 });
+    expect(r.consecutive_failures).toBe(1);
+    expect(r.transitioned_to_degraded).toBe(true);
+    const state = await syntheticProbeRepo.getState(PROBE_TENANT_ID, PROBE_AGENT_ID);
+    expect(state?.health).toBe('degraded');
+    expect(state?.alert_pending).toBe(true);
   });
 
   it('NEVER GREEN: gauge cresce a partir do first_attempt_at (last_ok_at nulo)', async () => {
@@ -231,20 +242,47 @@ d('synthetic probe — sweep de TTL', () => {
   });
 });
 
-d('synthetic probe — regressão §1.7.7 (ingresso real intacto)', () => {
-  it('o canal de sonda semeado é inativo + is_synthetic (fora do discriminador do catch-all)', async () => {
+d('synthetic probe — regressão §1.7.7 / P1-A (ingresso real intacto)', () => {
+  it('o canal de sonda semeado é inativo + is_synthetic', async () => {
     const row = await q<{ active: boolean; is_synthetic: boolean }>(
       `SELECT active, is_synthetic FROM channels WHERE id=$1`,
       [PROBE_CHANNEL_ID],
     );
     expect(row.rows[0]!.active).toBe(false);
     expect(row.rows[0]!.is_synthetic).toBe(true);
-    // o discriminador de findPrimaryCatchAllChannel conta canais ATIVOS de
-    // tenant ≠ primary; o canal de sonda (inativo) NUNCA entra nessa contagem.
+  });
+
+  it('P1-A: mesmo ATIVO, o canal de sonda é EXCLUÍDO do discriminador do catch-all', async () => {
+    // Ativa o canal de sonda e confirma que o discriminador de
+    // findPrimaryCatchAllChannel (active AND tenant≠primary AND NOT is_synthetic)
+    // NÃO o conta — logo ele nunca derruba o catch-all real.
+    await q(`UPDATE channels SET active=true WHERE id=$1`, [PROBE_CHANNEL_ID]);
     const disc = await q<{ n: string }>(
-      `SELECT count(*) n FROM channels WHERE active=true AND tenant_id <> 'primary' AND id=$1`,
+      `SELECT count(*) n FROM channels
+        WHERE active=true AND tenant_id <> 'primary' AND is_synthetic = false AND id=$1`,
       [PROBE_CHANNEL_ID],
     );
     expect(Number(disc.rows[0]!.n)).toBe(0);
+  });
+});
+
+d('synthetic probe — ativação atômica + auditada (P1-B)', () => {
+  it('setChannelActive liga/desliga com predicado is_synthetic e valida RETURNING', async () => {
+    const on = await syntheticProbeRepo.setChannelActive(
+      { tenant_id: PROBE_TENANT_ID, agent_id: PROBE_AGENT_ID, channel_id: PROBE_CHANNEL_ID },
+      true,
+    );
+    expect(on?.active).toBe(true);
+    const dbRow = await q<{ active: boolean }>(`SELECT active FROM channels WHERE id=$1`, [PROBE_CHANNEL_ID]);
+    expect(dbRow.rows[0]!.active).toBe(true);
+  });
+
+  it('setChannelActive RECUSA (null) um canal que não é is_synthetic', async () => {
+    // um channel_id inexistente/não-sintético não casa o predicado atômico.
+    const res = await syntheticProbeRepo.setChannelActive(
+      { tenant_id: PROBE_TENANT_ID, agent_id: PROBE_AGENT_ID, channel_id: '00000000-0000-0000-0000-0000000000aa' },
+      true,
+    );
+    expect(res).toBeNull();
   });
 });
