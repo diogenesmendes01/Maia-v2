@@ -16,17 +16,26 @@ import type { SyntheticProbeState } from '../schema.js';
 
 export type ProbeOutcome = 'ok' | 'slow' | 'wrong' | 'silent' | 'error';
 
+/** Escopo (tenant, agent) da sonda — aplicado em TODO WHERE (isolamento). */
+export type ProbeScope = { tenant_id: string; agent_id: string };
+
 /** Resultado da validação fail-fast de boot (§1.3). */
 export type ChannelSyntheticCheck =
   | { ok: true }
-  | { ok: false; reason: 'not_found' | 'not_synthetic' | 'primary_tenant' | 'inactive_ok' };
+  | { ok: false; reason: 'not_found' | 'not_synthetic' | 'primary_tenant' };
+
+/** Resultado do guard de prontidão por tick (§1.2, review): exige ATIVO. */
+export type ChannelReadyCheck =
+  | { ok: true }
+  | { ok: false; reason: 'not_found' | 'not_synthetic' | 'primary_tenant' | 'inactive' };
 
 export const syntheticProbeRepo = {
   /**
    * Boot fail-fast (§1.3): o canal do triplete configurado existe e é
    * EXCLUSIVAMENTE sintético (is_synthetic=true, tenant ≠ primary)? O canal
-   * pode (e deve) estar INATIVO — a sonda o ativa só no pareamento sob
-   * exact_first/strict (§1.2); inatividade NÃO é motivo de falha de boot.
+   * pode (e deve) estar INATIVO no boot — a ativação é um passo operacional
+   * posterior (§1.2); inatividade NÃO é motivo de falha de boot (o guard de
+   * prontidão por tick, `channelReady`, é que exige ativo).
    */
   async checkChannelSynthetic(scope: {
     tenant_id: string;
@@ -48,6 +57,44 @@ export const syntheticProbeRepo = {
     if (!row) return { ok: false, reason: 'not_found' };
     if (!row.is_synthetic) return { ok: false, reason: 'not_synthetic' };
     if (row.tenant_id === PRIMARY_TENANT_ID) return { ok: false, reason: 'primary_tenant' };
+    return { ok: true };
+  },
+
+  /**
+   * Guard de prontidão POR TICK (§1.2, correção do review — alta): o canal
+   * precisa estar ATIVO + is_synthetic + tenant ≠ primary para o exact-match
+   * resolver a injeção para o canal de sonda. Se estiver INATIVO, o
+   * `resolveChannel` cai no `resolveLegacy` (catch-all `primary/primary` no
+   * runtime mono-tenant) e a sonda injetaria num tenant REAL — com o sink SEM
+   * casar (escopo ≠ triplete de sonda). O boot fail-fast (que aceita inativo)
+   * não cobre desativação POSTERIOR; por isso a checagem é a cada tick, e o
+   * worker FALHA FECHADO (não injeta) quando não está pronto.
+   */
+  async channelReady(scope: {
+    tenant_id: string;
+    agent_id: string;
+    channel_id: string;
+  }): Promise<ChannelReadyCheck> {
+    const rows = await db
+      .select({
+        is_synthetic: channels.is_synthetic,
+        tenant_id: channels.tenant_id,
+        active: channels.active,
+      })
+      .from(channels)
+      .where(
+        and(
+          eq(channels.id, scope.channel_id),
+          eq(channels.tenant_id, scope.tenant_id),
+          eq(channels.agent_id, scope.agent_id),
+        ),
+      )
+      .limit(1);
+    const row = rows[0];
+    if (!row) return { ok: false, reason: 'not_found' };
+    if (!row.is_synthetic) return { ok: false, reason: 'not_synthetic' };
+    if (row.tenant_id === PRIMARY_TENANT_ID) return { ok: false, reason: 'primary_tenant' };
+    if (!row.active) return { ok: false, reason: 'inactive' };
     return { ok: true };
   },
 
@@ -73,11 +120,21 @@ export const syntheticProbeRepo = {
     return row!.id;
   },
 
-  async setRunMensagemId(runId: string, mensagem_id: string): Promise<void> {
+  // Escopo COMPLETO (tenant+agent) em TODO WHERE das rows de run (correção do
+  // review — alta): o UUID do run é único, mas escopar é defense-in-depth
+  // contra qualquer row indevido de outra dupla mutar cross-context.
+
+  async setRunMensagemId(scope: ProbeScope, runId: string, mensagem_id: string): Promise<void> {
     await db
       .update(synthetic_probe_runs)
       .set({ mensagem_id })
-      .where(eq(synthetic_probe_runs.id, runId));
+      .where(
+        and(
+          eq(synthetic_probe_runs.id, runId),
+          eq(synthetic_probe_runs.tenant_id, scope.tenant_id),
+          eq(synthetic_probe_runs.agent_id, scope.agent_id),
+        ),
+      );
   },
 
   /**
@@ -85,6 +142,7 @@ export const syntheticProbeRepo = {
    * cleanup pode recolher o tráfego do run (§1.5).
    */
   async completeRun(
+    scope: ProbeScope,
     runId: string,
     input: { outcome: ProbeOutcome; latency_ms: number | null; detail?: unknown; terminal: boolean },
   ): Promise<void> {
@@ -96,52 +154,78 @@ export const syntheticProbeRepo = {
         detail: (input.detail as object) ?? {},
         ...(input.terminal ? { terminal_at: sql`now()` } : {}),
       })
-      .where(eq(synthetic_probe_runs.id, runId));
+      .where(
+        and(
+          eq(synthetic_probe_runs.id, runId),
+          eq(synthetic_probe_runs.tenant_id, scope.tenant_id),
+          eq(synthetic_probe_runs.agent_id, scope.agent_id),
+        ),
+      );
   },
 
   /**
    * Runs em voo (terminal_at NULL) mais velhos que o cutoff — órfãos do sweep
-   * de TTL (§1.5): um job que estourou o SLO mas nunca fechou.
+   * de TTL (§1.5). Escopado por (tenant, agent).
    */
   async listOpenRunsOlderThan(
+    scope: ProbeScope,
     cutoff: Date,
     limit: number,
-  ): Promise<
-    Array<{ id: string; tenant_id: string; mensagem_id: string | null; whatsapp_id: string }>
-  > {
+  ): Promise<Array<{ id: string; mensagem_id: string | null; whatsapp_id: string }>> {
     return db
       .select({
         id: synthetic_probe_runs.id,
-        tenant_id: synthetic_probe_runs.tenant_id,
         mensagem_id: synthetic_probe_runs.mensagem_id,
         whatsapp_id: synthetic_probe_runs.whatsapp_id,
       })
       .from(synthetic_probe_runs)
       .where(
-        and(sql`${synthetic_probe_runs.terminal_at} IS NULL`, lt(synthetic_probe_runs.started_at, cutoff)),
+        and(
+          eq(synthetic_probe_runs.tenant_id, scope.tenant_id),
+          eq(synthetic_probe_runs.agent_id, scope.agent_id),
+          sql`${synthetic_probe_runs.terminal_at} IS NULL`,
+          lt(synthetic_probe_runs.started_at, cutoff),
+        ),
       )
       .limit(limit);
   },
 
-  /** Fecha um órfão do sweep como `error` terminal (idempotente). */
-  async closeOrphanRun(runId: string): Promise<void> {
+  /** Fecha um órfão do sweep como `error` terminal (idempotente). Escopado. */
+  async closeOrphanRun(scope: ProbeScope, runId: string): Promise<void> {
     await db
       .update(synthetic_probe_runs)
       .set({ outcome: sql`COALESCE(${synthetic_probe_runs.outcome}, 'error')`, terminal_at: sql`now()` })
-      .where(and(eq(synthetic_probe_runs.id, runId), sql`${synthetic_probe_runs.terminal_at} IS NULL`));
+      .where(
+        and(
+          eq(synthetic_probe_runs.id, runId),
+          eq(synthetic_probe_runs.tenant_id, scope.tenant_id),
+          eq(synthetic_probe_runs.agent_id, scope.agent_id),
+          sql`${synthetic_probe_runs.terminal_at} IS NULL`,
+        ),
+      );
   },
 
   /**
    * Cleanup do tráfego do run (§1.5): remove a `transacoes` criada pelo cenário
    * (a side-effect que polui dados de finança), correlacionada por
-   * `mensagem_id` e escopada ao tenant da sonda. Idempotente. NÃO toca
+   * `mensagem_id` e escopada pelo TRIPLETE (tenant+agent). Idempotente. NÃO toca
    * `mensagens`/`conversas` — elas são fixadas pela FK NO ACTION de `audit_log`
    * (preservar audit ⇒ preservar a trilha; §1.7.6). Retorna quantas removeu.
    */
-  async cleanupRunTraffic(input: { tenant_id: string; mensagem_id: string }): Promise<number> {
+  async cleanupRunTraffic(input: {
+    tenant_id: string;
+    agent_id: string;
+    mensagem_id: string;
+  }): Promise<number> {
     const deleted = await db
       .delete(transacoes)
-      .where(and(eq(transacoes.tenant_id, input.tenant_id), eq(transacoes.mensagem_id, input.mensagem_id)))
+      .where(
+        and(
+          eq(transacoes.tenant_id, input.tenant_id),
+          eq(transacoes.agent_id, input.agent_id),
+          eq(transacoes.mensagem_id, input.mensagem_id),
+        ),
+      )
       .returning({ id: transacoes.id });
     return deleted.length;
   },
@@ -213,10 +297,12 @@ export const syntheticProbeRepo = {
         SELECT health FROM synthetic_probe_state
         WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
       ), upsert AS (
-        INSERT INTO synthetic_probe_state (tenant_id, agent_id, last_ok_at, consecutive_failures, health, updated_at)
-        VALUES (${tenant_id}, ${agent_id}, now(), 0, 'healthy', now())
+        INSERT INTO synthetic_probe_state (tenant_id, agent_id, last_ok_at, first_attempt_at, consecutive_failures, health, updated_at)
+        VALUES (${tenant_id}, ${agent_id}, now(), now(), 0, 'healthy', now())
         ON CONFLICT (tenant_id, agent_id) DO UPDATE
-          SET last_ok_at = now(), consecutive_failures = 0, health = 'healthy',
+          SET last_ok_at = now(),
+              first_attempt_at = COALESCE(synthetic_probe_state.first_attempt_at, now()),
+              consecutive_failures = 0, health = 'healthy',
               alert_pending = false, alert_pending_since = null, updated_at = now()
         RETURNING 1
       )
@@ -236,10 +322,11 @@ export const syntheticProbeRepo = {
     alert_after_k: number;
   }): Promise<{ consecutive_failures: number; transitioned_to_degraded: boolean }> {
     const res = await db.execute<{ consecutive_failures: number; transitioned: boolean }>(sql`
-      INSERT INTO synthetic_probe_state (tenant_id, agent_id, consecutive_failures, health, updated_at)
-      VALUES (${input.tenant_id}, ${input.agent_id}, 1, 'healthy', now())
+      INSERT INTO synthetic_probe_state (tenant_id, agent_id, first_attempt_at, consecutive_failures, health, updated_at)
+      VALUES (${input.tenant_id}, ${input.agent_id}, now(), 1, 'healthy', now())
       ON CONFLICT (tenant_id, agent_id) DO UPDATE
-        SET consecutive_failures = synthetic_probe_state.consecutive_failures + 1,
+        SET first_attempt_at = COALESCE(synthetic_probe_state.first_attempt_at, now()),
+            consecutive_failures = synthetic_probe_state.consecutive_failures + 1,
             health = CASE
               WHEN synthetic_probe_state.consecutive_failures + 1 >= ${input.alert_after_k} THEN 'degraded'
               ELSE synthetic_probe_state.health END,
@@ -286,18 +373,26 @@ export const syntheticProbeRepo = {
 
   /**
    * Gauge PRIMÁRIO de outage (§1.6): segundos desde o último OK do recurso de
-   * sonda. Sem ALS (scrape de /metrics). Retorna 0 quando ainda não houve OK
-   * (o caminho health→degraded→alerta cobre o "nunca ficou verde"); um valor
-   * que CRESCE É o outage e sobrevive a restart.
+   * sonda. Sem ALS (scrape de /metrics). Um valor que CRESCE É o outage e
+   * sobrevive a restart.
+   *
+   * Correção do review (alta — "never green"): se a sonda NUNCA passou
+   * (`last_ok_at` nulo) mas já tentou (`first_attempt_at` set), o gauge cresce
+   * a partir da PRIMEIRA tentativa — senão ficaria em 0 para sempre e uma regra
+   * `>15m` jamais dispararia num ambiente quebrado desde o 1º tick. Só retorna
+   * 0 quando nunca houve tentativa (sonda off / ainda não rodou).
    */
   async secondsSinceLastOk(tenant_id: string, agent_id: string): Promise<number> {
     const rows = await db
-      .select({ last_ok_at: synthetic_probe_state.last_ok_at })
+      .select({
+        last_ok_at: synthetic_probe_state.last_ok_at,
+        first_attempt_at: synthetic_probe_state.first_attempt_at,
+      })
       .from(synthetic_probe_state)
       .where(and(eq(synthetic_probe_state.tenant_id, tenant_id), eq(synthetic_probe_state.agent_id, agent_id)))
       .limit(1);
-    const lastOk = rows[0]?.last_ok_at;
-    if (!lastOk) return 0;
-    return Math.max(0, Math.floor((Date.now() - lastOk.getTime()) / 1000));
+    const anchor = rows[0]?.last_ok_at ?? rows[0]?.first_attempt_at;
+    if (!anchor) return 0;
+    return Math.max(0, Math.floor((Date.now() - anchor.getTime()) / 1000));
   },
 };

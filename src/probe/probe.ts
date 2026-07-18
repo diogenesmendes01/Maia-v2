@@ -38,10 +38,16 @@ export function buildSyntheticMessage(
 }
 
 /**
- * Classificação de desfecho (§1.1 passo 5). Efeito colateral é a asserção
- * PRIMÁRIA: satisfeito ⇒ ok (ou slow se passou do SLO_warn). Sem efeito: com
- * liveness ⇒ wrong (respondeu, mas não fez); sem liveness ⇒ silent (não
- * respondeu no SLO). `error` é tratado à parte (exceção no run).
+ * Classificação de desfecho (§1.1 passo 5). O contrato é efeito **+ liveness**
+ * (correção do review — alta): sucesso EXIGE os dois. Efeito satisfeito SEM
+ * resposta (`mensagens direcao='out'`) NÃO é sucesso — a Maia "fez" mas não
+ * respondeu, o que é uma falha (`wrong`); classificar como ok zeraria o outage
+ * apesar do silêncio ao usuário.
+ *   - efeito + liveness ⇒ ok (ou slow se passou do SLO_warn);
+ *   - liveness sem efeito ⇒ wrong (respondeu, mas não fez / fez errado);
+ *   - efeito sem liveness ⇒ wrong (fez, mas não respondeu);
+ *   - nem efeito nem liveness ⇒ silent (não respondeu no SLO).
+ * `error` é tratado à parte (exceção no run).
  */
 export function classifyOutcome(input: {
   effectSatisfied: boolean;
@@ -49,13 +55,16 @@ export function classifyOutcome(input: {
   elapsedMs: number;
   slowMs: number;
 }): Exclude<ProbeOutcome, 'error'> {
-  if (input.effectSatisfied) return input.elapsedMs > input.slowMs ? 'slow' : 'ok';
-  if (input.liveness) return 'wrong';
+  if (input.effectSatisfied && input.liveness) {
+    return input.elapsedMs > input.slowMs ? 'slow' : 'ok';
+  }
+  if (input.liveness || input.effectSatisfied) return 'wrong';
   return 'silent';
 }
 
 type ProbeRepo = Pick<
   typeof syntheticProbeRepo,
+  | 'channelReady'
   | 'createRun'
   | 'setRunMensagemId'
   | 'completeRun'
@@ -64,6 +73,9 @@ type ProbeRepo = Pick<
   | 'recordFailure'
   | 'recordAlertAttempt'
 >;
+
+/** Escopo (tenant, agent) da sonda — aplicado em todo WHERE de run. */
+const SCOPE = { tenant_id: PROBE_TENANT_ID, agent_id: PROBE_AGENT_ID };
 
 export type ProbeTickDeps = {
   now: () => number;
@@ -119,10 +131,11 @@ async function applyOutcome(
   if (success && mensagem_id) {
     detail.cleaned_transacoes = await deps.repo.cleanupRunTraffic({
       tenant_id: PROBE_TENANT_ID,
+      agent_id: PROBE_AGENT_ID,
       mensagem_id,
     });
   }
-  await deps.repo.completeRun(runId, { outcome, latency_ms, detail, terminal: success });
+  await deps.repo.completeRun(SCOPE, runId, { outcome, latency_ms, detail, terminal: success });
 
   if (success) {
     const rec = await deps.repo.recordOk(PROBE_TENANT_ID, PROBE_AGENT_ID);
@@ -162,8 +175,24 @@ export async function runProbeTick(deps: ProbeTickDeps): Promise<ProbeTickResult
   // por linha não resolve o canal da sonda — fail-closed (no-op + audit), NUNCA
   // ativa o canal (um canal ativo derrubaria o ingresso real).
   if (deps.routingMode !== 'exact_first' && deps.routingMode !== 'strict') {
-    await deps.audit({ acao: 'synthetic_probe_prereq_unmet', metadata: { routing_mode: deps.routingMode } });
+    await deps.audit({ acao: 'synthetic_probe_prereq_unmet', metadata: { reason: 'routing_mode', routing_mode: deps.routingMode } });
     deps.logger.warn({ routing_mode: deps.routingMode }, 'synthetic_probe.prereq_unmet');
+    return { status: 'prereq_unmet', consecutiveFailures: 0 };
+  }
+
+  // Guard de prontidão POR TICK (§1.2, correção do review — alta): o canal
+  // precisa estar ATIVO + is_synthetic. Se estiver INATIVO, o exact-match falha
+  // e a injeção resolveria para o catch-all `primary/primary` (tenant REAL),
+  // com o sink SEM casar. Fail-closed: NÃO injeta, audita e no-opa. Cobre a
+  // desativação POSTERIOR ao boot (o boot fail-fast não cobre).
+  const ready = await deps.repo.channelReady({
+    tenant_id: PROBE_TENANT_ID,
+    agent_id: PROBE_AGENT_ID,
+    channel_id: PROBE_CHANNEL_ID,
+  });
+  if (!ready.ok) {
+    await deps.audit({ acao: 'synthetic_probe_prereq_unmet', metadata: { reason: 'channel_not_ready', detail: ready.reason } });
+    deps.logger.warn({ reason: ready.reason }, 'synthetic_probe.channel_not_ready');
     return { status: 'prereq_unmet', consecutiveFailures: 0 };
   }
 
@@ -202,7 +231,7 @@ export async function runProbeTick(deps: ProbeTickDeps): Promise<ProbeTickResult
       await deps.sleep(deps.pollIntervalMs);
     }
     const elapsed = deps.now() - startMs;
-    if (mensagemId) await deps.repo.setRunMensagemId(runId, mensagemId);
+    if (mensagemId) await deps.repo.setRunMensagemId(SCOPE, runId, mensagemId);
 
     // LLM-judge (secundário, opt-in §1.4c) — só quando houve resposta.
     let judgeVerdict: JudgeVerdict | null = null;

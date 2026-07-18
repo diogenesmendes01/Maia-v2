@@ -24,12 +24,30 @@ Roda num **tenant/agente dedicados** (`__probe__`), isolados dos dados reais.
   `synthetic_probe_prereq_unmet`) e NUNCA ativa o canal da sonda — um canal
   ativo de tenant ≠ `primary` derrubaria `findPrimaryCatchAllChannel` para
   `multi_tenant:true` e quebraria o ingresso REAL.
-- **Pareamento do canal:** a migração 094 semeia o canal da sonda **INATIVO**
-  (`is_synthetic=true`). Ele só é ativado no pareamento (a linha `+999000999001`
-  precisa ser pareada como qualquer outra), sob exact_first/strict, quando o
-  exact-match já resolve o tráfego da sonda sem tocar o catch-all. Enquanto
-  inativo, `forChannel` recusa enviar por ele — então a sonda só produz o
-  desfecho `ok`/`slow` depois de pareado.
+- **Guard de prontidão POR TICK:** a cada tick o worker exige que o canal esteja
+  **ativo + `is_synthetic`**. Se estiver inativo (antes da ativação ou após uma
+  desativação), o `resolveChannel` cairia no catch-all `primary/primary` (tenant
+  real) — então o worker **não injeta**, audita `synthetic_probe_prereq_unmet`
+  (`reason=channel_not_ready`) e no-opa. O boot fail-fast (que aceita inativo)
+  não cobre desativação posterior; o guard por tick cobre.
+- **Ativação do canal (NÃO é pareamento Baileys):** a migração 094 semeia o
+  canal **INATIVO** (`is_synthetic=true`) com uma linha placeholder
+  (`+999000999001`). Essa linha **não pode ser pareada** — nenhuma conta
+  WhatsApp real prova posse de `+999...`. A sonda **não precisa** de sessão real
+  (inbound injetado + outbound no sink). Ative pelo script dedicado:
+
+  ```
+  MAIA_CHANNEL_ROUTING_MODE=exact_first npm run probe:activate
+  # desativar:  npm run probe:activate -- --deactivate
+  ```
+
+  O script recusa ativar se o canal não for exclusivamente sintético ou se o
+  modo for `shadow`. ⚠️ Num deployment que DEPENDE do catch-all (mono-linha,
+  `primary/primary` respondendo desconhecidos), ativar o canal faz
+  `findPrimaryCatchAllChannel` retornar `multi_tenant:true` — desconhecidos
+  passam a falhar fechado. Só ative em ambiente de roteamento por exact-match
+  (spec §1.2/§5). O canal sintético NÃO sobe sessão de linha no boot
+  (`listActiveWhatsappLinesCrossTenant` exclui `is_synthetic`).
 
 ## Boot fail-fast (§1.3)
 
@@ -67,7 +85,8 @@ impossível, por construção, um reply da sonda sair pela linha real.
 
 1. Migração 094 aplicada (seed inativo + coluna `is_synthetic` + tabelas de
    estado). Flag off.
-2. Ambiente já em `exact_first`/`strict` validado. Parear o canal da sonda.
+2. Ambiente já em `exact_first`/`strict` validado (roteamento por exact-match,
+   sem depender do catch-all). Ativar o canal da sonda: `npm run probe:activate`.
 3. Staging: `MAIA_SYNTHETIC_PROBE=true`, `MAIA_PROBE_ALERT_MODE=log_only`.
    Medir a latência baseline; calibrar `MAIA_PROBE_SLO_MS` /
    `MAIA_PROBE_SLO_WARN_MS` / `MAIA_PROBE_ALERT_AFTER_K`.

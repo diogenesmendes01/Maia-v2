@@ -58,6 +58,9 @@ describe('classifyOutcome', () => {
   it('wrong quando respondeu (liveness) mas sem efeito', () => {
     expect(classifyOutcome({ effectSatisfied: false, liveness: true, elapsedMs: 5000, slowMs: 2000 })).toBe('wrong');
   });
+  it('wrong quando efeito satisfeito mas SEM resposta (liveness) — não é sucesso', () => {
+    expect(classifyOutcome({ effectSatisfied: true, liveness: false, elapsedMs: 1000, slowMs: 2000 })).toBe('wrong');
+  });
   it('silent quando nem respondeu', () => {
     expect(classifyOutcome({ effectSatisfied: false, liveness: false, elapsedMs: 5000, slowMs: 2000 })).toBe('silent');
   });
@@ -105,6 +108,7 @@ describe('outbound sink (buildOutput)', () => {
 
 function fakeRepo(overrides: Record<string, unknown> = {}) {
   return {
+    channelReady: vi.fn(async () => ({ ok: true })),
     createRun: vi.fn(async () => 'run-1'),
     setRunMensagemId: vi.fn(async () => undefined),
     completeRun: vi.fn(async () => undefined),
@@ -164,9 +168,15 @@ describe('runProbeTick', () => {
     const res = await runProbeTick(deps);
     expect(res.outcome).toBe('ok');
     expect(deps.ingress).toHaveBeenCalledOnce();
-    expect(repo.cleanupRunTraffic).toHaveBeenCalledWith(expect.objectContaining({ mensagem_id: 'm-1' }));
+    expect(repo.cleanupRunTraffic).toHaveBeenCalledWith(
+      expect.objectContaining({ mensagem_id: 'm-1', tenant_id: expect.any(String), agent_id: expect.any(String) }),
+    );
     expect(repo.recordOk).toHaveBeenCalled();
-    expect(repo.completeRun).toHaveBeenCalledWith('run-1', expect.objectContaining({ terminal: true, outcome: 'ok' }));
+    expect(repo.completeRun).toHaveBeenCalledWith(
+      expect.objectContaining({ tenant_id: expect.any(String), agent_id: expect.any(String) }),
+      'run-1',
+      expect.objectContaining({ terminal: true, outcome: 'ok' }),
+    );
     expect(deps.metrics.inc).toHaveBeenCalledWith('synthetic_probe_runs_total', { outcome: 'ok' });
   });
 
@@ -185,7 +195,23 @@ describe('runProbeTick', () => {
     expect(res.outcome).toBe('wrong');
     expect(repo.recordFailure).toHaveBeenCalled();
     expect(repo.cleanupRunTraffic).not.toHaveBeenCalled();
-    expect(repo.completeRun).toHaveBeenCalledWith('run-1', expect.objectContaining({ terminal: false, outcome: 'wrong' }));
+    expect(repo.completeRun).toHaveBeenCalledWith(
+      expect.objectContaining({ tenant_id: expect.any(String), agent_id: expect.any(String) }),
+      'run-1',
+      expect.objectContaining({ terminal: false, outcome: 'wrong' }),
+    );
+  });
+
+  it('canal NÃO pronto (inativo) ⇒ fail-closed: audit + NÃO injeta + prereq_unmet', async () => {
+    const repo = fakeRepo({ channelReady: vi.fn(async () => ({ ok: false, reason: 'inactive' })) });
+    const deps = baseDeps({ repo: repo as unknown as ProbeTickDeps['repo'] });
+    const res = await runProbeTick(deps);
+    expect(res.status).toBe('prereq_unmet');
+    expect(deps.ingress).not.toHaveBeenCalled();
+    expect(repo.createRun).not.toHaveBeenCalled();
+    expect(deps.audit).toHaveBeenCalledWith(
+      expect.objectContaining({ acao: 'synthetic_probe_prereq_unmet' }),
+    );
   });
 
   it('sem resposta até o SLO ⇒ silent', async () => {

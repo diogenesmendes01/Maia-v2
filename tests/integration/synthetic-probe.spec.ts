@@ -135,6 +135,20 @@ d('synthetic probe — state machine (durável)', () => {
     expect(secs).toBeGreaterThanOrEqual(0);
     expect(secs).toBeLessThan(5);
   });
+
+  it('NEVER GREEN: gauge cresce a partir do first_attempt_at (last_ok_at nulo)', async () => {
+    // Uma sonda que falha desde o 1º tick: recordFailure carimba first_attempt_at.
+    await syntheticProbeRepo.recordFailure({ tenant_id: PROBE_TENANT_ID, agent_id: PROBE_AGENT_ID, alert_after_k: 3 });
+    // Envelhece a primeira tentativa 20min no passado, mantendo last_ok_at nulo.
+    await q(
+      `UPDATE synthetic_probe_state SET first_attempt_at = now() - interval '20 minutes', last_ok_at = NULL
+        WHERE tenant_id=$1 AND agent_id=$2`,
+      [PROBE_TENANT_ID, PROBE_AGENT_ID],
+    );
+    const secs = await syntheticProbeRepo.secondsSinceLastOk(PROBE_TENANT_ID, PROBE_AGENT_ID);
+    // Sem o fallback, seria 0 (regra '>15m' nunca dispararia). Com o fix, ~1200s.
+    expect(secs).toBeGreaterThan(15 * 60);
+  });
 });
 
 d('synthetic probe — single-flight lease', () => {
@@ -181,7 +195,11 @@ d('synthetic probe — correlação, asserção e cleanup', () => {
       audit({ acao: 'transaction_created', mensagem_id: inboundId, conversa_id: conversaId }),
     );
 
-    const removed = await syntheticProbeRepo.cleanupRunTraffic({ tenant_id: PROBE_TENANT_ID, mensagem_id: inboundId });
+    const removed = await syntheticProbeRepo.cleanupRunTraffic({
+      tenant_id: PROBE_TENANT_ID,
+      agent_id: PROBE_AGENT_ID,
+      mensagem_id: inboundId,
+    });
     expect(removed).toBe(1);
 
     const tx = await q<{ n: string }>(`SELECT count(*) n FROM transacoes WHERE tenant_id=$1`, [PROBE_TENANT_ID]);
@@ -205,10 +223,10 @@ d('synthetic probe — sweep de TTL', () => {
       scenario: 'register_transaction_pendente',
       whatsapp_id: 'probe-orphan',
     });
-    const open = await syntheticProbeRepo.listOpenRunsOlderThan(new Date(Date.now() + 60_000), 100);
+    const open = await syntheticProbeRepo.listOpenRunsOlderThan(PROBE_CONTEXT, new Date(Date.now() + 60_000), 100);
     expect(open.some((r) => r.id === runId)).toBe(true);
-    await syntheticProbeRepo.closeOrphanRun(runId);
-    const stillOpen = await syntheticProbeRepo.listOpenRunsOlderThan(new Date(Date.now() + 60_000), 100);
+    await syntheticProbeRepo.closeOrphanRun(PROBE_CONTEXT, runId);
+    const stillOpen = await syntheticProbeRepo.listOpenRunsOlderThan(PROBE_CONTEXT, new Date(Date.now() + 60_000), 100);
     expect(stillOpen.some((r) => r.id === runId)).toBe(false);
   });
 });

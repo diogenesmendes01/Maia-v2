@@ -65,6 +65,10 @@ CREATE TABLE IF NOT EXISTS synthetic_probe_state (
   agent_id              text NOT NULL REFERENCES agents(id),
   -- sinal PRIMÁRIO de outage (§1.6): o gauge seconds_since_last_ok é lido daqui.
   last_ok_at            timestamptz,
+  -- primeira tentativa registrada — o gauge cresce a partir daqui mesmo se a
+  -- sonda NUNCA ficou verde (last_ok_at nulo). Sem isso um ambiente que falha
+  -- desde o 1º tick exibiria gauge=0 e a regra '>15m' nunca dispararia (review).
+  first_attempt_at      timestamptz,
   consecutive_failures  integer NOT NULL DEFAULT 0,
   health                text NOT NULL DEFAULT 'healthy' CHECK (health IN ('healthy','degraded')),
   -- alerta durável com retry (§1.6): a transição saudável→degradado grava

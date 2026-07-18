@@ -452,6 +452,11 @@ export const channelsRepo = {
         and(
           eq(channels.channel_type, 'whatsapp'),
           eq(channels.active, true),
+          // Canais SINTÉTICOS (sonda) nunca sobem uma sessão real: o inbound é
+          // injetado sinteticamente e o outbound é interceptado pelo sink. A
+          // linha placeholder (+999...) não tem auth pareado e não deve gerar
+          // QR nem warn de "pair first" no boot (correção do review — alta).
+          eq(channels.is_synthetic, false),
           sql`${channels.external_id} ~ '^\\+[1-9][0-9]{6,14}$'`,
         ),
       );

@@ -15,6 +15,7 @@
     "build": "tsc && tsc-alias",
     "start": "node dist/index.js",
     "setup": "tsx scripts/setup.ts",
+    "probe:activate": "tsx scripts/activate-synthetic-probe.ts",
     "pessoa:add": "tsx scripts/pessoa-add.ts",
     "db:migrate": "tsx scripts/migrate.ts",
     "db:seed": "tsx scripts/seed.ts",

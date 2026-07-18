@@ -55,15 +55,21 @@ async function retryPendingAlert(): Promise<void> {
   });
 }
 
-/** Sweep de TTL dos runs órfãos (§1.5) — cleanup do tráfego + fecha o run. */
+/** Sweep de TTL dos runs órfãos (§1.5) — cleanup do tráfego + fecha o run.
+ *  Escopado por (tenant, agent) em todas as chamadas (correção do review). */
 async function sweepOrphanRuns(nowMs: number): Promise<void> {
+  const scope = { tenant_id: PROBE_TENANT_ID, agent_id: PROBE_AGENT_ID };
   const cutoff = new Date(nowMs - config.MAIA_PROBE_RUN_TTL_MS);
-  const open = await syntheticProbeRepo.listOpenRunsOlderThan(cutoff, 100);
+  const open = await syntheticProbeRepo.listOpenRunsOlderThan(scope, cutoff, 100);
   for (const run of open) {
     if (run.mensagem_id) {
-      await syntheticProbeRepo.cleanupRunTraffic({ tenant_id: run.tenant_id, mensagem_id: run.mensagem_id });
+      await syntheticProbeRepo.cleanupRunTraffic({
+        tenant_id: PROBE_TENANT_ID,
+        agent_id: PROBE_AGENT_ID,
+        mensagem_id: run.mensagem_id,
+      });
     }
-    await syntheticProbeRepo.closeOrphanRun(run.id);
+    await syntheticProbeRepo.closeOrphanRun(scope, run.id);
   }
   if (open.length > 0) logger.info({ swept: open.length }, 'synthetic_probe.ttl_sweep');
 }

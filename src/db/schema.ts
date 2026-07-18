@@ -2467,6 +2467,9 @@ export const synthetic_probe_state = pgTable(
     agent_id: text('agent_id').notNull(),
     // sinal PRIMÁRIO de outage (§1.6): o gauge seconds_since_last_ok lê daqui.
     last_ok_at: timestamp('last_ok_at', { withTimezone: true }),
+    // primeira tentativa — o gauge cresce a partir daqui mesmo se NUNCA ficou
+    // verde (last_ok_at nulo), senão gauge=0 e '>15m' nunca dispara (review).
+    first_attempt_at: timestamp('first_attempt_at', { withTimezone: true }),
     consecutive_failures: integer('consecutive_failures').notNull().default(0),
     health: text('health').notNull().default('healthy'),
     // alerta durável com retry (§1.6): a transição saudável→degradado grava
