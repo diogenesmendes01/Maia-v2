@@ -63,6 +63,14 @@ async function main() {
   startUnroutedReplayWorker(async (job) => {
     await processUnroutedReplay(job.data.unrouted_id);
   });
+  // Sonda sintética (spec §1.3) — validação fail-fast + armamento do sink ANTES
+  // de startWorkers: se MAIA_SYNTHETIC_PROBE=true e o canal configurado não for
+  // exclusivamente sintético, o boot FALHA aqui (nunca sobe armando o sink sobre
+  // um recurso real). No-op com a flag off. O worker `synthetic_probe` é
+  // registrado em phase 1 mas só age com a flag on + pré-requisito de roteamento.
+  const { validateAndArmSyntheticProbe } = await import('@/probe/boot-validate.js');
+  await validateAndArmSyntheticProbe();
+
   startWorkers(1);
   await startBaileys();
 

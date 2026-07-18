@@ -1821,6 +1821,11 @@ export const channels = pgTable(
     channel_type: text('channel_type').notNull(),
     display_name: text('display_name'),
     active: boolean('active').notNull().default(true),
+    // 094 — marcador sintético IMUTÁVEL (spec sonda §1.3): setado só no seed da
+    // migração, nunca por config de runtime. Base do sink de outbound e da
+    // validação fail-fast de boot; garante que a sonda não silencie um recurso
+    // não-sintético (o sink exige is_synthetic=true + triplete completo).
+    is_synthetic: boolean('is_synthetic').notNull().default(false),
     metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
@@ -2422,6 +2427,67 @@ export type CapabilityProposal = typeof capability_proposals.$inferSelect;
 export type NewCapabilityProposal = typeof capability_proposals.$inferInsert;
 export type CapabilityTestResult = typeof capability_test_results.$inferSelect;
 export type NewCapabilityTestResult = typeof capability_test_results.$inferInsert;
+// 094 — Sonda sintética (spec §1.5): estado DURÁVEL em Postgres. Os contadores/
+// gauges de metrics.ts são in-memory e as rows do run são limpas; sem estas
+// tabelas um restart esqueceria o outage (last_ok) ou duplicaria runs
+// (single-flight). Namespaced pelo tenant '__probe__', filtrado de dashboards.
+export const synthetic_probe_runs = pgTable(
+  'synthetic_probe_runs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    channel_id: uuid('channel_id'),
+    scenario: text('scenario').notNull(),
+    // id estável do inbound sintético injetado (metadata.whatsapp_id) — o HANDLE
+    // do run; dele a sonda resolve a `mensagens` de entrada e daí os efeitos.
+    whatsapp_id: text('whatsapp_id').notNull(),
+    // `mensagens.id` da entrada resolvida — chave de correlação dos efeitos
+    // (transacoes.mensagem_id / out.metadata->>'in_reply_to'). NULL até resolver.
+    mensagem_id: uuid('mensagem_id'),
+    started_at: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
+    // ok | slow | wrong | silent | error — NULL enquanto em voo.
+    outcome: text('outcome'),
+    latency_ms: integer('latency_ms'),
+    detail: jsonb('detail').notNull().default(sql`'{}'::jsonb`),
+    // set no estado TERMINAL do run — só então o cleanup pode recolher (§1.5).
+    terminal_at: timestamp('terminal_at', { withTimezone: true }),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    scopeIdx: index('synthetic_probe_runs_scope_idx').on(t.tenant_id, t.agent_id, t.started_at),
+    widIdx: index('synthetic_probe_runs_wid_idx').on(t.whatsapp_id),
+  }),
+);
+
+export const synthetic_probe_state = pgTable(
+  'synthetic_probe_state',
+  {
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    // sinal PRIMÁRIO de outage (§1.6): o gauge seconds_since_last_ok lê daqui.
+    last_ok_at: timestamp('last_ok_at', { withTimezone: true }),
+    consecutive_failures: integer('consecutive_failures').notNull().default(0),
+    health: text('health').notNull().default('healthy'),
+    // alerta durável com retry (§1.6): a transição saudável→degradado grava
+    // alert_pending=true; o retry reentrega até confirmar e só então zera.
+    alert_pending: boolean('alert_pending').notNull().default(false),
+    alert_pending_since: timestamp('alert_pending_since', { withTimezone: true }),
+    last_alert_attempt_at: timestamp('last_alert_attempt_at', { withTimezone: true }),
+    // single-flight (§1.5): impede runs concorrentes; lease vencido é reciclado.
+    lease_until: timestamp('lease_until', { withTimezone: true }),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.tenant_id, t.agent_id] }),
+  }),
+);
+
+export type SyntheticProbeRun = typeof synthetic_probe_runs.$inferSelect;
+export type NewSyntheticProbeRun = typeof synthetic_probe_runs.$inferInsert;
+export type SyntheticProbeState = typeof synthetic_probe_state.$inferSelect;
+export type NewSyntheticProbeState = typeof synthetic_probe_state.$inferInsert;
+
 export type Channel = typeof channels.$inferSelect;
 export type NewChannel = typeof channels.$inferInsert;
 export type Role = typeof roles.$inferSelect;

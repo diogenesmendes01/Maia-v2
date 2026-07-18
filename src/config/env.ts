@@ -134,6 +134,62 @@ const envSchema = z
     // sem keyring válido (fail-closed).
     MAIA_STAGING_KEYRING: z.string().optional(),
     MAIA_STAGING_ACTIVE_KEY_ID: z.string().optional(),
+    // Synthetic Agent Probe (spec 2026-07-17 §1) — sonda sintética que
+    // exercita o agente ponta-a-ponta pelo caminho de produção real
+    // (ingresso → resolver → fila → LLM → tools → persistência → saída) e
+    // falha ALTO quando a Maia para de responder ou responde errado.
+    //  - MAIA_SYNTHETIC_PROBE: gate de comportamento. INERTE (no-op) enquanto
+    //    false (default). O worker É registrado em phase 1 (§1.1 — phase 2
+    //    nunca é agendado por startWorkers(1)), mas só age com a flag on. O
+    //    recurso de sonda (tenant/agente/canal/entidade/conta) é SEMEADO com
+    //    ids literais pela migração 094 e referenciado por constante em
+    //    src/probe/constants.ts — NÃO por env, para que não haja como
+    //    apontar o sink para um tenant real (o blast radius do §1.3). O boot
+    //    fail-fast (§1.3) revalida no DB que o triplete é exclusivamente
+    //    sintético mesmo assim (defense-in-depth).
+    //  - Pré-requisito de roteamento (§1.2): sob MAIA_CHANNEL_ROUTING_MODE=
+    //    shadow o worker FALHA FECHADO (no-op + audit synthetic_probe_prereq_
+    //    unmet) — não é erro de boot; só exact_first/strict habilitam a sonda.
+    MAIA_SYNTHETIC_PROBE: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
+    // LLM-as-judge (§1.4c) — asserção SECUNDÁRIA para intenção semântica.
+    // Implementado desde a v1 (não é fase futura), porém ligável por esta
+    // sub-flag (off por default: custo/ruído, coerente com §1.4/§5). A
+    // asserção PRIMÁRIA é sempre o efeito colateral verificável + liveness.
+    MAIA_PROBE_LLM_JUDGE: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
+    // Cadência do tick (§1.1, default */10). 1 cenário/tick (custo bounded).
+    MAIA_PROBE_CRON: z.string().default('*/10 * * * *'),
+    // SLO do efeito colateral (ms): deadline do poll. Sem efeito em SLO ⇒
+    // `silent`; efeito ok mas acima de SLO_WARN ⇒ `slow` (§1.1 passo 5).
+    MAIA_PROBE_SLO_MS: z.coerce.number().int().positive().default(30_000),
+    MAIA_PROBE_SLO_WARN_MS: z.coerce.number().int().positive().default(15_000),
+    // K falhas consecutivas para a transição saudável→degradado + alerta
+    // (§1.6/§5 — separa lentidão pontual de outage real).
+    MAIA_PROBE_ALERT_AFTER_K: z.coerce.number().int().positive().default(3),
+    // Auto-silêncio (§1.5/§5): após N falhas consecutivas o worker para de
+    // gastar LLM continuamente — passa a sondar recuperação só a cada
+    // SILENCED_BACKOFF_MS (implementado estendendo o lease de single-flight,
+    // sem query extra). Um OK reseta o contador e a cadência normal volta.
+    MAIA_PROBE_AUTOSILENCE_AFTER_N: z.coerce.number().int().positive().default(10),
+    MAIA_PROBE_SILENCED_BACKOFF_MS: z.coerce.number().int().positive().default(3_600_000),
+    // TTL (ms) do cleanup de rows de run órfãs — um job BullMQ que estourou o
+    // SLO pode persistir DEPOIS; o cleanup só recolhe após terminal OU TTL
+    // (§1.5), nunca no meio de um job em voo.
+    MAIA_PROBE_RUN_TTL_MS: z.coerce.number().int().positive().default(300_000),
+    // Lease (ms) de single-flight (§1.5): impede dois runs concorrentes; um
+    // worker morto tem o lease reciclado ao expirar.
+    MAIA_PROBE_LEASE_MS: z.coerce.number().int().positive().default(120_000),
+    // Modo de alerta (rollout §4): 'log_only' (default, staging-safe) emite log
+    // estruturado + métrica e NÃO chama sendAlert — a "entrega" é o log (sempre
+    // sucede). 'alert' entrega por sendAlert (telegram/email) com retry durável
+    // via alert_pending. O gauge seconds_since_last_ok é o sinal PRIMÁRIO nos
+    // dois modos.
+    MAIA_PROBE_ALERT_MODE: z.enum(['log_only', 'alert']).default('log_only'),
     FEATURE_ONE_TAP: z
       .string()
       .default('false')

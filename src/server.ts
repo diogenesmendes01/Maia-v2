@@ -21,6 +21,17 @@ export async function buildServer() {
   setGaugeProvider('maia_baileys_connected', () => (isBaileysConnected() ? 1 : 0));
   setGaugeProvider('maia_db_connected', () => (isDbConnected() ? 1 : 0));
 
+  // Sonda sintética (spec §1.6) — sinal PRIMÁRIO de outage, DURÁVEL (lido de
+  // synthetic_probe_state.last_ok_at, não in-memory): segundos desde o último
+  // OK. Um valor que CRESCE É o outage e sobrevive a restart. Provider async,
+  // sem ALS (scrape). Inerte (0) com a flag off / antes do primeiro OK.
+  setGaugeProvider('synthetic_probe_seconds_since_last_ok', async () => {
+    if (!config.MAIA_SYNTHETIC_PROBE) return 0;
+    const { syntheticProbeRepo } = await import('@/db/repositories/synthetic-probe-repos.js');
+    const { PROBE_TENANT_ID, PROBE_AGENT_ID } = await import('@/probe/constants.js');
+    return syntheticProbeRepo.secondsSinceLastOk(PROBE_TENANT_ID, PROBE_AGENT_ID);
+  });
+
   // Refresh the cached DB connectivity state in the background. Each call
   // self-throttles to 5s, so this is cheap regardless of the scrape rate.
   // Driven by setInterval so the gauge updates even when /metrics is idle.
