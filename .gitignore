@@ -8,6 +8,11 @@ dist/
 .env
 .env.local
 .env.*.local
+# Fase 0 cap. 6 — env files reais do compose de produção (nunca commitar).
+# Os exemplos versionados são .env.app.prod.example / .env.admin.prod.example.
+.env.app
+.env.admin
+.env.infra
 
 # WhatsApp / Baileys
 .baileys-auth/
