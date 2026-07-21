@@ -41,7 +41,7 @@ vi.mock('qrcode-terminal', () => ({ default: { generate: vi.fn() } }));
 
 vi.mock('../../src/config/env.js', () => ({
   config: {
-    BAILEYS_AUTH_DIR: '/tmp/maia-reconnect-test',
+    BAILEYS_AUTH_DIR: '/tmp/maia-baileys-reconnect-test',
     FEATURE_MESSAGE_UPDATE: false,
     FEATURE_ONE_TAP: false,
   },

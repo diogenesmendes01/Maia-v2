@@ -61,7 +61,7 @@ vi.mock('node:fs/promises', () => ({
   rm: fsMocks.rm,
 }));
 vi.mock('../../../src/config/env.js', () => ({
-  config: { BAILEYS_AUTH_DIR: '/tmp/maia-pairing-mgr-test', MAIA_MULTI_LINE: false },
+  config: { BAILEYS_AUTH_DIR: '/tmp/maia-baileys-pairing-mgr-test', MAIA_MULTI_LINE: false },
 }));
 vi.mock('../../../src/lib/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },

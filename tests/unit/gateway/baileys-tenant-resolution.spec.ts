@@ -92,7 +92,7 @@ vi.mock('qrcode-terminal', () => ({ default: { generate: vi.fn() } }));
 
 vi.mock('@/config/env.js', () => ({
   config: {
-    BAILEYS_AUTH_DIR: '/tmp/maia-issue-290-test',
+    BAILEYS_AUTH_DIR: '/tmp/maia-baileys-issue-290-test',
     FEATURE_MESSAGE_UPDATE: false,
     FEATURE_ONE_TAP: false,
     FEATURE_MESSAGE_DEBOUNCE: false,

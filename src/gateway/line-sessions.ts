@@ -50,6 +50,7 @@ import {
   lineAuthDir,
   type LineTransport,
 } from './line-session-manager.js';
+import { triggerRecovery } from '../setup/recovery.js';
 
 const LINE_RECONNECT_BASE_MS = 1000;
 const LINE_RECONNECT_MAX_MS = 30_000;
@@ -90,6 +91,45 @@ function auditLineTransition(
     { tenant_id: channel.tenant_id, agent_id: channel.agent_id },
     () => audit({ acao: 'line_session_transition', metadata }),
   );
+}
+
+/**
+ * Cap. 7 (auditoria P0) — LoggedOut de uma linha ADICIONAL encerra a posse
+ * DE VERDADE, não só em memória:
+ *  1. audita `pairing_logged_out` sob o ALS do dono do canal (mesmo evento
+ *     que a primária emite em baileys.ts, com o canal em metadata);
+ *  2. delega ao recovery por-alvo, que DESATIVA o canal no DB (fail-closed:
+ *     roteamento e boot param de usar a linha — antes a row podia continuar
+ *     ativa/elegível) e remove APENAS `lines/<channel_id>` (guard de raiz).
+ * O pairing dir NÃO é tocado: fora de um pareamento em curso ele não existe
+ * (o ciclo §2.5 promove ou destrói), e removê-lo aqui poderia atropelar um
+ * re-pareamento concorrente do operador.
+ */
+async function handleLineLoggedOut(
+  channel: LineChannel,
+  reason: number | undefined,
+): Promise<void> {
+  try {
+    await runWithTenantContext(
+      { tenant_id: channel.tenant_id, agent_id: channel.agent_id },
+      () =>
+        audit({
+          acao: 'pairing_logged_out',
+          metadata: {
+            channel_id: channel.id,
+            line_external_id: channel.external_id,
+            is_primary: false,
+            reason,
+          },
+        }),
+    );
+    await triggerRecovery({ target: 'line', channel });
+  } catch (err) {
+    logger.error(
+      { channel_id: channel.id, err: (err as Error).message },
+      'line_session.logged_out_recovery_failed',
+    );
+  }
 }
 
 function buildTransport(state: LineSessionState): LineTransport {
@@ -238,6 +278,9 @@ async function startLineSession(channel: LineChannel): Promise<void> {
         is_primary: false,
         reason,
       });
+      // Cap. 7 — loggedOut persiste o encerramento da posse (canal inativo +
+      // rm do auth SÓ desta linha) em vez de fechar apenas em memória.
+      if (loggedOut) void handleLineLoggedOut(channel, reason);
       if (loggedOut || state.stopped) return;
       state.reconnectAttempts += 1;
       if (state.reconnectAttempts > LINE_RECONNECT_MAX_ATTEMPTS) {

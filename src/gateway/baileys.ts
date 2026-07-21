@@ -10,9 +10,14 @@ import {
 import { Boom } from '@hapi/boom';
 import qrcodeTerminal from 'qrcode-terminal';
 import { mkdirSync, writeFileSync, existsSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { readFile, readdir, rename, rm } from 'node:fs/promises';
+import { join, basename } from 'node:path';
 import { config } from '@/config/env.js';
+import {
+  assertSafeAuthDir,
+  isReservedRootEntry,
+  resolvePrimaryAuthDir,
+} from '@/setup/auth-dir.js';
 import { logger } from '@/lib/logger.js';
 import { sha256 } from '@/lib/utils.js';
 import { mensagensRepo } from '@/db/repositories.js';
@@ -309,7 +314,14 @@ async function handleConnectionUpdate(update: ConnectionUpdate): Promise<void> {
     if (reason === DisconnectReason.loggedOut) {
       await audit({ acao: 'pairing_logged_out', metadata: { reason } });
       reconnectAttempts = 0;
-      triggerRecovery({ shutdownBaileys, startBaileys }).catch((err) => {
+      // Cap. 7 — recovery POR ALVO: o LoggedOut da primária remove apenas
+      // primary/ (nunca a raiz — lines/, pairing/ e control/ sobrevivem).
+      triggerRecovery({
+        target: 'primary',
+        line: currentLineE164,
+        shutdownBaileys,
+        startBaileys,
+      }).catch((err) => {
         logger.error({ err }, 'setup.recovery_failed');
       });
     } else {
@@ -320,7 +332,12 @@ async function handleConnectionUpdate(update: ConnectionUpdate): Promise<void> {
         reconnectAttempts = 0;
         // Flip to recovering — the auto-loop is exhausted, the operator
         // path takes over via the same recovery hook used for loggedOut.
-        triggerRecovery({ shutdownBaileys, startBaileys }).catch((err) => {
+        triggerRecovery({
+          target: 'primary',
+          line: currentLineE164,
+          shutdownBaileys,
+          startBaileys,
+        }).catch((err) => {
           logger.error({ err }, 'setup.recovery_failed');
         });
         return;
@@ -337,12 +354,119 @@ async function handleConnectionUpdate(update: ConnectionUpdate): Promise<void> {
   }
 }
 
+/** Prefixo dos staging dirs da migração de layout — dentro da raiz para o
+ * `rename` de promoção ser atômico (mesmo filesystem). */
+const AUTH_MIGRATION_STAGING_PREFIX = '.primary-migration-';
+
+/**
+ * Auditoria P0 cap. 7 — a sessão primária deixa de usar a RAIZ do
+ * `BAILEYS_AUTH_DIR` e passa a viver em `primary/` (filho direto da raiz),
+ * lado a lado com `lines/<id>`, `pairing/<id>` e `control/`. Com isso o
+ * recovery da primária pode remover `primary/` sem destruir as credenciais
+ * das linhas adicionais, os pareamentos em curso e o setup token.
+ *
+ * Migração do layout LEGADO (creds.json direto na raiz) no boot:
+ *  - move CADA entrada da raiz — exceto as reservadas (`lines/`, `pairing/`,
+ *    `control/`, `media/`, `setup-token.txt`) — para um staging dir e promove
+ *    com `rename` atômico para `primary/` (staging dentro da raiz ⇒ mesmo
+ *    filesystem);
+ *  - qualquer falha faz rollback best-effort das entradas já movidas e o
+ *    boot SEGUE NO CAMINHO LEGADO (raiz) — log + audit; os arquivos legados
+ *    nunca ficam meio-migrados sem sessão utilizável;
+ *  - um staging órfão de um boot anterior interrompido é retomado: com
+ *    `creds.json` dentro, é a sessão completa (a queda ocorreu entre o move
+ *    e o promote) ⇒ promove; sem, devolve as entradas para a raiz.
+ * NUNCA toca `lines/`, `pairing/`, `control/` (nem `media/`).
+ */
+async function ensurePrimaryAuthDirMigrated(): Promise<string> {
+  const root = assertSafeAuthDir(config.BAILEYS_AUTH_DIR);
+  const primaryDir = resolvePrimaryAuthDir();
+  if (existsSync(primaryDir)) return primaryDir;
+  if (!existsSync(root)) {
+    // Instalação nova — nada legado para migrar.
+    mkdirSync(primaryDir, { recursive: true });
+    return primaryDir;
+  }
+
+  const entries = await readdir(root);
+
+  // Retoma migração interrompida (staging órfão de um boot anterior).
+  for (const name of entries) {
+    if (!name.startsWith(AUTH_MIGRATION_STAGING_PREFIX)) continue;
+    const stagingPath = join(root, name);
+    if (existsSync(join(stagingPath, 'creds.json'))) {
+      await rename(stagingPath, primaryDir);
+      logger.info({ dir: primaryDir }, 'baileys.auth_layout_staging_promoted');
+      return primaryDir;
+    }
+    // Staging parcial sem creds — devolve o que der para a raiz (rollback).
+    for (const inner of await readdir(stagingPath).catch(() => [] as string[])) {
+      await rename(join(stagingPath, inner), join(root, inner)).catch(() => undefined);
+    }
+    await rm(stagingPath, { recursive: true, force: true }).catch(() => undefined);
+  }
+
+  if (!existsSync(join(root, 'creds.json'))) {
+    // Sem sessão legada (cold start ou pós-recovery) — só cria primary/.
+    mkdirSync(primaryDir, { recursive: true });
+    return primaryDir;
+  }
+
+  const staging = join(root, `${AUTH_MIGRATION_STAGING_PREFIX}${process.pid}-${Date.now()}`);
+  const moved: string[] = [];
+  try {
+    mkdirSync(staging, { recursive: true });
+    for (const name of await readdir(root)) {
+      if (isReservedRootEntry(name)) continue;
+      if (name === basename(staging) || name.startsWith(AUTH_MIGRATION_STAGING_PREFIX)) continue;
+      if (name === 'primary') continue; // defensivo — não existe neste ponto
+      await rename(join(root, name), join(staging, name));
+      moved.push(name);
+    }
+    await rename(staging, primaryDir);
+    logger.info(
+      { dir: primaryDir, entries: moved.length },
+      'baileys.auth_layout_migrated_to_primary',
+    );
+    // `AUDIT_ACTIONS` é fechado e fora do escopo deste capítulo —
+    // `config_loaded` é a ação existente para "estado de configuração no
+    // boot"; o evento real vai em metadata.
+    await audit({
+      acao: 'config_loaded',
+      metadata: { event: 'baileys_auth_layout_migrated_to_primary', entries: moved.length },
+    }).catch(() => undefined);
+    return primaryDir;
+  } catch (err) {
+    // Rollback best-effort — mantém o layout LEGADO utilizável neste boot;
+    // os fluxos de recovery limpam a raiz ENTRADA A ENTRADA (nunca a raiz).
+    for (const name of moved) {
+      await rename(join(staging, name), join(root, name)).catch(() => undefined);
+    }
+    await rm(staging, { recursive: true, force: true }).catch(() => undefined);
+    logger.error(
+      { err: (err as Error).message },
+      'baileys.auth_layout_migration_failed_using_legacy_root',
+    );
+    await audit({
+      acao: 'config_loaded',
+      metadata: {
+        event: 'baileys_auth_layout_migration_failed',
+        error: (err as Error).message,
+      },
+    }).catch(() => undefined);
+    return root;
+  }
+}
+
 export async function startBaileys(): Promise<void> {
   // Backend boot (maia-app): create media dirs here, NOT at module load, so
   // importing this module (e.g. from the admin-ui tool catalog) has no fs side
   // effects. Idempotent.
   ensureMediaDirs();
-  const { state, saveCreds } = await useMultiFileAuthState(config.BAILEYS_AUTH_DIR);
+  // Cap. 7 — a primária usa `primary/` (com migração transparente do layout
+  // legado); só um boot cuja migração falhou continua na raiz.
+  const authDir = await ensurePrimaryAuthDirMigrated();
+  const { state, saveCreds } = await useMultiFileAuthState(authDir);
   // Pin the WA Web protocol version to whatever WhatsApp is currently
   // serving. Without this, Baileys uses the version hardcoded at the time
   // the library was published — when WhatsApp ships a server-side bump,
@@ -1264,6 +1388,7 @@ export const _internal = {
     return reconnectAttempts;
   },
   _extractMessageUpdateTargetId: extractMessageUpdateTargetId,
+  _ensurePrimaryAuthDirMigrated: ensurePrimaryAuthDirMigrated,
   RECONNECT_MAX_ATTEMPTS,
 };
 

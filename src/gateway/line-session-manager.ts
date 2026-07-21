@@ -29,10 +29,16 @@ import {
 } from '@whiskeysockets/baileys';
 import { mkdirSync, existsSync } from 'node:fs';
 import { rename, rm } from 'node:fs/promises';
-import nodePath, { resolve as pathResolve } from 'node:path';
+import { resolve as pathResolve } from 'node:path';
 import { config } from '../config/env.js';
 import { logger } from '../lib/logger.js';
 import { TypedError } from '../lib/utils.js';
+import {
+  assertIsDirectChildOfAuthRoot,
+  resolveLineAuthDir,
+  resolvePairingAuthDir,
+  resolveScopedAuthDir,
+} from '../setup/auth-dir.js';
 import type { WAQuotedContext } from './types.js';
 import type { SendPollResult, TypingHandle } from './presence.js';
 
@@ -67,41 +73,20 @@ export interface LineSessionInfo {
   is_primary: boolean;
 }
 
-/** Subconjunto de `node:path` usado na validação — injetável para testar
- * as semânticas win32 E posix na mesma plataforma (review #498 médio 5). */
-type PathImpl = Pick<typeof nodePath, 'resolve' | 'relative' | 'isAbsolute' | 'sep'>;
-
 /**
- * Resolve `<base>/<bucket>/<channelId>` garantindo que o resultado é um
- * FILHO DIRETO da raiz do bucket (UUID do canal, nunca o número — review v3,
- * path traversal). Review #498 (médio 5): a comparação por prefixo
- * `startsWith(root + '/')` rejeitava TODO path válido no Windows (o
- * separador de `path.resolve` lá é `\`) — `path.relative` + `path.sep` são
- * portáveis: escape ⇒ `..`/absoluto; descida além de um nível ⇒ contém sep.
+ * Cap. 7 (auditoria P0): a validação de path (traversal do channelId + guard
+ * de remoção) tem FONTE ÚNICA em `setup/auth-dir.ts` — este módulo delega e
+ * re-exporta para os consumidores existentes. `lineAuthDir`/`pairingAuthDir`
+ * agora também validam a RAIZ (`assertSafeAuthDir`) em toda derivação.
  */
-export function resolveScopedAuthDir(
-  baseDir: string,
-  bucket: 'lines' | 'pairing',
-  channelId: string,
-  p: PathImpl = nodePath,
-): string {
-  const root = p.resolve(baseDir, bucket);
-  const dir = p.resolve(root, channelId);
-  const rel = p.relative(root, dir);
-  if (rel === '' || rel.startsWith('..') || p.isAbsolute(rel) || rel.includes(p.sep)) {
-    throw new TypedError('auth_dir_escape', `resolved auth dir escapes ${bucket} root`, {
-      channelId,
-    });
-  }
-  return dir;
-}
+export { resolveScopedAuthDir };
 
 export function lineAuthDir(channelId: string): string {
-  return resolveScopedAuthDir(config.BAILEYS_AUTH_DIR, 'lines', channelId);
+  return resolveLineAuthDir(channelId);
 }
 
 export function pairingAuthDir(channelId: string): string {
-  return resolveScopedAuthDir(config.BAILEYS_AUTH_DIR, 'pairing', channelId);
+  return resolvePairingAuthDir(channelId);
 }
 
 const PAIRING_TTL_MS = 15 * 60_000;
@@ -293,12 +278,14 @@ class LineSessionManager {
           void (async () => {
             try {
               if (matched) {
-                const target = lineAuthDir(args.channel_id);
+                // Cap. 7: todo rm sob a raiz passa pelo guard — a raiz (e os
+                // buckets inteiros) são irremovíveis por construção.
+                const target = assertIsDirectChildOfAuthRoot(lineAuthDir(args.channel_id));
                 mkdirSync(pathResolve(config.BAILEYS_AUTH_DIR, 'lines'), { recursive: true });
                 if (existsSync(target)) await rm(target, { recursive: true, force: true });
                 await rename(dir, target);
               } else {
-                await rm(dir, { recursive: true, force: true });
+                await rm(assertIsDirectChildOfAuthRoot(dir), { recursive: true, force: true });
               }
               resolvePromise({ matched, actual_line: actual });
             } catch (err) {
@@ -335,7 +322,10 @@ class LineSessionManager {
     } catch {
       /* já fechado */
     }
-    await rm(pairingAuthDir(channelId), { recursive: true, force: true });
+    await rm(assertIsDirectChildOfAuthRoot(pairingAuthDir(channelId)), {
+      recursive: true,
+      force: true,
+    });
     // Resolve a promise pendente (matched: false) — review #498 alto 4:
     // o abort deixava a promise da PairingSession pendente para sempre.
     entry.settle?.({ matched: false, actual_line: null });

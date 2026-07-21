@@ -1,10 +1,58 @@
-import { readFile, writeFile, unlink, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, unlink, mkdir, rename, stat } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { config } from '@/config/env.js';
 import { audit } from '@/governance/audit.js';
 
-const TOKEN_FILE = (): string => join(config.BAILEYS_AUTH_DIR, 'setup-token.txt');
+/**
+ * Auditoria P0 cap. 7 — o token vive em `control/`, FORA de qualquer alvo de
+ * recovery por-linha: o recovery da primária remove `primary/`, o de uma
+ * linha remove `lines/<id>` — nenhum deles pode levar o token junto (o
+ * layout legado guardava o token direto na raiz, e o recovery antigo a
+ * destruía inteira).
+ */
+const TOKEN_FILE = (): string => join(config.BAILEYS_AUTH_DIR, 'control', 'setup-token.txt');
+
+/** Caminho legado (pré-cap. 7) — token direto na raiz do auth dir. */
+const LEGACY_TOKEN_FILE = (): string => join(config.BAILEYS_AUTH_DIR, 'setup-token.txt');
+
+/**
+ * Migração transparente do token legado: se `<raiz>/setup-token.txt` existe
+ * e `control/setup-token.txt` NÃO, move (rename; fallback copy+unlink para
+ * EXDEV/filesystems distintos) ANTES da lógica normal — o token vigente
+ * continua válido através do upgrade, sem rotação. Se o novo já existe, o
+ * novo é o canônico e o legado fica para o `rotateToken` limpar. Best-effort
+ * na presença de corrida: o conteúdo migrado passa pelas MESMAS validações
+ * de formato do fluxo normal logo depois.
+ */
+async function migrateLegacyTokenFile(): Promise<void> {
+  const legacyPath = LEGACY_TOKEN_FILE();
+  const tokenPath = TOKEN_FILE();
+  const legacyExists = await stat(legacyPath).then(
+    (s) => s.isFile(),
+    () => false,
+  );
+  if (!legacyExists) return;
+  const targetExists = await stat(tokenPath).then(
+    () => true,
+    () => false,
+  );
+  if (targetExists) return;
+  await mkdir(dirname(tokenPath), { recursive: true });
+  try {
+    await rename(legacyPath, tokenPath);
+  } catch {
+    // Fallback copy+unlink (ex.: EXDEV). `wx` preserva a semântica atômica:
+    // se um concorrente venceu a corrida, o vencedor é o canônico.
+    const content = await readFile(legacyPath);
+    try {
+      await writeFile(tokenPath, content, { mode: 0o600, flag: 'wx' });
+    } catch (writeErr) {
+      if ((writeErr as NodeJS.ErrnoException).code !== 'EEXIST') throw writeErr;
+    }
+    await unlink(legacyPath).catch(() => undefined);
+  }
+}
 
 /**
  * Canonical bootstrap-token format: lowercase 32-char hex string (128 bits
@@ -48,7 +96,8 @@ async function createTokenFile(tokenPath: string): Promise<string> {
 /**
  * Returns the current bootstrap token. If `SETUP_TOKEN_OVERRIDE` is set, returns
  * it (env-bypass for dev/test). Otherwise reads from
- * `<BAILEYS_AUTH_DIR>/setup-token.txt`. If missing OR present-but-corrupted
+ * `<BAILEYS_AUTH_DIR>/control/setup-token.txt` (migrando o arquivo legado da
+ * raiz de forma transparente). If missing OR present-but-corrupted
  * (empty / not 32-hex), creates a new 32-hex-char token (mode 0o600) and emits
  * `setup_token_rotated` audit with reason `'cold_start'` (first run) or
  * `'unexpected_missing'` (file vanished/corrupted after the process already
@@ -60,6 +109,9 @@ async function createTokenFile(tokenPath: string): Promise<string> {
  */
 export async function ensureToken(): Promise<string> {
   if (config.SETUP_TOKEN_OVERRIDE) return config.SETUP_TOKEN_OVERRIDE;
+
+  // Cap. 7 — honra (e move) o token legado da raiz antes da lógica normal.
+  await migrateLegacyTokenFile();
 
   const tokenPath = TOKEN_FILE();
   let existing: string | null = null;
@@ -92,14 +144,21 @@ export async function ensureToken(): Promise<string> {
 
 /**
  * Deletes the existing token file and creates a fresh one. Called from the
- * recovery flow (§4.3). Concurrent `rotateToken` calls are serialised by the
- * outer `recoveryPromise` lock; this function does NOT need its own lock.
+ * PRIMARY recovery flow (§4.3). Concurrent `rotateToken` calls are serialised
+ * by the outer per-target recovery lock (key `'primary'` — só a recovery da
+ * primária rotaciona); this function does NOT need its own lock.
  *
  * Emits exactly one `setup_token_rotated` audit with reason `'recovery_or_pair'`.
  */
 export async function rotateToken(): Promise<string> {
   const tokenPath = TOKEN_FILE();
   await unlink(tokenPath).catch((err) => {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  });
+  // Cap. 7 — remove também o arquivo LEGADO na raiz (se sobrou): um token
+  // revogado não pode continuar legível no caminho antigo que os runbooks
+  // pré-migração apontavam.
+  await unlink(LEGACY_TOKEN_FILE()).catch((err) => {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
   });
   const token = await createTokenFile(tokenPath);
