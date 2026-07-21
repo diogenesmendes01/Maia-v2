@@ -56,11 +56,16 @@ function baseRequest(fingerprint: string) {
   };
 }
 
+// Ids NAMESPACED (approval095-*): agents.id é PK GLOBAL — um id genérico
+// como 'agent-b' colide com seeds de outras suítes (tenant-isolation.spec).
+const OTHER_TENANT = 'approval095-tenant-b';
+const OTHER_AGENT = 'approval095-agent-b';
+
 d('approval store — DB real (migration 095)', () => {
   beforeAll(async () => {
     pool = new pg.Pool({ connectionString: process.env.TEST_DB_URL });
     await ensureTenantAgent('primary', 'primary');
-    await ensureTenantAgent('tenant-b', 'agent-b');
+    await ensureTenantAgent(OTHER_TENANT, OTHER_AGENT);
   });
 
   afterAll(async () => {
@@ -70,6 +75,8 @@ d('approval store — DB real (migration 095)', () => {
       ]);
       await pool.query(`DELETE FROM approval_requests WHERE id = ANY($1::uuid[])`, [createdIds]);
     }
+    await pool.query(`DELETE FROM agents WHERE id = $1`, [OTHER_AGENT]);
+    await pool.query(`DELETE FROM tenants WHERE id = $1`, [OTHER_TENANT]);
     await pool.end();
   });
 
@@ -159,7 +166,7 @@ d('approval store — DB real (migration 095)', () => {
     createdIds.push(request!.id);
 
     const fromOtherTenant = await runWithTenantContext(
-      { tenant_id: 'tenant-b', agent_id: 'agent-b' },
+      { tenant_id: OTHER_TENANT, agent_id: OTHER_AGENT },
       async () => {
         const byId = await approvalRequestsRepo.byId(request!.id);
         const byFp = await approvalRequestsRepo.findOpenByFingerprint(fp);
