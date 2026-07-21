@@ -49,6 +49,27 @@ describe('isPrivateAddress', () => {
   it.each(['8.8.8.8', '1.1.1.1', '2606:4700:4700::1111'])('%s é público', (ip) => {
     expect(isPrivateAddress(ip)).toBe(false);
   });
+  // Revisão adversarial: forma HEX do IPv4-mapped não era normalizada pelo
+  // node nem coberta pelo regex pontilhado — passava como pública.
+  it.each([
+    '::ffff:7f00:1', // 127.0.0.1
+    '::ffff:a9fe:a9fe', // 169.254.169.254 (metadata)
+    '::ffff:0a00:0001', // 10.0.0.1
+    '::ffff:c0a8:0001', // 192.168.0.1
+  ])('IPv4-mapped hex %s é privado', (ip) => {
+    expect(isPrivateAddress(ip)).toBe(true);
+  });
+});
+
+describe('assertSafeMcpUrlSyntax — IPv4-mapped hex (revisão adversarial)', () => {
+  it.each([
+    'https://[::ffff:7f00:1]/mcp',
+    'https://[::ffff:a9fe:a9fe]/latest/meta-data/',
+  ])('rejeita %s', (url) => {
+    expect(() => assertSafeMcpUrlSyntax(url, { allowLocalhostHttp: false })).toThrowError(
+      McpGuardError,
+    );
+  });
 });
 
 describe('assertSafeMcpUrlSyntax', () => {

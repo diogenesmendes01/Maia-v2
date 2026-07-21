@@ -59,9 +59,16 @@ export function isPrivateAddress(ip: string): boolean {
   if (family === 4) return isPrivateV4(ip);
   if (family === 6) {
     const lower = ip.toLowerCase();
-    // IPv4-mapped (::ffff:a.b.c.d) — julga pelo miolo v4.
-    const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(lower);
-    if (mapped && mapped[1]) return isPrivateV4(mapped[1]);
+    // IPv4-mapped (::ffff:...). O node NÃO normaliza a forma HEX
+    // (`::ffff:7f00:1`) para pontilhada, e `new URL()` preserva o hostname
+    // como veio — então checar só o formato pontilhado deixava
+    // `::ffff:7f00:1` (=127.0.0.1) e `::ffff:a9fe:a9fe` (=169.254.169.254
+    // metadata) passarem como "públicos". Extrai os 32 bits finais em
+    // QUALQUER forma textual e julga pelo miolo v4 (fail-closed).
+    const embedded = extractMappedV4(lower);
+    if (embedded) return isPrivateV4(embedded);
+    // ::ffff:0:0/96 sem miolo reconhecível ⇒ trata como privado (fail-closed).
+    if (lower.startsWith('::ffff:') || lower.startsWith('::ffff0:')) return true;
     if (lower === '::' || lower === '::1') return true;
     // fc00::/7 (ULA), fe80::/10 (link-local), ff00::/8 (multicast)
     if (/^f[cd]/.test(lower)) return true;
@@ -71,6 +78,23 @@ export function isPrivateAddress(ip: string): boolean {
   }
   // Não é um IP literal — o caller decide (hostname passa pela resolução).
   return false;
+}
+
+/**
+ * Extrai o endereço IPv4 embutido em um IPv6 IPv4-mapped, aceitando as duas
+ * formas textuais: pontilhada (`::ffff:1.2.3.4`) e hex (`::ffff:0102:0304`).
+ * Retorna 'a.b.c.d' ou null se não for mapped.
+ */
+function extractMappedV4(lower: string): string | null {
+  const dotted = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(lower);
+  if (dotted && dotted[1]) return dotted[1];
+  const hex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(lower);
+  if (hex && hex[1] && hex[2]) {
+    const hi = parseInt(hex[1], 16);
+    const lo = parseInt(hex[2], 16);
+    return `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+  }
+  return null;
 }
 
 function isPrivateV4(ip: string): boolean {

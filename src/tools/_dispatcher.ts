@@ -299,9 +299,22 @@ export async function dispatchTool(input: {
       natureza,
       categoria_id,
     });
-    // `deny` é INALCANÇÁVEL aqui: canAct (acima) delega a decisão de valor ao
-    // MESMO avaliador e já retornou forbidden para todo caso de negação. Este
-    // bloco só CLASSIFICA a confirmação (allow / single / dual).
+    // Fail-closed (revisão adversarial): NORMALMENTE o `deny` já foi barrado
+    // pelo loop de `canAct` acima (mesmo avaliador). MAS o loop roda por
+    // `required_actions` — uma tool com `required_actions: []` (hoje só as de
+    // leitura, mas nada impede uma futura tool mutável com `valor`) o pularia,
+    // e este bloco classificaria a confirmação deixando um `deny` escapar.
+    // Aqui o `deny` vira `forbidden` explícito — nunca executa.
+    if (fin.decision === 'deny') {
+      await audit({
+        acao: 'unauthorized_access_attempt',
+        pessoa_id: input.ctx.pessoa.id,
+        conversa_id: input.ctx.conversa.id,
+        mensagem_id: input.ctx.mensagem_id,
+        metadata: { tool: tool.name, reason: fin.reason_code, policy_version: fin.policy_version },
+      });
+      return { error: 'forbidden', details: { reason: fin.reason_code } };
+    }
     if (fin.decision === 'require_dual_approval') {
       approvalRequirement = 'dual';
       approvalReason = `valor acima do threshold de aprovação dupla`;
