@@ -1,4 +1,3 @@
-import { readFile } from 'node:fs/promises';
 import Anthropic from '@anthropic-ai/sdk';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
@@ -36,13 +35,19 @@ beneficiario_nome, beneficiario_documento (CPF/CNPJ apenas dígitos), beneficiar
 endToEndId (formato Banco Central E + 32 chars), banco_origem, banco_destino.
 Se algum campo não estiver legível, omita-o. Retorne APENAS o JSON.`;
 
-export async function parseImage(input: { path: string; kind: 'boleto' | 'receipt' }): Promise<
-  (BoletoFields & ReceiptFields) | null
-> {
-  const buf = await readFile(input.path);
-  const ext = input.path.split('.').pop()?.toLowerCase() ?? 'jpeg';
-  const mime = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg';
-  const data = buf.toString('base64');
+/**
+ * P0 audit chapter 4: takes the ALREADY-VALIDATED bytes + SNIFFED mime from
+ * `readValidatedMedia` (src/lib/media-guard.ts). This module no longer reads
+ * the filesystem, and the media type is never derived from a file extension.
+ */
+export async function parseImage(input: {
+  buf: Buffer;
+  mime: string;
+  kind: 'boleto' | 'receipt';
+}): Promise<(BoletoFields & ReceiptFields) | null> {
+  // media-guard's 'image' kind only yields the sniffed types below.
+  const mime = input.mime as 'image/jpeg' | 'image/png' | 'image/webp';
+  const data = input.buf.toString('base64');
 
   const prompt = input.kind === 'boleto' ? BOLETO_PROMPT : RECEIPT_PROMPT;
   const t0 = Date.now();

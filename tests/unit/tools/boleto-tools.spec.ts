@@ -23,6 +23,12 @@ vi.mock('../../../src/gateway/queue.js', () => ({
   enqueueAgent: vi.fn(),
   agentQueue: {},
 }));
+// P0 audit ch. 4: receipt_validate resolves an opaque attachment_id before
+// delegating to parse_receipt. Stub the resolver so no repo/ALS is needed.
+const resolveAttachmentByIdMock = vi.fn();
+vi.mock('../../../src/lib/attachment-resolver.js', () => ({
+  resolveAttachmentById: resolveAttachmentByIdMock,
+}));
 
 const ctx = {
   pessoa: { id: 'p1' },
@@ -125,7 +131,16 @@ describe('receipt_validate — reuses parse_receipt + FAIL-CLOSED (issue #416/#4
     expect(receiptValidateTool.audit_action).toBe('receipt_validated');
   });
 
-  it('delegates to parse_receipt and is valid for an authentic, complete receipt', async () => {
+  const ATT_ID = '55555555-6666-4777-8888-999999999999';
+
+  it('delegates to parse_receipt with the resolved attachment_id and is valid for an authentic, complete receipt', async () => {
+    resolveAttachmentByIdMock.mockResolvedValue({
+      message_id: ATT_ID,
+      path: '/media/t/2026-07/x.jpg',
+      mime: 'image/jpeg',
+      tipo: 'imagem',
+      caption: 'comprovante',
+    });
     const parseReceiptMod = await import('../../../src/tools/parse-receipt.js');
     const spy = vi
       .spyOn(parseReceiptMod.parseReceiptTool, 'handler')
@@ -138,11 +153,11 @@ describe('receipt_validate — reuses parse_receipt + FAIL-CLOSED (issue #416/#4
       } as never);
 
     const { receiptValidateTool } = await import('../../../src/tools/receipt-validate.js');
-    const out = await receiptValidateTool.handler(
-      { media_local_path: '/tmp/x.jpg', file_sha256: 'abc' } as never,
-      ctx,
-    );
-    expect(spy).toHaveBeenCalledWith({ media_local_path: '/tmp/x.jpg', file_sha256: 'abc' }, ctx);
+    const out = await receiptValidateTool.handler({ attachment_ref: ATT_ID } as never, ctx);
+    // The ref was validated against the CURRENT conversation, then delegated
+    // as an opaque attachment_id — no path/sha crosses the boundary.
+    expect(resolveAttachmentByIdMock).toHaveBeenCalledWith('c1', ATT_ID);
+    expect(spy).toHaveBeenCalledWith({ attachment_id: ATT_ID }, ctx);
     expect(out.identified_amount).toBe(150.5);
     expect(out.identified_date).toBe('2026-06-01');
     expect(out.authenticity).toBe('plausible');
@@ -152,15 +167,19 @@ describe('receipt_validate — reuses parse_receipt + FAIL-CLOSED (issue #416/#4
   });
 
   it('is FAIL-CLOSED: a parse with missing amount/recipient is invalid with reasons', async () => {
+    resolveAttachmentByIdMock.mockResolvedValue({
+      message_id: ATT_ID,
+      path: '/media/t/2026-07/z.jpg',
+      mime: 'image/jpeg',
+      tipo: 'imagem',
+      caption: null,
+    });
     const parseReceiptMod = await import('../../../src/tools/parse-receipt.js');
     const spy = vi
       .spyOn(parseReceiptMod.parseReceiptTool, 'handler')
       .mockResolvedValue({ tipo: 'pix', confianca: 0 } as never);
     const { receiptValidateTool } = await import('../../../src/tools/receipt-validate.js');
-    const out = await receiptValidateTool.handler(
-      { media_local_path: '/tmp/z.jpg', file_sha256: 'ghi' } as never,
-      ctx,
-    );
+    const out = await receiptValidateTool.handler({ attachment_ref: ATT_ID } as never, ctx);
     expect(out.valid).toBe(false);
     expect(out.reasons).toContain('missing_amount');
     expect(out.reasons).toContain('missing_recipient_identification');

@@ -236,7 +236,7 @@ export async function dispatchTool(input: {
     return { error: 'redis_unavailable_blocked' };
   }
 
-  const file_sha256 = pickToolField<'string'>(args, 'file_sha256', 'string');
+  const file_sha256 = pickToolField<'string'>(args, 'file_sha256', 'string') ?? pickToolField<'string'>(args, 'attachment_id', 'string');
   const idempotency_key = computeIdempotencyKey({
     pessoa_id: input.ctx.pessoa.id,
     entity_id,

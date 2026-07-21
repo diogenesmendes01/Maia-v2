@@ -1,4 +1,3 @@
-import { readFile } from 'node:fs/promises';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 
@@ -9,14 +8,28 @@ export type Transcription = {
   confianca: number;
 };
 
-export async function transcribeWhisper(localPath: string): Promise<Transcription> {
+/**
+ * P0 audit chapter 4: takes the ALREADY-VALIDATED bytes + SNIFFED mime from
+ * `readValidatedMedia` (src/lib/media-guard.ts). This module no longer reads
+ * the filesystem — callers resolve an attachment_id and pass the buffer.
+ */
+export async function transcribeWhisper(input: { buf: Buffer; mime: string }): Promise<Transcription> {
   if (!config.OPENAI_API_KEY) {
     throw new Error('OPENAI_API_KEY missing for Whisper');
   }
-  const buf = await readFile(localPath);
-  const blob = new Blob([buf]);
+  const ext =
+    input.mime === 'audio/mpeg'
+      ? 'mp3'
+      : input.mime === 'audio/mp4'
+        ? 'm4a'
+        : input.mime === 'audio/wav'
+          ? 'wav'
+          : 'ogg';
+  // Copy into a plain Uint8Array<ArrayBuffer> — Buffer's ArrayBufferLike
+  // backing store is not assignable to BlobPart under strict lib.dom typings.
+  const blob = new Blob([new Uint8Array(input.buf)], { type: input.mime });
   const form = new FormData();
-  form.append('file', blob, 'audio.ogg');
+  form.append('file', blob, `audio.${ext}`);
   form.append('model', config.WHISPER_MODEL);
   form.append('language', 'pt');
   form.append('response_format', 'verbose_json');

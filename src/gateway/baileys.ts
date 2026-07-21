@@ -9,8 +9,8 @@ import {
 } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import qrcodeTerminal from 'qrcode-terminal';
-import { mkdirSync, writeFileSync, existsSync } from 'node:fs';
-import { readFile, readdir, rename, rm } from 'node:fs/promises';
+import { mkdirSync, existsSync } from 'node:fs';
+import { readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { join, basename } from 'node:path';
 import { config } from '@/config/env.js';
 import {
@@ -21,7 +21,14 @@ import {
 import { logger } from '@/lib/logger.js';
 import { sha256 } from '@/lib/utils.js';
 import { mensagensRepo } from '@/db/repositories.js';
-import { runWithTenantContext } from '@/db/tenant-context.js';
+import { runWithTenantContext, getCurrentTenant } from '@/db/tenant-context.js';
+import {
+  MAX_IMAGE_BYTES,
+  MAX_AUDIO_BYTES,
+  MAX_DOCUMENT_BYTES,
+  sniffMime,
+  extensionForMime,
+} from '@/lib/media-guard.js';
 import { isDuplicate, markSeen } from './dedup.js';
 import {
   markRead,
@@ -1002,7 +1009,7 @@ async function handleIncoming(
     return;
   }
 
-  const { type, content, mediaPath, mediaMime, mediaSha256 } = await extractContent(msg);
+  const { type, content, mediaPath, mediaMime, mediaSha256, mediaRejected } = await extractContent(msg);
 
   const { row: stored, duplicate } = await mensagensRepo.createInbound({
     conversa_id: null,
@@ -1024,6 +1031,10 @@ async function handleIncoming(
       timestamp_ms: Number(msg.messageTimestamp ?? 0) * 1000,
       media_mime: mediaMime,
       media_sha256: mediaSha256,
+      // P0 audit ch. 4 — why the media was refused ('too_large_declared' |
+      // 'too_large' | 'bad_magic'), null when accepted/absent. The turn still
+      // processes; only the media fields are withheld.
+      media_rejected: mediaRejected,
       // [Issue #290] Channel resolved at the ingress. In single-tenant this is
       // the seeded default channel id (#411 catch-all); null only when the
       // resolver path didn't surface a channel_id (e.g., tests driving
@@ -1149,12 +1160,17 @@ async function extractContent(msg: proto.IWebMessageInfo): Promise<{
   mediaPath: string | null;
   mediaMime: string | null;
   mediaSha256: string | null;
+  /** P0 audit ch. 4 — non-null when media was refused (size/magic). The turn
+   * still processes (text/caption survives); the reason lands in metadata. */
+  mediaRejected: string | null;
 }> {
   const m = msg.message;
-  if (!m) return { type: 'sistema', content: null, mediaPath: null, mediaMime: null, mediaSha256: null };
+  if (!m) {
+    return { type: 'sistema', content: null, mediaPath: null, mediaMime: null, mediaSha256: null, mediaRejected: null };
+  }
 
   if (m.conversation) {
-    return { type: 'texto', content: m.conversation, mediaPath: null, mediaMime: null, mediaSha256: null };
+    return { type: 'texto', content: m.conversation, mediaPath: null, mediaMime: null, mediaSha256: null, mediaRejected: null };
   }
   if (m.extendedTextMessage?.text) {
     return {
@@ -1163,6 +1179,7 @@ async function extractContent(msg: proto.IWebMessageInfo): Promise<{
       mediaPath: null,
       mediaMime: null,
       mediaSha256: null,
+      mediaRejected: null,
     };
   }
   // Media branches: we save the buffer (when available)
@@ -1175,28 +1192,65 @@ async function extractContent(msg: proto.IWebMessageInfo): Promise<{
         ? 'documentMessage'
         : null;
   if (!mediaKind) {
-    return { type: 'sistema', content: null, mediaPath: null, mediaMime: null, mediaSha256: null };
+    return { type: 'sistema', content: null, mediaPath: null, mediaMime: null, mediaSha256: null, mediaRejected: null };
   }
 
-  const mime = (m as Record<string, { mimetype?: string; caption?: string }>)[mediaKind]?.mimetype ?? null;
-  const caption = (m as Record<string, { mimetype?: string; caption?: string }>)[mediaKind]?.caption ?? null;
+  type MediaEnvelope = {
+    mimetype?: string;
+    caption?: string;
+    fileLength?: number | { toString(): string } | null;
+  };
+  const envelope = (m as unknown as Record<string, MediaEnvelope | undefined>)[mediaKind];
+  const mime = envelope?.mimetype ?? null;
+  const caption = envelope?.caption ?? null;
   const type: WhatsAppInbound['type'] =
     mediaKind === 'audioMessage' ? 'audio' : mediaKind === 'imageMessage' ? 'imagem' : 'documento';
+
+  // P0 audit ch. 4 — per-kind byte caps, checked against the DECLARED
+  // fileLength BEFORE downloading (no unbounded in-memory download), and
+  // re-checked against the actual buffer afterwards.
+  const cap =
+    type === 'audio' ? MAX_AUDIO_BYTES : type === 'imagem' ? MAX_IMAGE_BYTES : MAX_DOCUMENT_BYTES;
+  const declaredRaw = envelope?.fileLength;
+  const declaredLen = declaredRaw == null ? null : Number(declaredRaw.toString());
+
   let mediaPath: string | null = null;
   let mediaSha256: string | null = null;
-  try {
-    const buf = await downloadMediaMessage(msg, 'buffer', {});
-    if (Buffer.isBuffer(buf)) {
-      const ext =
-        mime?.split('/')[1]?.split(';')[0] ?? (type === 'audio' ? 'ogg' : type === 'imagem' ? 'jpg' : 'bin');
-      const saved = mediaPathFor(buf, ext);
-      mediaPath = saved.path;
-      mediaSha256 = saved.sha;
+  let mediaRejected: string | null = null;
+  if (declaredLen !== null && Number.isFinite(declaredLen) && declaredLen > cap) {
+    mediaRejected = 'too_large_declared';
+    logger.warn({ declared: declaredLen, cap, kind: type }, 'baileys.media_rejected');
+  } else {
+    try {
+      const buf = await downloadMediaMessage(msg, 'buffer', {});
+      if (Buffer.isBuffer(buf)) {
+        const sniffed = sniffMime(buf);
+        if (buf.length > cap) {
+          mediaRejected = 'too_large';
+          logger.warn({ size: buf.length, cap, kind: type }, 'baileys.media_rejected');
+        } else if (
+          // Images/audio must sniff as such; documents accept any payload
+          // (extension falls back to 'bin' below). Fail-closed on mismatch.
+          (type === 'imagem' && !sniffed?.startsWith('image/')) ||
+          (type === 'audio' && !sniffed?.startsWith('audio/'))
+        ) {
+          mediaRejected = 'bad_magic';
+          logger.warn({ kind: type, sniffed: sniffed ?? null }, 'baileys.media_rejected');
+        } else {
+          // Extension comes from the SNIFFED magic — never from the declared
+          // mimetype/filename. Sanitized; unknown magic (documents) → 'bin'.
+          const rawExt = sniffed ? extensionForMime(sniffed) : null;
+          const ext = rawExt && /^[a-z0-9]{1,8}$/.test(rawExt) ? rawExt : 'bin';
+          const saved = await mediaPathFor(buf, ext);
+          mediaPath = saved.path;
+          mediaSha256 = saved.sha;
+        }
+      }
+    } catch (err) {
+      logger.warn({ err: (err as Error).message }, 'baileys.media_download_failed');
     }
-  } catch (err) {
-    logger.warn({ err: (err as Error).message }, 'baileys.media_download_failed');
   }
-  return { type, content: caption, mediaPath, mediaMime: mime, mediaSha256 };
+  return { type, content: caption, mediaPath, mediaMime: mime, mediaSha256, mediaRejected };
 }
 
 /**
@@ -1392,16 +1446,23 @@ export const _internal = {
   RECONNECT_MAX_ATTEMPTS,
 };
 
-// Helper to deterministically create per-message media filenames
-export function mediaPathFor(buf: Buffer, ext: string): { path: string; sha: string } {
+// Helper to deterministically create per-message media filenames.
+// P0 audit ch. 4: scoped PER TENANT — `<MEDIA_ROOT>/<urlencoded tenant>/<month>/<sha>.<ext>`.
+// The caller (extractContent ← handleIncoming) always runs inside
+// `runWithTenantContext`, so `getCurrentTenant()` is bound; without an ALS
+// context this THROWS (fail-closed — never writes into a shared bucket).
+// Async write (no event-loop-blocking writeFileSync on the ingress hot path).
+// Legacy rows whose midia_url points at the old un-tenanted `<MEDIA_ROOT>/<month>/`
+// dirs still resolve: media-guard containment is checked against MEDIA_ROOT.
+export async function mediaPathFor(buf: Buffer, ext: string): Promise<{ path: string; sha: string }> {
   // Defensive: ensure MEDIA_ROOT exists even when startBaileys() hasn't run
   // (module load no longer creates it). Idempotent.
   ensureMediaDirs();
   const sha = sha256(buf);
   const month = new Date().toISOString().slice(0, 7);
-  const dir = join(MEDIA_ROOT, month);
+  const dir = join(MEDIA_ROOT, encodeURIComponent(getCurrentTenant()), month);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   const path = join(dir, `${sha}.${ext}`);
-  if (!existsSync(path)) writeFileSync(path, buf);
+  if (!existsSync(path)) await writeFile(path, buf);
   return { path, sha };
 }

@@ -747,7 +747,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   },
   {
     "name": "conversation_attachment_lookup",
-    "description": "Lista os arquivos (imagens, PDFs, áudios, documentos) já enviados nesta conversa, lendo os metadados de mídia das mensagens. Não baixa nem rebaixa mídia do WhatsApp. Apenas leitura, escopo tenant/agente/conversa.",
+    "description": "Lista os arquivos (imagens, PDFs, áudios, documentos) já enviados nesta conversa, com o attachment_id de cada um — use esse id nas ferramentas parse_image/parse_receipt/parse_boleto/transcribe_audio. Não baixa nem rebaixa mídia do WhatsApp. Apenas leitura, escopo tenant/agente/conversa.",
     "side_effect": "read",
     "operation_type": "read",
     "sensitive": false,
@@ -1169,7 +1169,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   },
   {
     "name": "parse_boleto",
-    "description": "Extrai dados estruturados de uma imagem de boleto: linha digitável, valor, vencimento, beneficiário, banco emissor.",
+    "description": "Extrai dados estruturados de uma imagem de boleto: linha digitável, valor, vencimento, beneficiário, banco emissor. Recebe o attachment_id de um anexo desta conversa (obtenha via conversation_attachment_lookup).",
     "side_effect": "read",
     "operation_type": "parse_only",
     "sensitive": false,
@@ -1179,12 +1179,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     ],
     "inputs": [
       {
-        "name": "media_local_path",
-        "type": "string",
-        "optional": false
-      },
-      {
-        "name": "file_sha256",
+        "name": "attachment_id",
         "type": "string",
         "optional": false
       }
@@ -1192,7 +1187,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   },
   {
     "name": "parse_image",
-    "description": "Identifica o tipo da imagem (boleto vs comprovante PIX/TED) e extrai os campos. Use quando o usuário envia uma foto e você não tem certeza do tipo.",
+    "description": "Identifica o tipo da imagem (boleto vs comprovante PIX/TED) e extrai os campos. Use quando o usuário envia uma foto e você não tem certeza do tipo. Recebe o attachment_id de um anexo desta conversa (obtenha via conversation_attachment_lookup).",
     "side_effect": "read",
     "operation_type": "parse_only",
     "sensitive": false,
@@ -1202,12 +1197,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     ],
     "inputs": [
       {
-        "name": "media_local_path",
-        "type": "string",
-        "optional": false
-      },
-      {
-        "name": "file_sha256",
+        "name": "attachment_id",
         "type": "string",
         "optional": false
       }
@@ -1215,7 +1205,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   },
   {
     "name": "parse_receipt",
-    "description": "Extrai dados estruturados de uma imagem de comprovante (PIX, TED, DOC, etc.): tipo, valor, beneficiário, chave PIX, endToEndId.",
+    "description": "Extrai dados estruturados de uma imagem de comprovante (PIX, TED, DOC, etc.): tipo, valor, beneficiário, chave PIX, endToEndId. Recebe o attachment_id de um anexo desta conversa (obtenha via conversation_attachment_lookup).",
     "side_effect": "read",
     "operation_type": "parse_only",
     "sensitive": false,
@@ -1225,12 +1215,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     ],
     "inputs": [
       {
-        "name": "media_local_path",
-        "type": "string",
-        "optional": false
-      },
-      {
-        "name": "file_sha256",
+        "name": "attachment_id",
         "type": "string",
         "optional": false
       }
@@ -1542,16 +1527,6 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
       "read_balance"
     ],
     "inputs": [
-      {
-        "name": "media_local_path",
-        "type": "string",
-        "optional": true
-      },
-      {
-        "name": "file_sha256",
-        "type": "string",
-        "optional": true
-      },
       {
         "name": "conversation_id",
         "type": "string",
@@ -2223,7 +2198,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   },
   {
     "name": "transcribe_audio",
-    "description": "Transcreve um áudio (voice note) para texto em português.",
+    "description": "Transcreve um áudio (voice note) para texto em português. Recebe o attachment_id de um anexo desta conversa (obtenha via conversation_attachment_lookup).",
     "side_effect": "read",
     "operation_type": "parse_only",
     "sensitive": false,
@@ -2233,12 +2208,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
     ],
     "inputs": [
       {
-        "name": "media_local_path",
-        "type": "string",
-        "optional": false
-      },
-      {
-        "name": "file_sha256",
+        "name": "attachment_id",
         "type": "string",
         "optional": false
       }
