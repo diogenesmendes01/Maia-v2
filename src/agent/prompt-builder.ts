@@ -634,7 +634,11 @@ export async function buildPrompt(ctx: PromptContext): Promise<{ system: string;
   const profileBlock = Array.from(ctx.scope.byEntity.entries())
     .map(([eid, rp]) => {
       const ent = ents.find((e) => e.id === eid);
-      return `  - ${ent?.nome ?? eid}: profile=${rp.profile.id}, limite=R$ ${rp.effective_limits.valor_max}`;
+      const limite =
+        rp.effective_limits.valor_max === null
+          ? 'sem limite individual (teto global aplica)'
+          : `R$ ${rp.effective_limits.valor_max}`;
+      return `  - ${ent?.nome ?? eid}: profile=${rp.profile.id}, limite=${limite}`;
     })
     .join('\n');
 

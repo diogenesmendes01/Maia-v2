@@ -13,6 +13,11 @@ import { buildAudienceContext } from '@/identity/audience-context.js';
 import { allowedDataScopesForAudience } from '@/skills/usage-policy.js';
 import type { AudienceContext } from '@/identity/audience-context.js';
 import { checkPendingFirst } from '@/agent/pending-gate.js';
+import {
+  parseApprovalReply,
+  recordApprovalDecision,
+  formatDecisionOutcome,
+} from '@/governance/approval-requests.js';
 import { checkRateLimit, formatPoliteReply } from '@/gateway/rate-limit.js';
 import { resolveIdentity } from '@/identity/resolver.js';
 import { handleQuarantineFirstContact, handleOwnerIdentityReply } from '@/identity/quarantine.js';
@@ -608,6 +613,30 @@ async function runAgentForMensagemInner(
     return;
   }
 
+  // Fase 0 cap. 3 — respostas de aprovação ("aprova AP-xxxxxxxx") são
+  // governança DETERMINÍSTICA: o humano é identificado pela linha WhatsApp
+  // autenticada e a decisão vai direto ao store backend (migration 095). O
+  // LLM nunca vê nem intermedeia a decisão — prompt injection não alcança.
+  if (typeof inbound.conteudo === 'string') {
+    const approvalReply = parseApprovalReply(inbound.conteudo);
+    if (approvalReply) {
+      const outcome = await recordApprovalDecision({
+        refPrefix: approvalReply.refPrefix,
+        approver: pessoa,
+        decision: approvalReply.decision,
+      });
+      await sendOutbound(pessoa.id, c.id, formatDecisionOutcome(outcome), inbound.id, {
+        channel_id: c.channel_id,
+      }).catch((err) =>
+        logger.warn({ err: (err as Error).message }, 'agent.approval_reply_send_failed'),
+      );
+      await markAllProcessed(0);
+      await conversasRepo.touch(c.id);
+      await clearDebounceState(pessoa.telefone_whatsapp);
+      return;
+    }
+  }
+
   // B0: pre-LLM gate. If the user's reply resolves a pending question,
   // the gate (via resolveAndDispatch) has already executed the proposed
   // action and audited it; we just close the loop and skip the ReAct turn.
@@ -923,9 +952,14 @@ async function runAgentForMensagemInner(
       }
 
       // action_mode='escalate' without a hard block → still escalate (dual-approval path)
+      // Fase 0 cap. 3 — o texto NÃO promete notificação: este caminho apenas
+      // bloqueia o turno; o request de aprovação persistido (com notificação
+      // real aos aprovadores) é criado pelo dispatcher quando a tool é
+      // efetivamente proposta. Prometer "o responsável será notificado" aqui
+      // era mentira operacional (audit P0 cap. 3).
       if (packet.action_mode === 'escalate') {
         const escalateMsg =
-          'Esta ação requer aprovação adicional. O responsável será notificado.';
+          'Esta ação requer aprovação adicional antes de prosseguir.';
         await sendOutbound(pessoa.id, c.id, escalateMsg, inbound.id, {
           channel_id: c.channel_id,
         }).catch((err) =>

@@ -564,6 +564,77 @@ export const workflows = pgTable('workflows', {
   metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
 });
 
+// Fase 0 cap. 2 (migration 095) — evidência backend imutável de aprovação.
+// Fonte de verdade das aprovações humanas (4-eyes/confirmação): intent
+// imutável + hash canônico versionado, classe/contagem exigida, expiração e
+// máquina de estados com consumo one-time. O LLM nunca cria/assina/consome.
+export const approval_requests = pgTable(
+  'approval_requests',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    requester_pessoa_id: uuid('requester_pessoa_id').notNull(),
+    entidade_id: uuid('entidade_id'),
+    conversa_id: uuid('conversa_id'),
+    mensagem_id: uuid('mensagem_id'),
+    request_id: text('request_id'),
+    tool: text('tool').notNull(),
+    operation_type: text('operation_type').notNull(),
+    intent_payload: jsonb('intent_payload').notNull(),
+    intent_hash: text('intent_hash').notNull(),
+    intent_hash_version: integer('intent_hash_version').notNull().default(1),
+    approval_class: text('approval_class').notNull(),
+    required_approvals: integer('required_approvals').notNull(),
+    status: text('status').notNull().default('pending'),
+    fingerprint: text('fingerprint').notNull(),
+    expires_at: timestamp('expires_at', { withTimezone: true }).notNull(),
+    approved_at: timestamp('approved_at', { withTimezone: true }),
+    denied_at: timestamp('denied_at', { withTimezone: true }),
+    claimed_at: timestamp('claimed_at', { withTimezone: true }),
+    consumed_at: timestamp('consumed_at', { withTimezone: true }),
+    claim_token: text('claim_token'),
+    result_ref: text('result_ref'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    scope_status_idx: index('approval_requests_scope_status_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.status,
+      t.expires_at,
+    ),
+    // Partial unique (WHERE status aberto) vive na migration 095 — Drizzle não
+    // expressa o WHERE aqui; a DB enforce.
+  }),
+);
+
+export const approval_decisions = pgTable(
+  'approval_decisions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    request_id: uuid('request_id')
+      .notNull()
+      .references(() => approval_requests.id),
+    principal_pessoa_id: uuid('principal_pessoa_id').notNull(),
+    principal_tipo: text('principal_tipo').notNull(),
+    decision: text('decision').notNull(),
+    channel: text('channel').notNull().default('whatsapp'),
+    reason: text('reason'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    request_principal_uq: unique('approval_decisions_request_principal_uq').on(
+      t.request_id,
+      t.principal_pessoa_id,
+    ),
+    scope_idx: index('approval_decisions_scope_idx').on(t.tenant_id, t.agent_id, t.request_id),
+  }),
+);
+
 // Spec 18 — Scheduling: Series, Occurrences, Tasks, Outbox.
 // Lives in its own domain alongside `workflows` (which keeps dual_approval
 // and any other ad-hoc workflow types). Recurring scheduling never touches
@@ -2298,6 +2369,8 @@ export type SelfState = typeof self_state.$inferSelect;
 export type EntityState = typeof entity_states.$inferSelect;
 export type Workflow = typeof workflows.$inferSelect;
 export type WorkflowStep = typeof workflow_steps.$inferSelect;
+export type ApprovalRequest = typeof approval_requests.$inferSelect;
+export type ApprovalDecision = typeof approval_decisions.$inferSelect;
 export type PendingQuestion = typeof pending_questions.$inferSelect;
 export type IdempotencyKey = typeof idempotency_keys.$inferSelect;
 export type IdempotencyEffectOutboxRow = typeof idempotency_effect_outbox.$inferSelect;

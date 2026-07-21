@@ -407,6 +407,36 @@ const envSchema = z
         message: 'OWNER_TELEFONE_WHATSAPP must differ from WHATSAPP_NUMBER_MAIA',
       });
     }
+    // Fase 0 cap. 5 (auditoria P0) — MCP permanece OFF em produção até o
+    // enablement passar por issue própria + threat model + pentest (gate G4).
+    // Ligar a flag em produção é recusado no boot, fail-closed e explícito.
+    if (cfg.NODE_ENV === 'production' && cfg.FEATURE_MCP_TOOLS) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['FEATURE_MCP_TOOLS'],
+        message:
+          'FEATURE_MCP_TOOLS não pode ser habilitada em produção: o enablement do MCP exige ' +
+          'revisão de segurança dedicada (Fase 0 gate G4 — threat model + pentest) antes de sair do default OFF.',
+      });
+    }
+    // Fase 0 cap. 1 — coerência dos thresholds financeiros. Fora de ordem, a
+    // política vira contraditória: DUAL > DURO torna a aprovação dupla
+    // inalcançável (tudo acima do duro é deny), e SEM_CONFIRMACAO > DUAL
+    // permitiria operação relevante sem confirmação. Boot falha fechado.
+    if (
+      !(
+        cfg.VALOR_LIMITE_SEM_CONFIRMACAO <= cfg.VALOR_DUAL_APPROVAL &&
+        cfg.VALOR_DUAL_APPROVAL <= cfg.VALOR_LIMITE_DURO
+      )
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['VALOR_DUAL_APPROVAL'],
+        message:
+          `financial thresholds out of order: require VALOR_LIMITE_SEM_CONFIRMACAO (${cfg.VALOR_LIMITE_SEM_CONFIRMACAO}) ` +
+          `<= VALOR_DUAL_APPROVAL (${cfg.VALOR_DUAL_APPROVAL}) <= VALOR_LIMITE_DURO (${cfg.VALOR_LIMITE_DURO})`,
+      });
+    }
     // P10b (Codex review #102 — issue 2): fail-closed on missing HMAC secret.
     // P11: runtime trace is always-on (flag removed), so in production the
     // master secret MUST be set (KMS-backed) unconditionally. Test/dev can

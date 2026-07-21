@@ -34,6 +34,7 @@ const { canActMock } = vi.hoisted(() => ({ canActMock: vi.fn(() => ({ allowed: t
 
 vi.mock('@/db/repositories.js', () => ({
   idempotencyRepo: {
+    lookup: vi.fn(async () => null),
     tryReserve: vi.fn(async () => ({
       was_inserted: true,
       state: 'in_progress',
@@ -46,6 +47,14 @@ vi.mock('@/db/repositories.js', () => ({
   },
   idempotencyOutboxRepo: { markCompletedWithEffect: vi.fn(async () => true) },
   agentToolGrantsRepo: { findForCurrentAgent: vi.fn(async () => grantState.grant) },
+  // Fase 0 cap. 2/3 — repos do store de aprovação (não exercitados aqui: o
+  // constitutionalCheck está mockado para null e os valores ficam abaixo dos
+  // thresholds, então o dispatcher não entra no fluxo de approval).
+  approvalRequestsRepo: {
+    findOpenByFingerprint: vi.fn(async () => null),
+    create: vi.fn(async () => null),
+  },
+  approvalDecisionsRepo: { record: vi.fn(async () => null), byRequest: vi.fn(async () => []) },
 }));
 vi.mock('@/governance/audit.js', () => ({ audit: auditMock }));
 vi.mock('@/lib/redis.js', () => ({ isRedisConnected: vi.fn(() => true) }));

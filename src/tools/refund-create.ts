@@ -40,7 +40,8 @@ const inputSchema = z
     // Normalised PIX or bank data (see `bank_account_validate.normalized`).
     payment_data: z.record(z.string(), z.unknown()).optional(),
     reason: z.string().trim().min(1).max(500),
-    dual_approval_granted: z.boolean().optional(),
+    // Fase 0 cap. 3: sem `dual_approval_granted` — evidência humana só via
+    // store backend (approval_requests), nunca por args do LLM.
   })
   // A refund must carry evidence: at least one of a related payment/boleto or a
   // validated receipt reference. Prevents opening a refund with no traceability.

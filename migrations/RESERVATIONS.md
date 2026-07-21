@@ -198,3 +198,4 @@ NEW shared prefixes — pick `max(existing)+1`.
 092 | 092_inbound_unrouted.sql | staging cifrado de inbound nao-roteado para modo strict (spec roteamento v4)
 093 | 093_proposal_approvals_scope.sql | escopo tenant/agent/source em proposal_approvals + partial uniques (spec perfil-inbox v4)
 094 | 094_synthetic_probe.sql | sonda sintetica: teste real de interacao do agente automatizado — is_synthetic + synthetic_probe_runs/state + seed do recurso de sonda (spec 2026-07-17)
+095 | 095_approval_requests.sql | fase 0 cap.2: evidencia backend imutavel de aprovacao humana (approval_requests + approval_decisions, hash canonico, consumo one-time)

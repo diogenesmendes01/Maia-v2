@@ -225,11 +225,6 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
         "name": "reason",
         "type": "string",
         "optional": false
-      },
-      {
-        "name": "dual_approval_granted",
-        "type": "boolean",
-        "optional": true
       }
     ]
   },
@@ -606,11 +601,6 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
         "name": "reason",
         "type": "string",
         "optional": false
-      },
-      {
-        "name": "dual_approval_granted",
-        "type": "boolean",
-        "optional": true
       }
     ]
   },
@@ -1634,11 +1624,6 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
         "name": "reason",
         "type": "string",
         "optional": false
-      },
-      {
-        "name": "dual_approval_granted",
-        "type": "boolean",
-        "optional": true
       }
     ]
   },
@@ -2064,7 +2049,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   },
   {
     "name": "start_recurring_outreach",
-    "description": "Agenda uma série recorrente de mensagens para um terceiro (ex: pedir relatório mensal). Cada ciclo envia o template para o destinatário, espera resposta (ou expira em wait_response_hours), e se forward_template estiver setado, encaminha para uma segunda pessoa. Requer aprovação dupla (dual_approval_granted=true).",
+    "description": "Agenda uma série recorrente de mensagens para um terceiro (ex: pedir relatório mensal). Cada ciclo envia o template para o destinatário, espera resposta (ou expira em wait_response_hours), e se forward_template estiver setado, encaminha para uma segunda pessoa. Requer aprovação dupla registrada pelo backend (4-eyes fora do chat do modelo).",
     "side_effect": "communication",
     "operation_type": "create",
     "sensitive": false,
@@ -2126,11 +2111,6 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
       {
         "name": "entidade_id",
         "type": "string",
-        "optional": false
-      },
-      {
-        "name": "dual_approval_granted",
-        "type": "boolean",
         "optional": false
       }
     ]
