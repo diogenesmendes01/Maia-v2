@@ -5,7 +5,7 @@
  * validação de secret ref/slug, decisão auditada e a edição de grant
  * (setAgentPack) preservando tools/denies existentes.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { TRPCError } from '@trpc/server';
 import { mcpRouter } from '@/admin-ui/trpc/routers/mcp.js';
 
@@ -149,13 +149,23 @@ function makeCtx(
 }
 
 describe('mcp.registerServer', () => {
+  // Fase 0 cap. 5 — as mutations de cadastro/test/sync exigem a feature
+  // ligada (UI honesta: com flag off o worker de sync é no-op). Os testes de
+  // comportamento ligam a flag; os de contenção provam o bloqueio com ela off.
+  beforeEach(() => {
+    process.env.FEATURE_MCP_TOOLS = 'true';
+  });
+  afterEach(() => {
+    delete process.env.FEATURE_MCP_TOOLS;
+  });
+
   it('registers and audits (owner)', async () => {
     const { ctx, audit } = makeCtx('owner');
     const caller = mcpRouter.createCaller(ctx);
     const res = await caller.registerServer({
       name: 'erp',
       url: 'https://erp.example.com/mcp',
-      authSecretRef: 'MCP_SERVER_ERP_TOKEN',
+      authSecretRef: 'MCP_SECRET_ERP_TOKEN',
     });
     expect(res.id).toBe(SERVER_UUID);
     expect(audit[0]).toMatchObject({ action: 'mcp_server_registered' });
@@ -175,6 +185,40 @@ describe('mcp.registerServer', () => {
     await expect(
       caller.registerServer({ name: 'erp', url: 'https://x.com/mcp', authSecretRef: null }),
     ).rejects.toThrowError(/FORBIDDEN|not allowed/);
+  });
+
+  it('Fase 0 cap.5 — flag OFF bloqueia o cadastro (PRECONDITION_FAILED)', async () => {
+    delete process.env.FEATURE_MCP_TOOLS;
+    const { ctx } = makeCtx('owner');
+    const caller = mcpRouter.createCaller(ctx);
+    await expect(
+      caller.registerServer({ name: 'erp', url: 'https://x.com/mcp', authSecretRef: null }),
+    ).rejects.toThrowError(/desativado/);
+  });
+
+  it('Fase 0 cap.5 — env var fora do namespace MCP_SECRET_* é rejeitado', async () => {
+    const { ctx } = makeCtx('owner');
+    const caller = mcpRouter.createCaller(ctx);
+    for (const ref of ['ANTHROPIC_API_KEY', 'DATABASE_URL', 'NEXTAUTH_SECRET']) {
+      await expect(
+        caller.registerServer({ name: 'erp', url: 'https://x.com/mcp', authSecretRef: ref }),
+      ).rejects.toThrowError(/MCP_SECRET_/);
+    }
+  });
+
+  it('Fase 0 cap.5 — URL privada/metadata/http é rejeitada no cadastro', async () => {
+    const { ctx } = makeCtx('owner');
+    const caller = mcpRouter.createCaller(ctx);
+    for (const url of [
+      'https://169.254.169.254/latest/meta-data/',
+      'https://10.0.0.5/mcp',
+      'https://user:pass@example.com/mcp',
+      'https://example.com:6379/mcp',
+    ]) {
+      await expect(
+        caller.registerServer({ name: 'erp', url, authSecretRef: null }),
+      ).rejects.toThrowError();
+    }
   });
 
   it('rejects secret ref that is not an env-var name (Zod)', async () => {

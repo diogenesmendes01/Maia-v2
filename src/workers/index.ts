@@ -84,7 +84,12 @@ export const JOBS: Job[] = [
   { name: 'objective_execute', cron: '* * * * *', fn: runObjectiveExecuteWorker, phase: 2 },
   // Issue #478 — MCP: executa test/sync pedidos pelo console (ponte
   // Postgres-as-queue por flags; só o runtime tem rede para os servers).
-  { name: 'mcp_sync', cron: '* * * * *', fn: runMcpSyncWorker, phase: 2 },
+  // Fase 0 cap. 5: PHASE 1 de propósito (mesmo padrão do synthetic_probe
+  // abaixo) — startWorkers(1) ignora phase>1, então em phase 2 o worker
+  // NUNCA rodava e o console mostrava test/sync "pendentes" para sempre
+  // (UI desonesta). A FLAG é o gate real: com FEATURE_MCP_TOOLS off o
+  // worker é no-op na primeira linha (nenhuma rede, nenhum secret).
+  { name: 'mcp_sync', cron: '* * * * *', fn: runMcpSyncWorker, phase: 1 },
   { name: 'series_next_scheduler', cron: '*/10 * * * *', fn: runSeriesNextSchedulerWorker, phase: 1 },
   // Sonda sintética (spec 2026-07-17 §1.1). PHASE 1 de propósito: startWorkers(1)
   // ignora phase>1, então phase 2 NUNCA seria agendado (correção do review). É
