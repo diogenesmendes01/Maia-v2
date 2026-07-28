@@ -12,6 +12,7 @@ import {
   toStrictJsonSchema,
   recordStrictDowngrade,
   describeProviderPayload,
+  recordProviderPayload,
 } from '@/lib/tool-schema-provider.js';
 
 export type LLMMessage = {
@@ -97,7 +98,7 @@ class AnthropicProvider implements LLMProvider {
     // two hashes must match; logging both makes that verifiable instead of
     // assumed.
     if (params.tools && params.tools.length > 0) {
-      logger.debug(
+      recordProviderPayload(
         describeProviderPayload({
           provider: 'anthropic',
           model,
@@ -105,7 +106,6 @@ class AnthropicProvider implements LLMProvider {
           payload: params.tools,
           strictCount: 0,
         }),
-        'llm.tool_payload',
       );
     }
     const res = await this.getClient().messages.create(
@@ -318,7 +318,7 @@ class OpenRouterProvider implements LLMProvider {
     // filter does not identify this payload. Record both, plus the mode, so the
     // divergence is observable in production rather than inferred.
     if (params.tools && params.tools.length > 0 && oaiTools) {
-      logger.debug(
+      recordProviderPayload(
         describeProviderPayload({
           provider: 'openrouter',
           model,
@@ -328,7 +328,6 @@ class OpenRouterProvider implements LLMProvider {
             (t) => (t as { function?: { strict?: boolean } }).function?.strict === true,
           ).length,
         }),
-        'llm.tool_payload',
       );
     }
     const res = await this.getClient().chat.completions.create(

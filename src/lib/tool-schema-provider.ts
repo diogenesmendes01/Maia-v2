@@ -24,6 +24,7 @@
  *      permission, limit and approval gate.
  */
 import { incCounter } from '@/lib/metrics.js';
+import { logger } from '@/lib/logger.js';
 // Deterministic, key-order-independent hashing — the same primitives the
 // canonical converter uses, so the two hashes are directly comparable.
 // `schema-json.ts` imports `_registry.ts` for TYPES ONLY, so there is no
@@ -305,4 +306,33 @@ export function describeProviderPayload(params: {
     provider_payload_hash: schemaHash(params.payload),
     provider_payload_bytes: Buffer.byteLength(serialized, 'utf8'),
   };
+}
+
+/**
+ * Emit the payload digest so it is available WITHOUT re-deploying at
+ * `LOG_LEVEL=debug` (PR #530 review round 2).
+ *
+ * `debug` is dropped by the default `info` level, and nobody raises the log
+ * level BEFORE an incident — they raise it after, when the turn under
+ * investigation is already gone. Diagnostic data that only exists in a
+ * configuration nobody runs is not diagnostic data.
+ *
+ * Two retained surfaces:
+ *   - `logger.info('llm.tool_payload')` — carries the hash PAIR, which a metric
+ *     cannot without unbounded label cardinality. One small identity-only line
+ *     per LLM call that ships tools.
+ *   - `maia_tool_schema_provider_payload_total{provider,model,mode}` — bounded
+ *     labels, so the strict/canonical split is alertable without parsing logs.
+ *
+ * Not an `audit()` row: `callLLM` is reached from cognition workers and the
+ * synthetic probe, which have no pessoa/conversa context, and a per-call DB
+ * write in the hot path would be a real cost for diagnostic data.
+ */
+export function recordProviderPayload(digest: ProviderPayloadDigest): void {
+  incCounter('maia_tool_schema_provider_payload_total', {
+    provider: digest.provider,
+    model: digest.model,
+    mode: digest.mode,
+  });
+  logger.info(digest, 'llm.tool_payload');
 }

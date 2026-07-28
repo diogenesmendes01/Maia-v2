@@ -192,7 +192,11 @@ export async function toolMediatedMode(
       tools.map((t) => t.name),
       'skill_tool_mediated',
     );
-    logger.debug(
+    // `info`, not `debug` (PR #530 review round 2): the agent path persists its
+    // canonical digest in the `tool_visibility_resolved` audit row, but this
+    // path has no audit — at the default `LOG_LEVEL=info` a `debug` line would
+    // simply not exist when someone needs it.
+    logger.info(
       {
         skill_id: ctx.skill.id,
         tool_schema_canonical_hash: digest.set_hash,

@@ -6,11 +6,12 @@
  * capability matrix confirms support; everywhere else the canonical schema goes
  * out unchanged and Zod revalidation carries the weight.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   supportsStrictToolSchemas,
   toStrictJsonSchema,
   describeProviderPayload,
+  recordProviderPayload,
   STRICT_CAPABLE_MODEL_PREFIXES,
 } from '../../../src/lib/tool-schema-provider.js';
 import { toOpenAITools, type ToolSchema } from '../../../src/lib/claude.js';
@@ -453,5 +454,69 @@ describe('#530 P2 — provider payload identity', () => {
       'provider_payload_hash',
       'tools',
     ]);
+  });
+});
+
+/**
+ * PR #530 review round 2, [P2 partial] — the digest must survive the DEFAULT log
+ * level. `LOG_LEVEL` defaults to `info`, so a `logger.debug` line simply does
+ * not exist in production, and nobody raises the level before an incident.
+ *
+ * This spec runs with NO log-level override — it asserts against whatever the
+ * default config produces.
+ */
+describe('#530 P2 — the payload digest is retained at the DEFAULT log level', () => {
+  const goldenTool = toolInputToJsonSchema(REGISTRY.cancel_transaction!);
+  const canonicalSet = [
+    {
+      name: goldenTool.name,
+      description: goldenTool.description,
+      input_schema: goldenTool.input_schema,
+    },
+  ];
+
+  it('the default LOG_LEVEL is info, so debug lines are dropped', async () => {
+    const { config } = await import('../../../src/config/env.js');
+    const { logger } = await import('../../../src/lib/logger.js');
+    expect(config.LOG_LEVEL).toBe('info');
+    // The precise reason the round-1 placement was invisible in production.
+    expect(logger.isLevelEnabled('debug')).toBe(false);
+    expect(logger.isLevelEnabled('info')).toBe(true);
+  });
+
+  it('recordProviderPayload emits at a retained level AND as a bounded metric', async () => {
+    const { logger } = await import('../../../src/lib/logger.js');
+    const { renderPrometheus, _resetForTests } = await import('../../../src/lib/metrics.js');
+    _resetForTests();
+    const infoSpy = vi.spyOn(logger, 'info').mockImplementation(() => undefined);
+    const debugSpy = vi.spyOn(logger, 'debug').mockImplementation(() => undefined);
+    try {
+      const digest = describeProviderPayload({
+        provider: 'openrouter',
+        model: 'openai/gpt-4.1',
+        canonical: canonicalSet,
+        payload: [],
+        strictCount: 0,
+      });
+      recordProviderPayload(digest);
+
+      expect(debugSpy).not.toHaveBeenCalled();
+      expect(infoSpy).toHaveBeenCalledTimes(1);
+      expect(infoSpy.mock.calls[0]![0]).toMatchObject({
+        canonical_hash: digest.canonical_hash,
+        mode: 'canonical',
+      });
+      expect(infoSpy.mock.calls[0]![1]).toBe('llm.tool_payload');
+
+      const scraped = await renderPrometheus();
+      expect(scraped).toContain('maia_tool_schema_provider_payload_total');
+      expect(scraped).toContain('mode="canonical"');
+      // Bounded labels only — never a hash (unbounded cardinality).
+      expect(scraped).not.toContain(digest.canonical_hash);
+    } finally {
+      infoSpy.mockRestore();
+      debugSpy.mockRestore();
+      _resetForTests();
+    }
   });
 });
