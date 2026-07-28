@@ -252,24 +252,21 @@ ssh maia 'cd /opt/maia && npm run dlq -- list'
 
 ## 6. Restore de backup (drill ou recuperação real)
 
-**Drill** (sem afetar produção):
+> **Movido para [`backup-restore.md`](backup-restore.md)** (issue #520). O procedimento abaixo ficou incorreto em dois pontos que importam:
+>
+> - escolher o dump por `ls | tail` ignora se o artefato foi verificado, se está cifrado e se existe cópia off-site — `backup_runs` responde isso;
+> - restaurar e subir o app direto **ressuscita** dados excluídos depois do snapshot. A reconciliação de tombstones é obrigatória antes de liberar tráfego.
+
+Resumo rápido (detalhes e SQL de diagnóstico no runbook dedicado):
 
 ```bash
-ssh maia 'cd /opt/maia && npm run restore:test'
-# Pega o backup mais recente, restaura num DB efêmero, valida count(pessoas), drop.
-# Audit: 'restore_test_passed' ou 'restore_test_failed'.
+ssh maia 'cd /opt/maia && npm run backup'        # exit 0 ok · 2 DEGRADED · 1 failed
+ssh maia 'cd /opt/maia && npm run restore:test'  # drill em DB efêmero
 ```
 
-**Recuperação real** (DB original perdido/corrompido):
+Recuperação real: pare o app → escolha o artefato **por evidência** em `backup_runs` → verifique checksum e assinatura do manifesto → decifre → `pg_restore` → `npm run db:migrate` → **reconcilie tombstones** → reconcilie mídia/Redis/sessão Baileys → só então inicie.
 
-1. **Pare o app**: `sudo systemctl stop maia`.
-2. **Identifique o dump**: `ls -la /opt/maia/backups/maia-*.dump | tail`.
-3. **Recrie o DB**: `sudo -u postgres dropdb maia && sudo -u postgres createdb maia`.
-4. **Restore**: `sudo -u postgres pg_restore --no-owner -d maia /opt/maia/backups/maia-2026-XX-XX-XX-XX-XX.dump`.
-5. **Migrações em cima** (se mudou schema entre backup e agora): `npm run db:migrate`.
-6. **Inicie**: `sudo systemctl start maia`. Confira `/health/db`.
-
-**Janela de perda**: até 24h (backup é nightly). Pra perda menor: snapshots EBS / volume cloud = follow-up.
+**Janela de perda**: até 24h (backup é nightly). RPO menor exige PITR/WAL archiving — sub-escopo planejado, não prometido.
 
 ---
 
