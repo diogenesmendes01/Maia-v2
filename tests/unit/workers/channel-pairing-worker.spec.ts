@@ -23,6 +23,7 @@ const {
   startPairingMock,
   abortPairingMock,
   triggerRecoveryMock,
+  stopLineSessionMock,
   sealMock,
   qrPngMock,
 } = vi.hoisted(() => ({
@@ -41,6 +42,7 @@ const {
   startPairingMock: vi.fn(async () => ({ ok: true as const })),
   abortPairingMock: vi.fn(async () => undefined),
   triggerRecoveryMock: vi.fn(async () => undefined),
+  stopLineSessionMock: vi.fn(() => true),
   sealMock: vi.fn(() => ({ envelope: Buffer.from('SEALED'), key_id: 'k1' })),
   qrPngMock: vi.fn(async () => Buffer.from('PNGBYTES')),
 }));
@@ -63,6 +65,9 @@ vi.mock('../../../src/setup/line-pairing.js', () => ({
   abortChannelPairing: abortPairingMock,
 }));
 vi.mock('../../../src/setup/recovery.js', () => ({ triggerRecovery: triggerRecoveryMock }));
+vi.mock('../../../src/gateway/line-sessions.js', () => ({
+  stopLineSession: stopLineSessionMock,
+}));
 
 import {
   runChannelPairingWorker,
@@ -123,6 +128,8 @@ beforeEach(() => {
   repoMock.putPairingMaterial.mockResolvedValue(true);
   repoMock.transition.mockResolvedValue(true);
   startPairingMock.mockResolvedValue({ ok: true });
+  stopLineSessionMock.mockReturnValue(true);
+  triggerRecoveryMock.mockResolvedValue(undefined);
   sealMock.mockReturnValue({ envelope: Buffer.from('SEALED'), key_id: 'k1' });
   qrPngMock.mockResolvedValue(Buffer.from('PNGBYTES'));
   _internal.reset();
@@ -320,6 +327,42 @@ describe('abort e repair', () => {
     claimOnce(null);
     await runChannelPairingWorker();
     expect(repoMock.releaseStaleAborts).toHaveBeenCalled();
+  });
+
+  it('repair DERRUBA o socket ANTES de apagar o auth dir (review PR #528, P1)', async () => {
+    const order: string[] = [];
+    stopLineSessionMock.mockImplementation(() => {
+      order.push('stop');
+      return true;
+    });
+    triggerRecoveryMock.mockImplementation(async () => {
+      order.push('recovery');
+    });
+    claimOnce(commandRow({ command: 'repair', command_method: null }));
+    await runChannelPairingWorker();
+
+    // Ao contrário, o Baileys ainda vivo regrava credenciais em cima do dir
+    // recém-removido e a sessão zumbi coexiste com o pareamento novo.
+    expect(order).toEqual(['stop', 'recovery']);
+    expect(stopLineSessionMock).toHaveBeenCalledWith(CHANNEL_ID);
+  });
+
+  it('stop_line derruba a sessão da linha', async () => {
+    claimOnce(commandRow({ command: 'stop_line', command_method: null }));
+    await runChannelPairingWorker();
+    expect(stopLineSessionMock).toHaveBeenCalledWith(CHANNEL_ID);
+  });
+
+  it('stop_line que falha NÃO marca a linha como failed (ela está disabled)', async () => {
+    stopLineSessionMock.mockImplementation(() => {
+      throw new Error('boom');
+    });
+    claimOnce(commandRow({ command: 'stop_line', command_method: null }));
+    await runChannelPairingWorker();
+
+    // Marcar `failed` aqui apagaria a decisão do operador de desabilitar.
+    expect(repoMock.transition).not.toHaveBeenCalled();
+    expect(repoMock.clearCommand).toHaveBeenCalled();
   });
 
   it('repair delega ao recovery POR ALVO e devolve a linha para declared', async () => {

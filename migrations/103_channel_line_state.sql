@@ -98,8 +98,11 @@ CREATE TABLE IF NOT EXISTS channel_line_state (
     'failed',
     'disabled'
   )),
+  -- `stop_line` (review PR #528, P1): o console não tem o socket. Desabilitar
+  -- uma linha precisa DERRUBAR a sessão viva no runtime — cancelar timers,
+  -- encerrar o socket, remover o transporte — e não apenas desativar a row.
   CONSTRAINT channel_line_state_command_chk CHECK (
-    command IS NULL OR command IN ('start_pairing', 'abort_pairing', 'repair')
+    command IS NULL OR command IN ('start_pairing', 'abort_pairing', 'repair', 'stop_line')
   ),
   CONSTRAINT channel_line_state_method_chk CHECK (
     command_method IS NULL OR command_method IN ('qr', 'code')

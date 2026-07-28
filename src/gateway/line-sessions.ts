@@ -106,9 +106,16 @@ function auditLineTransition(
  */
 function persistLineState(
   channel: LineChannel,
+  session: LineSessionState,
   state: LineState,
   extra: { reason_code?: string | null; connected?: boolean } = {},
 ): void {
+  // Review PR #528 (P1) — guard de IDENTIDADE, o mesmo padrão do pareamento.
+  // Um `connection.update` atrasado do socket que acabou de ser encerrado
+  // gravava `connected` DEPOIS de o operador desabilitar a linha, e a tela
+  // voltava a dizer que ela estava no ar. Só escreve quem ainda é a sessão
+  // corrente deste canal e não foi parada.
+  if (session.stopped || sessions.get(channel.id) !== session) return;
   const now = new Date();
   void channelLineStateRepo
     .upsertTransition({
@@ -294,7 +301,7 @@ async function startLineSession(channel: LineChannel): Promise<void> {
         state: 'connected',
         is_primary: false,
       });
-      persistLineState(channel, 'connected', { connected: true });
+      persistLineState(channel, state, 'connected', { connected: true });
       return;
     }
     if (u.connection === 'close') {
@@ -316,11 +323,9 @@ async function startLineSession(channel: LineChannel): Promise<void> {
       // `closed` por loggedOut é PERDA DE POSSE (a linha precisa re-parear);
       // `closed` por desistir da reconexão é `failed` (retryable). Os dois
       // são estados distintos para o operador — a UI oferece CTAs diferentes.
-      persistLineState(
-        channel,
-        loggedOut ? 'logged_out' : 'recovering',
-        { reason_code: loggedOut ? 'whatsapp_logged_out' : 'transport_closed' },
-      );
+      persistLineState(channel, state, loggedOut ? 'logged_out' : 'recovering', {
+        reason_code: loggedOut ? 'whatsapp_logged_out' : 'transport_closed',
+      });
       // Cap. 7 — loggedOut persiste o encerramento da posse (canal inativo +
       // rm do auth SÓ desta linha) em vez de fechar apenas em memória.
       if (loggedOut) void handleLineLoggedOut(channel, reason);
@@ -332,7 +337,7 @@ async function startLineSession(channel: LineChannel): Promise<void> {
           'line_session.reconnect_giving_up',
         );
         manager.markState(channel.id, 'closed');
-        persistLineState(channel, 'failed', { reason_code: 'reconnect_exhausted' });
+        persistLineState(channel, state, 'failed', { reason_code: 'reconnect_exhausted' });
         return;
       }
       const delay = Math.min(
@@ -375,6 +380,44 @@ export async function startAdditionalLineSessions(): Promise<void> {
       );
     }
   }
+}
+
+/**
+ * Issue #518 / review PR #528 (P1) — encerra a sessão de UMA linha.
+ *
+ * `disable` e `requestRepair` mexiam só no banco: desativavam o registro e
+ * (no repair) apagavam o auth dir, mas o SOCKET continuava vivo. Uma linha
+ * "desabilitada" seguia registrada no transporte, os timers de reconexão
+ * continuavam disparando, `connection.update` atrasado regravava `connected`,
+ * e o Baileys podia recriar credenciais em cima do dir recém-apagado ou
+ * coexistir com a tentativa de pareamento nova.
+ *
+ * A ordem aqui é o contrato: marcar como parada (para os callbacks pararem de
+ * escrever) → cancelar o timer de reconexão → encerrar o socket → remover o
+ * transporte. Só DEPOIS o chamador desativa ou apaga o auth dir.
+ *
+ * Idempotente: parar uma linha que não tem sessão é um no-op.
+ */
+export function stopLineSession(channelId: string): boolean {
+  const state = sessions.get(channelId);
+  // `markState('closed')` remove o transporte no manager mesmo sem sessão
+  // local — a linha pode ter sido registrada por outro caminho.
+  getLineSessionManager().markState(channelId, 'closed');
+  if (!state) return false;
+  state.stopped = true;
+  if (state.reconnectTimer) {
+    clearTimeout(state.reconnectTimer);
+    state.reconnectTimer = null;
+  }
+  state.connected = false;
+  try {
+    state.sock?.end(undefined);
+  } catch {
+    /* já fechado */
+  }
+  sessions.delete(channelId);
+  logger.info({ channel_id: channelId }, 'line_session.stopped');
+  return true;
 }
 
 /**

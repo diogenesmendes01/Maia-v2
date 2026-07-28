@@ -687,6 +687,23 @@ d('channel_line_state — material cifrado e restart', () => {
     expect((await channelLineStateRepo.getStateForScope(scope))?.state).toBe('pairing');
   });
 
+  it('uma linha DESABILITADA não é ressuscitada por callback atrasado da sessão', async () => {
+    const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+    const scope = { tenant_id: T, agent_id: A, channel_id: channelId };
+    await channelLineStateRepo.markDisabled(scope, 'operator_disabled');
+
+    // `connection.update` atrasado do socket que ainda não morreu.
+    await channelLineStateRepo.upsertTransition({
+      channel_id: channelId,
+      tenant_id: T,
+      agent_id: A,
+      state: 'connected',
+      connected_at: new Date(),
+    });
+
+    expect((await channelLineStateRepo.getStateForScope(scope))?.state).toBe('disabled');
+  });
+
   it('claimNextCommand devolve o triplete + a linha, para o worker abrir o ALS certo', async () => {
     const { channelLineStateRepo } = await import('../../src/db/repositories.js');
     await channelLineStateRepo.requestCommand({

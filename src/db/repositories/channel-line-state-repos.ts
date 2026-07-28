@@ -37,7 +37,7 @@ export type LineState =
   | 'failed'
   | 'disabled';
 
-export type LineCommand = 'start_pairing' | 'abort_pairing' | 'repair';
+export type LineCommand = 'start_pairing' | 'abort_pairing' | 'repair' | 'stop_line';
 export type PairingMethod = 'qr' | 'code';
 
 /**
@@ -339,7 +339,12 @@ export const channelLineStateRepo = {
                     }
                   : {}),
               }
-            : { ...base, reason_code: 'operator_repair_requested' };
+            : args.command === 'repair'
+              ? { ...base, reason_code: 'operator_repair_requested' }
+              : // `stop_line`: só a ORDEM de derrubar o socket. O estado
+                // (`disabled`) já foi decidido por quem pediu — este comando
+                // não redefine estado nem reason code.
+                base;
 
       if (current === null) {
         const inserted = await tx
@@ -673,6 +678,11 @@ export const channelLineStateRepo = {
           last_transition_at: now,
           updated_at: now,
         },
+        // Review PR #528 (P1): uma linha DESABILITADA pelo operador não volta
+        // sozinha. Sem este guard, um `connection.update` atrasado do socket
+        // que ainda não morreu regravava `connected` por cima do `disabled` —
+        // a tela passava a mentir sobre uma linha que o operador desligou.
+        setWhere: sql`${channel_line_state.state} <> 'disabled'`,
       });
   },
 

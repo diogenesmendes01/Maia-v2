@@ -409,6 +409,24 @@ describe('auditoria — ator administrativo presente, segredo ausente', () => {
     ]);
   });
 
+  it('disable ENFILEIRA a parada do socket, não só desativa a row (review PR #528)', async () => {
+    const { ctx, commands, disabled } = makeCtx('owner');
+    await caller(ctx).disable({ agentId: 'agent-a', channelId: CHANNEL_ID, comment: REASON });
+
+    // Desativar a row para o ROTEAMENTO na hora; o SOCKET vive no runtime e
+    // só morre por comando. Sem isto a sessão seguia registrada no transporte,
+    // com timers de reconexão vivos.
+    expect(disabled).toEqual([CHANNEL_ID]);
+    const stop = commands.find((c) => c.command === 'stop_line');
+    expect(stop).toBeDefined();
+    expect(stop!.scope).toEqual({
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-a',
+      channel_id: CHANNEL_ID,
+    });
+    expect(stop!.actor_id).toBe('user-1');
+  });
+
   it('disable e requestRepair auditam com o ator e a linha', async () => {
     const { ctx, audits, disabled } = makeCtx('owner');
     await caller(ctx).disable({ agentId: 'agent-a', channelId: CHANNEL_ID, comment: REASON });

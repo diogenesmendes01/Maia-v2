@@ -226,6 +226,12 @@ async function executeRepair(row: {
   agent_id: string;
   external_id: string;
 }): Promise<void> {
+  // Review PR #528 (P1) — a ORDEM importa: derrubar o socket ANTES de apagar
+  // o auth dir. Ao contrário, o Baileys ainda vivo pode regravar credenciais
+  // em cima do dir recém-removido e a sessão zumbi coexiste com o pareamento
+  // novo.
+  const { stopLineSession } = await import('@/gateway/line-sessions.js');
+  stopLineSession(row.channel_id);
   await triggerRecovery({
     target: 'line',
     channel: {
@@ -242,6 +248,21 @@ async function executeRepair(row: {
     release_owner: true,
   });
   incCounter('maia_channel_pairing_total', { outcome: 'repaired' });
+}
+
+/**
+ * Desabilitar uma linha (review PR #528, P1). O console já desativou a row —
+ * o roteamento para na hora, que é a propriedade de segurança — mas só o
+ * runtime tem o socket. Aqui a sessão é DERRUBADA de fato: timers cancelados,
+ * socket encerrado, transporte removido. O estado `disabled` já foi gravado
+ * pelo console e é protegido contra ressurreição por callback atrasado.
+ */
+async function executeStopLine(row: { channel_id: string }): Promise<void> {
+  const { stopLineSession } = await import('@/gateway/line-sessions.js');
+  const stopped = stopLineSession(row.channel_id);
+  incCounter('maia_channel_pairing_total', {
+    outcome: stopped ? 'line_stopped' : 'line_already_stopped',
+  });
 }
 
 /**
@@ -313,6 +334,8 @@ export async function runChannelPairingWorker(): Promise<void> {
             agent_id: row.agent_id,
             external_id: row.external_id,
           });
+        } else if (row.command === 'stop_line') {
+          await executeStopLine({ channel_id: row.channel_id });
         }
       } catch (err) {
         // Fail-isolated por comando: um canal problemático não trava a fila.
@@ -320,15 +343,19 @@ export async function runChannelPairingWorker(): Promise<void> {
           { channel_id: row.channel_id, command: row.command, err: (err as Error).message },
           'channel_pairing.command_failed',
         );
-        await channelLineStateRepo
-          .transition({
-            channel_id: row.channel_id,
-            state: 'failed',
-            reason_code: 'command_execution_failed',
-            expected_command_id: row.command_id,
-            release_owner: true,
-          })
-          .catch(() => undefined);
+        // `stop_line` não define estado: a linha já está `disabled` por
+        // decisão do operador, e marcá-la `failed` aqui apagaria essa decisão.
+        if (row.command !== 'stop_line') {
+          await channelLineStateRepo
+            .transition({
+              channel_id: row.channel_id,
+              state: 'failed',
+              reason_code: 'command_execution_failed',
+              expected_command_id: row.command_id,
+              release_owner: true,
+            })
+            .catch(() => undefined);
+        }
       } finally {
         // CAS: só limpa SE o comando ainda for este e a posse ainda for nossa.
         // O `finally` incondicional anterior apagava um comando NOVO que o

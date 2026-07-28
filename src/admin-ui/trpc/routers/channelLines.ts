@@ -341,6 +341,20 @@ export const channelLinesRouter = router({
       }
       await ctx.repos.channelLineStateRepo.markDisabled(scope, 'operator_disabled');
 
+      // Review PR #528 (P1) — desativar a row para o ROTEAMENTO na hora (a
+      // propriedade de segurança), mas o SOCKET vive no runtime. Sem este
+      // comando a sessão continuava registrada no transporte, os timers de
+      // reconexão seguiam disparando e um `connection.update` atrasado
+      // regravava `connected` por cima do `disabled`.
+      await ctx.repos.channelLineStateRepo.requestCommand({
+        scope,
+        command: 'stop_line',
+        command_id: randomUUID(),
+        actor_id: ctx.userId,
+        actor_role: ctx.userRole,
+        correlation_id: randomUUID(),
+      });
+
       await ctx.repos.adminAuditLogRepo.append({
         tenant_id: tenantId,
         actor_id: ctx.userId,
