@@ -56,6 +56,8 @@ import {
   absorbDebounceInputs,
   concludeTurn,
   failTurnRetryable,
+  isTerminalTurnStatus,
+  turnStateAuthoritative,
 } from '@/runtime/turns/index.js';
 import {
   runWithTenantContext,
@@ -478,20 +480,42 @@ async function runAgentForMensagemInner(
     logger.warn({ mensagem_id }, 'agent.message_not_found');
     return;
   }
-  if (inbound.processada_em) {
+  // Issue #503 — handle do turno DURÁVEL, resolvido ANTES do early-return
+  // porque em modo autoritativo é o ESTADO que decide se há trabalho.
+  // `ensureTurnHandle` reencontra o turno criado atomicamente no ingresso ou,
+  // para rows anteriores a esta issue (e durante deploy rolling), cria um em
+  // `received`. `null` quando a flag está OFF.
+  const turn = await ensureTurnHandle(inbound);
+
+  // EARLY-RETURN POR ESTADO (achado P1 rodada 1). Decidir por `processada_em`
+  // aqui matava o retry inteiro: um turno que virou `retryable` tinha o campo
+  // legado carimbado logo abaixo, o recovery reenfileirava a mensagem e a
+  // reentrada morria neste `if` antes de olhar o turno — os cenários A e B da
+  // #503 continuavam sendo perda definitiva, que é exatamente o que a máquina
+  // de estados existe para impedir.
+  //
+  // Autoritativo: só estado TERMINAL encerra. `outbound_pending` também para,
+  // por motivo oposto — a resposta já está comprometida e quem finaliza é o
+  // delivery worker (#506); reexecutar o ReAct duplicaria a resposta.
+  // Sem turno (falha de escrita em shadow) cai no critério legado — fail-closed
+  // contra reprocessamento.
+  if (turnStateAuthoritative() && turn) {
+    if (isTerminalTurnStatus(turn.status)) {
+      logger.debug({ mensagem_id, turn_id: turn.turn_id, status: turn.status }, 'agent.turn_terminal');
+      return;
+    }
+    if (turn.status === 'outbound_pending') {
+      logger.debug({ mensagem_id, turn_id: turn.turn_id }, 'agent.turn_outbound_pending_skip');
+      return;
+    }
+  } else if (inbound.processada_em) {
     logger.debug({ mensagem_id }, 'agent.already_processed');
     return;
   }
 
-  // Issue #503 — handle do turno DURÁVEL. `ensureTurnHandle` reencontra o turno
-  // criado atomicamente no ingresso ou, para rows anteriores a esta issue (e
-  // durante deploy rolling), cria um em `received`. `null` quando a flag está
-  // OFF — todas as chamadas abaixo viram no-op nesse caso.
-  //
   // ATENÇÃO (#504): `beginTurnExecution` registra que a execução COMEÇOU; NÃO é
   // exclusão mútua. Duas réplicas ainda podem entrar no mesmo turno até o claim
   // atômico com lease/fencing. Por isso um conflito aqui não aborta o turno.
-  const turn = await ensureTurnHandle(inbound);
   await beginTurnExecution(turn, { channel_id });
 
   if (!inbound.conversa_id) {
@@ -1272,14 +1296,28 @@ async function runAgentForMensagemInner(
     });
   }
 
-  // NOTA DE ROLLOUT (#503 §6): `markAllProcessed` continua rodando SEMPRE,
-  // inclusive quando o turno ficou `retryable`. Enquanto
-  // FEATURE_TURN_STATE_AUTHORITATIVE estiver OFF, `processada_em` é a decisão de
-  // negócio e o comportamento observável é IDÊNTICO ao anterior — a máquina de
-  // estados roda em shadow e a divergência é medida por
-  // `maia_turn_legacy_projection_mismatch_total`. Ao ligar a flag, o recovery
-  // passa a eleger por estado e é ele quem rearma o turno `retryable`.
-  await markAllProcessed(totalTokens);
+  // PROJEÇÃO LEGADA (#503 §6), agora condicionada ao ESTADO.
+  //
+  // SHADOW: `markAllProcessed` roda sempre — `processada_em` é a decisão de
+  // negócio e o comportamento observável é IDÊNTICO ao anterior; a divergência
+  // (turno `retryable` com o campo carimbado) é justamente o que
+  // `maia_turn_legacy_projection_mismatch_total` mede.
+  //
+  // AUTORITATIVO: carimbar `processada_em` num turno NÃO-terminal era o que
+  // matava o retry — o recovery reenfileirava e a reentrada morria no
+  // early-return legado (achado P1 rodada 1). Aqui só projetamos quando o turno
+  // chegou a terminal; nesse caso o repositório JÁ escreveu a projeção dentro
+  // da transação do CAS, e `markAllProcessed` apenas grava `tokens_usados` e
+  // cobre as irmãs do debounce.
+  const turnIsTerminal = turn ? isTerminalTurnStatus(turn.status) : false;
+  if (!turnStateAuthoritative() || turnIsTerminal) {
+    await markAllProcessed(totalTokens);
+  } else {
+    logger.info(
+      { turn_id: turn?.turn_id, to_status: turn?.status, mensagem_id: inbound.id },
+      'agent.legacy_projection_skipped_non_terminal',
+    );
+  }
   await conversasRepo.touch(c.id);
   // Issue #73 — persist the scope hash for the *next* turn's sentinel check.
   // Merge (jsonb ||) instead of overwrite so concurrent writers don't clobber

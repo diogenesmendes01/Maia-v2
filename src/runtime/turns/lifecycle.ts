@@ -226,6 +226,22 @@ export async function beginTurnExecution(
 ): Promise<void> {
   if (!handle || !turnStateMachineEnabled()) return;
   await guarded('begin_execution', async () => {
+    // Reentrada de um turno em RETRY. O recovery normalmente já fez
+    // `retryable -> queued` ao rearmar, mas um retry do próprio BullMQ chega
+    // aqui direto de `retryable`. Sem esta perna o turno executaria inteiro
+    // ainda marcado `retryable`, e a conclusão terminal falharia no CAS
+    // (`retryable` não alcança `completed`) — o turno voltaria à fila para
+    // sempre. `retryable -> queued` é aresta do contrato, então a cadeia
+    // completa é retryable -> queued -> claimed -> running.
+    if (handle.status === 'retryable') {
+      applyResult(
+        handle,
+        await agentTurnsRepo.markQueued({
+          turn_id: handle.turn_id,
+          expected_version: handle.state_version,
+        }),
+      );
+    }
     if (handle.status === 'received' || handle.status === 'queued') {
       applyResult(
         handle,

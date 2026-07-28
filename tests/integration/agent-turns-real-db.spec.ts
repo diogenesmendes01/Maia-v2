@@ -608,4 +608,93 @@ d('agent_turns — DB real (migrations 096/097)', () => {
     const still = await inOther(() => agentTurnsRepo.findById(turnB.id));
     expect(still?.status).toBe('received');
   });
+
+  // Achado P1 rodada 1: no modo autoritativo o turno virava `retryable`, mas
+  // `processada_em` era carimbado assim mesmo — o recovery reenfileirava e a
+  // reentrada morria no early-return legado. Os cenários A e B da #503
+  // continuavam como perda definitiva. Este teste percorre o CICLO INTEIRO e
+  // ancora as duas propriedades que o consertam: a projeção legada NÃO é
+  // escrita enquanto o turno não for terminal, e o turno volta a ser executável.
+  it('(11) ciclo completo falha → retryable → recovery → nova execução', async () => {
+    const { agentTurnsRepo } = await loadRepos();
+    const mensagem_id = await mkInbound('primary', 'primary');
+    let turn = await inPrimary(() =>
+      agentTurnsRepo.ensureTurnForMessage({
+        id: mensagem_id,
+        tenant_id: 'primary',
+        agent_id: 'primary',
+        conversa_id: null,
+        channel_id: null,
+      }),
+    );
+
+    // received -> queued -> claimed -> running (primeira execução)
+    for (const step of ['markQueued', 'markClaimed', 'markRunning'] as const) {
+      const r = await inPrimary(() =>
+        agentTurnsRepo[step]({ turn_id: turn.id, expected_version: Number(turn.state_version) }),
+      );
+      expect(r.ok, `${step} deveria vencer`).toBe(true);
+      if (r.ok) turn = r.turn;
+    }
+    expect(turn.status).toBe('running');
+    expect(turn.attempt_count).toBe(1);
+
+    // Falha do reasoner (cenário A): retryable com tentativa JÁ vencida, para
+    // que o recovery a eleja no mesmo tick.
+    const retry = await inPrimary(() =>
+      agentTurnsRepo.markRetryable({
+        turn_id: turn.id,
+        next_attempt_at: new Date(Date.now() - 1_000),
+        error_code: 'reasoner_failed',
+        error_summary: null,
+        expected_version: Number(turn.state_version),
+      }),
+    );
+    expect(retry.ok).toBe(true);
+    if (retry.ok) turn = retry.turn;
+
+    // A PROPRIEDADE CENTRAL: turno não-terminal não projeta no campo legado.
+    // Se `processada_em` fosse escrito aqui, o early-return de core.ts abortaria
+    // a reentrada e o retry nunca aconteceria.
+    const projected = await pool.query(`SELECT processada_em FROM mensagens WHERE id = $1`, [
+      mensagem_id,
+    ]);
+    expect(projected.rows[0].processada_em).toBeNull();
+
+    // O recovery ELEGE o turno, com o motivo certo.
+    const candidates = await inPrimary(() => agentTurnsRepo.findRecoverableTurns(0, 100));
+    const mine = candidates.find((c) => c.turn.id === turn.id);
+    expect(mine, 'o turno retryable deveria ser candidato de recovery').toBeDefined();
+    expect(mine!.reason).toBe('retry_due');
+
+    // Rearme + nova execução: retryable -> queued -> claimed -> running.
+    for (const step of ['markQueued', 'markClaimed', 'markRunning'] as const) {
+      const r = await inPrimary(() =>
+        agentTurnsRepo[step]({ turn_id: turn.id, expected_version: Number(turn.state_version) }),
+      );
+      expect(r.ok, `${step} na reentrada deveria vencer`).toBe(true);
+      if (r.ok) turn = r.turn;
+    }
+    expect(turn.status).toBe('running');
+    // Segunda tentativa contabilizada — é o que alimenta o teto de dead letter.
+    expect(turn.attempt_count).toBe(2);
+
+    // Agora conclui de verdade: terminal projeta `processada_em`.
+    const done = await inPrimary(() =>
+      agentTurnsRepo.completeTurnTx({
+        turn_id: turn.id,
+        outcome: 'reply_delivered',
+        expected_version: Number(turn.state_version),
+      }),
+    );
+    expect(done.ok).toBe(true);
+    const after = await pool.query(`SELECT processada_em FROM mensagens WHERE id = $1`, [
+      mensagem_id,
+    ]);
+    expect(after.rows[0].processada_em).not.toBeNull();
+
+    // E deixa de ser candidato de recovery.
+    const post = await inPrimary(() => agentTurnsRepo.findRecoverableTurns(0, 100));
+    expect(post.find((c) => c.turn.id === turn.id)).toBeUndefined();
+  });
 });
