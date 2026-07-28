@@ -37,7 +37,7 @@ import { probeDb } from '@/db/client.js';
 import { startWorkers } from '@/workers/index.js';
 import { lifecycle, StartupAbortedError } from '@/runtime/lifecycle/controller.js';
 import { checkSchemaVersion } from '@/runtime/lifecycle/schema-version.js';
-import { roleOwns } from '@/runtime/lifecycle/roles.js';
+import { roleOwns, roleRequires } from '@/runtime/lifecycle/roles.js';
 import {
   installSignalHandlers,
   registerShutdownSequence,
@@ -231,6 +231,35 @@ async function main() {
     await startAdditionalLineSessions().catch((err) =>
       logger.error({ err: (err as Error).message }, 'line_sessions.boot_failed'),
     );
+
+    // Review round 2 (P1 on `src/index.ts:189`): fixing `/readyz` was not
+    // enough — the PROCESS state was still lying. The lifecycle transition to
+    // `ready`, the `system_started` audit row and `/startupz` (which reads that
+    // state) all used to happen right after the socket was ARMED. So the audit
+    // trail claimed the system had started at a moment when `/readyz` was
+    // deliberately answering 503 and the instance could not send a single
+    // message. All three now wait on the same criterion the component uses:
+    // the first `connection.update = open`.
+    //
+    // Deliberately UNBOUNDED (interruptible by a stop signal). On expiry there
+    // would be no honest move: proceeding announces a startup that did not
+    // happen, and failing turns a cold start into a restart loop that makes
+    // pairing impossible. Waiting — visibly, via the 30s heartbeat — is the
+    // truthful state, and `/livez` plus `/setup` stay available throughout.
+    if (!roleRequires(role, 'whatsapp_session')) return;
+    if (lifecycle.getComponent('whatsapp_session').state === 'ready') return;
+    logger.warn(
+      { role },
+      'maia.awaiting_whatsapp_open — startup is NOT complete until the session opens; on a cold start, pair via /setup',
+    );
+    const opened = await lifecycle.waitForComponent(
+      'whatsapp_session',
+      (s) => s === 'ready',
+      { heartbeatMs: 30_000 },
+    );
+    // `aborted` = a stop signal arrived; `runStartupStep`'s post-await check
+    // turns that into a clean `StartupAbortedError` right after this returns.
+    if (opened === 'matched') logger.info('maia.whatsapp_session_open');
   });
 
   // ── 10. ready ──────────────────────────────────────────────────────────

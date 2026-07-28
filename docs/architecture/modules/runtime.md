@@ -90,7 +90,8 @@ Rules this module enforces:
 
 - readiness is impossible outside `ready`, and turns 503 on the first request after a drain starts — the state is checked before AND after the probes, so a drain that begins mid-probe still answers not-ready;
 - **no new work after `draining`**: BullMQ workers are paused in the first shutdown step, the processor re-parks a job handed to it during the race, cron ticks are refused, and Baileys reconnect timers are cancelled instead of awaited;
-- the STARTUP is cancellable too — a signal mid-boot aborts at the next phase boundary and the shutdown waits for the phase in flight;
+- the STARTUP is cancellable too — a signal mid-boot aborts at the next phase boundary and the shutdown waits for the phase in flight (and records `startup:<phase>` as undrained if that wait expires, which forces a non-zero exit);
+- the boot does not declare `ready` — nor audit `system_started`, nor let `/startupz` pass — until every component the ROLE requires is genuinely up, including the first WhatsApp `open` (`waitForComponent`);
 - a required component that is `down`/`unknown` keeps the instance out of rotation (fail-closed);
 - probes never write and never return raw driver text;
 - shutdown is idempotent — concurrent signals share one promise — and closes consumers before the pools they use;
@@ -135,6 +136,7 @@ Rules this module enforces:
 | `tests/unit/runtime/lifecycle-shutdown-order.spec.ts` | Shutdown step ORDER as a contract |
 | `tests/unit/runtime/lifecycle-startup-abort.spec.ts` | Signal mid-boot: cancellation + serialization |
 | `tests/unit/runtime/lifecycle-whatsapp-readiness.spec.ts` | Never-established vs reconnecting |
+| `tests/unit/runtime/lifecycle-wait-for-component.spec.ts` | `ready`/`system_started`/`/startupz` gated on the first `open` |
 | `tests/unit/runtime/lifecycle-background-tasks-wired.spec.ts` | The drain observes real fire-and-forget work |
 | `tests/unit/gateway/queue-drain-guard.spec.ts` | No job starts after draining |
 | `tests/unit/gateway/queue-await-ready.spec.ts` | `waitUntilReady` before claiming ready |

@@ -223,16 +223,31 @@ Regras que o código garante (`src/runtime/lifecycle/`):
 - **Nenhum probe devolve texto cru de driver** (`details` é removido na borda
   HTTP; a mensagem completa vai só para o log).
 
-> **Cold start / pareamento.** No papel `all`, `whatsapp_session` só vira
-> `ready` no primeiro `connection.update = open` real — não quando
-> `startBaileys()` retorna. Enquanto o número não estiver pareado, `/readyz`
-> responde **503** de propósito: a instância não consegue enviar nada. O
-> `/setup` continua acessível (é rota HTTP, não passa pelo `/readyz`), então o
-> fluxo de pareamento por QR/código funciona normalmente — acesse o host
-> diretamente, não pelo pool do load balancer. Depois do primeiro `open`, uma
-> queda de socket vira `degraded` e a instância **permanece** em rotação
-> (anti-flapping); um `loggedOut` vira `failed` e tira de rotação, porque aí a
-> sessão realmente acabou e exige novo pareamento.
+> **Cold start / pareamento.** Nos papéis que exigem a sessão (`all`,
+> `session-owner`), o primeiro `connection.update = open` real — e não o
+> retorno de `startBaileys()` — é o marco de "subiu". Até ele acontecer:
+>
+> - `whatsapp_session` fica `starting`;
+> - o lifecycle fica em `starting` (não vai para `ready`);
+> - **`system_started` NÃO é auditado** — a trilha não pode dizer que o sistema
+>   subiu num instante em que ele não atendia;
+> - `/startupz` e `/readyz` respondem **503**;
+> - `/livez` responde 200 (o processo está vivo) e o log emite
+>   `lifecycle.still_waiting_for_component` a cada 30s.
+>
+> O `/setup` continua acessível (é rota HTTP, fora dos gates), então o fluxo de
+> QR/código funciona normalmente — acesse o host diretamente, não pelo pool do
+> load balancer. **Não** aponte um startup probe com `failureThreshold` curto
+> para `/startupz` num host que ainda vai ser pareado: o probe mataria o pod
+> antes de alguém conseguir escanear o QR. Use `/livez` para liveness (é o que
+> o `compose.prod.yml` faz).
+>
+> A espera é interrompível: um SIGTERM durante o pareamento aborta o boot e
+> drena limpo (`maia.startup_aborted_by_shutdown`).
+>
+> Depois do primeiro `open`, uma queda de socket vira `degraded` e a instância
+> **permanece** em rotação (anti-flapping); um `loggedOut` vira `failed` e tira
+> de rotação, porque aí a sessão realmente acabou e exige novo pareamento.
 
 ```bash
 curl -s -o /dev/null -w '%{http_code}\n' http://localhost:3000/livez     # 200 sempre que o processo responde

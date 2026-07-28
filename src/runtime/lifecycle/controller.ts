@@ -155,6 +155,8 @@ class LifecycleController {
   #gaugesRegistered = false;
   /** The startup phase currently executing, if any. See `runStartupStep`. */
   #startupStep: { name: string; done: Promise<unknown> } | null = null;
+  /** Callbacks re-evaluated on every component change. See `waitForComponent`. */
+  #componentWaiters = new Set<() => void>();
 
   constructor() {
     this.#resetComponents();
@@ -246,6 +248,78 @@ class LifecycleController {
       { component, state, reason, role: this.#role, instance_id: this.instanceId },
       'lifecycle.component',
     );
+    this.#notifyComponentWaiters();
+  }
+
+  #notifyComponentWaiters(): void {
+    // Copy: a waiter deregisters itself from inside the callback.
+    for (const notify of [...this.#componentWaiters]) notify();
+  }
+
+  /**
+   * Block until `component` satisfies `predicate` — issue #512 review round 2
+   * (P1 on `src/index.ts:189`).
+   *
+   * Used by the boot to refuse to call itself `ready` while a component the
+   * ROLE requires has not actually come up. Always interruptible: a stop
+   * signal resolves it with `'aborted'` so a SIGTERM during a pairing wait
+   * still drains cleanly instead of sitting in a phase the shutdown then has
+   * to time out on.
+   *
+   * `timeoutMs` is optional and OFF by default: for a component like the
+   * WhatsApp session there is no honest fallback on expiry — proceeding would
+   * mean announcing a startup that did not happen, and failing would mean a
+   * restart loop that makes pairing impossible. Waiting (visibly, via
+   * `heartbeatMs`) is the truthful state.
+   */
+  async waitForComponent(
+    component: LifecycleComponent,
+    predicate: (state: ComponentState) => boolean,
+    opts?: { timeoutMs?: number; heartbeatMs?: number },
+  ): Promise<'matched' | 'aborted' | 'timeout'> {
+    if (predicate(this.getComponent(component).state)) return 'matched';
+    if (this.isShuttingDown()) return 'aborted';
+
+    const startedAt = Date.now();
+    return new Promise((resolve) => {
+      let settled = false;
+      let timeout: NodeJS.Timeout | undefined;
+      let heartbeat: NodeJS.Timeout | undefined;
+      const finish = (result: 'matched' | 'aborted' | 'timeout'): void => {
+        if (settled) return;
+        settled = true;
+        this.#componentWaiters.delete(check);
+        if (timeout) clearTimeout(timeout);
+        if (heartbeat) clearInterval(heartbeat);
+        resolve(result);
+      };
+      const check = (): void => {
+        if (this.isShuttingDown()) return finish('aborted');
+        if (predicate(this.getComponent(component).state)) finish('matched');
+      };
+      this.#componentWaiters.add(check);
+      if (opts?.timeoutMs && opts.timeoutMs > 0) {
+        timeout = setTimeout(() => finish('timeout'), opts.timeoutMs);
+        timeout.unref?.();
+      }
+      if (opts?.heartbeatMs && opts.heartbeatMs > 0) {
+        heartbeat = setInterval(() => {
+          logger.warn(
+            {
+              component,
+              state: this.getComponent(component).state,
+              waited_ms: Date.now() - startedAt,
+              role: this.#role,
+              instance_id: this.instanceId,
+            },
+            'lifecycle.still_waiting_for_component',
+          );
+        }, opts.heartbeatMs);
+        heartbeat.unref?.();
+      }
+      // Re-check after registering, in case the state changed in between.
+      check();
+    });
   }
 
   getComponent(component: LifecycleComponent): ComponentSnapshot {
@@ -403,6 +477,7 @@ class LifecycleController {
     this.#signalCount = 0;
     this.#backgroundTasks.clear();
     this.#startupStep = null;
+    this.#componentWaiters.clear();
     this.#role = 'all';
     this.#resetComponents();
   }
@@ -451,6 +526,10 @@ class LifecycleController {
       return this.#shutdownPromise;
     }
     this.#shutdownPromise = this.#runShutdown(opts);
+    // Release anything blocked in `waitForComponent` — e.g. a boot parked on
+    // "waiting for the WhatsApp session to open". It must yield NOW, not be
+    // timed out by the drain.
+    this.#notifyComponentWaiters();
     return this.#shutdownPromise;
   }
 
