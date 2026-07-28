@@ -1,13 +1,15 @@
-import { Queue, Worker, type Job } from 'bullmq';
+import { DelayedError, Queue, Worker, type Job } from 'bullmq';
 import { createHash } from 'node:crypto';
 import IORedis from 'ioredis';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
+import { incCounter } from '@/lib/metrics.js';
 import { dlqRepo } from '@/db/repositories.js';
 import { audit } from '@/governance/audit.js';
 import { sendAlert } from '@/lib/alerts.js';
 import { isRedisOomError, recordRedisOomDegraded } from '@/lib/redis.js';
 import { runWithSystemContext } from '@/db/tenant-context.js';
+import { lifecycle } from '@/runtime/lifecycle/controller.js';
 import type { AgentJob } from './types.js';
 
 const connection = new IORedis(config.REDIS_URL, {
@@ -17,13 +19,53 @@ const connection = new IORedis(config.REDIS_URL, {
 
 export const agentQueue = new Queue<AgentJob>('agent', { connection });
 
+/**
+ * How long a job deferred by the drain guard waits before becoming eligible
+ * again. Long enough that THIS instance (which is going away) does not pick it
+ * back up, short enough that the next instance answers the user quickly.
+ */
+const DRAIN_REQUEUE_DELAY_MS = 5_000;
+
+/**
+ * Refuse to START a job once the process stopped accepting work — issue #512
+ * review round 1 (P1 on `src/index.ts:260`).
+ *
+ * `pauseQueueWorkers()` stops the workers from FETCHING, but there is an
+ * unavoidable window: a fetch already in flight when the signal lands still
+ * hands us a job. Without this guard that job would begin a full turn —
+ * LLM call, tool writes, and an outbound send against a Baileys socket the
+ * shutdown sequence may already have closed.
+ *
+ * The job is moved back to DELAYED instead of failed: no attempt is consumed,
+ * no DLQ row is created, and the work stays recoverable for the next instance
+ * (issue #512: "Jobs excedendo o deadline ficam recuperáveis"). `DelayedError`
+ * is BullMQ's sanctioned way to tell the worker "I re-parked this job, do not
+ * treat the handler's exit as a failure".
+ */
+async function deferIfNotAcceptingWork(
+  job: Job<unknown>,
+  token: string | undefined,
+  queue: 'agent' | 'unrouted-replay',
+): Promise<void> {
+  if (lifecycle.isAcceptingWork()) return;
+  await job.moveToDelayed(Date.now() + DRAIN_REQUEUE_DELAY_MS, token);
+  incCounter('maia_queue_job_deferred_draining_total', { queue });
+  logger.warn(
+    { job_id: job.id, queue, lifecycle_state: lifecycle.state },
+    'queue.job_deferred_draining',
+  );
+  throw new DelayedError();
+}
+
 let worker: Worker<AgentJob> | null = null;
 
 export function startAgentWorker(processor: (job: Job<AgentJob>) => Promise<void>): Worker<AgentJob> {
   if (worker) return worker;
   worker = new Worker<AgentJob>(
     'agent',
-    async (job) => {
+    async (job, token) => {
+      // Drain guard FIRST — before any side effect, before the ALS context.
+      await deferIfNotAcceptingWork(job, token, 'agent');
       logger.debug({ job_id: job.id, mensagem_id: job.data.mensagem_id }, 'agent.job.start');
       // Issue #369: the worker callstack runs the channel resolver + cross-tenant
       // adoption (`src/agent/core.ts`) BEFORE the real tenant tuple is known, so
@@ -162,7 +204,8 @@ export function startUnroutedReplayWorker(
   if (unroutedWorker) return unroutedWorker;
   unroutedWorker = new Worker<UnroutedReplayJob>(
     'unrouted-replay',
-    async (job) => {
+    async (job, token) => {
+      await deferIfNotAcceptingWork(job, token, 'unrouted-replay');
       // Mesmo racional do agent worker (#369): a janela pré-resolução nunca
       // roda sem contexto — o replay resolve o tenant por dentro.
       await runWithSystemContext(() => processor(job));
@@ -216,6 +259,49 @@ export async function enqueueUnroutedReplay(args: {
       backoff: { type: 'exponential', delay: 30_000 },
     },
   );
+}
+
+/**
+ * Stop CONSUMING, immediately — issue #512 review round 1 (P1 on
+ * `src/index.ts:260`). This is the first atomic move of the shutdown, well
+ * before anything is closed.
+ *
+ * `pause(true)` = stop fetching new jobs NOW and do NOT wait for the active
+ * one; waiting is a separate, later step (`shutdownQueue()`). Splitting the
+ * two is the whole point: the old sequence closed BullMQ in the FOURTH step,
+ * after the WhatsApp sockets, so a job pulled meanwhile could reach an
+ * outbound send with the transport already gone.
+ *
+ * Idempotent and safe on a process that never started the workers.
+ */
+export async function pauseQueueWorkers(): Promise<void> {
+  await worker?.pause(true);
+  await unroutedWorker?.pause(true);
+  logger.info(
+    { agent_paused: worker?.isPaused() ?? null, unrouted_paused: unroutedWorker?.isPaused() ?? null },
+    'queue.workers_paused',
+  );
+}
+
+/**
+ * Wait until the BullMQ queues AND workers have a live Redis connection —
+ * issue #512 review round 1 (P1 on `src/index.ts:170`).
+ *
+ * Constructing a `Queue`/`Worker` does NOT mean it can consume: the
+ * connection is lazy. Marking the components `ready` right after construction
+ * let `/readyz` answer 200 while BullMQ was still connecting, and with
+ * `READINESS_BACKLOG_MAX=0` (the default) that flag is the ONLY evidence
+ * readiness has about the queue.
+ *
+ * `waitUntilReady()` rejects if the connection cannot be established, so the
+ * caller can fail the component closed.
+ */
+export async function awaitQueueReady(opts?: { includeWorkers?: boolean }): Promise<void> {
+  await agentQueue.waitUntilReady();
+  await unroutedQueue.waitUntilReady();
+  if (opts?.includeWorkers === false) return;
+  await worker?.waitUntilReady();
+  await unroutedWorker?.waitUntilReady();
 }
 
 /**

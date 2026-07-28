@@ -345,6 +345,25 @@ class LifecycleController {
   }
 
   /**
+   * May this process START a new unit of work (a BullMQ job, a cron tick, a
+   * new side effect)? — issue #512 review round 1, P1 on `src/index.ts:260`.
+   *
+   * Deliberately checks `#shutdownPromise` and NOT just the state: `shutdown()`
+   * sets the promise SYNCHRONOUSLY, before `#runShutdown` gets its first tick
+   * to transition to `draining`. A queue consumer that only looked at the
+   * state could therefore pull one more job out of that window and start
+   * producing external effects while the transport is already closing.
+   *
+   * `starting` counts as accepting: the BullMQ workers are constructed before
+   * the `ready` transition, and by then every mandatory dependency for the
+   * role has been verified.
+   */
+  isAcceptingWork(): boolean {
+    if (this.#shutdownPromise !== null) return false;
+    return this.#state === 'starting' || this.#state === 'ready';
+  }
+
+  /**
    * Idempotent graceful shutdown. Concurrent callers (SIGTERM + SIGINT, or a
    * supervisor that sends both) share ONE promise — the sequence runs exactly
    * once. The SECOND signal escalates: it is counted, audited by the caller

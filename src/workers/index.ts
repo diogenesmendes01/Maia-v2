@@ -277,12 +277,28 @@ export type StopWorkersResult = {
  *        final"; "informar job ativo no momento do shutdown").
  */
 export async function stopWorkers(deadlineMs = 15_000): Promise<StopWorkersResult> {
+  await haltWorkerScheduling();
+  return drainWorkers(deadlineMs);
+}
+
+/**
+ * Stop scheduling, WITHOUT waiting — issue #512 review round 1 (P1 on
+ * `src/index.ts:260`). This belongs to the first atomic shutdown step,
+ * alongside `pauseQueueWorkers()`: everything that could START new work is
+ * silenced before anything begins to close.
+ *
+ * Idempotent.
+ */
+export async function haltWorkerScheduling(): Promise<void> {
   acceptingTicks = false;
   // node-cron v4 `stop()` returns `void | Promise<void>`; await both shapes so
   // the scheduler is really quiesced before we start counting the drain.
   await Promise.all(tasks.map(async (t) => t.stop()));
   tasks.length = 0;
+}
 
+/** Await the cron runs already in flight. See `stopWorkers` for the contract. */
+export async function drainWorkers(deadlineMs = 15_000): Promise<StopWorkersResult> {
   const running = [...inflight.keys()];
   if (running.length === 0) return { drained: [], pending: [] };
   logger.info({ jobs: running, deadline_ms: deadlineMs }, 'worker.drain_started');
