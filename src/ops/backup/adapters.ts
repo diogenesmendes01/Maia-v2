@@ -9,7 +9,7 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createReadStream, readdirSync, readFileSync } from 'node:fs';
-import { mkdir, open, rename, rm } from 'node:fs/promises';
+import { link, mkdir, open, rm } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
 import { sql } from 'drizzle-orm';
@@ -200,8 +200,16 @@ export function createBackupPorts(): BackupPorts {
       }
     },
 
-    // fsync BEFORE rename: without it a power loss can leave a final-named
-    // file whose contents never reached the platter.
+    // Two guarantees, both load-bearing:
+    //
+    //  1. fsync BEFORE publishing — without it a power loss can leave a
+    //     final-named file whose contents never reached the platter.
+    //  2. NO-REPLACE publication (round-1 P1). `rename` silently replaces an
+    //     existing destination on POSIX, so a name collision would overwrite a
+    //     previous artifact whose manifest still points at it. `link` fails
+    //     with EEXIST instead, turning a collision into a loud `promote_failed`
+    //     rather than silent data loss. The temp name is then unlinked; both
+    //     names referenced the same inode, so the published file survives.
     promote: async (tempPath, finalPath) => {
       try {
         const fh = await open(tempPath, 'r');
@@ -210,12 +218,15 @@ export function createBackupPorts(): BackupPorts {
         } finally {
           await fh.close();
         }
-        await rename(tempPath, finalPath);
+        await link(tempPath, finalPath);
       } catch (err) {
         throw new TypedError('promote_failed', 'could not promote the temporary artifact', {
-          cause: (err as Error).name,
+          cause: (err as NodeJS.ErrnoException).code ?? (err as Error).name,
         });
       }
+      // Non-fatal: the artifact is already published under its final name. A
+      // leftover `.partial` is swept by the nightly local prune.
+      await rm(tempPath, { force: true }).catch(() => undefined);
     },
 
     remove: async (path) => {

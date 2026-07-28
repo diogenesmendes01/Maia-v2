@@ -46,20 +46,27 @@ interface Harness {
   logs: { event: string; detail: Record<string, unknown> }[];
   removed: string[];
   promoted: { from: string; to: string }[];
+  /**
+   * Files "on disk", path → the run that wrote them. Round-1 P1: the old fake
+   * only RECORDED promotions, so a second run publishing over the first looked
+   * identical to two independent successes. This models the real thing.
+   */
+  fs: Map<string, string>;
 }
 
-function harness(over: Partial<BackupPorts> = {}): Harness {
+function harness(over: Partial<BackupPorts> = {}, opts: { frozenClock?: boolean; id?: string } = {}): Harness {
   const runs: Record<string, unknown>[] = [];
   const manifests: { runId: string; signed: unknown }[] = [];
   const audits: { action: string; metadata: Record<string, unknown> }[] = [];
   const logs: { event: string; detail: Record<string, unknown> }[] = [];
   const removed: string[] = [];
   const promoted: { from: string; to: string }[] = [];
+  const fs = new Map<string, string>();
   let clock = new Date('2026-07-28T03:00:00.000Z').getTime();
 
   const ports: BackupPorts = {
-    now: () => new Date((clock += 1000)),
-    newId: () => '11111111-2222-4333-8444-555555555555',
+    now: () => new Date(opts.frozenClock ? clock : (clock += 1000)),
+    newId: () => opts.id ?? '11111111-2222-4333-8444-555555555555',
     resolvePath: (name) => `/backups/${name}`,
     ensureBackupDir: async () => undefined,
     dump: async () => undefined,
@@ -69,11 +76,18 @@ function harness(over: Partial<BackupPorts> = {}): Harness {
         ? { sha256: ENC_DIGEST, bytes: 2048 }
         : { sha256: DIGEST, bytes: 1024 },
     encrypt: async () => ({ key_id: 'k1' }),
+    // NO-REPLACE, like `link(2)`. A collision must be a loud failure, not a
+    // silent overwrite — that is the whole point of the finding.
     promote: async (from, to) => {
+      if (fs.has(to)) {
+        throw new TypedError('promote_failed', 'destination already exists', { cause: 'EEXIST' });
+      }
       promoted.push({ from, to });
+      fs.set(to, opts.id ?? 'run');
     },
     remove: async (p) => {
       removed.push(p);
+      fs.delete(p);
     },
     upload: async (): Promise<UploadOutcome> => ({
       locator: 'f'.repeat(32),
@@ -121,7 +135,7 @@ function harness(over: Partial<BackupPorts> = {}): Harness {
     },
     ...over,
   };
-  return { ports, runs, manifests, audits, logs, removed, promoted };
+  return { ports, runs, manifests, audits, logs, removed, promoted, fs };
 }
 
 function lastRun(h: Harness): Record<string, unknown> {
@@ -129,8 +143,64 @@ function lastRun(h: Harness): Record<string, unknown> {
 }
 
 describe('artifactName', () => {
-  it('is a deterministic timestamp with no host or tenant in it', () => {
-    expect(artifactName(new Date('2026-07-28T03:00:00.000Z'))).toBe('maia-2026-07-28T03-00-00.dump');
+  const AT = new Date('2026-07-28T03:00:00.000Z');
+  const ID_A = '11111111-2222-4333-8444-555555555555';
+  const ID_B = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+
+  it('is a sortable timestamp with no host or tenant in it', () => {
+    expect(artifactName(AT, ID_A)).toMatch(/^maia-2026-07-28T03-00-00-[0-9a-f]{12}\.dump$/);
+  });
+
+  it('is deterministic for the same instant AND run', () => {
+    expect(artifactName(AT, ID_A)).toBe(artifactName(AT, ID_A));
+  });
+
+  it('differs for two runs in the SAME second (the round-1 collision)', () => {
+    expect(artifactName(AT, ID_A)).not.toBe(artifactName(AT, ID_B));
+  });
+});
+
+describe('two runs starting in the same second (round-1 P1)', () => {
+  const AT = '2026-07-28T03:00:00.000Z';
+
+  it('publish under DIFFERENT names — neither overwrites the other', async () => {
+    const a = harness({}, { frozenClock: true, id: '11111111-2222-4333-8444-555555555555' });
+    const b = harness({}, { frozenClock: true, id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee' });
+    // Same wall clock for both runs.
+    a.ports.now = () => new Date(AT);
+    b.ports.now = () => new Date(AT);
+
+    const r1 = await runVerifiedBackup(a.ports, resolveBackupProfile(cfg()));
+    const r2 = await runVerifiedBackup(b.ports, resolveBackupProfile(cfg()));
+
+    expect(r1.artifact_ref).not.toBe(r2.artifact_ref);
+    expect(r1.outcome).not.toBe('failed');
+    expect(r2.outcome).not.toBe('failed');
+  });
+
+  it('a run whose destination somehow exists FAILS loudly instead of replacing it', async () => {
+    // Simulates the pre-fix world: the same name resolved twice. The no-replace
+    // promotion turns it into `promote_failed` rather than silent data loss —
+    // which would have left run 1's signed manifest describing run 2's bytes.
+    const h = harness({}, { frozenClock: true });
+    h.ports.now = () => new Date(AT);
+    const first = await runVerifiedBackup(h.ports, resolveBackupProfile(cfg()));
+    expect(first.outcome).not.toBe('failed');
+
+    const second = await runVerifiedBackup(h.ports, resolveBackupProfile(cfg()));
+    expect(second.outcome).toBe('failed');
+    expect(lastRun(h).error_code).toBe('promote_failed');
+    // And the first artifact is still the one on disk.
+    expect(h.fs.size).toBe(1);
+  });
+
+  it('emits no manifest for the run that failed to publish', async () => {
+    const h = harness({}, { frozenClock: true });
+    h.ports.now = () => new Date(AT);
+    await runVerifiedBackup(h.ports, resolveBackupProfile(cfg()));
+    const before = h.manifests.length;
+    await runVerifiedBackup(h.ports, resolveBackupProfile(cfg()));
+    expect(h.manifests.length).toBe(before);
   });
 });
 
@@ -161,7 +231,7 @@ describe('happy path — local only', () => {
     const h = harness();
     await runVerifiedBackup(h.ports, resolveBackupProfile(cfg()));
     const meta = h.audits.at(-1)!.metadata;
-    expect(meta.artifact_ref).toMatch(/^maia-2026-07-28T03-00-\d\d\.dump$/);
+    expect(meta.artifact_ref).toMatch(/^maia-2026-07-28T03-00-\d\d-[0-9a-f]{12}\.dump$/);
     expect(JSON.stringify(meta)).not.toContain('/backups/');
   });
 });

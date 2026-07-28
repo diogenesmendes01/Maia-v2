@@ -33,6 +33,7 @@ import {
   type BackupEvidence,
   type BackupOutcome,
   type BackupState,
+  type OutcomeVerdict,
 } from './state-machine.js';
 import {
   MANIFEST_VERSION,
@@ -135,9 +136,26 @@ export interface BackupRunResult {
   state: BackupState;
 }
 
-/** Timestamped artifact name. Deterministic shape, no host/tenant in it. */
-export function artifactName(at: Date): string {
-  return `maia-${at.toISOString().replace(/[:.]/g, '-').slice(0, 19)}.dump`;
+/**
+ * Artifact name: sortable timestamp + an opaque run discriminator.
+ *
+ * ROUND-1 REVIEW FINDING (P1). The name used to be the timestamp alone, at
+ * one-second resolution. The global lock prevents two SIMULTANEOUS runs but not
+ * a second run started right after the first, and two runs beginning in the
+ * same second resolved to the same final path — where `rename` silently
+ * replaces on POSIX. The failure is worse than losing a backup: the FIRST run's
+ * signed manifest would then describe bytes belonging to the SECOND, so its
+ * checksum either fails verification later or, if the two dumps happen to be
+ * identical, passes while the provenance is wrong.
+ *
+ * The discriminator is the first 12 hex characters of the run's own id — opaque
+ * (it identifies a run, not a tenant or a host) and already present in the
+ * manifest, so an operator can tie file to manifest without a lookup table.
+ */
+export function artifactName(at: Date, backupId: string): string {
+  const stamp = at.toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const discriminator = backupId.replace(/-/g, '').slice(0, 12);
+  return `maia-${stamp}-${discriminator}.dump`;
 }
 
 /**
@@ -196,7 +214,7 @@ export async function runVerifiedBackup(
   });
   await ports.audit('backup_run_started', { backup_id, correlation_id, profile: profile.name });
 
-  const finalName = artifactName(started);
+  const finalName = artifactName(started, backup_id);
   const finalPath = ports.resolvePath(finalName);
   // The `.partial` suffix is the contract every consumer (drill, retention,
   // readiness) filters on. A crash leaves a file nothing will ever restore.
@@ -324,7 +342,18 @@ export async function runVerifiedBackup(
   }
 
   // ── classify from evidence ──────────────────────────────────────────────
-  const verdict = classifyOutcome(evidence);
+  //
+  // A stage that ABORTED is always a failure, whatever the evidence gathered
+  // before it says. Round-1 P1 surfaced the gap: a `promote_failed` happens
+  // AFTER `locally_verified` is true, so the classifier — which only reasons
+  // about verification and off-site — happily returned `completed_degraded`
+  // for a run whose artifact was never published. `errorCode` is set only on a
+  // fatal stage abort (an upload failure is handled inside its own try and
+  // deliberately does NOT set it, because it feeds the classifier instead).
+  const verdict: OutcomeVerdict =
+    errorCode !== null
+      ? { outcome: 'failed', reason: errorCode as OutcomeVerdict['reason'] }
+      : classifyOutcome(evidence);
   const finished = ports.now();
   const finalState: BackupState =
     verdict.outcome === 'failed'
@@ -353,8 +382,12 @@ export async function runVerifiedBackup(
     error_code: errorCode,
   };
 
-  // ── manifest (only for a run that produced a real artifact) ─────────────
-  if (evidence.locally_verified && digest !== null && plaintextDigest !== null) {
+  // ── manifest (only for a run that PUBLISHED a real artifact) ───────────
+  //
+  // `errorCode === null` is load-bearing: a manifest for an artifact that was
+  // never promoted would describe bytes no consumer can find — or, worse, a
+  // path another run later occupies.
+  if (errorCode === null && evidence.locally_verified && digest !== null && plaintextDigest !== null) {
     try {
       const prov = await ports.provenance();
       const watermark = await ports.tombstoneWatermark();
