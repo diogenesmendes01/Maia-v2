@@ -59,7 +59,11 @@ const inputSchema = z
   })
   .refine((v) => Boolean(v.attachment_ref || v.attachment_hint || v.conversation_id), {
     message: 'provide an attachment_ref (attachment_id), attachment_hint or conversation_id',
-  });
+  })
+  // Issue #509 §6 — regra cross-field sem keyword JSON Schema; Zod é a autoridade.
+  .describe(
+    'Validação de comprovante. Informe AO MENOS UM: attachment_ref, attachment_hint ou conversation_id.',
+  );
 
 const outputSchema = z.object({
   valid: z.boolean(),

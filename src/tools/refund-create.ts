@@ -52,6 +52,12 @@ const inputSchema = z
         'refund_create requires evidence: related_payment_id, related_boleto_id, or receipt_reference',
       path: ['receipt_reference'],
     },
+  )
+  // Issue #509 §6 — regra cross-field sem keyword JSON Schema; Zod é a autoridade.
+  .describe(
+    'Abertura de reembolso. Além dos campos obrigatórios, informe AO MENOS UMA ' +
+      'evidência: related_payment_id, related_boleto_id ou receipt_reference. ' +
+      'Valor em BRL. A aprovação humana, quando exigida, é resolvida pelo backend.',
   );
 
 const outputSchema = z.object({

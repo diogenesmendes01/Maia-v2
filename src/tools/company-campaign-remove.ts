@@ -38,7 +38,12 @@ const inputSchema = z
   .refine((v) => Boolean(v.cnpj ?? v.company_id), {
     message: 'company_campaign_remove requires cnpj or company_id',
     path: ['company_id'],
-  });
+  })
+  // Issue #509 §6 — regra cross-field sem keyword JSON Schema; Zod é a autoridade.
+  .describe(
+    'Remoção de campanha. Além dos campos obrigatórios, informe cnpj OU company_id ' +
+      'para identificar a empresa alvo sem ambiguidade.',
+  );
 
 const outputSchema = z.object({
   executed: z.boolean(),

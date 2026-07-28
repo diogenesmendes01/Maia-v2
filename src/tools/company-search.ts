@@ -45,6 +45,10 @@ const inputSchema = z
         v.company_id || v.cnpj || v.legal_name || v.trade_name || v.partner_or_owner_name,
       ),
     { message: 'at least one search field is required' },
+  )
+  // Issue #509 §6 — regra cross-field sem keyword JSON Schema; Zod é a autoridade.
+  .describe(
+    'Busca de empresas. Informe AO MENOS UM campo: company_id, cnpj, legal_name, trade_name ou partner_or_owner_name.',
   );
 
 const companyShape = z.object({

@@ -3,9 +3,20 @@ import { contasRepo } from '@/db/repositories.js';
 import type { Tool } from './_registry.js';
 import { sumDecimal, toDecimal } from '@/lib/decimal.js';
 
+// Issue #509 §6 — descriptions shipped to the model via the canonical JSON
+// Schema. Both filters are optional: omitting them queries every conta visível
+// no escopo já resolvido pelo backend (o modelo não amplia escopo por argumento).
 const inputSchema = z.object({
-  entidade_id: z.string().uuid().optional(),
-  conta_id: z.string().uuid().optional(),
+  entidade_id: z
+    .string()
+    .uuid()
+    .optional()
+    .describe('UUID opaco da entidade. Omita para consultar todas as entidades já no escopo.'),
+  conta_id: z
+    .string()
+    .uuid()
+    .optional()
+    .describe('UUID opaco da conta. Omita para somar todas as contas do escopo. Saldos em BRL.'),
 });
 
 const outputSchema = z.object({
