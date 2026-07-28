@@ -474,10 +474,10 @@ describe('Issue #250 — vision cache is (tenant, agent)-scoped (v3)', () => {
     });
 
     it('sha256 with `:` is URI-encoded (segment boundary stays unambiguous)', async () => {
-      // file_sha256 is `z.string().min(1)` (parse-image.ts), so the schema
-      // does NOT enforce a hex shape — any non-empty string is accepted.
-      // Encode it too: defence in depth against a future caller passing a
-      // delimiter-bearing identifier here.
+      // Since P0 audit ch. 4 the callers key on the sha RECOMPUTED by
+      // media-guard (hex, so never delimiter-bearing in practice), but the
+      // cache API still takes an arbitrary string. Encode it too: defence in
+      // depth against a future caller passing a delimiter-bearing identifier.
       const { setCachedVision } = await import('@/tools/_vision-cache.js');
       await runWithTenantContext(A_CTX, async () => {
         await setCachedVision('parse_image', 'sha:with:colons', { kind: 'boleto' });

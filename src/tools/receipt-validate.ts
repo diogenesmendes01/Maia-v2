@@ -28,41 +28,38 @@
  * A positive verdict is a PRECONDITION the policy layer still gates, never an
  * authorization (this tool never approves a refund).
  *
- * Input sources (the issue allows several; the underlying parser needs a local
- * path + sha):
- *   - `media_local_path + file_sha256` directly, OR
- *   - `conversation_id + attachment_hint` / `attachment_ref` → resolved from the
- *     CURRENT conversation's messages via `mensagensRepo.recentInConversation`
- *     (ALS-scoped). The gateway stores the local path in the `midia_url` column
- *     and the sha in `metadata.media_sha256` (NOT a `file_sha256` column).
+ * Input sources (P0 audit chapter 4 — no filesystem path / declared sha ever
+ * crosses the LLM boundary):
+ *   - `attachment_ref` — an attachment_id (mensagens row id, e.g. from
+ *     `conversation_attachment_lookup`), validated against the CURRENT
+ *     conversation (fail-closed), OR
+ *   - `attachment_hint` / bare `conversation_id` → the most recent media
+ *     message of the CURRENT conversation is picked via
+ *     `mensagensRepo.recentInConversation` (ALS-scoped); a hint matches the
+ *     message caption or provider message id (whatsapp_id) — NEVER a path or
+ *     sha. The resolved id is then delegated to parse_receipt, which performs
+ *     the guarded read (media-guard) and recomputes the sha.
  */
 import { z } from 'zod';
 import type { Tool } from './_registry.js';
 import { parseReceiptTool } from './parse-receipt.js';
 import { mensagensRepo } from '@/db/repositories.js';
+import { resolveAttachmentById } from '@/lib/attachment-resolver.js';
 
 const inputSchema = z
   .object({
-    // Direct path — the underlying parser's native inputs.
-    media_local_path: z.string().max(1024).optional(),
-    file_sha256: z.string().max(128).optional(),
     // Indirect: resolve the attachment from the current conversation's messages.
     // `conversation_id` is accepted for API parity but the read is ALWAYS pinned
     // to the ALS conversation (invariant #1); a divergent id is ignored.
     conversation_id: z.string().max(120).optional(),
+    // An attachment_id candidate (mensagens row id). Non-uuid values are
+    // treated as a hint.
     attachment_ref: z.string().max(256).optional(),
     attachment_hint: z.string().max(256).optional(),
   })
-  .refine(
-    (v) =>
-      Boolean(
-        (v.media_local_path && v.file_sha256) ||
-          v.attachment_ref ||
-          v.attachment_hint ||
-          v.conversation_id,
-      ),
-    { message: 'provide media_local_path+file_sha256 or an attachment reference/hint' },
-  );
+  .refine((v) => Boolean(v.attachment_ref || v.attachment_hint || v.conversation_id), {
+    message: 'provide an attachment_ref (attachment_id), attachment_hint or conversation_id',
+  });
 
 const outputSchema = z.object({
   valid: z.boolean(),
@@ -82,33 +79,29 @@ const outputSchema = z.object({
 
 type Output = z.infer<typeof outputSchema>;
 
-/** Resolve a local media path + sha from the CURRENT conversation. Picks the
- * most recent media message whose stored fields are present; when a hint is
- * given, prefers a message whose caption/url/sha contains it. ALS-scoped read. */
-async function resolveAttachment(
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Resolve an ATTACHMENT ID (mensagens row id) from the CURRENT conversation.
+ * Picks the most recent media message; when a hint is given, prefers a message
+ * whose caption or provider message id (whatsapp_id) contains it — the hint is
+ * NEVER matched against a filesystem path or sha (those are no longer part of
+ * the tool surface). ALS-scoped read. */
+async function resolveAttachmentIdFromConversation(
   conversaId: string,
   hint: string | undefined,
-): Promise<{ path: string; sha: string } | null> {
+): Promise<string | null> {
   const rows = await mensagensRepo.recentInConversation(conversaId, 50);
   const needle = hint?.toLowerCase();
-  let fallback: { path: string; sha: string } | null = null;
+  let fallback: string | null = null;
   for (const m of rows) {
-    const path = m.midia_url;
-    const meta = (m.metadata ?? {}) as Record<string, unknown>;
-    const sha = typeof meta.media_sha256 === 'string' ? meta.media_sha256 : null;
-    if (!path || !sha) continue;
-    const candidate = { path, sha };
-    if (fallback === null) fallback = candidate; // newest-first → first usable is newest
+    if (!m.midia_url) continue;
+    if (fallback === null) fallback = m.id; // newest-first → first usable is newest
     if (!needle) continue;
-    const hay = [
-      m.conteudo ?? '',
-      path,
-      sha,
-      typeof meta.whatsapp_id === 'string' ? meta.whatsapp_id : '',
-    ]
+    const meta = (m.metadata ?? {}) as Record<string, unknown>;
+    const hay = [m.conteudo ?? '', typeof meta.whatsapp_id === 'string' ? meta.whatsapp_id : '']
       .join(' ')
       .toLowerCase();
-    if (hay.includes(needle)) return candidate;
+    if (hay.includes(needle)) return m.id;
   }
   return fallback;
 }
@@ -127,31 +120,34 @@ export const receiptValidateTool: Tool<typeof inputSchema, typeof outputSchema> 
   handler: async (args, ctx) => {
     const warnings: string[] = [];
 
-    // Resolve the (path, sha) — either directly or from the conversation.
-    let path = args.media_local_path;
-    let sha = args.file_sha256;
-    if (!path || !sha) {
-      const resolved = await resolveAttachment(
+    // Resolve the attachment_id — either directly (attachment_ref is a
+    // mensagens row id, validated against the CURRENT conversation) or by
+    // scanning the conversation's recent media messages.
+    let attachmentId: string | null = null;
+    if (args.attachment_ref && UUID_RE.test(args.attachment_ref)) {
+      const direct = await resolveAttachmentById(ctx.conversa.id, args.attachment_ref);
+      if (direct) attachmentId = direct.message_id;
+    }
+    if (!attachmentId) {
+      attachmentId = await resolveAttachmentIdFromConversation(
         ctx.conversa.id,
         args.attachment_hint ?? args.attachment_ref,
       );
-      if (!resolved) {
-        // No receipt to validate → fail-closed with an explicit reason.
-        return {
-          valid: false,
-          authenticity: 'unknown',
-          warnings: ['no_receipt_attachment_found_in_conversation'],
-          reasons: ['no_receipt_attachment_found_in_conversation'],
-          source_parser: 'parse_receipt',
-        };
-      }
-      path = resolved.path;
-      sha = resolved.sha;
+    }
+    if (!attachmentId) {
+      // No receipt to validate → fail-closed with an explicit reason.
+      return {
+        valid: false,
+        authenticity: 'unknown',
+        warnings: ['no_receipt_attachment_found_in_conversation'],
+        reasons: ['no_receipt_attachment_found_in_conversation'],
+        source_parser: 'parse_receipt',
+      };
     }
 
-    // Delegate to parse_receipt — shared vision cache (keyed by its tool name)
-    // + shared sanitization. ctx is forwarded though parse_receipt ignores it.
-    const parsed = await parseReceiptTool.handler({ media_local_path: path, file_sha256: sha }, ctx);
+    // Delegate to parse_receipt — shared vision cache (keyed by its tool name
+    // + the sha it RECOMPUTES from the guarded read) + shared sanitization.
+    const parsed = await parseReceiptTool.handler({ attachment_id: attachmentId }, ctx);
 
     const amount = typeof parsed.valor === 'number' ? parsed.valor : undefined;
     const date = parsed.data;

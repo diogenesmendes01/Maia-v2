@@ -10,7 +10,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import nodePath, { win32, posix } from 'node:path';
 
 vi.mock('../../src/config/env.js', () => ({
-  config: { BAILEYS_AUTH_DIR: '/tmp/maia-test-auth', MAIA_MULTI_LINE: false },
+  config: { BAILEYS_AUTH_DIR: '/tmp/maia-baileys-test-auth', MAIA_MULTI_LINE: false },
 }));
 vi.mock('../../src/lib/logger.js', () => ({
   logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -112,8 +112,8 @@ describe('auth dirs — UUID do canal, traversal rejeitado (review v3)', () => {
   it('deriva lines/<channel_id> e pairing/<channel_id> sob a raiz (agnóstico de plataforma)', () => {
     // path.resolve da PLATAFORMA corrente — no Windows o separador é '\'
     // (review #498 médio 5: a comparação por prefixo '/' rejeitava tudo lá).
-    expect(lineAuthDir(UUID)).toBe(nodePath.resolve('/tmp/maia-test-auth', 'lines', UUID));
-    expect(pairingAuthDir(UUID)).toBe(nodePath.resolve('/tmp/maia-test-auth', 'pairing', UUID));
+    expect(lineAuthDir(UUID)).toBe(nodePath.resolve('/tmp/maia-baileys-test-auth', 'lines', UUID));
+    expect(pairingAuthDir(UUID)).toBe(nodePath.resolve('/tmp/maia-baileys-test-auth', 'pairing', UUID));
   });
 
   it('rejeita channelId com traversal (../) — defesa em profundidade', () => {

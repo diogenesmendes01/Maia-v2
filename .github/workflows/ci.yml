@@ -126,6 +126,34 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  dependency-audit:
+    # Fase 0 cap. 8 (auditoria P0) — SCA BLOQUEANTE nos DOIS lockfiles. O
+    # audit do root não enxerga o projeto do admin-ui (lockfile próprio), e um
+    # critical no Next ficou invisível exatamente por isso. `npm audit` lê o
+    # lockfile direto (sem npm ci), então o job é rápido e sem serviços.
+    # Gate em --audit-level=high: moderate/low exigem relatório + exceção com
+    # owner/expiry (processo do cap. 8), não passam silenciosamente a high.
+    name: npm audit (prod deps, both lockfiles)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: 'npm'
+      - name: Pin npm to 11.5.2
+        # Mesmo pin do job validate (ci.yml acima): o audit resolve advisories
+        # contra o lockfile gerado com npm 11.5.2.
+        run: npm install -g npm@11.5.2
+      - name: Assert npm version
+        run: test "$(npm --version)" = "11.5.2"
+      - name: Audit root lockfile (prod deps)
+        run: npm audit --omit=dev --audit-level=high
+      - name: Audit admin-ui lockfile (prod deps)
+        working-directory: src/admin-ui
+        run: npm audit --omit=dev --audit-level=high
+
   integration:
     name: integration + e2e (node ${{ matrix.node }})
     runs-on: ubuntu-latest

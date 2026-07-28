@@ -16,6 +16,7 @@ import { resolveTenantId } from '../tenant-resolver.js';
 import { runWithTenantContext } from '../../../db/tenant-context.js';
 import { mcpPackId } from '../../../db/repositories/mcp-repos.js';
 import { BASE_AGENT_PACKS } from '../../../tools/base-agent-packs.js';
+import { assertSafeMcpUrlSyntax, MCP_SECRET_REF_RE } from '../../../lib/mcp-url-guard.js';
 
 const NameSchema = z
   .string()
@@ -23,15 +24,49 @@ const NameSchema = z
   .max(40)
   .regex(/^[a-z0-9][a-z0-9_-]*$/, 'slug minúsculo: letras/dígitos/_/-');
 
+/**
+ * Fase 0 cap. 5 — UI honesta com a feature OFF: com FEATURE_MCP_TOOLS
+ * desligada o worker de sync é no-op, então cadastrar/testar/sincronizar só
+ * criaria operações pendentes que nunca rodam (e uma URL+ref persistidos à
+ * espera do enablement). Bloqueia na mutation com mensagem explícita. A
+ * habilitação em produção exige issue própria + threat model + pentest
+ * (gate G4 da Fase 0) — e o boot de produção recusa a flag ligada.
+ */
+function assertMcpFeatureEnabled(): void {
+  const v = process.env.FEATURE_MCP_TOOLS;
+  if (v !== 'true' && v !== '1') {
+    throw new TRPCError({
+      code: 'PRECONDITION_FAILED',
+      message:
+        'MCP está desativado (FEATURE_MCP_TOOLS=false). Cadastro/test/sync ficam indisponíveis até o enablement passar pela revisão de segurança dedicada (Fase 0, gate G4).',
+    });
+  }
+}
+
 const RegisterInput = z.object({
   tenantId: z.string().optional(),
   name: NameSchema,
-  url: z.string().url().max(500),
-  // Nome da env var no runtime com o bearer (ex.: MCP_SERVER_ERP_TOKEN).
+  // Fase 0 cap. 5 (auditoria P0) — validação sintática anti-SSRF já no
+  // cadastro: https obrigatório, sem userinfo, sem porta de datastore, IP
+  // literal privado rejeitado. O runtime revalida (inclusive a RESOLUÇÃO
+  // DNS) a cada uso — este check é a primeira camada, não a única.
+  url: z
+    .string()
+    .url()
+    .max(500)
+    .superRefine((raw, ctx) => {
+      try {
+        assertSafeMcpUrlSyntax(raw, { allowLocalhostHttp: process.env.NODE_ENV !== 'production' });
+      } catch (err) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: (err as Error).message });
+      }
+    }),
+  // Fase 0 cap. 5 — o ref é um NAMESPACE dedicado (MCP_SECRET_*), nunca um
+  // env var arbitrário: um owner comprometido não consegue mais apontar para
+  // DATABASE_URL/chaves LLM e exfiltrar o valor como bearer.
   authSecretRef: z
     .string()
-    .regex(/^[A-Z][A-Z0-9_]*$/, 'nome de env var (MAIÚSCULAS_COM_UNDERSCORE)')
-    .max(100)
+    .regex(MCP_SECRET_REF_RE, 'use o namespace MCP_SECRET_* (ex.: MCP_SECRET_ERP_TOKEN)')
     .nullable(),
 });
 
@@ -71,6 +106,7 @@ export const mcpRouter = router({
 
   registerServer: protectedProcedure.input(RegisterInput).mutation(async ({ input, ctx }) => {
     ctx.assertRole('owner', 'founder');
+    assertMcpFeatureEnabled();
     const tenantId = resolveTenantId(ctx, input.tenantId);
     const existing = await ctx.repos.mcpServersRepo.findByName({
       tenant_id: tenantId,
@@ -123,6 +159,7 @@ export const mcpRouter = router({
 
   requestTest: protectedProcedure.input(ServerIdInput).mutation(async ({ input, ctx }) => {
     ctx.assertRole('owner', 'founder');
+    assertMcpFeatureEnabled();
     const tenantId = resolveTenantId(ctx, input.tenantId);
     const ok = await ctx.repos.mcpServersRepo.requestOp({
       tenant_id: tenantId,
@@ -135,6 +172,7 @@ export const mcpRouter = router({
 
   requestSync: protectedProcedure.input(ServerIdInput).mutation(async ({ input, ctx }) => {
     ctx.assertRole('owner', 'founder');
+    assertMcpFeatureEnabled();
     const tenantId = resolveTenantId(ctx, input.tenantId);
     const ok = await ctx.repos.mcpServersRepo.requestOp({
       tenant_id: tenantId,

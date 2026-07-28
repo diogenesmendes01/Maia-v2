@@ -29,6 +29,21 @@ export const AUDIT_ACTIONS = [
   'dual_approval_denied',
   'dual_approval_timeout',
   'dual_approval_executed',
+  // Fase 0 cap. 2/3 — store backend de evidência de aprovação (migration 095).
+  // Cobre tanto confirmação simples quanto 4-eyes; o ciclo completo é
+  // requested → decision_recorded* → granted|denied|expired → claimed →
+  // consumed | execution_failed. replay_blocked/payload_mismatch são os
+  // bloqueios de reuso/adulteração.
+  'approval_requested',
+  'approval_decision_recorded',
+  'approval_granted',
+  'approval_denied',
+  'approval_expired',
+  'approval_claimed',
+  'approval_consumed',
+  'approval_execution_failed',
+  'approval_payload_mismatch',
+  'approval_replay_blocked',
   'audit_mode_activated',
   'audit_mode_deactivated',
   'audit_mode_deactivated_auto',

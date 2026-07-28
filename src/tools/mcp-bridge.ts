@@ -20,6 +20,7 @@
  * fidelidade de schema; validação completa (ajv) é v2.
  */
 import type { ToolSchema } from '@/lib/claude.js';
+import type { Pessoa, Conversa } from '@/db/schema.js';
 import { featureFlags } from '@/config/feature-flags.js';
 import { getCurrentAgent, getCurrentTenant } from '@/db/tenant-context.js';
 import {
@@ -28,8 +29,22 @@ import {
   mcpPackId,
 } from '@/db/repositories.js';
 import { mcpCallTool } from '@/lib/mcp-client.js';
+import { constitutionalCheck } from '@/governance/rules.js';
 import { audit } from '@/governance/audit.js';
 import { logger } from '@/lib/logger.js';
+
+/**
+ * Fase 0 cap. 5 — contexto completo da chamada MCP. Estruturalmente
+ * compatível com o ToolContext do dispatcher (definido local para não criar
+ * ciclo de import: _dispatcher importa este módulo).
+ */
+export type McpToolContext = {
+  pessoa: Pessoa;
+  scope: { entidades: string[] };
+  conversa: Conversa;
+  mensagem_id: string;
+  request_id: string;
+};
 
 const MCP_PREFIX = 'mcp:';
 const MAX_VISIBLE_MCP_TOOLS = 10;
@@ -114,24 +129,31 @@ function validateArgsStructurally(
 
 function truncateResult(raw: unknown): { text: string; truncated: boolean; bytes: number } {
   const text = typeof raw === 'string' ? raw : JSON.stringify(raw ?? null);
-  const bytes = Buffer.byteLength(text, 'utf8');
-  if (bytes <= MAX_RESULT_BYTES) return { text, truncated: false, bytes };
+  const buf = Buffer.from(text, 'utf8');
+  if (buf.length <= MAX_RESULT_BYTES) return { text, truncated: false, bytes: buf.length };
+  // Fase 0 cap. 5 — corte BYTE-safe: antes media bytes mas cortava em code
+  // units UTF-16 (podia devolver ~3x o cap e partir surrogate pair). O
+  // replace remove o replacement char de um code point multi-byte partido.
+  const cut = buf.subarray(0, MAX_RESULT_BYTES).toString('utf8').replace(/�+$/u, '');
   return {
-    text: text.slice(0, MAX_RESULT_BYTES) + '\n…[resultado truncado pelo cap de 32KB]',
+    text: cut + '\n…[resultado truncado pelo cap de 32KB]',
     truncated: true,
-    bytes,
+    bytes: buf.length,
   };
 }
 
 /**
  * Executa uma tool MCP com TODAS as guardas revalidadas server-side:
  * flag → parse do nome → pack no grant → tool aprovada+read-only+server
- * ativo → validação estrutural → chamada com timeout → cap → audit.
+ * ativo → regras constitucionais (Fase 0 cap. 5) → validação estrutural →
+ * chamada com timeout real (abort) → cap byte-safe → audit com pessoa/
+ * conversa/mensagem.
  */
 export async function dispatchMcpTool(input: {
   tool: string;
   args: unknown;
   request_id: string;
+  ctx: McpToolContext;
 }): Promise<McpDispatchResult> {
   if (!featureFlags.isEnabled('MCP_TOOLS')) {
     return { error: 'feature_disabled', details: { tool: input.tool, feature_flag: 'MCP_TOOLS' } };
@@ -142,12 +164,20 @@ export async function dispatchMcpTool(input: {
   const tenant_id = getCurrentTenant();
   const agent_id = getCurrentAgent();
   const started = Date.now();
+  // Fase 0 cap. 5 — todo audit MCP carrega o contexto humano completo
+  // (pessoa/conversa/mensagem), como qualquer tool do REGISTRY.
+  const auditCtx = {
+    pessoa_id: input.ctx.pessoa.id,
+    conversa_id: input.ctx.conversa.id,
+    mensagem_id: input.ctx.mensagem_id,
+  };
 
   // (1) Grant do agente — mesmo contrato do guard `tool_not_granted`.
   const granted = await grantedMcpServerNames();
   if (!granted.has(parsed.serverName)) {
     await audit({
       acao: 'mcp_tool_call',
+      ...auditCtx,
       alvo_id: input.tool,
       metadata: { request_id: input.request_id, outcome: 'denied_not_granted' },
     });
@@ -165,6 +195,7 @@ export async function dispatchMcpTool(input: {
   if (!tool) {
     await audit({
       acao: 'mcp_tool_call',
+      ...auditCtx,
       alvo_id: input.tool,
       metadata: { request_id: input.request_id, outcome: 'denied_not_executable' },
     });
@@ -174,6 +205,30 @@ export async function dispatchMcpTool(input: {
         tool: input.tool,
         reason: 'não aprovada, suspensa, write (fase v1) ou server desativado',
       },
+    };
+  }
+
+  // (2b) Fase 0 cap. 5 — MCP não é atalho de governança (#478): as mesmas
+  // regras constitucionais do dispatcher aplicam (ex.: C-004 cross-entity).
+  const violation = constitutionalCheck({
+    intent: {
+      tool: input.tool,
+      args: (input.args ?? {}) as Record<string, unknown>,
+    },
+    pessoa: input.ctx.pessoa,
+    resolved: null,
+    scope: { entidades: input.ctx.scope.entidades },
+  });
+  if (violation) {
+    await audit({
+      acao: 'mcp_tool_call',
+      ...auditCtx,
+      alvo_id: input.tool,
+      metadata: { request_id: input.request_id, outcome: 'denied_constitutional' },
+    });
+    return {
+      error: violation.kind === 'forbidden' ? 'forbidden' : 'requires_dual_approval',
+      details: { tool: input.tool, reason: violation.reason },
     };
   }
 
@@ -198,6 +253,7 @@ export async function dispatchMcpTool(input: {
     const { text, truncated, bytes } = truncateResult(raw);
     await audit({
       acao: 'mcp_tool_call',
+      ...auditCtx,
       alvo_id: input.tool,
       metadata: {
         request_id: input.request_id,
@@ -213,6 +269,7 @@ export async function dispatchMcpTool(input: {
     const message = err instanceof Error ? err.message : String(err);
     await audit({
       acao: 'mcp_tool_call',
+      ...auditCtx,
       alvo_id: input.tool,
       metadata: {
         request_id: input.request_id,

@@ -9,14 +9,26 @@ import {
 } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import qrcodeTerminal from 'qrcode-terminal';
-import { mkdirSync, writeFileSync, existsSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdirSync, existsSync } from 'node:fs';
+import { readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
+import { join, basename } from 'node:path';
 import { config } from '@/config/env.js';
+import {
+  assertSafeAuthDir,
+  isReservedRootEntry,
+  resolvePrimaryAuthDir,
+} from '@/setup/auth-dir.js';
 import { logger } from '@/lib/logger.js';
 import { sha256 } from '@/lib/utils.js';
 import { mensagensRepo } from '@/db/repositories.js';
-import { runWithTenantContext } from '@/db/tenant-context.js';
+import { runWithTenantContext, getCurrentTenant } from '@/db/tenant-context.js';
+import {
+  MAX_IMAGE_BYTES,
+  MAX_AUDIO_BYTES,
+  MAX_DOCUMENT_BYTES,
+  sniffMime,
+  extensionForMime,
+} from '@/lib/media-guard.js';
 import { isDuplicate, markSeen } from './dedup.js';
 import {
   markRead,
@@ -309,7 +321,14 @@ async function handleConnectionUpdate(update: ConnectionUpdate): Promise<void> {
     if (reason === DisconnectReason.loggedOut) {
       await audit({ acao: 'pairing_logged_out', metadata: { reason } });
       reconnectAttempts = 0;
-      triggerRecovery({ shutdownBaileys, startBaileys }).catch((err) => {
+      // Cap. 7 — recovery POR ALVO: o LoggedOut da primária remove apenas
+      // primary/ (nunca a raiz — lines/, pairing/ e control/ sobrevivem).
+      triggerRecovery({
+        target: 'primary',
+        line: currentLineE164,
+        shutdownBaileys,
+        startBaileys,
+      }).catch((err) => {
         logger.error({ err }, 'setup.recovery_failed');
       });
     } else {
@@ -320,7 +339,12 @@ async function handleConnectionUpdate(update: ConnectionUpdate): Promise<void> {
         reconnectAttempts = 0;
         // Flip to recovering — the auto-loop is exhausted, the operator
         // path takes over via the same recovery hook used for loggedOut.
-        triggerRecovery({ shutdownBaileys, startBaileys }).catch((err) => {
+        triggerRecovery({
+          target: 'primary',
+          line: currentLineE164,
+          shutdownBaileys,
+          startBaileys,
+        }).catch((err) => {
           logger.error({ err }, 'setup.recovery_failed');
         });
         return;
@@ -337,12 +361,119 @@ async function handleConnectionUpdate(update: ConnectionUpdate): Promise<void> {
   }
 }
 
+/** Prefixo dos staging dirs da migração de layout — dentro da raiz para o
+ * `rename` de promoção ser atômico (mesmo filesystem). */
+const AUTH_MIGRATION_STAGING_PREFIX = '.primary-migration-';
+
+/**
+ * Auditoria P0 cap. 7 — a sessão primária deixa de usar a RAIZ do
+ * `BAILEYS_AUTH_DIR` e passa a viver em `primary/` (filho direto da raiz),
+ * lado a lado com `lines/<id>`, `pairing/<id>` e `control/`. Com isso o
+ * recovery da primária pode remover `primary/` sem destruir as credenciais
+ * das linhas adicionais, os pareamentos em curso e o setup token.
+ *
+ * Migração do layout LEGADO (creds.json direto na raiz) no boot:
+ *  - move CADA entrada da raiz — exceto as reservadas (`lines/`, `pairing/`,
+ *    `control/`, `media/`, `setup-token.txt`) — para um staging dir e promove
+ *    com `rename` atômico para `primary/` (staging dentro da raiz ⇒ mesmo
+ *    filesystem);
+ *  - qualquer falha faz rollback best-effort das entradas já movidas e o
+ *    boot SEGUE NO CAMINHO LEGADO (raiz) — log + audit; os arquivos legados
+ *    nunca ficam meio-migrados sem sessão utilizável;
+ *  - um staging órfão de um boot anterior interrompido é retomado: com
+ *    `creds.json` dentro, é a sessão completa (a queda ocorreu entre o move
+ *    e o promote) ⇒ promove; sem, devolve as entradas para a raiz.
+ * NUNCA toca `lines/`, `pairing/`, `control/` (nem `media/`).
+ */
+async function ensurePrimaryAuthDirMigrated(): Promise<string> {
+  const root = assertSafeAuthDir(config.BAILEYS_AUTH_DIR);
+  const primaryDir = resolvePrimaryAuthDir();
+  if (existsSync(primaryDir)) return primaryDir;
+  if (!existsSync(root)) {
+    // Instalação nova — nada legado para migrar.
+    mkdirSync(primaryDir, { recursive: true });
+    return primaryDir;
+  }
+
+  const entries = await readdir(root);
+
+  // Retoma migração interrompida (staging órfão de um boot anterior).
+  for (const name of entries) {
+    if (!name.startsWith(AUTH_MIGRATION_STAGING_PREFIX)) continue;
+    const stagingPath = join(root, name);
+    if (existsSync(join(stagingPath, 'creds.json'))) {
+      await rename(stagingPath, primaryDir);
+      logger.info({ dir: primaryDir }, 'baileys.auth_layout_staging_promoted');
+      return primaryDir;
+    }
+    // Staging parcial sem creds — devolve o que der para a raiz (rollback).
+    for (const inner of await readdir(stagingPath).catch(() => [] as string[])) {
+      await rename(join(stagingPath, inner), join(root, inner)).catch(() => undefined);
+    }
+    await rm(stagingPath, { recursive: true, force: true }).catch(() => undefined);
+  }
+
+  if (!existsSync(join(root, 'creds.json'))) {
+    // Sem sessão legada (cold start ou pós-recovery) — só cria primary/.
+    mkdirSync(primaryDir, { recursive: true });
+    return primaryDir;
+  }
+
+  const staging = join(root, `${AUTH_MIGRATION_STAGING_PREFIX}${process.pid}-${Date.now()}`);
+  const moved: string[] = [];
+  try {
+    mkdirSync(staging, { recursive: true });
+    for (const name of await readdir(root)) {
+      if (isReservedRootEntry(name)) continue;
+      if (name === basename(staging) || name.startsWith(AUTH_MIGRATION_STAGING_PREFIX)) continue;
+      if (name === 'primary') continue; // defensivo — não existe neste ponto
+      await rename(join(root, name), join(staging, name));
+      moved.push(name);
+    }
+    await rename(staging, primaryDir);
+    logger.info(
+      { dir: primaryDir, entries: moved.length },
+      'baileys.auth_layout_migrated_to_primary',
+    );
+    // `AUDIT_ACTIONS` é fechado e fora do escopo deste capítulo —
+    // `config_loaded` é a ação existente para "estado de configuração no
+    // boot"; o evento real vai em metadata.
+    await audit({
+      acao: 'config_loaded',
+      metadata: { event: 'baileys_auth_layout_migrated_to_primary', entries: moved.length },
+    }).catch(() => undefined);
+    return primaryDir;
+  } catch (err) {
+    // Rollback best-effort — mantém o layout LEGADO utilizável neste boot;
+    // os fluxos de recovery limpam a raiz ENTRADA A ENTRADA (nunca a raiz).
+    for (const name of moved) {
+      await rename(join(staging, name), join(root, name)).catch(() => undefined);
+    }
+    await rm(staging, { recursive: true, force: true }).catch(() => undefined);
+    logger.error(
+      { err: (err as Error).message },
+      'baileys.auth_layout_migration_failed_using_legacy_root',
+    );
+    await audit({
+      acao: 'config_loaded',
+      metadata: {
+        event: 'baileys_auth_layout_migration_failed',
+        error: (err as Error).message,
+      },
+    }).catch(() => undefined);
+    return root;
+  }
+}
+
 export async function startBaileys(): Promise<void> {
   // Backend boot (maia-app): create media dirs here, NOT at module load, so
   // importing this module (e.g. from the admin-ui tool catalog) has no fs side
   // effects. Idempotent.
   ensureMediaDirs();
-  const { state, saveCreds } = await useMultiFileAuthState(config.BAILEYS_AUTH_DIR);
+  // Cap. 7 — a primária usa `primary/` (com migração transparente do layout
+  // legado); só um boot cuja migração falhou continua na raiz.
+  const authDir = await ensurePrimaryAuthDirMigrated();
+  const { state, saveCreds } = await useMultiFileAuthState(authDir);
   // Pin the WA Web protocol version to whatever WhatsApp is currently
   // serving. Without this, Baileys uses the version hardcoded at the time
   // the library was published — when WhatsApp ships a server-side bump,
@@ -878,7 +1009,7 @@ async function handleIncoming(
     return;
   }
 
-  const { type, content, mediaPath, mediaMime, mediaSha256 } = await extractContent(msg);
+  const { type, content, mediaPath, mediaMime, mediaSha256, mediaRejected } = await extractContent(msg);
 
   const { row: stored, duplicate } = await mensagensRepo.createInbound({
     conversa_id: null,
@@ -900,6 +1031,10 @@ async function handleIncoming(
       timestamp_ms: Number(msg.messageTimestamp ?? 0) * 1000,
       media_mime: mediaMime,
       media_sha256: mediaSha256,
+      // P0 audit ch. 4 — why the media was refused ('too_large_declared' |
+      // 'too_large' | 'bad_magic'), null when accepted/absent. The turn still
+      // processes; only the media fields are withheld.
+      media_rejected: mediaRejected,
       // [Issue #290] Channel resolved at the ingress. In single-tenant this is
       // the seeded default channel id (#411 catch-all); null only when the
       // resolver path didn't surface a channel_id (e.g., tests driving
@@ -1025,12 +1160,17 @@ async function extractContent(msg: proto.IWebMessageInfo): Promise<{
   mediaPath: string | null;
   mediaMime: string | null;
   mediaSha256: string | null;
+  /** P0 audit ch. 4 — non-null when media was refused (size/magic). The turn
+   * still processes (text/caption survives); the reason lands in metadata. */
+  mediaRejected: string | null;
 }> {
   const m = msg.message;
-  if (!m) return { type: 'sistema', content: null, mediaPath: null, mediaMime: null, mediaSha256: null };
+  if (!m) {
+    return { type: 'sistema', content: null, mediaPath: null, mediaMime: null, mediaSha256: null, mediaRejected: null };
+  }
 
   if (m.conversation) {
-    return { type: 'texto', content: m.conversation, mediaPath: null, mediaMime: null, mediaSha256: null };
+    return { type: 'texto', content: m.conversation, mediaPath: null, mediaMime: null, mediaSha256: null, mediaRejected: null };
   }
   if (m.extendedTextMessage?.text) {
     return {
@@ -1039,6 +1179,7 @@ async function extractContent(msg: proto.IWebMessageInfo): Promise<{
       mediaPath: null,
       mediaMime: null,
       mediaSha256: null,
+      mediaRejected: null,
     };
   }
   // Media branches: we save the buffer (when available)
@@ -1051,28 +1192,65 @@ async function extractContent(msg: proto.IWebMessageInfo): Promise<{
         ? 'documentMessage'
         : null;
   if (!mediaKind) {
-    return { type: 'sistema', content: null, mediaPath: null, mediaMime: null, mediaSha256: null };
+    return { type: 'sistema', content: null, mediaPath: null, mediaMime: null, mediaSha256: null, mediaRejected: null };
   }
 
-  const mime = (m as Record<string, { mimetype?: string; caption?: string }>)[mediaKind]?.mimetype ?? null;
-  const caption = (m as Record<string, { mimetype?: string; caption?: string }>)[mediaKind]?.caption ?? null;
+  type MediaEnvelope = {
+    mimetype?: string;
+    caption?: string;
+    fileLength?: number | { toString(): string } | null;
+  };
+  const envelope = (m as unknown as Record<string, MediaEnvelope | undefined>)[mediaKind];
+  const mime = envelope?.mimetype ?? null;
+  const caption = envelope?.caption ?? null;
   const type: WhatsAppInbound['type'] =
     mediaKind === 'audioMessage' ? 'audio' : mediaKind === 'imageMessage' ? 'imagem' : 'documento';
+
+  // P0 audit ch. 4 — per-kind byte caps, checked against the DECLARED
+  // fileLength BEFORE downloading (no unbounded in-memory download), and
+  // re-checked against the actual buffer afterwards.
+  const cap =
+    type === 'audio' ? MAX_AUDIO_BYTES : type === 'imagem' ? MAX_IMAGE_BYTES : MAX_DOCUMENT_BYTES;
+  const declaredRaw = envelope?.fileLength;
+  const declaredLen = declaredRaw == null ? null : Number(declaredRaw.toString());
+
   let mediaPath: string | null = null;
   let mediaSha256: string | null = null;
-  try {
-    const buf = await downloadMediaMessage(msg, 'buffer', {});
-    if (Buffer.isBuffer(buf)) {
-      const ext =
-        mime?.split('/')[1]?.split(';')[0] ?? (type === 'audio' ? 'ogg' : type === 'imagem' ? 'jpg' : 'bin');
-      const saved = mediaPathFor(buf, ext);
-      mediaPath = saved.path;
-      mediaSha256 = saved.sha;
+  let mediaRejected: string | null = null;
+  if (declaredLen !== null && Number.isFinite(declaredLen) && declaredLen > cap) {
+    mediaRejected = 'too_large_declared';
+    logger.warn({ declared: declaredLen, cap, kind: type }, 'baileys.media_rejected');
+  } else {
+    try {
+      const buf = await downloadMediaMessage(msg, 'buffer', {});
+      if (Buffer.isBuffer(buf)) {
+        const sniffed = sniffMime(buf);
+        if (buf.length > cap) {
+          mediaRejected = 'too_large';
+          logger.warn({ size: buf.length, cap, kind: type }, 'baileys.media_rejected');
+        } else if (
+          // Images/audio must sniff as such; documents accept any payload
+          // (extension falls back to 'bin' below). Fail-closed on mismatch.
+          (type === 'imagem' && !sniffed?.startsWith('image/')) ||
+          (type === 'audio' && !sniffed?.startsWith('audio/'))
+        ) {
+          mediaRejected = 'bad_magic';
+          logger.warn({ kind: type, sniffed: sniffed ?? null }, 'baileys.media_rejected');
+        } else {
+          // Extension comes from the SNIFFED magic — never from the declared
+          // mimetype/filename. Sanitized; unknown magic (documents) → 'bin'.
+          const rawExt = sniffed ? extensionForMime(sniffed) : null;
+          const ext = rawExt && /^[a-z0-9]{1,8}$/.test(rawExt) ? rawExt : 'bin';
+          const saved = await mediaPathFor(buf, ext);
+          mediaPath = saved.path;
+          mediaSha256 = saved.sha;
+        }
+      }
+    } catch (err) {
+      logger.warn({ err: (err as Error).message }, 'baileys.media_download_failed');
     }
-  } catch (err) {
-    logger.warn({ err: (err as Error).message }, 'baileys.media_download_failed');
   }
-  return { type, content: caption, mediaPath, mediaMime: mime, mediaSha256 };
+  return { type, content: caption, mediaPath, mediaMime: mime, mediaSha256, mediaRejected };
 }
 
 /**
@@ -1264,19 +1442,27 @@ export const _internal = {
     return reconnectAttempts;
   },
   _extractMessageUpdateTargetId: extractMessageUpdateTargetId,
+  _ensurePrimaryAuthDirMigrated: ensurePrimaryAuthDirMigrated,
   RECONNECT_MAX_ATTEMPTS,
 };
 
-// Helper to deterministically create per-message media filenames
-export function mediaPathFor(buf: Buffer, ext: string): { path: string; sha: string } {
+// Helper to deterministically create per-message media filenames.
+// P0 audit ch. 4: scoped PER TENANT — `<MEDIA_ROOT>/<urlencoded tenant>/<month>/<sha>.<ext>`.
+// The caller (extractContent ← handleIncoming) always runs inside
+// `runWithTenantContext`, so `getCurrentTenant()` is bound; without an ALS
+// context this THROWS (fail-closed — never writes into a shared bucket).
+// Async write (no event-loop-blocking writeFileSync on the ingress hot path).
+// Legacy rows whose midia_url points at the old un-tenanted `<MEDIA_ROOT>/<month>/`
+// dirs still resolve: media-guard containment is checked against MEDIA_ROOT.
+export async function mediaPathFor(buf: Buffer, ext: string): Promise<{ path: string; sha: string }> {
   // Defensive: ensure MEDIA_ROOT exists even when startBaileys() hasn't run
   // (module load no longer creates it). Idempotent.
   ensureMediaDirs();
   const sha = sha256(buf);
   const month = new Date().toISOString().slice(0, 7);
-  const dir = join(MEDIA_ROOT, month);
+  const dir = join(MEDIA_ROOT, encodeURIComponent(getCurrentTenant()), month);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   const path = join(dir, `${sha}.${ext}`);
-  if (!existsSync(path)) writeFileSync(path, buf);
+  if (!existsSync(path)) await writeFile(path, buf);
   return { path, sha };
 }
