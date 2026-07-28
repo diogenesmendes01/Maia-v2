@@ -30,6 +30,7 @@ import { TypedError } from '@/lib/utils.js';
 import type { Mensagem, ProcedureExecution, Role } from '@/db/schema.js';
 import { resolveChannel } from '@/gateway/channel-resolver.js';
 import { audit } from '@/governance/audit.js';
+import { lifecycle } from '@/runtime/lifecycle/controller.js';
 import { computeRuntimeVisibleTools } from '@/tools/runtime-filter.js';
 import { mcpVisibleToolSchemas } from '@/tools/mcp-bridge.js';
 import { forCurrentAgentChannel } from '@/gateway/line-output.js';
@@ -1194,21 +1195,30 @@ async function runAgentForMensagemInner(
   // correction trigger that double-fired with the graph) was collapsed in
   // issue #412 — the graph is now the sole path. Errors NEVER block the turn.
   // See src/cognitive-graph/postturn-graph.ts.
-  void runNodes(buildPostturnNodes(), {
-    conversa_id: c.id,
-    turno_id: inbound.id,
-    pessoa,
-    conversa: c,
-    inbound,
-    response_text: reactOutboundText,
-    tools_called: reactToolsCalled,
-    // P7 parity (issue #412): the step-evaluator node passes only
-    // { response_text, tools_called } to evaluateCurrentStep — matching the
-    // legacy imperative IIFE exactly (it never passed `user_message`). We pass
-    // active_execution_id so the step-evaluator runs only when there's
-    // something to advance.
-    active_execution_id: activeExecution?.id ?? null,
-  });
+  //
+  // Issue #512 review round 1 (P1 on the background-task registry): this is
+  // the single largest piece of fire-and-forget work in the system — it writes
+  // memories, evaluations and step advances AFTER the reply was sent. It used
+  // to be invisible to the shutdown, so `process.exit` killed it mid-write.
+  // Tracking it makes the drain actually wait for the turn's tail.
+  void lifecycle.trackBackgroundTask(
+    'postturn_reflection',
+    runNodes(buildPostturnNodes(), {
+      conversa_id: c.id,
+      turno_id: inbound.id,
+      pessoa,
+      conversa: c,
+      inbound,
+      response_text: reactOutboundText,
+      tools_called: reactToolsCalled,
+      // P7 parity (issue #412): the step-evaluator node passes only
+      // { response_text, tools_called } to evaluateCurrentStep — matching the
+      // legacy imperative IIFE exactly (it never passed `user_message`). We pass
+      // active_execution_id so the step-evaluator runs only when there's
+      // something to advance.
+      active_execution_id: activeExecution?.id ?? null,
+    }),
+  );
 }
 /**
  * P7 Task 8 — helper file-local para montar `role_inputs` do PreturnContext.

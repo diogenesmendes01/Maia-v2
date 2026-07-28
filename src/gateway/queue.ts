@@ -94,26 +94,35 @@ export function startAgentWorker(processor: (job: Job<AgentJob>) => Promise<void
       removeOnFail: { count: 1000, age: 7 * 24 * 3600 },
     },
   );
-  worker.on('failed', async (job, err) => {
+  worker.on('failed', (job, err) => {
     logger.error({ job_id: job?.id, err: err?.message }, 'agent.job.failed');
-    if (job && job.attemptsMade >= (job.opts.attempts ?? 3)) {
-      const entry = await dlqRepo.add({
-        queue_name: 'agent',
-        job_id: job.id ?? 'unknown',
-        payload: job.data,
-        error: err?.message ?? 'unknown',
-        attempts: job.attemptsMade,
-      });
-      await audit({
-        acao: 'dlq_job_added',
-        alvo_id: entry.id,
-        metadata: { queue: 'agent', job_id: job.id, attempts: job.attemptsMade },
-      });
-      await sendAlert({
-        subject: `DLQ entry on agent queue (${job.attemptsMade} attempts)`,
-        body: `Job ${job.id} exhausted retries. Error: ${err?.message ?? 'unknown'}\nDLQ id: ${entry.id}\nRun "npm run dlq" to inspect.`,
-      }).catch(() => null);
-    }
+    if (!job || job.attemptsMade < (job.opts.attempts ?? 3)) return;
+    // Issue #512 review round 1 (P1 on the background-task registry): BullMQ
+    // event listeners are fire-and-forget from the worker's point of view, so
+    // `worker.close()` does NOT wait for them. This one WRITES — a DLQ row, an
+    // audit row and an alert — and losing it during a deploy means a job
+    // silently vanished with no DLQ trace. Tracked so the drain waits for it.
+    void lifecycle.trackBackgroundTask(
+      'dlq_write',
+      (async () => {
+        const entry = await dlqRepo.add({
+          queue_name: 'agent',
+          job_id: job.id ?? 'unknown',
+          payload: job.data,
+          error: err?.message ?? 'unknown',
+          attempts: job.attemptsMade,
+        });
+        await audit({
+          acao: 'dlq_job_added',
+          alvo_id: entry.id,
+          metadata: { queue: 'agent', job_id: job.id, attempts: job.attemptsMade },
+        });
+        await sendAlert({
+          subject: `DLQ entry on agent queue (${job.attemptsMade} attempts)`,
+          body: `Job ${job.id} exhausted retries. Error: ${err?.message ?? 'unknown'}\nDLQ id: ${entry.id}\nRun "npm run dlq" to inspect.`,
+        }).catch(() => null);
+      })().catch((e) => logger.error({ err: (e as Error).message }, 'agent.job.dlq_write_failed')),
+    );
   });
   return worker;
 }
