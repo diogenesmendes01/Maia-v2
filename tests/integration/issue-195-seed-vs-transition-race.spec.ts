@@ -192,6 +192,28 @@ d('seedNewActiveAtomic vs transition cross-writer race (issue #195, real DB)', (
         }),
       );
 
+      // PR #527 — marca a rejeição como TRATADA já na criação.
+      //
+      // Diferente de todas as outras corridas deste repo (issue-166,
+      // issue-177, cenário B abaixo), que chamam `Promise.allSettled` no
+      // MESMO tick em que criam as promises, este cenário só anexa o
+      // handler ~4 linhas depois — com um `sleep(100)` e DUAS idas ao banco
+      // (`UPDATE` + `COMMIT`) no meio. O seed é desbloqueado exatamente
+      // pelo COMMIT da conexão lateral e rejeita com
+      // `seed_atomic_stale_active` (o desfecho ESPERADO, afirmado na linha
+      // ~269). Se essa rejeição chegar antes de o `await side.query('COMMIT')`
+      // retomar, `seedPromise` está sem handler e o Node dispara
+      // `unhandledRejection` — o Vitest registra o erro e o processo sai
+      // com código != 0 mesmo com 100% dos testes verdes. Qual dos dois
+      // sockets é lido primeiro é detalhe de agendamento do event loop:
+      // o CI reproduziu isso no node 22 e não no node 26, mesmo commit.
+      //
+      // `.catch()` devolve uma promise DERIVADA (descartada); a original
+      // segue rejeitando e o `Promise.allSettled` abaixo continua
+      // observando o mesmo `{ status: 'rejected', reason }`. Nenhuma
+      // asserção muda — só deixa de existir a janela sem handler.
+      seedPromise.catch(() => undefined);
+
       // Give the seed time to enqueue its blocking statement against our
       // row lock. 100ms is generous; even on a slow CI runner the seed's
       // initial SELECTs run in single-digit ms.
