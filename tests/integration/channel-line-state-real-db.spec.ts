@@ -358,6 +358,128 @@ d('channel_line_state — material cifrado e restart', () => {
     expect(state?.pairing_material).toBeNull();
   });
 
+  it('DUAS réplicas nunca executam o mesmo comando: o segundo claim volta vazio', async () => {
+    const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+    await channelLineStateRepo.requestCommand({
+      scope: { tenant_id: T, agent_id: A, channel_id: channelId },
+      command: 'start_pairing',
+      method: 'qr',
+      command_id: randomUUID(),
+      ...ACTOR,
+    });
+
+    // `FOR UPDATE SKIP LOCKED` so protege a janela da transacao; o bug era o
+    // comando voltar a ser elegivel assim que ela commitava.
+    const a = await channelLineStateRepo.claimNextCommand('replica-A');
+    const b = await channelLineStateRepo.claimNextCommand('replica-B');
+    expect(a?.channel_id).toBe(channelId);
+    expect(b).toBeNull();
+  });
+
+  it('claims CONCORRENTES de duas réplicas produzem exatamente um vencedor', async () => {
+    const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+    await channelLineStateRepo.requestCommand({
+      scope: { tenant_id: T, agent_id: A, channel_id: channelId },
+      command: 'start_pairing',
+      method: 'qr',
+      command_id: randomUUID(),
+      ...ACTOR,
+    });
+    const [a, b] = await Promise.all([
+      channelLineStateRepo.claimNextCommand('replica-A'),
+      channelLineStateRepo.claimNextCommand('replica-B'),
+    ]);
+    expect([a, b].filter((r) => r !== null)).toHaveLength(1);
+  });
+
+  it('lease VENCIDA (dono morto) libera o comando para outra réplica', async () => {
+    const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+    await channelLineStateRepo.requestCommand({
+      scope: { tenant_id: T, agent_id: A, channel_id: channelId },
+      command: 'start_pairing',
+      method: 'qr',
+      command_id: randomUUID(),
+      ...ACTOR,
+    });
+    // Réplica A reivindica com lease de 1ms e "morre" (nunca renova).
+    expect(await channelLineStateRepo.claimNextCommand('replica-A', 1)).not.toBeNull();
+    await new Promise((r) => setTimeout(r, 20));
+    const takeover = await channelLineStateRepo.claimNextCommand('replica-B');
+    expect(takeover?.owner_instance).toBe('replica-B');
+  });
+
+  it('a réplica B NÃO derruba o pareamento vivo da réplica A (heartbeat)', async () => {
+    const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+    const scope = { tenant_id: T, agent_id: A, channel_id: channelId };
+    const key = randomUUID();
+    await channelLineStateRepo.requestCommand({
+      scope,
+      command: 'start_pairing',
+      method: 'qr',
+      command_id: key,
+      ...ACTOR,
+    });
+    // A reivindica, consome o comando e mantém a sessão viva renovando a lease.
+    await channelLineStateRepo.claimNextCommand('replica-A');
+    await channelLineStateRepo.clearCommand({
+      channel_id: channelId,
+      command_id: key,
+      owner_instance: 'replica-A',
+    });
+    await channelLineStateRepo.renewOwnerLeases('replica-A');
+
+    // B varre. Antes do fix, o filtro `owner_instance <> 'replica-B'` matava a
+    // sessão de A a cada tick — o bug distribuído que a #528 apontou.
+    const swept = await channelLineStateRepo.failStalePairings({
+      reason_code: 'interrupted_retryable',
+    });
+    expect(swept.map((s) => s.channel_id)).not.toContain(channelId);
+    expect((await channelLineStateRepo.getStateForScope(scope))?.state).toBe('pairing');
+  });
+
+  it('o heartbeat renova SÓ as rows do próprio dono', async () => {
+    const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+    await channelLineStateRepo.requestCommand({
+      scope: { tenant_id: T, agent_id: A, channel_id: channelId },
+      command: 'start_pairing',
+      method: 'qr',
+      command_id: randomUUID(),
+      ...ACTOR,
+    });
+    await channelLineStateRepo.claimNextCommand('replica-A');
+    expect(await channelLineStateRepo.renewOwnerLeases('replica-B')).toBe(0);
+    expect(await channelLineStateRepo.renewOwnerLeases('replica-A')).toBe(1);
+  });
+
+  it('clearCommand é CAS: um finally atrasado não apaga o comando NOVO', async () => {
+    const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+    const scope = { tenant_id: T, agent_id: A, channel_id: channelId };
+    const oldKey = randomUUID();
+    await channelLineStateRepo.requestCommand({
+      scope,
+      command: 'start_pairing',
+      method: 'qr',
+      command_id: oldKey,
+      ...ACTOR,
+    });
+    await channelLineStateRepo.claimNextCommand('replica-A');
+    // O operador cancela: comando NOVO na mesma row.
+    await channelLineStateRepo.requestCommand({
+      scope,
+      command: 'abort_pairing',
+      command_id: randomUUID(),
+      ...ACTOR,
+    });
+
+    const cleared = await channelLineStateRepo.clearCommand({
+      channel_id: channelId,
+      command_id: oldKey,
+      owner_instance: 'replica-A',
+    });
+    expect(cleared).toBe(false);
+    expect((await channelLineStateRepo.getStateForScope(scope))?.command).toBe('abort_pairing');
+  });
+
   it('restart: tentativa órfã vira failed retryable (nunca verified) e perde o material', async () => {
     const { channelLineStateRepo } = await import('../../src/db/repositories.js');
     const scope = { tenant_id: T, agent_id: A, channel_id: channelId };
@@ -369,8 +491,9 @@ d('channel_line_state — material cifrado e restart', () => {
       command_id: key,
       ...ACTOR,
     });
-    // O worker reivindicou (instância "velha") e o processo morreu.
-    await channelLineStateRepo.claimNextCommand('old-instance:1');
+    // O worker reivindicou (instância "velha", lease de 1ms) e o processo
+    // morreu: nunca renovou o heartbeat, então a lease vence.
+    await channelLineStateRepo.claimNextCommand('old-instance:1', 1);
     await channelLineStateRepo.putPairingMaterial({
       channel_id: channelId,
       command_id: key,
@@ -379,10 +502,15 @@ d('channel_line_state — material cifrado e restart', () => {
       kind: 'qr',
       expires_at: new Date(Date.now() + 60_000),
     });
-    await channelLineStateRepo.clearCommand(channelId);
+    await channelLineStateRepo.clearCommand({
+      channel_id: channelId,
+      command_id: key,
+      owner_instance: 'old-instance:1',
+      lease_ms: 1,
+    });
+    await new Promise((r) => setTimeout(r, 20));
 
     const stale = await channelLineStateRepo.failStalePairings({
-      owner_instance: 'new-instance:2',
       reason_code: 'interrupted_retryable',
     });
     expect(stale.map((s) => s.channel_id)).toContain(channelId);
@@ -404,7 +532,6 @@ d('channel_line_state — material cifrado e restart', () => {
       ...ACTOR,
     });
     const stale = await channelLineStateRepo.failStalePairings({
-      owner_instance: 'any-instance',
       reason_code: 'interrupted_retryable',
     });
     expect(stale).toHaveLength(0);

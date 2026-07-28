@@ -137,6 +137,10 @@ async function executeStartPairing(row: {
             reason_code: p.reason_code ?? null,
             expected_command_id: row.command_id,
             ...(p.phase === 'verified' ? { verified_at: new Date() } : {}),
+            // Terminal: a PairingSession acabou, nada mais roda em memória
+            // para este canal — solta a lease para o heartbeat parar de
+            // renová-la (senão o canal ficaria "ocupado" por 60s à toa).
+            release_owner: true,
           })
           .then(() =>
             incCounter('maia_channel_pairing_total', {
@@ -159,6 +163,7 @@ async function executeStartPairing(row: {
       state: 'failed',
       reason_code: result.error,
       expected_command_id: row.command_id,
+      release_owner: true,
     });
     incCounter('maia_channel_pairing_total', { outcome: 'rejected' });
     logger.warn(
@@ -217,6 +222,7 @@ async function executeRepair(row: {
     channel_id: row.channel_id,
     state: 'declared',
     reason_code: 'repair_completed',
+    release_owner: true,
   });
   incCounter('maia_channel_pairing_total', { outcome: 'repaired' });
 }
@@ -227,8 +233,11 @@ async function executeRepair(row: {
  * auditada como `pairing_session_expired` sob o ALS do dono do canal.
  */
 async function sweepStalePairings(): Promise<void> {
+  // O critério é a LEASE VENCIDA, não "o dono é outro" — ver
+  // `failStalePairings`. Com N réplicas, a instância que varre pode
+  // perfeitamente não ser a dona da sessão viva, e derrubá-la seria um bug de
+  // produção (review PR #528, P1).
   const stale = await channelLineStateRepo.failStalePairings({
-    owner_instance: OWNER_INSTANCE,
     reason_code: 'interrupted_retryable',
   });
   for (const row of stale) {
@@ -251,6 +260,16 @@ export async function runChannelPairingWorker(): Promise<void> {
   if (running) return;
   running = true;
   try {
+    // Heartbeat ANTES de qualquer varredura: renova a lease do que ESTA
+    // instância está tocando agora. Se este processo morrer, para de renovar e
+    // outra réplica assume — é a única forma correta de distinguir dono morto
+    // de dono vivo (review PR #528, P1).
+    await channelLineStateRepo
+      .renewOwnerLeases(OWNER_INSTANCE)
+      .catch((err) =>
+        logger.warn({ err: (err as Error).message }, 'channel_pairing.lease_renew_failed'),
+      );
+
     if (tickCount % STALE_SWEEP_EVERY_TICKS === 0) {
       await sweepStalePairings();
     }
@@ -283,10 +302,21 @@ export async function runChannelPairingWorker(): Promise<void> {
             channel_id: row.channel_id,
             state: 'failed',
             reason_code: 'command_execution_failed',
+            expected_command_id: row.command_id,
+            release_owner: true,
           })
           .catch(() => undefined);
       } finally {
-        await channelLineStateRepo.clearCommand(row.channel_id).catch(() => undefined);
+        // CAS: só limpa SE o comando ainda for este e a posse ainda for nossa.
+        // O `finally` incondicional anterior apagava um comando NOVO que o
+        // operador tivesse enfileirado durante a execução (review PR #528, P1).
+        await channelLineStateRepo
+          .clearCommand({
+            channel_id: row.channel_id,
+            command_id: row.command_id,
+            owner_instance: OWNER_INSTANCE,
+          })
+          .catch(() => undefined);
       }
     }
   } catch (err) {

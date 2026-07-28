@@ -1930,6 +1930,7 @@ export const channel_line_state = pgTable(
     command_id: uuid('command_id'),
     command_requested_at: timestamp('command_requested_at', { withTimezone: true }),
     command_claimed_at: timestamp('command_claimed_at', { withTimezone: true }),
+    owner_lease_expires_at: timestamp('owner_lease_expires_at', { withTimezone: true }),
     actor_id: text('actor_id'),
     actor_role: text('actor_role'),
     correlation_id: text('correlation_id'),
@@ -1966,6 +1967,9 @@ export const channel_line_state = pgTable(
     pairingExpiryIdx: index('channel_line_state_pairing_expiry_idx')
       .on(t.pairing_expires_at)
       .where(sql`state = 'pairing'`),
+    ownerIdx: index('channel_line_state_owner_idx')
+      .on(t.owner_instance)
+      .where(sql`owner_instance IS NOT NULL`),
   }),
 );
 export type ChannelLineStateRow = typeof channel_line_state.$inferSelect;

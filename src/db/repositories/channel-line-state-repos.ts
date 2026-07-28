@@ -38,6 +38,14 @@ export type LineState =
 export type LineCommand = 'start_pairing' | 'abort_pairing' | 'repair';
 export type PairingMethod = 'qr' | 'code';
 
+/**
+ * Validade da LEASE de posse (review PR #528, P1). Precisa ser
+ * confortavelmente maior que a cadência do heartbeat (o worker roda a cada 5s)
+ * para não expirar por um tick perdido, e pequena o bastante para que um
+ * processo morto libere o canal em menos de um minuto.
+ */
+export const OWNER_LEASE_MS = 60_000;
+
 export interface LineScope {
   tenant_id: string;
   agent_id: string;
@@ -381,7 +389,10 @@ export const channelLineStateRepo = {
    * Reivindica o próximo comando pendente. `FOR UPDATE SKIP LOCKED` = duas
    * réplicas do runtime nunca pegam a mesma row.
    */
-  async claimNextCommand(owner_instance: string): Promise<
+  async claimNextCommand(
+    owner_instance: string,
+    lease_ms: number = OWNER_LEASE_MS,
+  ): Promise<
     | (ChannelLineStateRow & {
         external_id: string;
         channel_type: string;
@@ -390,10 +401,23 @@ export const channelLineStateRepo = {
     | null
   > {
     return withTx(async (tx) => {
+      const now = new Date();
+      // Review PR #528 (P1): o candidato precisa estar NÃO-REIVINDICADO ou com
+      // a LEASE VENCIDA. Antes, qualquer `command IS NOT NULL` era elegível —
+      // `FOR UPDATE SKIP LOCKED` só protege a janela da transação, então assim
+      // que ela commitava a mesma row voltava ao pool e uma segunda réplica
+      // executava o MESMO `command_id`.
       const candidates = await tx
         .select({ channel_id: channel_line_state.channel_id })
         .from(channel_line_state)
-        .where(isNotNull(channel_line_state.command))
+        .where(
+          and(
+            isNotNull(channel_line_state.command),
+            sql`(${channel_line_state.command_claimed_at} IS NULL
+                  OR ${channel_line_state.owner_lease_expires_at} IS NULL
+                  OR ${channel_line_state.owner_lease_expires_at} < ${now})`,
+          ),
+        )
         .orderBy(channel_line_state.command_requested_at)
         .limit(1)
         .for('update', { skipLocked: true });
@@ -402,7 +426,11 @@ export const channelLineStateRepo = {
 
       const claimed = await tx
         .update(channel_line_state)
-        .set({ command_claimed_at: new Date(), owner_instance })
+        .set({
+          command_claimed_at: now,
+          owner_instance,
+          owner_lease_expires_at: new Date(now.getTime() + lease_ms),
+        })
         .where(eq(channel_line_state.channel_id, target.channel_id))
         .returning();
       const row = claimed[0]!;
@@ -427,17 +455,72 @@ export const channelLineStateRepo = {
     });
   },
 
-  /** Limpa o comando reivindicado (executado ou descartado). */
-  async clearCommand(channel_id: string): Promise<void> {
-    await db
+  /**
+   * Heartbeat: o dono renova a lease das rows que está tocando AGORA — as que
+   * têm comando reivindicado por ele e as que estão com um pareamento vivo em
+   * memória (comando já consumido, PairingSession rodando).
+   *
+   * É isto que distingue "dono morto" de "dono vivo e lento". Sem o heartbeat
+   * a única forma de detectar o dono morto seria comparar `owner_instance`, e
+   * era exatamente essa comparação que fazia a réplica B derrubar a sessão
+   * viva da réplica A (review PR #528, P1).
+   */
+  async renewOwnerLeases(
+    owner_instance: string,
+    lease_ms: number = OWNER_LEASE_MS,
+  ): Promise<number> {
+    const now = new Date();
+    const rows = await db
+      .update(channel_line_state)
+      .set({ owner_lease_expires_at: new Date(now.getTime() + lease_ms) })
+      .where(
+        and(
+          eq(channel_line_state.owner_instance, owner_instance),
+          sql`(${channel_line_state.command} IS NOT NULL
+                OR ${channel_line_state.state} = 'pairing')`,
+        ),
+      )
+      .returning({ channel_id: channel_line_state.channel_id });
+    return rows.length;
+  },
+
+  /**
+   * Limpa o comando executado. CAS por `(channel_id, command_id,
+   * owner_instance)`: um `finally` atrasado de uma execução ANTIGA não pode
+   * apagar o comando NOVO que o operador acabou de enfileirar (review PR #528,
+   * P1). Devolve `false` quando o comando já não é o desta execução.
+   *
+   * A LEASE é renovada, não zerada: o comando acabou, mas a PairingSession que
+   * ele abriu continua viva NESTA instância — zerar a lease aqui faria o
+   * próprio sweep matar a sessão que acabamos de abrir.
+   */
+  async clearCommand(args: {
+    channel_id: string;
+    command_id: string | null;
+    owner_instance: string;
+    lease_ms?: number;
+  }): Promise<boolean> {
+    const now = new Date();
+    const rows = await db
       .update(channel_line_state)
       .set({
         command: null,
         command_method: null,
         command_claimed_at: null,
-        updated_at: new Date(),
+        owner_lease_expires_at: new Date(now.getTime() + (args.lease_ms ?? OWNER_LEASE_MS)),
+        updated_at: now,
       })
-      .where(eq(channel_line_state.channel_id, channel_id));
+      .where(
+        and(
+          eq(channel_line_state.channel_id, args.channel_id),
+          eq(channel_line_state.owner_instance, args.owner_instance),
+          args.command_id === null
+            ? sql`${channel_line_state.command_id} IS NULL`
+            : eq(channel_line_state.command_id, args.command_id),
+        ),
+      )
+      .returning({ channel_id: channel_line_state.channel_id });
+    return rows.length > 0;
   },
 
   /**
@@ -489,12 +572,21 @@ export const channelLineStateRepo = {
     connected_at?: Date;
     disconnected_at?: Date;
     clear_material?: boolean;
+    /**
+     * Solta a posse: o trabalho terminou, esta instância não tem mais nada
+     * rodando em memória para este canal. Sem isto a lease continuaria sendo
+     * renovada pelo heartbeat de um dono que já não faz nada.
+     */
+    release_owner?: boolean;
   }): Promise<boolean> {
     const now = new Date();
     const rows = await db
       .update(channel_line_state)
       .set({
         state: args.state,
+        ...(args.release_owner
+          ? { owner_instance: null, owner_lease_expires_at: null }
+          : {}),
         ...(args.reason_code !== undefined ? { reason_code: args.reason_code } : {}),
         ...(args.verified_at ? { verified_at: args.verified_at } : {}),
         ...(args.connected_at ? { connected_at: args.connected_at } : {}),
@@ -574,7 +666,6 @@ export const channelLineStateRepo = {
    * `verified`. O material é destruído junto.
    */
   async failStalePairings(args: {
-    owner_instance: string;
     reason_code: string;
   }): Promise<Array<{ channel_id: string; tenant_id: string; agent_id: string }>> {
     const now = new Date();
@@ -585,6 +676,7 @@ export const channelLineStateRepo = {
         reason_code: args.reason_code,
         command_claimed_at: null,
         owner_instance: null,
+        owner_lease_expires_at: null,
         pairing_material: null,
         pairing_material_key_id: null,
         pairing_material_kind: null,
@@ -596,11 +688,17 @@ export const channelLineStateRepo = {
         and(
           eq(channel_line_state.state, 'pairing'),
           // Um comando AINDA PENDENTE é uma tentativa recém-pedida pelo
-          // console que este worker ainda não reivindicou — varrê-la aqui
-          // mataria o pareamento antes de ele começar.
+          // console que nenhum worker reivindicou — varrê-la aqui mataria o
+          // pareamento antes de ele começar.
           sql`${channel_line_state.command} IS NULL`,
+          // Review PR #528 (P1): o critério é a LEASE, NUNCA a identidade do
+          // dono. A versão anterior tinha `owner_instance <> :me`, e com duas
+          // réplicas isso significava que B derrubava a sessão VIVA de A a
+          // cada tick. Agora só cai quem parou de renovar (processo morto) ou
+          // quem estourou o TTL da própria tentativa.
           sql`(${channel_line_state.owner_instance} IS NULL
-                OR ${channel_line_state.owner_instance} <> ${args.owner_instance}
+                OR ${channel_line_state.owner_lease_expires_at} IS NULL
+                OR ${channel_line_state.owner_lease_expires_at} < ${now}
                 OR ${channel_line_state.pairing_expires_at} < ${now})`,
         ),
       )

@@ -28,7 +28,8 @@ const {
 } = vi.hoisted(() => ({
   repoMock: {
     claimNextCommand: vi.fn(),
-    clearCommand: vi.fn(async () => undefined),
+    clearCommand: vi.fn(async () => true),
+    renewOwnerLeases: vi.fn(async () => 0),
     putPairingMaterial: vi.fn(async () => true),
     transition: vi.fn(async () => true),
     failStalePairings: vi.fn(async () => []),
@@ -115,6 +116,8 @@ beforeEach(() => {
     });
   });
   repoMock.failStalePairings.mockResolvedValue([]);
+  repoMock.renewOwnerLeases.mockResolvedValue(0);
+  repoMock.clearCommand.mockResolvedValue(true);
   repoMock.putPairingMaterial.mockResolvedValue(true);
   repoMock.transition.mockResolvedValue(true);
   startPairingMock.mockResolvedValue({ ok: true });
@@ -206,7 +209,71 @@ describe('start_pairing — o material só sai daqui cifrado', () => {
     expect(repoMock.transition).toHaveBeenCalledWith(
       expect.objectContaining({ state: 'failed', reason_code: 'command_execution_failed' }),
     );
-    expect(repoMock.clearCommand).toHaveBeenCalledWith(CHANNEL_ID);
+    expect(repoMock.clearCommand).toHaveBeenCalledWith({
+      channel_id: CHANNEL_ID,
+      command_id: COMMAND_ID,
+      owner_instance: _internal.OWNER_INSTANCE,
+    });
+  });
+});
+
+describe('lease de posse — correção distribuída (review PR #528, P1)', () => {
+  it('o tick RENOVA a lease antes de varrer — dono vivo nunca vira stale', async () => {
+    claimOnce(null);
+    await runChannelPairingWorker();
+
+    expect(repoMock.renewOwnerLeases).toHaveBeenCalledWith(_internal.OWNER_INSTANCE);
+    // Ordem importa: renovar DEPOIS de varrer deixaria a própria sessão viva
+    // desta instância exposta a um tick perdido.
+    const renewOrder = repoMock.renewOwnerLeases.mock.invocationCallOrder[0]!;
+    const sweepOrder = repoMock.failStalePairings.mock.invocationCallOrder[0]!;
+    expect(renewOrder).toBeLessThan(sweepOrder);
+  });
+
+  it('a varredura NÃO recebe owner_instance: o critério é a lease, não a identidade', async () => {
+    claimOnce(null);
+    await runChannelPairingWorker();
+
+    const args = repoMock.failStalePairings.mock.calls[0]![0] as Record<string, unknown>;
+    // Com `owner_instance` no filtro, a réplica B derrubava a sessão viva da
+    // réplica A a cada tick — o bug que este teste tranca.
+    expect(args).not.toHaveProperty('owner_instance');
+    expect(args.reason_code).toBe('interrupted_retryable');
+  });
+
+  it('clearCommand é CAS por (channel_id, command_id, owner_instance)', async () => {
+    claimOnce(commandRow());
+    await runChannelPairingWorker();
+
+    expect(repoMock.clearCommand).toHaveBeenCalledWith({
+      channel_id: CHANNEL_ID,
+      command_id: COMMAND_ID,
+      owner_instance: _internal.OWNER_INSTANCE,
+    });
+  });
+
+  it('transições terminais SOLTAM a posse (o heartbeat para de renovar)', async () => {
+    let hooks: { onPhase?: (p: unknown) => void } = {};
+    startPairingMock.mockImplementation(async (args: { hooks?: typeof hooks }) => {
+      hooks = args.hooks ?? {};
+      return { ok: true };
+    });
+    claimOnce(commandRow());
+    await runChannelPairingWorker();
+
+    hooks.onPhase?.({ phase: 'verified' });
+    await flush();
+
+    expect(repoMock.transition).toHaveBeenLastCalledWith(
+      expect.objectContaining({ state: 'verified_offline', release_owner: true }),
+    );
+  });
+
+  it('uma falha no heartbeat não derruba o tick', async () => {
+    repoMock.renewOwnerLeases.mockRejectedValue(new Error('db blip'));
+    claimOnce(commandRow());
+    await expect(runChannelPairingWorker()).resolves.toBeUndefined();
+    expect(startPairingMock).toHaveBeenCalled();
   });
 });
 
@@ -249,12 +316,8 @@ describe('restart no meio do pareamento', () => {
 
     await runChannelPairingWorker();
 
-    const args = repoMock.failStalePairings.mock.calls[0]![0] as {
-      owner_instance: string;
-      reason_code: string;
-    };
+    const args = repoMock.failStalePairings.mock.calls[0]![0] as { reason_code: string };
     expect(args.reason_code).toBe('interrupted_retryable');
-    expect(args.owner_instance).toBe(_internal.OWNER_INSTANCE);
 
     const expired = auditCalls.find((c) => c.acao === 'pairing_session_expired');
     expect(expired?.ctx).toMatchObject({ tenant_id: 'tenant-A', agent_id: 'agent-a' });

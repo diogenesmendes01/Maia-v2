@@ -39,6 +39,19 @@ CREATE TABLE IF NOT EXISTS channel_line_state (
   command_id uuid,
   command_requested_at timestamptz,
   command_claimed_at timestamptz,
+  -- LEASE de posse do trabalho deste canal (review PR #528, P1).
+  --
+  -- `command_claimed_at` sozinho não resolve nada num deploy com N réplicas:
+  -- `FOR UPDATE SKIP LOCKED` só protege a JANELA da transação, e assim que ela
+  -- commita a row volta a ser elegível — duas réplicas executavam o MESMO
+  -- `command_id`. Pior: o sweep de pareamentos órfãos considerava stale
+  -- qualquer `owner_instance` diferente da instância local, então a réplica B
+  -- matava a sessão VIVA da réplica A.
+  --
+  -- A lease é a única fonte de verdade de "alguém vivo está tocando isto": o
+  -- dono a renova por heartbeat a cada tick; um dono morto para de renovar e a
+  -- lease vence. Quem varre olha a LEASE, nunca a identidade do dono.
+  owner_lease_expires_at timestamptz,
   -- Ator ADMINISTRATIVO preservado ponta a ponta (invariante 4 do AGENTS.md):
   -- o runtime audita a transição citando quem pediu, não "system".
   actor_id text,
@@ -116,6 +129,11 @@ CREATE INDEX IF NOT EXISTS channel_line_state_scope_idx
 CREATE INDEX IF NOT EXISTS channel_line_state_pending_command_idx
   ON channel_line_state (command_requested_at)
   WHERE command IS NOT NULL;
+
+-- Heartbeat da lease: o dono renova só as SUAS rows.
+CREATE INDEX IF NOT EXISTS channel_line_state_owner_idx
+  ON channel_line_state (owner_instance)
+  WHERE owner_instance IS NOT NULL;
 
 -- Sweep de TTL do material efêmero + de pairings interrompidos por restart.
 CREATE INDEX IF NOT EXISTS channel_line_state_pairing_expiry_idx
