@@ -281,11 +281,13 @@ sudo systemctl stop maia          # SIGTERM → inicia o drain
 # Log esperado, nesta ordem:
 #   maia.shutting_down
 #   lifecycle.transition            from=ready to=draining
+#   queue.workers_paused
+#   lifecycle.shutdown_step_done    step=stop_accepting_work
 #   lifecycle.shutdown_step_done    step=cron_workers
+#   lifecycle.shutdown_step_done    step=bullmq
 #   lifecycle.shutdown_step_done    step=background_tasks
 #   lifecycle.shutdown_step_done    step=line_sessions
 #   lifecycle.shutdown_step_done    step=baileys
-#   lifecycle.shutdown_step_done    step=bullmq
 #   lifecycle.shutdown_step_done    step=http
 #   lifecycle.shutdown_step_done    step=pools
 #   lifecycle.shutdown_complete     result=clean
@@ -293,18 +295,35 @@ sudo systemctl start maia
 # Aguarde 'http.listening' → 'maia.ready' e /readyz respondendo 200
 ```
 
-**O que o shutdown faz de verdade** (`src/index.ts`, `registerShutdownSequence`):
+**O que o shutdown faz de verdade**
+(`src/runtime/lifecycle/shutdown-sequence.ts`, `registerShutdownSequence`):
 
-1. transição atômica para `draining` → `/readyz` responde 503 no request seguinte;
-2. para de agendar crons e **espera** o tick em execução (antes ele só chamava
-   `task.stop()` e seguia em frente, fechando os pools por baixo do job);
-3. espera as tarefas fire-and-forget rastreadas;
-4. fecha as linhas adicionais e depois a sessão Baileys primária;
-5. fecha BullMQ — `Worker.close()` **espera o job ativo terminar**;
+0. transição atômica para `draining` → `/readyz` responde 503 no request
+   seguinte, e o guard de trabalho novo (`lifecycle.isAcceptingWork()`) fecha
+   no mesmo tick do sinal;
+1. **para de aceitar trabalho** (`stop_accepting_work`, primeiro passo, sem
+   esperar nada): pausa os dois Workers BullMQ (`pause(true)` — para de
+   *buscar*) e para de agendar crons. Um job que já estava sendo entregue ao
+   processor é reestacionado como `delayed`, não executado;
+2. **espera** o tick de cron em execução (antes ele só chamava `task.stop()` e
+   seguia em frente, fechando os pools por baixo do job);
+3. fecha BullMQ — `Worker.close()` **espera o job ativo terminar**. Vem
+   ANTES do WhatsApp para que um turno em voo ainda consiga responder;
+4. espera as tarefas fire-and-forget rastreadas (reflection pós-turno, escrita
+   de DLQ, registro de linha) — depois da fila e dos crons, que são quem as
+   gera;
+5. fecha as linhas adicionais e depois a sessão Baileys primária (cancelando o
+   timer de reconexão pendente);
 6. fecha o Fastify (dispara os `onClose`: timers do coletor de memória e do probe de DB);
 7. audita `system_stopped`;
 8. fecha Redis e Postgres **por último** (nenhum consumidor fica com handle fechado);
 9. sai naturalmente. Não há `process.exit(0)` prematuro.
+
+**SIGTERM durante o boot** é tratado: cada fase do startup roda sob
+`lifecycle.runStartupStep`, que aborta o boot no primeiro checkpoint após o
+sinal e serializa contra o shutdown (nada é fechado enquanto ainda está sendo
+aberto). O log mostra `maia.startup_aborted_by_shutdown` e **não** há
+`system_start_failed` — sinal durante deploy não é incidente.
 
 **Orçamento de tempo** — `SHUTDOWN_GRACE_MS` (default 25s) é o teto do drain
 inteiro e `SHUTDOWN_STEP_TIMEOUT_MS` (default 10s) o de cada passo. Ele

@@ -221,51 +221,67 @@ async function evaluateComponents(
   return checks;
 }
 
+/** Not-ready answer derived purely from the lifecycle state — no I/O. */
+function notReadyByState(state: LifecycleState, role: ProcessRole): RoleReadinessReport {
+  // Report the in-memory component registry (free) so an operator can see
+  // WHAT is missing, but do no I/O — a draining instance must not probe.
+  const contract = getRoleContract(role);
+  const checks = contract.requires.map((component) => ({
+    ...fromComponentState(component),
+    required: true,
+  }));
+  return {
+    ready: false,
+    state,
+    role,
+    instance_id: lifecycle.instanceId,
+    reason:
+      state === 'draining'
+        ? 'draining: instance is shedding traffic before shutdown'
+        : state === 'failed'
+          ? 'startup failed: mandatory dependency unavailable'
+          : state === 'stopped'
+            ? 'stopped'
+            : 'starting: mandatory components not verified yet',
+    checks,
+  };
+}
+
 /**
  * Composite readiness for the current process role.
  *
- * Lifecycle state is evaluated BEFORE any component work and is never cached:
- * the moment `shutdown()` transitions to `draining`, this returns 503-worthy
- * with no I/O at all.
+ * The lifecycle state is checked TWICE and never cached — before the probes
+ * (so a draining instance does no I/O at all) and again immediately before the
+ * response is built.
+ *
+ * The second check is the fix for review round 1 (P2 on `readiness.ts:275`):
+ * `evaluateComponents()` can take up to `READINESS_PROBE_TIMEOUT_MS`, and a
+ * SIGTERM landing inside that window used to be invisible — the request had
+ * already sampled `state = 'ready'` and answered 200 from a snapshot taken
+ * before the drain. That silently broke the "503 immediately on drain"
+ * guarantee for exactly the requests in flight when the signal arrives, which
+ * are the ones a rolling deploy produces.
  */
 export async function checkRoleReadiness(): Promise<RoleReadinessReport> {
-  const state = lifecycle.state;
   const role = lifecycle.role;
   const instance_id = lifecycle.instanceId;
 
-  if (NOT_READY_STATES.includes(state)) {
-    // Report the in-memory component registry (free) so an operator can see
-    // WHAT is missing, but do no I/O — a draining instance must not probe.
-    const contract = getRoleContract(role);
-    const checks = contract.requires.map((component) => ({
-      ...fromComponentState(component),
-      required: true,
-    }));
-    return {
-      ready: false,
-      state,
-      role,
-      instance_id,
-      reason:
-        state === 'draining'
-          ? 'draining: instance is shedding traffic before shutdown'
-          : state === 'failed'
-            ? 'startup failed: mandatory dependency unavailable'
-            : state === 'stopped'
-              ? 'stopped'
-              : 'starting: mandatory components not verified yet',
-      checks,
-    };
-  }
+  const stateBefore = lifecycle.state;
+  if (NOT_READY_STATES.includes(stateBefore)) return notReadyByState(stateBefore, role);
 
-  const checks = await evaluateComponents(role, state);
+  const checks = await evaluateComponents(role, stateBefore);
+
+  // RESAMPLE: the drain may have started while the probes were in flight.
+  const stateAfter = lifecycle.state;
+  if (NOT_READY_STATES.includes(stateAfter)) return notReadyByState(stateAfter, role);
+
   const blocking = checks.filter(
     (c) => c.required && c.status !== 'ok' && c.status !== 'degraded',
   );
   if (blocking.length > 0) {
     return {
       ready: false,
-      state,
+      state: stateAfter,
       role,
       instance_id,
       reason: `required component(s) not healthy: ${blocking
@@ -274,7 +290,7 @@ export async function checkRoleReadiness(): Promise<RoleReadinessReport> {
       checks,
     };
   }
-  return { ready: true, state, role, instance_id, checks };
+  return { ready: true, state: stateAfter, role, instance_id, checks };
 }
 
 /** Startup probe (`/startupz`): did this process finish initialization? */

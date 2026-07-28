@@ -269,6 +269,51 @@ describe('checkRoleReadiness — probes are cheap and bounded', () => {
     expect(probeDbMock).toHaveBeenCalledTimes(1);
   });
 
+  it('RESAMPLES the state after the probes: draining mid-probe still answers not-ready', async () => {
+    // Review round 1, P2 (`readiness.ts:275`): the state was sampled BEFORE the
+    // probes and never re-checked, so a SIGTERM landing while a probe was in
+    // flight produced a `ready: true` built from a pre-drain snapshot. That is
+    // exactly the request a rolling deploy generates.
+    makeEverythingHealthy();
+    lifecycle.transitionTo('ready');
+
+    let releaseProbe!: () => void;
+    probeDbMock.mockReturnValue(
+      new Promise<boolean>((resolve) => {
+        releaseProbe = () => resolve(true);
+      }),
+    );
+
+    const inFlight = checkRoleReadiness();
+    // …the drain starts while the DB probe is still pending.
+    await new Promise((r) => setTimeout(r, 10));
+    lifecycle.transitionTo('draining', 'SIGTERM');
+    releaseProbe();
+
+    const r = await inFlight;
+    expect(r.ready).toBe(false);
+    expect(r.state).toBe('draining');
+    expect(r.reason).toMatch(/draining/i);
+  });
+
+  it('resamples for `failed` mid-probe too', async () => {
+    makeEverythingHealthy();
+    lifecycle.transitionTo('ready');
+    let releaseProbe!: () => void;
+    probeDbMock.mockReturnValue(
+      new Promise<boolean>((resolve) => {
+        releaseProbe = () => resolve(true);
+      }),
+    );
+    const inFlight = checkRoleReadiness();
+    await new Promise((r) => setTimeout(r, 10));
+    lifecycle.transitionTo('failed', 'dependency lost');
+    releaseProbe();
+    const r = await inFlight;
+    expect(r.ready).toBe(false);
+    expect(r.state).toBe('failed');
+  });
+
   it('a component that never answers is reported `unknown` (fail-closed for required)', async () => {
     makeEverythingHealthy();
     lifecycle.transitionTo('ready');
