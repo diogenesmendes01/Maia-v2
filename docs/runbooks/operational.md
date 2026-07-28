@@ -267,6 +267,7 @@ Valor desconhecido = erro de boot (fail-closed), nunca fallback permissivo.
 | `maia_shutdown_total{result,role}` | counter | `result="incomplete"` |
 | `maia_shutdown_duration_ms{component}` | histogram | passo perto do `SHUTDOWN_STEP_TIMEOUT_MS` |
 | `maia_shutdown_forced_total{reason,role}` | counter | **qualquer** incremento |
+| `maia_shutdown_undrained_startup_total{step}` | counter | **qualquer** incremento (fase de boot travada; recurso pode ter ficado aberto) |
 | `maia_worker_active_jobs{worker}` | gauge | =1 continuamente (job travado) |
 | `maia_worker_last_success_timestamp{worker}` | gauge | idade > 3× a cadência do cron |
 | `maia_worker_last_failure_timestamp{worker}` | gauge | recente + sem sucesso depois |
@@ -324,6 +325,16 @@ sudo systemctl start maia
 sinal e serializa contra o shutdown (nada é fechado enquanto ainda está sendo
 aberto). O log mostra `maia.startup_aborted_by_shutdown` e **não** há
 `system_start_failed` — sinal durante deploy não é incidente.
+
+Se a fase de boot **não ceder** dentro de `SHUTDOWN_STEP_TIMEOUT_MS`, o drain
+não espera para sempre — mas também **não** se declara limpo: a fase entra em
+`undrained` como `startup:<fase>` (log
+`lifecycle.shutdown_startup_step_did_not_yield`, counter
+`maia_shutdown_undrained_startup_total{step}`), o outcome vira `incomplete` e
+o processo sai com `SHUTDOWN_FORCED_EXIT_CODE`. O motivo é concreto: um
+`startServer()`/`startBaileys()` que retorna DEPOIS do passo que o fecharia
+deixaria listener ou socket vivo num processo que já se disse parado — a saída
+forçada entrega ao SO o que não foi possível fechar.
 
 **Orçamento de tempo** — `SHUTDOWN_GRACE_MS` (default 25s) é o teto do drain
 inteiro e `SHUTDOWN_STEP_TIMEOUT_MS` (default 10s) o de cada passo. Ele

@@ -465,26 +465,41 @@ class LifecycleController {
     // before any resource starts closing.
     this.transitionTo('draining', opts?.reason ?? opts?.signal ?? 'shutdown_requested');
 
+    const grace = config.SHUTDOWN_GRACE_MS;
+    const drained: string[] = [];
+    const undrained: string[] = [];
+
     // SERIALIZE against a boot in flight (review round 1, P1 on
     // `src/index.ts:319`). Closing a resource while `main()` is still opening
     // it is how a "stopped" process ends up with live sockets. `runStartupStep`
-    // aborts at its next checkpoint, so this wait is short — but it is bounded
-    // anyway so a wedged dependency cannot hold the whole drain hostage.
+    // aborts at its next checkpoint, so this wait is normally very short — but
+    // it is bounded so a wedged dependency cannot hold the whole drain hostage.
+    //
+    // Review round 2: when that bound EXPIRES the drain is NOT clean. The boot
+    // phase is still running, and whatever it is opening (`startServer()`'s
+    // listener, `startBaileys()`'s socket) can land AFTER the step that would
+    // have closed it — leaving a live resource on a process that has declared
+    // itself stopped. So the timeout is recorded as UNDRAINED, which makes the
+    // outcome `incomplete`, which makes `runShutdown()` exit with
+    // `SHUTDOWN_FORCED_EXIT_CODE` and let the OS reclaim what we could not
+    // close. Giving up on a wait is a forced shutdown, not a clean one.
     const startup = this.#startupStep;
     if (startup) {
       logger.info({ step: startup.name }, 'lifecycle.shutdown_waiting_for_startup_step');
       const settled = await withDeadline(startup.done, config.SHUTDOWN_STEP_TIMEOUT_MS);
       if (!settled.ok) {
+        undrained.push(`startup:${startup.name}`);
+        incCounter('maia_shutdown_undrained_startup_total', { step: startup.name });
         logger.error(
-          { step: startup.name, timeout_ms: config.SHUTDOWN_STEP_TIMEOUT_MS },
-          'lifecycle.shutdown_startup_step_did_not_yield',
+          {
+            step: startup.name,
+            timeout_ms: config.SHUTDOWN_STEP_TIMEOUT_MS,
+            instance_id: this.instanceId,
+          },
+          'lifecycle.shutdown_startup_step_did_not_yield — resource may still be opening; drain is INCOMPLETE',
         );
       }
     }
-
-    const grace = config.SHUTDOWN_GRACE_MS;
-    const drained: string[] = [];
-    const undrained: string[] = [];
 
     for (const step of this.#steps) {
       const remaining = grace - (Date.now() - t0);

@@ -148,18 +148,52 @@ describe('shutdown — serialization against a boot in flight', () => {
     await draining;
   });
 
-  it('does not wait forever on a wedged startup phase (bounded, then proceeds)', async () => {
+  it('a wedged startup phase does NOT block the drain, but makes it INCOMPLETE', async () => {
+    // Review round 2: the previous version of this test asserted
+    // `result === 'clean'` and so protected the bug. Giving up on the wait is
+    // not a clean shutdown — the boot phase is still running, and whatever it
+    // is opening (an HTTP listener, a Baileys socket) can land AFTER the step
+    // that would have closed it. The process must say so and exit forced.
     const order: string[] = [];
     lifecycle.registerShutdownStep({
       name: 'pools',
       run: async () => void order.push('shutdown_step'),
     });
-    // Never settles — a dependency that hangs must not hold the drain hostage.
-    void lifecycle.runStartupStep('redis', () => new Promise<void>(() => undefined)).catch(
-      () => undefined,
-    );
+    // Never settles — a dependency that hangs must not hold the drain hostage…
+    void lifecycle
+      .runStartupStep('http', () => new Promise<void>(() => undefined))
+      .catch(() => undefined);
+
     const out = await lifecycle.shutdown({ signal: 'SIGTERM' });
+
+    // …so the remaining steps still run (the pools DO get closed)…
     expect(order).toEqual(['shutdown_step']);
-    expect(out.result).toBe('clean');
+    // …but the outcome is honest about what it could not serialize against.
+    expect(out.result).toBe('incomplete');
+    expect(out.undrained).toContain('startup:http');
+    // `runShutdown()` turns `incomplete` into a forced, non-zero exit.
   }, 30_000);
+
+  it('names the wedged phase so the operator knows which resource may be live', async () => {
+    lifecycle.registerShutdownStep({ name: 'baileys', run: async () => undefined });
+    void lifecycle
+      .runStartupStep('whatsapp_session', () => new Promise<void>(() => undefined))
+      .catch(() => undefined);
+    const out = await lifecycle.shutdown({ signal: 'SIGTERM' });
+    expect(out.undrained).toEqual(['startup:whatsapp_session']);
+  }, 30_000);
+
+  it('a phase that yields IN TIME keeps the drain clean', async () => {
+    const slow = deferred();
+    lifecycle.registerShutdownStep({ name: 'pools', run: async () => undefined });
+    const phase = lifecycle.runStartupStep('redis', async () => {
+      await slow.promise;
+    });
+    const draining = lifecycle.shutdown({ signal: 'SIGTERM' });
+    slow.resolve();
+    await phase.catch(() => undefined);
+    const out = await draining;
+    expect(out.result).toBe('clean');
+    expect(out.undrained).toEqual([]);
+  });
 });
