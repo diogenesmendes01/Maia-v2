@@ -119,6 +119,14 @@ export type ReActDelivery = {
    * NUNCA reenviar: o outcome correto é `reply_delivery_unknown`.
    */
   persistUnknown: boolean;
+  /**
+   * Alguma tool com `side_effect` `write`/`communication` foi INVOCADA neste
+   * turno. Quando true, um retry pode DUPLICAR o efeito (transação criada duas
+   * vezes, mensagem enviada duas vezes), então o turno não pode voltar para a
+   * fila — vai para dead letter com outcome `unsafe_to_retry` e exige decisão
+   * humana. Conservador por construção: marca na invocação, não no sucesso.
+   */
+  sideEffectsCommitted: boolean;
 };
 
 export type ReActExitReason =
@@ -164,6 +172,9 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
   // Issue #503 — dispatch entregue mas persistência ambígua: o usuário TEM a
   // resposta, então nunca reenviar; o outcome é `reply_delivery_unknown`.
   let persistUnknown = false;
+  // Issue #503 — alguma tool com efeito externo irreversível chegou a rodar?
+  // Enquanto false, um retry é seguro; a partir de true, não é.
+  let sideEffectsCommitted = false;
 
   for (let i = 0; i < MAX_REACT_ITERATIONS; i++) {
     const reasonerResult = await runCognitiveModule(
@@ -312,6 +323,21 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
         },
       });
       const isError = typeof out === 'object' && out !== null && 'error' in out;
+
+      // Issue #503 — RASTREIO DE EFEITO IRREVERSÍVEL. Uma tool `write` ou
+      // `communication` pode ter alterado estado externo (transação criada,
+      // mensagem enviada). Se o turno falhar DEPOIS disso, reexecutar o ReAct
+      // duplicaria o efeito, então o turno não pode ser `retryable`.
+      //
+      // Deliberadamente conservador: marcamos na INVOCAÇÃO, não no sucesso. Um
+      // `isError` do dispatcher não prova que nada foi aplicado (pode ter
+      // falhado depois do commit externo), e o custo de errar para o lado
+      // seguro é uma intervenção manual; para o outro lado é cobrar o cliente
+      // duas vezes.
+      const spec = REGISTRY[tu.tool];
+      if (spec?.side_effect === 'write' || spec?.side_effect === 'communication') {
+        sideEffectsCommitted = true;
+      }
 
       // P3b Task 9: capture every tool invocation for the post-turn
       // step-evaluator (tool_result success criteria).
@@ -468,6 +494,6 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
     totalTokens,
     outboundText,
     toolsCalled,
-    delivery: { dispatched: outboundDispatched, exitReason, persistUnknown },
+    delivery: { dispatched: outboundDispatched, exitReason, persistUnknown, sideEffectsCommitted },
   };
 }

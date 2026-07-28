@@ -383,7 +383,7 @@ export const agentTurnsRepo = {
   /** Tentativas esgotadas ou estado que exige intervenção humana. TERMINAL. */
   async markDeadLetter(input: {
     turn_id: string;
-    outcome: Extract<TurnOutcome, 'retry_exhausted' | 'operator_cancelled'>;
+    outcome: Extract<TurnOutcome, 'retry_exhausted' | 'operator_cancelled' | 'unsafe_to_retry'>;
     error_code: string;
     error_summary: string | null;
     expected_version?: number;

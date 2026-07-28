@@ -88,6 +88,7 @@ export const TURN_OUTCOMES = [
   'operator_cancelled',
   'merged_into_turn',
   'retry_exhausted',
+  'unsafe_to_retry',
 ] as const;
 
 export type TurnOutcome = (typeof TURN_OUTCOMES)[number];
@@ -168,7 +169,10 @@ export const TERMINAL_OUTCOMES: Readonly<Record<TerminalTurnStatus, readonly Tur
     'operator_cancelled',
   ],
   superseded: ['merged_into_turn'],
-  dead_letter: ['retry_exhausted', 'operator_cancelled'],
+  // `unsafe_to_retry`: a tentativa falhou DEPOIS de uma tool com efeito externo
+  // irreversível ter rodado. Retry duplicaria o efeito, então o turno para aqui
+  // e exige decisão humana (replay manual auditado, ou encerramento).
+  dead_letter: ['retry_exhausted', 'operator_cancelled', 'unsafe_to_retry'],
 } as const;
 
 /**

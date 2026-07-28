@@ -125,7 +125,7 @@ CREATE TABLE IF NOT EXISTS agent_turns (
     ))
     OR (status = 'superseded' AND outcome IS NOT NULL AND outcome = 'merged_into_turn')
     OR (status = 'dead_letter' AND outcome IS NOT NULL
-        AND outcome IN ('retry_exhausted', 'operator_cancelled'))
+        AND outcome IN ('retry_exhausted', 'operator_cancelled', 'unsafe_to_retry'))
   ),
 
   CONSTRAINT agent_turns_state_version_chk CHECK (state_version >= 0),

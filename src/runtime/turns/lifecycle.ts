@@ -440,7 +440,7 @@ export async function deadLetterTurn(
   args: {
     code: string;
     summary?: string | null;
-    outcome?: 'retry_exhausted' | 'operator_cancelled';
+    outcome?: 'retry_exhausted' | 'operator_cancelled' | 'unsafe_to_retry';
     error?: unknown;
   },
 ): Promise<void> {

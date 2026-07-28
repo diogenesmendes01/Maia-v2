@@ -48,6 +48,7 @@ import { executeSelectedSkill } from './execute-skill.js';
 import { runSkill } from '@/skills/index.js';
 import { skillsRepo, outboundMessagesRepo } from '@/db/repositories.js';
 import { runReActLoop, type ReActDelivery } from './react-loop.js';
+import { decideTurnAction } from './turn-outcome.js';
 // Issue #503 — máquina de estados durável do turno inbound. `core.ts` declara o
 // OUTCOME de negócio; a fachada escolhe o estado terminal e faz o CAS.
 import {
@@ -56,6 +57,7 @@ import {
   absorbDebounceInputs,
   concludeTurn,
   failTurnRetryable,
+  deadLetterTurn,
   isTerminalTurnStatus,
   turnStateAuthoritative,
 } from '@/runtime/turns/index.js';
@@ -1275,25 +1277,36 @@ async function runAgentForMensagemInner(
   // `iteration_cap` NÃO é retryable: tools já rodaram, reexecutar duplicaria
   // efeito colateral — conclui sem resposta e o operador vê pela auditoria
   // `turn_completed_without_reply`.
-  if (reactDelivery.dispatched) {
-    await concludeTurn(
-      turn,
-      reactDelivery.persistUnknown ? 'reply_delivery_unknown' : 'reply_delivered',
-      { pessoa_id: pessoa.id, mensagem_id: inbound.id },
-    );
-  } else if (
-    reactDelivery.exitReason === 'reasoner_failed' ||
-    reactDelivery.exitReason === 'outbound_failure'
-  ) {
-    await failTurnRetryable(turn, {
-      code: reactDelivery.exitReason,
-      mensagem_id: inbound.id,
-    });
-  } else {
-    await concludeTurn(turn, 'no_reply_produced', {
+  //
+  // A MESMA proteção vale para `reasoner_failed`/`outbound_failure` (achado P1
+  // rodada 1): o risco não é do motivo da saída, é de JÁ TER RODADO uma tool com
+  // efeito externo. Iteração 1 cria um boleto, iteração 2 expira o reasoner —
+  // reenfileirar reexecutaria o ReAct do zero e poderia criar o boleto de novo.
+  // `reactDelivery.sideEffectsCommitted` é o gate: sem efeito irreversível, o
+  // retry é seguro; com efeito, o turno para em dead letter com
+  // `unsafe_to_retry` e exige decisão humana (replay manual auditado).
+  // A regra vive em `decideTurnAction` (src/agent/turn-outcome.ts): pura,
+  // exaustivamente testada, e fora deste orquestrador onde nenhum teste
+  // alcançava.
+  const action = decideTurnAction(reactDelivery);
+  if (action.kind === 'complete') {
+    await concludeTurn(turn, action.outcome, {
       pessoa_id: pessoa.id,
       mensagem_id: inbound.id,
     });
+  } else if (action.kind === 'retry') {
+    await failTurnRetryable(turn, { code: action.code, mensagem_id: inbound.id });
+  } else {
+    logger.error(
+      {
+        mensagem_id: inbound.id,
+        turn_id: turn?.turn_id,
+        error_code: action.code,
+        ops_alert: true,
+      },
+      'agent.turn_unsafe_to_retry',
+    );
+    await deadLetterTurn(turn, { code: action.code, outcome: action.outcome });
   }
 
   // PROJEÇÃO LEGADA (#503 §6), agora condicionada ao ESTADO.
