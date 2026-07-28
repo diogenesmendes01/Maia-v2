@@ -249,16 +249,37 @@ d('agent_turns — DB real (migrations 096/097)', () => {
     /** Nomes de constraint que podem legitimamente barrar um par inválido. */
     const OUTCOME_CONSTRAINTS = /agent_turns_(outcome_presence|status_outcome)_chk/;
 
-    async function insertTurn(
+    /**
+     * Devolve o RESULTADO da query, não `void`.
+     *
+     * A primeira versão era `Promise<void>`: os casos positivos usavam
+     * `.resolves.toBeDefined()` e falhavam sempre, porque um INSERT bem
+     * sucedido resolvia `undefined`. Os 21 pares que DEVEM ser aceitos
+     * apareciam como falha — o CI de integração ficou vermelho exatamente
+     * aqui. Retornando o `QueryResult`, o caso positivo afirma algo real:
+     * `rowCount === 1`.
+     */
+    function insertTurn(
       mensagem_id: string,
       status: string,
       outcome: string | null,
-    ): Promise<void> {
-      await pool.query(
+    ): Promise<pg.QueryResult> {
+      return pool.query(
         `INSERT INTO agent_turns (tenant_id, agent_id, representative_message_id, status, outcome)
          VALUES ('primary', 'primary', $1, $2, $3)`,
         [mensagem_id, status, outcome],
       );
+    }
+
+    /** Insere e exige que a row TENHA sido criada. */
+    async function expectAccepted(
+      mensagem_id: string,
+      status: string,
+      outcome: string | null,
+      hint: string,
+    ): Promise<void> {
+      const result = await insertTurn(mensagem_id, status, outcome);
+      expect(result.rowCount, hint).toBe(1);
     }
 
     let rejectMsg: string;
@@ -279,10 +300,12 @@ d('agent_turns — DB real (migrations 096/097)', () => {
       for (const status of TERMINAL_TURN_STATUSES) {
         for (const outcome of TERMINAL_OUTCOMES[status]) {
           const msg = await mkInbound('primary', 'primary');
-          await expect(
-            insertTurn(msg, status, outcome),
+          await expectAccepted(
+            msg,
+            status,
+            outcome,
             `${status} + ${outcome} consta de TERMINAL_OUTCOMES e deveria ser aceito`,
-          ).resolves.toBeDefined();
+          );
         }
       }
     });
@@ -304,10 +327,7 @@ d('agent_turns — DB real (migrations 096/097)', () => {
       for (const status of TURN_STATUSES) {
         if (isTerminalTurnStatus(status)) continue;
         const msg = await mkInbound('primary', 'primary');
-        await expect(
-          insertTurn(msg, status, null),
-          `${status} + outcome NULL deveria ser aceito`,
-        ).resolves.toBeDefined();
+        await expectAccepted(msg, status, null, `${status} + outcome NULL deveria ser aceito`);
       }
     });
 
@@ -348,7 +368,7 @@ d('agent_turns — DB real (migrations 096/097)', () => {
           `${outcome} não pode ser aceito em 'completed'`,
         ).rejects.toThrow(OUTCOME_CONSTRAINTS);
         const msg = await mkInbound('primary', 'primary');
-        await expect(insertTurn(msg, 'ignored', outcome)).resolves.toBeDefined();
+        await expectAccepted(msg, 'ignored', outcome, `${outcome} deveria ser aceito em 'ignored'`);
       }
     });
 
@@ -364,7 +384,12 @@ d('agent_turns — DB real (migrations 096/097)', () => {
         );
       }
       const msg = await mkInbound('primary', 'primary');
-      await expect(insertTurn(msg, 'dead_letter', 'retry_exhausted')).resolves.toBeDefined();
+      await expectAccepted(
+        msg,
+        'dead_letter',
+        'retry_exhausted',
+        "retry_exhausted deveria ser aceito em 'dead_letter'",
+      );
     });
   });
 
