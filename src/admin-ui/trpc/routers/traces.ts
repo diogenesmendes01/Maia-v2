@@ -165,11 +165,22 @@ export const tracesRouter = router({
         // never the operator's free-text reason.
         pep_decisions: hooks.map((h, i) => ({
           id: `${trace.trace_id}:${i}`,
+          // `hook_name` is the PEP kind (early/mid/late) — surfacing it lets an
+          // operator see WHERE in the chain the verdict came from.
+          pep: String(h.hook_name ?? 'unknown'),
           decision: String(h.outcome ?? h.effect ?? 'unknown'),
           reason: String(h.error_code ?? ''),
           at: trace.created_at,
         })),
-        policy_refs: trace.policy_id ? [trace.policy_id] : [],
+        // Every policy that participated, not just the blocking one.
+        policy_refs: [
+          ...new Set(
+            [
+              trace.policy_id,
+              ...hooks.map((h) => (typeof h.hook_id === 'string' ? h.hook_id : null)),
+            ].filter((p): p is string => typeof p === 'string' && p.length > 0),
+          ),
+        ],
         full_snapshot_available: grant !== null,
       };
     }),

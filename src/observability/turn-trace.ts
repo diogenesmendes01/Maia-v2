@@ -209,6 +209,24 @@ export function toContextStub(input: TraceTurnDecisionInput): ExecutionContextPa
       // No `text`, no `media_refs`. Redaction would strip them anyway; not
       // collecting them in the first place is the stronger guarantee.
     },
+    // Review round 1 [P2]: the PERSISTED body carried no `policy_hooks`, but
+    // the Trace Explorer reads `redacted_packet.policy_hooks` exclusively — so
+    // the detail page showed "nenhuma decisão PEP" even for turns where policy
+    // actually fired. `toDecisionStub` had the hooks; only the envelope saw
+    // them, and the envelope is not what the Explorer renders.
+    //
+    // Projected into the shape `lib/redaction.ts` ALLOWS for hooks
+    // (`hook_id`, `hook_name`, `outcome`, `error_code`, `duration_ms`,
+    // `version`) — anything else would be dropped on write, which is how this
+    // silently produced an empty array. Note what is deliberately absent:
+    // `rule_descriptor` and `reason` are operator/LLM-authored free text that
+    // can quote user content, so they never reach durable storage. The
+    // enumerated verdict is the whole evidentiary payload.
+    policy_hooks: hooks.map((d) => ({
+      hook_name: d.pep,
+      hook_id: d.policy_id,
+      outcome: d.decision,
+    })),
     decision_meta: {
       risk_score: riskScoreFor(packet.risk_profile.level),
       hook_count: hooks.length,

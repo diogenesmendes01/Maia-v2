@@ -7,6 +7,7 @@ import { trpc } from '../../../trpc/client.js';
 import { PageHeader } from '../../../components/ui/page-header.js';
 import { Card, CardHeader, CardBody } from '../../../components/ui/card.js';
 import { Button } from '../../../components/ui/button.js';
+import { Badge } from '../../../components/ui/badge.js';
 import { Modal } from '../../../components/ui/modal.js';
 import { Field, Input, Select, Textarea } from '../../../components/ui/field.js';
 import {
@@ -184,10 +185,11 @@ export default function TraceDetailPage({
               <ul className="space-y-2 text-sm">
                 {trace.pep_decisions.map((d) => (
                   <li key={d.id} className="flex items-baseline gap-2">
+                    <Badge tone="neutral">{d.pep}</Badge>
                     <span className="font-mono text-xs text-zinc-700">
                       {d.decision}
                     </span>
-                    <span className="text-zinc-600">— {d.reason}</span>
+                    {d.reason && <span className="text-zinc-600">— {d.reason}</span>}
                   </li>
                 ))}
               </ul>
