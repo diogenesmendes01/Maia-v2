@@ -108,6 +108,26 @@ export async function uploadBackup(localPath: string): Promise<string> {
  * client-side before it reaches this module, so a provider that ignores SSE
  * still never receives plaintext.
  */
+/**
+ * The object key an artifact will occupy. Exposed so the caller knows the key
+ * BEFORE uploading — which is what lets a cancelled upload reap its own
+ * possible leftover (issue #520 round-1 P2).
+ */
+export function backupObjectKey(localPath: string): string {
+  return `${config.BACKUP_S3_PREFIX}/${basename(localPath)}`;
+}
+
+/** Delete one backup object. Used to reap the leftover of a cancelled upload. */
+export async function deleteBackupObject(key: string): Promise<void> {
+  if (!config.BACKUP_S3_BUCKET) return;
+  await getS3Client().send(
+    new DeleteObjectsCommand({
+      Bucket: config.BACKUP_S3_BUCKET,
+      Delete: { Objects: [{ Key: key }] },
+    }),
+  );
+}
+
 export async function uploadBackupObject(
   localPath: string,
   sha256Hex: string,
@@ -117,7 +137,7 @@ export async function uploadBackupObject(
     throw new Error('BACKUP_S3_BUCKET not set');
   }
   const stats = await stat(localPath);
-  const key = `${config.BACKUP_S3_PREFIX}/${basename(localPath)}`;
+  const key = backupObjectKey(localPath);
   const body = createReadStream(localPath);
   // Abort must tear the source stream down too, or the file handle outlives
   // the cancelled request (issue #520 round-1 P2).

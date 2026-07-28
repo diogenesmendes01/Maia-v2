@@ -20,12 +20,15 @@ import { TypedError } from '@/lib/utils.js';
 import { audit } from '@/governance/audit.js';
 import type { AuditAction } from '@/governance/audit-actions.js';
 import {
+  backupObjectKey,
+  deleteBackupObject,
   downloadAndDigestBackupObject,
   headBackupObject,
   isS3Configured,
   uploadBackupObject,
 } from '@/workers/backup-s3.js';
 import { base64ToHex, verifyRemoteArtifact } from './remote-verify.js';
+import { putWithDeadline } from './upload-deadline.js';
 import { sha256File } from './checksum.js';
 import { encryptFile, parseBackupKeyring } from './encryption.js';
 import { opaqueLocator } from './redaction.js';
@@ -265,14 +268,27 @@ export function createBackupPorts(): BackupPorts {
         throw new TypedError('upload_failed', 'no off-site destination configured', {});
       }
       const { sha256 } = await sha256File(path);
-      const uploaded = await withTimeout(
-        uploadBackupObject(path, sha256),
+      // The key is derived BEFORE the request so a cancelled upload can reap
+      // its own leftover (round-1 P2).
+      const key = backupObjectKey(path);
+      const bucket = config.BACKUP_S3_BUCKET ?? '';
+      await putWithDeadline(
+        {
+          put: async (signal) => {
+            await uploadBackupObject(path, sha256, { signal });
+          },
+          objectExists: async () => (await headBackupObject(key)) !== null,
+          deleteObject: () => deleteBackupObject(key),
+          // The key is hashed even in a warning: an object key names the
+          // artifact and, with the bucket, locates the crown jewels.
+          log: (event, detail) =>
+            logger.warn({ ...detail, key_hash: opaqueLocator(bucket, key) }, event),
+        },
         timeoutMs,
-        'upload_failed',
       );
-      const head = await headBackupObject(uploaded.key);
+      const head = await headBackupObject(key);
       return {
-        locator: opaqueLocator(uploaded.bucket, uploaded.key),
+        locator: opaqueLocator(bucket, key),
         remote_bytes: head?.bytes ?? null,
         // The provider's own digest, hex — null when it offers none. This is
         // NOT the uploader's metadata stamp (round-1 P1); `verifyRemote`
@@ -281,7 +297,7 @@ export function createBackupPorts(): BackupPorts {
           ? (base64ToHex(head.providerSha256Base64) ?? null)
           : null,
         // Carried so verifyRemote can re-HEAD without re-deriving the key.
-        ...({ _key: uploaded.key } as Record<string, string>),
+        ...({ _key: key } as Record<string, string>),
       } as UploadOutcome;
     },
 
@@ -323,24 +339,11 @@ export function createBackupPorts(): BackupPorts {
   };
 }
 
-function withTimeout<T>(p: Promise<T>, ms: number, code: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(
-      () => reject(new TypedError(code, `operation exceeded its ${ms}ms budget`, {})),
-      ms,
-    );
-    p.then(
-      (v) => {
-        clearTimeout(timer);
-        resolve(v);
-      },
-      (e) => {
-        clearTimeout(timer);
-        reject(e as Error);
-      },
-    );
-  });
-}
+// A `withTimeout` helper used to live here and bounded the upload by RACING a
+// timer against the request. It was deleted in the round-1 P2 fix: racing
+// rejects the outer promise while the request keeps running, which is how a
+// "failed" run ended up with an untracked remote object. `putWithDeadline`
+// (src/ops/backup/upload-deadline.ts) aborts, awaits settlement and reaps.
 
 /** Exported for the restore drill: stream a local artifact for verification. */
 export function openArtifact(path: string): ReturnType<typeof createReadStream> {
