@@ -17,22 +17,91 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-const { dbInsertValuesMock, dbExecuteMock, dbTransactionMock, txRows } = vi.hoisted(() => {
+const {
+  dbInsertValuesMock,
+  dbExecuteMock,
+  dbTransactionMock,
+  txRows,
+  persisted,
+  UniqueViolationError,
+} = vi.hoisted(() => {
   const txRows: Array<{ table: string; row: Record<string, unknown> }> = [];
+
+  /**
+   * Review round 1 [P1] — the previous fake accepted every INSERT, so the
+   * retry spec zeroed `txRows` between attempts and never exercised the fact
+   * that `runtime_trace_envelopes.trace_id` is a PRIMARY KEY. It was a test
+   * that could not fail for the right reason.
+   *
+   * This fake models real PK semantics:
+   *   - a plain INSERT of an existing `trace_id` THROWS a unique violation
+   *     (Postgres SQLSTATE 23505), exactly like the database;
+   *   - `.onConflictDoNothing()` swallows the conflict and inserts nothing.
+   *
+   * `persisted` is the durable store and survives `txRows` being cleared, so a
+   * spec can inspect the last transaction's rows without losing uniqueness
+   * state across attempts.
+   */
+  const persisted = new Map<string, Record<string, unknown>>();
+
+  /**
+   * Resolve a Drizzle table's real name. It lives under `Symbol(drizzle:Name)`,
+   * NOT `table._.name` (which is `undefined`). The previous fake read `._.name`
+   * and silently labelled every row `'unknown'`, so the envelope and its outbox
+   * row — which share a `trace_id` — were indistinguishable. Keying the store
+   * on that would have made the outbox insert look like a duplicate of the
+   * envelope.
+   */
+  function tableName(table: unknown): string {
+    if (!table || typeof table !== 'object') return 'unknown';
+    for (const sym of Object.getOwnPropertySymbols(table)) {
+      if (String(sym) === 'Symbol(drizzle:Name)') {
+        const v = (table as Record<symbol, unknown>)[sym];
+        if (typeof v === 'string') return v;
+      }
+    }
+    return 'unknown';
+  }
+
+  class UniqueViolationError extends Error {
+    code = '23505';
+    constructor(key: string) {
+      super(`duplicate key value violates unique constraint (${key})`);
+      this.name = 'UniqueViolationError';
+    }
+  }
+
+  function insertInto(table: string, row: Record<string, unknown>) {
+    const key = `${table}:${String(row.trace_id)}`;
+    const conflict = persisted.has(key);
+    const commit = (): void => {
+      persisted.set(key, row);
+      txRows.push({ table, row });
+    };
+    return {
+      // Awaited without a conflict clause → behaves like a bare INSERT.
+      then: (resolve: (v: unknown) => void, reject: (e: unknown) => void) => {
+        if (conflict) return reject(new UniqueViolationError(key));
+        commit();
+        return resolve(undefined);
+      },
+      onConflictDoNothing: () => {
+        if (!conflict) commit();
+        return Promise.resolve(undefined);
+      },
+    };
+  }
+
   return {
     txRows,
+    persisted,
+    UniqueViolationError,
     dbInsertValuesMock: vi.fn().mockResolvedValue(undefined),
     dbExecuteMock: vi.fn().mockResolvedValue({ rows: [] }),
     dbTransactionMock: vi.fn(async (fn: (tx: unknown) => Promise<void>) => {
       const tx = {
-        insert: vi.fn((table: { _?: { name?: string } }) => ({
-          values: vi.fn((row: Record<string, unknown>) => {
-            txRows.push({ table: table?._?.name ?? 'unknown', row });
-            return {
-              then: (resolve: (v: unknown) => void) => resolve(undefined),
-              onConflictDoNothing: vi.fn().mockResolvedValue(undefined),
-            };
-          }),
+        insert: vi.fn((table: unknown) => ({
+          values: vi.fn((row: Record<string, unknown>) => insertInto(tableName(table), row)),
         })),
       };
       await fn(tx);
@@ -66,9 +135,12 @@ vi.mock('@/config/env.js', () => ({
   },
 }));
 
-const { traceTurnDecision, toContextStub, MandatoryTraceEnvelopeError } = await import(
-  '@/observability/turn-trace.js'
-);
+const {
+  traceTurnDecision,
+  toContextStub,
+  MandatoryTraceEnvelopeError,
+  envelopeTraceIdForAttempt,
+} = await import('@/observability/turn-trace.js');
 const { redactPacket } = await import('@/control-plane/runtime-trace/lib/redaction.js');
 const { verifyHmac, canonicalJson } = await import('@/control-plane/runtime-trace/lib/hmac.js');
 const { runWithCorrelation, deriveTraceId } = await import('@/observability/correlation.js');
@@ -127,6 +199,7 @@ function packetFixture(over: Partial<DecisionPacket> = {}): DecisionPacket {
 describe('issue #514 — hot-path runtime trace, real writers', () => {
   beforeEach(() => {
     txRows.length = 0;
+    persisted.clear();
     dbTransactionMock.mockClear();
   });
 
@@ -142,7 +215,7 @@ describe('issue #514 — hot-path runtime trace, real writers', () => {
     expect(dbTransactionMock).toHaveBeenCalledTimes(1);
     expect(txRows).toHaveLength(2); // envelope + outbox
 
-    const envelope = txRows[0]!.row;
+    const envelope = txRows.filter((r) => r.table === 'runtime_trace_envelopes')[0]!.row;
     expect(envelope.trace_id).toBe(trace_id);
     expect(envelope.tenant_id).toBe('acme');
     expect(envelope.agent_id).toBe('a1');
@@ -155,21 +228,24 @@ describe('issue #514 — hot-path runtime trace, real writers', () => {
   });
 
   it('signs the envelope with a TENANT-derived key — same decision, different tenants, different HMAC', async () => {
-    const trace_id = deriveTraceId('turn-e2e-2');
-    await traceTurnDecision({ base: baseFixture('tenant-a', trace_id), packet: packetFixture() });
-    const hmacA = txRows[0]!.row.envelope_hmac as string;
+    // Distinct trace ids per tenant: `trace_id` is the PK, so two tenants
+    // sharing one is not a state the database can hold. What this asserts is
+    // that the KEY is tenant-derived, which the identical decision payload
+    // isolates.
+    const traceA = deriveTraceId('turn-e2e-2-a');
+    const traceB = deriveTraceId('turn-e2e-2-b');
+    await traceTurnDecision({ base: baseFixture('tenant-a', traceA), packet: packetFixture() });
+    await traceTurnDecision({ base: baseFixture('tenant-b', traceB), packet: packetFixture() });
 
-    txRows.length = 0;
-    await traceTurnDecision({ base: baseFixture('tenant-b', trace_id), packet: packetFixture() });
-    const hmacB = txRows[0]!.row.envelope_hmac as string;
-
-    expect(hmacA).not.toBe(hmacB);
+    const envelopes = txRows.filter((r) => r.table === 'runtime_trace_envelopes');
+    expect(envelopes).toHaveLength(2);
+    expect(envelopes[0]!.row.envelope_hmac).not.toBe(envelopes[1]!.row.envelope_hmac);
   });
 
   it('the envelope HMAC verifies against its own signed payload', async () => {
     const trace_id = deriveTraceId('turn-e2e-3');
     await traceTurnDecision({ base: baseFixture('acme', trace_id), packet: packetFixture() });
-    const row = txRows[0]!.row;
+    const row = txRows.filter((r) => r.table === 'runtime_trace_envelopes')[0]!.row;
 
     const signed = {
       trace_id: row.trace_id,
@@ -202,7 +278,7 @@ describe('issue #514 — hot-path runtime trace, real writers', () => {
     const trace_id = deriveTraceId('turn-e2e-4');
     await traceTurnDecision({ base: baseFixture('acme', trace_id), packet: packetFixture() });
 
-    const outbox = txRows[1]!.row;
+    const outbox = txRows.filter((r) => r.table === 'runtime_trace_body_outbox')[0]!.row;
     const payload = outbox.payload as { packet: Record<string, unknown> };
     const { packet: redacted, bytes_redacted } = redactPacket(payload.packet, 'standard');
     const serialized = JSON.stringify(redacted);
@@ -255,27 +331,95 @@ describe('issue #514 — hot-path runtime trace, real writers', () => {
         base: baseFixture('acme', trace_id),
         packet: packetFixture(),
       });
-      expect(txRows[0]!.row.trace_id).toBe(trace_id);
+      expect(txRows.filter((r) => r.table === 'runtime_trace_envelopes')[0]!.row.trace_id).toBe(trace_id);
     });
   });
 
-  it('two attempts at the same turn share ONE envelope trace id', async () => {
-    const trace_id = deriveTraceId('turn-e2e-8');
-    const ids: unknown[] = [];
-    for (const attempt of [1, 2]) {
-      txRows.length = 0;
-      await runWithCorrelation(
-        { seed: 'turn-e2e-8', turn_id: 'turn-e2e-8', attempt, origin: 'recovery' },
-        async () => {
-          await traceTurnDecision({
-            base: baseFixture('acme', trace_id),
+  describe('retry / recovery under REAL primary-key semantics [P1]', () => {
+    const TURN = 'turn-e2e-8';
+    const root = deriveTraceId(TURN);
+
+    /** Drive one attempt of the same turn, exactly as the worker would. */
+    async function attemptTurn(attempt: number) {
+      return runWithCorrelation(
+        { seed: TURN, turn_id: TURN, attempt, origin: 'recovery' },
+        () =>
+          traceTurnDecision({
+            base: baseFixture('acme', root),
             packet: packetFixture(),
-          });
-          ids.push(txRows[0]!.row.trace_id);
-        },
+          }),
       );
     }
-    expect(new Set(ids).size).toBe(1);
+
+    it('the fake enforces uniqueness — a bare duplicate INSERT throws 23505', async () => {
+      // Guard on the guard. If this ever stops throwing, every assertion below
+      // becomes vacuous, which is precisely how the previous revision passed
+      // while the production code was broken.
+      const { db } = await import('@/db/client.js');
+      await db.transaction(async (tx) => {
+        const t = { _: { name: 'probe_table' } };
+        await (tx as { insert: (t: unknown) => { values: (r: unknown) => Promise<unknown> } })
+          .insert(t)
+          .values({ trace_id: root });
+      });
+      await expect(
+        db.transaction(async (tx) => {
+          const t = { _: { name: 'probe_table' } };
+          await (tx as { insert: (t: unknown) => { values: (r: unknown) => Promise<unknown> } })
+            .insert(t)
+            .values({ trace_id: root });
+        }),
+      ).rejects.toBeInstanceOf(UniqueViolationError);
+    });
+
+    it('a retry SUCCEEDS instead of dying on the PK', async () => {
+      await expect(attemptTurn(1)).resolves.not.toBeNull();
+      // Before the fix this rejected with a unique violation, and because the
+      // envelope is mandatory for `call_tool` that rejection blocked the turn
+      // — so a retry could never succeed.
+      await expect(attemptTurn(2)).resolves.not.toBeNull();
+      await expect(attemptTurn(3)).resolves.not.toBeNull();
+    });
+
+    it('every attempt gets its own envelope row, attempt 1 keeping the ROOT id', async () => {
+      await attemptTurn(1);
+      await attemptTurn(2);
+      await attemptTurn(3);
+
+      const envelopes = txRows.filter((r) => r.table === 'runtime_trace_envelopes');
+      expect(envelopes).toHaveLength(3);
+      const ids = envelopes.map((e) => e.row.trace_id as string);
+      expect(new Set(ids).size).toBe(3);
+      // Attempt 1 keeps the root id so the operator-facing id is still the
+      // turn's id and the existing Explorer link is unchanged.
+      expect(ids[0]).toBe(root);
+      expect(ids[1]).not.toBe(root);
+    });
+
+    it('correlation survives: every attempt shares turno_id and conversa_id', async () => {
+      await attemptTurn(1);
+      await attemptTurn(2);
+      const envelopes = txRows.filter((r) => r.table === 'runtime_trace_envelopes');
+      expect(new Set(envelopes.map((e) => e.row.turno_id)).size).toBe(1);
+      expect(new Set(envelopes.map((e) => e.row.conversa_id)).size).toBe(1);
+      expect(envelopes[0]!.row.turno_id).toBe(TURNO_ID);
+    });
+
+    it('re-running the SAME attempt is idempotent — no duplicate row, no throw', async () => {
+      await attemptTurn(2);
+      await expect(attemptTurn(2)).resolves.not.toBeNull();
+      const envelopes = txRows.filter((r) => r.table === 'runtime_trace_envelopes');
+      expect(envelopes).toHaveLength(1);
+    });
+
+    it('the per-attempt id is deterministic across processes', () => {
+      expect(envelopeTraceIdForAttempt(root, 1)).toBe(root);
+      expect(envelopeTraceIdForAttempt(root, 2)).toBe(envelopeTraceIdForAttempt(root, 2));
+      expect(envelopeTraceIdForAttempt(root, 2)).not.toBe(envelopeTraceIdForAttempt(root, 3));
+      expect(envelopeTraceIdForAttempt(root, 2)).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+      );
+    });
   });
 
   it('toContextStub never carries the decision rationale or policy reason', () => {

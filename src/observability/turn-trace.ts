@@ -49,7 +49,7 @@ import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 import { counter, histogram } from './metrics.js';
 import { METRIC } from './taxonomy.js';
-import { correlationLogFields, tryGetCorrelation } from './correlation.js';
+import { correlationLogFields, deriveTraceId, tryGetCorrelation } from './correlation.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -243,7 +243,13 @@ export async function traceTurnDecision(
     return null;
   }
 
-  const trace_id = asUuidOrNull(input.base.trace_id);
+  const root_trace_id = asUuidOrNull(input.base.trace_id);
+  // Attempt-scoped PK so a retry of the same turn does not collide with the
+  // envelope attempt 1 already wrote (review round 1 [P1]).
+  const attempt = tryGetCorrelation()?.attempt ?? 1;
+  const trace_id = root_trace_id
+    ? envelopeTraceIdForAttempt(root_trace_id, attempt)
+    : null;
   if (!trace_id) {
     // Non-UUID trace id (a standalone caller that never opened a correlation
     // scope). Skip rather than crash the turn on a UUID column.
@@ -310,4 +316,32 @@ export async function traceTurnDecision(
 /** Diagnostic helper for logs — the attempt the envelope belongs to. */
 export function currentAttempt(): number | null {
   return tryGetCorrelation()?.attempt ?? null;
+}
+
+/**
+ * Envelope primary key for a given attempt of a turn.
+ *
+ * Review round 1 [P1]: `runtime_trace_envelopes.trace_id` is the PRIMARY KEY
+ * and the writer does a plain INSERT. Retry and recovery deliberately reuse the
+ * SAME root trace id (that is the whole correlation contract), so the second
+ * attempt hit a unique violation — and, because the envelope is mandatory for
+ * effect-capable turns, that violation *became* a turn-blocking error. A retry
+ * could never succeed.
+ *
+ * Resolution — attempts are modelled separately without colliding with the
+ * root:
+ *   - attempt 1 uses the ROOT trace id, so the id an operator sees is still the
+ *     turn's id and nothing about the existing Explorer link changes;
+ *   - attempt N>1 uses a DETERMINISTIC id derived from `${root}:attempt:N`.
+ *     Deterministic (not random) so a re-run of the same attempt is idempotent
+ *     rather than a new row every time.
+ *
+ * Correlation survives because every attempt carries the same `turno_id` (the
+ * persisted inbound row id) and the same `conversa_id` on the envelope — those
+ * are the columns that group attempts of one turn, and both are already
+ * indexed and surfaced by the Explorer.
+ */
+export function envelopeTraceIdForAttempt(rootTraceId: string, attempt: number): string {
+  if (attempt <= 1) return rootTraceId;
+  return deriveTraceId(`${rootTraceId}:attempt:${attempt}`);
 }

@@ -84,20 +84,31 @@ export async function writeEnvelope(
       // rather lose the envelope (no proof) than the body (lost evidence
       // attached to a phantom envelope).
       await db.transaction(async (tx) => {
-        await tx.insert(runtime_trace_envelopes).values({
-          trace_id: input.trace_id,
-          tenant_id: input.tenant_id,
-          agent_id: input.agent_id,
-          conversa_id: input.conversa_id ?? null,
-          turno_id: input.turno_id ?? null,
-          policy_id,
-          decision,
-          side_effect_level,
-          redaction_class,
-          envelope_hmac,
-          hmac_key_version,
-          body_status: 'pending',
-        });
+        await tx
+          .insert(runtime_trace_envelopes)
+          .values({
+            trace_id: input.trace_id,
+            tenant_id: input.tenant_id,
+            agent_id: input.agent_id,
+            conversa_id: input.conversa_id ?? null,
+            turno_id: input.turno_id ?? null,
+            policy_id,
+            decision,
+            side_effect_level,
+            redaction_class,
+            envelope_hmac,
+            hmac_key_version,
+            body_status: 'pending',
+          })
+          // Issue #514 review round 1 [P1]: the writer is at-least-once by
+          // construction (BullMQ retries, the recovery sweep, the outbox
+          // relayer). Re-writing the SAME envelope must be a no-op, not a
+          // unique violation that fails the turn closed. Distinct ATTEMPTS get
+          // distinct ids upstream (`envelopeTraceIdForAttempt`), so a conflict
+          // here means "this exact attempt was already recorded" — the
+          // evidence requirement is satisfied either way. Mirrors the outbox
+          // insert just below, which has always been conflict-tolerant.
+          .onConflictDoNothing();
         const bodyForOutbox = options.outbox_body!;
         await tx
           .insert(runtime_trace_body_outbox)
@@ -112,20 +123,24 @@ export async function writeEnvelope(
       });
     } else {
       // Best-effort path (legacy callers / minimal redaction).
-      await db.insert(runtime_trace_envelopes).values({
-        trace_id: input.trace_id,
-        tenant_id: input.tenant_id,
-        agent_id: input.agent_id,
-        conversa_id: input.conversa_id ?? null,
-        turno_id: input.turno_id ?? null,
-        policy_id,
-        decision,
-        side_effect_level,
-        redaction_class,
-        envelope_hmac,
-        hmac_key_version,
-        body_status: 'pending',
-      });
+      await db
+        .insert(runtime_trace_envelopes)
+        .values({
+          trace_id: input.trace_id,
+          tenant_id: input.tenant_id,
+          agent_id: input.agent_id,
+          conversa_id: input.conversa_id ?? null,
+          turno_id: input.turno_id ?? null,
+          policy_id,
+          decision,
+          side_effect_level,
+          redaction_class,
+          envelope_hmac,
+          hmac_key_version,
+          body_status: 'pending',
+        })
+        // Same at-least-once rationale as the transactional path above.
+        .onConflictDoNothing();
     }
   } catch (err) {
     incCounter('maia_runtime_trace_envelope_write_failed_total', {
