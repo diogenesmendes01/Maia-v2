@@ -237,7 +237,11 @@ export const ENV_CONTRACT = {
     services: ['runtime', 'maintenance'],
     schema: z.string().url(),
     example: 'redis://localhost:6379',
-    fixture: 'redis://redis.internal:6379',
+    // Carries the synthetic password on purpose: `secret/synthetic-fixture`
+    // matches a secret's fixture EXACTLY, so a fixture that could plausibly be
+    // somebody's real value (`redis://redis.internal:6379`) would turn into a
+    // false positive that aborts their boot.
+    fixture: 'redis://:fixture0000pass@redis.internal:6379',
     requiredIn: ['development', 'staging', 'production'],
     restartRequired: true,
   },
@@ -2009,6 +2013,48 @@ export function allowedProfiles(spec: EnvVarSpec): readonly MaiaProfile[] {
 export const SECRET_NAMES: readonly string[] = CONTRACT_ENTRIES.filter(
   (s) => s.secret,
 ).map((s) => s.name);
+
+// ---------------------------------------------------------------------------
+// Synthetic CI fixture detection — EXACT, per variable
+// ---------------------------------------------------------------------------
+
+/**
+ * The synthetic values `buildFixture()` can emit for one variable (its
+ * `fixture` plus every `fixtureByProfile` override). Empty for anything that is
+ * not a declared secret.
+ *
+ * WHY EXACT, AND WHY SECRETS ONLY (PR #522 review round 2):
+ *
+ * The first implementation matched any value containing the word `fixture`.
+ * With a fail-closed boot that is a production outage waiting to happen —
+ * `OWNER_NOME=Fixture Labs`, `BACKUP_S3_BUCKET=maia-fixture-store` and
+ * `NEXTAUTH_URL=https://fixture.example.com` are all legitimate, and all would
+ * have aborted the process with a message claiming the operator's value was a
+ * CI fixture. A broad heuristic and a fail-closed gate do not mix.
+ *
+ * The fixtures are generated FROM this table, so the exact synthetic value for
+ * each key is known — no heuristic needed.
+ *
+ * Scoped to secrets because that is where the protection matters (a credential
+ * that authenticates against nothing) and because non-secret fixtures are
+ * ordinary values: `POSTGRES_USER=maia`, `TZ=America/Sao_Paulo` and
+ * `EMBEDDING_MODEL=voyage-3` are exactly what a real deployment sets.
+ */
+export function syntheticFixtureValuesFor(name: string): readonly string[] {
+  const spec = findSpec(name);
+  if (!spec?.secret) return [];
+  const values = [spec.fixture, ...Object.values(spec.fixtureByProfile ?? {})];
+  return values.filter((v): v is string => typeof v === 'string' && v.length > 0);
+}
+
+/**
+ * True when `value` is EXACTLY the synthetic CI fixture for `name` — i.e. this
+ * environment carries a credential copied out of
+ * `src/config/generated/fixtures/`, which authenticates against nothing.
+ */
+export function isSyntheticFixtureValue(name: string, value: string): boolean {
+  return syntheticFixtureValuesFor(name).includes(value);
+}
 
 // ---------------------------------------------------------------------------
 // Typed object-schema derivation

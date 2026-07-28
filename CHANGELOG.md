@@ -10,6 +10,8 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 O boot agora valida o contrato inteiro e **aborta em TODOS os profiles — `development` incluído**. Antes, só as regras legadas de boot eram aplicadas e o resto ficava no `maia config check`.
 
+> **Abortar em `development` é decisão deliberada do owner, não descuido.** O rollout descrito na issue #515 (passo 6) previa *aviso* em `development` e erro só em staging/produção. Durante a review da [PR #522](https://github.com/diogenesmendes01/Maia-v2/pull/522) o owner decidiu explicitamente ligar o fail-closed em todos os profiles, ciente da divergência em relação ao texto da issue: um `.env` que sobe no laptop e morre em staging é justamente o drift que o contrato existe para eliminar. Quem for revisitar isso depois: o ponto de revert é único e está documentado no runbook §4.3.
+
 Passam a abortar o boot:
 
 | Situação | Regra | Antes |

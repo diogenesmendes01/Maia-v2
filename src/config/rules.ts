@@ -11,14 +11,13 @@
  * touches no filesystem, and never interpolates a secret VALUE into a message.
  */
 import { assertSafeAuthDir } from '@/setup/auth-dir-path.js';
-import { CONTRACT_ENTRIES } from '@/config/contract.js';
+import { CONTRACT_ENTRIES, isSyntheticFixtureValue } from '@/config/contract.js';
 import {
   type EnvVarSpec,
   type MaiaProfile,
   describeRequiredWhen,
   evaluateRequiredWhen,
   isOperatorPlaceholder,
-  isSyntheticFixtureValue,
 } from '@/config/metadata.js';
 
 /** Where a rule is enforced. */
@@ -513,18 +512,23 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
           message: `${name} ainda está com um valor de placeholder no profile ${profile}.`,
           remediation: `Substitua ${name} por um valor real antes do deploy.`,
         });
-      } else if (isSyntheticFixtureValue(value)) {
+      } else if (isSyntheticFixtureValue(name, value)) {
         // As fixtures de `src/config/generated/fixtures/` existem para o CI
         // provar que o contrato é satisfazível. Valores previsíveis como
         // `sk-ant-fixture-*` não autenticam em nada: um processo configurado
         // com eles fica INOPERANTE parecendo configurado. Achado [P1] da
         // rodada 1 da PR #522.
+        //
+        // A comparação é EXATA e restrita a segredos declarados
+        // (`isSyntheticFixtureValue` em contract.ts). A versão anterior casava
+        // qualquer valor contendo a palavra "fixture", o que — com o boot
+        // fail-closed — derrubaria um `OWNER_NOME=Fixture Labs` legítimo.
         push({
           scope: 'contract',
           severity: 'error',
           variable: name,
           rule: 'secret/synthetic-fixture',
-          message: `${name} está com um valor de FIXTURE sintética (CI) no profile ${profile}.`,
+          message: `${name} está com o valor EXATO da fixture sintética de CI, no profile ${profile}.`,
           remediation:
             `As fixtures em src/config/generated/fixtures/ provam que o contrato é satisfazível; ` +
             `elas não autenticam em nada. Gere um ponto de partida operacional com ` +

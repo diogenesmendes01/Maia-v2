@@ -23,7 +23,7 @@ import {
   isUnknownMaiaKey,
   objectSchemaForService,
 } from '@/config/contract.js';
-import { GROUP_ORDER, MAIA_SERVICES, isPlaceholderValue } from '@/config/metadata.js';
+import { GROUP_ORDER, MAIA_SERVICES, isOperatorPlaceholder } from '@/config/metadata.js';
 
 /** Key set of the pre-#515 runtime schema (src/config/env.ts @ d93624b). */
 const LEGACY_RUNTIME_KEYS = [
@@ -111,6 +111,24 @@ describe('config contract — shape (#515)', () => {
     expect(missing, 'fixtures are what prove the contract is satisfiable').toEqual([]);
   });
 
+  it("every SECRET's fixture is unmistakably synthetic", () => {
+    // `secret/synthetic-fixture` matches a secret's fixture EXACTLY, so a
+    // fixture that could plausibly be somebody's real value becomes a false
+    // positive that aborts their boot (PR #522 review round 2). Every secret
+    // fixture must therefore carry a synthetic marker: the literal `fixture`,
+    // or the all-zero base64 block used for key-shaped fields.
+    const offenders = CONTRACT_ENTRIES.filter((s) => s.secret).filter((s) => {
+      const values = [s.fixture, ...Object.values(s.fixtureByProfile ?? {})].filter(
+        (v): v is string => typeof v === 'string',
+      );
+      return values.some((v) => !/fixture/i.test(v) && !/A{20,}=/.test(v));
+    });
+    expect(
+      offenders.map((s) => s.name),
+      'um fixture de segredo que pareça um valor real vira falso positivo no boot',
+    ).toEqual([]);
+  });
+
   it('no secret carries a usable credential as its example', () => {
     // A URL with no userinfo (`redis://localhost:6379`) carries no credential,
     // so it may be shown verbatim. Anything else that is declared secret must
@@ -122,7 +140,7 @@ describe('config contract — shape (#515)', () => {
       expect(spec.example, `${spec.name} must document an example`).toBeDefined();
       const example = spec.example!;
       expect(
-        isPlaceholderValue(example) || carriesNoCredential(example),
+        isOperatorPlaceholder(example) || carriesNoCredential(example),
         `${spec.name}: the .env.example value must be a placeholder (or a credential-free URL), got "${example}"`,
       ).toBe(true);
     }

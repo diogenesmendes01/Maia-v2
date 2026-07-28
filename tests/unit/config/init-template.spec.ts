@@ -22,12 +22,8 @@ import { describe, it, expect } from 'vitest';
 import { buildFixture, renderEnvTemplate, renderFixture } from '@/config/generate.js';
 import { parseEnvFile } from '@/config/env-file.js';
 import { formatHuman, validateConfig } from '@/config/validate.js';
-import {
-  MAIA_PROFILES,
-  type MaiaProfile,
-  isOperatorPlaceholder,
-  isSyntheticFixtureValue,
-} from '@/config/metadata.js';
+import { MAIA_PROFILES, type MaiaProfile, isOperatorPlaceholder } from '@/config/metadata.js';
+import { CONTRACT_ENTRIES, isSyntheticFixtureValue } from '@/config/contract.js';
 
 const STRICT: MaiaProfile[] = ['staging', 'production'];
 
@@ -45,7 +41,7 @@ function fillTemplate(profile: MaiaProfile): Record<string, string> {
 describe('config init — o template não é uma fixture (#515 / PR #522 [P1])', () => {
   it.each(MAIA_PROFILES)('o template de %s não contém NENHUM valor de fixture', (profile) => {
     const template = parseEnvFile(renderEnvTemplate(profile));
-    const leaked = Object.entries(template).filter(([, v]) => isSyntheticFixtureValue(v));
+    const leaked = Object.entries(template).filter(([k, v]) => isSyntheticFixtureValue(k, v));
     expect(
       leaked,
       'o template operacional nunca pode carregar um valor sintético de CI',
@@ -177,20 +173,85 @@ describe('secret/synthetic-fixture — rede de segurança (#515 / PR #522 [P1])'
     expect(result.errors.some((p) => p.rule === 'secret/placeholder')).toBe(true);
   });
 
-  it('reconhece as formas sintéticas e ignora valores reais', () => {
-    for (const value of [
-      'sk-ant-fixture-not-a-real-key',
-      'sk-or-fixture-not-a-real-key',
-      'fixture0000pass',
-      'postgres://maia:fixture0000pass@db.internal:5432/maia',
-      '1=fixture-runtime-trace-prev-secret-0000',
-      'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
-    ]) {
-      expect(isSyntheticFixtureValue(value), value).toBe(true);
-      expect(isOperatorPlaceholder(value), value).toBe(false);
+  it('detecta o valor EXATO da fixture de cada segredo — um positivo por campo', () => {
+    // Um positivo para cada segredo do contrato: se alguém copiar a fixture, a
+    // proteção precisa continuar valendo em TODOS os campos, não só nos que
+    // casavam com a regex antiga.
+    const fixture = buildFixture('production');
+    const secrets = CONTRACT_ENTRIES.filter((s) => s.secret && fixture[s.name] !== undefined);
+    expect(secrets.length).toBeGreaterThan(10);
+    for (const spec of secrets) {
+      const value = fixture[spec.name]!;
+      expect(isSyntheticFixtureValue(spec.name, value), `${spec.name}=${value}`).toBe(true);
     }
-    for (const value of ['maia', 'us-east-1', 'ops@example.com', 'primary', 'voyage-3', '3000']) {
-      expect(isSyntheticFixtureValue(value), value).toBe(false);
+  });
+
+  it('o mesmo valor em OUTRA variável não é fixture (a detecção é por chave)', () => {
+    const fixture = buildFixture('production');
+    const anthropic = fixture.ANTHROPIC_API_KEY!;
+    expect(isSyntheticFixtureValue('ANTHROPIC_API_KEY', anthropic)).toBe(true);
+    expect(isSyntheticFixtureValue('OPENAI_API_KEY', anthropic)).toBe(false);
+  });
+
+  it('valores legítimos que CONTÊM a palavra "fixture" não são recusados', () => {
+    // Os três casos concretos da rodada 2 do review. A regex anterior reservava
+    // globalmente uma palavra comum do inglês; com o boot fail-closed, cada um
+    // destes derrubaria o processo em produção com uma mensagem falsa.
+    const LEGIT: [string, string][] = [
+      ['OWNER_NOME', 'Fixture Labs'],
+      ['BACKUP_S3_BUCKET', 'maia-fixture-store'],
+      ['NEXTAUTH_URL', 'https://fixture.example.com'],
+    ];
+    for (const [name, value] of LEGIT) {
+      expect(isSyntheticFixtureValue(name, value), `${name}=${value}`).toBe(false);
+      expect(isOperatorPlaceholder(value), `${name}=${value}`).toBe(false);
+    }
+  });
+
+  it('os três valores legítimos passam na validação de production', () => {
+    const result = validateConfig({
+      env: {
+        ...buildFixture('production'),
+        OWNER_NOME: 'Fixture Labs',
+        BACKUP_S3_BUCKET: 'maia-fixture-store',
+        NEXTAUTH_URL: 'https://fixture.example.com',
+      },
+      profile: 'production',
+      allowSyntheticFixtures: true,
+    });
+    expect(
+      result.errors.filter((p) =>
+        ['OWNER_NOME', 'BACKUP_S3_BUCKET', 'NEXTAUTH_URL'].includes(p.variable ?? ''),
+      ),
+      formatHuman(result),
+    ).toEqual([]);
+  });
+
+  it('e não abortam o BOOT (o caminho que a regex ampla derrubaria)', async () => {
+    // A prova que importa: com boot fail-closed, o falso positivo é uma queda
+    // de produção, não um aviso.
+    const { evaluateCrossFieldRules } = await import('@/config/rules.js');
+    const raw = {
+      ...buildFixture('production'),
+      OWNER_NOME: 'Fixture Labs',
+      BACKUP_S3_BUCKET: 'maia-fixture-store',
+      NEXTAUTH_URL: 'https://fixture.example.com',
+    };
+    const findings = evaluateCrossFieldRules({ values: {}, raw, profile: 'production' });
+    const falsePositives = findings.filter(
+      (f) =>
+        f.rule === 'secret/synthetic-fixture' &&
+        ['OWNER_NOME', 'BACKUP_S3_BUCKET', 'NEXTAUTH_URL'].includes(f.variable ?? ''),
+    );
+    expect(falsePositives).toEqual([]);
+  });
+
+  it('variáveis não-secretas nunca entram na detecção', () => {
+    // POSTGRES_USER=maia e TZ=America/Sao_Paulo SÃO os valores das fixtures, e
+    // também exatamente o que um deployment real configura.
+    const fixture = buildFixture('production');
+    for (const name of ['POSTGRES_USER', 'POSTGRES_DB', 'TZ', 'EMBEDDING_MODEL', 'ALERT_CHANNELS']) {
+      expect(isSyntheticFixtureValue(name, fixture[name]!), name).toBe(false);
     }
   });
 });

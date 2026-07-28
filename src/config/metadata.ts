@@ -357,45 +357,24 @@ const OPERATOR_PLACEHOLDER_PATTERNS: readonly RegExp[] = [
   /^xxx+$/i,
 ];
 
-/**
- * Values produced by `buildFixture()` — the SYNTHETIC configuration CI uses to
- * prove the contract is satisfiable.
- *
- * They are deliberately predictable (`sk-ant-fixture-not-a-real-key`,
- * `fixture0000pass`, an all-zero base64 key block), which is fine for a CI
- * witness and catastrophic in a real deployment: they authenticate against
- * nothing, so a process configured with them is inoperable while looking
- * configured. PR #522 review round 1 [P1] found `maia config init` promoting
- * exactly these into a production `.env`.
- *
- * They are therefore treated as placeholders too. The dedicated rule
- * `secret/synthetic-fixture` reports them in staging/production, and only the
- * explicit `--allow-fixtures` opt-in (used solely to validate the generated
- * fixtures themselves) silences it.
- */
-const SYNTHETIC_FIXTURE_PATTERNS: readonly RegExp[] = [
-  // `fixture…` at the start, or after any non-alphanumeric separator, so it
-  // matches `sk-ant-fixture-…`, `1=fixture-…` and `postgres://u:fixture0000pass@…`.
-  /(^|[^a-z0-9])fixture/i,
-  // All-zero base64 blocks used for the key-shaped fixture fields.
-  /A{20,}=/,
-];
-
 /** True when the value is a marker a human must replace before deploying. */
 export function isOperatorPlaceholder(value: string): boolean {
   return OPERATOR_PLACEHOLDER_PATTERNS.some((rx) => rx.test(value));
 }
 
-/** True when the value came from the synthetic CI fixture set. */
-export function isSyntheticFixtureValue(value: string): boolean {
-  return SYNTHETIC_FIXTURE_PATTERNS.some((rx) => rx.test(value));
-}
-
 /**
- * True when the value is NOT a real, usable value — either an operator
- * placeholder or a synthetic CI fixture. Used by the contract tests and by the
- * `config init` template renderer.
+ * Detection of the SYNTHETIC CI fixture values lives in
+ * `src/config/contract.ts` (`isSyntheticFixtureValue`), keyed BY VARIABLE.
+ *
+ * It used to live here as a regex over any value containing the word
+ * `fixture`. That reserved a common English word across the whole value space
+ * — and, since the boot now fails closed in every profile, a tenant named
+ * `OWNER_NOME=Fixture Labs`, a bucket `maia-fixture-store` or a host
+ * `https://fixture.example.com` would have aborted a production process with a
+ * message claiming their value was a CI fixture. PR #522 review round 2 caught
+ * it.
+ *
+ * The lesson, recorded in `docs/runbooks/config-contract.md`: a broad heuristic
+ * and a fail-closed boot do not mix. Rejection has to be EXACT. Since the
+ * fixtures come from this same contract, the exact value for each key is known.
  */
-export function isPlaceholderValue(value: string): boolean {
-  return isOperatorPlaceholder(value) || isSyntheticFixtureValue(value);
-}

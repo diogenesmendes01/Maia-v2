@@ -10,6 +10,21 @@ destravar um ambiente sem esperar por um deploy de código.
 > **`MAIA_CONFIG_STRICT_BOOT=false`**, que é env-only e não exige redeploy.
 > Ele desliga a garantia inteira: use para destravar, não para conviver. Veja §4.
 
+> ### ⚠️ Abortar em `development` é decisão deliberada do owner
+>
+> **Não "conserte" isto achando que é bug.** O rollout descrito na issue #515
+> (passo 6) previa **aviso** em `development` e erro só em staging/produção. O
+> owner decidiu explicitamente, durante a review da
+> [PR #522](https://github.com/diogenesmendes01/Maia-v2/pull/522), **ligar o
+> fail-closed em todos os profiles**, ciente do tradeoff — a review chegou a
+> registrar a divergência em relação ao texto da issue, e a decisão foi mantida.
+>
+> A razão: um `.env` que sobe no laptop e morre em staging é exatamente o drift
+> que este contrato existe para eliminar. Consistência total vale mais que a
+> conveniência de um boot tolerante em dev.
+>
+> Se um dia a decisão for revista, o ponto de revert é único e está em §4.3.
+
 ---
 
 ## 1. Mudança que quebra deploys existentes
@@ -176,7 +191,51 @@ comportamento "aviso em development" sem tocar em mais nada.
 
 ---
 
-## 5. Adicionar, depreciar, remover uma variável
+## 5. Regra de projeto: heurístico amplo e boot fail-closed não combinam
+
+Vale para qualquer regra nova em `src/config/rules.ts`. Com o boot abortando,
+**todo falso positivo de uma regra de rejeição é uma queda de produção** — e a
+mensagem ainda diz ao operador que o valor *dele* está errado, o que é falso e
+confuso. Antes de a #515 ligar o fail-closed, o mesmo falso positivo teria sido
+só um aviso no `config check`.
+
+O caso concreto (rodada 2 da review da PR #522): a detecção de fixture sintética
+nasceu como uma regex que casava **qualquer valor contendo a palavra `fixture`**,
+aplicada a todas as variáveis. Ou seja, estes três valores perfeitamente
+legítimos derrubavam o processo:
+
+```bash
+OWNER_NOME=Fixture Labs
+BACKUP_S3_BUCKET=maia-fixture-store
+NEXTAUTH_URL=https://fixture.example.com
+```
+
+A correção foi trocar o heurístico por **igualdade exata, por variável**: as
+fixtures são geradas do próprio contrato, então o valor sintético de cada chave
+é conhecido — `isSyntheticFixtureValue(name, value)` em
+`src/config/contract.ts`. A detecção fica restrita a variáveis marcadas
+`secret`, porque é lá que a proteção importa e porque fixture de campo
+não-secreto é um valor comum (`POSTGRES_USER=maia`, `TZ=America/Sao_Paulo`).
+
+**Checklist antes de adicionar uma regra que RECUSA um valor:**
+
+1. A condição é **exata** (igualdade, enum, formato fechado) ou é heurística
+   sobre texto livre? Heurística sobre texto livre não entra em `error`.
+2. Ela olha só as variáveis onde a checagem faz sentido, ou varre `raw` inteiro?
+3. Existe um valor real plausível que casa? Escreva o **negativo** como teste —
+   `tests/unit/config/init-template.spec.ts` tem o padrão.
+4. Se a regra for mesmo necessária mas não puder ser exata, ela é `warning`, não
+   `error`.
+
+Um corolário que virou teste: o `fixture` de todo segredo precisa ser
+inconfundivelmente sintético (contém `fixture`, ou é o bloco base64 de zeros).
+Um fixture que pareça um valor real — `redis://redis.internal:6379`, por
+exemplo — vira falso positivo no boot de quem usa exatamente aquele valor.
+Ver `tests/unit/config/contract.spec.ts`.
+
+---
+
+## 6. Adicionar, depreciar, remover uma variável
 
 O runbook completo é **gerado** junto com a documentação de configuração:
 [`docs/configuration.md`](../configuration.md) (seção "Runbook"). Resumo:
@@ -193,7 +252,7 @@ Toda leitura de configuração passa por um loader — `eslint.config.js` recusa
 
 ---
 
-## 6. Referências
+## 7. Referências
 
 - Contrato canônico: [`src/config/contract.ts`](../../src/config/contract.ts)
 - Documentação gerada: [`docs/configuration.md`](../configuration.md)
