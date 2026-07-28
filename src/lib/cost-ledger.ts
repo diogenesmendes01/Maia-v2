@@ -1,5 +1,6 @@
 import { factsRepo } from '@/db/repositories.js';
 import { logger } from '@/lib/logger.js';
+import { incCounter } from '@/lib/metrics.js';
 import { getToolCallingModels } from '@/lib/openrouter-models.js';
 
 // Approximate USD prices per 1k tokens (cents) for direct-vendor models.
@@ -82,6 +83,10 @@ export async function recordLLMCost(input: {
       });
     }
   } catch (err) {
+    // Issue #508: falha de persistência do ledger não pode descartar a
+    // evidência em silêncio. O warn já existia; o counter é o que dá sinal
+    // operacional (alertável) de que custo está sendo perdido.
+    incCounter('maia_llm_cost_ledger_failures_total', { stage: 'upsert' });
     logger.warn({ err: (err as Error).message }, 'cost_ledger.llm_failed');
   }
 }

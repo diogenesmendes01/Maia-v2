@@ -24,12 +24,14 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-const { anthropicCreateMock, openaiCreateMock, getMainMock, getFastMock } = vi.hoisted(() => ({
-  anthropicCreateMock: vi.fn(),
-  openaiCreateMock: vi.fn(),
-  getMainMock: vi.fn(),
-  getFastMock: vi.fn(),
-}));
+const { anthropicCreateMock, openaiCreateMock, getMainMock, getFastMock, getSettingsMock } =
+  vi.hoisted(() => ({
+    anthropicCreateMock: vi.fn(),
+    openaiCreateMock: vi.fn(),
+    getMainMock: vi.fn(),
+    getFastMock: vi.fn(),
+    getSettingsMock: vi.fn(),
+  }));
 
 vi.mock('@anthropic-ai/sdk', () => {
   const Anthropic = vi.fn(function (this: unknown) {
@@ -45,9 +47,14 @@ vi.mock('openai', () => {
   return { default: OpenAI };
 });
 
+// Issue #508: o gateway resolve main + fast numa ÚNICA leitura
+// (`getCurrentLLMSettings`) em vez das duas operações sequenciais que
+// `callLLM` fazia por chamada. Os mocks legados continuam aqui porque as
+// asserções de "nada foi lido antes do abort" seguem valendo para eles.
 vi.mock('@/lib/llm-settings.js', () => ({
   getCurrentMainModel: getMainMock,
   getCurrentFastModel: getFastMock,
+  getCurrentLLMSettings: getSettingsMock,
 }));
 
 vi.mock('@/lib/cost-ledger.js', () => ({
@@ -113,6 +120,11 @@ describe('callLLM — Anthropic SDK abort wiring (PR #221, item 3)', () => {
     getFastMock.mockReset();
     getMainMock.mockResolvedValue('claude-test-main');
     getFastMock.mockResolvedValue('claude-test-fast');
+    getSettingsMock.mockReset();
+    getSettingsMock.mockResolvedValue({
+      main: { value: 'claude-test-main', source: 'global' },
+      fast: { value: 'claude-test-fast', source: 'global' },
+    });
     // Drop the cached module so the `selectProvider()` snapshot uses the
     // current `LLM_PROVIDER` mock value rather than whatever a prior test
     // (in a different describe block) installed.
@@ -154,11 +166,12 @@ describe('callLLM — Anthropic SDK abort wiring (PR #221, item 3)', () => {
       }),
     ).rejects.toThrow('llm_call_aborted');
 
-    // Item 4: the early-cancellation check runs before getCurrentMainModel,
-    // so even the settings reads must not have happened.
+    // Item 4: the early-cancellation check runs before ANY settings read, so
+    // neither the legacy per-tier reads nor the issue-#508 joint read fire.
     expect(anthropicCreateMock).not.toHaveBeenCalled();
     expect(getMainMock).not.toHaveBeenCalled();
     expect(getFastMock).not.toHaveBeenCalled();
+    expect(getSettingsMock).not.toHaveBeenCalled();
   });
 
   it('does not retry when SDK rejects with AbortError mid-flight', async () => {
@@ -254,6 +267,11 @@ describe('callLLM — OpenRouter (OpenAI SDK) abort wiring (PR #221, item 3)', (
     getFastMock.mockReset();
     getMainMock.mockResolvedValue('anthropic/claude-test-main');
     getFastMock.mockResolvedValue('anthropic/claude-test-fast');
+    getSettingsMock.mockReset();
+    getSettingsMock.mockResolvedValue({
+      main: { value: 'anthropic/claude-test-main', source: 'global' },
+      fast: { value: 'anthropic/claude-test-fast', source: 'global' },
+    });
     vi.resetModules();
     // Swap the config provider to openrouter before importing claude.ts.
     vi.doMock('@/config/env.js', async () => {
