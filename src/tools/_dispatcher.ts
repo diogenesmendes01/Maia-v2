@@ -26,6 +26,8 @@ import { isRedisConnected } from '@/lib/redis.js';
 import { logger } from '@/lib/logger.js';
 import type { ActionKey } from '@/governance/audit-actions.js';
 import { featureFlags } from '@/config/feature-flags.js';
+import { incCounter } from '@/lib/metrics.js';
+import { config } from '@/config/env.js';
 
 export type ToolContext = {
   pessoa: Pessoa;
@@ -169,10 +171,31 @@ export async function dispatchTool(input: {
     return { error: 'tool_not_granted', details: { tool: tool.name } };
   }
 
+  // Zod stays the AUTHORITY (issue #509 §4): the richer JSON Schema shipped to
+  // the model improves generation, it never replaces this check nor any gate
+  // below it.
   const parsed = tool.input_schema.safeParse(input.args);
   if (!parsed.success) {
+    // Issue #509 — invalid-args observability. Labels are BOUNDED and carry no
+    // payload: `reason` is the zod issue CODE (a closed set), never the value
+    // or the field content.
+    const reason = parsed.error.issues[0]?.code ?? 'unknown';
+    incCounter('maia_tool_call_validation_total', {
+      tool: tool.name,
+      result: 'invalid_args',
+      reason,
+    });
+    incCounter('maia_tool_call_invalid_args_total', {
+      tool: tool.name,
+      provider: config.LLM_PROVIDER,
+    });
     return { error: 'invalid_args', details: parsed.error.issues };
   }
+  incCounter('maia_tool_call_validation_total', {
+    tool: tool.name,
+    result: 'ok',
+    reason: 'none',
+  });
   const args = parsed.data;
 
   const entity_id =
