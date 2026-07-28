@@ -14,6 +14,7 @@ import {
   procedureDefinitionsRepo,
   operationalProfileVersionsRepo,
 } from '@/db/repositories.js';
+import { runWithQueryCounter } from '@/db/query-counter.js';
 import type { Pessoa, Conversa, Mensagem, BehavioralHint, Role, ProcedureExecution } from '@/db/schema.js';
 import type { ResolvedPermission } from '@/governance/permissions.js';
 import { renderOperationalProfile, type RenderedProfile } from '@/identity/profile-renderer.js';
@@ -24,6 +25,7 @@ import { logger } from '@/lib/logger.js';
 import { GapLevel } from '@/types/enums.js';
 import { sanitizeBlock } from './sanitize.js';
 import { hashScope } from './scope-hash.js';
+import { recordTurnContextLoad, type TurnContextResult } from './turn-context/metrics.js';
 import {
   DOMAIN_KEYWORDS,
   type ToolExecutionSummary,
@@ -586,7 +588,47 @@ async function buildGapMentionSection(): Promise<string | null> {
   return `## Limitações conhecidas (mencionar com transparência se vier à tona)\n${lines.join('\n')}`;
 }
 
+/**
+ * Issue #511 — instrumented entry point.
+ *
+ * The prompt build is the single most query-hungry step of a turn, and until
+ * now it had no number attached: the waterfall below issues one query per
+ * entity state, one per behavioural-hint scope, one per optional section. This
+ * wrapper opens a query-counter frame (`src/db/query-counter.ts`, fed by the
+ * instrumented drizzle client) and publishes the round-trip count and duration
+ * so the batch/cache work has a measured baseline to beat.
+ *
+ * Phase label is `legacy` — it names the pre-#511 waterfall specifically, so a
+ * dashboard can watch the legacy and loader-backed paths side by side during
+ * the cutover instead of averaging them together.
+ *
+ * The counter frame is per-call and ALS-scoped: concurrent turns never share a
+ * frame, and the count is reported from `finally` so a throwing build still
+ * publishes what it spent before failing.
+ */
 export async function buildPrompt(ctx: PromptContext): Promise<{ system: string; messages: LLMMessage[] }> {
+  const started_at = Date.now();
+  return runWithQueryCounter(async (counter) => {
+    let result: TurnContextResult = 'ok';
+    try {
+      return await buildPromptUninstrumented(ctx);
+    } catch (err) {
+      result = 'error';
+      throw err;
+    } finally {
+      recordTurnContextLoad({
+        phase: 'legacy',
+        result,
+        duration_ms: Date.now() - started_at,
+        query_count: counter.count,
+      });
+    }
+  });
+}
+
+async function buildPromptUninstrumented(
+  ctx: PromptContext,
+): Promise<{ system: string; messages: LLMMessage[] }> {
   // P4: operational profile v2. An active profile renders via
   // renderOperationalProfile; a missing or non-'active' profile falls back to
   // self_state (runtime defense — never expose a `proposed`/`frozen` profile
