@@ -49,6 +49,52 @@ export function channelPairingStatus(channel_id: string): ChannelPairingState {
 }
 
 /**
+ * Issue #518 — ATOR administrativo da operação. Quando o pareamento nasce no
+ * Admin autenticado, `actor_id`/`actor_role` são o usuário do console (não
+ * `system`) e `correlation_id` amarra o pedido do console às transições do
+ * runtime. O caminho legado `/setup` (token de operador) não tem ator
+ * identificável e omite o bloco — o audit então registra a origem `setup`.
+ */
+export interface PairingActor {
+  actor_id: string;
+  actor_role: string;
+  correlation_id: string;
+}
+
+/**
+ * Ganchos de PERSISTÊNCIA fornecidos pelo chamador. `line-pairing` continua
+ * sendo pura orquestração em memória: quem tem acesso ao Postgres (o worker
+ * `channel_pairing`) injeta a gravação do estado e do material CIFRADO.
+ *
+ * Manter o DB fora deste módulo é deliberado — o caminho `/setup` legado roda
+ * sem repos e os testes unitários da orquestração não precisam de Postgres.
+ *
+ * `onMaterial` recebe o material EM CLARO e é o ÚNICO ponto autorizado a
+ * vê-lo; ele deve cifrar antes de qualquer persistência e nunca logar.
+ */
+export interface PairingHooks {
+  onMaterial?: (
+    material: { kind: 'qr'; qr: string } | { kind: 'code'; code: string },
+  ) => void;
+  onPhase?: (phase: {
+    phase: 'pairing' | 'verified' | 'failed';
+    reason_code?: string | null;
+  }) => void;
+}
+
+/** Metadata de auditoria comum: ator + correlação, NUNCA material sensível. */
+function actorMetadata(actor: PairingActor | undefined): Record<string, unknown> {
+  return actor
+    ? {
+        actor_id: actor.actor_id,
+        actor_role: actor.actor_role,
+        correlation_id: actor.correlation_id,
+        origin: 'admin_ui',
+      }
+    : { origin: 'setup_token' };
+}
+
+/**
  * Audita o ciclo de pareamento sob o ALS do (tenant, agent) DONO do canal
  * (review #498 alto 2): sem o wrap, `audit()` caía no bucket `system` —
  * tenant/agente só em metadata não corrige colunas nem labels de métricas.
@@ -66,7 +112,10 @@ function auditScoped(
 export async function startChannelPairing(args: {
   channel_id: string;
   method: 'qr' | 'code';
+  actor?: PairingActor;
+  hooks?: PairingHooks;
 }): Promise<{ ok: true } | { ok: false; error: string }> {
+  const hooks = args.hooks ?? {};
   const previous = pairings.get(args.channel_id);
   if (previous?.phase === 'pairing') return { ok: false, error: 'pairing_in_progress' };
 
@@ -108,8 +157,10 @@ export async function startChannelPairing(args: {
       agent_id: channel.agent_id,
       declared_line: declared,
       method: args.method,
+      ...actorMetadata(args.actor),
     },
   });
+  hooks.onPhase?.({ phase: 'pairing' });
 
   // A promise resolve no matched/TTL — corre em background; o operador
   // acompanha via channelPairingStatus (polling, mesmo padrão do /setup).
@@ -118,8 +169,17 @@ export async function startChannelPairing(args: {
       channel_id: channel.id,
       declared_line: declared,
       onUpdate: (u) => {
-        if (u.qr) state.qr = u.qr;
-        if (u.pairing_code) state.pairing_code = u.pairing_code;
+        // Guard de identidade também no material: um callback atrasado de uma
+        // sessão abortada não pode reinjetar QR na tentativa NOVA.
+        if (!stillCurrent()) return;
+        if (u.qr) {
+          state.qr = u.qr;
+          hooks.onMaterial?.({ kind: 'qr', qr: u.qr });
+        }
+        if (u.pairing_code) {
+          state.pairing_code = u.pairing_code;
+          hooks.onMaterial?.({ kind: 'code', code: u.pairing_code });
+        }
       },
       ...(args.method === 'code' ? { requestPairingCodeFor: declared } : {}),
     })
@@ -134,13 +194,15 @@ export async function startChannelPairing(args: {
             actual_line: result.actual_line,
           });
         }
+        hooks.onPhase?.({ phase: 'failed', reason_code: reason });
         await auditScoped(channel, {
-          acao: 'pairing_session_failed',
+          acao: reason === 'ttl_expired_or_aborted' ? 'pairing_session_expired' : 'pairing_session_failed',
           metadata: {
             channel_id: channel.id,
             declared_line: declared,
             actual_line: result.actual_line,
             reason,
+            ...actorMetadata(args.actor),
           },
         });
         return;
@@ -160,13 +222,20 @@ export async function startChannelPairing(args: {
         await rm(lineAuthDir(channel.id), { recursive: true, force: true }).catch(
           () => undefined,
         );
+        hooks.onPhase?.({ phase: 'failed', reason_code: act.reason });
         await auditScoped(channel, {
           acao: 'pairing_session_failed',
-          metadata: { channel_id: channel.id, declared_line: declared, reason: act.reason },
+          metadata: {
+            channel_id: channel.id,
+            declared_line: declared,
+            reason: act.reason,
+            ...actorMetadata(args.actor),
+          },
         });
         return;
       }
       if (stillCurrent()) pairings.set(channel.id, { ...IDLE, phase: 'verified' });
+      hooks.onPhase?.({ phase: 'verified' });
       await auditScoped(channel, {
         acao: 'pairing_session_verified',
         metadata: {
@@ -174,6 +243,7 @@ export async function startChannelPairing(args: {
           tenant_id: channel.tenant_id,
           agent_id: channel.agent_id,
           line: declared,
+          ...actorMetadata(args.actor),
         },
       });
       // Fase 3: com o runtime multi-linha ligado, a sessão de roteamento da
@@ -206,12 +276,14 @@ export async function startChannelPairing(args: {
           error: (err as Error).message,
         });
       }
+      hooks.onPhase?.({ phase: 'failed', reason_code: 'session_error' });
       await auditScoped(channel, {
         acao: 'pairing_session_failed',
         metadata: {
           channel_id: channel.id,
           declared_line: declared,
           reason: (err as Error).message,
+          ...actorMetadata(args.actor),
         },
       });
     });

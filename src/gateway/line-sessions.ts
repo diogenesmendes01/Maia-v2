@@ -32,6 +32,10 @@ import { audit } from '../governance/audit.js';
 import { runWithTenantContext } from '../db/tenant-context.js';
 import { channelsRepo } from '../db/repositories/channel-repos.js';
 import {
+  channelLineStateRepo,
+  type LineState,
+} from '../db/repositories/channel-line-state-repos.js';
+import {
   ingressUpsertMessage,
   handleMessagesUpdate,
   getCurrentLineE164,
@@ -91,6 +95,36 @@ function auditLineTransition(
     { tenant_id: channel.tenant_id, agent_id: channel.agent_id },
     () => audit({ acao: 'line_session_transition', metadata }),
   );
+}
+
+/**
+ * Issue #518 — a transição de sessão também PERSISTE (migration 103), para
+ * que o console mostre conectado/recovering/deslogado sem depender de estado
+ * em memória de outro processo. Best-effort e fail-isolated: a sessão de
+ * WhatsApp nunca cai porque o Postgres piscou. Nenhum material sensível é
+ * gravado aqui — só o estado e um reason code sanitizado.
+ */
+function persistLineState(
+  channel: LineChannel,
+  state: LineState,
+  extra: { reason_code?: string | null; connected?: boolean } = {},
+): void {
+  const now = new Date();
+  void channelLineStateRepo
+    .upsertTransition({
+      channel_id: channel.id,
+      tenant_id: channel.tenant_id,
+      agent_id: channel.agent_id,
+      state,
+      reason_code: extra.reason_code ?? null,
+      ...(extra.connected ? { connected_at: now } : { disconnected_at: now }),
+    })
+    .catch((err) =>
+      logger.warn(
+        { channel_id: channel.id, state, err: (err as Error).message },
+        'line_session.state_persist_failed',
+      ),
+    );
 }
 
 /**
@@ -260,6 +294,7 @@ async function startLineSession(channel: LineChannel): Promise<void> {
         state: 'connected',
         is_primary: false,
       });
+      persistLineState(channel, 'connected', { connected: true });
       return;
     }
     if (u.connection === 'close') {
@@ -278,6 +313,14 @@ async function startLineSession(channel: LineChannel): Promise<void> {
         is_primary: false,
         reason,
       });
+      // `closed` por loggedOut é PERDA DE POSSE (a linha precisa re-parear);
+      // `closed` por desistir da reconexão é `failed` (retryable). Os dois
+      // são estados distintos para o operador — a UI oferece CTAs diferentes.
+      persistLineState(
+        channel,
+        loggedOut ? 'logged_out' : 'recovering',
+        { reason_code: loggedOut ? 'whatsapp_logged_out' : 'transport_closed' },
+      );
       // Cap. 7 — loggedOut persiste o encerramento da posse (canal inativo +
       // rm do auth SÓ desta linha) em vez de fechar apenas em memória.
       if (loggedOut) void handleLineLoggedOut(channel, reason);
@@ -289,6 +332,7 @@ async function startLineSession(channel: LineChannel): Promise<void> {
           'line_session.reconnect_giving_up',
         );
         manager.markState(channel.id, 'closed');
+        persistLineState(channel, 'failed', { reason_code: 'reconnect_exhausted' });
         return;
       }
       const delay = Math.min(

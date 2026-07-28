@@ -28,6 +28,24 @@ const nextConfig = {
       allowedOrigins: ['localhost:4000', 'localhost:3000'],
     },
   },
+  // Issue #518 — `Referrer-Policy: no-referrer` em TODAS as páginas do
+  // console. As URLs do admin carregam ids de tenant/agente/canal; sem esta
+  // política, qualquer navegação ou recurso externo levaria a URL de origem
+  // no header `Referer`. É também a contrapartida no console da mesma regra
+  // já aplicada ao `/setup` do runtime. `nosniff` e `DENY` são higiene padrão
+  // da mesma superfície.
+  async headers() {
+    return [
+      {
+        source: '/:path*',
+        headers: [
+          { key: 'Referrer-Policy', value: 'no-referrer' },
+          { key: 'X-Content-Type-Options', value: 'nosniff' },
+          { key: 'X-Frame-Options', value: 'DENY' },
+        ],
+      },
+    ];
+  },
   // ESM-style imports across the admin-ui use the .js extension on .ts files
   // (consistent with the root tsconfig "module: NodeNext" + tsc-alias output).
   // Next's webpack default doesn't resolve `.js` → `.ts(x)`; this alias does.

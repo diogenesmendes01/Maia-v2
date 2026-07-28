@@ -209,6 +209,21 @@ export const AUDIT_ACTIONS = [
   'pairing_session_started',
   'pairing_session_verified',
   'pairing_session_failed',
+  // Issue #518 — o pareamento passa a ser pedido pelo Admin AUTENTICADO. O
+  // ator administrativo (`actor_id`/`actor_role`) e o `correlation_id` viajam
+  // do console até estas ações, então uma linha pareada tem trilha ponta a
+  // ponta. NUNCA carregam QR, código, token ou auth state em metadata.
+  //  - channel_pairing_requested: o console enfileirou o comando.
+  //  - pairing_session_aborted: o operador cancelou (idempotente).
+  //  - pairing_session_expired: TTL estourou; ou o restart matou a tentativa
+  //    em memória e ela foi para `failed/retryable` (nunca `verified`).
+  //  - channel_disabled / channel_repair_requested: desativação e pedido de
+  //    re-pareamento (recovery de linha) partindo do console.
+  'channel_pairing_requested',
+  'pairing_session_aborted',
+  'pairing_session_expired',
+  'channel_disabled',
+  'channel_repair_requested',
   'message_update_channel_unresolved',
   // Staging de inbound não-roteado (§1.4, modo strict): staged na chegada sem
   // rota; handed_off quando o replay entrega na pipeline normal (dedup por

@@ -61,6 +61,11 @@ vi.mock('../../../src/governance/audit.js', () => ({
 vi.mock('../../../src/db/repositories/channel-repos.js', () => ({
   channelsRepo: { listActiveWhatsappLinesCrossTenant: vi.fn(async () => []) },
 }));
+// #518 — a transição de sessão passa a PERSISTIR o estado da linha (103).
+// É best-effort e fail-isolated; aqui basta stubar para o teste não tocar o DB.
+vi.mock('../../../src/db/repositories/channel-line-state-repos.js', () => ({
+  channelLineStateRepo: { upsertTransition: vi.fn(async () => undefined) },
+}));
 vi.mock('../../../src/gateway/baileys.js', () => ({
   ingressUpsertMessage: vi.fn(async () => 'handled' as const),
   handleMessagesUpdate: vi.fn(async () => undefined),

@@ -16,6 +16,7 @@ export * from './repositories/capability-repos.js';
 export * from './repositories/procedure-repos.js';
 export * from './repositories/profile-repos.js';
 export * from './repositories/channel-repos.js';
+export * from './repositories/channel-line-state-repos.js';
 export * from './repositories/inbound-unrouted-repos.js';
 export * from './repositories/admin-repos.js';
 export * from './repositories/playground-repos.js';
