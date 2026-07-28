@@ -7,6 +7,10 @@ import {
 } from '../../../src/ops/backup/service.js';
 import { resolveBackupProfile, type BackupConfigInput } from '../../../src/ops/backup/profile.js';
 import { verifyManifest } from '../../../src/ops/backup/manifest.js';
+import {
+  canReleaseTraffic,
+  planReconciliation,
+} from '../../../src/ops/retention/tombstones.js';
 import { TypedError } from '../../../src/lib/utils.js';
 
 /**
@@ -114,7 +118,15 @@ function harness(over: Partial<BackupPorts> = {}, opts: { frozenClock?: boolean;
       schema_fingerprint: 'b'.repeat(64),
       config_fingerprint: 'b'.repeat(64),
     }),
-    tombstoneWatermark: async () => new Date('2026-07-28T02:59:00.000Z'),
+    // Round-1 P1: the old fake returned a bare Date, so "ledger empty" and
+    // "ledger unreachable" were indistinguishable — exactly the collapse the
+    // production code had. The fake now models a REACHABILITY probe, and the
+    // cases below drive it into all three states.
+    tombstoneWatermark: async (reference: Date) => ({
+      available: true,
+      watermark: reference,
+      rows_present: true,
+    }),
     manifestSecret: () => ({ secret: SECRET, key_version: 1 }),
     store: {
       createRun: async (row) => {
@@ -470,7 +482,7 @@ describe('manifest', () => {
     if (!verdict.ok) return;
     expect(verdict.manifest.migration_head).toBe('102_data_lifecycle.sql');
     expect(verdict.manifest.commit).toBe('d93624b');
-    expect(verdict.manifest.tombstone_watermark).toBe('2026-07-28T02:59:00.000Z');
+    expect(verdict.manifest.tombstone_watermark).not.toBeNull();
   });
 
   it('declares the data classes the dump does NOT cover', async () => {
@@ -494,6 +506,82 @@ describe('manifest', () => {
     const h = harness({ readCatalog: async () => false });
     await runVerifiedBackup(h.ports, resolveBackupProfile(cfg()));
     expect(h.manifests).toHaveLength(0);
+  });
+});
+
+describe('tombstone ledger probe (round-1 P1)', () => {
+  it('FAILS the run when the ledger is unreachable — before it can be `completed`', async () => {
+    const h = harness({
+      tombstoneWatermark: async () => ({
+        available: false,
+        watermark: null,
+        rows_present: false,
+      }),
+    });
+    const res = await runVerifiedBackup(h.ports, resolveBackupProfile(cfg({ BACKUP_S3_BUCKET: 'b' })));
+    expect(res.outcome).toBe('failed');
+    expect(lastRun(h).error_code).toBe('tombstone_ledger_unavailable');
+  });
+
+  it('fails FAST — an unreadable ledger never reaches pg_dump', async () => {
+    const dump = vi.fn();
+    const h = harness({
+      dump: async () => {
+        dump();
+      },
+      tombstoneWatermark: async () => ({
+        available: false,
+        watermark: null,
+        rows_present: false,
+      }),
+    });
+    await runVerifiedBackup(h.ports, resolveBackupProfile(cfg()));
+    expect(dump).not.toHaveBeenCalled();
+  });
+
+  it('an EMPTY ledger still yields a watermark (a fresh install is backupable)', async () => {
+    const h = harness({
+      tombstoneWatermark: async (reference: Date) => ({
+        available: true,
+        watermark: reference,
+        rows_present: false,
+      }),
+    });
+    const res = await runVerifiedBackup(h.ports, resolveBackupProfile(cfg()));
+    expect(res.outcome).not.toBe('failed');
+    const verdict = verifyManifest(h.manifests[0]!.signed, SECRET);
+    if (!verdict.ok) throw new Error('manifest invalid');
+    expect(verdict.manifest.tombstone_watermark).not.toBeNull();
+  });
+
+  it('the artifact of an empty-ledger run is RESTORABLE (no watermark_missing)', async () => {
+    // The end-to-end shape of the finding: backup succeeded, restore blocked.
+    const h = harness({
+      tombstoneWatermark: async (reference: Date) => ({
+        available: true,
+        watermark: reference,
+        rows_present: false,
+      }),
+    });
+    await runVerifiedBackup(h.ports, resolveBackupProfile(cfg()));
+    const verdict = verifyManifest(h.manifests[0]!.signed, SECRET);
+    if (!verdict.ok) throw new Error('manifest invalid');
+
+    const plan = planReconciliation({
+      watermark: new Date(verdict.manifest.tombstone_watermark!),
+      ledger_available: true,
+      tombstones: [],
+      secret: 'reconcile-secret',
+    });
+    expect(plan.ok).toBe(true);
+    expect(plan.blocked_reason).toBeNull();
+    expect(canReleaseTraffic(plan, [])).toEqual({ release: true, reason: 'ok' });
+  });
+
+  it('stamps the run row with the watermark it recorded', async () => {
+    const h = harness();
+    await runVerifiedBackup(h.ports, resolveBackupProfile(cfg()));
+    expect(lastRun(h).tombstone_watermark).toBeInstanceOf(Date);
   });
 });
 

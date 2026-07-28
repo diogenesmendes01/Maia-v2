@@ -60,6 +60,27 @@ export interface Provenance {
   config_fingerprint: string | null;
 }
 
+/**
+ * Result of probing the tombstone ledger (issue #520 §13).
+ *
+ * `available: false` means the boundary could not be READ — a different thing
+ * from an empty ledger, and a fatal one: an artifact whose deletion history is
+ * unknown cannot be reconciled after a restore, so the run fails BEFORE it can
+ * be classified `completed`.
+ *
+ * When available, `watermark` is ALWAYS a real instant, even with zero rows.
+ * The reference is the run's own start: every tombstone effective after it is
+ * replayed on restore. Deletions already effective before it are inside the
+ * dump. Re-applying one that landed mid-dump is harmless — reconciliation is
+ * idempotent — so erring toward replay is the conservative direction.
+ */
+export interface TombstoneWatermarkProbe {
+  available: boolean;
+  watermark: Date | null;
+  /** Whether the ledger had any rows. Diagnostic; does not change the verdict. */
+  rows_present: boolean;
+}
+
 export interface UploadOutcome {
   /** Opaque destination locator (redaction.opaqueLocator). */
   locator: string;
@@ -102,8 +123,18 @@ export interface BackupPorts {
   ): Promise<RemoteVerification>;
 
   provenance(): Promise<Provenance>;
-  /** Newest tombstone instant at dump time — the §13 replay watermark. */
-  tombstoneWatermark(): Promise<Date | null>;
+  /**
+   * Probe the tombstone ledger and derive this artifact's replay watermark
+   * (§13). Takes the run's reference instant.
+   *
+   * ROUND-1 REVIEW FINDING (P1): this used to return `Date | null`, collapsing
+   * "the ledger is EMPTY" and "the ledger is UNREACHABLE" into the same `null`.
+   * Both then produced a manifest with no watermark, which `planReconciliation`
+   * rejects with `watermark_missing` — so a run could be marked `completed`
+   * while being intrinsically un-restorable, and a fresh installation with no
+   * tombstones could never produce a restorable backup at all.
+   */
+  tombstoneWatermark(reference: Date): Promise<TombstoneWatermarkProbe>;
 
   /** Secret used to sign the manifest. Lives OUTSIDE the artifact (§5). */
   manifestSecret(): { secret: string; key_version: number };
@@ -168,6 +199,7 @@ export type BackupErrorCode =
   | 'catalog_unreadable'
   | 'artifact_too_small'
   | 'encryption_failed'
+  | 'tombstone_ledger_unavailable'
   | 'promote_failed'
   | 'upload_failed'
   | 'remote_verification_failed'
@@ -181,6 +213,7 @@ function codeOf(err: unknown): BackupErrorCode {
     'catalog_unreadable',
     'artifact_too_small',
     'encryption_failed',
+    'tombstone_ledger_unavailable',
     'promote_failed',
     'upload_failed',
     'remote_verification_failed',
@@ -240,6 +273,7 @@ export async function runVerifiedBackup(
   let upload: UploadOutcome | null = null;
   let remoteMethod: RemoteVerificationMethod = 'none';
   let remoteReason = 'not_attempted';
+  let watermark: Date | null = null;
   let errorCode: BackupErrorCode | null = null;
   let dumpMs: number | null = null;
   let uploadMs: number | null = null;
@@ -247,6 +281,20 @@ export async function runVerifiedBackup(
 
   try {
     await ports.ensureBackupDir();
+
+    // ── tombstone ledger probe (BEFORE the dump) ─────────────────────────
+    // Fails fast: an artifact whose deletion history we cannot read is not
+    // restorable, and discovering that after an hour of `pg_dump` wastes the
+    // window. An EMPTY ledger is fine and still yields a watermark.
+    const probe = await ports.tombstoneWatermark(started);
+    if (!probe.available || probe.watermark === null) {
+      throw new TypedError(
+        'tombstone_ledger_unavailable',
+        'the tombstone ledger could not be read — this artifact could not be reconciled after a restore',
+        {},
+      );
+    }
+    watermark = probe.watermark;
 
     // ── dump ──────────────────────────────────────────────────────────────
     const t0 = ports.now().getTime();
@@ -390,7 +438,7 @@ export async function runVerifiedBackup(
   if (errorCode === null && evidence.locally_verified && digest !== null && plaintextDigest !== null) {
     try {
       const prov = await ports.provenance();
-      const watermark = await ports.tombstoneWatermark();
+      // Probed BEFORE the dump and guaranteed non-null past that gate.
       const manifest: BackupManifest = {
         manifest_version: MANIFEST_VERSION,
         backup_id,

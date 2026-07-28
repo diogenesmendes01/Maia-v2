@@ -29,7 +29,12 @@ import { base64ToHex, verifyRemoteArtifact } from './remote-verify.js';
 import { sha256File } from './checksum.js';
 import { encryptFile, parseBackupKeyring } from './encryption.js';
 import { opaqueLocator } from './redaction.js';
-import type { BackupPorts, Provenance, UploadOutcome } from './service.js';
+import type {
+  BackupPorts,
+  Provenance,
+  TombstoneWatermarkProbe,
+  UploadOutcome,
+} from './service.js';
 import { backupEvidenceStore } from '@/db/repositories/ops-repos.js';
 
 const MIGRATIONS_DIR = join(process.cwd(), 'migrations');
@@ -131,20 +136,42 @@ export async function collectProvenance(): Promise<Provenance> {
   };
 }
 
-/** Newest tombstone instant — the §13 replay watermark stamped into the manifest. */
-export async function readTombstoneWatermark(): Promise<Date | null> {
+/**
+ * Probe the tombstone ledger and derive this artifact's replay watermark (§13).
+ *
+ * ROUND-1 REVIEW FINDING (P1). This used to return `max(effective_at)` or
+ * `null`, and swallowed a DB error into that same `null`. Three problems in
+ * one:
+ *
+ *  1. an UNREADABLE ledger looked exactly like an EMPTY one;
+ *  2. either way the manifest carried no watermark, and `planReconciliation`
+ *    blocks a restore with `watermark_missing` — so a run reported `completed`
+ *    could be intrinsically un-restorable;
+ *  3. an installation that has never deleted anything could NEVER produce a
+ *    restorable backup, because `max()` over zero rows is null forever.
+ *
+ * Now the read is a REACHABILITY probe and the watermark is the run's own
+ * reference instant. Any tombstone effective after it gets replayed on restore;
+ * anything effective before it is already inside the dump. A deletion landing
+ * mid-dump is replayed too, which is harmless because reconciliation is
+ * idempotent — erring toward replay is the conservative direction.
+ */
+export async function readTombstoneWatermark(
+  reference: Date,
+): Promise<TombstoneWatermarkProbe> {
   try {
-    const res = await db.execute<{ watermark: string | null }>(
-      sql`SELECT max(effective_at)::text AS watermark FROM data_tombstones`,
+    const res = await db.execute<{ rows_present: boolean }>(
+      sql`SELECT EXISTS (SELECT 1 FROM data_tombstones) AS rows_present`,
     );
-    const raw = res.rows[0]?.watermark;
-    return raw ? new Date(raw) : null;
+    return {
+      available: true,
+      watermark: reference,
+      rows_present: res.rows[0]?.rows_present === true,
+    };
   } catch {
-    // The ledger being unreadable is recorded as "no watermark", which makes
-    // any later restore of this artifact fail closed at reconciliation
-    // (planReconciliation → blocked_reason 'watermark_missing'). That is the
-    // correct conservative outcome.
-    return null;
+    // Unreadable: the caller FAILS the run rather than publishing an artifact
+    // nobody could reconcile.
+    return { available: false, watermark: null, rows_present: false };
   }
 }
 
