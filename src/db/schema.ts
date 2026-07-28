@@ -3016,6 +3016,8 @@ export const agent_turns = pgTable(
     representative_message_id: uuid('representative_message_id').notNull(),
     status: text('status').notNull().default('received'), // TurnStatus
     outcome: text('outcome'), // TurnOutcome | null
+    /** Turno que absorveu este pelo debounce (só em `superseded`). */
+    superseded_by_turn_id: uuid('superseded_by_turn_id'),
     // Compare-and-swap: toda transição incrementa e o UPDATE exige a versão
     // esperada. `bigint` com mode 'number' — o contador nunca chega perto de
     // 2^53 (é por turno, não global).
@@ -3062,6 +3064,9 @@ export const agent_turns = pgTable(
     leaseIdx: index('agent_turns_lease_idx')
       .on(t.tenant_id, t.agent_id, t.lease_expires_at)
       .where(sql`status IN ('claimed', 'running')`),
+    supersededByIdx: index('agent_turns_superseded_by_idx')
+      .on(t.tenant_id, t.agent_id, t.superseded_by_turn_id)
+      .where(sql`superseded_by_turn_id IS NOT NULL`),
   }),
 );
 

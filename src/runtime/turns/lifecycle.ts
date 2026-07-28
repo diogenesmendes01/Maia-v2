@@ -272,9 +272,14 @@ export async function beginTurnExecution(
  * Duas situações por mensagem irmã:
  *   - sem turno (row legada / ingresso sem dual-write): vira input deste turno;
  *   - com turno próprio (o ingresso criou um por mensagem): o turno da irmã é
- *     marcado `superseded`/`merged_into_turn` e a associação input permanece
- *     onde está — assim a trilha mostra que aquele turno foi absorvido, sem
- *     violar "uma mensagem pertence a no máximo um turno".
+ *     marcado `superseded`/`merged_into_turn` COM `superseded_by_turn_id`
+ *     apontando para o turno executor, e a associação input permanece onde
+ *     está — sem violar "uma mensagem pertence a no máximo um turno".
+ *
+ * A relação de absorção é PERSISTIDA (não só logada): antes o operador via
+ * `outcome = merged_into_turn` e não tinha como saber qual turno respondeu no
+ * lugar; a pergunta "quem absorveu este?" / "o que este absorveu?" agora tem
+ * resposta em SQL (`listAbsorbedTurns`).
  *
  * A associação DEFINITIVA (um turno por rajada, decidido no ingresso) é
  * fechada em #505 — aqui o objetivo é que a rajada produza UM turno executável
@@ -300,6 +305,7 @@ export async function absorbDebounceInputs(
       if (sibling.id === handle.turn_id) continue;
       const result = await agentTurnsRepo.markSuperseded({
         turn_id: sibling.id,
+        absorbed_by_turn_id: handle.turn_id,
         expected_version: Number(sibling.state_version),
       });
       if (result.ok) {

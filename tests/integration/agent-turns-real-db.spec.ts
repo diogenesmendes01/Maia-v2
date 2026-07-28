@@ -609,6 +609,83 @@ d('agent_turns — DB real (migrations 096/097)', () => {
     expect(still?.status).toBe('received');
   });
 
+  // Achado P2 rodada 1: a irmã do debounce virava `superseded` mas a relação de
+  // absorção só existia no log — o operador via `merged_into_turn` sem saber
+  // QUAL turno respondeu no lugar. Agora é coluna, com FK composta.
+  it('(12) absorção do debounce é PERSISTIDA e escopada por tenant', async () => {
+    const { agentTurnsRepo } = await loadRepos();
+    const mkTurn = async (): Promise<{ id: string; state_version: number }> => {
+      const msg = await mkInbound('primary', 'primary');
+      const t = await inPrimary(() =>
+        agentTurnsRepo.ensureTurnForMessage({
+          id: msg,
+          tenant_id: 'primary',
+          agent_id: 'primary',
+          conversa_id: null,
+          channel_id: null,
+        }),
+      );
+      return { id: t.id, state_version: Number(t.state_version) };
+    };
+    const executor = await mkTurn();
+    const sibling = await mkTurn();
+
+    const r = await inPrimary(() =>
+      agentTurnsRepo.markSuperseded({
+        turn_id: sibling.id,
+        absorbed_by_turn_id: executor.id,
+        expected_version: sibling.state_version,
+      }),
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.turn.status).toBe('superseded');
+      expect(r.turn.outcome).toBe('merged_into_turn');
+      expect(r.turn.superseded_by_turn_id).toBe(executor.id);
+    }
+
+    // A pergunta que o operador faz: "o que este turno absorveu?"
+    const absorbed = await inPrimary(() => agentTurnsRepo.listAbsorbedTurns(executor.id));
+    expect(absorbed.map((t) => t.id)).toEqual([sibling.id]);
+
+    // CHECK: absorção só existe em `superseded`.
+    const other = await mkTurn();
+    await expect(
+      pool.query(`UPDATE agent_turns SET superseded_by_turn_id = $1 WHERE id = $2`, [
+        executor.id,
+        other.id,
+      ]),
+    ).rejects.toThrow(/agent_turns_superseded_by_chk/);
+
+    // CHECK: ninguém absorve a si mesmo.
+    await expect(
+      pool.query(
+        `UPDATE agent_turns SET status = 'superseded', outcome = 'merged_into_turn',
+         superseded_by_turn_id = id WHERE id = $1`,
+        [other.id],
+      ),
+    ).rejects.toThrow(/agent_turns_superseded_by_chk/);
+
+    // FK composta: não dá para ser absorvido por turno de OUTRO tenant.
+    const msgB = await mkInbound(OTHER_TENANT, OTHER_AGENT);
+    const turnB = await inOther(() =>
+      agentTurnsRepo.ensureTurnForMessage({
+        id: msgB,
+        tenant_id: OTHER_TENANT,
+        agent_id: OTHER_AGENT,
+        conversa_id: null,
+        channel_id: null,
+      }),
+    );
+    await expect(
+      pool.query(
+        `UPDATE agent_turns SET status = 'superseded', outcome = 'merged_into_turn',
+         superseded_by_turn_id = $1 WHERE id = $2`,
+        [turnB.id, other.id],
+      ),
+    ).rejects.toThrow();
+  });
+
   // Achado P1 rodada 1: no modo autoritativo o turno virava `retryable`, mas
   // `processada_em` era carimbado assim mesmo — o recovery reenfileirava e a
   // reentrada morria no early-return legado. Os cenários A e B da #503

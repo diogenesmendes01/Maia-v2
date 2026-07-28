@@ -64,6 +64,8 @@ export type TurnTransitionPatch = {
   last_error_summary?: string | null;
   outbound_message_id?: string | null;
   deadline_at?: Date | null;
+  /** Turno que absorveu este pelo debounce (só faz sentido em `superseded`). */
+  superseded_by_turn_id?: string | null;
   /** Incrementa `attempt_count` no mesmo UPDATE (retry). */
   bumpAttempt?: boolean;
 };
@@ -341,6 +343,8 @@ export const agentTurnsRepo = {
   /** Turno incorporado a outro pelo debounce (`received | queued -> superseded`). */
   async markSuperseded(input: {
     turn_id: string;
+    /** Turno EXECUTOR que absorveu este. Persistido em `superseded_by_turn_id`. */
+    absorbed_by_turn_id?: string;
     expected_version?: number;
   }): Promise<TurnTransitionResult> {
     return this.transitionTurn({
@@ -350,8 +354,29 @@ export const agentTurnsRepo = {
       ...(input.expected_version !== undefined
         ? { expected_version: input.expected_version }
         : {}),
-      patch: { next_attempt_at: null },
+      patch: {
+        next_attempt_at: null,
+        ...(input.absorbed_by_turn_id !== undefined
+          ? { superseded_by_turn_id: input.absorbed_by_turn_id }
+          : {}),
+      },
     });
+  },
+
+  /** Turnos que foram absorvidos por `turn_id` (rajada de debounce). */
+  async listAbsorbedTurns(turn_id: string): Promise<AgentTurn[]> {
+    const { tenant_id, agent_id } = scope();
+    return db
+      .select()
+      .from(agent_turns)
+      .where(
+        and(
+          eq(agent_turns.tenant_id, tenant_id),
+          eq(agent_turns.agent_id, agent_id),
+          eq(agent_turns.superseded_by_turn_id, turn_id),
+        ),
+      )
+      .orderBy(asc(agent_turns.created_at));
   },
 
   /**
@@ -856,6 +881,9 @@ async function runTransition(args: {
       set['outbound_message_id'] = args.patch.outbound_message_id;
     }
     if (args.patch.deadline_at !== undefined) set['deadline_at'] = args.patch.deadline_at;
+    if (args.patch.superseded_by_turn_id !== undefined) {
+      set['superseded_by_turn_id'] = args.patch.superseded_by_turn_id;
+    }
 
     const updated = await tx
       .update(agent_turns)

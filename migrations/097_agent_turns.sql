@@ -48,6 +48,12 @@ CREATE TABLE IF NOT EXISTS agent_turns (
 
   status text NOT NULL DEFAULT 'received',
   outcome text,
+  -- Turno que ABSORVEU este, quando o debounce agregou a mensagem em outra
+  -- execução (status 'superseded'). Sem esta coluna a relação só existia no
+  -- log: o operador via `outcome = merged_into_turn` e não tinha como saber
+  -- QUAL turno respondeu no lugar. FK composta (self-referencing) mantém a
+  -- absorção dentro do mesmo tenant/agent.
+  superseded_by_turn_id uuid,
   state_version bigint NOT NULL DEFAULT 0,
   attempt_count integer NOT NULL DEFAULT 0,
   next_attempt_at timestamptz,
@@ -138,10 +144,38 @@ CREATE TABLE IF NOT EXISTS agent_turns (
   CONSTRAINT agent_turns_error_code_len_chk
     CHECK (last_error_code IS NULL OR length(last_error_code) <= 64),
 
+  -- A absorção só existe em turno `superseded`, e nenhum turno absorve a si
+  -- mesmo (o que criaria um ciclo trivial na trilha).
+  CONSTRAINT agent_turns_superseded_by_chk CHECK (
+    superseded_by_turn_id IS NULL
+    OR (status = 'superseded' AND superseded_by_turn_id <> id)
+  ),
+
   -- Alvo das FKs compostas de agent_turn_inputs. `id` já é PK, então a
   -- unicidade do trio é consequência — não pode falhar por duplicata.
   CONSTRAINT agent_turns_scope_id_uq UNIQUE (tenant_id, agent_id, id)
 );
+
+-- Self-FK composta: um turno só pode ser absorvido por outro do MESMO par
+-- (tenant, agent). Declarada fora do CREATE TABLE porque referencia a unique
+-- `agent_turns_scope_id_uq` da própria tabela, que só existe após ele.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'agent_turns_superseded_by_scope_fk'
+  ) THEN
+    ALTER TABLE agent_turns
+      ADD CONSTRAINT agent_turns_superseded_by_scope_fk
+      FOREIGN KEY (tenant_id, agent_id, superseded_by_turn_id)
+      REFERENCES agent_turns (tenant_id, agent_id, id);
+  END IF;
+END $$;
+
+-- "Quais turnos foram absorvidos por este?" — a pergunta que o operador faz ao
+-- investigar uma rajada de debounce.
+CREATE INDEX IF NOT EXISTS agent_turns_superseded_by_idx
+  ON agent_turns (tenant_id, agent_id, superseded_by_turn_id)
+  WHERE superseded_by_turn_id IS NOT NULL;
 
 -- Idempotência estrutural do ingresso e do backfill: um turno por mensagem
 -- representativa. `createReceivedTurnTx` e o backfill em lotes dependem disto
