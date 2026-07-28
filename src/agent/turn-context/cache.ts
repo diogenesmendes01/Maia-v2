@@ -171,8 +171,30 @@ export type TurnContextCacheConfig = {
   ttl_ms: number;
   negative_ttl_ms: number;
   max_entries: number;
-  /** Fired once per (instance, tenant) on first write — drives lazy SUBSCRIBE. */
-  onTenantTouched?: (tenant_id: string) => void;
+  /**
+   * Resolves once this process is CONFIRMED subscribed to the tenant's
+   * invalidation channel; rejects when it is not.
+   *
+   * Round-1 review (P2): the previous hook was fire-and-forget and the tenant
+   * was marked "subscribed" BEFORE any acknowledgement. Two bugs fell out of
+   * that. If the first fill happened before the subscriber finished wiring, the
+   * hook was a no-op and the tenant was never retried — invalidations were lost
+   * for the life of the process. And even on the happy path the entry became
+   * readable before the SUBSCRIBE was acknowledged, so an invalidation
+   * published in that window went nowhere.
+   *
+   * Now the cache refuses to STORE until this resolves. Not caching is strictly
+   * safer than caching something we cannot invalidate, and the refusal is
+   * metered (`unsubscribed`) instead of silently degrading to TTL.
+   *
+   * Omit only in tests that deliberately want a TTL-only cache with no bus.
+   */
+  ensureSubscribed?: (tenant_id: string) => Promise<void>;
+  /**
+   * Minimum gap between subscribe attempts for a tenant after a failure, so a
+   * Redis outage does not turn every cache miss into a reconnect storm.
+   */
+  subscribe_retry_ms?: number;
 };
 
 /**
@@ -187,7 +209,9 @@ export type TurnContextCacheConfig = {
  */
 export class TurnContextCache {
   private readonly store = new Map<string, Entry>();
-  private readonly touchedTenants = new Set<string>();
+  /** Tenants whose SUBSCRIBE this process has ACKNOWLEDGED — never before. */
+  private readonly subscribedTenants = new Set<string>();
+  private readonly lastSubscribeAttempt = new Map<string, number>();
   private hits = 0;
   private misses = 0;
   private negativeHits = 0;
@@ -241,8 +265,14 @@ export class TurnContextCache {
     this.misses++;
     recordCacheOutcome(resource, 'miss');
     const loaded = await load();
-    this.put(scoped.key, loaded === null || loaded === undefined ? ABSENT : loaded);
-    this.notifyTenantTouched(scoped.tenant_id);
+
+    // Store ONLY once we can prove this process will hear about invalidations
+    // for this tenant. A value we cannot invalidate is worse than no value.
+    if (await this.ensureSubscribed(scoped.tenant_id)) {
+      this.put(scoped.key, loaded === null || loaded === undefined ? ABSENT : loaded);
+    } else {
+      recordCacheOutcome(resource, 'unsubscribed');
+    }
     return loaded ?? null;
   }
 
@@ -288,7 +318,8 @@ export class TurnContextCache {
   /** Test helper: reset counters and contents. */
   resetForTests(): void {
     this.store.clear();
-    this.touchedTenants.clear();
+    this.subscribedTenants.clear();
+    this.lastSubscribeAttempt.clear();
     this.hits = 0;
     this.misses = 0;
     this.negativeHits = 0;
@@ -317,19 +348,44 @@ export class TurnContextCache {
     }
   }
 
-  private notifyTenantTouched(tenant_id: string): void {
-    if (this.touchedTenants.has(tenant_id)) return;
-    this.touchedTenants.add(tenant_id);
+  /**
+   * True once this process is confirmed subscribed to `tenant_id`'s channel.
+   *
+   * The tenant is added to `subscribedTenants` ONLY after the hook resolves, so
+   * a failure is retried on the next miss rather than being remembered as
+   * success. A cooldown bounds retry pressure during a Redis outage; inside the
+   * cooldown we simply do not cache.
+   */
+  private async ensureSubscribed(tenant_id: string): Promise<boolean> {
+    // No hook configured = an explicit TTL-only cache (tests, or a deployment
+    // that deliberately runs without the bus). Nothing to confirm.
+    if (!this.cfg.ensureSubscribed) return true;
+    if (this.subscribedTenants.has(tenant_id)) return true;
+
+    const cooldown = this.cfg.subscribe_retry_ms ?? 5_000;
+    const last = this.lastSubscribeAttempt.get(tenant_id) ?? 0;
+    const now = Date.now();
+    if (now - last < cooldown) return false;
+    this.lastSubscribeAttempt.set(tenant_id, now);
+
     try {
-      this.cfg.onTenantTouched?.(tenant_id);
+      await this.cfg.ensureSubscribed(tenant_id);
+      this.subscribedTenants.add(tenant_id);
+      return true;
     } catch (err) {
-      // A failed subscribe only means this tenant falls back to TTL-bounded
-      // staleness. It must never break the read path.
+      // Loud, not silent: the turn still works, but the cache is inert for
+      // this tenant and an operator needs to be able to see that.
       logger.warn(
         { err: (err as Error).message, tenant_id },
-        'turn_context_cache.on_tenant_touched_hook_failed',
+        'turn_context_cache.subscribe_unconfirmed_not_caching',
       );
+      return false;
     }
+  }
+
+  /** Test helper: tenants with a confirmed subscription. */
+  subscribedTenantsForTest(): ReadonlySet<string> {
+    return this.subscribedTenants;
   }
 }
 
@@ -337,13 +393,15 @@ export class TurnContextCache {
 // Process singleton + Redis wiring
 // ============================================================================
 
-let pendingSubscribe: ((tenant_id: string) => void) | null = null;
-
 export const turnContextCache = new TurnContextCache({
   ttl_ms: config.TURN_CONTEXT_CACHE_TTL_MS,
   negative_ttl_ms: config.TURN_CONTEXT_CACHE_NEGATIVE_TTL_MS,
   max_entries: config.TURN_CONTEXT_CACHE_MAX_ENTRIES,
-  onTenantTouched: (tenant_id) => pendingSubscribe?.(tenant_id),
+  // Always wired in production: a process that forgot to start the subscriber
+  // must NOT silently fall through to an un-invalidatable cache. `subscribeTenant`
+  // rejects when the subscriber is not running, and the cache then declines to
+  // store and meters `unsubscribed`.
+  ensureSubscribed: (tenant_id) => subscribeTenant(tenant_id),
 });
 
 /**
@@ -377,6 +435,16 @@ export async function readCached<T>(
  * happened, and failing the operator's activation because a cache hint could
  * not be published would be the worse outcome.
  */
+/**
+ * Hard ceiling on how long a committed mutation will wait for the broker.
+ *
+ * ioredis is configured with `maxRetriesPerRequest: null`, so a PUBLISH issued
+ * while the connection is down does not fail — it QUEUES, indefinitely. Without
+ * this bound, a Redis outage would hang profile activation (a governance
+ * operation that has already committed and audited) rather than degrade it.
+ */
+const PUBLISH_TIMEOUT_MS = 2_000;
+
 export async function publishTurnContextInvalidation(args: {
   tenant_id: string;
   agent_id: string | null;
@@ -384,6 +452,10 @@ export async function publishTurnContextInvalidation(args: {
   /** Injected in tests; defaults to the shared client. */
   publisher?: { publish: (channel: string, message: string) => Promise<unknown> };
 }): Promise<void> {
+  // Nothing is cached while the feature is off, so there is nothing to
+  // invalidate — and no reason to touch Redis from a mutation path.
+  if (!config.FEATURE_TURN_CONTEXT_CACHE && !args.publisher) return;
+
   const event: TurnContextInvalidationEvent = {
     tenant_id: args.tenant_id,
     agent_id: args.agent_id,
@@ -393,14 +465,32 @@ export async function publishTurnContextInvalidation(args: {
   // Apply locally first: this replica must not serve a stale value even if the
   // broker is unreachable.
   turnContextCache.invalidate(event);
+
+  let timer: NodeJS.Timeout | undefined;
   try {
     const client = args.publisher ?? (await import('@/lib/redis.js')).redis;
-    await client.publish(turnContextInvalidationChannel(args.tenant_id), JSON.stringify(event));
+    const published = client.publish(
+      turnContextInvalidationChannel(args.tenant_id),
+      JSON.stringify(event),
+    );
+    await Promise.race([
+      published,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`publish timed out after ${PUBLISH_TIMEOUT_MS}ms`)),
+          PUBLISH_TIMEOUT_MS,
+        );
+        // Don't hold the event loop open for a best-effort cache hint.
+        timer.unref?.();
+      }),
+    ]);
   } catch (err) {
     logger.warn(
       { err: (err as Error).message, tenant_id: args.tenant_id, resource: args.resource },
       'turn_context_cache.invalidation_publish_failed_ttl_only',
     );
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -451,12 +541,77 @@ export function handleTurnContextInvalidationMessage(
   });
 }
 
-let subscriberStarted = false;
-const subscribedTenantsForTest = new Set<string>();
+/** Minimal surface this module needs from an ioredis subscriber connection. */
+type SubscriberClient = {
+  subscribe: (channel: string) => Promise<unknown>;
+  on: (event: string, handler: (...args: never[]) => void) => unknown;
+  connect: () => Promise<unknown>;
+};
+
+let subscriberEnabled = false;
+let subscriberClient: Promise<SubscriberClient> | null = null;
+let subscriberCache: TurnContextCache = turnContextCache;
+/** Injected by tests in place of a real ioredis connection. */
+let subscriberFactory: (() => Promise<SubscriberClient>) | null = null;
+
+async function buildSubscriber(): Promise<SubscriberClient> {
+  // `ioredis` is imported lazily so this module stays cheap for the hot path:
+  // `prompt-builder.ts` pulls it in on every turn just to call `readCached`,
+  // and a top-level driver import would drag the client into that graph (and
+  // into every prompt-builder unit spec) for no reason.
+  const sub: SubscriberClient = subscriberFactory
+    ? await subscriberFactory()
+    : await (async () => {
+        const { default: IORedis } = await import('ioredis');
+        return new IORedis(config.REDIS_URL, {
+          maxRetriesPerRequest: null,
+          enableReadyCheck: true,
+          lazyConnect: true,
+        }) as unknown as SubscriberClient;
+      })();
+
+  sub.on('error', ((err: Error) => {
+    logger.warn({ err: err.message }, 'turn_context_cache.subscriber_error');
+  }) as never);
+  sub.on('message', ((channel: string, message: string) => {
+    handleTurnContextInvalidationMessage(channel, message, subscriberCache);
+  }) as never);
+  // Await the connection: `subscribeTenant` must not resolve on a client that
+  // has not connected, or the cache would treat an unacknowledged SUBSCRIBE as
+  // confirmed — the exact bug this rework closes.
+  await sub.connect();
+  return sub;
+}
 
 /**
- * Idempotent. Starts a dedicated subscriber connection (ioredis forbids other
- * commands on a subscribed client) and wires the lazy per-tenant SUBSCRIBE.
+ * Resolve once this process holds an ACKNOWLEDGED subscription to the tenant's
+ * invalidation channel. Rejects otherwise — including when the subscriber was
+ * never started, which is what stops a misconfigured process from quietly
+ * running an un-invalidatable cache.
+ *
+ * A failed connection nulls the memoized client so the NEXT call rebuilds it;
+ * the cache's own cooldown keeps that from becoming a reconnect storm.
+ */
+async function subscribeTenant(tenant_id: string): Promise<void> {
+  if (!subscriberEnabled) {
+    throw new Error('turn_context_cache.subscriber_not_started');
+  }
+  const channel = turnContextInvalidationChannel(tenant_id);
+  if (!subscriberClient) subscriberClient = buildSubscriber();
+  let sub: SubscriberClient;
+  try {
+    sub = await subscriberClient;
+  } catch (err) {
+    subscriberClient = null;
+    throw err;
+  }
+  await sub.subscribe(channel);
+}
+
+/**
+ * Idempotent. Enables the dedicated subscriber connection (ioredis forbids
+ * other commands on a subscribed client). The connection itself is built lazily
+ * on the first tenant that needs it.
  *
  * No-op when the cache feature is off: with nothing cached there is nothing to
  * invalidate, and an idle connection per replica is not free.
@@ -464,73 +619,28 @@ const subscribedTenantsForTest = new Set<string>();
 export function startTurnContextCacheInvalidationSubscriber(
   cache: TurnContextCache = turnContextCache,
 ): void {
-  if (subscriberStarted) return;
   if (!config.FEATURE_TURN_CONTEXT_CACHE) return;
-  subscriberStarted = true;
-
-  // `ioredis` is imported lazily so this module stays cheap for the hot path:
-  // `prompt-builder.ts` pulls it in on every turn just to call `readCached`,
-  // and a top-level driver import would drag the client into that graph (and
-  // into every prompt-builder unit spec) for no reason.
-  void (async () => {
-    const { default: IORedis } = await import('ioredis');
-    const sub = new IORedis(config.REDIS_URL, {
-      maxRetriesPerRequest: null,
-      enableReadyCheck: true,
-      lazyConnect: true,
-    });
-    sub.on('error', (err) => {
-      logger.warn({ err: err.message }, 'turn_context_cache.subscriber_error');
-    });
-    sub.connect().catch((err) => {
-      logger.warn(
-        { err: (err as Error).message },
-        'turn_context_cache.subscribe_connect_failed',
-      );
-    });
-    sub.on('message', (channel, message) => {
-      handleTurnContextInvalidationMessage(channel, message, cache);
-    });
-
-    pendingSubscribe = (tenant_id: string): void => {
-      let channel: string;
-      try {
-        channel = turnContextInvalidationChannel(tenant_id);
-      } catch (err) {
-        logger.warn(
-          { err: (err as Error).message, tenant_id },
-          'turn_context_cache.subscribe_build_channel_failed',
-        );
-        return;
-      }
-      subscribedTenantsForTest.add(tenant_id);
-      void sub.subscribe(channel, (err) => {
-        if (err) {
-          logger.warn(
-            { err: err.message, channel, tenant_id },
-            'turn_context_cache.subscribe_failed_natural_ttl_only',
-          );
-        }
-      });
-    };
-  })().catch((err) => {
-    logger.warn(
-      { err: (err as Error).message },
-      'turn_context_cache.subscriber_start_failed_ttl_only',
-    );
-  });
+  subscriberCache = cache;
+  subscriberEnabled = true;
 }
 
-/** Test-only: reset the once-flag so a spec can re-wire the subscriber. */
+/** Test-only: reset subscriber state so a spec can re-wire it. */
 export function _resetTurnContextSubscriberForTests(): void {
-  subscriberStarted = false;
-  pendingSubscribe = null;
-  subscribedTenantsForTest.clear();
+  subscriberEnabled = false;
+  subscriberClient = null;
+  subscriberFactory = null;
+  subscriberCache = turnContextCache;
 }
 
-/** Test-only: which tenants this process explicitly SUBSCRIBEd to. */
-export function _getSubscribedTenantsForTest(): ReadonlySet<string> {
-  return subscribedTenantsForTest;
+/** Test-only: stand in for the ioredis connection. */
+export function _setTurnContextSubscriberFactoryForTests(
+  factory: (() => Promise<SubscriberClient>) | null,
+): void {
+  subscriberFactory = factory;
+  subscriberClient = null;
 }
+
+/** Test-only: the tenant-subscribe entry point, so a spec can drive it. */
+export const _subscribeTenantForTests = subscribeTenant;
 
 export const _internal = { ABSENT, KEY_PREFIX, CHANNEL_PREFIX };

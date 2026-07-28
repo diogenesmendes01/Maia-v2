@@ -35,11 +35,16 @@ import {
   turnContextInvalidationChannel,
   parseTurnContextInvalidationChannel,
   handleTurnContextInvalidationMessage,
+  startTurnContextCacheInvalidationSubscriber,
+  _resetTurnContextSubscriberForTests,
+  _setTurnContextSubscriberFactoryForTests,
+  _subscribeTenantForTests,
   InvalidCacheScopeError,
   CACHEABLE_RESOURCES,
   type CacheableResource,
 } from '../../src/agent/turn-context/cache.js';
 import { runWithTenantContext } from '../../src/db/tenant-context.js';
+import { renderPrometheus, _resetForTests as _resetMetrics } from '../../src/lib/metrics.js';
 
 function mkCache(over: Partial<{ ttl_ms: number; negative_ttl_ms: number; max_entries: number }> = {}) {
   return new TurnContextCache({
@@ -250,6 +255,143 @@ describe('#511 turn-context cache — invalidation', () => {
         cache.getOrLoad('identity', async () => 'acme-dev-v2'),
       ),
     ).toBe('acme-dev-v1');
+  });
+});
+
+/**
+ * Round-1 review, P2. The tenant used to be marked subscribed BEFORE any
+ * acknowledgement, which lost invalidations two ways: a first fill that landed
+ * before the subscriber finished wiring marked the tenant permanently (never
+ * retried), and even on the happy path the entry was readable before the
+ * SUBSCRIBE was acked. The cache now refuses to STORE until the subscription is
+ * confirmed, and meters the refusal.
+ */
+describe('#511 turn-context cache — subscription gating', () => {
+  it('does not store anything until the subscription is confirmed', async () => {
+    let allow = false;
+    const cache = new TurnContextCache({
+      ttl_ms: 300_000,
+      negative_ttl_ms: 30_000,
+      max_entries: 100,
+      subscribe_retry_ms: 0,
+      ensureSubscribed: async () => {
+        if (!allow) throw new Error('subscriber not started');
+      },
+    });
+    const load = vi.fn(async () => 'v1');
+
+    // Subscriber not ready → the read works, but nothing is cached.
+    await runWithTenantContext(A, () => cache.getOrLoad('identity', load));
+    await runWithTenantContext(A, () => cache.getOrLoad('identity', load));
+    expect(load).toHaveBeenCalledTimes(2);
+    expect(cache.stats().entries).toBe(0);
+    expect(cache.subscribedTenantsForTest().has('acme')).toBe(false);
+
+    // Once it is confirmed, the tenant is retried and caching begins.
+    allow = true;
+    await runWithTenantContext(A, () => cache.getOrLoad('identity', load));
+    expect(load).toHaveBeenCalledTimes(3);
+    expect(cache.subscribedTenantsForTest().has('acme')).toBe(true);
+
+    await runWithTenantContext(A, () => cache.getOrLoad('identity', load));
+    expect(load).toHaveBeenCalledTimes(3); // served from cache
+  });
+
+  it('meters the refusal instead of degrading silently', async () => {
+    _resetMetrics();
+    const cache = new TurnContextCache({
+      ttl_ms: 300_000,
+      negative_ttl_ms: 30_000,
+      max_entries: 100,
+      subscribe_retry_ms: 0,
+      ensureSubscribed: async () => {
+        throw new Error('redis down');
+      },
+    });
+    await runWithTenantContext(A, () => cache.getOrLoad('identity', async () => 'v'));
+
+    const exposition = await renderPrometheus();
+    // A flat hit rate must be explainable from the metrics alone.
+    expect(exposition).toContain(
+      'maia_turn_context_cache_total{result="unsubscribed",section="identity"} 1',
+    );
+  });
+
+  it('backs off between subscribe attempts instead of retrying every miss', async () => {
+    const ensureSubscribed = vi.fn(async () => {
+      throw new Error('redis down');
+    });
+    const cache = new TurnContextCache({
+      ttl_ms: 300_000,
+      negative_ttl_ms: 30_000,
+      max_entries: 100,
+      subscribe_retry_ms: 60_000,
+      ensureSubscribed,
+    });
+
+    for (let i = 0; i < 5; i++) {
+      await runWithTenantContext(A, () => cache.getOrLoad('identity', async () => 'v'));
+    }
+    // One attempt, not five — an outage must not become a reconnect storm.
+    expect(ensureSubscribed).toHaveBeenCalledTimes(1);
+  });
+
+  it('a cache with NO bus configured is an explicit TTL-only cache', async () => {
+    // Tests (and a deployment that deliberately runs without the bus) opt out
+    // by omitting the hook — that is different from a hook that fails.
+    const cache = mkCache();
+    const load = vi.fn(async () => 'v');
+    await runWithTenantContext(A, () => cache.getOrLoad('identity', load));
+    await runWithTenantContext(A, () => cache.getOrLoad('identity', load));
+    expect(load).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses to subscribe when the subscriber was never started', async () => {
+    _resetTurnContextSubscriberForTests();
+    await expect(_subscribeTenantForTests('acme')).rejects.toThrow(
+      /subscriber_not_started/,
+    );
+  });
+
+  it('only resolves after the client connected AND the channel was subscribed', async () => {
+    _resetTurnContextSubscriberForTests();
+    const order: string[] = [];
+    _setTurnContextSubscriberFactoryForTests(async () => ({
+      on: () => undefined,
+      connect: async () => {
+        order.push('connect');
+      },
+      subscribe: async (channel: string) => {
+        order.push(`subscribe:${channel}`);
+      },
+    }));
+    startTurnContextCacheInvalidationSubscriber();
+
+    await _subscribeTenantForTests('acme');
+
+    expect(order).toEqual(['connect', `subscribe:${turnContextInvalidationChannel('acme')}`]);
+    _resetTurnContextSubscriberForTests();
+  });
+
+  it('rebuilds the client after a failed connect so a later turn can recover', async () => {
+    _resetTurnContextSubscriberForTests();
+    let attempts = 0;
+    _setTurnContextSubscriberFactoryForTests(async () => {
+      attempts++;
+      if (attempts === 1) throw new Error('connect refused');
+      return {
+        on: () => undefined,
+        connect: async () => undefined,
+        subscribe: async () => undefined,
+      };
+    });
+    startTurnContextCacheInvalidationSubscriber();
+
+    await expect(_subscribeTenantForTests('acme')).rejects.toThrow('connect refused');
+    // A transient outage must not disable the cache for the process lifetime.
+    await expect(_subscribeTenantForTests('acme')).resolves.toBeUndefined();
+    expect(attempts).toBe(2);
+    _resetTurnContextSubscriberForTests();
   });
 });
 

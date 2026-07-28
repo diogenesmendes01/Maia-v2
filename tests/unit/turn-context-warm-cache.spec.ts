@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { Mensagem, Pessoa, Conversa } from '../../src/db/schema.js';
 
 /**
@@ -85,7 +85,12 @@ vi.mock('../../src/db/repositories.js', () => ({
 
 import { buildPrompt, type PromptContext } from '../../src/agent/prompt-builder.js';
 import { runWithTenantContext } from '../../src/db/tenant-context.js';
-import { turnContextCache } from '../../src/agent/turn-context/cache.js';
+import {
+  turnContextCache,
+  startTurnContextCacheInvalidationSubscriber,
+  _resetTurnContextSubscriberForTests,
+  _setTurnContextSubscriberFactoryForTests,
+} from '../../src/agent/turn-context/cache.js';
 
 const SCOPE = { tenant_id: 'acme', agent_id: 'agent-1' };
 
@@ -131,6 +136,35 @@ describe('#511 warm-cache query budget', () => {
   beforeEach(() => {
     for (const k of Object.keys(h.calls)) delete h.calls[k];
     turnContextCache.resetForTests();
+    // Round-1 review (P2): the cache refuses to STORE until it holds a
+    // confirmed subscription to the tenant's invalidation channel. Stand up a
+    // fake bus so these tests measure the cache, not the refusal — and so the
+    // wiring they exercise matches production's.
+    _resetTurnContextSubscriberForTests();
+    _setTurnContextSubscriberFactoryForTests(async () => ({
+      on: () => undefined,
+      connect: async () => undefined,
+      subscribe: async () => undefined,
+    }));
+    startTurnContextCacheInvalidationSubscriber();
+  });
+
+  afterEach(() => {
+    _resetTurnContextSubscriberForTests();
+  });
+
+  it('caches NOTHING while the invalidation bus is unconfirmed', async () => {
+    // The safety property behind the numbers below: without a confirmed
+    // subscription there is no cache at all, so there is no window in which a
+    // replica serves an identity it can never be told to drop.
+    _resetTurnContextSubscriberForTests();
+    turnContextCache.resetForTests();
+
+    await runWithTenantContext(SCOPE, () => buildPrompt(mkCtx()));
+    for (const k of Object.keys(h.calls)) delete h.calls[k];
+    await runWithTenantContext(SCOPE, () => buildPrompt(mkCtx()));
+
+    expect(totalCalls()).toBe(13);
   });
 
   it('drops from 13 to 11 queries on the second turn of the same agent', async () => {

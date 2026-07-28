@@ -58,7 +58,19 @@ export type SectionStatus = 'loaded' | 'empty' | 'degraded';
  * cache was disabled; `error` means the cache backend itself failed and the
  * loader fell through to the DB.
  */
-export type CacheResult = 'hit' | 'miss' | 'negative_hit' | 'bypass' | 'error';
+export type CacheResult =
+  | 'hit'
+  | 'miss'
+  | 'negative_hit'
+  | 'bypass'
+  | 'error'
+  /**
+   * The value was loaded but NOT stored, because this process is not confirmed
+   * subscribed to the tenant's invalidation channel. A non-zero rate here means
+   * the cache is doing nothing for that tenant — which is safe, but must be
+   * visible rather than inferred from a mysteriously flat hit rate.
+   */
+  | 'unsubscribed';
 
 /**
  * Why a section was truncated. Closed set — the actual counts go in the
