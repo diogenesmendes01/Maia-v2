@@ -28,7 +28,7 @@ If a project instruction conflicts with a skill, the project wins. If the user s
 
 | Layer | Tech |
 |---|---|
-| Runtime | Node 20+, TypeScript 5+, ESM |
+| Runtime | Node 22+ (`.nvmrc`, `package.json` engines e imagens Docker na mesma linha), TypeScript 5+, ESM |
 | Server | Fastify (`src/server.ts`) |
 | DB | PostgreSQL 16 + pgvector via Drizzle ORM |
 | Cache / Queue | Redis + BullMQ (`ioredis`) |
@@ -60,6 +60,8 @@ If a project instruction conflicts with a skill, the project wins. If the user s
 
 | What | Where |
 |---|---|
+| Configuração (contrato de env vars, profiles, comandos) | [`docs/configuration.md`](docs/configuration.md) — **gerado** por `npm run config:generate` |
+| Boot falhando por config, e o rollback | [`docs/runbooks/config-contract.md`](docs/runbooks/config-contract.md) |
 | Operational runbooks (debug + rollback) | [`docs/runbooks/`](docs/runbooks/) |
 | Per-feature design specs | [`docs/superpowers/specs/`](docs/superpowers/specs/) |
 | Implementation plans | [`docs/superpowers/plans/`](docs/superpowers/plans/) |
@@ -120,9 +122,15 @@ npm run test:leak                 # cross-tenant leak suite (critical, run befor
 
 # Static checks (run before every commit)
 npm run docs:ai:check             # AI engineering docs governance
+npm run config:check:drift        # config contract: generated artifacts up to date? (#515)
 npm run typecheck                 # tsc --noEmit
 npm run lint                      # eslint src tests scripts
 npm run format                    # prettier --write src
+
+# Configuração (contrato único — src/config/contract.ts)
+npm run config:generate           # regenera .env.example, docs/configuration.md, schema, manifest, fixtures
+npm run config:check -- --profile production --env-file .env
+npm run config:init -- --profile development
 
 # Build
 npm run build                     # tsc + tsc-alias

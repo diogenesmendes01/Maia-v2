@@ -5,7 +5,7 @@
 > aprovados para assumir uma função operacional humana — com governança,
 > escopo e evidência.
 
-[![Node](https://img.shields.io/badge/node-20%2B-green)]()
+[![Node](https://img.shields.io/badge/node-22%2B-green)]()
 [![TypeScript](https://img.shields.io/badge/typescript-5%2B-blue)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -51,7 +51,7 @@
 
 ## Stack
 
-- **Runtime:** Node.js 20+ + TypeScript 5+
+- **Runtime:** Node.js 22+ + TypeScript 5+
 - **Banco:** PostgreSQL 16 + pgvector
 - **Cache / Fila:** Redis + BullMQ
 - **WhatsApp:** Baileys
@@ -127,7 +127,7 @@ maia/
 ```bash
 # Pré-requisitos
 # - Docker + Docker Compose
-# - Node 20+
+# - Node 22+ (linha única do repo: .nvmrc, package.json engines, imagens Docker)
 # - Conta Anthropic com API key
 # - Conta OpenAI com API key
 # - Um chip WhatsApp dedicado por agente que você for operar

@@ -1,502 +1,146 @@
-import { z } from 'zod';
+/**
+ * Runtime configuration singleton.
+ *
+ * Since issue #515 this file is a THIN LOADER: the schema, the defaults and the
+ * cross-field rules all come from the pure contract
+ * (`src/config/contract.ts` + `src/config/rules.ts`). This module is the only
+ * one that still has import-time side effects (`dotenv/config` + `loadConfig()`),
+ * which is exactly why the contract is kept separate — the CLI, `maia doctor`
+ * (#517), the migration runner (#516) and the tests import the contract and get
+ * schema + validation WITHOUT booting the world.
+ *
+ * BOOT IS FAIL-CLOSED IN EVERY PROFILE (owner decision on PR #522 review round
+ * 1). An unknown Maia variable, a removed one (tombstone) or a `NODE_ENV` ×
+ * `MAIA_ENV` contradiction aborts the boot in `development` exactly as it does
+ * in production. Consistency is the point: a `.env` that boots on a laptop and
+ * dies in staging is the drift this issue exists to remove.
+ *
+ * ROLLBACK, WITHOUT A REDEPLOY: `MAIA_CONFIG_STRICT_BOOT=false` reverts to the
+ * pre-contract loader (Zod schema + `boot`-scope cross-field rules only). It
+ * turns the WHOLE contract guarantee off, so it is a lever to unblock an
+ * environment while the real fix lands — see `docs/runbooks/config-contract.md`.
+ *
+ * Public surface unchanged: `config` and `Config`, with the same keys and the
+ * same inferred types as before the contract landed.
+ */
+import type { z } from 'zod';
 import 'dotenv/config';
-import { assertSafeAuthDir } from '@/setup/auth-dir.js';
+import { CONTRACT_VERSION, objectSchemaForService } from '@/config/contract.js';
+import { evaluateCrossFieldRules } from '@/config/rules.js';
+import { resolveProfile } from '@/config/profiles.js';
+import { validateConfig } from '@/config/validate.js';
+import type { ConfigProblem } from '@/config/metadata.js';
 
-const envSchema = z
-  .object({
-    NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
-    TZ: z.string().default('America/Sao_Paulo'),
-    APP_PORT: z.coerce.number().int().positive().default(3000),
-    LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
-
-    DATABASE_URL: z.string().url(),
-    POSTGRES_USER: z.string().min(1),
-    POSTGRES_PASSWORD: z.string().min(8),
-    POSTGRES_DB: z.string().min(1),
-    POSTGRES_PORT: z.coerce.number().int().positive().default(5432),
-
-    REDIS_URL: z.string().url(),
-    REDIS_PORT: z.coerce.number().int().positive().default(6379),
-
-    LLM_PROVIDER: z.enum(['anthropic', 'openrouter']).default('anthropic'),
-    ANTHROPIC_API_KEY: z.string().startsWith('sk-ant-').optional(),
-    OPENROUTER_API_KEY: z.string().startsWith('sk-or-').optional(),
-    OPENROUTER_MODEL_MAIN: z.string().default('anthropic/claude-sonnet-4.6'),
-    OPENROUTER_MODEL_FAST: z.string().default('anthropic/claude-haiku-4.5'),
-    CLAUDE_MODEL_MAIN: z.string().default('claude-sonnet-4-6'),
-    CLAUDE_MODEL_FAST: z.string().default('claude-haiku-4-5-20251001'),
-    OPENAI_API_KEY: z.string().startsWith('sk-').optional(),
-
-    WHISPER_PROVIDER: z.enum(['openai']).default('openai'),
-    WHISPER_MODEL: z.string().default('whisper-1'),
-
-    EMBEDDING_PROVIDER: z.enum(['voyage', 'openai', 'cohere']).default('voyage'),
-    EMBEDDING_MODEL: z.string().default('voyage-3'),
-    EMBEDDING_DIMENSIONS: z.coerce.number().int().positive().default(1024),
-    VOYAGE_API_KEY: z.string().optional(),
-    COHERE_API_KEY: z.string().optional(),
-
-    BAILEYS_AUTH_DIR: z.string().default('./.baileys-auth'),
-    WHATSAPP_NUMBER_MAIA: z.string().regex(/^\+\d{10,15}$/),
-    MAIA_DISPLAY_NAME: z.string().default('Maia'),
-
-    OWNER_TELEFONE_WHATSAPP: z.string().regex(/^\+\d{10,15}$/),
-    OWNER_NOME: z.string().min(1),
-
-    VALOR_LIMITE_SEM_CONFIRMACAO: z.coerce.number().nonnegative().default(1000),
-    VALOR_DUAL_APPROVAL: z.coerce.number().nonnegative().default(20000),
-    VALOR_LIMITE_DURO: z.coerce.number().positive().default(50000),
-    DUAL_APPROVAL_TIMEOUT_HOURS: z.coerce.number().int().positive().default(6),
-    AUDIT_MODE_TTL_HOURS: z.coerce.number().int().positive().default(24),
-    IDEMPOTENCY_BUCKET_MINUTES: z.coerce.number().int().positive().default(5),
-    PENDING_QUESTION_TTL_MINUTES: z.coerce.number().int().positive().default(120),
-    PENDING_ACTION_TTL_HOURS: z.coerce.number().int().positive().default(6),
-    RATE_LIMIT_MSGS_PER_HOUR: z.coerce.number().int().positive().default(30),
-
-    CLAUDE_MAX_RETRIES: z.coerce.number().int().nonnegative().default(3),
-    CLAUDE_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),
-    WHATSAPP_RECONNECT_ALERT_MIN: z.coerce.number().int().positive().default(5),
-    // Decision Engine total wall-clock budget (ms). Raised from the original
-    // 400ms baseline: the intent classifier's Haiku hop (~390ms) alone blew the
-    // 400ms budget on every heuristic-miss, forcing the canned
-    // `ask_clarification` fallback (main LLM skipped). See
-    // src/runtime/decision/decision-engine.ts.
-    DECISION_ENGINE_BUDGET_MS: z.coerce.number().int().positive().default(2500),
-
-    ALERT_CHANNELS: z
-      .string()
-      .default('email')
-      .transform((s) => s.split(',').map((x) => x.trim()).filter(Boolean)),
-    SMTP_HOST: z.string().optional(),
-    SMTP_PORT: z.coerce.number().int().positive().optional(),
-    SMTP_USER: z.string().optional(),
-    SMTP_PASS: z.string().optional(),
-    ALERT_EMAIL_TO: z.string().email().optional(),
-    TELEGRAM_BOT_TOKEN: z.string().optional(),
-    TELEGRAM_CHAT_ID: z.string().optional(),
-
-    BACKUP_DIR: z.string().default('./backups'),
-    BACKUP_RETENTION_LOCAL_DAYS: z.coerce.number().int().positive().default(7),
-    BACKUP_RETENTION_CLOUD_DAYS: z.coerce.number().int().positive().default(30),
-    BACKUP_S3_BUCKET: z.string().optional(),
-    // Optional custom endpoint for S3-compatible providers (Backblaze B2,
-    // Cloudflare R2, Wasabi, etc.). Leave unset for AWS S3 native.
-    BACKUP_S3_ENDPOINT: z.string().url().optional(),
-    BACKUP_S3_REGION: z.string().default('us-east-1'),
-    BACKUP_S3_ACCESS_KEY: z.string().optional(),
-    BACKUP_S3_SECRET_KEY: z.string().optional(),
-    // S3 path prefix inside the bucket (no leading or trailing slash).
-    BACKUP_S3_PREFIX: z.string().default('maia'),
-
-    DAILY_LLM_USD_THRESHOLD: z.coerce.number().positive().default(5),
-    DLQ_ALERT_THRESHOLD: z.coerce.number().int().positive().default(10),
-
-    FEATURE_MCP_TOOLS: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
-    FEATURE_PROACTIVE_MESSAGES: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
-    FEATURE_OFX_IMPORT: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
-    FEATURE_DASHBOARD: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
-    FEATURE_PENDING_GATE: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
-    FEATURE_PRESENCE: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
-    // Roteamento multi-linha (spec 2026-07-09 Draft v4):
-    //  - MAIA_MULTI_LINE: liga o LineSessionManager como dono do transporte
-    //    por canal (fase 3). Default off = paridade mono-linha (fase 0/1).
-    //  - MAIA_CHANNEL_ROUTING_MODE (§1.2, tri-state — review v2): shadow
-    //    computa o exact-match pela linha em paralelo e SÓ loga divergência;
-    //    exact_first usa exact-match com fallback no catch-all legado;
-    //    strict exige staging operante e falha tipado no miss.
-    MAIA_MULTI_LINE: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
-    MAIA_CHANNEL_ROUTING_MODE: z
-      .enum(['shadow', 'exact_first', 'strict'])
-      .default('shadow'),
-    // Staging cifrado de inbound não-roteado (§1.4, modo strict): keyring
-    // JSON { key_id: base64(32B) } + id da chave ativa. Strict recusa ligar
-    // sem keyring válido (fail-closed).
-    MAIA_STAGING_KEYRING: z.string().optional(),
-    MAIA_STAGING_ACTIVE_KEY_ID: z.string().optional(),
-    // Synthetic Agent Probe (spec 2026-07-17 §1) — sonda sintética que
-    // exercita o agente ponta-a-ponta pelo caminho de produção real
-    // (ingresso → resolver → fila → LLM → tools → persistência → saída) e
-    // falha ALTO quando a Maia para de responder ou responde errado.
-    //  - MAIA_SYNTHETIC_PROBE: gate de comportamento. INERTE (no-op) enquanto
-    //    false (default). O worker É registrado em phase 1 (§1.1 — phase 2
-    //    nunca é agendado por startWorkers(1)), mas só age com a flag on. O
-    //    recurso de sonda (tenant/agente/canal/entidade/conta) é SEMEADO com
-    //    ids literais pela migração 094 e referenciado por constante em
-    //    src/probe/constants.ts — NÃO por env, para que não haja como
-    //    apontar o sink para um tenant real (o blast radius do §1.3). O boot
-    //    fail-fast (§1.3) revalida no DB que o triplete é exclusivamente
-    //    sintético mesmo assim (defense-in-depth).
-    //  - Pré-requisito de roteamento (§1.2): sob MAIA_CHANNEL_ROUTING_MODE=
-    //    shadow o worker FALHA FECHADO (no-op + audit synthetic_probe_prereq_
-    //    unmet) — não é erro de boot; só exact_first/strict habilitam a sonda.
-    MAIA_SYNTHETIC_PROBE: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
-    // LLM-as-judge (§1.4c) — asserção SECUNDÁRIA para intenção semântica.
-    // Implementado desde a v1 (não é fase futura), porém ligável por esta
-    // sub-flag (off por default: custo/ruído, coerente com §1.4/§5). A
-    // asserção PRIMÁRIA é sempre o efeito colateral verificável + liveness.
-    MAIA_PROBE_LLM_JUDGE: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
-    // Cadência do tick (§1.1, default */10). 1 cenário/tick (custo bounded).
-    MAIA_PROBE_CRON: z.string().default('*/10 * * * *'),
-    // SLO do efeito colateral (ms): deadline do poll. Sem efeito em SLO ⇒
-    // `silent`; efeito ok mas acima de SLO_WARN ⇒ `slow` (§1.1 passo 5).
-    MAIA_PROBE_SLO_MS: z.coerce.number().int().positive().default(30_000),
-    MAIA_PROBE_SLO_WARN_MS: z.coerce.number().int().positive().default(15_000),
-    // K falhas consecutivas para a transição saudável→degradado + alerta
-    // (§1.6/§5 — separa lentidão pontual de outage real).
-    MAIA_PROBE_ALERT_AFTER_K: z.coerce.number().int().positive().default(3),
-    // Auto-silêncio (§1.5/§5): após N falhas consecutivas o worker para de
-    // gastar LLM continuamente — passa a sondar recuperação só a cada
-    // SILENCED_BACKOFF_MS (implementado estendendo o lease de single-flight,
-    // sem query extra). Um OK reseta o contador e a cadência normal volta.
-    MAIA_PROBE_AUTOSILENCE_AFTER_N: z.coerce.number().int().positive().default(10),
-    MAIA_PROBE_SILENCED_BACKOFF_MS: z.coerce.number().int().positive().default(3_600_000),
-    // TTL (ms) do cleanup de rows de run órfãs — um job BullMQ que estourou o
-    // SLO pode persistir DEPOIS; o cleanup só recolhe após terminal OU TTL
-    // (§1.5), nunca no meio de um job em voo.
-    MAIA_PROBE_RUN_TTL_MS: z.coerce.number().int().positive().default(300_000),
-    // Lease (ms) de single-flight (§1.5): impede dois runs concorrentes; um
-    // worker morto tem o lease reciclado ao expirar.
-    MAIA_PROBE_LEASE_MS: z.coerce.number().int().positive().default(120_000),
-    // Modo de alerta (rollout §4): 'log_only' (default, staging-safe) emite log
-    // estruturado + métrica e NÃO chama sendAlert — a "entrega" é o log (sempre
-    // sucede). 'alert' entrega por sendAlert (telegram/email) com retry durável
-    // via alert_pending. O gauge seconds_since_last_ok é o sinal PRIMÁRIO nos
-    // dois modos.
-    MAIA_PROBE_ALERT_MODE: z.enum(['log_only', 'alert']).default('log_only'),
-    FEATURE_ONE_TAP: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
-    FEATURE_MESSAGE_UPDATE: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
-    FEATURE_PENDING_REMINDER: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
-    FEATURE_VIEW_ONCE_SENSITIVE: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
-    FEATURE_PDF_REPORTS: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
-    FEATURE_OUTBOUND_VOICE: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
-    // #227 — outbound delivery idempotency ledger. When on, dispatch routes
-    // record pre-send / mark-sent / mark-failed against `outbound_messages`,
-    // and the safeDispatchOutput boundary short-circuits already-attempted
-    // turns. Default off so the migration can deploy ahead of the wiring.
-    FEATURE_OUTBOUND_DEDUP: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
-    // #292 — outbound_messages sweeper cutoffs (follow-up de #227/#233).
-    // OUTBOUND_SWEEPER_STALE_PENDING_SEC: rows em status='pending' com
-    //   created_at < now() - N são promovidas a 'unknown' (terminal per #233).
-    //   Default 300s (5min) — folga grande contra o tempo normal de send+persist.
-    // OUTBOUND_SWEEPER_RETENTION_DAYS: rows terminais (sent/failed/unknown) com
-    //   age > N dias são DELETADAS no mesmo sweeper pass. Default 30 dias.
-    OUTBOUND_SWEEPER_STALE_PENDING_SEC: z.coerce.number().int().positive().default(300),
-    OUTBOUND_SWEEPER_RETENTION_DAYS: z.coerce.number().int().positive().default(30),
-    // #292 Codex blocker #1 — retention DELETE batch size. The retention
-    //   cleanup deletes terminal rows in bounded chunks (DELETE ... WHERE id IN
-    //   (SELECT ... LIMIT N)) and loops until a pass returns 0 rows, so a large
-    //   backlog never holds a table-wide lock for a single unbounded DELETE.
-    //   Default 1000 — balances per-statement overhead vs WAL/replication lag.
-    OUTBOUND_SWEEPER_RETENTION_BATCH_SIZE: z.coerce.number().int().positive().default(1000),
-    // #292 Codex blocker #2 — per-tenant fairness cap on stale-pending
-    //   recovery. Each tenant promotes AT MOST this many stale-pending rows per
-    //   pass (oldest first), so a single high-volume tenant cannot consume the
-    //   whole sweep window and starve later tenants. Default 500 — the next
-    //   */5min tick drains any remainder. Promotion is expected to be 0/rare in
-    //   healthy operation (each promotion is an ops_alert).
-    OUTBOUND_SWEEPER_RECOVERY_LIMIT_PER_TENANT: z.coerce.number().int().positive().default(500),
-    // #316 — idempotency transactional effect outbox relayer. The relayer
-    //   (src/workers/idempotency-outbox-relayer.ts) runs every minute, single-
-    //   flight (GLOBAL advisory lock), per-tenant fan-out, and dispatches each
-    //   committed pending effect EXACTLY ONCE with retry/backoff.
-    // OUTBOX_RELAYER_BATCH_PER_TENANT: max pending effects dispatched per
-    //   (tenant, agent) per pass (oldest-first fairness). Default 100 — the
-    //   next */1min tick drains any remainder; a high-volume tenant can't
-    //   starve others within one pass.
-    OUTBOX_RELAYER_BATCH_PER_TENANT: z.coerce.number().int().positive().default(100),
-    // OUTBOX_RELAYER_BASE_BACKOFF_SEC: base of the exponential backoff applied
-    //   on a transient dispatch failure. next_attempt_at is pushed forward by
-    //   base * 2^attempts (capped at the max below). Default 30s.
-    OUTBOX_RELAYER_BASE_BACKOFF_SEC: z.coerce.number().int().positive().default(30),
-    // OUTBOX_RELAYER_MAX_BACKOFF_SEC: cap on the backoff interval so a row that
-    //   has retried many times still gets revisited within a bounded window.
-    //   Default 3600s (1h).
-    OUTBOX_RELAYER_MAX_BACKOFF_SEC: z.coerce.number().int().positive().default(3600),
-    // OUTBOX_RELAYER_RETENTION_DAYS: terminal rows (sent/failed) older than this
-    //   are deleted in the same pass (bounded batched DELETE). Default 30 days.
-    OUTBOX_RELAYER_RETENTION_DAYS: z.coerce.number().int().positive().default(30),
-    // OUTBOX_RELAYER_RETENTION_BATCH_SIZE: bounded retention DELETE chunk size
-    //   (mirrors OUTBOUND_SWEEPER_RETENTION_BATCH_SIZE). Default 1000.
-    OUTBOX_RELAYER_RETENTION_BATCH_SIZE: z.coerce.number().int().positive().default(1000),
-    // Feature flags do roadmap Maia v2
-    // P6 — FEATURE_MULTI_CHANNEL removed in #411: channel resolution now has a
-    //   single-tenant catch-all (resolves any sender to default/default), so the
-    //   toggle is always-on / gone.
-    // P7 — FEATURE_COGNITIVE_GRAPH removed in #412: the cognitive graph runs
-    //   unconditionally (parity with the imperative path proven), so there is no
-    //   env toggle. The SYNC_LATENCY_P95_* budget vars below remain — they gate
-    //   p95 latency, not the graph itself.
-    /** Cache TTL (ms) for PolicyResolverCache. Default 5min = 300_000ms. */
-    POLICY_RESOLVER_CACHE_TTL_MS: z.coerce.number().int().positive().default(300_000),
-    /** LRU cap for PolicyResolverCache. Default 10_000 entries. */
-    POLICY_RESOLVER_CACHE_MAX_ENTRIES: z.coerce.number().int().positive().default(10_000),
-    /** HMAC key version currently in use (rotates every 90d). */
-    RUNTIME_TRACE_HMAC_KEY_VERSION: z.coerce.number().int().positive().default(1),
-    /** Master secret material (test only — prod fetches from KMS). */
-    RUNTIME_TRACE_HMAC_MASTER_SECRET: z.string().optional(),
-    /**
-     * Previous HMAC master secrets for audit-row verification after rotation.
-     * Format: semicolon-separated `version=secret` pairs, e.g.:
-     *   "1=<old-secret>;2=<older-secret>"
-     * The current master secret is keyed separately in RUNTIME_TRACE_HMAC_MASTER_SECRET
-     * (at RUNTIME_TRACE_HMAC_KEY_VERSION). Previous secrets are retained here
-     * through the audit-retention window so old rows remain verifiable.
-     * Round-2 finding #3 fix.
-     */
-    RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS: z.string().optional(),
-    /** S3 bucket for debug-mode encrypted snapshots (24h TTL). */
-    RUNTIME_TRACE_DEBUG_S3_BUCKET: z.string().optional(),
-    /** AES-GCM key (base64) for debug-mode snapshot encryption. */
-    RUNTIME_TRACE_DEBUG_AES_KEY: z.string().optional(),
-    /** Max age in seconds of a pending envelope body before recoverer alerts (default 300). */
-    RUNTIME_TRACE_BODY_ORPHAN_SEC: z.coerce.number().int().positive().default(300),
-    /** Refresh interval for unified_trace_events matview (worker schedules; this is metadata only). */
-    RUNTIME_TRACE_MATVIEW_REFRESH_SEC: z.coerce.number().int().positive().default(300),
-    /** Baseline pré-P7 em ms para p95 do sync path. Se ausente, gate skipa. */
-    SYNC_LATENCY_P95_BASELINE_MS: z.coerce.number().int().positive().optional(),
-    /** Percentual extra permitido sobre baseline (default 20). */
-    SYNC_LATENCY_P95_BUDGET_PERCENT: z.coerce.number().int().nonnegative().default(20),
-    // Message debounce: hold incoming text messages from the same user for a
-    // short window so chunked typing ("Oi, " / "como está " / "a finança?")
-    // arrives at the LLM as a single coherent turn. Off by default — when on,
-    // each new text resets the timer up to MESSAGE_DEBOUNCE_MAX_MS, then the
-    // worker aggregates all unprocessed inbound texts in the conversation.
-    // Media (audio/imagem/documento) bypasses the buffer and runs immediately.
-    FEATURE_MESSAGE_DEBOUNCE: z
-      .string()
-      .default('false')
-      .transform((s) => s === 'true' || s === '1'),
-    // P84-Op (PR #84 review): kill switch for the P3b procedure runtime
-    // (selector + engine + post-turn evaluator). When OFF, the runtime
-    // no-ops: no selector decisions are recorded, no executions are
-    // created, no events are emitted. Defaults to ON. Set to 'false'
-    // when zombie executions accumulate or any procedure-runtime bug
-    // surfaces in prod before P3c lands. The baseline ReAct turn is
-    // unaffected either way — procedure runtime never blocks reply.
-    FEATURE_PROCEDURE_RUNTIME: z
-      .string()
-      .default('true')
-      .transform((s) => s === 'true' || s === '1'),
-    // PR #84 Minor #5: selector confidence threshold was hardcoded at 0.6.
-    // Different tenants/agents have different acceptable false-positive
-    // rates; expose as env override so ops can tune without a redeploy.
-    // Constrained to (0, 1] — 0 would auto-start on any candidate.
-    PROCEDURE_SELECTOR_CONFIDENCE_THRESHOLD: z.coerce
-      .number()
-      .gt(0)
-      .lte(1)
-      .default(0.6),
-    MESSAGE_DEBOUNCE_MS: z.coerce.number().int().positive().default(5000),
-    MESSAGE_DEBOUNCE_MAX_MS: z.coerce.number().int().positive().default(30000),
-    // Outbox backpressure caps (per agent instance). Defaults are
-    // conservative; tune per provider rate-limits.
-    OUTBOX_MAX_PER_SECOND: z.coerce.number().int().positive().default(2),
-    OUTBOX_MAX_PER_HOUR: z.coerce.number().int().positive().default(120),
-    // How long a leased occurrence stays leased before another worker can
-    // reclaim it (e.g. crashed worker). Stale leases are reclaimed on the
-    // next tick.
-    OCCURRENCE_LEASE_TTL_SECONDS: z.coerce.number().int().positive().default(300),
-    OUTBOX_LEASE_TTL_SECONDS: z.coerce.number().int().positive().default(60),
-    OUTBOX_WORKER_CONCURRENCY: z.coerce.number().int().positive().default(4),
-    // Drain worker tick parameters: how many drain passes per tick and how
-    // long to sleep between ticks. Defaults give ~1 pass/200ms.
-    OUTBOX_DRAIN_LOOP_PASSES: z.coerce.number().int().positive().default(5),
-    OUTBOX_DRAIN_LOOP_SLEEP_MS: z.coerce.number().int().nonnegative().default(200),
-    // SETUP: optional override for the bootstrap token. When set, bypasses
-    // the file-backed token. Discouraged in prod (env vars leak more than
-    // file mode 0o600). Useful for dev / scripted deploys / E2E tests.
-    SETUP_TOKEN_OVERRIDE: z.string().optional(),
-  })
-  .superRefine((cfg, ctx) => {
-    if (cfg.LLM_PROVIDER === 'anthropic' && !cfg.ANTHROPIC_API_KEY) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: 'ANTHROPIC_API_KEY required when LLM_PROVIDER=anthropic',
-      });
-    }
-    if (cfg.LLM_PROVIDER === 'openrouter' && !cfg.OPENROUTER_API_KEY) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: 'OPENROUTER_API_KEY required when LLM_PROVIDER=openrouter',
-      });
-    }
-    if (cfg.EMBEDDING_PROVIDER === 'voyage' && !cfg.VOYAGE_API_KEY) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: 'VOYAGE_API_KEY required when EMBEDDING_PROVIDER=voyage',
-      });
-    }
-    if (cfg.EMBEDDING_PROVIDER === 'openai' && !cfg.OPENAI_API_KEY) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: 'OPENAI_API_KEY required when EMBEDDING_PROVIDER=openai',
-      });
-    }
-    if (cfg.EMBEDDING_PROVIDER === 'cohere' && !cfg.COHERE_API_KEY) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: 'COHERE_API_KEY required when EMBEDDING_PROVIDER=cohere',
-      });
-    }
-    if (
-      cfg.ALERT_CHANNELS.includes('telegram') &&
-      (!cfg.TELEGRAM_BOT_TOKEN || !cfg.TELEGRAM_CHAT_ID)
-    ) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: 'Telegram alerts require TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID',
-      });
-    }
-    if (cfg.ALERT_CHANNELS.includes('email') && !cfg.ALERT_EMAIL_TO) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: 'Email alerts require ALERT_EMAIL_TO',
-      });
-    }
-    if (cfg.OWNER_TELEFONE_WHATSAPP === cfg.WHATSAPP_NUMBER_MAIA) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: 'OWNER_TELEFONE_WHATSAPP must differ from WHATSAPP_NUMBER_MAIA',
-      });
-    }
-    // Fase 0 cap. 5 (auditoria P0) — MCP permanece OFF em produção até o
-    // enablement passar por issue própria + threat model + pentest (gate G4).
-    // Ligar a flag em produção é recusado no boot, fail-closed e explícito.
-    if (cfg.NODE_ENV === 'production' && cfg.FEATURE_MCP_TOOLS) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['FEATURE_MCP_TOOLS'],
-        message:
-          'FEATURE_MCP_TOOLS não pode ser habilitada em produção: o enablement do MCP exige ' +
-          'revisão de segurança dedicada (Fase 0 gate G4 — threat model + pentest) antes de sair do default OFF.',
-      });
-    }
-    // Fase 0 cap. 1 — coerência dos thresholds financeiros. Fora de ordem, a
-    // política vira contraditória: DUAL > DURO torna a aprovação dupla
-    // inalcançável (tudo acima do duro é deny), e SEM_CONFIRMACAO > DUAL
-    // permitiria operação relevante sem confirmação. Boot falha fechado.
-    if (
-      !(
-        cfg.VALOR_LIMITE_SEM_CONFIRMACAO <= cfg.VALOR_DUAL_APPROVAL &&
-        cfg.VALOR_DUAL_APPROVAL <= cfg.VALOR_LIMITE_DURO
-      )
-    ) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['VALOR_DUAL_APPROVAL'],
-        message:
-          `financial thresholds out of order: require VALOR_LIMITE_SEM_CONFIRMACAO (${cfg.VALOR_LIMITE_SEM_CONFIRMACAO}) ` +
-          `<= VALOR_DUAL_APPROVAL (${cfg.VALOR_DUAL_APPROVAL}) <= VALOR_LIMITE_DURO (${cfg.VALOR_LIMITE_DURO})`,
-      });
-    }
-    // P10b (Codex review #102 — issue 2): fail-closed on missing HMAC secret.
-    // P11: runtime trace is always-on (flag removed), so in production the
-    // master secret MUST be set (KMS-backed) unconditionally. Test/dev can
-    // override via _setTestMasterSecretForTests().
-    if (
-      cfg.NODE_ENV === 'production' &&
-      !cfg.RUNTIME_TRACE_HMAC_MASTER_SECRET
-    ) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['RUNTIME_TRACE_HMAC_MASTER_SECRET'],
-        message:
-          'RUNTIME_TRACE_HMAC_MASTER_SECRET is required in production — audit HMACs would be forgeable without it',
-      });
-    }
-    // PR #406 — fail-closed on the REMOVED context-packet flag. The
-    // FEATURE_CONTEXT_PACKET_V1 hot-path was deleted (the agent loop always
-    // uses buildPrompt), but a stale deployment could still carry the flag (or
-    // its kill switch) in its env. Setting it now is a no-op that would
-    // SILENTLY mislead operators into thinking the path is live, so boot fails
-    // loudly instead. Read process.env directly: these are no longer schema
-    // fields, so cfg does not carry them.
-    if (
-      process.env.FEATURE_CONTEXT_PACKET_V1 === 'true' ||
-      process.env.FEATURE_CONTEXT_PACKET_V1_KILL_SWITCH === 'true'
-    ) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['FEATURE_CONTEXT_PACKET_V1'],
-        message:
-          'FEATURE_CONTEXT_PACKET_V1 (and its kill switch) was REMOVED in PR #406 — ' +
-          'the context-packet path no longer exists. Unset FEATURE_CONTEXT_PACKET_V1 / ' +
-          'FEATURE_CONTEXT_PACKET_V1_KILL_SWITCH in this environment.',
-      });
-    }
-    try {
-      assertSafeAuthDir(cfg.BAILEYS_AUTH_DIR);
-    } catch (err) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['BAILEYS_AUTH_DIR'],
-        message: (err as Error).message,
-      });
-    }
-  });
+const envSchema = objectSchemaForService('runtime');
 
 export type Config = z.infer<typeof envSchema>;
 
+/** The escape hatch. Read from the raw env — it gates the loader itself. */
+function strictBoot(raw: Record<string, string | undefined>): boolean {
+  return raw.MAIA_CONFIG_STRICT_BOOT !== 'false';
+}
+
+/**
+ * Boot failure text. Names the VARIABLE, the RULE and the REMEDIATION of every
+ * problem — never a value (the validator redacts by construction; see
+ * `src/config/redact.ts`).
+ *
+ * The first line keeps the historical `Invalid configuration:` prefix so
+ * existing log greps and runbooks still match.
+ */
+function formatBootFailure(problems: readonly ConfigProblem[], profile: string): string {
+  const body = problems
+    .map((p) => `  - ${p.variable ?? '<root>'} [${p.rule}]: ${p.message}\n      → ${p.remediation}`)
+    .join('\n');
+  return [
+    `Invalid configuration: ${problems.length} problema(s) no profile ${profile} ` +
+      `(contrato ${CONTRACT_VERSION}).`,
+    '',
+    body,
+    '',
+    'O boot falha fechado em TODOS os profiles (issue #515). Se algum item acima for',
+    'uma variável legítima que o contrato ainda não conhece, declare-a em',
+    'src/config/contract.ts e rode `npm run config:generate`.',
+    '',
+    'Para inspecionar o ambiente inteiro de uma vez:',
+    '  npm run config:check -- --env-file .env',
+    '',
+    'ROLLBACK DE EMERGÊNCIA (env-only, sem redeploy): MAIA_CONFIG_STRICT_BOOT=false',
+    'volta ao loader anterior e DESLIGA a validação de contrato inteira.',
+    'Runbook: docs/runbooks/config-contract.md',
+  ].join('\n');
+}
+
+/**
+ * The pre-contract boot check, preserved for the rollback path: the Zod schema
+ * (applied by the caller) plus the `boot`-scope cross-field rules, with their
+ * original messages.
+ */
+function legacyBootProblems(
+  cfg: Config,
+  raw: Record<string, string | undefined>,
+): ConfigProblem[] {
+  const { profile } = resolveProfile(raw);
+  return evaluateCrossFieldRules({
+    values: cfg as unknown as Record<string, unknown>,
+    raw,
+    profile,
+  })
+    .filter((f) => f.scope === 'boot' && f.severity === 'error')
+    .map((f) => ({
+      severity: 'error' as const,
+      variable: f.variable,
+      rule: f.rule,
+      message: f.message,
+      remediation: f.remediation,
+    }));
+}
+
 function loadConfig(): Config {
-  const result = envSchema.safeParse(process.env);
-  if (!result.success) {
-    const issues = result.error.issues
-      .map((i) => `  - ${i.path.join('.') || '<root>'}: ${i.message}`)
-      .join('\n');
-    // Throw instead of process.exit(1) - main().catch in index.ts handles
-    // fatal logging and exit. Throwing keeps vitest alive when a spec file
-    // imports a config-dependent module without mocking env.
-    throw new Error(`Invalid configuration:\n${issues}`);
+  const raw = process.env as Record<string, string | undefined>;
+  const strict = strictBoot(raw);
+
+  if (strict) {
+    // ONE pass over the whole contract: schema, per-profile requirements,
+    // cross-field rules, tombstones, unknown keys and the NODE_ENV × MAIA_ENV
+    // contradiction. Every problem at once, instead of one per restart.
+    const result = validateConfig({ env: raw, service: 'runtime' });
+    if (!result.ok) {
+      // Throw instead of process.exit(1) — main().catch in index.ts handles
+      // fatal logging and exit, and throwing keeps vitest alive when a spec
+      // imports a config-dependent module without mocking env.
+      throw new Error(formatBootFailure(result.errors, result.profile));
+    }
   }
-  return result.data;
+
+  const parsed = envSchema.safeParse(raw);
+  if (!parsed.success) {
+    // Unreachable under `strict` (validateConfig already reports every schema
+    // issue) — this is the rollback path's schema gate.
+    const problems: ConfigProblem[] = parsed.error.issues.map((i) => ({
+      severity: 'error' as const,
+      variable: i.path.join('.') || null,
+      rule: `schema/${i.code}`,
+      message: i.message,
+      remediation: 'Corrija a variável conforme src/config/contract.ts.',
+    }));
+    throw new Error(formatBootFailure(problems, resolveProfile(raw).profile));
+  }
+
+  if (!strict) {
+    const problems = legacyBootProblems(parsed.data, raw);
+    if (problems.length > 0) {
+      throw new Error(formatBootFailure(problems, resolveProfile(raw).profile));
+    }
+    // Loud on purpose: a silent escape hatch is one nobody remembers to close.
+    console.warn(
+      '[config] MAIA_CONFIG_STRICT_BOOT=false — validação de contrato DESLIGADA ' +
+        '(variável desconhecida, tombstone e contradição de profile não são checados). ' +
+        'Rollback temporário; ver docs/runbooks/config-contract.md.',
+    );
+  }
+
+  return parsed.data;
 }
 
 export const config: Config = loadConfig();
