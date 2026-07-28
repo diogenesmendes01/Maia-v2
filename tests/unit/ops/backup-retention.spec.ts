@@ -6,6 +6,7 @@ import {
   type RetentionCandidate,
   type RetentionPorts,
 } from '../../../src/ops/backup/retention.js';
+import { resolveArtifactPath } from '../../../src/ops/backup/artifact-path.js';
 
 /**
  * Issue #520 §10 — round-1 review finding (P1): the destructive paths deleted
@@ -206,6 +207,50 @@ describe('a partial pass can never report completed', () => {
     const s = store({ deleteThrowsFor: 'b-1' });
     const out = await runArtifactRetention(s.ports, 's3', { dryRun: false, correlationId: 'c' });
     expect(() => assertConclusive(out)).toThrowError(/retention pass ended failed/);
+  });
+});
+
+describe('a poisoned artifact_ref cannot delete anything (round-2 finding)', () => {
+  // Wires the REAL guard into the fake port, so this proves the COMPOSITION —
+  // the executor plus the confinement check — not just the check in isolation.
+  function guardedStore(ref: string) {
+    const removed: string[] = [];
+    const s = store({ candidates: [candidate({ artifact_ref: ref })] });
+    s.ports.deleteArtifact = vi.fn(async (c) => {
+      removed.push(resolveArtifactPath('/opt/maia/backups', c.artifact_ref));
+    });
+    s.ports.confirmDeleted = vi.fn(async () => true);
+    return { ...s, removed };
+  }
+
+  it.each([
+    ['posix traversal', '../../etc/passwd'],
+    ['absolute path', '/etc/passwd'],
+    ['windows separator', '..\\..\\evil.dump'],
+    ['drive-relative', 'C:evil.dump'],
+  ])('refuses to remove anything for a %s reference', async (_name, ref) => {
+    const s = guardedStore(ref);
+    const out = await runArtifactRetention(s.ports, 'local', {
+      dryRun: false,
+      correlationId: 'c',
+    });
+    expect(s.removed).toEqual([]);
+    // A poisoned row makes the pass NON-CONCLUSIVE and alertable, rather than
+    // silently doing damage or silently doing nothing.
+    expect(out.status).toBe('failed');
+    expect(out.failed).toBe(1);
+    expect(s.marked).toEqual([]);
+  });
+
+  it('still removes a legitimate artifact, inside the root', async () => {
+    const s = guardedStore('maia-2026-07-01T03-00-00-aaaaaaaaaaaa.dump');
+    const out = await runArtifactRetention(s.ports, 'local', {
+      dryRun: false,
+      correlationId: 'c',
+    });
+    expect(out.status).toBe('completed');
+    expect(s.removed).toHaveLength(1);
+    expect(s.removed[0]).toMatch(/backups[\\/]maia-2026-07-01T03-00-00-aaaaaaaaaaaa\.dump$/);
   });
 });
 

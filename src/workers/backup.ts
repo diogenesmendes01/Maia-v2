@@ -15,6 +15,10 @@ import { resolveBackupProfile, type BackupConfigInput } from '@/ops/backup/profi
 import { createBackupPorts } from '@/ops/backup/adapters.js';
 import { runVerifiedBackup, type BackupTrigger } from '@/ops/backup/service.js';
 import { runArtifactRetention } from '@/ops/backup/retention.js';
+import {
+  resolveArtifactObjectKey,
+  resolveArtifactPath,
+} from '@/ops/backup/artifact-path.js';
 import { OPS_LOCK_KEYS, requireOpsLock, withOpsLock } from '@/ops/backup/single-flight.js';
 import { UNAPPROVED_POLICY_VERSION } from '@/ops/retention/data-classes.js';
 import {
@@ -195,20 +199,31 @@ async function runOneRetentionPass(
       now: () => new Date(),
       listCandidates: listRetentionCandidates,
       anyActiveHold: anyActiveLegalHold,
+      // ROUND-2 REVIEW FINDING: `artifact_ref` comes from a DB row, and this is
+      // a REMOVAL path. A corrupted or tampered row carrying `../…`, an
+      // absolute path or a Windows separator would have deleted a file outside
+      // BACKUP_DIR. Every reference is now validated as a bare Maia filename
+      // and PROVEN to resolve to a direct child of the root (or, off-site, of
+      // the configured prefix) before anything is removed. A refusal throws,
+      // which the executor counts as a failed delete — so a poisoned row makes
+      // the pass non-conclusive and alerts, instead of silently doing damage.
       deleteArtifact: async (candidate) => {
         if (candidate.destination_kind === 's3') {
-          await deleteBackupObject(`${config.BACKUP_S3_PREFIX}/${candidate.artifact_ref}`);
+          await deleteBackupObject(
+            resolveArtifactObjectKey(config.BACKUP_S3_PREFIX, candidate.artifact_ref),
+          );
         } else {
-          await rm(join(config.BACKUP_DIR, candidate.artifact_ref), { force: true });
+          await rm(resolveArtifactPath(config.BACKUP_DIR, candidate.artifact_ref), {
+            force: true,
+          });
         }
       },
       confirmDeleted: async (candidate) => {
         if (candidate.destination_kind === 's3') {
-          return (
-            (await headBackupObject(`${config.BACKUP_S3_PREFIX}/${candidate.artifact_ref}`)) === null
-          );
+          const key = resolveArtifactObjectKey(config.BACKUP_S3_PREFIX, candidate.artifact_ref);
+          return (await headBackupObject(key)) === null;
         }
-        return !existsSync(join(config.BACKUP_DIR, candidate.artifact_ref));
+        return !existsSync(resolveArtifactPath(config.BACKUP_DIR, candidate.artifact_ref));
       },
       markDeleted: markRunDeleted,
       audit: (acao, metadata) => audit({ acao: acao as AuditAction, metadata }),
