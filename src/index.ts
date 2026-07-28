@@ -50,6 +50,18 @@ async function main() {
   startPolicyCacheInvalidationSubscriber();
   logger.info('policy_resolver.cache_invalidation_subscriber_started');
 
+  // Issue #511: cross-replica invalidation for the turn-context cache
+  // (identity / capabilities / gaps). Idempotent, and a no-op while
+  // FEATURE_TURN_CONTEXT_CACHE is off — with nothing cached there is nothing to
+  // invalidate, and an idle subscriber connection per replica is not free.
+  const { startTurnContextCacheInvalidationSubscriber } = await import(
+    '@/agent/turn-context/cache.js'
+  );
+  startTurnContextCacheInvalidationSubscriber();
+  if (config.FEATURE_TURN_CONTEXT_CACHE) {
+    logger.info('turn_context.cache_invalidation_subscriber_started');
+  }
+
   const app = await startServer();
 
   // Sonda sintética (spec §1.3 / review P1-C) — carrega o sink ANTES do worker

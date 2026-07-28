@@ -25,6 +25,7 @@ import { logger } from '@/lib/logger.js';
 import { GapLevel } from '@/types/enums.js';
 import { sanitizeBlock } from './sanitize.js';
 import { hashScope } from './scope-hash.js';
+import { readCached } from './turn-context/cache.js';
 import { recordTurnContextLoad, type TurnContextResult } from './turn-context/metrics.js';
 import {
   DOMAIN_KEYWORDS,
@@ -577,8 +578,15 @@ async function buildRoleSection(role: Role | null | undefined): Promise<string |
  * - Retorna null quando não há nada a injetar (chamador omite a seção).
  */
 async function buildGapMentionSection(): Promise<string | null> {
+  // Issue #511 — cached under `gaps`, separately from `capabilities` so the two
+  // sections keep INDEPENDENT degradation: a failure of the gap read must not
+  // also blank the self-awareness block, which is how it behaved before.
   const gaps =
-    (await capabilityGapsRepo?.listByLevels?.([GapLevel.MENTIONABLE, GapLevel.PROPOSED])) ?? [];
+    (await readCached(
+      'gaps',
+      async () =>
+        (await capabilityGapsRepo?.listByLevels?.([GapLevel.MENTIONABLE, GapLevel.PROPOSED])) ?? [],
+    )) ?? [];
   if (gaps.length === 0) return null;
   const lines = gaps.slice(0, 5).map((g) => {
     const proposedSuffix =
@@ -633,18 +641,24 @@ async function buildPromptUninstrumented(
   // renderOperationalProfile; a missing or non-'active' profile falls back to
   // self_state (runtime defense — never expose a `proposed`/`frozen` profile
   // even if the DB invariant slips).
-  let renderedV2: RenderedProfile | null;
-  let selfVersionLabel: string;
-  let systemPromptBody: string;
-  let resumoAprendizadosBody: string;
-
-  const profile = await operationalProfileVersionsRepo.getActive();
-  if (profile && profile.status === 'active') {
-    renderedV2 = renderOperationalProfile({ version: profile });
-    systemPromptBody = renderedV2.system_prompt_block;
-    selfVersionLabel = `op_profile_v${profile.version}`;
-    resumoAprendizadosBody = '(perfil v2 ativo)';
-  } else {
+  //
+  // Issue #511 — this pair of reads is cached under the `identity` resource.
+  // Identity is the textbook cacheable section: it changes only through an
+  // audited activation (which publishes an invalidation after commit), it is
+  // read on every single turn, and it grants nothing — so a stale read can at
+  // worst render a slightly old persona, never an old permission. The cached
+  // value is the DERIVED render output, not the row, so the (pure)
+  // `renderOperationalProfile` call is amortised too.
+  const identity = (await readCached('identity', async () => {
+    const profile = await operationalProfileVersionsRepo.getActive();
+    if (profile && profile.status === 'active') {
+      const rendered: RenderedProfile = renderOperationalProfile({ version: profile });
+      return {
+        systemPromptBody: rendered.system_prompt_block,
+        selfVersionLabel: `op_profile_v${profile.version}`,
+        resumoAprendizadosBody: '(perfil v2 ativo)',
+      };
+    }
     if (profile) {
       // Profile loaded but status !== 'active' — runtime defense, should never
       // happen if the DB invariant holds. Log + fall back to self_state.
@@ -654,10 +668,15 @@ async function buildPromptUninstrumented(
       );
     }
     const self = await selfStateRepo.getActive();
-    systemPromptBody = self?.system_prompt ?? 'Você é a Maia.';
-    selfVersionLabel = `self_state_v${self?.versao ?? 0}`;
-    resumoAprendizadosBody = self?.resumo_aprendizados ?? '(vazio)';
-  }
+    return {
+      systemPromptBody: self?.system_prompt ?? 'Você é a Maia.',
+      selfVersionLabel: `self_state_v${self?.versao ?? 0}`,
+      resumoAprendizadosBody: self?.resumo_aprendizados ?? '(vazio)',
+    };
+  }))!;
+  // The loader always returns a value (it has its own fallbacks), so `identity`
+  // is never the negative-cache `null`. The non-null assertion documents that.
+  const { systemPromptBody, selfVersionLabel, resumoAprendizadosBody } = identity;
 
   const recent = await mensagensRepo.recentInConversation(ctx.conversa.id, 10);
   const ents = await entidadesRepo.byIds(ctx.scope.entidades);
@@ -819,13 +838,25 @@ async function buildPromptUninstrumented(
   }
 
   try {
-    const allSkills = (await capabilitiesSkillRepo?.listAll?.()) ?? [];
-    const topSkills = [...allSkills]
+    // Issue #511 — cached under `capabilities`. The skills CATALOGUE and the
+    // gap list are descriptive self-knowledge: they say what the agent believes
+    // it is good at, not what it is allowed to do. What it may actually run is
+    // re-resolved every turn by `computeRuntimeVisibleTools` and re-checked at
+    // execution by the dispatcher, neither of which reads this cache — so a
+    // stale entry here cannot widen a grant.
+    //
+    // Both reads live inside ONE cache load, so a failure of either leaves the
+    // entry unwritten rather than pinning a half-empty capability picture.
+    const capabilities = (await readCached('capabilities', async () => ({
+      skills: (await capabilitiesSkillRepo?.listAll?.()) ?? [],
+      mentionableGaps: (await capabilityGapsRepo?.listByLevel?.('mentionable')) ?? [],
+    })))!;
+    const topSkills = [...capabilities.skills]
       .sort((a, b) => Number(b.confidence) - Number(a.confidence))
       .slice(0, 5);
     const masteredSkills = topSkills.filter((s) => Number(s.confidence) >= 0.7);
     const learningSkills = topSkills.filter((s) => Number(s.confidence) < 0.5);
-    const mentionableGaps = (await capabilityGapsRepo?.listByLevel?.('mentionable')) ?? [];
+    const mentionableGaps = capabilities.mentionableGaps;
 
     const lines = [
       masteredSkills.length

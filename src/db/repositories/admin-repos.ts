@@ -838,6 +838,12 @@ export const proposalsUnifiedRepo = {
       }
     | { ok: false; reason: 'profile_transition_failed'; detail: ProfileTransitionFailure }
   > {
+    // Issue #511 — set as the LAST statement inside the transaction callback,
+    // so any throw before that point leaves it null and publishes nothing. The
+    // only window left is a COMMIT that fails after the callback returned, which
+    // would publish a spurious invalidation — harmless (one extra cache miss),
+    // and strictly preferable to the opposite failure mode.
+    let activatedIdentity: { tenant_id: string; agent_id: string } | null = null;
     try {
       return await withTx(async (tx) => {
         // (0) Leitura SEM lock só para descobrir o agent_id — o lock do
@@ -1012,6 +1018,9 @@ export const proposalsUnifiedRepo = {
         // high sem segunda assinatura: NENHUMA transição (invariante 2) — a
         // approval fica gravada aguardando o segundo aprovador.
 
+        if (profile?.activated) {
+          activatedIdentity = { tenant_id: input.tenantId, agent_id: sourceRow.agent_id };
+        }
         return {
           ok: true as const,
           sourceTransitioned,
@@ -1026,6 +1035,27 @@ export const proposalsUnifiedRepo = {
         return { ok: false, reason: 'profile_transition_failed', detail: err.detail };
       }
       throw err;
+    } finally {
+      // Issue #511 — publish the identity-cache invalidation AFTER the
+      // transaction commits, never inside it. Publishing from inside would race
+      // the readers: a replica receiving the event before COMMIT would re-read
+      // the PRE-commit snapshot and pin the OLD identity for a full TTL —
+      // strictly worse than not publishing at all.
+      //
+      // Activation is the only transition that changes what `getActive()`
+      // returns, so it is the only one that needs to fan out. Best-effort by
+      // contract: `publishTurnContextInvalidation` swallows broker failures
+      // (staleness then falls back to the TTL bound) and never fails the
+      // operator's approval, which is already committed and audited.
+      if (activatedIdentity) {
+        const { publishTurnContextInvalidation } = await import(
+          '@/agent/turn-context/cache.js'
+        );
+        await publishTurnContextInvalidation({
+          ...(activatedIdentity as { tenant_id: string; agent_id: string }),
+          resource: 'identity',
+        });
+      }
     }
   },
 
