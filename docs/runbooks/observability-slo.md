@@ -101,7 +101,8 @@ correto, não é o incidente. O incidente é o Postgres/HMAC por trás.
 2. `maia_db_connected` — Postgres está de pé?
 3. Se `RUNTIME_TRACE_HMAC_MASTER_SECRET` faltar, `lib/hmac.ts` falha fechado.
    Confira o env do processo.
-4. Rollback de emergência: `FEATURE_RUNTIME_TRACE_V1=false` desliga o hook do
+4. Rollback de emergência: `FEATURE_RUNTIME_TRACE_V1=false` **+ restart do
+   processo** desliga o hook do
    hot path (`src/observability/turn-trace.ts`). **Isso não desliga audit.**
    Só faça isso conforme a política de governança — ver
    `docs/runbooks/p10b-runtime-trace.md`.
@@ -208,12 +209,17 @@ alvo — o orçamento é o mecanismo, não uma métrica decorativa.
 
 | Quero desligar | Como | O que NÃO desliga |
 |---|---|---|
-| runtime trace no hot path | `FEATURE_RUNTIME_TRACE_V1=false` | audit, métricas |
+| runtime trace no hot path | `FEATURE_RUNTIME_TRACE_V1=false` **+ restart** | audit, métricas |
 | correlação de trace | nada a desligar — é aditivo e inerte | — |
 | labels problemáticas | remova do call site | o sanitizer continua ativo |
 
 Redaction **nunca** é desligada. Envelopes obrigatórios só saem conforme a
 política de governança.
+
+> **Toda variável desta tabela é `restartRequired` (contrato #515).** Elas são
+> validadas no boot e lidas pelo loader tipado (`src/config/env.ts`), não por
+> `process.env` em tempo de chamada — mudar o valor sem reiniciar o processo
+> não tem efeito. Confira o estado corrente com `npm run config:check`.
 
 ## 8. Ativando as regras no Prometheus
 

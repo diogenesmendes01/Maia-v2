@@ -9,7 +9,6 @@ describe('issue #514 — sanitized metric emitters', () => {
   beforeEach(() => {
     _resetForTests();
     _resetLabelGuardForTests();
-    delete process.env.MAIA_STRICT_METRIC_LABELS;
   });
 
   it('auto-attaches tenant_id + agent_id from ALS', async () => {

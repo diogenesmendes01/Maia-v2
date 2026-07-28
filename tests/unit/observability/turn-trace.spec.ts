@@ -1,7 +1,7 @@
 /**
  * Issue #514 §4 — the durable runtime trace connected to the hot path.
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 const traceMock = vi.fn();
 vi.mock('@/control-plane/runtime-trace/index.js', async (importOriginal) => {
@@ -9,6 +9,25 @@ vi.mock('@/control-plane/runtime-trace/index.js', async (importOriginal) => {
     typeof import('@/control-plane/runtime-trace/index.js')
   >();
   return { ...actual, trace: traceMock };
+});
+
+/**
+ * Issue #515 — the rollout gate now comes from the typed config loader. Every
+ * other key stays real (the runtime-trace import graph boots the DB client and
+ * the HMAC module), so we override exactly one property.
+ */
+const cfg = vi.hoisted(() => ({ traceEnabled: false }));
+vi.mock('@/config/env.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/config/env.js')>();
+  return {
+    ...actual,
+    config: new Proxy(actual.config, {
+      get: (target, prop, receiver) =>
+        prop === 'FEATURE_RUNTIME_TRACE_V1'
+          ? cfg.traceEnabled
+          : Reflect.get(target, prop, receiver),
+    }),
+  };
 });
 
 const {
@@ -84,10 +103,7 @@ describe('issue #514 — runtime trace on the hot path', () => {
     });
     _resetForTests();
     _resetLabelGuardForTests();
-    delete process.env.FEATURE_RUNTIME_TRACE_V1;
-  });
-  afterEach(() => {
-    delete process.env.FEATURE_RUNTIME_TRACE_V1;
+    cfg.traceEnabled = false;
   });
 
   describe('rollout gate', () => {
@@ -98,8 +114,10 @@ describe('issue #514 — runtime trace on the hot path', () => {
       expect(traceMock).not.toHaveBeenCalled();
     });
 
-    it('is read at call time so the flag flips without a redeploy', async () => {
-      process.env.FEATURE_RUNTIME_TRACE_V1 = 'true';
+    it('traces the turn once the contract flag is on', async () => {
+      // #515: the value comes from the typed loader and is resolved at BOOT,
+      // so flipping it needs a restart (contract: restartRequired: true).
+      cfg.traceEnabled = true;
       expect(runtimeTraceHotPathEnabled()).toBe(true);
       await traceTurnDecision({ base: baseFixture(), packet: packetFixture() });
       expect(traceMock).toHaveBeenCalledTimes(1);
@@ -213,7 +231,7 @@ describe('issue #514 — runtime trace on the hot path', () => {
     });
 
     it('skips entirely when the trace id is not UUID-shaped', async () => {
-      process.env.FEATURE_RUNTIME_TRACE_V1 = 'true';
+      cfg.traceEnabled = true;
       const env = await traceTurnDecision({
         base: baseFixture({ trace_id: 'not-a-uuid' }),
         packet: packetFixture(),
@@ -227,7 +245,7 @@ describe('issue #514 — runtime trace on the hot path', () => {
 
   describe('failure semantics', () => {
     beforeEach(() => {
-      process.env.FEATURE_RUNTIME_TRACE_V1 = 'true';
+      cfg.traceEnabled = true;
     });
 
     it('RETHROWS when a MANDATORY envelope cannot be written (fail-loud)', async () => {

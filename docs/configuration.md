@@ -256,6 +256,8 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 
 | Variável | Tipo | Default | Segredo | Serviços | Restart | Descrição |
 |---|---|---|---|---|---|---|
+| `FEATURE_RUNTIME_TRACE_V1` | string | `false` | não | `runtime` | sim | Liga o runtime trace durável no hot path (#514). Default OFF: com a flag desligada o caminho do turno é idêntico ao anterior e o HMAC master secret não é exigido. Ligar em canário — ver docs/runbooks/observability-slo.md. |
+| `MAIA_STRICT_METRIC_LABELS` | string | `false` | não | `runtime` | sim | Promove violação da política de labels de métrica (PII / alta cardinalidade) a exceção em vez de descarte silencioso (#514). Para suíte de testes e diagnóstico; em produção o sanitizer já descarta sem lançar. |
 | `RUNTIME_TRACE_HMAC_KEY_VERSION` | number | `1` | não | `runtime` | sim | Versão da chave HMAC em uso (rotação a cada 90d). |
 | `RUNTIME_TRACE_HMAC_MASTER_SECRET` | string | — | sim | `runtime` | sim | Segredo mestre do HMAC de auditoria. OBRIGATÓRIO em produção — sem ele os HMACs de auditoria seriam forjáveis. Obrigatória em: staging, production. |
 | `RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS` | string | — | sim | `runtime` | sim | Segredos anteriores, formato `versao=segredo` separados por `;`, retidos pela janela de retenção de auditoria. |

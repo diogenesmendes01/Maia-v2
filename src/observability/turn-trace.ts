@@ -45,6 +45,7 @@ import {
   type TraceEnvelopeWritten,
 } from '@/control-plane/runtime-trace/index.js';
 import type { BaseContextPacket, DecisionPacket } from '@/runtime/context-packet/types.js';
+import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 import { counter, histogram } from './metrics.js';
 import { METRIC } from './taxonomy.js';
@@ -61,9 +62,18 @@ function asUuidOrNull(v: string | null | undefined): string | null {
   return typeof v === 'string' && UUID_RE.test(v) ? v.toLowerCase() : null;
 }
 
-/** Read at call time so the flag can be flipped without a redeploy. */
+/**
+ * Rollout gate, read through the typed config loader (issue #515 — no direct
+ * `process.env` reads outside the contract).
+ *
+ * NOTE the behaviour change this implies: the value is now resolved at BOOT,
+ * not per call, so flipping the flag requires a process restart. That is why
+ * the contract marks it `restartRequired: true`, matching every other
+ * `FEATURE_*` flag. The canary procedure in
+ * `docs/runbooks/observability-slo.md` §7 is written accordingly.
+ */
 export function runtimeTraceHotPathEnabled(): boolean {
-  return process.env.FEATURE_RUNTIME_TRACE_V1 === 'true';
+  return config.FEATURE_RUNTIME_TRACE_V1;
 }
 
 /**

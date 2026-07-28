@@ -1,4 +1,26 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+
+/**
+ * Issue #515 — `MAIA_STRICT_METRIC_LABELS` now comes from the typed config
+ * loader, not `process.env`, so a test flips it by overriding the loader. The
+ * Proxy keeps every OTHER config key real (the import graph below still boots
+ * the logger and the registry), which is what `tests/setup.ts` means by
+ * "tests that need a custom config mock `@/config/env.js` directly".
+ */
+const cfg = vi.hoisted(() => ({ strictLabels: false }));
+vi.mock('@/config/env.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/config/env.js')>();
+  return {
+    ...actual,
+    config: new Proxy(actual.config, {
+      get: (target, prop, receiver) =>
+        prop === 'MAIA_STRICT_METRIC_LABELS'
+          ? cfg.strictLabels
+          : Reflect.get(target, prop, receiver),
+    }),
+  };
+});
+
 import {
   sanitizeLabels,
   _resetLabelGuardForTests,
@@ -17,10 +39,7 @@ import {
 describe('issue #514 — metric label sanitizer', () => {
   beforeEach(() => {
     _resetLabelGuardForTests();
-    delete process.env.MAIA_STRICT_METRIC_LABELS;
-  });
-  afterEach(() => {
-    delete process.env.MAIA_STRICT_METRIC_LABELS;
+    cfg.strictLabels = false;
   });
 
   describe('key policy', () => {
@@ -172,7 +191,7 @@ describe('issue #514 — metric label sanitizer', () => {
 
   describe('strict mode', () => {
     it('throws on any violation when MAIA_STRICT_METRIC_LABELS=true', () => {
-      process.env.MAIA_STRICT_METRIC_LABELS = 'true';
+      cfg.strictLabels = true;
       expect(() => sanitizeLabels('maia_test_total', { telefone: '5511999999999' })).toThrow(
         ForbiddenMetricLabelError,
       );
@@ -180,6 +199,18 @@ describe('issue #514 — metric label sanitizer', () => {
 
     it('stays silent in the default (production) mode', () => {
       expect(() => sanitizeLabels('maia_test_total', { telefone: '5511' })).not.toThrow();
+    });
+
+    it('reads the flag through the config loader, not process.env (#515)', () => {
+      // Setting the raw env var must NOT change behaviour any more — the value
+      // is contract-validated at boot. This is the regression guard for
+      // someone "fixing" the loader read back into a direct env read.
+      process.env.MAIA_STRICT_METRIC_LABELS = 'true';
+      try {
+        expect(() => sanitizeLabels('maia_test_total', { telefone: '5511' })).not.toThrow();
+      } finally {
+        delete process.env.MAIA_STRICT_METRIC_LABELS;
+      }
     });
   });
 });

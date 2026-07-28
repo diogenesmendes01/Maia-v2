@@ -148,7 +148,10 @@ Context builders must **not** mint a new root (`build-base-context.ts:83`,
 cardinality-capped. High-cardinality correlation ids live in **logs and
 traces** (`correlationLogFields()`), never in labels. Nothing throws in
 production; `MAIA_STRICT_METRIC_LABELS=true` promotes a violation to a test
-failure.
+failure. Both that flag and `FEATURE_RUNTIME_TRACE_V1` are declared in the
+configuration contract (`src/config/contract.ts`, issue #515) and read through
+the typed loader — never `process.env` — so both are validated at boot and
+`restartRequired`.
 
 ### 4.5 Drift detector — 7 types × 4 severities
 

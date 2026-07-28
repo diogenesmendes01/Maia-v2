@@ -15,7 +15,7 @@
  *     reaches the evidence layer);
  *   - a mandatory envelope failure aborts the turn (invariant 12).
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const { dbInsertValuesMock, dbExecuteMock, dbTransactionMock, txRows } = vi.hoisted(() => {
   const txRows: Array<{ table: string; row: Record<string, unknown> }> = [];
@@ -53,6 +53,11 @@ vi.mock('@/lib/logger.js', () => ({
 vi.mock('@/config/env.js', () => ({
   config: {
     NODE_ENV: 'test',
+    // #515: the rollout gate is a contract variable read through the loader,
+    // so it is part of the mocked config rather than a `process.env` write.
+    // These specs exercise the ON path end-to-end.
+    FEATURE_RUNTIME_TRACE_V1: true,
+    MAIA_STRICT_METRIC_LABELS: false,
     RUNTIME_TRACE_HMAC_MASTER_SECRET: 'issue-514-hot-path-master-secret',
     RUNTIME_TRACE_HMAC_KEY_VERSION: 1,
     RUNTIME_TRACE_DEBUG_AES_KEY: Buffer.alloc(32, 7).toString('base64'),
@@ -121,10 +126,6 @@ describe('issue #514 — hot-path runtime trace, real writers', () => {
   beforeEach(() => {
     txRows.length = 0;
     dbTransactionMock.mockClear();
-    process.env.FEATURE_RUNTIME_TRACE_V1 = 'true';
-  });
-  afterEach(() => {
-    delete process.env.FEATURE_RUNTIME_TRACE_V1;
   });
 
   it('writes the envelope + body outbox row in ONE transaction', async () => {
