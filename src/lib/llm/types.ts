@@ -41,13 +41,13 @@ export type LLMWorkload =
   | 'skill'
   | 'vision'
   | 'playground'
-  | 'probe'
-  /**
-   * Escape hatch temporário para o facade `callLLM()` quando o caller ainda
-   * não declarou workload. Tratado como `reasoner` na política, mas rotulado
-   * separadamente nas métricas para que o resíduo de migração seja visível.
-   */
-  | 'legacy';
+  | 'probe';
+// NOTA: não existe workload `legacy`. Ele foi criado como escape hatch para
+// callers ainda não migrados, mas virou um bypass: declarar nada era uma opção,
+// e a regra de lint que bloqueia SDK direto não impedia isso. Com todos os call
+// sites migrados, o escape hatch sumiu e `workload` é obrigatório em toda a
+// superfície — inclusive no facade `callLLM`. O gate em
+// tests/unit/lib/llm-workload-declaration.spec.ts impede a reintrodução.
 
 /**
  * Tier = a CLASSE de modelo, resolvida pelo backend a partir das settings

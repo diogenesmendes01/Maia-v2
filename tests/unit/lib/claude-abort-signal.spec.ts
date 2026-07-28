@@ -171,6 +171,7 @@ describe('callLLM — Anthropic SDK abort wiring (PR #221, item 3)', () => {
     const controller = new AbortController();
     const promise = withScope(() =>
       callLLM({
+        workload: 'reasoner',
         system: 'sys',
         messages: [{ role: 'user', content: 'hi' }],
         signal: controller.signal,
@@ -196,6 +197,7 @@ describe('callLLM — Anthropic SDK abort wiring (PR #221, item 3)', () => {
 
     await expect(
       callLLM({
+        workload: 'reasoner',
         system: 'sys',
         messages: [{ role: 'user', content: 'hi' }],
         signal: controller.signal,
@@ -218,6 +220,7 @@ describe('callLLM — Anthropic SDK abort wiring (PR #221, item 3)', () => {
     await expect(
       withScope(() =>
         callLLM({
+          workload: 'reasoner',
           system: 'sys',
           messages: [{ role: 'user', content: 'hi' }],
           signal: controller.signal,
@@ -240,6 +243,7 @@ describe('callLLM — Anthropic SDK abort wiring (PR #221, item 3)', () => {
     const controller = new AbortController();
     const promise = withScope(() =>
       callLLM({
+        workload: 'reasoner',
         system: 'sys',
         messages: [{ role: 'user', content: 'hi' }],
         signal: controller.signal,
@@ -285,6 +289,7 @@ describe('callLLM — Anthropic SDK abort wiring (PR #221, item 3)', () => {
 
     const err = await withScope(() =>
       callLLM({
+        workload: 'reasoner',
         system: 'sys',
         messages: [{ role: 'user', content: 'hi' }],
         signal: controller.signal,
@@ -355,6 +360,7 @@ describe('callLLM — OpenRouter (OpenAI SDK) abort wiring (PR #221, item 3)', (
     const controller = new AbortController();
     const promise = withScope(() =>
       callLLM({
+        workload: 'reasoner',
         system: 'sys',
         messages: [{ role: 'user', content: 'hi' }],
         signal: controller.signal,
@@ -379,6 +385,7 @@ describe('callLLM — OpenRouter (OpenAI SDK) abort wiring (PR #221, item 3)', (
     await expect(
       withScope(() =>
         callLLM({
+          workload: 'reasoner',
           system: 'sys',
           messages: [{ role: 'user', content: 'hi' }],
           signal: controller.signal,

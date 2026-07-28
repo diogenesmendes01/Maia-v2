@@ -73,18 +73,21 @@ export async function callLLM(params: {
    */
   signal?: AbortSignal;
   /**
-   * Intenção da chamada. Omitir mantém o comportamento legado sob o rótulo
-   * `legacy`, que existe justamente para o resíduo de migração ficar visível
-   * nas métricas.
+   * Intenção da chamada — OBRIGATÓRIA.
+   *
+   * Já foi opcional, caindo num workload `legacy`. Isso era um bypass: a regra
+   * de lint bloqueia importar o SDK direto, mas não impedia chamar o gateway
+   * sem declarar política de tier, retry e fallback. Com todos os call sites
+   * migrados, o default sumiu.
    */
-  workload?: LLMWorkload;
+  workload: LLMWorkload;
   /** Classe de modelo. Omitir usa o tier default do workload. */
   tier?: LLMTier;
   /** Deadline/trace opcionais (issues #507 e #514). */
   ctx?: LLMExecutionContext;
 }): Promise<LLMResponse> {
   return executeLLM({
-    workload: params.workload ?? 'legacy',
+    workload: params.workload,
     tier: params.tier,
     system: params.system,
     messages: params.messages,

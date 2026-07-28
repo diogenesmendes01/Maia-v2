@@ -78,7 +78,6 @@ const POLICIES: Record<LLMWorkload, WorkloadPolicy> = {
   skill: VIA_CALL_LLM,
   playground: VIA_CALL_LLM,
   probe: VIA_CALL_LLM,
-  legacy: VIA_CALL_LLM,
 
   // --- migrados de SDK direto: uma tentativa, sem fallback -----------------
   risk_classifier: SINGLE_SHOT_FAST,
