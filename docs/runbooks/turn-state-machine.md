@@ -68,13 +68,28 @@ ORDER BY 1,2,3;
 | `claimed`/`running` parados | worker morreu no meio | Até #504 (lease) **não** rearme automaticamente. Investigue antes: reexecutar um turno que já chamou tool duplica efeito colateral. |
 | `outbound_pending` parado | resposta comprometida, entrega travada | **Nunca** rearmar via recovery. É o delivery worker (#506) que finaliza. |
 | Crescimento de `retryable` | reasoner ou envio falhando | `SELECT last_error_code, count(*) FROM agent_turns WHERE status='retryable' GROUP BY 1;` |
+| `dead_letter` com `unsafe_to_retry` | a tentativa falhou DEPOIS de uma tool com efeito externo | **Não replaye às cegas.** Confira o efeito (`outbound_message_id`, trilha de tools) antes de decidir — replayar pode duplicar cobrança/envio. |
 
 Logs estruturados: `turn.created`, `turn.transitioned`, `turn.transition_conflict`,
 `turn.retry_scheduled`, `turn.dead_lettered`, `turn.legacy_projection_mismatch`.
 Nenhum deles carrega texto, prompt, telefone ou JID — se você precisa do conteúdo,
 ele está em `mensagens`, sob as mesmas regras de acesso de sempre.
 
-Métricas: `maia_turn_transitions_total{from,to,outcome}`,
+**Gauges** (os dois sinais de "turno preso"; só estados vivos — terminais são
+volume histórico, não saúde):
+
+| Gauge | Lê como |
+|---|---|
+| `maia_turns_current{status}` | quantos turnos em cada estado agora |
+| `maia_turn_state_age_seconds{status}` | idade do turno mais ANTIGO naquele estado |
+
+`maia_turns_current{status="running"}` que não desce, ou
+`maia_turn_state_age_seconds{status="outbound_pending"}` que cresce, **é** o
+incidente. Snapshot com TTL de 15s compartilhado entre as séries: um scrape faz
+uma query. Falha do banco mantém o último snapshot em vez de derrubar
+`/metrics`.
+
+Contadores: `maia_turn_transitions_total{from,to,outcome}`,
 `maia_turn_state_conflicts_total{transition}`,
 `maia_turn_recovery_candidates_total{reason}`,
 `maia_turn_retries_total{error_code}`,

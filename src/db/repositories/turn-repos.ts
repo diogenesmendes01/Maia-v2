@@ -631,6 +631,52 @@ export const agentTurnsRepo = {
   },
 
   /**
+   * Snapshot dos turnos VIVOS por estado, para os gauges de `/metrics`
+   * (`maia_turns_current` e `maia_turn_state_age_seconds`).
+   *
+   * CROSS-TENANT e sem ALS por construção: o scrape do Prometheus não roda
+   * dentro de contexto de tenant, e o sinal que interessa (turno preso,
+   * envelhecimento por estado) é global à instalação. Nenhum dado por tenant é
+   * exposto — só contagem e idade agregadas por estado.
+   *
+   * Só estados NÃO-terminais. Terminais crescem indefinidamente, são volume
+   * histórico e não sinal de saúde; incluí-los trocaria um índice parcial por
+   * um scan da tabela inteira a cada scrape. O índice
+   * `agent_turns_live_status_idx` cobre exatamente este predicado.
+   *
+   * `oldest_age_seconds` usa `min(updated_at)`: é a idade do turno mais ANTIGO
+   * naquele estado — a métrica que dispara alerta quando algo trava.
+   */
+  async snapshotLiveTurnStates(): Promise<
+    Array<{ status: TurnStatus; total: number; oldest_age_seconds: number }>
+  > {
+    const result = await db.execute<{
+      status: string;
+      total: string;
+      oldest_age_seconds: string;
+    }>(sql`
+      SELECT
+        status,
+        count(*)::text AS total,
+        COALESCE(EXTRACT(EPOCH FROM (now() - min(updated_at))), 0)::text AS oldest_age_seconds
+      FROM ${agent_turns}
+      WHERE status IN ('received', 'queued', 'claimed', 'running', 'outbound_pending', 'retryable')
+      GROUP BY status
+    `);
+    return Array.from(
+      result.rows as unknown as Array<{
+        status: string;
+        total: string;
+        oldest_age_seconds: string;
+      }>,
+    ).map((r) => ({
+      status: r.status as TurnStatus,
+      total: Number(r.total),
+      oldest_age_seconds: Math.max(0, Math.round(Number(r.oldest_age_seconds))),
+    }));
+  },
+
+  /**
    * Divergência POR PAR (tenant, agent), CROSS-TENANT e sem ALS.
    *
    * A variante escopada acima só enxerga o par corrente, e o worker a chamava

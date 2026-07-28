@@ -177,6 +177,14 @@ CREATE INDEX IF NOT EXISTS agent_turns_superseded_by_idx
   ON agent_turns (tenant_id, agent_id, superseded_by_turn_id)
   WHERE superseded_by_turn_id IS NOT NULL;
 
+-- Gauges de `/metrics` (`maia_turns_current`, `maia_turn_state_age_seconds`):
+-- agregação GLOBAL por estado, sem tenant no predicado — o scrape não roda em
+-- contexto de tenant. Parcial nos estados VIVOS para que o custo seja
+-- proporcional ao trabalho em voo, e não ao histórico acumulado.
+CREATE INDEX IF NOT EXISTS agent_turns_live_status_idx
+  ON agent_turns (status, updated_at)
+  WHERE status IN ('received', 'queued', 'claimed', 'running', 'outbound_pending', 'retryable');
+
 -- Idempotência estrutural do ingresso e do backfill: um turno por mensagem
 -- representativa. `createReceivedTurnTx` e o backfill em lotes dependem disto
 -- (ON CONFLICT DO NOTHING) para serem seguros em re-execução.

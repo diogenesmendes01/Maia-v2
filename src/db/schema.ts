@@ -3067,6 +3067,11 @@ export const agent_turns = pgTable(
     supersededByIdx: index('agent_turns_superseded_by_idx')
       .on(t.tenant_id, t.agent_id, t.superseded_by_turn_id)
       .where(sql`superseded_by_turn_id IS NOT NULL`),
+    liveStatusIdx: index('agent_turns_live_status_idx')
+      .on(t.status, t.updated_at)
+      .where(
+        sql`status IN ('received', 'queued', 'claimed', 'running', 'outbound_pending', 'retryable')`,
+      ),
   }),
 );
 
