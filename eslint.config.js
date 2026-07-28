@@ -77,6 +77,27 @@ const RESTRICTED_SEND_IMPORT_PATHS = [
   },
 ];
 
+// Issue #508 — LINT GATE da fronteira única de LLM. Fora de
+// `src/lib/llm/providers/**`, NINGUÉM importa SDK de provider generativo:
+// toda chamada de chat/classificação/visão passa pelo gateway
+// (`@/lib/llm/index.js`), que é quem resolve provider/modelo, aplica
+// deadline, cancelamento, retry, fallback, orçamento, custo e métrica.
+//
+// Sem esta regra, o bypass é trivial (`new Anthropic({...})` em qualquer
+// módulo) e foi exatamente assim que 13 call sites acabaram fora da
+// contabilidade de custo e ignorando o `LLM_PROVIDER` configurado.
+//
+// A regra entra direto como `error` (e não como warning, como sugeria o
+// rollout da issue) porque o sweep pós-migração já está limpo — não há
+// resíduo para tolerar, só novos bypasses para impedir.
+const RESTRICTED_LLM_SDK_PATTERNS = [
+  {
+    group: ['@anthropic-ai/sdk', '@anthropic-ai/sdk/*', 'openai', 'openai/*'],
+    message:
+      'Fronteira única de LLM (issue #508): use o gateway (@/lib/llm/index.js → executeLLM) ou o facade callLLM (@/lib/claude.js). SDK de provider só é permitido em src/lib/llm/providers/**.',
+  },
+];
+
 const TS_RULES = {
   ...tsPlugin.configs.recommended.rules,
 
@@ -201,6 +222,9 @@ export default [
               message:
                 'Architecture Lock (P8e): agent/cognition MUST NOT import the policy module directly. Use a slice builder (P8d) or PEP (P9b/d) instead.',
             },
+            // Fronteira única de LLM (#508) — repetida aqui porque flat
+            // config não faz merge de opções de regra entre blocos.
+            ...RESTRICTED_LLM_SDK_PATTERNS,
           ],
         },
       ],
@@ -214,6 +238,29 @@ export default [
   {
     files: ['src/**/*.ts'],
     ignores: ['src/gateway/**', 'src/agent/**', 'src/cognition/**'],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        { paths: RESTRICTED_SEND_IMPORT_PATHS, patterns: RESTRICTED_LLM_SDK_PATTERNS },
+      ],
+    },
+  },
+
+  // Fronteira única de LLM (#508) em src/gateway/**, que os blocos acima
+  // deixam de fora de propósito (é o dono das primitivas físicas de envio).
+  // O lock de SDK de provider vale ali também.
+  {
+    files: ['src/gateway/**/*.ts'],
+    rules: {
+      'no-restricted-imports': ['error', { patterns: RESTRICTED_LLM_SDK_PATTERNS }],
+    },
+  },
+
+  // Os ÚNICOS arquivos autorizados a importar SDK de provider. Aqui o lock de
+  // LLM sai (senão os próprios adapters não compilariam sob a regra); o lock
+  // das primitivas de envio continua.
+  {
+    files: ['src/lib/llm/providers/**/*.ts'],
     rules: {
       'no-restricted-imports': ['error', { paths: RESTRICTED_SEND_IMPORT_PATHS }],
     },

@@ -14,7 +14,7 @@
  * Returns `null` quando não há mensagens do agente, quando o LLM responde
  * `drift_detected: false`, ou quando há erro/parse failure (defensivo).
  */
-import Anthropic from '@anthropic-ai/sdk';
+import { callLLM } from '@/lib/claude.js';
 import { DriftType } from '@/types/enums.js';
 import type { DriftDetector, DriftDetectionInput, DriftEvidence } from './types.js';
 
@@ -32,7 +32,6 @@ export const linguagemDetector: DriftDetector = {
 
     const sample = agentMessages.slice(-20).map((m) => `- ${m.text}`).join('\n');
 
-    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY ?? '' });
     const system = [
       'Você audita o vocabulário e registro linguístico do agente.',
       'Compare as últimas mensagens com o descritor de voz esperado.',
@@ -46,16 +45,13 @@ export const linguagemDetector: DriftDetector = {
     ].join('\n');
 
     try {
-      const completion = await anthropic.messages.create({
-        model: 'claude-sonnet-4-6',
+      const completion = await callLLM({
+        workload: 'drift_detector',
         max_tokens: 600,
         system,
         messages: [{ role: 'user', content: user }],
       });
-      const text = completion.content
-        .filter((c): c is Anthropic.TextBlock => c.type === 'text')
-        .map((c) => c.text)
-        .join('');
+      const text = completion.content ?? '';
       const match = text.match(/\{[\s\S]*\}/);
       if (!match) return null;
       const parsed = JSON.parse(match[0]) as {

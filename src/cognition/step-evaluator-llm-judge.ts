@@ -1,6 +1,6 @@
-import Anthropic from '@anthropic-ai/sdk';
 import { runCognitiveModule } from './runner.js';
-import { config } from '@/config/env.js';
+import { callLLM } from '@/lib/claude.js';
+import { isLLMConfigured } from '@/lib/llm/index.js';
 
 /**
  * LLM-as-judge para critérios subjetivos de procedure steps.
@@ -26,7 +26,9 @@ export type LLMJudgeResult = {
   reasoning: string;
 };
 
-const JUDGE_MODEL = 'claude-haiku-4-5-20251001';
+// Issue #508: o slug do juiz deixou de morar aqui. O tier (`fast`) vem da
+// política do workload `step_evaluator` e o slug efetivo das settings
+// dinâmicas — o operador troca o modelo pelo Admin, não por deploy.
 const JUDGE_TIMEOUT_MS = 5000;
 
 const FALLBACK_RESULT: LLMJudgeResult = {
@@ -52,7 +54,10 @@ export async function judgeStepCriterion(input: LLMJudgeInput): Promise<LLMJudge
   // Short-circuit BEFORE calling runCognitiveModule so the missing-key
   // result is exposed as the module output (and therefore audited as such)
   // rather than degrading into the generic timeout/error fallback path.
-  if (!config.ANTHROPIC_API_KEY || config.ANTHROPIC_API_KEY.length === 0) {
+  // Issue #508: a checagem passa a ser sobre o provider ATIVO. Antes, um
+  // deploy com LLM_PROVIDER=openrouter e sem ANTHROPIC_API_KEY caía aqui
+  // mesmo tendo LLM perfeitamente configurado.
+  if (!isLLMConfigured()) {
     return { ...MISSING_API_KEY_RESULT };
   }
 
@@ -64,7 +69,6 @@ export async function judgeStepCriterion(input: LLMJudgeInput): Promise<LLMJudge
       fallback: () => ({ ...FALLBACK_RESULT }),
     },
     async () => {
-      const client = new Anthropic({ apiKey: config.ANTHROPIC_API_KEY ?? '' });
       const system = [
         'Você é um avaliador objetivo de respostas de um agente.',
         'Dado um CRITÉRIO em linguagem natural, opcionalmente um RUBRIC, e a RESPOSTA do agente,',
@@ -79,17 +83,14 @@ export async function judgeStepCriterion(input: LLMJudgeInput): Promise<LLMJudge
       userParts.push('Devolva JSON com score (0-1) e reasoning curto (<=200 chars).');
       const userPrompt = userParts.join('\n\n');
 
-      const completion = await client.messages.create({
-        model: JUDGE_MODEL,
+      const completion = await callLLM({
+        workload: 'step_evaluator',
         max_tokens: 200,
         system,
         messages: [{ role: 'user', content: userPrompt }],
       });
 
-      const text = (completion.content as Array<{ type: string; text?: string }>)
-        .filter((c): c is { type: 'text'; text: string } => c.type === 'text' && typeof c.text === 'string')
-        .map((c) => c.text)
-        .join('');
+      const text = completion.content ?? '';
 
       const match = text.match(/\{[\s\S]*\}/);
       if (!match) {

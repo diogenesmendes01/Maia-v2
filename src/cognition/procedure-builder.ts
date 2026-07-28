@@ -125,6 +125,7 @@ export async function teachProcedureSafe(input: {
       let res;
       try {
         res = await callLLM({
+          workload: 'procedure_builder',
           system: builderPrompt(),
           messages: [{ role: 'user', content: input.descricao_livre }],
           max_tokens: 1500,

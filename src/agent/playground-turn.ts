@@ -108,6 +108,7 @@ export async function runPlaygroundTurn(args: {
     },
     async () =>
       callLLM({
+        workload: 'playground',
         system,
         messages,
         max_tokens: MAX_OUTPUT_TOKENS,
