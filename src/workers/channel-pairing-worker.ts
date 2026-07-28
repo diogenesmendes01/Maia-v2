@@ -28,6 +28,7 @@ import { runWithTenantContext } from '@/db/tenant-context.js';
 import {
   channelLineStateRepo,
   type PairingMethod,
+  type LineState,
 } from '@/db/repositories/channel-line-state-repos.js';
 import {
   sealPairingMaterial,
@@ -105,6 +106,21 @@ function persistMaterial(
   })();
 }
 
+/**
+ * O que a CONCLUSÃO atômica do comando deve gravar (rodada 2 do review
+ * PR #528). Cada handler apenas DESCREVE o desfecho; quem escreve é um único
+ * `completeCommand`, sob um único CAS. Separar "libera a posse" de "limpa o
+ * comando" em dois statements foi exatamente o bug: o primeiro zerava o
+ * `owner_instance` que o CAS do segundo comparava, o clear falhava e o comando
+ * terminal voltava para a fila.
+ */
+interface CommandCompletion {
+  /** `false` só para o `start_pairing` que deixou uma sessão viva AQUI. */
+  release_owner: boolean;
+  state?: LineState;
+  reason_code?: string | null;
+}
+
 async function executeStartPairing(row: {
   channel_id: string;
   tenant_id: string;
@@ -114,7 +130,7 @@ async function executeStartPairing(row: {
   actor_id: string | null;
   actor_role: string | null;
   correlation_id: string | null;
-}): Promise<void> {
+}): Promise<CommandCompletion> {
   const method: PairingMethod = row.command_method === 'code' ? 'code' : 'qr';
   const actor =
     row.actor_id && row.actor_role
@@ -161,19 +177,17 @@ async function executeStartPairing(row: {
   });
 
   if (!result.ok) {
-    await channelLineStateRepo.transition({
-      channel_id: row.channel_id,
-      state: 'failed',
-      reason_code: result.error,
-      expected_command_id: row.command_id,
-      release_owner: true,
-    });
     incCounter('maia_channel_pairing_total', { outcome: 'rejected' });
     logger.warn(
       { channel_id: row.channel_id, reason: result.error },
       'channel_pairing.start_rejected',
     );
+    return { release_owner: true, state: 'failed', reason_code: result.error };
   }
+  // A PairingSession ficou VIVA nesta instância: o comando foi consumido, mas
+  // a posse permanece (o heartbeat continua renovando a lease) até o
+  // `onPhase` terminal chegar, minutos depois.
+  return { release_owner: false };
 }
 
 /**
@@ -193,15 +207,8 @@ async function executeAbort(row: {
   actor_id: string | null;
   actor_role: string | null;
   correlation_id: string | null;
-}): Promise<void> {
+}): Promise<CommandCompletion> {
   await abortChannelPairing(row.channel_id);
-  await channelLineStateRepo.transition({
-    channel_id: row.channel_id,
-    state: 'declared',
-    reason_code: 'operator_abort',
-    expected_command_id: row.command_id,
-    release_owner: true,
-  });
   await runWithTenantContext({ tenant_id: row.tenant_id, agent_id: row.agent_id }, () =>
     audit({
       acao: 'pairing_session_aborted',
@@ -215,6 +222,8 @@ async function executeAbort(row: {
     }),
   );
   incCounter('maia_channel_pairing_total', { outcome: 'aborted' });
+  // A linha só reabre para um novo start AGORA, junto da limpeza do comando.
+  return { release_owner: true, state: 'declared', reason_code: 'operator_abort' };
 }
 
 /**
@@ -228,7 +237,7 @@ async function executeRepair(row: {
   tenant_id: string;
   agent_id: string;
   external_id: string;
-}): Promise<void> {
+}): Promise<CommandCompletion> {
   // Review PR #528 (P1) — a ORDEM importa: derrubar o socket ANTES de apagar
   // o auth dir. Ao contrário, o Baileys ainda vivo pode regravar credenciais
   // em cima do dir recém-removido e a sessão zumbi coexiste com o pareamento
@@ -244,13 +253,8 @@ async function executeRepair(row: {
       external_id: row.external_id,
     },
   });
-  await channelLineStateRepo.transition({
-    channel_id: row.channel_id,
-    state: 'declared',
-    reason_code: 'repair_completed',
-    release_owner: true,
-  });
   incCounter('maia_channel_pairing_total', { outcome: 'repaired' });
+  return { release_owner: true, state: 'declared', reason_code: 'repair_completed' };
 }
 
 /**
@@ -260,12 +264,15 @@ async function executeRepair(row: {
  * socket encerrado, transporte removido. O estado `disabled` já foi gravado
  * pelo console e é protegido contra ressurreição por callback atrasado.
  */
-async function executeStopLine(row: { channel_id: string }): Promise<void> {
+async function executeStopLine(row: { channel_id: string }): Promise<CommandCompletion> {
   const { stopLineSession } = await import('@/gateway/line-sessions.js');
   const stopped = stopLineSession(row.channel_id);
   incCounter('maia_channel_pairing_total', {
     outcome: stopped ? 'line_stopped' : 'line_already_stopped',
   });
+  // Sem `state`: a linha já está `disabled` por decisão do operador, e
+  // sobrescrever isso apagaria a decisão.
+  return { release_owner: true };
 }
 
 /**
@@ -404,51 +411,63 @@ export async function runChannelPairingWorker(): Promise<void> {
     for (let i = 0; i < MAX_COMMANDS_PER_TICK; i += 1) {
       const row = await channelLineStateRepo.claimNextCommand(OWNER_INSTANCE);
       if (!row) return;
+
+      // Desfecho padrão: se algo explodir antes de o handler descrever o seu,
+      // o comando é encerrado como falha — nunca fica pendente para outra
+      // réplica reexecutar.
+      let completion: CommandCompletion =
+        row.command === 'stop_line'
+          ? { release_owner: true }
+          : { release_owner: true, state: 'failed', reason_code: 'command_execution_failed' };
       try {
         if (row.command === 'start_pairing') {
-          await executeStartPairing(row);
+          completion = await executeStartPairing(row);
         } else if (row.command === 'abort_pairing') {
-          await executeAbort(row);
+          completion = await executeAbort(row);
         } else if (row.command === 'repair') {
-          await executeRepair({
+          completion = await executeRepair({
             channel_id: row.channel_id,
             tenant_id: row.tenant_id,
             agent_id: row.agent_id,
             external_id: row.external_id,
           });
         } else if (row.command === 'stop_line') {
-          await executeStopLine({ channel_id: row.channel_id });
+          completion = await executeStopLine({ channel_id: row.channel_id });
         }
       } catch (err) {
         // Fail-isolated por comando: um canal problemático não trava a fila.
+        // O `completion` já é o desfecho de falha declarado acima.
         logger.error(
           { channel_id: row.channel_id, command: row.command, err: (err as Error).message },
           'channel_pairing.command_failed',
         );
-        // `stop_line` não define estado: a linha já está `disabled` por
-        // decisão do operador, e marcá-la `failed` aqui apagaria essa decisão.
-        if (row.command !== 'stop_line') {
-          await channelLineStateRepo
-            .transition({
-              channel_id: row.channel_id,
-              state: 'failed',
-              reason_code: 'command_execution_failed',
-              expected_command_id: row.command_id,
-              release_owner: true,
-            })
-            .catch(() => undefined);
-        }
       } finally {
-        // CAS: só limpa SE o comando ainda for este e a posse ainda for nossa.
-        // O `finally` incondicional anterior apagava um comando NOVO que o
-        // operador tivesse enfileirado durante a execução (review PR #528, P1).
-        await channelLineStateRepo
-          .clearCommand({
+        // UM ÚNICO write, UM ÚNICO CAS por (channel_id, command_id,
+        // owner_instance): limpa a ordem, aplica o estado terminal e libera a
+        // posse de uma vez. Antes eram dois statements, e o primeiro
+        // (`release_owner`) zerava justamente o `owner_instance` que o CAS do
+        // segundo comparava — o clear falhava e o comando terminal voltava
+        // para a fila (rodada 2 do review PR #528).
+        const done = await channelLineStateRepo
+          .completeCommand({
             channel_id: row.channel_id,
             command_id: row.command_id,
             owner_instance: OWNER_INSTANCE,
+            release_owner: completion.release_owner,
+            ...(completion.state ? { state: completion.state } : {}),
+            ...(completion.reason_code !== undefined
+              ? { reason_code: completion.reason_code }
+              : {}),
           })
-          .catch(() => undefined);
+          .catch(() => false);
+        if (!done) {
+          // CAS recusado: o operador enfileirou um comando NOVO durante a
+          // execução. Correto — o novo comando manda; nada a fazer.
+          logger.info(
+            { channel_id: row.channel_id, command: row.command },
+            'channel_pairing.completion_superseded',
+          );
+        }
       }
     }
   } catch (err) {

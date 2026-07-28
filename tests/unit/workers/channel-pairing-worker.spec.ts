@@ -31,7 +31,7 @@ const {
 } = vi.hoisted(() => ({
   repoMock: {
     claimNextCommand: vi.fn(),
-    clearCommand: vi.fn(async () => true),
+    completeCommand: vi.fn(async () => true),
     renewOwnerLeases: vi.fn(async () => 0),
     putPairingMaterial: vi.fn(async () => true),
     transition: vi.fn(async () => true),
@@ -140,7 +140,7 @@ beforeEach(() => {
   repoMock.renewOwnerLeases.mockResolvedValue(0);
   readinessMock.mockResolvedValue({ ready: true });
   activateVerifiedMock.mockResolvedValue({ ok: true });
-  repoMock.clearCommand.mockResolvedValue(true);
+  repoMock.completeCommand.mockResolvedValue(true);
   repoMock.putPairingMaterial.mockResolvedValue(true);
   repoMock.transition.mockResolvedValue(true);
   startPairingMock.mockResolvedValue({ ok: true });
@@ -221,24 +221,41 @@ describe('start_pairing — o material só sai daqui cifrado', () => {
     claimOnce(commandRow());
     await runChannelPairingWorker();
 
-    expect(repoMock.transition).toHaveBeenCalledWith(
-      expect.objectContaining({ state: 'failed', reason_code: 'already_active' }),
-    );
+    // O estado terminal viaja na PRÓPRIA conclusão do comando, não num
+    // statement separado (rodada 2 do review PR #528).
+    expect(repoMock.completeCommand).toHaveBeenCalledWith({
+      channel_id: CHANNEL_ID,
+      command_id: COMMAND_ID,
+      owner_instance: _internal.OWNER_INSTANCE,
+      release_owner: true,
+      state: 'failed',
+      reason_code: 'already_active',
+    });
   });
 
-  it('o comando é SEMPRE limpo, mesmo quando a execução explode', async () => {
+  it('o comando é SEMPRE concluído, mesmo quando a execução explode', async () => {
     startPairingMock.mockRejectedValue(new Error('boom'));
     claimOnce(commandRow());
     await runChannelPairingWorker();
 
-    expect(repoMock.transition).toHaveBeenCalledWith(
-      expect.objectContaining({ state: 'failed', reason_code: 'command_execution_failed' }),
-    );
-    expect(repoMock.clearCommand).toHaveBeenCalledWith({
+    expect(repoMock.completeCommand).toHaveBeenCalledWith({
       channel_id: CHANNEL_ID,
       command_id: COMMAND_ID,
       owner_instance: _internal.OWNER_INSTANCE,
+      release_owner: true,
+      state: 'failed',
+      reason_code: 'command_execution_failed',
     });
+  });
+
+  it('start bem-sucedido NÃO libera a posse — a PairingSession segue viva aqui', async () => {
+    claimOnce(commandRow());
+    await runChannelPairingWorker();
+
+    const call = repoMock.completeCommand.mock.calls[0]![0] as Record<string, unknown>;
+    // Liberar aqui faria o próprio sweep matar a sessão recém-aberta.
+    expect(call.release_owner).toBe(false);
+    expect(call.state).toBeUndefined();
   });
 });
 
@@ -266,14 +283,41 @@ describe('lease de posse — correção distribuída (review PR #528, P1)', () =
     expect(args.reason_code).toBe('interrupted_retryable');
   });
 
-  it('clearCommand é CAS por (channel_id, command_id, owner_instance)', async () => {
+  it('completeCommand é CAS por (channel_id, command_id, owner_instance)', async () => {
     claimOnce(commandRow());
     await runChannelPairingWorker();
 
-    expect(repoMock.clearCommand).toHaveBeenCalledWith({
+    expect(repoMock.completeCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        channel_id: CHANNEL_ID,
+        command_id: COMMAND_ID,
+        owner_instance: _internal.OWNER_INSTANCE,
+      }),
+    );
+  });
+
+  /**
+   * RODADA 2 do review PR #528 — o bug central: `release_owner: true` numa
+   * transição SEPARADA zerava o `owner_instance` que o CAS do clear seguinte
+   * comparava. O clear falhava, o comando ficava setado e voltava a ser
+   * elegível imediatamente.
+   */
+  it('caminho terminal: limpeza e liberação de posse saem num ÚNICO write', async () => {
+    claimOnce(commandRow({ command: 'abort_pairing', command_method: null }));
+    await runChannelPairingWorker();
+
+    // Nenhuma transição avulsa com release_owner antes da conclusão.
+    for (const call of repoMock.transition.mock.calls) {
+      expect((call[0] as Record<string, unknown>).release_owner).not.toBe(true);
+    }
+    expect(repoMock.completeCommand).toHaveBeenCalledTimes(1);
+    expect(repoMock.completeCommand).toHaveBeenCalledWith({
       channel_id: CHANNEL_ID,
       command_id: COMMAND_ID,
       owner_instance: _internal.OWNER_INSTANCE,
+      release_owner: true,
+      state: 'declared',
+      reason_code: 'operator_abort',
     });
   });
 
@@ -318,8 +362,8 @@ describe('abort e repair', () => {
     abortPairingMock.mockImplementation(async () => {
       order.push('abort');
     });
-    repoMock.transition.mockImplementation(async (a: { state: string }) => {
-      order.push(`transition:${a.state}`);
+    repoMock.completeCommand.mockImplementation(async (a: { state?: string }) => {
+      order.push(`complete:${a.state ?? 'none'}`);
       return true;
     });
     claimOnce(commandRow({ command: 'abort_pairing', command_method: null }));
@@ -327,15 +371,7 @@ describe('abort e repair', () => {
 
     // A ordem é o invariante: reabrir a linha ANTES de matar a sessão é
     // exatamente o que permitia a tentativa antiga concluir e ativar.
-    expect(order).toEqual(['abort', 'transition:declared']);
-    expect(repoMock.transition).toHaveBeenCalledWith(
-      expect.objectContaining({
-        state: 'declared',
-        reason_code: 'operator_abort',
-        expected_command_id: COMMAND_ID,
-        release_owner: true,
-      }),
-    );
+    expect(order).toEqual(['abort', 'complete:declared']);
   });
 
   it('aborts órfãos (dono morto) são resgatados no sweep', async () => {
@@ -378,7 +414,7 @@ describe('abort e repair', () => {
 
     // Marcar `failed` aqui apagaria a decisão do operador de desabilitar.
     expect(repoMock.transition).not.toHaveBeenCalled();
-    expect(repoMock.clearCommand).toHaveBeenCalled();
+    expect(repoMock.completeCommand).toHaveBeenCalled();
   });
 
   it('repair delega ao recovery POR ALVO e devolve a linha para declared', async () => {
@@ -394,9 +430,196 @@ describe('abort e repair', () => {
         external_id: '+5511900001111',
       },
     });
-    expect(repoMock.transition).toHaveBeenCalledWith(
-      expect.objectContaining({ state: 'declared', reason_code: 'repair_completed' }),
+    expect(repoMock.completeCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        state: 'declared',
+        reason_code: 'repair_completed',
+        release_owner: true,
+      }),
     );
+  });
+});
+
+/**
+ * RODADA 2 do review PR #528, achados `:396` e `:274`.
+ *
+ * O caminho terminal ficava REELEGÍVEL: `release_owner: true` numa transição
+ * separada zerava o `owner_instance`, o CAS do `clearCommand` seguinte
+ * falhava, o comando continuava setado e a próxima varredura o servia de novo
+ * — abort/falha reexecutados, potencialmente por outra réplica.
+ *
+ * Este bloco percorre a SEQUÊNCIA REAL do worker contra um fake de repositório
+ * que implementa a semântica de fila, e prova que o comando não reaparece.
+ */
+describe('sequência real: request → claim → terminal → clear (o comando não reaparece)', () => {
+  interface FakeRow {
+    channel_id: string;
+    tenant_id: string;
+    agent_id: string;
+    command: string | null;
+    command_method: string | null;
+    command_id: string | null;
+    owner_instance: string | null;
+    owner_lease_expires_at: Date | null;
+    state: string;
+    reason_code: string | null;
+    external_id: string;
+    channel_type: string;
+    channel_active: boolean;
+  }
+
+  let row: FakeRow;
+
+  /** Fake com a MESMA semântica de CAS/lease do repositório real. */
+  function installQueueFake(): void {
+    repoMock.claimNextCommand.mockImplementation(async (owner: string) => {
+      if (row.command === null) return null;
+      const leaseAlive =
+        row.owner_lease_expires_at !== null && row.owner_lease_expires_at.getTime() > Date.now();
+      if (row.owner_instance !== null && leaseAlive) return null; // já reivindicado
+      row.owner_instance = owner;
+      row.owner_lease_expires_at = new Date(Date.now() + 60_000);
+      return { ...row };
+    });
+
+    repoMock.completeCommand.mockImplementation(
+      async (a: {
+        channel_id: string;
+        command_id: string | null;
+        owner_instance: string;
+        release_owner: boolean;
+        state?: string;
+        reason_code?: string | null;
+      }) => {
+        // CAS exatamente como o UPDATE real.
+        if (row.command_id !== a.command_id || row.owner_instance !== a.owner_instance) {
+          return false;
+        }
+        row.command = null;
+        row.command_method = null;
+        if (a.release_owner) {
+          row.owner_instance = null;
+          row.owner_lease_expires_at = null;
+        } else {
+          row.owner_lease_expires_at = new Date(Date.now() + 60_000);
+        }
+        if (a.state) {
+          row.state = a.state;
+          row.reason_code = a.reason_code ?? null;
+        }
+        return true;
+      },
+    );
+  }
+
+  function request(command: string, command_id: string): void {
+    row.command = command;
+    row.command_id = command_id;
+    row.command_method = command === 'start_pairing' ? 'qr' : null;
+    row.owner_instance = null;
+    row.owner_lease_expires_at = null;
+  }
+
+  beforeEach(() => {
+    row = {
+      channel_id: CHANNEL_ID,
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-a',
+      command: null,
+      command_method: null,
+      command_id: null,
+      owner_instance: null,
+      owner_lease_expires_at: null,
+      state: 'declared',
+      reason_code: null,
+      external_id: '+5511900001111',
+      channel_type: 'whatsapp',
+      channel_active: false,
+    };
+    installQueueFake();
+  });
+
+  it('abort: após o tick, o comando some e NÃO é servido de novo', async () => {
+    request('abort_pairing', 'cmd-abort');
+    await runChannelPairingWorker();
+
+    expect(row.command).toBeNull();
+    expect(row.owner_instance).toBeNull();
+    expect(row.state).toBe('declared');
+
+    // O tick seguinte não encontra nada — antes, o abort era reexecutado.
+    _internal.reset();
+    abortPairingMock.mockClear();
+    await runChannelPairingWorker();
+    expect(abortPairingMock).not.toHaveBeenCalled();
+  });
+
+  it('repair: idem — recovery roda UMA vez, não a cada tick', async () => {
+    request('repair', 'cmd-repair');
+    await runChannelPairingWorker();
+    expect(row.command).toBeNull();
+    expect(triggerRecoveryMock).toHaveBeenCalledTimes(1);
+
+    _internal.reset();
+    await runChannelPairingWorker();
+    expect(triggerRecoveryMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('start REJEITADO: vira failed e não é retentado sozinho', async () => {
+    startPairingMock.mockResolvedValue({ ok: false, error: 'already_active' });
+    request('start_pairing', 'cmd-start');
+    await runChannelPairingWorker();
+
+    expect(row.command).toBeNull();
+    expect(row.state).toBe('failed');
+    expect(row.reason_code).toBe('already_active');
+
+    _internal.reset();
+    startPairingMock.mockClear();
+    await runChannelPairingWorker();
+    expect(startPairingMock).not.toHaveBeenCalled();
+  });
+
+  it('start com EXCEÇÃO: comando encerrado como failed, sem reexecução', async () => {
+    startPairingMock.mockRejectedValue(new Error('boom'));
+    request('start_pairing', 'cmd-start');
+    await runChannelPairingWorker();
+
+    expect(row.command).toBeNull();
+    expect(row.state).toBe('failed');
+    expect(row.reason_code).toBe('command_execution_failed');
+
+    _internal.reset();
+    startPairingMock.mockClear();
+    await runChannelPairingWorker();
+    expect(startPairingMock).not.toHaveBeenCalled();
+  });
+
+  it('start BEM-SUCEDIDO: comando consumido, posse RETIDA (sessão viva aqui)', async () => {
+    request('start_pairing', 'cmd-start');
+    await runChannelPairingWorker();
+
+    expect(row.command).toBeNull();
+    // A posse fica: soltá-la faria o sweep matar a PairingSession recém-aberta.
+    expect(row.owner_instance).toBe(_internal.OWNER_INSTANCE);
+    expect(row.owner_lease_expires_at).not.toBeNull();
+  });
+
+  it('comando NOVO durante a execução sobrevive: o CAS da conclusão antiga é recusado', async () => {
+    request('start_pairing', 'cmd-start');
+    startPairingMock.mockImplementation(async () => {
+      // O operador cancela enquanto o start roda.
+      request('abort_pairing', 'cmd-abort');
+      row.owner_instance = _internal.OWNER_INSTANCE; // ainda reivindicado
+      row.owner_lease_expires_at = new Date(Date.now() + 60_000);
+      return { ok: true };
+    });
+
+    await runChannelPairingWorker();
+
+    // A conclusão do start não pode apagar o abort recém-enfileirado.
+    expect(row.command).toBe('abort_pairing');
+    expect(row.command_id).toBe('cmd-abort');
   });
 });
 

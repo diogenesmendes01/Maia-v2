@@ -341,10 +341,11 @@ d('channel_line_state — idempotência e concorrência', () => {
       ...ACTOR,
     });
     await channelLineStateRepo.claimNextCommand('dead-instance', 1);
-    await channelLineStateRepo.clearCommand({
+    await channelLineStateRepo.completeCommand({
       channel_id: channelId,
       command_id: abortKey,
       owner_instance: 'dead-instance',
+      release_owner: false,
       lease_ms: 1,
     });
     await new Promise((r) => setTimeout(r, 20));
@@ -710,10 +711,11 @@ d('channel_line_state — material cifrado e restart', () => {
     });
     // A reivindica, consome o comando e mantém a sessão viva renovando a lease.
     await channelLineStateRepo.claimNextCommand('replica-A');
-    await channelLineStateRepo.clearCommand({
+    await channelLineStateRepo.completeCommand({
       channel_id: channelId,
       command_id: key,
       owner_instance: 'replica-A',
+      release_owner: false,
     });
     await channelLineStateRepo.renewOwnerLeases('replica-A');
 
@@ -740,7 +742,72 @@ d('channel_line_state — material cifrado e restart', () => {
     expect(await channelLineStateRepo.renewOwnerLeases('replica-A')).toBe(1);
   });
 
-  it('clearCommand é CAS: um finally atrasado não apaga o comando NOVO', async () => {
+  it('conclusão terminal: comando limpo E posse liberada no MESMO write', async () => {
+    // Rodada 2 do review PR #528: `release_owner` num statement separado
+    // zerava o `owner_instance` que o CAS do clear comparava — o clear falhava
+    // e o comando terminal voltava a ser elegível na hora.
+    const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+    const scope = { tenant_id: T, agent_id: A, channel_id: channelId };
+    const key = randomUUID();
+    await channelLineStateRepo.requestCommand({
+      scope,
+      command: 'abort_pairing',
+      command_id: key,
+      ...ACTOR,
+    });
+    const claimed = await channelLineStateRepo.claimNextCommand('replica-A');
+    expect(claimed?.command).toBe('abort_pairing');
+
+    const done = await channelLineStateRepo.completeCommand({
+      channel_id: channelId,
+      command_id: key,
+      owner_instance: 'replica-A',
+      release_owner: true,
+      state: 'declared',
+      reason_code: 'operator_abort',
+    });
+    expect(done).toBe(true);
+
+    const after = await channelLineStateRepo.getStateForScope(scope);
+    expect(after?.command).toBeNull();
+    expect(after?.owner_instance).toBeNull();
+    expect(after?.owner_lease_expires_at).toBeNull();
+    expect(after?.state).toBe('declared');
+
+    // A PROVA: nenhuma réplica volta a receber o comando.
+    expect(await channelLineStateRepo.claimNextCommand('replica-A')).toBeNull();
+    expect(await channelLineStateRepo.claimNextCommand('replica-B')).toBeNull();
+  });
+
+  it('conclusão SEM liberar a posse mantém a linha reservada a esta instância', async () => {
+    const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+    const scope = { tenant_id: T, agent_id: A, channel_id: channelId };
+    const key = randomUUID();
+    await channelLineStateRepo.requestCommand({
+      scope,
+      command: 'start_pairing',
+      method: 'qr',
+      command_id: key,
+      ...ACTOR,
+    });
+    await channelLineStateRepo.claimNextCommand('replica-A');
+    await channelLineStateRepo.completeCommand({
+      channel_id: channelId,
+      command_id: key,
+      owner_instance: 'replica-A',
+      release_owner: false,
+    });
+
+    const after = await channelLineStateRepo.getStateForScope(scope);
+    expect(after?.command).toBeNull();
+    // A PairingSession segue viva em A: soltar a posse aqui faria o sweep
+    // matá-la.
+    expect(after?.owner_instance).toBe('replica-A');
+    expect(after?.owner_lease_expires_at).not.toBeNull();
+    expect(after?.state).toBe('pairing');
+  });
+
+  it('completeCommand é CAS: um finally atrasado não apaga o comando NOVO', async () => {
     const { channelLineStateRepo } = await import('../../src/db/repositories.js');
     const scope = { tenant_id: T, agent_id: A, channel_id: channelId };
     const oldKey = randomUUID();
@@ -760,10 +827,11 @@ d('channel_line_state — material cifrado e restart', () => {
       ...ACTOR,
     });
 
-    const cleared = await channelLineStateRepo.clearCommand({
+    const cleared = await channelLineStateRepo.completeCommand({
       channel_id: channelId,
       command_id: oldKey,
       owner_instance: 'replica-A',
+      release_owner: false,
     });
     expect(cleared).toBe(false);
     expect((await channelLineStateRepo.getStateForScope(scope))?.command).toBe('abort_pairing');
@@ -791,10 +859,11 @@ d('channel_line_state — material cifrado e restart', () => {
       kind: 'qr',
       expires_at: new Date(Date.now() + 60_000),
     });
-    await channelLineStateRepo.clearCommand({
+    await channelLineStateRepo.completeCommand({
       channel_id: channelId,
       command_id: key,
       owner_instance: 'old-instance:1',
+      release_owner: false,
       lease_ms: 1,
     });
     await new Promise((r) => setTimeout(r, 20));

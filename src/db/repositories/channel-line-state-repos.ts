@@ -666,20 +666,37 @@ export const channelLineStateRepo = {
   },
 
   /**
-   * Limpa o comando executado. CAS por `(channel_id, command_id,
-   * owner_instance)`: um `finally` atrasado de uma execução ANTIGA não pode
-   * apagar o comando NOVO que o operador acabou de enfileirar (review PR #528,
-   * P1). Devolve `false` quando o comando já não é o desta execução.
+   * Conclui o comando reivindicado: limpa a ordem, aplica a transição de
+   * estado e (quando o trabalho acabou) libera a posse — TUDO num único
+   * UPDATE, sob UM ÚNICO CAS por `(channel_id, command_id, owner_instance)`.
    *
-   * A LEASE é renovada, não zerada: o comando acabou, mas a PairingSession que
-   * ele abriu continua viva NESTA instância — zerar a lease aqui faria o
-   * próprio sweep matar a sessão que acabamos de abrir.
+   * ── Por que num só statement (rodada 2 do review PR #528) ──────────────
+   * A versão anterior fazia `transition({ release_owner: true })` e DEPOIS
+   * `clearCommand(..., owner_instance)`. O `release_owner` zerava
+   * `owner_instance`, então o CAS do clear — que compara justamente por
+   * `owner_instance` — falhava, o comando NÃO era limpo e voltava a ser
+   * elegível na hora. Isso anulava as duas correções da rodada 1: o comando
+   * terminal (abort, repair, falha de start) era reexecutado por qualquer
+   * réplica. Liberar a posse e limpar o comando são a MESMA decisão; separá-las
+   * em dois statements é o bug.
+   *
+   * `release_owner: false` é o caso do `start_pairing` bem-sucedido: a ordem
+   * foi consumida, mas a PairingSession continua VIVA nesta instância, então a
+   * posse permanece e a lease é RENOVADA (zerá-la faria o próprio sweep matar
+   * a sessão recém-aberta).
+   *
+   * `command_id` NÃO é limpo de propósito: ele é o token de versão que as
+   * transições atrasadas (callback da PairingSession) usam como CAS.
    */
-  async clearCommand(args: {
+  async completeCommand(args: {
     channel_id: string;
     command_id: string | null;
     owner_instance: string;
+    /** `true` = trabalho encerrado; `false` = sessão segue viva AQUI. */
+    release_owner: boolean;
     lease_ms?: number;
+    state?: LineState;
+    reason_code?: string | null;
   }): Promise<boolean> {
     const now = new Date();
     const rows = await db
@@ -688,7 +705,24 @@ export const channelLineStateRepo = {
         command: null,
         command_method: null,
         command_claimed_at: null,
-        owner_lease_expires_at: new Date(now.getTime() + (args.lease_ms ?? OWNER_LEASE_MS)),
+        ...(args.release_owner
+          ? { owner_instance: null, owner_lease_expires_at: null }
+          : {
+              owner_lease_expires_at: new Date(
+                now.getTime() + (args.lease_ms ?? OWNER_LEASE_MS),
+              ),
+            }),
+        ...(args.state
+          ? {
+              state: args.state,
+              reason_code: args.reason_code ?? null,
+              last_transition_at: now,
+              pairing_material: null,
+              pairing_material_key_id: null,
+              pairing_material_kind: null,
+              pairing_material_expires_at: null,
+            }
+          : {}),
         updated_at: now,
       })
       .where(
