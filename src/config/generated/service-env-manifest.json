@@ -102,6 +102,13 @@
           "restartRequired": true
         },
         {
+          "name": "REDIS_CONNECT_TIMEOUT_MS",
+          "secret": false,
+          "required": false,
+          "group": "redis",
+          "restartRequired": true
+        },
+        {
           "name": "LLM_PROVIDER",
           "secret": false,
           "required": false,
@@ -956,6 +963,76 @@
           "restartRequired": true
         },
         {
+          "name": "MAIA_PROCESS_ROLE",
+          "secret": false,
+          "required": false,
+          "group": "lifecycle",
+          "restartRequired": true
+        },
+        {
+          "name": "SHUTDOWN_GRACE_MS",
+          "secret": false,
+          "required": false,
+          "group": "lifecycle",
+          "restartRequired": true
+        },
+        {
+          "name": "SHUTDOWN_STEP_TIMEOUT_MS",
+          "secret": false,
+          "required": false,
+          "group": "lifecycle",
+          "restartRequired": true
+        },
+        {
+          "name": "SHUTDOWN_EXIT_TIMEOUT_MS",
+          "secret": false,
+          "required": false,
+          "group": "lifecycle",
+          "restartRequired": true
+        },
+        {
+          "name": "SHUTDOWN_FORCED_EXIT_CODE",
+          "secret": false,
+          "required": false,
+          "group": "lifecycle",
+          "restartRequired": true
+        },
+        {
+          "name": "READINESS_CACHE_MS",
+          "secret": false,
+          "required": false,
+          "group": "lifecycle",
+          "restartRequired": true
+        },
+        {
+          "name": "READINESS_PROBE_TIMEOUT_MS",
+          "secret": false,
+          "required": false,
+          "group": "lifecycle",
+          "restartRequired": true
+        },
+        {
+          "name": "READINESS_SCHEMA_CHECK",
+          "secret": false,
+          "required": false,
+          "group": "lifecycle",
+          "restartRequired": true
+        },
+        {
+          "name": "READINESS_BACKLOG_MAX",
+          "secret": false,
+          "required": false,
+          "group": "lifecycle",
+          "restartRequired": true
+        },
+        {
+          "name": "READINESS_REQUIRE_WHATSAPP_LIVE",
+          "secret": false,
+          "required": false,
+          "group": "lifecycle",
+          "restartRequired": true
+        },
+        {
           "name": "SETUP_TOKEN_OVERRIDE",
           "secret": true,
           "required": false,
@@ -1004,6 +1081,7 @@
             "MAIA_REJECT_DEFAULT_LITERAL",
             "POSTGRES_PORT",
             "REDIS_PORT",
+            "REDIS_CONNECT_TIMEOUT_MS",
             "LLM_PROVIDER",
             "ANTHROPIC_API_KEY",
             "OPENROUTER_API_KEY",
@@ -1121,6 +1199,16 @@
             "TURN_CONTEXT_CACHE_MAX_ENTRIES",
             "SYNC_LATENCY_P95_BASELINE_MS",
             "SYNC_LATENCY_P95_BUDGET_PERCENT",
+            "MAIA_PROCESS_ROLE",
+            "SHUTDOWN_GRACE_MS",
+            "SHUTDOWN_STEP_TIMEOUT_MS",
+            "SHUTDOWN_EXIT_TIMEOUT_MS",
+            "SHUTDOWN_FORCED_EXIT_CODE",
+            "READINESS_CACHE_MS",
+            "READINESS_PROBE_TIMEOUT_MS",
+            "READINESS_SCHEMA_CHECK",
+            "READINESS_BACKLOG_MAX",
+            "READINESS_REQUIRE_WHATSAPP_LIVE",
             "SETUP_TOKEN_OVERRIDE"
           ]
         },
@@ -1147,6 +1235,7 @@
             "MAIA_REJECT_DEFAULT_LITERAL",
             "POSTGRES_PORT",
             "REDIS_PORT",
+            "REDIS_CONNECT_TIMEOUT_MS",
             "LLM_PROVIDER",
             "ANTHROPIC_API_KEY",
             "OPENROUTER_API_KEY",
@@ -1262,6 +1351,16 @@
             "TURN_CONTEXT_CACHE_MAX_ENTRIES",
             "SYNC_LATENCY_P95_BASELINE_MS",
             "SYNC_LATENCY_P95_BUDGET_PERCENT",
+            "MAIA_PROCESS_ROLE",
+            "SHUTDOWN_GRACE_MS",
+            "SHUTDOWN_STEP_TIMEOUT_MS",
+            "SHUTDOWN_EXIT_TIMEOUT_MS",
+            "SHUTDOWN_FORCED_EXIT_CODE",
+            "READINESS_CACHE_MS",
+            "READINESS_PROBE_TIMEOUT_MS",
+            "READINESS_SCHEMA_CHECK",
+            "READINESS_BACKLOG_MAX",
+            "READINESS_REQUIRE_WHATSAPP_LIVE",
             "SETUP_TOKEN_OVERRIDE"
           ]
         },
@@ -1288,6 +1387,7 @@
             "MAIA_REJECT_DEFAULT_LITERAL",
             "POSTGRES_PORT",
             "REDIS_PORT",
+            "REDIS_CONNECT_TIMEOUT_MS",
             "LLM_PROVIDER",
             "ANTHROPIC_API_KEY",
             "OPENROUTER_API_KEY",
@@ -1403,6 +1503,16 @@
             "TURN_CONTEXT_CACHE_MAX_ENTRIES",
             "SYNC_LATENCY_P95_BASELINE_MS",
             "SYNC_LATENCY_P95_BUDGET_PERCENT",
+            "MAIA_PROCESS_ROLE",
+            "SHUTDOWN_GRACE_MS",
+            "SHUTDOWN_STEP_TIMEOUT_MS",
+            "SHUTDOWN_EXIT_TIMEOUT_MS",
+            "SHUTDOWN_FORCED_EXIT_CODE",
+            "READINESS_CACHE_MS",
+            "READINESS_PROBE_TIMEOUT_MS",
+            "READINESS_SCHEMA_CHECK",
+            "READINESS_BACKLOG_MAX",
+            "READINESS_REQUIRE_WHATSAPP_LIVE",
             "SETUP_TOKEN_OVERRIDE"
           ]
         }

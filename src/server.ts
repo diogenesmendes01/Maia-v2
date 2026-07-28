@@ -4,10 +4,12 @@ import { logger } from '@/lib/logger.js';
 import {
   checkAll,
   checkDb,
-  checkReadiness,
   checkRedis,
   checkWhatsApp,
+  toPublicHealthReport,
 } from '@/lib/healthcheck.js';
+import { lifecycle } from '@/runtime/lifecycle/controller.js';
+import { checkRoleReadiness, checkStartup } from '@/runtime/lifecycle/readiness.js';
 import { renderPrometheus, setGaugeProvider } from '@/lib/metrics.js';
 import { isRedisConnected } from '@/lib/redis.js';
 import { isBaileysConnected } from '@/gateway/baileys.js';
@@ -16,6 +18,10 @@ import { startRedisMemoryCollector } from '@/observability/redis-memory-collecto
 
 export async function buildServer() {
   const app = Fastify({ logger: false });
+
+  // Issue #512 — `maia_lifecycle_state{role,state}` (one series per state,
+  // exactly one of them 1). Idempotent: buildServer() runs many times in tests.
+  lifecycle.registerGauges();
 
   setGaugeProvider('maia_redis_connected', () => (isRedisConnected() ? 1 : 0));
   setGaugeProvider('maia_baileys_connected', () => (isBaileysConnected() ? 1 : 0));
@@ -55,20 +61,49 @@ export async function buildServer() {
     redisMemoryCollector.stop();
   });
 
-  app.get('/health', async () => checkAll());
-  app.get('/health/db', async () => checkDb());
-  app.get('/health/redis', async () => checkRedis());
-  app.get('/health/whatsapp', async () => checkWhatsApp());
-  // Issue #297 — readiness gate. Distinct from /health/* (liveness-ish
-  // component probes): /readyz tells a load balancer whether to keep this
-  // instance in rotation. Returns 503 when Redis memory pressure crosses the
-  // critical ratio so the LB drains the instance BEFORE `noeviction` turns
-  // pressure into write failures (see docs/runbooks/redis.md §4).
+  // Issue #512 — three DISTINCT probes with three distinct jobs.
+  //
+  // /livez     — is the process alive? NO I/O at all: no DB, no Redis, no
+  //              WhatsApp, no disk. A liveness probe that touches a dependency
+  //              turns a dependency outage into a restart loop.
+  // /startupz  — did initialization finish? Positive once the lifecycle
+  //              reached `ready`; stays positive while draining so a slow
+  //              drain is not killed by a "failed startup" verdict.
+  // /readyz    — should the load balancer route here? Composite and
+  //              ROLE-AWARE (see src/runtime/lifecycle/roles.ts), fail-closed,
+  //              read-only, cached.
+  app.get('/livez', async (_req, reply) => {
+    const snap = lifecycle.snapshot();
+    reply.code(200);
+    return {
+      live: true,
+      state: snap.state,
+      role: snap.role,
+      instance_id: snap.instance_id,
+      uptime_ms: snap.uptime_ms,
+    };
+  });
+  app.get('/startupz', async (_req, reply) => {
+    const report = checkStartup();
+    reply.code(report.started ? 200 : 503);
+    return report;
+  });
   app.get('/readyz', async (_req, reply) => {
-    const report = await checkReadiness();
+    const report = await checkRoleReadiness();
     reply.code(report.ready ? 200 : 503);
     return report;
   });
+
+  // `/health` is the component view for humans and the container healthcheck.
+  // Issue #512: it is now READ-ONLY (no `system_health_events` rows per poll),
+  // cached, and stripped of raw driver text before leaving the process.
+  app.get('/health', async () => {
+    const report = await checkAll();
+    return { status: report.status, components: report.components.map(toPublicHealthReport) };
+  });
+  app.get('/health/db', async () => toPublicHealthReport(await checkDb()));
+  app.get('/health/redis', async () => toPublicHealthReport(await checkRedis()));
+  app.get('/health/whatsapp', async () => toPublicHealthReport(await checkWhatsApp()));
   app.get('/metrics', async (_req, reply) => {
     reply.header('content-type', 'text/plain; version=0.0.4');
     return renderPrometheus();

@@ -556,6 +556,8 @@ type SubscriberClient = {
   subscribe: (channel: string) => Promise<unknown>;
   on: (event: string, handler: (...args: never[]) => void) => unknown;
   connect: () => Promise<unknown>;
+  /** Optional so a test double can omit it; production ioredis always has it. */
+  quit?: () => Promise<unknown>;
 };
 
 let subscriberEnabled = false;
@@ -632,6 +634,41 @@ export function startTurnContextCacheInvalidationSubscriber(
   if (!config.FEATURE_TURN_CONTEXT_CACHE) return;
   subscriberCache = cache;
   subscriberEnabled = true;
+}
+
+/**
+ * Close the invalidation subscriber — issue #512 (graceful shutdown).
+ *
+ * The subscriber owns its OWN ioredis connection (ioredis forbids other
+ * commands on a subscribed client), so the shared `redis` client that
+ * `shutdownPools()` quits is not the same handle: without this, a drained
+ * process kept an open pub/sub socket, the event loop never emptied, and the
+ * post-drain backstop fired `maia_shutdown_forced_total{reason=
+ * "handles_still_open"}` on every clean deploy.
+ *
+ * Disabling comes FIRST: any `subscribeTenant` racing the drain then rejects
+ * with `subscriber_not_started`, and the cache declines to store rather than
+ * running un-invalidatable — the same fail-safe the module already uses for a
+ * process that never started the subscriber.
+ *
+ * Idempotent, and a no-op on a process that never built the connection (flag
+ * off, or a role that never built a prompt).
+ */
+export async function stopTurnContextCacheInvalidationSubscriber(): Promise<void> {
+  subscriberEnabled = false;
+  const pending = subscriberClient;
+  subscriberClient = null;
+  if (!pending) return;
+  try {
+    const sub = await pending;
+    await sub.quit?.();
+  } catch (err) {
+    // Already down, or never finished connecting. Nothing left to close.
+    logger.warn(
+      { err: (err as Error).message },
+      'turn_context_cache.subscriber_close_failed',
+    );
+  }
 }
 
 /** Test-only: reset subscriber state so a spec can re-wire it. */

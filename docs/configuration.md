@@ -49,7 +49,7 @@ Os dois opt-ins são separados de propósito: `--allow-placeholders` (usado no `
 
 | Serviço | Variáveis | Segredos |
 |---|---:|---:|
-| `runtime` | 135 | 17 |
+| `runtime` | 146 | 17 |
 | `admin-ui` | 22 | 4 |
 | `migrator` | 10 | 2 |
 | `backup` | 27 | 6 |
@@ -87,6 +87,7 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 |---|---|---|---|---|---|---|
 | `REDIS_URL` | string | — | sim | `runtime`, `maintenance` | sim | URL do Redis (filas BullMQ, dedup, debounce, rate limit). Obrigatória em: development, staging, production. |
 | `REDIS_PORT` | number | `6379` | não | `runtime`, `maintenance` | sim | Porta do Redis (usada pelo compose). |
+| `REDIS_CONNECT_TIMEOUT_MS` | number | `10000` | não | `runtime` | sim | Quanto o boot espera pela conexão com o Redis antes de FALHAR FECHADO (issue #512). Redis é dependência obrigatória (BullMQ, dedup, debouncer, working memory, rate limit): `ensureRedisConnect()` não engole mais a falha — sem conexão o processo não anuncia readiness e sai com erro. |
 
 ### LLM provider
 
@@ -287,6 +288,21 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 | `TURN_CONTEXT_CACHE_MAX_ENTRIES` | number | `5000` | não | `runtime` | sim | Teto de entradas do cache de contexto do turno (#511). Existe para limitar memória se a contagem de tuplas (tenant, agent) explodir, não para otimizar hit rate — o working set é de uma entrada por tupla. |
 | `SYNC_LATENCY_P95_BASELINE_MS` | number | — | não | `runtime` | sim | Baseline (ms) do p95 do caminho síncrono. Ausente ⇒ o gate é pulado. |
 | `SYNC_LATENCY_P95_BUDGET_PERCENT` | number | `20` | não | `runtime` | sim | Percentual extra permitido sobre a baseline. |
+
+### Lifecycle do processo (readiness e shutdown)
+
+| Variável | Tipo | Default | Segredo | Serviços | Restart | Descrição |
+|---|---|---|---|---|---|---|
+| `MAIA_PROCESS_ROLE` | `all` \| `api` \| `worker` \| `scheduler` \| `session-owner` | `all` | não | `runtime` | sim | Qual fatia da topologia ESTE processo executa: all \| api \| worker \| scheduler \| session-owner. O papel decide o que o boot INICIA e o que o /readyz EXIGE, então um processo worker nunca fica fora de rotação por causa do WhatsApp, e um api-only nunca anuncia readiness por conseguir falar com o Redis. `all` é o modo compatível de processo único que roda hoje; os demais existem para a separação de topologia (issue #513). Contrato em src/runtime/lifecycle/roles.ts. |
+| `SHUTDOWN_GRACE_MS` | number | `25000` | não | `runtime` | sim | Orçamento TOTAL do drain depois do SIGTERM: ticks de cron em execução, jobs BullMQ ativos e tarefas de background rastreadas. Precisa ser MENOR que o timeout de kill do supervisor (systemd TimeoutStopSec / compose stop_grace_period, hoje 40s), senão o SIGKILL corta o drain no meio. |
+| `SHUTDOWN_STEP_TIMEOUT_MS` | number | `10000` | não | `runtime` | sim | Teto por PASSO do shutdown, para que um componente travado (um socket que não fecha) não consuma o orçamento inteiro. Também limita a espera pela fase de boot em voo; se essa espera estoura, o drain é marcado incompleto e o processo sai forçado. |
+| `SHUTDOWN_EXIT_TIMEOUT_MS` | number | `5000` | não | `runtime` | sim | Rede de segurança APÓS um drain limpo. O processo sai naturalmente quando o event loop esvazia; este timer (unref) só dispara se algum handle vazado mantiver o loop vivo. Não é um process.exit prematuro — a saída natural sempre vence a corrida. |
+| `SHUTDOWN_FORCED_EXIT_CODE` | number | `1` | não | `runtime` | sim | Código de saída quando o drain termina INCOMPLETO (deadline estourado com trabalho em voo, segundo sinal, ou fase de boot que não cedeu). Distinto do 0 de um drain limpo, para o supervisor e o log distinguirem os dois casos. |
+| `READINESS_CACHE_MS` | number | `2000` | não | `runtime` | sim | Janela de cache da avaliação de componentes do /readyz, para que um polling agressivo do load balancer não vire gerador de carga em DB/Redis. O ESTADO do lifecycle nunca é cacheado: o drain derruba o /readyz para 503 na requisição seguinte. |
+| `READINESS_PROBE_TIMEOUT_MS` | number | `1500` | não | `runtime` | sim | Timeout por componente nas probes de readiness. Componente que não responde a tempo é reportado como `unknown` — o que é fail-closed para um componente obrigatório do papel. |
+| `READINESS_SCHEMA_CHECK` | string | `true` | não | `runtime` | sim | Exige que a migration mais nova em disco esteja aplicada em schema_migrations antes de anunciar readiness. A readiness NUNCA aplica migration — só recusa servir num schema para o qual o código não foi construído. Desligue apenas onde código e schema são publicados fora de banda de propósito; isso é política explícita, não fallback silencioso. |
+| `READINESS_BACKLOG_MAX` | number | `0` | não | `runtime` | sim | Shedding de capacidade opcional: reporta NÃO-pronto quando a fila do agente tem mais de N jobs esperando. Default 0 = DESLIGADO, deliberadamente — um limiar mal escolhido drena a frota inteira durante um pico legítimo e transforma backlog em outage. Ligue por ambiente depois de conhecer o formato normal do backlog. |
+| `READINESS_REQUIRE_WHATSAPP_LIVE` | string | `false` | não | `runtime` | sim | Readiness estrita de WhatsApp. Default false: uma sessão JÁ estabelecida que está reconectando reporta `degraded` e a instância PERMANECE em rotação, porque queda de socket Baileys é rotina e travar nisso faz a readiness flapar. Ligue onde capacidade de canal e capacidade de API precisam ser o mesmo sinal. Não afeta o cold start: antes do primeiro `open` a instância nunca fica pronta, com a flag ligada ou não. |
 
 ### Bootstrap / setup
 

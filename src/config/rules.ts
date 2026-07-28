@@ -571,6 +571,76 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
   // [P2] da rodada 1 da PR #522). Roda por ÚLTIMO e pula o que uma regra
   // específica (com a mensagem de boot legada) já reportou.
   // -------------------------------------------------------------------
+  // -------------------------------------------------------------------
+  // Lifecycle do processo (issue #512): readiness role-aware e drain real.
+  // -------------------------------------------------------------------
+
+  const graceMs = num(c.SHUTDOWN_GRACE_MS);
+  const stepMs = num(c.SHUTDOWN_STEP_TIMEOUT_MS);
+  if (graceMs !== undefined && stepMs !== undefined && stepMs > graceMs) {
+    push({
+      scope: 'contract',
+      severity: 'error',
+      variable: 'SHUTDOWN_STEP_TIMEOUT_MS',
+      rule: 'lifecycle/step-timeout-exceeds-grace',
+      message:
+        `SHUTDOWN_STEP_TIMEOUT_MS=${stepMs} é maior que SHUTDOWN_GRACE_MS=${graceMs}: o teto por passo nunca dispara, ` +
+        'então um único componente travado consome o orçamento inteiro do drain e os passos seguintes (fechar sockets, filas e pools) são pulados por deadline.',
+      remediation:
+        'Deixe SHUTDOWN_STEP_TIMEOUT_MS <= SHUTDOWN_GRACE_MS — na prática uma fração dele, para sobrar orçamento para os demais passos.',
+    });
+  }
+
+  const cacheMs = num(c.READINESS_CACHE_MS);
+  const probeMs = num(c.READINESS_PROBE_TIMEOUT_MS);
+  if (cacheMs !== undefined && probeMs !== undefined && cacheMs > 0 && probeMs > cacheMs) {
+    push({
+      scope: 'contract',
+      severity: 'warning',
+      variable: 'READINESS_PROBE_TIMEOUT_MS',
+      rule: 'lifecycle/probe-timeout-exceeds-cache',
+      message:
+        `READINESS_PROBE_TIMEOUT_MS=${probeMs} é maior que READINESS_CACHE_MS=${cacheMs}: com uma dependência lenta cada requisição do load balancer volta a fazer I/O real, ` +
+        'e o cache deixa de proteger DB/Redis exatamente durante o incidente em que ele mais importa.',
+      remediation:
+        'Mantenha READINESS_PROBE_TIMEOUT_MS <= READINESS_CACHE_MS, ou aumente a janela de cache.',
+    });
+  }
+
+  // A checagem de schema é um gate fail-closed: desligá-la é política
+  // explícita e legítima (deploy de código e schema fora de banda), mas fora
+  // de development o operador precisa ver que ela está desligada.
+  if (profile !== 'development' && c.READINESS_SCHEMA_CHECK === false) {
+    push({
+      scope: 'contract',
+      severity: 'warning',
+      variable: 'READINESS_SCHEMA_CHECK',
+      rule: 'lifecycle/schema-check-disabled',
+      message:
+        'READINESS_SCHEMA_CHECK=false: a instância vai anunciar readiness mesmo com migration pendente, e falhará na primeira query que tocar uma coluna nova.',
+      remediation:
+        'Deixe READINESS_SCHEMA_CHECK=true, a menos que código e schema sejam publicados fora de banda de propósito neste ambiente.',
+    });
+  }
+
+  // A separação de topologia (#513) ainda não foi entregue: o contrato de
+  // papéis existe e o boot já ramifica por `roleOwns`, mas só `all` roda em
+  // produção hoje. Avisar é honesto — bloquear impediria o rollout da #513.
+  const processRole = str(c.MAIA_PROCESS_ROLE);
+  if (processRole !== undefined && processRole !== 'all') {
+    push({
+      scope: 'contract',
+      severity: 'warning',
+      variable: 'MAIA_PROCESS_ROLE',
+      rule: 'lifecycle/process-role-not-default',
+      message:
+        `MAIA_PROCESS_ROLE=${processRole}: este processo vai iniciar APENAS os componentes desse papel, e o /readyz vai exigir apenas os que ele requer. ` +
+        'A separação de topologia (issue #513) ainda não foi entregue — garanta que os demais papéis estão rodando em outros processos, ou a plataforma fica sem worker/scheduler/sessão.',
+      remediation:
+        'Use MAIA_PROCESS_ROLE=all (modo de processo único) até a topologia estar separada, ou confirme o conjunto completo de papéis no deployment.',
+    });
+  }
+
   const alreadyCovered = new Set(out.flatMap((f) => f.covers ?? []));
   for (const spec of view.entries ?? CONTRACT_ENTRIES) {
     if (!spec.requiredWhen || alreadyCovered.has(spec.name)) continue;

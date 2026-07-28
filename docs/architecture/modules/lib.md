@@ -15,11 +15,11 @@
 | `src/lib/tts.ts` | OpenAI TTS (outbound voice notes) |
 | `src/lib/vision.ts` | Claude Vision (boleto / receipt parsing) |
 | `src/lib/embeddings.ts` | Embedding generation for vector memory |
-| `src/lib/redis.ts` | ioredis client + helpers |
+| `src/lib/redis.ts` | ioredis client + helpers. `ensureRedisConnect()` is **fail-closed** since #512: it throws `RedisUnavailableError` instead of logging a warning and letting the boot continue without a mandatory dependency |
 | `src/lib/logger.ts` | Pino structured logger |
 | `src/lib/metrics.ts` | `incCounter`, `observeHistogram`, `setGauge` + Prometheus registry |
 | `src/lib/alerts.ts` | Email + Telegram alert channels |
-| `src/lib/healthcheck.ts` | Liveness/readiness probes |
+| `src/lib/healthcheck.ts` | Component probes (`checkDb`/`checkRedis`/`checkWhatsApp`/`checkAll`) + the #297 Redis-memory readiness gate. **Read-only** since #512: `recordHealthSnapshot()` is called by the `health_monitor` cron, never by an endpoint, and `toPublicHealthReport()` strips raw driver text at the HTTP edge. The composite, role-aware `/readyz` lives in `src/runtime/lifecycle/readiness.ts` |
 | `src/lib/decimal.ts` | `decimal.js` wrapper — `toDecimal()`, `fmtBRL()` |
 | `src/lib/brazilian.ts` | Brazilian formatting (CPF, CNPJ, currency, dates) |
 | `src/lib/business-days.ts` | Business-day arithmetic |

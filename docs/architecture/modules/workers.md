@@ -8,7 +8,28 @@
 
 | File | Role |
 |---|---|
-| `src/workers/index.ts` | Worker registry and startup orchestration |
+| `src/workers/index.ts` | Worker registry, startup orchestration and the cron **drain** (`stopWorkers`) |
+
+### Cron drain and overlap (issue #512)
+
+`startWorkers()` wraps every tick in a guard (`runTick`) that:
+
+- **refuses new ticks once the drain started** — no side effect begins after `draining`;
+- **skips a job whose previous run is still active** (`maia_worker_tick_skipped_total{worker,reason="overlap"}`). Every long-running job here is already single-flight via a DB lease, so skipping beats racing;
+- tracks the in-flight promise so `stopWorkers(deadlineMs)` can **await** it.
+
+`stopWorkers()` is `async` and returns `{ drained, pending }`. `pending` is the
+honest list of jobs still executing when the deadline expired — it is logged
+(`worker.drain_deadline_exceeded`) and surfaces in the shutdown outcome. Before
+#512 it was a synchronous `task.stop()` loop, so `gracefulShutdown()` closed
+the Redis/Postgres pools underneath a running cron.
+
+Per-worker gauges: `maia_worker_active_jobs{worker}`,
+`maia_worker_last_success_timestamp{worker}`,
+`maia_worker_last_failure_timestamp{worker}`.
+
+`health_monitor` also owns the **persistence** of the health timeline
+(`recordHealthSnapshot`) since #512 — `/health` itself no longer writes.
 
 ### Worker categories
 
