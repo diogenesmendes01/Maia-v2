@@ -16,11 +16,11 @@ import { dirname, relative, resolve } from 'node:path';
 import { MAIA_PROFILES, type MaiaProfile } from '@/config/metadata.js';
 import {
   buildJsonSchema,
-  parseEnvFile,
   renderConfigDoc,
   renderEnvExample,
   renderFixture,
 } from '@/config/generate.js';
+import { parseEnvFile } from '@/config/env-file.js';
 import { buildServiceManifest } from '@/config/services.js';
 import { formatHuman, formatJson, validateConfig } from '@/config/validate.js';
 import { isMaiaProfile } from '@/config/profiles.js';

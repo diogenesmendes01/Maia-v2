@@ -450,31 +450,14 @@ export function renderFixture(profile: MaiaProfile): string {
 }
 
 // ---------------------------------------------------------------------------
-// .env parsing (shared by the CLI and by the parity tests)
+// .env parsing
 // ---------------------------------------------------------------------------
 
 /**
- * Minimal `.env` parser — deliberately NOT `dotenv`, because dotenv mutates
- * `process.env` and the validator must stay pure. Handles `KEY=value`,
- * `export KEY=value`, `#` comments and single/double quotes.
+ * Re-exported for convenience. The implementation lives in
+ * `src/config/env-file.ts` and delegates to `dotenv.parse`, so the CLI, the
+ * validator and the runtime boot share ONE interpretation of a `.env` file.
+ * A hand-rolled parser used to live here and diverged from dotenv on inline
+ * comments, quoting and multi-line values (PR #522 review round 1).
  */
-export function parseEnvFile(content: string): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const line of content.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (trimmed === '' || trimmed.startsWith('#')) continue;
-    const withoutExport = trimmed.startsWith('export ') ? trimmed.slice(7).trim() : trimmed;
-    const eq = withoutExport.indexOf('=');
-    if (eq <= 0) continue;
-    const key = withoutExport.slice(0, eq).trim();
-    let value = withoutExport.slice(eq + 1).trim();
-    if (
-      (value.startsWith('"') && value.endsWith('"') && value.length >= 2) ||
-      (value.startsWith("'") && value.endsWith("'") && value.length >= 2)
-    ) {
-      value = value.slice(1, -1);
-    }
-    out[key] = value;
-  }
-  return out;
-}
+export { parseEnvFile } from '@/config/env-file.js';

@@ -17,7 +17,8 @@
 | `src/config/services.ts` | Minimum configuration per service; `manifestForService`, `assertServiceMayRead` |
 | `src/config/load.ts` | `loadServiceConfig()` + `ConfigValidationError` + `bootSummary()` |
 | `src/config/migration-config.ts` · `admin-config.ts` · `backup-config.ts` | Named loaders for the migration runner (#516), the Admin UI and backup/restore |
-| `src/config/generate.ts` | Deterministic generators for every artifact + a pure `.env` parser |
+| `src/config/generate.ts` | Deterministic generators for every artifact |
+| `src/config/env-file.ts` | `parseEnvFile()` — delegates to `dotenv.parse`, the same parser the boot uses, so CLI and runtime cannot disagree about a `.env` line |
 | `src/config/env.ts` | **Thin** boot loader: `dotenv/config` + the runtime schema from the contract; exports the `config` singleton |
 | `src/config/feature-flags.ts` | Runtime feature-flag overrides / kill switches on top of the env defaults |
 | `src/config/generated/` | Generated artifacts (JSON Schema, service manifest, per-profile fixtures) |
@@ -84,6 +85,7 @@ npm run config:init -- --profile development
 | `tests/unit/config/generated-artifacts.spec.ts` | Golden tests for every generated artifact |
 | `tests/unit/config/parity.spec.ts` | Compose/Dockerfile ↔ contract parity; Node/npm version parity |
 | `tests/unit/config/no-direct-env-reads.spec.ts` | The `process.env` allow-list is exact and the ESLint rule is live |
+| `tests/unit/config/env-file.spec.ts` | `parseEnvFile` ↔ `dotenv.parse` parity (inline comments, quoting, escapes, multi-line) |
 
 ## In-flight changes
 

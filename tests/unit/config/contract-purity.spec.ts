@@ -35,15 +35,22 @@ const PURE_ENTRYPOINTS = [
   'src/config/validate.ts',
   'src/config/services.ts',
   'src/config/generate.ts',
+  'src/config/env-file.ts',
   'src/setup/auth-dir-path.ts',
 ];
 
 /**
  * Modules whose mere import has side effects (or that drag in I/O). Reaching
  * any of these from a pure entrypoint is the regression.
+ *
+ * NOTE on `dotenv`: the bare module is a pure library — `dotenv.parse(src)` is
+ * string → object. It is `dotenv/config` (and calling `dotenv.config()`) that
+ * reads the filesystem and mutates `process.env`. `src/config/env-file.ts`
+ * deliberately uses `dotenv.parse` so the validator and the runtime boot share
+ * ONE interpretation of a `.env` file (PR #522 review round 1); the dedicated
+ * tests below pin the side-effecting entry points as forbidden.
  */
 const FORBIDDEN_SPECIFIERS = [
-  'dotenv',
   'dotenv/config',
   'pg',
   'ioredis',
@@ -102,6 +109,11 @@ interface GraphNode {
   readonly external: string[];
 }
 
+/** Drop comments so a docstring naming a forbidden API is not a violation. */
+function stripComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+}
+
 /** Transitive local import graph starting at `entry`. */
 function walk(entry: string): { visited: Set<string>; nodes: GraphNode[] } {
   const visited = new Set<string>();
@@ -146,6 +158,31 @@ describe('config contract — import purity (#515)', () => {
       );
     });
   }
+
+  it('only src/config/env-file.ts may import dotenv, and never its config entry', () => {
+    for (const entry of PURE_ENTRYPOINTS) {
+      const { nodes } = walk(entry);
+      for (const node of nodes) {
+        const usesDotenv = node.external.some((s) => s === 'dotenv' || s.startsWith('dotenv/'));
+        if (!usesDotenv) continue;
+        expect(
+          node.file,
+          'dotenv belongs behind the single wrapper in src/config/env-file.ts',
+        ).toBe('src/config/env-file.ts');
+        expect(
+          node.external.filter((s) => s.startsWith('dotenv/')),
+          'dotenv/config reads the filesystem and mutates process.env',
+        ).toEqual([]);
+        // `.parse` only — `.config()` / `.configDotenv()` do the I/O. Comments
+        // are stripped first: the wrapper's docstring explains precisely why
+        // `dotenv.config` is off limits, and must not trip its own guard.
+        const source = stripComments(readFileSync(join(REPO_ROOT, node.file), 'utf8'));
+        expect(/dotenv\s*\.\s*config/.test(source), `${node.file} calls dotenv.config`).toBe(
+          false,
+        );
+      }
+    }
+  });
 
   it('src/config/contract.ts imports nothing but zod', () => {
     // The Admin UI bundles this module. A `node:*` import (or anything with a
