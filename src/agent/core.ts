@@ -1208,25 +1208,63 @@ async function runAgentForMensagemInner(
       }
     }
   } catch (err) {
-    // Issue #514 review round 1 [P1]: `MandatoryTraceEnvelopeError` joins the
-    // block set. A required runtime-trace envelope that could not be written
-    // means the turn has no evidence record, so it MUST NOT reach ReAct, tools
-    // or outbound (P10b invariant 12). Falling through to
-    // `wiring_error_continuing` below would do exactly that.
-    if (
-      err instanceof DecisionEngineFailClosedError ||
-      err instanceof MandatoryTraceEnvelopeError
-    ) {
-      if (err instanceof MandatoryTraceEnvelopeError) {
+    // Issue #514 review round 2 [P1]: a MANDATORY runtime-trace envelope that
+    // could not be written is NOT the same class of failure as an engine
+    // crash, and must NOT be handled the same way.
+    //
+    // Round 1 stopped the turn reaching ReAct — that closed the side-effect
+    // hole. But it then took the engine's path: reply to the user, mark the
+    // inbound processed, return. The job COMPLETED, so the turn was silently
+    // lost: no retry, no dead-letter, and a `processada_em` stamp that stops
+    // `runMessageRecovery` from ever picking it up again. A failure to write
+    // authoritative evidence has to PROPAGATE.
+    //
+    // So: audit it (the audit log is the only durable record left — the trace
+    // write is precisely what failed), leave the inbound UNPROCESSED, and
+    // rethrow. BullMQ then retries per the job policy and dead-letters on
+    // exhaustion, which is where the operator alert already fires.
+    //
+    // No user-facing reply here on purpose: a retry may well succeed, and
+    // "Sistema indisponível" followed by a real answer is worse than a
+    // slightly slower answer. If every attempt fails the DLQ alert is the
+    // signal, and the inbound stays recoverable.
+    //
+    // #503 hand-off: once the durable turn state machine lands, this is where
+    // the turn should be marked `retryable` / `dead_letter` through its facade
+    // instead of relying on BullMQ's job state alone. The required BEHAVIOUR
+    // is the same either way — the job fails — so adopting the facade is a
+    // mechanical change at merge time, not a redesign.
+    if (err instanceof MandatoryTraceEnvelopeError) {
+      logger.error(
+        {
+          err: err.cause_error,
+          tenant_id: err.tenant_id,
+          side_effect_level: err.side_effect_level,
+          mensagem_id: inbound.id,
+        },
+        'agent.runtime_trace.mandatory_envelope_failed_failing_job',
+      );
+      await audit({
+        acao: 'runtime_trace_envelope_blocked_turn',
+        alvo_id: inbound.id,
+        metadata: {
+          side_effect_level: err.side_effect_level,
+          conversa_id: c.id,
+          // Enumerated/structural only — no message content.
+          reason: 'mandatory_envelope_write_failed',
+        },
+      }).catch((e) =>
         logger.error(
-          {
-            err: err.cause_error,
-            tenant_id: err.tenant_id,
-            side_effect_level: err.side_effect_level,
-          },
-          'agent.runtime_trace.mandatory_envelope_failed_blocking_turn',
-        );
-      }
+          { err: (e as Error).message },
+          'agent.runtime_trace.blocked_turn_audit_failed',
+        ),
+      );
+      // Deliberately NOT marking processed: the row must stay pending so the
+      // recovery sweep can re-enqueue it if the job itself is lost.
+      throw err;
+    }
+
+    if (err instanceof DecisionEngineFailClosedError) {
       // fail-closed: block the turn, reply to user, skip LLM (there is no
       // legacy fallback path anymore)
       const failMsg = 'Sistema indisponível temporariamente. Tente novamente em alguns instantes.';

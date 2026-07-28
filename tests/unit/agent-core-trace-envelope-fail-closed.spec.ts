@@ -192,7 +192,10 @@ describe('issue #514 [P1] — mandatory trace envelope failure blocks the whole 
     sendOutboundDocument.mockReset();
     sendOutboundVoice.mockReset();
     sendPoll.mockReset();
-    audit.mockReset();
+    // `audit()` is awaited-then-`.catch()`ed in core.ts, so the mock must
+    // resolve — a bare `mockReset()` returns undefined and blows up on
+    // `.catch`, masking the error under test.
+    audit.mockReset().mockResolvedValue(undefined);
     createMensagem.mockReset();
     findById.mockReset().mockResolvedValue(PESSOA);
     findMensagem.mockReset().mockResolvedValue({ ...TEXT_INBOUND });
@@ -214,7 +217,7 @@ describe('issue #514 [P1] — mandatory trace envelope failure blocks the whole 
     });
 
     const { runAgentForMensagem } = await import('../../src/agent/core.js');
-    await runAgentForMensagem('in1');
+    await expect(runAgentForMensagem('in1')).rejects.toBeInstanceOf(MandatoryTraceEnvelopeError);
 
     expect(callLLM).not.toHaveBeenCalled();
   });
@@ -230,12 +233,15 @@ describe('issue #514 [P1] — mandatory trace envelope failure blocks the whole 
     });
 
     const { runAgentForMensagem } = await import('../../src/agent/core.js');
-    await runAgentForMensagem('in1');
+    await expect(runAgentForMensagem('in1')).rejects.toThrow();
 
     expect(dispatchTool).not.toHaveBeenCalled();
   });
 
-  it('sends ONLY the fail-closed notice — never a ReAct-produced outbound', async () => {
+  it('sends NO outbound at all — the retry may still answer the user', async () => {
+    // Round 2 [P1]: round 1 replied "Sistema indisponível" and completed the
+    // job. Now the job fails and BullMQ retries, so an apology followed by a
+    // successful retry answer would be worse than a slightly slower answer.
     runDecisionEngineForTurn.mockRejectedValue(
       new MandatoryTraceEnvelopeError(new Error('db down'), 'primary', 'medium'),
     );
@@ -245,24 +251,61 @@ describe('issue #514 [P1] — mandatory trace envelope failure blocks the whole 
     });
 
     const { runAgentForMensagem } = await import('../../src/agent/core.js');
-    await runAgentForMensagem('in1');
+    await expect(runAgentForMensagem('in1')).rejects.toThrow();
 
-    expect(sendOutboundText).toHaveBeenCalledTimes(1);
-    const sentBody = String(sendOutboundText.mock.calls[0]?.[1] ?? '');
-    expect(sentBody).toBe(FAIL_CLOSED_REPLY);
-    expect(sentBody).not.toContain('transferi');
+    expect(sendOutboundText).not.toHaveBeenCalled();
     expect(sendOutboundDocument).not.toHaveBeenCalled();
     expect(sendOutboundVoice).not.toHaveBeenCalled();
     expect(sendPoll).not.toHaveBeenCalled();
   });
 
-  it('closes the turn out (marks processed) instead of leaving it half-run', async () => {
+  it('PROPAGATES so the job fails — no retry/dead-letter is silently skipped', async () => {
+    // The core of round 2 [P1]: the turn must not end as a success.
     runDecisionEngineForTurn.mockRejectedValue(
       new MandatoryTraceEnvelopeError(new Error('db down'), 'primary', 'critical'),
     );
     const { runAgentForMensagem } = await import('../../src/agent/core.js');
-    await runAgentForMensagem('in1');
-    expect(markProcessed).toHaveBeenCalled();
+    await expect(runAgentForMensagem('in1')).rejects.toMatchObject({
+      code: 'MANDATORY_TRACE_ENVELOPE_FAILED',
+    });
+  });
+
+  it('leaves the inbound UNPROCESSED so the recovery sweep can re-enqueue it', async () => {
+    // A `processada_em` stamp would make `runMessageRecovery` skip the row
+    // forever — the exact "turno perdido em silêncio" the review flagged.
+    runDecisionEngineForTurn.mockRejectedValue(
+      new MandatoryTraceEnvelopeError(new Error('db down'), 'primary', 'critical'),
+    );
+    const { runAgentForMensagem } = await import('../../src/agent/core.js');
+    await expect(runAgentForMensagem('in1')).rejects.toThrow();
+    expect(markProcessed).not.toHaveBeenCalled();
+  });
+
+  it('audits the refusal — the audit log is the only durable record left', async () => {
+    // The trace write is what failed, so the trace cannot carry this evidence.
+    runDecisionEngineForTurn.mockRejectedValue(
+      new MandatoryTraceEnvelopeError(new Error('db down'), 'primary', 'high'),
+    );
+    const { runAgentForMensagem } = await import('../../src/agent/core.js');
+    await expect(runAgentForMensagem('in1')).rejects.toThrow();
+
+    const row = audit.mock.calls.map((c) => c[0] as Record<string, unknown>).find(
+      (a) => a.acao === 'runtime_trace_envelope_blocked_turn',
+    );
+    expect(row).toBeDefined();
+    expect(row!.alvo_id).toBe('in1');
+    expect((row!.metadata as Record<string, unknown>).side_effect_level).toBe('high');
+    // No message content in the audit metadata.
+    expect(JSON.stringify(row)).not.toContain('transfere 5000');
+  });
+
+  it('a failing audit write does not mask the original error', async () => {
+    runDecisionEngineForTurn.mockRejectedValue(
+      new MandatoryTraceEnvelopeError(new Error('db down'), 'primary', 'medium'),
+    );
+    audit.mockRejectedValue(new Error('audit table unreachable'));
+    const { runAgentForMensagem } = await import('../../src/agent/core.js');
+    await expect(runAgentForMensagem('in1')).rejects.toBeInstanceOf(MandatoryTraceEnvelopeError);
   });
 
   it('REGRESSION: a plain Error still falls through — proving the block comes from the TYPE', async () => {
