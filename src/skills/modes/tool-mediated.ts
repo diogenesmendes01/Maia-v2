@@ -28,7 +28,7 @@
  *  - Streaming de tool_use (assumimos modo síncrono)
  */
 import { callLLM, type LLMMessage, type ToolSchema } from '@/lib/claude.js';
-import { getToolSchemasByName } from '@/tools/_registry.js';
+import { getToolSchemasByName, describeExposedSchemas } from '@/tools/_registry.js';
 import { logger } from '@/lib/logger.js';
 import { incCounter } from '@/lib/metrics.js';
 import {
@@ -178,6 +178,26 @@ export async function toolMediatedMode(
   // registry and seed SQL; they are always derived from the live registry.
   const visibleNames = allowedTools.filter((t) => !deniedTools.has(t));
   const tools: ToolSchema[] = getToolSchemasByName(visibleNames);
+
+  // Issue #509 — schema identity + budget for THIS skill's exposed set. The
+  // agent hot path records the same digest in its `tool_visibility_resolved`
+  // audit row; this path has no such audit, so the trace lives in the log.
+  // Contract identity only: no schema bodies, no arguments.
+  {
+    const digest = describeExposedSchemas(
+      tools.map((t) => t.name),
+      'skill_tool_mediated',
+    );
+    logger.debug(
+      {
+        skill_id: ctx.skill.id,
+        tool_schema_set_hash: digest.set_hash,
+        tool_schema_bytes: digest.bytes,
+        tools: digest.tools,
+      },
+      'p9a.tool_schemas_resolved',
+    );
+  }
 
   const messages: LLMMessage[] = [{ role: 'user', content: JSON.stringify(ctx.input) }];
   const toolsCalled: string[] = [];
