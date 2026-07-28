@@ -24,6 +24,8 @@ const {
   abortPairingMock,
   triggerRecoveryMock,
   stopLineSessionMock,
+  readinessMock,
+  activateVerifiedMock,
   sealMock,
   qrPngMock,
 } = vi.hoisted(() => ({
@@ -35,8 +37,11 @@ const {
     transition: vi.fn(async () => true),
     failStalePairings: vi.fn(async () => []),
     releaseStaleAborts: vi.fn(async () => []),
+    listVerifiedAwaitingActivation: vi.fn(async () => []),
     expireStaleMaterial: vi.fn(async () => 0),
   },
+  readinessMock: vi.fn(async () => ({ ready: true })),
+  activateVerifiedMock: vi.fn(async () => ({ ok: true })),
   auditMock: vi.fn(async () => undefined),
   auditCalls: [] as Array<{ acao: string; ctx: unknown; metadata: unknown }>,
   startPairingMock: vi.fn(async () => ({ ok: true as const })),
@@ -67,7 +72,15 @@ vi.mock('../../../src/setup/line-pairing.js', () => ({
 vi.mock('../../../src/setup/recovery.js', () => ({ triggerRecovery: triggerRecoveryMock }));
 vi.mock('../../../src/gateway/line-sessions.js', () => ({
   stopLineSession: stopLineSessionMock,
+  _internal: { startLineSession: vi.fn(async () => undefined) },
 }));
+vi.mock('../../../src/setup/line-readiness.js', () => ({
+  evaluateLineReadiness: readinessMock,
+}));
+vi.mock('../../../src/db/repositories/channel-repos.js', () => ({
+  channelsRepo: { activateVerified: activateVerifiedMock },
+}));
+vi.mock('../../../src/config/env.js', () => ({ config: { MAIA_MULTI_LINE: false } }));
 
 import {
   runChannelPairingWorker,
@@ -123,7 +136,10 @@ beforeEach(() => {
   });
   repoMock.failStalePairings.mockResolvedValue([]);
   repoMock.releaseStaleAborts.mockResolvedValue([]);
+  repoMock.listVerifiedAwaitingActivation.mockResolvedValue([]);
   repoMock.renewOwnerLeases.mockResolvedValue(0);
+  readinessMock.mockResolvedValue({ ready: true });
+  activateVerifiedMock.mockResolvedValue({ ok: true });
   repoMock.clearCommand.mockResolvedValue(true);
   repoMock.putPairingMaterial.mockResolvedValue(true);
   repoMock.transition.mockResolvedValue(true);
@@ -405,6 +421,74 @@ describe('restart no meio do pareamento', () => {
     claimOnce(null);
     await runChannelPairingWorker();
     expect(repoMock.expireStaleMaterial).toHaveBeenCalled();
+  });
+});
+
+describe('readiness — a linha verificada só roteia quando estiver pronta (#518 §4)', () => {
+  const AWAITING = {
+    channel_id: CHANNEL_ID,
+    tenant_id: 'tenant-A',
+    agent_id: 'agent-a',
+    external_id: '+5511900001111',
+  };
+
+  it('linha verificada SEM política pronta continua inativa', async () => {
+    repoMock.listVerifiedAwaitingActivation.mockResolvedValue([AWAITING]);
+    readinessMock.mockResolvedValue({ ready: false, reason_code: 'missing_policy' });
+    claimOnce(null);
+
+    await runChannelPairingWorker();
+
+    expect(activateVerifiedMock).not.toHaveBeenCalled();
+    expect(auditCalls.some((c) => c.acao === 'channel_activated')).toBe(false);
+  });
+
+  it('quando a política fica pronta, o backend ATIVA sozinho — sem novo pareamento', async () => {
+    repoMock.listVerifiedAwaitingActivation.mockResolvedValue([AWAITING]);
+    readinessMock.mockResolvedValue({ ready: true });
+    claimOnce(null);
+
+    await runChannelPairingWorker();
+
+    expect(activateVerifiedMock).toHaveBeenCalledWith({
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-a',
+      channel_id: CHANNEL_ID,
+    });
+    const activated = auditCalls.find((c) => c.acao === 'channel_activated');
+    expect(activated?.ctx).toMatchObject({ tenant_id: 'tenant-A', agent_id: 'agent-a' });
+    expect(activated?.metadata).toMatchObject({ trigger: 'readiness_revalidated' });
+  });
+
+  it('linha que pertence a outro workspace falha fechado, não ativa', async () => {
+    repoMock.listVerifiedAwaitingActivation.mockResolvedValue([AWAITING]);
+    activateVerifiedMock.mockResolvedValue({ ok: false, reason: 'line_owned_elsewhere' });
+    claimOnce(null);
+
+    await runChannelPairingWorker();
+
+    expect(repoMock.transition).toHaveBeenCalledWith(
+      expect.objectContaining({ state: 'failed', reason_code: 'line_owned_elsewhere' }),
+    );
+    expect(auditCalls.some((c) => c.acao === 'channel_activated')).toBe(false);
+  });
+
+  it('uma linha problemática não impede a promoção das demais', async () => {
+    repoMock.listVerifiedAwaitingActivation.mockResolvedValue([
+      AWAITING,
+      { ...AWAITING, channel_id: 'outro-canal' },
+    ]);
+    readinessMock
+      .mockRejectedValueOnce(new Error('db blip'))
+      .mockResolvedValue({ ready: true });
+    claimOnce(null);
+
+    await runChannelPairingWorker();
+
+    expect(activateVerifiedMock).toHaveBeenCalledTimes(1);
+    expect(activateVerifiedMock).toHaveBeenCalledWith(
+      expect.objectContaining({ channel_id: 'outro-canal' }),
+    );
   });
 });
 

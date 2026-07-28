@@ -76,7 +76,8 @@ console autenticado — sem shell, sem curl, sem token:
 |---|---|---|
 | `declared` | Número registrado; ninguém provou a posse. Não roteia | **Parear** |
 | `pairing` | Sessão aberta; QR/código na tela | Acompanhar ou **Cancelar** |
-| `verified_offline` | Posse provada; a sessão de roteamento ainda não subiu | Conferir política/papel padrão |
+| `aborting` | Cancelamento pedido; aguardando o runtime confirmar | Aguardar (segundos) |
+| `verified_offline` | Posse provada, mas **não roteia**: falta readiness | Criar a política com papel padrão ativo — o backend ativa sozinho |
 | `connected` | Sessão viva: envia e recebe | — |
 | `recovering` | Queda transitória; o runtime reconecta sozinho | Aguardar |
 | `logged_out` | O WhatsApp encerrou a sessão — a posse acabou | **Re-parear** |
@@ -112,10 +113,28 @@ e audita `pairing_session_expired`. Nunca vira `verified`. O operador clica em
 pareamento falha com `line_mismatch` e o canal NÃO é ativado. Digitar um número
 nunca dá posse.
 
+**Pareou mas não responde?** Provavelmente é o gate de readiness (issue #518
+§4): posse provada **não** é permissão de rotear. Uma linha só é ativada quando
+o backend revalida, deterministicamente, que ela tem política de canal com
+papel padrão **ativo**. Até lá fica `verified_offline` e o audit registra
+`channel_activation_deferred` com o motivo (`missing_policy` ou
+`default_role_inactive`).
+
+Não é preciso re-parear: o worker revalida a cada minuto e emite
+`channel_activated` assim que a política ficar pronta.
+
+```sql
+-- Linhas com posse provada esperando readiness.
+SELECT s.channel_id, s.reason_code, c.external_id, c.active
+  FROM channel_line_state s JOIN channels c ON c.id = s.channel_id
+ WHERE s.state = 'verified_offline' AND c.active = false;
+```
+
 **Audit log relacionado**: `channel_pairing_requested`, `pairing_session_started`,
 `pairing_session_verified`, `pairing_session_failed`, `pairing_session_aborted`,
 `pairing_session_expired`, `line_session_transition`, `channel_disabled`,
-`channel_repair_requested`. Nenhum deles carrega QR, código, token ou auth state.
+`channel_repair_requested`, `channel_activation_deferred`, `channel_activated`.
+Nenhum deles carrega QR, código, token ou auth state.
 
 **Break-glass** (console fora do ar), sem token em query string:
 

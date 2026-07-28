@@ -777,6 +777,40 @@ export const channelLineStateRepo = {
       .returning({ channel_id: channel_line_state.channel_id });
   },
 
+  /**
+   * Linhas com POSSE PROVADA que ainda NÃO roteiam (issue #518 §4).
+   *
+   * O gate de readiness deixa o canal inativo quando a política não está
+   * pronta. Esta consulta alimenta a revalidação periódica: assim que o
+   * operador criar a política, o backend ativa sozinho — sem exigir um novo
+   * pareamento. Cross-tenant pelo mesmo padrão sancionado do boot multi-linha;
+   * a própria row diz a qual (tenant, agent) a linha pertence.
+   */
+  async listVerifiedAwaitingActivation(
+    limit = 50,
+  ): Promise<
+    Array<{ channel_id: string; tenant_id: string; agent_id: string; external_id: string }>
+  > {
+    return db
+      .select({
+        channel_id: channel_line_state.channel_id,
+        tenant_id: channel_line_state.tenant_id,
+        agent_id: channel_line_state.agent_id,
+        external_id: channels.external_id,
+      })
+      .from(channel_line_state)
+      .innerJoin(channels, eq(channels.id, channel_line_state.channel_id))
+      .where(
+        and(
+          eq(channel_line_state.state, 'verified_offline'),
+          eq(channels.active, false),
+          eq(channels.channel_type, 'whatsapp'),
+          eq(channels.is_synthetic, false),
+        ),
+      )
+      .limit(limit);
+  },
+
   /** Sweep barato do material vencido (o estado da tentativa continua). */
   async expireStaleMaterial(): Promise<number> {
     const rows = await db

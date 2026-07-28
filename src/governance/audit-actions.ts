@@ -224,6 +224,14 @@ export const AUDIT_ACTIONS = [
   'pairing_session_expired',
   'channel_disabled',
   'channel_repair_requested',
+  // Issue #518 §4 / review PR #528 — posse provada NÃO é permissão de rotear.
+  //  - channel_activation_deferred: a linha foi VERIFICADA mas o canal segue
+  //    inativo por readiness (sem política, ou papel padrão desativado).
+  //  - channel_activated: o backend revalidou a readiness e ativou o
+  //    roteamento — no fim do pareamento ou depois, quando a política ficou
+  //    pronta.
+  'channel_activation_deferred',
+  'channel_activated',
   'message_update_channel_unresolved',
   // Staging de inbound não-roteado (§1.4, modo strict): staged na chegada sem
   // rota; handed_off quando o replay entrega na pipeline normal (dedup por

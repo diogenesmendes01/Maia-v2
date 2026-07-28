@@ -23,6 +23,7 @@ import {
   getLineSessionManager,
   lineAuthDir,
 } from '@/gateway/line-session-manager.js';
+import { evaluateLineReadiness } from './line-readiness.js';
 
 export type ChannelPairingState = {
   phase: 'idle' | 'pairing' | 'verified' | 'failed';
@@ -235,7 +236,54 @@ export async function startChannelPairing(args: {
         });
         return;
       }
-      // Posse provada — ativa. 23505 do índice global (091) ⇒ a linha já
+      // Issue #518 §4 / review PR #528 (P1) — POSSE PROVADA NÃO É PERMISSÃO
+      // DE ROTEAR.
+      //
+      // A verificação sempre é registrada (a linha é desta workspace, ponto
+      // final), mas a ATIVAÇÃO passa por uma revalidação determinística de
+      // readiness no backend. Sem este gate, parear a linha de um agente sem
+      // política/papel deixava `channels.active = true` e, com
+      // `MAIA_MULTI_LINE`, a sessão de roteamento subia na hora — uma linha
+      // respondendo sem governança configurada.
+      //
+      // Não é um beco sem saída: o worker `channel_pairing` revalida as linhas
+      // `verified_offline` a cada minuto e ativa assim que a política ficar
+      // pronta, sem novo pareamento.
+      const readiness = await evaluateLineReadiness({
+        id: channel.id,
+        tenant_id: channel.tenant_id,
+        agent_id: channel.agent_id,
+      });
+      if (!readiness.ready) {
+        if (stillCurrent()) pairings.set(channel.id, { ...IDLE, phase: 'verified' });
+        hooks.onPhase?.({ phase: 'verified', reason_code: 'awaiting_readiness' });
+        await auditScoped(channel, {
+          acao: 'pairing_session_verified',
+          metadata: {
+            channel_id: channel.id,
+            tenant_id: channel.tenant_id,
+            agent_id: channel.agent_id,
+            line: declared,
+            routing_activated: false,
+            ...actorMetadata(args.actor),
+          },
+        });
+        await auditScoped(channel, {
+          acao: 'channel_activation_deferred',
+          metadata: {
+            channel_id: channel.id,
+            line: declared,
+            reason: readiness.reason_code,
+            ...actorMetadata(args.actor),
+          },
+        });
+        logger.info(
+          { channel_id: channel.id, reason: readiness.reason_code },
+          'pairing_session.verified_awaiting_readiness',
+        );
+        return;
+      }
+      // Readiness ok — ativa. 23505 do índice global (091) ⇒ a linha já
       // está ativa em OUTRO workspace: fail-closed, remove o auth promovido
       // (mantê-lo permitiria subir uma sessão de linha não-autorizada).
       const act = await channelsRepo.activateVerified({
@@ -271,6 +319,16 @@ export async function startChannelPairing(args: {
           tenant_id: channel.tenant_id,
           agent_id: channel.agent_id,
           line: declared,
+          routing_activated: true,
+          ...actorMetadata(args.actor),
+        },
+      });
+      await auditScoped(channel, {
+        acao: 'channel_activated',
+        metadata: {
+          channel_id: channel.id,
+          line: declared,
+          trigger: 'pairing_verified',
           ...actorMetadata(args.actor),
         },
       });

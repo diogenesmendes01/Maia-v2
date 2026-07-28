@@ -97,6 +97,10 @@ const REASONS: Record<string, string> = {
   operator_disabled: 'Desabilitada pelo operador.',
   operator_repair_requested: 'Re-pareamento pedido pelo operador.',
   repair_completed: 'Posse encerrada. Pronta para um novo pareamento.',
+  awaiting_readiness:
+    'Posse provada. A linha só entra em roteamento quando tiver política com papel padrão ativo — o backend ativa sozinho assim que isso acontecer.',
+  missing_policy: 'Falta a política de canal (papel padrão) para esta linha rotear.',
+  default_role_inactive: 'O papel padrão da política está desativado — a linha não roteia.',
   already_active: 'A linha já estava ativa.',
   not_whatsapp: 'Este canal não é uma linha WhatsApp.',
   invalid_line: 'O identificador não é uma linha E.164 válida.',

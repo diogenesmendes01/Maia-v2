@@ -305,9 +305,10 @@ export default function LinePairingModal({
         )}
 
         {state === 'verified_offline' && (
-          <Alert tone="success">
-            Posse provada. A linha ainda não roteia: ela precisa de uma política com papel padrão
-            e da sessão de roteamento no ar.
+          <Alert tone="success" title="Posse provada">
+            A linha ainda NÃO roteia. O backend revalida a prontidão a cada minuto e ativa
+            sozinho assim que houver política com papel padrão ativo — não é preciso parear de
+            novo.
           </Alert>
         )}
 

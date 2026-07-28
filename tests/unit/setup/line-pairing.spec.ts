@@ -12,7 +12,9 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-const { auditMock, auditCalls, channelsRepoMock, managerMock, rmMock } = vi.hoisted(() => ({
+const { auditMock, auditCalls, channelsRepoMock, managerMock, rmMock, readinessMock } = vi.hoisted(
+  () => ({
+  readinessMock: vi.fn(async () => ({ ready: true })),
   auditMock: vi.fn(async () => undefined),
   auditCalls: [] as Array<{
     acao: string;
@@ -27,7 +29,8 @@ const { auditMock, auditCalls, channelsRepoMock, managerMock, rmMock } = vi.hois
     abortPairing: vi.fn(async () => undefined),
   },
   rmMock: vi.fn(async () => undefined),
-}));
+  }),
+);
 
 vi.mock('node:fs/promises', () => ({ rm: rmMock }));
 vi.mock('../../../src/config/env.js', () => ({
@@ -44,6 +47,11 @@ vi.mock('../../../src/db/repositories/channel-repos.js', () => ({
 vi.mock('../../../src/gateway/line-session-manager.js', () => ({
   getLineSessionManager: () => managerMock,
   lineAuthDir: (id: string) => `/tmp/maia-pairing-orch-test/lines/${id}`,
+}));
+// Issue #518 §4 — posse provada não é permissão de rotear; o gate de readiness
+// decide a ativação. Default: pronta (os casos legados esperam ativação).
+vi.mock('../../../src/setup/line-readiness.js', () => ({
+  evaluateLineReadiness: readinessMock,
 }));
 
 import {
@@ -93,6 +101,7 @@ beforeEach(() => {
   });
   channelsRepoMock.getByIdCrossTenant.mockResolvedValue(CHANNEL);
   channelsRepoMock.activateVerified.mockResolvedValue({ ok: true });
+  readinessMock.mockResolvedValue({ ready: true });
   _resetChannelPairingsForTests();
 });
 
@@ -198,6 +207,68 @@ describe('resultado SUPERSEDED não ativa a linha (review PR #528, P1)', () => {
 
     expect(channelsRepoMock.activateVerified).not.toHaveBeenCalled();
     expect(channelPairingStatus(CHANNEL.id).phase).toBe('pairing');
+  });
+});
+
+describe('gate de readiness — posse provada não é permissão de rotear (#518 §4)', () => {
+  it('sem política pronta: VERIFICA a posse mas NÃO ativa o canal', async () => {
+    readinessMock.mockResolvedValue({ ready: false, reason_code: 'missing_policy' });
+    const gate = pendingPairing();
+    managerMock.startPairingSession.mockReturnValue(gate.promise);
+    await startChannelPairing({ channel_id: CHANNEL.id, method: 'qr' });
+
+    gate.resolve({ matched: true, actual_line: CHANNEL.external_id });
+    await flush();
+
+    // Antes do fix, `activateVerified` era incondicional e a linha entrava em
+    // roteamento sem política — o que o critério de aceite proíbe.
+    expect(channelsRepoMock.activateVerified).not.toHaveBeenCalled();
+    expect(channelPairingStatus(CHANNEL.id).phase).toBe('verified');
+
+    const acoes = auditCalls.map((c) => c.acao);
+    expect(acoes).toContain('pairing_session_verified');
+    expect(acoes).toContain('channel_activation_deferred');
+    expect(acoes).not.toContain('channel_activated');
+  });
+
+  it('papel padrão desativado também adia a ativação', async () => {
+    readinessMock.mockResolvedValue({ ready: false, reason_code: 'default_role_inactive' });
+    const gate = pendingPairing();
+    managerMock.startPairingSession.mockReturnValue(gate.promise);
+    await startChannelPairing({ channel_id: CHANNEL.id, method: 'qr' });
+
+    gate.resolve({ matched: true, actual_line: CHANNEL.external_id });
+    await flush();
+
+    expect(channelsRepoMock.activateVerified).not.toHaveBeenCalled();
+    const deferred = auditCalls.find((c) => c.acao === 'channel_activation_deferred');
+    expect(deferred?.ctx).toEqual({ tenant_id: 'tenant-pair', agent_id: 'agent-pair' });
+  });
+
+  it('com readiness ok, ativa e audita channel_activated', async () => {
+    const gate = pendingPairing();
+    managerMock.startPairingSession.mockReturnValue(gate.promise);
+    await startChannelPairing({ channel_id: CHANNEL.id, method: 'qr' });
+
+    gate.resolve({ matched: true, actual_line: CHANNEL.external_id });
+    await flush();
+
+    expect(channelsRepoMock.activateVerified).toHaveBeenCalledTimes(1);
+    expect(auditCalls.map((c) => c.acao)).toContain('channel_activated');
+  });
+
+  it('a readiness é avaliada DEPOIS do guard de posse — tentativa superseded nem consulta', async () => {
+    const gate = pendingPairing();
+    managerMock.startPairingSession.mockReturnValue(gate.promise);
+    await startChannelPairing({ channel_id: CHANNEL.id, method: 'qr' });
+    await abortChannelPairing(CHANNEL.id);
+    readinessMock.mockClear();
+
+    gate.resolve({ matched: true, actual_line: CHANNEL.external_id });
+    await flush();
+
+    expect(readinessMock).not.toHaveBeenCalled();
+    expect(channelsRepoMock.activateVerified).not.toHaveBeenCalled();
   });
 });
 

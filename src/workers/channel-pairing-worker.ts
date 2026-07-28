@@ -20,6 +20,7 @@
  * disso é logado nem auditado.
  */
 import { hostname } from 'node:os';
+import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 import { incCounter } from '@/lib/metrics.js';
 import { audit } from '@/governance/audit.js';
@@ -34,7 +35,9 @@ import {
 } from '@/setup/pairing-material.js';
 import { qrToPngBuffer } from '@/setup/qr-png.js';
 import { startChannelPairing, abortChannelPairing } from '@/setup/line-pairing.js';
+import { evaluateLineReadiness } from '@/setup/line-readiness.js';
 import { triggerRecovery } from '@/setup/recovery.js';
+import { channelsRepo } from '@/db/repositories/channel-repos.js';
 
 /** Máximo de comandos executados por tick — mantém o tick curto e previsível. */
 const MAX_COMMANDS_PER_TICK = 10;
@@ -266,6 +269,82 @@ async function executeStopLine(row: { channel_id: string }): Promise<void> {
 }
 
 /**
+ * Issue #518 §4 / review PR #528 (P1) — revalidação de READINESS.
+ *
+ * Uma linha com posse provada mas sem política pronta fica `verified_offline`
+ * e NÃO roteia. Sem esta varredura o operador teria que re-parear depois de
+ * criar a política, o que é absurdo: a posse já foi provada. Aqui o backend
+ * revalida periodicamente e ativa sozinho quando as condições aparecem.
+ *
+ * Fail-isolated por linha e auditado sob o ALS do dono do canal.
+ */
+async function promoteReadyVerifiedLines(): Promise<void> {
+  const pending = await channelLineStateRepo.listVerifiedAwaitingActivation();
+  for (const line of pending) {
+    try {
+      const readiness = await evaluateLineReadiness({
+        id: line.channel_id,
+        tenant_id: line.tenant_id,
+        agent_id: line.agent_id,
+      });
+      if (!readiness.ready) continue;
+
+      const act = await channelsRepo.activateVerified({
+        tenant_id: line.tenant_id,
+        agent_id: line.agent_id,
+        channel_id: line.channel_id,
+      });
+      if (!act.ok) {
+        // `line_owned_elsewhere` (23505 do índice global) é fail-closed: a
+        // linha pertence a outro workspace, esta não pode ativar.
+        await channelLineStateRepo.transition({
+          channel_id: line.channel_id,
+          state: 'failed',
+          reason_code: act.reason,
+        });
+        continue;
+      }
+
+      await runWithTenantContext(
+        { tenant_id: line.tenant_id, agent_id: line.agent_id },
+        () =>
+          audit({
+            acao: 'channel_activated',
+            metadata: {
+              channel_id: line.channel_id,
+              line: line.external_id,
+              trigger: 'readiness_revalidated',
+            },
+          }),
+      );
+      incCounter('maia_channel_pairing_total', { outcome: 'activated' });
+
+      if (config.MAIA_MULTI_LINE) {
+        const { _internal } = await import('@/gateway/line-sessions.js');
+        await _internal
+          .startLineSession({
+            id: line.channel_id,
+            tenant_id: line.tenant_id,
+            agent_id: line.agent_id,
+            external_id: line.external_id,
+          })
+          .catch((err) =>
+            logger.error(
+              { channel_id: line.channel_id, err: (err as Error).message },
+              'channel_pairing.start_after_readiness_failed',
+            ),
+          );
+      }
+    } catch (err) {
+      logger.error(
+        { channel_id: line.channel_id, err: (err as Error).message },
+        'channel_pairing.readiness_promotion_failed',
+      );
+    }
+  }
+}
+
+/**
  * Restart no meio do pareamento: a PairingSession vivia em memória e morreu.
  * Toda tentativa órfã vira `failed` (retryable) — NUNCA `verified` — e é
  * auditada como `pairing_session_expired` sob o ALS do dono do canal.
@@ -316,6 +395,9 @@ export async function runChannelPairingWorker(): Promise<void> {
 
     if (tickCount % STALE_SWEEP_EVERY_TICKS === 0) {
       await sweepStalePairings();
+      // Mesma cadência de ~1min: a linha verificada entra em roteamento assim
+      // que a política ficar pronta, sem exigir um novo pareamento.
+      await promoteReadyVerifiedLines();
     }
     tickCount += 1;
 

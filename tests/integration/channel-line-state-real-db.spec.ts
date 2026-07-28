@@ -687,6 +687,43 @@ d('channel_line_state — material cifrado e restart', () => {
     expect((await channelLineStateRepo.getStateForScope(scope))?.state).toBe('pairing');
   });
 
+  it('listVerifiedAwaitingActivation só devolve linha VERIFICADA e INATIVA', async () => {
+    const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+    await channelLineStateRepo.upsertTransition({
+      channel_id: channelId,
+      tenant_id: T,
+      agent_id: A,
+      state: 'verified_offline',
+    });
+    // Linha de outro tenant, também verificada e inativa: entra na lista
+    // (a varredura é cross-tenant por contrato), mas com o triplete próprio.
+    await channelLineStateRepo.upsertTransition({
+      channel_id: foreignChannelId,
+      tenant_id: T2,
+      agent_id: A2,
+      state: 'verified_offline',
+    });
+
+    const pending = await channelLineStateRepo.listVerifiedAwaitingActivation();
+    const mine = pending.find((p) => p.channel_id === channelId);
+    expect(mine).toMatchObject({ tenant_id: T, agent_id: A });
+    const foreign = pending.find((p) => p.channel_id === foreignChannelId);
+    expect(foreign).toMatchObject({ tenant_id: T2, agent_id: A2 });
+  });
+
+  it('linha JÁ ativa não aparece como pendente de ativação', async () => {
+    const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+    const activeId = await seedChannel(T, A, `+55117${Date.now() % 100000000}`, true);
+    await channelLineStateRepo.upsertTransition({
+      channel_id: activeId,
+      tenant_id: T,
+      agent_id: A,
+      state: 'verified_offline',
+    });
+    const pending = await channelLineStateRepo.listVerifiedAwaitingActivation();
+    expect(pending.map((p) => p.channel_id)).not.toContain(activeId);
+  });
+
   it('uma linha DESABILITADA não é ressuscitada por callback atrasado da sessão', async () => {
     const { channelLineStateRepo } = await import('../../src/db/repositories.js');
     const scope = { tenant_id: T, agent_id: A, channel_id: channelId };
