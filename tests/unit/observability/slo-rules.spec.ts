@@ -120,6 +120,82 @@ describe('issue #514 — SLO rules ↔ code drift guard', () => {
     expect(clamps.length).toBeGreaterThanOrEqual(ratioRecords.length);
   });
 
+  describe('SLIs count TERMINAL outcomes only [P2]', () => {
+    // `maia_turn_completed_total` is emitted per ATTEMPT. Counting `retryable`
+    // in a denominator makes one turn look like several: two retries then
+    // success rendered as 3 observations / 33% success. Every aggregation over
+    // this counter must therefore either select a specific outcome or filter
+    // to the terminal set.
+    const TERMINAL_FILTER = 'outcome=~"completed|failed"';
+
+    /**
+     * Every `maia_turn_completed_total{...}` selector in EXECUTABLE lines.
+     * YAML `#` comments are stripped first — the rationale block above the
+     * rules names the metric in prose, and that is not a query.
+     */
+    function selectors(): string[] {
+      const code = rules
+        .split('\n')
+        .filter((line) => !/^\s*#/.test(line))
+        .join('\n');
+      return [...code.matchAll(/maia_turn_completed_total(\{[^}]*\})?/g)].map(
+        (m) => m[1] ?? '',
+      );
+    }
+
+    it('no selector aggregates the counter without an outcome filter', () => {
+      const bare = selectors().filter((s) => !s.includes('outcome'));
+      expect(
+        bare,
+        'maia_turn_completed_total used with no outcome filter — retryable attempts ' +
+          'would inflate the denominator',
+      ).toEqual([]);
+    });
+
+    it('every denominator uses the terminal set', () => {
+      // A denominator is the selector inside clamp_min(...).
+      const denominators = [...rules.matchAll(/clamp_min\(([\s\S]*?)\), 1e-9\)/g)]
+        .map((m) => m[1]!)
+        .filter((d) => d.includes('maia_turn_completed_total'));
+      expect(denominators.length).toBeGreaterThanOrEqual(4);
+      for (const d of denominators) {
+        expect(d, `denominator missing the terminal filter: ${d.trim()}`).toContain(
+          TERMINAL_FILTER,
+        );
+      }
+    });
+
+    it('retryable is tracked as its OWN sli, not folded into failures', () => {
+      expect(rules).toContain('maia:turn_retry_ratio:rate5m');
+      expect(rules).toMatch(/maia_turn_completed_total\{outcome="retryable"\}/);
+      // …and never as a numerator of the failure ratio.
+      const failureBlock = rules.slice(
+        rules.indexOf('- record: maia:turn_failure_ratio:rate5m'),
+        rules.indexOf('- record: maia:turn_failure_ratio:rate5m:by_tenant'),
+      );
+      expect(failureBlock).not.toContain('retryable"}[5m]))\n          /');
+    });
+
+    it('burn-rate rules use the same terminal denominator as the SLIs', () => {
+      const burnBlock = rules.slice(rules.indexOf('maia:turn_error_budget_burn:1h'));
+      const burnDenoms = [...burnBlock.matchAll(/clamp_min\(([\s\S]*?)\), 1e-9\)/g)].map(
+        (m) => m[1]!,
+      );
+      expect(burnDenoms.length).toBeGreaterThanOrEqual(2);
+      for (const d of burnDenoms) expect(d).toContain(TERMINAL_FILTER);
+    });
+
+    it('latency percentiles are computed over COMPLETED turns only', () => {
+      // A failed turn never replied (time-to-failure is not latency) and a
+      // retryable attempt is a partial attempt.
+      const buckets = [...rules.matchAll(/maia_turn_e2e_latency_ms_bucket(\{[^}]*\})?/g)].map(
+        (m) => m[1] ?? '',
+      );
+      expect(buckets.length).toBeGreaterThanOrEqual(2);
+      for (const b of buckets) expect(b).toContain('outcome="completed"');
+    });
+  });
+
   it('the runbook documents every alert the rules define', () => {
     const runbook = readFileSync(RUNBOOK_PATH, 'utf8');
     const alerts = [...rules.matchAll(/- alert: (\w+)/g)].map((m) => m[1]!);

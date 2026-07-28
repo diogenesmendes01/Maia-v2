@@ -123,9 +123,24 @@ correspondente. Ver `docs/architecture/concerns/tenant-isolation.md`.
 
 1. Quebre por tenant: `maia:turn_failure_ratio:rate5m:by_tenant`. Um tenant só
    ⇒ dado/config daquele tenant. Todos ⇒ dependência compartilhada.
-2. `outcome="retryable"` alto com `failed` baixo ⇒ transitório, o retry está
-   segurando. `failed` subindo ⇒ retries esgotados, olhe a DLQ.
+2. Olhe `maia:turn_retry_ratio:rate5m` ao lado. Retry alto com `failed` baixo
+   ⇒ transitório, a plataforma está absorvendo. `failed` subindo ⇒ retries
+   esgotados, olhe a DLQ (§4.8).
 3. Cruze com §4.9 (LLM) e §4.10 (dependências).
+
+> **Como o SLI conta (issue #514).** `maia_turn_completed_total` é emitido uma
+> vez por TENTATIVA, com três outcomes: `completed`, `failed` e `retryable`.
+> Os SLIs e o error budget contam **só os terminais** (`completed|failed`),
+> porque `retryable` não é um desfecho — aquele mesmo turno vai ser retentado e
+> depois emite um terminal. Contar tentativa faria um turno com duas retentativas
+> e sucesso final aparecer como 3 observações e 33% de sucesso. O filtro garante
+> exatamente **uma observação terminal por turno**: o worker sempre emite
+> `failed` quando esgota as tentativas (`recordTurnOutcome` em
+> `src/gateway/queue.ts`). Retries não somem — viram
+> `maia:turn_retry_ratio:rate5m`, um sinal próprio.
+>
+> A latência (`maia:turn_e2e_latency_ms:p95/p99`) conta só `completed`: turno
+> que falhou nunca respondeu, e tentativa `retryable` é tentativa PARCIAL.
 
 ### 4.5 `MaiaTurnLatencyP95High` / `MaiaTurnLatencyP99High`
 

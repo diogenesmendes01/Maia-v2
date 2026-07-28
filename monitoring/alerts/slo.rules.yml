@@ -33,17 +33,34 @@ groups:
     interval: 30s
     rules:
       # --- availability: turns reaching a durable terminal state -------------
+      #
+      # TERMINAL OUTCOMES ONLY (issue #514 review round 1 [P2]).
+      #
+      # `maia_turn_completed_total` is emitted once per ATTEMPT, with three
+      # outcomes: `completed`, `failed` and `retryable`. `retryable` is by
+      # definition NOT terminal — that same turn will be retried and will later
+      # emit `completed` or `failed`. Counting it in the denominator made one
+      # turn look like several: two retries followed by success showed up as
+      # 3 observations and a 33% success rate, so a healthy service with normal
+      # transient retries appeared to be burning error budget.
+      #
+      # Filtering to `completed|failed` yields EXACTLY ONE observation per
+      # turn, because the worker emits `failed` when the attempts are exhausted
+      # (`recordTurnOutcome` in `src/gateway/queue.ts`) — no turn can end
+      # without a terminal outcome.
+      #
+      # Retries are not lost information; they get their own SLI below.
       - record: maia:turn_success_ratio:rate5m
         expr: |
           sum(rate(maia_turn_completed_total{outcome="completed"}[5m]))
           /
-          clamp_min(sum(rate(maia_turn_completed_total[5m])), 1e-9)
+          clamp_min(sum(rate(maia_turn_completed_total{outcome=~"completed|failed"}[5m])), 1e-9)
 
       - record: maia:turn_failure_ratio:rate5m
         expr: |
           sum(rate(maia_turn_completed_total{outcome="failed"}[5m]))
           /
-          clamp_min(sum(rate(maia_turn_completed_total[5m])), 1e-9)
+          clamp_min(sum(rate(maia_turn_completed_total{outcome=~"completed|failed"}[5m])), 1e-9)
 
       # Per-tenant view — the whole point of the tenant labels (AGENTS.md §4.1):
       # one noisy tenant must be distinguishable from a platform-wide outage.
@@ -51,21 +68,41 @@ groups:
         expr: |
           sum by (tenant_id, agent_id) (rate(maia_turn_completed_total{outcome="failed"}[5m]))
           /
-          clamp_min(sum by (tenant_id, agent_id) (rate(maia_turn_completed_total[5m])), 1e-9)
+          clamp_min(
+            sum by (tenant_id, agent_id) (
+              rate(maia_turn_completed_total{outcome=~"completed|failed"}[5m])
+            ),
+            1e-9
+          )
+
+      # Retries per terminal turn. A SEPARATE signal, deliberately: retries
+      # rising while the failure ratio stays flat means the platform is
+      # absorbing transient faults (worth investigating, not worth paging).
+      - record: maia:turn_retry_ratio:rate5m
+        expr: |
+          sum(rate(maia_turn_completed_total{outcome="retryable"}[5m]))
+          /
+          clamp_min(sum(rate(maia_turn_completed_total{outcome=~"completed|failed"}[5m])), 1e-9)
 
       # --- latency: measured from the PERSISTED inbound timestamp -----------
+      #
+      # `outcome="completed"` only. A failed turn never sent a response, so
+      # including it would measure time-to-failure, and a `retryable` attempt
+      # is a PARTIAL attempt whose duration is not a user-visible latency at
+      # all — averaging those in makes the percentile meaningless in both
+      # directions.
       - record: maia:turn_e2e_latency_ms:p95
         expr: |
           histogram_quantile(
             0.95,
-            sum by (le) (rate(maia_turn_e2e_latency_ms_bucket[5m]))
+            sum by (le) (rate(maia_turn_e2e_latency_ms_bucket{outcome="completed"}[5m]))
           )
 
       - record: maia:turn_e2e_latency_ms:p99
         expr: |
           histogram_quantile(
             0.99,
-            sum by (le) (rate(maia_turn_e2e_latency_ms_bucket[5m]))
+            sum by (le) (rate(maia_turn_e2e_latency_ms_bucket{outcome="completed"}[5m]))
           )
 
       # --- queue ------------------------------------------------------------
@@ -340,12 +377,14 @@ groups:
   - name: maia_slo_burn_rate
     interval: 1m
     rules:
+      # Same terminal-outcome filter as the SLIs above — otherwise a burst of
+      # transient retries burns budget that was never actually spent.
       - record: maia:turn_error_budget_burn:1h
         expr: |
           (
             sum(rate(maia_turn_completed_total{outcome="failed"}[1h]))
             /
-            clamp_min(sum(rate(maia_turn_completed_total[1h])), 1e-9)
+            clamp_min(sum(rate(maia_turn_completed_total{outcome=~"completed|failed"}[1h])), 1e-9)
           ) / 0.001
 
       - record: maia:turn_error_budget_burn:6h
@@ -353,7 +392,7 @@ groups:
           (
             sum(rate(maia_turn_completed_total{outcome="failed"}[6h]))
             /
-            clamp_min(sum(rate(maia_turn_completed_total[6h])), 1e-9)
+            clamp_min(sum(rate(maia_turn_completed_total{outcome=~"completed|failed"}[6h])), 1e-9)
           ) / 0.001
 
       - alert: MaiaErrorBudgetFastBurn
