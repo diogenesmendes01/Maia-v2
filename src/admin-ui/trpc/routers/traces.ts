@@ -6,21 +6,41 @@
  *   - getTrace               — get redacted body + PEP decisions inline
  *   - requestFullSnapshot    — create a TTL-bounded debug_snapshot_grant
  *
- * runtime_trace_bodies depends on P10b. For now, traces return [].
+ * Issue #514 §7: `listTraces`/`getTrace` were stubs returning `[]`/`null`
+ * because P10b's tables did not exist when this router was written. They do
+ * now, so both are wired to `runtimeTraceRepo`
+ * (`src/db/repositories/runtime-trace-repos.ts`).
+ *
+ * Boundaries preserved:
+ *   - `resolveTenantId()` + the existing RBAC are untouched; the repo ALSO
+ *     scopes every query by tenant, so isolation does not depend on this layer
+ *     alone.
+ *   - The body returned here is the REDACTED one the body writer persisted.
+ *     Un-redacted access stays behind the existing `debug_snapshot_grant`
+ *     flow — this issue does not widen that permission.
+ *   - Pagination is cursor/keyset based; there is no OFFSET and no COUNT.
  *
  * Post-Codex-review #101: tenantId derived from authenticated session.
  */
 import { z } from 'zod';
+import { TRPCError } from '@trpc/server';
 import { router, protectedProcedure } from '../server.js';
 import { resolveTenantId } from '../tenant-resolver.js';
 
 const ListTracesSchema = z.object({
   tenantId: z.string().optional(),
   agentId: z.string().optional(),
-  conversaId: z.string().optional(),
+  conversaId: z.string().uuid().optional(),
   fromDate: z.date().optional(),
   toDate: z.date().optional(),
+  /** Envelope outcome filter. Enumerated — mirrors the P10b `Decision` type. */
+  decision: z.enum(['allow', 'deny', 'soft_block', 'escalate', 'observe']).optional(),
+  /** Only traces whose side effect actually touched the world. */
+  sideEffectOnly: z.boolean().optional(),
+  /** Surfaces bodies still pending or gone orphaned. */
+  bodyStatus: z.enum(['pending', 'persisted', 'orphaned']).optional(),
   limit: z.number().int().min(1).max(200).default(50),
+  cursor: z.string().nullish(),
 });
 
 const GetTraceSchema = z.object({
@@ -40,35 +60,110 @@ export const tracesRouter = router({
   listTraces: protectedProcedure
     .input(ListTracesSchema)
     .query(async ({ input, ctx }) => {
-      const _tenantId = resolveTenantId(ctx, input.tenantId);
-      // P10b runtime_trace + runtime_trace_bodies repo wired here once available.
-      return { items: [] as Array<{
-        id: string;
-        conversa_id: string | null;
-        agent_id: string;
-        tenant_id: string;
-        started_at: Date;
-        duration_ms: number | null;
-        outcome: string | null;
-      }> };
+      const tenantId = resolveTenantId(ctx, input.tenantId);
+      const page = await ctx.repos.runtimeTraceRepo.list({
+        tenantId,
+        agentId: input.agentId,
+        conversaId: input.conversaId,
+        fromDate: input.fromDate,
+        toDate: input.toDate,
+        decision: input.decision,
+        sideEffectOnly: input.sideEffectOnly,
+        bodyStatus: input.bodyStatus,
+        limit: input.limit,
+        cursor: input.cursor,
+      });
+
+      return {
+        items: page.items.map((t) => ({
+          // `id` kept as the display key for the existing pages; `trace_id` is
+          // the canonical name and both point at the same UUID.
+          id: t.trace_id,
+          trace_id: t.trace_id,
+          tenant_id: t.tenant_id,
+          agent_id: t.agent_id,
+          conversa_id: t.conversa_id,
+          turno_id: t.turno_id,
+          started_at: t.created_at,
+          decision: t.decision,
+          side_effect_level: t.side_effect_level,
+          body_status: t.body_status,
+          body_persisted_at: t.body_persisted_at,
+          /**
+           * The envelope records the DECISION, not a span duration — P10b has
+           * no end timestamp, so a "duration" column here would be invented.
+           * Kept as an explicit null rather than dropped so the existing table
+           * column renders "—" instead of breaking. Real per-stage durations
+           * arrive with the operational/OTLP spans (issue #514, still open).
+           */
+          duration_ms: null as number | null,
+          outcome: t.decision,
+        })),
+        hasMore: page.hasMore,
+        nextCursor: page.nextCursor,
+      };
     }),
 
   getTrace: protectedProcedure
     .input(GetTraceSchema)
     .query(async ({ input, ctx }) => {
       const tenantId = resolveTenantId(ctx, input.tenantId);
-      // Redaction policy from P10 applied here; for now return null body.
-      // If user has an active debug_snapshot_grant, return un-redacted body.
+
+      const trace = await ctx.repos.runtimeTraceRepo.get({
+        tenantId,
+        traceId: input.traceId,
+      });
+      if (!trace) {
+        // NOT_FOUND, never FORBIDDEN: a "forbidden" answer for another
+        // tenant's trace would confirm the id exists — an existence oracle is
+        // itself a cross-tenant leak.
+        throw new TRPCError({ code: 'NOT_FOUND', message: 'Trace não encontrado' });
+      }
+
+      // Un-redacted access remains behind the governed grant flow.
       const grant = await ctx.repos.debugSnapshotGrantsRepo.findActive({
         tenantId,
         userId: ctx.userId,
         traceId: input.traceId,
       });
+
+      const packet = (trace.redacted_packet ?? null) as Record<string, unknown> | null;
+      const hooks = Array.isArray(packet?.policy_hooks)
+        ? (packet.policy_hooks as Array<Record<string, unknown>>)
+        : [];
+
       return {
-        trace_id: input.traceId,
-        redacted_packet: null as unknown,
-        pep_decisions: [] as Array<{ id: string; decision: string; reason: string; at: Date }>,
-        policy_refs: [] as string[],
+        trace_id: trace.trace_id,
+        tenant_id: trace.tenant_id,
+        agent_id: trace.agent_id,
+        conversa_id: trace.conversa_id,
+        turno_id: trace.turno_id,
+        started_at: trace.created_at,
+        decision: trace.decision,
+        side_effect_level: trace.side_effect_level,
+        redaction_class: trace.redaction_class,
+        redaction_applied: trace.redaction_applied,
+        // Integrity surface — the operator can see the trace is signed and
+        // with which key version, without the signature being actionable.
+        hmac_key_version: trace.hmac_key_version,
+        envelope_signed: trace.envelope_hmac.length > 0,
+        // Body lifecycle — makes "pending" and "orphaned" visible instead of
+        // looking like an empty trace.
+        body_status: trace.body_status,
+        body_persisted_at: trace.body_persisted_at,
+        body_available: trace.body_available,
+        body_encrypted: trace.encrypted,
+        redacted_packet: trace.redacted_packet,
+        // PEP decisions come from the redacted body's `policy_hooks`, which the
+        // redaction allowlist restricts to hook/outcome/error_code/duration —
+        // never the operator's free-text reason.
+        pep_decisions: hooks.map((h, i) => ({
+          id: `${trace.trace_id}:${i}`,
+          decision: String(h.outcome ?? h.effect ?? 'unknown'),
+          reason: String(h.error_code ?? ''),
+          at: trace.created_at,
+        })),
+        policy_refs: trace.policy_id ? [trace.policy_id] : [],
         full_snapshot_available: grant !== null,
       };
     }),

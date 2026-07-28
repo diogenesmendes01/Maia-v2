@@ -90,6 +90,70 @@ export default function TraceDetailPage({
       />
 
       <div className="space-y-4">
+        {/* Issue #514 §7 — envelope summary: integrity + body lifecycle.
+            A "pending" or "orphaned" body must be legible as such, otherwise
+            an incomplete trace reads as a trace where nothing happened. */}
+        <Card>
+          <CardHeader
+            title="Envelope"
+            description="Registro durável e assinado da decisão deste turno."
+          />
+          <CardBody>
+            <dl className="grid grid-cols-2 gap-x-6 gap-y-3 text-sm sm:grid-cols-3">
+              <Meta label="Agente" value={trace.agent_id} />
+              <Meta label="Decisão" value={trace.decision} />
+              <Meta label="Nível de efeito" value={trace.side_effect_level} />
+              <Meta label="Classe de redação" value={trace.redaction_class} />
+              <Meta
+                label="Início"
+                value={new Date(trace.started_at).toLocaleString('pt-BR')}
+              />
+              <Meta
+                label="Conversa"
+                value={trace.conversa_id ? trace.conversa_id.slice(0, 8) : '—'}
+              />
+              <Meta
+                label="Integridade"
+                value={
+                  trace.envelope_signed
+                    ? `HMAC v${trace.hmac_key_version}`
+                    : 'NÃO ASSINADO'
+                }
+              />
+              <Meta
+                label="Corpo"
+                value={
+                  trace.body_status === 'persisted'
+                    ? 'persistido'
+                    : trace.body_status === 'orphaned'
+                      ? 'ÓRFÃO (evidência perdida)'
+                      : 'pendente'
+                }
+              />
+              <Meta
+                label="Persistido em"
+                value={
+                  trace.body_persisted_at
+                    ? new Date(trace.body_persisted_at).toLocaleString('pt-BR')
+                    : '—'
+                }
+              />
+            </dl>
+            {trace.body_status === 'orphaned' && (
+              <Alert tone="danger">
+                O corpo deste trace nunca foi persistido e passou da janela de
+                recuperação. Ver docs/runbooks/p10b-runtime-trace.md.
+              </Alert>
+            )}
+            {trace.body_encrypted && (
+              <Alert tone="warning">
+                Corpo cifrado (classe debug). O conteúdo só é acessível pelo
+                fluxo governado de snapshot.
+              </Alert>
+            )}
+          </CardBody>
+        </Card>
+
         <Card>
           <CardHeader
             title="Decisões PEP"
@@ -123,7 +187,10 @@ export default function TraceDetailPage({
           <CardBody>
             <pre className="scroll-thin overflow-x-auto rounded-lg bg-zinc-950 p-4 text-xs text-zinc-100">
               {JSON.stringify(
-                trace.redacted_packet ?? { note: 'Corpo ainda não populado' },
+                trace.redacted_packet ??
+                  (trace.body_available
+                    ? { note: 'Corpo cifrado — use o fluxo de snapshot' }
+                    : { note: 'Corpo ainda não persistido', body_status: trace.body_status }),
                 null,
                 2,
               )}
@@ -142,6 +209,16 @@ export default function TraceDetailPage({
           }}
         />
       )}
+    </div>
+  );
+}
+
+/** Small definition-list cell used by the envelope summary. */
+function Meta({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <dt className="text-xs font-medium uppercase tracking-wide text-zinc-500">{label}</dt>
+      <dd className="mt-0.5 font-mono text-xs text-zinc-800">{value}</dd>
     </div>
   );
 }
