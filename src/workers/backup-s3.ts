@@ -1,7 +1,13 @@
 import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import { basename } from 'node:path';
-import { S3Client, PutObjectCommand, ListObjectsV2Command, DeleteObjectsCommand } from '@aws-sdk/client-s3';
+import {
+  S3Client,
+  PutObjectCommand,
+  ListObjectsV2Command,
+  DeleteObjectsCommand,
+  HeadObjectCommand,
+} from '@aws-sdk/client-s3';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 
@@ -63,6 +69,68 @@ export async function uploadBackup(localPath: string): Promise<string> {
   );
   const endpoint = config.BACKUP_S3_ENDPOINT ?? 's3.amazonaws.com';
   return `${endpoint.replace(/\/$/, '')}/${config.BACKUP_S3_BUCKET}/${key}`;
+}
+
+/**
+ * Issue #520 §4/§6 — upload with integrity metadata, and read it back.
+ *
+ * `uploadBackup` above returns a URL and carries no integrity information, so
+ * the caller could only ever prove "PutObject did not throw". These two helpers
+ * are what let the runner prove the object AT THE DESTINATION matches the bytes
+ * it hashed locally:
+ *
+ *  - `uploadBackupObject` stamps the hex SHA-256 into user metadata. Object
+ *    metadata is supported by every S3-compatible provider (AWS, B2, R2,
+ *    Wasabi); a multipart ETag is NOT a content hash and is deliberately not
+ *    used as a substitute (issue §3).
+ *  - `headBackupObject` reads size + that metadata back for verification.
+ *
+ * Provider-side controls the application cannot set portably — SSE-KMS key
+ * policy, bucket versioning, object lock — remain the operator's bucket
+ * configuration (issue §6). The artifact itself is already encrypted
+ * client-side before it reaches this module, so a provider that ignores SSE
+ * still never receives plaintext.
+ */
+export async function uploadBackupObject(
+  localPath: string,
+  sha256Hex: string,
+): Promise<{ bucket: string; key: string }> {
+  if (!config.BACKUP_S3_BUCKET) {
+    throw new Error('BACKUP_S3_BUCKET not set');
+  }
+  const stats = await stat(localPath);
+  const key = `${config.BACKUP_S3_PREFIX}/${basename(localPath)}`;
+  await getS3Client().send(
+    new PutObjectCommand({
+      Bucket: config.BACKUP_S3_BUCKET,
+      Key: key,
+      Body: createReadStream(localPath),
+      ContentLength: stats.size,
+      ContentType: 'application/octet-stream',
+      Metadata: { 'maia-sha256': sha256Hex },
+    }),
+  );
+  return { bucket: config.BACKUP_S3_BUCKET, key };
+}
+
+/** Read size + integrity metadata back from the destination. `null` when absent. */
+export async function headBackupObject(
+  key: string,
+): Promise<{ bytes: number | null; sha256: string | null } | null> {
+  if (!config.BACKUP_S3_BUCKET) return null;
+  try {
+    const res = await getS3Client().send(
+      new HeadObjectCommand({ Bucket: config.BACKUP_S3_BUCKET, Key: key }),
+    );
+    return {
+      bytes: res.ContentLength ?? null,
+      sha256: res.Metadata?.['maia-sha256'] ?? null,
+    };
+  } catch {
+    // A missing/unreadable object is a verification FAILURE, not an exception
+    // the caller must special-case — it returns null and the run degrades/fails.
+    return null;
+  }
 }
 
 /**
