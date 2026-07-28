@@ -81,7 +81,7 @@ import {
   handleLLMSettingsInvalidation,
   publishLLMSettingsInvalidation,
 } from '@/lib/llm/cache-invalidation.js';
-import { runWithTenantContext } from '@/db/tenant-context.js';
+import { runWithTenantContext, runWithSystemContext } from '@/db/tenant-context.js';
 
 function okReply() {
   return {
@@ -194,12 +194,34 @@ describe('orçamento diário por tenant+agent', () => {
     expect(counterCalls('maia_llm_budget_check_failures_total').length).toBe(1);
   });
 
-  it('sem contexto de ALS não há quota per-tenant a avaliar (worker global segue)', async () => {
+  /**
+   * Este teste substitui um que FIXAVA o bug: ele afirmava que "sem contexto
+   * de ALS o worker global segue", ou seja, congelava o fail-open como
+   * contrato. Perder o contexto era um bypass da cota — e um teste verde
+   * defendendo isso é pior que nenhum teste.
+   */
+  it('sem contexto de ALS a chamada é REJEITADA antes de qualquer I/O', async () => {
     readDailyUsdMock.mockResolvedValue(999);
+    await expect(executeLLM(REQ)).rejects.toMatchObject({ kind: 'missing_tenant_context' });
+    expect(anthropicCreateMock).not.toHaveBeenCalled();
+    expect(getSettingsMock).not.toHaveBeenCalled();
+  });
+
+  it('trabalho global roda sob runWithSystemContext e tem quota própria', async () => {
+    readDailyUsdMock.mockResolvedValue(0);
     anthropicCreateMock.mockResolvedValueOnce(okReply());
-    await executeLLM(REQ);
+    await runWithSystemContext(() => executeLLM(REQ));
     expect(anthropicCreateMock).toHaveBeenCalledTimes(1);
-    expect(readDailyUsdMock).not.toHaveBeenCalled();
+    // A quota do tenant reservado `system` é avaliada como a de qualquer outro.
+    expect(readDailyUsdMock).toHaveBeenCalled();
+  });
+
+  it('o tenant reservado `system` também estoura quota — não é isento', async () => {
+    readDailyUsdMock.mockResolvedValue(50);
+    await expect(runWithSystemContext(() => executeLLM(REQ))).rejects.toMatchObject({
+      kind: 'budget_exhausted',
+    });
+    expect(anthropicCreateMock).not.toHaveBeenCalled();
   });
 });
 

@@ -22,7 +22,14 @@ export type LLMErrorKind =
   | 'aborted'
   | 'response_invalid'
   | 'budget_exhausted'
-  | 'configuration';
+  | 'configuration'
+  /**
+   * Fail-closed de isolamento: a chamada chegou ao gateway sem
+   * `tenant_id + agent_id` no ALS. Kind próprio (e não `configuration`) para
+   * que o operador distinga "faltou chave" de "faltou contexto de tenant" —
+   * o segundo é bug de call site e tem remediação diferente.
+   */
+  | 'missing_tenant_context';
 
 /**
  * Só erros TRANSITÓRIOS são retentáveis. `aborted` e `timeout` ficam de fora

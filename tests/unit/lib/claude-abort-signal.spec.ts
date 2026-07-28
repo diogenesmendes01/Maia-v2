@@ -112,6 +112,16 @@ function makeAbortError() {
   return err;
 }
 
+/**
+ * Issue #508 (review rodada 1): o gateway exige `tenant_id + agent_id` no ALS
+ * — uma chamada de LLM sempre gasta dinheiro de algum tenant. Estes testes
+ * cobrem cancelamento, não isolamento, então rodam sob um escopo fixo.
+ */
+async function withScope<T>(fn: () => Promise<T>): Promise<T> {
+  const { runWithTenantContext } = await import('@/db/tenant-context.js');
+  return runWithTenantContext({ tenant_id: 'acme', agent_id: 'ana' }, fn);
+}
+
 describe('callLLM — Anthropic SDK abort wiring (PR #221, item 3)', () => {
   beforeEach(() => {
     anthropicCreateMock.mockReset();
@@ -140,11 +150,13 @@ describe('callLLM — Anthropic SDK abort wiring (PR #221, item 3)', () => {
     anthropicCreateMock.mockResolvedValueOnce(happyAnthropicResponse());
 
     const controller = new AbortController();
-    await callLLM({
-      system: 'sys',
-      messages: [{ role: 'user', content: 'hi' }],
-      signal: controller.signal,
-    });
+    await withScope(() =>
+      callLLM({
+        system: 'sys',
+        messages: [{ role: 'user', content: 'hi' }],
+        signal: controller.signal,
+      }),
+    );
 
     expect(anthropicCreateMock).toHaveBeenCalledTimes(1);
     // RequestOptions is the second positional arg.
@@ -180,11 +192,13 @@ describe('callLLM — Anthropic SDK abort wiring (PR #221, item 3)', () => {
 
     const controller = new AbortController();
     await expect(
-      callLLM({
-        system: 'sys',
-        messages: [{ role: 'user', content: 'hi' }],
-        signal: controller.signal,
-      }),
+      withScope(() =>
+        callLLM({
+          system: 'sys',
+          messages: [{ role: 'user', content: 'hi' }],
+          signal: controller.signal,
+        }),
+      ),
     ).rejects.toMatchObject({ name: 'AbortError' });
 
     // Critical assertion: AbortError must NOT trigger the retry loop.
@@ -200,11 +214,13 @@ describe('callLLM — Anthropic SDK abort wiring (PR #221, item 3)', () => {
     anthropicCreateMock.mockRejectedValueOnce(new Error('500: upstream'));
 
     const controller = new AbortController();
-    const promise = callLLM({
-      system: 'sys',
-      messages: [{ role: 'user', content: 'hi' }],
-      signal: controller.signal,
-    });
+    const promise = withScope(() =>
+      callLLM({
+        system: 'sys',
+        messages: [{ role: 'user', content: 'hi' }],
+        signal: controller.signal,
+      }),
+    );
 
     // Let the first attempt run + reject, then enter the back-off sleep.
     // The first back-off is 2000ms; the test would hang for the full delay
@@ -243,11 +259,13 @@ describe('callLLM — Anthropic SDK abort wiring (PR #221, item 3)', () => {
         throw makeAbortError();
       });
 
-    const err = await callLLM({
-      system: 'sys',
-      messages: [{ role: 'user', content: 'hi' }],
-      signal: controller.signal,
-    }).catch((e) => e);
+    const err = await withScope(() =>
+      callLLM({
+        system: 'sys',
+        messages: [{ role: 'user', content: 'hi' }],
+        signal: controller.signal,
+      }),
+    ).catch((e) => e);
 
     // The abort error has name 'AbortError'. lastErr would have message
     // starting with '500:'. Item 2 ensures abort wins.
@@ -300,11 +318,13 @@ describe('callLLM — OpenRouter (OpenAI SDK) abort wiring (PR #221, item 3)', (
     openaiCreateMock.mockResolvedValueOnce(happyOpenAIResponse());
 
     const controller = new AbortController();
-    await callLLM({
-      system: 'sys',
-      messages: [{ role: 'user', content: 'hi' }],
-      signal: controller.signal,
-    });
+    await withScope(() =>
+      callLLM({
+        system: 'sys',
+        messages: [{ role: 'user', content: 'hi' }],
+        signal: controller.signal,
+      }),
+    );
 
     expect(openaiCreateMock).toHaveBeenCalledTimes(1);
     const requestOptions = openaiCreateMock.mock.calls[0]?.[1];
@@ -318,11 +338,13 @@ describe('callLLM — OpenRouter (OpenAI SDK) abort wiring (PR #221, item 3)', (
 
     const controller = new AbortController();
     await expect(
-      callLLM({
-        system: 'sys',
-        messages: [{ role: 'user', content: 'hi' }],
-        signal: controller.signal,
-      }),
+      withScope(() =>
+        callLLM({
+          system: 'sys',
+          messages: [{ role: 'user', content: 'hi' }],
+          signal: controller.signal,
+        }),
+      ),
     ).rejects.toMatchObject({ name: 'AbortError' });
 
     expect(openaiCreateMock).toHaveBeenCalledTimes(1);

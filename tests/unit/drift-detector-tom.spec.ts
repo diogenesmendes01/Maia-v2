@@ -25,7 +25,13 @@ vi.mock('@anthropic-ai/sdk', () => {
   return { default: Anthropic };
 });
 
-import { tomDetector } from '@/cognition/drift/tom.js';
+import { tomDetector as rawTomDetector } from '@/cognition/drift/tom.js';
+import { scopedDetector } from '../helpers/llm-scope.js';
+
+// Issue #508: o gateway exige contexto de tenant. Em produção o fan-out em
+// `src/cognition/drift/index.ts` já abre esse contexto; aqui o wrapper faz o
+// mesmo, em vez de exercitar um caminho sem ALS que a produção não tem.
+const tomDetector = scopedDetector(rawTomDetector);
 
 function makeAnthropicReply(jsonObj: Record<string, unknown>): {
   content: Array<{ type: 'text'; text: string }>;

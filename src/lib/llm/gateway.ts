@@ -134,10 +134,52 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
     });
   }
 
-  // (2) Fail-closed de configuração: sem a chave do provider ATIVO não há
+  const provider = getProvider();
+
+  // (2) Fail-closed de ISOLAMENTO. Uma chamada de LLM é sempre atribuível: ela
+  // gasta dinheiro do tenant, consome a quota dele e produz evidência que
+  // precisa ser correlacionada com ele. Sem `tenant_id + agent_id` no ALS não
+  // há quota a reservar, não há custo a atribuir e não há métrica a rotular —
+  // então a chamada não acontece.
+  //
+  // Antes desta correção o gateway seguia com `scope=null` e o orçamento
+  // simplesmente não era avaliado: bastava perder o contexto para escapar da
+  // cota. Contexto ausente-por-omissão não é um modo de operação válido.
+  //
+  // Trabalho genuinamente global (backup, GC, sondas) já tem endereço
+  // explícito e tipado: `runWithSystemContext()` em `src/db/tenant-context.ts`,
+  // que abre o contexto reservado `system`/`system`. É opt-in declarado, não
+  // ausência.
+  if (!scope) {
+    const err = new LLMGatewayError({
+      kind: 'missing_tenant_context',
+      detail:
+        'LLM call requires tenant_id + agent_id in the ALS — wrap the caller in ' +
+        'runWithTenantContext(), or runWithSystemContext() for genuinely global work',
+      provider: provider.name,
+      workload: req.workload,
+    });
+    await emitUsage(
+      {
+        workload: req.workload,
+        tier,
+        provider: provider.name,
+        model: 'unresolved',
+        status: 'error',
+        attempts: 0,
+        duration_ms: Date.now() - startedAt,
+        error_kind: 'missing_tenant_context',
+        pessoa_id: req.pessoa_id,
+        trace_id: ctx.trace_id,
+      },
+      scope,
+    );
+    throw err;
+  }
+
+  // (3) Fail-closed de configuração: sem a chave do provider ATIVO não há
   // chamada. Isto é o que faz `LLM_PROVIDER=openrouter` deixar de exigir
   // ANTHROPIC_API_KEY nos módulos migrados.
-  const provider = getProvider();
   if (!provider.isConfigured()) {
     const err = new LLMGatewayError({
       kind: 'configuration',
@@ -163,7 +205,7 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
     throw err;
   }
 
-  // (3) Orçamento por tenant+agent ANTES de qualquer I/O de provider — o ponto
+  // (4) Orçamento por tenant+agent ANTES de qualquer I/O de provider — o ponto
   // de uma quota é não gastar. Rejeita com `budget_exhausted` (não retentável).
   try {
     await assertWithinBudget({ scope, workload: req.workload });
@@ -190,7 +232,7 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
     throw err;
   }
 
-  // (4) Uma leitura de settings resolve primário E fallback.
+  // (5) Uma leitura de settings resolve primário E fallback.
   const { primary, fast } = await resolveModelPair(tier);
 
   const link = linkSignal(ctx.signal, ctx.deadline_at);

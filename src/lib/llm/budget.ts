@@ -15,10 +15,12 @@
  *  - Orçamento EXCEDIDO → rejeita com `budget_exhausted` (não retentável).
  *    Este é o caminho fail-closed: gastar é o efeito colateral, e efeito
  *    colateral sem orçamento não acontece.
- *  - SEM contexto de ALS → não há orçamento a avaliar (orçamentos são
- *    per-tenant). A chamada segue e o gap é contado em
- *    `maia_llm_scope_missing_total` pela telemetria. Bloquear aqui derrubaria
- *    workers globais legítimos que rodam sob `system`.
+ *  - SEM contexto de ALS → a chamada nem chega aqui: o gateway a rejeita com
+ *    `missing_tenant_context` antes de qualquer I/O de provider. A versão
+ *    anterior deste módulo aceitava `scope=null` e retornava sem avaliar nada,
+ *    o que transformava "perder o contexto" num bypass da cota. Trabalho
+ *    genuinamente global declara `runWithSystemContext()` e passa a ter quota
+ *    própria sob o tenant reservado `system`.
  *  - Leitura do ledger FALHOU → fail-OPEN com counter
  *    (`maia_llm_budget_check_failures_total`). Custo é controle financeiro,
  *    não de segurança: derrubar todo o tráfego de um tenant por um hiccup de
@@ -63,13 +65,17 @@ export function isBudgetEnabled(): boolean {
  * ponto de uma quota é não gastar, então ela precisa vir primeiro.
  */
 export async function assertWithinBudget(args: {
-  scope: { tenant_id: string; agent_id: string } | null;
+  /**
+   * Não-nulo por tipo. O gateway já rejeita a chamada sem contexto de ALS
+   * (`missing_tenant_context`) antes de chegar aqui — antes, este módulo
+   * aceitava `null` e simplesmente NÃO avaliava a quota, o que fazia de
+   * "perder o contexto" um jeito de escapar do orçamento.
+   */
+  scope: { tenant_id: string; agent_id: string };
   workload: LLMWorkload;
 }): Promise<void> {
   const budget = dailyBudgetUsd();
   if (budget <= 0) return;
-  // Sem escopo não há quota per-tenant a avaliar — ver nota de postura acima.
-  if (!args.scope) return;
 
   const key = cacheKey(args.scope);
   const cached = spendCache.get(key);

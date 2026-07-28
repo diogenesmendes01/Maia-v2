@@ -77,12 +77,24 @@ vi.mock('@/config/env.js', async () => {
   };
 });
 
-import { executeLLM } from '@/lib/llm/gateway.js';
+import { executeLLM as executeLLMRaw } from '@/lib/llm/gateway.js';
 import { invalidateModelCache } from '@/lib/llm/model-resolver.js';
 import { LLMGatewayError, parseRetryAfterMs, redactErrorText } from '@/lib/llm/errors.js';
 import { workloadPolicy } from '@/lib/llm/workloads.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
-import type { LLMGatewayRequest } from '@/lib/llm/types.js';
+import type { LLMGatewayRequest, LLMResponse } from '@/lib/llm/types.js';
+
+const DEFAULT_SCOPE = { tenant_id: 'acme', agent_id: 'ana' };
+
+/**
+ * Toda chamada ao gateway exige `tenant_id + agent_id` no ALS — é fail-closed
+ * de isolamento, não conveniência. Este helper injeta o escopo default para
+ * que cada teste não repita o wrapper; os testes que exercitam a AUSÊNCIA de
+ * contexto (ou um escopo específico) usam `executeLLMRaw` de propósito.
+ */
+function executeLLM(r: LLMGatewayRequest): Promise<LLMResponse> {
+  return runWithTenantContext(DEFAULT_SCOPE, () => executeLLMRaw(r));
+}
 
 const MAIN_MODEL = 'settings-main';
 const FAST_MODEL = 'settings-fast';
@@ -194,8 +206,8 @@ describe('executeLLM — cache de settings', () => {
 
   it('escopos de tenant/agent distintos não compartilham entrada de cache', async () => {
     anthropicCreateMock.mockResolvedValue(okReply());
-    await runWithTenantContext({ tenant_id: 't1', agent_id: 'a1' }, () => executeLLM(req()));
-    await runWithTenantContext({ tenant_id: 't2', agent_id: 'a2' }, () => executeLLM(req()));
+    await runWithTenantContext({ tenant_id: 't1', agent_id: 'a1' }, () => executeLLMRaw(req()));
+    await runWithTenantContext({ tenant_id: 't2', agent_id: 'a2' }, () => executeLLMRaw(req()));
     expect(getSettingsMock).toHaveBeenCalledTimes(2);
   });
 
@@ -385,13 +397,22 @@ describe('executeLLM — telemetria e custo', () => {
     expect(counterCalls('maia_llm_requests_total')[0]?.status).toBe('rate_limit');
   });
 
-  it('sem contexto de ALS a chamada é contada SEM labels de tenant e o gap é sinalizado', async () => {
+  /**
+   * Substitui um teste que registrava a chamada sem labels de tenant e seguia
+   * em frente — ou seja, tratava contexto ausente como modo de operação. Uma
+   * chamada de LLM sempre gasta dinheiro de ALGUÉM; se não dá para dizer de
+   * quem, ela não acontece.
+   */
+  it('sem contexto de ALS a chamada é rejeitada e o gap é sinalizado', async () => {
     anthropicCreateMock.mockResolvedValueOnce(okReply());
-    await executeLLM(req());
+    await expect(executeLLMRaw(req())).rejects.toMatchObject({
+      kind: 'missing_tenant_context',
+      retryable: false,
+    });
+    expect(anthropicCreateMock).not.toHaveBeenCalled();
     const labels = counterCalls('maia_llm_requests_total')[0] ?? {};
+    // Sem labels inventados — e nunca o literal 'default'.
     expect(labels.tenant_id).toBeUndefined();
-    expect(labels.agent_id).toBeUndefined();
-    // Nunca o literal 'default'.
     expect(Object.values(labels)).not.toContain('default');
     expect(counterCalls('maia_llm_scope_missing_total').length).toBe(1);
   });
