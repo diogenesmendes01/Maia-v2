@@ -65,6 +65,70 @@ sudo systemctl start maia
 
 ---
 
+## 1b. Linhas ADICIONAIS: parear, cancelar, re-parear (Admin, issue #518)
+
+A linha primária continua no `/setup`. Toda linha **adicional** é operada pelo
+console autenticado — sem shell, sem curl, sem token:
+
+**Console → Setup → Canais.** Cada linha mostra:
+
+| Estado | Significado | Próxima ação |
+|---|---|---|
+| `declared` | Número registrado; ninguém provou a posse. Não roteia | **Parear** |
+| `pairing` | Sessão aberta; QR/código na tela | Acompanhar ou **Cancelar** |
+| `verified_offline` | Posse provada; a sessão de roteamento ainda não subiu | Conferir política/papel padrão |
+| `connected` | Sessão viva: envia e recebe | — |
+| `recovering` | Queda transitória; o runtime reconecta sozinho | Aguardar |
+| `logged_out` | O WhatsApp encerrou a sessão — a posse acabou | **Re-parear** |
+| `failed` | Última tentativa não completou (mismatch, TTL, restart) | **Repetir** |
+| `disabled` | Desligada pelo operador | **Parear** quando quiser religar |
+
+**Pré-requisito de deploy**: `MAIA_STAGING_KEYRING` + `MAIA_STAGING_ACTIVE_KEY_ID`
+configurados no runtime **e** no console. O QR/código só trafegam cifrados; sem
+keyring a tela mostra os estados mas o botão de parear fica desabilitado com a
+explicação.
+
+**Como funciona por baixo** (útil quando algo trava): o console NÃO fala com o
+Baileys. Ele grava um comando em `channel_line_state` com o ator administrativo;
+o worker `channel_pairing` (a cada 5s, no processo do runtime) reivindica,
+executa e devolve o estado.
+
+```sql
+-- Comando pendente que ninguém reivindicou ⇒ o worker do runtime está parado.
+SELECT channel_id, command, command_requested_at, command_claimed_at, owner_instance
+  FROM channel_line_state WHERE command IS NOT NULL;
+
+-- Tentativas presas em pairing (o sweep de 1min deveria zerar isto).
+SELECT channel_id, state, reason_code, pairing_expires_at
+  FROM channel_line_state WHERE state = 'pairing';
+```
+
+**Restart durante o pareamento**: a sessão vivia em memória e morreu junto. O
+worker marca a tentativa como `failed` com `reason_code = interrupted_retryable`
+e audita `pairing_session_expired`. Nunca vira `verified`. O operador clica em
+"Repetir pareamento".
+
+**Mismatch de número**: se o WhatsApp que leu o QR não for a linha declarada, o
+pareamento falha com `line_mismatch` e o canal NÃO é ativado. Digitar um número
+nunca dá posse.
+
+**Audit log relacionado**: `channel_pairing_requested`, `pairing_session_started`,
+`pairing_session_verified`, `pairing_session_failed`, `pairing_session_aborted`,
+`pairing_session_expired`, `line_session_transition`, `channel_disabled`,
+`channel_repair_requested`. Nenhum deles carrega QR, código, token ou auth state.
+
+**Break-glass** (console fora do ar), sem token em query string:
+
+```bash
+TOKEN=$(ssh maia 'cat .baileys-auth/control/setup-token.txt')
+curl -s -X POST -H "x-maia-setup-token: $TOKEN" -H 'content-type: application/json' \
+  -d '{"method":"qr"}' https://maia.SEU-DOMINIO.com/setup/channels/<CHANNEL_ID>/pair
+curl -s -H "x-maia-setup-token: $TOKEN" \
+  https://maia.SEU-DOMINIO.com/setup/channels/<CHANNEL_ID>/pair/status
+```
+
+---
+
 ## 2. WhatsApp rate-limit (banimento temporário do número Maia)
 
 **Sinal**: erros `too many requests` ou `connection refused` repetidos do socket Baileys, mensagens não saem.

@@ -91,6 +91,16 @@ function makeCtx(role: string, opts: LineOpts = {}) {
           return { rowCount: opts.deactivateRowCount ?? 1 };
         },
       },
+      rolesRepo: {
+        async listActive() {
+          return [{ id: 'role-1', role_key: 'atendente' }];
+        },
+      },
+      channelPoliciesRepo: {
+        async getByChannelId(id: string) {
+          return id === CHANNEL_ID ? null : { id: 'pol-1', default_role_id: 'role-1' };
+        },
+      },
       channelLineStateRepo: {
         async listLinesForScope() {
           return [
@@ -240,6 +250,17 @@ describe('listagem — canal inativo permanece visível', () => {
     expect(res.lines.map((l) => l.state)).toEqual(['declared', 'connected']);
     expect(res.lines.some((l) => l.active === false)).toBe(true);
     expect(res.pairing_available).toBe(true);
+  });
+
+  it('a política do canal vem na MESMA resposta — inclusive para o canal inativo', async () => {
+    const { ctx } = makeCtx('owner');
+    const res = await caller(ctx).list({ agentId: 'agent-a' });
+    const declared = res.lines.find((l) => l.channel_id === CHANNEL_ID)!;
+    const connected = res.lines.find((l) => l.channel_id === OTHER_CHANNEL_ID)!;
+    expect(declared.has_policy).toBe(false);
+    expect(declared.policy_ready).toBe(false);
+    expect(connected.policy_ready).toBe(true);
+    expect(connected.default_role_key).toBe('atendente');
   });
 
   it('sem keyring a listagem CONTINUA funcionando, sinalizando indisponibilidade', async () => {

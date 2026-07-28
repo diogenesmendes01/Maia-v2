@@ -8,7 +8,8 @@
 
 | Path | Role |
 |---|---|
-| `src/admin-ui/trpc/routers/` | 19 tRPC routers (governance surface) |
+| `src/admin-ui/trpc/routers/` | 20 tRPC routers (governance surface) |
+| `src/admin-ui/trpc/rate-limit.ts` | Janela fixa em memória para procedures caras/perigosas (issue #518) |
 | `src/admin-ui/app/` | Next.js App Router pages (pt-BR, agent-first IA) |
 | `src/admin-ui/components/ui/` | Design-system primitives (Button, Card, Field, Table, Modal, …) |
 | `src/admin-ui/components/layout/` | App shell: dark sidebar + nav config (`nav.ts` is the IA source of truth) |
@@ -26,6 +27,7 @@ The "new agent → answers on a channel" journey closes entirely in the UI:
 - **Go-live checklist** on the agent overview: profile active → channel registered → role+policy ready, each linking to the screen that resolves it; disappears when complete.
 - **Single approval surface** for operational profiles (spec perfil-inbox v4, fase C): profiles are a NATIVE source of the unified proposal engine. `/inbox` lists them with computed risk + exhaustive diff and decides via `proposals.approve`/`reject`; the agent's Versões tab calls the SAME endpoint (the version id IS the proposal id), so dual-approval (`high` risk) can collect its second signature on either surface. `/identities` is a read-only cross-agent view linking into the agent (`?tab=` deep-link). The legacy `agents.approveProfile` shim and the bespoke `agents.pendingProfileApprovals` card were removed with the `FEATURE_PROFILE_INBOX_SOURCE` flag.
 - **Progressive disclosure** in the shared profile form: princípios and limites cognitivos are collapsed "avançado" cards with always-visible summaries.
+- **Gestão e pareamento de linhas WhatsApp** (`/setup/channels`, issue #518) — a listagem passou a mostrar canais ATIVOS E INATIVOS com o estado operacional da linha (`declared` → `pairing` → `verified_offline` → `connected` / `recovering` / `logged_out` / `failed` / `disabled`), separado de `channels.active` (que é ROTEAMENTO). O operador pareia por QR ou código, cancela, repete, desabilita e pede re-pareamento sem shell nem curl. O console não fala com o Baileys: ele enfileira comandos em `channel_line_state` (migration 103) com o ATOR administrativo, e o worker `channel_pairing` do runtime executa. O QR/código atravessam o Postgres CIFRADOS (`src/setup/pairing-material.ts`), chegam ao browser como data URI no corpo de uma resposta `no-store`, e nunca aparecem em URL, log ou auditoria — foi o que substituiu o `?token=` do `/setup`.
 - **Capabilities editing** on the agent overview: domain packs + hard denies via `agents.updateCapabilities` (owner/founder; atomic grant+audit via `agentToolGrantsRepo.updateWithAudit`; `mcp.*` packs preserved — managed in `/setup/mcp`). New-tool acquisition stays in the `capability_proposals` flow.
 
 ### tRPC routers
@@ -35,6 +37,7 @@ The "new agent → answers on a channel" journey closes entirely in the UI:
 | `agents` | Agent provisioning, profile version proposals (create/updateProfile), capabilities (view/edit) — profile DECISIONS live in `proposals` |
 | `audit` | Audit log explorer |
 | `capabilities` | Capability proposals + approvals |
+| `channelLines` | Linhas WhatsApp: listagem com estado operacional (ativos + inativos), pareamento QR/código, abort, disable, re-pareamento. owner/founder, rate-limited, auditado com o ator (#518) |
 | `channelPolicies` | Channels + roles creation, channel policy CRUD, channels overview (policy readiness) |
 | `drift` | Drift alert triage |
 | `inbox` | Operator inbox (unified proposal queue) |

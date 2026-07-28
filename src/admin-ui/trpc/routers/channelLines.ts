@@ -81,8 +81,37 @@ export const channelLinesRouter = router({
       tenant_id: tenantId,
       agent_id: input.agentId,
     });
+
+    // Política por canal na MESMA resposta (mesmo contrato do
+    // `channelsOverview`, mas cobrindo também os canais inativos, que são
+    // justamente os que precisam de CTA). N é o número de linhas do agente —
+    // uma unidade, não uma listagem paginada.
+    const withPolicy = await runWithTenantContext(
+      { tenant_id: tenantId, agent_id: input.agentId },
+      async () => {
+        const roles = await ctx.repos.rolesRepo.listActive();
+        const roleKeyById = new Map(roles.map((r) => [r.id, r.role_key]));
+        return Promise.all(
+          lines.map(async (line) => {
+            const policy = await ctx.repos.channelPoliciesRepo.getByChannelId(line.channel_id);
+            // `roleKeyById` só tem papéis ATIVOS: uma política cujo papel
+            // padrão foi desativado tem `has_policy` mas NÃO está pronta.
+            const defaultRoleKey = policy
+              ? (roleKeyById.get(policy.default_role_id) ?? null)
+              : null;
+            return {
+              ...line,
+              has_policy: policy !== null,
+              default_role_key: defaultRoleKey,
+              policy_ready: policy !== null && defaultRoleKey !== null,
+            };
+          }),
+        );
+      },
+    );
+
     return {
-      lines,
+      lines: withPolicy,
       /**
        * Sem keyring o pareamento pelo console não pode acontecer (o material
        * só trafega cifrado). A UI mostra o estado mesmo assim e explica o que
