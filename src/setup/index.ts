@@ -9,6 +9,14 @@ import { setupState } from './state.js';
 import { ensureToken, verifyToken } from './token.js';
 import { qrToPngBuffer } from './qr-png.js';
 import {
+  createSetupSession,
+  verifySetupSession,
+  SETUP_SESSION_COOKIE,
+  SETUP_SESSION_TTL_MS,
+  SETUP_TOKEN_HEADER,
+} from './session.js';
+import {
+  renderTokenGate,
   renderChooser,
   renderQr,
   renderCode,
@@ -47,8 +55,36 @@ function newCsrf(): string {
   return randomBytes(16).toString('hex');
 }
 
+function cookieOpts(maxAgeS: number): {
+  path: string;
+  httpOnly: true;
+  sameSite: 'strict';
+  maxAge: number;
+  secure: boolean;
+} {
+  return {
+    path: '/',
+    httpOnly: true,
+    sameSite: 'strict',
+    maxAge: maxAgeS,
+    // Code self-decides per env so prod doesn't need a manual edit.
+    // dev/local stays cleartext-friendly; prod requires HTTPS via nginx.
+    secure: config.NODE_ENV === 'production',
+  };
+}
+
+function setCsrfCookie(reply: FastifyReply): string {
+  const csrf = newCsrf();
+  reply.setCookie(CSRF_COOKIE_NAME, csrf, cookieOpts(CSRF_COOKIE_MAX_AGE_S));
+  return csrf;
+}
+
+function cookies(req: FastifyRequest): Record<string, string | undefined> {
+  return (req.cookies as Record<string, string | undefined> | undefined) ?? {};
+}
+
 async function verifyCsrf(req: FastifyRequest, reply: FastifyReply): Promise<boolean> {
-  const cookieToken = (req.cookies as Record<string, string | undefined> | undefined)?.[CSRF_COOKIE_NAME] ?? '';
+  const cookieToken = cookies(req)[CSRF_COOKIE_NAME] ?? '';
   const body = (req.body ?? {}) as { csrf?: string };
   const presented = typeof body.csrf === 'string' ? body.csrf : '';
   const ok =
@@ -71,25 +107,46 @@ async function verifyCsrf(req: FastifyRequest, reply: FastifyReply): Promise<boo
   return true;
 }
 
+async function auditUnauthorized(req: FastifyRequest, via: string): Promise<void> {
+  await audit({
+    acao: 'setup_unauthorized_access',
+    metadata: {
+      ip: (req.ip ?? 'unknown').slice(0, 64),
+      ua: (req.headers['user-agent'] ?? 'unknown').slice(0, 200),
+      via,
+    },
+  });
+}
+
+/**
+ * Issue #518 — o gate NÃO lê mais `req.query.token`.
+ *
+ * Duas provas de identidade são aceitas, nenhuma delas em URL:
+ *   1. cookie de sessão de operador (`maia_setup_session`), estabelecido pelo
+ *      formulário de `POST /setup/session`;
+ *   2. header `x-maia-setup-token` com o bootstrap token — o caminho
+ *      BREAK-GLASS documentado para curl/automação/runbook.
+ *
+ * Um `?token=` numa URL antiga simplesmente não autentica mais; o operador
+ * cai no portão e cola o token no formulário.
+ */
 async function authGate(req: FastifyRequest, reply: FastifyReply): Promise<boolean> {
-  const presented =
-    typeof (req.query as { token?: string }).token === 'string'
-      ? (req.query as { token: string }).token
-      : '';
-  const actual = await ensureToken();
   applyHeaders(reply);
-  if (!verifyToken(presented, actual)) {
-    await audit({
-      acao: 'setup_unauthorized_access',
-      metadata: {
-        ip: (req.ip ?? 'unknown').slice(0, 64),
-        ua: (req.headers['user-agent'] ?? 'unknown').slice(0, 200),
-      },
-    });
+
+  const headerToken = req.headers[SETUP_TOKEN_HEADER];
+  if (typeof headerToken === 'string' && headerToken.length > 0) {
+    const actual = await ensureToken();
+    if (verifyToken(headerToken, actual)) return true;
+    await auditUnauthorized(req, 'header');
     reply.code(403).type('text/plain').send('forbidden');
     return false;
   }
-  return true;
+
+  if (verifySetupSession(cookies(req)[SETUP_SESSION_COOKIE])) return true;
+
+  await auditUnauthorized(req, 'no_session');
+  reply.code(403).type('text/plain').send('forbidden');
+  return false;
 }
 
 /**
@@ -137,41 +194,70 @@ export async function registerSetupRoutes(app: FastifyInstance): Promise<void> {
     },
   );
 
+  /**
+   * Portão de sessão (#518). O token chega no CORPO — nunca em query string —
+   * e é trocado por um id de sessão opaco em cookie httpOnly. A resposta é um
+   * 303 para `/setup`, uma URL LIMPA: nada de segredo em histórico ou referer.
+   */
+  app.post('/setup/session', async (req, reply) => {
+    applyHeaders(reply);
+    const body = (req.body ?? {}) as { token?: string };
+    const presented = typeof body.token === 'string' ? body.token.trim() : '';
+    const actual = await ensureToken();
+
+    if (!verifyToken(presented, actual)) {
+      await auditUnauthorized(req, 'session_form');
+      const csrf = setCsrfCookie(reply);
+      return reply
+        .code(403)
+        .type('text/html')
+        .send(renderTokenGate(csrf, 'Token inválido. Confira o arquivo e tente de novo.'));
+    }
+
+    reply.setCookie(
+      SETUP_SESSION_COOKIE,
+      createSetupSession(),
+      cookieOpts(Math.floor(SETUP_SESSION_TTL_MS / 1000)),
+    );
+    if (isFormSubmit(req)) {
+      return reply.code(303).header('location', '/setup').send();
+    }
+    return reply.type('application/json').send({ ok: true });
+  });
+
   app.get('/setup', async (req, reply) => {
+    applyHeaders(reply);
+    // Sem sessão o operador recebe o PORTÃO (formulário), não um 403 seco:
+    // é o único ponto da jornada em que o token é digitado, e ele vai no
+    // corpo do POST.
+    const headerToken = req.headers[SETUP_TOKEN_HEADER];
+    const hasHeader = typeof headerToken === 'string' && headerToken.length > 0;
+    if (!hasHeader && !verifySetupSession(cookies(req)[SETUP_SESSION_COOKIE])) {
+      const csrf = setCsrfCookie(reply);
+      return reply.code(401).type('text/html').send(renderTokenGate(csrf));
+    }
     if (!(await authGate(req, reply))) return;
 
-    const token = (req.query as { token: string }).token;
     const phaseObj = setupState.current();
 
     switch (phaseObj.phase) {
       case 'unpaired': {
-        const csrf = newCsrf();
-        reply.setCookie(CSRF_COOKIE_NAME, csrf, {
-          path: '/',
-          httpOnly: true,
-          sameSite: 'strict',
-          maxAge: CSRF_COOKIE_MAX_AGE_S,
-          // Code self-decides per env so prod doesn't need a manual edit.
-          // dev/local stays cleartext-friendly; prod requires HTTPS via nginx.
-          secure: config.NODE_ENV === 'production',
-        });
-        return reply.type('text/html').send(renderChooser(token, csrf));
+        const csrf = setCsrfCookie(reply);
+        return reply.type('text/html').send(renderChooser(csrf));
       }
       case 'pairing_qr':
-        return reply.type('text/html').send(renderQr(token, phaseObj.qr));
+        return reply.type('text/html').send(renderQr(phaseObj.qr));
       case 'pairing_code':
-        return reply.type('text/html').send(
-          renderCode(token, phaseObj.code, phaseObj.expiresAt),
-        );
+        return reply.type('text/html').send(renderCode(phaseObj.code, phaseObj.expiresAt));
       case 'connected':
         return reply
           .code(410)
           .type('text/html')
           .send(renderConnected(phaseObj.connectedAt, !!config.FEATURE_DASHBOARD));
       case 'disconnected_transient':
-        return reply.code(503).type('text/html').send(renderTransientDisconnect(token));
+        return reply.code(503).type('text/html').send(renderTransientDisconnect());
       case 'recovering':
-        return reply.code(503).type('text/html').send(renderRecovering(token));
+        return reply.code(503).type('text/html').send(renderRecovering());
     }
   });
 
@@ -197,13 +283,11 @@ export async function registerSetupRoutes(app: FastifyInstance): Promise<void> {
 
     const body = (req.body ?? {}) as { method?: 'qr' | 'code'; csrf?: string };
     const fromForm = isFormSubmit(req);
-    // Browsers submit the chooser as a plain HTML form, so on success/retry
-    // we redirect them back to /setup with the same token. The page then
-    // reflects the new state (chooser still / QR / code) via the existing
-    // polling JS. JSON callers (programmatic / tests) keep getting JSON.
+    // Browsers submit the chooser as a plain HTML form, so on success/retry we
+    // redirect them back to /setup — agora uma URL LIMPA (#518): a sessão
+    // viaja no cookie, então o redirect não carrega segredo nenhum.
     const redirectToSetup = (): void => {
-      const token = (req.query as { token?: string }).token ?? '';
-      reply.code(303).header('location', `/setup?token=${encodeURIComponent(token)}`).send();
+      reply.code(303).header('location', '/setup').send();
     };
 
     if (body.method !== 'qr' && body.method !== 'code') {
@@ -276,12 +360,13 @@ export async function registerSetupRoutes(app: FastifyInstance): Promise<void> {
   });
 
   // ── §2.5 (spec roteamento v4) — pareamento de LINHAS ADICIONAIS ──────────
-  // Canais whatsapp DECLARADOS (inativos, criados no admin-ui) provam a posse
-  // da linha aqui: POST inicia a PairingSession (QR ou código de 8 dígitos),
-  // GET status entrega qr/código + fase, POST abort encerra. Auth: o mesmo
-  // token de operador do /setup (a autenticação é o token na query — não há
-  // cookie de sessão, então CSRF não se aplica a estes endpoints JSON).
-  // API JSON: o fluxo interativo é consumido pelo admin-ui/curl do operador.
+  //
+  // ⚠️ LEGADO / BREAK-GLASS (issue #518). A jornada normal de pareamento de
+  // linhas adicionais é o Admin UI autenticado (`channelLines.*`), que carrega
+  // o ATOR administrativo até a auditoria e não expõe segredo algum. Estes
+  // endpoints permanecem por um ciclo como caminho de emergência, e já NÃO
+  // aceitam `?token=`: a prova de identidade é o cookie de sessão de operador
+  // ou o header `x-maia-setup-token`.
   const linePairing = await import('./line-pairing.js');
 
   app.post('/setup/channels/:channelId/pair', async (req, reply) => {
@@ -312,9 +397,10 @@ export async function registerSetupRoutes(app: FastifyInstance): Promise<void> {
       if (!(await authGate(req, reply))) return;
       const { channelId } = req.params as { channelId: string };
       const st = linePairing.channelPairingStatus(channelId);
-      // O QR cru é entregue aqui (JSON de operador autenticado) — diferente do
-      // /setup primário, esta superfície não tem página HTML própria; o
-      // consumidor renderiza o QR localmente.
+      // O QR cru é entregue aqui (JSON de operador autenticado por sessão/
+      // header) — esta superfície de break-glass não tem página HTML própria;
+      // o consumidor renderiza o QR localmente. A jornada normal (Admin UI)
+      // entrega o QR já renderizado e cifrado em repouso.
       return reply.type('application/json').send(st);
     },
   );

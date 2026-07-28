@@ -35,7 +35,9 @@
 |---|---|
 | `scripts/setup.ts` | CLI invokes the wizard |
 | `src/gateway/baileys.ts` | Reads `BAILEYS_AUTH_DIR` and setup token |
-| HTTP endpoints in `src/server.ts` | `/setup?token=...` consumes setup-token |
+| HTTP endpoints in `src/server.ts` | `/setup` consumes the setup-token — via the `POST /setup/session` form (token in the BODY, traded for an `httpOnly` session cookie) or the `x-maia-setup-token` header for break-glass. **Never via query string** (issue #518) |
+| `src/admin-ui/trpc/routers/channelLines.ts` | Pareamento de linhas ADICIONAIS na jornada normal: o console autenticado enfileira comandos em `channel_line_state` e o worker `channel_pairing` executa `line-pairing.ts`. Os endpoints `/setup/channels/:id/pair*` ficam como break-glass |
+| `src/setup/pairing-material.ts` | Cifra o QR/código para a travessia console↔runtime (envelope AES-GCM do keyring de staging); TTL curto, nunca em claro, nunca em log/audit/URL |
 
 ## Tests
 

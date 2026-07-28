@@ -3,6 +3,7 @@ import { join, dirname } from 'node:path';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { config } from '@/config/env.js';
 import { audit } from '@/governance/audit.js';
+import { revokeAllSetupSessions } from './session.js';
 
 /**
  * Auditoria P0 cap. 7 — o token vive em `control/`, FORA de qualquer alvo de
@@ -162,6 +163,11 @@ export async function rotateToken(): Promise<string> {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
   });
   const token = await createTokenFile(tokenPath);
+  // Issue #518 — rotacionar o token REVOGA as sessões de operador abertas com
+  // o token antigo. Sem isso, uma aba que já trocou o token por um cookie de
+  // sessão sobreviveria à rotação, o que esvaziaria o sentido de rotacionar
+  // durante um recovery.
+  revokeAllSetupSessions();
   await audit({ acao: 'setup_token_rotated', metadata: { reason: 'recovery_or_pair' } });
   hasInitialised = true;
   return token;

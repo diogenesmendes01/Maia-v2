@@ -22,10 +22,24 @@ ssh maia 'tail -50 /var/log/maia.log | grep baileys'
 **Caso 2 — LoggedOut**: o auto-recovery deveria ter rotacionado o token e mandado alerta. Se você não recebeu o alerta:
 
 ```bash
-ssh maia 'cat .baileys-auth/setup-token.txt'   # NOVO token (já rotacionado pelo recovery)
-# Browser → https://maia.SEU-DOMINIO.com/setup?token=<TOKEN>
+ssh maia 'cat .baileys-auth/control/setup-token.txt'   # NOVO token (já rotacionado pelo recovery)
+# Browser → https://maia.SEU-DOMINIO.com/setup
+# A página pede o token: COLE no formulário (o token vai no corpo do POST).
 # Clique "QR" ou "Código de 8 dígitos"
 ```
+
+> **Issue #518 — o token NÃO vai mais na URL.** `/setup?token=…` não autentica
+> mais: a URL ficava no histórico do navegador, no header `Referer` e no
+> access log do nginx. O token é colado uma vez no formulário e trocado por um
+> cookie de sessão `httpOnly` + `SameSite=Strict` válido por 30 minutos.
+> Rotacionar o token revoga as sessões abertas.
+>
+> Break-glass para automação/curl (sem browser), com o token em HEADER:
+>
+> ```bash
+> TOKEN=$(ssh maia 'cat .baileys-auth/control/setup-token.txt')
+> curl -s -H "x-maia-setup-token: $TOKEN" https://maia.SEU-DOMINIO.com/setup/status
+> ```
 
 **Caso 3 — recovery travou**: verifique no `audit_log` se `pairing_recovery_started` apareceu sem `pairing_recovery_completed`:
 
@@ -397,7 +411,8 @@ Restart preserva: sessão Baileys (`.baileys-auth/`), backups, audit log, jobs
 - [ ] `npm run db:migrate` rodado
 - [ ] `npm run build` clean
 - [ ] App started → log mostra `setup.bootstrap_token_ready` (cold start, sem `creds.json`)
-- [ ] SSH cat `.baileys-auth/setup-token.txt` → `/setup?token=…` no browser → escolher QR ou código → parear com WhatsApp do número da Maia
+- [ ] SSH cat `.baileys-auth/control/setup-token.txt` → abrir `/setup` no browser → colar o token no formulário (nunca na URL) → escolher QR ou código → parear com WhatsApp do número da Maia
+- [ ] Linhas ADICIONAIS: parear pelo Admin (`/setup/channels`), não pelo `/setup` — o console é autenticado e a auditoria fica com o ator administrativo (issue #518)
 - [ ] Audit log mostra `system_started`, `pairing_qr_displayed` (ou `pairing_code_requested`), `pairing_completed`
 - [ ] `/health/whatsapp` ok
 - [ ] Mande mensagem teste pro número Maia → log mostra `baileys.message.enqueued` → resposta do agente em ~3-8s
