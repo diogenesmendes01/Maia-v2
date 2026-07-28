@@ -201,4 +201,6 @@ NEW shared prefixes — pick `max(existing)+1`.
 095 | 095_approval_requests.sql | fase 0 cap.2: evidencia backend imutavel de aprovacao humana (approval_requests + approval_decisions, hash canonico, consumo one-time)
 096 | 096_mensagens_turn_scope_indexes.sql | fase 1: indices CONCURRENTLY em mensagens que sustentam a maquina de estados do turno — unique (tenant, agent, id) alvo da FK composta + parcial de inbound para backfill/divergencia (issue 503)
 097 | 097_agent_turns.sql | fase 1: maquina de estados duravel do turno inbound — agent_turns + agent_turn_inputs, CAS por state_version, outcome fechado por estado terminal, FKs compostas por tenant/agent (issue 503)
+101 | 101_backup_runs_manifests.sql | issue 520: evidencia duravel de backup/restore (backup_runs lifecycle, backup_manifests assinado, restore_drills para RTO medido)
+102 | 102_data_lifecycle.sql | issue 520: ciclo de vida de dados (legal_holds, privacy_requests, data_tombstones anti-ressurreicao, retention_runs dry-runnable)
 103 | 103_channel_line_state.sql | estado operacional das linhas whatsapp + fila duravel de comandos admin->runtime, material de pareamento cifrado (issue 518)

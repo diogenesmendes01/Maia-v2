@@ -3177,3 +3177,272 @@ export type AgentTurn = typeof agent_turns.$inferSelect;
 export type NewAgentTurn = typeof agent_turns.$inferInsert;
 export type AgentTurnInput = typeof agent_turn_inputs.$inferSelect;
 export type NewAgentTurnInput = typeof agent_turn_inputs.$inferInsert;
+
+// ---------------------------------------------------------------------------
+// Issue #520 — evidência de backup/restore (migration 101) e ciclo de vida de
+// dados (migration 102).
+//
+// ESCOPO: as três tabelas de backup são DB-wide por natureza (`pg_dump` não
+// tem tenant a que se atribuir) e vivem sob o sentinela RESERVADO `system`
+// (src/db/tenant-context.ts:77) — a migration 101 grava esse contrato num
+// CHECK. As quatro tabelas de ciclo de vida são per-tenant DE VERDADE:
+// tenant_id/agent_id NOT NULL, primeiro em todo índice, e a migration 102
+// recusa o literal legado 'default'.
+// ---------------------------------------------------------------------------
+
+export const backup_runs = pgTable(
+  'backup_runs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull().default('system'),
+    agent_id: text('agent_id').notNull().default('system'),
+    correlation_id: text('correlation_id').notNull(),
+    /** BackupState — src/ops/backup/state-machine.ts. */
+    state: text('state').notNull().default('scheduled'),
+    profile: text('profile').notNull(),
+    trigger: text('trigger').notNull().default('schedule'),
+    started_at: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
+    finished_at: timestamp('finished_at', { withTimezone: true }),
+    dump_duration_ms: integer('dump_duration_ms'),
+    upload_duration_ms: integer('upload_duration_ms'),
+    outcome: text('outcome'),
+    outcome_reason: text('outcome_reason'),
+    /** Basename apenas — nunca caminho absoluto. */
+    artifact_ref: text('artifact_ref'),
+    size_bytes: bigint('size_bytes', { mode: 'number' }),
+    sha256: text('sha256'),
+    encryption_mode: text('encryption_mode').notNull().default('none'),
+    /** IDENTIFICADOR de chave. Material de chave nunca é persistido. */
+    encryption_key_id: text('encryption_key_id'),
+    destination_kind: text('destination_kind').notNull().default('local'),
+    /** Locator opaco — src/ops/backup/redaction.ts:opaqueLocator. */
+    destination_locator: text('destination_locator'),
+    local_verified: boolean('local_verified').notNull().default(false),
+    remote_verified: boolean('remote_verified').notNull().default(false),
+    remote_verified_at: timestamp('remote_verified_at', { withTimezone: true }),
+    tombstone_watermark: timestamp('tombstone_watermark', { withTimezone: true }),
+    retention_class: text('retention_class').notNull().default('backup_artifact'),
+    delete_after: timestamp('delete_after', { withTimezone: true }),
+    legal_hold_state: text('legal_hold_state').notNull().default('none'),
+    /** Código estável de falha — NUNCA a stderr crua do pg_dump. */
+    error_code: text('error_code'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    recent_idx: index('backup_runs_recent_idx').on(
+      t.destination_kind,
+      t.remote_verified,
+      t.started_at,
+    ),
+    state_idx: index('backup_runs_state_idx').on(t.state, t.started_at),
+    // O unique parcial de single-flight (WHERE state IN (não-terminais)) e os
+    // CHECKs de forma vivem na migration 101 — Drizzle não os expressa aqui.
+  }),
+);
+
+export const backup_manifests = pgTable(
+  'backup_manifests',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull().default('system'),
+    agent_id: text('agent_id').notNull().default('system'),
+    backup_run_id: uuid('backup_run_id')
+      .notNull()
+      .references(() => backup_runs.id),
+    manifest_version: integer('manifest_version').notNull(),
+    manifest: jsonb('manifest').notNull(),
+    manifest_sha256: text('manifest_sha256').notNull(),
+    signature: text('signature').notNull(),
+    signature_alg: text('signature_alg').notNull().default('HMAC-SHA256'),
+    signature_key_version: integer('signature_key_version').notNull(),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    run_uq: unique('backup_manifests_backup_run_id_key').on(t.backup_run_id),
+    created_idx: index('backup_manifests_created_idx').on(t.created_at),
+  }),
+);
+
+export const restore_drills = pgTable(
+  'restore_drills',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull().default('system'),
+    agent_id: text('agent_id').notNull().default('system'),
+    correlation_id: text('correlation_id').notNull(),
+    backup_run_id: uuid('backup_run_id').references(() => backup_runs.id),
+    source: text('source').notNull().default('local'),
+    started_at: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
+    finished_at: timestamp('finished_at', { withTimezone: true }),
+    duration_ms: integer('duration_ms'),
+    status: text('status').notNull().default('running'),
+    /** Booleanos e contagens por probe — nunca valores de linha. */
+    probes: jsonb('probes').notNull().default(sql`'{}'::jsonb`),
+    tombstones_pending: integer('tombstones_pending'),
+    failure_code: text('failure_code'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    recent_idx: index('restore_drills_recent_idx').on(t.status, t.started_at),
+    run_idx: index('restore_drills_run_idx').on(t.backup_run_id),
+  }),
+);
+
+export const legal_holds = pgTable(
+  'legal_holds',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    case_reference: text('case_reference').notNull(),
+    /** Classe de dado congelada; '*' cobre todas as classes do escopo. */
+    data_class: text('data_class').notNull(),
+    /** Sujeito PSEUDONIMIZADO; NULL = hold de escopo amplo. */
+    subject_ref: text('subject_ref'),
+    /** CÓDIGO de motivo — §11 "logs não expõem motivo sensível". */
+    reason_code: text('reason_code').notNull(),
+    status: text('status').notNull().default('active'),
+    effective_from: timestamp('effective_from', { withTimezone: true }).notNull().defaultNow(),
+    effective_until: timestamp('effective_until', { withTimezone: true }),
+    created_by: text('created_by').notNull(),
+    approved_by: text('approved_by'),
+    released_by: text('released_by'),
+    released_at: timestamp('released_at', { withTimezone: true }),
+    release_reevaluated_at: timestamp('release_reevaluated_at', { withTimezone: true }),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    active_idx: index('legal_holds_active_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.data_class,
+      t.status,
+      t.effective_from,
+      t.effective_until,
+    ),
+  }),
+);
+
+export const privacy_requests = pgTable(
+  'privacy_requests',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    type: text('type').notNull(),
+    /** Sujeito PSEUDONIMIZADO — §12 "evitar enumeração por identificador". */
+    subject_ref: text('subject_ref').notNull(),
+    status: text('status').notNull().default('received'),
+    identity_method: text('identity_method'),
+    identity_verified_by: text('identity_verified_by'),
+    identity_verified_at: timestamp('identity_verified_at', { withTimezone: true }),
+    approved_by: text('approved_by'),
+    approved_at: timestamp('approved_at', { withTimezone: true }),
+    due_at: timestamp('due_at', { withTimezone: true }),
+    completed_at: timestamp('completed_at', { withTimezone: true }),
+    denied_reason_code: text('denied_reason_code'),
+    systems_covered: jsonb('systems_covered').notNull().default(sql`'[]'::jsonb`),
+    exceptions: jsonb('exceptions').notNull().default(sql`'[]'::jsonb`),
+    /** Contagens e códigos, nunca o conteúdo excluído. */
+    evidence: jsonb('evidence').notNull().default(sql`'{}'::jsonb`),
+    /** Locator OPACO — jamais uma URL assinada. */
+    export_locator: text('export_locator'),
+    export_expires_at: timestamp('export_expires_at', { withTimezone: true }),
+    export_downloaded_at: timestamp('export_downloaded_at', { withTimezone: true }),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    scope_status_idx: index('privacy_requests_scope_status_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.status,
+      t.created_at,
+    ),
+  }),
+);
+
+export const data_tombstones = pgTable(
+  'data_tombstones',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    data_class: text('data_class').notNull(),
+    /** PSEUDONIMIZADO — o ledger reconhece um sujeito, nunca o enumera. */
+    subject_ref: text('subject_ref'),
+    resource_locator: text('resource_locator'),
+    action: text('action').notNull(),
+    effective_at: timestamp('effective_at', { withTimezone: true }).notNull().defaultNow(),
+    privacy_request_id: uuid('privacy_request_id').references(() => privacy_requests.id),
+    origin: text('origin').notNull().default('privacy_request'),
+    version: integer('version').notNull().default(1),
+    hmac: text('hmac').notNull(),
+    hmac_key_version: integer('hmac_key_version').notNull().default(1),
+    last_reconciled_at: timestamp('last_reconciled_at', { withTimezone: true }),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    watermark_idx: index('data_tombstones_watermark_idx').on(
+      t.effective_at,
+      t.tenant_id,
+      t.agent_id,
+    ),
+    scope_class_idx: index('data_tombstones_scope_class_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.data_class,
+      t.effective_at,
+    ),
+  }),
+);
+
+export const retention_runs = pgTable(
+  'retention_runs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    correlation_id: text('correlation_id').notNull(),
+    data_class: text('data_class').notNull(),
+    dry_run: boolean('dry_run').notNull().default(true),
+    policy_version: text('policy_version').notNull(),
+    started_at: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
+    finished_at: timestamp('finished_at', { withTimezone: true }),
+    status: text('status').notNull().default('running'),
+    scanned: integer('scanned').notNull().default(0),
+    eligible: integer('eligible').notNull().default(0),
+    deleted: integer('deleted').notNull().default(0),
+    skipped_held: integer('skipped_held').notNull().default(0),
+    failed: integer('failed').notNull().default(0),
+    cursor_watermark: timestamp('cursor_watermark', { withTimezone: true }),
+    error_code: text('error_code'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    scope_idx: index('retention_runs_scope_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.data_class,
+      t.started_at,
+    ),
+    status_idx: index('retention_runs_status_idx').on(t.status, t.started_at),
+  }),
+);
+
+export type BackupRun = typeof backup_runs.$inferSelect;
+export type NewBackupRun = typeof backup_runs.$inferInsert;
+export type BackupManifestRow = typeof backup_manifests.$inferSelect;
+export type NewBackupManifestRow = typeof backup_manifests.$inferInsert;
+export type RestoreDrill = typeof restore_drills.$inferSelect;
+export type NewRestoreDrill = typeof restore_drills.$inferInsert;
+export type LegalHold = typeof legal_holds.$inferSelect;
+export type NewLegalHold = typeof legal_holds.$inferInsert;
+export type PrivacyRequest = typeof privacy_requests.$inferSelect;
+export type NewPrivacyRequest = typeof privacy_requests.$inferInsert;
+export type DataTombstone = typeof data_tombstones.$inferSelect;
+export type NewDataTombstone = typeof data_tombstones.$inferInsert;
+export type RetentionRun = typeof retention_runs.$inferSelect;
+export type NewRetentionRun = typeof retention_runs.$inferInsert;
