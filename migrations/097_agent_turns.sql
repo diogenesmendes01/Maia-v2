@@ -21,6 +21,16 @@
 --   * `state_version` sustenta o compare-and-swap: toda transição incrementa e
 --     o UPDATE exige a versão esperada.
 --
+-- O QUE O BANCO **NÃO** GUARDA: as ARESTAS da máquina de estados (quais `from`
+-- alcançam qual `to`). Um CHECK não enxerga o valor anterior da row, então a
+-- tabela de transições — incluindo as arestas `retryable -> dead_letter` e
+-- `claimed -> dead_letter` — é imposta pelo predicado do compare-and-swap
+-- (`status = ANY(<origens>)`, derivado de `sourceStatusesFor` em
+-- src/runtime/turns/contract.ts), no repositório. O banco guarda o que é
+-- expressável por row: o vocabulário e a compatibilidade estado x outcome.
+-- Um trigger de transição fecharia também as arestas, ao custo de duplicar a
+-- tabela em PL/pgSQL — segunda fonte de verdade, sujeita a drift.
+--
 -- Campos de claim/lease/deadline/outbound são criados AQUI mesmo sem uso nesta
 -- issue. #504 (claim/lease/fencing), #506 (outbox) e #507 (deadline) os
 -- consomem; criá-los agora evita uma sequência de ALTER TABLE no hot path.
@@ -70,21 +80,52 @@ CREATE TABLE IF NOT EXISTS agent_turns (
     'retryable', 'completed', 'ignored', 'superseded', 'dead_letter'
   )),
 
-  -- Compatibilidade estado x outcome, em UMA constraint. Cobre as três regras:
-  -- não-terminal ⇒ outcome NULL; terminal ⇒ outcome NOT NULL; e o par tem de
-  -- pertencer à lista fechada do estado.
+  -- PRESENÇA do outcome — escrita de forma que NUNCA possa avaliar para NULL.
+  --
+  -- ARMADILHA DE LÓGICA TERNÁRIA (bug encontrado pelo CI antes do merge, PR
+  -- #532): um CHECK do Postgres só REPROVA quando o predicado dá FALSE. Se der
+  -- NULL, a row é ACEITA. A primeira versão desta migration tinha só a
+  -- constraint composta abaixo, cujo ramo terminal era
+  -- `status = 'completed' AND outcome IN (...)`. Com `outcome IS NULL` esse
+  -- ramo virava `TRUE AND NULL` = NULL, o OR inteiro virava NULL e um turno
+  -- `completed` SEM outcome passava — exatamente a invariante que a constraint
+  -- existe para impedir.
+  --
+  -- Esta constraint usa CASE + `IS NOT NULL`/`IS NULL`, que são sempre
+  -- booleanos: nenhum caminho pode produzir NULL. Ela cobre as DUAS direções
+  -- (terminal exige outcome; não-terminal proíbe outcome) e é a rede que
+  -- sobrevive a uma futura reescrita do predicado composto.
+  CONSTRAINT agent_turns_outcome_presence_chk CHECK (
+    CASE
+      WHEN status IN ('completed', 'ignored', 'superseded', 'dead_letter')
+        THEN outcome IS NOT NULL
+      ELSE outcome IS NULL
+    END
+  ),
+
+  -- COMPATIBILIDADE do par (estado terminal, outcome): a lista fechada de cada
+  -- estado. Espelha 1:1 `TERMINAL_OUTCOMES` em src/runtime/turns/contract.ts —
+  -- `tests/integration/agent-turns-real-db.spec.ts` gera a matriz completa A
+  -- PARTIR daquelas constantes, então qualquer divergência entre este SQL e o
+  -- contrato falha no CI.
+  --
+  -- O `outcome IS NOT NULL` explícito em cada ramo é o que impede a armadilha
+  -- acima de voltar: sem ele, `outcome IN (...)` com NULL devolve NULL e
+  -- contamina o OR. Redundante com a constraint anterior — e a redundância é
+  -- deliberada.
   CONSTRAINT agent_turns_status_outcome_chk CHECK (
     (status NOT IN ('completed', 'ignored', 'superseded', 'dead_letter') AND outcome IS NULL)
-    OR (status = 'completed' AND outcome IN (
+    OR (status = 'completed' AND outcome IS NOT NULL AND outcome IN (
       'reply_delivered', 'reply_delivery_unknown', 'fallback_delivered',
       'no_reply_produced', 'pending_action_resolved', 'legacy_processed'
     ))
-    OR (status = 'ignored' AND outcome IN (
+    OR (status = 'ignored' AND outcome IS NOT NULL AND outcome IN (
       'blocked_by_policy', 'identity_unknown', 'identity_blocked',
       'quarantined', 'rate_limited_silent', 'operator_cancelled'
     ))
-    OR (status = 'superseded' AND outcome = 'merged_into_turn')
-    OR (status = 'dead_letter' AND outcome IN ('retry_exhausted', 'operator_cancelled'))
+    OR (status = 'superseded' AND outcome IS NOT NULL AND outcome = 'merged_into_turn')
+    OR (status = 'dead_letter' AND outcome IS NOT NULL
+        AND outcome IN ('retry_exhausted', 'operator_cancelled'))
   ),
 
   CONSTRAINT agent_turns_state_version_chk CHECK (state_version >= 0),

@@ -21,6 +21,15 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import pg from 'pg';
 import { randomUUID } from 'node:crypto';
 import { runWithTenantContext } from '@/db/tenant-context.js';
+// A matriz do caso (5) é GERADA a partir do contrato: se o SQL da migration 097
+// e `TERMINAL_OUTCOMES` divergirem, o caso correspondente falha.
+import {
+  TURN_STATUSES,
+  TURN_OUTCOMES,
+  TERMINAL_TURN_STATUSES,
+  TERMINAL_OUTCOMES,
+  isTerminalTurnStatus,
+} from '@/runtime/turns/contract.js';
 
 const SHOULD_RUN =
   !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
@@ -217,32 +226,146 @@ d('agent_turns — DB real (migrations 096/097)', () => {
     ).rejects.toThrow();
   });
 
-  it('(5) CHECK rejeita terminal sem outcome e par estado/outcome incompatível', async () => {
-    const mensagem_id = await mkInbound('primary', 'primary');
-    await expect(
-      pool.query(
-        `INSERT INTO agent_turns (tenant_id, agent_id, representative_message_id, status)
-         VALUES ('primary', 'primary', $1, 'completed')`,
-        [mensagem_id],
-      ),
-    ).rejects.toThrow(/agent_turns_status_outcome_chk/);
+  // ─── (5) MATRIZ COMPLETA estado x outcome, contra o banco ────────────────
+  //
+  // A primeira versão deste teste cobria três casos pontuais e por isso deixou
+  // passar um bug REAL na migration 097: o CHECK composto usava
+  // `status = 'completed' AND outcome IN (...)`, que com `outcome IS NULL`
+  // avalia para NULL — e um CHECK do Postgres só REPROVA em FALSE, aceitando
+  // NULL. Ou seja, "terminal exige outcome" não estava valendo no banco.
+  //
+  // Agora a matriz é GERADA a partir das constantes do contrato
+  // (src/runtime/turns/contract.ts). Duas propriedades novas:
+  //   - cobre os 10 estados x (14 outcomes + NULL) = 150 combinações, então
+  //     nenhum par fica sem cobertura por esquecimento;
+  //   - se alguém adicionar um outcome/estado ao contrato sem atualizar o SQL
+  //     (ou vice-versa), o caso correspondente falha aqui. É o guarda contra a
+  //     divergência contrato ↔ migration.
+  //
+  // Os casos REJEITADOS reusam uma única mensagem: um INSERT recusado não
+  // deixa row, então a unique de `representative_message_id` não é consumida.
+  // Os casos ACEITOS precisam de uma mensagem nova cada.
+  describe('(5) matriz estado x outcome — o CHECK do banco espelha o contrato', () => {
+    /** Nomes de constraint que podem legitimamente barrar um par inválido. */
+    const OUTCOME_CONSTRAINTS = /agent_turns_(outcome_presence|status_outcome)_chk/;
 
-    await expect(
-      pool.query(
+    async function insertTurn(
+      mensagem_id: string,
+      status: string,
+      outcome: string | null,
+    ): Promise<void> {
+      await pool.query(
         `INSERT INTO agent_turns (tenant_id, agent_id, representative_message_id, status, outcome)
-         VALUES ('primary', 'primary', $1, 'completed', 'merged_into_turn')`,
-        [mensagem_id],
-      ),
-    ).rejects.toThrow(/agent_turns_status_outcome_chk/);
+         VALUES ('primary', 'primary', $1, $2, $3)`,
+        [mensagem_id, status, outcome],
+      );
+    }
 
-    // Estado NÃO-terminal com outcome também é rejeitado.
-    await expect(
-      pool.query(
-        `INSERT INTO agent_turns (tenant_id, agent_id, representative_message_id, status, outcome)
-         VALUES ('primary', 'primary', $1, 'running', 'reply_delivered')`,
-        [mensagem_id],
-      ),
-    ).rejects.toThrow(/agent_turns_status_outcome_chk/);
+    let rejectMsg: string;
+    beforeAll(async () => {
+      rejectMsg = await mkInbound('primary', 'primary');
+    });
+
+    it('todo estado TERMINAL sem outcome é REJEITADO (o bug que o CI pegou)', async () => {
+      for (const status of TERMINAL_TURN_STATUSES) {
+        await expect(
+          insertTurn(rejectMsg, status, null),
+          `${status} + outcome NULL deveria ser rejeitado`,
+        ).rejects.toThrow(OUTCOME_CONSTRAINTS);
+      }
+    });
+
+    it('todo par (terminal, outcome) VÁLIDO do contrato é ACEITO', async () => {
+      for (const status of TERMINAL_TURN_STATUSES) {
+        for (const outcome of TERMINAL_OUTCOMES[status]) {
+          const msg = await mkInbound('primary', 'primary');
+          await expect(
+            insertTurn(msg, status, outcome),
+            `${status} + ${outcome} consta de TERMINAL_OUTCOMES e deveria ser aceito`,
+          ).resolves.toBeDefined();
+        }
+      }
+    });
+
+    it('todo par (terminal, outcome) FORA da lista do contrato é REJEITADO', async () => {
+      for (const status of TERMINAL_TURN_STATUSES) {
+        const allowed = new Set<string>(TERMINAL_OUTCOMES[status]);
+        for (const outcome of TURN_OUTCOMES) {
+          if (allowed.has(outcome)) continue;
+          await expect(
+            insertTurn(rejectMsg, status, outcome),
+            `${status} + ${outcome} NÃO consta de TERMINAL_OUTCOMES e deveria ser rejeitado`,
+          ).rejects.toThrow(OUTCOME_CONSTRAINTS);
+        }
+      }
+    });
+
+    it('todo estado NÃO-terminal com outcome NULL é ACEITO', async () => {
+      for (const status of TURN_STATUSES) {
+        if (isTerminalTurnStatus(status)) continue;
+        const msg = await mkInbound('primary', 'primary');
+        await expect(
+          insertTurn(msg, status, null),
+          `${status} + outcome NULL deveria ser aceito`,
+        ).resolves.toBeDefined();
+      }
+    });
+
+    it('todo estado NÃO-terminal com QUALQUER outcome é REJEITADO', async () => {
+      for (const status of TURN_STATUSES) {
+        if (isTerminalTurnStatus(status)) continue;
+        for (const outcome of TURN_OUTCOMES) {
+          await expect(
+            insertTurn(rejectMsg, status, outcome),
+            `${status} + ${outcome}: estado não-terminal não pode carregar outcome`,
+          ).rejects.toThrow(OUTCOME_CONSTRAINTS);
+        }
+      }
+    });
+
+    it('valor fora do vocabulário é rejeitado (status e outcome)', async () => {
+      await expect(insertTurn(rejectMsg, 'processing', null)).rejects.toThrow(
+        /agent_turns_status_chk/,
+      );
+      // Outcome desconhecido não casa nenhuma lista fechada.
+      await expect(insertTurn(rejectMsg, 'completed', 'done')).rejects.toThrow(
+        OUTCOME_CONSTRAINTS,
+      );
+    });
+
+    // Divergência consciente nº 1 da PR, verificada NO BANCO e não só no
+    // contrato: descarte por regra explícita é `ignored`, nunca `completed`.
+    it('descartes por política pertencem a `ignored` e são recusados em `completed`', async () => {
+      for (const outcome of [
+        'blocked_by_policy',
+        'identity_unknown',
+        'identity_blocked',
+        'quarantined',
+        'rate_limited_silent',
+      ] as const) {
+        await expect(
+          insertTurn(rejectMsg, 'completed', outcome),
+          `${outcome} não pode ser aceito em 'completed'`,
+        ).rejects.toThrow(OUTCOME_CONSTRAINTS);
+        const msg = await mkInbound('primary', 'primary');
+        await expect(insertTurn(msg, 'ignored', outcome)).resolves.toBeDefined();
+      }
+    });
+
+    // Divergência consciente nº 2: as ARESTAS extras (`retryable`/`claimed` ->
+    // `dead_letter`) não são expressáveis num CHECK — quem as impõe é o CAS do
+    // repositório (teste (1)). O que o banco garante é o lado do OUTCOME:
+    // `retry_exhausted` só existe em `dead_letter`.
+    it('`retry_exhausted` só é aceito em `dead_letter`', async () => {
+      for (const status of TERMINAL_TURN_STATUSES) {
+        if (status === 'dead_letter') continue;
+        await expect(insertTurn(rejectMsg, status, 'retry_exhausted')).rejects.toThrow(
+          OUTCOME_CONSTRAINTS,
+        );
+      }
+      const msg = await mkInbound('primary', 'primary');
+      await expect(insertTurn(msg, 'dead_letter', 'retry_exhausted')).resolves.toBeDefined();
+    });
   });
 
   it('(6) terminal projeta processada_em; retryable NÃO projeta', async () => {
