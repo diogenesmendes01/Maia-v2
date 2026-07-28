@@ -96,8 +96,11 @@ describe('trace() facade', () => {
     // Durable path: one transaction containing envelope INSERT + outbox INSERT.
     expect(dbTransactionMock).toHaveBeenCalledTimes(1);
     expect(txInsertValuesMock).toHaveBeenCalledTimes(2);
-    // Outbox uses onConflictDoNothing for idempotency.
-    expect(txOnConflictMock).toHaveBeenCalledTimes(1);
+    // Issue #514 review round 1 [P1]: BOTH inserts are idempotent now — the
+    // envelope as well as the outbox. The writer is at-least-once (BullMQ
+    // retry, recovery sweep, outbox relayer), so re-writing the same envelope
+    // must be a no-op rather than a unique violation that fails the turn.
+    expect(txOnConflictMock).toHaveBeenCalledTimes(2);
     // In-memory enqueue as accelerator.
     expect(enqueueMock).toHaveBeenCalledTimes(1);
     expect(out.envelope_hmac.length).toBeGreaterThan(0);
