@@ -46,6 +46,13 @@ export interface ValidateConfigInput {
    * `__SET_ME__…`). Used to check `.env.example` itself.
    */
   readonly allowPlaceholders?: boolean;
+  /**
+   * Accept the SYNTHETIC CI fixture values (`sk-ant-fixture-…`). Used only to
+   * validate `src/config/generated/fixtures/*.env` — i.e. to prove the contract
+   * is satisfiable. Never for a real environment: those values authenticate
+   * against nothing.
+   */
+  readonly allowSyntheticFixtures?: boolean;
   /** Contract override — tests only. */
   readonly entries?: readonly EnvVarSpec[];
   /** Tombstone override — tests only. */
@@ -181,6 +188,7 @@ export function validateConfig(input: ValidateConfigInput): ValidateConfigResult
   const crossField = evaluateCrossFieldRules({ values, raw: env, profile, entries });
   for (const f of crossField) {
     if (input.allowPlaceholders && f.rule === 'secret/placeholder') continue;
+    if (input.allowSyntheticFixtures && f.rule === 'secret/synthetic-fixture') continue;
     if (scopeNames && f.variable !== null && !scopeNames.has(f.variable)) continue;
     problems.push({
       severity: f.severity,

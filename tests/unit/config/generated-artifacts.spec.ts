@@ -88,10 +88,37 @@ describe('generated artifacts — semantics (#515)', () => {
     expect(read('.env.example')).toContain('FEATURE_MULTI_CHANNEL — removida em PR #411');
   });
 
-  it.each(MAIA_PROFILES)('the %s fixture is strictly valid for its own profile', (profile) => {
-    const env = parseEnvFile(read(`src/config/generated/fixtures/${profile}.env`));
-    const result = validateConfig({ env, profile: profile as MaiaProfile });
-    expect(result.errors, formatHuman(result)).toEqual([]);
+  it.each(MAIA_PROFILES)(
+    'the %s fixture satisfies every rule of its profile (contract is satisfiable)',
+    (profile) => {
+      const env = parseEnvFile(read(`src/config/generated/fixtures/${profile}.env`));
+      const result = validateConfig({
+        env,
+        profile: profile as MaiaProfile,
+        allowSyntheticFixtures: true,
+      });
+      expect(result.errors, formatHuman(result)).toEqual([]);
+    },
+  );
+
+  it.each(['staging', 'production'] as const)(
+    'the %s fixture file is REJECTED without the explicit --allow-fixtures opt-in',
+    (profile) => {
+      // The footgun the review found: `config init` used to write this file as
+      // `.env`, and the recommended `config check` said it was fine.
+      const env = parseEnvFile(read(`src/config/generated/fixtures/${profile}.env`));
+      const result = validateConfig({ env, profile });
+      expect(result.ok).toBe(false);
+      expect(result.errors.some((p) => p.rule === 'secret/synthetic-fixture')).toBe(true);
+    },
+  );
+
+  it('the fixture files warn, in the file itself, against being used as a .env', () => {
+    for (const profile of MAIA_PROFILES) {
+      const content = read(`src/config/generated/fixtures/${profile}.env`);
+      expect(content).toContain('NÃO USE COMO .env');
+      expect(content).toContain('config:init');
+    }
   });
 
   it('no generated artifact contains anything shaped like a real credential', () => {

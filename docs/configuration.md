@@ -23,10 +23,23 @@ npm run config:generate                 # regenera .env.example, docs, manifest,
 npm run config:check:drift              # falha se os artefatos gerados estiverem desatualizados
 npm run config:check -- --profile production --env-file .env
 npm run config:check -- --profile development --env-file .env.example --allow-placeholders
-npm run config:init -- --profile development
+npm run config:init -- --profile production   # ponto de partida operacional
 ```
 
 `config:check` reporta **todos** os problemas numa única execução (nunca só o primeiro), com variável, regra violada e remediação — e **nunca** o valor de um segredo. Aceita `--json` para automações.
+
+`config:init` gera um **ponto de partida operacional**: todo valor que pertence ao operador vem marcado com `__SET_ME__`, e a validação estrita **falha de propósito** até que ele seja substituído. Ele NÃO é uma fixture.
+
+### Fixtures sintéticas vs. configuração real
+
+As fixtures em `src/config/generated/fixtures/` existem para o CI provar que o contrato é **satisfazível**: valores previsíveis (`sk-ant-fixture-…`) que não autenticam em nada. Um processo configurado com elas fica inoperante parecendo configurado, então `config:check` as **recusa** fora de development (regra `secret/synthetic-fixture`). Só o opt-in explícito `--allow-fixtures`, usado para validar esses próprios arquivos, as aceita:
+
+```bash
+npm run config:check -- --profile production \
+  --env-file src/config/generated/fixtures/production.env --allow-fixtures
+```
+
+Os dois opt-ins são separados de propósito: `--allow-placeholders` (usado no `.env.example`) não concede permissão para valores de fixture, e vice-versa.
 
 ## Configuração mínima por serviço
 

@@ -330,11 +330,12 @@ export interface ConfigProblem {
 }
 
 /**
- * Values that look like a placeholder rather than a real credential. Mirrors
+ * Values a HUMAN is expected to replace. Mirrors
  * `src/admin-ui/lib/auth-gating.ts` `KNOWN_PLACEHOLDER_PATTERNS` and extends it
- * with the markers used by the generated `.env.example`.
+ * with the markers used by the generated `.env.example` and by
+ * `maia config init`.
  */
-const PLACEHOLDER_PATTERNS: readonly RegExp[] = [
+const OPERATOR_PLACEHOLDER_PATTERNS: readonly RegExp[] = [
   /^changeme-/i,
   /change-?me/i,
   /change_me/i,
@@ -348,7 +349,45 @@ const PLACEHOLDER_PATTERNS: readonly RegExp[] = [
   /^xxx+$/i,
 ];
 
-/** True when the value is a documented placeholder, not a usable credential. */
+/**
+ * Values produced by `buildFixture()` — the SYNTHETIC configuration CI uses to
+ * prove the contract is satisfiable.
+ *
+ * They are deliberately predictable (`sk-ant-fixture-not-a-real-key`,
+ * `fixture0000pass`, an all-zero base64 key block), which is fine for a CI
+ * witness and catastrophic in a real deployment: they authenticate against
+ * nothing, so a process configured with them is inoperable while looking
+ * configured. PR #522 review round 1 [P1] found `maia config init` promoting
+ * exactly these into a production `.env`.
+ *
+ * They are therefore treated as placeholders too. The dedicated rule
+ * `secret/synthetic-fixture` reports them in staging/production, and only the
+ * explicit `--allow-fixtures` opt-in (used solely to validate the generated
+ * fixtures themselves) silences it.
+ */
+const SYNTHETIC_FIXTURE_PATTERNS: readonly RegExp[] = [
+  // `fixture…` at the start, or after any non-alphanumeric separator, so it
+  // matches `sk-ant-fixture-…`, `1=fixture-…` and `postgres://u:fixture0000pass@…`.
+  /(^|[^a-z0-9])fixture/i,
+  // All-zero base64 blocks used for the key-shaped fixture fields.
+  /A{20,}=/,
+];
+
+/** True when the value is a marker a human must replace before deploying. */
+export function isOperatorPlaceholder(value: string): boolean {
+  return OPERATOR_PLACEHOLDER_PATTERNS.some((rx) => rx.test(value));
+}
+
+/** True when the value came from the synthetic CI fixture set. */
+export function isSyntheticFixtureValue(value: string): boolean {
+  return SYNTHETIC_FIXTURE_PATTERNS.some((rx) => rx.test(value));
+}
+
+/**
+ * True when the value is NOT a real, usable value — either an operator
+ * placeholder or a synthetic CI fixture. Used by the contract tests and by the
+ * `config init` template renderer.
+ */
 export function isPlaceholderValue(value: string): boolean {
-  return PLACEHOLDER_PATTERNS.some((rx) => rx.test(value));
+  return isOperatorPlaceholder(value) || isSyntheticFixtureValue(value);
 }

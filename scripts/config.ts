@@ -18,6 +18,7 @@ import {
   buildJsonSchema,
   renderConfigDoc,
   renderEnvExample,
+  renderEnvTemplate,
   renderFixture,
 } from '@/config/generate.js';
 import { parseEnvFile } from '@/config/env-file.js';
@@ -119,6 +120,7 @@ function cmdCheck(args: Map<string, string | true>): number {
     env,
     profile,
     allowPlaceholders: args.get('allow-placeholders') === true,
+    allowSyntheticFixtures: args.get('allow-fixtures') === true,
   });
 
   console.log(args.get('json') === true ? formatJson(result) : formatHuman(result));
@@ -137,14 +139,18 @@ function cmdInit(args: Map<string, string | true>): number {
     console.error(`config: ${out} já existe. Use --force para sobrescrever (você perde o conteúdo atual).`);
     return 1;
   }
-  // development starts from `.env.example` (placeholders the operator fills in);
-  // staging/production start from the strict fixture shape so nothing is
-  // silently missing. Neither carries a real credential.
-  const content = rawProfile === 'development' ? renderEnvExample() : renderFixture(rawProfile);
+  // NEVER the CI fixtures. `config init` used to write
+  // `src/config/generated/fixtures/<profile>.env` for staging/production, so a
+  // `.env` full of `sk-ant-fixture-*` values passed the very `config check`
+  // printed below — a production configuration that authenticates against
+  // nothing, certified as valid (PR #522 review round 1 [P1]). The operational
+  // template marks every value the operator owns with `__SET_ME__`, which the
+  // strict check rejects until it is replaced.
+  const content = renderEnvTemplate(rawProfile);
   mkdirSync(dirname(abs), { recursive: true });
   writeFileSync(abs, content, 'utf8');
   console.log(`config: ${out} criado a partir do contrato (profile ${rawProfile}).`);
-  console.log('Preencha os valores marcados como placeholder e valide com:');
+  console.log('Todo valor __SET_ME__ é seu. A validação FALHA até você preenchê-los:');
   console.log(`  npm run config:check -- --profile ${rawProfile} --env-file ${out}`);
   return 0;
 }
@@ -176,9 +182,17 @@ function usage(): void {
       '                                   o JSON Schema, o manifest por serviço e as fixtures',
       '  generate --check                 falha se algum artefato estiver desatualizado',
       '  check [--profile P] [--env-file F] [--json] [--allow-placeholders]',
-      '                                   valida um arquivo de ambiente contra o contrato',
+      '        [--allow-fixtures]',
+      '                                   valida um arquivo de ambiente contra o contrato.',
+      '                                   --allow-placeholders: modo estrutural (checa o',
+      '                                   .env.example, que traz placeholders de propósito).',
+      '                                   --allow-fixtures: aceita os valores sintéticos de',
+      '                                   src/config/generated/fixtures/ — só para validar',
+      '                                   ESSES arquivos, nunca um ambiente real.',
       '  init [--profile P] [--out F] [--force]',
-      '                                   cria um arquivo de ambiente a partir do contrato',
+      '                                   cria um ponto de partida operacional: todo valor',
+      '                                   que é do operador vem como __SET_ME__ e a',
+      '                                   validação estrita FALHA até ser preenchido',
       '',
       `  P ∈ {${MAIA_PROFILES.join(', ')}}`,
     ].join('\n'),

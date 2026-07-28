@@ -72,8 +72,18 @@ Direct `process.env.X` reads outside `src/config/` are an anti-pattern, enforced
 npm run config:generate       # regenerate every artifact
 npm run config:check:drift    # CI gate: fail if an artifact is stale
 npm run config:check -- --profile production --env-file .env [--json]
-npm run config:init -- --profile development
+npm run config:init -- --profile production   # operational template
 ```
+
+**Templates vs. fixtures — they are not interchangeable.**
+`config:init` writes an *operational template*: every value the operator owns is
+`__SET_ME__`, so `config:check` **fails on purpose** until it is filled in. The
+files in `src/config/generated/fixtures/` are the opposite — a synthetic witness
+that the contract is satisfiable, with predictable values that authenticate
+against nothing. `config:check` rejects those outside development
+(`secret/synthetic-fixture`); only `--allow-fixtures`, used to validate the
+fixture files themselves, accepts them. `--allow-placeholders` (used for
+`.env.example`) does **not** imply `--allow-fixtures`, and vice versa.
 
 ## Tests
 
@@ -88,6 +98,7 @@ npm run config:init -- --profile development
 | `tests/unit/config/no-direct-env-reads.spec.ts` | The `process.env` allow-list is exact and the ESLint rule is live |
 | `tests/unit/config/env-file.spec.ts` | `parseEnvFile` ↔ `dotenv.parse` parity (inline comments, quoting, escapes, multi-line) |
 | `tests/unit/config/required-when.spec.ts` | Every `requiredWhen` in the contract, both branches; the case list is asserted to equal the contract's |
+| `tests/unit/config/init-template.spec.ts` | `config init` emits a template (never a fixture), it fails until filled and passes once filled; fixture-as-environment is rejected |
 
 ## In-flight changes
 

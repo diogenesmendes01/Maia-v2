@@ -39,6 +39,11 @@ export interface LoadOptions {
    * Default `true` — fail closed.
    */
   readonly validate?: boolean;
+  /**
+   * Accept the synthetic CI fixture values. Only for the tests and CI steps
+   * that prove the contract is satisfiable — never for a real deployment.
+   */
+  readonly allowSyntheticFixtures?: boolean;
 }
 
 /**
@@ -78,7 +83,12 @@ export function loadServiceConfig<S extends MaiaService>(
   const problems: ConfigProblem[] = [];
 
   if (options.validate !== false) {
-    const result = validateConfig({ env, profile, service });
+    const result = validateConfig({
+      env,
+      profile,
+      service,
+      allowSyntheticFixtures: options.allowSyntheticFixtures,
+    });
     problems.push(...result.errors);
   }
 
@@ -123,7 +133,12 @@ export function bootSummary(
   warnings: number;
 } {
   const env = options.env ?? (process.env as Record<string, string | undefined>);
-  const result = validateConfig({ env, profile: options.profile, service });
+  const result = validateConfig({
+    env,
+    profile: options.profile,
+    service,
+    allowSyntheticFixtures: options.allowSyntheticFixtures,
+  });
   return {
     service,
     profile: result.profile,

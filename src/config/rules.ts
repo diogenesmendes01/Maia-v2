@@ -17,7 +17,8 @@ import {
   type MaiaProfile,
   describeRequiredWhen,
   evaluateRequiredWhen,
-  isPlaceholderValue,
+  isOperatorPlaceholder,
+  isSyntheticFixtureValue,
 } from '@/config/metadata.js';
 
 /** Where a rule is enforced. */
@@ -503,7 +504,7 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
   if (profile !== 'development') {
     for (const [name, value] of Object.entries(raw)) {
       if (!value) continue;
-      if (isPlaceholderValue(value)) {
+      if (isOperatorPlaceholder(value)) {
         push({
           scope: 'contract',
           severity: 'error',
@@ -511,6 +512,23 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
           rule: 'secret/placeholder',
           message: `${name} ainda está com um valor de placeholder no profile ${profile}.`,
           remediation: `Substitua ${name} por um valor real antes do deploy.`,
+        });
+      } else if (isSyntheticFixtureValue(value)) {
+        // As fixtures de `src/config/generated/fixtures/` existem para o CI
+        // provar que o contrato é satisfazível. Valores previsíveis como
+        // `sk-ant-fixture-*` não autenticam em nada: um processo configurado
+        // com eles fica INOPERANTE parecendo configurado. Achado [P1] da
+        // rodada 1 da PR #522.
+        push({
+          scope: 'contract',
+          severity: 'error',
+          variable: name,
+          rule: 'secret/synthetic-fixture',
+          message: `${name} está com um valor de FIXTURE sintética (CI) no profile ${profile}.`,
+          remediation:
+            `As fixtures em src/config/generated/fixtures/ provam que o contrato é satisfazível; ` +
+            `elas não autenticam em nada. Gere um ponto de partida operacional com ` +
+            `\`npm run config:init -- --profile ${profile}\` e preencha ${name} com o valor real.`,
         });
       }
     }

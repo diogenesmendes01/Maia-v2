@@ -24,6 +24,8 @@ import {
   type EnvVarSpec,
   type MaiaProfile,
   describeRequiredWhen,
+  evaluateRequiredWhen,
+  isOperatorPlaceholder,
 } from '@/config/metadata.js';
 
 const BANNER_ENV = [
@@ -160,14 +162,134 @@ function commentBlock(text: string): string[] {
 }
 
 // ---------------------------------------------------------------------------
-// .env.example
+// .env.example and the `maia config init` operational template
 // ---------------------------------------------------------------------------
 
-/** Deterministic `.env.example`, in contract order. */
-export function renderEnvExample(): string {
-  const lines: string[] = [...BANNER_ENV];
+/**
+ * Variables whose value IS the profile. The operator does not choose them, so
+ * the template writes them out rather than asking for a value.
+ */
+const PROFILE_DETERMINED = new Set(['MAIA_ENV', 'NODE_ENV']);
 
-  for (const { title, specs } of groupsInOrder(CONTRACT_ENTRIES)) {
+/** True when the schema itself rejects an absent value. */
+function schemaRequires(spec: EnvVarSpec): boolean {
+  return spec.schema.safeParse(undefined).success === false;
+}
+
+/**
+ * True when the operator MUST supply this value for this profile. Those get a
+ * `__SET_ME__` marker in the template so `maia config check` fails until they
+ * are filled in.
+ */
+function mustBeSupplied(spec: EnvVarSpec, profile: MaiaProfile): boolean {
+  if (PROFILE_DETERMINED.has(spec.name)) return false;
+  if (spec.secret) return true;
+  if (spec.requiredIn?.includes(profile)) return true;
+  if (schemaRequires(spec)) return true;
+  // An `http://localhost` default is a development convenience; outside
+  // development it is a deployment-specific public URL.
+  return profile !== 'development' && (spec.example ?? '').startsWith('http://');
+}
+
+/**
+ * Placeholder that keeps enough SHAPE to be schema-valid where possible, so the
+ * template fails on the explicit `secret/placeholder` rule (clear message)
+ * rather than on an opaque schema error.
+ */
+function templatePlaceholder(spec: EnvVarSpec, profile: MaiaProfile): string {
+  const example = spec.example ?? '';
+  const url = /^([a-z][a-z0-9+.-]*):\/\//i.exec(example);
+  if (url?.[1]) {
+    const scheme =
+      url[1].toLowerCase() === 'http' && profile !== 'development' ? 'https' : url[1];
+    return `${scheme}://__SET_ME__`;
+  }
+  // Keep the documented example ONLY when a bare marker would not satisfy the
+  // schema and the example would — i.e. when the example carries structure the
+  // operator needs to preserve (`sk-ant-…` prefix, a 16-char minimum). For
+  // everything else the bare marker reads better than `trocar_senha_forte`.
+  const bareRejected = !spec.schema.safeParse(MARKER).success;
+  if (bareRejected && example && isOperatorPlaceholder(example)) {
+    if (spec.schema.safeParse(example).success) return example;
+  }
+  return MARKER;
+}
+
+/** The marker every value the operator owns carries in a generated template. */
+const MARKER = '__SET_ME__';
+
+function templateValue(spec: EnvVarSpec, profile: MaiaProfile): string {
+  if (PROFILE_DETERMINED.has(spec.name)) {
+    return spec.fixtureByProfile?.[profile] ?? spec.fixture ?? spec.example ?? '';
+  }
+  if (mustBeSupplied(spec, profile)) return templatePlaceholder(spec, profile);
+  return spec.example ?? '';
+}
+
+/**
+ * Which variables the template writes UNCOMMENTED for a profile: the ones the
+ * example already writes, the ones the profile requires, and the transitive
+ * closure of `requiredWhen` over those (a required `BACKUP_S3_BUCKET` pulls in
+ * its credentials).
+ */
+function templateActiveNames(profile: MaiaProfile): Set<string> {
+  const allowed = CONTRACT_ENTRIES.filter((s) => allowedProfiles(s).includes(profile));
+  const active = new Set(
+    allowed
+      .filter((spec) => {
+        if (spec.requiredIn?.includes(profile) || schemaRequires(spec)) return true;
+        // A CONDITIONAL secret (a provider key) starts commented out: demanding
+        // COHERE_API_KEY from a deployment that runs Voyage would block a
+        // perfectly good `.env`. The `requiredWhen` closure below turns on
+        // exactly the ones the chosen providers need.
+        if (spec.secret && spec.requiredWhen) return false;
+        return !spec.commentedInExample;
+      })
+      .map((s) => s.name),
+  );
+
+  // Fixed point — the deepest chain in the contract is 2 hops.
+  for (let pass = 0; pass < 5; pass += 1) {
+    const raw: Record<string, string | undefined> = {};
+    for (const spec of allowed) {
+      if (active.has(spec.name)) raw[spec.name] = templateValue(spec, profile);
+    }
+    let changed = false;
+    for (const spec of allowed) {
+      if (active.has(spec.name) || !spec.requiredWhen) continue;
+      if (evaluateRequiredWhen(spec.requiredWhen, { values: {}, raw })) {
+        active.add(spec.name);
+        changed = true;
+      }
+    }
+    if (!changed) break;
+  }
+  return active;
+}
+
+interface EnvRenderOptions {
+  readonly profile: MaiaProfile;
+  /**
+   * `example` — the committed `.env.example`: documents EVERY variable with its
+   * example value, development-shaped.
+   * `template` — `maia config init`: a per-profile starting point where every
+   * value the operator must supply is a placeholder that FAILS
+   * `maia config check` until replaced.
+   */
+  readonly mode: 'example' | 'template';
+}
+
+function renderEnvFile(options: EnvRenderOptions): string {
+  const { profile, mode } = options;
+  const template = mode === 'template';
+  const active = template ? templateActiveNames(profile) : null;
+  const entries = template
+    ? CONTRACT_ENTRIES.filter((s) => allowedProfiles(s).includes(profile))
+    : CONTRACT_ENTRIES;
+
+  const lines: string[] = template ? [...bannerTemplate(profile)] : [...BANNER_ENV];
+
+  for (const { title, specs } of groupsInOrder(entries)) {
     lines.push(`# ---- ${title} ----`);
     for (const spec of specs) {
       lines.push(...commentBlock(spec.description));
@@ -184,8 +306,13 @@ export function renderEnvExample(): string {
         meta.push(`ativa apenas em: ${restricted.join(', ')}`);
       }
       if (meta.length > 0) lines.push(...commentBlock(`(${meta.join(' · ')})`));
-      const prefix = spec.commentedInExample ? '# ' : '';
-      lines.push(`${prefix}${spec.name}=${spec.example ?? ''}`);
+
+      const value = template ? templateValue(spec, profile) : (spec.example ?? '');
+      if (template && mustBeSupplied(spec, profile) && spec.example && spec.example !== value) {
+        lines.push(...commentBlock(`formato/exemplo: ${spec.example}`));
+      }
+      const commented = template ? !active!.has(spec.name) : Boolean(spec.commentedInExample);
+      lines.push(`${commented ? '# ' : ''}${spec.name}=${value}`);
       lines.push('');
     }
   }
@@ -206,6 +333,42 @@ export function renderEnvExample(): string {
   }
 
   return `${lines.join('\n').trimEnd()}\n`;
+}
+
+function bannerTemplate(profile: MaiaProfile): string[] {
+  return [
+    '# =====================================================================',
+    `# Maia — ponto de partida operacional do profile ${profile}`,
+    '#',
+    `# Gerado por: npm run config:init -- --profile ${profile}`,
+    '#',
+    '# Todo valor marcado __SET_ME__ é SEU: preencha antes do deploy. Enquanto',
+    '# houver qualquer um deles, o comando abaixo FALHA de propósito —',
+    '# é assim que uma configuração incompleta não passa por completa:',
+    `#     npm run config:check -- --profile ${profile} --env-file .env`,
+    '#',
+    '# Este arquivo NÃO é uma fixture de CI. As fixtures em',
+    '# src/config/generated/fixtures/ têm valores sintéticos que não',
+    '# autenticam em nada e nunca devem virar um .env.',
+    '#',
+    '# NUNCA comite o .env real.',
+    '# =====================================================================',
+    '',
+  ];
+}
+
+/** Deterministic `.env.example`, in contract order. */
+export function renderEnvExample(): string {
+  return renderEnvFile({ profile: 'development', mode: 'example' });
+}
+
+/**
+ * Operational starting point for `maia config init`. Every value the operator
+ * must supply is a `__SET_ME__` placeholder, so the generated file FAILS
+ * `maia config check --profile <p>` until it is filled in.
+ */
+export function renderEnvTemplate(profile: MaiaProfile): string {
+  return renderEnvFile({ profile, mode: 'template' });
 }
 
 // ---------------------------------------------------------------------------
@@ -251,13 +414,39 @@ export function renderConfigDoc(): string {
   out.push('npm run config:check:drift              # falha se os artefatos gerados estiverem desatualizados');
   out.push('npm run config:check -- --profile production --env-file .env');
   out.push('npm run config:check -- --profile development --env-file .env.example --allow-placeholders');
-  out.push('npm run config:init -- --profile development');
+  out.push('npm run config:init -- --profile production   # ponto de partida operacional');
   out.push('```');
   out.push('');
   out.push(
     '`config:check` reporta **todos** os problemas numa única execução (nunca só o primeiro), com ' +
       'variável, regra violada e remediação — e **nunca** o valor de um segredo. Aceita `--json` ' +
       'para automações.',
+  );
+  out.push('');
+  out.push(
+    '`config:init` gera um **ponto de partida operacional**: todo valor que pertence ao operador ' +
+      'vem marcado com `__SET_ME__`, e a validação estrita **falha de propósito** até que ele seja ' +
+      'substituído. Ele NÃO é uma fixture.',
+  );
+  out.push('');
+  out.push('### Fixtures sintéticas vs. configuração real');
+  out.push('');
+  out.push(
+    'As fixtures em `src/config/generated/fixtures/` existem para o CI provar que o contrato é ' +
+      '**satisfazível**: valores previsíveis (`sk-ant-fixture-…`) que não autenticam em nada. Um ' +
+      'processo configurado com elas fica inoperante parecendo configurado, então `config:check` ' +
+      'as **recusa** fora de development (regra `secret/synthetic-fixture`). Só o opt-in explícito ' +
+      '`--allow-fixtures`, usado para validar esses próprios arquivos, as aceita:',
+  );
+  out.push('');
+  out.push('```bash');
+  out.push('npm run config:check -- --profile production \\');
+  out.push('  --env-file src/config/generated/fixtures/production.env --allow-fixtures');
+  out.push('```');
+  out.push('');
+  out.push(
+    'Os dois opt-ins são separados de propósito: `--allow-placeholders` (usado no `.env.example`) ' +
+      'não concede permissão para valores de fixture, e vice-versa.',
   );
   out.push('');
 
@@ -434,12 +623,21 @@ export function buildFixture(profile: MaiaProfile): Record<string, string> {
 export function renderFixture(profile: MaiaProfile): string {
   const lines: string[] = [
     '# =====================================================================',
-    `# Maia — fixture sintética do profile ${profile}`,
+    `# Maia — fixture SINTÉTICA do profile ${profile}`,
     '#',
     '# ARQUIVO GERADO — não edite à mão (npm run config:generate).',
-    '# Valores sintéticos: NENHUM segredo real. Usado pelo CI para provar que',
-    '# o contrato é satisfazível e pelos testes que precisam de uma config',
-    '# válida sem tocar em process.env.',
+    '#',
+    '# NÃO USE COMO .env. Os valores aqui são previsíveis de propósito e não',
+    '# autenticam em NADA: um processo configurado com eles fica inoperante',
+    '# parecendo configurado. `maia config check` recusa estes valores fora de',
+    '# development (regra secret/synthetic-fixture) — só o opt-in explícito',
+    '# --allow-fixtures, usado para validar ESTE arquivo, os aceita.',
+    '#',
+    '# Para um ponto de partida real:',
+    `#     npm run config:init -- --profile ${profile}`,
+    '#',
+    '# Serve para o CI provar que o contrato é satisfazível e para os testes',
+    '# que precisam de uma configuração completa sem tocar em process.env.',
     '# =====================================================================',
     '',
   ];

@@ -16,9 +16,17 @@ import { buildFixture } from '@/config/generate.js';
 
 const PROD = () => buildFixture('production');
 
+/**
+ * The fixtures are SYNTHETIC (`sk-ant-fixture-…`). A real environment carrying
+ * those values is rejected by `secret/synthetic-fixture` — that is the point of
+ * PR #522 review round 1 [P1]. Loading them here IS the satisfiability proof,
+ * so the opt-in is explicit and shared by the cases below.
+ */
+const FIXTURE_OPTS = { profile: 'production', allowSyntheticFixtures: true } as const;
+
 describe('service loaders (#515)', () => {
   it('the migrator receives Postgres + core knobs and nothing else', () => {
-    const cfg = loadMigrationConfig({ env: PROD(), profile: 'production' });
+    const cfg = loadMigrationConfig({ env: PROD(), ...FIXTURE_OPTS });
     expect(cfg.DATABASE_URL).toContain('postgres://');
     expect(cfg.POSTGRES_DB).toBe('maia');
     expect('ANTHROPIC_API_KEY' in cfg).toBe(false);
@@ -27,21 +35,21 @@ describe('service loaders (#515)', () => {
   });
 
   it('the backup loader receives the S3 destination and the alert transport', () => {
-    const cfg = loadBackupConfig({ env: PROD(), profile: 'production' });
+    const cfg = loadBackupConfig({ env: PROD(), ...FIXTURE_OPTS });
     expect(cfg.BACKUP_S3_BUCKET).toBe('maia-backups');
     expect(cfg.ALERT_CHANNELS).toEqual(['log']);
     expect('WHATSAPP_NUMBER_MAIA' in cfg).toBe(false);
   });
 
   it('the admin loader receives NextAuth/OIDC and not the WhatsApp session', () => {
-    const cfg = loadAdminConfig({ env: PROD(), profile: 'production' });
+    const cfg = loadAdminConfig({ env: PROD(), ...FIXTURE_OPTS });
     expect(cfg.NEXTAUTH_URL).toContain('https://');
     expect(cfg.OIDC_TENANT_SLUGS).toBe('primary');
     expect('BAILEYS_AUTH_DIR' in cfg).toBe(false);
   });
 
   it('the runtime loader parses coerced numbers, booleans and the alert list', () => {
-    const cfg = loadServiceConfig('runtime', { env: PROD(), profile: 'production' });
+    const cfg = loadServiceConfig('runtime', { env: PROD(), ...FIXTURE_OPTS });
     expect(cfg.APP_PORT).toBe(3000);
     expect(cfg.FEATURE_PROCEDURE_RUNTIME).toBe(true);
     expect(cfg.FEATURE_MCP_TOOLS).toBe(false);
@@ -84,7 +92,7 @@ describe('service loaders (#515)', () => {
   it('loading does not mutate the caller environment', () => {
     const env = PROD();
     const before = JSON.stringify(env);
-    loadServiceConfig('runtime', { env, profile: 'production' });
+    loadServiceConfig('runtime', { env, ...FIXTURE_OPTS });
     expect(JSON.stringify(env)).toBe(before);
   });
 
@@ -107,7 +115,7 @@ describe('service loaders (#515)', () => {
   });
 
   it('bootSummary emits profile/version/hash/warning count and no secret', () => {
-    const summary = bootSummary('runtime', { env: PROD(), profile: 'production' });
+    const summary = bootSummary('runtime', { env: PROD(), ...FIXTURE_OPTS });
     expect(summary).toEqual({
       service: 'runtime',
       profile: 'production',

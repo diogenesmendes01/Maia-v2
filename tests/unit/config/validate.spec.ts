@@ -28,13 +28,29 @@ function rules(result: { errors: readonly { rule: string }[]; warnings: readonly
 
 describe('validateConfig — per-profile fixtures (#515)', () => {
   for (const profile of PROFILES) {
-    it(`the ${profile} fixture is strictly valid`, () => {
-      const result = validateConfig({ env: envFor(profile), profile });
+    it(`the ${profile} fixture satisfies every rule of its profile`, () => {
+      // `allowSyntheticFixtures` is the ONLY thing waived: the fixture proves
+      // the contract is SATISFIABLE, and its values are deliberately synthetic
+      // (`secret/synthetic-fixture` rejects them in a real environment).
+      const result = validateConfig({
+        env: envFor(profile),
+        profile,
+        allowSyntheticFixtures: true,
+      });
       expect(result.errors, formatHuman(result)).toEqual([]);
       expect(result.ok).toBe(true);
       expect(result.profile).toBe(profile);
     });
   }
+
+  it.each(['staging', 'production'] as const)(
+    'the %s fixture is REJECTED when it is used as a real environment',
+    (profile) => {
+      const result = validateConfig({ env: envFor(profile), profile });
+      expect(result.ok, 'copiar uma fixture de CI para .env não pode passar').toBe(false);
+      expect(result.errors.some((p) => p.rule === 'secret/synthetic-fixture')).toBe(true);
+    },
+  );
 
   it('an empty environment reports EVERY missing requirement, not just the first', () => {
     const result = validateConfig({ env: {}, profile: 'production' });
