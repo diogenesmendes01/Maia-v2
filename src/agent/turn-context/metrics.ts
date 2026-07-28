@@ -90,13 +90,15 @@ export function recordCacheOutcome(section: TurnContextSection, result: CacheRes
 export function recordTruncation(
   section: TurnContextSection,
   reason: TruncationReason,
-  dropped: number,
+  lost: number,
 ): void {
-  // The counter tracks HOW MANY ITEMS were dropped, not how many truncation
-  // events happened: an operator watching this wants "we are silently losing
-  // context at rate X", and one event dropping 80 facts is not the same
-  // incident as 80 events dropping one each.
-  incCounter('maia_turn_context_truncated_total', { section, reason }, dropped);
+  // The counter tracks HOW MANY ITEMS were lost — removed entirely, or (for
+  // `max_bytes`) clipped to fit — not how many truncation events happened. An
+  // operator watching this wants "we are losing context at rate X", and one
+  // event dropping 80 facts is not the same incident as 80 events dropping one
+  // each. A section that hits BOTH limits reports each separately, so the
+  // labels say which knob to turn.
+  incCounter('maia_turn_context_truncated_total', { section, reason }, lost);
 }
 
 export function recordSectionSize(

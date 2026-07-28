@@ -25,7 +25,7 @@ import { logger } from '@/lib/logger.js';
 import { GapLevel } from '@/types/enums.js';
 import { sanitizeBlock } from './sanitize.js';
 import { hashScope } from './scope-hash.js';
-import { applyBudget, utf8Bytes } from './turn-context/budget.js';
+import { applyBudget, truncateUtf8, utf8Bytes } from './turn-context/budget.js';
 import { readCached } from './turn-context/cache.js';
 import {
   recordSectionStatus,
@@ -601,6 +601,10 @@ async function buildGapMentionSection(): Promise<string | null> {
     gaps,
     SECTION_BUDGETS.gaps,
     (g) => utf8Bytes(g.capability_description),
+    (g, maxBytes) => ({
+      ...g,
+      capability_description: truncateUtf8(g.capability_description, maxBytes),
+    }),
   ).items.map((g) => {
     const proposedSuffix =
       g.current_level === GapLevel.PROPOSED ? ' (proposta de melhoria já enviada)' : '';
@@ -703,7 +707,7 @@ async function buildPromptUninstrumented(
   // drops any fact whose corresponding memory_entry row has
   // mention_allowed=false or needs_review=true. Sensitive content captured
   // before P2 stays out of the prompt while the classifier reviews it.
-  const [recent, ents, facts, rules, entityStates] = await Promise.all([
+  const [recentRaw, ents, facts, rules, entityStates] = await Promise.all([
     mensagensRepo.recentInConversation(ctx.conversa.id, SECTION_BUDGETS.history.max_items),
     entidadesRepo.byIds(ctx.scope.entidades),
     factsRepo.listMentionableForScopes([
@@ -720,6 +724,23 @@ async function buildPromptUninstrumented(
     // instead of throwing.
     (async () => (await entityStatesRepo?.byIds?.(ctx.scope.entidades)) ?? [])(),
   ]);
+
+  // #511 round 1 review: `history` declared a budget but never went through
+  // `applyBudget`, so the item cap was enforced (by the repo's LIMIT) while the
+  // byte ceiling was not — one long message could still blow the prompt.
+  //
+  // `recentInConversation` returns NEWEST-FIRST (the render below reverses it),
+  // so a prefix keeps the most recent turns and drops the oldest. That is the
+  // right end to cut: recency is what the model needs. The oversized-single-
+  // message case is clipped rather than dropped, so a turn whose latest message
+  // is huge still shows the model what was just said.
+  const recent = applyBudget(
+    'history',
+    recentRaw,
+    SECTION_BUDGETS.history,
+    (m) => utf8Bytes(m.conteudo ?? ''),
+    (m, maxBytes) => ({ ...m, conteudo: truncateUtf8(m.conteudo ?? '', maxBytes) }),
+  ).items;
 
   // #511: index once instead of a linear scan per entity — the scope block and
   // the state block below both look entities up by id.
@@ -747,6 +768,7 @@ async function buildPromptUninstrumented(
     facts.map((f) => `  - ${f.escopo}/${f.chave}: ${wrapFact(JSON.stringify(f.valor))}`),
     SECTION_BUDGETS.facts,
     utf8Bytes,
+    truncateUtf8,
   ).items.join('\n');
 
   const rulesBlock = applyBudget(
@@ -757,6 +779,7 @@ async function buildPromptUninstrumented(
     ),
     SECTION_BUDGETS.rules,
     utf8Bytes,
+    truncateUtf8,
   ).items.join('\n');
 
   // Rendering walks `ctx.scope.entidades`, so the state block's ORDER is scope
@@ -764,15 +787,26 @@ async function buildPromptUninstrumented(
   // the block is byte-identical to the pre-batch output.
   const stateByEntityId = new Map(entityStates.map((s) => [s.entidade_id, s]));
 
-  const entityStateBlocks: string[] = [];
+  const entityStateLines: string[] = [];
   for (const eid of ctx.scope.entidades) {
     const st = stateByEntityId.get(eid);
     if (!st) continue;
     const ent = entById.get(eid);
-    entityStateBlocks.push(
+    entityStateLines.push(
       `  - ${ent?.nome ?? eid}: saldo=${st.saldo_consolidado ?? '?'}, próximo_venc=${st.proximo_vencimento ?? '?'}`,
     );
   }
+  // #511 round 1 review: `entity_states` declared a budget but never went
+  // through `applyBudget`, so an elephant tenant's scope rendered unbounded.
+  // Entity NAMES are tenant-controlled free text, so the byte ceiling matters
+  // here as much as the item cap.
+  const entityStateBlocks = applyBudget(
+    'entity_states',
+    entityStateLines,
+    SECTION_BUDGETS.entity_states,
+    utf8Bytes,
+    truncateUtf8,
+  ).items;
 
   // P2: Load memory_entry respecting visibility flags, behavioral hints, and
   // self-awareness (capabilities + gaps).
@@ -829,7 +863,13 @@ async function buildPromptUninstrumented(
     // that contains "ignore previous rules…" would be interpolated raw
     // into the system prompt and could override governance.
     const lines = mentionableMemories.map((m) => `- ${wrapMemory(m.content)}`);
-    const budgeted = applyBudget('memories', lines, SECTION_BUDGETS.memories, utf8Bytes);
+    const budgeted = applyBudget(
+      'memories',
+      lines,
+      SECTION_BUDGETS.memories,
+      utf8Bytes,
+      truncateUtf8,
+    );
     return '\n## Memória relevante\n' + budgeted.items.join('\n');
   };
 
@@ -867,7 +907,7 @@ async function buildPromptUninstrumented(
     // P83-C6: hints are derived from observed conversations and so
     // may carry untrusted text. Wrap them as <hint> data.
     const lines = allHints.map((h) => `- ${wrapHint(h.hint_text)}`);
-    const budgeted = applyBudget('hints', lines, SECTION_BUDGETS.hints, utf8Bytes);
+    const budgeted = applyBudget('hints', lines, SECTION_BUDGETS.hints, utf8Bytes, truncateUtf8);
     return '\n## Instruções comportamentais ativas\n' + budgeted.items.join('\n');
   };
 
@@ -892,8 +932,12 @@ async function buildPromptUninstrumented(
       (a, b) =>
         Number(b.confidence) - Number(a.confidence) || a.skill_name.localeCompare(b.skill_name),
     );
-    const topSkills = applyBudget('capabilities', sortedSkills, SECTION_BUDGETS.capabilities, (s) =>
-      utf8Bytes(s.skill_name),
+    const topSkills = applyBudget(
+      'capabilities',
+      sortedSkills,
+      SECTION_BUDGETS.capabilities,
+      (s) => utf8Bytes(s.skill_name),
+      (s, maxBytes) => ({ ...s, skill_name: truncateUtf8(s.skill_name, maxBytes) }),
     ).items;
     const masteredSkills = topSkills.filter((s) => Number(s.confidence) >= 0.7);
     const learningSkills = topSkills.filter((s) => Number(s.confidence) < 0.5);
