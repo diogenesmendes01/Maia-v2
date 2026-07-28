@@ -115,9 +115,11 @@ export default function TraceDetailPage({
               <Meta
                 label="Integridade"
                 value={
-                  trace.envelope_signed
-                    ? `HMAC v${trace.hmac_key_version}`
-                    : 'NÃO ASSINADO'
+                  trace.envelope_integrity === 'verified'
+                    ? `HMAC v${trace.hmac_key_version} verificado`
+                    : trace.envelope_integrity === 'invalid'
+                      ? 'ADULTERADO — HMAC não confere'
+                      : `Não verificável (chave v${trace.hmac_key_version} ausente)`
                 }
               />
               <Meta
@@ -139,6 +141,20 @@ export default function TraceDetailPage({
                 }
               />
             </dl>
+            {trace.envelope_integrity === 'invalid' && (
+              <Alert tone="danger">
+                A assinatura HMAC deste envelope NÃO confere com o conteúdo da
+                linha. Trate como incidente de integridade — não tome decisão
+                com base neste trace. Ver docs/runbooks/observability-slo.md §4.1.
+              </Alert>
+            )}
+            {trace.envelope_integrity === 'unknown' && (
+              <Alert tone="warning">
+                Não foi possível verificar a assinatura: a chave HMAC v
+                {trace.hmac_key_version} não está configurada neste processo.
+                Ausência de prova não é prova de adulteração.
+              </Alert>
+            )}
             {trace.body_status === 'orphaned' && (
               <Alert tone="danger">
                 O corpo deste trace nunca foi persistido e passou da janela de

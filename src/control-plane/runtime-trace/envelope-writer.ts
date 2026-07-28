@@ -35,6 +35,46 @@ import { signHmac, currentKeyVersion } from './lib/hmac.js';
 import { logger } from '@/lib/logger.js';
 import { incCounter, observeHistogram } from '@/lib/metrics.js';
 
+/**
+ * The exact field set covered by `envelope_hmac`, in one place.
+ *
+ * Issue #514 review round 1 [P2]: the Trace Explorer needs to VERIFY this
+ * signature, not just check that the string is non-empty. Signer and verifier
+ * must agree byte-for-byte, so both go through this function — a field added
+ * to the signature here is automatically covered by the check, and the two
+ * cannot silently drift apart.
+ *
+ * `canonicalJson` (in `lib/hmac.ts`) sorts keys, so declaration order here is
+ * irrelevant; what matters is the SET of fields and their exact values.
+ */
+export interface EnvelopeSignedFields {
+  trace_id: string;
+  tenant_id: string;
+  agent_id: string;
+  conversa_id: string | null;
+  turno_id: string | null;
+  policy_id: string | null;
+  decision: Decision;
+  side_effect_level: SideEffectLevel;
+  redaction_class: string;
+  hmac_key_version: number;
+}
+
+export function envelopeSignedPayload(fields: EnvelopeSignedFields): EnvelopeSignedFields {
+  return {
+    trace_id: fields.trace_id,
+    tenant_id: fields.tenant_id,
+    agent_id: fields.agent_id,
+    conversa_id: fields.conversa_id ?? null,
+    turno_id: fields.turno_id ?? null,
+    policy_id: fields.policy_id ?? null,
+    decision: fields.decision,
+    side_effect_level: fields.side_effect_level,
+    redaction_class: fields.redaction_class,
+    hmac_key_version: fields.hmac_key_version,
+  };
+}
+
 export interface EnvelopeWriteOptions {
   /**
    * If supplied, write a durable outbox row in the same transaction as
@@ -63,7 +103,7 @@ export async function writeEnvelope(
 
   // Payload to sign — canonical JSON guarantees stable bytes regardless of
   // insertion order. We sign the envelope contents (no DB-assigned fields).
-  const signedPayload = {
+  const signedPayload = envelopeSignedPayload({
     trace_id: input.trace_id,
     tenant_id: input.tenant_id,
     agent_id: input.agent_id,
@@ -74,7 +114,7 @@ export async function writeEnvelope(
     side_effect_level,
     redaction_class,
     hmac_key_version,
-  };
+  });
   const envelope_hmac = signHmac(input.tenant_id, hmac_key_version, signedPayload);
 
   try {

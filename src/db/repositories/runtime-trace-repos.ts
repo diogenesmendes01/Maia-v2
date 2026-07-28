@@ -29,6 +29,14 @@ import {
   runtime_trace_bodies,
 } from '@/db/schema.js';
 import { assertNotDefaultLiteral } from '@/db/tenant-context.js';
+import {
+  verifyEnvelopeIntegrity,
+  type EnvelopeIntegrity,
+} from '@/control-plane/runtime-trace/verify-envelope.js';
+import type {
+  Decision as VerifiableDecision,
+  SideEffectLevel as VerifiableSideEffectLevel,
+} from '@/control-plane/runtime-trace/types.js';
 
 /** Side-effect levels the Explorer treats as "touched the world". */
 const SIDE_EFFECT_LEVELS = ['medium', 'high', 'critical'] as const;
@@ -51,6 +59,11 @@ export interface TraceDetail extends TraceListItem {
   policy_id: string | null;
   envelope_hmac: string;
   hmac_key_version: number;
+  /**
+   * Result of RECOMPUTING the envelope HMAC over this row (issue #514 review
+   * round 1 [P2]). Not a "is the string non-empty" check.
+   */
+  integrity: EnvelopeIntegrity;
   /** Redacted packet as persisted by the body writer; null while pending. */
   redacted_packet: unknown;
   redaction_applied: string | null;
@@ -252,6 +265,21 @@ export const runtimeTraceRepo = {
       redaction_class: env.redaction_class,
       envelope_hmac: env.envelope_hmac,
       hmac_key_version: env.hmac_key_version,
+      // Recomputed over the row we just read, so a tampered field or a
+      // tampered signature both surface as `invalid`.
+      integrity: verifyEnvelopeIntegrity({
+        trace_id: env.trace_id,
+        tenant_id: env.tenant_id,
+        agent_id: env.agent_id,
+        conversa_id: env.conversa_id,
+        turno_id: env.turno_id,
+        policy_id: env.policy_id,
+        decision: env.decision as VerifiableDecision,
+        side_effect_level: env.side_effect_level as VerifiableSideEffectLevel,
+        redaction_class: env.redaction_class,
+        hmac_key_version: env.hmac_key_version,
+        envelope_hmac: env.envelope_hmac,
+      }),
       body_status: env.body_status,
       body_persisted_at: env.body_persisted_at,
       created_at: env.created_at,

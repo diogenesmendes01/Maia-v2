@@ -143,10 +143,16 @@ export const tracesRouter = router({
         side_effect_level: trace.side_effect_level,
         redaction_class: trace.redaction_class,
         redaction_applied: trace.redaction_applied,
-        // Integrity surface — the operator can see the trace is signed and
-        // with which key version, without the signature being actionable.
+        // Integrity surface. Review round 1 [P2]: this used to be
+        // `envelope_hmac.length > 0`, which reported a TAMPERED envelope as
+        // "signed" — worse than showing nothing, because an operator acts on
+        // it during an incident. The repo now RECOMPUTES the HMAC over the
+        // row's own fields and returns verified | invalid | unknown
+        // (`unknown` = the key version's secret is not configured here, which
+        // is a config gap, never evidence of tampering).
         hmac_key_version: trace.hmac_key_version,
-        envelope_signed: trace.envelope_hmac.length > 0,
+        envelope_integrity: trace.integrity,
+        envelope_signed: trace.integrity === 'verified',
         // Body lifecycle — makes "pending" and "orphaned" visible instead of
         // looking like an empty trace.
         body_status: trace.body_status,

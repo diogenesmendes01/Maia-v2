@@ -37,6 +37,8 @@ function detailRow(over: Record<string, unknown> = {}) {
     policy_id: 'pol-1',
     envelope_hmac: 'c2lnbmF0dXJl',
     hmac_key_version: 1,
+    // The repo recomputes this; the router only projects it.
+    integrity: 'verified' as const,
     redacted_packet: {
       trace_id: TRACE_ID,
       tenant_id: 'tenant-A',
@@ -231,9 +233,30 @@ describe('traces.getTrace', () => {
   it('reports integrity without handing out the signature', async () => {
     const { ctx } = makeCtx();
     const res = await tracesRouter.createCaller(ctx).getTrace({ traceId: TRACE_ID });
+    expect(res.envelope_integrity).toBe('verified');
     expect(res.envelope_signed).toBe(true);
     expect(res.hmac_key_version).toBe(1);
     expect(JSON.stringify(res)).not.toContain('c2lnbmF0dXJl');
+  });
+
+  it('a TAMPERED envelope is never reported as signed [P2]', async () => {
+    // The regression this guards: the old implementation returned
+    // `envelope_signed: envelope_hmac.length > 0`, so this exact row — a
+    // non-empty but non-verifying signature — was shown to the operator as
+    // signed during an incident.
+    const { ctx } = makeCtx({ detail: detailRow({ integrity: 'invalid' }) });
+    const res = await tracesRouter.createCaller(ctx).getTrace({ traceId: TRACE_ID });
+    expect(res.envelope_integrity).toBe('invalid');
+    expect(res.envelope_signed).toBe(false);
+  });
+
+  it('an unverifiable envelope is `unknown`, not `invalid`', async () => {
+    // Key rotated out / reader without the secret. Crying tampering here would
+    // make every rotation look like an incident.
+    const { ctx } = makeCtx({ detail: detailRow({ integrity: 'unknown' }) });
+    const res = await tracesRouter.createCaller(ctx).getTrace({ traceId: TRACE_ID });
+    expect(res.envelope_integrity).toBe('unknown');
+    expect(res.envelope_signed).toBe(false);
   });
 
   it('derives PEP decisions from the redacted hooks only', async () => {
