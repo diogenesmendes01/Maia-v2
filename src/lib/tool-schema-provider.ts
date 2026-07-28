@@ -24,6 +24,11 @@
  *      permission, limit and approval gate.
  */
 import { incCounter } from '@/lib/metrics.js';
+// Deterministic, key-order-independent hashing — the same primitives the
+// canonical converter uses, so the two hashes are directly comparable.
+// `schema-json.ts` imports `_registry.ts` for TYPES ONLY, so there is no
+// runtime cycle back into the tool registry from here.
+import { schemaHash, canonicalStringify } from '@/tools/schema-json.js';
 
 export type JsonObject = Record<string, unknown>;
 
@@ -242,4 +247,62 @@ export function recordStrictDowngrade(
   reason: 'model_not_strict_capable' | StrictRejectReason,
 ): void {
   incCounter('maia_tool_schema_provider_downgrade_total', { provider, model, reason });
+}
+
+/**
+ * Issue #509 / PR #530 review round 1, [P2] — identity of the tool payload that
+ * ACTUALLY went on the wire.
+ *
+ * `runtime-filter.ts` audits the CANONICAL contract, which is computed before
+ * any provider adaptation. In the strict path the envelope rewrites `required`,
+ * drops keywords and rewrites descriptions, so the canonical hash alone does not
+ * identify what the model saw. This records BOTH:
+ *
+ *   - `canonical_hash` — the same value the audit row carries, so a turn's audit
+ *     row and its wire payload can be joined;
+ *   - `provider_payload_hash` — the exact bytes handed to the SDK.
+ *
+ * Equal hashes ⇒ the envelope was a pass-through. Different hashes with
+ * `mode: 'canonical'` would be a bug. Different hashes with `mode: 'strict'` is
+ * expected, and comparing the two is how the P1 divergence class gets caught in
+ * production rather than in an incident.
+ *
+ * Contract identity only: hashes, counts and bytes. No schema bodies, no
+ * messages, no arguments.
+ */
+export interface ProviderPayloadDigest {
+  provider: string;
+  model: string;
+  /** 'strict' = every tool strict; 'mixed' = some; 'canonical' = none. */
+  mode: 'strict' | 'mixed' | 'canonical';
+  tools: number;
+  canonical_hash: string;
+  provider_payload_hash: string;
+  provider_payload_bytes: number;
+}
+
+export function describeProviderPayload(params: {
+  provider: string;
+  model: string;
+  canonical: ReadonlyArray<{ name: string; input_schema: Record<string, unknown> }>;
+  payload: unknown;
+  strictCount: number;
+}): ProviderPayloadDigest {
+  const canonicalMap: Record<string, string> = {};
+  for (const t of params.canonical) canonicalMap[t.name] = schemaHash(t.input_schema);
+  const serialized = canonicalStringify(params.payload);
+  return {
+    provider: params.provider,
+    model: params.model,
+    mode:
+      params.strictCount === 0
+        ? 'canonical'
+        : params.strictCount === params.canonical.length
+          ? 'strict'
+          : 'mixed',
+    tools: params.canonical.length,
+    canonical_hash: schemaHash(canonicalMap),
+    provider_payload_hash: schemaHash(params.payload),
+    provider_payload_bytes: Buffer.byteLength(serialized, 'utf8'),
+  };
 }

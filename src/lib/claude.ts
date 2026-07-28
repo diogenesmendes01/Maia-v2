@@ -11,6 +11,7 @@ import {
   supportsStrictToolSchemas,
   toStrictJsonSchema,
   recordStrictDowngrade,
+  describeProviderPayload,
 } from '@/lib/tool-schema-provider.js';
 
 export type LLMMessage = {
@@ -91,6 +92,22 @@ class AnthropicProvider implements LLMProvider {
   }): Promise<LLMResponse> {
     const model = params.model ?? config.CLAUDE_MODEL_MAIN;
     const start = Date.now();
+    // Issue #509 / PR #530 P2 — identity of the tool payload actually sent.
+    // Anthropic has no strict mode, so the envelope is a pass-through and the
+    // two hashes must match; logging both makes that verifiable instead of
+    // assumed.
+    if (params.tools && params.tools.length > 0) {
+      logger.debug(
+        describeProviderPayload({
+          provider: 'anthropic',
+          model,
+          canonical: params.tools,
+          payload: params.tools,
+          strictCount: 0,
+        }),
+        'llm.tool_payload',
+      );
+    }
     const res = await this.getClient().messages.create(
       {
         model,
@@ -293,13 +310,32 @@ class OpenRouterProvider implements LLMProvider {
   }): Promise<LLMResponse> {
     const model = params.model ?? config.OPENROUTER_MODEL_MAIN;
     const start = Date.now();
+    // Issue #509 — pass the model so the strict-mode capability matrix can
+    // decide whether `function.strict` is attached for this request.
+    const oaiTools = toOpenAITools(params.tools, model);
+    // PR #530 P2 — the strict envelope REWRITES the schema (required, dropped
+    // keywords, descriptions), so the canonical hash audited by the runtime
+    // filter does not identify this payload. Record both, plus the mode, so the
+    // divergence is observable in production rather than inferred.
+    if (params.tools && params.tools.length > 0 && oaiTools) {
+      logger.debug(
+        describeProviderPayload({
+          provider: 'openrouter',
+          model,
+          canonical: params.tools,
+          payload: oaiTools,
+          strictCount: oaiTools.filter(
+            (t) => (t as { function?: { strict?: boolean } }).function?.strict === true,
+          ).length,
+        }),
+        'llm.tool_payload',
+      );
+    }
     const res = await this.getClient().chat.completions.create(
       {
         model,
         messages: toOpenAIMessages(params.system, params.messages),
-        // Issue #509 — pass the model so the strict-mode capability matrix can
-        // decide whether `function.strict` is attached for this request.
-        tools: toOpenAITools(params.tools, model),
+        tools: oaiTools,
         max_tokens: params.max_tokens ?? 1024,
         temperature: params.temperature ?? 0.2,
       },

@@ -79,9 +79,19 @@ the exposed set rather than advertising a permissive stub, and the catalog lint
 
 Each schema has a deterministic `schema_hash`. Eight tools have their hash
 PINNED in the catalog lint — changing a contract changes the hash and fails the
-test, so the change is reviewed instead of silently shipped to the model. The
-hash of the visible set is recorded per turn in the `tool_visibility_resolved`
-audit row (`tool_schema_set_hash`).
+test, so the change is reviewed instead of silently shipped to the model.
+
+Two hashes are recorded per turn, because the provider envelope can rewrite the
+schema:
+
+| Where | Field | Identifies |
+|---|---|---|
+| `tool_visibility_resolved` audit row | `tool_schema_canonical_hash` (+ `_hashes`, `_bytes`) | the CANONICAL contract of the visible set |
+| `llm.tool_payload` log line, at the call site | `canonical_hash` + `provider_payload_hash` + `mode` | the exact bytes handed to the SDK |
+
+`canonical_hash` is the join key between the two. Equal hashes mean the envelope
+was a pass-through; different hashes with `mode: 'strict'` are expected, and
+comparing them is how an envelope that changed the contract gets caught.
 
 ### Provider delivery
 

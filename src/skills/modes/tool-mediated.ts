@@ -179,9 +179,13 @@ export async function toolMediatedMode(
   const visibleNames = allowedTools.filter((t) => !deniedTools.has(t));
   const tools: ToolSchema[] = getToolSchemasByName(visibleNames);
 
-  // Issue #509 — schema identity + budget for THIS skill's exposed set. The
-  // agent hot path records the same digest in its `tool_visibility_resolved`
-  // audit row; this path has no such audit, so the trace lives in the log.
+  // Issue #509 — CANONICAL schema identity + budget for THIS skill's exposed
+  // set. The agent hot path records the same digest in its
+  // `tool_visibility_resolved` audit row; this path has no such audit, so the
+  // trace lives in the log. Canonical, NOT the wire payload: the provider
+  // envelope is applied later inside `callLLM`, which logs its own
+  // `llm.tool_payload` line carrying the same `canonical_hash` plus the
+  // `provider_payload_hash` (PR #530 review round 1, P2).
   // Contract identity only: no schema bodies, no arguments.
   {
     const digest = describeExposedSchemas(
@@ -191,8 +195,8 @@ export async function toolMediatedMode(
     logger.debug(
       {
         skill_id: ctx.skill.id,
-        tool_schema_set_hash: digest.set_hash,
-        tool_schema_bytes: digest.bytes,
+        tool_schema_canonical_hash: digest.set_hash,
+        tool_schema_canonical_bytes: digest.bytes,
         tools: digest.tools,
       },
       'p9a.tool_schemas_resolved',

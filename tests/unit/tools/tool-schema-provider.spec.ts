@@ -10,6 +10,7 @@ import { describe, it, expect } from 'vitest';
 import {
   supportsStrictToolSchemas,
   toStrictJsonSchema,
+  describeProviderPayload,
   STRICT_CAPABLE_MODEL_PREFIXES,
 } from '../../../src/lib/tool-schema-provider.js';
 import { toOpenAITools, type ToolSchema } from '../../../src/lib/claude.js';
@@ -324,5 +325,133 @@ describe('#509 provider equivalence — both providers get the same contract', (
     const after = new Set((strict.required ?? []) as string[]);
     for (const key of before) expect(after.has(key)).toBe(true);
     expect(strict.additionalProperties).toBe(false);
+  });
+});
+
+/**
+ * PR #530 review round 1, [P2] — the audited hash must identify the payload
+ * that went on the wire, not the pre-adaptation contract.
+ */
+describe('#530 P2 — provider payload identity', () => {
+  const built = toolInputToJsonSchema(REGISTRY.cancel_transaction!);
+  const canonical = [
+    { name: built.name, description: built.description, input_schema: built.input_schema },
+  ];
+
+  it('canonical_hash matches the audited canonical digest for the same set', async () => {
+    const { describeExposedSchemas } = await import('../../../src/tools/_registry.js');
+    const audited = describeExposedSchemas(['cancel_transaction'], 'test');
+    const digest = describeProviderPayload({
+      provider: 'anthropic',
+      model: 'claude-sonnet-4-6',
+      canonical,
+      payload: canonical,
+      strictCount: 0,
+    });
+    // The join key between the audit row and the wire payload.
+    expect(digest.canonical_hash).toBe(audited.set_hash);
+  });
+
+  it('a pass-through envelope (anthropic) reports mode canonical', () => {
+    const digest = describeProviderPayload({
+      provider: 'anthropic',
+      model: 'claude-sonnet-4-6',
+      canonical,
+      payload: canonical,
+      strictCount: 0,
+    });
+    expect(digest.mode).toBe('canonical');
+    expect(digest.tools).toBe(1);
+    expect(digest.provider_payload_bytes).toBeGreaterThan(0);
+    expect(digest.provider_payload_hash).toMatch(/^[0-9a-f]{16}$/);
+  });
+
+  it('the OpenAI envelope has a DIFFERENT payload hash than the canonical one', () => {
+    const payload = toOpenAITools(canonical, 'anthropic/claude-sonnet-4.6')!;
+    const digest = describeProviderPayload({
+      provider: 'openrouter',
+      model: 'anthropic/claude-sonnet-4.6',
+      canonical,
+      payload,
+      strictCount: 0,
+    });
+    // This is the whole point of the finding: the two identify different things,
+    // so recording only one of them cannot describe what the model saw.
+    expect(digest.provider_payload_hash).not.toBe(digest.canonical_hash);
+  });
+
+  it('a strict rewrite changes the payload hash and reports mode strict', () => {
+    const nullSafe = [
+      {
+        name: 'ns',
+        description: 'ns',
+        input_schema: {
+          type: 'object',
+          properties: {
+            req: { type: 'string' },
+            opt: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+          },
+          required: ['req'],
+          additionalProperties: false,
+        },
+      },
+    ];
+    const plain = toOpenAITools(nullSafe, 'anthropic/claude-sonnet-4.6')!;
+    const strict = toOpenAITools(nullSafe, 'openai/gpt-4.1')!;
+    expect((strict[0] as { function: { strict?: boolean } }).function.strict).toBe(true);
+
+    const base = { provider: 'openrouter', canonical: nullSafe };
+    const plainDigest = describeProviderPayload({
+      ...base,
+      model: 'anthropic/claude-sonnet-4.6',
+      payload: plain,
+      strictCount: 0,
+    });
+    const strictDigest = describeProviderPayload({
+      ...base,
+      model: 'openai/gpt-4.1',
+      payload: strict,
+      strictCount: 1,
+    });
+
+    // Same contract on both sides…
+    expect(strictDigest.canonical_hash).toBe(plainDigest.canonical_hash);
+    // …different bytes on the wire, and the mode says why.
+    expect(strictDigest.provider_payload_hash).not.toBe(plainDigest.provider_payload_hash);
+    expect(strictDigest.mode).toBe('strict');
+    expect(plainDigest.mode).toBe('canonical');
+  });
+
+  it('mode is "mixed" when only some tools went strict', () => {
+    const digest = describeProviderPayload({
+      provider: 'openrouter',
+      model: 'openai/gpt-4.1',
+      canonical: [...canonical, { name: 'b', description: 'b', input_schema: { type: 'object' } }],
+      payload: [],
+      strictCount: 1,
+    });
+    expect(digest.mode).toBe('mixed');
+  });
+
+  it('the digest carries identity only — no schema bodies', () => {
+    const digest = describeProviderPayload({
+      provider: 'openrouter',
+      model: 'openai/gpt-4.1',
+      canonical,
+      payload: toOpenAITools(canonical, 'openai/gpt-4.1')!,
+      strictCount: 0,
+    });
+    const serialized = JSON.stringify(digest);
+    expect(serialized).not.toContain('properties');
+    expect(serialized).not.toContain('entidade_id');
+    expect(Object.keys(digest).sort()).toEqual([
+      'canonical_hash',
+      'mode',
+      'model',
+      'provider',
+      'provider_payload_bytes',
+      'provider_payload_hash',
+      'tools',
+    ]);
   });
 });
