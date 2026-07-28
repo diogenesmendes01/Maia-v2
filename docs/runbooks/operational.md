@@ -309,6 +309,7 @@ sudo systemctl stop maia          # SIGTERM → inicia o drain
 #   lifecycle.shutdown_step_done    step=cron_workers
 #   lifecycle.shutdown_step_done    step=bullmq
 #   lifecycle.shutdown_step_done    step=background_tasks
+#   lifecycle.shutdown_step_done    step=turn_context_subscriber
 #   lifecycle.shutdown_step_done    step=line_sessions
 #   lifecycle.shutdown_step_done    step=baileys
 #   lifecycle.shutdown_step_done    step=http
@@ -335,12 +336,16 @@ sudo systemctl start maia
 4. espera as tarefas fire-and-forget rastreadas (reflection pós-turno, escrita
    de DLQ, registro de linha) — depois da fila e dos crons, que são quem as
    gera;
-5. fecha as linhas adicionais e depois a sessão Baileys primária (cancelando o
+5. fecha o subscriber de invalidação do cache de contexto do turno (#511). Ele
+   tem conexão ioredis PRÓPRIA (o ioredis proíbe outros comandos num cliente
+   inscrito), então o `pools` do passo 9 não a cobre; deixá-la aberta segurava
+   o event loop e disparava o backstop de saída a cada deploy limpo;
+6. fecha as linhas adicionais e depois a sessão Baileys primária (cancelando o
    timer de reconexão pendente);
-6. fecha o Fastify (dispara os `onClose`: timers do coletor de memória e do probe de DB);
-7. audita `system_stopped`;
-8. fecha Redis e Postgres **por último** (nenhum consumidor fica com handle fechado);
-9. sai naturalmente. Não há `process.exit(0)` prematuro.
+7. fecha o Fastify (dispara os `onClose`: timers do coletor de memória e do probe de DB);
+8. audita `system_stopped`;
+9. fecha Redis e Postgres **por último** (nenhum consumidor fica com handle fechado);
+10. sai naturalmente. Não há `process.exit(0)` prematuro.
 
 **SIGTERM durante o boot** é tratado: cada fase do startup roda sob
 `lifecycle.runStartupStep`, que aborta o boot no primeiro checkpoint após o

@@ -86,7 +86,23 @@ export function registerShutdownSequence(): void {
     },
   });
 
-  // 5. additional WhatsApp lines, then the primary socket. Every producer of
+  // 5. turn-context cache subscriber (issue #511). It owns its OWN ioredis
+  //    connection — ioredis forbids other commands on a subscribed client — so
+  //    the shared client that `pools` quits is a different handle. Closed HERE:
+  //    every reader of the cache (BullMQ turns, cron prompt builders, post-turn
+  //    background tasks) is already drained, and leaving it open kept the event
+  //    loop alive after a clean drain, firing the exit backstop on every deploy.
+  lifecycle.registerShutdownStep({
+    name: 'turn_context_subscriber',
+    run: async () => {
+      const { stopTurnContextCacheInvalidationSubscriber } = await import(
+        '@/agent/turn-context/cache.js'
+      );
+      await stopTurnContextCacheInvalidationSubscriber();
+    },
+  });
+
+  // 6. additional WhatsApp lines, then the primary socket. Every producer of
   //    outbound traffic (jobs, crons, background tasks) is already quiet.
   //    Lines first so a per-line reconnect timer can never resurrect a socket
   //    after the primary session is gone (review #498 alto 3 cancels them).
@@ -106,7 +122,7 @@ export function registerShutdownSequence(): void {
     },
   });
 
-  // 6. HTTP. Fastify's `onClose` hooks stop the Redis memory collector and the
+  // 7. HTTP. Fastify's `onClose` hooks stop the Redis memory collector and the
   //    DB probe timer, so this must run before the pools close.
   lifecycle.registerShutdownStep({
     name: 'http',
@@ -117,7 +133,7 @@ export function registerShutdownSequence(): void {
     },
   });
 
-  // 7. audit — still needs the DB pool, hence before `pools`.
+  // 8. audit — still needs the DB pool, hence before `pools`.
   lifecycle.registerShutdownStep({
     name: 'audit_stop',
     critical: false,
@@ -129,7 +145,7 @@ export function registerShutdownSequence(): void {
     },
   });
 
-  // 8. pools LAST.
+  // 9. pools LAST.
   lifecycle.registerShutdownStep({
     name: 'pools',
     run: async () => {

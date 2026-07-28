@@ -50,6 +50,11 @@ vi.mock('../../../src/gateway/baileys.js', () => ({
 vi.mock('../../../src/lib/healthcheck.js', () => ({
   shutdownPools: vi.fn(async () => void calls.push('pools')),
 }));
+vi.mock('../../../src/agent/turn-context/cache.js', () => ({
+  stopTurnContextCacheInvalidationSubscriber: vi.fn(
+    async () => void calls.push('turn_context_subscriber'),
+  ),
+}));
 vi.mock('../../../src/governance/audit.js', () => ({
   audit: vi.fn(async () => void calls.push('audit_stop')),
 }));
@@ -91,10 +96,32 @@ describe('shutdown sequence order', () => {
     await lifecycle.shutdown({ signal: 'SIGTERM' });
 
     expect(calls.at(-1)).toBe('pools');
-    for (const earlier of ['bullmq_close', 'drain_cron', 'line_sessions', 'baileys', 'audit_stop']) {
+    for (const earlier of [
+      'bullmq_close',
+      'drain_cron',
+      'turn_context_subscriber',
+      'line_sessions',
+      'baileys',
+      'audit_stop',
+    ]) {
       expect(calls.indexOf(earlier)).toBeLessThan(calls.indexOf('pools'));
       expect(calls.indexOf(earlier)).toBeGreaterThanOrEqual(0);
     }
+  });
+
+  it('closes the turn-context subscriber AFTER every reader of the cache (#511)', async () => {
+    // It owns a SEPARATE ioredis connection, so `pools` does not cover it —
+    // leaving it open kept the event loop alive after a clean drain and fired
+    // the exit backstop on every deploy. But it must close only once the turns,
+    // the crons and the post-turn tasks that READ the cache are done.
+    registerShutdownSequence();
+    await lifecycle.shutdown({ signal: 'SIGTERM' });
+
+    const subIdx = calls.indexOf('turn_context_subscriber');
+    expect(subIdx).toBeGreaterThanOrEqual(0);
+    expect(calls.indexOf('drain_cron')).toBeLessThan(subIdx);
+    expect(calls.indexOf('bullmq_close')).toBeLessThan(subIdx);
+    expect(subIdx).toBeLessThan(calls.indexOf('pools'));
   });
 
   it('produces a clean drain end-to-end', async () => {

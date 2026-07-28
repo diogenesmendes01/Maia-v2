@@ -142,19 +142,29 @@ async function main() {
     );
     startPolicyCacheInvalidationSubscriber();
     logger.info('policy_resolver.cache_invalidation_subscriber_started');
-  });
 
-  // Issue #511: cross-replica invalidation for the turn-context cache
-  // (identity / capabilities / gaps). Idempotent, and a no-op while
-  // FEATURE_TURN_CONTEXT_CACHE is off — with nothing cached there is nothing to
-  // invalidate, and an idle subscriber connection per replica is not free.
-  const { startTurnContextCacheInvalidationSubscriber } = await import(
-    '@/agent/turn-context/cache.js'
-  );
-  startTurnContextCacheInvalidationSubscriber();
-  if (config.FEATURE_TURN_CONTEXT_CACHE) {
-    logger.info('turn_context.cache_invalidation_subscriber_started');
-  }
+    // Issue #511: cross-replica invalidation for the turn-context cache
+    // (identity / capabilities / gaps). Idempotent, and a no-op while
+    // FEATURE_TURN_CONTEXT_CACHE is off — with nothing cached there is nothing to
+    // invalidate, and an idle subscriber connection per replica is not free.
+    //
+    // Lives in `boot_chores` (right after the Redis phase, next to its twin,
+    // the policy-cache subscriber) rather than under `roleOwns(agent_worker)`:
+    // the call itself does NO I/O — it flips a flag, and the ioredis connection
+    // is built lazily by the first tenant that actually caches something. That
+    // laziness IS the role-awareness, and it is more accurate than a static
+    // gate would be: the agent worker is not the only prompt builder (the
+    // playground drain, the synthetic probe and the briefings are crons), so
+    // gating on `agent_worker` would silently degrade the scheduler role to an
+    // un-invalidatable — hence declined — cache.
+    const { startTurnContextCacheInvalidationSubscriber } = await import(
+      '@/agent/turn-context/cache.js'
+    );
+    startTurnContextCacheInvalidationSubscriber();
+    if (config.FEATURE_TURN_CONTEXT_CACHE) {
+      logger.info('turn_context.cache_invalidation_subscriber_started');
+    }
+  });
 
   // ── 6. HTTP (probes answer 503 while `starting`) ───────────────────────
   await lifecycle.runStartupStep('http', async () => {
