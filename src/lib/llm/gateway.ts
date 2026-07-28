@@ -81,7 +81,7 @@ function linkSignal(caller: AbortSignal | undefined, deadlineAt: number | undefi
 function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     if (signal?.aborted) {
-      reject(abortedError(signal.reason));
+      reject(abortedError());
       return;
     }
     let onAbort: (() => void) | null = null;
@@ -92,7 +92,7 @@ function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
     if (signal) {
       onAbort = () => {
         clearTimeout(timer);
-        reject(abortedError(signal.reason));
+        reject(abortedError());
       };
       signal.addEventListener('abort', onAbort, { once: true });
     }
@@ -104,8 +104,10 @@ function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
  * pré-#508 casavam por substring. Mantido de propósito para não quebrar
  * contrato de erro durante a migração.
  */
-function abortedError(reason?: unknown): LLMGatewayError {
-  return new LLMGatewayError({ kind: 'aborted', detail: 'llm_call_aborted', cause: reason });
+function abortedError(): LLMGatewayError {
+  // `signal.reason` NÃO entra: é valor arbitrário do caller e já foi vetor de
+  // vazamento em outros sistemas. O kind já diz tudo que o operador precisa.
+  return new LLMGatewayError({ kind: 'aborted', detail: 'llm_call_aborted' });
 }
 
 /** Backoff exponencial com jitter para baixo (50%–100% da janela nominal). */
@@ -123,7 +125,7 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
 
   // (1) Cancelamento antecipado: um caller que já abortou não paga nem pela
   // leitura de settings. Precede QUALQUER I/O.
-  if (ctx.signal?.aborted) throw abortedError(ctx.signal.reason);
+  if (ctx.signal?.aborted) throw abortedError();
   if (ctx.deadline_at !== undefined && ctx.deadline_at <= Date.now()) {
     throw new LLMGatewayError({
       kind: 'timeout',
@@ -169,7 +171,7 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
     const err =
       budgetErr instanceof LLMGatewayError
         ? budgetErr
-        : new LLMGatewayError({ kind: 'budget_exhausted', detail: budgetErr });
+        : new LLMGatewayError({ kind: 'budget_exhausted', detail: 'budget check failed' });
     await emitUsage(
       {
         workload: req.workload,
@@ -262,7 +264,7 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
   try {
     for (let i = 0; i < maxAttempts; i++) {
       if (ctx.signal?.aborted) {
-        const err = abortedError(ctx.signal.reason);
+        const err = abortedError();
         await fail(primary, err);
         throw err;
       }
@@ -341,7 +343,7 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
           // Abortou durante o backoff: ainda é um desfecho da chamada e
           // precisa aparecer em `maia_llm_cancelled_total`.
           const aborted =
-            sleepErr instanceof LLMGatewayError ? sleepErr : abortedError(sleepErr);
+            sleepErr instanceof LLMGatewayError ? sleepErr : abortedError();
           await fail(primary, aborted);
           throw aborted;
         }

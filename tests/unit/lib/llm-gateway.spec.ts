@@ -448,4 +448,54 @@ describe('LLMGatewayError — redaction', () => {
     ).catch((e) => e as Error);
     expect(err.message).not.toContain('123.456.789-00');
   });
+
+  /**
+   * O vetor real: um `400` do provider tipicamente ECOA o input. Truncar em
+   * 200 caracteres preservava o começo do eco — que é exatamente onde a PII
+   * aparece. A correção não é sanitizar melhor: é a mensagem do provider não
+   * entrar no erro.
+   */
+  it('erro de provider que ECOA PII não propaga nada do corpo', async () => {
+    const echoed =
+      'invalid_request_error: messages.0.content: "Cliente Maria Silva, CPF 123.456.789-00, ' +
+      'telefone (11) 98765-4321, transferir R$ 12.500,00 para a conta 4455-6" is too long';
+    anthropicCreateMock.mockRejectedValue(
+      apiError(400, echoed, { 'request-id': 'req_abc123' }),
+    );
+
+    const err = await executeLLM(
+      req({ messages: [{ role: 'user', content: 'Maria Silva, CPF 123.456.789-00' }] }),
+    ).catch((e) => e as Error & { kind?: string; status?: number; request_id?: string });
+
+    // Nada do corpo do provider — nem o começo, que sobrevivia ao truncamento.
+    expect(err.message).not.toContain('Maria Silva');
+    expect(err.message).not.toContain('123.456.789-00');
+    expect(err.message).not.toContain('98765-4321');
+    expect(err.message).not.toContain('12.500');
+    expect(err.message).not.toContain('4455-6');
+    expect(err.message).not.toContain('is too long');
+
+    // O que SAI é a allowlist: kind + status + request_id.
+    expect(err.kind).toBe('invalid_request');
+    expect(err.status).toBe(400);
+    expect(err.request_id).toBe('req_abc123');
+    expect(err.message).toBe('llm_gateway_invalid_request (status=400 request_id=req_abc123)');
+  });
+
+  it('nenhum campo enumerável do erro carrega o corpo do provider', async () => {
+    const echoed = 'boom: paciente João, CID F32.1, CPF 987.654.321-00';
+    anthropicCreateMock.mockRejectedValue(apiError(400, echoed));
+    const err = await executeLLM(req()).catch((e) => e);
+    // Cobre o caminho "vazou por serializador de log": pino & cia descem em
+    // `cause` e em propriedades próprias. Nenhuma pode conter o eco.
+    const serialized = JSON.stringify({
+      ...(err as object),
+      message: (err as Error).message,
+      cause: (err as { cause?: unknown }).cause,
+    });
+    expect(serialized).not.toContain('987.654.321-00');
+    expect(serialized).not.toContain('João');
+    expect(serialized).not.toContain('F32.1');
+    expect((err as { cause?: unknown }).cause).toBeUndefined();
+  });
 });

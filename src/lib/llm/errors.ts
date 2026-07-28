@@ -51,9 +51,19 @@ const SECRET_PATTERNS: RegExp[] = [
 const MAX_ERROR_TEXT = 200;
 
 /**
- * Redige e trunca texto vindo do provider. Truncar importa tanto quanto
- * redigir: um corpo de erro 400 do provider costuma ecoar parte do prompt, e
- * prompt é PII neste produto.
+ * Scrubber de ÚLTIMA linha para texto AUTORADO PELA MAIA.
+ *
+ * ⚠️ Não é — e nunca foi suficiente como — sanitizador de corpo de provider.
+ * A versão original desta função truncava em 200 caracteres achando que isso
+ * bastava. Não basta: um `400` do provider tipicamente ECOA o input, e o
+ * início do eco é justamente o que sobrevive ao truncamento. O prompt da Maia
+ * carrega conversa de cliente — CPF, telefone, valores. Truncar preserva PII,
+ * não a remove.
+ *
+ * Por isso texto de provider não passa mais por aqui: ele simplesmente não
+ * entra no erro (ver `classifyProviderError`). Esta função continua existindo
+ * para os literais que a própria Maia escreve, onde o risco é acidente de
+ * interpolação, não eco de input.
  */
 export function redactErrorText(input: unknown): string {
   const raw =
@@ -69,14 +79,19 @@ export function redactErrorText(input: unknown): string {
 
 export type LLMGatewayErrorInit = {
   kind: LLMErrorKind;
-  /** Texto JÁ redigido, ou o erro do provider (será redigido aqui). */
-  detail?: unknown;
+  /**
+   * Texto AUTORADO PELA MAIA (literal no código). NUNCA passe aqui a
+   * mensagem, o corpo ou qualquer campo livre vindo do provider — use os
+   * campos estruturados abaixo, que são a allowlist.
+   */
+  detail?: string;
   status?: number;
   retry_after_ms?: number;
+  /** Id de correlação do provider — opaco, sem conteúdo de request. */
+  request_id?: string;
   provider?: string;
   model?: string;
   workload?: string;
-  cause?: unknown;
 };
 
 export class LLMGatewayError extends Error {
@@ -85,26 +100,37 @@ export class LLMGatewayError extends Error {
   readonly retryable: boolean;
   readonly status?: number;
   readonly retry_after_ms?: number;
+  readonly request_id?: string;
   readonly provider?: string;
   readonly model?: string;
   readonly workload?: string;
 
   constructor(init: LLMGatewayErrorInit) {
-    const detail = init.detail === undefined ? '' : redactErrorText(init.detail);
-    super(detail ? `llm_gateway_${init.kind}: ${detail}` : `llm_gateway_${init.kind}`);
+    // A mensagem é montada SÓ com campos da allowlist. `status` e
+    // `request_id` são o que um operador precisa para abrir chamado com o
+    // provider; a mensagem dele não acrescenta nada que valha o risco.
+    const parts: string[] = [`llm_gateway_${init.kind}`];
+    const facts: string[] = [];
+    if (init.status !== undefined) facts.push(`status=${init.status}`);
+    if (init.request_id) facts.push(`request_id=${init.request_id}`);
+    if (facts.length > 0) parts.push(`(${facts.join(' ')})`);
+    const detail = init.detail ? redactErrorText(init.detail) : '';
+    if (detail) parts.push(`- ${detail}`);
+    super(parts.join(' '));
+
     this.name = 'LLMGatewayError';
     this.kind = init.kind;
     this.retryable = isRetryableKind(init.kind);
     this.status = init.status;
     this.retry_after_ms = init.retry_after_ms;
+    this.request_id = init.request_id;
     this.provider = init.provider;
     this.model = init.model;
     this.workload = init.workload;
-    if (init.cause !== undefined) {
-      // `cause` fica disponível pra debug local, mas nunca é serializado nos
-      // logs do gateway (ver telemetry.ts) — só o kind + detalhe redigido.
-      (this as { cause?: unknown }).cause = init.cause;
-    }
+    // `cause` foi REMOVIDO de propósito. Anexar o erro original mantinha o
+    // corpo do provider pendurado no objeto, e serializadores de log (pino
+    // inclusive) descem em `cause` — o vazamento voltava pela porta dos
+    // fundos, exatamente onde ninguém procura.
   }
 }
 
@@ -176,11 +202,17 @@ export function classifyProviderError(
 ): LLMGatewayError {
   if (err instanceof LLMGatewayError) return err;
 
+  // NENHUM ramo abaixo repassa `detail` a partir do erro do provider. O que
+  // sai é a allowlist: kind + status + request_id. É a diferença entre
+  // "sanitizamos a mensagem do provider" (frágil — depende de acertar todo
+  // padrão de PII) e "a mensagem do provider não entra" (estrutural).
+  const request_id = providerRequestId(err);
+
   if (isAbortError(err)) {
-    return new LLMGatewayError({ kind: 'aborted', detail: err, cause: err, ...meta });
+    return new LLMGatewayError({ kind: 'aborted', request_id, ...meta });
   }
   if (isTimeoutError(err)) {
-    return new LLMGatewayError({ kind: 'timeout', detail: err, cause: err, ...meta });
+    return new LLMGatewayError({ kind: 'timeout', request_id, ...meta });
   }
 
   const status = (err as { status?: unknown })?.status;
@@ -195,13 +227,24 @@ export function classifyProviderError(
     else kind = 'invalid_request';
     return new LLMGatewayError({
       kind,
-      detail: err,
       status,
       retry_after_ms: retryAfter,
-      cause: err,
+      request_id,
       ...meta,
     });
   }
 
-  return new LLMGatewayError({ kind: 'network', detail: err, cause: err, ...meta });
+  return new LLMGatewayError({ kind: 'network', request_id, ...meta });
+}
+
+/**
+ * Id de correlação do provider. Anthropic expõe `request_id` no erro tipado;
+ * ambos os SDKs devolvem o header. É opaco por construção — não carrega
+ * conteúdo da requisição — e é o que o operador leva para o suporte do
+ * provider no lugar da mensagem que não propagamos mais.
+ */
+function providerRequestId(err: unknown): string | undefined {
+  const direct = (err as { request_id?: unknown })?.request_id;
+  if (typeof direct === 'string' && direct.length > 0) return direct;
+  return readHeader(err, 'request-id') ?? readHeader(err, 'x-request-id');
 }
