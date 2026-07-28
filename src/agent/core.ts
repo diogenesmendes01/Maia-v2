@@ -43,7 +43,7 @@ import type { TypingHandle } from '@/gateway/presence.js';
 // procedure-selector node output below).
 import { type SelectorDecision } from '@/cognition/procedure-selector.js';
 import * as procedureEngine from '@/procedures/engine.js';
-import { sendOutbound, safeDispatchOutput } from './output-dispatch.js';
+import { sendOutbound, safeDispatchOutput, OutboundDeliveryError } from './output-dispatch.js';
 import { executeSelectedSkill } from './execute-skill.js';
 import { runSkill } from '@/skills/index.js';
 import { skillsRepo, outboundMessagesRepo } from '@/db/repositories.js';
@@ -1191,18 +1191,52 @@ async function runAgentForMensagemInner(
       // fail-closed: the always-on engine errored → block the turn, reply to
       // user, skip LLM (there is no legacy fallback path anymore)
       const failMsg = 'Sistema indisponível temporariamente. Tente novamente em alguns instantes.';
-      await sendOutbound(pessoa.id, c.id, failMsg, inbound.id, {
-        channel_id: c.channel_id,
-      }).catch((e) =>
-        logger.warn({ err: (e as Error).message }, 'agent.decision_engine.fail_closed_reply_failed'),
-      );
-      // Fallback determinístico entregue ao usuário (não é sucesso do turno,
-      // mas também não é retry: o engine falhou fechado por decisão de política).
-      await concludeTurn(turn, 'fallback_delivered', {
-        pessoa_id: pessoa.id,
-        mensagem_id: inbound.id,
-      });
-      await markAllProcessed(0);
+      // #503 — o resultado do envio DECIDE o outcome. Antes o `.catch` engolia
+      // a falha e o turno era concluído como `fallback_delivered` mesmo quando
+      // nada chegou ao usuário, violando o critério da issue de que falha
+      // pre-send não resulta em `completed`.
+      //
+      // `sendOutbound` lança `OutboundDeliveryError` com o flag `delivered`,
+      // que distingue as duas situações que não podem ser confundidas:
+      //   delivered=false → PRE-SEND (canal desconectado, pessoa/JID não
+      //     resolvidos): nada chegou, retry é seguro;
+      //   delivered=true  → enviado mas ambíguo (transporte lançou depois do
+      //     envio, ou persistência falhou): NUNCA reenviar.
+      let fallback: 'sent' | 'ambiguous' | 'not_sent' = 'sent';
+      try {
+        await sendOutbound(pessoa.id, c.id, failMsg, inbound.id, {
+          channel_id: c.channel_id,
+        });
+      } catch (e) {
+        fallback = e instanceof OutboundDeliveryError && e.delivered ? 'ambiguous' : 'not_sent';
+        logger.warn(
+          { err: (e as Error).message, fallback },
+          'agent.decision_engine.fail_closed_reply_failed',
+        );
+      }
+
+      if (fallback === 'not_sent') {
+        // Nada foi entregue e o ReAct nem chegou a rodar — nenhuma tool, logo
+        // nenhum efeito irreversível. Retry é seguro e é o único desfecho
+        // honesto.
+        await failTurnRetryable(turn, {
+          code: 'decision_engine_fallback_not_sent',
+          mensagem_id: inbound.id,
+        });
+      } else {
+        await concludeTurn(
+          turn,
+          fallback === 'ambiguous' ? 'reply_delivery_unknown' : 'fallback_delivered',
+          { pessoa_id: pessoa.id, mensagem_id: inbound.id },
+        );
+      }
+
+      // Mesma regra de projeção da conclusão do ReAct: turno não-terminal em
+      // modo autoritativo NÃO carimba `processada_em`, senão o recovery
+      // reenfileira e a reentrada morre no early-return legado.
+      if (!turnStateAuthoritative() || fallback !== 'not_sent') {
+        await markAllProcessed(0);
+      }
       await conversasRepo.touch(c.id);
       await clearDebounceState(pessoa.telefone_whatsapp);
       return;
