@@ -38,7 +38,7 @@
     "pr:body:check": "tsx scripts/check-pr-body.ts",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:leak": "vitest run tests/integration/leak.spec.ts tests/integration/repos-leak.spec.ts tests/integration/agent-tool-grants-leak.spec.ts tests/unit/cross-entity.spec.ts tests/unit/constitutional.spec.ts tests/unit/agent-tool-grants-repo-scope.spec.ts tests/integration/synthetic-probe.spec.ts tests/unit/turn-context-cache.spec.ts tests/integration/turn-context-batch-repos.spec.ts",
+    "test:leak": "vitest run tests/integration/leak.spec.ts tests/integration/repos-leak.spec.ts tests/integration/agent-tool-grants-leak.spec.ts tests/unit/cross-entity.spec.ts tests/unit/constitutional.spec.ts tests/unit/agent-tool-grants-repo-scope.spec.ts tests/integration/synthetic-probe.spec.ts tests/unit/turn-context-cache.spec.ts tests/unit/turn-context-warm-cache.spec.ts tests/integration/turn-context-batch-repos.spec.ts",
     "test:integration:setup": "docker compose up -d redis postgres",
     "test:integration:teardown": "docker compose down -v",
     "test:integration": "vitest run tests/integration --no-coverage",

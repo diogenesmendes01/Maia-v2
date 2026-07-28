@@ -27,6 +27,56 @@
 | `src/agent/message-update.ts` | Updates outbound message state |
 | `src/agent/notification-adapter.ts` | Adapter to notification channels |
 | `src/agent/scope-hash.ts` | Computes scope hash for memoization |
+| `src/agent/turn-context/metrics.ts` | `maia_turn_context_*` metrics (closed label vocabulary) |
+| `src/agent/turn-context/types.ts` | `LoadedSection` contract + per-section budgets |
+| `src/agent/turn-context/budget.ts` | Deterministic, metered truncation |
+| `src/agent/turn-context/cache.ts` | Versioned tenant+agent cache for the static context, with cross-replica invalidation |
+
+## Turn-context loading (issue #511)
+
+The turn's context is loaded in two phases, and the split is a cost decision:
+
+1. **Cheap gate first.** `core.ts` runs the Decision Engine BEFORE `buildPrompt`.
+   A turn that is blocked or escalated never hydrates a prompt, so it does not
+   pay ~13 DB round-trips it is about to discard.
+2. **Reasoner context second.** Only allowed turns hydrate history, entities and
+   states, facts, rules, memories, hints, capabilities, gaps and the procedure.
+
+Cost, measured by `tests/unit/turn-context-baseline.spec.ts`:
+
+| entities | 1 | 10 | 100 |
+|---|---|---|---|
+| before #511 | 17 | 35 | 215 |
+| after (cold cache) | 15 | 15 | 15 |
+| after (warm cache) | 10 | 10 | 10 |
+
+The slope is zero — scope size no longer multiplies round-trips against the
+fixed 10-connection pool in `src/db/client.ts`.
+
+**What is cached, and what is not.** `CACHEABLE_RESOURCES` in
+`turn-context/cache.ts` is a closed union: `identity`, `capabilities`, `gaps`.
+Caching anything authorization-bearing is not expressible, which is what makes a
+Redis outage survivable — no cached value carries a grant, so no cached value
+can keep a revoked one alive. `resolveScope` and the dispatcher's
+execution-time re-check always read Postgres. Keys are
+`maia:turn_ctx:v1:{tenant}:{agent}:{resource}` and a degenerate scope (empty or
+the legacy `'default'` literal) throws rather than producing a shared bucket.
+
+Staleness has three bounds: an invalidation published after commit and fanned
+out over a per-tenant Redis channel, a positive TTL, and a shorter negative TTL.
+`FEATURE_TURN_CONTEXT_CACHE` is default OFF; turning it off degrades to direct
+reads through the same path, never to the old waterfall.
+
+**Budgets.** Every truncated section has a `max_items` AND a `max_bytes` ceiling
+(`turn-context/types.ts`), and every dropped item is counted on
+`maia_turn_context_truncated_total`. Truncation always takes a prefix, so the
+same snapshot renders the same prompt on every replica. Policy, permission and
+scope blocks have no budget entry — they are never truncatable.
+
+**Degradation.** Optional sections load concurrently under `Promise.allSettled`;
+a failure degrades that section only, and is logged as `turn_context.degraded`
+with the section NAME (never its content) plus counted on
+`maia_turn_context_section_total{status="degraded"}`.
 
 ## Patterns it follows
 

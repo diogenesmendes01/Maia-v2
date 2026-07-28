@@ -864,19 +864,7 @@ async function runAgentForMensagemInner(
     );
   }
 
-  // Prompt assembly via the prompt-builder. The FEATURE_CONTEXT_PACKET_V1
-  // "context packet" path was an unwired stub — its history loader returned
-  // zero turns, which would have dropped ALL conversation history — so the hot
-  // path always uses buildPrompt.
   const tenantId = getCurrentTenant();
-  const { system, messages } = await buildPrompt({
-    pessoa,
-    conversa: c,
-    scope,
-    inbound,
-    activeRole,
-    activeExecution,
-  });
 
   // Issue #408 — Runtime Tool Filter. Composes the AGENT grant
   // (agent_tool_grants: baseline.core ∪ packs ∪ tools − denied) with the HUMAN
@@ -905,6 +893,19 @@ async function runAgentForMensagemInner(
   // P11 — Decision Engine gate: always runs BEFORE the LLM call. The engine
   // gates the turn (block/escalate short-circuit) and tool_reductions are
   // applied to the toolSet; an engine error fails closed (see catch below).
+  //
+  // Issue #511 — the gate now runs BEFORE the prompt is hydrated (`buildPrompt`
+  // moved below this block). It used to run after, so a turn that the engine
+  // was about to BLOCK had already paid for the whole context: history,
+  // entities and states, facts, rules, memories, hints, capabilities, gaps and
+  // the procedure — around 13 DB round-trips on a fixed 10-connection pool, all
+  // of it thrown away when the block short-circuited the turn.
+  //
+  // The reorder is safe because the gate's input does not depend on the prompt:
+  // `buildBaseContextPacketFromTurn` reads the inbound, conversa, pessoa,
+  // tenant/agent, channel, active role, active execution and audience — every
+  // one of them already resolved above. What DOES depend on the gate is the
+  // tool set (`applyToolReductions`), so tool visibility stays above it.
   try {
     const baseCtx = buildBaseContextPacketFromTurn({
       inbound,
@@ -1113,6 +1114,23 @@ async function runAgentForMensagemInner(
       'agent.decision_engine.wiring_error_continuing',
     );
   }
+
+  // Prompt assembly via the prompt-builder. The FEATURE_CONTEXT_PACKET_V1
+  // "context packet" path was an unwired stub — its history loader returned
+  // zero turns, which would have dropped ALL conversation history — so the hot
+  // path always uses buildPrompt.
+  //
+  // Issue #511 — deliberately positioned AFTER the Decision Engine gate: every
+  // `return` above this line is a turn that will never reach the LLM, and none
+  // of them pays for context hydration any more.
+  const { system, messages } = await buildPrompt({
+    pessoa,
+    conversa: c,
+    scope,
+    inbound,
+    activeRole,
+    activeExecution,
+  });
 
   // Use the JID the inbound message arrived on so replies stay on the same
   // thread — critical when WhatsApp routes via `@lid` (privacy IDs) instead

@@ -25,8 +25,15 @@ import { logger } from '@/lib/logger.js';
 import { GapLevel } from '@/types/enums.js';
 import { sanitizeBlock } from './sanitize.js';
 import { hashScope } from './scope-hash.js';
+import { applyBudget, utf8Bytes } from './turn-context/budget.js';
 import { readCached } from './turn-context/cache.js';
-import { recordTurnContextLoad, type TurnContextResult } from './turn-context/metrics.js';
+import {
+  recordSectionStatus,
+  recordTurnContextLoad,
+  type TurnContextResult,
+  type TurnContextSection,
+} from './turn-context/metrics.js';
+import { SECTION_BUDGETS } from './turn-context/types.js';
 import {
   DOMAIN_KEYWORDS,
   type ToolExecutionSummary,
@@ -588,7 +595,13 @@ async function buildGapMentionSection(): Promise<string | null> {
         (await capabilityGapsRepo?.listByLevels?.([GapLevel.MENTIONABLE, GapLevel.PROPOSED])) ?? [],
     )) ?? [];
   if (gaps.length === 0) return null;
-  const lines = gaps.slice(0, 5).map((g) => {
+  // #511: the 5-gap cap is now metered instead of silent (token bloat guard).
+  const lines = applyBudget(
+    'gaps',
+    gaps,
+    SECTION_BUDGETS.gaps,
+    (g) => utf8Bytes(g.capability_description),
+  ).items.map((g) => {
     const proposedSuffix =
       g.current_level === GapLevel.PROPOSED ? ' (proposta de melhoria já enviada)' : '';
     return `- Se o usuário perguntar sobre ${g.capability_description}, você pode explicar honestamente que isso é uma limitação atual${proposedSuffix}.`;
@@ -678,19 +691,35 @@ async function buildPromptUninstrumented(
   // is never the negative-cache `null`. The non-null assertion documents that.
   const { systemPromptBody, selfVersionLabel, resumoAprendizadosBody } = identity;
 
-  const recent = await mensagensRepo.recentInConversation(ctx.conversa.id, 10);
-  const ents = await entidadesRepo.byIds(ctx.scope.entidades);
+  // Issue #511 — these five reads have no dependency on one another and used to
+  // run strictly one after the other. `Promise.all` (not `allSettled`) is the
+  // right primitive here precisely because they are NOT optional: each one
+  // previously threw straight out of `buildPrompt`, and that contract is
+  // preserved — first rejection still fails the turn. The only thing that
+  // changes is that the turn now waits for the SLOWEST rather than the SUM.
+  //
   // PR #82 review (Superpowers Critical #1): route legacy factsBlock
   // through the memory_entry sensitivity filter. listMentionableForScopes
   // drops any fact whose corresponding memory_entry row has
   // mention_allowed=false or needs_review=true. Sensitive content captured
   // before P2 stays out of the prompt while the classifier reviews it.
-  const facts = await factsRepo.listMentionableForScopes([
-    'global',
-    `pessoa:${ctx.pessoa.id}`,
-    ...ctx.scope.entidades.map((e) => `entidade:${e}`),
+  const [recent, ents, facts, rules, entityStates] = await Promise.all([
+    mensagensRepo.recentInConversation(ctx.conversa.id, SECTION_BUDGETS.history.max_items),
+    entidadesRepo.byIds(ctx.scope.entidades),
+    factsRepo.listMentionableForScopes([
+      'global',
+      `pessoa:${ctx.pessoa.id}`,
+      ...ctx.scope.entidades.map((e) => `entidade:${e}`),
+    ]),
+    rulesRepo.listActive('classificacao'),
+    // Issue #511 — was one `entityStatesRepo.byId(eid)` per entity: the dominant
+    // N+1 of the turn. A single tenant-scoped `WHERE entidade_id IN (…)`
+    // replaces it, so scope size no longer multiplies round-trips on the
+    // 10-connection pool. `?.` mirrors the optional-repo idiom used below —
+    // older test mocks that only stub the per-id method degrade to "no states"
+    // instead of throwing.
+    (async () => (await entityStatesRepo?.byIds?.(ctx.scope.entidades)) ?? [])(),
   ]);
-  const rules = await rulesRepo.listActive('classificacao');
 
   // #511: index once instead of a linear scan per entity — the scope block and
   // the state block below both look entities up by id.
@@ -707,30 +736,32 @@ async function buildPromptUninstrumented(
     })
     .join('\n');
 
-  const factsBlock = facts
-    .slice(0, 20)
-    .map((f) => `  - ${f.escopo}/${f.chave}: ${wrapFact(JSON.stringify(f.valor))}`)
-    .join('\n');
+  // Issue #511 — the `.slice(0, 20)` caps that used to live here were
+  // deterministic but INVISIBLE: a tenant whose 200 facts were being cut to 20
+  // looked exactly like a tenant that had 20. `applyBudget` keeps the same cut,
+  // adds a byte ceiling (20 facts carrying 50 KB payloads each is still a
+  // megabyte of prompt), and counts every dropped item onto
+  // `maia_turn_context_truncated_total`.
+  const factsBlock = applyBudget(
+    'facts',
+    facts.map((f) => `  - ${f.escopo}/${f.chave}: ${wrapFact(JSON.stringify(f.valor))}`),
+    SECTION_BUDGETS.facts,
+    utf8Bytes,
+  ).items.join('\n');
 
-  const rulesBlock = rules
-    .slice(0, 20)
-    .map(
+  const rulesBlock = applyBudget(
+    'rules',
+    rules.map(
       (r) =>
         `  - [#${r.id.slice(0, 8)}] (${r.tipo}, conf ${r.confianca}) ${wrapRule(`${r.contexto} → ${r.acao}`)}`,
-    )
-    .join('\n');
+    ),
+    SECTION_BUDGETS.rules,
+    utf8Bytes,
+  ).items.join('\n');
 
-  // Issue #511 — was one `entityStatesRepo.byId(eid)` per entity: the dominant
-  // N+1 of the turn. A single tenant-scoped `WHERE entidade_id IN (…)` replaces
-  // it, so scope size no longer multiplies round-trips on the 10-connection
-  // pool. `?.` mirrors the optional-repo idiom used by the sections below —
-  // older test mocks that only stub the per-id method degrade to "no states"
-  // instead of throwing.
-  //
-  // Rendering still walks `ctx.scope.entidades`, so the block's ORDER is
-  // unchanged (scope order, not DB order) and entities without a state row are
-  // still skipped — the prompt is byte-identical to the pre-batch output.
-  const entityStates = (await entityStatesRepo?.byIds?.(ctx.scope.entidades)) ?? [];
+  // Rendering walks `ctx.scope.entidades`, so the state block's ORDER is scope
+  // order (not DB order) and entities without a state row are still skipped —
+  // the block is byte-identical to the pre-batch output.
   const stateByEntityId = new Map(entityStates.map((s) => [s.entidade_id, s]));
 
   const entityStateBlocks: string[] = [];
@@ -744,17 +775,25 @@ async function buildPromptUninstrumented(
   }
 
   // P2: Load memory_entry respecting visibility flags, behavioral hints, and
-  // self-awareness (capabilities + gaps). Wrapped in try/catch so any DB
-  // failure or missing repo (e.g. older test mocks) degrades gracefully —
-  // the existing prompt is still produced.
-  let memorySection = '';
-  let hintsSection = '';
-  let selfAwarenessSection = '';
-  let roleSection = '';
-  let procedureSection = '';
-  let gapMentionSection = '';
+  // self-awareness (capabilities + gaps).
+  //
+  // Issue #511 — these six sections are INDEPENDENT of one another, and used to
+  // run one after the other: the turn paid the sum of their latencies before
+  // the first LLM token. They now run concurrently under `Promise.allSettled`,
+  // so the turn pays the MAXIMUM instead of the sum. Six concurrent reads
+  // against a 10-connection pool (`src/db/client.ts`) is a deliberate ceiling —
+  // enough to collapse the waterfall, not enough for one turn to starve the
+  // pool for everyone else.
+  //
+  // `allSettled` (never `all`) is what preserves the existing contract: each of
+  // these is OPTIONAL, so one failing must degrade its own section and leave
+  // the other five intact. What changes is that the failure is no longer
+  // swallowed — the section name lands in `degradedSections` and is logged, so
+  // "the prompt was thin" stops being indistinguishable from "there was nothing
+  // to say".
+  const degradedSections: string[] = [];
 
-  try {
+  const loadMemorySection = async (): Promise<string> => {
     const memoryEntries = (await memoryEntryRepo?.findRelevant?.({
       interlocutor_id: ctx.pessoa?.id,
       conversa_id: ctx.conversa?.id,
@@ -765,7 +804,7 @@ async function buildPromptUninstrumented(
       // these through the agent core.
       role_id: ctx.current_role_id ?? undefined,
       channel_id: ctx.current_channel_id ?? undefined,
-      limit: 30,
+      limit: SECTION_BUDGETS.memories.max_items,
     })) ?? [];
 
     // Respect proactive_use: if false, only include when current message
@@ -783,21 +822,18 @@ async function buildPromptUninstrumented(
     // Split: only mention_allowed enters the prompt literally. The hidden-
     // influence subset is represented via behavioral hints derived from it.
     const mentionableMemories = usableMemories.filter((m) => m.mention_allowed);
+    if (mentionableMemories.length === 0) return '';
 
-    if (mentionableMemories.length > 0) {
-      // P83-C6: wrap memory content in <memory> tags so the LLM treats
-      // it as DATA, not as instruction. Without this, a stored memory
-      // that contains "ignore previous rules…" would be interpolated raw
-      // into the system prompt and could override governance.
-      memorySection =
-        '\n## Memória relevante\n' +
-        mentionableMemories.map((m) => `- ${wrapMemory(m.content)}`).join('\n');
-    }
-  } catch {
-    // Degrade gracefully — DB unavailable or repo unmocked in tests.
-  }
+    // P83-C6: wrap memory content in <memory> tags so the LLM treats
+    // it as DATA, not as instruction. Without this, a stored memory
+    // that contains "ignore previous rules…" would be interpolated raw
+    // into the system prompt and could override governance.
+    const lines = mentionableMemories.map((m) => `- ${wrapMemory(m.content)}`);
+    const budgeted = applyBudget('memories', lines, SECTION_BUDGETS.memories, utf8Bytes);
+    return '\n## Memória relevante\n' + budgeted.items.join('\n');
+  };
 
-  try {
+  const loadHintsSection = async (): Promise<string> => {
     const scopeQueries: Array<{ scope_type: string; subject_id?: string | null }> = [
       { scope_type: 'interlocutor', subject_id: ctx.pessoa?.id },
       { scope_type: 'conversation', subject_id: ctx.conversa?.id },
@@ -826,18 +862,16 @@ async function buildPromptUninstrumented(
     );
     const allHints: BehavioralHint[] =
       (await behavioralHintRepo?.findActiveForScopes?.(scopedQueries)) ?? [];
-    if (allHints.length > 0) {
-      // P83-C6: hints are derived from observed conversations and so
-      // may carry untrusted text. Wrap them as <hint> data.
-      hintsSection =
-        '\n## Instruções comportamentais ativas\n' +
-        allHints.map((h) => `- ${wrapHint(h.hint_text)}`).join('\n');
-    }
-  } catch {
-    // Degrade gracefully.
-  }
+    if (allHints.length === 0) return '';
 
-  try {
+    // P83-C6: hints are derived from observed conversations and so
+    // may carry untrusted text. Wrap them as <hint> data.
+    const lines = allHints.map((h) => `- ${wrapHint(h.hint_text)}`);
+    const budgeted = applyBudget('hints', lines, SECTION_BUDGETS.hints, utf8Bytes);
+    return '\n## Instruções comportamentais ativas\n' + budgeted.items.join('\n');
+  };
+
+  const loadSelfAwarenessSection = async (): Promise<string> => {
     // Issue #511 — cached under `capabilities`. The skills CATALOGUE and the
     // gap list are descriptive self-knowledge: they say what the agent believes
     // it is good at, not what it is allowed to do. What it may actually run is
@@ -851,9 +885,16 @@ async function buildPromptUninstrumented(
       skills: (await capabilitiesSkillRepo?.listAll?.()) ?? [],
       mentionableGaps: (await capabilityGapsRepo?.listByLevel?.('mentionable')) ?? [],
     })))!;
-    const topSkills = [...capabilities.skills]
-      .sort((a, b) => Number(b.confidence) - Number(a.confidence))
-      .slice(0, 5);
+    // Deterministic order before the cut: sort by confidence, then by name so
+    // two skills with equal confidence never swap places between turns (which
+    // would change the prompt bytes for no reason and defeat prompt caching).
+    const sortedSkills = [...capabilities.skills].sort(
+      (a, b) =>
+        Number(b.confidence) - Number(a.confidence) || a.skill_name.localeCompare(b.skill_name),
+    );
+    const topSkills = applyBudget('capabilities', sortedSkills, SECTION_BUDGETS.capabilities, (s) =>
+      utf8Bytes(s.skill_name),
+    ).items;
     const masteredSkills = topSkills.filter((s) => Number(s.confidence) >= 0.7);
     const learningSkills = topSkills.filter((s) => Number(s.confidence) < 0.5);
     const mentionableGaps = capabilities.mentionableGaps;
@@ -873,23 +914,17 @@ async function buildPromptUninstrumented(
         : '',
     ].filter(Boolean);
 
-    if (lines.length > 0) {
-      selfAwarenessSection = '\n## Autoconhecimento\n' + lines.join('\n');
-    }
-  } catch {
-    // Degrade gracefully.
-  }
+    return lines.length > 0 ? '\n## Autoconhecimento\n' + lines.join('\n') : '';
+  };
 
   // P6 Task 9: injeta "## Modo operacional" entre selfAwareness e procedure
   // para respeitar a precedência da spec §10.7 (CHANNEL POLICY > PROCEDURE).
   // Tolerante a ausência de role e omitido para o role default (ver
   // buildRoleSection — MULTI_CHANNEL removido / sempre on após #411).
-  try {
+  const loadRoleSection = async (): Promise<string> => {
     const section = await buildRoleSection(ctx.activeRole);
-    if (section) roleSection = '\n' + section;
-  } catch {
-    // Degrade gracefully — role section é não-essencial ao turno base.
-  }
+    return section ? '\n' + section : '';
+  };
 
   // P3b Task 8: if there's an active procedure_execution for this conversa,
   // surface it in the system prompt so the model can follow the step's
@@ -901,7 +936,7 @@ async function buildPromptUninstrumented(
   // (`ctx.activeExecution`) over a fresh DB roundtrip. `undefined` means the
   // caller didn't provide one (legacy / test) → fall back to lookup. `null`
   // means the caller looked and found nothing → skip the section entirely.
-  try {
+  const loadProcedureSection = async (): Promise<string> => {
     if (ctx.conversa?.id) {
       const activeExec =
         ctx.activeExecution !== undefined
@@ -927,7 +962,7 @@ async function buildPromptUninstrumented(
               ? criteria.find((c) => c.id === currentStep.sucesso_criteria_ref)
               : null;
             const stateJson = JSON.stringify(activeExec.execution_state, null, 2);
-            procedureSection = `\n## Procedimento em execução
+            return `\n## Procedimento em execução
 Você está executando "${def.nome}" v${def.version_number}, passo atual: "${currentStep.id}".
 Intenção do passo: ${currentStep.intencao ?? 'não especificada'}.
 Como executar: ${currentStep.como ?? 'não especificado'}.${matchingCriterion ? `\nCritério de sucesso (${matchingCriterion.type}).` : ''}${currentStep.armadilhas?.length ? `\nArmadilhas comuns: ${currentStep.armadilhas.join('; ')}.` : ''}
@@ -938,19 +973,57 @@ ${stateJson}`;
         }
       }
     }
-  } catch {
-    // Degrade gracefully — procedure runtime must not break baseline prompt.
-  }
+    return '';
+  };
 
   // P5 Task 10: surface gaps em nível mentionable/proposed para que o agente
   // possa ser transparente sobre limitações conhecidas se vierem à tona.
   // Flag-gated (DIALOGICAL_ACQUISITION). Tolerante a falhas: qualquer erro
   // de repo degrada para "sem seção" sem quebrar o prompt.
-  try {
+  const loadGapMentionSection = async (): Promise<string> => {
     const section = await buildGapMentionSection();
-    if (section) gapMentionSection = '\n' + section;
-  } catch {
-    // Degrade gracefully — gap mention é não-essencial ao turno.
+    return section ? '\n' + section : '';
+  };
+
+  // Fan out. Order of the tuple is the order the sections are concatenated into
+  // the system prompt below — keeping the two aligned means a reordering
+  // mistake shows up as a compile error, not as a silently reordered prompt.
+  const optionalLoaders: Array<[string, () => Promise<string>]> = [
+    ['memories', loadMemorySection],
+    ['hints', loadHintsSection],
+    ['capabilities', loadSelfAwarenessSection],
+    ['role', loadRoleSection],
+    ['procedure', loadProcedureSection],
+    ['gaps', loadGapMentionSection],
+  ];
+  const settled = await Promise.allSettled(optionalLoaders.map(([, load]) => load()));
+  const sections = settled.map((outcome, i) => {
+    const name = optionalLoaders[i]![0];
+    if (outcome.status === 'fulfilled') {
+      recordSectionStatus(name as TurnContextSection, outcome.value ? 'loaded' : 'empty');
+      return outcome.value;
+    }
+    // Degrade gracefully — same availability contract as the per-block
+    // try/catch this replaces — but the failure is now COUNTED and NAMED
+    // instead of vanishing into an empty catch.
+    degradedSections.push(name);
+    recordSectionStatus(name as TurnContextSection, 'degraded');
+    logger.warn(
+      { section: name, err: (outcome.reason as Error)?.message },
+      'turn_context.section_degraded',
+    );
+    return '';
+  });
+  const [memorySection, hintsSection, selfAwarenessSection, roleSection, procedureSection, gapMentionSection] =
+    sections as [string, string, string, string, string, string];
+
+  if (degradedSections.length > 0) {
+    // One structured line per turn carrying the degraded section NAMES only —
+    // never their content (issue §Observabilidade).
+    logger.warn(
+      { degraded_sections: degradedSections, conversa_id: ctx.conversa?.id },
+      'turn_context.degraded',
+    );
   }
 
   // Issue #73 — scope-change sentinel + backend events + contradiction overlay.

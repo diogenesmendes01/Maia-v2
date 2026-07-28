@@ -39,6 +39,9 @@ const dispatchTool = vi.fn();
 const callLLM = vi.fn();
 const buildPrompt = vi.fn();
 const synthesizeSpeech = vi.fn();
+// Issue #511: reconfigurable per test so the "blocked turn never hydrates the
+// prompt" case can drive the engine to a block.
+const runDecisionEngineForTurn = vi.fn();
 
 vi.mock('../../src/gateway/baileys.js', () => ({
   sendOutboundText, sendOutboundDocument, sendOutboundVoice,
@@ -66,7 +69,7 @@ vi.mock('../../src/gateway/line-output.js', () => ({
 // agent/core.ts proceeds straight to the LLM path, the behaviour these output-
 // channel smoke tests assert).
 vi.mock('../../src/runtime/decision/integration.js', () => ({
-  runDecisionEngineForTurn: vi.fn().mockResolvedValue({ engine_ran: false }),
+  runDecisionEngineForTurn,
   DecisionEngineFailClosedError: class DecisionEngineFailClosedError extends Error {},
 }));
 vi.mock('../../src/lib/tts.js', () => ({
@@ -200,7 +203,8 @@ describe('agent core flow — output dispatch routing (smoke)', () => {
     findById.mockReset(); findMensagem.mockReset(); markProcessed.mockReset();
     synthesizeSpeech.mockReset();
     recentInConversation.mockReset().mockResolvedValue([]);
-    buildPrompt.mockResolvedValue({ system: 's', messages: [] });
+    buildPrompt.mockReset().mockResolvedValue({ system: 's', messages: [] });
+    runDecisionEngineForTurn.mockReset().mockResolvedValue({ engine_ran: false });
     findById.mockResolvedValue(PESSOA);
     sendOutboundText.mockResolvedValue('WAID-OUT');
     sendOutboundDocument.mockResolvedValue('WAID-DOC');
@@ -209,6 +213,71 @@ describe('agent core flow — output dispatch routing (smoke)', () => {
 
     pdfPath = join(SANDBOX, 'tmp', `${Math.random().toString(36).slice(2)}.pdf`);
     await writeFile(pdfPath, '%PDF-1.4 sample\n%%EOF');
+  });
+
+  /**
+   * Issue #511 — the cheap gate runs BEFORE context hydration.
+   *
+   * The Decision Engine used to run AFTER `buildPrompt`, so a turn it was about
+   * to block had already paid for the entire context — history, entities and
+   * states, facts, rules, memories, hints, capabilities, gaps, procedure — and
+   * then threw all of it away. These two cases pin the ordering: the blocked
+   * and escalated paths must reply to the user without ever hydrating a prompt.
+   */
+  describe('#511 cheap gate precedes context hydration', () => {
+    const blockingDecision = (action_mode: string, block: boolean) => ({
+      engine_ran: true,
+      result: {
+        block,
+        packet: {
+          action_mode,
+          tool_permissions: { allowed_tools: [], blocked_tools: [], requires_confirmation: [] },
+          risk_profile: { level: 'low', reasons: [], requires_human_review: false },
+          routing: { agent_id: 'primary', candidate_skill_ids: [] },
+        },
+      },
+    });
+
+    it('a BLOCKED turn never builds the prompt', async () => {
+      findMensagem.mockResolvedValue({ ...TEXT_INBOUND });
+      runDecisionEngineForTurn.mockResolvedValue(blockingDecision('respond', true));
+
+      const { runAgentForMensagem } = await import('../../src/agent/core.js');
+      await runAgentForMensagem('in1');
+
+      expect(runDecisionEngineForTurn).toHaveBeenCalledTimes(1);
+      expect(buildPrompt).not.toHaveBeenCalled();
+      expect(callLLM).not.toHaveBeenCalled();
+      // The user still gets an answer — this is about cost, not silence.
+      expect(sendOutboundText).toHaveBeenCalledTimes(1);
+    });
+
+    it('an ESCALATED turn never builds the prompt', async () => {
+      findMensagem.mockResolvedValue({ ...TEXT_INBOUND });
+      runDecisionEngineForTurn.mockResolvedValue(blockingDecision('escalate', false));
+
+      const { runAgentForMensagem } = await import('../../src/agent/core.js');
+      await runAgentForMensagem('in1');
+
+      expect(buildPrompt).not.toHaveBeenCalled();
+      expect(callLLM).not.toHaveBeenCalled();
+      expect(sendOutboundText).toHaveBeenCalledTimes(1);
+    });
+
+    it('an ALLOWED turn still builds the prompt exactly once', async () => {
+      findMensagem.mockResolvedValue({ ...TEXT_INBOUND });
+      runDecisionEngineForTurn.mockResolvedValue(blockingDecision('respond', false));
+      callLLM.mockResolvedValueOnce({
+        content: 'ok', tool_uses: [],
+        usage: { input_tokens: 10, output_tokens: 5 },
+      });
+
+      const { runAgentForMensagem } = await import('../../src/agent/core.js');
+      await runAgentForMensagem('in1');
+
+      expect(buildPrompt).toHaveBeenCalledTimes(1);
+      expect(callLLM).toHaveBeenCalled();
+    });
   });
 
   it('plain text turn → sendOutboundText', async () => {
