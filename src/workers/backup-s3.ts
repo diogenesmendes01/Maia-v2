@@ -1,15 +1,19 @@
+import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import { basename } from 'node:path';
+import type { Readable } from 'node:stream';
 import {
   S3Client,
   PutObjectCommand,
   ListObjectsV2Command,
   DeleteObjectsCommand,
   HeadObjectCommand,
+  GetObjectCommand,
 } from '@aws-sdk/client-s3';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
+import { hexToBase64, type RemoteHead } from '@/ops/backup/remote-verify.js';
 
 /**
  * S3 / S3-compatible cloud backup helpers. AWS S3, Backblaze B2, Cloudflare
@@ -72,18 +76,31 @@ export async function uploadBackup(localPath: string): Promise<string> {
 }
 
 /**
- * Issue #520 §4/§6 — upload with integrity metadata, and read it back.
+ * Issue #520 §4/§6 — upload with PROVIDER-VERIFIED integrity, and read it back.
  *
- * `uploadBackup` above returns a URL and carries no integrity information, so
- * the caller could only ever prove "PutObject did not throw". These two helpers
- * are what let the runner prove the object AT THE DESTINATION matches the bytes
- * it hashed locally:
+ * ROUND-1 REVIEW FINDING (P1). The first version stamped the SHA-256 into user
+ * metadata and read that same stamp back with `HEAD`. Metadata is stored BESIDE
+ * the object, not derived from it, so a rotted object still reported a matching
+ * "remote checksum" and the run was marked verified. The check could not fail
+ * for the reason it existed.
  *
- *  - `uploadBackupObject` stamps the hex SHA-256 into user metadata. Object
- *    metadata is supported by every S3-compatible provider (AWS, B2, R2,
- *    Wasabi); a multipart ETag is NOT a content hash and is deliberately not
- *    used as a substitute (issue §3).
- *  - `headBackupObject` reads size + that metadata back for verification.
+ * What actually verifies:
+ *
+ *  - `uploadBackupObject` sends `ChecksumAlgorithm: SHA256` + the expected
+ *    `ChecksumSHA256`. S3 (and every provider that implements the flexible
+ *    checksum API) VALIDATES it against the received bytes and REJECTS a
+ *    mismatched upload — so a corrupted transfer never becomes an object.
+ *  - `headBackupObject` asks for `ChecksumMode: ENABLED`, which returns the
+ *    digest the provider computed over what it stored. That is evidence.
+ *  - `downloadAndDigestBackupObject` is the fallback for providers that
+ *    implement neither: stream the object back and recompute locally.
+ *
+ * The user-metadata stamp is still written and still returned, but ONLY as a
+ * diagnostic label — `src/ops/backup/remote-verify.ts` never reads it when
+ * deciding, and a test proves a matching stamp over corrupted bytes fails.
+ *
+ * A multipart ETag is NOT a content hash and is deliberately never used as a
+ * substitute (issue §3).
  *
  * Provider-side controls the application cannot set portably — SSE-KMS key
  * policy, bucket versioning, object lock — remain the operator's bucket
@@ -94,41 +111,96 @@ export async function uploadBackup(localPath: string): Promise<string> {
 export async function uploadBackupObject(
   localPath: string,
   sha256Hex: string,
+  options: { signal?: AbortSignal } = {},
 ): Promise<{ bucket: string; key: string }> {
   if (!config.BACKUP_S3_BUCKET) {
     throw new Error('BACKUP_S3_BUCKET not set');
   }
   const stats = await stat(localPath);
   const key = `${config.BACKUP_S3_PREFIX}/${basename(localPath)}`;
-  await getS3Client().send(
-    new PutObjectCommand({
-      Bucket: config.BACKUP_S3_BUCKET,
-      Key: key,
-      Body: createReadStream(localPath),
-      ContentLength: stats.size,
-      ContentType: 'application/octet-stream',
-      Metadata: { 'maia-sha256': sha256Hex },
-    }),
-  );
+  const body = createReadStream(localPath);
+  // Abort must tear the source stream down too, or the file handle outlives
+  // the cancelled request (issue #520 round-1 P2).
+  const onAbort = () => body.destroy(new Error('upload aborted'));
+  options.signal?.addEventListener('abort', onAbort, { once: true });
+  try {
+    await getS3Client().send(
+      new PutObjectCommand({
+        Bucket: config.BACKUP_S3_BUCKET,
+        Key: key,
+        Body: body,
+        ContentLength: stats.size,
+        ContentType: 'application/octet-stream',
+        // The provider validates this against the bytes it receives.
+        ChecksumAlgorithm: 'SHA256',
+        ChecksumSHA256: hexToBase64(sha256Hex),
+        // Diagnostic only — never used as verification evidence.
+        Metadata: { 'maia-sha256': sha256Hex },
+      }),
+      { abortSignal: options.signal },
+    );
+  } finally {
+    options.signal?.removeEventListener('abort', onAbort);
+    if (!body.destroyed) body.destroy();
+  }
   return { bucket: config.BACKUP_S3_BUCKET, key };
 }
 
-/** Read size + integrity metadata back from the destination. `null` when absent. */
-export async function headBackupObject(
-  key: string,
-): Promise<{ bytes: number | null; sha256: string | null } | null> {
+/**
+ * Read the destination's own view of the object: size, the digest the PROVIDER
+ * computed over the stored bytes, and (diagnostically) the uploader's stamp.
+ * `null` when the object is missing or unreadable.
+ */
+export async function headBackupObject(key: string): Promise<RemoteHead | null> {
   if (!config.BACKUP_S3_BUCKET) return null;
   try {
     const res = await getS3Client().send(
-      new HeadObjectCommand({ Bucket: config.BACKUP_S3_BUCKET, Key: key }),
+      new HeadObjectCommand({
+        Bucket: config.BACKUP_S3_BUCKET,
+        Key: key,
+        // Without this the provider does not return ChecksumSHA256 at all.
+        ChecksumMode: 'ENABLED',
+      }),
     );
     return {
       bytes: res.ContentLength ?? null,
-      sha256: res.Metadata?.['maia-sha256'] ?? null,
+      providerSha256Base64: res.ChecksumSHA256 ?? null,
+      metadataSha256Hex: res.Metadata?.['maia-sha256'] ?? null,
     };
   } catch {
     // A missing/unreadable object is a verification FAILURE, not an exception
     // the caller must special-case — it returns null and the run degrades/fails.
+    return null;
+  }
+}
+
+/**
+ * Stream the stored object back and recompute its digest locally.
+ *
+ * The fallback for S3-compatible providers that do not implement the flexible
+ * checksum API (some B2 / R2 / Wasabi configurations). Costs a full egress, so
+ * the caller decides when it is warranted — but it is the only remaining way to
+ * prove the STORED bytes are the ones we produced.
+ */
+export async function downloadAndDigestBackupObject(
+  key: string,
+): Promise<{ sha256: string; bytes: number } | null> {
+  if (!config.BACKUP_S3_BUCKET) return null;
+  try {
+    const res = await getS3Client().send(
+      new GetObjectCommand({ Bucket: config.BACKUP_S3_BUCKET, Key: key }),
+    );
+    const body = res.Body as Readable | undefined;
+    if (!body) return null;
+    const hash = createHash('sha256');
+    let bytes = 0;
+    for await (const chunk of body) {
+      const buf = chunk as Buffer;
+      bytes += buf.length;
+      hash.update(buf);
+    }
+    return { sha256: hash.digest('hex'), bytes };
+  } catch {
     return null;
   }
 }

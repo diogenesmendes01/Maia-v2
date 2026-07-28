@@ -20,10 +20,12 @@ import { TypedError } from '@/lib/utils.js';
 import { audit } from '@/governance/audit.js';
 import type { AuditAction } from '@/governance/audit-actions.js';
 import {
+  downloadAndDigestBackupObject,
   headBackupObject,
   isS3Configured,
   uploadBackupObject,
 } from '@/workers/backup-s3.js';
+import { base64ToHex, verifyRemoteArtifact } from './remote-verify.js';
 import { sha256File } from './checksum.js';
 import { encryptFile, parseBackupKeyring } from './encryption.js';
 import { opaqueLocator } from './redaction.js';
@@ -234,22 +236,36 @@ export function createBackupPorts(): BackupPorts {
       return {
         locator: opaqueLocator(uploaded.bucket, uploaded.key),
         remote_bytes: head?.bytes ?? null,
-        remote_sha256: head?.sha256 ?? null,
+        // The provider's own digest, hex — null when it offers none. This is
+        // NOT the uploader's metadata stamp (round-1 P1); `verifyRemote`
+        // re-reads it from the destination anyway and decides there.
+        remote_sha256: head?.providerSha256Base64
+          ? (base64ToHex(head.providerSha256Base64) ?? null)
+          : null,
         // Carried so verifyRemote can re-HEAD without re-deriving the key.
         ...({ _key: uploaded.key } as Record<string, string>),
       } as UploadOutcome;
     },
 
-    // Verification compares what the DESTINATION reports against what we
-    // hashed locally. A provider that reports neither size nor checksum yields
-    // `false` — the run degrades/fails instead of claiming a verified copy.
+    // Verification asks the PROVIDER for a digest it computed over the stored
+    // bytes, and falls back to downloading and re-hashing. The uploader's own
+    // metadata stamp is never consulted — that was the round-1 P1 finding.
     verifyRemote: async (uploadOutcome, expected) => {
       const key = (uploadOutcome as unknown as { _key?: string })._key;
-      const head = key ? await headBackupObject(key) : null;
-      const remoteBytes = head?.bytes ?? uploadOutcome.remote_bytes;
-      const remoteSha = head?.sha256 ?? uploadOutcome.remote_sha256;
-      if (remoteSha === null || remoteBytes === null) return false;
-      return remoteSha.toLowerCase() === expected.sha256.toLowerCase() && remoteBytes === expected.bytes;
+      if (!key) return { verified: false, method: 'none', reason: 'object_missing' };
+      return verifyRemoteArtifact(
+        {
+          head: headBackupObject,
+          downloadAndDigest: downloadAndDigestBackupObject,
+          // A nightly artifact is gigabytes; re-downloading it on every run
+          // would multiply egress. We only pay it when the provider offers no
+          // checksum of its own — otherwise the copy is reported UNVERIFIED
+          // rather than assumed good.
+          allowFullDownload: true,
+        },
+        key,
+        expected,
+      );
     },
 
     provenance: collectProvenance,

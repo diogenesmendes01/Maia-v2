@@ -44,6 +44,9 @@ function manifest(over: Partial<BackupManifest> = {}): BackupManifest {
       catalog_readable: true,
       local_checksum_verified: true,
       remote_checksum_verified: false,
+      // Manifest v2: nothing attested the stored bytes for a local-only run.
+      remote_verification_method: 'none',
+      remote_verification_reason: 'not_attempted',
       remote_verified_at: null,
     },
     data_classes_included: ['postgres.core'],

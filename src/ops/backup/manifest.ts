@@ -29,7 +29,16 @@ import { digestsMatch } from './checksum.js';
  * Bump when a field's MEANING changes (not when an optional field is added).
  * A restore drill refuses a manifest whose version it does not understand.
  */
-export const MANIFEST_VERSION = 1;
+/**
+ * v2 (issue #520 round-1 review, P1): `verification.remote_checksum_verified`
+ * CHANGED MEANING. In v1 it could be true because the uploader's own user
+ * metadata came back from `HEAD` — it did not attest to the stored bytes at
+ * all. In v2 it is true only when a provider-computed checksum matched or the
+ * object was downloaded and re-hashed, and the new
+ * `remote_verification_method` records which. A meaning change, so the version
+ * moves and a restore drill refuses a manifest it does not understand.
+ */
+export const MANIFEST_VERSION = 2;
 
 export const SIGNATURE_ALG = 'HMAC-SHA256' as const;
 
@@ -51,8 +60,16 @@ export const verificationMetaSchema = z.object({
   catalog_readable: z.boolean(),
   /** Local streaming checksum matched the recorded digest. */
   local_checksum_verified: z.boolean(),
-  /** Destination HEAD/metadata check matched size + checksum. */
+  /**
+   * The STORED bytes were proven to be the artifact we produced. True only via
+   * `provider_checksum` or `full_download` — never via the uploader's own
+   * metadata stamp (see `src/ops/backup/remote-verify.ts`).
+   */
   remote_checksum_verified: z.boolean(),
+  /** Which mechanism proved it. `none` = nothing did. */
+  remote_verification_method: z.enum(['provider_checksum', 'full_download', 'none']),
+  /** Stable outcome code from the verifier, for the operator's triage. */
+  remote_verification_reason: z.string().min(1),
   remote_verified_at: isoDate.nullable(),
 });
 

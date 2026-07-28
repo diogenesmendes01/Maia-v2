@@ -80,7 +80,15 @@ function harness(over: Partial<BackupPorts> = {}): Harness {
       remote_bytes: 1024,
       remote_sha256: DIGEST,
     }),
-    verifyRemote: async () => true,
+    // Round-1 P1: the old fake was `async () => true`, which let the service
+    // record a verified off-site copy no matter what the destination said. The
+    // port now returns the METHOD, and the service must carry it into the
+    // manifest — `none` is what an unverifiable copy looks like.
+    verifyRemote: async () => ({
+      verified: true,
+      method: 'provider_checksum' as const,
+      reason: 'ok' as const,
+    }),
     provenance: async () => ({
       environment: 'development',
       source_id: 'host-9f2c',
@@ -324,10 +332,55 @@ describe('off-site', () => {
   });
 
   it('FAILS a production run whose remote checksum did not verify', async () => {
-    const h = harness({ verifyRemote: async () => false });
+    const h = harness({
+      verifyRemote: async () => ({
+        verified: false,
+        method: 'provider_checksum' as const,
+        reason: 'checksum_mismatch' as const,
+      }),
+    });
     const res = await runVerifiedBackup(h.ports, resolveBackupProfile(prodCfg));
     expect(res.outcome).toBe('failed');
     expect(lastRun(h).remote_verified).toBe(false);
+  });
+
+  it('FAILS a production run the destination could not attest at all', async () => {
+    // The exact shape of the round-1 finding: nothing proved the stored bytes.
+    const h = harness({
+      verifyRemote: async () => ({
+        verified: false,
+        method: 'none' as const,
+        reason: 'no_provider_checksum' as const,
+      }),
+    });
+    const res = await runVerifiedBackup(h.ports, resolveBackupProfile(prodCfg));
+    expect(res.outcome).toBe('failed');
+    expect(res.reason).toBe('offsite_required_but_unverified');
+  });
+
+  it('records HOW the remote copy was verified in the manifest', async () => {
+    const h = harness();
+    await runVerifiedBackup(h.ports, resolveBackupProfile(s3Cfg));
+    const verdict = verifyManifest(h.manifests[0]!.signed, SECRET);
+    if (!verdict.ok) throw new Error('manifest invalid');
+    expect(verdict.manifest.verification.remote_verification_method).toBe('provider_checksum');
+    expect(verdict.manifest.verification.remote_checksum_verified).toBe(true);
+  });
+
+  it('records `none` as the method when no upload was attempted', async () => {
+    const h = harness();
+    await runVerifiedBackup(h.ports, resolveBackupProfile(cfg()));
+    const verdict = verifyManifest(h.manifests[0]!.signed, SECRET);
+    if (!verdict.ok) throw new Error('manifest invalid');
+    expect(verdict.manifest.verification.remote_verification_method).toBe('none');
+    expect(verdict.manifest.verification.remote_checksum_verified).toBe(false);
+  });
+
+  it('audits the verification METHOD, not just the fact', async () => {
+    const h = harness();
+    await runVerifiedBackup(h.ports, resolveBackupProfile(s3Cfg));
+    const verified = h.audits.find((a) => a.action === 'backup_artifact_verified');
+    expect(verified?.metadata.method).toBe('provider_checksum');
   });
 
   it('persists an OPAQUE destination locator, never a bucket/key or URL', async () => {

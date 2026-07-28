@@ -42,6 +42,7 @@ import {
   type SignedManifest,
 } from './manifest.js';
 import { artifactRef, redactSecrets } from './redaction.js';
+import type { RemoteVerification, RemoteVerificationMethod } from './remote-verify.js';
 import { sha256Buffer } from './checksum.js';
 import { classesIncludedInDump, classesExcludedFromDump } from '@/ops/retention/data-classes.js';
 
@@ -88,8 +89,16 @@ export interface BackupPorts {
   remove(path: string): Promise<void>;
 
   upload(path: string, timeoutMs: number): Promise<UploadOutcome>;
-  /** HEAD/metadata check at the destination against the local evidence. */
-  verifyRemote(upload: UploadOutcome, expected: { sha256: string; bytes: number }): Promise<boolean>;
+  /**
+   * Prove the stored object is the artifact we produced — provider-computed
+   * checksum, or a full re-download. NEVER the uploader's own metadata stamp
+   * (issue #520 round-1 P1). Returns the METHOD so the manifest records HOW the
+   * copy was verified, not merely that a boolean was true.
+   */
+  verifyRemote(
+    upload: UploadOutcome,
+    expected: { sha256: string; bytes: number },
+  ): Promise<RemoteVerification>;
 
   provenance(): Promise<Provenance>;
   /** Newest tombstone instant at dump time — the §13 replay watermark. */
@@ -211,6 +220,8 @@ export async function runVerifiedBackup(
   let plaintextDigest: { sha256: string; bytes: number } | null = null;
   let keyId: string | null = null;
   let upload: UploadOutcome | null = null;
+  let remoteMethod: RemoteVerificationMethod = 'none';
+  let remoteReason = 'not_attempted';
   let errorCode: BackupErrorCode | null = null;
   let dumpMs: number | null = null;
   let uploadMs: number | null = null;
@@ -266,13 +277,26 @@ export async function runVerifiedBackup(
         upload = await ports.upload(finalPath, profile.timeouts.uploadMs);
         uploadMs = ports.now().getTime() - u0;
         state = 'uploaded';
-        evidence.offsite_verified = await ports.verifyRemote(upload, digest!);
+        const verification = await ports.verifyRemote(upload, digest!);
+        remoteMethod = verification.method;
+        remoteReason = verification.reason;
+        evidence.offsite_verified = verification.verified;
         if (evidence.offsite_verified) {
           state = 'remotely_verified';
           await ports.audit('backup_artifact_verified', {
             backup_id,
             correlation_id,
             stage: 'remote',
+            // HOW it was verified is part of the evidence: a run verified by a
+            // provider-computed checksum and one verified by a full download
+            // are both trustworthy, and one verified by neither is not.
+            method: verification.method,
+          });
+        } else {
+          ports.log('backup.remote_verification_failed', {
+            backup_id,
+            method: verification.method,
+            reason: verification.reason,
           });
         }
       } catch (err) {
@@ -368,6 +392,11 @@ export async function runVerifiedBackup(
           catalog_readable: true,
           local_checksum_verified: true,
           remote_checksum_verified: evidence.offsite_verified,
+          // Manifest v2: WHICH mechanism proved it. `none` means nothing did —
+          // in v1 this field did not exist and `remote_checksum_verified: true`
+          // could mean "the uploader's own metadata came back".
+          remote_verification_method: remoteMethod,
+          remote_verification_reason: remoteReason,
           remote_verified_at: evidence.offsite_verified ? finished.toISOString() : null,
         },
         data_classes_included: classesIncludedInDump(),
