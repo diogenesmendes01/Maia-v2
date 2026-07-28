@@ -1,26 +1,39 @@
 /**
  * Issue #520 §1 — the backup/restore configuration contract.
  *
- * Baseline gap (`src/config/env.ts:78-89`): retention + S3 knobs exist, but
- * nothing states what a given ENVIRONMENT *requires*. S3 was optional
- * everywhere, so a production host silently ran local-only forever.
+ * Baseline gap: retention + S3 knobs existed, but nothing stated what a given
+ * ENVIRONMENT *requires*. S3 was optional everywhere, so a production host
+ * silently ran local-only forever.
  *
- * This module is PURE — it takes a plain record and returns a resolved profile
- * plus a list of issues. It deliberately does NOT import `@/config/env.js`:
- * `env.ts` calls `validateBackupProfile` from its own `superRefine`, so a
- * config import here would be a cycle. Keeping it pure also means the
- * validation can be exercised in unit tests for every profile without
- * mutating `process.env`.
+ * DIVISION OF LABOUR WITH #515. The variables are declared in
+ * `src/config/contract.ts` and the fail-closed VERDICTS ("production without an
+ * off-site destination must not boot") live in `src/config/rules.ts`, under the
+ * `backup/*` rule family. This module only RESOLVES: given the already-coerced
+ * values and the Maia profile, what is required and what is configured. It does
+ * not re-implement a single rule, so the boot gate and the readiness view
+ * cannot drift.
+ *
+ * There is deliberately NO `BACKUP_PROFILE`: the profile is `MAIA_ENV`
+ * (`src/config/profiles.ts`). A second profile selector scoped to backup would
+ * be exactly the second source of truth this reconciliation exists to avoid.
+ *
+ * PURE — takes a plain record, imports no config singleton, so every profile
+ * can be exercised in unit tests without touching `process.env`.
  */
+import type { MaiaProfile } from '@/config/metadata.js';
 
-export type BackupProfileName = 'development' | 'staging' | 'production';
+export type BackupProfileName = MaiaProfile;
 export type EncryptionMode = 'none' | 'envelope_aes256_gcm';
 export type OffsiteKind = 'none' | 's3';
 
-/** Raw, already-coerced env slice this module understands. */
+/**
+ * Already-coerced slice of the contract this module understands, plus the
+ * resolved Maia profile. Every field name matches a contract variable, so a
+ * rename in `contract.ts` breaks this at compile time.
+ */
 export interface BackupConfigInput {
-  NODE_ENV: 'development' | 'test' | 'production';
-  BACKUP_PROFILE?: BackupProfileName;
+  /** Resolved Maia profile — `resolveProfile()`, never inferred locally. */
+  profile: MaiaProfile;
   BACKUP_ENABLED: boolean;
   BACKUP_DIR: string;
   BACKUP_RETENTION_LOCAL_DAYS: number;
@@ -72,25 +85,8 @@ export interface ResolvedBackupProfile {
   retention: { localDays: number; cloudDays: number; dryRun: boolean };
 }
 
-export interface ProfileIssue {
-  /** Env var (or pseudo-path) the operator must fix. */
-  path: string;
-  /** Operator-facing remediation. MUST NOT quote any secret value. */
-  message: string;
-}
-
-/**
- * Default profile inference: `NODE_ENV=production` ⇒ the `production` profile
- * unless the operator pinned one explicitly. `test` maps to `development` so
- * the suite never demands an S3 bucket.
- */
-export function inferProfileName(input: BackupConfigInput): BackupProfileName {
-  if (input.BACKUP_PROFILE) return input.BACKUP_PROFILE;
-  return input.NODE_ENV === 'production' ? 'production' : 'development';
-}
-
 export function resolveBackupProfile(input: BackupConfigInput): ResolvedBackupProfile {
-  const name = inferProfileName(input);
+  const name = input.profile;
   const configured = Boolean(input.BACKUP_S3_BUCKET);
   const hasKey = Boolean(input.BACKUP_S3_ACCESS_KEY);
   const hasSecret = Boolean(input.BACKUP_S3_SECRET_KEY);
@@ -140,89 +136,24 @@ export function resolveBackupProfile(input: BackupConfigInput): ResolvedBackupPr
 }
 
 /**
- * Fail-closed configuration validation (issue §1 "Em produção").
+ * WHERE THE FAIL-CLOSED VERDICTS LIVE.
  *
- * Returns the list of blocking problems; an empty list means the profile is
- * usable. `env.ts` turns each entry into a Zod issue, so an invalid production
- * config refuses to BOOT rather than degrading to a warning at 03:00.
+ * A `validateBackupProfile()` used to sit here and was called from the
+ * pre-contract `env.ts` `superRefine`. After #515 it would be a SECOND
+ * implementation of rules the contract validator already owns, and two copies
+ * of a boot gate drift. The verdicts now live in `src/config/rules.ts` as the
+ * `backup/*` rule family, evaluated at boot AND by `maia config check` /
+ * `maia doctor`:
  *
- * Messages carry the variable NAME and the remediation, never the value —
- * `maia doctor` can print them verbatim without leaking a secret.
+ *   backup/production-enabled          BACKUP_ENABLED=false em production
+ *   backup/production-offsite-required BACKUP_OFFSITE_REQUIRED=false em production
+ *   backup/offsite-destination         off-site exigido sem BACKUP_S3_BUCKET
+ *   backup/production-encryption       BACKUP_ENCRYPTION_MODE=none em production
+ *   backup/encryption-key              cifra exigida sem keyring/key id
+ *   backup/rpo-feasible                BACKUP_RPO_TARGET_HOURS < 24
+ *   backup/retention-ordering          retenção cloud < local com off-site exigido
+ *   backup/s3-credentials              bucket sem credenciais (regra da #515)
+ *
+ * This module keeps only the RESOLUTION (`resolveBackupProfile` above), which
+ * the runner and the readiness evaluator both consume.
  */
-export function validateBackupProfile(profile: ResolvedBackupProfile): ProfileIssue[] {
-  const issues: ProfileIssue[] = [];
-  const isProd = profile.name === 'production';
-
-  // Backup itself may be disabled outside production (a laptop, a CI job).
-  if (isProd && !profile.enabled) {
-    issues.push({
-      path: 'BACKUP_ENABLED',
-      message:
-        'BACKUP_ENABLED=false is not allowed in the production profile — a production deployment without backups has no recovery path.',
-    });
-  }
-
-  if (!profile.enabled) return issues;
-
-  // --- Off-site ---------------------------------------------------------
-  if (isProd && !profile.offsite.required) {
-    issues.push({
-      path: 'BACKUP_OFFSITE_REQUIRED',
-      message:
-        'BACKUP_OFFSITE_REQUIRED=false is not allowed in the production profile — losing the host would take the only artifact with it.',
-    });
-  }
-  if (profile.offsite.required && !profile.offsite.configured) {
-    issues.push({
-      path: 'BACKUP_S3_BUCKET',
-      message:
-        'off-site backup is required by this profile but no destination is configured. Set BACKUP_S3_BUCKET (and credentials) or switch to a profile that does not require off-site.',
-    });
-  }
-  if (!profile.offsite.credentialsComplete) {
-    issues.push({
-      path: 'BACKUP_S3_ACCESS_KEY',
-      message:
-        'partial S3 credentials: set BOTH BACKUP_S3_ACCESS_KEY and BACKUP_S3_SECRET_KEY, or NEITHER (to use an instance role).',
-    });
-  }
-
-  // --- Encryption -------------------------------------------------------
-  if (isProd && profile.encryption.mode === 'none') {
-    issues.push({
-      path: 'BACKUP_ENCRYPTION_MODE',
-      message:
-        'BACKUP_ENCRYPTION_MODE=none is not allowed in the production profile — a dump contains every tenant\'s personal data in the clear.',
-    });
-  }
-  if (profile.encryption.required && !profile.encryption.keyConfigured) {
-    issues.push({
-      path: 'BACKUP_ENCRYPTION_KEYRING',
-      message:
-        'encryption is required but the keyring is incomplete. Set BACKUP_ENCRYPTION_KEYRING (JSON {key_id: base64(32 bytes)}) and BACKUP_ENCRYPTION_ACTIVE_KEY_ID. The run fails closed rather than writing a plaintext dump.',
-    });
-  }
-
-  // --- Objectives -------------------------------------------------------
-  // Do not let the deployment PROMISE an RPO the schedule cannot meet
-  // (issue §8 "não declarar RPO incompatível com a arquitetura"). The nightly
-  // cadence is 24h, so an RPO target below that needs PITR/WAL archiving,
-  // which this issue explicitly leaves as a planned sub-scope.
-  if (profile.objectives.rpoHours < 24) {
-    issues.push({
-      path: 'BACKUP_RPO_TARGET_HOURS',
-      message:
-        'BACKUP_RPO_TARGET_HOURS below 24 cannot be met by nightly logical dumps alone. Either raise the target or land PITR/WAL archiving first — the platform must not advertise an RPO it cannot honour.',
-    });
-  }
-
-  if (profile.retention.localDays > profile.retention.cloudDays && profile.offsite.required) {
-    issues.push({
-      path: 'BACKUP_RETENTION_CLOUD_DAYS',
-      message:
-        'cloud retention is shorter than local retention while off-site is required — the authoritative copy would expire before the local one.',
-    });
-  }
-
-  return issues;
-}

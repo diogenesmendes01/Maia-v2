@@ -1,21 +1,24 @@
 import { describe, it, expect } from 'vitest';
 import {
   resolveBackupProfile,
-  validateBackupProfile,
-  inferProfileName,
   type BackupConfigInput,
 } from '../../../src/ops/backup/profile.js';
 
 /**
- * Issue #520 §1 — "Em produção: ausência de destino off-site obrigatório falha
- * readiness; combinação parcial de credenciais falha validação; criptografia
- * exigida sem chave válida falha fechado; configuração inválida não pode ser
- * reduzida a warning silencioso."
+ * Issue #520 §1 — RESOLUTION only.
+ *
+ * Since the rebase onto #515 the fail-closed VERDICTS live in
+ * `src/config/rules.ts` (rule family `backup/*`) and are covered by
+ * `tests/unit/config/backup-rules.spec.ts`. This spec covers what remains
+ * here: given the coerced values and the Maia profile, what does the runner
+ * consider required and configured?
+ *
+ * There is no `BACKUP_PROFILE` any more — the profile is `MAIA_ENV`.
  */
 
 function input(over: Partial<BackupConfigInput> = {}): BackupConfigInput {
   return {
-    NODE_ENV: 'development',
+    profile: 'development',
     BACKUP_ENABLED: true,
     BACKUP_DIR: './backups',
     BACKUP_RETENTION_LOCAL_DAYS: 7,
@@ -35,7 +38,7 @@ function input(over: Partial<BackupConfigInput> = {}): BackupConfigInput {
 
 function prod(over: Partial<BackupConfigInput> = {}): BackupConfigInput {
   return input({
-    NODE_ENV: 'production',
+    profile: 'production',
     BACKUP_S3_BUCKET: 'maia-backups',
     BACKUP_S3_ACCESS_KEY: 'ak',
     BACKUP_S3_SECRET_KEY: 'sk',
@@ -46,28 +49,41 @@ function prod(over: Partial<BackupConfigInput> = {}): BackupConfigInput {
   });
 }
 
-function paths(cfg: BackupConfigInput): string[] {
-  return validateBackupProfile(resolveBackupProfile(cfg)).map((i) => i.path);
-}
-
-describe('inferProfileName', () => {
-  it('maps NODE_ENV=production to the production profile', () => {
-    expect(inferProfileName(input({ NODE_ENV: 'production' }))).toBe('production');
+describe('resolveBackupProfile — the profile comes from MAIA_ENV', () => {
+  it('carries the resolved Maia profile through unchanged', () => {
+    expect(resolveBackupProfile(input({ profile: 'staging' })).name).toBe('staging');
+    expect(resolveBackupProfile(prod()).name).toBe('production');
   });
 
-  it('maps test/development to the development profile', () => {
-    expect(inferProfileName(input({ NODE_ENV: 'test' }))).toBe('development');
-  });
-
-  it('honours an explicit override', () => {
-    expect(inferProfileName(input({ BACKUP_PROFILE: 'staging' }))).toBe('staging');
-  });
-});
-
-describe('resolveBackupProfile', () => {
   it('requires off-site by default in production only', () => {
     expect(resolveBackupProfile(prod()).offsite.required).toBe(true);
     expect(resolveBackupProfile(input()).offsite.required).toBe(false);
+    expect(resolveBackupProfile(input({ profile: 'staging' })).offsite.required).toBe(false);
+  });
+
+  it('lets an operator opt IN to off-site outside production', () => {
+    expect(
+      resolveBackupProfile(input({ BACKUP_OFFSITE_REQUIRED: true })).offsite.required,
+    ).toBe(true);
+  });
+
+  it('treats an absent BACKUP_OFFSITE_REQUIRED as "the profile decides"', () => {
+    // Tri-state: undefined is NOT false.
+    expect(
+      resolveBackupProfile(prod({ BACKUP_OFFSITE_REQUIRED: undefined })).offsite.required,
+    ).toBe(true);
+    expect(
+      resolveBackupProfile(prod({ BACKUP_OFFSITE_REQUIRED: false })).offsite.required,
+    ).toBe(false);
+  });
+
+  it('reports a destination as configured only when a bucket is set', () => {
+    expect(resolveBackupProfile(prod()).offsite.configured).toBe(true);
+    expect(resolveBackupProfile(prod({ BACKUP_S3_BUCKET: undefined })).offsite.configured).toBe(
+      false,
+    );
+    expect(resolveBackupProfile(prod()).offsite.kind).toBe('s3');
+    expect(resolveBackupProfile(input()).offsite.kind).toBe('none');
   });
 
   it('treats any non-none encryption mode as required', () => {
@@ -75,74 +91,45 @@ describe('resolveBackupProfile', () => {
     expect(resolveBackupProfile(input()).encryption.required).toBe(false);
   });
 
+  it('reports the keyring as configured only with BOTH keyring and active id', () => {
+    expect(resolveBackupProfile(prod()).encryption.keyConfigured).toBe(true);
+    expect(
+      resolveBackupProfile(prod({ BACKUP_ENCRYPTION_ACTIVE_KEY_ID: undefined })).encryption
+        .keyConfigured,
+    ).toBe(false);
+    expect(
+      resolveBackupProfile(prod({ BACKUP_ENCRYPTION_KEYRING: undefined })).encryption
+        .keyConfigured,
+    ).toBe(false);
+  });
+
+  it('flags partial S3 credentials (both or neither)', () => {
+    expect(resolveBackupProfile(prod()).offsite.credentialsComplete).toBe(true);
+    expect(
+      resolveBackupProfile(prod({ BACKUP_S3_SECRET_KEY: undefined })).offsite
+        .credentialsComplete,
+    ).toBe(false);
+    // Neither = an instance role, which is legitimate.
+    expect(
+      resolveBackupProfile(
+        prod({ BACKUP_S3_ACCESS_KEY: undefined, BACKUP_S3_SECRET_KEY: undefined }),
+      ).offsite.credentialsComplete,
+    ).toBe(true);
+  });
+
   it('never exposes key material — only the active key id', () => {
     const p = resolveBackupProfile(prod());
     expect(p.encryption.activeKeyId).toBe('k1');
     expect(JSON.stringify(p)).not.toContain('AAAA');
   });
-});
 
-describe('validateBackupProfile — production fails closed', () => {
-  it('accepts a fully-configured production profile', () => {
-    expect(paths(prod())).toEqual([]);
-  });
-
-  it('rejects production without an off-site destination', () => {
-    expect(paths(prod({ BACKUP_S3_BUCKET: undefined }))).toContain('BACKUP_S3_BUCKET');
-  });
-
-  it('rejects an operator turning off the off-site requirement in production', () => {
-    expect(paths(prod({ BACKUP_OFFSITE_REQUIRED: false }))).toContain('BACKUP_OFFSITE_REQUIRED');
-  });
-
-  it('rejects partial S3 credentials', () => {
-    expect(paths(prod({ BACKUP_S3_SECRET_KEY: undefined }))).toContain('BACKUP_S3_ACCESS_KEY');
-  });
-
-  it('accepts NEITHER credential (instance role)', () => {
-    expect(
-      paths(prod({ BACKUP_S3_ACCESS_KEY: undefined, BACKUP_S3_SECRET_KEY: undefined })),
-    ).toEqual([]);
-  });
-
-  it('rejects plaintext backups in production', () => {
-    expect(paths(prod({ BACKUP_ENCRYPTION_MODE: 'none' }))).toContain('BACKUP_ENCRYPTION_MODE');
-  });
-
-  it('rejects encryption required without a usable keyring', () => {
-    expect(paths(prod({ BACKUP_ENCRYPTION_ACTIVE_KEY_ID: undefined }))).toContain(
-      'BACKUP_ENCRYPTION_KEYRING',
-    );
-  });
-
-  it('rejects disabling backups in production', () => {
-    expect(paths(prod({ BACKUP_ENABLED: false }))).toContain('BACKUP_ENABLED');
-  });
-
-  it('refuses to promise an RPO the nightly cadence cannot meet', () => {
-    expect(paths(prod({ BACKUP_RPO_TARGET_HOURS: 1 }))).toContain('BACKUP_RPO_TARGET_HOURS');
-  });
-
-  it('rejects cloud retention shorter than local when off-site is authoritative', () => {
-    expect(
-      paths(prod({ BACKUP_RETENTION_LOCAL_DAYS: 60, BACKUP_RETENTION_CLOUD_DAYS: 30 })),
-    ).toContain('BACKUP_RETENTION_CLOUD_DAYS');
-  });
-
-  it('never quotes a secret value in a remediation message', () => {
-    const issues = validateBackupProfile(
-      resolveBackupProfile(prod({ BACKUP_ENCRYPTION_ACTIVE_KEY_ID: undefined })),
-    );
-    for (const i of issues) expect(i.message).not.toContain('AAAA');
-  });
-});
-
-describe('validateBackupProfile — development stays usable', () => {
-  it('accepts a bare local-only development profile', () => {
-    expect(paths(input())).toEqual([]);
-  });
-
-  it('allows backups to be disabled outside production', () => {
-    expect(paths(input({ BACKUP_ENABLED: false }))).toEqual([]);
+  it('carries the objectives and the dry-run posture through', () => {
+    const p = resolveBackupProfile(input({ RETENTION_DRY_RUN: true }));
+    expect(p.objectives).toEqual({
+      rpoHours: 24,
+      rtoMinutes: 120,
+      restoreDrillIntervalHours: 168,
+    });
+    expect(p.retention.dryRun).toBe(true);
   });
 });

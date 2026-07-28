@@ -18,7 +18,7 @@ const HOURS = 3_600_000;
 
 function cfg(over: Partial<BackupConfigInput> = {}): BackupConfigInput {
   return {
-    NODE_ENV: 'development',
+    profile: 'development',
     BACKUP_ENABLED: true,
     BACKUP_DIR: './backups',
     BACKUP_RETENTION_LOCAL_DAYS: 7,
@@ -38,7 +38,7 @@ function cfg(over: Partial<BackupConfigInput> = {}): BackupConfigInput {
 
 function prodCfg(over: Partial<BackupConfigInput> = {}): BackupConfigInput {
   return cfg({
-    NODE_ENV: 'production',
+    profile: 'production',
     BACKUP_S3_BUCKET: 'maia-backups',
     BACKUP_ENCRYPTION_MODE: 'envelope_aes256_gcm',
     BACKUP_ENCRYPTION_KEYRING: '{"k1":"x"}',

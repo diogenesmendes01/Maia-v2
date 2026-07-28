@@ -18,6 +18,13 @@
           "restartRequired": true
         },
         {
+          "name": "MAIA_BUILD_COMMIT",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
           "name": "TZ",
           "secret": false,
           "required": false,
@@ -501,6 +508,106 @@
         },
         {
           "name": "BACKUP_S3_PREFIX",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_ENABLED",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_OFFSITE_REQUIRED",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_ENCRYPTION_MODE",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_ENCRYPTION_KEYRING",
+          "secret": true,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true,
+          "requiredWhen": "BACKUP_ENCRYPTION_MODE=envelope_aes256_gcm"
+        },
+        {
+          "name": "BACKUP_ENCRYPTION_ACTIVE_KEY_ID",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true,
+          "requiredWhen": "BACKUP_ENCRYPTION_MODE=envelope_aes256_gcm"
+        },
+        {
+          "name": "BACKUP_DUMP_TIMEOUT_MS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_UPLOAD_TIMEOUT_MS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_RESTORE_TIMEOUT_MS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_MIN_ARTIFACT_BYTES",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_RPO_TARGET_HOURS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_RTO_TARGET_MINUTES",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "RETENTION_DRY_RUN",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "RETENTION_POLICY",
           "secret": false,
           "required": false,
           "group": "backup",
@@ -1075,6 +1182,7 @@
         "TELEGRAM_BOT_TOKEN",
         "BACKUP_S3_ACCESS_KEY",
         "BACKUP_S3_SECRET_KEY",
+        "BACKUP_ENCRYPTION_KEYRING",
         "RUNTIME_TRACE_HMAC_MASTER_SECRET",
         "RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS",
         "RUNTIME_TRACE_DEBUG_AES_KEY",
@@ -1095,6 +1203,7 @@
           "optional": [
             "NODE_ENV",
             "MAIA_ENV",
+            "MAIA_BUILD_COMMIT",
             "TZ",
             "APP_PORT",
             "LOG_LEVEL",
@@ -1155,6 +1264,20 @@
             "BACKUP_S3_ACCESS_KEY",
             "BACKUP_S3_SECRET_KEY",
             "BACKUP_S3_PREFIX",
+            "BACKUP_ENABLED",
+            "BACKUP_OFFSITE_REQUIRED",
+            "BACKUP_ENCRYPTION_MODE",
+            "BACKUP_ENCRYPTION_KEYRING",
+            "BACKUP_ENCRYPTION_ACTIVE_KEY_ID",
+            "BACKUP_DUMP_TIMEOUT_MS",
+            "BACKUP_UPLOAD_TIMEOUT_MS",
+            "BACKUP_RESTORE_TIMEOUT_MS",
+            "BACKUP_MIN_ARTIFACT_BYTES",
+            "BACKUP_RPO_TARGET_HOURS",
+            "BACKUP_RTO_TARGET_MINUTES",
+            "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
+            "RETENTION_DRY_RUN",
+            "RETENTION_POLICY",
             "DAILY_LLM_USD_THRESHOLD",
             "FEATURE_MCP_TOOLS",
             "FEATURE_PROACTIVE_MESSAGES",
@@ -1252,6 +1375,7 @@
           ],
           "optional": [
             "NODE_ENV",
+            "MAIA_BUILD_COMMIT",
             "TZ",
             "APP_PORT",
             "LOG_LEVEL",
@@ -1311,6 +1435,20 @@
             "BACKUP_S3_ACCESS_KEY",
             "BACKUP_S3_SECRET_KEY",
             "BACKUP_S3_PREFIX",
+            "BACKUP_ENABLED",
+            "BACKUP_OFFSITE_REQUIRED",
+            "BACKUP_ENCRYPTION_MODE",
+            "BACKUP_ENCRYPTION_KEYRING",
+            "BACKUP_ENCRYPTION_ACTIVE_KEY_ID",
+            "BACKUP_DUMP_TIMEOUT_MS",
+            "BACKUP_UPLOAD_TIMEOUT_MS",
+            "BACKUP_RESTORE_TIMEOUT_MS",
+            "BACKUP_MIN_ARTIFACT_BYTES",
+            "BACKUP_RPO_TARGET_HOURS",
+            "BACKUP_RTO_TARGET_MINUTES",
+            "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
+            "RETENTION_DRY_RUN",
+            "RETENTION_POLICY",
             "DAILY_LLM_USD_THRESHOLD",
             "FEATURE_MCP_TOOLS",
             "FEATURE_PROACTIVE_MESSAGES",
@@ -1407,6 +1545,7 @@
           ],
           "optional": [
             "NODE_ENV",
+            "MAIA_BUILD_COMMIT",
             "TZ",
             "APP_PORT",
             "LOG_LEVEL",
@@ -1466,6 +1605,20 @@
             "BACKUP_S3_ACCESS_KEY",
             "BACKUP_S3_SECRET_KEY",
             "BACKUP_S3_PREFIX",
+            "BACKUP_ENABLED",
+            "BACKUP_OFFSITE_REQUIRED",
+            "BACKUP_ENCRYPTION_MODE",
+            "BACKUP_ENCRYPTION_KEYRING",
+            "BACKUP_ENCRYPTION_ACTIVE_KEY_ID",
+            "BACKUP_DUMP_TIMEOUT_MS",
+            "BACKUP_UPLOAD_TIMEOUT_MS",
+            "BACKUP_RESTORE_TIMEOUT_MS",
+            "BACKUP_MIN_ARTIFACT_BYTES",
+            "BACKUP_RPO_TARGET_HOURS",
+            "BACKUP_RTO_TARGET_MINUTES",
+            "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
+            "RETENTION_DRY_RUN",
+            "RETENTION_POLICY",
             "DAILY_LLM_USD_THRESHOLD",
             "FEATURE_MCP_TOOLS",
             "FEATURE_PROACTIVE_MESSAGES",
@@ -1561,6 +1714,13 @@
           "name": "MAIA_ENV",
           "secret": false,
           "required": true,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_BUILD_COMMIT",
+          "secret": false,
+          "required": false,
           "group": "core",
           "restartRequired": true
         },
@@ -1720,6 +1880,7 @@
           "optional": [
             "NODE_ENV",
             "MAIA_ENV",
+            "MAIA_BUILD_COMMIT",
             "TZ",
             "LOG_LEVEL",
             "MAIA_CONFIG_STRICT_BOOT",
@@ -1753,6 +1914,7 @@
           ],
           "optional": [
             "NODE_ENV",
+            "MAIA_BUILD_COMMIT",
             "TZ",
             "LOG_LEVEL",
             "MAIA_CONFIG_STRICT_BOOT",
@@ -1781,6 +1943,7 @@
           ],
           "optional": [
             "NODE_ENV",
+            "MAIA_BUILD_COMMIT",
             "TZ",
             "LOG_LEVEL",
             "MAIA_CONFIG_STRICT_BOOT",
@@ -1812,6 +1975,13 @@
           "name": "MAIA_ENV",
           "secret": false,
           "required": true,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_BUILD_COMMIT",
+          "secret": false,
+          "required": false,
           "group": "core",
           "restartRequired": true
         },
@@ -1887,6 +2057,7 @@
           "optional": [
             "NODE_ENV",
             "MAIA_ENV",
+            "MAIA_BUILD_COMMIT",
             "TZ",
             "LOG_LEVEL",
             "MAIA_CONFIG_STRICT_BOOT",
@@ -1903,6 +2074,7 @@
           ],
           "optional": [
             "NODE_ENV",
+            "MAIA_BUILD_COMMIT",
             "TZ",
             "LOG_LEVEL",
             "MAIA_CONFIG_STRICT_BOOT",
@@ -1919,6 +2091,7 @@
           ],
           "optional": [
             "NODE_ENV",
+            "MAIA_BUILD_COMMIT",
             "TZ",
             "LOG_LEVEL",
             "MAIA_CONFIG_STRICT_BOOT",
@@ -1940,6 +2113,13 @@
           "name": "MAIA_ENV",
           "secret": false,
           "required": true,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_BUILD_COMMIT",
+          "secret": false,
+          "required": false,
           "group": "core",
           "restartRequired": true
         },
@@ -2123,6 +2303,106 @@
           "required": false,
           "group": "backup",
           "restartRequired": true
+        },
+        {
+          "name": "BACKUP_ENABLED",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_OFFSITE_REQUIRED",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_ENCRYPTION_MODE",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_ENCRYPTION_KEYRING",
+          "secret": true,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true,
+          "requiredWhen": "BACKUP_ENCRYPTION_MODE=envelope_aes256_gcm"
+        },
+        {
+          "name": "BACKUP_ENCRYPTION_ACTIVE_KEY_ID",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true,
+          "requiredWhen": "BACKUP_ENCRYPTION_MODE=envelope_aes256_gcm"
+        },
+        {
+          "name": "BACKUP_DUMP_TIMEOUT_MS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_UPLOAD_TIMEOUT_MS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_RESTORE_TIMEOUT_MS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_MIN_ARTIFACT_BYTES",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_RPO_TARGET_HOURS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_RTO_TARGET_MINUTES",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "RETENTION_DRY_RUN",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "RETENTION_POLICY",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
         }
       ],
       "secrets": [
@@ -2131,7 +2411,8 @@
         "SMTP_PASS",
         "TELEGRAM_BOT_TOKEN",
         "BACKUP_S3_ACCESS_KEY",
-        "BACKUP_S3_SECRET_KEY"
+        "BACKUP_S3_SECRET_KEY",
+        "BACKUP_ENCRYPTION_KEYRING"
       ],
       "by_profile": {
         "development": {
@@ -2144,6 +2425,7 @@
           "optional": [
             "NODE_ENV",
             "MAIA_ENV",
+            "MAIA_BUILD_COMMIT",
             "TZ",
             "LOG_LEVEL",
             "MAIA_CONFIG_STRICT_BOOT",
@@ -2164,7 +2446,21 @@
             "BACKUP_S3_REGION",
             "BACKUP_S3_ACCESS_KEY",
             "BACKUP_S3_SECRET_KEY",
-            "BACKUP_S3_PREFIX"
+            "BACKUP_S3_PREFIX",
+            "BACKUP_ENABLED",
+            "BACKUP_OFFSITE_REQUIRED",
+            "BACKUP_ENCRYPTION_MODE",
+            "BACKUP_ENCRYPTION_KEYRING",
+            "BACKUP_ENCRYPTION_ACTIVE_KEY_ID",
+            "BACKUP_DUMP_TIMEOUT_MS",
+            "BACKUP_UPLOAD_TIMEOUT_MS",
+            "BACKUP_RESTORE_TIMEOUT_MS",
+            "BACKUP_MIN_ARTIFACT_BYTES",
+            "BACKUP_RPO_TARGET_HOURS",
+            "BACKUP_RTO_TARGET_MINUTES",
+            "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
+            "RETENTION_DRY_RUN",
+            "RETENTION_POLICY"
           ]
         },
         "staging": {
@@ -2178,6 +2474,7 @@
           ],
           "optional": [
             "NODE_ENV",
+            "MAIA_BUILD_COMMIT",
             "TZ",
             "LOG_LEVEL",
             "MAIA_CONFIG_STRICT_BOOT",
@@ -2197,7 +2494,21 @@
             "BACKUP_S3_REGION",
             "BACKUP_S3_ACCESS_KEY",
             "BACKUP_S3_SECRET_KEY",
-            "BACKUP_S3_PREFIX"
+            "BACKUP_S3_PREFIX",
+            "BACKUP_ENABLED",
+            "BACKUP_OFFSITE_REQUIRED",
+            "BACKUP_ENCRYPTION_MODE",
+            "BACKUP_ENCRYPTION_KEYRING",
+            "BACKUP_ENCRYPTION_ACTIVE_KEY_ID",
+            "BACKUP_DUMP_TIMEOUT_MS",
+            "BACKUP_UPLOAD_TIMEOUT_MS",
+            "BACKUP_RESTORE_TIMEOUT_MS",
+            "BACKUP_MIN_ARTIFACT_BYTES",
+            "BACKUP_RPO_TARGET_HOURS",
+            "BACKUP_RTO_TARGET_MINUTES",
+            "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
+            "RETENTION_DRY_RUN",
+            "RETENTION_POLICY"
           ]
         },
         "production": {
@@ -2211,6 +2522,7 @@
           ],
           "optional": [
             "NODE_ENV",
+            "MAIA_BUILD_COMMIT",
             "TZ",
             "LOG_LEVEL",
             "MAIA_CONFIG_STRICT_BOOT",
@@ -2230,7 +2542,21 @@
             "BACKUP_S3_REGION",
             "BACKUP_S3_ACCESS_KEY",
             "BACKUP_S3_SECRET_KEY",
-            "BACKUP_S3_PREFIX"
+            "BACKUP_S3_PREFIX",
+            "BACKUP_ENABLED",
+            "BACKUP_OFFSITE_REQUIRED",
+            "BACKUP_ENCRYPTION_MODE",
+            "BACKUP_ENCRYPTION_KEYRING",
+            "BACKUP_ENCRYPTION_ACTIVE_KEY_ID",
+            "BACKUP_DUMP_TIMEOUT_MS",
+            "BACKUP_UPLOAD_TIMEOUT_MS",
+            "BACKUP_RESTORE_TIMEOUT_MS",
+            "BACKUP_MIN_ARTIFACT_BYTES",
+            "BACKUP_RPO_TARGET_HOURS",
+            "BACKUP_RTO_TARGET_MINUTES",
+            "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
+            "RETENTION_DRY_RUN",
+            "RETENTION_POLICY"
           ]
         }
       }
@@ -2248,6 +2574,13 @@
           "name": "MAIA_ENV",
           "secret": false,
           "required": true,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_BUILD_COMMIT",
+          "secret": false,
+          "required": false,
           "group": "core",
           "restartRequired": true
         },
@@ -2557,6 +2890,106 @@
           "restartRequired": true
         },
         {
+          "name": "BACKUP_ENABLED",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_OFFSITE_REQUIRED",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_ENCRYPTION_MODE",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_ENCRYPTION_KEYRING",
+          "secret": true,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true,
+          "requiredWhen": "BACKUP_ENCRYPTION_MODE=envelope_aes256_gcm"
+        },
+        {
+          "name": "BACKUP_ENCRYPTION_ACTIVE_KEY_ID",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true,
+          "requiredWhen": "BACKUP_ENCRYPTION_MODE=envelope_aes256_gcm"
+        },
+        {
+          "name": "BACKUP_DUMP_TIMEOUT_MS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_UPLOAD_TIMEOUT_MS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_RESTORE_TIMEOUT_MS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_MIN_ARTIFACT_BYTES",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_RPO_TARGET_HOURS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_RTO_TARGET_MINUTES",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "RETENTION_DRY_RUN",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "RETENTION_POLICY",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
           "name": "DAILY_LLM_USD_THRESHOLD",
           "secret": false,
           "required": false,
@@ -2583,7 +3016,8 @@
         "SMTP_PASS",
         "TELEGRAM_BOT_TOKEN",
         "BACKUP_S3_ACCESS_KEY",
-        "BACKUP_S3_SECRET_KEY"
+        "BACKUP_S3_SECRET_KEY",
+        "BACKUP_ENCRYPTION_KEYRING"
       ],
       "by_profile": {
         "development": {
@@ -2597,6 +3031,7 @@
           "optional": [
             "NODE_ENV",
             "MAIA_ENV",
+            "MAIA_BUILD_COMMIT",
             "TZ",
             "LOG_LEVEL",
             "MAIA_CONFIG_STRICT_BOOT",
@@ -2634,6 +3069,20 @@
             "BACKUP_S3_ACCESS_KEY",
             "BACKUP_S3_SECRET_KEY",
             "BACKUP_S3_PREFIX",
+            "BACKUP_ENABLED",
+            "BACKUP_OFFSITE_REQUIRED",
+            "BACKUP_ENCRYPTION_MODE",
+            "BACKUP_ENCRYPTION_KEYRING",
+            "BACKUP_ENCRYPTION_ACTIVE_KEY_ID",
+            "BACKUP_DUMP_TIMEOUT_MS",
+            "BACKUP_UPLOAD_TIMEOUT_MS",
+            "BACKUP_RESTORE_TIMEOUT_MS",
+            "BACKUP_MIN_ARTIFACT_BYTES",
+            "BACKUP_RPO_TARGET_HOURS",
+            "BACKUP_RTO_TARGET_MINUTES",
+            "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
+            "RETENTION_DRY_RUN",
+            "RETENTION_POLICY",
             "DAILY_LLM_USD_THRESHOLD",
             "FEATURE_OFX_IMPORT"
           ]
@@ -2650,6 +3099,7 @@
           ],
           "optional": [
             "NODE_ENV",
+            "MAIA_BUILD_COMMIT",
             "TZ",
             "LOG_LEVEL",
             "MAIA_CONFIG_STRICT_BOOT",
@@ -2686,6 +3136,20 @@
             "BACKUP_S3_ACCESS_KEY",
             "BACKUP_S3_SECRET_KEY",
             "BACKUP_S3_PREFIX",
+            "BACKUP_ENABLED",
+            "BACKUP_OFFSITE_REQUIRED",
+            "BACKUP_ENCRYPTION_MODE",
+            "BACKUP_ENCRYPTION_KEYRING",
+            "BACKUP_ENCRYPTION_ACTIVE_KEY_ID",
+            "BACKUP_DUMP_TIMEOUT_MS",
+            "BACKUP_UPLOAD_TIMEOUT_MS",
+            "BACKUP_RESTORE_TIMEOUT_MS",
+            "BACKUP_MIN_ARTIFACT_BYTES",
+            "BACKUP_RPO_TARGET_HOURS",
+            "BACKUP_RTO_TARGET_MINUTES",
+            "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
+            "RETENTION_DRY_RUN",
+            "RETENTION_POLICY",
             "DAILY_LLM_USD_THRESHOLD",
             "FEATURE_OFX_IMPORT"
           ]
@@ -2702,6 +3166,7 @@
           ],
           "optional": [
             "NODE_ENV",
+            "MAIA_BUILD_COMMIT",
             "TZ",
             "LOG_LEVEL",
             "MAIA_CONFIG_STRICT_BOOT",
@@ -2738,6 +3203,20 @@
             "BACKUP_S3_ACCESS_KEY",
             "BACKUP_S3_SECRET_KEY",
             "BACKUP_S3_PREFIX",
+            "BACKUP_ENABLED",
+            "BACKUP_OFFSITE_REQUIRED",
+            "BACKUP_ENCRYPTION_MODE",
+            "BACKUP_ENCRYPTION_KEYRING",
+            "BACKUP_ENCRYPTION_ACTIVE_KEY_ID",
+            "BACKUP_DUMP_TIMEOUT_MS",
+            "BACKUP_UPLOAD_TIMEOUT_MS",
+            "BACKUP_RESTORE_TIMEOUT_MS",
+            "BACKUP_MIN_ARTIFACT_BYTES",
+            "BACKUP_RPO_TARGET_HOURS",
+            "BACKUP_RTO_TARGET_MINUTES",
+            "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
+            "RETENTION_DRY_RUN",
+            "RETENTION_POLICY",
             "DAILY_LLM_USD_THRESHOLD",
             "FEATURE_OFX_IMPORT"
           ]

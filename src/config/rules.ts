@@ -282,6 +282,156 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
   }
 
   // -------------------------------------------------------------------
+  // BACKUP FAIL-CLOSED (issue #520 §1, "Em produção").
+  //
+  // BOOT scope on purpose. These are the gates that stop a production host
+  // from running with a backup configuration that can only ever produce an
+  // unrecoverable or plaintext artifact — the issue is explicit that
+  // "configuração inválida não pode ser reduzida a warning silencioso".
+  // Boot scope also means they still apply under the
+  // MAIA_CONFIG_STRICT_BOOT=false rollback lever: that lever exists to unblock
+  // an environment blocked by contract bookkeeping, not to let production boot
+  // without an off-site destination or an encryption key.
+  //
+  // The single source of truth for these rules is HERE. `src/ops/backup/
+  // profile.ts` only RESOLVES the profile (what is required, what is
+  // configured); it does not re-implement the verdicts.
+  // -------------------------------------------------------------------
+
+  const isProdProfile = profile === 'production';
+  const backupEnabled = c.BACKUP_ENABLED !== false;
+  // Ausente = o profile decide (production exige). Ver BACKUP_OFFSITE_REQUIRED.
+  const offsiteRequired =
+    c.BACKUP_OFFSITE_REQUIRED === undefined ? isProdProfile : c.BACKUP_OFFSITE_REQUIRED === true;
+  const encryptionMode = str(c.BACKUP_ENCRYPTION_MODE) ?? 'none';
+
+  if (isProdProfile && c.BACKUP_ENABLED === false) {
+    push({
+      scope: 'boot',
+      severity: 'error',
+      variable: 'BACKUP_ENABLED',
+      rule: 'backup/production-enabled',
+      message:
+        'BACKUP_ENABLED=false is not allowed in the production profile — a production deployment without backups has no recovery path.',
+      remediation:
+        'Defina BACKUP_ENABLED=true, ou rode este host sob MAIA_ENV=development/staging.',
+    });
+  }
+
+  if (backupEnabled) {
+    if (isProdProfile && c.BACKUP_OFFSITE_REQUIRED === false) {
+      push({
+        scope: 'boot',
+        severity: 'error',
+        variable: 'BACKUP_OFFSITE_REQUIRED',
+        rule: 'backup/production-offsite-required',
+        message:
+          'BACKUP_OFFSITE_REQUIRED=false is not allowed in the production profile — losing the host would take the only artifact with it.',
+        remediation:
+          'Remova BACKUP_OFFSITE_REQUIRED (o profile já exige) ou defina true, e configure BACKUP_S3_BUCKET.',
+      });
+    }
+
+    // Off-site exigido sem destino é a falha silenciosa que a #520 fecha: o
+    // job "terminava com sucesso" gravando só em disco local.
+    if (offsiteRequired && !str(c.BACKUP_S3_BUCKET)) {
+      push({
+        scope: 'boot',
+        severity: 'error',
+        variable: 'BACKUP_S3_BUCKET',
+        rule: 'backup/offsite-destination',
+        message:
+          'off-site backup is required by this profile but no destination is configured. Set BACKUP_S3_BUCKET (and credentials) or switch to a profile that does not require off-site.',
+        covers: ['BACKUP_S3_BUCKET'],
+        remediation:
+          'Defina BACKUP_S3_BUCKET + credenciais, ou desligue a exigência fora de production (BACKUP_OFFSITE_REQUIRED=false).',
+      });
+    }
+
+    if (isProdProfile && encryptionMode === 'none') {
+      push({
+        scope: 'boot',
+        severity: 'error',
+        variable: 'BACKUP_ENCRYPTION_MODE',
+        rule: 'backup/production-encryption',
+        message:
+          "BACKUP_ENCRYPTION_MODE=none is not allowed in the production profile — a dump contains every tenant's personal data in the clear.",
+        remediation: 'Defina BACKUP_ENCRYPTION_MODE=envelope_aes256_gcm e configure o keyring.',
+      });
+    }
+
+    // Chave ausente com cifra exigida: a run falha fechado em vez de gravar
+    // um dump em claro, então o boot avisa antes de o operador descobrir às 3h.
+    if (
+      encryptionMode !== 'none' &&
+      (!str(c.BACKUP_ENCRYPTION_KEYRING) || !str(c.BACKUP_ENCRYPTION_ACTIVE_KEY_ID))
+    ) {
+      push({
+        scope: 'boot',
+        severity: 'error',
+        variable: 'BACKUP_ENCRYPTION_KEYRING',
+        rule: 'backup/encryption-key',
+        message:
+          'encryption is required but the keyring is incomplete. Set BACKUP_ENCRYPTION_KEYRING (JSON {key_id: base64(32 bytes)}) and BACKUP_ENCRYPTION_ACTIVE_KEY_ID. The run fails closed rather than writing a plaintext dump.',
+        covers: ['BACKUP_ENCRYPTION_KEYRING', 'BACKUP_ENCRYPTION_ACTIVE_KEY_ID'],
+        remediation:
+          'Defina BACKUP_ENCRYPTION_KEYRING e BACKUP_ENCRYPTION_ACTIVE_KEY_ID, ou volte para BACKUP_ENCRYPTION_MODE=none fora de production.',
+      });
+    }
+
+    // Não anunciar um RPO que a arquitetura não cumpre (§8).
+    const rpoHours = num(c.BACKUP_RPO_TARGET_HOURS);
+    if (rpoHours !== undefined && rpoHours < 24) {
+      push({
+        scope: 'boot',
+        severity: 'error',
+        variable: 'BACKUP_RPO_TARGET_HOURS',
+        rule: 'backup/rpo-feasible',
+        message:
+          'BACKUP_RPO_TARGET_HOURS below 24 cannot be met by nightly logical dumps alone. Either raise the target or land PITR/WAL archiving first — the platform must not advertise an RPO it cannot honour.',
+        remediation: 'Use BACKUP_RPO_TARGET_HOURS >= 24 enquanto não houver PITR/WAL archiving.',
+      });
+    }
+
+    // A cópia autoritativa não pode expirar antes da secundária.
+    const localDays = num(c.BACKUP_RETENTION_LOCAL_DAYS);
+    const cloudDays = num(c.BACKUP_RETENTION_CLOUD_DAYS);
+    if (
+      offsiteRequired &&
+      localDays !== undefined &&
+      cloudDays !== undefined &&
+      localDays > cloudDays
+    ) {
+      push({
+        scope: 'boot',
+        severity: 'error',
+        variable: 'BACKUP_RETENTION_CLOUD_DAYS',
+        rule: 'backup/retention-ordering',
+        message:
+          'cloud retention is shorter than local retention while off-site is required — the authoritative copy would expire before the local one.',
+        remediation:
+          'Aumente BACKUP_RETENTION_CLOUD_DAYS para >= BACKUP_RETENTION_LOCAL_DAYS.',
+      });
+    }
+  }
+
+  // Exclusão é IRREVERSÍVEL: desligar o dry-run é uma decisão consciente por
+  // ambiente, não um default herdado. Warning (não erro) porque o operador
+  // PODE legitimamente querer executar retenção — mas nunca por acidente.
+  if (c.RETENTION_DRY_RUN === false) {
+    push({
+      scope: 'contract',
+      severity: 'warning',
+      variable: 'RETENTION_DRY_RUN',
+      rule: 'retention/dry-run-disabled',
+      message:
+        'RETENTION_DRY_RUN=false: o executor de retenção pode APAGAR dados neste ambiente.',
+      remediation:
+        'Confirme que a política de retenção foi aprovada pelo jurídico/DPO e que as contagens do dry-run foram conferidas — ver docs/architecture/concerns/data-retention-matrix.md.',
+    });
+  }
+
+  // -------------------------------------------------------------------
   // CONTRACT-SCOPE rules — enforced by `maia config check` / `maia doctor`.
   // Not wired into boot yet (rollout step 1: contract lands without changing
   // the loader's failure surface).

@@ -7,7 +7,8 @@ import { logger } from '@/lib/logger.js';
 import { pool } from '@/db/client.js';
 import { isS3Configured, pruneCloud } from './backup-s3.js';
 import { runWithSystemContext } from '@/db/tenant-context.js';
-import { resolveBackupProfile } from '@/ops/backup/profile.js';
+import { resolveProfile } from '@/config/profiles.js';
+import { resolveBackupProfile, type BackupConfigInput } from '@/ops/backup/profile.js';
 import { createBackupPorts } from '@/ops/backup/adapters.js';
 import { runVerifiedBackup, type BackupTrigger } from '@/ops/backup/service.js';
 import { OPS_LOCK_KEYS, withOpsLock } from '@/ops/backup/single-flight.js';
@@ -40,6 +41,49 @@ export async function runNightlyBackup(): Promise<void> {
 }
 
 /**
+ * Project the loaded configuration onto the slice `resolveBackupProfile` reads.
+ *
+ * Explicit rather than passing `config` wholesale: the field list is the
+ * compile-time contract between this worker and `src/ops/backup/profile.ts`, so
+ * renaming a variable in `src/config/contract.ts` breaks the build here instead
+ * of silently resolving to `undefined`.
+ *
+ * The Maia PROFILE comes from `resolveProfile` (issue #515), not from a
+ * backup-specific selector — `MAIA_ENV` is the single source of truth, and
+ * `resolveProfile` is pure (it reads the snapshot it is handed, not
+ * `process.env`).
+ */
+function backupConfigInput(): BackupConfigInput {
+  const { profile } = resolveProfile({
+    MAIA_ENV: config.MAIA_ENV,
+    NODE_ENV: config.NODE_ENV,
+  });
+  return {
+    profile,
+    BACKUP_ENABLED: config.BACKUP_ENABLED,
+    BACKUP_DIR: config.BACKUP_DIR,
+    BACKUP_RETENTION_LOCAL_DAYS: config.BACKUP_RETENTION_LOCAL_DAYS,
+    BACKUP_RETENTION_CLOUD_DAYS: config.BACKUP_RETENTION_CLOUD_DAYS,
+    BACKUP_S3_BUCKET: config.BACKUP_S3_BUCKET,
+    BACKUP_S3_ACCESS_KEY: config.BACKUP_S3_ACCESS_KEY,
+    BACKUP_S3_SECRET_KEY: config.BACKUP_S3_SECRET_KEY,
+    BACKUP_S3_ENDPOINT: config.BACKUP_S3_ENDPOINT,
+    BACKUP_OFFSITE_REQUIRED: config.BACKUP_OFFSITE_REQUIRED,
+    BACKUP_ENCRYPTION_MODE: config.BACKUP_ENCRYPTION_MODE,
+    BACKUP_ENCRYPTION_KEYRING: config.BACKUP_ENCRYPTION_KEYRING,
+    BACKUP_ENCRYPTION_ACTIVE_KEY_ID: config.BACKUP_ENCRYPTION_ACTIVE_KEY_ID,
+    BACKUP_DUMP_TIMEOUT_MS: config.BACKUP_DUMP_TIMEOUT_MS,
+    BACKUP_UPLOAD_TIMEOUT_MS: config.BACKUP_UPLOAD_TIMEOUT_MS,
+    BACKUP_RESTORE_TIMEOUT_MS: config.BACKUP_RESTORE_TIMEOUT_MS,
+    BACKUP_MIN_ARTIFACT_BYTES: config.BACKUP_MIN_ARTIFACT_BYTES,
+    BACKUP_RPO_TARGET_HOURS: config.BACKUP_RPO_TARGET_HOURS,
+    BACKUP_RTO_TARGET_MINUTES: config.BACKUP_RTO_TARGET_MINUTES,
+    BACKUP_RESTORE_DRILL_INTERVAL_HOURS: config.BACKUP_RESTORE_DRILL_INTERVAL_HOURS,
+    RETENTION_DRY_RUN: config.RETENTION_DRY_RUN,
+  };
+}
+
+/**
  * Shared entry point for cron and CLI. Returns the outcome so the CLI can pick
  * a process exit code.
  */
@@ -48,7 +92,7 @@ export async function executeBackup(trigger: BackupTrigger): Promise<{
   outcome?: 'completed' | 'completed_degraded' | 'failed';
   reason?: string;
 }> {
-  const profile = resolveBackupProfile(config);
+  const profile = resolveBackupProfile(backupConfigInput());
   if (!profile.enabled) {
     logger.warn({ profile: profile.name }, 'backup.disabled');
     return { status: 'disabled' };

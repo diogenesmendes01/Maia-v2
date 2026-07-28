@@ -115,9 +115,10 @@ export async function collectProvenance(): Promise<Provenance> {
     environment: config.NODE_ENV,
     source_id: `host-${createHash('sha256').update(hostname(), 'utf8').digest('hex').slice(0, 12)}`,
     app_version: appVersion,
-    // Injected by the deploy pipeline; spawning `git` from a nightly worker is
-    // not worth the failure mode.
-    commit: process.env.GIT_COMMIT ?? null,
+    // Injected by the deploy pipeline via the contract variable
+    // MAIA_BUILD_COMMIT (issue #515 forbids a raw `process.env` read here, and
+    // spawning `git` from a nightly worker is not worth the failure mode).
+    commit: config.MAIA_BUILD_COMMIT ?? null,
     pg_client_version: null,
     pg_server_version: pgServerVersion,
     migration_head: migrationHead,

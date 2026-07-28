@@ -103,6 +103,10 @@ Restaura o artefato num banco efêmero, roda probes e derruba o banco em `finall
 
 ## 6. Chaves de criptografia
 
+> Todas as variáveis abaixo são declaradas no contrato de configuração (#515):
+> `src/config/contract.ts`, grupo `backup`. Rode `npm run config:check` para
+> validar um ambiente inteiro de uma vez — o boot já falha fechado por contrato.
+
 - `BACKUP_ENCRYPTION_KEYRING` = JSON `{ key_id: base64(32 bytes) }`; `BACKUP_ENCRYPTION_ACTIVE_KEY_ID` aponta a chave de cifra.
 - **Rotação**: adicione a nova chave ao keyring, troque a ativa, **mantenha a antiga** enquanto existir artefato que a referencie. Retirar cedo demais torna o artefato indecifrável — `verifyDecryptable` reporta `backup_key_unavailable`.
 - **Drill de decrypt**: `verifyDecryptable` streama pelo decipher e descarta a saída — prova que a chave existe e a tag confere, sem materializar dado pessoal.

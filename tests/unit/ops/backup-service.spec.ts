@@ -20,7 +20,7 @@ const ENC_DIGEST = 'c'.repeat(64);
 
 function cfg(over: Partial<BackupConfigInput> = {}): BackupConfigInput {
   return {
-    NODE_ENV: 'development',
+    profile: 'development',
     BACKUP_ENABLED: true,
     BACKUP_DIR: '/backups',
     BACKUP_RETENTION_LOCAL_DAYS: 7,
@@ -286,7 +286,7 @@ describe('encryption', () => {
 describe('off-site', () => {
   const s3Cfg = cfg({ BACKUP_S3_BUCKET: 'maia-backups' });
   const prodCfg = cfg({
-    NODE_ENV: 'production',
+    profile: 'production',
     BACKUP_S3_BUCKET: 'maia-backups',
     BACKUP_ENCRYPTION_MODE: 'envelope_aes256_gcm',
     BACKUP_ENCRYPTION_KEYRING: '{"k1":"x"}',

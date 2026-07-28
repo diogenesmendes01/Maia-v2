@@ -19,7 +19,7 @@ The default is deliberately "do not delete". Deletion is irreversible, so the fa
 
 1. The DPO answers the open question for a class (below).
 2. The answer is recorded in this document, with its legal basis and exceptions.
-3. It ships as the `RETENTION_POLICY` environment value:
+3. It ships as the `RETENTION_POLICY` environment value (declared in the configuration contract, `src/config/contract.ts`, group `backup`):
 
    ```json
    {

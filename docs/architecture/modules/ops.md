@@ -10,7 +10,7 @@ Everything in this module is written so the DECISION is pure and the SIDE EFFECT
 
 | File | Role |
 |---|---|
-| `src/ops/backup/profile.ts` | Configuration contract per profile (`development` / `staging` / `production`), validated fail-closed from `src/config/env.ts` |
+| `src/ops/backup/profile.ts` | Resolves the backup posture (what is required, what is configured) for the Maia profile. The fail-closed VERDICTS live in `src/config/rules.ts` (`backup/*`), per issue #515 |
 | `src/ops/backup/state-machine.ts` | The 12-state lifecycle and `classifyOutcome` — the terminal verdict is COMPUTED from evidence |
 | `src/ops/backup/checksum.ts` | Streaming SHA-256 + timing-safe digest comparison |
 | `src/ops/backup/manifest.ts` | Versioned, HMAC-signed manifest: provenance, checksum, coverage, tombstone watermark |
@@ -35,7 +35,7 @@ Everything in this module is written so the DECISION is pure and the SIDE EFFECT
 
 | Need | Where |
 |---|---|
-| Add a backup configuration knob | `src/config/env.ts` + `BackupConfigInput`/`resolveBackupProfile`; add its production rule to `validateBackupProfile` |
+| Add a backup configuration knob | Declare it in `src/config/contract.ts` (group `backup`), add it to `BackupConfigInput`/`backupConfigInput()`, and put its fail-closed rule in `src/config/rules.ts` (`backup/*`). Then `npm run config:generate`. |
 | Add a lifecycle stage | `state-machine.ts` (`BACKUP_STATES` + `TRANSITIONS`), then the CHECK in `migrations/101_*.sql` |
 | Add a manifest field | `manifest.ts` (`backupManifestSchema`); bump `MANIFEST_VERSION` only when an existing field's MEANING changes |
 | Add a data class | `retention/data-classes.ts` + the matrix doc; state its `dpo_open_question` |
