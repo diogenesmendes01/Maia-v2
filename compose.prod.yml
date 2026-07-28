@@ -174,12 +174,21 @@ services:
     cap_drop:
       - ALL
     pids_limit: 512
+    # Issue #512 — a janela de drain tem que caber ANTES do SIGKILL do Docker
+    # (default 10s). SHUTDOWN_GRACE_MS (default 25s) + fechamento de recursos
+    # cabe em 40s; se aumentar o grace no .env, aumente isto junto.
+    stop_grace_period: 40s
     healthcheck:
+      # Issue #512 — LIVENESS usa `/livez`: sem I/O, sem DB/Redis/WhatsApp. O
+      # healthcheck antigo batia em `/health`, que agrega dependências: uma
+      # queda de Postgres marcava o CONTAINER unhealthy e o restart matava o
+      # processo em vez de deixar o `/readyz` tirar a instância de rotação.
       # Node 22 tem fetch global — sem curl/wget, sem segredo no comando.
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(function(r){process.exit(r.ok?0:1)}).catch(function(){process.exit(1)})"]
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/livez').then(function(r){process.exit(r.ok?0:1)}).catch(function(){process.exit(1)})"]
       interval: 30s
       timeout: 10s
       retries: 5
+      # Startup: `/startupz` só vira 200 quando o lifecycle chega em `ready`.
       start_period: 30s
 
   # admin-ui (Next.js) — container separado; o proxy roteia

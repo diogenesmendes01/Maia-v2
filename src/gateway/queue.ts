@@ -218,10 +218,25 @@ export async function enqueueUnroutedReplay(args: {
   );
 }
 
+/**
+ * Close the BullMQ surface in dependency order (issue #512 §5).
+ *
+ * `Worker.close()` waits for the job currently being processed to finish —
+ * that wait IS the queue drain the old `gracefulShutdown()` never performed
+ * (it closed the Redis/Postgres pools out from under an active turn). A job
+ * that outlives the caller's deadline stays in Redis and is re-delivered as
+ * stalled by the next instance, so unfinished work remains RECOVERABLE.
+ *
+ * Idempotent and safe on a process that never started the workers (a
+ * role-restricted process, or a boot that failed before this point): the
+ * connection is only quit when it is actually open.
+ */
 export async function shutdownQueue(): Promise<void> {
   await worker?.close();
   await unroutedWorker?.close();
-  await agentQueue.close();
-  await unroutedQueue.close();
-  await connection.quit();
+  worker = null;
+  unroutedWorker = null;
+  await agentQueue.close().catch(() => undefined);
+  await unroutedQueue.close().catch(() => undefined);
+  if (connection.status !== 'end') await connection.quit().catch(() => undefined);
 }

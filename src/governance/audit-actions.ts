@@ -57,6 +57,13 @@ export const AUDIT_ACTIONS = [
   'auto_blocked_anomalous_volume',
   'system_started',
   'system_stopped',
+  // Issue #512 — explicit lifecycle outcomes. `system_started` now lands only
+  // AFTER every mandatory dependency for the process role was verified; these
+  // two cover the paths that used to be invisible: a boot aborted fail-closed
+  // on an unavailable dependency, and an operator-forced exit (second stop
+  // signal, or a drain deadline that expired with work still in flight).
+  'system_start_failed',
+  'system_shutdown_forced',
   'config_loaded',
   'backup_completed',
   'backup_failed',

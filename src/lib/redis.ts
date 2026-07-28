@@ -203,11 +203,83 @@ export function isRedisConnected(): boolean {
   return connected;
 }
 
-export async function ensureRedisConnect(): Promise<void> {
-  if (redis.status === 'ready' || redis.status === 'connecting') return;
+/**
+ * Redis is unavailable at boot — issue #512.
+ *
+ * Typed so the boot path can fail CLOSED on it instead of pattern-matching a
+ * driver error. Redis is a MANDATORY dependency (BullMQ agent queue, inbound
+ * dedup, the debouncer, working memory, rate limiting), so a process that
+ * cannot reach it must never announce readiness.
+ */
+export class RedisUnavailableError extends Error {
+  readonly code = 'REDIS_UNAVAILABLE';
+  constructor(detail: string) {
+    super(`redis unavailable at startup: ${detail}`);
+    this.name = 'RedisUnavailableError';
+  }
+}
+
+/** Resolve once the client reports `ready`, or reject on the deadline. */
+async function waitForReady(timeoutMs: number): Promise<void> {
+  if (redis.status === 'ready') return;
+  await new Promise<void>((resolve, reject) => {
+    let done = false;
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      redis.off('ready', onReady);
+      redis.off('error', onError);
+      reject(new Error(`timed out after ${timeoutMs}ms waiting for redis ready`));
+    }, timeoutMs);
+    timer.unref?.();
+    function settle(err?: Error): void {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      redis.off('ready', onReady);
+      redis.off('error', onError);
+      if (err) reject(err);
+      else resolve();
+    }
+    function onReady(): void {
+      settle();
+    }
+    function onError(err: Error): void {
+      settle(err);
+    }
+    redis.on('ready', onReady);
+    redis.on('error', onError);
+  });
+}
+
+/**
+ * Connect the shared Redis client, FAIL-CLOSED (issue #512).
+ *
+ * Previously this swallowed the failure and logged a warning, so a process
+ * with no Redis kept booting, started HTTP, went "ready" for the load
+ * balancer and only failed later — once per inbound message — on the queue,
+ * dedup and working-memory paths. AGENTS.md §4.2 (fail-closed) makes that the
+ * wrong default: an unavailable MANDATORY dependency must stop the boot with
+ * an explicit policy, never "just log and continue".
+ *
+ * @throws RedisUnavailableError when the connection is not `ready` within
+ *         `REDIS_CONNECT_TIMEOUT_MS`. The caller (`src/index.ts`) marks the
+ *         lifecycle `failed`, drains what it already opened and exits non-zero.
+ */
+export async function ensureRedisConnect(opts?: { timeoutMs?: number }): Promise<void> {
+  const timeoutMs = opts?.timeoutMs ?? config.REDIS_CONNECT_TIMEOUT_MS;
+  if (redis.status === 'ready') return;
   try {
-    await redis.connect();
+    // `connect()` throws "Redis is already connecting/connected" if a connect
+    // is already in flight (e.g. two boot paths racing) — in that case we only
+    // need to WAIT for readiness, not to initiate.
+    if (redis.status !== 'connecting' && redis.status !== 'connect' && redis.status !== 'reconnecting') {
+      await redis.connect();
+    }
+    await waitForReady(timeoutMs);
   } catch (err) {
-    logger.warn({ err }, 'redis.connect_failed');
+    const detail = (err as Error)?.message ?? 'unknown error';
+    logger.error({ err: detail, timeout_ms: timeoutMs }, 'redis.connect_failed');
+    throw new RedisUnavailableError(detail);
   }
 }

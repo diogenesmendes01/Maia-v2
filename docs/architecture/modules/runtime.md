@@ -70,6 +70,29 @@
 |---|---|
 | `build-prompt-from-packet.ts` | Renders prompt from context packet |
 
+### Lifecycle (`src/runtime/lifecycle/`) — issue #512
+
+Process-level (not per-turn) infrastructure: the explicit `starting → ready →
+draining → stopped ↘ failed` state machine, role-aware readiness and the
+ordered graceful shutdown. `src/index.ts` drives it; `src/server.ts` exposes it
+through `/livez`, `/startupz` and `/readyz`.
+
+| File | Role |
+|---|---|
+| `roles.ts` | **Process role contract** — `ProcessRole`, `LifecycleComponent`, `ROLE_CONTRACTS`, `roleOwns()`, `roleRequires()`. What a role STARTS vs what gates its readiness. Consumed by issue #513 (topology separation). |
+| `controller.ts` | Singleton state machine: legal transitions, component registry, idempotent shutdown with an ordered step list + deadline, background-task registry, `maia_lifecycle_state` gauge |
+| `readiness.ts` | Composite, role-aware `/readyz` + `/startupz` evaluation. Read-only, per-component timeout, memoized, sanitized output |
+| `schema-version.ts` | Applied-vs-expected migration comparison. Validates only — never applies |
+| `index.ts` | Public barrel (import the role contract from here) |
+
+Rules this module enforces:
+
+- readiness is impossible outside `ready`, and turns 503 on the first request after a drain starts;
+- a required component that is `down`/`unknown` keeps the instance out of rotation (fail-closed);
+- probes never write and never return raw driver text;
+- shutdown is idempotent — concurrent signals share one promise — and closes consumers before the pools they use;
+- undrained components are reported (log + `maia_shutdown_total{result="incomplete"}`), never silently dropped.
+
 ## Patterns it follows
 
 - [Action layer](../concerns/action-layer.md) — decision engine + PEPs + skill modes
@@ -102,6 +125,11 @@
 | `tests/unit/decision/action-decider/` | Routing decisions |
 | `tests/unit/runtime/context-packet/` | Slice assembly + cache |
 | `tests/unit/runtime/feature-flags/` | Flag defaults |
+| `tests/unit/runtime/lifecycle-roles.spec.ts` | Process role contract (#512/#513) |
+| `tests/unit/runtime/lifecycle-controller.spec.ts` | State machine, idempotent shutdown, drain deadline |
+| `tests/unit/runtime/lifecycle-readiness.spec.ts` | Role-aware `/readyz` + `/startupz` fail-closed cases |
+| `tests/unit/runtime/lifecycle-schema-version.spec.ts` | Migration version gate |
+| `tests/integration/lifecycle-probes.spec.ts` | Probes against real Postgres/Redis; `/health` writes no rows |
 
 ## In-flight changes
 

@@ -190,23 +190,135 @@ curl -s http://localhost:3000/metrics | grep -E "maia_(baileys|redis|llm|audit)_
 | `maia_llm_latency_ms` | histogram | p99 > 30s |
 | `maia_audit_events_total{action,tenant_id,agent_id}` | counter | crescimento súbito em ações sensíveis (filtrável por tenant) |
 
-**Health endpoints** (em `src/server.ts`): `/health`, `/health/db`, `/health/redis`, `/health/whatsapp`. Não há `/health/llm` — use `maia_llm_calls_total{status}` no Prometheus.
+> Adicionar `maia_llm_circuit_state` é um follow-up trivial (uma linha em `src/server.ts` via `setGaugeProvider`). Se quiser alertas baseados nessa, abre uma PR.
 
-> Adicionar `maia_db_connected` e `maia_llm_circuit_state` é um follow-up trivial (uma linha cada em `src/server.ts` via `setGaugeProvider`). Se quiser alertas baseados nessas, abre uma PR.
+### 8.1 Probes — qual endpoint usar onde (issue #512)
+
+Quatro superfícies com **contratos diferentes**. Apontar o probe errado para o
+endpoint errado transforma queda de dependência em restart loop.
+
+| Endpoint | Pergunta que responde | Faz I/O? | Usar em |
+|---|---|---|---|
+| `/livez` | o processo está vivo? | **não** (nenhum) | liveness do orquestrador / `healthcheck` do compose |
+| `/startupz` | a inicialização terminou? | não | startup probe |
+| `/readyz` | o load balancer deve mandar tráfego? | sim, read-only e cacheado | readiness probe / pool do LB |
+| `/health`, `/health/{db,redis,whatsapp}` | qual componente está ruim? | sim, read-only e cacheado | diagnóstico humano, dashboards |
+
+Não há `/health/llm` — use `maia_llm_calls_total{status}` no Prometheus.
+
+Regras que o código garante (`src/runtime/lifecycle/`):
+
+- **`/livez` nunca toca DB, Redis, WhatsApp ou disco.** Um `/health` como
+  liveness fazia o container ser reiniciado quando o Postgres caía — o
+  processo estava perfeitamente vivo.
+- **`/readyz` é role-aware** (`MAIA_PROCESS_ROLE`, ver §8.2) e **fail-closed**:
+  503 enquanto `starting`, `draining`, `failed` ou `stopped`, e 503 se um
+  componente obrigatório do papel estiver `down`/`unknown` (DB, Redis,
+  pressão de memória do Redis, versão de schema, fila/worker, sessão).
+- **`/readyz` vira 503 no primeiro request depois do SIGTERM** — o estado é
+  checado antes (e fora) do cache.
+- **Nenhum probe escreve.** Antes do #512 cada chamada de `/health` inseria 3
+  linhas em `system_health_events`; a série histórica agora é escrita pelo cron
+  `health_monitor` (1×/min).
+- **Nenhum probe devolve texto cru de driver** (`details` é removido na borda
+  HTTP; a mensagem completa vai só para o log).
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost:3000/livez     # 200 sempre que o processo responde
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost:3000/startupz  # 503 → boot ainda em andamento
+curl -s http://localhost:3000/readyz | jq '.ready, .state, .role, (.checks[] | select(.required))'
+```
+
+### 8.2 Papel do processo (`MAIA_PROCESS_ROLE`)
+
+Contrato em `src/runtime/lifecycle/roles.ts`. Hoje todo processo roda `all`
+(modo compatível). Os demais papéis existem para a separação de topologia
+(issue #513) e já mudam o que `/readyz` exige:
+
+| Papel | Inicia | `/readyz` exige |
+|---|---|---|
+| `all` | tudo | tudo |
+| `api` | HTTP + filas (produtor) | config, db, schema, redis, redis_memory, queue, http |
+| `worker` | filas + worker BullMQ | config, db, schema, redis, redis_memory, queue, agent_worker |
+| `scheduler` | crons | config, db, schema, redis, redis_memory, cron_scheduler |
+| `session-owner` | sessões WhatsApp + filas | config, db, schema, redis, redis_memory, queue, whatsapp_session |
+
+Valor desconhecido = erro de boot (fail-closed), nunca fallback permissivo.
+
+### 8.3 Métricas de lifecycle
+
+| Métrica | Tipo | Alerta se |
+|---|---|---|
+| `maia_lifecycle_state{role,state}` | gauge | `state="failed"`=1, ou `state="draining"`=1 por > grace |
+| `maia_lifecycle_transition_total{role,from,to}` | counter | transições para `failed` |
+| `maia_readiness_check_total{component,result}` | counter | `result!="ok"` sustentado |
+| `maia_readiness_check_duration_ms{component}` | histogram | p99 perto do `READINESS_PROBE_TIMEOUT_MS` |
+| `maia_shutdown_total{result,role}` | counter | `result="incomplete"` |
+| `maia_shutdown_duration_ms{component}` | histogram | passo perto do `SHUTDOWN_STEP_TIMEOUT_MS` |
+| `maia_shutdown_forced_total{reason,role}` | counter | **qualquer** incremento |
+| `maia_worker_active_jobs{worker}` | gauge | =1 continuamente (job travado) |
+| `maia_worker_last_success_timestamp{worker}` | gauge | idade > 3× a cadência do cron |
+| `maia_worker_last_failure_timestamp{worker}` | gauge | recente + sem sucesso depois |
+| `maia_worker_tick_skipped_total{worker,reason}` | counter | crescimento (execução anterior não termina no intervalo) |
 
 ---
 
 ## 9. Restart limpo (zero data loss)
 
 ```bash
-sudo systemctl stop maia          # SIGTERM → finaliza jobs em flight
-# Aguarde 'maia.shutting_down' no log
-sleep 5
+sudo systemctl stop maia          # SIGTERM → inicia o drain
+# Log esperado, nesta ordem:
+#   maia.shutting_down
+#   lifecycle.transition            from=ready to=draining
+#   lifecycle.shutdown_step_done    step=cron_workers
+#   lifecycle.shutdown_step_done    step=background_tasks
+#   lifecycle.shutdown_step_done    step=line_sessions
+#   lifecycle.shutdown_step_done    step=baileys
+#   lifecycle.shutdown_step_done    step=bullmq
+#   lifecycle.shutdown_step_done    step=http
+#   lifecycle.shutdown_step_done    step=pools
+#   lifecycle.shutdown_complete     result=clean
 sudo systemctl start maia
-# Aguarde 'http.listening' + 'baileys.connected'
+# Aguarde 'http.listening' → 'maia.ready' e /readyz respondendo 200
 ```
 
-O shutdown handler em `src/index.ts` chama `stopWorkers()` + `shutdownPools()` + audit `system_stopped`. Restart preserva: sessão Baileys (`.baileys-auth/`), backups, audit log, jobs (BullMQ persiste em Redis).
+**O que o shutdown faz de verdade** (`src/index.ts`, `registerShutdownSequence`):
+
+1. transição atômica para `draining` → `/readyz` responde 503 no request seguinte;
+2. para de agendar crons e **espera** o tick em execução (antes ele só chamava
+   `task.stop()` e seguia em frente, fechando os pools por baixo do job);
+3. espera as tarefas fire-and-forget rastreadas;
+4. fecha as linhas adicionais e depois a sessão Baileys primária;
+5. fecha BullMQ — `Worker.close()` **espera o job ativo terminar**;
+6. fecha o Fastify (dispara os `onClose`: timers do coletor de memória e do probe de DB);
+7. audita `system_stopped`;
+8. fecha Redis e Postgres **por último** (nenhum consumidor fica com handle fechado);
+9. sai naturalmente. Não há `process.exit(0)` prematuro.
+
+**Orçamento de tempo** — `SHUTDOWN_GRACE_MS` (default 25s) é o teto do drain
+inteiro e `SHUTDOWN_STEP_TIMEOUT_MS` (default 10s) o de cada passo. Ele
+**precisa ser menor** que o `TimeoutStopSec` do systemd / `stop_grace_period`
+do compose (40s no `compose.prod.yml`), senão o SIGKILL corta o drain.
+
+**Quando o deadline estoura:** os componentes não drenados aparecem em
+`lifecycle.shutdown_incomplete` (campo `undrained`), o counter
+`maia_shutdown_forced_total{reason="drain_deadline"}` incrementa e o processo
+sai com `SHUTDOWN_FORCED_EXIT_CODE` (default 1). Trabalho não concluído
+continua recuperável: o job BullMQ volta como stalled e a row de inbound
+pendente é re-enfileirada pelo `message_recovery`.
+
+**Segundo SIGTERM/SIGINT** força a saída imediata — é auditado
+(`system_shutdown_forced`) e metrificado
+(`maia_shutdown_forced_total{reason="second_signal_SIGTERM"}`). Use só se o
+drain travou.
+
+**Se o boot falhar** (dependência obrigatória fora): não há readiness, o
+lifecycle vai para `failed`, `system_start_failed` é auditado, o que já abriu é
+fechado e o processo sai com 1. Redis indisponível **não** é mais um warning
+silencioso.
+
+Restart preserva: sessão Baileys (`.baileys-auth/`), backups, audit log, jobs
+(BullMQ persiste em Redis).
 
 ---
 
