@@ -14,7 +14,10 @@ import {
   PRIMARY_TENANT_ID,
   PRIMARY_AGENT_ID,
 } from '../tenant-context.js';
-import type { Conversa, Mensagem, PendingQuestion } from '../schema.js';
+import type { AgentTurn, Conversa, Mensagem, PendingQuestion } from '../schema.js';
+// Issue #503 — ingresso atômico (mensagem + turno na mesma transação). Import
+// unidirecional: `turn-repos` NÃO importa este módulo, então não há ciclo.
+import { agentTurnsRepo } from './turn-repos.js';
 
 export const conversasRepo = {
   /**
@@ -356,9 +359,18 @@ export const mensagensRepo = {
     const rows = await db.insert(mensagens).values(guarded).returning();
     return rows[0]!;
   },
+  /**
+   * Issue #503 — `opts.withTurn` faz a persistência do inbound e a criação do
+   * turno `received` acontecerem na MESMA transação PostgreSQL (delegado a
+   * `agentTurnsRepo.createReceivedTurnTx`). Sem a opção o comportamento é
+   * idêntico ao anterior: só a row de mensagem. O caminho de dedup (pre-check +
+   * retry no 23505) é o mesmo nos dois modos — uma duplicata nunca chega a
+   * abrir transação, então nunca cria turno órfão.
+   */
   async createInbound(
     input: MensagemInsertInput,
-  ): Promise<{ row: Mensagem; duplicate: boolean }> {
+    opts?: { withTurn?: boolean },
+  ): Promise<{ row: Mensagem; duplicate: boolean; turn?: AgentTurn }> {
     const wid = (input.metadata as Record<string, unknown> | null)?.['whatsapp_id'];
     // 090 (spec roteamento v4 §1.7) — o pre-check espelha as partial uniques:
     // com canal conhecido, um retry NA MESMA linha (ou de uma row legada sem
@@ -372,6 +384,13 @@ export const mensagensRepo = {
     const preExisting = await findExisting();
     if (preExisting) return { row: preExisting, duplicate: true };
     try {
+      if (opts?.withTurn) {
+        const created = await agentTurnsRepo.createReceivedTurnTx({
+          mensagem: { ...input, channel_id: input.channel_id ?? null },
+          channel_id: input.channel_id ?? null,
+        });
+        return { row: created.mensagem, duplicate: false, turn: created.turn };
+      }
       const guarded = applyTenantGuard({ ...input, channel_id: input.channel_id ?? null });
       const rows = await db.insert(mensagens).values(guarded).returning();
       return { row: rows[0]!, duplicate: false };

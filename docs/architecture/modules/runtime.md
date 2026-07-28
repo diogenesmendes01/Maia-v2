@@ -51,6 +51,53 @@
 | Tool | `slice-builders/tool-slice-builder.ts` |
 | User | `slice-builders/user-slice-builder.ts` |
 
+### Turn state machine (`src/runtime/turns/`) — issue #503
+
+Máquina de estados **durável** do turno inbound. PostgreSQL é a fonte de verdade
+do ciclo de vida; Redis/BullMQ são só wake-up e distribuição. Um turno é
+**lógico**: agrega N mensagens inbound (debounce) numa única execução.
+
+| File | Role |
+|---|---|
+| `contract.ts` | Vocabulário PURO: estados, outcomes, tabela de transições, compatibilidade estado/outcome, sanitização do erro persistido. Sem I/O — unit-testável sem Postgres. |
+| `lifecycle.ts` | Fachada usada por gateway/agent/workers: flag de rollout, fail-soft, auditoria e métricas. |
+| `index.ts` | Superfície pública — importe daqui. |
+
+A **única porta de escrita** é `agentTurnsRepo`
+([`src/db/repositories/turn-repos.ts`](../../../src/db/repositories/turn-repos.ts)):
+nenhum caller atualiza `status` direto e toda transição é compare-and-swap sobre
+`state_version`, escopada por `tenant_id + agent_id`.
+
+**Estados** — `received → queued → claimed → running → outbound_pending →
+completed`, com `retryable` (falha antes de efeito irreversível), `ignored`
+(descarte por regra explícita), `superseded` (absorvido pelo debounce) e
+`dead_letter`. `outbound_pending` **nunca** volta para `running`; estado
+terminal **sempre** carrega outcome.
+
+**Outcome ≠ estado**: o caller declara o RESULTADO DE NEGÓCIO
+(`reply_delivered`, `identity_unknown`, `rate_limited_silent`, …) e a fachada
+deriva o estado terminal. É assim que "nenhum turno é concluído simplesmente
+porque uma função retornou" fica garantido.
+
+**Rollout** — duas flags, registradas em `ENV_CONTRACT`
+([`src/config/contract.ts`](../../../src/config/contract.ts)) e documentadas em
+[`docs/configuration.md`](../../configuration.md) (arquivo **gerado**; edite o
+contrato, nunca o `.env.example`):
+
+| Flag | Default | Efeito |
+|---|---|---|
+| `FEATURE_TURN_STATE_MACHINE` | `true` | Dual-write: cria/transiciona turnos. Só ESCRITA — o comportamento observável não muda. **Exige as migrations 096/097 aplicadas.** |
+| `FEATURE_TURN_STATE_AUTHORITATIVE` | `false` | Flip da LEITURA: o recovery elege por `agent_turns.status` em vez de `processada_em`. |
+
+A combinação `AUTHORITATIVE=true` + `MACHINE=false` é inerte e por isso o boot a
+**recusa** (regra `turn-state/authoritative-requires-dual-write` em
+[`src/config/rules.ts`](../../../src/config/rules.ts)).
+
+Enquanto a segunda flag estiver OFF, `mensagens.processada_em` continua sendo a
+decisão de negócio e a máquina roda em **shadow**; a divergência é medida por
+`maia_turn_legacy_projection_mismatch_total`. Runbook:
+[`docs/runbooks/turn-state-machine.md`](../../runbooks/turn-state-machine.md).
+
 ### Feature flags (`src/runtime/feature-flags/`)
 
 | File | Role |
@@ -142,6 +189,10 @@ Rules this module enforces:
 | `tests/unit/gateway/queue-await-ready.spec.ts` | `waitUntilReady` before claiming ready |
 | `tests/integration/lifecycle-probes.spec.ts` | Probes against real Postgres/Redis; `/health` writes no rows |
 | `tests/integration/lifecycle-drain-queue.spec.ts` | Real Redis: job enqueued during the drain never runs |
+| `tests/unit/turn-state-machine.spec.ts` | Tabela completa de transições válidas/inválidas, outcome obrigatório em terminal, sanitização do erro |
+| `tests/unit/turn-lifecycle.spec.ts` | Kill switch, derivação outcome→estado, retry/dead letter, fail-soft |
+| `tests/integration/agent-turns-real-db.spec.ts` | CAS concorrente, FK composta, projeção legada, backfill idempotente, plano do índice |
+| `tests/integration/agent-turns-leak.spec.ts` | Leak cross-tenant do `agentTurnsRepo` (parte de `npm run test:leak`) |
 
 ## In-flight changes
 

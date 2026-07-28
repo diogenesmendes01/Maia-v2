@@ -47,7 +47,16 @@ import { sendOutbound, safeDispatchOutput } from './output-dispatch.js';
 import { executeSelectedSkill } from './execute-skill.js';
 import { runSkill } from '@/skills/index.js';
 import { skillsRepo, outboundMessagesRepo } from '@/db/repositories.js';
-import { runReActLoop } from './react-loop.js';
+import { runReActLoop, type ReActDelivery } from './react-loop.js';
+// Issue #503 — máquina de estados durável do turno inbound. `core.ts` declara o
+// OUTCOME de negócio; a fachada escolhe o estado terminal e faz o CAS.
+import {
+  ensureTurnHandle,
+  beginTurnExecution,
+  absorbDebounceInputs,
+  concludeTurn,
+  failTurnRetryable,
+} from '@/runtime/turns/index.js';
 import {
   runWithTenantContext,
   getCurrentTenant,
@@ -473,6 +482,18 @@ async function runAgentForMensagemInner(
     logger.debug({ mensagem_id }, 'agent.already_processed');
     return;
   }
+
+  // Issue #503 — handle do turno DURÁVEL. `ensureTurnHandle` reencontra o turno
+  // criado atomicamente no ingresso ou, para rows anteriores a esta issue (e
+  // durante deploy rolling), cria um em `received`. `null` quando a flag está
+  // OFF — todas as chamadas abaixo viram no-op nesse caso.
+  //
+  // ATENÇÃO (#504): `beginTurnExecution` registra que a execução COMEÇOU; NÃO é
+  // exclusão mútua. Duas réplicas ainda podem entrar no mesmo turno até o claim
+  // atômico com lease/fencing. Por isso um conflito aqui não aborta o turno.
+  const turn = await ensureTurnHandle(inbound);
+  await beginTurnExecution(turn, { channel_id });
+
   if (!inbound.conversa_id) {
     const tel = (inbound.metadata as Record<string, unknown>)?.['telefone'] as string | undefined;
     if (!tel) return;
@@ -481,16 +502,27 @@ async function runAgentForMensagemInner(
     const resolved = await resolveIdentity({ telefone_whatsapp: tel, channel_id });
     if (resolved.kind === 'unknown') {
       // Mark processed so the recovery worker doesn't requeue forever.
+      // #503: descarte INTENCIONAL por regra explícita → `ignored`, com outcome
+      // próprio (antes era indistinguível de "processado com sucesso").
+      await concludeTurn(turn, 'identity_unknown', { mensagem_id: inbound.id });
       await mensagensRepo.markProcessed(inbound.id, 0);
       return;
     }
     if (resolved.kind === 'blocked') {
       logger.info({ pessoa_id: resolved.pessoa.id, reason: resolved.reason }, 'agent.blocked_drop');
+      await concludeTurn(turn, 'identity_blocked', {
+        pessoa_id: resolved.pessoa.id,
+        mensagem_id: inbound.id,
+      });
       await mensagensRepo.markProcessed(inbound.id, 0);
       return;
     }
     if (resolved.kind === 'quarantined') {
       await handleQuarantineFirstContact({ pessoa: resolved.pessoa, inbound });
+      await concludeTurn(turn, 'quarantined', {
+        pessoa_id: resolved.pessoa.id,
+        mensagem_id: inbound.id,
+      });
       await mensagensRepo.markProcessed(inbound.id, 0);
       return;
     }
@@ -506,6 +538,10 @@ async function runAgentForMensagemInner(
       });
       if (consumed) {
         await mensagensRepo.setConversaId(inbound.id, resolved.conversa.id);
+        await concludeTurn(turn, 'pending_action_resolved', {
+          pessoa_id: resolved.pessoa.id,
+          mensagem_id: inbound.id,
+        });
         await mensagensRepo.markProcessed(inbound.id, 0);
         return;
       }
@@ -564,6 +600,10 @@ async function runAgentForMensagemInner(
     );
   }
   const allInboundIds = [...aggregated.merged_ids, inbound.id];
+  // #503 — a rajada do debounce produz UM turno executável: as irmãs viram
+  // inputs deste turno (ou têm seu próprio turno marcado `superseded`). A
+  // associação definitiva no ingresso é fechada em #505.
+  await absorbDebounceInputs(turn, aggregated.merged_ids);
   const markAllProcessed = async (tokens: number | null): Promise<void> => {
     // Per-row update keeps the existing repo contract (single-id) and
     // mirrors the audit semantics: each row gets its own processada_em.
@@ -608,6 +648,10 @@ async function runAgentForMensagemInner(
         logger.warn({ err: (err as Error).message }, 'agent.rate_limit_reply_failed'),
       );
     }
+    await concludeTurn(turn, 'rate_limited_silent', {
+      pessoa_id: pessoa.id,
+      mensagem_id: inbound.id,
+    });
     await markAllProcessed(0);
     await conversasRepo.touch(c.id);
     await clearDebounceState(pessoa.telefone_whatsapp);
@@ -631,6 +675,10 @@ async function runAgentForMensagemInner(
       }).catch((err) =>
         logger.warn({ err: (err as Error).message }, 'agent.approval_reply_send_failed'),
       );
+      await concludeTurn(turn, 'pending_action_resolved', {
+        pessoa_id: pessoa.id,
+        mensagem_id: inbound.id,
+      });
       await markAllProcessed(0);
       await conversasRepo.touch(c.id);
       await clearDebounceState(pessoa.telefone_whatsapp);
@@ -643,6 +691,10 @@ async function runAgentForMensagemInner(
   // action and audited it; we just close the loop and skip the ReAct turn.
   const gate = await checkPendingFirst({ pessoa, conversa: c, inbound });
   if (gate.kind === 'resolved') {
+    await concludeTurn(turn, 'pending_action_resolved', {
+      pessoa_id: pessoa.id,
+      mensagem_id: inbound.id,
+    });
     await markAllProcessed(0);
     await conversasRepo.touch(c.id);
     await clearDebounceState(pessoa.telefone_whatsapp);
@@ -947,6 +999,10 @@ async function runAgentForMensagemInner(
         }).catch((err) =>
           logger.warn({ err: (err as Error).message }, 'agent.decision_engine.blocked_reply_failed'),
         );
+        await concludeTurn(turn, 'blocked_by_policy', {
+          pessoa_id: pessoa.id,
+          mensagem_id: inbound.id,
+        });
         await markAllProcessed(0);
         await conversasRepo.touch(c.id);
         await clearDebounceState(pessoa.telefone_whatsapp);
@@ -967,6 +1023,10 @@ async function runAgentForMensagemInner(
         }).catch((err) =>
           logger.warn({ err: (err as Error).message }, 'agent.decision_engine.escalate_reply_failed'),
         );
+        await concludeTurn(turn, 'blocked_by_policy', {
+          pessoa_id: pessoa.id,
+          mensagem_id: inbound.id,
+        });
         await markAllProcessed(0);
         await conversasRepo.touch(c.id);
         await clearDebounceState(pessoa.telefone_whatsapp);
@@ -1076,6 +1136,12 @@ async function runAgentForMensagemInner(
           },
         );
         if (outcome.handled) {
+          // A skill entregou a resposta pelo dispatchOutput — turno concluído
+          // COM resposta.
+          await concludeTurn(turn, 'reply_delivered', {
+            pessoa_id: pessoa.id,
+            mensagem_id: inbound.id,
+          });
           await markAllProcessed(0);
           await conversasRepo.touch(c.id);
           await clearDebounceState(pessoa.telefone_whatsapp);
@@ -1104,6 +1170,12 @@ async function runAgentForMensagemInner(
       }).catch((e) =>
         logger.warn({ err: (e as Error).message }, 'agent.decision_engine.fail_closed_reply_failed'),
       );
+      // Fallback determinístico entregue ao usuário (não é sucesso do turno,
+      // mas também não é retry: o engine falhou fechado por decisão de política).
+      await concludeTurn(turn, 'fallback_delivered', {
+        pessoa_id: pessoa.id,
+        mensagem_id: inbound.id,
+      });
       await markAllProcessed(0);
       await conversasRepo.touch(c.id);
       await clearDebounceState(pessoa.telefone_whatsapp);
@@ -1145,6 +1217,7 @@ async function runAgentForMensagemInner(
   let totalTokens: number;
   let reactOutboundText: string;
   let reactToolsCalled: Array<{ name: string; result: unknown }>;
+  let reactDelivery: ReActDelivery;
   try {
     const result = await runReActLoop({
       pessoa,
@@ -1162,10 +1235,50 @@ async function runAgentForMensagemInner(
     totalTokens = result.totalTokens;
     reactOutboundText = result.outboundText;
     reactToolsCalled = result.toolsCalled;
+    reactDelivery = result.delivery;
   } finally {
     stopTyping();
   }
 
+  // Issue #503 — o outcome do turno vem do RESULTADO DURÁVEL do ReAct, nunca do
+  // simples retorno da função. Dois casos deixam de ser `completed`:
+  //   * `reasoner_failed`  (cenário A) — o LLM expirou/errou, nada foi produzido;
+  //   * `outbound_failure` (cenário B) — resposta pronta, envio falhou pre-send.
+  // Ambos viram `retryable` com backoff (ou dead letter no esgotamento), então o
+  // recovery por estado (FEATURE_TURN_STATE_AUTHORITATIVE) refaz o turno em vez
+  // de perdê-lo.
+  //
+  // `iteration_cap` NÃO é retryable: tools já rodaram, reexecutar duplicaria
+  // efeito colateral — conclui sem resposta e o operador vê pela auditoria
+  // `turn_completed_without_reply`.
+  if (reactDelivery.dispatched) {
+    await concludeTurn(
+      turn,
+      reactDelivery.persistUnknown ? 'reply_delivery_unknown' : 'reply_delivered',
+      { pessoa_id: pessoa.id, mensagem_id: inbound.id },
+    );
+  } else if (
+    reactDelivery.exitReason === 'reasoner_failed' ||
+    reactDelivery.exitReason === 'outbound_failure'
+  ) {
+    await failTurnRetryable(turn, {
+      code: reactDelivery.exitReason,
+      mensagem_id: inbound.id,
+    });
+  } else {
+    await concludeTurn(turn, 'no_reply_produced', {
+      pessoa_id: pessoa.id,
+      mensagem_id: inbound.id,
+    });
+  }
+
+  // NOTA DE ROLLOUT (#503 §6): `markAllProcessed` continua rodando SEMPRE,
+  // inclusive quando o turno ficou `retryable`. Enquanto
+  // FEATURE_TURN_STATE_AUTHORITATIVE estiver OFF, `processada_em` é a decisão de
+  // negócio e o comportamento observável é IDÊNTICO ao anterior — a máquina de
+  // estados roda em shadow e a divergência é medida por
+  // `maia_turn_legacy_projection_mismatch_total`. Ao ligar a flag, o recovery
+  // passa a eleger por estado e é ele quem rearma o turno `retryable`.
   await markAllProcessed(totalTokens);
   await conversasRepo.touch(c.id);
   // Issue #73 — persist the scope hash for the *next* turn's sentinel check.

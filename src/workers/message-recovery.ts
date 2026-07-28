@@ -1,10 +1,27 @@
-import { mensagensRepo } from '@/db/repositories.js';
+import { mensagensRepo, agentTurnsRepo } from '@/db/repositories.js';
 import { enqueueAgent, QueueRedisUnavailableError } from '@/gateway/queue.js';
 import { logger } from '@/lib/logger.js';
+import { incCounter } from '@/lib/metrics.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
+import {
+  noteTurnQueued,
+  reportLegacyProjectionDivergence,
+  turnStateAuthoritative,
+  turnStateMachineEnabled,
+} from '@/runtime/turns/index.js';
 
 const STUCK_AFTER_MS = 2 * 60 * 1000; // older than 2min and still unprocessed
 const MAX_PER_RUN = 200;
+
+/**
+ * Issue #503 — o probe de divergência (§6, shadow-read) faz um JOIN de
+ * `agent_turn_inputs × agent_turns × mensagens` por par. Barato hoje, caro numa
+ * base grande — e ele mede uma condição que muda em MINUTOS, não a cada sweep.
+ * Por isso roda no máximo uma vez a cada 15min por processo, e nunca no caminho
+ * que rearma trabalho.
+ */
+const DIVERGENCE_PROBE_EVERY_MS = 15 * 60 * 1000;
+let lastDivergenceProbeAt = 0;
 
 /**
  * Re-enqueues inbound messages that were persisted but never picked up by the
@@ -39,7 +56,17 @@ const MAX_PER_RUN = 200;
  * so the inner still runs once under default. Fail-isolated per tuple.
  */
 export async function runMessageRecovery(): Promise<void> {
-  const tuples = await mensagensRepo.listTenantAgentPairsWithUnprocessedOlderThan(STUCK_AFTER_MS);
+  // Issue #503, passo 8 do rollout. Duas fontes de verdade possíveis para
+  // "quem precisa ser rearmado":
+  //   OFF (padrão): `processada_em IS NULL` — comportamento histórico. A
+  //     máquina de estados roda em SHADOW e só medimos a divergência.
+  //   ON: `agent_turns.status` — o único modo em que `retryable` volta à fila e
+  //     em que `outbound_pending`/`ignored`/`superseded`/`dead_letter` são
+  //     EXPLICITAMENTE poupados (o filtro legado não sabe distingui-los).
+  const authoritative = turnStateAuthoritative();
+  const tuples = authoritative
+    ? await agentTurnsRepo.listTenantAgentPairsWithRecoverableTurns(STUCK_AFTER_MS)
+    : await mensagensRepo.listTenantAgentPairsWithUnprocessedOlderThan(STUCK_AFTER_MS);
 
   if (tuples.length === 0) {
     logger.debug('message_recovery.idle');
@@ -51,7 +78,10 @@ export async function runMessageRecovery(): Promise<void> {
 
   for (const { tenant_id, agent_id } of tuples) {
     try {
-      await runWithTenantContext({ tenant_id, agent_id }, runMessageRecoveryInner);
+      await runWithTenantContext(
+        { tenant_id, agent_id },
+        authoritative ? runTurnRecoveryInner : runMessageRecoveryInner,
+      );
       agents_processed++;
     } catch (err) {
       // Fail-isolated per (tenant, agent): a throw under one tuple must not
@@ -69,10 +99,81 @@ export async function runMessageRecovery(): Promise<void> {
     }
   }
 
+  // Shadow-read (#503 §6, passo 6): mede a divergência entre a máquina de
+  // estados e a projeção legada, por par, SEM decidir nada com ela. É o sinal
+  // que autoriza (ou barra) ligar FEATURE_TURN_STATE_AUTHORITATIVE.
+  if (turnStateMachineEnabled() && Date.now() - lastDivergenceProbeAt >= DIVERGENCE_PROBE_EVERY_MS) {
+    lastDivergenceProbeAt = Date.now();
+    for (const { tenant_id, agent_id } of tuples) {
+      await runWithTenantContext({ tenant_id, agent_id }, reportLegacyProjectionDivergence).catch(
+        (err) =>
+          logger.warn(
+            { tenant_id, agent_id, err: (err as Error).message },
+            'message_recovery.divergence_probe_failed',
+          ),
+      );
+    }
+  }
+
   logger.info(
-    { tuples: tuples.length, agents_processed, agents_failed },
+    { tuples: tuples.length, agents_processed, agents_failed, authoritative },
     'message_recovery.done',
   );
+}
+
+/**
+ * Inner do modo AUTORITATIVO (#503): elege candidatos POR ESTADO do turno.
+ *
+ * Diferenças materiais em relação ao inner legado:
+ *   - `retryable` volta à fila quando `next_attempt_at` vence — o legado nunca
+ *     rearmava um turno cujo `processada_em` já tinha sido carimbado;
+ *   - `outbound_pending` NUNCA é rearmado (a resposta já está comprometida; só
+ *     o delivery worker de #506 a finaliza);
+ *   - terminais (`completed`/`ignored`/`superseded`/`dead_letter`) são
+ *     invisíveis por construção.
+ *
+ * O job continua carregando só `mensagem_id` (a representativa do turno): o
+ * worker do agente reencontra o turno por `findTurnByMessage`. jobId
+ * determinístico — e portanto a garantia de não duplicar execução — é #504.
+ */
+async function runTurnRecoveryInner(): Promise<void> {
+  const candidates = await agentTurnsRepo.findRecoverableTurns(STUCK_AFTER_MS, MAX_PER_RUN);
+  if (candidates.length === 0) return;
+  let requeued = 0;
+  for (const { turn, reason } of candidates) {
+    incCounter('maia_turn_recovery_candidates_total', { reason });
+    try {
+      await enqueueAgent({ mensagem_id: turn.representative_message_id });
+      // Só `received` e `retryable` têm aresta para `queued`. Um turno já em
+      // `queued` (job perdido) ou em `claimed`/`running` com lease vencida é
+      // rearmado na FILA sem mexer no estado — tentar transicionar aqui só
+      // produziria conflito de CAS ruidoso, e rebaixar `running` para `queued`
+      // seria mentira sobre o que já foi executado.
+      if (turn.status === 'received' || turn.status === 'retryable') {
+        await noteTurnQueued({
+          turn_id: turn.id,
+          status: turn.status,
+          state_version: Number(turn.state_version),
+          attempt_count: turn.attempt_count,
+          conversa_id: turn.conversa_id,
+        });
+      }
+      requeued++;
+    } catch (err) {
+      if (err instanceof QueueRedisUnavailableError) {
+        logger.warn(
+          { turn_id: turn.id, requeued, scanned: candidates.length, oom: err.oom },
+          'turn_recovery.aborted_redis_unavailable',
+        );
+        break;
+      }
+      logger.warn(
+        { err: (err as Error).message, turn_id: turn.id, reason },
+        'turn_recovery.enqueue_failed',
+      );
+    }
+  }
+  logger.info({ requeued, scanned: candidates.length }, 'turn_recovery.done');
 }
 
 async function runMessageRecoveryInner(): Promise<void> {

@@ -1,0 +1,126 @@
+# Runbook — máquina de estados durável do turno (issue #503)
+
+Cobre: rollout, backfill, turno preso, divergência com o campo legado, replay de
+dead letter e rollback.
+
+Fonte de verdade do vocabulário: [`src/runtime/turns/contract.ts`](../../src/runtime/turns/contract.ts).
+Única porta de escrita: [`src/db/repositories/turn-repos.ts`](../../src/db/repositories/turn-repos.ts).
+
+## 1. Modelo em 30 segundos
+
+Um **turno** é a execução lógica de um inbound. Ele agrega N mensagens quando o
+debounce está ligado. `agent_turns` guarda o estado; `agent_turn_inputs` guarda
+quais mensagens o turno consumiu (uma mensagem pertence a **no máximo um** turno).
+
+```
+received → queued → claimed → running → outbound_pending → completed
+```
+
+| Estado | Significa | Recovery rearma? |
+|---|---|---|
+| `received` | persistido, enqueue não confirmado | sim, se antigo |
+| `queued` | wake-up armado | sim, se antigo |
+| `claimed` | worker com lease | só com lease vencida (#504) |
+| `running` | executando | só com lease vencida (#504) |
+| `outbound_pending` | resposta comprometida no outbox | **NUNCA** |
+| `retryable` | falhou antes de efeito irreversível | sim, quando `next_attempt_at` vence |
+| `completed` / `ignored` / `superseded` / `dead_letter` | terminal | não |
+
+Todo terminal carrega **outcome** (`reply_delivered`, `identity_unknown`,
+`retry_exhausted`, …). Um CHECK no banco recusa terminal sem outcome e par
+estado/outcome incompatível.
+
+## 2. Rollout (ordem obrigatória)
+
+1. `npm run db:migrate` — aplica 096 (índices `CONCURRENTLY` em `mensagens`) e
+   097 (tabelas). A 096 **não** roda em transação; se ela falhar no meio, o
+   índice fica `INVALID` — rode o `_down` da 096 e reaplique.
+2. Deploy com `FEATURE_TURN_STATE_MACHINE=true` (padrão) e
+   `FEATURE_TURN_STATE_AUTHORITATIVE=false` (padrão). Nesse ponto o turno é
+   **shadow**: escreve, mede, não decide. Comportamento observável idêntico ao
+   anterior.
+3. `npm run backfill:turns` — em lotes, idempotente, resumível.
+   `npm run backfill:turns -- --dry-run` mostra o volume antes.
+4. Observe `maia_turn_legacy_projection_mismatch_total` por pelo menos um ciclo
+   de retenção. Ver §4 para o que fazer com divergência.
+5. Só então ligue `FEATURE_TURN_STATE_AUTHORITATIVE=true`. A partir daí o
+   recovery elege por estado — e turnos `retryable` (timeout de reasoner, falha
+   pre-send) voltam para a fila em vez de morrerem silenciosamente.
+6. Mantenha o dual-write por, no mínimo, uma janela de rollback completa.
+   `mensagens.processada_em` **não** é removido nesta fase.
+
+## 3. Turno preso
+
+```sql
+-- distribuição por estado e idade (por tenant/agent)
+SELECT tenant_id, agent_id, status,
+       count(*) AS n,
+       max(now() - updated_at) AS mais_antigo
+FROM agent_turns
+GROUP BY 1,2,3
+ORDER BY 1,2,3;
+```
+
+| Sintoma | Leitura | Ação |
+|---|---|---|
+| Pilha de `received` antigos | enqueue falhando (Redis OOM/queda) | Ver [`redis.md`](redis.md). O sweep rearma sozinho quando o Redis voltar. |
+| Pilha de `queued` antigos | worker parado ou job perdido | Checar o worker `agent`; o sweep rearma. |
+| `claimed`/`running` parados | worker morreu no meio | Até #504 (lease) **não** rearme automaticamente. Investigue antes: reexecutar um turno que já chamou tool duplica efeito colateral. |
+| `outbound_pending` parado | resposta comprometida, entrega travada | **Nunca** rearmar via recovery. É o delivery worker (#506) que finaliza. |
+| Crescimento de `retryable` | reasoner ou envio falhando | `SELECT last_error_code, count(*) FROM agent_turns WHERE status='retryable' GROUP BY 1;` |
+
+Logs estruturados: `turn.created`, `turn.transitioned`, `turn.transition_conflict`,
+`turn.retry_scheduled`, `turn.dead_lettered`, `turn.legacy_projection_mismatch`.
+Nenhum deles carrega texto, prompt, telefone ou JID — se você precisa do conteúdo,
+ele está em `mensagens`, sob as mesmas regras de acesso de sempre.
+
+Métricas: `maia_turn_transitions_total{from,to,outcome}`,
+`maia_turn_state_conflicts_total{transition}`,
+`maia_turn_recovery_candidates_total{reason}`,
+`maia_turn_retries_total{error_code}`,
+`maia_turn_legacy_projection_mismatch_total{kind}`,
+`maia_turn_state_errors_total{op,error_code}`.
+
+## 4. Divergência com `processada_em`
+
+Duas direções, ambas contadas por `agentTurnsRepo.countLegacyProjectionMismatch()`
+(o sweep de recovery a executa por par e emite auditoria
+`turn_state_inconsistency_detected` quando encontra algo):
+
+| Divergência | Significa | Ação |
+|---|---|---|
+| `terminal_without_projection` | turno terminal, mensagem ainda `processada_em IS NULL` | A projeção falhou. Investigue; enquanto a leitura legada for autoritativa, o recovery vai reprocessar a mensagem. |
+| `projection_without_terminal` | `processada_em` preenchido, turno não-terminal | Esperado **em shadow** quando o turno virou `retryable` (o caminho legado carimbou por fora). Some ao ligar `FEATURE_TURN_STATE_AUTHORITATIVE`. Fora desse caso, é código legado escrevendo `processada_em` por um caminho não instrumentado — encontre-o antes do flip. |
+
+Não existe correção automática: a decisão é do operador.
+
+## 5. Replay de dead letter
+
+`dead_letter` **não** volta sozinho. O replay é operação explícita e auditada
+(`turn_replayed`), gera nova tentativa e descarta o `claim_token` anterior:
+
+```ts
+import { replayDeadLetteredTurn } from '@/runtime/turns/index.js';
+await replayDeadLetteredTurn({ turn_id, actor: 'ops:<seu-usuario>', reason: '<por quê>' });
+```
+
+Antes de replayar, confirme que o efeito colateral do turno **não** ocorreu
+(cheque `outbound_message_id` e a trilha de tools). Replayar um turno que já
+enviou resposta duplica a mensagem para o usuário.
+
+## 6. Rollback
+
+**De aplicação** — volte o código; mantenha as tabelas; mantenha o dual-write
+enquanto houver versão mista rodando. `processada_em` nunca deixou de ser
+escrito, então o caminho legado está íntegro.
+
+**De feature** — `FEATURE_TURN_STATE_AUTHORITATIVE=false` devolve a decisão ao
+campo legado imediatamente. `FEATURE_TURN_STATE_MACHINE=false` desliga também a
+escrita. Nenhum turno ou outcome já gravado é apagado.
+
+**De migration** — `097_agent_turns_down.sql` é **destrutivo** (apaga a trilha).
+Só execute com TODAS estas condições: nenhuma versão nova rodando, nenhum turno
+em estado não-terminal, backup validado, runtime de volta à leitura legada. A
+`096` só pode cair **depois** da `097` (a FK composta depende do índice único).
+Nunca rode down migration automática durante incidente — ver
+[`migrations.md`](migrations.md).

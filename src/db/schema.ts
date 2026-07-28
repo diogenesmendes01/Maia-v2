@@ -2994,3 +2994,105 @@ export type McpServer = typeof mcp_servers.$inferSelect;
 export type NewMcpServer = typeof mcp_servers.$inferInsert;
 export type McpServerTool = typeof mcp_server_tools.$inferSelect;
 export type NewMcpServerTool = typeof mcp_server_tools.$inferInsert;
+
+// ─── Issue #503 — máquina de estados durável do turno inbound (migration 097) ─
+//
+// O turno é LÓGICO: agrega N mensagens inbound (debounce) numa única execução.
+// PostgreSQL é a fonte de verdade do ciclo de vida; Redis/BullMQ são só
+// wake-up e distribuição. O vocabulário de `status`/`outcome` e a tabela de
+// transições vivem em `src/runtime/turns/contract.ts` — aqui só a forma da row.
+// Toda escrita passa por `agentTurnsRepo` (src/db/repositories/turn-repos.ts);
+// nenhum caller atualiza `status` direto.
+export const agent_turns = pgTable(
+  'agent_turns',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    // NULL até a identidade/conversa ser resolvida (o inbound é persistido
+    // ANTES da resolução — ver src/gateway/baileys.ts).
+    conversa_id: uuid('conversa_id'),
+    channel_id: uuid('channel_id'),
+    representative_message_id: uuid('representative_message_id').notNull(),
+    status: text('status').notNull().default('received'), // TurnStatus
+    outcome: text('outcome'), // TurnOutcome | null
+    // Compare-and-swap: toda transição incrementa e o UPDATE exige a versão
+    // esperada. `bigint` com mode 'number' — o contador nunca chega perto de
+    // 2^53 (é por turno, não global).
+    state_version: bigint('state_version', { mode: 'number' }).notNull().default(0),
+    attempt_count: integer('attempt_count').notNull().default(0),
+    next_attempt_at: timestamp('next_attempt_at', { withTimezone: true }),
+    // Sanitizados por `sanitizeTurnError` — nunca payload/prompt/PII.
+    last_error_code: text('last_error_code'),
+    last_error_summary: text('last_error_summary'),
+    // Reservados para #504 (claim/lease/fencing).
+    claimed_by: text('claimed_by'),
+    claim_token: uuid('claim_token'),
+    lease_expires_at: timestamp('lease_expires_at', { withTimezone: true }),
+    // Reservado para #507 (deadline/cancelamento).
+    deadline_at: timestamp('deadline_at', { withTimezone: true }),
+    // Reservado para #506 (outbox durável).
+    outbound_message_id: uuid('outbound_message_id'),
+    queued_at: timestamp('queued_at', { withTimezone: true }),
+    claimed_at: timestamp('claimed_at', { withTimezone: true }),
+    started_at: timestamp('started_at', { withTimezone: true }),
+    outbound_committed_at: timestamp('outbound_committed_at', { withTimezone: true }),
+    completed_at: timestamp('completed_at', { withTimezone: true }),
+    dead_lettered_at: timestamp('dead_lettered_at', { withTimezone: true }),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    scopeIdUq: unique('agent_turns_scope_id_uq').on(t.tenant_id, t.agent_id, t.id),
+    representativeUq: uniqueIndex('agent_turns_representative_uq').on(
+      t.representative_message_id,
+    ),
+    scopeStatusIdx: index('agent_turns_scope_status_next_attempt_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.status,
+      t.next_attempt_at,
+    ),
+    pendingDispatchIdx: index('agent_turns_pending_dispatch_idx')
+      .on(t.status, t.next_attempt_at, t.created_at)
+      .where(sql`status IN ('received', 'queued', 'claimed', 'running', 'retryable')`),
+    conversaIdx: index('agent_turns_conversa_idx')
+      .on(t.tenant_id, t.agent_id, t.conversa_id, t.created_at)
+      .where(sql`conversa_id IS NOT NULL`),
+    leaseIdx: index('agent_turns_lease_idx')
+      .on(t.tenant_id, t.agent_id, t.lease_expires_at)
+      .where(sql`status IN ('claimed', 'running')`),
+  }),
+);
+
+// Associação inbound -> turno. As DUAS FKs são COMPOSTAS por (tenant, agent):
+// é o que impede fisicamente ligar uma mensagem do tenant B a um turno do
+// tenant A. A unique em `mensagem_id` implementa "uma mensagem inbound
+// pertence a no máximo um turno".
+export const agent_turn_inputs = pgTable(
+  'agent_turn_inputs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    turn_id: uuid('turn_id').notNull(),
+    mensagem_id: uuid('mensagem_id').notNull(),
+    /** Ordem de chegada dentro do turno. 0 = mensagem representativa. */
+    ingress_seq: integer('ingress_seq').notNull().default(0),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    mensagemUq: uniqueIndex('agent_turn_inputs_mensagem_uq').on(t.mensagem_id),
+    turnIdx: index('agent_turn_inputs_turn_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.turn_id,
+      t.ingress_seq,
+    ),
+  }),
+);
+
+export type AgentTurn = typeof agent_turns.$inferSelect;
+export type NewAgentTurn = typeof agent_turns.$inferInsert;
+export type AgentTurnInput = typeof agent_turn_inputs.$inferSelect;
+export type NewAgentTurnInput = typeof agent_turn_inputs.$inferInsert;

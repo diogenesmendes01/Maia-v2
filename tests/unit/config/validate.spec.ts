@@ -158,6 +158,48 @@ describe('validateConfig — cross-field rules (#515)', () => {
     expect(problem!.message).toContain('VALOR_LIMITE_SEM_CONFIRMACAO');
   });
 
+  // Issue #503 — o flip da leitura da máquina de estados do turno depende do
+  // dual-write. A combinação contraditória é INERTE em runtime, então o
+  // contrato precisa recusá-la: senão o operador acredita ter feito o passo 8
+  // do rollout e o recovery segue decidindo pelo campo legado.
+  it('FEATURE_TURN_STATE_AUTHORITATIVE sem FEATURE_TURN_STATE_MACHINE é rejeitado', () => {
+    const result = validateConfig({
+      env: envFor('production', {
+        FEATURE_TURN_STATE_MACHINE: 'false',
+        FEATURE_TURN_STATE_AUTHORITATIVE: 'true',
+      }),
+      profile: 'production',
+      allowSyntheticFixtures: true,
+    });
+    const problem = result.errors.find(
+      (p) => p.rule === 'turn-state/authoritative-requires-dual-write',
+    );
+    expect(problem).toBeDefined();
+    expect(problem!.variable).toBe('FEATURE_TURN_STATE_AUTHORITATIVE');
+    expect(problem!.remediation).toContain('FEATURE_TURN_STATE_MACHINE');
+  });
+
+  it.each([
+    ['true', 'true'],
+    ['true', 'false'],
+    ['false', 'false'],
+  ] as const)(
+    'MACHINE=%s + AUTHORITATIVE=%s é uma combinação válida',
+    (machine, authoritative) => {
+      const result = validateConfig({
+        env: envFor('production', {
+          FEATURE_TURN_STATE_MACHINE: machine,
+          FEATURE_TURN_STATE_AUTHORITATIVE: authoritative,
+        }),
+        profile: 'production',
+        allowSyntheticFixtures: true,
+      });
+      expect(
+        result.errors.some((p) => p.rule === 'turn-state/authoritative-requires-dual-write'),
+      ).toBe(false);
+    },
+  );
+
   it.each([
     ['anthropic', 'ANTHROPIC_API_KEY'],
     ['openrouter', 'OPENROUTER_API_KEY'],

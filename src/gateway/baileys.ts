@@ -39,6 +39,13 @@ import {
 import type { LineTransport } from './line-session-manager.js';
 import { enqueueAgent, QueueRedisUnavailableError } from './queue.js';
 import { scheduleDebouncedAgent } from './debouncer.js';
+// Issue #503 — máquina de estados durável do turno (dual-write no ingresso).
+import {
+  noteTurnQueued,
+  noteTurnEnqueueFailed,
+  turnStateMachineEnabled,
+  type TurnStatus,
+} from '@/runtime/turns/index.js';
 import { checkBotAndMaybeBlock } from './bot-detection.js';
 import { audit } from '@/governance/audit.js';
 import { dispatchReactionAsAnswer, dispatchPollVote } from '@/agent/one-tap.js';
@@ -1062,45 +1069,67 @@ async function handleIncoming(
 
   const { type, content, mediaPath, mediaMime, mediaSha256, mediaRejected } = await extractContent(msg);
 
-  const { row: stored, duplicate } = await mensagensRepo.createInbound({
-    conversa_id: null,
-    // 090 (spec roteamento v4 §1.7): canal resolvido NO ingresso, carimbado na
-    // PERSISTÊNCIA — o dedup de rows novas é por (channel_id, whatsapp_id), de
-    // modo que o mesmo whatsapp_id em duas linhas persiste DUAS vezes e um
-    // retry na MESMA linha persiste UMA. Null (testes/entradas sem resolução)
-    // cai na partial unique legada por (tenant, agent, whatsapp_id).
-    channel_id: _resolvedChannelId,
-    direcao: 'in',
-    tipo: type,
-    conteudo: content,
-    midia_url: mediaPath,
-    metadata: {
-      whatsapp_id,
-      remote_jid,
-      telefone: tel,
-      pushname: msg.pushName ?? null,
-      timestamp_ms: Number(msg.messageTimestamp ?? 0) * 1000,
-      media_mime: mediaMime,
-      media_sha256: mediaSha256,
-      // P0 audit ch. 4 — why the media was refused ('too_large_declared' |
-      // 'too_large' | 'bad_magic'), null when accepted/absent. The turn still
-      // processes; only the media fields are withheld.
-      media_rejected: mediaRejected,
-      // [Issue #290] Channel resolved at the ingress. In single-tenant this is
-      // the seeded default channel id (#411 catch-all); null only when the
-      // resolver path didn't surface a channel_id (e.g., tests driving
-      // handleIncoming directly). Persisted for triage and as defense-in-depth
-      // — the worker's adoption probe is unaffected by this field.
-      ingress_channel_id: _resolvedChannelId,
-      // §1.1 (spec roteamento v4) — a LINHA que RECEBEU esta mensagem. O
-      // probe do worker (`probeMessageForChannel`) repassa ao resolver para o
-      // exact-match por linha nos modos shadow/exact_first/strict.
-      bot_line_external_id: _botLine,
+  // Issue #503 — `withTurn` faz o inbound e o turno `received` nascerem na MESMA
+  // transação. Se o processo morrer entre o commit e o enqueue, o recovery
+  // reencontra o turno em `received` (a ordem persistir-antes-de-enfileirar já
+  // era a fundação correta; o turno só a torna diagnosticável).
+  const {
+    row: stored,
+    duplicate,
+    turn,
+  } = await mensagensRepo.createInbound(
+    {
+      conversa_id: null,
+      // 090 (spec roteamento v4 §1.7): canal resolvido NO ingresso, carimbado na
+      // PERSISTÊNCIA — o dedup de rows novas é por (channel_id, whatsapp_id), de
+      // modo que o mesmo whatsapp_id em duas linhas persiste DUAS vezes e um
+      // retry na MESMA linha persiste UMA. Null (testes/entradas sem resolução)
+      // cai na partial unique legada por (tenant, agent, whatsapp_id).
+      channel_id: _resolvedChannelId,
+      direcao: 'in',
+      tipo: type,
+      conteudo: content,
+      midia_url: mediaPath,
+      metadata: {
+        whatsapp_id,
+        remote_jid,
+        telefone: tel,
+        pushname: msg.pushName ?? null,
+        timestamp_ms: Number(msg.messageTimestamp ?? 0) * 1000,
+        media_mime: mediaMime,
+        media_sha256: mediaSha256,
+        // P0 audit ch. 4 — why the media was refused ('too_large_declared' |
+        // 'too_large' | 'bad_magic'), null when accepted/absent. The turn still
+        // processes; only the media fields are withheld.
+        media_rejected: mediaRejected,
+        // [Issue #290] Channel resolved at the ingress. In single-tenant this is
+        // the seeded default channel id (#411 catch-all); null only when the
+        // resolver path didn't surface a channel_id (e.g., tests driving
+        // handleIncoming directly). Persisted for triage and as defense-in-depth
+        // — the worker's adoption probe is unaffected by this field.
+        ingress_channel_id: _resolvedChannelId,
+        // §1.1 (spec roteamento v4) — a LINHA que RECEBEU esta mensagem. O
+        // probe do worker (`probeMessageForChannel`) repassa ao resolver para o
+        // exact-match por linha nos modos shadow/exact_first/strict.
+        bot_line_external_id: _botLine,
+      },
+      processada_em: null,
+      ferramentas_chamadas: [],
+      tokens_usados: null,
     },
-    processada_em: null,
-    ferramentas_chamadas: [],
-    tokens_usados: null,
-  });
+    { withTurn: turnStateMachineEnabled() },
+  );
+  // Handle do turno recém-criado (null quando a flag está OFF). Só transições
+  // de ESTADO passam por ele — nenhum dado da mensagem.
+  const turnHandle = turn
+    ? {
+        turn_id: turn.id,
+        status: turn.status as TurnStatus,
+        state_version: Number(turn.state_version),
+        attempt_count: turn.attempt_count,
+        conversa_id: turn.conversa_id,
+      }
+    : null;
 
   await markSeen(whatsapp_id);
   // Fase 3: o read receipt sai pela sessão da LINHA que recebeu (quando
@@ -1141,6 +1170,10 @@ async function handleIncoming(
       // `messages.upsert` installs above — so a shared phone across two
       // tenants gets two INDEPENDENT debouncers (issue #248).
       const result = await scheduleDebouncedAgent({ phone: tel, mensagem_id: stored.id });
+      // #503: só DEPOIS do wake-up confirmado o turno sai de `received`. Um
+      // crash antes daqui deixa `received`, que é exatamente o que o recovery
+      // procura.
+      await noteTurnQueued(turnHandle);
       logger.info(
         {
           mensagem_id: stored.id,
@@ -1176,6 +1209,9 @@ async function handleIncoming(
         },
         'baileys.debounce_failed_fail_closed',
       );
+      // #503: o turno FICA em `received` (não vira `retryable` — não houve
+      // tentativa de execução). O sweep de recovery o reencontra.
+      await noteTurnEnqueueFailed(turnHandle, { code: errCode ?? 'debounce_failed', error: err });
       return;
     }
   }
@@ -1198,10 +1234,13 @@ async function handleIncoming(
         { mensagem_id: stored.id, tel: '[REDACTED]', failure_class: 'redis_unavailable', oom: err.oom },
         'baileys.enqueue_failed_fail_closed',
       );
+      await noteTurnEnqueueFailed(turnHandle, { code: err.code, error: err });
       return;
     }
+    await noteTurnEnqueueFailed(turnHandle, { code: 'enqueue_failed', error: err });
     throw err;
   }
+  await noteTurnQueued(turnHandle);
   logger.info({ mensagem_id: stored.id, tel: '[REDACTED]' }, 'baileys.message.enqueued');
 }
 
