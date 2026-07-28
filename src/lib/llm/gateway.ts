@@ -368,12 +368,15 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
           signal: link.signal,
           timeout_ms: attemptTimeout(),
         });
-        recordAttempt({
-          provider: primary.provider,
-          model: primary.model,
-          workload: req.workload,
-          outcome: 'ok',
-        });
+        recordAttempt(
+          {
+            provider: primary.provider,
+            model: primary.model,
+            workload: req.workload,
+            outcome: 'ok',
+          },
+          scope,
+        );
         return await finish(primary, res);
       } catch (rawErr) {
         // Deadline que disparou aparece no SDK como abort — reclassificamos
@@ -388,12 +391,15 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
             });
         lastError = err;
         lastRawError = rawErr;
-        recordAttempt({
-          provider: primary.provider,
-          model: primary.model,
-          workload: req.workload,
-          outcome: err.kind,
-        });
+        recordAttempt(
+          {
+            provider: primary.provider,
+            model: primary.model,
+            workload: req.workload,
+            outcome: err.kind,
+          },
+          scope,
+        );
 
         // Cancelamento NUNCA é retentável e nunca é reportado como erro de
         // provider. Repassamos o erro original quando ele veio do SDK para
@@ -459,12 +465,15 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
         signal: link.signal,
         timeout_ms: attemptTimeout(),
       });
-      recordAttempt({
-        provider: fast.provider,
-        model: fast.model,
-        workload: req.workload,
-        outcome: 'ok',
-      });
+      recordAttempt(
+        {
+          provider: fast.provider,
+          model: fast.model,
+          workload: req.workload,
+          outcome: 'ok',
+        },
+        scope,
+      );
       return await finish(fast, res, primary.model);
     } catch (rawErr) {
       const err = link.deadlineFired()
@@ -474,12 +483,15 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
             model: fast.model,
             workload: req.workload,
           });
-      recordAttempt({
-        provider: fast.provider,
-        model: fast.model,
-        workload: req.workload,
-        outcome: err.kind,
-      });
+      recordAttempt(
+        {
+          provider: fast.provider,
+          model: fast.model,
+          workload: req.workload,
+          outcome: err.kind,
+        },
+        scope,
+      );
       await fail(fast, err);
       // Um abort no fallback tem que vencer o erro do primário: mascarar o
       // cancelamento atrás do último 5xx rouba do caller o sinal de que ELE

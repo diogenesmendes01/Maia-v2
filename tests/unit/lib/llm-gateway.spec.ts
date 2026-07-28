@@ -439,6 +439,57 @@ describe('executeLLM — telemetria e custo', () => {
       workload: 'role_selector',
     });
   });
+
+  /**
+   * Antes, só `maia_llm_requests_total` levava o escopo: duração, timeout,
+   * cancelamento, fallback, tokens e attempts agregavam todos os tenants. Um
+   * tenant sozinho estourando latência ou queimando tokens ficava diluído na
+   * média — justamente a pergunta que o operador precisa responder.
+   */
+  it('TODA emissão tenant-aware carrega tenant_id + agent_id', async () => {
+    anthropicCreateMock.mockResolvedValueOnce(okReply());
+    await executeLLM(req());
+
+    for (const metric of ['maia_llm_requests_total', 'maia_llm_tokens_total', 'maia_llm_attempts_total']) {
+      const calls = counterCalls(metric);
+      expect(calls.length, `${metric} não foi emitida`).toBeGreaterThan(0);
+      for (const labels of calls) {
+        expect(labels, `${metric} sem tenant_id`).toMatchObject({
+          tenant_id: 'acme',
+          agent_id: 'ana',
+        });
+      }
+    }
+    const durationLabels = (observeHistogramMock.mock.calls.find(
+      (c) => c[0] === 'maia_llm_request_duration_ms',
+    )?.[2] ?? {}) as Record<string, string>;
+    expect(durationLabels).toMatchObject({ tenant_id: 'acme', agent_id: 'ana' });
+  });
+
+  it('timeout, cancelamento e fallback também levam o escopo', async () => {
+    anthropicCreateMock
+      .mockRejectedValueOnce(apiError(503))
+      .mockRejectedValueOnce(apiError(503))
+      .mockResolvedValueOnce(okReply());
+    await executeLLM(req());
+    expect(counterCalls('maia_llm_fallback_total')[0]).toMatchObject({
+      tenant_id: 'acme',
+      agent_id: 'ana',
+    });
+
+    incCounterMock.mockClear();
+    anthropicCreateMock.mockReset();
+    anthropicCreateMock.mockRejectedValue(apiError(503));
+    // `reasoner` retenta, então o backoff (≥1s) não cabe no que resta do
+    // deadline (40ms) e o desfecho é `timeout`, não `error`.
+    await executeLLM(
+      req({ workload: 'reasoner', ctx: { deadline_at: Date.now() + 40 } }),
+    ).catch(() => undefined);
+    expect(counterCalls('maia_llm_timeouts_total')[0] ?? {}).toMatchObject({
+      tenant_id: 'acme',
+      agent_id: 'ana',
+    });
+  }, 20000);
 });
 
 // ---------------------------------------------------------------------------

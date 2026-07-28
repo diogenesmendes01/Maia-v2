@@ -82,7 +82,16 @@ export function currentScope(): LLMScope {
  * issue: "falha de telemetria não pode esconder a chamada").
  */
 export async function emitUsage(event: LLMUsageEvent, scope: LLMScope): Promise<void> {
+  // Issue #508 (review rodada 1): o escopo entra em TODAS as emissões
+  // tenant-aware, não só em `requests_total`. Antes, duração, timeout,
+  // cancelamento, fallback, tokens e attempts agregavam tenants — um tenant
+  // sozinho estourando latência ou queimando tokens ficava diluído na média
+  // de todos, que é justamente a pergunta que o operador precisa responder.
+  const scopeLabels: Record<string, string> = scope
+    ? { tenant_id: scope.tenant_id, agent_id: scope.agent_id }
+    : {};
   const base = {
+    ...scopeLabels,
     provider: event.provider,
     model: event.model,
     tier: event.tier,
@@ -90,11 +99,7 @@ export async function emitUsage(event: LLMUsageEvent, scope: LLMScope): Promise<
   };
 
   try {
-    incCounter('maia_llm_requests_total', {
-      ...(scope ? { tenant_id: scope.tenant_id, agent_id: scope.agent_id } : {}),
-      ...base,
-      status: event.status,
-    });
+    incCounter('maia_llm_requests_total', { ...base, status: event.status });
     observeHistogram('maia_llm_request_duration_ms', event.duration_ms, {
       ...base,
       status: event.status,
@@ -113,6 +118,7 @@ export async function emitUsage(event: LLMUsageEvent, scope: LLMScope): Promise<
 
     if (event.status === 'timeout') {
       incCounter('maia_llm_timeouts_total', {
+        ...scopeLabels,
         provider: event.provider,
         model: event.model,
         workload: event.workload,
@@ -120,6 +126,7 @@ export async function emitUsage(event: LLMUsageEvent, scope: LLMScope): Promise<
     }
     if (event.status === 'cancelled') {
       incCounter('maia_llm_cancelled_total', {
+        ...scopeLabels,
         provider: event.provider,
         model: event.model,
         workload: event.workload,
@@ -127,6 +134,7 @@ export async function emitUsage(event: LLMUsageEvent, scope: LLMScope): Promise<
     }
     if (event.fallback_from) {
       incCounter('maia_llm_fallback_total', {
+        ...scopeLabels,
         from_model: event.fallback_from,
         to_model: event.model,
         workload: event.workload,
@@ -202,13 +210,17 @@ export async function emitUsage(event: LLMUsageEvent, scope: LLMScope): Promise<
 }
 
 /** Contabiliza o desfecho de UMA tentativa (não da chamada inteira). */
-export function recordAttempt(args: {
-  provider: string;
-  model: string;
-  workload: LLMWorkload;
-  outcome: 'ok' | LLMErrorKind;
-}): void {
+export function recordAttempt(
+  args: {
+    provider: string;
+    model: string;
+    workload: LLMWorkload;
+    outcome: 'ok' | LLMErrorKind;
+  },
+  scope: LLMScope,
+): void {
   incCounter('maia_llm_attempts_total', {
+    ...(scope ? { tenant_id: scope.tenant_id, agent_id: scope.agent_id } : {}),
     provider: args.provider,
     model: args.model,
     workload: args.workload,
