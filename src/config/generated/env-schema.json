@@ -294,6 +294,21 @@
         "6379"
       ]
     },
+    "REDIS_CONNECT_TIMEOUT_MS": {
+      "type": "string",
+      "description": "Quanto o boot espera pela conexão com o Redis antes de FALHAR FECHADO (issue #512). Redis é dependência obrigatória (BullMQ, dedup, debouncer, working memory, rate limit): `ensureRedisConnect()` não engole mais a falha — sem conexão o processo não anuncia readiness e sai com erro.",
+      "x-maia-type": "number",
+      "x-maia-group": "redis",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "10000",
+      "examples": [
+        "10000"
+      ]
+    },
     "LLM_PROVIDER": {
       "type": "string",
       "description": "Provider do LLM principal: anthropic (direto) ou openrouter (gateway).",
@@ -2136,6 +2151,163 @@
       "default": "20",
       "examples": [
         "20"
+      ]
+    },
+    "MAIA_PROCESS_ROLE": {
+      "type": "string",
+      "description": "Qual fatia da topologia ESTE processo executa: all | api | worker | scheduler | session-owner. O papel decide o que o boot INICIA e o que o /readyz EXIGE, então um processo worker nunca fica fora de rotação por causa do WhatsApp, e um api-only nunca anuncia readiness por conseguir falar com o Redis. `all` é o modo compatível de processo único que roda hoje; os demais existem para a separação de topologia (issue #513). Contrato em src/runtime/lifecycle/roles.ts.",
+      "x-maia-type": "string",
+      "x-maia-group": "lifecycle",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "enum": [
+        "all",
+        "api",
+        "worker",
+        "scheduler",
+        "session-owner"
+      ],
+      "default": "all",
+      "examples": [
+        "all"
+      ]
+    },
+    "SHUTDOWN_GRACE_MS": {
+      "type": "string",
+      "description": "Orçamento TOTAL do drain depois do SIGTERM: ticks de cron em execução, jobs BullMQ ativos e tarefas de background rastreadas. Precisa ser MENOR que o timeout de kill do supervisor (systemd TimeoutStopSec / compose stop_grace_period, hoje 40s), senão o SIGKILL corta o drain no meio.",
+      "x-maia-type": "number",
+      "x-maia-group": "lifecycle",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "25000",
+      "examples": [
+        "25000"
+      ]
+    },
+    "SHUTDOWN_STEP_TIMEOUT_MS": {
+      "type": "string",
+      "description": "Teto por PASSO do shutdown, para que um componente travado (um socket que não fecha) não consuma o orçamento inteiro. Também limita a espera pela fase de boot em voo; se essa espera estoura, o drain é marcado incompleto e o processo sai forçado.",
+      "x-maia-type": "number",
+      "x-maia-group": "lifecycle",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "10000",
+      "examples": [
+        "10000"
+      ]
+    },
+    "SHUTDOWN_EXIT_TIMEOUT_MS": {
+      "type": "string",
+      "description": "Rede de segurança APÓS um drain limpo. O processo sai naturalmente quando o event loop esvazia; este timer (unref) só dispara se algum handle vazado mantiver o loop vivo. Não é um process.exit prematuro — a saída natural sempre vence a corrida.",
+      "x-maia-type": "number",
+      "x-maia-group": "lifecycle",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "5000",
+      "examples": [
+        "5000"
+      ]
+    },
+    "SHUTDOWN_FORCED_EXIT_CODE": {
+      "type": "string",
+      "description": "Código de saída quando o drain termina INCOMPLETO (deadline estourado com trabalho em voo, segundo sinal, ou fase de boot que não cedeu). Distinto do 0 de um drain limpo, para o supervisor e o log distinguirem os dois casos.",
+      "x-maia-type": "number",
+      "x-maia-group": "lifecycle",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "1",
+      "examples": [
+        "1"
+      ]
+    },
+    "READINESS_CACHE_MS": {
+      "type": "string",
+      "description": "Janela de cache da avaliação de componentes do /readyz, para que um polling agressivo do load balancer não vire gerador de carga em DB/Redis. O ESTADO do lifecycle nunca é cacheado: o drain derruba o /readyz para 503 na requisição seguinte.",
+      "x-maia-type": "number",
+      "x-maia-group": "lifecycle",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "2000",
+      "examples": [
+        "2000"
+      ]
+    },
+    "READINESS_PROBE_TIMEOUT_MS": {
+      "type": "string",
+      "description": "Timeout por componente nas probes de readiness. Componente que não responde a tempo é reportado como `unknown` — o que é fail-closed para um componente obrigatório do papel.",
+      "x-maia-type": "number",
+      "x-maia-group": "lifecycle",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "1500",
+      "examples": [
+        "1500"
+      ]
+    },
+    "READINESS_SCHEMA_CHECK": {
+      "type": "string",
+      "description": "Exige que a migration mais nova em disco esteja aplicada em schema_migrations antes de anunciar readiness. A readiness NUNCA aplica migration — só recusa servir num schema para o qual o código não foi construído. Desligue apenas onde código e schema são publicados fora de banda de propósito; isso é política explícita, não fallback silencioso.",
+      "x-maia-type": "string",
+      "x-maia-group": "lifecycle",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "true",
+      "examples": [
+        "true"
+      ]
+    },
+    "READINESS_BACKLOG_MAX": {
+      "type": "string",
+      "description": "Shedding de capacidade opcional: reporta NÃO-pronto quando a fila do agente tem mais de N jobs esperando. Default 0 = DESLIGADO, deliberadamente — um limiar mal escolhido drena a frota inteira durante um pico legítimo e transforma backlog em outage. Ligue por ambiente depois de conhecer o formato normal do backlog.",
+      "x-maia-type": "number",
+      "x-maia-group": "lifecycle",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "0",
+      "examples": [
+        "0"
+      ]
+    },
+    "READINESS_REQUIRE_WHATSAPP_LIVE": {
+      "type": "string",
+      "description": "Readiness estrita de WhatsApp. Default false: uma sessão JÁ estabelecida que está reconectando reporta `degraded` e a instância PERMANECE em rotação, porque queda de socket Baileys é rotina e travar nisso faz a readiness flapar. Ligue onde capacidade de canal e capacidade de API precisam ser o mesmo sinal. Não afeta o cold start: antes do primeiro `open` a instância nunca fica pronta, com a flag ligada ou não.",
+      "x-maia-type": "string",
+      "x-maia-group": "lifecycle",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "false",
+      "examples": [
+        "false"
       ]
     },
     "SETUP_TOKEN_OVERRIDE": {

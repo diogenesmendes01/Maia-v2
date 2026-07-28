@@ -255,6 +255,13 @@ curl -s -o /dev/null -w '%{http_code}\n' http://localhost:3000/startupz  # 503 �
 curl -s http://localhost:3000/readyz | jq '.ready, .state, .role, (.checks[] | select(.required))'
 ```
 
+> As variáveis desta seção vivem no contrato de configuração (#515): grupo
+> **Lifecycle do processo** em `src/config/contract.ts`, documentadas em
+> [`docs/configuration.md`](../configuration.md). As relações entre elas são
+> regras executáveis em `src/config/rules.ts` — `npm run config:check` avisa,
+> por exemplo, se `SHUTDOWN_STEP_TIMEOUT_MS` ficar maior que
+> `SHUTDOWN_GRACE_MS`.
+
 ### 8.2 Papel do processo (`MAIA_PROCESS_ROLE`)
 
 Contrato em `src/runtime/lifecycle/roles.ts`. Hoje todo processo roda `all`
@@ -380,7 +387,7 @@ Restart preserva: sessão Baileys (`.baileys-auth/`), backups, audit log, jobs
 
 ## 10. Checklist de deploy novo (cold start)
 
-- [ ] `.env` preenchido (todas as obrigatórias do `envSchema` em `src/config/env.ts`)
+- [ ] `.env` preenchido e validado — `npm run config:check` (fonte da verdade: `ENV_CONTRACT` em `src/config/contract.ts`; referência gerada em [`docs/configuration.md`](../configuration.md))
 - [ ] Postgres + Redis up (`/health/db` + `/health/redis`)
 - [ ] `npm run db:migrate` rodado
 - [ ] `npm run build` clean

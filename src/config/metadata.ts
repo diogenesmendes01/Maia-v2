@@ -67,6 +67,7 @@ export type ConfigGroup =
   | 'outbox'
   | 'procedures'
   | 'performance'
+  | 'lifecycle'
   | 'setup'
   | 'admin-ui';
 
@@ -91,6 +92,7 @@ export const GROUP_ORDER: readonly { group: ConfigGroup; title: string }[] = [
   { group: 'outbox', title: 'Outbox / sweeper' },
   { group: 'procedures', title: 'Procedures / reaper' },
   { group: 'performance', title: 'Performance / caches' },
+  { group: 'lifecycle', title: 'Lifecycle do processo (readiness e shutdown)' },
   { group: 'setup', title: 'Bootstrap / setup' },
   { group: 'admin-ui', title: 'Admin UI (container Next.js separado)' },
 ];
@@ -297,6 +299,13 @@ export const MAIA_KEY_PREFIXES: readonly string[] = [
   'CONTRADICTION_',
   'VOYAGE_',
   'COHERE_',
+  // Issue #512 — lifecycle do processo. Namespaces exclusivamente da Maia
+  // (nenhuma plataforma de hospedagem injeta SHUTDOWN_*/READINESS_*), então um
+  // typo como SHUTDOWN_GRACE_MSS é detectado em vez de virar knob silencioso.
+  // `REDIS_` continua FORA de propósito: provedores gerenciados (Upstash,
+  // Heroku) injetam REDIS_* próprios, e rejeitá-los quebraria o boot.
+  'SHUTDOWN_',
+  'READINESS_',
 ] as const;
 // Deliberately NOT listed, because these namespaces belong to somebody else and
 // an unknown key in them is NOT a Maia misconfiguration:
