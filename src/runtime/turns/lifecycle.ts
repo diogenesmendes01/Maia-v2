@@ -8,12 +8,12 @@
  *      `FEATURE_TURN_STATE_MACHINE` está OFF, então o kill switch da issue
  *      (§ Migration e rollout, passo 4) devolve o runtime ao comportamento
  *      anterior sem tocar em código.
- *   2. **Fail-soft.** Durante o dual-write a máquina de estados é uma trilha
- *      PARALELA: `processada_em` continua sendo a decisão de negócio até
- *      `FEATURE_TURN_STATE_AUTHORITATIVE` ser ligada. Portanto uma falha ao
- *      transicionar NUNCA pode derrubar o turno do usuário — vira log +
- *      métrica. Quando a leitura nova virar autoritativa (#504+), este
- *      contrato endurece.
+ *   2. **Política de falha por MODO.** Em shadow/dual-write a máquina é uma
+ *      trilha PARALELA (`processada_em` decide), então falha ao transicionar
+ *      vira log + métrica e nunca derruba o turno do usuário. Em AUTORITATIVO
+ *      isso se inverte: fail-soft contradiria "PostgreSQL é a fonte de
+ *      verdade", então a falha propaga como `TurnStateWriteError` e o turno
+ *      não avança. Ver `guarded()`.
  *   3. **Auditoria e observabilidade.** Descarte por política, dead letter,
  *      replay manual, conclusão sem resposta e detecção de inconsistência
  *      geram `audit()`; o resto vira métrica + log estruturado.
@@ -102,15 +102,62 @@ function applyResult(handle: TurnHandle, result: TurnTransitionResult): boolean 
 }
 
 /**
- * Executa uma operação da máquina de estados sem deixar erro escapar para o
- * hot path (contrato de fail-soft do dual-write). Retorna `null` no erro.
+ * Falha BLOQUEANTE de escrita da máquina de estados. Só existe em modo
+ * autoritativo — ver `guarded()`.
  */
-async function soft<T>(op: string, fn: () => Promise<T>): Promise<T | null> {
+export class TurnStateWriteError extends Error {
+  readonly code = 'TURN_STATE_WRITE_FAILED';
+  readonly op: string;
+  readonly error_code: string;
+
+  constructor(op: string, error_code: string, cause: unknown) {
+    super(
+      `falha ao persistir transição de turno (op=${op}, error_code=${error_code}); ` +
+        `em modo autoritativo o PostgreSQL é a fonte de verdade, então o turno NÃO pode ` +
+        `prosseguir como se tivesse sido gravado`,
+      { cause },
+    );
+    this.name = 'TurnStateWriteError';
+    this.op = op;
+    this.error_code = error_code;
+  }
+}
+
+/**
+ * Executa uma operação da máquina de estados aplicando a política de falha do
+ * MODO CORRENTE.
+ *
+ * SHADOW / dual-write (`FEATURE_TURN_STATE_AUTHORITATIVE=false`): a máquina é
+ * um OBSERVADOR — `mensagens.processada_em` é quem decide. Uma falha de
+ * escrita não pode derrubar o turno do usuário, então vira log + métrica e a
+ * função devolve `null`.
+ *
+ * AUTORITATIVO: fail-soft passa a CONTRADIZER a invariante "PostgreSQL é a
+ * fonte de verdade" — a persistência falharia e o caller seguiria adiante,
+ * gravando `processada_em` e deixando o turno `running` sem lease, invisível
+ * para o recovery (achado P1 da rodada 1). Nesse modo o erro é PROPAGADO como
+ * `TurnStateWriteError`: o job do BullMQ falha, nada é projetado no campo
+ * legado, e o turno continua elegível.
+ *
+ * `blocking: false` força o comportamento shadow — usado só pelo probe de
+ * divergência, que é observabilidade e nunca deve derrubar o sweep.
+ */
+async function guarded<T>(
+  op: string,
+  fn: () => Promise<T>,
+  opts: { blocking?: boolean } = {},
+): Promise<T | null> {
   try {
     return await fn();
   } catch (err) {
+    if (err instanceof TurnStateWriteError) throw err; // já contabilizado
     const { code } = sanitizeTurnError({ error: err });
     incCounter('maia_turn_state_errors_total', { op, error_code: code });
+    const blocking = opts.blocking ?? turnStateAuthoritative();
+    if (blocking) {
+      logger.error({ op, error_code: code, ops_alert: true }, 'turn.state_write_failed');
+      throw new TurnStateWriteError(op, code, err);
+    }
     logger.warn({ op, error_code: code }, 'turn.state_write_failed');
     return null;
   }
@@ -128,7 +175,7 @@ export async function ensureTurnHandle(
   mensagem: Pick<Mensagem, 'id' | 'tenant_id' | 'agent_id' | 'conversa_id' | 'channel_id'>,
 ): Promise<TurnHandle | null> {
   if (!turnStateMachineEnabled()) return null;
-  return soft('ensure_turn', async () => {
+  return guarded('ensure_turn', async () => {
     const existing = await agentTurnsRepo.findTurnByMessage(mensagem.id);
     if (existing) return toHandle(existing);
     const created = await agentTurnsRepo.ensureTurnForMessage(mensagem);
@@ -140,7 +187,7 @@ export async function ensureTurnHandle(
 /** `received | retryable -> queued` — o wake-up do BullMQ foi confirmado. */
 export async function noteTurnQueued(handle: TurnHandle | null): Promise<void> {
   if (!handle || !turnStateMachineEnabled()) return;
-  await soft('mark_queued', async () => {
+  await guarded('mark_queued', async () => {
     const result = await agentTurnsRepo.markQueued({
       turn_id: handle.turn_id,
       expected_version: handle.state_version,
@@ -178,7 +225,7 @@ export async function beginTurnExecution(
   args: { conversa_id?: string | null; channel_id?: string | null } = {},
 ): Promise<void> {
   if (!handle || !turnStateMachineEnabled()) return;
-  await soft('begin_execution', async () => {
+  await guarded('begin_execution', async () => {
     if (handle.status === 'received' || handle.status === 'queued') {
       applyResult(
         handle,
@@ -221,7 +268,7 @@ export async function absorbDebounceInputs(
   mensagem_ids: readonly string[],
 ): Promise<void> {
   if (!handle || !turnStateMachineEnabled() || mensagem_ids.length === 0) return;
-  await soft('absorb_inputs', async () => {
+  await guarded('absorb_inputs', async () => {
     let seq = 1;
     for (const mensagem_id of mensagem_ids) {
       const sibling = await agentTurnsRepo.findTurnByMessage(mensagem_id);
@@ -262,7 +309,7 @@ export async function concludeTurn(
   ctx: { pessoa_id?: string | null; mensagem_id?: string | null } = {},
 ): Promise<void> {
   if (!handle || !turnStateMachineEnabled()) return;
-  await soft('conclude', async () => {
+  await guarded('conclude', async () => {
     const from = handle.status;
     const result =
       outcome === 'merged_into_turn'
@@ -339,11 +386,14 @@ export async function failTurnRetryable(
 ): Promise<void> {
   if (!handle || !turnStateMachineEnabled()) return;
   const { code, summary } = sanitizeTurnError({ code: args.code, error: args.error });
-  await soft('fail_retryable', async () => {
-    if (handle.attempt_count >= MAX_TURN_ATTEMPTS) {
-      await deadLetterTurn(handle, { code, summary, outcome: 'retry_exhausted' });
-      return;
-    }
+  // Esgotou as tentativas: dead letter. FORA do `guarded` abaixo para não
+  // aninhar duas políticas de falha (a contagem em `maia_turn_state_errors_total`
+  // sairia dobrada e o `op` do erro seria o do wrapper externo, não o real).
+  if (handle.attempt_count >= MAX_TURN_ATTEMPTS) {
+    await deadLetterTurn(handle, { code, summary, outcome: 'retry_exhausted' });
+    return;
+  }
+  await guarded('fail_retryable', async () => {
     const next = new Date(Date.now() + retryDelayMs(handle.attempt_count + 1));
     const from = handle.status;
     const result = await agentTurnsRepo.markRetryable({
@@ -383,7 +433,7 @@ export async function deadLetterTurn(
     args.summary !== undefined
       ? { code: args.code, summary: args.summary }
       : sanitizeTurnError({ code: args.code, error: args.error });
-  await soft('dead_letter', async () => {
+  await guarded('dead_letter', async () => {
     const from = handle.status;
     const result = await agentTurnsRepo.markDeadLetter({
       turn_id: handle.turn_id,
@@ -468,7 +518,10 @@ export async function reportLegacyProjectionDivergence(): Promise<{
   projection_without_terminal: number;
 } | null> {
   if (!turnStateMachineEnabled()) return null;
-  return soft('projection_divergence', async () => {
+  // `blocking: false` SEMPRE: o probe é observabilidade. Derrubar o sweep de
+  // recovery porque a medição de divergência falhou seria trocar um problema
+  // de visibilidade por um de disponibilidade.
+  return guarded('projection_divergence', async () => {
     const counts = await agentTurnsRepo.countLegacyProjectionMismatch();
     const total = counts.terminal_without_projection + counts.projection_without_terminal;
     if (total === 0) return counts;
@@ -488,5 +541,5 @@ export async function reportLegacyProjectionDivergence(): Promise<{
       metadata: { ...counts },
     });
     return counts;
-  });
+  }, { blocking: false });
 }

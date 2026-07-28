@@ -46,8 +46,11 @@ const {
   concludeTurn,
   failTurnRetryable,
   beginTurnExecution,
+  ensureTurnHandle,
+  reportLegacyProjectionDivergence,
   retryDelayMs,
   MAX_TURN_ATTEMPTS,
+  TurnStateWriteError,
   turnStateMachineEnabled,
   turnStateAuthoritative,
 } = await import('@/runtime/turns/lifecycle.js');
@@ -221,7 +224,7 @@ describe('turn lifecycle — retry e dead letter', () => {
   });
 });
 
-describe('turn lifecycle — fail-soft (dual-write não derruba o hot path)', () => {
+describe('turn lifecycle — SHADOW: fail-soft não derruba o hot path', () => {
   it('erro do repositório é engolido, logado e contabilizado', async () => {
     repo.completeTurnTx.mockRejectedValue(new Error('DB down'));
     await expect(concludeTurn(handle(), 'reply_delivered')).resolves.toBeUndefined();
@@ -230,6 +233,90 @@ describe('turn lifecycle — fail-soft (dual-write não derruba o hot path)', ()
   it('erro no begin não impede o turno de seguir', async () => {
     repo.markClaimed.mockRejectedValue(new Error('DB down'));
     await expect(beginTurnExecution(handle({ status: 'queued' }))).resolves.toBeUndefined();
+  });
+});
+
+// Achado P1 rodada 1: em modo autoritativo o fail-soft CONTRADIZ "PostgreSQL é
+// a fonte de verdade" — a persistência falharia e o caller seguiria gravando
+// `processada_em`, deixando o turno `running` sem lease e fora do recovery.
+describe('turn lifecycle — AUTORITATIVO: falha de transição é BLOQUEANTE', () => {
+  beforeEach(() => {
+    flags.FEATURE_TURN_STATE_AUTHORITATIVE = true;
+  });
+
+  const boom = (): Error => new Error('DB down');
+
+  it.each([
+    ['reply_delivered (completed)', 'completeTurnTx' as const],
+    ['identity_unknown (ignored)', 'markIgnored' as const],
+    ['merged_into_turn (superseded)', 'markSuperseded' as const],
+  ])('conclusão terminal %s propaga TurnStateWriteError', async (_label, method) => {
+    repo[method].mockRejectedValue(boom());
+    const outcome =
+      method === 'completeTurnTx'
+        ? 'reply_delivered'
+        : method === 'markIgnored'
+          ? 'identity_unknown'
+          : 'merged_into_turn';
+    await expect(concludeTurn(handle(), outcome as never)).rejects.toThrow(TurnStateWriteError);
+  });
+
+  it('retry propaga', async () => {
+    repo.markRetryable.mockRejectedValue(boom());
+    await expect(
+      failTurnRetryable(handle({ attempt_count: 1 }), { code: 'reasoner_failed' }),
+    ).rejects.toThrow(TurnStateWriteError);
+  });
+
+  it('dead letter propaga', async () => {
+    repo.markDeadLetter.mockRejectedValue(boom());
+    await expect(
+      failTurnRetryable(handle({ attempt_count: MAX_TURN_ATTEMPTS }), { code: 'x' }),
+    ).rejects.toThrow(TurnStateWriteError);
+  });
+
+  it('begin e ensure propagam', async () => {
+    repo.markClaimed.mockRejectedValue(boom());
+    await expect(beginTurnExecution(handle({ status: 'queued' }))).rejects.toThrow(
+      TurnStateWriteError,
+    );
+    repo.findTurnByMessage.mockRejectedValue(boom());
+    await expect(
+      ensureTurnHandle({
+        id: 'm-1',
+        tenant_id: 't',
+        agent_id: 'a',
+        conversa_id: null,
+        channel_id: null,
+      }),
+    ).rejects.toThrow(TurnStateWriteError);
+  });
+
+  it('o erro carrega op e error_code sanitizados (sem PII)', async () => {
+    repo.completeTurnTx.mockRejectedValue(
+      Object.assign(new Error('conn to +55 11 98888-7777 lost'), { code: 'ECONNREFUSED' }),
+    );
+    await expect(concludeTurn(handle(), 'reply_delivered')).rejects.toMatchObject({
+      code: 'TURN_STATE_WRITE_FAILED',
+      op: 'conclude',
+      error_code: 'econnrefused',
+    });
+  });
+
+  it('NÃO propaga um CONFLITO de CAS — conflito é resultado, não falha', async () => {
+    repo.completeTurnTx.mockResolvedValue({
+      ok: false,
+      conflict: 'state_mismatch',
+      to: 'completed',
+      current_status: 'outbound_pending',
+      current_state_version: 9,
+    });
+    await expect(concludeTurn(handle(), 'reply_delivered')).resolves.toBeUndefined();
+  });
+
+  it('o probe de divergência continua NÃO-bloqueante mesmo autoritativo', async () => {
+    repo.countLegacyProjectionMismatch.mockRejectedValue(boom());
+    await expect(reportLegacyProjectionDivergence()).resolves.toBeNull();
   });
 });
 
